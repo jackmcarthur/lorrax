@@ -280,11 +280,11 @@ def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
     assert np.all(times != 0.0)
 
 
-def test_crossing_fallback_density_uses_complete_live_span(monkeypatch):
-    """The fitted interval, not its possibly smaller radius, sets density."""
+def test_covered_crossing_fallback_keeps_shipped_density(monkeypatch):
+    """A covered radius does not inflate the whole-window fallback."""
     problem = ReciprocalMeasureProblem(
-        frequencies=np.asarray([0.0, 2.0]),
-        internal_sums=np.asarray([-3.0 - 0.1j, 1.0 - 0.1j]),
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([5.9 - 0.1j, -1.0 - 0.1j]),
         cell_masses=np.asarray([1.0, 1.0]))
     requested = []
 
@@ -303,8 +303,9 @@ def test_crossing_fallback_density_uses_complete_live_span(monkeypatch):
         problem, pole_sign=1.0, relative_target=1.0e-4, max_nodes=420)
 
     oriented, gamma, radius = delivered._crossing_geometry(problem, 1.0)
-    assert requested == [pytest.approx(np.ptp(oriented.real) / gamma)]
-    assert requested[0] > radius
+    fit_span = np.ptp(oriented.real) / gamma
+    assert requested == [pytest.approx(60.0)]
+    assert radius < requested[0] < fit_span
 
 
 def _served_candidate(spec, *_args):
@@ -413,6 +414,30 @@ def test_crossing_patch_count_is_the_smallest_catalog_covered_partition(
     # One unpatched window has A=max(17, 20-5)/0.25=68, so A=60 cannot
     # cover it.  The returned two-patch cover is therefore minimal.
     assert 68.0 > widest_span
+
+
+def test_only_a_refused_crossing_is_split_into_exact_product_windows(
+        monkeypatch):
+    calls = []
+
+    def refuse_whole_crossing(spec, *_args):
+        calls.append(spec["name"])
+        if spec["kind"] == "crossing" and "[p" not in spec["name"]:
+            raise delivered._CrossingRuleRefusal("measured gate miss")
+        return _served_candidate(spec)
+
+    monkeypatch.setattr(
+        delivered, "_candidate_rules", refuse_whole_crossing)
+    plan, report = _patched_test_plan(5.0)
+    patched = [row for row in plan if "[p" in row.window.name]
+
+    assert report["refused_crossing_split_count"] == 1
+    assert len(patched) >= 2
+    joined = np.concatenate([row.omega_idx for row in patched
+                             if ":resonant[p" in row.window.name])
+    np.testing.assert_array_equal(joined, np.arange(21))
+    assert report["direct_term_count"] == 0
+    assert calls[0] == "5 eV conduction:resonant"
 
 
 def test_emitted_crossing_patches_are_disjoint_complete_and_reproducible(

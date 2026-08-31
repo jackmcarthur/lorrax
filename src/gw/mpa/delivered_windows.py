@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 9
+_PLAN_CACHE_VERSION = 10
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -77,6 +77,10 @@ _CROSSING_CONDITIONING_SLACK = 0.2
 # present in evaluator.damped_rectangle_gauss_rule; it fixes the time interval
 # without a search over tail fractions.
 _CROSSING_TAIL_FRACTION = 0.9
+
+
+class _CrossingRuleRefusal(RuntimeError):
+    """A crossing fit missed its measured gates and may be product-split."""
 
 
 def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
@@ -1130,7 +1134,7 @@ def _crossing_fit_span(problem, pole_sign):
 
 
 def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
-                            pole_sign, state_edge, bins):
+                            pole_sign, state_edge, bins, *, force_split=False):
     """Return the smallest exact omega-patch routing covered by HGL.
 
     A covered problem returns one identity route.  A wider crossing is split
@@ -1150,8 +1154,9 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
         raise RuntimeError("the shipped HGL family is empty")
     widest_span = max(float(entry.range_max) for entry in entries)
     if (_window_kind(problem) != "crossing"
-            or _crossing_geometry(problem, pole_sign)[2]
-            <= widest_span + 1.0e-12):
+            or (not force_split
+                and _crossing_geometry(problem, pole_sign)[2]
+                <= widest_span + 1.0e-12)):
         return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
 
     raw_energy = (float(pole_sign)
@@ -1256,19 +1261,29 @@ def _crossing_fallback_node_count(A_dim, max_nodes):
 def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     """Fit one fixed deterministic causal grid; never search node/time pairs."""
     oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
-    # The shipped odd HGL target is certified on ``[-A, A]``, so lookup uses
-    # the support radius above.  The unconstrained IRLS fallback keeps its
-    # established density against the complete real span; it is not an HGL
-    # certificate and reducing that grid changed its conditioning.
     fit_A_dim = _crossing_fit_span(problem, pole_sign)
-    # The shipped odd HGL rule is certified by its radius.  The fallback is
-    # an unconstrained fit to the complete measured interval, so its node
-    # density must instead follow that interval's end-to-end span.  This is
-    # particularly important after a QSGW update: the radius can remain
-    # inside the widest table while the live state/pole cloud becomes much
-    # less symmetric and nearly doubles its span.  Using the table radius in
-    # that case under-resolves the only allowed fallback.
-    fallback_A_dim = fit_A_dim
+    widest_hgl = max(
+        float(entry.range_max)
+        for entry in _mm.catalog().for_family("crossing")
+        if entry.target_kind == "hgl"
+        and entry.eps_q is not None
+        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12)
+    covered_hgl = [
+        float(entry.range_max)
+        for entry in _mm.catalog().for_family("crossing")
+        if entry.target_kind == "hgl"
+        and entry.eps_q is not None
+        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12
+        and entry.range_max <= fit_A_dim + 1.0e-12
+    ]
+    # Keep the shipped density while the physical HGL radius is covered.
+    # A fit that misses its live gates is split into smaller exact product
+    # windows below; spending more nodes on the whole crossing was both
+    # slower and less accurate on the asymmetric QSGW support.
+    fallback_A_dim = (
+        max(covered_hgl, default=fit_A_dim)
+        if A_dim <= widest_hgl + 1.0e-12 else fit_A_dim
+    )
     node_count, source_range = _crossing_fallback_node_count(
         fallback_A_dim, max_nodes)
     target = min(float(relative_target), 0.5)
@@ -1424,12 +1439,96 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
             f"; radius/eta={radius:.6g}, "
             f"fit_span/eta={_crossing_fit_span(spec['problem'], spec['pole_sign']):.6g}, "
             "attempts=" + repr(attempts))
-    raise RuntimeError(
+    refusal = (
         f"delivered product window {spec['name']!r} refused: achieved "
         f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
         "the shipped product-window family and its one crossing fallback "
         "did not survive the residual, noise, and factor-growth gates"
         f"{geometry}")
+    if spec["kind"] == "crossing":
+        raise _CrossingRuleRefusal(refusal)
+    raise RuntimeError(refusal)
+
+
+def _split_refused_crossing(spec, state_edge, bins):
+    """Replace one refused crossing by exact omega/pole product cells."""
+    routes = _crossing_omega_patches(
+        spec["problem"], spec["measure"], spec["state_positions"],
+        spec["pole_bounds"], spec["pole_sign"], state_edge, bins,
+        force_split=True)
+    patch_count = len(routes)
+    children = []
+    for patch_number, (omega_rows, routed_bounds) in enumerate(
+            routes, start=1):
+        patch_frequencies = spec["problem"].frequencies[omega_rows]
+        for cell_role, cell_bounds in routed_bounds:
+            product = _product_problem(
+                spec["state_positions"], cell_bounds, spec["measure"],
+                patch_frequencies, spec["pole_sign"], int(bins))
+            if product is None:
+                continue
+            problem, validation, pole_indices = product
+            kind = _window_kind(problem)
+            label = (spec["name"] if cell_role == "crossing" else
+                     f"{spec['name']}:{cell_role}_flank")
+            envelope_by_frequency = (
+                problem.cell_masses[None, :] / np.abs(problem.denominators)
+            ).sum(axis=1)
+            E_ref = float(np.min(spec["raw_state_energy"]))
+            if kind != "crossing":
+                _rotated, transform = _sign_definite_orientation(problem)
+                table_sign = (1.0 if transform.startswith("positive")
+                              else -1.0)
+                if spec["pole_sign"] * table_sign > 0.0:
+                    E_ref = float(np.max(spec["raw_state_energy"]))
+            child = dict(spec)
+            child.update({
+                "name": f"{label}[p{patch_number}/{patch_count}]",
+                "problem": problem,
+                "validation": validation,
+                "kind": kind,
+                "pole_indices": pole_indices,
+                "pole_bounds": tuple(map(float, cell_bounds)),
+                "E_ref_A": E_ref,
+                "omega_abs": np.asarray(spec["omega_abs"])[omega_rows],
+                "omega_idx": np.asarray(spec["omega_idx"])[omega_rows],
+                "envelope": float(np.max(envelope_by_frequency)),
+                "envelope_by_frequency": envelope_by_frequency,
+            })
+            children.append(child)
+    if patch_count < 2 or not children:
+        raise RuntimeError(
+            f"refused crossing {spec['name']!r} produced no product split")
+
+    original_cost = _frequency_cost(spec, 1.0)
+    split_cost = np.zeros_like(original_cost)
+    for child in children:
+        split_cost += _frequency_cost(child, 1.0, size=split_cost.size)
+    if not np.allclose(split_cost, original_cost, rtol=2.0e-14, atol=0.0):
+        raise AssertionError(
+            f"crossing split for {spec['name']!r} did not preserve its "
+            "measured inverse-gap envelope")
+    return children
+
+
+def _refresh_spec_geometry(specs, branch_reports, omega_count):
+    """Recount branch slices and the pointwise envelope after a split."""
+    combined = np.zeros(int(omega_count), dtype=np.float64)
+    cursor = 0
+    for report in branch_reports:
+        report["plan_start"] = cursor
+        while (cursor < len(specs)
+               and specs[cursor]["branch_report"] is report):
+            spec = specs[cursor]
+            np.add.at(
+                combined, np.asarray(spec["omega_idx"], np.int64),
+                np.asarray(spec["envelope_by_frequency"], np.float64))
+            cursor += 1
+        report["plan_stop"] = cursor
+        report["window_count"] = report["plan_stop"] - report["plan_start"]
+    if cursor != len(specs):
+        raise AssertionError("delivered product specs are not branch-contiguous")
+    return combined
 
 
 def _empty_frequency_cost(specs):
@@ -1656,7 +1755,6 @@ def build_delivered_sigma_windows(
             raise ValueError("reference_sigma_omega is invalid")
 
     specs, branch_reports = [], []
-    combined_envelope = np.zeros(omega_grid.size, dtype=np.float64)
     for branch, measure in zip(branch_rows, measure_rows):
         positions = np.asarray(branch.omega_idx, dtype=np.int64)
         frequencies = omega_grid[positions]
@@ -1751,11 +1849,12 @@ def build_delivered_sigma_windows(
                         "branch_report": report,
                     }
                     specs.append(spec)
-                    combined_envelope[patch_positions] += envelope_by_frequency
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
 
+    combined_envelope = _refresh_spec_geometry(
+        specs, branch_reports, omega_grid.size)
     combined_scale = float(np.max(combined_envelope))
     total_absolute = target * combined_scale * safety
     cache_fingerprint = _plan_cache_fingerprint(
@@ -1780,8 +1879,8 @@ def build_delivered_sigma_windows(
                 _save_plan_cache(
                     plan_cache_path, cache_fingerprint, fits, free_pairs,
                     required_cost, window_tau_pairs)
+    crossing_split_count = 0
     if cached is None:
-        cache_status = "disabled" if plan_cache_path is None else "miss"
         # The compact measured problems are replicated.  Running the same
         # host IRLS fit on every GPU rank merely oversubscribes BLAS (four
         # ranks x 32 threads measured 14.54 s here).  With the campaign's
@@ -1790,15 +1889,90 @@ def build_delivered_sigma_windows(
         # exact same nodes.  A cache-disabled caller keeps the serial spelling
         # on every rank because it supplied no synchronization artifact.
         owner_only = process_count() > 1 and plan_cache_path is not None
-        if not owner_only or process_rank() == 0:
+        fit_here = not owner_only or process_rank() == 0
+        split_flags = np.zeros(len(specs), dtype=np.uint8)
+        candidates_by_window = None
+        if fit_here:
+            candidates_by_window = []
+            for index, spec in enumerate(specs):
+                try:
+                    candidates = _candidate_rules(
+                        spec, eta, pair_ceiling, factor_cap,
+                        min(0.5, total_absolute / spec["envelope"]))
+                except _CrossingRuleRefusal:
+                    split_flags[index] = 1
+                    candidates = None
+                candidates_by_window.append(candidates)
+        if owner_only:
+            gathered_flags = all_gather_processes(split_flags)
+            split_flags = np.asarray(gathered_flags[0], np.uint8)
+            if np.any(np.asarray(gathered_flags[1:], np.uint8)):
+                raise AssertionError(
+                    "only rank 0 may resolve delivered crossing splits")
+
+        crossing_split_count = int(np.count_nonzero(split_flags))
+        if crossing_split_count:
+            resolved_specs = []
+            resolved_candidates = [] if fit_here else None
+            for index, spec in enumerate(specs):
+                if not split_flags[index]:
+                    resolved_specs.append(spec)
+                    if fit_here:
+                        resolved_candidates.append(
+                            candidates_by_window[index])
+                    continue
+                children = _split_refused_crossing(
+                    spec, geometry["state_edge_ry"], int(lattice_bins))
+                resolved_specs.extend(children)
+                if fit_here:
+                    resolved_candidates.extend([
+                        _candidate_rules(
+                            child, eta, pair_ceiling, factor_cap,
+                            min(0.5, total_absolute / child["envelope"]))
+                        for child in children
+                    ])
+            specs = resolved_specs
+            candidates_by_window = resolved_candidates
+            previous_scale = combined_scale
+            combined_envelope = _refresh_spec_geometry(
+                specs, branch_reports, omega_grid.size)
+            combined_scale = float(np.max(combined_envelope))
+            if not np.isclose(
+                    combined_scale, previous_scale, rtol=2.0e-14, atol=0.0):
+                raise AssertionError(
+                    "crossing product split changed the complete delivered "
+                    "inverse-gap envelope")
+            total_absolute = target * combined_scale * safety
+            cache_fingerprint = _plan_cache_fingerprint(
+                specs, eta=eta, target=target, safety=safety,
+                factor_cap=factor_cap, pair_ceiling=pair_ceiling,
+                grid_mode=grid_mode, lattice_bins=lattice_bins)
+            cached = _load_plan_cache(
+                plan_cache_path, cache_fingerprint, len(specs))
+            cache_status = "disabled" if plan_cache_path is None else "hit"
+            if cached is not None:
+                (fits, free_pairs, required_cost, window_tau_pairs,
+                 fingerprint_match) = cached
+                if not fingerprint_match:
+                    validated_cost = _validate_cached_fits(
+                        specs, fits, eta=eta, factor_cap=factor_cap,
+                        pair_ceiling=pair_ceiling,
+                        total_absolute=total_absolute)
+                    if validated_cost is None:
+                        cached = None
+                    else:
+                        required_cost = validated_cost
+                        cache_status = "validated_hit"
+                        _save_plan_cache(
+                            plan_cache_path, cache_fingerprint, fits,
+                            free_pairs, required_cost, window_tau_pairs)
+
+        if cached is None:
+            cache_status = "disabled" if plan_cache_path is None else "miss"
+        if cached is None and fit_here:
             # Each lookup first receives the largest relative allowance it
             # could spend without exceeding the complete plan budget by
             # itself.  The exact selector checks the sum of ACHIEVED costs.
-            candidates_by_window = [
-                _candidate_rules(
-                    spec, eta, pair_ceiling, factor_cap,
-                    min(0.5, total_absolute / spec["envelope"]))
-                for spec in specs]
             fits, free_pairs, required_cost = _select_rules(
                 specs, candidates_by_window, total_absolute, pair_ceiling)
             window_tau_pairs = free_pairs
@@ -1924,6 +2098,7 @@ def build_delivered_sigma_windows(
         "window_tau_pairs": window_tau_pairs,
         "distinct_tau_count": distinct_tau_count,
         "direct_term_count": 0,
+        "refused_crossing_split_count": crossing_split_count,
         "plan_seconds": time.perf_counter() - started,
         "plan_cache_status": cache_status,
         "plan_cache_path": plan_cache_path,
