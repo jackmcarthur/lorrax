@@ -339,6 +339,12 @@ def test_crossing_patch_count_is_the_smallest_catalog_covered_partition(
         evidence["family"] == "crossing_hgl"
         for evidence in wide_report["branches"][0]["windows"]
         if ":resonant[p" in evidence["name"])
+    reported_A = [
+        evidence["crossing_A_dim"]
+        for evidence in wide_report["branches"][0]["windows"]
+        if evidence["crossing_A_dim"] is not None]
+    assert reported_A
+    assert wide_report["crossing_A_dim_max"] == max(reported_A)
     # One unpatched window has A=max(17, 20-5)/0.25=68, so A=60 cannot
     # cover it.  The returned two-patch cover is therefore minimal.
     assert 68.0 > widest_span

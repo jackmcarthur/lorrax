@@ -1690,6 +1690,8 @@ def compute_sigma_c_ppm_omega_grid(
             f"grid={geometry['tau_grid_mode']}, "
             f"{geometry['window_tau_pairs']} (window,tau) pairs, "
             f"{geometry['distinct_tau_count']} branch-distinct tau, "
+            f"crossing A_dim_max="
+            f"{geometry.get('crossing_A_dim_max', float('nan')):.3f}, "
             f"plan {geometry['plan_seconds']:.3f} s")
         for report in geometry["branches"]:
             for window in report["windows"]:

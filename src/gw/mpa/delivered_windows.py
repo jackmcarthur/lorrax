@@ -2236,6 +2236,10 @@ def build_delivered_sigma_windows(
             band_weight=branch.band_weight))
         spec["branch_report"]["windows"].append({
             "name": spec["name"], "kind": spec["kind"],
+            "crossing_A_dim": (
+                _crossing_geometry(
+                    spec["validation"], spec["pole_sign"])[2]
+                if spec["kind"] == "crossing" else None),
             "omega_abs_ry": np.asarray(spec["omega_abs"]).tolist(),
             "omega_indices": np.asarray(spec["omega_idx"]).tolist(),
             "product_state_interval_ry": [state_lo, state_hi],
@@ -2318,6 +2322,12 @@ def build_delivered_sigma_windows(
         "window_tau_pairs": window_tau_pairs,
         "distinct_tau_count": distinct_tau_count,
         "direct_term_count": 0,
+        "crossing_A_dim_max": max(
+            (float(window["crossing_A_dim"])
+             for branch in branch_reports
+             for window in branch["windows"]
+             if window["crossing_A_dim"] is not None),
+            default=0.0),
         "plan_seconds": plan_seconds,
         "planning_profile_seconds": {
             "census": census_seconds,
