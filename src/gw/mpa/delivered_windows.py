@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 5
+_PLAN_CACHE_VERSION = 6
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -1261,8 +1261,18 @@ def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     # A support whose physical HGL radius is covered keeps the established
     # widest-table density even when the conservative end-to-end span is a
     # little larger.  Truly wider supports are patched before this fallback.
-    fallback_A_dim = (min(fit_A_dim, widest_hgl)
-                      if A_dim <= widest_hgl + 1.0e-12 else fit_A_dim)
+    covered_hgl = [
+        float(entry.range_max)
+        for entry in _mm.catalog().for_family("crossing")
+        if entry.target_kind == "hgl"
+        and entry.eps_q is not None
+        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12
+        and entry.range_max <= fit_A_dim + 1.0e-12
+    ]
+    fallback_A_dim = (
+        max(covered_hgl, default=fit_A_dim)
+        if A_dim <= widest_hgl + 1.0e-12 else fit_A_dim
+    )
     node_count, source_range = _crossing_fallback_node_count(
         fallback_A_dim, max_nodes)
     target = min(float(relative_target), 0.5)
