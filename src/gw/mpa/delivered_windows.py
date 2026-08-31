@@ -1486,14 +1486,22 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
         merged = _merge_branch_specs(group)
         if merged is None:
             continue
+        split_nodes = sum(int(candidates[i][0]["times"].size) for i in indices)
         allowance = min(0.5, total_absolute / merged["envelope"])
+        # A merged rule is only ever accepted below the split's node count, so
+        # searching at or above it is pure waste.  Bounding the trial by its
+        # own acceptance criterion is dial-free and cuts the dominant residual
+        # planning cost: a refused merged-conduction trial measured 32.4 s of
+        # a 44.1 s plan, searching ranks it could never have kept.
+        trial_ceiling = min(int(max_nodes), split_nodes - 1)
+        if trial_ceiling < 1:
+            continue
         try:
             candidate = window_candidates(
-                merged, eta, max_nodes, factor_cap, allowance)[0]
+                merged, eta, trial_ceiling, factor_cap, allowance)[0]
         except (RuntimeError, ValueError, FloatingPointError, OverflowError,
                 np.linalg.LinAlgError):
             continue
-        split_nodes = sum(int(candidates[i][0]["times"].size) for i in indices)
         split_cost = sum(float(candidates[i][0]["absolute_cost"])
                          for i in indices)
         # Fewer nodes is NOT sufficient. A merged window covers more support,
