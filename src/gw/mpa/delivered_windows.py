@@ -1874,7 +1874,9 @@ def build_delivered_sigma_windows(
         nodes = MinimaxNodes(
             t=jnp.asarray(time_exec, dtype=jnp.complex128),
             alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128))
-        state_shape = np.asarray(gather_to_host(branch.E_A)).shape
+        # JAX array shapes are global metadata.  Reading the shape must not
+        # all-gather the full state field once per product window.
+        state_shape = tuple(branch.E_A.shape)
         mask = np.zeros(int(np.prod(state_shape)), dtype=bool)
         mask[np.asarray(spec["state_indices"], np.int64)] = True
         state_lo, state_hi = spec["state_interval"]
