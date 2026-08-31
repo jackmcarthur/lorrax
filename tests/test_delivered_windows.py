@@ -157,6 +157,58 @@ def test_complete_plan_receipt_reconstructs_current_branch_arrays(tmp_path):
             got.window.nodes.alpha, expected.window.nodes.alpha)
 
 
+def test_distributed_cache_miss_plans_only_on_rank_zero(tmp_path, monkeypatch):
+    """Host candidate work is published once instead of repeated by P ranks."""
+    omega_grid = np.asarray([0.0])
+    branch = _branch("rank-zero planning", "cond", [0.2], omega_grid)
+    Omega = np.asarray([0.5 - 0.05j]).reshape(1, 1, 1, 1)
+    residue = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
+    measure = measure_delivered_sigma_pole_batch(
+        branch, Omega, residue,
+        regularization_width_ry=0.02, lattice_bins=9)
+    path = tmp_path / "distributed-plan.pkl"
+    rank = [0]
+    barriers = []
+    candidate_ranks = []
+    original_candidates = delivered._candidate_rules
+
+    monkeypatch.setattr(delivered, "process_count", lambda: 2)
+    monkeypatch.setattr(delivered, "process_rank", lambda: rank[0])
+    monkeypatch.setattr(
+        delivered, "barrier", lambda name: barriers.append((rank[0], name)))
+    monkeypatch.setattr(
+        delivered, "_save_complete_delivered_sigma_plan",
+        lambda *args, **kwargs: None)
+
+    def counted_candidates(*args, **kwargs):
+        candidate_ranks.append(rank[0])
+        return original_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(delivered, "_candidate_rules", counted_candidates)
+    kwargs = dict(
+        regularization_width_ry=0.02,
+        envelope_relative_target=1.0e-5,
+        lattice_bins=9, max_nodes=128,
+        measures_by_branch=[measure], plan_cache_path=str(path))
+    rank0_plan, rank0_report = build_delivered_sigma_windows(
+        None, None, [branch], omega_grid, **kwargs)
+    rank[0] = 1
+    rank1_plan, rank1_report = build_delivered_sigma_windows(
+        None, None, [branch], omega_grid, **kwargs)
+
+    assert candidate_ranks and set(candidate_ranks) == {0}
+    assert barriers == [
+        (0, "delivered_sigma_plan_receipt"),
+        (1, "delivered_sigma_plan_receipt")]
+    assert rank0_report["window_tau_pairs"] == rank1_report[
+        "window_tau_pairs"]
+    for left, right in zip(rank0_plan, rank1_plan):
+        np.testing.assert_array_equal(
+            left.window.nodes.t, right.window.nodes.t)
+        np.testing.assert_array_equal(
+            left.window.nodes.alpha, right.window.nodes.alpha)
+
+
 def _two_branch_plan():
     omega = np.linspace(0.0, 1.2, 7)
     energies = [0.05, 0.25, 0.45, 1.4]

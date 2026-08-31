@@ -35,8 +35,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.collectives import (gather_to_host, process_count, process_rank,
-                                psum_replicate)
+from common.collectives import (barrier, gather_to_host, process_count,
+                                process_rank, psum_replicate)
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.evaluator import gauss_legendre_interval
 from gw.mpa.sigma_windows import SharedSigmaWindow
@@ -1744,8 +1744,11 @@ def build_delivered_sigma_windows(
         specs, eta=eta, target=target, safety=safety,
         factor_cap=factor_cap, node_ceiling=node_ceiling,
         grid_mode=grid_mode, lattice_bins=lattice_bins)
-    cached = _load_plan_cache(
-        plan_cache_path, cache_fingerprint, len(specs))
+    distributed_receipt = (
+        plan_cache_path is not None and process_count() > 1)
+    cached = (None if distributed_receipt and process_rank() != 0 else
+              _load_plan_cache(
+                  plan_cache_path, cache_fingerprint, len(specs)))
     cache_status = "disabled" if plan_cache_path is None else "hit"
     if cached is not None:
         (fits, free_pairs, required_cost, window_tau_pairs,
@@ -1769,18 +1772,35 @@ def build_delivered_sigma_windows(
         # exact selector below then checks the sum of ACHIEVED costs.  This
         # support-derived ceiling avoids a tolerance sweep while preserving
         # the global delivered-error contract.
-        candidates_by_window = [
-            _candidate_rules(
-                spec, eta, node_ceiling, factor_cap,
-                min(0.5, total_absolute / spec["envelope"]))
-            for spec in specs]
-        fits, free_pairs, required_cost = _select_rules(
-            specs, candidates_by_window, total_absolute, node_ceiling)
-
-        window_tau_pairs = free_pairs
-        _save_plan_cache(
-            plan_cache_path, cache_fingerprint, fits, free_pairs,
-            required_cost, window_tau_pairs)
+        # The measured problems are identical on every process.  Candidate
+        # evaluation is host NumPy, so running it on every rank only makes P
+        # copies contend for one node's CPUs.  With a receipt path, rank 0
+        # plans once, publishes atomically, and the other ranks load the same
+        # bit-identical rules after the barrier.
+        planning_rank = not distributed_receipt or process_rank() == 0
+        if planning_rank:
+            candidates_by_window = [
+                _candidate_rules(
+                    spec, eta, node_ceiling, factor_cap,
+                    min(0.5, total_absolute / spec["envelope"]))
+                for spec in specs]
+            fits, free_pairs, required_cost = _select_rules(
+                specs, candidates_by_window, total_absolute, node_ceiling)
+            window_tau_pairs = free_pairs
+            _save_plan_cache(
+                plan_cache_path, cache_fingerprint, fits, free_pairs,
+                required_cost, window_tau_pairs)
+    if distributed_receipt:
+        barrier("delivered_sigma_plan_receipt")
+        if process_rank() != 0:
+            published = _load_plan_cache(
+                plan_cache_path, cache_fingerprint, len(specs))
+            if published is None or not published[-1]:
+                raise RuntimeError(
+                    "rank 0 did not publish the expected delivered-plan "
+                    f"receipt {plan_cache_path!r}")
+            (fits, free_pairs, required_cost, window_tau_pairs,
+             _fingerprint_match) = published
 
     output = []
     for spec, fit in zip(specs, fits):
