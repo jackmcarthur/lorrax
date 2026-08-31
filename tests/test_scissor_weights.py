@@ -78,6 +78,17 @@ def test_identity_conduction_scissor_preserves_every_energy_bit_exactly():
     assert got is not energies
 
 
+def test_empty_conduction_fit_keeps_tail_at_dft_energy():
+    energies = np.array([
+        [-8.0, -2.0, 1.0, 3.0, 7.0, 11.0],
+        [-7.5, -1.5, 1.5, 4.0, 8.0, 12.0],
+    ], dtype=np.float64)
+    got = apply_conduction_scissor_to_tail(
+        energies, _tail_fit(n_fit_c=0), tail_start=4, logical_stop=6)
+
+    assert np.array_equal(got, energies)
+
+
 def test_affine_conduction_scissor_changes_only_b3_to_b4_user():
     energies = np.arange(16, dtype=np.float64).reshape(2, 8) - 4.0
     got = apply_conduction_scissor_to_tail(
