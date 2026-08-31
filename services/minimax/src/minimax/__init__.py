@@ -230,8 +230,10 @@ _WINDOWED_FIT_NAMES = (
     "PhaseBoundedReciprocalFit", "fit_phase_bounded_candidates",
 )
 _ROQ_FIT_NAMES = (
-    "RoqGroup", "RoqRule", "roq_select_times", "fit_roq_group",
-    "fit_roq_branch", "branch_delivered_error", "branch_noise_gate",
+    "RoqWindow", "RoqGroup", "RoqRule", "RoqBranchEvidence", "RoqPlan",
+    "roq_select_times", "fit_roq_group", "fit_roq_branch",
+    "branch_delivered_error", "branch_noise_gate",
+    "plan_measure_adapted_roq",
 )
 
 

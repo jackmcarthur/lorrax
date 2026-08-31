@@ -28,7 +28,10 @@ reproduces times and weights bit-for-bit.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import os
+import time
 
 import numpy as np
 import scipy.linalg as la
@@ -36,12 +39,56 @@ from scipy.special import roots_legendre
 
 from minimax.reciprocal_fit import (ReciprocalMeasureProblem, delivered_error,
                                     rule_amplification,
+                                    single_core_blas,
                                     solve_fixed_time_weights_fast)
 
 __all__ = [
-    "RoqGroup", "RoqRule", "fit_roq_group", "fit_roq_branch",
-    "roq_select_times", "branch_delivered_error", "branch_noise_gate",
+    "RoqWindow", "RoqGroup", "RoqRule", "RoqBranchEvidence", "RoqPlan",
+    "fit_roq_group", "fit_roq_branch", "roq_select_times",
+    "branch_delivered_error", "branch_noise_gate",
+    "plan_measure_adapted_roq",
 ]
+
+
+# These are production policy, not user dials.  The fixed scan contains the
+# measured Na optimum (-58 degrees) and its -55-degree near miss.  Wider
+# rotations stop at -75 degrees because the contour then grows on common
+# valence supports.  Claim 522 is the provenance for this grid.
+_ANGLE_SCAN_DEG = (0.0, -55.0, -58.0, -65.0, -75.0)
+_ANGLE_PROBE_RANK = 12
+_ANGLE_BASE_NODES = 64
+_MIN_RANK = 6
+_MAX_RANK = 64
+_FINAL_BASE_NODES = 192
+
+# The ROQ study used horizons 260/85/27 Ry^-1 for the Na resonant/tail/valence
+# groups.  Five inverse low-percentile energy scales reproduces 249/83/31 on
+# the frozen measures.  The 0.01% quantile ignores only negligible delivered
+# mass; eta remains the hard lower energy scale.
+_HORIZON_DECAY_LENGTHS = 5.0
+_HORIZON_MASS_QUANTILE = 1.0e-4
+
+_NOISE_FLOOR = 6.0e-8
+_NOISE_SHARE = 0.05
+_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+
+@dataclass(frozen=True)
+class RoqWindow:
+    """One product window supplied to the production ROQ planner.
+
+    ``fit`` selects nodes and weights.  ``validation`` is the refined
+    lattice used for every acceptance decision.  ``target`` is the window's
+    apportioned relative delivered-error budget.  ``branch`` and ``sigma``
+    group windows that may share one causal rule.
+    """
+
+    name: str
+    fit: ReciprocalMeasureProblem
+    validation: ReciprocalMeasureProblem
+    target: float
+    branch: str
+    sigma: int
 
 
 @dataclass(frozen=True)
@@ -71,6 +118,35 @@ class RoqRule:
     kappa_p99: float
     kappa_max: float
     singular_ratio: float
+    angle_deg: float = 0.0
+    horizon: float = 0.0
+    windows: tuple[str, ...] = ()
+    target_met: bool = True
+    noise_passed: bool = True
+    search_evaluations: int = 0
+
+
+@dataclass(frozen=True)
+class RoqBranchEvidence:
+    """Validation evidence for the rules selected for one causal branch."""
+
+    branch: str
+    strategy: str
+    target: float
+    max_error: float
+    kappa_p99: float
+    noise_passed: bool
+    node_count: int
+    window_errors: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True)
+class RoqPlan:
+    """Selected rules and refined-lattice evidence from one planner call."""
+
+    rules: tuple[RoqRule, ...]
+    branches: tuple[RoqBranchEvidence, ...]
+    planning_seconds: float
 
 
 def _candidates(group: RoqGroup, base_nodes: int):
@@ -141,32 +217,90 @@ def roq_select_times(group: RoqGroup, rank: int, *, base_nodes: int = 0,
 
 
 def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
-           ratio: float) -> RoqRule:
+           ratio: float, *, windows: tuple[str, ...] = (),
+           target: float = np.inf, evaluations: int = 0) -> RoqRule:
     error, _ = delivered_error(group.validation, times, weights)
     p99, peak = rule_amplification(times, weights, group.validation)
+    passed = p99 * _NOISE_FLOOR <= _NOISE_SHARE * float(target)
     return RoqRule(group.name, times, weights, rank, float(np.max(error)),
-                   float(p99), float(peak), ratio)
+                   float(p99), float(peak), ratio, group.angle_deg,
+                   group.horizon, windows, float(np.max(error)) <= target,
+                   passed, evaluations)
+
+
+def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
+                  windows: tuple[str, ...] = (), quick: bool = False,
+                  evaluations: int = 0) -> RoqRule:
+    """Fit and validate one rank from an already built snapshot basis."""
+    times, ratio = _select_prepared(*prepared, rank, group.name)
+    weights, _ = solve_fixed_time_weights_fast(
+        group.fit, times,
+        iterations=16 if quick else 45,
+        stall_iterations=3 if quick else 5,
+        conditioning_pass=not quick)
+    return _score(group, times, weights, rank, ratio, windows=windows,
+                  target=target, evaluations=evaluations)
 
 
 def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
-                  base_nodes: int = 0) -> RoqRule:
-    """First rank whose IRLS-refit rule meets ``target`` on validation.
+                  base_nodes: int = 0,
+                  windows: tuple[str, ...] = ()) -> RoqRule:
+    """Find the smallest passing rank by bisection on one snapshot basis.
 
-    Returns the best rule found even on a miss — check ``max_error``.
+    Search fits use a short deterministic IRLS solve.  The chosen rank is
+    refit with the full production settings and accepted only from
+    ``group.validation``.  If the final solve misses, larger ranks are tried;
+    a complete miss returns the best measured rule with ``target_met=False``.
     """
-    ranks = list(ranks) if ranks is not None else list(range(6, 65, 2))
+    ranks = sorted(set(int(rank) for rank in (
+        ranks if ranks is not None else range(_MIN_RANK, _MAX_RANK + 1))))
+    if not ranks or ranks[0] < 1:
+        raise ValueError("ranks must contain positive integers")
     base_nodes = int(base_nodes) or max(4 * max(ranks), 96)
     prepared = _prepare_subspace(group, base_nodes, max(ranks))
+    cache = {}
+
+    def probe(index: int) -> RoqRule:
+        rank = ranks[index]
+        if rank not in cache:
+            cache[rank] = _fit_prepared(
+                group, prepared, rank, target=target, windows=windows,
+                quick=True, evaluations=len(cache) + 1)
+        return cache[rank]
+
+    # The error curve is generally decreasing.  Bisection cuts the old
+    # 363-prefix scan to O(log N); checking the two lower neighbours catches
+    # the small QDEIM pivot non-monotonicity seen in the study.
+    lo, hi = -1, len(ranks) - 1
+    if not probe(hi).target_met:
+        final = _fit_prepared(
+            group, prepared, ranks[hi], target=target, windows=windows,
+            evaluations=len(cache))
+        return final
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        rule = probe(mid)
+        if rule.target_met:
+            hi = mid
+        else:
+            lo = mid
+    first = max(0, hi - 2)
+    passing = [i for i in range(first, hi + 1) if probe(i).target_met]
+    chosen = min(passing) if passing else hi
+
     best = None
-    for rank in ranks:
-        times, ratio = _select_prepared(*prepared, rank, group.name)
-        weights, _ = solve_fixed_time_weights_fast(
-            group.fit, times, iterations=55, stall_iterations=6)
-        rule = _score(group, times, weights, rank, ratio)
-        if best is None or rule.max_error < best.max_error:
-            best = rule
-        if rule.max_error <= float(target):
-            return rule
+    for index in range(chosen, len(ranks)):
+        final = _fit_prepared(
+            group, prepared, ranks[index], target=target, windows=windows,
+            evaluations=len(cache))
+        if best is None or final.max_error < best.max_error:
+            best = final
+        if final.target_met and final.noise_passed:
+            return final
+        # A quick probe that was optimistic normally needs one extra rank;
+        # keep the refusal bounded if the full fit reveals a broader miss.
+        if index >= chosen + 3:
+            break
     return best
 
 
@@ -261,3 +395,356 @@ def fit_roq_branch(groups, start_rules, *, iterations: int = 60,
              for group, rule, pack, y in zip(groups, start_rules, packs,
                                              best_coeff)]
     return rules, branch_delivered_error(groups, rules)
+
+
+def _merge_problems(windows, which: str) -> ReciprocalMeasureProblem:
+    """Concatenate product-window cells without changing their masses."""
+    problems = [getattr(window, which) for window in windows]
+    first = problems[0]
+    for problem in problems[1:]:
+        if not np.array_equal(problem.frequencies, first.frequencies):
+            raise ValueError("consolidated ROQ windows need identical frequencies")
+        if (problem.excluded_radius != first.excluded_radius
+                or problem.normalization_floor != first.normalization_floor
+                or problem.zero_weight_sum != first.zero_weight_sum):
+            raise ValueError(
+                "consolidated ROQ windows need identical measure options")
+    return ReciprocalMeasureProblem(
+        first.frequencies,
+        np.concatenate([problem.internal_sums for problem in problems]),
+        np.concatenate([problem.cell_masses for problem in problems]),
+        excluded_radius=first.excluded_radius,
+        normalization_floor=first.normalization_floor,
+        zero_weight_sum=first.zero_weight_sum)
+
+
+def _merged_group(windows, name: str, angle: float, horizon: float) -> RoqGroup:
+    sigmas = {window.sigma for window in windows}
+    if sigmas - {-1, 1} or len(sigmas) != 1:
+        raise ValueError("one ROQ group needs one half-plane sign, +1 or -1")
+    return RoqGroup(name, _merge_problems(windows, "fit"),
+                    _merge_problems(windows, "validation"), sigmas.pop(),
+                    angle, horizon)
+
+
+def _combined_target(windows, which: str = "validation") -> float:
+    """Branch budget implied by the windows' apportioned targets."""
+    delivered = []
+    for window in windows:
+        problem = getattr(window, which)
+        _, mass, _ = problem.retained()
+        delivered.append(mass)
+    delivered = np.asarray(delivered)
+    target = np.asarray([window.target for window in windows])[:, None]
+    return float(np.max(np.sum(target * delivered, axis=0)
+                        / np.sum(delivered, axis=0)))
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray,
+                       quantile: float) -> float:
+    order = np.argsort(values, kind="stable")
+    cumulative = np.cumsum(weights[order])
+    index = np.searchsorted(cumulative, float(quantile) * cumulative[-1])
+    return float(values[order[min(index, order.size - 1)]])
+
+
+def _derive_horizon(problem: ReciprocalMeasureProblem, eta: float) -> float:
+    d = problem.denominators
+    magnitude = np.abs(d).ravel()
+    mass = np.broadcast_to(problem.cell_masses, d.shape).ravel() / magnitude
+    scale = _weighted_quantile(magnitude, mass, _HORIZON_MASS_QUANTILE)
+    return _HORIZON_DECAY_LENGTHS / max(float(eta), scale)
+
+
+def _angle_decays(group: RoqGroup, angle: float) -> bool:
+    contour = np.exp(1j * np.deg2rad(float(angle)))
+    rate = np.imag(group.sigma * contour * group.fit.denominators)
+    return bool(np.min(rate) > 0.0)
+
+
+def _probe_angle(group: RoqGroup, angle: float, target: float,
+                 windows: tuple[str, ...]) -> tuple[RoqGroup, RoqRule] | None:
+    candidate = RoqGroup(group.name, group.fit, group.validation, group.sigma,
+                         angle, group.horizon)
+    if not _angle_decays(candidate, angle):
+        return None
+    prepared = _prepare_subspace(candidate, _ANGLE_BASE_NODES,
+                                 _ANGLE_PROBE_RANK)
+    times, ratio = _select_prepared(*prepared, _ANGLE_PROBE_RANK,
+                                    candidate.name)
+    weights, _ = solve_fixed_time_weights_fast(
+        candidate.fit, times, iterations=10, stall_iterations=2,
+        conditioning_pass=False)
+    rule = _score(candidate, times, weights, _ANGLE_PROBE_RANK, ratio,
+                  windows=windows, target=target)
+    return candidate, rule
+
+
+def _product_group_seed(windows, eta: float):
+    """Build one angle-free group and its derived target and horizon."""
+    names = tuple(window.name for window in windows)
+    label = "+".join(names)
+    target = _combined_target(windows)
+    seed = _merged_group(windows, label, 0.0, 1.0)
+    horizon = _derive_horizon(seed.fit, eta)
+    seed = RoqGroup(seed.name, seed.fit, seed.validation, seed.sigma,
+                    0.0, horizon)
+    return seed, target, names
+
+
+def _fit_production_rank(group: RoqGroup, target: float,
+                         windows: tuple[str, ...],
+                         angle_probe: RoqRule) -> RoqRule:
+    """Bracket from the angle probe, test one midpoint, and fully refit."""
+    prepared = _prepare_subspace(group, _FINAL_BASE_NODES, _MAX_RANK)
+    cache = {}
+
+    def quick(rank: int) -> RoqRule:
+        rank = int(rank)
+        if rank not in cache:
+            cache[rank] = _fit_prepared(
+                group, prepared, rank, target=target, windows=windows,
+                quick=True, evaluations=len(cache) + 1)
+        return cache[rank]
+
+    lower = _MIN_RANK
+    upper = _ANGLE_PROBE_RANK
+    if not angle_probe.target_met or not quick(upper).target_met:
+        lower = upper
+        for candidate in (18, 27, 40, 60, _MAX_RANK):
+            upper = candidate
+            if quick(upper).target_met:
+                break
+            lower = upper
+        else:
+            return _fit_prepared(
+                group, prepared, _MAX_RANK, target=target, windows=windows,
+                evaluations=len(cache))
+    midpoint = (lower + upper) // 2
+    if lower < midpoint < upper and quick(midpoint).target_met:
+        upper = midpoint
+
+    best = None
+    for rank in range(upper, min(_MAX_RANK, upper + 3) + 1):
+        final = _fit_prepared(
+            group, prepared, rank, target=target, windows=windows,
+            evaluations=len(cache))
+        if best is None or final.max_error < best.max_error:
+            best = final
+        if final.target_met and final.noise_passed:
+            return final
+    return best
+
+
+def _fit_product_groups(subsets, eta: float):
+    """Fit independent product groups through one bounded CPU work pool."""
+    records = []
+    for key, windows in subsets.items():
+        seed, target, names = _product_group_seed(windows, eta)
+        records.append((key, seed, target, names))
+
+    jobs = [(key, seed, target, names, angle)
+            for key, seed, target, names in records
+            for angle in _ANGLE_SCAN_DEG]
+    with single_core_blas(), ThreadPoolExecutor(
+            max_workers=_MAX_WORKERS) as executor:
+        results = list(executor.map(
+            lambda job: (job[0], _probe_angle(
+                job[1], job[4], job[2], job[3])), jobs))
+        probes_by_key = {key: [] for key in subsets}
+        for key, probe in results:
+            if probe is not None:
+                probes_by_key[key].append(probe)
+
+        selected = {}
+        for key, probes in probes_by_key.items():
+            if not probes:
+                label = "+".join(window.name for window in subsets[key])
+                raise ValueError(
+                    f"group {label!r}: atoms grow at every production "
+                    "contour angle")
+            selected[key] = min(probes, key=lambda item: (
+                item[1].max_error, item[1].kappa_p99,
+                _ANGLE_SCAN_DEG.index(item[0].angle_deg)))
+
+        fitted = list(executor.map(
+            lambda record: (
+                record[0],
+                selected[record[0]][0],
+                _fit_production_rank(
+                    selected[record[0]][0], record[2], record[3],
+                    selected[record[0]][1])),
+            records))
+    return {key: (group, rule) for key, group, rule in fitted}
+
+
+def _fit_product_group(windows, eta: float) -> tuple[RoqGroup, RoqRule]:
+    """Derive contour and rank for one product group."""
+    return _fit_product_groups({(0,): tuple(windows)}, eta)[(0,)]
+
+
+def _try_whole_below(windows, eta: float, node_cap: int):
+    """Test a whole-branch rule only where it can beat the fallback."""
+    seed, target, names = _product_group_seed(windows, eta)
+    angles = tuple(angle for angle in _ANGLE_SCAN_DEG if angle < 0.0
+                   and _angle_decays(seed, angle))
+    if not angles:
+        return None
+    with single_core_blas(), ThreadPoolExecutor(
+            max_workers=_MAX_WORKERS) as executor:
+        probes = list(executor.map(
+            lambda angle: _probe_angle(seed, angle, target, names),
+            angles))
+    probes = [probe for probe in probes if probe is not None]
+    if not probes:
+        return None
+    group, _ = min(probes, key=lambda item: (
+        item[1].max_error, item[1].kappa_p99,
+        _ANGLE_SCAN_DEG.index(item[0].angle_deg)))
+    cap = max(_MIN_RANK, min(int(node_cap), _MAX_RANK))
+    base_nodes = max(_ANGLE_BASE_NODES, 3 * cap)
+    prepared = _prepare_subspace(group, base_nodes, cap)
+    cap_rule = _fit_prepared(group, prepared, cap, target=target,
+                             windows=names)
+    if not (cap_rule.target_met and cap_rule.noise_passed):
+        return group, cap_rule
+    rule = fit_roq_group(group, target, ranks=range(_MIN_RANK, cap + 1),
+                         base_nodes=base_nodes, windows=names)
+    return group, rule
+
+
+def _decay_partition(windows) -> tuple[tuple[int, ...], ...]:
+    """Group windows that can share at least one rotated decaying contour."""
+    signatures = {True: [], False: []}
+    for index, window in enumerate(windows):
+        group = _merged_group([window], window.name, 0.0, 1.0)
+        valid = tuple(angle for angle in _ANGLE_SCAN_DEG
+                      if _angle_decays(group, angle))
+        signatures[any(angle < 0.0 for angle in valid)].append(index)
+    return tuple(tuple(indices) for indices in signatures.values() if indices)
+
+
+def _branch_evidence(branch: str, strategy: str, windows, groups,
+                     rules) -> RoqBranchEvidence | None:
+    target = _combined_target(windows)
+    error = branch_delivered_error(groups, rules)
+    passed, kappa = branch_noise_gate(groups, rules, target)
+    window_errors = []
+    for window in windows:
+        rule = next(rule for rule in rules if window.name in rule.windows)
+        value, _ = delivered_error(window.validation, rule.times, rule.weights)
+        window_errors.append((window.name, float(np.max(value))))
+    evidence = RoqBranchEvidence(
+        branch, strategy, target, float(np.max(error)), kappa,
+        bool(passed and all(rule.noise_passed for rule in rules)),
+        int(sum(rule.rank for rule in rules)), tuple(window_errors))
+    if evidence.max_error > target or not evidence.noise_passed:
+        return None
+    return evidence
+
+
+def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
+    """Build the smallest validated product-window ROQ plan.
+
+    Parameters
+    ----------
+    windows
+        Per-window fit and refined-validation measures, apportioned targets,
+        branch labels, and half-plane signs as :class:`RoqWindow` objects.
+    eta
+        Physical broadening in the same energy unit as the measures.  It is
+        the only contour-scale input; angle, horizon, and rank are derived.
+
+    Returns
+    -------
+    RoqPlan
+        Rules and achieved refined-lattice evidence.  Whole-branch rules are
+        tried first.  A decay-compatible product-window partition and then
+        individual product windows are fallbacks; no explicit ``(n,p)`` pair
+        evaluator exists.  If none passes, this function refuses.
+    """
+    started = time.perf_counter()
+    windows = tuple(windows)
+    if not windows:
+        raise ValueError("ROQ planning needs at least one product window")
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("eta must be positive and finite")
+    for window in windows:
+        if not np.isfinite(window.target) or window.target <= 0.0:
+            raise ValueError(f"window {window.name!r} needs a positive target")
+
+    by_branch = {}
+    for window in windows:
+        by_branch.setdefault(window.branch, []).append(window)
+
+    branch_data = {}
+    initial_subsets = {}
+    for branch, branch_windows_list in by_branch.items():
+        branch_windows = tuple(branch_windows_list)
+        all_indices = tuple(range(len(branch_windows)))
+        partition = _decay_partition(branch_windows)
+        strategy = ("whole_branch" if partition == (all_indices,)
+                    else "decay_compatible")
+        for indices in partition:
+            key = (branch, indices)
+            initial_subsets[key] = tuple(
+                branch_windows[i] for i in indices)
+        branch_data[branch] = (branch_windows, all_indices, strategy,
+                               partition)
+
+    group_cache = _fit_product_groups(initial_subsets, eta)
+    selected_rules = []
+    evidence_rows = []
+    for branch, data in branch_data.items():
+        branch_windows, all_indices, strategy, partition = data
+        candidates = []
+        groups = [group_cache[(branch, indices)][0]
+                  for indices in partition]
+        rules = [group_cache[(branch, indices)][1]
+                 for indices in partition]
+        row = _branch_evidence(branch, strategy, branch_windows,
+                               groups, rules)
+        if row is not None:
+            candidates.append((row, tuple(rules)))
+
+        if partition != (all_indices,):
+            cap = (row.node_count - 1) if row is not None else _MAX_RANK
+            whole = _try_whole_below(branch_windows, eta, cap)
+            if whole is not None:
+                whole_group, whole_rule = whole
+                whole_row = _branch_evidence(
+                    branch, "whole_branch", branch_windows,
+                    [whole_group], [whole_rule])
+                if whole_row is not None:
+                    candidates.append((whole_row, (whole_rule,)))
+
+        # Individual product windows are a refusal fallback, not prepaid
+        # alternatives.  Consolidated winners are already no less accurate;
+        # fitting every legacy window made the first Na prototype 61 s.
+        if not candidates:
+            partition = tuple((i,) for i in range(len(branch_windows)))
+            missing = {
+                (branch, indices): tuple(branch_windows[i] for i in indices)
+                for indices in partition
+                if (branch, indices) not in group_cache}
+            if missing:
+                group_cache.update(_fit_product_groups(missing, eta))
+            groups = [group_cache[(branch, indices)][0]
+                      for indices in partition]
+            rules = [group_cache[(branch, indices)][1]
+                     for indices in partition]
+            row = _branch_evidence(branch, "per_window", branch_windows,
+                                   groups, rules)
+            if row is not None:
+                candidates.append((row, tuple(rules)))
+        if not candidates:
+            raise RuntimeError(
+                f"branch {branch!r}: no product-window ROQ plan meets the "
+                "refined delivered-error and noise gates")
+        row, rules = min(candidates, key=lambda item: (
+            item[0].node_count, item[0].max_error, item[0].strategy))
+        selected_rules.extend(rules)
+        evidence_rows.append(row)
+
+    return RoqPlan(tuple(selected_rules), tuple(evidence_rows),
+                   time.perf_counter() - started)
