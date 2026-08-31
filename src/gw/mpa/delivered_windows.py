@@ -1507,19 +1507,38 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
 
 
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
-                      relative_target):
+                      relative_target, *, adapted_only=False):
     """Rules for one window: rotated ROQ if it crosses, else shipped lookup.
 
     The single routing decision, at module level so the planner, the tests and
     the offline node audit all take the same path.
     """
+    adapted = None
     if spec["kind"] == "crossing":
         adapted = _roq_crossing_candidate(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
-        if adapted is not None:
-            return [adapted]
-    return _candidate_rules(
-        spec, eta, max_nodes, factor_growth_cap, relative_target)
+    if adapted is not None and adapted_only:
+        # First pass: the cheap rule alone.  Fitting the shipped crossing
+        # rule as well costs seconds per window and is only needed when the
+        # GLOBAL budget cannot be met from cheap rules, which the caller
+        # discovers by retrying.  Planning was 66 s of an 85 s stage before
+        # this split.
+        return [adapted]
+    try:
+        shipped = _candidate_rules(
+            spec, eta, max_nodes, factor_growth_cap, relative_target)
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError,
+            np.linalg.LinAlgError):
+        if adapted is None:
+            raise
+        shipped = []
+    # BOTH are offered to the exact selector, cheapest first.  The adapted
+    # rule is usually far cheaper in nodes, but a window's own allowance is
+    # not the whole story: the selector minimises nodes subject to the GLOBAL
+    # delivered-error budget, and sometimes it must buy a more accurate rule
+    # in one window to afford the plan.  Offering only the cheap rule made a
+    # real deck refuse at 4.6% over budget with no alternative to pick.
+    return ([adapted] + shipped) if adapted is not None else shipped
 
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
@@ -1893,16 +1912,45 @@ def build_delivered_sigma_windows(
         # exact selector below then checks the sum of ACHIEVED costs.  This
         # support-derived ceiling avoids a tolerance sweep while preserving
         # the global delivered-error contract.
-        candidates_by_window = [
-            window_candidates(
-                spec, eta, pair_ceiling, factor_cap,
-                min(0.5, total_absolute / spec["envelope"]))
-            for spec in specs]
-        specs, candidates_by_window = _consolidate_branches(
-            specs, candidates_by_window, eta, pair_ceiling, factor_cap,
-            total_absolute)
-        fits, free_pairs, required_cost = _select_rules(
-            specs, candidates_by_window, total_absolute, pair_ceiling)
+        # The adapted (rotated) rule per window is fitted ONCE and reused.
+        # Pass 1 offers only those, which is what closes the budget on every
+        # deck measured so far; pass 2 adds the shipped candidates for the
+        # selector to buy accuracy where the global budget needs it.  Fitting
+        # the shipped crossing rule up front cost ~1 s per window for nothing,
+        # and refitting the adapted rule on retry cost far more (132 s vs 85 s
+        # measured on the Na deck), so both are avoided here.
+        allowances = [min(0.5, total_absolute / spec["envelope"])
+                      for spec in specs]
+        adapted_cache = [
+            _roq_crossing_candidate(spec, eta, pair_ceiling, factor_cap,
+                                    allowance)
+            if spec["kind"] == "crossing" else None
+            for spec, allowance in zip(specs, allowances)]
+        base_specs = specs
+        fits = None
+        for adapted_only in (True, False):
+            specs = base_specs
+            candidates_by_window = []
+            for spec, allowance, adapted in zip(base_specs, allowances,
+                                                adapted_cache):
+                if adapted is not None and adapted_only:
+                    candidates_by_window.append([adapted])
+                    continue
+                shipped = _candidate_rules(
+                    spec, eta, pair_ceiling, factor_cap, allowance)
+                candidates_by_window.append(
+                    ([adapted] + shipped) if adapted is not None else shipped)
+            specs, candidates_by_window = _consolidate_branches(
+                specs, candidates_by_window, eta, pair_ceiling, factor_cap,
+                total_absolute)
+            try:
+                fits, free_pairs, required_cost = _select_rules(
+                    specs, candidates_by_window, total_absolute, pair_ceiling)
+                break
+            except RuntimeError:
+                if not adapted_only:
+                    raise      # the shipped rules could not close it either
+        del base_specs
 
         window_tau_pairs = free_pairs
         _save_plan_cache(
