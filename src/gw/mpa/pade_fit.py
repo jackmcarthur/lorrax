@@ -489,6 +489,30 @@ def _loewner_pencil(w, x_hat, n):
     return L, sL
 
 
+def _equilibrate_loewner_pencil(L, sL):
+    """Scale Loewner rows and columns before the small SVD solve.
+
+    The same nonsingular diagonal factors multiply both members of the
+    pencil, so its generalized eigenvalues do not change.  Rows of ``L``
+    are first scaled to unit 2-norm, then its columns are scaled to unit
+    2-norm.  Applying the identical factors to ``sL`` keeps the pencil
+    equivalent while removing sample-amplitude scale from the matrix that
+    is inverted.  Zero rows or columns retain a scale of one and remain
+    visible to the rank-revealing SVD.
+    """
+
+    row_norm = jnp.linalg.norm(L, axis=1)
+    row_scale = 1.0 / jnp.where(row_norm > 0, row_norm, 1.0)
+    L_eq = row_scale[:, None].astype(L.dtype) * L
+    sL_eq = row_scale[:, None].astype(sL.dtype) * sL
+
+    col_norm = jnp.linalg.norm(L_eq, axis=0)
+    col_scale = 1.0 / jnp.where(col_norm > 0, col_norm, 1.0)
+    L_eq = L_eq * col_scale[None, :].astype(L.dtype)
+    sL_eq = sL_eq * col_scale[None, :].astype(sL.dtype)
+    return L_eq, sL_eq
+
+
 def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     """Poles of the Loewner interpolant, in the ``b_hat = x/x_max`` plane.
 
@@ -507,6 +531,7 @@ def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     """
 
     L, sL = _loewner_pencil(w, x_hat, n)
+    L, sL = _equilibrate_loewner_pencil(L, sL)
     u, s, vh = jnp.linalg.svd(L, full_matrices=False)
     s_max = s[0]
     s_min = s[-1]

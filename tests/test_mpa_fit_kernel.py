@@ -232,6 +232,31 @@ def test_default_solve_is_explicit_loewner_bit_for_bit():
         np.testing.assert_array_equal(implicit[2][key], explicit[2][key])
 
 
+def test_loewner_equilibration_preserves_pencil_spectrum():
+    """Diagonal pencil scaling improves the solve without moving poles."""
+
+    L = np.asarray([
+        [1.0e-8, 2.0e-5, 3.0e-2],
+        [2.0e-6, 5.0e-3, 7.0],
+        [4.0e-4, 8.0e-1, 9.0e2],
+    ], dtype=np.complex128)
+    sL = np.asarray([
+        [3.0e-8 - 1.0e-9j, 4.0e-5, 2.0e-2],
+        [1.0e-6, 7.0e-3 - 2.0e-4j, 5.0],
+        [6.0e-4, 3.0e-1, 8.0e2 - 3.0e1j],
+    ], dtype=np.complex128)
+    L_eq, sL_eq = pade_fit._equilibrate_loewner_pencil(
+        jnp.asarray(L), jnp.asarray(sL))
+    L_eq, sL_eq = np.asarray(L_eq), np.asarray(sL_eq)
+
+    before = np.linalg.eigvals(np.linalg.solve(L, sL))
+    after = np.linalg.eigvals(np.linalg.solve(L_eq, sL_eq))
+    before = before[np.lexsort((before.imag, before.real))]
+    after = after[np.lexsort((after.imag, after.real))]
+    np.testing.assert_allclose(after, before, rtol=2e-10, atol=2e-10)
+    assert np.linalg.cond(L_eq) < 0.1 * np.linalg.cond(L)
+
+
 def test_leon_np15_qpps_fractions_are_the_yambo_integer_construction():
     expected = tuple(Fraction(k, 16) for k in range(13)) + (
         Fraction(14, 16), Fraction(1))
