@@ -2315,9 +2315,22 @@ def build_delivered_sigma_windows(
                     # tighter only if the shipped path is asked again at the
                     # tightened allowance; asking the adapted path alone
                     # leaves exactly those windows at their loose rules.
-                    return _window_candidates_profiled(
-                        base_specs[index], eta, pair_ceiling, factor_cap,
-                        tightened[index], adapted_only=False)
+                    #
+                    # A window that cannot meet the TIGHTENED allowance is not
+                    # a failure: its loose rule is still in the candidate list
+                    # below, and the selector may not have needed this window
+                    # to give anything up.  Refusing here aborts a plan that
+                    # the looser rules can still close (measured: SC map 1
+                    # died on 'cond:pole_tail' at residual 1.38e-4 while the
+                    # base plan held a rule for it).
+                    try:
+                        return _window_candidates_profiled(
+                            base_specs[index], eta, pair_ceiling, factor_cap,
+                            tightened[index], adapted_only=False)
+                    except (RuntimeError, ValueError, FloatingPointError,
+                            OverflowError, np.linalg.LinAlgError):
+                        return [], {"adapted_fit_seconds": 0.0,
+                                    "shipped_fallback_seconds": 0.0}
 
                 fit_started = time.perf_counter()
                 tight_candidates, tight_rows = _run_parallel_planner_jobs(
