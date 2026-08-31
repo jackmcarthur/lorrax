@@ -2502,7 +2502,24 @@ def build_delivered_sigma_windows(
             "fit_provenance": fit["evidence"]["provenance"],
         })
 
+    # Consolidation merges windows AFTER the branch reports recorded their
+    # plan slices, so plan_start/plan_stop describe the pre-merge plan and
+    # address the wrong rows the moment a merge fires.  Measured: a two-branch
+    # plan whose conduction windows merged reported branch 0 as plan[0:2] --
+    # picking up the NEXT branch's row, 35 nodes against its own 28 -- and
+    # branch 1 as plan[2:3], past the end and empty.  The same slices feed the
+    # distinct-tau count below, so that was wrong too whenever a deck merged.
+    # Recompute them from the plan that actually shipped.
+    report_positions = {}
+    for position, spec in enumerate(specs):
+        report_positions.setdefault(id(spec["branch_report"]), []).append(
+            position)
     for report in branch_reports:
+        positions = report_positions.get(id(report), [])
+        report["plan_start"] = positions[0] if positions else len(output)
+        report["plan_stop"] = (positions[-1] + 1 if positions
+                               else report["plan_start"])
+        report["window_count"] = len(positions)
         report["node_count"] = sum(
             row["node_count"] for row in report["windows"])
     distinct_tau_count = sum(len({
