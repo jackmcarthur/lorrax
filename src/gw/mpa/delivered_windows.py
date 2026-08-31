@@ -1883,14 +1883,12 @@ def build_delivered_sigma_windows(
     use_shipped_minimax_tables: bool = True,
     pane_times: tuple = (),
     tau_grid_mode: str = "free",
-    max_direct_terms: int = 32,
     measures_by_branch=None,
     mesh_xy=None,
     plan_cache_path=None,
     plan_cache_request_fingerprint=None,
 ):
     """Build the owner-specified product-window delivered Sigma plan."""
-    del max_direct_terms
     started = time.perf_counter()
     branch_rows = list(branches)
     omega_grid = np.asarray(omega_grid_ry, dtype=np.float64)
@@ -2317,7 +2315,6 @@ def build_delivered_sigma_windows(
         "n_tau": window_tau_pairs,
         "window_tau_pairs": window_tau_pairs,
         "distinct_tau_count": distinct_tau_count,
-        "direct_term_count": 0,
         "plan_seconds": plan_seconds,
         "planning_profile_seconds": {
             "census": census_seconds,

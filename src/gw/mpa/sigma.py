@@ -89,7 +89,6 @@ def _require_product_plan(plan, geometry=None, *, receipt_path=None):
         for row in plan)
     recorded_rows = 0
     if geometry is not None:
-        recorded_rows += int(geometry.get("direct_term_count", 0))
         recorded_rows += sum(
             int(branch.get("direct_term_count", 0))
             for branch in geometry.get("branches", ()))
@@ -489,7 +488,6 @@ def compute_sigma_c_mpa_omega_grid(
                     # fingerprint.  It is immutable receipt-schema salt, not
                     # a planner argument or execution limit; keeping it lets
                     # certified product-only receipts survive the deletion.
-                    "max_direct_terms": 32,
                     "edge_factor": edge_factor,
                     "pole_batch_size": pole_batch_size,
                 })
