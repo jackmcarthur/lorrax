@@ -10,12 +10,17 @@ self-consistent output path and requires a full P=4 Na validation.
   guards and their two documentation restrictions atomically.
 - CPU evidence: the exact campaign CPU environment ran
   `tests/test_fixed_sigma_evsc.py`, `tests/test_sigma_result_basis.py`,
-  `tests/test_qp_solver_config.py`, and `tests/test_layering.py`: **150
-  passed, 1 skipped** in 78.14 s.  A separate four-logical-device CPU
+  `tests/test_qp_solver_config.py`, and `tests/test_layering.py`: **151
+  passed, 1 skipped** in 77.17 s.  A separate four-logical-device CPU
   execution of
   `test_full_sigma_cube_rotation_stays_two_axis_sharded_on_p4` passed in
-  1.91 s; it matched the explicit host `U C U†` transform and retained
+  1.71 s; it matched the explicit host `U C U†` transform and retained
   `P(None,None,'x','y')`.
+- CUDA P=4 kernel evidence: JID 57754440, step 71, nid001033, source
+  `b82bf168`, four ranks/four devices.  The row-scanned output kept
+  `P(None,None,'x','y')` and matched the corresponding host tiles with
+  max absolute error `9.1551e-16`.  Evidence:
+  `runs/Na/02_soc48b_qsgw_mpa/60_sc_delivered_20260831/codex_qsgwdyn_probe/rotation_p4.log`.
 - P=4 Na evidence, SC convergence, planner costs, artifact checker, and
   fixed-point diagonal comparison: pending.
 
