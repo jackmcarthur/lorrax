@@ -575,35 +575,46 @@ def _solve_occupation_state(
     legitimately need it: the map input (chi/head/Sigma) and F(H)'s candidate
     output (the no-lag valence anchor).
     """
-    # ``occ_broadening`` is the DIAL (0 ⇒ step occupations, historical path
-    # untouched); ``config.occ_broadening_ry`` is the WIDTH.  They are the
-    # same key on an insulating deck and cross-checked on a metal one.
+    # ``occ_broadening`` is the head DIAL (0 means the historical insulating
+    # path).  A declared MPA metal still needs the fixed-N state when the
+    # head is off: chi, Sigma and the Fermi reference consume it.  The
+    # physical WIDTH is the single ``config.occ_broadening_ry`` value.
     width_ev = float(inputs.config.screening.occ_broadening_ev)
     pt = getattr(inputs, "parallel_transport", None)
-    if width_ev == 0.0 or pt is None:
+    metal = _material_class(inputs) == "metal"
+    if not metal and (width_ev == 0.0 or pt is None):
         return None
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     if energies.ndim != 2:
         raise ValueError(
             f"QSGW head occupation energies must be (nk,nb), got {energies.shape}.")
-    nb_logical = int(pt.nb_logical)
-    # The velocity is the one large dataset BOTH head modes carry; the
-    # finite links are absent under sc_head_update = dft_velocity.  They are
-    # written with identical shape, so the storage width is unchanged.
-    nb_storage = int(pt.velocity_dft_cart.shape[-1])
+    if pt is None:
+        # Head-off MPA metal: the current DFT/QP energy ladder is already the
+        # canonical body carrier.  No padding or velocity-storage width
+        # exists, so solve every band in that ladder directly.
+        nb_logical = int(energies.shape[1])
+        nb_storage = nb_logical
+    else:
+        nb_logical = int(pt.nb_logical)
+        # The velocity is the one large dataset BOTH head modes carry; the
+        # finite links are absent under sc_head_update = dft_velocity.  They
+        # are written with identical shape, so the storage width is unchanged.
+        nb_storage = int(pt.velocity_dft_cart.shape[-1])
     if not (0 < nb_logical <= nb_storage <= int(energies.shape[1])):
         raise ValueError(
             "QSGW head occupation manifold must satisfy 0 < logical <= "
             f"storage <= energy bands; got {nb_logical}, {nb_storage}, "
             f"{energies.shape[1]}.")
 
-    from psp.get_DFT_mtxels import spin_degeneracy_factor
     from .efermi import assert_fixed_n, solve_mp1_occupations
 
     nk = int(energies.shape[0])
     kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
-    capacity = float(spin_degeneracy_factor(inputs.wfn))
+    # WfnLoader owns this value.  Importing the full pseudopotential CLI only
+    # to read the same attribute pulled XML parser dependencies into the SC
+    # map and obscured that this is immutable WFN provenance.
+    capacity = float(inputs.wfn.occupation_state_capacity)
     target_electrons = float(inputs.wfn.num_electrons)
     width_ry = inputs.config.occ_broadening_ry
     mu_ry, occ_logical = solve_mp1_occupations(
@@ -644,6 +655,11 @@ def _solve_head_occupations(
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     pt = inputs.parallel_transport
+    if pt is None:
+        # A head-off MPA metal still needs the occupation state for chi,
+        # Sigma and its fixed-N Fermi reference.  It has no velocity carrier
+        # and therefore no Drude surface table to construct.
+        return occ_state, None
     nb_logical = int(pt.nb_logical)
     nb_storage = int(pt.velocity_dft_cart.shape[-1])
     nk = int(energies.shape[0])
