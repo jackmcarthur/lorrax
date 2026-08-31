@@ -248,6 +248,24 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     np.testing.assert_allclose(np.asarray(single.window.nodes.alpha), expected)
 
 
+def test_damped_rule_cache_does_not_alias_nearby_widths(monkeypatch):
+    calls = []
+
+    def fake(gamma_min, gamma_max, *_args, **_kwargs):
+        calls.append((gamma_min, gamma_max))
+        return {"call": len(calls)}
+
+    monkeypatch.setattr(SW, "damped_rectangle_positive_rule", fake)
+    cache = {}
+    first = SW._damped_rule_cached(
+        cache, 0.1000000000004, 0.2000000000004, 1.0, 1.0e-6, 64)
+    second = SW._damped_rule_cached(
+        cache, 0.1000000000008, 0.2000000000008, 1.0, 1.0e-6, 64)
+    assert first is not second
+    assert calls == [(0.1000000000004, 0.2000000000004),
+                     (0.1000000000008, 0.2000000000008)]
+
+
 def test_a_truly_crossing_sign_definite_cell_refuses(monkeypatch):
     monkeypatch.setattr(
         SW.minimax, "fit_damped_reciprocal",

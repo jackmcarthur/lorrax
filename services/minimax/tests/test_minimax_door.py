@@ -413,6 +413,43 @@ def test_f5_false_case_with_the_hatch_open_it_solves_and_says_so(
     assert M.RUNTIME_SOLVE_ENV in line
 
 
+def test_runtime_target_coordinates_are_not_rounded_and_hit_is_checked(
+        monkeypatch):
+    """Nearby functions neither share a key nor accept an unmet cache hit."""
+    from minimax import door
+
+    seen = []
+    provenance = M.runtime_provenance("fake", "test")
+
+    def fake(A, target, n_max, eps_q, kind):
+        seen.append((A, eps_q))
+        return np.array([1.0]), np.array([1.0]), 5.0e-7, provenance
+
+    monkeypatch.setattr(door, "_solve_crossing_scaled_cached", fake)
+    for A, eps_q in ((20.0000000000004, 0.0010000000004),
+                     (20.0000000000008, 0.0010000000008)):
+        M.solve_uncertified(
+            family="crossing", target="hgl", range_value=A,
+            error_bound=1.0e-6, n_max=60, eps_q=eps_q)
+    assert seen == [(20.0000000000004, 0.0010000000004),
+                    (20.0000000000008, 0.0010000000008)]
+
+    monkeypatch.setattr(
+        door, "_solve_crossing_scaled_cached",
+        lambda *_args: (np.array([1.0]), np.array([1.0]), 2.0e-6,
+                        provenance))
+    with pytest.raises(M.UncertifiedSolveRefused, match="does not meet"):
+        M.solve_uncertified(
+            family="crossing", target="hgl", range_value=20.0,
+            error_bound=1.0e-6, n_max=60, eps_q=1.0e-3)
+
+
+@pytest.mark.parametrize("R", [1.0, 0.5, np.nan])
+def test_noncrossing_kappa0_refuses_an_empty_interval(R):
+    with pytest.raises(ValueError, match="finite R > 1"):
+        M.noncrossing_kappa0(np.array([1.0]), np.array([1.0]), R)
+
+
 def test_serve_prefers_the_certified_table_over_the_hatch(isolated_cache):
     """The ordering that makes stage 1 worth having at all: the hatch is a
     FALLBACK, not a parallel path.  A request the catalog covers must

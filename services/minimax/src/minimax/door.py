@@ -363,7 +363,12 @@ def noncrossing_kappa0(
     """Return the service-owned noncrossing amplification functional."""
     tau = np.asarray(tau, dtype=np.float64)
     weights = np.asarray(weights)
-    upper = max(float(range_value), 1.0 + 1.0e-12)
+    upper = float(range_value)
+    if not np.isfinite(upper) or upper <= 1.0:
+        raise ValueError(
+            f"minimax: noncrossing kappa0 requires a finite R > 1; got "
+            f"{upper!r}.  R <= 1 has no interval and cannot be padded into "
+            "one without changing the requested problem.")
     u = np.geomspace(1.0, upper, int(n_eval))
     envelope = u * np.sum(
         np.abs(weights)[None, :] * np.exp(-tau[None, :] * u[:, None]),
@@ -594,32 +599,41 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
                       omega_hat: float | None = None) -> Quadrature:
     """Run the offline solver in-process, and SAY SO.
 
-    The rounding of every cache key below is carried verbatim from the
-    pre-extraction call sites, for the reason given above the wrappers.
+    Target-function coordinates are exact cache keys.  Decimal rounding
+    aliases distinct functions, so a nearby request must miss and solve.
     """
     spec, target_kind = _resolve(family, target)
     if family == "noncrossing":
         tau, w, err, prov = _solve_noncrossing_scaled_cached(
-            round(float(np.log(float(range_value))), 12),
+            float(np.log(float(range_value))),
             _tolerance_key(error_bound), int(n_max))
     elif family == "noncrossing_imag":
         if omega_hat is None:
             raise UnknownTarget(
                 "minimax: family 'noncrossing_imag' needs omega_hat.")
         tau, w, err, prov = _solve_noncrossing_imag_scaled_cached(
-            round(float(np.log(float(range_value))), 12),
-            round(float(omega_hat), 12),
+            float(np.log(float(range_value))),
+            float(omega_hat),
             _tolerance_key(error_bound), int(n_max))
     elif family == "crossing":
         tau, w, err, prov = _solve_crossing_scaled_cached(
-            round(float(range_value), 12), _tolerance_key(error_bound),
+            float(range_value), _tolerance_key(error_bound),
             int(n_max),
-            round(float(eps_q if eps_q is not None else 1.0e-3), 12),
+            float(eps_q if eps_q is not None else 1.0e-3),
             str(target_kind))
     else:
         raise UncertifiedSolveRefused(
             f"minimax: family {family!r} has no in-process solver.  "
             f"{spec.generator_hint}")
+
+    achieved = float(err)
+    requested = float(error_bound)
+    if not np.isfinite(achieved) or achieved >= requested:
+        raise UncertifiedSolveRefused(
+            f"minimax: cached/runtime {family} rule does not meet the exact "
+            f"request; achieved {achieved:.6g}, requested < "
+            f"{requested:.6g}.  A cache hit is not accepted on identity "
+            "alone.")
 
     quad = Quadrature(
         nodes=tau, weights=w, family=family, target=target,

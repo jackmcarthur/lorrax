@@ -283,7 +283,9 @@ def _damped_rule_cached(cache, gamma_min, gamma_max, f_max, rel_tol,
                         max_nodes):
     f_pad = _F_MAX_LATTICE_RY * float(
         np.ceil(max(float(f_max), _F_MAX_LATTICE_RY) / _F_MAX_LATTICE_RY))
-    key = (round(float(gamma_min), 12), round(float(gamma_max), 12),
+    # Widths select the target rectangle; unlike the conservative f_max
+    # lattice below, rounding them aliases distinct functions.
+    key = (float(gamma_min), float(gamma_max),
            f_pad, float(rel_tol), int(max_nodes))
     if key not in cache:
         cache[key] = damped_rectangle_positive_rule(
