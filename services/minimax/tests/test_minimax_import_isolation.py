@@ -150,7 +150,7 @@ def test_the_lookup_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
             "        continue\n"
             "    assert hasattr(M, _n), _n\n"
             "v = M.catalog()\n"
-            "assert len(v) == 40, len(v)\n"
+            "assert len(v) == 44, len(v)\n"
             "assert v.families() == ('crossing', 'crossing_causal', "
             "'noncrossing'), v\n"
             "q = M.lookup(family='noncrossing', target='inverse',\n"
