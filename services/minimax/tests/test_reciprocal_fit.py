@@ -23,6 +23,7 @@ from minimax import (
     evaluate_rule,
     rule_amplification,
     solve_fixed_time_weights,
+    solve_fixed_time_weights_fast,
 )
 
 _FREQ = np.array([1.0, 2.5])
@@ -186,3 +187,15 @@ def test_rule_amplification_is_finite_with_p99_at_most_the_maximum_and_both_at_l
     p99, peak = rule_amplification(times, weights, problem)
     assert np.isfinite(p99) and np.isfinite(peak)
     assert 1.0 <= p99 <= peak
+
+
+def test_fast_weight_solve_is_bit_deterministic():
+    """Repeated production solves return the identical rule and error."""
+    problem = ReciprocalMeasureProblem(_FREQ, _SUMS, _MASS)
+    times = np.array([0.1 - 0.05j, 0.4 + 0.1j, 0.9 - 0.2j])
+
+    first_weights, first_error = solve_fixed_time_weights_fast(problem, times)
+    second_weights, second_error = solve_fixed_time_weights_fast(problem, times)
+
+    np.testing.assert_array_equal(second_weights, first_weights)
+    assert second_error == first_error
