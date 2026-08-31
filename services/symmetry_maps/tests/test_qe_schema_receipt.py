@@ -127,6 +127,39 @@ def test_minimized_real_qe_schema_pins_storage_order_and_translation_units():
     assert receipt.antiunitary.tolist() == [False, False]
 
 
+def test_inactive_lattice_symmetry_rows_are_not_bound_to_the_wfn(tmp_path):
+    lattice = np.diag([-1, 1, -1]).astype(np.int32)
+    inactive = f"""
+      <symmetry><info time_reversal="false">lattice_symmetry</info>
+        <rotation>{_matrix_text(lattice)}</rotation>
+      </symmetry>
+    """
+    text = _schema_text().replace(
+        "    <symmetries>",
+        "    <symmetries><nsym>2</nsym><nrot>3</nrot>",
+    ).replace("    </symmetries>", inactive + "    </symmetries>")
+    save = tmp_path / "lattice-candidates.save"
+    save.mkdir()
+    schema = save / "data-file-schema.xml"
+    schema.write_text(text, encoding="utf-8")
+
+    receipt = read_qe_symmetry_receipt(schema)
+    assert receipt.sym_matrices.shape == (2, 3, 3)
+    assert receipt.antiunitary.tolist() == [False, True]
+    np.testing.assert_array_equal(receipt.sym_matrices[1], _ORDER3)
+
+
+def test_declared_active_symmetry_count_mismatch_refuses(tmp_path):
+    text = _schema_text().replace(
+        "    <symmetries>", "    <symmetries><nsym>3</nsym><nrot>3</nrot>")
+    save = tmp_path / "bad-active-count.save"
+    save.mkdir()
+    schema = save / "data-file-schema.xml"
+    schema.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="declared nsym=3.*found 2"):
+        read_qe_symmetry_receipt(schema)
+
+
 def test_binding_refuses_transposed_major_minor_axis_twin(tmp_path):
     receipt = read_qe_symmetry_receipt(_write_schema(tmp_path))
     wfn = _binding_stub(receipt)
