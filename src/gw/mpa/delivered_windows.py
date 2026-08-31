@@ -1764,12 +1764,14 @@ def build_delivered_sigma_windows(
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
 
+    problems_finished = time.perf_counter()
     combined_scale = float(np.max(combined_envelope))
     total_absolute = target * combined_scale * safety
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
         factor_cap=factor_cap, node_ceiling=node_ceiling,
         grid_mode=grid_mode, lattice_bins=lattice_bins)
+    fingerprint_finished = time.perf_counter()
     distributed_receipt = (
         plan_cache_path is not None and process_count() > 1)
     cached = (None if distributed_receipt and process_rank() != 0 else
@@ -1863,6 +1865,7 @@ def build_delivered_sigma_windows(
             (fits, free_pairs, required_cost, window_tau_pairs,
              _fingerprint_match) = published
 
+    fits_finished = time.perf_counter()
     output = []
     for spec, fit in zip(specs, fits):
         branch = spec["branch"]
@@ -1942,6 +1945,7 @@ def build_delivered_sigma_windows(
             "fit_provenance": fit["evidence"]["provenance"],
         })
 
+    materialize_finished = time.perf_counter()
     for report in branch_reports:
         report["node_count"] = sum(
             row["node_count"] for row in report["windows"])
@@ -1982,6 +1986,10 @@ def build_delivered_sigma_windows(
         "distinct_tau_count": distinct_tau_count,
         "direct_term_count": 0,
         "plan_seconds": time.perf_counter() - started,
+        "problem_seconds": problems_finished - started,
+        "fingerprint_seconds": fingerprint_finished - problems_finished,
+        "fit_and_sync_seconds": fits_finished - fingerprint_finished,
+        "materialize_seconds": materialize_finished - fits_finished,
         "plan_cache_status": cache_status,
         "plan_cache_path": plan_cache_path,
         "plan_cache_fingerprint": cache_fingerprint,
