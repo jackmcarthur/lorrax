@@ -1385,7 +1385,9 @@ def _rule_candidate(problem, validation, times, weights, evidence):
     return {
         "times": times,
         "weights": weights,
-        "fit_metrics": _rule_metrics(problem, times, weights),
+        # Candidate acceptance uses the stricter refined lattice.  Only the
+        # chosen rule needs the fitting-lattice number for its report.
+        "fit_metrics": None,
         "metrics": _rule_metrics(validation, times, weights),
         "evidence": evidence,
     }
@@ -1910,9 +1912,21 @@ def build_delivered_sigma_windows(
                 patch_positions = positions[omega_rows]
                 patch_frequencies = frequencies[omega_rows]
                 for cell_role, cell_bounds in routed_bounds:
-                    cell_product = (_product_problem(
-                        selected_states, cell_bounds, measure,
-                        patch_frequencies, pole_sign, int(lattice_bins)))
+                    identity_route = (
+                        patch_count == 1 and cell_role == "identity"
+                        and np.array_equal(
+                            omega_rows,
+                            np.arange(frequencies.size, dtype=np.int64))
+                        and np.allclose(
+                            cell_bounds, pole_bounds, rtol=0.0, atol=0.0))
+                    # The routing probe already built this exact product.
+                    # Reuse it instead of repeating the costly lattice
+                    # reduction for every ordinary unsplit window.
+                    cell_product = (product if identity_route else
+                                    _product_problem(
+                                        selected_states, cell_bounds, measure,
+                                        patch_frequencies, pole_sign,
+                                        int(lattice_bins)))
                     if cell_product is None:
                         continue
                     cell_problem, cell_validation, pole_indices = cell_product
@@ -2106,6 +2120,9 @@ def build_delivered_sigma_windows(
 
     output = []
     for spec, fit in zip(specs, fits):
+        if fit.get("fit_metrics") is None:
+            fit["fit_metrics"] = _rule_metrics(
+                spec["problem"], fit["times"], fit["weights"])
         branch = spec["branch"]
         pole_sign = int(spec["pole_sign"])
         external_sign = -1 if branch.neg_omega_half else 1
