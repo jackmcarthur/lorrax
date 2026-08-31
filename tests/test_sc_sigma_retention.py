@@ -58,13 +58,14 @@ def _state_attrs(fn, var="state"):
 
 
 # The carried state one QSGW map call READS: the QP Hamiltonian, the
-# counter, and the previous call's OccupationState — the last of these for
-# the mu-drift diagnostic ONLY.  Since the entry-solve rule (2026-08-15)
+# counter, the previous protected-band decision, and the previous call's
+# OccupationState — the last of these for the mu-drift diagnostic ONLY.
+# Since the entry-solve rule (2026-08-15)
 # the map solves its own occupations from the spectrum of the H it is
 # handed, so neither correctness nor the head consumes the carry;
 # head_surface_weight_kn is carried for continuity but never read here.
 _CARRY_KEYS = {
-    "iteration", "H_qp_dft", "occupation_state",
+    "iteration", "H_qp_dft", "partition", "occupation_state",
 }
 
 # What a bare INPUT SCState is constructed with in the drivers: the read

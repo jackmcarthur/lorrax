@@ -222,6 +222,8 @@ def build_omega_band_partition(
     band_offset: int,
     omega_min_abs_ev: float,
     omega_max_abs_ev: float,
+    previous_partition: BandPartition | None = None,
+    hysteresis_margin_ev: float = 0.0,
     label: str = "SC",
     print_fn=print,
 ) -> BandPartition:
@@ -239,6 +241,27 @@ def build_omega_band_partition(
     band_in_grid, _ = classify_bands_in_grid(
         e_dft_ev, float(omega_min_abs_ev), float(omega_max_abs_ev))
     in_range = jnp.asarray(band_in_grid, dtype=bool)
+    protected = np.asarray(band_in_grid, dtype=bool)
+    margin = float(hysteresis_margin_ev)
+    if margin < 0.0 or not np.isfinite(margin):
+        raise ValueError("hysteresis_margin_ev must be finite and nonnegative")
+    if previous_partition is not None and margin > 0.0:
+        previous = np.asarray(
+            previous_partition.protected_mask, dtype=bool).reshape(-1)
+        if previous.shape != protected.shape:
+            raise ValueError(
+                "previous partition and current spectrum have different "
+                f"band counts ({previous.size} and {protected.size})")
+        # Schmitt boundary: a band gains protection at the actual Sigma-grid
+        # edge, but one that was already protected is not dropped until every
+        # k has crossed an edge by the run-derived deadband.  This keeps an
+        # edge band's own off-diagonal mixing from switching the structure of
+        # H on and off on alternate maps.
+        retained_kn = (
+            (e_dft_ev >= float(omega_min_abs_ev) - margin)
+            & (e_dft_ev <= float(omega_max_abs_ev) + margin))
+        retained = np.all(retained_kn, axis=0)
+        protected |= previous & retained
     # A band is in-grid only if EVERY k is in the window, so one stray k
     # discards the whole band and every state it holds inside the window.
     # Report what that costs: on the sodium metal at +-10 eV, bands sitting
@@ -255,7 +278,7 @@ def build_omega_band_partition(
         f"({int(state_in.sum())}/{int(state_in.size)} (k,band) states lie in "
         f"the window; the all-k rule keeps {kept})")
     partition = BandPartition(
-        protected_mask=in_range, in_range_mask=in_range)
+        protected_mask=jnp.asarray(protected), in_range_mask=in_range)
     partition.report_multiplet_splits(
         np.asarray(e_dft_full_kn_ry, dtype=np.float64), int(band_offset),
         label=label, print_fn=print_fn)
