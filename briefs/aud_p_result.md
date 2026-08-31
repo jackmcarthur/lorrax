@@ -29,7 +29,7 @@ the newly amended branches, were not measured in this sprint.  The base already
 contains an emulated P=1/4/16 determinism test; that is not evidence for the two
 later branch tips.
 
-Verification: prescribed CPU gate pending at report creation.  No GPU leg is
-owed: all changes are audit documentation and all probes are scalar/CPU cells,
-so the four-GPU rule's CPU-cell exemption applies.  Branch:
+Verification: prescribed CPU gate **134 passed, 8 warnings in 148.51 s**.  No
+GPU leg is owed: all changes are audit documentation and all probes are
+scalar/CPU cells, so the four-GPU rule's CPU-cell exemption applies.  Branch:
 `audit/planner-robustness-2026-08-31`.
