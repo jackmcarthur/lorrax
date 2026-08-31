@@ -583,6 +583,7 @@ def _fit_production_rank(group: RoqGroup, target: float,
         return cache[rank]
 
     lower = _MIN_RANK
+    final_ranks = None
     # Clamp every search rank to the usable interval.  The angle probe was
     # built independently and can sit above a low-rank measure's ceiling.
     upper = min(_ANGLE_PROBE_RANK, ceiling)
@@ -598,23 +599,33 @@ def _fit_production_rank(group: RoqGroup, target: float,
                 break
             lower = upper
         else:
-            # A miss still needs the best honest refusal.  Continue through
-            # the same full-fit path at the last usable rank instead of
-            # returning through a separate, easy-to-empty branch.
-            upper = ceiling
-    midpoint = (lower + upper) // 2
-    if lower < midpoint < upper and quick(midpoint).target_met:
-        upper = midpoint
+            # A miss still needs the best honest refusal.  The error can turn
+            # upward near the numerical-rank cliff.  Refine the last ladder
+            # rung with cheap probes, then fully score its best local rank
+            # instead of paying for a known-worse fit at the numerical cliff.
+            usable_ladder = tuple(rank for rank in ladder
+                                  if _MIN_RANK <= rank <= ceiling)
+            anchor = usable_ladder[-2] if len(usable_ladder) > 1 else ceiling
+            local = range(anchor, min(ceiling, anchor + 4) + 1)
+            stable = min(local, key=lambda rank: (
+                quick(rank).max_error, quick(rank).kappa_p99, rank))
+            final_ranks = (stable,)
+    if final_ranks is None:
+        midpoint = (lower + upper) // 2
+        if lower < midpoint < upper and quick(midpoint).target_met:
+            upper = midpoint
+        final_ranks = tuple(
+            range(upper, min(ceiling, upper + 3) + 1))
 
-    # Evaluate the selected rank unconditionally, then at most three larger
-    # usable ranks.  Initializing ``best`` here makes the search total even
-    # when the usable ceiling equals the first probe.
+    # The ladder always contains the ceiling, and the passing path always
+    # contains ``upper``.  Evaluate the first rank unconditionally so the
+    # search is total even when the usable ceiling equals the first probe.
     best = _fit_prepared(
-        group, prepared, upper, target=target, windows=windows,
+        group, prepared, final_ranks[0], target=target, windows=windows,
         evaluations=len(cache))
     if best.target_met and best.noise_passed:
         return best
-    for rank in range(upper + 1, min(ceiling, upper + 3) + 1):
+    for rank in final_ranks[1:]:
         final = _fit_prepared(
             group, prepared, rank, target=target, windows=windows,
             evaluations=len(cache))
