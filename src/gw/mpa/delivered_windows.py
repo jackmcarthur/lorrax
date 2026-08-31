@@ -35,8 +35,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.collectives import (gather_to_host, process_count, process_rank,
-                                psum_replicate)
+from common.collectives import (all_gather_processes, gather_to_host,
+                                process_count, process_rank, psum_replicate)
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.evaluator import gauss_legendre_interval
 from gw.mpa.sigma_windows import SharedSigmaWindow
@@ -77,6 +77,138 @@ _CROSSING_CONDITIONING_SLACK = 0.2
 # present in evaluator.damped_rectangle_gauss_rule; it fixes the time interval
 # without a search over tail fractions.
 _CROSSING_TAIL_FRACTION = 0.9
+
+
+def _planner_work_indices(count, rank=None, world=None):
+    """Return this process's deterministic share of indexed planner work."""
+    world = int(process_count() if world is None else world)
+    rank = int(process_rank() if rank is None else rank)
+    if world < 1 or not 0 <= rank < world:
+        raise ValueError(
+            f"invalid planner process coordinate rank={rank}, world={world}")
+    return tuple(range(rank, int(count), world))
+
+
+def _all_gather_planner_payload(payload):
+    """Gather one variable-length Python payload without creating a mesh.
+
+    The existing process collective accepts fixed-shape arrays.  A length
+    gather followed by one padded byte gather carries the small fitted-rule
+    dictionaries while preserving NumPy dtypes and every bit of their nodes
+    and weights.
+    """
+    encoded = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    local = np.frombuffer(encoded, dtype=np.uint8)
+    lengths = np.asarray(all_gather_processes(
+        np.asarray(local.size, dtype=np.int32)), dtype=np.int64).reshape(-1)
+    if lengths.size != int(process_count()) or np.any(lengths <= 0):
+        raise RuntimeError("planner payload length gather returned bad data")
+    width = int(np.max(lengths))
+    padded = np.zeros(width, dtype=np.uint8)
+    padded[:local.size] = local
+    gathered = np.asarray(all_gather_processes(padded), dtype=np.uint8)
+    if gathered.shape != (int(process_count()), width):
+        raise RuntimeError(
+            "planner payload gather returned shape "
+            f"{gathered.shape}, expected {(int(process_count()), width)}")
+    return [pickle.loads(np.ascontiguousarray(
+        gathered[source, :int(length)]).tobytes())
+        for source, length in enumerate(lengths)]
+
+
+def _assemble_planner_rows(shards, count, world, *, refuse_errors):
+    """Reassemble indexed work and choose one rank-independent refusal."""
+    rows = [row for shard in shards for row in shard]
+    rows.sort(key=lambda row: int(row["index"]))
+    indices = [int(row["index"]) for row in rows]
+    expected = list(range(int(count)))
+    if indices != expected:
+        raise RuntimeError(
+            f"planner gather returned work indices {indices}, expected "
+            f"{expected}")
+    for row in rows:
+        expected_source = int(row["index"]) % int(world)
+        if int(row["source_rank"]) != expected_source:
+            raise RuntimeError(
+                f"planner work {row['index']} came from rank "
+                f"{row['source_rank']}, expected {expected_source}")
+    refusals = [row for row in rows if row["error"] is not None]
+    if refusals and refuse_errors:
+        # Rows are index-sorted, so every process raises the same first
+        # refusal even when several independent windows fail.
+        raise RuntimeError(refusals[0]["error"]["message"])
+    values = [None if row["error"] is not None else row["value"]
+              for row in rows]
+    return values, rows
+
+
+def _run_parallel_planner_jobs(count, worker, *, refuse_errors):
+    """Run indexed fits once across processes, then replicate their results.
+
+    Exceptions are data until after the gather.  This is essential on a
+    fail-fast launcher: raising on one process before its peers enter the
+    collective would turn an ordinary product-window refusal into a hang.
+    """
+    rank = int(process_rank())
+    world = int(process_count())
+    local_rows = []
+    for index in _planner_work_indices(count, rank, world):
+        started = time.perf_counter()
+        try:
+            value, detail = worker(index)
+            error = None
+        except Exception as exc:  # noqa: BLE001 - refusals cross ranks as data
+            value, detail = None, {}
+            error = {
+                "type": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                "message": str(exc),
+            }
+        local_rows.append({
+            "index": int(index),
+            "source_rank": rank,
+            "value": value,
+            "error": error,
+            "seconds": time.perf_counter() - started,
+            "detail": detail,
+        })
+    shards = _all_gather_planner_payload(local_rows)
+    return _assemble_planner_rows(
+        shards, count, world, refuse_errors=refuse_errors)
+
+
+def _planner_rows_profile(rows):
+    """Summarize fit costs on the rank that determined stage wall time."""
+    world = max(
+        int(process_count()),
+        max((int(row["source_rank"]) + 1 for row in rows), default=1))
+    by_rank = {rank: {
+        "fit": 0.0, "adapted": 0.0, "shipped": 0.0, "jobs": 0,
+    } for rank in range(world)}
+    for row in rows:
+        bucket = by_rank[int(row["source_rank"])]
+        bucket["fit"] += float(row["seconds"])
+        bucket["adapted"] += float(
+            row["detail"].get("adapted_fit_seconds", 0.0))
+        bucket["shipped"] += float(
+            row["detail"].get("shipped_fallback_seconds", 0.0))
+        bucket["jobs"] += 1
+    critical_rank = max(
+        by_rank, key=lambda rank: (by_rank[rank]["fit"], -rank), default=0)
+    critical = by_rank.get(critical_rank, {
+        "fit": 0.0, "adapted": 0.0, "shipped": 0.0, "jobs": 0})
+    return {
+        "critical_rank": int(critical_rank),
+        "critical_rank_fit_seconds": float(critical["fit"]),
+        "critical_rank_adapted_fit_seconds": float(critical["adapted"]),
+        "critical_rank_shipped_fallback_seconds": float(critical["shipped"]),
+        "critical_rank_fit_overhead_seconds": max(
+            0.0, float(critical["fit"] - critical["adapted"]
+                       - critical["shipped"])),
+        "jobs_per_rank": [int(by_rank[rank]["jobs"])
+                          for rank in range(world)],
+        "job_count": len(rows),
+        "refusal_count": sum(row["error"] is not None for row in rows),
+    }
 
 
 def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
@@ -1467,7 +1599,7 @@ def _merge_branch_specs(group):
 
 
 def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
-                          total_absolute):
+                          total_absolute, trial_candidates=None):
     """Replace a branch's windows by one merged window when that costs less.
 
     Tried, not assumed: the merged window is fitted and kept only if it is
@@ -1477,8 +1609,7 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
     by_branch = {}
     for index, spec in enumerate(specs):
         by_branch.setdefault(id(spec["branch"]), []).append(index)
-    keep = list(range(len(specs)))
-    merged_specs, merged_candidates = dict(), dict()
+    trials = []
     for indices in by_branch.values():
         if len(indices) < 2:
             continue
@@ -1486,39 +1617,53 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
         merged = _merge_branch_specs(group)
         if merged is None:
             continue
-        split_nodes = sum(int(candidates[i][0]["times"].size) for i in indices)
         allowance = min(0.5, total_absolute / merged["envelope"])
-        # A merged rule is only ever accepted below the split's node count, so
-        # searching at or above it is pure waste.  Bounding the trial by its
-        # own acceptance criterion is dial-free and cuts the dominant residual
-        # planning cost: a refused merged-conduction trial measured 32.4 s of
-        # a 44.1 s plan, searching ranks it could never have kept.
+        split_nodes = sum(int(candidates[i][0]["times"].size)
+                          for i in indices)
+        # A merged rule is only ever KEPT below the split's node count, so
+        # searching at or above it can never yield an accepted rule.  Bounding
+        # each trial by its own acceptance criterion is dial-free and removes
+        # the dominant residual planning cost: a refused merged-conduction
+        # trial measured 32.4 s of a 44.1 s plan searching ranks it could not
+        # have kept.
         trial_ceiling = min(int(max_nodes), split_nodes - 1)
         if trial_ceiling < 1:
             continue
-        try:
-            candidate = window_candidates(
-                merged, eta, trial_ceiling, factor_cap, allowance)[0]
-        except (RuntimeError, ValueError, FloatingPointError, OverflowError,
-                np.linalg.LinAlgError):
+        trials.append((indices, merged, allowance, trial_ceiling))
+
+    def fit_trial(index):
+        _indices, merged, allowance, ceiling = trials[index]
+        rows, detail = _window_candidates_profiled(
+            merged, eta, ceiling, factor_cap, allowance,
+            adapted_only=True)
+        return rows[0], detail
+
+    if trial_candidates is None:
+        trial_candidates, trial_rows = _run_parallel_planner_jobs(
+            len(trials), fit_trial, refuse_errors=False)
+    else:
+        if len(trial_candidates) != len(trials):
+            raise RuntimeError(
+                "cached consolidation trial count changed across retry")
+        trial_rows = []
+    keep = list(range(len(specs)))
+    merged_specs, merged_candidates = dict(), dict()
+    for (indices, merged, _allowance, _ceiling), candidate in zip(
+            trials, trial_candidates):
+        if candidate is None:
             continue
-        split_cost = sum(float(candidates[i][0]["absolute_cost"])
-                         for i in indices)
-        # Fewer nodes is NOT sufficient. A merged window covers more support,
-        # so its envelope is larger and its absolute error cost can rise even
-        # at a similar relative residual — which made a real SC deck refuse
-        # with best cost 3.94e9 against a 2.79e9 budget. Require BOTH.
-        if (int(candidate["times"].size) >= split_nodes
-                or float(candidate["absolute_cost"]) > split_cost):
+        split_nodes = sum(int(candidates[i][0]["times"].size) for i in indices)
+        if int(candidate["times"].size) >= split_nodes:
             continue
         merged_specs[indices[0]] = merged
         merged_candidates[indices[0]] = [candidate]
         for dropped in indices[1:]:
             keep.remove(dropped)
     if not merged_specs:
-        return specs, candidates
+        return specs, candidates, trial_rows, trial_candidates
     return ([merged_specs.get(i, specs[i]) for i in keep],
-            [merged_candidates.get(i, candidates[i]) for i in keep])
+            [merged_candidates.get(i, candidates[i]) for i in keep],
+            trial_rows, trial_candidates)
 
 
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
@@ -1528,17 +1673,30 @@ def window_candidates(spec, eta, max_nodes, factor_growth_cap,
     The single routing decision, at module level so the planner, the tests and
     the offline node audit all take the same path.
     """
+    return _window_candidates_profiled(
+        spec, eta, max_nodes, factor_growth_cap, relative_target,
+        adapted_only=adapted_only)[0]
+
+
+def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
+                                relative_target, *, adapted_only=False):
+    """Return one window's rules and a cost split for planner evidence."""
+    detail = {"adapted_fit_seconds": 0.0,
+              "shipped_fallback_seconds": 0.0}
     adapted = None
     if spec["kind"] == "crossing":
+        started = time.perf_counter()
         adapted = _roq_crossing_candidate(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
+        detail["adapted_fit_seconds"] = time.perf_counter() - started
     if adapted is not None and adapted_only:
         # First pass: the cheap rule alone.  Fitting the shipped crossing
         # rule as well costs seconds per window and is only needed when the
         # GLOBAL budget cannot be met from cheap rules, which the caller
         # discovers by retrying.  Planning was 66 s of an 85 s stage before
         # this split.
-        return [adapted]
+        return [adapted], detail
+    started = time.perf_counter()
     try:
         shipped = _candidate_rules(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
@@ -1547,13 +1705,16 @@ def window_candidates(spec, eta, max_nodes, factor_growth_cap,
         if adapted is None:
             raise
         shipped = []
+    finally:
+        detail["shipped_fallback_seconds"] = time.perf_counter() - started
     # BOTH are offered to the exact selector, cheapest first.  The adapted
     # rule is usually far cheaper in nodes, but a window's own allowance is
     # not the whole story: the selector minimises nodes subject to the GLOBAL
     # delivered-error budget, and sometimes it must buy a more accurate rule
     # in one window to afford the plan.  Offering only the cheap rule made a
     # real deck refuse at 4.6% over budget with no alternative to pick.
-    return ([adapted] + shipped) if adapted is not None else shipped
+    candidates = ([adapted] + shipped) if adapted is not None else shipped
+    return candidates, detail
 
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
@@ -1764,6 +1925,7 @@ def build_delivered_sigma_windows(
         branch_rows, eta, edge_factor=float(edge_factor))
     split = geometry["pole_edge_ry"]
 
+    census_started = time.perf_counter()
     if measures_by_branch is None:
         omega_rows = _per_branch(
             Omega_poles_by_branch, branch_rows, "Omega_poles_by_branch")
@@ -1788,6 +1950,7 @@ def build_delivered_sigma_windows(
                 raise ValueError(
                     f"branch {branch.tag!r} was measured at pole split "
                     f"{measure[7]['pole_split_ry']}, expected {split}")
+    census_seconds = time.perf_counter() - census_started
 
     reference = None
     if reference_sigma_omega is not None:
@@ -1797,6 +1960,7 @@ def build_delivered_sigma_windows(
                 or not float(np.max(np.abs(reference))) > 0.0):
             raise ValueError("reference_sigma_omega is invalid")
 
+    window_geometry_started = time.perf_counter()
     specs, branch_reports = [], []
     combined_envelope = np.zeros(omega_grid.size, dtype=np.float64)
     for branch, measure in zip(branch_rows, measure_rows):
@@ -1895,27 +2059,10 @@ def build_delivered_sigma_windows(
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
+    window_geometry_seconds = time.perf_counter() - window_geometry_started
 
-    # The delivered error at one frequency can only come from windows that
-    # COVER that frequency.  A signed omega grid splits at zero into halves
-    # whose windows occupy DISJOINT omega positions, so charging their summed
-    # cost against a single per-frequency maximum under-budgets the plan by
-    # roughly the number of halves — measured: a +-5 eV SC deck refused at
-    # 2.82e9 against a 2.79e9 budget, 1.07% over, with every rule accepted on
-    # its own support.  Give each disjoint omega group its own allowance and
-    # sum them, which reduces to the old value for a one-sided grid.
-    groups: list[np.ndarray] = []
-    for spec in specs:
-        positions = np.unique(np.asarray(spec["omega_idx"], np.int64))
-        for index, existing in enumerate(groups):
-            if np.intersect1d(existing, positions).size:
-                groups[index] = np.union1d(existing, positions)
-                break
-        else:
-            groups.append(positions)
     combined_scale = float(np.max(combined_envelope))
-    total_absolute = target * safety * float(sum(
-        np.max(combined_envelope[group]) for group in groups))
+    total_absolute = target * combined_scale * safety
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
         factor_cap=factor_cap, pair_ceiling=pair_ceiling,
@@ -1923,6 +2070,8 @@ def build_delivered_sigma_windows(
     cached = _load_plan_cache(
         plan_cache_path, cache_fingerprint, len(specs))
     cache_status = "disabled" if plan_cache_path is None else "hit"
+    window_fit_rows, consolidation_rows = [], []
+    window_parallel_seconds = consolidation_seconds = selection_seconds = 0.0
     if cached is not None:
         (fits, free_pairs, required_cost, window_tau_pairs,
          fingerprint_match) = cached
@@ -1954,33 +2103,67 @@ def build_delivered_sigma_windows(
         # measured on the Na deck), so both are avoided here.
         allowances = [min(0.5, total_absolute / spec["envelope"])
                       for spec in specs]
-        adapted_cache = [
-            _roq_crossing_candidate(spec, eta, pair_ceiling, factor_cap,
-                                    allowance)
-            if spec["kind"] == "crossing" else None
-            for spec, allowance in zip(specs, allowances)]
         base_specs = specs
+
+        def fit_window(index):
+            return _window_candidates_profiled(
+                base_specs[index], eta, pair_ceiling, factor_cap,
+                allowances[index], adapted_only=True)
+
+        fit_started = time.perf_counter()
+        base_candidates, window_fit_rows = _run_parallel_planner_jobs(
+            len(base_specs), fit_window, refuse_errors=True)
+        window_parallel_seconds += time.perf_counter() - fit_started
         fits = None
+        consolidation_cache = None
         for adapted_only in (True, False):
             specs = base_specs
-            candidates_by_window = []
-            for spec, allowance, adapted in zip(base_specs, allowances,
-                                                adapted_cache):
-                if adapted is not None and adapted_only:
-                    candidates_by_window.append([adapted])
-                    continue
-                shipped = _candidate_rules(
-                    spec, eta, pair_ceiling, factor_cap, allowance)
-                candidates_by_window.append(
-                    ([adapted] + shipped) if adapted is not None else shipped)
-            specs, candidates_by_window = _consolidate_branches(
+            if adapted_only:
+                candidates_by_window = base_candidates
+            else:
+                def fit_retry(index):
+                    existing = base_candidates[index]
+                    adapted = next((candidate for candidate in existing
+                        if candidate["evidence"]["family"]
+                        == "measure_adapted_roq"), None)
+                    detail = {"adapted_fit_seconds": 0.0,
+                              "shipped_fallback_seconds": 0.0}
+                    if adapted is None:
+                        return existing, detail
+                    started = time.perf_counter()
+                    try:
+                        shipped = _candidate_rules(
+                            base_specs[index], eta, pair_ceiling, factor_cap,
+                            allowances[index])
+                    except (RuntimeError, ValueError, FloatingPointError,
+                            OverflowError, np.linalg.LinAlgError):
+                        shipped = []
+                    detail["shipped_fallback_seconds"] = (
+                        time.perf_counter() - started)
+                    return [adapted] + shipped, detail
+
+                fit_started = time.perf_counter()
+                candidates_by_window, retry_rows = (
+                    _run_parallel_planner_jobs(
+                        len(base_specs), fit_retry, refuse_errors=True))
+                window_parallel_seconds += time.perf_counter() - fit_started
+                window_fit_rows.extend(retry_rows)
+            consolidation_started = time.perf_counter()
+            (specs, candidates_by_window, trial_rows,
+             consolidation_cache) = _consolidate_branches(
                 specs, candidates_by_window, eta, pair_ceiling, factor_cap,
-                total_absolute)
+                total_absolute, consolidation_cache)
+            consolidation_seconds += (
+                time.perf_counter() - consolidation_started)
+            consolidation_rows.extend(trial_rows)
+            selection_started = time.perf_counter()
             try:
                 fits, free_pairs, required_cost = _select_rules(
                     specs, candidates_by_window, total_absolute, pair_ceiling)
+                selection_seconds += time.perf_counter() - selection_started
                 break
             except RuntimeError:
+                selection_seconds += time.perf_counter() - selection_started
                 if not adapted_only:
                     raise      # the shipped rules could not close it either
         del base_specs
@@ -2072,6 +2255,22 @@ def build_delivered_sigma_windows(
     if reference is not None:
         exchange_rate = combined_scale / float(np.max(np.abs(reference)))
         calibration = "calibrated_to_reference_sigma"
+    plan_seconds = time.perf_counter() - started
+    fit_profile = _planner_rows_profile(window_fit_rows)
+    consolidation_profile = _planner_rows_profile(consolidation_rows)
+    exchange_seconds = max(
+        0.0, window_parallel_seconds
+        - fit_profile["critical_rank_fit_seconds"])
+    exchange_seconds += max(
+        0.0, consolidation_seconds
+        - consolidation_profile["critical_rank_fit_seconds"])
+    accounted_seconds = (
+        census_seconds + window_geometry_seconds
+        + fit_profile["critical_rank_adapted_fit_seconds"]
+        + fit_profile["critical_rank_shipped_fallback_seconds"]
+        + fit_profile["critical_rank_fit_overhead_seconds"]
+        + consolidation_profile["critical_rank_fit_seconds"]
+        + exchange_seconds + selection_seconds)
     report = {
         "planner": "delivered_product_windows",
         "eta_ry": eta,
@@ -2097,7 +2296,30 @@ def build_delivered_sigma_windows(
         "window_tau_pairs": window_tau_pairs,
         "distinct_tau_count": distinct_tau_count,
         "direct_term_count": 0,
-        "plan_seconds": time.perf_counter() - started,
+        "plan_seconds": plan_seconds,
+        "planning_profile_seconds": {
+            "census": census_seconds,
+            "window_geometry": window_geometry_seconds,
+            "adapted_fits_on_critical_rank": fit_profile[
+                "critical_rank_adapted_fit_seconds"],
+            "shipped_fallbacks_on_critical_rank": fit_profile[
+                "critical_rank_shipped_fallback_seconds"],
+            "window_fit_overhead_on_critical_rank": fit_profile[
+                "critical_rank_fit_overhead_seconds"],
+            "merged_trials_on_critical_rank": consolidation_profile[
+                "critical_rank_fit_seconds"],
+            "candidate_exchange_and_wait": exchange_seconds,
+            "selection": selection_seconds,
+            "cache_and_output_assembly": max(
+                0.0, plan_seconds - accounted_seconds),
+        },
+        "planning_parallelism": {
+            "process_count": int(process_count()),
+            "window_fits": fit_profile,
+            "consolidation_trials": consolidation_profile,
+            "assignment": "job_index_modulo_process_count",
+            "collective": "common.collectives.all_gather_processes",
+        },
         "plan_cache_status": cache_status,
         "plan_cache_path": plan_cache_path,
         "plan_cache_fingerprint": cache_fingerprint,

@@ -440,3 +440,143 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
 
 def test_tolerance_ladder_is_deleted():
     assert not hasattr(delivered, "_FIT_TOLERANCE_LADDER")
+
+
+def _emulated_parallel_runner(world):
+    """Run every rank's deterministic share in-process for a CPU gate."""
+    def run(count, worker, *, refuse_errors):
+        shards = []
+        for rank in range(world):
+            rows = []
+            for index in delivered._planner_work_indices(
+                    count, rank=rank, world=world):
+                try:
+                    value, detail = worker(index)
+                    error = None
+                except Exception as exc:  # mirrors the production exchange
+                    value, detail = None, {}
+                    error = {
+                        "type": type(exc).__qualname__,
+                        "message": str(exc),
+                    }
+                rows.append({
+                    "index": index, "source_rank": rank,
+                    "value": value, "error": error,
+                    "seconds": 0.0, "detail": detail,
+                })
+            shards.append(rows)
+        return delivered._assemble_planner_rows(
+            shards, count, world, refuse_errors=refuse_errors)
+    return run
+
+
+def test_parallel_planner_is_bitwise_independent_of_p(monkeypatch):
+    """P=1, 4, and 16 emit identical windows, nodes, and weights."""
+    def fitted(spec, *_args, **_kwargs):
+        count = 5 if spec["name"].endswith(":consolidated") else 2
+        offset = sum(spec["name"].encode("utf-8")) * 1.0e-6
+        times = np.asarray(
+            [offset + 0.1 * (index + 1) + 0.2j
+             for index in range(count)], dtype=np.complex128)
+        weights = np.asarray(
+            [0.3j * (index + 1) - offset
+             for index in range(count)], dtype=np.complex128)
+        candidate = {
+            "times": times, "weights": weights,
+            "evidence": {
+                "family": "rank-independent-test",
+                "candidate_tolerance": 1.0e-6,
+                "provenance": "deterministic rank partition test",
+            },
+            "fit_metrics": (0.0, 1.0, 1.0),
+            "metrics": (0.0, 1.0, 1.0),
+            "required_target": 1.0e-8,
+            "absolute_cost": spec["envelope"] * 1.0e-8,
+            "factor_growth": (0.0, 0.0), "attempts": [],
+        }
+        return [candidate], {
+            "adapted_fit_seconds": 0.0,
+            "shipped_fallback_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(delivered, "_window_candidates_profiled", fitted)
+    signatures = []
+    for world in (1, 4, 16):
+        monkeypatch.setattr(
+            delivered, "_run_parallel_planner_jobs",
+            _emulated_parallel_runner(world))
+        plan, report = _patched_test_plan(20.0)
+        signatures.append((
+            report["n_windows"], report["window_tau_pairs"],
+            tuple((
+                row.window.name,
+                np.asarray(row.window.nodes.t).tobytes(),
+                np.asarray(row.window.nodes.alpha).tobytes(),
+                np.asarray(row.window.mask_A).tobytes(),
+                np.asarray(row.omega_idx).tobytes(),
+                np.asarray(row.pole_indices).tobytes(),
+            ) for row in plan),
+        ))
+    assert signatures[1] == signatures[0]
+    assert signatures[2] == signatures[0]
+
+
+def test_parallel_planner_refusal_is_rank_independent():
+    world = 4
+    shards = []
+    for rank in range(world):
+        rows = []
+        for index in delivered._planner_work_indices(7, rank, world):
+            message = None
+            if index in (2, 5):
+                message = f"window {index} refused on owner rank {rank}"
+            rows.append({
+                "index": index, "source_rank": rank, "value": index,
+                "error": (None if message is None else {
+                    "type": "RuntimeError", "message": message}),
+                "seconds": 0.0, "detail": {},
+            })
+        shards.append(rows)
+
+    for _observer_rank in range(world):
+        with pytest.raises(
+                RuntimeError,
+                match="window 2 refused on owner rank 2"):
+            delivered._assemble_planner_rows(
+                shards, 7, world, refuse_errors=True)
+
+
+def test_budget_retry_reuses_gathered_consolidation_trials(monkeypatch):
+    """One merged fit per branch survives the global-budget retry."""
+    fitted_names = []
+
+    def fitted(spec, *_args, **_kwargs):
+        fitted_names.append(spec["name"])
+        return _served_candidate(spec), {
+            "adapted_fit_seconds": 0.0,
+            "shipped_fallback_seconds": 0.0,
+        }
+
+    original_select = delivered._select_rules
+    select_calls = 0
+
+    def retry_once(*args, **kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        if select_calls == 1:
+            raise RuntimeError("forced global-budget retry")
+        return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(delivered, "_window_candidates_profiled", fitted)
+    monkeypatch.setattr(
+        delivered, "_run_parallel_planner_jobs",
+        _emulated_parallel_runner(4))
+    monkeypatch.setattr(delivered, "_select_rules", retry_once)
+    _branches, _poles, _plan, report = _two_branch_plan()
+
+    assert select_calls == 2
+    consolidated = [name for name in fitted_names
+                    if name.endswith(":consolidated")]
+    assert consolidated
+    assert len(consolidated) == len(set(consolidated))
+    assert report["n_windows"] > 0
