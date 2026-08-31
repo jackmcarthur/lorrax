@@ -335,7 +335,7 @@ def test_f4c_absence_of_an_optional_field_is_not_corruption():
 def test_f4_false_case_the_shipped_bundle_loads_and_every_entry_parses():
     """The FALSE case for all of F4: the real artifact is healthy.
 
-    31 entries in ``catalog.json``, 54 in the complex_laplace one and 29
+    40 entries in ``catalog.json``, 55 in the complex_laplace one and 29
     in the damped_line one, every payload resolvable and every field
     typed.  If this cell ever goes red the bundle is broken, which is
     exactly the event the four refusals above exist to report instead of
@@ -349,7 +349,7 @@ def test_f4_false_case_the_shipped_bundle_loads_and_every_entry_parses():
     that would not be pinning anything.
     """
     view = M.catalog()
-    assert len(view) == 31
+    assert len(view) == 40
     assert view.schema_version == 1
     for entry in view.entries:
         tau, alpha, err, _k, h = C.load_table(entry)
@@ -357,31 +357,20 @@ def test_f4_false_case_the_shipped_bundle_loads_and_every_entry_parses():
         assert np.isfinite(err) and err > 0.0
         assert h.startswith("sha256:")
     cl = _cl_view()
-    assert len(cl) == 54 and cl.schema_version == 2
+    assert len(cl) == 55 and cl.schema_version == 2
 
 
 # ---------------------------------------------------------------------------
 #  F6 — the 2x2's empty cell
 # ---------------------------------------------------------------------------
 
-def test_f6_the_strip_cell_refuses_by_name():
-    """``gw/screening.py:527-531``'s refusal, moved somewhere that can say
-    what is missing and what would create it.
-
-    Both parts of z nonzero is where the whole MPA fit stage lives, and
-    the family that serves it does not exist.  Refusing here means the
-    refusal happens before any physics runs, from declarative data,
-    rather than somewhere inside a kernel.
-    """
-    with pytest.raises(M.SamplingUnsupported) as excinfo:
-        M.family_for_character("strip")
-    text = str(excinfo.value)
-    assert "damped_line" in text
-    assert "WP9" in text or "campaign" in text, text
+def test_f6_the_strip_cell_resolves_to_the_causal_reciprocal_family():
+    """The shipped MPA reciprocal family closes the strip dispatch hole."""
+    assert M.family_for_character("strip") == "crossing_causal"
 
 
-def test_f6_false_case_the_three_live_cells_resolve():
-    """The FALSE case, and the 2×2 read out loud."""
+def test_f6_false_case_the_other_three_live_cells_resolve():
+    """The remaining three cells of the 2×2 read out loud."""
     assert M.family_for_character("static") == "noncrossing"
     assert M.family_for_character("real") == "crossing"
     assert M.family_for_character("imag") == "noncrossing_imag"

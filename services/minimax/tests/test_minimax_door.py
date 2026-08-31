@@ -87,7 +87,7 @@ def test_the_declared_families_match_the_shipped_bundle():
 
 
 def test_the_catalog_view_is_enumerable_without_solving_anything():
-    """31 entries, two families, no optimiser.
+    """Forty entries, three families, no optimiser.
 
     The "no optimiser" half is NOT asserted here with
     ``'minimax.solver' not in sys.modules`` — in a shared session another
@@ -98,9 +98,10 @@ def test_the_catalog_view_is_enumerable_without_solving_anything():
     scrubbed one by the isolation suite.
     """
     view = M.catalog()
-    assert len(view) == len(view.entries) == 31
-    assert len(view.for_family("crossing")) == 5
-    assert len(view.for_family("noncrossing")) == 26
+    assert len(view) == len(view.entries) == 40
+    assert len(view.for_family("crossing")) == 6
+    assert len(view.for_family("crossing_causal")) == 6
+    assert len(view.for_family("noncrossing")) == 28
 
 
 # ---------------------------------------------------------------------------

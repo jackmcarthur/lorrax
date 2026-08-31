@@ -21,6 +21,13 @@
       "error_metric": "linf_abs_target",
       "eps_q": 0.001,
       "target_kind": "hgl"
+    },
+    "crossing_causal": {
+      "problem": "1/(x+i*g) on x in [-A_dim,A_dim], g in [1,100]",
+      "representation": "Q(z)=sum alpha_r exp(i*tau_r*z), tau_r>0",
+      "error_metric": "max g*abs(Q(x+i*g)-1/(x+i*g))",
+      "physical_error_note": "runtime scales z by gamma_min, so absolute error is bounded by error_bound/gamma_min",
+      "width_ratio_max": 100.0
     }
   },
   "sweeps": {
@@ -52,6 +59,15 @@
       21544.346900318822,
       46415.888336127726,
       100000.0
+    ],
+    "crossing_causal_A_dim_values": [
+      10.0,
+      20.0,
+      40.0
+    ],
+    "crossing_causal_error_bounds": [
+      0.0001,
+      1e-05
     ]
   },
   "tables": [
@@ -126,6 +142,288 @@
       "node_count": 66,
       "max_error": 9.435262925405752e-07,
       "file": "crossing/crossing_hgl_A_60p000000_eps_1p0em06_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing_causal",
+      "target_kind": "causal_reciprocal",
+      "error_bound": 0.0001,
+      "error_metric": "linf_g_times_abs_reciprocal_error",
+      "range_param": "A_dim",
+      "range_max": 10.0,
+      "width_ratio_max": 100.0,
+      "measured_na_width_ratio_max": 90.1414665872282,
+      "node_count": 60,
+      "max_error": 2.0188366301301578e-05,
+      "measured_family_error": 2.0088175279399608e-05,
+      "held_out_max_error": 2.0188366301304898e-05,
+      "kappa0": 1.0000000000006994,
+      "kappa0_preferred_bound": 2.0,
+      "kappa0_hard_bound": 10.0,
+      "sum_abs_alpha": 10.819778284410283,
+      "payload_sha256": "61483406d5cd05b55e4d4bf179d1dcc524894c950d578c993280ed7941b07966",
+      "certified": true,
+      "certification": {
+        "method": "maximum-modulus boundary certificate with analytic derivative roots, bounded local extrema, and dense two-dimensional family re-score",
+        "edge_grid_size": 32769,
+        "gamma_edge_grid_size": 16385,
+        "reference_x_size": 4097,
+        "reference_gamma_size": 257,
+        "derivative_root_count": 76,
+        "local_refinement_count": 9512,
+        "checks": [
+          "positive_real_times",
+          "negative_imaginary_weights",
+          "certified_error",
+          "dense_family_reference",
+          "kappa0"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_causal_crossing_assets.py",
+        "tool_sha256": "297c337e6ee125000dcf85658bf0ee9074766908abc7ae02c37e98c6442c4b95",
+        "generator_commit": "d4dcc878a1764ddca397ab68b720b7838680710e",
+        "numpy": "2.5.2",
+        "scipy": "1.18.1",
+        "python": "3.13.15",
+        "certifier": "causal-rectangle-boundary-extrema+dense-family/v1",
+        "backend_sha256": "fedea00deca27815c86fa8042cfe598994e27bebda8e568bb25e86ebdb549052"
+      },
+      "file": "crossing_causal/crossing_causal_A_10p000000_G_100p000000_eps_1p0em04.npz"
+    },
+    {
+      "family": "crossing_causal",
+      "target_kind": "causal_reciprocal",
+      "error_bound": 1e-05,
+      "error_metric": "linf_g_times_abs_reciprocal_error",
+      "range_param": "A_dim",
+      "range_max": 10.0,
+      "width_ratio_max": 100.0,
+      "measured_na_width_ratio_max": 90.1414665872282,
+      "node_count": 71,
+      "max_error": 2.3750000776253893e-06,
+      "measured_family_error": 2.374999991228144e-06,
+      "held_out_max_error": 2.375000076381961e-06,
+      "kappa0": 1.0000000000000726,
+      "kappa0_preferred_bound": 2.0,
+      "kappa0_hard_bound": 10.0,
+      "sum_abs_alpha": 12.950513120477668,
+      "payload_sha256": "6b22b610c1cdd0a3e15d44697f856bdaa470c9f121b70883eee91b83c5087a71",
+      "certified": true,
+      "certification": {
+        "method": "maximum-modulus boundary certificate with analytic derivative roots, bounded local extrema, and dense two-dimensional family re-score",
+        "edge_grid_size": 32769,
+        "gamma_edge_grid_size": 16385,
+        "reference_x_size": 4097,
+        "reference_gamma_size": 257,
+        "derivative_root_count": 134,
+        "local_refinement_count": 15339,
+        "checks": [
+          "positive_real_times",
+          "negative_imaginary_weights",
+          "certified_error",
+          "dense_family_reference",
+          "kappa0"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_causal_crossing_assets.py",
+        "tool_sha256": "297c337e6ee125000dcf85658bf0ee9074766908abc7ae02c37e98c6442c4b95",
+        "generator_commit": "d4dcc878a1764ddca397ab68b720b7838680710e",
+        "numpy": "2.5.2",
+        "scipy": "1.18.1",
+        "python": "3.13.15",
+        "certifier": "causal-rectangle-boundary-extrema+dense-family/v1",
+        "backend_sha256": "fedea00deca27815c86fa8042cfe598994e27bebda8e568bb25e86ebdb549052"
+      },
+      "file": "crossing_causal/crossing_causal_A_10p000000_G_100p000000_eps_1p0em05.npz"
+    },
+    {
+      "family": "crossing_causal",
+      "target_kind": "causal_reciprocal",
+      "error_bound": 0.0001,
+      "error_metric": "linf_g_times_abs_reciprocal_error",
+      "range_param": "A_dim",
+      "range_max": 20.0,
+      "width_ratio_max": 100.0,
+      "measured_na_width_ratio_max": 90.1414665872282,
+      "node_count": 64,
+      "max_error": 2.4678968730520863e-05,
+      "measured_family_error": 2.3125000005563834e-05,
+      "held_out_max_error": 2.4678968500954527e-05,
+      "kappa0": 0.9999999999999817,
+      "kappa0_preferred_bound": 2.0,
+      "kappa0_hard_bound": 10.0,
+      "sum_abs_alpha": 10.674596274565786,
+      "payload_sha256": "6c3b24ae7ac8d7426ec0ac946818ed96ab8b529d6bea76b5860c7500ce4f10eb",
+      "certified": true,
+      "certification": {
+        "method": "maximum-modulus boundary certificate with analytic derivative roots, bounded local extrema, and dense two-dimensional family re-score",
+        "edge_grid_size": 32769,
+        "gamma_edge_grid_size": 16385,
+        "reference_x_size": 4097,
+        "reference_gamma_size": 257,
+        "derivative_root_count": 194,
+        "local_refinement_count": 10898,
+        "checks": [
+          "positive_real_times",
+          "negative_imaginary_weights",
+          "certified_error",
+          "dense_family_reference",
+          "kappa0"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_causal_crossing_assets.py",
+        "tool_sha256": "297c337e6ee125000dcf85658bf0ee9074766908abc7ae02c37e98c6442c4b95",
+        "generator_commit": "d4dcc878a1764ddca397ab68b720b7838680710e",
+        "numpy": "2.5.2",
+        "scipy": "1.18.1",
+        "python": "3.13.15",
+        "certifier": "causal-rectangle-boundary-extrema+dense-family/v1",
+        "backend_sha256": "fedea00deca27815c86fa8042cfe598994e27bebda8e568bb25e86ebdb549052"
+      },
+      "file": "crossing_causal/crossing_causal_A_20p000000_G_100p000000_eps_1p0em04.npz"
+    },
+    {
+      "family": "crossing_causal",
+      "target_kind": "causal_reciprocal",
+      "error_bound": 1e-05,
+      "error_metric": "linf_g_times_abs_reciprocal_error",
+      "range_param": "A_dim",
+      "range_max": 20.0,
+      "width_ratio_max": 100.0,
+      "measured_na_width_ratio_max": 90.1414665872282,
+      "node_count": 78,
+      "max_error": 2.4471835308825874e-06,
+      "measured_family_error": 2.000000034363403e-06,
+      "held_out_max_error": 2.447183521820389e-06,
+      "kappa0": 0.999999999999898,
+      "kappa0_preferred_bound": 2.0,
+      "kappa0_hard_bound": 10.0,
+      "sum_abs_alpha": 13.122363377404332,
+      "payload_sha256": "1b9b72e32392513240880247b8572b1aa2983e7fe5266fc9185bd4b3b40feef2",
+      "certified": true,
+      "certification": {
+        "method": "maximum-modulus boundary certificate with analytic derivative roots, bounded local extrema, and dense two-dimensional family re-score",
+        "edge_grid_size": 32769,
+        "gamma_edge_grid_size": 16385,
+        "reference_x_size": 4097,
+        "reference_gamma_size": 257,
+        "derivative_root_count": 170,
+        "local_refinement_count": 4682,
+        "checks": [
+          "positive_real_times",
+          "negative_imaginary_weights",
+          "certified_error",
+          "dense_family_reference",
+          "kappa0"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_causal_crossing_assets.py",
+        "tool_sha256": "297c337e6ee125000dcf85658bf0ee9074766908abc7ae02c37e98c6442c4b95",
+        "generator_commit": "d4dcc878a1764ddca397ab68b720b7838680710e",
+        "numpy": "2.5.2",
+        "scipy": "1.18.1",
+        "python": "3.13.15",
+        "certifier": "causal-rectangle-boundary-extrema+dense-family/v1",
+        "backend_sha256": "fedea00deca27815c86fa8042cfe598994e27bebda8e568bb25e86ebdb549052"
+      },
+      "file": "crossing_causal/crossing_causal_A_20p000000_G_100p000000_eps_1p0em05.npz"
+    },
+    {
+      "family": "crossing_causal",
+      "target_kind": "causal_reciprocal",
+      "error_bound": 0.0001,
+      "error_metric": "linf_g_times_abs_reciprocal_error",
+      "range_param": "A_dim",
+      "range_max": 40.0,
+      "width_ratio_max": 100.0,
+      "measured_na_width_ratio_max": 90.1414665872282,
+      "node_count": 122,
+      "max_error": 2.344319307215876e-05,
+      "measured_family_error": 2.3124999951162906e-05,
+      "held_out_max_error": 2.344318928415457e-05,
+      "kappa0": 1.000000000003113,
+      "kappa0_preferred_bound": 2.0,
+      "kappa0_hard_bound": 10.0,
+      "sum_abs_alpha": 10.674596274565786,
+      "payload_sha256": "3f65843794eda55312b04d58f01278d69a1c555e22fb38222eaa711f3bed85cf",
+      "certified": true,
+      "certification": {
+        "method": "maximum-modulus boundary certificate with analytic derivative roots, bounded local extrema, and dense two-dimensional family re-score",
+        "edge_grid_size": 32769,
+        "gamma_edge_grid_size": 16385,
+        "reference_x_size": 4097,
+        "reference_gamma_size": 257,
+        "derivative_root_count": 272,
+        "local_refinement_count": 13752,
+        "checks": [
+          "positive_real_times",
+          "negative_imaginary_weights",
+          "certified_error",
+          "dense_family_reference",
+          "kappa0"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_causal_crossing_assets.py",
+        "tool_sha256": "297c337e6ee125000dcf85658bf0ee9074766908abc7ae02c37e98c6442c4b95",
+        "generator_commit": "d4dcc878a1764ddca397ab68b720b7838680710e",
+        "numpy": "2.5.2",
+        "scipy": "1.18.1",
+        "python": "3.13.15",
+        "certifier": "causal-rectangle-boundary-extrema+dense-family/v1",
+        "backend_sha256": "fedea00deca27815c86fa8042cfe598994e27bebda8e568bb25e86ebdb549052"
+      },
+      "file": "crossing_causal/crossing_causal_A_40p000000_G_100p000000_eps_1p0em04.npz"
+    },
+    {
+      "family": "crossing_causal",
+      "target_kind": "causal_reciprocal",
+      "error_bound": 1e-05,
+      "error_metric": "linf_g_times_abs_reciprocal_error",
+      "range_param": "A_dim",
+      "range_max": 40.0,
+      "width_ratio_max": 100.0,
+      "measured_na_width_ratio_max": 90.1414665872282,
+      "node_count": 147,
+      "max_error": 2.36881990335799e-06,
+      "measured_family_error": 2.249999992431917e-06,
+      "held_out_max_error": 2.3688177933717434e-06,
+      "kappa0": 1.0000000000000548,
+      "kappa0_preferred_bound": 2.0,
+      "kappa0_hard_bound": 10.0,
+      "sum_abs_alpha": 13.004580341747946,
+      "payload_sha256": "6fafaac3e9a2589b856b3f9a7c2ec8972f3bbeb533507138feca48f31ce8b8b8",
+      "certified": true,
+      "certification": {
+        "method": "maximum-modulus boundary certificate with analytic derivative roots, bounded local extrema, and dense two-dimensional family re-score",
+        "edge_grid_size": 32769,
+        "gamma_edge_grid_size": 16385,
+        "reference_x_size": 4097,
+        "reference_gamma_size": 257,
+        "derivative_root_count": 340,
+        "local_refinement_count": 20633,
+        "checks": [
+          "positive_real_times",
+          "negative_imaginary_weights",
+          "certified_error",
+          "dense_family_reference",
+          "kappa0"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_causal_crossing_assets.py",
+        "tool_sha256": "297c337e6ee125000dcf85658bf0ee9074766908abc7ae02c37e98c6442c4b95",
+        "generator_commit": "d4dcc878a1764ddca397ab68b720b7838680710e",
+        "numpy": "2.5.2",
+        "scipy": "1.18.1",
+        "python": "3.13.15",
+        "certifier": "causal-rectangle-boundary-extrema+dense-family/v1",
+        "backend_sha256": "fedea00deca27815c86fa8042cfe598994e27bebda8e568bb25e86ebdb549052"
+      },
+      "file": "crossing_causal/crossing_causal_A_40p000000_G_100p000000_eps_1p0em05.npz"
     },
     {
       "family": "noncrossing",

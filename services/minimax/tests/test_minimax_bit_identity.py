@@ -11,7 +11,7 @@ something measures it.  Two claims here, and they are different:
    loader that had quietly started rounding.
 2. **The selection rule chooses the same table.**  The WP1 census measured
    54 distinct requests across the frozen decks, the campaign decks and
-   the suite, of which 51 were served, touching exactly SIX of the 31
+   the suite, of which 51 were served, touching a small pinned subset of the
    shipped tables.  Those six, and the requests that reach them, are
    pinned here by name.  If the selection rule drifts, this file names the
    request that moved and the table it moved to.
@@ -37,7 +37,22 @@ _CENSUS_TABLES = {
     "noncrossing/noncrossing_R_10p000000_eps_1p0em06.npz": 47,
     "noncrossing/noncrossing_R_46p415888_eps_1p0em06.npz": 10,
     "noncrossing/noncrossing_R_21p544347_eps_1p0em06.npz": 8,
-    "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz": 6,
+    "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz": 6,
+}
+
+_CAUSAL_PAYLOAD_SHA256 = {
+    "crossing_causal/crossing_causal_A_10p000000_G_100p000000_eps_1p0em04.npz":
+        "61483406d5cd05b55e4d4bf179d1dcc524894c950d578c993280ed7941b07966",
+    "crossing_causal/crossing_causal_A_10p000000_G_100p000000_eps_1p0em05.npz":
+        "6b22b610c1cdd0a3e15d44697f856bdaa470c9f121b70883eee91b83c5087a71",
+    "crossing_causal/crossing_causal_A_20p000000_G_100p000000_eps_1p0em04.npz":
+        "6c3b24ae7ac8d7426ec0ac946818ed96ab8b529d6bea76b5860c7500ce4f10eb",
+    "crossing_causal/crossing_causal_A_20p000000_G_100p000000_eps_1p0em05.npz":
+        "1b9b72e32392513240880247b8572b1aa2983e7fe5266fc9185bd4b3b40feef2",
+    "crossing_causal/crossing_causal_A_40p000000_G_100p000000_eps_1p0em04.npz":
+        "3f65843794eda55312b04d58f01278d69a1c555e22fb38222eaa711f3bed85cf",
+    "crossing_causal/crossing_causal_A_40p000000_G_100p000000_eps_1p0em05.npz":
+        "6fafaac3e9a2589b856b3f9a7c2ec8972f3bbeb533507138feca48f31ce8b8b8",
 }
 
 #: Requests taken verbatim from the census's deck and suite tables, with
@@ -59,7 +74,7 @@ _CENSUS_REQUESTS = [
     # the production crossing request, which pins at A_core = 24.0 exactly
     # for as long as the conditioning floor stays engaged (census §2.3)
     (("crossing", "hgl", 24.0, 1.0e-6, 500, 1.0e-3),
-     "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz"),
+     "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz"),
 ]
 
 
@@ -68,8 +83,10 @@ def _load_raw(rel: str):
     path = C._asset_root().joinpath(rel)
     with path.open("rb") as fh:
         with np.load(fh, allow_pickle=False) as data:
-            return (np.asarray(data["tau"], dtype=np.float64),
-                    np.asarray(data["alpha"], dtype=np.float64),
+            alpha = np.asarray(data["alpha"])
+            if not np.iscomplexobj(alpha):
+                alpha = np.asarray(alpha, dtype=np.float64)
+            return (np.asarray(data["tau"], dtype=np.float64), alpha,
                     float(data["max_error"][()]))
 
 
@@ -128,7 +145,7 @@ def test_the_served_error_is_the_payloads_and_not_the_catalogs_claim():
     assert q.max_error == raw_err               # and the payload is the source
 
 
-def test_the_whole_measured_surface_is_six_tables_of_thirty_one():
+def test_the_measured_surface_stays_inside_its_pinned_tables():
     """The census's most useful single number, pinned.
 
     Everything the frozen decks, the campaign decks and the suite ever
@@ -144,7 +161,29 @@ def test_the_whole_measured_surface_is_six_tables_of_thirty_one():
                      error_bound=error_bound, n_max=n_max, **kw)
         served.add(q.provenance.catalog_entry)
     assert served <= set(_CENSUS_TABLES), served - set(_CENSUS_TABLES)
-    assert len(M.catalog()) == 31
+    assert len(M.catalog()) == 40
+
+
+@pytest.mark.parametrize("file, expected_sha", _CAUSAL_PAYLOAD_SHA256.items(),
+                         ids=lambda value: value.split("/")[-1][:42])
+def test_every_causal_crossing_table_is_bit_pinned(file, expected_sha):
+    """Every new complex payload is selected and served byte-for-byte."""
+    entry = next(e for e in M.catalog().for_family("crossing_causal")
+                 if e.file == file)
+    q = M.lookup(
+        family="crossing_causal", target="causal_reciprocal",
+        range_value=entry.range_max, error_bound=entry.error_bound,
+        n_max=entry.node_count)
+    tau, alpha, max_error = _load_raw(file)
+    assert q.provenance.catalog_entry == file
+    assert q.nodes.tobytes() == tau.tobytes()
+    assert q.weights.tobytes() == alpha.tobytes()
+    assert q.nodes.dtype == np.float64
+    assert q.weights.dtype == np.complex128
+    assert q.max_error == max_error
+    assert C.payload_sha256(q.nodes, q.weights) == expected_sha
+    assert entry.raw["payload_sha256"] == expected_sha
+    assert q.provenance.certified is True
 
 
 def test_the_table_hash_is_stable_across_reads():

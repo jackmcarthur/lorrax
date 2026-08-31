@@ -10,9 +10,9 @@ certificate chain is: catalog range and scaled sup-norm bound, physical
 rescaling by the smallest gap, achieved error on the fitting lattice, achieved
 error on the refined validation lattice, and the runtime-noise gate.  A table
 that misses the measured gate is replaced by the next tighter or wider shipped
-table.  Crossing windows first try shipped HGL tables and otherwise perform one
-deterministic fixed-time weight fit.  The planner never evaluates explicit
-state--pole pairs and never emits zero-time or direct terms.
+table.  Crossing windows first try shipped causal reciprocal tables and
+otherwise perform one deterministic fixed-time weight fit.  The planner never
+evaluates explicit state--pole pairs and never emits zero-time or direct terms.
 
 The final acceptance test is
 
@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 6
+_PLAN_CACHE_VERSION = 7
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -1116,13 +1116,14 @@ def _crossing_geometry(problem, pole_sign):
     if np.any(gamma <= 0.0):
         raise RuntimeError("oriented crossing support is not eta-damped")
     gamma_min = float(np.min(gamma))
+    gamma_max = float(np.max(gamma))
     radius = float(np.max(np.abs(oriented.real)))
-    return oriented, gamma_min, radius / gamma_min
+    return oriented, gamma_min, radius / gamma_min, gamma_max / gamma_min
 
 
 def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
                             pole_sign, state_edge, bins):
-    """Return the smallest exact omega-patch routing covered by HGL.
+    """Return the smallest exact omega-patch routing covered by causal tables.
 
     A covered problem returns one identity route.  A wider crossing is split
     into equal contiguous omega patches.  For each patch the original pole
@@ -1133,12 +1134,9 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
     user-specified Sigma window with its own omega list and broadening.
     """
     omega_rows = np.arange(problem.frequencies.size, dtype=np.int64)
-    entries = [entry for entry in _mm.catalog().for_family("crossing")
-               if entry.target_kind == "hgl"
-               and entry.eps_q is not None
-               and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12]
+    entries = list(_mm.catalog().for_family("crossing_causal"))
     if not entries:
-        raise RuntimeError("the shipped HGL family is empty")
+        raise RuntimeError("the shipped causal crossing family is empty")
     widest_span = max(float(entry.range_max) for entry in entries)
     if (_window_kind(problem) != "crossing"
             or _crossing_geometry(problem, pole_sign)[2]
@@ -1182,31 +1180,37 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
             return tuple(planned)
     raise RuntimeError(
         "crossing support cannot be served by omega product windows: "
-        "even one-row patches exceed the widest shipped HGL span "
+        "even one-row patches exceed the widest shipped causal span "
         f"A={widest_span:.6g}")
 
 
 def _crossing_table_candidates(problem, pole_sign, relative_target,
                                max_nodes):
-    """Yield HGL table rules whose scaled span and bound cover the support."""
-    _oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
+    """Yield causal tables whose span, width, and bound cover the support."""
+    _oriented, gamma_min, A_dim, G_dim = _crossing_geometry(
+        problem, pole_sign)
     absolute_target = _absolute_kernel_target(problem, relative_target)
     scaled_target = absolute_target * gamma_min
     entries = _catalog_walk(
-        "crossing", A_dim, scaled_target, max_nodes,
-        target_kind="hgl", eps_q=_CROSSING_EPS_Q)
+        "crossing_causal", A_dim, scaled_target, max_nodes)
+    entries = [
+        entry for entry in entries
+        if float(entry.raw.get("width_ratio_max", 0.0))
+        + 1.0e-12 >= G_dim
+    ]
     for entry in entries:
         served = _load_catalog_entry(
-            entry, family="crossing", target="hgl",
-            eps_q=_CROSSING_EPS_Q)
+            entry, family="crossing_causal", target="causal_reciprocal")
         times = (float(pole_sign) * np.asarray(served.nodes, np.float64)
                  / gamma_min)
-        weights = (float(pole_sign) * -1.0j
-                   * np.asarray(served.weights, np.float64) / gamma_min)
+        weights = (float(pole_sign)
+                   * np.asarray(served.weights, np.complex128) / gamma_min)
         yield np.asarray(times), np.asarray(weights), {
-            "family": "crossing_hgl",
+            "family": "crossing_causal",
             "requested_range": A_dim,
             "table_range": float(entry.range_max),
+            "requested_width_ratio": G_dim,
+            "table_width_ratio": float(entry.raw["width_ratio_max"]),
             "requested_scaled_error": scaled_target,
             "catalog_error_bound_scaled": float(entry.error_bound),
             "certificate_abs_error_bound": float(
@@ -1246,7 +1250,8 @@ def _crossing_fallback_node_count(A_dim, max_nodes):
 
 def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     """Fit one fixed deterministic causal grid; never search node/time pairs."""
-    oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
+    oriented, gamma_min, A_dim, _G_dim = _crossing_geometry(
+        problem, pole_sign)
     # The shipped odd HGL target is certified on ``[-A, A]``, so lookup uses
     # the support radius above.  The unconstrained IRLS fallback keeps its
     # established density against the complete real span; it is not an HGL

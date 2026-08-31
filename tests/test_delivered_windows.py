@@ -280,9 +280,37 @@ def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
     assert np.all(times != 0.0)
 
 
+def test_mpa_crossing_lookup_serves_the_causal_family_without_hgl(
+        monkeypatch):
+    """The reciprocal MPA target must never load a GN-PPM HGL table."""
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.linspace(-8.0, 8.0, 17),
+        internal_sums=np.asarray([-1.0j, -3.0j]),
+        cell_masses=np.ones(2))
+    loaded = []
+    original = delivered._load_catalog_entry
+
+    def recorded(entry, **kwargs):
+        loaded.append((entry.family, kwargs["family"], kwargs["target"]))
+        return original(entry, **kwargs)
+
+    monkeypatch.setattr(delivered, "_load_catalog_entry", recorded)
+    times, weights, evidence = next(delivered._crossing_table_candidates(
+        problem, pole_sign=1.0, relative_target=1.0e-3,
+        max_nodes=420))
+
+    assert loaded == [(
+        "crossing_causal", "crossing_causal", "causal_reciprocal")]
+    assert evidence["family"] == "crossing_causal"
+    assert evidence["table_width_ratio"] == 100.0
+    assert times.dtype == np.float64
+    assert weights.dtype == np.complex128
+    assert delivered._rule_metrics(problem, times, weights)[0] < 2.0e-5
+
+
 def _served_candidate(spec, *_args):
     evidence = {
-        "family": ("crossing_hgl" if spec["kind"] == "crossing"
+        "family": ("crossing_causal" if spec["kind"] == "crossing"
                    else "noncrossing"),
         "candidate_tolerance": 1.0e-6,
         "provenance": "deterministic shipped-table test rule",
@@ -328,18 +356,15 @@ def test_crossing_patch_count_is_the_smallest_catalog_covered_partition(
     crossing = [row for row in wide if ":resonant[p" in row.window.name]
     widest_span = max(
         entry.range_max
-        for entry in delivered._mm.catalog().for_family("crossing")
-        if entry.target_kind == "hgl"
-        and entry.eps_q is not None
-        and abs(entry.eps_q - delivered._CROSSING_EPS_Q) <= 1.0e-12)
+        for entry in delivered._mm.catalog().for_family("crossing_causal"))
 
     assert len(crossing) == 2
     assert all("[p" in row.window.name for row in crossing)
     assert all(
-        evidence["family"] == "crossing_hgl"
+        evidence["family"] == "crossing_causal"
         for evidence in wide_report["branches"][0]["windows"]
         if ":resonant[p" in evidence["name"])
-    # One unpatched window has A=max(17, 20-5)/0.25=68, so A=60 cannot
+    # One unpatched window has A=max(17, 20-5)/0.25=68, so A=40 cannot
     # cover it.  The returned two-patch cover is therefore minimal.
     assert 68.0 > widest_span
 
