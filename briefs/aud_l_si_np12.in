@@ -14,6 +14,7 @@ bare_coulomb_cutoff = 25.0
 
 compute_mode = mpa
 screening_diagrams = w_rpa
+head_correction = off
 do_screened = true
 qp_solver = one_shot_dft
 memory_per_device_gb = 28
@@ -32,13 +33,11 @@ minimax_target_error = 1e-6
 minimax_max_nodes = 64
 
 mpa_n_poles = 12
-mpa_material_class = insulator
 mpa_sampling_alpha = 1
 mpa_varpi_near_ry = 0.2
 mpa_varpi_far_ry = 2.0
 mpa_pole_batch_size = 4
 mpa_sigma_sector_target_error = 6.5e-4
-mpa_sigma_crossing_target_error = 2.0e-3
 mpa_sigma_max_nodes = 96
 
 sigma_diag_file = sigma_diag.dat
