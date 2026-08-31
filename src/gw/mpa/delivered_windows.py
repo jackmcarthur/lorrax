@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 8
+_PLAN_CACHE_VERSION = 9
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -1150,8 +1150,7 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
         raise RuntimeError("the shipped HGL family is empty")
     widest_span = max(float(entry.range_max) for entry in entries)
     if (_window_kind(problem) != "crossing"
-            or max(_crossing_geometry(problem, pole_sign)[2],
-                   _crossing_fit_span(problem, pole_sign))
+            or _crossing_geometry(problem, pole_sign)[2]
             <= widest_span + 1.0e-12):
         return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
 
@@ -1176,8 +1175,7 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
                 state_positions, shell_bounds, measure,
                 problem.frequencies[patch], pole_sign, int(bins))
             if (shell is not None and _window_kind(shell[0]) == "crossing"
-                    and max(_crossing_geometry(shell[0], pole_sign)[2],
-                            _crossing_fit_span(shell[0], pole_sign))
+                    and _crossing_geometry(shell[0], pole_sign)[2]
                     > widest_span + 1.0e-12):
                 planned = []
                 break
@@ -1418,11 +1416,20 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 "candidate_tolerance": evidence.get("candidate_tolerance"),
                 "refusal": str(exc)})
     residual, amplification = best_pair
+    geometry = ""
+    if spec["kind"] == "crossing":
+        _oriented, _gamma, radius = _crossing_geometry(
+            spec["problem"], spec["pole_sign"])
+        geometry = (
+            f"; radius/eta={radius:.6g}, "
+            f"fit_span/eta={_crossing_fit_span(spec['problem'], spec['pole_sign']):.6g}, "
+            "attempts=" + repr(attempts))
     raise RuntimeError(
         f"delivered product window {spec['name']!r} refused: achieved "
         f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
         "the shipped product-window family and its one crossing fallback "
-        "did not survive the residual, noise, and factor-growth gates")
+        "did not survive the residual, noise, and factor-growth gates"
+        f"{geometry}")
 
 
 def _empty_frequency_cost(specs):
