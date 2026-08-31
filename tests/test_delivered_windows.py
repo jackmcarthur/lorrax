@@ -472,7 +472,7 @@ def _emulated_parallel_runner(world):
 
 def test_parallel_planner_is_bitwise_independent_of_p(monkeypatch):
     """P=1, 4, and 16 emit identical windows, nodes, and weights."""
-    def fitted(spec, *_args):
+    def fitted(spec, *_args, **_kwargs):
         count = 5 if spec["name"].endswith(":consolidated") else 2
         offset = sum(spec["name"].encode("utf-8")) * 1.0e-6
         times = np.asarray(
