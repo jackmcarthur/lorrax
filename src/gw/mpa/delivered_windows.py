@@ -1186,13 +1186,21 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
 
 def _crossing_table_candidates(problem, pole_sign, relative_target,
                                max_nodes):
-    """Yield causal tables whose span, width, and bound cover the support."""
+    """Yield causal tables whose span, width, and node count cover support.
+
+    The rectangle certificate is a sufficient uniform error bound, not the
+    delivered-error acceptance metric.  Walk the full covered table ladder,
+    loosest and smallest first, and remeasure every candidate on the fitting
+    and validation lattices.  Otherwise a table that is much more accurate on
+    the occupied support is discarded before the required achieved-error and
+    noise gates can see it, causing an unnecessary optimized fallback.
+    """
     _oriented, gamma_min, A_dim, G_dim = _crossing_geometry(
         problem, pole_sign)
     absolute_target = _absolute_kernel_target(problem, relative_target)
     scaled_target = absolute_target * gamma_min
     entries = _catalog_walk(
-        "crossing_causal", A_dim, scaled_target, max_nodes)
+        "crossing_causal", A_dim, np.inf, max_nodes)
     entries = [
         entry for entry in entries
         if float(entry.raw.get("width_ratio_max", 0.0))
@@ -1207,12 +1215,15 @@ def _crossing_table_candidates(problem, pole_sign, relative_target,
                    * np.asarray(served.weights, np.complex128) / gamma_min)
         yield np.asarray(times), np.asarray(weights), {
             "family": "crossing_causal",
+            "table_file": entry.file,
             "requested_range": A_dim,
             "table_range": float(entry.range_max),
             "requested_width_ratio": G_dim,
             "table_width_ratio": float(entry.raw["width_ratio_max"]),
             "requested_scaled_error": scaled_target,
             "catalog_error_bound_scaled": float(entry.error_bound),
+            "certificate_covers_requested_scaled_error": bool(
+                entry.error_bound <= scaled_target + 1.0e-18),
             "certificate_abs_error_bound": float(
                 entry.error_bound / gamma_min),
             "catalog_achieved_abs_error": float(
@@ -1803,7 +1814,16 @@ def build_delivered_sigma_windows(
             "green_factor_log_growth_max": fit["factor_growth"][0],
             "screened_factor_log_growth_max": fit["factor_growth"][1],
             "family": fit["evidence"]["family"],
+            "table_file": fit["evidence"].get("table_file"),
+            "table_range": fit["evidence"].get("table_range"),
             "candidate_tolerance": fit["evidence"]["candidate_tolerance"],
+            "requested_scaled_error": fit["evidence"].get(
+                "requested_scaled_error"),
+            "catalog_error_bound_scaled": fit["evidence"].get(
+                "catalog_error_bound_scaled"),
+            "certificate_covers_requested_scaled_error": fit[
+                "evidence"].get(
+                    "certificate_covers_requested_scaled_error"),
             "certificate_abs_error_bound": fit["evidence"].get(
                 "certificate_abs_error_bound"),
             "catalog_achieved_abs_error": fit["evidence"].get(

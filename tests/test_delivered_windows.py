@@ -308,6 +308,23 @@ def test_mpa_crossing_lookup_serves_the_causal_family_without_hgl(
     assert delivered._rule_metrics(problem, times, weights)[0] < 2.0e-5
 
 
+def test_crossing_walk_remeasures_tables_beyond_the_sufficient_bound():
+    """A conservative uniform bound must not preempt delivered validation."""
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([-1.0j]),
+        cell_masses=np.asarray([1.0]))
+
+    _times, _weights, evidence = next(delivered._crossing_table_candidates(
+        problem, pole_sign=1.0, relative_target=1.0e-8, max_nodes=64))
+
+    assert evidence["family"] == "crossing_causal"
+    assert evidence["requested_scaled_error"] < (
+        evidence["catalog_error_bound_scaled"])
+    assert not evidence["certificate_covers_requested_scaled_error"]
+    assert evidence["table_file"].startswith("crossing_causal/")
+
+
 def _served_candidate(spec, *_args):
     evidence = {
         "family": ("crossing_causal" if spec["kind"] == "crossing"
