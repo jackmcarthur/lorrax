@@ -682,7 +682,13 @@ def _planned_rank_ceiling(windows, support_margin: float,
     dimensionless planning radius is ``(max|Re d| + margin) / min|Im d|``.
     The production scaling laws above turn that radius into a rank ceiling;
     ``max_nodes`` remains only the caller's resource certificate.
+
+    A zero margin keeps the proven one-shot rank ceiling.  The larger basis
+    is solely an SC drift response: changing the DFT-support plan before any
+    drift has been measured can select a costlier rule for no physical gain.
     """
+    if float(support_margin) == 0.0:
+        return max(_MIN_RANK, min(int(max_nodes), _MAX_RANK))
     estimates = []
     for window in windows:
         denominator = np.asarray(window.validation.denominators)

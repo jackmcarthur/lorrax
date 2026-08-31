@@ -303,7 +303,7 @@ def test_crossing_rank_ceiling_includes_measured_first_step_drift():
         roq_fit._LOOSE_RANK_SLOPE * planned_A
         + roq_fit._LOOSE_RANK_INTERCEPT))
 
-    assert exact == 88
+    assert exact == 64
     assert padded == expected == 97
 
 
