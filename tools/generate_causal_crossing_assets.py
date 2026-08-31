@@ -50,7 +50,7 @@ from minimax import payload_sha256  # noqa: E402
 
 ASSET_ROOT = (MINIMAX_SRC / "minimax" / "minimax_assets")
 CATALOG_PATH = ASSET_ROOT / "catalog.json"
-A_VALUES = (10.0, 20.0, 40.0)
+A_VALUES = (10.0, 20.0, 40.0, 64.0, 96.0)
 ERROR_BOUNDS = (1.0e-4, 1.0e-5)
 G_MAX = 100.0
 MEASURED_NA_G_MAX = 90.1414665872282
@@ -394,7 +394,7 @@ def _update_catalog(entries: list[dict[str, object]]) -> None:
 
 
 def generate(*, write_assets: bool) -> list[dict[str, object]]:
-    """Generate, certify, optionally write, and print the six tables."""
+    """Generate, certify, optionally write, and print the table ladder."""
     provenance = _provenance()
     entries = []
     for A in A_VALUES:
@@ -429,7 +429,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--write-assets", action="store_true",
-        help="Write the six payloads and merge their rows into catalog.json.")
+        help="Write the payloads and merge their rows into catalog.json.")
     args = parser.parse_args()
     generate(write_assets=bool(args.write_assets))
 
