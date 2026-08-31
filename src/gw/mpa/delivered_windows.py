@@ -2407,15 +2407,15 @@ def build_delivered_sigma_windows(
         fits = None
         consolidation_cache = None
         shortfall = None
-        # Three stages, each entered only when the previous cannot close the
+        # Five stages, each entered only when the previous cannot close the
         # global budget.  Stage 1 offers the adapted rules alone (this is what
         # every passing deck uses, and it pays for exactly one fit round).
         # Stage 2 adds the shipped rules so the selector can buy accuracy.
-        # Stage 3 re-fits at a TIGHTENED allowance, which is the only stage
-        # that can lower a cost the first two merely re-shuffle.
+        # Stages 3--5 compound up to three TIGHTENED allowances, which are the
+        # only stages that can lower a cost the first two merely re-shuffle.
         tighten_scale = 1.0
-        for stage in ("adapted", "shipped",
-                      "tightened", "tightened", "tightened"):
+        stages = ("adapted", "shipped") + ("tightened",) * 3
+        for stage_index, stage in enumerate(stages):
             adapted_only = stage == "adapted"
             specs = base_specs
             if stage == "adapted":
@@ -2553,8 +2553,8 @@ def build_delivered_sigma_windows(
                             time.perf_counter() - selection_started)
                 if stage == "shipped" and shortfall is None:
                     raise      # ceiling-limited: tightening cannot help
-                if stage == "tightened":
-                    raise      # a tightened re-fit could not close it either
+                if stage == "tightened" and stage_index == len(stages) - 1:
+                    raise      # all three compounded re-fits were exhausted
         del base_specs
 
         window_tau_pairs = free_pairs

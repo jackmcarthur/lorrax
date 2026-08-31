@@ -25,7 +25,9 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from gw.band_partition import BandPartition, apply_band_partition
+from common.units import RYD_TO_EV
+from gw.band_partition import (
+    BandPartition, apply_band_partition, build_omega_band_partition)
 
 
 def _random_hermitian(nk: int, nb: int, seed: int = 0) -> jax.Array:
@@ -118,3 +120,42 @@ def test_no_warning_when_all_protected_in_range():
     buf = io.StringIO()
     part.warn_if_protected_outside_grid(print_fn=lambda *a, **k: print(*a, file=buf, **k))
     assert buf.getvalue() == ""
+
+
+def test_reanchored_partition_hysteresis_breaks_edge_band_two_cycle():
+    """The audit's 1.061/0.990 eV edge oscillator stays structurally fixed."""
+    fixed_h_ev = np.asarray([[[0.50, 0.20], [0.20, 0.99]]])
+    scissor_ev = np.asarray([[0.50, 0.99]])
+    spectrum_ev = np.asarray([[0.50, 0.99]])
+    previous = None
+    masks, uppers, offdiagonals = [], [], []
+    for _ in range(6):
+        partition = build_omega_band_partition(
+            spectrum_ev / RYD_TO_EV, spectrum_ev / RYD_TO_EV,
+            band_offset=0, omega_min_abs_ev=-1.0,
+            omega_max_abs_ev=1.0, previous_partition=previous,
+            hysteresis_margin_ev=0.125, print_fn=lambda *_args: None)
+        h_next = np.asarray(apply_band_partition(
+            jnp.asarray(fixed_h_ev / RYD_TO_EV),
+            protected_mask=partition.protected_mask,
+            in_range_mask=partition.in_range_mask,
+            scissor_E_qp_kn=jnp.asarray(scissor_ev / RYD_TO_EV)))
+        spectrum_ev = np.linalg.eigvalsh(h_next) * RYD_TO_EV
+        masks.append(np.asarray(partition.protected_mask, dtype=int).tolist())
+        uppers.append(float(spectrum_ev[0, 1]))
+        offdiagonals.append(float(h_next[0, 0, 1] * RYD_TO_EV))
+        previous = partition
+
+    assert masks == [[1, 1]] * 6
+    np.testing.assert_allclose(uppers, [1.061267292017] * 6, atol=1e-12)
+    np.testing.assert_allclose(offdiagonals, [0.2] * 6, atol=1e-14)
+
+    # Hysteresis is a deadband, not a frozen class: 0.20 eV beyond the edge
+    # exceeds the run-derived 0.125 eV margin and genuinely loses protection.
+    drifted = build_omega_band_partition(
+        np.asarray([[0.50, 1.20]]) / RYD_TO_EV,
+        np.asarray([[0.50, 1.20]]) / RYD_TO_EV,
+        band_offset=0, omega_min_abs_ev=-1.0, omega_max_abs_ev=1.0,
+        previous_partition=previous, hysteresis_margin_ev=0.125,
+        print_fn=lambda *_args: None)
+    np.testing.assert_array_equal(drifted.protected_mask, [True, False])

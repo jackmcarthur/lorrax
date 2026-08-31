@@ -638,3 +638,54 @@ def test_budget_retry_reuses_gathered_consolidation_trials(monkeypatch):
     assert consolidated
     assert len(consolidated) == len(set(consolidated))
     assert report["n_windows"] > 0
+
+
+def test_tightening_reaches_second_compounded_round(monkeypatch):
+    """Three shortfalls reach selection call 4 and two tightened fits."""
+    fitted_allowances = []
+
+    def candidate(spec):
+        row = _served_candidate(spec)[0]
+        row["evidence"] = dict(
+            row["evidence"], family="measure_adapted_roq")
+        return row
+
+    def fitted(spec, _eta, _ceiling, _factor_cap, allowance, **_kwargs):
+        fitted_allowances.append(float(allowance))
+        return [candidate(spec)], {
+            "adapted_fit_seconds": 0.0,
+            "shipped_fallback_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(delivered, "_window_candidates_profiled", fitted)
+    monkeypatch.setattr(
+        delivered, "_candidate_rules",
+        lambda spec, *_args, **_kwargs: [candidate(spec)])
+    monkeypatch.setattr(
+        delivered, "_consolidate_branches",
+        lambda specs, candidates, *_args: (specs, candidates, [], None))
+
+    select_calls = 0
+
+    def accept_on_fourth(_specs, candidates, _budget, _ceiling):
+        nonlocal select_calls
+        select_calls += 1
+        if select_calls < 4:
+            raise delivered._BudgetShortfall("forced", 2.0, 1.0)
+        selected = [rows[0] for rows in candidates]
+        for row in selected:
+            row["residual_target"] = row["required_target"]
+        return selected, sum(row["times"].size for row in selected), 0.0
+
+    monkeypatch.setattr(delivered, "_select_rules", accept_on_fourth)
+    _plan, report = _patched_test_plan(5.0)
+
+    assert select_calls == 4
+    assert len(fitted_allowances) == 3
+    np.testing.assert_allclose(
+        fitted_allowances, [1.6e-4, 7.2e-5, 3.24e-5],
+        rtol=0.0, atol=1e-14)
+    np.testing.assert_allclose(
+        np.asarray(fitted_allowances[1:]) / fitted_allowances[0],
+        [0.45, 0.45 ** 2], rtol=0.0, atol=1e-14)
+    assert report["n_windows"] == 1
