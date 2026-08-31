@@ -1152,6 +1152,32 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
     sorted_energy = selected[order]
     gamma_floor = _crossing_geometry(problem, pole_sign)[1]
     original_lo, original_hi = map(float, pole_bounds)
+
+    # First cut only the compact state axis while leaving the pole interval
+    # intact.  Metallic occupation tails commonly make one remote state block
+    # inflate the rectangle even though that block is sign-definite.  This
+    # partition removes it with one cheap noncrossing window instead of
+    # repeating pole flanks for every omega patch.
+    for state_patch_count in range(2, sorted_states.size + 1):
+        groups = tuple(np.array_split(sorted_states, state_patch_count))
+        planned = []
+        for states in groups:
+            product = _product_problem(
+                states, pole_bounds, measure, problem.frequencies,
+                pole_sign, int(bins))
+            if product is None:
+                continue
+            if (_window_kind(product[0]) == "crossing"
+                    and _crossing_geometry(product[0], pole_sign)[2]
+                    > widest_span + 1.0e-12):
+                planned = []
+                break
+            planned.append((
+                states, omega_rows,
+                (("identity", tuple(map(float, pole_bounds))),)))
+        if planned:
+            return tuple(planned)
+
     best = None
     for patch_count in range(2, omega_rows.size + 1):
         if best is not None and patch_count >= len(best):
