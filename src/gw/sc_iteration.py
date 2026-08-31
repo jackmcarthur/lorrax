@@ -311,6 +311,11 @@ class SCInputs:
     #: ``sc_head_update=off``.  Built once on the shared screening plan, not
     #: rebuilt in every map call; the resident W still supplies the one fold.
     fixed_dft_head_response: object | None = None
+    #: Seed mapping and exact fit path resolved once by a certified-fit
+    #: provider before the nonlinear solver starts.  The seed serves map 0;
+    #: later maps retain only its sample-grid provenance and rebuild W.
+    screening_seed: object | None = None
+    certified_fit_path: str | None = None
     print_fn: Callable = print
 
 
@@ -2492,11 +2497,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     metal_occ_state = (entry_occ_state
                        if _material_class(inputs) == "metal" else None)
 
-    def _screening(mpa_plan, iteration_head_response):
+    def _screening(mpa_plan, iteration_head_response, *, producer=None,
+                   quad_override=None):
         """Call the driver-owned producer/reuse provider at one map seam."""
-        return inputs.screening_model_fn(
+        used_producer = (inputs.screening_model_fn
+                         if producer is None else producer)
+        used_quad = inputs.quad if quad_override is None else quad_override
+        return used_producer(
             inputs.config.compute_mode, wfns_qp, inputs.V_q,
-            quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
+            quad=used_quad, e_ref=inputs.e_ref, sym=inputs.sym,
             centroid_indices=inputs.centroid_indices, config=inputs.config,
             meta=inputs.meta, mesh_xy=inputs.mesh_xy,
             run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
@@ -2520,9 +2529,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 "MPA certified-fit reuse with no screening quadrature cannot "
                 "serve head_correction=full, whose current-iteration head "
                 "must be folded through newly sampled W")
-        screening_reuse = _screening(None, None)
-        if isinstance(screening_reuse, dict):
-            certified_fit = screening_reuse.get("mpa_fit")
+        certified_fit = inputs.certified_fit_path
+        if state.iteration == 0:
+            screening_reuse = inputs.screening_seed
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
@@ -2667,9 +2676,25 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
     # The pre-plan reuse call already returned this map's complete fit mapping.
     # A live producer runs here, after the current head response exists.
-    W_by_role = (
-        screening_reuse if screening_reuse is not None
-        else _screening(mpa_plan, iteration_head_response))
+    if screening_reuse is not None:
+        W_by_role = screening_reuse
+    elif mpa_mode and inputs.quad is None:
+        # The external fit is valid only for the occupation state stamped in
+        # it.  Once the SC spectrum changes, keep its exactly reconstructed
+        # sample geometry but run the canonical producer on this map's live
+        # occupations.  ``build_mpa_fit`` needs only the original frequency
+        # ceiling from the quadrature object when an explicit plan is given.
+        from types import SimpleNamespace
+        from .mpa import sample_plan as _sample_plan
+        from .screening import compute_screening_model as _live_screening
+        plan_z = np.asarray(
+            _sample_plan.plan_z(mpa_plan), dtype=np.complex128)
+        stored_ceiling = SimpleNamespace(x_max=float(np.max(plan_z.real)))
+        W_by_role = _screening(
+            mpa_plan, iteration_head_response,
+            producer=_live_screening, quad_override=stored_ceiling)
+    else:
+        W_by_role = _screening(mpa_plan, iteration_head_response)
 
     # MPA owns a shared complex-frequency model rather than the finite role
     # table above.  Its fit mapping is not a body-W role mapping; without
@@ -4550,6 +4575,37 @@ def run_sc_driver(
         print_fn=print_fn,
     )
     state_init = make_initial_state_from_dft(inputs)
+    if config.compute_mode is ComputeMode.MPA and quad is None:
+        if config.head.correction is HeadCorrection.FULL:
+            raise ValueError(
+                "MPA certified-fit reuse with no screening quadrature cannot "
+                "serve head_correction=full, whose current-iteration head "
+                "must be folded through newly sampled W")
+        metal_occ_state = (
+            state_init.occupation_state
+            if _material_class(inputs) == "metal" else None)
+        screening_seed = screening_model_fn(
+            config.compute_mode, wfns, V_q,
+            quad=quad, e_ref=e_ref, sym=sym,
+            centroid_indices=centroid_indices, config=config, meta=meta,
+            mesh_xy=mesh_xy,
+            run_dir=os.path.join(input_dir, "tmp", "mpa"),
+            label="sc_0000", head_resolver=head_resolver,
+            head_channel=head_channel, wfn=wfn,
+            mpa_plan=None, iteration_head_response=None,
+            occupation_state=metal_occ_state,
+            tensors_filename=tensors_filename,
+            print_fn=print_fn)
+        certified_fit_path = (
+            screening_seed.get("mpa_fit")
+            if isinstance(screening_seed, dict) else None)
+        if certified_fit_path is None:
+            raise ValueError(
+                "MPA SC has no screening quadrature and its reuse provider "
+                "did not return an already-resolved {'mpa_fit': path} seed")
+        inputs = dataclasses.replace(
+            inputs, screening_seed=screening_seed,
+            certified_fit_path=os.fspath(certified_fit_path))
     # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
     # deprecated overrides, applied at config construction).
     sc = config.sc
