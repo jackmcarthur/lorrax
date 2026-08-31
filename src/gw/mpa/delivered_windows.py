@@ -68,6 +68,13 @@ TIGHTEN_FLOOR = 0.05
 MAX_WINDOW_TAU_PAIRS = 200
 _PLAN_CACHE_VERSION = 6
 
+# Refusal recovery is deliberately bounded independently of the deck.  These
+# are planner safety certificates, not accuracy/resource dials: a crossing
+# support gets at most ten bisections and the complete plan may never explode
+# past 128 product pieces while trying to recover it.
+_MAX_REFUSAL_SPLIT_DEPTH = 10
+_MAX_REFUSAL_SPLIT_PIECES = 128
+
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
 # select those tables safely.
@@ -1243,6 +1250,120 @@ def _window_kind(problem):
     return "crossing"
 
 
+def _spec_crossing_radius(spec):
+    """Return ``A/gamma`` for comparing exact product bisections."""
+    denominator = np.asarray(spec["problem"].denominators, np.complex128)
+    return (float(np.max(np.abs(denominator.real)))
+            / float(np.min(np.abs(denominator.imag))))
+
+
+def _rebuild_split_spec(spec, state_positions, omega_rows, state_interval,
+                        suffix, bins):
+    """Rebuild one exact state-interval x omega-interval child."""
+    state_positions = np.asarray(state_positions, np.int64)
+    omega_rows = np.asarray(omega_rows, np.int64)
+    frequencies = np.asarray(spec["problem"].frequencies)[omega_rows]
+    product = _product_problem(
+        state_positions, spec["pole_bounds"], spec["measure"], frequencies,
+        spec["pole_sign"], int(bins))
+    if product is None:
+        return None
+    problem, validation, pole_indices = product
+    envelope_by_frequency = (
+        problem.cell_masses[None, :] / np.abs(problem.denominators)).sum(axis=1)
+    raw_energy = (float(spec["pole_sign"])
+                  * np.asarray(spec["measure"][0], np.float64))
+    selected_raw = raw_energy[state_positions]
+    E_ref = float(np.min(selected_raw))
+    kind = _window_kind(problem)
+    if kind != "crossing":
+        _rotated, transform = _sign_definite_orientation(problem)
+        table_sign = 1.0 if transform.startswith("positive") else -1.0
+        if float(spec["pole_sign"]) * table_sign > 0.0:
+            E_ref = float(np.max(selected_raw))
+    child = dict(spec)
+    child.update(
+        name=f"{spec['name']}[split={suffix}]",
+        problem=problem,
+        validation=validation,
+        kind=kind,
+        pole_indices=pole_indices,
+        state_positions=state_positions,
+        state_indices=np.asarray(spec["measure"][2])[state_positions],
+        raw_state_energy=selected_raw,
+        state_interval=tuple(map(float, state_interval)),
+        E_ref_A=E_ref,
+        omega_abs=np.asarray(spec["omega_abs"])[omega_rows],
+        omega_idx=np.asarray(spec["omega_idx"])[omega_rows],
+        envelope=float(np.max(envelope_by_frequency)))
+    return child
+
+
+def _split_refused_crossing_spec(spec, bins):
+    """Bisect a refused crossing rectangle along its effective wide axis.
+
+    Omega is preferred when its bisection reduces the worst child radius at
+    least as much as a state bisection.  Otherwise the measured state spread
+    dominates and the state interval is bisected instead.  Both choices are
+    exact disjoint product windows.
+    """
+    if spec["kind"] != "crossing":
+        return None
+    omega_count = int(np.asarray(spec["omega_idx"]).size)
+    omega_children = None
+    if omega_count > 1:
+        omega_parts = np.array_split(np.arange(omega_count), 2)
+        omega_children = tuple(_rebuild_split_spec(
+            spec, spec["state_positions"], rows, spec["state_interval"],
+            f"omega-{part + 1}/2", bins)
+            for part, rows in enumerate(omega_parts))
+        if any(child is None for child in omega_children):
+            omega_children = None
+
+    raw = np.asarray(spec["raw_state_energy"], np.float64)
+    order = np.argsort(raw, kind="stable")
+    distinct_cuts = np.nonzero(np.diff(raw[order]) > 0.0)[0] + 1
+    state_children = None
+    if distinct_cuts.size:
+        cut = int(distinct_cuts[np.argmin(np.abs(
+            distinct_cuts - 0.5 * order.size))])
+        lower_order, upper_order = order[:cut], order[cut:]
+        boundary = 0.5 * (raw[lower_order[-1]] + raw[upper_order[0]])
+        state_lo, state_hi = spec["state_interval"]
+        state_children = (
+            _rebuild_split_spec(
+                spec, np.asarray(spec["state_positions"])[lower_order],
+                np.arange(omega_count), (state_lo, boundary),
+                "state-1/2", bins),
+            _rebuild_split_spec(
+                spec, np.asarray(spec["state_positions"])[upper_order],
+                np.arange(omega_count), (boundary, state_hi),
+                "state-2/2", bins),
+        )
+        if any(child is None for child in state_children):
+            state_children = None
+
+    if omega_children is None:
+        return state_children
+    if state_children is None:
+        return omega_children
+    omega_radius = max(_spec_crossing_radius(child)
+                       for child in omega_children)
+    state_radius = max(_spec_crossing_radius(child)
+                       for child in state_children)
+    return omega_children if omega_radius <= state_radius else state_children
+
+
+def _combined_spec_envelope(specs, size):
+    """Reassemble the exact per-frequency envelope after product splits."""
+    combined = np.zeros(int(size), dtype=np.float64)
+    for spec in specs:
+        envelope = (spec["problem"].cell_masses[None, :]
+                    / np.abs(spec["problem"].denominators)).sum(axis=1)
+        combined[np.asarray(spec["omega_idx"], np.int64)] += envelope
+    return combined
+
+
 def _rule_metrics(problem, times, weights):
     """Measure residual and amplification from one shared phase matrix."""
     kept, delivered, _excluded = problem.retained()
@@ -2264,22 +2385,92 @@ def build_delivered_sigma_windows(
         # the shipped crossing rule up front cost ~1 s per window for nothing,
         # and refitting the adapted rule on retry cost far more (132 s vs 85 s
         # measured on the Na deck), so both are avoided here.
-        base_specs = specs
+        base_specs = list(specs)
+        base_candidates = [None] * len(base_specs)
+        split_depths = [0] * len(base_specs)
+        while any(candidates is None for candidates in base_candidates):
+            pending = [index for index, candidates in enumerate(base_candidates)
+                       if candidates is None]
 
-        def fit_window(index):
-            return _window_candidates_profiled(
-                base_specs[index], eta, pair_ceiling, factor_cap,
-                allowances[index], adapted_only=True)
+            def fit_window(index):
+                position = pending[index]
+                return _window_candidates_profiled(
+                    base_specs[position], eta, pair_ceiling, factor_cap,
+                    allowances[position], adapted_only=True)
 
-        fit_started = time.perf_counter()
-        base_candidates, window_fit_rows = _run_parallel_planner_jobs(
-            len(base_specs), fit_window, refuse_errors=False)
-        window_parallel_seconds += time.perf_counter() - fit_started
-        _emit_window_census(
-            base_specs, eta, allowances,
-            candidates_by_window=base_candidates,
-            planner_rows=window_fit_rows, source="live_fit")
-        _raise_first_planner_refusal(window_fit_rows)
+            fit_started = time.perf_counter()
+            pending_candidates, pending_rows = _run_parallel_planner_jobs(
+                len(pending), fit_window, refuse_errors=False)
+            window_parallel_seconds += time.perf_counter() - fit_started
+            window_fit_rows.extend(pending_rows)
+            census_rows = [{"error": None} for _spec in base_specs]
+            for local, position in enumerate(pending):
+                census_rows[position] = pending_rows[local]
+                if pending_rows[local]["error"] is None:
+                    base_candidates[position] = pending_candidates[local]
+            _emit_window_census(
+                base_specs, eta, allowances,
+                candidates_by_window=base_candidates,
+                planner_rows=census_rows, source="live_fit")
+
+            refused = [
+                (position, pending_rows[local])
+                for local, position in enumerate(pending)
+                if pending_rows[local]["error"] is not None]
+            if not refused:
+                break
+            replacements = {}
+            blocking = None
+            for position, row in refused:
+                children = None
+                if split_depths[position] < _MAX_REFUSAL_SPLIT_DEPTH:
+                    children = _split_refused_crossing_spec(
+                        base_specs[position], int(lattice_bins))
+                if children is None:
+                    blocking = row
+                    break
+                replacements[position] = children
+            resulting_count = len(base_specs) + len(replacements)
+            if (blocking is None
+                    and resulting_count > _MAX_REFUSAL_SPLIT_PIECES):
+                blocking = refused[0][1]
+            if blocking is not None:
+                message = blocking["error"]["message"]
+                raise RuntimeError(
+                    f"{message}; split fallback exhausted at "
+                    f"depth<={_MAX_REFUSAL_SPLIT_DEPTH}, "
+                    f"pieces<={_MAX_REFUSAL_SPLIT_PIECES}")
+
+            next_specs, next_candidates, next_depths = [], [], []
+            for position, (spec, candidates, depth) in enumerate(zip(
+                    base_specs, base_candidates, split_depths)):
+                children = replacements.get(position)
+                if children is None:
+                    next_specs.append(spec)
+                    next_candidates.append(candidates)
+                    next_depths.append(depth)
+                else:
+                    next_specs.extend(children)
+                    next_candidates.extend([None] * len(children))
+                    next_depths.extend([depth + 1] * len(children))
+            base_specs = next_specs
+            base_candidates = next_candidates
+            split_depths = next_depths
+            specs = base_specs
+            combined_envelope = _combined_spec_envelope(
+                specs, omega_grid.size)
+            combined_scale = float(np.max(combined_envelope))
+            total_absolute = target * combined_scale * safety
+            allowances = [min(0.5, total_absolute / spec["envelope"])
+                          for spec in specs]
+            derived_ceiling = _derived_pair_ceiling(specs, eta)
+            pair_ceiling = (min(derived_ceiling, int(max_nodes))
+                            if max_nodes is not None else derived_ceiling)
+            cache_fingerprint = _plan_cache_fingerprint(
+                specs, eta=eta, target=target, safety=safety,
+                factor_cap=factor_cap, pair_ceiling=pair_ceiling,
+                grid_mode=grid_mode, lattice_bins=lattice_bins)
+        specs = base_specs
         fits = None
         consolidation_cache = None
         shortfall = None
