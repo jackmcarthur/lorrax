@@ -379,9 +379,11 @@ def _add_exact_four_current_hartree(base, scalar, transverse):
 class SCOutputs:
     """Output-only records captured from one map call.
 
-    Purely for the final output writers (``run_sc_driver``'s finalize,
-    ``dump_sigma_omega_h5_final``, ``dump_qp_wfn_artifacts``, the per-map
-    snapshot); nothing here feeds the next fixed-point evaluation.
+    Captured for the verdict on this map and for the final output writers
+    (``run_sc_driver``'s finalize, ``dump_sigma_omega_h5_final``,
+    ``dump_qp_wfn_artifacts``, the per-map snapshot); nothing here feeds the
+    next fixed-point evaluation.  ``partition`` is the live, mu-anchored band
+    set used by both this map's scissor and its convergence verdict.
 
     ``sigma_result`` and ``sigma_basis_U`` are on the FULL BZ and must
     AGREE, because they are consumed together by ``run_sc_driver``'s
@@ -435,8 +437,9 @@ class SCState:
     Sigma (compute_sigma_xc); insulating decks pass None and keep the
     historical occupations bit-exactly.
 
-    ``outputs`` (an ``SCOutputs`` record) is purely for the final output
-    writers; it does not feed the next iteration.  Its ``sigma_basis_U``
+    ``outputs`` (an ``SCOutputs`` record) supplies this map's convergence
+    verdict and the final output writers; it does not feed the next map.
+    Its ``sigma_basis_U``
     is the DFT→QP unitary that DEFINED the basis ``sigma_result`` was
     computed in (the eigh of the *previous* carry) — the writer must
     rotate Σ back to DFT with THIS U, not the converged U of the final
