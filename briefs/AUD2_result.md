@@ -27,6 +27,7 @@ I therefore did **not** test its scaling claim, cross-P determinism, or budgets
 at frequencies absent from the supplied enumeration.
 
 Defects and exact affected lines are recorded in `KNOWN_LORRAX_ISSUES.md`.
-The prescribed CPU gate is the verification for this documentation-only
-branch; no GPU path was changed, so the four-GPU rule's unit/CPU exemption
-applies.  Branch: `audit/round2-2026-08-31`.
+The prescribed CPU gate passed **134 tests / 0 failures** in **82.54 s**.
+This branch changes documentation only, so no GPU path was changed and the
+four-GPU rule's unit/CPU exemption applies.  Branch:
+`audit/round2-2026-08-31`.
