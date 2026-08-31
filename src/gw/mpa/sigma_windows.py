@@ -381,10 +381,9 @@ def build_shared_sigma_windows(
     regularization_width_ry: float,
     edge_factor: float,
     target_error: float,
-    crossing_target_error: float | None = None,
     max_rank: int,
     crossing_max_nodes: int,
-    omega_cluster_gap_ry: float = 1.0,
+    omega_grid_step_ry: float,
     occupation_window_threshold: float = OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """Build the complete MPA frequency plan from summarized pole bounds.
@@ -401,22 +400,17 @@ def build_shared_sigma_windows(
     causal branches use the existing rotated-Laplace minimax service.  Pole
     batching is solely an executor memory policy and never a spectral split.
 
-    ``target_error`` and ``crossing_target_error`` both bound the same
-    dimensionless relative residual ``|1-d Q(d)|``.  The latter defaults to
-    the former for direct callers; production MPA supplies independently
-    validated budgets because the two rule families have different
-    observable sensitivity.
+    ``target_error`` bounds the dimensionless residual ``|1-d Q(d)|``.
+    The delivered planner apportions it among windows by delivered mass.
 
-    ``omega_cluster_gap_ry`` splits each branch's |ω| evaluation values
-    into clusters at gaps larger than the given value.  With one cluster
-    (every contiguous grid) the plan is the incumbent monolithic core,
-    bit-for-bit.  With several (a patched semicore grid), the core is
-    decomposed per cluster into a small crossing SHELL — bandwidth set by
-    the cluster span and the pole bracket, independent of the dynamic
-    range — plus sign-definite bulk slabs on the logarithmic
-    rotated-Laplace family; the metallic sd sliver decomposes on the same
-    pattern.  Derivation and cost law:
-    ``docs/dev/crossing-rule-cost-law.md``.
+    Omega clusters come from the requested grid and its own step
+    (``sigma_omega_step_ev``), not from a separate tolerance.  Every patch in
+    ``sigma_omega_patches_ev`` is built AT that step, so consecutive samples
+    within a patch sit exactly one step apart and only a patch boundary can
+    exceed it; a break wider than 1.5 steps is therefore a genuinely missing
+    patch.  Patched semicore grids split, contiguous grids stay monolithic
+    bit-for-bit, and a patch holding a single sample is still resolved — which
+    is why the step is read from the deck rather than inferred from spacings.
 
     ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves a
     Green's-function branch; :func:`_weight_floor` converts it to the branch
@@ -426,11 +420,9 @@ def build_shared_sigma_windows(
     the value given to :func:`summarize_sigma_poles`.
     """
     sector_error = float(target_error)
-    crossing_error = (sector_error if crossing_target_error is None
-                      else float(crossing_target_error))
-    if not (0.0 < sector_error < 1.0
-            and 0.0 < crossing_error < 1.0):
-        raise ValueError("MPA Sigma target errors must lie in (0, 1)")
+    crossing_error = sector_error
+    if not 0.0 < sector_error < 1.0:
+        raise ValueError("MPA Sigma target error must lie in (0, 1)")
 
     summaries = tuple(pole_summaries)
     if not summaries:
@@ -538,10 +530,10 @@ def build_shared_sigma_windows(
                 np.asarray(phases, bool),
                 band_weight=branch.band_weight))
 
-    gap_ry = float(omega_cluster_gap_ry)
+    gap_ry = 1.5 * float(omega_grid_step_ry)
     if not (np.isfinite(gap_ry) and gap_ry > 0.0):
         raise ValueError(
-            "MPA sigma omega_cluster_gap_ry must be finite and positive")
+            "MPA sigma omega grid step must be finite and positive")
     #: The same protection the crossing_edge carries: edge margin + the
     #: worst wrong-side excursion across all branches.
     margin = crossing_edge - omega_max
@@ -926,9 +918,8 @@ def build_shared_sigma_windows(
 
     return output, {"eta_ry": eta, "omega_max_ry": omega_max,
                     "crossing_edge_ry": crossing_edge,
-                    "sector_target_error": sector_error,
-                    "crossing_target_error": crossing_error,
-                    "omega_cluster_gap_ry": gap_ry,
+                    "target_error": sector_error,
+                    "omega_gap_ry": gap_ry,
                     "n_windows": len(output),
                     "n_tau": int(sum(row.window.n_tau for row in output))}
 

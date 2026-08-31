@@ -696,35 +696,6 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "deferral, DESIGN_2026-08-15.md section 1",
     ),
     (
-        # ``mpa_material_class`` is the authority for which MPA material
-        # formulation the deck requests.  The metal branch now also requires
-        # explicit smearing metadata, but that metadata does not weaken this
-        # rule: every certified w_bse path is insulating, so the material
-        # class alone is the complete parse-time predicate.  A fractional
-        # WFN whose deck never declares metal is caught by the runtime
-        # occupation gate (gw/screening_bse.py, the same rule id).
-        "w_bse_insulators_only",
-        lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
-                     .strip().lower() != "insulator"),
-        lambda cfg: f"mpa_material_class = {cfg.mpa.material_class}",
-        "mpa_material_class = insulator (the default) -- w_bse v1 serves "
-        "insulating systems only",
-        "drop mpa_material_class (or set it to insulator) for a gapped "
-        "system, or keep screening_diagrams = w_rpa for a metal",
-        "the ladder operator, its TRS-gauge machinery and every "
-        "certification this feature has are INSULATOR-DERIVED: integer "
-        "occupations and a gapped D throughout (the pair basis is a "
-        "band-index cut at nelec, and the resolvent's poles are the "
-        "transition energies that cut produces).  Partial occupations "
-        "enter BOTH -- the pair basis gains partially-blocked transitions "
-        "and (z - H)^-1 gains poles at ~0 -- in ways nothing here has "
-        "measured, so the run would produce a complete, plausible W under "
-        "a diagram set that was never verified for it.  The metallic MPA "
-        "screening/Sigma pipeline is live under screening_diagrams = w_rpa; "
-        "that is the supported alternative, not evidence that the distinct "
-        "ladder operator has acquired fractional-occupation semantics",
-    ),
-    (
         "w_bse_head_placement_unimplemented",
         lambda cfg: str(cfg.head.mc_average_placement) != "off",
         lambda cfg: f"mc_average_placement = {cfg.head.mc_average_placement}",
@@ -2110,7 +2081,6 @@ _DEFAULTS = {
     "ppm_sigma_max_nodes": 64,
     # Multipole W sampling / bounded Sigma consumption.
     "mpa_n_poles": 8,
-    "mpa_material_class": "insulator",
     "mpa_sampling_alpha": 1,
     # The incumbent nested extension and the literal Leon/Yambo qPPS
     # continuation agree through eight poles and differ from nine onward.
@@ -2129,17 +2099,10 @@ _DEFAULTS = {
     # key, and therefore TWICE the Ha value the papers quote.
     "mpa_metal_origin_shift_ry": None,
     "mpa_pole_batch_size": 4,
-    # Both targets bound the same dimensionless relative residual
-    # |1-d Q(d)|.  They are separate because the positive crossing rule is
-    # demonstrably less observable-sensitive than the support-selected
-    # sign-definite rules on the validated MPA Sigma gate.
+    # One delivered-error target. The planner apportions it among windows
+    # according to their measured delivered mass.
     "mpa_sigma_sector_target_error": 6.5e-4,
-    "mpa_sigma_crossing_target_error": 2.0e-3,
     "mpa_sigma_max_nodes": 96,
-    # Σ planner ω-clustering gap (Ry): with a gapped (patched) ω grid the
-    # crossing core decomposes per cluster; a contiguous grid is always
-    # one cluster and keeps the incumbent plan bit-for-bit.
-    "mpa_sigma_omega_cluster_gap_ry": 1.0,
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
     # the applied floor is 1 − threshold: 0.995 ⇒ |weight| > 0.005.  It is
@@ -3625,9 +3588,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         (config.qp_solver is QPSolver.ONE_SHOT_DFT,
          f"qp_solver = {config.qp_solver.value}",
          "qp_solver = one_shot_dft"),
-        (str(config.mpa.material_class).strip().lower() == "insulator",
-         f"mpa_material_class = {config.mpa.material_class}",
-         "mpa_material_class = insulator"),
         (not bool(config.restart), "restart = true", "restart = false"),
         (mode is BispinorGWMode.FULL_STATIC_COHSEX
          or int(config.sys_dim) == 2,
@@ -4138,7 +4098,6 @@ class MPAConfig:
     """Multipole sample geometry and bounded pole-consumption policy."""
 
     n_poles: int
-    material_class: str
     sampling_alpha: int
     sampling_schedule: str
     pole_solver: str
@@ -4149,16 +4108,7 @@ class MPAConfig:
     metal_origin_shift_ry: float | None
     pole_batch_size: int
     sigma_sector_target_error: float
-    sigma_crossing_target_error: float
     sigma_max_nodes: int
-    #: ``mpa_sigma_omega_cluster_gap_ry``: the Σ planner splits each
-    #: branch's |ω| evaluation values into clusters at gaps larger than
-    #: this, decomposing the crossing core per cluster (shell + Laplace
-    #: slabs) so the eta-resolved rule bandwidth is set by the cluster
-    #: span, not the dynamic range.  A contiguous grid is always one
-    #: cluster (the incumbent plan, bit-for-bit); pair with
-    #: ``sigma_omega_patches_ev`` to actually gap the grid.
-    sigma_omega_cluster_gap_ry: float = 1.0
     #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
     #: counting toward a metallic Green's-function branch.  The Σ planner's
     #: cut is on the branch WEIGHT (``f`` on val, ``1 − f`` on cond), so the
@@ -4174,10 +4124,6 @@ class MPAConfig:
     def __post_init__(self):
         if not 1 <= self.n_poles <= 16:
             raise ValueError("mpa_n_poles must be in [1, 16]")
-        if self.material_class not in ("insulator", "metal"):
-            raise ValueError(
-                "mpa_material_class must be 'insulator' or 'metal'; "
-                f"got {self.material_class!r}")
         if self.sampling_alpha not in (1, 2):
             raise ValueError("mpa_sampling_alpha must be 1 or 2")
         if self.sampling_schedule not in ("nested", "leon"):
@@ -4192,17 +4138,7 @@ class MPAConfig:
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
-        # The origin shift is metal-only geometry: an insulating plan puts
-        # its first near-line sample at z = 0 exactly, so a shift there is
-        # an off-dial that must refuse rather than be ignored.
         if self.metal_origin_shift_ry is not None:
-            if self.material_class != "metal":
-                raise ValueError(
-                    "mpa_metal_origin_shift_ry is a metal-only key "
-                    f"(mpa_material_class = {self.material_class} here): it "
-                    "moves the METAL near line's first sample off zero, and "
-                    "an insulating plan samples z = 0 exactly. Remove it, or "
-                    "set mpa_material_class = metal.")
             if not (0.0 < self.metal_origin_shift_ry < self.varpi_near_ry):
                 raise ValueError(
                     "mpa_metal_origin_shift_ry must satisfy 0 < shift < "
@@ -4216,13 +4152,8 @@ class MPAConfig:
                     "default 1e-5 Ha = 2e-5 Ry).")
         if self.sigma_max_nodes < 2:
             raise ValueError("mpa_sigma_max_nodes must be at least two")
-        if not (np.isfinite(self.sigma_omega_cluster_gap_ry)
-                and self.sigma_omega_cluster_gap_ry > 0.0):
-            raise ValueError(
-                "mpa_sigma_omega_cluster_gap_ry must be finite and "
-                "positive (Ry); a huge value disables clustering")
 
-    def sample_plan(self, omega_m_ry):
+    def sample_plan(self, omega_m_ry, *, material_class):
         """Return the configured double-parallel frequency plan in Ry.
 
         This is sampling geometry only.  In particular, constructing a
@@ -4233,7 +4164,7 @@ class MPAConfig:
 
         return mpa_plan(
             self.n_poles, omega_m_ry,
-            material_class=self.material_class,
+            material_class=material_class,
             alpha=self.sampling_alpha,
             schedule=self.sampling_schedule,
             varpi_near=self.varpi_near_ry,
@@ -4440,13 +4371,8 @@ class BSEConfig:
 _OCC_WIDTH_RTOL = 1.0e-4
 
 
-def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
-    """Cross-key deck validation for the metallic occupation model.
-
-    Metal decks must declare the smearing pair and the two Sigma keys the
-    metallic MPA path actually honors; insulating decks must not carry the
-    smearing pair at all (an off-dial refusal, never a silent ignore).
-    Module-level so tests exercise it without a full parse.
+def _validate_occupation_smearing(screening, family, width_ry):
+    """Validate the occupation-smearing pair without classifying the WFN.
 
     THE WIDTH CONVENTION, stated once, here, because two keys carry it.
     ``occ_smearing_width_ry`` and ``occ_broadening`` are the SAME width in
@@ -4456,15 +4382,12 @@ def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
     resolved, because the two ways of being wrong (halving or doubling the
     smearing) are indistinguishable in the output.
     """
-    if mpa.material_class == "metal":
-        if family is None or width_ry is None:
-            raise ValueError(
-                "mpa_material_class = metal requires the occupation "
-                "smearing pair: set occ_smearing_family = mp1 and "
-                "occ_smearing_width_ry = <BerkeleyGW occ_broadening, in "
-                "Ry> = <the QE degauss, in Ry> / 2. "
-                "They cannot be derived from WFN.h5 (mf_header carries "
-                "no smearing metadata).")
+    if (family is None) != (width_ry is None):
+        raise ValueError(
+            "occ_smearing_family and occ_smearing_width_ry must be set "
+            "together; WFN.h5 supplies occupations but not their smearing "
+            "family or width.")
+    if family is not None:
         if family != "mp1":
             raise ValueError(
                 "occ_smearing_family supports only 'mp1' "
@@ -4475,23 +4398,6 @@ def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
             raise ValueError(
                 "occ_smearing_width_ry must be > 0 for a metal; got "
                 f"{width_ry!r}")
-        if sigma.fermi_reference != "mp1_fixed_n":
-            raise ValueError(
-                "mpa_material_class = metal requires fermi_reference = "
-                f"mp1_fixed_n (got {sigma.fermi_reference!r}): the metallic "
-                "Sigma measures energies against the fixed-N MP1 chemical "
-                "potential, not a gap-derived reference.")
-    else:
-        if family is not None or width_ry is not None:
-            raise ValueError(
-                "occ_smearing_family / occ_smearing_width_ry are metal-only "
-                "keys (mpa_material_class = insulator here). Remove them, "
-                "or set mpa_material_class = metal.")
-        if sigma.fermi_reference == "mp1_fixed_n":
-            raise ValueError(
-                "fermi_reference = mp1_fixed_n requires "
-                "mpa_material_class = metal (it names the fixed-N MP1 "
-                "chemical potential, which insulating decks do not solve).")
 
     # Cross-key width agreement, checked last so the class-level off-dial
     # refusals above own their own messages.  ``occ_broadening = 0`` is the
@@ -4517,33 +4423,41 @@ def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
                 f"{RYD_TO_EV} eV/Ry, or remove one of them.")
 
 
-def _validate_metal_compute_mode(config):
-    """Bind the declared metal formulation to its occupation-aware mode."""
-    if config.mpa.material_class != "metal":
-        return
-    mode = config.compute_mode
-    if mode is ComputeMode.MPA:
-        return
-
-    raw_mode = (config.compute_mode_raw or "auto").strip().lower()
-    got_mode = (
-        f"compute_mode = auto (resolved to {mode.value})"
-        if raw_mode == "auto" else f"compute_mode = {mode.value}")
-    raise ValueError(
-        "GATE metal_material_class_requires_mpa: "
-        "mpa_material_class = metal is refused outside the "
-        "occupation-aware MPA path.\n"
-        f"  got: mpa_material_class = metal; {got_mode}\n"
-        "  want: mpa_material_class = metal with compute_mode = mpa\n"
-        "  fix: set compute_mode = mpa for a metal, or set "
-        "mpa_material_class = insulator for an x_only / cohsex / gn_ppm / "
-        "hl_ppm run\n"
-        f"  why: the compute_mode = {mode.value} head route accepts no "
-        "occupation_state and uses step occupations from the dipole/static "
-        "head path; it cannot honor the fixed-N MP1 mu, fractional "
-        "occupations, Drude term, or Thomas-Fermi limit declared by the "
-        "metal key\n"
-        "  doc: docs/theory/metallic-mpa-screening.md")
+def validate_material_inputs(config, material_class):
+    """Validate deck inputs after occupations determine the material class."""
+    if material_class not in ("insulator", "metal"):
+        raise ValueError(f"unknown inferred material class {material_class!r}")
+    family = config.occ_smearing_family
+    width_ry = config.occ_smearing_width_ry
+    if material_class == "metal":
+        if config.compute_mode is not ComputeMode.MPA:
+            raise ValueError(
+                "GATE fractional_occupations_require_mpa: WFN occupations "
+                f"identify a metal, but compute_mode={config.compute_mode.value}; "
+                "use compute_mode=mpa, the occupation-aware path.")
+        if family is None or width_ry is None:
+            raise ValueError(
+                "metallic WFN occupations require occ_smearing_family=mp1 "
+                "and occ_smearing_width_ry=<BerkeleyGW width in Ry>; WFN.h5 "
+                "does not store that metadata.")
+        if config.sigma.fermi_reference != "mp1_fixed_n":
+            raise ValueError(
+                "metallic WFN occupations require fermi_reference="
+                f"mp1_fixed_n (got {config.sigma.fermi_reference!r}).")
+    else:
+        if family is not None or width_ry is not None:
+            raise ValueError(
+                "integer WFN occupations identify an insulator, so "
+                "occ_smearing_family/occ_smearing_width_ry would be unused; "
+                "remove them.")
+        if config.sigma.fermi_reference == "mp1_fixed_n":
+            raise ValueError(
+                "integer WFN occupations identify an insulator, which has "
+                "no fixed-N MP1 chemical potential; choose vbm or midgap.")
+        if config.mpa.metal_origin_shift_ry is not None:
+            raise ValueError(
+                "mpa_metal_origin_shift_ry is metal-only, but WFN "
+                "occupations identify an insulator; remove the key.")
 
 
 @dataclass(frozen=True)
@@ -4693,8 +4607,7 @@ class LorraxConfig:
     input_file: str = ""
 
     def __post_init__(self):
-        """Refuse metallic and head settings outside their landed scope."""
-        _validate_metal_compute_mode(self)
+        """Refuse head settings outside their landed scope."""
         if self.eqp2.enabled:
             if self.qp_solver is not QPSolver.ONE_SHOT_DFT:
                 raise ValueError(
@@ -5121,7 +5034,6 @@ class LorraxConfig:
         )
         mpa = MPAConfig(
             n_poles=int(_g("mpa_n_poles")),
-            material_class=str(_g("mpa_material_class")).strip().lower(),
             sampling_alpha=int(_g("mpa_sampling_alpha")),
             sampling_schedule=str(
                 _g("mpa_sampling_schedule")).strip().lower(),
@@ -5134,11 +5046,7 @@ class LorraxConfig:
             pole_batch_size=int(_g("mpa_pole_batch_size")),
             sigma_sector_target_error=float(
                 _g("mpa_sigma_sector_target_error")),
-            sigma_crossing_target_error=float(
-                _g("mpa_sigma_crossing_target_error")),
             sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
-            sigma_omega_cluster_gap_ry=float(
-                _g("mpa_sigma_omega_cluster_gap_ry")),
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
         )
@@ -5185,8 +5093,7 @@ class LorraxConfig:
             if _occ_family is not None else None)
         _occ_width = _g("occ_smearing_width_ry")
         _occ_width = float(_occ_width) if _occ_width is not None else None
-        _validate_occupation_smearing(
-            mpa, sigma, screening, _occ_family, _occ_width)
+        _validate_occupation_smearing(screening, _occ_family, _occ_width)
         # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
         # of the sc_* input keys (kept so existing sweep scripts run
         # unchanged); a note is printed whenever one is active.
@@ -5225,7 +5132,7 @@ class LorraxConfig:
             head_update=str(_g("sc_head_update")).strip().lower(),
         )
         eqp2 = EQP2Config(
-            enabled=_eqp2_enabled,
+            enabled=bool(_g("write_eqp2")),
             tol_ev=float(_g("eqp2_tol_ev")),
             max_iter=int(_g("eqp2_max_iter")),
             accelerator=str(_g("eqp2_accelerator")).strip().lower(),

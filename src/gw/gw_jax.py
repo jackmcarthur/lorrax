@@ -100,7 +100,8 @@ import common.timing as timing
 from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver,
 	ScreeningDiagrams, refuse_unimplemented_compute_mode,
-	uses_four_spinor_finite_q_charge, uses_static_photon_response)
+	uses_four_spinor_finite_q_charge, uses_static_photon_response,
+	validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -202,7 +203,16 @@ def _compute_static_head(
 	return terms
 
 
-def _oneshot_mpa_occupation_state(config, wfn, wfns):
+def _infer_material_class(wfn) -> str:
+	"""Classify the loaded mean field from its supplied occupations."""
+	occ = np.asarray(wfn.occs, dtype=np.float64)
+	if occ.size == 0 or not np.all(np.isfinite(occ)):
+		raise ValueError("WFN occupations must be finite and nonempty")
+	distance = np.abs(occ - np.rint(occ))
+	return "metal" if float(np.max(distance)) > 1.0e-6 else "insulator"
+
+
+def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class):
 	"""Solve the fixed-N MP1 state consumed by one-shot metallic MPA.
 
 	The self-consistent driver already solves this state at map entry.  A
@@ -210,7 +220,7 @@ def _oneshot_mpa_occupation_state(config, wfn, wfns):
 	record to the MPA fit and Sigma; reconstructing either the chemical
 	potential or occupations at a consumer would violate the one-state rule.
 	"""
-	if str(getattr(config.mpa, "material_class", "insulator")) != "metal":
+	if material_class != "metal":
 		return None
 	from psp.get_DFT_mtxels import spin_degeneracy_factor
 	from .efermi import OccupationState
@@ -355,6 +365,9 @@ def main(argv=None):
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
+	material_class = _infer_material_class(wfn)
+	validate_material_inputs(config, material_class)
+	print0(f"  Material class: {material_class} (inferred from WFN occupations)")
 	sym = wfn.symmetry()
 	centroid_basis = load_centroid_basis(
 		config.paths.centroids_file, wfn.fft_grid, sym=sym)
@@ -497,7 +510,7 @@ def main(argv=None):
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
 	oneshot_occupation_state = (
-		_oneshot_mpa_occupation_state(config, wfn, wfns)
+		_oneshot_mpa_occupation_state(config, wfn, wfns, material_class)
 		if (qp_solver is not QPSolver.SELF_CONSISTENT
 			and mode.value == "mpa") else None)
 	if oneshot_occupation_state is not None:
@@ -576,7 +589,8 @@ def main(argv=None):
 		if mode.value == "mpa":
 			from .mpa import sample_plan
 			from .mpa.model import make_mpa_plan
-			oneshot_mpa_plan = make_mpa_plan(config, quad)
+			oneshot_mpa_plan = make_mpa_plan(
+				config, quad, material_class=material_class)
 			oneshot_omegas = np.asarray(
 				sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
 		else:
@@ -647,6 +661,7 @@ def main(argv=None):
 					mpa_plan=oneshot_mpa_plan,
 					iteration_head_response=oneshot_head_response,
 					occupation_state=oneshot_occupation_state,
+					material_class=material_class,
 					tensors_filename=tensors_filename,
 					print_fn=print0)
 
@@ -758,6 +773,7 @@ def main(argv=None):
 				bispinor_v_q_path=bispinor_v_q_path,
 				photon_response=photon_response,
 				occupation_state=oneshot_occupation_state,
+				material_class=material_class,
 				print_fn=print0,
 			)
 		# Screening bodies have no consumer after Sigma.  In the photon mode
@@ -861,7 +877,8 @@ def main(argv=None):
 				sym=sym, wfn=wfn, centroid_indices=centroid_indices,
 				band_slices=band_slices, input_dir=input_dir,
 				tensors_filename=tensors_filename,
-				enk_dft=enk_dft, print_fn=print0)
+				enk_dft=enk_dft, material_class=material_class,
+				print_fn=print0)
 		sigma_result = sc_result.sigma_result_dft
 		sigma_total = sc_result.sigma_total_dft
 		rotations_written = sc_result.rotations_written

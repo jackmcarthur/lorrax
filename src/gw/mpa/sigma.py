@@ -358,10 +358,9 @@ def compute_sigma_c_mpa_omega_grid(
     regularization_width_ry,
     edge_factor=1.5,
     target_error,
-    crossing_target_error=None,
     max_rank,
     crossing_max_nodes,
-    omega_cluster_gap_ry=1.0,
+    omega_grid_step_ry,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
@@ -427,9 +426,8 @@ def compute_sigma_c_mpa_omega_grid(
                 summaries, branches,
                 regularization_width_ry=regularization_width_ry,
                 edge_factor=edge_factor, target_error=target_error,
-                crossing_target_error=crossing_target_error,
                 max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
-                omega_cluster_gap_ry=omega_cluster_gap_ry,
+                omega_grid_step_ry=omega_grid_step_ry,
                 occupation_window_threshold=occupation_window_threshold)
         else:
             # The delivered measure needs the residues, not only rectangle

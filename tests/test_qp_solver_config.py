@@ -324,15 +324,6 @@ def test_eqp2_dynamic_one_shot_keys_parse(tmp_path):
     assert cfg.eqp2.accelerator == "linear"
     assert cfg.eqp2.history_depth == 3
     assert cfg.paths.eqp2_file.endswith("custom.eqp2")
-    assert cfg.sigma.omega_layout == "sharded"
-
-
-def test_eqp2_explicit_replicated_sigma_cube_refuses(tmp_path):
-    with pytest.raises(ValueError, match="requires sigma_omega_layout=sharded"):
-        _config(
-            tmp_path,
-            "compute_mode = gn_ppm\nwrite_eqp2 = true\n"
-            "sigma_omega_layout = replicated\n")
 
 
 @pytest.mark.parametrize("line,match", [

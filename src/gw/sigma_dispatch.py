@@ -572,6 +572,7 @@ def compute_sigma_xc(
     omit_v_h: bool = False,
     iteration_head=None,
     occupation_state=None,
+    material_class: str,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -1036,7 +1037,7 @@ def compute_sigma_xc(
         # neither output said what xi it ran at.
         _xi = sigma_regularization_for_config(config)
         print_fn(_xi.describe())
-        if config.mpa.material_class == "metal":
+        if material_class == "metal":
             # Metal deck-key consistency is refused at config parse
             # (_validate_occupation_smearing); here the run-level facts:
             # the one-occupation-state rule, and head/body provenance.
@@ -1070,13 +1071,11 @@ def compute_sigma_xc(
             regularization_width_ry=_xi.resolved_ry,
             edge_factor=float(config.sigma.window_edge_factor),
             target_error=float(config.mpa.sigma_sector_target_error),
-            crossing_target_error=float(
-                config.mpa.sigma_crossing_target_error),
             max_rank=int(config.mpa.sigma_max_nodes),
             crossing_max_nodes=max(
                 CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
-            omega_cluster_gap_ry=float(
-                config.mpa.sigma_omega_cluster_gap_ry),
+            omega_grid_step_ry=(
+                float(config.sigma.omega_step_ev) / RYD_TO_EV),
             occupation_window_threshold=float(
                 config.mpa.occupation_window_threshold),
             pole_batch_size=int(config.mpa.pole_batch_size),

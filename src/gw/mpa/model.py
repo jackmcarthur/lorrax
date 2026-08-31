@@ -15,12 +15,12 @@ _CHI = "chi_qmunu_z"
 _WC = "Wc_qmunu_z"
 
 
-def make_mpa_plan(config, quad):
+def make_mpa_plan(config, quad, *, material_class):
     """Build and validate the one frequency plan shared by body and head."""
     n_p = int(config.mpa.n_poles)
     omega_m = float(quad.x_max)
     plan = sample_plan.mpa_plan(
-        n_p, omega_m, material_class=config.mpa.material_class,
+        n_p, omega_m, material_class=material_class,
         alpha=config.mpa.sampling_alpha,
         schedule=config.mpa.sampling_schedule,
         varpi_near=config.mpa.varpi_near_ry,
@@ -30,7 +30,7 @@ def make_mpa_plan(config, quad):
     return plan
 
 
-def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy):
+def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy, material_class):
     """Rebuild and verify the frequency plan stored by a certified fit.
 
     A reused fit has no live screening quadrature.  Its scalar-head sample
@@ -59,7 +59,8 @@ def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy):
     class _StoredFrequencyCeiling:
         x_max = float(np.max(stored_z.real))
 
-    plan = make_mpa_plan(config, _StoredFrequencyCeiling())
+    plan = make_mpa_plan(
+        config, _StoredFrequencyCeiling(), material_class=material_class)
     planned_z = np.asarray(sample_plan.plan_z(plan), dtype=np.complex128)
     if planned_z.shape != stored_z.shape or not np.array_equal(
             planned_z, stored_z):
@@ -395,11 +396,11 @@ def _metal_kminq_rows(sym, q_idx):
     return rows
 
 
-def _require_metal_occupations(config, occupation_state):
+def _require_metal_occupations(material_class, occupation_state):
     """One owner of the metal-needs-occupations refusal (two gates pin it:
     the build_mpa_fit entry, before any inode exists, and the
     _evaluate_samples seam for direct callers)."""
-    if config.mpa.material_class != "insulator" and occupation_state is None:
+    if material_class == "metal" and occupation_state is None:
         raise ValueError(
             "GATE mpa_metal_needs_occupations: a metal MPA plan requires "
             "occupation_state (gw.efermi.OccupationState); got None. "
@@ -409,6 +410,7 @@ def _require_metal_occupations(config, occupation_state):
 
 def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *,
+    material_class,
     energy_reference, occupation_state, write_full, write_wedge,
     static_gamma_override, gamma_row, kminq_rows,
 ):
@@ -434,8 +436,8 @@ def _evaluate_samples(
         occupation_support_bandwidth,
     )
 
-    metal = config.mpa.material_class != "insulator"
-    _require_metal_occupations(config, occupation_state)
+    metal = material_class == "metal"
+    _require_metal_occupations(material_class, occupation_state)
     omega_m = float(quad.x_max)
     # ONE occupancy window for the whole fit: the rule bandwidth below and
     # every fractional-chi call in this function read the same deck value, so
@@ -528,7 +530,8 @@ def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
-    occupation_state=None, head_channel=None, wc_source=None, print_fn=print,
+    occupation_state=None, material_class, head_channel=None, wc_source=None,
+    print_fn=print,
 ):
     """Write body/head samples and fits; return path plus iteration head.
 
@@ -550,8 +553,8 @@ def build_mpa_fit(
     # any inode exists, and again at the _evaluate_samples seam — and that
     # refusal is now the only gate on the deck path: the driver-level
     # UNIMPLEMENTED_MODES row was deleted when the metal pipeline ran E2E.
-    _require_metal_occupations(config, occupation_state)
-    if wc_source is not None and config.mpa.material_class != "insulator":
+    _require_metal_occupations(material_class, occupation_state)
+    if wc_source is not None and material_class == "metal":
         raise ValueError(
             "GATE w_bse_insulators_only: an alternate ladder wc_source "
             "requires mpa_material_class = insulator; keep the default "
@@ -565,7 +568,8 @@ def build_mpa_fit(
 
     n_p = int(config.mpa.n_poles)
     omega_m = float(quad.x_max)
-    plan = make_mpa_plan(config, quad) if plan is None else plan
+    plan = (make_mpa_plan(config, quad, material_class=material_class)
+            if plan is None else plan)
     z_all = sample_plan.plan_z(plan)
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
     if iteration_head_response is not None:
@@ -624,7 +628,7 @@ def build_mpa_fit(
         sample_path, _WC, mode="a", **common)
 
     routes = sample_plan.plan_routes(plan)
-    metal = config.mpa.material_class != "insulator"
+    metal = material_class == "metal"
     kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
     static_gamma_override = (
         iteration_head_response.static_chi_body_gamma
@@ -645,6 +649,7 @@ def build_mpa_fit(
 
     _evaluate_samples(
         wfns, routes, quad, config, meta, mesh_xy,
+        material_class=material_class,
         energy_reference=energy_reference,
         occupation_state=occupation_state,
         write_full=_write_full, write_wedge=_write_wedge,

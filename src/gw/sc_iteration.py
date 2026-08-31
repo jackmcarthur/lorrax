@@ -297,6 +297,7 @@ class SCInputs:
     # to anchor the Sigma window/partition.  Retained here so an SC map never
     # re-solves the old endpoint of its Fermi displacement.
     efermi_dft_ry: float
+    material_class: str
     #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
     #: runs entirely on the full BZ, which is what every result before
     #: 2026-08-04 did and what the one-shot equivalence gate pins.  When
@@ -508,7 +509,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
             "  SC head occupations: initialized BGW-MP1 state at "
             f"mu={occ_state.mu_ry * RYD_TO_EV:.8f} eV "
             f"[occ_hash {occ_state.occ_hash}]")
-        if _material_class(inputs) == "metal":
+        if inputs.material_class == "metal":
             # Metal-run startup gate: re-solving on the WFN's OWN stored
             # eigenvalue/weight table must reproduce its stored occupations,
             # or the smearing family/width does not match the deck that made
@@ -558,12 +559,6 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     )
 
 
-def _material_class(inputs) -> str:
-    """The deck's declared MPA material class; 'insulator' when absent."""
-    mpa = getattr(inputs.config, "mpa", None)
-    return str(getattr(mpa, "material_class", "insulator"))
-
-
 def _solve_occupation_state(
     inputs: SCInputs,
     energies_kn_ry,
@@ -590,7 +585,7 @@ def _solve_occupation_state(
     # physical WIDTH is the single ``config.occ_broadening_ry`` value.
     width_ev = float(inputs.config.screening.occ_broadening_ev)
     pt = getattr(inputs, "parallel_transport", None)
-    metal = _material_class(inputs) == "metal"
+    metal = inputs.material_class == "metal"
     if not metal and (width_ev == 0.0 or pt is None):
         return None
 
@@ -1866,7 +1861,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
 
     # E stays on the device: both are jit kernels over ``E`` (``gw.efermi``
     # header) and only E_F and the degeneracy flag cross.
-    if _material_class(inputs) == "metal":
+    if inputs.material_class == "metal":
         # Metal ρ: fixed-N MP1 occupations solved on THIS iteration's QP
         # spectrum (W3 update point).  The step path below cannot represent
         # a metal (partial fill / degenerate-manifold refusal), and the
@@ -2189,7 +2184,7 @@ def _report_extrapolation_eqp_shift(
 
 
 def _sc_head_frequency_plan(
-        config, quad, *, certified_fit=None, mesh_xy=None):
+        config, quad, *, material_class, certified_fit=None, mesh_xy=None):
     """Single frequency plan for SC body W and every head provenance arm.
 
     A live screening build takes its ceiling from ``quad``.  A certified-fit
@@ -2215,10 +2210,12 @@ def _sc_head_frequency_plan(
                     "for the collective head-fit provenance read")
             from .mpa.model import make_mpa_plan_from_fit
             mpa_plan = make_mpa_plan_from_fit(
-                config, certified_fit, mesh_xy=mesh_xy)
+                config, certified_fit, mesh_xy=mesh_xy,
+                material_class=material_class)
         else:
             from .mpa.model import make_mpa_plan
-            mpa_plan = make_mpa_plan(config, quad)
+            mpa_plan = make_mpa_plan(
+                config, quad, material_class=material_class)
         mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
         head_omegas = [complex(value) for value in mpa_z]
         # The metallic MPA grid starts just above the origin.  Preserve a
@@ -2608,7 +2605,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Same-run metal threading: the ENTRY-solved state feeds chi, the head
     # and Sigma — one mu per map call, from this call's spectrum.
     metal_occ_state = (entry_occ_state
-                       if _material_class(inputs) == "metal" else None)
+                       if inputs.material_class == "metal" else None)
 
     def _screening(mpa_plan, iteration_head_response, *, producer=None,
                    quad_override=None):
@@ -2629,13 +2626,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             mpa_plan=mpa_plan,
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
+            material_class=inputs.material_class,
             print_fn=inputs.print_fn)
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
     requests, mpa_plan, head_omegas = _sc_head_frequency_plan(
         inputs.config, inputs.quad, certified_fit=certified_fit,
-        mesh_xy=inputs.mesh_xy)
+        mesh_xy=inputs.mesh_xy, material_class=inputs.material_class)
 
     # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
     # accelerators that evaluate one carry repeatedly: at iteration zero
@@ -2867,6 +2865,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         hartree_basis_rotation=U_full,
         omit_v_h=exact_hartree_dft is not None,
         iteration_head=iteration_head,
+        material_class=inputs.material_class,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
@@ -4475,6 +4474,7 @@ def run_sc_driver(
     input_dir: str,
     tensors_filename: str,
     enk_dft,
+    material_class: str,
     print_fn: Callable = print,
 ) -> SCDriverResult:
     """Self-consistent QSGW, driver-facing: DFT inputs in, DFT-basis Σ out.
@@ -4641,7 +4641,8 @@ def run_sc_driver(
         # once, on the same single-sourced frequency plan every map consumes,
         # then fold it through each iteration's resident W exactly once.
         from .qsgw_head import build_dft_head_response
-        _, _, fixed_head_omegas = _sc_head_frequency_plan(config, quad)
+        _, _, fixed_head_omegas = _sc_head_frequency_plan(
+            config, quad, material_class=material_class)
         fixed_dft_head_response = build_dft_head_response(
             wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
             input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
@@ -4667,6 +4668,7 @@ def run_sc_driver(
         # One SC convention at both endpoints: fixed-band midgap on an
         # insulator, the existing initial fixed-N _mu_ry on a metal.
         efermi_dft_ry=efermi_dft_scissor_ry,
+        material_class=material_class,
         kstar=kstar,
         parallel_transport=parallel_transport,
         fixed_dft_head_response=fixed_dft_head_response,
