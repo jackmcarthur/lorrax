@@ -1469,6 +1469,9 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
                   pair_ceiling):
     """Exact small integer plan: minimum pairs whose budget cost fits."""
+    minimum_pairs = sum(
+        min(int(candidate["times"].size) for candidate in candidates)
+        for candidates in candidates_by_window)
     states = {0: (0.0, ())}
     for candidates in candidates_by_window:
         next_states = {}
@@ -1493,7 +1496,8 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
             key=lambda pair: min(c["absolute_cost"] for c in pair[1]))
         candidate = min(blocking[1], key=lambda row: row["absolute_cost"])
         metrics = candidate["metrics"]
-        detail = "no bounded combination"
+        detail = (f"minimum pairs={minimum_pairs} across {len(specs)} "
+                  "product windows")
         if best is not None:
             detail = (f"best cost={best[1][0]:.6g}, "
                       f"budget={float(total_absolute_budget):.6g}")
