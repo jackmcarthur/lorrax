@@ -13,6 +13,30 @@ from common.scientific_output import (
 def prune_band_ranges(args, n_val: int, n_cond: int):
     """Resolved pair-density windows, shared by pruning and provenance."""
     top = int(n_val) + int(n_cond)
+    fit_window = getattr(args, "fit_window", None)
+    if fit_window is not None:
+        if args.prune_window != "v_x_vc":
+            raise ValueError(
+                "--fit-window cannot be combined with a non-default "
+                "--prune-window")
+        try:
+            fields = str(fit_window).split(",")
+            if len(fields) != 2:
+                raise ValueError
+            left = tuple(int(v) for v in fields[0].split(":"))
+            right = tuple(int(v) for v in fields[1].split(":"))
+            if len(left) != 2 or len(right) != 2:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "--fit-window must be L0:L1,R0:R1 using integer, 0-based "
+                "half-open bounds") from exc
+        if any(lo < 0 or hi <= lo or hi > top
+               for lo, hi in (left, right)):
+            raise ValueError(
+                f"--fit-window ranges must be nonempty and lie in [0,{top}); "
+                f"got left={left}, right={right}")
+        return left, right, "explicit feature pair"
     if args.prune_window == "v_x_c":
         return (0, int(n_val)), (int(n_val), top), "valence x conduction"
     if args.prune_window == "vc_x_vc":

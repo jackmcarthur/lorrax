@@ -2,6 +2,9 @@
 
 from types import SimpleNamespace
 
+import pytest
+
+from centroid.pivoted_cholesky import _gram_meta_band_counts
 from centroid.production_output import (
     format_centroid_header,
     format_kmeans_report,
@@ -49,6 +52,23 @@ def test_prune_header_and_executor_share_one_window_resolver():
     args = SimpleNamespace(prune_window="v_x_vc")
     assert prune_band_ranges(args, 8, 32) == (
         (0, 8), (0, 40), "valence x (valence + conduction)")
+
+
+def test_explicit_fit_window_is_independent_of_physical_occupancy():
+    args = SimpleNamespace(
+        prune_window="v_x_vc", fit_window="0:16,0:28")
+    assert prune_band_ranges(args, 8, 20) == (
+        (0, 16), (0, 28), "explicit feature pair")
+    assert _gram_meta_band_counts(8, 28, None, None) == (8, 20)
+
+
+def test_explicit_fit_window_refuses_ambiguous_or_out_of_wfn_ranges():
+    with pytest.raises(ValueError, match="non-default"):
+        prune_band_ranges(SimpleNamespace(
+            prune_window="v_x_c", fit_window="0:16,0:28"), 8, 20)
+    with pytest.raises(ValueError, match="lie in"):
+        prune_band_ranges(SimpleNamespace(
+            prune_window="v_x_vc", fit_window="0:16,0:29"), 8, 20)
 
 
 def test_kmeans_report_is_compact_scientific_output(tmp_path):
