@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import hashlib
+import json
 import os
 import pickle
 import time
@@ -77,6 +78,17 @@ _CROSSING_CONDITIONING_SLACK = 0.2
 # present in evaluator.damped_rectangle_gauss_rule; it fixes the time interval
 # without a search over tail fractions.
 _CROSSING_TAIL_FRACTION = 0.9
+
+_WINDOW_CENSUS_PREFIX = "[delivered-planner-window] "
+
+
+class _ProductWindowRefusal(RuntimeError):
+    """A product-window refusal with its best measured rule metrics."""
+
+    def __init__(self, message, residual=None, amplification_p99=None):
+        super().__init__(message)
+        self.residual = residual
+        self.amplification_p99 = amplification_p99
 
 
 def _planner_work_indices(count, rank=None, world=None):
@@ -162,6 +174,9 @@ def _run_parallel_planner_jobs(count, worker, *, refuse_errors):
             error = {
                 "type": f"{type(exc).__module__}.{type(exc).__qualname__}",
                 "message": str(exc),
+                "best_achieved_residual": getattr(exc, "residual", None),
+                "best_achieved_kappa_p99": getattr(
+                    exc, "amplification_p99", None),
             }
         local_rows.append({
             "index": int(index),
@@ -174,6 +189,83 @@ def _run_parallel_planner_jobs(count, worker, *, refuse_errors):
     shards = _all_gather_planner_payload(local_rows)
     return _assemble_planner_rows(
         shards, count, world, refuse_errors=refuse_errors)
+
+
+def _raise_first_planner_refusal(rows):
+    """Raise the first index-ordered planner refusal after diagnostics."""
+    refusal = next((row for row in rows if row["error"] is not None), None)
+    if refusal is not None:
+        raise RuntimeError(refusal["error"]["message"])
+
+
+def _window_census_geometry(spec, eta):
+    """Measure the support coordinates that can change between SC calls."""
+    denominator = np.asarray(spec["problem"].denominators, np.complex128)
+    magnitude = np.abs(denominator)
+    scale_span = float(np.max(magnitude) / np.min(magnitude))
+    if spec["kind"] != "crossing":
+        return None, None, None, None, scale_span
+    oriented = float(spec["pole_sign"]) * denominator
+    gamma_min = float(np.min(oriented.imag))
+    radius = float(np.max(np.abs(oriented.real)))
+    return (radius, gamma_min, radius / float(eta),
+            radius / gamma_min, scale_span)
+
+
+def _emit_window_census(specs, eta, apportioned_targets, *,
+                        candidates_by_window=None, planner_rows=None,
+                        source):
+    """Print one stable JSON record for every fitted product window.
+
+    The mass share uses each window's maximum inverse-gap delivered envelope,
+    the same quantity that converts its relative target to the global absolute
+    budget.  Only rank zero prints because all planner ranks hold the same
+    gathered rows and measured window problems.
+    """
+    if process_rank() != 0:
+        return
+    total_mass = float(sum(float(spec["envelope"]) for spec in specs))
+    rows = planner_rows if planner_rows is not None else [None] * len(specs)
+    candidates = (candidates_by_window if candidates_by_window is not None
+                  else [None] * len(specs))
+    for spec, apportioned_target, window_candidates, row in zip(
+            specs, apportioned_targets, candidates, rows):
+        error = None if row is None else row["error"]
+        best_residual = (None if error is None else
+                         error.get("best_achieved_residual"))
+        best_kappa = (None if error is None else
+                      error.get("best_achieved_kappa_p99"))
+        family = None
+        if error is None and window_candidates:
+            best = min(
+                window_candidates,
+                key=lambda candidate: (
+                    float(candidate["metrics"][0]),
+                    float(candidate["metrics"][1])))
+            best_residual = float(best["metrics"][0])
+            best_kappa = float(best["metrics"][1])
+            family = best["evidence"]["family"]
+        radius, gamma_min, A_over_eta, A_over_gamma, span = (
+            _window_census_geometry(spec, eta))
+        record = {
+            "A_over_eta": A_over_eta,
+            "A_over_gamma_min": A_over_gamma,
+            "apportioned_target": float(apportioned_target),
+            "best_achieved_kappa_p99": best_kappa,
+            "best_achieved_residual": best_residual,
+            "candidate_family": family,
+            "cell_count": int(spec["problem"].internal_sums.size),
+            "crossing_radius_ry": radius,
+            "delivered_mass_share": float(spec["envelope"]) / total_mass,
+            "gamma_min_ry": gamma_min,
+            "kind": spec["kind"],
+            "name": spec["name"],
+            "scale_span": span,
+            "source": str(source),
+            "status": "refused" if error is not None else "served",
+        }
+        print(_WINDOW_CENSUS_PREFIX + json.dumps(
+            record, sort_keys=True, separators=(",", ":")), flush=True)
 
 
 def _planner_rows_profile(rows):
@@ -1744,7 +1836,7 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
             break
         except (FloatingPointError, OverflowError, RuntimeError, ValueError,
                 np.linalg.LinAlgError) as exc:
-            raise RuntimeError(
+            raise _ProductWindowRefusal(
                 f"delivered product window {spec['name']!r} refused: "
                 f"{exc}") from exc
         try:
@@ -1783,11 +1875,12 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 "candidate_tolerance": evidence.get("candidate_tolerance"),
                 "refusal": str(exc)})
     residual, amplification = best_pair
-    raise RuntimeError(
+    raise _ProductWindowRefusal(
         f"delivered product window {spec['name']!r} refused: achieved "
         f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
         "the shipped product-window family and its one crossing fallback "
-        "did not survive the residual, noise, and factor-growth gates")
+        "did not survive the residual, noise, and factor-growth gates",
+        float(residual), float(amplification))
 
 
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
@@ -2063,6 +2156,8 @@ def build_delivered_sigma_windows(
 
     combined_scale = float(np.max(combined_envelope))
     total_absolute = target * combined_scale * safety
+    allowances = [min(0.5, total_absolute / spec["envelope"])
+                  for spec in specs]
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
         factor_cap=factor_cap, pair_ceiling=pair_ceiling,
@@ -2101,8 +2196,6 @@ def build_delivered_sigma_windows(
         # the shipped crossing rule up front cost ~1 s per window for nothing,
         # and refitting the adapted rule on retry cost far more (132 s vs 85 s
         # measured on the Na deck), so both are avoided here.
-        allowances = [min(0.5, total_absolute / spec["envelope"])
-                      for spec in specs]
         base_specs = specs
 
         def fit_window(index):
@@ -2112,8 +2205,13 @@ def build_delivered_sigma_windows(
 
         fit_started = time.perf_counter()
         base_candidates, window_fit_rows = _run_parallel_planner_jobs(
-            len(base_specs), fit_window, refuse_errors=True)
+            len(base_specs), fit_window, refuse_errors=False)
         window_parallel_seconds += time.perf_counter() - fit_started
+        _emit_window_census(
+            base_specs, eta, allowances,
+            candidates_by_window=base_candidates,
+            planner_rows=window_fit_rows, source="live_fit")
+        _raise_first_planner_refusal(window_fit_rows)
         fits = None
         consolidation_cache = None
         for adapted_only in (True, False):
@@ -2194,6 +2292,11 @@ def build_delivered_sigma_windows(
         _save_plan_cache(
             plan_cache_path, cache_fingerprint, fits, free_pairs,
             required_cost, window_tau_pairs)
+    else:
+        _emit_window_census(
+            specs, eta, allowances,
+            candidates_by_window=[[fit] for fit in fits],
+            source="fit_cache")
 
     output = []
     for spec, fit in zip(specs, fits):
