@@ -816,6 +816,12 @@ def compute_screening_model(
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
+        if quad is None:
+            raise ValueError(
+                "MPA screening has no quadrature and no certified-fit reuse "
+                "provider served an existing fit. A normal screening build "
+                "requires quad; a reuse harness must return its already-"
+                "resolved path as {'mpa_fit': path}.")
         if head_resolver is None:
             raise ValueError("MPA screening requires a head resolver")
         from .mpa.model import build_mpa_fit
