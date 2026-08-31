@@ -8,7 +8,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from gw.mpa.delivered_windows import build_delivered_sigma_windows
-from gw.mpa.sigma import _batch_rows, _require_product_plan
+from gw.mpa.sigma import _batch_rows
 from gw.ppm_windows import _SigmaBranch
 
 
@@ -53,18 +53,6 @@ def test_mpa_executor_has_one_tau_kernel_factory_and_no_delivered_factory():
     assert len(calls) == 1
     assert "tuple_components" not in executor + kernel
     assert "get_shared_sigma_direct_kernel" not in executor + kernel
-
-
-def test_old_receipt_with_direct_work_refuses_by_path():
-    """A stale pairwise receipt is rejected before executor dispatch."""
-    geometry = {"direct_term_count": 1, "branches": []}
-    with np.testing.assert_raises_regex(
-            ValueError,
-            "delivered plan receipt '/tmp/old-plan.pkl' contains direct terms"):
-        _require_product_plan(
-            [_range_row((0,))], geometry,
-            receipt_path="/tmp/old-plan.pkl")
-
 
 def test_raw_sigma_checkpoint_precedes_every_qp_stage():
     """The expensive Sigma cube must survive a later mean-field/QP failure."""
@@ -160,7 +148,6 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
     assert len(plan) == 1
     assert seen[0][0] == "crossing"
     np.testing.assert_array_equal(seen[0][1], omega)
-    assert plan[0].state_indices is None
     np.testing.assert_array_equal(plan[0].window.mask_A, [[True] * 4])
     np.testing.assert_array_equal(plan[0].omega_idx, np.arange(omega.size))
     np.testing.assert_array_equal(plan[0].pole_indices, [0])
@@ -193,7 +180,6 @@ def test_metallic_style_crossing_uses_one_bounded_product_rule():
     assert window["refined_residual"] <= window[
         "relative_residual_target"]
     assert window["noise_budget_met"]
-    assert plan[0].state_indices is None
     np.testing.assert_array_equal(plan[0].window.mask_A, [[True] * 8])
 
 

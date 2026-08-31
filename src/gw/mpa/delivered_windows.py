@@ -12,7 +12,7 @@ error on the refined validation lattice, and the runtime-noise gate.  A table
 that misses the measured gate is replaced by the next tighter or wider shipped
 table.  Crossing windows first try shipped HGL tables and otherwise perform one
 deterministic fixed-time weight fit.  The planner never evaluates explicit
-state--pole pairs and never emits zero-time or direct terms.
+state--pole pairs.
 
 The final acceptance test is
 

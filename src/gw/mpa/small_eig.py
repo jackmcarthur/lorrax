@@ -122,7 +122,7 @@ def _hessenberg(H, n):
     ``O(n**3)``, and at ``n = 8`` it is 4096 flops against 512 -- both of
     which are nothing beside a single kernel launch.  What it buys is
     that every operand has the same shape at every ``k``, so the whole
-    reduction fuses instead of becoming a staircase of differently-shaped
+    reduction fuses instead of becoming a chain of differently-shaped
     slices.
     """
 

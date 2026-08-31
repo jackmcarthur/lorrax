@@ -42,8 +42,8 @@ and spatial pole extent; no raw state--spatial-pole support is gathered.
 Each causal branch is covered by two to four ordinary Cartesian product
 windows, `state interval x pole interval` (a degenerate one-pole branch may
 need only one). A window selects its states with a plain interval mask and its
-leading poles with a plain interval bound. There are no explicit state--pole
-tuple lists, membership predicates, or frequency staircases. The crossing
+leading poles with a plain interval bound. A window is specified by
+`(E_min, E_max)` and `(Omega_min, Omega_max)` and nothing else. The crossing
 band stays inside its resonant product window. Its `eta`-damped reciprocal is
 integrated by the positive real-time quadrature; candidate density follows
 the oscillatory bandwidth relative to the `eta` floor. An exact small integer
@@ -80,11 +80,10 @@ fixed-cap acceptance gate. The adapter separately refuses a rule when either
 executed `G` or `W` exponential exceeds the log-growth cap, even if their
 product would cancel.
 
-This construction emits no direct terms. A refusal names the product window
-and the best achieved `(residual, kappa_p99)` pair. The separately configured
-`LORRAX_DELIVERED_MAX_DIRECT_TERMS` ceiling (default 32) remains in the shared
-driver contract and report as a fail-closed guard; the owner construction's
-target and achieved direct count are both zero.
+Every window is served by a quadrature rule. A refusal names the product
+window and the best achieved `(residual, kappa_p99)` pair; there is no
+alternative route for a window that cannot be served, and no per-state or
+per-pole evaluation exists anywhere in the planner or the executor.
 
 Every result is an ordinary `SharedSigmaWindow` consumed by the existing MPA
 window executor and `DeviceOmegaAccumulator`. The adapter converts the fitted
@@ -114,13 +113,11 @@ sizes. At execution, rows with the same exact tau grid and frequency block are
 fused: all component `G/W` transforms remain explicit, but the Sigma-side
 forward transform and band projection run once per distinct tau and resident
 pole batch. The run log reports both actual tau dispatches and the saved Sigma
-back-transforms. `direct_term_count` remains a separate reported currency and
-is zero for this construction.
+back-transforms.
 `max_nodes` is a global `window_tau_pairs` ceiling for the complete plan, not
 a per-window allowance. Shared-grid selection converts the remaining global
 budget to a per-branch grid ceiling before fitting, and a final fail-closed
-check pins the total. Direct terms have their own separately reported ceiling
-and must remain zero.
+check pins the total.
 
 ## GN-PPM and time reversal
 

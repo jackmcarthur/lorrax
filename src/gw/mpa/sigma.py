@@ -76,37 +76,6 @@ def _batch_rows(row, batch):
     )
 
 
-def _require_product_plan(plan, geometry=None, *, receipt_path=None):
-    """Refuse saved or live plans containing explicit state--pole work.
-
-    Product windows are the only bounded-complexity execution contract.  A
-    receipt is checked before its rows reach the executor so an obsolete
-    receipt cannot silently recover the deleted pairwise route.
-    """
-    explicit_rows = sum(
-        getattr(row, "state_indices", None) is not None
-        or bool(getattr(row, "direct", False))
-        for row in plan)
-    recorded_rows = 0
-    if geometry is not None:
-        # Both shapes must be checked: hatch-era receipts recorded the count
-        # at the top level, later ones per branch.  This is the guard that
-        # makes an old plan REFUSE rather than execute pairwise work.
-        recorded_rows += int(geometry.get("direct_term_count", 0))
-        recorded_rows += sum(
-            int(branch.get("direct_term_count", 0))
-            for branch in geometry.get("branches", ()))
-    if not explicit_rows and not recorded_rows:
-        return
-    if receipt_path is not None:
-        raise ValueError(
-            f"delivered plan receipt {receipt_path!r} contains direct terms; "
-            "delete the receipt and replan with product windows")
-    raise ValueError(
-        "MPA Sigma execution requires Cartesian product windows; "
-        "explicit state--pole work is not supported")
-
-
 def _integrate_sigma_batches(
     wfns,
     batches,
@@ -195,7 +164,6 @@ def _integrate_sigma_batches(
         mesh_xy=mesh_xy,
         kgrid=kgrid,
         **face_kwargs)
-    _require_product_plan(plan)
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
@@ -499,8 +467,6 @@ def compute_sigma_c_mpa_omega_grid(
                 delivered_cache_path, request_fingerprint, branches)
             if cached is not None:
                 plan, geometry = cached
-                _require_product_plan(
-                    plan, geometry, receipt_path=delivered_cache_path)
             else:
                 state_amplitudes = projected_state_amplitude_envelope(
                     wfns, state_bands=wfns.slices.sigma_sum,

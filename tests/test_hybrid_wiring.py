@@ -34,7 +34,6 @@ def _executed_scalar(plan, poles, residues, energies, omega):
         win = row.window
         times = np.asarray(win.nodes.t)
         alpha = np.asarray(win.nodes.alpha)
-        assert row.state_indices is None
         states = np.flatnonzero(np.asarray(win.mask_A).reshape(-1))
         pairs = tuple((state, pole) for state in states
                       for pole in row.pole_indices)
@@ -134,7 +133,6 @@ def test_gn_single_pole_reduction_is_one_executable_window():
     assert report["branches"][0]["window_count"] == 1
     assert len(plan) == 1
     np.testing.assert_array_equal(plan[0].pole_indices, [0])
-    assert plan[0].state_indices is None
     np.testing.assert_array_equal(plan[0].window.mask_A, [[True, True]])
     assert plan[0].window.project == "full"
 

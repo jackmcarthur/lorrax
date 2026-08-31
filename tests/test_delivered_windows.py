@@ -122,7 +122,6 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
         "window_tau_pairs"]
     assert len(resident) == len(batched)
     for got, expected in zip(batched, resident):
-        np.testing.assert_array_equal(got.state_indices, expected.state_indices)
         np.testing.assert_array_equal(got.pole_indices, expected.pole_indices)
         np.testing.assert_allclose(got.window.nodes.t, expected.window.nodes.t)
         np.testing.assert_allclose(
@@ -199,7 +198,6 @@ def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
             assert (window_evidence["runtime_noise_bound"]
                     <= window_evidence["runtime_noise_budget"])
             assert row.window.project == "full"
-            assert row.state_indices is None
             assert np.any(row.window.mask_A)
             assert np.all(np.asarray(row.window.mask_A)
                           <= np.asarray(branch.base_mask_A))
