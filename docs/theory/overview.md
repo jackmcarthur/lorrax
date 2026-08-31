@@ -20,6 +20,7 @@ Each arrow has one detailed owner:
 | How are interpolation vectors and Coulomb matrices formed? | [G-flat zeta and V](isdf-zeta-vq.md) |
 | How is the direct Hartree field built from charge and current? | [Direct Hartree field](hartree.md) |
 | Which symmetry convention controls irreducible-zone work and unfolding? | [Symmetry](symmetry.md) |
+| What problem does the Sigma quadrature solve, and what must any method obey? | [The Sigma(omega) quadrature problem](sigma-quadrature-problem.md) |
 | How are static and GN/HL-PPM frequency integrals separated? | [Minimax quadrature](minimax-quadrature.md) |
 | What fixes the HL plasmon pole? | [HL-GPP derivation](hl-gpp-derivation.md) |
 | How are MPA samples, poles, and Sigma windows constructed? | [Multipole frequency integration](THEORY_mpa_implementation.md) |
