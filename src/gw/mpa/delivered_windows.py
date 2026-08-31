@@ -1123,17 +1123,17 @@ def _crossing_geometry(problem, pole_sign):
 
 def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
                             pole_sign, state_edge, bins):
-    """Return the smallest exact product routing covered by causal tables.
+    """Return the smallest exact omega-patch routing covered by causal tables.
 
     A covered problem returns one identity route.  A wider crossing is split
-    into contiguous omega and state-energy patches.  For each product patch
-    the original pole interval is tiled into a resonant shell and two
-    sign-definite flanks; the shell bounds follow directly from that patch's
-    omega rows and actual state extrema.  Problems are rebuilt from the same
-    compact measured cells, with no explicit state--pole pairs.
+    into equal contiguous omega patches.  For each patch the original pole
+    interval is tiled into a resonant shell and two sign-definite flanks; the
+    shell bounds follow directly from that patch's omega rows and the actual
+    state extrema.  Problems are rebuilt from the same compact measured cells,
+    with no explicit state--pole pairs.  This is also the seam for a future
+    user-specified Sigma window with its own omega list and broadening.
     """
     omega_rows = np.arange(problem.frequencies.size, dtype=np.int64)
-    state_positions = np.asarray(state_positions, dtype=np.int64)
     entries = list(_mm.catalog().for_family("crossing_causal"))
     if not entries:
         raise RuntimeError("the shipped causal crossing family is empty")
@@ -1141,103 +1141,43 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
     if (_window_kind(problem) != "crossing"
             or _crossing_geometry(problem, pole_sign)[2]
             <= widest_span + 1.0e-12):
-        return ((state_positions, omega_rows,
-                 (("identity", tuple(map(float, pole_bounds))),)),)
+        return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
 
     raw_energy = (float(pole_sign)
                   * np.asarray(measure[0], np.float64))
-    selected = raw_energy[state_positions]
-    order = np.argsort(selected, kind="stable")
-    sorted_states = state_positions[order]
-    sorted_energy = selected[order]
-    gamma_floor = _crossing_geometry(problem, pole_sign)[1]
+    selected = raw_energy[np.asarray(state_positions, np.int64)]
+    state_min, state_max = float(np.min(selected)), float(np.max(selected))
     original_lo, original_hi = map(float, pole_bounds)
-
-    # First cut only the compact state axis while leaving the pole interval
-    # intact.  Metallic occupation tails commonly make one remote state block
-    # inflate the rectangle even though that block is sign-definite.  This
-    # partition removes it with one cheap noncrossing window instead of
-    # repeating pole flanks for every omega patch.
-    for state_patch_count in range(2, sorted_states.size + 1):
-        groups = tuple(np.array_split(sorted_states, state_patch_count))
-        planned = []
-        for states in groups:
-            product = _product_problem(
-                states, pole_bounds, measure, problem.frequencies,
-                pole_sign, int(bins))
-            if product is None:
-                continue
-            if (_window_kind(product[0]) == "crossing"
-                    and _crossing_geometry(product[0], pole_sign)[2]
-                    > widest_span + 1.0e-12):
-                planned = []
-                break
-            planned.append((
-                states, omega_rows,
-                (("identity", tuple(map(float, pole_bounds))),)))
-        if planned:
-            return tuple(planned)
-
-    best = None
     for patch_count in range(2, omega_rows.size + 1):
-        if best is not None and patch_count >= len(best):
-            break
         patches = tuple(np.array_split(omega_rows, patch_count))
         planned = []
-        valid = True
         for patch in patches:
             oriented = float(pole_sign) * problem.frequencies[patch]
             omega_lo, omega_hi = (float(np.min(oriented)),
                                   float(np.max(oriented)))
-            state_span = (widest_span * gamma_floor
-                          - (omega_hi - omega_lo) - float(state_edge))
-            if state_span <= 0.0:
-                valid = False
+            shell_lo = max(
+                original_lo, omega_lo - state_max - float(state_edge))
+            shell_hi = min(
+                original_hi, omega_hi - state_min + float(state_edge))
+            shell_bounds = (shell_lo, max(shell_lo, shell_hi))
+            shell = _product_problem(
+                state_positions, shell_bounds, measure,
+                problem.frequencies[patch], pole_sign, int(bins))
+            if (shell is not None and _window_kind(shell[0]) == "crossing"
+                    and _crossing_geometry(shell[0], pole_sign)[2]
+                    > widest_span + 1.0e-12):
+                planned = []
                 break
-            starts = [0]
-            while starts[-1] < sorted_states.size:
-                stop = int(np.searchsorted(
-                    sorted_energy,
-                    sorted_energy[starts[-1]] + state_span,
-                    side="right"))
-                stop = max(stop, starts[-1] + 1)
-                starts.append(stop)
-            for start, stop in zip(starts[:-1], starts[1:]):
-                states = sorted_states[start:stop]
-                state_min = float(np.min(raw_energy[states]))
-                state_max = float(np.max(raw_energy[states]))
-                shell_lo = max(
-                    original_lo,
-                    omega_lo - state_max - float(state_edge))
-                shell_hi = min(
-                    original_hi,
-                    omega_hi - state_min + float(state_edge))
-                shell_bounds = (shell_lo, max(shell_lo, shell_hi))
-                shell = _product_problem(
-                    states, shell_bounds, measure,
-                    problem.frequencies[patch], pole_sign, int(bins))
-                if (shell is not None
-                        and _window_kind(shell[0]) == "crossing"
-                        and _crossing_geometry(shell[0], pole_sign)[2]
-                        > widest_span + 1.0e-12):
-                    valid = False
-                    break
-                cells = []
-                if original_lo < shell_bounds[0]:
-                    cells.append(
-                        ("positive", (original_lo, shell_bounds[0])))
-                if shell_bounds[0] < shell_bounds[1]:
-                    cells.append(("crossing", shell_bounds))
-                if shell_bounds[1] < original_hi:
-                    cells.append(
-                        ("negative", (shell_bounds[1], original_hi)))
-                planned.append((states, patch, tuple(cells)))
-            if not valid:
-                break
-        if valid and planned and (best is None or len(planned) < len(best)):
-            best = tuple(planned)
-    if best is not None:
-        return best
+            cells = []
+            if original_lo < shell_bounds[0]:
+                cells.append(("positive", (original_lo, shell_bounds[0])))
+            if shell_bounds[0] < shell_bounds[1]:
+                cells.append(("crossing", shell_bounds))
+            if shell_bounds[1] < original_hi:
+                cells.append(("negative", (shell_bounds[1], original_hi)))
+            planned.append((patch, tuple(cells)))
+        if len(planned) == len(patches):
+            return tuple(planned)
     raise RuntimeError(
         "crossing support cannot be served by omega product windows: "
         "even one-row patches exceed the widest shipped causal span "
@@ -1495,9 +1435,6 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
                   pair_ceiling):
     """Exact small integer plan: minimum pairs whose budget cost fits."""
-    minimum_pairs = sum(
-        min(int(candidate["times"].size) for candidate in candidates)
-        for candidates in candidates_by_window)
     states = {0: (0.0, ())}
     for candidates in candidates_by_window:
         next_states = {}
@@ -1522,8 +1459,7 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
             key=lambda pair: min(c["absolute_cost"] for c in pair[1]))
         candidate = min(blocking[1], key=lambda row: row["absolute_cost"])
         metrics = candidate["metrics"]
-        detail = (f"minimum pairs={minimum_pairs} across {len(specs)} "
-                  "product windows")
+        detail = "no bounded combination"
         if best is not None:
             detail = (f"best cost={best[1][0]:.6g}, "
                       f"budget={float(total_absolute_budget):.6g}")
@@ -1706,14 +1642,13 @@ def build_delivered_sigma_windows(
                 problem, measure, selected_states, pole_bounds, pole_sign,
                 geometry["state_edge_ry"], int(lattice_bins))
             patch_count = len(routes)
-            for patch_number, (route_states, omega_rows,
-                               routed_bounds) in enumerate(
+            for patch_number, (omega_rows, routed_bounds) in enumerate(
                     routes, start=1):
                 patch_positions = positions[omega_rows]
                 patch_frequencies = frequencies[omega_rows]
                 for cell_role, cell_bounds in routed_bounds:
                     cell_product = (_product_problem(
-                        route_states, cell_bounds, measure,
+                        selected_states, cell_bounds, measure,
                         patch_frequencies, pole_sign, int(lattice_bins)))
                     if cell_product is None:
                         continue
@@ -1732,7 +1667,7 @@ def build_delivered_sigma_windows(
                         / np.abs(cell_problem.denominators)
                     ).sum(axis=1)
                     envelope = float(np.max(envelope_by_frequency))
-                    selected_raw = raw_energy[route_states]
+                    selected_raw = raw_energy[selected_states]
                     E_ref = float(np.min(selected_raw))
                     if patch_count > 1 and cell_kind != "crossing":
                         _rotated, transform = _sign_definite_orientation(
@@ -1748,8 +1683,8 @@ def build_delivered_sigma_windows(
                         "kind": cell_kind, "pole_sign": pole_sign,
                         "pole_interval": pole_interval,
                         "pole_indices": pole_indices,
-                        "state_positions": route_states,
-                        "state_indices": np.asarray(measure[2])[route_states],
+                        "state_positions": selected_states,
+                        "state_indices": np.asarray(measure[2])[selected_states],
                         "raw_state_energy": selected_raw,
                         "state_interval": (float(state_lower), float(state_upper)),
                         "pole_bounds": tuple(map(float, cell_bounds)),

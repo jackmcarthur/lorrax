@@ -13,8 +13,7 @@ The advertised error is relative to the ``1/g`` envelope:
 
 ``max g * |Q(x+i*g) - 1/(x+i*g)| <= error_bound``.
 
-Generation is offline.  A positive Gauss rule supplies the deterministic
-seed; offline compression may polish its times and complex weights.
+Generation is offline.  The positive Gauss rule supplies ``alpha=-i*h``.
 Certification is independent of the solver's training grid.  It bounds the
 requested metric by the maximum-modulus residual
 ``|1-z*sum(h*exp(-z*t))|``, ``z=g-i*x``, and finds that maximum on all four
@@ -213,13 +212,15 @@ def certify(
     """Certify one final numerical payload against its complete family."""
     tau = np.asarray(tau, dtype=np.float64)
     alpha = np.asarray(alpha, dtype=np.complex128)
-    h = 1.0j * alpha
+    h = np.real(1.0j * alpha)
     if (tau.ndim != 1 or alpha.shape != tau.shape or not tau.size
             or not np.all(np.isfinite(tau))
             or not np.all(np.isfinite(alpha))):
         raise ValueError("causal crossing payload must be finite 1-D arrays")
     if np.any(tau <= 0.0):
         raise ValueError("causal crossing times must be positive")
+    if not np.array_equal(alpha, -1.0j * h) or np.any(h <= 0.0):
+        raise ValueError("causal crossing alpha must be negative imaginary")
 
     x_grid = np.linspace(-float(A), float(A), EDGE_GRID_SIZE)
     log_g_grid = np.linspace(0.0, np.log(G_MAX), G_EDGE_GRID_SIZE)
@@ -359,7 +360,7 @@ def _entry(
                 certificate["local_refinement_count"]),
             "checks": [
                 "positive_real_times",
-                "finite_complex_weights",
+                "negative_imaginary_weights",
                 "certified_error",
                 "dense_family_reference",
                 "kappa0",
