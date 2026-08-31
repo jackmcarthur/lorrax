@@ -291,6 +291,22 @@ def test_loewner_rank_reduction_removes_both_null_couplings(monkeypatch):
     assert float(condition) == pytest.approx(1.0)
 
 
+def test_loewner_order_eight_preserves_incumbent_unscaled_path(monkeypatch):
+    """The conditioning repair adds no work to the certified order."""
+
+    n = 8
+    z = _grid(n)
+    Omega_t, B_t = _si_like_poles(n)
+    w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+
+    def unexpected_equilibration(*args):
+        raise AssertionError("n_p=8 must retain the incumbent fit graph")
+
+    monkeypatch.setattr(
+        pade_fit, "_equilibrate_loewner_pencil", unexpected_equilibration)
+    pade_fit._loewner_roots(w, z * z / jnp.max(jnp.abs(z * z)), n, 1.0e-13)
+
+
 def test_leon_np15_qpps_fractions_are_the_yambo_integer_construction():
     expected = tuple(Fraction(k, 16) for k in range(13)) + (
         Fraction(14, 16), Fraction(1))
