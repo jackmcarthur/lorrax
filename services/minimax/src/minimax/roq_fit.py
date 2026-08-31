@@ -239,10 +239,17 @@ def roq_select_times(group: RoqGroup, rank: int, *, base_nodes: int = 0,
 
 def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
            ratio: float, *, windows: tuple[str, ...] = (),
-           target: float = np.inf, evaluations: int = 0) -> RoqRule:
+           target: float = np.inf, evaluations: int = 0,
+           amplification: bool = True) -> RoqRule:
     error, _ = delivered_error(group.validation, times, weights)
-    p99, peak = rule_amplification(times, weights, group.validation)
-    passed = p99 * _NOISE_FLOOR <= _NOISE_SHARE * float(target)
+    if amplification:
+        p99, peak = rule_amplification(times, weights, group.validation)
+        passed = p99 * _NOISE_FLOOR <= _NOISE_SHARE * float(target)
+    else:
+        # Rank search needs only the exact delivered residual.  Cancellation
+        # is measured once on the selected rule before it can be accepted.
+        p99 = peak = np.nan
+        passed = False
     return RoqRule(group.name, times, weights, rank, float(np.max(error)),
                    float(p99), float(peak), ratio, group.angle_deg,
                    group.horizon, windows, float(np.max(error)) <= target,
@@ -262,7 +269,8 @@ def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
         conditioning_pass=not quick,
         start_weights=start_weights)
     return _score(group, times, weights, rank, ratio, windows=windows,
-                  target=target, evaluations=evaluations)
+                  target=target, evaluations=evaluations,
+                  amplification=not quick)
 
 
 def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
@@ -598,12 +606,19 @@ def _fit_production_rank(group: RoqGroup, target: float,
             else:
                 lower = predicted
 
-    # Search fits are cheaper Lawson solves, but their acceptance scores are
-    # already the exact refined-lattice residual and production noise gate.
-    # Do not repeat an accepted rank merely to run a longer iteration cap.
+    # Search fits are cheaper Lawson solves, but their residual is already the
+    # exact refined-lattice score.  Measure amplification once on the selected
+    # rule; do not repeat its IRLS merely to run a longer iteration cap.
     searched = cache.get(upper)
-    if searched is not None and searched.target_met and searched.noise_passed:
-        return searched
+    if searched is not None and searched.target_met:
+        if not np.isfinite(searched.kappa_p99):
+            searched = _score(
+                group, searched.times, searched.weights, searched.rank,
+                searched.singular_ratio, windows=windows, target=target,
+                evaluations=searched.search_evaluations)
+            cache[upper] = searched
+        if searched.noise_passed:
+            return searched
 
     best = None
     for rank in range(upper, min(ceiling, upper + 3) + 1):
