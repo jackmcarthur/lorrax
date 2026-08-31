@@ -54,7 +54,17 @@ __all__ = [
 # measured Na optimum (-58 degrees) and its -55-degree near miss.  Wider
 # rotations stop at -75 degrees because the contour then grows on common
 # valence supports.  Claim 522 is the provenance for this grid.
-_ANGLE_SCAN_DEG = (0.0, -55.0, -58.0, -65.0, -75.0)
+# Measured on the frozen Na valence support (2026-08-31): node count is FLAT
+# from -70 to -90 deg while kappa falls to exactly 1.00 at -85, so the useful
+# region is a narrow band near the imaginary axis, not a sweep from 0.  The
+# sign-definite limit is 90 deg (a Laplace rule), which is what the certified
+# noncrossing tables already are; crossing support wants a few degrees off it.
+# The -58 deg the earlier study chose costs one extra node and 18% more
+# cancellation than -85 on the same support.  Real-time (0 deg) is retained
+# ONLY as the last entry: it is the operating point the shipped fitter used
+# and it misses this support by four orders of magnitude, so it must never be
+# tried first.
+_ANGLE_SCAN_DEG = (-85.0, -80.0, -70.0, -58.0, 0.0)
 _ANGLE_PROBE_RANK = 12
 _ANGLE_BASE_NODES = 64
 _MIN_RANK = 6
