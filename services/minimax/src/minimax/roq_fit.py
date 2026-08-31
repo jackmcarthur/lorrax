@@ -583,10 +583,9 @@ def _fit_production_rank(group: RoqGroup, target: float,
         return cache[rank]
 
     lower = _MIN_RANK
-    # Clamp the bracket to the usable rank: on a low-rank measure the ceiling
-    # can fall below the angle probe's rank, which left the final loop's range
-    # empty and returned no rule at all.
-    upper = max(_MIN_RANK, min(_ANGLE_PROBE_RANK, ceiling))
+    # Clamp every search rank to the usable interval.  The angle probe was
+    # built independently and can sit above a low-rank measure's ceiling.
+    upper = min(_ANGLE_PROBE_RANK, ceiling)
     if not angle_probe.target_met or not quick(upper).target_met:
         lower = upper
         # Ladder scaled to this support's own ceiling, so a wide window is
@@ -599,19 +598,27 @@ def _fit_production_rank(group: RoqGroup, target: float,
                 break
             lower = upper
         else:
-            return _fit_prepared(
-                group, prepared, ceiling, target=target, windows=windows,
-                evaluations=len(cache))
+            # A miss still needs the best honest refusal.  Continue through
+            # the same full-fit path at the last usable rank instead of
+            # returning through a separate, easy-to-empty branch.
+            upper = ceiling
     midpoint = (lower + upper) // 2
     if lower < midpoint < upper and quick(midpoint).target_met:
         upper = midpoint
 
-    best = None
-    for rank in range(upper, min(ceiling, upper + 3) + 1):
+    # Evaluate the selected rank unconditionally, then at most three larger
+    # usable ranks.  Initializing ``best`` here makes the search total even
+    # when the usable ceiling equals the first probe.
+    best = _fit_prepared(
+        group, prepared, upper, target=target, windows=windows,
+        evaluations=len(cache))
+    if best.target_met and best.noise_passed:
+        return best
+    for rank in range(upper + 1, min(ceiling, upper + 3) + 1):
         final = _fit_prepared(
             group, prepared, rank, target=target, windows=windows,
             evaluations=len(cache))
-        if best is None or final.max_error < best.max_error:
+        if final.max_error < best.max_error:
             best = final
         if final.target_met and final.noise_passed:
             return final
