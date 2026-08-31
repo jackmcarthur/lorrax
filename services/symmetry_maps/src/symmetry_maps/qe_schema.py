@@ -151,8 +151,10 @@ def _read_qe_symmetry_receipt_cached(
     noncolin = False
     do_magnetization: bool | None = None
     current_info_anti = False
+    current_info_kind: str | None = None
     current_rotation: np.ndarray | None = None
     current_translation = np.zeros(3, dtype=np.float64)
+    declared_nsym: int | None = None
     stack: list[str] = []
 
     for event, elem in ET.iterparse(xml_path, events=("start", "end")):
@@ -161,6 +163,7 @@ def _read_qe_symmetry_receipt_cached(
             stack.append(tag)
             if tag == "symmetry":
                 current_info_anti = False
+                current_info_kind = None
                 current_rotation = None
                 current_translation = np.zeros(3, dtype=np.float64)
             continue
@@ -174,6 +177,8 @@ def _read_qe_symmetry_receipt_cached(
             noncolin = _bool_text(elem.text)
         elif tag == "do_magnetization" and "magnetization" in ancestry:
             do_magnetization = _bool_text(elem.text)
+        elif parent == "symmetries" and tag == "nsym":
+            declared_nsym = int((elem.text or "").strip())
         elif tag in {"b1", "b2", "b3"} and "reciprocal_lattice" in ancestry:
             bvec_rows[tag] = _numbers(elem.text)
         elif tag == "monkhorst_pack" and "starting_k_points" in ancestry:
@@ -189,6 +194,7 @@ def _read_qe_symmetry_receipt_cached(
             if values.shape == (3,):
                 kpoints_cart_input.append(values)
         elif parent == "symmetry" and tag == "info":
+            current_info_kind = (elem.text or "").strip().lower()
             current_info_anti = (
                 elem.attrib.get("time_reversal", "false").strip().lower()
                 == "true")
@@ -209,15 +215,23 @@ def _read_qe_symmetry_receipt_cached(
                     f"shape {values.shape}, expected (3,).")
             current_translation = values
         elif tag == "symmetry" and current_rotation is not None:
-            rotations.append(current_rotation)
-            translations_qe.append(current_translation.copy())
-            antiunitary.append(bool(current_info_anti))
+            # QE emits ``nrot`` lattice candidates after its ``nsym`` active
+            # crystal operations.  Only the latter acted on the KS states and
+            # can authenticate the WFN header.
+            if current_info_kind in {None, "", "crystal_symmetry"}:
+                rotations.append(current_rotation)
+                translations_qe.append(current_translation.copy())
+                antiunitary.append(bool(current_info_anti))
 
         stack.pop()
         elem.clear()
 
     if not rotations:
         raise ValueError(f"QE schema {xml_path} contains no symmetry rotations.")
+    if declared_nsym is not None and len(rotations) != declared_nsym:
+        raise ValueError(
+            f"QE schema {xml_path}: declared nsym={declared_nsym} but found "
+            f"{len(rotations)} active crystal_symmetry records.")
     if kgrid is None:
         # Older QE schemas with an explicit k-point list carry no MP grid.
         # The WFN still carries it; the exact stored k coordinates below are
