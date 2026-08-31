@@ -115,6 +115,12 @@ TARGETS: Mapping[str, TargetSpec] = MappingProxyType({
                     "Im[sqrt(pi/2) exp(-(u+i)^2/2)(1 + i erfi((u+i)/sqrt2))]"),
         version=1,
         domain="real"),
+    "causal_reciprocal": TargetSpec(
+        name="causal_reciprocal",
+        definition=("1/(x + i*g) for x in [-A, A], g in [1, 100], "
+                    "as a one-sided causal exponential sum"),
+        version=1,
+        domain="strip"),
     "fermi": TargetSpec(
         name="fermi",
         definition="G_fermi(u) = tanh-regularized sign target on u in [0, A]",
@@ -176,6 +182,21 @@ FAMILIES: Mapping[str, FamilySpec] = MappingProxyType({
                         "--a-max <A> --error-tier <eps>   (~1 core-hour, "
                         "offline)"),
         description="The HGL regularized sign target as a signed sine sum."),
+    "crossing_causal": FamilySpec(
+        name="crossing_causal",
+        route="causal_exponential_sum",
+        target="causal_reciprocal",
+        character="strip",
+        range_param="A_dim",
+        catalog="catalog.json",
+        shipped=True,
+        wired=True,
+        range_lever=("lower A_dim = max |Re d| / min |Im d|; the shipped "
+                     "family also requires max |Im d| / min |Im d| <= 100"),
+        generator_hint=("tools/generate_causal_crossing_assets.py "
+                        "--write-assets   (offline only)"),
+        description=("1/(x+i*g) as a stable one-sided causal exponential "
+                     "sum on |x| <= A and 1 <= g <= 100.")),
     "noncrossing_imag": FamilySpec(
         name="noncrossing_imag",
         route="exponential_sum_imag",
