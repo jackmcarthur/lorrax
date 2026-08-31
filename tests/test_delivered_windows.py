@@ -300,6 +300,50 @@ def _served_candidate(spec, *_args):
     }]
 
 
+def _budget_candidate(required_target):
+    return [{
+        "times": np.asarray([0.1]),
+        "weights": np.asarray([1.0j]),
+        "metrics": (required_target, 1.0, 1.0),
+        "required_target": required_target,
+        "absolute_cost": required_target,
+    }]
+
+
+def test_rule_budget_adds_only_on_each_omega_patch():
+    specs = [
+        {
+            "name": "left", "omega_idx": np.asarray([0]),
+            "envelope_by_frequency": np.asarray([1.0]), "envelope": 1.0,
+        },
+        {
+            "name": "right", "omega_idx": np.asarray([1]),
+            "envelope_by_frequency": np.asarray([1.0]), "envelope": 1.0,
+        },
+    ]
+    fits, pairs, required = delivered._select_rules(
+        specs, [_budget_candidate(0.75), _budget_candidate(0.75)],
+        total_absolute_budget=1.0, pair_ceiling=2)
+
+    assert len(fits) == 2
+    assert pairs == 2
+    assert required == pytest.approx(0.75)
+
+
+def test_rule_budget_still_adds_overlapping_omega_patches():
+    specs = [
+        {
+            "name": name, "omega_idx": np.asarray([0]),
+            "envelope_by_frequency": np.asarray([1.0]), "envelope": 1.0,
+        }
+        for name in ("first", "second")
+    ]
+    with pytest.raises(RuntimeError, match=r"best cost=1.5, budget=1"):
+        delivered._select_rules(
+            specs, [_budget_candidate(0.75), _budget_candidate(0.75)],
+            total_absolute_budget=1.0, pair_ceiling=2)
+
+
 def _patched_test_plan(width_ev):
     ev_to_ry = 1.0 / 27.211386245988
     eta = 0.25 * ev_to_ry

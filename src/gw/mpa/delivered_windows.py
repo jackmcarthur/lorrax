@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 6
+_PLAN_CACHE_VERSION = 7
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -124,6 +124,7 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
             bool(branch.neg_omega_half))).encode())
         add_array((*spec["state_interval"], *spec["pole_bounds"],
                    spec["E_ref_A"], spec["envelope"]))
+        add_array(spec["envelope_by_frequency"])
         for key in ("pole_indices", "state_indices", "raw_state_energy"):
             add_array(spec[key])
         for problem in (spec["problem"], spec["validation"]):
@@ -167,7 +168,7 @@ def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
     """Re-certify cached nodes and weights on the live measured problems."""
     if len(fits) != len(specs):
         return None
-    required_cost = 0.0
+    required_cost_by_frequency = _empty_frequency_cost(specs)
     for spec, fit in zip(specs, fits):
         try:
             times = np.asarray(fit["times"], np.complex128)
@@ -188,10 +189,12 @@ def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
         required = max(
             metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
             / AMPLIFICATION_NOISE_SAFETY)
-        required_cost += float(spec["envelope"] * required)
+        required_cost_by_frequency += _frequency_cost(
+            spec, required, size=required_cost_by_frequency.size)
         fit.update(metrics=metrics, factor_growth=factor,
                    required_target=required,
                    absolute_cost=float(spec["envelope"] * required))
+    required_cost = _peak_frequency_cost(required_cost_by_frequency)
     if (sum(int(np.asarray(fit["times"]).size) for fit in fits)
             > int(pair_ceiling)
             or required_cost > float(total_absolute)):
@@ -1427,28 +1430,77 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
         "did not survive the residual, noise, and factor-growth gates")
 
 
+def _empty_frequency_cost(specs):
+    """Return one zero cost per physical frequency row in ``specs``."""
+    largest = max(
+        (int(np.max(spec["omega_idx"])) for spec in specs
+         if np.asarray(spec["omega_idx"]).size),
+        default=-1)
+    return np.zeros(largest + 1, dtype=np.float64)
+
+
+def _frequency_cost(spec, relative_error, *, size=None):
+    """Upper-bound one window's delivered error on its frequency rows."""
+    cost = (_empty_frequency_cost((spec,)) if size is None
+            else np.zeros(int(size), dtype=np.float64))
+    np.add.at(
+        cost, np.asarray(spec["omega_idx"], np.int64),
+        np.asarray(spec["envelope_by_frequency"], np.float64)
+        * float(relative_error))
+    return cost
+
+
+def _peak_frequency_cost(cost):
+    """Return the largest absolute delivered-error bound over frequency."""
+    array = np.asarray(cost, np.float64)
+    return float(np.max(array)) if array.size else 0.0
+
+
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
                   pair_ceiling):
-    """Exact small integer plan: minimum pairs whose budget cost fits."""
-    states = {0: (0.0, ())}
-    for candidates in candidates_by_window:
+    """Exact small integer plan under the pointwise frequency budget.
+
+    Omega patches cover disjoint frequency rows.  Their error bounds therefore
+    add only where their rows overlap; summing each patch's worst envelope as
+    though every patch covered every frequency is not the delivered-error
+    contract.  For each node count, keep the pointwise Pareto frontier and
+    select the fewest pairs whose peak achieved bound fits the global budget.
+    """
+    zeros = _empty_frequency_cost(specs)
+    states = {0: [(zeros, ())]}
+    for window_index, candidates in enumerate(candidates_by_window):
         next_states = {}
-        for used, (cost, choices) in states.items():
-            for index, candidate in enumerate(candidates):
-                nodes = int(candidate["times"].size)
-                new_used = used + nodes
-                if new_used > int(pair_ceiling):
-                    continue
-                new_cost = cost + candidate["absolute_cost"]
-                previous = next_states.get(new_used)
-                if previous is None or new_cost < previous[0]:
-                    next_states[new_used] = (new_cost, choices + (index,))
+        spec = specs[window_index]
+        for used, rows in states.items():
+            for cost, choices in rows:
+                for index, candidate in enumerate(candidates):
+                    nodes = int(candidate["times"].size)
+                    new_used = used + nodes
+                    if new_used > int(pair_ceiling):
+                        continue
+                    candidate_cost = _frequency_cost(
+                        spec, candidate["required_target"], size=zeros.size)
+                    new_cost = cost + candidate_cost
+                    frontier = next_states.setdefault(new_used, [])
+                    if any(np.all(previous[0] <= new_cost)
+                           for previous in frontier):
+                        continue
+                    frontier[:] = [
+                        previous for previous in frontier
+                        if not np.all(new_cost <= previous[0])]
+                    frontier.append((new_cost, choices + (index,)))
         states = next_states
-    feasible = [(nodes, cost, choices)
-                for nodes, (cost, choices) in states.items()
-                if cost <= float(total_absolute_budget)]
+    feasible = [
+        (nodes, cost, choices)
+        for nodes, rows in states.items()
+        for cost, choices in rows
+        if _peak_frequency_cost(cost) <= float(total_absolute_budget)]
     if not feasible:
-        best = min(states.items(), key=lambda item: item[1][0], default=None)
+        best = min(
+            ((nodes, cost, choices)
+             for nodes, rows in states.items()
+             for cost, choices in rows),
+            key=lambda row: _peak_frequency_cost(row[1]), default=None)
         blocking = max(
             zip(specs, candidates_by_window),
             key=lambda pair: min(c["absolute_cost"] for c in pair[1]))
@@ -1456,17 +1508,23 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
         metrics = candidate["metrics"]
         detail = "no bounded combination"
         if best is not None:
-            detail = (f"best cost={best[1][0]:.6g}, "
+            detail = (f"best cost={_peak_frequency_cost(best[1]):.6g}, "
                       f"budget={float(total_absolute_budget):.6g}")
         raise RuntimeError(
             f"delivered product window {blocking[0]['name']!r} refused: "
             f"achieved (residual={metrics[0]:.6g}, "
             f"amplification_p99={metrics[1]:.6g}); {detail}, "
             f"pair ceiling={int(pair_ceiling)}")
-    nodes, required_cost, choices = min(feasible, key=lambda row: (row[0], row[1]))
+    nodes, required_cost_by_frequency, choices = min(
+        feasible, key=lambda row: (row[0], _peak_frequency_cost(row[1])))
+    required_cost = _peak_frequency_cost(required_cost_by_frequency)
     selected = [candidates[index]
                 for candidates, index in zip(candidates_by_window, choices)]
-    envelope_sum = sum(spec["envelope"] for spec in specs)
+    envelope_sum_by_frequency = _empty_frequency_cost(specs)
+    for spec in specs:
+        envelope_sum_by_frequency += _frequency_cost(
+            spec, 1.0, size=envelope_sum_by_frequency.size)
+    envelope_sum = _peak_frequency_cost(envelope_sum_by_frequency)
     spare_relative = ((float(total_absolute_budget) - required_cost)
                       / envelope_sum)
     for spec, candidate in zip(specs, selected):
@@ -1686,7 +1744,9 @@ def build_delivered_sigma_windows(
                         "E_ref_A": E_ref,
                         "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
                         "omega_idx": patch_positions,
-                        "envelope": envelope, "branch_report": report,
+                        "envelope": envelope,
+                        "envelope_by_frequency": envelope_by_frequency,
+                        "branch_report": report,
                     }
                     specs.append(spec)
                     combined_envelope[patch_positions] += envelope_by_frequency
