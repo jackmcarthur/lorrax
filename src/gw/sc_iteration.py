@@ -1116,6 +1116,62 @@ def _rotate_sigma_omega_cube(
     return fn(sigma_c_omega_ry, U_dft_to_qp)
 
 
+def _sigma_c_at_dft_diag_from_dft_cube(
+    sigma_c_omega_dft_ry: jax.Array,
+    sigma_result: SigmaResult,
+    *,
+    mesh: Mesh,
+    print_fn: Callable = print,
+) -> np.ndarray:
+    """Interpolate the DFT-basis cube diagonal at the DFT energies.
+
+    ``sigma_result.sigma_c_at_dft_diag_ev`` was formed before the SC
+    finalize, from the diagonal of the QP-basis cube.  A diagonal cannot be
+    similarity-transformed by itself.  After the full cube has undergone the
+    one sanctioned QP-to-DFT rotation, extract its much smaller diagonal and
+    repeat the canonical output interpolation on the already-recorded omega
+    axis and DFT evaluation points.  The full cube is never gathered to host.
+
+    Parameters
+    ----------
+    sigma_c_omega_dft_ry
+        ``(n_omega, n_k, n_band, n_band)`` correlation operator in the DFT
+        output basis.  It may be band-sharded.
+    sigma_result
+        Last-map result carrying the omega grid and DFT-relative evaluation
+        energies used by the original interpolation.
+    mesh
+        Device mesh that owns the cube.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n_k, n_band)`` complex correlation diagonal at ``E_DFT``, in eV
+        and in the DFT output basis.
+    """
+    from .qsgw_utils import (
+        extract_sigma_diag_replicated,
+        interp_along_omega,
+        resolve_out_of_range_policy,
+    )
+
+    if (sigma_result.omega_grid_ev is None
+            or sigma_result.omega_dft_rel_ev is None):
+        raise ValueError(
+            "a dynamic SC output cube needs its omega grid and DFT-relative "
+            "evaluation energies to rebuild Sigma_c(E_DFT)")
+    diagonal_ev = np.asarray(extract_sigma_diag_replicated(
+        sigma_c_omega_dft_ry, mesh)) * RYD_TO_EV
+    return interp_along_omega(
+        diagonal_ev,
+        np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
+        np.asarray(sigma_result.omega_dft_rel_ev, dtype=np.float64),
+        out_of_range=resolve_out_of_range_policy(),
+        context="DFT-basis Sigma_c at E_DFT after SC finalize",
+        print_fn=print_fn,
+    )
+
+
 @_functools.partial(jax.jit, static_argnames=("mesh", "to_qp"))
 def _rotate_fixed_matrix(A: jax.Array, U_dft_to_qp: jax.Array, *,
                          mesh: Mesh, to_qp: bool) -> jax.Array:
@@ -4565,6 +4621,11 @@ def run_sc_driver(
             sigma_result.sigma_c_omega_kij_ry, U,
             mesh=mesh_xy, to_qp=False)
         if sigma_result.sigma_c_omega_kij_ry is not None else None)
+    sigma_c_at_dft_dft = (
+        _sigma_c_at_dft_diag_from_dft_cube(
+            sigma_c_omega_dft, sigma_result,
+            mesh=mesh_xy, print_fn=print_fn)
+        if sigma_c_omega_dft is not None else None)
     # These are diagnostics only.  Avoid an extra U-sized |U|^2 temporary and
     # five distributed contractions on the default path where no debug table
     # consumes them; when enabled, build the weight once and share it.
@@ -4608,6 +4669,7 @@ def run_sc_driver(
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_dft,
         sigma_c_omega_kij_ry=sigma_c_omega_dft,
+        sigma_c_at_dft_diag_ev=sigma_c_at_dft_dft,
         sigma_sx_kij_ry=(
             _rotate_to_dft_basis(sigma_result.sigma_sx_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_sx_kij_ry is not None else None),

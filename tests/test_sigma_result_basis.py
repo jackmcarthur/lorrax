@@ -45,7 +45,8 @@ SC_SRC = os.path.join(os.path.dirname(__file__), "..", "src", "gw",
 #: The finalize's rotation primitives and the other band rotations in the
 #: Σ path.  The cube may pass only through its row-scanned helper.
 _ROTATORS = ("_rotate_to_dft_basis", "_rotate_sigma_omega_cube",
-             "rotate_band_matrix", "_rotate_v_h_to_qp")
+             "_sigma_c_at_dft_diag_from_dft_cube", "rotate_band_matrix",
+             "_rotate_v_h_to_qp")
 
 
 def _sc_module():

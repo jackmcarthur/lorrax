@@ -209,6 +209,10 @@ ROTATED_TO_DFT_FIELDS = (
     # Rotated one omega row at a time on device.  A band-sharded cube keeps
     # P(None,None,'x','y'); no full-cube device or host gather is permitted.
     "sigma_c_omega_kij_ry",
+    # A diagonal cannot be rotated element-wise.  The finalize derives this
+    # cache from the diagonal of the once-rotated cube, on the original omega
+    # grid and at the DFT energies, so sigma_diag.dat cannot mix bases.
+    "sigma_c_at_dft_diag_ev",
     # The un-extrapolated N₃ twin of ``sigma_xc_kij_ry``, present only when
     # the band extrapolation is driving.  It is here and not in
     # ``SIGMA_BASIS_FIELDS`` because it is the SAME KIND OF OBJECT as the
@@ -227,7 +231,6 @@ ROTATED_TO_DFT_FIELDS = (
 #: element-wise.  ``e_eval_ev`` is the spectrum used by the QSGW ansatz in
 #: the last map's QP basis; it is output provenance rather than an operator.
 SIGMA_BASIS_FIELDS = (
-    "sigma_c_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",
 )
@@ -236,8 +239,8 @@ SIGMA_BASIS_FIELDS = (
 #: path: ``omega_dft_rel_ev`` is E_DFT − E_F, built from
 #: ``get_enk_bandrange`` in ``dynamic_sigma.eval_sigma_c_at_dft_energies``.
 #: TRAP: under self-consistency it labels bands by the DFT index while
-#: ``sigma_c_at_dft_diag_ev`` — the interpolation it drives, in that same
-#: function — labels them by the QP index.
+#: ``sigma_c_at_dft_diag_ev`` is rebuilt from the DFT-basis output cube by
+#: the SC finalize, so these evaluation points and that diagonal agree.
 DFT_BASIS_FIELDS = (
     "omega_dft_rel_ev",
     "photon_head_sigma_diag_tskn_ry",

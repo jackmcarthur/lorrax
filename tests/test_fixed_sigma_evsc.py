@@ -13,6 +13,7 @@ from common.units import RYD_TO_EV
 from gw.sc_iteration import (
     _place,
     _rotate_sigma_omega_cube,
+    _sigma_c_at_dft_diag_from_dft_cube,
     run_fixed_sigma_evsc,
 )
 from gw.sigma_dispatch import SigmaResult
@@ -85,6 +86,28 @@ def test_full_sigma_cube_rotation_to_dft_is_u_sigma_u_dagger():
         jnp.asarray(cube), _place(U, mesh, None), mesh=mesh, to_qp=False)
     np.testing.assert_allclose(np.asarray(got), _rotate_host_to_dft(cube, U),
                                rtol=2e-13, atol=2e-13)
+
+
+def test_at_dft_diagonal_is_rebuilt_from_rotated_cube():
+    omega_ev = np.asarray([-1.0, 0.0, 1.0])
+    cube = np.zeros((3, 1, 2, 2), dtype=np.complex128)
+    cube[:, 0, 0, 0] = [1.0, 2.0, 3.0]
+    cube[:, 0, 1, 1] = [4.0, 6.0, 8.0]
+    zero = jnp.zeros((1, 2, 2), dtype=jnp.complex128)
+    result = SigmaResult(
+        v_h_kij_ry=zero,
+        sigma_x_kij_ry=zero,
+        sigma_xc_kij_ry=zero,
+        sigma_c_omega_kij_ry=jnp.asarray(cube / RYD_TO_EV),
+        omega_grid_ev=omega_ev,
+        omega_dft_rel_ev=np.asarray([[0.5, -0.5]]),
+        # Deliberately wrong QP-basis cache: the helper must not reuse it.
+        sigma_c_at_dft_diag_ev=np.full((1, 2), 999.0),
+    )
+    mesh = single_device_mesh()
+    got = _sigma_c_at_dft_diag_from_dft_cube(
+        result.sigma_c_omega_kij_ry, result, mesh=mesh)
+    np.testing.assert_allclose(got, [[2.5, 5.0]], rtol=0.0, atol=1e-14)
 
 
 @pytest.mark.mesh(4)
