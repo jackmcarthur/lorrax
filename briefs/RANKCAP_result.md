@@ -20,9 +20,9 @@ the former empty-range/`None.times` failure is removed.  The integration test
 also now accepts the live ROQ serving this low-rank fixture before its shipped
 fallback while retaining the complete crossing-rectangle assertions.
 
-Verification: the requested CPU gate collected and passed **134/134** in
-**146.38 s**; after the final refusal-selection change, the formerly failing
-focused test passed **1/1** in **9.52 s**.
+Verification at the final pushed implementation: the requested CPU gate
+collected and passed **134/134** in **120.90 s**; the focused refusal and
+integration pair also passed **2/2** in **33.76 s**.
 Timing used `OPENBLAS_NUM_THREADS=OMP_NUM_THREADS=MKL_NUM_THREADS=1` and the
 brief's supplied venv.  Frozen input:
 `/pscratch/sd/j/jackm/wt_kappa_2026-08-31/tmp/kappa_probe/crossing_supports.npz`.
