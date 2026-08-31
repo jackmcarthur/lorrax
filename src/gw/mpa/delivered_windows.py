@@ -35,8 +35,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.collectives import (gather_to_host, process_count, process_rank,
-                                psum_replicate)
+from common.collectives import (all_gather_processes, gather_to_host,
+                                process_count, process_rank, psum_replicate)
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.evaluator import gauss_legendre_interval
 from gw.mpa.sigma_windows import SharedSigmaWindow
@@ -77,6 +77,103 @@ _CROSSING_CONDITIONING_SLACK = 0.2
 # present in evaluator.damped_rectangle_gauss_rule; it fixes the time interval
 # without a search over tail fractions.
 _CROSSING_TAIL_FRACTION = 0.9
+
+
+def _planner_work_indices(count, rank=None, world=None):
+    """Return this process's deterministic share of indexed planner work."""
+    world = int(process_count() if world is None else world)
+    rank = int(process_rank() if rank is None else rank)
+    if world < 1 or not 0 <= rank < world:
+        raise ValueError(
+            f"invalid planner process coordinate rank={rank}, world={world}")
+    return tuple(range(rank, int(count), world))
+
+
+def _all_gather_planner_payload(payload):
+    """Gather one variable-length Python payload without creating a mesh.
+
+    The existing process collective accepts fixed-shape arrays.  A length
+    gather followed by one padded byte gather carries the small fitted-rule
+    dictionaries while preserving NumPy dtypes and every bit of their nodes
+    and weights.
+    """
+    encoded = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    local = np.frombuffer(encoded, dtype=np.uint8)
+    lengths = np.asarray(all_gather_processes(
+        np.asarray(local.size, dtype=np.int32)), dtype=np.int64).reshape(-1)
+    if lengths.size != int(process_count()) or np.any(lengths <= 0):
+        raise RuntimeError("planner payload length gather returned bad data")
+    width = int(np.max(lengths))
+    padded = np.zeros(width, dtype=np.uint8)
+    padded[:local.size] = local
+    gathered = np.asarray(all_gather_processes(padded), dtype=np.uint8)
+    if gathered.shape != (int(process_count()), width):
+        raise RuntimeError(
+            "planner payload gather returned shape "
+            f"{gathered.shape}, expected {(int(process_count()), width)}")
+    return [pickle.loads(np.ascontiguousarray(
+        gathered[source, :int(length)]).tobytes())
+        for source, length in enumerate(lengths)]
+
+
+def _assemble_planner_rows(shards, count, world, *, refuse_errors):
+    """Reassemble indexed work and choose one rank-independent refusal."""
+    rows = [row for shard in shards for row in shard]
+    rows.sort(key=lambda row: int(row["index"]))
+    indices = [int(row["index"]) for row in rows]
+    expected = list(range(int(count)))
+    if indices != expected:
+        raise RuntimeError(
+            f"planner gather returned work indices {indices}, expected "
+            f"{expected}")
+    for row in rows:
+        expected_source = int(row["index"]) % int(world)
+        if int(row["source_rank"]) != expected_source:
+            raise RuntimeError(
+                f"planner work {row['index']} came from rank "
+                f"{row['source_rank']}, expected {expected_source}")
+    refusals = [row for row in rows if row["error"] is not None]
+    if refusals and refuse_errors:
+        # Rows are index-sorted, so every process raises the same first
+        # refusal even when several independent windows fail.
+        raise RuntimeError(refusals[0]["error"]["message"])
+    values = [None if row["error"] is not None else row["value"]
+              for row in rows]
+    return values, rows
+
+
+def _run_parallel_planner_jobs(count, worker, *, refuse_errors):
+    """Run indexed fits once across processes, then replicate their results.
+
+    Exceptions are data until after the gather.  This is essential on a
+    fail-fast launcher: raising on one process before its peers enter the
+    collective would turn an ordinary product-window refusal into a hang.
+    """
+    rank = int(process_rank())
+    world = int(process_count())
+    local_rows = []
+    for index in _planner_work_indices(count, rank, world):
+        started = time.perf_counter()
+        try:
+            value, detail = worker(index)
+            error = None
+        except Exception as exc:  # noqa: BLE001 - refusals cross ranks as data
+            value, detail = None, {}
+            error = {
+                "type": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                "message": str(exc),
+            }
+        local_rows.append({
+            "index": int(index),
+            "source_rank": rank,
+            "value": value,
+            "error": error,
+            "seconds": time.perf_counter() - started,
+            "detail": detail,
+        })
+    shards = _all_gather_planner_payload(local_rows)
+    return _assemble_planner_rows(
+        shards, count, world, refuse_errors=refuse_errors)
 
 
 def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
@@ -1477,8 +1574,7 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
     by_branch = {}
     for index, spec in enumerate(specs):
         by_branch.setdefault(id(spec["branch"]), []).append(index)
-    keep = list(range(len(specs)))
-    merged_specs, merged_candidates = dict(), dict()
+    trials = []
     for indices in by_branch.values():
         if len(indices) < 2:
             continue
@@ -1487,11 +1583,21 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
         if merged is None:
             continue
         allowance = min(0.5, total_absolute / merged["envelope"])
-        try:
-            candidate = window_candidates(
-                merged, eta, max_nodes, factor_cap, allowance)[0]
-        except (RuntimeError, ValueError, FloatingPointError, OverflowError,
-                np.linalg.LinAlgError):
+        trials.append((indices, merged, allowance))
+
+    def fit_trial(index):
+        _indices, merged, allowance = trials[index]
+        rows, detail = _window_candidates_profiled(
+            merged, eta, max_nodes, factor_cap, allowance)
+        return rows[0], detail
+
+    trial_candidates, trial_rows = _run_parallel_planner_jobs(
+        len(trials), fit_trial, refuse_errors=False)
+    keep = list(range(len(specs)))
+    merged_specs, merged_candidates = dict(), dict()
+    for (indices, merged, _allowance), candidate in zip(
+            trials, trial_candidates):
+        if candidate is None:
             continue
         split_nodes = sum(int(candidates[i][0]["times"].size) for i in indices)
         if int(candidate["times"].size) >= split_nodes:
@@ -1501,9 +1607,10 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
         for dropped in indices[1:]:
             keep.remove(dropped)
     if not merged_specs:
-        return specs, candidates
+        return specs, candidates, trial_rows
     return ([merged_specs.get(i, specs[i]) for i in keep],
-            [merged_candidates.get(i, candidates[i]) for i in keep])
+            [merged_candidates.get(i, candidates[i]) for i in keep],
+            trial_rows)
 
 
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
@@ -1513,17 +1620,30 @@ def window_candidates(spec, eta, max_nodes, factor_growth_cap,
     The single routing decision, at module level so the planner, the tests and
     the offline node audit all take the same path.
     """
+    return _window_candidates_profiled(
+        spec, eta, max_nodes, factor_growth_cap, relative_target,
+        adapted_only=adapted_only)[0]
+
+
+def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
+                                relative_target, *, adapted_only=False):
+    """Return one window's rules and a cost split for planner evidence."""
+    detail = {"adapted_fit_seconds": 0.0,
+              "shipped_fallback_seconds": 0.0}
     adapted = None
     if spec["kind"] == "crossing":
+        started = time.perf_counter()
         adapted = _roq_crossing_candidate(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
+        detail["adapted_fit_seconds"] = time.perf_counter() - started
     if adapted is not None and adapted_only:
         # First pass: the cheap rule alone.  Fitting the shipped crossing
         # rule as well costs seconds per window and is only needed when the
         # GLOBAL budget cannot be met from cheap rules, which the caller
         # discovers by retrying.  Planning was 66 s of an 85 s stage before
         # this split.
-        return [adapted]
+        return [adapted], detail
+    started = time.perf_counter()
     try:
         shipped = _candidate_rules(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
@@ -1532,13 +1652,16 @@ def window_candidates(spec, eta, max_nodes, factor_growth_cap,
         if adapted is None:
             raise
         shipped = []
+    finally:
+        detail["shipped_fallback_seconds"] = time.perf_counter() - started
     # BOTH are offered to the exact selector, cheapest first.  The adapted
     # rule is usually far cheaper in nodes, but a window's own allowance is
     # not the whole story: the selector minimises nodes subject to the GLOBAL
     # delivered-error budget, and sometimes it must buy a more accurate rule
     # in one window to afford the plan.  Offering only the cheap rule made a
     # real deck refuse at 4.6% over budget with no alternative to pick.
-    return ([adapted] + shipped) if adapted is not None else shipped
+    candidates = ([adapted] + shipped) if adapted is not None else shipped
+    return candidates, detail
 
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
@@ -1890,6 +2013,7 @@ def build_delivered_sigma_windows(
     cached = _load_plan_cache(
         plan_cache_path, cache_fingerprint, len(specs))
     cache_status = "disabled" if plan_cache_path is None else "hit"
+    window_fit_rows, consolidation_rows = [], []
     if cached is not None:
         (fits, free_pairs, required_cost, window_tau_pairs,
          fingerprint_match) = cached
@@ -1921,28 +2045,50 @@ def build_delivered_sigma_windows(
         # measured on the Na deck), so both are avoided here.
         allowances = [min(0.5, total_absolute / spec["envelope"])
                       for spec in specs]
-        adapted_cache = [
-            _roq_crossing_candidate(spec, eta, pair_ceiling, factor_cap,
-                                    allowance)
-            if spec["kind"] == "crossing" else None
-            for spec, allowance in zip(specs, allowances)]
         base_specs = specs
+
+        def fit_window(index):
+            return _window_candidates_profiled(
+                base_specs[index], eta, pair_ceiling, factor_cap,
+                allowances[index], adapted_only=True)
+
+        base_candidates, window_fit_rows = _run_parallel_planner_jobs(
+            len(base_specs), fit_window, refuse_errors=True)
         fits = None
         for adapted_only in (True, False):
             specs = base_specs
-            candidates_by_window = []
-            for spec, allowance, adapted in zip(base_specs, allowances,
-                                                adapted_cache):
-                if adapted is not None and adapted_only:
-                    candidates_by_window.append([adapted])
-                    continue
-                shipped = _candidate_rules(
-                    spec, eta, pair_ceiling, factor_cap, allowance)
-                candidates_by_window.append(
-                    ([adapted] + shipped) if adapted is not None else shipped)
-            specs, candidates_by_window = _consolidate_branches(
+            if adapted_only:
+                candidates_by_window = base_candidates
+            else:
+                def fit_retry(index):
+                    existing = base_candidates[index]
+                    adapted = next((candidate for candidate in existing
+                        if candidate["evidence"]["family"]
+                        == "measure_adapted_roq"), None)
+                    detail = {"adapted_fit_seconds": 0.0,
+                              "shipped_fallback_seconds": 0.0}
+                    if adapted is None:
+                        return existing, detail
+                    started = time.perf_counter()
+                    try:
+                        shipped = _candidate_rules(
+                            base_specs[index], eta, pair_ceiling, factor_cap,
+                            allowances[index])
+                    except (RuntimeError, ValueError, FloatingPointError,
+                            OverflowError, np.linalg.LinAlgError):
+                        shipped = []
+                    detail["shipped_fallback_seconds"] = (
+                        time.perf_counter() - started)
+                    return [adapted] + shipped, detail
+
+                candidates_by_window, retry_rows = (
+                    _run_parallel_planner_jobs(
+                        len(base_specs), fit_retry, refuse_errors=True))
+                window_fit_rows.extend(retry_rows)
+            specs, candidates_by_window, trial_rows = _consolidate_branches(
                 specs, candidates_by_window, eta, pair_ceiling, factor_cap,
                 total_absolute)
+            consolidation_rows.extend(trial_rows)
             try:
                 fits, free_pairs, required_cost = _select_rules(
                     specs, candidates_by_window, total_absolute, pair_ceiling)
