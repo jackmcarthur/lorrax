@@ -1392,33 +1392,60 @@ def _rule_candidate(problem, validation, times, weights, evidence):
 
 
 def _factor_growth(spec, times, eta):
+    """Return exponent maxima from one cached product-support scan.
+
+    Delivered times are axis-aligned: crossing nodes are real and
+    noncrossing nodes are imaginary.  Min/max support bounds therefore give
+    the exact maximum real exponent.  Cache those four scalars instead of
+    rescanning every measured pole cell for each tighter table candidate.
+    """
     time = np.asarray(times, dtype=np.complex128).reshape(-1)
     if not time.size:
         return 0.0, 0.0
     pole_sign = float(spec["pole_sign"])
     time_exec = pole_sign * time
-    raw = np.asarray(spec["raw_state_energy"], dtype=np.float64)
-    reference = float(spec["E_ref_A"])
-    green = float(np.max(np.real(
-        -1.0j * (raw[:, None] - reference) * time_exec[None, :])))
-    cells = []
-    pole_lo, pole_hi = map(float, spec["pole_bounds"])
-    measure = spec["measure"]
-    selected_poles = set(np.asarray(spec["pole_indices"]).tolist())
-    for local, pole in enumerate(np.asarray(measure[5], np.int32)):
-        if pole not in selected_poles:
-            continue
-        for part in (0, 1):
-            pole_cells = measure[3][local][part]
-            if pole_cells is not None:
+    bounds = spec.get("_factor_support_bounds")
+    if bounds is None:
+        raw = np.asarray(spec["raw_state_energy"], dtype=np.float64)
+        delta = raw - float(spec["E_ref_A"])
+        pole_lo, pole_hi = map(float, spec["pole_bounds"])
+        measure = spec["measure"]
+        selected_poles = set(np.asarray(spec["pole_indices"]).tolist())
+        x_min, x_max = np.inf, -np.inf
+        y_min, y_max = np.inf, -np.inf
+        for local, pole in enumerate(np.asarray(measure[5], np.int32)):
+            if pole not in selected_poles:
+                continue
+            for part in (0, 1):
+                pole_cells = measure[3][local][part]
+                if pole_cells is None:
+                    continue
                 pole_cells = np.asarray(pole_cells)
                 keep = ((pole_cells.real > pole_lo)
                         & (pole_cells.real <= pole_hi))
-                if np.any(keep):
-                    cells.append(pole_cells[keep] + 1.0j * eta)
-    pole_values = np.concatenate(cells)
-    screened = float(np.max(np.real(
-        -1.0j * pole_values[:, None] * time_exec[None, :])))
+                if not np.any(keep):
+                    continue
+                kept = pole_cells[keep]
+                x_min = min(x_min, float(np.min(kept.real)))
+                x_max = max(x_max, float(np.max(kept.real)))
+                y_min = min(y_min, float(np.min(kept.imag)) + float(eta))
+                y_max = max(y_max, float(np.max(kept.imag)) + float(eta))
+        if not np.isfinite((x_min, x_max, y_min, y_max)).all():
+            raise RuntimeError(
+                f"product window {spec['name']!r} has no pole cells for "
+                "the executor factor-growth gate")
+        bounds = (float(np.min(delta)), float(np.max(delta)),
+                  x_min, x_max, y_min, y_max)
+        spec["_factor_support_bounds"] = bounds
+
+    delta_min, delta_max, x_min, x_max, y_min, y_max = bounds
+    a = time_exec.real
+    b = time_exec.imag
+    green = float(np.max(np.where(
+        b >= 0.0, delta_max * b, delta_min * b)))
+    x_term = np.where(b >= 0.0, x_max * b, x_min * b)
+    y_term = np.where(a >= 0.0, y_max * a, y_min * a)
+    screened = float(np.max(x_term + y_term))
     return green, screened
 
 
@@ -1427,7 +1454,7 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
     """Return accepted rules needed by the complete-plan budget.
 
     Shipped tables are walked first, with one candidate per certified error
-    level.  A crossing uses its two deterministic fallbacks only if no table
+    level.  A crossing uses one deterministic positive rule if no table
     passes.  Keeping tighter accepted choices lets the final selector meet
     the global error budget without a tolerance or node sweep.
     """
@@ -1562,6 +1589,9 @@ def _split_refused_crossing(spec, state_edge, bins):
                 if spec["pole_sign"] * table_sign > 0.0:
                     E_ref = float(np.max(spec["raw_state_energy"]))
             child = dict(spec)
+            # The child has narrower pole bounds and must scan its own factor
+            # support instead of inheriting the refused parent's cache.
+            child.pop("_factor_support_bounds", None)
             child.update({
                 "name": f"{label}[p{patch_number}/{patch_count}]",
                 "problem": problem,
