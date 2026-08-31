@@ -20,6 +20,15 @@ from .gw_config import (
 
 HEAD_PERSIST_ITERATION_SEAM = "head-persist-iteration-seam-v1"
 
+
+def _is_band_sharded_static(a) -> bool:
+    """Whether a 3-D operator has either matrix axis partitioned."""
+    spec = getattr(getattr(a, "sharding", None), "spec", None)
+    if spec is None or getattr(a, "ndim", 0) != 3:
+        return False
+    spec = tuple(spec) + (None,) * (3 - len(tuple(spec)))
+    return spec[1] is not None or spec[2] is not None
+
 # ---------------------------------------------------------------------------
 # Results container
 # ---------------------------------------------------------------------------
@@ -38,19 +47,19 @@ class GWResults:
 
     Attributes
     ----------
-    sig_sx : np.ndarray, (nk, nb, nb)
+    sig_sx : np.ndarray or jax.Array, (nk, nb, nb)
         Static screened-exchange Σ_SX (Ry).  In PPM mode this is still
         the static COHSEX value, retained for diagnostics/restart.
-    sig_coh : np.ndarray, (nk, nb, nb)
+    sig_coh : np.ndarray or jax.Array, (nk, nb, nb)
         Static Coulomb-hole Σ_COH (Ry).
-    sig_h : np.ndarray, (nk, nb, nb)
+    sig_h : np.ndarray or jax.Array, (nk, nb, nb)
         Exact total direct contribution ``V_H + H_T`` (Ry).
-    sig_h_scalar : np.ndarray, (nk, nb, nb)
+    sig_h_scalar : np.ndarray or jax.Array, (nk, nb, nb)
         Source-resolved scalar charge Hartree contribution (Ry).
-    h_transverse : np.ndarray or None, (nk, nb, nb)
+    h_transverse : np.ndarray, jax.Array, or None, (nk, nb, nb)
         Exact periodic transverse-current Hartree contribution (Ry), absent
         on charge-only runs.
-    sig_x : np.ndarray, (nk, nb, nb)
+    sig_x : np.ndarray or jax.Array, (nk, nb, nb)
         Bare exchange Σ_X (Ry).  Used as the "sigX" column in PPM mode
         and as a quality-of-fit check in COHSEX mode.
     E_qp_ry : np.ndarray, (nk, nb)
@@ -94,6 +103,15 @@ class GWResults:
     band_stop: int
     sig_h_scalar: np.ndarray | None = None
     h_transverse: np.ndarray | None = None
+    # Bounded host mirrors used by rank-0 text writers when the corresponding
+    # full operators remain P(None,'x','y')-sharded.  Local NumPy constructors
+    # may omit them; band-sharded constructors must provide them.
+    sig_sx_diag_ry: np.ndarray | None = None
+    sig_coh_diag_ry: np.ndarray | None = None
+    sig_h_diag_ry: np.ndarray | None = None
+    sig_h_scalar_diag_ry: np.ndarray | None = None
+    h_transverse_diag_ry: np.ndarray | None = None
+    sig_x_diag_ry: np.ndarray | None = None
     use_ppm: bool = False
     self_consistent: bool = False
     sigma_c_diag_at_dft_ry: np.ndarray | None = None
@@ -142,12 +160,55 @@ class GWResults:
             # Historical charge-only callers: aggregate and scalar are the
             # same array, so no arithmetic or output byte changes.
             self.sig_h_scalar = self.sig_h
-        elif self.h_transverse is not None and not np.array_equal(
-            np.asarray(self.sig_h),
-            np.asarray(self.sig_h_scalar) + np.asarray(self.h_transverse),
-        ):
-            raise ValueError(
-                "GWResults: sig_h must equal sig_h_scalar + h_transverse exactly")
+        if self.h_transverse is not None:
+            if (self.sig_h_diag_ry is not None
+                    and self.sig_h_scalar_diag_ry is not None
+                    and self.h_transverse_diag_ry is not None):
+                total = np.asarray(self.sig_h_diag_ry)
+                parts = (np.asarray(self.sig_h_scalar_diag_ry)
+                         + np.asarray(self.h_transverse_diag_ry))
+            else:
+                if any(_is_band_sharded_static(a) for a in (
+                        self.sig_h, self.sig_h_scalar, self.h_transverse)):
+                    raise ValueError(
+                        "GWResults requires bounded Hartree diagonal mirrors "
+                        "for band-sharded operators")
+                # Legacy local constructors retain the full-matrix contract.
+                total = np.asarray(self.sig_h)
+                parts = (np.asarray(self.sig_h_scalar)
+                         + np.asarray(self.h_transverse))
+            if not np.array_equal(total, parts):
+                raise ValueError(
+                    "GWResults: sig_h must equal sig_h_scalar + "
+                    "h_transverse exactly")
+
+
+_RESULT_DIAGONAL_FIELDS = {
+    "sig_sx": "sig_sx_diag_ry",
+    "sig_coh": "sig_coh_diag_ry",
+    "sig_h": "sig_h_diag_ry",
+    "sig_h_scalar": "sig_h_scalar_diag_ry",
+    "h_transverse": "h_transverse_diag_ry",
+    "sig_x": "sig_x_diag_ry",
+}
+
+
+def _result_matrix_diag(results: GWResults, name: str):
+    """Return a result component's host ``(nk,nb)`` diagonal only."""
+    value = getattr(results, name)
+    if value is None:
+        return None
+    cached = getattr(results, _RESULT_DIAGONAL_FIELDS[name])
+    if cached is not None:
+        return np.asarray(cached)
+    if _is_band_sharded_static(value):
+        raise ValueError(
+            f"GWResults.{name} is band-sharded but its bounded diagonal "
+            "mirror is missing")
+    arr = np.asarray(value)
+    if arr.ndim != 3 or arr.shape[1] != arr.shape[2]:
+        raise ValueError(f"GWResults.{name} must be (nk,nb,nb); got {arr.shape}")
+    return np.diagonal(arr, axis1=1, axis2=2)
 
 
 # ---------------------------------------------------------------------------
@@ -678,18 +739,16 @@ def write_freq_debug(
     _kin_diag_ev = np.real(
         np.diagonal(np.asarray(results.kin_ion_ry), axis1=1, axis2=2)) * RYD_TO_EV
     _v_h_diag_ev = np.real(
-        np.diagonal(np.asarray(results.sig_h_scalar), axis1=1, axis2=2)
-    ) * RYD_TO_EV
+        _result_matrix_diag(results, "sig_h_scalar")) * RYD_TO_EV
     _h_transverse_diag_ev = (
-        None if results.h_transverse is None else np.real(np.diagonal(
-            np.asarray(results.h_transverse), axis1=1, axis2=2)) * RYD_TO_EV)
+        None if results.h_transverse is None else np.real(
+            _result_matrix_diag(results, "h_transverse")) * RYD_TO_EV)
     _h_direct_diag_ev = (
-        np.real(np.diagonal(
-            np.asarray(results.sig_h), axis1=1, axis2=2)) * RYD_TO_EV
+        np.real(_result_matrix_diag(results, "sig_h")) * RYD_TO_EV
         if _h_transverse_diag_ev is None
         else _v_h_diag_ev + _h_transverse_diag_ev)
     _sig_x_diag_ev = np.real(
-        np.diagonal(np.asarray(results.sig_x), axis1=1, axis2=2)) * RYD_TO_EV
+        _result_matrix_diag(results, "sig_x")) * RYD_TO_EV
     _nk, _nb = _e_dft_ev_full.shape
     # Static-COHSEX q→0 head: band-diagonal ``(nb,)`` shifts applied
     # in-place to Σ_x / Σ_SX / Σ_COH inside ``cohsex_sigma``.  The
@@ -848,11 +907,11 @@ def write_freq_debug(
             ))
     else:
         _cols.append(
-            ("sex_0", np.real(np.diagonal(
-                np.asarray(results.sig_sx), axis1=1, axis2=2)) * RYD_TO_EV))
+            ("sex_0", np.real(
+                _result_matrix_diag(results, "sig_sx")) * RYD_TO_EV))
         _cols.append(
-            ("coh_0", np.real(np.diagonal(
-                np.asarray(results.sig_coh), axis1=1, axis2=2)) * RYD_TO_EV))
+            ("coh_0", np.real(
+                _result_matrix_diag(results, "sig_coh")) * RYD_TO_EV))
         if static_head_terms is not None and config.do_screened:
             _cols.append((
                 "sex_head",
@@ -876,10 +935,10 @@ def write_freq_debug(
     # in 2987003); this is the second site, and it is why the two disagreed.
     _sig_x_for_eqp = _sig_x_diag_ev          # PPM: bare X is correct
     if not use_ppm_c:
-        _sigma_c_at_dft_for_eqp = np.real(np.diagonal(
-            np.asarray(results.sig_coh), axis1=1, axis2=2)) * RYD_TO_EV
-        _sig_x_for_eqp = np.real(np.diagonal(
-            np.asarray(results.sig_sx), axis1=1, axis2=2)) * RYD_TO_EV
+        _sigma_c_at_dft_for_eqp = np.real(
+            _result_matrix_diag(results, "sig_coh")) * RYD_TO_EV
+        _sig_x_for_eqp = np.real(
+            _result_matrix_diag(results, "sig_sx")) * RYD_TO_EV
         _z_factor = None
     _eqp0_ev, _eqp1_ev = compute_eqp_diag(
         kin_ion_diag_ev=_kin_diag_ev,
@@ -994,9 +1053,16 @@ def write_qsgw_qp_ladders(
     from .qsgw_utils import (
         is_band_sharded_sigma_omega, solve_diagonal_sigma_fixed_point)
 
+    def _band_sharded(a):
+        spec = getattr(getattr(a, "sharding", None), "spec", None)
+        if spec is None or getattr(a, "ndim", 0) != 3:
+            return False
+        spec = tuple(spec) + (None,) * (3 - len(tuple(spec)))
+        return spec[1] is not None or spec[2] is not None
+
+    static_band_sharded = any(_band_sharded(a) for a in (
+        results.sig_h, results.sig_x, results.sig_sx, results.sig_coh))
     kin_ion = np.asarray(results.kin_ion_ry)
-    sig_h = np.asarray(results.sig_h)
-    sig_x = np.asarray(results.sig_x)
     efermi_ev = float(results.efermi_ev or 0.0)
     payload: dict[str, np.ndarray] = {}
     omitted: list[str] = []
@@ -1015,7 +1081,18 @@ def write_qsgw_qp_ladders(
             + explain_missing_channels(config.compute_mode,
                                        SigmaChannel.SX, SigmaChannel.COH)
             + ")")
+    elif static_band_sharded and not results.use_ppm:
+        # In a static run this is the driver's already-computed eigenspectrum
+        # of precisely H0 + VH + Sigma_SX + Sigma_COH.  Re-diagonalizing a
+        # rank-0 full gather would only reproduce it while breaking layout.
+        payload["qp_static_cohsex_ev"] = (
+            np.asarray(results.E_qp_ry, dtype=np.float64) * RYD_TO_EV)
+    elif static_band_sharded:
+        omitted.append(
+            "qp_static_cohsex_ev (static Sigma matrices are band-sharded; "
+            "the optional rank-0 appendix does not gather them)")
     else:
+        sig_h = np.asarray(results.sig_h)
         payload["qp_static_cohsex_ev"] = _eigen_ladder_ev(
             kin_ion + sig_h + np.asarray(results.sig_sx)
             + np.asarray(results.sig_coh))
@@ -1040,11 +1117,17 @@ def write_qsgw_qp_ladders(
         omitted.append("qp_omega0_ev (no Σ_c(ω) cube in this run)")
     elif is_band_sharded_sigma_omega(sigma_c_omega):
         omitted.append(
-            "qp_omega0_ev (sigma_omega_layout = sharded; the ω slice cannot "
-            "be read from one rank)")
+            "qp_omega0_ev (sigma_omega_layout = sharded; the optional "
+            "rank-0 appendix does not gather its omega slice)")
+    elif static_band_sharded:
+        omitted.append(
+            "qp_omega0_ev (a required operator is band-sharded; the optional "
+            "rank-0 appendix does not gather it)")
     else:
         i0 = int(np.argmin(np.abs(np.asarray(omega_grid_ev))))
         sigma_c_0 = np.asarray(sigma_c_omega[i0])
+        sig_h = np.asarray(results.sig_h)
+        sig_x = np.asarray(results.sig_x)
         payload["qp_omega0_ev"] = _eigen_ladder_ev(
             kin_ion + sig_h + sig_x + sigma_c_0)
 
@@ -1059,10 +1142,11 @@ def write_qsgw_qp_ladders(
     # the grid than about the band.
     if sigma_c_omega_diag_ev is not None and omega_grid_ev is not None:
         omega_ev = np.asarray(omega_grid_ev, dtype=np.float64)
-        h0_diag_ev = np.real(np.diagonal(
-            kin_ion + sig_h, axis1=1, axis2=2)) * RYD_TO_EV
-        sig_x_diag_ev = np.real(np.diagonal(
-            sig_x, axis1=1, axis2=2)) * RYD_TO_EV
+        h0_diag_ev = (
+            np.real(np.diagonal(kin_ion, axis1=1, axis2=2))
+            + np.real(_result_matrix_diag(results, "sig_h"))) * RYD_TO_EV
+        sig_x_diag_ev = np.real(
+            _result_matrix_diag(results, "sig_x")) * RYD_TO_EV
         sigma_xc_diag_w_kn_ev = (np.real(np.asarray(sigma_c_omega_diag_ev))
                                  + sig_x_diag_ev[None, :, :])
         e_dft_rel_ev = (np.asarray(results.E_dft_ry, dtype=np.float64)
@@ -1218,6 +1302,18 @@ def _warn_on_unphysical_h0(
 # Result writer  (QE ``punch('all')`` pattern)
 # ---------------------------------------------------------------------------
 
+def _as_kband_diag(values):
+    """Accept a ``(nk,nb)`` diagonal or extract it from ``(nk,nb,nb)``."""
+    arr = np.asarray(values)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[1] == arr.shape[2]:
+        return np.diagonal(arr, axis1=1, axis2=2)
+    raise ValueError(
+        "expected a (nk,nb) diagonal or (nk,nb,nb) matrix; got "
+        f"{arr.shape}")
+
+
 def _star_spread_of_sigma_diag(sigma_tot_kij_ev, sym):
     """Per-band star spread of Re diag Σ_tot, plus its max and n members.
 
@@ -1259,7 +1355,7 @@ def _star_spread_of_sigma_diag(sigma_tot_kij_ev, sym):
     if sym is None:
         return None, None, None
     labels = np.asarray(sym.irr_idx_k)
-    diag = np.real(np.diagonal(np.asarray(sigma_tot_kij_ev), axis1=1, axis2=2))
+    diag = np.real(_as_kband_diag(sigma_tot_kij_ev))
     if labels.shape[0] != diag.shape[0]:
         raise ValueError(
             f"sym.irr_idx_k has {labels.shape[0]} entries but Sigma has "
@@ -1329,7 +1425,7 @@ def _star_spread_over_multiplets(sigma_tot_kij_ev, sym, e_dft_ry,
 
     tol = float(DEGENERACY_TOL_RY if tol_ry is None else tol_ry)
     labels = np.asarray(sym.irr_idx_k)
-    diag = np.real(np.diagonal(np.asarray(sigma_tot_kij_ev), axis1=1, axis2=2))
+    diag = np.real(_as_kband_diag(sigma_tot_kij_ev))
     e = np.asarray(e_dft_ry, dtype=np.float64)
     if e.ndim != 2 or e.shape[1] != diag.shape[1]:
         return None
@@ -1470,27 +1566,24 @@ def write_results(
     # sigSX/sigCOH/sigTOT/VH; PPM prints sigX/sigC/sigXC/VH (same array
     # slots, relabelled).  The driver passes the right arrays for each mode.
     if results.use_ppm:
-        sx_arr = results.sig_x
-        diag_ry = results.sigma_c_diag_at_dft_ry
-        corr_arr = np.zeros_like(results.sig_coh)
-        if diag_ry is not None:
-            nb = diag_ry.shape[1]
-            idx = np.arange(nb)
-            corr_arr[:, idx, idx] = np.asarray(diag_ry)
+        sx_diag_ry = _result_matrix_diag(results, "sig_x")
+        corr_diag_ry = (
+            np.zeros_like(sx_diag_ry) if results.sigma_c_diag_at_dft_ry is None
+            else np.asarray(results.sigma_c_diag_at_dft_ry))
     else:
-        sx_arr = results.sig_sx
-        corr_arr = results.sig_coh
+        sx_diag_ry = _result_matrix_diag(results, "sig_sx")
+        corr_diag_ry = _result_matrix_diag(results, "sig_coh")
 
-    sx_out    = r2e * sx_arr
-    corr_out  = r2e * corr_arr
-    sig_h_scalar_out = r2e * results.sig_h_scalar
+    sx_out = r2e * sx_diag_ry
+    corr_out = r2e * corr_diag_ry
+    sig_h_scalar_out = r2e * _result_matrix_diag(results, "sig_h_scalar")
     h_transverse_out = (
         None if results.h_transverse is None
-        else r2e * results.h_transverse)
+        else r2e * _result_matrix_diag(results, "h_transverse"))
     sig_h_out = (
-        r2e * results.sig_h if h_transverse_out is None
+        r2e * _result_matrix_diag(results, "sig_h")
+        if h_transverse_out is None
         else sig_h_scalar_out + h_transverse_out)
-    sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
     # ── THE k-BASIS OF EVERY TEXT FILE THIS FUNCTION WRITES ───────────────
     # Sigma is EXTRACTED on the irreducible wedge; the full-BZ arrays this
@@ -1589,13 +1682,10 @@ def write_results(
         np.real(np.diagonal(_wedge(results.kin_ion_ry), axis1=1, axis2=2)) * r2e
     )
     # ── H₀'s sole live G-space Hartree term ───────────────────────────────
-    hartree_diag_ev = np.real(
-        np.diagonal(_wedge(sig_h_out), axis1=1, axis2=2))
-    hartree_scalar_diag_ev = np.real(
-        np.diagonal(_wedge(sig_h_scalar_out), axis1=1, axis2=2))
+    hartree_diag_ev = np.real(_wedge(sig_h_out))
+    hartree_scalar_diag_ev = np.real(_wedge(sig_h_scalar_out))
     hartree_transverse_diag_ev = (
-        None if h_transverse_out is None else np.real(
-            np.diagonal(_wedge(h_transverse_out), axis1=1, axis2=2)))
+        None if h_transverse_out is None else np.real(_wedge(h_transverse_out)))
     # MODE-CORRECT exchange, not the bare one.  ``sx_out`` is already
     # resolved per mode ~50 lines up: results.sig_x under PPM (where Sigma =
     # Sigma_x + Sigma_c and bare X is right), results.sig_sx under static
@@ -1608,7 +1698,7 @@ def write_results(
     # the regression gate, which compares only the sigma_diag file -- and that
     # writer already uses sx_out, which is why the two disagreed by exactly
     # Sigma_SX (4.474 eV at Gamma band 1).
-    sigma_x_diag_ev = np.real(np.diagonal(_wedge(sx_out), axis1=1, axis2=2))
+    sigma_x_diag_ev = np.real(_wedge(sx_out))
     # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value
     # the driver already computed; in static modes it is the static Σ_COH
     # diagonal (post-degen-averaging if enabled).
@@ -1617,7 +1707,7 @@ def write_results(
             _wedge(np.asarray(results.sigma_c_diag_at_dft_ry, dtype=np.complex128)) * r2e
         )
     else:
-        sigma_c_at_dft_diag_ev = np.diagonal(_wedge(corr_out), axis1=1, axis2=2)
+        sigma_c_at_dft_diag_ev = _wedge(corr_out)
 
     # E_DFT relative to the run's ω reference (matches gw_jax convention).
     # Only needed when there is a finite ω-grid to interpolate against.
@@ -1764,11 +1854,9 @@ def write_results(
     ):
         # Same live G-space H0 operator used by the eqp writer.
         h0_diag = (
-            np.real(
-                np.diagonal(results.kin_ion_ry + results.sig_h, axis1=1, axis2=2)
-            )
-            * r2e
-        )
+            np.real(np.diagonal(
+                np.asarray(results.kin_ion_ry), axis1=1, axis2=2)) * r2e
+            + np.real(_result_matrix_diag(results, "sig_h")) * r2e)
         g0w0_path = os.path.join(input_dir, "eqp_g0w0.dat")
         # The wedge, like every other text file here.  Its one former
         # full-BZ consumer was the out-of-tree ``make_eqp_htformat.py``,
