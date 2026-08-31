@@ -280,6 +280,33 @@ def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
     assert np.all(times != 0.0)
 
 
+def test_crossing_fallback_density_uses_complete_live_span(monkeypatch):
+    """The fitted interval, not its possibly smaller radius, sets density."""
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0, 2.0]),
+        internal_sums=np.asarray([-3.0 - 0.1j, 1.0 - 0.1j]),
+        cell_masses=np.asarray([1.0, 1.0]))
+    requested = []
+
+    def record_span(span, _max_nodes):
+        requested.append(span)
+        return 4, 60.0
+
+    monkeypatch.setattr(
+        delivered, "_crossing_fallback_node_count", record_span)
+    monkeypatch.setattr(
+        delivered, "solve_fixed_time_weights_fast",
+        lambda _problem, times, **_kwargs: (
+            np.ones_like(times, dtype=np.complex128), 0.0))
+
+    delivered._fit_crossing_once(
+        problem, pole_sign=1.0, relative_target=1.0e-4, max_nodes=420)
+
+    oriented, gamma, radius = delivered._crossing_geometry(problem, 1.0)
+    assert requested == [pytest.approx(np.ptp(oriented.real) / gamma)]
+    assert requested[0] > radius
+
+
 def _served_candidate(spec, *_args):
     evidence = {
         "family": ("crossing_hgl" if spec["kind"] == "crossing"

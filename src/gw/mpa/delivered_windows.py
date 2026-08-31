@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 7
+_PLAN_CACHE_VERSION = 8
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -1255,27 +1255,14 @@ def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     # established density against the complete real span; it is not an HGL
     # certificate and reducing that grid changed its conditioning.
     fit_A_dim = float(np.ptp(oriented.real)) / gamma_min
-    widest_hgl = max(
-        float(entry.range_max)
-        for entry in _mm.catalog().for_family("crossing")
-        if entry.target_kind == "hgl"
-        and entry.eps_q is not None
-        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12)
-    # A support whose physical HGL radius is covered keeps the established
-    # widest-table density even when the conservative end-to-end span is a
-    # little larger.  Truly wider supports are patched before this fallback.
-    covered_hgl = [
-        float(entry.range_max)
-        for entry in _mm.catalog().for_family("crossing")
-        if entry.target_kind == "hgl"
-        and entry.eps_q is not None
-        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12
-        and entry.range_max <= fit_A_dim + 1.0e-12
-    ]
-    fallback_A_dim = (
-        max(covered_hgl, default=fit_A_dim)
-        if A_dim <= widest_hgl + 1.0e-12 else fit_A_dim
-    )
+    # The shipped odd HGL rule is certified by its radius.  The fallback is
+    # an unconstrained fit to the complete measured interval, so its node
+    # density must instead follow that interval's end-to-end span.  This is
+    # particularly important after a QSGW update: the radius can remain
+    # inside the widest table while the live state/pole cloud becomes much
+    # less symmetric and nearly doubles its span.  Using the table radius in
+    # that case under-resolves the only allowed fallback.
+    fallback_A_dim = fit_A_dim
     node_count, source_range = _crossing_fallback_node_count(
         fallback_A_dim, max_nodes)
     target = min(float(relative_target), 0.5)
