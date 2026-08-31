@@ -251,14 +251,16 @@ def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
 
 def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
                   windows: tuple[str, ...] = (), quick: bool = False,
-                  evaluations: int = 0) -> RoqRule:
+                  evaluations: int = 0,
+                  start_weights: np.ndarray | None = None) -> RoqRule:
     """Fit and validate one rank from an already built snapshot basis."""
     times, ratio = _select_prepared(*prepared, rank, group.name)
     weights, _ = solve_fixed_time_weights_fast(
         group.fit, times,
         iterations=16 if quick else 45,
         stall_iterations=3 if quick else 5,
-        conditioning_pass=not quick)
+        conditioning_pass=not quick,
+        start_weights=start_weights)
     return _score(group, times, weights, rank, ratio, windows=windows,
                   target=target, evaluations=evaluations)
 
@@ -297,7 +299,7 @@ def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
     if not probe(hi).target_met:
         final = _fit_prepared(
             group, prepared, ranks[hi], target=target, windows=windows,
-            evaluations=len(cache))
+            evaluations=len(cache), start_weights=cache[ranks[hi]].weights)
         return final
     while hi - lo > 1:
         mid = (lo + hi) // 2
@@ -314,7 +316,9 @@ def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
     for index in range(chosen, len(ranks)):
         final = _fit_prepared(
             group, prepared, ranks[index], target=target, windows=windows,
-            evaluations=len(cache))
+            evaluations=len(cache),
+            start_weights=(cache[ranks[index]].weights
+                           if ranks[index] in cache else None))
         if best is None or final.max_error < best.max_error:
             best = final
         if final.target_met and final.noise_passed:
@@ -568,16 +572,45 @@ def _fit_production_rank(group: RoqGroup, target: float,
         else:
             return _fit_prepared(
                 group, prepared, ceiling, target=target, windows=windows,
-                evaluations=len(cache))
+                evaluations=len(cache),
+                start_weights=(cache[ceiling].weights
+                               if ceiling in cache else None))
     midpoint = (lower + upper) // 2
-    if lower < midpoint < upper and quick(midpoint).target_met:
-        upper = midpoint
+    if lower < midpoint < upper:
+        if quick(midpoint).target_met:
+            upper = midpoint
+        else:
+            lower = midpoint
+
+    # Delivered error falls close to exponentially with rank on the measured
+    # crossing supports.  Interpolate in log(error) inside the validated
+    # fail/pass bracket instead of spending full fits from its upper edge.
+    # The interpolated rank is still measured before it can be accepted.
+    if upper - lower > 1 and lower in cache and upper in cache:
+        log_lower = np.log(cache[lower].max_error / target)
+        log_upper = np.log(cache[upper].max_error / target)
+        if log_lower > 0.0 > log_upper:
+            fraction = log_lower / (log_lower - log_upper)
+            predicted = int(round(lower + fraction * (upper - lower)))
+            predicted = int(np.clip(predicted, lower + 1, upper - 1))
+            if quick(predicted).target_met:
+                upper = predicted
+            else:
+                lower = predicted
+
+    # Search fits are cheaper Lawson solves, but their acceptance scores are
+    # already the exact refined-lattice residual and production noise gate.
+    # Do not repeat an accepted rank merely to run a longer iteration cap.
+    searched = cache.get(upper)
+    if searched is not None and searched.target_met and searched.noise_passed:
+        return searched
 
     best = None
     for rank in range(upper, min(ceiling, upper + 3) + 1):
         final = _fit_prepared(
             group, prepared, rank, target=target, windows=windows,
-            evaluations=len(cache))
+            evaluations=len(cache),
+            start_weights=(cache[rank].weights if rank in cache else None))
         if best is None or final.max_error < best.max_error:
             best = final
         if final.target_met and final.noise_passed:

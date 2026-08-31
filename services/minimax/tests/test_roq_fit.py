@@ -74,6 +74,38 @@ def test_wrong_half_plane_is_loud(groups):
         fit_roq_group(wrong, 1.0e-4, ranks=[10, 14])
 
 
+def test_production_rank_interpolates_and_accepts_exact_search_score(
+        groups, monkeypatch):
+    from minimax import roq_fit
+
+    target = 1.0e-4
+    calls = []
+
+    def fake_fit(group, prepared, rank, **kwargs):
+        quick = bool(kwargs.get("quick"))
+        calls.append((rank, quick))
+        error = target * np.exp(0.2 * (40 - rank))
+        return roq_fit.RoqRule(
+            group.name, np.arange(rank), np.ones(rank), rank, error,
+            2.0, 2.0, 1.0, target_met=error <= target,
+            noise_passed=True)
+
+    monkeypatch.setattr(roq_fit, "_rank_ceiling", lambda group: 100)
+    monkeypatch.setattr(roq_fit, "_prepare_subspace",
+                        lambda group, base_nodes, max_rank: None)
+    monkeypatch.setattr(roq_fit, "_fit_prepared", fake_fit)
+    angle_probe = fake_fit(groups[0], None, 12, quick=True)
+    angle_probe = roq_fit.RoqRule(
+        **{**angle_probe.__dict__, "target_met": False})
+
+    rule = roq_fit._fit_production_rank(
+        groups[0], target, ("window",), angle_probe)
+
+    assert rule.rank == 40
+    assert rule.max_error == target
+    assert all(quick for _, quick in calls[1:])
+
+
 def test_production_planner_refuses_a_growing_product_window(groups):
     tails, _ = groups
     window = RoqWindow("wrong", tails.fit, tails.validation, 1.0e-4,
