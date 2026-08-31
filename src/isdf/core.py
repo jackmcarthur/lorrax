@@ -37,6 +37,8 @@ from common.gamma_matrices import (
     gamma_perm_phase as _gamma_perm_phase_mu,
     gamma_apply,
     gamma_double_contract,
+    gammas_perm as _gammas_perm,
+    gammas_phase as _gammas_phase,
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
 from common.wfn_transforms import take_rchunk_padded, to_rchunk_inner
@@ -305,10 +307,12 @@ def _gram_q0_kernel(
 	lhs_id: bool,
 	rhs_id: bool,
 	symmetrize: bool,
+	transverse_feature_sum: bool = False,
 ):
 	"""Return the one cached q=0 executable used by run and planning."""
 	cache_key = ('gram_q0_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu,
-	             n_col, lhs_id, rhs_id, symmetrize)
+	             n_col, lhs_id, rhs_id, symmetrize,
+	             transverse_feature_sum)
 
 	if cache_key not in _isdf_pipeline_cache:
 		in_spin = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
@@ -319,22 +323,58 @@ def _gram_q0_kernel(
 		_lhs_id = lhs_id
 		_rhs_id = rhs_id
 		_symmetrize = symmetrize
+		_transverse_feature_sum = transverse_feature_sum
 
 		@partial(jax.jit,
 		         in_shardings=(in_spin, in_spin, kw_rep, rep, rep, rep, rep),
 		         out_shardings=out_xy)
 		def _gram_q0(P_v, P_c, kw, perm_L_, phase_L_, perm_R_, phase_R_):
-			# γ̃-contracted spin reduction (5 → 3 rank, dropping (a,b)).
-			# spin axes are (1, 2) on the (k, a, b, μ, ν) layout.
-			prod = gamma_double_contract(
-				jnp.conj(P_v), P_c,
-				perm_L=None if _lhs_id else perm_L_,
-				phase_L=None if _lhs_id else phase_L_,
-				perm_R=None if _rhs_id else perm_R_,
-				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(1, 2),
-			)
-			G = jnp.sum(kw[:, None, None] * prod, axis=0)
+			if _transverse_feature_sum:
+				# Candidate pruning needs a positive metric on the STACKED
+				# transition-density features
+				#
+				#   Z_i(a,mn,k) = <psi^R_m(a)|gamma_i|psi^L_n(a)>,
+				#   G_perp = sum_i Z_i Z_i^H.
+				#
+				# In the pair-density factorisation the first endpoint therefore
+				# carries gamma_i^* and the second gamma_i.  This conjugated
+				# left phase is load-bearing for imaginary gamma_2: using the
+				# raw CCT contraction (gamma_i, gamma_i) gives its NEGATIVE and
+				# is not a candidate Gram.  Accumulate one component at a time so
+				# no three-component rank-3 stack is ever materialised.
+				def _one_component(G_acc, mu_lorentz):
+					perm = perm_L_[mu_lorentz]
+					phase = phase_L_[mu_lorentz]
+					prod = gamma_double_contract(
+						jnp.conj(P_v), P_c,
+						perm_L=perm,
+						phase_L=jnp.conj(phase),
+						perm_R=perm,
+						phase_R=phase,
+						spin_axes=(1, 2),
+					)
+					return (G_acc
+					        + jnp.sum(kw[:, None, None] * prod, axis=0), None)
+
+				G, _ = jax.lax.scan(
+					_one_component,
+					jnp.zeros((n_rmu, n_col), dtype=P_v.dtype),
+					jnp.arange(1, 4, dtype=jnp.int32),
+					unroll=1,
+				)
+			else:
+				# γ̃-contracted spin reduction (5 → 3 rank, dropping
+				# (a,b)). Spin axes are (1, 2) on (k, a, b, μ, ν).
+				# Keep this historical charge/arbitrary-CCT arm unchanged.
+				prod = gamma_double_contract(
+					jnp.conj(P_v), P_c,
+					perm_L=None if _lhs_id else perm_L_,
+					phase_L=None if _lhs_id else phase_L_,
+					perm_R=None if _rhs_id else perm_R_,
+					phase_R=None if _rhs_id else phase_R_,
+					spin_axes=(1, 2),
+				)
+				G = jnp.sum(kw[:, None, None] * prod, axis=0)
 			# Symmetrize: q=0 Gram is Hermitian by construction; fp roundoff
 			# can break it.  (Skipped for rectangular column blocks.)
 			if _symmetrize:
@@ -409,8 +449,50 @@ def gram_q0_from_pair(
 	return _gram_q0_kernel(
 		mesh_xy, nk, ns1, ns2, n_rmu, n_col,
 		lhs_id=lhs_id, rhs_id=rhs_id, symmetrize=symmetrize,
+		transverse_feature_sum=False,
 	)(
 		P_v_k, P_c_k, k_weights, perm_L, phase_L, perm_R, phase_R)
+
+
+def transverse_gram_q0_from_pair(
+	P_l_k: jax.Array,
+	P_r_k: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	symmetrize: bool = True,
+) -> jax.Array:
+	"""PSD q=0 Gram of the three stacked transverse transition features.
+
+	For ``Z_i(a,mn,k) = <psi^R_m(a)|gamma_i|psi^L_n(a)>`` this computes
+
+	``G_perp(a,b) = sum_{i=1}^3 sum_{nmk} w_k Z_i(a,mn,k) conj(Z_i(b,mn,k))``.
+
+	Since every transverse gamma is Hermitian, this ``Z_i`` is the conjugate
+	of ``<psi^L|gamma_i|psi^R>``; the pair-density factorisation therefore
+	uses ``gamma_i^*`` on its first endpoint and ``gamma_i`` on its second.
+	Components have equal weight and are never normalised separately, so an
+	orthogonal rotation among the three Cartesian current components leaves
+	the Gram invariant.  The computation
+	reuses :func:`gamma_double_contract` and scans one component at a time;
+	neither band-pair features nor a three-component pair-density stack is
+	materialised.
+	"""
+	nk, ns1, ns2, n_rmu, n_col = P_l_k.shape
+	if int(ns1) != 4 or int(ns2) != 4:
+		raise ValueError(
+			"transverse_gram_q0_from_pair requires the four-component "
+			f"bispinor carrier; got spin axes ({int(ns1)}, {int(ns2)})")
+	if P_r_k.shape != P_l_k.shape:
+		raise ValueError(
+			"transverse_gram_q0_from_pair requires matching left/right pair "
+			f"shapes; got {P_l_k.shape} and {P_r_k.shape}")
+	return _gram_q0_kernel(
+		mesh_xy, nk, ns1, ns2, n_rmu, n_col,
+		lhs_id=False, rhs_id=False, symmetrize=symmetrize,
+		transverse_feature_sum=True,
+	)(P_l_k, P_r_k, k_weights,
+	  _gammas_perm, _gammas_phase, _gammas_perm, _gammas_phase)
 
 
 def gram_q0_aot_peak_bytes(
@@ -421,8 +503,17 @@ def gram_q0_aot_peak_bytes(
 	n_rmu: int,
 	n_col: int,
 	dtype=jnp.complex128,
+	gamma_mode: str = "charge",
 ) -> int:
-	"""Per-rank compiled peak for the canonical charge q=0 tile fold."""
+	"""Per-rank compiled peak for the canonical q=0 candidate tile fold."""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
 	pair_sh = NamedSharding(
 		mesh_xy, P(None, None, None, 'x', 'y'),
 	)
@@ -432,11 +523,14 @@ def gram_q0_aot_peak_bytes(
 		dtype, sharding=pair_sh,
 	)
 	kw = jax.ShapeDtypeStruct((int(nk),), jnp.float64, sharding=rep)
-	perm = jax.ShapeDtypeStruct((int(nspinor),), jnp.int32, sharding=rep)
-	phase = jax.ShapeDtypeStruct((int(nspinor),), dtype, sharding=rep)
+	gamma_shape = ((4, int(nspinor)) if mode == "transverse"
+	               else (int(nspinor),))
+	perm = jax.ShapeDtypeStruct(gamma_shape, jnp.int32, sharding=rep)
+	phase = jax.ShapeDtypeStruct(gamma_shape, dtype, sharding=rep)
 	compiled = _gram_q0_kernel(
 		mesh_xy, int(nk), int(nspinor), int(nspinor), int(n_rmu),
-		int(n_col), lhs_id=True, rhs_id=True, symmetrize=False,
+		int(n_col), lhs_id=(mode == "charge"), rhs_id=(mode == "charge"),
+		symmetrize=False, transverse_feature_sum=(mode == "transverse"),
 	).lower(pair, pair, kw, perm, phase, perm, phase).compile()
 	from runtime.aot_memory import aot_kernel_peak_bytes
 	return int(aot_kernel_peak_bytes(compiled).total)

@@ -4,7 +4,10 @@ Implements the q=0 candidate-pruning stage described in
 ``pivoted_cholesky.md`` (sandbox root). The idea: k-means gives a set of M
 candidate points ``{r̃_a}`` (M > N_μ); the pair-product rows
 ``z_{a,(vck)} = φ*_{v,k}(r̃_a) ψ_{c,k}(r̃_a)`` define a Hermitian PSD Gram
-matrix ``G^{(0)} ∈ ℂ^{M×M}``. Greedy pivoted Cholesky picks the N_μ pivots
+matrix ``G^{(0)} ∈ ℂ^{M×M}``.  For the transverse bispinor channel the
+features are stacked over all three current components and the Gram is
+``G_perp = Σ_i Z_i Z_i†`` with equal component weights. Greedy pivoted
+Cholesky picks the N_μ pivots
 with the largest residual Schur-complement diagonal, and the corresponding
 ``r̃_a`` become the final ISDF points. This is strictly better than picking
 on amplitude alone because it targets the coherence structure of the
@@ -84,6 +87,54 @@ _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
 _GRAM_FINAL_FOLD_SLOTS = 3
+_CANDIDATE_GAMMA_MODES = ("charge", "transverse")
+
+
+def _resolve_candidate_gamma_mode(gamma_mode: str, *, bispinor: bool) -> str:
+    """Validate the candidate feature family before loading wavefunctions."""
+    mode = str(gamma_mode).strip().lower()
+    if mode not in _CANDIDATE_GAMMA_MODES:
+        raise ValueError(
+            "gamma_mode must be 'charge' or 'transverse'; got "
+            f"{gamma_mode!r}")
+    if mode == "transverse" and not bispinor:
+        raise ValueError(
+            "gamma_mode='transverse' requires bispinor=True so the canonical "
+            "four-component gamma algebra can be applied")
+    return mode
+
+
+def candidate_gram_q0_from_pair(
+    P_l_k: jax.Array,
+    P_r_k: jax.Array,
+    k_weights: jax.Array,
+    *,
+    mesh_xy: Mesh,
+    gamma_mode: str = "charge",
+    symmetrize: bool = True,
+) -> jax.Array:
+    """Fold canonical pair densities into the selected candidate metric.
+
+    ``charge`` delegates byte-for-byte to the historical scalar q=0 fold.
+    ``transverse`` delegates to :mod:`isdf.core`'s fused three-component
+    transition-feature fold, which computes the PSD sum
+    ``G_perp = sum_i Z_i Z_i†`` without materialising ``Z_i`` or summing raw
+    indefinite transverse CCTs.
+    """
+    mode = str(gamma_mode).strip().lower()
+    if mode == "charge":
+        from isdf import gram_q0_from_pair
+        return gram_q0_from_pair(
+            P_l_k, P_r_k, k_weights,
+            mesh_xy=mesh_xy, symmetrize=symmetrize)
+    if mode == "transverse":
+        from isdf import transverse_gram_q0_from_pair
+        return transverse_gram_q0_from_pair(
+            P_l_k, P_r_k, k_weights,
+            mesh_xy=mesh_xy, symmetrize=symmetrize)
+    raise ValueError(
+        "gamma_mode must be 'charge' or 'transverse'; got "
+        f"{gamma_mode!r}")
 
 
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
@@ -650,6 +701,7 @@ def prune_candidates_by_pivoted_cholesky(
     k_weights: np.ndarray | None = None,
     verbose: bool = True,
     bispinor: bool = False,
+    gamma_mode: str = "charge",
     orbit_id: np.ndarray | None = None,
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
@@ -700,6 +752,13 @@ def prune_candidates_by_pivoted_cholesky(
     beside the kernel; the short version is that each one used to be a
     silent wrong answer that passed every downstream shape check.
     """
+    gamma_mode = _resolve_candidate_gamma_mode(
+        gamma_mode, bispinor=bispinor)
+    if gamma_mode == "transverse" and band_norms is not None:
+        raise ValueError(
+            "transverse candidate pruning uses unit weight for every band "
+            "in the requested left/right fit windows; band_norms must be None")
+
     M = int(cand_idx.shape[0])
     n_tot = int(wfn.nbands)
     asymmetric = (band_range_left is not None and band_range_right is not None)
@@ -781,7 +840,8 @@ def prune_candidates_by_pivoted_cholesky(
         window_tag = (f"left={band_range_left}, right={band_range_right}, "
                       f"norms={'on' if band_norms is not None else 'off'}"
                       if asymmetric else f"n_val={n_val}, n_cond={n_cond}")
-        print(f"[pivoted_cholesky] M={M}, n_keep={n_keep}, {window_tag} "
+        print(f"[pivoted_cholesky] M={M}, n_keep={n_keep}, {window_tag}, "
+              f"gamma_mode={gamma_mode} "
               f"(load_wfns 2-D, mesh axes {mesh.axis_names})")
 
     with timing.section("prune.gram"):
@@ -792,6 +852,7 @@ def prune_candidates_by_pivoted_cholesky(
             band_range_left=band_range_left,
             band_range_right=band_range_right,
             band_norms=band_norms,
+            gamma_mode=gamma_mode,
         )
         # Reshard ('x','y') → row-sharded for the column-major pivot scan.
         G = jax.lax.with_sharding_constraint(
@@ -991,6 +1052,7 @@ def build_gram_q0_via_loadwfns(
     mesh_xy: Mesh | None = None,
     *,
     bispinor: bool = False,
+    gamma_mode: str = "charge",
     verbose: bool = True,
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
@@ -1000,7 +1062,7 @@ def build_gram_q0_via_loadwfns(
 ) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
 
-    Two call modes:
+    Two band-window call modes:
 
     * Simple ``(n_val, n_cond)`` (legacy): left window = ``(0, n_val)``,
       right window = ``(n_val, n_val + n_cond)``. This is the literal
@@ -1013,6 +1075,11 @@ def build_gram_q0_via_loadwfns(
       Passing ``band_norms`` additionally applies the pseudoband
       normalization ``ψ /= max(norm, 1.0)`` on both left and right
       (same clamp recipe as ``isdf_fitting.py:838-847``).
+
+    ``gamma_mode='charge'`` preserves the historical scalar pair-product
+    Gram exactly. ``gamma_mode='transverse'`` requires ``bispinor=True`` and
+    uses the equal-weight PSD sum of the three current transition-feature
+    Grams. It never consumes occupations or ``band_norms``.
 
     Full-BZ unfold: one ``load_wfns.read_Gvecs_to_devices`` per window,
     ``get_sharded_wfns_centroids`` at the candidate indices, sharded
@@ -1035,6 +1102,9 @@ def build_gram_q0_via_loadwfns(
             ``'y'`` at present — we follow that convention.)
         bispinor: if True, upcast the spin structure to 4 components
             (matches gw_jax's bispinor mode). Default False.
+        gamma_mode: ``'charge'`` or ``'transverse'``. The latter requires
+            the four-component bispinor carrier and gives all three current
+            components equal weight without per-component normalisation.
         verbose: print progress lines.
         band_range_left: optional explicit left window (start, end).
             When given, takes precedence over (n_val, n_cond).
@@ -1057,13 +1127,19 @@ def build_gram_q0_via_loadwfns(
     from isdf import (
         pair_density,
         pair_density_aot_peak_bytes,
-        gram_q0_from_pair,
         gram_q0_aot_peak_bytes,
     )
     from common.staged_reshard import (
         shard_local_slice_pad,
         shard_local_update,
     )
+
+    gamma_mode = _resolve_candidate_gamma_mode(
+        gamma_mode, bispinor=bispinor)
+    if gamma_mode == "transverse" and band_norms is not None:
+        raise ValueError(
+            "transverse candidate pruning uses unit weight for every band "
+            "in the requested left/right fit windows; band_norms must be None")
 
     # Resolve windows.
     if band_range_left is None or band_range_right is None:
@@ -1160,6 +1236,7 @@ def build_gram_q0_via_loadwfns(
         print(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
               f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
               f"right={right_range} (nb={nb_right}), M={M}, "
+              f"gamma_mode={gamma_mode}, "
               f"norms={'on' if band_norms is not None else 'off'}, "
               f"backend=WfnLoader(auto), "
               f"budget={meta.memory_per_device_gb:g} GB/device, "
@@ -1334,6 +1411,7 @@ def build_gram_q0_via_loadwfns(
             fold_peak = gram_q0_aot_peak_bytes(
                 mesh_xy=mesh_xy, nk=nk_, nspinor=ns_,
                 n_rmu=tile_width, n_col=tile_width,
+                gamma_mode=gamma_mode,
             )
             one_pair_local = (
                 nk_ * ns_ * ns_
@@ -1456,8 +1534,9 @@ def build_gram_q0_via_loadwfns(
                     P_r_b.block_until_ready()
                     del row_r, block_r
 
-                    G_b = gram_q0_from_pair(
+                    G_b = candidate_gram_q0_from_pair(
                         P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
+                        gamma_mode=gamma_mode,
                         symmetrize=False,
                     )
                     G_b.block_until_ready()
@@ -1498,6 +1577,8 @@ def build_gram_q0_via_loadwfns(
     # ---- q=0 Gram: sum_k w_k · Σ_{αβ} conj(P_l_k,αβ) · P_r_k,αβ ----
     # γ̃ identity (charge channel) — open-spin Frobenius reduction.
     with timing.section("q0_sum"):
-        G = gram_q0_from_pair(P_l_k, P_r_k, kw, mesh_xy=mesh_xy)
+        G = candidate_gram_q0_from_pair(
+            P_l_k, P_r_k, kw, mesh_xy=mesh_xy,
+            gamma_mode=gamma_mode)
         G.block_until_ready()
     return G
