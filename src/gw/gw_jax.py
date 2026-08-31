@@ -569,7 +569,15 @@ def main(argv=None):
 				if jax.process_index() != 0:
 					warnings.simplefilter("ignore", RuntimeWarning)
 				quad, e_ref = build_static_quadrature(
-					wfns, config.minimax_config, print_fn=print0)
+					wfns, config.minimax_config,
+					# A metal's fundamental gap is not its smallest MEANINGFUL
+					# transition; the smearing width is.  Insulating decks
+					# carry no smearing and keep the incumbent interval.
+					occupation_width_ry=(
+						float(config.occ_broadening_ry)
+						if getattr(config, "occ_smearing_family", None)
+						else None),
+					print_fn=print0)
 
 	# One-shot and QSGW now share one response/finalization implementation.
 	# Build the irreducible DFT tensor and its wings on the exact chi0 band
