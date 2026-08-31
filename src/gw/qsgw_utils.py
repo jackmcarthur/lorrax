@@ -845,8 +845,12 @@ def solve_qp(
         np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
     sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
 
-    h0_diag_ry = np.real(
-        np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
+    # H0 is tiled over the process mesh at P>1.  The fixed-point solve below
+    # is deliberately host NumPy, so recover the one logical matrix before
+    # taking its band diagonal; bare np.asarray can only see local shards.
+    from common.collectives import gather_to_host
+    h0_diag_ry = np.real(np.diagonal(
+        np.asarray(gather_to_host(kin_ion + sig_h)), axis1=1, axis2=2))
     efermi_ry = float(sigma_result.efermi_dft_ev) / RYD_TO_EV
     E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
         h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
