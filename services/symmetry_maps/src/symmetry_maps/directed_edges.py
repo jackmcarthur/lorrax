@@ -170,8 +170,8 @@ def q_stencil_orbit_table(
     matrix at fixed k: a finite-q polarizability is first summed over the full
     k grid at each returned ``source_step``. The resulting scalar, vector or
     tensor response may then be unfolded to ``target_steps`` with
-    :func:`apply_band_matrix_symmetry`; Cartesian wings pass
-    ``SymMaps.R_cart_forward[target_sym_idx]`` as ``component_mix``.
+    :func:`apply_band_matrix_symmetry`; Cartesian wings obtain
+    ``component_mix`` from ``SymMaps.cartesian_action``.
 
     ``seed_steps`` need not already be closed under the crystal point group.
     The service adds their exact integer images and records which seeds

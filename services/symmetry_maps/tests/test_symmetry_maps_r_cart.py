@@ -179,8 +179,10 @@ def test_the_no_symmetry_branch_publishes_a_forward_rotation_too():
     sym = SymMaps(_TrivialDeck())
     R = np.asarray(sym.R_cart)
     F = np.asarray(sym.R_cart_forward)
-    assert R.shape == (1, 3, 3)
-    assert np.array_equal(F, R) and np.array_equal(F[0], np.eye(3))
+    assert R.shape == (2, 3, 3)
+    np.testing.assert_array_equal(R[0], np.eye(3))
+    np.testing.assert_array_equal(R[1], -np.eye(3))
+    np.testing.assert_array_equal(F, R)
 
 
 # ---------------------------------------------------------------------------

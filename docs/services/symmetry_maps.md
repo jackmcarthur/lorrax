@@ -38,7 +38,7 @@ so reaching *past* the door is the thing that still flags.
 
 | name | what it is |
 |---|---|
-| `SymMaps(wfn)` | The eager table builder. Builds paired unitary/antiunitary candidate rows, then exposes `active_symmetry_rows` from the measured global-TR verdict plus an authenticated QE operation-type receipt. Also owns `irr_idx_k`/`sym_idx_k`, q maps, Cartesian/spin rotations, and umklapp vectors. Missing QE provenance warns at initialization; incomplete authenticated coverage refuses. |
+| `SymMaps(wfn)` | Canonical operation source. `operation_rows` returns reciprocal rotation, Seitz translation, and the antiunitary bit. `cartesian_action` selects polar/axial and time parity; `spinor_action`, `reciprocal_phase`, and `unfold_wavefunction` use the same typed rows. |
 | `read_qe_symmetry_receipt` / `bind_qe_symmetry_receipt` / `resolve_qe_symmetry_binding` | Bounded `data-file-schema.xml` reader and WFN authentication gate. Pins raw matrix orientation, Seitz translation, k rows/grid, spinor count, per-operation antiunitary bits, and QE's pure-TR k-reduction permission. |
 | `build_spatial_operator_tables(wfn)` | Canonical `mtrx.T`, translation, Cartesian and spinor action tables without a k-map. The 2c reference check uses this to measure an inconsistent reduced WFN before `SymMaps` refuses its mesh coverage. |
 | `KStarMap(irr_idx, sym_idx, n_sym_spatial)` / `.from_sym(sym, nss)` | Band-index IBZ ⇄ full BZ. Bundles the three arrays that always travel together so no call site can supply two of the three. `.identity(nk)` is the no-reduction map, so a driver reads the same whether or not symmetry is in use. `select` / `broadcast` / `spread` / `spread_rel`. |
@@ -49,7 +49,7 @@ so reaching *past* the door is the thing that still flags.
 | `q_stencil_orbit_table(...)` | Pure-array reduction of a finite-q stencil through the canonical `irr_idx_q`/`sym_idx_q` tables. Returns exact q-IBZ sources plus target-to-source symmetry metadata; it does not define a second symmetry action. |
 | `apply_band_matrix_symmetry(...)` | The one band-matrix action: optional adjoint, antiunitary conjugation, endpoint sewing, and optional component mixing. `star_broadcast` uses its identity-sewing antiunitary path rather than maintaining a second algebra. |
 | `unfold_v_q(V_q_ibz, *, irr_idx, sym_idx, sym_perm, L_table, q_irr_frac, mesh_xy, n_sym_spatial)` | Sharded centroid double-gather + umklapp L-phase + TRS conj. `shard_map` + paired `all_to_all`, 1× single-tile peak memory per rank. |
-| `unfold_v_q_bispinor_lorentz(...)` | The 3-vector Lorentz mixing on the bispinor TT block. Its `R_proper_table` operand is in a convention the §A5 formula compensates for — see Antipatterns. |
+| `mix_channels_by_proper_rotation(..., sym=...)` | Pauli-vector mixing on the bispinor TT block. It requests axial, time-odd actions from `SymMaps`; callers cannot supply a rotation convention. |
 | `unfold_psi(cnk_kbar, *, sym_idx, g_kbar, sym_mats_k, translations, U_spinor_spatial)` | The (★) ψ derivation: spinor rotation, τ phase, G-list negation, TRS conjugation. Hard-raises unless `len(sym_mats_k) == 2·len(U_spinor_spatial)`. |
 | `slice_q_full_to_ibz` | Full-BZ → IBZ q-axis gather, sharding-preserving and jit-cached. |
 | `trs_augment_U`, `tau_phase_row`, `kgrid_shift_map`, `q_negation_index`, `common_uniform_grid_indices`, `find_irreducible_bz_points`, `map_full_kpoints_to_irreducible` | Pure-NumPy primitives. The two mapping routines share the registered highest-parent/lowest-operation rule; `map_full_kpoints_to_irreducible` also returns a coverage mask so incomplete WFN metadata is refused before an index table is used. |
@@ -170,10 +170,9 @@ M(gk0,gk1) = B_g(k0) M(k0,k1) B_g(k1)† .
 
 An antiunitary row conjugates `M`; it does not transpose a non-Hermitian
 link.  A reverse edge first adjoints `M` and swaps the endpoint sewings.
-`component_mix[..., out, in]` optionally mixes a Cartesian/vector/covector
-component axis after the band action; the caller supplies the already chosen
-forward rotation or covector representation, so this helper never guesses
-whether a component is Cartesian, reduced-coordinate, polar, or axial.
+`component_mix[..., out, in]` optionally mixes a component axis after the
+band action. Cartesian callers obtain it from `SymMaps.cartesian_action`;
+non-Cartesian representations remain explicit.
 Translations and nonsymmorphic phases belong in the endpoint sewing matrices,
 not in the edge table.  Identity sewings preserve the existing
 `star_broadcast` convention exactly.
@@ -198,9 +197,8 @@ It closes a small set of integer q-step seeds under the exact
 plus a complete target-to-source/action table. It never acts on a transition
 matrix at fixed k. The finite-q response must first be summed over the full k
 grid at a stored source q; the resulting scalar/vector/tensor is unfolded with
-`apply_band_matrix_symmetry`. For Cartesian wings the caller passes
-`sym.R_cart_forward[target_sym_idx]` as `component_mix`—there is no second
-rotation convention.
+`apply_band_matrix_symmetry`. Cartesian wings use
+`sym.cartesian_action(target_sym_idx, ...)` as `component_mix`.
 
 The table also returns a target-to-seed mask so a physics caller can retain
 first/second-shell labels without putting W-av policy into the symmetry
@@ -240,7 +238,7 @@ to be indexed.
 |---|---|---|---|
 | L-a star contract | `test_symmetry_maps_star_contract.py` | 32 | nothing |
 | L-a algebra + primitives | `test_symmetry_maps_algebra.py` | 31 | nothing |
-| L-a `R_cart` / `R_proper` contract | `test_symmetry_maps_r_cart.py` | 17 | nothing |
+| L-a typed representation contract | `test_typed_representation_actions.py`, `test_symmetry_maps_r_cart.py` | polar/axial, time parity, C4 orientation, spinor/TR and translation | nothing |
 | L-a+ deck tables | `test_symmetry_maps_deck_tables.py` | 34 | h5py + the four in-tree WFN headers |
 | L-b emulated mesh | `test_symmetry_maps_emulated_mesh.py` | 17 | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
 | L-c real multi-process | `test_symmetry_maps_multiproc.py` | 11 | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) |
@@ -348,15 +346,9 @@ iteration — and is the thing every helper is written not to move.
 
 ## Antipatterns
 
-* **Rotating a Cartesian index with `sym.R_cart[s]` untransposed.**
-  `R_cart` is the INVERSE Cartesian rotation, because `mtrx` is the inverse
-  real-space rotation while `mtrx.T` is what acts on k and G. Norms,
-  hermiticity and traces all survive the mistake. Use `R_cart_forward` for
-  anything rotating a rank ≥ 1 Cartesian index. Two consumers are exempt
-  and each says why in place: `get_spinor_rotations` (its transposed
-  Shepperd form cancels the inversion) and `unfold_v_q_bispinor_lorentz`
-  (its §A5 contraction compensates internally, and since 2026-08-07 its
-  docstring — not a comment 800 lines away — says so).
+* **Reading `R_cart` or reconstructing determinant/TR signs in a driver.**
+  Use `SymMaps.cartesian_action`; it owns forward orientation, polar versus
+  axial parity, and the antiunitary time sign.
 * **Re-deriving the conjugation predicate.** `sidx >= n_sym_spatial` is the
   member's OWN flag, correct only for the raw-IBZ-slab operand flavour.
   Against a star-row reference it INVERTS the rule for every star whose

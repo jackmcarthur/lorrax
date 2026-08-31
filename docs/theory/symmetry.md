@@ -174,10 +174,9 @@ along one already-sharded matrix axis, and the output retains both matrix
 axes distributed. Padded centroid slots use identity permutations and zero
 wraps.
 
-Bispinor \(V_q^{ij}\) first unfolds each unique tensor tile with the scalar
-rule, then rotates its Cartesian channel indices with the proper rotation
-associated with the same symmetry row. Time-reversal signs cancel for the
-two-vector channel pair, while the scalar complex conjugation remains.
+Bispinor \(V_q^{ij}\) first unfolds each tile with the scalar rule. Its two
+Pauli-vector indices then use the same row's axial, time-odd action. The two
+time-reversal signs cancel; the scalar complex conjugation remains.
 
 ## 6. Where symmetry may reduce work
 

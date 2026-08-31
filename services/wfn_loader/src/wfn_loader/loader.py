@@ -844,8 +844,8 @@ class WfnLoader:
                 nk_int = int(nk)
                 sym_idx = int(sym.sym_idx_k[nk_int])
                 kbar = int(sym.irr_idx_k[nk_int])
-                sym_krep = np.asarray(
-                    sym.sym_mats_k[sym_idx], dtype=np.int32)
+                sym_krep, _, _ = sym.operation_rows(sym_idx)
+                sym_krep = np.asarray(sym_krep, dtype=np.int32)
                 start = int(self._kpt_starts[kbar])
                 end = start + int(self.ngk[kbar])
                 k_gvecs = self._gvecs_raw[start:end]
@@ -1132,51 +1132,25 @@ class WfnLoader:
         ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)[:nk_full]
         sym_idx_per_full = np.asarray(sym.sym_idx_k, dtype=np.int32)[:nk_full]
         n_tran = int(sym.sym_matrices.shape[0])
-        tr_mask = (sym_idx_per_full >= n_tran).astype(np.bool_)
+        _, _, tr_mask = sym.operation_rows(sym_idx_per_full)
 
-        # Per-k spinor rotation matrix, single-sourced via the ψ-unfold
-        # spinor rule (spatial rows → ``sym.U_spinor[s]``; TRS rows →
-        # ``iσ_y · conj(sym.U_spinor[s − ntran])``, the T = iσ_y K rule).
-        # See ``common.symmetry_maps.{unfold_psi,trs_augment_U}`` and
-        # ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.  ``sym.U_spinor``
-        # is length ``ntran`` (PR3); the TRS half is built inside the helper.
-        # ``nspinor`` is NOT optional here.  ``sym.U_spinor`` is always
-        # (ntran, 2, 2) — it is built from the CARTESIAN rotations and
-        # knows nothing about how many components psi has — so on a scalar
-        # (nspinor=1) WFN the un-told helper hands back a 2x2; the former
-        # unfold einsum BROADCASTED the size-1 spinor axis instead of raising,
-        # and psi came back 2-component holding ``U[a,0]+U[a,1]`` times
-        # itself.  Told ``nspinor``, the helper returns the 1x1 identity and
-        # the static service application is a genuine no-op.  Registered
-        # nspinor=1 loader defect, fixed 2026-08-09;
-        # see ``tests/KNOWN_FAILURES.md``.
-        from symmetry_maps import trs_augment_U
-        U_per = trs_augment_U(
-            sym.U_spinor, sym_idx_per_full, n_tran,
-            nspinor=int(self.nspinor))                        # (nk_full, ns, ns)
+        # SymMaps owns the spatial/antiunitary row interpretation.  Passing
+        # nspinor is required so a scalar WFN receives a 1x1 identity rather
+        # than broadcasting the stored Pauli-spinor table.
+        U_per = sym.spinor_action(
+            sym_idx_per_full, nspinor=int(self.nspinor))      # (nk_full, ns, ns)
 
-        # τ-phase per full-BZ k on the ibz-source ngkmax-padded G-list.
-        # Use the SAME formula for spatial and TRS rows:
-        #   phase = exp(-i (sym_mats_k[s] · G_kbar) · τ_{s_spatial})
-        # For TRS rows ``sym_mats_k[s] = -S_spatial`` so the formula yields
-        # ``exp(+i (S_spatial · G_kbar) · τ)``, which is ``conj`` of the
-        # spatial-row phase. Combined with the downstream kernel's
-        # ``where(tr_mask, conj(cnk), cnk)`` step, the per-element TRS rule
-        # ``ψ_full = (iσ_y · conj(U)) · conj(ψ_kbar) · conj(phase_spatial)``
-        # is reproduced. Pre-PR3 the TRS rows were set to 1 (skipped the
-        # phase entirely) — that bug fired on non-symmorphic non-inversion
-        # bispinor systems.
-        from symmetry_maps import tau_phase_row
+        # The reciprocal action contains the antiunitary minus, while the
+        # translation comes from its spatial Seitz row; the service combines
+        # them into the nonsymmorphic phase.
         phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
         for nk in range(nk_full):
             s = int(sym_idx_per_full[nk])
-            s_spatial = s - n_tran if s >= n_tran else s
             ibz = int(ibz_per_full[nk])
             ngk_k = int(self.ngk[ibz])
             start = int(self._kpt_starts[ibz])
             g_bar = self._gvecs_raw[start:start + ngk_k]
-            ph = tau_phase_row(
-                sym.sym_mats_k[s], sym.translations[s_spatial], g_bar)
+            ph = sym.reciprocal_phase(s, g_bar)
             if ph is not None:
                 phase[nk, :ngk_k] = ph
 
@@ -1689,9 +1663,7 @@ class WfnLoader:
           1. For each requested k, look up (sym_idx, kbar_idx, sym_krep).
           2. Read raw IBZ band-block from ``self._coeffs_raw`` at
              ``kpt_starts[kbar]:..+ngk[kbar]``; convert (re, im) → c128.
-          3. If TRS (sym_idx >= ntran): conjugate.
-             Else apply ``exp(-i (S·G_bar)·τ)`` per-G phase.
-          4. Apply U_spinor[sym_idx] rotation.
+          3. Apply the canonical rotation, translation phase and TR action.
           5. Place into output at ``[j, :nb_logical, :, :ngk]``; rest zero.
         """
         nb_logical = b_hi - b_lo
@@ -1712,9 +1684,7 @@ class WfnLoader:
             return out
 
         # Full-BZ unfold path.
-        from symmetry_maps import unfold_psi
         sym = self._ensure_sym()
-        ntran = int(sym.sym_matrices.shape[0])
         for j, nk in enumerate(k_idxs):
             nk_int = int(nk)
             sym_idx = int(sym.sym_idx_k[nk_int])
@@ -1726,14 +1696,8 @@ class WfnLoader:
             raw = self._coeffs_ds[b_lo:b_hi, :, start:end, :]
             cnk = raw[..., 0] + 1j * raw[..., 1]                    # (nb, ns, ngk_k)
             g_bar = self._gvecs_raw[start:end]                      # (ngk_k, 3)
-            cnk = unfold_psi(
-                cnk,
-                sym_idx=sym_idx,
-                g_kbar=g_bar,
-                sym_mats_k=sym.sym_mats_k,
-                translations=self.translations,
-                U_spinor_spatial=sym.U_spinor,
-            )
+            cnk = sym.unfold_wavefunction(
+                cnk, row=sym_idx, g_parent=g_bar)
             out[j, :nb_logical, :, :ngk_k] = cnk
         return out
 

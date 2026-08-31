@@ -1041,12 +1041,10 @@ def unfold_isdf_one_leg(
     under time reversal, matching :func:`unfold_psi`.
 
     ``component_action='scalar'`` returns that scalar leg.  The ``'polar'``
-    action takes one streamed source Cartesian component and returns its
-    contributions to all three target components using exactly the named
-    ``SymMaps.R_cart_forward`` column.  Its TRS-augmented row already carries
-    the single time-reversal minus for a polar current; no second parity sign
-    is applied.  Summing the three calls with ``source_component=0,1,2`` is
-    the full vector action, while only one large zeta slab is resident.
+    action streams one source Cartesian component through the canonical
+    polar, time-odd :meth:`SymMaps.cartesian_action`.  Summing the three
+    source components gives the full vector action while only one large zeta
+    slab is resident.
 
     ``sym_idx`` is deliberately explicit: callers must pass the measured
     :class:`QgridTrsPolicy`'s ``unfold_sym_idx``.  This function never falls
@@ -1259,12 +1257,8 @@ def unfold_isdf_one_leg(
     trs = rows >= n_spatial
     R_column = None
     if action == "polar":
-        R = np.asarray(sym.R_cart_forward, dtype=np.float64)
-        if R.shape != (S_all.shape[0], 3, 3):
-            raise ValueError(
-                "unfold_isdf_one_leg: SymMaps.R_cart_forward has shape "
-                f"{R.shape}, expected {(S_all.shape[0], 3, 3)}.")
-        R_column = R[rows, :, source]
+        R_column = sym.cartesian_action(
+            rows, axial=False, time_odd=True)[:, :, source]
 
     fn = _get_unfold_isdf_one_leg_jit(
         zeta_shape=zshape, idx=idx, rows=rows, perm=perm,
@@ -1379,51 +1373,16 @@ def _get_unfold_isdf_one_leg_jit(
 def mix_channels_by_proper_rotation(
     V_tt_per_channel,
     *,
+    sym,
     sym_idx,
-    R_proper_table,
     mesh_xy,
 ):
-    """Apply the 3-vector Lorentz mixing on the bispinor TT-block tiles.
+    """Mix the two Pauli-vector indices on bispinor TT tiles.
 
-    Operates on the (μ_L, ν_L) ∈ {1,2,3}² block of bispinor V_q tiles that
-    have already been passed through :func:`unfold_isdf_operator` (centroid
-    double-permute + L-phase + TRS conj-wrap).  Implements the rule from
-    ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A5::
-
-        V^{i,j}_mixed[q, μ, ν]
-            = Σ_{α, β ∈ {1,2,3}} R_proper[s(q), i-1, α-1]
-                                  · R_proper[s(q), j-1, β-1]
-                                  · V^{α,β}_unfolded[q, μ, ν]
-
-    where ``s(q) = sym_idx[q]`` and ``R_proper`` is the derivation's own
-    Cartesian rotation ``R_deriv = Aᵀ · mtrx⁻¹ · (Aᵀ)⁻¹``.
-
-    THE FORMULA ABOVE IS THE DERIVATION'S; THE TABLE THIS FUNCTION TAKES
-    IS ITS TRANSPOSE, AND THE CONTRACTION COMPENSATES.  ``SymMaps.R_proper``
-    is built from ``R_cart = Aᵀ · mtrx · (Aᵀ)⁻¹`` (with the det-flip), the
-    rotation ``get_spinor_rotations`` consumes and the one LORRAX's
-    ``U_spinor`` actually satisfies the σ-sandwich identity for.  Because
-    ``mtrx`` is orthogonal, that is ``R_deriv`` transposed row-wise, so
-    ``R_deriv^{i,α} = R_proper^{α,i}`` and the implemented contraction is
-
-        V^{i,j}_mixed[q, μ, ν]
-            = Σ_{α, β} R_proper[s(q), α, i-1] · R_proper[s(q), β, j-1]
-                       · V^{α,β}_unfolded[q, μ, ν]
-
-    (einsum ``'qai,qbj,abqmn->ijqmn'``).  Passing a table in the
-    derivation-text convention — e.g. the offline fixture
-    ``reports/bispinor_ibz_2026-05-16/cri3_R_proper.npz`` — WITHOUT
-    transposing it first applies the inverse rotation, which leaves norms,
-    hermiticity and traces intact.  This is the same inversion
-    ``syms_crystal_to_cartesian``'s docstring warns about; ``R_cart`` /
-    ``R_proper`` are the INVERSE Cartesian rotation and
-    ``SymMaps.R_cart_forward`` is the forward one.
-
-    TRS rows reuse the spatial
-    ``R_proper``: the σ-flip TRS sigma-sign on (μ_L, ν_L) ∈ {1,2,3}²
-    factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and is
-    absorbed by the existing scalar ``unfold_isdf_operator`` conj-wrap
-    (derivation §A4).
+    Each index requests the canonical axial, time-odd action from ``sym``.
+    The two antiunitary signs cancel while :func:`unfold_isdf_operator` owns
+    the single complex conjugation.  Keeping the action typed here prevents
+    callers from choosing a transpose, determinant sign, or TR convention.
 
     Parameters
     ----------
@@ -1435,11 +1394,8 @@ def mix_channels_by_proper_rotation(
         ``conj(swapaxes(V[i,j], -1, -2))``.
     sym_idx : np.ndarray | jax.Array
         ``(n_q_full,)`` int — ``SymMaps.sym_idx_q`` (TRS-augmented).
-    R_proper_table : np.ndarray
-        ``(2·n_sym_spatial, 3, 3)`` float64 — ``SymMaps.R_proper``, in
-        the LORRAX ``Aᵀ · mtrx · (Aᵀ)⁻¹`` convention, NOT the derivation
-        text's transpose of it (see above).  Both spatial and TRS halves
-        contain the same spatial ``R_proper`` per the derivation.
+    sym : SymMaps
+        Canonical operation and representation source.
     mesh_xy : jax.sharding.Mesh
         Device mesh (used to lock the output sharding).
 
@@ -1448,17 +1404,17 @@ def mix_channels_by_proper_rotation(
     dict[(i, j) -> jax.Array]
         Same keys, same shapes, sharded ``P(None, 'x', 'y')``.
     """
-    sym_arr = np.asarray(sym_idx, dtype=np.int32)
-    R_arr = np.asarray(R_proper_table, dtype=np.float64)
-    if R_arr.ndim != 3 or R_arr.shape[1:] != (3, 3):
+    sym_raw = np.asarray(sym_idx)
+    if sym_raw.ndim != 1:
         raise ValueError(
-            f"mix_channels_by_proper_rotation: R_proper_table must have shape "
-            f"(2·n_sym_spatial, 3, 3); got {R_arr.shape}.")
-    # Per-q 3×3 mixer baked into the jit closure as a constant — same
-    # caching pattern as ``unfold_isdf_operator`` (small int + float table
-    # folded into HLO).  ``R_per_q[q]`` ∈ R^{3×3} is the spatial rotation that
-    # mixes the (1,2,3) Lorentz indices for full-BZ q.
-    R_per_q = R_arr[sym_arr]                                # (n_q_full, 3, 3)
+            "mix_channels_by_proper_rotation: sym_idx must be rank one; "
+            f"got {sym_raw.shape}.")
+    R_per_q = np.asarray(sym.cartesian_action(
+        sym_raw, axial=True, time_odd=True), dtype=np.float64)
+    if R_per_q.shape != (sym_raw.size, 3, 3):
+        raise ValueError(
+            "mix_channels_by_proper_rotation: typed Cartesian actions must "
+            f"have shape {(sym_raw.size, 3, 3)}; got {R_per_q.shape}.")
 
     # Build the 9×9 source array V_in[α, β] at full-BZ shape, contract,
     # write back into the same 6 unique slots (plus 3 redundants).
@@ -1472,8 +1428,6 @@ def mix_channels_by_proper_rotation(
                 f"Hermitian-redundant entries).")
     sample = V_tt_per_channel[(1, 1)]
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    R_dev = jnp.asarray(R_per_q)                            # closure constant
-
     fn = _get_mix_channels_jit(
         V_shape=tuple(int(s) for s in sample.shape),
         R_per_q_arr=R_per_q,
@@ -1519,18 +1473,9 @@ def _get_mix_channels_jit(*, V_shape, R_per_q_arr, mesh_xy):
 
     @partial(jax.jit, in_shardings=in_sh, out_shardings=V_sh)
     def _do_mix(V_in):
-        # V_in: (3, 3, n_q, μ, ν).  Derivation §A5 (in its own R_proper
-        # convention ``R_deriv = A.T · inv(mtrx) · inv(A.T)``):
-        #     V^{i,j} = Σ_{α,β} R_deriv^{i,α} · R_deriv^{j,β} · V^{α,β}.
-        # The LIVE ``R_per_q`` here is ``R_LORRAX`` (``A.T · mtrx ·
-        # inv(A.T)`` with the det-flip; see ``SymMaps.R_proper``
-        # docstring).  For orthogonal mtrx ``R_LORRAX = R_deriv.T``
-        # row-wise, so ``R_deriv^{i,α} = R_LORRAX^{α,i}`` and the
-        # contraction becomes
-        #     V^{i,j} = Σ R_LORRAX^{α,i}(q) · R_LORRAX^{β,j}(q) · V^{α,β}(q).
-        # In einsum letters with R indexed [q, row, col]:
+        # V_in: (3, 3, n_q, μ, ν); R is the forward action [q,out,in].
         return jnp.einsum(
-            'qai,qbj,abqmn->ijqmn',
+            'qia,qjb,abqmn->ijqmn',
             R_per_q_j, R_per_q_j, V_in,
         )
 
@@ -2114,14 +2059,6 @@ class SymMaps:
             self.R_cart = np.concatenate(
                 [_R_identity, -_R_identity], axis=0)
             self.U_spinor = np.eye(2, dtype=complex)[None, :, :]
-            # ``R_proper`` is the proper (det = +1) Cartesian rotation used
-            # by the bispinor 3-vector vertex mixing.  Identity case: a
-            # spatial identity is its own proper part; the TRS-augmented
-            # half reuses it, as in the general branch.  See
-            # ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A2.
-            self.R_proper = np.repeat(
-                np.eye(3, dtype=np.float64)[None, :, :], 2, axis=0)
-
             # Build direct integer-grid lookup for the identity/no-symmetry case.
             kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
             shift = np.asarray(getattr(wfn, "shift", (0.0, 0.0, 0.0)), dtype=np.float64)
@@ -2380,40 +2317,6 @@ class SymMaps:
         # Site #6 for the per-element derivation.
         self.R_cart = _operator_tables.R_cart
         self.U_spinor = _operator_tables.U_spinor
-        # ``R_proper[s]`` is the PROPER (det=+1) Cartesian rotation that
-        # mixes the bispinor 3-vector vertices ``γ̃^{1,2,3} = (σ_x, σ_y,
-        # σ_z)`` per the SO(3) image of ``U_spinor``'s SU(2) sandwich:
-        #   ``U_spinor[s]† σ^i U_spinor[s] = Σ_j R_proper[s]^{j,i} σ^j``.
-        # This is the SAME rotation matrix that ``get_spinor_rotations``
-        # consumes (``A · mtrx · A⁻¹`` with the det-flip — see
-        # ``syms_crystal_to_cartesian`` docstring), so ``R_proper`` is
-        # just ``R_cart`` with the same proper-flip that
-        # ``get_spinor_rotations`` applies internally at line 1069.
-        # Derivation: ``reports/bispinor_ibz_2026-05-16/derivation.md``
-        # §A2; mixing rule §A5
-        #   ``V^{i,j}_full[q] = R_proper^{i,α}(s) · R_proper^{j,β}(s) ·
-        #                       V^{α,β}_unfolded[q]``.
-        #
-        # NOTE: this differs from the OFFLINE fixture
-        # ``reports/bispinor_ibz_2026-05-16/cri3_R_proper.npz`` by a
-        # transpose on every row — the fixture follows the derivation
-        # TEXT (``O = A · U · A⁻¹``, ``U = mtrx⁻¹``), while the live
-        # code follows the σ-sandwich identity that LORRAX's actual
-        # ``U_spinor`` satisfies (built from ``A · mtrx · A⁻¹``).  The
-        # two are inverses of each other for orthogonal mtrx and pick
-        # up a transpose on the (i, j) indices of the §A5 formula.
-        #
-        # TRS half reuses the SPATIAL R_proper (NOT ``−R_spatial``): the
-        # σ-flip TRS sigma-sign on the (μ_L, ν_L) ∈ {1,2,3}² block
-        # factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and
-        # is absorbed by the existing ``unfold_isdf_operator`` conj-wrap.  See
-        # derivation §A4.
-        _R_spatial = np.asarray(self.R_cart[:wfn.ntran], dtype=np.float64)
-        _R_proper_spatial = np.where(
-            np.linalg.det(_R_spatial)[:, None, None] < 0,
-            -_R_spatial, _R_spatial)
-        self.R_proper = np.concatenate(
-            [_R_proper_spatial, _R_proper_spatial], axis=0)
         self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
         self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
 
@@ -2742,43 +2645,86 @@ class SymMaps:
 
     @property
     def R_cart_forward(self):
-        """The FORWARD Cartesian rotation per op: ``R_cart[s].T``.
+        """Compatibility table for a polar, time-odd Cartesian index."""
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        return self.cartesian_action(
+            np.arange(2 * n, dtype=np.int32), axial=False, time_odd=True)
 
-        ``R_cart`` is the cartesian image of ``mtrx``, and ``mtrx`` is the
-        INVERSE real-space rotation.  ``syms_crystal_to_cartesian``'s own
-        caution says what follows, and it is quoted here rather than
-        paraphrased because paraphrasing it is how it got lost the first
-        time (061f8a3 added it as a comment on the wrong side of the call):
+    @property
+    def R_proper(self):
+        """Compatibility table for the inverse axial, time-even action."""
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        forward = self.cartesian_action(
+            np.arange(2 * n, dtype=np.int32), axial=True, time_odd=False)
+        return np.swapaxes(forward, -1, -2)
 
-            CAUTION FOR OTHER CONSUMERS.  Because ``mtrx`` is the inverse
-            real-space rotation while ``mtrx.T`` is what acts on k and G,
-            this matrix is the INVERSE of the Cartesian rotation that
-            carries k_irr to S·k_irr.  ``get_spinor_rotations`` is
-            unaffected — its quaternion extraction uses the transposed
-            Shepperd form, so the two inversions cancel — but anything
-            rotating a Cartesian INDEX (a dipole or any rank≥1 operator)
-            must use the TRANSPOSE of this matrix.  Using it untransposed
-            leaves norms, hermiticity and traces intact, so the error is
-            invisible to the obvious checks.
+    def operation_rows(self, rows):
+        """Return reciprocal action, spatial translation and TR bit.
 
-        So: ``R_cart`` for the spinor sandwich, ``R_cart_forward`` for a
-        Cartesian INDEX.  This property is the named spelling of "the
-        transpose of this matrix" — an ADDITIVE surface, with no rename and
-        no change to either live consumer's math (both are provably
-        self-consistent today; their adoption of the name is registered
-        post-wave).  Its whole value is that the wrong pattern now has a
-        right one to sit beside, and the docs' Antipatterns section can
-        name it: *rotating a Cartesian index with ``sym.R_cart[s]``
-        untransposed*.
-
-        Shape and rows are ``R_cart``'s: ``(2·ntran, 3, 3)``, spatial ops
-        first, the time-reversal half duplicating them with the sign
-        convention ``R_cart[ntran:] = −R_cart[:ntran]``.  Orthogonal per
-        op, so the transpose IS the inverse — which is exactly why the two
-        spellings are so easy to confuse and so hard to tell apart by any
-        norm-, trace- or hermiticity-based check.
+        Rows use the one canonical ``[unitary, antiunitary]`` layout.  The
+        reciprocal matrix already contains the antiunitary minus; the
+        translation always belongs to the underlying spatial Seitz row.
         """
-        return np.swapaxes(np.asarray(self.R_cart), -1, -2)
+        raw = np.asarray(rows)
+        if (not np.issubdtype(raw.dtype, np.integer)
+                or np.any(raw < 0)):
+            raise ValueError(
+                f"SymMaps.operation_rows: rows must be nonnegative integers; "
+                f"got {raw!r}.")
+        idx = raw.astype(np.int32, copy=False)
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        if np.any(idx >= 2 * n):
+            raise ValueError(
+                f"SymMaps.operation_rows: row outside [0,{2 * n}); "
+                f"got {raw!r}.")
+        spatial = idx % n
+        return (np.asarray(self.sym_mats_k)[idx],
+                np.asarray(self.translations)[spatial], idx >= n)
+
+    def cartesian_action(self, rows, *, axial, time_odd):
+        """Forward action for a typed Cartesian index.
+
+        ``axial`` selects ``det(R) R`` instead of the polar ``R``;
+        ``time_odd`` supplies the minus on antiunitary rows.  Antiunitary
+        complex conjugation is applied by the tensor action, not this real
+        representation table.
+        """
+        if not isinstance(axial, (bool, np.bool_)):
+            raise TypeError("SymMaps.cartesian_action: axial must be bool.")
+        if not isinstance(time_odd, (bool, np.bool_)):
+            raise TypeError("SymMaps.cartesian_action: time_odd must be bool.")
+        raw = np.asarray(rows)
+        _, _, antiunitary = self.operation_rows(raw)
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        spatial = raw.astype(np.int32, copy=False) % n
+        forward = np.swapaxes(
+            np.asarray(self.R_cart[:n], dtype=np.float64), -1, -2)[spatial]
+        if axial:
+            forward = (np.linalg.det(forward)[..., None, None] * forward)
+        if time_odd:
+            forward = np.where(
+                np.asarray(antiunitary)[..., None, None], -forward, forward)
+        return forward
+
+    def spinor_action(self, rows, *, nspinor):
+        """Canonical unitary/antiunitary spinor factor for operation rows."""
+        self.operation_rows(rows)  # validate against this instance
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        return spinor_rotation_for_sym_row(
+            self.U_spinor, rows, n, nspinor=nspinor)
+
+    def reciprocal_phase(self, row, carriers):
+        """Nonsymmorphic phase for reciprocal carriers under one typed row."""
+        reciprocal, translation, _ = self.operation_rows(row)
+        return tau_phase_row(reciprocal, translation, carriers)
+
+    def unfold_wavefunction(self, coefficients, *, row, g_parent):
+        """Apply one complete spatial/translation/TR wavefunction action."""
+        self.operation_rows(row)  # validate against this instance
+        return unfold_psi(
+            coefficients, sym_idx=row, g_kbar=g_parent,
+            sym_mats_k=self.sym_mats_k, translations=self.translations,
+            U_spinor_spatial=self.U_spinor)
 
     @staticmethod
     def get_spinor_rotations(wfn, sym_matrices_cart):
@@ -3500,20 +3446,21 @@ def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
     """
     out = unfold_file_wedge_to_full_bz(sym, data)
     sym_rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
-    rotations = np.asarray(sym.R_cart_forward, dtype=np.float64)
+    rotations = np.asarray(sym.cartesian_action(
+        sym_rows, axial=False, time_odd=True), dtype=np.float64)
     if sym_rows.shape != (int(sym.nk_tot),):
         raise ValueError(
             "unfold_file_wedge_polar_matrix: sym.sym_idx_k must have one "
             f"row per full k-point; got {sym_rows.shape}, expected "
             f"({int(sym.nk_tot)},).")
     if (rotations.ndim != 3 or rotations.shape[1:] != (3, 3)
-            or np.any(sym_rows < 0) or np.any(sym_rows >= rotations.shape[0])):
+            or rotations.shape[0] != sym_rows.shape[0]):
         raise ValueError(
             "unfold_file_wedge_polar_matrix: invalid canonical symmetry-row "
-            f"map {sym_rows.shape} for R_cart_forward {rotations.shape}.")
+            f"map {sym_rows.shape} for Cartesian actions {rotations.shape}.")
     return apply_band_matrix_symmetry(
         out,
-        component_mix=rotations[sym_rows],
+        component_mix=rotations,
         component_axis=component_axis,
     )
 

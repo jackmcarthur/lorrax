@@ -321,7 +321,8 @@ def test_file_wedge_polar_matrix_uses_forward_not_inverse_rotation():
         irr_idx_k=np.asarray([0], dtype=np.int32),
         sym_idx_k=np.asarray([0], dtype=np.int32),
         sym_mats_k=np.stack([np.eye(3), -np.eye(3)]),
-        R_cart_forward=np.stack([forward, -forward]),
+        cartesian_action=lambda rows, *, axial, time_odd: np.stack(
+            [forward, -forward])[np.asarray(rows, dtype=np.int32)],
     )
     wedge = np.asarray([[[[1.0]], [[2.0]], [[3.0]]]], dtype=np.complex128)
     got = unfold_file_wedge_polar_matrix(sym, wedge)

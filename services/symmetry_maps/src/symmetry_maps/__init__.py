@@ -51,12 +51,10 @@ on the loader as ``trs_holds`` and gates antiunitary rows in :class:`SymMaps`.
 The surface
 -----------
 ``SymMaps(wfn)``
-    The eager table builder.  Publishes ``irr_idx_k``/``sym_idx_k`` (the
-    full-BZ → IBZ row and the operator that gets you there), the q-axis
-    twins, the rotation tables (``R_grid``, ``Rinv_grid``, ``R_cart``,
-    ``R_proper``, ``U_spinor``) and the k−q maps.  ``R_cart`` is the
-    INVERSE Cartesian rotation; rotating a Cartesian index with it
-    untransposed passes norms, traces and hermiticity while being wrong.
+    The eager table builder and operation source of truth.  Consumers use
+    ``operation_rows`` for reciprocal rotation/translation/TR typing,
+    ``cartesian_action`` for polar or axial and time-even or time-odd
+    indices, and ``spinor_action``/``unfold_wavefunction`` for states.
 ``KStarMap`` / ``star_select`` / ``star_broadcast`` / ``star_spread``
     IBZ⇄full-BZ for band-index objects, and the residual that checks the
     premise.
@@ -90,9 +88,7 @@ The surface
     contract on an ``('x','y')`` mesh.
 ``unfold_psi`` / ``spinor_rotation_for_sym_row`` /
 ``apply_spinor_rotation`` / ``tau_phase_row``
-    The ψ-unfold rule, and the single sources of the spinor TRS
-    augmentation, its static one- or two-component application, and the τ
-    phase.
+    Pure-array backends used by the corresponding ``SymMaps`` methods.
 ``kgrid_shift_map`` / ``bgw_signed_q_representative`` /
 ``bgw_integer_q_to_fractional`` / ``common_uniform_grid_indices`` /
 ``find_irreducible_bz_points``

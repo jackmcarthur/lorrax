@@ -60,25 +60,18 @@ is a note for whoever does that work, not a task. In particular
 regenerated — it stays exactly as it is, keep-with-justification, recorded
 under the non-closed-set dispositions below.
 
-## 2. Proper-rotation channel mixing (the bispinor-adjacent one)
+## 2. Cartesian and Pauli-vector actions
 
-`maps.py` `mix_channels_by_proper_rotation`, one live caller
-(`gw/v_q_bispinor.py`). `R_proper` built once in `SymMaps.__init__`.
-
-Two **recorded, unreconciled** convention disagreements against the offline
-fixture `reports/bispinor_ibz_2026-05-16/cri3_R_proper.npz`: it is transposed
-row-for-row, and its TRS half carries `−R` where live code carries `+R`. The
-live choice is justified only for the tiles currently stored — a future
-off-diagonal `(0,i)` tile would need the −1.
+`SymMaps.cartesian_action` owns forward orientation, polar/axial parity, and
+time parity. The bispinor TT mixer requests an axial, time-odd action per
+Pauli index; its two TR signs cancel. A future charge-current tile must request
+one polar, time-odd index rather than reuse the two-index TT rule.
 
 ## 3. Wavefunction / orbital rotation
 
-**ψ coefficient transform.** Order is `conj (if TRS) → τ phase → U`.
-Two implementations of that *sequencing* — host `maps.py unfold_psi`, device
-`wfn_loader/loader.py` — which **agree**, and both import the *factors*
-(`tau_phase_row`, `spinor_rotation_for_sym_row`) rather than rebuilding them.
-This is the one genuine duplication in rotation math and it is minimal: two
-lines of ordering, no math.
+**ψ coefficient transform.** `SymMaps.unfold_wavefunction` owns the host
+action; the device loader obtains its row, spinor, and translation factors
+through `operation_rows`, `spinor_action`, and `reciprocal_phase`.
 
 **G rotation + umklapp** (`G' = sym_mats_k @ G − kg0`). **Re-counted by
 reading, 2026-08-15: the "four implementations" this page used to claim is
@@ -629,14 +622,14 @@ registered.
 |---|---|---|
 | SU(2) from 3×3 | **yes** | nothing — clean |
 | TRS spinor augmentation | **yes** | nothing live |
-| ψ unfold sequencing | 2 (agree) | order-of-ops must be edited twice; factors are shared |
-| Proper-rotation channel mix | **yes** | the CrI₃ fixture is transposed + TRS-sign-flipped |
+| ψ unfold sequencing | **yes: `SymMaps` methods** | host/device kernels consume the same typed factors |
+| Pauli-channel mix | **yes: typed Cartesian action** | nothing live |
 | G rotation + umklapp | **3 live** (was miscounted as 4) | `vcoul/bgw_parity.py` (blocked) and **`file_io/epsreader.py:136`**, which was unregistered and is τ-blind by its own admission |
 | τ phase (G-space) | **yes** | but the 2π convention splits across 4 dividers |
 | TRS conjugation predicate | 2 semantics, **no default, all 13 call sites explicit** | nothing — AST-swept |
 | r-grid image / source map | **12 expressions** (was miscounted as ~6) | forward/pull-back must be upgraded together — AND the four in `centroid/kmeans_isdf.py`, the module that GENERATES the centroid sets |
 | Density symmetrisation | 2 (**one broken**) | the bench copy |
-| Cartesian-index rotation | `R_cart_forward` named but **unused**; the one live site uses `R_cart` untransposed | — |
+| Cartesian-index rotation | **yes: `cartesian_action`** | nothing live |
 
 ---
 
@@ -694,14 +687,12 @@ measurable separately and both are ~100 % of the signal:
   rel 2.000, which is what `+v` against `−v` looks like. Adding **−1 on the
   antiunitary rows** takes the whole array to **2.703570e-15**.
 
-So the complete rule is `d_a(gk) = −1^{TRS} · R_cart_forward[s]_{ab} ·
+So the complete rule is `d_a(gk) = −1^{TRS} · R_forward[s]_{ab} ·
 conj^{TRS}(d_b(k))`, and the sign is there because **v̂ is odd under time
 reversal** while `kin_ion` is even. The live G-space Hartree matrix follows
-the scalar-operator star relation but is not stored. The tree already said
-the transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
-rotating a Cartesian INDEX (a dipole or any rank≥1 operator) must use the
-TRANSPOSE of this matrix", and the scorecard above records it as *named but
-unused*. The TRS sign was not written down anywhere.
+the scalar-operator star relation but is not stored. Production consumers now
+obtain this matrix as `cartesian_action(..., axial=False, time_odd=True)`;
+they do not choose the transpose or sign independently.
 
 #### …and the SAME sign applies to the QSGW velocity — derived 2026-08-22
 

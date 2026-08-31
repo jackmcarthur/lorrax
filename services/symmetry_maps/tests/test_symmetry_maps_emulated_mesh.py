@@ -561,6 +561,21 @@ def _r_proper(rng, n_rows):
     return np.concatenate([sp, sp], axis=0)
 
 
+class _TypedSym:
+    """Expose a legacy inverse proper table through the typed forward API."""
+
+    def __init__(self, inverse_proper):
+        self.inverse_proper = np.asarray(inverse_proper)
+        self.n_spatial = self.inverse_proper.shape[0] // 2
+
+    def cartesian_action(self, rows, *, axial, time_odd):
+        assert axial and time_odd
+        idx = np.asarray(rows, dtype=np.int32)
+        forward = np.swapaxes(self.inverse_proper[idx], -1, -2)
+        return np.where((idx >= self.n_spatial)[:, None, None],
+                        -forward, forward)
+
+
 @pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])
 def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
     """G6.  The §A5 3-vector mixing, against an explicit double sum.
@@ -594,7 +609,7 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
             tiles[(i, j)] = a
     out = mix_channels_by_proper_rotation(
         {k: jnp.asarray(v) for k, v in tiles.items()},
-        sym_idx=_SYM, R_proper_table=R, mesh_xy=mesh)
+        sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
 
     Rq = R[np.asarray(_SYM)]                                  # (n_q, 3, 3)
     for i in (1, 2, 3):
@@ -648,8 +663,8 @@ def test_the_lorentz_reference_notices_a_transposed_R():
         f"this draw of R is too close to symmetric to be a discriminator")
 
 
-def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_table():
-    """Both refusals: all nine (i,j) required, and R is ``(n, 3, 3)``.
+def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_action():
+    """All nine tiles and a typed ``(n_q,3,3)`` action are required.
 
     Nine, not six: the caller may synthesise the Hermitian-redundant
     entries with ``conj(swapaxes(...))``, but the function will not guess.
@@ -663,11 +678,16 @@ def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_table():
              for i in (1, 2, 3) for j in (1, 2, 3)}
     partial = {k: v for k, v in tiles.items() if k != (2, 3)}
     with pytest.raises(ValueError, match=r"missing TT tile"):
-        mix_channels_by_proper_rotation(partial, sym_idx=_SYM,
-                                        R_proper_table=R, mesh_xy=mesh)
-    with pytest.raises(ValueError, match=r"\(2·n_sym_spatial, 3, 3\)"):
         mix_channels_by_proper_rotation(
-            tiles, sym_idx=_SYM, R_proper_table=R[:, :2, :], mesh_xy=mesh)
+            partial, sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
+
+    class _BadTypedSym:
+        def cartesian_action(self, rows, *, axial, time_odd):
+            return R[np.asarray(rows), :2, :]
+
+    with pytest.raises(ValueError, match=r"typed Cartesian actions"):
+        mix_channels_by_proper_rotation(
+            tiles, sym=_BadTypedSym(), sym_idx=_SYM, mesh_xy=mesh)
 
 
 # ---------------------------------------------------------------------------

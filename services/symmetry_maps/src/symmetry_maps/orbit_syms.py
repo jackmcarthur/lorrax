@@ -1369,14 +1369,14 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
 
     ``field`` is ``(3,nx,ny,nz)``.  Every permitted row acts through the
     canonical real-space pullback from :func:`fft_grid_pullback_perm` and
-    the forward Cartesian-index action ``SymMaps.R_cart_forward``::
+    the polar, time-odd :meth:`SymMaps.cartesian_action`::
 
         (g J)_a(r_new) = R_forward[g]_{a b} J_b(r_old).
 
-    The time-reversal half of ``R_cart_forward`` already contains the one
-    minus sign of a time-odd polar current.  Time reversal does not move
-    ``r``, so its row reuses the spatial pullback and no second parity sign
-    is applied.  Antiunitary rows participate only when the live
+    Its antiunitary rows contain the one time-odd minus and act antilinearly
+    through complex conjugation.  Time reversal does not move ``r``, so its
+    row reuses the spatial pullback.  Antiunitary rows participate only when
+    the live
     ``SymMaps.active_symmetry_rows`` authorizes them.  A measured global-TRS
     verdict authorizes the complete second half; a broken-global-TRS magnetic
     schema may authorize only specific antiunitary rows.
@@ -1428,15 +1428,17 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
         raise ValueError(
             "project_polar_fft_field: SymMaps.sym_matrices must have shape "
             f"(n,3,3), n>=1; got {spatial.shape}.")
-    rotations = np.asarray(sym.R_cart_forward, dtype=np.float64)
+    rotations = np.asarray(sym.cartesian_action(
+        np.arange(2 * n_spatial, dtype=np.int32),
+        axial=False, time_odd=True), dtype=np.float64)
     expected_rotations = (2 * n_spatial, 3, 3)
     if rotations.shape != expected_rotations:
         raise ValueError(
-            "project_polar_fft_field: SymMaps.R_cart_forward has shape "
+            "project_polar_fft_field: Cartesian action table has shape "
             f"{rotations.shape}, expected {expected_rotations}.")
     if not np.all(np.isfinite(rotations)):
         raise ValueError(
-            "project_polar_fft_field: SymMaps.R_cart_forward contains "
+            "project_polar_fft_field: Cartesian action table contains "
             "non-finite values.")
     translations = np.asarray(sym.translations, dtype=np.float64)
     if translations.shape[0] < n_spatial or translations.shape[1:] != (3,):
@@ -1584,7 +1586,10 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
 
     def _act(row, operand):
         spatial_row = int(row) % n_spatial
-        return rotations[int(row)] @ operand[:, pullback[spatial_row]]
+        source = operand[:, pullback[spatial_row]]
+        if int(row) >= n_spatial:
+            source = np.conj(source)
+        return rotations[int(row)] @ source
 
     projected = np.zeros_like(flat, dtype=np.result_type(value.dtype, np.float64))
     for row in active_rows:

@@ -205,7 +205,7 @@ band-pair cost; it is not the implemented path.
 | [`src/common/bispinor_init.py`](../src/common/bispinor_init.py) | Single σ·p implementation; requires an explicitly Cartesian reciprocal basis in Bohr⁻¹. |
 | [`services/wfn_loader/`](services/wfn_loader.md) | The WFN-format boundary folds `wfn.blat` into raw `wfn.bvec` once before calling the lift. |
 | [`src/gw/isdf_fitting.py`](../src/gw/isdf_fitting.py) + [`src/isdf/core.py`](../src/isdf/core.py) | One fit driver and one pair-density/CCT/Z/solve implementation for charge and transverse vertices; the private coordinator only schedules those owners. |
-| [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical k/q maps and spin rotations used by the fit, IBZ writer, and V reconstruction. The 3-vector Lorentz unfold uses the service's `R_proper_table` convention. |
+| [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
 | **[`src/centroid/current_density.py`](../src/centroid/current_density.py)** *(new)* | Builds $W_{\rm curr}(r)$ from the canonical lifted bispinor and direct $\Psi^\dagger\alpha_i\Psi/\alpha_{\rm FS}$ vertex; the Gordon form remains the independent parity identity. |
 | [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes density-fit, source-density, and intended-channel provenance. |
 | [`src/gw/sigma_x_bispinor.py`](../src/gw/sigma_x_bispinor.py) | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$. |

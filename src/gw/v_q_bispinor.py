@@ -524,9 +524,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
         tt_mixed = mix_channels_by_proper_rotation(
             tt_full_in,
+            sym=sym,
             sym_idx=np.asarray(
                 qgrid_policy.unfold_sym_idx, dtype=np.int32),
-            R_proper_table=np.asarray(sym.R_proper, dtype=np.float64),
             mesh_xy=mesh_xy,
         )
 
