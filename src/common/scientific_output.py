@@ -265,6 +265,16 @@ def _fractional_translation(translation) -> np.ndarray:
     return np.asarray(translation, dtype=np.float64) / (2.0 * np.pi)
 
 
+def _operation_usage(active_rows: set[int], spatial_row: int,
+                     n_spatial: int) -> str:
+    kinds = []
+    if spatial_row in active_rows:
+        kinds.append("unitary")
+    if spatial_row + n_spatial in active_rows:
+        kinds.append("TR")
+    return "+".join(kinds) if kinds else "inactive"
+
+
 def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
                             enumerate_ibz: bool = True) -> list[str]:
     """Render the canonical spatial operations and BZ/IBZ sampling.
@@ -285,18 +295,59 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
         "translations",
     ]
     qe_binding = getattr(sym, "qe_symmetry_binding", None)
+    active = np.asarray(
+        getattr(sym, "active_symmetry_rows",
+                np.arange(2 * n_sym if bool(sym.trs_allowed) else n_sym)),
+        dtype=np.int32).reshape(-1)
+    active_set = {int(row) for row in active}
+    n_active_unitary = sum(row < n_sym for row in active_set)
+    n_active_anti = sum(row >= n_sym for row in active_set)
     if qe_binding is None:
+        qe_tr = None
+        diagnostic = str(getattr(
+            sym, "qe_symmetry_diagnostic",
+            "no authenticated QE data-file-schema.xml"))
         lines.append(
-            "QE operation type: UNAVAILABLE; WFN-only fallback (wrong if "
-            "broken TR and QE used an antiunitary magnetic operation)")
+            f"QE schema      : NOT FOUND ({diagnostic})")
+        lines.append(
+            f"Stored QE type : unknown for all {n_sym} operations; WFN.h5 "
+            "omits each time_reversal bit")
     else:
-        active = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
-        n_typed_anti = int(np.count_nonzero(active >= n_sym))
+        qe_tr = np.asarray(getattr(
+            sym, "qe_operation_antiunitary", qe_binding.antiunitary),
+            dtype=bool).reshape(-1)
+        if qe_tr.shape != (n_sym,):
+            raise ValueError(
+                "symmetry_sampling_lines: QE operation typing has shape "
+                f"{qe_tr.shape}, expected ({n_sym},)")
+        schema_path = abs_path(qe_binding.schema_path)
+        schema_name = os.path.basename(schema_path)
+        n_qe_anti = int(np.count_nonzero(qe_tr))
         lines.append(
-            f"QE operation type: authenticated {qe_binding.schema_path} "
-            f"(sha256 {qe_binding.schema_sha256[:12]}; active "
-            f"antiunitary rows {n_typed_anti}/{active.size}; pure-TR flag "
-            f"{'enabled' if qe_binding.qe_permitted_pure_time_reversal else 'disabled'})")
+            f"QE schema      : FOUND {schema_name} at {schema_path}")
+        lines.append(
+            f"QE schema hash : SHA256 {qe_binding.schema_sha256[:12]}")
+        lines.append(
+            f"Stored QE type : {n_sym - n_qe_anti} unitary; {n_qe_anti} "
+            "composed with time reversal")
+    lines.append(
+        f"Active op rows : {n_active_unitary} unitary; {n_active_anti} "
+        "TR-composed")
+
+    inversion = np.all(
+        rotations == -np.eye(3, dtype=rotations.dtype), axis=(1, 2))
+    inversion_rows = np.flatnonzero(inversion)
+    if inversion_rows.size == 0:
+        lines.append("Inversion      : absent")
+    else:
+        descriptions = []
+        for row in inversion_rows:
+            qe_status = ("unknown" if qe_tr is None else
+                         "yes" if bool(qe_tr[row]) else "no")
+            descriptions.append(
+                f"S{int(row) + 1:02d} (QE-TR={qe_status}; "
+                f"used={_operation_usage(active_set, int(row), n_sym)})")
+        lines.append("Inversion      : present at " + ", ".join(descriptions))
 
     receipt = getattr(wfn, "trs_reference", None)
     if receipt is None:
@@ -359,10 +410,15 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             "from the retained legacy verdict")
 
     display_tau = clean_rounded(tau, digits=TAU_DIGITS)
+    lines.append("  op   QE time-reversal status       R^-1 and fractional translation")
     for i, (rotation, shift) in enumerate(
             zip(rotations, display_tau), start=1):
+        qe_status = ("unknown" if qe_tr is None else
+                     "yes" if bool(qe_tr[i - 1]) else "no")
+        usage = _operation_usage(active_set, i - 1, n_sym)
         lines.append(
-            f"  S{i:02d}  R^-1={_matrix_text(rotation)}  "
+            f"  S{i:02d}  QE-TR={qe_status:<7} active={usage:<10} "
+            f"R^-1={_matrix_text(rotation)}  "
             f"tau=({shift[0]: .{TAU_DIGITS}f} "
             f"{shift[1]: .{TAU_DIGITS}f} "
             f"{shift[2]: .{TAU_DIGITS}f})")

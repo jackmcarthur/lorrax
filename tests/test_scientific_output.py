@@ -78,7 +78,9 @@ def test_symmetry_receipt_fractional_ops_and_ibz_use_five_decimals():
     assert "tau=(" in text
     assert "Time reversal  : HOLDS (measured" in text
     assert "coverage=100.00%" in text
-    assert "TRS unfolding  : enabled from the retained legacy verdict" in text
+    assert "Global TRS     : enabled from the retained legacy verdict" in text
+    assert "QE schema      : NOT FOUND" in text
+    assert "S01  QE-TR=unknown active=unitary+TR" in text
     assert " 0.25000   0.25000   0.25000   0.75000" in text
     assert ".250000" not in text
     assert "-0.00000" not in text
@@ -126,3 +128,43 @@ def test_two_component_trs_receipt_is_not_applied_to_scalar_reference():
     text = "\n".join(symmetry_sampling_lines(wfn, sym))
     assert "DFT 2c TRS     : NOT APPLICABLE (nspin=1, nspinor=1)" in text
     assert "S01" in text       # the receipt must not truncate the operation list
+
+
+def test_qe_schema_path_inversion_and_operation_tr_status_are_explicit():
+    receipt = SimpleNamespace(
+        method="occupied-density-subspace", trs_holds=False,
+        conclusive=True, trs_basis="raw-pair", subspace_residual=2.0e-2,
+        trs_coverage=1.0, evidence_counts=(("raw-pair", 1),),
+    )
+    binding = SimpleNamespace(
+        schema_path="/work/qe/nscf/test.save/data-file-schema.xml",
+        schema_sha256="a" * 64,
+        antiunitary=np.array([True, False, True]),
+    )
+    wfn = SimpleNamespace(
+        trs_reference=receipt, density_symmetry=receipt,
+        kgrid=np.array([2, 2, 1]), shift=np.zeros(3),
+        kpoints=np.zeros((1, 3)), kweights=np.ones(1),
+    )
+    sym = SimpleNamespace(
+        Rinv_grid=np.array([
+            np.eye(3, dtype=int),
+            -np.eye(3, dtype=int),
+            [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
+        ]),
+        translations=np.zeros((3, 3)), trs_allowed=False,
+        nk_tot=4, nk_red=1, qe_symmetry_binding=binding,
+        qe_operation_antiunitary=binding.antiunitary,
+        active_symmetry_rows=np.array([3, 1, 5]),
+    )
+
+    text = "\n".join(symmetry_sampling_lines(wfn, sym))
+    assert ("QE schema      : FOUND data-file-schema.xml at "
+            "/work/qe/nscf/test.save/data-file-schema.xml") in text
+    assert "QE schema hash : SHA256 aaaaaaaaaaaa" in text
+    assert "Stored QE type : 1 unitary; 2 composed with time reversal" in text
+    assert "Active op rows : 1 unitary; 2 TR-composed" in text
+    assert "Inversion      : present at S02 (QE-TR=no; used=unitary)" in text
+    assert "S01  QE-TR=yes     active=TR" in text
+    assert "S02  QE-TR=no      active=unitary" in text
+    assert "S03  QE-TR=yes     active=TR" in text
