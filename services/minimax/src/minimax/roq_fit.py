@@ -147,6 +147,7 @@ class RoqPlan:
     rules: tuple[RoqRule, ...]
     branches: tuple[RoqBranchEvidence, ...]
     planning_seconds: float
+    planning_breakdown: tuple[tuple[str, float], ...] = ()
 
 
 def _candidates(group: RoqGroup, base_nodes: int):
@@ -677,6 +678,7 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
     for window in windows:
         by_branch.setdefault(window.branch, []).append(window)
 
+    partition_started = time.perf_counter()
     branch_data = {}
     initial_subsets = {}
     for branch, branch_windows_list in by_branch.items():
@@ -692,9 +694,14 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
         branch_data[branch] = (branch_windows, all_indices, strategy,
                                partition)
 
+    partition_seconds = time.perf_counter() - partition_started
+    fit_started = time.perf_counter()
     group_cache = _fit_product_groups(initial_subsets, eta)
+    fit_seconds = time.perf_counter() - fit_started
     selected_rules = []
     evidence_rows = []
+    consolidation_seconds = 0.0
+    fallback_seconds = 0.0
     for branch, data in branch_data.items():
         branch_windows, all_indices, strategy, partition = data
         candidates = []
@@ -709,7 +716,10 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
 
         if partition != (all_indices,):
             cap = (row.node_count - 1) if row is not None else _MAX_RANK
+            consolidation_started = time.perf_counter()
             whole = _try_whole_below(branch_windows, eta, cap)
+            consolidation_seconds += (
+                time.perf_counter() - consolidation_started)
             if whole is not None:
                 whole_group, whole_rule = whole
                 whole_row = _branch_evidence(
@@ -728,7 +738,9 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
                 for indices in partition
                 if (branch, indices) not in group_cache}
             if missing:
+                fallback_started = time.perf_counter()
                 group_cache.update(_fit_product_groups(missing, eta))
+                fallback_seconds += time.perf_counter() - fallback_started
             groups = [group_cache[(branch, indices)][0]
                       for indices in partition]
             rules = [group_cache[(branch, indices)][1]
@@ -746,5 +758,15 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
         selected_rules.extend(rules)
         evidence_rows.append(row)
 
-    return RoqPlan(tuple(selected_rules), tuple(evidence_rows),
-                   time.perf_counter() - started)
+    total = time.perf_counter() - started
+    measured = (partition_seconds + fit_seconds + consolidation_seconds
+                + fallback_seconds)
+    breakdown = (
+        ("partition", partition_seconds),
+        ("angle_and_rank_fits", fit_seconds),
+        ("whole_branch_challenge", consolidation_seconds),
+        ("per_window_fallback", fallback_seconds),
+        ("selection_and_scoring", max(0.0, total - measured)),
+    )
+    return RoqPlan(tuple(selected_rules), tuple(evidence_rows), total,
+                   breakdown)
