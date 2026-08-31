@@ -68,8 +68,18 @@ _ANGLE_SCAN_DEG = (-85.0, -80.0, -70.0, -58.0, 0.0)
 _ANGLE_PROBE_RANK = 12
 _ANGLE_BASE_NODES = 64
 _MIN_RANK = 6
-_MAX_RANK = 64
-_FINAL_BASE_NODES = 192
+#: Slope of the measured crossing cost law, n ~= 2.02*(A/gamma) at eps = 1e-4
+#: (claim 528).  It is what tells a support how much rank it can NEED.
+_COST_LAW_SLOPE = 2.02
+#: Headroom over that law, because the law is a fit at one tolerance and a
+#: window asking for a tighter one sits above it.
+_RANK_MARGIN = 1.5
+#: The candidate contour is over-resolved relative to the rank it must
+#: support; 3x is the ratio the node-capped path already used.
+_NODES_PER_RANK = 3
+#: Sanity bound, not a tuning dial: a support demanding more rank than this
+#: is pathological and should be refused rather than ground on.
+_RANK_HARD_CAP = 512
 
 # The ROQ study used horizons 260/85/27 Ry^-1 for the Na resonant/tail/valence
 # groups.  Five inverse low-percentile energy scales reproduces 249/83/31 on
@@ -264,7 +274,8 @@ def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
     a complete miss returns the best measured rule with ``target_met=False``.
     """
     ranks = sorted(set(int(rank) for rank in (
-        ranks if ranks is not None else range(_MIN_RANK, _MAX_RANK + 1))))
+        ranks if ranks is not None
+        else range(_MIN_RANK, _rank_ceiling(group) + 1))))
     if not ranks or ranks[0] < 1:
         raise ValueError("ranks must contain positive integers")
     base_nodes = int(base_nodes) or max(4 * max(ranks), 96)
@@ -503,11 +514,34 @@ def _product_group_seed(windows, eta: float):
     return seed, target, names
 
 
+def _rank_ceiling(group: "RoqGroup") -> int:
+    """The rank this support can actually need, from its own geometry.
+
+    A FIXED ceiling silently truncates any support wider than the one it was
+    tuned on.  At the former constant 64, a crossing window with A/gamma = 59
+    could not represent its own answer: the fit came back at residual 0.17
+    against a 3.3e-4 target instead of refusing, which is how a +-10 eV Sigma
+    request read as unservable when it was merely under-ranked.
+
+    A is the denominator RADIUS (max |Re d|) and gamma the support's own
+    width (min |Im d|), the same pair the cost law was measured against.
+    """
+    d = np.asarray(group.fit.denominators)
+    radius = float(np.max(np.abs(d.real)))
+    width = float(np.min(np.abs(d.imag)))
+    if not (np.isfinite(radius) and np.isfinite(width)) or width <= 0.0:
+        return _RANK_HARD_CAP
+    need = _RANK_MARGIN * _COST_LAW_SLOPE * radius / width
+    return int(np.clip(np.ceil(need), _MIN_RANK, _RANK_HARD_CAP))
+
+
 def _fit_production_rank(group: RoqGroup, target: float,
                          windows: tuple[str, ...],
                          angle_probe: RoqRule) -> RoqRule:
     """Bracket from the angle probe, test one midpoint, and fully refit."""
-    prepared = _prepare_subspace(group, _FINAL_BASE_NODES, _MAX_RANK)
+    ceiling = _rank_ceiling(group)
+    prepared = _prepare_subspace(
+        group, _NODES_PER_RANK * ceiling, ceiling)
     cache = {}
 
     def quick(rank: int) -> RoqRule:
@@ -522,21 +556,25 @@ def _fit_production_rank(group: RoqGroup, target: float,
     upper = _ANGLE_PROBE_RANK
     if not angle_probe.target_met or not quick(upper).target_met:
         lower = upper
-        for candidate in (18, 27, 40, 60, _MAX_RANK):
+        # Ladder scaled to this support's own ceiling, so a wide window is
+        # bracketed in the same number of probes as a narrow one.
+        ladder = sorted({int(round(ceiling * f))
+                         for f in (0.28, 0.42, 0.62, 0.94)} | {ceiling})
+        for candidate in [c for c in ladder if c > lower]:
             upper = candidate
             if quick(upper).target_met:
                 break
             lower = upper
         else:
             return _fit_prepared(
-                group, prepared, _MAX_RANK, target=target, windows=windows,
+                group, prepared, ceiling, target=target, windows=windows,
                 evaluations=len(cache))
     midpoint = (lower + upper) // 2
     if lower < midpoint < upper and quick(midpoint).target_met:
         upper = midpoint
 
     best = None
-    for rank in range(upper, min(_MAX_RANK, upper + 3) + 1):
+    for rank in range(upper, min(ceiling, upper + 3) + 1):
         final = _fit_prepared(
             group, prepared, rank, target=target, windows=windows,
             evaluations=len(cache))
@@ -612,8 +650,8 @@ def _try_whole_below(windows, eta: float, node_cap: int):
     group, _ = min(probes, key=lambda item: (
         item[1].max_error, item[1].kappa_p99,
         _ANGLE_SCAN_DEG.index(item[0].angle_deg)))
-    cap = max(_MIN_RANK, min(int(node_cap), _MAX_RANK))
-    base_nodes = max(_ANGLE_BASE_NODES, 3 * cap)
+    cap = max(_MIN_RANK, min(int(node_cap), _rank_ceiling(group)))
+    base_nodes = max(_ANGLE_BASE_NODES, _NODES_PER_RANK * cap)
     prepared = _prepare_subspace(group, base_nodes, cap)
     cap_rule = _fit_prepared(group, prepared, cap, target=target,
                              windows=names)
@@ -725,7 +763,8 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
             candidates.append((row, tuple(rules)))
 
         if partition != (all_indices,):
-            cap = (row.node_count - 1) if row is not None else _MAX_RANK
+            cap = ((row.node_count - 1) if row is not None
+                   else _rank_ceiling(group))
             consolidation_started = time.perf_counter()
             whole = _try_whole_below(branch_windows, eta, cap)
             consolidation_seconds += (
