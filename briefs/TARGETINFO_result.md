@@ -47,6 +47,9 @@ has no node cost to report here because it cannot satisfy the contract at any
 measured rank.  The closest stable attempt already costs **200 window–tau
 pairs** and exceeds the remaining global allowance by 99.57×.
 
+CPU gate: **134 passed, 8 warnings in 96.41 s** using the five prescribed
+test modules; collected count matches the base contract.
+
 Evidence: exact P=4 sodium census and supports at
 `/pscratch/sd/j/jackm/wt_kappa_2026-08-31/tmp/kappa_probe/` (JID 57789884,
 step 30, four ranks/four A100s, BFC@0.85, source
