@@ -555,6 +555,7 @@ def compute_sigma_c_mpa_omega_grid(
                 f"{geometry['n_windows']} logical windows, "
                 f"grid={geometry['tau_grid_mode']}, "
                 f"plan_cache={geometry['plan_cache_status']}, "
+                f"plan={geometry['plan_seconds']:.3f}s, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
                 f"{geometry['distinct_tau_count']} branch-distinct tau")
             for branch in geometry["branches"]:
