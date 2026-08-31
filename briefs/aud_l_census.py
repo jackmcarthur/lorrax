@@ -30,11 +30,11 @@ def _legacy_roots(w, x_hat, n, rcond, eig="lapack"):
             pade_fit._matrix_backward_error(L, sL, X))
 
 
-def _sample_indices(n_p: int) -> np.ndarray:
-    """Evenly retain n_p points from each line of the 12-pole grid."""
-    one_line = np.rint(np.linspace(0, 11, n_p)).astype(np.int64)
+def _sample_indices(n_p: int, source_n_p: int) -> np.ndarray:
+    """Evenly retain ``n_p`` points from each source-grid line."""
+    one_line = np.rint(np.linspace(0, source_n_p - 1, n_p)).astype(np.int64)
     assert len(np.unique(one_line)) == n_p
-    return np.concatenate((one_line, 12 + one_line))
+    return np.concatenate((one_line, source_n_p + one_line))
 
 
 def _fit_kernel(n_p: int, legacy: bool):
@@ -50,6 +50,7 @@ def main() -> None:
     parser.add_argument("sample_file")
     parser.add_argument("output_dir")
     parser.add_argument("--chunk", type=int, default=4096)
+    parser.add_argument("--counts", type=int, nargs="+", default=(8, 10, 12))
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -59,9 +60,13 @@ def main() -> None:
     with h5py.File(args.sample_file, "r") as h5:
         data = h5["Wc_qmunu_z"]
         z24 = np.asarray(h5["Wc_qmunu_z__mpa/omega"], np.complex128)
+        source_n_p = len(z24) // 2
         q_ids = np.arange(data.shape[1])[rank::size]
-        for n_p in (8, 10, 12):
-            pick = _sample_indices(n_p)
+        for n_p in args.counts:
+            if n_p > source_n_p:
+                raise ValueError(
+                    f"requested n_p={n_p} from an n_p={source_n_p} grid")
+            pick = _sample_indices(n_p, source_n_p)
             z = jnp.asarray(z24[pick])
             samples = np.asarray(data[pick][:, q_ids], np.complex128)
             samples = np.moveaxis(samples, 0, -1).reshape(-1, 2 * n_p)
@@ -96,10 +101,26 @@ def main() -> None:
                     "residue": residue,
                     "rel_rms": float(np.sqrt(np.mean(err ** 2)) / scale),
                     "max_rel": float(np.max(err) / scale),
+                    "error_sumsq": float(np.sum(err ** 2)),
+                    "n_values": int(err.size),
+                    "sample_abs_max": scale,
+                    "max_abs_error": float(np.max(err)),
+                    "error": err,
                     "seconds": elapsed,
                 }
             pade_fit._loewner_roots = current_roots
             old, new = arm_results["legacy"], arm_results["current"]
+            changed = old["n_valid"] != new["n_valid"]
+            if np.any(changed):
+                changed_samples = samples[changed]
+                changed_scale = float(np.max(np.abs(changed_samples)))
+                old_min_residue_ratio = (
+                    np.min(np.abs(old["residue"][changed]), axis=1)
+                    / np.maximum(np.max(np.abs(old["residue"][changed]), axis=1),
+                                 np.finfo(float).tiny))
+            else:
+                changed_scale = 0.0
+                old_min_residue_ratio = np.empty(0, dtype=np.float64)
             row = {
                 "rank": rank, "n_p": n_p, "n_elements": len(samples),
                 "legacy_cond_p50": float(np.median(old["cond"])),
@@ -112,6 +133,12 @@ def main() -> None:
                 "current_rel_rms": new["rel_rms"],
                 "legacy_max_rel": old["max_rel"],
                 "current_max_rel": new["max_rel"],
+                "legacy_error_sumsq": old["error_sumsq"],
+                "current_error_sumsq": new["error_sumsq"],
+                "n_values": new["n_values"],
+                "sample_abs_max": new["sample_abs_max"],
+                "legacy_max_abs_error": old["max_abs_error"],
+                "current_max_abs_error": new["max_abs_error"],
                 "legacy_seconds": old["seconds"],
                 "current_seconds": new["seconds"],
                 "bit_identical": bool(
@@ -120,7 +147,23 @@ def main() -> None:
                     and all(np.array_equal(old[k], new[k])
                             for k in ("cond", "backward", "n_valid"))),
                 "changed_valid_count": int(np.count_nonzero(
-                    old["n_valid"] != new["n_valid"])),
+                    changed)),
+                "changed_n_values": int(np.count_nonzero(changed) * 2 * n_p),
+                "changed_sample_abs_max": changed_scale,
+                "changed_legacy_error_sumsq": float(
+                    np.sum(old["error"][changed] ** 2)),
+                "changed_current_error_sumsq": float(
+                    np.sum(new["error"][changed] ** 2)),
+                "changed_legacy_max_abs_error": float(
+                    np.max(old["error"][changed]) if np.any(changed) else 0.0),
+                "changed_current_max_abs_error": float(
+                    np.max(new["error"][changed]) if np.any(changed) else 0.0),
+                "changed_legacy_min_residue_ratio_p50": float(
+                    np.median(old_min_residue_ratio)
+                    if old_min_residue_ratio.size else 0.0),
+                "changed_legacy_min_residue_ratio_max": float(
+                    np.max(old_min_residue_ratio)
+                    if old_min_residue_ratio.size else 0.0),
                 "tiny_residue_elements": int(np.count_nonzero(
                     np.max(np.abs(new["residue"]), axis=1) < 1.0e-10)),
                 "near_degenerate_elements": int(np.count_nonzero(
@@ -130,6 +173,22 @@ def main() -> None:
                                - new["omega"][:, None, :])), axis=(1, 2))
                     < 1.0e-8)),
             }
+            max_residue = np.max(np.abs(new["residue"]), axis=1)
+            pole_gap = np.min(np.where(
+                np.eye(n_p, dtype=bool)[None], np.inf,
+                np.abs(new["omega"][:, :, None]
+                       - new["omega"][:, None, :])), axis=(1, 2))
+            np.savez_compressed(
+                os.path.join(args.output_dir,
+                             f"census.rank{rank}.np{n_p}.npz"),
+                q_ids=q_ids,
+                legacy_cond=old["cond"],
+                current_cond=new["cond"],
+                legacy_n_valid=old["n_valid"],
+                current_n_valid=new["n_valid"],
+                current_max_residue=max_residue,
+                current_pole_gap=pole_gap,
+            )
             all_rows.append(row)
             print(json.dumps(row, sort_keys=True), flush=True)
 
