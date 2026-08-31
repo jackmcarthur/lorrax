@@ -2444,6 +2444,43 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
         inputs, enk_entry)
 
+    # ------------------------------------------------------------------
+    # RE-ANCHOR THE WINDOW ON THIS ITERATION'S FERMI LEVEL.
+    #
+    # The Sigma grid is built as mu +- the deck's half-width and the MPA
+    # branches measure every state energy from the SAME mu
+    # (``mpa.sigma._branches``: energy = enk - occupation_state.mu_ry, with
+    # a hard refusal if the two disagree).  The band partition -- which
+    # bands are trusted on that grid and which are handed to the scissor --
+    # therefore has to be rebuilt against the same pair, or it answers a
+    # question about a grid the run no longer has.
+    #
+    # It used to be built ONCE, before the loop, from the DFT spectrum and
+    # the DFT mu.  Measured on the signed +-5 eV sodium deck, mu moves
+    # +1.352 eV in ONE map (E_F(DFT) = +1.646762 -> E_F(F(H)) = +2.998851),
+    # which left 2 of 24 bands in range, put 10 protected bands OUTSIDE the
+    # grid, and gave the scissor fit zero qualifying samples so it returned
+    # the identity and those bands took no correction at all.
+    #
+    # On the first map the spectrum IS the DFT spectrum and mu IS the DFT
+    # mu, so this reproduces the frozen partition exactly; it only starts
+    # to differ once the spectrum has actually moved.
+    # ------------------------------------------------------------------
+    partition = inputs.partition
+    if entry_occ_state is not None:
+        _mu_ev = float(entry_occ_state.mu_ry) * RYD_TO_EV
+        # E_full is this map's active table on the full BZ -- the same rows
+        # and bands as inputs.e_dft_active_kn_ry, which is what the partition
+        # masks are applied to.
+        _e_active_now = np.asarray(E_full, dtype=np.float64)
+        partition = build_omega_band_partition(
+            _e_active_now, np.asarray(enk_entry, dtype=np.float64),
+            band_offset=int(inputs.band_slices.b0),
+            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
+            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
+            label=f"SC map {int(state.iteration)} (mu-anchored)",
+            print_fn=inputs.print_fn)
+
     # Resolve an external MPA seed before any occupation consumer runs.  The
     # provider remains the sole owner of path resolution; production then
     # replays and asserts the stored occupation provenance on this exact
@@ -2530,7 +2567,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             valence_fit = ks.select(valence_fit)
         e_dft_fit_ev = np.asarray(e_dft_fit, dtype=np.float64) * RYD_TO_EV
         fit_mask_kn = np.broadcast_to(
-            np.asarray(inputs.partition.in_range_mask, dtype=bool)[None, :],
+            np.asarray(partition.in_range_mask, dtype=bool)[None, :],
             e_dft_fit_ev.shape)
         # SAME three-way classification as the active-window scissor below.
         # It matters here too: the tail law that gets applied is the
@@ -2996,7 +3033,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # the fit is a reduction over k and must use the multiplicities of the
     # exact rows selected above.
     H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
-        H_qp_dft_full, e_dft_act, val_mask, inputs.partition, ks,
+        H_qp_dft_full, e_dft_act, val_mask, partition, ks,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
         n_occ=n_occ,
         candidate_efermi_fn=lambda H: _partitioned_candidate_efermi(

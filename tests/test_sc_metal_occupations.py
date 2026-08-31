@@ -20,8 +20,10 @@ def _inputs(material_class: str):
             screening=SimpleNamespace(occ_broadening_ev=0.0),
             occ_broadening_ry=0.01,
             occupation_clamp_tol=1.0e-12,
-            mpa=SimpleNamespace(material_class=material_class),
         ),
+        # The class is DERIVED from the WFN occupations and threaded on the
+        # inputs; it is no longer a deck key under config.mpa.
+        material_class=material_class,
         parallel_transport=None,
         wfn=SimpleNamespace(
             num_electrons=2.0,

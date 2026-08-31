@@ -556,6 +556,38 @@ def _solve_crossing_scaled_cached(A_key: float, target_key: float,
         _cache._payload_hash(tau, w), _cache.backend_tag())
 
 
+def _tolerance_key(error_bound: float) -> float:
+    """Round a tolerance for the cache key WITHOUT rounding it away.
+
+    ``round(x, 14)`` is the key rounding carried verbatim from the original
+    call sites, and it is kept so every stored entry still hits.  But a
+    tolerance is a positive number that may legitimately be far below 1e-14
+    once rescaled into ``[1, R]`` units (the Laplace bound asks the service
+    for ``eps_phys * x_min``), and rounding such a value to 14 decimals
+    yields exactly 0.0.
+
+    A zero tolerance is not a tight request, it is an UNSATISFIABLE one:
+    ``noncrossing_grids`` exits early on ``err < eps``, which no rule can
+    meet at eps=0, so it silently runs the entire N ladder to N_max and
+    returns the last rule -- measured at 18+ minutes on the sodium SC deck,
+    where it looked like a hang.
+
+    So: keep the decimal key where it is faithful, and fall back to a
+    significant-figure key only where it would underflow. Existing cache
+    entries are unaffected.
+    """
+    x = float(error_bound)
+    if not np.isfinite(x) or x <= 0.0:
+        raise ValueError(
+            f"minimax: tolerance must be finite and positive; got {x!r}. "
+            "A non-positive tolerance cannot be met by any rule and would "
+            "run the solver's full node ladder for nothing.")
+    key = round(x, 14)
+    if key <= 0.0:
+        key = float(f"{x:.12e}")
+    return key
+
+
 def solve_uncertified(*, family: str, target: str, range_value: float,
                       error_bound: float, n_max: int,
                       eps_q: float | None = None,
@@ -569,7 +601,7 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
     if family == "noncrossing":
         tau, w, err, prov = _solve_noncrossing_scaled_cached(
             round(float(np.log(float(range_value))), 12),
-            round(float(error_bound), 14), int(n_max))
+            _tolerance_key(error_bound), int(n_max))
     elif family == "noncrossing_imag":
         if omega_hat is None:
             raise UnknownTarget(
@@ -577,10 +609,10 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
         tau, w, err, prov = _solve_noncrossing_imag_scaled_cached(
             round(float(np.log(float(range_value))), 12),
             round(float(omega_hat), 12),
-            round(float(error_bound), 14), int(n_max))
+            _tolerance_key(error_bound), int(n_max))
     elif family == "crossing":
         tau, w, err, prov = _solve_crossing_scaled_cached(
-            round(float(range_value), 12), round(float(error_bound), 14),
+            round(float(range_value), 12), _tolerance_key(error_bound),
             int(n_max),
             round(float(eps_q if eps_q is not None else 1.0e-3), 12),
             str(target_kind))
