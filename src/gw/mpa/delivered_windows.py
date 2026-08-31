@@ -52,6 +52,14 @@ ENVELOPE_ERROR_SAFETY = 0.8
 FACTOR_GROWTH_CAP = 30.0
 RUNTIME_NOISE_EPSILON = 6.0e-8
 AMPLIFICATION_NOISE_SAFETY = 0.05
+#: Overshoot the tightening slightly, because a re-fit at a given allowance
+#: lands somewhere at or under it rather than exactly on it.
+TIGHTEN_MARGIN = 0.9
+#: A single tightening pass never asks for more than this factor at once.  The
+#: guaranteed-feasible allowance is the budget split N ways, so no honest deck
+#: needs a bigger step than that; anything demanding one is refusing for a
+#: reason tightening will not fix, and should say so rather than grind.
+TIGHTEN_FLOOR = 0.05
 # Default pair budget for the shipped 0..5 eV demonstration grid; the deck's
 # max_nodes OWNS the budget (a 4x-wider omega request physically needs more
 # crossing nodes — growth is linear in crossing bandwidth). 200 remains the
@@ -89,6 +97,20 @@ class _ProductWindowRefusal(RuntimeError):
         super().__init__(message)
         self.residual = residual
         self.amplification_p99 = amplification_p99
+
+
+class _BudgetShortfall(RuntimeError):
+    """Rules exist and fit under the node ceiling, but their costs overshoot.
+
+    Distinct from a refusal: nothing is unservable here, the plan is merely
+    priced above the global delivered-error budget.  Carries the numbers the
+    planner needs to tighten by exactly the amount it is short.
+    """
+
+    def __init__(self, message, best_cost, budget):
+        super().__init__(message)
+        self.best_cost = float(best_cost)
+        self.budget = float(budget)
 
 
 def _planner_work_indices(count, rank=None, world=None):
@@ -257,6 +279,12 @@ def _emit_window_census(specs, eta, apportioned_targets, *,
             "cell_count": int(spec["problem"].internal_sums.size),
             "crossing_radius_ry": radius,
             "delivered_mass_share": float(spec["envelope"]) / total_mass,
+            # The SHARE is normalised, so it moves when ANY window's mass
+            # moves.  Comparing two SC maps needs the absolute envelope
+            # and the total beside it, or a window that never changed
+            # reads as having gained mass.
+            "delivered_envelope": float(spec["envelope"]),
+            "delivered_envelope_total": float(total_mass),
             "gamma_min_ry": gamma_min,
             "kind": spec["kind"],
             "name": spec["name"],
@@ -1937,11 +1965,16 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
         if best is not None:
             detail = (f"best cost={best[1][0]:.6g}, "
                       f"budget={float(total_absolute_budget):.6g}")
-        raise RuntimeError(
+        message = (
             f"delivered product window {blocking[0]['name']!r} refused: "
             f"achieved (residual={metrics[0]:.6g}, "
             f"amplification_p99={metrics[1]:.6g}); {detail}, "
             f"pair ceiling={int(pair_ceiling)}")
+        if best is None:
+            # Nothing fits under the node ceiling; tightening cannot help.
+            raise RuntimeError(message)
+        raise _BudgetShortfall(
+            message, best[1][0], float(total_absolute_budget))
     nodes, required_cost, choices = min(feasible, key=lambda row: (row[0], row[1]))
     selected = [candidates[index]
                 for candidates, index in zip(candidates_by_window, choices)]
@@ -2242,10 +2275,60 @@ def build_delivered_sigma_windows(
         _raise_first_planner_refusal(window_fit_rows)
         fits = None
         consolidation_cache = None
-        for adapted_only in (True, False):
+        shortfall = None
+        # Three stages, each entered only when the previous cannot close the
+        # global budget.  Stage 1 offers the adapted rules alone (this is what
+        # every passing deck uses, and it pays for exactly one fit round).
+        # Stage 2 adds the shipped rules so the selector can buy accuracy.
+        # Stage 3 re-fits at a TIGHTENED allowance, which is the only stage
+        # that can lower a cost the first two merely re-shuffle.
+        tighten_scale = 1.0
+        for stage in ("adapted", "shipped",
+                      "tightened", "tightened", "tightened"):
+            adapted_only = stage == "adapted"
             specs = base_specs
-            if adapted_only:
+            if stage == "adapted":
                 candidates_by_window = base_candidates
+            elif stage == "tightened":
+                # Every window's allowance is the WHOLE plan budget divided by
+                # its own envelope, so N windows can each satisfy their own
+                # allowance and still sum to N times the budget.  The fits are
+                # normally far inside it and the sum fits; when delivered mass
+                # moves between windows (an SC map after the spectrum shifts)
+                # it does not.  Tighten every allowance by exactly the factor
+                # the plan came up short, with a margin, and re-fit: the extra
+                # accuracy is bought with nodes instead of a refusal.
+                deficit = shortfall.budget / shortfall.best_cost
+                step = max(min(deficit * TIGHTEN_MARGIN, 1.0), TIGHTEN_FLOOR)
+                # Compounding, because one round only buys back the shortfall
+                # it could see: tightening the rules changes which window
+                # blocks next (measured on the signed deck: 2.02x over budget
+                # blocked by a crossing merge, then 1.34x blocked by a
+                # sign-definite tail).
+                tighten_scale *= step
+                tightened = [min(0.5, allowance * tighten_scale)
+                             for allowance in allowances]
+
+                def fit_tight(index):
+                    # NOT adapted_only.  A sign-definite window is served by a
+                    # certified table indexed BY its target, so it re-fits
+                    # tighter only if the shipped path is asked again at the
+                    # tightened allowance; asking the adapted path alone
+                    # leaves exactly those windows at their loose rules.
+                    return _window_candidates_profiled(
+                        base_specs[index], eta, pair_ceiling, factor_cap,
+                        tightened[index], adapted_only=False)
+
+                fit_started = time.perf_counter()
+                tight_candidates, tight_rows = _run_parallel_planner_jobs(
+                    len(base_specs), fit_tight, refuse_errors=True)
+                window_parallel_seconds += time.perf_counter() - fit_started
+                window_fit_rows.extend(tight_rows)
+                # Keep the looser rules too: they may still be the cheapest
+                # choice for a window the shortfall did not come from.
+                candidates_by_window = [
+                    list(tight) + list(base)
+                    for tight, base in zip(tight_candidates, base_candidates)]
             else:
                 def fit_retry(index):
                     existing = base_candidates[index]
@@ -2277,10 +2360,18 @@ def build_delivered_sigma_windows(
             unconsolidated_specs = specs
             unconsolidated_candidates = candidates_by_window
             consolidation_started = time.perf_counter()
-            (specs, candidates_by_window, trial_rows,
-             consolidation_cache) = _consolidate_branches(
-                specs, candidates_by_window, eta, pair_ceiling, factor_cap,
-                total_absolute, consolidation_cache)
+            # The tightened stage deliberately does NOT consolidate.  Merging
+            # is chosen against the LOOSE candidate set, so re-running it over
+            # tightened rules picks a different merge and can price the plan
+            # higher than the split one it replaced (measured: 5.65e9 split,
+            # 6.58e9 after a tightened re-merge).  Tightening and merging are
+            # separate optimisations; letting them interact loses both.
+            trial_rows = []
+            if stage != "tightened":
+                (specs, candidates_by_window, trial_rows,
+                 consolidation_cache) = _consolidate_branches(
+                    specs, candidates_by_window, eta, pair_ceiling, factor_cap,
+                    total_absolute, consolidation_cache)
             consolidation_seconds += (
                 time.perf_counter() - consolidation_started)
             consolidation_rows.extend(trial_rows)
@@ -2290,8 +2381,10 @@ def build_delivered_sigma_windows(
                     specs, candidates_by_window, total_absolute, pair_ceiling)
                 selection_seconds += time.perf_counter() - selection_started
                 break
-            except RuntimeError:
+            except RuntimeError as exc:
                 selection_seconds += time.perf_counter() - selection_started
+                if isinstance(exc, _BudgetShortfall):
+                    shortfall = exc
                 # Merging leaves the selector ONE rule for that branch, so a
                 # merge that is cheaper per node can still make the plan
                 # unaffordable with no alternative to fall back on (measured:
@@ -2312,8 +2405,10 @@ def build_delivered_sigma_windows(
                     except RuntimeError:
                         selection_seconds += (
                             time.perf_counter() - selection_started)
-                if not adapted_only:
-                    raise      # the shipped rules could not close it either
+                if stage == "shipped" and shortfall is None:
+                    raise      # ceiling-limited: tightening cannot help
+                if stage == "tightened":
+                    raise      # a tightened re-fit could not close it either
         del base_specs
 
         window_tau_pairs = free_pairs
