@@ -487,5 +487,46 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
     assert len(candidates[0]["attempts"]) == 2
 
 
+def test_lookup_walk_keeps_tighter_accepted_rules_for_global_budget(
+        monkeypatch):
+    """The global selector must see all accepted shipped table choices."""
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([-1.0 - 0.1j]),
+        cell_masses=np.asarray([1.0]))
+    denominator = complex(problem.denominators[0, 0])
+
+    def table_walk(*_args, **_kwargs):
+        for time, tolerance in ((1.0, 1.0e-6), (1.1, 2.0e-7)):
+            times = np.asarray([time * 1.0j])
+            weights = np.asarray([
+                np.exp(time * denominator) / denominator])
+            yield times, weights, {
+                "family": "noncrossing",
+                "candidate_tolerance": tolerance,
+                "provenance": f"accepted table {tolerance:g}",
+            }
+
+    monkeypatch.setattr(
+        delivered, "_sign_definite_table_candidates", table_walk)
+    monkeypatch.setattr(delivered, "_factor_growth", lambda *_args: (0.0, 0.0))
+    spec = {
+        "name": "global-choice probe",
+        "kind": "sign_definite_positive",
+        "problem": problem,
+        "validation": problem,
+        "pole_sign": 1.0,
+        "envelope": 1.0,
+    }
+
+    candidates = delivered._candidate_rules(
+        spec, eta=0.1, max_nodes=8, factor_growth_cap=30.0,
+        relative_target=1.0e-5)
+
+    assert len(candidates) == 2
+    assert [row["evidence"]["candidate_tolerance"]
+            for row in candidates] == [1.0e-6, 2.0e-7]
+
+
 def test_tolerance_ladder_is_deleted():
     assert not hasattr(delivered, "_FIT_TOLERANCE_LADDER")

@@ -1041,6 +1041,18 @@ def _catalog_walk(family, range_value, scaled_target, max_nodes, *,
         entry.range_max, -entry.error_bound, entry.node_count))
 
 
+def _smallest_range_error_ladder(entries):
+    """Keep the catalog's smallest covering range at each error level."""
+    smallest = {}
+    for entry in entries:
+        previous = smallest.get(entry.error_bound)
+        if previous is None or (entry.range_max, entry.node_count) < (
+                previous.range_max, previous.node_count):
+            smallest[entry.error_bound] = entry
+    return sorted(smallest.values(), key=lambda entry: (
+        -entry.error_bound, entry.range_max, entry.node_count))
+
+
 def _load_catalog_entry(entry, *, family, target, eps_q=None):
     """Load one exact catalog entry through the minimax service door."""
     keywords = {} if eps_q is None else {"eps_q": float(eps_q)}
@@ -1077,8 +1089,8 @@ def _sign_definite_table_candidates(problem, relative_target, max_nodes):
     range_value = x_max / x_min
     absolute_target = _absolute_kernel_target(problem, relative_target)
     scaled_target = absolute_target * x_min
-    entries = _catalog_walk(
-        "noncrossing", range_value, scaled_target, max_nodes)
+    entries = _smallest_range_error_ladder(_catalog_walk(
+        "noncrossing", range_value, scaled_target, max_nodes))
     if not entries:
         raise RuntimeError(
             "no shipped noncrossing table covers "
@@ -1196,8 +1208,8 @@ def _crossing_table_candidates(problem, pole_sign, relative_target,
         problem, pole_sign)
     absolute_target = _absolute_kernel_target(problem, relative_target)
     scaled_target = absolute_target * gamma_min
-    entries = _catalog_walk(
-        "crossing_causal", A_dim, np.inf, max_nodes)
+    entries = _smallest_range_error_ladder(_catalog_walk(
+        "crossing_causal", A_dim, np.inf, max_nodes))
     entries = [
         entry for entry in entries
         if float(entry.raw.get("width_ratio_max", 0.0))
@@ -1369,69 +1381,88 @@ def _factor_growth(spec, times, eta):
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                      relative_target):
-    """Return the first lookup-first rule passing the measured window gates."""
+    """Return every shipped rule passing the measured window gates.
+
+    The complete-plan selector needs the tighter accepted lookup choices to
+    meet its global delivered-error budget.  Crossing optimization remains a
+    last resort: it runs only when no covered causal table passes locally.
+    """
     best_pair = (np.inf, np.inf)
     attempts = []
     if spec["kind"] == "crossing":
-        def rules():
-            yield from _crossing_table_candidates(
-                spec["problem"], spec["pole_sign"], relative_target,
-                max_nodes)
-            # At most one optimized fit exists: it is made only after every
-            # matching shipped HGL table has missed the measured gates.
+        table_rows = _crossing_table_candidates(
+            spec["problem"], spec["pole_sign"], relative_target,
+            max_nodes)
+    else:
+        table_rows = _sign_definite_table_candidates(
+            spec["problem"], relative_target, max_nodes)
+
+    def accepted_rows(rule_rows):
+        nonlocal best_pair
+        accepted = []
+        iterator = iter(rule_rows)
+        while True:
+            try:
+                times, weights, evidence = next(iterator)
+            except StopIteration:
+                break
+            except (FloatingPointError, OverflowError, RuntimeError,
+                    ValueError, np.linalg.LinAlgError) as exc:
+                raise RuntimeError(
+                    f"delivered product window {spec['name']!r} refused: "
+                    f"{exc}") from exc
+            try:
+                candidate = _rule_candidate(
+                    spec["problem"], spec["validation"],
+                    times, weights, evidence)
+                refined = candidate["metrics"]
+                factor = _factor_growth(spec, times, eta)
+                best_pair = min(best_pair, (refined[0], refined[1]))
+                attempts.append({
+                    "family": evidence["family"],
+                    "candidate_tolerance": evidence["candidate_tolerance"],
+                    "node_count": int(times.size),
+                    "refined_residual": refined[0],
+                    "amplification_p99": refined[1],
+                    "amplification_max": refined[2],
+                    "factor_log_growth_max": max(factor),
+                })
+                if (not _rule_accepted(refined, relative_target)
+                        or max(factor) > float(factor_growth_cap)):
+                    continue
+                required_target = max(
+                    refined[0],
+                    refined[1] * RUNTIME_NOISE_EPSILON
+                    / AMPLIFICATION_NOISE_SAFETY)
+                candidate.update(
+                    required_target=float(required_target),
+                    absolute_cost=float(spec["envelope"] * required_target),
+                    factor_growth=factor,
+                    attempts=attempts.copy())
+                accepted.append(candidate)
+            except (FloatingPointError, OverflowError, RuntimeError,
+                    ValueError, np.linalg.LinAlgError) as exc:
+                attempts.append({
+                    "family": evidence.get("family", "unknown"),
+                    "candidate_tolerance": evidence.get(
+                        "candidate_tolerance"),
+                    "refusal": str(exc)})
+        return accepted
+
+    candidates = accepted_rows(table_rows)
+    if candidates:
+        return candidates
+    if spec["kind"] == "crossing":
+        # At most one optimized fit exists, and a covered accepted table
+        # always wins over it.
+        def fallback_row():
             yield _fit_crossing_once(
                 spec["problem"], spec["pole_sign"], relative_target,
                 max_nodes)
-        rule_rows = rules()
-    else:
-        rule_rows = _sign_definite_table_candidates(
-            spec["problem"], relative_target, max_nodes)
-    iterator = iter(rule_rows)
-    while True:
-        try:
-            times, weights, evidence = next(iterator)
-        except StopIteration:
-            break
-        except (FloatingPointError, OverflowError, RuntimeError, ValueError,
-                np.linalg.LinAlgError) as exc:
-            raise RuntimeError(
-                f"delivered product window {spec['name']!r} refused: "
-                f"{exc}") from exc
-        try:
-            candidate = _rule_candidate(
-                spec["problem"], spec["validation"],
-                times, weights, evidence)
-            refined = candidate["metrics"]
-            factor = _factor_growth(spec, times, eta)
-            best_pair = min(best_pair, (refined[0], refined[1]))
-            attempts.append({
-                "family": evidence["family"],
-                "candidate_tolerance": evidence["candidate_tolerance"],
-                "node_count": int(times.size),
-                "refined_residual": refined[0],
-                "amplification_p99": refined[1],
-                "amplification_max": refined[2],
-                "factor_log_growth_max": max(factor),
-            })
-            if (not _rule_accepted(refined, relative_target)
-                    or max(factor) > float(factor_growth_cap)):
-                continue
-            required_target = max(
-                refined[0],
-                refined[1] * RUNTIME_NOISE_EPSILON
-                / AMPLIFICATION_NOISE_SAFETY)
-            candidate.update(
-                required_target=float(required_target),
-                absolute_cost=float(spec["envelope"] * required_target),
-                factor_growth=factor,
-                attempts=attempts.copy())
-            return [candidate]
-        except (FloatingPointError, OverflowError, RuntimeError, ValueError,
-                np.linalg.LinAlgError) as exc:
-            attempts.append({
-                "family": evidence.get("family", "unknown"),
-                "candidate_tolerance": evidence.get("candidate_tolerance"),
-                "refusal": str(exc)})
+
+        candidates = accepted_rows(fallback_row())
+        if candidates:
+            return candidates
     residual, amplification = best_pair
     raise RuntimeError(
         f"delivered product window {spec['name']!r} refused: achieved "
