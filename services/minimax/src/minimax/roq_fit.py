@@ -1,29 +1,31 @@
-"""Measure-weighted reduced-order quadrature (ROQ) node discovery.
+"""Deterministic reduced-order quadrature on a delivered measure.
 
-A deterministic alternative to the candidate-tolerance ladder: node
-discovery by linear algebra on the actual delivered measure.
+The production entry point is :func:`plan_measure_adapted_roq`. It accepts
+Cartesian product windows with fit and refined-validation measures plus the
+physical broadening ``eta``. Contour angles, horizons, ranks, and the bounded
+CPU work pool are internal policy, not caller dials.
 
 For one causal support group with half-plane sign ``sigma`` and contour
-``c = exp(i*angle)``, the exact representation
+``c = exp(i*angle)``, use
 
     1/d = -i*sigma*c * integral_0^inf exp(i*sigma*c*u*d) du
 
-is overresolved with Gauss-Legendre nodes ``u_l`` on ``[0, horizon]``.
+and overresolve it with Gauss-Legendre nodes ``u_l`` on ``[0, horizon]``.
 The snapshot family ``exp(i*sigma*c*u_l*d)`` on the group's fit cells,
 weighted by delivered mass and per-frequency normalization, is reduced by
 SVD; QDEIM (pivoted QR on the right singular basis) selects physical time
 columns; universal complex weights come from the production IRLS solver;
-scoring uses only the production delivered metrics.  Unlike a uniform
-Hankel lift, the measure's mass anisotropy is inside the inner product,
-so node selection sees it (measured on Na: branch error <= 1e-5 with 69
-nodes for cond 39+18 / val 12 at angles 0/-65/-58 deg, vs 137 production
-window-tau pairs; provenance: sandbox claim 512 lineage, ROQ study).
+scoring uses only the delivered residual and amplification on the refined
+measure. Unlike a uniform Hankel lift, the measure's mass anisotropy is inside
+the inner product, so node selection sees it.
 
 The snapshot reduction accumulates the candidate Gram per frequency; its
 squared conditioning only blurs the candidate subspace, never the final
 answer — the refit and all reported errors are computed downstream on the
-exact cells.  Everything here is deterministic: rerunning a fit
-reproduces times and weights bit-for-bit.
+exact cells. The planner groups only complete product windows. It may try a
+whole-branch consolidation and may fall back to individual product windows;
+it has no explicit state--pole evaluator. Everything here is deterministic:
+rerunning a fit reproduces times and weights bit-for-bit.
 """
 
 from __future__ import annotations
@@ -655,7 +657,7 @@ def _branch_evidence(branch: str, strategy: str, windows, groups,
 
 
 def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
-    """Build the smallest validated product-window ROQ plan.
+    """Build a validated product-window ROQ plan.
 
     Parameters
     ----------
@@ -669,10 +671,12 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
     Returns
     -------
     RoqPlan
-        Rules and achieved refined-lattice evidence.  Whole-branch rules are
-        tried first.  A decay-compatible product-window partition and then
-        individual product windows are fallbacks; no explicit ``(n,p)`` pair
-        evaluator exists.  If none passes, this function refuses.
+        Rules and achieved refined-lattice evidence. Windows sharing a
+        decaying contour are fitted together first. A whole-branch rule is
+        then challenged only when it can use fewer nodes; individual product
+        windows are the terminal fallback. No explicit ``(n,p)`` pair
+        evaluator exists. If no product-window plan passes, this function
+        refuses.
     """
     started = time.perf_counter()
     windows = tuple(windows)

@@ -557,8 +557,8 @@ def build_mpa_fit(
     if wc_source is not None and material_class == "metal":
         raise ValueError(
             "GATE w_bse_insulators_only: an alternate ladder wc_source "
-            "requires mpa_material_class = insulator; keep the default "
-            "RPA source for a metal.")
+            "requires integer WFN occupations; keep the default RPA source "
+            "for an inferred metal.")
     from common.collectives import barrier, process_rank
 
     root = os.path.abspath(os.fspath(run_dir))

@@ -69,13 +69,16 @@ WHO CALLS WHAT
     That 2×2's dispatch, with F6 for the empty cell.
 ``Quadrature`` / ``Provenance``
     What comes back.  ``Provenance.one_line()`` is what the driver logs.
+``RoqWindow`` / ``plan_measure_adapted_roq``
+    Deterministic delivered-measure ROQ. These names are lazy because they
+    need scipy; product geometry and physical budgets remain with the caller.
 ``G_hgl``, ``noncrossing_grids``, ``crossing_grids``, …
     The OFFLINE solvers, on the door but imported LAZILY (PEP 562): they
     are the only thing here that needs scipy, and a production lookup must
     not pay for it.  A generator campaign touches these; a run does not.
 
-Dependencies: numpy.  ``import minimax`` touches no jax, no scipy and no
-lorrax — measured, not asserted, in
+Base dependency: numpy. ``import minimax`` touches no jax, no scipy and no
+lorrax; accessing a lazy fitting or solver name then imports scipy. Measured in
 ``services/minimax/tests/test_minimax_import_isolation.py``.
 """
 

@@ -812,7 +812,7 @@ def _slab_to_host(a):
 
 	The star-spread statistic is measured on ONE omega slice (the caller
 	slices before calling, so the transfer is the slice, not the cube).  On
-	the ``sigma_omega_layout = sharded`` path at P > 1 that slice is still a
+	the band-sharded path at P > 1 that slice is still a
 	GLOBALLY sharded ``jax.Array`` whose devices are not all addressable
 	from this process, and a bare ``np.asarray`` on it raises
 	"Fetching value for `jax.Array` that spans non-addressable ... devices"

@@ -184,7 +184,7 @@ FAMILIES: Mapping[str, FamilySpec] = MappingProxyType({
         range_param="R",
         catalog="catalog.json",
         # MEASURED, and it is R1's structural hole: `catalog.json` carries
-        # 31 entries in two families, `{'crossing': 5, 'noncrossing': 26}`.
+        # 34 entries in two families, `{'crossing': 6, 'noncrossing': 28}`.
         # There is no `noncrossing_imag` family at all, which is why
         # `build_imag_quadrature` -- on the path of EVERY GN-PPM run -- is a
         # 100% runtime-solve path with no table behind it.

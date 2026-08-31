@@ -215,7 +215,7 @@ def _band_count_point(cube, i: int):
     """``cube[i]`` with the TRAILING (ω, k, m, n) sharding preserved.
 
     The Σ cube's leading axis is the band count and is replicated, so
-    dropping it is shard-local — but ``sigma_omega_layout=sharded``'s whole
+    dropping it is shard-local — but the band-sharded cube's whole
     contract is that consumers read the layout off the array itself
     (``qsgw_utils.is_band_sharded_sigma_omega``), and a bare ``cube[i]``
     leaves that to XLA's propagation through a slice+reshape.  Restate it.
@@ -268,7 +268,7 @@ def _extrapolated_point(cube, weights):
 
     Sharding is restated on the way out for the same reason
     :func:`_band_count_point` restates it: the leading axis is dropped, and
-    ``sigma_omega_layout=sharded``'s contract is that consumers read the
+    the band-sharded cube's contract is that consumers read the
     layout off the array rather than trusting XLA to propagate it through a
     reduction.
     """

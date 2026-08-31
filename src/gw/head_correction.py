@@ -2275,7 +2275,7 @@ def compute_ppm_head_sigma_diag(
     The q→0 head enters only the band diagonal (``M_{nm}(k, q→0, G=0) =
     δ_{nm}``), so this is the complete information content of the dense
     ``(nω, nk, nb, nb)`` tensor at nb× less memory — the representation the
-    sharded-Σ layout (``sigma_omega_layout=sharded``) injects rank-locally
+    band-sharded Σ representation injects rank-locally
     instead of materializing the dense cube on every rank.  The dense
     builder above embeds exactly this array, so the two representations are
     bit-identical by construction (single source of truth).

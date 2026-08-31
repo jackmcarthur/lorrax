@@ -429,9 +429,9 @@ class SCState:
     fixed-N μ, family, width, hash) plus its derived tetrahedron
     Fermi-surface table: iteration i's first-half consumers read the values
     produced only at the END of iteration i-1.  They are deliberately not
-    installed in the wavefunction bundle: under mpa_material_class = metal
+    installed in the wavefunction bundle: for an occupation-inferred metal
     the state is threaded explicitly into screening (build_mpa_fit) and
-    Sigma (compute_sigma_xc); insulating decks pass None and keep the
+    Sigma (compute_sigma_xc); insulating inputs pass None and keep the
     historical occupations bit-exactly.
 
     ``outputs`` (an ``SCOutputs`` record) is purely for the final output
@@ -1869,7 +1869,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
         width_ev = float(inputs.config.screening.occ_broadening_ev)
         if width_ev <= 0.0:
             raise ValueError(
-                "mpa_material_class = metal requires screening occ_broadening "
+                "metallic WFN occupations require screening occ_broadening "
                 "> 0 to solve fixed-N MP1 occupations for the density; got "
                 f"{width_ev!r} eV.")
         occ_state = OccupationState.solve_mp1(
@@ -2830,7 +2830,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 nk_tot=int(inputs.meta.nk_tot),
             )
 
-    # Under mpa_material_class = metal the finite-q body above went through
+    # For an occupation-inferred metal the finite-q body above went through
     # build_mpa_fit(occupation_state=...) — fractional contour lines and the
     # divided-difference origin rows.  Insulating decks keep the historical
     # valence/conduction cut (occupation_state=None).
@@ -3949,10 +3949,8 @@ def _run_rcrop(
         # ``state.H_qp_dft`` and nothing else, so the previous result was
         # passed in and held in this cell for the whole call for no
         # reader.  Its ``sigma_c_omega_kij_ry`` is the largest object on
-        # the SC path and, at the default ``sigma_omega_layout =
-        # "replicated"``, does not shrink with P: 2751 MB/rank at nb=512
-        # (``gw_config.py``), so holding two generations was a
-        # P-independent doubling of the peak.  Only the LAST one has a
+        # the SC path.  Holding two generations still doubles that large
+        # live allocation.  Only the LAST one has a
         # consumer -- ``dump_sigma_omega_h5_final`` -- and it survives:
         # this cell is refilled below and the loop exits with it.
         _last_outputs[0] = None

@@ -1,15 +1,19 @@
 # Minimax quadrature for static and plasmon-pole GW
 
-This chapter describes the scalar quadratures used by static screening and the
-GN/HL plasmon-pole self-energy. The current MPA body uses fitted complex poles,
-a positive causal crossing rule, and complex-sector rules instead; see
-[Multipole frequency integration](THEORY_mpa_implementation.md).
+This chapter describes the scalar quadratures used by static screening and
+frequency-dependent self-energy. The MPA pane planner uses fitted complex
+poles with positive crossing and complex-sector rules. The opt-in delivered
+planner instead measures Cartesian product windows, serves sign-definite
+windows from shipped tables, and uses deterministic measure-adapted ROQ for
+crossing windows. See [Multipole frequency integration](THEORY_mpa_implementation.md)
+and [the Sigma quadrature problem](sigma-quadrature-problem.md).
 
 The physics owner supplies an energy interval and a target function. The
 `minimax` service supplies immutable nodes, weights, achieved error,
-amplification, and provenance. Production lookup does not silently solve a
-new table; a missing certified asset refuses unless the explicit uncertified
-escape hatch is enabled.
+amplification, and provenance. `lookup` never solves. `serve` uses the same
+catalog selection and, while the stage-1 escape hatch remains enabled, may
+announce and run an uncertified solve on a miss; disabling that hatch makes the
+same miss refuse.
 
 ## 1. Why reciprocal kernels are separated
 
@@ -139,10 +143,12 @@ node cap, content hash, generator provenance, achieved error, and
 amplification. The range is rounded only in the conservative direction:
 a served table must cover the complete requested interval.
 
-Runtime nonlinear fitting is intentionally not the default. The historical
-VarPro/Lawson solvers can converge to different local supports on different
-numerical stacks even when their residuals are similar. Certified artifacts
-make the mathematical object reproducible.
+Runtime nonlinear node fitting is intentionally not the default. The
+historical VarPro/Lawson solvers can converge to different local supports on
+different numerical stacks even when their residuals are similar. Certified
+artifacts make the mathematical object reproducible. The delivered crossing
+ROQ is distinct: SVD/QDEIM selects nodes deterministically from the measured
+support, and only the fixed-node weights use the bounded IRLS solve.
 
 ## 5. Execution form
 
@@ -168,17 +174,18 @@ when two windows reuse the same scalar node set.
 ## 6. Ownership and tuning
 
 `services/minimax` owns target definitions, catalog lookup, provenance,
-certification, and offline solvers. `gw.minimax_screening` owns physical
-intervals, energy references, and rescaling. `gw.ppm_sigma` owns PPM causal
-branches and window selectors. The shared Green-function and convolution
-kernels own no quadrature policy.
+certification, and the physics-free ROQ/fitting algorithms.
+`gw.minimax_screening` owns screening intervals, references, and rescaling.
+`gw.mpa.delivered_windows` owns the measured Sigma products, global budget,
+derived node ceiling, retry, and refusal. The shared Green-function and
+convolution kernels own no quadrature policy.
 
-Exact tolerances and node caps are documented in the
-[input reference](../input_reference.md). When a wider band interval exceeds
-a shipped table, generate and certify a wider asset or refuse; do not clip the
+The user-facing accuracy and broadening controls are documented in the
+[input reference](../input_reference.md). The delivered planner derives its
+resource ceiling from the measured support. When a wider interval exceeds the
+shipped family, use a covered product decomposition or refuse; do not clip the
 interval. When a denominator approaches zero, route it to the crossing family
-or change the declared physical regularization; do not lower-bound it
-silently.
+or change the declared physical regularization; do not lower-bound it silently.
 
 ## References
 

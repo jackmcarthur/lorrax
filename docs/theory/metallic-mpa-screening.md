@@ -651,9 +651,9 @@ fix is geometric, not algorithmic: only a thin shell
 With `sigma_omega_patches_ev` gapping the evaluation grid to where QP
 energies live (2s cluster, 2p cluster, Fermi window — the Σ(ω)→E
 interpolation is piecewise linear and needs nothing in between; a solved
-energy inside a hole refuses at the QSGW seam) and
-`mpa_sigma_omega_cluster_gap_ry` clustering the planner, the core and the
-metallic `sd_core` sliver decompose per cluster into an η-resolved shell
+energy inside a hole refuses at the QSGW seam), gaps wider than 1.5 times
+`sigma_omega_step_ev` split planner clusters. The core and the metallic
+`sd_core` sliver decompose per cluster into an η-resolved shell
 whose bandwidth is set by the cluster span and pole bracket — independent
 of the dynamic range — plus sign-definite bulk cells on the logarithmic
 sector family. Contiguous grids keep the monolithic plan bit for bit.

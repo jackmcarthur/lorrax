@@ -235,26 +235,14 @@ up to `nb_full` (harmless: any padded position is `>= nb_logical`, hence
 already excluded by the pre-existing `nb_logical` mask) before the face
 kernel is called with the FULL `psi_mun`/`psi_nmu`.
 
-## What this does NOT unblock, and why (read before touching the refusal row)
+## Current reachability
 
-`gw_config._validate_metal_compute_mode` REQUIRES `compute_mode = mpa`
-whenever `mpa_material_class = metal` (`gw_config.py:3827-3853`) — there is
-no deck combination that reaches this session's ported kernels without also
-setting `compute_mode = mpa`. `compute_mode = mpa` is UNCONDITIONALLY
-refused under `low_mem_bands = true` by the separate, pre-existing
-`low_mem_bands_dynamic_ppm_unported` row (`gw.mpa.sigma`'s own executor —
-a completely different subsystem: frequency-domain Σ_c(ω) integration, not
-this note's χ₀/response subject — was mechanically ported in an earlier
-session but never end-to-end gated). So **lifting
-`low_mem_bands_metal_material_class_unported` alone cannot unblock a live
-`low_mem_bands=true` metal deck**: a deck that cleared this row would
-immediately refuse at the OTHER row instead, with a different rule id. This
-is not a gap in this session's port; it is a genuinely separate, unrelated
-census item this session was not scoped to touch. `docs/input_reference.md`
-and `gw_config._LOW_MEM_BANDS_REFUSALS`'s row 2 comment say this explicitly
-so the next reader does not have to re-derive it — the row STAYS REFUSING,
-narrowed to name the real remaining blocker, per this session's own
-verification section below.
+Material class is inferred from the loaded WFN occupations; it is not a deck
+option. The face-carrier MPA executor and its occupation-weighted kernels are
+now supported with `low_mem_bands = true`, so no material-specific refusal row
+remains. The live option envelope is owned by [the input
+reference](../input_reference.md#memory); this page records the kernel port and
+does not duplicate that register.
 
 ## Verification
 

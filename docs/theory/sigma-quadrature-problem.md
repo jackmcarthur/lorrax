@@ -174,3 +174,13 @@ The metallic case is the hard one and the design target.
 - Consolidating windows is an optimisation to attempt, never a commitment: it
   must reduce total nodes, must not raise the branch's absolute error, and must
   be abandonable when the global budget cannot then be met.
+- Bound the search from the measured support, not from a user resource dial.
+  Production estimates `2A/eta` nodes for each crossing window and 20 for each
+  sign-definite window, doubles their sum, and applies a floor of 32. A method
+  that cannot fit under that honest-cost ceiling refuses.
+- Fit the cheap candidates once. Production tries the measure-adapted crossing
+  rules plus lookup-served sign-definite rules first, then adds tighter shipped
+  candidates only when the exact global selector cannot close the budget. It
+  reuses both adapted fits and consolidation trials across the retry.
+- Refusal is terminal. There is no direct state--pole evaluator, capped or
+  otherwise, and no coupled selector hidden behind a small-problem threshold.

@@ -337,7 +337,7 @@ def solve_diagonal_sigma_fixed_point(
 
 def is_band_sharded_sigma_omega(a) -> bool:
     """True iff ``a`` is a 4-D jax.Array actually partitioned on its (m, n)
-    band axes (the ``sigma_omega_layout=sharded`` tile cube).
+    band axes (the dynamic Sigma tile cube).
 
     Layout is read off the array itself — the single source of truth
     (QUALITY_PATTERNS #3) — so consumers cannot disagree with the producer
@@ -358,7 +358,7 @@ def is_band_sharded_sigma_omega(a) -> bool:
 _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
 # Sharded-layout siblings (one per mesh): the diagonal-only extractor and
-# the band-diagonal adder used by the ``sigma_omega_layout=sharded`` path.
+# the band-diagonal adder used by the band-sharded path.
 _EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
 _ADD_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
@@ -525,8 +525,8 @@ def extract_sigma_diag_replicated(
     per device (≈ 270 MB for MoS2 4×4×1, 80 bands, 41 ω-points).  Fits
     comfortably in the 28 GB device budget.
 
-    Sharded layout (``sigma_omega_layout=sharded``): when the input is
-    genuinely band-partitioned (read off ``sigma_w_kij.sharding`` — the
+    When the input is genuinely band-partitioned (read off
+    ``sigma_w_kij.sharding`` — the
     array itself is the source of truth), the shard_map specialisation
     extracts ONLY the diagonal and psums it (nω·nk·nb·16 B moved instead
     of the full cube).  The replicated input keeps the historical kernel

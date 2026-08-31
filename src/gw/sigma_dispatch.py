@@ -661,11 +661,9 @@ def compute_sigma_xc(
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
 
     # ── THE ONE ENVELOPE ROW NO DECK KEY CAN EXPRESS ─────────────────────
-    # low_mem_bands's other four unsupported combinations (head_correction,
-    # qp_solver, mpa_material_class, bispinor) already refused at config
-    # resolution, before this function -- or anything upstream of it --
-    # ever ran.  An explicit Gij is a call-time Python parameter with no
-    # deck key, so it is checked here instead: this is the only seam that
+    # An explicit Gij is a call-time Python parameter with no deck key, so
+    # the config-resolution table cannot express this combination.  Check
+    # it here instead: this is the only seam that
     # ever sees both a resolved low_mem_bands and a live Gij operand
     # together, and it still runs before any Gij-dependent allocation.
     refuse_explicit_gij_under_low_mem_bands(config, Gij)
@@ -997,38 +995,9 @@ def compute_sigma_xc(
         except KeyError as exc:
             raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
         # ── DECK KEYS THIS BRANCH HONORS, NAMED ─────────────────────────
-        # Both keys below are parsed and validated by gw_config and were
-        # then IGNORED here: MPA hard-coded ``wfn.efermi`` and always
-        # emitted the sharded cube, while the PPM branch honored both.  A
-        # parsed-but-ignored key is a defect (TASTE 13), and it became a
-        # live one the moment UNIMPLEMENTED_MODES stopped holding MPA back.
-        #
-        # sigma_omega_layout: the MPA executor's accumulator is born
-        # P(None,None,'x','y') and there is no replicated plan for it --
-        # which is what the metal-only refusal in
-        # gw_config._validate_occupation_smearing already SAYS ("the MPA
-        # Sigma emits the mesh-sharded omega cube only").  That is a fact
-        # about MPA, not about metals, so the refusal is generalised here
-        # rather than left to fire on one material class.  Refusing (not
-        # gathering) is the standing ruling: the sharded layout exists
-        # precisely to elide the P-independent full-cube gather, so
-        # "replicated" would be an allgather sold as a fallback
-        # (decisions.md 2026-08-05).
-        #
-        # BUT REFUSE ONLY A DECK THAT SAID IT.  ``sigma_omega_layout``'s
-        # DEFAULT is ``replicated``, so a bare refusal on the resolved
-        # value fires on every insulating MPA deck that never mentioned
-        # the key -- a flag day for decks that are not wrong about
-        # anything.  TASTE 13 draws exactly this line: an off-dial may
-        # refuse, a typo never does, and a value nobody typed is not a
-        # request.  The parser records the raw keys it saw
-        # (``GWConfig.raw_input_keys``), so the question is asked of that
-        # -- the same idiom ``restart_q_storage.deck_named_the_key`` uses,
-        # including its conservative answer when the record is absent.
-        # A deck that DID name ``replicated`` still refuses: honouring it
-        # would mean gathering the full cube on every rank, which is the
-        # P-independent collective the sharded layout exists to elide
-        # (decisions.md 2026-08-05, refuse rather than gather).
+        # Dynamic Sigma has one layout: the executor's accumulator is born
+        # P(None,None,'x','y').  Consumers read that fact from the array's
+        # sharding; no deck dial or replicated-cube fallback exists.
         # The effective Sigma broadening, from the SAME resolver the PPM
         # driver uses.  MPA used to take ``regularization_ev`` raw while
         # GN-PPM silently raised it to a window-dependent conditioning
@@ -1038,13 +1007,13 @@ def compute_sigma_xc(
         _xi = sigma_regularization_for_config(config)
         print_fn(_xi.describe())
         if material_class == "metal":
-            # Metal deck-key consistency is refused at config parse
-            # (_validate_occupation_smearing); here the run-level facts:
-            # the one-occupation-state rule, and head/body provenance.
+            # Deck consistency is checked after the driver infers material
+            # class from WFN occupations.  Here enforce the run-level
+            # one-occupation-state rule and head/body provenance.
             if occupation_state is None:
                 raise ValueError(
-                    "MPA Sigma under mpa_material_class = metal requires "
-                    "the iteration's occupation_state (fixed-N MP1 solve); "
+                    "MPA Sigma for an inferred metal requires the iteration's "
+                    "occupation_state (fixed-N MP1 solve); "
                     "got None. The QSGW driver passes it; a direct caller "
                     "must construct one from the current spectrum.")
             # No stamp assert here: this is a SAME-RUN site (the fit store

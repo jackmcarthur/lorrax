@@ -131,10 +131,9 @@ class SigmaOmegaResult:
     # ``sigma_band_extrapolation`` — one shape, one code path, no branch.
     #
     # Layout of the TRAILING four axes is carried BY THE ARRAY'S OWN
-    # SHARDING (single source of truth): replicated/uncommitted under
-    # sigma_omega_layout=replicated (historical), or
-    # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
-    # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
+    # SHARDING (single source of truth).  The current executor emits
+    # P(..., None, None, 'x', 'y') band tiles; consumers inspect the array
+    # through qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
     #: The LOGICAL band count each leading-axis element sums to.  Aligned
     #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
@@ -211,13 +210,9 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
     a caller or a test reads a NUMBER rather than the absence of an
     exception.
 
-    WHAT IS MEASURED, AND WHY THE DECK KEY CANNOT ANSWER IT.
-    ``gw_config._validate_metal_compute_mode`` already refuses
-    ``mpa_material_class = metal`` outside ``compute_mode = mpa``.  But
-    ``insulator`` is the DEFAULT, so a metallic system run without the key
-    reaches this driver with nothing objecting — and the deck key is a
-    DECLARATION, while this is a property of the spectrum.  So the
-    measurement is on the occupation table:
+    WHAT IS MEASURED.  Material class is a property of the loaded mean
+    field, not a deck declaration, so this driver measures the occupation
+    table directly:
 
         band n crosses E_F  <=>  occ[:, n] > 0.5 is not constant over k.
 
@@ -276,9 +271,9 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
         f"Sigma driver, whose band split is a hard occ > 0.5 step\n"
         f"  want: a gapped spectrum, i.e. every band uniformly occupied or "
         f"uniformly empty over k\n"
-        f"  fix:  run this system with compute_mode = mpa and "
-        f"mpa_material_class = metal, which carries the iteration's fixed-N "
-        f"MP1 occupation state; or narrow the band window so no band "
+        f"  fix:  run this system with compute_mode = mpa, which carries "
+        f"the inferred metal's fixed-N MP1 occupation state; or narrow the "
+        f"band window so no band "
         f"crosses E_F\n"
         f"  why:  with a crossing band, vbm > cbm, so the 'midgap' Fermi "
         f"reference this driver derives is not in any gap, and E_cond/H_val "
@@ -805,10 +800,8 @@ def assert_sharded_sigma_window_divides_mesh(nb_proj: int, mesh_xy, *,
         f"pad/strip pair is exact in VALUE but leaves a sharded array "
         f"whose declared P(None,None,'x','y') no longer divides its own "
         f"shape, and the QSGW Hermitize needs a square unpadded extent.  "
-        f"Choose nval+ncond divisible by both mesh extents"
-        + (", or use sigma_omega_layout = replicated."
-           if ansatz.endswith("ppm") else
-           " (compute_mode = mpa has no replicated cube plan)."))
+        f"Choose nval+ncond divisible by both mesh extents; dynamic Sigma "
+        f"has no replicated-cube alternative.")
 
 
 def _make_strip_sharded_sigma_window(mesh_xy: Mesh, ndim: int, nb_real: int):
@@ -1496,11 +1489,9 @@ def compute_sigma_c_ppm_omega_grid(
     keep_invalid = invalid_mode == "2ry"
     invalid_static = invalid_mode in ("static_limit", "infinity")
 
-    # THE OCCUPATION SPLIT THIS DRIVER CAN HONOUR IS A GAPPED ONE.  Measured
-    # here, on the spectrum, because the deck key cannot see it: config's
-    # ``_validate_metal_compute_mode`` refuses ``mpa_material_class = metal``
-    # outside MPA, but ``insulator`` is the DEFAULT, so a metallic system run
-    # without the key reaches this driver and nothing objects.
+    # THE OCCUPATION SPLIT THIS DRIVER CAN HONOUR IS A GAPPED ONE.  Measure
+    # it here on the spectrum; material class is inferred from the WFN, not
+    # declared by a deck key.
     assert_gapped_occupations_for_ppm(occ_full, print_fn=print_fn)
 
     # Derive Fermi level, energy/band masks, and PPM pole masks in one fused trace.

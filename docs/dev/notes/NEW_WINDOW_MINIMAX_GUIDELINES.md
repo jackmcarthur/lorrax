@@ -1,5 +1,10 @@
 # Coarse windowing strategy for Laplace-transformed (\chi) and (\Sigma)
 
+> **Historical pane-design note.** The six-window construction below is not
+> the delivered planner's current product geometry or API. Current behavior is
+> owned by [the Sigma quadrature problem](../../theory/sigma-quadrature-problem.md)
+> and [the delivered-plan contract](../delivered_plan.md).
+
 A self-contained note on why a **coarse six-window partition** is the right choice given the new scaling, with the final routing stated in the **raw-eigenvalue convention**.
 
 ## Motivation

@@ -687,7 +687,7 @@ main                                       [gw/gw_jax.py]
 | **Coulomb kernel + truncation** | `gw/coulomb/` — `get_kernel(meta.sys_dim)` → `Bulk3D` (3) \| `Slab2D` (2) \| `Box0D` (0). Production `v(q+G)` enters at `gw/compute_vcoul.py : compute_v_q_per_G`. *(This row named `gw/vcoul.py : compute_V_qfullG_for_q` until 2026-08-06; that function does not exist anywhere in `src/`.)* **On `feat/vcoul-consolidation-2026-08-06` (unmerged)** `compute_v_q_per_G` becomes a thin dispatcher over one `coulomb/base.py : v_qG_table` driver: each kernel contributes only `_v_bare_per_q` (the dimension's bare formula at one q), and the per-q loop, the `vcoul_cutoff_ry` mask, the G=0 head-slot injection and the `(n_q, ngkmax)` float64 contract live once — so the cutoff, head injection and batching that used to exist only in `compute_vcoul` become available in every dimension, and `Box0D` refuses q≠0 rather than returning a wrong number. |
 | **χ₀ minimax kernel** | `gw/w_isdf.py : _get_chi_minimax_kernel`, `compute_chi0_minimax` |
 | **W Dyson solve** | `gw/w_isdf.py : solve_w`, `_get_w_solve_fn` |
-| **Static minimax lookup** | `gw/minimax_screening.py : build_static_minimax_window_pair` |
+| **Static minimax lookup** | `gw/minimax_screening.py : solve_laplace_minimax_interval` |
 | **Build G** | `gw/greens_function_kernel.py : build_G` |
 | **Σ band projection** | `gw/wavefunction_bundle.py : project`, `project_ri` |
 | **Reduce-scatter projection** | `gw/ppm_sigma.py : _make_project_ri_reduce_scatter` |
@@ -723,7 +723,7 @@ main                                       [gw/gw_jax.py]
 - Memory model: [`MEMORY_MODEL.md`](memory-model.md)
 - Environment / Perlmutter: [`environment/overview.md`](../environment/overview.md), [`environment/machines/perlmutter.md`](../environment/machines/perlmutter.md), [`../config/README.md`](../../config/README.md)
 - FFI internals: [`../src/ffi/AGENTS.md`](../../src/ffi/AGENTS.md)
-- GN-PPM Σ details: see developer notes under `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`
+- GN-PPM Σ quadrature: [`docs/theory/minimax-quadrature.md`](../theory/minimax-quadrature.md); the older derivation note is retained under `docs/dev/notes/` but is not the API register.
 - Current BGW-vs-LORRAX status: see developer notes under `docs/dev/progress/SIGMA_FREQ_AUDIT_STATUS.md`
 - Agent todos: `docs/dev/notes/AGENT_TODO.md` is **superseded** and should not be
   worked from — it describes a `src/isdf/` package layout the tree no longer has,

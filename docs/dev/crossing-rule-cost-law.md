@@ -84,10 +84,11 @@ Two facts make the fix possible with zero executor changes:
 
 With a patched ω grid (dense near the valence window, dense near each
 semicore cluster, empty in between — `sigma_omega_patches_ev`), the
-planner clusters each branch's `omega_abs` at gaps >
-`mpa_sigma_omega_cluster_gap_ry` (default 1.0 Ry; a uniform production
-grid is always ONE cluster and reproduces the incumbent plan
-bit-for-bit).  Per crossing branch with ≥ 2 clusters, per cluster
+planner clusters each branch's `omega_abs` at gaps wider than 1.5 times
+`sigma_omega_step_ev` (converted to Ry). The step is read from the deck so a
+single-sample patch is still resolved; a minimum-observed-spacing rule could
+not do that. A uniform production grid is always one cluster and reproduces
+the incumbent plan bit-for-bit. Per crossing branch with ≥ 2 clusters, per cluster
 `[w_lo, w_hi]`, the core bands split three ways at margin
 `m = edge_factor·η + excursion` against the shallow-pole bracket
 `[a_lo, a_hi]`:

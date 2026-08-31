@@ -39,16 +39,16 @@ collective. Fixed-size `psum` operations produce the global centroids. Thus
 the communicated cell count is independent of process count, state count,
 and spatial pole extent; no raw state--spatial-pole support is gathered.
 
-Each causal branch is covered by two to four ordinary Cartesian product
+Each causal branch is covered by ordinary Cartesian product
 windows, `state interval x pole interval` (a degenerate one-pole branch may
 need only one). A window selects its states with a plain interval mask and its
 leading poles with a plain interval bound. A window is specified by
 `(E_min, E_max)` and `(Omega_min, Omega_max)` and nothing else. The crossing
-band stays inside its resonant product window. Its `eta`-damped reciprocal is
-integrated by the positive real-time quadrature; candidate density follows
-the oscillatory bandwidth relative to the `eta` floor. An exact small integer
-selection chooses one candidate rule per window while enforcing at most 200
-total `(window, tau)` pairs across all branches.
+band stays inside its resonant product window. Crossing supports first use the
+measure-adapted ROQ route; sign-definite supports start from shipped
+`noncrossing` tables. An exact small integer selection chooses one candidate
+per window subject to the global delivered-error budget and the derived pair
+ceiling.
 
 The production target is **envelope-relative**. It multiplies the
 noncancelling inverse-gap planning envelope by the unchanged 0.8 safety factor
@@ -59,9 +59,12 @@ target. When a reference Sigma is supplied, the planner reports the measured
 reference it reports that calibration as unavailable. Since the initial
 difficulty is envelope divided by delivered mass, mass-times-difficulty
 apportionment intentionally gives each retained window the same normalized
-envelope residual target. Sign-definite windows use the minimax service's
-incumbent `fit_damped_reciprocal`; crossing windows use the `eta`-damped
-positive rule. The refined lattice validates every selected rule.
+envelope residual target. A sign-definite lookup walks to the next tighter or
+wider certified table when the first covered entry misses the measured gate.
+For a crossing window, deterministic ROQ derives the contour, horizon, and
+rank from the measured support. Shipped HGL entries and one deterministic
+fixed-time fit are tightening candidates, not an explicit-pair fallback. The
+refined lattice validates every selected rule.
 
 Amplification multiplies runtime arithmetic noise, not the physical fit
 error. Acceptance is therefore
@@ -93,31 +96,31 @@ interval and state mask remain independent executor selectors, so the
 streamed pole-batch walk evaluates their Cartesian product without adding a
 tuple axis to a large spatial tensor.
 
-### Shared tau grid
+### Ceiling and tightening retry
 
-The delivered planner defaults to independent (`free`) window grids. Set
+There is one grid mode: each product window carries the nodes of its served
+rule. The planner derives a global `(window, tau)` ceiling from the measured
+supports. Its honest-cost estimate is `2A/eta` for each crossing window and 20
+nodes for each sign-definite window; twice their sum, with a floor of 32, is the
+runaway guard. This is derived policy, not a deck dial.
 
-```bash
-export LORRAX_DELIVERED_TAU_GRID=shared
-```
+The first selection pass offers the measure-adapted crossing rule and the
+lookup-served sign-definite rules. Only if their achieved absolute costs cannot
+close the global budget does a second pass add the shipped crossing/tighter
+lookup candidates. The adapted fit is reused. Branch consolidation is tried
+only below the split plan's node count and is cached across this retry. If a
+merge makes the global budget unaffordable, selection retries the already-fit
+unmerged windows before refusing. No retry creates a coupled state--pole
+selector or direct evaluator.
 
-to build one identical grid per causal branch and re-solve unrestricted
-complex weights for every window on that grid. Candidate times are the exact
-stable union of the already accepted free-window rules. Every refitted window
-must still satisfy its refined residual, p99 noise budget, and factor-growth
-gate.
+Reports retain `window_tau_pairs` and `distinct_tau_count`; the latter is a
+census of exact node values by branch, not a selectable shared-grid plan.
 
-Reports keep the two cost currencies separate: `window_tau_pairs` is
-`sum_w n_tau(w)`, while `distinct_tau_count` sums the per-branch shared-grid
-sizes. At execution, rows with the same exact tau grid and frequency block are
-fused: all component `G/W` transforms remain explicit, but the Sigma-side
-forward transform and band projection run once per distinct tau and resident
-pole batch. The run log reports both actual tau dispatches and the saved Sigma
-back-transforms.
-`max_nodes` is a global `window_tau_pairs` ceiling for the complete plan, not
-a per-window allowance. Shared-grid selection converts the remaining global
-budget to a per-branch grid ceiling before fitting, and a final fail-closed
-check pins the total.
+`LORRAX_DELIVERED_PLAN_CACHE=/path/to/receipt.npz` stores fitted rules and the
+measured-problem fingerprint. A complete matching receipt loads before the
+pole census and survives a process-count change. A fit-only hit is validated
+against the live measured problems before execution. Any fingerprint or gate
+mismatch replans; the cache never makes a stale rule executable.
 
 ## GN-PPM and time reversal
 

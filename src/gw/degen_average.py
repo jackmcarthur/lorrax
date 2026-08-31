@@ -122,8 +122,8 @@ def average_sigma_components(
     # the (replicated) Σ components, identical on every rank;
     # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
     def _dav(M):
-        # gather_to_host, not np.asarray: under sigma_omega_layout=sharded
-        # (mandatory for MPA metals) M spans other processes' devices and a
+        # gather_to_host, not np.asarray: the dynamic Sigma cube is sharded,
+        # so M spans other processes' devices and a
         # host fetch raises; the gather returns the identical full array on
         # every process, so the averaged result stays replica-consistent.
         return device_put_process_local(apply_to_matrix_diagonals(

@@ -586,13 +586,11 @@ class ScreeningDiagrams(str, enum.Enum):
     (see :class:`ComputeMode`'s docstring) applies here.
 
     NOT EVERY COMBINATION IS SUPPORTED.  ``w_bse`` is refused at parse
-    time against ``x_only``, ``hl_ppm``, the self-consistent QP solver,
-    ``mc_average_placement != off`` and a declared metal
-    (``mpa_material_class = metal``) — see
+    time against ``x_only``, ``hl_ppm``, the self-consistent QP solver and
+    ``mc_average_placement != off`` — see
     :func:`refuse_unsupported_screening_diagrams`, which carries the
-    reason for each.  INSULATORS ONLY is the one of those that a deck key
-    cannot always express: a metallic WFN on a deck that declares nothing
-    is refused at the stage instead, on the occupations themselves
+    reason for each.  Its insulators-only gate cannot run until the WFN is
+    loaded: a metallic WFN is refused at the stage on its occupations
     (``gw.screening_bse``, the same ``w_bse_insulators_only`` id).
     ``w_rpa_resolvent`` is refused at parse time against ``x_only``, the
     self-consistent QP solver, ``mc_average_placement != off`` and
@@ -791,38 +789,15 @@ _W_RPA_RESOLVENT_REFUSALS: tuple[
         "conservatively rather than shipping an unaudited combination "
         "under a new name",
     ),
-    # NO PARSE-TIME "w_rpa_resolvent_insulators_only" ROW -- audited and
-    # found DEAD, not omitted by oversight.  ``w_bse_insulators_only``'s
-    # deck-key predicate (``mpa_material_class != insulator``) is only
-    # ever TRUE past ``_validate_metal_compute_mode``'s standing invariant
-    # (material_class = metal implies compute_mode = mpa, enforced in
-    # ``LorraxConfig.__post_init__`` BEFORE this table runs -- see
-    # ``metal_material_class_requires_mpa``), i.e. the predicate can only
-    # fire on a ``compute_mode = mpa`` deck.  ``w_rpa_resolvent_mpa_
-    # unimplemented`` above already refuses EVERY ``compute_mode = mpa``
-    # deck under this diagram set, unconditionally, and it appears FIRST
-    # in this tuple -- so a parallel insulators-only row here would be
-    # logically implied by, and always shadowed by, that row: the exact
-    # "narrowed row that is a STRICT SUBSET of an earlier row's predicate"
-    # shape the ``low_mem_bands_metal_material_class_unported`` /
-    # ``low_mem_bands_dynamic_ppm_unported`` precedent in
-    # ``_LOW_MEM_BANDS_REFUSALS`` names and deletes on sight.  MEASURED,
-    # not merely reasoned: ``tests/test_w_rpa_resolvent_config.py`` tried
-    # exactly this deck (``mpa_material_class = metal`` under a non-mpa
-    # compute_mode) and reached ``metal_material_class_requires_mpa``
-    # instead, before this table ever ran.
-    #
-    # The insulators-only CERTIFICATION still applies in full -- audited,
-    # not dropped -- through its OTHER half, the one that does not need a
-    # deck key at all: ``gw.screening_bse.refuse_fractional_occupations``
-    # / ``_refuse_metallic_mean_field`` read the mean field's OWN
-    # occupations at the stage, before any compute, under the rule id
+    # NO PARSE-TIME "w_rpa_resolvent_insulators_only" ROW: material class
+    # is inferred from the WFN after config parsing.  The insulators-only
+    # certification is enforced by
+    # ``gw.screening_bse.refuse_fractional_occupations`` /
+    # ``_refuse_metallic_mean_field``, which read the mean field's own
+    # occupations at the stage before any compute, under rule id
     # ``w_rpa_resolvent_insulators_only`` (``diagram_name`` threaded from
-    # ``include_w``).  That check fires on every compute_mode this
-    # diagram set supports (cohsex, gn_ppm) and is not shadowed by
-    # anything: it is what actually gates a metallic WFN on a
-    # ``w_rpa_resolvent`` deck that declares nothing, which is the
-    # harder-to-see half of "insulators only" the ``w_bse`` docstring
+    # ``include_w``).  It covers every compute mode this diagram set
+    # supports (cohsex, gn_ppm).
     # itself says the deck key cannot always express.  The pair-basis /
     # integer-occupation argument transfers unchanged from ``w_bse``'s
     # row (the band-index cut at ``nelec`` does not depend on
@@ -2235,7 +2210,7 @@ _DEFAULTS = {
     "band_extrapolation_bracket_scheme": BRACKET_SCHEME_DEFAULT,
     "fermi_reference": "midgap",
     # DFT occupation smearing of the starting point.  REQUIRED as a pair
-    # when ``mpa_material_class = metal``; refused under insulator.  These
+    # when WFN occupations identify a metal; refused for an insulator.  These
     # are deck keys because WFN.h5 does NOT carry them: mf_header stores
     # el/occ/w but no smearing family and no degauss (verified 2026-08-15
     # on the canonical Na deck's WFN.h5 — zero attrs anywhere in mf_header).
@@ -2958,8 +2933,8 @@ def read_lorrax_input(filename: str) -> dict:
             if _acc.strip().strip('"\'').lower() == "kij_stream":
                 raise ValueError(
                     "sigma_omega_accumulation = kij_stream was REMOVED; "
-                    "host-tile accumulation is the only mode "
-                    "(sigma_omega_layout selects the end-of-stage layout)")
+                    "host-tile accumulation and band-sharded output are the "
+                    "only dynamic-Sigma path")
             import warnings
             warnings.warn(
                 "Input key 'sigma_omega_accumulation' is no longer "
@@ -3414,23 +3389,9 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # -- eqp0.dat max|dE_QP|=6.510e-05 eV, eqp1.dat max|dE_QP|=
         # 8.575e-05 eV, max|dE_DFT|=0.0 eV both, legacy vs face.
         #
-        # A NARROWED (metal-only) row was drafted first and then deleted
-        # rather than kept, per its own predicate's own "narrow it away
-        # entirely if nothing else remains under it" instruction: a
-        # metal deck's mpa_material_class == 'metal' predicate is a
-        # STRICT SUBSET of -- and, given _validate_metal_compute_mode's
-        # standing invariant (material_class == metal implies compute_
-        # mode == mpa, enforced in LorraxConfig.__post_init__ BEFORE this
-        # table ever runs), logically EQUIVALENT to -- the
-        # low_mem_bands_metal_material_class_unported row's own predicate,
-        # which appears earlier in this tuple and therefore always fires
-        # first.  A second, later row with an implied-equivalent predicate
-        # would never be reached -- a dead, vacuous entry, the exact "gate
-        # that cannot fail" shape TASTE.md warns against -- so it is
-        # deleted outright rather than shipped unreachable.  Metal MPA
-        # remains refused, by the metal row alone; see that row's own
-        # updated comment for why (three named infra obstacles this
-        # session, none of them in gw.mpa.sigma's own code).
+        # No material-specific row remains.  The executor and occupation-
+        # weighted kernels are ported to the face carrier, so low-memory
+        # metallic MPA follows the same supported path.
 )
 
 
@@ -4507,7 +4468,7 @@ class LorraxConfig:
     sc_on_ibz: bool
     #: DFT occupation smearing of the starting point ("mp1" = Methfessel-
     #: Paxton order 1, the only certified family).  REQUIRED as a pair when
-    #: ``mpa_material_class = metal``; refused under insulator.  Deck keys,
+    #: WFN occupations identify a metal; refused for an insulator.  Deck keys,
     #: not derived: WFN.h5's mf_header carries el/occ/w but no smearing
     #: metadata (see ``_DEFAULTS``).  Validated by
     #: ``_validate_occupation_smearing``.

@@ -1,5 +1,12 @@
 # Full-Frequency GW Self-Energy via GN-PPM and Minimax-Windowed CTSP in the ISDF Basis
 
+> **Derivation record, not the live API register.** Function sketches and
+> tuning lists below predate the minimax service door and the delivered Sigma
+> planner. Current quadrature families, ownership, controls, and refusal rules
+> are in [Minimax quadrature](../../theory/minimax-quadrature.md), [the Sigma
+> quadrature problem](../../theory/sigma-quadrature-problem.md), and [the input
+> reference](../../input_reference.md). Keep this page for the GN-PPM algebra.
+
 ### Purpose
 
 Reference for computing the **correlation self-energy** (\Sigma^c_{kij}(\omega)) using:

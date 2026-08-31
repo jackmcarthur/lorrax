@@ -174,12 +174,9 @@ until fixed.  File:line references as of this page's commit.
    replicated mode remains the default for operand consumers
    (`sigma_dispatch`'s gspace V_H route).
 7. **eigenvalue vectors** — `lambda (nq, mu)` replicated in the
-   distributed zeta tier (ScaLAPACK's own contract); `Sigma_c(omega,k,m,n)`
-   cube replicated under the default `sigma_omega_layout = replicated`.
-   `sharded` removes that residency (the layout's own `self_consistent`
-   refusal was deleted 2026-08-05; since 2026-08-27 `self_consistent`
-   itself is refused at driver entry beside a dynamic `compute_mode`, so
-   the cube pairs with `one_shot_dft` / `fixed_point` only).
+   distributed zeta tier (ScaLAPACK's own contract). The dynamic
+   `Sigma_c(omega,k,m,n)` cube is always sharded over its band axes and is
+   never a full per-rank resident.
 
    IF A CUBE ROTATION IS EVER ADDED (e.g. to put `sigma_mnk.h5` and
    `WFN_qp.h5` in one basis), the sharded layout does NOT force the cube

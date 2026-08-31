@@ -1030,7 +1030,7 @@ def write_qsgw_qp_ladders(
     #
     # AND IT IS SKIPPED ON THE BAND-SHARDED LAYOUT, because THIS caller is
     # rank-0-only (it sits in ``gw_jax``'s rank-0 output block, beside
-    # ``write_freq_debug``).  A ``sigma_omega_layout = sharded`` cube is
+    # ``write_freq_debug``).  The dynamic Sigma cube is
     # tiled across every process, so the host transfer of one ω slice from
     # one rank is the "spans non-addressable devices" error, not a slow
     # success.  Gathering it here would mean a collective inside a
@@ -1040,7 +1040,7 @@ def write_qsgw_qp_ladders(
         omitted.append("qp_omega0_ev (no Σ_c(ω) cube in this run)")
     elif is_band_sharded_sigma_omega(sigma_c_omega):
         omitted.append(
-            "qp_omega0_ev (sigma_omega_layout = sharded; the ω slice cannot "
+            "qp_omega0_ev (band-sharded Sigma cube; the ω slice cannot "
             "be read from one rank)")
     else:
         i0 = int(np.argmin(np.abs(np.asarray(omega_grid_ev))))

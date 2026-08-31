@@ -362,6 +362,11 @@ validated starting point; increase $N_p$ only with held-out W and QP evidence.
 
 ## 7. Sigma branches and literal retarded broadening
 
+`LORRAX_SIGMA_PLAN=panes` (the default) uses the geometric pane planner in
+sections 8--10. `LORRAX_SIGMA_PLAN=delivered` uses the measured product-window
+planner described in section 10.2. Both consume the same fitted poles and the
+same shared spatial executor.
+
 For one fitted pole and one band energy, every body-Sigma denominator can be
 written as a causal resolvent with
 
@@ -559,13 +564,10 @@ This is linear in energy bandwidth, not quadratic. Reducing $\eta$ lengthens
 the time interval and can raise the cost nearly in inverse proportion when
 the fitted poles themselves are narrow.
 
-The sector and crossing tolerances bound the same dimensionless residual
-$|1-dQ(d)|$, so they are numerically comparable. They are separate controls
-because a uniform scalar budget is not an optimal observable-error allocation.
-On the measured Si case, loosening only the crossing budget from
-$6.5\times10^{-4}$ to $2\times10^{-3}$ reduced the physical census from 478
-to 446 without a measurable change relative to the 478-node plan at the
-$5\times10^{-5}$ meV reporting scale.
+Sector and crossing rules use the same dimensionless residual target
+$|1-dQ(d)|$. It is the single MPA Sigma accuracy dial. In the delivered plan,
+the global target is converted to absolute envelope cost and apportioned from
+the measured delivered mass; the user does not set a second crossing target.
 
 ### 10.1 The Landau floor, and the omega-clustered decomposition
 
@@ -589,9 +591,10 @@ What IS wrong is the certified region.  For any single evaluation
 frequency, only the thin shell $|\omega-e-a|\lesssim$ (margins) crosses;
 the rest of the $[\omega_{\min},\omega_{\max}]\times$(transitions) product
 set is sign-definite and belongs to the logarithmic family.  The planner
-therefore clusters each branch's $|\omega|$ values at gaps larger than
-`mpa_sigma_omega_cluster_gap_ry` and, when there is more than one cluster,
-splits the core per cluster at the crossing-edge margin $m$:
+therefore clusters each branch's $|\omega|$ values at gaps larger than 1.5
+times the deck's `sigma_omega_step_ev` (converted to Ry) and, when there is
+more than one cluster, splits the core per cluster at the crossing-edge margin
+$m$:
 
 * bands $e < w_{\rm lo} - a_{\rm hi} - m$: the denominator
   $\omega-e-a+i\gamma$ keeps a positive real part — a rotated-Laplace fit
@@ -626,6 +629,26 @@ $\Sigma$, never by how far apart they are.  Derivation, executor-safety
 constraints (the conjugate placement grows factored exponentials, so the
 references anchor at the mask maximum and masked bands are clamped), and
 the rejected alternatives: `docs/dev/crossing-rule-cost-law.md`.
+
+### 10.2 Delivered product-window plan
+
+The delivered path builds separable `state interval x pole interval` windows
+and measures each product's residue-, occupation-, and
+projection-weighted reciprocal problem. Sign-definite products are served from
+certified `noncrossing` tables. Crossing products first use deterministic
+measure-adapted ROQ: SVD/QDEIM selects time nodes, fixed-node IRLS solves the
+weights, and the refined lattice plus the runtime-noise and factor-growth gates
+decide acceptance.
+
+The global pair ceiling is derived from the measured support: twice the sum of
+`2A/eta` for crossing products and 20 for sign-definite products, with a floor
+of 32. The first selection pass offers the adapted and lookup-served rules.
+Only when their achieved absolute costs miss the global budget does a second
+pass add tighter shipped candidates; it reuses the adapted fits and the
+bounded consolidation trials. Failure to serve a product window is a refusal.
+No explicit state--pole evaluator exists. See
+[the Sigma quadrature specification](sigma-quadrature-problem.md) and the
+[implementation contract](../dev/delivered_plan.md).
 
 ## 11. Shared spatial execution
 
@@ -757,7 +780,6 @@ minimax_target_error = 1e-6
 minimax_max_nodes = 64
 
 mpa_n_poles = 8
-mpa_material_class = insulator
 mpa_sampling_alpha = 1
 mpa_sampling_schedule = nested
 mpa_pole_solver = loewner
@@ -766,28 +788,16 @@ mpa_varpi_far_ry = 2.0
 mpa_pole_batch_size = 4
 
 mpa_sigma_sector_target_error = 6.5e-4
-mpa_sigma_crossing_target_error = 2e-3
-mpa_sigma_max_nodes = 96
 sigma_regularization_ev = 0.25
 sigma_window_edge_factor = 1.5
-sigma_omega_layout = sharded
 ```
 
-The measured output grid was $[-7,7]$ eV in $0.5$ eV steps. On four A100
-GPUs, job 56958426 at commit `f29e5c34` used 446 physical time dispatches and
-12 sweeps, taking 58.775 s in the Sigma stage and 81.993 s wall. Relative to a
-plan with both scalar budgets tightened to $2\times10^{-6}$, the maximum QP
-difference over 84 registered states was 0.07265 meV, the RMS difference was
-0.04378 meV, and the direct-Gamma gap changed by 0.07424 meV. This is a
-body-quadrature convergence statement for that system and fixed head, not a
-universal accuracy bound or a comparison with BerkeleyGW.
-
-The two error budgets play different roles. Keep chi at roughly $10^{-6}$
-before tuning the pole count: sample noise is amplified by the rational fit.
-The measured Sigma sector budget should also be treated conservatively because
-its current support ladder is not nested. The positive crossing rule degraded
-smoothly enough to use $2\times10^{-3}$ on the measured system. A new material
-still needs a tight-plan comparison at the QP level.
+The driver derives the material formulation from WFN occupations and always
+stores dynamic Sigma with its two band axes sharded. Neither is a deck choice.
+Keep chi at roughly $10^{-6}$ before tuning the pole count because the rational
+fit can amplify sample noise. Treat the one Sigma target conservatively and
+compare complete emitted plans at the QP level; nearby targets need not select
+nested supports.
 
 ## 14. What changes the cost or the answer
 
@@ -843,10 +853,11 @@ Use these dependencies when moving beyond the validated profile.
   Sigma result. Zero is not intrinsically invalid, but a sector rectangle that
   reaches the origin will refuse.
 
-- **A looser scalar tolerance.** Crossing Gauss ranks are nearly smooth but not
-  mathematically monotone. Sector support can change discontinuously. Always
-  compare the emitted plan provenance and the QP observable; never assume that
-  a numerically smaller tolerance produced a nested rule.
+- **A looser scalar tolerance.** Crossing ranks are nearly smooth but not
+  mathematically monotone, and sign-definite table selection can change
+  discontinuously. Always compare the emitted plan provenance and the QP
+  observable; never assume that a numerically smaller tolerance produced a
+  nested rule.
 
 - **More poles.** This adds two chi samples per pole, increases fit work, can
   create another partial pole batch, and need not improve the rational model.
@@ -878,7 +889,9 @@ Use these dependencies when moving beyond the validated profile.
 | Loewner fit algebra | `gw.mpa.pade_fit` |
 | sharded column walk | `gw.mpa.fit_driver` |
 | sample and pole bytes | `file_io.mpa_store` through SlabIO |
-| Sigma geometry and scalar windows | `gw.mpa.sigma_windows` |
+| pane Sigma geometry and scalar windows | `gw.mpa.sigma_windows` |
+| delivered product windows, budget, retry, and receipt | `gw.mpa.delivered_windows` |
+| measure-adapted ROQ algebra | `services/minimax` |
 | shared $G\times W$ spatial kernel | `gw.ppm_tau_kernel` |
 | dynamic-Sigma output and QSGW finalization | `gw.sigma_dispatch` and `gw.dynamic_sigma` |
 

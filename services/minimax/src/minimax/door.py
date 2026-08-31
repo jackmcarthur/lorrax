@@ -5,8 +5,8 @@ gaps by name; runtime solving is not a service path.*
 
 R1 SHIPS IN TWO STAGES, and this module is stage 1.  The reason is a
 measurement, not a preference: the imaginary-axis family has **no shipped
-tables at all** — ``catalog.json`` carries 31 entries in two families,
-``{'crossing': 5, 'noncrossing': 26}``, and ``build_imag_quadrature``, on
+tables at all** — ``catalog.json`` carries 34 entries in two families,
+``{'crossing': 6, 'noncrossing': 28}``, and ``build_imag_quadrature``, on
 the path of every GN-PPM run there has ever been, is a 100% runtime-solve
 path with nothing behind it.  Applied literally today, lookup-and-refuse
 refuses the default production deck.  So:

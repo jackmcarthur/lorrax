@@ -191,7 +191,14 @@ Ranked.  These escape input-file validation, the run log, and provenance.
    therefore policy, not machine capability; the env form is the initial
    opt-in and must be promoted before it becomes a default candidate. See
    [the delivered-plan contract](delivered_plan.md).
-5. *(removed 2026-08-31)* `LORRAX_DELIVERED_TAU_GRID` no longer exists:
+5. **`LORRAX_DELIVERED_PLAN_CACHE` → a Sigma planning/cache key.** Unset or
+   blank disables the receipt. A path stores a complete delivered plan keyed
+   by the request and measured-problem fingerprints. A complete hit is loaded
+   before the pole census; a fit-only hit is revalidated against the live
+   measure. The receipt contains fitted rules, not screening or Sigma values,
+   and remains valid across process-count changes when the fingerprints match
+   (`gw.sigma_plan.resolve_delivered_plan_cache`).
+6. *(removed 2026-08-31)* `LORRAX_DELIVERED_TAU_GRID` no longer exists:
    lookup-served rules carry their own nodes and there is one grid mode.
 
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
@@ -318,7 +325,8 @@ incident instruments, not production results.
 | var | default | effect |
 |---|---|---|
 | `LORRAX_SIGMA_TAU_TIMING` | `0` | Per-stage blocking timing rows for the staged τ kernel (`gw/ppm_tau_kernel.py:66`; the sub-rows are documented at `gw/ppm_sigma.py:377`).  Numerics identical (same primitives, same order, separate XLA modules); walltime NOT comparable to the fused path.  Scale-neutral: O(1) host work per τ stage. |
-| `LORRAX_PPM_ALLOW_CROSSING_BANDS` | unset (→ off) | Debugging override of `GATE ppm_sigma_gapped_occupations` (`gw/ppm_sigma.py::assert_gapped_occupations_for_ppm`), which REFUSES a GN/HL plasmon-pole Sigma whose occupation table has a Fermi-crossing band -- one occupied at some k and empty at others.  The GN/HL driver splits bands by a hard `occ > 0.5` step at a Fermi level it derives itself as `0.5*(vbm+cbm)`; with a crossing band `vbm > cbm`, so that reference is not in any gap, and `E_cond`/`H_val` are clipped at zero so a wrong-side band cannot be represented.  Nothing about that changes an array shape or the exit code.  The deck key `mpa_material_class = metal` is already refused outside `compute_mode = mpa` at parse time, but `insulator` is the DEFAULT, so this measures the SPECTRUM rather than trusting the declaration.  `1`/`true`/`on` downgrades the refusal to a loud line and continues.  `AGENT_PREAMBLE`: never set it to make a gate pass. |
+| `LORRAX_DELIVERED_CENSUS_PROFILE` | `0` | Exact value `1` prints the per-rank delivered pole-census timing split (factory, submissions, readback, and fixed-size collective) after the measured field reduction. It changes no measure, rule, or receipt (`gw.mpa.delivered_windows.measure_delivered_sigma_pole_fields`). |
+| `LORRAX_PPM_ALLOW_CROSSING_BANDS` | unset (→ off) | Debugging override of `GATE ppm_sigma_gapped_occupations` (`gw/ppm_sigma.py::assert_gapped_occupations_for_ppm`), which refuses a GN/HL plasmon-pole Sigma whose occupation table has a Fermi-crossing band. The GN/HL driver uses a hard `occ > 0.5` split and requires a genuine gap; the MPA driver instead infers the occupation-aware path from the WFN occupations. `1`/`true`/`on` downgrades the PPM refusal to a loud line and continues. `AGENT_PREAMBLE`: never set it to make a gate pass. |
 | `LORRAX_PPM_HERM_DIAG` | `0` | Deck-level ε_H measurement of the PPM amplitude's inherited hermiticity residual — `check_hermitian` over B_q and Ω_q, all q, rtol 1.0 (`gw/ppm_sigma.py:275`).  Diagnostic, not a gate (the channel merge needs no hermiticity). |
 | `LORRAX_EXTRA_RANK_PAD` | `""` (→ 0) | **Test-only** extra null directions on the htransform Galerkin rank axis, on top of the mesh-lcm round-up (`bandstructure/htransform.py::resolve_extra_rank_pad`) — the pad-extent-invariance knob for this axis, exactly the role `LORRAX_EXTRA_MU_PAD` plays for μ.  Any result that moves under it at fixed P is a defect.  Negative or malformed REFUSES.  NEVER set in production.  There is deliberately no `LORRAX_EXTRA_BAND_PAD` counterpart — ruling and precondition in [`architecture/decisions.md` 2026-08-06](../architecture/decisions.md).  Exercised by `tests/test_pad_parity_gates.py` — until 2026-08-06 the ONLY test-suite mention was `test_layering.py`'s `_L1_LIBRARY_ENV_READS` registry, whose two consumers are `ast.parse` static analysis and cannot tell a working resolver from a dead one. |
 | `LORRAX_EXIT_AFTER_ZETA` | unset | Clean `SystemExit(0)` right after the ζ fit (`gw_init.py`). Combine with `LORRAX_MAX_RCHUNKS` for fast fit-only sweeps; add `LORRAX_DEBUG_PRINT=1` when the sweep needs per-chunk detail. |

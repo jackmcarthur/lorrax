@@ -144,7 +144,7 @@ def test_the_whole_measured_surface_is_six_tables_of_thirty_one():
                      error_bound=error_bound, n_max=n_max, **kw)
         served.add(q.provenance.catalog_entry)
     assert served <= set(_CENSUS_TABLES), served - set(_CENSUS_TABLES)
-    assert len(M.catalog()) == 31
+    assert len(M.catalog()) == 34
 
 
 def test_the_table_hash_is_stable_across_reads():

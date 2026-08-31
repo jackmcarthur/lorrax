@@ -10,16 +10,17 @@ certificate chain is: catalog range and scaled sup-norm bound, physical
 rescaling by the smallest gap, achieved error on the fitting lattice, achieved
 error on the refined validation lattice, and the runtime-noise gate.  A table
 that misses the measured gate is replaced by the next tighter or wider shipped
-table.  Crossing windows first try shipped HGL tables and otherwise perform one
-deterministic fixed-time weight fit.  The planner never evaluates explicit
-state--pole pairs.
+table. Crossing windows first try deterministic measure-adapted ROQ. If the
+global budget cannot close, a tightening retry adds shipped HGL candidates and
+one deterministic fixed-time weight fit without refitting the ROQ rule. The
+planner never evaluates explicit state--pole pairs.
 
 The final acceptance test is
 
 ``kappa_p99 * RUNTIME_NOISE_EPSILON <= AMPLIFICATION_NOISE_SAFETY * target``.
 
-The plan also refuses exponent growth above its bounded-factor limit and more
-than 200 total ``(window, tau)`` pairs.
+The plan also refuses exponent growth above its bounded-factor limit and a
+total ``(window, tau)`` count above the support-derived ceiling.
 """
 
 from __future__ import annotations
@@ -52,11 +53,9 @@ ENVELOPE_ERROR_SAFETY = 0.8
 FACTOR_GROWTH_CAP = 30.0
 RUNTIME_NOISE_EPSILON = 6.0e-8
 AMPLIFICATION_NOISE_SAFETY = 0.05
-# Default pair budget for the shipped 0..5 eV demonstration grid; the deck's
-# max_nodes OWNS the budget (a 4x-wider omega request physically needs more
-# crossing nodes — growth is linear in crossing bandwidth). 200 remains the
-# default via the config default; it is a resource certificate, not an
-# accuracy dial (dial census 2026-08-31, DERIVE).
+# Compatibility cap for direct Python callers. Production derives the honest
+# pair ceiling from the measured supports below; a caller-supplied value can
+# only tighten that ceiling.
 MAX_WINDOW_TAU_PAIRS = 200
 _PLAN_CACHE_VERSION = 6
 
@@ -311,7 +310,7 @@ def _derived_pair_ceiling(specs, eta):
     section 7), and a sign-definite window a logarithmic count that is 8-12 in
     practice — 20 is a generous stand-in.  Doubling the sum leaves a healthy
     plan untouched while still catching a pathological fit that would otherwise
-    run away.  This replaces the deck's ``mpa_sigma_max_nodes``: a user should
+    run away. This replaces the removed node-ceiling deck dial: a user should
     not have to guess a resource ceiling the supports already determine.
     """
     total = 0.0
@@ -2004,7 +2003,15 @@ def build_delivered_sigma_windows(
     plan_cache_path=None,
     plan_cache_request_fingerprint=None,
 ):
-    """Build the owner-specified product-window delivered Sigma plan."""
+    """Build and validate the product-window delivered Sigma plan.
+
+    The two numerical inputs are ``envelope_relative_target`` and the physical
+    broadening ``regularization_width_ry``. Product geometry, the global pair
+    ceiling, per-window allowances, contour data, and ranks are derived from
+    the measured supports. Sign-definite windows use shipped lookup; crossing
+    windows use measure-adapted ROQ with a tightening retry. A window that no
+    product rule can serve refuses; no direct state--pole path exists.
+    """
     started = time.perf_counter()
     branch_rows = list(branches)
     omega_grid = np.asarray(omega_grid_ry, dtype=np.float64)
