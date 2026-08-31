@@ -66,7 +66,7 @@ TIGHTEN_FLOOR = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 6
+_PLAN_CACHE_VERSION = 7
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -438,11 +438,10 @@ def _load_plan_cache(path, fingerprint, n_specs):
 
 
 def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
-                          total_absolute):
+                          pointwise_budget):
     """Re-certify cached nodes and weights on the live measured problems."""
     if len(fits) != len(specs):
         return None
-    required_cost = 0.0
     for spec, fit in zip(specs, fits):
         try:
             times = np.asarray(fit["times"], np.complex128)
@@ -463,15 +462,16 @@ def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
         required = max(
             metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
             / AMPLIFICATION_NOISE_SAFETY)
-        required_cost += float(spec["envelope"] * required)
         fit.update(metrics=metrics, factor_growth=factor,
                    required_target=required,
                    absolute_cost=float(spec["envelope"] * required))
+    pointwise_cost = _pointwise_rule_costs(
+        specs, fits, np.asarray(pointwise_budget).size)
     if (sum(int(np.asarray(fit["times"]).size) for fit in fits)
             > int(pair_ceiling)
-            or required_cost > float(total_absolute)):
+            or np.any(pointwise_cost > np.asarray(pointwise_budget))):
         return None
-    return float(required_cost)
+    return float(np.max(pointwise_cost, initial=0.0))
 
 
 def _save_plan_cache(path, fingerprint, fits, free_pairs, required_cost,
@@ -1744,12 +1744,13 @@ def _merge_branch_specs(group):
         # fingerprint and the report.  The real range lives in pole_bounds.
         pole_interval=-1,
         E_ref_A=float(np.min(raw)),
-        envelope=float(np.max(envelope_by_frequency)))
+        envelope=float(np.max(envelope_by_frequency)),
+        envelope_by_frequency=envelope_by_frequency)
     return merged
 
 
 def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
-                          total_absolute, trial_candidates=None):
+                          pointwise_budget, trial_candidates=None):
     """Replace a branch's windows by one merged window when that costs less.
 
     Tried, not assumed: the merged window is fitted and kept only if it is
@@ -1767,7 +1768,7 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
         merged = _merge_branch_specs(group)
         if merged is None:
             continue
-        allowance = min(0.5, total_absolute / merged["envelope"])
+        allowance = _pointwise_window_allowance(merged, pointwise_budget)
         split_nodes = sum(int(candidates[i][0]["times"].size)
                           for i in indices)
         # A merged rule is only ever KEPT below the split's node count, so
@@ -1941,11 +1942,41 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
         float(residual), float(amplification))
 
 
+def _pointwise_rule_costs(specs, candidates, frequency_count):
+    """Return achieved envelope error at every externally served frequency."""
+    costs = np.zeros(int(frequency_count), dtype=np.float64)
+    for spec, candidate in zip(specs, candidates):
+        np.add.at(
+            costs, np.asarray(spec["omega_idx"], dtype=np.int64),
+            np.asarray(spec["envelope_by_frequency"], dtype=np.float64)
+            * float(candidate["required_target"]))
+    return costs
+
+
+def _pointwise_window_allowance(spec, pointwise_budget):
+    """Largest relative error this window alone may spend at every omega."""
+    positions = np.asarray(spec["omega_idx"], dtype=np.int64)
+    envelope = np.asarray(spec["envelope_by_frequency"], dtype=np.float64)
+    return min(0.5, float(np.min(
+        np.asarray(pointwise_budget, dtype=np.float64)[positions] / envelope)))
+
+
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
-                  pair_ceiling):
-    """Exact small integer plan: minimum pairs whose budget cost fits."""
+                  pair_ceiling, *, pointwise_budget):
+    """Minimum-pair scalar search, followed by pointwise contract validation."""
+    pointwise_budget = np.asarray(pointwise_budget, dtype=np.float64)
+    surrogate_frequency = int(np.argmax(pointwise_budget))
+
+    def surrogate_cost(spec, candidate):
+        positions = np.asarray(spec["omega_idx"], dtype=np.int64)
+        local = np.nonzero(positions == surrogate_frequency)[0]
+        if not local.size:
+            return 0.0
+        envelope = np.asarray(spec["envelope_by_frequency"], dtype=np.float64)
+        return float(envelope[local[0]] * candidate["required_target"])
+
     states = {0: (0.0, ())}
-    for candidates in candidates_by_window:
+    for spec, candidates in zip(specs, candidates_by_window):
         next_states = {}
         for used, (cost, choices) in states.items():
             for index, candidate in enumerate(candidates):
@@ -1953,14 +1984,23 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
                 new_used = used + nodes
                 if new_used > int(pair_ceiling):
                     continue
-                new_cost = cost + candidate["absolute_cost"]
+                new_cost = cost + surrogate_cost(spec, candidate)
                 previous = next_states.get(new_used)
                 if previous is None or new_cost < previous[0]:
                     next_states[new_used] = (new_cost, choices + (index,))
         states = next_states
-    feasible = [(nodes, cost, choices)
-                for nodes, (cost, choices) in states.items()
-                if cost <= float(total_absolute_budget)]
+    surrogate_budget = float(pointwise_budget[surrogate_frequency])
+    feasible = []
+    for nodes, (cost, choices) in states.items():
+        if cost > surrogate_budget:
+            continue
+        selected = [candidates[index] for candidates, index in zip(
+            candidates_by_window, choices)]
+        pointwise_cost = _pointwise_rule_costs(
+            specs, selected, pointwise_budget.size)
+        if np.all(pointwise_cost <= pointwise_budget):
+            feasible.append((nodes, float(np.max(pointwise_cost)), choices,
+                             pointwise_cost))
     if not feasible:
         best = min(states.items(), key=lambda item: item[1][0], default=None)
         blocking = max(
@@ -1969,9 +2009,23 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
         candidate = min(blocking[1], key=lambda row: row["absolute_cost"])
         metrics = candidate["metrics"]
         detail = "no bounded combination"
+        best_cost = float("inf")
+        blocking_budget = float(total_absolute_budget)
         if best is not None:
-            detail = (f"best cost={best[1][0]:.6g}, "
-                      f"budget={float(total_absolute_budget):.6g}")
+            choices = best[1][1]
+            selected = [candidates[index] for candidates, index in zip(
+                candidates_by_window, choices)]
+            costs = _pointwise_rule_costs(
+                specs, selected, pointwise_budget.size)
+            ratios = np.divide(
+                costs, pointwise_budget, out=np.zeros_like(costs),
+                where=pointwise_budget > 0.0)
+            blocking_frequency = int(np.argmax(ratios))
+            best_cost = float(costs[blocking_frequency])
+            blocking_budget = float(pointwise_budget[blocking_frequency])
+            detail = (f"pointwise cost={best_cost:.6g}, "
+                      f"budget={blocking_budget:.6g}, "
+                      f"frequency index={blocking_frequency}")
         message = (
             f"delivered product window {blocking[0]['name']!r} refused: "
             f"achieved (residual={metrics[0]:.6g}, "
@@ -1981,13 +2035,19 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
             # Nothing fits under the node ceiling; tightening cannot help.
             raise RuntimeError(message)
         raise _BudgetShortfall(
-            message, best[1][0], float(total_absolute_budget))
-    nodes, required_cost, choices = min(feasible, key=lambda row: (row[0], row[1]))
+            message, best_cost, blocking_budget)
+    nodes, required_cost, choices, pointwise_cost = min(
+        feasible, key=lambda row: (row[0], row[1]))
     selected = [candidates[index]
                 for candidates, index in zip(candidates_by_window, choices)]
-    envelope_sum = sum(spec["envelope"] for spec in specs)
-    spare_relative = ((float(total_absolute_budget) - required_cost)
-                      / envelope_sum)
+    selected_envelope = _pointwise_rule_costs(
+        specs, [{"required_target": 1.0}] * len(specs),
+        pointwise_budget.size)
+    spare = np.divide(
+        pointwise_budget - pointwise_cost, selected_envelope,
+        out=np.full_like(pointwise_budget, np.inf),
+        where=selected_envelope > 0.0)
+    spare_relative = max(0.0, float(np.min(spare)))
     for spec, candidate in zip(specs, selected):
         candidate["residual_target"] = (
             candidate["required_target"] + spare_relative)
@@ -2206,7 +2266,9 @@ def build_delivered_sigma_windows(
                         "E_ref_A": E_ref,
                         "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
                         "omega_idx": patch_positions,
-                        "envelope": envelope, "branch_report": report,
+                        "envelope": envelope,
+                        "envelope_by_frequency": envelope_by_frequency,
+                        "branch_report": report,
                     }
                     specs.append(spec)
                     combined_envelope[patch_positions] += envelope_by_frequency
@@ -2223,8 +2285,9 @@ def build_delivered_sigma_windows(
                     if max_nodes is not None else derived_ceiling)
 
     combined_scale = float(np.max(combined_envelope))
-    total_absolute = target * combined_scale * safety
-    allowances = [min(0.5, total_absolute / spec["envelope"])
+    pointwise_budget = target * combined_envelope * safety
+    total_absolute = float(np.max(pointwise_budget))
+    allowances = [_pointwise_window_allowance(spec, pointwise_budget)
                   for spec in specs]
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
@@ -2241,7 +2304,8 @@ def build_delivered_sigma_windows(
         if not fingerprint_match:
             validated_cost = _validate_cached_fits(
                 specs, fits, eta=eta, factor_cap=factor_cap,
-                pair_ceiling=pair_ceiling, total_absolute=total_absolute)
+                pair_ceiling=pair_ceiling,
+                pointwise_budget=pointwise_budget)
             if validated_cost is None:
                 cached = None
             else:
@@ -2391,14 +2455,15 @@ def build_delivered_sigma_windows(
                 (specs, candidates_by_window, trial_rows,
                  consolidation_cache) = _consolidate_branches(
                     specs, candidates_by_window, eta, pair_ceiling, factor_cap,
-                    total_absolute, consolidation_cache)
+                    pointwise_budget, consolidation_cache)
             consolidation_seconds += (
                 time.perf_counter() - consolidation_started)
             consolidation_rows.extend(trial_rows)
             selection_started = time.perf_counter()
             try:
                 fits, free_pairs, required_cost = _select_rules(
-                    specs, candidates_by_window, total_absolute, pair_ceiling)
+                    specs, candidates_by_window, total_absolute, pair_ceiling,
+                    pointwise_budget=pointwise_budget)
                 selection_seconds += time.perf_counter() - selection_started
                 break
             except RuntimeError as exc:
@@ -2416,7 +2481,8 @@ def build_delivered_sigma_windows(
                     try:
                         fits, free_pairs, required_cost = _select_rules(
                             unconsolidated_specs, unconsolidated_candidates,
-                            total_absolute, pair_ceiling)
+                            total_absolute, pair_ceiling,
+                            pointwise_budget=pointwise_budget)
                         specs = unconsolidated_specs
                         candidates_by_window = unconsolidated_candidates
                         selection_seconds += (
@@ -2441,6 +2507,11 @@ def build_delivered_sigma_windows(
             candidates_by_window=[[fit] for fit in fits],
             source="fit_cache")
 
+    required_pointwise = _pointwise_rule_costs(
+        specs, fits, pointwise_budget.size)
+    pointwise_fraction = np.divide(
+        required_pointwise, pointwise_budget,
+        out=np.zeros_like(required_pointwise), where=pointwise_budget > 0.0)
     output = []
     for spec, fit in zip(specs, fits):
         branch = spec["branch"]
@@ -2565,6 +2636,8 @@ def build_delivered_sigma_windows(
         "envelope_error_safety": safety,
         "planned_absolute_envelope_error_budget": total_absolute,
         "required_absolute_envelope_budget": required_cost,
+        "max_pointwise_envelope_budget_fraction": float(
+            np.max(pointwise_fraction, initial=0.0)),
         "combined_inverse_gap_envelope": combined_scale,
         "envelope_to_physical_exchange_rate": exchange_rate,
         "exchange_rate_calibration": calibration,
