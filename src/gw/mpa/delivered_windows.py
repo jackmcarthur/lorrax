@@ -10,9 +10,10 @@ certificate chain is: catalog range and scaled sup-norm bound, physical
 rescaling by the smallest gap, achieved error on the fitting lattice, achieved
 error on the refined validation lattice, and the runtime-noise gate.  A table
 that misses the measured gate is replaced by the next tighter or wider shipped
-table.  Crossing windows first try shipped HGL tables and otherwise perform one
-deterministic fixed-time weight fit.  The planner never evaluates explicit
-state--pole pairs and never emits zero-time or direct terms.
+table.  Crossing windows first try shipped HGL tables and otherwise use one
+positive causal Gauss construction.  The planner never runs an optimization
+sweep, evaluates explicit state--pole pairs, or emits zero-time or direct
+terms.
 
 The final acceptance test is
 
@@ -64,10 +65,10 @@ _PLAN_CACHE_VERSION = 10
 # select those tables safely.
 _CROSSING_EPS_Q = 1.0e-3
 
-# The one crossing fallback uses one deterministic IRLS call.  Twelve steps
-# with three-step patience and 20% conditioning slack are the frozen-Na
-# settings that keep both crossing windows below their incumbent residuals
-# while leaving the complete six-window fitting stage below three seconds.
+# The legacy fitted crossing construction remains as a directly tested
+# diagnostic.  Production fallback is the positive Gauss rule below: unlike
+# IRLS it has no optimization loop and its fixed node formula carries the
+# planner's sub-five-second contract across process counts.
 _CROSSING_FIT_ITERATIONS = 12
 _CROSSING_FIT_STALL = 3
 _CROSSING_CONDITIONING_SLACK = 0.2
@@ -77,6 +78,12 @@ _CROSSING_CONDITIONING_SLACK = 0.2
 # present in evaluator.damped_rectangle_gauss_rule; it fixes the time interval
 # without a search over tail fractions.
 _CROSSING_TAIL_FRACTION = 0.9
+
+# 5/4 is the smallest simple fixed oversampling factor that passed both the
+# compact metallic child-window validation and the live Na validation lattice
+# under the same residual/noise gates (2026-08-31).  It is quadrature geometry,
+# not a user dial or a searched candidate ladder.
+_CROSSING_GAUSS_OVERSAMPLING = 1.25
 
 
 class _CrossingRuleRefusal(RuntimeError):
@@ -1333,7 +1340,7 @@ def _positive_crossing_once(problem, pole_sign, relative_target, max_nodes):
     """Build one stable causal Gauss rule after the fitted rule refuses.
 
     The time ceiling leaves ``0.9 * target`` in the omitted exponential
-    tail.  One Gauss node per eta-scaled half wavelength resolves the
+    tail.  Five Gauss nodes per four eta-scaled half wavelengths resolve the
     remaining finite interval without a node or tolerance search.  The live
     fitting and validation lattices still own acceptance; this construction
     is only a bounded product-window candidate, never a direct-pair route.
@@ -1343,11 +1350,12 @@ def _positive_crossing_once(problem, pole_sign, relative_target, max_nodes):
     dimensionless_t_max = np.log(
         1.0 / (_CROSSING_TAIL_FRACTION * target))
     node_count = max(
-        2, int(np.ceil(A_dim * dimensionless_t_max / np.pi)))
+        2, int(np.ceil(_CROSSING_GAUSS_OVERSAMPLING
+                       * A_dim * dimensionless_t_max / np.pi)))
     if node_count > int(max_nodes):
         raise RuntimeError(
             f"positive crossing support A={A_dim:.6g} needs {node_count} "
-            f"half-wavelength nodes, max_nodes={int(max_nodes)}")
+            f"oversampled half-wavelength nodes, max_nodes={int(max_nodes)}")
     t_max = dimensionless_t_max / gamma_min
     tau, positive_weights = gauss_legendre_interval(
         node_count, 0.0, t_max)
@@ -1360,7 +1368,7 @@ def _positive_crossing_once(problem, pole_sign, relative_target, max_nodes):
         "candidate_tolerance": float(relative_target),
         "eta_floor_ry": gamma_min,
         "time_ceiling_ry_inverse": float(t_max),
-        "node_resolution": "one node per eta-scaled half wavelength",
+        "node_resolution": "five nodes per four eta-scaled half wavelengths",
         "tail_budget_fraction": _CROSSING_TAIL_FRACTION,
         "provenance": "one deterministic positive causal Gauss rule",
     }
@@ -1492,22 +1500,14 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
     if candidates:
         return candidates
     if spec["kind"] == "crossing":
-        # These are two fixed constructions, not a searched ladder.  Retain
-        # both when both pass so the complete-plan selector can trade a few
-        # extra nodes for a smaller achieved error.
-        fallbacks = (
-            lambda: _fit_crossing_once(
+        # One deterministic positive quadrature is the whole fallback.  It
+        # keeps the product-window contract but avoids turning planning back
+        # into an optimization stage after lookup refusal.
+        candidates = accepted_rows((
+            _positive_crossing_once(
                 spec["problem"], spec["pole_sign"], relative_target,
                 max_nodes),
-            lambda: _positive_crossing_once(
-                spec["problem"], spec["pole_sign"], relative_target,
-                max_nodes),
-        )
-        candidates = []
-        for build in fallbacks:
-            def one_row(build=build):
-                yield build()
-            candidates.extend(accepted_rows(one_row()))
+        ))
         if candidates:
             return candidates
     residual, amplification = best_pair
@@ -1522,7 +1522,7 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
     refusal = (
         f"delivered product window {spec['name']!r} refused: achieved "
         f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
-        "the shipped product-window family and its one crossing fallback "
+        "the shipped product-window family and its positive crossing rule "
         "did not survive the residual, noise, and factor-growth gates"
         f"{geometry}")
     if spec["kind"] == "crossing":
@@ -2001,8 +2001,13 @@ def build_delivered_sigma_windows(
                         resolved_candidates.append(
                             candidates_by_window[index])
                     continue
-                children = _split_refused_crossing(
-                    spec, geometry["state_edge_ry"], int(lattice_bins))
+                try:
+                    children = _split_refused_crossing(
+                        spec, geometry["state_edge_ry"], int(lattice_bins))
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"delivered product window {spec['name']!r} "
+                        f"refused: {exc}") from exc
                 resolved_specs.extend(children)
                 if fit_here:
                     resolved_candidates.extend([

@@ -321,7 +321,9 @@ def test_positive_crossing_recovery_has_no_node_search():
     _oriented, _gamma, radius = delivered._crossing_geometry(problem, 1.0)
     dimensionless_t_max = np.log(
         1.0 / (delivered._CROSSING_TAIL_FRACTION * target))
-    expected_nodes = int(np.ceil(radius * dimensionless_t_max / np.pi))
+    expected_nodes = int(np.ceil(
+        delivered._CROSSING_GAUSS_OVERSAMPLING
+        * radius * dimensionless_t_max / np.pi))
     assert times.size == expected_nodes
     assert np.all(times > 0.0)
     assert np.all(weights.real == 0.0)

@@ -4464,7 +4464,7 @@ def run_sc_driver(
     e_ref: float,
     static_head_terms,
     head_resolver,
-    screening_model_fn,
+    screening_model_fn=None,
     config,
     meta,
     mesh_xy: Mesh,
