@@ -2,14 +2,15 @@
 
 This is an offline study driver, not a runtime planner.  It freezes the
 DEV-80 measure construction and reuses one weighted snapshot eigensolve for
-an ascending integer-rank scan.  Each accepted rank is scored only on the
-independent 50-bin validation lattice.
+an ascending rank scan.  Each accepted rank is scored only on the independent
+50-bin validation lattice and must also pass the runtime-noise gate.
 
-The contour constants come from the Na ROQ anchor recorded by source commit
-1426d9f4: conduction uses the real-time resonant contour (260 Ry^-1, rounded
-to 20 eV^-1 here), while valence uses -58 degrees and 27 Ry^-1 (rounded to
-2 eV^-1).  They are fixed across widths and seeds; this study does not tune
-them after seeing a result.
+The controlled family keeps the actual DEV-80 crossing mass and widths.  For
+each branch it translates the delivery interval to the nearest support edge
+and grows the interval and included measure together.  Translation does not
+change the reciprocal kernel.  The causal contour is real time, and its
+horizon is the elementary truncation horizon log(1 / target) / eta.  Thus the
+only accuracy dials are the target and eta.
 """
 
 from __future__ import annotations
@@ -56,16 +57,12 @@ DEFAULT_CATALOG = Path(
     "services/minimax/src/minimax/minimax_assets/catalog.json"
 )
 ETA_EV = 0.25
-WIDTHS_EV = (2.5, 5.0, 10.0, 20.0)
-# These are the production-geometry crossing radii requested in the brief,
-# not width / eta.  The toy frequency grids scale with the widths above.
 A_OVER_ETA = (12.0, 24.0, 47.0, 94.0)
+WIDTHS_EV = tuple(value * ETA_EV for value in A_OVER_ETA)
 TARGETS = (1.0e-3, 1.0e-4)
 TABLE_ERROR_FOR_TARGET = {1.0e-3: 1.0e-4, 1.0e-4: 1.0e-5}
-CONTOURS = {
-    "cond": {"angle_deg": 0.0, "horizon": 20.0},
-    "val": {"angle_deg": -58.0, "horizon": 2.0},
-}
+RUNTIME_NOISE = 6.0e-8
+NOISE_FRACTION = 0.05
 
 
 def _sha256(path: Path) -> str:
@@ -105,8 +102,9 @@ def _infer_sigma(problem: ReciprocalMeasureProblem) -> int:
     raise ValueError("measure crosses causal half-planes")
 
 
-def build_toy_group(study: Path, seed: int, branch: str, width_ev: float):
-    """Build one whole toy branch on the DEV-80 25/50-bin lattices."""
+def build_toy_group(study: Path, seed: int, branch: str, width_ev: float,
+                    target: float):
+    """Build one translated crossing window on DEV-80 25/50-bin lattices."""
     run_study, toy_models = _load_study_modules(study)
     ensemble_path = study / f"data/toy_ensemble_seed{seed}.npz"
     ensemble = dict(np.load(ensemble_path))
@@ -114,30 +112,52 @@ def build_toy_group(study: Path, seed: int, branch: str, width_ev: float):
         pole = np.asarray(ensemble[half], np.complex128)
         ensemble[half] = pole.real - 1.0j * ((-pole.imag) + ETA_EV)
     terms = toy_models.branch_terms(ensemble, branch)
+    raw_internal = terms["internal_sum"]
+    if branch == "cond":
+        omega_min = float(np.min(raw_internal.real))
+        omega_max = omega_min + float(width_ev)
+        keep = raw_internal.real <= omega_max
+    else:
+        omega_max = float(np.max(raw_internal.real))
+        omega_min = omega_max - float(width_ev)
+        keep = raw_internal.real >= omega_min
+    if not np.any(keep):
+        raise ValueError(f"empty crossing window for {branch} width {width_ev}")
     fit_cells, fit_mass, val_cells, val_mass = run_study.lattice_measure(
-        terms["internal_sum"], terms["mass_abs_residue"], bins_per_axis=25
+        raw_internal[keep], terms["mass_abs_residue"][keep], bins_per_axis=25
     )
-    frequencies = np.linspace(0.0, float(width_ev), 81)
+    frequencies = np.linspace(omega_min, omega_max, 81)
     fit = ReciprocalMeasureProblem(frequencies, fit_cells, fit_mass)
     validation = ReciprocalMeasureProblem(frequencies, val_cells, val_mass)
-    contour = CONTOURS[branch]
+    horizon = float(np.log(1.0 / float(target)) / ETA_EV)
     group = RoqGroup(
         f"toy_s{seed}_{branch}_w{width_ev:g}", fit, validation,
-        sigma=_infer_sigma(fit), angle_deg=contour["angle_deg"],
-        horizon=contour["horizon"],
+        sigma=_infer_sigma(fit), angle_deg=0.0, horizon=horizon,
     )
-    return group, ensemble_path
+    selection = {
+        "omega_min_ev": omega_min,
+        "omega_max_ev": omega_max,
+        "raw_cell_count": int(np.count_nonzero(keep)),
+        "raw_cell_fraction": float(np.mean(keep)),
+        "raw_mass_fraction": float(
+            np.sum(terms["mass_abs_residue"][keep])
+            / np.sum(terms["mass_abs_residue"])
+        ),
+    }
+    return group, ensemble_path, selection
 
 
-def _fixed_basis_rank_scan(group: RoqGroup, max_rank: int, base_nodes: int):
-    """Return every rank through the first 1e-4 validation-lattice pass."""
+def _fixed_basis_rank_scan(group: RoqGroup, target: float, max_rank: int,
+                           base_nodes: int, rank_step: int):
+    """Bracket the first accepted rank, then check every rank in its bracket."""
     scan_started = time.perf_counter()
     basis_started = time.perf_counter()
     candidates, gl = _candidates(group, base_nodes)
     singular, basis = _weighted_subspace(group, candidates, gl, max_rank)
     basis_seconds = time.perf_counter() - basis_started
-    rows = []
-    for rank in range(4, max_rank + 1):
+    rows_by_rank = {}
+
+    def evaluate(rank):
         rank_started = time.perf_counter()
         pivots = la.qr(basis[:, :rank].T, mode="economic", pivoting=True)[2]
         selected = np.sort(pivots[:rank])
@@ -149,26 +169,48 @@ def _fixed_basis_rank_scan(group: RoqGroup, max_rank: int, base_nodes: int):
         kappa_p99, kappa_max = rule_amplification(
             times, weights, group.validation
         )
-        rows.append({
+        gate_limit = NOISE_FRACTION * float(target)
+        row = {
             "rank": rank,
             "max_error": float(np.max(error)),
             "kappa_p99": float(kappa_p99),
             "kappa_max": float(kappa_max),
+            "runtime_noise_bound": float(kappa_p99 * RUNTIME_NOISE),
+            "runtime_noise_budget": gate_limit,
+            "error_pass": bool(np.max(error) <= target),
+            "noise_pass": bool(kappa_p99 * RUNTIME_NOISE <= gate_limit),
             "singular_ratio": float(singular[rank - 1] / singular[0]),
             "rank_seconds": time.perf_counter() - rank_started,
-        })
-        if all(any(row["max_error"] <= target for row in rows)
-               for target in TARGETS):
+        }
+        row["accepted"] = row["error_pass"] and row["noise_pass"]
+        rows_by_rank[rank] = row
+        print(
+            f"rank {rank}: error={row['max_error']:.6e} "
+            f"kappa={row['kappa_p99']:.6g} accepted={row['accepted']} "
+            f"wall={row['rank_seconds']:.3f}s",
+            flush=True,
+        )
+        return row
+
+    coarse_ranks = list(range(4, max_rank + 1, int(rank_step)))
+    if coarse_ranks[-1] != max_rank:
+        coarse_ranks.append(max_rank)
+    accepted_rank = None
+    previous = 3
+    for rank in coarse_ranks:
+        row = evaluate(rank)
+        if row["accepted"]:
+            accepted_rank = rank
             break
-    return rows, basis_seconds, time.perf_counter() - scan_started
-
-
-def _selected_rows(rows):
-    selected = {}
-    for target in TARGETS:
-        matches = [row for row in rows if row["max_error"] <= target]
-        selected[f"{target:.0e}"] = matches[0] if matches else None
-    return selected
+        previous = rank
+    if accepted_rank is not None:
+        for rank in range(previous + 1, accepted_rank):
+            evaluate(rank)
+    rows = [rows_by_rank[rank] for rank in sorted(rows_by_rank)]
+    matches = [row for row in rows if row["accepted"]]
+    selected = min(matches, key=lambda row: row["rank"]) if matches else None
+    return (rows, selected, basis_seconds,
+            time.perf_counter() - scan_started)
 
 
 def _certified_counts(catalog_path: Path, a_over_eta: float):
@@ -203,19 +245,22 @@ def main() -> None:
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument("--seed", type=int, choices=range(4), required=True)
     parser.add_argument("--branch", choices=("cond", "val"), required=True)
-    parser.add_argument("--width-ev", type=float, choices=WIDTHS_EV,
+    parser.add_argument("--a-over-eta", type=float, choices=A_OVER_ETA,
                         required=True)
+    parser.add_argument("--target", type=float, choices=TARGETS, required=True)
     parser.add_argument("--max-rank", type=int, default=180)
     parser.add_argument("--base-nodes", type=int, default=384)
+    parser.add_argument("--rank-step", type=int, default=8)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
-    width_index = WIDTHS_EV.index(args.width_ev)
-    group, ensemble_path = build_toy_group(
-        args.study, args.seed, args.branch, args.width_ev
+    width_index = A_OVER_ETA.index(args.a_over_eta)
+    width_ev = WIDTHS_EV[width_index]
+    group, ensemble_path, selection = build_toy_group(
+        args.study, args.seed, args.branch, width_ev, args.target
     )
-    rows, basis_seconds, scan_seconds = _fixed_basis_rank_scan(
-        group, args.max_rank, args.base_nodes
+    rows, selected, basis_seconds, scan_seconds = _fixed_basis_rank_scan(
+        group, args.target, args.max_rank, args.base_nodes, args.rank_step
     )
     payload = {
         "schema": "roq-scaling-study/v1",
@@ -237,25 +282,33 @@ def main() -> None:
         "catalog_sha256": _sha256(args.catalog),
         "seed": args.seed,
         "branch": args.branch,
-        "width_ev": args.width_ev,
+        "width_ev": width_ev,
         "eta_ev": ETA_EV,
-        "a_over_eta": A_OVER_ETA[width_index],
-        "contour": CONTOURS[args.branch],
+        "a_over_eta": args.a_over_eta,
+        "target": args.target,
+        "contour": {"angle_deg": 0.0, "horizon": group.horizon},
+        "window_selection": selection,
         "fit_shape": list(group.fit.denominators.shape),
         "validation_shape": list(group.validation.denominators.shape),
         "max_rank": args.max_rank,
         "base_nodes": args.base_nodes,
+        "rank_step": args.rank_step,
         "basis_seconds": basis_seconds,
         "scan_seconds": scan_seconds,
-        "selected": _selected_rows(rows),
-        "certified": _certified_counts(args.catalog,
-                                         A_OVER_ETA[width_index]),
+        "selected": selected,
+        "selected_plan_seconds": (
+            None if selected is None
+            else basis_seconds + selected["rank_seconds"]
+        ),
+        "certified": _certified_counts(args.catalog, args.a_over_eta)[
+            f"{args.target:.0e}"
+        ],
         "rank_scan": rows,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps({key: payload[key] for key in (
-        "seed", "branch", "width_ev", "a_over_eta", "basis_seconds",
+        "seed", "branch", "width_ev", "a_over_eta", "target", "basis_seconds",
         "scan_seconds", "selected", "certified"
     )}, indent=2), flush=True)
 
