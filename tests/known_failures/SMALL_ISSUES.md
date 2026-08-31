@@ -925,3 +925,15 @@ across two logs without checking the `XLA allocator:` line in both, and read
 `host_accum`/`d2h_wait` as the device wall on the BFC arm
 (`src/gw/ppm_accumulators.py:425`). Full ladder and adjudication:
 `tests/known_failures/2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`.
+
+## 48. `mpa_sigma_max_nodes` remains a live deck key after its replacement (2026-08-31)
+
+The delivered planner derives its global pair ceiling from measured product
+supports in `gw.mpa.delivered_windows._derived_pair_ceiling`, and its own
+docstring says that this replaces the user dial. The deck surface nevertheless
+still defines `mpa_sigma_max_nodes = 96`, validates it in `MPAConfig`, and
+passes it from `sigma_dispatch` into MPA planning. The owner ruling deletes the
+key because a user should not guess a resource ceiling already determined by
+the supports. Removing that live parser/config surface changes accepted input
+and is outside the documentation-only lane; live documentation no longer
+presents the key as supported.
