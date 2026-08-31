@@ -616,10 +616,15 @@ def test_crossing_walk_can_defer_tighter_tables_until_global_retry(monkeypatch):
         spec, 0.1, 8, 30.0, 1.0e-3, True)
     complete = delivered._candidate_rules(
         spec, 0.1, 8, 30.0, 1.0e-3)
+    resumed = delivered._candidate_rules(
+        spec, 0.1, 8, 30.0, 1.0e-3, True,
+        first[0]["evidence"]["provenance"])
 
     assert len(first) == 1
     assert len(complete) == 2
+    assert len(resumed) == 1
     assert first[0]["evidence"]["candidate_tolerance"] == 1.0e-4
+    assert resumed[0]["evidence"]["candidate_tolerance"] == 1.0e-5
 
 
 def test_tolerance_ladder_is_deleted():

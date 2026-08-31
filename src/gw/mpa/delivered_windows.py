@@ -1380,7 +1380,8 @@ def _factor_growth(spec, times, eta):
 
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
-                     relative_target, first_accepted_only=False):
+                     relative_target, first_accepted_only=False,
+                     resume_after_provenance=None):
     """Return every shipped rule passing the measured window gates.
 
     The complete-plan selector needs the tighter accepted lookup choices to
@@ -1401,6 +1402,7 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
         nonlocal best_pair
         accepted = []
         iterator = iter(rule_rows)
+        resumed = resume_after_provenance is None
         while True:
             try:
                 times, weights, evidence = next(iterator)
@@ -1411,6 +1413,10 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 raise RuntimeError(
                     f"delivered product window {spec['name']!r} refused: "
                     f"{exc}") from exc
+            if not resumed:
+                if evidence["provenance"] == resume_after_provenance:
+                    resumed = True
+                continue
             try:
                 candidate = _rule_candidate(
                     spec["problem"], spec["validation"],
@@ -1447,13 +1453,19 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 attempts.append({
                     "family": evidence.get("family", "unknown"),
                     "candidate_tolerance": evidence.get(
-                        "candidate_tolerance"),
+                    "candidate_tolerance"),
                     "refusal": str(exc)})
+        if not resumed:
+            raise RuntimeError(
+                f"delivered product window {spec['name']!r} could not "
+                "resume its deterministic table walk")
         return accepted
 
     candidates = accepted_rows(table_rows)
     if candidates:
         return candidates
+    if resume_after_provenance is not None:
+        return []
     if spec["kind"] == "crossing":
         # At most one optimized fit exists, and a covered accepted table
         # always wins over it.
@@ -1787,25 +1799,42 @@ def build_delivered_sigma_windows(
             candidates_by_window = [
                 _candidate_rules(
                     spec, eta, node_ceiling, factor_cap,
-                    relative_target, spec["kind"] == "crossing")
+                    relative_target, True)
                 for spec, relative_target in zip(specs, candidate_targets)]
-            try:
-                fits, free_pairs, required_cost = _select_rules(
-                    specs, candidates_by_window, total_absolute, node_ceiling)
-            except RuntimeError:
-                # The first accepted causal table is normally already far
-                # below the delivered residual gate.  Only if the global
-                # achieved-error budget still fails do we pay to measure its
-                # tighter catalog alternatives; this preserves the complete
-                # selector without making every ordinary plan scan them.
-                candidates_by_window = [
-                    (_candidate_rules(
-                        spec, eta, node_ceiling, factor_cap, relative_target)
-                     if spec["kind"] == "crossing" else candidates)
-                    for spec, relative_target, candidates in zip(
-                        specs, candidate_targets, candidates_by_window)]
-                fits, free_pairs, required_cost = _select_rules(
-                    specs, candidates_by_window, total_absolute, node_ceiling)
+            exhausted = set()
+            while True:
+                try:
+                    fits, free_pairs, required_cost = _select_rules(
+                        specs, candidates_by_window, total_absolute,
+                        node_ceiling)
+                    break
+                except RuntimeError as selection_error:
+                    # Expand the window spending the most achieved error, one
+                    # accepted table at a time.  The exact selector runs after
+                    # every addition.  If every ladder is exhausted, preserve
+                    # its original global-budget refusal.
+                    order = sorted(
+                        (index for index in range(len(specs))
+                         if index not in exhausted),
+                        key=lambda index: min(
+                            row["absolute_cost"]
+                            for row in candidates_by_window[index]),
+                        reverse=True)
+                    advanced = False
+                    for index in order:
+                        alternatives = _candidate_rules(
+                            specs[index], eta, node_ceiling, factor_cap,
+                            candidate_targets[index], True,
+                            candidates_by_window[index][-1]["evidence"][
+                                "provenance"])
+                        if not alternatives:
+                            exhausted.add(index)
+                            continue
+                        candidates_by_window[index].extend(alternatives)
+                        advanced = True
+                        break
+                    if not advanced:
+                        raise selection_error
             window_tau_pairs = free_pairs
             _save_plan_cache(
                 plan_cache_path, cache_fingerprint, fits, free_pairs,
