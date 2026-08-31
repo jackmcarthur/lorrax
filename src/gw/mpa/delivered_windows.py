@@ -1123,6 +1123,12 @@ def _crossing_geometry(problem, pole_sign):
     return oriented, gamma_min, radius / gamma_min
 
 
+def _crossing_fit_span(problem, pole_sign):
+    """End-to-end real span seen by the one allowed crossing fit."""
+    oriented, gamma_min, _radius = _crossing_geometry(problem, pole_sign)
+    return float(np.ptp(oriented.real)) / gamma_min
+
+
 def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
                             pole_sign, state_edge, bins):
     """Return the smallest exact omega-patch routing covered by HGL.
@@ -1144,7 +1150,8 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
         raise RuntimeError("the shipped HGL family is empty")
     widest_span = max(float(entry.range_max) for entry in entries)
     if (_window_kind(problem) != "crossing"
-            or _crossing_geometry(problem, pole_sign)[2]
+            or max(_crossing_geometry(problem, pole_sign)[2],
+                   _crossing_fit_span(problem, pole_sign))
             <= widest_span + 1.0e-12):
         return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
 
@@ -1169,7 +1176,8 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
                 state_positions, shell_bounds, measure,
                 problem.frequencies[patch], pole_sign, int(bins))
             if (shell is not None and _window_kind(shell[0]) == "crossing"
-                    and _crossing_geometry(shell[0], pole_sign)[2]
+                    and max(_crossing_geometry(shell[0], pole_sign)[2],
+                            _crossing_fit_span(shell[0], pole_sign))
                     > widest_span + 1.0e-12):
                 planned = []
                 break
@@ -1254,7 +1262,7 @@ def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     # the support radius above.  The unconstrained IRLS fallback keeps its
     # established density against the complete real span; it is not an HGL
     # certificate and reducing that grid changed its conditioning.
-    fit_A_dim = float(np.ptp(oriented.real)) / gamma_min
+    fit_A_dim = _crossing_fit_span(problem, pole_sign)
     # The shipped odd HGL rule is certified by its radius.  The fallback is
     # an unconstrained fit to the complete measured interval, so its node
     # density must instead follow that interval's end-to-end span.  This is
