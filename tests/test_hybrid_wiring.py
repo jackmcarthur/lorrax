@@ -171,7 +171,7 @@ def test_mpa_pole_windows_reconstruct_a_small_true_sigma():
     assert relative <= 2.0e-3
 
 
-def test_global_tau_pair_ceiling_rejects_collectively_over_budget_windows(
+def test_node_ceiling_applies_to_each_product_window_rule(
         monkeypatch):
     def two_node_candidates(spec, eta, max_nodes, factor_growth_cap,
                             *args, **kwargs):
@@ -187,6 +187,7 @@ def test_global_tau_pair_ceiling_rejects_collectively_over_budget_windows(
             "evidence": {
                 "family": "budget_negative_control",
                 "candidate_tolerance": 0.0,
+                "provenance": "test fake rule",
             },
             "attempts": [],
         }]
@@ -197,12 +198,20 @@ def test_global_tau_pair_ceiling_rejects_collectively_over_budget_windows(
     branch = _branch("budget", "cond", [0.01, 0.2], omega)
     poles = np.asarray([0.02 - 0.1j, 8.0 - 0.2j])
     residues = np.asarray([1.0 + 0.0j, 0.8 + 0.0j])
-    with pytest.raises(RuntimeError, match="pair ceiling=3"):
+    plan, report = build_delivered_sigma_windows(
+        [poles], [residues], [branch], omega,
+        regularization_width_ry=0.05,
+        envelope_relative_target=1.0e-3,
+        max_nodes=3)
+    assert len(plan) == 3
+    assert report["window_tau_pairs"] == 6
+    assert report["per_rule_node_ceiling"] == 3
+    with pytest.raises(RuntimeError, match="per-rule node ceiling=1"):
         build_delivered_sigma_windows(
             [poles], [residues], [branch], omega,
             regularization_width_ry=0.05,
             envelope_relative_target=1.0e-3,
-            max_nodes=3)
+            max_nodes=1)
 
 
 def test_reference_sigma_calibrates_envelope_exchange_rate():
@@ -233,5 +242,3 @@ def test_reference_sigma_calibrates_envelope_exchange_rate():
         "calibrated_to_reference_sigma")
     np.testing.assert_allclose(
         report["envelope_to_physical_exchange_rate"], expected)
-
-

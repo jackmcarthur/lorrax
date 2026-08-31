@@ -18,8 +18,8 @@ The final acceptance test is
 
 ``kappa_p99 * RUNTIME_NOISE_EPSILON <= AMPLIFICATION_NOISE_SAFETY * target``.
 
-The plan also refuses exponent growth above its bounded-factor limit and more
-than 200 total ``(window, tau)`` pairs.
+The plan also refuses exponent growth above its bounded-factor limit and any
+served rule above its configured node ceiling.
 """
 
 from __future__ import annotations
@@ -51,13 +51,11 @@ ENVELOPE_ERROR_SAFETY = 0.8
 FACTOR_GROWTH_CAP = 30.0
 RUNTIME_NOISE_EPSILON = 6.0e-8
 AMPLIFICATION_NOISE_SAFETY = 0.05
-# Default pair budget for the shipped 0..5 eV demonstration grid; the deck's
-# max_nodes OWNS the budget (a 4x-wider omega request physically needs more
-# crossing nodes — growth is linear in crossing bandwidth). 200 remains the
-# default via the config default; it is a resource certificate, not an
-# accuracy dial (dial census 2026-08-31, DERIVE).
-MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 7
+# Default node ceiling for one served product-window rule.  This is a resource
+# certificate, not an accuracy dial; the complete plan may contain several
+# bounded rules and reports their total ``(window, tau)`` pair count.
+MAX_RULE_NODES = 200
+_PLAN_CACHE_VERSION = 8
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -80,7 +78,7 @@ _CROSSING_TAIL_FRACTION = 0.9
 
 
 def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
-                            pair_ceiling, grid_mode, lattice_bins):
+                            node_ceiling, grid_mode, lattice_bins):
     """Hash the measured numerical problems that determine fitted rules."""
     digest = hashlib.sha256()
 
@@ -111,7 +109,7 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
 
     digest.update(f"delivered-plan-cache-v{_PLAN_CACHE_VERSION}".encode())
     digest.update(repr((float(eta), float(target), float(safety),
-                        float(factor_cap), int(pair_ceiling), str(grid_mode),
+                        float(factor_cap), int(node_ceiling), str(grid_mode),
                         int(lattice_bins), _CROSSING_EPS_Q,
                         _CROSSING_FIT_ITERATIONS, _CROSSING_FIT_STALL,
                         _CROSSING_CONDITIONING_SLACK,
@@ -162,7 +160,7 @@ def _load_plan_cache(path, fingerprint, n_specs):
             payload.get("fingerprint") == fingerprint)
 
 
-def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
+def _validate_cached_fits(specs, fits, *, eta, factor_cap, node_ceiling,
                           total_absolute):
     """Re-certify cached nodes and weights on the live measured problems."""
     if len(fits) != len(specs):
@@ -180,6 +178,7 @@ def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
             return None
         if (times.ndim != 1 or weights.shape != times.shape
                 or not times.size or np.any(times == 0.0)
+                or times.size > int(node_ceiling)
                 or not np.all(np.isfinite(times))
                 or not np.all(np.isfinite(weights)) or not _rule_accepted(
                     metrics, residual_target)
@@ -192,9 +191,7 @@ def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
         fit.update(metrics=metrics, factor_growth=factor,
                    required_target=required,
                    absolute_cost=float(spec["envelope"] * required))
-    if (sum(int(np.asarray(fit["times"]).size) for fit in fits)
-            > int(pair_ceiling)
-            or required_cost > float(total_absolute)):
+    if required_cost > float(total_absolute):
         return None
     return float(required_cost)
 
@@ -1444,17 +1441,17 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
 
 
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
-                  pair_ceiling):
-    """Exact small integer plan: minimum pairs whose budget cost fits."""
+                  node_ceiling):
+    """Select the minimum-pair plan with every rule below its node cap."""
     states = {0: (0.0, ())}
     for candidates in candidates_by_window:
         next_states = {}
         for used, (cost, choices) in states.items():
             for index, candidate in enumerate(candidates):
                 nodes = int(candidate["times"].size)
-                new_used = used + nodes
-                if new_used > int(pair_ceiling):
+                if nodes > int(node_ceiling):
                     continue
+                new_used = used + nodes
                 new_cost = cost + candidate["absolute_cost"]
                 previous = next_states.get(new_used)
                 if previous is None or new_cost < previous[0]:
@@ -1478,7 +1475,7 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
             f"delivered product window {blocking[0]['name']!r} refused: "
             f"achieved (residual={metrics[0]:.6g}, "
             f"amplification_p99={metrics[1]:.6g}); {detail}, "
-            f"pair ceiling={int(pair_ceiling)}")
+            f"per-rule node ceiling={int(node_ceiling)}")
     nodes, required_cost, choices = min(feasible, key=lambda row: (row[0], row[1]))
     selected = [candidates[index]
                 for candidates, index in zip(candidates_by_window, choices)]
@@ -1527,7 +1524,7 @@ def build_delivered_sigma_windows(
     envelope_relative_target: float,
     state_amplitudes_by_branch=None,
     reference_sigma_omega=None,
-    max_nodes: int = MAX_WINDOW_TAU_PAIRS,
+    max_nodes: int = MAX_RULE_NODES,
     lattice_bins: int = DEFAULT_LATTICE_BINS,
     envelope_error_safety: float = ENVELOPE_ERROR_SAFETY,
     factor_growth_cap: float = FACTOR_GROWTH_CAP,
@@ -1551,7 +1548,7 @@ def build_delivered_sigma_windows(
     target = float(envelope_relative_target)
     safety = float(envelope_error_safety)
     factor_cap = float(factor_growth_cap)
-    pair_ceiling = int(max_nodes)
+    node_ceiling = int(max_nodes)
     grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
             or not np.all(np.isfinite(omega_grid))):
@@ -1560,8 +1557,8 @@ def build_delivered_sigma_windows(
         raise ValueError("envelope_relative_target must lie in (0,1)")
     if not 0.0 < safety <= 1.0:
         raise ValueError("envelope_error_safety must lie in (0,1]")
-    if pair_ceiling < 1:
-        raise ValueError("max_nodes must permit at least one pair")
+    if node_ceiling < 1:
+        raise ValueError("max_nodes must permit at least one node per rule")
     if not np.isclose(float(crossing_eps_q), _CROSSING_EPS_Q,
                       rtol=0.0, atol=1.0e-15):
         raise ValueError(
@@ -1714,7 +1711,7 @@ def build_delivered_sigma_windows(
     total_absolute = target * combined_scale * safety
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
-        factor_cap=factor_cap, pair_ceiling=pair_ceiling,
+        factor_cap=factor_cap, node_ceiling=node_ceiling,
         grid_mode=grid_mode, lattice_bins=lattice_bins)
     cached = _load_plan_cache(
         plan_cache_path, cache_fingerprint, len(specs))
@@ -1725,7 +1722,7 @@ def build_delivered_sigma_windows(
         if not fingerprint_match:
             validated_cost = _validate_cached_fits(
                 specs, fits, eta=eta, factor_cap=factor_cap,
-                pair_ceiling=pair_ceiling, total_absolute=total_absolute)
+                node_ceiling=node_ceiling, total_absolute=total_absolute)
             if validated_cost is None:
                 cached = None
             else:
@@ -1743,11 +1740,11 @@ def build_delivered_sigma_windows(
         # the global delivered-error contract.
         candidates_by_window = [
             _candidate_rules(
-                spec, eta, pair_ceiling, factor_cap,
+                spec, eta, node_ceiling, factor_cap,
                 min(0.5, total_absolute / spec["envelope"]))
             for spec in specs]
         fits, free_pairs, required_cost = _select_rules(
-            specs, candidates_by_window, total_absolute, pair_ceiling)
+            specs, candidates_by_window, total_absolute, node_ceiling)
 
         window_tau_pairs = free_pairs
         _save_plan_cache(
@@ -1863,7 +1860,7 @@ def build_delivered_sigma_windows(
         "runtime_noise_epsilon": RUNTIME_NOISE_EPSILON,
         "runtime_noise_safety": AMPLIFICATION_NOISE_SAFETY,
         "factor_growth_cap": factor_cap,
-        "global_window_tau_pair_ceiling": pair_ceiling,
+        "per_rule_node_ceiling": node_ceiling,
         "tau_grid_mode": grid_mode,
         "n_windows": len(output),
         "n_tau": window_tau_pairs,
@@ -1886,7 +1883,7 @@ def build_delivered_sigma_windows(
 __all__ = [
     "AMPLIFICATION_NOISE_SAFETY", "DEFAULT_LATTICE_BINS",
     "ENVELOPE_ERROR_SAFETY", "FACTOR_GROWTH_CAP",
-    "MAX_WINDOW_TAU_PAIRS", "RUNTIME_NOISE_EPSILON",
+    "MAX_RULE_NODES", "RUNTIME_NOISE_EPSILON",
     "build_delivered_sigma_windows",
     "combine_delivered_sigma_pole_measures",
     "delivered_plan_request_fingerprint",

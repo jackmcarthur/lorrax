@@ -62,10 +62,10 @@ def _problems(path: Path):
 def _fit(problem, validation, pole_sign, target):
     if planner._window_kind(problem) == "crossing":
         candidates = planner._crossing_table_candidates(
-            problem, pole_sign, target, planner.MAX_WINDOW_TAU_PAIRS)
+            problem, pole_sign, target, planner.MAX_RULE_NODES)
     else:
         candidates = planner._sign_definite_table_candidates(
-            problem, target, planner.MAX_WINDOW_TAU_PAIRS)
+            problem, target, planner.MAX_RULE_NODES)
     for times, weights, evidence in candidates:
         candidate = planner._rule_candidate(
             problem, validation, times, weights, evidence)
@@ -76,7 +76,7 @@ def _fit(problem, validation, pole_sign, target):
     return planner._rule_candidate(
         problem, validation,
         *planner._fit_crossing_once(
-            problem, pole_sign, target, planner.MAX_WINDOW_TAU_PAIRS))
+            problem, pole_sign, target, planner.MAX_RULE_NODES))
 
 
 def main():

@@ -53,6 +53,14 @@ _CAUSAL_PAYLOAD_SHA256 = {
         "3f65843794eda55312b04d58f01278d69a1c555e22fb38222eaa711f3bed85cf",
     "crossing_causal/crossing_causal_A_40p000000_G_100p000000_eps_1p0em05.npz":
         "6fafaac3e9a2589b856b3f9a7c2ec8972f3bbeb533507138feca48f31ce8b8b8",
+    "crossing_causal/crossing_causal_A_64p000000_G_100p000000_eps_1p0em04.npz":
+        "78e5f87fa9d919c88be21455594e53e418c1657e184e7f7ac864069823f30a06",
+    "crossing_causal/crossing_causal_A_64p000000_G_100p000000_eps_1p0em05.npz":
+        "0c13e6bd0521ffd9bd9f3fab7600df76ed6935e49126602ab882136bc425692e",
+    "crossing_causal/crossing_causal_A_96p000000_G_100p000000_eps_1p0em04.npz":
+        "382fd50232f8dde7a4505fc2fde7bc8149c1780292a975d45f40daccdbce857b",
+    "crossing_causal/crossing_causal_A_96p000000_G_100p000000_eps_1p0em05.npz":
+        "f7c289f4c72da65dbb506b5e07f499b98208dae02f2548f84430b4dd6f8aa486",
 }
 
 #: Requests taken verbatim from the census's deck and suite tables, with
@@ -161,7 +169,7 @@ def test_the_measured_surface_stays_inside_its_pinned_tables():
                      error_bound=error_bound, n_max=n_max, **kw)
         served.add(q.provenance.catalog_entry)
     assert served <= set(_CENSUS_TABLES), served - set(_CENSUS_TABLES)
-    assert len(M.catalog()) == 40
+    assert len(M.catalog()) == 44
 
 
 @pytest.mark.parametrize("file, expected_sha", _CAUSAL_PAYLOAD_SHA256.items(),
