@@ -257,6 +257,37 @@ def test_loewner_equilibration_preserves_pencil_spectrum():
     assert np.linalg.cond(L_eq) < 0.1 * np.linalg.cond(L)
 
 
+def test_loewner_rank_reduction_removes_both_null_couplings(monkeypatch):
+    """A truncated pencil reaches eig as a two-sided reduced realization."""
+
+    L = jnp.asarray([[1.0, 2.0], [2.0, 4.0]], dtype=jnp.complex128)
+    sL = jnp.asarray(
+        [[3.0 - 0.2j, 7.0], [5.0, 11.0 + 0.4j]],
+        dtype=jnp.complex128,
+    )
+    seen = []
+
+    monkeypatch.setattr(
+        pade_fit, "_loewner_pencil", lambda w, x_hat, n: (L, sL))
+
+    def record(matrix, eig):
+        seen.append(np.asarray(matrix))
+        return jnp.diag(matrix)
+
+    monkeypatch.setattr(pade_fit, "_eigvals", record)
+    _, condition, _, _, _ = pade_fit._loewner_roots(
+        jnp.ones(4, dtype=jnp.complex128),
+        jnp.arange(4, dtype=jnp.complex128),
+        2,
+        1.0e-13,
+    )
+
+    assert len(seen) == 1
+    np.testing.assert_array_equal(seen[0][1], np.zeros(2))
+    np.testing.assert_array_equal(seen[0][:, 1], np.zeros(2))
+    assert float(condition) == pytest.approx(1.0)
+
+
 def test_leon_np15_qpps_fractions_are_the_yambo_integer_construction():
     expected = tuple(Fraction(k, 16) for k in range(13)) + (
         Fraction(14, 16), Fraction(1))
