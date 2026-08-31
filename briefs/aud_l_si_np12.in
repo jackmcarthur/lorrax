@@ -1,0 +1,47 @@
+[cohsex]
+
+restart = false
+centroids_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/03_smallband_gnppm_2026-08-15/qe/centroids_frac_192.txt
+wfn_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/03_smallband_gnppm_2026-08-15/qe/WFN.h5
+kin_ion_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/03_smallband_gnppm_2026-08-15/qe/kin_ion.h5
+
+nval = 8
+ncond = 8
+number_bands = 24
+sys_dim = 3
+bispinor = false
+bare_coulomb_cutoff = 25.0
+
+compute_mode = mpa
+screening_diagrams = w_rpa
+do_screened = true
+qp_solver = one_shot_dft
+memory_per_device_gb = 28
+
+write_restart_tensors = true
+restart_q_storage = ibz
+use_bgw_vcoul = false
+mc_average_vcoul_body = false
+
+vhead = 3303.748102330572
+whead_0freq = 151.136147756334
+whead_imfreq = 2350.004378428604
+
+zeta_rcond = 1e-10
+minimax_target_error = 1e-6
+minimax_max_nodes = 64
+
+mpa_n_poles = 12
+mpa_material_class = insulator
+mpa_sampling_alpha = 1
+mpa_varpi_near_ry = 0.2
+mpa_varpi_far_ry = 2.0
+mpa_pole_batch_size = 4
+mpa_sigma_sector_target_error = 6.5e-4
+mpa_sigma_crossing_target_error = 2.0e-3
+mpa_sigma_max_nodes = 96
+
+sigma_diag_file = sigma_diag.dat
+eqp0_file = eqp0.dat
+eqp1_file = eqp1.dat
+write_wfn_h5 = false
