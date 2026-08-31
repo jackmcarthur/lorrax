@@ -1494,7 +1494,14 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
                 np.linalg.LinAlgError):
             continue
         split_nodes = sum(int(candidates[i][0]["times"].size) for i in indices)
-        if int(candidate["times"].size) >= split_nodes:
+        split_cost = sum(float(candidates[i][0]["absolute_cost"])
+                         for i in indices)
+        # Fewer nodes is NOT sufficient. A merged window covers more support,
+        # so its envelope is larger and its absolute error cost can rise even
+        # at a similar relative residual — which made a real SC deck refuse
+        # with best cost 3.94e9 against a 2.79e9 budget. Require BOTH.
+        if (int(candidate["times"].size) >= split_nodes
+                or float(candidate["absolute_cost"]) > split_cost):
             continue
         merged_specs[indices[0]] = merged
         merged_candidates[indices[0]] = [candidate]
