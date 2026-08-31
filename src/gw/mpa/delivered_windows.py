@@ -1354,10 +1354,17 @@ def _split_refused_crossing_spec(spec, bins):
         return state_children
     if state_children is None:
         return omega_children
+    parent_radius = _spec_crossing_radius(spec)
     omega_radius = max(_spec_crossing_radius(child)
                        for child in omega_children)
     state_radius = max(_spec_crossing_radius(child)
                        for child in state_children)
+    # A state-dominated support can retain its exact worst denominator in
+    # every omega child.  The real two-patch Na arm measured precisely that:
+    # A/gamma stayed 204.367 after bisection and both children conditioned
+    # worse.  Spend the one permitted state split immediately in this case.
+    if omega_radius >= parent_radius * (1.0 - 1.0e-12):
+        return state_children
     return omega_children if omega_radius <= state_radius else state_children
 
 

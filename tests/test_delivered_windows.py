@@ -404,6 +404,31 @@ def test_refused_crossing_is_replaced_by_exact_omega_bisection(monkeypatch):
     assert report["window_tau_pairs"] == 2
 
 
+def test_state_dominated_refusal_does_not_repeat_omega_bisection(monkeypatch):
+    """No omega-radius reduction spends the single state split immediately."""
+    spec = {
+        "kind": "crossing", "omega_idx": np.arange(2),
+        "raw_state_energy": np.asarray([0.0, 1.0]),
+        "state_positions": np.arange(2),
+        "state_interval": (-np.inf, np.inf),
+    }
+
+    def rebuild(_spec, _states, _omega, _interval, suffix, _bins,
+                **_kwargs):
+        return {"suffix": suffix}
+
+    radii = {"omega-1/2": 10.0, "omega-2/2": 10.0,
+             "state-1/2": 12.0, "state-2/2": 12.0}
+    monkeypatch.setattr(delivered, "_rebuild_split_spec", rebuild)
+    monkeypatch.setattr(
+        delivered, "_spec_crossing_radius",
+        lambda row: 10.0 if row is spec else radii[row["suffix"]])
+
+    children = delivered._split_refused_crossing_spec(spec, bins=9)
+    assert [row["suffix"] for row in children] == [
+        "state-1/2", "state-2/2"]
+
+
 def test_zero_time_rule_is_refused():
     problem = ReciprocalMeasureProblem(
         frequencies=np.asarray([0.0]),
