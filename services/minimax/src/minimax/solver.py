@@ -596,7 +596,6 @@ def evaluate_noncrossing_imag(x, t, w):
 def _cr_varpro_lm(tau, u_grid, g, max_iter=120, tol=1e-14, weights=None,
                   tau_hi=None):
     """VarPro-LM for sin-basis crossing problem (Phase 2 polish)."""
-    N = len(tau)
     M = len(u_grid)
     tau = tau.copy()
 

@@ -1706,13 +1706,11 @@ def _merge_branch_specs(group):
             return None
     positions = np.unique(np.concatenate(
         [np.asarray(spec["state_positions"]).reshape(-1) for spec in group]))
-    order = {int(p): None for p in positions}
     raw = np.empty(positions.size, dtype=np.float64)
     for spec in group:
         for value, position in zip(np.asarray(spec["raw_state_energy"]),
                                    np.asarray(spec["state_positions"]).reshape(-1)):
             raw[np.searchsorted(positions, int(position))] = float(value)
-    del order
     problem = ReciprocalMeasureProblem(
         first["problem"].frequencies,
         np.concatenate([spec["problem"].internal_sums for spec in group]),
@@ -2292,7 +2290,6 @@ def build_delivered_sigma_windows(
         tighten_scale = 1.0
         for stage in ("adapted", "shipped",
                       "tightened", "tightened", "tightened"):
-            adapted_only = stage == "adapted"
             specs = base_specs
             if stage == "adapted":
                 candidates_by_window = base_candidates

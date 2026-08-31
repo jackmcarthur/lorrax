@@ -627,11 +627,6 @@ def _fit_product_groups(subsets, eta: float):
     return {key: (group, rule) for key, group, rule in fitted}
 
 
-def _fit_product_group(windows, eta: float) -> tuple[RoqGroup, RoqRule]:
-    """Derive contour and rank for one product group."""
-    return _fit_product_groups({(0,): tuple(windows)}, eta)[(0,)]
-
-
 def _try_whole_below(windows, eta: float, node_cap: int):
     """Test a whole-branch rule only where it can beat the fallback."""
     seed, target, names = _product_group_seed(windows, eta)
