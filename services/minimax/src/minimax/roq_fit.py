@@ -110,21 +110,34 @@ def _weighted_subspace(group: RoqGroup, times: np.ndarray, gl: np.ndarray,
     return singular, vectors[:, order]
 
 
+def _prepare_subspace(group: RoqGroup, base_nodes: int, max_rank: int):
+    """Build the rank-independent candidate basis once for a rank search."""
+    times, gl = _candidates(group, base_nodes)
+    singular, basis = _weighted_subspace(group, times, gl, max_rank)
+    return times, singular, basis
+
+
+def _select_prepared(times: np.ndarray, singular: np.ndarray,
+                     basis: np.ndarray, rank: int, name: str):
+    """Select one QDEIM rank from a prepared candidate basis."""
+    rank = int(rank)
+    if rank > basis.shape[1]:
+        raise ValueError(f"rank {rank} exceeds computed subspace "
+                         f"{basis.shape[1]} for group {name!r}")
+    pivots = la.qr(basis[:, :rank].T, mode="economic", pivoting=True)[2]
+    selected = np.sort(pivots[:rank])
+    ratio = float(singular[rank - 1] / singular[0]) if singular[0] > 0 else 0.0
+    return times[selected], ratio
+
+
 def roq_select_times(group: RoqGroup, rank: int, *, base_nodes: int = 0,
                      max_rank: int = 0):
     """QDEIM-selected causal times and the subspace singular ratio."""
     rank = int(rank)
     max_rank = int(max_rank) or max(2 * rank, rank + 8)
     base_nodes = int(base_nodes) or max(4 * max_rank, 96)
-    times, gl = _candidates(group, base_nodes)
-    singular, basis = _weighted_subspace(group, times, gl, max_rank)
-    if rank > basis.shape[1]:
-        raise ValueError(f"rank {rank} exceeds computed subspace "
-                         f"{basis.shape[1]} for group {group.name!r}")
-    pivots = la.qr(basis[:, :rank].T, mode="economic", pivoting=True)[2]
-    selected = np.sort(pivots[:rank])
-    ratio = float(singular[rank - 1] / singular[0]) if singular[0] > 0 else 0.0
-    return times[selected], ratio
+    prepared = _prepare_subspace(group, base_nodes, max_rank)
+    return _select_prepared(*prepared, rank, group.name)
 
 
 def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
@@ -142,10 +155,11 @@ def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
     Returns the best rule found even on a miss — check ``max_error``.
     """
     ranks = list(ranks) if ranks is not None else list(range(6, 65, 2))
+    base_nodes = int(base_nodes) or max(4 * max(ranks), 96)
+    prepared = _prepare_subspace(group, base_nodes, max(ranks))
     best = None
     for rank in ranks:
-        times, ratio = roq_select_times(group, rank, base_nodes=base_nodes,
-                                        max_rank=max(ranks))
+        times, ratio = _select_prepared(*prepared, rank, group.name)
         weights, _ = solve_fixed_time_weights_fast(
             group.fit, times, iterations=55, stall_iterations=6)
         rule = _score(group, times, weights, rank, ratio)
