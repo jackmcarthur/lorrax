@@ -476,8 +476,11 @@ def compute_sigma_c_mpa_omega_grid(
             # (owner ruling 2026-08-31; lookup rules carry their own nodes).
             tau_grid_mode = "free"
             delivered_cache_path = resolve_delivered_plan_cache()
-            delivered_max_nodes = max(
-                int(max_rank), int(crossing_max_nodes))
+            # Delivered product rules use the MPA deck's one node ceiling.
+            # ``crossing_max_nodes`` carries the legacy 500-node pane floor;
+            # inheriting it here would silently override
+            # ``mpa_sigma_max_nodes`` in the plan receipt.
+            delivered_max_nodes = int(max_rank)
             request_fingerprint = delivered_plan_request_fingerprint(
                 branches, omega_grid_ry, fit_ledger=ledger,
                 parameters={
