@@ -308,6 +308,29 @@ def test_covered_crossing_fallback_keeps_shipped_density(monkeypatch):
     assert radius < requested[0] < fit_span
 
 
+def test_positive_crossing_recovery_has_no_node_search():
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([5.9 - 0.1j, -1.0 - 0.1j]),
+        cell_masses=np.asarray([1.0, 1.0]))
+    target = 1.0e-3
+
+    times, weights, evidence = delivered._positive_crossing_once(
+        problem, pole_sign=1.0, relative_target=target, max_nodes=420)
+
+    _oriented, _gamma, radius = delivered._crossing_geometry(problem, 1.0)
+    dimensionless_t_max = np.log(
+        1.0 / (delivered._CROSSING_TAIL_FRACTION * target))
+    expected_nodes = int(np.ceil(radius * dimensionless_t_max / np.pi))
+    assert times.size == expected_nodes
+    assert np.all(times > 0.0)
+    assert np.all(weights.real == 0.0)
+    assert np.all(weights.imag < 0.0)
+    assert evidence["family"] == "crossing_positive_gauss"
+    assert delivered._rule_accepted(
+        delivered._rule_metrics(problem, times, weights), target)
+
+
 def _served_candidate(spec, *_args):
     evidence = {
         "family": ("crossing_hgl" if spec["kind"] == "crossing"

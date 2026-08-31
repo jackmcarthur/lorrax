@@ -1317,6 +1317,43 @@ def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     }
 
 
+def _positive_crossing_once(problem, pole_sign, relative_target, max_nodes):
+    """Build one stable causal Gauss rule after the fitted rule refuses.
+
+    The time ceiling leaves ``0.9 * target`` in the omitted exponential
+    tail.  One Gauss node per eta-scaled half wavelength resolves the
+    remaining finite interval without a node or tolerance search.  The live
+    fitting and validation lattices still own acceptance; this construction
+    is only a bounded product-window candidate, never a direct-pair route.
+    """
+    _oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
+    target = min(float(relative_target), 0.5)
+    dimensionless_t_max = np.log(
+        1.0 / (_CROSSING_TAIL_FRACTION * target))
+    node_count = max(
+        2, int(np.ceil(A_dim * dimensionless_t_max / np.pi)))
+    if node_count > int(max_nodes):
+        raise RuntimeError(
+            f"positive crossing support A={A_dim:.6g} needs {node_count} "
+            f"half-wavelength nodes, max_nodes={int(max_nodes)}")
+    t_max = dimensionless_t_max / gamma_min
+    tau, positive_weights = gauss_legendre_interval(
+        node_count, 0.0, t_max)
+    times = float(pole_sign) * np.asarray(tau, np.float64)
+    weights = (float(pole_sign) * -1.0j
+               * np.asarray(positive_weights, np.float64))
+    return np.asarray(times), np.asarray(weights), {
+        "family": "crossing_positive_gauss",
+        "requested_range": A_dim,
+        "candidate_tolerance": float(relative_target),
+        "eta_floor_ry": gamma_min,
+        "time_ceiling_ry_inverse": float(t_max),
+        "node_resolution": "one node per eta-scaled half wavelength",
+        "tail_budget_fraction": _CROSSING_TAIL_FRACTION,
+        "provenance": "one deterministic positive causal Gauss rule",
+    }
+
+
 def _rule_candidate(problem, validation, times, weights, evidence):
     times = np.asarray(times, np.complex128)
     weights = np.asarray(weights, np.complex128)
@@ -1378,6 +1415,12 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
             # At most one optimized fit exists: it is made only after every
             # matching shipped HGL table has missed the measured gates.
             yield _fit_crossing_once(
+                spec["problem"], spec["pole_sign"], relative_target,
+                max_nodes)
+            # If the fitted weights miss, retain the same product window and
+            # try one positive causal rule.  Its order is derived directly
+            # from the window span and time ceiling, not searched.
+            yield _positive_crossing_once(
                 spec["problem"], spec["pole_sign"], relative_target,
                 max_nodes)
         rule_rows = rules()
