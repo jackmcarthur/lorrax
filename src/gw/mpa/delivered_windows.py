@@ -35,8 +35,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.collectives import (gather_to_host, process_count, process_rank,
-                                psum_replicate)
+from common.collectives import (all_gather_processes, gather_to_host,
+                                process_count, process_rank, psum_replicate)
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.evaluator import gauss_legendre_interval
 from gw.mpa.sigma_windows import SharedSigmaWindow
@@ -1767,23 +1767,40 @@ def build_delivered_sigma_windows(
                     required_cost, window_tau_pairs)
     if cached is None:
         cache_status = "disabled" if plan_cache_path is None else "miss"
-        # Each lookup first receives the largest relative allowance it could
-        # spend without exceeding the complete plan budget by itself.  The
-        # exact selector below then checks the sum of ACHIEVED costs.  This
-        # support-derived ceiling avoids a tolerance sweep while preserving
-        # the global delivered-error contract.
-        candidates_by_window = [
-            _candidate_rules(
-                spec, eta, pair_ceiling, factor_cap,
-                min(0.5, total_absolute / spec["envelope"]))
-            for spec in specs]
-        fits, free_pairs, required_cost = _select_rules(
-            specs, candidates_by_window, total_absolute, pair_ceiling)
-
-        window_tau_pairs = free_pairs
-        _save_plan_cache(
-            plan_cache_path, cache_fingerprint, fits, free_pairs,
-            required_cost, window_tau_pairs)
+        # The compact measured problems are replicated.  Running the same
+        # host IRLS fit on every GPU rank merely oversubscribes BLAS (four
+        # ranks x 32 threads measured 14.54 s here).  With the campaign's
+        # required shared receipt, rank 0 fits once, publishes atomically,
+        # and the other ranks wait at one tiny collective before loading the
+        # exact same nodes.  A cache-disabled caller keeps the serial spelling
+        # on every rank because it supplied no synchronization artifact.
+        owner_only = process_count() > 1 and plan_cache_path is not None
+        if not owner_only or process_rank() == 0:
+            # Each lookup first receives the largest relative allowance it
+            # could spend without exceeding the complete plan budget by
+            # itself.  The exact selector checks the sum of ACHIEVED costs.
+            candidates_by_window = [
+                _candidate_rules(
+                    spec, eta, pair_ceiling, factor_cap,
+                    min(0.5, total_absolute / spec["envelope"]))
+                for spec in specs]
+            fits, free_pairs, required_cost = _select_rules(
+                specs, candidates_by_window, total_absolute, pair_ceiling)
+            window_tau_pairs = free_pairs
+            _save_plan_cache(
+                plan_cache_path, cache_fingerprint, fits, free_pairs,
+                required_cost, window_tau_pairs)
+        if owner_only:
+            all_gather_processes(np.asarray([1], dtype=np.uint8))
+            if process_rank() != 0:
+                published = _load_plan_cache(
+                    plan_cache_path, cache_fingerprint, len(specs))
+                if published is None or not published[-1]:
+                    raise RuntimeError(
+                        "rank 0 did not publish the exact delivered-plan "
+                        "fit receipt after the planning barrier")
+                (fits, free_pairs, required_cost, window_tau_pairs,
+                 _fingerprint_match) = published
 
     output = []
     for spec, fit in zip(specs, fits):
