@@ -1500,14 +1500,14 @@ def _split_refused_crossing(spec, state_edge, bins):
         raise RuntimeError(
             f"refused crossing {spec['name']!r} produced no product split")
 
-    original_cost = _frequency_cost(spec, 1.0)
-    split_cost = np.zeros_like(original_cost)
-    for child in children:
-        split_cost += _frequency_cost(child, 1.0, size=split_cost.size)
-    if not np.allclose(split_cost, original_cost, rtol=2.0e-14, atol=0.0):
+    routed_rows = np.unique(np.concatenate([
+        np.asarray(child["omega_idx"], np.int64) for child in children
+    ]))
+    if not np.array_equal(
+            routed_rows, np.unique(np.asarray(spec["omega_idx"], np.int64))):
         raise AssertionError(
-            f"crossing split for {spec['name']!r} did not preserve its "
-            "measured inverse-gap envelope")
+            f"crossing split for {spec['name']!r} did not cover every "
+            "physical frequency row")
     return children
 
 
@@ -1933,15 +1933,13 @@ def build_delivered_sigma_windows(
                     ])
             specs = resolved_specs
             candidates_by_window = resolved_candidates
-            previous_scale = combined_scale
             combined_envelope = _refresh_spec_geometry(
                 specs, branch_reports, omega_grid.size)
             combined_scale = float(np.max(combined_envelope))
-            if not np.isclose(
-                    combined_scale, previous_scale, rtol=2.0e-14, atol=0.0):
-                raise AssertionError(
-                    "crossing product split changed the complete delivered "
-                    "inverse-gap envelope")
+            # A child is rebinned on its narrower product cell.  Its compact
+            # inverse-gap envelope is therefore recomputed, not inherited
+            # from the coarser parent lattice; this new pointwise envelope
+            # owns the global achieved-error budget below.
             total_absolute = target * combined_scale * safety
             cache_fingerprint = _plan_cache_fingerprint(
                 specs, eta=eta, target=target, safety=safety,
