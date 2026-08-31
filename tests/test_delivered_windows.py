@@ -298,6 +298,34 @@ def _served_candidate(spec, *_args):
     }]
 
 
+def test_rule_selection_enforces_budget_pointwise_not_sum_of_window_maxima():
+    specs = [
+        {"name": "left", "envelope": 1.0,
+         "omega_idx": np.asarray([0]),
+         "envelope_by_frequency": np.asarray([1.0])},
+        {"name": "right", "envelope": 1.0,
+         "omega_idx": np.asarray([1]),
+         "envelope_by_frequency": np.asarray([1.0])},
+    ]
+    candidates = []
+    for _spec in specs:
+        candidates.append([{
+            "times": np.asarray([0.1]),
+            "metrics": (0.08, 1.0, 1.0),
+            "required_target": 0.08,
+            "absolute_cost": 0.08,
+        }])
+
+    selected, nodes, required = delivered._select_rules(
+        specs, candidates, total_absolute_budget=0.1, pair_ceiling=2,
+        pointwise_budget=np.asarray([0.1, 0.1]))
+
+    assert len(selected) == 2
+    assert nodes == 2
+    assert required == pytest.approx(0.08)
+    assert sum(row["absolute_cost"] for row in selected) == pytest.approx(0.16)
+
+
 def _patched_test_plan(width_ev):
     ev_to_ry = 1.0 / 27.211386245988
     eta = 0.25 * ev_to_ry
