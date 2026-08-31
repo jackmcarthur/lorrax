@@ -63,11 +63,11 @@ def _build_tail_refined_lattice(
     grid = np.zeros(real_nodes.size * imag_nodes.size, dtype=np.float64)
     for real_index, real_weight in real_cloud:
         for imag_index, imag_weight in imag_cloud:
-            np.add.at(
-                grid,
-                real_index * imag_nodes.size + imag_index,
-                masses * real_weight * imag_weight,
-            )
+            flat_index = real_index * imag_nodes.size + imag_index
+            grid += np.bincount(
+                flat_index,
+                weights=masses * real_weight * imag_weight,
+                minlength=grid.size)
     nodes = (real_nodes[:, None]
              + 1.0j * imag_nodes[None, :]).reshape(-1)
     live = grid > 0.0
