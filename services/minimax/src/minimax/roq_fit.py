@@ -51,9 +51,12 @@ __all__ = [
 
 
 # These are production policy, not user dials.  The fixed scan contains the
-# measured Na optimum (-58 degrees) and its -55-degree near miss.  Wider
-# rotations stop at -75 degrees because the contour then grows on common
-# valence supports.  Claim 522 is the provenance for this grid.
+# measured Na optimum (-58 degrees), near-imaginary-axis rotations for
+# sign-biased supports, and small positive rotations for asymmetric crossing
+# supports.  On frozen Na p0 at A/gamma=125.4, +1.1 degrees reduced the
+# accepted rank 133 -> 107 and kappa_p99 38.3 -> 22.2.  ``_angle_decays``
+# still rejects each candidate when the actual support would grow.  Claim 522
+# is the provenance for the original negative-angle grid.
 # Measured on the frozen Na valence support (2026-08-31): node count is FLAT
 # from -70 to -90 deg while kappa falls to exactly 1.00 at -85, so the useful
 # region is a narrow band near the imaginary axis, not a sweep from 0.  The
@@ -62,9 +65,9 @@ __all__ = [
 # The -58 deg the earlier study chose costs one extra node and 18% more
 # cancellation than -85 on the same support.  Real-time (0 deg) is retained
 # ONLY as the last entry: it is the operating point the shipped fitter used
-# and it misses this support by four orders of magnitude, so it must never be
-# tried first.
-_ANGLE_SCAN_DEG = (-85.0, -80.0, -70.0, -58.0, 0.0)
+# and it misses sign-biased supports by four orders of magnitude, so it must
+# never win a tie by scan order.
+_ANGLE_SCAN_DEG = (-85.0, -80.0, -70.0, -58.0, 1.2, 1.1, 0.0)
 _ANGLE_PROBE_RANK = 12
 _ANGLE_BASE_NODES = 64
 _MIN_RANK = 6
