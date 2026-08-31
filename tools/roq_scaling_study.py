@@ -205,7 +205,8 @@ def _fixed_basis_rank_scan(group: RoqGroup, target: float, max_rank: int,
         previous = rank
     if accepted_rank is not None:
         for rank in range(previous + 1, accepted_rank):
-            evaluate(rank)
+            if evaluate(rank)["accepted"]:
+                break
     rows = [rows_by_rank[rank] for rank in sorted(rows_by_rank)]
     matches = [row for row in rows if row["accepted"]]
     selected = min(matches, key=lambda row: row["rank"]) if matches else None
