@@ -243,8 +243,8 @@ _GUARD_KEYS = tuple(DEFAULT_GUARDS)
 #: under a store that was written before it existed.
 EIG_MODES = ("lapack", "jax_qr")
 
-#: Pole-identification algebra.  ``loewner`` remains the default and its
-#: implementation is unchanged.  ``companion`` is Leon/Yambo's optional
+#: Pole-identification algebra.  ``loewner`` remains the default.
+#: ``companion`` is Leon/Yambo's optional
 #: linear-algebra (``LA``) route.  ``thiele`` is its default Padé--Thiele
 #: (``PT``) reciprocal-difference recurrence, Appendix A.2 of Leon et al.
 #: (2021) and ``mpa_E_solver_Pade`` in Yambo 5.3.  Both published twins end
@@ -434,11 +434,11 @@ def _backward_error(A, rhs, y):
 
 
 def _matrix_backward_error(L, sL, X):
-    """The same quantity for the Loewner reduction ``L X = sL``.
+    """The same quantity for the supplied Loewner reduction ``L X = sL``.
 
-    Not row-equilibrated: the Loewner matrix is not a cross-multiplied
-    system whose rows span decades of ``|W|``, it is a divided-difference
-    table whose rows are already commensurate.
+    The caller supplies the algebra that was actually solved: the
+    equilibrated full pencil for a full-rank fit, or its diagonal-SVD
+    realization and two-sided projected right member after truncation.
     """
 
     num = jnp.linalg.norm(L @ X - sL)
@@ -489,6 +489,30 @@ def _loewner_pencil(w, x_hat, n):
     return L, sL
 
 
+def _equilibrate_loewner_pencil(L, sL):
+    """Scale Loewner rows and columns before the small SVD solve.
+
+    The same nonsingular diagonal factors multiply both members of the
+    pencil, so its generalized eigenvalues do not change.  Rows of ``L``
+    are first scaled to unit 2-norm, then its columns are scaled to unit
+    2-norm.  Applying the identical factors to ``sL`` keeps the pencil
+    equivalent while removing sample-amplitude scale from the matrix that
+    is inverted.  Zero rows or columns retain a scale of one and remain
+    visible to the rank-revealing SVD.
+    """
+
+    row_norm = jnp.linalg.norm(L, axis=1)
+    row_scale = 1.0 / jnp.where(row_norm > 0, row_norm, 1.0)
+    L_eq = row_scale[:, None].astype(L.dtype) * L
+    sL_eq = row_scale[:, None].astype(sL.dtype) * sL
+
+    col_norm = jnp.linalg.norm(L_eq, axis=0)
+    col_scale = 1.0 / jnp.where(col_norm > 0, col_norm, 1.0)
+    L_eq = L_eq * col_scale[None, :].astype(L.dtype)
+    sL_eq = sL_eq * col_scale[None, :].astype(sL.dtype)
+    return L_eq, sL_eq
+
+
 def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     """Poles of the Loewner interpolant, in the ``b_hat = x/x_max`` plane.
 
@@ -496,26 +520,68 @@ def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     the companion route, so the two are drop-in for each other.
 
     THE PENCIL IS REDUCED RATHER THAN SOLVED AS A PENCIL.  The poles are
-    the generalised eigenvalues of ``(sL, L)``; jax has no ``QZ``, so
-    they are taken as the ordinary eigenvalues of ``L^+ sL`` with ``L^+``
-    the same truncated-SVD pseudo-inverse the rest of the module uses.
-    That is the identical spectrum whenever ``L`` is invertible, and the
-    reported ``cond`` is ``cond(L)`` -- precisely the number that says
-    whether it was.  The same ``n x n`` non-symmetric ``eigvals`` call
-    ends the companion route, so this is a drop-in on the eigensolver
-    side too.
+    the generalised eigenvalues of ``(sL, L)``; jax has no ``QZ``.  For
+    ``n > 8``, the SVD of the equilibrated ``L = U diag(s) V^H`` supplies
+    the standard rank-revealing Loewner realization
+
+    ``diag(1/s_kept) U^H sL V``
+
+    on the retained row AND column subspace.  Projecting both sides is
+    load-bearing.  Zeroing inverse singular values alone leaves a
+    retained-to-null coupling block in the ordinary eigenproblem; that
+    block is not part of the reduced pencil and makes its zero cluster
+    unnecessarily non-normal.  The static ``n x n`` matrix below embeds
+    the reduced realization beside exact zero rows and columns, so vmap
+    keeps its fixed output shape and the null-pole guard removes the padding.
+
+    The reported condition uses the smallest RETAINED singular value and
+    therefore describes the algebra that produced the poles rather than a
+    direction the rank-revealing solve explicitly discarded.  Orders through
+    eight retain the already-certified, unscaled one-sided realization and
+    its raw condition number because equilibrating it regressed measured fit
+    wall time.  The same ``n x n`` non-symmetric ``eigvals`` call ends the
+    companion route, so this remains a drop-in on the eigensolver side.
     """
 
     L, sL = _loewner_pencil(w, x_hat, n)
+    # n_p=8 is the largest already-certified production order.  Real-Na P=4
+    # A/B on 11,147,600 elements measured 37.997 s for this incumbent
+    # reduction and 39.474 s when equilibration was applied to it.  Preserve
+    # that graph exactly: the conditioning repair starts at the measured
+    # failure orders (10 and 12), without a deck dial or an n_p=8 wall cost.
+    if n <= 8:
+        u, s, vh = jnp.linalg.svd(L, full_matrices=False)
+        s_max = s[0]
+        s_min = s[-1]
+        s_inv = jnp.where(
+            s > rcond * s_max,
+            1.0 / jnp.where(s > 0, s, 1.0),
+            0.0,
+        )
+        L_pinv = vh.conj().T @ (
+            s_inv.astype(L.dtype)[:, None] * u.conj().T)
+        X = L_pinv @ sL
+        cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
+        return (_eigvals(X, eig), cond, s_max, s_min,
+                _matrix_backward_error(L, sL, X))
+
+    L, sL = _equilibrate_loewner_pencil(L, sL)
     u, s, vh = jnp.linalg.svd(L, full_matrices=False)
     s_max = s[0]
-    s_min = s[-1]
-    s_inv = jnp.where(s > rcond * s_max, 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
-    L_pinv = vh.conj().T @ (s_inv.astype(L.dtype)[:, None] * u.conj().T)
-    cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
-    X = L_pinv @ sL
+    retained = s > rcond * s_max
+    s_min = jnp.min(jnp.where(retained, s, jnp.inf))
+    s_inv = jnp.where(
+        retained, 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
+
+    # Work in V coordinates.  At full rank this is unitarily similar to
+    # L^{-1}sL.  At reduced rank the two masks remove both null-space
+    # coupling blocks, which is the textbook compressed Loewner pencil.
+    core = (u.conj().T @ sL) @ vh.conj().T
+    core = jnp.where(retained[:, None] & retained[None, :], core, 0.0)
+    X = s_inv.astype(L.dtype)[:, None] * core
+    cond = jnp.where(jnp.isfinite(s_min), s_max / s_min, jnp.inf)
     return (_eigvals(X, eig), cond, s_max, s_min,
-            _matrix_backward_error(L, sL, X))
+            _matrix_backward_error(jnp.diag(s), core, X))
 
 
 def _companion_roots(c_coeffs, eig="lapack"):

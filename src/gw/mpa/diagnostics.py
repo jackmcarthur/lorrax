@@ -62,9 +62,13 @@ def solve_conditioning(
 
     ``cond``
         2-norm condition number of the matrix the chosen mode inverts:
-        the row-equilibrated ``2n x 2n`` cross-multiplied system for
-        the ``n x n`` Loewner matrix ``L``.  This is the number that
-        decides whether the
+        the row-equilibrated ``2n x 2n`` cross-multiplied system, or the
+        SVD-retained subspace of the ``n x n`` Loewner matrix ``L``.  The
+        Loewner matrix is equilibrated above eight poles; the certified
+        orders through eight retain their incumbent raw scale.  A singular
+        direction discarded by the declared ``rcond`` is not reported as if
+        it produced a pole.  This is the
+        number that decides whether the
         recovered poles mean anything: the theory plan's ranked risk 6 is
         precisely "Vandermonde/companion conditioning fails at any
         scheduled n_p", and the papers' ``n_p <= 15`` range is not
