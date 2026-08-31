@@ -260,10 +260,13 @@ def test_loewner_equilibration_preserves_pencil_spectrum():
 def test_loewner_rank_reduction_removes_both_null_couplings(monkeypatch):
     """A truncated pencil reaches eig as a two-sided reduced realization."""
 
-    L = jnp.asarray([[1.0, 2.0], [2.0, 4.0]], dtype=jnp.complex128)
-    sL = jnp.asarray(
-        [[3.0 - 0.2j, 7.0], [5.0, 11.0 + 0.4j]],
-        dtype=jnp.complex128,
+    n = 10
+    left = jnp.arange(1, n + 1, dtype=jnp.float64)
+    right = jnp.arange(n, 0, -1, dtype=jnp.float64)
+    L = (left[:, None] * right[None, :]).astype(jnp.complex128)
+    sL = (
+        jnp.arange(n * n, dtype=jnp.float64).reshape(n, n)
+        + 0.2j * jnp.eye(n, dtype=jnp.complex128)
     )
     seen = []
 
@@ -276,15 +279,15 @@ def test_loewner_rank_reduction_removes_both_null_couplings(monkeypatch):
 
     monkeypatch.setattr(pade_fit, "_eigvals", record)
     _, condition, _, _, _ = pade_fit._loewner_roots(
-        jnp.ones(4, dtype=jnp.complex128),
-        jnp.arange(4, dtype=jnp.complex128),
-        2,
+        jnp.ones(2 * n, dtype=jnp.complex128),
+        jnp.arange(2 * n, dtype=jnp.complex128),
+        n,
         1.0e-13,
     )
 
     assert len(seen) == 1
-    np.testing.assert_array_equal(seen[0][1], np.zeros(2))
-    np.testing.assert_array_equal(seen[0][:, 1], np.zeros(2))
+    np.testing.assert_array_equal(seen[0][1:], np.zeros((n - 1, n)))
+    np.testing.assert_array_equal(seen[0][:, 1:], np.zeros((n, n - 1)))
     assert float(condition) == pytest.approx(1.0)
 
 

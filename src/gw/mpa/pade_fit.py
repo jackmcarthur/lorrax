@@ -434,11 +434,11 @@ def _backward_error(A, rhs, y):
 
 
 def _matrix_backward_error(L, sL, X):
-    """The same quantity for the Loewner reduction ``L X = sL``.
+    """The same quantity for the supplied Loewner reduction ``L X = sL``.
 
-    Not row-equilibrated: the Loewner matrix is not a cross-multiplied
-    system whose rows span decades of ``|W|``, it is a divided-difference
-    table whose rows are already commensurate.
+    The caller supplies the algebra that was actually solved: the
+    equilibrated full pencil for a full-rank fit, or its diagonal-SVD
+    realization and two-sided projected right member after truncation.
     """
 
     num = jnp.linalg.norm(L @ X - sL)
@@ -542,6 +542,27 @@ def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     """
 
     L, sL = _loewner_pencil(w, x_hat, n)
+    # n_p=8 is the largest already-certified production order.  Real-Na P=4
+    # A/B on 11,147,600 elements measured 37.997 s for this incumbent
+    # reduction and 39.474 s when equilibration was applied to it.  Preserve
+    # that graph exactly: the conditioning repair starts at the measured
+    # failure orders (10 and 12), without a deck dial or an n_p=8 wall cost.
+    if n <= 8:
+        u, s, vh = jnp.linalg.svd(L, full_matrices=False)
+        s_max = s[0]
+        s_min = s[-1]
+        s_inv = jnp.where(
+            s > rcond * s_max,
+            1.0 / jnp.where(s > 0, s, 1.0),
+            0.0,
+        )
+        L_pinv = vh.conj().T @ (
+            s_inv.astype(L.dtype)[:, None] * u.conj().T)
+        X = L_pinv @ sL
+        cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
+        return (_eigvals(X, eig), cond, s_max, s_min,
+                _matrix_backward_error(L, sL, X))
+
     L, sL = _equilibrate_loewner_pencil(L, sL)
     u, s, vh = jnp.linalg.svd(L, full_matrices=False)
     s_max = s[0]
