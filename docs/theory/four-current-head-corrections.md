@@ -365,6 +365,24 @@ component dumps.
 | `src/gw/w_bispinor.py`: channel-blocked supermatrix `[C n_C \| T1 n_T \| T2 n_T \| T3 n_T]`, the scalar `solve_w` at size `n_C + 3n_T` | `origin/agent/bispinor-supermatrix-w` (2026-06-16/17), carried to `origin/agent/bispinor-ibz-lorentz-unfold` with an IBZ→full-BZ Lorentz unfold, Σ^B folded into the static QP Σ_xc, and a screened-versus-unscreened Breit comparison (`breit_comparison.dat`) | milestone A: charge χ⁰⁰ only (W^{ij} = bare); milestone B: six TT χ^{ij} plus the three charge–current cross χ^{0i} by folding `γ̃` into the conduction ket of the scalar χ⁰ kernel | ω = 0 only, inside the static-quadrature section; GN-PPM probe screening charge-only | never merged. Measured on FM CrI3 6×6 (640/200 centroids): deeper bands −17…−40 meV Breit, screened vs unscreened differ by < 10 μeV |
 | `src/gw/photon_layout.py` + `w_isdf.compute_static_photon_response` + `src/gw/photon_sigma.py`: mesh-interleaved direct sum, distributed Dyson, sixteen-block Σ | `origin/main` since the 2026-08-24/25 integration branches (`integ/full-screened-bispinor-2026-08-24`, `integ/full-bispinor-*`) | all sixteen no-pair `χ^{IJ}_0` blocks (`compute_no_pair_dirac_current_block`, TT Ward-subtracted) and the exact-slab Γ completion of §4 | ω = 0 only (`compute_mode = cohsex`) | on main as `full_static_cohsex` / `charge_hall_cubature` |
 
+What is on `origin/main` (2026-08-26 and 2026-08-28 integrations), judged
+by content rather than commit ancestry: the packed layout, the sixteen-block
+no-pair response with exact orientations, the distributed Dyson, the
+sixteen-block Σ, the exact-slab Γ completion with the Hall term, the Hall
+producer and its artifact, the bare TT head, the three `bare_transverse`
+carrier variants, the four-spinor exact G-space Hartree including the
+transverse current in every bispinor mode, and the face-layout bispinor ζ
+fits. What stayed on `origin/feat/static-photon-effective-response-completion-2026-08-28`
+(about 3,200 diverged lines): a frequency-axis carrier for the four-current
+head (`gw.four_current_head.FrequencyResolvedFourCurrentHead`, holding
+`Q0_direct`, `H_linear`, `S_direct` per stored ω, with an immutable writer
+that refuses dynamic rows "until Q0/H/S share one causal response kernel";
+its only producer call passes `(0.0+0.0j,)`), the normalized retained
+static-response producer with the mixed CT response, the Hall CT sign
+reconciliation across band orientations, the Adler–Wiser interband wing-sign
+fix (§4.5's first item), the separated q→0 wing face endpoints, and the
+completion-receipt persistence. Its mode envelope is still `cohsex`-only.
+
 The two 2026-08-22 design audits that preceded the second incarnation
 (sandbox `RUNS_INFLIGHT.md` rows "codex-full-screened-bispinor-gw-audit"
 and "codex-bispinor-screened-wings-q0-audit", at `origin/main@c344d57c`)
