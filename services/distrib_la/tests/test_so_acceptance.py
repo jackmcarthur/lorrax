@@ -669,6 +669,30 @@ def test_scalapack_symbol_checker_owns_the_exact_13_symbol_surface():
     assert not missing, f"{header} lacks declarations for {missing}"
 
 
+def test_machine_scripts_do_not_gate_scalapack_on_slate():
+    """ScaLAPACK/PBLAS is a provider contract, not a SLATE side effect."""
+    root = _repo_root()
+    frontera_path = os.path.join(
+        root, "config", "frontera", "build_ffi_host.sh")
+    perlmutter_path = os.path.join(
+        root, "config", "perlmutter", "build_ffi_host.sh")
+    with open(frontera_path) as fh:
+        frontera = fh.read()
+    with open(perlmutter_path) as fh:
+        perlmutter = fh.read()
+
+    provider = frontera.index("# ScaLAPACK provider.")
+    slate = frontera.index("# Optional SLATE provider")
+    assert provider < slate
+    assert "LORRAX_SLATE_HOST_INSTALL_DIR" not in frontera[provider:slate]
+    assert "-DLORRAX_HOST_HAVE_SCALAPACK=ON" in frontera
+    assert '_expect_backends="scalapack,gemm,phdf5,fft"' in frontera
+
+    assert "-DLORRAX_HOST_HAVE_SCALAPACK=ON" in perlmutter
+    assert "-DLORRAX_HOST_HAVE_SLATE=OFF" in perlmutter
+    assert "LORRAX_SLATE_HOST_INSTALL_DIR" not in perlmutter
+
+
 def _run_verifier(so: str, leg: str, extra_env: dict | None = None):
     root = _repo_root()
     env = dict(os.environ)
