@@ -184,3 +184,94 @@ def test_no_completion_receipt_is_inside_a_tau_kernel():
     assert not any(isinstance(call, ast.Call)
                    and _call_name(call) == "completion_receipt"
                    for call in ast.walk(fn))
+
+
+def test_static_photon_driver_releases_scalar_v_before_packed_response():
+    fn = _function(ROOT / "src/gw/gw_jax.py", "main")
+    photon_arms = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        test_calls = [_call_name(call) for call in ast.walk(node.test)
+                      if isinstance(call, ast.Call)]
+        body_calls = [_call_name(call) for stmt in node.body
+                      for call in ast.walk(stmt)
+                      if isinstance(call, ast.Call)]
+        if ("uses_static_photon_response" in test_calls
+                and "compute_static_photon_response" in body_calls):
+            photon_arms.append(node)
+    assert len(photon_arms) == 1
+    arm = photon_arms[0]
+    response_call = next(
+        call for call in ast.walk(arm)
+        if isinstance(call, ast.Call)
+        and _call_name(call) == "compute_static_photon_response")
+    none_assignments = []
+    for node in ast.walk(arm):
+        if not isinstance(node, ast.Assign):
+            continue
+        if (not isinstance(node.value, ast.Constant)
+                or node.value.value is not None):
+            continue
+        none_assignments.extend((target, node.lineno) for target in node.targets)
+    names = {
+        target.id: lineno for target, lineno in none_assignments
+        if isinstance(target, ast.Name)
+    }
+    attributes = {
+        (target.value.id, target.attr): lineno
+        for target, lineno in none_assignments
+        if (isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name))
+    }
+    assert names["V_q"] < response_call.lineno
+    assert attributes[("isdf", "V_qmunu")] < response_call.lineno
+
+    # There must be no second local alias keeping the same device buffer live.
+    local_vqmunu = [node for node in ast.walk(fn)
+                    if isinstance(node, ast.Name)
+                    and node.id == "V_qmunu"]
+    assert not local_vqmunu
+
+
+def test_sigma_dispatch_enforces_disjoint_scalar_and_photon_v_owners():
+    fn = _function(ROOT / "src/gw/sigma_dispatch.py", "compute_sigma_xc")
+    photon_arms = [
+        node for node in ast.walk(fn)
+        if (isinstance(node, ast.If)
+            and any(isinstance(call, ast.Call)
+                    and _call_name(call) == "uses_static_photon_response"
+                    for call in ast.walk(node.test)))
+    ]
+    assert len(photon_arms) == 1
+    arm = photon_arms[0]
+
+    first = arm.body[0]
+    assert isinstance(first, ast.If)
+    assert isinstance(first.test, ast.Compare)
+    assert (isinstance(first.test.left, ast.Name)
+            and first.test.left.id == "V_q")
+    assert isinstance(first.test.ops[0], ast.IsNot)
+    assert (isinstance(first.test.comparators[0], ast.Constant)
+            and first.test.comparators[0].value is None)
+    assert any(isinstance(node, ast.Raise) for node in ast.walk(first))
+
+    # Scalar W fallback and scalar kernels live only in the non-photon arm,
+    # after its reciprocal V_q-is-None refusal.
+    assert arm.orelse and isinstance(arm.orelse[0], ast.If)
+    scalar_guard = arm.orelse[0]
+    assert isinstance(scalar_guard.test, ast.Compare)
+    assert (isinstance(scalar_guard.test.left, ast.Name)
+            and scalar_guard.test.left.id == "V_q")
+    assert isinstance(scalar_guard.test.ops[0], ast.Is)
+    assert any(isinstance(node, ast.Raise)
+               for node in ast.walk(scalar_guard.body[0]))
+    scalar_calls = {
+        _call_name(call) for node in arm.orelse[1:]
+        for call in ast.walk(node) if isinstance(call, ast.Call)
+    }
+    assert {"get", "compute_cohsex_sigma", "compute_sigma_x"} <= scalar_calls
+    assert not any(_call_name(call) in {
+        "get", "compute_cohsex_sigma", "compute_sigma_x"
+    } for node in arm.body for call in ast.walk(node)
+      if isinstance(call, ast.Call))
