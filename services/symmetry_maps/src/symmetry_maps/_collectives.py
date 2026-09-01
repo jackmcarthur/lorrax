@@ -14,10 +14,9 @@ service-local portability bet, not shared ``lxkit`` policy.
 from __future__ import annotations
 
 
-# The production CrI3 receipt has exceeded 40 minutes when every rank fought
-# through the same host overlap.  Root-only execution is expected to be much
-# faster, but the transport timeout must not turn a slow valid check into a
-# false distributed failure.
+# Large-WFN host overlap has no separately certified wall-time bound.  Keep
+# the receipt wait well above an ordinary RPC timeout so a slow valid check is
+# not turned into a false distributed failure.
 DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000
 
 
