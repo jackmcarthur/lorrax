@@ -146,6 +146,6 @@ LORRAX_MPIWRAPPER_ABI_DEFAULT="2.10.0"
 
 # Reproducible host toolchain for that adapter.  Cray MPICH is still the MPI
 # implementation; MPIwrapper only translates MPItrampoline's stable ABI.
-LORRAX_PM_PRGENV_DEFAULT="PrgEnv-gnu/8.6.0"
-LORRAX_PM_MPICH_DEFAULT="cray-mpich/9.0.1"
+LORRAX_PM_PRGENV_DEFAULT="PrgEnv-gnu/8.7.0"
+LORRAX_PM_MPICH_DEFAULT="cray-mpich/9.1.0"
 LORRAX_PM_CMAKE_DEFAULT="cmake/3.30.2"
