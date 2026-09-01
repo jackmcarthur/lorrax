@@ -59,6 +59,8 @@ for the real one, which is exactly what the deleted shim was.
 | `load(*, bands, k='full_bz', sharding=None, bispinor=False)` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. |
 | `load_process_local(*, bands, k, bispinor=False)` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. |
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
+| `full_k_parent_groups(full_k=None)` | Stable O(nk) grouping of requested full-BZ rows by raw IBZ parent. |
+| `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False)` | Apply the canonical typed unitary/antiunitary action to one already-loaded raw parent row. Consumers can realize a star with one child workspace and no parent re-read. |
 | `gvecs(k=...)` | `(n_k, ngkmax, 3)` int32, pad rows = the FFT-box **pad sentinel**, never zeros. |
 | `ngk_valid(k=...)` | The mask that makes the pad rows discountable. The pair is the contract. |
 | `box_index(k=...)` / `box_index_dev(...)` | FFT-box gather table, host / device-cached (the replicated-buffer-leak fix). |
@@ -97,6 +99,10 @@ for the real one, which is exactly what the deleted shim was.
   array (every rank must request the same window); `load_process_local`
   is the k-parallel primitive (per-rank windows, combination explicit).
   They are different primitives, not a flag.
+* **Parent/star streaming keeps one-k memory.** Non-singleton full-k stars
+  load each raw IBZ parent once and realize children serially through
+  `unfold_parent_to_full_k`; singleton stars retain the direct full-k path.
+  Both use the same typed symmetry action and keep one transformed child live.
 * **Late mesh binding is narrow.** `adopt_mesh` switches only a
   multi-process, auto-picked, currently-eager loader; explicit requests
   are never overridden.
