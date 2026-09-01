@@ -1874,9 +1874,10 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
     """Return measured table rungs passing the window gates.
 
     Sign-definite tables are cheap lookups, so expose their complete accepted
-    accuracy--node curve to the global selector.  Crossing keeps its first
-    accepted rule: continuing that iterator would run the expensive fitted
-    fallback even after a shipped table succeeded.
+    accuracy--node curve to the global selector.  Dominated rungs are removed
+    after measuring them.  Crossing keeps its first accepted rule: continuing
+    that iterator would run the expensive fitted fallback even after a shipped
+    table succeeded.
     """
     best_pair = (np.inf, np.inf)
     attempts = []
@@ -1944,7 +1945,20 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 "candidate_tolerance": evidence.get("candidate_tolerance"),
                 "refusal": str(exc)})
     if candidates:
-        return candidates
+        # Stable Pareto reduction: for a fixed node count keep the most
+        # accurate measured rule, then keep a higher-node rung only when it
+        # lowers the achieved required error.  This is the marginal curve the
+        # selector needs; dominated wider-range tables merely add binaries and
+        # can otherwise win arbitrary equal-node MILP ties.
+        curve = []
+        best_required = np.inf
+        for candidate in sorted(candidates, key=lambda row: (
+                int(row["times"].size), float(row["required_target"]))):
+            required = float(candidate["required_target"])
+            if required < best_required:
+                curve.append(candidate)
+                best_required = required
+        return curve
     residual, amplification = best_pair
     raise _ProductWindowRefusal(
         f"delivered product window {spec['name']!r} refused: achieved "

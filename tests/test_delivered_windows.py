@@ -468,8 +468,9 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
         cell_masses=np.asarray([1.0]))
     denominator = complex(problem.denominators[0, 0])
     passing_time = np.asarray([1.0j])
-    passing_weight = np.asarray([
+    exact_weight = np.asarray([
         np.exp(denominator) / denominator], dtype=np.complex128)
+    passing_weight = exact_weight * (1.0 + 5.0e-6)
 
     def table_walk(*_args, **_kwargs):
         yield (np.asarray([1.0j]), np.asarray([0.0j]),
@@ -478,7 +479,7 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
         yield (passing_time, passing_weight,
                {"family": "noncrossing", "candidate_tolerance": 2.0e-7,
                 "provenance": "next tighter table"})
-        yield (passing_time, passing_weight,
+        yield (np.repeat(passing_time, 2), np.repeat(exact_weight / 2.0, 2),
                {"family": "noncrossing", "candidate_tolerance": 1.0e-8,
                 "provenance": "tightest table"})
 
