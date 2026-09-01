@@ -5,14 +5,10 @@ retarded broadening ``eta``.  It divides each causal branch into a few
 ``state interval x pole interval`` windows, measures their weighted reciprocal
 problems, and assigns each window part of the global error budget.
 
-Sign-definite windows start from shipped noncrossing minimax tables.  Their
-certificate chain is: catalog range and scaled sup-norm bound, physical
-rescaling by the smallest gap, achieved error on the fitting lattice, achieved
-error on the refined validation lattice, and the runtime-noise gate.  A table
-that misses the measured gate is replaced by the next tighter or wider shipped
-table.  Crossing windows first try shipped HGL tables and otherwise perform one
-deterministic fixed-time weight fit.  The planner never evaluates explicit
-state--pole pairs.
+Every product window is fitted on demand against its measured pole distribution.
+The fitted rule is accepted only from its achieved error on the refined
+validation lattice, the runtime-noise gate, and the bounded-factor gate.  The
+planner never evaluates explicit state--pole pairs.
 
 The final acceptance test is
 
@@ -40,12 +36,9 @@ from scipy.optimize import Bounds, LinearConstraint, milp
 from common.collectives import (all_gather_processes, gather_to_host,
                                 process_count, process_rank, psum_replicate)
 from gw.minimax_screening import MinimaxNodes
-from gw.mpa.evaluator import gauss_legendre_interval
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaBranch, _SigmaWindow
-import minimax as _mm
-from minimax import (ReciprocalMeasureProblem, solve_fixed_time_weights_fast,
-                     tail_refined_lattice_measure)
+from minimax import ReciprocalMeasureProblem, tail_refined_lattice_measure
 
 
 DEFAULT_LATTICE_BINS = 25
@@ -67,26 +60,7 @@ TIGHTEN_FLOOR = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 7
-
-# The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
-# artifact coordinate, not a planner dial; asking for another value cannot
-# select those tables safely.
-_CROSSING_EPS_Q = 1.0e-3
-
-# The one crossing fallback uses one deterministic IRLS call.  Twelve steps
-# with three-step patience and 20% conditioning slack are the frozen-Na
-# settings that keep both crossing windows below their incumbent residuals
-# while leaving the complete six-window fitting stage below three seconds.
-_CROSSING_FIT_ITERATIONS = 12
-_CROSSING_FIT_STALL = 3
-_CROSSING_CONDITIONING_SLACK = 0.2
-
-# The causal integral tail is exp(-gamma_min * t_max).  Reserving 90% of the
-# requested relative target for that tail is the balanced allocation already
-# present in evaluator.damped_rectangle_gauss_rule; it fixes the time interval
-# without a search over tail fractions.
-_CROSSING_TAIL_FRACTION = 0.9
+_PLAN_CACHE_VERSION = 8
 
 _WINDOW_CENSUS_PREFIX = "[delivered-planner-window] "
 
@@ -388,10 +362,7 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
     digest.update(f"delivered-plan-cache-v{_PLAN_CACHE_VERSION}".encode())
     digest.update(repr((float(eta), float(target), float(safety),
                         float(factor_cap), int(pair_ceiling), str(grid_mode),
-                        int(lattice_bins), _CROSSING_EPS_Q,
-                        _CROSSING_FIT_ITERATIONS, _CROSSING_FIT_STALL,
-                        _CROSSING_CONDITIONING_SLACK,
-                        _CROSSING_TAIL_FRACTION)).encode())
+                        int(lattice_bins))).encode())
     for spec in specs:
         branch = spec["branch"]
         digest.update(repr((
@@ -1279,55 +1250,6 @@ def _rule_accepted(metrics, target):
         <= AMPLIFICATION_NOISE_SAFETY * float(target))
 
 
-def _absolute_kernel_target(problem, relative_target):
-    """Convert delivered relative error to a uniform absolute kernel bound.
-
-    If ``|Q(d) - 1/d| <= eps_abs`` on every retained cell, the delivered
-    numerator at frequency ``i`` is at most ``eps_abs * sum(mass)``.  Thus
-    ``relative_target * min(delivered_mass) / sum(mass)`` is a sufficient
-    physical absolute target.  It is used only to select a shipped table;
-    acceptance is always remeasured in the delivered norm.
-    """
-    _kept, delivered_mass, _excluded = problem.retained()
-    total_mass = float(np.sum(problem.cell_masses))
-    target = (float(relative_target) * float(np.min(delivered_mass))
-              / total_mass)
-    if not np.isfinite(target) or target <= 0.0:
-        raise RuntimeError(
-            "delivered product window has no positive absolute error target")
-    return target
-
-
-def _catalog_walk(family, range_value, scaled_target, max_nodes, *,
-                  target_kind=None, eps_q=None):
-    """Return shipped entries in selection order, then tighter/wider order."""
-    entries = []
-    for entry in _mm.catalog().for_family(family):
-        if entry.range_max + 1.0e-12 < float(range_value):
-            continue
-        if entry.error_bound - 1.0e-18 > float(scaled_target):
-            continue
-        if entry.node_count > int(max_nodes):
-            continue
-        if target_kind is not None and entry.target_kind != target_kind:
-            continue
-        if eps_q is not None and (
-                entry.eps_q is None
-                or abs(entry.eps_q - float(eps_q)) > 1.0e-12):
-            continue
-        entries.append(entry)
-    return sorted(entries, key=lambda entry: (
-        entry.range_max, -entry.error_bound, entry.node_count))
-
-
-def _load_catalog_entry(entry, *, family, target, eps_q=None):
-    """Load one exact catalog entry through the minimax service door."""
-    keywords = {} if eps_q is None else {"eps_q": float(eps_q)}
-    return _mm.lookup(
-        family=family, target=target, range_value=entry.range_max,
-        error_bound=entry.error_bound, n_max=entry.node_count, **keywords)
-
-
 def _sign_definite_orientation(problem):
     """Return positive-real lower-half support and its executor transform."""
     denominator = problem.denominators
@@ -1345,248 +1267,12 @@ def _sign_definite_orientation(problem):
         "sign-definite product support crosses an axis and cannot be served")
 
 
-def _sign_definite_table_candidates(problem, relative_target, max_nodes):
-    """Yield rescaled noncrossing tables in conservative walk order."""
-    rotated, transform = _sign_definite_orientation(problem)
-    x_min = float(np.min(rotated.real))
-    x_max = float(np.max(rotated.real))
-    if not 0.0 < x_min <= x_max < np.inf:
-        raise RuntimeError(
-            f"invalid sign-definite support [{x_min:.6g}, {x_max:.6g}] Ry")
-    range_value = x_max / x_min
-    absolute_target = _absolute_kernel_target(problem, relative_target)
-    scaled_target = absolute_target * x_min
-    entries = _catalog_walk(
-        "noncrossing", range_value, scaled_target, max_nodes)
-    if not entries:
-        raise RuntimeError(
-            "no shipped noncrossing table covers "
-            f"R={range_value:.6g}, scaled target={scaled_target:.6g}, "
-            f"and max_nodes={int(max_nodes)}")
-    for entry in entries:
-        served = _load_catalog_entry(
-            entry, family="noncrossing", target="inverse")
-        tau = np.asarray(served.nodes, np.float64) / x_min
-        alpha = np.asarray(served.weights, np.float64) / x_min
-        if transform.startswith("positive"):
-            times, weights = 1.0j * tau, alpha
-        else:
-            times, weights = -1.0j * tau, -alpha
-        yield np.asarray(times), np.asarray(weights), {
-            "family": "noncrossing",
-            "transform": transform,
-            "requested_range": range_value,
-            "table_range": float(entry.range_max),
-            "requested_scaled_error": scaled_target,
-            "catalog_error_bound_scaled": float(entry.error_bound),
-            "certificate_abs_error_bound": float(entry.error_bound / x_min),
-            "catalog_achieved_abs_error": float(served.max_error / x_min),
-            "candidate_tolerance": float(entry.error_bound),
-            "provenance": served.provenance.one_line(),
-        }
-
-
-def _crossing_geometry(problem, pole_sign):
-    oriented = float(pole_sign) * problem.denominators
-    gamma = oriented.imag
-    if np.any(gamma <= 0.0):
-        raise RuntimeError("oriented crossing support is not eta-damped")
-    gamma_min = float(np.min(gamma))
-    radius = float(np.max(np.abs(oriented.real)))
-    return oriented, gamma_min, radius / gamma_min
-
-
 def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
                             pole_sign, state_edge, bins):
-    """Return the smallest exact omega-patch routing covered by HGL.
-
-    A covered problem returns one identity route.  A wider crossing is split
-    into equal contiguous omega patches.  For each patch the original pole
-    interval is tiled into a resonant shell and two sign-definite flanks; the
-    shell bounds follow directly from that patch's omega rows and the actual
-    state extrema.  Problems are rebuilt from the same compact measured cells,
-    with no explicit state--pole pairs.  This is also the seam for a future
-    user-specified Sigma window with its own omega list and broadening.
-    """
+    """Return one measured window; on-demand fitting has no catalog span."""
+    del measure, state_positions, pole_sign, state_edge, bins
     omega_rows = np.arange(problem.frequencies.size, dtype=np.int64)
-    entries = [entry for entry in _mm.catalog().for_family("crossing")
-               if entry.target_kind == "hgl"
-               and entry.eps_q is not None
-               and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12]
-    if not entries:
-        raise RuntimeError("the shipped HGL family is empty")
-    # Keyed to the CATALOG deliberately, not to the wider reach of the
-    # measure-adapted fitter.  Splitting is cost-neutral in nodes -- the law is
-    # linear in A, so one window at A and two patches at A/2 both cost about
-    # 2.02*A/gamma -- but a patch inside the catalog is an instant lookup where
-    # a wide one is a ~150 s fit.  Split for the cheap server, not the capable
-    # one.
-    widest_span = max(float(entry.range_max) for entry in entries)
-    if (_window_kind(problem) != "crossing"
-            or _crossing_geometry(problem, pole_sign)[2]
-            <= widest_span + 1.0e-12):
-        return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
-
-    raw_energy = (float(pole_sign)
-                  * np.asarray(measure[0], np.float64))
-    selected = raw_energy[np.asarray(state_positions, np.int64)]
-    state_min, state_max = float(np.min(selected)), float(np.max(selected))
-    original_lo, original_hi = map(float, pole_bounds)
-    for patch_count in range(2, omega_rows.size + 1):
-        patches = tuple(np.array_split(omega_rows, patch_count))
-        planned = []
-        for patch in patches:
-            oriented = float(pole_sign) * problem.frequencies[patch]
-            omega_lo, omega_hi = (float(np.min(oriented)),
-                                  float(np.max(oriented)))
-            shell_lo = max(
-                original_lo, omega_lo - state_max - float(state_edge))
-            shell_hi = min(
-                original_hi, omega_hi - state_min + float(state_edge))
-            shell_bounds = (shell_lo, max(shell_lo, shell_hi))
-            shell = _product_problem(
-                state_positions, shell_bounds, measure,
-                problem.frequencies[patch], pole_sign, int(bins))
-            if (shell is not None and _window_kind(shell[0]) == "crossing"
-                    and _crossing_geometry(shell[0], pole_sign)[2]
-                    > widest_span + 1.0e-12):
-                planned = []
-                break
-            cells = []
-            if original_lo < shell_bounds[0]:
-                cells.append(("positive", (original_lo, shell_bounds[0])))
-            if shell_bounds[0] < shell_bounds[1]:
-                cells.append(("crossing", shell_bounds))
-            if shell_bounds[1] < original_hi:
-                cells.append(("negative", (shell_bounds[1], original_hi)))
-            planned.append((patch, tuple(cells)))
-        if len(planned) == len(patches):
-            return tuple(planned)
-    # Even one omega row per patch leaves a support wider than the fitter
-    # serves.  Hand back the unpatched window rather than raising: the
-    # candidate refusal downstream reports the real residual and kappa, which
-    # is a usable diagnostic, where raising here only names this guard.
     return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
-
-
-def _crossing_table_candidates(problem, pole_sign, relative_target,
-                               max_nodes):
-    """Yield HGL table rules whose scaled span and bound cover the support."""
-    _oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
-    absolute_target = _absolute_kernel_target(problem, relative_target)
-    scaled_target = absolute_target * gamma_min
-    entries = _catalog_walk(
-        "crossing", A_dim, scaled_target, max_nodes,
-        target_kind="hgl", eps_q=_CROSSING_EPS_Q)
-    for entry in entries:
-        served = _load_catalog_entry(
-            entry, family="crossing", target="hgl",
-            eps_q=_CROSSING_EPS_Q)
-        times = (float(pole_sign) * np.asarray(served.nodes, np.float64)
-                 / gamma_min)
-        weights = (float(pole_sign) * -1.0j
-                   * np.asarray(served.weights, np.float64) / gamma_min)
-        yield np.asarray(times), np.asarray(weights), {
-            "family": "crossing_hgl",
-            "requested_range": A_dim,
-            "table_range": float(entry.range_max),
-            "requested_scaled_error": scaled_target,
-            "catalog_error_bound_scaled": float(entry.error_bound),
-            "certificate_abs_error_bound": float(
-                entry.error_bound / gamma_min),
-            "catalog_achieved_abs_error": float(
-                served.max_error / gamma_min),
-            "candidate_tolerance": float(entry.error_bound),
-            "provenance": served.provenance.one_line(),
-        }
-
-
-def _crossing_fallback_node_count(A_dim, max_nodes):
-    """Choose the fallback size from the nearest shipped HGL span."""
-    entries = [entry for entry in _mm.catalog().for_family("crossing")
-               if entry.target_kind == "hgl"
-               and entry.eps_q is not None
-               and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12]
-    if not entries:
-        raise RuntimeError("the shipped HGL family is empty")
-    lower_ranges = [entry.range_max for entry in entries
-                    if entry.range_max <= float(A_dim) + 1.0e-12]
-    table_range = (max(lower_ranges) if lower_ranges
-                   else min(entry.range_max for entry in entries))
-    node_count = max(entry.node_count for entry in entries
-                     if entry.range_max == table_range)
-    if float(A_dim) > table_range:
-        # Crossing node counts grow linearly in bandwidth (measured across
-        # the shipped HGL family); a request wider than the widest shipped
-        # span extrapolates the density rather than running under-resolved.
-        node_count = int(np.ceil(node_count * float(A_dim) / table_range))
-    if node_count > int(max_nodes):
-        raise RuntimeError(
-            f"crossing support A={A_dim:.6g} needs {node_count} fixed "
-            f"nodes from the nearest HGL span, max_nodes={int(max_nodes)}")
-    return int(node_count), float(table_range)
-
-
-def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
-    """Fit one fixed deterministic causal grid; never search node/time pairs."""
-    oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
-    # The shipped odd HGL target is certified on ``[-A, A]``, so lookup uses
-    # the support radius above.  The unconstrained IRLS fallback keeps its
-    # established density against the complete real span; it is not an HGL
-    # certificate and reducing that grid changed its conditioning.
-    fit_A_dim = float(np.ptp(oriented.real)) / gamma_min
-    widest_hgl = max(
-        float(entry.range_max)
-        for entry in _mm.catalog().for_family("crossing")
-        if entry.target_kind == "hgl"
-        and entry.eps_q is not None
-        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12)
-    # A support whose physical HGL radius is covered keeps the established
-    # widest-table density even when the conservative end-to-end span is a
-    # little larger.  Truly wider supports are patched before this fallback.
-    covered_hgl = [
-        float(entry.range_max)
-        for entry in _mm.catalog().for_family("crossing")
-        if entry.target_kind == "hgl"
-        and entry.eps_q is not None
-        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12
-        and entry.range_max <= fit_A_dim + 1.0e-12
-    ]
-    fallback_A_dim = (
-        max(covered_hgl, default=fit_A_dim)
-        if A_dim <= widest_hgl + 1.0e-12 else fit_A_dim
-    )
-    node_count, source_range = _crossing_fallback_node_count(
-        fallback_A_dim, max_nodes)
-    target = min(float(relative_target), 0.5)
-    t_max = (np.log(1.0 / (_CROSSING_TAIL_FRACTION * target))
-             / gamma_min)
-    tau, positive_weights = gauss_legendre_interval(
-        node_count, 0.0, t_max)
-    times = float(pole_sign) * np.asarray(tau, np.float64)
-    seed = (float(pole_sign) * -1.0j
-            * np.asarray(positive_weights, np.float64))
-    weights, _objective = solve_fixed_time_weights_fast(
-        problem, times,
-        iterations=_CROSSING_FIT_ITERATIONS,
-        stall_iterations=_CROSSING_FIT_STALL,
-        conditioning_slack=_CROSSING_CONDITIONING_SLACK,
-        conditioning_pass=True,
-        start_weights=seed)
-    return np.asarray(times), np.asarray(weights), {
-        "family": "crossing_fixed_time_fit",
-        "requested_range": A_dim,
-        "fit_span": fit_A_dim,
-        "node_count_source_range": source_range,
-        "candidate_tolerance": float(relative_target),
-        "eta_floor_ry": gamma_min,
-        "real_span_ry": float(np.ptp(oriented.real)),
-        "time_ceiling_ry_inverse": float(t_max),
-        "fit_iterations": _CROSSING_FIT_ITERATIONS,
-        "fit_stall_iterations": _CROSSING_FIT_STALL,
-        "conditioning_slack": _CROSSING_CONDITIONING_SLACK,
-        "provenance": "one deterministic fixed-time IRLS fit",
-    }
 
 
 def _rule_candidate(problem, validation, times, weights, evidence):
@@ -1660,19 +1346,16 @@ def _factor_growth(spec, times, eta):
     return green, screened
 
 
-def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
-                            relative_target):
-    """Measure-adapted rule for ONE crossing window, or None to fall back.
+def _measure_adapted_candidate(spec, eta, max_nodes, factor_growth_cap,
+                               relative_target):
+    """Measure-adapted rule for one product window, or ``None`` on refusal.
 
     Node count is the runtime currency: one node is one FFT(G_w W_w).  The
-    shipped path fits crossing windows on the real-time contour, which is
-    measurably the wrong operating point — on this deck it spends more nodes
-    and runs at kappa_p99 15.9/30.9 where a rotated contour meets the same
-    targets near kappa 1.1.  Sign-definite windows are NOT routed here: their
-    certified imaginary-axis tables already cost 8-12 nodes and are served by
-    lookup, which nothing measured beats.
+    The contour, rank, and nodes are derived from this run's measure.  This is
+    the sole production path for crossing and sign-definite supports.
     """
-    from minimax import RoqWindow, plan_measure_adapted_roq  # noqa: PLC0415
+    from minimax import (RoqPlanningRefusal, RoqWindow,
+                         plan_measure_adapted_roq)  # noqa: PLC0415
 
     d = spec["problem"].denominators
     sigma = 1 if float(np.mean(np.imag(d) > 0.0)) > 0.5 else -1
@@ -1681,6 +1364,13 @@ def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
         target=float(relative_target), branch=spec["name"], sigma=int(sigma))
     try:
         plan = plan_measure_adapted_roq((window,), float(eta))
+    except RoqPlanningRefusal as exc:
+        raise _ProductWindowRefusal(
+            f"delivered product window {spec['name']!r} refused: achieved "
+            f"(residual={exc.residual:.6g}, "
+            f"amplification_p99={exc.kappa_p99:.6g}); the measure-adapted "
+            "fit did not survive the residual and noise gates",
+            exc.residual, exc.kappa_p99) from exc
     except (ValueError, RuntimeError, FloatingPointError, OverflowError,
             np.linalg.LinAlgError):
         return None
@@ -1844,7 +1534,7 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
 
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
                       relative_target, *, adapted_only=False):
-    """Rules for one window: rotated ROQ if it crosses, else shipped lookup.
+    """Fit one on-demand measure-adapted rule for a product window.
 
     The single routing decision, at module level so the planner, the tests and
     the offline node audit all take the same path.
@@ -1857,114 +1547,29 @@ def window_candidates(spec, eta, max_nodes, factor_growth_cap,
 def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
                                 relative_target, *, adapted_only=False):
     """Return one window's rules and a cost split for planner evidence."""
+    del adapted_only
     detail = {"adapted_fit_seconds": 0.0,
               "shipped_fallback_seconds": 0.0}
-    adapted = None
-    if spec["kind"] == "crossing":
-        started = time.perf_counter()
-        adapted = _roq_crossing_candidate(
-            spec, eta, max_nodes, factor_growth_cap, relative_target)
-        detail["adapted_fit_seconds"] = time.perf_counter() - started
-    if adapted is not None and adapted_only:
-        # First pass: the cheap rule alone.  Fitting the shipped crossing
-        # rule as well costs seconds per window and is only needed when the
-        # GLOBAL budget cannot be met from cheap rules, which the caller
-        # discovers by retrying.  Planning was 66 s of an 85 s stage before
-        # this split.
-        return [adapted], detail
     started = time.perf_counter()
     try:
-        shipped = _candidate_rules(
+        candidates = _candidate_rules(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
-    except (RuntimeError, ValueError, FloatingPointError, OverflowError,
-            np.linalg.LinAlgError):
-        if adapted is None:
-            raise
-        shipped = []
     finally:
-        detail["shipped_fallback_seconds"] = time.perf_counter() - started
-    # BOTH are offered to the exact selector, cheapest first.  The adapted
-    # rule is usually far cheaper in nodes, but a window's own allowance is
-    # not the whole story: the selector minimises nodes subject to the GLOBAL
-    # delivered-error budget, and sometimes it must buy a more accurate rule
-    # in one window to afford the plan.  Offering only the cheap rule made a
-    # real deck refuse at 4.6% over budget with no alternative to pick.
-    candidates = ([adapted] + shipped) if adapted is not None else shipped
+        detail["adapted_fit_seconds"] = time.perf_counter() - started
     return candidates, detail
 
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                      relative_target):
-    """Return the first lookup-first rule passing the measured window gates."""
-    best_pair = (np.inf, np.inf)
-    attempts = []
-    if spec["kind"] == "crossing":
-        def rules():
-            yield from _crossing_table_candidates(
-                spec["problem"], spec["pole_sign"], relative_target,
-                max_nodes)
-            # At most one optimized fit exists: it is made only after every
-            # matching shipped HGL table has missed the measured gates.
-            yield _fit_crossing_once(
-                spec["problem"], spec["pole_sign"], relative_target,
-                max_nodes)
-        rule_rows = rules()
-    else:
-        rule_rows = _sign_definite_table_candidates(
-            spec["problem"], relative_target, max_nodes)
-    iterator = iter(rule_rows)
-    while True:
-        try:
-            times, weights, evidence = next(iterator)
-        except StopIteration:
-            break
-        except (FloatingPointError, OverflowError, RuntimeError, ValueError,
-                np.linalg.LinAlgError) as exc:
-            raise _ProductWindowRefusal(
-                f"delivered product window {spec['name']!r} refused: "
-                f"{exc}") from exc
-        try:
-            candidate = _rule_candidate(
-                spec["problem"], spec["validation"],
-                times, weights, evidence)
-            refined = candidate["metrics"]
-            factor = _factor_growth(spec, times, eta)
-            best_pair = min(best_pair, (refined[0], refined[1]))
-            attempts.append({
-                "family": evidence["family"],
-                "candidate_tolerance": evidence["candidate_tolerance"],
-                "node_count": int(times.size),
-                "refined_residual": refined[0],
-                "amplification_p99": refined[1],
-                "amplification_max": refined[2],
-                "factor_log_growth_max": max(factor),
-            })
-            if (not _rule_accepted(refined, relative_target)
-                    or max(factor) > float(factor_growth_cap)):
-                continue
-            required_target = max(
-                refined[0],
-                refined[1] * RUNTIME_NOISE_EPSILON
-                / AMPLIFICATION_NOISE_SAFETY)
-            candidate.update(
-                required_target=float(required_target),
-                absolute_cost=float(spec["envelope"] * required_target),
-                factor_growth=factor,
-                attempts=attempts.copy())
-            return [candidate]
-        except (FloatingPointError, OverflowError, RuntimeError, ValueError,
-                np.linalg.LinAlgError) as exc:
-            attempts.append({
-                "family": evidence.get("family", "unknown"),
-                "candidate_tolerance": evidence.get("candidate_tolerance"),
-                "refusal": str(exc)})
-    residual, amplification = best_pair
-    raise _ProductWindowRefusal(
-        f"delivered product window {spec['name']!r} refused: achieved "
-        f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
-        "the shipped product-window family and its one crossing fallback "
-        "did not survive the residual, noise, and factor-growth gates",
-        float(residual), float(amplification))
+    """Return the on-demand rule after its delivered acceptance gates."""
+    candidate = _measure_adapted_candidate(
+        spec, eta, max_nodes, factor_growth_cap, relative_target)
+    if candidate is None:
+        raise _ProductWindowRefusal(
+            f"delivered product window {spec['name']!r} refused: the "
+            "measure-adapted fit did not survive the residual, noise, node, "
+            "and factor-growth gates")
+    return [candidate]
 
 
 def _pointwise_rule_costs(specs, candidates, frequency_count):
@@ -2198,6 +1803,7 @@ def build_delivered_sigma_windows(
     factor_cap = float(factor_growth_cap)
     pair_ceiling = int(max_nodes) if max_nodes is not None else 0
     grid_mode = str(tau_grid_mode).strip().lower()
+    del crossing_eps_q, use_shipped_minimax_tables
     if (omega_grid.ndim != 1 or not omega_grid.size
             or not np.all(np.isfinite(omega_grid))):
         raise ValueError("omega_grid_ry must be a nonempty finite vector")
@@ -2207,17 +1813,11 @@ def build_delivered_sigma_windows(
         raise ValueError("envelope_error_safety must lie in (0,1]")
     if pair_ceiling < 1:
         raise ValueError("max_nodes must permit at least one pair")
-    if not np.isclose(float(crossing_eps_q), _CROSSING_EPS_Q,
-                      rtol=0.0, atol=1.0e-15):
-        raise ValueError(
-            f"lookup-first crossing tables require eps_q={_CROSSING_EPS_Q:g}")
-    if not bool(use_shipped_minimax_tables):
-        raise ValueError("lookup-first planning requires shipped minimax tables")
     if tuple(pane_times):
-        raise ValueError("lookup-first planning does not accept pane time grids")
+        raise ValueError("on-demand planning does not accept pane time grids")
     if grid_mode != "free":
         raise ValueError(
-            "lookup-first planning uses one served grid per window; "
+            "on-demand planning uses one fitted grid per window; "
             "tau_grid_mode must be 'free'")
     geometry = delivered_product_geometry(
         branch_rows, eta, edge_factor=float(edge_factor))
@@ -2394,18 +1994,14 @@ def build_delivered_sigma_windows(
                     required_cost, window_tau_pairs)
     if cached is None:
         cache_status = "disabled" if plan_cache_path is None else "miss"
-        # Each lookup first receives the largest relative allowance it could
+        # Each fit first receives the largest relative allowance it could
         # spend without exceeding the complete plan budget by itself.  The
         # exact selector below then checks the sum of ACHIEVED costs.  This
         # support-derived ceiling avoids a tolerance sweep while preserving
         # the global delivered-error contract.
         # The adapted (rotated) rule per window is fitted ONCE and reused.
-        # Pass 1 offers only those, which is what closes the budget on every
-        # deck measured so far; pass 2 adds the shipped candidates for the
-        # selector to buy accuracy where the global budget needs it.  Fitting
-        # the shipped crossing rule up front cost ~1 s per window for nothing,
-        # and refitting the adapted rule on retry cost far more (132 s vs 85 s
-        # measured on the Na deck), so both are avoided here.
+        # The exact selector checks their achieved costs.  A shortfall is
+        # addressed only by tighter on-demand fits.
         base_specs = specs
 
         def fit_window(index):
@@ -2425,16 +2021,14 @@ def build_delivered_sigma_windows(
         fits = None
         consolidation_cache = None
         shortfall = None
-        # Five stages, each entered only when the previous cannot close the
+        # Four stages, each entered only when the previous cannot close the
         # global budget.  Stage 1 offers the adapted rules alone (this is what
         # every passing deck uses, and it pays for exactly one fit round).
-        # Stage 2 adds the shipped rules so the selector can buy accuracy.
-        # Stages 3--5 compound up to three TIGHTENED allowances, which are the
+        # Stages 2--4 compound up to three TIGHTENED allowances, which are the
         # only stages that can lower a cost the first two merely re-shuffle.
         tighten_scale = 1.0
-        stages = ("adapted", "shipped") + ("tightened",) * 3
+        stages = ("adapted",) + ("tightened",) * 3
         for stage_index, stage in enumerate(stages):
-            adapted_only = stage == "adapted"
             specs = base_specs
             if stage == "adapted":
                 candidates_by_window = base_candidates
@@ -2459,12 +2053,6 @@ def build_delivered_sigma_windows(
                              for allowance in allowances]
 
                 def fit_tight(index):
-                    # NOT adapted_only.  A sign-definite window is served by a
-                    # certified table indexed BY its target, so it re-fits
-                    # tighter only if the shipped path is asked again at the
-                    # tightened allowance; asking the adapted path alone
-                    # leaves exactly those windows at their loose rules.
-                    #
                     # A window that cannot meet the TIGHTENED allowance is not
                     # a failure: its loose rule is still in the candidate list
                     # below, and the selector may not have needed this window
@@ -2491,34 +2079,6 @@ def build_delivered_sigma_windows(
                 candidates_by_window = [
                     list(tight) + list(base)
                     for tight, base in zip(tight_candidates, base_candidates)]
-            else:
-                def fit_retry(index):
-                    existing = base_candidates[index]
-                    adapted = next((candidate for candidate in existing
-                        if candidate["evidence"]["family"]
-                        == "measure_adapted_roq"), None)
-                    detail = {"adapted_fit_seconds": 0.0,
-                              "shipped_fallback_seconds": 0.0}
-                    if adapted is None:
-                        return existing, detail
-                    started = time.perf_counter()
-                    try:
-                        shipped = _candidate_rules(
-                            base_specs[index], eta, pair_ceiling, factor_cap,
-                            allowances[index])
-                    except (RuntimeError, ValueError, FloatingPointError,
-                            OverflowError, np.linalg.LinAlgError):
-                        shipped = []
-                    detail["shipped_fallback_seconds"] = (
-                        time.perf_counter() - started)
-                    return [adapted] + shipped, detail
-
-                fit_started = time.perf_counter()
-                candidates_by_window, retry_rows = (
-                    _run_parallel_planner_jobs(
-                        len(base_specs), fit_retry, refuse_errors=True))
-                window_parallel_seconds += time.perf_counter() - fit_started
-                window_fit_rows.extend(retry_rows)
             unconsolidated_specs = specs
             unconsolidated_candidates = candidates_by_window
             consolidation_started = time.perf_counter()
@@ -2569,7 +2129,7 @@ def build_delivered_sigma_windows(
                     except RuntimeError:
                         selection_seconds += (
                             time.perf_counter() - selection_started)
-                if stage == "shipped" and shortfall is None:
+                if stage == "adapted" and shortfall is None:
                     raise      # ceiling-limited: tightening cannot help
                 if stage == "tightened" and stage_index == len(stages) - 1:
                     raise      # all three compounded re-fits were exhausted
