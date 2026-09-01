@@ -48,9 +48,21 @@ from minimax import (ReciprocalMeasureProblem, solve_fixed_time_weights_fast,
 
 
 DEFAULT_LATTICE_BINS = 25
+# Spend only 80% of the error the deck asked for, leaving room for the error
+# the RUNTIME adds on top of the fit's. Not swept: 0.8 is a chosen reserve.
 ENVELOPE_ERROR_SAFETY = 0.8
+# Rule weights grow like exp(t*d) along the contour and float64 overflows near
+# 709 log units, so 30 is a deliberately distant guard rail. Beware how it
+# bites: it silently DROPPED a rule sitting 771x inside its target at kappa
+# 1.08, because the growth was measured about the wrong energy origin. A
+# window refusing with no candidate family means suspect this, not the fit.
 FACTOR_GROWTH_CAP = 30.0
+# Complex128 arithmetic in the tau sweep injects about this much relative
+# noise, so a rule that amplifies cancellation past a share of its target is
+# useless however good its residual looks on paper.
 RUNTIME_NOISE_EPSILON = 6.0e-8
+# A rule may spend at most 5% of its budget on that amplified noise. The 5% is
+# a judgement call and has never been measured for optimality.
 AMPLIFICATION_NOISE_SAFETY = 0.05
 #: Overshoot the tightening slightly, because a re-fit at a given allowance
 #: lands somewhere at or under it rather than exactly on it.
@@ -2387,6 +2399,10 @@ def build_delivered_sigma_windows(
             # 6.58e9 after a tightened re-merge).  Tightening and merging are
             # separate optimisations; letting them interact loses both.
             trial_rows = []
+            # Merging is chosen against the LOOSE candidate set, so re-running
+            # it over tightened rules picks a different merge and can price the
+            # plan higher than the split one it replaced -- measured at 6.58e9
+            # against 5.65e9. Tighten or merge, never both at once.
             if stage != "tightened":
                 (specs, candidates_by_window, trial_rows,
                  consolidation_cache) = _consolidate_branches(

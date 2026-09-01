@@ -65,8 +65,12 @@ __all__ = [
 # and it misses this support by four orders of magnitude, so it must never be
 # tried first.
 _ANGLE_SCAN_DEG = (-85.0, -80.0, -70.0, -58.0, 0.0)
+# Choose the contour angle with a cheap low-rank fit before paying for the
+# real one: the best angle barely moves with rank, so 12 suffices to rank them.
 _ANGLE_PROBE_RANK = 12
 _ANGLE_BASE_NODES = 64
+# Under about six nodes a reciprocal fit has too few degrees of freedom to be
+# worth measuring, so the rank search starts here rather than at 1.
 _MIN_RANK = 6
 #: Slope of the measured crossing cost law, n ~= 2.02*(A/gamma) at eps = 1e-4
 #: (claim 528).  It is what tells a support how much rank it can NEED.
@@ -88,6 +92,9 @@ _RANK_HARD_CAP = 512
 _HORIZON_DECAY_LENGTHS = 5.0
 _HORIZON_MASS_QUANTILE = 1.0e-4
 
+# The same runtime noise the delivered planner assumes, doing double duty: it
+# also decides which singular modes are real, since a basis direction weaker
+# than the noise the runtime injects cannot carry information a fit may use.
 _NOISE_FLOOR = 6.0e-8
 _NOISE_SHARE = 0.05
 _MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
@@ -180,7 +187,15 @@ def _candidates(group: RoqGroup, base_nodes: int):
 
 def _weighted_subspace(group: RoqGroup, times: np.ndarray, gl: np.ndarray,
                        max_rank: int):
-    """Right singular basis of the mass/frequency-weighted snapshot family."""
+    """Right singular basis of the mass/frequency-weighted snapshot family.
+
+    Weighting by delivered mass BEFORE taking the basis is the whole point: it
+    makes the fit accurate where the physics actually puts weight rather than
+    uniformly over a box. The cost is that the basis inherits the measure's
+    dimensionality -- a support with 91% of its mass on 10% of its cells had
+    228 of 512 modes come back numerically zero, and fitting past them buys
+    cancellation instead of accuracy. See _usable_rank.
+    """
     problem = group.fit
     d = problem.denominators
     mass = problem.cell_masses
