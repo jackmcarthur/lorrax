@@ -77,6 +77,12 @@ map is the single place the row convention (`U @ bvec`, never
 `U @ bvec.T`) is decidable; the 2026-05..08 head bias lived precisely in a
 private copy of it. `minibz_voronoi_batches`, `minibz_average` and
 `minibz_inscribed_sphere_r2` are the BGW `minibzaverage.f90` port;
+`minibz_moment_tensor` (`⟨v q_a q_b⟩`) and `minibz_transverse_head_avg`
+(`⟨v (δ_ab − q̂_a q̂_b)⟩`, the bare TT head) are the same draw and the same
+two estimator branches with a tensor weight; `slab_minibz_photon_cubature`
+is the separate exact Wigner–Seitz polygon rule the packed photon head
+uses. Physics owner for all of them:
+`docs/theory/four-current-head-corrections.md`;
 `wrap_points_to_voronoi` is the jitted Voronoi fold everything shares.
 
 `bare_coulomb_sphere_indices` / `bare_coulomb_sphere_mask` answer "which G
