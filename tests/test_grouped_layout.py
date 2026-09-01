@@ -7,6 +7,8 @@ and shard-local conjugated symmetry gathers.
 """
 from __future__ import annotations
 
+import importlib
+
 import numpy as np
 import pytest
 
@@ -19,7 +21,16 @@ def _labels_from_sizes(sizes, *, spelling=None):
 
 
 def test_grouped_layout_balances_whole_groups_and_round_trips():
-    from runtime.grouped_layout import build_grouped_shard_layout
+    from common.grouped_layout import (
+        GroupedShardLayout,
+        SquareGroupedShardLayout,
+        build_grouped_shard_layout,
+    )
+
+    with pytest.raises(TypeError):
+        GroupedShardLayout()
+    with pytest.raises(TypeError):
+        SquareGroupedShardLayout()
 
     sizes = np.asarray([11, 9, 7, 5, 4, 3, 2, 1], dtype=np.int32)
     labels = _labels_from_sizes(sizes, spelling=[81, 4, 77, 9, 15, 2, 40, 8])
@@ -40,10 +51,10 @@ def test_grouped_layout_balances_whole_groups_and_round_trips():
         assert rows[0] // layout.shard_size == layout.group_owner[group]
 
     canonical = np.arange(layout.n_logical * 3).reshape(3, -1)
-    packed = layout.pack(canonical, axis=1, fill_value=-700)
+    packed = layout.pack_host(canonical, axis=1, fill_value=-700)
     assert packed.shape == (3, layout.n_padded)
     assert np.all(packed[:, ~layout.active_mask] == -700)
-    np.testing.assert_array_equal(layout.unpack(packed, axis=1), canonical)
+    np.testing.assert_array_equal(layout.unpack_host(packed, axis=1), canonical)
 
     # Input label names are not scientific identity.  Renaming them leaves
     # every derived permutation and load exactly unchanged.
@@ -56,27 +67,62 @@ def test_grouped_layout_balances_whole_groups_and_round_trips():
         layout.packed_to_canonical[0] = 99
 
 
-def test_each_axis_gets_an_independent_view_of_one_canonical_partition():
-    from runtime.grouped_layout import build_grouped_shard_layout
+@pytest.mark.parametrize("package", ["common", "src.common"])
+def test_layout_receipt_matches_selector_under_supported_import_styles(package):
+    """A relative sibling import must not manufacture a second receipt type."""
+    jax = pytest.importorskip("jax")
+    from jax.sharding import Mesh
+
+    layout_module = importlib.import_module(f"{package}.grouped_layout")
+    selector_module = importlib.import_module(f"{package}.pivoted_cholesky")
+    labels = _labels_from_sizes([2, 1])
+    layout = layout_module.build_grouped_shard_layout(labels, 1)
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    selector = selector_module.make_sharded_group_panel_pivoted_cholesky_select(
+        mesh, 2, layout, mesh_axis=("x", "y"))
+    assert callable(selector)
+
+
+def test_one_finest_layout_coarsens_to_identical_square_axis_views():
+    from common.grouped_layout import build_square_grouped_shard_layout
 
     labels = _labels_from_sizes([13, 11, 8, 7, 6, 5, 4, 3, 2, 1])
-    x = build_grouped_shard_layout(labels, 2)
-    y = build_grouped_shard_layout(labels, 4)
-    xy = build_grouped_shard_layout(labels, 8)
+    square = build_square_grouped_shard_layout(labels, (2, 2))
+    layout = square.fine
 
-    # The canonical rows do not change, while the runtime extents and owners
-    # are independently legal for P('x'), P('y'), and P(('x','y')).
-    for layout in (x, y, xy):
-        assert layout.n_padded % layout.n_shards == 0
-        np.testing.assert_array_equal(
-            layout.unpack(layout.pack(np.arange(layout.n_logical))),
-            np.arange(layout.n_logical))
-    assert x.n_shards == 2 and y.n_shards == 4 and xy.n_shards == 8
-    assert not np.array_equal(x.group_owner, y.group_owner)
+    assert layout.n_shards == 4
+    assert square.axis_shard_size == 2 * layout.shard_size
+    np.testing.assert_array_equal(
+        layout.unpack_host(layout.pack_host(np.arange(layout.n_logical))),
+        np.arange(layout.n_logical))
+    for group in range(layout.n_groups):
+        rows = np.flatnonzero(layout.packed_group_id == group)
+        fine_owners = np.unique(rows // layout.shard_size)
+        axis_owners = np.unique(rows // square.axis_shard_size)
+        assert fine_owners.tolist() == [int(layout.group_owner[group])]
+        # This one numerical coarse owner is reused for both X and Y.
+        assert axis_owners.tolist() == [int(square.axis_group_owner[group])]
+    assert square.gram_extent_multiplier == pytest.approx(
+        (layout.n_padded / layout.n_logical) ** 2)
+
+    with pytest.raises(ValueError, match="square"):
+        build_square_grouped_shard_layout(labels, (2, 4))
+
+
+def test_finest_layout_allows_all_pad_shards_without_splitting_groups():
+    from common.grouped_layout import build_square_grouped_shard_layout
+
+    square = build_square_grouped_shard_layout(
+        _labels_from_sizes([5, 3]), (2, 2))
+    layout = square.fine
+    assert np.count_nonzero(layout.shard_load == 0) == 2
+    for group in range(layout.n_groups):
+        rows = np.flatnonzero(layout.packed_group_id == group)
+        assert np.unique(rows // layout.shard_size).size == 1
 
 
 def test_symmetry_maps_become_shard_local_after_packing():
-    from runtime.grouped_layout import build_grouped_shard_layout
+    from common.grouped_layout import build_grouped_shard_layout
     from symmetry_maps import permutation_orbit_labels
 
     sizes = [3, 4, 2, 5]
@@ -94,19 +140,22 @@ def test_symmetry_maps_become_shard_local_after_packing():
     labels = permutation_orbit_labels(permutations)
     np.testing.assert_array_equal(np.bincount(labels), sizes)
     layout = build_grouped_shard_layout(labels, 3)
-    packed_perm = layout.pack_permutations(permutations)
+    packed_perm = layout.pack_permutations_host(permutations)
+    local_perm = layout.pack_fine_local_permutations_host(permutations)
 
     owner = np.arange(layout.n_padded) // layout.shard_size
     assert np.all(owner[None, :] == owner[packed_perm])
+    np.testing.assert_array_equal(
+        local_perm, packed_perm % layout.shard_size)
     values = np.arange(n, dtype=np.int64) * 17
-    packed_values = layout.pack(values, fill_value=-1)
+    packed_values = layout.pack_host(values, fill_value=-1)
     for operation in range(permutations.shape[0]):
-        got = layout.unpack(packed_values[packed_perm[operation]])
+        got = layout.unpack_host(packed_values[packed_perm[operation]])
         np.testing.assert_array_equal(got, values[permutations[operation]])
 
 
 def test_nonclosed_group_partition_refuses_a_fake_local_gather():
-    from runtime.grouped_layout import build_grouped_shard_layout
+    from common.grouped_layout import build_grouped_shard_layout
 
     singleton_layout = build_grouped_shard_layout(
         np.arange(8, dtype=np.int32), 2)
@@ -115,7 +164,7 @@ def test_nonclosed_group_partition_refuses_a_fake_local_gather():
     # parity and would be an accidentally local negative control).
     crosses = np.asarray([np.roll(np.arange(8), 1)], dtype=np.int32)
     with pytest.raises(ValueError, match="cross|not closed|moves canonical row"):
-        singleton_layout.pack_permutations(crosses)
+        singleton_layout.pack_permutations_host(crosses)
 
 
 def test_panel_selector_matches_rank_one_reference_in_canonical_order():
@@ -126,7 +175,7 @@ def test_panel_selector_matches_rank_one_reference_in_canonical_order():
         group_block_pivoted_cholesky_select,
         make_sharded_group_panel_pivoted_cholesky_select,
     )
-    from runtime.grouped_layout import build_grouped_shard_layout
+    from common.grouped_layout import build_grouped_shard_layout
 
     labels = _labels_from_sizes([3, 5, 2, 4, 3])
     n = int(labels.size)
@@ -141,25 +190,27 @@ def test_panel_selector_matches_rank_one_reference_in_canonical_order():
         n_groups=int(labels.max()) + 1, tol_rel=1e-13)
 
     layout = build_grouped_shard_layout(labels, 1)
-    packed = layout.pack(layout.pack(gram, axis=0), axis=1)
+    packed = layout.pack_host(layout.pack_host(gram, axis=0), axis=1)
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    with pytest.raises(TypeError, match="build_grouped_shard_layout"):
+        make_sharded_group_panel_pivoted_cholesky_select(
+            mesh, budget, object(), mesh_axis=("x", "y"))
+    with pytest.raises(ValueError, match="2 fine shards"):
+        make_sharded_group_panel_pivoted_cholesky_select(
+            mesh, budget, build_grouped_shard_layout(labels, 2),
+            mesh_axis=("x", "y"))
     selector = make_sharded_group_panel_pivoted_cholesky_select(
-        mesh, layout.n_padded, budget,
-        layout.group_start, layout.group_size,
+        mesh, budget, layout,
         mesh_axis=("x", "y"), tol_rel=1e-13)
-    panel = selector(
-        jnp.asarray(packed),
-        jnp.asarray(layout.packed_group_id),
-        jnp.asarray(layout.packed_to_canonical, dtype=jnp.int32),
-        jnp.asarray(layout.active_mask))
+    panel = selector(jnp.asarray(packed))
 
     np.testing.assert_array_equal(np.asarray(panel[0]), np.asarray(reference[0]))
     assert int(panel[2]) == int(reference[2])
     np.testing.assert_allclose(
-        layout.unpack(np.asarray(panel[1]), axis=0), np.asarray(reference[1]),
+        layout.unpack_host(np.asarray(panel[1]), axis=0), np.asarray(reference[1]),
         rtol=2e-11, atol=2e-11)
     np.testing.assert_allclose(
-        layout.unpack(np.asarray(panel[3])), np.asarray(reference[3]),
+        layout.unpack_host(np.asarray(panel[3])), np.asarray(reference[3]),
         rtol=2e-11, atol=2e-11)
     np.testing.assert_allclose(
         np.asarray(panel[4]), np.asarray(reference[4]),
@@ -177,7 +228,7 @@ def test_panel_selector_preserves_rank_floor_and_post_floor_delivery():
         group_block_pivoted_cholesky_select,
         make_sharded_group_panel_pivoted_cholesky_select,
     )
-    from runtime.grouped_layout import build_grouped_shard_layout
+    from common.grouped_layout import build_grouped_shard_layout
 
     labels = _labels_from_sizes([4, 3, 5, 2, 4])
     n, budget = int(labels.size), 14
@@ -191,16 +242,12 @@ def test_panel_selector_preserves_rank_floor_and_post_floor_delivery():
         n_groups=int(labels.max()) + 1, tol_rel=1e-10)
 
     layout = build_grouped_shard_layout(labels, 1)
-    packed = layout.pack(layout.pack(gram, axis=0), axis=1)
+    packed = layout.pack_host(layout.pack_host(gram, axis=0), axis=1)
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     selector = make_sharded_group_panel_pivoted_cholesky_select(
-        mesh, layout.n_padded, budget,
-        layout.group_start, layout.group_size,
+        mesh, budget, layout,
         mesh_axis=("x", "y"), tol_rel=1e-10)
-    panel = selector(
-        jnp.asarray(packed), jnp.asarray(layout.packed_group_id),
-        jnp.asarray(layout.packed_to_canonical, dtype=jnp.int32),
-        jnp.asarray(layout.active_mask))
+    panel = selector(jnp.asarray(packed))
 
     assert int(reference[2]) == 7 == int(panel[2])
     ref_piv, panel_piv = np.asarray(reference[0]), np.asarray(panel[0])
@@ -224,11 +271,68 @@ def test_panel_selector_preserves_rank_floor_and_post_floor_delivery():
         np.asarray(panel[5]), np.asarray(reference[5]),
         rtol=3e-10, atol=3e-10)
     assert np.count_nonzero(np.asarray(panel[4])) == 7
-    assert np.count_nonzero(panel_piv >= 0) == 13 > int(panel[2]), (
+    assert np.count_nonzero(panel_piv >= 0) == 14 > int(panel[2]), (
         "rank floor must zero factor columns, not stop whole-group delivery")
-    assert panel_piv[-1] == -1 == ref_piv[-1], (
-        "the sole sentinel is structural: one budget slot remains but the "
-        "smallest unpicked complete group has two members")
+    assert panel_piv[-1] >= 0 and ref_piv[-1] >= 0
+
+
+def test_group_select_sentinel_means_no_complete_group_fits():
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
+    from common.pivoted_cholesky import (
+        group_block_pivoted_cholesky_select,
+        make_sharded_group_panel_pivoted_cholesky_select,
+    )
+    from common.grouped_layout import build_grouped_shard_layout
+
+    labels = np.asarray([0, 0, 1, 1], dtype=np.int32)
+    gram = np.diag(np.asarray([4., 3., 2., 1.]))
+    expected = np.asarray([0, 1, -1], dtype=np.int32)
+    reference = group_block_pivoted_cholesky_select(
+        jnp.asarray(gram), 3, jnp.asarray(labels), n_groups=2,
+        tol_rel=1e-10)
+    np.testing.assert_array_equal(np.asarray(reference[0]), expected)
+
+    layout = build_grouped_shard_layout(labels, 1)
+    packed = layout.pack_host(layout.pack_host(gram, axis=0), axis=1)
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    panel = make_sharded_group_panel_pivoted_cholesky_select(
+        mesh, 3, layout, mesh_axis=("x", "y"), tol_rel=1e-10)(
+            jnp.asarray(packed))
+    np.testing.assert_array_equal(np.asarray(panel[0]), expected)
+
+
+def test_group_select_does_not_reopen_a_group_at_the_exact_rank_floor():
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
+    from common.pivoted_cholesky import (
+        group_block_pivoted_cholesky_select,
+        make_sharded_group_panel_pivoted_cholesky_select,
+    )
+    from common.grouped_layout import build_grouped_shard_layout
+
+    labels = np.asarray([0, 1, 2, 2, 2, 3, 3], dtype=np.int32)
+    gram = np.diag(np.asarray([9., 0., 8., 7., 6., 5., 4.]))
+    expected_piv = np.asarray([0, 2, 3, 4, 1], dtype=np.int32)
+    expected_taken = np.asarray([9., 8., 7., 6., 0.])
+    reference = group_block_pivoted_cholesky_select(
+        jnp.asarray(gram), 5, jnp.asarray(labels), n_groups=4,
+        tol_rel=1e-10)
+    np.testing.assert_array_equal(np.asarray(reference[0]), expected_piv)
+    np.testing.assert_array_equal(np.asarray(reference[4]), expected_taken)
+    assert int(reference[2]) == 4
+
+    layout = build_grouped_shard_layout(labels, 1)
+    packed = layout.pack_host(layout.pack_host(gram, axis=0), axis=1)
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    panel = make_sharded_group_panel_pivoted_cholesky_select(
+        mesh, 5, layout, mesh_axis=("x", "y"), tol_rel=1e-10)(
+            jnp.asarray(packed))
+    np.testing.assert_array_equal(np.asarray(panel[0]), expected_piv)
+    np.testing.assert_array_equal(np.asarray(panel[4]), expected_taken)
+    assert int(panel[2]) == 4
 
 
 @pytest.mark.parametrize(

@@ -106,11 +106,47 @@ def main() -> None:
     if int(got[2]) != used.size:
         _fail(f"full-rank fixture delivered {used.size}, rank={int(got[2])}")
 
+    # Exact post-floor red twin for the admitted-group reopen defect.  The
+    # four-rank selector must continue with the lowest unadmitted group, not
+    # reopen a zero-score group and emit the exhaustion sentinel.
+    floor_labels = np.asarray([0, 1, 2, 2, 2, 3, 3], dtype=np.int32)
+    floor_M = 8
+    floor_groups = 4
+    floor_gid = np.concatenate([
+        floor_labels, np.asarray([floor_groups], dtype=np.int32)])
+    floor_active = np.arange(floor_M) < floor_labels.size
+    floor_G_host = np.zeros((floor_M, floor_M), dtype=np.complex128)
+    floor_G_host[np.arange(7), np.arange(7)] = np.asarray(
+        [9., 0., 8., 7., 6., 5., 4.])
+    expected_piv = np.asarray([0, 2, 3, 4, 1], dtype=np.int32)
+    expected_taken = np.asarray([9., 8., 7., 6., 0.])
+    floor_ref = group_block_pivoted_cholesky_select(
+        jnp.asarray(floor_G_host), 5, jnp.asarray(floor_gid),
+        n_groups=floor_groups, active_init=jnp.asarray(floor_active),
+        tol_rel=1e-10)
+    floor_step = make_sharded_group_block_pivoted_cholesky_select(
+        mesh, floor_M, 5, floor_groups, mesh_axis=("x", "y"),
+        tol_rel=1e-10)
+    floor_got = floor_step(
+        device_put_process_local(floor_G_host, row),
+        device_put_process_local(floor_gid, row1),
+        device_put_process_local(floor_active, row1))
+    jax.block_until_ready(floor_got)
+    np.testing.assert_array_equal(np.asarray(floor_ref[0]), expected_piv)
+    np.testing.assert_array_equal(np.asarray(floor_got[0]), expected_piv)
+    np.testing.assert_array_equal(np.asarray(floor_ref[4]), expected_taken)
+    np.testing.assert_array_equal(np.asarray(floor_got[4]), expected_taken)
+    if int(floor_ref[2]) != 4 or int(floor_got[2]) != 4:
+        _fail("exact-floor distributed rank drifted")
+
     if jax.process_index() == 0:
         print(
             f"[centroid-group-block-p4] delivered={used.size}/{budget} "
             f"groups={picked.size}/{n_groups} rank={int(got[2])} "
             f"logical/padded={logical_M}/{M}",
+            flush=True)
+        print(
+            "[centroid-group-block-p4] exact-floor reopen red twin PASS",
             flush=True)
         print("[centroid-group-block-p4] PASS", flush=True)
 

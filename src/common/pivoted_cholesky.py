@@ -29,9 +29,10 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.sharding import Mesh, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from common.shard_map import shard_map
+from .grouped_layout import GroupedShardLayout
 
 
 __all__ = [
@@ -262,6 +263,7 @@ def group_block_pivoted_cholesky_select(
         jnp.zeros((M, point_budget), dtype=G.dtype),
         -jnp.ones((point_budget,), dtype=jnp.int32),
         active0,                         # not yet admitted
+        jnp.zeros((n_groups + 1,), dtype=bool),  # admitted groups
         active0,                         # admitted but not yet pivoted, or future
         jnp.int32(-1),                   # open group
         jnp.int32(0),                    # rows remaining in open group
@@ -275,17 +277,18 @@ def group_block_pivoted_cholesky_select(
     col_ids = jnp.arange(point_budget)
 
     def body(j, carry):
-        (d, L, piv, unadmitted, available, current, current_left,
+        (d, L, piv, unadmitted, chosen, available, current, current_left,
          committed, d_taken, trR, d_min_raw, d_min_at, d_min_j) = carry
 
         need_group = current_left == 0
 
         def choose_group(_):
             values = jax.ops.segment_sum(
-                jnp.where(unadmitted, d, 0.0), group_id,
+                jnp.where(unadmitted & (d > floor), d, 0.0), group_id,
                 num_segments=n_groups + 1, indices_are_sorted=False)
             remaining_budget = jnp.int32(point_budget) - committed
             eligible = ((group_sizes > 0)
+                        & ~chosen
                         & (group_sizes <= remaining_budget)
                         & (jnp.arange(n_groups + 1) < n_groups))
             scores = jnp.where(
@@ -310,6 +313,7 @@ def group_block_pivoted_cholesky_select(
         opened_size = group_sizes[safe_group]
         current_left = jnp.where(opened, opened_size, current_left)
         committed = committed + jnp.where(opened, opened_size, 0)
+        chosen = chosen.at[candidate].set(chosen[candidate] | opened)
         unadmitted = unadmitted & ~(opened & (group_id == current))
 
         in_current = available & (group_id == current)
@@ -346,10 +350,10 @@ def group_block_pivoted_cholesky_select(
         available = available & ~kill
         current_left = current_left - jnp.where(avail, 1, 0)
         d = jnp.where(kill, 0.0, jnp.where(take, d_new, d))
-        return (d, L, piv, unadmitted, available, current, current_left,
+        return (d, L, piv, unadmitted, chosen, available, current, current_left,
                 committed, d_taken, trR, d_min_raw, d_min_at, d_min_j)
 
-    (d, L, piv, _, available, _, _, _, d_taken, trR,
+    (d, L, piv, _, _, available, _, _, _, d_taken, trR,
      d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
         0, point_budget, body, init)
     d_final = jnp.where(available, d, 0.0)
@@ -681,6 +685,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
                 jnp.zeros((M_slab, point_budget), dtype=G_slab.dtype),
                 -jnp.ones((point_budget,), dtype=jnp.int32),
                 active0,                         # not admitted
+                jnp.zeros((n_groups + 1,), dtype=bool),  # admitted groups
                 active0,                         # not pivoted
                 jnp.int32(-1),                   # open group
                 jnp.int32(0),                    # rows left in open group
@@ -696,7 +701,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
             col_ids = jnp.arange(point_budget)
 
             def body(j, carry):
-                (d, L, piv, unadmitted, available, current, current_left,
+                (d, L, piv, unadmitted, chosen, available, current, current_left,
                  committed, d_taken, trR, d_min_raw,
                  d_min_at, d_min_j) = carry
 
@@ -704,11 +709,13 @@ def make_sharded_group_block_pivoted_cholesky_select(
 
                 def choose_group(_):
                     local_values = jax.ops.segment_sum(
-                        jnp.where(unadmitted, d, 0.0), group_id_slab,
+                        jnp.where(unadmitted & (d > floor), d, 0.0),
+                        group_id_slab,
                         num_segments=n_groups + 1, indices_are_sorted=False)
                     values = lax.psum(local_values, axis_name=mesh_axis)
                     remaining_budget = jnp.int32(point_budget) - committed
                     eligible = ((group_sizes > 0)
+                                & ~chosen
                                 & (group_sizes <= remaining_budget)
                                 & (jnp.arange(n_groups + 1) < n_groups))
                     scores = jnp.where(
@@ -734,6 +741,8 @@ def make_sharded_group_block_pivoted_cholesky_select(
                 opened_size = group_sizes[safe_group]
                 current_left = jnp.where(opened, opened_size, current_left)
                 committed = committed + jnp.where(opened, opened_size, 0)
+                chosen = chosen.at[candidate].set(
+                    chosen[candidate] | opened)
                 unadmitted = unadmitted & ~(
                     opened & (group_id_slab == current))
 
@@ -791,11 +800,11 @@ def make_sharded_group_block_pivoted_cholesky_select(
                 available = available & ~kill
                 current_left = current_left - jnp.where(avail, 1, 0)
                 d = jnp.where(kill, 0.0, jnp.where(take, d_new, d))
-                return (d, L, piv, unadmitted, available, current,
+                return (d, L, piv, unadmitted, chosen, available, current,
                         current_left, committed, d_taken, trR,
                         d_min_raw, d_min_at, d_min_j)
 
-            (d, L, piv, _, available, _, _, _, d_taken, trR,
+            (d, L, piv, _, _, available, _, _, _, d_taken, trR,
              d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
                 0, point_budget, body, init)
             d_final = jnp.where(available, d, 0.0)
@@ -831,10 +840,8 @@ def make_sharded_group_block_pivoted_cholesky_select(
 
 def make_sharded_group_panel_pivoted_cholesky_select(
     mesh: Mesh,
-    M: int,
     point_budget: int,
-    group_start,
-    group_size,
+    layout: GroupedShardLayout,
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
     tol_rel: float | None = None,
@@ -848,37 +855,28 @@ def make_sharded_group_panel_pivoted_cholesky_select(
     update is a local GEMM plus triangular solve; no collective occurs inside
     its member loop.
 
-    ``step(G, group_id, canonical_id, active_init)`` returns the usual
-    seven-tuple.  Pivots and PSD row receipts are canonical IDs, while ``L``
-    and ``d_final`` remain in the supplied packed row order.
+    ``layout`` is the single validated source for intervals, labels, canonical
+    identities, and pads.  The returned ``step(G)`` accepts no independently
+    drifting metadata.  Pivots and PSD row receipts are canonical IDs, while
+    ``L`` and ``d_final`` remain in the supplied packed row order.
     """
+    if not isinstance(layout, GroupedShardLayout):
+        raise TypeError("layout must come from build_grouped_shard_layout()")
     n_dev = _mesh_axis_size(
         mesh, mesh_axis, "make_sharded_group_panel_pivoted_cholesky_select")
-    if M % n_dev:
+    if layout.n_shards != n_dev:
         raise ValueError(
-            f"M={M} must be divisible by product of mesh axes "
-            f"{mesh_axis} (= {n_dev})")
+            f"layout has {layout.n_shards} fine shards, but mesh axes "
+            f"{mesh_axis} provide {n_dev}")
+    M = layout.n_padded
     if point_budget < 1 or point_budget > M:
         raise ValueError(
             f"point_budget must lie in [1, M={M}]; got {point_budget}")
-    starts_np = jnp.asarray(group_start, dtype=jnp.int32)
-    sizes_np = jnp.asarray(group_size, dtype=jnp.int32)
-    if starts_np.ndim != 1 or sizes_np.shape != starts_np.shape \
-            or int(starts_np.size) < 1:
-        raise ValueError("group_start/group_size must be equal nonempty vectors")
-    # Validate on the host before tracing; communication kernels may trust it.
-    starts_host = list(map(int, group_start))
-    sizes_host = list(map(int, group_size))
+    starts_np = jnp.asarray(layout.group_start, dtype=jnp.int32)
+    sizes_np = jnp.asarray(layout.group_size, dtype=jnp.int32)
+    starts_host = list(map(int, layout.group_start))
+    sizes_host = list(map(int, layout.group_size))
     M_slab = M // n_dev
-    for group, (start, size) in enumerate(zip(starts_host, sizes_host)):
-        if size < 1 or start < 0 or start + size > M:
-            raise ValueError(
-                f"group {group} interval [{start}, {start + size}) is outside "
-                f"[0, {M})")
-        if start // M_slab != (start + size - 1) // M_slab:
-            raise ValueError(
-                f"group {group} interval [{start}, {start + size}) crosses "
-                f"row-shard boundaries of width {M_slab}")
     n_groups = len(starts_host)
     max_group = max(sizes_host)
 
@@ -889,7 +887,7 @@ def make_sharded_group_panel_pivoted_cholesky_select(
                  (rep, rep, rep))
 
     @jax.jit
-    def step(G, group_id, canonical_id, active_init):
+    def _step(G, group_id, canonical_id, active_init):
         def body_local(G_slab, group_slab, canonical_slab, active_slab):
             real_dtype = G_slab.real.dtype
             minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
@@ -948,7 +946,7 @@ def make_sharded_group_panel_pivoted_cholesky_select(
                  d_min_j) = carry
 
                 local_values = jax.ops.segment_sum(
-                    jnp.where(available, d, 0.0), group_slab,
+                    jnp.where(available & (d > floor), d, 0.0), group_slab,
                     num_segments=n_groups + 1, indices_are_sorted=False)
                 values = lax.psum(local_values, axis_name=mesh_axis)
                 remaining = jnp.int32(point_budget) - committed
@@ -1156,5 +1154,18 @@ def make_sharded_group_panel_pivoted_cholesky_select(
             in_specs=(row_shard, row_shard_1d, row_shard_1d, row_shard_1d),
             out_specs=out_specs, check_vma=False,
         )(G, group_id, canonical_id, active_init)
+
+    # Bind the O(M) carriers once without an implicit replica-consistency
+    # collective.  They remain runtime operands, rather than material-value
+    # constants.  The much smaller group start/size vectors remain closed.
+    from common.collectives import device_put_process_local
+    plan_sharding = NamedSharding(mesh, row_shard_1d)
+    group_dev = device_put_process_local(layout.packed_group_id, plan_sharding)
+    canonical_dev = device_put_process_local(
+        layout.packed_to_canonical, plan_sharding)
+    active_dev = device_put_process_local(layout.active_mask, plan_sharding)
+
+    def step(G):
+        return _step(G, group_dev, canonical_dev, active_dev)
 
     return step
