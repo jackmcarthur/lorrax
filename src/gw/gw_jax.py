@@ -529,7 +529,6 @@ def main(argv=None):
 			print0=print0,
 			bgw_v_grid_fn=bgw_v_grid_fn,
 		)
-	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
 	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
 	# samples ψ at the transverse-centroid Wfns bundle (None when
@@ -560,7 +559,7 @@ def main(argv=None):
 
 	# ---- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ----
 	# X_ONLY requests no screening at all.
-	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
+	V_q = isdf.V_qmunu          # flat-q (nq, μ, μ) — compute and restart alike
 	quad, e_ref = None, None
 	if do_screened:
 		# The minimax τ-axis, solved on G's actual spectral range — shared
@@ -640,6 +639,15 @@ def main(argv=None):
 						"static packed-photon screening requires the transverse "
 						"wavefunction "
 						"bundle and v_q_bispinor.h5; refusing a charge-only W.")
+				# The packed response reads its complete CC/CT/TC/TT bare
+				# operator from v_q_bispinor.h5; neither it nor the packed Sigma
+				# consumes the separate scalar-charge array.  Drop both Python
+				# owners before allocating packed V/W, and pass the None sentinel
+				# through the dispatch so a future accidental scalar consumer
+				# fails closed instead of silently extending this live set.
+				isdf.V_qmunu = None
+				V_q = None
+				gc.collect()
 				from .w_isdf import compute_static_photon_response
 				photon_response = compute_static_photon_response(
 					wfns, wfns_transverse, quad, bispinor_v_q_path,

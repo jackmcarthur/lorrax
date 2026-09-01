@@ -551,7 +551,7 @@ def compute_sigma_xc(
     mode: ComputeMode,
     *,
     wfns,
-    V_q: jax.Array,
+    V_q: jax.Array | None,
     W_by_role: dict,
     e_qp_ev: np.ndarray | None,
     static_head_terms,
@@ -587,7 +587,9 @@ def compute_sigma_xc(
         ``Wavefunctions`` bundle in the *current* QP basis (or DFT basis
         for the iter-0 / one-shot call).
     V_q
-        Bare Coulomb in flat-q ISDF basis.
+        Bare Coulomb in flat-q ISDF basis.  Must be ``None`` for the packed
+        static-photon route, whose complete bare operator is owned by
+        ``photon_response.V_packed``; required for every scalar route.
     W_by_role
         Screened-Coulomb dict produced by
         :func:`gw.screening.compute_screening`, keyed by symbolic role.
@@ -829,13 +831,18 @@ def compute_sigma_xc(
     # top-level entry point for the X-only path so the modes that build no
     # static screened channels never invoke the W-touching kernels, and
     # the two paths each get their own jit-cached graph.
-    W_static = W_by_role.get("static", V_q)
     builds_static_screened = mode_builds_channels(
         mode, SigmaChannel.SX, SigmaChannel.COH)
     photon_head_sigma_diag = None
     photon_head_sigma_operator_fingerprint = None
     photon_head_sigma_basis = None
     if uses_static_photon_response(config):
+        if V_q is not None:
+            raise RuntimeError(
+                "static packed-photon Sigma received a live scalar V_q. "
+                "The driver must release isdf.V_qmunu before constructing "
+                "the packed response and pass V_q=None; retaining both "
+                "operators duplicates the charge block's live storage.")
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
                 "static packed-photon mode reached Sigma outside "
@@ -883,30 +890,36 @@ def compute_sigma_xc(
                 photon_head_diagnostics
                 .hamiltonian_config_operator_fingerprint)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
-    elif builds_static_screened:
-        cohsex = compute_cohsex_sigma(
-            wfns, V_q, W_static, meta, mesh_xy,
-            Gij=Gij,
-            do_screened=True,
-            static_head_terms=static_head_terms,
-            compute_bare_x=True,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
-            occupation_state=occupation_state,
-        )
-        sig_x = cohsex["sig_x"]
-        sig_sx = cohsex["sig_sx"]
-        sig_coh = cohsex["sig_coh"]
     else:
-        sig_x = compute_sigma_x(
-            wfns, V_q, meta, mesh_xy,
-            Gij=Gij,
-            static_head_terms=static_head_terms,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
-            occupation_state=occupation_state,
-        )
-        sig_sx = sig_coh = jnp.zeros_like(sig_x)
+        if V_q is None:
+            raise RuntimeError(
+                "scalar Sigma route received V_q=None.  Only the packed "
+                "static-photon route may release the scalar bare Coulomb.")
+        W_static = W_by_role.get("static", V_q)
+        if builds_static_screened:
+            cohsex = compute_cohsex_sigma(
+                wfns, V_q, W_static, meta, mesh_xy,
+                Gij=Gij,
+                do_screened=True,
+                static_head_terms=static_head_terms,
+                compute_bare_x=True,
+                wfns_transverse=wfns_transverse,
+                bispinor_v_q_path=bispinor_v_q_path,
+                occupation_state=occupation_state,
+            )
+            sig_x = cohsex["sig_x"]
+            sig_sx = cohsex["sig_sx"]
+            sig_coh = cohsex["sig_coh"]
+        else:
+            sig_x = compute_sigma_x(
+                wfns, V_q, meta, mesh_xy,
+                Gij=Gij,
+                static_head_terms=static_head_terms,
+                wfns_transverse=wfns_transverse,
+                bispinor_v_q_path=bispinor_v_q_path,
+                occupation_state=occupation_state,
+            )
+            sig_sx = sig_coh = jnp.zeros_like(sig_x)
 
     # Density-SC rebuilds this same exact G-space operator from the evolving
     # orbitals directly in the DFT basis.  Other paths build it once here.
