@@ -43,8 +43,8 @@
 #                                        the flat-k FFT handlers are SKIPPED
 #                                        here and LORRAX_FFT_FFI refuses at
 #                                        startup.  See the FFT note below.
-#   slate      slate:: C++ templates     ICL SLATE, gpu_backend=none, built
-#                                        against LibSci + cray-mpich.
+#   slate      slate:: C++ templates     not built by this route; independent
+#                                        of the LibSci ScaLAPACK/PBLAS route.
 #
 # ----------------------------------------------------------------------------
 # WHY LibSci AND NOT MKL (MKL 2025.3 *does* exist at /opt/intel/oneapi/mkl)
@@ -129,7 +129,7 @@ LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
 # library ran.  cray-fftw's SONAME is version- and MPI-flavour-stamped, and
 # the Shifter container does not bind-mount /opt/cray/pe/fftw at all, so the
 # .so simply would not dlopen in-container.  Measured 2026-08-06: nineteen
-# ScaLAPACK/SLATE/GEMM contract tests -- none of which perform an FFT --
+# ScaLAPACK/GEMM contract tests -- none of which perform an FFT --
 # turned into SKIPS, and the suite reported 0 failures.  A lost FFT
 # optimisation silently became a lost linear-algebra test suite.
 #
@@ -157,12 +157,10 @@ if [[ -z "${LORRAX_FFI_PHDF5_DIR:-}" && -r "$(dirname "$0")/site_config.sh" ]]; 
                             printf %s "$LORRAX_FFI_PHDF5_DIR_DEFAULT")"
 fi
 LORRAX_PM_PHDF5_STAGE="${LORRAX_FFI_PHDF5_DIR:-}"
-# LibSci threading flavour.  MUST match the SLATE install's, or the process
-# ends up with both libsci_gnu_mpi and libsci_gnu_mpi_mp loaded and ELF load
-# order silently decides which BLAS/ScaLAPACK runs.  The gpu_backend=none
-# SLATE here was built threaded, so: _mp.
+# LibSci threading flavour.  Use one explicit flavour for both the distributed
+# and local BLAS dependencies; the wrapper module is unloaded below so it
+# cannot inject the sequential twin as well.
 LORRAX_PM_LIBSCI_FLAVOUR="${LORRAX_PM_LIBSCI_FLAVOUR:-_mp}"
-LORRAX_SLATE_HOST_INSTALL_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$HOME/software/slate_builds/cpu/install}"
 # XLA FFI headers must match the RUNTIME jaxlib, not whatever python is first
 # on PATH.  src/ffi/cpp/build_host.sh stages these out of the Shifter image;
 # reuse that stage.
@@ -189,9 +187,9 @@ module unload cudatoolkit           2>/dev/null || true
 #
 # WHY: the Cray CC wrapper auto-injects `-lsci_gnu` — the SEQUENTIAL LibSci —
 # whenever the cray-libsci module is loaded.  Our own link line asks for the
-# THREADED `_mp` pair (to match the gpu_backend=none SLATE, which links
-# threaded), so leaving the module loaded puts BOTH flavours in the .so.  That
-# is not a theoretical concern: the Cray runtime itself detects it and prints
+# THREADED `_mp` pair, so leaving the module loaded puts BOTH flavours in the
+# .so.  That is not a theoretical concern: the Cray runtime itself detects it
+# and prints
 #     [CRAYBLAS_WARNING] Application linked against multiple cray-libsci libraries
 # on the first BLAS call.  ELF order makes it deterministic (the _mp pair comes
 # first and wins), but "deterministic if you re-derive the link order" is not a
@@ -251,13 +249,6 @@ if [[ ! -f "$LORRAX_XLA_FFI_HEADERS_DIR/xla/ffi/api/ffi.h" ]]; then
     echo "[build_ffi_host] Stage them once with: bash src/ffi/cpp/build_host.sh" >&2
     exit 2
 fi
-if [[ ! -d "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" ]]; then
-    echo "[build_ffi_host] ERROR: gpu_backend=none SLATE not found at" >&2
-    echo "[build_ffi_host]   $LORRAX_SLATE_HOST_INSTALL_DIR" >&2
-    echo "[build_ffi_host] Build it with: bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu" >&2
-    exit 2
-fi
-
 # ---------------------------------------------------------------------------
 # PRE-FLIGHT: the thirteen ScaLAPACK/BLACS names must actually be in LibSci.
 # A capability check, not a version check — this is what makes the script
@@ -296,10 +287,11 @@ fi
 cmake "$SRC" \
     "${FFTW_ARGS[@]}" \
     -DLORRAX_FFI_PLATFORM=host \
+    -DLORRAX_HOST_HAVE_SCALAPACK=ON \
+    -DLORRAX_HOST_HAVE_SLATE=OFF \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC \
     -DLORRAX_XLA_FFI_INCLUDE_DIR="$LORRAX_XLA_FFI_HEADERS_DIR" \
-    -DLORRAX_SLATE_HOST_INSTALL_DIR="$LORRAX_SLATE_HOST_INSTALL_DIR" \
     -DLORRAX_SCALAPACK_LIBRARIES="-L$LORRAX_PM_LIBSCI_DIR/lib -Wl,--no-as-needed -lsci_gnu_mpi${F} -lsci_gnu${F} -lgomp -lpthread -lm -ldl" \
     -DLORRAX_CBLAS_INCLUDE_DIR="$LORRAX_PM_LIBSCI_DIR/include" \
     -DLORRAX_CBLAS_LIBRARY="$LORRAX_PM_LIBSCI_DIR/lib/libsci_gnu${F}.so" \
@@ -447,18 +439,17 @@ echo "[build_ffi_host] GATE 9 PASSED: 0 lorrax_ffi internals exported, all $(gre
 unset _dynsyms
 
 # GATE 4 (load-time resolution) used to be written out here; it is one of the
-# gates that moved into scripts/verify_ffi_build.sh, which runs it below with
-# the same SLATE LD_LIBRARY_PATH this script would have used.
+# gates that moved into scripts/verify_ffi_build.sh.
 
-# The Perlmutter host recipe builds ALL FIVE host backends.  Declaring it is
-# what turns "ScaLAPACK/BLACS not found" from a CMake WARNING into a build
-# failure — the Aug-7 deployed library shipped with scalapack=0 because
-# nothing anywhere said what it was supposed to contain.
-LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,slate,phdf5,fft}" \
-LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-libmpi_gnu_123}" \
+# The Perlmutter host recipe builds its four required host backends and keeps
+# the independent SLATE host backend off.  Declaring the required set turns
+# "ScaLAPACK/BLACS not found" from a CMake WARNING into a build failure — the
+# Aug-7 deployed library shipped with scalapack=0 because nothing anywhere
+# said what it was supposed to contain.
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,phdf5,fft}" \
+LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-libmpi_gnu}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
 LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
-LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:${LD_LIBRARY_PATH:-}" \
 GATE_TAG=build_ffi_host \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$SO_FILE" || {
         echo "[build_ffi_host] FAILED: the library does not meet the build" >&2
@@ -489,11 +480,10 @@ GATE_TAG=build_ffi_host \
     "hdf5=$LORRAX_PM_HDF5" \
     "phdf5_stage=$LORRAX_PM_PHDF5_STAGE" \
     "fftw=$LORRAX_PM_FFTW" \
-    "slate=$LORRAX_SLATE_HOST_INSTALL_DIR" || {
+    "slate=off" || {
         echo "[build_ffi_host] WARNING: provenance stamp failed" >&2
     }
 
 echo
 echo "[build_ffi_host] done.  .so at: $SO_FILE"
 echo "[build_ffi_host] run with: export LORRAX_FFI_HOST_SO=$SO_FILE"
-echo "[build_ffi_host]           export LD_LIBRARY_PATH=$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:\$LD_LIBRARY_PATH"

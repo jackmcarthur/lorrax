@@ -58,8 +58,9 @@ a check that cannot fail.** Everything below is the structural answer.
 There are two libraries, built in two different places, and they must agree.
 
 `liblorrax_ffi_host.so` — the **host leg** — is CUDA-free and built bare-metal
-against the site's compiler environment. It carries the ScaLAPACK, SLATE-CPU,
-CBLAS GEMM, FFT and parallel-HDF5 handlers. `liblorrax_ffi.so` — the **device
+against the site's compiler environment. It carries ScaLAPACK/PBLAS, CBLAS
+GEMM, FFT and parallel-HDF5 handlers; SLATE-CPU is an independent optional
+group. `liblorrax_ffi.so` — the **device
 leg** — is built inside the container against cuSOLVERMp, cuBLASMp, cuFFT,
 SLATE-CUDA and the same parallel HDF5, from whatever is bind-mounted there.
 
@@ -129,8 +130,8 @@ site recipe rather than building a reduced library — that hand-off is the dire
 fix for the Aug-7 accident. `LORRAX_FFI_GENERIC_BUILD=1` overrides it.
 
 The site recipe knows the machine's answers: the explicit LibSci ScaLAPACK link
-line (CMake's MKL-shaped probe cannot find it), the `_mp` threading flavour that
-matches the `gpu_backend=none` SLATE install, capturing the LibSci and FFTW
+line (CMake's MKL-shaped probe cannot find it), the `_mp` threading flavour,
+capturing the LibSci and FFTW
 prefixes and then *unloading* both modules before invoking CMake, and the phdf5
 stage to compare the HDF5 against.
 
@@ -144,10 +145,9 @@ LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
 
 Same gates, different vendors: MKL supplies ScaLAPACK, CBLAS and DFTI;
 `libmkl_blacs_intelmpi_lp64` must match the MPI, because the wrong BLACS links
-perfectly and only fails inside the first `blacs_gridinit`. Without
-`LORRAX_SLATE_HOST_INSTALL_DIR` this recipe builds the phdf5-only library, and
-it declares that to the verifier — a reduced build that says so is fine; a
-reduced build that does not is the defect.
+perfectly and only fails inside the first `blacs_gridinit`. ScaLAPACK/PBLAS is
+built whether or not `LORRAX_SLATE_HOST_INSTALL_DIR` is set; that variable adds
+only the independent SLATE handlers.
 
 ## Porting to a new site
 

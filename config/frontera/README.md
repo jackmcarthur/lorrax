@@ -160,7 +160,7 @@ never `fi_info` (it false-negatives on mlx).
 | `mpi_transport_env.sh` | Intel-MPI transport hygiene, **unconditional**: PMI2 glue, `I_MPI_FABRICS` (default `shm:ofi`; `LORRAX_MPI_FABRICS=shm` = rtx hatch), `LORRAX_MPI_PROVIDER` case-block, UCX setdefaults, `I_MPI_DEBUG` |
 | `ffi_env.sh` | **deprecated back-compat shim**: sources the two above + the `LORRAX_FFI_PHDF5=1` staging block |
 | `stage_ffi_deps.sh` / `build_ffi.sh` | GPU FFI: pip CUDA root staging + `liblorrax_ffi.so` build (in-container) |
-| `build_ffi_host.sh` | CPU host FFI: phdf5 + SLATE/ScaLAPACK `liblorrax_ffi_host.so` |
+| `build_ffi_host.sh` | CPU host FFI: phdf5 + ScaLAPACK/PBLAS, with optional SLATE, in `liblorrax_ffi_host.so` |
 | `build_mpiwrapper.sh` + `mpiwrapper/` | the patched MPIwrapper for `impl=mpi` (login node) |
 | `build_mpi_overlay.sh` + `sitecustomize.py` | the mpi4py 4.1.2 / parallel-h5py 3.16.0 PYTHONPATH overlay, pinned + verified (`fetch` on login, `build` in-container) |
 | `stage_host_pmi.sh` | stages the host SLURM PMI2 lib to `$WORK/host_pmi` (provenance + checksum recorded in the script) |
