@@ -51,15 +51,17 @@ for _svc in ("lxkit", "symmetry_maps"):
 if _TESTS not in sys.path:
     sys.path.insert(0, _TESTS)
 
-# CLI multi-rank mode: jax.distributed.initialize must run before ANY
-# XLA-backend touch, so it happens at import time when this module is the
-# entry point of a multi-task launch.
+# CLI multi-rank mode uses the same runtime boundary as production drivers.
+# This keeps JAX initialization, CPU-MPI selection, mesh warm-up and ordered
+# finalization in one source of truth.
 if __name__ == "__main__":
     os.environ.setdefault("JAX_ENABLE_X64", "1")
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-        import jax
-        jax.distributed.initialize()
+    from lxkit.gate import platform_from_env
+    from runtime import initialize_communicator_stack
+    _plat = platform_from_env()
+    _RUNTIME = initialize_communicator_stack(
+        platform="gpu" if _plat == "CUDA" else "cpu")
 
 import test_symmetry_maps_emulated_mesh as L_b                # noqa: E402
 import test_symmetry_maps_qirr_store as QIRR                  # noqa: E402
