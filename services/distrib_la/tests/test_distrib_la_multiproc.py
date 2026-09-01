@@ -10,8 +10,13 @@ here::
 
     lx run -N 1 -G 4 -n 4 python3 \\
         services/distrib_la/tests/test_distrib_la_multiproc.py --mesh 2x2
-    lx run --cpu -N 1 -n 4 python3 \\
+    lx run --cpu -N 1 -n 4 env LORRAX_DEBUG_PRINT=1 python3 \\
         services/distrib_la/tests/test_distrib_la_multiproc.py --mesh 2x2
+
+The smallest decisive CPU/PBLAS retry is the second command with
+``--only scalapack_gemm_hardening --dtypes complex128``.  The runtime boundary
+below derives a unique coordinator from the Slurm step before importing JAX;
+launch wrappers must not install a second coordinator owner.
 
 ONE SET OF CHECK BODIES, TWO CALLERS — the ``_CLI_CELLS`` pattern copied
 from the contract suite rather than reinvented.  Every ``check_*(mesh,
@@ -845,6 +850,112 @@ def check_gemm_plan_scalapack(mesh, dtype="complex128", *,
     return out
 
 
+def check_scalapack_gemm_hardening(mesh, dtype="complex128"):
+    """One decisive P4 PBLAS cell: auto, padding, transpose, and aliasing.
+
+    Logical ``(m,k,n)=(9,13,11)`` is externally zero-padded to the real
+    square mesh, so this exercises nontrivial local tile extents while keeping
+    the provider's exact-face contract honest.  Literal ``T,N`` and ``N,C``
+    catch both descriptor transpose sides; the existing ``matmul_scalapack``
+    cell owns ``C,N``.  ``LORRAX_DEBUG_PRINT=1`` is required so the retained
+    log contains the defining shared object for all thirteen ScaLAPACK/PBLAS
+    symbols, rather than merely a Python backend label.
+    """
+    debug = os.environ.get("LORRAX_DEBUG_PRINT", "").strip().lower()
+    assert debug in ("1", "true", "yes", "on"), (
+        "scalapack_gemm_hardening requires LORRAX_DEBUG_PRINT=1 so the "
+        "P4 log contains the C++ thirteen-symbol provider map")
+
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    assert px == py, f"PBLAS one-face GEMM needs square mesh, got {px}x{py}"
+
+    def _pad_to(value, divisor):
+        return ((value + divisor - 1) // divisor) * divisor
+
+    nq = 2
+    logical_m, logical_k, logical_n = 9, 13, 11
+    m = _pad_to(logical_m, px)
+    k = _pad_to(_pad_to(logical_k, px), py)
+    n = _pad_to(logical_n, py)
+    assert (m, k, n) != (logical_m, logical_k, logical_n)
+
+    rng = np.random.default_rng(20260902)
+    A_log = _rng_mat(rng, (nq, logical_m, logical_k), dtype)
+    B_log = _rng_mat(rng, (nq, logical_k, logical_n), dtype)
+    A_np = np.zeros((nq, m, k), dtype=dtype)
+    B_np = np.zeros((nq, k, n), dtype=dtype)
+    A_np[:, :logical_m, :logical_k] = A_log
+    B_np[:, :logical_k, :logical_n] = B_log
+    A = _put(A_np, mesh, (None, "x", "y"))
+    B = _put(B_np, mesh, (None, "x", "y"))
+
+    plan = D.gemm_plan(
+        mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, backend="auto")
+    assert plan.backend == "scalapack", (
+        f"CPU backend='auto' demoted or misrouted to {plan.backend!r}")
+    got_pad = _gather(plan(A, B))
+    want_log = A_log @ B_log
+    crop_rel = _rel(got_pad[:, :logical_m, :logical_n], want_log)
+    assert crop_rel < RTOL, crop_rel
+    assert np.array_equal(got_pad[:, logical_m:, :],
+                          np.zeros_like(got_pad[:, logical_m:, :])), (
+        "zero-padded output row tail is not exactly zero")
+    assert np.array_equal(got_pad[:, :logical_m, logical_n:],
+                          np.zeros_like(got_pad[:, :logical_m, logical_n:])), (
+        "zero-padded output column tail is not exactly zero")
+
+    # XLA donation is a request; this checks the compiled buffer assignment
+    # granted the input-C/output alias used to avoid a second output tile.
+    C_alias = _put(np.zeros((nq, m, n), dtype=dtype),
+                   mesh, (None, "x", "y"))
+    compiled = plan._fn_with_c.lower(A, B, C_alias).compile()
+    compiled_text = compiled.as_text()
+    assert "input_output_alias" in compiled_text, (
+        "the compiled PBLAS plan grants no input-C/output alias")
+    alias_bytes = int(compiled.memory_analysis().alias_size_in_bytes)
+    assert alias_bytes > 0, (
+        "compiled memory analysis reports zero aliased bytes for donated C")
+
+    alpha = (0.75 - 0.25j if np.dtype(dtype).kind == "c" else 0.75)
+
+    A_t = _rng_mat(rng, (nq, k, m), dtype)
+    B_t = _rng_mat(rng, (nq, k, n), dtype)
+    got_tn = _gather(D.matmul(
+        _put(A_t, mesh, (None, "x", "y")),
+        _put(B_t, mesh, (None, "x", "y")), mesh=mesh, alpha=alpha,
+        transa="T", transb="N", backend="auto"))
+    want_tn = alpha * (np.swapaxes(A_t, -1, -2) @ B_t)
+    tn_rel = _rel(got_tn, want_tn)
+    assert tn_rel < RTOL, tn_rel
+
+    A_c = _rng_mat(rng, (nq, m, k), dtype)
+    B_c = _rng_mat(rng, (nq, n, k), dtype)
+    got_nc = _gather(D.matmul(
+        _put(A_c, mesh, (None, "x", "y")),
+        _put(B_c, mesh, (None, "x", "y")), mesh=mesh, alpha=alpha,
+        transa="N", transb="C", backend="auto"))
+    want_nc = alpha * (A_c @ np.conj(np.swapaxes(B_c, -1, -2)))
+    nc_rel = _rel(got_nc, want_nc)
+    assert nc_rel < RTOL, nc_rel
+
+    from distrib_la import loader
+    return {
+        "requested_backend": "auto",
+        "resolved_backend": plan.backend,
+        "host_ffi": loader.loaded_lib_path("cpu"),
+        "logical_mkn": (logical_m, logical_k, logical_n),
+        "padded_mkn": (m, k, n),
+        "local_ABC": ((nq, m // px, k // py),
+                      (nq, k // px, n // py),
+                      (nq, m // px, n // py)),
+        "crop_rel": crop_rel,
+        "transpose_TN_rel": tn_rel,
+        "transpose_NC_rel": nc_rel,
+        "alias_bytes": alias_bytes,
+        "provider_map": "required in stderr via LORRAX_DEBUG_PRINT=1",
+    }
+
+
 def check_gemm_plan_manual_shard_map(mesh, dtype="complex128", *, nq=3,
                                      m=None, k=None, n=None, nsteps=3):
     """``GemmPlan.local_call``: the SAME planned N,N GEMM as
@@ -1221,6 +1332,8 @@ _CLI_CELLS = [
     ("gemm_plan_scalapack_auto", "cpu",
      lambda mesh, dt: check_gemm_plan_scalapack(
          mesh, dt, backend="auto")),
+    ("scalapack_gemm_hardening", "cpu",
+     lambda mesh, dt: check_scalapack_gemm_hardening(mesh, dt)),
     ("gemm_plan_manual_shard_map", "CUDA",
      lambda mesh, dt: check_gemm_plan_manual_shard_map(mesh, dt)),
 ]
