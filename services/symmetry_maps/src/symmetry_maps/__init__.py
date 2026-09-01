@@ -4,7 +4,8 @@ Everything LORRAX knows about the space group of a deck, in one package:
 the k-grid reduction and the IBZ⇄full-BZ tables (:class:`SymMaps`), the
 band-index k-star map (:class:`KStarMap` and the ``star_*`` helpers), the
 sharded q-axis unfolds (:func:`unfold_isdf_operator`,
-:func:`unfold_isdf_one_leg`, :func:`mix_channels_by_proper_rotation`),
+:func:`unfold_isdf_one_leg`, :func:`mix_one_channel_by_proper_rotation`,
+:func:`mix_channels_by_proper_rotation`),
 the ψ-unfold antiunitary rule
 (:func:`unfold_psi`, :func:`spinor_rotation_for_sym_row`,
 :func:`apply_spinor_rotation`,
@@ -82,6 +83,7 @@ The surface
     inverse of the file-wedge unfold — see its docstring.  There is no
     star-wedge twin because that is ``star_select``.
 ``unfold_isdf_operator`` / ``unfold_isdf_one_leg`` /
+``mix_one_channel_by_proper_rotation`` /
 ``mix_channels_by_proper_rotation`` / ``slice_q_full_to_ibz``
     The sharded q-axis actions.  The one-leg action owns exact parent-G
     relabelling and scalar/polar component transport without materialising a
@@ -219,6 +221,7 @@ from symmetry_maps.maps import (
     unfold_psi,
     unfold_isdf_operator,
     unfold_isdf_one_leg,
+    mix_one_channel_by_proper_rotation,
     mix_channels_by_proper_rotation,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
@@ -317,6 +320,7 @@ __all__ = [
     "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator", "unfold_isdf_one_leg",
+    "mix_one_channel_by_proper_rotation",
     "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
