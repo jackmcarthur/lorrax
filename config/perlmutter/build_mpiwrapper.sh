@@ -177,7 +177,7 @@ fi
     -DCMAKE_C_COMPILER=cc \
     -DCMAKE_CXX_COMPILER=CC \
     -DCMAKE_Fortran_COMPILER=ftn \
-    -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--as-needed
+    -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--no-as-needed
 "$CMAKE" --build "$BUILD" --parallel
 "$CMAKE" --install "$BUILD"
 
