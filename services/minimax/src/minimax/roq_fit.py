@@ -557,6 +557,30 @@ def _rank_ceiling(group: "RoqGroup") -> int:
     return int(np.clip(np.ceil(need), _MIN_RANK, _RANK_HARD_CAP))
 
 
+def _rank_floor(group: "RoqGroup", target: float) -> int:
+    """Cost-law floor for a crossing support's delivered measure.
+
+    The ceiling uses the full geometric radius.  A floor at that same radius
+    would ignore that a histogram can genuinely need fewer nodes.  At each
+    frequency, discard at most the window's apportioned target of delivered
+    ``mass / |d|`` and use the largest remaining radius.
+    """
+    d = np.asarray(group.fit.denominators)
+    if not (np.min(d.real) < 0.0 < np.max(d.real)):
+        return _MIN_RANK
+    width = float(np.min(np.abs(d.imag)))
+    if not np.isfinite(width) or width <= 0.0:
+        return _MIN_RANK
+    quantile = float(np.clip(1.0 - target, 0.0, 1.0))
+    radii = []
+    for row in d:
+        delivered_mass = group.fit.cell_masses / np.abs(row)
+        radii.append(_weighted_quantile(
+            np.abs(row.real), delivered_mass, quantile))
+    need = _COST_LAW_SLOPE * max(radii) / width
+    return int(np.clip(np.ceil(need), _MIN_RANK, _rank_ceiling(group)))
+
+
 def _usable_rank(singular) -> int:
     """How many modes this MEASURE actually supports.
 
@@ -604,12 +628,22 @@ def _fit_production_rank(group: RoqGroup, target: float,
                 quick=True, evaluations=len(cache) + 1)
         return cache[rank]
 
-    lower = _MIN_RANK
     final_ranks = None
-    # Clamp every search rank to the usable interval.  The angle probe was
-    # built independently and can sit above a low-rank measure's ceiling.
-    upper = min(_ANGLE_PROBE_RANK, ceiling)
-    if not angle_probe.target_met or not quick(upper).target_met:
+    floor = min(_rank_floor(group, target), ceiling)
+    # The already-paid angle probe is direct histogram evidence.  A crossing
+    # support whose twelve-node rule clears both delivered gates may search
+    # below the cost-law floor; otherwise the geometric ladder starts there.
+    if angle_probe.target_met and angle_probe.noise_passed:
+        floor = _MIN_RANK
+    if floor == _MIN_RANK:
+        lower = _MIN_RANK
+        upper = min(_ANGLE_PROBE_RANK, ceiling)
+        missed = not angle_probe.target_met or not quick(upper).target_met
+    else:
+        lower = floor - 1
+        upper = floor
+        missed = not quick(upper).target_met
+    if missed:
         lower = upper
         # Ladder scaled to this support's own ceiling, so a wide window is
         # bracketed in the same number of probes as a narrow one.

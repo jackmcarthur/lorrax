@@ -156,6 +156,13 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
 
     monkeypatch.setattr(
         "gw.mpa.delivered_windows._candidate_rules", one_node_candidate)
+    # This gate is about the rectangular product-window seam, not which
+    # crossing family wins.  Keep the measure-adapted route from pre-empting
+    # the instrumented candidate now that the rank floor makes it serve this
+    # tiny fixture directly.
+    monkeypatch.setattr(
+        "minimax.plan_measure_adapted_roq",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError))
     poles = np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)
     residues = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
     plan, report = build_delivered_sigma_windows(

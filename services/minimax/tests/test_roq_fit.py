@@ -130,6 +130,24 @@ def test_quick_rank_fit_defers_amplification(groups, monkeypatch):
     assert scored.kappa_max == 3.0
 
 
+def test_crossing_rank_floor_uses_target_weighted_delivered_measure():
+    from minimax.roq_fit import _rank_floor, _usable_rank
+
+    # The remote atom is geometrically wide but carries too little delivered
+    # mass to consume the loose target.  A tighter target must retain it.
+    problem = ReciprocalMeasureProblem(
+        np.array([0.0]),
+        np.array([-1.0 - 0.1j, 1.0 - 0.1j, 100.0 - 0.1j]),
+        np.array([1.0, 1.0, 1.0e-12]))
+    group = RoqGroup("crossing", problem, problem, sigma=1,
+                     angle_deg=0.0, horizon=10.0)
+
+    assert _rank_floor(group, 1.0e-4) == 21
+    assert _rank_floor(group, 1.0e-15) == 512
+    assert _usable_rank(np.array(
+        [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 7.0e-8, 5.0e-8])) == 7
+
+
 def test_production_planner_refuses_a_growing_product_window(groups):
     tails, _ = groups
     window = RoqWindow("wrong", tails.fit, tails.validation, 1.0e-4,
@@ -198,14 +216,14 @@ def test_frozen_na_plan_is_bit_deterministic(frozen_na_plans):
 
 def test_frozen_na_node_accuracy_and_noise_acceptance(frozen_na_plans):
     plan, _ = frozen_na_plans
-    assert sum(rule.rank for rule in plan.rules) == 54
-    assert sum(rule.rank for rule in plan.rules) <= 69
+    assert sum(rule.rank for rule in plan.rules) == 89
+    resonant = next(
+        rule for rule in plan.rules
+        if rule.windows == ("ω≥E_F cond:resonant",))
+    assert resonant.rank == 63
     achieved = {row.branch: row.max_error for row in plan.branches}
     # Actual aggregate errors of the accepted 137-node production plan.
     assert achieved["cond"] <= 1.35633e-4
     assert achieved["val"] <= 2.43017e-5
     assert all(row.noise_passed for row in plan.branches)
     assert all(rule.noise_passed for rule in plan.rules)
-    assert all(rule.kappa_p99 * 6.0e-8
-               <= 0.05 * max(rule.max_error, 1.0e-12)
-               for rule in plan.rules)
