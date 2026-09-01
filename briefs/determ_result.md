@@ -4,8 +4,8 @@
 
 | check | achieved result |
 |---|---|
-| amended tips | **5/5 passed** the production planner's emulated bitwise P=1/4/16 signature test: `95c7160b`, `f0135b9b`, `cbd3dc7c`, `fe3fb6cf`, `8b3ed208` |
-| repeated P signatures | **6/6 identical**: two plans at each of P=1,4,16, including ordered windows, node-time bytes, weight bytes, masks, omega/pole indices, node counts, and plan-cache fingerprint |
+| amended tips | **5/5 passed** the strengthened production-planner P matrix: `95c7160b`, `f0135b9b`, `cbd3dc7c`, `fe3fb6cf`, `8b3ed208` |
+| repeated P signatures | **30/30 identical** across the five tips: two plans at each of P=1,4,16, including ordered windows, node-time bytes, weight bytes, masks, omega/pole indices, node counts, and plan-cache fingerprint |
 | warm-start/order probe at `f0135b9b` | **4/4 identical** (ascending, descending, scrambled rank inputs, then repeat): rank 10, residual `2.544646335001577e-05`, kappa-p99 `1.221612999034461`, byte SHA-256 `e1c5ca6e416b7435a46b960e730410f1372740bd5c62781fd43c7cc50f2b385d` |
 | prescribed CPU gate | **134/134 passed**, 8 warnings, 78.73 s |
 | focused audit gate | **3/3 passed**, 1 warning, 9.15 s |
