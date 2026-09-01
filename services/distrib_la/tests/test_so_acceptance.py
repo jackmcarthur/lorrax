@@ -61,7 +61,7 @@ _NEEDS_GEMM_LANE_SO = (
     "— unskip when that lane lands")
 
 
-#: The four Scalapack host handlers.  BUILD_NOTES.md's check 2 counts
+#: The ScaLAPACK host handlers.  BUILD_NOTES.md's check 2 counts
 #: them; naming them means a build that exported three and a typo passes
 #: the count and fails here.
 _SCALAPACK_SYMBOLS = tuple(sorted(
@@ -223,8 +223,8 @@ def test_check_1_the_host_library_was_built_with_scalapack():
         f"found' as a CMake WARNING and succeeds with no ScaLAPACK at all.")
 
 
-def test_check_2_all_four_scalapack_handlers_are_exported():
-    """``nm -D --defined-only <so> | grep -c Scalapack`` must be 4.
+def test_check_2_all_scalapack_handlers_are_exported():
+    """Every ScaLAPACK handler declared by the loader must be exported.
 
     The count AND the names.  A count alone passes a build that exported
     four symbols one of which was misspelled, and the names come from
@@ -234,15 +234,12 @@ def test_check_2_all_four_scalapack_handlers_are_exported():
     """
     so = _pinned("cpu")
     syms = _defined_symbols(so)
-    assert len(_SCALAPACK_SYMBOLS) == 4, (
-        f"the loader's host table lists {len(_SCALAPACK_SYMBOLS)} Scalapack "
-        f"handlers, not 4; BUILD_NOTES.md's check counts 4 — one of the two "
-        f"moved and they must move together: {_SCALAPACK_SYMBOLS}")
     missing = [s for s in _SCALAPACK_SYMBOLS if s not in syms]
     assert not missing, f"{so} does not export {missing}"
     grepped = sum(1 for s in syms if "Scalapack" in s)
-    assert grepped == 4, (
-        f"{so} exports {grepped} Scalapack* symbols, want exactly 4 "
+    assert grepped == len(_SCALAPACK_SYMBOLS), (
+        f"{so} exports {grepped} Scalapack* symbols, want exactly "
+        f"{len(_SCALAPACK_SYMBOLS)} "
         f"({sorted(s for s in syms if 'Scalapack' in s)})")
 
 
@@ -290,7 +287,6 @@ def test_check_4_exactly_one_libsci_flavour():
 # Two more the loader's own table earns for free
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason=_NEEDS_GEMM_LANE_SO)
 def test_every_host_handler_this_package_claims_is_actually_exported():
     """The service's target table vs the library, in full.
 

@@ -171,11 +171,16 @@ def test_batch_reshard_source_is_two_forward_then_two_inverse_exchanges():
 def test_provider_wrappers_call_library_gemm_not_jax_panels():
     import inspect
     from distrib_la import _scalapack, _slate
-    for wrapper, target in (
-            (_scalapack.batched_distributed_matmul,
-             "lorrax_scalapack_batched_gemm"),
-            (_slate.batched_distributed_matmul,
-             "lorrax_slate_batched_gemm")):
+    scalapack_helper = inspect.getsource(_scalapack._get_batched_matmul_fn)
+    assert "_GEMM_TARGET" in scalapack_helper
+    assert "ffi_call" in scalapack_helper
+    assert "all_gather" not in scalapack_helper
+    scalapack_wrapper = inspect.getsource(
+        _scalapack.batched_distributed_matmul)
+    assert "_get_batched_matmul_fn" in scalapack_wrapper
+
+    for wrapper, target in ((_slate.batched_distributed_matmul,
+                             "lorrax_slate_batched_gemm"),):
         source = inspect.getsource(wrapper)
         assert target in source or "_GEMM_TARGET" in source
         assert "ffi_call" in source
