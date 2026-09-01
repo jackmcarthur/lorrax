@@ -179,6 +179,7 @@ fi
 module load "$LORRAX_PM_PRGENV" "$LORRAX_PM_LIBSCI" "$LORRAX_PM_HDF5" "$LORRAX_PM_FFTW" "$LORRAX_PM_CMAKE"
 module unload craype-accel-nvidia80 2>/dev/null || true
 module unload cudatoolkit           2>/dev/null || true
+module unload darshan               2>/dev/null || true
 
 : "${CRAY_LIBSCI_PREFIX_DIR:?cray-libsci did not set CRAY_LIBSCI_PREFIX_DIR}"
 : "${CRAY_MPICH_DIR:?cray-mpich did not set CRAY_MPICH_DIR}"
