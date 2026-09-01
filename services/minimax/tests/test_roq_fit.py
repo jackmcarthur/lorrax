@@ -49,6 +49,26 @@ def test_group_fit_meets_target_and_is_deterministic(groups):
     np.testing.assert_array_equal(first.weights, second.weights)
 
 
+def test_group_fit_is_bitwise_independent_of_rank_input_order(groups):
+    """Caller rank order cannot change the selected fitted rule."""
+    tails, _ = groups
+    ascending = list(range(6, 41, 2))
+    first = fit_roq_group(tails, 1.0e-4, ranks=ascending)
+    second = fit_roq_group(tails, 1.0e-4, ranks=reversed(ascending))
+
+    assert (first.group, first.rank, first.max_error, first.kappa_p99,
+            first.kappa_max, first.singular_ratio, first.angle_deg,
+            first.horizon, first.windows, first.target_met,
+            first.noise_passed, first.search_evaluations) == (
+                second.group, second.rank, second.max_error,
+                second.kappa_p99, second.kappa_max, second.singular_ratio,
+                second.angle_deg, second.horizon, second.windows,
+                second.target_met, second.noise_passed,
+                second.search_evaluations)
+    np.testing.assert_array_equal(first.times, second.times)
+    np.testing.assert_array_equal(first.weights, second.weights)
+
+
 def test_rule_scores_with_production_metric(groups):
     tails, _ = groups
     rule = fit_roq_group(tails, 1.0e-4, ranks=range(6, 41, 2))
