@@ -92,7 +92,7 @@ def _require_provider(provider: str, mesh: Mesh) -> None:
             + "; ".join(bad[:4]))
     platform = _provider_platform(provider, mesh)
     probe = loader.probe_target(_TARGETS[provider], platform)
-    if not probe:
+    if not probe.ok:
         raise RuntimeError(
             f"matmul backend {provider!r} is unavailable: {probe.reason}")
 

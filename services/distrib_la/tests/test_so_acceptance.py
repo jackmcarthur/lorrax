@@ -47,18 +47,19 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 
 import pytest
 
 from distrib_la.loader import _HOST_TARGET_SYMBOLS, _PLATFORMS
 
-# The seven cells below are ENVIRONMENT-GATED, not expected-to-fail logic:
-# they pass against the fresh matmul FFI builds the GEMM lane produced and
-# fail against every older pin, including the campaign's.  Named skips, not
-# xfail — see claim 209 for the measured before/after sets.
+# The four paired-artifact cells below are ENVIRONMENT-GATED, not
+# expected-to-fail logic: they require fresh host and CUDA libraries from the
+# same ABI/GEMM lane.  Host-only checks use ``_pinned('cpu')`` directly: that
+# helper skips with the missing env-var prerequisite and fails a stale pin.
 _NEEDS_GEMM_LANE_SO = (
-    "requires a rebuilt host .so containing the ScaLAPACK/PBLAS GEMM "
-    "handler — unskip when that artifact is pinned")
+    "requires freshly paired host and CUDA .so files from the same "
+    "ABI/GEMM build lane; pin both artifacts")
 
 
 #: The ScaLAPACK host handlers.  BUILD_NOTES.md's check 2 counts
@@ -206,7 +207,6 @@ def _defined_symbols(so: str) -> set[str]:
 # BUILD_NOTES.md's four checks
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason=_NEEDS_GEMM_LANE_SO)
 def test_check_1_the_host_library_was_built_with_scalapack():
     """``strings <so> | grep 'scalapack='`` must say ``scalapack=1``.
 
@@ -292,7 +292,6 @@ def test_check_3_no_fftw_in_the_dynamic_dependencies():
         f"2026-08-06.  Full NEEDED list: {needed}")
 
 
-@pytest.mark.skip(reason=_NEEDS_GEMM_LANE_SO)
 def test_check_4_exactly_one_libsci_flavour():
     """``readelf -d <so> | grep NEEDED | grep -cE 'libsci_gnu(_mpi)?\\.so'``
     must be 0 — GATE 2.
@@ -316,7 +315,6 @@ def test_check_4_exactly_one_libsci_flavour():
 # Two more the loader's own table earns for free
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason=_NEEDS_GEMM_LANE_SO)
 def test_every_host_handler_this_package_claims_is_actually_exported():
     """The service's target table vs the library, in full.
 
@@ -667,6 +665,19 @@ def test_scalapack_symbol_checker_owns_the_exact_13_symbol_surface():
         if re.search(rf"\b{re.escape(symbol)}\s*\(", source) is None
     ]
     assert not missing, f"{header} lacks declarations for {missing}"
+
+
+def test_scalapack_symbol_checker_rejects_a_real_elf_without_the_surface():
+    """Red twin: a readable dynamic table with no PBLAS API must fail."""
+    checker = os.path.join(
+        _repo_root(), "src", "ffi", "cpp", "scalapack",
+        "check_symbol_contract.sh")
+    out = subprocess.run(
+        ["bash", checker, "provider", sys.executable],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        timeout=60)
+    assert out.returncode != 0, out.stdout
+    assert "MISSING pzgemm_" in out.stdout, out.stdout
 
 
 def test_machine_scripts_do_not_gate_scalapack_on_slate():
