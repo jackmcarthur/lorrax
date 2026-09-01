@@ -285,6 +285,8 @@ def compute_static_w(
                 else int(meta.nk_tot))
     _mu = int(meta.n_rmu)
     _w = f"W[{role}]"
+    _batched_route = getattr(
+        config.backend, "distrib_la_batched_route", "auto")
 
     with timing.section(f"gw_jax.{section}"):
         with jax_profile.trace_section(section):
@@ -326,7 +328,9 @@ def compute_static_w(
                 with timing.section("chi.compile", announce=True,
                                     label=f"{_w} chi0 compile (dual-output)"):
                     precompile_chi0_multi(wfns, _tau_full, _alpha_rows, meta,
-                                          mesh_xy, energy_reference=e_ref)
+                                          mesh_xy, energy_reference=e_ref,
+                                          distrib_la_batched_route=(
+                                              _batched_route))
                 with timing.section(
                         "chi.exec", announce=True,
                         label=f"{_w} chi0 build "
@@ -335,21 +339,25 @@ def compute_static_w(
                               f"fused probe accumulator)"):
                     chi0_q, chi0_extra_q = compute_chi0_multi(
                         wfns, _tau_full, _alpha_rows, meta, mesh_xy,
-                        energy_reference=e_ref)
+                        energy_reference=e_ref,
+                        distrib_la_batched_route=_batched_route)
                     chi0_q.block_until_ready()
                     chi0_extra_q.block_until_ready()
             else:
                 with timing.section("chi.compile", announce=True,
                                     label=f"{_w} chi0 compile"):
                     precompile_chi0(wfns, quad, meta, mesh_xy,
-                                    energy_reference=e_ref)
+                                    energy_reference=e_ref,
+                                    distrib_la_batched_route=_batched_route)
                 with timing.section(
                         "chi.exec", announce=True,
                         label=f"{_w} chi0 build "
                               f"({len(np.asarray(quad.tau))} tau nodes, "
                               f"{int(meta.nk_tot)} q, mu={_mu})"):
                     chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
-                                          energy_reference=e_ref)
+                                          energy_reference=e_ref,
+                                          distrib_la_batched_route=(
+                                              _batched_route))
                     chi0_q.block_until_ready()
             if gamma_chi_override is not None:
                 gamma = jnp.asarray(gamma_chi_override)
@@ -384,10 +392,7 @@ def compute_static_w(
                                 label=f"{_w} Dyson compile"):
                 precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
                                    dyson_solver=config.backend.w_dyson_solver,
-                                   distrib_la_batched_route=(
-                                       getattr(config.backend,
-                                               "distrib_la_batched_route",
-                                               "auto")))
+                                   distrib_la_batched_route=_batched_route)
             if (head_channel is None
                     or str(getattr(head_channel, "mode", "off")) == "off"):
                 with timing.section(
@@ -397,9 +402,7 @@ def compute_static_w(
                     W_q_solve = solve_w(
                         V_q_solve, chi0_q_solve, meta, mesh_xy,
                         dyson_solver=config.backend.w_dyson_solver,
-                        distrib_la_batched_route=(
-                            getattr(config.backend,
-                                    "distrib_la_batched_route", "auto")))
+                        distrib_la_batched_route=_batched_route)
                     # χ₀ is donated inside solve_w — the reference is
                     # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
                     del chi0_q_solve
@@ -436,16 +439,12 @@ def compute_static_w(
                     W_body0 = solve_w(
                         V_body_solve, chi0_q_solve.copy(), meta, mesh_xy,
                         dyson_solver=config.backend.w_dyson_solver,
-                        distrib_la_batched_route=(
-                            getattr(config.backend,
-                                    "distrib_la_batched_route", "auto")))
+                        distrib_la_batched_route=_batched_route)
                     del V_body_solve
                     W_bare = solve_w(
                         V_bare_solve, chi0_q_solve, meta, mesh_xy,
                         dyson_solver=config.backend.w_dyson_solver,
-                        distrib_la_batched_route=(
-                            getattr(config.backend,
-                                    "distrib_la_batched_route", "auto")))
+                        distrib_la_batched_route=_batched_route)
                     del chi0_q_solve, V_bare_solve
                     W_q_solve = _hc.combine_head_channel(
                         W_body0, W_bare, head_channel, q_index=q_idx)

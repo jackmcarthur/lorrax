@@ -46,13 +46,13 @@ backend='auto', batched_route='auto')``
     plan.  The default dispatches to cuBLASMp, PBLAS or SLATE; the explicit
     opt-in performs x/y face-to-batch exchanges, local GEMM, then y/x inverse
     exchanges. ``backend='off'`` makes that route provider-free.
-``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) ->
-GemmPlan``
-    Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE, for a caller
-    that will call it many times from inside its own ``jax.jit``/
-    ``lax.scan`` (G construction, per-tau Sigma projection).  ``GemmPlan(A,
-    B, C=None, *, out=None)`` is trace-safe through cuBLASMp or ScaLAPACK,
-    with one replicated leading batch (holds k) and no transpose modes.
+``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto',
+batched_route='auto', alpha=1, beta=0) -> GemmPlan``
+    Resolve and prepare one N,N GEMM shape once for repeated calls inside a
+    caller's ``jax.jit``/``lax.scan`` (G construction, per-tau Sigma
+    projection). ``batched_route='auto'`` uses cuBLASMp or ScaLAPACK;
+    ``'batch_reshard'`` reuses ``matmul``'s staged face-to-batch/local-GEMM
+    engine and reports its per-rank A+B+D(+C) storage floor.
     ``GemmPlan.local_call`` is the cuBLASMp-only manual-shard-map entry.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the

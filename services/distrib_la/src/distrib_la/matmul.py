@@ -253,17 +253,38 @@ def _provider_matmul(provider, mesh, A, B, C, *, alpha, beta,
         transa=transa, transb=transb)
 
 
-def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
+def _get_batch_reshard_matmul_fn(
+    mesh,
+    *,
+    a_shape,
+    b_shape,
+    c_shape,
+    dtype,
+    alpha,
+    beta,
+    transa,
+    transb,
+):
+    """Return the one cached staged/local GEMM for an exact signature.
+
+    Both :func:`matmul` and :func:`distrib_la.gemm_plan` use this builder.
+    Keeping the exchanges, padding, local GEMM, and inverse schedule here
+    prevents the planned hot-loop surface from growing a second
+    implementation of route ``batch_reshard``.
+    """
     from distrib_la._batch_reshard import _batch_to_face, _face_to_batch
 
     px, py = _mesh_shape(mesh)
     ptotal = px * py
-    nb = int(A.shape[0])
+    a_shape = tuple(int(v) for v in a_shape)
+    b_shape = tuple(int(v) for v in b_shape)
+    c_shape = None if c_shape is None else tuple(int(v) for v in c_shape)
+    dtype = jnp.dtype(dtype)
+    nb = int(a_shape[0])
     nb_pad = ((nb + ptotal - 1) // ptotal) * ptotal
     pad = nb_pad - nb
-    has_c = C is not None
-    key = (mesh_key(mesh), tuple(A.shape), tuple(B.shape),
-           None if C is None else tuple(C.shape), str(A.dtype), alpha, beta,
+    has_c = c_shape is not None
+    key = (mesh_key(mesh), a_shape, b_shape, c_shape, str(dtype), alpha, beta,
            transa, transb)
     fn = _RESHARD_CACHE.get(key)
     if fn is None:
@@ -285,9 +306,9 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
                 b = jnp.swapaxes(b, -1, -2)
                 if transb == "C":
                     b = jnp.conj(b)
-            d = jnp.asarray(alpha, A.dtype) * jnp.matmul(a, b)
+            d = jnp.asarray(alpha, dtype) * jnp.matmul(a, b)
             if c is not None:
-                d = d + jnp.asarray(beta, A.dtype) * c
+                d = d + jnp.asarray(beta, dtype) * c
             d = _batch_to_face(d, px=px, py=py)
             return d[:nb]
 
@@ -309,7 +330,22 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
         # the other batch_reshard operations.
         fn = jax.jit(_local)
         _RESHARD_CACHE[key] = fn
-    return fn(A, B, C) if has_c else fn(A, B)
+    return fn
+
+
+def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
+    fn = _get_batch_reshard_matmul_fn(
+        mesh,
+        a_shape=A.shape,
+        b_shape=B.shape,
+        c_shape=None if C is None else C.shape,
+        dtype=A.dtype,
+        alpha=alpha,
+        beta=beta,
+        transa=transa,
+        transb=transb,
+    )
+    return fn(A, B, C) if C is not None else fn(A, B)
 
 
 def matmul(

@@ -53,6 +53,7 @@ def _integrate_sigma_batches(
     *,
     pole_batch_size,
     print_fn,
+    distrib_la_batched_route: str = "auto",
 ):
     """One spatial executor for streamed fit slabs."""
     omega = np.asarray(omega_grid_ry, np.float64)
@@ -128,6 +129,7 @@ def _integrate_sigma_batches(
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        distrib_la_batched_route=distrib_la_batched_route,
         **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
@@ -194,6 +196,7 @@ def integrate_sigma_store(
     *,
     pole_batch_size=4,
     print_fn=print,
+    distrib_la_batched_route: str = "auto",
 ):
     """Read, unfold, consume, and release one pole range at a time.
 
@@ -218,7 +221,8 @@ def integrate_sigma_store(
     def run(reader):
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
-            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn,
+            distrib_la_batched_route=distrib_la_batched_route)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -301,6 +305,7 @@ def compute_sigma_c_mpa_omega_grid(
     expected_screening_diagrams=None,
     occupation_state=None,
     print_fn=print,
+    distrib_la_batched_route: str = "auto",
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
 
@@ -364,7 +369,8 @@ def compute_sigma_c_mpa_omega_grid(
             f"{geometry['n_windows']} logical windows")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+            pole_batch_size=pole_batch_size, print_fn=print_fn,
+            distrib_la_batched_route=distrib_la_batched_route)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):

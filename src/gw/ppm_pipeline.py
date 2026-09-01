@@ -486,6 +486,7 @@ def compute_ppm_sigma_pipeline(
     sym,
     iteration_head=None,
     occupation_state=None,
+    distrib_la_batched_route: str = "auto",
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -626,6 +627,7 @@ def compute_ppm_sigma_pipeline(
                     config.omega_grid_ry,
                     sigma_xi.resolved_ry,
                     config.sigma.window_edge_factor),
+                distrib_la_batched_route=distrib_la_batched_route,
             )
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
@@ -637,6 +639,7 @@ def compute_ppm_sigma_pipeline(
                 ansatz=config.compute_mode,
                 occupation_state=occupation_state,
                 plan=plan,
+                distrib_la_batched_route=distrib_la_batched_route,
                 print_fn=print_fn,
             )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries

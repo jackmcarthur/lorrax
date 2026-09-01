@@ -2,12 +2,202 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+_PRODUCTION_GEMM_PLAN_INVENTORY = Counter({
+    ("src/common/contract_bands.py", "_face_project_kernel"): 2,
+    ("src/gw/cohsex_sigma.py", "_make_cohsex_kernels_face"): 1,
+    ("src/gw/isdf_fitting.py", "fit_zeta_to_h5"): 1,
+    ("src/gw/photon_sigma.py", "_make_photon_static_block_kernel"): 1,
+    ("src/gw/ppm_sigma.py", "_face_g_plan"): 1,
+    ("src/gw/ppm_tau_kernel.py", "_get_sigma_kij_kernel"): 2,
+    ("src/gw/w_isdf.py", "_get_chi_minimax_kernel_face"): 1,
+    ("src/gw/w_isdf.py", "_get_chi_fractional_contour_kernel_face"): 1,
+    ("src/gw/w_isdf.py", "_get_finite_transfer_current_block_kernel"): 1,
+    ("src/gw/wavefunction_bundle.py", "_face_rotate_kernel"): 2,
+})
+
+
+# Each factory below retains a callable that directly or transitively closes
+# over one of the GemmPlans above.  Its cache key must therefore distinguish
+# the run route; otherwise a later request can silently receive the executable
+# built for an earlier route in the same process.
+_ROUTE_KEYED_PLAN_FACTORIES = {
+    "src/gw/cohsex_sigma.py": {
+        "_make_cohsex_kernels": "cache_key",
+    },
+    "src/gw/photon_sigma.py": {
+        "_make_photon_static_block_kernel": "key",
+    },
+    "src/gw/ppm_tau_kernel.py": {
+        "get_sigma_spatial_kernel": "key",
+        "_get_sigma_kij_kernel": "key",
+        "_get_sigma_tau_kernel": "cache_key",
+        "get_shared_sigma_tau_kernel": "key",
+    },
+    "src/gw/w_isdf.py": {
+        "_get_chi_minimax_kernel": "cache_key",
+        "_get_chi_fractional_contour_kernel": "cache_key",
+        "_get_finite_transfer_current_block_kernel": "key",
+    },
+    "src/gw/wavefunction_bundle.py": {
+        "_face_rotate_kernel": "key",
+    },
+}
+
+
+# Public/orchestrator-to-factory seams that must carry the same resolved route
+# all the way to the plan-owning functions above.  Values are exact call counts
+# within the named owner; a duplicate/new path is intentionally a review event.
+_TRANSITIVE_ROUTE_SEAMS = {
+    "src/gw/sigma_dispatch.py": {
+        "compute_sigma_xc": {
+            "compute_static_photon_sigma": 1,
+            "compute_cohsex_sigma": 1,
+            "compute_sigma_x": 1,
+            "compute_sigma_c_mpa_omega_grid": 1,
+            "compute_ppm_sigma_pipeline": 1,
+        },
+    },
+    "src/gw/photon_sigma.py": {
+        "compute_static_photon_sigma": {
+            "_make_photon_static_block_kernel": 1,
+        },
+        "_make_photon_static_block_kernel": {
+            "contract_bands_block_reshard": 1,
+        },
+    },
+    "src/gw/cohsex_sigma.py": {
+        "compute_cohsex_sigma": {
+            "_make_cohsex_kernels": 1,
+            "compute_sigma_x_bispinor": 1,
+        },
+        "compute_sigma_x": {
+            "_make_cohsex_kernels": 1,
+            "compute_sigma_x_bispinor": 1,
+        },
+        "_make_cohsex_kernels": {
+            "_make_cohsex_kernels_face": 1,
+        },
+        "_make_cohsex_kernels_face": {
+            "contract_bands_block_reshard": 1,
+        },
+    },
+    "src/gw/sigma_x_bispinor.py": {
+        "compute_sigma_x_bispinor": {
+            "_make_cohsex_kernels": 1,
+        },
+    },
+    "src/gw/ppm_pipeline.py": {
+        "compute_ppm_sigma_pipeline": {
+            "precompile_sigma": 1,
+            "compute_sigma_c_ppm_omega_grid": 1,
+        },
+    },
+    "src/gw/ppm_tau_kernel.py": {
+        "precompile_sigma": {"_get_sigma_tau_kernel": 2},
+        "_get_sigma_tau_kernel": {"_get_sigma_kij_kernel": 1},
+        "get_shared_sigma_tau_kernel": {"_get_sigma_kij_kernel": 1},
+        "_get_sigma_kij_kernel": {"get_sigma_spatial_kernel": 1},
+        "get_sigma_spatial_kernel": {
+            "_make_project_ri_reduce_scatter": 1,
+        },
+        "_make_project_ri_reduce_scatter": {
+            "contract_bands_block_reshard": 1,
+        },
+    },
+    "src/gw/ppm_sigma.py": {
+        "_run_sigma_branch": {"_get_sigma_tau_kernel": 2},
+        "_compute_invalid_static_sigma": {
+            "get_sigma_spatial_kernel": 1,
+            "_face_g_plan": 1,
+        },
+        "_invalid_static_coh_by_bracket": {
+            "get_sigma_spatial_kernel": 1,
+            "_face_g_plan": 1,
+        },
+        "compute_sigma_c_ppm_omega_grid": {
+            "_compute_invalid_static_sigma": 1,
+            "_invalid_static_coh_by_bracket": 1,
+        },
+    },
+    "src/gw/mpa/sigma.py": {
+        "compute_sigma_c_mpa_omega_grid": {"integrate_sigma_store": 1},
+        "integrate_sigma_store": {"_integrate_sigma_batches": 1},
+        "_integrate_sigma_batches": {"get_shared_sigma_tau_kernel": 1},
+    },
+    "src/gw/sc_iteration.py": {
+        "gw_iteration_map": {"rotate_wavefunctions": 1},
+    },
+    "src/gw/wavefunction_bundle.py": {
+        "rotate_wavefunctions": {"_rotate_wavefunctions_face": 1},
+        "_rotate_wavefunctions_face": {"_face_rotate_kernel": 1},
+    },
+}
+
+
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _function_args(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    args = (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)
+    return {arg.arg for arg in args}
+
+
+def _gemm_plan_names(tree: ast.AST) -> set[str]:
+    """Recognize direct imports and aliases such as ``_gemm_plan``."""
+    names = {"gemm_plan"}  # also covers ``distrib_la.gemm_plan(...)``
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.module != "distrib_la":
+            continue
+        for alias in node.names:
+            if alias.name == "gemm_plan":
+                names.add(alias.asname or alias.name)
+    return names
+
+
+def _function_by_name(tree: ast.AST, name: str):
+    found = [node for node in ast.walk(tree)
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and node.name == name]
+    assert len(found) == 1, f"expected one production function {name}: {found}"
+    return found[0]
+
+
+def _assigned_value(fn: ast.AST, variable: str):
+    found = []
+    for node in ast.walk(fn):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(isinstance(target, ast.Name) and target.id == variable
+               for target in targets):
+            found.append(node.value)
+    assert len(found) == 1, (
+        f"{getattr(fn, 'name', '<function>')} must assign one {variable} "
+        f"cache key, found {len(found)}")
+    return found[0]
+
+
+def _calls_named(fn: ast.AST, name: str) -> list[ast.Call]:
+    return [node for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and _call_name(node) == name]
+
+
+def _keyword_value(call: ast.Call, name: str):
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
 
 
 def test_deck_route_defaults_normalizes_and_refuses_unknown(tmp_path):
@@ -164,3 +354,134 @@ def test_kmeans_is_preprocessing_not_an_inert_distrib_la_consumer():
     assert "--distrib-la-batched-route" not in cli
     assert "linalg_plan(" not in implementation
     assert ".batched(" not in implementation
+
+
+def test_every_production_gemm_plan_explicitly_uses_the_run_route():
+    """No reshardable planned GEMM may fall back to its own ``auto``.
+
+    The exact inventory makes a newly added production GemmPlan a review
+    event: it must either join this universal run dial or be documented and
+    tested as structurally non-reshardable instead of silently escaping it.
+    """
+    inventory = Counter()
+    for path in sorted((ROOT / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        gemm_plan_names = _gemm_plan_names(tree)
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+
+        for call in (node for node in ast.walk(tree)
+                     if isinstance(node, ast.Call)
+                     and _call_name(node) in gemm_plan_names):
+            owner = call
+            while owner in parents and not isinstance(
+                    owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                owner = parents[owner]
+            assert isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)), (
+                f"{path.relative_to(ROOT)}:{call.lineno} gemm_plan is not "
+                "owned by a production factory")
+            rel = str(path.relative_to(ROOT))
+            inventory[(rel, owner.name)] += 1
+
+            assert "distrib_la_batched_route" in _function_args(owner), (
+                f"{rel}:{owner.name} builds a GemmPlan but cannot receive "
+                "the universal run route")
+            route = next((kw.value for kw in call.keywords
+                          if kw.arg == "batched_route"), None)
+            assert route is not None, (
+                f"{rel}:{call.lineno} gemm_plan drops batched_route=")
+            route_names = {node.id for node in ast.walk(route)
+                           if isinstance(node, ast.Name)}
+            assert "distrib_la_batched_route" in route_names, (
+                f"{rel}:{call.lineno} gemm_plan hard-codes or substitutes "
+                f"the route: {ast.unparse(route)}")
+
+    assert inventory == _PRODUCTION_GEMM_PLAN_INVENTORY, (
+        "production gemm_plan inventory changed; classify the new/removed "
+        f"site explicitly: got={inventory}")
+
+
+def test_every_cached_gemm_plan_factory_keys_on_the_run_route():
+    """A cached closure built for one route cannot serve another route."""
+    for rel, factories in _ROUTE_KEYED_PLAN_FACTORIES.items():
+        tree = ast.parse((ROOT / rel).read_text())
+        for name, key_name in factories.items():
+            fn = _function_by_name(tree, name)
+            assert "distrib_la_batched_route" in _function_args(fn), (
+                f"{rel}:{name} caches a GemmPlan closure but cannot receive "
+                "the universal run route")
+            key = _assigned_value(fn, key_name)
+            key_names = {node.id for node in ast.walk(key)
+                         if isinstance(node, ast.Name)}
+            assert "distrib_la_batched_route" in key_names, (
+                f"{rel}:{name} cache {key_name} omits the run route: "
+                f"{ast.unparse(key)}")
+
+
+def test_transitive_gemm_plan_callers_forward_the_run_route():
+    """The one dispatch setting reaches every plan-owning factory chain."""
+    for rel, owners in _TRANSITIVE_ROUTE_SEAMS.items():
+        tree = ast.parse((ROOT / rel).read_text())
+        for owner_name, expected in owners.items():
+            owner = _function_by_name(tree, owner_name)
+            is_dispatch = (rel, owner_name) == (
+                "src/gw/sigma_dispatch.py", "compute_sigma_xc")
+            is_sc_entry = (rel, owner_name) == (
+                "src/gw/sc_iteration.py", "gw_iteration_map")
+
+            if is_dispatch:
+                resolved = _assigned_value(
+                    owner, "distrib_la_batched_route")
+                source = ast.unparse(resolved)
+                assert "config.backend" in source
+                assert "distrib_la_batched_route" in source
+            elif not is_sc_entry:
+                assert "distrib_la_batched_route" in _function_args(owner), (
+                    f"{rel}:{owner_name} cannot receive the run route")
+
+            for callee, count in expected.items():
+                calls = _calls_named(owner, callee)
+                assert len(calls) == count, (
+                    f"{rel}:{owner_name} expected {count} call(s) to "
+                    f"{callee}, found {len(calls)}")
+                for call in calls:
+                    route = _keyword_value(
+                        call, "distrib_la_batched_route")
+                    assert route is not None, (
+                        f"{rel}:{call.lineno} {owner_name}->{callee} drops "
+                        "distrib_la_batched_route=")
+                    source = ast.unparse(route)
+                    if is_sc_entry:
+                        assert "inputs.config.backend" in source
+                        assert "distrib_la_batched_route" in source
+                    else:
+                        route_names = {
+                            node.id for node in ast.walk(route)
+                            if isinstance(node, ast.Name)
+                        }
+                        assert "distrib_la_batched_route" in route_names, (
+                            f"{rel}:{call.lineno} {owner_name}->{callee} "
+                            f"substitutes route {source}")
+
+
+def test_ppm_executor_branch_kwargs_carry_the_run_route():
+    """The branch loop forwards its route through the one shared kwargs map."""
+    tree = ast.parse((ROOT / "src/gw/ppm_sigma.py").read_text())
+    owner = _function_by_name(tree, "compute_sigma_c_ppm_omega_grid")
+    bundle = _assigned_value(owner, "common_branch_kwargs")
+    assert isinstance(bundle, ast.Call) and _call_name(bundle) == "dict"
+    route = _keyword_value(bundle, "distrib_la_batched_route")
+    assert route is not None
+    assert "distrib_la_batched_route" in {
+        node.id for node in ast.walk(route) if isinstance(node, ast.Name)}
+
+    calls = _calls_named(owner, "_run_sigma_branch")
+    assert len(calls) == 1
+    expansions = [kw.value for kw in calls[0].keywords if kw.arg is None]
+    assert any(isinstance(value, ast.Name)
+               and value.id == "common_branch_kwargs"
+               for value in expansions), (
+        "compute_sigma_c_ppm_omega_grid no longer expands its route-bearing "
+        "common_branch_kwargs into _run_sigma_branch")

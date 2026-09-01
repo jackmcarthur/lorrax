@@ -280,7 +280,8 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                          nk_tot: int, *, layout: str = "legacy",
-                         face_shape=None):
+                         face_shape=None,
+                         distrib_la_batched_route: str = "auto"):
     """Cached factory returning the SX/COH kernels.
 
     Keyed on (id(mesh_xy), kgrid, ffi_dial_key(), layout, face_shape) —
@@ -311,7 +312,7 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # thrown away anyway.
     from ffi import ffi_dial_key
     cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
-                layout, face_shape)
+                layout, face_shape, str(distrib_la_batched_route))
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
@@ -319,7 +320,9 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     if layout == "legacy":
         kernels = _make_cohsex_kernels_legacy(_convolve)
     else:
-        kernels = _make_cohsex_kernels_face(mesh_xy, face_shape, _convolve)
+        kernels = _make_cohsex_kernels_face(
+            mesh_xy, face_shape, _convolve,
+            distrib_la_batched_route=distrib_la_batched_route)
 
     _cohsex_kernel_cache[cache_key] = kernels
     return kernels
@@ -369,7 +372,10 @@ def _make_cohsex_kernels_legacy(_convolve):
     return sigma_sx, sigma_coh
 
 
-def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve):
+def _make_cohsex_kernels_face(
+    mesh_xy: Mesh, face_shape, _convolve, *,
+    distrib_la_batched_route: str = "auto",
+):
     """Face-layout kernel bodies.
 
     G and Σ-projection route through the two owning modules'
@@ -398,9 +404,11 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve):
     mu_s = n_rmu * ns
 
     g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
-                       dtype=jnp.complex128)
+                       dtype=jnp.complex128,
+                       batched_route=distrib_la_batched_route)
     proj_fn = contract_bands_block_reshard(
-        mesh_xy, layout="face", face_shape=face_shape)
+        mesh_xy, layout="face", face_shape=face_shape,
+        distrib_la_batched_route=distrib_la_batched_route)
 
     @jax.jit
     def sigma_sx(wfns, Gij, W_q, *, wfns_g=None):
@@ -535,6 +543,7 @@ def compute_cohsex_sigma(
     wfns_transverse=None,
     bispinor_v_q_path=None,
     occupation_state=None,
+    distrib_la_batched_route: str = "auto",
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
 
@@ -584,7 +593,9 @@ def compute_cohsex_sigma(
     kgrid = meta.kgrid
     nk_tot = int(meta.nk_tot)
     sigma_sx_k, sigma_coh_k = _make_cohsex_kernels(
-        mesh_xy, kgrid, nk_tot, **_face_kwargs(wfns))
+        mesh_xy, kgrid, nk_tot,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_face_kwargs(wfns))
 
     with mesh_xy:
         sig_sx  = sigma_sx_k(wfns, Gij, W_q)
@@ -662,6 +673,7 @@ def compute_cohsex_sigma(
                     Gij=Gij,
                     bispinor_v_q_path=bispinor_v_q_path,
                     meta=meta, mesh_xy=mesh_xy,
+                    distrib_la_batched_route=distrib_la_batched_route,
                 )
             sig_x_b.block_until_ready()
             sig_x = sig_x + sig_x_b
@@ -685,6 +697,7 @@ def compute_sigma_x(
     wfns_transverse=None,
     bispinor_v_q_path=None,
     occupation_state=None,
+    distrib_la_batched_route: str = "auto",
 )-> jax.Array:
     """Bare-exchange-only path for modes without static screening.
 
@@ -708,7 +721,9 @@ def compute_sigma_x(
     """
     Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _ = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
+        mesh_xy, meta.kgrid, int(meta.nk_tot),
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_face_kwargs(wfns))
     with mesh_xy:
         sig_x = sigma_sx_k(wfns, Gij, V_q)
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
@@ -737,6 +752,7 @@ def compute_sigma_x(
                 Gij=Gij,
                 bispinor_v_q_path=bispinor_v_q_path,
                 meta=meta, mesh_xy=mesh_xy,
+                distrib_la_batched_route=distrib_la_batched_route,
             )
         sig_x_b.block_until_ready()
         sig_x = sig_x + sig_x_b

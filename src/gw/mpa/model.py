@@ -377,6 +377,8 @@ def _evaluate_samples(
     # no longer contain.  Same key, same default and same predicate as the
     # Sigma planner's band window (gw.efermi.occupation_weight_floor).
     occ_window = float(config.mpa.occupation_window_threshold)
+    batched_route = getattr(
+        config.backend, "distrib_la_batched_route", "auto")
     if metal:
         delta_max = occupation_support_bandwidth(
             wfns.enk, occupation_state.f_kn,
@@ -391,7 +393,8 @@ def _evaluate_samples(
                         target_error=config.minimax_config.target_error,
                         max_nodes=config.minimax_config.max_nodes))
             chi = compute_chi0(
-                wfns, used, meta, mesh_xy, energy_reference=energy_reference)
+                wfns, used, meta, mesh_xy, energy_reference=energy_reference,
+                distrib_la_batched_route=batched_route)
             if (
                 point["character"] == "static"
                 and static_gamma_override is not None
@@ -423,7 +426,8 @@ def _evaluate_samples(
                 meta, mesh_xy,
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
-                occupation_window_threshold=occ_window)
+                occupation_window_threshold=occ_window,
+                distrib_la_batched_route=batched_route)
             write_full(point, chi)
 
     for varpi_i, points in routes["lines"]:
@@ -443,7 +447,8 @@ def _evaluate_samples(
                 wfns, t, h, z, meta, mesh_xy,
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
-                occupation_window_threshold=occ_window)
+                occupation_window_threshold=occ_window,
+                distrib_la_batched_route=batched_route)
         else:
             tau = np.concatenate((1j * t, -1j * t))
             signs = np.concatenate((np.ones(t.size, np.int8),
@@ -452,7 +457,8 @@ def _evaluate_samples(
                 np.concatenate((1j * h, -1j * h)), (z.size, 2 * t.size))
             values = compute_chi0_contour(
                 wfns, tau, weights, signs, z, meta, mesh_xy,
-                energy_reference=energy_reference)
+                energy_reference=energy_reference,
+                distrib_la_batched_route=batched_route)
         values = (values,) if z.size == 1 else values
         for point, chi in zip(points, values):
             write_full(point, chi)

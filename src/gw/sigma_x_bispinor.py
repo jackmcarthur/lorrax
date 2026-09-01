@@ -97,6 +97,7 @@ def compute_sigma_x_bispinor(
     mesh_xy: Mesh,
     print_fn=print,
     verbose: bool = True,
+    distrib_la_batched_route: str = "auto",
 ) -> jax.Array:
     """Compute Σ^B (transverse-only bispinor bare exchange).
 
@@ -159,7 +160,9 @@ def compute_sigma_x_bispinor(
     # for a face-layout wfns_transverse rather than only ever working on
     # the legacy carrier.
     sigma_sx_k, _ = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, nk_tot, **face_kernel_kwargs(wfns_transverse))
+        mesh_xy, meta.kgrid, nk_tot,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **face_kernel_kwargs(wfns_transverse))
 
     # Instrumented psi inventory disclosure (report §7's "disclose the
     # selected layout"): the transverse-centroid bundle DOUBLES whichever

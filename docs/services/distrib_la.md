@@ -199,7 +199,7 @@ hang documented at the top applies to the dilation extent 2n as well.
 | `dispatch_batched_eigh(A, mesh, backend, *, batched_route='auto')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='auto')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. Unlike `plan`, `backend='auto'` selects a distributed provider. |
 | `resolve_matmul_backend(requested, mesh, *, batched_route='auto') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
-| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe: safe inside a caller's own `jax.jit`/`lax.scan`. |
+| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', batched_route='auto', max_batch_reshard_local_operand_bytes=None, alpha=1, beta=0) -> GemmPlan` | Prepare one fixed N,N GEMM shape once — the `matmul` analogue of `plan_polar_factor`. Provider routes resolve/probe/warm; cuBLASMp also compiles exact shapes at construction. The staged route warms cliques and compiles on first real-shape call. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe inside a caller's own `jax.jit`/`lax.scan`. |
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
@@ -428,7 +428,7 @@ rank-divergent `INVALID_VALUE` and deadlock. Both are refused before the
 provider call; pretranspose into the ordinary face layout, select PBLAS/SLATE,
 or use the staged route.
 
-## Planned GEMM — a trace-safe cuBLASMp N,N call for hot loops
+## Planned GEMM — trace-safe provider or staged N,N GEMM for hot loops
 
 `matmul()` resolves its provider and probes capability at every call. That
 is correct for an eager call site, but a caller that runs G construction
@@ -442,9 +442,10 @@ precedent for driving an FFI call from inside a composed, jitted kernel.
 
 ```python
 plan = distrib_la.gemm_plan(
-    mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, backend='auto')
-# ... hoisted out of the k/tau loop; by here the provider context
-# exists and both kernel variants have already run once on dummy data ...
+    mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, backend='auto',
+    batched_route=run_wide_route)
+# ... hoisted out of the k/tau loop; provider context or staged-collective
+# cliques are ready before the first call ...
 D = plan(A, B)                 # inside jit/scan: no dlopen, no probe
 ```
 
@@ -461,28 +462,30 @@ Deliberately narrower than `matmul()`:
   batch — flatten it into m/k/n, or call the SAME plan `ns` times in a
   small, statically unrolled Python loop. `nq=1` is a legal,
   zero-overhead rank-2-equivalent plan.
-* **cuBLASMp or ScaLAPACK** — both reuse their backend's canonical compiled
-  GEMM builder. The ScaLAPACK handler is a thin `pdgemm`/`pzgemm` wrapper;
-  PBLAS owns communication. SLATE remains refused by name.
-* **Provider route only** — `backend='off'` refuses by name.
-  `batch_reshard` materializes complete A, B, C and D on every device; the
-  reason to reach for a *planned* GEMM at all is a G/Sigma-sized operand
-  that must never be that, so this surface never selects it.
+* **One route dial** — `batched_route='auto'` uses cuBLASMp or ScaLAPACK and
+  reuses that backend's canonical compiled GEMM builder. Explicit
+  `'batch_reshard'` reuses `matmul()`'s one face-to-batch exchange/local-JAX-
+  GEMM/inverse-exchange implementation; it is not a second GEMM engine.
+  `backend='off'` is legal only for this provider-free staged route.
+* **Exact staged storage floor** — construction reports
+  `ceil(nq/P) * (m*k + k*n + m*n [+ m*n iff beta != 0]) * itemsize`
+  bytes/rank. An optional `max_batch_reshard_local_operand_bytes` refuses
+  before provider probing, clique warmup, or JAX allocation. This counts
+  complete local A+B+D(+C) only: caller-live faces, collective temporaries,
+  and native workspace remain additional peak memory.
 
-**Output liveness.** A plan built with `beta=0` (the default, and what
-every G/T/Sigma GEMM in the `low_mem_bands` audit needs) additionally
-compiles a kernel that builds its zero addend with `jnp.zeros` INSIDE the
-same compiled program as the GEMM FFI call, so a repeated call never pays
-`matmul()`'s separate top-level `jax.jit` dispatch for a missing `C`
-(`matmul.py:433-437`) — one compiled program, not two. Passing an existing
-buffer as `out=` skips the internal zero-fill entirely and donates that
-buffer's storage to the provider instead, for a caller threading a scratch
-accumulator through a `lax.scan` carry. Neither path removes cuBLASMp's own
-requirement of a live `C` argument: the FFI handler binds it unconditionally
-(`src/ffi/cpp/cublasmp/batched_gemm_ffi.cc`, `.Arg<AnyBuffer>() // C`), so
-there is no provider-level "no C at all" mode — what this surface removes
-is the extra Python-level allocation and compiled program, not the C++
-argument. State that distinction when reporting the memory win.
+**Output liveness.** On a provider route, `beta=0` additionally compiles a
+kernel that builds its zero addend inside the provider program; `out=` may
+instead donate an existing buffer. cuBLASMp still binds a C++ `C` argument,
+so this removes a Python-level allocation/program, not that FFI operand. On
+the staged route, `beta=0` does not allocate or exchange C, and `out=` is
+refused because the forward/inverse exchanges cannot promise face-buffer
+aliasing. The staged route requests no donation and leaves A/B reusable.
+
+Plan construction compiles/runs exact dummy shapes only for cuBLASMp.
+ScaLAPACK warms one scalar PBLAS context. The staged route synchronously
+warms CPU/MPI x, y, (x,y), and (y,x) cliques on the main thread, then compiles
+on the first real call; it never allocates a production-sized dummy stack.
 
 `out=` is refused on a `beta!=0` plan: `C` and `out` both reach the same
 compiled kernel, and that kernel's `beta` is fixed at *plan construction*,
@@ -492,19 +495,13 @@ buffer's stale content would silently be scaled by `beta` and folded into
 the result. Pass `C=` on such a plan instead, where the accumulate is
 explicit at the call site.
 
-**Verified**, `services/distrib_la/tests/test_distrib_la_matmul_plan.py`
-(emulated CPU mesh — the eager refusal ladder only: `backend='off'`, a
-resolved non-cuBLASMp provider, mesh topology, dtype, malformed shapes;
-real execution cannot be reached without a CUDA mesh) and
-`test_distrib_la_multiproc.py`'s `gemm_plan_cublasmp` CLI cell, on
-Perlmutter, `lx run -G 4 -n 4 ... --mesh 2x2 --only gemm_plan`: numerics
-against `A @ B` (complex128 and float64, relative ~1e-16), called eagerly,
-inside a `jax.jit`, inside a `lax.scan` (the actual per-tau/per-k hot-loop
-shape), through the `beta!=0` accumulate path, through the donated `out=`
-path, and across five repeated calls with fresh operands. `matmul_cublasmp`
-in the same suite (the pre-existing `matmul()` path, unchanged by this
-work) passed on the same real 2x2 mesh in the same run, confirming no
-regression.
+**Verified** in the service tests on an emulated P4 mesh (floor/refusal,
+ragged scan parity/layout, no donation, exact forward/inverse movement) and
+on real P4 CPU/MPI: complex128 nested JIT+scan residual `3.68e-16`, exact
+reported floor, repeatability, and reusable inputs. The unchanged ScaLAPACK
+control passed eager/JIT/scan/beta/out/repeat with worst residual about
+`2.08e-16`. The existing real-P4 CUDA `gemm_plan_cublasmp` cell continues to
+cover the provider path, including `beta!=0` and donated `out=`.
 
 ## Tests
 

@@ -67,8 +67,11 @@ if os.path.join(_REPO, "src") not in sys.path:
     sys.path.insert(0, os.path.join(_REPO, "src"))
 
 if __name__ == "__main__":
+    from lxkit.gate import platform_from_env
     from runtime import initialize_communicator_stack
-    _RUNTIME = initialize_communicator_stack(platform="gpu")
+    _platform = platform_from_env()
+    _RUNTIME = initialize_communicator_stack(
+        platform="gpu" if _platform == "CUDA" else "cpu")
 
 import numpy as np                                              # noqa: E402
 
@@ -324,7 +327,7 @@ def check_sigma_sx_chain_face_matches_legacy(
 
 def check_four_current_ordered_pair_all16(
         mesh, dtype="complex128", *, nk=3, nb=4, n_c=6, n_t=8,
-        spin_pair_stream=None):
+        spin_pair_stream=None, distrib_la_batched_route="auto"):
     """Discriminate AB/BA, q/-q, and rectangular CT/TC orientations."""
     import jax
     from types import SimpleNamespace
@@ -372,7 +375,8 @@ def check_four_current_ordered_pair_all16(
             got = _gather(w_isdf.compute_no_pair_dirac_current_block(
                 families[A], families[B], quad, meta, mesh,
                 vertex_left=A, vertex_right=B,
-                spin_pair_stream=spin_pair_stream))
+                spin_pair_stream=spin_pair_stream,
+                distrib_la_batched_route=distrib_la_batched_route))
             want = np.zeros(
                 (nk, extents[A], extents[B]), dtype=np.complex128)
             for q in range(nk):
@@ -431,9 +435,11 @@ def check_four_current_ordered_pair_all16(
     cc_distinct = _gather(w_isdf.compute_no_pair_dirac_current_block(
         wfns_c, wfns_c_clone, quad, meta, mesh,
         vertex_left=0, vertex_right=0,
-        spin_pair_stream=spin_pair_stream))
+        spin_pair_stream=spin_pair_stream,
+        distrib_la_batched_route=distrib_la_batched_route))
     cc_charge = _gather(w_isdf.compute_chi0(
-        wfns_c, quad, meta, mesh))
+        wfns_c, quad, meta, mesh,
+        distrib_la_batched_route=distrib_la_batched_route))
     cc_rel = _rel(cc_distinct, cc_charge)
     if spin_pair_stream:
         assert cc_rel < RTOL, (
@@ -471,7 +477,10 @@ _CLI_CELLS = (
         check_four_current_ordered_pair_all16),
        ("four_current_spin_pair_stream_all16",
         (lambda mesh, dt: check_four_current_ordered_pair_all16(
-            mesh, dt, spin_pair_stream=True)))]
+            mesh, dt, spin_pair_stream=True))),
+       ("four_current_batch_reshard_all16",
+        (lambda mesh, dt: check_four_current_ordered_pair_all16(
+            mesh, dt, distrib_la_batched_route="batch_reshard")))]
 )
 
 

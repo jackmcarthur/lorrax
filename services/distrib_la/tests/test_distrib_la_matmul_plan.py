@@ -60,11 +60,123 @@ def test_validate_dtype_only_f64_c128():
 # Eager construction-time refusals, reachable on an emulated CPU mesh.
 # ---------------------------------------------------------------------------
 
-def test_backend_off_refuses_by_name():
+def test_backend_off_without_explicit_staged_route_refuses_by_name():
     mesh = _mesh()
-    with pytest.raises(ValueError, match="never selects batch_reshard"):
+    with pytest.raises((ValueError, RuntimeError), match="batch_reshard"):
         D.gemm_plan(mesh, m=4, k=4, n=4, nq=2, dtype="complex128",
                    backend="off")
+
+
+def _batch_reshard_local_operand_floor(*, mesh, m, k, n, nq, dtype,
+                                       beta):
+    """Independent oracle for the documented post-exchange local floor."""
+    local_nq = (nq + int(mesh.size) - 1) // int(mesh.size)
+    matrices = m * k + k * n + m * n
+    if beta != 0:
+        matrices += m * n
+    return local_nq * matrices * np.dtype(dtype).itemsize
+
+
+@pytest.mark.parametrize("dtype", ["float64", "complex128"])
+def test_batch_reshard_plan_reports_exact_local_operand_floor(dtype):
+    """The estimate is only the unavoidable local A+B+D(+C) storage.
+
+    It deliberately excludes caller-live faces, exchange temporaries and
+    native-workspace guesses, so it remains an exact, stable planning floor.
+    """
+    mesh = _mesh()
+    shape = dict(m=8, k=12, n=16, nq=5)
+    floor0 = _batch_reshard_local_operand_floor(
+        mesh=mesh, dtype=dtype, beta=0, **shape)
+    floor1 = _batch_reshard_local_operand_floor(
+        mesh=mesh, dtype=dtype, beta=1, **shape)
+
+    p0 = D.gemm_plan(
+        mesh, dtype=dtype, backend="off", beta=0,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+        max_batch_reshard_local_operand_bytes=floor0,
+        **shape)
+    p1 = D.gemm_plan(
+        mesh, dtype=dtype, backend="off", beta=1,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+        max_batch_reshard_local_operand_bytes=floor1,
+        **shape)
+
+    assert p0.batched_route == D.ROUTE_BATCH_RESHARD
+    assert p1.batched_route == D.ROUTE_BATCH_RESHARD
+    assert p0.batch_reshard_local_operand_bytes == floor0
+    assert p1.batch_reshard_local_operand_bytes == floor1
+    assert floor1 - floor0 == (
+        ((shape["nq"] + mesh.size - 1) // mesh.size)
+        * shape["m"] * shape["n"] * np.dtype(dtype).itemsize)
+    assert "batch_reshard" in p0.describe()
+
+
+def test_batch_reshard_plan_refuses_below_floor_before_building_kernel(
+        monkeypatch):
+    """A doomed shape is rejected eagerly, before compiling/exchanging."""
+    import importlib
+
+    mesh = _mesh()
+    shape = dict(m=8, k=12, n=16, nq=5)
+    floor = _batch_reshard_local_operand_floor(
+        mesh=mesh, dtype="complex128", beta=0, **shape)
+    calls = []
+
+    def forbidden_builder(*args, **kwargs):
+        calls.append((args, kwargs))
+        pytest.fail("batch-reshard kernel built before memory refusal")
+
+    matmul_mod = importlib.import_module("distrib_la.matmul")
+    plan_mod = importlib.import_module("distrib_la.matmul_plan")
+    monkeypatch.setattr(
+        matmul_mod, "_get_batch_reshard_matmul_fn", forbidden_builder)
+    # Accommodate either a module-level import or a local module lookup while
+    # requiring both implementation styles to refuse before the builder.
+    monkeypatch.setattr(
+        plan_mod, "_get_batch_reshard_matmul_fn", forbidden_builder,
+        raising=False)
+
+    with pytest.raises(
+            (ValueError, MemoryError),
+            match="max_batch_reshard_local_operand_bytes|local operand"):
+        D.gemm_plan(
+            mesh, dtype="complex128", backend="off", beta=0,
+            batched_route=D.ROUTE_BATCH_RESHARD,
+            max_batch_reshard_local_operand_bytes=floor - 1,
+            **shape)
+    assert calls == []
+
+
+def test_batch_reshard_plan_warms_cliques_before_building_kernel(monkeypatch):
+    """The first traced call must not create CPU/MPI cliques on a worker."""
+    import importlib
+
+    mesh = _mesh()
+    events = []
+    collectives = importlib.import_module("distrib_la._collectives")
+    plan_mod = importlib.import_module("distrib_la.matmul_plan")
+
+    monkeypatch.setattr(
+        collectives, "warm_mesh_cliques",
+        lambda got: events.append(("warm", got)))
+    monkeypatch.setattr(
+        plan_mod, "_get_batch_reshard_matmul_fn",
+        lambda **kwargs: events.append(("build", kwargs["mesh"]))
+        or (lambda *args: args[0]))
+
+    plan_mod.gemm_plan(
+        mesh, m=8, k=12, n=16, nq=5, dtype="complex128",
+        backend="off", batched_route=D.ROUTE_BATCH_RESHARD)
+    assert events == [("warm", mesh), ("build", mesh)]
+
+
+def test_gemm_plan_rejects_unknown_batched_route():
+    mesh = _mesh()
+    with pytest.raises(ValueError, match="auto\\|batch_reshard"):
+        D.gemm_plan(
+            mesh, m=4, k=4, n=4, nq=2, dtype="complex128",
+            backend="off", batched_route="reshard-ish")
 
 
 def test_cpu_provider_requires_one_process_per_mesh_cell():
@@ -253,5 +365,6 @@ def test_scalapack_local_call_refuses_by_name():
     plan = _fake_plan(mesh, beta=0.0, backend="scalapack")
     A = _sharded(mesh, 0, (1, 2, 2))
     B = _sharded(mesh, 0, (1, 2, 2))
-    with pytest.raises(NotImplementedError, match="only for cuBLASMp"):
+    with pytest.raises(
+            NotImplementedError, match="only for (?:the provider )?cuBLASMp"):
         plan.local_call(A, B)

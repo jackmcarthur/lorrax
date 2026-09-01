@@ -307,10 +307,11 @@ FaceProjectShape = tuple
 
 
 def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
-                         channels: str = "none", right_face_shape=None):
-    """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
-    no psum_scatter — cuBLASMp's own distributed algorithm does the
-    reduction the legacy body does by hand.  See the module docstring's
+                         channels: str = "none", right_face_shape=None,
+                         distrib_la_batched_route: str = "auto"):
+    """The face-layout Σ projector: TWO planned N,N GEMMs, no driver-local
+    shard_map or psum_scatter — the selected distrib_la provider or staged
+    route performs the reduction the legacy body does by hand. See the module docstring's
     face-layout section and reports/gwjax_low_mem_bands_audit_2026-08-22/
     report.md §5 ("Sigma = conj(psi_nmu) @ (O @ psi_mun)").
 
@@ -337,7 +338,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
     ``(S_R, S_I)`` — both complex (ψ is complex even though the channel
     weight is real).  No f64-split de-promotion trick here: that lever
     exists on the legacy XLA-einsum body to dodge XLA's real-operand
-    promotion inside a mixed-dtype ``jnp.dot``; a planned cuBLASMp GEMM
+    promotion inside a mixed-dtype ``jnp.dot``; a planned distrib_la GEMM
     is typed ``complex128`` at construction regardless of the operand's
     algebraic content, so there is nothing to de-promote — running the
     SAME complex chain twice (once per channel) is already the minimal
@@ -362,9 +363,11 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
     mu_s_left = n_rmu_left * ns
     mu_s_right = n_rmu_right * ns
     plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_full, nq=nk,
-                      dtype=jnp.complex128)
+                      dtype=jnp.complex128,
+                      batched_route=distrib_la_batched_route)
     plan2 = gemm_plan(mesh_xy, m=nb_full, k=mu_s_left, n=nb_full, nq=nk,
-                      dtype=jnp.complex128)
+                      dtype=jnp.complex128,
+                      batched_route=distrib_la_batched_route)
 
     def _check(psi_nmu, O, psi_mun):
         if psi_nmu.ndim != 4 or psi_mun.ndim != 4 or O.ndim != 5:
@@ -429,6 +432,7 @@ def contract_bands_block_reshard(
     layout: str = "legacy",
     face_shape=None,
     right_face_shape=None,
+    distrib_la_batched_route: str = "auto",
 ) -> Callable:
     """Build the band projection + reshard primitive (module docstring).
 
@@ -529,7 +533,8 @@ def contract_bands_block_reshard(
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
         return _face_project_kernel(
             mesh_xy, face_shape, axes, channels=channels,
-            right_face_shape=right_face_shape)
+            right_face_shape=right_face_shape,
+            distrib_la_batched_route=distrib_la_batched_route)
 
     from common.shard_map import shard_map
 

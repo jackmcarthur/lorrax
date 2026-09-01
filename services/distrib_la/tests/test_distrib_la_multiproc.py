@@ -850,6 +850,69 @@ def check_gemm_plan_scalapack(mesh, dtype="complex128", *,
     return out
 
 
+def check_gemm_plan_batch_reshard(mesh, dtype="complex128"):
+    """Real-MPI proof for planned staged GEMM inside ``jit`` + ``scan``.
+
+    The provider-free spelling isolates the x/y collectives and local GEMM
+    from any ScaLAPACK/cuBLASMp capability.  A ragged leading batch proves
+    padding, the scan proves the production composition, and reading A/B
+    again proves the staged route made no donation promise.
+    """
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    ptotal = px * py
+    nq = ptotal + 1
+    m, k, n, nsteps = 4 * px, 6 * px * py, 5 * py, 3
+    rng = np.random.default_rng(20260903)
+    A_np = _rng_mat(rng, (nsteps, nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nsteps, nq, k, n), dtype)
+    A = _put(A_np, mesh, (None, None, "x", "y"))
+    B = _put(B_np, mesh, (None, None, "x", "y"))
+    itemsize = np.dtype(dtype).itemsize
+    floor = ((nq + ptotal - 1) // ptotal
+             * (m * k + k * n + m * n) * itemsize)
+    plan = D.gemm_plan(
+        mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, backend="off",
+        batched_route=D.ROUTE_BATCH_RESHARD,
+        max_batch_reshard_local_operand_bytes=floor)
+    assert plan.backend == "off"
+    assert plan.batched_route == D.ROUTE_BATCH_RESHARD
+    assert plan.batch_reshard_local_operand_bytes == floor
+
+    @jax.jit
+    def _scanned(a_stack, b_stack):
+        def _body(carry, operands):
+            return carry, plan(operands[0], operands[1])
+        return jax.lax.scan(_body, None, (a_stack, b_stack), unroll=1)[1]
+
+    got_j = _scanned(A, B)
+    assert got_j.sharding.spec == P(None, None, "x", "y")
+    scan_rel = _rel(_gather(got_j), A_np @ B_np)
+    assert scan_rel < RTOL, scan_rel
+
+    # No A/B donation: both stacks remain readable and reusable after the
+    # collective/local/inverse schedule has completed.
+    a_rel = _rel(_gather(A), A_np)
+    b_rel = _rel(_gather(B), B_np)
+    assert a_rel == 0.0 and b_rel == 0.0, (a_rel, b_rel)
+    repeat_rel = _rel(_gather(_scanned(A, B)), A_np @ B_np)
+    assert repeat_rel < RTOL, repeat_rel
+
+    scratch = _put(
+        np.zeros((nq, m, n), dtype=dtype), mesh,
+        (None, "x", "y"))
+    with _raises(ValueError, "out= is unavailable"):
+        plan(A[0], B[0], out=scratch)
+    return {
+        "scan_residual": scan_rel,
+        "repeat_residual": repeat_rel,
+        "local_operand_floor_bytes": floor,
+        "inputs_preserved": True,
+    }
+
+
 def check_scalapack_gemm_hardening(mesh, dtype="complex128"):
     """One decisive P4 PBLAS cell: auto, padding, transpose, and aliasing.
 
@@ -1332,6 +1395,8 @@ _CLI_CELLS = [
     ("gemm_plan_scalapack_auto", "cpu",
      lambda mesh, dt: check_gemm_plan_scalapack(
          mesh, dt, backend="auto")),
+    ("gemm_plan_batch_reshard", "",
+     lambda mesh, dt: check_gemm_plan_batch_reshard(mesh, dt)),
     ("scalapack_gemm_hardening", "cpu",
      lambda mesh, dt: check_scalapack_gemm_hardening(mesh, dt)),
     ("gemm_plan_manual_shard_map", "CUDA",

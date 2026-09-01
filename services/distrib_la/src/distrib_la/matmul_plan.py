@@ -16,8 +16,11 @@ TRACE-SAFE closure built from its result.
 — the one existing precedent in this package for driving an FFI call from
 inside a composed, jitted kernel: shape/mesh/backend are fixed and resolved
 EAGERLY, and the returned :class:`GemmPlan` is called with only
-static-shape/dtype/layout checks (safe on a tracer) plus a pre-built,
-pre-compiled ``jax.jit`` executable.
+static-shape/dtype/layout checks (safe on a tracer) plus a pre-built
+``jax.jit`` closure.  cuBLASMp compiles and executes its exact-shape
+variants during construction; ScaLAPACK warms a scalar PBLAS context; the
+staged route warms its MPI cliques on the main thread and compiles on the
+first real-shape call, avoiding a second production-sized dummy allocation.
 
 Contract, deliberately narrower than :func:`distrib_la.matmul`:
 
@@ -42,34 +45,33 @@ Contract, deliberately narrower than :func:`distrib_la.matmul`:
   itself — cuBLASMp's own per-slice loop makes ``nq=1`` a legitimate,
   zero-overhead special case, the same way ``distrib_la.matmul`` lifts
   rank-2 internally (``matmul.py:402-406,438``).
-* **cuBLASMp or ScaLAPACK.**  Provider resolution and capability probing are
-  exactly those of :func:`distrib_la.matmul`.  The ScaLAPACK route reuses
-  :mod:`distrib_la._scalapack`'s PBLAS descriptor/FFI/cache builder; this
-  module does not duplicate provider code.  SLATE remains refused by name.
-* **Provider route only.**  ``batch_reshard`` materializes complete A, B,
-  C and D on every device (``matmul.py:377-384``); the whole reason a
-  caller reaches for a *planned* GEMM is a G/Sigma-sized object that must
-  never be that.  :func:`gemm_plan` refuses ``backend='off'`` by name —
-  the only spelling that would otherwise select the staged route.
+* **Provider or staged execution.**  Provider resolution and capability
+  probing are exactly those of :func:`distrib_la.matmul`.  The automatic
+  provider route supports cuBLASMp and ScaLAPACK; its PBLAS branch reuses
+  :mod:`distrib_la._scalapack`'s descriptor/FFI/cache builder.  The staged
+  route is provider-independent after the requested capability probe, so it
+  also works with a probed SLATE request or ``backend='off'`` without adding a
+  SLATE GEMM implementation here.
+* **One route dial.**  ``batched_route='auto'`` keeps the resolved
+  cuBLASMp/PBLAS provider path.  ``'batch_reshard'`` reuses
+  :func:`distrib_la.matmul`'s one staged face-to-batch implementation:
+  each rank owns only ``ceil(nq/P)`` complete matrices, runs local JAX
+  GEMM, then applies the inverse exchanges.  Plan construction reports the
+  exact local A+B+D (+C when ``beta != 0``) whole-matrix byte floor and may
+  refuse it against a caller-supplied cap before provider probing or JAX
+  allocation.  That floor deliberately excludes the caller-live faces,
+  collective temporaries, and native-kernel workspace; it is a lower bound,
+  not a peak-memory prediction.
 
-Output liveness.  A plan built with ``beta=0`` (the default) compiles a
-SECOND warmed kernel that builds its zero addend with ``jnp.zeros`` INSIDE
-the same compiled program as the GEMM FFI call, so a repeated call never
-pays a separate top-level ``jax.jit`` dispatch — the pattern
-``distrib_la.matmul`` uses when ``C`` is omitted (``matmul.py:433-437``) —
-or an allocation that has to exist as its own executable's output before
-the provider's own call even starts.  Passing an existing buffer as
-``out=`` skips that internal zero-fill entirely and donates the buffer's
-storage to the provider instead — the shape a caller threading a scratch
-accumulator through a ``lax.scan`` carry wants.  Neither path removes the
-C++ handler's own requirement of a live ``C`` argument: cuBLASMp's
-batched-GEMM FFI binds ``C`` as a required buffer unconditionally
-(``src/ffi/cpp/cublasmp/batched_gemm_ffi.cc``, ``.Arg<AnyBuffer>() // C``),
-so there is no PROVIDER-level "no C at all" mode to expose without an FFI
-signature change, which is out of this module's scope.  What this module
-removes is the extra Python-level allocation and the extra compiled
-program, not the C++ argument — state that distinction when reporting the
-memory win, rather than claiming a C-less FFI call.
+Output liveness.  On the provider route, a plan built with ``beta=0`` (the
+default) compiles a SECOND warmed kernel that builds its zero addend inside
+the same compiled program as the GEMM FFI call.  Passing an existing buffer
+as ``out=`` skips that internal zero-fill and donates the buffer to the
+provider.  cuBLASMp still binds a live C++ ``C`` argument unconditionally;
+this removes a separate Python allocation/program, not that FFI operand.
+On the staged route, ``beta=0`` exchanges no C at all and ``out=`` is
+refused: forward/inverse exchanges prevent a face-input/output aliasing
+promise, and the route deliberately requests no donation.
 
 Communication, not layout, is this surface's dominant cost per call at
 multi-node scale — measured 2026-08-22 (``gw.greens_function_kernel``'s
@@ -156,8 +158,15 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._shard_map import shard_map
-from distrib_la.matmul import (_OP_CODE, _TARGETS, _mesh_shape, _zeros,
-                               resolve_matmul_backend)
+from distrib_la.matmul import (
+    _OP_CODE,
+    _TARGETS,
+    _get_batch_reshard_matmul_fn,
+    _mesh_shape,
+    _zeros,
+    resolve_matmul_backend,
+)
+from distrib_la.plan import BATCHED_ROUTE_CHOICES, ROUTE_BATCH_RESHARD
 
 __all__ = ["GemmPlan", "gemm_plan"]
 
@@ -186,6 +195,41 @@ def _as_scalar(label: str, value) -> complex:
         raise ValueError(
             f"gemm_plan: {label} must be a real or complex scalar, "
             f"got {value!r}") from exc
+
+
+def _as_nonnegative_bytes(label: str, value) -> int:
+    if isinstance(value, bool):
+        raise ValueError(
+            f"gemm_plan: {label} must be a nonnegative integer, got "
+            f"{value!r}")
+    try:
+        out = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(
+            f"gemm_plan: {label} must be a nonnegative integer, got "
+            f"{value!r}") from exc
+    if out < 0:
+        raise ValueError(
+            f"gemm_plan: {label} must be nonnegative, got {out}")
+    return int(out)
+
+
+def _batch_reshard_local_operand_bytes(
+    *, nq: int, m: int, k: int, n: int, ptotal: int, dtype, with_c: bool,
+) -> int:
+    """Exact local whole-matrix operand floor after face-to-batch exchange.
+
+    A rank receives ``ceil(nq/P)`` complete matrices, including synthetic
+    leading-batch padding.  Count A, B, D, and C only when it is
+    mathematically live (``beta != 0``).  Caller-live face arrays,
+    collective temporaries, and native GEMM workspace are intentionally not
+    included, so this is a refusal floor rather than a peak estimator.
+    """
+    local_batch = (int(nq) + int(ptotal) - 1) // int(ptotal)
+    elements = local_batch * (m * k + k * n + m * n)
+    if with_c:
+        elements += local_batch * m * n
+    return int(elements * jnp.dtype(dtype).itemsize)
 
 
 def _validate_dtype(dtype) -> None:
@@ -328,16 +372,15 @@ def _check_operand(plan: "GemmPlan", label: str, x, shape: tuple[int, int, int],
 
 @dataclass(frozen=True)
 class GemmPlan:
-    """A resolved, warmed, trace-safe ``D[q] = alpha*A[q]@B[q] (+ beta*C[q])``.
+    """A prepared, trace-safe ``D[q] = alpha*A[q]@B[q] (+ beta*C[q])``.
 
     Construct with :func:`gemm_plan`; never instantiate directly.  Every
-    eager step — mesh/topology refusal, provider resolution and capability
-    probe, the cuBLASMp communicator, and both compiled kernels (the
-    donated-``C`` form, and — when ``beta==0`` — the internal-zero form)
-    — has already run and already executed once on real dummy data by the
-    time :func:`gemm_plan` returns.  Calling the plan touches none of
-    that: shape/dtype/layout checks that read only static metadata, then
-    the pre-built executable.
+    eager step — mesh/topology refusal, optional provider resolution and
+    capability probe, and route-specific communicator/clique warmup — has
+    completed when :func:`gemm_plan` returns. cuBLASMp's exact-shape kernels
+    have also run once; the staged closure compiles on its first real call to
+    avoid production-sized dummy operands. Calling the plan performs only
+    static shape/dtype/layout checks and invokes the pre-built closure.
     """
 
     mesh: Mesh
@@ -353,29 +396,37 @@ class GemmPlan:
     in_sharding_b: NamedSharding
     out_sharding: NamedSharding
     ctx_handle: int
-    _fn_with_c: Callable
+    _fn_with_c: Callable | None
     _fn_no_c: Callable | None
+    batched_route: str = "auto"
+    batch_reshard_local_operand_bytes: int | None = None
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what shape."""
         px, py = _mesh_shape(self.mesh)
-        return (f"gemm_plan: {self.backend} N,N on {px}x{py}, "
+        memory = ("" if self.batch_reshard_local_operand_bytes is None else
+                  ", local whole-matrix floor="
+                  f"{self.batch_reshard_local_operand_bytes} B/rank")
+        return (f"gemm_plan: backend={self.backend}, "
+                f"batched_route={self.batched_route} N,N on {px}x{py}, "
                 f"shape (nq={self.nq}, m={self.m}, k={self.k}, n={self.n}), "
-                f"dtype={self.dtype}, alpha={self.alpha}, beta={self.beta}")
+                f"dtype={self.dtype}, alpha={self.alpha}, beta={self.beta}"
+                f"{memory}")
 
     def __call__(self, A, B, C=None, *, out=None):
         """Return ``D``.  Trace-safe: usable inside nested ``jit``/``scan``.
 
         ``C`` (accumulate; required when this plan's ``beta != 0``) and
-        ``out`` (a live buffer DONATED purely for its storage when
-        ``beta == 0`` — its content is ignored) are mutually exclusive.
-        With neither, and ``beta == 0``, the zero addend is built inside
-        the same compiled call — see the module docstring.
+        ``out`` (provider-route-only live buffer DONATED purely for its
+        storage when ``beta == 0`` — its content is ignored) are mutually
+        exclusive. The staged route refuses ``out`` for every beta.
+        With neither, and ``beta == 0``, the provider route builds its zero
+        addend inside the compiled call; the staged route has no C operand.
 
-        ``out=`` is refused on a ``beta != 0`` plan.  Both ``C`` and
-        ``out`` reach the identical compiled ``_fn_with_c`` — the PLAN's
-        own ``beta`` (fixed at construction, not chosen per call) decides
-        whether that buffer's content is mathematically live.  On a
+        On the provider route, ``out=`` is refused on a ``beta != 0`` plan:
+        both ``C`` and ``out`` reach the identical compiled ``_fn_with_c`` —
+        the PLAN's own ``beta`` (fixed at construction, not chosen per call)
+        decides whether that buffer's content is mathematically live.  On a
         ``beta != 0`` plan, ``out=``'s "content is ignored, pure storage"
         contract would silently be false: whatever the buffer happened to
         hold gets scaled by ``beta`` and added into the result.  Refuse
@@ -386,6 +437,18 @@ class GemmPlan:
         """
         if C is not None and out is not None:
             raise ValueError("gemm_plan: pass C or out, not both")
+        if self.batched_route == ROUTE_BATCH_RESHARD and out is not None:
+            raise ValueError(
+                "gemm_plan: out= is unavailable for batched_route="
+                "'batch_reshard': the forward and inverse exchanges prevent "
+                "face-input/output aliasing, so this route never promises "
+                "donation")
+        if (self.batched_route == ROUTE_BATCH_RESHARD
+                and self.beta == 0 and C is not None):
+            raise ValueError(
+                "gemm_plan: omit C when beta==0 with batched_route="
+                "'batch_reshard'; C is mathematically dead and exchanging a "
+                "full extra matrix would violate the route's memory floor")
         if out is not None and self.beta != 0:
             raise ValueError(
                 "gemm_plan: out= is only a content-ignored donation on a "
@@ -405,12 +468,16 @@ class GemmPlan:
                     f"(this plan's beta={self.beta})")
             if self._fn_no_c is None:
                 raise AssertionError(
-                    "gemm_plan: internal-zero kernel was not warmed for a "
+                    "gemm_plan: no-C kernel was not prepared for a "
                     "beta==0 plan; this is a construction bug, not a "
                     "caller error")
             return self._fn_no_c(A, B)
         _check_operand(self, "C/out", c_or_out, (self.nq, self.m, self.n),
                       self.out_sharding)
+        if self._fn_with_c is None:
+            raise AssertionError(
+                "gemm_plan: with-C kernel is unavailable for this route; "
+                "this is a construction bug, not a caller error")
         return self._fn_with_c(A, B, c_or_out)
 
     def local_call(self, A, B, C=None, *, out=None):
@@ -447,11 +514,13 @@ class GemmPlan:
         contract; only the operand SHAPES differ (local tile vs. global
         array).
         """
-        if self.backend != "cublasmp":
+        if (self.batched_route != "auto" or self.backend != "cublasmp"):
             raise NotImplementedError(
-                "gemm_plan.local_call is available only for cuBLASMp; "
-                f"backend {self.backend!r} supports the global __call__ "
-                "path but has no exposed manual-shard-map local body")
+                "gemm_plan.local_call is available only for the provider "
+                "cuBLASMp route; "
+                f"backend={self.backend!r}, "
+                f"batched_route={self.batched_route!r} supports the global "
+                "__call__ path but has no exposed manual-shard-map local body")
         if C is not None and out is not None:
             raise ValueError("gemm_plan.local_call: pass C or out, not both")
         if out is not None and self.beta != 0:
@@ -494,18 +563,20 @@ def gemm_plan(
     nq: int,
     dtype,
     backend: str = "auto",
+    batched_route: str = "auto",
+    max_batch_reshard_local_operand_bytes: int | None = None,
     alpha=1.0,
     beta=0.0,
 ) -> GemmPlan:
-    """Eagerly resolve, probe, warm and COMPILE one N,N GEMM shape, ONCE.
+    """Eagerly resolve and prepare one fixed N,N GEMM shape, once.
 
     Hoist this call out of every per-k/per-tau loop — G build, Sigma
-    projection, Hartree.  By the time this returns, the cuBLASMp
-    communicator exists and both kernel variants (donated-``C``, and —
-    when ``beta==0`` — internal-zero-``C``) are compiled AND HAVE RUN ONCE
-    on real dummy data, so :meth:`GemmPlan.__call__` never dlopens, never
-    probes, never builds a ``jax.jit`` wrapper, and never traces for the
-    first time from inside somebody else's ``lax.scan``.
+    projection, Hartree.  Provider routes resolve and warm their native
+    context here; cuBLASMp also compiles and runs its exact-shape variants.
+    The staged route warms CPU/MPI mesh cliques here but deliberately
+    compiles on its first real-shape call, avoiding production-sized dummy
+    operands.  In every route :meth:`GemmPlan.__call__` never dlopens, never
+    probes, and never builds a new ``jax.jit`` wrapper.
 
     Parameters
     ----------
@@ -533,18 +604,30 @@ def gemm_plan(
         ``float64`` or ``complex128`` — the two dtypes the cuBLASMp
         handler compiles for.
     backend
-        A name from ``distrib_la.MATMUL_BACKEND_CHOICES`` other than
-        ``'off'``.  ``'auto'``/``'distributed'`` resolve to the platform's
-        provider exactly as ``distrib_la.matmul`` does.  ``cublasmp`` and
-        ``scalapack`` are supported; a resolved ``slate`` refuses by name.
+        A name from ``distrib_la.MATMUL_BACKEND_CHOICES``.
+        ``'auto'``/``'distributed'`` resolve to the platform's provider
+        exactly as ``distrib_la.matmul`` does.  ``'off'`` is legal only
+        with ``batched_route='batch_reshard'``.
+    batched_route
+        The same single route dial used by :func:`distrib_la.matmul` and
+        the factor/solve plans.  ``'auto'`` runs the resolved distributed
+        provider.  ``'batch_reshard'`` stages the replicated leading batch
+        over the mesh, runs local JAX GEMM, and reverses the exchanges.
+    max_batch_reshard_local_operand_bytes
+        Optional hard cap for the staged route's exact per-rank
+        whole-matrix A+B+D (+C when ``beta != 0``) floor.  Refusal happens
+        before provider probing or JAX allocation.  The floor excludes
+        caller-live faces, collective temporaries, and native workspace.
+        Refused when ``batched_route='auto'`` so an ignored cap cannot be
+        mistaken for a memory guarantee.
     alpha, beta
         Fixed GEMM scalars, baked into the compiled kernel — cuBLASMp
         takes them as FFI attributes, not array arguments, so they cannot
         vary per call the way ``distrib_la.matmul``'s do.  ``beta=0`` (the
         default, and what every G/T/Sigma GEMM in the low_mem_bands audit
-        needs) additionally compiles the internal-zero-``C`` kernel;
-        ``beta != 0`` compiles only the donated-``C`` kernel, and every
-        call must then supply ``C``.
+        needs) uses the internal-zero-``C`` provider kernel or the C-free
+        staged kernel. ``beta != 0`` requires ``C`` on every route; provider
+        execution donates that buffer, while staged execution does not.
     """
     px, py = _mesh_shape(mesh)
     m = _as_extent("m", m)
@@ -559,17 +642,47 @@ def gemm_plan(
         raise ValueError(
             f"gemm_plan: alpha/beta must be real for real dtype {dtype}")
 
-    requested = str(backend)
-    if requested == "off":
+    requested = str(backend).strip().lower()
+    route = str(batched_route).strip().lower()
+    if route not in BATCHED_ROUTE_CHOICES:
         raise ValueError(
-            "gemm_plan: backend='off' has no provider, and this planned "
-            "surface never selects batch_reshard — it materializes "
-            "complete A/B/C/D on every device, exactly what a planned "
-            "GEMM exists to avoid for a G/Sigma-sized operand.  Use "
-            "distrib_la.matmul(..., batched_route='batch_reshard') "
-            "directly for that route.")
-    resolved = resolve_matmul_backend(requested, mesh, batched_route="auto")
-    if resolved not in ("cublasmp", "scalapack"):
+            "gemm_plan: batched_route must be one of "
+            f"{'|'.join(BATCHED_ROUTE_CHOICES)}, got {route!r}")
+    if route == "auto" and requested == "off":
+        raise ValueError(
+            "gemm_plan: backend='off' has no provider; select "
+            "batched_route='batch_reshard' for the staged/local route")
+    if max_batch_reshard_local_operand_bytes is not None:
+        max_batch_reshard_local_operand_bytes = _as_nonnegative_bytes(
+            "max_batch_reshard_local_operand_bytes",
+            max_batch_reshard_local_operand_bytes)
+        if route != ROUTE_BATCH_RESHARD:
+            raise ValueError(
+                "gemm_plan: max_batch_reshard_local_operand_bytes applies "
+                "only to batched_route='batch_reshard'; refusing an ignored "
+                "memory cap")
+
+    local_operand_bytes = None
+    if route == ROUTE_BATCH_RESHARD:
+        local_operand_bytes = _batch_reshard_local_operand_bytes(
+            nq=nq, m=m, k=k, n=n, ptotal=px * py, dtype=dtype,
+            with_c=beta_c != 0)
+        if (max_batch_reshard_local_operand_bytes is not None
+                and local_operand_bytes
+                > max_batch_reshard_local_operand_bytes):
+            raise MemoryError(
+                "gemm_plan: batch_reshard local whole-matrix operand floor "
+                f"is {local_operand_bytes} B/rank for "
+                f"(nq={nq},m={m},k={k},n={n},dtype={dtype},P={px * py}), "
+                "exceeding max_batch_reshard_local_operand_bytes="
+                f"{max_batch_reshard_local_operand_bytes} B.  This floor "
+                "counts A+B+D (+C iff beta!=0) after exchange and excludes "
+                "caller-live faces, collective temporaries, and native "
+                "workspace.")
+
+    resolved = resolve_matmul_backend(
+        requested, mesh, batched_route=route)
+    if route == "auto" and resolved not in ("cublasmp", "scalapack"):
         raise NotImplementedError(
             f"gemm_plan: backend {requested!r} resolved to {resolved!r}, "
             "which has no warmed kernel in this module.  "
@@ -590,7 +703,27 @@ def gemm_plan(
     in_sharding_b = in_sharding_a
     out_sharding = in_sharding_a
 
-    if resolved == "cublasmp":
+    if route == ROUTE_BATCH_RESHARD:
+        # CPU/MPI must create collective communicators synchronously on the
+        # main thread.  The first plan call commonly sits inside an outer
+        # jit/scan and is therefore too late.  Keep this at the service door,
+        # matching matmul() and Plan.batched(), not in a physics driver.
+        from distrib_la._collectives import warm_mesh_cliques
+        warm_mesh_cliques(mesh)
+        ctx_handle = -1
+        fn_with_c = None
+        fn_no_c = None
+        shapes = dict(
+            mesh=mesh, a_shape=(nq, m, k), b_shape=(nq, k, n),
+            dtype=dtype, alpha=alpha_c, beta=beta_c,
+            transa="N", transb="N")
+        if beta_c == 0:
+            fn_no_c = _get_batch_reshard_matmul_fn(
+                **shapes, c_shape=None)
+        else:
+            fn_with_c = _get_batch_reshard_matmul_fn(
+                **shapes, c_shape=(nq, m, n))
+    elif resolved == "cublasmp":
         from distrib_la._cusolvermp import get_or_init_context
         ctx_handle = get_or_init_context(mesh, col_major=False)
         fn_with_c = jax.jit(
@@ -628,7 +761,7 @@ def gemm_plan(
     # cuBLASMp has shape-dependent descriptors/workspace, so execute both
     # exact shapes eagerly.  PBLAS has neither: its branch above warms one
     # scalar tile per rank and deliberately avoids full dummy A/B/C arrays.
-    if resolved == "cublasmp":
+    if route == "auto" and resolved == "cublasmp":
         jax.block_until_ready(fn_with_c(
             _zeros((nq, m, k), dtype, in_sharding_a),
             _zeros((nq, k, n), dtype, in_sharding_b),
@@ -644,4 +777,6 @@ def gemm_plan(
         alpha=alpha_c, beta=beta_c,
         in_sharding_a=in_sharding_a, in_sharding_b=in_sharding_b,
         out_sharding=out_sharding, ctx_handle=int(ctx_handle),
-        _fn_with_c=fn_with_c, _fn_no_c=fn_no_c)
+        _fn_with_c=fn_with_c, _fn_no_c=fn_no_c,
+        batched_route=route,
+        batch_reshard_local_operand_bytes=local_operand_bytes)

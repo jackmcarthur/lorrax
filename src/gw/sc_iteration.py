@@ -2345,6 +2345,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         efermi=float(efermi_ry),
         mesh_xy=inputs.mesh_xy,
         active_slice=inputs.band_slices.sigma,
+        distrib_la_batched_route=getattr(
+            inputs.config.backend, "distrib_la_batched_route", "auto"),
     )
 
     # (``entry_occ_state`` was solved above, before the tail scissor that

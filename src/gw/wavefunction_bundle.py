@@ -1200,7 +1200,8 @@ def _face_embed_active_U(U_active, *, nb_full: int, a_lo: int, mesh_xy: Mesh):
 
 
 def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
-                        n_rmu: int, ns: int, nk: int):
+                        n_rmu: int, ns: int, nk: int,
+                        distrib_la_batched_route: str = "auto"):
     """One built kernel per ``(mesh, active window, face shape)`` — mirrors
     :func:`_rotate_kernel`'s cache shape, but for the two-face carrier.
 
@@ -1244,16 +1245,19 @@ def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
     from distrib_la import gemm_plan
     from common.contract_bands import merge_spin_centroid, split_spin_centroid
 
-    key = (id(mesh), a_lo, nb_active, nb_full, n_rmu, ns, nk)
+    key = (id(mesh), a_lo, nb_active, nb_full, n_rmu, ns, nk,
+           str(distrib_la_batched_route))
     hit = _FACE_ROTATE_CACHE.get(key)
     if hit is not None:
         return hit
 
     mu_s = n_rmu * ns
     plan_nmu = gemm_plan(mesh, m=nb_full, k=nb_full, n=mu_s, nq=nk,
-                        dtype=jnp.complex128)
+                        dtype=jnp.complex128,
+                        batched_route=distrib_la_batched_route)
     plan_mun = gemm_plan(mesh, m=mu_s, k=nb_full, n=nb_full, nq=nk,
-                        dtype=jnp.complex128)
+                        dtype=jnp.complex128,
+                        batched_route=distrib_la_batched_route)
 
     @jax.jit
     def fn(psi_nmu_full, psi_mun_full, U_active):
@@ -1374,6 +1378,7 @@ def _rotate_wavefunctions_face(
     efermi: float | None,
     mesh_xy: Mesh,
     active_slice: slice | None = None,
+    distrib_la_batched_route: str = "auto",
 ) -> Wavefunctions:
     """``layout='face'`` sibling of :func:`_rotate_wavefunctions_legacy` —
     same validation and the same ``enk``/``occ`` rebuild, but the ψ
@@ -1405,7 +1410,8 @@ def _rotate_wavefunctions_face(
         nk_face, nb_full, n_rmu, ns = fk['face_shape']
         U = _place_U_face(U_dft_to_qp_active, mesh_xy)
         rotate = _face_rotate_kernel(
-            mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
+            mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face,
+            distrib_la_batched_route=distrib_la_batched_route)
         psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
 
         # enk/occ: SAME expression as the legacy sibling (layout-independent
@@ -1444,6 +1450,7 @@ def rotate_wavefunctions(
     efermi: float | None,
     mesh_xy: Mesh,
     active_slice: slice | None = None,
+    distrib_la_batched_route: str = "auto",
 ) -> Wavefunctions:
     """Return a new ``Wavefunctions`` bundle with the **active subspace**
     rotated by ``U_dft_to_qp_active[k, m, n] = ⟨DFT_m | QP_n⟩``.
@@ -1545,17 +1552,19 @@ def rotate_wavefunctions(
         Contiguous active band block.  Defaults to ``wfns_dft.slices.sigma``.
     """
     if wfns_dft.layout == 'legacy':
-        impl = _rotate_wavefunctions_legacy
-    elif wfns_dft.layout == 'face':
-        impl = _rotate_wavefunctions_face
-    else:
+        return _rotate_wavefunctions_legacy(
+            wfns_dft, U_dft_to_qp_active, enk_active_new=enk_active_new,
+            enk_base=enk_base, efermi=efermi, mesh_xy=mesh_xy,
+            active_slice=active_slice)
+    if wfns_dft.layout != 'face':
         raise ValueError(
             f"rotate_wavefunctions: wfns_dft.layout={wfns_dft.layout!r} "
             f"not in ('legacy', 'face').")
-    return impl(
+    return _rotate_wavefunctions_face(
         wfns_dft, U_dft_to_qp_active, enk_active_new=enk_active_new,
         enk_base=enk_base, efermi=efermi, mesh_xy=mesh_xy,
-        active_slice=active_slice)
+        active_slice=active_slice,
+        distrib_la_batched_route=distrib_la_batched_route)
 
 
 # ---------------------------------------------------------------------------
@@ -1567,7 +1576,8 @@ def rotate_wavefunctions(
 # ---------------------------------------------------------------------------
 
 def project(psi_xr, psi_yn, sigma_k, *, layout='legacy', mesh_xy=None,
-           face_shape=None, right_face_shape=None, face_project_fn=None):
+           face_shape=None, right_face_shape=None, face_project_fn=None,
+           distrib_la_batched_route: str = "auto"):
     """Σ(nk, s, μ, s, μ) → Σ(nk, m, n) in band basis.
 
     ``layout='legacy'`` (default): the exact body this function has always
@@ -1605,7 +1615,8 @@ def project(psi_xr, psi_yn, sigma_k, *, layout='legacy', mesh_xy=None,
         from common.contract_bands import contract_bands_block_reshard
         fn = contract_bands_block_reshard(
             mesh_xy, layout='face', face_shape=face_shape,
-            right_face_shape=right_face_shape)
+            right_face_shape=right_face_shape,
+            distrib_la_batched_route=distrib_la_batched_route)
     return fn(psi_xr, sigma_k, psi_yn)
 
 

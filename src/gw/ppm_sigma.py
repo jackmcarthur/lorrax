@@ -84,7 +84,10 @@ from .ppm_accumulators import (
 from .wavefunction_bundle import face_kernel_kwargs
 
 
-def _face_g_plan(mesh_xy: Mesh, face_shape):
+def _face_g_plan(
+    mesh_xy: Mesh, face_shape, *,
+    distrib_la_batched_route: str = "auto",
+):
     """One ``distrib_la.gemm_plan`` for a face-layout G build, at the shape
     ``greens_function_kernel._build_G_face`` requires — mirrors
     ``cohsex_sigma._make_cohsex_kernels_face``'s identical construction
@@ -100,7 +103,8 @@ def _face_g_plan(mesh_xy: Mesh, face_shape):
     nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     mu_s = n_rmu * ns
     return gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
-                     dtype=jnp.complex128)
+                     dtype=jnp.complex128,
+                     batched_route=distrib_la_batched_route)
 
 
 @dataclass(frozen=True)
@@ -941,6 +945,7 @@ def _run_sigma_branch(
     use_shipped_minimax_tables: bool = True,
     packed_coh: tuple[tuple, tuple] | None = None,
     partition_hgl: bool = False,
+    distrib_la_batched_route: str = "auto",
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
 
@@ -1049,6 +1054,7 @@ def _run_sigma_branch(
         brackets=brackets,
         pack_brackets=pack_brackets,
         energy_windows=energy_windows,
+        distrib_la_batched_route=distrib_la_batched_route,
         **face_kwargs,
     )
     # Merged Laplace-plan sibling kernel (the default and only path for
@@ -1061,6 +1067,7 @@ def _run_sigma_branch(
         brackets=brackets,
         pack_brackets=pack_brackets,
         energy_windows=energy_windows,
+        distrib_la_batched_route=distrib_la_batched_route,
         **face_kwargs,
     )
 
@@ -1118,6 +1125,7 @@ def _compute_invalid_static_sigma(
     meta,
     mesh_xy: Mesh,
     occupation_state=None,
+    distrib_la_batched_route: str = "auto",
 ) -> np.ndarray:
     """Static-COHSEX Σ for the invalid PPM poles (BGW ``invalid_gpp_mode=3``).
 
@@ -1164,9 +1172,12 @@ def _compute_invalid_static_sigma(
     Gij = build_Gij(meta, mesh_xy, occupation_state)
     face_kwargs = face_kernel_kwargs(wfns)
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True,
+        distrib_la_batched_route=distrib_la_batched_route, **face_kwargs)
     s = wfns.slices
-    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+    g_plan = (_face_g_plan(
+                 mesh_xy, face_kwargs["face_shape"],
+                 distrib_la_batched_route=distrib_la_batched_route)
              if wfns.layout == "face" else None)
 
     with mesh_xy:
@@ -1228,6 +1239,7 @@ def _invalid_static_coh_by_bracket(
     meta,
     mesh_xy: Mesh,
     brackets,
+    distrib_la_batched_route: str = "auto",
 ) -> np.ndarray:
     """The static-limit term's OWN band-count series, one point per bracket.
 
@@ -1270,9 +1282,12 @@ def _invalid_static_coh_by_bracket(
 
     face_kwargs = face_kernel_kwargs(wfns)
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True,
+        distrib_la_batched_route=distrib_la_batched_route, **face_kwargs)
     s = wfns.slices
-    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+    g_plan = (_face_g_plan(
+                 mesh_xy, face_kwargs["face_shape"],
+                 distrib_la_batched_route=distrib_la_batched_route)
              if wfns.layout == "face" else None)
 
     out = []
@@ -1330,6 +1345,7 @@ def compute_sigma_c_ppm_omega_grid(
     occupation_state=None,
     plan: 'BandBracketPlan | None' = None,
     print_fn=print,
+    distrib_la_batched_route: str = "auto",
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration.
 
@@ -1551,7 +1567,8 @@ def compute_sigma_c_ppm_omega_grid(
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
             wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
-            occupation_state=occupation_state)
+            occupation_state=occupation_state,
+            distrib_la_batched_route=distrib_la_batched_route)
         print_fn(
             "  GN invalid modes → static COHSEX: max|Σ_static| = "
             f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV "
@@ -1565,7 +1582,8 @@ def compute_sigma_c_ppm_omega_grid(
             static_coh_at_counts = np.cumsum(
                 _invalid_static_coh_by_bracket(
                     wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
-                    brackets),
+                    brackets,
+                    distrib_la_batched_route=distrib_la_batched_route),
                 axis=0)
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
@@ -1629,6 +1647,7 @@ def compute_sigma_c_ppm_omega_grid(
         brackets=brackets,
         packed_coh=packed_coh,
         partition_hgl=partition_hgl,
+        distrib_la_batched_route=distrib_la_batched_route,
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.

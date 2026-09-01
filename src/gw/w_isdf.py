@@ -128,7 +128,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             right_face_shape=None,
                             vertex_pair: bool = False,
                             vertex_identity=(False, False),
-                            spin_pair_stream=None):
+                            spin_pair_stream=None,
+                            distrib_la_batched_route: str = "auto"):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
 
     ``n_out`` (static): number of χ outputs accumulated over the SAME τ
@@ -161,6 +162,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # (flat-k FFT service contract, docs/dev/flat_k_fft_service.md).
     from ffi import ffi_dial_key
     complex_contour = bool(complex_contour)
+    distrib_la_batched_route = str(
+        distrib_la_batched_route).strip().lower()
     if layout not in ("legacy", "face"):
         raise ValueError(
             f"_get_chi_minimax_kernel: layout must be 'legacy' or 'face', "
@@ -208,7 +211,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         spin_pair_stream = bool(spin_pair_stream)
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_pair, vertex_identity, spin_pair_stream)
+                 vertex_pair, vertex_identity, spin_pair_stream,
+                 distrib_la_batched_route)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -225,7 +229,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             right_face_shape=right_face_shape,
             vertex_pair=vertex_pair,
             vertex_identity=vertex_identity,
-            spin_pair_stream=spin_pair_stream)
+            spin_pair_stream=spin_pair_stream,
+            distrib_la_batched_route=distrib_la_batched_route)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -443,7 +448,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
                                  vertex_pair=False,
                                  vertex_identity=(False, False),
-                                 spin_pair_stream=False):
+                                 spin_pair_stream=False,
+                                 distrib_la_batched_route="auto"):
     """Face-layout sibling of :func:`_get_chi_minimax_kernel_legacy`.
 
     G construction is the only part that forks (module-level docstring):
@@ -512,7 +518,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     g_spin_extent = 1 if spin_pair_stream else ns
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * g_spin_extent, k=nb_full,
-        n=n_rmu_right * g_spin_extent, nq=nk, dtype=jnp.complex128)
+        n=n_rmu_right * g_spin_extent, nq=nk, dtype=jnp.complex128,
+        batched_route=distrib_la_batched_route)
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
@@ -758,6 +765,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
     *, layout: str = "legacy", face_shape=None,
+    distrib_la_batched_route: str = "auto",
 ):
     """Retarded finite-occupation chi0 on one positive-time sweep.
 
@@ -780,6 +788,8 @@ def _get_chi_fractional_contour_kernel(
 
     grid = tuple(int(n) for n in kgrid)
     n_out = int(n_out)
+    distrib_la_batched_route = str(
+        distrib_la_batched_route).strip().lower()
     if n_out < 1:
         raise ValueError("fractional contour chi0 requires at least one output")
     if layout not in ("legacy", "face"):
@@ -787,7 +797,7 @@ def _get_chi_fractional_contour_kernel(
             f"_get_chi_fractional_contour_kernel: layout must be 'legacy' "
             f"or 'face', got {layout!r}")
     cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(),
-                 n_out, layout, face_shape)
+                 n_out, layout, face_shape, distrib_la_batched_route)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -799,7 +809,8 @@ def _get_chi_fractional_contour_kernel(
                 "_get_chi_fractional_contour_kernel(layout='face') requires "
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
         kernel = _get_chi_fractional_contour_kernel_face(
-            mesh_xy, grid, n_out, face_shape)
+            mesh_xy, grid, n_out, face_shape,
+            distrib_la_batched_route=distrib_la_batched_route)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -944,6 +955,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
+    *, distrib_la_batched_route: str = "auto",
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -1010,7 +1022,8 @@ def _get_chi_fractional_contour_kernel_face(
     # and Gu build this kernel ever does — mirrors
     # _get_chi_minimax_kernel_face's own g_plan.
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
-                       nq=nk, dtype=jnp.complex128)
+                       nq=nk, dtype=jnp.complex128,
+                       batched_route=distrib_la_batched_route)
 
     @partial(
         jax.jit,
@@ -1607,7 +1620,8 @@ def _chi_layout_operands(wfns, eref):
     return (wfns.psi_mun, wfns.psi_nmu, mask_v, mask_c, enk_full)
 
 
-def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
+def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0,
+                 distrib_la_batched_route: str = "auto"):
     """Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
 
     Returns flat-q array (nq, μ, μ).
@@ -1651,7 +1665,10 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, **_chi_face_kwargs(wfns))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_chi_face_kwargs(wfns))
     return kernel(
         nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),
@@ -1662,7 +1679,7 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
 def compute_no_pair_dirac_current_block(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
-    spin_pair_stream=None,
+    spin_pair_stream=None, distrib_la_batched_route: str = "auto",
 ):
     """Compute one raw no-pair Dirac-current response block ``chi_AB``.
 
@@ -1749,7 +1766,8 @@ def compute_no_pair_dirac_current_block(
         mesh_xy, kgrid, layout="face", face_shape=left_shape,
         right_face_shape=right_shape, vertex_pair=True,
         vertex_identity=(A == 0, B == 0),
-        spin_pair_stream=spin_pair_stream)
+        spin_pair_stream=spin_pair_stream,
+        distrib_la_batched_route=distrib_la_batched_route)
     mask_v = wfns_left.band_mask(s.val)
     mask_c = wfns_left.band_mask(s.cond)
     enk_full = wfns_left.enk - jnp.asarray(
@@ -1768,6 +1786,7 @@ def compute_no_pair_dirac_current_block(
 
 def _get_finite_transfer_current_block_kernel(
     mesh_xy, *, nk: int, nb: int, ns: int, n_rmu: int,
+    distrib_la_batched_route: str = "auto",
 ):
     """One-q current block through the incumbent face Green builder.
 
@@ -1783,15 +1802,18 @@ def _get_finite_transfer_current_block_kernel(
     from .greens_function_kernel import build_G_tau
     from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
 
+    distrib_la_batched_route = str(
+        distrib_la_batched_route).strip().lower()
     key = ("finite_transfer_current_block", id(mesh_xy), int(nk), int(nb),
-           int(ns), int(n_rmu))
+           int(ns), int(n_rmu), distrib_la_batched_route)
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
 
     g_plan = gemm_plan(
         mesh_xy, m=int(n_rmu) * int(ns), k=int(nb),
-        n=int(n_rmu) * int(ns), nq=int(nk), dtype=jnp.complex128)
+        n=int(n_rmu) * int(ns), nq=int(nk), dtype=jnp.complex128,
+        batched_route=distrib_la_batched_route)
     mun_sharding = NamedSharding(mesh_xy, PSI_MUN_SPEC)
     nmu_sharding = NamedSharding(mesh_xy, PSI_NMU_SPEC)
     rep2 = NamedSharding(mesh_xy, P(None, None))
@@ -1865,6 +1887,7 @@ def compute_finite_transfer_current_block_row(
 def _compute_finite_transfer_current_block_row_unverified(
     endpoint, endpoint_minus_q, target_basis_binding, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
+    distrib_la_batched_route: str = "auto",
 ):
     r"""Private fixed-q TT algebra oracle at one stored q row.
 
@@ -2072,7 +2095,8 @@ def _compute_finite_transfer_current_block_row_unverified(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128))
     kernel = _get_finite_transfer_current_block_kernel(
-        mesh_xy, nk=nk, nb=nb, ns=ns, n_rmu=n_rmu)
+        mesh_xy, nk=nk, nb=nb, ns=ns, n_rmu=n_rmu,
+        distrib_la_batched_route=distrib_la_batched_route)
     orientations = []
     for current_mun, current_nmu, kminq, left_vertex, right_vertex in (
         (current_mun_q, current_nmu_q, kminq_q, A, B),
@@ -2125,6 +2149,7 @@ def compute_experimental_no_pair_photon_chi0(
     wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout, *,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
+    distrib_la_batched_route: str = "auto",
 ):
     """Build all sixteen no-pair blocks with an experimental TT proxy.
 
@@ -2161,7 +2186,8 @@ def compute_experimental_no_pair_photon_chi0(
         chi_ab = compute_no_pair_dirac_current_block(
             families[A], families[B], quad, meta, mesh_xy,
             vertex_left=A, vertex_right=B,
-            energy_reference=energy_reference)
+            energy_reference=energy_reference,
+            distrib_la_batched_route=distrib_la_batched_route)
         if A and B:
             # Experimental no-pair Ward completion: TT only.  CC/CT/TC are
             # left untouched and no diamagnetic contact is invented.
@@ -2304,7 +2330,8 @@ def compute_static_photon_response(
     chi_packed = compute_experimental_no_pair_photon_chi0(
         wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
         current_contact=current_contact,
-        energy_reference=energy_reference)
+        energy_reference=energy_reference,
+        distrib_la_batched_route=distrib_la_batched_route)
 
     dyson_started = time.perf_counter()
     W_packed = solve_w(
@@ -2426,7 +2453,8 @@ def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
 
 
 def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
-                       energy_reference=0.0):
+                       energy_reference=0.0,
+                       distrib_la_batched_route: str = "auto"):
     """χ₀ at several weight vectors over ONE τ sweep — see
     ``_get_chi_minimax_kernel(n_out>=2)``.  Returns an ``n_out``-tuple of
     flat-q (nq, μ, μ) arrays, one per row of ``alpha_rows``."""
@@ -2434,13 +2462,16 @@ def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args, n_out = _chi0_multi_kernel_args(
         wfns, tau, alpha_rows, energy_reference)
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
-                                     **_chi_face_kwargs(wfns))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=n_out,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_chi_face_kwargs(wfns))
     return kernel(*args)
 
 
 def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
-                          energy_reference=None):
+                          energy_reference=None,
+                          distrib_la_batched_route: str = "auto"):
     """AOT lower+compile sibling of :func:`precompile_chi0` for the
     multi-output kernel."""
     ensure_jax_compile_cache()
@@ -2449,8 +2480,10 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
         return
     args, n_out = _chi0_multi_kernel_args(
         wfns, tau, alpha_rows, energy_reference)
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
-                                     **_chi_face_kwargs(wfns))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=n_out,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_chi_face_kwargs(wfns))
     kernel.lower(*args).compile()
 
 
@@ -2508,7 +2541,8 @@ def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
 
 
 def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
-                         meta, mesh_xy, *, energy_reference=0.0):
+                         meta, mesh_xy, *, energy_reference=0.0,
+                         distrib_la_batched_route: str = "auto"):
     """Evaluate several complex-frequency chi0 values in one node sweep.
 
     The scalar contour arrays select the two ``Delta +/- z`` resolvents.  All
@@ -2521,13 +2555,15 @@ def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=True,
+        distrib_la_batched_route=distrib_la_batched_route,
         **_chi_face_kwargs(wfns))
     return kernel(*args)
 
 
 def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
                             z_values, meta, mesh_xy, *,
-                            energy_reference=None):
+                            energy_reference=None,
+                            distrib_la_batched_route: str = "auto"):
     """AOT sibling of :func:`compute_chi0_contour`."""
     if len(np.asarray(tau)) == 0:
         return
@@ -2537,6 +2573,7 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=True,
+        distrib_la_batched_route=distrib_la_batched_route,
         **_chi_face_kwargs(wfns))
     kernel.lower(*args).compile()
 
@@ -2709,6 +2746,7 @@ def compute_chi0_contour_fractional(
     occupations=None,
     energy_reference=0.0,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+    distrib_la_batched_route: str = "auto",
 ):
     """Evaluate retarded finite-occupation chi0 at complex frequencies.
 
@@ -2734,7 +2772,9 @@ def compute_chi0_contour_fractional(
         occupation_window_threshold,
     )
     kernel = _get_chi_fractional_contour_kernel(
-        mesh_xy, kgrid, n_out, **_chi_face_kwargs(wfns))
+        mesh_xy, kgrid, n_out,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_chi_face_kwargs(wfns))
     values = kernel(*args)
     return values[0] if n_out == 1 else values
 
@@ -3408,6 +3448,7 @@ def precompile_chi0_contour_fractional(
     occupations=None,
     energy_reference=0.0,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+    distrib_la_batched_route: str = "auto",
 ):
     """AOT sibling of compute_chi0_contour_fractional."""
     ensure_jax_compile_cache()
@@ -3422,10 +3463,13 @@ def precompile_chi0_contour_fractional(
         occupation_window_threshold,
     )
     _get_chi_fractional_contour_kernel(
-        mesh_xy, kgrid, n_out, **_chi_face_kwargs(wfns)).lower(*args).compile()
+        mesh_xy, kgrid, n_out,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_chi_face_kwargs(wfns)).lower(*args).compile()
 
 
-def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
+def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None,
+                    distrib_la_batched_route: str = "auto"):
     """AOT lower+compile of the χ₀ minimax kernel at the real input
     shapes/shardings — warms the JAX in-process cache so the first
     ``compute_chi0`` call is execution-only.  Call inside a dedicated
@@ -3452,7 +3496,10 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, **_chi_face_kwargs(wfns))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid,
+        distrib_la_batched_route=distrib_la_batched_route,
+        **_chi_face_kwargs(wfns))
     kernel.lower(
         nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),

@@ -104,6 +104,7 @@ def _fft_ffi_fused_enabled() -> bool:
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = False,
     layout: str = "legacy", face_shape=None,
+    distrib_la_batched_route: str = "auto",
 ) -> Callable[..., jax.Array]:
     """Build the shard_map'd ψ* σ ψ projector that reduce-scatters the output.
 
@@ -222,6 +223,7 @@ def _make_project_ri_reduce_scatter(
         channels=("none" if merged_x else "split_reim"),
         layout=layout,
         face_shape=face_shape,
+        distrib_la_batched_route=distrib_la_batched_route,
         divisibility_hint=(
             "Both existing sigma call sites pad via pad_sigma_window; "
             "meta.py rounds b_id_4 to world_size but NOT the sigma band "
@@ -261,6 +263,7 @@ def get_sigma_spatial_kernel(
     merged_x: bool = False,
     layout: str = "legacy",
     face_shape=None,
+    distrib_la_batched_route: str = "auto",
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
@@ -303,7 +306,8 @@ def get_sigma_spatial_kernel(
         make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           bool(merged_x), layout, face_shape)
+           bool(merged_x), layout, face_shape,
+           str(distrib_la_batched_route))
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -326,7 +330,8 @@ def get_sigma_spatial_kernel(
         _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
     project = _make_project_ri_reduce_scatter(
-        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape)
+        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
+        distrib_la_batched_route=distrib_la_batched_route)
 
     @jax.jit
     def prep_w(W_q):
@@ -432,6 +437,7 @@ def _get_sigma_kij_kernel(
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "legacy", face_shape=None, pack_brackets: bool = True,
     energy_windows: bool = False,
+    distrib_la_batched_route: str = "auto",
 ) -> Callable[..., jax.Array]:
     """GN/MPA adapter that builds G and calls the shared spatial kernel.
 
@@ -521,13 +527,15 @@ def _get_sigma_kij_kernel(
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-           bool(pack_brackets), bool(energy_windows))
+           bool(pack_brackets), bool(energy_windows),
+           str(distrib_la_batched_route))
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
-        layout=layout, face_shape=face_shape)
+        layout=layout, face_shape=face_shape,
+        distrib_la_batched_route=distrib_la_batched_route)
 
     g_plan = None
     g_plans = None
@@ -537,7 +545,8 @@ def _get_sigma_kij_kernel(
         nk_f, nb_full_f, n_rmu_f, ns_f = (int(v) for v in face_shape)
         mu_s_f = n_rmu_f * ns_f
         g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_f,
-                           nq=nk_f, dtype=jnp.complex128)
+                           nq=nk_f, dtype=jnp.complex128,
+                           batched_route=distrib_la_batched_route)
         use_packed = bool(pack_brackets) and brackets is not None \
             and len(brackets) > 1
         if use_packed:
@@ -560,7 +569,8 @@ def _get_sigma_kij_kernel(
                 else:
                     g_plans.append(gemm_plan(
                         mesh_xy, m=mu_s_f, k=w_pad, n=mu_s_f, nq=nk_f,
-                        dtype=jnp.complex128))
+                        dtype=jnp.complex128,
+                        batched_route=distrib_la_batched_route))
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
         # The A-side selector operand is dtype-dispatched (static at trace
@@ -861,6 +871,7 @@ def _get_sigma_tau_kernel(
     face_shape=None,
     pack_brackets: bool = True,
     energy_windows: bool = False,
+    distrib_la_batched_route: str = "auto",
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs.
 
@@ -906,7 +917,8 @@ def _get_sigma_tau_kernel(
     from ffi import ffi_dial_key
     cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
                  ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-                 bool(pack_brackets), bool(energy_windows))
+                 bool(pack_brackets), bool(energy_windows),
+                 str(distrib_la_batched_route))
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
@@ -918,7 +930,9 @@ def _get_sigma_tau_kernel(
                                              layout=layout,
                                              face_shape=face_shape,
                                              pack_brackets=pack_brackets,
-                                             energy_windows=energy_windows)
+                                             energy_windows=energy_windows,
+                                             distrib_la_batched_route=
+                                             distrib_la_batched_route)
 
     @jax.jit
     def _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi, E_ref_B, t_node):
@@ -1073,6 +1087,7 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     layout: str = "legacy", face_shape=None,
+    distrib_la_batched_route: str = "auto",
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -1093,7 +1108,7 @@ def get_shared_sigma_tau_kernel(
     from ffi import ffi_dial_key
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           layout, face_shape)
+           layout, face_shape, str(distrib_la_batched_route))
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
@@ -1101,7 +1116,8 @@ def get_shared_sigma_tau_kernel(
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     sigma_kij = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
-        layout=layout, face_shape=face_shape)
+        layout=layout, face_shape=face_shape,
+        distrib_la_batched_route=distrib_la_batched_route)
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,
@@ -1148,6 +1164,7 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,
                      brackets: tuple[tuple[int, int], ...] = ((0, None),),
                      pack_brackets: bool = True,
                      energy_windows: bool = False,
+                     distrib_la_batched_route: str = "auto",
                      ) -> None:
     """AOT lower + compile the per-τ sigma kernel.
 
@@ -1193,10 +1210,14 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,
         _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid,
                               brackets=brackets, pack_brackets=pack_brackets,
                               energy_windows=energy_windows,
+                              distrib_la_batched_route=
+                              distrib_la_batched_route,
                               **face_kwargs),
         _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
                               brackets=brackets, pack_brackets=pack_brackets,
                               energy_windows=energy_windows,
+                              distrib_la_batched_route=
+                              distrib_la_batched_route,
                               **face_kwargs),
     ]
 

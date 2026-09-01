@@ -692,7 +692,8 @@ def fit_zeta_to_h5(
                 _face_gemm = _gemm_plan(
                     mesh_xy, m=n_rmu_padded * _ns_face, k=_nb_face,
                     n=n_rmu_padded * _ns_face,
-                    nq=nk_tot, dtype=jnp.complex128)
+                    nq=nk_tot, dtype=jnp.complex128,
+                    batched_route=distrib_la_batched_route)
                 print_fn(f"  {_face_gemm.describe()}")
                 # Band-window WEIGHTS over the array's own [band_range_full)
                 # extent (matching STEP 1's l_band_start/r_band_start

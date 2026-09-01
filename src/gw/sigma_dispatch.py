@@ -661,6 +661,8 @@ def compute_sigma_xc(
     # entry check.  It is a dict lookup on a resolved enum, so it costs
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
+    distrib_la_batched_route = getattr(
+        config.backend, "distrib_la_batched_route", "auto")
 
     # ── THE ONE ENVELOPE ROW NO DECK KEY CAN EXPRESS ─────────────────────
     # low_mem_bands's other four unsupported combinations (head_correction,
@@ -882,6 +884,7 @@ def compute_sigma_xc(
             diagnostic_input_basis=(
                 "qp" if hartree_basis_rotation is not None else "dft"),
             print_fn=print_fn,
+            distrib_la_batched_route=distrib_la_batched_route,
         )
         if photon_head_diagnostics is not None:
             photon_head_sigma_diag = (
@@ -906,6 +909,7 @@ def compute_sigma_xc(
                 wfns_transverse=wfns_transverse,
                 bispinor_v_q_path=bispinor_v_q_path,
                 occupation_state=occupation_state,
+                distrib_la_batched_route=distrib_la_batched_route,
             )
             sig_x = cohsex["sig_x"]
             sig_sx = cohsex["sig_sx"]
@@ -918,6 +922,7 @@ def compute_sigma_xc(
                 wfns_transverse=wfns_transverse,
                 bispinor_v_q_path=bispinor_v_q_path,
                 occupation_state=occupation_state,
+                distrib_la_batched_route=distrib_la_batched_route,
             )
             sig_sx = sig_coh = jnp.zeros_like(sig_x)
 
@@ -1123,7 +1128,8 @@ def compute_sigma_xc(
             # this run's screening_diagrams either did or did not produce,
             # and the two are indistinguishable in the bytes.
             expected_screening_diagrams=config.screening.diagrams,
-            print_fn=print_fn)
+            print_fn=print_fn,
+            distrib_la_batched_route=distrib_la_batched_route)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
         # One occupation state per iteration: head fit vs body (skips when
@@ -1205,6 +1211,7 @@ def compute_sigma_xc(
         band_slices=band_slices, wfn=wfn, sym=sym,
         iteration_head=iteration_head,
         occupation_state=occupation_state,
+        distrib_la_batched_route=distrib_la_batched_route,
         print_fn=print_fn,
     )
 

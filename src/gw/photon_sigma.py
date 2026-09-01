@@ -129,6 +129,7 @@ def _require_packed_operator(name, packed, mesh_xy):
 def _make_photon_static_block_kernel(
     mesh_xy: Mesh, kgrid, nk_tot: int, wfns_left, wfns_right, *,
     with_q0_diagnostic: bool,
+    distrib_la_batched_route: str = "auto",
 ):
     """One block contraction, specialized only by endpoint carrier shapes.
 
@@ -146,7 +147,7 @@ def _make_photon_static_block_kernel(
     key = (id(mesh_xy), tuple(int(v) for v in kgrid), int(nk_tot),
            ffi_dial_key(), wfns_left.layout,
            endpoint.get("face_shape"), endpoint.get("right_face_shape"),
-           bool(with_q0_diagnostic))
+           bool(with_q0_diagnostic), str(distrib_la_batched_route))
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
 
@@ -159,7 +160,9 @@ def _make_photon_static_block_kernel(
         _make_static_convolution(
             mesh_xy, kgrid, nk_tot, q0_only=True)
         if with_q0_diagnostic else None)
-    project = contract_bands_block_reshard(mesh_xy, **endpoint)
+    project = contract_bands_block_reshard(
+        mesh_xy, distrib_la_batched_route=distrib_la_batched_route,
+        **endpoint)
 
     if wfns_left.layout == "face":
         from distrib_la import gemm_plan
@@ -172,7 +175,8 @@ def _make_photon_static_block_kernel(
                 f"got {endpoint['face_shape']} and {right_shape}")
         g_plan = gemm_plan(
             mesh_xy, m=mu_left * ns, k=nb_full, n=mu_right * ns,
-            nq=int(nk_tot), dtype=jnp.complex128)
+            nq=int(nk_tot), dtype=jnp.complex128,
+            batched_route=distrib_la_batched_route)
     else:
         g_plan = None
 
@@ -290,6 +294,7 @@ def compute_static_photon_sigma(
     diagnostic_input_basis=None,
     print_fn=print,
     verbose: bool = True,
+    distrib_la_batched_route: str = "auto",
 ) -> tuple[
     jax.Array, jax.Array, jax.Array, StaticPhotonHeadSigmaDiagnostics | None,
 ]:
@@ -353,7 +358,8 @@ def compute_static_photon_sigma(
             n_right = _padded_centroid_extent(right)
             contract_block = _make_photon_static_block_kernel(
                 mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
-                with_q0_diagnostic=q0_factors is not None)
+                with_q0_diagnostic=q0_factors is not None,
+                distrib_la_batched_route=distrib_la_batched_route)
             V_AB = photon_block_view(V_packed, photon_layout, A, B, mesh_xy)
             W_AB = photon_block_view(W_packed, photon_layout, A, B, mesh_xy)
             expected = (int(meta.nk_tot), n_left, n_right)

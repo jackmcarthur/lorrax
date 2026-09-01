@@ -22,6 +22,13 @@ def _put(a, mesh):
         np.asarray(a), NamedSharding(mesh, P(None, "x", "y")))
 
 
+def _put_steps(a, mesh):
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.device_put(
+        np.asarray(a), NamedSharding(mesh, P(None, None, "x", "y")))
+
+
 def _herm(rng, nb, n):
     z = rng.standard_normal((nb, n, n)) + 1j * rng.standard_normal((nb, n, n))
     return (0.5 * (z + np.conj(np.swapaxes(z, -1, -2)))).astype("complex128")
@@ -151,6 +158,106 @@ def test_selected_route_remains_trace_safe_inside_a_callers_jit():
     resid = _rel(
         A @ np.asarray(Z), np.asarray(Z) * np.asarray(W)[:, None, :])
     assert resid < 1e-12
+
+
+def test_gemm_batch_reshard_builder_cache_uses_the_exact_signature():
+    """The shared one-route builder neither retraces exact hits nor aliases
+    shapes/scalars/C-presence that require different staged programs."""
+    import importlib
+    import jax.numpy as jnp
+
+    mesh = _mesh()
+    matmul_mod = importlib.import_module("distrib_la.matmul")
+    base = dict(
+        mesh=mesh,
+        a_shape=(5, 8, 12),
+        b_shape=(5, 12, 16),
+        c_shape=None,
+        dtype=jnp.complex128,
+        alpha=1 + 0j,
+        beta=0 + 0j,
+        transa="N",
+        transb="N",
+    )
+    fn = matmul_mod._get_batch_reshard_matmul_fn(**base)
+    assert matmul_mod._get_batch_reshard_matmul_fn(**base) is fn
+
+    with_c = dict(base, c_shape=(5, 8, 16), beta=1 + 0j)
+    other_alpha = dict(base, alpha=2 + 0j)
+    other_batch = dict(
+        base, a_shape=(6, 8, 12), b_shape=(6, 12, 16))
+    assert matmul_mod._get_batch_reshard_matmul_fn(**with_c) is not fn
+    assert matmul_mod._get_batch_reshard_matmul_fn(**other_alpha) is not fn
+    assert matmul_mod._get_batch_reshard_matmul_fn(**other_batch) is not fn
+
+
+def test_gemm_plan_batch_reshard_p4_scan_numerics_and_layout():
+    """The planned route composes in a caller scan and restores face layout."""
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    mesh = _mesh()
+    rng = np.random.default_rng(8501)
+    steps, nq, m, k, n = 3, 5, 8, 12, 16
+    A = (rng.standard_normal((steps, nq, m, k))
+         + 1j * rng.standard_normal((steps, nq, m, k))).astype("complex128")
+    B = (rng.standard_normal((steps, nq, k, n))
+         + 1j * rng.standard_normal((steps, nq, k, n))).astype("complex128")
+    plan = D.gemm_plan(
+        mesh, m=m, k=k, n=n, nq=nq, dtype="complex128", backend="off",
+        batched_route=D.ROUTE_BATCH_RESHARD,
+        max_batch_reshard_local_operand_bytes=1 << 30)
+
+    @jax.jit
+    def run(a, b):
+        def body(carry, operands):
+            left, right = operands
+            return carry, plan(left, right)
+        return jax.lax.scan(body, (), (a, b))[1]
+
+    got = run(_put_steps(A, mesh), _put_steps(B, mesh))
+    assert got.shape == (steps, nq, m, n)
+    assert got.sharding.spec == P(None, None, "x", "y")
+    assert _rel(got, A @ B) < 2e-12
+
+
+def test_gemm_plan_batch_reshard_refuses_out_and_preserves_inputs():
+    """Staged exchanges do not expose the provider route's donation API."""
+    import warnings
+    import jax
+
+    mesh = _mesh()
+    rng = np.random.default_rng(8502)
+    nq, m, k, n = 5, 8, 12, 16
+    A = (rng.standard_normal((nq, m, k))
+         + 1j * rng.standard_normal((nq, m, k))).astype("complex128")
+    B = (rng.standard_normal((nq, k, n))
+         + 1j * rng.standard_normal((nq, k, n))).astype("complex128")
+    a = _put(A, mesh)
+    b = _put(B, mesh)
+    scratch = _put(np.zeros((nq, m, n), dtype="complex128"), mesh)
+    plan = D.gemm_plan(
+        mesh, m=m, k=k, n=n, nq=nq, dtype="complex128", backend="off",
+        batched_route=D.ROUTE_BATCH_RESHARD,
+        max_batch_reshard_local_operand_bytes=1 << 30)
+
+    with pytest.raises(
+            ValueError, match="batch_reshard.*out=|out=.*batch_reshard"):
+        plan(a, b, out=scratch)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        got = plan(a, b)
+        jax.block_until_ready(got)
+    assert not any("donat" in str(w.message).lower() for w in caught)
+
+    # A donated buffer is deleted after dispatch.  Reading both inputs and
+    # calling the same plan again therefore checks the public ownership
+    # contract, rather than merely inspecting private jit metadata.
+    assert np.array_equal(np.asarray(a), A)
+    assert np.array_equal(np.asarray(b), B)
+    again = plan(a, b)
+    assert _rel(again, A @ B) < 2e-12
 
 
 def test_staged_forward_then_inverse_is_bit_exact():
