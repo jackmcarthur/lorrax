@@ -957,7 +957,9 @@ def loaded_platforms_in_order() -> list:
     return list(_LIBS)
 
 
-_MPI_RUNTIME_BASENAME = re.compile(r"^libmpi(?:_gnu_[0-9]+)?[.]so(?:[.]|$)")
+_MPI_RUNTIME_BASENAME = re.compile(
+    r"^libmpi(?:_gnu(?:_[0-9]+)?)?[.]so(?:[.]|$)"
+)
 
 
 def _assert_one_mapped_mpi_runtime() -> None:

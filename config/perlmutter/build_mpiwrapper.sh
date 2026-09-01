@@ -177,7 +177,7 @@ fi
     -DCMAKE_C_COMPILER=cc \
     -DCMAKE_CXX_COMPILER=CC \
     -DCMAKE_Fortran_COMPILER=ftn \
-    -DCMAKE_MODULE_LINKER_FLAGS="-Wl,--no-as-needed -lmpi_gnu"
+    -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--as-needed
 "$CMAKE" --build "$BUILD" --parallel
 "$CMAKE" --install "$BUILD"
 
@@ -220,7 +220,7 @@ if grep -qE 'libmpi_gtl_cuda|libcuda|libcudart|libdarshan' <<<"$NEEDED"; then
     exit 1
 fi
 LORRAX_GATE_ONE_MPI=on GATE_TAG=build_mpiw.pm "$ONE_MPI_GATE" \
-    "$SO" 'libmpi_gnu_'
+    "$SO" 'libmpi_gnu'
 
 ARTIFACT_SHA="$(sha256sum "$SO" | awk '{print $1}')"
 BUILDER_SHA="$(sha256sum "$LORRAX_ROOT/config/perlmutter/build_mpiwrapper.sh" | awk '{print $1}')"
