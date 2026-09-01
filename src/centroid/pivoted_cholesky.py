@@ -672,6 +672,31 @@ def point_rank_closure_note(G, keep_mask, rank, *, tol_rel=None):
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _emit_complete_groups(cand_idx, dense_group_id, piv):
+    """Map point pivots back to an exactly complete-group coordinate set."""
+    cand_idx = np.asarray(cand_idx)
+    dense_group_id = np.asarray(dense_group_id, dtype=np.int32)
+    piv_used = np.asarray(piv, dtype=np.int32)
+    piv_used = piv_used[piv_used >= 0]
+    picked_groups = dense_group_id[piv_used]
+    order = picked_groups[np.sort(np.unique(
+        picked_groups, return_index=True)[1])]
+    in_kept = np.isin(dense_group_id, order)
+    sizes = np.bincount(dense_group_id)
+    pivot_counts = np.bincount(picked_groups, minlength=sizes.size)
+    if not np.array_equal(pivot_counts[order], sizes[order]):
+        raise RuntimeError(
+            "group-block pivoted Cholesky returned a partial group; "
+            "the point-budget admission contract is broken")
+    keep_idx = cand_idx[in_kept]
+    if int(keep_idx.shape[0]) != int(piv_used.size):
+        raise RuntimeError(
+            "group-block pivot/emission count mismatch: "
+            f"pivoted {piv_used.size} point rows but emitted "
+            f"{keep_idx.shape[0]}")
+    return keep_idx, in_kept, order, piv_used
+
+
 def prune_candidates_by_pivoted_cholesky(
     wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
@@ -910,18 +935,9 @@ def prune_candidates_by_pivoted_cholesky(
             raise RuntimeError(
                 f"pivoted-Cholesky REFUSES: point budget {budget} is smaller "
                 f"than every complete group (minimum size {int(sizes.min())})")
-        picked_groups = dense_id[piv_used]
-        order = picked_groups[np.sort(np.unique(
-            picked_groups, return_index=True)[1])]
-        in_kept = np.isin(dense_id, order)
-        sizes = np.bincount(dense_id, minlength=n_groups)
-        pivot_counts = np.bincount(picked_groups, minlength=n_groups)
-        if not np.array_equal(pivot_counts[order], sizes[order]):
-            raise RuntimeError(
-                "group-block pivoted Cholesky returned a partial group; "
-                "the point-budget admission contract is broken")
-        keep_idx = np.asarray(cand_idx)[in_kept]
-        n_delivered = int(keep_idx.size)
+        keep_idx, in_kept, order, piv_used = _emit_complete_groups(
+            cand_idx, dense_id, piv_used)
+        n_delivered = int(keep_idx.shape[0])
         rank_i = int(rank)
         diag_host = np.real(np.asarray(jnp.diag(G)))[:M]
         psd_host = (

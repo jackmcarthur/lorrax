@@ -543,6 +543,23 @@ def test_group_block_select_never_opens_a_partial_budget_block():
                       <= remaining)
 
 
+def test_group_block_emission_counts_coordinate_rows_not_scalars():
+    from src.centroid.pivoted_cholesky import _emit_complete_groups
+
+    sizes = np.asarray([2, 3, 4], dtype=np.int32)
+    group_id = np.repeat(np.arange(sizes.size, dtype=np.int32), sizes)
+    coordinates = np.arange(group_id.size * 3).reshape(group_id.size, 3)
+    piv = np.asarray([2, 3, 4, 0, 1], dtype=np.int32)
+    kept, mask, order, used = _emit_complete_groups(
+        coordinates, group_id, piv)
+    assert kept.shape == (5, 3)
+    assert mask.sum() == used.size == kept.shape[0]
+    np.testing.assert_array_equal(order, np.asarray([1, 0]))
+
+    with pytest.raises(RuntimeError, match="partial group"):
+        _emit_complete_groups(coordinates, group_id, np.asarray([2, 3]))
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # 4. Orbit-aware Lloyd reduces to plain Lloyd on the trivial group
 # ─────────────────────────────────────────────────────────────────────────
