@@ -358,6 +358,56 @@ def test_rule_selection_keeps_pointwise_feasible_incomparable_choice():
     assert required == pytest.approx(0.9)
 
 
+def test_prefit_feasibility_refuses_before_any_fit_and_names_dominators(
+        monkeypatch):
+    specs = [
+        {"name": "large", "kind": "sign_definite_positive",
+         "omega_idx": np.asarray([0]),
+         "envelope_by_frequency": np.asarray([8.0])},
+        {"name": "small", "kind": "sign_definite_negative",
+         "omega_idx": np.asarray([0]),
+         "envelope_by_frequency": np.asarray([2.0])},
+        {"name": "crossing", "kind": "crossing",
+         "omega_idx": np.asarray([0]),
+         "envelope_by_frequency": np.asarray([100.0])},
+    ]
+    floors = iter(((0.25, {"method": "lookup"}),
+                   (0.10, {"method": "lookup"})))
+    monkeypatch.setattr(
+        delivered, "_sign_definite_reachable_floor",
+        lambda *_args: next(floors))
+
+    with pytest.raises(RuntimeError, match=(
+            r"infeasible by 2\.2x.*'large'.*'small'")):
+        delivered._precheck_plan_feasibility(
+            specs, np.asarray([1.0]), target=1.0e-4, max_nodes=64)
+
+
+def test_prefit_feasibility_pass_is_necessary_not_sufficient(monkeypatch):
+    specs = [{
+        "name": "working lookup", "kind": "sign_definite_positive",
+        "omega_idx": np.asarray([0, 1]),
+        "envelope_by_frequency": np.asarray([2.0, 1.0]),
+    }, {
+        "name": "unfitted crossing", "kind": "crossing",
+        "omega_idx": np.asarray([0, 1]),
+        "envelope_by_frequency": np.asarray([1.0e6, 1.0e6]),
+    }]
+    monkeypatch.setattr(
+        delivered, "_sign_definite_reachable_floor",
+        lambda *_args: (0.1, {"method": "lookup"}))
+
+    report = delivered._precheck_plan_feasibility(
+        specs, np.asarray([1.0, 1.0]), target=1.0e-4, max_nodes=64)
+
+    assert report["feasible"]
+    assert not report["sufficient"]
+    assert report["max_budget_ratio"] == pytest.approx(0.2)
+    crossing = report["windows"][1]
+    assert crossing["relative_floor"] == 0.0
+    assert crossing["rank_limited_floor_requires_fit"]
+
+
 def _patched_test_plan(width_ev):
     ev_to_ry = 1.0 / 27.211386245988
     eta = 0.25 * ev_to_ry

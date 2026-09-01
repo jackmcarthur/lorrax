@@ -1962,6 +1962,135 @@ def _pointwise_window_allowance(spec, pointwise_budget):
         np.asarray(pointwise_budget, dtype=np.float64)[positions] / envelope)))
 
 
+def _sign_definite_reachable_floor(spec, max_nodes):
+    """Achieved residual of the tightest shipped rule covering ``spec``.
+
+    This is deliberately a lookup and a validation-lattice evaluation, not a
+    fit. The tightest catalog error rung is the last accuracy the production
+    sign-definite route can ask for at this geometry. Crossing windows do not
+    have an analogous positive cheap floor: numerical rank bounds how many
+    modes a fit may use, but it does not determine the residual without fitting
+    their weights.
+    """
+    rotated, transform = _sign_definite_orientation(spec["problem"])
+    x_min = float(np.min(rotated.real))
+    range_value = float(np.max(rotated.real)) / x_min
+    entries = [
+        entry for entry in _mm.catalog().for_family("noncrossing")
+        if entry.range_max + 1.0e-12 >= range_value
+        and entry.node_count <= int(max_nodes)
+        and entry.certified
+    ]
+    if not entries:
+        # This precheck is about accuracy budget, not node feasibility. The
+        # exact selector owns a missing-rule / pair-ceiling refusal.
+        return 0.0, {
+            "method": "no_shipped_noncrossing_rule",
+            "range": range_value,
+        }
+    # Stay on the tightest rung at the first catalog geometry that covers the
+    # support. A much wider table is a different geometry, not a tighter rung
+    # of this one.
+    entry = min(entries, key=lambda row: (
+        row.range_max, row.error_bound, row.node_count))
+    served = _load_catalog_entry(
+        entry, family="noncrossing", target="inverse")
+    tau = np.asarray(served.nodes, np.float64) / x_min
+    alpha = np.asarray(served.weights, np.float64) / x_min
+    if transform.startswith("positive"):
+        times, weights = 1.0j * tau, alpha
+    else:
+        times, weights = -1.0j * tau, -alpha
+    residual, kappa_p99, _kappa_max = _rule_metrics(
+        spec["validation"], times, weights)
+    required = max(
+        residual,
+        kappa_p99 * RUNTIME_NOISE_EPSILON / AMPLIFICATION_NOISE_SAFETY)
+    return float(required), {
+        "method": "tightest_shipped_noncrossing_rule",
+        "range": range_value,
+        "table_range": float(entry.range_max),
+        "table_error_bound": float(entry.error_bound),
+        "node_count": int(entry.node_count),
+        "residual": float(residual),
+        "kappa_p99": float(kappa_p99),
+    }
+
+
+def _precheck_plan_feasibility(specs, pointwise_budget, target, max_nodes):
+    """Refuse a necessary delivered-error condition before any rule fit.
+
+    Sign-definite floors are measured from their tightest shipped lookup.
+    Crossing floors remain zero: a positive number inferred only from usable
+    rank would not be a necessary bound. Consequently passing this check is
+    not sufficient and the exact selector remains authoritative.
+    """
+    budget = np.asarray(pointwise_budget, dtype=np.float64)
+    costs = np.zeros_like(budget)
+    rows = []
+    for spec in specs:
+        if spec["kind"] == "crossing":
+            floor = 0.0
+            evidence = {
+                "method": "conservative_zero_crossing_floor",
+                "rank_limited_floor_requires_fit": True,
+            }
+        else:
+            floor, evidence = _sign_definite_reachable_floor(
+                spec, max_nodes)
+        positions = np.asarray(spec["omega_idx"], dtype=np.int64)
+        contribution = (
+            np.asarray(spec["envelope_by_frequency"], dtype=np.float64)
+            * float(floor))
+        np.add.at(costs, positions, contribution)
+        rows.append({
+            "name": spec["name"],
+            "kind": spec["kind"],
+            "relative_floor": float(floor),
+            "max_absolute_floor": float(np.max(contribution, initial=0.0)),
+            **evidence,
+        })
+    ratios = np.divide(
+        costs, budget, out=np.zeros_like(costs), where=budget > 0.0)
+    blocking_frequency = int(np.argmax(ratios))
+    ratio = float(ratios[blocking_frequency])
+    report = {
+        "necessary_condition": "pointwise sum(envelope * reachable_floor)",
+        "sufficient": False,
+        "feasible": bool(ratio <= 1.0),
+        "max_budget_ratio": ratio,
+        "blocking_frequency_index": blocking_frequency,
+        "floor_cost": float(costs[blocking_frequency]),
+        "budget": float(budget[blocking_frequency]),
+        "minimum_deck_target": float(target) * ratio,
+        "windows": rows,
+    }
+    if ratio <= 1.0:
+        return report
+
+    contributions = []
+    for spec, row in zip(specs, rows):
+        local = np.nonzero(
+            np.asarray(spec["omega_idx"], np.int64) == blocking_frequency)[0]
+        if local.size:
+            absolute = float(
+                np.asarray(spec["envelope_by_frequency"])[local[0]]
+                * row["relative_floor"])
+            contributions.append((absolute, row))
+    dominant = sorted(contributions, key=lambda item: item[0], reverse=True)[:3]
+    detail = "; ".join(
+        f"{row['name']!r}: floor={row['relative_floor']:.6g}, "
+        f"cost={absolute:.6g}"
+        for absolute, row in dominant)
+    raise RuntimeError(
+        "delivered plan is infeasible before fitting: necessary pointwise "
+        f"floor cost={costs[blocking_frequency]:.6g}, "
+        f"budget={budget[blocking_frequency]:.6g}, "
+        f"infeasible by {ratio:.6g}x at frequency index "
+        f"{blocking_frequency}; deck target would need to be at least "
+        f"{float(target) * ratio:.6g}. Dominant windows: {detail}")
+
+
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
                   pair_ceiling, *, pointwise_budget):
     """Select the minimum-pair plan under every frequency's error budget.
@@ -2349,6 +2478,8 @@ def build_delivered_sigma_windows(
     total_absolute = float(np.max(pointwise_budget))
     allowances = [_pointwise_window_allowance(spec, pointwise_budget)
                   for spec in specs]
+    feasibility = _precheck_plan_feasibility(
+        specs, pointwise_budget, target, pair_ceiling)
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
         factor_cap=factor_cap, pair_ceiling=pair_ceiling,
@@ -2696,6 +2827,7 @@ def build_delivered_sigma_windows(
         "envelope_error_safety": safety,
         "planned_absolute_envelope_error_budget": total_absolute,
         "required_absolute_envelope_budget": required_cost,
+        "pre_fit_feasibility": feasibility,
         "max_pointwise_envelope_budget_fraction": float(
             np.max(pointwise_fraction, initial=0.0)),
         "combined_inverse_gap_envelope": combined_scale,
