@@ -970,7 +970,8 @@ def fit_galerkin_basis(
     # retains its FFT boxing, Bloch phase, padding and sharding conventions.
     psi_rmu, _ = load_centroids_band_chunked(
         wfn, None, meta, centroid_indices, bispinor, mesh_xy,
-        band_range=(b_start, b_end), band_chunk_size=bc_carrier)
+        band_range=(b_start, b_end), band_chunk_size=bc_carrier,
+        output_faces="y")
     B_at_mu = _basis_at_nodes_from_selected_states(
         psi_rmu=psi_rmu, selected_states=selected,
         factor=L, rank_carrier=rank, n_nodes=n_mu, mesh_xy=mesh_xy)

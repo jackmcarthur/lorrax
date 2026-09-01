@@ -534,11 +534,19 @@ def test_streamed_centroid_transfer_matches_bulk(synth_loader):
     reused_y, reused_x = load_centroids_band_chunked(
         synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
         band_chunk_size=4, k_chunk_size=1, psi_G_flat=preloaded)
+    reused_y_only, reused_x_omitted = load_centroids_band_chunked(
+        synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+        band_chunk_size=4, k_chunk_size=1, psi_G_flat=preloaded,
+        output_faces="y")
 
     np.testing.assert_allclose(
         np.asarray(reused_y), np.asarray(bulk_y), rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(
         np.asarray(reused_x), np.asarray(bulk_x), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(reused_y_only), np.asarray(bulk_y),
+        rtol=1e-10, atol=1e-12)
+    assert reused_x_omitted is None
 
     for key in list(_wfn_transforms._KERNEL_CACHE):
         if key[0] == "gflat_to_rmu":
@@ -546,15 +554,34 @@ def test_streamed_centroid_transfer_matches_bulk(synth_loader):
     stream_y, stream_x = load_centroids_band_chunked(
         synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
         band_chunk_size=4, k_chunk_size=1)
+    stream_y_only, stream_x_omitted = load_centroids_band_chunked(
+        synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+        band_chunk_size=4, k_chunk_size=1, output_faces="y")
     np.testing.assert_allclose(
         np.asarray(stream_y), np.asarray(bulk_y), rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(
         np.asarray(stream_x), np.asarray(bulk_x), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(stream_y_only), np.asarray(bulk_y),
+        rtol=1e-10, atol=1e-12)
+    assert stream_x_omitted is None
     families = [
         key for key in _wfn_transforms._KERNEL_CACHE
         if key[0] == "gflat_to_rmu"
     ]
     assert len(families) == 1
+
+
+def test_centroid_transfer_rejects_unknown_output_faces(synth_loader):
+    """The face-selection contract fails before allocating WFN data."""
+    sym = synth_loader.symmetry()
+    meta = Meta.from_system(
+        synth_loader, sym, nval=1, ncond=1, nband=2,
+        n_rmu=1, bispinor=False)
+    with pytest.raises(ValueError, match="output_faces must be 'both' or 'y'"):
+        load_centroids_band_chunked(
+            synth_loader, sym, meta, jnp.zeros((1, 3), dtype=jnp.int32),
+            False, MESH, (0, 2), output_faces="x")
 
 
 # ---------------------------------------------------------------------------
