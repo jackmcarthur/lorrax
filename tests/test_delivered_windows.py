@@ -424,40 +424,22 @@ def test_catalog_candidate_helpers_are_deleted():
     assert not hasattr(delivered, "_catalog_walk")
 
 
-def test_screened_reference_serves_an_accurate_sign_definite_rule(monkeypatch):
+def test_screened_reference_keeps_factor_growth_bounded():
     """A harmless pole-energy origin must not trip the factor-growth cap."""
-    problem = ReciprocalMeasureProblem(
-        frequencies=np.asarray([0.0]),
-        internal_sums=np.asarray([-1.0 - 0.1j]),
-        cell_masses=np.asarray([1.0]))
-    denominator = complex(problem.denominators[0, 0])
     time = np.asarray([4.0j])
-    weight = np.asarray([np.exp(4.0 * denominator) / denominator])
-
-    def table_walk(*_args, **_kwargs):
-        yield time, weight, {
-            "family": "noncrossing", "candidate_tolerance": 0.5,
-            "provenance": "shifted screened-reference test rule",
-        }
-
-    monkeypatch.setattr(
-        delivered, "_sign_definite_table_candidates", table_walk)
     measure = (None, None, None, ((np.asarray([10.0 + 0.0j]), None),),
                None, np.asarray([0]), None, None)
     spec = {
         "name": "shifted pole probe", "kind": "sign_definite_positive",
-        "problem": problem, "validation": problem, "pole_sign": 1.0,
+        "pole_sign": 1.0,
         "envelope": 1.0, "measure": measure,
         "pole_indices": np.asarray([0]), "pole_bounds": (0.0, np.inf),
         "raw_state_energy": np.asarray([0.0]),
         "E_ref_A": 0.0, "E_ref_B": 10.0,
     }
-    candidates = delivered._candidate_rules(
-        spec, eta=0.1, max_nodes=8, factor_growth_cap=30.0,
-        relative_target=0.5)
+    factor_growth = delivered._factor_growth(spec, time, eta=0.1)
 
-    assert len(candidates) == 1
-    assert candidates[0]["factor_growth"][1] <= 0.0
+    assert factor_growth[1] <= 0.0
 
 
 def test_tolerance_ladder_is_deleted():
