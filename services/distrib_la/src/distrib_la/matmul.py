@@ -71,7 +71,7 @@ def _provider_platform(provider: str, mesh: Mesh) -> str:
 
 def _require_provider(provider: str, mesh: Mesh) -> None:
     px, py = _mesh_shape(mesh)
-    if provider in ("cublasmp", "slate") and px != py:
+    if provider in ("cublasmp", "scalapack", "slate") and px != py:
         raise ValueError(
             f"matmul backend {provider!r} needs a square mesh: its "
             f"one-face GEMM layout is invalid on a {px}x{py} grid")
@@ -368,7 +368,7 @@ def matmul(
     -----
     Provider routes require float64 or complex128, one JAX process per mesh
     cell in y-minor order, exact face tiling, and an available handler.
-    cuBLASMp and SLATE additionally require a square mesh; multi-rank
+    cuBLASMp, ScaLAPACK, and SLATE require a square mesh; multi-rank
     cuBLASMp accepts only ``N,N``.
     Its transpose-A mode returned a wrong answer in the real P=4 gate, while
     transpose-B can return rank-divergent ``INVALID_VALUE`` and deadlock; both

@@ -1,4 +1,4 @@
-"""Planned, trace-safe cuBLASMp N,N GEMM — resolve/warm once, call inside a
+"""Planned, trace-safe distributed N,N GEMM — resolve/warm once, call inside a
 hot loop.
 
 ``distrib_la.matmul`` resolves its provider and probes capability at every
@@ -42,15 +42,10 @@ Contract, deliberately narrower than :func:`distrib_la.matmul`:
   itself — cuBLASMp's own per-slice loop makes ``nq=1`` a legitimate,
   zero-overhead special case, the same way ``distrib_la.matmul`` lifts
   rank-2 internally (``matmul.py:402-406,438``).
-* **cuBLASMp only, today.**  ``lorrax_scalapack_batched_gemm`` and
-  ``lorrax_slate_batched_gemm`` are claimed by ``distrib_la.loader``'s
-  target table but have no C++ definition anywhere in this tree
-  (``KNOWN_LORRAX_ISSUES.md``, "services/distrib_la loader vs src/ffi"
-  row) — confirmed again here by `nm -D` on the pinned CUDA library, which
-  exports only ``CublasMpBatchedGemmFfi``.  A request that resolves to
-  either provider refuses at :func:`gemm_plan` construction, by name, using
-  the SAME capability probe ``distrib_la.matmul`` already runs — this
-  module adds no leniency and no second probe path.
+* **cuBLASMp or ScaLAPACK.**  Provider resolution and capability probing are
+  exactly those of :func:`distrib_la.matmul`.  The ScaLAPACK route reuses
+  :mod:`distrib_la._scalapack`'s PBLAS descriptor/FFI/cache builder; this
+  module does not duplicate provider code.  SLATE remains refused by name.
 * **Provider route only.**  ``batch_reshard`` materializes complete A, B,
   C and D on every device (``matmul.py:377-384``); the whole reason a
   caller reaches for a *planned* GEMM is a G/Sigma-sized object that must
@@ -452,6 +447,11 @@ class GemmPlan:
         contract; only the operand SHAPES differ (local tile vs. global
         array).
         """
+        if self.backend != "cublasmp":
+            raise NotImplementedError(
+                "gemm_plan.local_call is available only for cuBLASMp; "
+                f"backend {self.backend!r} supports the global __call__ "
+                "path but has no exposed manual-shard-map local body")
         if C is not None and out is not None:
             raise ValueError("gemm_plan.local_call: pass C or out, not both")
         if out is not None and self.beta != 0:
@@ -535,11 +535,8 @@ def gemm_plan(
     backend
         A name from ``distrib_la.MATMUL_BACKEND_CHOICES`` other than
         ``'off'``.  ``'auto'``/``'distributed'`` resolve to the platform's
-        provider exactly as ``distrib_la.matmul`` does; only
-        ``cublasmp``/``cusolvermp`` have a warmed kernel in this module
-        today (see the module docstring) — a resolved ``scalapack``/
-        ``slate`` refuses BY NAME rather than silently falling back to a
-        route this module does not implement.
+        provider exactly as ``distrib_la.matmul`` does.  ``cublasmp`` and
+        ``scalapack`` are supported; a resolved ``slate`` refuses by name.
     alpha, beta
         Fixed GEMM scalars, baked into the compiled kernel — cuBLASMp
         takes them as FFI attributes, not array arguments, so they cannot
@@ -572,11 +569,10 @@ def gemm_plan(
             "distrib_la.matmul(..., batched_route='batch_reshard') "
             "directly for that route.")
     resolved = resolve_matmul_backend(requested, mesh, batched_route="auto")
-    if resolved != "cublasmp":
+    if resolved not in ("cublasmp", "scalapack"):
         raise NotImplementedError(
             f"gemm_plan: backend {requested!r} resolved to {resolved!r}, "
-            "which has no warmed kernel in this module yet — only "
-            "cuBLASMp is wired (see the module docstring).  "
+            "which has no warmed kernel in this module.  "
             "distrib_la.matmul() capability-probed this provider and "
             "found it usable, so the gap is this module's, not a missing "
             f"library; land the {resolved} kernel variant here before "
@@ -590,34 +586,52 @@ def gemm_plan(
                 f"gemm_plan: {label}={extent} does not tile the "
                 f"{px}x{py} mesh (needs divisor {divisor})")
 
-    from distrib_la._cusolvermp import get_or_init_context
-    ctx_handle = get_or_init_context(mesh, col_major=False)
-
     in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
     in_sharding_b = in_sharding_a
     out_sharding = in_sharding_a
 
-    fn_with_c = jax.jit(
-        _build_kernel(mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
-                     alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
-                     with_c=True),
-        donate_argnums=(2,))
+    if resolved == "cublasmp":
+        from distrib_la._cusolvermp import get_or_init_context
+        ctx_handle = get_or_init_context(mesh, col_major=False)
+        fn_with_c = jax.jit(
+            _build_kernel(
+                mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
+                alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
+                with_c=True),
+            donate_argnums=(2,))
+        fn_no_c = (jax.jit(_build_kernel(
+            mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
+            alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
+            with_c=False)) if beta_c == 0 else None)
+    else:
+        from distrib_la._scalapack import _get_batched_matmul_fn
+        shapes = dict(
+            mesh=mesh, a_shape=(nq, m, k), b_shape=(nq, k, n),
+            c_shape=(nq, m, n), dtype=dtype, alpha=alpha_c,
+            beta=beta_c, transa="N", transb="N")
+        fn_with_c, ctx_handle = _get_batched_matmul_fn(
+            **shapes, with_c=True)
+        fn_no_c = None
+        if beta_c == 0:
+            fn_no_c, ctx_no_c = _get_batched_matmul_fn(
+                **shapes, with_c=False)
+            if ctx_no_c != ctx_handle:
+                raise RuntimeError(
+                    "gemm_plan: ScaLAPACK context changed while building "
+                    "one plan")
     # A REAL warmup call, not merely a trace: this is what forces the
     # cuBLASMp matmul descriptor build and workspace allocation to happen
     # now, eagerly, rather than on this plan's first use inside a caller's
     # scan.  The buffers are throwaway (c0 is DONATED away by this call).
-    fn_with_c(_zeros((nq, m, k), dtype, in_sharding_a),
-             _zeros((nq, k, n), dtype, in_sharding_b),
-             _zeros((nq, m, n), dtype, out_sharding))
+    jax.block_until_ready(fn_with_c(
+        _zeros((nq, m, k), dtype, in_sharding_a),
+        _zeros((nq, k, n), dtype, in_sharding_b),
+        _zeros((nq, m, n), dtype, out_sharding)))
 
-    fn_no_c = None
-    if beta_c == 0:
-        fn_no_c = jax.jit(_build_kernel(
-            mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
-            alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
-            with_c=False))
-        fn_no_c(_zeros((nq, m, k), dtype, in_sharding_a),
-               _zeros((nq, k, n), dtype, in_sharding_b))
+    if fn_no_c is not None:
+        jax.block_until_ready(fn_no_c(
+            _zeros((nq, m, k), dtype, in_sharding_a),
+            _zeros((nq, k, n), dtype, in_sharding_b)))
 
     return GemmPlan(
         mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,

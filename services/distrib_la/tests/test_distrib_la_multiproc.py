@@ -687,14 +687,14 @@ def check_distributed_matmul(mesh, dtype="complex128", *,
 
 
 def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
-                             m=None, k=None, n=None):
+                             m=None, k=None, n=None,
+                             backend="cublasmp"):
     """``distrib_la.gemm_plan``/``GemmPlan``: numerics, nested ``jit``,
     ``lax.scan`` reuse, the donated ``out=`` path, the ``beta!=0``
     accumulate path, and the internal-zero-``C`` path -- all against an
     ``A @ B`` numpy reference.  This is the ONLY tier that can certify any
-    of it: the plan refuses off-CUDA and off-cuBLASMp by construction (see
-    ``test_distrib_la_matmul_plan.py``), so an emulated mesh never reaches
-    the code this checks.
+    of it: an emulated mesh never reaches the collective provider code this
+    checks.  ``backend`` is ``cublasmp`` on CUDA and ``scalapack`` on CPU.
 
     ``m, k, n`` default from the mesh so the plan's own tiling checks
     (``m % px``, ``k % px``, ``k % py``, ``n % py``) are exercised on
@@ -716,8 +716,8 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
     want = A_np @ B_np
 
     plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
-                       backend="cublasmp")
-    assert plan.backend == "cublasmp"
+                       backend=backend)
+    assert plan.backend == backend
     assert plan.describe(), "describe() must produce a non-empty banner line"
     out = {}
 
@@ -766,7 +766,7 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
     # 4. explicit C, beta != 0 -- the donated-C kernel's accumulate form,
     # and its own refusal when a beta!=0 plan is called with no C.
     plan_beta = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
-                            backend="cublasmp", beta=-0.5)
+                            backend=backend, beta=-0.5)
     C_np = _rng_mat(rng, (nq, m, n), dtype)
     C = _put(C_np, mesh, (None, "x", "y"))
     D_c = _gather(plan_beta(A, B, C))
@@ -801,6 +801,11 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
         assert r < RTOL, f"repeated call {i}: rel {r:.3e}"
     out["repeated_calls"] = 5
     return out
+
+
+def check_gemm_plan_scalapack(mesh, dtype="complex128"):
+    """The planned global-call contract through the canonical PBLAS path."""
+    return check_gemm_plan_cublasmp(mesh, dtype, backend="scalapack")
 
 
 def check_gemm_plan_manual_shard_map(mesh, dtype="complex128", *, nq=3,
@@ -1174,6 +1179,8 @@ _CLI_CELLS = [
          mesh, dt, backend="slate", batched_route="auto", nq=4)),
     ("gemm_plan_cublasmp", "CUDA",
      lambda mesh, dt: check_gemm_plan_cublasmp(mesh, dt)),
+    ("gemm_plan_scalapack", "cpu",
+     lambda mesh, dt: check_gemm_plan_scalapack(mesh, dt)),
     ("gemm_plan_manual_shard_map", "CUDA",
      lambda mesh, dt: check_gemm_plan_manual_shard_map(mesh, dt)),
 ]

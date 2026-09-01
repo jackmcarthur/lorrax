@@ -1,16 +1,13 @@
 """Planned N,N GEMM (``distrib_la.gemm_plan``/``GemmPlan``) — logic tier.
 
-Real cuBLASMp execution needs a CUDA mesh with one process per device, so
-none of it is reachable here: every cell in this file either exercises a
-pure-Python helper directly, or drives ``gemm_plan()`` on an emulated CPU
-mesh far enough to observe its EAGER refusal ladder (backend='off', a
-resolved non-cuBLASMp provider, mesh topology, shape divisibility, dtype)
-BEFORE it would reach ``get_or_init_context``/the FFI call.  Numerics
+Real provider execution needs one process per mesh cell, so none of it is
+reachable here: every cell in this file either exercises a pure-Python
+helper directly, or drives ``gemm_plan()`` on an emulated CPU mesh far
+enough to observe its EAGER refusal ladder.  Numerics
 inside nested ``jit``/``lax.scan``, the donated-``out=`` path, and the
-internal-zero-``C`` kernel are the real four-rank CUDA gate,
-``check_gemm_plan_cublasmp`` in ``test_distrib_la_multiproc.py``
-(``gemm_plan_cublasmp`` CLI cell) — this file names that split rather than
-padding a CPU-only report to look like coverage it does not have.
+internal-zero-``C`` kernel are the real four-rank provider gates in
+``test_distrib_la_multiproc.py``: ``gemm_plan_cublasmp`` on CUDA and
+``gemm_plan_scalapack`` on CPU.
 """
 from __future__ import annotations
 
@@ -70,14 +67,11 @@ def test_backend_off_refuses_by_name():
                    backend="off")
 
 
-def test_cpu_mesh_resolves_scalapack_and_gemm_plan_refuses_by_name():
-    """cuBLASMp is CUDA-only, so 'auto' on a CPU mesh resolves to
-    scalapack -- for which this module has no warmed kernel (the GEMM FFI
-    symbol itself does not exist in the tree either, per
-    KNOWN_LORRAX_ISSUES.md).  Either way the caller gets a NAMED refusal,
-    never a silent construction of something unusable."""
+def test_cpu_provider_requires_one_process_per_mesh_cell():
+    """The ScaLAPACK plan is real, but an emulated 2x2 single-process mesh
+    is not valid evidence and must be refused before its collective FFI."""
     mesh = _mesh()
-    with pytest.raises((RuntimeError, NotImplementedError)):
+    with pytest.raises(RuntimeError, match="one JAX process per mesh cell"):
         D.gemm_plan(mesh, m=4, k=4, n=4, nq=2, dtype="complex128",
                    backend="auto")
 
@@ -138,14 +132,14 @@ def test_unsupported_dtype_refuses():
 # (``check_gemm_plan_cublasmp``), not this file's.
 # ---------------------------------------------------------------------------
 
-def _fake_plan(mesh, *, beta):
+def _fake_plan(mesh, *, beta, backend="cublasmp"):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from distrib_la.matmul_plan import GemmPlan
 
     sharding = NamedSharding(mesh, P(None, "x", "y"))
     return GemmPlan(
-        mesh=mesh, backend="cublasmp", m=2, k=2, n=2, nq=1,
+        mesh=mesh, backend=backend, m=2, k=2, n=2, nq=1,
         dtype=jnp.dtype("complex128"), alpha=1 + 0j, beta=complex(beta),
         in_sharding_a=sharding, in_sharding_b=sharding, out_sharding=sharding,
         ctx_handle=0,   # stand-in: no real FFI call reachable via __call__ here
@@ -204,3 +198,12 @@ def test_c_still_works_unaffected_on_a_beta_nonzero_plan():
     C = _sharded(mesh, 1, (1, 2, 2))
     out = plan(A, B, C=C)
     assert out is C
+
+
+def test_scalapack_local_call_refuses_by_name():
+    mesh = _mesh()
+    plan = _fake_plan(mesh, beta=0.0, backend="scalapack")
+    A = _sharded(mesh, 0, (1, 2, 2))
+    B = _sharded(mesh, 0, (1, 2, 2))
+    with pytest.raises(NotImplementedError, match="only for cuBLASMp"):
+        plan.local_call(A, B)

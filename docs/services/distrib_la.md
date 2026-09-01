@@ -432,7 +432,7 @@ or use the staged route.
 is correct for an eager call site, but a caller that runs G construction
 or a per-tau Sigma projection inside its own `jax.jit`/`lax.scan` needs the
 same two-phase split `Plan`/`PolarPlan` already give the solver ops: an
-EAGER phase (dlopen, probe, mesh geometry, cuBLASMp communicator) that runs
+EAGER phase (dlopen, probe, mesh geometry, provider context) that runs
 ONCE, and a closure built from its result that touches none of that.
 `gemm_plan`/`GemmPlan` (`distrib_la.matmul_plan`) is that split for GEMM,
 modelled directly on `plan_polar_factor`/`PolarPlan` — the one existing
@@ -441,7 +441,7 @@ precedent for driving an FFI call from inside a composed, jitted kernel.
 ```python
 plan = distrib_la.gemm_plan(
     mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, backend='auto')
-# ... hoisted out of the k/tau loop; by here the cuBLASMp communicator
+# ... hoisted out of the k/tau loop; by here the provider context
 # exists and both kernel variants have already run once on dummy data ...
 D = plan(A, B)                 # inside jit/scan: no dlopen, no probe
 ```
@@ -459,14 +459,9 @@ Deliberately narrower than `matmul()`:
   batch — flatten it into m/k/n, or call the SAME plan `ns` times in a
   small, statically unrolled Python loop. `nq=1` is a legal,
   zero-overhead rank-2-equivalent plan.
-* **cuBLASMp only, today** — `lorrax_scalapack_batched_gemm` and
-  `lorrax_slate_batched_gemm` are claimed by `distrib_la.loader`'s target
-  table but have no C++ definition anywhere in this tree
-  (`KNOWN_LORRAX_ISSUES.md`, "services/distrib_la loader vs src/ffi" row;
-  confirmed again by `nm -D` on the pinned CUDA library, which exports
-  only `CublasMpBatchedGemmFfi`). A request that `resolve_matmul_backend`
-  would send to either provider refuses at `gemm_plan()` construction, by
-  name, using the same capability probe `matmul()` uses.
+* **cuBLASMp or ScaLAPACK** — both reuse their backend's canonical compiled
+  GEMM builder. The ScaLAPACK handler is a thin `pdgemm`/`pzgemm` wrapper;
+  PBLAS owns communication. SLATE remains refused by name.
 * **Provider route only** — `backend='off'` refuses by name.
   `batch_reshard` materializes complete A, B, C and D on every device; the
   reason to reach for a *planned* GEMM at all is a G/Sigma-sized operand
@@ -530,7 +525,7 @@ measures that the marks arrived).
 | L-b emulated multi-device | `test_distrib_la_emulated_mesh.py` | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
 | route-c staged movement | `test_distrib_la_batch_reshard.py` | four emulated CPU devices; all three local kernels, ragged batches, inverse round trip + wrong-order red twin |
 | GEMM provider + staged contract | `test_distrib_la_matmul.py` | four emulated CPU devices; backend vocabulary, rank-2 and ragged rank-3 GEMM, transpose codes, and exact x/y + y/x schedule |
-| planned GEMM eager refusal ladder | `test_distrib_la_matmul_plan.py` | nothing but jax; `gemm_plan()`'s pure helpers plus its `backend='off'`/non-cuBLASMp/topology/dtype/shape refusals on an emulated CPU mesh — real cuBLASMp execution is CUDA-only and is leg L-c's `gemm_plan_cublasmp` cell |
+| planned GEMM eager refusal ladder | `test_distrib_la_matmul_plan.py` | nothing but jax; pure helpers plus backend/topology/dtype/shape refusals on an emulated mesh; real provider execution is the L-c `gemm_plan_cublasmp` and `gemm_plan_scalapack` cells |
 | L-c real multi-process | `test_distrib_la_multiproc.py` | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) — same functions, no duplicated logic |
 | contract + wiring | `test_distrib_la_contract.py` | the `.so` pins; every refusal constructibly fires |
 | C++ / ELF acceptance | `test_so_acceptance.py` | binutils + a pinned `.so`; reads the ELF, never dlopens |
