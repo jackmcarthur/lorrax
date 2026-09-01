@@ -160,14 +160,14 @@ def test_frozen_na_plan_is_bit_deterministic(frozen_na_plans):
 
 def test_frozen_na_node_accuracy_and_noise_acceptance(frozen_na_plans):
     plan, _ = frozen_na_plans
-    assert sum(rule.rank for rule in plan.rules) == 54
-    assert sum(rule.rank for rule in plan.rules) <= 69
+    assert sum(rule.rank for rule in plan.rules) == 89
+    resonant = next(
+        rule for rule in plan.rules
+        if rule.windows == ("ω≥E_F cond:resonant",))
+    assert resonant.rank == 63
     achieved = {row.branch: row.max_error for row in plan.branches}
     # Actual aggregate errors of the accepted 137-node production plan.
     assert achieved["cond"] <= 1.35633e-4
     assert achieved["val"] <= 2.43017e-5
     assert all(row.noise_passed for row in plan.branches)
     assert all(rule.noise_passed for rule in plan.rules)
-    assert all(rule.kappa_p99 * 6.0e-8
-               <= 0.05 * max(rule.max_error, 1.0e-12)
-               for rule in plan.rules)

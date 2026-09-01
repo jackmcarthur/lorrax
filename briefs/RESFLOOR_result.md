@@ -65,7 +65,7 @@ most their own apportioned target of delivered `mass/|d|`; the already-paid
 rank-12 fit may waive it only by passing both delivered gates.  The floor is
 then capped by the measure's runtime-noise usable rank.  No deck dial or
 execution change was added.  Mandated CPU gate: **134 passed in 84.85 s**;
-focused ROQ gate: **6 passed**.  The first P=4 staging attempt produced no
+focused ROQ gate: **9 passed in 55.30 s**.  The first P=4 staging attempt produced no
 measurement (missing restart); the repaired cold step is the result above.
 
 Evidence: `/pscratch/sd/j/jackm/wt_resfloor_2026-08-31/tmp/resfloor_na_p4`
