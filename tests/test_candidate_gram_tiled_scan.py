@@ -70,18 +70,21 @@ def _incumbent_tile_dispatches(faces, weights, mesh, *, width, mode):
 
 
 @pytest.mark.parametrize("mode", ("charge", "transverse"))
-def test_tiled_scan_is_bit_exact_to_incumbent_dispatches_with_tail(mode):
-    """Fusion preserves tile arithmetic/order, including a padded tail."""
+@pytest.mark.parametrize("npoint,width", ((7, 3), (6, 3)))
+def test_tiled_scan_is_bit_exact_to_incumbent_dispatches(
+        mode, npoint, width):
+    """Fusion preserves tile arithmetic/order with and without a tail."""
     from isdf import gram_q0_tiled_from_psi_sm
 
-    _, _, left_x, left_y, right_x, right_y, weights = _problem()
+    _, _, left_x, left_y, right_x, right_y, weights = _problem(
+        npoint=npoint)
     mesh = _mesh11()
     faces = (left_x, left_y, right_x, right_y)
     expected = _incumbent_tile_dispatches(
-        faces, weights, mesh, width=3, mode=mode)
+        faces, weights, mesh, width=width, mode=mode)
     got = gram_q0_tiled_from_psi_sm(
-        jnp.zeros((7, 7), dtype=jnp.complex128), *faces, weights,
-        mesh_xy=mesh, tile_width=3, gamma_mode=mode,
+        jnp.zeros((npoint, npoint), dtype=jnp.complex128), *faces, weights,
+        mesh_xy=mesh, tile_width=width, gamma_mode=mode,
     )
     assert np.array_equal(np.asarray(got), np.asarray(expected))
 
@@ -153,6 +156,18 @@ def test_tiled_executor_scan_and_donation_are_explicit_in_source():
               if kw.arg == "donate_argnums"]
     assert len(donate) == 1
     assert ast.literal_eval(donate[0]) == (0,)
+    scatter_updates = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "at"
+    ]
+    assert scatter_updates == []
+    dynamic_stores = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "dynamic_update_slice"
+    ]
+    assert dynamic_stores
 
 
 def test_terminal_hermitian_fold_preserves_value_and_xy_layout():

@@ -3,8 +3,10 @@
 The production-like fixture has 600 candidates and nine square tiles, with a
 real tail on both local axes.  Both feature families must be bit-identical to
 the incumbent extract/Gram/update dispatch sequence.  Optimized HLO must
-contain one copy of each pair-density contraction inside a loop, no
-gather-class collective, and an alias for the donated local Gram shard.
+contain two pair-density contraction definitions, no gather-class collective,
+and an alias for the donated local Gram shard.  The matched Nsight gate owns
+their dynamic execution count because definition count alone cannot expose a
+contraction sunk into the transverse component scan.
 """
 from __future__ import annotations
 
@@ -181,6 +183,9 @@ def main() -> None:
             _fail(f"{mode}: unexpected collective(s) {forbidden}")
         if not re.search(r"\bwhile(?:-start|-done)?\(", hlo):
             _fail(f"{mode}: optimized HLO has no scan/while loop")
+        if re.search(r"\bscatter\(", hlo):
+            _fail(
+                f"{mode}: contiguous tile store lowered back to scatter")
 
         dot_ops = len(re.findall(r"\bdot(?:-general)?\(", hlo))
         gemm_ops = len(re.findall(
