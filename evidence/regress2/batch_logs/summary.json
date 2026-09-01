@@ -1,0 +1,78 @@
+{
+  "manifest": "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/manifest.jsonl",
+  "mode": "pool",
+  "parallel": 4,
+  "span_s": 124.227,
+  "leg_wall_s": 242.952,
+  "occupancy": 1.956,
+  "n_legs": 4,
+  "missing": [],
+  "failed": [
+    "int",
+    "null",
+    "ondemand"
+  ],
+  "complete": false,
+  "legs": [
+    {
+      "id": "int",
+      "rc": 1,
+      "error": "",
+      "t_start": 0.006,
+      "t_end": 36.908,
+      "wall_s": 36.901,
+      "log": "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/batch_logs/int.log",
+      "argv": [
+        "/bin/bash",
+        "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh",
+        "int"
+      ],
+      "launched": true
+    },
+    {
+      "id": "null",
+      "rc": 1,
+      "error": "",
+      "t_start": 0.007,
+      "t_end": 34.659,
+      "wall_s": 34.652,
+      "log": "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/batch_logs/null.log",
+      "argv": [
+        "/bin/bash",
+        "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh",
+        "null"
+      ],
+      "launched": true
+    },
+    {
+      "id": "ondemand",
+      "rc": 1,
+      "error": "",
+      "t_start": 0.007,
+      "t_end": 47.187,
+      "wall_s": 47.18,
+      "log": "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/batch_logs/ondemand.log",
+      "argv": [
+        "/bin/bash",
+        "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh",
+        "ondemand"
+      ],
+      "launched": true
+    },
+    {
+      "id": "hackbusch",
+      "rc": 0,
+      "error": "",
+      "t_start": 0.008,
+      "t_end": 124.226,
+      "wall_s": 124.219,
+      "log": "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/batch_logs/hackbusch.log",
+      "argv": [
+        "/bin/bash",
+        "/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh",
+        "hackbusch"
+      ],
+      "launched": true
+    }
+  ]
+}

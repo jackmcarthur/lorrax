@@ -1,0 +1,4 @@
+{"id":"int","argv":["/bin/bash","/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh","int"],"workdir":"/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/int","gpus":4,"nodes":1,"ranks":4}
+{"id":"null","argv":["/bin/bash","/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh","null"],"workdir":"/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/null","gpus":4,"nodes":1,"ranks":4}
+{"id":"ondemand","argv":["/bin/bash","/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh","ondemand"],"workdir":"/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/ondemand","gpus":4,"nodes":1,"ranks":4}
+{"id":"hackbusch","argv":["/bin/bash","/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/run_candidate.sh","hackbusch"],"workdir":"/pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/hackbusch","gpus":4,"nodes":1,"ranks":4}

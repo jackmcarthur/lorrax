@@ -1,0 +1,9 @@
+
+[lx batch] 4 leg(s), P=4, pool mode
+  leg              rc         wall_s    start      end
+  int              1            36.9      0.0     36.9
+  null             1            34.7      0.0     34.7
+  ondemand         1            47.2      0.0     47.2
+  hackbusch        0           124.2      0.0    124.2
+  span 124.2 s · leg wall 243.0 s · occupancy 1.96 (1.00 = one leg at a time)
+  logs: /pscratch/sd/j/jackm/wt_regress2_2026-08-31/evidence/regress2/batch_logs
