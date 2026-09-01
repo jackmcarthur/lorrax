@@ -99,9 +99,22 @@ def _cheb_grid(S, n):
     return 0.5 * S * (1.0 - x), 0.5 * S * c
 
 
-def _grid_size(d, theta, S, points_per_half_wave=3.0, cap=6000):
-    nu_max = np.max(np.abs(np.cos(theta) * d.real + np.sin(theta) * d.imag))
-    return min(int(points_per_half_wave * nu_max * S / np.pi) + 100, cap)
+def _grid_size(d, theta, S, eps=1e-5, points_per_half_wave=3.0, cap=6000):
+    """Chebyshev points needed on ``[0, S]`` for the family on this ray.
+
+    A member with oscillation frequency ``nu`` and decay rate ``lam`` is alive
+    for ``min(S, ln(10/eps)/lam)`` and needs ``points_per_half_wave`` points per
+    half wave over that lifetime (on a rotated ray the fast members are also
+    the fast-decaying ones, so this is far below ``nu_max * S``).  The second
+    term keeps the Chebyshev spacing near ``s = 0``, ``S (pi/N)^2 / 2``, at or
+    below a half wave of the fastest member.
+    """
+    nu = np.abs(np.cos(theta) * d.real + np.sin(theta) * d.imag)
+    lam = np.maximum(np.cos(theta) * d.imag - np.sin(theta) * d.real, 1e-300)
+    life = np.minimum(S, np.log(10.0 / eps) / lam)
+    interior = points_per_half_wave * np.max(nu * life) / np.pi
+    near_zero = np.sqrt(points_per_half_wave * np.pi * S * np.max(nu) / 2.0)
+    return int(min(max(interior, near_zero) + 100, cap))
 
 
 def _family(d, theta, s):
@@ -118,7 +131,7 @@ def _choose_angle(d, eps, scan=(-85, -70, -55, -40, -20, 0, 20, 40, 55, 70, 85))
         if abs(th_ok[i] - np.deg2rad(deg)) > np.deg2rad(0.6):
             continue
         S = np.log(10.0 / eps) / rate_ok[i]
-        s, w = _cheb_grid(S, _grid_size(thin, th_ok[i], S))
+        s, w = _cheb_grid(S, _grid_size(thin, th_ok[i], S, eps))
         sv = svd(_family(thin, th_ok[i], s) * np.sqrt(w)[None, :], compute_uv=False)
         r = int(np.sum(sv > eps * sv[0]))
         if best is None or r < best[0]:
@@ -136,7 +149,7 @@ class _RayFamily:
     def __init__(self, d, theta, S, eps):
         self.d, self.theta, self.S = d, theta, S
         self.phase = np.exp(-1j * theta)
-        n_s = _grid_size(d, theta, S)
+        n_s = _grid_size(d, theta, S, eps)
         s, ws = _cheb_grid(S, n_s)
         M = _family(d, theta, s) * np.sqrt(ws)[None, :]
         _P, sig, Qh = svd(M, full_matrices=False)

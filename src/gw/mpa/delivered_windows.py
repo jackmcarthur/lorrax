@@ -1625,7 +1625,7 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
     return candidates, detail
 
 
-UNIFORM_RULE_TIME_BUDGET_SECONDS = 60.0
+UNIFORM_RULE_TIME_BUDGET_SECONDS = 15.0   # Gauss reduction cap per window; the interpolatory rule is ready after ~1 s
 
 
 def _uniform_rule_eps():
@@ -1663,9 +1663,15 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     elif not np.all(d.imag > 0.0):
         return None, None
     re_lo, re_hi = float(np.min(d.real)), float(np.max(d.real))
+    # Guard the lattice cells' extremes by 2% of the width, but never let the
+    # padding carry a sign-definite edge across zero: that would turn a
+    # Laplace box into a crossing box of the full width (measured: val:bulk
+    # went from 16 nodes in 3 s to a 414 s fall-through).  The near-zero
+    # edge is padded toward zero by at most 30% of its own distance.
     pad = 0.02 * max(re_hi - re_lo, float(eta))
-    box = (re_lo - pad, re_hi + pad,
-           float(np.min(d.imag)), float(np.max(d.imag)))
+    lo = re_lo - pad if re_lo <= 0.0 else max(re_lo - pad, 0.7 * re_lo)
+    hi = re_hi + pad if re_hi >= 0.0 else min(re_hi + pad, 0.7 * re_hi)
+    box = (lo, hi, float(np.min(d.imag)), float(np.max(d.imag)))
     rule = build_uniform_rule(
         box, float(eps), time_budget=UNIFORM_RULE_TIME_BUDGET_SECONDS)
     times, weights = rule.times, rule.weights
