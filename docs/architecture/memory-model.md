@@ -1047,7 +1047,7 @@ bispinor on 16 GPUs (4×4 mesh, ``p_xy=16``, ``nk=36``, ``ns=2``,
 | ``c128 (n_q_ibz, mu, ngkmax)`` second copy (TT off-diagonal only) | ``n_q_ibz × mu × ngkmax × 16 / p_xy`` | 3.28 (off-diag) / 0 (CC + diag) | ``gw/v_q_g_flat.py: same`` | μ-sharded | ``E.zeta_R_all`` | Agent I §2: doubles slab term for ``same_zeta=False`` |
 | ``c128 (mu, ngkmax)`` (resharded inside per-q kernel) | ``mu × ngkmax × 16 / p_x`` | 0.365 | ``gw/v_q_g_flat.py: _make_per_q_kernel.fn`` (reshard to ``P('x', None)``) | sharded /p_x (REPLICATED on y) | ``E.zeta_L_on_x_axis`` | Agent I §2 |
 | ``c128 (n_q_ibz, mu, mu)`` (V_acc; post-unfold piggybacks same slot) | ``n_q_ibz × mu × mu × 16 / p_xy`` | 0.083 | ``gw/v_q_g_flat.py:372`` | μ-sharded | ``E.V_acc`` + ``E.V_acc_full_BZ`` | Agent H probe P5: post-V_q live_total +1.33 GB global = V_qmunu_CC |
-| ``c128 (n_q_full, mu, mu)`` ×{9, 6} (Lorentz mix, bispinor IBZ-T only) | ``{9, 6} × nq × mu × mu × 16 / p_xy`` | 1.22 total | ``gw/v_q_bispinor.py:587-728`` (``unfold_v_q_bispinor_lorentz``) | μ-sharded | ``E.tt_full_in_9_tiles`` + ``E.tt_mixed_6_tiles`` | Agent I §4 |
+| ``c128 (n_q_full, mu, mu)`` ×{6 persistent inputs, 1 output} (Lorentz mix, bispinor IBZ-T only) | persistent: ``7 × nq × mu × mu × 16 / p_xy``; compiler workspace separate | 0.58 persistent | ``gw/v_q_bispinor.py`` (``mix_one_channel_by_proper_rotation`` loop) | μ-sharded | ``E.tt_unique_6_tiles`` + ``E.tt_mixed_1_tile`` | P4 CPU HLO at ``(nq,mu)=(5,8)``: no ``(3,3,q,mu,mu)`` stack; per-rank ``(arguments, output, temporary)=(7688,1280,3080)`` bytes versus old ``(11520,11520,11520)``, 2.87× lower compiler total. Production-scale HLO/runtime remeasurement remains owed. |
 
 ### How to use this appendix
 
