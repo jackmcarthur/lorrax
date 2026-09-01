@@ -350,6 +350,16 @@ the compound index `(I⊗μ, J⊗ν)` was built twice. Neither incarnation ever
 evaluated it at a nonzero frequency; the plasmon-probe and MPA screening
 requests pass the scalar charge `V_q` in every branch.
 
+The second incarnation supersedes the first rather than extending it: it
+computes the same sixteen blocks, but with both particle–hole orientations
+summed exactly (the June kernel used the `−2F` time-reversal shortcut,
+`alpha_chi = -2.0 * ...`, which is invalid on a magnet), with the reverse
+orientation's vertex phase conjugated, with the TT blocks Ward-subtracted,
+and with a mesh-interleaved packed layout instead of a replicated
+`jnp.concatenate` supermatrix. Nothing physical in the June branch is absent
+from main except its `breit_comparison.dat` diagnostic and the `Σ_mnk`
+component dumps.
+
 | incarnation | where | what it solves | frequency | status |
 |---|---|---|---|---|
 | `src/gw/w_bispinor.py`: channel-blocked supermatrix `[C n_C \| T1 n_T \| T2 n_T \| T3 n_T]`, the scalar `solve_w` at size `n_C + 3n_T` | `origin/agent/bispinor-supermatrix-w` (2026-06-16/17), carried to `origin/agent/bispinor-ibz-lorentz-unfold` with an IBZ→full-BZ Lorentz unfold, Σ^B folded into the static QP Σ_xc, and a screened-versus-unscreened Breit comparison (`breit_comparison.dat`) | milestone A: charge χ⁰⁰ only (W^{ij} = bare); milestone B: six TT χ^{ij} plus the three charge–current cross χ^{0i} by folding `γ̃` into the conduction ket of the scalar χ⁰ kernel | ω = 0 only, inside the static-quadrature section; GN-PPM probe screening charge-only | never merged. Measured on FM CrI3 6×6 (640/200 centroids): deeper bands −17…−40 meV Breit, screened vs unscreened differ by < 10 μeV |
