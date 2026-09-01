@@ -424,6 +424,27 @@ def test_catalog_candidate_helpers_are_deleted():
     assert not hasattr(delivered, "_catalog_walk")
 
 
+def test_screened_reference_bounds_an_on_demand_sign_definite_rule():
+    """The executor reference remains pole-centred without a table path."""
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([-1.0 - 0.1j]),
+        cell_masses=np.asarray([1.0]))
+    measure = (None, None, None, ((np.asarray([10.0 + 0.0j]), None),),
+               None, np.asarray([0]), None, None)
+    spec = {
+        "name": "shifted pole probe", "kind": "sign_definite_positive",
+        "problem": problem, "pole_sign": 1.0, "measure": measure,
+        "pole_indices": np.asarray([0]), "pole_bounds": (0.0, np.inf),
+        "raw_state_energy": np.asarray([0.0]),
+        "E_ref_A": 0.0, "E_ref_B": 0.0,
+    }
+    spec["E_ref_A"], spec["E_ref_B"] = delivered._factor_references(spec)
+
+    assert spec["E_ref_B"] == pytest.approx(10.0)
+    assert delivered._factor_growth(spec, np.asarray([4.0j]), 0.1)[1] <= 0.0
+
+
 def test_tolerance_ladder_is_deleted():
     assert not hasattr(delivered, "_FIT_TOLERANCE_LADDER")
 
