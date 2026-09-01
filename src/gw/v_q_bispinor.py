@@ -386,10 +386,10 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # to disk — no mixing.  Decision: write-time mixing keeps the on-disk
     # format identical to the existing post-mix tiles (downstream Σ^B
     # reads them unchanged via BispinorVqReader.get_tile).  Alternative
-    # (read-time mixing inside the reader) would require all 9 TT tiles
-    # to be in memory for any single get_tile(i, j) call — write-time
-    # mixing keeps the reader's per-tile contract clean.  See derivation
-    # §A5 (the algebraic identity for V^{i,j}_full[q]).
+    # (read-time mixing inside the reader) would require all 6 unique TT
+    # source tiles for any single get_tile(i, j) call — write-time mixing
+    # keeps the reader's per-tile contract clean.  See derivation §A5 (the
+    # algebraic identity for V^{i,j}_full[q]).
     tt_buffer: dict[tuple[int, int], jax.Array] = {}
     tt_g0 = None
     g0_by_channel: list[jax.Array | None] = [None, None, None, None]
@@ -512,29 +512,25 @@ def compute_V_q_bispinor_g_flat_to_h5(
     if _use_ibz_T and sym is not None and tt_buffer:
         from ffi import _services
         _services.ensure_on_path()
-        from symmetry_maps import mix_channels_by_proper_rotation
+        from symmetry_maps import mix_one_channel_by_proper_rotation
 
-        # Synthesise the 3 Hermitian-redundant tiles (j, i) for i < j from
-        # the stored upper-triangle.  These are needed as INPUTS to the
-        # 3×3 contraction; we write only the 6 unique upper-triangle outputs.
-        tt_full_in: dict[tuple[int, int], jax.Array] = dict(tt_buffer)
-        for (j, i), (i_src, j_src) in HERMITIAN_PAIRS.items():
-            tt_full_in[(j, i)] = jnp.conj(
-                jnp.swapaxes(tt_buffer[(i_src, j_src)], -1, -2))
-
-        tt_mixed = mix_channels_by_proper_rotation(
-            tt_full_in,
-            sym=sym,
-            sym_idx=np.asarray(
-                qgrid_policy.unfold_sym_idx, dtype=np.int32),
-            mesh_xy=mesh_xy,
-        )
-
-        # Write the 6 unique upper-triangle TT tiles post-mix.
+        # Keep only the six unique distributed source tiles resident.  The
+        # symmetry service derives lower-triangle Hermitian terms inside one
+        # fused output contraction.  Mix, persist and release one output at a
+        # time: six persistent inputs + one output at the Python boundary,
+        # with no 9-tile input/output stacks.  The symmetry service owns and
+        # separately gates any compiler collective workspace.
         for (mu_L, nu_L) in UNIQUE_TILES:
             if mu_L == 0 and nu_L == 0:
                 continue
-            V_mix = tt_mixed[(mu_L, nu_L)]
+            V_mix = mix_one_channel_by_proper_rotation(
+                tt_buffer,
+                output_channel=(mu_L, nu_L),
+                sym=sym,
+                sym_idx=np.asarray(
+                    qgrid_policy.unfold_sym_idx, dtype=np.int32),
+                mesh_xy=mesh_xy,
+            )
             name = tile_dataset_name(mu_L, nu_L)
             v_logical_shape = (int(V_mix.shape[0]), n_rmu_T, n_rmu_T)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
@@ -548,7 +544,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
                             "bispinor transverse IBZ one-leg accumulation "
                             "is missing despite three diagonal source tiles.")
                     g0_by_channel[mu_L] = tt_g0[mu_L - 1]
-        del tt_full_in, tt_mixed
+            del V_mix
     del tt_buffer, tt_g0
 
     # Format string + tile-layout JSON — rank-0 post-close write so

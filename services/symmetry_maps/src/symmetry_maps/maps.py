@@ -1370,6 +1370,100 @@ def _get_unfold_isdf_one_leg_jit(
     return _do_unfold
 
 
+_TT_UNIQUE_CHANNELS = (
+    (1, 1), (2, 2), (3, 3), (1, 2), (1, 3), (2, 3),
+)
+
+
+def _prepare_tt_rotation_mix(V_tt_unique, *, sym, sym_idx):
+    """Validate the six-tile carrier and obtain its one typed action."""
+    if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
+        raise TypeError(
+            "TT proper-rotation mixing: sym_idx is host metadata; "
+            "pass a NumPy array, not a JAX array or tracer.")
+    sym_raw = np.asarray(sym_idx)
+    if sym_raw.ndim != 1:
+        raise ValueError(
+            "TT proper-rotation mixing: sym_idx must be rank one; "
+            f"got {sym_raw.shape}.")
+    R_per_q = np.asarray(sym.cartesian_action(
+        sym_raw, axial=True, time_odd=True), dtype=np.float64)
+    if R_per_q.shape != (sym_raw.size, 3, 3):
+        raise ValueError(
+            "TT proper-rotation mixing: typed Cartesian actions must "
+            f"have shape {(sym_raw.size, 3, 3)}; got {R_per_q.shape}.")
+
+    for channel in _TT_UNIQUE_CHANNELS:
+        if channel not in V_tt_unique:
+            raise ValueError(
+                f"TT proper-rotation mixing: missing unique TT tile "
+                f"{channel}; caller must supply the six upper-triangle "
+                "tiles.  Lower-triangle tiles are derived by Hermitian "
+                "transpose inside the compiled kernel.")
+    values = tuple(V_tt_unique[channel] for channel in _TT_UNIQUE_CHANNELS)
+    shapes = {tuple(int(n) for n in value.shape) for value in values}
+    if len(shapes) != 1:
+        raise ValueError(
+            "TT proper-rotation mixing: all six unique tiles must have one "
+            f"shape; got {sorted(shapes)}.")
+    shape = next(iter(shapes))
+    if len(shape) != 3 or shape[1] != shape[2]:
+        raise ValueError(
+            "TT proper-rotation mixing: each tile must have shape "
+            f"(n_q, mu, mu); got {shape}.")
+    if shape[0] != sym_raw.size:
+        raise ValueError(
+            "TT proper-rotation mixing: tile q extent must match sym_idx; "
+            f"got {shape[0]} and {sym_raw.size}.")
+    dtypes = {np.dtype(value.dtype) for value in values}
+    if len(dtypes) != 1:
+        raise ValueError(
+            "TT proper-rotation mixing: all six unique tiles must have one "
+            f"dtype; got {sorted(str(dtype) for dtype in dtypes)}.")
+    return values, shape, R_per_q
+
+
+def mix_one_channel_by_proper_rotation(
+    V_tt_unique,
+    *,
+    output_channel,
+    sym,
+    sym_idx,
+    mesh_xy,
+):
+    """Mix one output channel from six unique bispinor TT tiles.
+
+    Each Pauli-vector index requests the canonical axial, time-odd action
+    from ``sym``.  The two antiunitary signs cancel while
+    :func:`unfold_isdf_operator` owns the single complex conjugation.
+
+    ``V_tt_unique`` supplies only ``(11, 22, 33, 12, 13, 23)``.  The three
+    lower-triangle inputs are their Hermitian transposes and are formed inside
+    the compiled expression, never retained as Python-level device arrays.
+    One invocation returns one ``(n_q, mu, mu)`` array on
+    ``P(None, 'x', 'y')``.  A caller that writes and releases each result
+    therefore retains six input tiles plus one output at the Python boundary,
+    rather than stacking nine inputs and nine outputs.  Compiler collective
+    workspace is measured separately.
+    """
+    try:
+        out_i, out_j = (int(output_channel[0]), int(output_channel[1]))
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError(
+            "mix_one_channel_by_proper_rotation: output_channel must be "
+            "a pair in {1,2,3}².") from exc
+    if out_i not in (1, 2, 3) or out_j not in (1, 2, 3):
+        raise ValueError(
+            "mix_one_channel_by_proper_rotation: output_channel must be "
+            f"a pair in {{1,2,3}}²; got {(out_i, out_j)}.")
+
+    values, shape, R_per_q = _prepare_tt_rotation_mix(
+        V_tt_unique, sym=sym, sym_idx=sym_idx)
+    fn = _get_mix_one_channel_jit(
+        V_shape=shape, R_per_q_arr=R_per_q, mesh_xy=mesh_xy)
+    return fn(*values, np.int32(out_i - 1), np.int32(out_j - 1))
+
+
 def mix_channels_by_proper_rotation(
     V_tt_per_channel,
     *,
@@ -1377,114 +1471,92 @@ def mix_channels_by_proper_rotation(
     sym_idx,
     mesh_xy,
 ):
-    """Mix the two Pauli-vector indices on bispinor TT tiles.
+    """Compatibility bulk result built from the one-output TT kernel.
 
-    Each index requests the canonical axial, time-odd action from ``sym``.
-    The two antiunitary signs cancel while :func:`unfold_isdf_operator` owns
-    the single complex conjugation.  Keeping the action typed here prevents
-    callers from choosing a transpose, determinant sign, or TR convention.
-
-    Parameters
-    ----------
-    V_tt_per_channel : dict[(i, j) -> jax.Array]
-        Dict keyed by ``(i, j)`` with ``i, j ∈ {1, 2, 3}`` (9 entries).
-        Each value is ``(n_q_full, μ, ν)`` complex128 already at full-BZ
-        shape, sharded ``P(None, 'x', 'y')``.  Callers may pass the 6
-        unique tiles + the 3 Hermitian-redundant tiles synthesised via
-        ``conj(swapaxes(V[i,j], -1, -2))``.
-    sym_idx : numpy.ndarray
-        Host ``(n_q_full,)`` integer metadata from ``SymMaps.sym_idx_q``.
-        Device arrays and tracers are refused before the compiled tile path.
-    sym : SymMaps
-        Canonical operation and representation source.
-    mesh_xy : jax.sharding.Mesh
-        Device mesh (used to lock the output sharding).
-
-    Returns
-    -------
-    dict[(i, j) -> jax.Array]
-        Same keys, same shapes, sharded ``P(None, 'x', 'y')``.
+    The six upper-triangle inputs are the source of truth.  Any supplied
+    lower-triangle entries are ignored and reconstructed by Hermitian
+    transpose, as required by the bispinor V format.  Production writers
+    should call :func:`mix_one_channel_by_proper_rotation` and release each
+    output after persistence; this all-output convenience surface necessarily
+    retains its returned nine arrays.
     """
-    if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
-        raise TypeError(
-            "mix_channels_by_proper_rotation: sym_idx is host metadata; "
-            "pass a NumPy array, not a JAX array or tracer.")
-    sym_raw = np.asarray(sym_idx)
-    if sym_raw.ndim != 1:
-        raise ValueError(
-            "mix_channels_by_proper_rotation: sym_idx must be rank one; "
-            f"got {sym_raw.shape}.")
-    R_per_q = np.asarray(sym.cartesian_action(
-        sym_raw, axial=True, time_odd=True), dtype=np.float64)
-    if R_per_q.shape != (sym_raw.size, 3, 3):
-        raise ValueError(
-            "mix_channels_by_proper_rotation: typed Cartesian actions must "
-            f"have shape {(sym_raw.size, 3, 3)}; got {R_per_q.shape}.")
-
-    # Build the 9×9 source array V_in[α, β] at full-BZ shape, contract,
-    # write back into the same 6 unique slots (plus 3 redundants).
-    keys_in = [(i, j) for i in (1, 2, 3) for j in (1, 2, 3)]
-    for k in keys_in:
-        if k not in V_tt_per_channel:
-            raise ValueError(
-                f"mix_channels_by_proper_rotation: missing TT tile {k}; "
-                f"caller must supply all 9 (i, j) ∈ {{1,2,3}}² "
-                f"(use ``conj(swapaxes(.., -1, -2))`` to synthesise the "
-                f"Hermitian-redundant entries).")
-    sample = V_tt_per_channel[(1, 1)]
-    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    fn = _get_mix_channels_jit(
-        V_shape=tuple(int(s) for s in sample.shape),
-        R_per_q_arr=R_per_q,
-        mesh_xy=mesh_xy,
-    )
-    # Stack input tiles in (α, β, q, μ, ν) layout; contract via einsum
-    # and unstack into the output dict.
-    V_in = jnp.stack(
-        [jnp.stack([V_tt_per_channel[(a, b)] for b in (1, 2, 3)], axis=0)
-         for a in (1, 2, 3)],
-        axis=0,
-    )                                                       # (3, 3, n_q, μ, ν)
-    V_out = fn(V_in)                                        # (3, 3, n_q, μ, ν)
+    values, shape, R_per_q = _prepare_tt_rotation_mix(
+        V_tt_per_channel, sym=sym, sym_idx=sym_idx)
+    fn = _get_mix_one_channel_jit(
+        V_shape=shape, R_per_q_arr=R_per_q, mesh_xy=mesh_xy)
     return {
-        (i, j): jax.lax.with_sharding_constraint(V_out[i - 1, j - 1], V_sh)
+        (i, j): fn(*values, np.int32(i - 1), np.int32(j - 1))
         for i in (1, 2, 3) for j in (1, 2, 3)
     }
 
 
-_MIX_CHANNELS_JIT_CACHE: dict = {}
+_MIX_ONE_CHANNEL_JIT_CACHE: dict = {}
 
 
-def _get_mix_channels_jit(*, V_shape, R_per_q_arr, mesh_xy):
-    """Cache the inner Lorentz-mix jit by (shape, R-table content).
+def _get_mix_one_channel_jit(*, V_shape, R_per_q_arr, mesh_xy):
+    """Cache the six-input, one-output Lorentz-mix executable.
 
     Same content-keyed caching strategy as
     :func:`_get_unfold_isdf_operator_jit`: the R table is baked into the jit
-    closure as a constant so XLA can fold it into the HLO.  The cache key is
-    the bytes-hash of the table plus the V shape plus the mesh identity.
+    closure.  The requested output pair remains a two-scalar runtime operand,
+    so all six persisted outputs reuse one compiled module.
     """
     key = (
         V_shape,
         R_per_q_arr.shape, R_per_q_arr.tobytes(),
         id(mesh_xy),
     )
-    hit = _MIX_CHANNELS_JIT_CACHE.get(key)
+    hit = _MIX_ONE_CHANNEL_JIT_CACHE.get(key)
     if hit is not None:
         return hit
 
-    R_per_q_j = jnp.asarray(R_per_q_arr)                    # (n_q_full, 3, 3)
-    V_sh = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-    in_sh = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+    R_per_q_j = jnp.asarray(R_per_q_arr)       # [q, destination, source]
+    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    in_shardings = (V_sh,) * 6 + (None, None)
 
-    @partial(jax.jit, in_shardings=in_sh, out_shardings=V_sh)
-    def _do_mix(V_in):
-        # V_in: (3, 3, n_q, μ, ν); R is the forward action [q,out,in].
-        return jnp.einsum(
-            'qia,qjb,abqmn->ijqmn',
-            R_per_q_j, R_per_q_j, V_in,
+    @partial(jax.jit, in_shardings=in_shardings, out_shardings=V_sh)
+    def _do_mix(V11, V22, V33, V12, V13, V23, out_i, out_j):
+        # Dynamic destination rows keep this one executable shared by all
+        # output channels.  Lower source tiles are fused Hermitian views.
+        ri = jax.lax.dynamic_index_in_dim(
+            R_per_q_j, out_i, axis=1, keepdims=False)
+        rj = jax.lax.dynamic_index_in_dim(
+            R_per_q_j, out_j, axis=1, keepdims=False)
+
+        def weighted(a, b, tile):
+            return (ri[:, a] * rj[:, b])[:, None, None] * tile
+
+        # Direct-orientation terms need no centroid-axis redistribution.
+        # Keep the three Hermitian-transposed terms behind a runtime loop:
+        # spelling all three in one expression lets XLA schedule three
+        # tile-sized collective-permute temporaries concurrently.  The loop
+        # reuses one temporary while carrying only the final output tile.
+        direct = (
+            weighted(0, 0, V11)
+            + weighted(1, 1, V22)
+            + weighted(2, 2, V33)
+            + weighted(0, 1, V12)
+            + weighted(0, 2, V13)
+            + weighted(1, 2, V23)
         )
+        lower_coeff = jnp.stack((
+            ri[:, 1] * rj[:, 0],
+            ri[:, 2] * rj[:, 0],
+            ri[:, 2] * rj[:, 1],
+        ), axis=0)
 
-    _MIX_CHANNELS_JIT_CACHE[key] = _do_mix
+        def add_lower(k, acc):
+            upper = jax.lax.switch(
+                k,
+                (lambda _: V12, lambda _: V13, lambda _: V23),
+                operand=None,
+            )
+            lower = jnp.conj(jnp.swapaxes(upper, -1, -2))
+            return acc + lower_coeff[k, :, None, None] * lower
+
+        return jax.lax.fori_loop(0, 3, add_lower, direct)
+
+    _MIX_ONE_CHANNEL_JIT_CACHE[key] = _do_mix
     return _do_mix
 
 

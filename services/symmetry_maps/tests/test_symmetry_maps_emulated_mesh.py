@@ -43,6 +43,7 @@ import pytest
 
 from lxkit.testing import require_devices
 from symmetry_maps import (KStarMap, centroid_source_map_and_wrap,
+                           mix_one_channel_by_proper_rotation,
                            mix_channels_by_proper_rotation, star_broadcast,
                            star_select, star_spread,
                            unfold_isdf_operator)
@@ -577,7 +578,7 @@ class _TypedSym:
 
 @pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])
 def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
-    """G6.  The §A5 3-vector mixing, against an explicit double sum.
+    """G6.  The streamed §A5 3-vector mix, against an explicit double sum.
 
     ``mix_channels_by_proper_rotation`` applies, per full-BZ q::
 
@@ -591,19 +592,30 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
     :func:`test_the_lorentz_reference_notices_a_transposed_R` is the twin
     that proves the difference is visible.
     """
+    import jax
     import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
     mesh = _mesh(px, py)
     rng = np.random.default_rng(23)
     n_q, n_mu = 5, 8
     R = _inverse_axial_rows(rng, _NTRAN)
-    tiles = {}
-    for i in (1, 2, 3):
-        for j in (1, 2, 3):
-            a = (rng.standard_normal((n_q, n_mu, n_mu))
-                 + 1j * rng.standard_normal((n_q, n_mu, n_mu)))
-            tiles[(i, j)] = a
+    unique = {}
+    for i, j in ((1, 1), (2, 2), (3, 3), (1, 2), (1, 3), (2, 3)):
+        a = (rng.standard_normal((n_q, n_mu, n_mu))
+             + 1j * rng.standard_normal((n_q, n_mu, n_mu)))
+        unique[(i, j)] = (0.5 * (a + np.swapaxes(a.conj(), -1, -2))
+                          if i == j else a)
+    tiles = dict(unique)
+    for j, i in ((2, 1), (3, 1), (3, 2)):
+        tiles[(j, i)] = np.swapaxes(unique[(i, j)].conj(), -1, -2)
+
+    tile_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    unique_dev = {
+        channel: jax.device_put(jnp.asarray(value), tile_sharding)
+        for channel, value in unique.items()
+    }
     out = mix_channels_by_proper_rotation(
-        {k: jnp.asarray(v) for k, v in tiles.items()},
+        unique_dev,
         sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
 
     Rq = R[np.asarray(_SYM)]                                  # (n_q, 3, 3)
@@ -614,10 +626,102 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
                 for b in (1, 2, 3):
                     coeff = Rq[:, a - 1, i - 1] * Rq[:, b - 1, j - 1]
                     ref += coeff[:, None, None] * tiles[(a, b)]
-            got = np.asarray(out[(i, j)])
+            one = mix_one_channel_by_proper_rotation(
+                unique_dev, output_channel=(i, j),
+                sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
+            assert one.sharding.spec == P(None, 'x', 'y')
+            shard_shapes = {tuple(shard.data.shape)
+                            for shard in one.addressable_shards}
+            assert shard_shapes == {(n_q, n_mu // px, n_mu // py)}
+            got = np.asarray(one)
             rel = float(np.abs(got - ref).max()
                         / max(np.abs(ref).max(), 1e-300))
             assert rel < 1e-13, f"{px}x{py} tile ({i},{j}): {rel:.3e}"
+            np.testing.assert_allclose(np.asarray(out[(i, j)]), got,
+                                       rtol=0.0, atol=0.0)
+
+
+def test_the_streamed_lorentz_hlo_has_six_inputs_and_one_tile_output():
+    """The production kernel has no 9-channel stack or all-output tuple.
+
+    This is the structural memory gate behind the writer's streaming loop.
+    The old reference executable consumes and returns ``(3,3,q,mu,mu)``;
+    the live executable consumes six ``(q,mu,mu)`` tiles and returns one.
+    Compiler memory sizes are compared only within this one build, so the
+    test does not freeze backend-specific workspace bytes.
+    """
+    from functools import partial
+
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    mesh = _mesh(2, 2)
+    rng = np.random.default_rng(37)
+    n_q, n_mu = 5, 8
+    tile_nbytes = n_q * n_mu * n_mu * np.dtype(np.complex128).itemsize
+    tile_shard_nbytes = tile_nbytes // 4
+    inverse = _inverse_axial_rows(rng, _NTRAN)
+    typed = _TypedSym(inverse)
+    Rq = np.asarray(typed.cartesian_action(
+        _SYM, axial=True, time_odd=True), dtype=np.float64)
+    tile_sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+
+    unique_host = {}
+    for channel in ((1, 1), (2, 2), (3, 3), (1, 2), (1, 3), (2, 3)):
+        unique_host[channel] = (
+            rng.standard_normal((n_q, n_mu, n_mu))
+            + 1j * rng.standard_normal((n_q, n_mu, n_mu)))
+    unique_dev = tuple(jax.device_put(
+        jnp.asarray(unique_host[channel]), tile_sharding)
+        for channel in ((1, 1), (2, 2), (3, 3), (1, 2), (1, 3), (2, 3)))
+
+    get_live = mix_one_channel_by_proper_rotation.__globals__[
+        "_get_mix_one_channel_jit"]
+    live_fn = get_live(
+        V_shape=(n_q, n_mu, n_mu), R_per_q_arr=Rq, mesh_xy=mesh)
+    live_lowered = live_fn.lower(
+        *unique_dev, np.int32(0), np.int32(1))
+    live_hlo = live_lowered.compiler_ir(dialect="hlo").as_hlo_text()
+    stacked_shape = f"c128[3,3,{n_q},{n_mu},{n_mu}]"
+    assert stacked_shape not in live_hlo
+    live_compiled = live_lowered.compile()
+    live_mem = live_compiled.memory_analysis()
+
+    full_host = dict(unique_host)
+    for j, i in ((2, 1), (3, 1), (3, 2)):
+        full_host[(j, i)] = np.swapaxes(
+            unique_host[(i, j)].conj(), -1, -2)
+    stacked_host = np.stack([
+        np.stack([full_host[(i, j)] for j in (1, 2, 3)], axis=0)
+        for i in (1, 2, 3)
+    ], axis=0)
+    stack_sharding = NamedSharding(mesh, P(None, None, None, 'x', 'y'))
+    stacked_dev = jax.device_put(jnp.asarray(stacked_host), stack_sharding)
+    Rj = jnp.asarray(Rq)
+
+    @partial(jax.jit, in_shardings=stack_sharding,
+             out_shardings=stack_sharding)
+    def old_all_outputs(V_in):
+        return jnp.einsum(
+            'qia,qjb,abqmn->ijqmn', Rj, Rj, V_in)
+
+    old_lowered = old_all_outputs.lower(stacked_dev)
+    old_hlo = old_lowered.compiler_ir(dialect="hlo").as_hlo_text()
+    assert stacked_shape in old_hlo
+    old_mem = old_lowered.compile().memory_analysis()
+
+    assert live_mem.argument_size_in_bytes >= 6 * tile_shard_nbytes
+    assert live_mem.argument_size_in_bytes < 7 * tile_shard_nbytes
+    assert live_mem.output_size_in_bytes == tile_shard_nbytes
+    assert old_mem.argument_size_in_bytes == 9 * tile_shard_nbytes
+    assert old_mem.output_size_in_bytes == 9 * tile_shard_nbytes
+    assert (live_mem.argument_size_in_bytes
+            + live_mem.output_size_in_bytes
+            + live_mem.temp_size_in_bytes
+            < old_mem.argument_size_in_bytes
+            + old_mem.output_size_in_bytes
+            + old_mem.temp_size_in_bytes)
 
 
 def test_the_lorentz_reference_notices_a_transposed_R():
@@ -659,11 +763,7 @@ def test_the_lorentz_reference_notices_a_transposed_R():
 
 
 def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_action():
-    """All nine tiles and a typed ``(n_q,3,3)`` action are required.
-
-    Nine, not six: the caller may synthesise the Hermitian-redundant
-    entries with ``conj(swapaxes(...))``, but the function will not guess.
-    """
+    """Six unique tiles, one legal output and a typed action are required."""
     import jax.numpy as jnp
     mesh = _mesh(1, 1)
     rng = np.random.default_rng(31)
@@ -672,7 +772,7 @@ def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_action():
                                  + 0j)
              for i in (1, 2, 3) for j in (1, 2, 3)}
     partial = {k: v for k, v in tiles.items() if k != (2, 3)}
-    with pytest.raises(ValueError, match=r"missing TT tile"):
+    with pytest.raises(ValueError, match=r"missing unique TT tile"):
         mix_channels_by_proper_rotation(
             partial, sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
 
@@ -687,6 +787,11 @@ def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_action():
     with pytest.raises(TypeError, match=r"host metadata"):
         mix_channels_by_proper_rotation(
             tiles, sym=_TypedSym(R), sym_idx=jnp.asarray(_SYM), mesh_xy=mesh)
+
+    with pytest.raises(ValueError, match=r"output_channel"):
+        mix_one_channel_by_proper_rotation(
+            tiles, output_channel=(0, 2),
+            sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
 
 
 # ---------------------------------------------------------------------------
