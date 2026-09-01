@@ -57,8 +57,8 @@ from distrib_la.loader import _HOST_TARGET_SYMBOLS, _PLATFORMS
 # fail against every older pin, including the campaign's.  Named skips, not
 # xfail — see claim 209 for the measured before/after sets.
 _NEEDS_GEMM_LANE_SO = (
-    "requires the GEMM FFI lane .so (rescue snapshot 1f9128f1, unvalidated) "
-    "— unskip when that lane lands")
+    "requires a rebuilt host .so containing the ScaLAPACK/PBLAS GEMM "
+    "handler — unskip when that artifact is pinned")
 
 
 #: The ScaLAPACK host handlers.  BUILD_NOTES.md's check 2 counts
@@ -66,6 +66,14 @@ _NEEDS_GEMM_LANE_SO = (
 #: the count and fails here.
 _SCALAPACK_SYMBOLS = tuple(sorted(
     sym for sym in _HOST_TARGET_SYMBOLS.values() if "Scalapack" in sym))
+
+_SCALAPACK_GEMM_TARGET = "lorrax_scalapack_batched_gemm"
+_SCALAPACK_GEMM_EXPORT = "ScalapackBatchedGemmHostFfi"
+_SCALAPACK_API_SYMBOLS = (
+    "pzheevd_", "pdsyevd_", "pzgetrf_", "pdgetrf_", "pzgetrs_",
+    "pdgetrs_", "pzgemm_", "pdgemm_", "numroc_", "Cblacs_gridinfo",
+    "descinit_", "Csys2blacs_handle", "Cblacs_gridinit",
+)
 
 # ---------------------------------------------------------------------------
 # WHAT LORRAX ITSELF DEFINES — the set that must not be shared.
@@ -241,6 +249,27 @@ def test_check_2_all_scalapack_handlers_are_exported():
         f"{so} exports {grepped} Scalapack* symbols, want exactly "
         f"{len(_SCALAPACK_SYMBOLS)} "
         f"({sorted(s for s in syms if 'Scalapack' in s)})")
+
+
+def test_exact_scalapack_gemm_loader_target():
+    """Pin the public target spelling to the exact C++ export."""
+    assert _HOST_TARGET_SYMBOLS.get(
+        _SCALAPACK_GEMM_TARGET) == _SCALAPACK_GEMM_EXPORT
+    source_path = os.path.join(
+        _repo_root(), "src", "ffi", "cpp", "scalapack", "gemm_ffi.cc")
+    with open(source_path) as fh:
+        source = fh.read()
+    assert re.search(
+        rf"XLA_FFI_DEFINE_HANDLER_SYMBOL\(\s*"
+        rf"{re.escape(_SCALAPACK_GEMM_EXPORT)}\s*,", source)
+
+
+def test_exact_scalapack_gemm_export_is_present():
+    """Make every pinned host artifact carry that exact export."""
+    so = _pinned("cpu")
+    assert _SCALAPACK_GEMM_EXPORT in _defined_symbols(so), (
+        f"{so} does not export {_SCALAPACK_GEMM_EXPORT} for "
+        f"{_SCALAPACK_GEMM_TARGET}")
 
 
 def test_check_3_no_fftw_in_the_dynamic_dependencies():
@@ -616,6 +645,28 @@ def _repo_root():
             f"from {here} (standalone install of this service).  The verifier "
             "is the LORRAX repo's file; covered by any monorepo run.")
     return root
+
+
+def test_scalapack_symbol_checker_owns_the_exact_13_symbol_surface():
+    """Keep the executable provider gate aligned with C++ declarations."""
+    root = _repo_root()
+    checker = os.path.join(
+        root, "src", "ffi", "cpp", "scalapack", "check_symbol_contract.sh")
+    out = subprocess.run(
+        ["bash", checker, "--print-all"], stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, timeout=60)
+    assert out.returncode == 0, out.stdout
+    assert tuple(out.stdout.splitlines()) == _SCALAPACK_API_SYMBOLS
+
+    header = os.path.join(
+        root, "src", "ffi", "cpp", "scalapack", "blacs_grid.h")
+    with open(header) as fh:
+        source = fh.read()
+    missing = [
+        symbol for symbol in _SCALAPACK_API_SYMBOLS
+        if re.search(rf"\b{re.escape(symbol)}\s*\(", source) is None
+    ]
+    assert not missing, f"{header} lacks declarations for {missing}"
 
 
 def _run_verifier(so: str, leg: str, extra_env: dict | None = None):

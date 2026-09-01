@@ -372,8 +372,10 @@ face-sharded matrices: cuBLASMp on CUDA, PBLAS `pdgemm`/`pzgemm` on CPU, or
 requests never demote, and `cusolvermp` names its cuBLASMp sibling. Provider
 handlers accept `float64` and `complex128`, require an exact 2-D `('x','y')`
 mesh with y-minor process order, one JAX process per cell, and exact face
-tiling. They alias/donate `C` to the output. cuBLASMp and SLATE also require a
-square mesh; PBLAS supports rectangular grids. `backend='off'` has no
+tiling. They alias/donate `C` to the output. All three service routes require
+a square mesh. General PBLAS supports rectangular grids, but this one-face
+layout does not: A's contracted column blocks must match B's row blocks.
+`backend='off'` has no
 provider and is therefore legal only with the staged route.
 
 With `batched_route='batch_reshard'`, the service pads a leading batch `B`
@@ -699,8 +701,10 @@ explicit requests are never demoted.
 5. **A genuine CPU partition.** The "cpu" legs ran on the GPU pool's nodes
    with `JAX_PLATFORMS=cpu`; the Milan CPU partition has one census leg
    (jobid 56446562) and no perf leg.
-6. **Non-square 1-D meshes.** ScaLAPACK accepts them (square *blocks*, not
-   a square grid) and nothing has been timed on one.
+6. **Non-square 1-D solver meshes.** ScaLAPACK eig/LU accept them (square
+   *blocks*, not a square grid) and nothing has been timed on one. The PBLAS
+   GEMM service deliberately refuses them because its contracted face axes
+   do not align.
 7. **Batched vs serial, split by backend.** ~~Never isolated.~~ Partly
    closed by the A/B in § "The batched surface is a scan": on cpu 2×2 at
    nq=8/n=64 the scan route costs 0.0115 s against the ScaLAPACK stacked
