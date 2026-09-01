@@ -44,10 +44,20 @@ from minimax.reciprocal_fit import (ReciprocalMeasureProblem, delivered_error,
 
 __all__ = [
     "RoqWindow", "RoqGroup", "RoqRule", "RoqBranchEvidence", "RoqPlan",
+    "RoqPlanningRefusal",
     "fit_roq_group", "fit_roq_branch", "roq_select_times",
     "branch_delivered_error", "branch_noise_gate",
     "plan_measure_adapted_roq",
 ]
+
+
+class RoqPlanningRefusal(RuntimeError):
+    """A validated ROQ miss carrying its best achieved acceptance metrics."""
+
+    def __init__(self, message: str, residual: float, kappa_p99: float):
+        super().__init__(message)
+        self.residual = float(residual)
+        self.kappa_p99 = float(kappa_p99)
 
 
 # These are production policy, not user dials.  The fixed scan contains the
@@ -896,9 +906,13 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
             if row is not None:
                 candidates.append((row, tuple(rules)))
         if not candidates:
-            raise RuntimeError(
+            error = branch_delivered_error(groups, rules)
+            _noise_passed, kappa = branch_noise_gate(
+                groups, rules, _combined_target(branch_windows))
+            raise RoqPlanningRefusal(
                 f"branch {branch!r}: no product-window ROQ plan meets the "
-                "refined delivered-error and noise gates")
+                "refined delivered-error and noise gates",
+                float(np.max(error)), float(kappa))
         row, rules = min(candidates, key=lambda item: (
             item[0].node_count, item[0].max_error, item[0].strategy))
         selected_rules.extend(rules)
