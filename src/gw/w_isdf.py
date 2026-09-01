@@ -468,9 +468,17 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     # ONE planned GEMM, built here (eagerly, once) and shared by every Gv
     # and Gc build this kernel ever does — see distrib_la.gemm_plan's own
     # "hoist this call out of every per-k/per-tau loop" instruction.
+    #
+    # A four-current block streams the 4x4 open-spin trace one pair at a
+    # time.  Its plan therefore has only centroid rows/columns; the ordinary
+    # scalar kernel keeps the incumbent flattened (spin,centroid) plan.  The
+    # arithmetic is identical: 16 pair GEMMs contain exactly the same
+    # multiply-adds as one 4mu-by-4mu GEMM.  What changes is the live range:
+    # two 1x1-spin G/FFT tensors replace two full 4x4-spin tensors.
+    g_spin_extent = 1 if vertex_pair else ns
     g_plan = gemm_plan(
-        mesh_xy, m=n_rmu_left * ns, k=nb_full,
-        n=n_rmu_right * ns, nq=nk, dtype=jnp.complex128)
+        mesh_xy, m=n_rmu_left * g_spin_extent, k=nb_full,
+        n=n_rmu_right * g_spin_extent, nq=nk, dtype=jnp.complex128)
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
@@ -496,6 +504,18 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                        mask=mask_c, layout="face", gemm=g_plan),
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
+
+    def _build_G_pair(psi_mun_left, psi_nmu_right, mask, enk_full,
+                      tau_scalar, e_ref, spin_left, spin_right):
+        """One open-spin pair through the canonical face G builder."""
+        psi_mun_pair = jax.lax.dynamic_slice_in_dim(
+            psi_mun_left, spin_left, 1, axis=1)
+        psi_nmu_pair = jax.lax.dynamic_slice_in_dim(
+            psi_nmu_right, spin_right, 1, axis=2)
+        G_pair = build_G_tau(
+            psi_mun_pair, psi_nmu_pair, enk_full, tau_scalar,
+            e_ref=e_ref, mask=mask, layout="face", gemm=g_plan)
+        return jax.lax.with_sharding_constraint(jnp.conj(G_pair), _G_k_shard)
 
     _nodes_shard = MinimaxNodes(
         t=NamedSharding(mesh_xy, _rep1),
@@ -562,6 +582,58 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             t_scalar, alpha_scalar = xs
             tau_kernel = (t_scalar if complex_contour else
                           jnp.real(t_scalar).astype(jnp.float64))
+            if vertex_pair:
+                perm_l, phase_l, perm_r, phase_r = vertex_operands
+                pair_zero = jax.lax.with_sharding_constraint(
+                    jnp.zeros((nk, n_rmu_left, n_rmu_right),
+                              dtype=jnp.complex128),
+                    _chi_R_shard)
+
+                def _pair_body(pair_accs, pair_index):
+                    forward_acc, reverse_acc = pair_accs
+                    spin_l = pair_index // ns
+                    spin_r = pair_index % ns
+                    gc_l = (spin_l if left_identity else perm_l[spin_l])
+                    gc_r = (spin_r if right_identity else perm_r[spin_r])
+                    coeff_l = (jnp.asarray(1, jnp.complex128)
+                               if left_identity else phase_l[spin_l])
+                    # gamma_double_contract's right-endpoint convention is
+                    # the conjugated row phase (the incumbent full-spin
+                    # branch immediately below uses the same convention).
+                    coeff_r = (jnp.asarray(1, jnp.complex128)
+                               if right_identity
+                               else jnp.conj(phase_r[spin_r]))
+
+                    Gv_k_pair = _build_G_pair(
+                        psi_mun, psi_nmu, mask_v, enk_full, -tau_kernel,
+                        vmax, spin_l, spin_r)
+                    t_c = (jnp.conj(tau_kernel)
+                           if complex_contour else tau_kernel)
+                    Gc_k_pair = _build_G_pair(
+                        psi_mun, psi_nmu, mask_c, enk_full, t_c,
+                        cmin, gc_l, gc_r)
+                    Gv_R_pair = _Gv_fftn(Gv_k_pair)[:, 0, :, 0, :]
+                    Gc_R_pair = _Gc_fftn(Gc_k_pair)[:, 0, :, 0, :]
+                    contribution = ((coeff_l * coeff_r)
+                                    * Gc_R_pair * jnp.conj(Gv_R_pair))
+                    # The incumbent reverse orientation transposes the same
+                    # two G tensors and swaps the vertex tables.  For this
+                    # (spin_l,spin_r) term that is exactly contribution^T in
+                    # its natural (mu_B,mu_A) endpoint order.
+                    return (forward_acc + contribution,
+                            reverse_acc
+                            + jnp.swapaxes(contribution, -1, -2)), None
+
+                (chi_tau_raw, reverse_tau_raw), _ = jax.lax.scan(
+                    _pair_body, (pair_zero, jnp.swapaxes(pair_zero, -1, -2)),
+                    jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
+                chi_tau = jax.lax.with_sharding_constraint(
+                    chi_tau_raw, _chi_R_shard)
+                if not complex_contour:
+                    chi_tau = _complete_static_vertex_orientations(
+                        chi_tau, reverse_tau_raw)
+                return chi_R_acc + alpha_scalar * chi_tau, None
+
             Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
                                       enk_full, tau_kernel, vmax, cmin)
             Gv_R = _Gv_fftn(Gv_k)
