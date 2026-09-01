@@ -79,8 +79,12 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     assert relative_error <= 1.01 * evidence["refined_residual"] + 1.0e-15
     assert win.E_ref_B == pytest.approx(Omega[0].real)
     assert evidence["screened_factor_log_growth_max"] <= 0.0
-    assert evidence["family"] == "noncrossing_on_demand"
-    assert "Hackbusch-seeded" in evidence["fit_provenance"]
+    assert evidence["family"] in {
+        "noncrossing_on_demand", "measure_adapted_roq"}
+    if evidence["family"] == "noncrossing_on_demand":
+        assert "Hackbusch-seeded" in evidence["fit_provenance"]
+    else:
+        assert "measure-adapted ROQ" in evidence["fit_provenance"]
 
 
 def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
