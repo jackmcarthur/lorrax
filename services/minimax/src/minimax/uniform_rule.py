@@ -185,9 +185,12 @@ class _RayFamily:
         return self.A @ T, self.A @ dT
 
     def interpolatory(self):
-        Ug = self.U(self.s_grid.astype(complex))
+        # The Lobatto grid contains s = 0; a node there is a zero time node,
+        # which the executor refuses, so it is never offered to the QR.
+        cand = self.s_grid[1:-1]
+        Ug = self.U(cand.astype(complex))
         _, _, piv = _pivoted_qr(Ug, mode="economic", pivoting=True)
-        s = np.sort(self.s_grid[piv[:self.r]]).astype(complex)
+        s = np.sort(cand[piv[:self.r]]).astype(complex)
         w = lstsq(self.U(s), self.m, rcond=None)[0]
         return s, w
 
@@ -257,6 +260,8 @@ class _RayFamily:
                 protected.update((k - 1, k, k + 1))
                 if len(drop) >= batch:
                     break
+            if not drop:
+                break                       # no removable candidate left
             s_t = np.delete(s, drop)
             w_t = lstsq(self.U(s_t), self.m, rcond=None)[0]
             s_t, w_t = self.newton(s_t, w_t, im_lo, im_hi)

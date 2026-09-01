@@ -1684,8 +1684,11 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
         "candidate_tolerance": float(eps),
         "provenance": rule.one_line(),
     }
-    candidate = _rule_candidate(
-        spec["problem"], spec["validation"], times, weights, evidence)
+    try:
+        candidate = _rule_candidate(
+            spec["problem"], spec["validation"], times, weights, evidence)
+    except (RuntimeError, ValueError, FloatingPointError):
+        return None, None
     metrics = candidate["metrics"]
     factor = _factor_growth(spec, times, eta)
     if (not _rule_accepted(metrics, relative_target)
@@ -1707,14 +1710,27 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
     if eps is not None:
         candidate, metrics = _uniform_box_candidate(
             spec, eta, eps, max_nodes, factor_growth_cap, relative_target)
-        if candidate is None and metrics is not None and metrics[0] > 0.0:
+        attempts = []
+        if metrics is not None:
+            attempts.append({"family": "uniform_box", "candidate_tolerance": float(eps),
+                             "refined_residual": metrics[0], "amplification_p99": metrics[1],
+                             "amplification_max": metrics[2]})
+        if (candidate is None and metrics is not None
+                and metrics[0] > float(relative_target)):
             # Missed the window's residual gate: tighten once by the miss
             # ratio (with margin), then fall through to the incumbent paths.
+            # A kappa or factor-growth miss is not retried: the same box at a
+            # tighter eps would rebuild the same rule.
             tighter = eps * 0.5 * float(relative_target) / float(metrics[0])
             candidate, metrics = _uniform_box_candidate(
                 spec, eta, min(eps, tighter), max_nodes, factor_growth_cap,
                 relative_target)
+            if metrics is not None:
+                attempts.append({"family": "uniform_box", "candidate_tolerance": float(min(eps, tighter)),
+                                 "refined_residual": metrics[0], "amplification_p99": metrics[1],
+                                 "amplification_max": metrics[2]})
         if candidate is not None:
+            candidate["attempts"] = attempts
             return [candidate]
     if acceptance_rank_margin is None:
         acceptance_rank_margin = (
