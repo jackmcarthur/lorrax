@@ -138,6 +138,25 @@ def candidate_gram_q0_from_pair(
         f"{gamma_mode!r}")
 
 
+def candidate_gram_q0_from_psi(
+    psi_l_X: jax.Array,
+    psi_l_Y: jax.Array,
+    psi_r_X: jax.Array,
+    psi_r_Y: jax.Array,
+    k_weights: jax.Array,
+    *,
+    mesh_xy: Mesh,
+    gamma_mode: str = "charge",
+    symmetrize: bool = True,
+) -> jax.Array:
+    """Build one candidate Gram tile through the fused ISDF owner."""
+    from isdf import gram_q0_from_psi_sm
+    return gram_q0_from_psi_sm(
+        psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
+        mesh_xy=mesh_xy, gamma_mode=gamma_mode, symmetrize=symmetrize,
+    )
+
+
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
     """Transient bytes priced for one open-spin Gram column block.
 
@@ -221,45 +240,47 @@ def gram_col_block_device_bytes(
 def gram_block_live_set_bytes(
     *,
     resident_bytes: int,
-    pair_left_peak_bytes: int,
-    pair_right_peak_bytes: int,
-    gram_fold_peak_bytes: int,
-    one_pair_tile_bytes: int,
+    fused_gram_peak_bytes: int,
     gram_matrix_local_bytes: int,
-    extract_left_increment_bytes: int = 0,
-    extract_right_increment_bytes: int = 0,
-    one_left_input_tile_bytes: int = 0,
-    one_right_input_tile_bytes: int = 0,
+    extracted_input_bytes: int = 0,
+    extract_increment_bytes: int = 0,
 ) -> dict[str, int]:
     """Complete per-device live set for one 2-D Gram tile.
 
-    ``resident_bytes`` is read from the live XLA allocator after BOTH WFN
-    windows have been produced by ``load_centroids_band_chunked``.  The three
-    executable peaks come from ``runtime.aot_memory`` applied to the exact
-    canonical pair-density and q=0-fold JITs.  The right pair build adds the
-    completed left pair tile; the fold peak already includes both pair inputs.
-    The donated shard-local update keeps one full local Gram at every tile
-    stage.  Finally, input + transpose/conjugate + output are conservatively
-    three full local-Gram slots; there is no global concatenate.
+    ``resident_bytes`` is sampled after both complete candidate-WFN windows
+    exist. ``fused_gram_peak_bytes`` is the compiler peak of the exact
+    production tile executable, including all four extracted WFN inputs, both
+    compiler-internal pair densities and the output tile. The extraction row
+    conservatively carries every completed input slice plus the largest one-
+    extractor increment. The donated shard-local update keeps one full local
+    Gram resident. Finally, input + transpose/conjugate + output are three
+    local-Gram slots for the Hermitian fold; there is no global concatenate.
     """
     resident = int(resident_bytes)
-    pair_tile = int(one_pair_tile_bytes)
     gram_local = int(gram_matrix_local_bytes)
     stages = {
-        "extract_left": (resident + gram_local
-                         + int(one_left_input_tile_bytes)
-                         + int(extract_left_increment_bytes)),
-        "pair_left": resident + gram_local + int(pair_left_peak_bytes),
-        "extract_right": (resident + gram_local + pair_tile
-                          + int(one_right_input_tile_bytes)
-                          + int(extract_right_increment_bytes)),
-        "pair_right": (resident + gram_local + pair_tile
-                       + int(pair_right_peak_bytes)),
-        "gram_fold": resident + gram_local + int(gram_fold_peak_bytes),
+        "extract": (resident + gram_local + int(extracted_input_bytes)
+                    + int(extract_increment_bytes)),
+        "fused_gram": (resident + gram_local
+                       + int(fused_gram_peak_bytes)),
         "final_fold": resident + _GRAM_FINAL_FOLD_SLOTS * gram_local,
     }
     stages["peak"] = max(stages.values())
     return stages
+
+
+def gram_tile_schedule(extent: int, width: int) -> tuple[int, int, float]:
+    """Return tile count, padded extent and square-work inflation."""
+    extent_i = int(extent)
+    width_i = int(width)
+    if extent_i < 1 or width_i < 1:
+        raise ValueError(
+            f"Gram extent and tile width must be positive; got "
+            f"extent={extent_i}, width={width_i}")
+    ntiles = -(-extent_i // width_i)
+    executed = ntiles * width_i
+    inflation = float(executed * executed) / float(extent_i * extent_i)
+    return ntiles, executed, inflation
 
 
 def _auto_gram_width_from_compiled_peaks(
@@ -270,13 +291,15 @@ def _auto_gram_width_from_compiled_peaks(
     budget_bytes: int,
     peak_for_width,
 ) -> tuple[int, dict[str, int]]:
-    """Geometrically grow/shrink to the largest certified rung.
+    """Find a certified rung, then remove padding at the same tile count.
 
     Each rung compiles the SAME canonical tile executables production will
     run.  A geometric ladder avoids a dozen throw-away production-shape
-    compilations while retaining a strict property: the returned rung itself
-    was queried and fits.  Tail tiles are zero-padded to this width, so there
-    is only one static executable shape to certify.
+    compilations. Once the largest feasible rung is known, its tile count is
+    fixed and the width is reduced to the smallest mesh-aligned value that
+    covers the logical extent in that many tiles. This preserves dispatch
+    count while minimizing zero-padded pair-density work. The returned width
+    itself is always queried and certified.
     """
     d = max(1, int(divisor))
     floor = ((max(1, _GRAM_MIN_COL_BLOCK) + d - 1) // d) * d
@@ -309,6 +332,18 @@ def _auto_gram_width_from_compiled_peaks(
         if wider_facts["peak"] > int(budget_bytes):
             break
         width, facts = wider, wider_facts
+
+    # Largest-width is not a runtime optimum with fixed-shape tail padding.
+    # Example: extent 3008, width 3004 executes two 3004-wide tiles per axis,
+    # nearly 4x the useful square work.  Keep the SAME number of dispatches
+    # and shrink to the minimum aligned width that still covers the extent.
+    ntiles, _, _ = gram_tile_schedule(ceiling, width)
+    compact = round_up(-(-ceiling // ntiles), d)
+    compact = min(width, max(floor, compact))
+    if compact != width:
+        compact_facts = check(compact)
+        if compact_facts["peak"] <= int(budget_bytes):
+            width, facts = compact, compact_facts
     return width, facts
 
 
@@ -1175,12 +1210,11 @@ def build_gram_q0_via_loadwfns(
     uses the equal-weight PSD sum of the three current transition-feature
     Grams. It never consumes occupations or ``band_norms``.
 
-    Full-BZ unfold: one ``load_wfns.read_Gvecs_to_devices`` per window,
-    ``get_sharded_wfns_centroids`` at the candidate indices, sharded
-    pair densities via ``compute_pair_density_spin_traced``, combined
-    with the q=0 sum via ``compute_gram_q0_from_left_right``. k-weights
-    are supplied on that full-BZ order.  ``None`` retains the historical
-    uniform ``1 / nk_tot`` convention for standalone callers.
+    The shared WFN transform service unfolds each band window onto candidate
+    points. Small Grams retain the sequential low-residency pair route; large
+    Grams keep both final WFN faces and fuse each bounded pair-density/q=0
+    tile through :mod:`isdf`. k-weights are supplied in full-BZ order.
+    ``None`` retains uniform ``1 / nk_tot`` for standalone callers.
 
     Args:
         wfn: open WFNReader.
@@ -1225,8 +1259,7 @@ def build_gram_q0_via_loadwfns(
     from common.wfn_transforms import load_centroids_band_chunked
     from isdf import (
         pair_density,
-        pair_density_aot_peak_bytes,
-        gram_q0_aot_peak_bytes,
+        gram_q0_from_psi_aot_peak_bytes,
     )
     from common.staged_reshard import (
         shard_local_slice_pad,
@@ -1504,67 +1537,44 @@ def build_gram_q0_via_loadwfns(
         def _compiled_live_set(tile_width):
             tile_width = int(tile_width)
             extract_x, extract_y = _services_for_width(tile_width)
-            extract_left = max(
+            extract_increment = max(
                 _extract_increment(extract_x, psi_l_rmuT_X),
                 _extract_increment(extract_y, psi_l_rmu_Y),
-            )
-            extract_right = max(
                 _extract_increment(extract_x, psi_r_rmuT_X),
                 _extract_increment(extract_y, psi_r_rmu_Y),
             )
-            left_peak = pair_density_aot_peak_bytes(
-                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_left,
-                nspinor=ns_, n_col=tile_width,
+            fused_peak = gram_q0_from_psi_aot_peak_bytes(
+                mesh_xy=mesh_xy, nk=nk_, n_rows=tile_width,
+                n_cols=tile_width, nb_l=nb_left, nb_r=nb_right,
+                nspinor=ns_, gamma_mode=gamma_mode, symmetrize=False,
             )
-            right_peak = pair_density_aot_peak_bytes(
-                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_right,
-                nspinor=ns_, n_col=tile_width,
-            )
-            fold_peak = gram_q0_aot_peak_bytes(
-                mesh_xy=mesh_xy, nk=nk_, nspinor=ns_,
-                n_rmu=tile_width, n_col=tile_width,
-                gamma_mode=gamma_mode,
-            )
-            one_pair_local = (
-                nk_ * ns_ * ns_
-                * ((tile_width + n_x - 1) // n_x)
-                * ((tile_width + n_y - 1) // n_y)
-                * _GRAM_COMPLEX_BYTES
-            )
-            one_left_input_local = (
-                nk_ * (tile_width // n_x) * nb_left * ns_
-                * _GRAM_COMPLEX_BYTES
-            )
-            one_right_input_local = (
-                nk_ * (tile_width // n_x) * nb_right * ns_
+            # All four completed shard-local slices are live at dispatch.
+            # tile_width is mesh-aligned, so these divisions are exact.
+            extracted_inputs = (
+                nk_ * tile_width * ns_ * (nb_left + nb_right)
+                * (n_x + n_y) // (n_x * n_y)
                 * _GRAM_COMPLEX_BYTES
             )
             facts = gram_block_live_set_bytes(
                 resident_bytes=resident_bytes,
-                pair_left_peak_bytes=left_peak,
-                pair_right_peak_bytes=right_peak,
-                gram_fold_peak_bytes=fold_peak,
-                one_pair_tile_bytes=one_pair_local,
+                fused_gram_peak_bytes=fused_peak,
                 gram_matrix_local_bytes=gram_local_bytes,
-                extract_left_increment_bytes=extract_left,
-                extract_right_increment_bytes=extract_right,
-                one_left_input_tile_bytes=one_left_input_local,
-                one_right_input_tile_bytes=one_right_input_local,
+                extracted_input_bytes=extracted_inputs,
+                extract_increment_bytes=extract_increment,
             )
             facts.update({
-                "extract_left": int(extract_left),
-                "extract_right": int(extract_right),
-                "pair_left_compiled": int(left_peak),
-                "pair_right_compiled": int(right_peak),
-                "gram_compiled": int(fold_peak),
-                "pair_tile": int(one_pair_local),
+                "extract_increment": int(extract_increment),
+                "extracted_inputs": int(extracted_inputs),
+                "fused_compiled": int(fused_peak),
             })
             return facts
 
-        # Keep a genuine blocked path: the sequential full-M path below has
-        # a smaller WFN live set and remains preferable whenever the cheap
-        # b6 square-law screen said it fits.
-        max_tile_width = ((M_cols - 1) // tile_divisor) * tile_divisor
+        # The sequential full-M path below still has the smaller WFN live set
+        # and wins whenever the cheap square-law screen selected it. Once the
+        # blocked route is entered, however, a full-width fused tile is valid
+        # if its exact compiled live set fits; stopping at M-1 forced two
+        # almost-full padded tiles per axis.
+        max_tile_width = M_cols
         if not env_cb:
             col_block, live_facts = _auto_gram_width_from_compiled_peaks(
                 col_block,
@@ -1584,22 +1594,23 @@ def build_gram_q0_via_loadwfns(
                 nk_, ns_, M_cols, col_block,
                 x_shards=n_x, y_shards=n_y,
             ) / 2**30
-            ntiles = -(-M_cols // col_block)
+            ntiles, executed_extent, work_inflation = gram_tile_schedule(
+                M_cols, col_block)
             print(
                 f"[pivoted_cholesky] 2-D blocked Gram: M={M_cols}, "
                 f"tile={col_block} ({ntiles}x{ntiles} tiles; "
+                f"executed_extent={executed_extent}, "
+                f"padded_work={work_inflation:.3f}x; "
                 f"{n_dev_total}-device path; {block_source}; "
                 f"square-law={square_gib:.2f} GiB global, "
-                f"two-pair local={local_gib:.2f} GiB/device; "
+                f"pair-workspace model={local_gib:.2f} GiB/device; "
                 f"resident(two WFN windows; worst rank)="
                 f"{resident_bytes / 2**30:.2f}, "
-                f"compiled L/R/fold="
-                f"{live_facts['pair_left_compiled'] / 2**30:.2f}/"
-                f"{live_facts['pair_right_compiled'] / 2**30:.2f}/"
-                f"{live_facts['gram_compiled'] / 2**30:.2f}, "
-                f"extract L/R increment="
-                f"{live_facts['extract_left'] / 2**30:.2f}/"
-                f"{live_facts['extract_right'] / 2**30:.2f}, "
+                f"compiled fused="
+                f"{live_facts['fused_compiled'] / 2**30:.2f}, "
+                f"extracted inputs/increment="
+                f"{live_facts['extracted_inputs'] / 2**30:.2f}/"
+                f"{live_facts['extract_increment'] / 2**30:.2f}, "
                 f"full-live peak={live_facts['peak'] / 2**30:.2f} "
                 f"of target={target_bytes / 2**30:.2f} GiB/device)"
             )
@@ -1622,7 +1633,7 @@ def build_gram_q0_via_loadwfns(
             return device_put_process_local(
                 np.asarray(value, dtype=np.int32), rep_sh)
 
-        with timing.section("q0_sum"):
+        with timing.section("q0_sum.fused"):
             for c0 in range(0, local_cols, local_col_tile):
                 c_start = _rep_i32(c0)
                 for r0 in range(0, local_rows, local_row_tile):
@@ -1630,29 +1641,20 @@ def build_gram_q0_via_loadwfns(
 
                     # Slice inside each already-owned X/Y shard.  The generic
                     # layout primitive zero-pads the local tail, so no smaller
-                    # global extent is ever repartitioned and the pair/fold
-                    # executables keep one static shape.
+                    # global extent is ever repartitioned and the fused
+                    # executable keeps one static shape.
                     row_l = extract_x(psi_l_rmuT_X, r_start)
                     block_l = extract_y(psi_l_rmu_Y, c_start)
-                    P_l_b = pair_density(row_l, block_l, mesh_xy)
-                    # This barrier makes the planner's stage max real: the
-                    # left compiler arena is gone before the right one starts.
-                    P_l_b.block_until_ready()
-                    del row_l, block_l
-
                     row_r = extract_x(psi_r_rmuT_X, r_start)
                     block_r = extract_y(psi_r_rmu_Y, c_start)
-                    P_r_b = pair_density(row_r, block_r, mesh_xy)
-                    P_r_b.block_until_ready()
-                    del row_r, block_r
-
-                    G_b = candidate_gram_q0_from_pair(
-                        P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
+                    G_b = candidate_gram_q0_from_psi(
+                        row_l, block_l, row_r, block_r, kw,
+                        mesh_xy=mesh_xy,
                         gamma_mode=gamma_mode,
                         symmetrize=False,
                     )
                     G_b.block_until_ready()
-                    del P_l_b, P_r_b
+                    del row_l, block_l, row_r, block_r
                     starts = _rep_i32((r0, c0))
                     G = update_g(G, G_b, starts)
                     G.block_until_ready()
@@ -1688,7 +1690,7 @@ def build_gram_q0_via_loadwfns(
 
     # ---- q=0 Gram: sum_k w_k · Σ_{αβ} conj(P_l_k,αβ) · P_r_k,αβ ----
     # γ̃ identity (charge channel) — open-spin Frobenius reduction.
-    with timing.section("q0_sum"):
+    with timing.section("q0_sum.sequential"):
         G = candidate_gram_q0_from_pair(
             P_l_k, P_r_k, kw, mesh_xy=mesh_xy,
             gamma_mode=gamma_mode)

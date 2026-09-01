@@ -28,26 +28,19 @@ assert pc.gram_col_block_device_bytes(
     81, 2, 3600, tile, x_shards=4, y_shards=4,
 ) == pc.gram_col_block_bytes(81, 2, tile) // 16
 
-# Complete-live-set accounting: right pair build carries the completed left
-# pair tile; final Hermitian fold has three local-G slots.  The max is explicit.
+# Complete-live-set accounting: the fused compiled peak includes its four
+# input slices and internal pair workspaces; final Hermitian fold has three
+# local-G slots. The max is explicit.
 live = pc.gram_block_live_set_bytes(
     resident_bytes=1000,
-    pair_left_peak_bytes=200,
-    pair_right_peak_bytes=300,
-    gram_fold_peak_bytes=400,
-    one_pair_tile_bytes=50,
+    fused_gram_peak_bytes=400,
     gram_matrix_local_bytes=25,
-    extract_left_increment_bytes=125,
-    extract_right_increment_bytes=150,
-    one_left_input_tile_bytes=10,
-    one_right_input_tile_bytes=20,
+    extracted_input_bytes=30,
+    extract_increment_bytes=150,
 )
 assert live == {
-    "extract_left": 1160,
-    "pair_left": 1225,
-    "extract_right": 1245,
-    "pair_right": 1375,
-    "gram_fold": 1425,
+    "extract": 1205,
+    "fused_gram": 1425,
     "final_fold": 1075,
     "peak": 1425,
 }
@@ -66,6 +59,37 @@ chosen, chosen_facts = pc._auto_gram_width_from_compiled_peaks(
 assert chosen == 512, (chosen, seen)
 assert chosen_facts["peak"] == 51200
 assert seen == [256, 512, 1020], seen
+
+# A full-width tile is admissible when its compiled live set fits.
+chosen, _ = pc._auto_gram_width_from_compiled_peaks(
+    488, max_width=3008, divisor=4, budget_bytes=4000,
+    peak_for_width=lambda width: {"peak": width},
+)
+assert chosen == 3008
+assert pc.gram_tile_schedule(3008, chosen) == (1, 3008, 1.0)
+
+# If the 3008-wide rung fails but 1952 fits, compact to the minimum width
+# that preserves two tiles. This removes the old ~1.68x padded square work.
+seen_compact = []
+def compact_peak(width):
+    seen_compact.append(width)
+    return {"peak": width}
+
+chosen, _ = pc._auto_gram_width_from_compiled_peaks(
+    488, max_width=3008, divisor=4, budget_bytes=2000,
+    peak_for_width=compact_peak,
+)
+assert chosen == 1504, (chosen, seen_compact)
+assert pc.gram_tile_schedule(3008, chosen) == (2, 3008, 1.0)
+assert seen_compact == [488, 976, 1952, 3008, 1504], seen_compact
+
+chosen, _ = pc._auto_gram_width_from_compiled_peaks(
+    488, max_width=3008, divisor=4, budget_bytes=500,
+    peak_for_width=lambda width: {"peak": width},
+)
+ntiles, executed, inflation = pc.gram_tile_schedule(3008, chosen)
+assert (chosen, ntiles, executed) == (432, 7, 3024)
+assert inflation < 1.011
 
 required = pc.gram_col_block_bytes(81, 2, 256)
 try:

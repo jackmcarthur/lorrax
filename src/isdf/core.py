@@ -109,10 +109,11 @@ def host_rss_gb() -> float:
 #                              · γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
 #                              · P_{α'β'}(μ,ν;k)
 #
-# The :func:`pair_density` standalone (rank-5 P_k_ab carrier) is kept
-# for ``centroid.pivoted_cholesky``'s q=0 valence-conduction Gram —
-# its caller can hold the full P_k_ab in HBM at the centroid-selection
-# stage.  The hot CCT/ZCT path in :func:`fit_zeta_to_h5` never
+# The :func:`pair_density` standalone (rank-5 P_k_ab carrier) is kept for
+# tests, planning and the centroid selector's sequential low-residency route.
+# Its blocked route uses :func:`gram_q0_from_psi_sm`, which folds both band
+# contractions and the normal matrix into one compiled program.  The hot
+# CCT/ZCT path in :func:`fit_zeta_to_h5` likewise never
 # materialises P_k_ab globally; everything happens inside the
 # monolithic shard_map kernels below.
 
@@ -296,6 +297,69 @@ _isdf_pipeline_cache = {}  # ISDF pipeline (z_q/c_q from psi_sm) kernel
 # the answer.  Used by :mod:`centroid.pivoted_cholesky` to score
 # candidate centroids on valence × conduction pair products.
 
+
+def _gram_q0_fold_local(
+	P_v: jax.Array,
+	P_c: jax.Array,
+	kw: jax.Array,
+	perm_L: jax.Array,
+	phase_L: jax.Array,
+	perm_R: jax.Array,
+	phase_R: jax.Array,
+	*,
+	lhs_id: bool,
+	rhs_id: bool,
+	symmetrize: bool,
+	transverse_feature_sum: bool,
+) -> jax.Array:
+	"""Fold open-spin pair densities into one local q=0 Gram tile."""
+	if transverse_feature_sum:
+		# Candidate pruning needs a positive metric on the STACKED
+		# transition-density features
+		#
+		#   Z_i(a,mn,k) = <psi^R_m(a)|gamma_i|psi^L_n(a)>,
+		#   G_perp = sum_i Z_i Z_i^H.
+		#
+		# In the pair-density factorisation the first endpoint therefore
+		# carries gamma_i^* and the second gamma_i.  This conjugated left
+		# phase is load-bearing for imaginary gamma_2: using the raw CCT
+		# contraction (gamma_i, gamma_i) gives its NEGATIVE and is not a
+		# candidate Gram.  Accumulate one component at a time so no
+		# three-component rank-3 stack is materialised.
+		def _one_component(G_acc, mu_lorentz):
+			perm = perm_L[mu_lorentz]
+			phase = phase_L[mu_lorentz]
+			prod = gamma_double_contract(
+				jnp.conj(P_v), P_c,
+				perm_L=perm,
+				phase_L=jnp.conj(phase),
+				perm_R=perm,
+				phase_R=phase,
+				spin_axes=(1, 2),
+			)
+			return (G_acc
+			        + jnp.sum(kw[:, None, None] * prod, axis=0), None)
+
+		G, _ = jax.lax.scan(
+			_one_component,
+			jnp.zeros(P_v.shape[-2:], dtype=P_v.dtype),
+			jnp.arange(1, 4, dtype=jnp.int32),
+			unroll=1,
+		)
+	else:
+		prod = gamma_double_contract(
+			jnp.conj(P_v), P_c,
+			perm_L=None if lhs_id else perm_L,
+			phase_L=None if lhs_id else phase_L,
+			perm_R=None if rhs_id else perm_R,
+			phase_R=None if rhs_id else phase_R,
+			spin_axes=(1, 2),
+		)
+		G = jnp.sum(kw[:, None, None] * prod, axis=0)
+	if symmetrize:
+		G = 0.5 * (G + jnp.conj(G.T))
+	return G
+
 def _gram_q0_kernel(
 	mesh_xy: Mesh,
 	nk: int,
@@ -329,57 +393,12 @@ def _gram_q0_kernel(
 		         in_shardings=(in_spin, in_spin, kw_rep, rep, rep, rep, rep),
 		         out_shardings=out_xy)
 		def _gram_q0(P_v, P_c, kw, perm_L_, phase_L_, perm_R_, phase_R_):
-			if _transverse_feature_sum:
-				# Candidate pruning needs a positive metric on the STACKED
-				# transition-density features
-				#
-				#   Z_i(a,mn,k) = <psi^R_m(a)|gamma_i|psi^L_n(a)>,
-				#   G_perp = sum_i Z_i Z_i^H.
-				#
-				# In the pair-density factorisation the first endpoint therefore
-				# carries gamma_i^* and the second gamma_i.  This conjugated
-				# left phase is load-bearing for imaginary gamma_2: using the
-				# raw CCT contraction (gamma_i, gamma_i) gives its NEGATIVE and
-				# is not a candidate Gram.  Accumulate one component at a time so
-				# no three-component rank-3 stack is ever materialised.
-				def _one_component(G_acc, mu_lorentz):
-					perm = perm_L_[mu_lorentz]
-					phase = phase_L_[mu_lorentz]
-					prod = gamma_double_contract(
-						jnp.conj(P_v), P_c,
-						perm_L=perm,
-						phase_L=jnp.conj(phase),
-						perm_R=perm,
-						phase_R=phase,
-						spin_axes=(1, 2),
-					)
-					return (G_acc
-					        + jnp.sum(kw[:, None, None] * prod, axis=0), None)
-
-				G, _ = jax.lax.scan(
-					_one_component,
-					jnp.zeros((n_rmu, n_col), dtype=P_v.dtype),
-					jnp.arange(1, 4, dtype=jnp.int32),
-					unroll=1,
-				)
-			else:
-				# γ̃-contracted spin reduction (5 → 3 rank, dropping
-				# (a,b)). Spin axes are (1, 2) on (k, a, b, μ, ν).
-				# Keep this historical charge/arbitrary-CCT arm unchanged.
-				prod = gamma_double_contract(
-					jnp.conj(P_v), P_c,
-					perm_L=None if _lhs_id else perm_L_,
-					phase_L=None if _lhs_id else phase_L_,
-					perm_R=None if _rhs_id else perm_R_,
-					phase_R=None if _rhs_id else phase_R_,
-					spin_axes=(1, 2),
-				)
-				G = jnp.sum(kw[:, None, None] * prod, axis=0)
-			# Symmetrize: q=0 Gram is Hermitian by construction; fp roundoff
-			# can break it.  (Skipped for rectangular column blocks.)
-			if _symmetrize:
-				G = 0.5 * (G + jnp.conj(G.T))
-			return G
+			return _gram_q0_fold_local(
+				P_v, P_c, kw, perm_L_, phase_L_, perm_R_, phase_R_,
+				lhs_id=_lhs_id, rhs_id=_rhs_id,
+				symmetrize=_symmetrize,
+				transverse_feature_sum=_transverse_feature_sum,
+			)
 
 		_isdf_pipeline_cache[cache_key] = _gram_q0
 
@@ -493,6 +512,188 @@ def transverse_gram_q0_from_pair(
 		transverse_feature_sum=True,
 	)(P_l_k, P_r_k, k_weights,
 	  _gammas_perm, _gammas_phase, _gammas_perm, _gammas_phase)
+
+
+def _gram_q0_from_psi_kernel(
+	mesh_xy: Mesh,
+	nk: int,
+	n_rows: int,
+	n_cols: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	*,
+	gamma_mode: str,
+	symmetrize: bool,
+):
+	"""Return the fused pair-density + q=0 normal-matrix executable."""
+	transverse = gamma_mode == "transverse"
+	cache_key = (
+		'gram_q0_from_psi_sm', id(mesh_xy), nk, n_rows, n_cols,
+		nb_l, nb_r, nspinor, gamma_mode, symmetrize,
+	)
+	if cache_key not in _isdf_pipeline_cache:
+		x_spec = P(None, 'x', None, None)
+		y_spec = P(None, None, None, 'y')
+		out_spec = P('x', 'y')
+		x_sh = NamedSharding(mesh_xy, x_spec)
+		y_sh = NamedSharding(mesh_xy, y_spec)
+		rep = NamedSharding(mesh_xy, P())
+		out_sh = NamedSharding(mesh_xy, out_spec)
+
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(x_spec, y_spec, x_spec, y_spec,
+		                   P(), P(), P(), P(), P()),
+		         out_specs=out_spec, check_vma=False)
+		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			P_l = jnp.einsum(
+				'kmna,knbr->kabmr', psi_l_X_, psi_l_Y_, optimize=True)
+			P_r = jnp.einsum(
+				'kmna,knbr->kabmr', psi_r_X_, psi_r_Y_, optimize=True)
+			return _gram_q0_fold_local(
+				P_l, P_r, kw_, perm_L_, phase_L_, perm_R_, phase_R_,
+				lhs_id=not transverse, rhs_id=not transverse,
+				symmetrize=False,
+				transverse_feature_sum=transverse,
+			)
+
+		@partial(jax.jit,
+		         in_shardings=(x_sh, y_sh, x_sh, y_sh,
+		                       rep, rep, rep, rep, rep),
+		         out_shardings=out_sh)
+		def _fused(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			G = _local(
+				psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+				perm_L_, phase_L_, perm_R_, phase_R_)
+			# This must be outside the manual shard_map: on a 2-D mesh, the
+			# conjugate-transpose tile lives on the rank with swapped X/Y
+			# coordinates. Production tiles request ``False`` and symmetrize
+			# only after assembly; the public square-matrix route remains exact.
+			if symmetrize:
+				G = 0.5 * (G + jnp.conj(G.T))
+			return G
+
+		_isdf_pipeline_cache[cache_key] = _fused
+	return _isdf_pipeline_cache[cache_key]
+
+
+def gram_q0_from_psi_sm(
+	psi_l_X: jax.Array,
+	psi_l_Y: jax.Array,
+	psi_r_X: jax.Array,
+	psi_r_Y: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	gamma_mode: str = "charge",
+	symmetrize: bool = True,
+) -> jax.Array:
+	"""Fused candidate Gram from two left/right centroid-WFN faces.
+
+	Inputs use the same single-axis face convention as
+	:func:`c_q_from_psi_sm`'s legacy route.  The two band contractions and
+	the q=0 normal-matrix fold are one compiled program, so their rank-5
+	pair densities are compiler-internal temporaries rather than committed
+	outputs of separate dispatches.
+
+	``gamma_mode='charge'`` computes the scalar q=0 CCT normal matrix.
+	``gamma_mode='transverse'`` requires four-component bispinors and computes
+	the PSD sum ``sum_i Z_i Z_i^H`` used by centroid selection; it is not the
+	individual indefinite transverse ``C_q^i`` used by the zeta solve.
+	"""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if any(arr.ndim != 4 for arr in
+	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
+		raise ValueError("gram_q0_from_psi_sm requires four rank-4 WFN faces")
+	nk, n_rows, nb_l, ns = (int(v) for v in psi_l_X.shape)
+	if tuple(int(v) for v in psi_l_Y.shape[:3]) != (nk, nb_l, ns):
+		raise ValueError(
+			"left WFN faces disagree: "
+			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
+	n_cols = int(psi_l_Y.shape[3])
+	if (int(psi_r_X.shape[0]) != nk or int(psi_r_X.shape[1]) != n_rows
+	        or int(psi_r_X.shape[3]) != ns):
+		raise ValueError(
+			"right X face disagrees with left X face: "
+			f"left={psi_l_X.shape}, right={psi_r_X.shape}")
+	nb_r = int(psi_r_X.shape[2])
+	if tuple(int(v) for v in psi_r_Y.shape) != (nk, nb_r, ns, n_cols):
+		raise ValueError(
+			"right WFN faces disagree: "
+			f"X={psi_r_X.shape}, Y={psi_r_Y.shape}")
+	if tuple(int(v) for v in k_weights.shape) != (nk,):
+		raise ValueError(
+			f"k_weights must have shape ({nk},); got {k_weights.shape}")
+	if mode == "transverse" and ns != 4:
+		raise ValueError(
+			"gamma_mode='transverse' requires four-component bispinors; "
+			f"got nspinor={ns}")
+	if mode == "transverse":
+		perm = _gammas_perm
+		phase = _gammas_phase
+	else:
+		perm = jnp.arange(ns, dtype=jnp.int32)
+		phase = jnp.ones(ns, dtype=psi_l_X.dtype)
+	return _gram_q0_from_psi_kernel(
+		mesh_xy, nk, n_rows, n_cols, nb_l, nb_r, ns,
+		gamma_mode=mode, symmetrize=bool(symmetrize),
+	)(psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
+	  perm, phase, perm, phase)
+
+
+def gram_q0_from_psi_aot_peak_bytes(
+	*,
+	mesh_xy: Mesh,
+	nk: int,
+	n_rows: int,
+	n_cols: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	dtype=jnp.complex128,
+	gamma_mode: str = "charge",
+	symmetrize: bool = False,
+) -> int:
+	"""Per-rank compiled peak of :func:`gram_q0_from_psi_sm`."""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
+	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
+	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+	rep = NamedSharding(mesh_xy, P())
+	x_l = jax.ShapeDtypeStruct(
+		(int(nk), int(n_rows), int(nb_l), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_l = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_l), int(nspinor), int(n_cols)), dtype,
+		sharding=y_sh)
+	x_r = jax.ShapeDtypeStruct(
+		(int(nk), int(n_rows), int(nb_r), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_r = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_r), int(nspinor), int(n_cols)), dtype,
+		sharding=y_sh)
+	kw = jax.ShapeDtypeStruct((int(nk),), jnp.float64, sharding=rep)
+	gamma_shape = ((4, int(nspinor)) if mode == "transverse"
+	               else (int(nspinor),))
+	perm = jax.ShapeDtypeStruct(gamma_shape, jnp.int32, sharding=rep)
+	phase = jax.ShapeDtypeStruct(gamma_shape, dtype, sharding=rep)
+	compiled = _gram_q0_from_psi_kernel(
+		mesh_xy, int(nk), int(n_rows), int(n_cols), int(nb_l), int(nb_r),
+		int(nspinor), gamma_mode=mode, symmetrize=bool(symmetrize),
+	).lower(x_l, y_l, x_r, y_r, kw, perm, phase, perm, phase).compile()
+	from runtime.aot_memory import aot_kernel_peak_bytes
+	return int(aot_kernel_peak_bytes(compiled).total)
 
 
 def gram_q0_aot_peak_bytes(

@@ -5,6 +5,8 @@ from isdf.core import (
     gram_q0_from_pair,   # q=0 Gram (centroid selection)
     transverse_gram_q0_from_pair,  # stacked-current PSD candidate Gram
     gram_q0_aot_peak_bytes,       # compiler peak for the same fold
+    gram_q0_from_psi_sm,  # fused centroid-WFN faces -> q=0 Gram
+    gram_q0_from_psi_aot_peak_bytes,  # compiler peak for fused route
     c_q_from_psi_sm,     # centroid ψ -> C_q metric
     z_q_from_psi_sm,     # ψ(G) -> Z_q rhs (exported for tests)
     complete_ordered_pair_normal_equations,  # LR -> conjugation-closed LR+RL
@@ -19,7 +21,8 @@ from isdf.galerkin import (GalerkinBasis, fit_galerkin_basis,
 __all__ = [
     "pair_density", "pair_density_aot_peak_bytes",
     "gram_q0_from_pair", "transverse_gram_q0_from_pair",
-    "gram_q0_aot_peak_bytes",
+    "gram_q0_aot_peak_bytes", "gram_q0_from_psi_sm",
+    "gram_q0_from_psi_aot_peak_bytes",
     "c_q_from_psi_sm", "z_q_from_psi_sm",
     "complete_ordered_pair_normal_equations",
     "factor_c_q", "solve_zeta", "fit_one_rchunk",
