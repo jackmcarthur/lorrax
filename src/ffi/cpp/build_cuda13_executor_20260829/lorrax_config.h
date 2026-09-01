@@ -1,0 +1,44 @@
+// lorrax_config.h.in — configure-time capability record for the host FFI leg.
+//
+// Generated into the build directory by src/ffi/cpp/CMakeLists.txt.  It
+// records WHAT THE BUILD ACTUALLY RESOLVED, not what it hoped to.
+//
+// Why this file exists.  probe_target() can already answer "is handler X
+// present?", but it cannot answer "which library is behind the handlers that
+// ARE present?" or "which vendor won the AUTO FFT race on this machine?".
+// Those questions previously had one answer each: read the configure log, if
+// you still have it.  On a machine where the FFT backend can be MKL DFTI or
+// FFTW3, and the BLAS/ScaLAPACK can be MKL or Cray LibSci or netlib or AOCL,
+// "which one did I actually get" is exactly the question you need answered
+// when a number comes out wrong — and it is the question a silently degraded
+// build makes you unable to ask.
+//
+// @-substituted by CMake; do not edit the generated copy.
+#pragma once
+
+// Generated for BOTH legs since 2026-08-08.  Each leg substitutes the keys
+// that mean something for it and leaves the others at 0; common/build_config.cc
+// emits only its own leg's keys, so a 0 here is never printed as a capability
+// the leg was supposed to have.  Two legs, one template, so a port that adds a
+// capability adds it in one place.
+
+// ---- host leg -------------------------------------------------------------
+// Whether a standalone FFTW3 was LINKED.  Which engine actually binds is a
+// RUNTIME dlsym fact by design (ffi_layout.md §7) -- on an MKL site this is
+// 0 and the FFTW3 C interface still resolves, out of libmkl_intel_lp64.  It is
+// therefore REPORTED and never asserted on: scripts/verify_ffi_build.sh prints
+// it and gates on the FFT HANDLER SYMBOLS instead.
+#define LORRAX_CFG_LINKED_FFTW3   0
+#define LORRAX_CFG_HAVE_SCALAPACK 0
+#define LORRAX_CFG_HAVE_GEMM      0
+#define LORRAX_CFG_MATH_LINK    ""
+
+// ---- device leg -----------------------------------------------------------
+#define LORRAX_CFG_HAVE_CUSOLVERMP 1
+#define LORRAX_CFG_HAVE_CUBLASMP   1
+#define LORRAX_CFG_HAVE_CUFFT      1
+#define LORRAX_CFG_HAVE_CAL        0
+
+// ---- both legs ------------------------------------------------------------
+#define LORRAX_CFG_HAVE_SLATE     0
+#define LORRAX_CFG_HAVE_PHDF5     1
