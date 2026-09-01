@@ -231,6 +231,7 @@ _WINDOWED_FIT_NAMES = (
 )
 _ROQ_FIT_NAMES = (
     "RoqWindow", "RoqGroup", "RoqRule", "RoqBranchEvidence", "RoqPlan",
+    "RoqPlanningRefusal",
     "roq_select_times", "fit_roq_group", "fit_roq_branch",
     "branch_delivered_error", "branch_noise_gate",
     "plan_measure_adapted_roq",
