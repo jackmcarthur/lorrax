@@ -59,18 +59,21 @@ def _problems(path: Path):
     return rows
 
 
-def _fit(problem, validation, pole_sign, target):
+def _fit(problem, validation, pole_sign, target, rank_margin):
     if planner._window_kind(problem) == "crossing":
         candidates = planner._crossing_table_candidates(
             problem, pole_sign, target, planner.MAX_WINDOW_TAU_PAIRS)
     else:
         candidates = planner._sign_definite_candidates(
             problem, target, planner.MAX_WINDOW_TAU_PAIRS)
+    accepted = 0
     for times, weights, evidence in candidates:
         candidate = planner._rule_candidate(
             problem, validation, times, weights, evidence)
         if planner._rule_accepted(candidate["metrics"], target):
-            return candidate
+            if accepted >= rank_margin:
+                return candidate
+            accepted += 1
     if planner._window_kind(problem) != "crossing":
         raise RuntimeError("the on-demand noncrossing rank ladder was exhausted")
     return planner._rule_candidate(
@@ -82,20 +85,24 @@ def _fit(problem, validation, pole_sign, target):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--problems", type=Path, default=DEFAULT_PROBLEMS)
+    parser.add_argument("--rank-margin", type=int, default=0,
+                        choices=(0, 1, 2))
     args = parser.parse_args()
     rows = _problems(args.problems)
     warnings.filterwarnings("ignore", message=r"minimax: served .*")
 
     started = time.perf_counter()
-    fitted = [
-        (key, target, incumbent,
-         _fit(problem, validation, pole_sign, target))
-        for key, problem, validation, pole_sign, target, incumbent in rows
-    ]
+    fitted = []
+    for key, problem, validation, pole_sign, target, incumbent in rows:
+        window_started = time.perf_counter()
+        fit = _fit(
+            problem, validation, pole_sign, target, args.rank_margin)
+        fitted.append((
+            key, target, incumbent, time.perf_counter() - window_started, fit))
     wall = time.perf_counter() - started
 
-    print("window | family | nodes | achieved | incumbent | ratio | noise gate")
-    for key, target, incumbent, fit in fitted:
+    print("window | family | nodes | seconds | achieved | kappa | incumbent | ratio | noise gate")
+    for key, target, incumbent, seconds, fit in fitted:
         residual, kappa_p99, _peak = fit["metrics"]
         ratio = residual / incumbent
         noise = kappa_p99 * planner.RUNTIME_NOISE_EPSILON
@@ -103,7 +110,8 @@ def main():
         passed = residual <= target and noise <= noise_budget
         print(
             f"{key} | {fit['evidence']['family']} | {fit['times'].size} | "
-            f"{residual:.9g} | {incumbent:.9g} | {ratio:.4f} | "
+            f"{seconds:.6f} | {residual:.9g} | {kappa_p99:.9g} | "
+            f"{incumbent:.9g} | {ratio:.4f} | "
             f"{noise:.3g}/{noise_budget:.3g} {'PASS' if passed else 'FAIL'}")
         if ratio > 2.0 or not passed:
             raise SystemExit(f"frozen Na accuracy gate failed for {key}")

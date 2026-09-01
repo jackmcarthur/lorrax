@@ -261,6 +261,34 @@ def test_sign_definite_planning_uses_seeded_noncrossing_solver(monkeypatch):
     assert calls
     assert candidate["evidence"]["family"] == "noncrossing_on_demand"
     assert candidate["evidence"]["fit_achieved_abs_error"] > 0.0
+    assert candidate["times"].size == candidate["first_passing_rank"] + 1
+    assert candidate["acceptance_rank_margin"] == 1
+
+
+def test_sign_definite_acceptance_rank_margin_is_explicit(monkeypatch):
+    """Margins zero through two select that many ranks past first passing."""
+    monkeypatch.setattr(delivered, "_factor_growth", lambda *_args: (0.0, 0.0))
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([-1.0, -25.0]),
+        cell_masses=np.asarray([0.5, 0.5]))
+    spec = {
+        "name": "rank-margin probe",
+        "kind": "sign_definite_positive",
+        "problem": problem, "validation": problem,
+        "pole_sign": 1.0, "envelope": 1.0,
+    }
+    candidates = [
+        delivered._candidate_rules(
+            spec, eta=0.05, max_nodes=64, factor_growth_cap=30.0,
+            relative_target=1.0e-4, acceptance_rank_margin=margin)[0]
+        for margin in (0, 1, 2)
+    ]
+    first = candidates[0]["times"].size
+    assert [candidate["times"].size for candidate in candidates] == [
+        first, first + 1, first + 2]
+    assert [candidate["acceptance_rank_margin"] for candidate in candidates] == [
+        0, 1, 2]
 
 
 def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
