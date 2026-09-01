@@ -159,3 +159,34 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
         "worst_process_resident_bytes(existing_live_local_bytes)"
     )
     assert assignments["nk_accum"] == "round_up(nk_tot, k_tile)"
+
+
+def test_galerkin_requests_the_loader_y_face_without_tracing_x():
+    """Galerkin opts out; the canonical loader's other callers keep both."""
+    repo = Path(__file__).resolve().parents[1]
+    wfn_tree = ast.parse((repo / "src/common/wfn_transforms.py").read_text())
+    galerkin_tree = ast.parse((repo / "src/isdf/galerkin.py").read_text())
+
+    loader = _function(wfn_tree, "load_centroids_band_chunked")
+    kw_defaults = {
+        arg.arg: default
+        for arg, default in zip(
+            loader.args.kwonlyargs, loader.args.kw_defaults, strict=True)
+    }
+    assert ast.literal_eval(kw_defaults["output_faces"]) == "both"
+
+    fit = _function(galerkin_tree, "fit_galerkin_basis")
+    calls = _calls(fit, "load_centroids_band_chunked")
+    assert len(calls) == 1
+    output_face_values = [
+        kw.value for kw in calls[0].keywords if kw.arg == "output_faces"
+    ]
+    assert len(output_face_values) == 1
+    assert ast.literal_eval(output_face_values[0]) == "y"
+
+    y_reshard = _function(loader, "_reshard_centroid_tile_y")
+    assert len(_calls(y_reshard, "_stage_y_face")) == 1
+    assert not _calls(y_reshard, "_stage_x_face")
+    y_insert = _function(loader, "_insert_y_tile")
+    assert len(_calls(y_insert, "_reshard_centroid_tile_y")) == 1
+    assert not _calls(y_insert, "_reshard_centroid_tile")

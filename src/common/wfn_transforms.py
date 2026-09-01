@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import gc
 from functools import partial
-from typing import Sequence, TYPE_CHECKING
+from typing import Literal, Sequence, TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -2344,7 +2344,8 @@ def load_centroids_band_chunked(
     *,
     psi_G_flat: jax.Array | None = None,
     bispinor_lift: str = "raw",
-) -> tuple[jax.Array, jax.Array]:
+    output_faces: Literal["both", "y"] = "both",
+) -> tuple[jax.Array, jax.Array | None]:
     """
     Load centroid-sampled wavefunctions using band AND k-point chunking.
 
@@ -2376,6 +2377,10 @@ def load_centroids_band_chunked(
             the bulk path regardless of chunk hints because its owner (the
             htransform Galerkin path) deliberately reuses the same allocation
             after centroid sampling.
+        output_faces: ``"both"`` preserves the public two-face result used by
+            GW and centroid selection.  ``"y"`` skips construction and memory
+            accounting of the conjugate-transposed X face for consumers, such
+            as the Galerkin fit, that use only the Y face.
 
         Both outer remainders are zero-padded through
         :mod:`runtime.padding` to the one fixed physical tile shape.  G-index
@@ -2385,7 +2390,8 @@ def load_centroids_band_chunked(
 
     Returns:
         psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
-        psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
+        psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None),
+            or ``None`` when ``output_faces="y"``.
 
     n_rmu divisibility: the kernels here shard the n_rmu axis by a
     single mesh axis (``'x'`` alone in psi_rmuT_X, ``'y'`` alone in
@@ -2399,6 +2405,12 @@ def load_centroids_band_chunked(
     del sym        # WfnLoader builds its own SymMaps lazily
     from common import timing
     from runtime.padding import padded_mu_extent
+
+    if output_faces not in ("both", "y"):
+        raise ValueError(
+            "load_centroids_band_chunked: output_faces must be "
+            f"'both' or 'y', got {output_faces!r}")
+    emit_x_face = output_faces == "both"
 
     b_start, b_end = band_range
     nb_total = b_end - b_start
@@ -2491,10 +2503,12 @@ def load_centroids_band_chunked(
     gflat_local_bytes = (
         k_tile * nb_per_band_shard * nspinor * int(loader.ngkmax) * 16
     )
+    y_local_mu = (n_rmu_padded + n_y - 1) // n_y
+    x_local_mu = (n_rmu_padded + n_x - 1) // n_x
+    face_local_mu = y_local_mu + (x_local_mu if emit_x_face else 0)
     output_local_bytes = (
         nk_accum * nb_accum * nspinor * 16
-        * (((n_rmu_padded + n_x - 1) // n_x)
-           + ((n_rmu_padded + n_y - 1) // n_y))
+        * face_local_mu
     )
     tile_band_output_local_bytes = 0
     tile_face_local_bytes = 0
@@ -2504,8 +2518,7 @@ def load_centroids_band_chunked(
         )
         tile_face_local_bytes = (
             k_tile * band_tile * nspinor * 16
-            * (((n_rmu_padded + n_x - 1) // n_x)
-               + ((n_rmu_padded + n_y - 1) // n_y))
+            * face_local_mu
         )
     # A caller-provided G-flat tensor is already in memory_stats(); only price
     # it here when this call will allocate it.  This avoids double-charging
@@ -2536,7 +2549,8 @@ def load_centroids_band_chunked(
             "load_centroids_band_chunked planner refuses before WFN "
             f"allocation: the minimum per-device live set is "
             f"{min_live_bytes / 2**30:.2f} GiB (G-flat "
-            f"{'tile' if stream_tiles else 'input'} + X/Y centroid "
+            f"{'tile' if stream_tiles else 'input'} + "
+            f"{'X/Y' if emit_x_face else 'Y'} centroid "
             f"outputs + one FFT scan row), but the residual prune "
             f"transient budget is {gpu_mem_bytes / 2**30:.2f} GiB. "
             "A smaller scan chunk cannot reduce this floor; use more "
@@ -2560,6 +2574,7 @@ def load_centroids_band_chunked(
         f"persistent={persistent_bytes / 2**30:.2f}, "
         f"scan_budget={scan_budget_bytes / 2**30:.2f} GiB/device, "
         f"peak_copies={peak_copies}, cs={cs}, "
+        f"faces={output_faces}, "
         f"stream={'on' if stream_tiles else 'off'}, "
         f"k_tile={k_tile}, band_tile={band_tile}"
     )
@@ -2573,47 +2588,73 @@ def load_centroids_band_chunked(
     kvecs_frac_full = loader.kvecs(k="full_bz")
 
     # One reshard owner for both the bulk and streamed paths.  The input is
-    # band-sharded; the two consumers need independent Y-face and transposed
-    # X-face layouts.  Applying each stage constraint before μ padding avoids
-    # the x-major/y-major involuntary rematerialization documented below.
-    @partial(jax.jit, out_shardings=(out_Y, out_X))
-    def _reshard_centroid_tile(psi_rmu_band):
+    # band-sharded; consumers always need the Y face and may request the
+    # independent transposed X face.  Applying each stage constraint before
+    # μ padding avoids the x-major/y-major involuntary rematerialization
+    # documented below.
+    def _stage_y_face(psi_rmu_band):
         pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
         psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
         if n_rmu_padded > n_rmu:
             psi_rmu = jnp.pad(psi_rmu, pad_cfg)
-        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
+        return jax.lax.with_sharding_constraint(psi_rmu, out_Y)
+
+    def _stage_x_face(psi_rmu_band):
+        pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
         psi_T = jax.lax.with_sharding_constraint(psi_rmu_band, stage_X_4d)
         if n_rmu_padded > n_rmu:
             psi_T = jnp.pad(psi_T, pad_cfg)
         psi_rmuT = jnp.conj(psi_T.transpose(0, 3, 1, 2))
-        psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
-        return psi_rmu, psi_rmuT
+        return jax.lax.with_sharding_constraint(psi_rmuT, out_X)
 
-    def _finish_faces(psi_rmu_all, psi_rmuT_all):
+    if emit_x_face:
+        @partial(jax.jit, out_shardings=(out_Y, out_X))
+        def _reshard_centroid_tile(psi_rmu_band):
+            return (_stage_y_face(psi_rmu_band),
+                    _stage_x_face(psi_rmu_band))
+    else:
+        @partial(jax.jit, out_shardings=out_Y)
+        def _reshard_centroid_tile_y(psi_rmu_band):
+            return _stage_y_face(psi_rmu_band)
+
+    def _finish_y_face(psi_rmu_all):
         # Remove fixed-shape stream/loader pad rows before returning the
         # public logical k and band extents.
         if int(psi_rmu_all.shape[0]) > nk_tot:
             psi_rmu_all = psi_rmu_all[:nk_tot]
-            psi_rmuT_all = psi_rmuT_all[:nk_tot]
         if int(psi_rmu_all.shape[1]) > nb_total:
             psi_rmu_all = psi_rmu_all[:, :nb_total, :, :]
-            psi_rmuT_all = psi_rmuT_all[:, :, :nb_total, :]
         psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
-        psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
 
         # Zero user-band-pad rows (unchanged contract).
         nb_user_in_range = max(0, meta.b_id_4_user - b_start)
         if nb_user_in_range < nb_total:
             zero_y = jnp.zeros_like(
                 psi_rmu_all[:, nb_user_in_range:nb_total, :, :])
-            zero_x = jnp.zeros_like(
-                psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
             psi_rmu_all = psi_rmu_all.at[
                 :, nb_user_in_range:nb_total, :, :].set(zero_y)
+        return psi_rmu_all
+
+    def _finish_x_face(psi_rmuT_all):
+        if int(psi_rmuT_all.shape[0]) > nk_tot:
+            psi_rmuT_all = psi_rmuT_all[:nk_tot]
+        if int(psi_rmuT_all.shape[2]) > nb_total:
+            psi_rmuT_all = psi_rmuT_all[:, :, :nb_total, :]
+        psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
+
+        nb_user_in_range = max(0, meta.b_id_4_user - b_start)
+        if nb_user_in_range < nb_total:
+            zero_x = jnp.zeros_like(
+                psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
             psi_rmuT_all = psi_rmuT_all.at[
                 :, :, nb_user_in_range:nb_total, :].set(zero_x)
-        return psi_rmu_all, psi_rmuT_all
+        return psi_rmuT_all
+
+    def _finish_faces(psi_rmu_all, psi_rmuT_all):
+        psi_rmu_all = _finish_y_face(psi_rmu_all)
+        if not emit_x_face:
+            return psi_rmu_all, None
+        return psi_rmu_all, _finish_x_face(psi_rmuT_all)
 
     if b_start >= int(loader.nbands):
         raise ValueError(
@@ -2622,27 +2663,50 @@ def load_centroids_band_chunked(
             f"band extent ({int(loader.nbands)})")
 
     if stream_tiles:
-        @partial(jax.jit, out_shardings=(out_Y, out_X))
-        def _zero_faces():
-            return (
-                jnp.zeros(
-                    (nk_accum, nb_accum, nspinor, n_rmu_padded),
-                    dtype=jnp.complex128),
-                jnp.zeros(
-                    (nk_accum, n_rmu_padded, nb_accum, nspinor),
-                    dtype=jnp.complex128),
-            )
+        if emit_x_face:
+            @partial(jax.jit, out_shardings=(out_Y, out_X))
+            def _zero_faces():
+                return (
+                    jnp.zeros(
+                        (nk_accum, nb_accum, nspinor, n_rmu_padded),
+                        dtype=jnp.complex128),
+                    jnp.zeros(
+                        (nk_accum, n_rmu_padded, nb_accum, nspinor),
+                        dtype=jnp.complex128),
+                )
 
-        @partial(
-            jax.jit, donate_argnums=(0, 1), out_shardings=(out_Y, out_X))
-        def _insert_tile(acc_y, acc_x, psi_rmu_band, k0, b0):
-            tile_y, tile_x = _reshard_centroid_tile(psi_rmu_band)
-            zero = jnp.int32(0)
-            acc_y = jax.lax.dynamic_update_slice(
-                acc_y, tile_y, (k0, b0, zero, zero))
-            acc_x = jax.lax.dynamic_update_slice(
-                acc_x, tile_x, (k0, zero, b0, zero))
-            return acc_y, acc_x
+            @partial(
+                jax.jit, donate_argnums=(0, 1),
+                out_shardings=(out_Y, out_X))
+            def _insert_tile(acc_y, acc_x, psi_rmu_band, k0, b0):
+                tile_y, tile_x = _reshard_centroid_tile(psi_rmu_band)
+                zero = jnp.int32(0)
+                acc_y = jax.lax.dynamic_update_slice(
+                    acc_y, tile_y, (k0, b0, zero, zero))
+                acc_x = jax.lax.dynamic_update_slice(
+                    acc_x, tile_x, (k0, zero, b0, zero))
+                return acc_y, acc_x
+        else:
+            @partial(jax.jit, out_shardings=out_Y)
+            def _zero_y_face():
+                return jnp.zeros(
+                    (nk_accum, nb_accum, nspinor, n_rmu_padded),
+                    dtype=jnp.complex128)
+
+            def _zero_faces():
+                return _zero_y_face(), None
+
+            @partial(jax.jit, donate_argnums=(0,), out_shardings=out_Y)
+            def _insert_y_tile(acc_y, psi_rmu_band, k0, b0):
+                tile_y = _reshard_centroid_tile_y(psi_rmu_band)
+                zero = jnp.int32(0)
+                return jax.lax.dynamic_update_slice(
+                    acc_y, tile_y, (k0, b0, zero, zero))
+
+            def _insert_tile(acc_y, acc_x, psi_rmu_band, k0, b0):
+                del acc_x
+                return _insert_y_tile(
+                    acc_y, psi_rmu_band, k0, b0), None
 
         psi_rmu_all, psi_rmuT_all = _zero_faces()
         from common.collectives import barrier as _sync_barrier
@@ -2687,7 +2751,9 @@ def load_centroids_band_chunked(
                     psi_rmu_all, psi_rmuT_all = _insert_tile(
                         psi_rmu_all, psi_rmuT_all, psi_rmu_band,
                         jnp.int32(k0), jnp.int32(b_rel))
-                    jax.block_until_ready((psi_rmu_all, psi_rmuT_all))
+                    jax.block_until_ready(
+                        (psi_rmu_all, psi_rmuT_all)
+                        if emit_x_face else psi_rmu_all)
                 del psi_rmu_band
 
         gc.collect()
@@ -2742,8 +2808,9 @@ def load_centroids_band_chunked(
     del psi_G_flat
 
     # Single global reshard {None, XY, None, None} → {None, None, None, Y}
-    # plus a conjugate-transpose into the rmuT_X layout.  TWO INDEPENDENT
-    # staged chains from the band-sharded input, one per output:
+    # plus, when requested, a conjugate-transpose into the rmuT_X layout.
+    # The two-face default uses TWO INDEPENDENT staged chains from the
+    # band-sharded input, one per output:
     #
     #   psi_rmu :  b:('x','y') → b:'y'  → μ:'y'   (out_Y)
     #   psi_rmuT:  b:('x','y') → b:'x'  → transpose → μ:'x'  (out_X)
@@ -2784,8 +2851,14 @@ def load_centroids_band_chunked(
         _sync_barrier("load_centroids_pre_reshard")
 
     with timing.section("load_centroids.reshard"):
-        psi_rmu_all, psi_rmuT_all = _reshard_centroid_tile(psi_rmu_band)
-        jax.block_until_ready(psi_rmuT_all)
+        if emit_x_face:
+            psi_rmu_all, psi_rmuT_all = _reshard_centroid_tile(
+                psi_rmu_band)
+            jax.block_until_ready((psi_rmu_all, psi_rmuT_all))
+        else:
+            psi_rmu_all = _reshard_centroid_tile_y(psi_rmu_band)
+            psi_rmuT_all = None
+            jax.block_until_ready(psi_rmu_all)
     del psi_rmu_band
     gc.collect()
     return _finish_faces(psi_rmu_all, psi_rmuT_all)
