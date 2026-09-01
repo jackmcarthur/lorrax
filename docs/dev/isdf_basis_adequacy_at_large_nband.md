@@ -143,10 +143,11 @@ a constant to distrust.
 
 1. **Select the basis on the right window.** With the fix, the default prune
    window is the full WFN conduction window — a superset of any deck's `ncond`.
-   If you narrow it with `--prune-n-cond`, the rank gate (Section 5) refuses if
-   that costs independence.
-2. **Read the rank line.** `After pruning: N centroids (rank=R)` must have `R`
-   equal to the requested orbit/point count. This is now enforced.
+   If you narrow it with `--prune-n-cond`, the rank report (Section 5) exposes
+   any loss of independence.
+2. **Read the rank line.** `After pruning: N centroids (rank=R)` reports both
+   values in point units. A shortfall is evidence to investigate, not an
+   automatic accuracy verdict.
 3. **Watch `n_keep / n_pad`** in `[zeta rank_truncate]` as an observable and
    report it — but see the Section 3 caveat before treating any value as a limit.
 
@@ -162,15 +163,14 @@ Section 2 failure (the failing points sat inside the band, at 9.8x and 14.7x),
 so **membership in that band is not evidence of adequacy**. That does not refute
 it as a starting point — it simply is not a check.
 
-## 5. Gate: centroid rank assertion
+## 5. Centroid rank report
 
-`kmeans_cli` now **refuses** to write a centroid set whose pivoted-Cholesky rank
-falls short of the number of directions requested (default tolerance 1%,
-override `LORRAX_CENTROID_RANK_TOL`). The message names the likely cause and the
-exact flags that fix it.
-
-Rationale: a rank shortfall does not change the number of points in the file, so
-nothing downstream can notice it. It has to be caught where it happens.
+`kmeans_cli` reports the pivoted-Cholesky rank in point units. Numerical
+flatness does not refuse by default: an over-complete interpolation set may be
+accurate and the downstream zeta solve already truncates unresolved modes.
+`LORRAX_CENTROID_SELECT=strict` is available for diagnostic reproduction.
+Structural failures—non-PSD input, pool exhaustion, or invalid pivots—always
+refuse.
 
 **Behaviour change to be aware of**: because the default prune window is now the
 full WFN window, `max_band = nbands` rather than the old clamped 52. A deck with

@@ -14,11 +14,11 @@ three scalars.  The sharded kernel requires the Gram, optional labels, and
 optional mask to be row-sharded across ``mesh_axis``; all outputs except
 ``L`` and ``d_final`` are replicated.
 
-Selection semantics are intentionally strict: global ties choose the lowest
-row index, grouped mode deactivates every row with the chosen label, and the
-collective order is two ``pmax`` operations followed by one fused ``psum`` per
-iteration.  The reference implementation is the bit-exact parity oracle for
-the distributed path.
+Selection semantics are deterministic: global ties choose the lowest row
+index. The compatibility grouped selector returns one representative per
+label. The block selector instead admits a complete group under a point budget
+and pivots every member before scoring another group. The reference
+implementation is the parity oracle for the distributed path.
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ from common.shard_map import shard_map
 __all__ = [
     "pivoted_cholesky_select",
     "make_sharded_pivoted_cholesky_select",
+    "group_block_pivoted_cholesky_select",
+    "make_sharded_group_block_pivoted_cholesky_select",
 ]
 
 
@@ -204,6 +206,154 @@ def pivoted_cholesky_select(
     # be monotone past the numerical rank (it is not, when it is noise).
     rank = jnp.sum(d_taken > floor).astype(jnp.int32)
     return (piv, L, rank, d_final, d_taken, trR_over_trG,
+            (d_min_raw, d_min_at, d_min_j))
+
+
+@partial(jax.jit, static_argnames=('point_budget', 'n_groups', 'tol_rel'))
+def group_block_pivoted_cholesky_select(
+    G: jnp.ndarray,
+    point_budget: int,
+    group_id: jnp.ndarray,
+    *,
+    n_groups: int,
+    tol_rel: float | None = None,
+    active_init: jnp.ndarray | None = None,
+):
+    """Select complete labelled groups under a point budget.
+
+    This is block pivoting in the selection sense: a group is admitted as a
+    whole, then every one of its rows is used in the ordinary rank-1 Schur
+    recurrence before another group is scored.  Groups are scored by mean
+    residual diagonal (residual value per point spent).  A group is eligible
+    only when all of its active rows fit in the remaining point budget.
+
+    ``group_id`` must be dense in ``[0, n_groups)``.  An optional inactive
+    padding row may use ``n_groups`` as a sentinel.  The return contract is
+    the same seven-tuple as :func:`pivoted_cholesky_select`; trailing ``-1``
+    pivots mean that no complete remaining group fit the budget.  Numerical
+    rank and delivered point count are intentionally separate: after the
+    residual reaches ``tol_rel`` the selected rows are still returned, but
+    their factor columns and ``d_taken`` entries are zero.
+    """
+    M = G.shape[0]
+    real_dtype = G.real.dtype
+    eps = jnp.finfo(real_dtype).eps
+    minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+    active0 = (jnp.ones((M,), dtype=bool) if active_init is None
+               else active_init.astype(bool))
+
+    diag_raw = jnp.real(jnp.diag(G))
+    diag0 = jnp.maximum(diag_raw, 0.0)
+    d0 = jnp.where(active0, diag0, 0.0)
+    tol = (jnp.sqrt(eps) if tol_rel is None
+           else jnp.asarray(tol_rel, real_dtype))
+    floor = tol * jnp.max(jnp.where(active0, diag_raw, minus_inf))
+    trG = jnp.sum(d0)
+    group_sizes = jax.ops.segment_sum(
+        active0.astype(jnp.int32), group_id,
+        num_segments=n_groups + 1, indices_are_sorted=False)
+
+    initial_for_min = jnp.where(active0, diag_raw, jnp.inf)
+    at0 = jnp.argmin(initial_for_min).astype(jnp.int32)
+    neg0 = initial_for_min[at0] < 0.0
+    init = (
+        d0,
+        jnp.zeros((M, point_budget), dtype=G.dtype),
+        -jnp.ones((point_budget,), dtype=jnp.int32),
+        active0,                         # not yet admitted
+        active0,                         # admitted but not yet pivoted, or future
+        jnp.int32(-1),                   # open group
+        jnp.int32(0),                    # rows remaining in open group
+        jnp.int32(0),                    # points committed by whole groups
+        jnp.zeros((point_budget,), dtype=real_dtype),
+        jnp.zeros((point_budget + 1,), dtype=real_dtype).at[0].set(1.0),
+        jnp.minimum(initial_for_min[at0], jnp.zeros((), dtype=real_dtype)),
+        jnp.where(neg0, at0, jnp.int32(-1)),
+        jnp.int32(-1),
+    )
+    col_ids = jnp.arange(point_budget)
+
+    def body(j, carry):
+        (d, L, piv, unadmitted, available, current, current_left,
+         committed, d_taken, trR, d_min_raw, d_min_at, d_min_j) = carry
+
+        need_group = current_left == 0
+
+        def choose_group(_):
+            values = jax.ops.segment_sum(
+                jnp.where(unadmitted, d, 0.0), group_id,
+                num_segments=n_groups + 1, indices_are_sorted=False)
+            remaining_budget = jnp.int32(point_budget) - committed
+            eligible = ((group_sizes > 0)
+                        & (group_sizes <= remaining_budget)
+                        & (jnp.arange(n_groups + 1) < n_groups))
+            scores = jnp.where(
+                eligible,
+                values / jnp.maximum(group_sizes.astype(real_dtype), 1.0),
+                minus_inf,
+            )
+            candidate = jnp.argmax(scores).astype(jnp.int32)
+            return candidate, jnp.max(scores) > minus_inf
+
+        # Score groups only at a block boundary.  On a generic orbit this
+        # removes ``group_size - 1`` redundant segment reductions per block.
+        candidate, has_candidate = lax.cond(
+            need_group,
+            choose_group,
+            lambda _: (current, jnp.bool_(False)),
+            operand=None,
+        )
+        opened = need_group & has_candidate
+        current = jnp.where(opened, candidate, current)
+        safe_group = jnp.clip(candidate, 0, n_groups)
+        opened_size = group_sizes[safe_group]
+        current_left = jnp.where(opened, opened_size, current_left)
+        committed = committed + jnp.where(opened, opened_size, 0)
+        unadmitted = unadmitted & ~(opened & (group_id == current))
+
+        in_current = available & (group_id == current)
+        masked_d = jnp.where(in_current, d, minus_inf)
+        p_raw = jnp.argmax(masked_d).astype(jnp.int32)
+        pivot_raw = masked_d[p_raw]
+        avail = pivot_raw > minus_inf
+        p = jnp.where(avail, p_raw, jnp.int32(0))
+        take = avail & (pivot_raw > floor)
+        pivot_val = jnp.maximum(pivot_raw, floor)
+
+        prev_mask = (col_ids < j).astype(G.dtype)
+        corr = L @ (jnp.conj(L[p, :]) * prev_mask)
+        denom = jnp.sqrt(pivot_val)
+        newcol = (G[:, p] - corr) / denom
+        newcol = newcol.at[p].set(denom.astype(G.dtype))
+        newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+        L = L.at[:, j].set(newcol)
+        piv = piv.at[j].set(jnp.where(avail, p, jnp.int32(-1)))
+        d_taken = d_taken.at[j].set(jnp.where(take, pivot_val, 0.0))
+
+        d_raw = d - jnp.abs(newcol) ** 2
+        masked_raw = jnp.where(available, d_raw, jnp.inf)
+        step_at = jnp.argmin(masked_raw).astype(jnp.int32)
+        step_min = masked_raw[step_at]
+        beats = take & (step_min < d_min_raw)
+        d_min_at = jnp.where(beats, step_at, d_min_at)
+        d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
+        d_min_raw = jnp.where(beats, step_min, d_min_raw)
+        d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
+        trR = trR.at[j + 1].set(jnp.sum(d_new) / trG)
+
+        kill = (jnp.arange(M) == p) & avail
+        available = available & ~kill
+        current_left = current_left - jnp.where(avail, 1, 0)
+        d = jnp.where(kill, 0.0, jnp.where(take, d_new, d))
+        return (d, L, piv, unadmitted, available, current, current_left,
+                committed, d_taken, trR, d_min_raw, d_min_at, d_min_j)
+
+    (d, L, piv, _, available, _, _, _, d_taken, trR,
+     d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
+        0, point_budget, body, init)
+    d_final = jnp.where(available, d, 0.0)
+    rank = jnp.sum(d_taken > floor).astype(jnp.int32)
+    return (piv, L, rank, d_final, d_taken, trR,
             (d_min_raw, d_min_at, d_min_j))
 
 
@@ -450,6 +600,228 @@ def make_sharded_pivoted_cholesky_select(
         return shard_map(
             _entry, mesh=mesh,
             in_specs=tuple(specs), out_specs=out_specs,
+            check_vma=False,
+        )(*args)
+
+    return step
+
+
+def make_sharded_group_block_pivoted_cholesky_select(
+    mesh: Mesh,
+    M: int,
+    point_budget: int,
+    n_groups: int,
+    *,
+    mesh_axis: str | tuple[str, ...] = 'x',
+    tol_rel: float | None = None,
+):
+    """Row-sharded counterpart of
+    :func:`group_block_pivoted_cholesky_select`.
+
+    The Gram and group labels are row-sharded across ``mesh_axis``.  Group
+    scores use one all-reduce of ``n_groups + 1`` residual sums when a new
+    group is opened; no group-score collective runs while the admitted group
+    is being deflated. The ordinary pivot value, global tie-break and
+    factor-row broadcast keep the same collective order as the point selector.
+    Group sizes are reduced once before the loop.
+    """
+    n_dev = _mesh_axis_size(
+        mesh, mesh_axis, "make_sharded_group_block_pivoted_cholesky_select"
+    )
+    if M % n_dev != 0:
+        raise ValueError(f"M={M} must be divisible by product of mesh axes "
+                         f"{mesh_axis} (= {n_dev})")
+    if point_budget < 1 or point_budget > M:
+        raise ValueError(
+            f"point_budget must lie in [1, M={M}]; got {point_budget}")
+    if n_groups < 1 or n_groups > M:
+        raise ValueError(f"n_groups must lie in [1, M={M}]; got {n_groups}")
+    M_slab = M // n_dev
+
+    row_shard = PartitionSpec(mesh_axis, None)
+    row_shard_1d = PartitionSpec(mesh_axis)
+    rep = PartitionSpec()
+    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep,
+                 (rep, rep, rep))
+
+    @jax.jit
+    def step(G, group_id, active_init=None):
+        def body_local(G_slab, group_id_slab, active_slab=None):
+            real_dtype = G_slab.real.dtype
+            eps = jnp.finfo(real_dtype).eps
+            minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+            my_idx = lax.axis_index(mesh_axis)
+            local_rows = jnp.arange(M_slab)
+            global_rows = my_idx * M_slab + local_rows
+            local_diag_raw = jnp.real(G_slab[local_rows, global_rows])
+            local_diag = jnp.maximum(local_diag_raw, 0.0)
+            active0 = (jnp.ones((M_slab,), dtype=bool)
+                       if active_slab is None else active_slab.astype(bool))
+            local_diag = jnp.where(active0, local_diag, 0.0)
+            trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
+            d0max = lax.pmax(
+                jnp.max(jnp.where(active0, local_diag_raw, minus_inf)),
+                axis_name=mesh_axis)
+            tol = (jnp.sqrt(eps) if tol_rel is None
+                   else jnp.asarray(tol_rel, real_dtype))
+            floor = tol * d0max
+            group_id_slab = group_id_slab.astype(jnp.int32)
+            local_sizes = jax.ops.segment_sum(
+                active0.astype(jnp.int32), group_id_slab,
+                num_segments=n_groups + 1, indices_are_sorted=False)
+            group_sizes = lax.psum(local_sizes, axis_name=mesh_axis)
+
+            initial_for_min = jnp.where(active0, local_diag_raw, jnp.inf)
+            at0_loc = jnp.argmin(initial_for_min).astype(jnp.int32)
+            at0_glob = (my_idx * M_slab + at0_loc).astype(jnp.int32)
+            neg0 = initial_for_min[at0_loc] < 0.0
+            init = (
+                local_diag,
+                jnp.zeros((M_slab, point_budget), dtype=G_slab.dtype),
+                -jnp.ones((point_budget,), dtype=jnp.int32),
+                active0,                         # not admitted
+                active0,                         # not pivoted
+                jnp.int32(-1),                   # open group
+                jnp.int32(0),                    # rows left in open group
+                jnp.int32(0),                    # points committed
+                jnp.zeros((point_budget,), dtype=real_dtype),
+                jnp.zeros((point_budget + 1,), dtype=real_dtype).at[0].set(
+                    jnp.sum(local_diag)),
+                jnp.minimum(initial_for_min[at0_loc],
+                            jnp.zeros((), dtype=real_dtype)),
+                jnp.where(neg0, at0_glob, jnp.int32(-1)),
+                jnp.int32(-1),
+            )
+            col_ids = jnp.arange(point_budget)
+
+            def body(j, carry):
+                (d, L, piv, unadmitted, available, current, current_left,
+                 committed, d_taken, trR, d_min_raw,
+                 d_min_at, d_min_j) = carry
+
+                need_group = current_left == 0
+
+                def choose_group(_):
+                    local_values = jax.ops.segment_sum(
+                        jnp.where(unadmitted, d, 0.0), group_id_slab,
+                        num_segments=n_groups + 1, indices_are_sorted=False)
+                    values = lax.psum(local_values, axis_name=mesh_axis)
+                    remaining_budget = jnp.int32(point_budget) - committed
+                    eligible = ((group_sizes > 0)
+                                & (group_sizes <= remaining_budget)
+                                & (jnp.arange(n_groups + 1) < n_groups))
+                    scores = jnp.where(
+                        eligible,
+                        values / jnp.maximum(
+                            group_sizes.astype(real_dtype), 1.0),
+                        minus_inf,
+                    )
+                    candidate = jnp.argmax(scores).astype(jnp.int32)
+                    return candidate, jnp.max(scores) > minus_inf
+
+                # ``need_group`` and its inputs are replicated, so every
+                # shard enters the collective branch together.
+                candidate, has_candidate = lax.cond(
+                    need_group,
+                    choose_group,
+                    lambda _: (current, jnp.bool_(False)),
+                    operand=None,
+                )
+                opened = need_group & has_candidate
+                current = jnp.where(opened, candidate, current)
+                safe_group = jnp.clip(candidate, 0, n_groups)
+                opened_size = group_sizes[safe_group]
+                current_left = jnp.where(opened, opened_size, current_left)
+                committed = committed + jnp.where(opened, opened_size, 0)
+                unadmitted = unadmitted & ~(
+                    opened & (group_id_slab == current))
+
+                in_current = available & (group_id_slab == current)
+                masked_d = jnp.where(in_current, d, minus_inf)
+                local_p_idx = jnp.argmax(masked_d).astype(jnp.int32)
+                local_pv = masked_d[local_p_idx]
+                global_pv = lax.pmax(local_pv, axis_name=mesh_axis)
+                local_global_p = (my_idx * M_slab + local_p_idx).astype(
+                    jnp.int32)
+                winner_p = jnp.where(
+                    local_pv >= global_pv, local_global_p, jnp.int32(2**30))
+                global_p_raw = -lax.pmax(-winner_p, axis_name=mesh_axis)
+                avail = global_pv > minus_inf
+                global_p = jnp.where(avail, global_p_raw, jnp.int32(0))
+                take = avail & (global_pv > floor)
+                pivot_val = jnp.maximum(global_pv, floor)
+
+                gcol_slab = G_slab[:, global_p]
+                my_has_p = (global_p // M_slab == my_idx) & avail
+                local_p_rel = global_p - my_idx * M_slab
+                safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
+                local_Lp = jnp.where(
+                    my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]))
+                L_p = lax.psum(local_Lp, axis_name=mesh_axis)
+
+                prev_mask = (col_ids < j).astype(G_slab.dtype)
+                corr = L @ (jnp.conj(L_p) * prev_mask)
+                denom = jnp.sqrt(pivot_val)
+                newcol = (gcol_slab - corr) / denom
+                fix_row = my_has_p & (local_rows == local_p_rel)
+                newcol = jnp.where(
+                    fix_row, denom.astype(G_slab.dtype), newcol)
+                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+                L = L.at[:, j].set(newcol)
+                piv = piv.at[j].set(jnp.where(
+                    avail, global_p, jnp.int32(-1)))
+                d_taken = d_taken.at[j].set(jnp.where(
+                    take, pivot_val, 0.0))
+
+                d_raw = d - jnp.abs(newcol) ** 2
+                masked_raw = jnp.where(available, d_raw, jnp.inf)
+                step_at = jnp.argmin(masked_raw).astype(jnp.int32)
+                step_min = masked_raw[step_at]
+                beats = take & (step_min < d_min_raw)
+                d_min_at = jnp.where(
+                    beats, (my_idx * M_slab + step_at).astype(jnp.int32),
+                    d_min_at)
+                d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
+                d_min_raw = jnp.where(beats, step_min, d_min_raw)
+                d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
+                trR = trR.at[j + 1].set(jnp.sum(d_new))
+
+                kill = my_has_p & (local_rows == local_p_rel)
+                available = available & ~kill
+                current_left = current_left - jnp.where(avail, 1, 0)
+                d = jnp.where(kill, 0.0, jnp.where(take, d_new, d))
+                return (d, L, piv, unadmitted, available, current,
+                        current_left, committed, d_taken, trR,
+                        d_min_raw, d_min_at, d_min_j)
+
+            (d, L, piv, _, available, _, _, _, d_taken, trR,
+             d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
+                0, point_budget, body, init)
+            d_final = jnp.where(available, d, 0.0)
+            trR = lax.psum(trR, axis_name=mesh_axis) / trG
+            rank = jnp.sum(d_taken > floor).astype(jnp.int32)
+            g_min = -lax.pmax(-d_min_raw, axis_name=mesh_axis)
+            mine = d_min_raw == g_min
+            far = jnp.int32(2**30)
+            g_at = -lax.pmax(
+                -jnp.where(mine, d_min_at, far), axis_name=mesh_axis)
+            g_j = -lax.pmax(
+                -jnp.where(mine, d_min_j, far), axis_name=mesh_axis)
+            return (piv, L, rank, d_final, d_taken, trR,
+                    (g_min, g_at, g_j))
+
+        specs = [row_shard, row_shard_1d]
+        args = [G, group_id]
+        has_active = active_init is not None
+        if has_active:
+            specs.append(row_shard_1d)
+            args.append(active_init)
+
+        def _entry(*a):
+            return body_local(a[0], a[1], a[2] if has_active else None)
+
+        return shard_map(
+            _entry, mesh=mesh, in_specs=tuple(specs), out_specs=out_specs,
             check_vma=False,
         )(*args)
 

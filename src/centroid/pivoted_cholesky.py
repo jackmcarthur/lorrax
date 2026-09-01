@@ -74,6 +74,7 @@ from common import timing
 from common.collectives import device_put_process_local
 from common.gpu_utils import worst_process_resident_bytes
 from common.pivoted_cholesky import (
+    make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
 )
 from runtime.padding import round_up
@@ -554,25 +555,12 @@ POINT_RANK_CAP_DEFAULT = 4096
 
 
 def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
-    """Independent directions in the DELIVERED POINT SET, not in the orbits.
+    """Independent directions in a delivered point set.
 
-    THE CONFUSION THIS REMOVES.  In orbit mode the greedy select deflates
-    the Schur complement by ONE direction per orbit while removing all
-    ``n_sym`` members from contention, so the rank it reports counts
-    ORBITS.  D3's gate passed at "42 of 42 directions certified" and the
-    file it blessed contained 1908 POINTS; the ζ back-solve then truncated
-    to 1440-1455 modes per q (23.7-24.5 %, logged eight times per leg and
-    read by nobody) because the 60-band pair-product space on a 24³ grid
-    saturates around 1450 numerical directions.  Asking for 1908 centroids
-    does not raise that ceiling — it hands the pseudo-inverse a
-    rank-deficient Gram.
-
-    Nothing in the centroid pipeline ever checked the delivered set at
-    point granularity, and in orbit mode it structurally cannot: the number
-    the rank gate reads is not comparable to the point count.  This is that
-    number, measured directly, so the log can say "42 orbits, 1908 points,
-    N independent directions" and an operator can see the ζ truncation
-    coming before spending a 7 GiB restart file on it.
+    The production whole-orbit block selector computes this rank directly as
+    it pivots every delivered point. This O(n³) host diagnostic remains for
+    the explicit representative-group compatibility path, whose select rank
+    counts representatives rather than emitted points.
 
     Returns ``(rank, n_points, reason)``.  ``rank`` is ``None`` when the
     measurement was skipped and ``reason`` says why — never a silent
@@ -607,11 +595,9 @@ def _report_point_granularity(G, keep_mask, rank_selected, *, unit,
                               tol_rel=None, verbose=True):
     """Say the certification at the granularity of the FILE being written.
 
-    ONE implementation for both modes.  ``rank_selected`` is what the select
-    certified — ORBITS in orbit mode, POINTS in point mode — and ``unit``
-    names which, because a number whose unit is ambiguous is how
-    "18/18 directions certified — PASS" came to be said over a delivered set
-    of 768 points.
+    ``rank_selected`` is what the compatibility selector certified. ``unit``
+    makes its granularity explicit; the production block path does not need
+    this second eigensolve because it already pivots every emitted point.
 
     This reports; it never refuses.  A rank-deficient delivered set is a
     fact about an over-complete interpolation basis and is measured
@@ -639,7 +625,7 @@ def _report_point_granularity(G, keep_mask, rank_selected, *, unit,
               f"on the Si anchor deck the 960-point set with ~160 dependent "
               f"points is the most accurate one measured.")
     _note = point_rank_closure_note(G, keep_mask, pt_rank, tol_rel=tol_rel)
-    print(f"  [point rank] closure: " + (
+    print("  [point rank] closure: " + (
         _note if _note else
         "the rank cut falls in a gap — no degenerate block is "
         "sliced at this tolerance."))
@@ -705,6 +691,7 @@ def prune_candidates_by_pivoted_cholesky(
     orbit_id: np.ndarray | None = None,
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
+    group_block: bool = False,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -714,11 +701,12 @@ def prune_candidates_by_pivoted_cholesky(
     G-space path; the prune driver does not select an HDF5 implementation.
 
     When ``orbit_id`` is provided (one int per candidate, equal for sym-
-    equivalent candidates), PC picks one pivot per orbit and the returned
-    ``keep_idx`` is the union of orbits of the picked pivots — guaranteed
-    orbit-closed under the sym group used to assign ``orbit_id``. In that
-    mode ``n_keep`` counts ORBITS (final unfolded centroid count is
-    ``Σ orbit_size`` for picked orbits).
+    equivalent candidates), the returned set is a union of complete orbits.
+    With ``group_block=False`` the compatibility path picks one representative
+    per orbit and ``n_keep`` counts orbits.  With ``group_block=True``, every
+    emitted orbit member participates in the Schur recurrence and
+    ``n_point_budget`` is the selection budget; this is the physically correct
+    centroid-pruning path.
 
     Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG,
     psd_info)``.
@@ -736,6 +724,11 @@ def prune_candidates_by_pivoted_cholesky(
     historical behaviour: ``n_keep`` orbits, whatever that costs in points.
     Ignored outside orbit mode, where ``n_keep`` already IS the point count.
 
+    ``group_block=True`` requires both ``orbit_id`` and ``n_point_budget``.
+    It admits an orbit only if the complete orbit fits, so the kernel itself
+    returns the largest greedy whole-orbit set no larger than the point budget;
+    there is no partial last block for the host to repair.
+
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
     ``LORRAX_CENTROID_PC_TOL`` from the environment and falls back to
@@ -744,14 +737,15 @@ def prune_candidates_by_pivoted_cholesky(
     LAPACK ``?pstrf``'s own policy is ``n·eps``; pass it explicitly to get
     it.
 
-    REFUSES, rather than returning a plausible-looking set, when the kernel
-    could not do what was asked: a non-PSD Gram, a pool that runs out of
-    orbits, a pool that is numerically rank-deficient, or a pivot outside
-    the candidate range.  ``rank == n_keep`` on every path that returns.
-    Those refusals are the assessment's R1 and they are stated in full
-    beside the kernel; the short version is that each one used to be a
-    silent wrong answer that passed every downstream shape check.
+    REFUSES on a non-PSD Gram, structural pool exhaustion, or a pivot outside
+    the candidate range.  Numerical rank deficiency is reported by default;
+    ``LORRAX_CENTROID_SELECT=strict`` promotes it to a refusal.  The policy is
+    owned once by :func:`refuse_unless_select_certified`.
     """
+    if group_block and orbit_id is None:
+        raise ValueError("group_block=True requires orbit_id")
+    if group_block and n_point_budget is None:
+        raise ValueError("group_block=True requires n_point_budget")
     gamma_mode = _resolve_candidate_gamma_mode(
         gamma_mode, bispinor=bispinor)
     if gamma_mode == "transverse" and band_norms is not None:
@@ -882,10 +876,83 @@ def prune_candidates_by_pivoted_cholesky(
                   f"M {M} -> {M_pad} (+{n_pad} inactive rows) so M_pad % "
                   f"{n_dev} == 0; pads carry d=0 and start INACTIVE")
 
-    # Run select on the row-sharded Gram. Orbit-aware mode passes orbit_id
-    # row-sharded the same way as G; the body marks the whole orbit
-    # inactive after each pivot pick (orbit_id of the pivot is broadcast
-    # via psum-with-mask, same idiom as the L[p, :] broadcast).
+    if group_block:
+        orbit_id_np = np.asarray(orbit_id, dtype=np.int32)
+        labels, dense_id = np.unique(orbit_id_np, return_inverse=True)
+        n_groups = int(labels.size)
+        budget = min(int(n_point_budget), M)
+        dense_pad = dense_id.astype(np.int32)
+        active_init = None
+        if n_pad:
+            dense_pad = np.concatenate([
+                dense_pad, np.full((n_pad,), n_groups, dtype=np.int32)])
+            active_host = np.ones((M_pad,), dtype=bool)
+            active_host[M:] = False
+            active_init = device_put_process_local(
+                active_host,
+                NamedSharding(mesh, PartitionSpec(select_axis)),
+            )
+        group_id_jax = device_put_process_local(
+            dense_pad, NamedSharding(mesh, PartitionSpec(select_axis)))
+        with timing.section("prune.select"):
+            select_step = _make_sharded_block_select(
+                mesh, M_pad, budget, n_groups,
+                mesh_axis=select_axis, tol_rel=tol_rel)
+            (piv, L, rank, d_final, d_taken, trR_over_trG,
+             psd_info) = select_step(G, group_id_jax, active_init)
+            piv.block_until_ready()
+        del L
+
+        piv_np = np.asarray(piv)
+        piv_used = piv_np[piv_np >= 0]
+        if piv_used.size == 0:
+            sizes = np.bincount(dense_id, minlength=n_groups)
+            raise RuntimeError(
+                f"pivoted-Cholesky REFUSES: point budget {budget} is smaller "
+                f"than every complete group (minimum size {int(sizes.min())})")
+        picked_groups = dense_id[piv_used]
+        order = picked_groups[np.sort(np.unique(
+            picked_groups, return_index=True)[1])]
+        in_kept = np.isin(dense_id, order)
+        sizes = np.bincount(dense_id, minlength=n_groups)
+        pivot_counts = np.bincount(picked_groups, minlength=n_groups)
+        if not np.array_equal(pivot_counts[order], sizes[order]):
+            raise RuntimeError(
+                "group-block pivoted Cholesky returned a partial group; "
+                "the point-budget admission contract is broken")
+        keep_idx = np.asarray(cand_idx)[in_kept]
+        n_delivered = int(keep_idx.size)
+        rank_i = int(rank)
+        diag_host = np.real(np.asarray(jnp.diag(G)))[:M]
+        psd_host = (
+            float(np.asarray(psd_info[0])), int(np.asarray(psd_info[1])),
+            int(np.asarray(psd_info[2])))
+        refuse_unless_select_certified(
+            piv_used, rank_i, psd_host, n_keep=n_delivered, M=M,
+            M_pad=M_pad, orbit_id=None, d0max=float(diag_host.max()),
+            tol_rel=tol_rel)
+        d_final_np = np.asarray(
+            _mh.process_allgather(d_final, tiled=True))[:M]
+        if n_pad:
+            G = G[:M, :M]
+        if verbose:
+            last = max(n_delivered - 1, 0)
+            print(
+                f"[pivoted_cholesky] GROUP-BLOCK: {len(order)} groups -> "
+                f"{n_delivered}/{budget} points, rank={rank_i}; every "
+                f"delivered point updated the residual")
+            print(f"[pivoted_cholesky] picked-pivot residuals: "
+                  f"first={float(d_taken[0]):.3e}, "
+                  f"last-delivered={float(d_taken[last]):.3e}")
+            print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
+                  f"first={float(trR_over_trG[1]):.3e}, "
+                  f"last-delivered={float(trR_over_trG[n_delivered]):.3e}")
+        return (keep_idx, rank_i, G, d_final_np, np.asarray(d_taken),
+                np.asarray(trR_over_trG), psd_host)
+
+    # Compatibility selector: orbit-aware mode chooses one representative and
+    # then emits its whole orbit. Production centroid pruning returns above
+    # through the group-block selector, which pivots every emitted point.
     with timing.section("prune.select"):
         select_step = _make_sharded_select(
             mesh, M_pad, n_keep, mesh_axis=select_axis, tol_rel=tol_rel,

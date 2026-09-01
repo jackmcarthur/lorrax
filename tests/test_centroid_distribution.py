@@ -468,7 +468,83 @@ def test_select_refuses_a_pivot_outside_the_candidate_range():
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 3. Orbit-aware Lloyd reduces to plain Lloyd on the trivial group
+# 3. Whole-group pivoting spends and deflates in the same unit
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_group_block_select_deflates_every_delivered_point():
+    from src.common.pivoted_cholesky import (
+        group_block_pivoted_cholesky_select,
+        pivoted_cholesky_select,
+    )
+
+    sizes = np.asarray([3, 5, 4, 2], dtype=np.int32)
+    group_id = np.repeat(np.arange(sizes.size, dtype=np.int32), sizes)
+    M = int(group_id.size)
+    rng = np.random.default_rng(1701)
+    A = (rng.standard_normal((M, 2 * M))
+         + 1j * rng.standard_normal((M, 2 * M)))
+    G = jnp.asarray(A @ A.conj().T, dtype=jnp.complex128)
+    G = 0.5 * (G + G.conj().T)
+
+    # The compatibility recurrence spends one pivot per group while a caller
+    # that unfolds those pivots emits all M points.
+    rep = pivoted_cholesky_select(
+        G, sizes.size, jnp.asarray(group_id))
+    assert int(rep[2]) == sizes.size
+    rep_groups = group_id[np.asarray(rep[0])]
+    assert np.isin(group_id, rep_groups).sum() == M
+
+    # The block recurrence emits the same complete set and performs one
+    # independent update per emitted point.
+    block = group_block_pivoted_cholesky_select(
+        G, M, jnp.asarray(group_id), n_groups=sizes.size)
+    piv = np.asarray(block[0])
+    assert np.all(piv >= 0)
+    assert int(block[2]) == M
+    np.testing.assert_array_equal(
+        np.bincount(group_id[piv], minlength=sizes.size), sizes)
+
+    # Negative control: duplicate every feature within its group.  The block
+    # path must still deliver complete groups after the numerical floor, but
+    # its certified rank must fall from M to the known group rank.
+    B = (rng.standard_normal((sizes.size, 2 * M))
+         + 1j * rng.standard_normal((sizes.size, 2 * M)))
+    A_flat = B[group_id]
+    G_flat = jnp.asarray(A_flat @ A_flat.conj().T, dtype=jnp.complex128)
+    flat = group_block_pivoted_cholesky_select(
+        G_flat, M, jnp.asarray(group_id), n_groups=sizes.size)
+    assert np.all(np.asarray(flat[0]) >= 0)
+    assert int(flat[2]) == sizes.size
+
+
+def test_group_block_select_never_opens_a_partial_budget_block():
+    from src.common.pivoted_cholesky import (
+        group_block_pivoted_cholesky_select,
+    )
+
+    sizes = np.asarray([2, 3, 4, 5], dtype=np.int32)
+    group_id = np.repeat(np.arange(sizes.size, dtype=np.int32), sizes)
+    M = int(group_id.size)
+    rng = np.random.default_rng(314)
+    A = (rng.standard_normal((M, 2 * M))
+         + 1j * rng.standard_normal((M, 2 * M)))
+    G = jnp.asarray(A @ A.conj().T, dtype=jnp.complex128)
+    budget = 8
+    out = group_block_pivoted_cholesky_select(
+        G, budget, jnp.asarray(group_id), n_groups=sizes.size)
+    piv = np.asarray(out[0])
+    piv = piv[piv >= 0]
+    picked = np.unique(group_id[piv])
+    counts = np.bincount(group_id[piv], minlength=sizes.size)
+    np.testing.assert_array_equal(counts[picked], sizes[picked])
+    assert piv.size <= budget
+    remaining = budget - piv.size
+    assert not np.any(sizes[np.setdiff1d(np.arange(sizes.size), picked)]
+                      <= remaining)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 4. Orbit-aware Lloyd reduces to plain Lloyd on the trivial group
 # ─────────────────────────────────────────────────────────────────────────
 
 def _bumpy_density(N=10, seed=0):
@@ -558,8 +634,12 @@ import jax, jax.numpy as jnp
 from jax.sharding import Mesh
 assert jax.device_count() == 4, f"want 4 devices, got {jax.device_count()}"
 
-from common.pivoted_cholesky import (pivoted_cholesky_select,
-                                     make_sharded_pivoted_cholesky_select)
+from common.pivoted_cholesky import (
+    group_block_pivoted_cholesky_select,
+    make_sharded_group_block_pivoted_cholesky_select,
+    make_sharded_pivoted_cholesky_select,
+    pivoted_cholesky_select,
+)
 
 mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
 AX = ("x", "y")
@@ -594,6 +674,23 @@ def check(name, G, k, oid=None):
           f"M_slab={int(G.shape[0])//4}, piv[0]={pr[0]}")
     return pr
 
+def check_block(name, G, budget, oid, n_groups):
+    oj = jnp.asarray(oid)
+    ref = group_block_pivoted_cholesky_select(
+        G, budget, oj, n_groups=n_groups)
+    step = make_sharded_group_block_pivoted_cholesky_select(
+        mesh, int(G.shape[0]), budget, n_groups, mesh_axis=AX)
+    sh = step(G, oj)
+    pr, ps = np.asarray(ref[0]), np.asarray(sh[0])
+    assert np.array_equal(pr, ps), f"{name}: piv {pr} vs {ps}"
+    assert int(ref[2]) == int(sh[2]), (
+        f"{name}: rank {int(ref[2])} vs {int(sh[2])}")
+    np.testing.assert_allclose(np.asarray(ref[4]), np.asarray(sh[4]),
+                               rtol=1e-12, atol=0.0, err_msg=name)
+    np.testing.assert_allclose(np.asarray(ref[5]), np.asarray(sh[5]),
+                               rtol=1e-12, atol=1e-15, err_msg=name)
+    print(f"  OK {name}: rank {int(ref[2])}/{np.count_nonzero(pr >= 0)}")
+
 # (a) full rank, and it must really be sharded four ways.
 p_full = check("full rank M=64 k=20", gram(64, 64, 3), 20)
 
@@ -611,6 +708,12 @@ check("orbit 16x4, k=24 (over)", 0.5 * (Go + Go.conj().T), 24, oid)
 
 # (d) a REAL float64 Gram — nothing in the suite tested one.
 check("real float64 M=64 k=20", real_gram(64, 64, 8), 20)
+
+# (e) GROUP-BLOCK mode: all four members of each admitted group are pivoted,
+# and the reference/distributed order agrees across shard boundaries.
+oid_block = np.repeat(np.arange(16, dtype=np.int32), 4)
+check_block("group-block 16x4, budget=32", gram(64, 64, 41),
+            32, oid_block, 16)
 
 # THE FALSIFICATION (assessment R4's own bar).  Flipping the tie-break from
 # lowest to highest global index must BREAK the reference comparison; if it

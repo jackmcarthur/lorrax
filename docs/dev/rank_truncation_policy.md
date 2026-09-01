@@ -277,13 +277,14 @@ same gate *passes* at 960 is 20–56× worse.
 
 Two separate defects, and only one of them is the rank:
 
-* **Granularity.**  In orbit mode the greedy deflates the Schur complement by
-  one direction per *orbit* while removing all `n_sym` members from
-  contention, so its `rank` counts orbits.  "18/18 directions certified —
-  PASS" over a delivered set of 768 *points* certifies nothing about the file
-  being written.  The certification statement is now made at **point**
-  granularity in both modes, which removes the asymmetry that made the
-  refusal reachable only on the more accurate path.
+* **Granularity.**  The old orbit path pivoted one representative, removed its
+  full orbit from contention, and then emitted that full orbit. Its rank
+  therefore counted orbits while the file contained points. The production
+  centroid path now admits a complete orbit only when it fits the remaining
+  point budget and applies a pivot update for every member before scoring the
+  next orbit. Its rank and delivered count are both in point units. The
+  representative selector remains an explicit compatibility path for callers
+  that truly request one direction per group.
 * **Authority.**  A numerically rank-deficient *pool* is not an error — it is
   the ordinary state of an over-complete interpolation set, and it is measured
   anti-correlated with accuracy on this deck.  It is reported, loudly, with
@@ -292,9 +293,8 @@ Two separate defects, and only one of them is the rank:
   non-PSD Gram, a pool that has literally run out of candidates, and any pivot
   outside the candidate range.
 
-The refusal text also no longer advises widening the prune window on this
-deck: measured here, widening at fixed orbit setting changes `sigTOT` by <2×
-and never recovers the orbit-mode loss.
+The selection window still has to cover the pair-density space being fitted;
+that is a physics contract, not a way to make a rank gate pass.
 
 ---
 

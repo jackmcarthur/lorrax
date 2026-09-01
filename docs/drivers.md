@@ -77,19 +77,14 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | `--density-mode` | `scalar` | `scalar` = charge feature-row norm/Gram; `current` = gauge-invariant three-current feature-row norm/Gram (suffix `_current`). Current mode requires atom-orbit closure, `rho_power=1`, and transverse-Gram pruning. |
 | `--orbit` / `--no-orbit` | auto (on if atom group has >1 row) | close the set under atom-derived spatial Seitz operations |
 | `--rho-power` | 1.0 | weight^alpha; centroid density ~ w^(0.6*alpha) |
-| `LORRAX_CENTROID_RANK_TOL` (env) | 0.01 | rank-gate tolerance; lowering it is a deliberate override |
 | `LORRAX_CENTROID_SELECT` (env) | `deliver` | what the select does when the pool is numerically flat but still has candidates; `strict` restores the 2026-08-07 refusal |
 
-Invariant: the selection window must span the sigma window `[0, nelec+ncond)` the GW run consumes; the default
-is a superset of any deck's `ncond`, so a shortfall means it was narrowed explicitly. Main refusal: "FATAL:
-pivoted-Cholesky rank deficiency" (certified rank < requested orbits) — check `--prune-n-cond` against the
-deck's sigma window first, since that gate is a PROXY for a prune-window mismatch and not a general accuracy
-statement; `vc_x_vc`, `--oversample`, or a lower N are the other levers, and `LORRAX_CENTROID_RANK_TOL` is the
-named override for a set you have MEASURED.
-
-Read the `[point rank]` lines, not only the `[rank gate]` PASS: in orbit mode the gate counts ORBITS and says
-nothing about the points in the file it blesses. Rank deficiency in the delivered POINT set is reported and
-does not refuse — it is measured anti-correlated with BerkeleyGW agreement on the Si anchor deck.
+The selection window must cover the sigma window the GW run consumes. In
+orbit mode, pruning admits only complete spatial-symmetry orbits that fit the
+point budget; every emitted point updates the Schur residual, and `rank` is in
+point units. Numerical flatness is reported rather than refused because an
+over-complete interpolation set can be accurate; non-PSD input, pool
+exhaustion, and invalid pivots still refuse.
 Policy: [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md) §7.
 
 ## dipole — `psp.get_dipole_mtxels`

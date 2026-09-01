@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "is a superset of any deck's ncond and therefore "
                         "always safe). Narrowing this selects the ISDF basis "
                         "on fewer pair densities than Sigma_c will consume; "
-                        "the rank gate will refuse if that costs independence. "
+                        "the selector reports the resulting numerical rank. "
                         "Before 2026-07-29 the default was min(n_val, nbands - "
                         "n_val), which silently clamped the window to n_val.")
     p.add_argument("--prune-window", choices=("v_x_c", "v_x_vc", "vc_x_vc"),
@@ -134,7 +134,6 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 print0 = debug_print
 
 import gc
-import os
 import time
 
 import jax
@@ -400,37 +399,25 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
     Greedy pivoting on the pair-density Gram keeps the candidates that add
     the most independent interpolation directions over the σ band window;
-    the achieved rank is the number it actually certified.  Returns
-    ``(indices, n_kept, rank, n_orbit_keep, n_val, max_band)`` — the last
-    four feed the rank gate in ``main()``.
+    the achieved rank is the number it actually certified. Returns
+    ``(indices, rank)``.
     """
     from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
     from .sampling_metric import full_k_quadrature_weights
 
-    # Orbit mode targets ORBITS, not points: the final centroid count is
-    # Σ orbit_size over the picked orbits.  ``N_c`` is a POINT count the user
-    # typed, so the orbit target is an ESTIMATE and the delivered point total
-    # is FLOORED to N_c inside the kernel (``n_point_budget``) — owner ruling,
-    # 2026-08-10.  The orbit TARGET below is unchanged, deliberately: it is
-    # what ``refuse_unless_select_certified`` and the rank gate in ``main``
-    # are both stated against, so moving it would move a refusal threshold as
-    # a side effect of a budget change.  The floor can only ever TRUNCATE the
-    # delivered set, so the generator now delivers at most N_c points and
-    # never more, with every existing refusal reading exactly as before.
-    n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
-    n_orbit_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
-                    if orbit_id is not None else N_c)
+    # ``N_c`` is a point budget.  The block selector admits only whole orbits
+    # that fit, then deflates by every point in each admitted orbit.
     print0(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
-           f"{f' (target {n_orbit_keep} orbits)' if orbit_id is not None else ''}")
+           f"{' (whole-orbit blocks)' if orbit_id is not None else ''}")
 
     n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
-    max_band = n_val + n_cond
     left_range, right_range, range_label = prune_band_ranges(
         args, n_val, n_cond)
     kwargs: dict = dict(
-        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
+        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=N_c, mesh=mesh,
         orbit_id=orbit_id,
         n_point_budget=(int(N_c) if orbit_id is not None else None),
+        group_block=(orbit_id is not None),
         bispinor=(args.density_mode == "current"),
         gamma_mode=("transverse" if args.density_mode == "current"
                     else "charge"),
@@ -454,9 +441,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
     print0(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
-    # The rank gate in main() compares rank against n_orbit_keep and names
-    # the effective prune window in its refusal — return all four.
-    return indices, indices.shape[0], int(rank), n_orbit_keep, n_val, max_band
+    return indices, int(rank)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -587,94 +572,17 @@ def main():
         del release_arrays, labels, centroids, kmeans_weight
         if not args.plot:
             del weight
-        (centroid_indices, n_unique, rank, n_orbit_keep,
-         _n_val_eff, _max_band) = _prune(
+        centroid_indices, rank = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
+        n_unique = int(centroid_indices.shape[0])
         centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
         pruned = True
         prune_rank = int(rank)
 
-        # --- HARD REFUSAL: the achieved rank must meet the request ----------
-        # (size campaign 2026-07-29, ladder notes R12.4; owner-approved.)
-        # ``rank`` is how many INDEPENDENT interpolation directions pivoted
-        # Cholesky could actually certify.  If it falls short of the number of
-        # orbits requested, the returned set is padded with directions the
-        # Gram says are numerically null — the file still contains the
-        # requested number of points, so nothing downstream notices, and the
-        # ISDF silently under-resolves.  That is exactly what happened on the
-        # b1024 rung: rank 630 against 897 requested, printed in every log for
-        # the whole campaign and read by nobody, while Σ_c produced a QP gap
-        # of 0.36 eV against a true ~3.2-3.6 eV.  Refuse instead.
-        #
-        # STATE THE SENSITIVITY OF THE PROXY (2026-08-22).  On the b1024 rung
-        # the ROOT CAUSE was a band-window mismatch — the ISDF window was
-        # clamped small and then used large — and rank deficiency was its
-        # SYMPTOM (``docs/dev/isdf_basis_adequacy_at_large_nband.md``: the fix
-        # was re-selecting the SAME NUMBER of centroids against a
-        # representative window).  So this gate is a proxy for a window
-        # mismatch, and it is not sensitive to accuracy in general: measured
-        # on the Si anchor deck, the shipped 960-point set carries ~160
-        # numerically dependent points and scores sigTOT MAE 0.644 meV, the
-        # best BerkeleyGW agreement on record, while the rank-clean orbit-mode
-        # arm at the same N is 20-56x worse.  Rank is not basis quality in
-        # EITHER direction (TASTE rule 12; ladder_rung1_notes R19.1).  The
-        # refusal is kept because the window-mismatch failure it catches costs
-        # electron-volts and is invisible to every other gate — but its text
-        # now says what it is a proxy FOR, and no longer offers advice that is
-        # measured not to work on the deck that hits it.
-        # docs/dev/rank_truncation_policy.md §7.
-        _unit = 'orbits' if orbit_id_arr is not None else 'points'
-        _rank_tol = float(os.environ.get("LORRAX_CENTROID_RANK_TOL", "0.01"))
-        _rank_floor = int(np.ceil((1.0 - _rank_tol) * n_orbit_keep))
-        if int(rank) < _rank_floor:
-            raise SystemExit(
-                f"\nFATAL: pivoted-Cholesky rank deficiency — the candidate "
-                f"pool cannot supply the independence you asked for.\n"
-                f"  requested : {n_orbit_keep} {_unit}\n"
-                f"  achieved  : {rank} {_unit}   "
-                f"({100.0 * rank / max(1, n_orbit_keep):.1f}%"
-                f", floor {_rank_floor} at tol {_rank_tol:g})\n"
-                f"  prune window: left=(0,{_n_val_eff}) right=(0,{_max_band}) "
-                f"[{args.prune_window}]\n"
-                f"WHAT THIS GATE IS A PROXY FOR: a prune window that does not "
-                f"cover the pair densities Σ will consume.  That failure is\n"
-                f"worth electron-volts and is invisible to every other gate "
-                f"(b1024: rank 630/897, QP gap 0.36 eV against ~3.2-3.6 eV, "
-                f"root-caused\nto a clamped ISDF band window).  It is NOT a "
-                f"general accuracy statement: a rank-deficient set can be the "
-                f"most accurate one\nmeasured (Si anchor 960 points, ~160 "
-                f"dependent, sigTOT MAE 0.644 meV — the record best).\n"
-                f"Fix, in order of likelihood on a real deck:\n"
-                f"  * check the prune window matches the Σ window — "
-                f"--prune-n-cond <ncond of your deck>.  If you NARROWED it\n"
-                f"    deliberately, this is the gate telling you the cost.  "
-                f"(On the Si anchor deck, widening at fixed orbit setting\n"
-                f"    changes sigTOT by <2x and never recovers the orbit-mode "
-                f"loss, so widening is not always the answer.)\n"
-                f"  * --prune-window vc_x_vc to include c×c pair densities "
-                f"(needed when ncond >> nval)\n"
-                f"  * raise --oversample for a richer pool, or lower N to "
-                f"{rank} {_unit} for a rank-clean set\n"
-                f"  * LORRAX_CENTROID_RANK_TOL=<fraction> to accept a "
-                f"deficient set deliberately — the named override, and the\n"
-                f"    one to use when you have MEASURED that this set is the "
-                f"accurate one.\n")
-        print0(f"  [rank gate] {rank}/{n_orbit_keep} {_unit} certified "
-               f"(floor {_rank_floor}, tol {_rank_tol:g}) — PASS")
-        if orbit_id_arr is not None:
-            # SAY WHAT THIS PASS DOES NOT CERTIFY.  In orbit mode the select
-            # deflates by one direction per ORBIT while removing all n_sym
-            # members from contention, so this number is not comparable to
-            # the point count of the file about to be written — "42 of 42
-            # directions certified — PASS" was once said over 1908 points
-            # whose ζ back-solve then truncated ~24% of the modes per q.
-            # The delivered-granularity number is the `[point rank]` line
-            # printed by the select above.
-            print0(f"  [rank gate] SCOPE: that PASS is stated in ORBITS.  It "
-                   f"certifies nothing about the {n_unique} POINTS this file "
-                   f"will contain — read the [point rank] line above for the "
-                   f"delivered-granularity number.")
+        print0(f"  [point rank] {rank}/{n_unique} delivered centroid "
+               "directions certified; rank deficiency is reported, while "
+               "LORRAX_CENTROID_SELECT=strict makes it a refusal")
 
     # Default suffix follows --density-mode unless the user overrode it.
     out_suffix = (args.out_suffix
