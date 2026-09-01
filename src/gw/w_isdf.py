@@ -83,6 +83,7 @@ from .minimax_screening import MinimaxNodes
 
 _chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
+_W_RESIDUAL_NCHECK = 4
 
 # The static metal fallback streams one small ordered band-pair tile at a
 # time.  This is deliberately a compile-time constant: changing it is a
@@ -1122,7 +1123,8 @@ def _get_chi_fractional_contour_kernel_face(
 # ============================================================================
 
 def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
-                          n_rmu_logical: int | None = None):
+                          n_rmu_logical: int | None = None, *,
+                          consume_v: bool = False):
     """W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ).
 
     The LOCAL plan: q's are scattered over all devices
@@ -1151,7 +1153,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
             f"_get_w_solve_fn_local: n_rmu_logical={n_log} exceeds extent {n_rmu}")
     mu_pad = int(n_rmu) - n_log
 
-    cache_key = ("local", id(mesh_xy), nq, n_rmu, n_log)
+    cache_key = ("local", id(mesh_xy), nq, n_rmu, n_log, bool(consume_v))
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -1191,12 +1193,14 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
     reshard_mid = NamedSharding(mesh_xy, P('x', None, 'y'))
     q_spec = P(('x', 'y'), None, None)
 
-    # ``chi_flat`` is donated (position 1): the caller releases χ₀ right
-    # after this call (module contract, same as the distributed plan —
-    # the ``del chi0_q_solve`` inside ``screening.py``'s ``W.exec``
-    # timing block).  ``V_flat`` is NOT donated — V is reused
-    # by COHSEX Σ_SX, Σ_COH, Σ_X and the PPM fit's Wc = W - V step.
-    @partial(jax.jit, donate_argnums=(1,))
+    # ``chi_flat`` is always donated (position 1).  The ordinary
+    # scalar/PPM contract leaves ``consume_v=False``, so V remains reusable
+    # by Sigma and Wc = W - V exactly as before.  The explicit consuming
+    # contract also donates position 0; its sole production caller reloads
+    # the bare packed photon operator after W completes.
+    donated = (0, 1) if consume_v else (1,)
+
+    @partial(jax.jit, donate_argnums=donated)
     def _solve_w(V_flat: jax.Array, chi_flat: jax.Array, pref: jax.Array) -> jax.Array:
         """V_flat, chi_flat: (nq, μ, μ).  Returns W: (nq, μ, μ)."""
         nq_local = V_flat.shape[0]
@@ -1267,9 +1271,15 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 # W solve — plan 2 of 2: DISTRIBUTED (2-D-sharded stacked-GEMM backsolve)
 # ============================================================================
 
+def _select_w_rhs(V_flat, copy_fn, *, consume_v: bool):
+    """Return the donated Dyson RHS under the public V-lifetime contract."""
+    return V_flat if consume_v else copy_fn(V_flat)
+
+
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                                 n_rmu_logical: int,
-                                distrib_la_batched_route: str = "auto"):
+                                distrib_la_batched_route: str = "auto", *,
+                                consume_v: bool = False):
     """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded.
 
     The DISTRIBUTED plan — the scale-out route for thousands of
@@ -1333,7 +1343,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # including it here would compile duplicate solve programs for identical
     # padded shapes.
     cache_key = ("distributed", id(mesh_xy), nq, n_ext,
-                 str(distrib_la_batched_route))
+                 str(distrib_la_batched_route), bool(consume_v))
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -1409,8 +1419,11 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # RHS must be a FRESH buffer, never an alias of the caller's V —
     # the FFI backsolve DONATES both operands (docs/dev/linalg_ffi.md
     # "Sharp edges") and V is still needed by Σ_SX/Σ_COH/Σ_X and the
-    # PPM fit's Wc = W − V.
+    # PPM fit's Wc = W − V.  ``consume_v=True`` is the explicit exception:
+    # the caller has surrendered V, so it becomes B directly and this
+    # body-sized copy is elided.
     _copy = jax.jit(jnp.copy, out_shardings=nat)
+    _snapshot = jax.jit(jnp.copy, out_shardings=nat)
 
     def _solve_w_dist(V_flat: jax.Array, chi_flat: jax.Array,
                       pref: jax.Array) -> jax.Array:
@@ -1428,7 +1441,21 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         for q0 in range(0, nq_local, qb):
             q1 = min(q0 + qb, nq_local)
             A = _a_chunk(V_flat[q0:q1], chi_scaled[q0:q1], A, q0)
-        B = _copy(V_flat)
+
+        residual_enabled = (
+            os.environ.get("LORRAX_W_RESIDUAL_CHECK", "0").strip().lower()
+            not in ("", "0", "false", "no", "off"))
+        V_snapshot = None
+        if consume_v and residual_enabled:
+            # The FFI call below invalidates V_flat.  Retain only the
+            # diagnostic's bounded q prefix, and complete that copy before
+            # donating the source buffer.  Never turn an optional numerical
+            # certificate into a refusal of the minimum-memory route.
+            ns = min(nq_local, _W_RESIDUAL_NCHECK)
+            V_snapshot = _snapshot(V_flat[:ns])
+            V_snapshot.block_until_ready()
+
+        B = _select_w_rhs(V_flat, _copy, consume_v=consume_v)
         # ONE plan call for the whole stack: one descriptor, one
         # workspace; A and B are donated into the FFI.
         W = p.batched(A, B)
@@ -1438,16 +1465,18 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         # LORRAX_W_RESIDUAL_CHECK=off/no/False silently ENABLED the
         # diagnostic — which must be OFF when taking collective-table
         # probes (docs/dev/env_vars.md).  (audit fix/zq 2026-07-28)
-        if os.environ.get("LORRAX_W_RESIDUAL_CHECK", "0").strip().lower() \
-                not in ("", "0", "false", "no", "off"):
-            _w_residual_report(V_flat, chi_scaled, W, n_ext)
+        if residual_enabled:
+            residual_v = V_snapshot if consume_v else V_flat
+            _w_residual_report(residual_v, chi_scaled, W, n_ext)
         return W
 
     _w_solve_cache[cache_key] = _solve_w_dist
     return _solve_w_dist
 
 
-def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
+def _w_residual_report(
+    V_flat, chi_scaled, W, n_ext, n_check: int = _W_RESIDUAL_NCHECK,
+):
     """Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q.
 
     THE strict numerical contract of the distributed plan (a
@@ -1493,7 +1522,8 @@ def _w_solve_pref_scalar(meta) -> float:
 
 
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
-                        distrib_la_batched_route: str = "auto"):
+                        distrib_la_batched_route: str = "auto",
+                        consume_v: bool = False):
     """Return ``(solve_fn, pref)`` for the requested W plan.
 
     Single source of truth for the two-plan dispatch.  Both ``solve_w``
@@ -1527,15 +1557,18 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
 
     if dyson == "distributed":
         solve_fn = _get_w_solve_fn_distributed(
-            mesh_xy, nq, n_rmu, n_log, distrib_la_batched_route)
+            mesh_xy, nq, n_rmu, n_log, distrib_la_batched_route,
+            consume_v=consume_v)
     else:
         solve_fn = _get_w_solve_fn_local(
-            mesh_xy, nq, n_rmu, n_rmu_logical=n_log)
+            mesh_xy, nq, n_rmu, n_rmu_logical=n_log,
+            consume_v=consume_v)
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 
 def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
-            distrib_la_batched_route: str = "auto"):
+            distrib_la_batched_route: str = "auto",
+            consume_v: bool = False):
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
@@ -1557,12 +1590,18 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
       ceiling.  Slower than ``local`` at moderate P; that is priced and
       accepted (the point is the per-rank memory ceiling, not speed).
 
-    ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
-    caller must drop its reference after this call.
+    ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the caller
+    must drop its reference after this call.  ``consume_v=False`` preserves
+    the incumbent scalar/PPM contract: V remains valid, and the distributed
+    plan copies it into the donated RHS.  With ``consume_v=True`` the caller
+    also surrenders V; both plans may donate its buffer and the distributed
+    plan passes it directly as the RHS.  The caller must replace/drop every
+    V reference immediately after this call.
     """
     solve_fn, pref = _resolve_w_solve_fn(
         meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
-        distrib_la_batched_route=distrib_la_batched_route)
+        distrib_la_batched_route=distrib_la_batched_route,
+        consume_v=consume_v)
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
 
@@ -2186,6 +2225,37 @@ class StaticPhotonResponse:
     approximation: str = "experimental_no_pair_bubble_screened_breit_v1"
 
 
+def _load_packed_static_photon_v(
+    bispinor_v_q_path, mesh_xy, *, expected_nq: int,
+    expected_layout=None,
+):
+    """Read and pack the complete bare photon operator from its tile store.
+
+    This is the sole reader/packer seam for both the pre-Dyson load and the
+    post-Dyson reload.  The second load authenticates the same immutable
+    layout again so a replaced/stale HDF5 artifact cannot silently give W and
+    Sigma different bases.
+    """
+    from .photon_layout import PhotonBasisLayout, pack_photon_operator
+    from .v_q_bispinor import BispinorVqReader
+
+    with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
+        if int(reader.n_q_total) != int(expected_nq):
+            raise ValueError(
+                "full photon response requires full-BZ body blocks: "
+                f"V reader has nq={reader.n_q_total}, expected={expected_nq}")
+        layout = PhotonBasisLayout.from_centroid_extents(
+            reader.n_rmu_C, reader.n_rmu_T, mesh_xy)
+        if expected_layout is not None and layout != expected_layout:
+            raise RuntimeError(
+                "packed photon V layout changed between the pre-Dyson load "
+                f"and post-Dyson reload: before={expected_layout}, "
+                f"after={layout}")
+        packed = pack_photon_operator(
+            reader.get_tile, reader.n_q_total, layout, mesh_xy)
+    return layout, packed
+
+
 def compute_static_photon_response(
     wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
     meta, mesh_xy, *,
@@ -2210,10 +2280,7 @@ def compute_static_photon_response(
     """
     from .gw_config import (
         BispinorGWMode, HeadCorrection, coerce_bispinor_gw_mode)
-    from .photon_layout import (
-        PhotonBasisLayout, pack_photon_channel_vectors,
-        pack_photon_operator)
-    from .v_q_bispinor import BispinorVqReader
+    from .photon_layout import pack_photon_channel_vectors
 
     if str(dyson_solver).strip().lower() != "distributed":
         raise ValueError(
@@ -2283,15 +2350,8 @@ def compute_static_photon_response(
             wfn_fingerprint_binding=wfn_fingerprint_binding,
         )
 
-    with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
-        if int(reader.n_q_total) != int(meta.nk_tot):
-            raise ValueError(
-                "full photon response requires full-BZ body blocks: "
-                f"V reader has nq={reader.n_q_total}, meta.nk_tot={meta.nk_tot}")
-        layout = PhotonBasisLayout.from_centroid_extents(
-            reader.n_rmu_C, reader.n_rmu_T, mesh_xy)
-        V_packed = pack_photon_operator(
-            reader.get_tile, reader.n_q_total, layout, mesh_xy)
+    layout, V_packed = _load_packed_static_photon_v(
+        bispinor_v_q_path, mesh_xy, expected_nq=int(meta.nk_tot))
 
     if jax.process_index() == 0:
         print(
@@ -2310,7 +2370,14 @@ def compute_static_photon_response(
     W_packed = solve_w(
         V_packed, chi_packed, meta, mesh_xy,
         dyson_solver="distributed",
-        distrib_la_batched_route=distrib_la_batched_route)
+        distrib_la_batched_route=distrib_la_batched_route,
+        consume_v=True)
+    # ``consume_v=True`` donated the packed V buffer as the distributed
+    # solve's RHS.  Invalidate the Python owner immediately; no diagnostic,
+    # head or Sigma path may accidentally touch it before the authenticated
+    # reload below.
+    V_packed = None
+    chi_packed = None
     # The bare Hartree/exchange stage that follows does not depend on W and
     # could otherwise begin allocating its Green/operator workspaces while
     # the asynchronous distributed LU still owns A, RHS and donated chi.
@@ -2329,6 +2396,13 @@ def compute_static_photon_response(
         raise ValueError(
             "static packed photon W[q=0] failed the canonical Hermiticity "
             "gate before coupled head/body folding")
+
+    # Sigma and optional coupled-head completion need bare V after W is
+    # complete.  Reload through the exact helper used above: this recreates
+    # one necessary resident V, without carrying a duplicate through LU.
+    _, V_packed = _load_packed_static_photon_v(
+        bispinor_v_q_path, mesh_xy, expected_nq=int(meta.nk_tot),
+        expected_layout=layout)
 
     head_completion = None
     if coupled_head:

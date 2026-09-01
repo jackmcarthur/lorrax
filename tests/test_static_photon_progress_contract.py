@@ -275,3 +275,131 @@ def test_sigma_dispatch_enforces_disjoint_scalar_and_photon_v_owners():
         "get", "compute_cohsex_sigma", "compute_sigma_x"
     } for node in arm.body for call in ast.walk(node)
       if isinstance(call, ast.Call))
+
+
+def test_solve_w_default_copies_rhs_and_consume_contract_does_not():
+    public = _function(ROOT / "src/gw/w_isdf.py", "solve_w")
+    defaults = {
+        arg.arg: default for arg, default in zip(
+            public.args.kwonlyargs, public.args.kw_defaults)
+        if default is not None
+    }
+    consume_default = defaults["consume_v"]
+    assert (isinstance(consume_default, ast.Constant)
+            and consume_default.value is False)
+
+    selector = _function(ROOT / "src/gw/w_isdf.py", "_select_w_rhs")
+    module = ast.Module(body=[selector], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {}
+    exec(compile(module, "w_rhs_policy", "exec"), namespace)
+    choose = namespace["_select_w_rhs"]
+    source = object()
+    copied = object()
+    calls = []
+
+    def copy_fn(value):
+        calls.append(value)
+        return copied
+
+    assert choose(source, copy_fn, consume_v=False) is copied
+    assert calls == [source], "the incumbent default must retain its copy"
+    calls.clear()
+    assert choose(source, copy_fn, consume_v=True) is source
+    assert calls == [], "the consuming path must pass V directly as B"
+
+
+def test_consuming_residual_keeps_only_a_bounded_pre_donation_snapshot():
+    fn = _function(ROOT / "src/gw/w_isdf.py", "_solve_w_dist")
+    snapshot_calls = [
+        call for call in ast.walk(fn)
+        if isinstance(call, ast.Call) and _call_name(call) == "_snapshot"
+    ]
+    assert len(snapshot_calls) == 1
+    snapshot_arg = snapshot_calls[0].args[0]
+    assert isinstance(snapshot_arg, ast.Subscript)
+    assert (isinstance(snapshot_arg.value, ast.Name)
+            and snapshot_arg.value.id == "V_flat")
+    assert isinstance(snapshot_arg.slice, ast.Slice)
+    assert (isinstance(snapshot_arg.slice.upper, ast.Name)
+            and snapshot_arg.slice.upper.id == "ns")
+
+    plan_calls = [
+        call for call in ast.walk(fn)
+        if isinstance(call, ast.Call) and _call_name(call) == "batched"
+    ]
+    reports = [
+        call for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and _call_name(call) == "_w_residual_report"
+    ]
+    assert len(plan_calls) == len(reports) == 1
+    assert snapshot_calls[0].lineno < plan_calls[0].lineno < reports[0].lineno
+    assert (isinstance(reports[0].args[0], ast.Name)
+            and reports[0].args[0].id == "residual_v")
+
+
+def test_one_reader_packer_helper_owns_both_photon_v_loads():
+    helper = _function(ROOT / "src/gw/w_isdf.py",
+                       "_load_packed_static_photon_v")
+    helper_calls = [_call_name(call) for call in ast.walk(helper)
+                    if isinstance(call, ast.Call)]
+    assert helper_calls.count("BispinorVqReader") == 1
+    assert helper_calls.count("pack_photon_operator") == 1
+
+    response = _function(ROOT / "src/gw/w_isdf.py",
+                         "compute_static_photon_response")
+    calls = [call for call in ast.walk(response) if isinstance(call, ast.Call)]
+    loads = sorted(
+        (call for call in calls
+         if _call_name(call) == "_load_packed_static_photon_v"),
+        key=lambda call: call.lineno)
+    assert len(loads) == 2
+    assert not any(_call_name(call) in {
+        "BispinorVqReader", "pack_photon_operator"
+    } for call in calls)
+    assert not any(keyword.arg == "expected_layout"
+                   for keyword in loads[0].keywords)
+    assert any(keyword.arg == "expected_layout"
+               and isinstance(keyword.value, ast.Name)
+               and keyword.value.id == "layout"
+               for keyword in loads[1].keywords)
+
+
+def test_consumed_photon_v_is_invalid_until_w_completion_and_reload():
+    fn = _function(ROOT / "src/gw/w_isdf.py",
+                   "compute_static_photon_response")
+    calls = [call for call in ast.walk(fn) if isinstance(call, ast.Call)]
+    solve = next(call for call in calls if _call_name(call) == "solve_w")
+    consume = next(keyword.value for keyword in solve.keywords
+                   if keyword.arg == "consume_v")
+    assert isinstance(consume, ast.Constant) and consume.value is True
+
+    invalidations = [
+        node for node in ast.walk(fn)
+        if (isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "V_packed" for target in node.targets)
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is None)
+    ]
+    receipts = [call for call in calls
+                if _call_name(call) == "completion_receipt"]
+    reloads = [call for call in calls
+               if (_call_name(call) == "_load_packed_static_photon_v"
+                   and any(keyword.arg == "expected_layout"
+                           for keyword in call.keywords))]
+    assert len(invalidations) == len(receipts) == len(reloads) == 1
+    invalid = invalidations[0]
+    receipt = receipts[0]
+    reload = reloads[0]
+    assert solve.lineno < invalid.lineno < receipt.lineno < reload.lineno
+
+    stale_reads = [
+        node for node in ast.walk(fn)
+        if (isinstance(node, ast.Name)
+            and node.id == "V_packed"
+            and isinstance(node.ctx, ast.Load)
+            and invalid.lineno < node.lineno < reload.lineno)
+    ]
+    assert not stale_reads
