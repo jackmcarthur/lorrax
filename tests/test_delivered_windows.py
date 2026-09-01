@@ -478,6 +478,9 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
         yield (passing_time, passing_weight,
                {"family": "noncrossing", "candidate_tolerance": 2.0e-7,
                 "provenance": "next tighter table"})
+        yield (passing_time, passing_weight,
+               {"family": "noncrossing", "candidate_tolerance": 1.0e-8,
+                "provenance": "tightest table"})
 
     monkeypatch.setattr(
         delivered, "_sign_definite_table_candidates", table_walk)
@@ -491,9 +494,11 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
         spec, eta=0.1, max_nodes=8, factor_growth_cap=30.0,
         relative_target=1.0e-5)
 
-    assert len(candidates) == 1
+    assert len(candidates) == 2
     assert candidates[0]["evidence"]["provenance"] == "next tighter table"
+    assert candidates[1]["evidence"]["provenance"] == "tightest table"
     assert len(candidates[0]["attempts"]) == 2
+    assert len(candidates[1]["attempts"]) == 3
 
 
 def test_tolerance_ladder_is_deleted():

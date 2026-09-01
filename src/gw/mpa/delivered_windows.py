@@ -1871,9 +1871,16 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                      relative_target):
-    """Return the first lookup-first rule passing the measured window gates."""
+    """Return measured table rungs passing the window gates.
+
+    Sign-definite tables are cheap lookups, so expose their complete accepted
+    accuracy--node curve to the global selector.  Crossing keeps its first
+    accepted rule: continuing that iterator would run the expensive fitted
+    fallback even after a shipped table succeeded.
+    """
     best_pair = (np.inf, np.inf)
     attempts = []
+    candidates = []
     if spec["kind"] == "crossing":
         def rules():
             yield from _crossing_table_candidates(
@@ -1927,13 +1934,17 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 absolute_cost=float(spec["envelope"] * required_target),
                 factor_growth=factor,
                 attempts=attempts.copy())
-            return [candidate]
+            candidates.append(candidate)
+            if spec["kind"] == "crossing":
+                return candidates
         except (FloatingPointError, OverflowError, RuntimeError, ValueError,
                 np.linalg.LinAlgError) as exc:
             attempts.append({
                 "family": evidence.get("family", "unknown"),
                 "candidate_tolerance": evidence.get("candidate_tolerance"),
                 "refusal": str(exc)})
+    if candidates:
+        return candidates
     residual, amplification = best_pair
     raise _ProductWindowRefusal(
         f"delivered product window {spec['name']!r} refused: achieved "
