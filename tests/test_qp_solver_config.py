@@ -581,10 +581,11 @@ def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):
         read_lorrax_input(str(q))
 
 
-def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
-    # 'auto' MAY demote, announced: distributed_cholesky=auto passes
-    # through (it carries the replicated rank-truncation route on CPU);
-    # distributed_lu=auto demotes to 'off' and says so.
+def test_auto_on_cpu_chol_and_lu_keep_portable_identity(
+        tmp_path, monkeypatch):
+    # Both auto values pass through.  Runtime resolution still selects local
+    # LU on CPU, but retaining ``auto`` lets an equivalent GPU auto+LU fit
+    # pass the exact provenance gate.
     _pin_backend(monkeypatch, "cpu")
     lines: list[str] = []
     path = tmp_path / "cohsex_auto_cpu.in"
@@ -592,8 +593,8 @@ def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
     cfg = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     assert cfg.backend.distributed_cholesky == "auto"
-    assert cfg.backend.distributed_lu == "off"
-    assert any("distributed_lu=auto" in l and "off" in l for l in lines)
+    assert cfg.backend.distributed_lu == "auto"
+    assert not any("distributed_lu=auto" in line for line in lines)
 
 
 def test_the_one_self_consistent_deck_is_the_pair_the_driver_refuses():

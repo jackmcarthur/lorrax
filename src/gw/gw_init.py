@@ -367,9 +367,9 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		#   distributed_lu           — the transverse LU backend.  A ζ_T
 		#       fit under `scalapack` (block-cyclic gauge) must not be
 		#       reused by an `off` rerun (per-q jnp.linalg.solve) and
-		#       vice versa.  This is the RESOLVED deck value: gw_config
-		#       already demotes `auto`→`off` on a CPU backend, so the
-		#       recorded string is what the fit ran.
+		#       vice versa.  `auto` is preserved across platforms; the
+		#       separately recorded solver kind distinguishes auto→LU from
+		#       auto→cuSOLVERMp LU when their numerical gauges differ.
 		#   transverse_solver_kind   — what `_resolve_solver_kind_transverse`
 		#       actually returned ('lu' | 'scalapack_lu' | 'cusolvermp_lu'
 		#       | 'transverse_rank_truncate').  Recorded IN ADDITION to
