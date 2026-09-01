@@ -106,7 +106,7 @@ def resolve_matmul_backend(requested: str, mesh: Mesh, *,
     CPU, and SLATE on ROCm.  Explicit requests never demote.  ``off`` is
     legal only with the local ``batch_reshard`` route, where no provider call
     is made. Every other result has already passed platform,
-    provider-specific mesh geometry (including cuBLASMp/SLATE square grids),
+    provider-specific mesh geometry (all current GEMM providers need square grids),
     one-process-per-cell, shared-library, and handler-symbol guards.
 
     Route selection is orthogonal to provider selection: an explicit or

@@ -10,8 +10,9 @@ Nothing is renamed; the only edits are the import lines.
 linked (MKL / LibSci / netlib / AOCL) is decided in
 ``src/ffi/cpp/CMakeLists.txt`` and nothing here can observe it — do not
 write a vendor name into this family's code as if it were a fact about the
-build.  Both ops need a SQUARE or 1-D ``('x','y')`` mesh (square descriptor
-blocks, one tile per rank).
+build. Eigh and LU accept square or 1-D ``('x','y')`` meshes. PBLAS GEMM
+requires a square mesh because its one-face contraction must align A's
+column blocks with B's row blocks.
 
 The SlateCtx lifecycle (``ensure_registered`` / ``get_or_init_context`` /
 ``validate_mesh`` / ``_mesh_key``) is shared with the SLATE backend and
@@ -243,7 +244,8 @@ def batched_distributed_matmul(
     :func:`distrib_la.matmul` door supplies rank-2 lifting, placement,
     provider resolution, and the optional zero C.  This backend requires a
     CPU process grid, float64 or complex128, N/T/C operation codes, exact
-    one-face-per-rank tiling, and one JAX process per mesh cell.
+    one-face-per-rank tiling, one JAX process per mesh cell, and a square
+    process grid.
     """
     if A.dtype != B.dtype or A.dtype != C.dtype:
         raise ValueError("scalapack matmul operands must share dtype")

@@ -7,6 +7,8 @@
 // per-SlateCtx BLACS context cache the handlers share.  32-bit integer
 // interface (LP64: `libmkl_scalapack_lp64` on Frontera, `libsci_*` on
 // Cray); every `int` below is the ScaLAPACK integer.
+// An ILP64 link line is ABI-INCOMPATIBLE even when it exports these same
+// unsuffixed names; LORRAX does not attempt run-time integer-width detection.
 //
 // Grid contract (identical for every handler): the BLACS grid is built on
 // the SlateCtx's rank-remapped comm (src/ffi/cpp/slate/context.cc) with
@@ -14,7 +16,8 @@
 // grid coords (mx, my) == the JAX mesh coords.  Combined with the square
 // block g = N / max(Px, Py) the block-cyclic distribution then coincides
 // exactly with JAX's contiguous ``P('x','y')`` shards on square and 1-D
-// meshes — which is why those are the only meshes the wrappers accept.
+// meshes. Eigh/LU accept both. GEMM further requires a square grid so A's
+// contracted column partition equals B's contracted row partition.
 //
 // The context is created COLLECTIVELY on first use per SlateCtx and cached
 // for the process lifetime (BLACS grids are freed at exit).
@@ -128,7 +131,7 @@ inline int blacs_ctxt_for(lorrax_ffi::slate::SlateCtx* ctx) {
 }
 
 // ---------------------------------------------------------------------------
-//  WHICH LIBRARY IS ACTUALLY BEHIND THESE ELEVEN NAMES  (2026-07-31)
+//  WHICH LIBRARY IS ACTUALLY BEHIND THESE THIRTEEN NAMES  (2026-07-31)
 //
 //  ScaLAPACK is an API with several implementations, and this file's whole
 //  premise is that LORRAX does not care which one answers — MKL on Frontera,
@@ -140,18 +143,19 @@ inline int blacs_ctxt_for(lorrax_ffi::slate::SlateCtx* ctx) {
 //  (`scalapack_api/`, built as `libslate_scalapack_api.so`) whose documented
 //  use is `LD_PRELOAD` interception: it re-DEFINES the ScaLAPACK entry
 //  points and forwards them to `slate::`.  MEASURED against this repo's own
-//  eleven names (SLATE v2025.05.28, built 2026-07-31, `nm -D`):
+//  thirteen names (SLATE v2025.05.28, built 2026-07-31, `nm -D`):
 //
-//      DEFINED (6)  pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_
+//      DEFINED (8)  pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_
+//                   pzgemm_ pdgemm_
 //      UNDEF   (2)  numroc_ Cblacs_gridinfo      <- it CALLS these
 //      absent  (3)  descinit_ Csys2blacs_handle Cblacs_gridinit
 //
 //  So it is an OVERLAY, never a provider: it must sit on top of a real
 //  ScaLAPACK+BLACS (it also consumes Cblacs_get / Cblacs_pcoord /
-//  Cblacs_pinfo / indxl2g_).  The six it does define are exactly the six
+//  Cblacs_pinfo / indxl2g_).  The eight it defines are exactly the eig/LU/GEMM
 //  compute routines LORRAX calls, i.e. an `LD_PRELOAD` — or an
 //  `-lslate_scalapack_api` ahead of MKL in LORRAX_SCALAPACK_LIBRARIES —
-//  silently replaces EVERY solve these two handlers make, with nothing on
+//  silently replaces EVERY compute call these handlers make, with nothing on
 //  the Python side able to observe it: `ffi_loader` keys only on LORRAX's
 //  own handler symbols (ScalapackEighHostFfi, ...), so
 //  `resolve_backend('eigh', 'scalapack')` still returns 'scalapack' and
@@ -371,7 +375,7 @@ inline void scalapack_announce_slate_api(const char* op, const char* name) {
 //  a vendor named in a docstring or a directory name is decoration.
 //
 //  This makes the answer visible on demand rather than guessable.  It prints
-//  the defining object for each of the ELEVEN names, once per process, on
+//  the defining object for each of the THIRTEEN names, once per process, on
 //  rank 0 (or every rank with `=all`), reusing the log grammar in
 //  mkl_thread_pin.h.  Opt-in, because in a healthy build it is noise; the
 //  moment a port misbehaves it is the first question worth asking.
