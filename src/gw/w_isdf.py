@@ -52,6 +52,7 @@ resident single-axis copy.  See the design doc for the full derivation and
 why ``distrib_la.gemm_plan``/``GemmPlan.local_call`` do not apply here.
 """
 import os
+import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -65,6 +66,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import numpy as np
 
+import common.timing as timing
 from common import Meta, jax_profile
 from common.bispinor_init import NO_PAIR_DIRAC_CURRENT_MODEL
 from common.collectives import device_put_process_local
@@ -2166,7 +2168,9 @@ def compute_experimental_no_pair_photon_chi0(
             return _subtract_static_tt_contact(chi_ab)
         return chi_ab
 
-    return pack_photon_operator(get_block, nq, layout, mesh_xy)
+    return pack_photon_operator(
+        get_block, nq, layout, mesh_xy,
+        progress_label="packed photon chi0")
 
 
 @dataclass(frozen=True)
@@ -2302,6 +2306,7 @@ def compute_static_photon_response(
         current_contact=current_contact,
         energy_reference=energy_reference)
 
+    dyson_started = time.perf_counter()
     W_packed = solve_w(
         V_packed, chi_packed, meta, mesh_xy,
         dyson_solver="distributed",
@@ -2310,7 +2315,8 @@ def compute_static_photon_response(
     # could otherwise begin allocating its Green/operator workspaces while
     # the asynchronous distributed LU still owns A, RHS and donated chi.
     # Finish the response here, inside its timing/lifetime boundary.
-    W_packed.block_until_ready()
+    timing.completion_receipt(
+        "packed photon Dyson", W_packed, started_at=dyson_started)
     # This packed path bypasses screening._gate_w, so apply its two valid
     # static stage invariants here through the shared sanity owner.  Full-q
     # scalar reciprocity is deliberately not borrowed: Lorentz current
