@@ -82,6 +82,33 @@ def test_production_planner_refuses_a_growing_product_window(groups):
         plan_measure_adapted_roq([window], eta=0.02)
 
 
+def test_failed_partition_challenges_whole_branch_at_derived_ceiling(
+        groups, monkeypatch):
+    """A failed initial partition must reach the whole-branch fallback."""
+    from minimax import roq_fit
+
+    tails, _ = groups
+    windows = tuple(
+        RoqWindow(f"window-{index}", tails.fit, tails.validation, 1.0e-4,
+                  "branch", sigma=1)
+        for index in range(2))
+    monkeypatch.setattr(roq_fit, "_decay_partition",
+                        lambda _windows: ((0,), (1,)))
+    monkeypatch.setattr(
+        roq_fit, "_fit_product_groups",
+        lambda subsets, _eta: {key: (object(), object()) for key in subsets})
+    monkeypatch.setattr(roq_fit, "_branch_evidence",
+                        lambda *_args, **_kwargs: None)
+    seen = []
+    monkeypatch.setattr(
+        roq_fit, "_try_whole_below",
+        lambda _windows, _eta, node_cap: seen.append(node_cap))
+
+    with pytest.raises(RuntimeError, match="no product-window ROQ plan"):
+        plan_measure_adapted_roq(windows, eta=0.02)
+    assert seen == [roq_fit._RANK_HARD_CAP]
+
+
 def _load_frozen_na():
     if not (_FROZEN_NA.exists() and _FROZEN_WINDOWS.exists()):
         pytest.skip("frozen Na measure export is not mounted")

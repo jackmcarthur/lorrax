@@ -764,7 +764,7 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
 
         if partition != (all_indices,):
             cap = ((row.node_count - 1) if row is not None
-                   else _rank_ceiling(group))
+                   else _RANK_HARD_CAP)
             consolidation_started = time.perf_counter()
             whole = _try_whole_below(branch_windows, eta, cap)
             consolidation_seconds += (
