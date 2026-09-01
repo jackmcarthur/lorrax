@@ -967,6 +967,63 @@ def centroid_source_map_and_wrap(
     return sym_perm, L_wrap
 
 
+def permutation_orbit_labels(permutations) -> np.ndarray:
+    """Dense connected-component labels for a stack of permutations.
+
+    This is the one conversion from a group action table to orbit identity.
+    It deliberately knows nothing about centroid placement or device meshes.
+    Labels are ordered by their first canonical row, so renumbering or
+    reordering symmetry operations cannot change them.
+
+    Parameters
+    ----------
+    permutations
+        Integer ``(n_operation, n_point)`` table.  Each row must be a
+        permutation of ``range(n_point)``.  Either forward or source/gather
+        maps produce the same connected components.
+    """
+    perm = np.asarray(permutations)
+    if perm.ndim != 2 or perm.dtype.kind not in "iu":
+        raise ValueError(
+            "permutation_orbit_labels: permutations must be a two-"
+            "dimensional integer table; got "
+            f"shape={perm.shape}, dtype={perm.dtype}.")
+    n_points = int(perm.shape[1])
+    if n_points < 1:
+        raise ValueError(
+            "permutation_orbit_labels: permutations must act on at least "
+            "one point.")
+    perm = perm.astype(np.int64, copy=False)
+    expected = np.arange(n_points, dtype=np.int64)
+    for operation, row in enumerate(perm):
+        if (int(row.min()) < 0 or int(row.max()) >= n_points
+                or not np.array_equal(np.sort(row), expected)):
+            raise ValueError(
+                "permutation_orbit_labels: row "
+                f"{operation} is not a permutation of [0, {n_points}).")
+
+    parent = np.arange(n_points, dtype=np.int64)
+
+    def find(point: int) -> int:
+        while parent[point] != point:
+            parent[point] = parent[parent[point]]
+            point = int(parent[point])
+        return point
+
+    for row in perm:
+        for target, source in enumerate(row):
+            root_target = find(target)
+            root_source = find(int(source))
+            if root_target != root_source:
+                # Lowest canonical member is the stable component root.
+                hi, lo = max(root_target, root_source), min(
+                    root_target, root_source)
+                parent[hi] = lo
+    roots = np.asarray([find(point) for point in range(n_points)])
+    _, labels = np.unique(roots, return_inverse=True)
+    return labels.astype(np.int32)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Orbit closure, as a MEASUREMENT you can hold — the public door diagnostic
 # ─────────────────────────────────────────────────────────────────────────

@@ -39,6 +39,7 @@ __all__ = [
     "make_sharded_pivoted_cholesky_select",
     "group_block_pivoted_cholesky_select",
     "make_sharded_group_block_pivoted_cholesky_select",
+    "make_sharded_group_panel_pivoted_cholesky_select",
 ]
 
 
@@ -824,5 +825,336 @@ def make_sharded_group_block_pivoted_cholesky_select(
             _entry, mesh=mesh, in_specs=tuple(specs), out_specs=out_specs,
             check_vma=False,
         )(*args)
+
+    return step
+
+
+def make_sharded_group_panel_pivoted_cholesky_select(
+    mesh: Mesh,
+    M: int,
+    point_budget: int,
+    group_start,
+    group_size,
+    *,
+    mesh_axis: str | tuple[str, ...] = 'x',
+    tol_rel: float | None = None,
+):
+    """Panelized whole-group selection on an orbit-local row layout.
+
+    Each group must occupy a contiguous interval wholly owned by one row
+    shard.  Opening a group then costs two collectives: its global score and
+    one fused broadcast of the owner's previous factor rows, residual
+    diagonal, canonical IDs, and small Gram block.  The group's rank-``b``
+    update is a local GEMM plus triangular solve; no collective occurs inside
+    its member loop.
+
+    ``step(G, group_id, canonical_id, active_init)`` returns the usual
+    seven-tuple.  Pivots and PSD row receipts are canonical IDs, while ``L``
+    and ``d_final`` remain in the supplied packed row order.
+    """
+    n_dev = _mesh_axis_size(
+        mesh, mesh_axis, "make_sharded_group_panel_pivoted_cholesky_select")
+    if M % n_dev:
+        raise ValueError(
+            f"M={M} must be divisible by product of mesh axes "
+            f"{mesh_axis} (= {n_dev})")
+    if point_budget < 1 or point_budget > M:
+        raise ValueError(
+            f"point_budget must lie in [1, M={M}]; got {point_budget}")
+    starts_np = jnp.asarray(group_start, dtype=jnp.int32)
+    sizes_np = jnp.asarray(group_size, dtype=jnp.int32)
+    if starts_np.ndim != 1 or sizes_np.shape != starts_np.shape \
+            or int(starts_np.size) < 1:
+        raise ValueError("group_start/group_size must be equal nonempty vectors")
+    # Validate on the host before tracing; communication kernels may trust it.
+    starts_host = list(map(int, group_start))
+    sizes_host = list(map(int, group_size))
+    M_slab = M // n_dev
+    for group, (start, size) in enumerate(zip(starts_host, sizes_host)):
+        if size < 1 or start < 0 or start + size > M:
+            raise ValueError(
+                f"group {group} interval [{start}, {start + size}) is outside "
+                f"[0, {M})")
+        if start // M_slab != (start + size - 1) // M_slab:
+            raise ValueError(
+                f"group {group} interval [{start}, {start + size}) crosses "
+                f"row-shard boundaries of width {M_slab}")
+    n_groups = len(starts_host)
+    max_group = max(sizes_host)
+
+    row_shard = PartitionSpec(mesh_axis, None)
+    row_shard_1d = PartitionSpec(mesh_axis)
+    rep = PartitionSpec()
+    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep,
+                 (rep, rep, rep))
+
+    @jax.jit
+    def step(G, group_id, canonical_id, active_init):
+        def body_local(G_slab, group_slab, canonical_slab, active_slab):
+            real_dtype = G_slab.real.dtype
+            minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+            plus_inf = jnp.array(jnp.inf, dtype=real_dtype)
+            far = jnp.int32(2 ** 30)
+            my_idx = lax.axis_index(mesh_axis)
+            local_rows = jnp.arange(M_slab, dtype=jnp.int32)
+            global_rows = my_idx * M_slab + local_rows
+            group_slab = group_slab.astype(jnp.int32)
+            canonical_slab = canonical_slab.astype(jnp.int32)
+            active0 = active_slab.astype(bool)
+            local_diag_raw = jnp.real(
+                G_slab[local_rows, global_rows])
+            d0 = jnp.where(active0, jnp.maximum(local_diag_raw, 0.0), 0.0)
+            trG = lax.psum(jnp.sum(d0), axis_name=mesh_axis)
+            d0max = lax.pmax(
+                jnp.max(jnp.where(active0, local_diag_raw, minus_inf)),
+                axis_name=mesh_axis)
+            eps = jnp.finfo(real_dtype).eps
+            tol = (jnp.sqrt(eps) if tol_rel is None
+                   else jnp.asarray(tol_rel, real_dtype))
+            floor = tol * d0max
+
+            min0 = jnp.min(jnp.where(active0, local_diag_raw, plus_inf))
+            at0 = jnp.min(jnp.where(
+                active0 & (local_diag_raw == min0), canonical_slab, far))
+            neg0 = min0 < 0.0
+            storage = point_budget + max_group
+            init = (
+                jnp.int32(0),                         # groups processed
+                jnp.bool_(True),                      # another group may fit
+                jnp.int32(0),                         # points committed
+                d0,
+                jnp.zeros((M_slab, storage), dtype=G_slab.dtype),
+                -jnp.ones((storage,), dtype=jnp.int32),
+                active0,
+                jnp.zeros((n_groups,), dtype=bool),
+                jnp.zeros((storage,), dtype=real_dtype),
+                jnp.zeros((storage + 1,), dtype=real_dtype).at[0].set(
+                    jnp.sum(d0)),
+                jnp.minimum(min0, jnp.zeros((), dtype=real_dtype)),
+                jnp.where(neg0, at0, jnp.int32(-1)),
+                jnp.int32(-1),
+            )
+            panel_rows = jnp.arange(max_group, dtype=jnp.int32)
+            factor_cols = jnp.arange(max_group, dtype=jnp.int32)
+
+            def keep_going(carry):
+                iteration, running, committed = carry[:3]
+                return ((iteration < n_groups) & running
+                        & (committed < point_budget))
+
+            def open_group(carry):
+                (iteration, _running, committed, d, L, piv, available,
+                 chosen, d_taken, trR, d_min_raw, d_min_at,
+                 d_min_j) = carry
+
+                local_values = jax.ops.segment_sum(
+                    jnp.where(available, d, 0.0), group_slab,
+                    num_segments=n_groups + 1, indices_are_sorted=False)
+                values = lax.psum(local_values, axis_name=mesh_axis)
+                remaining = jnp.int32(point_budget) - committed
+                eligible = ((sizes_np <= remaining) & ~chosen)
+                scores = jnp.where(
+                    eligible,
+                    values[:n_groups] / sizes_np.astype(real_dtype),
+                    minus_inf)
+                candidate = jnp.argmax(scores).astype(jnp.int32)
+                has_candidate = jnp.max(scores) > minus_inf
+                block_size = jnp.where(
+                    has_candidate, sizes_np[candidate], jnp.int32(0))
+                start = jnp.where(
+                    has_candidate, starts_np[candidate], jnp.int32(0))
+                members = start + panel_rows
+                valid_member = panel_rows < block_size
+                owner = start // M_slab
+                mine = (my_idx == owner) & has_candidate
+                local_member = members - my_idx * M_slab
+                safe_local = jnp.clip(local_member, 0, M_slab - 1)
+                safe_global = jnp.clip(members, 0, M - 1)
+
+                # One owner broadcast per admitted group.  The complex carrier
+                # fuses four faces that would otherwise be four round trips.
+                local_L = jnp.where(
+                    (mine & valid_member)[:, None],
+                    L[safe_local, :point_budget], 0.0)
+                local_G = G_slab[safe_local[:, None],
+                                 safe_global[None, :]]
+                local_G = jnp.where(
+                    mine & valid_member[:, None] & valid_member[None, :],
+                    local_G, 0.0)
+                local_d = jnp.where(
+                    mine & valid_member, d[safe_local], 0.0)
+                local_canonical = jnp.where(
+                    mine & valid_member, canonical_slab[safe_local], 0)
+                payload = jnp.concatenate([
+                    local_L.reshape(-1),
+                    local_G.reshape(-1),
+                    local_d.astype(G_slab.dtype),
+                    local_canonical.astype(G_slab.dtype),
+                ])
+                payload = lax.psum(payload, axis_name=mesh_axis)
+                n_l = max_group * point_budget
+                n_g = max_group * max_group
+                L_group = payload[:n_l].reshape(max_group, point_budget)
+                G_group = payload[n_l:n_l + n_g].reshape(
+                    max_group, max_group)
+                d_group = jnp.real(payload[n_l + n_g:n_l + n_g + max_group])
+                canonical_group = jnp.rint(jnp.real(
+                    payload[n_l + n_g + max_group:])).astype(jnp.int32)
+                prev = (jnp.arange(point_budget) < committed).astype(
+                    G_slab.dtype)
+                L_group_prev = L_group * prev[None, :]
+                residual_group = (
+                    G_group - L_group_prev @ jnp.conj(L_group_prev).T)
+
+                # Replicated small pivoted Cholesky.  It fixes the member
+                # order and triangular factor without another collective.
+                small_init = (
+                    d_group,
+                    jnp.zeros((max_group, max_group), dtype=G_slab.dtype),
+                    -jnp.ones((max_group,), dtype=jnp.int32),
+                    jnp.zeros((max_group,), dtype=real_dtype),
+                    valid_member & has_candidate,
+                )
+
+                def small_body(column, small):
+                    d_s, F, relative_piv, taken, unused = small
+                    masked = jnp.where(unused, d_s, minus_inf)
+                    pivot_value = jnp.max(masked)
+                    tied_id = jnp.min(jnp.where(
+                        unused & (masked == pivot_value),
+                        canonical_group, far))
+                    relative = jnp.argmin(jnp.where(
+                        unused & (canonical_group == tied_id),
+                        canonical_group, far)).astype(jnp.int32)
+                    avail = pivot_value > minus_inf
+                    take = avail & (pivot_value > floor)
+                    safe_value = jnp.maximum(pivot_value, floor)
+                    corr = F @ (jnp.conj(F[relative, :])
+                                * (factor_cols < column))
+                    new_column = (
+                        residual_group[:, relative] - corr) / jnp.sqrt(
+                            safe_value)
+                    new_column = new_column.at[relative].set(
+                        jnp.sqrt(safe_value).astype(G_slab.dtype))
+                    new_column = jnp.where(
+                        take & valid_member, new_column, 0.0)
+                    F = F.at[:, column].set(new_column)
+                    relative_piv = relative_piv.at[column].set(
+                        jnp.where(avail, relative, -1))
+                    taken = taken.at[column].set(
+                        jnp.where(take, safe_value, 0.0))
+                    d_next = jnp.maximum(jnp.where(
+                        take, d_s - jnp.abs(new_column) ** 2, d_s), 0.0)
+                    unused = unused & ~(
+                        (panel_rows == relative) & avail)
+                    return d_next, F, relative_piv, taken, unused
+
+                _, F, relative_piv, panel_taken, _ = lax.fori_loop(
+                    0, max_group, small_body, small_init)
+                safe_relative = jnp.clip(relative_piv, 0, max_group - 1)
+                pivot_members = safe_global[safe_relative]
+                pivot_canonical = canonical_group[safe_relative]
+                member_valid_in_order = factor_cols < block_size
+                L_piv_prev = L_group_prev[safe_relative]
+                G_columns = G_slab[:, pivot_members]
+                cross = G_columns - (
+                    L[:, :point_budget] @ jnp.conj(L_piv_prev).T)
+                cross = jnp.where(member_valid_in_order[None, :], cross, 0.0)
+                triangular = F[safe_relative, :]
+                taken_mask = panel_taken > 0.0
+                triangular = triangular.at[
+                    factor_cols, factor_cols].set(jnp.where(
+                        taken_mask, jnp.diag(triangular),
+                        jnp.ones((max_group,), dtype=G_slab.dtype)))
+                W = jax.scipy.linalg.solve_triangular(
+                    jnp.conj(triangular), cross.T, lower=True).T
+                W = jnp.where(taken_mask[None, :], W, 0.0)
+
+                # The selected owner rows are the small factor by definition;
+                # pinning them removes solve roundoff from later block scores.
+                def fix_owner_row(row, panel):
+                    old = panel[safe_local[row]]
+                    replacement = jnp.where(
+                        mine & valid_member[row], F[row], old)
+                    return panel.at[safe_local[row]].set(replacement)
+
+                W = lax.fori_loop(0, max_group, fix_owner_row, W)
+
+                # Diagnostics and exact per-point trace history need a cheap
+                # elementwise scan, not another factorization or collective.
+                def install(column, state):
+                    (d_i, L_i, piv_i, available_i, d_taken_i, trR_i,
+                     min_i, min_at_i, min_j_i) = state
+                    valid = has_candidate & (column < block_size)
+                    take = valid & (panel_taken[column] > 0.0)
+                    slot = committed + column
+                    new_column = jnp.where(take, W[:, column], 0.0)
+                    L_i = L_i.at[:, slot].set(jnp.where(
+                        valid, new_column, L_i[:, slot]))
+                    piv_i = piv_i.at[slot].set(jnp.where(
+                        valid, pivot_canonical[column], piv_i[slot]))
+                    d_taken_i = d_taken_i.at[slot].set(jnp.where(
+                        valid, panel_taken[column], d_taken_i[slot]))
+                    raw = d_i - jnp.abs(new_column) ** 2
+                    masked_raw = jnp.where(available_i, raw, plus_inf)
+                    step_min = jnp.min(masked_raw)
+                    step_at = jnp.min(jnp.where(
+                        available_i & (masked_raw == step_min),
+                        canonical_slab, far))
+                    beats = take & (step_min < min_i)
+                    min_i = jnp.where(beats, step_min, min_i)
+                    min_at_i = jnp.where(beats, step_at, min_at_i)
+                    min_j_i = jnp.where(
+                        beats, slot.astype(jnp.int32), min_j_i)
+                    d_next = jnp.maximum(jnp.where(take, raw, d_i), 0.0)
+                    trR_i = trR_i.at[slot + 1].set(jnp.where(
+                        valid, jnp.sum(d_next), trR_i[slot + 1]))
+                    kill = valid & (global_rows == pivot_members[column])
+                    available_i = available_i & ~kill
+                    d_i = jnp.where(kill, 0.0, jnp.where(take, d_next, d_i))
+                    return (d_i, L_i, piv_i, available_i, d_taken_i,
+                            trR_i, min_i, min_at_i, min_j_i)
+
+                (d, L, piv, available, d_taken, trR, d_min_raw,
+                 d_min_at, d_min_j) = lax.fori_loop(
+                    0, max_group, install,
+                    (d, L, piv, available, d_taken, trR,
+                     d_min_raw, d_min_at, d_min_j))
+                chosen = chosen.at[candidate].set(
+                    chosen[candidate] | has_candidate)
+                committed = committed + block_size
+                return (
+                    iteration + 1, has_candidate, committed, d, L, piv,
+                    available, chosen, d_taken, trR, d_min_raw,
+                    d_min_at, d_min_j)
+
+            (iteration, running, committed, d, L, piv, available, chosen,
+             d_taken, trR, d_min_raw, d_min_at, d_min_j) = lax.while_loop(
+                keep_going, open_group, init)
+            del iteration, running, chosen
+            # Match the rank-1 contract after structural exhaustion: trailing
+            # trace slots hold the final residual rather than an artificial 0.
+            trR = jnp.where(
+                jnp.arange(storage + 1) > committed,
+                jnp.sum(d), trR)
+            trR = lax.psum(trR[:point_budget + 1],
+                           axis_name=mesh_axis) / trG
+            d = jnp.where(available, d, 0.0)
+            rank = jnp.sum(d_taken[:point_budget] > floor).astype(jnp.int32)
+            g_min = -lax.pmax(-d_min_raw, axis_name=mesh_axis)
+            mine = d_min_raw == g_min
+            g_at = -lax.pmax(
+                -jnp.where(mine, d_min_at, far), axis_name=mesh_axis)
+            g_j = -lax.pmax(
+                -jnp.where(mine, d_min_j, far), axis_name=mesh_axis)
+            return (
+                piv[:point_budget], L[:, :point_budget], rank, d,
+                d_taken[:point_budget], trR, (g_min, g_at, g_j))
+
+        return shard_map(
+            body_local, mesh=mesh,
+            in_specs=(row_shard, row_shard_1d, row_shard_1d, row_shard_1d),
+            out_specs=out_specs, check_vma=False,
+        )(G, group_id, canonical_id, active_init)
 
     return step

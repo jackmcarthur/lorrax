@@ -259,6 +259,7 @@ from symmetry_maps.orbit_syms import (
     project_polar_fft_field,
     grid_point_image_perm,
     orbit_images,
+    permutation_orbit_labels,
     r_action_forward,
     r_action_forward_one,
     snap_to_grid_and_split_wrap,
@@ -324,6 +325,7 @@ __all__ = [
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
+    "permutation_orbit_labels",
     "fft_grid_pullback_perm", "grid_point_image_perm",
     "PolarFFTFieldProjection", "project_polar_fft_field",
     "r_action_forward", "r_action_forward_one",
