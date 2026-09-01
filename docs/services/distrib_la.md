@@ -473,6 +473,11 @@ Deliberately narrower than `matmul()`:
   before provider probing, clique warmup, or JAX allocation. This counts
   complete local A+B+D(+C) only: caller-live faces, collective temporaries,
   and native workspace remain additional peak memory.
+* **MPI-count-bounded movement** — CPU/MPI lowers each all-to-all peer payload
+  as an `MPI_BYTE` count. When it would exceed 2,000,000,000 bytes, the shared
+  staged engine slices an axis untouched by that exchange, performs several
+  smaller all-to-alls, and concatenates before the next mesh-axis exchange.
+  This preserves global order and sharding without driver-local communication.
 
 **Output liveness.** On a provider route, `beta=0` additionally compiles a
 kernel that builds its zero addend inside the provider program; `out=` may

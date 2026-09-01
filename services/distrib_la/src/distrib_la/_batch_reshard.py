@@ -25,9 +25,17 @@ zero-Hermitian padding.  Matrix dimensions still have to tile the incoming
 linear-algebra problem, so a consumer that needs it must pad before calling
 the plan and slice the result afterward; this route pads only the leading
 batch.
+
+JAX CPU/MPI expresses collective sizes as an ``MPI_BYTE`` count and MPICH's
+ordinary count is signed 32-bit.  Each exchange is therefore split along an
+axis untouched by that exchange whenever one peer message would exceed
+2,000,000,000 bytes.  The pieces are concatenated before the next mesh-axis
+exchange, preserving the exact global partition/order rather than changing
+the sharding to fit an MPI implementation detail.
 """
 from __future__ import annotations
 
+from math import prod
 from typing import Sequence
 
 import jax
@@ -41,6 +49,47 @@ __all__ = ["batch_reshard_call", "validate_batch_reshard_operands"]
 
 
 _JIT_CACHE: dict = {}
+_MPI_COUNT_SAFE_BYTES = 2_000_000_000
+
+
+def _all_to_all_chunk_extent(
+    shape,
+    dtype,
+    *,
+    chunk_axis: int,
+    axis_size: int,
+    max_per_peer_bytes: int,
+) -> int:
+    """Largest untouched-axis slice whose peer message fits ``MPI_Count``."""
+    shape = tuple(int(v) for v in shape)
+    extent = shape[chunk_axis]
+    limit = int(max_per_peer_bytes)
+    if limit < 1:
+        raise ValueError(
+            "batch_reshard max_per_peer_bytes must be positive; "
+            f"got {limit}")
+    total_bytes = int(prod(shape)) * int(jnp.dtype(dtype).itemsize)
+    if total_bytes % int(axis_size):
+        raise ValueError(
+            "batch_reshard all_to_all byte volume does not divide its mesh "
+            f"axis: shape={shape}, bytes={total_bytes}, "
+            f"axis_size={axis_size}")
+    per_peer_bytes = total_bytes // int(axis_size)
+    if per_peer_bytes <= limit:
+        return extent
+    if per_peer_bytes % extent:
+        raise ValueError(
+            "batch_reshard peer byte volume is not integral per untouched "
+            f"chunk-axis unit: shape={shape}, peer_bytes={per_peer_bytes}, "
+            f"chunk_axis={chunk_axis}")
+    bytes_per_chunk_unit = per_peer_bytes // extent
+    chunk_extent = limit // bytes_per_chunk_unit
+    if chunk_extent < 1:
+        raise MemoryError(
+            "batch_reshard cannot keep one all_to_all peer message below "
+            f"{limit} B by chunking axis {chunk_axis}: shape={shape}, "
+            f"one-unit message={bytes_per_chunk_unit} B")
+    return int(chunk_extent)
 
 
 def validate_batch_reshard_operands(
@@ -109,25 +158,80 @@ def validate_batch_reshard_operands(
     return nb, nb_pad - nb
 
 
-def _face_to_batch(a, *, px: int, py: int):
-    """Two volume-preserving exchanges: face tile → whole matrices."""
+def _chunked_all_to_all(
+    a,
+    axis_name: str,
+    *,
+    split_axis: int,
+    concat_axis: int,
+    chunk_axis: int,
+    axis_size: int,
+    max_per_peer_bytes: int,
+):
+    """One all-to-all, split only when MPICH's byte count would overflow.
+
+    ``chunk_axis`` must be untouched by this exchange.  Concatenating there
+    therefore reconstructs the bit-identical unchunked result before the next
+    mesh-axis exchange; chunking an axis that this call splits/joins would
+    instead change global element ownership.
+    """
+    if chunk_axis in (split_axis, concat_axis):
+        raise ValueError(
+            "batch_reshard collective chunk axis must be untouched by the "
+            f"exchange; got chunk={chunk_axis}, split={split_axis}, "
+            f"concat={concat_axis}")
+    shape = tuple(int(v) for v in a.shape)
+    extent = shape[chunk_axis]
+    chunk_extent = _all_to_all_chunk_extent(
+        shape, a.dtype, chunk_axis=chunk_axis, axis_size=axis_size,
+        max_per_peer_bytes=max_per_peer_bytes)
+    if chunk_extent == extent:
+        return jax.lax.all_to_all(
+            a, axis_name, split_axis=split_axis,
+            concat_axis=concat_axis, tiled=True)
+    pieces = []
+    for start in range(0, extent, chunk_extent):
+        stop = min(start + chunk_extent, extent)
+        piece = jax.lax.slice_in_dim(a, start, stop, axis=chunk_axis)
+        pieces.append(jax.lax.all_to_all(
+            piece, axis_name, split_axis=split_axis,
+            concat_axis=concat_axis, tiled=True))
+    return jnp.concatenate(pieces, axis=chunk_axis)
+
+
+def _face_to_batch(
+    a, *, px: int, py: int,
+    max_per_peer_bytes: int = _MPI_COUNT_SAFE_BYTES,
+):
+    """Two volume-preserving, MPI-count-bounded exchanges: face → batch."""
     if px > 1:
-        a = jax.lax.all_to_all(
-            a, "x", split_axis=0, concat_axis=1, tiled=True)
+        # x moves batch into rows; columns are untouched and safe to chunk.
+        a = _chunked_all_to_all(
+            a, "x", split_axis=0, concat_axis=1, chunk_axis=2,
+            axis_size=px, max_per_peer_bytes=max_per_peer_bytes)
     if py > 1:
-        a = jax.lax.all_to_all(
-            a, "y", split_axis=0, concat_axis=2, tiled=True)
+        # y moves batch into columns; rows are untouched and safe to chunk.
+        a = _chunked_all_to_all(
+            a, "y", split_axis=0, concat_axis=2, chunk_axis=1,
+            axis_size=py, max_per_peer_bytes=max_per_peer_bytes)
     return a
 
 
-def _batch_to_face(a, *, px: int, py: int):
-    """Literal inverse of :func:`_face_to_batch`: ``y`` then ``x``."""
+def _batch_to_face(
+    a, *, px: int, py: int,
+    max_per_peer_bytes: int = _MPI_COUNT_SAFE_BYTES,
+):
+    """Literal, MPI-count-bounded inverse: ``y`` then ``x``."""
     if py > 1:
-        a = jax.lax.all_to_all(
-            a, "y", split_axis=2, concat_axis=0, tiled=True)
+        # y moves columns back into batch; rows are untouched.
+        a = _chunked_all_to_all(
+            a, "y", split_axis=2, concat_axis=0, chunk_axis=1,
+            axis_size=py, max_per_peer_bytes=max_per_peer_bytes)
     if px > 1:
-        a = jax.lax.all_to_all(
-            a, "x", split_axis=1, concat_axis=0, tiled=True)
+        # x moves rows back into batch; local columns are untouched.
+        a = _chunked_all_to_all(
+            a, "x", split_axis=1, concat_axis=0, chunk_axis=2,
+            axis_size=px, max_per_peer_bytes=max_per_peer_bytes)
     return a
 
 

@@ -284,6 +284,74 @@ def test_staged_forward_then_inverse_is_bit_exact():
     assert np.array_equal(np.asarray(got), a)
 
 
+def test_forced_chunked_forward_inverse_is_bit_exact_and_face_sharded():
+    """A tiny cap exercises multiple collectives, not the fast one-call leg."""
+    import jax
+    from jax.sharding import PartitionSpec as P
+    from distrib_la._batch_reshard import (
+        _all_to_all_chunk_extent,
+        _batch_to_face,
+        _face_to_batch,
+    )
+    from distrib_la._shard_map import shard_map
+
+    mesh = _mesh()
+    a = np.arange(8 * 8 * 8, dtype=np.float64).reshape(8, 8, 8)
+    cap = 128
+    # P(None,x,y) gives each P4 rank (8,4,4).  The unchunked x message is
+    # 512 B/peer, while this cap permits only one column per call.
+    assert _all_to_all_chunk_extent(
+        (8, 4, 4), np.dtype("float64"), chunk_axis=2, axis_size=2,
+        max_per_peer_bytes=cap) == 1
+
+    def body(local):
+        local = _face_to_batch(
+            local, px=2, py=2, max_per_peer_bytes=cap)
+        return _batch_to_face(
+            local, px=2, py=2, max_per_peer_bytes=cap)
+
+    roundtrip = jax.jit(shard_map(
+        body, mesh=mesh, in_specs=(P(None, "x", "y"),),
+        out_specs=P(None, "x", "y"), check_vma=False))
+    got = roundtrip(_put(a, mesh))
+    assert got.sharding.spec == P(None, "x", "y")
+    assert np.array_equal(np.asarray(got), a)
+
+
+def test_run265_p16_chunk_plan_keeps_every_peer_message_below_2gb():
+    """Pure shape proof for nq=81→96 and merged-spin centroid N=12000."""
+    from distrib_la._batch_reshard import (
+        _MPI_COUNT_SAFE_BYTES,
+        _all_to_all_chunk_extent,
+    )
+
+    cap = 2_000_000_000
+    assert _MPI_COUNT_SAFE_BYTES == cap
+    # The four local arrays presented to forward-x, forward-y, inverse-y,
+    # inverse-x on a 4x4 mesh.  No production-sized array is allocated here.
+    stages = (
+        ((96, 3000, 3000), 2, 1736),
+        ((24, 12000, 3000), 1, 6944),
+        ((6, 12000, 12000), 1, 6944),
+        ((24, 12000, 3000), 2, 1736),
+    )
+    itemsize = np.dtype("complex128").itemsize
+    for shape, chunk_axis, expected_extent in stages:
+        extent = _all_to_all_chunk_extent(
+            shape, np.dtype("complex128"), chunk_axis=chunk_axis,
+            axis_size=4, max_per_peer_bytes=cap)
+        assert extent == expected_extent
+
+        per_peer = int(np.prod(shape, dtype=np.int64)) * itemsize // 4
+        bytes_per_unit = per_peer // shape[chunk_axis]
+        pieces = [min(extent, shape[chunk_axis] - start)
+                  for start in range(0, shape[chunk_axis], extent)]
+        peer_messages = [piece * bytes_per_unit for piece in pieces]
+        assert len(peer_messages) > 1
+        assert sum(pieces) == shape[chunk_axis]
+        assert max(peer_messages) <= cap
+
+
 def test_red_twin_wrong_inverse_order_scrambles_the_batch():
     """The round-trip gate fails if inverse exchanges run x then y."""
     import jax
