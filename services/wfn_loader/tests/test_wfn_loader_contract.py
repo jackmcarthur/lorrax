@@ -49,7 +49,7 @@ import h5py
 import numpy as np
 import pytest
 
-from wfn_loader import WfnLoader, read_wfn_provenance
+from wfn_loader import IBZRows, WfnLoader, read_wfn_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +224,201 @@ def _mesh_1x1():
     from jax.sharding import Mesh
     devs = np.asarray(jax.devices()[:1]).reshape(1, 1)
     return Mesh(devs, ("x", "y"))
+
+
+def test_full_k_parent_groups_stably_group_one_interleaved_k_pass():
+    """The loader owns stable grouping of adversarially interleaved stars."""
+    from types import SimpleNamespace
+
+    loader = WfnLoader.__new__(WfnLoader)
+    loader.nkpts = 3
+    loader._sym = SimpleNamespace(
+        nk_tot=6,
+        irr_idx_k=np.asarray([2, 0, 2, 1, 0, 2], dtype=np.int32),
+    )
+
+    groups = loader.full_k_parent_groups()
+    assert [parent for parent, _ in groups] == [2, 0, 1]
+    assert [children.tolist() for _, children in groups] == [
+        [0, 2, 5], [1, 4], [3]]
+    assert all(
+        children.dtype == np.int32 and children.flags.c_contiguous
+        for _, children in groups)
+
+    requested = [4, 3, 1, 5, 0]
+    subset = loader.full_k_parent_groups(requested)
+    assert [parent for parent, _ in subset] == [0, 1, 2]
+    assert [children.tolist() for _, children in subset] == [
+        [4, 1], [3], [5, 0]]
+    with pytest.raises(ValueError, match="duplicate"):
+        loader.full_k_parent_groups([1, 1])
+    with pytest.raises(ValueError, match="outside"):
+        loader.full_k_parent_groups([6])
+    with pytest.raises(ValueError, match="outside"):
+        loader.full_k_parent_groups(np.asarray([2**32], dtype=np.uint64))
+
+
+def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
+        synth_wfn_path):
+    """Hostile typed action: improper spatial op + tau + antiunitarity.
+
+    The reference comes from ``symmetry_maps.unfold_psi``.  The loader
+    primitive consumes the canonical typed tables in the same order but is
+    otherwise an independent on-device application to an already-read raw
+    parent.  Nonzero tau and the TR row make conjugation/phase order visible.
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from symmetry_maps import (
+        spinor_rotation_for_sym_row, tau_phase_row, unfold_psi)
+    from types import SimpleNamespace
+
+    mesh = _mesh_1x1()
+    band_spec = P(None, ("x", "y"), None, None)
+    with WfnLoader(
+            synth_wfn_path, backend="eager", mesh=mesh) as loader:
+        parent_psi = loader.load(
+            bands=(0, 3), k=IBZRows((0,)), sharding=band_spec)
+        n = int(loader.ngk[0])
+        g_parent = np.asarray(loader._gvecs_raw[:n], dtype=np.int32)
+
+        # Mirror is improper; its TR-augmented reciprocal row is -S.
+        spatial = np.diag([1, 1, -1]).astype(np.int32)
+        sym_mats_k = np.stack([spatial, -spatial])
+        assert np.linalg.det(spatial) < 0
+        tau = np.asarray([np.pi / 2, np.pi / 3, 0.0])
+        translations = tau[None, :]
+        # SU(2) action of the proper C2 part associated with the mirror.
+        U_spatial = np.asarray([
+            [[-1j, 0.0], [0.0, 1j]]], dtype=np.complex128)
+        tr_row = 1
+        expected_valid = unfold_psi(
+            np.asarray(parent_psi)[0, :, :, :n],
+            sym_idx=tr_row, g_kbar=g_parent,
+            sym_mats_k=sym_mats_k, translations=translations,
+            U_spinor_spatial=U_spatial)
+        phase_valid = tau_phase_row(sym_mats_k[tr_row], tau, g_parent)
+        assert phase_valid is not None
+        assert np.any(np.abs(phase_valid - 1.0) > 1e-12)
+        U_eff = spinor_rotation_for_sym_row(
+            U_spatial, tr_row, 1, nspinor=2)
+        assert np.any(np.abs(U_eff - np.diag(np.diag(U_eff))) > 0.0)
+
+        phase = np.ones((1, int(loader.ngkmax)), dtype=np.complex128)
+        phase[0, :n] = phase_valid
+        rep1 = NamedSharding(mesh, P(None))
+        rep2 = NamedSharding(mesh, P(None, None))
+        rep3 = NamedSharding(mesh, P(None, None, None))
+        loader._sym = SimpleNamespace(
+            nk_tot=1, irr_idx_k=np.asarray([0], dtype=np.int32))
+        loader._phdf5_static_dev = {
+            "U_per_full": jax.device_put(U_eff[None, ...], rep3),
+            "phase_per_full": jax.device_put(phase, rep2),
+            "tr_mask_per_full": jax.device_put(
+                np.asarray([True]), rep1),
+            # Unused by this primitive, but retained as a truthful typed
+            # table bundle rather than a partial fake of another format.
+            "ibz_per_full": jax.device_put(
+                np.asarray([0], dtype=np.int32), rep1),
+            "sym_idx_per_full": jax.device_put(
+                np.asarray([tr_row], dtype=np.int32), rep1),
+            "n_tran": 1,
+            "nk_full": 1,
+        }
+
+        got = np.asarray(loader.unfold_parent_to_full_k(
+            parent_psi, parent=0, full_k=0))[0]
+        expected = np.zeros_like(got)
+        expected[:, :, :n] = expected_valid
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-14)
+
+        # Feed the identical typed row through the collective kernel's
+        # distinct (band,spin,parent,G,re/im) carrier layout.  Both kernels
+        # must reach the shared spinor-last action and differ only in their
+        # layout transposes.
+        parent_np = np.asarray(parent_psi)[0]
+        union = np.stack([parent_np.real, parent_np.imag], axis=-1)
+        union = union[:, :, None, :, :]
+        union_sharding = NamedSharding(
+            mesh, P(("x", "y"), None, None, None, None))
+        union_dev = jax.device_put(union, union_sharding)
+        collective = np.asarray(loader._phdf5_unfold_and_shard(
+            union_dev,
+            k_idxs=np.asarray([0], dtype=np.int32), unfold=True,
+            n_reads=1, n_k=1, bands_per_rank=3, ns=2,
+            ngkmax=int(loader.ngkmax),
+            position_in_reads=np.asarray([0], dtype=np.int32),
+            out_sharding=NamedSharding(mesh, band_spec),
+        ))[0]
+        np.testing.assert_allclose(collective, got, rtol=0, atol=1e-14)
+        with pytest.raises(ValueError, match="does not belong"):
+            loader.unfold_parent_to_full_k(
+                parent_psi, parent=1, full_k=0)
+
+
+def test_parent_child_unfold_matches_full_loader_for_tr_and_post_unfold_4c(
+        gnppm_wfn):
+    """Real full-k parity, including the delicate post-unfold 4c lift."""
+    from jax.sharding import PartitionSpec as P
+
+    mesh = _mesh_1x1()
+    band_spec = P(None, ("x", "y"), None, None)
+    with WfnLoader(gnppm_wfn, backend="eager", mesh=mesh) as loader:
+        sym = loader.symmetry()
+        rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
+        _, _, antiunitary = sym.operation_rows(rows)
+        spatial_children = np.flatnonzero(
+            (~np.asarray(antiunitary)) & (rows == 0))
+        tr_children = np.flatnonzero(np.asarray(antiunitary))
+        assert spatial_children.size and tr_children.size, (
+            "gnppm must exercise both typed row kinds")
+        children = [int(spatial_children[0]), int(tr_children[0])]
+
+        group_for_child = {
+            int(child): int(parent)
+            for parent, group_children in loader.full_k_parent_groups()
+            for child in group_children
+        }
+        raw_by_parent = {}
+        for child in children:
+            parent = group_for_child[child]
+            if parent not in raw_by_parent:
+                raw_by_parent[parent] = loader.load(
+                    bands=(0, 2), k=IBZRows((parent,)),
+                    sharding=band_spec)
+            raw = raw_by_parent[parent]
+            got_2c = np.asarray(loader.unfold_parent_to_full_k(
+                raw, parent=parent, full_k=child))
+            ref_2c = np.asarray(loader.load(
+                bands=(0, 2), k=[child], sharding=band_spec))
+            np.testing.assert_allclose(
+                got_2c, ref_2c, rtol=0, atol=1e-14,
+                err_msg=f"2c child {child}, parent {parent}")
+
+            got_4c = np.asarray(loader.unfold_parent_to_full_k(
+                raw, parent=parent, full_k=child, bispinor=True))
+            ref_4c = np.asarray(loader.load(
+                bands=(0, 2), k=[child], sharding=band_spec,
+                bispinor=True))
+            assert got_4c.shape[2] == 4
+            np.testing.assert_allclose(
+                got_4c, ref_4c, rtol=0, atol=1e-14,
+                err_msg=f"4c child {child}, parent {parent}")
+            np.testing.assert_allclose(
+                got_4c[:, :, :2, :], got_2c, rtol=0, atol=0)
+            assert np.linalg.norm(got_4c[:, :, 2:, :]) > 0.0
+
+        # The spatial identity row is a bit-parity anchor: no phase,
+        # conjugation, or spinor arithmetic is allowed to perturb it.
+        identity = children[0]
+        identity_parent = group_for_child[identity]
+        got_identity = np.asarray(loader.unfold_parent_to_full_k(
+            raw_by_parent[identity_parent], parent=identity_parent,
+            full_k=identity))
+        np.testing.assert_array_equal(
+            got_identity,
+            np.asarray(loader.load(
+                bands=(0, 2), k=[identity], sharding=band_spec)))
 
 
 # ===========================================================================
@@ -1108,6 +1303,34 @@ def _scalar_wfn_from(spinor_path, dst):
                          data=np.stack([z.real, z.imag], axis=-1))
         f["mf_header/kpoints/nspinor"][()] = 1
     return dst
+
+
+def test_parent_child_unfold_matches_full_loader_for_scalar_tr(
+        gnppm_wfn, tmp_path, monkeypatch):
+    """A scalar TR child is plain conjugation; no Pauli factor appears."""
+    from jax.sharding import PartitionSpec as P
+
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
+    path = _scalar_wfn_from(
+        gnppm_wfn, str(tmp_path / "WFN_parent_star_ns1.h5"))
+    mesh = _mesh_1x1()
+    band_spec = P(None, ("x", "y"), None, None)
+    with WfnLoader(path, backend="eager", mesh=mesh) as loader:
+        sym = loader.symmetry()
+        rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
+        _, _, antiunitary = sym.operation_rows(rows)
+        tr_children = np.flatnonzero(np.asarray(antiunitary))
+        assert tr_children.size, "scalar fixture must retain a TR child"
+        child = int(tr_children[0])
+        parent = int(np.asarray(sym.irr_idx_k, dtype=np.int32)[child])
+        raw = loader.load(
+            bands=(0, 2), k=IBZRows((parent,)), sharding=band_spec)
+        got = np.asarray(loader.unfold_parent_to_full_k(
+            raw, parent=parent, full_k=child))
+        ref = np.asarray(loader.load(
+            bands=(0, 2), k=[child], sharding=band_spec))
+        assert got.shape[2] == 1
+        np.testing.assert_array_equal(got, ref)
 
 
 def test_a_scalar_wfn_unfolds_to_the_full_bz_with_no_spinor_factor(

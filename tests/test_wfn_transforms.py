@@ -30,7 +30,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from wfn_loader import WfnLoader                                    # noqa: E402
+from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 
 # The synthetic-WFN builder moved WITH the loader (charter wave 1): it
 # writes a ``WFN.h5``, so it belongs to the service that reads one, and the
@@ -57,6 +57,8 @@ from test_wfn_loader_contract import _synth_wfn, _MOS2_WFN   # noqa: E402
 # multi-rank production, no None branches anywhere.
 MESH = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
              axis_names=('x', 'y'))
+_GNPPM_WFN = (Path(__file__).resolve().parent
+               / "regression" / "gnppm_debug" / "WFN.h5")
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +69,13 @@ MESH = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
 def synth_loader(tmp_path):
     path = _synth_wfn(tmp_path)
     with WfnLoader(path) as loader:
+        yield loader
+
+
+@pytest.fixture
+def synth_loader_with_mesh(tmp_path):
+    path = _synth_wfn(tmp_path)
+    with WfnLoader(path, mesh=MESH, backend="eager") as loader:
         yield loader
 
 
@@ -510,8 +519,10 @@ def test_gflat_to_rmu_runtime_k_and_centroid_operands_share_one_family(
     ]
 
 
-def test_streamed_centroid_transfer_matches_bulk(synth_loader):
+def test_streamed_centroid_transfer_matches_bulk(
+        synth_loader_with_mesh, monkeypatch):
     """Two-dimensional WFN tiles preserve the public centroid faces."""
+    synth_loader = synth_loader_with_mesh
     sym = synth_loader.symmetry()
     nb = min(7, int(synth_loader.nbands))
     nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
@@ -543,6 +554,23 @@ def test_streamed_centroid_transfer_matches_bulk(synth_loader):
     for key in list(_wfn_transforms._KERNEL_CACHE):
         if key[0] == "gflat_to_rmu":
             del _wfn_transforms._KERNEL_CACHE[key]
+    singleton_groups = synth_loader.full_k_parent_groups()
+    assert singleton_groups and all(
+        len(children) == 1 for _, children in singleton_groups), (
+        "the synthetic deck must pin the no-reuse singleton path")
+    singleton_requests = []
+    original_load = synth_loader.load
+
+    def _counted_singleton_load(*args, **kwargs):
+        singleton_requests.append(kwargs.get("k"))
+        return original_load(*args, **kwargs)
+
+    def _forbid_parent_unfold(*_args, **_kwargs):
+        raise AssertionError("singleton star dispatched parent unfold")
+
+    monkeypatch.setattr(synth_loader, "load", _counted_singleton_load)
+    monkeypatch.setattr(
+        synth_loader, "unfold_parent_to_full_k", _forbid_parent_unfold)
     stream_y, stream_x = load_centroids_band_chunked(
         synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
         band_chunk_size=4, k_chunk_size=1)
@@ -555,6 +583,102 @@ def test_streamed_centroid_transfer_matches_bulk(synth_loader):
         if key[0] == "gflat_to_rmu"
     ]
     assert len(families) == 1
+    # One direct full-child request per singleton group: no IBZRows raw
+    # parent carrier and no separate parent unfold for a star of size one.
+    # The production loop is band-major then parent-major.
+    expected_singletons = [
+        [int(children[0])]
+        for _b_rel in range(0, nb, 4)
+        for _, children in singleton_groups
+    ]
+    assert singleton_requests == expected_singletons
+    assert all(not isinstance(req, IBZRows) for req in singleton_requests)
+
+
+def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
+        monkeypatch):
+    """The production schedule reduces real WFN reads, not FFT count.
+
+    ``gnppm`` has non-singleton full-k stars.  The strict inequalities and
+    the asserted raw-IBZ request vocabulary make this a non-tautological
+    parent-reuse test: a loop that merely renames every full child a parent
+    still performs ``nk_full`` reads and fails.  Conversely, preserving one
+    FFT call per child pins the one-k workspace and the deliberately
+    conservative transform path.
+    """
+    from types import SimpleNamespace
+
+    if not _GNPPM_WFN.exists():
+        pytest.skip("checked-in gnppm WFN absent")
+    with WfnLoader(
+            str(_GNPPM_WFN), mesh=MESH, backend="eager") as loader:
+        sym = loader.symmetry()
+        groups = loader.full_k_parent_groups()
+        nk_full = int(sym.nk_tot)
+        assert sum(len(children) for _, children in groups) == nk_full
+        assert len(groups) < nk_full
+        assert any(len(children) > 1 for _, children in groups)
+
+        nb = 2
+        nx, ny, nz = (int(v) for v in loader.fft_grid)
+        r_mu = jnp.asarray([
+            [0, 0, 0],
+            [min(1, nx - 1), min(2, ny - 1), min(3, nz - 1)],
+        ], dtype=jnp.int32)
+        meta = SimpleNamespace(
+            nk_tot=nk_full,
+            nspinor=int(loader.nspinor),
+            fft_grid=tuple(int(v) for v in loader.fft_grid),
+            memory_per_device_gb=1000.0,
+            b_id_4_user=nb,
+        )
+
+        # Independent full-k carrier through the established bulk path.
+        preloaded = loader.load(
+            bands=(0, nb), k="full_bz",
+            sharding=P(None, ("x", "y"), None, None))
+        ref_y, ref_x = load_centroids_band_chunked(
+            loader, sym, meta, r_mu, False, MESH, (0, nb),
+            band_chunk_size=nb, psi_G_flat=preloaded)
+
+        load_requests = []
+        fft_k_extents = []
+        original_load = loader.load
+        original_fft = _wfn_transforms.gflat_to_rmu
+
+        def _counted_load(*args, **kwargs):
+            load_requests.append(kwargs.get("k"))
+            return original_load(*args, **kwargs)
+
+        def _counted_fft(*args, **kwargs):
+            fft_k_extents.append(int(args[0].shape[0]))
+            return original_fft(*args, **kwargs)
+
+        monkeypatch.setattr(loader, "load", _counted_load)
+        monkeypatch.setattr(
+            _wfn_transforms, "gflat_to_rmu", _counted_fft)
+        got_y, got_x = load_centroids_band_chunked(
+            loader, sym, meta, r_mu, False, MESH, (0, nb),
+            band_chunk_size=nb, k_chunk_size=1)
+
+        assert len(load_requests) == len(groups)
+        for request, (parent, children) in zip(load_requests, groups):
+            if len(children) == 1:
+                assert request == [int(children[0])]
+                assert not isinstance(request, IBZRows)
+            else:
+                assert isinstance(request, IBZRows)
+                assert request.rows == (int(parent),)
+        raw_parent_rows = [
+            request.rows for request in load_requests
+            if isinstance(request, IBZRows)]
+        assert len(raw_parent_rows) == len(set(raw_parent_rows))
+        assert len(fft_k_extents) == nk_full
+        assert fft_k_extents == [1] * nk_full
+        np.testing.assert_allclose(
+            np.asarray(got_y), np.asarray(ref_y), rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(got_x), np.asarray(ref_x), rtol=1e-10, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------

@@ -28,19 +28,16 @@ assert pc.gram_col_block_device_bytes(
     81, 2, 3600, tile, x_shards=4, y_shards=4,
 ) == pc.gram_col_block_bytes(81, 2, tile) // 16
 
-# Complete-live-set accounting: the fused compiled peak includes its four
-# input slices and internal pair workspaces; final Hermitian fold has three
-# local-G slots. The max is explicit.
-live = pc.gram_block_live_set_bytes(
+# Complete-live-set accounting: the scan's compiler fact is the increment
+# above its four resident WFN faces and donated G; the final Hermitian fold
+# has three local-G slots. The max is explicit.
+live = pc.gram_scan_live_set_bytes(
     resident_bytes=1000,
-    fused_gram_peak_bytes=400,
+    scan_resident_increment_bytes=400,
     gram_matrix_local_bytes=25,
-    extracted_input_bytes=30,
-    extract_increment_bytes=150,
 )
 assert live == {
-    "extract": 1205,
-    "fused_gram": 1425,
+    "scan": 1425,
     "final_fold": 1075,
     "peak": 1425,
 }

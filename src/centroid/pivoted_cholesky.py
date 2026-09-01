@@ -52,7 +52,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.experimental import multihost_utils as _mh
-from functools import partial
 from typing import TYPE_CHECKING
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -237,32 +236,25 @@ def gram_col_block_device_bytes(
     return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
 
 
-def gram_block_live_set_bytes(
+def gram_scan_live_set_bytes(
     *,
     resident_bytes: int,
-    fused_gram_peak_bytes: int,
+    scan_resident_increment_bytes: int,
     gram_matrix_local_bytes: int,
-    extracted_input_bytes: int = 0,
-    extract_increment_bytes: int = 0,
 ) -> dict[str, int]:
-    """Complete per-device live set for one 2-D Gram tile.
+    """Complete per-device live set for the one-dispatch tiled Gram scan.
 
     ``resident_bytes`` is sampled after both complete candidate-WFN windows
-    exist. ``fused_gram_peak_bytes`` is the compiler peak of the exact
-    production tile executable, including all four extracted WFN inputs, both
-    compiler-internal pair densities and the output tile. The extraction row
-    conservatively carries every completed input slice plus the largest one-
-    extractor increment. The donated shard-local update keeps one full local
-    Gram resident. Finally, input + transpose/conjugate + output are three
-    local-Gram slots for the Hermitian fold; there is no global concatenate.
+    exist.  The exact production executable reports only its bytes above
+    those four inputs and the donated local ``P('x','y')`` Gram.  The final
+    Hermitian fold can hold input, transpose/conjugate and output: three
+    local-Gram slots, with no global concatenate.
     """
     resident = int(resident_bytes)
     gram_local = int(gram_matrix_local_bytes)
     stages = {
-        "extract": (resident + gram_local + int(extracted_input_bytes)
-                    + int(extract_increment_bytes)),
-        "fused_gram": (resident + gram_local
-                       + int(fused_gram_peak_bytes)),
+        "scan": (resident + gram_local
+                 + int(scan_resident_increment_bytes)),
         "final_fold": resident + _GRAM_FINAL_FOLD_SLOTS * gram_local,
     }
     stages["peak"] = max(stages.values())
@@ -297,7 +289,7 @@ def _auto_gram_width_from_compiled_peaks(
     run.  A geometric ladder avoids a dozen throw-away production-shape
     compilations. Once the largest feasible rung is known, its tile count is
     fixed and the width is reduced to the smallest mesh-aligned value that
-    covers the logical extent in that many tiles. This preserves dispatch
+    covers the logical extent in that many tiles. This preserves scan-iteration
     count while minimizing zero-padded pair-density work. The returned width
     itself is always queried and certified.
     """
@@ -335,7 +327,7 @@ def _auto_gram_width_from_compiled_peaks(
 
     # Largest-width is not a runtime optimum with fixed-shape tail padding.
     # Example: extent 3008, width 3004 executes two 3004-wide tiles per axis,
-    # nearly 4x the useful square work.  Keep the SAME number of dispatches
+    # nearly 4x the useful square work.  Keep the SAME number of scan iterations
     # and shrink to the minimum aligned width that still covers the extent.
     ntiles, _, _ = gram_tile_schedule(ceiling, width)
     compact = round_up(-(-ceiling // ntiles), d)
@@ -1259,11 +1251,8 @@ def build_gram_q0_via_loadwfns(
     from common.wfn_transforms import load_centroids_band_chunked
     from isdf import (
         pair_density,
-        gram_q0_from_psi_aot_peak_bytes,
-    )
-    from common.staged_reshard import (
-        shard_local_slice_pad,
-        shard_local_update,
+        gram_q0_tiled_from_psi_sm,
+        gram_q0_tiled_from_psi_aot_resident_increment_bytes,
     )
 
     gamma_mode = _resolve_candidate_gamma_mode(
@@ -1473,6 +1462,18 @@ def build_gram_q0_via_loadwfns(
         gc.collect()
         from common.gpu_utils import _get_jax_gpu_memory_bytes
         _, live_now, _ = _get_jax_gpu_memory_bytes()
+        if live_now is None and jax.default_backend() in ("gpu", "cuda"):
+            from common.gpu_utils import (
+                get_gpu_used_memory_bytes_nvidia_smi)
+            live_now = get_gpu_used_memory_bytes_nvidia_smi()
+            if live_now is not None:
+                from runtime.aot_memory import announce_once
+                announce_once(
+                    "gram-live-nvidia-smi",
+                    "allocator bytes_in_use unavailable for the Gram planner; "
+                    "using this rank's conservative nvidia-smi whole-device "
+                    "memory.used sample",
+                )
         if live_now is None:
             # CPU/fallback accounting: sum the returned WFN shards.  Announce
             # that this is weaker because it cannot see service tables.
@@ -1505,68 +1506,21 @@ def build_gram_q0_via_loadwfns(
             * _GRAM_COMPLEX_BYTES
         )
 
-        rep_sh = NamedSharding(mesh_xy, PartitionSpec())
-        row_spec = PartitionSpec(None, 'x', None, None)
-        col_spec = PartitionSpec(None, None, None, 'y')
-        tile_spec = PartitionSpec('x', 'y')
-        tile_services = {}
-
-        def _services_for_width(tile_width):
-            tile_width = int(tile_width)
-            if tile_width not in tile_services:
-                tile_services[tile_width] = (
-                    shard_local_slice_pad(
-                        mesh_xy, spec=row_spec, axis=1, mesh_axis='x',
-                        local_size=tile_width // n_x),
-                    shard_local_slice_pad(
-                        mesh_xy, spec=col_spec, axis=3, mesh_axis='y',
-                        local_size=tile_width // n_y),
-                )
-            return tile_services[tile_width]
-
-        def _extract_increment(extractor, arr):
-            from runtime.aot_memory import aot_kernel_peak_bytes
-            arr_arg = jax.ShapeDtypeStruct(
-                tuple(int(s) for s in arr.shape), arr.dtype,
-                sharding=arr.sharding)
-            start_arg = jax.ShapeDtypeStruct(
-                (), jnp.int32, sharding=rep_sh)
-            compiled = extractor.lower(arr_arg, start_arg).compile()
-            return int(aot_kernel_peak_bytes(compiled).resident_increment)
-
         def _compiled_live_set(tile_width):
             tile_width = int(tile_width)
-            extract_x, extract_y = _services_for_width(tile_width)
-            extract_increment = max(
-                _extract_increment(extract_x, psi_l_rmuT_X),
-                _extract_increment(extract_y, psi_l_rmu_Y),
-                _extract_increment(extract_x, psi_r_rmuT_X),
-                _extract_increment(extract_y, psi_r_rmu_Y),
+            scan_increment = (
+                gram_q0_tiled_from_psi_aot_resident_increment_bytes(
+                    mesh_xy=mesh_xy, nk=nk_, n_points=M_cols,
+                    nb_l=nb_left, nb_r=nb_right, nspinor=ns_,
+                    tile_width=tile_width, gamma_mode=gamma_mode,
+                )
             )
-            fused_peak = gram_q0_from_psi_aot_peak_bytes(
-                mesh_xy=mesh_xy, nk=nk_, n_rows=tile_width,
-                n_cols=tile_width, nb_l=nb_left, nb_r=nb_right,
-                nspinor=ns_, gamma_mode=gamma_mode, symmetrize=False,
-            )
-            # All four completed shard-local slices are live at dispatch.
-            # tile_width is mesh-aligned, so these divisions are exact.
-            extracted_inputs = (
-                nk_ * tile_width * ns_ * (nb_left + nb_right)
-                * (n_x + n_y) // (n_x * n_y)
-                * _GRAM_COMPLEX_BYTES
-            )
-            facts = gram_block_live_set_bytes(
+            facts = gram_scan_live_set_bytes(
                 resident_bytes=resident_bytes,
-                fused_gram_peak_bytes=fused_peak,
+                scan_resident_increment_bytes=scan_increment,
                 gram_matrix_local_bytes=gram_local_bytes,
-                extracted_input_bytes=extracted_inputs,
-                extract_increment_bytes=extract_increment,
             )
-            facts.update({
-                "extract_increment": int(extract_increment),
-                "extracted_inputs": int(extracted_inputs),
-                "fused_compiled": int(fused_peak),
-            })
+            facts["scan_increment"] = int(scan_increment)
             return facts
 
         # The sequential full-M path below still has the smaller WFN live set
@@ -1606,60 +1560,27 @@ def build_gram_q0_via_loadwfns(
                 f"pair-workspace model={local_gib:.2f} GiB/device; "
                 f"resident(two WFN windows; worst rank)="
                 f"{resident_bytes / 2**30:.2f}, "
-                f"compiled fused="
-                f"{live_facts['fused_compiled'] / 2**30:.2f}, "
-                f"extracted inputs/increment="
-                f"{live_facts['extracted_inputs'] / 2**30:.2f}/"
-                f"{live_facts['extract_increment'] / 2**30:.2f}, "
+                f"compiled scan increment="
+                f"{live_facts['scan_increment'] / 2**30:.2f}, "
                 f"full-live peak={live_facts['peak'] / 2**30:.2f} "
                 f"of target={target_bytes / 2**30:.2f} GiB/device)"
             )
-        extract_x, extract_y = _services_for_width(col_block)
-        tile_xy = NamedSharding(mesh_xy, tile_spec)
-        update_g = shard_local_update(mesh_xy, spec=tile_spec)
-        local_rows = M_cols // n_x
-        local_cols = M_cols // n_y
-        local_row_tile = col_block // n_x
-        local_col_tile = col_block // n_y
+        tile_xy = NamedSharding(mesh_xy, PartitionSpec('x', 'y'))
 
-        @partial(jax.jit, out_shardings=tile_xy)
+        @jax.jit(out_shardings=tile_xy)
         def _zero_gram():
             return jnp.zeros((M_cols, M_cols), dtype=jnp.complex128)
 
         G = _zero_gram()
         G.block_until_ready()
 
-        def _rep_i32(value):
-            return device_put_process_local(
-                np.asarray(value, dtype=np.int32), rep_sh)
-
         with timing.section("q0_sum.fused"):
-            for c0 in range(0, local_cols, local_col_tile):
-                c_start = _rep_i32(c0)
-                for r0 in range(0, local_rows, local_row_tile):
-                    r_start = _rep_i32(r0)
-
-                    # Slice inside each already-owned X/Y shard.  The generic
-                    # layout primitive zero-pads the local tail, so no smaller
-                    # global extent is ever repartitioned and the fused
-                    # executable keeps one static shape.
-                    row_l = extract_x(psi_l_rmuT_X, r_start)
-                    block_l = extract_y(psi_l_rmu_Y, c_start)
-                    row_r = extract_x(psi_r_rmuT_X, r_start)
-                    block_r = extract_y(psi_r_rmu_Y, c_start)
-                    G_b = candidate_gram_q0_from_psi(
-                        row_l, block_l, row_r, block_r, kw,
-                        mesh_xy=mesh_xy,
-                        gamma_mode=gamma_mode,
-                        symmetrize=False,
-                    )
-                    G_b.block_until_ready()
-                    del row_l, block_l, row_r, block_r
-                    starts = _rep_i32((r0, c0))
-                    G = update_g(G, G_b, starts)
-                    G.block_until_ready()
-                    del G_b, r_start, starts
-                del c_start
+            G = gram_q0_tiled_from_psi_sm(
+                G, psi_l_rmuT_X, psi_l_rmu_Y,
+                psi_r_rmuT_X, psi_r_rmu_Y, kw,
+                mesh_xy=mesh_xy, tile_width=col_block,
+                gamma_mode=gamma_mode,
+            )
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
             G = 0.5 * (G + jnp.conj(G.T))

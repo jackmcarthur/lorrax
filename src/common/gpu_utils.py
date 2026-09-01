@@ -74,10 +74,13 @@ def worst_process_resident_bytes(local_bytes: int) -> int:
 
 
 def _query_nvidia_smi_memory(field: str) -> float | None:
-    """Query a single GPU memory field (in MiB) from nvidia-smi."""
+    """Query this rank's visible GPU memory field, returned in GB."""
     try:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        gpu_id = visible.split(",", 1)[0].strip() if visible else "0"
         result = subprocess.run(
-            ['nvidia-smi', f'--query-gpu={field}', '--format=csv,noheader,nounits'],
+            ['nvidia-smi', f'--id={gpu_id}', f'--query-gpu={field}',
+             '--format=csv,noheader,nounits'],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
@@ -91,6 +94,19 @@ def _query_nvidia_smi_memory(field: str) -> float | None:
 def get_gpu_memory_nvidia_smi() -> float | None:
     """Query currently free GPU memory via nvidia-smi (GB)."""
     return _query_nvidia_smi_memory('memory.free')
+
+
+def get_gpu_used_memory_bytes_nvidia_smi() -> int | None:
+    """Conservative whole-device residency for this rank's visible GPU.
+
+    Unlike JAX allocator accounting this includes the CUDA context, library
+    workspaces and any unrelated process sharing the device.  It is therefore
+    an upper bound suitable for a capacity refusal, not an attribution tool.
+    """
+    used_gb = _query_nvidia_smi_memory('memory.used')
+    if used_gb is None:
+        return None
+    return int(used_gb * 1e9)
 
 
 def _get_jax_gpu_memory_bytes() -> tuple[float | None, float | None, float | None]:
@@ -255,5 +271,6 @@ def get_device_memory_info() -> dict:
 
 __all__ = ["bfc_fragmentation_target_utilization",
            "get_device_memory_gb", "get_device_memory_info",
-           "get_gpu_memory_nvidia_smi", "get_cpu_memory_total",
+           "get_gpu_memory_nvidia_smi",
+           "get_gpu_used_memory_bytes_nvidia_smi", "get_cpu_memory_total",
            "worst_process_resident_bytes"]

@@ -646,6 +646,288 @@ def gram_q0_from_psi_sm(
 	  perm, phase, perm, phase)
 
 
+def _gram_q0_tiled_from_psi_kernel(
+	mesh_xy: Mesh,
+	nk: int,
+	n_points: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	tile_width: int,
+	*,
+	gamma_mode: str,
+):
+	"""Return one donated executable for a complete tiled q=0 Gram build.
+
+	The manual shard-map body owns each rank's complete WFN faces and local
+	``P('x','y')`` Gram shard.  Its scan walks the caller's fixed square-tile
+	schedule in column-major order, matching the historical Python loop.  Thus
+	the four face slices, two pair densities, Gram fold and local insertion are
+	compiler-internal to one dispatch; only the full WFN faces and the donated
+	Gram persist across tiles.
+	"""
+	transverse = gamma_mode == "transverse"
+	n_x = int(mesh_xy.shape['x'])
+	n_y = int(mesh_xy.shape['y'])
+	local_rows = int(n_points) // n_x
+	local_cols = int(n_points) // n_y
+	local_tile_rows = int(tile_width) // n_x
+	local_tile_cols = int(tile_width) // n_y
+	n_row_tiles = -(-local_rows // local_tile_rows)
+	n_col_tiles = -(-local_cols // local_tile_cols)
+	n_tiles = n_row_tiles * n_col_tiles
+	cache_key = (
+		'gram_q0_tiled_from_psi_sm', id(mesh_xy), nk, n_points,
+		nb_l, nb_r, nspinor, tile_width, gamma_mode,
+	)
+	if cache_key not in _isdf_pipeline_cache:
+		x_spec = P(None, 'x', None, None)
+		y_spec = P(None, None, None, 'y')
+		out_spec = P('x', 'y')
+		x_sh = NamedSharding(mesh_xy, x_spec)
+		y_sh = NamedSharding(mesh_xy, y_spec)
+		out_sh = NamedSharding(mesh_xy, out_spec)
+		rep = NamedSharding(mesh_xy, P())
+
+		def _slice_pad_local(a, start, *, axis, size):
+			"""Slice one already-owned shard and zero its out-of-range tail."""
+			n_local = int(a.shape[axis])
+			ids = jnp.asarray(start, dtype=jnp.int32) + jnp.arange(
+				size, dtype=jnp.int32)
+			safe = jnp.minimum(ids, jnp.int32(n_local - 1))
+			out = jnp.take(a, safe, axis=axis)
+			mask_shape = [1] * a.ndim
+			mask_shape[axis] = size
+			valid = (ids < jnp.int32(n_local)).reshape(mask_shape)
+			return jnp.where(valid, out, jnp.zeros((), dtype=a.dtype))
+
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(out_spec, x_spec, y_spec, x_spec, y_spec,
+		                   P(), P(), P(), P(), P()),
+		         out_specs=out_spec, check_vma=False)
+		def _local(G_local, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			def _one_tile(G_acc, tile_idx):
+				# Preserve the incumbent c-outer/r-inner tile order.  There is no
+				# arithmetic dependence between tiles, but the order is useful HLO
+				# evidence that this is the same fixed schedule in one executable.
+				c_idx = tile_idx // jnp.int32(n_row_tiles)
+				r_idx = tile_idx - c_idx * jnp.int32(n_row_tiles)
+				r_start = r_idx * jnp.int32(local_tile_rows)
+				c_start = c_idx * jnp.int32(local_tile_cols)
+
+				row_l = _slice_pad_local(
+					psi_l_X_, r_start, axis=1, size=local_tile_rows)
+				col_l = _slice_pad_local(
+					psi_l_Y_, c_start, axis=3, size=local_tile_cols)
+				row_r = _slice_pad_local(
+					psi_r_X_, r_start, axis=1, size=local_tile_rows)
+				col_r = _slice_pad_local(
+					psi_r_Y_, c_start, axis=3, size=local_tile_cols)
+				P_l = jnp.einsum(
+					'kmna,knbr->kabmr', row_l, col_l, optimize=True)
+				P_r = jnp.einsum(
+					'kmna,knbr->kabmr', row_r, col_r, optimize=True)
+				G_tile = _gram_q0_fold_local(
+					P_l, P_r, kw_, perm_L_, phase_L_, perm_R_, phase_R_,
+					lhs_id=not transverse, rhs_id=not transverse,
+					symmetrize=False,
+					transverse_feature_sum=transverse,
+				)
+				row_ids = r_start + jnp.arange(
+					local_tile_rows, dtype=jnp.int32)
+				col_ids = c_start + jnp.arange(
+					local_tile_cols, dtype=jnp.int32)
+				G_acc = G_acc.at[
+					row_ids[:, None], col_ids[None, :]
+				].set(G_tile, mode='drop')
+				return G_acc, None
+
+			G_local, _ = jax.lax.scan(
+				_one_tile,
+				G_local,
+				jnp.arange(n_tiles, dtype=jnp.int32),
+				unroll=1,
+			)
+			return G_local
+
+		@partial(jax.jit,
+		         in_shardings=(out_sh, x_sh, y_sh, x_sh, y_sh,
+		                       rep, rep, rep, rep, rep),
+		         out_shardings=out_sh, donate_argnums=(0,))
+		def _tiled(G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			return _local(
+				G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+				perm_L_, phase_L_, perm_R_, phase_R_)
+
+		_isdf_pipeline_cache[cache_key] = _tiled
+	return _isdf_pipeline_cache[cache_key]
+
+
+def gram_q0_tiled_from_psi_sm(
+	G_xy: jax.Array,
+	psi_l_X: jax.Array,
+	psi_l_Y: jax.Array,
+	psi_r_X: jax.Array,
+	psi_r_Y: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	tile_width: int,
+	gamma_mode: str = "charge",
+) -> jax.Array:
+	"""Assemble every q=0 candidate-Gram tile in one donated executable.
+
+	This is the blocked counterpart of :func:`gram_q0_from_psi_sm`.  ``G_xy``
+	is a square destination sharded ``P('x','y')`` and is donated.  The WFN
+	faces keep their full candidate extent and their canonical X/Y layouts;
+	each scan step slices only the already-owned local shards.  The final
+	Hermitian fold remains the caller's operation, exactly as in the historical
+	blocked schedule.
+
+	``tile_width`` is the existing global square-tile width, not a tuning
+	choice made here.  It must divide both mesh axes.  Tail tiles are padded
+	with exact zeros locally and out-of-range destination entries are dropped.
+	The transverse route calls the unchanged three-component scan in
+	:func:`_gram_q0_fold_local`, preserving its component and reduction order.
+	"""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if any(arr.ndim != 4 for arr in
+	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
+		raise ValueError(
+			"gram_q0_tiled_from_psi_sm requires four rank-4 WFN faces")
+	if G_xy.ndim != 2 or int(G_xy.shape[0]) != int(G_xy.shape[1]):
+		raise ValueError(
+			"gram_q0_tiled_from_psi_sm requires a square rank-2 destination; "
+			f"got {G_xy.shape}")
+	nk, n_points, nb_l, ns = (int(v) for v in psi_l_X.shape)
+	if tuple(int(v) for v in G_xy.shape) != (n_points, n_points):
+		raise ValueError(
+			"Gram destination and WFN point extents disagree: "
+			f"G={G_xy.shape}, psi_l_X={psi_l_X.shape}")
+	if tuple(int(v) for v in psi_l_Y.shape) != (nk, nb_l, ns, n_points):
+		raise ValueError(
+			"left WFN faces disagree: "
+			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
+	if (int(psi_r_X.shape[0]) != nk
+	        or int(psi_r_X.shape[1]) != n_points
+	        or int(psi_r_X.shape[3]) != ns):
+		raise ValueError(
+			"right X face disagrees with left X face: "
+			f"left={psi_l_X.shape}, right={psi_r_X.shape}")
+	nb_r = int(psi_r_X.shape[2])
+	if tuple(int(v) for v in psi_r_Y.shape) != (nk, nb_r, ns, n_points):
+		raise ValueError(
+			"right WFN faces disagree: "
+			f"X={psi_r_X.shape}, Y={psi_r_Y.shape}")
+	if tuple(int(v) for v in k_weights.shape) != (nk,):
+		raise ValueError(
+			f"k_weights must have shape ({nk},); got {k_weights.shape}")
+	if mode == "transverse" and ns != 4:
+		raise ValueError(
+			"gamma_mode='transverse' requires four-component bispinors; "
+			f"got nspinor={ns}")
+	width = int(tile_width)
+	if width <= 0:
+		raise ValueError(f"tile_width must be positive; got {width}")
+	n_x = int(mesh_xy.shape['x'])
+	n_y = int(mesh_xy.shape['y'])
+	if n_points % n_x or n_points % n_y:
+		raise ValueError(
+			"candidate extent must divide both mesh axes for a P('x','y') "
+			f"destination; got n_points={n_points}, mesh={n_x}x{n_y}")
+	if width % n_x or width % n_y:
+		raise ValueError(
+			"tile_width must divide both mesh axes; "
+			f"got tile_width={width}, mesh={n_x}x{n_y}")
+	if mode == "transverse":
+		perm = _gammas_perm
+		phase = _gammas_phase
+	else:
+		perm = jnp.arange(ns, dtype=jnp.int32)
+		phase = jnp.ones(ns, dtype=psi_l_X.dtype)
+	return _gram_q0_tiled_from_psi_kernel(
+		mesh_xy, nk, n_points, nb_l, nb_r, ns, width,
+		gamma_mode=mode,
+	)(G_xy, psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
+	  perm, phase, perm, phase)
+
+
+def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
+	*,
+	mesh_xy: Mesh,
+	nk: int,
+	n_points: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	tile_width: int,
+	dtype=jnp.complex128,
+	gamma_mode: str = "charge",
+) -> int:
+	"""Compiled bytes above the already-resident WFN faces and donated G.
+
+	This lowers the exact production scan executable.  The caller's live-set
+	model already counts all arguments (the four complete WFN faces and the
+	local ``P('x','y')`` destination), so ``resident_increment`` is the relevant
+	compiler fact: temporary bytes plus any non-aliased output bytes.  Donation
+	should make the latter zero; the focused P=4 HLO gate asserts the alias.
+	"""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
+	n_x = int(mesh_xy.shape['x'])
+	n_y = int(mesh_xy.shape['y'])
+	width = int(tile_width)
+	if (int(n_points) <= 0 or width <= 0
+	        or int(n_points) % n_x or int(n_points) % n_y
+	        or width % n_x or width % n_y):
+		raise ValueError(
+			"tiled Gram planning requires positive candidate/tile extents "
+			"divisible by both mesh axes; got "
+			f"n_points={int(n_points)}, tile_width={width}, mesh={n_x}x{n_y}")
+	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
+	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+	xy_sh = NamedSharding(mesh_xy, P('x', 'y'))
+	rep = NamedSharding(mesh_xy, P())
+	G = jax.ShapeDtypeStruct(
+		(int(n_points), int(n_points)), dtype, sharding=xy_sh)
+	x_l = jax.ShapeDtypeStruct(
+		(int(nk), int(n_points), int(nb_l), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_l = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_l), int(nspinor), int(n_points)), dtype,
+		sharding=y_sh)
+	x_r = jax.ShapeDtypeStruct(
+		(int(nk), int(n_points), int(nb_r), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_r = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_r), int(nspinor), int(n_points)), dtype,
+		sharding=y_sh)
+	kw = jax.ShapeDtypeStruct((int(nk),), jnp.float64, sharding=rep)
+	gamma_shape = ((4, int(nspinor)) if mode == "transverse"
+	               else (int(nspinor),))
+	perm = jax.ShapeDtypeStruct(gamma_shape, jnp.int32, sharding=rep)
+	phase = jax.ShapeDtypeStruct(gamma_shape, dtype, sharding=rep)
+	compiled = _gram_q0_tiled_from_psi_kernel(
+		mesh_xy, int(nk), int(n_points), int(nb_l), int(nb_r),
+		int(nspinor), width, gamma_mode=mode,
+	).lower(
+		G, x_l, y_l, x_r, y_r, kw, perm, phase, perm, phase,
+	).compile()
+	from runtime.aot_memory import aot_kernel_peak_bytes
+	return int(aot_kernel_peak_bytes(compiled).resident_increment)
+
+
 def gram_q0_from_psi_aot_peak_bytes(
 	*,
 	mesh_xy: Mesh,
