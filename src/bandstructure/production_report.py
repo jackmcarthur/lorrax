@@ -84,12 +84,12 @@ class HTransformProductionReport:
         self.emit("-" * len(title))
 
     def begin(self, *, input_file: str, output_file: str,
-              energy_source: str) -> None:
+              energy_source: str, output_label: str = "Band output") -> None:
         self.emit("=" * 78)
         self.emit("LORRAX HAMILTONIAN INTERPOLATION")
         self.emit("=" * 78)
         self.emit(f"Input          : {abs_path(input_file)}")
-        self.emit(f"Band output    : {abs_path(output_file)}")
+        self.emit(f"{output_label:<15}: {abs_path(output_file)}")
         self.emit(f"Energy source  : {energy_source}")
 
     def architecture(self) -> None:
@@ -98,7 +98,7 @@ class HTransformProductionReport:
             self.emit(line)
 
     def environment(self, *, params, wfn, fine_plan,
-                    fine_enabled: bool) -> None:
+                    fine_enabled: bool, basis_only: bool = False) -> None:
         self.heading("Numerical environment")
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
@@ -126,6 +126,9 @@ class HTransformProductionReport:
             if str(fine_plan.requested_batched_route) != str(fine_plan.batched_route):
                 batch_text += f" -> {fine_plan.batched_route}"
             self.emit("Batched LA     : " + batch_text)
+        elif basis_only:
+            self.emit("Fine-k eigensolve: not used (--basis-only)")
+            self.emit("Batched LA     : not used (--basis-only)")
         else:
             self.emit("Fine-k eigensolve: not used (get_centroids_fi = false)")
             self.emit("Batched LA     : not used by this calculation")
@@ -141,6 +144,15 @@ class HTransformProductionReport:
             self.emit(line)
         if centroids is not None:
             self.emit(centroid_orbit_line(centroids))
+
+    def basis_only_result(self, *, basis_file: str, rank_physical: int) -> None:
+        """Report the terminal fit-only boundary without implying a path run."""
+        self.heading("Basis-only result")
+        self.emit(f"Galerkin basis : {abs_path(basis_file)}")
+        self.emit(f"Physical rank  : {int(rank_physical)}")
+        self.emit("Validation     : collective reopen; completion and "
+                  "provenance receipts matched")
+        self.emit("Path solve     : skipped by --basis-only")
 
     def interpolation_space(self, *, params, wfn, meta, result,
                             enk_sigma_ry, ctilde, centroid_file: str,
