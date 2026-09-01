@@ -920,10 +920,13 @@ class WfnLoader:
                 f"{sharding!r}.")
 
         static = self._ensure_phdf5_static()
+        phase_host = self._host_phase_rows_for_full_k(
+            np.asarray([full_k], dtype=np.int32))
+        rep1 = NamedSharding(self._mesh, P(None))
         child = _parent_to_full_k_unfold_kernel(self._mesh)(
             parent_psi,
             static["U_per_full"][full_k],
-            static["phase_per_full"][full_k],
+            device_put_process_local(phase_host[0], rep1),
             static["tr_mask_per_full"][full_k],
         )
         if bispinor:
@@ -1269,15 +1272,65 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # phdf5 backend — collective FFI read + on-device unfold
     # ------------------------------------------------------------------
+    def _host_phase_rows_for_full_k(
+        self, full_k_rows: np.ndarray,
+    ) -> np.ndarray:
+        """Build canonical nonsymmorphic phases for requested full-k rows.
+
+        ``SymMaps.reciprocal_phase`` remains the physics owner.  This helper
+        owns only loader padding and row selection.  It returns exactly the
+        requested rows and never caches them, so one-child parent streaming
+        cannot grow into a dense ``(nk_full, ngkmax)`` resident table.
+        """
+        raw = np.asarray(full_k_rows)
+        sym = self._ensure_sym()
+        nk_full = int(sym.nk_tot)
+        if (raw.ndim != 1 or not np.issubdtype(raw.dtype, np.integer)
+                or np.any(raw < 0) or np.any(raw >= nk_full)):
+            raise ValueError(
+                "WfnLoader typed-action rows must be one-dimensional full-k "
+                f"indices in [0,{nk_full}); got {raw!r}.")
+        rows = raw.astype(np.int32, copy=False)
+        sym_rows_all = np.asarray(sym.sym_idx_k, dtype=np.int32)
+        parents_all = np.asarray(sym.irr_idx_k, dtype=np.int32)
+        if sym_rows_all.shape != (nk_full,) or parents_all.shape != (nk_full,):
+            raise ValueError(
+                "WfnLoader typed-action map shape mismatch: "
+                f"sym={sym_rows_all.shape}, parent={parents_all.shape}, "
+                f"want {(nk_full,)}.")
+        sym_rows = sym_rows_all[rows]
+        parents = parents_all[rows]
+        if (np.any(parents < 0)
+                or np.any(parents >= int(self.nkpts))):
+            raise ValueError(
+                "WfnLoader typed-action parent row outside the raw WFN k "
+                f"axis [0,{int(self.nkpts)}); got {parents.tolist()}.")
+
+        ngkmax = int(self.ngkmax)
+        phase = np.ones((len(rows), ngkmax), dtype=np.complex128)
+        for out, (sym_row, parent) in enumerate(zip(sym_rows, parents)):
+            ngk_k = int(self.ngk[int(parent)])
+            start = int(self._kpt_starts[int(parent)])
+            g_parent = self._gvecs_raw[start:start + ngk_k]
+            phase_valid = sym.reciprocal_phase(int(sym_row), g_parent)
+            if phase_valid is not None:
+                phase_valid = np.asarray(phase_valid, dtype=np.complex128)
+                if (phase_valid.shape != (ngk_k,)
+                        or not np.all(np.isfinite(phase_valid))):
+                    raise ValueError(
+                        "SymMaps.reciprocal_phase returned an invalid row: "
+                        f"shape={phase_valid.shape}, want {(ngk_k,)}, "
+                        f"finite={bool(np.all(np.isfinite(phase_valid)))}.")
+                phase[out, :ngk_k] = phase_valid
+        return np.ascontiguousarray(phase)
+
     def _ensure_phdf5_static(self) -> dict:
         """Lazy build of the per-full-BZ-k symmetry tables on device.
 
-        Builds once per ``WfnLoader`` instance; subsequent ``load()``
-        calls reuse the staged arrays.  Mirrors
-        ``PhdfWfnReader._build_symmetry_tables`` +
-        ``_compute_phases_all_full_k`` + ``_device_put_static_tables``
-        but without the FFT-box machinery (which lives downstream in
-        ``wfn_transforms``).
+        Builds once per ``WfnLoader`` instance; subsequent ``load()`` calls
+        reuse the O(nk) parent, row, TR and spin tables. Nonsymmorphic phase
+        rows are request-local through :meth:`_host_phase_rows_for_full_k`;
+        they are never retained here as O(nk*ngkmax) state.
 
         Touches NO FFI: these are numpy tables staged process-locally, so
         the collective handle lives in :meth:`_ensure_slab_io` instead of
@@ -1290,55 +1343,28 @@ class WfnLoader:
 
         sym = self._ensure_sym()
         nk_full = int(sym.nk_tot)
-        ngkmax = int(self.ngkmax)
         ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)[:nk_full]
         sym_idx_per_full = np.asarray(sym.sym_idx_k, dtype=np.int32)[:nk_full]
         n_tran = int(sym.sym_matrices.shape[0])
         _, _, tr_mask = sym.operation_rows(sym_idx_per_full)
-
-        # SymMaps owns the spatial/antiunitary row interpretation.  Passing
-        # nspinor is required so a scalar WFN receives a 1x1 identity rather
-        # than broadcasting the stored Pauli-spinor table.
         U_per = sym.spinor_action(
-            sym_idx_per_full, nspinor=int(self.nspinor))      # (nk_full, ns, ns)
-
-        # The reciprocal action contains the antiunitary minus, while the
-        # translation comes from its spatial Seitz row; the service combines
-        # them into the nonsymmorphic phase.
-        phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
-        for nk in range(nk_full):
-            s = int(sym_idx_per_full[nk])
-            ibz = int(ibz_per_full[nk])
-            ngk_k = int(self.ngk[ibz])
-            start = int(self._kpt_starts[ibz])
-            g_bar = self._gvecs_raw[start:start + ngk_k]
-            ph = sym.reciprocal_phase(s, g_bar)
-            if ph is not None:
-                phase[nk, :ngk_k] = ph
+            sym_idx_per_full, nspinor=int(self.nspinor))
 
         # Device-stage the static tables once.  Sharding choice mirrors
         # ``PhdfWfnReader._device_put_static_tables`` — all replicated
         # since they're per-full-BZ-k metadata, not per-band data.
-        rep0 = NamedSharding(self._mesh, P())
         rep1 = NamedSharding(self._mesh, P(None))
-        rep2 = NamedSharding(self._mesh, P(None, None))
         rep3 = NamedSharding(self._mesh, P(None, None, None))
         # Process-local placement, NOT ``jax.device_put(numpy, sharding)``.
         # On a multi-process mesh the latter fires JAX's silent
         # ``multihost_utils.assert_equal`` → ``process_allgather(tiled=True)``
         # per table (see ``common.collectives.device_put_process_local``).
-        # ``phase`` is the second of scorecard Y.3's two P-LINEAR loader
-        # allgathers: ``P·nk·ngkmax·16`` = 1.27 GB/rank at P=64, 2.85 GB
-        # projected at P=144.  Every rank computes these tables from the
-        # same file with the same code, so they are bit-identical by
-        # construction and the assertion buys nothing.
         self._phdf5_static_dev = {
             "ibz_per_full": device_put_process_local(ibz_per_full, rep1),
             "sym_idx_per_full": device_put_process_local(
                 sym_idx_per_full, rep1),
             "tr_mask_per_full": device_put_process_local(tr_mask, rep1),
             "U_per_full": device_put_process_local(U_per, rep3),
-            "phase_per_full": device_put_process_local(phase, rep2),
             "n_tran": n_tran,
             "nk_full": nk_full,
         }
@@ -1485,8 +1511,11 @@ class WfnLoader:
         if unfold:
             U_k = jnp.take(static["U_per_full"],
                            jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
-            phase_k = jnp.take(static["phase_per_full"],
-                                jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            phase_sh = NamedSharding(self._mesh, P(None, None))
+            phase_k = device_put_process_local(
+                self._host_phase_rows_for_full_k(
+                    np.asarray(k_idxs, dtype=np.int32)),
+                phase_sh)
             tr_mask_k = jnp.take(static["tr_mask_per_full"],
                                   jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
             psi = unfold_jit(cnk_at_ibz, U_k, phase_k, tr_mask_k,
@@ -2052,9 +2081,9 @@ def _parent_to_full_k_unfold_kernel(mesh: Mesh):
     """One-k typed symmetry action on an already-loaded raw parent.
 
     The large operand stays band-sharded over the full XY mesh.  All typed
-    action tables are small replicated operands supplied by
-    :meth:`WfnLoader._ensure_phdf5_static`, the same source used by the
-    collective full-k loader.
+    action tables are replicated operands supplied by the loader's canonical
+    typed-action builder.  Parent streaming supplies one phase row; it never
+    initializes the collective loader's dense full-k phase table.
     """
     def _per_rank(parent_psi, U_child, phase_child, tr_child):
         coeff_last = jnp.moveaxis(parent_psi, 2, -1)

@@ -101,7 +101,8 @@ for the real one, which is exactly what the deleted shim was.
   They are different primitives, not a flag.
 * **Parent/star streaming keeps one-k memory.** Non-singleton full-k stars
   load each raw IBZ parent once and realize children serially through
-  `unfold_parent_to_full_k`; singleton stars retain the direct full-k path.
+  `unfold_parent_to_full_k`; its phase row is child-local rather than a dense
+  full-k table. Singleton stars retain the direct full-k path.
   Both use the same typed symmetry action and keep one transformed child live.
 * **Late mesh binding is narrow.** `adopt_mesh` switches only a
   multi-process, auto-picked, currently-eager loader; explicit requests

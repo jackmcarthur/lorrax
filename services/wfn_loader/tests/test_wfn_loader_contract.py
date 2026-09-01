@@ -307,13 +307,21 @@ def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
         phase = np.ones((1, int(loader.ngkmax)), dtype=np.complex128)
         phase[0, :n] = phase_valid
         rep1 = NamedSharding(mesh, P(None))
-        rep2 = NamedSharding(mesh, P(None, None))
         rep3 = NamedSharding(mesh, P(None, None, None))
+
+        def _phase_for_child(row, carriers):
+            assert int(row) == tr_row
+            np.testing.assert_array_equal(carriers, g_parent)
+            return phase_valid
+
         loader._sym = SimpleNamespace(
-            nk_tot=1, irr_idx_k=np.asarray([0], dtype=np.int32))
+            nk_tot=1,
+            irr_idx_k=np.asarray([0], dtype=np.int32),
+            sym_idx_k=np.asarray([tr_row], dtype=np.int32),
+            reciprocal_phase=_phase_for_child,
+        )
         loader._phdf5_static_dev = {
             "U_per_full": jax.device_put(U_eff[None, ...], rep3),
-            "phase_per_full": jax.device_put(phase, rep2),
             "tr_mask_per_full": jax.device_put(
                 np.asarray([True]), rep1),
             # Unused by this primitive, but retained as a truthful typed
@@ -365,6 +373,13 @@ def test_parent_child_unfold_matches_full_loader_for_tr_and_post_unfold_4c(
     band_spec = P(None, ("x", "y"), None, None)
     with WfnLoader(gnppm_wfn, backend="eager", mesh=mesh) as loader:
         sym = loader.symmetry()
+        compact_static = loader._ensure_phdf5_static()
+        assert "phase_per_full" not in compact_static
+        assert not any(
+            tuple(int(v) for v in value.shape)
+            == (int(sym.nk_tot), int(loader.ngkmax))
+            for value in compact_static.values()
+            if hasattr(value, "shape"))
         rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
         _, _, antiunitary = sym.operation_rows(rows)
         spatial_children = np.flatnonzero(
@@ -387,6 +402,15 @@ def test_parent_child_unfold_matches_full_loader_for_tr_and_post_unfold_4c(
                     bands=(0, 2), k=IBZRows((parent,)),
                     sharding=band_spec)
             raw = raw_by_parent[parent]
+            one_phase = loader._host_phase_rows_for_full_k(
+                np.asarray([child], dtype=np.int32))
+            assert one_phase.shape == (1, int(loader.ngkmax))
+            assert one_phase.flags.c_contiguous
+            ngk_parent = int(loader.ngk[parent])
+            np.testing.assert_array_equal(
+                one_phase[0, ngk_parent:],
+                np.ones(int(loader.ngkmax) - ngk_parent,
+                        dtype=np.complex128))
             got_2c = np.asarray(loader.unfold_parent_to_full_k(
                 raw, parent=parent, full_k=child))
             ref_2c = np.asarray(loader.load(
@@ -1414,6 +1438,7 @@ def test_the_device_spinor_table_is_1x1_on_a_scalar_wfn(
 
     with WfnLoader(path, backend="eager", mesh=mesh) as loader:
         static = loader._ensure_phdf5_static()
+        assert "phase_per_full" not in static
         U = np.asarray(static["U_per_full"])
         assert U.shape[1:] == (1, 1), (
             f"device spinor table is {U.shape[1:]} per k on an nspinor=1 "

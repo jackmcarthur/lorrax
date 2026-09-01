@@ -74,7 +74,7 @@ def worst_process_resident_bytes(local_bytes: int) -> int:
 
 
 def _query_nvidia_smi_memory(field: str) -> float | None:
-    """Query this rank's visible GPU memory field, returned in GB."""
+    """Query this rank's visible GPU memory field, returned in GiB."""
     try:
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
         gpu_id = visible.split(",", 1)[0].strip() if visible else "0"
@@ -85,7 +85,7 @@ def _query_nvidia_smi_memory(field: str) -> float | None:
         )
         if result.returncode == 0:
             value_mib = float(result.stdout.strip().split('\n')[0])
-            return value_mib / 1024.0  # MiB -> GB
+            return value_mib / 1024.0  # MiB -> GiB
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         pass
     return None
@@ -103,10 +103,10 @@ def get_gpu_used_memory_bytes_nvidia_smi() -> int | None:
     workspaces and any unrelated process sharing the device.  It is therefore
     an upper bound suitable for a capacity refusal, not an attribution tool.
     """
-    used_gb = _query_nvidia_smi_memory('memory.used')
-    if used_gb is None:
+    used_gib = _query_nvidia_smi_memory('memory.used')
+    if used_gib is None:
         return None
-    return int(used_gb * 1e9)
+    return int(used_gib * 2**30)
 
 
 def _get_jax_gpu_memory_bytes() -> tuple[float | None, float | None, float | None]:

@@ -643,8 +643,10 @@ def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
 
         load_requests = []
         fft_k_extents = []
+        phase_requests = []
         original_load = loader.load
         original_fft = _wfn_transforms.gflat_to_rmu
+        original_phase_rows = loader._host_phase_rows_for_full_k
 
         def _counted_load(*args, **kwargs):
             load_requests.append(kwargs.get("k"))
@@ -654,13 +656,20 @@ def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
             fft_k_extents.append(int(args[0].shape[0]))
             return original_fft(*args, **kwargs)
 
+        def _counted_phase_rows(rows):
+            phase_requests.append(tuple(int(v) for v in np.asarray(rows)))
+            return original_phase_rows(rows)
+
         monkeypatch.setattr(loader, "load", _counted_load)
         monkeypatch.setattr(
             _wfn_transforms, "gflat_to_rmu", _counted_fft)
+        monkeypatch.setattr(
+            loader, "_host_phase_rows_for_full_k", _counted_phase_rows)
         got_y, got_x = load_centroids_band_chunked(
             loader, sym, meta, r_mu, False, MESH, (0, nb),
             band_chunk_size=nb, k_chunk_size=1)
 
+        assert "phase_per_full" not in loader._ensure_phdf5_static()
         assert len(load_requests) == len(groups)
         for request, (parent, children) in zip(load_requests, groups):
             if len(children) == 1:
@@ -675,6 +684,12 @@ def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
         assert len(raw_parent_rows) == len(set(raw_parent_rows))
         assert len(fft_k_extents) == nk_full
         assert fft_k_extents == [1] * nk_full
+        expected_phase_children = [
+            int(child)
+            for _, children in groups if len(children) > 1
+            for child in children
+        ]
+        assert phase_requests == [(child,) for child in expected_phase_children]
         np.testing.assert_allclose(
             np.asarray(got_y), np.asarray(ref_y), rtol=1e-10, atol=1e-12)
         np.testing.assert_allclose(

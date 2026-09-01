@@ -2533,8 +2533,13 @@ def load_centroids_band_chunked(
     # A caller-provided G-flat tensor is already in memory_stats(); only price
     # it here when this call will allocate it.  This avoids double-charging
     # htransform's shared-window reuse path.
+    # Every loader unfold stages request-local c128 nonsymmorphic phase rows.
+    # They are deliberately uncached to keep extreme-G parent streaming O(1)
+    # in k; charge the maximum rows held by this call alongside G-flat data.
+    phase_rows = k_tile if stream_tiles else nk_tot
+    request_phase_bytes = phase_rows * int(loader.ngkmax) * 16
     new_gflat_bytes = (
-        gflat_local_bytes + parent_reuse_extra_bytes
+        gflat_local_bytes + parent_reuse_extra_bytes + request_phase_bytes
         if psi_G_flat is None else 0
     )
     persistent_bytes = (

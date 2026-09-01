@@ -15,7 +15,7 @@ def test_nvidia_smi_memory_query_uses_this_ranks_visible_gpu(monkeypatch):
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
     monkeypatch.setattr(gpu_utils.subprocess, "run", run)
-    assert gpu_utils.get_gpu_used_memory_bytes_nvidia_smi() == 2_000_000_000
+    assert gpu_utils.get_gpu_used_memory_bytes_nvidia_smi() == 2_147_483_648
     assert seen["argv"] == [
         "nvidia-smi", "--id=3", "--query-gpu=memory.used",
         "--format=csv,noheader,nounits",
