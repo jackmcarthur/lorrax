@@ -151,6 +151,24 @@ def test_scalapack_plan_never_warms_with_production_sized_zeros(monkeypatch):
     assert calls == [{"mesh": mesh, "dtype": jnp.dtype(jnp.complex128)}]
 
 
+@pytest.mark.parametrize(
+    "m,k,n,label", [(5, 4, 4, "m"), (4, 5, 4, "k"), (4, 4, 5, "n")])
+def test_scalapack_plan_refuses_each_nondivisible_face_before_ffi(
+        monkeypatch, m, k, n, label):
+    """Logical extents need an explicit caller-owned pad, never rounding."""
+    import importlib
+    plan_mod = importlib.import_module("distrib_la.matmul_plan")
+    mesh = _mesh()
+    monkeypatch.setattr(
+        plan_mod, "resolve_matmul_backend",
+        lambda *args, **kwargs: "scalapack")
+
+    with pytest.raises(ValueError, match=rf"{label}=5 does not tile"):
+        plan_mod.gemm_plan(
+            mesh, m=m, k=k, n=n, nq=2, dtype="complex128",
+            backend="auto")
+
+
 # ---------------------------------------------------------------------------
 # ``GemmPlan.__call__``'s own Python-level guards -- shape/dtype/sharding
 # and the out=/beta interaction -- are pure checks on static metadata, run

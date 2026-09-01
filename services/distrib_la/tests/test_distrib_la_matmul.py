@@ -8,6 +8,23 @@ from lxkit.testing import require_devices
 import distrib_la as D
 
 
+class _FakeDevice:
+    def __init__(self, process_index, platform="cpu"):
+        self.process_index = process_index
+        self.platform = platform
+
+
+class _FakeProviderMesh:
+    axis_names = ("x", "y")
+
+    def __init__(self, px=2, py=2, platform="cpu"):
+        self.shape = {"x": px, "y": py}
+        self.devices = np.asarray([
+            [_FakeDevice(ix * py + iy, platform) for iy in range(py)]
+            for ix in range(px)
+        ])
+
+
 def _mesh():
     import jax
     from jax.sharding import Mesh
@@ -92,6 +109,42 @@ def test_provider_vocabulary_and_off_refusal():
         D.resolve_matmul_backend("off", mesh)
 
 
+def test_cpu_auto_resolves_to_exact_scalapack_target(monkeypatch):
+    """A successful CPU auto probe is a promise, not a preference hint."""
+    import importlib
+    from lxkit.probe import AVAILABLE
+    public_matmul = importlib.import_module("distrib_la.matmul")
+    seen = []
+
+    monkeypatch.setattr(public_matmul.jax, "process_count", lambda: 4)
+    monkeypatch.setattr(
+        public_matmul.loader, "probe_target",
+        lambda target, platform: seen.append((target, platform)) or AVAILABLE)
+
+    got = D.resolve_matmul_backend("auto", _FakeProviderMesh())
+    assert got == "scalapack"
+    assert seen == [("lorrax_scalapack_batched_gemm", "cpu")]
+
+
+def test_cpu_auto_never_demotes_a_failed_scalapack_probe(monkeypatch):
+    """A missing PBLAS handler refuses with its reason; no local fallback."""
+    import importlib
+    from lxkit.probe import ProbeResult
+    public_matmul = importlib.import_module("distrib_la.matmul")
+    seen = []
+
+    monkeypatch.setattr(public_matmul.jax, "process_count", lambda: 4)
+
+    def _failed_probe(target, platform):
+        seen.append((target, platform))
+        return ProbeResult(False, "synthetic missing pzgemm provider")
+
+    monkeypatch.setattr(public_matmul.loader, "probe_target", _failed_probe)
+    with pytest.raises(RuntimeError, match="synthetic missing pzgemm provider"):
+        D.resolve_matmul_backend("auto", _FakeProviderMesh())
+    assert seen == [("lorrax_scalapack_batched_gemm", "cpu")]
+
+
 def test_mesh_axes_must_be_exact_and_y_minor():
     import jax
     from jax.sharding import Mesh
@@ -143,6 +196,11 @@ def test_slate_provider_refuses_rectangular_before_ffi(monkeypatch):
         D.resolve_matmul_backend("slate", FakeMesh())
     assert "validate_mesh(mesh, require_square=True)" in inspect.getsource(
         slate.batched_distributed_matmul)
+
+
+def test_scalapack_provider_refuses_rectangular_before_ffi():
+    with pytest.raises(ValueError, match="needs a square mesh"):
+        D.resolve_matmul_backend("scalapack", _FakeProviderMesh(px=1, py=2))
 
 
 def test_transposed_output_face_refuses_before_zero_c_placement():
