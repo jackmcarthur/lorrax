@@ -405,6 +405,38 @@ def record(name: str, seconds: float, *, count: int = 1) -> None:
 	_GLOBAL_COLLECTOR.record(name, seconds, count=count)
 
 
+def completion_receipt(
+	label: str,
+	*completed: Any,
+	started_at: float | None = None,
+	announce: bool = True,
+) -> float | None:
+	"""Synchronize a completed stage and emit one flushed rank-0 receipt.
+
+	This is the loop-cadence sibling of :func:`section`: use it at a coarse
+	Python-loop lifetime boundary that already must synchronize its result.
+	Every supplied value is blocked on EVERY rank before rank 0 speaks, so a
+	receipt cannot get ahead of asynchronous JAX work or leave peer ranks
+	running the previous body.  ``announce=False`` preserves the synchronization
+	while suppressing output.  No timing-tree row is added: callers are normally
+	already inside an owning section, and recording this elapsed time again would
+	double-count it in the final report.
+	"""
+	for value in completed:
+		blocker = getattr(value, "block_until_ready", None)
+		if not callable(blocker):
+			raise TypeError(
+				f"completion_receipt {label!r} requires values with "
+				"block_until_ready()")
+		blocker()
+	elapsed = (None if started_at is None
+	           else max(0.0, time.perf_counter() - float(started_at)))
+	if announce and _rank0():
+		suffix = "" if elapsed is None else f"  {elapsed:.1f} s"
+		_trace(f"{label} complete{suffix}")
+	return elapsed
+
+
 def records() -> list[dict[str, Any]]:
 	"""Structured snapshot of the global timing collector."""
 	return _GLOBAL_COLLECTOR.records()

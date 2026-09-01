@@ -19,12 +19,14 @@ never gathered or held beside another block.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+import common.timing as timing
 from common.collectives import device_put_process_local
 
 
@@ -345,6 +347,7 @@ def compute_static_photon_sigma(
         left_g = with_lorentz_vertices(left, A, 0)
         n_left = _padded_centroid_extent(left)
         for B in _CHANNELS:
+            block_started = time.perf_counter()
             right = _bundle_for_channel(wfns_charge, wfns_transverse, B)
             right_g = with_lorentz_vertices(right, 0, B)
             n_right = _padded_centroid_extent(right)
@@ -426,9 +429,9 @@ def compute_static_photon_sigma(
             # Synchronize the small accumulator before advancing the block.
             # This is the lifetime boundary that prevents two W/G body tiles
             # from coexisting through asynchronous dispatch.
-            sig_coh.block_until_ready()
-            if verbose and jax.process_index() == 0:
-                print_fn(f"  packed photon COHSEX block ({A},{B}) complete")
+            timing.completion_receipt(
+                f"packed photon COHSEX block ({A},{B})", sig_coh,
+                started_at=block_started, announce=verbose)
 
     from .cohsex_sigma import _replicate_band_sigma
     sig_x = _replicate_band_sigma(sig_x, mesh_xy)

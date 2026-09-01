@@ -20,6 +20,7 @@ logical blocks remain the portable on-disk representation.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Mapping
@@ -29,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+import common.timing as timing
 from runtime.padding import padded_mu_extent
 
 
@@ -203,6 +205,7 @@ def _insert(packed, block, layout, A, B, mesh_xy):
 def pack_photon_operator(
     get_block: Callable[[int, int], jax.Array | None], nq: int,
     layout: PhotonBasisLayout, mesh_xy: Mesh, *, dtype=jnp.complex128,
+    progress_label: str | None = None,
 ) -> jax.Array:
     """Stream sixteen blocks into one packed ``P(None,'x','y')`` operator.
 
@@ -210,12 +213,15 @@ def pack_photon_operator(
     Each insertion is completed before the next callback so the consumed
     block's device buffer is released before another response block can be
     allocated.  Peak residency is therefore the accumulator plus one block,
-    and T1/T2/T3 never imply wavefunction copies.
+    and T1/T2/T3 never imply wavefunction copies.  ``progress_label`` opts
+    this same completion boundary into the incumbent timing stream: one
+    flushed rank-0 receipt per present block, after the packed update is ready.
     """
     layout.assert_mesh(mesh_xy)
     packed = _empty(nq, layout, mesh_xy, dtype)
     for A in range(N_LORENTZ):
         for B in range(N_LORENTZ):
+            block_started = time.perf_counter()
             block = get_block(A, B)
             # Missing physical channels are exact zero blocks.  Keeping this
             # case in the sole packer avoids a second packing graph and a
@@ -228,7 +234,12 @@ def pack_photon_operator(
             # dependency alone does not prevent two block outputs from being
             # allocated at once.  This is the explicit one-block lifetime
             # boundary promised by the streaming contract above.
-            packed.block_until_ready()
+            if progress_label is None:
+                packed.block_until_ready()
+            else:
+                timing.completion_receipt(
+                    f"{progress_label} block ({A},{B})", packed,
+                    started_at=block_started)
     return packed
 
 

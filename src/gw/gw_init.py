@@ -53,6 +53,7 @@ from .gw_config import (
 	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
 	uses_coupled_photon_head,
+	uses_static_photon_response,
 )
 
 # ── The ζ file's DOOR ────────────────────────────────────────────────────
@@ -3081,6 +3082,25 @@ def build_wavefunction_bundle(
 	return wfns
 
 
+def _needs_scalar_head_wavefunctions(representation, cfg) -> bool:
+	"""Whether the separate canonical two-spinor head bundle has a consumer.
+
+	Packed static-photon screening completes its coupled charge/current q=0
+	response inside :func:`gw.w_isdf.compute_static_photon_response`; it never
+	uses the scalar DFT head/wings branch in ``gw_jax``.  Keep the established
+	non-photon predicate otherwise unchanged so ordinary normalized kinetic
+	balance FULL-head calculations still build exactly the same bundle.
+	"""
+	return (
+		not uses_static_photon_response(cfg)
+		and representation.charge_representation ==
+		ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION
+		and bool(cfg.compute_mode.needs_screening)
+		and str(getattr(
+			cfg.head.correction, "value", cfg.head.correction)) == "full"
+	)
+
+
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
 	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None,
@@ -3863,11 +3883,7 @@ def prepare_isdf_and_wavefunctions(
 	# head-only and fresh-only (the mode's restart gate fired above); H0 and the
 	# finite-q normalized body remain untouched.
 	wfns_scalar_head = None
-	if (representation.charge_representation ==
-			ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION
-			and bool(cfg.compute_mode.needs_screening)
-			and str(getattr(cfg.head.correction, "value", cfg.head.correction)) ==
-			"full"):
+	if _needs_scalar_head_wavefunctions(representation, cfg):
 		meta_head = replace(
 			meta, nspinor=int(wfn.nspinor), npol=int(wfn.nspinor))
 		meta_head.sys_dim = meta.sys_dim
