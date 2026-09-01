@@ -688,7 +688,7 @@ def check_distributed_matmul(mesh, dtype="complex128", *,
 
 def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
                              m=None, k=None, n=None,
-                             backend="cublasmp"):
+                             backend="cublasmp", expected_backend=None):
     """``distrib_la.gemm_plan``/``GemmPlan``: numerics, nested ``jit``,
     ``lax.scan`` reuse, the donated ``out=`` path, the ``beta!=0``
     accumulate path, and the internal-zero-``C`` path -- all against an
@@ -717,7 +717,8 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
 
     plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
                        backend=backend)
-    assert plan.backend == backend
+    expected_backend = expected_backend or backend
+    assert plan.backend == expected_backend
     assert plan.describe(), "describe() must produce a non-empty banner line"
     out = {}
 
@@ -803,13 +804,16 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
     return out
 
 
-def check_gemm_plan_scalapack(mesh, dtype="complex128"):
+def check_gemm_plan_scalapack(mesh, dtype="complex128", *,
+                              backend="scalapack"):
     """The planned global-call contract through the canonical PBLAS path.
 
     The first exact-shape use deliberately occurs inside ``jit`` + ``scan``.
     PBLAS plan construction warms only a scalar tile per rank, so this is the
     regression gate for trace-safe cold exact-shape composition without
-    production-sized dummy operands.
+    production-sized dummy operands.  ``backend='auto'`` is the production
+    call shape used by the face-layout GW kernels; its resolved provider must
+    still be ScaLAPACK on this CPU mesh.
     """
     import jax
 
@@ -822,7 +826,8 @@ def check_gemm_plan_scalapack(mesh, dtype="complex128"):
     A = _put(A_np, mesh, (None, None, "x", "y"))
     B = _put(B_np, mesh, (None, None, "x", "y"))
     plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
-                       backend="scalapack")
+                       backend=backend)
+    assert plan.backend == "scalapack"
 
     @jax.jit
     def _cold_scan(A_steps, B_steps):
@@ -833,8 +838,10 @@ def check_gemm_plan_scalapack(mesh, dtype="complex128"):
 
     cold_rel = _rel(_gather(_cold_scan(A, B)), A_np @ B_np)
     assert cold_rel < RTOL, cold_rel
-    out = check_gemm_plan_cublasmp(mesh, dtype, backend="scalapack")
+    out = check_gemm_plan_cublasmp(
+        mesh, dtype, backend=backend, expected_backend="scalapack")
     out["cold_first_scan"] = cold_rel
+    out["resolved_backend"] = plan.backend
     return out
 
 
@@ -1211,6 +1218,9 @@ _CLI_CELLS = [
      lambda mesh, dt: check_gemm_plan_cublasmp(mesh, dt)),
     ("gemm_plan_scalapack", "cpu",
      lambda mesh, dt: check_gemm_plan_scalapack(mesh, dt)),
+    ("gemm_plan_scalapack_auto", "cpu",
+     lambda mesh, dt: check_gemm_plan_scalapack(
+         mesh, dt, backend="auto")),
     ("gemm_plan_manual_shard_map", "CUDA",
      lambda mesh, dt: check_gemm_plan_manual_shard_map(mesh, dt)),
 ]
