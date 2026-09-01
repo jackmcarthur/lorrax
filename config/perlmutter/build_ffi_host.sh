@@ -314,6 +314,7 @@ fi
 cmake "$SRC" \
     "${FFTW_ARGS[@]}" \
     -DLORRAX_FFI_PLATFORM=host \
+    -DLORRAX_HOST_HAVE_SLATE=OFF \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC \
     -DLORRAX_XLA_FFI_INCLUDE_DIR="$LORRAX_XLA_FFI_HEADERS_DIR" \
@@ -472,7 +473,7 @@ unset _dynsyms
 # what turns "ScaLAPACK/BLACS not found" from a CMake WARNING into a build
 # failure — the Aug-7 deployed library shipped with scalapack=0 because
 # nothing anywhere said what it was supposed to contain.
-LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,slate,phdf5,fft}" \
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,phdf5,fft}" \
 LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-libmpi_gnu}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
 LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
