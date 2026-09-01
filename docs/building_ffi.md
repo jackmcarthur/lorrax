@@ -158,7 +158,7 @@ below has cost somebody a build.
 | lever | what it selects | the trap |
 |---|---|---|
 | `LORRAX_FFI_EXPECT_BACKENDS` | what the build must contain | omit it and you inherit the full set — deliberately, so a silent reduction fails |
-| the BLAS/ScaLAPACK link line | ScaLAPACK + C-BLACS | CMake's probe expects an MKL layout; on anything else pass `-DLORRAX_SCALAPACK_LIBRARIES` as a whole link line |
+| the BLAS/ScaLAPACK link line | ScaLAPACK + C-BLACS | CMake's probe expects MKL; another `-DLORRAX_SCALAPACK_LIBRARIES` line must use LP64 (32-bit Fortran `INTEGER`) and conventional underscore symbols. ILP64 may link under the same names and corrupt descriptors. |
 | the BLAS module | which BLAS is linked | leaving it loaded lets the compiler wrapper inject a *second* flavour on top of yours — GATE 2 |
 | the FFTW module | where the FFT engine lives | it must reach CMake as a **dlopen hint** only; on the link line it becomes `DT_NEEDED` and the library stops loading anywhere that SONAME is absent — GATE 5 |
 | the HDF5 module (`LORRAX_PM_HDF5` on Cray) | the SOVERSION the host leg **links** | this, not the stage variable, is the real lever |

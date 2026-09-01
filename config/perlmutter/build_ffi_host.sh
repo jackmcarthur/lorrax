@@ -264,28 +264,8 @@ fi
 # survive a LibSci upgrade or a move to netlib/AOCL.
 # ---------------------------------------------------------------------------
 SCALAPACK_SO="$LORRAX_PM_LIBSCI_DIR/lib/libsci_gnu_mpi${LORRAX_PM_LIBSCI_FLAVOUR}.so"
-# Dump the symbol table ONCE.  Do not pipe nm into `grep -q` in a loop: under
-# `set -o pipefail`, grep -q exits on first match and closes the pipe, nm dies
-# of SIGPIPE, and the pipeline reports failure — which reads as "symbol
-# missing" for every symbol that IS present.  (Cost me one false gate trip.)
-_symtab="$(nm -D --defined-only "$SCALAPACK_SO" 2>/dev/null || true)"
-if [[ -z "$_symtab" ]]; then
-    echo "[build_ffi_host] ERROR: could not read symbols from $SCALAPACK_SO" >&2
-    exit 2
-fi
-missing=""
-for sym in pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_ \
-           pzgemm_ pdgemm_ \
-           numroc_ descinit_ Csys2blacs_handle Cblacs_gridinit Cblacs_gridinfo; do
-    grep -qE "[[:space:]]${sym}\$" <<<"$_symtab" || missing="$missing $sym"
-done
-unset _symtab
-if [[ -n "$missing" ]]; then
-    echo "[build_ffi_host] ERROR: $SCALAPACK_SO is missing:$missing" >&2
-    echo "[build_ffi_host] Pass an explicit -DLORRAX_SCALAPACK_LIBRARIES instead." >&2
-    exit 2
-fi
-echo "[build_ffi_host] pre-flight: all 13 ScaLAPACK/BLACS symbols present in $(basename "$SCALAPACK_SO")"
+bash "$LORRAX_ROOT/src/ffi/cpp/scalapack/check_symbol_contract.sh" \
+    provider "$SCALAPACK_SO"
 
 # ---------------------------------------------------------------------------
 # Configure + build.

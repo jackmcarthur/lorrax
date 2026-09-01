@@ -71,8 +71,8 @@
 #   libmkl_scalapack_lp64 +       ScaLAPACK + C-BLACS     Cray LibSci
 #   libmkl_blacs_intelmpi_lp64    (13 Fortran-ABI names,  (libsci_*_mpi_*),
 #   (+ the mkl_intel/thread/core  hand-declared in        netlib, AOCL, or
-#   layers they need)             cpp/scalapack/          SLATE's own
-#                                 blacs_grid.h)           libslate_scalapack_api
+#   layers they need)             cpp/scalapack/          netlib or AOCL
+#                                 blacs_grid.h)           (LP64 ABI only)
 #   libmkl_intel_lp64 (CBLAS)     cblas_dgemm/zgemm       OpenBLAS, BLIS,
 #                                 (+ an OPTIONAL batched  LibSci, ATLAS
 #                                 extension asked for at
@@ -100,11 +100,12 @@
 # runtime symptoms map back like this:
 #
 #   cannot resolve pzheevd_/pdsyevd_/pzgetrf_/pdgetrf_/pzgetrs_/pdgetrs_/
-#   numroc_/descinit_/Csys2blacs_handle/Cblacs_gridinit/Cblacs_gridinfo
+#   pzgemm_/pdgemm_/numroc_/descinit_/Csys2blacs_handle/
+#   Cblacs_gridinit/Cblacs_gridinfo
 #       -> no ScaLAPACK+BLACS was linked.  Set LORRAX_MKL_ROOT, or pass
-#       LORRAX_SCALAPACK_LIBRARIES.  Those ELEVEN names are the ENTIRE
-#       ScaLAPACK surface LORRAX uses — measured as the complete
-#       undefined-symbol set of the two handler objects outside libc.
+#       LORRAX_SCALAPACK_LIBRARIES.  Those THIRTEEN names are the complete
+#       numerical/grid surface. The explicit link line must be LP64
+#       (32-bit Fortran INTEGER); an ILP64 library is ABI-incompatible.
 #   cannot resolve cblas_dgemm/cblas_zgemm  -> a CBLAS header was found but
 #       its library was not on the link line.  (cblas_?gemm_batch will never
 #       appear here; it is looked up at runtime and its absence just selects

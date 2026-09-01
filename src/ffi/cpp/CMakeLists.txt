@@ -1015,7 +1015,7 @@ endif()
 #            symbols listed below,     and libmkl_blacs_<mpi>_lp64),
 #            declared in scalapack/    Cray LibSci (libsci_*_mpi_*), netlib
 #            cpp/blacs_grid.h)         ScaLAPACK, AMD AOCL.  NOT SLATE's
-#                                      libslate_scalapack_api: 6/13, and
+#                                      libslate_scalapack_api: 8/13, and
 #                                      refused -- see RESOLVE 1/4 below.
 #  mklblas   CBLAS (cblas_dgemm /      Intel MKL, Cray LibSci, OpenBLAS,
 #            cblas_zgemm; the batched  BLIS, ATLAS.  Only the *_batch entry
@@ -1040,9 +1040,9 @@ endif()
 #  Two capabilities were silently lost as a result:
 #    * no SLATE install  ->  ScaLAPACK eigh/LU, GEMM and FFT handlers ALL
 #      dropped, though none of them calls SLATE (proved by compiling
-#      cpp/scalapack/{eigh,solve_lu}_ffi.cc and mkl{fft,blas}/cpp/*.cc with
-#      only the XLA-FFI and MPI header paths — they need no SLATE header, and
-#      the resulting objects reference no slate symbol);
+#      cpp/scalapack/{eigh,solve_lu,getrf_getrs,gemm}_ffi.cc and the FFT/CBLAS
+#      sources with only the XLA-FFI and MPI header paths — they need no SLATE
+#      header, and the resulting objects reference no slate symbol);
 #    * ScaLAPACK given explicitly via -DLORRAX_SCALAPACK_LIBRARIES  ->  the
 #      FFT handlers were not merely skipped, they were never reached, so the
 #      configure log said nothing at all about them.
@@ -1056,14 +1056,14 @@ endif()
 #
 #  unresolved at load: any of
 #         pzheevd_  pdsyevd_  pzgetrf_  pdgetrf_  pzgetrs_  pdgetrs_
+#         pzgemm_   pdgemm_
 #         numroc_   descinit_ Csys2blacs_handle  Cblacs_gridinit
 #         Cblacs_gridinfo
 #      -> no ScaLAPACK+BLACS on the link line.  Set -DLORRAX_MKL_ROOT (or
 #         $MKLROOT), or pass a whole -DLORRAX_SCALAPACK_LIBRARIES link line.
-#         Those ELEVEN names are the entire ScaLAPACK surface LORRAX uses —
-#         the complete undefined-symbol set of solve_lu_ffi.cc + eigh_ffi.cc
-#         outside libc, measured, not estimated.  Anything implementing them
-#         can back these handlers.
+#         Those THIRTEEN names are the entire numerical/grid ScaLAPACK
+#         surface LORRAX uses.  Anything implementing the conventional LP64
+#         (32-bit Fortran INTEGER), underscore-symbol ABI can back them.
 #  unresolved at load: cblas_dgemm / cblas_zgemm
 #      -> the CBLAS came from a header-only prefix with no library on the
 #         link line.  cblas_?gemm_batch will NEVER appear here: it is looked
@@ -1090,7 +1090,7 @@ endif()
 #  ===========================================================================
 
 option(LORRAX_HOST_HAVE_SCALAPACK
-       "Build the ScaLAPACK host handlers (distributed eigh + fused LU)" ON)
+       "Build the ScaLAPACK/PBLAS host handlers (eigh, LU, and GEMM)" ON)
 
 # Accumulators.  Nothing is appended to LORRAX_FFI_HOST_SOURCES /
 # _host_link_libs / _host_rpaths in the RESOLVE half — the APPEND half
@@ -1105,7 +1105,7 @@ set(_mklblas_on       0)
 
 # ----------------------------------------------------------------------------
 #  RESOLVE 1/4 — ScaLAPACK + C-BLACS.  Required by cpp/scalapack/*_ffi.cc
-#  (pXgetrf / pXgetrs / pXheevd / Cblacs_gridinit / descinit / numroc;
+#  (pXgetrf / pXgetrs / pXheevd / pXgemm / Cblacs_gridinit / descinit / numroc;
 #  prototypes hand-declared in cpp/scalapack/blacs_grid.h because ScaLAPACK
 #  ships no vendor-neutral C header).
 #
@@ -1117,9 +1117,9 @@ set(_mklblas_on       0)
 #      block COMMENTED OUT ("# todo: requires ScaLAPACK"), so a CMake install
 #      never contains libslate_scalapack_api regardless of that setting.
 #    * Even when built from the GNUmakefile (or
-#      cpp/stage/slate_build_scalapack_api.sh), that library defines six of
-#      the thirteen names below — the solver routines, none of GEMM or
-#      grid/descriptor tools, and it CALLS numroc_ / Cblacs_gridinfo itself.
+#      cpp/stage/slate_build_scalapack_api.sh), that library defines eight of
+#      the thirteen names below — the eig/LU/GEMM compute routines, none of
+#      the grid/descriptor tools, and it CALLS numroc_ / Cblacs_gridinfo.
 #      It is an OVERLAY on a real ScaLAPACK, never a provider.  LORRAX
 #      REFUSES it at run time (cpp/scalapack/blacs_grid.h) because its
 #      pXheevd is bug L-2, its shims hard-code MPI_COMM_WORLD, and they
@@ -1128,10 +1128,11 @@ set(_mklblas_on       0)
 #  -DCMAKE_SHARED_LINKER_FLAGS on every configure — that gap is closed here.
 #
 #  Resolution order:
-#    1. -DLORRAX_SCALAPACK_LIBRARIES="<link line>" — vendor-agnostic escape
-#       hatch (Cray LibSci, netlib, AOCL, ...; NOT SLATE's overlay — see
-#       above).  A CMake list or a space-separated string; raw `-l`/`-L`
-#       flags are fine.
+#    1. -DLORRAX_SCALAPACK_LIBRARIES="<link line>" — vendor-agnostic LP64
+#       escape hatch (Cray LibSci, netlib, AOCL, ...; NOT SLATE's overlay —
+#       see above).  It must expose 32-bit Fortran INTEGER and conventional
+#       underscore symbols. A CMake list or a space-separated string; raw
+#       `-l`/`-L` flags are fine.
 #    2. MKL, probed under -DLORRAX_MKL_ROOT / $MKLROOT.  This is the Frontera
 #       path (MKL 2020.1 at
 #       /opt/intel/compilers_and_libraries_2020.1.217/linux/mkl).
@@ -1148,7 +1149,7 @@ set(_mklblas_on       0)
 if(LORRAX_HOST_HAVE_SCALAPACK)
     if(NOT DEFINED LORRAX_SCALAPACK_LIBRARIES AND DEFINED ENV{LORRAX_SCALAPACK_LIBRARIES})
         set(LORRAX_SCALAPACK_LIBRARIES "$ENV{LORRAX_SCALAPACK_LIBRARIES}" CACHE STRING
-            "Full ScaLAPACK+BLACS link line (overrides the MKL probe)")
+            "Full LP64 ScaLAPACK+BLACS link line (overrides the MKL probe)")
     endif()
     if(LORRAX_SCALAPACK_LIBRARIES)
         separate_arguments(_host_math_link UNIX_COMMAND
@@ -1193,7 +1194,7 @@ if(LORRAX_HOST_HAVE_SCALAPACK)
         else()
             message(WARNING
                 "ScaLAPACK/BLACS not found — the ScaLAPACK host handlers "
-                "(distributed eigh + fused LU) are NOT built, and "
+                "(distributed eigh, LU, and PBLAS GEMM) are NOT built, and "
                 "ffi_loader.has_target('lorrax_scalapack_eigh') will "
                 "correctly answer no.  Set -DLORRAX_MKL_ROOT (or \$MKLROOT), "
                 "or pass a full -DLORRAX_SCALAPACK_LIBRARIES link line "
