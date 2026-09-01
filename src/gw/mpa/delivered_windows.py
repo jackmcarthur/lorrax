@@ -5,12 +5,11 @@ retarded broadening ``eta``.  It divides each causal branch into a few
 ``state interval x pole interval`` windows, measures their weighted reciprocal
 problems, and assigns each window part of the global error budget.
 
-Sign-definite windows start from shipped noncrossing minimax tables.  Their
-certificate chain is: catalog range and scaled sup-norm bound, physical
-rescaling by the smallest gap, achieved error on the fitting lattice, achieved
-error on the refined validation lattice, and the runtime-noise gate.  A table
-that misses the measured gate is replaced by the next tighter or wider shipped
-table.  Crossing windows first try shipped HGL tables and otherwise perform one
+Sign-definite windows fit Hackbusch-seeded noncrossing rules on demand.  Their
+acceptance chain is: achieved error on the fitting lattice, achieved error on
+the refined validation lattice, and the runtime-noise gate.  An off-axis rule
+that misses those gates falls back to the general measure-adapted fitter.
+Crossing windows first try shipped HGL tables and otherwise perform one
 deterministic fixed-time weight fit.  The planner never evaluates explicit
 state--pole pairs.
 
@@ -1344,8 +1343,10 @@ def _sign_definite_orientation(problem):
         "sign-definite product support crosses an axis and cannot be served")
 
 
-def _sign_definite_table_candidates(problem, relative_target, max_nodes):
-    """Yield rescaled noncrossing tables in conservative walk order."""
+def _sign_definite_candidates(problem, relative_target, max_nodes):
+    """Yield on-demand noncrossing rules until the consumer accepts one."""
+    from minimax import noncrossing_grids  # noqa: PLC0415
+
     rotated, transform = _sign_definite_orientation(problem)
     x_min = float(np.min(rotated.real))
     x_max = float(np.max(rotated.real))
@@ -1355,34 +1356,36 @@ def _sign_definite_table_candidates(problem, relative_target, max_nodes):
     range_value = x_max / x_min
     absolute_target = _absolute_kernel_target(problem, relative_target)
     scaled_target = absolute_target * x_min
-    entries = _catalog_walk(
-        "noncrossing", range_value, scaled_target, max_nodes)
-    if not entries:
-        raise RuntimeError(
-            "no shipped noncrossing table covers "
-            f"R={range_value:.6g}, scaled target={scaled_target:.6g}, "
-            f"and max_nodes={int(max_nodes)}")
-    for entry in entries:
-        served = _load_catalog_entry(
-            entry, family="noncrossing", target="inverse")
-        tau = np.asarray(served.nodes, np.float64) / x_min
-        alpha = np.asarray(served.weights, np.float64) / x_min
+    next_rank = 2
+    while next_rank <= int(max_nodes):
+        tau, alpha, rank, achieved = noncrossing_grids(
+            range_value, scaled_target, N_start=next_rank,
+            N_max=int(max_nodes) if next_rank == 2 else next_rank)
+        tau = np.asarray(tau, np.float64) / x_min
+        alpha = np.asarray(alpha, np.float64) / x_min
         if transform.startswith("positive"):
             times, weights = 1.0j * tau, alpha
         else:
             times, weights = -1.0j * tau, -alpha
         yield np.asarray(times), np.asarray(weights), {
-            "family": "noncrossing",
+            "family": "noncrossing_on_demand",
             "transform": transform,
             "requested_range": range_value,
-            "table_range": float(entry.range_max),
+            "fit_range": float(range_value),
             "requested_scaled_error": scaled_target,
-            "catalog_error_bound_scaled": float(entry.error_bound),
-            "certificate_abs_error_bound": float(entry.error_bound / x_min),
-            "catalog_achieved_abs_error": float(served.max_error / x_min),
-            "candidate_tolerance": float(entry.error_bound),
-            "provenance": served.provenance.one_line(),
+            "fit_achieved_abs_error": float(achieved / x_min),
+            "candidate_tolerance": float(scaled_target),
+            "provenance": (
+                f"on-demand Hackbusch-seeded noncrossing fit, R "
+                f"{range_value:.6g}, rank {int(rank)}"),
         }
+        # A real-axis fit already at roundoff carries no information about
+        # an off-axis miss.  More ranks solve the same degenerate real problem,
+        # so hand that support to the general measure-adapted fallback.
+        if (int(rank) >= int(max_nodes)
+                or float(achieved) <= 16.0 * np.finfo(np.float64).eps):
+            return
+        next_rank = int(rank) + 1
 
 
 def _crossing_geometry(problem, pole_sign):
@@ -1638,15 +1641,15 @@ def _factor_growth(spec, times, eta):
 
 def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
                             relative_target):
-    """Measure-adapted rule for ONE crossing window, or None to fall back.
+    """Measure-adapted rule for one window, or ``None`` to fall back.
 
     Node count is the runtime currency: one node is one FFT(G_w W_w).  The
     shipped path fits crossing windows on the real-time contour, which is
     measurably the wrong operating point — on this deck it spends more nodes
     and runs at kappa_p99 15.9/30.9 where a rotated contour meets the same
-    targets near kappa 1.1.  Sign-definite windows are NOT routed here: their
-    certified imaginary-axis tables already cost 8-12 nodes and are served by
-    lookup, which nothing measured beats.
+    targets near kappa 1.1.  Sign-definite windows normally use the cheaper
+    on-demand noncrossing fit; this general fitter is retained only as the
+    accuracy-preserving fallback for an off-axis support it cannot serve.
     """
     from minimax import RoqWindow, plan_measure_adapted_roq  # noqa: PLC0415
 
@@ -1818,7 +1821,7 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
 
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
                       relative_target, *, adapted_only=False):
-    """Rules for one window: rotated ROQ if it crosses, else shipped lookup.
+    """Rules for one window: rotated ROQ or on-demand noncrossing fit.
 
     The single routing decision, at module level so the planner, the tests and
     the offline node audit all take the same path.
@@ -1884,7 +1887,7 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 max_nodes)
         rule_rows = rules()
     else:
-        rule_rows = _sign_definite_table_candidates(
+        rule_rows = _sign_definite_candidates(
             spec["problem"], relative_target, max_nodes)
     iterator = iter(rule_rows)
     while True:
@@ -1932,6 +1935,14 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 "family": evidence.get("family", "unknown"),
                 "candidate_tolerance": evidence.get("candidate_tolerance"),
                 "refusal": str(exc)})
+    if spec["kind"] != "crossing":
+        fallback = _roq_crossing_candidate(
+            spec, eta, max_nodes, factor_growth_cap, relative_target)
+        if fallback is not None:
+            fallback["attempts"] = attempts
+            fallback["evidence"]["provenance"] += (
+                "; noncrossing fit missed refined consumer gates")
+            return [fallback]
     residual, amplification = best_pair
     raise _ProductWindowRefusal(
         f"delivered product window {spec['name']!r} refused: achieved "
@@ -2506,6 +2517,10 @@ def build_delivered_sigma_windows(
                 "certificate_abs_error_bound"),
             "catalog_achieved_abs_error": fit["evidence"].get(
                 "catalog_achieved_abs_error"),
+            "fit_achieved_abs_error": fit["evidence"].get(
+                "fit_achieved_abs_error"),
+            "requested_range": fit["evidence"].get("requested_range"),
+            "fit_range": fit["evidence"].get("fit_range"),
             "fit_provenance": fit["evidence"]["provenance"],
         })
 
