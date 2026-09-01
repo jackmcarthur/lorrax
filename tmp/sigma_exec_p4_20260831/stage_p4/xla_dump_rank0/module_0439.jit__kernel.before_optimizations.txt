@@ -1,0 +1,189 @@
+HloModule jit__kernel, entry_computation_layout={(c128[21,512,24,24]{3,2,1,0}, c128[512,24,24]{2,1,0}, s32[512,24]{1,0}, s32[512,24]{1,0}, c128[512,24]{1,0}, /*index=5*/c128[512,24]{1,0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false,false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/qsgw_utils.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "build_qsgw_sigma_xc"
+6 "_qsgw_build_kernel.<locals>._kernel"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1128 column=15 end_column=54}
+5 {file_name_id=3 function_name_id=4 line=467 end_line=470 column=35 end_column=9}
+6 {file_name_id=4 function_name_id=5 line=701 end_line=705 column=20 end_column=5}
+7 {file_name_id=4 function_name_id=6 line=580 end_line=580 column=16 end_column=31}
+8 {file_name_id=4 function_name_id=6 line=576 end_line=576 column=37 end_column=58}
+9 {file_name_id=4 function_name_id=6 line=576 end_line=576 column=20 end_column=64}
+10 {file_name_id=4 function_name_id=6 line=578 end_line=578 column=19 end_column=60}
+11 {file_name_id=4 function_name_id=6 line=580 end_line=580 column=41 end_column=56}
+12 {file_name_id=4 function_name_id=6 line=577 end_line=577 column=37 end_column=58}
+13 {file_name_id=4 function_name_id=6 line=577 end_line=577 column=20 end_column=64}
+14 {file_name_id=4 function_name_id=6 line=579 end_line=579 column=19 end_column=60}
+15 {file_name_id=4 function_name_id=6 line=586 end_line=586 column=16 end_column=31}
+16 {file_name_id=4 function_name_id=6 line=582 end_line=582 column=37 end_column=58}
+17 {file_name_id=4 function_name_id=6 line=582 end_line=582 column=20 end_column=64}
+18 {file_name_id=4 function_name_id=6 line=584 end_line=584 column=19 end_column=60}
+19 {file_name_id=4 function_name_id=6 line=586 end_line=586 column=41 end_column=56}
+20 {file_name_id=4 function_name_id=6 line=583 end_line=583 column=37 end_column=58}
+21 {file_name_id=4 function_name_id=6 line=583 end_line=583 column=20 end_column=64}
+22 {file_name_id=4 function_name_id=6 line=585 end_line=585 column=19 end_column=60}
+23 {file_name_id=4 function_name_id=6 line=593 end_line=593 column=23 end_column=28}
+24 {file_name_id=4 function_name_id=6 line=593 end_line=593 column=16 end_column=29}
+25 {file_name_id=4 function_name_id=6 line=594 end_line=594 column=16 end_column=59}
+26 {file_name_id=4 function_name_id=6 line=595 end_line=595 column=37 end_column=60}
+27 {file_name_id=4 function_name_id=6 line=595 end_line=595 column=28 end_column=61}
+28 {file_name_id=4 function_name_id=6 line=595 end_line=595 column=24 end_column=61}
+29 {file_name_id=4 function_name_id=6 line=595 end_line=595 column=17 end_column=62}
+30 {file_name_id=4 function_name_id=6 line=596 end_line=596 column=19 end_column=63}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=7}
+9 {file_location_id=9 parent_frame_id=7}
+10 {file_location_id=10 parent_frame_id=1}
+11 {file_location_id=10 parent_frame_id=7}
+12 {file_location_id=11 parent_frame_id=7}
+13 {file_location_id=12 parent_frame_id=7}
+14 {file_location_id=13 parent_frame_id=7}
+15 {file_location_id=14 parent_frame_id=1}
+16 {file_location_id=14 parent_frame_id=7}
+17 {file_location_id=15 parent_frame_id=7}
+18 {file_location_id=16 parent_frame_id=7}
+19 {file_location_id=17 parent_frame_id=7}
+20 {file_location_id=18 parent_frame_id=1}
+21 {file_location_id=18 parent_frame_id=7}
+22 {file_location_id=19 parent_frame_id=7}
+23 {file_location_id=20 parent_frame_id=7}
+24 {file_location_id=21 parent_frame_id=7}
+25 {file_location_id=22 parent_frame_id=1}
+26 {file_location_id=22 parent_frame_id=7}
+27 {file_location_id=23 parent_frame_id=7}
+28 {file_location_id=24 parent_frame_id=7}
+29 {file_location_id=25 parent_frame_id=7}
+30 {file_location_id=26 parent_frame_id=7}
+31 {file_location_id=27 parent_frame_id=7}
+32 {file_location_id=27 parent_frame_id=32}
+33 {file_location_id=28 parent_frame_id=7}
+34 {file_location_id=29 parent_frame_id=7}
+35 {file_location_id=30 parent_frame_id=7}
+
+
+%region_0.1 (reduce_and.3: pred[], reduce_and.4: pred[]) -> pred[] {
+  %reduce_and.3 = pred[] parameter(0), metadata={op_name="reduce_and"}
+  %reduce_and.4 = pred[] parameter(1), metadata={op_name="reduce_and"}
+  ROOT %reduce_and.5 = pred[] and(%reduce_and.3, %reduce_and.4), metadata={op_name="reduce_and"}
+}
+
+%take_along_axis.2 (Arg_0.1: c128[21,512,24,24], Arg_1.1: s32[1,512,24,24]) -> c128[1,512,24,24] {
+  %Arg_1.1 = s32[1,512,24,24]{3,2,1,0} parameter(1)
+  %convert_element_type.2 = s64[1,512,24,24]{3,2,1,0} convert(%Arg_1.1), metadata={op_name="convert_element_type"}
+  %constant.11 = s64[] constant(0)
+  %lt.2 = s64[1,512,24,24]{3,2,1,0} broadcast(%constant.11), dimensions={}, metadata={op_name="lt"}
+  %lt.3 = pred[1,512,24,24]{3,2,1,0} compare(%convert_element_type.2, %lt.2), direction=LT, metadata={op_name="lt"}
+  %constant.10 = s64[] constant(21)
+  %add.2 = s64[1,512,24,24]{3,2,1,0} broadcast(%constant.10), dimensions={}, metadata={op_name="add"}
+  %add.3 = s64[1,512,24,24]{3,2,1,0} add(%convert_element_type.2, %add.2), metadata={op_name="add"}
+  %select_n.2 = s64[1,512,24,24]{3,2,1,0} select(%lt.3, %add.3, %convert_element_type.2), metadata={op_name="select_n"}
+  %reshape.1 = s64[1,512,24,24,1]{4,3,2,1,0} reshape(%select_n.2), metadata={op_name="reshape"}
+  %convert_element_type.3 = s32[1,512,24,24,1]{4,3,2,1,0} convert(%reshape.1), metadata={op_name="convert_element_type"}
+  %constant.9 = s32[] constant(0)
+  %ge.2 = s32[1,512,24,24,1]{4,3,2,1,0} broadcast(%constant.9), dimensions={}, metadata={op_name="ge"}
+  %ge.3 = pred[1,512,24,24,1]{4,3,2,1,0} compare(%convert_element_type.3, %ge.2), direction=GE, metadata={op_name="ge"}
+  %constant.8 = s32[] constant(20)
+  %le.2 = s32[1,512,24,24,1]{4,3,2,1,0} broadcast(%constant.8), dimensions={}, metadata={op_name="le"}
+  %le.3 = pred[1,512,24,24,1]{4,3,2,1,0} compare(%convert_element_type.3, %le.2), direction=LE, metadata={op_name="le"}
+  %and.1 = pred[1,512,24,24,1]{4,3,2,1,0} and(%ge.3, %le.3), metadata={op_name="and"}
+  %constant.12 = pred[] constant(true)
+  %reduce_and.7 = pred[1,512,24,24]{3,2,1,0} reduce(%and.1, %constant.12), dimensions={4}, to_apply=%region_0.1, metadata={op_name="reduce_and"}
+  %Arg_0.1 = c128[21,512,24,24]{3,2,1,0} parameter(0)
+  %gather.1 = c128[1,512,24,24]{3,2,1,0} gather(%Arg_0.1, %convert_element_type.3), offset_dims={}, collapsed_slice_dims={0}, start_index_map={0}, operand_batching_dims={1,2,3}, start_indices_batching_dims={1,2,3}, index_vector_dim=4, slice_sizes={1,1,1,1}, metadata={op_name="gather"}
+  %constant.7 = c128[] constant((nan, 0))
+  %broadcast_in_dim.9 = c128[1,512,24,24]{3,2,1,0} broadcast(%constant.7), dimensions={}, metadata={op_name="broadcast_in_dim"}
+  ROOT %select_n.3 = c128[1,512,24,24]{3,2,1,0} select(%reduce_and.7, %gather.1, %broadcast_in_dim.9), metadata={op_name="select_n"}
+}
+
+ENTRY %main.3 (sig_w.1: c128[21,512,24,24], sig_x.1: c128[512,24,24], ilo.1: s32[512,24], ihi.1: s32[512,24], wlo.1: c128[512,24], whi.1: c128[512,24]) -> c128[512,24,24] {
+  %wlo.1 = c128[512,24]{1,0} parameter(4), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}]>"}, metadata={op_name="wlo"}
+  %broadcast_in_dim.30 = c128[512,24,1]{2,1,0} reshape(%wlo.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=7}
+  %mul.18 = c128[512,24,1]{2,1,0} broadcast(%broadcast_in_dim.30), dimensions={0,1,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %mul.19 = c128[512,24]{1,0} reshape(%mul.18), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %mul.20 = c128[512,24,24]{2,1,0} broadcast(%mul.19), dimensions={0,1}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %sig_w.1 = c128[21,512,24,24]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="sig_w"}
+  %ilo.1 = s32[512,24]{1,0} parameter(2), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}]>"}, metadata={op_name="ilo"}
+  %broadcast_in_dim.22 = s32[1,512,24,1]{3,2,1,0} reshape(%ilo.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=8}
+  %broadcast_in_dim.23 = s32[1,512,24,1]{3,2,1,0} broadcast(%broadcast_in_dim.22), dimensions={0,1,2,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=9}
+  %broadcast_in_dim.24 = s32[1,512,24]{2,1,0} reshape(%broadcast_in_dim.23), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=9}
+  %broadcast_in_dim.25 = s32[1,512,24,24]{3,2,1,0} broadcast(%broadcast_in_dim.24), dimensions={0,1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=9}
+  %jit_take_along_axis_.4 = c128[1,512,24,24]{3,2,1,0} call(%sig_w.1, %broadcast_in_dim.25), to_apply=%take_along_axis.2, metadata={op_name="jit(_kernel)/jit(take_along_axis)" stack_frame_id=10}
+  %squeeze.4 = c128[512,24,24]{2,1,0} reshape(%jit_take_along_axis_.4), metadata={op_name="jit(_kernel)/squeeze" stack_frame_id=11}
+  %mul.21 = c128[512,24,24]{2,1,0} multiply(%mul.20, %squeeze.4), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %whi.1 = c128[512,24]{1,0} parameter(5), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}]>"}, metadata={op_name="whi"}
+  %broadcast_in_dim.31 = c128[512,24,1]{2,1,0} reshape(%whi.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=12}
+  %mul.22 = c128[512,24,1]{2,1,0} broadcast(%broadcast_in_dim.31), dimensions={0,1,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=12}
+  %mul.23 = c128[512,24]{1,0} reshape(%mul.22), metadata={op_name="jit(_kernel)/mul" stack_frame_id=12}
+  %mul.24 = c128[512,24,24]{2,1,0} broadcast(%mul.23), dimensions={0,1}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=12}
+  %ihi.1 = s32[512,24]{1,0} parameter(3), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}]>"}, metadata={op_name="ihi"}
+  %broadcast_in_dim.26 = s32[1,512,24,1]{3,2,1,0} reshape(%ihi.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=13}
+  %broadcast_in_dim.27 = s32[1,512,24,1]{3,2,1,0} broadcast(%broadcast_in_dim.26), dimensions={0,1,2,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=14}
+  %broadcast_in_dim.28 = s32[1,512,24]{2,1,0} reshape(%broadcast_in_dim.27), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=14}
+  %broadcast_in_dim.29 = s32[1,512,24,24]{3,2,1,0} broadcast(%broadcast_in_dim.28), dimensions={0,1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=14}
+  %jit_take_along_axis_.5 = c128[1,512,24,24]{3,2,1,0} call(%sig_w.1, %broadcast_in_dim.29), to_apply=%take_along_axis.2, metadata={op_name="jit(_kernel)/jit(take_along_axis)" stack_frame_id=15}
+  %squeeze.5 = c128[512,24,24]{2,1,0} reshape(%jit_take_along_axis_.5), metadata={op_name="jit(_kernel)/squeeze" stack_frame_id=16}
+  %mul.25 = c128[512,24,24]{2,1,0} multiply(%mul.24, %squeeze.5), metadata={op_name="jit(_kernel)/mul" stack_frame_id=12}
+  %add.9 = c128[512,24,24]{2,1,0} add(%mul.21, %mul.25), metadata={op_name="jit(_kernel)/add" stack_frame_id=7}
+  %broadcast_in_dim.40 = c128[512,1,24]{2,1,0} reshape(%wlo.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=17}
+  %mul.26 = c128[512,1,24]{2,1,0} broadcast(%broadcast_in_dim.40), dimensions={0,1,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=17}
+  %mul.27 = c128[512,24]{1,0} reshape(%mul.26), metadata={op_name="jit(_kernel)/mul" stack_frame_id=17}
+  %mul.28 = c128[512,24,24]{2,1,0} broadcast(%mul.27), dimensions={0,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=17}
+  %broadcast_in_dim.32 = s32[1,512,1,24]{3,2,1,0} reshape(%ilo.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=18}
+  %broadcast_in_dim.33 = s32[1,512,1,24]{3,2,1,0} broadcast(%broadcast_in_dim.32), dimensions={0,1,2,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=19}
+  %broadcast_in_dim.34 = s32[1,512,24]{2,1,0} reshape(%broadcast_in_dim.33), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=19}
+  %broadcast_in_dim.35 = s32[1,512,24,24]{3,2,1,0} broadcast(%broadcast_in_dim.34), dimensions={0,1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=19}
+  %jit_take_along_axis_.6 = c128[1,512,24,24]{3,2,1,0} call(%sig_w.1, %broadcast_in_dim.35), to_apply=%take_along_axis.2, metadata={op_name="jit(_kernel)/jit(take_along_axis)" stack_frame_id=20}
+  %squeeze.6 = c128[512,24,24]{2,1,0} reshape(%jit_take_along_axis_.6), metadata={op_name="jit(_kernel)/squeeze" stack_frame_id=21}
+  %mul.29 = c128[512,24,24]{2,1,0} multiply(%mul.28, %squeeze.6), metadata={op_name="jit(_kernel)/mul" stack_frame_id=17}
+  %broadcast_in_dim.41 = c128[512,1,24]{2,1,0} reshape(%whi.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=22}
+  %mul.30 = c128[512,1,24]{2,1,0} broadcast(%broadcast_in_dim.41), dimensions={0,1,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=22}
+  %mul.31 = c128[512,24]{1,0} reshape(%mul.30), metadata={op_name="jit(_kernel)/mul" stack_frame_id=22}
+  %mul.32 = c128[512,24,24]{2,1,0} broadcast(%mul.31), dimensions={0,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=22}
+  %broadcast_in_dim.36 = s32[1,512,1,24]{3,2,1,0} reshape(%ihi.1), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=23}
+  %broadcast_in_dim.37 = s32[1,512,1,24]{3,2,1,0} broadcast(%broadcast_in_dim.36), dimensions={0,1,2,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=24}
+  %broadcast_in_dim.38 = s32[1,512,24]{2,1,0} reshape(%broadcast_in_dim.37), metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=24}
+  %broadcast_in_dim.39 = s32[1,512,24,24]{3,2,1,0} broadcast(%broadcast_in_dim.38), dimensions={0,1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=24}
+  %jit_take_along_axis_.7 = c128[1,512,24,24]{3,2,1,0} call(%sig_w.1, %broadcast_in_dim.39), to_apply=%take_along_axis.2, metadata={op_name="jit(_kernel)/jit(take_along_axis)" stack_frame_id=25}
+  %squeeze.7 = c128[512,24,24]{2,1,0} reshape(%jit_take_along_axis_.7), metadata={op_name="jit(_kernel)/squeeze" stack_frame_id=26}
+  %mul.33 = c128[512,24,24]{2,1,0} multiply(%mul.32, %squeeze.7), metadata={op_name="jit(_kernel)/mul" stack_frame_id=22}
+  %add.10 = c128[512,24,24]{2,1,0} add(%mul.29, %mul.33), metadata={op_name="jit(_kernel)/add" stack_frame_id=17}
+  %add.11 = c128[512,24,24]{2,1,0} add(%add.9, %add.10), metadata={op_name="jit(_kernel)/add" stack_frame_id=27}
+  %constant.13 = c128[] constant((0.5, 0))
+  %broadcast.1 = c128[512,24,24]{2,1,0} broadcast(%constant.13), dimensions={}
+  %mul.34 = c128[512,24,24]{2,1,0} multiply(%add.11, %broadcast.1), metadata={op_name="jit(_kernel)/mul" stack_frame_id=28}
+  %sig_x.1 = c128[512,24,24]{2,1,0} parameter(1), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {}]>"}, metadata={op_name="sig_x"}
+  %add.12 = c128[512,24,24]{2,1,0} add(%mul.34, %sig_x.1), metadata={op_name="jit(_kernel)/add" stack_frame_id=28}
+  %sharding_constraint.2 = c128[512,24,24]{2,1,0} custom-call(%add.12), custom_call_target="Sharding", sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {}, {}]>]>"}, metadata={op_name="jit(_kernel)/sharding_constraint" stack_frame_id=29}
+  %transpose.1 = c128[512,24,24]{1,2,0} transpose(%sharding_constraint.2), dimensions={0,2,1}, metadata={op_name="jit(_kernel)/transpose" stack_frame_id=30}
+  %real.1 = f64[512,24,24]{1,2,0} real(%transpose.1), metadata={op_name="jit(_kernel)/real" stack_frame_id=32}
+  %imag.1 = f64[512,24,24]{1,2,0} imag(%transpose.1), metadata={op_name="jit(_kernel)/imag" stack_frame_id=32}
+  %neg.1 = f64[512,24,24]{1,2,0} negate(%imag.1), metadata={op_name="jit(_kernel)/neg" stack_frame_id=32}
+  %complex.1 = c128[512,24,24]{1,2,0} complex(%real.1, %neg.1), metadata={op_name="jit(_kernel)/complex" stack_frame_id=32}
+  %add.13 = c128[512,24,24]{2,1,0} add(%sharding_constraint.2, %complex.1), metadata={op_name="jit(_kernel)/add" stack_frame_id=33}
+  %mul.35 = c128[512,24,24]{2,1,0} multiply(%add.13, %broadcast.1), metadata={op_name="jit(_kernel)/mul" stack_frame_id=34}
+  ROOT %sharding_constraint.3 = c128[512,24,24]{2,1,0} custom-call(%mul.35), custom_call_target="Sharding", sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {}, {}]>]>"}, metadata={op_name="jit(_kernel)/sharding_constraint" stack_frame_id=35}
+}
+

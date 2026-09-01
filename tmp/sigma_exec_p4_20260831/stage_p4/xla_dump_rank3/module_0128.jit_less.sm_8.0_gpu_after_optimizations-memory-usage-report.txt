@@ -1,0 +1,15 @@
+Total bytes used: 7864328 (7.50MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   6.00MiB( 80%);    1.50MiB; allocation 0: size 6.00MiB, parameter 0, shape |s32[48,32768]| at ShapeIndex {}:
+   7.50MiB(100%);         8B; allocation 1: size 1.50MiB, output shape is |pred[48,32768]|, maybe-live-out:
+   7.50MiB(100%);         0B; allocation 2: size 8B, parameter 1, shape |s64[]| at ShapeIndex {}:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 6.00MiB, parameter 0, shape |s32[48,32768]| at ShapeIndex {}:
+allocation 1: size 1.50MiB, output shape is |pred[48,32768]|, maybe-live-out:
+allocation 2: size 8B, parameter 1, shape |s64[]| at ShapeIndex {}:

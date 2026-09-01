@@ -1,0 +1,73 @@
+HloModule jit_eigh, is_scheduled=true, entry_computation_layout={(c128[512,24,24]{2,1,0})->(f64[512,24]{1,0}, c128[512,24,24]{2,1,0})}, allow_spmd_sharding_propagation_to_output={true,true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="f2fa60a407ef27eae080e1abed6c106f"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=1059 end_line=1059 column=19 end_column=19}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+
+
+%fused_transpose (param_0.6: c128[512,24,24], param_1.20: s32[512]) -> c128[512,24,24] {
+  %param_1.20 = s32[512]{0} parameter(1)
+  %constant_10_1 = s32[] constant(0)
+  %eigh.6.5 = s32[512]{0} broadcast(%constant_10_1), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.7.5 = pred[512]{0} compare(%param_1.20, %eigh.6.5), direction=EQ, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %broadcast.4.1 = pred[512,24,24]{2,1,0} broadcast(%eigh.7.5), dimensions={0}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %param_0.6 = c128[512,24,24]{1,2,0} parameter(0)
+  %bitcast.6.3 = c128[512,24,24]{2,1,0} bitcast(%param_0.6)
+  %constant_12_1 = c128[] constant((nan, nan))
+  %broadcast.5.1 = c128[512,24,24]{2,1,0} broadcast(%constant_12_1), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %select.4 = c128[512,24,24]{2,1,0} select(%broadcast.4.1, %bitcast.6.3, %broadcast.5.1), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  ROOT %transpose.16.1 = c128[512,24,24]{2,1,0} transpose(%select.4), dimensions={0,2,1}
+}
+
+%fused_transpose.1 (param_0.12: c128[512,24,24]) -> c128[512,24,24] {
+  %param_0.12 = c128[512,24,24]{2,1,0} parameter(0)
+  %transpose.15.1 = c128[512,24,24]{2,1,0} transpose(%param_0.12), dimensions={0,2,1}, metadata={op_name="a"}
+  %real.3.1 = f64[512,24,24]{2,1,0} real(%param_0.12), metadata={op_name="jit(eigh)/real" stack_frame_id=3}
+  %imag.3.1 = f64[512,24,24]{2,1,0} imag(%param_0.12), metadata={op_name="jit(eigh)/imag" stack_frame_id=3}
+  %neg.3.1 = f64[512,24,24]{2,1,0} negate(%imag.3.1), metadata={op_name="jit(eigh)/neg" stack_frame_id=3}
+  %complex.4.1 = c128[512,24,24]{2,1,0} complex(%real.3.1, %neg.3.1), metadata={op_name="jit(eigh)/complex" stack_frame_id=3}
+  %add.3.1 = c128[512,24,24]{2,1,0} add(%transpose.15.1, %complex.4.1), metadata={op_name="jit(eigh)/add" stack_frame_id=3}
+  %constant_9_1 = c128[] constant((0.5, 0))
+  %broadcast.3.1 = c128[512,24,24]{2,1,0} broadcast(%constant_9_1), dimensions={}, metadata={op_name="jit(eigh)/div" stack_frame_id=3}
+  ROOT %multiply.1.1 = c128[512,24,24]{2,1,0} multiply(%add.3.1, %broadcast.3.1), metadata={op_name="jit(eigh)/div" stack_frame_id=3}
+}
+
+%fused_select (param_0.8: f64[512,24], param_1.19: s32[512]) -> f64[512,24] {
+  %param_1.19 = s32[512]{0} parameter(1)
+  %constant_10_2 = s32[] constant(0)
+  %eigh.6.3 = s32[512]{0} broadcast(%constant_10_2), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.7.3 = pred[512]{0} compare(%param_1.19, %eigh.6.3), direction=EQ, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.8.1 = pred[512,24]{1,0} broadcast(%eigh.7.3), dimensions={0}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %param_0.8 = f64[512,24]{1,0} parameter(0)
+  %constant_11_1 = f64[] constant(nan)
+  %eigh.9.1 = f64[512,24]{1,0} broadcast(%constant_11_1), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  ROOT %eigh.10.1 = f64[512,24]{1,0} select(%eigh.8.1, %param_0.8, %eigh.9.1), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+}
+
+ENTRY %main.0_spmd (param: c128[512,24,24]) -> (f64[512,24], c128[512,24,24]) {
+  %param = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="a"}
+  %input_transpose_fusion.1 = c128[512,24,24]{2,1,0} fusion(%param), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(eigh)/div" stack_frame_id=3}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  %bitcast.20.0 = c128[512,24,24]{1,2,0} bitcast(%input_transpose_fusion.1)
+  %custom-call = (c128[512,24,24]{1,2,0}, f64[512,24]{1,0}, s32[512]{0}) custom-call(%bitcast.20.0), custom_call_target="cusolver_syevd_ffi", operand_layout_constraints={c128[512,24,24]{1,2,0}}, api_version=API_VERSION_TYPED_FFI, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}, backend_config={algorithm = 0 : ui8, lower = true}
+  %get-tuple-element.5 = s32[512]{0} get-tuple-element(%custom-call), index=2, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %get-tuple-element.2.0 = c128[512,24,24]{1,2,0} get-tuple-element(%custom-call), index=0, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %get-tuple-element.1.0 = f64[512,24]{1,0} get-tuple-element(%custom-call), index=1, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %loop_select_fusion = f64[512,24]{1,0} fusion(%get-tuple-element.1.0, %get-tuple-element.5), kind=kLoop, calls=%fused_select, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %input_transpose_fusion = c128[512,24,24]{2,1,0} fusion(%get-tuple-element.2.0, %get-tuple-element.5), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  ROOT %tuple.3.0 = (f64[512,24]{1,0}, c128[512,24,24]{2,1,0}) tuple(%loop_select_fusion, %input_transpose_fusion)
+}
+

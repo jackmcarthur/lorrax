@@ -1,0 +1,51 @@
+BufferAssignment:
+allocation 0: size 24772608, parameter 0, shape |c128[21,512,12,12]| at ShapeIndex {}:
+ value: <22 param.1 @0> (size=24772608,offset=0): c128[21,512,12,12]{3,2,1,0}
+allocation 1: size 1403136, output shape is |c128[21,29,12,12]|, maybe-live-out:
+ value: <24 loop_select_fusion @0> (size=1403136,offset=0): c128[1,21,29,12,12]{4,3,2,1,0}
+allocation 2: size 232, parameter 1, shape |s64[29]| at ShapeIndex {}:
+ value: <23 param @0> (size=232,offset=0): s64[29]{0}
+
+Total bytes used: 26175976 (24.96MiB)
+
+Used values:
+<22 param.1 @0>
+ positions:
+  param.1
+ uses:
+  loop_select_fusion, operand 0
+ from instruction: %param.1 = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="a"}
+<23 param @0>
+ positions:
+  param
+ uses:
+  loop_select_fusion, operand 1
+ from instruction: %param = s64[29]{0} parameter(1), sharding={replicated}, metadata={op_name="indices"}
+<24 loop_select_fusion @0>
+ positions:
+  loop_select_fusion
+  bitcast.8.0
+ uses:
+  bitcast.8.0, operand 0
+ from instruction: %loop_select_fusion = c128[1,21,29,12,12]{4,3,2,1,0} fusion(%param.1, %param), kind=kLoop, calls=%fused_select, metadata={op_name="jit(_take)/select_n" stack_frame_id=9}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:param.1
+    1:param
+    2:loop_select_fusion
+    3:bitcast.8.0
+  BufferLiveRange:
+    param.1{}:0-4
+    param{}:0-4
+    loop_select_fusion{}:2-4
+  Live ranges at 2 (peak):
+    param.1{}: 24772608 bytes (cumulative: 24772608 bytes)
+    loop_select_fusion{}: 1403136 bytes (cumulative: 26175744 bytes)
+    param{}: 232 bytes (cumulative: 26175976 bytes)
+  Stack trace breakdown for peak usage: 26 175 976 bytes
+    main.1_spmd (100.0%, total: 26 175 976 bytes, current: 0 bytes, remaining: 26 175 976 bytes)
+      ├── a (94.6%, total: 24 772 608 bytes, current: 24 772 608 bytes, remaining: 1 403 368 bytes)
+      ├── jit(_take)/select_n (5.4%, total: 1 403 136 bytes, current: 1 403 136 bytes, remaining: 232 bytes)
+      └── indices (0.0%, total: 232 bytes, current: 232 bytes, remaining: 0 bytes)

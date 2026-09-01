@@ -1,0 +1,69 @@
+HloModule jit__per_rank, entry_computation_layout={(s64[2]{0}, s64[29,4]{1,0}, s64[29,4]{1,0})->f64[6,2,29,1532,2]{4,3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={true,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/services/wfn_loader/src/wfn_loader/loader.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/slab_io.py"
+7 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/_slab_io_ffi.py"
+8 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/ffi/io.py"
+
+FunctionNames
+1 "main"
+2 "compute_sigma_xc"
+3 "_compute_live_hartree"
+4 "compute_hartree_matrix"
+5 "WfnLoader.load"
+6 "WfnLoader._phdf5_build"
+7 "SlabIO.read_slabs"
+8 "_FfiBackend.read_slabs"
+9 "read_kchunk_union_sharded.<locals>._reader"
+10 "_read_kchunk_union_sharded_cached.<locals>._per_rank"
+11 "ffi_read_kchunk_union_call"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=48 end_line=48 column=13 end_column=13}
+2 {file_name_id=2 function_name_id=1 line=770 end_line=770 column=18 end_column=18}
+3 {file_name_id=3 function_name_id=2 line=922 end_line=922 column=30 end_column=30}
+4 {file_name_id=3 function_name_id=3 line=318 end_line=318 column=12 end_column=12}
+5 {file_name_id=4 function_name_id=4 line=984 end_line=984 column=12 end_column=12}
+6 {file_name_id=5 function_name_id=5 line=1415 end_line=1415 column=18 end_column=18}
+7 {file_name_id=5 function_name_id=6 line=1285 end_line=1285 column=21 end_column=21}
+8 {file_name_id=6 function_name_id=7 line=617 end_line=617 column=19 end_column=19}
+9 {file_name_id=7 function_name_id=8 line=2444 end_line=2444 column=15 end_column=15}
+10 {file_name_id=8 function_name_id=9 line=586 end_line=586 column=15 end_column=15}
+11 {file_name_id=8 function_name_id=10 line=736 end_line=736 column=15 end_column=15}
+12 {file_name_id=8 function_name_id=11 line=479 end_line=479 column=11 end_column=11}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=1}
+12 {file_location_id=12 parent_frame_id=12}
+
+
+ENTRY %main.0_spmd (param.3: s64[2], param.4: s64[29,4], param.5: s64[29,4]) -> f64[6,2,29,1532,2] {
+  %param.3 = s64[2]{0} parameter(0), sharding={replicated}, metadata={op_name="handle_local"}
+  %shard_map.4 = s64[2]{0} copy(%param.3), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %copy = s64[2]{0} copy(%shard_map.4), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %param.4 = s64[29,4]{1,0} parameter(1), sharding={replicated}, metadata={op_name="offset_base_local"}
+  %shard_map.5 = s64[29,4]{1,0} copy(%param.4), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %copy.1 = s64[29,4]{1,0} copy(%shard_map.5), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %param.5 = s64[29,4]{1,0} parameter(2), sharding={devices=[4,1]<=[4]}, metadata={op_name="count_base_local"}
+  %shard_map.6 = s64[29,4]{1,0} copy(%param.5), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %copy.2 = s64[29,4]{1,0} copy(%shard_map.6), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %ffi_call.3 = f64[6,2,29,1532,2]{4,3,2,1,0} custom-call(%copy, %copy.1, %copy.2), custom_call_target="lorrax_phdf5_read_kchunk_union", operand_layout_constraints={s64[2]{0}, s64[29,4]{1,0}, s64[29,4]{1,0}}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_per_rank)/shard_map/ffi_call" stack_frame_id=12}, backend_config={axis_count_per_dim = dense<[2, 0, 0, 0]> : tensor<4xi64>, axis_flat = dense<[0, 1]> : tensor<2xi64>, kchunk_axis = 2 : i64, mesh_shape = dense<2> : tensor<2xi64>, n_kchunk = 29 : i64}
+  %shard_map.24 = f64[6,2,29,1532,2]{4,3,2,1,0} copy(%ffi_call.3), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  ROOT %copy.3 = f64[6,2,29,1532,2]{4,3,2,1,0} copy(%shard_map.24), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+}
+

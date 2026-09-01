@@ -1,0 +1,72 @@
+HloModule jit_trace, entry_computation_layout={(c128[310,310]{1,0})->c128[]}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_init.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "prepare_isdf_and_wavefunctions"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=497 end_line=497 column=9 end_column=9}
+4 {file_name_id=3 function_name_id=3 line=3617 end_line=3617 column=10 end_column=10}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+
+
+%region_0.1 (reduce_sum.0: c128[], reduce_sum.1: c128[]) -> c128[] {
+  %reduce_sum.0 = c128[] parameter(0), metadata={op_name="jit(trace)/reduce_sum"}
+  %reduce_sum.1 = c128[] parameter(1), metadata={op_name="jit(trace)/reduce_sum"}
+  ROOT %reduce_sum.2 = c128[] add(%reduce_sum.0, %reduce_sum.1), metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+
+%region_0.1.clone (reduce_sum.8: c128[], reduce_sum.9: c128[]) -> c128[] {
+  %reduce_sum.8 = c128[] parameter(0), metadata={op_name="jit(trace)/reduce_sum"}
+  %reduce_sum.9 = c128[] parameter(1), metadata={op_name="jit(trace)/reduce_sum"}
+  ROOT %reduce_sum.10 = c128[] add(%reduce_sum.8, %reduce_sum.9), metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+
+%region_0.1.clone.1 (reduce_sum.11: c128[], reduce_sum.12: c128[]) -> c128[] {
+  %reduce_sum.11 = c128[] parameter(0), metadata={op_name="jit(trace)/reduce_sum"}
+  %reduce_sum.12 = c128[] parameter(1), metadata={op_name="jit(trace)/reduce_sum"}
+  ROOT %reduce_sum.13 = c128[] add(%reduce_sum.11, %reduce_sum.12), metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+
+ENTRY %main.2_spmd (param: c128[310,310]) -> c128[] {
+  %iota.8 = s64[310,310]{1,0} iota(), iota_dimension=0, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %constant = s32[4]{0} constant({0, 0, 1, 1}), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %partition-id = u32[] partition-id()
+  %dynamic-slice = s32[1]{0} dynamic-slice(%constant, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %reshape = s32[] reshape(%dynamic-slice), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %constant.5 = s32[] constant(310), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %multiply = s32[] multiply(%reshape, %constant.5), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %convert = s64[] convert(%multiply), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %broadcast = s64[310,310]{1,0} broadcast(%convert), dimensions={}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %add = s64[310,310]{1,0} add(%iota.8, %broadcast), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %iota.9 = s64[310,310]{1,0} iota(), iota_dimension=1, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %constant.7 = s32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %dynamic-slice.3 = s32[1]{0} dynamic-slice(%constant.7, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %reshape.3 = s32[] reshape(%dynamic-slice.3), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %multiply.1 = s32[] multiply(%reshape.3, %constant.5), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %convert.1 = s64[] convert(%multiply.1), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %broadcast.1 = s64[310,310]{1,0} broadcast(%convert.1), dimensions={}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %add.1 = s64[310,310]{1,0} add(%iota.9, %broadcast.1), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %eq.2 = pred[310,310]{1,0} compare(%add, %add.1), direction=EQ, metadata={op_name="jit(trace)/eq" stack_frame_id=4}
+  %param = c128[310,310]{1,0} parameter(0), sharding={devices=[2,2]<=[4]}, metadata={op_name="a"}
+  %constant.9 = c128[] constant((0, 0))
+  %broadcast_in_dim.2 = c128[310,310]{1,0} broadcast(%constant.9), dimensions={}, metadata={op_name="jit(trace)/broadcast_in_dim" stack_frame_id=4}
+  %select_n.3 = c128[310,310]{1,0} select(%eq.2, %param, %broadcast_in_dim.2), metadata={op_name="jit(trace)/jit(_where)/select_n"}
+  %reduce = c128[] reduce(%select_n.3, %constant.9), dimensions={0,1}, to_apply=%region_0.1, metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+  %all-reduce = c128[] all-reduce(%reduce), channel_id=1, replica_groups=[2,2]<=[4], use_global_device_ids=true, to_apply=%region_0.1.clone, metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+  ROOT %all-reduce.1 = c128[] all-reduce(%all-reduce), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), use_global_device_ids=true, to_apply=%region_0.1.clone.1, metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+

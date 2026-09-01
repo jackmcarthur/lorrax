@@ -1,0 +1,19 @@
+thunk_metadata {
+  thunk_info {
+  }
+  thunk_kind: "kSequential"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "input_reduce_fusion"
+    thunk_id: 1
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "input_reduce_fusion.1"
+    thunk_id: 2
+  }
+  thunk_kind: "kKernel"
+}

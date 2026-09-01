@@ -1,0 +1,40 @@
+HloModule jit_add, entry_computation_layout={(c128[512,24,24]{2,1,0}, c128[512,12,12]{2,1,0})->c128[512,12,12]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/qsgw_utils.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "solve_qp"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=902 end_line=902 column=17 end_column=17}
+4 {file_name_id=3 function_name_id=3 line=833 end_line=833 column=15 end_column=15}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+
+
+ENTRY %main.0_spmd (param: c128[512,24,24], param.1: c128[512,12,12]) -> c128[512,12,12] {
+  %param = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="x"}
+  %constant = s32[] constant(0), metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %constant.1 = s32[4]{0} constant({0, 0, 12, 12}), metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %partition-id = u32[] partition-id()
+  %dynamic-slice = s32[1]{0} dynamic-slice(%constant.1, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %reshape = s32[] reshape(%dynamic-slice), metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %constant.2 = s32[4]{0} constant({0, 12, 0, 12}), metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %dynamic-slice.1 = s32[1]{0} dynamic-slice(%constant.2, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %reshape.1 = s32[] reshape(%dynamic-slice.1), metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %dynamic-slice.2 = c128[512,12,12]{2,1,0} dynamic-slice(%param, %constant, %reshape, %reshape.1), dynamic_slice_sizes={512,12,12}, metadata={op_name="jit(add)/add" stack_frame_id=4}
+  %param.1 = c128[512,12,12]{2,1,0} parameter(1), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="y"}
+  ROOT %add.2 = c128[512,12,12]{2,1,0} add(%dynamic-slice.2, %param.1), metadata={op_name="jit(add)/add" stack_frame_id=4}
+}
+

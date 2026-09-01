@@ -1,0 +1,61 @@
+Total bytes used: 787405224 (750.93MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 750.78MiB(100%);   150.4KiB; allocation 0: size 750.78MiB, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+ 750.93MiB(100%);       144B; allocation 17: size 150.3KiB, preallocated-temp:
+ 750.93MiB(100%);       120B; allocation 1: size 24B, output shape is |f64[3]|, maybe-live-out:
+ 750.93MiB(100%);       112B; allocation 2: size 8B, thread-local:
+ 750.93MiB(100%);       104B; allocation 3: size 8B, thread-local:
+ 750.93MiB(100%);        96B; allocation 4: size 8B, thread-local:
+ 750.93MiB(100%);        88B; allocation 5: size 8B, thread-local:
+ 750.93MiB(100%);        80B; allocation 6: size 8B, thread-local:
+ 750.93MiB(100%);        72B; allocation 7: size 8B, thread-local:
+ 750.93MiB(100%);        64B; allocation 8: size 8B, thread-local:
+ 750.93MiB(100%);        56B; allocation 9: size 8B, thread-local:
+ 750.93MiB(100%);        48B; allocation 10: size 8B, thread-local:
+ 750.93MiB(100%);        40B; allocation 11: size 8B, thread-local:
+ 750.93MiB(100%);        32B; allocation 12: size 8B, thread-local:
+ 750.93MiB(100%);        24B; allocation 13: size 8B, thread-local:
+ 750.93MiB(100%);        16B; allocation 14: size 8B, thread-local:
+ 750.93MiB(100%);         8B; allocation 15: size 8B, thread-local:
+ 750.93MiB(100%);         0B; allocation 16: size 8B, thread-local:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 750.78MiB, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+allocation 17: size 150.3KiB, preallocated-temp:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	  50.0KiB( 33%);    50.0KiB;        51200;                1; s64[6400]
+	 100.0KiB( 67%);    50.0KiB;       102400;                2; f64[6400], s64[]
+	 150.0KiB(100%);    50.0KiB;            0;                2; s64[1], s64[6400]
+	 150.0KiB(100%);        24B;       153856;                1; (s64[6400], s64[6400], f64[6400])
+	 150.0KiB(100%);         8B;       153600;                2; 2×f64[]
+	 150.0KiB(100%);         8B;       102656;                1; s64[]
+	 150.0KiB(100%);         8B;          256;                1; s64[1]
+
+allocation 1: size 24B, output shape is |f64[3]|, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	      24B(100%);        24B;            0;                3; f64[3], 2×s64[2]
+
+allocation 2: size 8B, thread-local:
+allocation 3: size 8B, thread-local:
+allocation 4: size 8B, thread-local:
+allocation 5: size 8B, thread-local:
+allocation 6: size 8B, thread-local:
+allocation 7: size 8B, thread-local:
+allocation 8: size 8B, thread-local:
+allocation 9: size 8B, thread-local:
+allocation 10: size 8B, thread-local:
+allocation 11: size 8B, thread-local:
+allocation 12: size 8B, thread-local:
+allocation 13: size 8B, thread-local:
+allocation 14: size 8B, thread-local:
+allocation 15: size 8B, thread-local:
+allocation 16: size 8B, thread-local:

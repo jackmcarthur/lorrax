@@ -1,0 +1,36 @@
+BufferAssignment:
+allocation 0: size 524288, parameter 0, shape |c128[32,32,32]| at ShapeIndex {}:
+ value: <2 val.1 @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+allocation 1: size 262144, output shape is |f64[32,32,32]|, maybe-live-out:
+ value: <3 wrapped_real @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+
+Total bytes used: 786432 (768.0KiB)
+
+Used values:
+<2 val.1 @0>
+ positions:
+  val.1
+ uses:
+  wrapped_real, operand 0
+ from instruction: %val.1 = c128[32,32,32]{2,1,0} parameter(0), metadata={op_name="val"}
+<3 wrapped_real @0>
+ positions:
+  wrapped_real
+ uses:
+ from instruction: %wrapped_real = f64[32,32,32]{2,1,0} fusion(%val.1), kind=kLoop, calls=%wrapped_real_computation, metadata={op_name="jit(real)/real" stack_frame_id=9}
+
+
+HloLiveRange (max 2):
+  InstructionSequence:
+    0:val.1
+    1:wrapped_real
+  BufferLiveRange:
+    val.1{}:0-2
+    wrapped_real{}:1-2
+  Live ranges at 1 (peak):
+    val.1{}: 524288 bytes (cumulative: 524288 bytes)
+    wrapped_real{}: 262144 bytes (cumulative: 786432 bytes)
+  Stack trace breakdown for peak usage: 786 432 bytes
+    main.1 (100.0%, total: 786 432 bytes, current: 0 bytes, remaining: 786 432 bytes)
+      ├── val (66.7%, total: 524 288 bytes, current: 524 288 bytes, remaining: 262 144 bytes)
+      └── jit(real)/real (33.3%, total: 262 144 bytes, current: 262 144 bytes, remaining: 0 bytes)

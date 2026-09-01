@@ -1,0 +1,57 @@
+HloModule jit__per_rank, is_scheduled=true, entry_computation_layout={(s64[2]{0}, s64[4]{0}, s64[4]{0})->c128[512,48,2,310]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="ab7a66b504385a145d83eed4cf163951"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_init.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/tagged_arrays.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/slab_io.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/_slab_io_ffi.py"
+7 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/ffi/io.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "prepare_isdf_and_wavefunctions"
+4 "load_restart_state_from_h5"
+5 "read_restart_state_from_h5"
+6 "read_restart_state_from_h5.<locals>._read_psi"
+7 "SlabIO.read_slab"
+8 "_FfiBackend.read_slab"
+9 "_get_read_sm.<locals>._per_rank"
+10 "ffi_read_call"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=497 end_line=497 column=9 end_column=9}
+4 {file_name_id=3 function_name_id=3 line=3591 end_line=3591 column=8 end_column=8}
+5 {file_name_id=4 function_name_id=4 line=1435 end_line=1435 column=29 end_column=29}
+6 {file_name_id=4 function_name_id=5 line=1299 end_line=1299 column=25 end_column=25}
+7 {file_name_id=4 function_name_id=6 line=1263 end_line=1263 column=15 end_column=15}
+8 {file_name_id=5 function_name_id=7 line=509 end_line=509 column=18 end_column=18}
+9 {file_name_id=6 function_name_id=8 line=2357 end_line=2357 column=17 end_column=17}
+10 {file_name_id=6 function_name_id=9 line=1557 end_line=1557 column=15 end_column=15}
+11 {file_name_id=7 function_name_id=10 line=415 end_line=415 column=11 end_column=11}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=1}
+11 {file_location_id=11 parent_frame_id=11}
+
+
+ENTRY %main.0_spmd (param.3: s64[2], param.4: s64[4], param.5: s64[4]) -> c128[512,48,2,310] {
+  %param.5 = s64[4]{0} parameter(2), sharding={replicated}, metadata={op_name="valid_shape_local"}
+  %param.4 = s64[4]{0} parameter(1), sharding={replicated}, metadata={op_name="offset_local"}
+  %param.3 = s64[2]{0} parameter(0), sharding={replicated}, metadata={op_name="handle_local"}
+  ROOT %ffi_call.3 = c128[512,48,2,310]{3,2,1,0} custom-call(%param.3, %param.4, %param.5), custom_call_target="lorrax_phdf5_read", operand_layout_constraints={s64[2]{0}, s64[4]{0}, s64[4]{0}}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_per_rank)/shard_map/ffi_call" stack_frame_id=11}, backend_config={axis_count_per_dim = dense<[0, 0, 0, 1]> : tensor<4xi64>, axis_flat = dense<1> : tensor<1xi64>, mesh_shape = dense<2> : tensor<2xi64>}
+}
+

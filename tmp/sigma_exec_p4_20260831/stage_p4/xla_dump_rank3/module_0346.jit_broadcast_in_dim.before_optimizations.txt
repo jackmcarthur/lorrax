@@ -1,0 +1,6 @@
+HloModule jit_broadcast_in_dim, entry_computation_layout={(c128[29,620,620]{2,1,0})->c128[29,620,620]{2,1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+ENTRY %main.1 (args_0_.1: c128[29,620,620]) -> c128[29,620,620] {
+  ROOT %args_0_.1 = c128[29,620,620]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="args[0]"}
+}
+

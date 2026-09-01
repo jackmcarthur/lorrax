@@ -1,0 +1,107 @@
+BufferAssignment:
+allocation 0: size 4718592, output shape is |c128[512,24,24]|, maybe-live-out:
+ value: <9 all-gather-start{1} @0> (size=2359296,offset=0): c128[512,12,24]{1,0,2}
+ value: <13 loop_transpose_fusion @0> (size=4718592,offset=0): c128[512,24,24]{2,1,0}
+allocation 1: size 1179648, parameter 0, shape |c128[512,12,12]| at ShapeIndex {}:
+ value: <6 param @0> (size=1179648,offset=0): c128[512,12,12]{2,1,0}
+allocation 2: size 7078400, preallocated-temp:
+ value: <7 wrapped_transpose @0> (size=1179648,offset=512): c128[12,512,12]{2,1,0}
+ value: <8 all-gather-start{} @0> (size=16,offset=0): (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2})
+ value: <10 loop_transpose_fusion.1 @0> (size=2359296,offset=4719104): c128[12,512,24]{2,1,0}
+ value: <11 all-gather-start.1{} @0> (size=16,offset=256): (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1})
+ value: <12 all-gather-start.1{1} @0> (size=4718592,offset=512): c128[512,24,24]{2,0,1}
+
+Total bytes used: 12976640 (12.38MiB)
+
+Used values:
+<6 param @0>
+ positions:
+  param
+ uses:
+  wrapped_transpose, operand 0
+ from instruction: %param = c128[512,12,12]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="x"}
+<7 wrapped_transpose @0>
+ positions:
+  wrapped_transpose
+  bitcast.19.0
+  all-gather-start {0}
+ uses:
+  bitcast.19.0, operand 0
+  all-gather-start, operand 0
+  all-gather-done, operand 0 {0}
+ from instruction: %wrapped_transpose = c128[12,512,12]{2,1,0} fusion(%param), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="x"}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<8 all-gather-start{} @0>
+ positions:
+  all-gather-start {}
+ uses:
+  all-gather-done, operand 0 {}
+ from instruction: %all-gather-start = (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2}) all-gather-start(%bitcast.19.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<9 all-gather-start{1} @0>
+ positions:
+  all-gather-start {1}
+  all-gather-done
+ uses:
+  all-gather-done, operand 0 {1}
+  loop_transpose_fusion.1, operand 0
+ from instruction: %all-gather-start = (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2}) all-gather-start(%bitcast.19.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<10 loop_transpose_fusion.1 @0>
+ positions:
+  loop_transpose_fusion.1
+  bitcast.23.0
+  all-gather-start.1 {0}
+ uses:
+  bitcast.23.0, operand 0
+  all-gather-start.1, operand 0
+  all-gather-done.1, operand 0 {0}
+ from instruction: %loop_transpose_fusion.1 = c128[12,512,24]{2,1,0} fusion(%all-gather-done), kind=kInput, calls=%fused_transpose.1, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<11 all-gather-start.1{} @0>
+ positions:
+  all-gather-start.1 {}
+ uses:
+  all-gather-done.1, operand 0 {}
+ from instruction: %all-gather-start.1 = (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1}) all-gather-start(%bitcast.23.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<12 all-gather-start.1{1} @0>
+ positions:
+  all-gather-start.1 {1}
+  all-gather-done.1
+ uses:
+  all-gather-done.1, operand 0 {1}
+  loop_transpose_fusion, operand 0
+ from instruction: %all-gather-start.1 = (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1}) all-gather-start(%bitcast.23.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<13 loop_transpose_fusion @0>
+ positions:
+  loop_transpose_fusion
+ uses:
+ from instruction: %loop_transpose_fusion = c128[512,24,24]{2,1,0} fusion(%all-gather-done.1), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 10):
+  InstructionSequence:
+    0:param
+    1:wrapped_transpose
+    2:bitcast.19.0
+    3:all-gather-start
+    4:all-gather-done
+    5:loop_transpose_fusion.1
+    6:bitcast.23.0
+    7:all-gather-start.1
+    8:all-gather-done.1
+    9:loop_transpose_fusion
+  BufferLiveRange:
+    param{}:0-10
+    wrapped_transpose{}:1-4
+    all-gather-start{}:3-4
+    all-gather-start{1}:3-5
+    loop_transpose_fusion.1{}:5-8
+    all-gather-start.1{}:7-8
+    all-gather-start.1{1}:7-9
+    loop_transpose_fusion{}:9-10
+  Live ranges at 9 (peak):
+    all-gather-start.1{1}: 4718592 bytes (cumulative: 4718592 bytes)
+    loop_transpose_fusion{}: 4718592 bytes (cumulative: 9437184 bytes)
+    param{}: 1179648 bytes (cumulative: 10616832 bytes)
+  Stack trace breakdown for peak usage: 10 616 832 bytes
+    main.0_spmd (100.0%, total: 10 616 832 bytes, current: 0 bytes, remaining: 10 616 832 bytes)
+      ├── all-gather-start.1{1} (44.4%, total: 4 718 592 bytes, current: 4 718 592 bytes, remaining: 5 898 240 bytes)
+      ├── loop_transpose_fusion (44.4%, total: 4 718 592 bytes, current: 4 718 592 bytes, remaining: 1 179 648 bytes)
+      └── x (11.1%, total: 1 179 648 bytes, current: 1 179 648 bytes, remaining: 0 bytes)

@@ -1,0 +1,106 @@
+BufferAssignment:
+allocation 0: size 196608, parameter 1, shape |f64[512,48]| at ShapeIndex {}:
+ value: <15 operands_1_.1 @0> (size=196608,offset=0): f64[512,48]{1,0}
+allocation 1: size 4096, parameter 0, shape |f64[512]| at ShapeIndex {}:
+ value: <14 operands_0_.1 @0> (size=4096,offset=0): f64[512]{0}
+allocation 2: size 8, output shape is |f64[]|, maybe-live-out:
+ value: <17 input_reduce_fusion @0> (size=8,offset=0): f64[]
+allocation 3: size 8, thread-local:
+ value: <5 reduce_sum.2.0 @0> (size=8,offset=0): f64[]
+allocation 4: size 8, thread-local:
+ value: <0 reduce_sum.3 @0> (size=8,offset=0): f64[]
+allocation 5: size 8, thread-local:
+ value: <1 reduce_sum.4 @0> (size=8,offset=0): f64[]
+allocation 6: size 8, thread-local:
+ value: <2 reduce_sum.5.0 @0> (size=8,offset=0): f64[]
+allocation 7: size 8, thread-local:
+ value: <3 reduce_sum.0 @0> (size=8,offset=0): f64[]
+allocation 8: size 8, thread-local:
+ value: <4 reduce_sum.1 @0> (size=8,offset=0): f64[]
+allocation 9: size 4096, preallocated-temp:
+ value: <16 input_reduce_fusion.1 @0> (size=4096,offset=0): f64[512]{0}
+
+Total bytes used: 204856 (200.1KiB)
+
+Used values:
+<0 reduce_sum.3 @0>
+ positions:
+  reduce_sum.3
+ uses:
+  reduce_sum.5.0, operand 0
+ from instruction: %reduce_sum.3 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+<1 reduce_sum.4 @0>
+ positions:
+  reduce_sum.4
+ uses:
+  reduce_sum.5.0, operand 1
+ from instruction: %reduce_sum.4 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+<2 reduce_sum.5.0 @0>
+ positions:
+  reduce_sum.5.0
+ uses:
+ from instruction: %reduce_sum.5.0 = f64[] add(%reduce_sum.3, %reduce_sum.4), metadata={op_name="jit(_einsum)/reduce_sum" stack_frame_id=7}
+<3 reduce_sum.0 @0>
+ positions:
+  reduce_sum.0
+ uses:
+  reduce_sum.2.0, operand 0
+ from instruction: %reduce_sum.0 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+<4 reduce_sum.1 @0>
+ positions:
+  reduce_sum.1
+ uses:
+  reduce_sum.2.0, operand 1
+ from instruction: %reduce_sum.1 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+<5 reduce_sum.2.0 @0>
+ positions:
+  reduce_sum.2.0
+ uses:
+ from instruction: %reduce_sum.2.0 = f64[] add(%reduce_sum.0, %reduce_sum.1), metadata={op_name="jit(_einsum)/reduce_sum" stack_frame_id=7}
+<14 operands_0_.1 @0>
+ positions:
+  operands_0_.1
+ uses:
+  input_reduce_fusion, operand 0
+ from instruction: %operands_0_.1 = f64[512]{0} parameter(0), metadata={op_name="operands[0]"}
+<15 operands_1_.1 @0>
+ positions:
+  operands_1_.1
+ uses:
+  input_reduce_fusion.1, operand 0
+ from instruction: %operands_1_.1 = f64[512,48]{1,0} parameter(1), metadata={op_name="operands[1]"}
+<16 input_reduce_fusion.1 @0>
+ positions:
+  input_reduce_fusion.1
+ uses:
+  input_reduce_fusion, operand 1
+ from instruction: %input_reduce_fusion.1 = f64[512]{0} fusion(%operands_1_.1), kind=kInput, calls=%fused_reduce.1, metadata={op_name="jit(_einsum)/reduce_sum" stack_frame_id=7}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<17 input_reduce_fusion @0>
+ positions:
+  input_reduce_fusion
+ uses:
+ from instruction: %input_reduce_fusion = f64[] fusion(%operands_0_.1, %input_reduce_fusion.1), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(_einsum)/dot_general" stack_frame_id=7}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:operands_1_.1
+    1:operands_0_.1
+    2:input_reduce_fusion.1
+    3:input_reduce_fusion
+  BufferLiveRange:
+    operands_0_.1{}:0-4
+    operands_1_.1{}:0-4
+    input_reduce_fusion.1{}:2-3
+    input_reduce_fusion{}:3-4
+  Live ranges at 3 (peak):
+    operands_1_.1{}: 196608 bytes (cumulative: 196608 bytes)
+    input_reduce_fusion.1{}: 4096 bytes (cumulative: 200704 bytes)
+    operands_0_.1{}: 4096 bytes (cumulative: 204800 bytes)
+    input_reduce_fusion{}: 8 bytes (cumulative: 204808 bytes)
+  Stack trace breakdown for peak usage: 204 808 bytes
+    main.2 (100.0%, total: 204 808 bytes, current: 0 bytes, remaining: 204 808 bytes)
+      ├── operands[1] (96.0%, total: 196 608 bytes, current: 196 608 bytes, remaining: 8 200 bytes)
+      ├── jit(_einsum)/reduce_sum (2.0%, total: 4 096 bytes, current: 4 096 bytes, remaining: 4 104 bytes)
+      ├── operands[0] (2.0%, total: 4 096 bytes, current: 4 096 bytes, remaining: 8 bytes)
+      └── jit(_einsum)/dot_general (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

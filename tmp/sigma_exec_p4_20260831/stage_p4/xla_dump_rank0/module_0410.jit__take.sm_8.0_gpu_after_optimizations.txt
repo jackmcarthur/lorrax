@@ -1,0 +1,77 @@
+HloModule jit__take, is_scheduled=true, entry_computation_layout={(c128[21,512,12,12]{3,2,1,0}, s64[29]{0})->c128[21,29,12,12]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="9471b7c98356ab4e1a607bc917d5bcf7"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/dynamic_sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/sigma_output.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "write_sigma_omega"
+6 "write_sigma_omega_h5"
+7 "extract_and_stamp_k_irr"
+8 "star_select_k_irr"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=770 column=18 end_column=18}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1110 column=15 end_column=15}
+5 {file_name_id=3 function_name_id=4 line=425 end_line=425 column=34 end_column=34}
+6 {file_name_id=4 function_name_id=5 line=287 end_line=287 column=8 end_column=8}
+7 {file_name_id=5 function_name_id=6 line=1322 end_line=1322 column=43 end_column=43}
+8 {file_name_id=5 function_name_id=7 line=1029 end_line=1029 column=34 end_column=34}
+9 {file_name_id=5 function_name_id=8 line=806 end_line=806 column=9 end_column=9}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+
+
+%fused_select (param_0.10: c128[21,512,12,12], param_1.33: s64[29]) -> c128[1,21,29,12,12] {
+  %param_1.33 = s64[29]{0} parameter(1)
+  %constant_4_1 = s64[] constant(0)
+  %broadcast.8.7 = s64[29]{0} broadcast(%constant_4_1), dimensions={}, metadata={op_name="broadcast.7"}
+  %lt.2.9 = pred[29]{0} compare(%param_1.33, %broadcast.8.7), direction=LT, metadata={op_name="jit(_take)/lt" stack_frame_id=9}
+  %constant_12_1 = s64[] constant(512)
+  %broadcast.9.7 = s64[29]{0} broadcast(%constant_12_1), dimensions={}, metadata={op_name="broadcast.6"}
+  %add.2.9 = s64[29]{0} add(%param_1.33, %broadcast.9.7), metadata={op_name="jit(_take)/add" stack_frame_id=9}
+  %select_n.5.9 = s64[29]{0} select(%lt.2.9, %add.2.9, %param_1.33), metadata={op_name="jit(_take)/jit(_where)/select_n"}
+  %convert_element_type.4.7 = s32[29]{0} convert(%select_n.5.9), metadata={op_name="jit(_take)/convert_element_type" stack_frame_id=9}
+  %bitcast.31 = s32[29,1]{1,0} bitcast(%convert_element_type.4.7), metadata={op_name="jit(_take)/convert_element_type" stack_frame_id=9}
+  %constant_13_1 = s32[] constant(0)
+  %broadcast.10.5 = s32[29,1]{1,0} broadcast(%constant_13_1), dimensions={}, metadata={op_name="broadcast.5"}
+  %ge.2.5 = pred[29,1]{1,0} compare(%bitcast.31, %broadcast.10.5), direction=GE, metadata={op_name="jit(_take)/ge" stack_frame_id=9}
+  %constant_14_1 = s32[] constant(511)
+  %broadcast.11.5 = s32[29,1]{1,0} broadcast(%constant_14_1), dimensions={}, metadata={op_name="broadcast.4"}
+  %le.2.5 = pred[29,1]{1,0} compare(%bitcast.31, %broadcast.11.5), direction=LE, metadata={op_name="jit(_take)/le" stack_frame_id=9}
+  %and.2.3 = pred[29,1]{1,0} and(%ge.2.5, %le.2.5), metadata={op_name="jit(_take)/and" stack_frame_id=9}
+  %bitcast.1.3 = pred[29]{0} bitcast(%and.2.3), metadata={op_name="jit(_take)/and" stack_frame_id=9}
+  %broadcast.18.3 = pred[1,21,29,12,12]{4,3,2,1,0} broadcast(%bitcast.1.3), dimensions={2}, metadata={op_name="jit(_take)/broadcast_in_dim" stack_frame_id=9}
+  %param_0.10 = c128[21,512,12,12]{3,2,1,0} parameter(0)
+  %gather.3.3 = c128[29,21,1,12,12]{4,3,0,1,2} gather(%param_0.10, %bitcast.31), offset_dims={1,2,3,4}, collapsed_slice_dims={}, start_index_map={1}, index_vector_dim=1, slice_sizes={21,1,12,12}, metadata={op_name="jit(_take)/gather" stack_frame_id=9}
+  %bitcast.4.1 = c128[1,21,29,12,12]{4,3,2,1,0} bitcast(%gather.3.3)
+  %constant_17_1 = c128[] constant((nan, 0))
+  %broadcast.19.1 = c128[1,21,29,12,12]{4,3,2,1,0} broadcast(%constant_17_1), dimensions={}, metadata={op_name="jit(_take)/broadcast_in_dim" stack_frame_id=9}
+  ROOT %select.2 = c128[1,21,29,12,12]{4,3,2,1,0} select(%broadcast.18.3, %bitcast.4.1, %broadcast.19.1), metadata={op_name="jit(_take)/select_n" stack_frame_id=9}
+}
+
+ENTRY %main.1_spmd (param.1: c128[21,512,12,12], param: s64[29]) -> c128[21,29,12,12] {
+  %param.1 = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="a"}
+  %param = s64[29]{0} parameter(1), sharding={replicated}, metadata={op_name="indices"}
+  %loop_select_fusion = c128[1,21,29,12,12]{4,3,2,1,0} fusion(%param.1, %param), kind=kLoop, calls=%fused_select, metadata={op_name="jit(_take)/select_n" stack_frame_id=9}
+  ROOT %bitcast.8.0 = c128[21,29,12,12]{3,2,1,0} bitcast(%loop_select_fusion), metadata={op_name="jit(_take)/select_n" stack_frame_id=9}
+}
+

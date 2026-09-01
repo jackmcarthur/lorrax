@@ -1,0 +1,108 @@
+BufferAssignment:
+allocation 0: size 524288, output shape is |c128[32,32,32]|, maybe-live-out:
+ value: <30 copy.2 @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+ value: <34 loop_dynamic_update_slice_fusion @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+allocation 1: size 524288, parameter 0, shape |c128[32,32,32]| at ShapeIndex {}:
+ value: <29 args_0_.1 @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+allocation 2: size 16, parameter 2, shape |c128[]| at ShapeIndex {}:
+ value: <33 args_2_.1 @0> (size=16,offset=0): c128[]
+allocation 3: size 12, parameter 1, shape |s32[3]| at ShapeIndex {}:
+ value: <31 args_1_.1 @0> (size=12,offset=0): s32[3]{0}
+allocation 4: size 1, thread-local:
+ value: <2 and.3 @0> (size=1,offset=0): pred[]
+allocation 5: size 1, thread-local:
+ value: <0 lhs @0> (size=1,offset=0): pred[]
+allocation 6: size 1, thread-local:
+ value: <1 rhs @0> (size=1,offset=0): pred[]
+allocation 7: size 16, preallocated-temp:
+ value: <32 loop_dynamic_slice_fusion @0> (size=16,offset=0): c128[1,1,1]{2,1,0}
+
+Total bytes used: 1048623 (1.00MiB)
+
+Used values:
+<0 lhs @0>
+ positions:
+  lhs
+ uses:
+  and.3, operand 0
+ from instruction: %lhs = pred[] parameter(0)
+<1 rhs @0>
+ positions:
+  rhs
+ uses:
+  and.3, operand 1
+ from instruction: %rhs = pred[] parameter(1)
+<2 and.3 @0>
+ positions:
+  and.3
+ uses:
+ from instruction: %and.3 = pred[] and(%lhs, %rhs)
+<29 args_0_.1 @0>
+ positions:
+  args_0_.1
+ uses:
+  copy.2, operand 0
+ from instruction: %args_0_.1 = c128[32,32,32]{2,1,0} parameter(0), metadata={op_name="args[0]"}
+<30 copy.2 @0>
+ positions:
+  copy.2
+ uses:
+  loop_dynamic_slice_fusion, operand 0
+  loop_dynamic_update_slice_fusion, operand 0
+ from instruction: %copy.2 = c128[32,32,32]{2,1,0} copy(%args_0_.1)
+<31 args_1_.1 @0>
+ positions:
+  args_1_.1
+ uses:
+  loop_dynamic_slice_fusion, operand 1
+  loop_dynamic_update_slice_fusion, operand 3
+ from instruction: %args_1_.1 = s32[3]{0} parameter(1), metadata={op_name="args[1]"}
+<32 loop_dynamic_slice_fusion @0>
+ positions:
+  loop_dynamic_slice_fusion
+ uses:
+  loop_dynamic_update_slice_fusion, operand 1
+ from instruction: %loop_dynamic_slice_fusion = c128[1,1,1]{2,1,0} fusion(%copy.2, %args_1_.1), kind=kLoop, calls=%fused_dynamic_slice
+<33 args_2_.1 @0>
+ positions:
+  args_2_.1
+ uses:
+  loop_dynamic_update_slice_fusion, operand 2
+ from instruction: %args_2_.1 = c128[] parameter(2), metadata={op_name="args[2]"}
+<34 loop_dynamic_update_slice_fusion @0>
+ positions:
+  loop_dynamic_update_slice_fusion
+ uses:
+ from instruction: %loop_dynamic_update_slice_fusion = c128[32,32,32]{2,1,0} fusion(%copy.2, %loop_dynamic_slice_fusion, %args_2_.1, %args_1_.1), kind=kInput, calls=%fused_dynamic_update_slice, metadata={op_name="jit(scatter)/scatter" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 6):
+  InstructionSequence:
+    0:args_2_.1
+    1:args_1_.1
+    2:args_0_.1
+    3:copy.2
+    4:loop_dynamic_slice_fusion
+    5:loop_dynamic_update_slice_fusion
+  BufferLiveRange:
+    args_0_.1{}:0-6
+    copy.2{}:3-5
+    args_1_.1{}:0-6
+    loop_dynamic_slice_fusion{}:4-5
+    args_2_.1{}:0-6
+    loop_dynamic_update_slice_fusion{}:5-6
+  Live ranges at 5 (peak):
+    args_0_.1{}: 524288 bytes (cumulative: 524288 bytes)
+    copy.2{}: 524288 bytes (cumulative: 1048576 bytes)
+    loop_dynamic_update_slice_fusion{}: 524288 bytes (cumulative: 1572864 bytes)
+    args_2_.1{}: 16 bytes (cumulative: 1572880 bytes)
+    loop_dynamic_slice_fusion{}: 16 bytes (cumulative: 1572896 bytes)
+    args_1_.1{}: 12 bytes (cumulative: 1572908 bytes)
+  Stack trace breakdown for peak usage: 1 572 908 bytes
+    main.2 (100.0%, total: 1 572 908 bytes, current: 0 bytes, remaining: 1 572 908 bytes)
+      ├── args[0] (33.3%, total: 524 288 bytes, current: 524 288 bytes, remaining: 1 048 620 bytes)
+      ├── copy.2 (33.3%, total: 524 288 bytes, current: 524 288 bytes, remaining: 524 332 bytes)
+      ├── jit(scatter)/scatter (33.3%, total: 524 288 bytes, current: 524 288 bytes, remaining: 44 bytes)
+      ├── args[2] (0.0%, total: 16 bytes, current: 16 bytes, remaining: 28 bytes)
+      ├── loop_dynamic_slice_fusion (0.0%, total: 16 bytes, current: 16 bytes, remaining: 12 bytes)
+      └── args[1] (0.0%, total: 12 bytes, current: 12 bytes, remaining: 0 bytes)

@@ -1,0 +1,36 @@
+BufferAssignment:
+allocation 0: size 16, output shape is |c128[]|, maybe-live-out:
+ value: <3 wrapped_convert @0> (size=16,offset=0): c128[]
+allocation 1: size 8, parameter 0, shape |f64[]| at ShapeIndex {}:
+ value: <2 args_0_.1 @0> (size=8,offset=0): f64[]
+
+Total bytes used: 24 (24B)
+
+Used values:
+<2 args_0_.1 @0>
+ positions:
+  args_0_.1
+ uses:
+  wrapped_convert, operand 0
+ from instruction: %args_0_.1 = f64[] parameter(0), metadata={op_name="args[0]"}
+<3 wrapped_convert @0>
+ positions:
+  wrapped_convert
+ uses:
+ from instruction: %wrapped_convert = c128[] fusion(%args_0_.1), kind=kLoop, calls=%wrapped_convert_computation, metadata={op_name="jit(convert_element_type)/convert_element_type" stack_frame_id=9}
+
+
+HloLiveRange (max 2):
+  InstructionSequence:
+    0:args_0_.1
+    1:wrapped_convert
+  BufferLiveRange:
+    args_0_.1{}:0-2
+    wrapped_convert{}:1-2
+  Live ranges at 1 (peak):
+    wrapped_convert{}: 16 bytes (cumulative: 16 bytes)
+    args_0_.1{}: 8 bytes (cumulative: 24 bytes)
+  Stack trace breakdown for peak usage: 24 bytes
+    main.1 (100.0%, total: 24 bytes, current: 0 bytes, remaining: 24 bytes)
+      ├── jit(convert_element_type)/convert_element_type (66.7%, total: 16 bytes, current: 16 bytes, remaining: 8 bytes)
+      └── args[0] (33.3%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

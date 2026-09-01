@@ -1,0 +1,6 @@
+HloModule jit_broadcast_in_dim, entry_computation_layout={(f64[48,32768]{1,0})->f64[48,32768]{1,0}}, allow_spmd_sharding_propagation_to_parameters={true}, allow_spmd_sharding_propagation_to_output={true}
+
+ENTRY %main.1 (args_0_.1: f64[48,32768]) -> f64[48,32768] {
+  ROOT %args_0_.1 = f64[48,32768]{1,0} parameter(0), metadata={op_name="args[0]"}
+}
+

@@ -1,0 +1,50 @@
+HloModule jit_eigh, entry_computation_layout={(c128[512,24,24]{2,1,0})->(f64[512,24]{1,0}, c128[512,24,24]{2,1,0})}, allow_spmd_sharding_propagation_to_output={true,true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=1059 end_line=1059 column=19 end_column=19}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+
+
+ENTRY %main.0_spmd (param: c128[512,24,24]) -> (f64[512,24], c128[512,24,24]) {
+  %param = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="a"}
+  %real.3 = f64[512,24,24]{2,1,0} real(%param), metadata={op_name="jit(eigh)/real" stack_frame_id=3}
+  %imag.3 = f64[512,24,24]{2,1,0} imag(%param), metadata={op_name="jit(eigh)/imag" stack_frame_id=3}
+  %neg.3 = f64[512,24,24]{2,1,0} negate(%imag.3), metadata={op_name="jit(eigh)/neg" stack_frame_id=3}
+  %complex.4 = c128[512,24,24]{2,1,0} complex(%real.3, %neg.3), metadata={op_name="jit(eigh)/complex" stack_frame_id=3}
+  %complex.5 = c128[512,24,24]{1,2,0} transpose(%complex.4), dimensions={0,2,1}, metadata={op_name="jit(eigh)/complex" stack_frame_id=3}
+  %add.2 = c128[512,24,24]{2,1,0} add(%param, %complex.5), metadata={op_name="jit(eigh)/add" stack_frame_id=3}
+  %constant.9 = c128[] constant((0.5, 0))
+  %div.4 = c128[512,24,24]{2,1,0} broadcast(%constant.9), dimensions={}, metadata={op_name="jit(eigh)/div" stack_frame_id=3}
+  %div.5 = c128[512,24,24]{2,1,0} multiply(%add.2, %div.4), metadata={op_name="jit(eigh)/div" stack_frame_id=3}
+  %custom-call = (c128[512,24,24]{1,2,0}, f64[512,24]{1,0}, s32[512]{0}) custom-call(%div.5), custom_call_target="cusolver_syevd_ffi", operand_layout_constraints={c128[512,24,24]{1,2,0}}, api_version=API_VERSION_TYPED_FFI, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}, backend_config={algorithm = 0 : ui8, lower = true}
+  %get-tuple-element = s32[512]{0} get-tuple-element(%custom-call), index=2, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %constant.10 = s32[] constant(0)
+  %eigh.6 = s32[512]{0} broadcast(%constant.10), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.7 = pred[512]{0} compare(%get-tuple-element, %eigh.6), direction=EQ, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.8 = pred[512,24]{1,0} broadcast(%eigh.7), dimensions={0}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %get-tuple-element.1 = f64[512,24]{1,0} get-tuple-element(%custom-call), index=1, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %constant.11 = f64[] constant(nan)
+  %eigh.9 = f64[512,24]{1,0} broadcast(%constant.11), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.10 = f64[512,24]{1,0} select(%eigh.8, %get-tuple-element.1, %eigh.9), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.11 = pred[512,24,24]{2,1,0} broadcast(%eigh.7), dimensions={0}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %get-tuple-element.2 = c128[512,24,24]{1,2,0} get-tuple-element(%custom-call), index=0, frontend_attributes={num_batch_dims="1"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %constant.12 = c128[] constant((nan, nan))
+  %eigh.36 = c128[512,24,24]{2,1,0} broadcast(%constant.12), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.37 = c128[512,24,24]{2,1,0} select(%eigh.11, %get-tuple-element.2, %eigh.36), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  ROOT %tuple.2 = (f64[512,24]{1,0}, c128[512,24,24]{2,1,0}) tuple(%eigh.10, %eigh.37)
+}
+

@@ -1,0 +1,9 @@
+HloModule jit__identity_fn, entry_computation_layout={(f64[8]{0})->f64[8]{0}}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["processes"=4, "local_devices"=1]>}}
+
+ENTRY %main.1 (x.2: f64[8]) -> f64[8] {
+  %x.2 = f64[8]{0} parameter(0), sharding={devices=[4]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{\"processes\"}]>"}, metadata={op_name="x"}
+  %x.3 = f64[8]{0} custom-call(%x.2), custom_call_target="xla.sdy.FuncResultSharding", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}]>]>"}, metadata={op_name="x"}
+  %tuple.1 = (f64[8]{0}) tuple(%x.3)
+  ROOT %get-tuple-element.1 = f64[8]{0} get-tuple-element(%tuple.1), index=0, sharding={replicated}
+}
+

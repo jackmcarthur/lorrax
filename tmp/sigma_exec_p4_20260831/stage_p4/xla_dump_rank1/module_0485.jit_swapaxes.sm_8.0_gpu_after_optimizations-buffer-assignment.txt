@@ -1,0 +1,35 @@
+BufferAssignment:
+allocation 0: size 4718592, output shape is |c128[512,24,24]|, maybe-live-out:
+ value: <3 wrapped_transpose @0> (size=4718592,offset=0): c128[512,24,24]{2,1,0}
+allocation 1: size 4718592, parameter 0, shape |c128[512,24,24]| at ShapeIndex {}:
+ value: <2 param @0> (size=4718592,offset=0): c128[512,24,24]{2,1,0}
+
+Total bytes used: 9437184 (9.00MiB)
+
+Used values:
+<2 param @0>
+ positions:
+  param
+ uses:
+  wrapped_transpose, operand 0
+ from instruction: %param = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="a"}
+<3 wrapped_transpose @0>
+ positions:
+  wrapped_transpose
+ uses:
+ from instruction: %wrapped_transpose = c128[512,24,24]{2,1,0} fusion(%param), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="a"}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 2):
+  InstructionSequence:
+    0:param
+    1:wrapped_transpose
+  BufferLiveRange:
+    param{}:0-2
+    wrapped_transpose{}:1-2
+  Live ranges at 1 (peak):
+    param{}: 4718592 bytes (cumulative: 4718592 bytes)
+    wrapped_transpose{}: 4718592 bytes (cumulative: 9437184 bytes)
+  Stack trace breakdown for peak usage: 9 437 184 bytes
+    main.0_spmd (100.0%, total: 9 437 184 bytes, current: 0 bytes, remaining: 9 437 184 bytes)
+      └── a (100.0%, total: 9 437 184 bytes, current: 9 437 184 bytes, remaining: 0 bytes)

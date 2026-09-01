@@ -1,0 +1,507 @@
+version: 3
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "(c128[12,12]{1,0}, s8[1176576]{0}) custom-call(c128[12,3064]{1,0}, c128[12,3064]{1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"device_type\":\"DEVICE_TYPE_INVALID\",\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":0.062686839218463061,\"autotune_workspace_size\":\"0\",\"beta\":0,\"damax_output\":false,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[],\"lhs_contracting_dimensions\":[\"1\"],\"rhs_batch_dimensions\":[],\"rhs_contracting_dimensions\":[\"1\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"36768\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"HIGHEST\",\"HIGHEST\"]},\"rhs_stride\":\"36768\"},\"operation_queue_id\":\"0\",\"reification_cost\":[],\"wait_on_operation_queues\":[]}"
+  result {
+    other {
+      name: "CUBLAS"
+      config {
+        type_url: "type.googleapis.com/xla.AutotuneResult.GemmKey"
+        value: "\010\377\377\377\377\377\377\377\377\377\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "(c128[512,24,24]{2,1,0}, s8[4194304]{0}) custom-call(c128[512,24,620]{2,1,0}, c128[512,620,24]{2,1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"device_type\":\"DEVICE_TYPE_INVALID\",\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":1,\"autotune_workspace_size\":\"0\",\"beta\":0,\"damax_output\":false,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[\"0\"],\"lhs_contracting_dimensions\":[\"2\"],\"rhs_batch_dimensions\":[\"0\"],\"rhs_contracting_dimensions\":[\"1\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"14880\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"HIGHEST\",\"HIGHEST\"]},\"rhs_stride\":\"14880\"},\"operation_queue_id\":\"0\",\"reification_cost\":[],\"wait_on_operation_queues\":[]}"
+  result {
+    other {
+      name: "CUBLAS"
+      config {
+        type_url: "type.googleapis.com/xla.AutotuneResult.GemmKey"
+        value: "\010\377\377\377\377\377\377\377\377\377\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "(c128[512,24,620]{2,1,0}, s8[4194304]{0}) custom-call(c128[512,24,620]{2,1,0}, c128[512,620,620]{2,1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"device_type\":\"DEVICE_TYPE_INVALID\",\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":1,\"autotune_workspace_size\":\"0\",\"beta\":0,\"damax_output\":false,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[\"0\"],\"lhs_contracting_dimensions\":[\"2\"],\"rhs_batch_dimensions\":[\"0\"],\"rhs_contracting_dimensions\":[\"1\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"14880\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"HIGHEST\",\"HIGHEST\"]},\"rhs_stride\":\"384400\"},\"operation_queue_id\":\"0\",\"reification_cost\":[],\"wait_on_operation_queues\":[]}"
+  result {
+    other {
+      name: "CUBLAS"
+      config {
+        type_url: "type.googleapis.com/xla.AutotuneResult.GemmKey"
+        value: "\010\377\377\377\377\377\377\377\377\377\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "(c128[512,620,24]{2,1,0}, s8[4194304]{0}) custom-call(c128[512,24,620]{2,1,0}, c128[512,24,24]{2,1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"device_type\":\"DEVICE_TYPE_INVALID\",\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":1,\"autotune_workspace_size\":\"0\",\"beta\":0,\"damax_output\":false,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[\"0\"],\"lhs_contracting_dimensions\":[\"1\"],\"rhs_batch_dimensions\":[\"0\"],\"rhs_contracting_dimensions\":[\"1\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"14880\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"HIGHEST\",\"HIGHEST\"]},\"rhs_stride\":\"576\"},\"operation_queue_id\":\"0\",\"reification_cost\":[],\"wait_on_operation_queues\":[]}"
+  result {
+    other {
+      name: "CUBLAS"
+      config {
+        type_url: "type.googleapis.com/xla.AutotuneResult.GemmKey"
+        value: "\010\377\377\377\377\377\377\377\377\377\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "(c128[512,620,620]{2,1,0}, s8[4194304]{0}) custom-call(c128[512,620,24]{2,1,0}, c128[512,24,620]{2,1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"device_type\":\"DEVICE_TYPE_INVALID\",\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":1,\"autotune_workspace_size\":\"0\",\"beta\":0,\"damax_output\":false,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[\"0\"],\"lhs_contracting_dimensions\":[\"2\"],\"rhs_batch_dimensions\":[\"0\"],\"rhs_contracting_dimensions\":[\"1\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"14880\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"HIGHEST\",\"HIGHEST\"]},\"rhs_stride\":\"14880\"},\"operation_queue_id\":\"0\",\"reification_cost\":[],\"wait_on_operation_queues\":[]}"
+  result {
+    other {
+      name: "CUBLAS"
+      config {
+        type_url: "type.googleapis.com/xla.AutotuneResult.GemmKey"
+        value: "\010\377\377\377\377\377\377\377\377\377\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[310]{0} parameter(0)\n  tmp_1 = c128[] constant(0)\n  ROOT tmp_2 = c128[] reduce(c128[310]{0} tmp_0, c128[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[32,32,32]{2,1,0} parameter(0)\n  tmp_1 = s32[] constant(0)\n  tmp_2 = s32[3]{0} broadcast(s32[] tmp_1), dimensions={}\n  tmp_3 = s32[3]{0} parameter(3)\n  tmp_4 = s32[1,3]{1,0} bitcast(s32[3]{0} tmp_3)\n  tmp_5 = s32[1,1]{1,0} slice(s32[1,3]{1,0} tmp_4), slice={[0:1], [0:1]}\n  tmp_6 = s32[1]{0} bitcast(s32[1,1]{1,0} tmp_5)\n  tmp_7 = s32[2]{0} slice(s32[3]{0} tmp_3), slice={[1:3]}\n  tmp_8 = s32[3]{0} concatenate(s32[1]{0} tmp_6, s32[2]{0} tmp_7), dimensions={0}\n  tmp_9 = pred[3]{0} compare(s32[3]{0} tmp_2, s32[3]{0} tmp_8), direction=LE\n  tmp_10 = s32[] constant(31)\n  tmp_11 = s32[3]{0} broadcast(s32[] tmp_10), dimensions={}\n  tmp_12 = pred[3]{0} compare(s32[3]{0} tmp_11, s32[3]{0} tmp_8), direction=GE\n  tmp_13 = pred[3]{0} and(pred[3]{0} tmp_9, pred[3]{0} tmp_12)\n  tmp_14 = pred[] constant(1)\n  tmp_15 = pred[] reduce(pred[3]{0} tmp_13, pred[] tmp_14), dimensions={0}\n  tmp_16 = pred[1,1,1]{2,1,0} bitcast(pred[] tmp_15)\n  tmp_17 = c128[] parameter(2)\n  tmp_18 = c128[1,1,1]{2,1,0} bitcast(c128[] tmp_17)\n  tmp_19 = c128[1,1,1]{2,1,0} parameter(1)\n  tmp_20 = c128[1,1,1]{2,1,0} select(pred[1,1,1]{2,1,0} tmp_16, c128[1,1,1]{2,1,0} tmp_18, c128[1,1,1]{2,1,0} tmp_19)\n  tmp_21 = s32[] bitcast(s32[1,1]{1,0} tmp_5)\n  tmp_22 = s32[1]{0} slice(s32[3]{0} tmp_3), slice={[1:2]}\n  tmp_23 = s32[] bitcast(s32[1]{0} tmp_22)\n  tmp_24 = s32[1]{0} slice(s32[3]{0} tmp_3), slice={[2:3]}\n  tmp_25 = s32[] bitcast(s32[1]{0} tmp_24)\n  ROOT tmp_26 = c128[32,32,32]{2,1,0} dynamic-update-slice(c128[32,32,32]{2,1,0} tmp_0, c128[1,1,1]{2,1,0} tmp_20, s32[] tmp_21, s32[] tmp_23, s32[] tmp_25)\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[3]{0} parameter(0)\n  tmp_1 = c128[] constant(1)\n  ROOT tmp_2 = c128[] reduce(c128[3]{0} tmp_0, c128[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,155,620]{1,0,2} parameter(0)\n  tmp_1 = c128[620,512,155]{2,1,0} bitcast(c128[512,155,620]{1,0,2} tmp_0)\n  tmp_2 = c128[] constant({...})\n  tmp_3 = c128[620,512,155]{2,1,0} broadcast(c128[] tmp_2), dimensions={}\n  tmp_4 = c128[620,512,155]{2,1,0} multiply(c128[620,512,155]{2,1,0} tmp_1, c128[620,512,155]{2,1,0} tmp_3)\n  tmp_5 = c128[2,310,512,155]{3,2,1,0} bitcast(c128[620,512,155]{2,1,0} tmp_4)\n  ROOT tmp_6 = c128[512,2,155,310]{3,2,1,0} transpose(c128[2,310,512,155]{3,2,1,0} tmp_5), dimensions={2,0,3,1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,2,310,155]{3,2,1,0} parameter(1)\n  tmp_1 = c128[512,620,155]{2,1,0} bitcast(c128[512,2,310,155]{3,2,1,0} tmp_0)\n  tmp_2 = s64[317440,2]{1,0} parameter(0)\n  tmp_3 = c128[317440,1,1,155]{3,2,1,0} gather(c128[512,620,155]{2,1,0} tmp_1, s64[317440,2]{1,0} tmp_2), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={0,1}, index_vector_dim=1, slice_sizes={1,1,155}\n  tmp_4 = c128[512,620,155]{2,1,0} bitcast(c128[317440,1,1,155]{3,2,1,0} tmp_3)\n  ROOT tmp_5 = c128[620,512,155]{2,1,0} transpose(c128[512,620,155]{2,1,0} tmp_4), dimensions={1,0,2}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,2,310,48]{3,2,1,0} parameter(0)\n  tmp_1 = c128[512,2,310,24]{3,2,1,0} slice(c128[512,2,310,48]{3,2,1,0} tmp_0), slice={[0:512], [0:2], [0:310], [0:24]}\n  ROOT tmp_2 = c128[512,24,2,310]{3,2,1,0} transpose(c128[512,2,310,24]{3,2,1,0} tmp_1), dimensions={0,3,1,2}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,310,310]{1,0,2} parameter(0)\n  tmp_1 = c128[2,155,512,310]{3,2,1,0} bitcast(c128[512,310,310]{1,0,2} tmp_0)\n  ROOT tmp_2 = c128[512,2,310,155]{3,2,1,0} transpose(c128[2,155,512,310]{3,2,1,0} tmp_1), dimensions={2,0,3,1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,310,310]{2,0,1} parameter(1)\n  tmp_1 = c128[2,155,512,310]{3,2,1,0} bitcast(c128[512,310,310]{2,0,1} tmp_0)\n  tmp_2 = c128[512,155,2,310]{3,2,1,0} transpose(c128[2,155,512,310]{3,2,1,0} tmp_1), dimensions={2,1,0,3}\n  tmp_3 = c128[512,155,620]{2,1,0} bitcast(c128[512,155,2,310]{3,2,1,0} tmp_2)\n  tmp_4 = s64[317440,2]{1,0} parameter(0)\n  tmp_5 = c128[317440,1,155,1]{3,2,1,0} gather(c128[512,155,620]{2,1,0} tmp_3, s64[317440,2]{1,0} tmp_4), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={0,2}, index_vector_dim=1, slice_sizes={1,155,1}\n  tmp_6 = c128[512,620,155]{2,1,0} bitcast(c128[317440,1,155,1]{3,2,1,0} tmp_5)\n  ROOT tmp_7 = c128[620,512,155]{2,1,0} transpose(c128[512,620,155]{2,1,0} tmp_6), dimensions={1,0,2}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,310,310]{2,1,0} parameter(0)\n  tmp_1 = f64[512,310,310]{2,1,0} real(c128[512,310,310]{2,1,0} tmp_0)\n  tmp_2 = pred[512,310,310]{2,1,0} compare(f64[512,310,310]{2,1,0} tmp_1, f64[512,310,310]{2,1,0} tmp_1), direction=NE\n  tmp_3 = f64[512,310,310]{2,1,0} imag(c128[512,310,310]{2,1,0} tmp_0)\n  tmp_4 = pred[512,310,310]{2,1,0} compare(f64[512,310,310]{2,1,0} tmp_3, f64[512,310,310]{2,1,0} tmp_3), direction=NE\n  tmp_5 = pred[512,310,310]{2,1,0} or(pred[512,310,310]{2,1,0} tmp_2, pred[512,310,310]{2,1,0} tmp_4)\n  tmp_6 = s32[512,310,310]{2,1,0} convert(pred[512,310,310]{2,1,0} tmp_5)\n  tmp_7 = s64[512,310,310]{2,1,0} convert(s32[512,310,310]{2,1,0} tmp_6)\n  tmp_8 = s64[6400,7688]{1,0} bitcast(s64[512,310,310]{2,1,0} tmp_7)\n  tmp_9 = s64[] constant(0)\n  tmp_10 = s64[6400]{0} reduce(s64[6400,7688]{1,0} tmp_8, s64[] tmp_9), dimensions={1}\n  tmp_11 = pred[512,310,310]{2,1,0} is-finite(f64[512,310,310]{2,1,0} tmp_1)\n  tmp_12 = pred[512,310,310]{2,1,0} is-finite(f64[512,310,310]{2,1,0} tmp_3)\n  tmp_13 = pred[512,310,310]{2,1,0} and(pred[512,310,310]{2,1,0} tmp_11, pred[512,310,310]{2,1,0} tmp_12)\n  tmp_14 = pred[512,310,310]{2,1,0} not(pred[512,310,310]{2,1,0} tmp_13)\n  tmp_15 = s32[512,310,310]{2,1,0} convert(pred[512,310,310]{2,1,0} tmp_14)\n  tmp_16 = s64[512,310,310]{2,1,0} convert(s32[512,310,310]{2,1,0} tmp_15)\n  tmp_17 = s64[6400,7688]{1,0} bitcast(s64[512,310,310]{2,1,0} tmp_16)\n  tmp_18 = s64[6400]{0} reduce(s64[6400,7688]{1,0} tmp_17, s64[] tmp_9), dimensions={1}\n  tmp_19 = f64[512,310,310]{2,1,0} abs(c128[512,310,310]{2,1,0} tmp_0)\n  tmp_20 = f64[] constant(0)\n  tmp_21 = f64[512,310,310]{2,1,0} broadcast(f64[] tmp_20), dimensions={}\n  tmp_22 = f64[512,310,310]{2,1,0} select(pred[512,310,310]{2,1,0} tmp_13, f64[512,310,310]{2,1,0} tmp_19, f64[512,310,310]{2,1,0} tmp_21)\n  tmp_23 = f64[6400,7688]{1,0} bitcast(f64[512,310,310]{2,1,0} tmp_22)\n  tmp_24 = f64[] constant({...})\n  tmp_25 = f64[6400]{0} reduce(f64[6400,7688]{1,0} tmp_23, f64[] tmp_24), dimensions={1}\n  ROOT tmp_26 = (s64[6400]{0}, s64[6400]{0}, f64[6400]{0}) tuple(s64[6400]{0} tmp_10, s64[6400]{0} tmp_18, f64[6400]{0} tmp_25)\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,310,48,2]{3,2,1,0} parameter(0)\n  ROOT tmp_1 = c128[512,2,310,48]{3,2,1,0} transpose(c128[512,310,48,2]{3,2,1,0} tmp_0), dimensions={0,3,1,2}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,310,48,2]{3,2,1,0} parameter(0)\n  ROOT tmp_1 = c128[512,48,2,310]{3,2,1,0} transpose(c128[512,310,48,2]{3,2,1,0} tmp_0), dimensions={0,2,3,1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,48,2,310]{3,2,1,0} parameter(0)\n  ROOT tmp_1 = c128[512,2,310,48]{3,2,1,0} transpose(c128[512,48,2,310]{3,2,1,0} tmp_0), dimensions={0,2,3,1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,48,2,310]{3,2,1,0} parameter(0)\n  ROOT tmp_1 = c128[512,310,48,2]{3,2,1,0} transpose(c128[512,48,2,310]{3,2,1,0} tmp_0), dimensions={0,3,1,2}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,48,2,310]{3,2,1,0} parameter(0)\n  tmp_1 = f64[512,48,2,310]{3,2,1,0} real(c128[512,48,2,310]{3,2,1,0} tmp_0)\n  tmp_2 = pred[512,48,2,310]{3,2,1,0} compare(f64[512,48,2,310]{3,2,1,0} tmp_1, f64[512,48,2,310]{3,2,1,0} tmp_1), direction=NE\n  tmp_3 = f64[512,48,2,310]{3,2,1,0} imag(c128[512,48,2,310]{3,2,1,0} tmp_0)\n  tmp_4 = pred[512,48,2,310]{3,2,1,0} compare(f64[512,48,2,310]{3,2,1,0} tmp_3, f64[512,48,2,310]{3,2,1,0} tmp_3), direction=NE\n  tmp_5 = pred[512,48,2,310]{3,2,1,0} or(pred[512,48,2,310]{3,2,1,0} tmp_2, pred[512,48,2,310]{3,2,1,0} tmp_4)\n  tmp_6 = s32[512,48,2,310]{3,2,1,0} convert(pred[512,48,2,310]{3,2,1,0} tmp_5)\n  tmp_7 = s64[512,48,2,310]{3,2,1,0} convert(s32[512,48,2,310]{3,2,1,0} tmp_6)\n  tmp_8 = s64[2048,7440]{1,0} bitcast(s64[512,48,2,310]{3,2,1,0} tmp_7)\n  tmp_9 = s64[] constant(0)\n  tmp_10 = s64[2048]{0} reduce(s64[2048,7440]{1,0} tmp_8, s64[] tmp_9), dimensions={1}\n  tmp_11 = pred[512,48,2,310]{3,2,1,0} is-finite(f64[512,48,2,310]{3,2,1,0} tmp_1)\n  tmp_12 = pred[512,48,2,310]{3,2,1,0} is-finite(f64[512,48,2,310]{3,2,1,0} tmp_3)\n  tmp_13 = pred[512,48,2,310]{3,2,1,0} and(pred[512,48,2,310]{3,2,1,0} tmp_11, pred[512,48,2,310]{3,2,1,0} tmp_12)\n  tmp_14 = pred[512,48,2,310]{3,2,1,0} not(pred[512,48,2,310]{3,2,1,0} tmp_13)\n  tmp_15 = s32[512,48,2,310]{3,2,1,0} convert(pred[512,48,2,310]{3,2,1,0} tmp_14)\n  tmp_16 = s64[512,48,2,310]{3,2,1,0} convert(s32[512,48,2,310]{3,2,1,0} tmp_15)\n  tmp_17 = s64[2048,7440]{1,0} bitcast(s64[512,48,2,310]{3,2,1,0} tmp_16)\n  tmp_18 = s64[2048]{0} reduce(s64[2048,7440]{1,0} tmp_17, s64[] tmp_9), dimensions={1}\n  tmp_19 = f64[512,48,2,310]{3,2,1,0} abs(c128[512,48,2,310]{3,2,1,0} tmp_0)\n  tmp_20 = f64[] constant(0)\n  tmp_21 = f64[512,48,2,310]{3,2,1,0} broadcast(f64[] tmp_20), dimensions={}\n  tmp_22 = f64[512,48,2,310]{3,2,1,0} select(pred[512,48,2,310]{3,2,1,0} tmp_13, f64[512,48,2,310]{3,2,1,0} tmp_19, f64[512,48,2,310]{3,2,1,0} tmp_21)\n  tmp_23 = f64[2048,7440]{1,0} bitcast(f64[512,48,2,310]{3,2,1,0} tmp_22)\n  tmp_24 = f64[] constant({...})\n  tmp_25 = f64[2048]{0} reduce(f64[2048,7440]{1,0} tmp_23, f64[] tmp_24), dimensions={1}\n  ROOT tmp_26 = (s64[2048]{0}, s64[2048]{0}, f64[2048]{0}) tuple(s64[2048]{0} tmp_10, s64[2048]{0} tmp_18, f64[2048]{0} tmp_25)\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = c128[512,620,155]{2,0,1} parameter(0)\n  tmp_1 = c128[2,310,512,155]{3,2,1,0} bitcast(c128[512,620,155]{2,0,1} tmp_0)\n  ROOT tmp_2 = c128[310,512,2,155]{3,2,1,0} transpose(c128[2,310,512,155]{3,2,1,0} tmp_1), dimensions={1,2,0,3}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[128]{0} parameter(0)\n  tmp_1 = f64[] constant(0)\n  ROOT tmp_2 = f64[] reduce(f64[128]{0} tmp_0, f64[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "BLOCK_LEVEL_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.BlockLevelFusionConfig"
+        value: "\020\001\032\000 \001(\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[128]{0} parameter(0)\n  tmp_1 = f64[] constant({...})\n  ROOT tmp_2 = f64[] reduce(f64[128]{0} tmp_0, f64[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[16]{0} parameter(2)\n  tmp_1 = f64[16,2,32,32,32]{4,3,2,1,0} broadcast(f64[16]{0} tmp_0), dimensions={0}\n  tmp_2 = c128[16,2,32,32,32]{4,3,2,1,0} parameter(0)\n  tmp_3 = c128[] parameter(1)\n  tmp_4 = c128[16,2,32,32,32]{4,3,2,1,0} broadcast(c128[] tmp_3), dimensions={}\n  tmp_5 = c128[16,2,32,32,32]{4,3,2,1,0} multiply(c128[16,2,32,32,32]{4,3,2,1,0} tmp_2, c128[16,2,32,32,32]{4,3,2,1,0} tmp_4)\n  tmp_6 = f64[16,2,32,32,32]{4,3,2,1,0} real(c128[16,2,32,32,32]{4,3,2,1,0} tmp_5)\n  tmp_7 = f64[16,2,32,32,32]{4,3,2,1,0} imag(c128[16,2,32,32,32]{4,3,2,1,0} tmp_5)\n  tmp_8 = f64[16,2,32,32,32]{4,3,2,1,0} negate(f64[16,2,32,32,32]{4,3,2,1,0} tmp_7)\n  tmp_9 = c128[16,2,32,32,32]{4,3,2,1,0} complex(f64[16,2,32,32,32]{4,3,2,1,0} tmp_6, f64[16,2,32,32,32]{4,3,2,1,0} tmp_8)\n  tmp_10 = c128[16,2,32,32,32]{4,3,2,1,0} multiply(c128[16,2,32,32,32]{4,3,2,1,0} tmp_9, c128[16,2,32,32,32]{4,3,2,1,0} tmp_5)\n  tmp_11 = f64[16,2,32,32,32]{4,3,2,1,0} real(c128[16,2,32,32,32]{4,3,2,1,0} tmp_10)\n  tmp_12 = f64[16,2,32,32,32]{4,3,2,1,0} multiply(f64[16,2,32,32,32]{4,3,2,1,0} tmp_1, f64[16,2,32,32,32]{4,3,2,1,0} tmp_11)\n  tmp_13 = f64[32,32,32,32]{3,2,1,0} bitcast(f64[16,2,32,32,32]{4,3,2,1,0} tmp_12)\n  tmp_14 = f64[] constant(0)\n  ROOT tmp_15 = f64[32,32,32]{2,1,0} reduce(f64[32,32,32,32]{3,2,1,0} tmp_13, f64[] tmp_14), dimensions={0}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[2048]{0} parameter(0)\n  tmp_1 = f64[] constant({...})\n  ROOT tmp_2 = f64[] reduce(f64[2048]{0} tmp_0, f64[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "BLOCK_LEVEL_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.BlockLevelFusionConfig"
+        value: "\020\004\032\000 \001(\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[32,32,32]{2,1,0} parameter(0)\n  tmp_1 = f64[128,256]{1,0} bitcast(f64[32,32,32]{2,1,0} tmp_0)\n  tmp_2 = f64[] constant(0)\n  ROOT tmp_3 = f64[128]{0} reduce(f64[128,256]{1,0} tmp_1, f64[] tmp_2), dimensions={1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[32,32,32]{2,1,0} parameter(0)\n  tmp_1 = f64[128,256]{1,0} bitcast(f64[32,32,32]{2,1,0} tmp_0)\n  tmp_2 = f64[] constant({...})\n  ROOT tmp_3 = f64[128]{0} reduce(f64[128,256]{1,0} tmp_1, f64[] tmp_2), dimensions={1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[48,32768]{1,0} parameter(0)\n  tmp_1 = f64[] constant(0)\n  ROOT tmp_2 = f64[32768]{0} reduce(f64[48,32768]{1,0} tmp_0, f64[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "BLOCK_LEVEL_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.BlockLevelFusionConfig"
+        value: "\020\002\032\003\n\001\010 \001(\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[512,48]{1,0} parameter(0)\n  tmp_1 = f64[128,192]{1,0} bitcast(f64[512,48]{1,0} tmp_0)\n  tmp_2 = f64[] constant({...})\n  tmp_3 = f64[128]{0} reduce(f64[128,192]{1,0} tmp_1, f64[] tmp_2), dimensions={1}\n  tmp_4 = f64[] constant({...})\n  tmp_5 = f64[128]{0} reduce(f64[128,192]{1,0} tmp_1, f64[] tmp_4), dimensions={1}\n  ROOT tmp_6 = (f64[128]{0}, f64[128]{0}) tuple(f64[128]{0} tmp_3, f64[128]{0} tmp_5)\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[512,48]{1,0} parameter(0)\n  tmp_1 = f64[] constant(0)\n  ROOT tmp_2 = f64[512]{0} reduce(f64[512,48]{1,0} tmp_0, f64[] tmp_1), dimensions={1}\n}"
+  result {
+    other {
+      name: "BLOCK_LEVEL_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.BlockLevelFusionConfig"
+        value: "\020\002\032\003\n\001\010 \001(\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[512,48]{1,0} parameter(0)\n  tmp_1 = pred[512,48]{1,0} is-finite(f64[512,48]{1,0} tmp_0)\n  tmp_2 = pred[512,48]{1,0} not(pred[512,48]{1,0} tmp_1)\n  tmp_3 = s32[512,48]{1,0} convert(pred[512,48]{1,0} tmp_2)\n  tmp_4 = s64[512,48]{1,0} convert(s32[512,48]{1,0} tmp_3)\n  tmp_5 = s64[128,192]{1,0} bitcast(s64[512,48]{1,0} tmp_4)\n  tmp_6 = s64[] constant(0)\n  tmp_7 = s64[128]{0} reduce(s64[128,192]{1,0} tmp_5, s64[] tmp_6), dimensions={1}\n  tmp_8 = pred[512,48]{1,0} compare(f64[512,48]{1,0} tmp_0, f64[512,48]{1,0} tmp_0), direction=NE\n  tmp_9 = s32[512,48]{1,0} convert(pred[512,48]{1,0} tmp_8)\n  tmp_10 = s64[512,48]{1,0} convert(s32[512,48]{1,0} tmp_9)\n  tmp_11 = s64[128,192]{1,0} bitcast(s64[512,48]{1,0} tmp_10)\n  tmp_12 = s64[128]{0} reduce(s64[128,192]{1,0} tmp_11, s64[] tmp_6), dimensions={1}\n  tmp_13 = f64[512,48]{1,0} abs(f64[512,48]{1,0} tmp_0)\n  tmp_14 = f64[] constant(0)\n  tmp_15 = f64[512,48]{1,0} broadcast(f64[] tmp_14), dimensions={}\n  tmp_16 = f64[512,48]{1,0} select(pred[512,48]{1,0} tmp_1, f64[512,48]{1,0} tmp_13, f64[512,48]{1,0} tmp_15)\n  tmp_17 = f64[128,192]{1,0} bitcast(f64[512,48]{1,0} tmp_16)\n  tmp_18 = f64[] constant({...})\n  tmp_19 = f64[128]{0} reduce(f64[128,192]{1,0} tmp_17, f64[] tmp_18), dimensions={1}\n  ROOT tmp_20 = (s64[128]{0}, s64[128]{0}, f64[128]{0}) tuple(s64[128]{0} tmp_7, s64[128]{0} tmp_12, f64[128]{0} tmp_19)\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[512]{0} parameter(0)\n  tmp_1 = f64[512]{0} parameter(1)\n  tmp_2 = f64[512]{0} multiply(f64[512]{0} tmp_0, f64[512]{0} tmp_1)\n  tmp_3 = f64[] constant(0)\n  ROOT tmp_4 = f64[] reduce(f64[512]{0} tmp_2, f64[] tmp_3), dimensions={0}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[6400]{0} parameter(0)\n  tmp_1 = f64[] constant({...})\n  ROOT tmp_2 = f64[] reduce(f64[6400]{0} tmp_0, f64[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "BLOCK_LEVEL_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.BlockLevelFusionConfig"
+        value: "\020\010\032\000 \001(\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[] constant(1)\n  tmp_1 = f64[512,48]{1,0} broadcast(f64[] tmp_0), dimensions={}\n  tmp_2 = f64[512,48]{1,0} parameter(2)\n  tmp_3 = f64[] parameter(3)\n  tmp_4 = f64[] parameter(4)\n  tmp_5 = f64[] add(f64[] tmp_3, f64[] tmp_4)\n  tmp_6 = f64[] constant({...})\n  tmp_7 = f64[] multiply(f64[] tmp_5, f64[] tmp_6)\n  tmp_8 = f64[512,48]{1,0} broadcast(f64[] tmp_7), dimensions={}\n  tmp_9 = f64[512,48]{1,0} subtract(f64[512,48]{1,0} tmp_2, f64[512,48]{1,0} tmp_8)\n  tmp_10 = f64[] parameter(1)\n  tmp_11 = f64[] constant({...})\n  tmp_12 = f64[] multiply(f64[] tmp_10, f64[] tmp_11)\n  tmp_13 = f64[512,48]{1,0} broadcast(f64[] tmp_12), dimensions={}\n  tmp_14 = f64[512,48]{1,0} divide(f64[512,48]{1,0} tmp_9, f64[512,48]{1,0} tmp_13)\n  tmp_15 = f64[512,48]{1,0} erf(f64[512,48]{1,0} tmp_14)\n  tmp_16 = f64[512,48]{1,0} subtract(f64[512,48]{1,0} tmp_1, f64[512,48]{1,0} tmp_15)\n  tmp_17 = f64[512,48]{1,0} broadcast(f64[] tmp_6), dimensions={}\n  tmp_18 = f64[512,48]{1,0} multiply(f64[512,48]{1,0} tmp_16, f64[512,48]{1,0} tmp_17)\n  tmp_19 = pred[512,48]{1,0} is-finite(f64[512,48]{1,0} tmp_14)\n  tmp_20 = f64[512,48]{1,0} multiply(f64[512,48]{1,0} tmp_14, f64[512,48]{1,0} tmp_14)\n  tmp_21 = f64[512,48]{1,0} negate(f64[512,48]{1,0} tmp_20)\n  tmp_22 = f64[512,48]{1,0} exponential(f64[512,48]{1,0} tmp_21)\n  tmp_23 = f64[512,48]{1,0} multiply(f64[512,48]{1,0} tmp_14, f64[512,48]{1,0} tmp_22)\n  tmp_24 = f64[] constant(0)\n  tmp_25 = f64[512,48]{1,0} broadcast(f64[] tmp_24), dimensions={}\n  tmp_26 = f64[512,48]{1,0} select(pred[512,48]{1,0} tmp_19, f64[512,48]{1,0} tmp_23, f64[512,48]{1,0} tmp_25)\n  tmp_27 = f64[] constant({...})\n  tmp_28 = f64[512,48]{1,0} broadcast(f64[] tmp_27), dimensions={}\n  tmp_29 = f64[512,48]{1,0} multiply(f64[512,48]{1,0} tmp_26, f64[512,48]{1,0} tmp_28)\n  tmp_30 = f64[512,48]{1,0} subtract(f64[512,48]{1,0} tmp_18, f64[512,48]{1,0} tmp_29)\n  tmp_31 = f64[512,48]{1,0} abs(f64[512,48]{1,0} tmp_30)\n  tmp_32 = f64[] parameter(0)\n  tmp_33 = f64[512,48]{1,0} broadcast(f64[] tmp_32), dimensions={}\n  tmp_34 = pred[512,48]{1,0} compare(f64[512,48]{1,0} tmp_31, f64[512,48]{1,0} tmp_33), direction=LT\n  tmp_35 = f64[512,48]{1,0} select(pred[512,48]{1,0} tmp_34, f64[512,48]{1,0} tmp_25, f64[512,48]{1,0} tmp_30)\n  tmp_36 = f64[512,48]{1,0} subtract(f64[512,48]{1,0} tmp_1, f64[512,48]{1,0} tmp_35)\n  tmp_37 = f64[512,48]{1,0} abs(f64[512,48]{1,0} tmp_36)\n  tmp_38 = pred[512,48]{1,0} compare(f64[512,48]{1,0} tmp_37, f64[512,48]{1,0} tmp_33), direction=LT\n  tmp_39 = f64[512,48]{1,0} select(pred[512,48]{1,0} tmp_38, f64[512,48]{1,0} tmp_1, f64[512,48]{1,0} tmp_35)\n  ROOT tmp_40 = f64[512]{0} reduce(f64[512,48]{1,0} tmp_39, f64[] tmp_24), dimensions={1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = f64[] parameter(1)\n  tmp_1 = f64[1]{0} bitcast(f64[] tmp_0)\n  tmp_2 = f64[] parameter(0)\n  tmp_3 = f64[1]{0} bitcast(f64[] tmp_2)\n  tmp_4 = f64[128]{0} parameter(2)\n  tmp_5 = f64[] constant({...})\n  tmp_6 = f64[] reduce(f64[128]{0} tmp_4, f64[] tmp_5), dimensions={0}\n  tmp_7 = f64[1]{0} bitcast(f64[] tmp_6)\n  ROOT tmp_8 = f64[3]{0} concatenate(f64[1]{0} tmp_1, f64[1]{0} tmp_3, f64[1]{0} tmp_7), dimensions={0}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = pred[310,310]{1,0} parameter(0)\n  tmp_1 = c128[310,310]{1,0} parameter(1)\n  tmp_2 = c128[] constant(0)\n  tmp_3 = c128[310,310]{1,0} broadcast(c128[] tmp_2), dimensions={}\n  tmp_4 = c128[310,310]{1,0} select(pred[310,310]{1,0} tmp_0, c128[310,310]{1,0} tmp_1, c128[310,310]{1,0} tmp_3)\n  ROOT tmp_5 = c128[310]{0} reduce(c128[310,310]{1,0} tmp_4, c128[] tmp_2), dimensions={1}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = s64[128]{0} parameter(0)\n  tmp_1 = s64[] constant(0)\n  tmp_2 = s64[] reduce(s64[128]{0} tmp_0, s64[] tmp_1), dimensions={0}\n  ROOT tmp_3 = f64[] convert(s64[] tmp_2)\n}"
+  result {
+    other {
+      name: "BLOCK_LEVEL_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.BlockLevelFusionConfig"
+        value: "\020\001\032\000 \001(\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = s64[2048]{0} parameter(0)\n  tmp_1 = s64[] constant(0)\n  ROOT tmp_2 = s64[] reduce(s64[2048]{0} tmp_0, s64[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "BLOCK_LEVEL_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.BlockLevelFusionConfig"
+        value: "\020\004\032\000 \001(\001"
+      }
+    }
+  }
+  version: 25
+}
+results {
+  device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 9.24.0"
+  hlo: "{\n  tmp_0 = s64[6400]{0} parameter(0)\n  tmp_1 = s64[] constant(0)\n  ROOT tmp_2 = s64[] reduce(s64[6400]{0} tmp_0, s64[] tmp_1), dimensions={0}\n}"
+  result {
+    other {
+      name: "NATIVE_EMITTER"
+      config {
+        type_url: "type.googleapis.com/xla.gpu.NativeEmitterBackendConfig"
+      }
+    }
+  }
+  version: 25
+}

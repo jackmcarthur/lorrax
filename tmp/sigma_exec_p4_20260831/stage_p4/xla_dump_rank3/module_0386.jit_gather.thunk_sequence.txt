@@ -1,0 +1,1 @@
+001: kKernel	, kernel = loop_dynamic_slice_fusion, profile_annotation = loop_dynamic_slice_fusion, launch dimensions = blocks: {576, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt

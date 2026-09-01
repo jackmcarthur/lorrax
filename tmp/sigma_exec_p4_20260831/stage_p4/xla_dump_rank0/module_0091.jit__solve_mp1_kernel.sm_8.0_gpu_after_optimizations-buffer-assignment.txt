@@ -1,0 +1,568 @@
+BufferAssignment:
+allocation 0: size 196608, maybe-live-out:
+ value: <89 input_reduce_fusion.1 @0> (size=4096,offset=0): f64[512]{0}
+ value: <91 loop_select_fusion.1 @0> (size=8,offset=0): f64[]
+ value: <162 input_reduce_fusion.2{0} @0> (size=1024,offset=0): f64[128]{0}
+ value: <168 loop_add_fusion.1 @0> (size=8,offset=0): f64[]
+ value: <175 loop_select_fusion.2 @0> (size=196608,offset=0): f64[512,48]{1,0}
+ value: <181 arg_tuple.3{2} (phi) @0> (size=8,offset=0): f64[]
+ value: <190 arg_tuple.1{2} (phi) @0> (size=8,offset=0): f64[]
+ value: <200 while.6{2} (phi) @0> (size=8,offset=0): f64[]
+allocation 1: size 196608, parameter 0, shape |f64[512,48]| at ShapeIndex {}:
+ value: <160 E.1 @0> (size=196608,offset=0): f64[512,48]{1,0}
+allocation 2: size 4096, parameter 1, shape |f64[512]| at ShapeIndex {}:
+ value: <170 w.1 @0> (size=4096,offset=0): f64[512]{0}
+allocation 3: size 8, thread-local:
+ value: <11 reduce_sum.6.0 @0> (size=8,offset=0): f64[]
+allocation 4: size 16, output shape is |(f64[], f64[512,48])|, maybe-live-out:
+ value: <176 tuple.5.0{} @0> (size=16,offset=0): (f64[], f64[512,48]{1,0})
+allocation 5: size 8, thread-local:
+ value: <10 reduce_sum.2 @0> (size=8,offset=0): f64[]
+allocation 6: size 8, maybe-live-out:
+ value: <87 loop_add_fusion @0> (size=8,offset=0): s64[]
+ value: <159 copy.10 @0> (size=8,offset=0): s64[]
+ value: <174 loop_multiply_fusion @0> (size=8,offset=0): f64[]
+ value: <179 arg_tuple.3{0} (phi) @0> (size=8,offset=0): s64[]
+ value: <188 arg_tuple.1{0} (phi) @0> (size=8,offset=0): s64[]
+ value: <198 while.6{0} (phi) @0> (size=8,offset=0): s64[]
+allocation 7: size 8, constant:
+ value: <158 constant_36_0 @0> (size=8,offset=0): s64[]
+allocation 8: size 8, parameter 3, shape |f64[]| at ShapeIndex {}:
+ value: <165 broadening.1 @0> (size=8,offset=0): f64[]
+allocation 9: size 8, parameter 5, shape |f64[]| at ShapeIndex {}:
+ value: <169 clamp_tol.1 @0> (size=8,offset=0): f64[]
+allocation 10: size 8, parameter 4, shape |f64[]| at ShapeIndex {}:
+ value: <171 capacity.1 @0> (size=8,offset=0): f64[]
+allocation 11: size 8, parameter 2, shape |f64[]| at ShapeIndex {}:
+ value: <172 target.1 @0> (size=8,offset=0): f64[]
+allocation 12: size 8, thread-local:
+ value: <9 reduce_sum.1 @0> (size=8,offset=0): f64[]
+allocation 13: size 8, thread-local:
+ value: <0 reduce_min.3 @0> (size=8,offset=0): f64[]
+allocation 14: size 8, thread-local:
+ value: <1 reduce_min.4 @0> (size=8,offset=0): f64[]
+allocation 15: size 8, thread-local:
+ value: <2 reduce_min.5.0 @0> (size=8,offset=0): f64[]
+allocation 16: size 8, thread-local:
+ value: <3 reduce_max.3 @0> (size=8,offset=0): f64[]
+allocation 17: size 8, thread-local:
+ value: <4 reduce_max.4 @0> (size=8,offset=0): f64[]
+allocation 18: size 8, thread-local:
+ value: <5 reduce_max.5.0 @0> (size=8,offset=0): f64[]
+allocation 19: size 8, thread-local:
+ value: <6 reduce_sum.3 @0> (size=8,offset=0): f64[]
+allocation 20: size 8, thread-local:
+ value: <7 reduce_sum.4 @0> (size=8,offset=0): f64[]
+allocation 21: size 8, thread-local:
+ value: <8 reduce_sum.5.0 @0> (size=8,offset=0): f64[]
+allocation 22: size 1608, preallocated-temp:
+ value: <15 loop_compare_fusion @0> (size=1,offset=256): pred[]
+ value: <88 copy.5 @0> (size=8,offset=256): f64[]
+ value: <90 input_reduce_fusion @0> (size=8,offset=512): f64[]
+ value: <92 loop_select_fusion @0> (size=8,offset=0): f64[]
+ value: <93 tuple.7{} @0> (size=72,offset=1536): (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[])
+ value: <161 input_reduce_fusion.2{} @0> (size=16,offset=1280): (f64[128]{0}, f64[128]{0})
+ value: <163 input_reduce_fusion.2{1} @0> (size=1024,offset=0): f64[128]{0}
+ value: <164 input_reduce_fusion.3 @0> (size=8,offset=1024): f64[]
+ value: <166 loop_subtract_fusion @0> (size=8,offset=0): f64[]
+ value: <167 input_reduce_fusion.4 @0> (size=8,offset=256): f64[]
+ value: <173 tuple.4{} @0> (size=72,offset=1536): (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[])
+ value: <177 arg_tuple.3{} (phi) @0> (size=72,offset=1536): (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[])
+ value: <178 arg_tuple.1{} (phi) @0> (size=72,offset=1536): (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[])
+ value: <180 arg_tuple.3{1} (phi) @0> (size=8,offset=0): f64[]
+ value: <189 arg_tuple.1{1} (phi) @0> (size=8,offset=0): f64[]
+ value: <197 while.6{} (phi) @0> (size=72,offset=1536): (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[])
+ value: <199 while.6{1} (phi) @0> (size=8,offset=0): f64[]
+
+Total bytes used: 399080 (389.7KiB)
+
+Used values:
+<0 reduce_min.3 @0>
+ positions:
+  reduce_min.3
+ uses:
+  reduce_min.5.0, operand 0
+ from instruction: %reduce_min.3 = f64[] parameter(0), metadata={op_name="reduce_min"}
+<1 reduce_min.4 @0>
+ positions:
+  reduce_min.4
+ uses:
+  reduce_min.5.0, operand 1
+ from instruction: %reduce_min.4 = f64[] parameter(1), metadata={op_name="reduce_min"}
+<2 reduce_min.5.0 @0>
+ positions:
+  reduce_min.5.0
+ uses:
+ from instruction: %reduce_min.5.0 = f64[] minimum(%reduce_min.3, %reduce_min.4), metadata={op_name="jit(_solve_mp1_kernel)/reduce_min" stack_frame_id=7}
+<3 reduce_max.3 @0>
+ positions:
+  reduce_max.3
+ uses:
+  reduce_max.5.0, operand 0
+ from instruction: %reduce_max.3 = f64[] parameter(0), metadata={op_name="reduce_max"}
+<4 reduce_max.4 @0>
+ positions:
+  reduce_max.4
+ uses:
+  reduce_max.5.0, operand 1
+ from instruction: %reduce_max.4 = f64[] parameter(1), metadata={op_name="reduce_max"}
+<5 reduce_max.5.0 @0>
+ positions:
+  reduce_max.5.0
+ uses:
+ from instruction: %reduce_max.5.0 = f64[] maximum(%reduce_max.3, %reduce_max.4), metadata={op_name="jit(_solve_mp1_kernel)/reduce_max" stack_frame_id=8}
+<6 reduce_sum.3 @0>
+ positions:
+  reduce_sum.3
+ uses:
+  reduce_sum.5.0, operand 0
+ from instruction: %reduce_sum.3 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+<7 reduce_sum.4 @0>
+ positions:
+  reduce_sum.4
+ uses:
+  reduce_sum.5.0, operand 1
+ from instruction: %reduce_sum.4 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+<8 reduce_sum.5.0 @0>
+ positions:
+  reduce_sum.5.0
+ uses:
+ from instruction: %reduce_sum.5.0 = f64[] add(%reduce_sum.3, %reduce_sum.4), metadata={op_name="k,kn->/reduce_sum" stack_frame_id=10}
+<9 reduce_sum.1 @0>
+ positions:
+  reduce_sum.1
+ uses:
+  reduce_sum.6.0, operand 0
+ from instruction: %reduce_sum.1 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+<10 reduce_sum.2 @0>
+ positions:
+  reduce_sum.2
+ uses:
+  reduce_sum.6.0, operand 1
+ from instruction: %reduce_sum.2 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+<11 reduce_sum.6.0 @0>
+ positions:
+  reduce_sum.6.0
+ uses:
+ from instruction: %reduce_sum.6.0 = f64[] add(%reduce_sum.1, %reduce_sum.2), metadata={op_name="k,kn->/reduce_sum" stack_frame_id=10}
+<15 loop_compare_fusion @0>
+ positions:
+  loop_compare_fusion
+ uses:
+ from instruction: %loop_compare_fusion = pred[] fusion(%get-tuple-element.27.0), kind=kLoop, calls=%fused_compare, metadata={op_name="jit(_solve_mp1_kernel)/while/cond/lt" stack_frame_id=38}
+<87 loop_add_fusion @0>
+ positions:
+  loop_add_fusion
+  tuple.7 {0}
+ uses:
+  tuple.7, operand 0
+ from instruction: %loop_add_fusion = s64[] fusion(%get-tuple-element.20), kind=kLoop, calls=%fused_add, metadata={op_name="jit(_solve_mp1_kernel)/while/body/add" stack_frame_id=38}
+<88 copy.5 @0>
+ positions:
+  copy.5
+ uses:
+  input_reduce_fusion.1, operand 4
+  loop_select_fusion.1, operand 0
+  loop_select_fusion, operand 4
+ from instruction: %copy.5 = f64[] copy(%get-tuple-element.22)
+<89 input_reduce_fusion.1 @0>
+ positions:
+  input_reduce_fusion.1
+ uses:
+  input_reduce_fusion, operand 1
+ from instruction: %input_reduce_fusion.1 = f64[512]{0} fusion(%get-tuple-element.43, %get-tuple-element.42, %get-tuple-element.41, %get-tuple-element.21, %copy.5), kind=kInput, calls=%fused_reduce.1, metadata={op_name="jit(_solve_mp1_kernel)/while/body/closed_call/k,kn->/reduce_sum" stack_frame_id=10}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<90 input_reduce_fusion @0>
+ positions:
+  input_reduce_fusion
+ uses:
+  loop_select_fusion.1, operand 3
+  loop_select_fusion, operand 3
+ from instruction: %input_reduce_fusion = f64[] fusion(%get-tuple-element.44, %input_reduce_fusion.1), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(_solve_mp1_kernel)/while/body/closed_call/k,kn->/dot_general" stack_frame_id=10}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<91 loop_select_fusion.1 @0>
+ positions:
+  loop_select_fusion.1
+  tuple.7 {2}
+ uses:
+  tuple.7, operand 2
+ from instruction: %loop_select_fusion.1 = f64[] fusion(%copy.5, %get-tuple-element.46, %get-tuple-element.45, %input_reduce_fusion, %get-tuple-element.21), kind=kLoop, calls=%fused_select.1, control-predecessors={%input_reduce_fusion.1}, metadata={op_name="jit(_solve_mp1_kernel)/while/body/closed_call/jit(_where)/select_n"}
+<92 loop_select_fusion @0>
+ positions:
+  loop_select_fusion
+  tuple.7 {1}
+ uses:
+  tuple.7, operand 1
+ from instruction: %loop_select_fusion = f64[] fusion(%get-tuple-element.21, %get-tuple-element.46, %get-tuple-element.45, %input_reduce_fusion, %copy.5), kind=kLoop, calls=%fused_select, control-predecessors={%loop_select_fusion.1, %input_reduce_fusion.1}, metadata={op_name="jit(_solve_mp1_kernel)/while/body/closed_call/jit(_where)/select_n"}
+<93 tuple.7{} @0>
+ positions:
+  tuple.7 {}
+ uses:
+ from instruction: %tuple.7 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) tuple(%loop_add_fusion, %loop_select_fusion, %loop_select_fusion.1, %get-tuple-element.41, %get-tuple-element.42, /*index=5*/%get-tuple-element.43, %get-tuple-element.44, %get-tuple-element.45, %get-tuple-element.46)
+<158 constant_36_0 @0>
+ positions:
+  constant_36_0
+ uses:
+  copy.10, operand 0
+ from instruction: %constant_36_0 = s64[] constant(0)
+<159 copy.10 @0>
+ positions:
+  copy.10
+  tuple.4 {0}
+ uses:
+  while.6, operand 0 {0}
+ from instruction: %copy.10 = s64[] copy(%constant_36_0)
+<160 E.1 @0>
+ positions:
+  E.1
+  arg_tuple.1 {3}
+  get-tuple-element.41
+  tuple.7 {3}
+  arg_tuple.3 {3}
+  while.6 {3}
+  tuple.4 {3}
+ uses:
+  input_reduce_fusion.2, operand 0
+  loop_select_fusion.2, operand 1
+  tuple.7, operand 3
+  input_reduce_fusion.1, operand 2
+  while.6, operand 0 {3}
+ from instruction: %E.1 = f64[512,48]{1,0} parameter(0), metadata={op_name="E"}
+<161 input_reduce_fusion.2{} @0>
+ positions:
+  input_reduce_fusion.2 {}
+ uses:
+  get-tuple-element, operand 0 {}
+  get-tuple-element.1, operand 0 {}
+ from instruction: %input_reduce_fusion.2 = (f64[128]{0}, f64[128]{0}) fusion(%E.1), kind=kInput, calls=%fused_reduce.2, metadata={op_name="jit(_solve_mp1_kernel)/reduce_max" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<162 input_reduce_fusion.2{0} @0>
+ positions:
+  input_reduce_fusion.2 {0}
+  get-tuple-element
+ uses:
+  input_reduce_fusion.4, operand 0
+ from instruction: %input_reduce_fusion.2 = (f64[128]{0}, f64[128]{0}) fusion(%E.1), kind=kInput, calls=%fused_reduce.2, metadata={op_name="jit(_solve_mp1_kernel)/reduce_max" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<163 input_reduce_fusion.2{1} @0>
+ positions:
+  input_reduce_fusion.2 {1}
+  get-tuple-element.1
+ uses:
+  input_reduce_fusion.3, operand 0
+ from instruction: %input_reduce_fusion.2 = (f64[128]{0}, f64[128]{0}) fusion(%E.1), kind=kInput, calls=%fused_reduce.2, metadata={op_name="jit(_solve_mp1_kernel)/reduce_max" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<164 input_reduce_fusion.3 @0>
+ positions:
+  input_reduce_fusion.3
+ uses:
+  loop_subtract_fusion, operand 0
+ from instruction: %input_reduce_fusion.3 = f64[] fusion(%get-tuple-element.1), kind=kCustom, calls=%fused_reduce.3, metadata={op_name="jit(_solve_mp1_kernel)/reduce_min" stack_frame_id=7}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"1","output_tiles":[{"sizes":[]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<165 broadening.1 @0>
+ positions:
+  broadening.1
+  arg_tuple.1 {4}
+  get-tuple-element.42
+  tuple.7 {4}
+  arg_tuple.3 {4}
+  while.6 {4}
+  tuple.4 {4}
+ uses:
+  loop_add_fusion.1, operand 1
+  loop_select_fusion.2, operand 3
+  loop_subtract_fusion, operand 1
+  tuple.7, operand 4
+  input_reduce_fusion.1, operand 1
+  while.6, operand 0 {4}
+ from instruction: %broadening.1 = f64[] parameter(3), metadata={op_name="broadening"}
+<166 loop_subtract_fusion @0>
+ positions:
+  loop_subtract_fusion
+  tuple.4 {1}
+ uses:
+  while.6, operand 0 {1}
+ from instruction: %loop_subtract_fusion = f64[] fusion(%input_reduce_fusion.3, %broadening.1), kind=kLoop, calls=%fused_subtract, metadata={op_name="jit(_solve_mp1_kernel)/sub" stack_frame_id=7}
+<167 input_reduce_fusion.4 @0>
+ positions:
+  input_reduce_fusion.4
+ uses:
+  loop_add_fusion.1, operand 0
+ from instruction: %input_reduce_fusion.4 = f64[] fusion(%get-tuple-element), kind=kCustom, calls=%fused_reduce.4, metadata={op_name="jit(_solve_mp1_kernel)/reduce_max" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"1","output_tiles":[{"sizes":[]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<168 loop_add_fusion.1 @0>
+ positions:
+  loop_add_fusion.1
+  tuple.4 {2}
+ uses:
+  while.6, operand 0 {2}
+ from instruction: %loop_add_fusion.1 = f64[] fusion(%input_reduce_fusion.4, %broadening.1), kind=kLoop, calls=%fused_add.1, metadata={op_name="jit(_solve_mp1_kernel)/add" stack_frame_id=8}
+<169 clamp_tol.1 @0>
+ positions:
+  clamp_tol.1
+  arg_tuple.1 {5}
+  get-tuple-element.43
+  tuple.7 {5}
+  arg_tuple.3 {5}
+  while.6 {5}
+  tuple.4 {5}
+ uses:
+  loop_select_fusion.2, operand 0
+  tuple.7, operand 5
+  input_reduce_fusion.1, operand 0
+  while.6, operand 0 {5}
+ from instruction: %clamp_tol.1 = f64[] parameter(5), metadata={op_name="clamp_tol"}
+<170 w.1 @0>
+ positions:
+  w.1
+  arg_tuple.1 {6}
+  get-tuple-element.44
+  tuple.7 {6}
+  arg_tuple.3 {6}
+  while.6 {6}
+  tuple.4 {6}
+ uses:
+  tuple.7, operand 6
+  input_reduce_fusion, operand 0
+  while.6, operand 0 {6}
+ from instruction: %w.1 = f64[512]{0} parameter(1), metadata={op_name="w"}
+<171 capacity.1 @0>
+ positions:
+  capacity.1
+  arg_tuple.1 {7}
+  get-tuple-element.45
+  tuple.7 {7}
+  arg_tuple.3 {7}
+  while.6 {7}
+  tuple.4 {7}
+ uses:
+  loop_select_fusion, operand 2
+  loop_select_fusion.1, operand 2
+  tuple.7, operand 7
+  while.6, operand 0 {7}
+ from instruction: %capacity.1 = f64[] parameter(4), metadata={op_name="capacity"}
+<172 target.1 @0>
+ positions:
+  target.1
+  arg_tuple.1 {8}
+  get-tuple-element.46
+  tuple.7 {8}
+  arg_tuple.3 {8}
+  while.6 {8}
+  tuple.4 {8}
+ uses:
+  loop_select_fusion, operand 1
+  loop_select_fusion.1, operand 1
+  tuple.7, operand 8
+  while.6, operand 0 {8}
+ from instruction: %target.1 = f64[] parameter(2), metadata={op_name="target"}
+<173 tuple.4{} @0>
+ positions:
+  tuple.4 {}
+ uses:
+  while.6, operand 0 {}
+ from instruction: %tuple.4 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) tuple(%copy.10, %loop_subtract_fusion, %loop_add_fusion.1, %E.1, %broadening.1, /*index=5*/%clamp_tol.1, %w.1, %capacity.1, %target.1)
+<174 loop_multiply_fusion @0>
+ positions:
+  loop_multiply_fusion
+  tuple.5.0 {0}
+ uses:
+  loop_select_fusion.2, operand 2
+  tuple.5.0, operand 0
+ from instruction: %loop_multiply_fusion = f64[] fusion(%while.8.0, %while.9.0), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(_solve_mp1_kernel)/mul" stack_frame_id=41}
+<175 loop_select_fusion.2 @0>
+ positions:
+  loop_select_fusion.2
+  tuple.5.0 {1}
+ uses:
+  tuple.5.0, operand 1
+ from instruction: %loop_select_fusion.2 = f64[512,48]{1,0} fusion(%clamp_tol.1, %E.1, %loop_multiply_fusion, %broadening.1), kind=kLoop, calls=%fused_select.2, metadata={op_name="jit(_solve_mp1_kernel)/jit(_where)/select_n"}
+<176 tuple.5.0{} @0>
+ positions:
+  tuple.5.0 {}
+ uses:
+ from instruction: %tuple.5.0 = (f64[], f64[512,48]{1,0}) tuple(%loop_multiply_fusion, %loop_select_fusion.2)
+<177 arg_tuple.3{} (phi) @0>
+ positions:
+  arg_tuple.3 {}
+ uses:
+  get-tuple-element.27.0, operand 0 {}
+ from instruction: %arg_tuple.3 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<178 arg_tuple.1{} (phi) @0>
+ positions:
+  arg_tuple.1 {}
+ uses:
+  get-tuple-element.46, operand 0 {}
+  get-tuple-element.45, operand 0 {}
+  get-tuple-element.44, operand 0 {}
+  get-tuple-element.43, operand 0 {}
+  get-tuple-element.42, operand 0 {}
+  get-tuple-element.41, operand 0 {}
+  get-tuple-element.22, operand 0 {}
+  get-tuple-element.21, operand 0 {}
+  get-tuple-element.20, operand 0 {}
+ from instruction: %arg_tuple.1 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<179 arg_tuple.3{0} (phi) @0>
+ positions:
+  arg_tuple.3 {0}
+  get-tuple-element.27.0
+ uses:
+  loop_compare_fusion, operand 0
+ from instruction: %arg_tuple.3 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<180 arg_tuple.3{1} (phi) @0>
+ positions:
+  arg_tuple.3 {1}
+ uses:
+ from instruction: %arg_tuple.3 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<181 arg_tuple.3{2} (phi) @0>
+ positions:
+  arg_tuple.3 {2}
+ uses:
+ from instruction: %arg_tuple.3 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<188 arg_tuple.1{0} (phi) @0>
+ positions:
+  arg_tuple.1 {0}
+  get-tuple-element.20
+ uses:
+  loop_add_fusion, operand 0
+ from instruction: %arg_tuple.1 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<189 arg_tuple.1{1} (phi) @0>
+ positions:
+  arg_tuple.1 {1}
+  get-tuple-element.21
+ uses:
+  loop_select_fusion.1, operand 4
+  input_reduce_fusion.1, operand 3
+  loop_select_fusion, operand 0
+ from instruction: %arg_tuple.1 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<190 arg_tuple.1{2} (phi) @0>
+ positions:
+  arg_tuple.1 {2}
+  get-tuple-element.22
+ uses:
+  copy.5, operand 0
+ from instruction: %arg_tuple.1 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) parameter(0)
+<197 while.6{} (phi) @0>
+ positions:
+  while.6 {}
+ uses:
+  while.9.0, operand 0 {}
+  while.8.0, operand 0 {}
+ from instruction: %while.6 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) while(%tuple.4), condition=%region_4.9, body=%region_2.8, metadata={op_name="jit(_solve_mp1_kernel)/while" stack_frame_id=37}, backend_config={"known_trip_count":{"n":"64"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"0"},"dynamic_variable_tuple_indices":[]}
+<198 while.6{0} (phi) @0>
+ positions:
+  while.6 {0}
+ uses:
+ from instruction: %while.6 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) while(%tuple.4), condition=%region_4.9, body=%region_2.8, metadata={op_name="jit(_solve_mp1_kernel)/while" stack_frame_id=37}, backend_config={"known_trip_count":{"n":"64"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"0"},"dynamic_variable_tuple_indices":[]}
+<199 while.6{1} (phi) @0>
+ positions:
+  while.6 {1}
+  while.8.0
+ uses:
+  loop_multiply_fusion, operand 0
+ from instruction: %while.6 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) while(%tuple.4), condition=%region_4.9, body=%region_2.8, metadata={op_name="jit(_solve_mp1_kernel)/while" stack_frame_id=37}, backend_config={"known_trip_count":{"n":"64"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"0"},"dynamic_variable_tuple_indices":[]}
+<200 while.6{2} (phi) @0>
+ positions:
+  while.6 {2}
+  while.9.0
+ uses:
+  loop_multiply_fusion, operand 1
+ from instruction: %while.6 = (s64[], f64[], f64[], f64[512,48]{1,0}, f64[], /*index=5*/f64[], f64[512]{0}, f64[], f64[]) while(%tuple.4), condition=%region_4.9, body=%region_2.8, metadata={op_name="jit(_solve_mp1_kernel)/while" stack_frame_id=37}, backend_config={"known_trip_count":{"n":"64"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"0"},"dynamic_variable_tuple_indices":[]}
+
+
+HloLiveRange (max 42):
+  InstructionSequence:
+    0:target.1
+    1:capacity.1
+    2:clamp_tol.1
+    3:broadening.1
+    4:constant_36_0
+    5:copy.10
+    6:E.1
+    7:w.1
+    8:input_reduce_fusion.2
+    9:get-tuple-element.1
+    10:input_reduce_fusion.3
+    11:loop_subtract_fusion
+    12:get-tuple-element
+    13:input_reduce_fusion.4
+    14:loop_add_fusion.1
+    15:tuple.4
+    16:arg_tuple.3
+    17:get-tuple-element.27.0
+    18:loop_compare_fusion
+    19:arg_tuple.1
+    20:get-tuple-element.20
+    21:loop_add_fusion
+    22:get-tuple-element.21
+    23:get-tuple-element.22
+    24:copy.5
+    25:get-tuple-element.42
+    26:get-tuple-element.43
+    27:get-tuple-element.45
+    28:get-tuple-element.46
+    29:get-tuple-element.41
+    30:get-tuple-element.44
+    31:input_reduce_fusion.1
+    32:input_reduce_fusion
+    33:loop_select_fusion.1
+    34:loop_select_fusion
+    35:tuple.7
+    36:while.6
+    37:while.8.0
+    38:while.9.0
+    39:loop_multiply_fusion
+    40:loop_select_fusion.2
+    41:tuple.5.0
+  BufferLiveRange:
+    loop_compare_fusion{}:18-19
+    loop_add_fusion{}:21-36
+    copy.5{}:24-34
+    input_reduce_fusion.1{}:31-32
+    input_reduce_fusion{}:32-34
+    loop_select_fusion.1{}:33-36
+    loop_select_fusion{}:34-36
+    tuple.7{}:35-36
+    constant_36_0{}:4-5
+    copy.10{}:5-16
+    E.1{}:0-42
+    input_reduce_fusion.2{}:8-12
+    input_reduce_fusion.2{0}:8-13
+    input_reduce_fusion.2{1}:8-10
+    input_reduce_fusion.3{}:10-11
+    broadening.1{}:0-42
+    loop_subtract_fusion{}:11-16
+    input_reduce_fusion.4{}:13-14
+    loop_add_fusion.1{}:14-16
+    clamp_tol.1{}:0-42
+    w.1{}:0-42
+    capacity.1{}:0-42
+    target.1{}:0-42
+    tuple.4{}:15-16
+    loop_multiply_fusion{}:39-42
+    loop_select_fusion.2{}:40-42
+    tuple.5.0{}:41-42
+    arg_tuple.3{}:16-19
+    arg_tuple.1{}:19-30
+    arg_tuple.3{0}:16-19
+    arg_tuple.3{1}:16-19
+    arg_tuple.3{2}:16-19
+    arg_tuple.1{0}:19-21
+    arg_tuple.1{1}:19-34
+    arg_tuple.1{2}:19-24
+    while.6{}:36-38
+    while.6{0}:36-36
+    while.6{1}:36-39
+    while.6{2}:36-39
+  Live ranges at 40 (peak):
+    E.1{}: 196608 bytes (cumulative: 196608 bytes)
+    loop_select_fusion.2{}: 196608 bytes (cumulative: 393216 bytes)
+    w.1{}: 4096 bytes (cumulative: 397312 bytes)
+    broadening.1{}: 8 bytes (cumulative: 397320 bytes)
+    capacity.1{}: 8 bytes (cumulative: 397328 bytes)
+    clamp_tol.1{}: 8 bytes (cumulative: 397336 bytes)
+    loop_multiply_fusion{}: 8 bytes (cumulative: 397344 bytes)
+    target.1{}: 8 bytes (cumulative: 397352 bytes)
+  Stack trace breakdown for peak usage: 397 352 bytes
+    main.10 (100.0%, total: 397 352 bytes, current: 0 bytes, remaining: 397 352 bytes)
+      ├── E (49.5%, total: 196 608 bytes, current: 196 608 bytes, remaining: 200 744 bytes)
+      ├── jit(_solve_mp1_kernel)/jit(_where)/select_n (49.5%, total: 196 608 bytes, current: 196 608 bytes, remaining: 4 136 bytes)
+      ├── w (1.0%, total: 4 096 bytes, current: 4 096 bytes, remaining: 40 bytes)
+      ├── broadening (0.0%, total: 8 bytes, current: 8 bytes, remaining: 32 bytes)
+      ├── capacity (0.0%, total: 8 bytes, current: 8 bytes, remaining: 24 bytes)
+      ├── clamp_tol (0.0%, total: 8 bytes, current: 8 bytes, remaining: 16 bytes)
+      ├── jit(_solve_mp1_kernel)/mul (0.0%, total: 8 bytes, current: 8 bytes, remaining: 8 bytes)
+      └── target (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

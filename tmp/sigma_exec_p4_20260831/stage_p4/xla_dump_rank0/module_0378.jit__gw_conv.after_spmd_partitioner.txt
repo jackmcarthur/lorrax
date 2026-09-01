@@ -1,0 +1,60 @@
+HloModule jit__gw_conv, buffer_donor={ (0, {}) }, entry_computation_layout={(c128[512,2,310,2,310]{4,3,2,1,0}, c128[512,310,310]{2,1,0})->c128[512,2,310,2,310]{4,3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/ppm_tau_kernel.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/ffi/fft.py"
+
+FunctionNames
+1 "compute_sigma_xc"
+2 "compute_sigma_c_mpa_omega_grid"
+3 "integrate_sigma_store"
+4 "integrate_sigma_store.<locals>.run"
+5 "_integrate_sigma_batches"
+6 "get_shared_sigma_tau_kernel.<locals>._tau_staged"
+7 "_get_sigma_kij_kernel.<locals>.staged"
+8 "_get_sigma_kij_kernel.<locals>._staged_impl"
+9 "get_sigma_spatial_kernel.<locals>.conv_project_staged"
+10 "make_gw_conv_ffi.<locals>._gw_conv"
+11 "make_gw_conv_ffi.<locals>._local"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=1066 end_line=1066 column=15 end_column=15}
+2 {file_name_id=2 function_name_id=2 line=541 end_line=541 column=15 end_column=15}
+3 {file_name_id=2 function_name_id=3 line=300 end_line=300 column=15 end_column=15}
+4 {file_name_id=2 function_name_id=4 line=295 end_line=295 column=15 end_column=15}
+5 {file_name_id=2 function_name_id=5 line=212 end_line=212 column=42 end_column=42}
+6 {file_name_id=3 function_name_id=6 line=1140 end_line=1140 column=15 end_column=15}
+7 {file_name_id=3 function_name_id=7 line=846 end_line=846 column=19 end_column=19}
+8 {file_name_id=3 function_name_id=8 line=816 end_line=816 column=19 end_column=19}
+9 {file_name_id=3 function_name_id=9 line=378 end_line=378 column=26 end_column=26}
+10 {file_name_id=4 function_name_id=10 line=516 end_line=516 column=15 end_column=15}
+11 {file_name_id=4 function_name_id=11 line=499 end_line=499 column=15 end_column=15}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=1}
+
+
+ENTRY %main.0_spmd (param.2: c128[512,2,310,2,310], param.3: c128[512,310,310]) -> c128[512,2,310,2,310] {
+  %param.2 = c128[512,2,310,2,310]{4,3,2,1,0} parameter(0), sharding={devices=[1,1,2,1,2]<=[4]}, metadata={op_name="G_flat"}
+  %shard_map.4 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%param.2), metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=10}
+  %copy = c128[512,2,310,2,310]{4,3,2,1,0} copy(%shard_map.4), metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=10}
+  %param.3 = c128[512,310,310]{2,1,0} parameter(1), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="W_flat"}
+  %shard_map.8 = c128[512,310,310]{2,1,0} copy(%param.3), metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=10}
+  %copy.1 = c128[512,310,310]{2,1,0} copy(%shard_map.8), metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=10}
+  %ffi_call.3 = c128[512,2,310,2,310]{4,3,2,1,0} custom-call(%copy, %copy.1), custom_call_target="lorrax_mklfft_gw_conv", operand_layout_constraints={c128[512,2,310,2,310]{4,3,2,1,0}, c128[512,310,310]{2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_gw_conv)/shard_map/ffi_call" stack_frame_id=11}, backend_config={nkx = 8 : i64, nky = 8 : i64, nkz = 8 : i64, scale_f = -0.0019531249999999996 : f64, scale_i = 0.044194173824159216 : f64}
+  %shard_map.18 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%ffi_call.3), metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=10}
+  ROOT %copy.2 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%shard_map.18), metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=10}
+}
+

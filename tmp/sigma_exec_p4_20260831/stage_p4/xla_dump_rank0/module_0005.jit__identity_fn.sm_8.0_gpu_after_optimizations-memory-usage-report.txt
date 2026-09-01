@@ -1,0 +1,15 @@
+Total bytes used: 176 (176B)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+      128B( 73%);        48B; allocation 0: size 128B, output shape is |f64[8,2]|, maybe-live-out:
+      160B( 91%);        16B; allocation 1: size 32B, parameter 0, shape |f64[2,2]| at ShapeIndex {}:
+      176B(100%);         0B; allocation 2: size 16B, preallocated-temp:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 128B, output shape is |f64[8,2]|, maybe-live-out:
+allocation 1: size 32B, parameter 0, shape |f64[2,2]| at ShapeIndex {}:
+allocation 2: size 16B, preallocated-temp:

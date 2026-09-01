@@ -1,0 +1,1 @@
+001: kKernel	, kernel = loop_reduce_fusion, profile_annotation = loop_reduce_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt

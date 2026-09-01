@@ -1,0 +1,83 @@
+HloModule jit__take, entry_computation_layout={(c128[512,24,24]{2,1,0}, s64[29]{0})->c128[29,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/dynamic_sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/sigma_output.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "write_sigma_omega"
+6 "write_sigma_omega_h5"
+7 "extract_and_stamp_k_irr"
+8 "star_select_k_irr"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1128 column=15 end_column=54}
+5 {file_name_id=3 function_name_id=4 line=425 end_line=455 column=34 end_column=13}
+6 {file_name_id=4 function_name_id=5 line=287 end_line=307 column=8 end_column=9}
+7 {file_name_id=5 function_name_id=6 line=1322 end_line=1323 column=43 end_column=66}
+8 {file_name_id=5 function_name_id=7 line=1029 end_line=1030 column=34 end_column=48}
+9 {file_name_id=5 function_name_id=8 line=806 end_line=806 column=9 end_column=32}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+
+
+%_where.1 (Arg_0.1: pred[29], Arg_1.1: s64[29], Arg_2.1: s64[29]) -> s64[29] {
+  %Arg_0.1 = pred[29]{0} parameter(0)
+  %Arg_1.1 = s64[29]{0} parameter(1)
+  %Arg_2.1 = s64[29]{0} parameter(2)
+  ROOT %select_n.1 = s64[29]{0} select(%Arg_0.1, %Arg_1.1, %Arg_2.1), metadata={op_name="select_n"}
+}
+
+%region_0.2 (reduce_and.3: pred[], reduce_and.4: pred[]) -> pred[] {
+  %reduce_and.3 = pred[] parameter(0), metadata={op_name="reduce_and"}
+  %reduce_and.4 = pred[] parameter(1), metadata={op_name="reduce_and"}
+  ROOT %reduce_and.5 = pred[] and(%reduce_and.3, %reduce_and.4), metadata={op_name="jit(_take)/reduce_and" stack_frame_id=9}
+}
+
+ENTRY %main.3 (a.1: c128[512,24,24], indices.1: s64[29]) -> c128[29,24,24] {
+  %indices.1 = s64[29]{0} parameter(1), metadata={op_name="indices"}
+  %constant.11 = s64[] constant(0)
+  %broadcast.7 = s64[29]{0} broadcast(%constant.11), dimensions={}
+  %lt.1 = pred[29]{0} compare(%indices.1, %broadcast.7), direction=LT, metadata={op_name="jit(_take)/lt" stack_frame_id=9}
+  %constant.9 = s64[] constant(512)
+  %broadcast.6 = s64[29]{0} broadcast(%constant.9), dimensions={}
+  %add.1 = s64[29]{0} add(%indices.1, %broadcast.6), metadata={op_name="jit(_take)/add" stack_frame_id=9}
+  %jit__where_.1 = s64[29]{0} call(%lt.1, %add.1, %indices.1), to_apply=%_where.1, metadata={op_name="jit(_take)/jit(_where)"}
+  %broadcast_in_dim.4 = s64[29,1]{1,0} reshape(%jit__where_.1), metadata={op_name="jit(_take)/broadcast_in_dim" stack_frame_id=9}
+  %convert_element_type.1 = s32[29,1]{1,0} convert(%broadcast_in_dim.4), metadata={op_name="jit(_take)/convert_element_type" stack_frame_id=9}
+  %constant.8 = s32[] constant(0)
+  %broadcast.5 = s32[29,1]{1,0} broadcast(%constant.8), dimensions={}
+  %ge.1 = pred[29,1]{1,0} compare(%convert_element_type.1, %broadcast.5), direction=GE, metadata={op_name="jit(_take)/ge" stack_frame_id=9}
+  %constant.7 = s32[] constant(511)
+  %broadcast.4 = s32[29,1]{1,0} broadcast(%constant.7), dimensions={}
+  %le.1 = pred[29,1]{1,0} compare(%convert_element_type.1, %broadcast.4), direction=LE, metadata={op_name="jit(_take)/le" stack_frame_id=9}
+  %and.1 = pred[29,1]{1,0} and(%ge.1, %le.1), metadata={op_name="jit(_take)/and" stack_frame_id=9}
+  %constant.10 = pred[] constant(true)
+  %reduce_and.7 = pred[29]{0} reduce(%and.1, %constant.10), dimensions={1}, to_apply=%region_0.2, metadata={op_name="jit(_take)/reduce_and" stack_frame_id=9}
+  %broadcast_in_dim.5 = pred[29,24,24]{2,1,0} broadcast(%reduce_and.7), dimensions={0}, metadata={op_name="jit(_take)/broadcast_in_dim" stack_frame_id=9}
+  %a.1 = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {}]>"}, metadata={op_name="a"}
+  %gather.1 = c128[29,24,24]{2,1,0} gather(%a.1, %convert_element_type.1), offset_dims={1,2}, collapsed_slice_dims={0}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,24,24}, metadata={op_name="jit(_take)/gather" stack_frame_id=9}
+  %constant.6 = c128[] constant((nan, 0))
+  %broadcast_in_dim.3 = c128[29,24,24]{2,1,0} broadcast(%constant.6), dimensions={}, metadata={op_name="jit(_take)/broadcast_in_dim" stack_frame_id=9}
+  ROOT %select_n.3 = c128[29,24,24]{2,1,0} select(%broadcast_in_dim.5, %gather.1, %broadcast_in_dim.3), metadata={op_name="jit(_take)/select_n" stack_frame_id=9}
+}
+

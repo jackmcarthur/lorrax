@@ -1,0 +1,43 @@
+Total bytes used: 221560 (216.4KiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  120.3KiB( 56%);    96.1KiB; allocation 11: size 120.3KiB, preallocated-temp:
+  216.3KiB(100%);        96B; allocation 0: size 96.0KiB, parameter 0, shape |f64[512,24]| at ShapeIndex {}:
+  216.3KiB(100%);        72B; allocation 1: size 24B, output shape is |f64[3]|, maybe-live-out:
+  216.3KiB(100%);        64B; allocation 2: size 8B, thread-local:
+  216.3KiB(100%);        56B; allocation 3: size 8B, thread-local:
+  216.3KiB(100%);        48B; allocation 4: size 8B, thread-local:
+  216.3KiB(100%);        40B; allocation 5: size 8B, thread-local:
+  216.3KiB(100%);        32B; allocation 6: size 8B, thread-local:
+  216.3KiB(100%);        24B; allocation 7: size 8B, thread-local:
+  216.4KiB(100%);        16B; allocation 8: size 8B, thread-local:
+  216.4KiB(100%);         8B; allocation 9: size 8B, thread-local:
+  216.4KiB(100%);         0B; allocation 10: size 8B, thread-local:
+
+
+Allocations sorted by size with their values:
+allocation 11: size 120.3KiB, preallocated-temp:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	  96.0KiB( 80%);    96.0KiB;            0;                1; f64[512,24]
+	 108.0KiB( 90%);    12.0KiB;        98304;                1; pred[512,24]
+	 120.0KiB(100%);    12.0KiB;       110592;                2; f64[], pred[512,24]
+	 120.0KiB(100%);        24B;       123136;                1; (pred[512,24], f64[512,24], pred[512,24])
+	 120.0KiB(100%);         8B;       122880;                1; f64[]
+	 120.0KiB(100%);         8B;       110848;                1; f64[]
+
+allocation 0: size 96.0KiB, parameter 0, shape |f64[512,24]| at ShapeIndex {}:
+allocation 1: size 24B, output shape is |f64[3]|, maybe-live-out:
+allocation 2: size 8B, thread-local:
+allocation 3: size 8B, thread-local:
+allocation 4: size 8B, thread-local:
+allocation 5: size 8B, thread-local:
+allocation 6: size 8B, thread-local:
+allocation 7: size 8B, thread-local:
+allocation 8: size 8B, thread-local:
+allocation 9: size 8B, thread-local:
+allocation 10: size 8B, thread-local:

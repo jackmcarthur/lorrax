@@ -1,0 +1,21 @@
+Total bytes used: 263200 (257.0KiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  256.0KiB(100%);     1.0KiB; allocation 0: size 256.0KiB, parameter 0, shape |f64[32,32,32]| at ShapeIndex {}:
+  257.0KiB(100%);        32B; allocation 5: size 1.0KiB, preallocated-temp:
+  257.0KiB(100%);        24B; allocation 1: size 8B, output shape is |f64[]|, maybe-live-out:
+  257.0KiB(100%);        16B; allocation 2: size 8B, thread-local:
+  257.0KiB(100%);         8B; allocation 3: size 8B, thread-local:
+  257.0KiB(100%);         0B; allocation 4: size 8B, thread-local:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 256.0KiB, parameter 0, shape |f64[32,32,32]| at ShapeIndex {}:
+allocation 5: size 1.0KiB, preallocated-temp:
+allocation 1: size 8B, output shape is |f64[]|, maybe-live-out:
+allocation 2: size 8B, thread-local:
+allocation 3: size 8B, thread-local:
+allocation 4: size 8B, thread-local:

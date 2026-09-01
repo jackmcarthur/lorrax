@@ -1,0 +1,155 @@
+HloModule jit__g_from_selector, entry_computation_layout={(c128[512,2,310,24]{3,2,1,0}, c128[512,24,2,310]{3,2,1,0}, f64[512,24]{1,0}, f64[512,24]{1,0}, f64[], /*index=5*/c128[])->c128[512,2,310,2,310]{4,3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false,true,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/ppm_tau_kernel.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/greens_function_kernel.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+
+FunctionNames
+1 "compute_sigma_c_mpa_omega_grid"
+2 "integrate_sigma_store"
+3 "integrate_sigma_store.<locals>.run"
+4 "_integrate_sigma_batches"
+5 "get_shared_sigma_tau_kernel.<locals>._tau_staged"
+6 "_get_sigma_kij_kernel.<locals>.staged"
+7 "_get_sigma_kij_kernel.<locals>._staged_impl"
+8 "_get_sigma_kij_kernel.<locals>._build_g_timed"
+9 "_get_sigma_kij_kernel.<locals>._g_from_selector"
+10 "build_G_tau"
+11 "compute_sigma_xc"
+12 "windowed_exp_iEt"
+13 "build_G"
+14 "_build_G_legacy"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=541 end_line=541 column=15 end_column=15}
+2 {file_name_id=1 function_name_id=2 line=300 end_line=300 column=15 end_column=15}
+3 {file_name_id=1 function_name_id=3 line=295 end_line=295 column=15 end_column=15}
+4 {file_name_id=1 function_name_id=4 line=212 end_line=212 column=42 end_column=42}
+5 {file_name_id=2 function_name_id=5 line=1140 end_line=1140 column=15 end_column=15}
+6 {file_name_id=2 function_name_id=6 line=846 end_line=846 column=19 end_column=19}
+7 {file_name_id=2 function_name_id=7 line=814 end_line=814 column=18 end_column=18}
+8 {file_name_id=2 function_name_id=8 line=804 end_line=804 column=18 end_column=18}
+9 {file_name_id=2 function_name_id=9 line=592 end_line=592 column=15 end_column=15}
+10 {file_name_id=3 function_name_id=10 line=346 end_line=346 column=17 end_column=17}
+11 {file_name_id=3 function_name_id=10 line=355 end_line=355 column=12 end_column=12}
+12 {file_name_id=4 function_name_id=11 line=1066 end_line=1066 column=15 end_column=15}
+13 {file_name_id=2 function_name_id=9 line=592 end_line=592 column=38 end_column=38}
+14 {file_name_id=3 function_name_id=10 line=343 end_line=343 column=13 end_column=13}
+15 {file_name_id=3 function_name_id=12 line=282 end_line=282 column=20 end_column=20}
+16 {file_name_id=3 function_name_id=12 line=282 end_line=282 column=26 end_column=26}
+17 {file_name_id=3 function_name_id=12 line=282 end_line=282 column=12 end_column=12}
+18 {file_name_id=3 function_name_id=10 line=355 end_line=355 column=27 end_column=27}
+19 {file_name_id=3 function_name_id=10 line=366 end_line=366 column=11 end_column=11}
+20 {file_name_id=3 function_name_id=13 line=207 end_line=207 column=15 end_column=15}
+21 {file_name_id=3 function_name_id=14 line=133 end_line=133 column=15 end_column=15}
+22 {file_name_id=3 function_name_id=14 line=134 end_line=134 column=51 end_column=51}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=10}
+12 {file_location_id=12 parent_frame_id=1}
+13 {file_location_id=1 parent_frame_id=13}
+14 {file_location_id=2 parent_frame_id=14}
+15 {file_location_id=3 parent_frame_id=15}
+16 {file_location_id=4 parent_frame_id=16}
+17 {file_location_id=5 parent_frame_id=17}
+18 {file_location_id=6 parent_frame_id=18}
+19 {file_location_id=7 parent_frame_id=19}
+20 {file_location_id=8 parent_frame_id=20}
+21 {file_location_id=13 parent_frame_id=21}
+22 {file_location_id=2 parent_frame_id=1}
+23 {file_location_id=3 parent_frame_id=23}
+24 {file_location_id=4 parent_frame_id=24}
+25 {file_location_id=5 parent_frame_id=25}
+26 {file_location_id=6 parent_frame_id=26}
+27 {file_location_id=7 parent_frame_id=27}
+28 {file_location_id=8 parent_frame_id=28}
+29 {file_location_id=9 parent_frame_id=29}
+30 {file_location_id=14 parent_frame_id=30}
+31 {file_location_id=15 parent_frame_id=31}
+32 {file_location_id=16 parent_frame_id=31}
+33 {file_location_id=17 parent_frame_id=31}
+34 {file_location_id=18 parent_frame_id=10}
+35 {file_location_id=3 parent_frame_id=1}
+36 {file_location_id=4 parent_frame_id=36}
+37 {file_location_id=5 parent_frame_id=37}
+38 {file_location_id=6 parent_frame_id=38}
+39 {file_location_id=7 parent_frame_id=39}
+40 {file_location_id=8 parent_frame_id=40}
+41 {file_location_id=9 parent_frame_id=41}
+42 {file_location_id=19 parent_frame_id=42}
+43 {file_location_id=20 parent_frame_id=43}
+44 {file_location_id=21 parent_frame_id=44}
+45 {file_location_id=22 parent_frame_id=44}
+46 {file_location_id=9 parent_frame_id=46}
+47 {file_location_id=19 parent_frame_id=47}
+48 {file_location_id=20 parent_frame_id=48}
+49 {file_location_id=22 parent_frame_id=49}
+
+
+ENTRY %main.1_spmd (param: c128[512,2,310,24], param.5: c128[512,24,2,310], param.3: f64[512,24], param.1: f64[512,24], param.4: f64[], param.2: c128[]) -> c128[512,2,310,2,310] {
+  %param = c128[512,2,310,24]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,1,2]<=[4] last_tile_dim_replicate}, metadata={op_name="xn"}
+  %param.1 = f64[512,24]{1,0} parameter(3), sharding={replicated}, metadata={op_name="sel"}
+  %convert_element_type.4 = c128[512,24]{1,0} convert(%param.1), metadata={op_name="jit(_g_from_selector)/convert_element_type" stack_frame_id=10}
+  %constant.4 = c128[] constant((0, 0))
+  %ne.4 = c128[512,24]{1,0} broadcast(%constant.4), dimensions={}, metadata={op_name="jit(_g_from_selector)/ne" stack_frame_id=11}
+  %ne.5 = pred[512,24]{1,0} compare(%convert_element_type.4, %ne.4), direction=NE, metadata={op_name="jit(_g_from_selector)/ne" stack_frame_id=11}
+  %param.2 = c128[] parameter(5), sharding={replicated}, metadata={op_name="t"}
+  %constant.12 = c128[] constant((0, 1))
+  %mul.8 = c128[] multiply(%param.2, %constant.12), metadata={op_name="jit(_g_from_selector)/mul" stack_frame_id=21}
+  %neg.4 = c128[] negate(%mul.8), metadata={op_name="jit(_g_from_selector)/neg" stack_frame_id=31}
+  %mul.9 = c128[512,24]{1,0} broadcast(%neg.4), dimensions={}, metadata={op_name="jit(_g_from_selector)/mul" stack_frame_id=31}
+  %param.3 = f64[512,24]{1,0} parameter(2), sharding={replicated}, metadata={op_name="E"}
+  %param.4 = f64[] parameter(4), sharding={replicated}, metadata={op_name="ref"}
+  %sub.4 = f64[512,24]{1,0} broadcast(%param.4), dimensions={}, metadata={op_name="jit(_g_from_selector)/sub" stack_frame_id=32}
+  %sub.5 = f64[512,24]{1,0} subtract(%param.3, %sub.4), metadata={op_name="jit(_g_from_selector)/sub" stack_frame_id=32}
+  %convert_element_type.5 = c128[512,24]{1,0} convert(%sub.5), metadata={op_name="jit(_g_from_selector)/convert_element_type" stack_frame_id=31}
+  %mul.10 = c128[512,24]{1,0} multiply(%mul.9, %convert_element_type.5), metadata={op_name="jit(_g_from_selector)/mul" stack_frame_id=31}
+  %exp.44 = f64[512,24]{1,0} real(%mul.10), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.45 = f64[512,24]{1,0} exponential(%exp.44), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %constant.13 = f64[] constant(inf)
+  %exp.46 = f64[512,24]{1,0} broadcast(%constant.13), dimensions={}, metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.47 = pred[512,24]{1,0} compare(%exp.45, %exp.46), direction=EQ, metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %constant.14 = f64[] constant(0.5)
+  %exp.48 = f64[512,24]{1,0} broadcast(%constant.14), dimensions={}, metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.49 = f64[512,24]{1,0} multiply(%exp.44, %exp.48), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.50 = f64[512,24]{1,0} exponential(%exp.49), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.51 = f64[512,24]{1,0} imag(%mul.10), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.52 = f64[512,24]{1,0} cosine(%exp.51), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.53 = f64[512,24]{1,0} multiply(%exp.50, %exp.52), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.54 = f64[512,24]{1,0} multiply(%exp.53, %exp.50), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.55 = f64[512,24]{1,0} multiply(%exp.45, %exp.52), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.56 = f64[512,24]{1,0} select(%exp.47, %exp.54, %exp.55), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %constant.15 = f64[] constant(0)
+  %exp.57 = f64[512,24]{1,0} broadcast(%constant.15), dimensions={}, metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.58 = pred[512,24]{1,0} compare(%exp.51, %exp.57), direction=EQ, metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.59 = f64[512,24]{1,0} sine(%exp.51), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.60 = f64[512,24]{1,0} multiply(%exp.50, %exp.59), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.61 = f64[512,24]{1,0} multiply(%exp.60, %exp.50), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.62 = f64[512,24]{1,0} multiply(%exp.45, %exp.59), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.63 = f64[512,24]{1,0} select(%exp.47, %exp.61, %exp.62), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.64 = f64[512,24]{1,0} select(%exp.58, %exp.57, %exp.63), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %exp.65 = c128[512,24]{1,0} complex(%exp.56, %exp.64), metadata={op_name="jit(_g_from_selector)/exp" stack_frame_id=33}
+  %mul.11 = c128[512,24]{1,0} multiply(%exp.65, %convert_element_type.4), metadata={op_name="jit(_g_from_selector)/mul" stack_frame_id=34}
+  %select_n.3 = c128[512,24]{1,0} select(%ne.5, %mul.11, %ne.4), metadata={op_name="jit(_g_from_selector)/jit(_where)/select_n"}
+  %dot_general.1 = c128[512,24,2,310]{3,2,1,0} broadcast(%select_n.3), dimensions={0,1}, metadata={op_name="jit(_g_from_selector)/ksxn,kn,knty->ksxty/dot_general" stack_frame_id=44}
+  %param.5 = c128[512,24,2,310]{3,2,1,0} parameter(1), sharding={devices=[1,1,1,2,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="yr"}
+  %real.2 = f64[512,24,2,310]{3,2,1,0} real(%param.5), metadata={op_name="jit(_g_from_selector)/real" stack_frame_id=49}
+  %imag.2 = f64[512,24,2,310]{3,2,1,0} imag(%param.5), metadata={op_name="jit(_g_from_selector)/imag" stack_frame_id=49}
+  %neg.5 = f64[512,24,2,310]{3,2,1,0} negate(%imag.2), metadata={op_name="jit(_g_from_selector)/neg" stack_frame_id=49}
+  %complex.2 = c128[512,24,2,310]{3,2,1,0} complex(%real.2, %neg.5), metadata={op_name="jit(_g_from_selector)/complex" stack_frame_id=49}
+  %dot_general.6 = c128[512,24,2,310]{3,2,1,0} multiply(%dot_general.1, %complex.2), metadata={op_name="jit(_g_from_selector)/ksxn,kn,knty->ksxty/dot_general" stack_frame_id=44}
+  ROOT %dot = c128[512,2,310,2,310]{4,3,2,1,0} dot(%param, %dot_general.6), lhs_batch_dims={0}, lhs_contracting_dims={3}, rhs_batch_dims={0}, rhs_contracting_dims={1}, operand_precision={highest,highest}, metadata={op_name="jit(_g_from_selector)/ksxn,kn,knty->ksxty/dot_general" stack_frame_id=44}
+}
+

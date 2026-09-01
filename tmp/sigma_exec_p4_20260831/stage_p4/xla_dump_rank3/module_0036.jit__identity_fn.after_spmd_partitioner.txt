@@ -1,0 +1,7 @@
+HloModule jit__identity_fn, entry_computation_layout={(c128[512,310,48,2]{3,2,1,0})->c128[512,310,48,2]{3,2,1,0}}, num_partitions=4
+
+ENTRY %main.0_spmd (param: c128[512,310,48,2]) -> c128[512,310,48,2] {
+  %param = c128[512,310,48,2]{3,2,1,0} parameter(0), sharding={devices=[1,2,1,1,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="x"}
+  ROOT %collective-permute = c128[512,310,48,2]{3,2,1,0} collective-permute(%param), channel_id=1, source_target_pairs={{0,0},{2,1},{1,2},{3,3}}
+}
+

@@ -1,0 +1,7 @@
+HloModule jit__identity_fn, is_scheduled=true, entry_computation_layout={(f64[512,48]{1,0})->f64[512,48]{1,0}}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="970482c1e79446e0e77a09903910642b"}
+
+ENTRY %main.0_spmd (param: f64[512,48]) -> f64[512,48] {
+  %param = f64[512,48]{1,0} parameter(0), sharding={replicated}, metadata={op_name="x"}
+  ROOT %copy.1 = f64[512,48]{1,0} copy(%param)
+}
+

@@ -1,0 +1,19 @@
+thunk_metadata {
+  thunk_info {
+  }
+  thunk_kind: "kSequential"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "copy.2"
+    thunk_id: 1
+  }
+  thunk_kind: "kCopy"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all-reduce-start"
+    thunk_id: 2
+  }
+  thunk_kind: "kAllReduceStart"
+}

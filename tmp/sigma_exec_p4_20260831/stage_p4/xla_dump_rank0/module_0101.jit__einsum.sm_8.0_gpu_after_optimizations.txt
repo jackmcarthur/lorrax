@@ -1,0 +1,67 @@
+HloModule jit__einsum, is_scheduled=true, entry_computation_layout={(f64[512]{0}, f64[512,48]{1,0})->f64[]}, allow_spmd_sharding_propagation_to_parameters={true,true}, allow_spmd_sharding_propagation_to_output={true}, frontend_attributes={fingerprint_before_lhs="3c6347e51d5dab3bf37355e3c5662bc6"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/efermi.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "_oneshot_mpa_occupation_state"
+4 "OccupationState.solve_mp1"
+5 "assert_fixed_n"
+6 "occupied_band_count"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=513 end_line=513 column=2 end_column=66}
+4 {file_name_id=2 function_name_id=3 line=235 end_line=239 column=8 end_column=47}
+5 {file_name_id=3 function_name_id=4 line=769 end_line=769 column=8 end_column=77}
+6 {file_name_id=3 function_name_id=5 line=810 end_line=810 column=39 end_column=80}
+7 {file_name_id=3 function_name_id=6 line=871 end_line=873 column=17 end_column=67}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+
+
+%region_0.1.clone (reduce_sum.0: f64[], reduce_sum.1: f64[]) -> f64[] {
+  %reduce_sum.1 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+  %reduce_sum.0 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+  ROOT %reduce_sum.2.0 = f64[] add(%reduce_sum.0, %reduce_sum.1), metadata={op_name="jit(_einsum)/reduce_sum" stack_frame_id=7}
+}
+
+%fused_reduce (param_0.3: f64[512], param_1.3: f64[512]) -> f64[] {
+  %param_0.3 = f64[512]{0} parameter(0)
+  %param_1.3 = f64[512]{0} parameter(1)
+  %multiply.2 = f64[512]{0} multiply(%param_0.3, %param_1.3), metadata={op_name="jit(_einsum)/dot_general" stack_frame_id=7}
+  %constant_1_2 = f64[] constant(0)
+  ROOT %reduce.2 = f64[] reduce(%multiply.2, %constant_1_2), dimensions={0}, to_apply=%region_0.1.clone, metadata={op_name="jit(_einsum)/dot_general" stack_frame_id=7}
+}
+
+%region_0.1 (reduce_sum.3: f64[], reduce_sum.4: f64[]) -> f64[] {
+  %reduce_sum.4 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+  %reduce_sum.3 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+  ROOT %reduce_sum.5.0 = f64[] add(%reduce_sum.3, %reduce_sum.4), metadata={op_name="jit(_einsum)/reduce_sum" stack_frame_id=7}
+}
+
+%fused_reduce.1 (param_0.2: f64[512,48]) -> f64[512] {
+  %param_0.2 = f64[512,48]{1,0} parameter(0)
+  %constant_1_1 = f64[] constant(0)
+  ROOT %reduce_sum.7.1 = f64[512]{0} reduce(%param_0.2, %constant_1_1), dimensions={1}, to_apply=%region_0.1, metadata={op_name="jit(_einsum)/reduce_sum" stack_frame_id=7}
+}
+
+ENTRY %main.2 (operands_0_.1: f64[512], operands_1_.1: f64[512,48]) -> f64[] {
+  %operands_1_.1 = f64[512,48]{1,0} parameter(1), metadata={op_name="operands[1]"}
+  %operands_0_.1 = f64[512]{0} parameter(0), metadata={op_name="operands[0]"}
+  %input_reduce_fusion.1 = f64[512]{0} fusion(%operands_1_.1), kind=kInput, calls=%fused_reduce.1, metadata={op_name="jit(_einsum)/reduce_sum" stack_frame_id=7}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  ROOT %input_reduce_fusion = f64[] fusion(%operands_0_.1, %input_reduce_fusion.1), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(_einsum)/dot_general" stack_frame_id=7}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+}
+

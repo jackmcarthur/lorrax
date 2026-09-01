@@ -1,0 +1,74 @@
+HloModule jit_fn, is_scheduled=true, entry_computation_layout={(c128[1,16,2,1532]{3,2,1,0}, s32[1,32,32,32]{3,2,1,0})->c128[1,16,2,32,32,32]{5,4,3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true}, allow_spmd_sharding_propagation_to_output={true}, frontend_attributes={fingerprint_before_lhs="c718411cc7c8991935dbaaeda783be46",xla.sdy.meshes={empty_mesh = #sdy.mesh<[]>, mesh = #sdy.mesh<["x"=1, "y"=1]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/wfn_transforms.py"
+
+FunctionNames
+1 "main"
+2 "compute_sigma_xc"
+3 "_compute_live_hartree"
+4 "compute_hartree_matrix"
+5 "build_valence_density_distributed"
+6 "load_kpoint_fftbox_local"
+7 "to_box"
+8 "to_box.<locals>.build.<locals>.fn"
+9 "_box_kernel"
+10 "_maybe_constrain"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=48 end_line=48 column=13 end_column=48}
+2 {file_name_id=2 function_name_id=1 line=770 end_line=786 column=18 end_column=4}
+3 {file_name_id=3 function_name_id=2 line=922 end_line=924 column=30 end_column=48}
+4 {file_name_id=3 function_name_id=3 line=318 end_line=329 column=12 end_column=47}
+5 {file_name_id=4 function_name_id=4 line=853 end_line=860 column=17 end_column=30}
+6 {file_name_id=4 function_name_id=5 line=715 end_line=718 column=20 end_column=44}
+7 {file_name_id=5 function_name_id=6 line=1907 end_line=1909 column=14 end_column=47}
+8 {file_name_id=5 function_name_id=7 line=419 end_line=419 column=11 end_column=29}
+9 {file_name_id=5 function_name_id=8 line=413 end_line=413 column=18 end_column=60}
+10 {file_name_id=5 function_name_id=9 line=273 end_line=273 column=11 end_column=55}
+11 {file_name_id=5 function_name_id=9 line=274 end_line=274 column=17 end_column=54}
+12 {file_name_id=5 function_name_id=9 line=287 end_line=287 column=15 end_column=66}
+13 {file_name_id=5 function_name_id=9 line=288 end_line=288 column=11 end_column=54}
+14 {file_name_id=5 function_name_id=8 line=414 end_line=414 column=19 end_column=54}
+15 {file_name_id=5 function_name_id=10 line=326 end_line=326 column=11 end_column=58}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=10}
+12 {file_location_id=9 parent_frame_id=1}
+13 {file_location_id=12 parent_frame_id=13}
+14 {file_location_id=13 parent_frame_id=10}
+15 {file_location_id=14 parent_frame_id=9}
+16 {file_location_id=15 parent_frame_id=16}
+
+
+%fused_gather (param_0.1: s32[1,32,32,32], param_1.3: c128[1,16,2,1532]) -> c128[32768,16,2,1] {
+  %param_1.3 = c128[1,16,2,1532]{3,2,1,0} parameter(1)
+  %constant_1_1 = c128[] constant((0, 0))
+  %pad.2 = c128[1,16,2,1533]{3,2,1,0} pad(%param_1.3, %constant_1_1), padding=0_0x0_0x0_0x0_1, metadata={op_name="jit(fn)/concatenate" stack_frame_id=11}
+  %bitcast.32 = c128[16,2,1533]{2,1,0} bitcast(%pad.2), metadata={op_name="jit(fn)/concatenate" stack_frame_id=11}
+  %param_0.1 = s32[1,32,32,32]{3,2,1,0} parameter(0)
+  %bitcast.25.1 = s32[32768,1]{0,1} bitcast(%param_0.1)
+  ROOT %gather.2.1 = c128[32768,16,2,1]{0,2,1,3} gather(%bitcast.32, %bitcast.25.1), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={2}, index_vector_dim=1, slice_sizes={16,2,1}, metadata={op_name="jit(fn)/jit(_take)/gather"}
+}
+
+ENTRY %main.2 (psi_.1: c128[1,16,2,1532], g_index_.1: s32[1,32,32,32]) -> c128[1,16,2,32,32,32] {
+  %g_index_.1 = s32[1,32,32,32]{3,2,1,0} parameter(1), metadata={op_name="g_index_"}
+  %psi_.1 = c128[1,16,2,1532]{3,2,1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@empty_mesh, [{}, {}, {}, {}]>"}, metadata={op_name="psi_"}
+  %loop_gather_fusion = c128[32768,16,2,1]{0,2,1,3} fusion(%g_index_.1, %psi_.1), kind=kLoop, calls=%fused_gather, metadata={op_name="jit(fn)/jit(_take)/gather"}
+  ROOT %bitcast.3.0 = c128[1,16,2,32,32,32]{5,4,3,2,1,0} bitcast(%loop_gather_fusion), metadata={op_name="jit(fn)/jit(_take)/gather"}
+}
+

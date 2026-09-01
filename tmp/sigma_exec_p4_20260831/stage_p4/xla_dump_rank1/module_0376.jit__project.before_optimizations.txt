@@ -1,0 +1,103 @@
+HloModule jit__project, buffer_donor={ (1, {}) }, entry_computation_layout={(c128[512,24,2,620]{3,2,1,0}, c128[512,2,620,2,620]{4,3,2,1,0}, c128[512,2,620,24]{3,2,1,0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/contract_bands.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/ppm_tau_kernel.py"
+
+FunctionNames
+1 "contract_bands_block_reshard.<locals>._body_none"
+2 "contract_bands_block_reshard.<locals>._right_maybe_split"
+3 "contract_bands_block_reshard.<locals>._right_none"
+4 "compute_sigma_xc"
+5 "compute_sigma_c_mpa_omega_grid"
+6 "integrate_sigma_store"
+7 "integrate_sigma_store.<locals>.run"
+8 "_integrate_sigma_batches"
+9 "get_shared_sigma_tau_kernel.<locals>._tau_staged"
+10 "_get_sigma_kij_kernel.<locals>.staged"
+11 "_get_sigma_kij_kernel.<locals>._staged_impl"
+12 "get_sigma_spatial_kernel.<locals>.conv_project_staged"
+13 "contract_bands_block_reshard.<locals>._project"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=706 end_line=707 column=19 end_column=72}
+2 {file_name_id=1 function_name_id=1 line=711 end_line=712 column=15 end_column=68}
+3 {file_name_id=1 function_name_id=1 line=709 end_line=709 column=28 end_column=50}
+4 {file_name_id=1 function_name_id=1 line=704 end_line=704 column=16 end_column=70}
+5 {file_name_id=1 function_name_id=2 line=657 end_line=657 column=19 end_column=39}
+6 {file_name_id=1 function_name_id=3 line=623 end_line=623 column=19 end_column=76}
+7 {file_name_id=1 function_name_id=1 line=708 end_line=709 column=17 end_column=76}
+8 {file_name_id=2 function_name_id=4 line=1066 end_line=1086 column=15 end_column=30}
+9 {file_name_id=3 function_name_id=5 line=541 end_line=543 column=15 end_column=63}
+10 {file_name_id=3 function_name_id=6 line=300 end_line=300 column=15 end_column=27}
+11 {file_name_id=3 function_name_id=7 line=295 end_line=297 column=15 end_column=67}
+12 {file_name_id=3 function_name_id=8 line=212 end_line=212 column=42 end_column=67}
+13 {file_name_id=4 function_name_id=9 line=1140 end_line=1142 column=15 end_column=46}
+14 {file_name_id=4 function_name_id=10 line=846 end_line=848 column=19 end_column=62}
+15 {file_name_id=4 function_name_id=11 line=816 end_line=817 column=19 end_column=54}
+16 {file_name_id=4 function_name_id=12 line=388 end_line=388 column=18 end_column=63}
+17 {file_name_id=1 function_name_id=13 line=798 end_line=798 column=15 end_column=42}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=1 parent_frame_id=2}
+3 {file_location_id=2 parent_frame_id=1}
+4 {file_location_id=2 parent_frame_id=4}
+5 {file_location_id=3 parent_frame_id=1}
+6 {file_location_id=3 parent_frame_id=6}
+7 {file_location_id=4 parent_frame_id=1}
+8 {file_location_id=5 parent_frame_id=8}
+9 {file_location_id=6 parent_frame_id=9}
+10 {file_location_id=7 parent_frame_id=1}
+11 {file_location_id=8 parent_frame_id=1}
+12 {file_location_id=9 parent_frame_id=12}
+13 {file_location_id=10 parent_frame_id=13}
+14 {file_location_id=11 parent_frame_id=14}
+15 {file_location_id=12 parent_frame_id=15}
+16 {file_location_id=13 parent_frame_id=16}
+17 {file_location_id=14 parent_frame_id=17}
+18 {file_location_id=15 parent_frame_id=18}
+19 {file_location_id=16 parent_frame_id=19}
+20 {file_location_id=17 parent_frame_id=20}
+
+
+%region_0.1 (reduce_scatter.2: c128[], reduce_scatter.3: c128[]) -> c128[] {
+  %reduce_scatter.2 = c128[] parameter(0), metadata={op_name="reduce_scatter"}
+  %reduce_scatter.3 = c128[] parameter(1), metadata={op_name="reduce_scatter"}
+  ROOT %add.1 = c128[] add(%reduce_scatter.2, %reduce_scatter.3), metadata={op_name="add" stack_frame_id=2}
+}
+
+%region_1.2 (reduce_scatter.7: c128[], reduce_scatter.8: c128[]) -> c128[] {
+  %reduce_scatter.7 = c128[] parameter(0), metadata={op_name="reduce_scatter"}
+  %reduce_scatter.8 = c128[] parameter(1), metadata={op_name="reduce_scatter"}
+  ROOT %add.3 = c128[] add(%reduce_scatter.7, %reduce_scatter.8), metadata={op_name="add" stack_frame_id=4}
+}
+
+%xla.sdy.manual_computation_body.3 (shard_map.7: c128[512,24,2,310], shard_map.8: c128[512,2,310,2,310], shard_map.9: c128[512,2,310,24]) -> c128[512,12,12] {
+  %shard_map.7 = c128[512,24,2,310]{3,2,1,0} parameter(0), metadata={op_name="shard_map"}
+  %real.1 = f64[512,24,2,310]{3,2,1,0} real(%shard_map.7), metadata={op_name="real" stack_frame_id=6}
+  %imag.1 = f64[512,24,2,310]{3,2,1,0} imag(%shard_map.7), metadata={op_name="imag" stack_frame_id=6}
+  %neg.1 = f64[512,24,2,310]{3,2,1,0} negate(%imag.1), metadata={op_name="neg" stack_frame_id=6}
+  %complex.1 = c128[512,24,2,310]{3,2,1,0} complex(%real.1, %neg.1), metadata={op_name="complex" stack_frame_id=6}
+  %shard_map.8 = c128[512,2,310,2,310]{4,3,2,1,0} parameter(1), metadata={op_name="shard_map"}
+  %shard_map.9 = c128[512,2,310,24]{3,2,1,0} parameter(2), metadata={op_name="shard_map"}
+  %dot_general.2 = c128[512,2,310,24]{3,2,1,0} dot(%shard_map.8, %shard_map.9), lhs_batch_dims={0}, lhs_contracting_dims={3,4}, rhs_batch_dims={0}, rhs_contracting_dims={1,2}, operand_precision={highest,highest}, metadata={op_name="ksxty,ktyn->ksxn/dot_general" stack_frame_id=9}
+  %reduce_scatter.10 = c128[512,2,310,12]{3,2,1,0} reduce-scatter(%dot_general.2), channel_id=1, replica_groups={{0,1},{2,3}}, use_global_device_ids=true, dimensions={3}, to_apply=%region_0.1, metadata={op_name="reduce_scatter" stack_frame_id=1}
+  %dot_general.3 = c128[512,24,12]{2,1,0} dot(%complex.1, %reduce_scatter.10), lhs_batch_dims={0}, lhs_contracting_dims={2,3}, rhs_batch_dims={0}, rhs_contracting_dims={1,2}, operand_precision={highest,highest}, metadata={op_name="kmsx,ksxn->kmn/dot_general" stack_frame_id=10}
+  ROOT %reduce_scatter.11 = c128[512,12,12]{2,1,0} reduce-scatter(%dot_general.3), channel_id=1, replica_groups={{0,2},{1,3}}, use_global_device_ids=true, dimensions={1}, to_apply=%region_1.2, metadata={op_name="reduce_scatter" stack_frame_id=3}
+}
+
+ENTRY %main.4 (psi_left.1: c128[512,24,2,620], o.1: c128[512,2,620,2,620], psi_right.1: c128[512,2,620,24]) -> c128[512,24,24] {
+  %psi_left.1 = c128[512,24,2,620]{3,2,1,0} parameter(0), sharding={devices=[1,1,1,2,2]<=[4] last_tile_dim_replicate}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {}, {\"x\"}]>"}, metadata={op_name="psi_left"}
+  %o.1 = c128[512,2,620,2,620]{4,3,2,1,0} parameter(1), sharding={devices=[1,1,2,1,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {}, {\"y\"}]>"}, metadata={op_name="o"}
+  %psi_right.1 = c128[512,2,620,24]{3,2,1,0} parameter(2), sharding={devices=[1,1,2,1,2]<=[2,2]T(1,0) last_tile_dim_replicate}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"y\"}, {}]>"}, metadata={op_name="psi_right"}
+  %shard_map.12 = (c128[512,24,2,310]{3,2,1,0}, c128[512,2,310,2,310]{4,3,2,1,0}, c128[512,2,310,24]{3,2,1,0}) custom-call(%psi_left.1, %o.1, %psi_right.1), custom_call_target="xla.sdy.GlobalToLocalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.in_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {}, {}, {\"x\"}]>, <@mesh, [{}, {}, {\"x\"}, {}, {\"y\"}]>, <@mesh, [{}, {}, {\"y\"}, {}]>]>",xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>"}, metadata={op_name="jit(_project)/shard_map" stack_frame_id=20}
+  %shard_map.13 = c128[512,24,2,310]{3,2,1,0} get-tuple-element(%shard_map.12), index=0, metadata={op_name="jit(_project)/shard_map" stack_frame_id=20}
+  %shard_map.14 = c128[512,2,310,2,310]{4,3,2,1,0} get-tuple-element(%shard_map.12), index=1, metadata={op_name="jit(_project)/shard_map" stack_frame_id=20}
+  %shard_map.15 = c128[512,2,310,24]{3,2,1,0} get-tuple-element(%shard_map.12), index=2, metadata={op_name="jit(_project)/shard_map" stack_frame_id=20}
+  %shard_map.16 = c128[512,12,12]{2,1,0} call(%shard_map.13, %shard_map.14, %shard_map.15), to_apply=%xla.sdy.manual_computation_body.3, frontend_attributes={inlineable="false"}, metadata={op_name="jit(_project)/shard_map" stack_frame_id=20}
+  ROOT %shard_map.17 = c128[512,24,24]{2,1,0} custom-call(%shard_map.16), custom_call_target="xla.sdy.LocalToGlobalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>",xla.sdy.out_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\"}, {\"y\"}]>]>"}, metadata={op_name="jit(_project)/shard_map" stack_frame_id=20}
+}
+

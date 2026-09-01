@@ -1,0 +1,70 @@
+HloModule jit__ev_tensors, entry_computation_layout={(c128[21,512,12,12]{3,2,1,0}, c128[512,24,24]{2,1,0}, c128[512,12,12]{2,1,0})->(c128[21,512,12,12]{3,2,1,0}, c128[21,512,12,12]{3,2,1,0})}, allow_spmd_sharding_propagation_to_parameters={false,false,false}, allow_spmd_sharding_propagation_to_output={false,false}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/dynamic_sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/sigma_output.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "write_sigma_omega"
+6 "write_sigma_omega.<locals>._ev_tensors"
+7 "derive_sigma_total"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=770 column=18 end_column=18}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1110 column=15 end_column=15}
+5 {file_name_id=3 function_name_id=4 line=425 end_line=425 column=34 end_column=34}
+6 {file_name_id=4 function_name_id=5 line=284 end_line=284 column=31 end_column=31}
+7 {file_name_id=4 function_name_id=6 line=279 end_line=279 column=19 end_column=19}
+8 {file_name_id=4 function_name_id=6 line=281 end_line=281 column=22 end_column=22}
+9 {file_name_id=4 function_name_id=6 line=280 end_line=280 column=20 end_column=20}
+10 {file_name_id=5 function_name_id=7 line=1072 end_line=1072 column=10 end_column=10}
+11 {file_name_id=5 function_name_id=7 line=1074 end_line=1074 column=10 end_column=10}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=7}
+9 {file_location_id=9 parent_frame_id=7}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=10}
+
+
+ENTRY %main.0_spmd (param: c128[21,512,12,12], param.1: c128[512,24,24], param.2: c128[512,12,12]) -> (c128[21,512,12,12], c128[21,512,12,12]) {
+  %param = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="c_ry"}
+  %constant = c128[] constant((13.6056980659, 0))
+  %mul.3 = c128[21,512,12,12]{3,2,1,0} broadcast(%constant), dimensions={}, metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=7}
+  %mul.10 = c128[21,512,12,12]{3,2,1,0} multiply(%param, %mul.3), metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=7}
+  %param.1 = c128[512,24,24]{2,1,0} parameter(1), sharding={replicated}, metadata={op_name="x_ry"}
+  %constant.4 = s32[] constant(0), metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %constant.5 = s32[4]{0} constant({0, 0, 12, 12}), metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %partition-id = u32[] partition-id()
+  %dynamic-slice = s32[1]{0} dynamic-slice(%constant.5, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %reshape.10 = s32[] reshape(%dynamic-slice), metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %constant.6 = s32[4]{0} constant({0, 12, 0, 12}), metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %dynamic-slice.1 = s32[1]{0} dynamic-slice(%constant.6, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %reshape.11 = s32[] reshape(%dynamic-slice.1), metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %dynamic-slice.2 = c128[512,12,12]{2,1,0} dynamic-slice(%param.1, %constant.4, %reshape.10, %reshape.11), dynamic_slice_sizes={512,12,12}, metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %mul.11 = c128[512,12,12]{2,1,0} broadcast(%constant), dimensions={}, metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %mul.12 = c128[512,12,12]{2,1,0} multiply(%dynamic-slice.2, %mul.11), metadata={op_name="jit(_ev_tensors)/mul" stack_frame_id=8}
+  %add.0 = c128[21,512,12,12]{3,2,1,0} broadcast(%mul.12), dimensions={1,2,3}, metadata={op_name="jit(_ev_tensors)/add" stack_frame_id=10}
+  %add.1 = c128[21,512,12,12]{3,2,1,0} add(%mul.10, %add.0), metadata={op_name="jit(_ev_tensors)/add" stack_frame_id=10}
+  %param.2 = c128[512,12,12]{2,1,0} parameter(2), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="h_ev"}
+  %add.2 = c128[21,512,12,12]{3,2,1,0} broadcast(%param.2), dimensions={1,2,3}, metadata={op_name="jit(_ev_tensors)/add" stack_frame_id=11}
+  %add.3 = c128[21,512,12,12]{3,2,1,0} add(%add.1, %add.2), metadata={op_name="jit(_ev_tensors)/add" stack_frame_id=11}
+  ROOT %tuple.2 = (c128[21,512,12,12]{3,2,1,0}, c128[21,512,12,12]{3,2,1,0}) tuple(%add.3, %mul.10)
+}
+

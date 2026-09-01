@@ -1,0 +1,24 @@
+BufferAssignment:
+allocation 0: size 24772608, output shape is |c128[21,512,12,12]|, maybe-live-out:
+ value: <2 loop_broadcast_fusion @0> (size=24772608,offset=0): c128[21,512,12,12]{3,2,1,0}
+
+Total bytes used: 24772608 (23.62MiB)
+
+Used values:
+<2 loop_broadcast_fusion @0>
+ positions:
+  loop_broadcast_fusion
+ uses:
+ from instruction: %loop_broadcast_fusion = c128[21,512,12,12]{3,2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast, metadata={op_name="jit(<lambda>)/broadcast_in_dim" stack_frame_id=10}
+
+
+HloLiveRange (max 1):
+  InstructionSequence:
+    0:loop_broadcast_fusion
+  BufferLiveRange:
+    loop_broadcast_fusion{}:0-1
+  Live ranges at 0 (peak):
+    loop_broadcast_fusion{}: 24772608 bytes (cumulative: 24772608 bytes)
+  Stack trace breakdown for peak usage: 24 772 608 bytes
+    main.0_spmd (100.0%, total: 24 772 608 bytes, current: 0 bytes, remaining: 24 772 608 bytes)
+      └── jit(<lambda>)/broadcast_in_dim (100.0%, total: 24 772 608 bytes, current: 24 772 608 bytes, remaining: 0 bytes)

@@ -1,0 +1,142 @@
+HloModule jit_fn, is_scheduled=true, entry_computation_layout={(c128[512,24,24]{2,1,0})->f64[3]{0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="92ba9c46e2bd90e1f3cdf8cc0e3f2902"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/sanity.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "refuse_nonfinite"
+4 "_finite_stats"
+5 "_finite_stats_fn.<locals>.fn"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=1043 end_line=1043 column=1 end_column=1}
+4 {file_name_id=3 function_name_id=3 line=349 end_line=349 column=34 end_column=34}
+5 {file_name_id=3 function_name_id=4 line=243 end_line=243 column=16 end_column=16}
+6 {file_name_id=3 function_name_id=5 line=208 end_line=208 column=21 end_column=21}
+7 {file_name_id=3 function_name_id=5 line=211 end_line=211 column=17 end_column=17}
+8 {file_name_id=3 function_name_id=5 line=208 end_line=208 column=36 end_column=36}
+9 {file_name_id=3 function_name_id=5 line=214 end_line=214 column=30 end_column=30}
+10 {file_name_id=3 function_name_id=5 line=214 end_line=214 column=21 end_column=21}
+11 {file_name_id=3 function_name_id=5 line=221 end_line=221 column=20 end_column=20}
+12 {file_name_id=3 function_name_id=5 line=221 end_line=221 column=12 end_column=12}
+13 {file_name_id=3 function_name_id=5 line=220 end_line=220 column=15 end_column=15}
+14 {file_name_id=3 function_name_id=5 line=212 end_line=212 column=16 end_column=16}
+15 {file_name_id=3 function_name_id=5 line=215 end_line=215 column=28 end_column=28}
+16 {file_name_id=3 function_name_id=5 line=215 end_line=215 column=20 end_column=20}
+17 {file_name_id=3 function_name_id=5 line=222 end_line=222 column=12 end_column=12}
+18 {file_name_id=3 function_name_id=5 line=219 end_line=219 column=32 end_column=32}
+19 {file_name_id=3 function_name_id=5 line=223 end_line=223 column=12 end_column=12}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=6}
+8 {file_location_id=8 parent_frame_id=6}
+9 {file_location_id=9 parent_frame_id=6}
+10 {file_location_id=10 parent_frame_id=6}
+11 {file_location_id=11 parent_frame_id=6}
+12 {file_location_id=12 parent_frame_id=6}
+13 {file_location_id=13 parent_frame_id=6}
+14 {file_location_id=14 parent_frame_id=6}
+15 {file_location_id=15 parent_frame_id=6}
+16 {file_location_id=16 parent_frame_id=6}
+17 {file_location_id=17 parent_frame_id=6}
+18 {file_location_id=18 parent_frame_id=6}
+19 {file_location_id=19 parent_frame_id=6}
+
+
+%region_0.1.clone (reduce_sum.16: s64[], reduce_sum.17: s64[]) -> s64[] {
+  %reduce_sum.17 = s64[] parameter(1), metadata={op_name="jit(fn)/reduce_sum"}
+  %reduce_sum.16 = s64[] parameter(0), metadata={op_name="jit(fn)/reduce_sum"}
+  ROOT %reduce_sum.18.0 = s64[] add(%reduce_sum.16, %reduce_sum.17), metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=12}
+}
+
+%region_0.1 (reduce_sum.0: s64[], reduce_sum.1: s64[]) -> s64[] {
+  %reduce_sum.1 = s64[] parameter(1), metadata={op_name="jit(fn)/reduce_sum"}
+  %reduce_sum.0 = s64[] parameter(0), metadata={op_name="jit(fn)/reduce_sum"}
+  ROOT %reduce_sum.2.0 = s64[] add(%reduce_sum.0, %reduce_sum.1), metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=12}
+}
+
+%region_2.3 (reduce_max.0: f64[], reduce_max.1: f64[]) -> f64[] {
+  %reduce_max.1 = f64[] parameter(1), metadata={op_name="jit(fn)/reduce_max"}
+  %reduce_max.0 = f64[] parameter(0), metadata={op_name="jit(fn)/reduce_max"}
+  ROOT %reduce_max.2.0 = f64[] maximum(%reduce_max.0, %reduce_max.1), metadata={op_name="jit(fn)/reduce_max" stack_frame_id=19}
+}
+
+%fused_reduce (param_0.39: c128[512,24,24]) -> (s64[512], s64[512], f64[512]) {
+  %param_0.39 = c128[512,24,24]{2,1,0} parameter(0)
+  %real.2.14 = f64[512,24,24]{2,1,0} real(%param_0.39), metadata={op_name="jit(fn)/real" stack_frame_id=6}
+  %ne.4.5 = pred[512,24,24]{2,1,0} compare(%real.2.14, %real.2.14), direction=NE, metadata={op_name="jit(fn)/ne" stack_frame_id=14}
+  %imag.2.14 = f64[512,24,24]{2,1,0} imag(%param_0.39), metadata={op_name="jit(fn)/imag" stack_frame_id=8}
+  %ne.5.5 = pred[512,24,24]{2,1,0} compare(%imag.2.14, %imag.2.14), direction=NE, metadata={op_name="jit(fn)/ne" stack_frame_id=15}
+  %or.2.3 = pred[512,24,24]{2,1,0} or(%ne.4.5, %ne.5.5), metadata={op_name="jit(fn)/or" stack_frame_id=16}
+  %convert_element_type.15.1 = s32[512,24,24]{2,1,0} convert(%or.2.3), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=17}
+  %convert_element_type.16.1 = s64[512,24,24]{2,1,0} convert(%convert_element_type.15.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=17}
+  %bitcast.7.1 = s64[512,576]{1,0} bitcast(%convert_element_type.16.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=17}
+  %constant_6_4 = s64[] constant(0)
+  %reduce.8.1 = s64[512]{0} reduce(%bitcast.7.1, %constant_6_4), dimensions={1}, to_apply=%region_0.1.clone, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=17}
+  %is_finite.4.9.clone.1 = pred[512,24,24]{2,1,0} is-finite(%real.2.14), metadata={op_name="jit(fn)/is_finite" stack_frame_id=7}
+  %is_finite.5.9.clone.1 = pred[512,24,24]{2,1,0} is-finite(%imag.2.14), metadata={op_name="jit(fn)/is_finite" stack_frame_id=9}
+  %and.2.7.clone.1 = pred[512,24,24]{2,1,0} and(%is_finite.4.9.clone.1, %is_finite.5.9.clone.1), metadata={op_name="jit(fn)/and" stack_frame_id=10}
+  %not.2.3.clone.1 = pred[512,24,24]{2,1,0} not(%and.2.7.clone.1), metadata={op_name="jit(fn)/not" stack_frame_id=11}
+  %convert_element_type.12.1.clone.1 = s32[512,24,24]{2,1,0} convert(%not.2.3.clone.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=12}
+  %convert_element_type.13.1.clone.1 = s64[512,24,24]{2,1,0} convert(%convert_element_type.12.1.clone.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=12}
+  %bitcast.6.1.clone.1 = s64[512,576]{1,0} bitcast(%convert_element_type.13.1.clone.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=12}
+  %reduce.6.1.clone.1 = s64[512]{0} reduce(%bitcast.6.1.clone.1, %constant_6_4), dimensions={1}, to_apply=%region_0.1, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=12}
+  %abs.2.1.clone.1 = f64[512,24,24]{2,1,0} abs(%param_0.39), metadata={op_name="jit(fn)/abs" stack_frame_id=18}
+  %constant_7_1_clone_1 = f64[] constant(0)
+  %broadcast_in_dim.11.1.clone.1 = f64[512,24,24]{2,1,0} broadcast(%constant_7_1_clone_1), dimensions={}, metadata={op_name="jit(fn)/jit(_where)/broadcast_in_dim"}
+  %select_n.3.1.clone.1 = f64[512,24,24]{2,1,0} select(%and.2.7.clone.1, %abs.2.1.clone.1, %broadcast_in_dim.11.1.clone.1), metadata={op_name="jit(fn)/jit(_where)/select_n"}
+  %bitcast.8.1.clone.1 = f64[512,576]{1,0} bitcast(%select_n.3.1.clone.1), metadata={op_name="jit(fn)/jit(_where)/select_n"}
+  %constant_8_2_clone_1 = f64[] constant(-inf)
+  %reduce.10.1.clone.1 = f64[512]{0} reduce(%bitcast.8.1.clone.1, %constant_8_2_clone_1), dimensions={1}, to_apply=%region_2.3, metadata={op_name="jit(fn)/reduce_max" stack_frame_id=19}
+  ROOT %tuple.1 = (s64[512]{0}, s64[512]{0}, f64[512]{0}) tuple(%reduce.8.1, %reduce.6.1.clone.1, %reduce.10.1.clone.1)
+}
+
+%fused_concatenate (param_0.37: f64[], param_1.34: f64[], param_2.16: f64[512]) -> f64[3] {
+  %param_1.34 = f64[] parameter(1)
+  %bitcast.13 = f64[1]{0} bitcast(%param_1.34), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=12}
+  %param_0.37 = f64[] parameter(0)
+  %bitcast.1.1 = f64[1]{0} bitcast(%param_0.37), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=17}
+  %param_2.16 = f64[512]{0} parameter(2)
+  %constant_8_1 = f64[] constant(-inf)
+  %reduce.2.1 = f64[] reduce(%param_2.16, %constant_8_1), dimensions={0}, to_apply=%region_2.3, metadata={op_name="jit(fn)/reduce_max" stack_frame_id=19}
+  %bitcast.2.1 = f64[1]{0} bitcast(%reduce.2.1), metadata={op_name="jit(fn)/reduce_max" stack_frame_id=19}
+  ROOT %concatenate.2.1 = f64[3]{0} concatenate(%bitcast.13, %bitcast.1.1, %bitcast.2.1), dimensions={0}, metadata={op_name="jit(fn)/concatenate" stack_frame_id=13}
+}
+
+%fused_reduce.1 (param_0.34: s64[512]) -> f64[] {
+  %param_0.34 = s64[512]{0} parameter(0)
+  %constant_6_2 = s64[] constant(0)
+  %reduce.1.1 = s64[] reduce(%param_0.34, %constant_6_2), dimensions={0}, to_apply=%region_0.1.clone, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=17}
+  ROOT %convert_element_type.17.1 = f64[] convert(%reduce.1.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=17}
+}
+
+%fused_reduce.2 (param_0.36: s64[512]) -> f64[] {
+  %param_0.36 = s64[512]{0} parameter(0)
+  %constant_6_1 = s64[] constant(0)
+  %reduce.13 = s64[] reduce(%param_0.36, %constant_6_1), dimensions={0}, to_apply=%region_0.1, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=12}
+  ROOT %convert_element_type.14.1 = f64[] convert(%reduce.13), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=12}
+}
+
+ENTRY %main.4_spmd (param: c128[512,24,24]) -> f64[3] {
+  %param = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="arr"}
+  %input_reduce_fusion = (s64[512]{0}, s64[512]{0}, f64[512]{0}) fusion(%param), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=17}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  %get-tuple-element.2 = f64[512]{0} get-tuple-element(%input_reduce_fusion), index=2, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=17}
+  %get-tuple-element.1 = s64[512]{0} get-tuple-element(%input_reduce_fusion), index=1, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=17}
+  %input_reduce_fusion.2 = f64[] fusion(%get-tuple-element.1), kind=kInput, calls=%fused_reduce.2, metadata={op_name="jit(fn)/convert_element_type" deduplicated_name="input_reduce_fusion.1" stack_frame_id=12}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  %get-tuple-element = s64[512]{0} get-tuple-element(%input_reduce_fusion), index=0, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=17}
+  %input_reduce_fusion.1 = f64[] fusion(%get-tuple-element), kind=kInput, calls=%fused_reduce.1, metadata={op_name="jit(fn)/convert_element_type" deduplicated_name="input_reduce_fusion.1" stack_frame_id=17}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  ROOT %input_concatenate_fusion = f64[3]{0} fusion(%input_reduce_fusion.1, %input_reduce_fusion.2, %get-tuple-element.2), kind=kInput, calls=%fused_concatenate, metadata={op_name="jit(fn)/concatenate" stack_frame_id=13}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+}
+

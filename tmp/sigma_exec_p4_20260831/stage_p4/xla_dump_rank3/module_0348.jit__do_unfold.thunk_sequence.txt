@@ -1,0 +1,14 @@
+001: kKernel       	, kernel = wrapped_gather, profile_annotation = wrapped_gather, launch dimensions = blocks: {96100, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+002: kAllToAllStart	
+003: kAllToAllDone 	
+004: kKernel       	, kernel = input_transpose_fusion_1, profile_annotation = input_transpose_fusion.1, launch dimensions = blocks: {51200, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+005: kKernel       	, kernel = loop_transpose_fusion_2, profile_annotation = loop_transpose_fusion.2, launch dimensions = blocks: {96100, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+006: kAllToAllStart	
+007: kAllToAllDone 	
+008: kKernel       	, kernel = loop_transpose_fusion, profile_annotation = loop_transpose_fusion, launch dimensions = blocks: {96100, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+009: kAllToAllStart	
+010: kAllToAllDone 	
+011: kKernel       	, kernel = loop_transpose_fusion_1, profile_annotation = loop_transpose_fusion.1, launch dimensions = blocks: {96100, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+012: kAllToAllStart	
+013: kAllToAllDone 	
+014: kKernel       	, kernel = input_transpose_fusion, profile_annotation = input_transpose_fusion, launch dimensions = blocks: {51200, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt

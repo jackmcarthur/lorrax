@@ -1,0 +1,521 @@
+HloModule jit__run, entry_computation_layout={(c128[29,24,2,1532]{3,2,1,0}, s32[29,1532,3]{2,1,0}, f64[29,1532]{1,0}, s32[29,32,32,32]{3,2,1,0}, c128[32,32,32]{2,1,0})->c128[29,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true,true,true,true}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/fft_helpers.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/mtxel_sweep.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/wfn_transforms.py"
+4 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+7 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+8 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/timing.py"
+
+FunctionNames
+1 "make_sharded_ifftn_3d.<locals>._wrap"
+2 "local_ifftn3"
+3 "make_sharded_fftn_3d.<locals>._wrap"
+4 "local_fftn3"
+5 "sweep_matrix_elements.<locals>._run.<locals>.body"
+6 "sweep_matrix_elements.<locals>._run.<locals>.one_k"
+7 "local_potential_operator.<locals>.op"
+8 "_box_kernel"
+9 "<module>"
+10 "main"
+11 "compute_sigma_xc"
+12 "_compute_live_hartree"
+13 "compute_hartree_matrix"
+14 "TimingCollector.timed.<locals>.decorator.<locals>.wrapper"
+15 "sweep_matrix_elements"
+16 "sweep_matrix_elements.<locals>._run"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=290 end_line=290 column=15 end_column=58}
+2 {file_name_id=1 function_name_id=2 line=258 end_line=258 column=11 end_column=55}
+3 {file_name_id=1 function_name_id=3 line=375 end_line=375 column=15 end_column=57}
+4 {file_name_id=1 function_name_id=4 line=267 end_line=267 column=11 end_column=54}
+5 {file_name_id=2 function_name_id=5 line=1959 end_line=1959 column=37 end_column=48}
+6 {file_name_id=2 function_name_id=5 line=1959 end_line=1959 column=18 end_column=77}
+7 {file_name_id=2 function_name_id=6 line=1926 end_line=1926 column=32 end_column=55}
+8 {file_name_id=2 function_name_id=6 line=1926 end_line=1926 column=21 end_column=78}
+9 {file_name_id=2 function_name_id=6 line=1927 end_line=1928 column=23 end_column=64}
+10 {file_name_id=2 function_name_id=6 line=1931 end_line=1931 column=29 end_column=47}
+11 {file_name_id=2 function_name_id=5 line=1959 end_line=1959 column=24 end_column=35}
+12 {file_name_id=2 function_name_id=6 line=1902 end_line=1902 column=19 end_column=75}
+13 {file_name_id=2 function_name_id=7 line=559 end_line=559 column=14 end_column=58}
+14 {file_name_id=3 function_name_id=8 line=273 end_line=273 column=11 end_column=55}
+15 {file_name_id=3 function_name_id=8 line=274 end_line=274 column=17 end_column=54}
+16 {file_name_id=2 function_name_id=5 line=1959 end_line=1959 column=60 end_column=70}
+17 {file_name_id=3 function_name_id=8 line=287 end_line=287 column=15 end_column=66}
+18 {file_name_id=3 function_name_id=8 line=288 end_line=288 column=11 end_column=54}
+19 {file_name_id=2 function_name_id=7 line=560 end_line=560 column=16 end_column=34}
+20 {file_name_id=2 function_name_id=7 line=567 end_line=567 column=20 end_column=33}
+21 {file_name_id=2 function_name_id=7 line=568 end_line=568 column=16 end_column=49}
+22 {file_name_id=2 function_name_id=7 line=571 end_line=571 column=13 end_column=23}
+23 {file_name_id=2 function_name_id=7 line=574 end_line=574 column=14 end_column=36}
+24 {file_name_id=2 function_name_id=7 line=572 end_line=572 column=13 end_column=23}
+25 {file_name_id=2 function_name_id=7 line=573 end_line=573 column=13 end_column=23}
+26 {file_name_id=2 function_name_id=7 line=575 end_line=575 column=21 end_column=47}
+27 {file_name_id=2 function_name_id=7 line=575 end_line=575 column=15 end_column=65}
+28 {file_name_id=2 function_name_id=6 line=1919 end_line=1921 column=21 end_column=69}
+29 {file_name_id=2 function_name_id=6 line=1930 end_line=1931 column=18 end_column=71}
+30 {file_name_id=2 function_name_id=6 line=1932 end_line=1932 column=18 end_column=37}
+31 {file_name_id=2 function_name_id=6 line=1933 end_line=1933 column=19 end_column=72}
+32 {file_name_id=2 function_name_id=5 line=1960 end_line=1960 column=26 end_column=32}
+33 {file_name_id=4 function_name_id=9 line=53 end_line=53 column=21 end_column=27}
+34 {file_name_id=4 function_name_id=10 line=48 end_line=48 column=13 end_column=48}
+35 {file_name_id=5 function_name_id=10 line=770 end_line=786 column=18 end_column=4}
+36 {file_name_id=6 function_name_id=11 line=922 end_line=924 column=30 end_column=48}
+37 {file_name_id=6 function_name_id=12 line=318 end_line=329 column=12 end_column=47}
+38 {file_name_id=7 function_name_id=13 line=1008 end_line=1011 column=19 end_column=64}
+39 {file_name_id=8 function_name_id=14 line=243 end_line=243 column=14 end_column=35}
+40 {file_name_id=2 function_name_id=15 line=1985 end_line=1985 column=11 end_column=65}
+41 {file_name_id=2 function_name_id=16 line=1962 end_line=1963 column=15 end_column=76}
+42 {file_name_id=2 function_name_id=16 line=1897 end_line=1898 column=19 end_column=58}
+43 {file_name_id=2 function_name_id=16 line=1964 end_line=1964 column=15 end_column=66}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=1}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=1}
+6 {file_location_id=6 parent_frame_id=1}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=7}
+9 {file_location_id=9 parent_frame_id=7}
+10 {file_location_id=10 parent_frame_id=7}
+11 {file_location_id=6 parent_frame_id=11}
+12 {file_location_id=10 parent_frame_id=12}
+13 {file_location_id=11 parent_frame_id=1}
+14 {file_location_id=12 parent_frame_id=7}
+15 {file_location_id=13 parent_frame_id=15}
+16 {file_location_id=14 parent_frame_id=16}
+17 {file_location_id=15 parent_frame_id=16}
+18 {file_location_id=16 parent_frame_id=1}
+19 {file_location_id=17 parent_frame_id=16}
+20 {file_location_id=18 parent_frame_id=16}
+21 {file_location_id=19 parent_frame_id=15}
+22 {file_location_id=20 parent_frame_id=15}
+23 {file_location_id=21 parent_frame_id=15}
+24 {file_location_id=22 parent_frame_id=15}
+25 {file_location_id=23 parent_frame_id=15}
+26 {file_location_id=24 parent_frame_id=15}
+27 {file_location_id=25 parent_frame_id=15}
+28 {file_location_id=26 parent_frame_id=15}
+29 {file_location_id=27 parent_frame_id=15}
+30 {file_location_id=28 parent_frame_id=7}
+31 {file_location_id=29 parent_frame_id=7}
+32 {file_location_id=30 parent_frame_id=7}
+33 {file_location_id=31 parent_frame_id=7}
+34 {file_location_id=32 parent_frame_id=1}
+35 {file_location_id=33 parent_frame_id=1}
+36 {file_location_id=34 parent_frame_id=36}
+37 {file_location_id=35 parent_frame_id=37}
+38 {file_location_id=36 parent_frame_id=38}
+39 {file_location_id=37 parent_frame_id=39}
+40 {file_location_id=38 parent_frame_id=40}
+41 {file_location_id=39 parent_frame_id=41}
+42 {file_location_id=40 parent_frame_id=42}
+43 {file_location_id=41 parent_frame_id=43}
+44 {file_location_id=41 parent_frame_id=44}
+45 {file_location_id=41 parent_frame_id=45}
+46 {file_location_id=42 parent_frame_id=43}
+47 {file_location_id=43 parent_frame_id=43}
+
+
+%_take.1 (Arg_0.2: c128[24,2,1533], Arg_1.2: s32[1,32,32,32]) -> c128[24,2,1,32,32,32] {
+  %Arg_0.2 = c128[24,2,1533]{2,1,0} parameter(0)
+  %Arg_1.2 = s32[1,32,32,32]{3,2,1,0} parameter(1)
+  %broadcast_in_dim.6 = s32[1,32,32,32,1]{4,3,2,1,0} reshape(%Arg_1.2), metadata={op_name="broadcast_in_dim"}
+  ROOT %gather.1 = c128[24,2,1,32,32,32]{5,4,3,2,1,0} gather(%Arg_0.2, %broadcast_in_dim.6), offset_dims={0,1}, collapsed_slice_dims={2}, start_index_map={2}, index_vector_dim=4, slice_sizes={24,2,1}, metadata={op_name="gather"}
+}
+
+%fft.2 (Arg_0.4: c128[1,6,2,32,32,32]) -> c128[1,6,2,32,32,32] {
+  %Arg_0.4 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} parameter(0)
+  ROOT %fft.1 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} fft(%Arg_0.4), fft_type=IFFT, fft_length={32,32,32}, metadata={op_name="fft"}
+}
+
+%region_1.3 (reduce_prod.3: c128[], reduce_prod.4: c128[]) -> c128[] {
+  %reduce_prod.3 = c128[] parameter(0), metadata={op_name="reduce_prod"}
+  %reduce_prod.4 = c128[] parameter(1), metadata={op_name="reduce_prod"}
+  ROOT %reduce_prod.5 = c128[] multiply(%reduce_prod.3, %reduce_prod.4), metadata={op_name="reduce_prod" stack_frame_id=2}
+}
+
+%xla.sdy.manual_computation_body.4 (shard_map.5: c128[3], shard_map.6: c128[1,6,2,32,32,32]) -> c128[1,6,2,32,32,32] {
+  %shard_map.6 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} parameter(1), metadata={op_name="shard_map"}
+  %jit_fft_.1 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} call(%shard_map.6), to_apply=%fft.2, metadata={op_name="jit(fft)" stack_frame_id=2}
+  %shard_map.5 = c128[3]{0} parameter(0), metadata={op_name="shard_map"}
+  %constant.26 = c128[] constant((1, 0))
+  %reduce_prod.7 = c128[] reduce(%shard_map.5, %constant.26), dimensions={0}, to_apply=%region_1.3, metadata={op_name="reduce_prod" stack_frame_id=2}
+  %sqrt.93 = f64[] real(%reduce_prod.7), metadata={op_name="sqrt" stack_frame_id=2}
+  %constant.25 = f64[] constant(0)
+  %sqrt.94 = pred[] compare(%sqrt.93, %constant.25), direction=GE, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.95 = f64[] abs(%sqrt.93), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.96 = f64[] imag(%reduce_prod.7), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.97 = f64[] abs(%sqrt.96), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.98 = pred[] compare(%sqrt.95, %sqrt.97), direction=EQ, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.99 = f64[] sqrt(%sqrt.95), metadata={op_name="sqrt" stack_frame_id=2}
+  %constant.24 = f64[] constant(1.5537739740300374)
+  %sqrt.100 = f64[] multiply(%sqrt.99, %constant.24), metadata={op_name="sqrt" stack_frame_id=2}
+  %constant.23 = f64[] constant(1.4142135623730951)
+  %sqrt.101 = f64[] divide(%sqrt.100, %constant.23), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.102 = f64[] maximum(%sqrt.95, %sqrt.97), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.103 = f64[] minimum(%sqrt.95, %sqrt.97), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.104 = pred[] compare(%sqrt.102, %sqrt.103), direction=EQ, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.105 = f64[] multiply(%sqrt.102, %constant.23), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.106 = f64[] divide(%sqrt.103, %sqrt.102), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.107 = f64[] multiply(%sqrt.106, %sqrt.106), metadata={op_name="sqrt" stack_frame_id=2}
+  %constant.22 = f64[] constant(1)
+  %sqrt.108 = f64[] add(%sqrt.107, %constant.22), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.109 = f64[] sqrt(%sqrt.108), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.110 = pred[] compare(%sqrt.109, %constant.22), direction=EQ, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.111 = pred[] compare(%sqrt.107, %constant.25), direction=GT, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.112 = pred[] and(%sqrt.110, %sqrt.111), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.113 = f64[] multiply(%sqrt.102, %sqrt.107), metadata={op_name="sqrt" stack_frame_id=2}
+  %constant.21 = f64[] constant(2)
+  %sqrt.114 = f64[] divide(%sqrt.113, %constant.21), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.115 = f64[] add(%sqrt.102, %sqrt.114), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.116 = f64[] multiply(%sqrt.102, %sqrt.109), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.117 = f64[] select(%sqrt.112, %sqrt.115, %sqrt.116), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.118 = f64[] select(%sqrt.104, %sqrt.105, %sqrt.117), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.119 = f64[] divide(%sqrt.118, %constant.21), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.120 = f64[] divide(%sqrt.95, %constant.21), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.121 = f64[] add(%sqrt.119, %sqrt.120), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.122 = f64[] sqrt(%sqrt.121), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.123 = pred[] compare(%sqrt.122, %constant.25), direction=EQ, metadata={op_name="sqrt" stack_frame_id=2}
+  %constant.20 = f64[] constant(inf)
+  %sqrt.124 = pred[] compare(%sqrt.122, %constant.20), direction=EQ, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.125 = pred[] or(%sqrt.123, %sqrt.124), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.126 = pred[] compare(%sqrt.95, %sqrt.97), direction=GT, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.127 = pred[] compare(%sqrt.95, %sqrt.97), direction=LT, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.128 = f64[] divide(%sqrt.95, %sqrt.97), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.129 = f64[] divide(%sqrt.97, %sqrt.95), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.130 = f64[] select(%sqrt.127, %sqrt.128, %sqrt.129), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.131 = f64[] select(%sqrt.98, %constant.22, %sqrt.130), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.132 = f64[] abs(%sqrt.131), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.133 = f64[] maximum(%sqrt.132, %constant.22), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.134 = f64[] minimum(%sqrt.132, %constant.22), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.135 = pred[] compare(%sqrt.133, %sqrt.134), direction=EQ, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.136 = f64[] multiply(%sqrt.133, %constant.23), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.137 = f64[] divide(%sqrt.134, %sqrt.133), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.138 = f64[] multiply(%sqrt.137, %sqrt.137), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.139 = f64[] add(%sqrt.138, %constant.22), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.140 = f64[] sqrt(%sqrt.139), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.141 = pred[] compare(%sqrt.140, %constant.22), direction=EQ, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.142 = pred[] compare(%sqrt.138, %constant.25), direction=GT, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.143 = pred[] and(%sqrt.141, %sqrt.142), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.144 = f64[] multiply(%sqrt.133, %sqrt.138), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.145 = f64[] divide(%sqrt.144, %constant.21), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.146 = f64[] add(%sqrt.133, %sqrt.145), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.147 = f64[] multiply(%sqrt.133, %sqrt.140), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.148 = f64[] select(%sqrt.143, %sqrt.146, %sqrt.147), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.149 = f64[] select(%sqrt.135, %sqrt.136, %sqrt.148), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.150 = f64[] add(%sqrt.149, %constant.22), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.151 = f64[] sqrt(%sqrt.150), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.152 = f64[] divide(%sqrt.151, %constant.23), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.153 = f64[] multiply(%sqrt.99, %sqrt.152), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.154 = f64[] sqrt(%sqrt.97), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.155 = f64[] add(%sqrt.131, %sqrt.149), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.156 = f64[] sqrt(%sqrt.155), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.157 = f64[] divide(%sqrt.156, %constant.23), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.158 = f64[] multiply(%sqrt.154, %sqrt.157), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.159 = f64[] select(%sqrt.126, %sqrt.153, %sqrt.158), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.160 = f64[] select(%sqrt.125, %sqrt.159, %sqrt.122), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.161 = f64[] select(%sqrt.98, %sqrt.101, %sqrt.160), metadata={op_name="sqrt" stack_frame_id=2}
+  %constant.19 = f64[] constant(2.19736822693562)
+  %sqrt.162 = f64[] divide(%sqrt.154, %constant.19), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.163 = f64[] divide(%sqrt.99, %sqrt.154), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.164 = f64[] divide(%sqrt.154, %sqrt.99), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.165 = f64[] select(%sqrt.127, %sqrt.163, %sqrt.164), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.166 = f64[] select(%sqrt.98, %constant.22, %sqrt.165), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.167 = f64[] multiply(%sqrt.154, %sqrt.166), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.168 = f64[] multiply(%sqrt.151, %constant.23), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.169 = f64[] divide(%sqrt.167, %sqrt.168), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.170 = f64[] multiply(%sqrt.156, %constant.23), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.171 = f64[] divide(%sqrt.154, %sqrt.170), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.172 = f64[] select(%sqrt.126, %sqrt.169, %sqrt.171), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.173 = f64[] multiply(%sqrt.122, %constant.21), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.174 = f64[] divide(%sqrt.97, %sqrt.173), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.175 = f64[] select(%sqrt.125, %sqrt.172, %sqrt.174), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.176 = f64[] select(%sqrt.98, %sqrt.162, %sqrt.175), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.177 = f64[] select(%sqrt.94, %sqrt.161, %sqrt.176), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.178 = pred[] compare(%sqrt.93, %constant.25), direction=LT, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.179 = pred[] compare(%sqrt.96, %constant.25), direction=LT, metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.180 = f64[] negate(%sqrt.161), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.181 = f64[] select(%sqrt.179, %sqrt.180, %sqrt.161), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.182 = f64[] negate(%sqrt.176), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.183 = f64[] select(%sqrt.179, %sqrt.182, %sqrt.176), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.184 = f64[] select(%sqrt.178, %sqrt.181, %sqrt.183), metadata={op_name="sqrt" stack_frame_id=2}
+  %sqrt.185 = c128[] complex(%sqrt.177, %sqrt.184), metadata={op_name="sqrt" stack_frame_id=2}
+  %mul.5 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} broadcast(%sqrt.185), dimensions={}, metadata={op_name="mul" stack_frame_id=2}
+  ROOT %mul.6 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} multiply(%jit_fft_.1, %mul.5), metadata={op_name="mul" stack_frame_id=2}
+}
+
+%fft_18.5 (Arg_0.6: c128[1,6,2,32,32,32]) -> c128[1,6,2,32,32,32] {
+  %Arg_0.6 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} parameter(0)
+  ROOT %fft.3 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} fft(%Arg_0.6), fft_type=FFT, fft_length={32,32,32}, metadata={op_name="fft"}
+}
+
+%region_2.6 (reduce_prod.11: c128[], reduce_prod.12: c128[]) -> c128[] {
+  %reduce_prod.11 = c128[] parameter(0), metadata={op_name="reduce_prod"}
+  %reduce_prod.12 = c128[] parameter(1), metadata={op_name="reduce_prod"}
+  ROOT %reduce_prod.13 = c128[] multiply(%reduce_prod.11, %reduce_prod.12), metadata={op_name="reduce_prod" stack_frame_id=4}
+}
+
+%xla.sdy.manual_computation_body_0.7 (shard_map.14: c128[3], shard_map.15: c128[1,6,2,32,32,32]) -> c128[1,6,2,32,32,32] {
+  %shard_map.15 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} parameter(1), metadata={op_name="shard_map"}
+  %jit_fft_.3 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} call(%shard_map.15), to_apply=%fft_18.5, metadata={op_name="jit(fft)" stack_frame_id=4}
+  %constant.42 = c128[] constant((1, 0))
+  %shard_map.14 = c128[3]{0} parameter(0), metadata={op_name="shard_map"}
+  %reduce_prod.15 = c128[] reduce(%shard_map.14, %constant.42), dimensions={0}, to_apply=%region_2.6, metadata={op_name="reduce_prod" stack_frame_id=4}
+  %sqrt.279 = f64[] real(%reduce_prod.15), metadata={op_name="sqrt" stack_frame_id=4}
+  %constant.41 = f64[] constant(0)
+  %sqrt.280 = pred[] compare(%sqrt.279, %constant.41), direction=GE, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.281 = f64[] abs(%sqrt.279), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.282 = f64[] imag(%reduce_prod.15), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.283 = f64[] abs(%sqrt.282), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.284 = pred[] compare(%sqrt.281, %sqrt.283), direction=EQ, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.285 = f64[] sqrt(%sqrt.281), metadata={op_name="sqrt" stack_frame_id=4}
+  %constant.40 = f64[] constant(1.5537739740300374)
+  %sqrt.286 = f64[] multiply(%sqrt.285, %constant.40), metadata={op_name="sqrt" stack_frame_id=4}
+  %constant.39 = f64[] constant(1.4142135623730951)
+  %sqrt.287 = f64[] divide(%sqrt.286, %constant.39), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.288 = f64[] maximum(%sqrt.281, %sqrt.283), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.289 = f64[] minimum(%sqrt.281, %sqrt.283), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.290 = pred[] compare(%sqrt.288, %sqrt.289), direction=EQ, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.291 = f64[] multiply(%sqrt.288, %constant.39), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.292 = f64[] divide(%sqrt.289, %sqrt.288), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.293 = f64[] multiply(%sqrt.292, %sqrt.292), metadata={op_name="sqrt" stack_frame_id=4}
+  %constant.38 = f64[] constant(1)
+  %sqrt.294 = f64[] add(%sqrt.293, %constant.38), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.295 = f64[] sqrt(%sqrt.294), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.296 = pred[] compare(%sqrt.295, %constant.38), direction=EQ, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.297 = pred[] compare(%sqrt.293, %constant.41), direction=GT, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.298 = pred[] and(%sqrt.296, %sqrt.297), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.299 = f64[] multiply(%sqrt.288, %sqrt.293), metadata={op_name="sqrt" stack_frame_id=4}
+  %constant.37 = f64[] constant(2)
+  %sqrt.300 = f64[] divide(%sqrt.299, %constant.37), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.301 = f64[] add(%sqrt.288, %sqrt.300), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.302 = f64[] multiply(%sqrt.288, %sqrt.295), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.303 = f64[] select(%sqrt.298, %sqrt.301, %sqrt.302), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.304 = f64[] select(%sqrt.290, %sqrt.291, %sqrt.303), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.305 = f64[] divide(%sqrt.304, %constant.37), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.306 = f64[] divide(%sqrt.281, %constant.37), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.307 = f64[] add(%sqrt.305, %sqrt.306), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.308 = f64[] sqrt(%sqrt.307), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.309 = pred[] compare(%sqrt.308, %constant.41), direction=EQ, metadata={op_name="sqrt" stack_frame_id=4}
+  %constant.36 = f64[] constant(inf)
+  %sqrt.310 = pred[] compare(%sqrt.308, %constant.36), direction=EQ, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.311 = pred[] or(%sqrt.309, %sqrt.310), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.312 = pred[] compare(%sqrt.281, %sqrt.283), direction=GT, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.313 = pred[] compare(%sqrt.281, %sqrt.283), direction=LT, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.314 = f64[] divide(%sqrt.281, %sqrt.283), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.315 = f64[] divide(%sqrt.283, %sqrt.281), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.316 = f64[] select(%sqrt.313, %sqrt.314, %sqrt.315), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.317 = f64[] select(%sqrt.284, %constant.38, %sqrt.316), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.318 = f64[] abs(%sqrt.317), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.319 = f64[] maximum(%sqrt.318, %constant.38), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.320 = f64[] minimum(%sqrt.318, %constant.38), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.321 = pred[] compare(%sqrt.319, %sqrt.320), direction=EQ, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.322 = f64[] multiply(%sqrt.319, %constant.39), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.323 = f64[] divide(%sqrt.320, %sqrt.319), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.324 = f64[] multiply(%sqrt.323, %sqrt.323), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.325 = f64[] add(%sqrt.324, %constant.38), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.326 = f64[] sqrt(%sqrt.325), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.327 = pred[] compare(%sqrt.326, %constant.38), direction=EQ, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.328 = pred[] compare(%sqrt.324, %constant.41), direction=GT, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.329 = pred[] and(%sqrt.327, %sqrt.328), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.330 = f64[] multiply(%sqrt.319, %sqrt.324), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.331 = f64[] divide(%sqrt.330, %constant.37), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.332 = f64[] add(%sqrt.319, %sqrt.331), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.333 = f64[] multiply(%sqrt.319, %sqrt.326), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.334 = f64[] select(%sqrt.329, %sqrt.332, %sqrt.333), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.335 = f64[] select(%sqrt.321, %sqrt.322, %sqrt.334), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.336 = f64[] add(%sqrt.335, %constant.38), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.337 = f64[] sqrt(%sqrt.336), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.338 = f64[] divide(%sqrt.337, %constant.39), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.339 = f64[] multiply(%sqrt.285, %sqrt.338), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.340 = f64[] sqrt(%sqrt.283), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.341 = f64[] add(%sqrt.317, %sqrt.335), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.342 = f64[] sqrt(%sqrt.341), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.343 = f64[] divide(%sqrt.342, %constant.39), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.344 = f64[] multiply(%sqrt.340, %sqrt.343), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.345 = f64[] select(%sqrt.312, %sqrt.339, %sqrt.344), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.346 = f64[] select(%sqrt.311, %sqrt.345, %sqrt.308), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.347 = f64[] select(%sqrt.284, %sqrt.287, %sqrt.346), metadata={op_name="sqrt" stack_frame_id=4}
+  %constant.35 = f64[] constant(2.19736822693562)
+  %sqrt.348 = f64[] divide(%sqrt.340, %constant.35), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.349 = f64[] divide(%sqrt.285, %sqrt.340), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.350 = f64[] divide(%sqrt.340, %sqrt.285), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.351 = f64[] select(%sqrt.313, %sqrt.349, %sqrt.350), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.352 = f64[] select(%sqrt.284, %constant.38, %sqrt.351), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.353 = f64[] multiply(%sqrt.340, %sqrt.352), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.354 = f64[] multiply(%sqrt.337, %constant.39), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.355 = f64[] divide(%sqrt.353, %sqrt.354), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.356 = f64[] multiply(%sqrt.342, %constant.39), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.357 = f64[] divide(%sqrt.340, %sqrt.356), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.358 = f64[] select(%sqrt.312, %sqrt.355, %sqrt.357), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.359 = f64[] multiply(%sqrt.308, %constant.37), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.360 = f64[] divide(%sqrt.283, %sqrt.359), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.361 = f64[] select(%sqrt.311, %sqrt.358, %sqrt.360), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.362 = f64[] select(%sqrt.284, %sqrt.348, %sqrt.361), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.363 = f64[] select(%sqrt.280, %sqrt.347, %sqrt.362), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.364 = pred[] compare(%sqrt.279, %constant.41), direction=LT, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.365 = pred[] compare(%sqrt.282, %constant.41), direction=LT, metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.366 = f64[] negate(%sqrt.347), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.367 = f64[] select(%sqrt.365, %sqrt.366, %sqrt.347), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.368 = f64[] negate(%sqrt.362), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.369 = f64[] select(%sqrt.365, %sqrt.368, %sqrt.362), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.370 = f64[] select(%sqrt.364, %sqrt.367, %sqrt.369), metadata={op_name="sqrt" stack_frame_id=4}
+  %sqrt.371 = c128[] complex(%sqrt.363, %sqrt.370), metadata={op_name="sqrt" stack_frame_id=4}
+  %div.1 = c128[] divide(%constant.42, %sqrt.371), metadata={op_name="div" stack_frame_id=4}
+  %mul.14 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} broadcast(%div.1), dimensions={}, metadata={op_name="mul" stack_frame_id=4}
+  ROOT %mul.15 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} multiply(%jit_fft_.3, %mul.14), metadata={op_name="mul" stack_frame_id=4}
+}
+
+%closed_call.8 (Arg_0.7: c128[3], Arg_1.3: c128[32,32,32], Arg_2.1: c128[3], Arg_3.1: c128[24,2,1532], Arg_4.1: s32[1532,3], Arg_5.1: f64[1532], Arg_6.1: s32[32,32,32]) -> c128[24,24] {
+  %Arg_3.1 = c128[24,2,1532]{2,1,0} parameter(3)
+  %broadcast_in_dim.15 = c128[1,24,2,1532]{3,2,1,0} reshape(%Arg_3.1), metadata={op_name="broadcast_in_dim" stack_frame_id=5}
+  %Arg_5.1 = f64[1532]{0} parameter(5)
+  %broadcast_in_dim.22 = f64[1,1,1,1532]{3,2,1,0} reshape(%Arg_5.1), metadata={op_name="broadcast_in_dim" stack_frame_id=7}
+  %convert_element_type.3 = c128[1,1,1,1532]{3,2,1,0} convert(%broadcast_in_dim.22), metadata={op_name="convert_element_type" stack_frame_id=7}
+  %mul.39 = c128[1,1,1,1532]{3,2,1,0} broadcast(%convert_element_type.3), dimensions={0,1,2,3}, metadata={op_name="mul" stack_frame_id=8}
+  %mul.40 = c128[1,1532]{1,0} reshape(%mul.39), metadata={op_name="mul" stack_frame_id=8}
+  %mul.41 = c128[1,24,2,1532]{3,2,1,0} broadcast(%mul.40), dimensions={0,3}, metadata={op_name="mul" stack_frame_id=8}
+  %mul.42 = c128[1,24,2,1532]{3,2,1,0} multiply(%broadcast_in_dim.15, %mul.41), metadata={op_name="mul" stack_frame_id=8}
+  %sharding_constraint.5 = c128[1,24,2,1532]{3,2,1,0} custom-call(%mul.42), custom_call_target="Sharding", sharding={devices=[1,2,1,1,2]<=[4] last_tile_dim_replicate}, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\"}, {}, {}]>]>"}, metadata={op_name="sharding_constraint" stack_frame_id=9}
+  %real.1 = f64[1,24,2,1532]{3,2,1,0} real(%sharding_constraint.5), metadata={op_name="real" stack_frame_id=12}
+  %imag.1 = f64[1,24,2,1532]{3,2,1,0} imag(%sharding_constraint.5), metadata={op_name="imag" stack_frame_id=12}
+  %neg.1 = f64[1,24,2,1532]{3,2,1,0} negate(%imag.1), metadata={op_name="neg" stack_frame_id=12}
+  %complex.1 = c128[1,24,2,1532]{3,2,1,0} complex(%real.1, %neg.1), metadata={op_name="complex" stack_frame_id=12}
+  %Arg_2.1 = c128[3]{0} parameter(2)
+  %Arg_0.7 = c128[3]{0} parameter(0)
+  %broadcast_in_dim.14 = c128[1,24,2,1532]{3,2,1,0} reshape(%Arg_3.1), metadata={op_name="broadcast_in_dim" stack_frame_id=13}
+  %constant.48 = c128[] constant((0, 0))
+  %broadcast_in_dim.13 = c128[1,24,2,1]{3,2,1,0} broadcast(%constant.48), dimensions={}, metadata={op_name="broadcast_in_dim" stack_frame_id=16}
+  %concatenate.2 = c128[1,24,2,1533]{3,2,1,0} concatenate(%broadcast_in_dim.14, %broadcast_in_dim.13), dimensions={3}, metadata={op_name="concatenate" stack_frame_id=17}
+  %reshape_transpose.1 = c128[24,2,1533]{2,1,0} reshape(%concatenate.2), metadata={op_name="reshape;transpose"}
+  %Arg_6.1 = s32[32,32,32]{2,1,0} parameter(6)
+  %broadcast_in_dim.16 = s32[1,32,32,32]{3,2,1,0} reshape(%Arg_6.1), metadata={op_name="broadcast_in_dim" stack_frame_id=18}
+  %jit__take_.1 = c128[24,2,1,32,32,32]{5,4,3,2,1,0} call(%reshape_transpose.1, %broadcast_in_dim.16), to_apply=%_take.1, metadata={op_name="jit(_take)" stack_frame_id=19}
+  %transpose.1 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} reshape(%jit__take_.1), metadata={op_name="transpose" stack_frame_id=20}
+  %shard_map.18 = (c128[3]{0}, c128[1,6,2,32,32,32]{5,4,3,2,1,0}) custom-call(%Arg_0.7, %transpose.1), custom_call_target="xla.sdy.GlobalToLocalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.in_shardings="#sdy.sharding_per_value<[<@mesh, [{}]>, <@mesh, [{}, {\"x\", \"y\"}, {}, {}, {}, {}]>]>",xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>"}, metadata={op_name="shard_map" stack_frame_id=21}
+  %shard_map.19 = c128[3]{0} get-tuple-element(%shard_map.18), index=0, metadata={op_name="shard_map" stack_frame_id=21}
+  %shard_map.20 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} get-tuple-element(%shard_map.18), index=1, metadata={op_name="shard_map" stack_frame_id=21}
+  %shard_map.21 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} call(%shard_map.19, %shard_map.20), to_apply=%xla.sdy.manual_computation_body.4, frontend_attributes={inlineable="false"}, metadata={op_name="shard_map" stack_frame_id=21}
+  %shard_map.22 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} custom-call(%shard_map.21), custom_call_target="xla.sdy.LocalToGlobalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>",xla.sdy.out_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\", \"y\"}, {}, {}, {}, {}]>]>"}, metadata={op_name="shard_map" stack_frame_id=21}
+  %constant.47 = c128[] constant((11.347530010246667, 0))
+  %mul.28 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} broadcast(%constant.47), dimensions={}, metadata={op_name="mul" stack_frame_id=21}
+  %mul.29 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} multiply(%shard_map.22, %mul.28), metadata={op_name="mul" stack_frame_id=21}
+  %Arg_1.3 = c128[32,32,32]{2,1,0} parameter(1)
+  %broadcast_in_dim.17 = c128[1,1,1,32,32,32]{5,4,3,2,1,0} reshape(%Arg_1.3), metadata={op_name="broadcast_in_dim" stack_frame_id=22}
+  %mul.30 = c128[1,1,1,32,32,32]{5,4,3,2,1,0} broadcast(%broadcast_in_dim.17), dimensions={0,1,2,3,4,5}, metadata={op_name="mul" stack_frame_id=22}
+  %mul.31 = c128[1,32,32,32]{3,2,1,0} reshape(%mul.30), metadata={op_name="mul" stack_frame_id=22}
+  %mul.32 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} broadcast(%mul.31), dimensions={0,3,4,5}, metadata={op_name="mul" stack_frame_id=22}
+  %mul.33 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} multiply(%mul.29, %mul.32), metadata={op_name="mul" stack_frame_id=22}
+  %shard_map.23 = (c128[3]{0}, c128[1,6,2,32,32,32]{5,4,3,2,1,0}) custom-call(%Arg_2.1, %mul.33), custom_call_target="xla.sdy.GlobalToLocalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.in_shardings="#sdy.sharding_per_value<[<@mesh, [{}]>, <@mesh, [{}, {\"x\", \"y\"}, {}, {}, {}, {}]>]>",xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>"}, metadata={op_name="shard_map" stack_frame_id=23}
+  %shard_map.24 = c128[3]{0} get-tuple-element(%shard_map.23), index=0, metadata={op_name="shard_map" stack_frame_id=23}
+  %shard_map.25 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} get-tuple-element(%shard_map.23), index=1, metadata={op_name="shard_map" stack_frame_id=23}
+  %shard_map.26 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} call(%shard_map.24, %shard_map.25), to_apply=%xla.sdy.manual_computation_body_0.7, frontend_attributes={inlineable="false"}, metadata={op_name="shard_map" stack_frame_id=23}
+  %shard_map.27 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} custom-call(%shard_map.26), custom_call_target="xla.sdy.LocalToGlobalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>",xla.sdy.out_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\", \"y\"}, {}, {}, {}, {}]>]>"}, metadata={op_name="shard_map" stack_frame_id=23}
+  %constant.46 = c128[] constant((1.4057959491027565, 0))
+  %mul.27 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} broadcast(%constant.46), dimensions={}, metadata={op_name="mul" stack_frame_id=23}
+  %mul.34 = c128[1,24,2,32,32,32]{5,4,3,2,1,0} multiply(%shard_map.27, %mul.27), metadata={op_name="mul" stack_frame_id=23}
+  %Arg_4.1 = s32[1532,3]{1,0} parameter(4)
+  %slice.3 = s32[1532,1]{1,0} slice(%Arg_4.1), slice={[0:1532], [0:1]}, metadata={op_name="slice" stack_frame_id=24}
+  %squeeze.8 = s32[1532]{0} reshape(%slice.3), metadata={op_name="squeeze" stack_frame_id=24}
+  %constant.45 = s32[] constant(0)
+  %broadcast.4 = s32[1532]{0} broadcast(%constant.45), dimensions={}
+  %lt.3 = pred[1532]{0} compare(%squeeze.8, %broadcast.4), direction=LT, metadata={op_name="lt" stack_frame_id=25}
+  %constant.44 = s32[] constant(32)
+  %broadcast.3 = s32[1532]{0} broadcast(%constant.44), dimensions={}
+  %add.3 = s32[1532]{0} add(%squeeze.8, %broadcast.3), metadata={op_name="add" stack_frame_id=25}
+  %select_n.3 = s32[1532]{0} select(%lt.3, %add.3, %squeeze.8), metadata={op_name="select_n" stack_frame_id=25}
+  %broadcast_in_dim.18 = s32[1532,1]{1,0} reshape(%select_n.3), metadata={op_name="broadcast_in_dim" stack_frame_id=25}
+  %slice.4 = s32[1532,1]{1,0} slice(%Arg_4.1), slice={[0:1532], [1:2]}, metadata={op_name="slice" stack_frame_id=26}
+  %squeeze.9 = s32[1532]{0} reshape(%slice.4), metadata={op_name="squeeze" stack_frame_id=26}
+  %lt.4 = pred[1532]{0} compare(%squeeze.9, %broadcast.4), direction=LT, metadata={op_name="lt" stack_frame_id=25}
+  %add.4 = s32[1532]{0} add(%squeeze.9, %broadcast.3), metadata={op_name="add" stack_frame_id=25}
+  %select_n.4 = s32[1532]{0} select(%lt.4, %add.4, %squeeze.9), metadata={op_name="select_n" stack_frame_id=25}
+  %broadcast_in_dim.19 = s32[1532,1]{1,0} reshape(%select_n.4), metadata={op_name="broadcast_in_dim" stack_frame_id=25}
+  %slice.5 = s32[1532,1]{1,0} slice(%Arg_4.1), slice={[0:1532], [2:3]}, metadata={op_name="slice" stack_frame_id=27}
+  %squeeze.10 = s32[1532]{0} reshape(%slice.5), metadata={op_name="squeeze" stack_frame_id=27}
+  %lt.5 = pred[1532]{0} compare(%squeeze.10, %broadcast.4), direction=LT, metadata={op_name="lt" stack_frame_id=25}
+  %add.5 = s32[1532]{0} add(%squeeze.10, %broadcast.3), metadata={op_name="add" stack_frame_id=25}
+  %select_n.5 = s32[1532]{0} select(%lt.5, %add.5, %squeeze.10), metadata={op_name="select_n" stack_frame_id=25}
+  %broadcast_in_dim.20 = s32[1532,1]{1,0} reshape(%select_n.5), metadata={op_name="broadcast_in_dim" stack_frame_id=25}
+  %concatenate.3 = s32[1532,3]{1,0} concatenate(%broadcast_in_dim.18, %broadcast_in_dim.19, %broadcast_in_dim.20), dimensions={1}, metadata={op_name="concatenate" stack_frame_id=25}
+  %gather.3 = c128[1,24,2,1532]{3,2,1,0} gather(%mul.34, %concatenate.3), offset_dims={0,1,2}, collapsed_slice_dims={3,4,5}, start_index_map={3,4,5}, index_vector_dim=1, slice_sizes={1,24,2,1,1,1}, metadata={op_name="gather" stack_frame_id=25}
+  %broadcast_in_dim.21 = f64[1,1,1,1532]{3,2,1,0} reshape(%Arg_5.1), metadata={op_name="broadcast_in_dim" stack_frame_id=28}
+  %convert_element_type.2 = c128[1,1,1,1532]{3,2,1,0} convert(%broadcast_in_dim.21), metadata={op_name="convert_element_type" stack_frame_id=28}
+  %mul.35 = c128[1,1,1,1532]{3,2,1,0} broadcast(%convert_element_type.2), dimensions={0,1,2,3}, metadata={op_name="mul" stack_frame_id=29}
+  %mul.36 = c128[1,1532]{1,0} reshape(%mul.35), metadata={op_name="mul" stack_frame_id=29}
+  %mul.37 = c128[1,24,2,1532]{3,2,1,0} broadcast(%mul.36), dimensions={0,3}, metadata={op_name="mul" stack_frame_id=29}
+  %mul.38 = c128[1,24,2,1532]{3,2,1,0} multiply(%gather.3, %mul.37), metadata={op_name="mul" stack_frame_id=29}
+  %sharding_constraint.4 = c128[1,24,2,1532]{3,2,1,0} custom-call(%mul.38), custom_call_target="Sharding", sharding={devices=[1,2,1,1,2]<=[2,2]T(1,0) last_tile_dim_replicate}, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {\"y\"}, {}, {}]>]>"}, metadata={op_name="sharding_constraint" stack_frame_id=30}
+  %dot_general.1 = c128[1,24,24]{2,1,0} dot(%complex.1, %sharding_constraint.4), lhs_batch_dims={0}, lhs_contracting_dims={3,2}, rhs_batch_dims={0}, rhs_contracting_dims={3,2}, operand_precision={highest,highest}, metadata={op_name="kbsg,knsg->kbn/dot_general" stack_frame_id=31}
+  %constant.43 = c128[] constant((0.062686839218463061, 0))
+  %mul.26 = c128[1,24,24]{2,1,0} broadcast(%constant.43), dimensions={}, metadata={op_name="mul" stack_frame_id=32}
+  %mul.43 = c128[1,24,24]{2,1,0} multiply(%dot_general.1, %mul.26), metadata={op_name="mul" stack_frame_id=32}
+  %sharding_constraint.6 = c128[1,24,24]{2,1,0} custom-call(%mul.43), custom_call_target="Sharding", sharding={devices=[1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\"}, {\"y\"}]>]>"}, metadata={op_name="sharding_constraint" stack_frame_id=33}
+  ROOT %squeeze.11 = c128[24,24]{1,0} reshape(%sharding_constraint.6), metadata={op_name="squeeze" stack_frame_id=34}
+}
+
+%region_0.9 (arg_tuple.1: (s64[], c128[29,24,24], c128[29,24,2,1532], s32[29,1532,3], f64[29,1532], /*index=5*/s32[29,32,32,32], c128[32,32,32])) -> (s64[], c128[29,24,24], c128[29,24,2,1532], s32[29,1532,3], f64[29,1532], /*index=5*/s32[29,32,32,32], c128[32,32,32]) {
+  %arg_tuple.1 = (s64[], c128[29,24,24]{2,1,0}, c128[29,24,2,1532]{3,2,1,0}, s32[29,1532,3]{2,1,0}, f64[29,1532]{1,0}, /*index=5*/s32[29,32,32,32]{3,2,1,0}, c128[32,32,32]{2,1,0}) parameter(0)
+  %get-tuple-element.7 = s64[] get-tuple-element(%arg_tuple.1), index=0
+  %constant.49 = s64[] constant(1)
+  %add.7 = s64[] add(%get-tuple-element.7, %constant.49), metadata={op_name="jit(_run)/while/body/add" stack_frame_id=45}
+  %get-tuple-element.8 = c128[29,24,24]{2,1,0} get-tuple-element(%arg_tuple.1), index=1
+  %constant.50 = c128[] constant((32, 0))
+  %broadcast.5 = c128[3]{0} broadcast(%constant.50), dimensions={}
+  %get-tuple-element.13 = c128[32,32,32]{2,1,0} get-tuple-element(%arg_tuple.1), index=6
+  %get-tuple-element.9 = c128[29,24,2,1532]{3,2,1,0} get-tuple-element(%arg_tuple.1), index=2
+  %constant.51 = s64[] constant(0)
+  %dynamic_slice.4 = c128[1,24,2,1532]{3,2,1,0} dynamic-slice(%get-tuple-element.9, %get-tuple-element.7, %constant.51, %constant.51, %constant.51), dynamic_slice_sizes={1,24,2,1532}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=45}
+  %squeeze.12 = c128[24,2,1532]{2,1,0} reshape(%dynamic_slice.4), metadata={op_name="jit(_run)/while/body/squeeze" stack_frame_id=45}
+  %get-tuple-element.10 = s32[29,1532,3]{2,1,0} get-tuple-element(%arg_tuple.1), index=3
+  %dynamic_slice.5 = s32[1,1532,3]{2,1,0} dynamic-slice(%get-tuple-element.10, %get-tuple-element.7, %constant.51, %constant.51), dynamic_slice_sizes={1,1532,3}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=45}
+  %squeeze.13 = s32[1532,3]{1,0} reshape(%dynamic_slice.5), metadata={op_name="jit(_run)/while/body/squeeze" stack_frame_id=45}
+  %get-tuple-element.11 = f64[29,1532]{1,0} get-tuple-element(%arg_tuple.1), index=4
+  %dynamic_slice.6 = f64[1,1532]{1,0} dynamic-slice(%get-tuple-element.11, %get-tuple-element.7, %constant.51), dynamic_slice_sizes={1,1532}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=45}
+  %squeeze.14 = f64[1532]{0} reshape(%dynamic_slice.6), metadata={op_name="jit(_run)/while/body/squeeze" stack_frame_id=45}
+  %get-tuple-element.12 = s32[29,32,32,32]{3,2,1,0} get-tuple-element(%arg_tuple.1), index=5
+  %dynamic_slice.7 = s32[1,32,32,32]{3,2,1,0} dynamic-slice(%get-tuple-element.12, %get-tuple-element.7, %constant.51, %constant.51, %constant.51), dynamic_slice_sizes={1,32,32,32}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=45}
+  %squeeze.15 = s32[32,32,32]{2,1,0} reshape(%dynamic_slice.7), metadata={op_name="jit(_run)/while/body/squeeze" stack_frame_id=45}
+  %closed_call.1 = c128[24,24]{1,0} call(%broadcast.5, %get-tuple-element.13, %broadcast.5, %squeeze.12, %squeeze.13, /*index=5*/%squeeze.14, %squeeze.15), to_apply=%closed_call.8, metadata={op_name="jit(_run)/while/body/closed_call" stack_frame_id=45}
+  %broadcast_in_dim.24 = c128[1,24,24]{2,1,0} reshape(%closed_call.1), metadata={op_name="jit(_run)/while/body/broadcast_in_dim" stack_frame_id=45}
+  %dynamic_update_slice.1 = c128[29,24,24]{2,1,0} dynamic-update-slice(%get-tuple-element.8, %broadcast_in_dim.24, %get-tuple-element.7, %constant.51, %constant.51), metadata={op_name="jit(_run)/while/body/dynamic_update_slice" stack_frame_id=45}
+  ROOT %tuple.1 = (s64[], c128[29,24,24]{2,1,0}, c128[29,24,2,1532]{3,2,1,0}, s32[29,1532,3]{2,1,0}, f64[29,1532]{1,0}, /*index=5*/s32[29,32,32,32]{3,2,1,0}, c128[32,32,32]{2,1,0}) tuple(%add.7, %dynamic_update_slice.1, %get-tuple-element.9, %get-tuple-element.10, %get-tuple-element.11, /*index=5*/%get-tuple-element.12, %get-tuple-element.13)
+}
+
+%region_3.10 (arg_tuple.3: (s64[], c128[29,24,24], c128[29,24,2,1532], s32[29,1532,3], f64[29,1532], /*index=5*/s32[29,32,32,32], c128[32,32,32])) -> pred[] {
+  %arg_tuple.3 = (s64[], c128[29,24,24]{2,1,0}, c128[29,24,2,1532]{3,2,1,0}, s32[29,1532,3]{2,1,0}, f64[29,1532]{1,0}, /*index=5*/s32[29,32,32,32]{3,2,1,0}, c128[32,32,32]{2,1,0}) parameter(0)
+  %get-tuple-element.22 = c128[29,24,24]{2,1,0} get-tuple-element(%arg_tuple.3), index=1
+  %get-tuple-element.23 = c128[29,24,2,1532]{3,2,1,0} get-tuple-element(%arg_tuple.3), index=2
+  %get-tuple-element.24 = s32[29,1532,3]{2,1,0} get-tuple-element(%arg_tuple.3), index=3
+  %get-tuple-element.25 = f64[29,1532]{1,0} get-tuple-element(%arg_tuple.3), index=4
+  %get-tuple-element.26 = s32[29,32,32,32]{3,2,1,0} get-tuple-element(%arg_tuple.3), index=5
+  %get-tuple-element.27 = c128[32,32,32]{2,1,0} get-tuple-element(%arg_tuple.3), index=6
+  %get-tuple-element.21 = s64[] get-tuple-element(%arg_tuple.3), index=0
+  %constant.53 = s64[] constant(29)
+  ROOT %lt.7 = pred[] compare(%get-tuple-element.21, %constant.53), direction=LT, metadata={op_name="jit(_run)/while/cond/lt" stack_frame_id=45}
+}
+
+ENTRY %main.11 (psi.1: c128[29,24,2,1532], gvecs_.1: s32[29,1532,3], gmask_.1: f64[29,1532], bidx_.1: s32[29,32,32,32], consts__0_.1: c128[32,32,32]) -> c128[29,24,24] {
+  %constant.55 = s64[] constant(0)
+  %constant.54 = c128[] constant((0, 0))
+  %broadcast_in_dim.25 = c128[29,24,24]{2,1,0} broadcast(%constant.54), dimensions={}, metadata={op_name="jit(_run)/broadcast_in_dim" stack_frame_id=44}
+  %psi.1 = c128[29,24,2,1532]{3,2,1,0} parameter(0), sharding={devices=[1,4,1,1]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {\"x\", \"y\"}, {}, {}]>"}, metadata={op_name="psi"}
+  %sharding_constraint.8 = c128[29,24,2,1532]{3,2,1,0} custom-call(%psi.1), custom_call_target="Sharding", sharding={devices=[1,4,1,1]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\", \"y\"}, {}, {}]>]>"}, metadata={op_name="jit(_run)/sharding_constraint" stack_frame_id=46}
+  %gvecs_.1 = s32[29,1532,3]{2,1,0} parameter(1), metadata={op_name="gvecs_"}
+  %gmask_.1 = f64[29,1532]{1,0} parameter(2), metadata={op_name="gmask_"}
+  %bidx_.1 = s32[29,32,32,32]{3,2,1,0} parameter(3), metadata={op_name="bidx_"}
+  %consts__0_.1 = c128[32,32,32]{2,1,0} parameter(4), metadata={op_name="consts_[0]"}
+  %while.4 = (s64[], c128[29,24,24]{2,1,0}, c128[29,24,2,1532]{3,2,1,0}, s32[29,1532,3]{2,1,0}, f64[29,1532]{1,0}, /*index=5*/s32[29,32,32,32]{3,2,1,0}, c128[32,32,32]{2,1,0}) tuple(%constant.55, %broadcast_in_dim.25, %sharding_constraint.8, %gvecs_.1, %gmask_.1, /*index=5*/%bidx_.1, %consts__0_.1), metadata={op_name="jit(_run)/while" stack_frame_id=44}
+  %while.5 = (s64[], c128[29,24,24]{2,1,0}, c128[29,24,2,1532]{3,2,1,0}, s32[29,1532,3]{2,1,0}, f64[29,1532]{1,0}, /*index=5*/s32[29,32,32,32]{3,2,1,0}, c128[32,32,32]{2,1,0}) while(%while.4), condition=%region_3.10, body=%region_0.9, metadata={op_name="jit(_run)/while" stack_frame_id=44}
+  %while.6 = s64[] get-tuple-element(%while.5), index=0, metadata={op_name="jit(_run)/while" stack_frame_id=44}
+  %while.7 = c128[29,24,24]{2,1,0} get-tuple-element(%while.5), index=1, metadata={op_name="jit(_run)/while" stack_frame_id=44}
+  ROOT %sharding_constraint.9 = c128[29,24,24]{2,1,0} custom-call(%while.7), custom_call_target="Sharding", sharding={devices=[1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\"}, {\"y\"}]>]>"}, metadata={op_name="jit(_run)/sharding_constraint" stack_frame_id=47}
+}
+

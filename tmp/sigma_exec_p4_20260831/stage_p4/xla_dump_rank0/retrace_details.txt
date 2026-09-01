@@ -1,0 +1,432 @@
+# retrace_details.txt — input signatures per jit name
+# Each block: one jit name that retraced, with the ENTRY type
+# signature for each compiled module instance.
+#
+# Diffing the signatures within a block reveals which arg shape
+# changed between calls — the root cause of the retrace.
+
+────────────────────────────────────────────────────────────
+[jit_broadcast_in_dim]  19 modules
+────────────────────────────────────────────────────────────
+  module_0366.jit_broadcast_in_dim  peak=  1.47 GiB
+    sig: args_0_.1: c128[512,620,620]
+  module_0358.jit_broadcast_in_dim  peak= 85.05 MiB
+    sig: args_0_.1: c128[29,620,620]
+  module_0151.jit_broadcast_in_dim  peak= 24.00 MiB
+    sig: args_0_.1: f64[48,32768]
+  module_0147.jit_broadcast_in_dim  peak= 12.00 MiB
+    sig: args_0_.1: s32[48,32768]
+  module_0119.jit_broadcast_in_dim  peak=  4.50 MiB
+    sig: args_0_.1: c128[]
+  module_0051.jit_broadcast_in_dim  peak=  2.93 MiB
+    sig: args_0_.1: c128[620,620]
+  module_0405.jit_broadcast_in_dim  peak=  2.25 MiB
+    sig: args_0_.1: c128[512,24,24]
+  module_0124.jit_broadcast_in_dim  peak=256.01 KiB
+    sig: args_0_.1: f64[]
+  module_0326.jit_broadcast_in_dim  peak=192.00 KiB
+    sig: args_0_.1: f64[512,24]
+  module_0200.jit_broadcast_in_dim  peak=  512.00 B
+    sig: args_0_.1: f64[32]
+  module_0202.jit_broadcast_in_dim  peak=  512.00 B
+    sig: args_0_.1: f64[32]
+  module_0204.jit_broadcast_in_dim  peak=  512.00 B
+    sig: args_0_.1: f64[32]
+  module_0242.jit_broadcast_in_dim  peak=  512.00 B
+    sig: args_0_.1: s64[32]
+  module_0246.jit_broadcast_in_dim  peak=  512.00 B
+    sig: args_0_.1: s64[32]
+  module_0252.jit_broadcast_in_dim  peak=  512.00 B
+    sig: args_0_.1: s64[32]
+  module_0003.jit_broadcast_in_dim  peak=   40.00 B
+    sig: args_0_.1: f64[]
+  module_0012.jit_broadcast_in_dim  peak=   24.00 B
+    sig: args_0_.1: f64[]
+  module_0024.jit_broadcast_in_dim  peak=   16.00 B
+    sig: args_0_.1: f64[]
+  module_0047.jit_broadcast_in_dim  peak=    8.00 B
+    sig: args_0_.1: s32[]
+
+────────────────────────────────────────────────────────────
+[jit_multiply]  18 modules
+────────────────────────────────────────────────────────────
+  module_0354.jit_multiply  peak=340.20 MiB
+    sig: x.1: c128[4,29,620,620], y.1: f64[]
+  module_0401.jit_multiply  peak=  9.00 MiB
+    sig: x.1: f64[], y.1: c128[512,24,24]
+  module_0397.jit_multiply  peak=  2.25 MiB
+    sig: x.1: f64[], y.1: c128[512,24,24]
+  module_0184.jit_multiply  peak=  1.00 MiB
+    sig: x.1: c128[32,32,32], y.1: c128[]
+  module_0260.jit_multiply  peak=  1.00 MiB
+    sig: x.1: f64[], y.1: c128[32,32,32]
+  module_0281.jit_multiply  peak=768.00 KiB
+    sig: x.1: f64[32,32,32], y.1: f64[32,32,32]
+  module_0372.jit_multiply  peak=288.00 KiB
+    sig: x.1: f64[512,24], y.1: f64[512,24]
+  module_0228.jit_multiply  peak=  8.50 KiB
+    sig: x.1: f64[32,1,1], y.1: f64[1,32,1]
+  module_0232.jit_multiply  peak=  8.50 KiB
+    sig: x.1: f64[32,1,1], y.1: f64[1,1,32]
+  module_0236.jit_multiply  peak=  8.50 KiB
+    sig: x.1: f64[1,32,1], y.1: f64[1,1,32]
+  module_0212.jit_multiply  peak=  768.00 B
+    sig: x.1: f64[32,1,1], y.1: f64[32,1,1]
+  module_0216.jit_multiply  peak=  768.00 B
+    sig: x.1: f64[1,32,1], y.1: f64[1,32,1]
+  module_0222.jit_multiply  peak=  768.00 B
+    sig: x.1: f64[1,1,32], y.1: f64[1,1,32]
+  module_0198.jit_multiply  peak=  520.00 B
+    sig: x.1: f64[32], y.1: s64[]
+  module_0210.jit_multiply  peak=  520.00 B
+    sig: x.1: f64[], y.1: f64[32,1,1]
+  module_0214.jit_multiply  peak=  520.00 B
+    sig: x.1: f64[], y.1: f64[1,32,1]
+  module_0220.jit_multiply  peak=  520.00 B
+    sig: x.1: f64[], y.1: f64[1,1,32]
+  module_0226.jit_multiply  peak=   24.00 B
+    sig: x.1: s64[], y.1: f64[]
+
+────────────────────────────────────────────────────────────
+[jit__identity_fn]  13 modules
+────────────────────────────────────────────────────────────
+  module_0037.jit__identity_fn  peak=465.00 MiB
+    sig: x.2: c128[512,620,48,2]
+  module_0068.jit__identity_fn  peak=465.00 MiB
+    sig: x.2: c128[512,48,2,620]
+  module_0073.jit__identity_fn  peak=465.00 MiB
+    sig: x.2: c128[512,2,620,48]
+  module_0080.jit__identity_fn  peak=465.00 MiB
+    sig: x.2: c128[512,2,620,48]
+  module_0085.jit__identity_fn  peak=465.00 MiB
+    sig: x.2: c128[512,48,2,620]
+  module_0289.jit__identity_fn  peak= 16.27 MiB
+    sig: x.2: c128[29,24,2,1532]
+  module_0407.jit__identity_fn  peak= 12.38 MiB
+    sig: x.2: c128[512,24,24]
+  module_0115.jit__identity_fn  peak=  9.00 MiB
+    sig: x.2: c128[512,24,24]
+  module_0087.jit__identity_fn  peak=384.00 KiB
+    sig: x.2: f64[512,48]
+  module_0089.jit__identity_fn  peak=384.00 KiB
+    sig: x.2: f64[512,48]
+  module_0005.jit__identity_fn  peak=  176.00 B
+    sig: x.2: f64[8,2]
+  module_0014.jit__identity_fn  peak=   96.00 B
+    sig: x.2: f64[8]
+  module_0030.jit__identity_fn  peak=   36.00 B
+    sig: x.2: u32[4]
+
+────────────────────────────────────────────────────────────
+[jit__per_rank]  12 modules
+────────────────────────────────────────────────────────────
+  module_0026.jit__per_rank  peak=750.78 MiB
+    sig: handle_local.1: s64[2], offset_local.1: s64[3], valid_shape_local.1: s64[3]
+  module_0028.jit__per_rank  peak=232.50 MiB
+    sig: handle_local.1: s64[2], offset_local.1: s64[4], valid_shape_local.1: s64[4]
+  module_0352.jit__per_rank  peak=170.10 MiB
+    sig: handle_local.1: s64[2], offset_local.1: s64[4], valid_shape_local.1: s64[4]
+  module_0287.jit__per_rank  peak= 16.27 MiB
+    sig: cnk_at_ibz.1: f64[24,2,29,1532,2], position_in_reads.1: s32[29]
+  module_0285.jit__per_rank  peak=  8.14 MiB
+    sig: handle_local.1: s64[2], offset_base_local.1: s64[29,4], count_base_local.1: s64[116,4]
+  module_0431.jit__per_rank  peak=  1.34 MiB
+    sig: A_local.1: c128[21,29,24,24], handle_local.1: s64[2], offset_local.1: s64[4], valid_shape_local.1: s64[4]
+  module_0433.jit__per_rank  peak=261.07 KiB
+    sig: A_local.1: c128[29,24,24], handle_local.1: s64[2], offset_local.1: s64[3], valid_shape_local.1: s64[3]
+  module_0474.jit__per_rank  peak=261.06 KiB
+    sig: handle_local.1: s64[2], offset_local.1: s64[3], valid_shape_local.1: s64[3]
+  module_0435.jit__per_rank  peak= 65.32 KiB
+    sig: A_local.1: c128[29,24,24], handle_local.1: s64[2], offset_local.1: s64[3], valid_shape_local.1: s64[3]
+  module_0437.jit__per_rank  peak=  5.49 KiB
+    sig: A_local.1: f64[29,24], handle_local.1: s64[2], offset_local.1: s64[2], valid_shape_local.1: s64[2]
+  module_0386.jit__per_rank  peak=  288.00 B
+    sig: handle_local.1: s64[2], offset_local.1: s64[1], valid_shape_local.1: s64[1]
+  module_0388.jit__per_rank  peak=  160.00 B
+    sig: handle_local.1: s64[2], offset_local.1: s64[1], valid_shape_local.1: s64[1]
+
+────────────────────────────────────────────────────────────
+[jit_add]  11 modules
+────────────────────────────────────────────────────────────
+  module_0485.jit_add  peak= 13.50 MiB
+    sig: x.1: c128[512,24,24], y.1: c128[512,24,24]
+  module_0141.jit_add  peak= 12.00 MiB
+    sig: args_0_.1: s32[48,32768], args_1_.1: s32[]
+  module_0481.jit_add  peak=  6.75 MiB
+    sig: x.1: c128[512,24,24], y.1: c128[512,24,24]
+  module_0133.jit_add  peak=768.00 KiB
+    sig: x.1: f64[32,32,32], y.1: f64[32,32,32]
+  module_0135.jit_add  peak=768.00 KiB
+    sig: x.1: f64[32,32,32], y.1: f64[32,32,32]
+  module_0230.jit_add  peak=520.00 KiB
+    sig: x.1: f64[32,32,32], y.1: f64[32,32,1]
+  module_0234.jit_add  peak=520.00 KiB
+    sig: x.1: f64[32,32,32], y.1: f64[32,1,32]
+  module_0238.jit_add  peak=520.00 KiB
+    sig: x.1: f64[32,32,32], y.1: f64[1,32,32]
+  module_0224.jit_add  peak=264.25 KiB
+    sig: x.1: f64[32,32,1], y.1: f64[1,1,32]
+  module_0218.jit_add  peak=  8.50 KiB
+    sig: x.1: f64[32,1,1], y.1: f64[1,32,1]
+  module_0190.jit_add  peak=  520.00 B
+    sig: x.1: f64[32], y.1: s64[]
+
+────────────────────────────────────────────────────────────
+[jit_convert_element_type]  9 modules
+────────────────────────────────────────────────────────────
+  module_0297.jit_convert_element_type  peak=768.00 KiB
+    sig: args_0_.1: f64[32,32,32]
+  module_0370.jit_convert_element_type  peak=192.00 KiB
+    sig: args_0_.1: f64[512,24]
+  module_0175.jit_convert_element_type  peak=   96.00 B
+    sig: args_0_.1: c128[3]
+  module_0117.jit_convert_element_type  peak=   32.00 B
+    sig: args_0_.1: c128[]
+  module_0283.jit_convert_element_type  peak=   32.00 B
+    sig: args_0_.1: s64[2]
+  module_0268.jit_convert_element_type  peak=   24.00 B
+    sig: args_0_.1: f64[]
+  module_0001.jit_convert_element_type  peak=   16.00 B
+    sig: args_0_.1: f64[]
+  module_0264.jit_convert_element_type  peak=   16.00 B
+    sig: args_0_.1: f64[]
+  module_0045.jit_convert_element_type  peak=    8.00 B
+    sig: args_0_.1: s32[]
+
+────────────────────────────────────────────────────────────
+[jit_fn]  8 modules
+────────────────────────────────────────────────────────────
+  module_0039.jit_fn  peak=750.93 MiB
+    sig: arr.1: c128[512,620,620]
+  module_0059.jit_fn  peak=232.55 MiB
+    sig: arr.1: c128[512,48,2,620]
+  module_0126.jit_fn  peak= 16.87 MiB
+    sig: psi_.1: c128[1,16,2,1532], g_index_.1: s32[1,32,32,32]
+  module_0466.jit_fn  peak=  4.51 MiB
+    sig: arr.1: c128[512,24,24]
+  module_0483.jit_fn  peak=  4.51 MiB
+    sig: arr.1: c128[512,24,24]
+  module_0469.jit_fn  peak=  1.13 MiB
+    sig: arr.1: c128[512,24,24]
+  module_0495.jit_fn  peak=216.37 KiB
+    sig: arr.1: f64[512,24]
+  module_0065.jit_fn  peak=195.37 KiB
+    sig: arr.1: f64[512,48]
+
+────────────────────────────────────────────────────────────
+[jit_true_divide]  6 modules
+────────────────────────────────────────────────────────────
+  module_0262.jit_true_divide  peak=  1.25 MiB
+    sig: x1.1: c128[32,32,32], x2.1: f64[32,32,32]
+  module_0196.jit_true_divide  peak=  520.00 B
+    sig: x1.1: f64[32], x2.1: f64[]
+  module_0182.jit_true_divide  peak=   40.00 B
+    sig: x1.1: s64[], x2.1: c128[]
+  module_0107.jit_true_divide  peak=   24.00 B
+    sig: x1.1: f64[], x2.1: f64[]
+  module_0291.jit_true_divide  peak=   24.00 B
+    sig: x1.1: f64[], x2.1: f64[]
+  module_0295.jit_true_divide  peak=   24.00 B
+    sig: x1.1: f64[], x2.1: f64[]
+
+────────────────────────────────────────────────────────────
+[jit_gather]  5 modules
+────────────────────────────────────────────────────────────
+  module_0049.jit_gather  peak=752.25 MiB
+    sig: args_0_.1: c128[512,620,620], args_1_.1: s32[1]
+  module_0356.jit_gather  peak=212.62 MiB
+    sig: args_0_.1: c128[4,29,620,620], args_1_.1: s32[1]
+  module_0403.jit_gather  peak= 24.75 MiB
+    sig: args_0_.1: c128[21,512,24,24], args_1_.1: s32[1]
+  module_0149.jit_gather  peak= 18.25 MiB
+    sig: args_0_.1: f64[32768], args_1_.1: s32[48,32768,1]
+  module_0324.jit_gather  peak=288.00 KiB
+    sig: args_0_.1: f64[512,48], args_1_.1: s32[1]
+
+────────────────────────────────────────────────────────────
+[jit_transpose]  4 modules
+────────────────────────────────────────────────────────────
+  module_0034.jit_transpose  peak=465.00 MiB
+    sig: args_0_.1: c128[512,48,2,620]
+  module_0070.jit_transpose  peak=465.00 MiB
+    sig: args_0_.1: c128[512,48,2,620]
+  module_0077.jit_transpose  peak=465.00 MiB
+    sig: args_0_.1: c128[512,620,48,2]
+  module_0082.jit_transpose  peak=465.00 MiB
+    sig: args_0_.1: c128[512,620,48,2]
+
+────────────────────────────────────────────────────────────
+[jit_subtract]  4 modules
+────────────────────────────────────────────────────────────
+  module_0164.jit_subtract  peak=768.00 KiB
+    sig: x.1: f64[32,32,32], y.1: f64[32,32,32]
+  module_0328.jit_subtract  peak=192.01 KiB
+    sig: x.1: f64[512,24], y.1: f64[]
+  module_0334.jit_subtract  peak=192.01 KiB
+    sig: x.1: f64[], y.1: f64[512,24]
+  module_0194.jit_subtract  peak=  520.00 B
+    sig: x.1: f64[32], y.1: s64[]
+
+────────────────────────────────────────────────────────────
+[jit_sum]  3 modules
+────────────────────────────────────────────────────────────
+  module_0009.jit_sum  peak=   40.00 B
+    sig: a.1: f64[2,2]
+  module_0018.jit_sum  peak=   40.00 B
+    sig: a.1: f64[2]
+  module_0021.jit_sum  peak=   40.00 B
+    sig: a.1: f64[2]
+
+────────────────────────────────────────────────────────────
+[jit_conjugate]  3 modules
+────────────────────────────────────────────────────────────
+  module_0032.jit_conjugate  peak=465.00 MiB
+    sig: x.1: c128[512,48,2,620]
+  module_0075.jit_conjugate  peak=465.00 MiB
+    sig: x.1: c128[512,620,48,2]
+  module_0490.jit_conjugate  peak=  9.00 MiB
+    sig: x.1: c128[512,24,24]
+
+────────────────────────────────────────────────────────────
+[jit_sqrt]  3 modules
+────────────────────────────────────────────────────────────
+  module_0180.jit_sqrt  peak=   32.00 B
+    sig: x.1: c128[]
+  module_0105.jit_sqrt  peak=   16.00 B
+    sig: x.1: f64[]
+  module_0293.jit_sqrt  peak=   16.00 B
+    sig: x.1: f64[]
+
+────────────────────────────────────────────────────────────
+[jit__moveaxis]  3 modules
+────────────────────────────────────────────────────────────
+  module_0186.jit__moveaxis  peak=  1.00 MiB
+    sig: a.1: c128[32,32,32]
+  module_0275.jit__moveaxis  peak=  1.00 MiB
+    sig: a.1: c128[32,32,32]
+  module_0171.jit__moveaxis  peak=512.00 KiB
+    sig: a.1: f64[32,32,32]
+
+────────────────────────────────────────────────────────────
+[jit_equal]  3 modules
+────────────────────────────────────────────────────────────
+  module_0244.jit_equal  peak=  296.00 B
+    sig: x.1: s64[32,1,1], y.1: s64[]
+  module_0248.jit_equal  peak=  296.00 B
+    sig: x.1: s64[1,32,1], y.1: s64[]
+  module_0254.jit_equal  peak=  296.00 B
+    sig: x.1: s64[1,1,32], y.1: s64[]
+
+────────────────────────────────────────────────────────────
+[jit_bitwise_and]  3 modules
+────────────────────────────────────────────────────────────
+  module_0340.jit_bitwise_and  peak= 36.00 KiB
+    sig: x.1: pred[512,24], y.1: pred[512,24]
+  module_0256.jit_bitwise_and  peak= 33.03 KiB
+    sig: x.1: pred[32,32,1], y.1: pred[1,1,32]
+  module_0250.jit_bitwise_and  peak=  1.06 KiB
+    sig: x.1: pred[32,1,1], y.1: pred[1,32,1]
+
+────────────────────────────────────────────────────────────
+[jit__take]  3 modules
+────────────────────────────────────────────────────────────
+  module_0410.jit__take  peak= 24.96 MiB
+    sig: a.1: c128[21,512,24,24], indices.1: s64[29]
+  module_0418.jit__take  peak=  4.76 MiB
+    sig: a.1: c128[512,24,24], indices.1: s64[29]
+  module_0423.jit__take  peak=  1.19 MiB
+    sig: a.1: c128[512,24,24], indices.1: s64[29]
+
+────────────────────────────────────────────────────────────
+[jit__multi_slice]  2 modules
+────────────────────────────────────────────────────────────
+  module_0007.jit__multi_slice  peak=   40.00 B
+    sig: self.1: f64[2,2]
+  module_0016.jit__multi_slice  peak=   24.00 B
+    sig: self.1: f64[2]
+
+────────────────────────────────────────────────────────────
+[jit_real]  2 modules
+────────────────────────────────────────────────────────────
+  module_0279.jit_real  peak=768.00 KiB
+    sig: val.1: c128[32,32,32]
+  module_0057.jit_real  peak=   24.00 B
+    sig: val.1: c128[]
+
+────────────────────────────────────────────────────────────
+[jit_squeeze]  2 modules
+────────────────────────────────────────────────────────────
+  module_0128.jit_squeeze  peak= 32.00 MiB
+    sig: args_0_.1: c128[1,16,2,32,32,32]
+  module_0208.jit_squeeze  peak=   16.00 B
+    sig: args_0_.1: f64[1,1]
+
+────────────────────────────────────────────────────────────
+[jit_reshape]  2 modules
+────────────────────────────────────────────────────────────
+  module_0137.jit_reshape  peak=512.00 KiB
+    sig: args_0_.1: f64[32,32,32]
+  module_0157.jit_reshape  peak=512.00 KiB
+    sig: args_0_.1: f64[32768]
+
+────────────────────────────────────────────────────────────
+[jit_abs]  2 modules
+────────────────────────────────────────────────────────────
+  module_0159.jit_abs  peak=512.00 KiB
+    sig: x.1: f64[32,32,32]
+  module_0336.jit_abs  peak=192.00 KiB
+    sig: x.1: f64[512,24]
+
+────────────────────────────────────────────────────────────
+[jit_fft]  2 modules
+────────────────────────────────────────────────────────────
+  module_0173.jit_fft  peak=  1.25 MiB
+    sig: x.1: f64[32,32,32]
+  module_0277.jit_fft  peak=  1.00 MiB
+    sig: x.1: c128[32,32,32]
+
+────────────────────────────────────────────────────────────
+[jit_iota]  2 modules
+────────────────────────────────────────────────────────────
+  module_0188.jit_iota  peak=  256.00 B
+  module_0240.jit_iota  peak=  256.00 B
+
+────────────────────────────────────────────────────────────
+[jit_dynamic_slice]  2 modules
+────────────────────────────────────────────────────────────
+  module_0322.jit_dynamic_slice  peak=288.02 KiB
+    sig: args_0_.1: f64[512,48], args_1_.1: s64[], args_2_.1: s64[]
+  module_0206.jit_dynamic_slice  peak=   96.00 B
+    sig: args_0_.1: f64[3,3], args_1_.1: s64[], args_2_.1: s64[]
+
+────────────────────────────────────────────────────────────
+[jit_concatenate]  2 modules
+────────────────────────────────────────────────────────────
+  module_0368.jit_concatenate  peak=  5.87 GiB
+    sig: args_0_.1: c128[1,512,620,620], args_1_.1: c128[1,512,620,620], args_2_.1: c128[1,512,620,620], args_3_.1: c128[1,512,620,620]
+  module_0266.jit_concatenate  peak=   24.00 B
+    sig: args_0_.1: s32[1], args_1_.1: s32[1], args_2_.1: s32[1]
+
+────────────────────────────────────────────────────────────
+[jit__f]  2 modules
+────────────────────────────────────────────────────────────
+  module_0476.jit__f  peak=  4.76 MiB
+    sig: x.1: c128[29,24,24]
+  module_0314.jit__f  peak=  1.19 MiB
+    sig: x.1: c128[29,24,24]
+
+────────────────────────────────────────────────────────────
+[jit__lambda]  2 modules
+────────────────────────────────────────────────────────────
+  module_0384.jit__lambda  peak= 24.75 MiB
+    sig: acc.1: c128[21,512,24,24], sigma.1: c128[512,24,24], coeff.1: c128[21]
+  module_0350.jit__lambda  peak= 23.62 MiB
+
+────────────────────────────────────────────────────────────
+[jit__do_unfold]  2 modules
+────────────────────────────────────────────────────────────
+  module_0364.jit__do_unfold  peak=  2.25 GiB
+    sig: V_ibz.1: c128[29,620,620]
+  module_0360.jit__do_unfold  peak=  2.25 GiB
+    sig: V_ibz.1: c128[29,620,620]
+

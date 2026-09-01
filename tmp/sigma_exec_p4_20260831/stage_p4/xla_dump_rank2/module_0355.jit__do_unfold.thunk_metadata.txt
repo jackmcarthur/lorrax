@@ -1,0 +1,103 @@
+thunk_metadata {
+  thunk_info {
+  }
+  thunk_kind: "kSequential"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "wrapped_gather"
+    thunk_id: 1
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all_to_all.52.1"
+    thunk_id: 2
+  }
+  thunk_kind: "kAllToAllStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all-to-all-done"
+    thunk_id: 3
+  }
+  thunk_kind: "kAllToAllDone"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "input_transpose_fusion.1"
+    thunk_id: 4
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "loop_transpose_fusion.2"
+    thunk_id: 5
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all_to_all.56.1"
+    thunk_id: 6
+  }
+  thunk_kind: "kAllToAllStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all-to-all-done.1"
+    thunk_id: 7
+  }
+  thunk_kind: "kAllToAllDone"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "loop_transpose_fusion"
+    thunk_id: 8
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all_to_all.60.1"
+    thunk_id: 9
+  }
+  thunk_kind: "kAllToAllStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all-to-all-done.2"
+    thunk_id: 10
+  }
+  thunk_kind: "kAllToAllDone"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "loop_transpose_fusion.1"
+    thunk_id: 11
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all_to_all.64.1"
+    thunk_id: 12
+  }
+  thunk_kind: "kAllToAllStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all-to-all-done.3"
+    thunk_id: 13
+  }
+  thunk_kind: "kAllToAllDone"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "input_transpose_fusion"
+    thunk_id: 14
+  }
+  thunk_kind: "kKernel"
+}

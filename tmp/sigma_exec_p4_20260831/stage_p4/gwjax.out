@@ -1,0 +1,192 @@
+==============================================================================
+LORRAX GW CALCULATION
+==============================================================================
+Input          : /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/mpa_sigma.in
+Method         : mpa / one_shot_dft
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 4
+Accelerators   : 4 GPU devices (NVIDIA A100-SXM4-40GB, 1 per rank)
+Processor mesh : 2 x 2  (centroid axes X x Y)
+CPU allocation : 32 cores per rank
+Host threads   : runtime defaults
+
+METHOD AND PHYSICAL PATHWAYS
+----------------------------
+Self-energy    : multipole-approximation GW; one-shot full-matrix effective Hamiltonian; Sigma evaluated at E_DFT with QSGW Hermitian symmetrization (distinct from fixed-DFT-state diagonal G0W0)
+QP consistency  : one_shot_dft | other options: fixed_point (diagonal on-shell), self_consistent (rebuild G/W/Sigma)
+EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma eigenvalue self-consistency)
+Screening      : RPA Dyson series; minimax imaginary-axis quadrature
+Long wavelength: head=off; source=s_tensor
+Coulomb system : 3D bulk; Hartree=live G-space
+Spin channels  : charge (scalar)
+Degenerate sets: averaged at 1.36057e-05 eV
+ISDF state     : restart requested
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : phdf5 reader
+ISDF solve     : rank_truncate | back-solve policy=auto (other choices: replicated, per_q, distributed)
+W Dyson solve  : local | LU policy=auto (other choices: off, cusolvermp, scalapack)
+QP eigensolve  : auto (other choices: off, distributed, cusolvermp, slate, scalapack)
+LORRAX_BANDS_GEMM_FFI      = NATIVE : right-GEMM contraction forming G(tau) (native XLA dot lowering)
+LORRAX_FFT_FFI             = ON     : flat-k FFTs for ISDF, chi0 and Sigma (cuFFT flat-k FFI)
+LORRAX_FFT_FFI_FUSED       = ON     : fused tau-domain convolution (cuFFT fused-convolution FFI)
+LORRAX_CONV_KPAIR_FFI      = ON     : pair-density convolution forming V(q) (cuFFT pair-convolution FFI)
+
+CRYSTAL SYMMETRY AND BRILLOUIN-ZONE SAMPLING
+--------------------------------------------
+Real-space action: r' = R^-1 r + tau
+Spatial group   : 48 operations; 0 with fractional translations
+DFT 2c TRS     : CONSISTENT (spatial-conditional; occupied-density residual=2.98023e-08; coverage=70.31%; raw-pair=0, spatial-pair=12, trim=0)
+TRS unfolding  : enabled from the two-component reference check
+  S01  R^-1=[ 1  0  0;  0  1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S02  R^-1=[ 0  1  1;  0 -1  0;  1  1  0]  tau=( 0.000  0.000  0.000)
+  S03  R^-1=[-1  0  0;  1  0 -1; -1 -1  0]  tau=( 0.000  0.000  0.000)
+  S04  R^-1=[ 0 -1 -1; -1  0  1;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S05  R^-1=[ 0  0 -1;  0 -1  0; -1  0  0]  tau=( 0.000  0.000  0.000)
+  S06  R^-1=[-1 -1  0;  0  1  0;  0 -1 -1]  tau=( 0.000  0.000  0.000)
+  S07  R^-1=[ 0  0  1;  1  0 -1;  0  1  1]  tau=( 0.000  0.000  0.000)
+  S08  R^-1=[ 1  1  0; -1  0  1;  1  0  0]  tau=( 0.000  0.000  0.000)
+  S09  R^-1=[ 1  0  0; -1 -1  0;  1  0 -1]  tau=( 0.000  0.000  0.000)
+  S10  R^-1=[-1  0  0;  0  0  1;  0  1  0]  tau=( 0.000  0.000  0.000)
+  S11  R^-1=[ 0 -1 -1;  1  1  0;  0 -1  0]  tau=( 0.000  0.000  0.000)
+  S12  R^-1=[ 0  1  1;  0  0 -1; -1  0  1]  tau=( 0.000  0.000  0.000)
+  S13  R^-1=[ 0  1  0;  1  0  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S14  R^-1=[-1  0  1;  0 -1 -1;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S15  R^-1=[ 1  0 -1; -1  0  0;  1  1  0]  tau=( 0.000  0.000  0.000)
+  S16  R^-1=[ 0 -1  0;  0  1  1; -1 -1  0]  tau=( 0.000  0.000  0.000)
+  S17  R^-1=[ 1  1  0;  0 -1 -1;  0  1  0]  tau=( 0.000  0.000  0.000)
+  S18  R^-1=[ 0  0 -1;  0  1  1;  1  0 -1]  tau=( 0.000  0.000  0.000)
+  S19  R^-1=[-1 -1  0;  1  0  0; -1  0  1]  tau=( 0.000  0.000  0.000)
+  S20  R^-1=[ 0  0  1; -1  0  0;  0 -1  0]  tau=( 0.000  0.000  0.000)
+  S21  R^-1=[ 1  0 -1;  0  0  1;  0 -1 -1]  tau=( 0.000  0.000  0.000)
+  S22  R^-1=[ 0 -1  0;  0  0 -1;  1  0  0]  tau=( 0.000  0.000  0.000)
+  S23  R^-1=[-1  0  1;  1  1  0; -1  0  0]  tau=( 0.000  0.000  0.000)
+  S24  R^-1=[ 0  1  0; -1 -1  0;  0  1  1]  tau=( 0.000  0.000  0.000)
+  S25  R^-1=[-1  0  0;  0 -1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S26  R^-1=[ 0 -1 -1;  0  1  0; -1 -1  0]  tau=( 0.000  0.000  0.000)
+  S27  R^-1=[ 1  0  0; -1  0  1;  1  1  0]  tau=( 0.000  0.000  0.000)
+  S28  R^-1=[ 0  1  1;  1  0 -1;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S29  R^-1=[ 0  0  1;  0  1  0;  1  0  0]  tau=( 0.000  0.000  0.000)
+  S30  R^-1=[ 1  1  0;  0 -1  0;  0  1  1]  tau=( 0.000  0.000  0.000)
+  S31  R^-1=[ 0  0 -1; -1  0  1;  0 -1 -1]  tau=( 0.000  0.000  0.000)
+  S32  R^-1=[-1 -1  0;  1  0 -1; -1  0  0]  tau=( 0.000  0.000  0.000)
+  S33  R^-1=[-1  0  0;  1  1  0; -1  0  1]  tau=( 0.000  0.000  0.000)
+  S34  R^-1=[ 1  0  0;  0  0 -1;  0 -1  0]  tau=( 0.000  0.000  0.000)
+  S35  R^-1=[ 0  1  1; -1 -1  0;  0  1  0]  tau=( 0.000  0.000  0.000)
+  S36  R^-1=[ 0 -1 -1;  0  0  1;  1  0 -1]  tau=( 0.000  0.000  0.000)
+  S37  R^-1=[ 0 -1  0; -1  0  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S38  R^-1=[ 1  0 -1;  0  1  1;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S39  R^-1=[-1  0  1;  1  0  0; -1 -1  0]  tau=( 0.000  0.000  0.000)
+  S40  R^-1=[ 0  1  0;  0 -1 -1;  1  1  0]  tau=( 0.000  0.000  0.000)
+  S41  R^-1=[-1 -1  0;  0  1  1;  0 -1  0]  tau=( 0.000  0.000  0.000)
+  S42  R^-1=[ 0  0  1;  0 -1 -1; -1  0  1]  tau=( 0.000  0.000  0.000)
+  S43  R^-1=[ 1  1  0; -1  0  0;  1  0 -1]  tau=( 0.000  0.000  0.000)
+  S44  R^-1=[ 0  0 -1;  1  0  0;  0  1  0]  tau=( 0.000  0.000  0.000)
+  S45  R^-1=[-1  0  1;  0  0 -1;  0  1  1]  tau=( 0.000  0.000  0.000)
+  S46  R^-1=[ 0  1  0;  0  0  1; -1  0  0]  tau=( 0.000  0.000  0.000)
+  S47  R^-1=[ 1  0 -1; -1 -1  0;  1  0  0]  tau=( 0.000  0.000  0.000)
+  S48  R^-1=[ 0 -1  0;  1  1  0;  0 -1 -1]  tau=( 0.000  0.000  0.000)
+Full BZ grid   : 512 k points | mesh 8 x 8 x 8 | shift (0.00000, 0.00000, 0.00000)
+Stored IBZ     : 29 k points
+  ik        kx        ky        kz     weight
+    1   0.00000   0.00000   0.00000   0.00195
+    2   0.00000   0.00000   0.12500   0.02344
+    3   0.00000   0.00000   0.25000   0.02344
+    4   0.00000   0.00000   0.37500   0.02344
+    5   0.00000   0.00000   0.50000   0.01172
+    6   0.00000   0.12500   0.25000   0.04688
+    7   0.00000   0.12500   0.37500   0.09375
+    8   0.00000   0.12500   0.50000   0.09375
+    9   0.00000   0.25000   0.50000   0.04688
+   10   0.00000   0.25000   0.62500   0.04688
+   11   0.12500   0.12500   0.12500   0.01172
+   12   0.12500   0.12500   0.25000   0.04688
+   13   0.12500   0.12500   0.37500   0.04688
+   14   0.12500   0.12500   0.50000   0.02344
+   15   0.12500   0.25000   0.37500   0.04688
+   16   0.12500   0.25000   0.50000   0.09375
+   17   0.12500   0.37500   0.12500   0.01562
+   18   0.12500   0.37500   0.62500   0.01562
+   19   0.12500   0.50000   0.12500   0.04688
+   20   0.12500   0.62500   0.12500   0.02344
+   21   0.12500   0.62500   0.25000   0.04688
+   22   0.25000   0.25000   0.25000   0.01172
+   23   0.25000   0.25000   0.37500   0.04688
+   24   0.25000   0.25000   0.50000   0.02344
+   25   0.25000   0.37500   0.50000   0.04688
+   26   0.25000   0.75000   0.25000   0.00391
+   27   0.37500   0.37500   0.37500   0.01172
+   28   0.37500   0.37500   0.50000   0.02344
+   29   0.50000   0.50000   0.50000   0.00195
+Centroid orbit: CLOSED : 48/48 spatial operations preserve 620 sites (tol=1.00000e-05)
+
+BAND SPACES AND ENERGY COVERAGE
+-------------------------------
+Electrons      : 9.00000; occupied-band boundary = 10
+Occupied bands : 1-10
+QP valence     : 1-10
+QP conduction  : 11-24
+QP matrix      : 1-24
+chi0/W sum     : 1-48
+Sigma sum      : 1-24
+Loaded ISDF psi: 1-48
+zeta fit       : left 1-24; right 1-48
+
+DYNAMIC SIGMA ENERGY COVERAGE
+-----------------------------
+Energy origin   : E_F = +1.64676 eV (fixed-N mu)
+Sigma omega    : [+0.00000, +5.00000] eV relative to E_F; step=0.25000 eV; 21 points
+DFT QP valence : [-53.80461, +4.46452] eV relative to E_F
+DFT QP conduct.: [+1.12223, +19.27270] eV relative to E_F
+Coverage status : INCOMPLETE
+Grid shortfall  : 53.80461 eV below; 14.27270 eV above protected DFT states
+Band tail      : ON | estimator=spectral_shell | brackets=total_fractions
+
+FUNDAMENTAL GAP
+---------------
+DFT gap        : -3.34229 eV
+Full-matrix effective-H gap: -2.75254 eV (metallic/overlapping)
+Gap correction : +0.58975 eV relative to DFT
+State energies  : written to the EQP files listed below
+
+MAJOR-STAGE TIMING
+------------------
+  stage                    wall (s)     fraction
+  runtime bring-up             5.82       9.84%
+  pre-main + imports           0.37       0.63%
+  input + run setup            2.51       4.24%
+  restart load                 5.93      10.03%
+  Sigma                       40.65      68.73%
+  mean-field load              0.13       0.23%
+  QP solve + diagonalize       0.53       0.90%
+  result writes                0.16       0.28%
+  other driver work            3.03       5.12%
+  total run                   59.14     100.00%
+
+WARNINGS
+--------
+  WARNING: dynamic Sigma grid is incomplete for protected DFT states (53.80461 eV below; 14.27270 eV above); Sigma(E_DFT) has 10606/12288 out-of-grid cells; out-of-range policy=clamp. Widen sigma_omega_min_ev / sigma_omega_max_ev or add a sigma_omega_patches_ev window; use LORRAX_OMEGA_OUT_OF_RANGE=refuse when endpoint values must never enter an output.
+
+OUTPUT FILES AND INPUTS
+-----------------------
+  role                     state       path
+  input deck               read        /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/mpa_sigma.in
+  DFT wavefunctions        read        /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/WFN.h5
+  ISDF centroids           read        /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/centroids_frac_620.txt
+  mean-field Hamiltonian   read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/kin_ion_receipt_24b.h5
+  long-wave dipoles        read        /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/dipole.h5
+  parallel transport       absent      /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/parallel_transport.h5
+  ISDF restart tensors     present     /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/tmp/isdf_tensors_620.h5
+  self-energy table        written     /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/sigma_diag.dat
+  fixed-DFT-state diagonal zeroth-order energies written     /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/eqp0.dat
+  fixed-DFT-state diagonal Z-linearized energies written     /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/eqp1.dat
+  full-matrix effective-H rotations written     /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/qp_wfn_rotations.h5
+  matched full-matrix QP wavefunctions absent      /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/WFN_qp.h5
+  dynamic Sigma spectrum   written     /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/sigma_mnk.h5
+
+LORRAX GW calculation completed.
+Report written to /pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831/stage_p4/gwjax.out

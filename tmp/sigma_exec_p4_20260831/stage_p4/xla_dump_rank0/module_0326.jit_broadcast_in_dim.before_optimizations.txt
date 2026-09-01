@@ -1,0 +1,6 @@
+HloModule jit_broadcast_in_dim, entry_computation_layout={(f64[512,24]{1,0})->f64[512,24]{1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+ENTRY %main.1 (args_0_.1: f64[512,24]) -> f64[512,24] {
+  ROOT %args_0_.1 = f64[512,24]{1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}]>"}, metadata={op_name="args[0]"}
+}
+

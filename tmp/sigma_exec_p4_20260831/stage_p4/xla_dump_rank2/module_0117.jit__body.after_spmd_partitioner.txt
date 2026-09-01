@@ -1,0 +1,58 @@
+HloModule jit__body, entry_computation_layout={(f64[1,32,32,32]{3,2,1,0})->f64[32,32,32]{2,1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/collectives.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "_compute_live_hartree"
+5 "compute_hartree_matrix"
+6 "psum_replicate"
+7 "_psum_kernel.<locals>._body"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=770 column=18 end_column=18}
+4 {file_name_id=3 function_name_id=3 line=922 end_line=922 column=30 end_column=30}
+5 {file_name_id=3 function_name_id=4 line=318 end_line=318 column=12 end_column=12}
+6 {file_name_id=4 function_name_id=5 line=841 end_line=841 column=12 end_column=12}
+7 {file_name_id=5 function_name_id=6 line=684 end_line=684 column=22 end_column=22}
+8 {file_name_id=5 function_name_id=7 line=721 end_line=721 column=32 end_column=32}
+9 {file_name_id=5 function_name_id=7 line=721 end_line=721 column=19 end_column=19}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=1}
+9 {file_location_id=9 parent_frame_id=1}
+10 {file_location_id=9 parent_frame_id=10}
+
+
+%region_0.0 (psum.0: f64[], psum.1: f64[]) -> f64[] {
+  %psum.0 = f64[] parameter(0), metadata={op_name="psum"}
+  %psum.1 = f64[] parameter(1), metadata={op_name="psum"}
+  ROOT %add.0 = f64[] add(%psum.0, %psum.1), metadata={op_name="add" stack_frame_id=10}
+}
+
+ENTRY %main.0_spmd (param.1: f64[1,32,32,32]) -> f64[32,32,32] {
+  %param.1 = f64[1,32,32,32]{3,2,1,0} parameter(0), sharding={devices=[4,1,1,1]<=[4]}, metadata={op_name="x"}
+  %shard_map.1 = f64[1,32,32,32]{3,2,1,0} copy(%param.1), metadata={op_name="jit(_body)/shard_map" stack_frame_id=7}
+  %copy = f64[1,32,32,32]{3,2,1,0} copy(%shard_map.1), metadata={op_name="jit(_body)/shard_map" stack_frame_id=7}
+  %squeeze.3 = f64[32,32,32]{2,1,0} reshape(%copy), metadata={op_name="jit(_body)/shard_map/squeeze" stack_frame_id=8}
+  %psum.7 = f64[32,32,32]{2,1,0} all-reduce(%squeeze.3), channel_id=1, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0, metadata={op_name="jit(_body)/shard_map/psum" stack_frame_id=9}
+  %shard_map.4 = f64[32,32,32]{2,1,0} copy(%psum.7), metadata={op_name="jit(_body)/shard_map" stack_frame_id=7}
+  ROOT %copy.1 = f64[32,32,32]{2,1,0} copy(%shard_map.4), metadata={op_name="jit(_body)/shard_map" stack_frame_id=7}
+}
+

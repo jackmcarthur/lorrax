@@ -1,0 +1,56 @@
+HloModule jit_eigh, entry_computation_layout={(c128[512,24,24]{2,1,0})->(f64[512,24]{1,0}, c128[512,24,24]{2,1,0})}, allow_spmd_sharding_propagation_to_output={true,true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=1059 end_line=1059 column=19 end_column=58}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+
+
+ENTRY %main.1 (a.1: c128[512,24,24]) -> (f64[512,24], c128[512,24,24]) {
+  %a.1 = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {}]>"}, metadata={op_name="a"}
+  %transpose.1 = c128[512,24,24]{1,2,0} transpose(%a.1), dimensions={0,2,1}, metadata={op_name="jit(eigh)/transpose" stack_frame_id=3}
+  %real.1 = f64[512,24,24]{1,2,0} real(%transpose.1), metadata={op_name="jit(eigh)/real" stack_frame_id=3}
+  %imag.1 = f64[512,24,24]{1,2,0} imag(%transpose.1), metadata={op_name="jit(eigh)/imag" stack_frame_id=3}
+  %neg.1 = f64[512,24,24]{1,2,0} negate(%imag.1), metadata={op_name="jit(eigh)/neg" stack_frame_id=3}
+  %complex.1 = c128[512,24,24]{1,2,0} complex(%real.1, %neg.1), metadata={op_name="jit(eigh)/complex" stack_frame_id=3}
+  %add.1 = c128[512,24,24]{2,1,0} add(%a.1, %complex.1), metadata={op_name="jit(eigh)/add" stack_frame_id=3}
+  %constant.7 = c128[] constant((2, 0))
+  %div.2 = c128[512,24,24]{2,1,0} broadcast(%constant.7), dimensions={}, metadata={op_name="jit(eigh)/div" stack_frame_id=3}
+  %div.3 = c128[512,24,24]{2,1,0} divide(%add.1, %div.2), metadata={op_name="jit(eigh)/div" stack_frame_id=3}
+  %eigh.21 = (c128[512,24,24]{1,2,0}, f64[512,24]{1,0}, s32[512]{0}) custom-call(%div.3), custom_call_target="cusolver_syevd_ffi", operand_layout_constraints={c128[512,24,24]{1,2,0}}, output_to_operand_aliasing={{0}: (0, {})}, api_version=API_VERSION_TYPED_FFI, frontend_attributes={num_batch_dims="1",xla.sdy.sharding_rule="#sdy.op_sharding_rule<([i, j, k])->([i, l, m], [i, n], [i]) {i=512, j=24, k=24, l=24, m=24, n=24}, custom>"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}, backend_config={algorithm = 0 : ui8, lower = true}
+  %eigh.24 = s32[512]{0} get-tuple-element(%eigh.21), index=2, frontend_attributes={num_batch_dims="1",xla.sdy.sharding_rule="#sdy.op_sharding_rule<([i, j, k])->([i, l, m], [i, n], [i]) {i=512, j=24, k=24, l=24, m=24, n=24}, custom>"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %constant.6 = s32[] constant(0)
+  %eigh.20 = s32[512]{0} broadcast(%constant.6), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.25 = pred[512]{0} compare(%eigh.24, %eigh.20), direction=EQ, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.31 = pred[512,1]{1,0} reshape(%eigh.25), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.32 = pred[512,1]{1,0} broadcast(%eigh.31), dimensions={0,1}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.33 = pred[512]{0} reshape(%eigh.32), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.34 = pred[512,24]{1,0} broadcast(%eigh.33), dimensions={0}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.23 = f64[512,24]{1,0} get-tuple-element(%eigh.21), index=1, frontend_attributes={num_batch_dims="1",xla.sdy.sharding_rule="#sdy.op_sharding_rule<([i, j, k])->([i, l, m], [i, n], [i]) {i=512, j=24, k=24, l=24, m=24, n=24}, custom>"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %constant.4 = f64[] constant(nan)
+  %eigh.18 = f64[512,24]{1,0} broadcast(%constant.4), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.35 = f64[512,24]{1,0} select(%eigh.34, %eigh.23, %eigh.18), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.26 = pred[512,1,1]{2,1,0} reshape(%eigh.25), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.27 = pred[512,1,1]{2,1,0} broadcast(%eigh.26), dimensions={0,1,2}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.28 = pred[512]{0} reshape(%eigh.27), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.29 = pred[512,24,24]{2,1,0} broadcast(%eigh.28), dimensions={0}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.22 = c128[512,24,24]{1,2,0} get-tuple-element(%eigh.21), index=0, frontend_attributes={num_batch_dims="1",xla.sdy.sharding_rule="#sdy.op_sharding_rule<([i, j, k])->([i, l, m], [i, n], [i]) {i=512, j=24, k=24, l=24, m=24, n=24}, custom>"}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %constant.5 = c128[] constant((nan, nan))
+  %eigh.19 = c128[512,24,24]{2,1,0} broadcast(%constant.5), dimensions={}, metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  %eigh.30 = c128[512,24,24]{2,1,0} select(%eigh.29, %eigh.22, %eigh.19), metadata={op_name="jit(eigh)/eigh" stack_frame_id=3}
+  ROOT %tuple.1 = (f64[512,24]{1,0}, c128[512,24,24]{2,1,0}) tuple(%eigh.35, %eigh.30)
+}
+

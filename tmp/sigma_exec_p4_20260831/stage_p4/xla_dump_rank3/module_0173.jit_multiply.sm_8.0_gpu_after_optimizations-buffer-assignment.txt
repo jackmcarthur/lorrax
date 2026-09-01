@@ -1,0 +1,48 @@
+BufferAssignment:
+allocation 0: size 524288, output shape is |c128[32,32,32]|, maybe-live-out:
+ value: <6 loop_multiply_fusion @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+allocation 1: size 524288, parameter 0, shape |c128[32,32,32]| at ShapeIndex {}:
+ value: <4 x.1 @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+allocation 2: size 16, parameter 1, shape |c128[]| at ShapeIndex {}:
+ value: <5 y.1 @0> (size=16,offset=0): c128[]
+
+Total bytes used: 1048592 (1.00MiB)
+
+Used values:
+<4 x.1 @0>
+ positions:
+  x.1
+ uses:
+  loop_multiply_fusion, operand 0
+ from instruction: %x.1 = c128[32,32,32]{2,1,0} parameter(0), metadata={op_name="x"}
+<5 y.1 @0>
+ positions:
+  y.1
+ uses:
+  loop_multiply_fusion, operand 1
+ from instruction: %y.1 = c128[] parameter(1), metadata={op_name="y"}
+<6 loop_multiply_fusion @0>
+ positions:
+  loop_multiply_fusion
+ uses:
+ from instruction: %loop_multiply_fusion = c128[32,32,32]{2,1,0} fusion(%x.1, %y.1), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(multiply)/mul" stack_frame_id=9}
+
+
+HloLiveRange (max 3):
+  InstructionSequence:
+    0:y.1
+    1:x.1
+    2:loop_multiply_fusion
+  BufferLiveRange:
+    x.1{}:0-3
+    y.1{}:0-3
+    loop_multiply_fusion{}:2-3
+  Live ranges at 2 (peak):
+    loop_multiply_fusion{}: 524288 bytes (cumulative: 524288 bytes)
+    x.1{}: 524288 bytes (cumulative: 1048576 bytes)
+    y.1{}: 16 bytes (cumulative: 1048592 bytes)
+  Stack trace breakdown for peak usage: 1 048 592 bytes
+    main.1 (100.0%, total: 1 048 592 bytes, current: 0 bytes, remaining: 1 048 592 bytes)
+      ├── jit(multiply)/mul (50.0%, total: 524 288 bytes, current: 524 288 bytes, remaining: 524 304 bytes)
+      ├── x (50.0%, total: 524 288 bytes, current: 524 288 bytes, remaining: 16 bytes)
+      └── y (0.0%, total: 16 bytes, current: 16 bytes, remaining: 0 bytes)

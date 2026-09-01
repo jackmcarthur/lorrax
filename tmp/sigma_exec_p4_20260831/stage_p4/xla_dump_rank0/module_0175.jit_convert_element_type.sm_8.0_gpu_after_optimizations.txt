@@ -1,0 +1,7 @@
+HloModule jit_convert_element_type, is_scheduled=true, entry_computation_layout={(c128[3]{0})->c128[3]{0}}, allow_spmd_sharding_propagation_to_parameters={true}, allow_spmd_sharding_propagation_to_output={true}, frontend_attributes={fingerprint_before_lhs="8b6638529dc7baed527a83e43db55e43"}
+
+ENTRY %main.1 (args_0_.1: c128[3]) -> c128[3] {
+  %args_0_.1 = c128[3]{0} parameter(0), metadata={op_name="args[0]"}
+  ROOT %copy.1 = c128[3]{0} copy(%args_0_.1)
+}
+

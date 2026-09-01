@@ -1,0 +1,19 @@
+Total bytes used: 112 (112B)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+       48B( 43%);        64B; allocation 0: size 48B, parameter 0, shape |c128[3]| at ShapeIndex {}:
+       64B( 57%);        48B; allocation 1: size 16B, output shape is |c128[]|, maybe-live-out:
+       80B( 71%);        32B; allocation 2: size 16B, thread-local:
+       96B( 86%);        16B; allocation 3: size 16B, thread-local:
+      112B(100%);         0B; allocation 4: size 16B, thread-local:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 48B, parameter 0, shape |c128[3]| at ShapeIndex {}:
+allocation 1: size 16B, output shape is |c128[]|, maybe-live-out:
+allocation 2: size 16B, thread-local:
+allocation 3: size 16B, thread-local:
+allocation 4: size 16B, thread-local:

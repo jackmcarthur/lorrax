@@ -1,0 +1,50 @@
+HloModule jit_multiply, is_scheduled=true, entry_computation_layout={(f64[512,24]{1,0}, f64[512,24]{1,0})->f64[512,24]{1,0}}, allow_spmd_sharding_propagation_to_parameters={true,true}, allow_spmd_sharding_propagation_to_output={true}, frontend_attributes={fingerprint_before_lhs="8eff1b0abfb9c84a6365433aa09d8274"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "compute_sigma_c_mpa_omega_grid"
+5 "integrate_sigma_store"
+6 "integrate_sigma_store.<locals>.run"
+7 "_integrate_sigma_batches"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=1066 end_line=1086 column=15 end_column=30}
+5 {file_name_id=4 function_name_id=4 line=541 end_line=543 column=15 end_column=63}
+6 {file_name_id=4 function_name_id=5 line=300 end_line=300 column=15 end_column=27}
+7 {file_name_id=4 function_name_id=6 line=295 end_line=297 column=15 end_column=67}
+8 {file_name_id=4 function_name_id=7 line=189 end_line=192 column=28 end_column=61}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+
+
+%wrapped_multiply_computation (param_0: f64[512,24], param_1: f64[512,24]) -> f64[512,24] {
+  %param_0 = f64[512,24]{1,0} parameter(0)
+  %param_1 = f64[512,24]{1,0} parameter(1)
+  ROOT %mul.1.1 = f64[512,24]{1,0} multiply(%param_0, %param_1), metadata={op_name="jit(multiply)/mul" stack_frame_id=8}
+}
+
+ENTRY %main.1 (x.1: f64[512,24], y.1: f64[512,24]) -> f64[512,24] {
+  %y.1 = f64[512,24]{1,0} parameter(1), metadata={op_name="y"}
+  %x.1 = f64[512,24]{1,0} parameter(0), metadata={op_name="x"}
+  ROOT %wrapped_multiply = f64[512,24]{1,0} fusion(%x.1, %y.1), kind=kLoop, calls=%wrapped_multiply_computation, metadata={op_name="jit(multiply)/mul" stack_frame_id=8}
+}
+

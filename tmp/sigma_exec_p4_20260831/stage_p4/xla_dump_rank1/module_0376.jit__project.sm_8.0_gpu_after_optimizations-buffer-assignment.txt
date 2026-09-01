@@ -1,0 +1,272 @@
+BufferAssignment:
+allocation 0: size 3149004800, parameter 1, shape |c128[512,2,310,2,310]| at ShapeIndex {}:
+ value: <19 param.4 @0> (size=3149004800,offset=0): c128[512,2,310,2,310]{4,3,2,1,0}
+allocation 1: size 121896960, parameter 0, shape |c128[512,24,2,310]| at ShapeIndex {}:
+ value: <17 param.3 @0> (size=121896960,offset=0): c128[512,24,2,310]{3,2,1,0}
+allocation 2: size 121896960, parameter 2, shape |c128[512,2,310,24]| at ShapeIndex {}:
+ value: <20 param.5 @0> (size=121896960,offset=0): c128[512,2,310,24]{3,2,1,0}
+allocation 3: size 1179648, output shape is |c128[512,12,12]|, maybe-live-out:
+ value: <32 loop_transpose_fusion @0> (size=1179648,offset=0): c128[512,12,12]{2,1,0}
+allocation 4: size 16, thread-local:
+ value: <2 add.0.0 @0> (size=16,offset=0): c128[]
+allocation 5: size 16, thread-local:
+ value: <1 reduce_scatter.1 @0> (size=16,offset=0): c128[]
+allocation 6: size 16, thread-local:
+ value: <0 reduce_scatter.0 @0> (size=16,offset=0): c128[]
+allocation 7: size 16, thread-local:
+ value: <5 add.2.0 @0> (size=16,offset=0): c128[]
+allocation 8: size 16, thread-local:
+ value: <4 reduce_scatter.5 @0> (size=16,offset=0): c128[]
+allocation 9: size 16, thread-local:
+ value: <3 reduce_scatter.4 @0> (size=16,offset=0): c128[]
+allocation 10: size 243795216, preallocated-temp:
+ value: <15 reduce_scatter.14.1 @0> (size=60948480,offset=0): c128[512,2,310,12]{2,1,0,3}
+ value: <16 reduce_scatter.15.1 @0> (size=1179648,offset=0): c128[512,12,12]{2,0,1}
+ value: <18 loop_complex_fusion @0> (size=121896960,offset=63307776): c128[512,24,2,310]{3,2,1,0}
+ value: <21 custom-call.2{} @0> (size=16,offset=243795200): (c128[512,620,24]{2,1,0}, s8[4194304]{0})
+ value: <22 custom-call.2{0} @0> (size=121896960,offset=0): c128[512,620,24]{2,1,0}
+ value: <23 custom-call.2{1} @0> (size=4194304,offset=121896960): s8[4194304]{0}
+ value: <24 input_transpose_fusion @0> (size=121896960,offset=121896960): c128[24,512,2,310]{3,2,1,0}
+ value: <25 reduce-scatter-start{} @0> (size=16,offset=243794944): ((c128[512,2,310,24]{2,1,0,3}), c128[512,2,310,12]{2,1,0,3})
+ value: <26 reduce-scatter-start{0} @0> (size=8,offset=243794176): (c128[512,2,310,24]{2,1,0,3})
+ value: <27 custom-call.3{} @0> (size=16,offset=243794688): (c128[512,24,12]{2,0,1}, s8[4194304]{0})
+ value: <28 custom-call.3{0} @0> (size=2359296,offset=60948480): c128[512,24,12]{2,0,1}
+ value: <29 custom-call.3{1} @0> (size=4194304,offset=185204736): s8[4194304]{0}
+ value: <30 reduce-scatter-start.1{} @0> (size=16,offset=243794432): ((c128[512,24,12]{2,0,1}), c128[512,12,12]{2,0,1})
+ value: <31 reduce-scatter-start.1{0} @0> (size=8,offset=243793920): (c128[512,24,12]{2,0,1})
+
+Total bytes used: 3637773680 (3.39GiB)
+
+Used values:
+<0 reduce_scatter.0 @0>
+ positions:
+  reduce_scatter.0
+ uses:
+  add.0.0, operand 0
+ from instruction: %reduce_scatter.0 = c128[] parameter(0), metadata={op_name="reduce_scatter"}
+<1 reduce_scatter.1 @0>
+ positions:
+  reduce_scatter.1
+ uses:
+  add.0.0, operand 1
+ from instruction: %reduce_scatter.1 = c128[] parameter(1), metadata={op_name="reduce_scatter"}
+<2 add.0.0 @0>
+ positions:
+  add.0.0
+ uses:
+ from instruction: %add.0.0 = c128[] add(%reduce_scatter.0, %reduce_scatter.1), metadata={op_name="add" stack_frame_id=17}
+<3 reduce_scatter.4 @0>
+ positions:
+  reduce_scatter.4
+ uses:
+  add.2.0, operand 0
+ from instruction: %reduce_scatter.4 = c128[] parameter(0), metadata={op_name="reduce_scatter"}
+<4 reduce_scatter.5 @0>
+ positions:
+  reduce_scatter.5
+ uses:
+  add.2.0, operand 1
+ from instruction: %reduce_scatter.5 = c128[] parameter(1), metadata={op_name="reduce_scatter"}
+<5 add.2.0 @0>
+ positions:
+  add.2.0
+ uses:
+ from instruction: %add.2.0 = c128[] add(%reduce_scatter.4, %reduce_scatter.5), metadata={op_name="add" stack_frame_id=20}
+<15 reduce_scatter.14.1 @0>
+ positions:
+  reduce_scatter.14.1
+  bitcast.8.0
+  reduce-scatter-start {1}
+  reduce-scatter-done
+ uses:
+  custom-call.3, operand 1
+  reduce-scatter-done, operand 0 {1}
+  bitcast.8.0, operand 0
+ from instruction: %reduce_scatter.14.1 = c128[512,2,310,12]{2,1,0,3} reduce-scatter(%param_0.6), channel_id=1, replica_groups={{0,1},{2,3}}, use_global_device_ids=true, dimensions={3}, to_apply=%region_0.0, metadata={op_name="jit(_project)/shard_map/reduce_scatter" stack_frame_id=16}
+<16 reduce_scatter.15.1 @0>
+ positions:
+  reduce_scatter.15.1
+  reduce-scatter-start.1 {1}
+  reduce-scatter-done.1
+ uses:
+  reduce-scatter-done.1, operand 0 {1}
+  loop_transpose_fusion, operand 0
+ from instruction: %reduce_scatter.15.1 = c128[512,12,12]{2,0,1} reduce-scatter(%param_0.7), channel_id=1, replica_groups={{0,2},{1,3}}, use_global_device_ids=true, dimensions={1}, to_apply=%region_1.0, metadata={op_name="jit(_project)/shard_map/reduce_scatter" stack_frame_id=19}
+<17 param.3 @0>
+ positions:
+  param.3
+ uses:
+  loop_complex_fusion, operand 0
+ from instruction: %param.3 = c128[512,24,2,310]{3,2,1,0} parameter(0), sharding={devices=[1,1,1,2,2]<=[4] last_tile_dim_replicate}, metadata={op_name="psi_left"}
+<18 loop_complex_fusion @0>
+ positions:
+  loop_complex_fusion
+  bitcast.41
+ uses:
+  bitcast.41, operand 0
+  custom-call.3, operand 0
+ from instruction: %loop_complex_fusion = c128[512,24,2,310]{3,2,1,0} fusion(%param.3), kind=kLoop, calls=%fused_complex, metadata={op_name="jit(_project)/shard_map/complex" stack_frame_id=12}
+<19 param.4 @0>
+ positions:
+  param.4
+  bitcast.1.0
+ uses:
+  bitcast.1.0, operand 0
+  custom-call.2, operand 0
+ from instruction: %param.4 = c128[512,2,310,2,310]{4,3,2,1,0} parameter(1), sharding={devices=[1,1,2,1,2]<=[4]}, metadata={op_name="o"}
+<20 param.5 @0>
+ positions:
+  param.5
+  bitcast.2.0
+ uses:
+  bitcast.2.0, operand 0
+  custom-call.2, operand 1
+ from instruction: %param.5 = c128[512,2,310,24]{3,2,1,0} parameter(2), sharding={devices=[1,1,2,1,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="psi_right"}
+<21 custom-call.2{} @0>
+ positions:
+  custom-call.2 {}
+ uses:
+  get-tuple-element.4, operand 0 {}
+ from instruction: %custom-call.2 = (c128[512,620,24]{2,1,0}, s8[4194304]{0}) custom-call(%bitcast.1.0, %bitcast.2.0), custom_call_target="__cublas$gemm", metadata={op_name="jit(_project)/shard_map/ksxty,ktyn->ksxn/dot_general" stack_frame_id=15}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"selected_algorithm":"-1","alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["1"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["0"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"384400","rhs_stride":"14880","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<22 custom-call.2{0} @0>
+ positions:
+  custom-call.2 {0}
+  get-tuple-element.4
+ uses:
+  input_transpose_fusion, operand 0
+ from instruction: %custom-call.2 = (c128[512,620,24]{2,1,0}, s8[4194304]{0}) custom-call(%bitcast.1.0, %bitcast.2.0), custom_call_target="__cublas$gemm", metadata={op_name="jit(_project)/shard_map/ksxty,ktyn->ksxn/dot_general" stack_frame_id=15}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"selected_algorithm":"-1","alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["1"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["0"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"384400","rhs_stride":"14880","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<23 custom-call.2{1} @0>
+ positions:
+  custom-call.2 {1}
+ uses:
+ from instruction: %custom-call.2 = (c128[512,620,24]{2,1,0}, s8[4194304]{0}) custom-call(%bitcast.1.0, %bitcast.2.0), custom_call_target="__cublas$gemm", metadata={op_name="jit(_project)/shard_map/ksxty,ktyn->ksxn/dot_general" stack_frame_id=15}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"selected_algorithm":"-1","alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["1"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["0"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"384400","rhs_stride":"14880","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<24 input_transpose_fusion @0>
+ positions:
+  input_transpose_fusion
+  bitcast.30.0
+  reduce-scatter-start {0,0}
+  param_0.6
+ uses:
+  bitcast.30.0, operand 0
+  reduce-scatter-start, operand 0
+  reduce-scatter-done, operand 0 {0,0}
+  reduce_scatter.14.1, operand 0
+ from instruction: %input_transpose_fusion = c128[24,512,2,310]{3,2,1,0} fusion(%get-tuple-element.4), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(_project)/shard_map/ksxty,ktyn->ksxn/dot_general" stack_frame_id=15}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<25 reduce-scatter-start{} @0>
+ positions:
+  reduce-scatter-start {}
+ uses:
+  reduce-scatter-done, operand 0 {}
+ from instruction: %reduce-scatter-start = ((c128[512,2,310,24]{2,1,0,3}), c128[512,2,310,12]{2,1,0,3}) reduce-scatter-start(%bitcast.30.0), channel_id=1, replica_groups={{0,1},{2,3}}, use_global_device_ids=true, dimensions={3}, to_apply=%region_0.0, metadata={op_name="jit(_project)/shard_map/reduce_scatter" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<26 reduce-scatter-start{0} @0>
+ positions:
+  reduce-scatter-start {0}
+ uses:
+  reduce-scatter-done, operand 0 {0}
+ from instruction: %reduce-scatter-start = ((c128[512,2,310,24]{2,1,0,3}), c128[512,2,310,12]{2,1,0,3}) reduce-scatter-start(%bitcast.30.0), channel_id=1, replica_groups={{0,1},{2,3}}, use_global_device_ids=true, dimensions={3}, to_apply=%region_0.0, metadata={op_name="jit(_project)/shard_map/reduce_scatter" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<27 custom-call.3{} @0>
+ positions:
+  custom-call.3 {}
+ uses:
+  get-tuple-element.2.0, operand 0 {}
+ from instruction: %custom-call.3 = (c128[512,24,12]{2,0,1}, s8[4194304]{0}) custom-call(%bitcast.41, %bitcast.8.0), custom_call_target="__cublas$gemm", metadata={op_name="jit(_project)/shard_map/kmsx,ksxn->kmn/dot_general" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"selected_algorithm":"-1","alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["1"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"14880","rhs_stride":"317440","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<28 custom-call.3{0} @0>
+ positions:
+  custom-call.3 {0}
+  get-tuple-element.2.0
+  reduce-scatter-start.1 {0,0}
+  param_0.7
+ uses:
+  reduce-scatter-start.1, operand 0
+  reduce-scatter-done.1, operand 0 {0,0}
+  reduce_scatter.15.1, operand 0
+ from instruction: %custom-call.3 = (c128[512,24,12]{2,0,1}, s8[4194304]{0}) custom-call(%bitcast.41, %bitcast.8.0), custom_call_target="__cublas$gemm", metadata={op_name="jit(_project)/shard_map/kmsx,ksxn->kmn/dot_general" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"selected_algorithm":"-1","alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["1"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"14880","rhs_stride":"317440","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<29 custom-call.3{1} @0>
+ positions:
+  custom-call.3 {1}
+ uses:
+ from instruction: %custom-call.3 = (c128[512,24,12]{2,0,1}, s8[4194304]{0}) custom-call(%bitcast.41, %bitcast.8.0), custom_call_target="__cublas$gemm", metadata={op_name="jit(_project)/shard_map/kmsx,ksxn->kmn/dot_general" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"selected_algorithm":"-1","alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["1"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"14880","rhs_stride":"317440","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<30 reduce-scatter-start.1{} @0>
+ positions:
+  reduce-scatter-start.1 {}
+ uses:
+  reduce-scatter-done.1, operand 0 {}
+ from instruction: %reduce-scatter-start.1 = ((c128[512,24,12]{2,0,1}), c128[512,12,12]{2,0,1}) reduce-scatter-start(%get-tuple-element.2.0), channel_id=1, replica_groups={{0,2},{1,3}}, use_global_device_ids=true, dimensions={1}, to_apply=%region_1.0, metadata={op_name="jit(_project)/shard_map/reduce_scatter" stack_frame_id=19}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<31 reduce-scatter-start.1{0} @0>
+ positions:
+  reduce-scatter-start.1 {0}
+ uses:
+  reduce-scatter-done.1, operand 0 {0}
+ from instruction: %reduce-scatter-start.1 = ((c128[512,24,12]{2,0,1}), c128[512,12,12]{2,0,1}) reduce-scatter-start(%get-tuple-element.2.0), channel_id=1, replica_groups={{0,2},{1,3}}, use_global_device_ids=true, dimensions={1}, to_apply=%region_1.0, metadata={op_name="jit(_project)/shard_map/reduce_scatter" stack_frame_id=19}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<32 loop_transpose_fusion @0>
+ positions:
+  loop_transpose_fusion
+ uses:
+ from instruction: %loop_transpose_fusion = c128[512,12,12]{2,1,0} fusion(%reduce-scatter-done.1), kind=kInput, calls=%fused_transpose, metadata={op_name="jit(_project)/shard_map/reduce_scatter" stack_frame_id=19}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 23):
+  InstructionSequence:
+    0:param.4
+    1:bitcast.1.0
+    2:param.5
+    3:bitcast.2.0
+    4:custom-call.2
+    5:get-tuple-element.4
+    6:input_transpose_fusion
+    7:bitcast.30.0
+    8:param_0.6
+    9:reduce_scatter.14.1
+    10:reduce-scatter-start
+    11:reduce-scatter-done
+    12:bitcast.8.0
+    13:param.3
+    14:loop_complex_fusion
+    15:bitcast.41
+    16:custom-call.3
+    17:get-tuple-element.2.0
+    18:param_0.7
+    19:reduce_scatter.15.1
+    20:reduce-scatter-start.1
+    21:reduce-scatter-done.1
+    22:loop_transpose_fusion
+  BufferLiveRange:
+    reduce_scatter.14.1{}:9-16
+    reduce_scatter.15.1{}:19-22
+    param.3{}:0-23
+    loop_complex_fusion{}:14-16
+    param.4{}:0-23
+    param.5{}:0-23
+    custom-call.2{}:4-5
+    custom-call.2{0}:4-6
+    custom-call.2{1}:4-4
+    input_transpose_fusion{}:6-11
+    reduce-scatter-start{}:10-11
+    reduce-scatter-start{0}:10-11
+    custom-call.3{}:16-17
+    custom-call.3{0}:16-21
+    custom-call.3{1}:16-16
+    reduce-scatter-start.1{}:20-21
+    reduce-scatter-start.1{0}:20-21
+    loop_transpose_fusion{}:22-23
+  Live ranges at 16 (peak):
+    param.4{}: 3149004800 bytes (cumulative: 3149004800 bytes)
+    loop_complex_fusion{}: 121896960 bytes (cumulative: 3270901760 bytes)
+    param.3{}: 121896960 bytes (cumulative: 3392798720 bytes)
+    param.5{}: 121896960 bytes (cumulative: 3514695680 bytes)
+    reduce_scatter.14.1{}: 60948480 bytes (cumulative: 3575644160 bytes)
+    custom-call.3{1}: 4194304 bytes (cumulative: 3579838464 bytes)
+    custom-call.3{0}: 2359296 bytes (cumulative: 3582197760 bytes)
+    custom-call.3{}: 16 bytes (cumulative: 3582197776 bytes)
+  Stack trace breakdown for peak usage: 3 582 197 776 bytes
+    main.0_spmd (100.0%, total: 3 582 197 776 bytes, current: 0 bytes, remaining: 3 582 197 776 bytes)
+      ├── o (87.9%, total: 3 149 004 800 bytes, current: 3 149 004 800 bytes, remaining: 433 192 976 bytes)
+      ├── jit(_project)/shard_map/complex (3.4%, total: 121 896 960 bytes, current: 121 896 960 bytes, remaining: 311 296 016 bytes)
+      ├── psi_left (3.4%, total: 121 896 960 bytes, current: 121 896 960 bytes, remaining: 189 399 056 bytes)
+      ├── psi_right (3.4%, total: 121 896 960 bytes, current: 121 896 960 bytes, remaining: 67 502 096 bytes)
+      ├── jit(_project)/shard_map/reduce_scatter (1.7%, total: 60 948 480 bytes, current: 0 bytes, remaining: 67 502 096 bytes)
+      │   └── async_computation (1.7%, total: 60 948 480 bytes, current: 0 bytes, remaining: 67 502 096 bytes)
+      │       └── jit(_project)/shard_map/reduce_scatter (1.7%, total: 60 948 480 bytes, current: 60 948 480 bytes, remaining: 6 553 616 bytes)
+      ├── jit(_project)/shard_map/kmsx,ksxn->kmn/dot_general{1} (0.1%, total: 4 194 304 bytes, current: 4 194 304 bytes, remaining: 2 359 312 bytes)
+      ├── jit(_project)/shard_map/kmsx,ksxn->kmn/dot_general{0} (0.1%, total: 2 359 296 bytes, current: 2 359 296 bytes, remaining: 16 bytes)
+      └── jit(_project)/shard_map/kmsx,ksxn->kmn/dot_general (0.0%, total: 16 bytes, current: 16 bytes, remaining: 0 bytes)

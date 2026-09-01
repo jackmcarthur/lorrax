@@ -1,0 +1,68 @@
+HloModule jit__lambda, input_output_alias={ {}: (0, {}, may-alias) }, entry_computation_layout={(c128[21,512,24,24]{3,2,1,0}, c128[512,24,24]{2,1,0}, c128[21]{0})->c128[21,512,24,24]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/ppm_accumulators.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "compute_sigma_c_mpa_omega_grid"
+5 "integrate_sigma_store"
+6 "integrate_sigma_store.<locals>.run"
+7 "_integrate_sigma_batches"
+8 "DeviceOmegaAccumulator.precompile_tau_add"
+9 "_device_omega_add.<locals>.<lambda>"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=1066 end_line=1086 column=15 end_column=30}
+5 {file_name_id=4 function_name_id=4 line=541 end_line=543 column=15 end_column=63}
+6 {file_name_id=4 function_name_id=5 line=300 end_line=300 column=15 end_column=27}
+7 {file_name_id=4 function_name_id=6 line=295 end_line=297 column=15 end_column=67}
+8 {file_name_id=4 function_name_id=7 line=213 end_line=216 column=16 end_column=52}
+9 {file_name_id=5 function_name_id=8 line=649 end_line=650 column=8 end_column=38}
+10 {file_name_id=5 function_name_id=9 line=570 end_line=570 column=18 end_column=46}
+11 {file_name_id=5 function_name_id=9 line=570 end_line=570 column=49 end_column=65}
+12 {file_name_id=5 function_name_id=9 line=570 end_line=570 column=12 end_column=65}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=10}
+12 {file_location_id=12 parent_frame_id=10}
+
+
+ENTRY %main.1 (acc.1: c128[21,512,24,24], sigma.1: c128[512,24,24], coeff.1: c128[21]) -> c128[21,512,24,24] {
+  %acc.1 = c128[21,512,24,24]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="acc"}
+  %coeff.1 = c128[21]{0} parameter(2), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}]>"}, metadata={op_name="coeff"}
+  %reshape.1 = c128[21,1,1,1]{3,2,1,0} reshape(%coeff.1), metadata={op_name="jit(<lambda>)/reshape" stack_frame_id=10}
+  %mul.7 = c128[21,1,1,1]{3,2,1,0} broadcast(%reshape.1), dimensions={0,1,2,3}, metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %mul.8 = c128[21]{0} reshape(%mul.7), metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %mul.9 = c128[21,512,24,24]{3,2,1,0} broadcast(%mul.8), dimensions={0}, metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %sigma.1 = c128[512,24,24]{2,1,0} parameter(1), sharding={devices=[1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="sigma"}
+  %broadcast_in_dim.1 = c128[1,512,24,24]{3,2,1,0} reshape(%sigma.1), metadata={op_name="jit(<lambda>)/broadcast_in_dim" stack_frame_id=11}
+  %mul.10 = c128[1,512,24,24]{3,2,1,0} broadcast(%broadcast_in_dim.1), dimensions={0,1,2,3}, metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %mul.11 = c128[512,24,24]{2,1,0} reshape(%mul.10), metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %mul.12 = c128[21,512,24,24]{3,2,1,0} broadcast(%mul.11), dimensions={1,2,3}, metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %mul.13 = c128[21,512,24,24]{3,2,1,0} multiply(%mul.9, %mul.12), metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %add.2 = c128[21,512,24,24]{3,2,1,0} add(%acc.1, %mul.13), metadata={op_name="jit(<lambda>)/add" stack_frame_id=12}
+  %add.3 = c128[21,512,24,24]{3,2,1,0} custom-call(%add.2), custom_call_target="xla.sdy.FuncResultSharding", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>]>"}, metadata={op_name="jit(<lambda>)/add" stack_frame_id=12}
+  %tuple.1 = (c128[21,512,24,24]{3,2,1,0}) tuple(%add.3)
+  ROOT %get-tuple-element.1 = c128[21,512,24,24]{3,2,1,0} get-tuple-element(%tuple.1), index=0, sharding={devices=[1,1,2,2]<=[4]}
+}
+

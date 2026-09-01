@@ -1,0 +1,60 @@
+BufferAssignment:
+allocation 0: size 8530176, output shape is |f64[6,2,29,1532,2]|, maybe-live-out:
+ value: <3 ffi_call.3 @0> (size=8530176,offset=0): f64[6,2,29,1532,2]{4,3,2,1,0}
+allocation 1: size 928, parameter 1, shape |s64[29,4]| at ShapeIndex {}:
+ value: <1 param.4 @0> (size=928,offset=0): s64[29,4]{1,0}
+allocation 2: size 928, parameter 2, shape |s64[29,4]| at ShapeIndex {}:
+ value: <2 param.5 @0> (size=928,offset=0): s64[29,4]{1,0}
+allocation 3: size 16, parameter 0, shape |s64[2]| at ShapeIndex {}:
+ value: <0 param.3 @0> (size=16,offset=0): s64[2]{0}
+
+Total bytes used: 8532048 (8.14MiB)
+
+Used values:
+<0 param.3 @0>
+ positions:
+  param.3
+ uses:
+  ffi_call.3, operand 0
+ from instruction: %param.3 = s64[2]{0} parameter(0), sharding={replicated}, metadata={op_name="handle_local"}
+<1 param.4 @0>
+ positions:
+  param.4
+ uses:
+  ffi_call.3, operand 1
+ from instruction: %param.4 = s64[29,4]{1,0} parameter(1), sharding={replicated}, metadata={op_name="offset_base_local"}
+<2 param.5 @0>
+ positions:
+  param.5
+ uses:
+  ffi_call.3, operand 2
+ from instruction: %param.5 = s64[29,4]{1,0} parameter(2), sharding={devices=[4,1]<=[4]}, metadata={op_name="count_base_local"}
+<3 ffi_call.3 @0>
+ positions:
+  ffi_call.3
+ uses:
+ from instruction: %ffi_call.3 = f64[6,2,29,1532,2]{4,3,2,1,0} custom-call(%param.3, %param.4, %param.5), custom_call_target="lorrax_phdf5_read_kchunk_union", operand_layout_constraints={s64[2]{0}, s64[29,4]{1,0}, s64[29,4]{1,0}}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_per_rank)/shard_map/ffi_call" stack_frame_id=12}, backend_config={axis_count_per_dim = dense<[2, 0, 0, 0]> : tensor<4xi64>, axis_flat = dense<[0, 1]> : tensor<2xi64>, kchunk_axis = 2 : i64, mesh_shape = dense<2> : tensor<2xi64>, n_kchunk = 29 : i64}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:param.5
+    1:param.4
+    2:param.3
+    3:ffi_call.3
+  BufferLiveRange:
+    param.3{}:0-4
+    param.4{}:0-4
+    param.5{}:0-4
+    ffi_call.3{}:3-4
+  Live ranges at 3 (peak):
+    ffi_call.3{}: 8530176 bytes (cumulative: 8530176 bytes)
+    param.4{}: 928 bytes (cumulative: 8531104 bytes)
+    param.5{}: 928 bytes (cumulative: 8532032 bytes)
+    param.3{}: 16 bytes (cumulative: 8532048 bytes)
+  Stack trace breakdown for peak usage: 8 532 048 bytes
+    main.0_spmd (100.0%, total: 8 532 048 bytes, current: 0 bytes, remaining: 8 532 048 bytes)
+      ├── jit(_per_rank)/shard_map/ffi_call (100.0%, total: 8 530 176 bytes, current: 8 530 176 bytes, remaining: 1 872 bytes)
+      ├── count_base_local (0.0%, total: 928 bytes, current: 928 bytes, remaining: 944 bytes)
+      ├── offset_base_local (0.0%, total: 928 bytes, current: 928 bytes, remaining: 16 bytes)
+      └── handle_local (0.0%, total: 16 bytes, current: 16 bytes, remaining: 0 bytes)

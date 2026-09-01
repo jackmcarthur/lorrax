@@ -1,0 +1,51 @@
+BufferAssignment:
+allocation 0: size 8530176, output shape is |c128[29,6,2,1532]|, maybe-live-out:
+ value: <29 loop_select_fusion @0> (size=8530176,offset=0): c128[1,29,6,2,1532]{4,3,2,1,0}
+allocation 1: size 8530176, parameter 0, shape |f64[6,2,29,1532,2]| at ShapeIndex {}:
+ value: <27 param.2 @0> (size=8530176,offset=0): f64[6,2,29,1532,2]{4,3,2,1,0}
+allocation 2: size 116, parameter 1, shape |s32[29]| at ShapeIndex {}:
+ value: <28 param.3 @0> (size=116,offset=0): s32[29]{0}
+
+Total bytes used: 17060468 (16.27MiB)
+
+Used values:
+<27 param.2 @0>
+ positions:
+  param.2
+ uses:
+  loop_select_fusion, operand 0
+ from instruction: %param.2 = f64[6,2,29,1532,2]{4,3,2,1,0} parameter(0), sharding={devices=[4,1,1,1,1]<=[4]}, metadata={op_name="cnk_at_ibz"}
+<28 param.3 @0>
+ positions:
+  param.3
+ uses:
+  loop_select_fusion, operand 1
+ from instruction: %param.3 = s32[29]{0} parameter(1), sharding={replicated}, metadata={op_name="position_in_reads"}
+<29 loop_select_fusion @0>
+ positions:
+  loop_select_fusion
+  bitcast.3.0
+ uses:
+  bitcast.3.0, operand 0
+ from instruction: %loop_select_fusion = c128[1,29,6,2,1532]{4,3,2,1,0} fusion(%param.2, %param.3), kind=kLoop, calls=%fused_select, metadata={op_name="jit(_per_rank)/shard_map/jit(_take)/select_n"}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:param.3
+    1:param.2
+    2:loop_select_fusion
+    3:bitcast.3.0
+  BufferLiveRange:
+    param.2{}:0-4
+    param.3{}:0-4
+    loop_select_fusion{}:2-4
+  Live ranges at 2 (peak):
+    loop_select_fusion{}: 8530176 bytes (cumulative: 8530176 bytes)
+    param.2{}: 8530176 bytes (cumulative: 17060352 bytes)
+    param.3{}: 116 bytes (cumulative: 17060468 bytes)
+  Stack trace breakdown for peak usage: 17 060 468 bytes
+    main.2_spmd (100.0%, total: 17 060 468 bytes, current: 0 bytes, remaining: 17 060 468 bytes)
+      ├── cnk_at_ibz (50.0%, total: 8 530 176 bytes, current: 8 530 176 bytes, remaining: 8 530 292 bytes)
+      ├── jit(_per_rank)/shard_map/jit(_take)/select_n (50.0%, total: 8 530 176 bytes, current: 8 530 176 bytes, remaining: 116 bytes)
+      └── position_in_reads (0.0%, total: 116 bytes, current: 116 bytes, remaining: 0 bytes)

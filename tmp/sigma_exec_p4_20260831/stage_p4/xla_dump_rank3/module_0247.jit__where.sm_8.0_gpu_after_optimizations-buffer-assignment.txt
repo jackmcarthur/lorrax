@@ -1,0 +1,60 @@
+BufferAssignment:
+allocation 0: size 262144, output shape is |f64[32,32,32]|, maybe-live-out:
+ value: <8 loop_select_fusion @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+allocation 1: size 262144, parameter 2, shape |f64[32,32,32]| at ShapeIndex {}:
+ value: <6 y.1 @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+allocation 2: size 32768, parameter 0, shape |pred[32,32,32]| at ShapeIndex {}:
+ value: <5 condition.1 @0> (size=32768,offset=0): pred[32,32,32]{2,1,0}
+allocation 3: size 8, parameter 1, shape |f64[]| at ShapeIndex {}:
+ value: <7 x.1 @0> (size=8,offset=0): f64[]
+
+Total bytes used: 557064 (544.0KiB)
+
+Used values:
+<5 condition.1 @0>
+ positions:
+  condition.1
+ uses:
+  loop_select_fusion, operand 0
+ from instruction: %condition.1 = pred[32,32,32]{2,1,0} parameter(0), metadata={op_name="condition"}
+<6 y.1 @0>
+ positions:
+  y.1
+ uses:
+  loop_select_fusion, operand 1
+ from instruction: %y.1 = f64[32,32,32]{2,1,0} parameter(2), metadata={op_name="y"}
+<7 x.1 @0>
+ positions:
+  x.1
+ uses:
+  loop_select_fusion, operand 2
+ from instruction: %x.1 = f64[] parameter(1), metadata={op_name="x"}
+<8 loop_select_fusion @0>
+ positions:
+  loop_select_fusion
+ uses:
+ from instruction: %loop_select_fusion = f64[32,32,32]{2,1,0} fusion(%condition.1, %y.1, %x.1), kind=kLoop, calls=%fused_select, metadata={op_name="jit(_where)/select_n" stack_frame_id=10}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:x.1
+    1:y.1
+    2:condition.1
+    3:loop_select_fusion
+  BufferLiveRange:
+    condition.1{}:0-4
+    y.1{}:0-4
+    x.1{}:0-4
+    loop_select_fusion{}:3-4
+  Live ranges at 3 (peak):
+    loop_select_fusion{}: 262144 bytes (cumulative: 262144 bytes)
+    y.1{}: 262144 bytes (cumulative: 524288 bytes)
+    condition.1{}: 32768 bytes (cumulative: 557056 bytes)
+    x.1{}: 8 bytes (cumulative: 557064 bytes)
+  Stack trace breakdown for peak usage: 557 064 bytes
+    main.1 (100.0%, total: 557 064 bytes, current: 0 bytes, remaining: 557 064 bytes)
+      ├── jit(_where)/select_n (47.1%, total: 262 144 bytes, current: 262 144 bytes, remaining: 294 920 bytes)
+      ├── y (47.1%, total: 262 144 bytes, current: 262 144 bytes, remaining: 32 776 bytes)
+      ├── condition (5.9%, total: 32 768 bytes, current: 32 768 bytes, remaining: 8 bytes)
+      └── x (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

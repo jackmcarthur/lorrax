@@ -1,0 +1,4 @@
+# remat_details.txt — every involuntary rematerialization warning
+# Each block: warning + 5 lines before + 5 after from its HLO file
+
+_No rematerialization warnings emitted — nothing to show._

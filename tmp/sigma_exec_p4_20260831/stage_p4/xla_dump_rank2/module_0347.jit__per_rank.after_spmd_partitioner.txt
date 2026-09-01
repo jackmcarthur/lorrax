@@ -1,0 +1,69 @@
+HloModule jit__per_rank, entry_computation_layout={(s64[2]{0}, s64[4]{0}, s64[4]{0})->c128[4,29,310,310]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/mpa_store.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/slab_io.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/_slab_io_ffi.py"
+7 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/ffi/io.py"
+
+FunctionNames
+1 "main"
+2 "compute_sigma_xc"
+3 "compute_sigma_c_mpa_omega_grid"
+4 "integrate_sigma_store"
+5 "integrate_sigma_store.<locals>.run"
+6 "_integrate_sigma_batches"
+7 "integrate_sigma_store.<locals>.batches"
+8 "PoleReader.read"
+9 "SlabIO.read_slab"
+10 "_FfiBackend.read_slab"
+11 "_get_read_sm.<locals>._per_rank"
+12 "ffi_read_call"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=770 end_line=770 column=18 end_column=18}
+2 {file_name_id=2 function_name_id=2 line=1066 end_line=1066 column=15 end_column=15}
+3 {file_name_id=3 function_name_id=3 line=541 end_line=541 column=15 end_column=15}
+4 {file_name_id=3 function_name_id=4 line=300 end_line=300 column=15 end_column=15}
+5 {file_name_id=3 function_name_id=5 line=295 end_line=295 column=15 end_column=15}
+6 {file_name_id=3 function_name_id=6 line=173 end_line=173 column=24 end_column=24}
+7 {file_name_id=3 function_name_id=7 line=287 end_line=287 column=23 end_column=23}
+8 {file_name_id=4 function_name_id=8 line=3667 end_line=3667 column=16 end_column=16}
+9 {file_name_id=5 function_name_id=9 line=509 end_line=509 column=18 end_column=18}
+10 {file_name_id=6 function_name_id=10 line=2357 end_line=2357 column=17 end_column=17}
+11 {file_name_id=6 function_name_id=11 line=1557 end_line=1557 column=15 end_column=15}
+12 {file_name_id=7 function_name_id=12 line=415 end_line=415 column=11 end_column=11}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=1}
+12 {file_location_id=12 parent_frame_id=12}
+
+
+ENTRY %main.0_spmd (param.3: s64[2], param.4: s64[4], param.5: s64[4]) -> c128[4,29,310,310] {
+  %param.3 = s64[2]{0} parameter(0), sharding={replicated}, metadata={op_name="handle_local"}
+  %shard_map.4 = s64[2]{0} copy(%param.3), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %copy = s64[2]{0} copy(%shard_map.4), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %param.4 = s64[4]{0} parameter(1), sharding={replicated}, metadata={op_name="offset_local"}
+  %shard_map.5 = s64[4]{0} copy(%param.4), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %copy.1 = s64[4]{0} copy(%shard_map.5), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %param.5 = s64[4]{0} parameter(2), sharding={replicated}, metadata={op_name="valid_shape_local"}
+  %shard_map.6 = s64[4]{0} copy(%param.5), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %copy.2 = s64[4]{0} copy(%shard_map.6), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  %ffi_call.3 = c128[4,29,310,310]{3,2,1,0} custom-call(%copy, %copy.1, %copy.2), custom_call_target="lorrax_phdf5_read", operand_layout_constraints={s64[2]{0}, s64[4]{0}, s64[4]{0}}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_per_rank)/shard_map/ffi_call" stack_frame_id=12}, backend_config={axis_count_per_dim = dense<[0, 0, 1, 1]> : tensor<4xi64>, axis_flat = dense<[0, 1]> : tensor<2xi64>, mesh_shape = dense<2> : tensor<2xi64>}
+  %shard_map.24 = c128[4,29,310,310]{3,2,1,0} copy(%ffi_call.3), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+  ROOT %copy.3 = c128[4,29,310,310]{3,2,1,0} copy(%shard_map.24), metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=10}
+}
+

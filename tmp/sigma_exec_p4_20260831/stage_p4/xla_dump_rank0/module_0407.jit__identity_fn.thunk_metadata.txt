@@ -1,0 +1,40 @@
+thunk_metadata {
+  thunk_info {
+  }
+  thunk_kind: "kSequential"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "wrapped_transpose"
+    thunk_id: 1
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all-gather-start"
+    thunk_id: 2
+  }
+  thunk_kind: "kAllGatherStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "loop_transpose_fusion.1"
+    thunk_id: 3
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "all-gather-start.1"
+    thunk_id: 4
+  }
+  thunk_kind: "kAllGatherStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "loop_transpose_fusion"
+    thunk_id: 5
+  }
+  thunk_kind: "kKernel"
+}

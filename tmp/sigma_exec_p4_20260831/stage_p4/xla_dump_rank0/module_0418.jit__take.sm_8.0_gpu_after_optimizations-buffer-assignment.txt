@@ -1,0 +1,51 @@
+BufferAssignment:
+allocation 0: size 4718592, parameter 0, shape |c128[512,24,24]| at ShapeIndex {}:
+ value: <22 param.1 @0> (size=4718592,offset=0): c128[512,24,24]{2,1,0}
+allocation 1: size 267264, output shape is |c128[29,24,24]|, maybe-live-out:
+ value: <24 loop_select_fusion @0> (size=267264,offset=0): c128[1,29,24,24]{3,2,1,0}
+allocation 2: size 232, parameter 1, shape |s64[29]| at ShapeIndex {}:
+ value: <23 param @0> (size=232,offset=0): s64[29]{0}
+
+Total bytes used: 4986088 (4.75MiB)
+
+Used values:
+<22 param.1 @0>
+ positions:
+  param.1
+ uses:
+  loop_select_fusion, operand 0
+ from instruction: %param.1 = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="a"}
+<23 param @0>
+ positions:
+  param
+ uses:
+  loop_select_fusion, operand 1
+ from instruction: %param = s64[29]{0} parameter(1), sharding={replicated}, metadata={op_name="indices"}
+<24 loop_select_fusion @0>
+ positions:
+  loop_select_fusion
+  bitcast.2.0
+ uses:
+  bitcast.2.0, operand 0
+ from instruction: %loop_select_fusion = c128[1,29,24,24]{3,2,1,0} fusion(%param.1, %param), kind=kLoop, calls=%fused_select, metadata={op_name="jit(_take)/select_n" stack_frame_id=9}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:param.1
+    1:param
+    2:loop_select_fusion
+    3:bitcast.2.0
+  BufferLiveRange:
+    param.1{}:0-4
+    param{}:0-4
+    loop_select_fusion{}:2-4
+  Live ranges at 2 (peak):
+    param.1{}: 4718592 bytes (cumulative: 4718592 bytes)
+    loop_select_fusion{}: 267264 bytes (cumulative: 4985856 bytes)
+    param{}: 232 bytes (cumulative: 4986088 bytes)
+  Stack trace breakdown for peak usage: 4 986 088 bytes
+    main.1_spmd (100.0%, total: 4 986 088 bytes, current: 0 bytes, remaining: 4 986 088 bytes)
+      ├── a (94.6%, total: 4 718 592 bytes, current: 4 718 592 bytes, remaining: 267 496 bytes)
+      ├── jit(_take)/select_n (5.4%, total: 267 264 bytes, current: 267 264 bytes, remaining: 232 bytes)
+      └── indices (0.0%, total: 232 bytes, current: 232 bytes, remaining: 0 bytes)

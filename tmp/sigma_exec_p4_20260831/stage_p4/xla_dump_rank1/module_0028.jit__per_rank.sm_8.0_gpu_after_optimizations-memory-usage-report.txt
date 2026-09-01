@@ -1,0 +1,17 @@
+Total bytes used: 787251264 (750.78MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 750.78MiB(100%);        64B; allocation 0: size 750.78MiB, output shape is |c128[512,310,310]|, maybe-live-out:
+ 750.78MiB(100%);        40B; allocation 1: size 24B, parameter 1, shape |s64[3]| at ShapeIndex {}:
+ 750.78MiB(100%);        16B; allocation 2: size 24B, parameter 2, shape |s64[3]| at ShapeIndex {}:
+ 750.78MiB(100%);         0B; allocation 3: size 16B, parameter 0, shape |s64[2]| at ShapeIndex {}:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 750.78MiB, output shape is |c128[512,310,310]|, maybe-live-out:
+allocation 1: size 24B, parameter 1, shape |s64[3]| at ShapeIndex {}:
+allocation 2: size 24B, parameter 2, shape |s64[3]| at ShapeIndex {}:
+allocation 3: size 16B, parameter 0, shape |s64[2]| at ShapeIndex {}:

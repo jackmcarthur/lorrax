@@ -1,0 +1,59 @@
+BufferAssignment:
+allocation 0: size 48, parameter 0, shape |c128[3]| at ShapeIndex {}:
+ value: <6 a.1 @0> (size=48,offset=0): c128[3]{0}
+allocation 1: size 16, output shape is |c128[]|, maybe-live-out:
+ value: <7 loop_reduce_fusion @0> (size=16,offset=0): c128[]
+allocation 2: size 16, thread-local:
+ value: <0 reduce_prod.3 @0> (size=16,offset=0): c128[]
+allocation 3: size 16, thread-local:
+ value: <1 reduce_prod.4 @0> (size=16,offset=0): c128[]
+allocation 4: size 16, thread-local:
+ value: <2 reduce_prod.5.0 @0> (size=16,offset=0): c128[]
+
+Total bytes used: 112 (112B)
+
+Used values:
+<0 reduce_prod.3 @0>
+ positions:
+  reduce_prod.3
+ uses:
+  reduce_prod.5.0, operand 0
+ from instruction: %reduce_prod.3 = c128[] parameter(0), metadata={op_name="reduce_prod"}
+<1 reduce_prod.4 @0>
+ positions:
+  reduce_prod.4
+ uses:
+  reduce_prod.5.0, operand 1
+ from instruction: %reduce_prod.4 = c128[] parameter(1), metadata={op_name="reduce_prod"}
+<2 reduce_prod.5.0 @0>
+ positions:
+  reduce_prod.5.0
+ uses:
+ from instruction: %reduce_prod.5.0 = c128[] multiply(%reduce_prod.3, %reduce_prod.4), metadata={op_name="jit(_reduce_prod)/reduce_prod" stack_frame_id=9}
+<6 a.1 @0>
+ positions:
+  a.1
+ uses:
+  loop_reduce_fusion, operand 0
+ from instruction: %a.1 = c128[3]{0} parameter(0), metadata={op_name="a"}
+<7 loop_reduce_fusion @0>
+ positions:
+  loop_reduce_fusion
+ uses:
+ from instruction: %loop_reduce_fusion = c128[] fusion(%a.1), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(_reduce_prod)/reduce_prod" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 2):
+  InstructionSequence:
+    0:a.1
+    1:loop_reduce_fusion
+  BufferLiveRange:
+    a.1{}:0-2
+    loop_reduce_fusion{}:1-2
+  Live ranges at 1 (peak):
+    a.1{}: 48 bytes (cumulative: 48 bytes)
+    loop_reduce_fusion{}: 16 bytes (cumulative: 64 bytes)
+  Stack trace breakdown for peak usage: 64 bytes
+    main.2 (100.0%, total: 64 bytes, current: 0 bytes, remaining: 64 bytes)
+      ├── a (75.0%, total: 48 bytes, current: 48 bytes, remaining: 16 bytes)
+      └── jit(_reduce_prod)/reduce_prod (25.0%, total: 16 bytes, current: 16 bytes, remaining: 0 bytes)

@@ -1,0 +1,456 @@
+HloModule jit__run, entry_computation_layout={(c128[29,6,2,1532]{3,2,1,0}, s32[29,1532,3]{2,1,0}, f64[29,1532]{1,0}, s32[29,32,32,32]{3,2,1,0}, c128[32,32,32]{2,1,0})->c128[29,12,12]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true,true,true,true}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/timing.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/mtxel_sweep.py"
+7 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/wfn_transforms.py"
+8 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/fft_helpers.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "_compute_live_hartree"
+5 "compute_hartree_matrix"
+6 "TimingCollector.timed.<locals>.decorator.<locals>.wrapper"
+7 "sweep_matrix_elements"
+8 "sweep_matrix_elements.<locals>._run"
+9 "sweep_matrix_elements.<locals>._run.<locals>.body"
+10 "sweep_matrix_elements.<locals>._run.<locals>.one_k"
+11 "local_potential_operator.<locals>.op"
+12 "_box_kernel"
+13 "make_sharded_ifftn_3d.<locals>._wrap"
+14 "local_ifftn3"
+15 "make_sharded_fftn_3d.<locals>._wrap"
+16 "local_fftn3"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=770 column=18 end_column=18}
+4 {file_name_id=3 function_name_id=3 line=922 end_line=922 column=30 end_column=30}
+5 {file_name_id=3 function_name_id=4 line=318 end_line=318 column=12 end_column=12}
+6 {file_name_id=4 function_name_id=5 line=1008 end_line=1008 column=19 end_column=19}
+7 {file_name_id=5 function_name_id=6 line=243 end_line=243 column=14 end_column=14}
+8 {file_name_id=6 function_name_id=7 line=1985 end_line=1985 column=11 end_column=11}
+9 {file_name_id=6 function_name_id=8 line=1962 end_line=1962 column=15 end_column=15}
+10 {file_name_id=6 function_name_id=8 line=1897 end_line=1897 column=19 end_column=19}
+11 {file_name_id=6 function_name_id=9 line=1959 end_line=1959 column=18 end_column=18}
+12 {file_name_id=6 function_name_id=10 line=1926 end_line=1926 column=32 end_column=32}
+13 {file_name_id=6 function_name_id=10 line=1926 end_line=1926 column=21 end_column=21}
+14 {file_name_id=6 function_name_id=10 line=1927 end_line=1927 column=23 end_column=23}
+15 {file_name_id=6 function_name_id=10 line=1931 end_line=1931 column=29 end_column=29}
+16 {file_name_id=6 function_name_id=10 line=1902 end_line=1902 column=19 end_column=19}
+17 {file_name_id=6 function_name_id=11 line=559 end_line=559 column=14 end_column=14}
+18 {file_name_id=7 function_name_id=12 line=274 end_line=274 column=17 end_column=17}
+19 {file_name_id=7 function_name_id=12 line=288 end_line=288 column=11 end_column=11}
+20 {file_name_id=6 function_name_id=11 line=560 end_line=560 column=16 end_column=16}
+21 {file_name_id=8 function_name_id=13 line=290 end_line=290 column=15 end_column=15}
+22 {file_name_id=8 function_name_id=14 line=258 end_line=258 column=11 end_column=11}
+23 {file_name_id=6 function_name_id=11 line=567 end_line=567 column=20 end_column=20}
+24 {file_name_id=6 function_name_id=11 line=568 end_line=568 column=16 end_column=16}
+25 {file_name_id=8 function_name_id=15 line=375 end_line=375 column=15 end_column=15}
+26 {file_name_id=8 function_name_id=16 line=267 end_line=267 column=11 end_column=11}
+27 {file_name_id=6 function_name_id=11 line=571 end_line=571 column=13 end_column=13}
+28 {file_name_id=6 function_name_id=11 line=574 end_line=574 column=14 end_column=14}
+29 {file_name_id=6 function_name_id=11 line=572 end_line=572 column=13 end_column=13}
+30 {file_name_id=6 function_name_id=11 line=573 end_line=573 column=13 end_column=13}
+31 {file_name_id=6 function_name_id=11 line=575 end_line=575 column=21 end_column=21}
+32 {file_name_id=6 function_name_id=11 line=575 end_line=575 column=15 end_column=15}
+33 {file_name_id=6 function_name_id=10 line=1919 end_line=1919 column=21 end_column=21}
+34 {file_name_id=6 function_name_id=10 line=1930 end_line=1930 column=18 end_column=18}
+35 {file_name_id=6 function_name_id=10 line=1932 end_line=1932 column=18 end_column=18}
+36 {file_name_id=6 function_name_id=10 line=1933 end_line=1933 column=19 end_column=19}
+37 {file_name_id=6 function_name_id=8 line=1964 end_line=1964 column=15 end_column=15}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=9 parent_frame_id=10}
+11 {file_location_id=10 parent_frame_id=9}
+12 {file_location_id=9 parent_frame_id=11}
+13 {file_location_id=11 parent_frame_id=1}
+14 {file_location_id=12 parent_frame_id=14}
+15 {file_location_id=13 parent_frame_id=14}
+16 {file_location_id=14 parent_frame_id=14}
+17 {file_location_id=15 parent_frame_id=14}
+18 {file_location_id=11 parent_frame_id=18}
+19 {file_location_id=15 parent_frame_id=19}
+20 {file_location_id=16 parent_frame_id=14}
+21 {file_location_id=17 parent_frame_id=21}
+22 {file_location_id=18 parent_frame_id=22}
+23 {file_location_id=19 parent_frame_id=22}
+24 {file_location_id=20 parent_frame_id=21}
+25 {file_location_id=21 parent_frame_id=1}
+26 {file_location_id=22 parent_frame_id=26}
+27 {file_location_id=23 parent_frame_id=21}
+28 {file_location_id=24 parent_frame_id=21}
+29 {file_location_id=25 parent_frame_id=1}
+30 {file_location_id=26 parent_frame_id=30}
+31 {file_location_id=27 parent_frame_id=21}
+32 {file_location_id=28 parent_frame_id=21}
+33 {file_location_id=29 parent_frame_id=21}
+34 {file_location_id=30 parent_frame_id=21}
+35 {file_location_id=31 parent_frame_id=21}
+36 {file_location_id=32 parent_frame_id=21}
+37 {file_location_id=33 parent_frame_id=14}
+38 {file_location_id=34 parent_frame_id=14}
+39 {file_location_id=35 parent_frame_id=14}
+40 {file_location_id=36 parent_frame_id=14}
+41 {file_location_id=37 parent_frame_id=9}
+
+
+%region_1.1 (reduce_prod.0: c128[], reduce_prod.1: c128[]) -> c128[] {
+  %reduce_prod.0 = c128[] parameter(0), metadata={op_name="reduce_prod"}
+  %reduce_prod.1 = c128[] parameter(1), metadata={op_name="reduce_prod"}
+  ROOT %reduce_prod.2 = c128[] multiply(%reduce_prod.0, %reduce_prod.1), metadata={op_name="reduce_prod" stack_frame_id=26}
+}
+
+%region_2.3 (reduce_prod.8: c128[], reduce_prod.9: c128[]) -> c128[] {
+  %reduce_prod.8 = c128[] parameter(0), metadata={op_name="reduce_prod"}
+  %reduce_prod.9 = c128[] parameter(1), metadata={op_name="reduce_prod"}
+  ROOT %reduce_prod.10 = c128[] multiply(%reduce_prod.8, %reduce_prod.9), metadata={op_name="reduce_prod" stack_frame_id=30}
+}
+
+%region_0.5_spmd (param.4: (s64[], c128[29,12,12], c128[29,6,2,1532], f64[29,1532], s32[29,32,32,32], /*index=5*/c128[32,32,32], s32[29,1532,3])) -> (s64[], c128[29,12,12], c128[29,6,2,1532], f64[29,1532], s32[29,32,32,32], /*index=5*/c128[32,32,32], s32[29,1532,3]) {
+  %param.4 = (s64[], c128[29,12,12]{2,1,0}, c128[29,6,2,1532]{3,2,1,0}, f64[29,1532]{1,0}, s32[29,32,32,32]{3,2,1,0}, /*index=5*/c128[32,32,32]{2,1,0}, s32[29,1532,3]{2,1,0}) parameter(0)
+  %get-tuple-element.19 = s64[] get-tuple-element(%param.4), index=0
+  %constant.104 = s64[] constant(1)
+  %add.11 = s64[] add(%get-tuple-element.19, %constant.104), metadata={op_name="jit(_run)/while/body/add" stack_frame_id=12}
+  %get-tuple-element.20 = c128[29,12,12]{2,1,0} get-tuple-element(%param.4), index=1
+  %get-tuple-element.32 = c128[29,6,2,1532]{3,2,1,0} get-tuple-element(%param.4), index=2
+  %constant.105 = s64[] constant(0)
+  %dynamic-slice = c128[1,6,2,1532]{3,2,1,0} dynamic-slice(%get-tuple-element.32, %get-tuple-element.19, %constant.105, %constant.105, %constant.105), dynamic_slice_sizes={1,6,2,1532}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=12}
+  %all-gather = c128[1,12,2,1532]{3,2,1,0} all-gather(%dynamic-slice), channel_id=1, replica_groups=[2,2]<=[4], dimensions={1}, use_global_device_ids=true, metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=15}
+  %get-tuple-element.34 = f64[29,1532]{1,0} get-tuple-element(%param.4), index=3
+  %dynamic_slice.8 = f64[1,1532]{1,0} dynamic-slice(%get-tuple-element.34, %get-tuple-element.19, %constant.105), dynamic_slice_sizes={1,1532}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=12}
+  %convert_element_type.8 = c128[1,1532]{1,0} convert(%dynamic_slice.8), metadata={op_name="jit(_run)/while/body/closed_call/convert_element_type" stack_frame_id=14}
+  %mul.64 = c128[1532]{0} reshape(%convert_element_type.8), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=15}
+  %mul.65 = c128[1,12,2,1532]{3,2,1,0} broadcast(%mul.64), dimensions={3}, metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=15}
+  %mul.66 = c128[1,12,2,1532]{3,2,1,0} multiply(%all-gather, %mul.65), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=15}
+  %sharding_constraint.14 = c128[1,12,2,1532]{3,2,1,0} copy(%mul.66), metadata={op_name="jit(_run)/while/body/closed_call/sharding_constraint" stack_frame_id=16}
+  %real.3 = f64[1,12,2,1532]{3,2,1,0} real(%sharding_constraint.14), metadata={op_name="jit(_run)/while/body/closed_call/real" stack_frame_id=19}
+  %imag.3 = f64[1,12,2,1532]{3,2,1,0} imag(%sharding_constraint.14), metadata={op_name="jit(_run)/while/body/closed_call/imag" stack_frame_id=19}
+  %neg.3 = f64[1,12,2,1532]{3,2,1,0} negate(%imag.3), metadata={op_name="jit(_run)/while/body/closed_call/neg" stack_frame_id=19}
+  %complex.3 = c128[1,12,2,1532]{3,2,1,0} complex(%real.3, %neg.3), metadata={op_name="jit(_run)/while/body/closed_call/complex" stack_frame_id=19}
+  %reshape.37 = c128[12,2,1532]{2,1,0} reshape(%complex.3), metadata={op_name="reshape.15"}
+  %constant.115 = c128[] constant((0, 0))
+  %pad.1 = c128[1,6,2,1533]{3,2,1,0} pad(%dynamic-slice, %constant.115), padding=0_0x0_0x0_0x0_1, metadata={op_name="jit(_run)/while/body/closed_call/concatenate" stack_frame_id=22}
+  %reshape_transpose.3 = c128[6,2,1533]{2,1,0} reshape(%pad.1), metadata={op_name="jit(_run)/while/body/closed_call/reshape;transpose"}
+  %get-tuple-element.35 = s32[29,32,32,32]{3,2,1,0} get-tuple-element(%param.4), index=4
+  %dynamic_slice.9 = s32[1,32,32,32]{3,2,1,0} dynamic-slice(%get-tuple-element.35, %get-tuple-element.19, %constant.105, %constant.105, %constant.105), dynamic_slice_sizes={1,32,32,32}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=12}
+  %broadcast_in_dim.30 = s32[1,32,32,32,1]{4,3,2,1,0} reshape(%dynamic_slice.9), metadata={op_name="jit(_run)/while/body/closed_call/jit(_take)/broadcast_in_dim"}
+  %gather.7 = c128[6,2,1,32,32,32]{5,4,3,2,1,0} gather(%reshape_transpose.3, %broadcast_in_dim.30), offset_dims={0,1}, collapsed_slice_dims={2}, start_index_map={2}, index_vector_dim=4, slice_sizes={6,2,1}, metadata={op_name="jit(_run)/while/body/closed_call/jit(_take)/gather"}
+  %transpose.3 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} reshape(%gather.7), metadata={op_name="jit(_run)/while/body/closed_call/transpose" stack_frame_id=23}
+  %shard_map.44 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%transpose.3), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=24}
+  %copy.2 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%shard_map.44), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=24}
+  %fft.8 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} fft(%copy.2), fft_type=IFFT, fft_length={32,32,32}, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/jit(fft)/fft"}
+  %constant.114 = c128[] constant((32, 0))
+  %broadcast.18 = c128[3]{0} broadcast(%constant.114), dimensions={}, metadata={op_name="broadcast.5"}
+  %shard_map.42 = c128[3]{0} copy(%broadcast.18), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=28}
+  %copy = c128[3]{0} copy(%shard_map.42), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=28}
+  %constant.146 = c128[] constant((1, 0)), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %reduce_prod.18 = c128[] reduce(%copy, %constant.146), dimensions={0}, to_apply=%region_1.1, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/reduce_prod" stack_frame_id=26}
+  %sqrt.554 = f64[] real(%reduce_prod.18), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.147 = f64[] constant(0), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.555 = pred[] compare(%sqrt.554, %constant.147), direction=GE, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.556 = f64[] abs(%sqrt.554), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.557 = f64[] imag(%reduce_prod.18), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.558 = f64[] abs(%sqrt.557), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.559 = pred[] compare(%sqrt.556, %sqrt.558), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.560 = f64[] sqrt(%sqrt.556), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.148 = f64[] constant(1.0986841134678098), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.561 = f64[] multiply(%sqrt.560, %constant.148), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.562 = f64[] maximum(%sqrt.556, %sqrt.558), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.563 = f64[] minimum(%sqrt.556, %sqrt.558), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.564 = pred[] compare(%sqrt.562, %sqrt.563), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.149 = f64[] constant(1.4142135623730951), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.565 = f64[] multiply(%sqrt.562, %constant.149), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.566 = f64[] divide(%sqrt.563, %sqrt.562), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.567 = f64[] multiply(%sqrt.566, %sqrt.566), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.150 = f64[] constant(1), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.568 = f64[] add(%sqrt.567, %constant.150), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.569 = f64[] sqrt(%sqrt.568), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.570 = pred[] compare(%sqrt.569, %constant.150), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.571 = pred[] compare(%sqrt.567, %constant.147), direction=GT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.572 = pred[] and(%sqrt.570, %sqrt.571), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.573 = f64[] multiply(%sqrt.562, %sqrt.567), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.151 = f64[] constant(0.5), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.574 = f64[] multiply(%sqrt.573, %constant.151), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.575 = f64[] add(%sqrt.562, %sqrt.574), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.576 = f64[] multiply(%sqrt.562, %sqrt.569), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.577 = f64[] select(%sqrt.572, %sqrt.575, %sqrt.576), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.578 = f64[] select(%sqrt.564, %sqrt.565, %sqrt.577), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.579 = f64[] multiply(%sqrt.578, %constant.151), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.580 = f64[] multiply(%sqrt.556, %constant.151), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.581 = f64[] add(%sqrt.579, %sqrt.580), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.582 = f64[] sqrt(%sqrt.581), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.583 = pred[] compare(%sqrt.582, %constant.147), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.152 = f64[] constant(inf), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.584 = pred[] compare(%sqrt.582, %constant.152), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.585 = pred[] or(%sqrt.583, %sqrt.584), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.586 = pred[] compare(%sqrt.556, %sqrt.558), direction=GT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.587 = pred[] compare(%sqrt.556, %sqrt.558), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.588 = f64[] divide(%sqrt.556, %sqrt.558), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.589 = f64[] divide(%sqrt.558, %sqrt.556), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.590 = f64[] select(%sqrt.587, %sqrt.588, %sqrt.589), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.591 = f64[] select(%sqrt.559, %constant.150, %sqrt.590), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.592 = f64[] abs(%sqrt.591), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.593 = f64[] maximum(%sqrt.592, %constant.150), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.594 = f64[] minimum(%sqrt.592, %constant.150), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.595 = pred[] compare(%sqrt.593, %sqrt.594), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.596 = f64[] multiply(%sqrt.593, %constant.149), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.597 = f64[] divide(%sqrt.594, %sqrt.593), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.598 = f64[] multiply(%sqrt.597, %sqrt.597), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.599 = f64[] add(%sqrt.598, %constant.150), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.600 = f64[] sqrt(%sqrt.599), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.601 = pred[] compare(%sqrt.600, %constant.150), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.602 = pred[] compare(%sqrt.598, %constant.147), direction=GT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.603 = pred[] and(%sqrt.601, %sqrt.602), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.604 = f64[] multiply(%sqrt.593, %sqrt.598), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.605 = f64[] multiply(%sqrt.604, %constant.151), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.606 = f64[] add(%sqrt.593, %sqrt.605), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.607 = f64[] multiply(%sqrt.593, %sqrt.600), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.608 = f64[] select(%sqrt.603, %sqrt.606, %sqrt.607), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.609 = f64[] select(%sqrt.595, %sqrt.596, %sqrt.608), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.610 = f64[] add(%sqrt.609, %constant.150), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.611 = f64[] sqrt(%sqrt.610), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.153 = f64[] constant(0.70710678118654746), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.612 = f64[] multiply(%sqrt.611, %constant.153), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.613 = f64[] multiply(%sqrt.560, %sqrt.612), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.614 = f64[] sqrt(%sqrt.558), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.615 = f64[] add(%sqrt.591, %sqrt.609), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.616 = f64[] sqrt(%sqrt.615), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.617 = f64[] multiply(%sqrt.616, %constant.153), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.618 = f64[] multiply(%sqrt.614, %sqrt.617), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.619 = f64[] select(%sqrt.586, %sqrt.613, %sqrt.618), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.620 = f64[] select(%sqrt.585, %sqrt.619, %sqrt.582), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.621 = f64[] select(%sqrt.559, %sqrt.561, %sqrt.620), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.154 = f64[] constant(0.45508986056222733), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.622 = f64[] multiply(%sqrt.614, %constant.154), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.623 = f64[] divide(%sqrt.560, %sqrt.614), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.624 = f64[] divide(%sqrt.614, %sqrt.560), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.625 = f64[] select(%sqrt.587, %sqrt.623, %sqrt.624), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.626 = f64[] select(%sqrt.559, %constant.150, %sqrt.625), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.627 = f64[] multiply(%sqrt.614, %sqrt.626), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.628 = f64[] multiply(%sqrt.611, %constant.149), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.629 = f64[] divide(%sqrt.627, %sqrt.628), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.630 = f64[] multiply(%sqrt.616, %constant.149), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.631 = f64[] divide(%sqrt.614, %sqrt.630), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.632 = f64[] select(%sqrt.586, %sqrt.629, %sqrt.631), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %constant.155 = f64[] constant(2), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.633 = f64[] multiply(%sqrt.582, %constant.155), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.634 = f64[] divide(%sqrt.558, %sqrt.633), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.635 = f64[] select(%sqrt.585, %sqrt.632, %sqrt.634), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.636 = f64[] select(%sqrt.559, %sqrt.622, %sqrt.635), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.637 = f64[] select(%sqrt.555, %sqrt.621, %sqrt.636), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.638 = pred[] compare(%sqrt.554, %constant.147), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.639 = pred[] compare(%sqrt.557, %constant.147), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.640 = f64[] negate(%sqrt.621), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.641 = f64[] select(%sqrt.639, %sqrt.640, %sqrt.621), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.642 = f64[] negate(%sqrt.636), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.643 = f64[] select(%sqrt.639, %sqrt.642, %sqrt.636), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.644 = f64[] select(%sqrt.638, %sqrt.641, %sqrt.643), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %sqrt.645 = c128[] complex(%sqrt.637, %sqrt.644), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=26}
+  %mul.79 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} broadcast(%sqrt.645), dimensions={}, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/mul" stack_frame_id=26}
+  %mul.80 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} multiply(%fft.8, %mul.79), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/mul" stack_frame_id=26}
+  %shard_map.45 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%mul.80), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=24}
+  %copy.3 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%shard_map.45), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=24}
+  %get-tuple-element.36 = c128[32,32,32]{2,1,0} get-tuple-element(%param.4), index=5
+  %constant.127 = c128[] constant((11.347530010246667, 0))
+  %mul.67 = c128[32,32,32]{2,1,0} broadcast(%constant.127), dimensions={}, metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=27}
+  %mul.68 = c128[32,32,32]{2,1,0} multiply(%get-tuple-element.36, %mul.67), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=27}
+  %mul.69 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} broadcast(%mul.68), dimensions={3,4,5}, metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=27}
+  %mul.70 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} multiply(%copy.3, %mul.69), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=27}
+  %shard_map.46 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%mul.70), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=28}
+  %copy.4 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%shard_map.46), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=28}
+  %fft.9 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} fft(%copy.4), fft_type=FFT, fft_length={32,32,32}, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/jit(fft)/fft"}
+  %constant.156 = c128[] constant((1, 0)), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %reduce_prod.19 = c128[] reduce(%copy, %constant.156), dimensions={0}, to_apply=%region_2.3, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/reduce_prod" stack_frame_id=30}
+  %sqrt.646 = f64[] real(%reduce_prod.19), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.157 = f64[] constant(0), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.647 = pred[] compare(%sqrt.646, %constant.157), direction=GE, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.648 = f64[] abs(%sqrt.646), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.649 = f64[] imag(%reduce_prod.19), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.650 = f64[] abs(%sqrt.649), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.651 = pred[] compare(%sqrt.648, %sqrt.650), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.652 = f64[] sqrt(%sqrt.648), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.158 = f64[] constant(1.0986841134678098), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.653 = f64[] multiply(%sqrt.652, %constant.158), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.654 = f64[] maximum(%sqrt.648, %sqrt.650), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.655 = f64[] minimum(%sqrt.648, %sqrt.650), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.656 = pred[] compare(%sqrt.654, %sqrt.655), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.159 = f64[] constant(1.4142135623730951), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.657 = f64[] multiply(%sqrt.654, %constant.159), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.658 = f64[] divide(%sqrt.655, %sqrt.654), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.659 = f64[] multiply(%sqrt.658, %sqrt.658), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.160 = f64[] constant(1), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.660 = f64[] add(%sqrt.659, %constant.160), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.661 = f64[] sqrt(%sqrt.660), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.662 = pred[] compare(%sqrt.661, %constant.160), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.663 = pred[] compare(%sqrt.659, %constant.157), direction=GT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.664 = pred[] and(%sqrt.662, %sqrt.663), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.665 = f64[] multiply(%sqrt.654, %sqrt.659), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.161 = f64[] constant(0.5), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.666 = f64[] multiply(%sqrt.665, %constant.161), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.667 = f64[] add(%sqrt.654, %sqrt.666), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.668 = f64[] multiply(%sqrt.654, %sqrt.661), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.669 = f64[] select(%sqrt.664, %sqrt.667, %sqrt.668), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.670 = f64[] select(%sqrt.656, %sqrt.657, %sqrt.669), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.671 = f64[] multiply(%sqrt.670, %constant.161), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.672 = f64[] multiply(%sqrt.648, %constant.161), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.673 = f64[] add(%sqrt.671, %sqrt.672), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.674 = f64[] sqrt(%sqrt.673), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.675 = pred[] compare(%sqrt.674, %constant.157), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.162 = f64[] constant(inf), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.676 = pred[] compare(%sqrt.674, %constant.162), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.677 = pred[] or(%sqrt.675, %sqrt.676), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.678 = pred[] compare(%sqrt.648, %sqrt.650), direction=GT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.679 = pred[] compare(%sqrt.648, %sqrt.650), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.680 = f64[] divide(%sqrt.648, %sqrt.650), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.681 = f64[] divide(%sqrt.650, %sqrt.648), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.682 = f64[] select(%sqrt.679, %sqrt.680, %sqrt.681), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.683 = f64[] select(%sqrt.651, %constant.160, %sqrt.682), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.684 = f64[] abs(%sqrt.683), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.685 = f64[] maximum(%sqrt.684, %constant.160), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.686 = f64[] minimum(%sqrt.684, %constant.160), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.687 = pred[] compare(%sqrt.685, %sqrt.686), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.688 = f64[] multiply(%sqrt.685, %constant.159), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.689 = f64[] divide(%sqrt.686, %sqrt.685), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.690 = f64[] multiply(%sqrt.689, %sqrt.689), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.691 = f64[] add(%sqrt.690, %constant.160), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.692 = f64[] sqrt(%sqrt.691), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.693 = pred[] compare(%sqrt.692, %constant.160), direction=EQ, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.694 = pred[] compare(%sqrt.690, %constant.157), direction=GT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.695 = pred[] and(%sqrt.693, %sqrt.694), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.696 = f64[] multiply(%sqrt.685, %sqrt.690), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.697 = f64[] multiply(%sqrt.696, %constant.161), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.698 = f64[] add(%sqrt.685, %sqrt.697), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.699 = f64[] multiply(%sqrt.685, %sqrt.692), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.700 = f64[] select(%sqrt.695, %sqrt.698, %sqrt.699), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.701 = f64[] select(%sqrt.687, %sqrt.688, %sqrt.700), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.702 = f64[] add(%sqrt.701, %constant.160), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.703 = f64[] sqrt(%sqrt.702), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.163 = f64[] constant(0.70710678118654746), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.704 = f64[] multiply(%sqrt.703, %constant.163), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.705 = f64[] multiply(%sqrt.652, %sqrt.704), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.706 = f64[] sqrt(%sqrt.650), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.707 = f64[] add(%sqrt.683, %sqrt.701), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.708 = f64[] sqrt(%sqrt.707), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.709 = f64[] multiply(%sqrt.708, %constant.163), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.710 = f64[] multiply(%sqrt.706, %sqrt.709), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.711 = f64[] select(%sqrt.678, %sqrt.705, %sqrt.710), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.712 = f64[] select(%sqrt.677, %sqrt.711, %sqrt.674), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.713 = f64[] select(%sqrt.651, %sqrt.653, %sqrt.712), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.164 = f64[] constant(0.45508986056222733), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.714 = f64[] multiply(%sqrt.706, %constant.164), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.715 = f64[] divide(%sqrt.652, %sqrt.706), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.716 = f64[] divide(%sqrt.706, %sqrt.652), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.717 = f64[] select(%sqrt.679, %sqrt.715, %sqrt.716), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.718 = f64[] select(%sqrt.651, %constant.160, %sqrt.717), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.719 = f64[] multiply(%sqrt.706, %sqrt.718), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.720 = f64[] multiply(%sqrt.703, %constant.159), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.721 = f64[] divide(%sqrt.719, %sqrt.720), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.722 = f64[] multiply(%sqrt.708, %constant.159), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.723 = f64[] divide(%sqrt.706, %sqrt.722), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.724 = f64[] select(%sqrt.678, %sqrt.721, %sqrt.723), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %constant.165 = f64[] constant(2), metadata={op_name="jit(_run)/while/body/closed_call/shard_map"}
+  %sqrt.725 = f64[] multiply(%sqrt.674, %constant.165), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.726 = f64[] divide(%sqrt.650, %sqrt.725), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.727 = f64[] select(%sqrt.677, %sqrt.724, %sqrt.726), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.728 = f64[] select(%sqrt.651, %sqrt.714, %sqrt.727), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.729 = f64[] select(%sqrt.647, %sqrt.713, %sqrt.728), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.730 = pred[] compare(%sqrt.646, %constant.157), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.731 = pred[] compare(%sqrt.649, %constant.157), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.732 = f64[] negate(%sqrt.713), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.733 = f64[] select(%sqrt.731, %sqrt.732, %sqrt.713), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.734 = f64[] negate(%sqrt.728), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.735 = f64[] select(%sqrt.731, %sqrt.734, %sqrt.728), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.736 = f64[] select(%sqrt.730, %sqrt.733, %sqrt.735), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %sqrt.737 = c128[] complex(%sqrt.729, %sqrt.736), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/sqrt" stack_frame_id=30}
+  %div.3 = c128[] divide(%constant.156, %sqrt.737), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/div" stack_frame_id=30}
+  %mul.81 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} broadcast(%div.3), dimensions={}, metadata={op_name="jit(_run)/while/body/closed_call/shard_map/mul" stack_frame_id=30}
+  %mul.82 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} multiply(%fft.9, %mul.81), metadata={op_name="jit(_run)/while/body/closed_call/shard_map/mul" stack_frame_id=30}
+  %shard_map.47 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%mul.82), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=28}
+  %copy.5 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} copy(%shard_map.47), metadata={op_name="jit(_run)/while/body/closed_call/shard_map" stack_frame_id=28}
+  %constant.129 = c128[] constant((1.4057959491027565, 0))
+  %mul.71 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} broadcast(%constant.129), dimensions={}, metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=28}
+  %mul.72 = c128[1,6,2,32,32,32]{5,4,3,2,1,0} multiply(%copy.5, %mul.71), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=28}
+  %get-tuple-element.37 = s32[29,1532,3]{2,1,0} get-tuple-element(%param.4), index=6
+  %dynamic_slice.10 = s32[1,1532,3]{2,1,0} dynamic-slice(%get-tuple-element.37, %get-tuple-element.19, %constant.105, %constant.105), dynamic_slice_sizes={1,1532,3}, metadata={op_name="jit(_run)/while/body/dynamic_slice" stack_frame_id=12}
+  %squeeze.16 = s32[1532,3]{1,0} reshape(%dynamic_slice.10), metadata={op_name="jit(_run)/while/body/squeeze" stack_frame_id=12}
+  %slice.9 = s32[1532,1]{1,0} slice(%squeeze.16), slice={[0:1532], [0:1]}, metadata={op_name="jit(_run)/while/body/closed_call/slice" stack_frame_id=31}
+  %squeeze.17 = s32[1532]{0} reshape(%slice.9), metadata={op_name="jit(_run)/while/body/closed_call/squeeze" stack_frame_id=31}
+  %constant.130 = s32[] constant(0)
+  %closed_call.0 = s32[1532]{0} broadcast(%constant.130), dimensions={}, metadata={op_name="jit(_run)/while/body/closed_call"}
+  %lt.11 = pred[1532]{0} compare(%squeeze.17, %closed_call.0), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/lt" stack_frame_id=32}
+  %constant.131 = s32[] constant(32)
+  %closed_call.4 = s32[1532]{0} broadcast(%constant.131), dimensions={}, metadata={op_name="jit(_run)/while/body/closed_call"}
+  %add.12 = s32[1532]{0} add(%squeeze.17, %closed_call.4), metadata={op_name="jit(_run)/while/body/closed_call/add" stack_frame_id=32}
+  %select_n.9 = s32[1532]{0} select(%lt.11, %add.12, %squeeze.17), metadata={op_name="jit(_run)/while/body/closed_call/select_n" stack_frame_id=32}
+  %broadcast_in_dim.31 = s32[1532,1]{1,0} reshape(%select_n.9), metadata={op_name="jit(_run)/while/body/closed_call/broadcast_in_dim" stack_frame_id=32}
+  %slice.10 = s32[1532,1]{1,0} slice(%squeeze.16), slice={[0:1532], [1:2]}, metadata={op_name="jit(_run)/while/body/closed_call/slice" stack_frame_id=33}
+  %squeeze.18 = s32[1532]{0} reshape(%slice.10), metadata={op_name="jit(_run)/while/body/closed_call/squeeze" stack_frame_id=33}
+  %lt.12 = pred[1532]{0} compare(%squeeze.18, %closed_call.0), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/lt" stack_frame_id=32}
+  %add.13 = s32[1532]{0} add(%squeeze.18, %closed_call.4), metadata={op_name="jit(_run)/while/body/closed_call/add" stack_frame_id=32}
+  %select_n.10 = s32[1532]{0} select(%lt.12, %add.13, %squeeze.18), metadata={op_name="jit(_run)/while/body/closed_call/select_n" stack_frame_id=32}
+  %broadcast_in_dim.32 = s32[1532,1]{1,0} reshape(%select_n.10), metadata={op_name="jit(_run)/while/body/closed_call/broadcast_in_dim" stack_frame_id=32}
+  %slice.11 = s32[1532,1]{1,0} slice(%squeeze.16), slice={[0:1532], [2:3]}, metadata={op_name="jit(_run)/while/body/closed_call/slice" stack_frame_id=34}
+  %squeeze.19 = s32[1532]{0} reshape(%slice.11), metadata={op_name="jit(_run)/while/body/closed_call/squeeze" stack_frame_id=34}
+  %lt.13 = pred[1532]{0} compare(%squeeze.19, %closed_call.0), direction=LT, metadata={op_name="jit(_run)/while/body/closed_call/lt" stack_frame_id=32}
+  %add.14 = s32[1532]{0} add(%squeeze.19, %closed_call.4), metadata={op_name="jit(_run)/while/body/closed_call/add" stack_frame_id=32}
+  %select_n.11 = s32[1532]{0} select(%lt.13, %add.14, %squeeze.19), metadata={op_name="jit(_run)/while/body/closed_call/select_n" stack_frame_id=32}
+  %broadcast_in_dim.33 = s32[1532,1]{1,0} reshape(%select_n.11), metadata={op_name="jit(_run)/while/body/closed_call/broadcast_in_dim" stack_frame_id=32}
+  %concatenate.6 = s32[1532,3]{1,0} concatenate(%broadcast_in_dim.31, %broadcast_in_dim.32, %broadcast_in_dim.33), dimensions={1}, metadata={op_name="jit(_run)/while/body/closed_call/concatenate" stack_frame_id=32}
+  %gather.8 = c128[1,6,2,1532]{3,2,1,0} gather(%mul.72, %concatenate.6), offset_dims={0,1,2}, collapsed_slice_dims={3,4,5}, start_index_map={3,4,5}, index_vector_dim=1, slice_sizes={1,6,2,1,1,1}, metadata={op_name="jit(_run)/while/body/closed_call/gather" stack_frame_id=32}
+  %collective-permute = c128[1,6,2,1532]{3,2,1,0} collective-permute(%gather.8), channel_id=4, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}, metadata={op_name="jit(_run)/while/body/closed_call/gather" stack_frame_id=32}
+  %all-gather.1 = c128[1,12,2,1532]{3,2,1,0} all-gather(%collective-permute), channel_id=5, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, metadata={op_name="jit(_run)/while/body/closed_call/gather" stack_frame_id=32}
+  %mul.74 = c128[1,12,2,1532]{3,2,1,0} broadcast(%mul.64), dimensions={3}, metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=36}
+  %mul.75 = c128[1,12,2,1532]{3,2,1,0} multiply(%all-gather.1, %mul.74), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=36}
+  %sharding_constraint.15 = c128[1,12,2,1532]{3,2,1,0} copy(%mul.75), metadata={op_name="jit(_run)/while/body/closed_call/sharding_constraint" stack_frame_id=37}
+  %reshape.45 = c128[12,2,1532]{2,1,0} reshape(%sharding_constraint.15), metadata={op_name="reshape.16"}
+  %dot.1 = c128[12,12]{1,0} dot(%reshape.37, %reshape.45), lhs_contracting_dims={2,1}, rhs_contracting_dims={2,1}, operand_precision={highest,highest}, metadata={op_name="jit(_run)/while/body/closed_call/kbsg,knsg->kbn/dot_general" stack_frame_id=38}
+  %constant.140 = c128[] constant((0.062686839218463061, 0))
+  %mul.76 = c128[12,12]{1,0} broadcast(%constant.140), dimensions={}, metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=39}
+  %mul.77 = c128[12,12]{1,0} multiply(%dot.1, %mul.76), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=39}
+  %mul.78 = c128[1,12,12]{2,1,0} reshape(%mul.77), metadata={op_name="jit(_run)/while/body/closed_call/mul" stack_frame_id=39}
+  %sharding_constraint.16 = c128[1,12,12]{2,1,0} copy(%mul.78), metadata={op_name="jit(_run)/while/body/closed_call/sharding_constraint" stack_frame_id=40}
+  %dynamic-update-slice = c128[29,12,12]{2,1,0} dynamic-update-slice(%get-tuple-element.20, %sharding_constraint.16, %get-tuple-element.19, %constant.105, %constant.105), metadata={op_name="jit(_run)/while/body/dynamic_update_slice" stack_frame_id=12}
+  ROOT %tuple.2 = (s64[], c128[29,12,12]{2,1,0}, c128[29,6,2,1532]{3,2,1,0}, f64[29,1532]{1,0}, s32[29,32,32,32]{3,2,1,0}, /*index=5*/c128[32,32,32]{2,1,0}, s32[29,1532,3]{2,1,0}) tuple(%add.11, %dynamic-update-slice, %get-tuple-element.32, %get-tuple-element.34, %get-tuple-element.35, /*index=5*/%get-tuple-element.36, %get-tuple-element.37)
+}
+
+%region_3.6_spmd (param.5: (s64[], c128[29,12,12], c128[29,6,2,1532], f64[29,1532], s32[29,32,32,32], /*index=5*/c128[32,32,32], s32[29,1532,3])) -> pred[] {
+  %param.5 = (s64[], c128[29,12,12]{2,1,0}, c128[29,6,2,1532]{3,2,1,0}, f64[29,1532]{1,0}, s32[29,32,32,32]{3,2,1,0}, /*index=5*/c128[32,32,32]{2,1,0}, s32[29,1532,3]{2,1,0}) parameter(0)
+  %get-tuple-element.38 = s64[] get-tuple-element(%param.5), index=0
+  %constant.143 = s64[] constant(29)
+  ROOT %lt.14 = pred[] compare(%get-tuple-element.38, %constant.143), direction=LT, metadata={op_name="jit(_run)/while/cond/lt" stack_frame_id=12}
+}
+
+ENTRY %main.7_spmd (param.6: c128[29,6,2,1532], param.10: s32[29,1532,3], param.7: f64[29,1532], param.8: s32[29,32,32,32], param.9: c128[32,32,32]) -> c128[29,12,12] {
+  %constant.144 = s64[] constant(0)
+  %constant.145 = c128[] constant((0, 0))
+  %broadcast_in_dim.34 = c128[29,12,12]{2,1,0} broadcast(%constant.145), dimensions={}, metadata={op_name="jit(_run)/broadcast_in_dim" stack_frame_id=10}
+  %param.6 = c128[29,6,2,1532]{3,2,1,0} parameter(0), sharding={devices=[1,4,1,1]<=[4]}, metadata={op_name="psi"}
+  %sharding_constraint.17 = c128[29,6,2,1532]{3,2,1,0} copy(%param.6), metadata={op_name="jit(_run)/sharding_constraint" stack_frame_id=11}
+  %sharding_constraint.18 = c128[29,6,2,1532]{3,2,1,0} copy(%sharding_constraint.17), metadata={op_name="jit(_run)/sharding_constraint" stack_frame_id=11}
+  %param.7 = f64[29,1532]{1,0} parameter(2), sharding={replicated}, metadata={op_name="gmask_"}
+  %param.8 = s32[29,32,32,32]{3,2,1,0} parameter(3), sharding={replicated}, metadata={op_name="bidx_"}
+  %param.9 = c128[32,32,32]{2,1,0} parameter(4), sharding={replicated}, metadata={op_name="consts_[0]"}
+  %param.10 = s32[29,1532,3]{2,1,0} parameter(1), sharding={replicated}, metadata={op_name="gvecs_"}
+  %tuple.4 = (s64[], c128[29,12,12]{2,1,0}, c128[29,6,2,1532]{3,2,1,0}, f64[29,1532]{1,0}, s32[29,32,32,32]{3,2,1,0}, /*index=5*/c128[32,32,32]{2,1,0}, s32[29,1532,3]{2,1,0}) tuple(%constant.144, %broadcast_in_dim.34, %sharding_constraint.18, %param.7, %param.8, /*index=5*/%param.9, %param.10), metadata={op_name="jit(_run)/while" stack_frame_id=10}
+  %while.8 = (s64[], c128[29,12,12]{2,1,0}, c128[29,6,2,1532]{3,2,1,0}, f64[29,1532]{1,0}, s32[29,32,32,32]{3,2,1,0}, /*index=5*/c128[32,32,32]{2,1,0}, s32[29,1532,3]{2,1,0}) while(%tuple.4), condition=%region_3.6_spmd, body=%region_0.5_spmd, metadata={op_name="jit(_run)/while" stack_frame_id=10}
+  %get-tuple-element.39 = c128[29,12,12]{2,1,0} get-tuple-element(%while.8), index=1, metadata={op_name="jit(_run)/while" stack_frame_id=10}
+  ROOT %sharding_constraint.19 = c128[29,12,12]{2,1,0} copy(%get-tuple-element.39), metadata={op_name="jit(_run)/sharding_constraint" stack_frame_id=41}
+}
+

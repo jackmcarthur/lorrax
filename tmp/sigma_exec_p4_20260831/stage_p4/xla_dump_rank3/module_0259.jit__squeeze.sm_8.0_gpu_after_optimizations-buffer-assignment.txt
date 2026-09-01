@@ -1,0 +1,36 @@
+BufferAssignment:
+allocation 0: size 16, output shape is |c128[]|, maybe-live-out:
+ value: <1 copy.1 @0> (size=16,offset=0): c128[]
+allocation 1: size 16, parameter 0, shape |c128[]| at ShapeIndex {}:
+ value: <0 a.1 @0> (size=16,offset=0): c128[]
+
+Total bytes used: 32 (32B)
+
+Used values:
+<0 a.1 @0>
+ positions:
+  a.1
+ uses:
+  copy.1, operand 0
+ from instruction: %a.1 = c128[] parameter(0), metadata={op_name="a"}
+<1 copy.1 @0>
+ positions:
+  copy.1
+ uses:
+ from instruction: %copy.1 = c128[] copy(%a.1)
+
+
+HloLiveRange (max 2):
+  InstructionSequence:
+    0:a.1
+    1:copy.1
+  BufferLiveRange:
+    a.1{}:0-2
+    copy.1{}:1-2
+  Live ranges at 1 (peak):
+    a.1{}: 16 bytes (cumulative: 16 bytes)
+    copy.1{}: 16 bytes (cumulative: 32 bytes)
+  Stack trace breakdown for peak usage: 32 bytes
+    main.1 (100.0%, total: 32 bytes, current: 0 bytes, remaining: 32 bytes)
+      ├── a (50.0%, total: 16 bytes, current: 16 bytes, remaining: 16 bytes)
+      └── copy.1 (50.0%, total: 16 bytes, current: 16 bytes, remaining: 0 bytes)

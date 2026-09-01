@@ -1,0 +1,17 @@
+Total bytes used: 24 (24B)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+       12B( 50%);        12B; allocation 0: size 12B, output shape is |s32[3]|, maybe-live-out:
+       16B( 67%);         8B; allocation 1: size 4B, parameter 0, shape |s32[1]| at ShapeIndex {}:
+       20B( 83%);         4B; allocation 2: size 4B, parameter 1, shape |s32[1]| at ShapeIndex {}:
+       24B(100%);         0B; allocation 3: size 4B, parameter 2, shape |s32[1]| at ShapeIndex {}:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 12B, output shape is |s32[3]|, maybe-live-out:
+allocation 1: size 4B, parameter 0, shape |s32[1]| at ShapeIndex {}:
+allocation 2: size 4B, parameter 1, shape |s32[1]| at ShapeIndex {}:
+allocation 3: size 4B, parameter 2, shape |s32[1]| at ShapeIndex {}:

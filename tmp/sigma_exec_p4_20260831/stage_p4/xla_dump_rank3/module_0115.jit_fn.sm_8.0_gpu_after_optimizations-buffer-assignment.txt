@@ -1,0 +1,51 @@
+BufferAssignment:
+allocation 0: size 16777216, output shape is |c128[1,16,2,32,32,32]|, maybe-live-out:
+ value: <7 loop_gather_fusion @0> (size=16777216,offset=0): c128[32768,16,2,1]{0,2,1,3}
+allocation 1: size 784384, parameter 0, shape |c128[1,16,2,1532]| at ShapeIndex {}:
+ value: <6 psi_.1 @0> (size=784384,offset=0): c128[1,16,2,1532]{3,2,1,0}
+allocation 2: size 131072, parameter 1, shape |s32[1,32,32,32]| at ShapeIndex {}:
+ value: <5 g_index_.1 @0> (size=131072,offset=0): s32[1,32,32,32]{3,2,1,0}
+
+Total bytes used: 17692672 (16.87MiB)
+
+Used values:
+<5 g_index_.1 @0>
+ positions:
+  g_index_.1
+ uses:
+  loop_gather_fusion, operand 0
+ from instruction: %g_index_.1 = s32[1,32,32,32]{3,2,1,0} parameter(1), metadata={op_name="g_index_"}
+<6 psi_.1 @0>
+ positions:
+  psi_.1
+ uses:
+  loop_gather_fusion, operand 1
+ from instruction: %psi_.1 = c128[1,16,2,1532]{3,2,1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@empty_mesh, [{}, {}, {}, {}]>"}, metadata={op_name="psi_"}
+<7 loop_gather_fusion @0>
+ positions:
+  loop_gather_fusion
+  bitcast.3.0
+ uses:
+  bitcast.3.0, operand 0
+ from instruction: %loop_gather_fusion = c128[32768,16,2,1]{0,2,1,3} fusion(%g_index_.1, %psi_.1), kind=kLoop, calls=%fused_gather, metadata={op_name="jit(fn)/jit(_take)/gather"}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:g_index_.1
+    1:psi_.1
+    2:loop_gather_fusion
+    3:bitcast.3.0
+  BufferLiveRange:
+    g_index_.1{}:0-4
+    psi_.1{}:0-4
+    loop_gather_fusion{}:2-4
+  Live ranges at 2 (peak):
+    loop_gather_fusion{}: 16777216 bytes (cumulative: 16777216 bytes)
+    psi_.1{}: 784384 bytes (cumulative: 17561600 bytes)
+    g_index_.1{}: 131072 bytes (cumulative: 17692672 bytes)
+  Stack trace breakdown for peak usage: 17 692 672 bytes
+    main.2 (100.0%, total: 17 692 672 bytes, current: 0 bytes, remaining: 17 692 672 bytes)
+      ├── jit(fn)/jit(_take)/gather (94.8%, total: 16 777 216 bytes, current: 16 777 216 bytes, remaining: 915 456 bytes)
+      ├── psi_ (4.4%, total: 784 384 bytes, current: 784 384 bytes, remaining: 131 072 bytes)
+      └── g_index_ (0.7%, total: 131 072 bytes, current: 131 072 bytes, remaining: 0 bytes)

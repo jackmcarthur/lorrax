@@ -1,0 +1,8 @@
+HloModule jit__identity_fn, entry_computation_layout={(c128[512,12,12]{2,1,0})->c128[512,24,24]{2,1,0}}, num_partitions=4
+
+ENTRY %main.0_spmd (param: c128[512,12,12]) -> c128[512,24,24] {
+  %param = c128[512,12,12]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="x"}
+  %all-gather = c128[512,12,24]{2,1,0} all-gather(%param), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true
+  ROOT %all-gather.1 = c128[512,24,24]{2,1,0} all-gather(%all-gather), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true
+}
+

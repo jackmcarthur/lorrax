@@ -1,0 +1,60 @@
+BufferAssignment:
+allocation 0: size 6291456, output shape is |s32[48,32768]|, maybe-live-out:
+ value: <7 wrapped_select @0> (size=6291456,offset=0): s32[48,32768]{1,0}
+allocation 1: size 6291456, parameter 2, shape |s32[48,32768]| at ShapeIndex {}:
+ value: <5 args_2_.1 @0> (size=6291456,offset=0): s32[48,32768]{1,0}
+allocation 2: size 6291456, parameter 1, shape |s32[48,32768]| at ShapeIndex {}:
+ value: <6 args_1_.1 @0> (size=6291456,offset=0): s32[48,32768]{1,0}
+allocation 3: size 1572864, parameter 0, shape |pred[48,32768]| at ShapeIndex {}:
+ value: <4 args_0_.1 @0> (size=1572864,offset=0): pred[48,32768]{1,0}
+
+Total bytes used: 20447232 (19.50MiB)
+
+Used values:
+<4 args_0_.1 @0>
+ positions:
+  args_0_.1
+ uses:
+  wrapped_select, operand 0
+ from instruction: %args_0_.1 = pred[48,32768]{1,0} parameter(0), metadata={op_name="args[0]"}
+<5 args_2_.1 @0>
+ positions:
+  args_2_.1
+ uses:
+  wrapped_select, operand 1
+ from instruction: %args_2_.1 = s32[48,32768]{1,0} parameter(2), metadata={op_name="args[2]"}
+<6 args_1_.1 @0>
+ positions:
+  args_1_.1
+ uses:
+  wrapped_select, operand 2
+ from instruction: %args_1_.1 = s32[48,32768]{1,0} parameter(1), metadata={op_name="args[1]"}
+<7 wrapped_select @0>
+ positions:
+  wrapped_select
+ uses:
+ from instruction: %wrapped_select = s32[48,32768]{1,0} fusion(%args_0_.1, %args_2_.1, %args_1_.1), kind=kLoop, calls=%wrapped_select_computation, metadata={op_name="jit(select_n)/select_n" stack_frame_id=9}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:args_1_.1
+    1:args_2_.1
+    2:args_0_.1
+    3:wrapped_select
+  BufferLiveRange:
+    args_0_.1{}:0-4
+    args_2_.1{}:0-4
+    args_1_.1{}:0-4
+    wrapped_select{}:3-4
+  Live ranges at 3 (peak):
+    args_1_.1{}: 6291456 bytes (cumulative: 6291456 bytes)
+    args_2_.1{}: 6291456 bytes (cumulative: 12582912 bytes)
+    wrapped_select{}: 6291456 bytes (cumulative: 18874368 bytes)
+    args_0_.1{}: 1572864 bytes (cumulative: 20447232 bytes)
+  Stack trace breakdown for peak usage: 20 447 232 bytes
+    main.1 (100.0%, total: 20 447 232 bytes, current: 0 bytes, remaining: 20 447 232 bytes)
+      ├── args[1] (30.8%, total: 6 291 456 bytes, current: 6 291 456 bytes, remaining: 14 155 776 bytes)
+      ├── args[2] (30.8%, total: 6 291 456 bytes, current: 6 291 456 bytes, remaining: 7 864 320 bytes)
+      ├── jit(select_n)/select_n (30.8%, total: 6 291 456 bytes, current: 6 291 456 bytes, remaining: 1 572 864 bytes)
+      └── args[0] (7.7%, total: 1 572 864 bytes, current: 1 572 864 bytes, remaining: 0 bytes)

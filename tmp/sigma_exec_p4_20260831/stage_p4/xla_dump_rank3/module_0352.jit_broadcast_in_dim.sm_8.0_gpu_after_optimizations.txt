@@ -1,0 +1,51 @@
+HloModule jit_broadcast_in_dim, is_scheduled=true, entry_computation_layout={(c128[512,310,310]{2,1,0})->c128[1,512,310,310]{3,2,1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="58bf36ebf2a99cf018e94748a56c99b9"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/mpa_store.py"
+
+FunctionNames
+1 "main"
+2 "compute_sigma_xc"
+3 "compute_sigma_c_mpa_omega_grid"
+4 "integrate_sigma_store"
+5 "integrate_sigma_store.<locals>.run"
+6 "_integrate_sigma_batches"
+7 "integrate_sigma_store.<locals>.batches"
+8 "PoleReader.read"
+9 "_finish_pole_read"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=48 end_line=48 column=13 end_column=13}
+2 {file_name_id=2 function_name_id=1 line=770 end_line=770 column=18 end_column=18}
+3 {file_name_id=3 function_name_id=2 line=1066 end_line=1066 column=15 end_column=15}
+4 {file_name_id=4 function_name_id=3 line=541 end_line=541 column=15 end_column=15}
+5 {file_name_id=4 function_name_id=4 line=300 end_line=300 column=15 end_column=15}
+6 {file_name_id=4 function_name_id=5 line=295 end_line=295 column=15 end_column=15}
+7 {file_name_id=4 function_name_id=6 line=173 end_line=173 column=24 end_column=24}
+8 {file_name_id=4 function_name_id=7 line=287 end_line=287 column=23 end_column=23}
+9 {file_name_id=5 function_name_id=8 line=3673 end_line=3673 column=15 end_column=15}
+10 {file_name_id=5 function_name_id=9 line=3542 end_line=3542 column=12 end_column=12}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+
+
+ENTRY %main.0_spmd (param: c128[512,310,310]) -> c128[1,512,310,310] {
+  %param = c128[512,310,310]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="args[0]"}
+  %bitcast.1 = c128[1,512,310,310]{3,2,1,0} bitcast(%param), metadata={op_name="args[0]"}
+  ROOT %copy.1 = c128[1,512,310,310]{3,2,1,0} copy(%bitcast.1)
+}
+

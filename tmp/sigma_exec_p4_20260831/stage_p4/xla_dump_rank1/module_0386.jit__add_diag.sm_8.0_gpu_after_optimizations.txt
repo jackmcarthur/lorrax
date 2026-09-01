@@ -1,0 +1,247 @@
+HloModule jit__add_diag, is_scheduled=true, entry_computation_layout={(c128[21,512,12,12]{3,2,1,0}, c128[21,512,24]{2,1,0})->c128[21,512,12,12]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="f3f026b7c55a4054e97febb4f7fb8882"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/dynamic_sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/qsgw_utils.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "add_head_sigma_diag"
+6 "add_band_diag_sharded"
+7 "add_band_diag_sharded.<locals>._add_diag"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=770 column=18 end_column=18}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1110 column=15 end_column=15}
+5 {file_name_id=3 function_name_id=4 line=400 end_line=400 column=24 end_column=24}
+6 {file_name_id=4 function_name_id=5 line=82 end_line=82 column=15 end_column=15}
+7 {file_name_id=5 function_name_id=6 line=470 end_line=470 column=11 end_column=11}
+8 {file_name_id=5 function_name_id=7 line=462 end_line=462 column=19 end_column=19}
+9 {file_name_id=5 function_name_id=7 line=452 end_line=452 column=16 end_column=16}
+10 {file_name_id=5 function_name_id=7 line=447 end_line=447 column=17 end_column=17}
+11 {file_name_id=5 function_name_id=7 line=453 end_line=453 column=20 end_column=20}
+12 {file_name_id=5 function_name_id=7 line=453 end_line=453 column=16 end_column=16}
+13 {file_name_id=5 function_name_id=7 line=448 end_line=448 column=17 end_column=17}
+14 {file_name_id=5 function_name_id=7 line=454 end_line=454 column=20 end_column=20}
+15 {file_name_id=5 function_name_id=7 line=454 end_line=454 column=16 end_column=16}
+16 {file_name_id=5 function_name_id=7 line=455 end_line=455 column=19 end_column=19}
+17 {file_name_id=5 function_name_id=7 line=455 end_line=455 column=30 end_column=30}
+18 {file_name_id=5 function_name_id=7 line=455 end_line=455 column=18 end_column=18}
+19 {file_name_id=5 function_name_id=7 line=455 end_line=455 column=41 end_column=41}
+20 {file_name_id=5 function_name_id=7 line=455 end_line=455 column=52 end_column=52}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=1}
+9 {file_location_id=9 parent_frame_id=1}
+10 {file_location_id=10 parent_frame_id=1}
+11 {file_location_id=11 parent_frame_id=1}
+12 {file_location_id=12 parent_frame_id=1}
+13 {file_location_id=13 parent_frame_id=1}
+14 {file_location_id=14 parent_frame_id=1}
+15 {file_location_id=15 parent_frame_id=1}
+16 {file_location_id=16 parent_frame_id=1}
+17 {file_location_id=17 parent_frame_id=1}
+18 {file_location_id=18 parent_frame_id=1}
+19 {file_location_id=19 parent_frame_id=1}
+20 {file_location_id=20 parent_frame_id=1}
+
+
+%fused_transpose (param_0.25: c128[21,512,24], param_1.103: pred[24]) -> (f64[24,1,1,21,512], f64[24,1,1,21,512]) {
+  %param_1.103 = pred[24]{0} parameter(1)
+  %broadcast_in_dim.21.2 = pred[21,512,24]{2,1,0} broadcast(%param_1.103), dimensions={2}, metadata={op_name="jit(_add_diag)/shard_map/jit(_where)/broadcast_in_dim"}
+  %param_0.25 = c128[21,512,24]{2,1,0} parameter(0)
+  %constant_28_2 = c128[] constant((0, 0)), metadata={op_name="jit(_add_diag)/shard_map"}
+  %broadcast_in_dim.22.9 = c128[21,512,24]{2,1,0} broadcast(%constant_28_2), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/jit(_where)/broadcast_in_dim"}
+  %select_n.12.9 = c128[21,512,24]{2,1,0} select(%broadcast_in_dim.21.2, %param_0.25, %broadcast_in_dim.22.9), metadata={op_name="jit(_add_diag)/shard_map/jit(_where)/select_n"}
+  %scatter-add.34.3 = f64[21,512,24]{2,1,0} real(%select_n.12.9), metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  %bitcast.6.1 = f64[1,1,21,512,24]{4,3,2,1,0} bitcast(%scatter-add.34.3)
+  %transpose.14.1 = f64[24,1,1,21,512]{4,3,2,1,0} transpose(%bitcast.6.1), dimensions={4,0,1,2,3}
+  %scatter-add.37.3.clone.1 = f64[21,512,24]{2,1,0} imag(%select_n.12.9), metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  %bitcast.11.1.clone.1 = f64[1,1,21,512,24]{4,3,2,1,0} bitcast(%scatter-add.37.3.clone.1)
+  %transpose.18.1.clone.1 = f64[24,1,1,21,512]{4,3,2,1,0} transpose(%bitcast.11.1.clone.1), dimensions={4,0,1,2,3}
+  ROOT %tuple = (f64[24,1,1,21,512]{4,3,2,1,0}, f64[24,1,1,21,512]{4,3,2,1,0}) tuple(%transpose.14.1, %transpose.18.1.clone.1)
+}
+
+%fused_transpose.1 (param_0.6: f64[21,512,12,12], param_1.4: f64[12,12,21,512]) -> c128[21,512,12,12] {
+  %param_0.6 = f64[21,512,12,12]{3,2,1,0} parameter(0)
+  %param_1.4 = f64[12,12,21,512]{3,2,1,0} parameter(1)
+  %transpose.20.1 = f64[21,512,12,12]{3,2,1,0} transpose(%param_1.4), dimensions={2,3,0,1}, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  ROOT %complex.2 = c128[21,512,12,12]{3,2,1,0} complex(%param_0.6, %transpose.20.1), metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+}
+
+%fused_transpose.2 (param_0.10: c128[21,512,12,12]) -> (f64[12,12,21,512], f64[12,12,21,512]) {
+  %param_0.10 = c128[21,512,12,12]{3,2,1,0} parameter(0)
+  %scatter-add.33.1 = f64[21,512,12,12]{3,2,1,0} real(%param_0.10), metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  %transpose.15.1 = f64[12,12,21,512]{3,2,1,0} transpose(%scatter-add.33.1), dimensions={2,3,0,1}, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  %scatter-add.36.1.clone.1 = f64[21,512,12,12]{3,2,1,0} imag(%param_0.10), metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  %transpose.19.1.clone.1 = f64[12,12,21,512]{3,2,1,0} transpose(%scatter-add.36.1.clone.1), dimensions={2,3,0,1}, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  ROOT %tuple.2 = (f64[12,12,21,512]{3,2,1,0}, f64[12,12,21,512]{3,2,1,0}) tuple(%transpose.15.1, %transpose.19.1.clone.1)
+}
+
+%region_0.1 (scatter-add.0: f64[], scatter-add.1: f64[]) -> f64[] {
+  %scatter-add.1 = f64[] parameter(1), metadata={op_name="scatter-add"}
+  %scatter-add.0 = f64[] parameter(0), metadata={op_name="scatter-add"}
+  ROOT %scatter-add.2.0 = f64[] add(%scatter-add.0, %scatter-add.1), metadata={op_name="scatter-add" stack_frame_id=8}
+}
+
+%fused_scatter (param_0.26: f64[12,12,21,512], param_1.18: f64[24,1,1,21,512], param_2.88: u32[]) -> f64[12,12,21,512] {
+  %param_0.26 = f64[12,12,21,512]{3,2,1,0} parameter(0)
+  %constant_23_3 = s64[] constant(0), metadata={op_name="jit(_add_diag)/shard_map"}
+  %max.10.2 = s64[24]{0} broadcast(%constant_23_3), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/max"}
+  %iota.5.3 = s64[24]{0} iota(), iota_dimension=0, metadata={op_name="jit(_add_diag)/shard_map/iota" stack_frame_id=9}
+  %param_2.88 = u32[] parameter(2)
+  %constant_24_2 = u32[] constant(1), metadata={op_name="jit(_add_diag)/shard_map"}
+  %axis_index.23.7 = u32[] shift-right-logical(%param_2.88, %constant_24_2), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %axis_index.24.7 = u32[] and(%axis_index.23.7, %constant_24_2), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %axis_index.25.7 = s32[] convert(%axis_index.24.7), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %constant_25_1 = s32[] constant(12), metadata={op_name="jit(_add_diag)/shard_map"}
+  %mul.6.7 = s32[] multiply(%axis_index.25.7, %constant_25_1), metadata={op_name="jit(_add_diag)/shard_map/mul" stack_frame_id=11}
+  %convert_element_type.12.2 = s64[] convert(%mul.6.7), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=12}
+  %sub.12.3 = s64[24]{0} broadcast(%convert_element_type.12.2), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=12}
+  %sub.13.3 = s64[24]{0} subtract(%iota.5.3, %sub.12.3), metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=12}
+  %constant_26_2 = s64[] constant(11), metadata={op_name="jit(_add_diag)/shard_map"}
+  %min.14.1 = s64[24]{0} broadcast(%constant_26_2), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/min"}
+  %min.15.7 = s64[24]{0} clamp(%max.10.2, %sub.13.3, %min.14.1), metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/min"}
+  %lt.12.7 = pred[24]{0} compare(%min.15.7, %max.10.2), direction=LT, metadata={op_name="jit(_add_diag)/shard_map/lt" stack_frame_id=8}
+  %constant_27_2 = s64[] constant(12), metadata={op_name="jit(_add_diag)/shard_map"}
+  %broadcast.5.1 = s64[24]{0} broadcast(%constant_27_2), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/broadcast.2"}
+  %add.6.7 = s64[24]{0} add(%min.15.7, %broadcast.5.1), metadata={op_name="jit(_add_diag)/shard_map/add" stack_frame_id=8}
+  %select_n.10.7 = s64[24]{0} select(%lt.12.7, %add.6.7, %min.15.7), metadata={op_name="jit(_add_diag)/shard_map/select_n" stack_frame_id=8}
+  %convert_element_type.13.5 = s32[24]{0} convert(%select_n.10.7), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %bitcast.22 = s32[24,1]{1,0} bitcast(%convert_element_type.13.5), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %iota.6.3 = s64[24]{0} iota(), iota_dimension=0, metadata={op_name="jit(_add_diag)/shard_map/iota" stack_frame_id=9}
+  %axis_index.26.7 = u32[] and(%param_2.88, %constant_24_2), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=13}
+  %axis_index.27.7 = s32[] convert(%axis_index.26.7), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=13}
+  %mul.7.7 = s32[] multiply(%axis_index.27.7, %constant_25_1), metadata={op_name="jit(_add_diag)/shard_map/mul" stack_frame_id=14}
+  %convert_element_type.14.2 = s64[] convert(%mul.7.7), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=15}
+  %sub.14.3 = s64[24]{0} broadcast(%convert_element_type.14.2), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=15}
+  %sub.15.3 = s64[24]{0} subtract(%iota.6.3, %sub.14.3), metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=15}
+  %min.16.7 = s64[24]{0} clamp(%max.10.2, %sub.15.3, %min.14.1), metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/min"}
+  %lt.13.7 = pred[24]{0} compare(%min.16.7, %max.10.2), direction=LT, metadata={op_name="jit(_add_diag)/shard_map/lt" stack_frame_id=8}
+  %add.7.7 = s64[24]{0} add(%min.16.7, %broadcast.5.1), metadata={op_name="jit(_add_diag)/shard_map/add" stack_frame_id=8}
+  %select_n.11.7 = s64[24]{0} select(%lt.13.7, %add.7.7, %min.16.7), metadata={op_name="jit(_add_diag)/shard_map/select_n" stack_frame_id=8}
+  %convert_element_type.15.5 = s32[24]{0} convert(%select_n.11.7), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %bitcast.1.3 = s32[24,1]{1,0} bitcast(%convert_element_type.15.5), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %concatenate.3.3 = s32[24,2]{1,0} concatenate(%bitcast.22, %bitcast.1.3), dimensions={1}, metadata={op_name="jit(_add_diag)/shard_map/concatenate" stack_frame_id=8}
+  %param_1.18 = f64[24,1,1,21,512]{4,3,2,1,0} parameter(1)
+  ROOT %scatter.4.1 = f64[12,12,21,512]{3,2,1,0} scatter(%param_0.26, %concatenate.3.3, %param_1.18), update_window_dims={1,2,3,4}, inserted_window_dims={}, scatter_dims_to_operand_dims={0,1}, index_vector_dim=1, to_apply=%region_0.1, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+}
+
+%region_0.1.clone (scatter-add.41: f64[], scatter-add.42: f64[]) -> f64[] {
+  %scatter-add.42 = f64[] parameter(1), metadata={op_name="scatter-add"}
+  %scatter-add.41 = f64[] parameter(0), metadata={op_name="scatter-add"}
+  ROOT %scatter-add.43.0 = f64[] add(%scatter-add.41, %scatter-add.42), metadata={op_name="scatter-add" stack_frame_id=8}
+}
+
+%fused_scatter.1 (param_0.28: f64[12,12,21,512], param_1.21: f64[24,1,1,21,512], param_2.89: u32[]) -> f64[12,12,21,512] {
+  %param_0.28 = f64[12,12,21,512]{3,2,1,0} parameter(0)
+  %constant_23_1 = s64[] constant(0), metadata={op_name="jit(_add_diag)/shard_map"}
+  %max.10.4 = s64[24]{0} broadcast(%constant_23_1), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/max"}
+  %iota.5.9 = s64[24]{0} iota(), iota_dimension=0, metadata={op_name="jit(_add_diag)/shard_map/iota" stack_frame_id=9}
+  %param_2.89 = u32[] parameter(2)
+  %constant_24_1 = u32[] constant(1), metadata={op_name="jit(_add_diag)/shard_map"}
+  %axis_index.23.5 = u32[] shift-right-logical(%param_2.89, %constant_24_1), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %axis_index.24.5 = u32[] and(%axis_index.23.5, %constant_24_1), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %axis_index.25.5 = s32[] convert(%axis_index.24.5), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %constant_25_2 = s32[] constant(12), metadata={op_name="jit(_add_diag)/shard_map"}
+  %mul.6.5 = s32[] multiply(%axis_index.25.5, %constant_25_2), metadata={op_name="jit(_add_diag)/shard_map/mul" stack_frame_id=11}
+  %convert_element_type.12.1 = s64[] convert(%mul.6.5), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=12}
+  %sub.12.9 = s64[24]{0} broadcast(%convert_element_type.12.1), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=12}
+  %sub.13.9 = s64[24]{0} subtract(%iota.5.9, %sub.12.9), metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=12}
+  %constant_26_1 = s64[] constant(11), metadata={op_name="jit(_add_diag)/shard_map"}
+  %min.14.2 = s64[24]{0} broadcast(%constant_26_1), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/min"}
+  %min.15.5 = s64[24]{0} clamp(%max.10.4, %sub.13.9, %min.14.2), metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/min"}
+  %lt.12.5 = pred[24]{0} compare(%min.15.5, %max.10.4), direction=LT, metadata={op_name="jit(_add_diag)/shard_map/lt" stack_frame_id=8}
+  %constant_27_3 = s64[] constant(12), metadata={op_name="jit(_add_diag)/shard_map"}
+  %broadcast.5.2 = s64[24]{0} broadcast(%constant_27_3), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/broadcast.2"}
+  %add.6.5 = s64[24]{0} add(%min.15.5, %broadcast.5.2), metadata={op_name="jit(_add_diag)/shard_map/add" stack_frame_id=8}
+  %select_n.10.5 = s64[24]{0} select(%lt.12.5, %add.6.5, %min.15.5), metadata={op_name="jit(_add_diag)/shard_map/select_n" stack_frame_id=8}
+  %convert_element_type.13.3 = s32[24]{0} convert(%select_n.10.5), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %bitcast.24 = s32[24,1]{1,0} bitcast(%convert_element_type.13.3), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %iota.6.9 = s64[24]{0} iota(), iota_dimension=0, metadata={op_name="jit(_add_diag)/shard_map/iota" stack_frame_id=9}
+  %axis_index.26.5 = u32[] and(%param_2.89, %constant_24_1), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=13}
+  %axis_index.27.5 = s32[] convert(%axis_index.26.5), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=13}
+  %mul.7.5 = s32[] multiply(%axis_index.27.5, %constant_25_2), metadata={op_name="jit(_add_diag)/shard_map/mul" stack_frame_id=14}
+  %convert_element_type.14.1 = s64[] convert(%mul.7.5), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=15}
+  %sub.14.9 = s64[24]{0} broadcast(%convert_element_type.14.1), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=15}
+  %sub.15.9 = s64[24]{0} subtract(%iota.6.9, %sub.14.9), metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=15}
+  %min.16.5 = s64[24]{0} clamp(%max.10.4, %sub.15.9, %min.14.2), metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/min"}
+  %lt.13.5 = pred[24]{0} compare(%min.16.5, %max.10.4), direction=LT, metadata={op_name="jit(_add_diag)/shard_map/lt" stack_frame_id=8}
+  %add.7.5 = s64[24]{0} add(%min.16.5, %broadcast.5.2), metadata={op_name="jit(_add_diag)/shard_map/add" stack_frame_id=8}
+  %select_n.11.5 = s64[24]{0} select(%lt.13.5, %add.7.5, %min.16.5), metadata={op_name="jit(_add_diag)/shard_map/select_n" stack_frame_id=8}
+  %convert_element_type.15.3 = s32[24]{0} convert(%select_n.11.5), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %bitcast.1.5 = s32[24,1]{1,0} bitcast(%convert_element_type.15.3), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=8}
+  %concatenate.3.5 = s32[24,2]{1,0} concatenate(%bitcast.24, %bitcast.1.5), dimensions={1}, metadata={op_name="jit(_add_diag)/shard_map/concatenate" stack_frame_id=8}
+  %param_1.21 = f64[24,1,1,21,512]{4,3,2,1,0} parameter(1)
+  ROOT %scatter.5.1 = f64[12,12,21,512]{3,2,1,0} scatter(%param_0.28, %concatenate.3.5, %param_1.21), update_window_dims={1,2,3,4}, inserted_window_dims={}, scatter_dims_to_operand_dims={0,1}, index_vector_dim=1, to_apply=%region_0.1.clone, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+}
+
+%fused_and (param_0.98: u32[]) -> pred[24] {
+  %iota.5.15 = s64[24]{0} iota(), iota_dimension=0, metadata={op_name="jit(_add_diag)/shard_map/iota" stack_frame_id=9}
+  %param_0.98 = u32[] parameter(0)
+  %constant_24_3 = u32[] constant(1), metadata={op_name="jit(_add_diag)/shard_map"}
+  %axis_index.23.3 = u32[] shift-right-logical(%param_0.98, %constant_24_3), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %axis_index.24.3 = u32[] and(%axis_index.23.3, %constant_24_3), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %axis_index.25.3 = s32[] convert(%axis_index.24.3), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %constant_25_3 = s32[] constant(12), metadata={op_name="jit(_add_diag)/shard_map"}
+  %mul.6.3 = s32[] multiply(%axis_index.25.3, %constant_25_3), metadata={op_name="jit(_add_diag)/shard_map/mul" stack_frame_id=11}
+  %convert_element_type.12.10 = s64[] convert(%mul.6.3), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=12}
+  %sub.12.15 = s64[24]{0} broadcast(%convert_element_type.12.10), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=12}
+  %sub.13.15 = s64[24]{0} subtract(%iota.5.15, %sub.12.15), metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=12}
+  %constant_23_2 = s64[] constant(0), metadata={op_name="jit(_add_diag)/shard_map"}
+  %max.10.10 = s64[24]{0} broadcast(%constant_23_2), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/jit(clip)/max"}
+  %ge.6.7 = pred[24]{0} compare(%sub.13.15, %max.10.10), direction=GE, metadata={op_name="jit(_add_diag)/shard_map/ge" stack_frame_id=16}
+  %constant_27_1 = s64[] constant(12), metadata={op_name="jit(_add_diag)/shard_map"}
+  %broadcast.5.8 = s64[24]{0} broadcast(%constant_27_1), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/broadcast.2"}
+  %lt.14.3 = pred[24]{0} compare(%sub.13.15, %broadcast.5.8), direction=LT, metadata={op_name="jit(_add_diag)/shard_map/lt" stack_frame_id=17}
+  %and.11.5 = pred[24]{0} and(%ge.6.7, %lt.14.3), metadata={op_name="jit(_add_diag)/shard_map/and" stack_frame_id=18}
+  %iota.6.13 = s64[24]{0} iota(), iota_dimension=0, metadata={op_name="jit(_add_diag)/shard_map/iota" stack_frame_id=9}
+  %axis_index.26.3 = u32[] and(%param_0.98, %constant_24_3), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=13}
+  %axis_index.27.3 = s32[] convert(%axis_index.26.3), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=13}
+  %mul.7.3 = s32[] multiply(%axis_index.27.3, %constant_25_3), metadata={op_name="jit(_add_diag)/shard_map/mul" stack_frame_id=14}
+  %convert_element_type.14.8 = s64[] convert(%mul.7.3), metadata={op_name="jit(_add_diag)/shard_map/convert_element_type" stack_frame_id=15}
+  %sub.14.13 = s64[24]{0} broadcast(%convert_element_type.14.8), dimensions={}, metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=15}
+  %sub.15.13 = s64[24]{0} subtract(%iota.6.13, %sub.14.13), metadata={op_name="jit(_add_diag)/shard_map/sub" stack_frame_id=15}
+  %ge.7.3 = pred[24]{0} compare(%sub.15.13, %max.10.10), direction=GE, metadata={op_name="jit(_add_diag)/shard_map/ge" stack_frame_id=19}
+  %and.12.3 = pred[24]{0} and(%and.11.5, %ge.7.3), metadata={op_name="jit(_add_diag)/shard_map/and" stack_frame_id=18}
+  %lt.15.3 = pred[24]{0} compare(%sub.15.13, %broadcast.5.8), direction=LT, metadata={op_name="jit(_add_diag)/shard_map/lt" stack_frame_id=20}
+  ROOT %and.13.1 = pred[24]{0} and(%and.12.3, %lt.15.3), metadata={op_name="jit(_add_diag)/shard_map/and" stack_frame_id=18}
+}
+
+%wrapped_transpose_computation (param_0.99: f64[12,12,21,512]) -> f64[21,512,12,12] {
+  %param_0.99 = f64[12,12,21,512]{3,2,1,0} parameter(0)
+  ROOT %transpose.16.1 = f64[21,512,12,12]{3,2,1,0} transpose(%param_0.99), dimensions={2,3,0,1}, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+}
+
+ENTRY %main.4_spmd (param.2: c128[21,512,12,12], param.3: c128[21,512,24]) -> c128[21,512,12,12] {
+  %axis_index.22.0 = u32[] partition-id(), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+  %param.3 = c128[21,512,24]{2,1,0} parameter(1), sharding={replicated}, metadata={op_name="diag"}
+  %param.2 = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="tile"}
+  %loop_and_fusion = pred[24]{0} fusion(%axis_index.22.0), kind=kLoop, calls=%fused_and, metadata={op_name="jit(_add_diag)/shard_map/and" stack_frame_id=18}
+  %input_transpose_fusion = (f64[24,1,1,21,512]{4,3,2,1,0}, f64[24,1,1,21,512]{4,3,2,1,0}) fusion(%param.3, %loop_and_fusion), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  %get-tuple-element.2 = f64[24,1,1,21,512]{4,3,2,1,0} get-tuple-element(%input_transpose_fusion), index=1
+  %get-tuple-element = f64[24,1,1,21,512]{4,3,2,1,0} get-tuple-element(%input_transpose_fusion), index=0
+  %input_transpose_fusion.2 = (f64[12,12,21,512]{3,2,1,0}, f64[12,12,21,512]{3,2,1,0}) fusion(%param.2), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  %get-tuple-element.5 = f64[12,12,21,512]{3,2,1,0} get-tuple-element(%input_transpose_fusion.2), index=1, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  %get-tuple-element.4 = f64[12,12,21,512]{3,2,1,0} get-tuple-element(%input_transpose_fusion.2), index=0, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}
+  %input_scatter_fusion = f64[12,12,21,512]{3,2,1,0} fusion(%get-tuple-element.4, %get-tuple-element, %axis_index.22.0), kind=kInput, calls=%fused_scatter, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" deduplicated_name="input_scatter_fusion" stack_frame_id=8}
+  %input_scatter_fusion.1 = f64[12,12,21,512]{3,2,1,0} fusion(%get-tuple-element.5, %get-tuple-element.2, %axis_index.22.0), kind=kInput, calls=%fused_scatter.1, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" deduplicated_name="input_scatter_fusion" stack_frame_id=8}
+  %wrapped_transpose = f64[21,512,12,12]{3,2,1,0} fusion(%input_scatter_fusion), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  ROOT %input_transpose_fusion.1 = c128[21,512,12,12]{3,2,1,0} fusion(%wrapped_transpose, %input_scatter_fusion.1), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+}
+

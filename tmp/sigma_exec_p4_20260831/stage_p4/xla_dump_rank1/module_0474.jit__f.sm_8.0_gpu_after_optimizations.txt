@@ -1,0 +1,57 @@
+HloModule jit__f, is_scheduled=true, entry_computation_layout={(c128[29,24,24]{2,1,0})->c128[512,24,24]{2,1,0}}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="8e415a9c84d5ffa1d667a2cc1372a653"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/kin_ion.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/services/symmetry_maps/src/symmetry_maps/maps.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "load_kin_ion_submatrix"
+4 "_load_matrix_submatrix"
+5 "_unfold_if_ibz"
+6 "broadcast_ibz_to_full_bz"
+7 "star_broadcast"
+8 "_broadcast_rows"
+9 "_broadcast_rows.<locals>._build.<locals>._f"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=853 end_line=853 column=11 end_column=11}
+4 {file_name_id=3 function_name_id=3 line=484 end_line=484 column=8 end_column=8}
+5 {file_name_id=3 function_name_id=4 line=361 end_line=361 column=8 end_column=8}
+6 {file_name_id=3 function_name_id=5 line=265 end_line=265 column=8 end_column=8}
+7 {file_name_id=3 function_name_id=6 line=158 end_line=158 column=8 end_column=8}
+8 {file_name_id=4 function_name_id=7 line=3309 end_line=3309 column=11 end_column=11}
+9 {file_name_id=4 function_name_id=8 line=3117 end_line=3117 column=11 end_column=11}
+10 {file_name_id=4 function_name_id=9 line=3111 end_line=3111 column=18 end_column=18}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+
+
+%wrapped_gather_computation (param_0: c128[29,24,24], param_1: s32[512,1]) -> c128[512,1,24,24] {
+  %param_0 = c128[29,24,24]{2,1,0} parameter(0)
+  %param_1 = s32[512,1]{1,0} parameter(1)
+  ROOT %gather.4.1 = c128[512,1,24,24]{3,2,0,1} gather(%param_0, %param_1), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,24,24}, metadata={op_name="jit(_f)/gather" stack_frame_id=10}
+}
+
+ENTRY %main.0_spmd (param: c128[29,24,24]) -> c128[512,24,24] {
+  %constant_2_0 = s32[512,1]{1,0} constant({...})
+  %param = c128[29,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="x"}
+  %wrapped_gather = c128[512,1,24,24]{3,2,0,1} fusion(%param, %constant_2_0), kind=kLoop, calls=%wrapped_gather_computation, metadata={op_name="jit(_f)/gather" stack_frame_id=10}
+  ROOT %bitcast.10 = c128[512,24,24]{2,1,0} bitcast(%wrapped_gather), metadata={op_name="jit(_f)/gather" stack_frame_id=10}
+}
+

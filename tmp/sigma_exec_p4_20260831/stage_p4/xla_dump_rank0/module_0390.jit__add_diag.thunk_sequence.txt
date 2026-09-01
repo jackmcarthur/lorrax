@@ -1,0 +1,8 @@
+001: kPartitionId	
+002: kKernel     	, kernel = loop_and_fusion, profile_annotation = loop_and_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {24, 1, 1}, cluster_dim = nullopt
+003: kKernel     	, kernel = input_transpose_fusion, profile_annotation = input_transpose_fusion, launch dimensions = blocks: {336, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+004: kKernel     	, kernel = input_transpose_fusion_2, profile_annotation = input_transpose_fusion.2, launch dimensions = blocks: {1680, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+005: kKernel     	, kernel = input_scatter_fusion, profile_annotation = input_scatter_fusion, launch dimensions = blocks: {504, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+006: kKernel     	, kernel = input_scatter_fusion, profile_annotation = input_scatter_fusion.1, launch dimensions = blocks: {504, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+007: kKernel     	, kernel = wrapped_transpose, profile_annotation = wrapped_transpose, launch dimensions = blocks: {1680, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+008: kKernel     	, kernel = input_transpose_fusion_1, profile_annotation = input_transpose_fusion.1, launch dimensions = blocks: {1680, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt

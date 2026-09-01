@@ -1,0 +1,51 @@
+BufferAssignment:
+allocation 0: size 787251200, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+ value: <4 param.2 @0> (size=787251200,offset=0): c128[512,310,310]{2,1,0}
+allocation 1: size 1537600, output shape is |c128[310,310]|, maybe-live-out:
+ value: <6 loop_dynamic_slice_fusion @0> (size=1537600,offset=0): c128[1,310,310]{2,1,0}
+allocation 2: size 4, parameter 1, shape |s32[1]| at ShapeIndex {}:
+ value: <5 param.3 @0> (size=4,offset=0): s32[1]{0}
+
+Total bytes used: 788788804 (752.25MiB)
+
+Used values:
+<4 param.2 @0>
+ positions:
+  param.2
+ uses:
+  loop_dynamic_slice_fusion, operand 0
+ from instruction: %param.2 = c128[512,310,310]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="args[0]"}
+<5 param.3 @0>
+ positions:
+  param.3
+ uses:
+  loop_dynamic_slice_fusion, operand 1
+ from instruction: %param.3 = s32[1]{0} parameter(1), sharding={replicated}, metadata={op_name="args[1]"}
+<6 loop_dynamic_slice_fusion @0>
+ positions:
+  loop_dynamic_slice_fusion
+  bitcast.1.0
+ uses:
+  bitcast.1.0, operand 0
+ from instruction: %loop_dynamic_slice_fusion = c128[1,310,310]{2,1,0} fusion(%param.2, %param.3), kind=kLoop, calls=%fused_dynamic_slice, metadata={op_name="dynamic-slice.3"}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:param.3
+    1:param.2
+    2:loop_dynamic_slice_fusion
+    3:bitcast.1.0
+  BufferLiveRange:
+    param.2{}:0-4
+    param.3{}:0-4
+    loop_dynamic_slice_fusion{}:2-4
+  Live ranges at 2 (peak):
+    param.2{}: 787251200 bytes (cumulative: 787251200 bytes)
+    loop_dynamic_slice_fusion{}: 1537600 bytes (cumulative: 788788800 bytes)
+    param.3{}: 4 bytes (cumulative: 788788804 bytes)
+  Stack trace breakdown for peak usage: 788 788 804 bytes
+    main.0_spmd (100.0%, total: 788 788 804 bytes, current: 0 bytes, remaining: 788 788 804 bytes)
+      ├── args[0] (99.8%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 1 537 604 bytes)
+      ├── dynamic-slice.3 (0.2%, total: 1 537 600 bytes, current: 1 537 600 bytes, remaining: 4 bytes)
+      └── args[1] (0.0%, total: 4 bytes, current: 4 bytes, remaining: 0 bytes)

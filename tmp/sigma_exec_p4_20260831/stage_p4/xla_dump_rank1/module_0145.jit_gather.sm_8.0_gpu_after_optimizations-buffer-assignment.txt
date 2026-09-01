@@ -1,0 +1,51 @@
+BufferAssignment:
+allocation 0: size 12582912, output shape is |f64[48,32768]|, maybe-live-out:
+ value: <5 loop_gather_fusion @0> (size=12582912,offset=0): f64[1572864,1]{0,1}
+allocation 1: size 6291456, parameter 1, shape |s32[48,32768,1]| at ShapeIndex {}:
+ value: <4 args_1_.1 @0> (size=6291456,offset=0): s32[48,32768,1]{2,1,0}
+allocation 2: size 262144, parameter 0, shape |f64[32768]| at ShapeIndex {}:
+ value: <3 args_0_.1 @0> (size=262144,offset=0): f64[32768]{0}
+
+Total bytes used: 19136512 (18.25MiB)
+
+Used values:
+<3 args_0_.1 @0>
+ positions:
+  args_0_.1
+ uses:
+  loop_gather_fusion, operand 0
+ from instruction: %args_0_.1 = f64[32768]{0} parameter(0), metadata={op_name="args[0]"}
+<4 args_1_.1 @0>
+ positions:
+  args_1_.1
+ uses:
+  loop_gather_fusion, operand 1
+ from instruction: %args_1_.1 = s32[48,32768,1]{2,1,0} parameter(1), metadata={op_name="args[1]"}
+<5 loop_gather_fusion @0>
+ positions:
+  loop_gather_fusion
+  bitcast.1.0
+ uses:
+  bitcast.1.0, operand 0
+ from instruction: %loop_gather_fusion = f64[1572864,1]{0,1} fusion(%args_0_.1, %args_1_.1), kind=kLoop, calls=%fused_gather, metadata={op_name="jit(gather)/gather" stack_frame_id=9}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:args_1_.1
+    1:args_0_.1
+    2:loop_gather_fusion
+    3:bitcast.1.0
+  BufferLiveRange:
+    args_0_.1{}:0-4
+    args_1_.1{}:0-4
+    loop_gather_fusion{}:2-4
+  Live ranges at 2 (peak):
+    loop_gather_fusion{}: 12582912 bytes (cumulative: 12582912 bytes)
+    args_1_.1{}: 6291456 bytes (cumulative: 18874368 bytes)
+    args_0_.1{}: 262144 bytes (cumulative: 19136512 bytes)
+  Stack trace breakdown for peak usage: 19 136 512 bytes
+    main.1 (100.0%, total: 19 136 512 bytes, current: 0 bytes, remaining: 19 136 512 bytes)
+      ├── jit(gather)/gather (65.8%, total: 12 582 912 bytes, current: 12 582 912 bytes, remaining: 6 553 600 bytes)
+      ├── args[1] (32.9%, total: 6 291 456 bytes, current: 6 291 456 bytes, remaining: 262 144 bytes)
+      └── args[0] (1.4%, total: 262 144 bytes, current: 262 144 bytes, remaining: 0 bytes)

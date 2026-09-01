@@ -1,0 +1,146 @@
+HloModule jit_sigma_sx, entry_computation_layout={(c128[512,2,310,48]{3,2,1,0}, c128[512,48,2,310]{3,2,1,0}, c128[512,48,2,310]{3,2,1,0}, c128[512,2,310,48]{3,2,1,0}, c128[512,24,24]{2,1,0}, /*index=5*/c128[512,310,310]{2,1,0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false,false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/wavefunction_bundle.py"
+2 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/cohsex_sigma.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/greens_function_kernel.py"
+7 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/ffi/fft.py"
+
+FunctionNames
+1 "Wavefunctions.xr"
+2 "<module>"
+3 "main"
+4 "compute_sigma_xc"
+5 "compute_sigma_x"
+6 "_make_cohsex_kernels_legacy.<locals>.sigma_sx"
+7 "project"
+8 "build_G"
+9 "_build_G_legacy"
+10 "Wavefunctions.xn"
+11 "Wavefunctions.yr"
+12 "_make_static_convolution.<locals>._convolve"
+13 "make_flat_k_fft_ffi.<locals>._flat_k_fft_ffi"
+14 "make_flat_k_fft_ffi.<locals>._local"
+15 "Wavefunctions.yn"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=331 end_line=331 column=15 end_column=15}
+2 {file_name_id=2 function_name_id=2 line=53 end_line=53 column=21 end_column=21}
+3 {file_name_id=2 function_name_id=3 line=48 end_line=48 column=13 end_column=13}
+4 {file_name_id=3 function_name_id=3 line=770 end_line=770 column=18 end_column=18}
+5 {file_name_id=4 function_name_id=4 line=901 end_line=901 column=16 end_column=16}
+6 {file_name_id=5 function_name_id=5 line=713 end_line=713 column=16 end_column=16}
+7 {file_name_id=5 function_name_id=6 line=339 end_line=339 column=15 end_column=15}
+8 {file_name_id=1 function_name_id=7 line=1664 end_line=1664 column=26 end_column=26}
+9 {file_name_id=5 function_name_id=6 line=338 end_line=338 column=16 end_column=16}
+10 {file_name_id=6 function_name_id=8 line=207 end_line=207 column=15 end_column=15}
+11 {file_name_id=6 function_name_id=9 line=131 end_line=131 column=25 end_column=25}
+12 {file_name_id=1 function_name_id=10 line=326 end_line=326 column=15 end_column=15}
+13 {file_name_id=6 function_name_id=9 line=130 end_line=130 column=15 end_column=15}
+14 {file_name_id=1 function_name_id=11 line=336 end_line=336 column=15 end_column=15}
+15 {file_name_id=5 function_name_id=12 line=273 end_line=273 column=18 end_column=18}
+16 {file_name_id=7 function_name_id=13 line=434 end_line=434 column=15 end_column=15}
+17 {file_name_id=7 function_name_id=14 line=409 end_line=409 column=15 end_column=15}
+18 {file_name_id=5 function_name_id=12 line=274 end_line=274 column=18 end_column=18}
+19 {file_name_id=5 function_name_id=12 line=275 end_line=275 column=39 end_column=39}
+20 {file_name_id=5 function_name_id=12 line=275 end_line=275 column=31 end_column=31}
+21 {file_name_id=1 function_name_id=7 line=1663 end_line=1663 column=15 end_column=15}
+22 {file_name_id=1 function_name_id=15 line=341 end_line=341 column=15 end_column=15}
+23 {file_name_id=1 function_name_id=7 line=1665 end_line=1665 column=15 end_column=15}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=1}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=11}
+12 {file_location_id=12 parent_frame_id=1}
+13 {file_location_id=9 parent_frame_id=7}
+14 {file_location_id=10 parent_frame_id=14}
+15 {file_location_id=13 parent_frame_id=15}
+16 {file_location_id=14 parent_frame_id=1}
+17 {file_location_id=11 parent_frame_id=15}
+18 {file_location_id=9 parent_frame_id=18}
+19 {file_location_id=10 parent_frame_id=19}
+20 {file_location_id=11 parent_frame_id=20}
+21 {file_location_id=15 parent_frame_id=1}
+22 {file_location_id=16 parent_frame_id=22}
+23 {file_location_id=17 parent_frame_id=1}
+24 {file_location_id=18 parent_frame_id=1}
+25 {file_location_id=16 parent_frame_id=25}
+26 {file_location_id=19 parent_frame_id=1}
+27 {file_location_id=20 parent_frame_id=1}
+28 {file_location_id=16 parent_frame_id=28}
+29 {file_location_id=21 parent_frame_id=8}
+30 {file_location_id=22 parent_frame_id=1}
+31 {file_location_id=23 parent_frame_id=8}
+
+
+%add.clone (x.1: c128[], y.1: c128[]) -> c128[] {
+  %x.1 = c128[] parameter(0)
+  %y.1 = c128[] parameter(1)
+  ROOT %add.1 = c128[] add(%x.1, %y.1)
+}
+
+%add.1.clone (x.3: c128[], y.3: c128[]) -> c128[] {
+  %x.3 = c128[] parameter(0)
+  %y.3 = c128[] parameter(1)
+  ROOT %add.3 = c128[] add(%x.3, %y.3)
+}
+
+ENTRY %main.4_spmd (param.5: c128[512,2,310,48], param.3: c128[512,48,2,310], param.6: c128[512,48,2,310], param.8: c128[512,2,310,48], param.4: c128[512,24,24], param.7: c128[512,310,310]) -> c128[512,24,24] {
+  %param.3 = c128[512,48,2,310]{3,2,1,0} parameter(1), sharding={devices=[1,1,1,2,2]<=[4] last_tile_dim_replicate}, metadata={op_name="wfns.psi_xr"}
+  %slice.12 = c128[512,24,2,310]{3,2,1,0} slice(%param.3), slice={[0:512], [0:24], [0:2], [0:310]}, metadata={op_name="jit(sigma_sx)/jit(xr)/slice" stack_frame_id=1}
+  %real.4 = f64[512,24,2,310]{3,2,1,0} real(%slice.12), metadata={op_name="jit(sigma_sx)/real" stack_frame_id=11}
+  %imag.4 = f64[512,24,2,310]{3,2,1,0} imag(%slice.12), metadata={op_name="jit(sigma_sx)/imag" stack_frame_id=11}
+  %neg.4 = f64[512,24,2,310]{3,2,1,0} negate(%imag.4), metadata={op_name="jit(sigma_sx)/neg" stack_frame_id=11}
+  %complex.4 = c128[512,24,2,310]{3,2,1,0} complex(%real.4, %neg.4), metadata={op_name="jit(sigma_sx)/complex" stack_frame_id=11}
+  %param.4 = c128[512,24,24]{2,1,0} parameter(4), sharding={replicated}, metadata={op_name="Gij"}
+  %param.5 = c128[512,2,310,48]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,1,2]<=[4] last_tile_dim_replicate}, metadata={op_name="wfns.psi_xn"}
+  %slice.13 = c128[512,2,310,24]{3,2,1,0} slice(%param.5), slice={[0:512], [0:2], [0:310], [0:24]}, metadata={op_name="jit(sigma_sx)/jit(xn)/slice" stack_frame_id=12}
+  %dot = c128[512,24,2,310]{3,2,1,0} dot(%param.4, %slice.13), lhs_batch_dims={0}, lhs_contracting_dims={1}, rhs_batch_dims={0}, rhs_contracting_dims={3}, operand_precision={highest,highest}, metadata={op_name="jit(sigma_sx)/ksxi,kij,kjty->ksxty/dot_general" stack_frame_id=15}
+  %param.6 = c128[512,48,2,310]{3,2,1,0} parameter(2), sharding={devices=[1,1,1,2,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="wfns.psi_yr"}
+  %slice.14 = c128[512,24,2,310]{3,2,1,0} slice(%param.6), slice={[0:512], [0:24], [0:2], [0:310]}, metadata={op_name="jit(sigma_sx)/jit(yr)/slice" stack_frame_id=16}
+  %real.5 = f64[512,24,2,310]{3,2,1,0} real(%slice.14), metadata={op_name="jit(sigma_sx)/real" stack_frame_id=20}
+  %imag.5 = f64[512,24,2,310]{3,2,1,0} imag(%slice.14), metadata={op_name="jit(sigma_sx)/imag" stack_frame_id=20}
+  %neg.5 = f64[512,24,2,310]{3,2,1,0} negate(%imag.5), metadata={op_name="jit(sigma_sx)/neg" stack_frame_id=20}
+  %complex.5 = c128[512,24,2,310]{3,2,1,0} complex(%real.5, %neg.5), metadata={op_name="jit(sigma_sx)/complex" stack_frame_id=20}
+  %dot.1 = c128[512,2,310,2,310]{4,3,2,1,0} dot(%dot, %complex.5), lhs_batch_dims={0}, lhs_contracting_dims={1}, rhs_batch_dims={0}, rhs_contracting_dims={1}, operand_precision={highest,highest}, metadata={op_name="jit(sigma_sx)/ksxi,kij,kjty->ksxty/dot_general" stack_frame_id=15}
+  %shard_map.39 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%dot.1), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=22}
+  %copy = c128[512,2,310,2,310]{4,3,2,1,0} copy(%shard_map.39), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=22}
+  %ffi_call.9 = c128[512,2,310,2,310]{4,3,2,1,0} custom-call(%copy), custom_call_target="lorrax_mklfft_flat_k", operand_layout_constraints={c128[512,2,310,2,310]{4,3,2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map/ffi_call" stack_frame_id=23}, backend_config={forward = 0 : i64, nkx = 8 : i64, nky = 8 : i64, nkz = 8 : i64, scale = 0.044194173824159216 : f64}
+  %shard_map.40 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%ffi_call.9), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=22}
+  %copy.1 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%shard_map.40), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=22}
+  %param.7 = c128[512,310,310]{2,1,0} parameter(5), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="W_q"}
+  %shard_map.41 = c128[512,310,310]{2,1,0} copy(%param.7), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=25}
+  %copy.2 = c128[512,310,310]{2,1,0} copy(%shard_map.41), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=25}
+  %ffi_call.10 = c128[512,310,310]{2,1,0} custom-call(%copy.2), custom_call_target="lorrax_mklfft_flat_k", operand_layout_constraints={c128[512,310,310]{2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map/ffi_call" stack_frame_id=23}, backend_config={forward = 0 : i64, nkx = 8 : i64, nky = 8 : i64, nkz = 8 : i64, scale = 0.044194173824159216 : f64}
+  %shard_map.42 = c128[512,310,310]{2,1,0} copy(%ffi_call.10), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=25}
+  %copy.3 = c128[512,310,310]{2,1,0} copy(%shard_map.42), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=25}
+  %mul.20 = c128[512,2,310,2,310]{4,3,2,1,0} broadcast(%copy.3), dimensions={0,2,4}, metadata={op_name="jit(sigma_sx)/jit(_convolve)/mul" stack_frame_id=26}
+  %mul.21 = c128[512,2,310,2,310]{4,3,2,1,0} multiply(%copy.1, %mul.20), metadata={op_name="jit(sigma_sx)/jit(_convolve)/mul" stack_frame_id=26}
+  %constant.35 = c128[] constant((-0.044194173824159216, 0))
+  %mul.22 = c128[512,2,310,2,310]{4,3,2,1,0} broadcast(%constant.35), dimensions={}, metadata={op_name="jit(sigma_sx)/jit(_convolve)/mul" stack_frame_id=26}
+  %mul.23 = c128[512,2,310,2,310]{4,3,2,1,0} multiply(%mul.21, %mul.22), metadata={op_name="jit(sigma_sx)/jit(_convolve)/mul" stack_frame_id=26}
+  %shard_map.43 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%mul.23), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=28}
+  %copy.4 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%shard_map.43), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=28}
+  %ffi_call.11 = c128[512,2,310,2,310]{4,3,2,1,0} custom-call(%copy.4), custom_call_target="lorrax_mklfft_flat_k", operand_layout_constraints={c128[512,2,310,2,310]{4,3,2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map/ffi_call" stack_frame_id=23}, backend_config={forward = 1 : i64, nkx = 8 : i64, nky = 8 : i64, nkz = 8 : i64, scale = 0.044194173824159216 : f64}
+  %shard_map.44 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%ffi_call.11), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=28}
+  %copy.5 = c128[512,2,310,2,310]{4,3,2,1,0} copy(%shard_map.44), metadata={op_name="jit(sigma_sx)/jit(_convolve)/shard_map" stack_frame_id=28}
+  %dot.2 = c128[512,24,2,310]{3,2,1,0} dot(%complex.4, %copy.5), lhs_batch_dims={0}, lhs_contracting_dims={2,3}, rhs_batch_dims={0}, rhs_contracting_dims={1,2}, operand_precision={highest,highest}, metadata={op_name="jit(sigma_sx)/kmsx,ksxty->kmty/dot_general" stack_frame_id=29}
+  %all-reduce = c128[512,24,2,310]{3,2,1,0} all-reduce(%dot.2), channel_id=1, replica_groups=[2,2]<=[2,2]T(1,0), use_global_device_ids=true, to_apply=%add.clone, metadata={op_name="jit(sigma_sx)/kmsx,ksxty->kmty/dot_general" stack_frame_id=29}
+  %param.8 = c128[512,2,310,48]{3,2,1,0} parameter(3), sharding={devices=[1,1,2,1,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="wfns.psi_yn"}
+  %slice.15 = c128[512,2,310,24]{3,2,1,0} slice(%param.8), slice={[0:512], [0:2], [0:310], [0:24]}, metadata={op_name="jit(sigma_sx)/jit(yn)/slice" stack_frame_id=30}
+  %dot.3 = c128[512,24,24]{2,1,0} dot(%all-reduce, %slice.15), lhs_batch_dims={0}, lhs_contracting_dims={2,3}, rhs_batch_dims={0}, rhs_contracting_dims={1,2}, operand_precision={highest,highest}, metadata={op_name="jit(sigma_sx)/kmty,ktyn->kmn/dot_general" stack_frame_id=31}
+  ROOT %all-reduce.1 = c128[512,24,24]{2,1,0} all-reduce(%dot.3), channel_id=2, replica_groups=[2,2]<=[4], use_global_device_ids=true, to_apply=%add.1.clone, metadata={op_name="jit(sigma_sx)/kmty,ktyn->kmn/dot_general" stack_frame_id=31}
+}
+

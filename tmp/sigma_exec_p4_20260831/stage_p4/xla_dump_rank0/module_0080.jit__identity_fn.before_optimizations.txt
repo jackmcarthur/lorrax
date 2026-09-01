@@ -1,0 +1,9 @@
+HloModule jit__identity_fn, entry_computation_layout={(c128[512,2,620,48]{3,2,1,0})->c128[512,2,620,48]{3,2,1,0}}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+ENTRY %main.1 (x.2: c128[512,2,620,48]) -> c128[512,2,620,48] {
+  %x.2 = c128[512,2,620,48]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,1,2]<=[4] last_tile_dim_replicate}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {}]>"}, metadata={op_name="x"}
+  %x.3 = c128[512,2,620,48]{3,2,1,0} custom-call(%x.2), custom_call_target="xla.sdy.FuncResultSharding", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.sharding="#sdy.sharding_per_value<[<@mesh, [{}, {}, {\"x\"}, {}]>]>"}, metadata={op_name="x"}
+  %tuple.1 = (c128[512,2,620,48]{3,2,1,0}) tuple(%x.3)
+  ROOT %get-tuple-element.1 = c128[512,2,620,48]{3,2,1,0} get-tuple-element(%tuple.1), index=0, sharding={devices=[1,1,2,1,2]<=[4] last_tile_dim_replicate}
+}
+

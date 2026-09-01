@@ -1,0 +1,3 @@
+001: kPartitionId   	
+002: kKernel        	, kernel = loop_select_fusion, profile_annotation = loop_select_fusion, launch dimensions = blocks: {504, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+003: kAllReduceStart	

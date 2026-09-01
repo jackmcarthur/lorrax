@@ -1,0 +1,116 @@
+HloModule jit_fn, entry_computation_layout={(c128[512,24,24]{2,1,0})->f64[3]{0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/sanity.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "check_finite"
+4 "_finite_stats"
+5 "_finite_stats_fn.<locals>.fn"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=821 end_line=821 column=2 end_column=75}
+4 {file_name_id=3 function_name_id=3 line=286 end_line=286 column=34 end_column=54}
+5 {file_name_id=3 function_name_id=4 line=243 end_line=244 column=16 end_column=70}
+6 {file_name_id=3 function_name_id=5 line=221 end_line=221 column=12 end_column=28}
+7 {file_name_id=3 function_name_id=5 line=222 end_line=222 column=12 end_column=26}
+8 {file_name_id=3 function_name_id=5 line=223 end_line=223 column=12 end_column=24}
+9 {file_name_id=3 function_name_id=5 line=208 end_line=208 column=21 end_column=34}
+10 {file_name_id=3 function_name_id=5 line=211 end_line=211 column=17 end_column=39}
+11 {file_name_id=3 function_name_id=5 line=208 end_line=208 column=36 end_column=49}
+12 {file_name_id=3 function_name_id=5 line=214 end_line=214 column=30 end_column=45}
+13 {file_name_id=3 function_name_id=5 line=214 end_line=214 column=21 end_column=45}
+14 {file_name_id=3 function_name_id=5 line=221 end_line=221 column=20 end_column=27}
+15 {file_name_id=3 function_name_id=5 line=220 end_line=224 column=15 end_column=10}
+16 {file_name_id=3 function_name_id=5 line=212 end_line=212 column=16 end_column=35}
+17 {file_name_id=3 function_name_id=5 line=215 end_line=215 column=28 end_column=40}
+18 {file_name_id=3 function_name_id=5 line=215 end_line=215 column=20 end_column=40}
+19 {file_name_id=3 function_name_id=5 line=219 end_line=219 column=32 end_column=44}
+20 {file_name_id=3 function_name_id=5 line=219 end_line=219 column=14 end_column=50}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=6}
+8 {file_location_id=8 parent_frame_id=6}
+9 {file_location_id=9 parent_frame_id=6}
+10 {file_location_id=10 parent_frame_id=6}
+11 {file_location_id=11 parent_frame_id=6}
+12 {file_location_id=12 parent_frame_id=6}
+13 {file_location_id=13 parent_frame_id=6}
+14 {file_location_id=14 parent_frame_id=6}
+15 {file_location_id=15 parent_frame_id=6}
+16 {file_location_id=16 parent_frame_id=6}
+17 {file_location_id=17 parent_frame_id=6}
+18 {file_location_id=18 parent_frame_id=6}
+19 {file_location_id=19 parent_frame_id=6}
+20 {file_location_id=20 parent_frame_id=1}
+
+
+%region_0.2 (reduce_sum.3: s64[], reduce_sum.4: s64[]) -> s64[] {
+  %reduce_sum.3 = s64[] parameter(0), metadata={op_name="reduce_sum"}
+  %reduce_sum.4 = s64[] parameter(1), metadata={op_name="reduce_sum"}
+  ROOT %reduce_sum.5 = s64[] add(%reduce_sum.3, %reduce_sum.4), metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=6}
+}
+
+%region_1.3 (reduce_sum.10: s64[], reduce_sum.11: s64[]) -> s64[] {
+  %reduce_sum.10 = s64[] parameter(0), metadata={op_name="reduce_sum"}
+  %reduce_sum.11 = s64[] parameter(1), metadata={op_name="reduce_sum"}
+  ROOT %reduce_sum.12 = s64[] add(%reduce_sum.10, %reduce_sum.11), metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=7}
+}
+
+%_where.1 (Arg_0.1: pred[512,24,24], Arg_1.1: f64[512,24,24], Arg_2.1: f64[]) -> f64[512,24,24] {
+  %Arg_0.1 = pred[512,24,24]{2,1,0} parameter(0)
+  %Arg_1.1 = f64[512,24,24]{2,1,0} parameter(1)
+  %Arg_2.1 = f64[] parameter(2)
+  %broadcast_in_dim.1 = f64[512,24,24]{2,1,0} broadcast(%Arg_2.1), dimensions={}, metadata={op_name="broadcast_in_dim"}
+  ROOT %select_n.1 = f64[512,24,24]{2,1,0} select(%Arg_0.1, %Arg_1.1, %broadcast_in_dim.1), metadata={op_name="select_n"}
+}
+
+%region_2.4 (reduce_max.3: f64[], reduce_max.4: f64[]) -> f64[] {
+  %reduce_max.3 = f64[] parameter(0), metadata={op_name="reduce_max"}
+  %reduce_max.4 = f64[] parameter(1), metadata={op_name="reduce_max"}
+  ROOT %reduce_max.5 = f64[] maximum(%reduce_max.3, %reduce_max.4), metadata={op_name="jit(fn)/reduce_max" stack_frame_id=8}
+}
+
+ENTRY %main.5 (arr.1: c128[512,24,24]) -> f64[3] {
+  %arr.1 = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {}]>"}, metadata={op_name="arr"}
+  %real.1 = f64[512,24,24]{2,1,0} real(%arr.1), metadata={op_name="jit(fn)/real" stack_frame_id=9}
+  %is_finite.2 = pred[512,24,24]{2,1,0} is-finite(%real.1), metadata={op_name="jit(fn)/is_finite" stack_frame_id=10}
+  %imag.1 = f64[512,24,24]{2,1,0} imag(%arr.1), metadata={op_name="jit(fn)/imag" stack_frame_id=11}
+  %is_finite.3 = pred[512,24,24]{2,1,0} is-finite(%imag.1), metadata={op_name="jit(fn)/is_finite" stack_frame_id=12}
+  %and.1 = pred[512,24,24]{2,1,0} and(%is_finite.2, %is_finite.3), metadata={op_name="jit(fn)/and" stack_frame_id=13}
+  %not.1 = pred[512,24,24]{2,1,0} not(%and.1), metadata={op_name="jit(fn)/not" stack_frame_id=14}
+  %convert_element_type.6 = s32[512,24,24]{2,1,0} convert(%not.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=6}
+  %convert_element_type.7 = s64[512,24,24]{2,1,0} convert(%convert_element_type.6), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=6}
+  %constant.4 = s64[] constant(0)
+  %reduce_sum.14 = s64[] reduce(%convert_element_type.7, %constant.4), dimensions={0,1,2}, to_apply=%region_0.2, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=6}
+  %convert_element_type.8 = f64[] convert(%reduce_sum.14), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=6}
+  %broadcast_in_dim.5 = f64[1]{0} reshape(%convert_element_type.8), metadata={op_name="jit(fn)/broadcast_in_dim" stack_frame_id=15}
+  %ne.2 = pred[512,24,24]{2,1,0} compare(%real.1, %real.1), direction=NE, metadata={op_name="jit(fn)/ne" stack_frame_id=16}
+  %ne.3 = pred[512,24,24]{2,1,0} compare(%imag.1, %imag.1), direction=NE, metadata={op_name="jit(fn)/ne" stack_frame_id=17}
+  %or.1 = pred[512,24,24]{2,1,0} or(%ne.2, %ne.3), metadata={op_name="jit(fn)/or" stack_frame_id=18}
+  %convert_element_type.9 = s32[512,24,24]{2,1,0} convert(%or.1), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=7}
+  %convert_element_type.10 = s64[512,24,24]{2,1,0} convert(%convert_element_type.9), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=7}
+  %reduce_sum.15 = s64[] reduce(%convert_element_type.10, %constant.4), dimensions={0,1,2}, to_apply=%region_1.3, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=7}
+  %convert_element_type.11 = f64[] convert(%reduce_sum.15), metadata={op_name="jit(fn)/convert_element_type" stack_frame_id=7}
+  %broadcast_in_dim.6 = f64[1]{0} reshape(%convert_element_type.11), metadata={op_name="jit(fn)/broadcast_in_dim" stack_frame_id=15}
+  %abs.1 = f64[512,24,24]{2,1,0} abs(%arr.1), metadata={op_name="jit(fn)/abs" stack_frame_id=19}
+  %constant.5 = f64[] constant(0)
+  %jit__where_.1 = f64[512,24,24]{2,1,0} call(%and.1, %abs.1, %constant.5), to_apply=%_where.1, metadata={op_name="jit(fn)/jit(_where)" stack_frame_id=20}
+  %constant.3 = f64[] constant(-inf)
+  %reduce_max.7 = f64[] reduce(%jit__where_.1, %constant.3), dimensions={0,1,2}, to_apply=%region_2.4, metadata={op_name="jit(fn)/reduce_max" stack_frame_id=8}
+  %broadcast_in_dim.7 = f64[1]{0} reshape(%reduce_max.7), metadata={op_name="jit(fn)/broadcast_in_dim" stack_frame_id=15}
+  ROOT %concatenate.1 = f64[3]{0} concatenate(%broadcast_in_dim.5, %broadcast_in_dim.6, %broadcast_in_dim.7), dimensions={0}, metadata={op_name="jit(fn)/concatenate" stack_frame_id=15}
+}
+

@@ -1,0 +1,40 @@
+Total bytes used: 33816768 (32.25MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  16.00MiB( 50%);   16.25MiB; allocation 9: size 16.00MiB, preallocated-temp:
+  32.00MiB( 99%);   256.2KiB; allocation 0: size 16.00MiB, parameter 0, shape |c128[16,2,32,32,32]| at ShapeIndex {}:
+  32.25MiB(100%);       176B; allocation 1: size 256.0KiB, output shape is |f64[32,32,32]|, maybe-live-out:
+  32.25MiB(100%);        48B; allocation 2: size 128B, parameter 4, shape |f64[16]| at ShapeIndex {}:
+  32.25MiB(100%);        40B; allocation 3: size 8B, parameter 2, shape |f64[]| at ShapeIndex {}:
+  32.25MiB(100%);        32B; allocation 4: size 8B, parameter 1, shape |f64[]| at ShapeIndex {}:
+  32.25MiB(100%);        24B; allocation 5: size 8B, parameter 3, shape |f64[]| at ShapeIndex {}:
+  32.25MiB(100%);        16B; allocation 6: size 8B, thread-local:
+  32.25MiB(100%);         8B; allocation 7: size 8B, thread-local:
+  32.25MiB(100%);         0B; allocation 8: size 8B, thread-local:
+
+
+Allocations sorted by size with their values:
+allocation 9: size 16.00MiB, preallocated-temp:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	 16.00MiB(100%);   16.00MiB;            0;                1; c128[16,2,32,32,32]
+	 16.00MiB(100%);        16B;     16777216;                1; c128[]
+
+allocation 0: size 16.00MiB, parameter 0, shape |c128[16,2,32,32,32]| at ShapeIndex {}:
+allocation 1: size 256.0KiB, output shape is |f64[32,32,32]|, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	 256.0KiB(100%);   256.0KiB;            0;                2; 2×f64[32,32,32]
+
+allocation 2: size 128B, parameter 4, shape |f64[16]| at ShapeIndex {}:
+allocation 3: size 8B, parameter 2, shape |f64[]| at ShapeIndex {}:
+allocation 4: size 8B, parameter 1, shape |f64[]| at ShapeIndex {}:
+allocation 5: size 8B, parameter 3, shape |f64[]| at ShapeIndex {}:
+allocation 6: size 8B, thread-local:
+allocation 7: size 8B, thread-local:
+allocation 8: size 8B, thread-local:

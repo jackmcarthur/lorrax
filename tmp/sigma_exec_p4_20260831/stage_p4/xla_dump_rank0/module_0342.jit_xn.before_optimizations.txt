@@ -1,0 +1,47 @@
+HloModule jit_xn, entry_computation_layout={(c128[512,2,620,48]{3,2,1,0})->c128[512,2,620,24]{3,2,1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/wavefunction_bundle.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "compute_sigma_c_mpa_omega_grid"
+5 "integrate_sigma_store"
+6 "integrate_sigma_store.<locals>.run"
+7 "_integrate_sigma_batches"
+8 "Wavefunctions.xn"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=1066 end_line=1086 column=15 end_column=30}
+5 {file_name_id=4 function_name_id=4 line=541 end_line=543 column=15 end_column=63}
+6 {file_name_id=4 function_name_id=5 line=300 end_line=300 column=15 end_column=27}
+7 {file_name_id=4 function_name_id=6 line=295 end_line=297 column=15 end_column=67}
+8 {file_name_id=4 function_name_id=7 line=104 end_line=104 column=33 end_column=53}
+9 {file_name_id=5 function_name_id=8 line=326 end_line=326 column=15 end_column=42}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+
+
+ENTRY %main.1 (self_psi_xn.1: c128[512,2,620,48]) -> c128[512,2,620,24] {
+  %self_psi_xn.1 = c128[512,2,620,48]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,1,2]<=[4] last_tile_dim_replicate}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {}]>"}, metadata={op_name="self.psi_xn"}
+  ROOT %slice.1 = c128[512,2,620,24]{3,2,1,0} slice(%self_psi_xn.1), slice={[0:512], [0:2], [0:620], [0:24]}, metadata={op_name="jit(xn)/slice" stack_frame_id=9}
+}
+

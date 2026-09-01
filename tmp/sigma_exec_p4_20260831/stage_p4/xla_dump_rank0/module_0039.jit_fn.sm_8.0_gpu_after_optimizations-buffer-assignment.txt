@@ -1,0 +1,292 @@
+BufferAssignment:
+allocation 0: size 787251200, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+ value: <61 param @0> (size=787251200,offset=0): c128[512,310,310]{2,1,0}
+allocation 1: size 24, output shape is |f64[3]|, maybe-live-out:
+ value: <70 wrapped_concatenate @0> (size=16,offset=0): s64[2]{0}
+ value: <71 all-reduce-start.1 @0> (size=16,offset=0): s64[2]{0}
+ value: <74 input_concatenate_fusion @0> (size=24,offset=0): f64[3]{0}
+allocation 2: size 8, thread-local:
+ value: <14 reduce_sum.30.0 @0> (size=8,offset=0): s64[]
+allocation 3: size 8, thread-local:
+ value: <13 reduce_sum.29 @0> (size=8,offset=0): s64[]
+allocation 4: size 8, thread-local:
+ value: <6 reduce_sum.22 @0> (size=8,offset=0): s64[]
+allocation 5: size 8, thread-local:
+ value: <7 reduce_sum.23 @0> (size=8,offset=0): s64[]
+allocation 6: size 8, thread-local:
+ value: <8 reduce_sum.24.0 @0> (size=8,offset=0): s64[]
+allocation 7: size 8, thread-local:
+ value: <9 reduce_max.8 @0> (size=8,offset=0): f64[]
+allocation 8: size 8, thread-local:
+ value: <10 reduce_max.9 @0> (size=8,offset=0): f64[]
+allocation 9: size 8, thread-local:
+ value: <11 reduce_max.10.0 @0> (size=8,offset=0): f64[]
+allocation 10: size 8, thread-local:
+ value: <3 reduce_max.0 @0> (size=8,offset=0): f64[]
+allocation 11: size 8, thread-local:
+ value: <4 reduce_max.1 @0> (size=8,offset=0): f64[]
+allocation 12: size 8, thread-local:
+ value: <5 reduce_max.2.0 @0> (size=8,offset=0): f64[]
+allocation 13: size 8, thread-local:
+ value: <0 reduce_sum.0 @0> (size=8,offset=0): s64[]
+allocation 14: size 8, thread-local:
+ value: <1 reduce_sum.1 @0> (size=8,offset=0): s64[]
+allocation 15: size 8, thread-local:
+ value: <2 reduce_sum.2.0 @0> (size=8,offset=0): s64[]
+allocation 16: size 8, thread-local:
+ value: <12 reduce_sum.28 @0> (size=8,offset=0): s64[]
+allocation 17: size 153880, preallocated-temp:
+ value: <62 input_reduce_fusion{} @0> (size=24,offset=153856): (s64[6400]{0}, s64[6400]{0}, f64[6400]{0})
+ value: <63 input_reduce_fusion{0} @0> (size=51200,offset=0): s64[6400]{0}
+ value: <64 input_reduce_fusion{1} @0> (size=51200,offset=51200): s64[6400]{0}
+ value: <65 input_reduce_fusion{2} @0> (size=51200,offset=102400): f64[6400]{0}
+ value: <66 input_reduce_fusion.3 @0> (size=8,offset=153600): f64[]
+ value: <67 all-reduce-start @0> (size=8,offset=153600): f64[]
+ value: <68 input_reduce_fusion.2 @0> (size=8,offset=102656): s64[]
+ value: <69 input_reduce_fusion.1 @0> (size=8,offset=102400): s64[]
+ value: <72 wrapped_slice @0> (size=8,offset=0): s64[1]{0}
+ value: <73 wrapped_slice.1 @0> (size=8,offset=256): s64[1]{0}
+
+Total bytes used: 787405224 (750.93MiB)
+
+Used values:
+<0 reduce_sum.0 @0>
+ positions:
+  reduce_sum.0
+ uses:
+  reduce_sum.2.0, operand 0
+ from instruction: %reduce_sum.0 = s64[] parameter(0), metadata={op_name="jit(fn)/reduce_sum"}
+<1 reduce_sum.1 @0>
+ positions:
+  reduce_sum.1
+ uses:
+  reduce_sum.2.0, operand 1
+ from instruction: %reduce_sum.1 = s64[] parameter(1), metadata={op_name="jit(fn)/reduce_sum"}
+<2 reduce_sum.2.0 @0>
+ positions:
+  reduce_sum.2.0
+ uses:
+ from instruction: %reduce_sum.2.0 = s64[] add(%reduce_sum.0, %reduce_sum.1), metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=13}
+<3 reduce_max.0 @0>
+ positions:
+  reduce_max.0
+ uses:
+  reduce_max.2.0, operand 0
+ from instruction: %reduce_max.0 = f64[] parameter(0), metadata={op_name="jit(fn)/reduce_max"}
+<4 reduce_max.1 @0>
+ positions:
+  reduce_max.1
+ uses:
+  reduce_max.2.0, operand 1
+ from instruction: %reduce_max.1 = f64[] parameter(1), metadata={op_name="jit(fn)/reduce_max"}
+<5 reduce_max.2.0 @0>
+ positions:
+  reduce_max.2.0
+ uses:
+ from instruction: %reduce_max.2.0 = f64[] maximum(%reduce_max.0, %reduce_max.1), metadata={op_name="jit(fn)/reduce_max" stack_frame_id=20}
+<6 reduce_sum.22 @0>
+ positions:
+  reduce_sum.22
+ uses:
+  reduce_sum.24.0, operand 0
+ from instruction: %reduce_sum.22 = s64[] parameter(0), metadata={op_name="jit(fn)/reduce_sum"}
+<7 reduce_sum.23 @0>
+ positions:
+  reduce_sum.23
+ uses:
+  reduce_sum.24.0, operand 1
+ from instruction: %reduce_sum.23 = s64[] parameter(1), metadata={op_name="jit(fn)/reduce_sum"}
+<8 reduce_sum.24.0 @0>
+ positions:
+  reduce_sum.24.0
+ uses:
+ from instruction: %reduce_sum.24.0 = s64[] add(%reduce_sum.22, %reduce_sum.23), metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=18}
+<9 reduce_max.8 @0>
+ positions:
+  reduce_max.8
+ uses:
+  reduce_max.10.0, operand 0
+ from instruction: %reduce_max.8 = f64[] parameter(0), metadata={op_name="jit(fn)/reduce_max"}
+<10 reduce_max.9 @0>
+ positions:
+  reduce_max.9
+ uses:
+  reduce_max.10.0, operand 1
+ from instruction: %reduce_max.9 = f64[] parameter(1), metadata={op_name="jit(fn)/reduce_max"}
+<11 reduce_max.10.0 @0>
+ positions:
+  reduce_max.10.0
+ uses:
+ from instruction: %reduce_max.10.0 = f64[] maximum(%reduce_max.8, %reduce_max.9), metadata={op_name="jit(fn)/reduce_max" stack_frame_id=20}
+<12 reduce_sum.28 @0>
+ positions:
+  reduce_sum.28
+ uses:
+  reduce_sum.30.0, operand 0
+ from instruction: %reduce_sum.28 = s64[] parameter(0), metadata={op_name="jit(fn)/reduce_sum"}
+<13 reduce_sum.29 @0>
+ positions:
+  reduce_sum.29
+ uses:
+  reduce_sum.30.0, operand 1
+ from instruction: %reduce_sum.29 = s64[] parameter(1), metadata={op_name="jit(fn)/reduce_sum"}
+<14 reduce_sum.30.0 @0>
+ positions:
+  reduce_sum.30.0
+ uses:
+ from instruction: %reduce_sum.30.0 = s64[] add(%reduce_sum.28, %reduce_sum.29), metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=13}
+<61 param @0>
+ positions:
+  param
+ uses:
+  input_reduce_fusion, operand 0
+ from instruction: %param = c128[512,310,310]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="arr"}
+<62 input_reduce_fusion{} @0>
+ positions:
+  input_reduce_fusion {}
+ uses:
+  get-tuple-element, operand 0 {}
+  get-tuple-element.1, operand 0 {}
+  get-tuple-element.2, operand 0 {}
+ from instruction: %input_reduce_fusion = (s64[6400]{0}, s64[6400]{0}, f64[6400]{0}) fusion(%param), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<63 input_reduce_fusion{0} @0>
+ positions:
+  input_reduce_fusion {0}
+  get-tuple-element
+ uses:
+  input_reduce_fusion.2, operand 0
+ from instruction: %input_reduce_fusion = (s64[6400]{0}, s64[6400]{0}, f64[6400]{0}) fusion(%param), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<64 input_reduce_fusion{1} @0>
+ positions:
+  input_reduce_fusion {1}
+  get-tuple-element.1
+ uses:
+  input_reduce_fusion.1, operand 0
+ from instruction: %input_reduce_fusion = (s64[6400]{0}, s64[6400]{0}, f64[6400]{0}) fusion(%param), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<65 input_reduce_fusion{2} @0>
+ positions:
+  input_reduce_fusion {2}
+  get-tuple-element.2
+ uses:
+  input_reduce_fusion.3, operand 0
+ from instruction: %input_reduce_fusion = (s64[6400]{0}, s64[6400]{0}, f64[6400]{0}) fusion(%param), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(fn)/reduce_sum" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<66 input_reduce_fusion.3 @0>
+ positions:
+  input_reduce_fusion.3
+ uses:
+  all-reduce-start, operand 0
+ from instruction: %input_reduce_fusion.3 = f64[] fusion(%get-tuple-element.2), kind=kCustom, calls=%fused_reduce.3, metadata={op_name="jit(fn)/reduce_max" stack_frame_id=20}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"8","output_tiles":[{"sizes":[]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<67 all-reduce-start @0>
+ positions:
+  all-reduce-start
+  all-reduce-done
+ uses:
+  all-reduce-done, operand 0
+  input_concatenate_fusion, operand 0
+ from instruction: %all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion.3), channel_id=9, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_2.3.clone, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":false,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<68 input_reduce_fusion.2 @0>
+ positions:
+  input_reduce_fusion.2
+  bitcast.14
+ uses:
+  bitcast.14, operand 0
+  wrapped_concatenate, operand 0
+ from instruction: %input_reduce_fusion.2 = s64[] fusion(%get-tuple-element), kind=kInput, calls=%fused_reduce.2, metadata={op_name="jit(fn)/reduce_sum" deduplicated_name="input_reduce_fusion.1" stack_frame_id=18}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<69 input_reduce_fusion.1 @0>
+ positions:
+  input_reduce_fusion.1
+  bitcast.15
+ uses:
+  bitcast.15, operand 0
+  wrapped_concatenate, operand 1
+ from instruction: %input_reduce_fusion.1 = s64[] fusion(%get-tuple-element.1), kind=kInput, calls=%fused_reduce.1, metadata={op_name="jit(fn)/reduce_sum" deduplicated_name="input_reduce_fusion.1" stack_frame_id=13}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<70 wrapped_concatenate @0>
+ positions:
+  wrapped_concatenate
+ uses:
+  all-reduce-start.1, operand 0
+ from instruction: %wrapped_concatenate = s64[2]{0} fusion(%bitcast.14, %bitcast.15), kind=kLoop, calls=%wrapped_concatenate_computation
+<71 all-reduce-start.1 @0>
+ positions:
+  all-reduce-start.1
+  all-reduce-done.1
+ uses:
+  all-reduce-done.1, operand 0
+  wrapped_slice, operand 0
+  wrapped_slice.1, operand 0
+ from instruction: %all-reduce-start.1 = s64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=8, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<72 wrapped_slice @0>
+ positions:
+  wrapped_slice
+  bitcast.16
+ uses:
+  bitcast.16, operand 0
+  input_concatenate_fusion, operand 1
+ from instruction: %wrapped_slice = s64[1]{0} fusion(%all-reduce-done.1), kind=kLoop, calls=%wrapped_slice_computation
+<73 wrapped_slice.1 @0>
+ positions:
+  wrapped_slice.1
+  bitcast.17
+ uses:
+  bitcast.17, operand 0
+  input_concatenate_fusion, operand 2
+ from instruction: %wrapped_slice.1 = s64[1]{0} fusion(%all-reduce-done.1), kind=kLoop, calls=%wrapped_slice_computation.1
+<74 input_concatenate_fusion @0>
+ positions:
+  input_concatenate_fusion
+ uses:
+ from instruction: %input_concatenate_fusion = f64[3]{0} fusion(%all-reduce-done, %bitcast.16, %bitcast.17), kind=kInput, calls=%fused_concatenate, metadata={op_name="jit(fn)/concatenate" stack_frame_id=14}
+
+
+HloLiveRange (max 20):
+  InstructionSequence:
+    0:param
+    1:input_reduce_fusion
+    2:get-tuple-element.2
+    3:input_reduce_fusion.3
+    4:all-reduce-start
+    5:get-tuple-element.1
+    6:input_reduce_fusion.1
+    7:bitcast.15
+    8:get-tuple-element
+    9:input_reduce_fusion.2
+    10:bitcast.14
+    11:wrapped_concatenate
+    12:all-reduce-start.1
+    13:all-reduce-done.1
+    14:wrapped_slice.1
+    15:bitcast.17
+    16:wrapped_slice
+    17:bitcast.16
+    18:all-reduce-done
+    19:input_concatenate_fusion
+  BufferLiveRange:
+    param{}:0-20
+    input_reduce_fusion{}:1-8
+    input_reduce_fusion{0}:1-9
+    input_reduce_fusion{1}:1-6
+    input_reduce_fusion{2}:1-3
+    input_reduce_fusion.3{}:3-4
+    all-reduce-start{}:4-19
+    input_reduce_fusion.2{}:9-11
+    input_reduce_fusion.1{}:6-11
+    wrapped_concatenate{}:11-12
+    all-reduce-start.1{}:12-16
+    wrapped_slice{}:16-19
+    wrapped_slice.1{}:14-19
+    input_concatenate_fusion{}:19-20
+  Live ranges at 4 (peak):
+    param{}: 787251200 bytes (cumulative: 787251200 bytes)
+    input_reduce_fusion{0}: 51200 bytes (cumulative: 787302400 bytes)
+    input_reduce_fusion{1}: 51200 bytes (cumulative: 787353600 bytes)
+    input_reduce_fusion{}: 24 bytes (cumulative: 787353624 bytes)
+    all-reduce-start{}: 8 bytes (cumulative: 787353632 bytes)
+    input_reduce_fusion.3{}: 8 bytes (cumulative: 787353640 bytes)
+  Stack trace breakdown for peak usage: 787 353 640 bytes
+    main.4_spmd (100.0%, total: 787 353 640 bytes, current: 0 bytes, remaining: 787 353 640 bytes)
+      ├── arr (100.0%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 102 440 bytes)
+      ├── jit(fn)/reduce_sum{0} (0.0%, total: 51 200 bytes, current: 51 200 bytes, remaining: 51 240 bytes)
+      ├── jit(fn)/reduce_sum{1} (0.0%, total: 51 200 bytes, current: 51 200 bytes, remaining: 40 bytes)
+      ├── jit(fn)/reduce_sum (0.0%, total: 24 bytes, current: 24 bytes, remaining: 16 bytes)
+      ├── all-reduce-start (0.0%, total: 8 bytes, current: 8 bytes, remaining: 8 bytes)
+      └── jit(fn)/reduce_max (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

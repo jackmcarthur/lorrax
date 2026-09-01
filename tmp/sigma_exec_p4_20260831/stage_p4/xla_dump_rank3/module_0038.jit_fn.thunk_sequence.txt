@@ -1,0 +1,11 @@
+001: kKernel        	, kernel = input_reduce_fusion, profile_annotation = input_reduce_fusion, launch dimensions = blocks: {6400, 1, 1}, threads/block: {512, 1, 1}, cluster_dim = nullopt
+002: kKernel        	, kernel = input_reduce_fusion_3, profile_annotation = input_reduce_fusion.3, launch dimensions = blocks: {1, 1, 1}, threads/block: {256, 1, 1}, cluster_dim = nullopt
+003: kAllReduceStart	
+004: kKernel        	, kernel = input_reduce_fusion_1, profile_annotation = input_reduce_fusion.1, launch dimensions = blocks: {1, 1, 1}, threads/block: {416, 1, 1}, cluster_dim = nullopt
+005: kKernel        	, kernel = input_reduce_fusion_1, profile_annotation = input_reduce_fusion.2, launch dimensions = blocks: {1, 1, 1}, threads/block: {416, 1, 1}, cluster_dim = nullopt
+006: kKernel        	, kernel = wrapped_concatenate, profile_annotation = wrapped_concatenate, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt
+007: kAllReduceStart	
+008: kKernel        	, kernel = wrapped_slice_1, profile_annotation = wrapped_slice.1, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt
+009: kKernel        	, kernel = wrapped_slice, profile_annotation = wrapped_slice, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt
+010: kAllReduceDone 	
+011: kKernel        	, kernel = input_concatenate_fusion, profile_annotation = input_concatenate_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt

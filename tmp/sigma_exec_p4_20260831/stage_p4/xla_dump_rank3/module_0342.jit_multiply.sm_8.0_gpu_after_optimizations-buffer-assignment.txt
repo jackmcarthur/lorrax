@@ -1,0 +1,48 @@
+BufferAssignment:
+allocation 0: size 178361600, output shape is |c128[4,29,310,310]|, maybe-live-out:
+ value: <7 loop_multiply_fusion @0> (size=178361600,offset=0): c128[4,29,310,310]{3,2,1,0}
+allocation 1: size 178361600, parameter 0, shape |c128[4,29,310,310]| at ShapeIndex {}:
+ value: <5 param @0> (size=178361600,offset=0): c128[4,29,310,310]{3,2,1,0}
+allocation 2: size 8, parameter 1, shape |f64[]| at ShapeIndex {}:
+ value: <6 param.1 @0> (size=8,offset=0): f64[]
+
+Total bytes used: 356723208 (340.20MiB)
+
+Used values:
+<5 param @0>
+ positions:
+  param
+ uses:
+  loop_multiply_fusion, operand 0
+ from instruction: %param = c128[4,29,310,310]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="x"}
+<6 param.1 @0>
+ positions:
+  param.1
+ uses:
+  loop_multiply_fusion, operand 1
+ from instruction: %param.1 = f64[] parameter(1), sharding={replicated}, metadata={op_name="y"}
+<7 loop_multiply_fusion @0>
+ positions:
+  loop_multiply_fusion
+ uses:
+ from instruction: %loop_multiply_fusion = c128[4,29,310,310]{3,2,1,0} fusion(%param, %param.1), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(multiply)/mul" stack_frame_id=10}
+
+
+HloLiveRange (max 3):
+  InstructionSequence:
+    0:param.1
+    1:param
+    2:loop_multiply_fusion
+  BufferLiveRange:
+    param{}:0-3
+    param.1{}:0-3
+    loop_multiply_fusion{}:2-3
+  Live ranges at 2 (peak):
+    loop_multiply_fusion{}: 178361600 bytes (cumulative: 178361600 bytes)
+    param{}: 178361600 bytes (cumulative: 356723200 bytes)
+    param.1{}: 8 bytes (cumulative: 356723208 bytes)
+  Stack trace breakdown for peak usage: 356 723 208 bytes
+    main.0_spmd (100.0%, total: 356 723 208 bytes, current: 0 bytes, remaining: 356 723 208 bytes)
+      ├── jit(multiply)/mul (50.0%, total: 178 361 600 bytes, current: 178 361 600 bytes, remaining: 178 361 608 bytes)
+      ├── x (50.0%, total: 178 361 600 bytes, current: 178 361 600 bytes, remaining: 8 bytes)
+      └── y (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

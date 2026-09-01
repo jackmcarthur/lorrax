@@ -1,0 +1,48 @@
+BufferAssignment:
+allocation 0: size 256, parameter 0, shape |s64[1,32,1]| at ShapeIndex {}:
+ value: <4 x.1 @0> (size=256,offset=0): s64[1,32,1]{2,1,0}
+allocation 1: size 32, output shape is |pred[1,32,1]|, maybe-live-out:
+ value: <6 loop_compare_fusion @0> (size=32,offset=0): pred[1,32,1]{2,1,0}
+allocation 2: size 8, parameter 1, shape |s64[]| at ShapeIndex {}:
+ value: <5 y.1 @0> (size=8,offset=0): s64[]
+
+Total bytes used: 296 (296B)
+
+Used values:
+<4 x.1 @0>
+ positions:
+  x.1
+ uses:
+  loop_compare_fusion, operand 0
+ from instruction: %x.1 = s64[1,32,1]{2,1,0} parameter(0), metadata={op_name="x"}
+<5 y.1 @0>
+ positions:
+  y.1
+ uses:
+  loop_compare_fusion, operand 1
+ from instruction: %y.1 = s64[] parameter(1), metadata={op_name="y"}
+<6 loop_compare_fusion @0>
+ positions:
+  loop_compare_fusion
+ uses:
+ from instruction: %loop_compare_fusion = pred[1,32,1]{2,1,0} fusion(%x.1, %y.1), kind=kLoop, calls=%fused_compare, metadata={op_name="jit(equal)/eq" stack_frame_id=10}
+
+
+HloLiveRange (max 3):
+  InstructionSequence:
+    0:y.1
+    1:x.1
+    2:loop_compare_fusion
+  BufferLiveRange:
+    x.1{}:0-3
+    y.1{}:0-3
+    loop_compare_fusion{}:2-3
+  Live ranges at 2 (peak):
+    x.1{}: 256 bytes (cumulative: 256 bytes)
+    loop_compare_fusion{}: 32 bytes (cumulative: 288 bytes)
+    y.1{}: 8 bytes (cumulative: 296 bytes)
+  Stack trace breakdown for peak usage: 296 bytes
+    main.1 (100.0%, total: 296 bytes, current: 0 bytes, remaining: 296 bytes)
+      ├── x (86.5%, total: 256 bytes, current: 256 bytes, remaining: 40 bytes)
+      ├── jit(equal)/eq (10.8%, total: 32 bytes, current: 32 bytes, remaining: 8 bytes)
+      └── y (2.7%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

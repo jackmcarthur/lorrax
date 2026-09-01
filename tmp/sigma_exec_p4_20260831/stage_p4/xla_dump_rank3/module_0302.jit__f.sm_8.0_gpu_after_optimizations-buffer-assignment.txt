@@ -1,0 +1,51 @@
+BufferAssignment:
+allocation 0: size 1179648, output shape is |c128[512,12,12]|, maybe-live-out:
+ value: <5 wrapped_gather @0> (size=1179648,offset=0): c128[512,1,12,12]{3,2,0,1}
+allocation 1: size 66816, parameter 0, shape |c128[29,12,12]| at ShapeIndex {}:
+ value: <3 param @0> (size=66816,offset=0): c128[29,12,12]{2,1,0}
+allocation 2: size 2048, constant:
+ value: <4 constant_2_0 @0> (size=2048,offset=0): s32[512,1]{1,0}
+
+Total bytes used: 1248512 (1.19MiB)
+
+Used values:
+<3 param @0>
+ positions:
+  param
+ uses:
+  wrapped_gather, operand 0
+ from instruction: %param = c128[29,12,12]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="x"}
+<4 constant_2_0 @0>
+ positions:
+  constant_2_0
+ uses:
+  wrapped_gather, operand 1
+ from instruction: %constant_2_0 = s32[512,1]{1,0} constant({...})
+<5 wrapped_gather @0>
+ positions:
+  wrapped_gather
+  bitcast.10
+ uses:
+  bitcast.10, operand 0
+ from instruction: %wrapped_gather = c128[512,1,12,12]{3,2,0,1} fusion(%param, %constant_2_0), kind=kLoop, calls=%wrapped_gather_computation, metadata={op_name="jit(_f)/gather" stack_frame_id=10}
+
+
+HloLiveRange (max 4):
+  InstructionSequence:
+    0:constant_2_0
+    1:param
+    2:wrapped_gather
+    3:bitcast.10
+  BufferLiveRange:
+    param{}:0-4
+    constant_2_0{}:0-2
+    wrapped_gather{}:2-4
+  Live ranges at 2 (peak):
+    wrapped_gather{}: 1179648 bytes (cumulative: 1179648 bytes)
+    param{}: 66816 bytes (cumulative: 1246464 bytes)
+    constant_2_0{}: 2048 bytes (cumulative: 1248512 bytes)
+  Stack trace breakdown for peak usage: 1 248 512 bytes
+    main.0_spmd (100.0%, total: 1 248 512 bytes, current: 0 bytes, remaining: 1 248 512 bytes)
+      ├── jit(_f)/gather (94.5%, total: 1 179 648 bytes, current: 1 179 648 bytes, remaining: 68 864 bytes)
+      ├── x (5.4%, total: 66 816 bytes, current: 66 816 bytes, remaining: 2 048 bytes)
+      └── constant_2_0 (0.2%, total: 2 048 bytes, current: 2 048 bytes, remaining: 0 bytes)

@@ -1,0 +1,63 @@
+HloModule jit__per_rank, entry_computation_layout={(s64[2]{0}, s64[1]{0}, s64[1]{0})->c128[8]{0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/_slab_io_ffi.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/ffi/io.py"
+3 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/mpa_store.py"
+7 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/slab_io.py"
+
+FunctionNames
+1 "_get_read_sm.<locals>._per_rank"
+2 "ffi_read_call"
+3 "<module>"
+4 "main"
+5 "compute_sigma_xc"
+6 "read_head_fit_collective"
+7 "SlabIO.read_slab"
+8 "_FfiBackend.read_slab"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=1557 end_line=1562 column=15 end_column=9}
+2 {file_name_id=2 function_name_id=2 line=415 end_line=422 column=11 end_column=5}
+3 {file_name_id=3 function_name_id=3 line=53 end_line=53 column=21 end_column=27}
+4 {file_name_id=3 function_name_id=4 line=48 end_line=48 column=13 end_column=48}
+5 {file_name_id=4 function_name_id=4 line=770 end_line=786 column=18 end_column=4}
+6 {file_name_id=5 function_name_id=5 line=1087 end_line=1088 column=15 end_column=52}
+7 {file_name_id=6 function_name_id=6 line=2619 end_line=2620 column=16 end_column=70}
+8 {file_name_id=7 function_name_id=7 line=509 end_line=512 column=18 end_column=57}
+9 {file_name_id=1 function_name_id=8 line=2357 end_line=2357 column=17 end_column=60}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=1}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+
+
+%xla.sdy.manual_computation_body.1 (shard_map.7: s64[2], shard_map.8: s64[1], shard_map.9: s64[1]) -> c128[8] {
+  %shard_map.7 = s64[2]{0} parameter(0), metadata={op_name="shard_map"}
+  %shard_map.8 = s64[1]{0} parameter(1), metadata={op_name="shard_map"}
+  %shard_map.9 = s64[1]{0} parameter(2), metadata={op_name="shard_map"}
+  ROOT %ffi_call.1 = c128[8]{0} custom-call(%shard_map.7, %shard_map.8, %shard_map.9), custom_call_target="lorrax_phdf5_read", operand_layout_constraints={s64[2]{0}, s64[1]{0}, s64[1]{0}}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="ffi_call" stack_frame_id=2}, backend_config={axis_count_per_dim = dense<0> : tensor<1xi64>, axis_flat = dense<> : tensor<0xi64>, mesh_shape = dense<2> : tensor<2xi64>}
+}
+
+ENTRY %main.2 (handle_local.1: s64[2], offset_local.1: s64[1], valid_shape_local.1: s64[1]) -> c128[8] {
+  %handle_local.1 = s64[2]{0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}]>"}, metadata={op_name="handle_local"}
+  %offset_local.1 = s64[1]{0} parameter(1), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}]>"}, metadata={op_name="offset_local"}
+  %valid_shape_local.1 = s64[1]{0} parameter(2), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}]>"}, metadata={op_name="valid_shape_local"}
+  %shard_map.12 = (s64[2]{0}, s64[1]{0}, s64[1]{0}) custom-call(%handle_local.1, %offset_local.1, %valid_shape_local.1), custom_call_target="xla.sdy.GlobalToLocalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.in_shardings="#sdy.sharding_per_value<[<@mesh, [{}]>, <@mesh, [{}]>, <@mesh, [{}]>]>",xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>"}, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=9}
+  %shard_map.13 = s64[2]{0} get-tuple-element(%shard_map.12), index=0, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=9}
+  %shard_map.14 = s64[1]{0} get-tuple-element(%shard_map.12), index=1, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=9}
+  %shard_map.15 = s64[1]{0} get-tuple-element(%shard_map.12), index=2, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=9}
+  %shard_map.16 = c128[8]{0} call(%shard_map.13, %shard_map.14, %shard_map.15), to_apply=%xla.sdy.manual_computation_body.1, frontend_attributes={inlineable="false"}, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=9}
+  ROOT %shard_map.17 = c128[8]{0} custom-call(%shard_map.16), custom_call_target="xla.sdy.LocalToGlobalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>",xla.sdy.out_shardings="#sdy.sharding_per_value<[<@mesh, [{}]>]>"}, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=9}
+}
+

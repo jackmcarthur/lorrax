@@ -1,0 +1,147 @@
+HloModule jit_sqrt, entry_computation_layout={(c128[])->c128[]}, allow_spmd_sharding_propagation_to_parameters={true}, allow_spmd_sharding_propagation_to_output={true}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/psp/get_DFT_mtxels.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/fft_helpers.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "_compute_live_hartree"
+5 "compute_hartree_matrix"
+6 "build_hartree_potential"
+7 "compute_hartree_potential_real"
+8 "local_fftn3"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=922 end_line=924 column=30 end_column=48}
+5 {file_name_id=3 function_name_id=4 line=318 end_line=329 column=12 end_column=47}
+6 {file_name_id=4 function_name_id=5 line=921 end_line=926 column=12 end_column=5}
+7 {file_name_id=5 function_name_id=6 line=683 end_line=689 column=12 end_column=5}
+8 {file_name_id=5 function_name_id=7 line=844 end_line=845 column=12 end_column=60}
+9 {file_name_id=6 function_name_id=8 line=267 end_line=267 column=11 end_column=54}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+
+
+ENTRY %main.1 (x.1: c128[]) -> c128[] {
+  %x.1 = c128[] parameter(0), metadata={op_name="x"}
+  %sqrt.93 = f64[] real(%x.1), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %constant.13 = f64[] constant(0)
+  %sqrt.94 = pred[] compare(%sqrt.93, %constant.13), direction=GE, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.95 = f64[] abs(%sqrt.93), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.96 = f64[] imag(%x.1), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.97 = f64[] abs(%sqrt.96), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.98 = pred[] compare(%sqrt.95, %sqrt.97), direction=EQ, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.99 = f64[] sqrt(%sqrt.95), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %constant.12 = f64[] constant(1.5537739740300374)
+  %sqrt.100 = f64[] multiply(%sqrt.99, %constant.12), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %constant.11 = f64[] constant(1.4142135623730951)
+  %sqrt.101 = f64[] divide(%sqrt.100, %constant.11), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.102 = f64[] maximum(%sqrt.95, %sqrt.97), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.103 = f64[] minimum(%sqrt.95, %sqrt.97), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.104 = pred[] compare(%sqrt.102, %sqrt.103), direction=EQ, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.105 = f64[] multiply(%sqrt.102, %constant.11), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.106 = f64[] divide(%sqrt.103, %sqrt.102), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.107 = f64[] multiply(%sqrt.106, %sqrt.106), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %constant.10 = f64[] constant(1)
+  %sqrt.108 = f64[] add(%sqrt.107, %constant.10), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.109 = f64[] sqrt(%sqrt.108), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.110 = pred[] compare(%sqrt.109, %constant.10), direction=EQ, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.111 = pred[] compare(%sqrt.107, %constant.13), direction=GT, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.112 = pred[] and(%sqrt.110, %sqrt.111), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.113 = f64[] multiply(%sqrt.102, %sqrt.107), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %constant.9 = f64[] constant(2)
+  %sqrt.114 = f64[] divide(%sqrt.113, %constant.9), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.115 = f64[] add(%sqrt.102, %sqrt.114), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.116 = f64[] multiply(%sqrt.102, %sqrt.109), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.117 = f64[] select(%sqrt.112, %sqrt.115, %sqrt.116), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.118 = f64[] select(%sqrt.104, %sqrt.105, %sqrt.117), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.119 = f64[] divide(%sqrt.118, %constant.9), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.120 = f64[] divide(%sqrt.95, %constant.9), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.121 = f64[] add(%sqrt.119, %sqrt.120), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.122 = f64[] sqrt(%sqrt.121), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.123 = pred[] compare(%sqrt.122, %constant.13), direction=EQ, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %constant.8 = f64[] constant(inf)
+  %sqrt.124 = pred[] compare(%sqrt.122, %constant.8), direction=EQ, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.125 = pred[] or(%sqrt.123, %sqrt.124), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.126 = pred[] compare(%sqrt.95, %sqrt.97), direction=GT, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.127 = pred[] compare(%sqrt.95, %sqrt.97), direction=LT, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.128 = f64[] divide(%sqrt.95, %sqrt.97), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.129 = f64[] divide(%sqrt.97, %sqrt.95), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.130 = f64[] select(%sqrt.127, %sqrt.128, %sqrt.129), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.131 = f64[] select(%sqrt.98, %constant.10, %sqrt.130), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.132 = f64[] abs(%sqrt.131), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.133 = f64[] maximum(%sqrt.132, %constant.10), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.134 = f64[] minimum(%sqrt.132, %constant.10), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.135 = pred[] compare(%sqrt.133, %sqrt.134), direction=EQ, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.136 = f64[] multiply(%sqrt.133, %constant.11), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.137 = f64[] divide(%sqrt.134, %sqrt.133), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.138 = f64[] multiply(%sqrt.137, %sqrt.137), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.139 = f64[] add(%sqrt.138, %constant.10), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.140 = f64[] sqrt(%sqrt.139), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.141 = pred[] compare(%sqrt.140, %constant.10), direction=EQ, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.142 = pred[] compare(%sqrt.138, %constant.13), direction=GT, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.143 = pred[] and(%sqrt.141, %sqrt.142), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.144 = f64[] multiply(%sqrt.133, %sqrt.138), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.145 = f64[] divide(%sqrt.144, %constant.9), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.146 = f64[] add(%sqrt.133, %sqrt.145), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.147 = f64[] multiply(%sqrt.133, %sqrt.140), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.148 = f64[] select(%sqrt.143, %sqrt.146, %sqrt.147), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.149 = f64[] select(%sqrt.135, %sqrt.136, %sqrt.148), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.150 = f64[] add(%sqrt.149, %constant.10), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.151 = f64[] sqrt(%sqrt.150), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.152 = f64[] divide(%sqrt.151, %constant.11), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.153 = f64[] multiply(%sqrt.99, %sqrt.152), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.154 = f64[] sqrt(%sqrt.97), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.155 = f64[] add(%sqrt.131, %sqrt.149), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.156 = f64[] sqrt(%sqrt.155), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.157 = f64[] divide(%sqrt.156, %constant.11), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.158 = f64[] multiply(%sqrt.154, %sqrt.157), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.159 = f64[] select(%sqrt.126, %sqrt.153, %sqrt.158), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.160 = f64[] select(%sqrt.125, %sqrt.159, %sqrt.122), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.161 = f64[] select(%sqrt.98, %sqrt.101, %sqrt.160), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %constant.7 = f64[] constant(2.19736822693562)
+  %sqrt.162 = f64[] divide(%sqrt.154, %constant.7), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.163 = f64[] divide(%sqrt.99, %sqrt.154), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.164 = f64[] divide(%sqrt.154, %sqrt.99), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.165 = f64[] select(%sqrt.127, %sqrt.163, %sqrt.164), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.166 = f64[] select(%sqrt.98, %constant.10, %sqrt.165), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.167 = f64[] multiply(%sqrt.154, %sqrt.166), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.168 = f64[] multiply(%sqrt.151, %constant.11), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.169 = f64[] divide(%sqrt.167, %sqrt.168), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.170 = f64[] multiply(%sqrt.156, %constant.11), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.171 = f64[] divide(%sqrt.154, %sqrt.170), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.172 = f64[] select(%sqrt.126, %sqrt.169, %sqrt.171), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.173 = f64[] multiply(%sqrt.122, %constant.9), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.174 = f64[] divide(%sqrt.97, %sqrt.173), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.175 = f64[] select(%sqrt.125, %sqrt.172, %sqrt.174), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.176 = f64[] select(%sqrt.98, %sqrt.162, %sqrt.175), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.177 = f64[] select(%sqrt.94, %sqrt.161, %sqrt.176), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.178 = pred[] compare(%sqrt.93, %constant.13), direction=LT, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.179 = pred[] compare(%sqrt.96, %constant.13), direction=LT, metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.180 = f64[] negate(%sqrt.161), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.181 = f64[] select(%sqrt.179, %sqrt.180, %sqrt.161), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.182 = f64[] negate(%sqrt.176), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.183 = f64[] select(%sqrt.179, %sqrt.182, %sqrt.176), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  %sqrt.184 = f64[] select(%sqrt.178, %sqrt.181, %sqrt.183), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+  ROOT %sqrt.185 = c128[] complex(%sqrt.177, %sqrt.184), metadata={op_name="jit(sqrt)/sqrt" stack_frame_id=9}
+}
+

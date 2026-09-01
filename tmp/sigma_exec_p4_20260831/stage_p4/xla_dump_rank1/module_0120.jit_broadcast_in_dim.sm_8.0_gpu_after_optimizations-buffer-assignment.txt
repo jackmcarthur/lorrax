@@ -1,0 +1,36 @@
+BufferAssignment:
+allocation 0: size 262144, output shape is |f64[32,32,32]|, maybe-live-out:
+ value: <3 wrapped_broadcast @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+allocation 1: size 8, parameter 0, shape |f64[]| at ShapeIndex {}:
+ value: <2 args_0_.1 @0> (size=8,offset=0): f64[]
+
+Total bytes used: 262152 (256.0KiB)
+
+Used values:
+<2 args_0_.1 @0>
+ positions:
+  args_0_.1
+ uses:
+  wrapped_broadcast, operand 0
+ from instruction: %args_0_.1 = f64[] parameter(0), metadata={op_name="args[0]"}
+<3 wrapped_broadcast @0>
+ positions:
+  wrapped_broadcast
+ uses:
+ from instruction: %wrapped_broadcast = f64[32,32,32]{2,1,0} fusion(%args_0_.1), kind=kLoop, calls=%wrapped_broadcast_computation, metadata={op_name="jit(broadcast_in_dim)/broadcast_in_dim" stack_frame_id=7}
+
+
+HloLiveRange (max 2):
+  InstructionSequence:
+    0:args_0_.1
+    1:wrapped_broadcast
+  BufferLiveRange:
+    args_0_.1{}:0-2
+    wrapped_broadcast{}:1-2
+  Live ranges at 1 (peak):
+    wrapped_broadcast{}: 262144 bytes (cumulative: 262144 bytes)
+    args_0_.1{}: 8 bytes (cumulative: 262152 bytes)
+  Stack trace breakdown for peak usage: 262 152 bytes
+    main.1 (100.0%, total: 262 152 bytes, current: 0 bytes, remaining: 262 152 bytes)
+      ├── jit(broadcast_in_dim)/broadcast_in_dim (100.0%, total: 262 144 bytes, current: 262 144 bytes, remaining: 8 bytes)
+      └── args[0] (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

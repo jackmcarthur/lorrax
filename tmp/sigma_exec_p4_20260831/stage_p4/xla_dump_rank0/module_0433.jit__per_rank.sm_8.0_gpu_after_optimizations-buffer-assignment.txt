@@ -1,0 +1,72 @@
+BufferAssignment:
+allocation 0: size 267264, parameter 0, shape |c128[29,24,24]| at ShapeIndex {}:
+ value: <0 param.4 @0> (size=267264,offset=0): c128[29,24,24]{2,1,0}
+allocation 1: size 24, parameter 2, shape |s64[3]| at ShapeIndex {}:
+ value: <2 param.6 @0> (size=24,offset=0): s64[3]{0}
+allocation 2: size 24, parameter 3, shape |s64[3]| at ShapeIndex {}:
+ value: <3 param.7 @0> (size=24,offset=0): s64[3]{0}
+allocation 3: size 16, parameter 1, shape |s64[2]| at ShapeIndex {}:
+ value: <1 param.5 @0> (size=16,offset=0): s64[2]{0}
+allocation 4: size 4, output shape is |s32[1]|, maybe-live-out:
+ value: <4 ffi_call.3 @0> (size=4,offset=0): s32[1]{0}
+
+Total bytes used: 267332 (261.1KiB)
+
+Used values:
+<0 param.4 @0>
+ positions:
+  param.4
+ uses:
+  ffi_call.3, operand 0
+ from instruction: %param.4 = c128[29,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="A_local"}
+<1 param.5 @0>
+ positions:
+  param.5
+ uses:
+  ffi_call.3, operand 1
+ from instruction: %param.5 = s64[2]{0} parameter(1), sharding={replicated}, metadata={op_name="handle_local"}
+<2 param.6 @0>
+ positions:
+  param.6
+ uses:
+  ffi_call.3, operand 2
+ from instruction: %param.6 = s64[3]{0} parameter(2), sharding={replicated}, metadata={op_name="offset_local"}
+<3 param.7 @0>
+ positions:
+  param.7
+ uses:
+  ffi_call.3, operand 3
+ from instruction: %param.7 = s64[3]{0} parameter(3), sharding={replicated}, metadata={op_name="valid_shape_local"}
+<4 ffi_call.3 @0>
+ positions:
+  ffi_call.3
+ uses:
+ from instruction: %ffi_call.3 = s32[1]{0} custom-call(%param.4, %param.5, %param.6, %param.7), custom_call_target="lorrax_phdf5_write", operand_layout_constraints={c128[29,24,24]{2,1,0}, s64[2]{0}, s64[3]{0}, s64[3]{0}}, custom_call_has_side_effect=true, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_per_rank)/shard_map/ffi_call" stack_frame_id=4}, backend_config={axis_count_per_dim = dense<0> : tensor<3xi64>, axis_flat = dense<> : tensor<0xi64>, mesh_shape = dense<2> : tensor<2xi64>}
+
+
+HloLiveRange (max 5):
+  InstructionSequence:
+    0:param.7
+    1:param.6
+    2:param.5
+    3:param.4
+    4:ffi_call.3
+  BufferLiveRange:
+    param.4{}:0-5
+    param.5{}:0-5
+    param.6{}:0-5
+    param.7{}:0-5
+    ffi_call.3{}:4-5
+  Live ranges at 4 (peak):
+    param.4{}: 267264 bytes (cumulative: 267264 bytes)
+    param.6{}: 24 bytes (cumulative: 267288 bytes)
+    param.7{}: 24 bytes (cumulative: 267312 bytes)
+    param.5{}: 16 bytes (cumulative: 267328 bytes)
+    ffi_call.3{}: 4 bytes (cumulative: 267332 bytes)
+  Stack trace breakdown for peak usage: 267 332 bytes
+    main.0_spmd (100.0%, total: 267 332 bytes, current: 0 bytes, remaining: 267 332 bytes)
+      ├── A_local (100.0%, total: 267 264 bytes, current: 267 264 bytes, remaining: 68 bytes)
+      ├── offset_local (0.0%, total: 24 bytes, current: 24 bytes, remaining: 44 bytes)
+      ├── valid_shape_local (0.0%, total: 24 bytes, current: 24 bytes, remaining: 20 bytes)
+      ├── handle_local (0.0%, total: 16 bytes, current: 16 bytes, remaining: 4 bytes)
+      └── jit(_per_rank)/shard_map/ffi_call (0.0%, total: 4 bytes, current: 4 bytes, remaining: 0 bytes)

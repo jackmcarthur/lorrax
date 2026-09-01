@@ -1,0 +1,40 @@
+HloModule jit_multiply, entry_computation_layout={(f64[], c128[512,24,24]{2,1,0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={empty_mesh = #sdy.mesh<[]>, mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/dynamic_sigma.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "write_sigma_omega"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1128 column=15 end_column=54}
+5 {file_name_id=3 function_name_id=4 line=425 end_line=455 column=34 end_column=13}
+6 {file_name_id=4 function_name_id=5 line=290 end_line=290 column=28 end_column=45}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+
+
+ENTRY %main.1 (x.1: f64[], y.1: c128[512,24,24]) -> c128[512,24,24] {
+  %x.1 = f64[] parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@empty_mesh, []>"}, metadata={op_name="x"}
+  %convert_element_type.1 = c128[] convert(%x.1), metadata={op_name="jit(multiply)/convert_element_type" stack_frame_id=6}
+  %mul.2 = c128[512,24,24]{2,1,0} broadcast(%convert_element_type.1), dimensions={}, metadata={op_name="jit(multiply)/mul" stack_frame_id=6}
+  %y.1 = c128[512,24,24]{2,1,0} parameter(1), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {}]>"}, metadata={op_name="y"}
+  ROOT %mul.3 = c128[512,24,24]{2,1,0} multiply(%mul.2, %y.1), metadata={op_name="jit(multiply)/mul" stack_frame_id=6}
+}
+

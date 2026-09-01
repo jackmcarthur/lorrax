@@ -1,0 +1,20 @@
+001: kKernel	, kernel = loop_broadcast_fusion, profile_annotation = loop_broadcast_fusion, launch dimensions = blocks: {33, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+002: kCopy  	
+017: kWhile 	  
+condition:
+    003: kKernel	, kernel = loop_compare_fusion, profile_annotation = loop_compare_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt
+  body:
+    004: kCopy                  	
+    005: kKernel                	, kernel = loop_gather_fusion, profile_annotation = loop_gather_fusion, launch dimensions = blocks: {768, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+    006: kFft                   	
+    007: kKernel                	, kernel = loop_multiply_fusion, profile_annotation = loop_multiply_fusion, launch dimensions = blocks: {768, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+    008: kFft                   	
+    009: kKernel                	, kernel = loop_gather_fusion_1, profile_annotation = loop_gather_fusion.1, launch dimensions = blocks: {144, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+    010: kCollectivePermuteStart	
+    011: kAllGatherStart        	
+    012: kAllGatherStart        	
+    013: kKernel                	, kernel = loop_complex_multiply_fusion, profile_annotation = loop_complex_multiply_fusion, launch dimensions = blocks: {288, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+    014: kGemm                  	
+    015: kCopy                  	
+    016: kKernel                	, kernel = loop_add_fusion, profile_annotation = loop_add_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt
+

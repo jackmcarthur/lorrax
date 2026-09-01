@@ -1,0 +1,193 @@
+HloModule jit__kernel, entry_computation_layout={(c128[21,512,12,12]{3,2,1,0}, c128[512,24,24]{2,1,0}, s32[512,24]{1,0}, s32[512,24]{1,0}, c128[512,24]{1,0}, /*index=5*/c128[512,24]{1,0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false,false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/qsgw_utils.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "build_qsgw_sigma_xc"
+6 "_qsgw_build_kernel.<locals>._kernel"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=770 column=18 end_column=18}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1110 column=15 end_column=15}
+5 {file_name_id=3 function_name_id=4 line=467 end_line=467 column=35 end_column=35}
+6 {file_name_id=4 function_name_id=5 line=701 end_line=701 column=20 end_column=20}
+7 {file_name_id=4 function_name_id=6 line=580 end_line=580 column=16 end_column=16}
+8 {file_name_id=4 function_name_id=6 line=576 end_line=576 column=20 end_column=20}
+9 {file_name_id=4 function_name_id=6 line=580 end_line=580 column=41 end_column=41}
+10 {file_name_id=4 function_name_id=6 line=577 end_line=577 column=20 end_column=20}
+11 {file_name_id=4 function_name_id=6 line=586 end_line=586 column=16 end_column=16}
+12 {file_name_id=4 function_name_id=6 line=582 end_line=582 column=20 end_column=20}
+13 {file_name_id=4 function_name_id=6 line=586 end_line=586 column=41 end_column=41}
+14 {file_name_id=4 function_name_id=6 line=583 end_line=583 column=20 end_column=20}
+15 {file_name_id=4 function_name_id=6 line=593 end_line=593 column=23 end_column=23}
+16 {file_name_id=4 function_name_id=6 line=593 end_line=593 column=16 end_column=16}
+17 {file_name_id=4 function_name_id=6 line=594 end_line=594 column=16 end_column=16}
+18 {file_name_id=4 function_name_id=6 line=595 end_line=595 column=28 end_column=28}
+19 {file_name_id=4 function_name_id=6 line=595 end_line=595 column=24 end_column=24}
+20 {file_name_id=4 function_name_id=6 line=595 end_line=595 column=17 end_column=17}
+21 {file_name_id=4 function_name_id=6 line=596 end_line=596 column=19 end_column=19}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=7}
+9 {file_location_id=9 parent_frame_id=7}
+10 {file_location_id=10 parent_frame_id=7}
+11 {file_location_id=11 parent_frame_id=7}
+12 {file_location_id=12 parent_frame_id=7}
+13 {file_location_id=13 parent_frame_id=7}
+14 {file_location_id=14 parent_frame_id=7}
+15 {file_location_id=15 parent_frame_id=7}
+16 {file_location_id=16 parent_frame_id=7}
+17 {file_location_id=17 parent_frame_id=7}
+18 {file_location_id=18 parent_frame_id=7}
+19 {file_location_id=18 parent_frame_id=19}
+20 {file_location_id=19 parent_frame_id=7}
+21 {file_location_id=20 parent_frame_id=7}
+22 {file_location_id=21 parent_frame_id=7}
+
+
+ENTRY %main.1_spmd (param.2: c128[21,512,12,12], param.5: c128[512,24,24], param.1: s32[512,24], param.4: s32[512,24], param: c128[512,24], param.3: c128[512,24]) -> c128[512,24,24] {
+  %param = c128[512,24]{1,0} parameter(4), sharding={replicated}, metadata={op_name="wlo"}
+  %constant.56 = s32[] constant(0), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %constant.57 = s32[2]{0} constant({0, 12}), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %constant.55 = u32[4]{0} constant({0, 0, 1, 1}), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %partition-id = u32[] partition-id()
+  %dynamic-slice = u32[1]{0} dynamic-slice(%constant.55, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %reshape.97 = u32[] reshape(%dynamic-slice), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %dynamic-slice.1 = s32[1]{0} dynamic-slice(%constant.57, %reshape.97), dynamic_slice_sizes={1}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %reshape.98 = s32[] reshape(%dynamic-slice.1), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %dynamic-slice.2 = c128[512,12]{1,0} dynamic-slice(%param, %constant.56, %reshape.98), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %mul.9 = c128[1,512,12,12]{3,2,1,0} broadcast(%dynamic-slice.2), dimensions={1,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %param.1 = s32[512,24]{1,0} parameter(2), sharding={replicated}, metadata={op_name="ilo"}
+  %dynamic-slice.5 = s32[512,12]{1,0} dynamic-slice(%param.1, %constant.56, %reshape.98), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.40 = s64[512,12]{1,0} convert(%dynamic-slice.5), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %constant.61 = s64[] constant(0)
+  %lt.30 = s64[512,12]{1,0} broadcast(%constant.61), dimensions={}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/lt"}
+  %lt.31 = pred[512,12]{1,0} compare(%convert_element_type.40, %lt.30), direction=LT, metadata={op_name="jit(_kernel)/jit(take_along_axis)/lt"}
+  %broadcast_in_dim.12 = pred[1,512,12,12]{3,2,1,0} broadcast(%lt.31), dimensions={1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=8}
+  %constant.62 = s64[] constant(21)
+  %add.43 = s64[512,12]{1,0} broadcast(%constant.62), dimensions={}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/add"}
+  %add.44 = s64[512,12]{1,0} add(%convert_element_type.40, %add.43), metadata={op_name="jit(_kernel)/jit(take_along_axis)/add"}
+  %broadcast_in_dim.42 = s64[1,512,12,12]{3,2,1,0} broadcast(%add.44), dimensions={1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=8}
+  %broadcast_in_dim.43 = s64[1,512,12,12]{3,2,1,0} broadcast(%convert_element_type.40), dimensions={1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=8}
+  %select_n.24 = s64[1,512,12,12]{3,2,1,0} select(%broadcast_in_dim.12, %broadcast_in_dim.42, %broadcast_in_dim.43), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %convert_element_type.41 = s32[1,512,12,12]{3,2,1,0} convert(%select_n.24), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.42 = s32[1,512,12,12,1]{4,3,2,1,0} reshape(%convert_element_type.41), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %ge.21 = s32[1,512,12,12,1]{4,3,2,1,0} broadcast(%constant.56), dimensions={}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/ge"}
+  %ge.22 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.42, %ge.21), direction=GE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/ge"}
+  %constant.64 = s32[] constant(20)
+  %le.21 = s32[1,512,12,12,1]{4,3,2,1,0} broadcast(%constant.64), dimensions={}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/le"}
+  %le.22 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.42, %le.21), direction=LE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/le"}
+  %and.12 = pred[1,512,12,12,1]{4,3,2,1,0} and(%ge.22, %le.22), metadata={op_name="jit(_kernel)/jit(take_along_axis)/and"}
+  %reduce_and.24 = pred[1,512,12,12]{3,2,1,0} reshape(%and.12), metadata={op_name="jit(_kernel)/jit(take_along_axis)/reduce_and"}
+  %param.2 = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="sig_w"}
+  %gather.12 = c128[1,512,12,12]{3,2,1,0} gather(%param.2, %convert_element_type.42), offset_dims={}, collapsed_slice_dims={0}, start_index_map={0}, operand_batching_dims={1,2,3}, start_indices_batching_dims={1,2,3}, index_vector_dim=4, slice_sizes={1,1,1,1}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/gather"}
+  %constant.67 = c128[] constant((nan, 0))
+  %broadcast_in_dim.44 = c128[1,512,12,12]{3,2,1,0} broadcast(%constant.67), dimensions={}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/broadcast_in_dim"}
+  %select_n.25 = c128[1,512,12,12]{3,2,1,0} select(%reduce_and.24, %gather.12, %broadcast_in_dim.44), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %mul.10 = c128[1,512,12,12]{3,2,1,0} multiply(%mul.9, %select_n.25), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+  %param.3 = c128[512,24]{1,0} parameter(5), sharding={replicated}, metadata={op_name="whi"}
+  %dynamic-slice.10 = c128[512,12]{1,0} dynamic-slice(%param.3, %constant.56, %reshape.98), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=9}
+  %mul.36 = c128[1,512,12,12]{3,2,1,0} broadcast(%dynamic-slice.10), dimensions={1,2}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=9}
+  %param.4 = s32[512,24]{1,0} parameter(3), sharding={replicated}, metadata={op_name="ihi"}
+  %dynamic-slice.13 = s32[512,12]{1,0} dynamic-slice(%param.4, %constant.56, %reshape.98), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.43 = s64[512,12]{1,0} convert(%dynamic-slice.13), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %lt.32 = pred[512,12]{1,0} compare(%convert_element_type.43, %lt.30), direction=LT, metadata={op_name="jit(_kernel)/jit(take_along_axis)/lt"}
+  %broadcast_in_dim.45 = pred[1,512,12,12]{3,2,1,0} broadcast(%lt.32), dimensions={1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=10}
+  %add.45 = s64[512,12]{1,0} add(%convert_element_type.43, %add.43), metadata={op_name="jit(_kernel)/jit(take_along_axis)/add"}
+  %broadcast_in_dim.46 = s64[1,512,12,12]{3,2,1,0} broadcast(%add.45), dimensions={1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=10}
+  %broadcast_in_dim.47 = s64[1,512,12,12]{3,2,1,0} broadcast(%convert_element_type.43), dimensions={1,2}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=10}
+  %select_n.26 = s64[1,512,12,12]{3,2,1,0} select(%broadcast_in_dim.45, %broadcast_in_dim.46, %broadcast_in_dim.47), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %convert_element_type.44 = s32[1,512,12,12]{3,2,1,0} convert(%select_n.26), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.45 = s32[1,512,12,12,1]{4,3,2,1,0} reshape(%convert_element_type.44), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %ge.23 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.45, %ge.21), direction=GE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/ge"}
+  %le.23 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.45, %le.21), direction=LE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/le"}
+  %and.13 = pred[1,512,12,12,1]{4,3,2,1,0} and(%ge.23, %le.23), metadata={op_name="jit(_kernel)/jit(take_along_axis)/and"}
+  %reduce_and.25 = pred[1,512,12,12]{3,2,1,0} reshape(%and.13), metadata={op_name="jit(_kernel)/jit(take_along_axis)/reduce_and"}
+  %gather.13 = c128[1,512,12,12]{3,2,1,0} gather(%param.2, %convert_element_type.45), offset_dims={}, collapsed_slice_dims={0}, start_index_map={0}, operand_batching_dims={1,2,3}, start_indices_batching_dims={1,2,3}, index_vector_dim=4, slice_sizes={1,1,1,1}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/gather"}
+  %select_n.27 = c128[1,512,12,12]{3,2,1,0} select(%reduce_and.25, %gather.13, %broadcast_in_dim.44), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %mul.37 = c128[1,512,12,12]{3,2,1,0} multiply(%mul.36, %select_n.27), metadata={op_name="jit(_kernel)/mul" stack_frame_id=9}
+  %add.46 = c128[1,512,12,12]{3,2,1,0} add(%mul.10, %mul.37), metadata={op_name="jit(_kernel)/add" stack_frame_id=7}
+  %constant.76 = u32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %dynamic-slice.16 = u32[1]{0} dynamic-slice(%constant.76, %partition-id), dynamic_slice_sizes={1}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %reshape.109 = u32[] reshape(%dynamic-slice.16), metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %dynamic-slice.17 = s32[1]{0} dynamic-slice(%constant.57, %reshape.109), dynamic_slice_sizes={1}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %reshape.110 = s32[] reshape(%dynamic-slice.17), metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %dynamic-slice.18 = c128[512,12]{1,0} dynamic-slice(%param, %constant.56, %reshape.110), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %mul.38 = c128[1,512,12,12]{3,2,1,0} broadcast(%dynamic-slice.18), dimensions={1,3}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %dynamic-slice.21 = s32[512,12]{1,0} dynamic-slice(%param.1, %constant.56, %reshape.110), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.46 = s64[512,12]{1,0} convert(%dynamic-slice.21), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %lt.33 = s64[512,12]{1,0} broadcast(%constant.61), dimensions={}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/lt"}
+  %lt.34 = pred[512,12]{1,0} compare(%convert_element_type.46, %lt.33), direction=LT, metadata={op_name="jit(_kernel)/jit(take_along_axis)/lt"}
+  %broadcast_in_dim.48 = pred[1,512,12,12]{3,2,1,0} broadcast(%lt.34), dimensions={1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=12}
+  %add.47 = s64[512,12]{1,0} broadcast(%constant.62), dimensions={}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/add"}
+  %add.48 = s64[512,12]{1,0} add(%convert_element_type.46, %add.47), metadata={op_name="jit(_kernel)/jit(take_along_axis)/add"}
+  %broadcast_in_dim.49 = s64[1,512,12,12]{3,2,1,0} broadcast(%add.48), dimensions={1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=12}
+  %broadcast_in_dim.50 = s64[1,512,12,12]{3,2,1,0} broadcast(%convert_element_type.46), dimensions={1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=12}
+  %select_n.28 = s64[1,512,12,12]{3,2,1,0} select(%broadcast_in_dim.48, %broadcast_in_dim.49, %broadcast_in_dim.50), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %convert_element_type.47 = s32[1,512,12,12]{3,2,1,0} convert(%select_n.28), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.48 = s32[1,512,12,12,1]{4,3,2,1,0} reshape(%convert_element_type.47), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %ge.24 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.48, %ge.21), direction=GE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/ge"}
+  %le.24 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.48, %le.21), direction=LE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/le"}
+  %and.14 = pred[1,512,12,12,1]{4,3,2,1,0} and(%ge.24, %le.24), metadata={op_name="jit(_kernel)/jit(take_along_axis)/and"}
+  %reduce_and.26 = pred[1,512,12,12]{3,2,1,0} reshape(%and.14), metadata={op_name="jit(_kernel)/jit(take_along_axis)/reduce_and"}
+  %gather.14 = c128[1,512,12,12]{3,2,1,0} gather(%param.2, %convert_element_type.48), offset_dims={}, collapsed_slice_dims={0}, start_index_map={0}, operand_batching_dims={1,2,3}, start_indices_batching_dims={1,2,3}, index_vector_dim=4, slice_sizes={1,1,1,1}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/gather"}
+  %select_n.29 = c128[1,512,12,12]{3,2,1,0} select(%reduce_and.26, %gather.14, %broadcast_in_dim.44), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %mul.39 = c128[1,512,12,12]{3,2,1,0} multiply(%mul.38, %select_n.29), metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+  %dynamic-slice.26 = c128[512,12]{1,0} dynamic-slice(%param.3, %constant.56, %reshape.110), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=13}
+  %mul.40 = c128[1,512,12,12]{3,2,1,0} broadcast(%dynamic-slice.26), dimensions={1,3}, metadata={op_name="jit(_kernel)/mul" stack_frame_id=13}
+  %dynamic-slice.29 = s32[512,12]{1,0} dynamic-slice(%param.4, %constant.56, %reshape.110), dynamic_slice_sizes={512,12}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.49 = s64[512,12]{1,0} convert(%dynamic-slice.29), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %lt.35 = pred[512,12]{1,0} compare(%convert_element_type.49, %lt.33), direction=LT, metadata={op_name="jit(_kernel)/jit(take_along_axis)/lt"}
+  %broadcast_in_dim.51 = pred[1,512,12,12]{3,2,1,0} broadcast(%lt.35), dimensions={1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=14}
+  %add.49 = s64[512,12]{1,0} add(%convert_element_type.49, %add.47), metadata={op_name="jit(_kernel)/jit(take_along_axis)/add"}
+  %broadcast_in_dim.52 = s64[1,512,12,12]{3,2,1,0} broadcast(%add.49), dimensions={1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=14}
+  %broadcast_in_dim.53 = s64[1,512,12,12]{3,2,1,0} broadcast(%convert_element_type.49), dimensions={1,3}, metadata={op_name="jit(_kernel)/broadcast_in_dim" stack_frame_id=14}
+  %select_n.30 = s64[1,512,12,12]{3,2,1,0} select(%broadcast_in_dim.51, %broadcast_in_dim.52, %broadcast_in_dim.53), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %convert_element_type.50 = s32[1,512,12,12]{3,2,1,0} convert(%select_n.30), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %convert_element_type.51 = s32[1,512,12,12,1]{4,3,2,1,0} reshape(%convert_element_type.50), metadata={op_name="jit(_kernel)/jit(take_along_axis)/convert_element_type"}
+  %ge.25 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.51, %ge.21), direction=GE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/ge"}
+  %le.25 = pred[1,512,12,12,1]{4,3,2,1,0} compare(%convert_element_type.51, %le.21), direction=LE, metadata={op_name="jit(_kernel)/jit(take_along_axis)/le"}
+  %and.15 = pred[1,512,12,12,1]{4,3,2,1,0} and(%ge.25, %le.25), metadata={op_name="jit(_kernel)/jit(take_along_axis)/and"}
+  %reduce_and.27 = pred[1,512,12,12]{3,2,1,0} reshape(%and.15), metadata={op_name="jit(_kernel)/jit(take_along_axis)/reduce_and"}
+  %gather.15 = c128[1,512,12,12]{3,2,1,0} gather(%param.2, %convert_element_type.51), offset_dims={}, collapsed_slice_dims={0}, start_index_map={0}, operand_batching_dims={1,2,3}, start_indices_batching_dims={1,2,3}, index_vector_dim=4, slice_sizes={1,1,1,1}, metadata={op_name="jit(_kernel)/jit(take_along_axis)/gather"}
+  %select_n.31 = c128[1,512,12,12]{3,2,1,0} select(%reduce_and.27, %gather.15, %broadcast_in_dim.44), metadata={op_name="jit(_kernel)/jit(take_along_axis)/select_n"}
+  %mul.41 = c128[1,512,12,12]{3,2,1,0} multiply(%mul.40, %select_n.31), metadata={op_name="jit(_kernel)/mul" stack_frame_id=13}
+  %add.50 = c128[1,512,12,12]{3,2,1,0} add(%mul.39, %mul.41), metadata={op_name="jit(_kernel)/add" stack_frame_id=11}
+  %add.51 = c128[1,512,12,12]{3,2,1,0} add(%add.46, %add.50), metadata={op_name="jit(_kernel)/add" stack_frame_id=15}
+  %constant.92 = c128[] constant((0.5, 0))
+  %broadcast.77 = c128[1,512,12,12]{3,2,1,0} broadcast(%constant.92), dimensions={}, metadata={op_name="broadcast.73"}
+  %mul.42 = c128[1,512,12,12]{3,2,1,0} multiply(%add.51, %broadcast.77), metadata={op_name="jit(_kernel)/mul" stack_frame_id=16}
+  %mul.43 = c128[512,12,12]{2,1,0} reshape(%mul.42), metadata={op_name="jit(_kernel)/mul" stack_frame_id=16}
+  %all-gather = c128[512,12,24]{2,1,0} all-gather(%mul.43), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, metadata={op_name="jit(_kernel)/add" stack_frame_id=16}
+  %all-gather.1 = c128[512,24,24]{2,1,0} all-gather(%all-gather), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, metadata={op_name="jit(_kernel)/add" stack_frame_id=16}
+  %param.5 = c128[512,24,24]{2,1,0} parameter(1), sharding={replicated}, metadata={op_name="sig_x"}
+  %add.52 = c128[512,24,24]{2,1,0} add(%all-gather.1, %param.5), metadata={op_name="jit(_kernel)/add" stack_frame_id=16}
+  %sharding_constraint.4 = c128[512,24,24]{2,1,0} copy(%add.52), metadata={op_name="jit(_kernel)/sharding_constraint" stack_frame_id=17}
+  %real.3 = f64[512,24,24]{2,1,0} real(%sharding_constraint.4), metadata={op_name="jit(_kernel)/real" stack_frame_id=19}
+  %imag.3 = f64[512,24,24]{2,1,0} imag(%sharding_constraint.4), metadata={op_name="jit(_kernel)/imag" stack_frame_id=19}
+  %neg.3 = f64[512,24,24]{2,1,0} negate(%imag.3), metadata={op_name="jit(_kernel)/neg" stack_frame_id=19}
+  %complex.4 = c128[512,24,24]{2,1,0} complex(%real.3, %neg.3), metadata={op_name="jit(_kernel)/complex" stack_frame_id=19}
+  %complex.5 = c128[512,24,24]{1,2,0} transpose(%complex.4), dimensions={0,2,1}, metadata={op_name="jit(_kernel)/complex" stack_frame_id=19}
+  %add.53 = c128[512,24,24]{2,1,0} add(%sharding_constraint.4, %complex.5), metadata={op_name="jit(_kernel)/add" stack_frame_id=20}
+  %broadcast.78 = c128[512,24,24]{2,1,0} broadcast(%constant.92), dimensions={}, metadata={op_name="broadcast.1"}
+  %mul.44 = c128[512,24,24]{2,1,0} multiply(%add.53, %broadcast.78), metadata={op_name="jit(_kernel)/mul" stack_frame_id=21}
+  ROOT %sharding_constraint.5 = c128[512,24,24]{2,1,0} copy(%mul.44), metadata={op_name="jit(_kernel)/sharding_constraint" stack_frame_id=22}
+}
+

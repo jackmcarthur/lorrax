@@ -1,0 +1,50 @@
+HloModule jit_iota, entry_computation_layout={()->f64[32]{0}}, allow_spmd_sharding_propagation_to_output={true}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/psp/get_DFT_mtxels.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/psp/dft_operators.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "_compute_live_hartree"
+5 "compute_hartree_matrix"
+6 "build_hartree_potential"
+7 "compute_hartree_potential_real"
+8 "poisson_potential_from_rhoG"
+9 "_poisson_reciprocal_geometry"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=922 end_line=924 column=30 end_column=48}
+5 {file_name_id=3 function_name_id=4 line=318 end_line=329 column=12 end_column=47}
+6 {file_name_id=4 function_name_id=5 line=921 end_line=926 column=12 end_column=5}
+7 {file_name_id=5 function_name_id=6 line=683 end_line=689 column=12 end_column=5}
+8 {file_name_id=5 function_name_id=7 line=846 end_line=846 column=12 end_column=79}
+9 {file_name_id=6 function_name_id=8 line=160 end_line=161 column=16 end_column=50}
+10 {file_name_id=6 function_name_id=9 line=111 end_line=111 column=9 end_column=29}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+
+
+ENTRY %main.1 () -> f64[32] {
+  ROOT %iota.1 = f64[32]{0} iota(), iota_dimension=0, metadata={op_name="jit(iota)/iota" stack_frame_id=10}
+}
+

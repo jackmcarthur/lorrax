@@ -1,0 +1,51 @@
+HloModule jit__f, entry_computation_layout={(c128[29,12,12]{2,1,0})->c128[512,12,12]{2,1,0}}, num_partitions=4
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/kin_ion.py"
+6 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/services/symmetry_maps/src/symmetry_maps/maps.py"
+
+FunctionNames
+1 "main"
+2 "compute_sigma_xc"
+3 "_compute_live_hartree"
+4 "compute_hartree_matrix"
+5 "broadcast_ibz_to_full_bz"
+6 "star_broadcast"
+7 "_broadcast_rows"
+8 "_broadcast_rows.<locals>._build.<locals>._f"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=48 end_line=48 column=13 end_column=13}
+2 {file_name_id=2 function_name_id=1 line=770 end_line=770 column=18 end_column=18}
+3 {file_name_id=3 function_name_id=2 line=922 end_line=922 column=30 end_column=30}
+4 {file_name_id=3 function_name_id=3 line=318 end_line=318 column=12 end_column=12}
+5 {file_name_id=4 function_name_id=4 line=1020 end_line=1020 column=23 end_column=23}
+6 {file_name_id=4 function_name_id=5 line=312 end_line=312 column=11 end_column=11}
+7 {file_name_id=5 function_name_id=5 line=158 end_line=158 column=8 end_column=8}
+8 {file_name_id=6 function_name_id=6 line=3309 end_line=3309 column=11 end_column=11}
+9 {file_name_id=6 function_name_id=7 line=3117 end_line=3117 column=11 end_column=11}
+10 {file_name_id=6 function_name_id=8 line=3111 end_line=3111 column=18 end_column=18}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+
+
+ENTRY %main.0_spmd (param: c128[29,12,12]) -> c128[512,12,12] {
+  %param = c128[29,12,12]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="x"}
+  %constant.2 = s32[512,1]{1,0} constant({...})
+  ROOT %gather = c128[512,12,12]{2,1,0} gather(%param, %constant.2), offset_dims={1,2}, collapsed_slice_dims={0}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,12,12}, metadata={op_name="jit(_f)/gather" stack_frame_id=10}
+}
+

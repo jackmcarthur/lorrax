@@ -1,0 +1,213 @@
+# collectives_details.txt — top-40 collectives by output bytes
+# Each block: HLO line of the collective ± 3 lines of context
+# plus the Python source_file:line extracted from metadata.
+
+────────────────────────────────────────────────────────────
+[module_0360.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation (param_0.29: c128[512,310,310]) -> c128[512,310,310] {
+     %param_0.29 = c128[512,310,310]{1,0,2} parameter(0)
+>>   ROOT %all_to_all.52.1 = c128[512,310,310]{1,0,2} all-to-all(%param_0.29), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}
+   }
+   
+   %async_computation.1 (param_0.30: c128[512,620,155]) -> c128[512,620,155] {
+
+────────────────────────────────────────────────────────────
+[module_0360.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation.1 (param_0.30: c128[512,620,155]) -> c128[512,620,155] {
+     %param_0.30 = c128[512,620,155]{2,0,1} parameter(0)
+>>   ROOT %all_to_all.56.1 = c128[512,620,155]{2,0,1} all-to-all(%param_0.30), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}
+   }
+   
+   %async_computation.2 (param_0.31: c128[512,310,310]) -> c128[512,310,310] {
+
+────────────────────────────────────────────────────────────
+[module_0360.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation.2 (param_0.31: c128[512,310,310]) -> c128[512,310,310] {
+     %param_0.31 = c128[512,310,310]{2,0,1} parameter(0)
+>>   ROOT %all_to_all.60.1 = c128[512,310,310]{2,0,1} all-to-all(%param_0.31), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}
+   }
+   
+   %async_computation.3 (param_0.32: c128[512,155,620]) -> c128[512,155,620] {
+
+────────────────────────────────────────────────────────────
+[module_0360.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation.3 (param_0.32: c128[512,155,620]) -> c128[512,155,620] {
+     %param_0.32 = c128[512,155,620]{1,0,2} parameter(0)
+>>   ROOT %all_to_all.64.1 = c128[512,155,620]{1,0,2} all-to-all(%param_0.32), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}
+   }
+   
+   %wrapped_gather_computation (param_0.33: c128[29,310,310], param_1.18: s32[512,1]) -> c128[512,1,310,310] {
+
+────────────────────────────────────────────────────────────
+[module_0364.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation (param_0.38: c128[512,310,310]) -> c128[512,310,310] {
+     %param_0.38 = c128[512,310,310]{1,0,2} parameter(0)
+>>   ROOT %all_to_all.52.1 = c128[512,310,310]{1,0,2} all-to-all(%param_0.38), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}
+   }
+   
+   %async_computation.1 (param_0.39: c128[512,620,155]) -> c128[512,620,155] {
+
+────────────────────────────────────────────────────────────
+[module_0364.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation.1 (param_0.39: c128[512,620,155]) -> c128[512,620,155] {
+     %param_0.39 = c128[512,620,155]{2,0,1} parameter(0)
+>>   ROOT %all_to_all.56.1 = c128[512,620,155]{2,0,1} all-to-all(%param_0.39), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}
+   }
+   
+   %async_computation.2 (param_0.40: c128[512,310,310]) -> c128[512,310,310] {
+
+────────────────────────────────────────────────────────────
+[module_0364.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation.2 (param_0.40: c128[512,310,310]) -> c128[512,310,310] {
+     %param_0.40 = c128[512,310,310]{2,0,1} parameter(0)
+>>   ROOT %all_to_all.60.1 = c128[512,310,310]{2,0,1} all-to-all(%param_0.40), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}
+   }
+   
+   %async_computation.3 (param_0.41: c128[512,155,620]) -> c128[512,155,620] {
+
+────────────────────────────────────────────────────────────
+[module_0364.jit__do_unfold]  op=all-to-all  bytes=750.78 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation.3 (param_0.41: c128[512,155,620]) -> c128[512,155,620] {
+     %param_0.41 = c128[512,155,620]{1,0,2} parameter(0)
+>>   ROOT %all_to_all.64.1 = c128[512,155,620]{1,0,2} all-to-all(%param_0.41), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}
+   }
+   
+   %wrapped_gather_computation (param_0.42: c128[29,310,310], param_1.29: s32[512,1]) -> c128[512,1,310,310] {
+
+────────────────────────────────────────────────────────────
+[module_0380.jit__project]  op=reduce-scatter  bytes=58.12 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation (param_0.6: c128[512,2,310,24]) -> c128[512,2,310,12] {
+     %param_0.6 = c128[512,2,310,24]{2,1,0,3} parameter(0)
+>>   ROOT %reduce_scatter.14.1 = c128[512,2,310,12]{2,1,0,3} reduce-scatter(%param_0.6), channel_id=1, replica_groups={{0,1},{2,3}}, use_global_device_ids=true, dimensions={3}, to_apply=%region_0.0
+   }
+   
+   %region_1.0 (reduce_scatter.4: c128[], reduce_scatter.5: c128[]) -> c128[] {
+
+────────────────────────────────────────────────────────────
+[module_0407.jit__identity_fn]  op=all-gather-start  bytes=6.75 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+     %all-gather-done = c128[512,12,24]{1,0,2} all-gather-done(%all-gather-start)
+     %loop_transpose_fusion.1 = c128[12,512,24]{2,1,0} fusion(%all-gather-done), kind=kInput, calls=%fused_transpose.1, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+     %bitcast.23.0 = c128[512,12,24]{2,0,1} bitcast(%loop_transpose_fusion.1)
+>>   %all-gather-start.1 = (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1}) all-gather-start(%bitcast.23.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %all-gather-done.1 = c128[512,24,24]{2,0,1} all-gather-done(%all-gather-start.1)
+     ROOT %loop_transpose_fusion = c128[512,24,24]{2,1,0} fusion(%all-gather-done.1), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+   }
+
+────────────────────────────────────────────────────────────
+[module_0439.jit__kernel]  op=all-gather-start  bytes=6.75 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+     %all-gather-done = c128[512,12,24]{1,0,2} all-gather-done(%all-gather-start)
+     %loop_transpose_fusion = c128[12,512,24]{2,1,0} fusion(%all-gather-done), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+     %bitcast.226.0 = c128[512,12,24]{2,0,1} bitcast(%loop_transpose_fusion)
+>>   %all-gather-start.1 = (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1}) all-gather-start(%bitcast.226.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %all-gather-done.1 = c128[512,24,24]{2,0,1} all-gather-done(%all-gather-start.1)
+     ROOT %input_transpose_fusion = c128[512,24,24]{2,1,0} fusion(%param.5, %all-gather-done.1), kind=kInput, calls=%fused_transpose.1, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+   }
+
+────────────────────────────────────────────────────────────
+[module_0407.jit__identity_fn]  op=all-gather-start  bytes=3.38 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+     %param = c128[512,12,12]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}
+     %wrapped_transpose = c128[12,512,12]{2,1,0} fusion(%param), kind=kInput, calls=%wrapped_transpose_computation, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+     %bitcast.19.0 = c128[512,12,12]{1,0,2} bitcast(%wrapped_transpose)
+>>   %all-gather-start = (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2}) all-gather-start(%bitcast.19.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %all-gather-done = c128[512,12,24]{1,0,2} all-gather-done(%all-gather-start)
+     %loop_transpose_fusion.1 = c128[12,512,24]{2,1,0} fusion(%all-gather-done), kind=kInput, calls=%fused_transpose.1, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+     %bitcast.23.0 = c128[512,12,24]{2,0,1} bitcast(%loop_transpose_fusion.1)
+
+────────────────────────────────────────────────────────────
+[module_0439.jit__kernel]  op=all-gather-start  bytes=3.38 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+     %get-tuple-element = c128[1,12,512,12]{3,2,1,0} get-tuple-element(%input_transpose_fusion.2), index=0
+     %input_transpose_fusion.1 = c128[1,12,512,12]{3,2,1,0} fusion(%get-tuple-element, %param.2, %input_transpose_fusion.3, %get-tuple-element.1, %param, /*index=5*/%param.3, %param.1, %constant_76_0, %partition-id.1, %constant_55_0), kind=kInput, calls=%fused_transpose.2, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+     %bitcast.222.0 = c128[512,12,12]{1,0,2} bitcast(%input_transpose_fusion.1)
+>>   %all-gather-start = (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2}) all-gather-start(%bitcast.222.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %all-gather-done = c128[512,12,24]{1,0,2} all-gather-done(%all-gather-start)
+     %loop_transpose_fusion = c128[12,512,24]{2,1,0} fusion(%all-gather-done), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+     %bitcast.226.0 = c128[512,12,24]{2,0,1} bitcast(%loop_transpose_fusion)
+
+────────────────────────────────────────────────────────────
+[module_0380.jit__project]  op=reduce-scatter  bytes=1.12 MiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   %async_computation.1 (param_0.7: c128[512,24,12]) -> c128[512,12,12] {
+     %param_0.7 = c128[512,24,12]{2,0,1} parameter(0)
+>>   ROOT %reduce_scatter.15.1 = c128[512,12,12]{2,0,1} reduce-scatter(%param_0.7), channel_id=1, replica_groups={{0,2},{1,3}}, use_global_device_ids=true, dimensions={1}, to_apply=%region_1.0
+   }
+   
+   ENTRY %main.0_spmd (param.3: c128[512,24,2,310], param.4: c128[512,2,310,2,310], param.5: c128[512,2,310,24]) -> c128[512,12,12] {
+
+────────────────────────────────────────────────────────────
+[module_0299.jit__run]  op=all-gather-start  bytes=861.75 KiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+     %collective-permute-start = (c128[1,6,2,1532]{3,2,1,0}, c128[1,6,2,1532]{3,2,1,0}) collective-permute-start(%bitcast.27.0), channel_id=4, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %collective-permute-done = c128[1,6,2,1532]{3,2,1,0} collective-permute-done(%collective-permute-start)
+     %bitcast.15.0 = c128[6,2,1532]{2,1,0} bitcast(%collective-permute-done)
+>>   %all-gather-start.1 = (c128[6,2,1532]{2,1,0}, c128[12,2,1532]{2,1,0}) all-gather-start(%bitcast.15.0), channel_id=5, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %all-gather-done.1 = c128[12,2,1532]{2,1,0} all-gather-done(%all-gather-start.1)
+     %bitcast.57 = c128[6,2,1532]{2,1,0} bitcast(%loop_dynamic_slice_fusion)
+     %all-gather-start = (c128[6,2,1532]{2,1,0}, c128[12,2,1532]{2,1,0}) all-gather-start(%bitcast.57), channel_id=1, replica_groups=[2,2]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+
+────────────────────────────────────────────────────────────
+[module_0299.jit__run]  op=all-gather-start  bytes=861.75 KiB  src=(no source metadata)
+────────────────────────────────────────────────────────────
+     %all-gather-start.1 = (c128[6,2,1532]{2,1,0}, c128[12,2,1532]{2,1,0}) all-gather-start(%bitcast.15.0), channel_id=5, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %all-gather-done.1 = c128[12,2,1532]{2,1,0} all-gather-done(%all-gather-start.1)
+     %bitcast.57 = c128[6,2,1532]{2,1,0} bitcast(%loop_dynamic_slice_fusion)
+>>   %all-gather-start = (c128[6,2,1532]{2,1,0}, c128[12,2,1532]{2,1,0}) all-gather-start(%bitcast.57), channel_id=1, replica_groups=[2,2]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     %all-gather-done = c128[12,2,1532]{2,1,0} all-gather-done(%all-gather-start)
+     %get-tuple-element.60 = f64[29,1532]{1,0} get-tuple-element(%param.4), index=3
+     %loop_complex_multiply_fusion = (c128[12,2,1532]{2,1,0}, c128[12,2,1532]{2,1,0}) fusion(%all-gather-done.1, %get-tuple-element.60, %get-tuple-element.50, %all-gather-done), kind=kLoop, calls=%fused_complex_multiply
+
+────────────────────────────────────────────────────────────
+[module_0005.jit__identity_fn]  op=all-gather-start  bytes=160.00 B  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   ENTRY %main.0_spmd (param: f64[2,2]) -> f64[8,2] {
+     %param = f64[2,2]{1,0} parameter(0), sharding={devices=[4,1]<=[4]}
+>>   %all-gather-start = (f64[2,2]{1,0}, f64[8,2]{1,0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     ROOT %all-gather-done = f64[8,2]{1,0} all-gather-done(%all-gather-start)
+   }
+   
+
+────────────────────────────────────────────────────────────
+[module_0014.jit__identity_fn]  op=all-gather-start  bytes=80.00 B  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   ENTRY %main.0_spmd (param: f64[2]) -> f64[8] {
+     %param = f64[2]{0} parameter(0), sharding={devices=[4]<=[4]}
+>>   %all-gather-start = (f64[2]{0}, f64[8]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     ROOT %all-gather-done = f64[8]{0} all-gather-done(%all-gather-start)
+   }
+   
+
+────────────────────────────────────────────────────────────
+[module_0030.jit__identity_fn]  op=all-gather-start  bytes=20.00 B  src=(no source metadata)
+────────────────────────────────────────────────────────────
+   
+   ENTRY %main.0_spmd (param: u32[1]) -> u32[4] {
+     %param = u32[1]{0} parameter(0), sharding={devices=[4]<=[4]}
+>>   %all-gather-start = (u32[1]{0}, u32[4]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+     ROOT %all-gather-done = u32[4]{0} all-gather-done(%all-gather-start)
+   }
+   
+

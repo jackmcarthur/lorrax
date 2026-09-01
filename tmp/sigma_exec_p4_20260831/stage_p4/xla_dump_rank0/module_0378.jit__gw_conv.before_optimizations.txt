@@ -1,0 +1,64 @@
+HloModule jit__gw_conv, buffer_donor={ (0, {}) }, entry_computation_layout={(c128[512,2,620,2,620]{4,3,2,1,0}, c128[512,620,620]{2,1,0})->c128[512,2,620,2,620]{4,3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/ffi/fft.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/ppm_tau_kernel.py"
+
+FunctionNames
+1 "make_gw_conv_ffi.<locals>._local"
+2 "compute_sigma_xc"
+3 "compute_sigma_c_mpa_omega_grid"
+4 "integrate_sigma_store"
+5 "integrate_sigma_store.<locals>.run"
+6 "_integrate_sigma_batches"
+7 "get_shared_sigma_tau_kernel.<locals>._tau_staged"
+8 "_get_sigma_kij_kernel.<locals>.staged"
+9 "_get_sigma_kij_kernel.<locals>._staged_impl"
+10 "get_sigma_spatial_kernel.<locals>.conv_project_staged"
+11 "make_gw_conv_ffi.<locals>._gw_conv"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=499 end_line=502 column=15 end_column=36}
+2 {file_name_id=2 function_name_id=2 line=1066 end_line=1086 column=15 end_column=30}
+3 {file_name_id=3 function_name_id=3 line=541 end_line=543 column=15 end_column=63}
+4 {file_name_id=3 function_name_id=4 line=300 end_line=300 column=15 end_column=27}
+5 {file_name_id=3 function_name_id=5 line=295 end_line=297 column=15 end_column=67}
+6 {file_name_id=3 function_name_id=6 line=212 end_line=212 column=42 end_column=67}
+7 {file_name_id=4 function_name_id=7 line=1140 end_line=1142 column=15 end_column=46}
+8 {file_name_id=4 function_name_id=8 line=846 end_line=848 column=19 end_column=62}
+9 {file_name_id=4 function_name_id=9 line=816 end_line=817 column=19 end_column=54}
+10 {file_name_id=4 function_name_id=10 line=378 end_line=378 column=26 end_column=46}
+11 {file_name_id=1 function_name_id=11 line=516 end_line=516 column=15 end_column=34}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=1}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=11}
+
+
+%xla.sdy.manual_computation_body.1 (shard_map.5: c128[512,2,310,2,310], shard_map.6: c128[512,310,310]) -> c128[512,2,310,2,310] {
+  %shard_map.5 = c128[512,2,310,2,310]{4,3,2,1,0} parameter(0), metadata={op_name="shard_map"}
+  %shard_map.6 = c128[512,310,310]{2,1,0} parameter(1), metadata={op_name="shard_map"}
+  ROOT %ffi_call.1 = c128[512,2,310,2,310]{4,3,2,1,0} custom-call(%shard_map.5, %shard_map.6), custom_call_target="lorrax_mklfft_gw_conv", operand_layout_constraints={c128[512,2,310,2,310]{4,3,2,1,0}, c128[512,310,310]{2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="ffi_call" stack_frame_id=1}, backend_config={nkx = 8 : i64, nky = 8 : i64, nkz = 8 : i64, scale_f = -0.0019531249999999996 : f64, scale_i = 0.044194173824159216 : f64}
+}
+
+ENTRY %main.2 (G_flat.1: c128[512,2,620,2,620], W_flat.1: c128[512,620,620]) -> c128[512,2,620,2,620] {
+  %G_flat.1 = c128[512,2,620,2,620]{4,3,2,1,0} parameter(0), sharding={devices=[1,1,2,1,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {}, {\"y\"}]>"}, metadata={op_name="G_flat"}
+  %W_flat.1 = c128[512,620,620]{2,1,0} parameter(1), sharding={devices=[1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="W_flat"}
+  %shard_map.9 = (c128[512,2,310,2,310]{4,3,2,1,0}, c128[512,310,310]{2,1,0}) custom-call(%G_flat.1, %W_flat.1), custom_call_target="xla.sdy.GlobalToLocalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.in_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {}, {\"x\"}, {}, {\"y\"}]>, <@mesh, [{}, {\"x\"}, {\"y\"}]>]>",xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>"}, metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=11}
+  %shard_map.10 = c128[512,2,310,2,310]{4,3,2,1,0} get-tuple-element(%shard_map.9), index=0, metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=11}
+  %shard_map.11 = c128[512,310,310]{2,1,0} get-tuple-element(%shard_map.9), index=1, metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=11}
+  %shard_map.12 = c128[512,2,310,2,310]{4,3,2,1,0} call(%shard_map.10, %shard_map.11), to_apply=%xla.sdy.manual_computation_body.1, frontend_attributes={inlineable="false"}, metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=11}
+  ROOT %shard_map.13 = c128[512,2,620,2,620]{4,3,2,1,0} custom-call(%shard_map.12), custom_call_target="xla.sdy.LocalToGlobalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>",xla.sdy.out_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {}, {\"x\"}, {}, {\"y\"}]>]>"}, metadata={op_name="jit(_gw_conv)/shard_map" stack_frame_id=11}
+}
+

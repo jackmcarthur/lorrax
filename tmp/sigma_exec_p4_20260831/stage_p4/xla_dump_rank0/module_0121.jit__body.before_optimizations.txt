@@ -1,0 +1,61 @@
+HloModule jit__body, entry_computation_layout={(f64[4,32,32,32]{3,2,1,0})->f64[32,32,32]{2,1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/collectives.py"
+2 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+
+FunctionNames
+1 "_psum_kernel.<locals>._body"
+2 "<module>"
+3 "main"
+4 "compute_sigma_xc"
+5 "_compute_live_hartree"
+6 "compute_hartree_matrix"
+7 "psum_replicate"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=721 end_line=721 column=19 end_column=43}
+2 {file_name_id=1 function_name_id=1 line=721 end_line=721 column=32 end_column=36}
+3 {file_name_id=2 function_name_id=2 line=53 end_line=53 column=21 end_column=27}
+4 {file_name_id=2 function_name_id=3 line=48 end_line=48 column=13 end_column=48}
+5 {file_name_id=3 function_name_id=3 line=770 end_line=786 column=18 end_column=4}
+6 {file_name_id=4 function_name_id=4 line=922 end_line=924 column=30 end_column=48}
+7 {file_name_id=4 function_name_id=5 line=318 end_line=329 column=12 end_column=47}
+8 {file_name_id=5 function_name_id=6 line=841 end_line=845 column=12 end_column=49}
+9 {file_name_id=1 function_name_id=7 line=684 end_line=684 column=22 end_column=55}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=1 parent_frame_id=2}
+3 {file_location_id=2 parent_frame_id=1}
+4 {file_location_id=3 parent_frame_id=1}
+5 {file_location_id=4 parent_frame_id=5}
+6 {file_location_id=5 parent_frame_id=6}
+7 {file_location_id=6 parent_frame_id=7}
+8 {file_location_id=7 parent_frame_id=8}
+9 {file_location_id=8 parent_frame_id=9}
+10 {file_location_id=9 parent_frame_id=10}
+
+
+%region_0.1 (psum.2: f64[], psum.3: f64[]) -> f64[] {
+  %psum.2 = f64[] parameter(0), metadata={op_name="psum"}
+  %psum.3 = f64[] parameter(1), metadata={op_name="psum"}
+  ROOT %add.1 = f64[] add(%psum.2, %psum.3), metadata={op_name="add" stack_frame_id=2}
+}
+
+%xla.sdy.manual_computation_body.2 (shard_map.2: f64[1,32,32,32]) -> f64[32,32,32] {
+  %shard_map.2 = f64[1,32,32,32]{3,2,1,0} parameter(0), metadata={op_name="shard_map"}
+  %squeeze.1 = f64[32,32,32]{2,1,0} reshape(%shard_map.2), metadata={op_name="squeeze" stack_frame_id=3}
+  ROOT %psum.5 = f64[32,32,32]{2,1,0} all-reduce(%squeeze.1), channel_id=1, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1, metadata={op_name="psum" stack_frame_id=1}
+}
+
+ENTRY %main.3 (x.1: f64[4,32,32,32]) -> f64[32,32,32] {
+  %x.1 = f64[4,32,32,32]{3,2,1,0} parameter(0), sharding={devices=[4,1,1,1]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{\"x\", \"y\"}, {}, {}, {}]>"}, metadata={op_name="x"}
+  %shard_map.5 = f64[1,32,32,32]{3,2,1,0} custom-call(%x.1), custom_call_target="xla.sdy.GlobalToLocalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.in_shardings="#sdy.sharding_per_value<[<@mesh, [{\"x\", \"y\"}, {}, {}, {}]>]>",xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>"}, metadata={op_name="jit(_body)/shard_map" stack_frame_id=10}
+  %shard_map.6 = f64[32,32,32]{2,1,0} call(%shard_map.5), to_apply=%xla.sdy.manual_computation_body.2, frontend_attributes={inlineable="false"}, metadata={op_name="jit(_body)/shard_map" stack_frame_id=10}
+  ROOT %shard_map.7 = f64[32,32,32]{2,1,0} custom-call(%shard_map.6), custom_call_target="xla.sdy.LocalToGlobalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>",xla.sdy.out_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {}, {}]>]>"}, metadata={op_name="jit(_body)/shard_map" stack_frame_id=10}
+}
+

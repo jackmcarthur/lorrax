@@ -1,0 +1,120 @@
+HloModule jit__per_rank, entry_computation_layout={(f64[24,2,29,1532,2]{4,3,2,1,0}, s32[29]{0})->c128[29,24,2,1532]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/services/wfn_loader/src/wfn_loader/loader.py"
+2 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/kin_ion_io.py"
+
+FunctionNames
+1 "_phdf5_unfold_kernel.<locals>._per_rank"
+2 "<module>"
+3 "main"
+4 "compute_sigma_xc"
+5 "_compute_live_hartree"
+6 "compute_hartree_matrix"
+7 "WfnLoader.load"
+8 "WfnLoader._phdf5_build"
+9 "WfnLoader._phdf5_unfold_and_shard"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=1867 end_line=1867 column=18 end_column=36}
+2 {file_name_id=1 function_name_id=1 line=1867 end_line=1867 column=44 end_column=62}
+3 {file_name_id=1 function_name_id=1 line=1867 end_line=1867 column=39 end_column=62}
+4 {file_name_id=1 function_name_id=1 line=1868 end_line=1868 column=18 end_column=58}
+5 {file_name_id=1 function_name_id=1 line=1869 end_line=1869 column=19 end_column=51}
+6 {file_name_id=2 function_name_id=2 line=53 end_line=53 column=21 end_column=27}
+7 {file_name_id=2 function_name_id=3 line=48 end_line=48 column=13 end_column=48}
+8 {file_name_id=3 function_name_id=3 line=770 end_line=786 column=18 end_column=4}
+9 {file_name_id=4 function_name_id=4 line=922 end_line=924 column=30 end_column=48}
+10 {file_name_id=4 function_name_id=5 line=318 end_line=329 column=12 end_column=47}
+11 {file_name_id=5 function_name_id=6 line=984 end_line=987 column=12 end_column=36}
+12 {file_name_id=1 function_name_id=7 line=1415 end_line=1417 column=18 end_column=65}
+13 {file_name_id=1 function_name_id=8 line=1298 end_line=1301 column=15 end_column=75}
+14 {file_name_id=1 function_name_id=9 line=1335 end_line=1335 column=18 end_column=63}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=1}
+3 {file_location_id=3 parent_frame_id=1}
+4 {file_location_id=4 parent_frame_id=1}
+5 {file_location_id=5 parent_frame_id=1}
+6 {file_location_id=6 parent_frame_id=1}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=11}
+12 {file_location_id=12 parent_frame_id=12}
+13 {file_location_id=13 parent_frame_id=13}
+14 {file_location_id=14 parent_frame_id=14}
+
+
+%_where.1 (Arg_0.2: pred[29], Arg_1.2: s32[29], Arg_2.1: s32[29]) -> s32[29] {
+  %Arg_0.2 = pred[29]{0} parameter(0)
+  %Arg_1.2 = s32[29]{0} parameter(1)
+  %Arg_2.1 = s32[29]{0} parameter(2)
+  ROOT %select_n.1 = s32[29]{0} select(%Arg_0.2, %Arg_1.2, %Arg_2.1), metadata={op_name="select_n"}
+}
+
+%region_0.2 (reduce_and.3: pred[], reduce_and.4: pred[]) -> pred[] {
+  %reduce_and.3 = pred[] parameter(0), metadata={op_name="reduce_and"}
+  %reduce_and.4 = pred[] parameter(1), metadata={op_name="reduce_and"}
+  ROOT %reduce_and.5 = pred[] and(%reduce_and.3, %reduce_and.4), metadata={op_name="reduce_and"}
+}
+
+%_take.3 (Arg_0.3: c128[6,2,29,1532], Arg_1.3: s32[29]) -> c128[6,2,29,1532] {
+  %Arg_1.3 = s32[29]{0} parameter(1)
+  %constant.12 = s32[] constant(0)
+  %broadcast.7 = s32[29]{0} broadcast(%constant.12), dimensions={}
+  %lt.1 = pred[29]{0} compare(%Arg_1.3, %broadcast.7), direction=LT, metadata={op_name="lt"}
+  %constant.10 = s32[] constant(29)
+  %broadcast.6 = s32[29]{0} broadcast(%constant.10), dimensions={}
+  %add.2 = s32[29]{0} add(%Arg_1.3, %broadcast.6), metadata={op_name="add"}
+  %jit__where_.1 = s32[29]{0} call(%lt.1, %add.2, %Arg_1.3), to_apply=%_where.1, metadata={op_name="jit(_where)"}
+  %broadcast_in_dim.4 = s32[29,1]{1,0} reshape(%jit__where_.1), metadata={op_name="broadcast_in_dim"}
+  %constant.9 = s32[] constant(0)
+  %broadcast.5 = s32[29,1]{1,0} broadcast(%constant.9), dimensions={}
+  %ge.1 = pred[29,1]{1,0} compare(%broadcast_in_dim.4, %broadcast.5), direction=GE, metadata={op_name="ge"}
+  %constant.8 = s32[] constant(28)
+  %broadcast.4 = s32[29,1]{1,0} broadcast(%constant.8), dimensions={}
+  %le.1 = pred[29,1]{1,0} compare(%broadcast_in_dim.4, %broadcast.4), direction=LE, metadata={op_name="le"}
+  %and.1 = pred[29,1]{1,0} and(%ge.1, %le.1), metadata={op_name="and"}
+  %constant.11 = pred[] constant(true)
+  %reduce_and.7 = pred[29]{0} reduce(%and.1, %constant.11), dimensions={1}, to_apply=%region_0.2, metadata={op_name="reduce_and"}
+  %broadcast_in_dim.5 = pred[6,2,29,1532]{3,2,1,0} broadcast(%reduce_and.7), dimensions={2}, metadata={op_name="broadcast_in_dim"}
+  %Arg_0.3 = c128[6,2,29,1532]{3,2,1,0} parameter(0)
+  %gather.1 = c128[6,2,29,1532]{3,2,1,0} gather(%Arg_0.3, %broadcast_in_dim.4), offset_dims={0,1,3}, collapsed_slice_dims={2}, start_index_map={2}, index_vector_dim=1, slice_sizes={6,2,1,1532}, metadata={op_name="gather"}
+  %constant.7 = c128[] constant((nan, 0))
+  %broadcast_in_dim.3 = c128[6,2,29,1532]{3,2,1,0} broadcast(%constant.7), dimensions={}, metadata={op_name="broadcast_in_dim"}
+  ROOT %select_n.3 = c128[6,2,29,1532]{3,2,1,0} select(%broadcast_in_dim.5, %gather.1, %broadcast_in_dim.3), metadata={op_name="select_n"}
+}
+
+%xla.sdy.manual_computation_body.4 (shard_map.5: f64[6,2,29,1532,2], shard_map.6: s32[29]) -> c128[29,6,2,1532] {
+  %shard_map.5 = f64[6,2,29,1532,2]{4,3,2,1,0} parameter(0), metadata={op_name="shard_map"}
+  %slice.2 = f64[6,2,29,1532,1]{4,3,2,1,0} slice(%shard_map.5), slice={[0:6], [0:2], [0:29], [0:1532], [0:1]}, metadata={op_name="slice" stack_frame_id=1}
+  %squeeze.2 = f64[6,2,29,1532]{3,2,1,0} reshape(%slice.2), metadata={op_name="squeeze" stack_frame_id=1}
+  %convert_element_type.3 = c128[6,2,29,1532]{3,2,1,0} convert(%squeeze.2), metadata={op_name="convert_element_type" stack_frame_id=1}
+  %slice.3 = f64[6,2,29,1532,1]{4,3,2,1,0} slice(%shard_map.5), slice={[0:6], [0:2], [0:29], [0:1532], [1:2]}, metadata={op_name="slice" stack_frame_id=2}
+  %squeeze.3 = f64[6,2,29,1532]{3,2,1,0} reshape(%slice.3), metadata={op_name="squeeze" stack_frame_id=2}
+  %convert_element_type.2 = c128[6,2,29,1532]{3,2,1,0} convert(%squeeze.3), metadata={op_name="convert_element_type" stack_frame_id=3}
+  %constant.13 = c128[] constant((0, 1))
+  %mul.2 = c128[6,2,29,1532]{3,2,1,0} broadcast(%constant.13), dimensions={}, metadata={op_name="mul" stack_frame_id=3}
+  %mul.3 = c128[6,2,29,1532]{3,2,1,0} multiply(%convert_element_type.2, %mul.2), metadata={op_name="mul" stack_frame_id=3}
+  %add.3 = c128[6,2,29,1532]{3,2,1,0} add(%convert_element_type.3, %mul.3), metadata={op_name="add" stack_frame_id=1}
+  %shard_map.6 = s32[29]{0} parameter(1), metadata={op_name="shard_map"}
+  %jit__take_.1 = c128[6,2,29,1532]{3,2,1,0} call(%add.3, %shard_map.6), to_apply=%_take.3, metadata={op_name="jit(_take)" stack_frame_id=4}
+  ROOT %transpose.1 = c128[29,6,2,1532]{3,0,2,1} transpose(%jit__take_.1), dimensions={2,0,1,3}, metadata={op_name="transpose" stack_frame_id=5}
+}
+
+ENTRY %main.5 (cnk_at_ibz.1: f64[24,2,29,1532,2], position_in_reads.1: s32[29]) -> c128[29,24,2,1532] {
+  %cnk_at_ibz.1 = f64[24,2,29,1532,2]{4,3,2,1,0} parameter(0), sharding={devices=[4,1,1,1,1]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{\"x\", \"y\"}, {}, {}, {}, {}]>"}, metadata={op_name="cnk_at_ibz"}
+  %position_in_reads.1 = s32[29]{0} parameter(1), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}]>"}, metadata={op_name="position_in_reads"}
+  %shard_map.9 = (f64[6,2,29,1532,2]{4,3,2,1,0}, s32[29]{0}) custom-call(%cnk_at_ibz.1, %position_in_reads.1), custom_call_target="xla.sdy.GlobalToLocalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.in_shardings="#sdy.sharding_per_value<[<@mesh, [{\"x\", \"y\"}, {}, {}, {}, {}]>, <@mesh, [{}]>]>",xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>"}, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=14}
+  %shard_map.10 = f64[6,2,29,1532,2]{4,3,2,1,0} get-tuple-element(%shard_map.9), index=0, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=14}
+  %shard_map.11 = s32[29]{0} get-tuple-element(%shard_map.9), index=1, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=14}
+  %shard_map.12 = c128[29,6,2,1532]{3,0,2,1} call(%shard_map.10, %shard_map.11), to_apply=%xla.sdy.manual_computation_body.4, frontend_attributes={inlineable="false"}, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=14}
+  ROOT %shard_map.13 = c128[29,24,2,1532]{3,2,1,0} custom-call(%shard_map.12), custom_call_target="xla.sdy.LocalToGlobalShape", custom_call_has_side_effect=true, frontend_attributes={xla.sdy.manual_axes="#sdy<manual_axes{\"x\", \"y\"}>",xla.sdy.out_shardings="#sdy.sharding_per_value<[<@mesh, [{}, {\"x\", \"y\"}, {}, {}]>]>"}, metadata={op_name="jit(_per_rank)/shard_map" stack_frame_id=14}
+}
+

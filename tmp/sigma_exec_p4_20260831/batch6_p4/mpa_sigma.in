@@ -1,0 +1,36 @@
+[cohsex]
+nval = 10
+ncond = 14
+number_bands_chi = 48
+number_bands_sigma = 24
+sys_dim = 3
+mc_average_vcoul_body = false
+wfn_file = WFN.h5
+centroids_file = centroids_frac_620.txt
+kin_ion_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/kin_ion_receipt_24b.h5
+bispinor = false
+
+compute_mode = mpa
+mpa_n_poles = 8
+mpa_sampling_alpha = 2
+mpa_sampling_schedule = nested
+mpa_pole_solver = loewner
+mpa_metal_origin_shift_ry = 2.0e-5
+mpa_pole_batch_size = 6
+occ_smearing_family = mp1
+occ_smearing_width_ry = 0.01
+fermi_reference = mp1_fixed_n
+sigma_regularization_ev = 0.25
+mpa_sigma_sector_target_error = 1.0e-4
+
+# Reduced real demonstration grid; all other Sigma physics is inherited.
+sigma_omega_min_ev = 0.0
+sigma_omega_max_ev = 5.0
+sigma_omega_step_ev = 0.25
+
+qp_solver = one_shot_dft
+head_correction = off
+restart = true
+# Write tensors so repeated attempts skip the zeta/ISDF fitting instead
+# of refitting every launch (this deck is being iterated).
+write_restart_tensors = true

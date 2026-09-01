@@ -1,0 +1,53 @@
+HloModule jit_concatenate, entry_computation_layout={(c128[1,512,620,620]{3,2,1,0}, c128[1,512,620,620]{3,2,1,0}, c128[1,512,620,620]{3,2,1,0}, c128[1,512,620,620]{3,2,1,0})->c128[4,512,620,620]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/mpa_store.py"
+
+FunctionNames
+1 "main"
+2 "compute_sigma_xc"
+3 "compute_sigma_c_mpa_omega_grid"
+4 "integrate_sigma_store"
+5 "integrate_sigma_store.<locals>.run"
+6 "_integrate_sigma_batches"
+7 "integrate_sigma_store.<locals>.batches"
+8 "PoleReader.read"
+9 "_finish_pole_read"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=48 end_line=48 column=13 end_column=48}
+2 {file_name_id=2 function_name_id=1 line=770 end_line=786 column=18 end_column=4}
+3 {file_name_id=3 function_name_id=2 line=1066 end_line=1086 column=15 end_column=30}
+4 {file_name_id=4 function_name_id=3 line=541 end_line=543 column=15 end_column=63}
+5 {file_name_id=4 function_name_id=4 line=300 end_line=300 column=15 end_column=27}
+6 {file_name_id=4 function_name_id=5 line=295 end_line=297 column=15 end_column=67}
+7 {file_name_id=4 function_name_id=6 line=173 end_line=173 column=24 end_column=31}
+8 {file_name_id=4 function_name_id=7 line=287 end_line=289 column=23 end_column=29}
+9 {file_name_id=5 function_name_id=8 line=3673 end_line=3676 column=15 end_column=31}
+10 {file_name_id=5 function_name_id=9 line=3542 end_line=3542 column=12 end_column=21}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+
+
+ENTRY %main.1 (args_0_.1: c128[1,512,620,620], args_1_.1: c128[1,512,620,620], args_2_.1: c128[1,512,620,620], args_3_.1: c128[1,512,620,620]) -> c128[4,512,620,620] {
+  %args_0_.1 = c128[1,512,620,620]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="args[0]"}
+  %args_1_.1 = c128[1,512,620,620]{3,2,1,0} parameter(1), sharding={devices=[1,1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="args[1]"}
+  %args_2_.1 = c128[1,512,620,620]{3,2,1,0} parameter(2), sharding={devices=[1,1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="args[2]"}
+  %args_3_.1 = c128[1,512,620,620]{3,2,1,0} parameter(3), sharding={devices=[1,1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="args[3]"}
+  ROOT %concatenate.1 = c128[4,512,620,620]{3,2,1,0} concatenate(%args_0_.1, %args_1_.1, %args_2_.1, %args_3_.1), dimensions={0}, metadata={op_name="jit(concatenate)/concatenate" stack_frame_id=10}
+}
+

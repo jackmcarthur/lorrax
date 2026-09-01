@@ -1,0 +1,70 @@
+BufferAssignment:
+allocation 0: size 12582912, parameter 0, shape |f64[48,32768]| at ShapeIndex {}:
+ value: <10 a.1 @0> (size=12582912,offset=0): f64[48,32768]{1,0}
+allocation 1: size 262144, output shape is |f64[32768]|, maybe-live-out:
+ value: <11 input_reduce_fusion @0> (size=262144,offset=0): f64[32768]{0}
+ value: <12 loop_multiply_fusion @0> (size=262144,offset=0): f64[32768]{0}
+allocation 2: size 8, thread-local:
+ value: <0 reduce_sum.3 @0> (size=8,offset=0): f64[]
+allocation 3: size 8, thread-local:
+ value: <1 reduce_sum.4 @0> (size=8,offset=0): f64[]
+allocation 4: size 8, thread-local:
+ value: <2 reduce_sum.5.0 @0> (size=8,offset=0): f64[]
+
+Total bytes used: 12845080 (12.25MiB)
+
+Used values:
+<0 reduce_sum.3 @0>
+ positions:
+  reduce_sum.3
+ uses:
+  reduce_sum.5.0, operand 0
+ from instruction: %reduce_sum.3 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+<1 reduce_sum.4 @0>
+ positions:
+  reduce_sum.4
+ uses:
+  reduce_sum.5.0, operand 1
+ from instruction: %reduce_sum.4 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+<2 reduce_sum.5.0 @0>
+ positions:
+  reduce_sum.5.0
+ uses:
+ from instruction: %reduce_sum.5.0 = f64[] add(%reduce_sum.3, %reduce_sum.4), metadata={op_name="jit(_mean)/reduce_sum" stack_frame_id=9}
+<10 a.1 @0>
+ positions:
+  a.1
+ uses:
+  input_reduce_fusion, operand 0
+ from instruction: %a.1 = f64[48,32768]{1,0} parameter(0), metadata={op_name="a"}
+<11 input_reduce_fusion @0>
+ positions:
+  input_reduce_fusion
+ uses:
+  loop_multiply_fusion, operand 0
+ from instruction: %input_reduce_fusion = f64[32768]{0} fusion(%a.1), kind=kCustom, calls=%fused_reduce, metadata={op_name="jit(_mean)/reduce_sum" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"num_warps":"2","output_tiles":[{"sizes":["8"]}],"num_ctas":1,"num_stages":1,"is_tma_allowed":false,"is_warp_specialization_allowed":false}},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<12 loop_multiply_fusion @0>
+ positions:
+  loop_multiply_fusion
+ uses:
+ from instruction: %loop_multiply_fusion = f64[32768]{0} fusion(%input_reduce_fusion), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(_mean)/div" stack_frame_id=9}
+
+
+HloLiveRange (max 3):
+  InstructionSequence:
+    0:a.1
+    1:input_reduce_fusion
+    2:loop_multiply_fusion
+  BufferLiveRange:
+    a.1{}:0-3
+    input_reduce_fusion{}:1-2
+    loop_multiply_fusion{}:2-3
+  Live ranges at 2 (peak):
+    a.1{}: 12582912 bytes (cumulative: 12582912 bytes)
+    input_reduce_fusion{}: 262144 bytes (cumulative: 12845056 bytes)
+    loop_multiply_fusion{}: 262144 bytes (cumulative: 13107200 bytes)
+  Stack trace breakdown for peak usage: 13 107 200 bytes
+    main.2 (100.0%, total: 13 107 200 bytes, current: 0 bytes, remaining: 13 107 200 bytes)
+      ├── a (96.0%, total: 12 582 912 bytes, current: 12 582 912 bytes, remaining: 524 288 bytes)
+      ├── jit(_mean)/div (2.0%, total: 262 144 bytes, current: 262 144 bytes, remaining: 262 144 bytes)
+      └── jit(_mean)/reduce_sum (2.0%, total: 262 144 bytes, current: 262 144 bytes, remaining: 0 bytes)

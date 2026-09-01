@@ -1,0 +1,31 @@
+HloModule jit_gather, entry_computation_layout={(c128[512,620,620]{2,1,0}, s32[1]{0})->c128[620,620]{1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_init.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "prepare_isdf_and_wavefunctions"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=497 end_line=509 column=9 end_column=3}
+4 {file_name_id=3 function_name_id=3 line=3617 end_line=3617 column=20 end_column=30}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+
+
+ENTRY %main.1 (args_0_.1: c128[512,620,620], args_1_.1: s32[1]) -> c128[620,620] {
+  %args_0_.1 = c128[512,620,620]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="args[0]"}
+  %args_1_.1 = s32[1]{0} parameter(1), metadata={op_name="args[1]"}
+  ROOT %gather.1 = c128[620,620]{1,0} gather(%args_0_.1, %args_1_.1), offset_dims={0,1}, collapsed_slice_dims={0}, start_index_map={0}, index_vector_dim=0, slice_sizes={1,620,620}, indices_are_sorted=true, metadata={op_name="jit(gather)/gather" stack_frame_id=4}
+}
+

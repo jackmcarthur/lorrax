@@ -1,0 +1,1 @@
+001: kKernel	, kernel = wrapped_multiply, profile_annotation = wrapped_multiply, launch dimensions = blocks: {1, 1, 1}, threads/block: {32, 1, 1}, cluster_dim = nullopt

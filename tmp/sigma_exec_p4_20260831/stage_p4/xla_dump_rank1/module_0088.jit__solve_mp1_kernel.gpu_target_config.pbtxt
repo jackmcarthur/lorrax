@@ -1,0 +1,33 @@
+gpu_device_info {
+  threads_per_block_limit: 1024
+  threads_per_warp: 32
+  shared_memory_per_block: 49152
+  shared_memory_per_core: 167936
+  threads_per_core_limit: 2048
+  core_count: 108
+  fpus_per_core: 64
+  block_dim_limit_x: 2147483647
+  block_dim_limit_y: 65535
+  block_dim_limit_z: 65535
+  memory_bandwidth: 1555200000000
+  l2_cache_size: 41943040
+  clock_rate_ghz: 1.41
+  device_memory_size: 42404806656
+  shared_memory_per_block_optin: 166912
+  cuda_compute_capability {
+    major: 8
+    feature_extension: NONE
+  }
+  registers_per_core_limit: 65536
+  registers_per_block_limit: 65536
+}
+platform_name: "CUDA"
+dnn_version_info {
+  major: 9
+  minor: 24
+}
+device_description_str: "NVIDIA A100-SXM4-40GB"
+runtime_version {
+  major: 13
+  minor: 3
+}

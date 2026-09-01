@@ -1,0 +1,5 @@
+001: kKernel	, kernel = loop_compare_not_select_fusion, profile_annotation = loop_compare_not_select_fusion, launch dimensions = blocks: {96, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+002: kKernel	, kernel = input_reduce_fusion_2, profile_annotation = input_reduce_fusion.2, launch dimensions = blocks: {1, 1, 1}, threads/block: {768, 1, 1}, cluster_dim = nullopt
+003: kKernel	, kernel = input_reduce_fusion, profile_annotation = input_reduce_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {768, 1, 1}, cluster_dim = nullopt
+004: kKernel	, kernel = input_reduce_fusion_2, profile_annotation = input_reduce_fusion.1, launch dimensions = blocks: {1, 1, 1}, threads/block: {768, 1, 1}, cluster_dim = nullopt
+005: kKernel	, kernel = input_concatenate_fusion, profile_annotation = input_concatenate_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt

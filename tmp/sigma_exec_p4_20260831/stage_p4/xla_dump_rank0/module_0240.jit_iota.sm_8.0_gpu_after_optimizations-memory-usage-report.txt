@@ -1,0 +1,11 @@
+Total bytes used: 256 (256B)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+      256B(100%);         0B; allocation 0: size 256B, output shape is |s64[32]|, maybe-live-out:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 256B, output shape is |s64[32]|, maybe-live-out:

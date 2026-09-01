@@ -1,0 +1,38 @@
+HloModule jit_broadcast_in_dim, is_scheduled=true, entry_computation_layout={(f64[])->f64[1]{0}}, allow_spmd_sharding_propagation_to_parameters={true}, allow_spmd_sharding_propagation_to_output={true}, frontend_attributes={fingerprint_before_lhs="6b11ecc4d2f607de1e83d908264308a9"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_config.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/gpu_utils.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "LorraxConfig.from_input_file"
+4 "get_device_memory_gb"
+5 "_get_jax_gpu_memory_bytes"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=279 end_line=279 column=10 end_column=67}
+4 {file_name_id=3 function_name_id=3 line=4880 end_line=4880 column=35 end_column=57}
+5 {file_name_id=4 function_name_id=4 line=165 end_line=165 column=28 end_column=55}
+6 {file_name_id=4 function_name_id=5 line=111 end_line=111 column=12 end_column=24}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+
+
+ENTRY %main.1 (args_0_.1: f64[]) -> f64[1] {
+  %args_0_.1 = f64[] parameter(0), metadata={op_name="args[0]"}
+  %bitcast.1 = f64[1]{0} bitcast(%args_0_.1), metadata={op_name="args[0]"}
+  ROOT %copy.1 = f64[1]{0} copy(%bitcast.1)
+}
+

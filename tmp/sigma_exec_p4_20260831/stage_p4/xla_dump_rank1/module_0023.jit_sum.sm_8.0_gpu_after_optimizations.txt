@@ -1,0 +1,58 @@
+HloModule jit_sum, is_scheduled=true, entry_computation_layout={(f64[1]{0})->f64[]}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="e3a81c22f9cbdbb6305d255315f439f5"}
+
+FileNames
+1 "<frozen importlib._bootstrap>"
+2 "<frozen importlib._bootstrap_external>"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/runtime/__init__.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/collectives.py"
+
+FunctionNames
+1 "_call_with_frames_removed"
+2 "_find_and_load"
+3 "_find_and_load_unlocked"
+4 "_load_unlocked"
+5 "_LoaderBasics.exec_module"
+6 "<module>"
+7 "initialize_communicator_stack"
+8 "prepare_mesh"
+9 "nccl_warmup"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=488 end_line=488 column=11 end_column=11}
+2 {file_name_id=1 function_name_id=2 line=1360 end_line=1360 column=23 end_column=23}
+3 {file_name_id=1 function_name_id=3 line=1331 end_line=1331 column=21 end_column=21}
+4 {file_name_id=1 function_name_id=4 line=935 end_line=935 column=16 end_column=16}
+5 {file_name_id=2 function_name_id=5 line=999 end_line=999 column=8 end_column=8}
+6 {file_name_id=3 function_name_id=6 line=77 end_line=77 column=10 end_column=10}
+7 {file_name_id=4 function_name_id=7 line=1634 end_line=1634 column=11 end_column=11}
+8 {file_name_id=5 function_name_id=8 line=470 end_line=470 column=12 end_column=12}
+9 {file_name_id=4 function_name_id=9 line=1251 end_line=1251 column=12 end_column=12}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=1 parent_frame_id=6}
+7 {file_location_id=6 parent_frame_id=7}
+8 {file_location_id=7 parent_frame_id=8}
+9 {file_location_id=8 parent_frame_id=9}
+10 {file_location_id=9 parent_frame_id=10}
+
+
+%region_0.0.clone (reduce_sum.8: f64[], reduce_sum.9: f64[]) -> f64[] {
+  %reduce_sum.9 = f64[] parameter(1), metadata={op_name="jit(sum)/reduce_sum"}
+  %reduce_sum.8 = f64[] parameter(0), metadata={op_name="jit(sum)/reduce_sum"}
+  ROOT %reduce_sum.10.0 = f64[] add(%reduce_sum.8, %reduce_sum.9), metadata={op_name="jit(sum)/reduce_sum" stack_frame_id=10}
+}
+
+ENTRY %main.0_spmd (param: f64[1]) -> f64[] {
+  %param = f64[1]{0} parameter(0), sharding={devices=[2,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="a"}
+  %copy.2 = f64[1]{0} copy(%param)
+  %bitcast.1 = f64[] bitcast(%copy.2), metadata={op_name="a"}
+  %all-reduce-start = f64[] all-reduce-start(%bitcast.1), channel_id=1, replica_groups=[2,2]<=[4], use_global_device_ids=true, to_apply=%region_0.0.clone, metadata={op_name="jit(sum)/reduce_sum" stack_frame_id=10}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  ROOT %all-reduce-done = f64[] all-reduce-done(%all-reduce-start), metadata={op_name="jit(sum)/reduce_sum" stack_frame_id=10}
+}
+

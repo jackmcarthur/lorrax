@@ -1,0 +1,48 @@
+HloModule jit_gather, entry_computation_layout={(c128[21,512,24,24]{3,2,1,0}, s32[1]{0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/dynamic_sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/file_io/sigma_output.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "finalize_dynamic_sigma"
+5 "write_sigma_omega"
+6 "write_sigma_omega_h5"
+7 "extract_and_stamp_k_irr"
+8 "sigma_star_spread_stats"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=786 column=18 end_column=4}
+4 {file_name_id=3 function_name_id=3 line=1110 end_line=1128 column=15 end_column=54}
+5 {file_name_id=3 function_name_id=4 line=425 end_line=455 column=34 end_column=13}
+6 {file_name_id=4 function_name_id=5 line=287 end_line=307 column=8 end_column=9}
+7 {file_name_id=5 function_name_id=6 line=1322 end_line=1323 column=43 end_column=66}
+8 {file_name_id=5 function_name_id=7 line=1012 end_line=1014 column=10 end_column=54}
+9 {file_name_id=5 function_name_id=8 line=889 end_line=889 column=20 end_column=44}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+
+
+ENTRY %main.1 (args_0_.1: c128[21,512,24,24], args_1_.1: s32[1]) -> c128[512,24,24] {
+  %args_0_.1 = c128[21,512,24,24]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {\"x\"}, {\"y\"}]>"}, metadata={op_name="args[0]"}
+  %args_1_.1 = s32[1]{0} parameter(1), metadata={op_name="args[1]"}
+  ROOT %gather.1 = c128[512,24,24]{2,1,0} gather(%args_0_.1, %args_1_.1), offset_dims={0,1,2}, collapsed_slice_dims={0}, start_index_map={0}, index_vector_dim=0, slice_sizes={1,512,24,24}, indices_are_sorted=true, metadata={op_name="jit(gather)/gather" stack_frame_id=9}
+}
+

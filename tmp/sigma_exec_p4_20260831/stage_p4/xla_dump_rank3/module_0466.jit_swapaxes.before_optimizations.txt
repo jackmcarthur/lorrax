@@ -1,0 +1,26 @@
+HloModule jit_swapaxes, entry_computation_layout={(c128[512,24,24]{2,1,0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={xla.sdy.meshes={mesh = #sdy.mesh<["x"=2, "y"=2]>}}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=48}
+3 {file_name_id=2 function_name_id=2 line=1058 end_line=1058 column=48 end_column=91}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+
+
+ENTRY %main.1 (a.1: c128[512,24,24]) -> c128[512,24,24] {
+  %a.1 = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@mesh, [{}, {}, {}]>"}, metadata={op_name="a"}
+  ROOT %transpose.1 = c128[512,24,24]{1,2,0} transpose(%a.1), dimensions={0,2,1}, metadata={op_name="jit(swapaxes)/transpose" stack_frame_id=3}
+}
+

@@ -1,0 +1,7 @@
+HloModule jit__identity_fn, is_scheduled=true, entry_computation_layout={(c128[29,6,2,1532]{3,2,1,0})->c128[29,6,2,1532]{3,2,1,0}}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="6dba9fbccda7f6c121d4205618847485"}
+
+ENTRY %main.0_spmd (param: c128[29,6,2,1532]) -> c128[29,6,2,1532] {
+  %param = c128[29,6,2,1532]{3,2,1,0} parameter(0), sharding={devices=[1,4,1,1]<=[4]}, metadata={op_name="x"}
+  ROOT %copy.1 = c128[29,6,2,1532]{3,2,1,0} copy(%param)
+}
+

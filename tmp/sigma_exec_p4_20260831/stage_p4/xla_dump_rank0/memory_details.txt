@@ -1,0 +1,612 @@
+# memory_details.txt — top-40 modules by peak HBM
+# Each section: memory-usage-report.txt verbatim (allocations
+# sorted by size, smaller boilerplate trimmed).
+
+────────────────────────────────────────────────────────────
+[module_0109.jit_sigma_sx]   peak HBM = 8.25 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 8857125744 (8.25GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   6.60GiB( 80%);    1.65GiB; allocation 13: size 6.60GiB, preallocated-temp:
+   7.33GiB( 89%);  939.00MiB; allocation 0: size 750.78MiB, parameter 5, shape |c128[512,310,310]| at ShapeIndex {}:
+   7.56GiB( 92%);  706.50MiB; allocation 1: size 232.50MiB, parameter 1, shape |c128[512,48,2,310]| at ShapeIndex {}:
+   7.79GiB( 94%);  474.00MiB; allocation 2: size 232.50MiB, parameter 0, shape |c128[512,2,310,48]| at ShapeIndex {}:
+   8.01GiB( 97%);  241.50MiB; allocation 3: size 232.50MiB, parameter 2, shape |c128[512,48,2,310]| at ShapeIndex {}:
+   8.24GiB(100%);    9.00MiB; allocation 4: size 232.50MiB, parameter 3, shape |c128[512,2,310,48]| at ShapeIndex {}:
+   8.24GiB(100%);    4.50MiB; allocation 5: size 4.50MiB, output shape is |c128[512,24,24]|, maybe-live-out:
+   8.25GiB(100%);        96B; allocation 6: size 4.50MiB, parameter 4, shape |c128[512,24,24]| at ShapeIndex {}:
+   8.25GiB(100%);        80B; allocation 7: size 16B, thread-local:
+   8.25GiB(100%);        64B; allocation 8: size 16B, thread-local:
+   8.25GiB(100%);        48B; allocation 9: size 16B, thread-local:
+   8.25GiB(100%);        32B; allocation 10: size 16B, thread-local:
+   8.25GiB(100%);        16B; allocation 11: size 16B, thread-local:
+   8.25GiB(100%);         0B; allocation 12: size 16B, thread-local:
+
+────────────────────────────────────────────────────────────
+[module_0374.jit__build]   peak HBM = 6.60 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 7085263605 (6.60GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   2.93GiB( 44%);    3.67GiB; allocation 0: size 2.93GiB, parameter 1, shape |c128[4,512,310,310]| at ShapeIndex {}:
+   5.87GiB( 89%);  750.78MiB; allocation 1: size 2.93GiB, parameter 0, shape |c128[4,512,310,310]| at ShapeIndex {}:
+   6.60GiB(100%);     2.7KiB; allocation 2: size 750.78MiB, output shape is |c128[512,310,310]|, maybe-live-out:
+   6.60GiB(100%);       244B; allocation 9: size 2.5KiB, preallocated-temp:
+   6.60GiB(100%);        52B; allocation 3: size 192B, parameter 3, shape |f64[4,6]| at ShapeIndex {}:
+   6.60GiB(100%);        36B; allocation 6: size 16B, parameter 2, shape |s32[4]| at ShapeIndex {}:
+   6.60GiB(100%);        20B; allocation 7: size 16B, parameter 6, shape |c128[]| at ShapeIndex {}:
+   6.60GiB(100%);        12B; allocation 5: size 8B, parameter 5, shape |f64[]| at ShapeIndex {}:
+   6.60GiB(100%);         4B; allocation 8: size 8B, constant:
+   6.60GiB(100%);         0B; allocation 4: size 4B, parameter 4, shape |pred[4]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0368.jit_concatenate]   peak HBM = 5.87 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 6298009600 (5.87GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   2.93GiB( 50%);    2.93GiB; allocation 0: size 2.93GiB, output shape is |c128[4,512,310,310]|, maybe-live-out:
+   3.67GiB( 62%);    2.20GiB; allocation 1: size 750.78MiB, parameter 0, shape |c128[1,512,310,310]| at ShapeIndex {}:
+   4.40GiB( 75%);    1.47GiB; allocation 2: size 750.78MiB, parameter 1, shape |c128[1,512,310,310]| at ShapeIndex {}:
+   5.13GiB( 88%);  750.78MiB; allocation 3: size 750.78MiB, parameter 2, shape |c128[1,512,310,310]| at ShapeIndex {}:
+   5.87GiB(100%);         0B; allocation 4: size 750.78MiB, parameter 3, shape |c128[1,512,310,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0378.jit__gw_conv]   peak HBM = 3.67 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 3936256000 (3.67GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   2.93GiB( 80%);  750.78MiB; allocation 0: size 2.93GiB, parameter 0, shape |c128[512,2,310,2,310]| at ShapeIndex {}, output shape is |c128[512,2,310,2,310]|, maybe-live-out:
+   3.67GiB(100%);         0B; allocation 1: size 750.78MiB, parameter 1, shape |c128[512,310,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0380.jit__project]   peak HBM = 3.39 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 3637773680 (3.39GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   2.93GiB( 87%);  466.13MiB; allocation 0: size 2.93GiB, parameter 1, shape |c128[512,2,310,2,310]| at ShapeIndex {}:
+   3.16GiB( 93%);  233.62MiB; allocation 10: size 232.50MiB, preallocated-temp:
+   3.27GiB( 97%);  117.38MiB; allocation 1: size 116.25MiB, parameter 0, shape |c128[512,24,2,310]| at ShapeIndex {}:
+   3.39GiB(100%);    1.12MiB; allocation 2: size 116.25MiB, parameter 2, shape |c128[512,2,310,24]| at ShapeIndex {}:
+   3.39GiB(100%);        96B; allocation 3: size 1.12MiB, output shape is |c128[512,12,12]|, maybe-live-out:
+   3.39GiB(100%);        80B; allocation 4: size 16B, thread-local:
+   3.39GiB(100%);        64B; allocation 5: size 16B, thread-local:
+   3.39GiB(100%);        48B; allocation 6: size 16B, thread-local:
+   3.39GiB(100%);        32B; allocation 7: size 16B, thread-local:
+   3.39GiB(100%);        16B; allocation 8: size 16B, thread-local:
+   3.39GiB(100%);         0B; allocation 9: size 16B, thread-local:
+
+────────────────────────────────────────────────────────────
+[module_0376.jit__g_from_selector]   peak HBM = 3.28 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 3519086872 (3.28GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   2.93GiB( 89%);  352.94MiB; allocation 0: size 2.93GiB, output shape is |c128[512,2,310,2,310]|, maybe-live-out:
+   3.05GiB( 93%);  232.69MiB; allocation 7: size 120.25MiB, preallocated-temp:
+   3.16GiB( 97%);  116.44MiB; allocation 1: size 116.25MiB, parameter 0, shape |c128[512,2,310,24]| at ShapeIndex {}:
+   3.28GiB(100%);   192.0KiB; allocation 2: size 116.25MiB, parameter 1, shape |c128[512,24,2,310]| at ShapeIndex {}:
+   3.28GiB(100%);    96.0KiB; allocation 3: size 96.0KiB, parameter 3, shape |f64[512,24]| at ShapeIndex {}:
+   3.28GiB(100%);        24B; allocation 4: size 96.0KiB, parameter 2, shape |f64[512,24]| at ShapeIndex {}:
+   3.28GiB(100%);         8B; allocation 5: size 16B, parameter 5, shape |c128[]| at ShapeIndex {}:
+   3.28GiB(100%);         0B; allocation 6: size 8B, parameter 4, shape |f64[]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0364.jit__do_unfold]   peak HBM = 2.25 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 2419045700 (2.25GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   1.47GiB( 65%);  803.00MiB; allocation 5: size 1.47GiB, preallocated-temp:
+   2.20GiB( 98%);   52.21MiB; allocation 0: size 750.78MiB, output shape is |c128[512,310,310]|, maybe-live-out:
+   2.24GiB(100%);    9.69MiB; allocation 1: size 42.52MiB, parameter 0, shape |c128[29,310,310]| at ShapeIndex {}:
+   2.25GiB(100%);    4.85MiB; allocation 2: size 4.84MiB, constant:
+   2.25GiB(100%);     2.0KiB; allocation 3: size 4.84MiB, constant:
+   2.25GiB(100%);         0B; allocation 4: size 2.0KiB, constant:
+
+────────────────────────────────────────────────────────────
+[module_0360.jit__do_unfold]   peak HBM = 2.25 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 2411427136 (2.25GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   1.47GiB( 65%);  798.15MiB; allocation 4: size 1.47GiB, preallocated-temp:
+   2.20GiB( 98%);   47.37MiB; allocation 0: size 750.78MiB, output shape is |c128[512,310,310]|, maybe-live-out:
+   2.24GiB(100%);    4.85MiB; allocation 1: size 42.52MiB, parameter 0, shape |c128[29,310,310]| at ShapeIndex {}:
+   2.25GiB(100%);     2.0KiB; allocation 2: size 4.84MiB, constant:
+   2.25GiB(100%);         0B; allocation 3: size 2.0KiB, constant:
+
+────────────────────────────────────────────────────────────
+[module_0366.jit_broadcast_in_dim]   peak HBM = 1.47 GiB
+────────────────────────────────────────────────────────────
+Total bytes used: 1574502400 (1.47GiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 750.78MiB( 50%);  750.78MiB; allocation 0: size 750.78MiB, output shape is |c128[1,512,310,310]|, maybe-live-out:
+   1.47GiB(100%);         0B; allocation 1: size 750.78MiB, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0049.jit_gather]   peak HBM = 752.25 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 788788804 (752.25MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 750.78MiB(100%);    1.47MiB; allocation 0: size 750.78MiB, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+ 752.25MiB(100%);         4B; allocation 1: size 1.47MiB, output shape is |c128[310,310]|, maybe-live-out:
+ 752.25MiB(100%);         0B; allocation 2: size 4B, parameter 1, shape |s32[1]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0039.jit_fn]   peak HBM = 750.93 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 787405224 (750.93MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 750.78MiB(100%);   150.4KiB; allocation 0: size 750.78MiB, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+ 750.93MiB(100%);       144B; allocation 17: size 150.3KiB, preallocated-temp:
+ 750.93MiB(100%);       120B; allocation 1: size 24B, output shape is |f64[3]|, maybe-live-out:
+ 750.93MiB(100%);       112B; allocation 2: size 8B, thread-local:
+ 750.93MiB(100%);       104B; allocation 3: size 8B, thread-local:
+ 750.93MiB(100%);        96B; allocation 4: size 8B, thread-local:
+ 750.93MiB(100%);        88B; allocation 5: size 8B, thread-local:
+ 750.93MiB(100%);        80B; allocation 6: size 8B, thread-local:
+ 750.93MiB(100%);        72B; allocation 7: size 8B, thread-local:
+ 750.93MiB(100%);        64B; allocation 8: size 8B, thread-local:
+ 750.93MiB(100%);        56B; allocation 9: size 8B, thread-local:
+ 750.93MiB(100%);        48B; allocation 10: size 8B, thread-local:
+ 750.93MiB(100%);        40B; allocation 11: size 8B, thread-local:
+ 750.93MiB(100%);        32B; allocation 12: size 8B, thread-local:
+ 750.93MiB(100%);        24B; allocation 13: size 8B, thread-local:
+ 750.93MiB(100%);        16B; allocation 14: size 8B, thread-local:
+ 750.93MiB(100%);         8B; allocation 15: size 8B, thread-local:
+ 750.93MiB(100%);         0B; allocation 16: size 8B, thread-local:
+
+────────────────────────────────────────────────────────────
+[module_0026.jit__per_rank]   peak HBM = 750.78 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 787251264 (750.78MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 750.78MiB(100%);        64B; allocation 0: size 750.78MiB, output shape is |c128[512,310,310]|, maybe-live-out:
+ 750.78MiB(100%);        40B; allocation 1: size 24B, parameter 1, shape |s64[3]| at ShapeIndex {}:
+ 750.78MiB(100%);        16B; allocation 2: size 24B, parameter 2, shape |s64[3]| at ShapeIndex {}:
+ 750.78MiB(100%);         0B; allocation 3: size 16B, parameter 0, shape |s64[2]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0037.jit__identity_fn]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587856 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,310,48,2]|, maybe-live-out:
+ 465.00MiB(100%);        16B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,310,48,2]| at ShapeIndex {}:
+ 465.00MiB(100%);         0B; allocation 2: size 16B, preallocated-temp:
+
+────────────────────────────────────────────────────────────
+[module_0032.jit_conjugate]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,48,2,310]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0034.jit_transpose]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,310,48,2]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0068.jit__identity_fn]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,48,2,310]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0070.jit_transpose]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,2,310,48]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0073.jit__identity_fn]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,2,310,48]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,2,310,48]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0075.jit_conjugate]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,310,48,2]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,310,48,2]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0077.jit_transpose]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,2,310,48]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,310,48,2]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0080.jit__identity_fn]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,2,310,48]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,2,310,48]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0082.jit_transpose]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,48,2,310]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,310,48,2]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0085.jit__identity_fn]   peak HBM = 465.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 487587840 (465.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 50%);  232.50MiB; allocation 0: size 232.50MiB, output shape is |c128[512,48,2,310]|, maybe-live-out:
+ 465.00MiB(100%);         0B; allocation 1: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0342.jit_xn]   peak HBM = 348.75 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 365690880 (348.75MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 67%);  116.25MiB; allocation 0: size 232.50MiB, parameter 0, shape |c128[512,2,310,48]| at ShapeIndex {}:
+ 348.75MiB(100%);         0B; allocation 1: size 116.25MiB, output shape is |c128[512,2,310,24]|, maybe-live-out:
+
+────────────────────────────────────────────────────────────
+[module_0344.jit_yr]   peak HBM = 348.75 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 365690880 (348.75MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 67%);  116.25MiB; allocation 0: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+ 348.75MiB(100%);         0B; allocation 1: size 116.25MiB, output shape is |c128[512,24,2,310]|, maybe-live-out:
+
+────────────────────────────────────────────────────────────
+[module_0346.jit_xr]   peak HBM = 348.75 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 365690880 (348.75MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 67%);  116.25MiB; allocation 0: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+ 348.75MiB(100%);         0B; allocation 1: size 116.25MiB, output shape is |c128[512,24,2,310]|, maybe-live-out:
+
+────────────────────────────────────────────────────────────
+[module_0348.jit_yn]   peak HBM = 348.75 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 365690880 (348.75MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB( 67%);  116.25MiB; allocation 0: size 232.50MiB, parameter 0, shape |c128[512,2,310,48]| at ShapeIndex {}:
+ 348.75MiB(100%);         0B; allocation 1: size 116.25MiB, output shape is |c128[512,2,310,24]|, maybe-live-out:
+
+────────────────────────────────────────────────────────────
+[module_0354.jit_multiply]   peak HBM = 340.20 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 356723208 (340.20MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 170.10MiB( 50%);  170.10MiB; allocation 0: size 170.10MiB, output shape is |c128[4,29,310,310]|, maybe-live-out:
+ 340.20MiB(100%);         8B; allocation 1: size 170.10MiB, parameter 0, shape |c128[4,29,310,310]| at ShapeIndex {}:
+ 340.20MiB(100%);         0B; allocation 2: size 8B, parameter 1, shape |f64[]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0059.jit_fn]   peak HBM = 232.55 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 243843496 (232.55MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB(100%);    48.4KiB; allocation 0: size 232.50MiB, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+ 232.55MiB(100%);       144B; allocation 17: size 48.3KiB, preallocated-temp:
+ 232.55MiB(100%);       120B; allocation 1: size 24B, output shape is |f64[3]|, maybe-live-out:
+ 232.55MiB(100%);       112B; allocation 2: size 8B, thread-local:
+ 232.55MiB(100%);       104B; allocation 3: size 8B, thread-local:
+ 232.55MiB(100%);        96B; allocation 4: size 8B, thread-local:
+ 232.55MiB(100%);        88B; allocation 5: size 8B, thread-local:
+ 232.55MiB(100%);        80B; allocation 6: size 8B, thread-local:
+ 232.55MiB(100%);        72B; allocation 7: size 8B, thread-local:
+ 232.55MiB(100%);        64B; allocation 8: size 8B, thread-local:
+ 232.55MiB(100%);        56B; allocation 9: size 8B, thread-local:
+ 232.55MiB(100%);        48B; allocation 10: size 8B, thread-local:
+ 232.55MiB(100%);        40B; allocation 11: size 8B, thread-local:
+ 232.55MiB(100%);        32B; allocation 12: size 8B, thread-local:
+ 232.55MiB(100%);        24B; allocation 13: size 8B, thread-local:
+ 232.55MiB(100%);        16B; allocation 14: size 8B, thread-local:
+ 232.55MiB(100%);         8B; allocation 15: size 8B, thread-local:
+ 232.55MiB(100%);         0B; allocation 16: size 8B, thread-local:
+
+────────────────────────────────────────────────────────────
+[module_0028.jit__per_rank]   peak HBM = 232.50 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 243794000 (232.50MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 232.50MiB(100%);        80B; allocation 0: size 232.50MiB, output shape is |c128[512,48,2,310]|, maybe-live-out:
+ 232.50MiB(100%);        48B; allocation 1: size 32B, parameter 1, shape |s64[4]| at ShapeIndex {}:
+ 232.50MiB(100%);        16B; allocation 2: size 32B, parameter 2, shape |s64[4]| at ShapeIndex {}:
+ 232.50MiB(100%);         0B; allocation 3: size 16B, parameter 0, shape |s64[2]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0356.jit_gather]   peak HBM = 212.62 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 222952004 (212.62MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 170.10MiB( 80%);   42.52MiB; allocation 0: size 170.10MiB, parameter 0, shape |c128[4,29,310,310]| at ShapeIndex {}:
+ 212.62MiB(100%);         4B; allocation 1: size 42.52MiB, output shape is |c128[29,310,310]|, maybe-live-out:
+ 212.62MiB(100%);         0B; allocation 2: size 4B, parameter 1, shape |s32[1]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0352.jit__per_rank]   peak HBM = 170.10 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 178361680 (170.10MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+ 170.10MiB(100%);        80B; allocation 0: size 170.10MiB, output shape is |c128[4,29,310,310]|, maybe-live-out:
+ 170.10MiB(100%);        48B; allocation 1: size 32B, parameter 1, shape |s64[4]| at ShapeIndex {}:
+ 170.10MiB(100%);        16B; allocation 2: size 32B, parameter 2, shape |s64[4]| at ShapeIndex {}:
+ 170.10MiB(100%);         0B; allocation 3: size 16B, parameter 0, shape |s64[2]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0358.jit_broadcast_in_dim]   peak HBM = 85.05 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 89180800 (85.05MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  42.52MiB( 50%);   42.52MiB; allocation 0: size 42.52MiB, output shape is |c128[29,310,310]|, maybe-live-out:
+  85.05MiB(100%);         0B; allocation 1: size 42.52MiB, parameter 0, shape |c128[29,310,310]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0399.jit__ev_tensors]   peak HBM = 76.50 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 80216116 (76.50MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  23.62MiB( 31%);   52.88MiB; allocation 0: size 23.62MiB, maybe-live-out:
+  47.25MiB( 62%);   29.25MiB; allocation 1: size 23.62MiB, maybe-live-out:
+  70.88MiB( 93%);    5.62MiB; allocation 2: size 23.62MiB, parameter 0, shape |c128[21,512,12,12]| at ShapeIndex {}:
+  75.38MiB( 99%);    1.12MiB; allocation 3: size 4.50MiB, parameter 1, shape |c128[512,24,24]| at ShapeIndex {}:
+  76.50MiB(100%);        52B; allocation 4: size 1.12MiB, parameter 2, shape |c128[512,12,12]| at ShapeIndex {}:
+  76.50MiB(100%);        36B; allocation 5: size 16B, output shape is |(c128[21,512,12,12], c128[21,512,12,12])|, maybe-live-out:
+  76.50MiB(100%);        20B; allocation 6: size 16B, constant:
+  76.50MiB(100%);         4B; allocation 7: size 16B, constant:
+  76.50MiB(100%);         0B; allocation 8: size 4B, preallocated-temp:
+
+────────────────────────────────────────────────────────────
+[module_0390.jit__add_diag]   peak HBM = 74.81 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 78446912 (74.81MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  23.62MiB( 32%);   51.19MiB; allocation 9: size 23.62MiB, preallocated-temp:
+  47.25MiB( 63%);   27.56MiB; allocation 0: size 23.62MiB, output shape is |c128[21,512,12,12]|, maybe-live-out:
+  70.88MiB( 95%);    3.94MiB; allocation 1: size 23.62MiB, parameter 0, shape |c128[21,512,12,12]| at ShapeIndex {}:
+  74.81MiB(100%);        48B; allocation 2: size 3.94MiB, parameter 1, shape |c128[21,512,24]| at ShapeIndex {}:
+  74.81MiB(100%);        40B; allocation 3: size 8B, thread-local:
+  74.81MiB(100%);        32B; allocation 4: size 8B, thread-local:
+  74.81MiB(100%);        24B; allocation 5: size 8B, thread-local:
+  74.81MiB(100%);        16B; allocation 6: size 8B, thread-local:
+  74.81MiB(100%);         8B; allocation 7: size 8B, thread-local:
+  74.81MiB(100%);         0B; allocation 8: size 8B, thread-local:
+
+────────────────────────────────────────────────────────────
+[module_0439.jit__kernel]   peak HBM = 39.84 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 41780000 (39.84MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  23.62MiB( 59%);   16.22MiB; allocation 0: size 23.62MiB, parameter 0, shape |c128[21,512,12,12]| at ShapeIndex {}:
+  30.38MiB( 76%);    9.47MiB; allocation 9: size 6.75MiB, preallocated-temp:
+  34.88MiB( 88%);    4.97MiB; allocation 1: size 4.50MiB, output shape is |c128[512,24,24]|, maybe-live-out:
+  39.38MiB( 99%);   480.0KiB; allocation 2: size 4.50MiB, parameter 1, shape |c128[512,24,24]| at ShapeIndex {}:
+  39.56MiB( 99%);   288.0KiB; allocation 3: size 192.0KiB, parameter 5, shape |c128[512,24]| at ShapeIndex {}:
+  39.75MiB(100%);    96.0KiB; allocation 4: size 192.0KiB, parameter 4, shape |c128[512,24]| at ShapeIndex {}:
+  39.80MiB(100%);    48.0KiB; allocation 5: size 48.0KiB, parameter 3, shape |s32[512,24]| at ShapeIndex {}:
+  39.84MiB(100%);        32B; allocation 6: size 48.0KiB, parameter 2, shape |s32[512,24]| at ShapeIndex {}:
+  39.84MiB(100%);        16B; allocation 7: size 16B, constant:
+  39.84MiB(100%);         0B; allocation 8: size 16B, constant:
+
+────────────────────────────────────────────────────────────
+[module_0130.jit__valence_density_kernel]   peak HBM = 32.25 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 33816768 (32.25MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  16.00MiB( 50%);   16.25MiB; allocation 9: size 16.00MiB, preallocated-temp:
+  32.00MiB( 99%);   256.2KiB; allocation 0: size 16.00MiB, parameter 0, shape |c128[16,2,32,32,32]| at ShapeIndex {}:
+  32.25MiB(100%);       176B; allocation 1: size 256.0KiB, output shape is |f64[32,32,32]|, maybe-live-out:
+  32.25MiB(100%);        48B; allocation 2: size 128B, parameter 4, shape |f64[16]| at ShapeIndex {}:
+  32.25MiB(100%);        40B; allocation 3: size 8B, parameter 2, shape |f64[]| at ShapeIndex {}:
+  32.25MiB(100%);        32B; allocation 4: size 8B, parameter 1, shape |f64[]| at ShapeIndex {}:
+  32.25MiB(100%);        24B; allocation 5: size 8B, parameter 3, shape |f64[]| at ShapeIndex {}:
+  32.25MiB(100%);        16B; allocation 6: size 8B, thread-local:
+  32.25MiB(100%);         8B; allocation 7: size 8B, thread-local:
+  32.25MiB(100%);         0B; allocation 8: size 8B, thread-local:
+
+────────────────────────────────────────────────────────────
+[module_0128.jit_squeeze]   peak HBM = 32.00 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 33554432 (32.00MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  16.00MiB( 50%);   16.00MiB; allocation 0: size 16.00MiB, output shape is |c128[16,2,32,32,32]|, maybe-live-out:
+  32.00MiB(100%);         0B; allocation 1: size 16.00MiB, parameter 0, shape |c128[1,16,2,32,32,32]| at ShapeIndex {}:
+
+────────────────────────────────────────────────────────────
+[module_0394.jit__diag_sharded]   peak HBM = 27.56 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 28901428 (27.56MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  23.62MiB( 86%);    3.94MiB; allocation 0: size 23.62MiB, parameter 0, shape |c128[21,512,12,12]| at ShapeIndex {}:
+  27.56MiB(100%);        52B; allocation 1: size 3.94MiB, output shape is |c128[21,512,24]|, maybe-live-out:
+  27.56MiB(100%);        36B; allocation 2: size 16B, thread-local:
+  27.56MiB(100%);        20B; allocation 3: size 16B, thread-local:
+  27.56MiB(100%);         4B; allocation 4: size 16B, thread-local:
+  27.56MiB(100%);         0B; allocation 5: size 4B, preallocated-temp:
+
+────────────────────────────────────────────────────────────
+[module_0299.jit__run]   peak HBM = 25.45 MiB
+────────────────────────────────────────────────────────────
+Total bytes used: 26689536 (25.45MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  12.28MiB( 48%);   13.17MiB; allocation 7: size 12.28MiB, preallocated-temp:
+  20.42MiB( 80%);    5.04MiB; allocation 0: size 8.13MiB, parameter 0, shape |c128[29,6,2,1532]| at ShapeIndex {}:
+  24.04MiB( 94%);    1.41MiB; allocation 1: size 3.62MiB, parameter 3, shape |s32[29,32,32,32]| at ShapeIndex {}:
+  24.55MiB( 96%);   924.4KiB; allocation 2: size 520.6KiB, parameter 1, shape |s32[29,1532,3]| at ShapeIndex {}:
+  25.05MiB( 98%);   412.4KiB; allocation 3: size 512.0KiB, parameter 4, shape |c128[32,32,32]| at ShapeIndex {}:
+  25.39MiB(100%);    65.3KiB; allocation 4: size 347.1KiB, parameter 2, shape |f64[29,1532]| at ShapeIndex {}:
+  25.45MiB(100%);         8B; allocation 5: size 65.2KiB, output shape is |c128[29,12,12]|, maybe-live-out:
+  25.45MiB(100%);         0B; allocation 6: size 8B, constant:
+

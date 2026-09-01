@@ -1,0 +1,72 @@
+BufferAssignment:
+allocation 0: size 3149004800, output shape is |c128[4,512,310,310]|, maybe-live-out:
+ value: <9 wrapped_concatenate @0> (size=3149004800,offset=0): c128[4,512,310,310]{3,2,1,0}
+allocation 1: size 787251200, parameter 0, shape |c128[1,512,310,310]| at ShapeIndex {}:
+ value: <5 param @0> (size=787251200,offset=0): c128[1,512,310,310]{3,2,1,0}
+allocation 2: size 787251200, parameter 1, shape |c128[1,512,310,310]| at ShapeIndex {}:
+ value: <6 param.1 @0> (size=787251200,offset=0): c128[1,512,310,310]{3,2,1,0}
+allocation 3: size 787251200, parameter 2, shape |c128[1,512,310,310]| at ShapeIndex {}:
+ value: <7 param.2 @0> (size=787251200,offset=0): c128[1,512,310,310]{3,2,1,0}
+allocation 4: size 787251200, parameter 3, shape |c128[1,512,310,310]| at ShapeIndex {}:
+ value: <8 param.3 @0> (size=787251200,offset=0): c128[1,512,310,310]{3,2,1,0}
+
+Total bytes used: 6298009600 (5.87GiB)
+
+Used values:
+<5 param @0>
+ positions:
+  param
+ uses:
+  wrapped_concatenate, operand 0
+ from instruction: %param = c128[1,512,310,310]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="args[0]"}
+<6 param.1 @0>
+ positions:
+  param.1
+ uses:
+  wrapped_concatenate, operand 1
+ from instruction: %param.1 = c128[1,512,310,310]{3,2,1,0} parameter(1), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="args[1]"}
+<7 param.2 @0>
+ positions:
+  param.2
+ uses:
+  wrapped_concatenate, operand 2
+ from instruction: %param.2 = c128[1,512,310,310]{3,2,1,0} parameter(2), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="args[2]"}
+<8 param.3 @0>
+ positions:
+  param.3
+ uses:
+  wrapped_concatenate, operand 3
+ from instruction: %param.3 = c128[1,512,310,310]{3,2,1,0} parameter(3), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="args[3]"}
+<9 wrapped_concatenate @0>
+ positions:
+  wrapped_concatenate
+ uses:
+ from instruction: %wrapped_concatenate = c128[4,512,310,310]{3,2,1,0} fusion(%param, %param.1, %param.2, %param.3), kind=kLoop, calls=%wrapped_concatenate_computation, metadata={op_name="jit(concatenate)/concatenate" stack_frame_id=10}
+
+
+HloLiveRange (max 5):
+  InstructionSequence:
+    0:param.3
+    1:param.2
+    2:param.1
+    3:param
+    4:wrapped_concatenate
+  BufferLiveRange:
+    param{}:0-5
+    param.1{}:0-5
+    param.2{}:0-5
+    param.3{}:0-5
+    wrapped_concatenate{}:4-5
+  Live ranges at 4 (peak):
+    wrapped_concatenate{}: 3149004800 bytes (cumulative: 3149004800 bytes)
+    param{}: 787251200 bytes (cumulative: 3936256000 bytes)
+    param.1{}: 787251200 bytes (cumulative: 4723507200 bytes)
+    param.2{}: 787251200 bytes (cumulative: 5510758400 bytes)
+    param.3{}: 787251200 bytes (cumulative: 6298009600 bytes)
+  Stack trace breakdown for peak usage: 6 298 009 600 bytes
+    main.0_spmd (100.0%, total: 6 298 009 600 bytes, current: 0 bytes, remaining: 6 298 009 600 bytes)
+      ├── jit(concatenate)/concatenate (50.0%, total: 3 149 004 800 bytes, current: 3 149 004 800 bytes, remaining: 3 149 004 800 bytes)
+      ├── args[0] (12.5%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 2 361 753 600 bytes)
+      ├── args[1] (12.5%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 1 574 502 400 bytes)
+      ├── args[2] (12.5%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 787 251 200 bytes)
+      └── args[3] (12.5%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 0 bytes)

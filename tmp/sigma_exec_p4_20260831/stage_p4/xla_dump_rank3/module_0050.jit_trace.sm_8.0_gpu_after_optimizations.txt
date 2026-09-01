@@ -1,0 +1,86 @@
+HloModule jit_trace, is_scheduled=true, entry_computation_layout={(c128[310,310]{1,0})->c128[]}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="3e68c531c2e71c7c11f0f47148f1f476"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_init.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "prepare_isdf_and_wavefunctions"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=497 end_line=497 column=9 end_column=9}
+4 {file_name_id=3 function_name_id=3 line=3617 end_line=3617 column=10 end_column=10}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+
+
+%region_0.1 (reduce_sum.0: c128[], reduce_sum.1: c128[]) -> c128[] {
+  %reduce_sum.1 = c128[] parameter(1), metadata={op_name="jit(trace)/reduce_sum"}
+  %reduce_sum.0 = c128[] parameter(0), metadata={op_name="jit(trace)/reduce_sum"}
+  ROOT %reduce_sum.2.0 = c128[] add(%reduce_sum.0, %reduce_sum.1), metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+
+%fused_reduce (param_0.21: pred[310,310], param_1.22: c128[310,310]) -> c128[310] {
+  %param_0.21 = pred[310,310]{1,0} parameter(0)
+  %param_1.22 = c128[310,310]{1,0} parameter(1)
+  %constant_9_1 = c128[] constant((0, 0))
+  %broadcast_in_dim.2.3 = c128[310,310]{1,0} broadcast(%constant_9_1), dimensions={}, metadata={op_name="jit(trace)/broadcast_in_dim" stack_frame_id=4}
+  %select_n.3.3 = c128[310,310]{1,0} select(%param_0.21, %param_1.22, %broadcast_in_dim.2.3), metadata={op_name="jit(trace)/jit(_where)/select_n"}
+  ROOT %reduce.2.1 = c128[310]{0} reduce(%select_n.3.3, %constant_9_1), dimensions={1}, to_apply=%region_0.1, metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+
+%fused_compare (param_0.23: s32[4], param_1.24: u32[], param_2.15: s32[4]) -> pred[310,310] {
+  %iota.8.1 = s64[310,310]{1,0} iota(), iota_dimension=0, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %param_0.23 = s32[4]{0} parameter(0)
+  %param_1.24 = u32[] parameter(1)
+  %dynamic-slice.7 = s32[1]{0} dynamic-slice(%param_0.23, %param_1.24), dynamic_slice_sizes={1}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %constant_10_1 = s32[1]{0} constant({310}), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %multiply.2.3 = s32[1]{0} multiply(%dynamic-slice.7, %constant_10_1), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %bitcast.8 = s32[] bitcast(%multiply.2.3), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %convert.8.3 = s64[] convert(%bitcast.8), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %broadcast.3 = s64[310,310]{1,0} broadcast(%convert.8.3), dimensions={}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %add.3 = s64[310,310]{1,0} add(%iota.8.1, %broadcast.3), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %iota.9.1 = s64[310,310]{1,0} iota(), iota_dimension=1, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %param_2.15 = s32[4]{0} parameter(2)
+  %dynamic-slice.3.3 = s32[1]{0} dynamic-slice(%param_2.15, %param_1.24), dynamic_slice_sizes={1}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %multiply.3.3 = s32[1]{0} multiply(%dynamic-slice.3.3, %constant_10_1), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %bitcast.1.3 = s32[] bitcast(%multiply.3.3), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %convert.9.3 = s64[] convert(%bitcast.1.3), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %broadcast.1.1 = s64[310,310]{1,0} broadcast(%convert.9.3), dimensions={}, metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %add.1.1 = s64[310,310]{1,0} add(%iota.9.1, %broadcast.1.1), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  ROOT %eq.2.1 = pred[310,310]{1,0} compare(%add.3, %add.1.1), direction=EQ, metadata={op_name="jit(trace)/eq" stack_frame_id=4}
+}
+
+%fused_reduce.1 (param_0.22: c128[310]) -> c128[] {
+  %param_0.22 = c128[310]{0} parameter(0)
+  %constant_9_2 = c128[] constant((0, 0))
+  ROOT %reduce.5 = c128[] reduce(%param_0.22, %constant_9_2), dimensions={0}, to_apply=%region_0.1, metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+
+%region_0.1.clone (reduce_sum.8: c128[], reduce_sum.9: c128[]) -> c128[] {
+  %reduce_sum.9 = c128[] parameter(1), metadata={op_name="jit(trace)/reduce_sum"}
+  %reduce_sum.8 = c128[] parameter(0), metadata={op_name="jit(trace)/reduce_sum"}
+  ROOT %reduce_sum.10.0 = c128[] add(%reduce_sum.8, %reduce_sum.9), metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}
+}
+
+ENTRY %main.2_spmd (param: c128[310,310]) -> c128[] {
+  %partition-id.1 = u32[] partition-id()
+  %param = c128[310,310]{1,0} parameter(0), sharding={devices=[2,2]<=[4]}, metadata={op_name="a"}
+  %constant_7_0 = s32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %constant_12 = s32[4]{0} constant({0, 0, 1, 1}), metadata={op_name="jit(trace)/iota" stack_frame_id=4}
+  %loop_compare_fusion = pred[310,310]{1,0} fusion(%constant_12, %partition-id.1, %constant_7_0), kind=kLoop, calls=%fused_compare, metadata={op_name="jit(trace)/eq" stack_frame_id=4}
+  %input_reduce_fusion = c128[310]{0} fusion(%loop_compare_fusion, %param), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  %input_reduce_fusion.1 = c128[] fusion(%input_reduce_fusion), kind=kInput, calls=%fused_reduce.1, metadata={op_name="jit(trace)/reduce_sum" stack_frame_id=4}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+  %all-reduce-start = c128[] all-reduce-start(%input_reduce_fusion.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1.clone, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  ROOT %all-reduce-done = c128[] all-reduce-done(%all-reduce-start)
+}
+

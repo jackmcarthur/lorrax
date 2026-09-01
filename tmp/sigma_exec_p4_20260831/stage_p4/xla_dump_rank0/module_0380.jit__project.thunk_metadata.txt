@@ -1,0 +1,68 @@
+thunk_metadata {
+  thunk_info {
+  }
+  thunk_kind: "kSequential"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "custom-call.2"
+    thunk_id: 1
+  }
+  thunk_kind: "kGemm"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "input_transpose_fusion"
+    thunk_id: 2
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "reduce_scatter.14.1"
+    thunk_id: 3
+  }
+  thunk_kind: "kReduceScatterStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "reduce-scatter-done"
+    thunk_id: 4
+  }
+  thunk_kind: "kReduceScatterDone"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "loop_complex_fusion"
+    thunk_id: 5
+  }
+  thunk_kind: "kKernel"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "custom-call.3"
+    thunk_id: 6
+  }
+  thunk_kind: "kGemm"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "reduce_scatter.15.1"
+    thunk_id: 7
+  }
+  thunk_kind: "kReduceScatterStart"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "reduce-scatter-done.1"
+    thunk_id: 8
+  }
+  thunk_kind: "kReduceScatterDone"
+}
+thunk_metadata {
+  thunk_info {
+    profile_annotation: "loop_transpose_fusion"
+    thunk_id: 9
+  }
+  thunk_kind: "kKernel"
+}

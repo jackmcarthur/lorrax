@@ -1,0 +1,42 @@
+Total bytes used: 1638960 (1.56MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+   1.47MiB( 94%);    99.0KiB; allocation 0: size 1.47MiB, parameter 0, shape |c128[310,310]| at ShapeIndex {}:
+   1.56MiB(100%);       144B; allocation 10: size 98.8KiB, preallocated-temp:
+   1.56MiB(100%);       128B; allocation 1: size 16B, output shape is |c128[]|, maybe-live-out:
+   1.56MiB(100%);       112B; allocation 2: size 16B, constant:
+   1.56MiB(100%);        96B; allocation 3: size 16B, constant:
+   1.56MiB(100%);        80B; allocation 4: size 16B, thread-local:
+   1.56MiB(100%);        64B; allocation 5: size 16B, thread-local:
+   1.56MiB(100%);        48B; allocation 6: size 16B, thread-local:
+   1.56MiB(100%);        32B; allocation 7: size 16B, thread-local:
+   1.56MiB(100%);        16B; allocation 8: size 16B, thread-local:
+   1.56MiB(100%);         0B; allocation 9: size 16B, thread-local:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 1.47MiB, parameter 0, shape |c128[310,310]| at ShapeIndex {}:
+allocation 10: size 98.8KiB, preallocated-temp:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	  93.8KiB( 95%);    93.8KiB;            0;                1; pred[310,310]
+	  98.7KiB(100%);     4.8KiB;        96256;                1; c128[310]
+
+allocation 1: size 16B, output shape is |c128[]|, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	      16B(100%);        16B;            0;                3; u32[], 2×c128[]
+
+allocation 2: size 16B, constant:
+allocation 3: size 16B, constant:
+allocation 4: size 16B, thread-local:
+allocation 5: size 16B, thread-local:
+allocation 6: size 16B, thread-local:
+allocation 7: size 16B, thread-local:
+allocation 8: size 16B, thread-local:
+allocation 9: size 16B, thread-local:

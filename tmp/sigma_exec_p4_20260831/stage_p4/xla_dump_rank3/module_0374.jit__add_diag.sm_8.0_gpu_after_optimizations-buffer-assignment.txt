@@ -1,0 +1,204 @@
+BufferAssignment:
+allocation 0: size 24772608, output shape is |c128[21,512,12,12]|, maybe-live-out:
+ value: <136 input_transpose_fusion.2{0} @0> (size=12386304,offset=0): f64[12,12,21,512]{3,2,1,0}
+ value: <140 loop_and_fusion @0> (size=24,offset=0): pred[24]{0}
+ value: <144 input_scatter_fusion @0> (size=12386304,offset=0): f64[12,12,21,512]{3,2,1,0}
+ value: <147 input_transpose_fusion.1 @0> (size=24772608,offset=0): c128[21,512,12,12]{3,2,1,0}
+allocation 1: size 24772608, parameter 0, shape |c128[21,512,12,12]| at ShapeIndex {}:
+ value: <134 param.2 @0> (size=24772608,offset=0): c128[21,512,12,12]{3,2,1,0}
+allocation 2: size 4128768, parameter 1, shape |c128[21,512,24]| at ShapeIndex {}:
+ value: <138 param.3 @0> (size=4128768,offset=0): c128[21,512,24]{2,1,0}
+allocation 3: size 8, thread-local:
+ value: <2 scatter-add.2.0 @0> (size=8,offset=0): f64[]
+allocation 4: size 8, thread-local:
+ value: <1 scatter-add.1 @0> (size=8,offset=0): f64[]
+allocation 5: size 8, thread-local:
+ value: <0 scatter-add.0 @0> (size=8,offset=0): f64[]
+allocation 6: size 8, thread-local:
+ value: <3 scatter-add.41 @0> (size=8,offset=0): f64[]
+allocation 7: size 8, thread-local:
+ value: <4 scatter-add.42 @0> (size=8,offset=0): f64[]
+allocation 8: size 8, thread-local:
+ value: <5 scatter-add.43.0 @0> (size=8,offset=0): f64[]
+allocation 9: size 24772880, preallocated-temp:
+ value: <135 input_transpose_fusion.2{} @0> (size=16,offset=24772864): (f64[12,12,21,512]{3,2,1,0}, f64[12,12,21,512]{3,2,1,0})
+ value: <137 input_transpose_fusion.2{1} @0> (size=12386304,offset=0): f64[12,12,21,512]{3,2,1,0}
+ value: <139 axis_index.22.0 @0> (size=4,offset=16515072): u32[]
+ value: <141 input_transpose_fusion{} @0> (size=16,offset=24772608): (f64[24,1,1,21,512]{4,3,2,1,0}, f64[24,1,1,21,512]{4,3,2,1,0})
+ value: <142 input_transpose_fusion{0} @0> (size=2064384,offset=14450688): f64[24,1,1,21,512]{4,3,2,1,0}
+ value: <143 input_transpose_fusion{1} @0> (size=2064384,offset=12386304): f64[24,1,1,21,512]{4,3,2,1,0}
+ value: <145 wrapped_transpose @0> (size=12386304,offset=12386304): f64[21,512,12,12]{3,2,1,0}
+ value: <146 input_scatter_fusion.1 @0> (size=12386304,offset=0): f64[12,12,21,512]{3,2,1,0}
+
+Total bytes used: 78446912 (74.81MiB)
+
+Used values:
+<0 scatter-add.0 @0>
+ positions:
+  scatter-add.0
+ uses:
+  scatter-add.2.0, operand 0
+ from instruction: %scatter-add.0 = f64[] parameter(0), metadata={op_name="scatter-add"}
+<1 scatter-add.1 @0>
+ positions:
+  scatter-add.1
+ uses:
+  scatter-add.2.0, operand 1
+ from instruction: %scatter-add.1 = f64[] parameter(1), metadata={op_name="scatter-add"}
+<2 scatter-add.2.0 @0>
+ positions:
+  scatter-add.2.0
+ uses:
+ from instruction: %scatter-add.2.0 = f64[] add(%scatter-add.0, %scatter-add.1), metadata={op_name="scatter-add" stack_frame_id=8}
+<3 scatter-add.41 @0>
+ positions:
+  scatter-add.41
+ uses:
+  scatter-add.43.0, operand 0
+ from instruction: %scatter-add.41 = f64[] parameter(0), metadata={op_name="scatter-add"}
+<4 scatter-add.42 @0>
+ positions:
+  scatter-add.42
+ uses:
+  scatter-add.43.0, operand 1
+ from instruction: %scatter-add.42 = f64[] parameter(1), metadata={op_name="scatter-add"}
+<5 scatter-add.43.0 @0>
+ positions:
+  scatter-add.43.0
+ uses:
+ from instruction: %scatter-add.43.0 = f64[] add(%scatter-add.41, %scatter-add.42), metadata={op_name="scatter-add" stack_frame_id=8}
+<134 param.2 @0>
+ positions:
+  param.2
+ uses:
+  input_transpose_fusion.2, operand 0
+ from instruction: %param.2 = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="tile"}
+<135 input_transpose_fusion.2{} @0>
+ positions:
+  input_transpose_fusion.2 {}
+ uses:
+  get-tuple-element.4, operand 0 {}
+  get-tuple-element.5, operand 0 {}
+ from instruction: %input_transpose_fusion.2 = (f64[12,12,21,512]{3,2,1,0}, f64[12,12,21,512]{3,2,1,0}) fusion(%param.2), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<136 input_transpose_fusion.2{0} @0>
+ positions:
+  input_transpose_fusion.2 {0}
+  get-tuple-element.4
+ uses:
+  input_scatter_fusion, operand 0
+ from instruction: %input_transpose_fusion.2 = (f64[12,12,21,512]{3,2,1,0}, f64[12,12,21,512]{3,2,1,0}) fusion(%param.2), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<137 input_transpose_fusion.2{1} @0>
+ positions:
+  input_transpose_fusion.2 {1}
+  get-tuple-element.5
+ uses:
+  input_scatter_fusion.1, operand 0
+ from instruction: %input_transpose_fusion.2 = (f64[12,12,21,512]{3,2,1,0}, f64[12,12,21,512]{3,2,1,0}) fusion(%param.2), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<138 param.3 @0>
+ positions:
+  param.3
+ uses:
+  input_transpose_fusion, operand 0
+ from instruction: %param.3 = c128[21,512,24]{2,1,0} parameter(1), sharding={replicated}, metadata={op_name="diag"}
+<139 axis_index.22.0 @0>
+ positions:
+  axis_index.22.0
+ uses:
+  input_scatter_fusion, operand 2
+  input_scatter_fusion.1, operand 2
+  loop_and_fusion, operand 0
+ from instruction: %axis_index.22.0 = u32[] partition-id(), metadata={op_name="jit(_add_diag)/shard_map/axis_index" stack_frame_id=10}
+<140 loop_and_fusion @0>
+ positions:
+  loop_and_fusion
+ uses:
+  input_transpose_fusion, operand 1
+ from instruction: %loop_and_fusion = pred[24]{0} fusion(%axis_index.22.0), kind=kLoop, calls=%fused_and, metadata={op_name="jit(_add_diag)/shard_map/and" stack_frame_id=18}
+<141 input_transpose_fusion{} @0>
+ positions:
+  input_transpose_fusion {}
+ uses:
+  get-tuple-element, operand 0 {}
+  get-tuple-element.2, operand 0 {}
+ from instruction: %input_transpose_fusion = (f64[24,1,1,21,512]{4,3,2,1,0}, f64[24,1,1,21,512]{4,3,2,1,0}) fusion(%param.3, %loop_and_fusion), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<142 input_transpose_fusion{0} @0>
+ positions:
+  input_transpose_fusion {0}
+  get-tuple-element
+ uses:
+  input_scatter_fusion, operand 1
+ from instruction: %input_transpose_fusion = (f64[24,1,1,21,512]{4,3,2,1,0}, f64[24,1,1,21,512]{4,3,2,1,0}) fusion(%param.3, %loop_and_fusion), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<143 input_transpose_fusion{1} @0>
+ positions:
+  input_transpose_fusion {1}
+  get-tuple-element.2
+ uses:
+  input_scatter_fusion.1, operand 1
+ from instruction: %input_transpose_fusion = (f64[24,1,1,21,512]{4,3,2,1,0}, f64[24,1,1,21,512]{4,3,2,1,0}) fusion(%param.3, %loop_and_fusion), kind=kInput, calls=%fused_transpose, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<144 input_scatter_fusion @0>
+ positions:
+  input_scatter_fusion
+ uses:
+  wrapped_transpose, operand 0
+ from instruction: %input_scatter_fusion = f64[12,12,21,512]{3,2,1,0} fusion(%get-tuple-element.4, %get-tuple-element, %axis_index.22.0), kind=kInput, calls=%fused_scatter, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" deduplicated_name="input_scatter_fusion" stack_frame_id=8}
+<145 wrapped_transpose @0>
+ positions:
+  wrapped_transpose
+ uses:
+  input_transpose_fusion.1, operand 0
+ from instruction: %wrapped_transpose = f64[21,512,12,12]{3,2,1,0} fusion(%input_scatter_fusion), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<146 input_scatter_fusion.1 @0>
+ positions:
+  input_scatter_fusion.1
+ uses:
+  input_transpose_fusion.1, operand 1
+ from instruction: %input_scatter_fusion.1 = f64[12,12,21,512]{3,2,1,0} fusion(%get-tuple-element.5, %get-tuple-element.2, %axis_index.22.0), kind=kInput, calls=%fused_scatter.1, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" deduplicated_name="input_scatter_fusion" stack_frame_id=8}
+<147 input_transpose_fusion.1 @0>
+ positions:
+  input_transpose_fusion.1
+ uses:
+ from instruction: %input_transpose_fusion.1 = c128[21,512,12,12]{3,2,1,0} fusion(%wrapped_transpose, %input_scatter_fusion.1), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(_add_diag)/shard_map/scatter-add" stack_frame_id=8}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 14):
+  InstructionSequence:
+    0:axis_index.22.0
+    1:param.3
+    2:param.2
+    3:loop_and_fusion
+    4:input_transpose_fusion
+    5:get-tuple-element.2
+    6:get-tuple-element
+    7:input_transpose_fusion.2
+    8:get-tuple-element.5
+    9:get-tuple-element.4
+    10:input_scatter_fusion
+    11:input_scatter_fusion.1
+    12:wrapped_transpose
+    13:input_transpose_fusion.1
+  BufferLiveRange:
+    param.2{}:0-14
+    input_transpose_fusion.2{}:7-9
+    input_transpose_fusion.2{0}:7-10
+    input_transpose_fusion.2{1}:7-11
+    param.3{}:0-14
+    axis_index.22.0{}:0-11
+    loop_and_fusion{}:3-4
+    input_transpose_fusion{}:4-6
+    input_transpose_fusion{0}:4-10
+    input_transpose_fusion{1}:4-11
+    input_scatter_fusion{}:10-12
+    wrapped_transpose{}:12-13
+    input_scatter_fusion.1{}:11-13
+    input_transpose_fusion.1{}:13-14
+  Live ranges at 13 (peak):
+    input_transpose_fusion.1{}: 24772608 bytes (cumulative: 24772608 bytes)
+    param.2{}: 24772608 bytes (cumulative: 49545216 bytes)
+    input_scatter_fusion.1{}: 12386304 bytes (cumulative: 61931520 bytes)
+    wrapped_transpose{}: 12386304 bytes (cumulative: 74317824 bytes)
+    param.3{}: 4128768 bytes (cumulative: 78446592 bytes)
+  Stack trace breakdown for peak usage: 78 446 592 bytes
+    main.4_spmd (100.0%, total: 78 446 592 bytes, current: 0 bytes, remaining: 78 446 592 bytes)
+      ├── jit(_add_diag)/shard_map/scatter-add (63.2%, total: 49 545 216 bytes, current: 49 545 216 bytes, remaining: 28 901 376 bytes)
+      ├── tile (31.6%, total: 24 772 608 bytes, current: 24 772 608 bytes, remaining: 4 128 768 bytes)
+      └── diag (5.3%, total: 4 128 768 bytes, current: 4 128 768 bytes, remaining: 0 bytes)

@@ -1,0 +1,7 @@
+HloModule jit_broadcast_in_dim, is_scheduled=true, entry_computation_layout={(f64[48,32768]{1,0})->f64[48,32768]{1,0}}, allow_spmd_sharding_propagation_to_parameters={true}, allow_spmd_sharding_propagation_to_output={true}, frontend_attributes={fingerprint_before_lhs="a920c6f0a0cdb8e5a41ff39151f1cd10"}
+
+ENTRY %main.1 (args_0_.1: f64[48,32768]) -> f64[48,32768] {
+  %args_0_.1 = f64[48,32768]{1,0} parameter(0), metadata={op_name="args[0]"}
+  ROOT %copy.1 = f64[48,32768]{1,0} copy(%args_0_.1)
+}
+

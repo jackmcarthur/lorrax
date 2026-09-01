@@ -1,0 +1,8 @@
+HloModule jit__identity_fn, is_scheduled=true, entry_computation_layout={(f64[2]{0})->f64[8]{0}}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="13b9020741ee69880783ab7aa29c4f8e"}
+
+ENTRY %main.0_spmd (param: f64[2]) -> f64[8] {
+  %param = f64[2]{0} parameter(0), sharding={devices=[4]<=[4]}, metadata={op_name="x"}
+  %all-gather-start = (f64[2]{0}, f64[8]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  ROOT %all-gather-done = f64[8]{0} all-gather-done(%all-gather-start)
+}
+

@@ -1,0 +1,245 @@
+BufferAssignment:
+allocation 0: size 24772608, parameter 0, shape |c128[21,512,12,12]| at ShapeIndex {}:
+ value: <204 param.2 @0> (size=24772608,offset=0): c128[21,512,12,12]{3,2,1,0}
+allocation 1: size 4718592, output shape is |c128[512,24,24]|, maybe-live-out:
+ value: <211 input_transpose_fusion.2{0} @0> (size=1179648,offset=0): c128[1,12,512,12]{3,2,1,0}
+ value: <218 all-gather-start{1} @0> (size=2359296,offset=0): c128[512,12,24]{1,0,2}
+ value: <222 input_transpose_fusion @0> (size=4718592,offset=0): c128[512,24,24]{2,1,0}
+allocation 2: size 4718592, parameter 1, shape |c128[512,24,24]| at ShapeIndex {}:
+ value: <203 param.5 @0> (size=4718592,offset=0): c128[512,24,24]{2,1,0}
+allocation 3: size 196608, parameter 5, shape |c128[512,24]| at ShapeIndex {}:
+ value: <205 param.3 @0> (size=196608,offset=0): c128[512,24]{1,0}
+allocation 4: size 196608, parameter 4, shape |c128[512,24]| at ShapeIndex {}:
+ value: <213 param @0> (size=196608,offset=0): c128[512,24]{1,0}
+allocation 5: size 49152, parameter 3, shape |s32[512,24]| at ShapeIndex {}:
+ value: <206 param.4 @0> (size=49152,offset=0): s32[512,24]{1,0}
+allocation 6: size 49152, parameter 2, shape |s32[512,24]| at ShapeIndex {}:
+ value: <214 param.1 @0> (size=49152,offset=0): s32[512,24]{1,0}
+allocation 7: size 16, constant:
+ value: <207 constant_55_0 @0> (size=16,offset=0): u32[4]{0}
+allocation 8: size 16, constant:
+ value: <209 constant_76_0 @0> (size=16,offset=0): u32[4]{0}
+allocation 9: size 7078656, preallocated-temp:
+ value: <208 partition-id.1 @0> (size=4,offset=2360064): u32[]
+ value: <210 input_transpose_fusion.2{} @0> (size=16,offset=0): (c128[1,12,512,12]{3,2,1,0}, c128[1,12,512,12]{3,2,1,0})
+ value: <212 input_transpose_fusion.2{1} @0> (size=1179648,offset=768): c128[1,12,512,12]{3,2,1,0}
+ value: <215 input_transpose_fusion.3 @0> (size=1179648,offset=1180416): c128[1,12,512,12]{3,2,1,0}
+ value: <216 input_transpose_fusion.1 @0> (size=1179648,offset=1180416): c128[1,12,512,12]{3,2,1,0}
+ value: <217 all-gather-start{} @0> (size=16,offset=256): (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2})
+ value: <219 loop_transpose_fusion @0> (size=2359296,offset=4719360): c128[12,512,24]{2,1,0}
+ value: <220 all-gather-start.1{} @0> (size=16,offset=512): (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1})
+ value: <221 all-gather-start.1{1} @0> (size=4718592,offset=768): c128[512,24,24]{2,0,1}
+
+Total bytes used: 41780000 (39.84MiB)
+
+Used values:
+<203 param.5 @0>
+ positions:
+  param.5
+ uses:
+  input_transpose_fusion, operand 0
+ from instruction: %param.5 = c128[512,24,24]{2,1,0} parameter(1), sharding={replicated}, metadata={op_name="sig_x"}
+<204 param.2 @0>
+ positions:
+  param.2
+ uses:
+  input_transpose_fusion.1, operand 1
+  input_transpose_fusion.2, operand 0
+  input_transpose_fusion.3, operand 0
+ from instruction: %param.2 = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="sig_w"}
+<205 param.3 @0>
+ positions:
+  param.3
+ uses:
+  input_transpose_fusion.2, operand 1
+  input_transpose_fusion.1, operand 5
+ from instruction: %param.3 = c128[512,24]{1,0} parameter(5), sharding={replicated}, metadata={op_name="whi"}
+<206 param.4 @0>
+ positions:
+  param.4
+ uses:
+  input_transpose_fusion.2, operand 2
+ from instruction: %param.4 = s32[512,24]{1,0} parameter(3), sharding={replicated}, metadata={op_name="ihi"}
+<207 constant_55_0 @0>
+ positions:
+  constant_55_0
+ uses:
+  input_transpose_fusion.1, operand 9
+  input_transpose_fusion.2, operand 3
+ from instruction: %constant_55_0 = u32[4]{0} constant({0, 0, 1, 1}), metadata={op_name="jit(_kernel)/mul" stack_frame_id=7}
+<208 partition-id.1 @0>
+ positions:
+  partition-id.1
+ uses:
+  input_transpose_fusion.1, operand 8
+  input_transpose_fusion.2, operand 4
+  input_transpose_fusion.3, operand 4
+ from instruction: %partition-id.1 = u32[] partition-id()
+<209 constant_76_0 @0>
+ positions:
+  constant_76_0
+ uses:
+  input_transpose_fusion.3, operand 3
+  input_transpose_fusion.1, operand 7
+  input_transpose_fusion.2, operand 5
+ from instruction: %constant_76_0 = u32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}
+<210 input_transpose_fusion.2{} @0>
+ positions:
+  input_transpose_fusion.2 {}
+ uses:
+  get-tuple-element, operand 0 {}
+  get-tuple-element.1, operand 0 {}
+ from instruction: %input_transpose_fusion.2 = (c128[1,12,512,12]{3,2,1,0}, c128[1,12,512,12]{3,2,1,0}) fusion(%param.2, %param.3, %param.4, %constant_55_0, %partition-id.1, /*index=5*/%constant_76_0), kind=kInput, calls=%fused_transpose.3, metadata={op_name="jit(_kernel)/mul" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<211 input_transpose_fusion.2{0} @0>
+ positions:
+  input_transpose_fusion.2 {0}
+  get-tuple-element
+ uses:
+  input_transpose_fusion.1, operand 0
+ from instruction: %input_transpose_fusion.2 = (c128[1,12,512,12]{3,2,1,0}, c128[1,12,512,12]{3,2,1,0}) fusion(%param.2, %param.3, %param.4, %constant_55_0, %partition-id.1, /*index=5*/%constant_76_0), kind=kInput, calls=%fused_transpose.3, metadata={op_name="jit(_kernel)/mul" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<212 input_transpose_fusion.2{1} @0>
+ positions:
+  input_transpose_fusion.2 {1}
+  get-tuple-element.1
+ uses:
+  input_transpose_fusion.1, operand 3
+ from instruction: %input_transpose_fusion.2 = (c128[1,12,512,12]{3,2,1,0}, c128[1,12,512,12]{3,2,1,0}) fusion(%param.2, %param.3, %param.4, %constant_55_0, %partition-id.1, /*index=5*/%constant_76_0), kind=kInput, calls=%fused_transpose.3, metadata={op_name="jit(_kernel)/mul" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<213 param @0>
+ positions:
+  param
+ uses:
+  input_transpose_fusion.1, operand 4
+  input_transpose_fusion.3, operand 1
+ from instruction: %param = c128[512,24]{1,0} parameter(4), sharding={replicated}, metadata={op_name="wlo"}
+<214 param.1 @0>
+ positions:
+  param.1
+ uses:
+  input_transpose_fusion.3, operand 2
+  input_transpose_fusion.1, operand 6
+ from instruction: %param.1 = s32[512,24]{1,0} parameter(2), sharding={replicated}, metadata={op_name="ilo"}
+<215 input_transpose_fusion.3 @0>
+ positions:
+  input_transpose_fusion.3
+ uses:
+  input_transpose_fusion.1, operand 2
+ from instruction: %input_transpose_fusion.3 = c128[1,12,512,12]{3,2,1,0} fusion(%param.2, %param, %param.1, %constant_76_0, %partition-id.1), kind=kInput, calls=%fused_transpose.4, metadata={op_name="jit(_kernel)/mul" stack_frame_id=11}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<216 input_transpose_fusion.1 @0>
+ positions:
+  input_transpose_fusion.1
+  bitcast.222.0
+  all-gather-start {0}
+ uses:
+  bitcast.222.0, operand 0
+  all-gather-start, operand 0
+  all-gather-done, operand 0 {0}
+ from instruction: %input_transpose_fusion.1 = c128[1,12,512,12]{3,2,1,0} fusion(%get-tuple-element, %param.2, %input_transpose_fusion.3, %get-tuple-element.1, %param, /*index=5*/%param.3, %param.1, %constant_76_0, %partition-id.1, %constant_55_0), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(_kernel)/mul" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<217 all-gather-start{} @0>
+ positions:
+  all-gather-start {}
+ uses:
+  all-gather-done, operand 0 {}
+ from instruction: %all-gather-start = (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2}) all-gather-start(%bitcast.222.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, metadata={op_name="jit(_kernel)/add" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<218 all-gather-start{1} @0>
+ positions:
+  all-gather-start {1}
+  all-gather-done
+ uses:
+  all-gather-done, operand 0 {1}
+  loop_transpose_fusion, operand 0
+ from instruction: %all-gather-start = (c128[512,12,12]{1,0,2}, c128[512,12,24]{1,0,2}) all-gather-start(%bitcast.222.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, metadata={op_name="jit(_kernel)/add" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<219 loop_transpose_fusion @0>
+ positions:
+  loop_transpose_fusion
+  bitcast.226.0
+  all-gather-start.1 {0}
+ uses:
+  bitcast.226.0, operand 0
+  all-gather-start.1, operand 0
+  all-gather-done.1, operand 0 {0}
+ from instruction: %loop_transpose_fusion = c128[12,512,24]{2,1,0} fusion(%all-gather-done), kind=kInput, calls=%fused_transpose, metadata={op_name="jit(_kernel)/add" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<220 all-gather-start.1{} @0>
+ positions:
+  all-gather-start.1 {}
+ uses:
+  all-gather-done.1, operand 0 {}
+ from instruction: %all-gather-start.1 = (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1}) all-gather-start(%bitcast.226.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, metadata={op_name="jit(_kernel)/add" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<221 all-gather-start.1{1} @0>
+ positions:
+  all-gather-start.1 {1}
+  all-gather-done.1
+ uses:
+  all-gather-done.1, operand 0 {1}
+  input_transpose_fusion, operand 1
+ from instruction: %all-gather-start.1 = (c128[512,12,24]{2,0,1}, c128[512,24,24]{2,0,1}) all-gather-start(%bitcast.226.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, metadata={op_name="jit(_kernel)/add" stack_frame_id=16}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<222 input_transpose_fusion @0>
+ positions:
+  input_transpose_fusion
+ uses:
+ from instruction: %input_transpose_fusion = c128[512,24,24]{2,1,0} fusion(%param.5, %all-gather-done.1), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(_kernel)/mul" stack_frame_id=21}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 22):
+  InstructionSequence:
+    0:partition-id.1
+    1:constant_76_0
+    2:param.2
+    3:param.3
+    4:param.1
+    5:constant_55_0
+    6:param
+    7:param.5
+    8:param.4
+    9:input_transpose_fusion.3
+    10:input_transpose_fusion.2
+    11:get-tuple-element.1
+    12:get-tuple-element
+    13:input_transpose_fusion.1
+    14:bitcast.222.0
+    15:all-gather-start
+    16:all-gather-done
+    17:loop_transpose_fusion
+    18:bitcast.226.0
+    19:all-gather-start.1
+    20:all-gather-done.1
+    21:input_transpose_fusion
+  BufferLiveRange:
+    param.5{}:0-22
+    param.2{}:0-22
+    param.3{}:0-22
+    param.4{}:0-22
+    constant_55_0{}:5-13
+    partition-id.1{}:0-13
+    constant_76_0{}:1-13
+    input_transpose_fusion.2{}:10-12
+    input_transpose_fusion.2{0}:10-13
+    input_transpose_fusion.2{1}:10-13
+    param{}:0-22
+    param.1{}:0-22
+    input_transpose_fusion.3{}:9-13
+    input_transpose_fusion.1{}:13-16
+    all-gather-start{}:15-16
+    all-gather-start{1}:15-17
+    loop_transpose_fusion{}:17-20
+    all-gather-start.1{}:19-20
+    all-gather-start.1{1}:19-21
+    input_transpose_fusion{}:21-22
+  Live ranges at 21 (peak):
+    param.2{}: 24772608 bytes (cumulative: 24772608 bytes)
+    all-gather-start.1{1}: 4718592 bytes (cumulative: 29491200 bytes)
+    input_transpose_fusion{}: 4718592 bytes (cumulative: 34209792 bytes)
+    param.5{}: 4718592 bytes (cumulative: 38928384 bytes)
+    param{}: 196608 bytes (cumulative: 39124992 bytes)
+    param.3{}: 196608 bytes (cumulative: 39321600 bytes)
+    param.1{}: 49152 bytes (cumulative: 39370752 bytes)
+    param.4{}: 49152 bytes (cumulative: 39419904 bytes)
+  Stack trace breakdown for peak usage: 39 419 904 bytes
+    main.1_spmd (100.0%, total: 39 419 904 bytes, current: 0 bytes, remaining: 39 419 904 bytes)
+      ├── sig_w (62.8%, total: 24 772 608 bytes, current: 24 772 608 bytes, remaining: 14 647 296 bytes)
+      ├── jit(_kernel)/add{1} (12.0%, total: 4 718 592 bytes, current: 4 718 592 bytes, remaining: 9 928 704 bytes)
+      ├── jit(_kernel)/mul (12.0%, total: 4 718 592 bytes, current: 4 718 592 bytes, remaining: 5 210 112 bytes)
+      ├── sig_x (12.0%, total: 4 718 592 bytes, current: 4 718 592 bytes, remaining: 491 520 bytes)
+      ├── whi (0.5%, total: 196 608 bytes, current: 196 608 bytes, remaining: 294 912 bytes)
+      ├── wlo (0.5%, total: 196 608 bytes, current: 196 608 bytes, remaining: 98 304 bytes)
+      ├── ihi (0.1%, total: 49 152 bytes, current: 49 152 bytes, remaining: 49 152 bytes)
+      └── ilo (0.1%, total: 49 152 bytes, current: 49 152 bytes, remaining: 0 bytes)

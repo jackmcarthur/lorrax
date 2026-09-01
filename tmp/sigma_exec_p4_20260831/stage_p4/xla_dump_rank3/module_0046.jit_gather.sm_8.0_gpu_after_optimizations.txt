@@ -1,0 +1,40 @@
+HloModule jit_gather, is_scheduled=true, entry_computation_layout={(c128[512,310,310]{2,1,0}, s32[1]{0})->c128[310,310]{1,0}}, allow_spmd_sharding_propagation_to_parameters={false,true}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="e5d012ee4a97e13e12acd657d0636a8c"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_init.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "prepare_isdf_and_wavefunctions"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=497 end_line=497 column=9 end_column=9}
+4 {file_name_id=3 function_name_id=3 line=3617 end_line=3617 column=20 end_column=20}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+
+
+%fused_dynamic_slice (param_0: c128[512,310,310], param_1.2: s32[1]) -> c128[1,310,310] {
+  %param_0 = c128[512,310,310]{2,1,0} parameter(0)
+  %param_1.2 = s32[1]{0} parameter(1)
+  %bitcast.3 = s32[] bitcast(%param_1.2), metadata={op_name="args[1]"}
+  %constant_23_1 = s32[] constant(0), metadata={op_name="dynamic-slice.3"}
+  ROOT %dynamic-slice.6.1 = c128[1,310,310]{2,1,0} dynamic-slice(%param_0, %bitcast.3, %constant_23_1, %constant_23_1), dynamic_slice_sizes={1,310,310}, metadata={op_name="dynamic-slice.3"}
+}
+
+ENTRY %main.0_spmd (param.2: c128[512,310,310], param.3: s32[1]) -> c128[310,310] {
+  %param.3 = s32[1]{0} parameter(1), sharding={replicated}, metadata={op_name="args[1]"}
+  %param.2 = c128[512,310,310]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="args[0]"}
+  %loop_dynamic_slice_fusion = c128[1,310,310]{2,1,0} fusion(%param.2, %param.3), kind=kLoop, calls=%fused_dynamic_slice, metadata={op_name="dynamic-slice.3"}
+  ROOT %bitcast.1.0 = c128[310,310]{1,0} bitcast(%loop_dynamic_slice_fusion), metadata={op_name="dynamic-slice.3"}
+}
+

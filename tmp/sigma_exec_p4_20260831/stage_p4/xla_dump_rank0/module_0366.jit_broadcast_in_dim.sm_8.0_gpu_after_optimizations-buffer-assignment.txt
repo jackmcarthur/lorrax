@@ -1,0 +1,39 @@
+BufferAssignment:
+allocation 0: size 787251200, output shape is |c128[1,512,310,310]|, maybe-live-out:
+ value: <1 copy.1 @0> (size=787251200,offset=0): c128[1,512,310,310]{3,2,1,0}
+allocation 1: size 787251200, parameter 0, shape |c128[512,310,310]| at ShapeIndex {}:
+ value: <0 param @0> (size=787251200,offset=0): c128[512,310,310]{2,1,0}
+
+Total bytes used: 1574502400 (1.47GiB)
+
+Used values:
+<0 param @0>
+ positions:
+  param
+  bitcast.1
+ uses:
+  bitcast.1, operand 0
+  copy.1, operand 0
+ from instruction: %param = c128[512,310,310]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="args[0]"}
+<1 copy.1 @0>
+ positions:
+  copy.1
+ uses:
+ from instruction: %copy.1 = c128[1,512,310,310]{3,2,1,0} copy(%bitcast.1)
+
+
+HloLiveRange (max 3):
+  InstructionSequence:
+    0:param
+    1:bitcast.1
+    2:copy.1
+  BufferLiveRange:
+    param{}:0-3
+    copy.1{}:2-3
+  Live ranges at 2 (peak):
+    copy.1{}: 787251200 bytes (cumulative: 787251200 bytes)
+    param{}: 787251200 bytes (cumulative: 1574502400 bytes)
+  Stack trace breakdown for peak usage: 1 574 502 400 bytes
+    main.0_spmd (100.0%, total: 1 574 502 400 bytes, current: 0 bytes, remaining: 1 574 502 400 bytes)
+      ├── args[0] (50.0%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 787 251 200 bytes)
+      └── copy.1 (50.0%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 0 bytes)

@@ -1,0 +1,33 @@
+HloModule jit_add, is_scheduled=true, entry_computation_layout={(c128[512,24,24]{2,1,0}, c128[512,24,24]{2,1,0})->c128[512,24,24]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="e160dcd8ef5c9fc1698a68b611b62099"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=1058 end_line=1058 column=14 end_column=14}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+
+
+%wrapped_add_computation (param_0: c128[512,24,24], param_1: c128[512,24,24]) -> c128[512,24,24] {
+  %param_0 = c128[512,24,24]{2,1,0} parameter(0)
+  %param_1 = c128[512,24,24]{2,1,0} parameter(1)
+  ROOT %add.2.1 = c128[512,24,24]{2,1,0} add(%param_0, %param_1), metadata={op_name="jit(add)/add" stack_frame_id=3}
+}
+
+ENTRY %main.0_spmd (param: c128[512,24,24], param.1: c128[512,24,24]) -> c128[512,24,24] {
+  %param.1 = c128[512,24,24]{2,1,0} parameter(1), sharding={replicated}, metadata={op_name="y"}
+  %param = c128[512,24,24]{2,1,0} parameter(0), sharding={replicated}, metadata={op_name="x"}
+  ROOT %wrapped_add = c128[512,24,24]{2,1,0} fusion(%param, %param.1), kind=kLoop, calls=%wrapped_add_computation, metadata={op_name="jit(add)/add" stack_frame_id=3}
+}
+

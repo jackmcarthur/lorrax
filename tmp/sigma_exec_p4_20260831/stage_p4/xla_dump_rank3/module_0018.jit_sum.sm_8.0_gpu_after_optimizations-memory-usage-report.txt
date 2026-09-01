@@ -1,0 +1,24 @@
+Total bytes used: 40 (40B)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+        8B( 20%);        32B; allocation 0: size 8B, output shape is |f64[]|, maybe-live-out:
+       16B( 40%);        24B; allocation 1: size 8B, parameter 0, shape |f64[1]| at ShapeIndex {}:
+       24B( 60%);        16B; allocation 2: size 8B, thread-local:
+       32B( 80%);         8B; allocation 3: size 8B, thread-local:
+       40B(100%);         0B; allocation 4: size 8B, thread-local:
+
+
+Allocations sorted by size with their values:
+allocation 0: size 8B, output shape is |f64[]|, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	       8B(100%);         8B;            0;                2; f64[1], f64[]
+
+allocation 1: size 8B, parameter 0, shape |f64[1]| at ShapeIndex {}:
+allocation 2: size 8B, thread-local:
+allocation 3: size 8B, thread-local:
+allocation 4: size 8B, thread-local:

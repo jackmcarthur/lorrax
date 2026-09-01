@@ -1,0 +1,6 @@
+HloModule jit__identity_fn, entry_computation_layout={(c128[512,48,2,310]{3,2,1,0})->c128[512,48,2,310]{3,2,1,0}}, num_partitions=4
+
+ENTRY %main.0_spmd (param: c128[512,48,2,310]) -> c128[512,48,2,310] {
+  ROOT %param = c128[512,48,2,310]{3,2,1,0} parameter(0), sharding={devices=[1,1,1,2,2]<=[4] last_tile_dim_replicate}, metadata={op_name="x"}
+}
+

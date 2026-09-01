@@ -1,0 +1,36 @@
+BufferAssignment:
+allocation 0: size 243793920, parameter 0, shape |c128[512,48,2,310]| at ShapeIndex {}:
+ value: <2 param @0> (size=243793920,offset=0): c128[512,48,2,310]{3,2,1,0}
+allocation 1: size 121896960, output shape is |c128[512,24,2,310]|, maybe-live-out:
+ value: <3 wrapped_slice @0> (size=121896960,offset=0): c128[512,24,2,310]{3,2,1,0}
+
+Total bytes used: 365690880 (348.75MiB)
+
+Used values:
+<2 param @0>
+ positions:
+  param
+ uses:
+  wrapped_slice, operand 0
+ from instruction: %param = c128[512,48,2,310]{3,2,1,0} parameter(0), sharding={devices=[1,1,1,2,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="self.psi_yr"}
+<3 wrapped_slice @0>
+ positions:
+  wrapped_slice
+ uses:
+ from instruction: %wrapped_slice = c128[512,24,2,310]{3,2,1,0} fusion(%param), kind=kLoop, calls=%wrapped_slice_computation, metadata={op_name="jit(yr)/slice" stack_frame_id=9}
+
+
+HloLiveRange (max 2):
+  InstructionSequence:
+    0:param
+    1:wrapped_slice
+  BufferLiveRange:
+    param{}:0-2
+    wrapped_slice{}:1-2
+  Live ranges at 1 (peak):
+    param{}: 243793920 bytes (cumulative: 243793920 bytes)
+    wrapped_slice{}: 121896960 bytes (cumulative: 365690880 bytes)
+  Stack trace breakdown for peak usage: 365 690 880 bytes
+    main.0_spmd (100.0%, total: 365 690 880 bytes, current: 0 bytes, remaining: 365 690 880 bytes)
+      ├── self.psi_yr (66.7%, total: 243 793 920 bytes, current: 243 793 920 bytes, remaining: 121 896 960 bytes)
+      └── jit(yr)/slice (33.3%, total: 121 896 960 bytes, current: 121 896 960 bytes, remaining: 0 bytes)

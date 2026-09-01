@@ -1,0 +1,263 @@
+BufferAssignment:
+allocation 0: size 787251200, output shape is |c128[512,310,310]|, maybe-live-out:
+ value: <28 wrapped_gather @0> (size=787251200,offset=0): c128[512,1,310,310]{2,0,3,1}
+ value: <31 input_transpose_fusion.1 @0> (size=787251200,offset=0): c128[512,2,310,155]{3,2,1,0}
+ value: <35 loop_transpose_fusion @0> (size=787251200,offset=0): c128[310,512,2,155]{3,2,1,0}
+ value: <38 loop_transpose_fusion.1 @0> (size=787251200,offset=0): c128[620,512,155]{2,1,0}
+ value: <41 input_transpose_fusion @0> (size=787251200,offset=0): c128[512,2,155,310]{3,2,1,0}
+allocation 1: size 44590400, parameter 0, shape |c128[29,310,310]| at ShapeIndex {}:
+ value: <26 param.9 @0> (size=44590400,offset=0): c128[29,310,310]{2,1,0}
+allocation 2: size 5079040, constant:
+ value: <25 constant_81_0 @0> (size=5079040,offset=0): s64[317440,2]{1,0}
+allocation 3: size 2048, constant:
+ value: <27 constant_68_0 @0> (size=2048,offset=0): s32[512,1]{1,0}
+allocation 4: size 1574504448, preallocated-temp:
+ value: <18 all_to_all.52.1 @0> (size=787251200,offset=2048): c128[512,310,310]{1,0,2}
+ value: <19 all_to_all.56.1 @0> (size=787251200,offset=2048): c128[512,620,155]{2,0,1}
+ value: <20 all_to_all.60.1 @0> (size=787251200,offset=2048): c128[512,310,310]{2,0,1}
+ value: <21 all_to_all.64.1 @0> (size=787251200,offset=2048): c128[512,155,620]{1,0,2}
+ value: <29 all-to-all-start{} @0> (size=16,offset=0): ((c128[512,310,310]{1,0,2}), c128[512,310,310]{1,0,2})
+ value: <30 all-to-all-start{0} @0> (size=8,offset=1024): (c128[512,310,310]{1,0,2})
+ value: <32 loop_transpose_fusion.2 @0> (size=787251200,offset=787253248): c128[620,512,155]{2,1,0}
+ value: <33 all-to-all-start.1{} @0> (size=16,offset=256): ((c128[512,620,155]{2,0,1}), c128[512,620,155]{2,0,1})
+ value: <34 all-to-all-start.1{0} @0> (size=8,offset=1280): (c128[512,620,155]{2,0,1})
+ value: <36 all-to-all-start.2{} @0> (size=16,offset=512): ((c128[512,310,310]{2,0,1}), c128[512,310,310]{2,0,1})
+ value: <37 all-to-all-start.2{0} @0> (size=8,offset=1536): (c128[512,310,310]{2,0,1})
+ value: <39 all-to-all-start.3{} @0> (size=16,offset=768): ((c128[512,155,620]{1,0,2}), c128[512,155,620]{1,0,2})
+ value: <40 all-to-all-start.3{0} @0> (size=8,offset=1792): (c128[512,155,620]{1,0,2})
+
+Total bytes used: 2411427136 (2.25GiB)
+
+Used values:
+<18 all_to_all.52.1 @0>
+ positions:
+  all_to_all.52.1
+  all-to-all-start {1}
+  all-to-all-done
+ uses:
+  all-to-all-done, operand 0 {1}
+  input_transpose_fusion.1, operand 0
+ from instruction: %all_to_all.52.1 = c128[512,310,310]{1,0,2} all-to-all(%param_0.29), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=22}
+<19 all_to_all.56.1 @0>
+ positions:
+  all_to_all.56.1
+  all-to-all-start.1 {1}
+  all-to-all-done.1
+ uses:
+  all-to-all-done.1, operand 0 {1}
+  loop_transpose_fusion, operand 0
+ from instruction: %all_to_all.56.1 = c128[512,620,155]{2,0,1} all-to-all(%param_0.30), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=24}
+<20 all_to_all.60.1 @0>
+ positions:
+  all_to_all.60.1
+  all-to-all-start.2 {1}
+  all-to-all-done.2
+ uses:
+  all-to-all-done.2, operand 0 {1}
+  loop_transpose_fusion.1, operand 1
+ from instruction: %all_to_all.60.1 = c128[512,310,310]{2,0,1} all-to-all(%param_0.31), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=25}
+<21 all_to_all.64.1 @0>
+ positions:
+  all_to_all.64.1
+  all-to-all-start.3 {1}
+  all-to-all-done.3
+ uses:
+  all-to-all-done.3, operand 0 {1}
+  input_transpose_fusion, operand 0
+ from instruction: %all_to_all.64.1 = c128[512,155,620]{1,0,2} all-to-all(%param_0.32), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=27}
+<25 constant_81_0 @0>
+ positions:
+  constant_81_0
+ uses:
+  loop_transpose_fusion.2, operand 0
+  loop_transpose_fusion.1, operand 0
+ from instruction: %constant_81_0 = s64[317440,2]{1,0} constant({...}), metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+<26 param.9 @0>
+ positions:
+  param.9
+ uses:
+  wrapped_gather, operand 0
+ from instruction: %param.9 = c128[29,310,310]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="V_ibz"}
+<27 constant_68_0 @0>
+ positions:
+  constant_68_0
+ uses:
+  wrapped_gather, operand 1
+ from instruction: %constant_68_0 = s32[512,1]{1,0} constant({...}), metadata={op_name="jit(_do_unfold)/shard_map/broadcast_in_dim" stack_frame_id=11}
+<28 wrapped_gather @0>
+ positions:
+  wrapped_gather
+  bitcast.89.0
+  all-to-all-start {0,0}
+  param_0.29
+ uses:
+  bitcast.89.0, operand 0
+  all-to-all-start, operand 0
+  all-to-all-done, operand 0 {0,0}
+  all_to_all.52.1, operand 0
+ from instruction: %wrapped_gather = c128[512,1,310,310]{2,0,3,1} fusion(%param.9, %constant_68_0), kind=kLoop, calls=%wrapped_gather_computation, metadata={op_name="jit(_do_unfold)/shard_map/gather" stack_frame_id=21}
+<29 all-to-all-start{} @0>
+ positions:
+  all-to-all-start {}
+ uses:
+  all-to-all-done, operand 0 {}
+ from instruction: %all-to-all-start = ((c128[512,310,310]{1,0,2}), c128[512,310,310]{1,0,2}) all-to-all-start(%bitcast.89.0), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=22}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<30 all-to-all-start{0} @0>
+ positions:
+  all-to-all-start {0}
+ uses:
+  all-to-all-done, operand 0 {0}
+ from instruction: %all-to-all-start = ((c128[512,310,310]{1,0,2}), c128[512,310,310]{1,0,2}) all-to-all-start(%bitcast.89.0), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=22}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<31 input_transpose_fusion.1 @0>
+ positions:
+  input_transpose_fusion.1
+ uses:
+  loop_transpose_fusion.2, operand 1
+ from instruction: %input_transpose_fusion.1 = c128[512,2,310,155]{3,2,1,0} fusion(%all-to-all-done), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=22}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<32 loop_transpose_fusion.2 @0>
+ positions:
+  loop_transpose_fusion.2
+  bitcast.93.0
+  all-to-all-start.1 {0,0}
+  param_0.30
+ uses:
+  bitcast.93.0, operand 0
+  all-to-all-start.1, operand 0
+  all-to-all-done.1, operand 0 {0,0}
+  all_to_all.56.1, operand 0
+ from instruction: %loop_transpose_fusion.2 = c128[620,512,155]{2,1,0} fusion(%constant_81_0, %input_transpose_fusion.1), kind=kInput, calls=%fused_transpose.4, metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<33 all-to-all-start.1{} @0>
+ positions:
+  all-to-all-start.1 {}
+ uses:
+  all-to-all-done.1, operand 0 {}
+ from instruction: %all-to-all-start.1 = ((c128[512,620,155]{2,0,1}), c128[512,620,155]{2,0,1}) all-to-all-start(%bitcast.93.0), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=24}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<34 all-to-all-start.1{0} @0>
+ positions:
+  all-to-all-start.1 {0}
+ uses:
+  all-to-all-done.1, operand 0 {0}
+ from instruction: %all-to-all-start.1 = ((c128[512,620,155]{2,0,1}), c128[512,620,155]{2,0,1}) all-to-all-start(%bitcast.93.0), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=24}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<35 loop_transpose_fusion @0>
+ positions:
+  loop_transpose_fusion
+  bitcast.97.0
+  all-to-all-start.2 {0,0}
+  param_0.31
+ uses:
+  bitcast.97.0, operand 0
+  all-to-all-start.2, operand 0
+  all-to-all-done.2, operand 0 {0,0}
+  all_to_all.60.1, operand 0
+ from instruction: %loop_transpose_fusion = c128[310,512,2,155]{3,2,1,0} fusion(%all-to-all-done.1), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=24}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<36 all-to-all-start.2{} @0>
+ positions:
+  all-to-all-start.2 {}
+ uses:
+  all-to-all-done.2, operand 0 {}
+ from instruction: %all-to-all-start.2 = ((c128[512,310,310]{2,0,1}), c128[512,310,310]{2,0,1}) all-to-all-start(%bitcast.97.0), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=25}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<37 all-to-all-start.2{0} @0>
+ positions:
+  all-to-all-start.2 {0}
+ uses:
+  all-to-all-done.2, operand 0 {0}
+ from instruction: %all-to-all-start.2 = ((c128[512,310,310]{2,0,1}), c128[512,310,310]{2,0,1}) all-to-all-start(%bitcast.97.0), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=25}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<38 loop_transpose_fusion.1 @0>
+ positions:
+  loop_transpose_fusion.1
+  bitcast.101.0
+  all-to-all-start.3 {0,0}
+  param_0.32
+ uses:
+  bitcast.101.0, operand 0
+  all-to-all-start.3, operand 0
+  all-to-all-done.3, operand 0 {0,0}
+  all_to_all.64.1, operand 0
+ from instruction: %loop_transpose_fusion.1 = c128[620,512,155]{2,1,0} fusion(%constant_81_0, %all-to-all-done.2), kind=kInput, calls=%fused_transpose.3, metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<39 all-to-all-start.3{} @0>
+ positions:
+  all-to-all-start.3 {}
+ uses:
+  all-to-all-done.3, operand 0 {}
+ from instruction: %all-to-all-start.3 = ((c128[512,155,620]{1,0,2}), c128[512,155,620]{1,0,2}) all-to-all-start(%bitcast.101.0), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=27}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<40 all-to-all-start.3{0} @0>
+ positions:
+  all-to-all-start.3 {0}
+ uses:
+  all-to-all-done.3, operand 0 {0}
+ from instruction: %all-to-all-start.3 = ((c128[512,155,620]{1,0,2}), c128[512,155,620]{1,0,2}) all-to-all-start(%bitcast.101.0), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/all_to_all" stack_frame_id=27}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<41 input_transpose_fusion @0>
+ positions:
+  input_transpose_fusion
+  bitcast.10.0
+ uses:
+  bitcast.10.0, operand 0
+ from instruction: %input_transpose_fusion = c128[512,2,155,310]{3,2,1,0} fusion(%all-to-all-done.3), kind=kInput, calls=%fused_transpose, metadata={op_name="jit(_do_unfold)/shard_map/mul" stack_frame_id=20}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+
+
+HloLiveRange (max 30):
+  InstructionSequence:
+    0:constant_81_0
+    1:constant_68_0
+    2:param.9
+    3:wrapped_gather
+    4:bitcast.89.0
+    5:param_0.29
+    6:all_to_all.52.1
+    7:all-to-all-start
+    8:all-to-all-done
+    9:input_transpose_fusion.1
+    10:loop_transpose_fusion.2
+    11:bitcast.93.0
+    12:param_0.30
+    13:all_to_all.56.1
+    14:all-to-all-start.1
+    15:all-to-all-done.1
+    16:loop_transpose_fusion
+    17:bitcast.97.0
+    18:param_0.31
+    19:all_to_all.60.1
+    20:all-to-all-start.2
+    21:all-to-all-done.2
+    22:loop_transpose_fusion.1
+    23:bitcast.101.0
+    24:param_0.32
+    25:all_to_all.64.1
+    26:all-to-all-start.3
+    27:all-to-all-done.3
+    28:input_transpose_fusion
+    29:bitcast.10.0
+  BufferLiveRange:
+    all_to_all.52.1{}:6-9
+    all_to_all.56.1{}:13-16
+    all_to_all.60.1{}:19-22
+    all_to_all.64.1{}:25-28
+    constant_81_0{}:0-22
+    param.9{}:0-30
+    constant_68_0{}:1-3
+    wrapped_gather{}:3-8
+    all-to-all-start{}:7-8
+    all-to-all-start{0}:7-8
+    input_transpose_fusion.1{}:9-10
+    loop_transpose_fusion.2{}:10-15
+    all-to-all-start.1{}:14-15
+    all-to-all-start.1{0}:14-15
+    loop_transpose_fusion{}:16-21
+    all-to-all-start.2{}:20-21
+    all-to-all-start.2{0}:20-21
+    loop_transpose_fusion.1{}:22-27
+    all-to-all-start.3{}:26-27
+    all-to-all-start.3{0}:26-27
+    input_transpose_fusion{}:28-30
+  Live ranges at 9 (peak):
+    all_to_all.52.1{}: 787251200 bytes (cumulative: 787251200 bytes)
+    input_transpose_fusion.1{}: 787251200 bytes (cumulative: 1574502400 bytes)
+    param.9{}: 44590400 bytes (cumulative: 1619092800 bytes)
+    constant_81_0{}: 5079040 bytes (cumulative: 1624171840 bytes)
+  Stack trace breakdown for peak usage: 1 624 171 840 bytes
+    main.2_spmd (100.0%, total: 1 624 171 840 bytes, current: 0 bytes, remaining: 1 624 171 840 bytes)
+      ├── jit(_do_unfold)/shard_map/all_to_all (96.9%, total: 1 574 502 400 bytes, current: 787 251 200 bytes, remaining: 836 920 640 bytes)
+      │   └── async_computation (48.5%, total: 787 251 200 bytes, current: 0 bytes, remaining: 836 920 640 bytes)
+      │       └── jit(_do_unfold)/shard_map/all_to_all (48.5%, total: 787 251 200 bytes, current: 787 251 200 bytes, remaining: 49 669 440 bytes)
+      ├── V_ibz (2.7%, total: 44 590 400 bytes, current: 44 590 400 bytes, remaining: 5 079 040 bytes)
+      └── jit(_do_unfold)/shard_map/jit(take_along_axis)/gather (0.3%, total: 5 079 040 bytes, current: 5 079 040 bytes, remaining: 0 bytes)

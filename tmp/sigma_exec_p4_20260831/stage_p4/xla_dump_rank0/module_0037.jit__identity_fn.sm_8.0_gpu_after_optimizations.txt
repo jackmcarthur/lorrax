@@ -1,0 +1,8 @@
+HloModule jit__identity_fn, is_scheduled=true, entry_computation_layout={(c128[512,310,48,2]{3,2,1,0})->c128[512,310,48,2]{3,2,1,0}}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="0e0808c64363af2cd022a725af7012a3"}
+
+ENTRY %main.0_spmd (param: c128[512,310,48,2]) -> c128[512,310,48,2] {
+  %param = c128[512,310,48,2]{3,2,1,0} parameter(0), sharding={devices=[1,2,1,1,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="x"}
+  %collective-permute-start = (c128[512,310,48,2]{3,2,1,0}, c128[512,310,48,2]{3,2,1,0}) collective-permute-start(%param), channel_id=1, source_target_pairs={{0,0},{2,1},{1,2},{3,3}}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  ROOT %collective-permute-done = c128[512,310,48,2]{3,2,1,0} collective-permute-done(%collective-permute-start)
+}
+

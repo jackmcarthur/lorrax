@@ -1,0 +1,2 @@
+001: kCopy          	
+002: kAllReduceStart	

@@ -1,0 +1,7 @@
+HloModule jit__moveaxis, is_scheduled=true, entry_computation_layout={(c128[32,32,32]{2,1,0})->c128[32,32,32]{2,1,0}}, allow_spmd_sharding_propagation_to_parameters={true}, allow_spmd_sharding_propagation_to_output={true}, frontend_attributes={fingerprint_before_lhs="1353e51be8d569ef08e246ed447b7447"}
+
+ENTRY %main.1 (a.1: c128[32,32,32]) -> c128[32,32,32] {
+  %a.1 = c128[32,32,32]{2,1,0} parameter(0), metadata={op_name="a"}
+  ROOT %copy.1 = c128[32,32,32]{2,1,0} copy(%a.1)
+}
+

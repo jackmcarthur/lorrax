@@ -1,0 +1,64 @@
+HloModule jit__lambda, is_scheduled=true, input_output_alias={ {}: (0, {}, may-alias) }, entry_computation_layout={(c128[21,512,12,12]{3,2,1,0}, c128[512,12,12]{2,1,0}, c128[21]{0})->c128[21,512,12,12]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="740914890a3b1f33d49389bcbf478b6c"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829/run_existing_fit.py"
+2 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/mpa/sigma.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/ppm_accumulators.py"
+
+FunctionNames
+1 "<module>"
+2 "main"
+3 "compute_sigma_xc"
+4 "compute_sigma_c_mpa_omega_grid"
+5 "integrate_sigma_store"
+6 "integrate_sigma_store.<locals>.run"
+7 "_integrate_sigma_batches"
+8 "DeviceOmegaAccumulator.precompile_tau_add"
+9 "_device_omega_add.<locals>.<lambda>"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=53 end_line=53 column=21 end_column=21}
+2 {file_name_id=1 function_name_id=2 line=48 end_line=48 column=13 end_column=13}
+3 {file_name_id=2 function_name_id=2 line=770 end_line=770 column=18 end_column=18}
+4 {file_name_id=3 function_name_id=3 line=1066 end_line=1066 column=15 end_column=15}
+5 {file_name_id=4 function_name_id=4 line=541 end_line=541 column=15 end_column=15}
+6 {file_name_id=4 function_name_id=5 line=300 end_line=300 column=15 end_column=15}
+7 {file_name_id=4 function_name_id=6 line=295 end_line=295 column=15 end_column=15}
+8 {file_name_id=4 function_name_id=7 line=213 end_line=213 column=16 end_column=16}
+9 {file_name_id=5 function_name_id=8 line=649 end_line=649 column=8 end_column=8}
+10 {file_name_id=5 function_name_id=9 line=570 end_line=570 column=18 end_column=18}
+11 {file_name_id=5 function_name_id=9 line=570 end_line=570 column=12 end_column=12}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=10}
+
+
+%fused_add (param_0: c128[21,512,12,12], param_1.2: c128[512,12,12], param_2.2: c128[21]) -> c128[21,512,12,12] {
+  %param_0 = c128[21,512,12,12]{3,2,1,0} parameter(0)
+  %param_2.2 = c128[21]{0} parameter(2)
+  %mul.0.1 = c128[21,512,12,12]{3,2,1,0} broadcast(%param_2.2), dimensions={0}, metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %param_1.2 = c128[512,12,12]{2,1,0} parameter(1)
+  %mul.1.1 = c128[21,512,12,12]{3,2,1,0} broadcast(%param_1.2), dimensions={1,2,3}, metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  %mul.2.1 = c128[21,512,12,12]{3,2,1,0} multiply(%mul.0.1, %mul.1.1), metadata={op_name="jit(<lambda>)/mul" stack_frame_id=10}
+  ROOT %add.0.1 = c128[21,512,12,12]{3,2,1,0} add(%param_0, %mul.2.1), metadata={op_name="jit(<lambda>)/add" stack_frame_id=11}
+}
+
+ENTRY %main.0_spmd (param: c128[21,512,12,12], param.2: c128[512,12,12], param.1: c128[21]) -> c128[21,512,12,12] {
+  %param.2 = c128[512,12,12]{2,1,0} parameter(1), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="sigma"}
+  %param.1 = c128[21]{0} parameter(2), sharding={replicated}, metadata={op_name="coeff"}
+  %param = c128[21,512,12,12]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="acc"}
+  ROOT %loop_add_fusion = c128[21,512,12,12]{3,2,1,0} fusion(%param, %param.2, %param.1), kind=kLoop, calls=%fused_add, metadata={op_name="jit(<lambda>)/add" stack_frame_id=11}
+}
+

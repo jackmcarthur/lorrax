@@ -1,0 +1,6 @@
+HloModule jit__identity_fn, entry_computation_layout={(f64[512,48]{1,0})->f64[512,48]{1,0}}, allow_spmd_sharding_propagation_to_parameters={true}, num_partitions=4
+
+ENTRY %main.0_spmd (param: f64[512,48]) -> f64[512,48] {
+  ROOT %param = f64[512,48]{1,0} parameter(0), sharding={replicated}, metadata={op_name="x"}
+}
+

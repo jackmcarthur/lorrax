@@ -1,0 +1,6 @@
+HloModule jit_broadcast_in_dim, entry_computation_layout={(c128[310,310]{1,0})->c128[310,310]{1,0}}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4
+
+ENTRY %main.0_spmd (param: c128[310,310]) -> c128[310,310] {
+  ROOT %param = c128[310,310]{1,0} parameter(0), sharding={devices=[2,2]<=[4]}, metadata={op_name="args[0]"}
+}
+

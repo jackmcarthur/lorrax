@@ -1,0 +1,137 @@
+BufferAssignment:
+allocation 0: size 16777216, parameter 0, shape |c128[16,2,32,32,32]| at ShapeIndex {}:
+ value: <31 psi_k_box.1 @0> (size=16777216,offset=0): c128[16,2,32,32,32]{4,3,2,1,0}
+allocation 1: size 262144, output shape is |f64[32,32,32]|, maybe-live-out:
+ value: <36 input_reduce_fusion @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+ value: <39 loop_multiply_fusion @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+allocation 2: size 128, parameter 4, shape |f64[16]| at ShapeIndex {}:
+ value: <35 band_occupations.1 @0> (size=128,offset=0): f64[16]{0}
+allocation 3: size 8, parameter 2, shape |f64[]| at ShapeIndex {}:
+ value: <33 cell_volume.1 @0> (size=8,offset=0): f64[]
+allocation 4: size 8, parameter 1, shape |f64[]| at ShapeIndex {}:
+ value: <37 weight.1 @0> (size=8,offset=0): f64[]
+allocation 5: size 8, parameter 3, shape |f64[]| at ShapeIndex {}:
+ value: <38 spin_degeneracy.1 @0> (size=8,offset=0): f64[]
+allocation 6: size 8, thread-local:
+ value: <2 reduce_sum.5.0 @0> (size=8,offset=0): f64[]
+allocation 7: size 8, thread-local:
+ value: <0 reduce_sum.3 @0> (size=8,offset=0): f64[]
+allocation 8: size 8, thread-local:
+ value: <1 reduce_sum.4 @0> (size=8,offset=0): f64[]
+allocation 9: size 16777232, preallocated-temp:
+ value: <32 fft.0.0 @0> (size=16777216,offset=0): c128[16,2,32,32,32]{4,3,2,1,0}
+ value: <34 loop_multiply_fusion.1 @0> (size=16,offset=16777216): c128[]
+
+Total bytes used: 33816768 (32.25MiB)
+
+Used values:
+<0 reduce_sum.3 @0>
+ positions:
+  reduce_sum.3
+ uses:
+  reduce_sum.5.0, operand 0
+ from instruction: %reduce_sum.3 = f64[] parameter(0), metadata={op_name="reduce_sum"}
+<1 reduce_sum.4 @0>
+ positions:
+  reduce_sum.4
+ uses:
+  reduce_sum.5.0, operand 1
+ from instruction: %reduce_sum.4 = f64[] parameter(1), metadata={op_name="reduce_sum"}
+<2 reduce_sum.5.0 @0>
+ positions:
+  reduce_sum.5.0
+ uses:
+ from instruction: %reduce_sum.5.0 = f64[] add(%reduce_sum.3, %reduce_sum.4), metadata={op_name="jit(_valence_density_kernel)/reduce_sum" stack_frame_id=12}
+<31 psi_k_box.1 @0>
+ positions:
+  psi_k_box.1
+ uses:
+  fft.0.0, operand 0
+ from instruction: %psi_k_box.1 = c128[16,2,32,32,32]{4,3,2,1,0} parameter(0), sharding={replicated}, frontend_attributes={xla.sdy.sharding="#sdy.sharding<@empty_mesh, [{}, {}, {}, {}, {}]>"}, metadata={op_name="psi_k_box"}
+<32 fft.0.0 @0>
+ positions:
+  fft.0.0
+ uses:
+  input_reduce_fusion, operand 0
+ from instruction: %fft.0.0 = c128[16,2,32,32,32]{4,3,2,1,0} fft(%psi_k_box.1), fft_type=IFFT, fft_length={32,32,32}, metadata={op_name="jit(_valence_density_kernel)/jit(fft)/fft"}
+<33 cell_volume.1 @0>
+ positions:
+  cell_volume.1
+ uses:
+  loop_multiply_fusion.1, operand 0
+ from instruction: %cell_volume.1 = f64[] parameter(2), metadata={op_name="cell_volume"}
+<34 loop_multiply_fusion.1 @0>
+ positions:
+  loop_multiply_fusion.1
+ uses:
+  input_reduce_fusion, operand 1
+ from instruction: %loop_multiply_fusion.1 = c128[] fusion(%cell_volume.1), kind=kLoop, calls=%fused_multiply.1, metadata={op_name="jit(_valence_density_kernel)/mul" stack_frame_id=9}
+<35 band_occupations.1 @0>
+ positions:
+  band_occupations.1
+ uses:
+  input_reduce_fusion, operand 2
+ from instruction: %band_occupations.1 = f64[16]{0} parameter(4), metadata={op_name="band_occupations"}
+<36 input_reduce_fusion @0>
+ positions:
+  input_reduce_fusion
+ uses:
+  loop_multiply_fusion, operand 0
+ from instruction: %input_reduce_fusion = f64[32,32,32]{2,1,0} fusion(%fft.0.0, %loop_multiply_fusion.1, %band_occupations.1), kind=kInput, calls=%fused_reduce, metadata={op_name="jit(_valence_density_kernel)/reduce_sum" stack_frame_id=12}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID","native_emitter_backend_config":{}}
+<37 weight.1 @0>
+ positions:
+  weight.1
+ uses:
+  loop_multiply_fusion, operand 1
+ from instruction: %weight.1 = f64[] parameter(1), metadata={op_name="weight"}
+<38 spin_degeneracy.1 @0>
+ positions:
+  spin_degeneracy.1
+ uses:
+  loop_multiply_fusion, operand 2
+ from instruction: %spin_degeneracy.1 = f64[] parameter(3), metadata={op_name="spin_degeneracy"}
+<39 loop_multiply_fusion @0>
+ positions:
+  loop_multiply_fusion
+ uses:
+ from instruction: %loop_multiply_fusion = f64[32,32,32]{2,1,0} fusion(%input_reduce_fusion, %weight.1, %spin_degeneracy.1), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(_valence_density_kernel)/mul" stack_frame_id=14}
+
+
+HloLiveRange (max 9):
+  InstructionSequence:
+    0:cell_volume.1
+    1:loop_multiply_fusion.1
+    2:spin_degeneracy.1
+    3:weight.1
+    4:psi_k_box.1
+    5:band_occupations.1
+    6:fft.0.0
+    7:input_reduce_fusion
+    8:loop_multiply_fusion
+  BufferLiveRange:
+    psi_k_box.1{}:0-9
+    fft.0.0{}:6-7
+    cell_volume.1{}:0-9
+    loop_multiply_fusion.1{}:1-7
+    band_occupations.1{}:0-9
+    input_reduce_fusion{}:7-8
+    weight.1{}:0-9
+    spin_degeneracy.1{}:0-9
+    loop_multiply_fusion{}:8-9
+  Live ranges at 8 (peak):
+    psi_k_box.1{}: 16777216 bytes (cumulative: 16777216 bytes)
+    input_reduce_fusion{}: 262144 bytes (cumulative: 17039360 bytes)
+    loop_multiply_fusion{}: 262144 bytes (cumulative: 17301504 bytes)
+    band_occupations.1{}: 128 bytes (cumulative: 17301632 bytes)
+    cell_volume.1{}: 8 bytes (cumulative: 17301640 bytes)
+    spin_degeneracy.1{}: 8 bytes (cumulative: 17301648 bytes)
+    weight.1{}: 8 bytes (cumulative: 17301656 bytes)
+  Stack trace breakdown for peak usage: 17 301 656 bytes
+    main.4 (100.0%, total: 17 301 656 bytes, current: 0 bytes, remaining: 17 301 656 bytes)
+      ├── psi_k_box (97.0%, total: 16 777 216 bytes, current: 16 777 216 bytes, remaining: 524 440 bytes)
+      ├── jit(_valence_density_kernel)/mul (1.5%, total: 262 144 bytes, current: 262 144 bytes, remaining: 262 296 bytes)
+      ├── jit(_valence_density_kernel)/reduce_sum (1.5%, total: 262 144 bytes, current: 262 144 bytes, remaining: 152 bytes)
+      ├── band_occupations (0.0%, total: 128 bytes, current: 128 bytes, remaining: 24 bytes)
+      ├── cell_volume (0.0%, total: 8 bytes, current: 8 bytes, remaining: 16 bytes)
+      ├── spin_degeneracy (0.0%, total: 8 bytes, current: 8 bytes, remaining: 8 bytes)
+      └── weight (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

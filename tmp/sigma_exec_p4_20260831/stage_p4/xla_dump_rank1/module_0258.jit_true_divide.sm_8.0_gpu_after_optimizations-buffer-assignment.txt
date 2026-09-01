@@ -1,0 +1,48 @@
+BufferAssignment:
+allocation 0: size 524288, output shape is |c128[32,32,32]|, maybe-live-out:
+ value: <6 loop_divide_fusion @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+allocation 1: size 524288, parameter 0, shape |c128[32,32,32]| at ShapeIndex {}:
+ value: <4 x1.1 @0> (size=524288,offset=0): c128[32,32,32]{2,1,0}
+allocation 2: size 262144, parameter 1, shape |f64[32,32,32]| at ShapeIndex {}:
+ value: <5 x2.1 @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+
+Total bytes used: 1310720 (1.25MiB)
+
+Used values:
+<4 x1.1 @0>
+ positions:
+  x1.1
+ uses:
+  loop_divide_fusion, operand 0
+ from instruction: %x1.1 = c128[32,32,32]{2,1,0} parameter(0), metadata={op_name="x1"}
+<5 x2.1 @0>
+ positions:
+  x2.1
+ uses:
+  loop_divide_fusion, operand 1
+ from instruction: %x2.1 = f64[32,32,32]{2,1,0} parameter(1), metadata={op_name="x2"}
+<6 loop_divide_fusion @0>
+ positions:
+  loop_divide_fusion
+ uses:
+ from instruction: %loop_divide_fusion = c128[32,32,32]{2,1,0} fusion(%x1.1, %x2.1), kind=kLoop, calls=%fused_divide, metadata={op_name="jit(true_divide)/div" stack_frame_id=9}
+
+
+HloLiveRange (max 3):
+  InstructionSequence:
+    0:x2.1
+    1:x1.1
+    2:loop_divide_fusion
+  BufferLiveRange:
+    x1.1{}:0-3
+    x2.1{}:0-3
+    loop_divide_fusion{}:2-3
+  Live ranges at 2 (peak):
+    loop_divide_fusion{}: 524288 bytes (cumulative: 524288 bytes)
+    x1.1{}: 524288 bytes (cumulative: 1048576 bytes)
+    x2.1{}: 262144 bytes (cumulative: 1310720 bytes)
+  Stack trace breakdown for peak usage: 1 310 720 bytes
+    main.1 (100.0%, total: 1 310 720 bytes, current: 0 bytes, remaining: 1 310 720 bytes)
+      ├── jit(true_divide)/div (40.0%, total: 524 288 bytes, current: 524 288 bytes, remaining: 786 432 bytes)
+      ├── x1 (40.0%, total: 524 288 bytes, current: 524 288 bytes, remaining: 262 144 bytes)
+      └── x2 (20.0%, total: 262 144 bytes, current: 262 144 bytes, remaining: 0 bytes)

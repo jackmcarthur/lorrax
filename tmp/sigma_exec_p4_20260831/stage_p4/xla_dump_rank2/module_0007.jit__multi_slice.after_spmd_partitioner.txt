@@ -1,0 +1,49 @@
+HloModule jit__multi_slice, entry_computation_layout={(f64[2,2]{1,0})->f64[1,1]{1,0}}, allow_spmd_sharding_propagation_to_parameters={true}, allow_spmd_sharding_propagation_to_output={true}
+
+FileNames
+1 "<frozen importlib._bootstrap>"
+2 "<frozen importlib._bootstrap_external>"
+3 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/gw/gw_jax.py"
+4 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/runtime/__init__.py"
+5 "/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/src/common/collectives.py"
+
+FunctionNames
+1 "_call_with_frames_removed"
+2 "_find_and_load"
+3 "_find_and_load_unlocked"
+4 "_load_unlocked"
+5 "_LoaderBasics.exec_module"
+6 "<module>"
+7 "initialize_communicator_stack"
+8 "prepare_mesh"
+9 "nccl_warmup"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=488 end_line=488 column=11 end_column=27}
+2 {file_name_id=1 function_name_id=2 line=1360 end_line=1360 column=23 end_column=61}
+3 {file_name_id=1 function_name_id=3 line=1331 end_line=1331 column=21 end_column=41}
+4 {file_name_id=1 function_name_id=4 line=935 end_line=935 column=16 end_column=47}
+5 {file_name_id=2 function_name_id=5 line=999 end_line=999 column=8 end_column=73}
+6 {file_name_id=3 function_name_id=6 line=77 end_line=77 column=10 end_column=61}
+7 {file_name_id=4 function_name_id=7 line=1634 end_line=1634 column=11 end_column=67}
+8 {file_name_id=5 function_name_id=8 line=470 end_line=470 column=12 end_column=29}
+9 {file_name_id=4 function_name_id=9 line=1250 end_line=1250 column=12 end_column=72}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=1 parent_frame_id=6}
+7 {file_location_id=6 parent_frame_id=7}
+8 {file_location_id=7 parent_frame_id=8}
+9 {file_location_id=8 parent_frame_id=9}
+10 {file_location_id=9 parent_frame_id=10}
+
+
+ENTRY %main.1 (self.1: f64[2,2]) -> f64[1,1] {
+  %self.1 = f64[2,2]{1,0} parameter(0), metadata={op_name="self"}
+  ROOT %slice.1 = f64[1,1]{1,0} slice(%self.1), slice={[1:2], [0:1]}, metadata={op_name="jit(_multi_slice)/slice" stack_frame_id=10}
+}
+

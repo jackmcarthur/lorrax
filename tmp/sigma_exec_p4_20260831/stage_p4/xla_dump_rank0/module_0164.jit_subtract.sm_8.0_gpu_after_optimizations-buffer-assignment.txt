@@ -1,0 +1,48 @@
+BufferAssignment:
+allocation 0: size 262144, output shape is |f64[32,32,32]|, maybe-live-out:
+ value: <5 wrapped_subtract @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+allocation 1: size 262144, parameter 0, shape |f64[32,32,32]| at ShapeIndex {}:
+ value: <3 x.1 @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+allocation 2: size 262144, parameter 1, shape |f64[32,32,32]| at ShapeIndex {}:
+ value: <4 y.1 @0> (size=262144,offset=0): f64[32,32,32]{2,1,0}
+
+Total bytes used: 786432 (768.0KiB)
+
+Used values:
+<3 x.1 @0>
+ positions:
+  x.1
+ uses:
+  wrapped_subtract, operand 0
+ from instruction: %x.1 = f64[32,32,32]{2,1,0} parameter(0), metadata={op_name="x"}
+<4 y.1 @0>
+ positions:
+  y.1
+ uses:
+  wrapped_subtract, operand 1
+ from instruction: %y.1 = f64[32,32,32]{2,1,0} parameter(1), metadata={op_name="y"}
+<5 wrapped_subtract @0>
+ positions:
+  wrapped_subtract
+ uses:
+ from instruction: %wrapped_subtract = f64[32,32,32]{2,1,0} fusion(%x.1, %y.1), kind=kLoop, calls=%wrapped_subtract_computation, metadata={op_name="jit(subtract)/sub" stack_frame_id=8}
+
+
+HloLiveRange (max 3):
+  InstructionSequence:
+    0:y.1
+    1:x.1
+    2:wrapped_subtract
+  BufferLiveRange:
+    x.1{}:0-3
+    y.1{}:0-3
+    wrapped_subtract{}:2-3
+  Live ranges at 2 (peak):
+    wrapped_subtract{}: 262144 bytes (cumulative: 262144 bytes)
+    x.1{}: 262144 bytes (cumulative: 524288 bytes)
+    y.1{}: 262144 bytes (cumulative: 786432 bytes)
+  Stack trace breakdown for peak usage: 786 432 bytes
+    main.1 (100.0%, total: 786 432 bytes, current: 0 bytes, remaining: 786 432 bytes)
+      ├── jit(subtract)/sub (33.3%, total: 262 144 bytes, current: 262 144 bytes, remaining: 524 288 bytes)
+      ├── x (33.3%, total: 262 144 bytes, current: 262 144 bytes, remaining: 262 144 bytes)
+      └── y (33.3%, total: 262 144 bytes, current: 262 144 bytes, remaining: 0 bytes)
