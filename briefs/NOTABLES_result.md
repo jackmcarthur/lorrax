@@ -4,7 +4,7 @@
 
 - Sign-definite one-window A/B on one CPU host, back to back: shipped lookup **0.01405 s, 7 nodes, residual 8.950e-7, kappa_p99 1.0054**; on-demand fit **0.05911 s, 6 nodes, residual 6.727e-17, kappa_p99 1.0000**. Planning cost increased by **0.04506 s (4.21x)** while node cost fell by one.
 - Exact sprint gate on the consolidated base collected **136 tests**: first full run **135 passed / 1 failed in 87.52 s**. The failure identified lost refusal metrics; after the evidence handoff fix, its red cell passed **1/1 in 8.81 s**, and the complete post-fix gate passed **136/136 in 94.31 s**.
-- Total diff: **499 net lines deleted** (89 added, 588 deleted); production/service code accounts for **488 deleted lines**. Removed code includes catalog walk/load, sign-definite table candidates, crossing table candidates/fallback fit, and catalog-reach omega patching.
+- Commit diff: **480 net lines deleted** (108 added, 588 deleted, including this report); production/service code accounts for **488 deleted lines**. Removed code includes catalog walk/load, sign-definite table candidates, crossing table candidates/fallback fit, and catalog-reach omega patching.
 
 ## What changed
 
