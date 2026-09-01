@@ -343,7 +343,36 @@ former.
   routes; `bare_transverse` omits it (sandbox register, `sigma_dispatch`
   row).
 
-## 5. Where the code is
+## 5. Lineage: which branch holds which screened four-current solve
+
+The packed Lorentz Dyson solve `W^{IJ}_q(μ,ν) = [(1 − Dχ_0)^{-1}D]^{IJ}` over
+the compound index `(I⊗μ, J⊗ν)` was built twice. Neither incarnation ever
+evaluated it at a nonzero frequency; the plasmon-probe and MPA screening
+requests pass the scalar charge `V_q` in every branch.
+
+| incarnation | where | what it solves | frequency | status |
+|---|---|---|---|---|
+| `src/gw/w_bispinor.py`: channel-blocked supermatrix `[C n_C \| T1 n_T \| T2 n_T \| T3 n_T]`, the scalar `solve_w` at size `n_C + 3n_T` | `origin/agent/bispinor-supermatrix-w` (2026-06-16/17), carried to `origin/agent/bispinor-ibz-lorentz-unfold` with an IBZ→full-BZ Lorentz unfold, Σ^B folded into the static QP Σ_xc, and a screened-versus-unscreened Breit comparison (`breit_comparison.dat`) | milestone A: charge χ⁰⁰ only (W^{ij} = bare); milestone B: six TT χ^{ij} plus the three charge–current cross χ^{0i} by folding `γ̃` into the conduction ket of the scalar χ⁰ kernel | ω = 0 only, inside the static-quadrature section; GN-PPM probe screening charge-only | never merged. Measured on FM CrI3 6×6 (640/200 centroids): deeper bands −17…−40 meV Breit, screened vs unscreened differ by < 10 μeV |
+| `src/gw/photon_layout.py` + `w_isdf.compute_static_photon_response` + `src/gw/photon_sigma.py`: mesh-interleaved direct sum, distributed Dyson, sixteen-block Σ | `origin/main` since the 2026-08-24/25 integration branches (`integ/full-screened-bispinor-2026-08-24`, `integ/full-bispinor-*`) | all sixteen no-pair `χ^{IJ}_0` blocks (`compute_no_pair_dirac_current_block`, TT Ward-subtracted) and the exact-slab Γ completion of §4 | ω = 0 only (`compute_mode = cohsex`) | on main as `full_static_cohsex` / `charge_hall_cubature` |
+
+The two 2026-08-22 design audits that preceded the second incarnation
+(sandbox `RUNS_INFLIGHT.md` rows "codex-full-screened-bispinor-gw-audit"
+and "codex-bispinor-screened-wings-q0-audit", at `origin/main@c344d57c`)
+laid out a static-and-dynamic mode ladder, including a hybrid
+"charge dynamic, non-charge static" rung. Only the static rungs were built;
+no branch contains the hybrid or a dynamic photon block. (The audit texts
+survive in the sandbox archive
+`pre_2026-08-25_summary_archive_2026-09-01/reports/`.) The ingredient for
+one is present: `compute_no_pair_dirac_current_block` accepts any minimax
+`quad`, so `χ^{IJ}_0(iω_p)` and hence `W^{IJ}(iω_p)` is one call away, but
+nothing wires it into `photon_sigma` or the PPM Σ_c.
+
+A drafted manual chapter 8 ("Bispinor GW", four sections) and appendix B
+("The q→0 head of W") exist on `origin/agent/manual@84b8c2aa` (2026-07-13)
+and were never merged; chapter 8.4 already records "Not yet built:
+transverse screening".
+
+## 6. Where the code is
 
 | object | owner |
 |---|---|
