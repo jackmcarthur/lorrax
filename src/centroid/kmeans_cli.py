@@ -543,7 +543,7 @@ def main():
     else:
         kmeans_target = M_cand
 
-    with timing.section("kmeans"):
+    with timing.section("kmeans") as kmeans_section:
         labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
             avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
             mesh=mesh, mesh_axis=mesh_axis,
@@ -551,6 +551,12 @@ def main():
             R=R, Rinv=Rinv, tau=tau,
             print_fn=print0,
         )
+        # The host materialises ``centroids`` immediately below.  Watch every
+        # returned device value here so this phase measures completion rather
+        # than asynchronous dispatch; this is one semantic boundary, not an
+        # inner-loop synchronization point.
+        kmeans_section.watch(
+            labels, centroids, _lloyd_steps, _lloyd_move_sq)
     centroids_frac = np.asarray(centroids)
 
     with timing.section("snap_unfold"):
@@ -568,7 +574,8 @@ def main():
             # reloads the WFN windows.
             if not args.plot or array is not weight:
                 release_arrays.append(array)
-        _release_lloyd_before_prune(*release_arrays)
+        with timing.section("release_before_prune"):
+            _release_lloyd_before_prune(*release_arrays)
         del release_arrays, labels, centroids, kmeans_weight
         if not args.plot:
             del weight
@@ -632,8 +639,10 @@ def main():
         )
         print0(f"Saved centroids to {out_file}")
 
+    selection_wall = time.perf_counter() - selection_start
     if process_rank() == 0 and debug_print_enabled():
-        timing.report(title="--- kmeans_cli timing (s) ---")
+        timing.report(title="--- kmeans_cli timing (s) ---",
+                      wall=selection_wall)
 
     if process_rank() == 0:
         report_file = "kmeans.out"
@@ -641,7 +650,7 @@ def main():
             header=header, source_wfn="WFN.h5", centroid_file=out_file,
             report_file=report_file,
             wfn_backend=str(getattr(wfn, "backend", "unknown")),
-            elapsed_s=time.perf_counter() - selection_start,
+            elapsed_s=selection_wall, timing_records=timing.records(),
             runtime=RUNTIME, warnings=production_warnings)
         with open(report_file, "w", encoding="utf-8") as stream:
             stream.write(report_text)

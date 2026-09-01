@@ -1,5 +1,7 @@
 """Contract tests for the scientific provenance on centroid coordinate files."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -88,13 +90,84 @@ def test_kmeans_report_is_compact_scientific_output(tmp_path):
         centroid_file=str(tmp_path / "centroids_frac_20.txt"),
         report_file=str(tmp_path / "kmeans.out"),
         wfn_backend="phdf5", elapsed_s=12.5, runtime=runtime,
+        timing_records=(
+            {"name": "setup.wfn_io", "path": ("setup.wfn_io",),
+             "inclusive": 1.0},
+            {"name": "setup.weight", "path": ("setup.weight",),
+             "inclusive": 4.0},
+            {"name": "kmeans", "path": ("kmeans",), "inclusive": 2.0},
+            {"name": "init", "path": ("kmeans", "init"),
+             "inclusive": 0.2},
+            {"name": "lloyd", "path": ("kmeans", "lloyd"),
+             "inclusive": 1.5},
+            {"name": "assign_labels",
+             "path": ("kmeans", "assign_labels"), "inclusive": 0.3},
+            {"name": "snap_unfold", "path": ("snap_unfold",),
+             "inclusive": 0.5},
+            {"name": "release_before_prune",
+             "path": ("release_before_prune",), "inclusive": 1.0},
+            {"name": "prune", "path": ("prune",), "inclusive": 3.0},
+            # Nested diagnostics: already included in the prune parent.
+            {"name": "prune.gram", "path": ("prune", "prune.gram"),
+             "inclusive": 2.0},
+            {"name": "prune.select",
+             "path": ("prune", "prune.select"), "inclusive": 1.0},
+        ),
         warnings=("RuntimeWarning: density symmetry residual is large",))
 
     assert "MPI ranks      : 4" in text
     assert "Wavefunctions  : phdf5 reader" in text
     assert "JAX/JAXLIB     : 0.9.1 / 0.9.1" in text
     assert "feature fit: bands 1-40" in text
+    assert "TIMING (POST-STARTUP)" in text
+    timing_lines = {line.split(":", 1)[0].rstrip(): line
+                    for line in text.splitlines() if " s" in line}
+    assert timing_lines["Feature metric [setup.weight]"].endswith("4.000 s")
+    assert timing_lines["Orbit snap/unfold [snap_unfold]"].endswith("0.500 s")
+    assert timing_lines["  Gram build [prune/prune.gram]"].endswith("2.000 s")
+    assert timing_lines["  Block selection [prune/prune.select]"].endswith(
+        "1.000 s")
+    assert timing_lines["Other selection work"].endswith("1.000 s")
     assert "Selection wall : 12.500 s" in text
     assert "WARNINGS" in text
     assert "density symmetry residual is large" in text
     assert "per-rank" not in text and "HDF5" not in text and "h5py" not in text
+
+
+def test_kmeans_phase_waits_for_every_returned_lloyd_value():
+    """The k-means phase must include asynchronous device completion.
+
+    ``np.asarray(centroids)`` happens after the timing context.  Without a
+    watcher the context measures dispatch while the following host conversion
+    pays the device work, making the phase table systematically too small.
+    """
+    source = (Path(__file__).parents[1] / "src" / "centroid" /
+              "kmeans_cli.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    watched = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With) or len(node.items) != 1:
+            continue
+        item = node.items[0]
+        call = item.context_expr
+        if not (isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "section"
+                and call.args
+                and isinstance(call.args[0], ast.Constant)
+                and call.args[0].value == "kmeans"
+                and isinstance(item.optional_vars, ast.Name)):
+            continue
+        section_name = item.optional_vars.id
+        for child in ast.walk(node):
+            if (isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and isinstance(child.func.value, ast.Name)
+                    and child.func.value.id == section_name
+                    and child.func.attr == "watch"):
+                watched = {
+                    arg.id for arg in child.args if isinstance(arg, ast.Name)
+                }
+    assert watched == {
+        "labels", "centroids", "_lloyd_steps", "_lloyd_move_sq",
+    }
