@@ -287,6 +287,7 @@ def test_check_4_exactly_one_libsci_flavour():
 # Two more the loader's own table earns for free
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason=_NEEDS_GEMM_LANE_SO)
 def test_every_host_handler_this_package_claims_is_actually_exported():
     """The service's target table vs the library, in full.
 

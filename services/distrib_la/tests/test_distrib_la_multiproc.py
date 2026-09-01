@@ -804,8 +804,38 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
 
 
 def check_gemm_plan_scalapack(mesh, dtype="complex128"):
-    """The planned global-call contract through the canonical PBLAS path."""
-    return check_gemm_plan_cublasmp(mesh, dtype, backend="scalapack")
+    """The planned global-call contract through the canonical PBLAS path.
+
+    The first exact-shape use deliberately occurs inside ``jit`` + ``scan``.
+    PBLAS plan construction warms only a scalar tile per rank, so this is the
+    regression gate for trace-safe cold exact-shape composition without
+    production-sized dummy operands.
+    """
+    import jax
+
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    assert px == py
+    nq, m, k, n, nsteps = 2, 5 * px, 7 * px, 6 * px, 2
+    rng = np.random.default_rng(20260901)
+    A_np = _rng_mat(rng, (nsteps, nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nsteps, nq, k, n), dtype)
+    A = _put(A_np, mesh, (None, None, "x", "y"))
+    B = _put(B_np, mesh, (None, None, "x", "y"))
+    plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                       backend="scalapack")
+
+    @jax.jit
+    def _cold_scan(A_steps, B_steps):
+        def _body(carry, operands):
+            return carry, plan(operands[0], operands[1])
+        _, values = jax.lax.scan(_body, None, (A_steps, B_steps))
+        return values
+
+    cold_rel = _rel(_gather(_cold_scan(A, B)), A_np @ B_np)
+    assert cold_rel < RTOL, cold_rel
+    out = check_gemm_plan_cublasmp(mesh, dtype, backend="scalapack")
+    out["cold_first_scan"] = cold_rel
+    return out
 
 
 def check_gemm_plan_manual_shard_map(mesh, dtype="complex128", *, nq=3,
