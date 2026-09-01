@@ -39,3 +39,17 @@ def test_passing_rank_seed_walks_down_to_the_first_pass(monkeypatch):
 
     assert calls == [8, 7, 6]
     assert rank == 7 and error == 1.0e-7
+
+
+def test_varpro_default_skips_lawson_refinement(monkeypatch):
+    lawson_counts = []
+
+    def solve_once(_rank, _range, seed, lawson_iter):
+        lawson_counts.append(lawson_iter)
+        return seed, np.zeros_like(seed)
+
+    monkeypatch.setattr(solver, "_nc_solve_at_R", solve_once)
+
+    solver._nc_solve_varpro(2, 2.0)
+
+    assert lawson_counts == [0, 0]

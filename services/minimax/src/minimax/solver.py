@@ -152,10 +152,14 @@ def _nc_solve_at_R(N, Ri, s_init, lawson_iter=4):
     return s, w
 
 
-def _nc_solve_varpro(N, R, lawson_iter=4):
-    """Compute N-point minimax quadrature for 1/x on [1, R] via VarPro+Lawson.
+def _nc_solve_varpro(N, R, lawson_iter=0):
+    """Compute an N-point 1/x rule on [1, R] by VarPro and optional Lawson.
 
     Uses continuation in R from R=2 upward, warm-starting each solve.
+    The default stops after VarPro: on sign-definite delivered measures the
+    Lawson passes do not change the accepted rank or conditioning, while each
+    pass pays for another nonlinear solve.  Offline callers can still request
+    Lawson refinement explicitly.
 
     Returns
     -------
