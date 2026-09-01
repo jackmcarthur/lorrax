@@ -446,6 +446,10 @@ class SCState:
 
     H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
+    # The previous map's structural band decision.  Re-anchoring still uses
+    # this map's spectrum and Fermi level; this one-bit memory supplies only
+    # the Schmitt deadband at the moving window edge.
+    partition: BandPartition | None = None
     # DIAGNOSTIC continuity only (mu-drift log): the map ENTRY-solves its
     # own occupation state from the spectrum of the H it is handed, so
     # correctness never depends on these two fields — F(H) is a self-map
@@ -554,6 +558,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     return SCState(
         H_qp_dft=device_put_process_local(H0, rep),
         iteration=0,
+        partition=inputs.partition,
         occupation_state=occ_state,
         head_surface_weight_kn=head_surface_weight_kn,
     )
@@ -2230,12 +2235,31 @@ def _sc_head_frequency_plan(
     return requests, None, head_omegas
 
 
+def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
+    """Run-derived Schmitt margin for the re-anchored Sigma window."""
+    # Half a sampled omega bin is unresolved by the grid.  Metallic
+    # occupations also deliberately smear the Fermi edge over their physical
+    # width.  A classification must move beyond both resolutions before it
+    # can remove structure that the preceding map retained.
+    return max(
+        0.5 * float(inputs.config.sigma.omega_step_ev),
+        float(inputs.config.occ_broadening_ry) * RYD_TO_EV,
+    )
+
+
+def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
+    """Current partition, with compatibility for synthetic bare states."""
+    return state.partition if state.partition is not None else inputs.partition
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
     Pure function — no side effects on ``inputs.wfns_dft``.  All
-    derived quantities (E_qp, U_qp, efermi) are recomputed each call;
-    the only carried state is ``H_qp_dft`` on the active subspace.
+    derived quantities (E_qp, U_qp, efermi) are recomputed each call.  The
+    carried state is ``H_qp_dft`` plus the preceding protected-band decision;
+    the latter supplies only edge hysteresis and never freezes the Fermi
+    anchor or current-spectrum classification.
 
     Screening is mode-orthogonal: each iteration asks
     :func:`gw.screening.compute_screening_model` for the configured Σ
@@ -2478,6 +2502,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             band_offset=int(inputs.band_slices.b0),
             omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
             omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
+            previous_partition=(state.partition
+                                if state.partition is not None
+                                else inputs.partition),
+            hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
             label=f"SC map {int(state.iteration)} (mu-anchored)",
             print_fn=inputs.print_fn)
 
@@ -3102,6 +3130,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
+        partition=partition,
         occupation_state=entry_occ_state,
         head_surface_weight_kn=entry_surface_weight_kn,
         outputs=SCOutputs(
@@ -3642,9 +3671,9 @@ def run_self_consistency(
             prev_output_role="dft_seed",
             verdict=protected_band_convergence(
                 e_new_ev, e_initial_ev,
-                np.asarray(inputs.partition.protected_mask,
+                np.asarray(_state_partition(state_new, inputs).protected_mask,
                            dtype=bool).reshape(-1),
-                np.asarray(inputs.partition.in_range_mask,
+                np.asarray(_state_partition(state_new, inputs).in_range_mask,
                            dtype=bool).reshape(-1),
                 tol_ev),
         )
@@ -3694,10 +3723,6 @@ def _run_linear_mixing(
     #: under ``mixing != 1`` those are two different sequences and the file
     #: was stamped from the wrong one.
     _out_history: list[np.ndarray] = [E_prev_ev.copy()]
-    _protected = np.asarray(
-        inputs.partition.protected_mask, dtype=bool).reshape(-1)
-    _in_range = np.asarray(
-        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
@@ -3712,6 +3737,7 @@ def _run_linear_mixing(
         state = SCState(
             H_qp_dft=state.H_qp_dft,
             iteration=state.iteration,
+            partition=state.partition,
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
         )
@@ -3725,6 +3751,7 @@ def _run_linear_mixing(
         last_evaluated = SCState(
             H_qp_dft=map_input.H_qp_dft,
             iteration=state_map.iteration,
+            partition=_state_partition(state_map, inputs),
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
             outputs=state_map.outputs,
@@ -3739,6 +3766,7 @@ def _run_linear_mixing(
         state_next = SCState(
             H_qp_dft=H_next,
             iteration=state_map.iteration,
+            partition=_state_partition(state_map, inputs),
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
         )
@@ -3760,7 +3788,12 @@ def _run_linear_mixing(
         # including the scissored ones, both the looser test and a
         # different set.
         verdict = protected_band_convergence(
-            E_candidate_ev, E_prev_ev, _protected, _in_range, tol_ev)
+            E_candidate_ev, E_prev_ev,
+            np.asarray(_state_partition(state_map, inputs).protected_mask,
+                       dtype=bool),
+            np.asarray(_state_partition(state_map, inputs).in_range_mask,
+                       dtype=bool),
+            tol_ev)
         print_fn(f"    SC convergence: {verdict.summary()}")
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
@@ -3965,10 +3998,7 @@ def _run_rcrop(
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _iter_idx = [0]
     rms_history: list[float] = []
-    _protected = np.asarray(
-        inputs.partition.protected_mask, dtype=bool).reshape(-1)
-    _in_range = np.asarray(
-        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
+    _partition: list[BandPartition | None] = [state_init.partition]
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -3996,11 +4026,13 @@ def _run_rcrop(
         state_in = SCState(
             H_qp_dft=H,
             iteration=_iter_idx[0],
+            partition=_partition[0],
             occupation_state=_occ_state[0],
             head_surface_weight_kn=_head_surface_weight[0],
         )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
+        _partition[0] = _state_partition(state_out, inputs)
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
@@ -4014,7 +4046,12 @@ def _run_rcrop(
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
         _verdict = protected_band_convergence(
-            E_new, E_in, _protected, _in_range, tol_ev)
+            E_new, E_in,
+            np.asarray(_state_partition(state_out, inputs).protected_mask,
+                       dtype=bool),
+            np.asarray(_state_partition(state_out, inputs).in_range_mask,
+                       dtype=bool),
+            tol_ev)
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new.copy())
@@ -4057,6 +4094,7 @@ def _run_rcrop(
             raise _Converged(
                 SCState(H_qp_dft=H,
                         iteration=_iter_idx[0],
+                        partition=_state_partition(state_out, inputs),
                         occupation_state=state_out.occupation_state,
                         head_surface_weight_kn=state_out.head_surface_weight_kn,
                         outputs=state_out.outputs),
@@ -4160,6 +4198,7 @@ def _run_rcrop(
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
+        partition=_partition[0],
         occupation_state=_occ_state[0],
         head_surface_weight_kn=_head_surface_weight[0],
         outputs=_last_outputs[0],

@@ -298,6 +298,66 @@ def _served_candidate(spec, *_args):
     }]
 
 
+def test_rule_selection_enforces_budget_pointwise_not_sum_of_window_maxima():
+    specs = [
+        {"name": "left", "envelope": 1.0,
+         "omega_idx": np.asarray([0]),
+         "envelope_by_frequency": np.asarray([1.0])},
+        {"name": "right", "envelope": 1.0,
+         "omega_idx": np.asarray([1]),
+         "envelope_by_frequency": np.asarray([1.0])},
+    ]
+    candidates = []
+    for _spec in specs:
+        candidates.append([{
+            "times": np.asarray([0.1]),
+            "metrics": (0.08, 1.0, 1.0),
+            "required_target": 0.08,
+            "absolute_cost": 0.08,
+        }])
+
+    selected, nodes, required = delivered._select_rules(
+        specs, candidates, total_absolute_budget=0.1, pair_ceiling=2,
+        pointwise_budget=np.asarray([0.1, 0.1]))
+
+    assert len(selected) == 2
+    assert nodes == 2
+    assert required == pytest.approx(0.08)
+    assert sum(row["absolute_cost"] for row in selected) == pytest.approx(0.16)
+
+
+def test_rule_selection_keeps_pointwise_feasible_incomparable_choice():
+    specs = [
+        {"name": "left", "envelope": 1.0,
+         "omega_idx": np.asarray([0]),
+         "envelope_by_frequency": np.asarray([1.0])},
+        {"name": "right", "envelope": 1.0,
+         "omega_idx": np.asarray([1]),
+         "envelope_by_frequency": np.asarray([1.0])},
+    ]
+
+    def candidate(nodes, cost):
+        return {
+            "times": np.full(nodes, 0.1),
+            "metrics": (cost, 0.0, 0.0),
+            "required_target": cost,
+            "absolute_cost": cost,
+        }
+
+    candidates = [
+        [candidate(1, 0.9), candidate(2, 0.1)],
+        [candidate(1, 0.9), candidate(2, 0.1)],
+    ]
+
+    selected, nodes, required = delivered._select_rules(
+        specs, candidates, total_absolute_budget=1.0, pair_ceiling=3,
+        pointwise_budget=np.asarray([1.0, 0.5]))
+
+    assert nodes == 3
+    assert [row["required_target"] for row in selected] == [0.9, 0.1]
+    assert required == pytest.approx(0.9)
+
+
 def _patched_test_plan(width_ev):
     ev_to_ry = 1.0 / 27.211386245988
     eta = 0.25 * ev_to_ry
@@ -578,3 +638,55 @@ def test_budget_retry_reuses_gathered_consolidation_trials(monkeypatch):
     assert consolidated
     assert len(consolidated) == len(set(consolidated))
     assert report["n_windows"] > 0
+
+
+def test_tightening_reaches_second_compounded_round(monkeypatch):
+    """Three shortfalls reach selection call 4 and two tightened fits."""
+    fitted_allowances = []
+
+    def candidate(spec):
+        row = _served_candidate(spec)[0]
+        row["evidence"] = dict(
+            row["evidence"], family="measure_adapted_roq")
+        return row
+
+    def fitted(spec, _eta, _ceiling, _factor_cap, allowance, **_kwargs):
+        fitted_allowances.append(float(allowance))
+        return [candidate(spec)], {
+            "adapted_fit_seconds": 0.0,
+            "shipped_fallback_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(delivered, "_window_candidates_profiled", fitted)
+    monkeypatch.setattr(
+        delivered, "_candidate_rules",
+        lambda spec, *_args, **_kwargs: [candidate(spec)])
+    monkeypatch.setattr(
+        delivered, "_consolidate_branches",
+        lambda specs, candidates, *_args: (specs, candidates, [], None))
+
+    select_calls = 0
+
+    def accept_on_fourth(_specs, candidates, _budget, _ceiling, *,
+                         pointwise_budget):
+        nonlocal select_calls
+        select_calls += 1
+        if select_calls < 4:
+            raise delivered._BudgetShortfall("forced", 2.0, 1.0)
+        selected = [rows[0] for rows in candidates]
+        for row in selected:
+            row["residual_target"] = row["required_target"]
+        return selected, sum(row["times"].size for row in selected), 0.0
+
+    monkeypatch.setattr(delivered, "_select_rules", accept_on_fourth)
+    _plan, report = _patched_test_plan(5.0)
+
+    assert select_calls == 4
+    assert len(fitted_allowances) == 3
+    np.testing.assert_allclose(
+        fitted_allowances, [1.6e-4, 7.2e-5, 3.24e-5],
+        rtol=0.0, atol=1e-14)
+    np.testing.assert_allclose(
+        np.asarray(fitted_allowances[1:]) / fitted_allowances[0],
+        [0.45, 0.45 ** 2], rtol=0.0, atol=1e-14)
+    assert report["n_windows"] == 1

@@ -239,10 +239,17 @@ def roq_select_times(group: RoqGroup, rank: int, *, base_nodes: int = 0,
 
 def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
            ratio: float, *, windows: tuple[str, ...] = (),
-           target: float = np.inf, evaluations: int = 0) -> RoqRule:
+           target: float = np.inf, evaluations: int = 0,
+           amplification: bool = True) -> RoqRule:
     error, _ = delivered_error(group.validation, times, weights)
-    p99, peak = rule_amplification(times, weights, group.validation)
-    passed = p99 * _NOISE_FLOOR <= _NOISE_SHARE * float(target)
+    if amplification:
+        p99, peak = rule_amplification(times, weights, group.validation)
+        passed = p99 * _NOISE_FLOOR <= _NOISE_SHARE * float(target)
+    else:
+        # Rank search needs only the exact delivered residual.  Cancellation
+        # is measured once on the selected rule before it can be accepted.
+        p99 = peak = np.nan
+        passed = False
     return RoqRule(group.name, times, weights, rank, float(np.max(error)),
                    float(p99), float(peak), ratio, group.angle_deg,
                    group.horizon, windows, float(np.max(error)) <= target,
@@ -251,16 +258,19 @@ def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
 
 def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
                   windows: tuple[str, ...] = (), quick: bool = False,
-                  evaluations: int = 0) -> RoqRule:
+                  evaluations: int = 0,
+                  start_weights: np.ndarray | None = None) -> RoqRule:
     """Fit and validate one rank from an already built snapshot basis."""
     times, ratio = _select_prepared(*prepared, rank, group.name)
     weights, _ = solve_fixed_time_weights_fast(
         group.fit, times,
         iterations=16 if quick else 45,
         stall_iterations=3 if quick else 5,
-        conditioning_pass=not quick)
+        conditioning_pass=not quick,
+        start_weights=start_weights)
     return _score(group, times, weights, rank, ratio, windows=windows,
-                  target=target, evaluations=evaluations)
+                  target=target, evaluations=evaluations,
+                  amplification=not quick)
 
 
 def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
@@ -297,7 +307,7 @@ def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
     if not probe(hi).target_met:
         final = _fit_prepared(
             group, prepared, ranks[hi], target=target, windows=windows,
-            evaluations=len(cache))
+            evaluations=len(cache), start_weights=cache[ranks[hi]].weights)
         return final
     while hi - lo > 1:
         mid = (lo + hi) // 2
@@ -314,7 +324,9 @@ def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
     for index in range(chosen, len(ranks)):
         final = _fit_prepared(
             group, prepared, ranks[index], target=target, windows=windows,
-            evaluations=len(cache))
+            evaluations=len(cache),
+            start_weights=(cache[ranks[index]].weights
+                           if ranks[index] in cache else None))
         if best is None or final.max_error < best.max_error:
             best = final
         if final.target_met and final.noise_passed:
@@ -535,6 +547,32 @@ def _rank_ceiling(group: "RoqGroup") -> int:
     return int(np.clip(np.ceil(need), _MIN_RANK, _RANK_HARD_CAP))
 
 
+def _usable_rank(singular) -> int:
+    """How many modes this MEASURE actually supports.
+
+    The cost law bounds the rank a support can NEED; the weighted snapshot
+    spectrum bounds the rank it can USE.  They are different quantities and
+    the second was being ignored, so the ladder fitted far past the point
+    where the subspace still carries information and returned a rule built
+    on numerical noise.
+
+    Measured on the refusing sodium `w<E_F val:resonant` support: of 512
+    requested modes **228 were numerically zero**; at rank 212 the singular
+    ratio was 3.21e-8, and by rank 216 the fit had exploded to residual 47.0
+    with kappa_p99 1.98e7.  The production ladder nevertheless ran to 512,
+    where it reported residual 8.53e-3 at kappa_p99 9.4e4 -- a number that
+    describes the fitter's own cancellation, not the physics.
+
+    The cut is the runtime noise floor, not a new dial: a mode whose relative
+    magnitude is below the noise the runtime will inject cannot carry
+    information the fit is entitled to use.
+    """
+    s = np.asarray(singular, dtype=np.float64)
+    if s.size == 0 or not np.isfinite(s[0]) or s[0] <= 0.0:
+        return _MIN_RANK
+    return max(int(np.count_nonzero(s / s[0] > _NOISE_FLOOR)), _MIN_RANK)
+
+
 def _fit_production_rank(group: RoqGroup, target: float,
                          windows: tuple[str, ...],
                          angle_probe: RoqRule) -> RoqRule:
@@ -542,6 +580,10 @@ def _fit_production_rank(group: RoqGroup, target: float,
     ceiling = _rank_ceiling(group)
     prepared = _prepare_subspace(
         group, _NODES_PER_RANK * ceiling, ceiling)
+    # The measure's own numerical rank is the real ceiling.  Fitting past it
+    # buys cancellation, not accuracy, and turns an honest refusal into a
+    # meaningless kappa.
+    ceiling = min(ceiling, _usable_rank(prepared[1]))
     cache = {}
 
     def quick(rank: int) -> RoqRule:
@@ -553,7 +595,10 @@ def _fit_production_rank(group: RoqGroup, target: float,
         return cache[rank]
 
     lower = _MIN_RANK
-    upper = _ANGLE_PROBE_RANK
+    final_ranks = None
+    # Clamp every search rank to the usable interval.  The angle probe was
+    # built independently and can sit above a low-rank measure's ceiling.
+    upper = min(_ANGLE_PROBE_RANK, ceiling)
     if not angle_probe.target_met or not quick(upper).target_met:
         lower = upper
         # Ladder scaled to this support's own ceiling, so a wide window is
@@ -566,19 +611,71 @@ def _fit_production_rank(group: RoqGroup, target: float,
                 break
             lower = upper
         else:
-            return _fit_prepared(
-                group, prepared, ceiling, target=target, windows=windows,
-                evaluations=len(cache))
-    midpoint = (lower + upper) // 2
-    if lower < midpoint < upper and quick(midpoint).target_met:
-        upper = midpoint
+            # A miss still needs the best honest refusal.  The error can turn
+            # upward near the numerical-rank cliff.  Refine the last ladder
+            # rung with cheap probes, then fully score its best local rank
+            # instead of paying for a known-worse fit at the numerical cliff.
+            usable_ladder = tuple(rank for rank in ladder
+                                  if _MIN_RANK <= rank <= ceiling)
+            anchor = usable_ladder[-2] if len(usable_ladder) > 1 else ceiling
+            local = range(anchor, min(ceiling, anchor + 4) + 1)
+            stable = min(local, key=lambda rank: (
+                quick(rank).max_error, rank))
+            final_ranks = (stable,)
+    if final_ranks is None:
+        midpoint = (lower + upper) // 2
+        if lower < midpoint < upper:
+            if quick(midpoint).target_met:
+                upper = midpoint
+            else:
+                lower = midpoint
 
-    best = None
-    for rank in range(upper, min(ceiling, upper + 3) + 1):
+        # Delivered error falls close to exponentially with rank on the
+        # measured crossing supports.  Interpolate in log(error) inside the
+        # validated fail/pass bracket.  The rank is measured before acceptance.
+        if upper - lower > 1 and lower in cache and upper in cache:
+            log_lower = np.log(cache[lower].max_error / target)
+            log_upper = np.log(cache[upper].max_error / target)
+            if log_lower > 0.0 > log_upper:
+                fraction = log_lower / (log_lower - log_upper)
+                predicted = int(round(lower + fraction * (upper - lower)))
+                predicted = int(np.clip(predicted, lower + 1, upper - 1))
+                if quick(predicted).target_met:
+                    upper = predicted
+                else:
+                    lower = predicted
+
+        # Search fits already have the exact refined-lattice residual.  Score
+        # amplification only once, after rank selection.
+        searched = cache.get(upper)
+        if searched is not None and searched.target_met:
+            if not np.isfinite(searched.kappa_p99):
+                searched = _score(
+                    group, searched.times, searched.weights, searched.rank,
+                    searched.singular_ratio, windows=windows, target=target,
+                    evaluations=searched.search_evaluations)
+                cache[upper] = searched
+            if searched.noise_passed:
+                return searched
+        final_ranks = tuple(
+            range(upper, min(ceiling, upper + 3) + 1))
+
+    # The ladder always contains the ceiling, and the passing path always
+    # contains ``upper``.  Evaluate the first rank unconditionally so the
+    # search is total even when the usable ceiling equals the first probe.
+    best = _fit_prepared(
+        group, prepared, final_ranks[0], target=target, windows=windows,
+        evaluations=len(cache),
+        start_weights=(cache[final_ranks[0]].weights
+                       if final_ranks[0] in cache else None))
+    if best.target_met and best.noise_passed:
+        return best
+    for rank in final_ranks[1:]:
         final = _fit_prepared(
             group, prepared, rank, target=target, windows=windows,
-            evaluations=len(cache))
-        if best is None or final.max_error < best.max_error:
+            evaluations=len(cache),
+            start_weights=(cache[rank].weights if rank in cache else None))
+        if final.max_error < best.max_error:
             best = final
         if final.target_met and final.noise_passed:
             return final
