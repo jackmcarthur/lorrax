@@ -4032,7 +4032,8 @@ def _run_rcrop(
         )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
-        _partition[0] = _state_partition(state_out, inputs)
+        partition_out = _state_partition(state_out, inputs)
+        _partition[0] = partition_out
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
@@ -4045,12 +4046,18 @@ def _run_rcrop(
         # difference can be driven small by damping while F still has no
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
+        protected_mask = np.asarray(
+            partition_out.protected_mask, dtype=bool).reshape(-1)
+        in_range_mask = np.asarray(
+            partition_out.in_range_mask, dtype=bool).reshape(-1)
+        print_fn(
+            f"  SC protected-band mask map {_iter_idx[0]}: "
+            f"{protected_mask.astype(np.uint8).tolist()}"
+        )
         _verdict = protected_band_convergence(
             E_new, E_in,
-            np.asarray(_state_partition(state_out, inputs).protected_mask,
-                       dtype=bool),
-            np.asarray(_state_partition(state_out, inputs).in_range_mask,
-                       dtype=bool),
+            protected_mask,
+            in_range_mask,
             tol_ev)
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
