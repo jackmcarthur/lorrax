@@ -80,4 +80,7 @@ that proposal.  No planner behavior was changed.
 Evidence: archived logs and `sigma_mnk.h5` files under
 `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Na/02_soc48b_qsgw_mpa/50_delivered_plan_20260829`;
 metric definitions were committed before scoring in
-`briefs/contract_predictivity_prereg.md` at `5fd72b25`.
+`briefs/contract_predictivity_prereg.md` at `5fd72b25`.  The prescribed CPU
+gate completed **134 passed, 8 warnings in 102.92 s**; no GPU leg is owed
+because this measurement lane changed documentation only (four-GPU rule CPU
+exemption).
