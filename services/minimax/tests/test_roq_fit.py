@@ -74,6 +74,30 @@ def test_wrong_half_plane_is_loud(groups):
         fit_roq_group(wrong, 1.0e-4, ranks=[10, 14])
 
 
+def test_rank_search_thins_only_provisional_fit_frequencies(monkeypatch):
+    import minimax.roq_fit as roq_fit
+
+    frequency = np.linspace(-1.0, 1.0, 21)
+    problem = ReciprocalMeasureProblem(
+        frequency, np.array([2.0 - 0.1j]), np.ones(1))
+    group = RoqGroup("wide", problem, problem, sigma=1,
+                     angle_deg=0.0, horizon=1.0)
+    prepared = (np.array([0.0j]), np.ones(1), np.ones((1, 1)))
+    seen = []
+
+    def solve(candidate, times, **kwargs):
+        seen.append(candidate.frequencies.copy())
+        return np.zeros(times.size, dtype=np.complex128), 1.0
+
+    monkeypatch.setattr(roq_fit, "solve_fixed_time_weights_fast", solve)
+    roq_fit._fit_prepared(group, prepared, 1, target=1.0, quick=True)
+    roq_fit._fit_prepared(group, prepared, 1, target=1.0, quick=False)
+
+    assert seen[0].size == roq_fit._QUICK_FREQUENCY_CAP
+    assert seen[0][0] == frequency[0] and seen[0][-1] == frequency[-1]
+    np.testing.assert_array_equal(seen[1], frequency)
+
+
 def test_production_planner_refuses_a_growing_product_window(groups):
     tails, _ = groups
     window = RoqWindow("wrong", tails.fit, tails.validation, 1.0e-4,

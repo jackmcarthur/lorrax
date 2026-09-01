@@ -91,6 +91,7 @@ _HORIZON_MASS_QUANTILE = 1.0e-4
 _NOISE_FLOOR = 6.0e-8
 _NOISE_SHARE = 0.05
 _MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+_QUICK_FREQUENCY_CAP = 11
 
 
 @dataclass(frozen=True)
@@ -252,10 +253,27 @@ def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
 def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
                   windows: tuple[str, ...] = (), quick: bool = False,
                   evaluations: int = 0) -> RoqRule:
-    """Fit and validate one rank from an already built snapshot basis."""
+    """Fit and validate one rank from an already built snapshot basis.
+
+    Search-only fits use an endpoint-preserving frequency subset.  Their
+    weights are still scored on the complete refined lattice below, and the
+    selected rank is always refit on every fitting frequency before it can be
+    accepted.
+    """
     times, ratio = _select_prepared(*prepared, rank, group.name)
+    fit_problem = group.fit
+    if quick and fit_problem.frequencies.size > _QUICK_FREQUENCY_CAP:
+        indices = np.rint(np.linspace(
+            0, fit_problem.frequencies.size - 1,
+            _QUICK_FREQUENCY_CAP)).astype(int)
+        fit_problem = ReciprocalMeasureProblem(
+            fit_problem.frequencies[indices], fit_problem.internal_sums,
+            fit_problem.cell_masses,
+            excluded_radius=fit_problem.excluded_radius,
+            normalization_floor=fit_problem.normalization_floor,
+            zero_weight_sum=fit_problem.zero_weight_sum)
     weights, _ = solve_fixed_time_weights_fast(
-        group.fit, times,
+        fit_problem, times,
         iterations=16 if quick else 45,
         stall_iterations=3 if quick else 5,
         conditioning_pass=not quick)
