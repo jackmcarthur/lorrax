@@ -144,6 +144,7 @@ class RoqRule:
     target_met: bool = True
     noise_passed: bool = True
     search_evaluations: int = 0
+    usable_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -237,16 +238,26 @@ def roq_select_times(group: RoqGroup, rank: int, *, base_nodes: int = 0,
     return _select_prepared(*prepared, rank, group.name)
 
 
+def _usable_rank(singular) -> int:
+    """Number of weighted snapshot modes above the runtime noise floor."""
+    values = np.asarray(singular, dtype=np.float64)
+    if not values.size or not np.isfinite(values[0]) or values[0] <= 0.0:
+        return _MIN_RANK
+    return max(
+        int(np.count_nonzero(values / values[0] > _NOISE_FLOOR)), _MIN_RANK)
+
+
 def _score(group: RoqGroup, times: np.ndarray, weights: np.ndarray, rank: int,
            ratio: float, *, windows: tuple[str, ...] = (),
-           target: float = np.inf, evaluations: int = 0) -> RoqRule:
+           target: float = np.inf, evaluations: int = 0,
+           usable_rank: int = 0) -> RoqRule:
     error, _ = delivered_error(group.validation, times, weights)
     p99, peak = rule_amplification(times, weights, group.validation)
     passed = p99 * _NOISE_FLOOR <= _NOISE_SHARE * float(target)
     return RoqRule(group.name, times, weights, rank, float(np.max(error)),
                    float(p99), float(peak), ratio, group.angle_deg,
                    group.horizon, windows, float(np.max(error)) <= target,
-                   passed, evaluations)
+                   passed, evaluations, int(usable_rank))
 
 
 def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
@@ -260,7 +271,8 @@ def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
         stall_iterations=3 if quick else 5,
         conditioning_pass=not quick)
     return _score(group, times, weights, rank, ratio, windows=windows,
-                  target=target, evaluations=evaluations)
+                  target=target, evaluations=evaluations,
+                  usable_rank=_usable_rank(prepared[1]))
 
 
 def fit_roq_group(group: RoqGroup, target: float, *, ranks=None,
@@ -413,7 +425,7 @@ def fit_roq_branch(groups, start_rules, *, iterations: int = 60,
         if stall >= int(stall_iterations):
             break
     rules = [_score(group, rule.times, y * pack[4], rule.rank,
-                    rule.singular_ratio)
+                    rule.singular_ratio, usable_rank=rule.usable_rank)
              for group, rule, pack, y in zip(groups, start_rules, packs,
                                              best_coeff)]
     return rules, branch_delivered_error(groups, rules)

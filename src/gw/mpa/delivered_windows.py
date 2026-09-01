@@ -88,6 +88,8 @@ _CROSSING_CONDITIONING_SLACK = 0.2
 _CROSSING_TAIL_FRACTION = 0.9
 
 _WINDOW_CENSUS_PREFIX = "[delivered-planner-window] "
+_WINDOW_DIGEST_PREFIX = "[delivered-planner-fit]"
+_PLAN_DIGEST_PREFIX = "[delivered-planner-summary]"
 
 
 class _ProductWindowRefusal(RuntimeError):
@@ -258,6 +260,7 @@ def _emit_window_census(specs, eta, apportioned_targets, *,
         best_kappa = (None if error is None else
                       error.get("best_achieved_kappa_p99"))
         family = None
+        rank = usable_rank = nodes = None
         if error is None and window_candidates:
             best = min(
                 window_candidates,
@@ -267,6 +270,9 @@ def _emit_window_census(specs, eta, apportioned_targets, *,
             best_residual = float(best["metrics"][0])
             best_kappa = float(best["metrics"][1])
             family = best["evidence"]["family"]
+            rank = best["evidence"].get("rank")
+            usable_rank = best["evidence"].get("usable_rank")
+            nodes = int(np.asarray(best["times"]).size)
         radius, gamma_min, A_over_eta, A_over_gamma, span = (
             _window_census_geometry(spec, eta))
         record = {
@@ -288,10 +294,27 @@ def _emit_window_census(specs, eta, apportioned_targets, *,
             "gamma_min_ry": gamma_min,
             "kind": spec["kind"],
             "name": spec["name"],
+            "nodes": nodes,
+            "rank": rank,
             "scale_span": span,
             "source": str(source),
             "status": "refused" if error is not None else "served",
+            "usable_rank": usable_rank,
         }
+        def number(value, width=11):
+            return f"{float(value):{width}.4e}" if value is not None else f"{'-':>{width}}"
+
+        rank_pair = (f"{int(rank):3d}/{int(usable_rank):3d}"
+                     if rank is not None and usable_rank is not None
+                     else "  -/  -")
+        print(
+            f"{_WINDOW_DIGEST_PREFIX} {spec['name']:<30.30s} "
+            f"{spec['kind']:<12.12s} {number(A_over_gamma)} "
+            f"{rank_pair} {nodes if nodes is not None else 0:5d} "
+            f"{number(best_residual)} {number(best_kappa)} "
+            f"{100.0 * record['delivered_mass_share']:7.3f}% "
+            f"{number(apportioned_target)} {str(family):<24.24s}",
+            flush=True)
         print(_WINDOW_CENSUS_PREFIX + json.dumps(
             record, sort_keys=True, separators=(",", ":")), flush=True)
 
@@ -1682,6 +1705,8 @@ def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
         "factor_growth": factor, "attempts": [],
         "evidence": {
             "family": "measure_adapted_roq",
+            "rank": int(rule.rank),
+            "usable_rank": int(rule.usable_rank),
             "candidate_tolerance": float(relative_target),
             "provenance": (f"measure-adapted ROQ, contour "
                            f"{rule.angle_deg:.1f} deg, rank {rule.rank}"),
@@ -2206,7 +2231,9 @@ def build_delivered_sigma_windows(
                         "E_ref_A": E_ref,
                         "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
                         "omega_idx": patch_positions,
-                        "envelope": envelope, "branch_report": report,
+                        "envelope": envelope,
+                        "envelope_by_frequency": envelope_by_frequency,
+                        "branch_report": report,
                     }
                     specs.append(spec)
                     combined_envelope[patch_positions] += envelope_by_frequency
@@ -2275,10 +2302,11 @@ def build_delivered_sigma_windows(
         base_candidates, window_fit_rows = _run_parallel_planner_jobs(
             len(base_specs), fit_window, refuse_errors=False)
         window_parallel_seconds += time.perf_counter() - fit_started
-        _emit_window_census(
-            base_specs, eta, allowances,
-            candidates_by_window=base_candidates,
-            planner_rows=window_fit_rows, source="live_fit")
+        if any(row["error"] is not None for row in window_fit_rows):
+            _emit_window_census(
+                base_specs, eta, allowances,
+                candidates_by_window=base_candidates,
+                planner_rows=window_fit_rows, source="live_fit")
         _raise_first_planner_refusal(window_fit_rows)
         fits = None
         consolidation_cache = None
@@ -2435,11 +2463,21 @@ def build_delivered_sigma_windows(
         _save_plan_cache(
             plan_cache_path, cache_fingerprint, fits, free_pairs,
             required_cost, window_tau_pairs)
-    else:
-        _emit_window_census(
-            specs, eta, allowances,
-            candidates_by_window=[[fit] for fit in fits],
-            source="fit_cache")
+    _emit_window_census(
+        specs, eta, [fit["residual_target"] for fit in fits],
+        candidates_by_window=[[fit] for fit in fits],
+        source="fit_cache" if cached is not None else "selected_plan")
+
+    pointwise_spend = np.zeros(omega_grid.size, dtype=np.float64)
+    for spec, fit in zip(specs, fits):
+        np.add.at(
+            pointwise_spend, np.asarray(spec["omega_idx"], dtype=np.int64),
+            np.asarray(spec["envelope_by_frequency"], dtype=np.float64)
+            * float(fit["required_target"]))
+    pointwise_budget = target * combined_envelope * safety
+    pointwise_fraction = np.divide(
+        pointwise_spend, pointwise_budget,
+        out=np.zeros_like(pointwise_spend), where=pointwise_budget > 0.0)
 
     output = []
     for spec, fit in zip(specs, fits):
@@ -2541,6 +2579,17 @@ def build_delivered_sigma_windows(
         exchange_rate = combined_scale / float(np.max(np.abs(reference)))
         calibration = "calibrated_to_reference_sigma"
     plan_seconds = time.perf_counter() - started
+    if process_rank() == 0:
+        spend_fraction = (required_cost / total_absolute
+                          if total_absolute > 0.0 else 0.0)
+        print(
+            f"{_PLAN_DIGEST_PREFIX} windows={len(output):4d} "
+            f"pairs={window_tau_pairs:5d} plan_s={plan_seconds:9.3f} "
+            f"sum_envelope_residual={required_cost:11.4e} "
+            f"budget={total_absolute:11.4e} "
+            f"spend_frac={spend_fraction:8.4f} "
+            f"max_omega_spend={float(np.max(pointwise_fraction, initial=0.0)):8.4f}",
+            flush=True)
     fit_profile = _planner_rows_profile(window_fit_rows)
     consolidation_profile = _planner_rows_profile(consolidation_rows)
     exchange_seconds = max(
@@ -2565,6 +2614,8 @@ def build_delivered_sigma_windows(
         "envelope_error_safety": safety,
         "planned_absolute_envelope_error_budget": total_absolute,
         "required_absolute_envelope_budget": required_cost,
+        "max_pointwise_envelope_budget_fraction": float(
+            np.max(pointwise_fraction, initial=0.0)),
         "combined_inverse_gap_envelope": combined_scale,
         "envelope_to_physical_exchange_rate": exchange_rate,
         "exchange_rate_calibration": calibration,

@@ -124,7 +124,8 @@ def test_planner_refuses_an_unattainable_product_window(capsys):
     assert record["best_achieved_kappa_p99"] is not None
 
 
-def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
+def test_planner_integrates_crossing_in_one_product_window(monkeypatch,
+                                                           capsys):
     """Crossing keeps the full frequency/state support in one rectangle."""
     E_A = jnp.asarray([[-0.4, -0.2, 0.0, 0.2]])
     omega = np.asarray([0.2, 0.4, 0.6, 0.8])
@@ -148,6 +149,8 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
             "factor_growth": (0.0, 0.0),
             "evidence": {
                 "family": "test_product_rule",
+                "rank": 1,
+                "usable_rank": 3,
                 "candidate_tolerance": 0.0,
                 "provenance": "test_fake_rule",
             },
@@ -172,6 +175,19 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
     np.testing.assert_array_equal(plan[0].pole_indices, [0])
     assert report["branches"][0]["window_axis"] == (
         "state_interval_x_pole_interval")
+    stdout = capsys.readouterr().out.splitlines()
+    rows = [line for line in stdout
+            if line.startswith("[delivered-planner-window] ")]
+    assert len(rows) == 1
+    record = json.loads(rows[0].split(" ", 1)[1])
+    assert record["rank"] == 1
+    assert record["usable_rank"] == 3
+    assert record["nodes"] == 1
+    assert record["source"] == "selected_plan"
+    assert sum(line.startswith("[delivered-planner-fit]")
+               for line in stdout) == 1
+    assert sum(line.startswith("[delivered-planner-summary]")
+               for line in stdout) == 1
 
 
 def test_metallic_style_crossing_uses_one_bounded_product_rule():
