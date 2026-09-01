@@ -1625,9 +1625,91 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
     return candidates, detail
 
 
+UNIFORM_RULE_TIME_BUDGET_SECONDS = 60.0
+
+
+def _uniform_rule_eps():
+    """Sup-norm tolerance of the measure-independent box rule, or None.
+
+    Set ``LORRAX_UNIFORM_RULE_EPS`` (relative to the ``1/eta`` kernel peak)
+    to route every product window through ``minimax.uniform_rule`` first.
+    Unset, the incumbent measure-adapted paths are used unchanged.
+    """
+    value = os.environ.get("LORRAX_UNIFORM_RULE_EPS", "").strip()
+    if not value:
+        return None
+    eps = float(value)
+    if not 0.0 < eps < 1.0:
+        raise ValueError("LORRAX_UNIFORM_RULE_EPS must lie in (0, 1)")
+    return eps
+
+
+def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
+                           relative_target):
+    """Box rule for one product window: ``(candidate_or_None, metrics)``.
+
+    The rule depends on the window only through the support box of its
+    denominators (fit and validation cells together, padded by 2%); the
+    measure then only scores it through the ordinary consumer gates.
+    """
+    from minimax.uniform_rule import build_uniform_rule  # noqa: PLC0415
+
+    d = np.concatenate([
+        np.asarray(spec["problem"].denominators, np.complex128).ravel(),
+        np.asarray(spec["validation"].denominators, np.complex128).ravel()])
+    conjugate = bool(np.all(d.imag < 0.0))
+    if conjugate:
+        d = np.conj(d)
+    elif not np.all(d.imag > 0.0):
+        return None, None
+    re_lo, re_hi = float(np.min(d.real)), float(np.max(d.real))
+    pad = 0.02 * max(re_hi - re_lo, float(eta))
+    box = (re_lo - pad, re_hi + pad,
+           float(np.min(d.imag)), float(np.max(d.imag)))
+    rule = build_uniform_rule(
+        box, float(eps), time_budget=UNIFORM_RULE_TIME_BUDGET_SECONDS)
+    times, weights = rule.times, rule.weights
+    if conjugate:
+        times, weights = -np.conj(times), np.conj(weights)
+    if int(times.size) > int(max_nodes):
+        return None, None
+    evidence = {
+        "family": "uniform_box",
+        "candidate_tolerance": float(eps),
+        "provenance": rule.one_line(),
+    }
+    candidate = _rule_candidate(
+        spec["problem"], spec["validation"], times, weights, evidence)
+    metrics = candidate["metrics"]
+    factor = _factor_growth(spec, times, eta)
+    if (not _rule_accepted(metrics, relative_target)
+            or max(factor) > float(factor_growth_cap)):
+        return None, metrics
+    required = max(metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
+                   / AMPLIFICATION_NOISE_SAFETY)
+    candidate.update(
+        required_target=float(required),
+        absolute_cost=float(spec["envelope"] * required),
+        factor_growth=factor, attempts=[])
+    return candidate, metrics
+
+
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                      relative_target, *, acceptance_rank_margin=None):
     """Return the first on-demand rule passing the gates and rank margin."""
+    eps = _uniform_rule_eps()
+    if eps is not None:
+        candidate, metrics = _uniform_box_candidate(
+            spec, eta, eps, max_nodes, factor_growth_cap, relative_target)
+        if candidate is None and metrics is not None and metrics[0] > 0.0:
+            # Missed the window's residual gate: tighten once by the miss
+            # ratio (with margin), then fall through to the incumbent paths.
+            tighter = eps * 0.5 * float(relative_target) / float(metrics[0])
+            candidate, metrics = _uniform_box_candidate(
+                spec, eta, min(eps, tighter), max_nodes, factor_growth_cap,
+                relative_target)
+        if candidate is not None:
+            return [candidate]
     if acceptance_rank_margin is None:
         acceptance_rank_margin = (
             0 if spec["kind"] == "crossing"
