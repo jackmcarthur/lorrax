@@ -20,6 +20,7 @@ import math
 import pytest
 from lxkit.testing import hostile_extents
 
+from distrib_la._collectives import _warm_axis_groups
 from distrib_la._native2d import block_size_for
 from distrib_la._shape import ipiv_local_len
 
@@ -30,6 +31,13 @@ def _mesh_shapes():
     (Perlmutter job 56389339); 2x4 and 3x2 are non-square and coprime-ish,
     which is where lcm(Px, Py) stops being max(Px, Py)."""
     return [(1, 1), (2, 2), (4, 1), (1, 4), (2, 4), (4, 4), (3, 2)]
+
+
+def test_mpi_warmup_includes_both_ordered_product_faces():
+    """The standalone service must match LORRAX's ordered-clique contract."""
+    assert _warm_axis_groups(("x", "y")) == (
+        "x", "y", ("x", "y"), ("y", "x"))
+    assert _warm_axis_groups(("x",)) == ("x",)
 
 
 @pytest.mark.parametrize("mesh_shape", _mesh_shapes())

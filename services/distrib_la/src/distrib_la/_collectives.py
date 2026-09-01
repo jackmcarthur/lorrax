@@ -61,6 +61,15 @@ def broadcast_bytes(buf: np.ndarray, *, key: str,
 _WARMED_MESHES: set = set()
 
 
+def _warm_axis_groups(axis_names):
+    """Ordered mesh-axis groups required by distrib_la's 2-D routes."""
+    axes = tuple(axis_names)
+    groups = list(axes)
+    if len(axes) > 1:
+        groups.extend((axes, tuple(reversed(axes))))
+    return tuple(groups)
+
+
 def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     """Create each mesh-axis MPI communicator on the calling main thread.
 
@@ -91,7 +100,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     t0 = time.perf_counter()
     tiny = jnp.zeros(1)
     axes = list(mesh.axis_names)
-    groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
+    groups = _warm_axis_groups(axes)
     for ax in groups:
         f = jax.jit(shard_map(
             lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,
