@@ -2,4 +2,4 @@
 
 Lane weight: heavy (cross-material measurement study).
 
-Selected arm: scalar Si `runs/Si_scalar/05_mpa_wbse_first_exercise_20260816/00_mpa_wrpa`, because it is the smallest complete non-sodium one-shot MPA arm found: 192 centroids, 20 bands, and an existing finite P=4-compatible MPA fit/checkpoint. Measurements pending.
+Selected arm: gapped Si from the completed `wt_aud_l_2026-08-31/briefs` run, because it is the smallest current-era complete non-sodium one-shot MPA arm found: 192 centroids, 24 bands, a finalized 12-pole fit, 80.09 s prior P=4 driver wall, and finite QP outputs. Measurements pending.
