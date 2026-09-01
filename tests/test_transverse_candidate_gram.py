@@ -139,39 +139,6 @@ def test_transverse_orbit_block_deflates_every_emitted_current_point():
         pivoted_cholesky_select,
     )
 
-
-def test_fused_wfn_route_matches_staged_pair_route_for_both_metrics():
-    """Fusion removes dispatch boundaries, not candidate physics."""
-    from centroid.pivoted_cholesky import (
-        candidate_gram_q0_from_pair,
-        candidate_gram_q0_from_psi,
-    )
-    from isdf import pair_density
-
-    rng = np.random.default_rng(20260901)
-    nk, nl, nr, ns, npoint = 2, 3, 5, 4, 6
-    left = (rng.standard_normal((nk, nl, ns, npoint))
-            + 1j * rng.standard_normal((nk, nl, ns, npoint)))
-    right = (rng.standard_normal((nk, nr, ns, npoint))
-             + 1j * rng.standard_normal((nk, nr, ns, npoint)))
-    left_x = jnp.asarray(np.conj(left).transpose(0, 3, 1, 2))
-    left_y = jnp.asarray(left)
-    right_x = jnp.asarray(np.conj(right).transpose(0, 3, 1, 2))
-    right_y = jnp.asarray(right)
-    weights = jnp.asarray([0.375, 0.625], dtype=jnp.float64)
-    mesh = _one_device_mesh()
-
-    P_l = pair_density(left_x, left_y, mesh)
-    P_r = pair_density(right_x, right_y, mesh)
-    for mode in ("charge", "transverse"):
-        staged = candidate_gram_q0_from_pair(
-            P_l, P_r, weights, mesh_xy=mesh, gamma_mode=mode)
-        fused = candidate_gram_q0_from_psi(
-            left_x, left_y, right_x, right_y, weights,
-            mesh_xy=mesh, gamma_mode=mode)
-        np.testing.assert_allclose(
-            np.asarray(fused), np.asarray(staged), rtol=3e-13, atol=3e-13)
-
     mesh, P_l, P_r, weights, _ = _synthetic_pair_problem(seed=260831)
     G = np.asarray(candidate_gram_q0_from_pair(
         P_l, P_r, jnp.asarray(weights), mesh_xy=mesh,
@@ -212,3 +179,36 @@ def test_fused_wfn_route_matches_staged_pair_route_for_both_metrics():
     scale = max(1.0, float(np.linalg.norm(G)))
     assert np.linalg.norm(rep_residual) > 1.0e-4 * scale
     assert np.linalg.norm(block_residual) < 2.0e-12 * scale
+
+
+def test_fused_wfn_route_matches_staged_pair_route_for_both_metrics():
+    """Fusion removes dispatch boundaries, not candidate physics."""
+    from centroid.pivoted_cholesky import (
+        candidate_gram_q0_from_pair,
+        candidate_gram_q0_from_psi,
+    )
+    from isdf import pair_density
+
+    rng = np.random.default_rng(20260901)
+    nk, nl, nr, ns, npoint = 2, 3, 5, 4, 6
+    left = (rng.standard_normal((nk, nl, ns, npoint))
+            + 1j * rng.standard_normal((nk, nl, ns, npoint)))
+    right = (rng.standard_normal((nk, nr, ns, npoint))
+             + 1j * rng.standard_normal((nk, nr, ns, npoint)))
+    left_x = jnp.asarray(np.conj(left).transpose(0, 3, 1, 2))
+    left_y = jnp.asarray(left)
+    right_x = jnp.asarray(np.conj(right).transpose(0, 3, 1, 2))
+    right_y = jnp.asarray(right)
+    weights = jnp.asarray([0.375, 0.625], dtype=jnp.float64)
+    mesh = _one_device_mesh()
+
+    P_l = pair_density(left_x, left_y, mesh)
+    P_r = pair_density(right_x, right_y, mesh)
+    for mode in ("charge", "transverse"):
+        staged = candidate_gram_q0_from_pair(
+            P_l, P_r, weights, mesh_xy=mesh, gamma_mode=mode)
+        fused = candidate_gram_q0_from_psi(
+            left_x, left_y, right_x, right_y, weights,
+            mesh_xy=mesh, gamma_mode=mode)
+        np.testing.assert_allclose(
+            np.asarray(fused), np.asarray(staged), rtol=3e-13, atol=3e-13)
