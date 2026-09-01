@@ -256,8 +256,11 @@ def _fit_prepared(group: RoqGroup, prepared, rank: int, *, target: float,
     times, ratio = _select_prepared(*prepared, rank, group.name)
     weights, _ = solve_fixed_time_weights_fast(
         group.fit, times,
-        iterations=16 if quick else 45,
-        stall_iterations=3 if quick else 5,
+        # Rank probes only choose a bracket; the selected rank is refitted
+        # below.  Eight/two reproduced the accepted rule on all three frozen
+        # widened-Na supports while cutting their planning wall.
+        iterations=8 if quick else 45,
+        stall_iterations=2 if quick else 5,
         conditioning_pass=not quick)
     return _score(group, times, weights, rank, ratio, windows=windows,
                   target=target, evaluations=evaluations)

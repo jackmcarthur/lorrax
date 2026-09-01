@@ -56,6 +56,30 @@ def test_rule_scores_with_production_metric(groups):
     assert float(np.max(error)) == rule.max_error
 
 
+def test_rank_probe_uses_shorter_irls_budget_than_final_fit(groups, monkeypatch):
+    from minimax import roq_fit
+
+    calls = []
+    monkeypatch.setattr(
+        roq_fit, "_select_prepared",
+        lambda *args: (np.arange(8, dtype=np.complex128), 1.0))
+    monkeypatch.setattr(
+        roq_fit, "solve_fixed_time_weights_fast",
+        lambda problem, times, **kwargs: (
+            calls.append(kwargs) or np.ones(times.size), 0.0))
+    monkeypatch.setattr(roq_fit, "_score", lambda *args, **kwargs: None)
+
+    roq_fit._fit_prepared(groups[0], (), 8, target=1.0e-4, quick=True)
+    roq_fit._fit_prepared(groups[0], (), 8, target=1.0e-4, quick=False)
+
+    assert calls[0] == {
+        "iterations": 8, "stall_iterations": 2,
+        "conditioning_pass": False}
+    assert calls[1] == {
+        "iterations": 45, "stall_iterations": 5,
+        "conditioning_pass": True}
+
+
 def test_branch_joint_fit_and_noise_gate(groups):
     tails, resonant = groups
     seed_tails = fit_roq_group(tails, 1.0e-4, ranks=range(6, 41, 2))
