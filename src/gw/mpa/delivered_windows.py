@@ -5,10 +5,13 @@ retarded broadening ``eta``.  It divides each causal branch into a few
 ``state interval x pole interval`` windows, measures their weighted reciprocal
 problems, and assigns each window part of the global error budget.
 
-Every product window is fitted on demand against its measured pole distribution.
-The fitted rule is accepted only from its achieved error on the refined
-validation lattice, the runtime-noise gate, and the bounded-factor gate.  The
-planner never evaluates explicit state--pole pairs.
+Sign-definite windows fit Hackbusch-seeded noncrossing rules on demand.  Their
+acceptance chain is: achieved error on the fitting lattice, achieved error on
+the refined validation lattice, and the runtime-noise gate.  An off-axis rule
+that misses those gates falls back to the general measure-adapted fitter.
+Crossing windows are fitted on demand against their measured pole distribution.
+Every fitted rule must also pass the bounded-factor gate.  The planner never
+evaluates explicit state--pole pairs.
 
 The final acceptance test is
 
@@ -1250,6 +1253,18 @@ def _rule_accepted(metrics, target):
         <= AMPLIFICATION_NOISE_SAFETY * float(target))
 
 
+def _absolute_kernel_target(problem, relative_target):
+    """Convert delivered relative error to a uniform absolute kernel bound."""
+    _kept, delivered_mass, _excluded = problem.retained()
+    total_mass = float(np.sum(problem.cell_masses))
+    target = (float(relative_target) * float(np.min(delivered_mass))
+              / total_mass)
+    if not np.isfinite(target) or target <= 0.0:
+        raise RuntimeError(
+            "delivered product window has no positive absolute error target")
+    return target
+
+
 def _sign_definite_orientation(problem):
     """Return positive-real lower-half support and its executor transform."""
     denominator = problem.denominators
@@ -1265,6 +1280,51 @@ def _sign_definite_orientation(problem):
             return -np.conj(denominator), "negative_lower"
     raise RuntimeError(
         "sign-definite product support crosses an axis and cannot be served")
+
+
+def _sign_definite_candidates(problem, relative_target, max_nodes):
+    """Yield on-demand noncrossing rules until the consumer accepts one."""
+    from minimax import noncrossing_grids  # noqa: PLC0415
+
+    rotated, transform = _sign_definite_orientation(problem)
+    x_min = float(np.min(rotated.real))
+    x_max = float(np.max(rotated.real))
+    if not 0.0 < x_min <= x_max < np.inf:
+        raise RuntimeError(
+            f"invalid sign-definite support [{x_min:.6g}, {x_max:.6g}] Ry")
+    range_value = x_max / x_min
+    absolute_target = _absolute_kernel_target(problem, relative_target)
+    scaled_target = absolute_target * x_min
+    next_rank = 2
+    while next_rank <= int(max_nodes):
+        tau, alpha, rank, achieved = noncrossing_grids(
+            range_value, scaled_target, N_start=next_rank,
+            N_max=int(max_nodes) if next_rank == 2 else next_rank)
+        tau = np.asarray(tau, np.float64) / x_min
+        alpha = np.asarray(alpha, np.float64) / x_min
+        if transform.startswith("positive"):
+            times, weights = 1.0j * tau, alpha
+        else:
+            times, weights = -1.0j * tau, -alpha
+        yield np.asarray(times), np.asarray(weights), {
+            "family": "noncrossing_on_demand",
+            "transform": transform,
+            "requested_range": range_value,
+            "fit_range": float(range_value),
+            "requested_scaled_error": scaled_target,
+            "fit_achieved_abs_error": float(achieved / x_min),
+            "candidate_tolerance": float(scaled_target),
+            "provenance": (
+                f"on-demand Hackbusch-seeded noncrossing fit, R "
+                f"{range_value:.6g}, rank {int(rank)}"),
+        }
+        # A real-axis fit already at roundoff carries no information about
+        # an off-axis miss.  More ranks solve the same degenerate real problem,
+        # so hand that support to the general measure-adapted fallback.
+        if (int(rank) >= int(max_nodes)
+                or float(achieved) <= 16.0 * np.finfo(np.float64).eps):
+            return
+        next_rank = int(rank) + 1
 
 
 def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
@@ -1352,7 +1412,8 @@ def _measure_adapted_candidate(spec, eta, max_nodes, factor_growth_cap,
 
     Node count is the runtime currency: one node is one FFT(G_w W_w).  The
     The contour, rank, and nodes are derived from this run's measure.  This is
-    the sole production path for crossing and sign-definite supports.
+    the production path for crossing supports and the accuracy-preserving
+    fallback for sign-definite supports that miss their noncrossing fit gates.
     """
     from minimax import (RoqPlanningRefusal, RoqWindow,
                          plan_measure_adapted_roq)  # noqa: PLC0415
@@ -1534,7 +1595,7 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
 
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
                       relative_target, *, adapted_only=False):
-    """Fit one on-demand measure-adapted rule for a product window.
+    """Rules for one window: rotated ROQ or on-demand noncrossing fit.
 
     The single routing decision, at module level so the planner, the tests and
     the offline node audit all take the same path.
@@ -1561,15 +1622,81 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                      relative_target):
-    """Return the on-demand rule after its delivered acceptance gates."""
-    candidate = _measure_adapted_candidate(
+    """Return the first on-demand rule passing the measured window gates."""
+    if spec["kind"] == "crossing":
+        candidate = _measure_adapted_candidate(
+            spec, eta, max_nodes, factor_growth_cap, relative_target)
+        if candidate is None:
+            raise _ProductWindowRefusal(
+                f"delivered product window {spec['name']!r} refused: the "
+                "measure-adapted fit did not survive the residual, noise, "
+                "node, and factor-growth gates")
+        return [candidate]
+
+    best_pair = (np.inf, np.inf)
+    attempts = []
+    rule_rows = _sign_definite_candidates(
+        spec["problem"], relative_target, max_nodes)
+    iterator = iter(rule_rows)
+    while True:
+        try:
+            times, weights, evidence = next(iterator)
+        except StopIteration:
+            break
+        except (FloatingPointError, OverflowError, RuntimeError, ValueError,
+                np.linalg.LinAlgError) as exc:
+            raise _ProductWindowRefusal(
+                f"delivered product window {spec['name']!r} refused: "
+                f"{exc}") from exc
+        try:
+            candidate = _rule_candidate(
+                spec["problem"], spec["validation"],
+                times, weights, evidence)
+            refined = candidate["metrics"]
+            factor = _factor_growth(spec, times, eta)
+            best_pair = min(best_pair, (refined[0], refined[1]))
+            attempts.append({
+                "family": evidence["family"],
+                "candidate_tolerance": evidence["candidate_tolerance"],
+                "node_count": int(times.size),
+                "refined_residual": refined[0],
+                "amplification_p99": refined[1],
+                "amplification_max": refined[2],
+                "factor_log_growth_max": max(factor),
+            })
+            if (not _rule_accepted(refined, relative_target)
+                    or max(factor) > float(factor_growth_cap)):
+                continue
+            required_target = max(
+                refined[0],
+                refined[1] * RUNTIME_NOISE_EPSILON
+                / AMPLIFICATION_NOISE_SAFETY)
+            candidate.update(
+                required_target=float(required_target),
+                absolute_cost=float(spec["envelope"] * required_target),
+                factor_growth=factor,
+                attempts=attempts.copy())
+            return [candidate]
+        except (FloatingPointError, OverflowError, RuntimeError, ValueError,
+                np.linalg.LinAlgError) as exc:
+            attempts.append({
+                "family": evidence.get("family", "unknown"),
+                "candidate_tolerance": evidence.get("candidate_tolerance"),
+                "refusal": str(exc)})
+    fallback = _measure_adapted_candidate(
         spec, eta, max_nodes, factor_growth_cap, relative_target)
-    if candidate is None:
-        raise _ProductWindowRefusal(
-            f"delivered product window {spec['name']!r} refused: the "
-            "measure-adapted fit did not survive the residual, noise, node, "
-            "and factor-growth gates")
-    return [candidate]
+    if fallback is not None:
+        fallback["attempts"] = attempts
+        fallback["evidence"]["provenance"] += (
+            "; noncrossing fit missed refined consumer gates")
+        return [fallback]
+    residual, amplification = best_pair
+    raise _ProductWindowRefusal(
+        f"delivered product window {spec['name']!r} refused: achieved "
+        f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
+        "the on-demand noncrossing family and its measure-adapted fallback "
+        "did not survive the residual, noise, and factor-growth gates",
+        float(residual), float(amplification))
 
 
 def _pointwise_rule_costs(specs, candidates, frequency_count):
@@ -2216,6 +2343,10 @@ def build_delivered_sigma_windows(
                 "certificate_abs_error_bound"),
             "catalog_achieved_abs_error": fit["evidence"].get(
                 "catalog_achieved_abs_error"),
+            "fit_achieved_abs_error": fit["evidence"].get(
+                "fit_achieved_abs_error"),
+            "requested_range": fit["evidence"].get("requested_range"),
+            "fit_range": fit["evidence"].get("fit_range"),
             "fit_provenance": fit["evidence"]["provenance"],
         })
 
