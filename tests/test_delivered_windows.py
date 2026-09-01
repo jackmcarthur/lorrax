@@ -503,20 +503,21 @@ def test_parallel_planner_is_bitwise_independent_of_p(monkeypatch):
         monkeypatch.setattr(
             delivered, "_run_parallel_planner_jobs",
             _emulated_parallel_runner(world))
-        plan, report = _patched_test_plan(20.0)
-        signatures.append((
-            report["n_windows"], report["window_tau_pairs"],
-            tuple((
-                row.window.name,
-                np.asarray(row.window.nodes.t).tobytes(),
-                np.asarray(row.window.nodes.alpha).tobytes(),
-                np.asarray(row.window.mask_A).tobytes(),
-                np.asarray(row.omega_idx).tobytes(),
-                np.asarray(row.pole_indices).tobytes(),
-            ) for row in plan),
-        ))
-    assert signatures[1] == signatures[0]
-    assert signatures[2] == signatures[0]
+        for _repeat in range(2):
+            plan, report = _patched_test_plan(20.0)
+            signatures.append((
+                report["n_windows"], report["window_tau_pairs"],
+                report["plan_cache_fingerprint"],
+                tuple((
+                    row.window.name,
+                    np.asarray(row.window.nodes.t).tobytes(),
+                    np.asarray(row.window.nodes.alpha).tobytes(),
+                    np.asarray(row.window.mask_A).tobytes(),
+                    np.asarray(row.omega_idx).tobytes(),
+                    np.asarray(row.pole_indices).tobytes(),
+                ) for row in plan),
+            ))
+    assert all(signature == signatures[0] for signature in signatures[1:])
 
 
 def test_parallel_planner_refusal_is_rank_independent():
