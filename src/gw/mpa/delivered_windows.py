@@ -1605,16 +1605,8 @@ def _rule_candidate(problem, validation, times, weights, evidence):
     }
 
 
-def _factor_growth(spec, times, eta):
-    time = np.asarray(times, dtype=np.complex128).reshape(-1)
-    if not time.size:
-        return 0.0, 0.0
-    pole_sign = float(spec["pole_sign"])
-    time_exec = pole_sign * time
-    raw = np.asarray(spec["raw_state_energy"], dtype=np.float64)
-    reference = float(spec["E_ref_A"])
-    green = float(np.max(np.real(
-        -1.0j * (raw[:, None] - reference) * time_exec[None, :])))
+def _selected_pole_values(spec):
+    """Return the measured pole cells consumed by one product window."""
     cells = []
     pole_lo, pole_hi = map(float, spec["pole_bounds"])
     measure = spec["measure"]
@@ -1629,10 +1621,41 @@ def _factor_growth(spec, times, eta):
                 keep = ((pole_cells.real > pole_lo)
                         & (pole_cells.real <= pole_hi))
                 if np.any(keep):
-                    cells.append(pole_cells[keep] + 1.0j * eta)
-    pole_values = np.concatenate(cells)
+                    cells.append(pole_cells[keep])
+    if not cells:
+        raise RuntimeError(
+            f"delivered product window {spec['name']!r} has no pole cells")
+    return np.concatenate(cells)
+
+
+def _factor_references(spec):
+    """Choose exact executor shifts that keep imaginary-time factors bounded."""
+    raw = np.asarray(spec["raw_state_energy"], dtype=np.float64)
+    if spec["kind"] == "crossing":
+        return float(np.min(raw)), 0.0
+    _rotated, transform = _sign_definite_orientation(spec["problem"])
+    table_sign = 1.0 if transform.startswith("positive") else -1.0
+    use_upper = float(spec["pole_sign"]) * table_sign > 0.0
+    endpoint = np.max if use_upper else np.min
+    poles = _selected_pole_values(spec)
+    return float(endpoint(raw)), float(endpoint(poles.real))
+
+
+def _factor_growth(spec, times, eta):
+    time = np.asarray(times, dtype=np.complex128).reshape(-1)
+    if not time.size:
+        return 0.0, 0.0
+    pole_sign = float(spec["pole_sign"])
+    time_exec = pole_sign * time
+    raw = np.asarray(spec["raw_state_energy"], dtype=np.float64)
+    reference = float(spec["E_ref_A"])
+    green = float(np.max(np.real(
+        -1.0j * (raw[:, None] - reference) * time_exec[None, :])))
+    pole_values = _selected_pole_values(spec) + 1.0j * eta
+    pole_reference = float(spec.get("E_ref_B", 0.0))
     screened = float(np.max(np.real(
-        -1.0j * pole_values[:, None] * time_exec[None, :])))
+        -1.0j * (pole_values[:, None] - pole_reference)
+        * time_exec[None, :])))
     return green, screened
 
 
@@ -1745,6 +1768,7 @@ def _merge_branch_specs(group):
         pole_interval=-1,
         E_ref_A=float(np.min(raw)),
         envelope=float(np.max(envelope_by_frequency)))
+    merged["E_ref_A"], merged["E_ref_B"] = _factor_references(merged)
     return merged
 
 
@@ -2183,14 +2207,6 @@ def build_delivered_sigma_windows(
                     ).sum(axis=1)
                     envelope = float(np.max(envelope_by_frequency))
                     selected_raw = raw_energy[selected_states]
-                    E_ref = float(np.min(selected_raw))
-                    if patch_count > 1 and cell_kind != "crossing":
-                        _rotated, transform = _sign_definite_orientation(
-                            cell_problem)
-                        table_sign = (1.0 if transform.startswith("positive")
-                                      else -1.0)
-                        if pole_sign * table_sign > 0.0:
-                            E_ref = float(np.max(selected_raw))
                     spec = {
                         "name": cell_name, "branch": branch,
                         "measure": measure, "problem": cell_problem,
@@ -2203,11 +2219,13 @@ def build_delivered_sigma_windows(
                         "raw_state_energy": selected_raw,
                         "state_interval": (float(state_lower), float(state_upper)),
                         "pole_bounds": tuple(map(float, cell_bounds)),
-                        "E_ref_A": E_ref,
+                        "E_ref_A": float(np.min(selected_raw)),
+                        "E_ref_B": 0.0,
                         "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
                         "omega_idx": patch_positions,
                         "envelope": envelope, "branch_report": report,
                     }
+                    spec["E_ref_A"], spec["E_ref_B"] = _factor_references(spec)
                     specs.append(spec)
                     combined_envelope[patch_positions] += envelope_by_frequency
         report["plan_stop"] = len(specs)
@@ -2464,7 +2482,8 @@ def build_delivered_sigma_windows(
         window = _SigmaWindow(
             name=spec["name"], nodes=nodes,
             mask_A=mask.reshape(state_shape), E_ref_A=spec["E_ref_A"],
-            E_ref_B=0.0, omega_sign=pole_sign * external_sign,
+            E_ref_B=spec["E_ref_B"],
+            omega_sign=pole_sign * external_sign,
             project="full", prefactor=-1.0, max_error=metrics[0],
             provenance=(
                 "delivered Cartesian product window; "
