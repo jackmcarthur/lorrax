@@ -5300,10 +5300,11 @@ class LorraxConfig:
         #     that cannot serve it refuses there naming the probe that
         #     declined.  Removing the deck key removed the router, the
         #     three tiers and seven refusals with it (2026-08-06).
-        #   * on CPU, explicit ``cusolvermp`` is
-        #     REFUSED at parse time (CUDA-only backend; doctrine 3);
-        #     ``distributed_lu = auto`` demotes to ``"off"`` (in-tree
-        #     per-q ``jnp.linalg.solve``) with an announcement.
+        #   * on CPU, explicit ``cusolvermp`` is REFUSED at parse time
+        #     (CUDA-only backend; doctrine 3).  ``distributed_lu = auto``
+        #     stays ``auto``: the runtime resolver selects the in-tree per-q
+        #     ``jnp.linalg.solve``, while preserving a portable provenance
+        #     identity shared with a GPU auto route that resolved to LU.
         #
         # User-facing: same ``cohsex.in`` works on both backends.
         # Distributed-linalg axes.
@@ -5379,8 +5380,7 @@ class LorraxConfig:
             # matching the scalapack-on-GPU refusal below and
             # eigh_backend's fails-loudly contract — instead of being
             # rewritten to 'off' (which silently ran a different solver
-            # than the input file names).  Only 'auto' may demote, with an
-            # announcement.
+            # than the input file names).
             #
             # slate / scalapack pass through: host-platform FFIs
             # (liblorrax_ffi_host.so) with explicit-request-fails-loudly
@@ -5410,21 +5410,6 @@ class LorraxConfig:
                     "backend is CPU; use distributed_lu = "
                     "auto|off|scalapack on CPU runs (scalapack is the "
                     "ScaLAPACK host FFI).")
-            if _dist_lu == "auto":
-                # 'auto' demote, announced: auto never picks an FFI LU on
-                # a CPU backend (cuSOLVERMp is CUDA-only and auto never
-                # selects ScaLAPACK), so 'off' (in-tree per-q
-                # jnp.linalg.solve) is the same route auto would resolve
-                # to — made explicit here, and said out loud.
-                print_fn(
-                    "  [config] distributed_lu=auto on CPU backend: auto "
-                    "never picks an FFI LU here (cuSOLVERMp is CUDA-only; "
-                    "ScaLAPACK is explicit-only).  Demoting to 'off' "
-                    "(in-tree per-q jnp.linalg.solve).  The ScaLAPACK "
-                    "host FFI is available via explicit "
-                    "distributed_lu = scalapack."
-                )
-                _dist_lu = "off"
         elif _dist_lu == "scalapack":
             # Host-only backend on a non-CPU JAX backend: reject at parse
             # time — the alternative is a ValueError hours later at the

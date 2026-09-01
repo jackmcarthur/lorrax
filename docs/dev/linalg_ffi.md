@@ -364,9 +364,8 @@ unchanged. The per-site payload line is a mandatory production receipt.
   the ζ-solve.
 
 `gw_config.py` validates all three keys at parse time. On a CPU JAX
-backend it rewrites `distributed_cholesky`/`distributed_lu` values that
-cannot work (with a printed notice), but deliberately does NOT rewrite
-`auto` (see "Sharp edges") and does not touch `eigh_backend` — an
+backend it refuses explicit CUDA-only backends, but deliberately does NOT
+rewrite `auto` (see "Sharp edges") and does not touch `eigh_backend` — an
 explicit FFI eigh request keeps fails-loudly semantics at resolve time.
 
 ## The plan API
