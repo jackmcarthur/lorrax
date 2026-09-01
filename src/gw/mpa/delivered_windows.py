@@ -65,6 +65,11 @@ TIGHTEN_FLOOR = 0.05
 MAX_WINDOW_TAU_PAIRS = 200
 _PLAN_CACHE_VERSION = 8
 
+# The first sign-definite rank passing the consumer gates is the loosest legal
+# rule.  One additional rank is cheap for the logarithmic noncrossing family
+# and preserves a measured accuracy margin without adding a deck dial.
+SIGN_DEFINITE_ACCEPTANCE_RANK_MARGIN = 1
+
 _WINDOW_CENSUS_PREFIX = "[delivered-planner-window] "
 
 
@@ -1621,8 +1626,15 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
 
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
-                     relative_target):
-    """Return the first on-demand rule passing the measured window gates."""
+                     relative_target, *, acceptance_rank_margin=None):
+    """Return the first on-demand rule passing the gates and rank margin."""
+    if acceptance_rank_margin is None:
+        acceptance_rank_margin = (
+            0 if spec["kind"] == "crossing"
+            else SIGN_DEFINITE_ACCEPTANCE_RANK_MARGIN)
+    acceptance_rank_margin = int(acceptance_rank_margin)
+    if acceptance_rank_margin < 0:
+        raise ValueError("acceptance_rank_margin must be non-negative")
     if spec["kind"] == "crossing":
         candidate = _measure_adapted_candidate(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
@@ -1635,6 +1647,7 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
 
     best_pair = (np.inf, np.inf)
     attempts = []
+    first_passing_rank = None
     rule_rows = _sign_definite_candidates(
         spec["problem"], relative_target, max_nodes)
     iterator = iter(rule_rows)
@@ -1667,6 +1680,10 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
             if (not _rule_accepted(refined, relative_target)
                     or max(factor) > float(factor_growth_cap)):
                 continue
+            if first_passing_rank is None:
+                first_passing_rank = int(times.size)
+            if int(times.size) < first_passing_rank + acceptance_rank_margin:
+                continue
             required_target = max(
                 refined[0],
                 refined[1] * RUNTIME_NOISE_EPSILON
@@ -1675,6 +1692,8 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                 required_target=float(required_target),
                 absolute_cost=float(spec["envelope"] * required_target),
                 factor_growth=factor,
+                first_passing_rank=int(first_passing_rank),
+                acceptance_rank_margin=acceptance_rank_margin,
                 attempts=attempts.copy())
             return [candidate]
         except (FloatingPointError, OverflowError, RuntimeError, ValueError,
