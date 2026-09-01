@@ -67,7 +67,10 @@ def broadcast_root_bytes(
         raise RuntimeError(
             "broadcast_root_bytes: JAX distributed client is unavailable "
             f"for world={world}; initialize jax.distributed first")
-    required = ("key_value_set_bytes", "blocking_key_value_get_bytes")
+    required = (
+        "key_value_set_bytes", "blocking_key_value_get_bytes",
+        "wait_at_barrier",
+    )
     missing = [name for name in required if not callable(getattr(client, name, None))]
     if missing:
         raise RuntimeError(
@@ -80,11 +83,18 @@ def broadcast_root_bytes(
                 "broadcast_root_bytes: rank 0 must supply a bytes payload")
         data = bytes(payload)
         client.key_value_set_bytes(key, data)
-        return data
-    if payload is not None:
-        raise TypeError(
-            "broadcast_root_bytes: non-root processes must pass payload=None")
-    return bytes(client.blocking_key_value_get_bytes(key, int(timeout_ms)))
+    else:
+        if payload is not None:
+            raise TypeError(
+                "broadcast_root_bytes: non-root processes must pass "
+                "payload=None")
+        data = bytes(client.blocking_key_value_get_bytes(key, int(timeout_ms)))
+
+    # The payload may be an error that rank 0 will raise immediately after
+    # this call.  Commit the read collectively first: otherwise rank 0 can
+    # tear down the coordination client while peers are still in KV get.
+    client.wait_at_barrier(f"{key}/commit", timeout_in_ms=int(timeout_ms))
+    return data
 
 
 __all__ = ["broadcast_root_bytes", "DEFAULT_TIMEOUT_MS"]

@@ -101,6 +101,7 @@ class _FakeClient:
     def __init__(self):
         self.values = {}
         self.gets = []
+        self.barriers = []
 
     def key_value_set_bytes(self, key, value):
         self.values[key] = bytes(value)
@@ -108,6 +109,9 @@ class _FakeClient:
     def blocking_key_value_get_bytes(self, key, timeout_ms):
         self.gets.append((key, timeout_ms))
         return self.values[key]
+
+    def wait_at_barrier(self, key, *, timeout_in_ms):
+        self.barriers.append((key, timeout_in_ms))
 
 
 def test_fake_transport_publishes_once_and_returns_exact_bytes_to_every_rank():
@@ -123,6 +127,7 @@ def test_fake_transport_publishes_once_and_returns_exact_bytes_to_every_rank():
     assert got0 == payload
     assert peers == [payload, payload, payload]
     assert client.gets == [("receipt/7", 17)] * 3
+    assert client.barriers == [("receipt/7/commit", 17)] * 4
 
 
 def test_fake_transport_refuses_wrong_rank_roles_and_missing_byte_api():
