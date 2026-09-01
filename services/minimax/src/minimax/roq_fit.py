@@ -535,6 +535,42 @@ def _rank_ceiling(group: "RoqGroup") -> int:
     return int(np.clip(np.ceil(need), _MIN_RANK, _RANK_HARD_CAP))
 
 
+def _rank_floor(group: "RoqGroup", target: float) -> int:
+    """Cost-law floor for a crossing support's delivered measure.
+
+    The ceiling uses the full geometric radius.  A floor at that same radius
+    would ignore the owner's qualification that a histogram can genuinely
+    need fewer nodes.  Instead, at each frequency this floor discards at most
+    the window's own apportioned target of delivered ``mass / |d|`` and uses
+    the largest remaining radius.  Thus a negligible remote atom can lower
+    the floor, while a populated crossing bandwidth starts near the measured
+    ``2.02 A/gamma`` law rather than the ladder's former 0.28 fraction.
+    """
+    d = np.asarray(group.fit.denominators)
+    if not (np.min(d.real) < 0.0 < np.max(d.real)):
+        return _MIN_RANK
+    width = float(np.min(np.abs(d.imag)))
+    if not np.isfinite(width) or width <= 0.0:
+        return _MIN_RANK
+    quantile = float(np.clip(1.0 - target, 0.0, 1.0))
+    radii = []
+    for row in d:
+        delivered_mass = group.fit.cell_masses / np.abs(row)
+        radii.append(_weighted_quantile(
+            np.abs(row.real), delivered_mass, quantile))
+    need = _COST_LAW_SLOPE * max(radii) / width
+    return int(np.clip(np.ceil(need), _MIN_RANK, _rank_ceiling(group)))
+
+
+def _usable_rank(singular: np.ndarray) -> int:
+    """Number of weighted snapshot modes above the runtime noise floor."""
+    values = np.asarray(singular, dtype=np.float64)
+    if not values.size or not np.isfinite(values[0]) or values[0] <= 0.0:
+        return _MIN_RANK
+    return max(
+        int(np.count_nonzero(values / values[0] > _NOISE_FLOOR)), _MIN_RANK)
+
+
 def _fit_production_rank(group: RoqGroup, target: float,
                          windows: tuple[str, ...],
                          angle_probe: RoqRule) -> RoqRule:
@@ -542,6 +578,7 @@ def _fit_production_rank(group: RoqGroup, target: float,
     ceiling = _rank_ceiling(group)
     prepared = _prepare_subspace(
         group, _NODES_PER_RANK * ceiling, ceiling)
+    ceiling = min(ceiling, _usable_rank(prepared[1]))
     cache = {}
 
     def quick(rank: int) -> RoqRule:
@@ -552,9 +589,21 @@ def _fit_production_rank(group: RoqGroup, target: float,
                 quick=True, evaluations=len(cache) + 1)
         return cache[rank]
 
-    lower = _MIN_RANK
-    upper = _ANGLE_PROBE_RANK
-    if not angle_probe.target_met or not quick(upper).target_met:
+    floor = min(_rank_floor(group, target), ceiling)
+    # The already-paid angle probe is direct histogram evidence.  A crossing
+    # support whose twelve-node rule clears both delivered gates may search
+    # below the cost-law floor; otherwise the geometric ladder starts there.
+    if angle_probe.target_met and angle_probe.noise_passed:
+        floor = _MIN_RANK
+    if floor == _MIN_RANK:
+        lower = _MIN_RANK
+        upper = min(_ANGLE_PROBE_RANK, ceiling)
+        missed = not angle_probe.target_met or not quick(upper).target_met
+    else:
+        lower = floor - 1
+        upper = floor
+        missed = not quick(upper).target_met
+    if missed:
         lower = upper
         # Ladder scaled to this support's own ceiling, so a wide window is
         # bracketed in the same number of probes as a narrow one.

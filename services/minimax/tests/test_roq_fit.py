@@ -74,6 +74,24 @@ def test_wrong_half_plane_is_loud(groups):
         fit_roq_group(wrong, 1.0e-4, ranks=[10, 14])
 
 
+def test_crossing_rank_floor_uses_target_weighted_delivered_measure():
+    from minimax.roq_fit import _rank_floor, _usable_rank
+
+    # The remote atom is geometrically wide but carries too little delivered
+    # mass to consume the loose target.  A tighter target must retain it.
+    problem = ReciprocalMeasureProblem(
+        np.array([0.0]),
+        np.array([-1.0 - 0.1j, 1.0 - 0.1j, 100.0 - 0.1j]),
+        np.array([1.0, 1.0, 1.0e-12]))
+    group = RoqGroup("crossing", problem, problem, sigma=1,
+                     angle_deg=0.0, horizon=10.0)
+
+    assert _rank_floor(group, 1.0e-4) == 21
+    assert _rank_floor(group, 1.0e-15) == 512
+    assert _usable_rank(np.array(
+        [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 7.0e-8, 5.0e-8])) == 7
+
+
 def test_production_planner_refuses_a_growing_product_window(groups):
     tails, _ = groups
     window = RoqWindow("wrong", tails.fit, tails.validation, 1.0e-4,
