@@ -473,7 +473,7 @@ unset _dynsyms
 # failure — the Aug-7 deployed library shipped with scalapack=0 because
 # nothing anywhere said what it was supposed to contain.
 LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,slate,phdf5,fft}" \
-LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-libmpi_gnu_123}" \
+LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-libmpi_gnu}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
 LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
 LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:${LD_LIBRARY_PATH:-}" \

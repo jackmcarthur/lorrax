@@ -54,6 +54,17 @@ def test_live_mpi_gate_ignores_adapters_and_gtl(monkeypatch):
     ffi_loader._assert_one_mapped_mpi_runtime()
 
 
+def test_live_mpi_gate_recognizes_generic_gnu_soname(monkeypatch):
+    text = _maps(
+        "/opt/cray/pe/mpich/9.1.0/lib/libmpi_gnu.so.12.0.0",
+        "/foreign/intel/libmpi.so.12",
+    )
+    monkeypatch.setattr("builtins.open", lambda *a, **k: io.StringIO(text))
+    with pytest.raises(ffi_loader.FfiLibraryUnusable,
+                       match="more than one MPI runtime"):
+        ffi_loader._assert_one_mapped_mpi_runtime()
+
+
 def test_perlmutter_adapter_builder_refuses_one_mpi_gate_opt_out():
     env = os.environ.copy()
     env.update({

@@ -67,10 +67,11 @@ if printf %s "$LDD_OUT" | grep -q "not found"; then
 fi
 
 # Every resolved path in the closure whose basename is an MPI *runtime*
-# (libmpi.so / libmpi_gnu_<N>.so).  Excludes libmpifort*, libmpi_gtl_*.
+# (libmpi.so / libmpi_gnu.so / libmpi_gnu_<N>.so).  Excludes libmpifort*,
+# libmpi_gtl_*.
 mapfile -t MPI_PATHS < <(printf %s\\n "$LDD_OUT" \
     | sed -n "s|.*=> \\(/[^ ]*\\).*|\\1|p" \
-    | grep -E "/libmpi(_gnu_[0-9]+)?\\.so" || true)
+    | grep -E "/libmpi(_gnu(_[0-9]+)?)?\\.so" || true)
 
 if [[ ${#MPI_PATHS[@]} -eq 0 ]]; then
     echo "[$TAG] GATE FAILED (S3): no libmpi in the closure of $SO" >&2
@@ -85,7 +86,7 @@ mapfile -t MPI_SONAMES < <(for p in "${MPI_REAL[@]}"; do
 done | sort -u)
 
 echo "[$TAG] libmpi requests in closure:"
-printf %s\\n "$LDD_OUT" | grep -E "/libmpi(_gnu_[0-9]+)?\\.so" | sed "s/^/[$TAG]   /"
+printf %s\\n "$LDD_OUT" | grep -E "/libmpi(_gnu(_[0-9]+)?)?\\.so" | sed "s/^/[$TAG]   /"
 echo "[$TAG] distinct mapped objects: ${#MPI_REAL[@]}"
 for p in "${MPI_REAL[@]}"; do echo "[$TAG]   $p"; done
 echo "[$TAG] SONAMEs: ${MPI_SONAMES[*]}"
