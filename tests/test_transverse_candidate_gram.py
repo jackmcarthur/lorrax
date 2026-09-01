@@ -129,3 +129,53 @@ def test_charge_candidate_fold_is_bit_identical_to_the_scalar_owner():
     dispatched = candidate_gram_q0_from_pair(
         P_l, P_r, kw, mesh_xy=mesh, gamma_mode="charge")
     assert np.array_equal(np.asarray(dispatched), np.asarray(direct))
+
+
+def test_transverse_orbit_block_deflates_every_emitted_current_point():
+    """One representative per orbit does not span a generic current Gram."""
+    from centroid.pivoted_cholesky import candidate_gram_q0_from_pair
+    from common.pivoted_cholesky import (
+        group_block_pivoted_cholesky_select,
+        pivoted_cholesky_select,
+    )
+
+    mesh, P_l, P_r, weights, _ = _synthetic_pair_problem(seed=260831)
+    G = np.asarray(candidate_gram_q0_from_pair(
+        P_l, P_r, jnp.asarray(weights), mesh_xy=mesh,
+        gamma_mode="transverse"))
+    group_id = np.repeat(np.arange(3, dtype=np.int32), 2)
+    assert np.linalg.matrix_rank(G, tol=1.0e-11 * np.linalg.norm(G, 2)) == 6
+
+    # Historical behavior: three representatives authorize all six emitted
+    # points, but only three current-feature directions enter the recurrence.
+    representative = pivoted_cholesky_select(
+        jnp.asarray(G), 3, jnp.asarray(group_id))
+    assert int(representative[2]) == 3
+    rep_L = np.asarray(representative[1])
+    rep_residual = G - rep_L @ rep_L.conj().T
+
+    # A point budget cannot authorize a partial two-point orbit.
+    bounded = group_block_pivoted_cholesky_select(
+        jnp.asarray(G), 5, jnp.asarray(group_id), n_groups=3)
+    bounded_piv = np.asarray(bounded[0])
+    assert np.count_nonzero(bounded_piv >= 0) == 4
+    assert bounded_piv[-1] == -1
+    bounded_counts = np.bincount(
+        group_id[bounded_piv[bounded_piv >= 0]], minlength=3)
+    assert set(bounded_counts.tolist()) <= {0, 2}
+
+    # Production behavior: the same six-point delivery pivots both members
+    # of every complete orbit before another orbit is scored.
+    block = group_block_pivoted_cholesky_select(
+        jnp.asarray(G), 6, jnp.asarray(group_id), n_groups=3)
+    piv = np.asarray(block[0])
+    assert np.all(piv >= 0)
+    assert int(block[2]) == 6
+    np.testing.assert_array_equal(
+        np.bincount(group_id[piv], minlength=3), np.full(3, 2))
+    block_L = np.asarray(block[1])
+    block_residual = G - block_L @ block_L.conj().T
+
+    scale = max(1.0, float(np.linalg.norm(G)))
+    assert np.linalg.norm(rep_residual) > 1.0e-4 * scale
+    assert np.linalg.norm(block_residual) < 2.0e-12 * scale

@@ -1,7 +1,10 @@
 """Focused contracts for unit-weight centroid fitting and spatial closure."""
 
+import ast
+import sys
+from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -79,3 +82,110 @@ def test_scalar_mode_retains_explicit_experiment_switches():
     validate_mode_policy(SimpleNamespace(
         density_mode="scalar", no_orbit=True, rho_power=0.5,
         oversample=1.0))
+
+
+def _load_prune_stage_without_driver_startup():
+    """Compile the real policy-stage functions without bootstrapping JAX."""
+    source = (ROOT / "src/centroid/kmeans_cli.py").read_text()
+    tree = ast.parse(source)
+    wanted = {"_resolve_sigma_window", "_prune"}
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in wanted
+    ]
+    assert {node.name for node in definitions} == wanted
+    namespace = {
+        "__package__": "centroid",
+        "np": np,
+        "print0": lambda *args, **kwargs: None,
+        "debug_print_enabled": lambda: False,
+        "process_rank": lambda: 0,
+        "timing": SimpleNamespace(section=lambda _name: nullcontext()),
+    }
+    exec(compile(ast.Module(body=definitions, type_ignores=[]),
+                 str(ROOT / "src/centroid/kmeans_cli.py"), "exec"), namespace)
+    return namespace["_prune"]
+
+
+def test_current_prune_routes_exact_transverse_metric_through_group_blocks(
+        monkeypatch):
+    """Current mode spends a point budget and pivots complete atom orbits."""
+    from centroid.production_output import prune_band_ranges
+
+    calls = []
+    weights = np.asarray([0.25, 0.75])
+
+    prune_module = ModuleType("centroid.pivoted_cholesky")
+
+    def fake_prune(**kwargs):
+        calls.append(kwargs)
+        return (np.asarray(kwargs["cand_idx"])[:4], 4, None, None,
+                None, None, None)
+
+    prune_module.prune_candidates_by_pivoted_cholesky = fake_prune
+    metric_module = ModuleType("centroid.sampling_metric")
+    metric_module.full_k_quadrature_weights = lambda _wfn, _sym: weights
+    monkeypatch.setitem(sys.modules, "centroid.pivoted_cholesky", prune_module)
+    monkeypatch.setitem(sys.modules, "centroid.sampling_metric", metric_module)
+
+    prune = _load_prune_stage_without_driver_startup()
+    prune.__globals__["prune_band_ranges"] = prune_band_ranges
+    args = SimpleNamespace(
+        density_mode="current", prune_n_val=None, prune_n_cond=None,
+        prune_window="v_x_vc", fit_window=None,
+    )
+    wfn = SimpleNamespace(nelec=2, nbands=5)
+    candidates = np.arange(18, dtype=np.int64).reshape(6, 3)
+    orbit_id = np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int32)
+    selected, rank = prune(
+        args, wfn, object(), object(), candidates, orbit_id, 6, 4)
+
+    assert rank == 4 and selected.shape == (4, 3)
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["group_block"] is True
+    assert call["n_keep"] == call["n_point_budget"] == 4
+    assert call["bispinor"] is True
+    assert call["gamma_mode"] == "transverse"
+    assert "band_norms" not in call
+    np.testing.assert_array_equal(call["orbit_id"], orbit_id)
+    np.testing.assert_array_equal(call["k_weights"], weights)
+    assert call["band_range_left"] == (0, 2)
+    assert call["band_range_right"] == (0, 5)
+
+
+def test_scalar_prune_keeps_the_same_ungrouped_charge_route(monkeypatch):
+    """The current hardening does not redirect scalar point selection."""
+    from centroid.production_output import prune_band_ranges
+
+    calls = []
+    prune_module = ModuleType("centroid.pivoted_cholesky")
+
+    def fake_prune(**kwargs):
+        calls.append(kwargs)
+        return (np.asarray(kwargs["cand_idx"])[:3], 3, None, None,
+                None, None, None)
+
+    prune_module.prune_candidates_by_pivoted_cholesky = fake_prune
+    metric_module = ModuleType("centroid.sampling_metric")
+    metric_module.full_k_quadrature_weights = lambda _wfn, _sym: np.ones(1)
+    monkeypatch.setitem(sys.modules, "centroid.pivoted_cholesky", prune_module)
+    monkeypatch.setitem(sys.modules, "centroid.sampling_metric", metric_module)
+
+    prune = _load_prune_stage_without_driver_startup()
+    prune.__globals__["prune_band_ranges"] = prune_band_ranges
+    args = SimpleNamespace(
+        density_mode="scalar", prune_n_val=None, prune_n_cond=None,
+        prune_window="v_x_vc", fit_window=None,
+    )
+    selected, rank = prune(
+        args, SimpleNamespace(nelec=2, nbands=5), object(), object(),
+        np.arange(15, dtype=np.int64).reshape(5, 3), None, 5, 3)
+
+    assert rank == 3 and selected.shape == (3, 3)
+    call = calls[0]
+    assert call["group_block"] is False
+    assert call["n_point_budget"] is None
+    assert call["bispinor"] is False
+    assert call["gamma_mode"] == "charge"
