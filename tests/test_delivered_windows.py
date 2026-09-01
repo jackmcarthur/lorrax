@@ -79,9 +79,8 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     assert relative_error <= 1.01 * evidence["refined_residual"]
     assert win.E_ref_B == pytest.approx(Omega[0].real)
     assert evidence["screened_factor_log_growth_max"] <= 0.0
-    assert evidence["family"] == "noncrossing"
-    assert evidence["certificate_abs_error_bound"] > 0.0
-    assert "shipped noncrossing/" in evidence["fit_provenance"]
+    assert evidence["family"] == "measure_adapted_roq"
+    assert "measure-adapted ROQ" in evidence["fit_provenance"]
 
 
 def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
@@ -234,14 +233,9 @@ def test_selector_defaults_to_incumbent_panes(monkeypatch):
     assert resolve_sigma_plan() == "panes"
 
 
-def test_sign_definite_planning_is_lookup_only(monkeypatch):
-    """A noncrossing window must never enter either optimizer."""
-    def optimizer_called(*_args, **_kwargs):
-        raise AssertionError("lookup-first noncrossing plan called an optimizer")
-
-    monkeypatch.setattr(
-        delivered, "solve_fixed_time_weights_fast", optimizer_called)
-    branch = _branch("lookup-only valence", "val", [0.6], [0.8])
+def test_sign_definite_planning_is_fitted_on_demand():
+    """A noncrossing window uses the same measure-adapted fitter."""
+    branch = _branch("on-demand valence", "val", [0.6], [0.8])
     poles = np.asarray([1.0 - 0.2j])
     residues = np.asarray([0.8 + 0.3j])
     plan, report = build_delivered_sigma_windows(
@@ -252,32 +246,8 @@ def test_sign_definite_planning_is_lookup_only(monkeypatch):
 
     assert len(plan) == 1
     evidence = report["branches"][0]["windows"][0]
-    assert evidence["family"] == "noncrossing"
-    assert evidence["catalog_achieved_abs_error"] > 0.0
-
-
-def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
-    frequencies = np.asarray([-0.5, 0.5])
-    problem = ReciprocalMeasureProblem(
-        frequencies=frequencies,
-        internal_sums=np.asarray([0.0 - 0.05j]),
-        cell_masses=np.asarray([1.0]))
-    original = delivered.solve_fixed_time_weights_fast
-    calls = []
-
-    def counted(*args, **kwargs):
-        calls.append(kwargs.copy())
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(delivered, "solve_fixed_time_weights_fast", counted)
-    times, weights, evidence = delivered._fit_crossing_once(
-        problem, pole_sign=1.0, relative_target=2.0e-2, max_nodes=64)
-
-    assert len(calls) == 1
-    assert calls[0]["iterations"] == delivered._CROSSING_FIT_ITERATIONS
-    assert evidence["family"] == "crossing_fixed_time_fit"
-    assert times.shape == weights.shape
-    assert np.all(times != 0.0)
+    assert evidence["family"] == "measure_adapted_roq"
+    assert evidence["refined_residual"] <= 1.0e-5
 
 
 def _served_candidate(spec, *_args):
@@ -377,50 +347,35 @@ def _patched_test_plan(width_ev):
         lattice_bins=9, max_nodes=420)
 
 
-def test_crossing_patch_count_is_the_smallest_catalog_covered_partition(
-        monkeypatch):
+def test_on_demand_crossing_plan_does_not_patch_to_catalog_reach(monkeypatch):
     monkeypatch.setattr(delivered, "_candidate_rules", _served_candidate)
     narrow, narrow_report = _patched_test_plan(5.0)
     assert len(narrow) == 1
     assert narrow_report["n_windows"] == 1
 
     wide, wide_report = _patched_test_plan(20.0)
-    crossing = [row for row in wide if ":resonant[p" in row.window.name]
-    widest_span = max(
-        entry.range_max
-        for entry in delivered._mm.catalog().for_family("crossing")
-        if entry.target_kind == "hgl"
-        and entry.eps_q is not None
-        and abs(entry.eps_q - delivered._CROSSING_EPS_Q) <= 1.0e-12)
-
-    assert len(crossing) == 2
-    assert all("[p" in row.window.name for row in crossing)
-    assert all(
-        evidence["family"] == "crossing_hgl"
-        for evidence in wide_report["branches"][0]["windows"]
-        if ":resonant[p" in evidence["name"])
-    # One unpatched window has A=max(17, 20-5)/0.25=68, so A=60 cannot
-    # cover it.  The returned two-patch cover is therefore minimal.
-    assert 68.0 > widest_span
+    crossing = [row for row in wide if ":resonant" in row.window.name]
+    assert len(crossing) == 1
+    assert "[p" not in crossing[0].window.name
+    assert wide_report["n_windows"] == 1
 
 
-def test_emitted_crossing_patches_are_disjoint_complete_and_reproducible(
-        monkeypatch):
+def test_emitted_crossing_window_is_complete_and_reproducible(monkeypatch):
     ev_to_ry = 1.0 / 27.211386245988
     monkeypatch.setattr(delivered, "_candidate_rules", _served_candidate)
     first, first_report = _patched_test_plan(20.0)
     second, second_report = _patched_test_plan(20.0)
     first_crossing = [
-        row for row in first if ":resonant[p" in row.window.name]
+        row for row in first if ":resonant" in row.window.name]
     second_crossing = [
-        row for row in second if ":resonant[p" in row.window.name]
+        row for row in second if ":resonant" in row.window.name]
 
-    assert len(first_crossing) == len(second_crossing) == 2
+    assert len(first_crossing) == len(second_crossing) == 1
     joined = np.concatenate([row.omega_idx for row in first_crossing])
     omega = np.linspace(0.0, 20.0, 81) * ev_to_ry
     np.testing.assert_array_equal(joined, np.arange(omega.size))
     assert np.unique(joined).size == joined.size
-    assert all("[p" in row.window.name for row in first_crossing)
+    assert all("[p" not in row.window.name for row in first_crossing)
     for left, right in zip(first, second):
         assert left.window.name == right.window.name
         for left_array, right_array in (
@@ -463,39 +418,10 @@ def test_combined_rule_metrics_match_the_service_definitions():
         (np.max(residual), p99, peak), rtol=2.0e-15, atol=0.0)
 
 
-def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
-    problem = ReciprocalMeasureProblem(
-        frequencies=np.asarray([0.0]),
-        internal_sums=np.asarray([-1.0 - 0.1j]),
-        cell_masses=np.asarray([1.0]))
-    denominator = complex(problem.denominators[0, 0])
-    passing_time = np.asarray([1.0j])
-    passing_weight = np.asarray([
-        np.exp(denominator) / denominator], dtype=np.complex128)
-
-    def table_walk(*_args, **_kwargs):
-        yield (np.asarray([1.0j]), np.asarray([0.0j]),
-               {"family": "noncrossing", "candidate_tolerance": 1.0e-6,
-                "provenance": "first table"})
-        yield (passing_time, passing_weight,
-               {"family": "noncrossing", "candidate_tolerance": 2.0e-7,
-                "provenance": "next tighter table"})
-
-    monkeypatch.setattr(
-        delivered, "_sign_definite_table_candidates", table_walk)
-    monkeypatch.setattr(delivered, "_factor_growth", lambda *_args: (0.0, 0.0))
-    spec = {
-        "name": "walk probe", "kind": "sign_definite_positive",
-        "problem": problem, "validation": problem, "pole_sign": 1.0,
-        "envelope": 1.0,
-    }
-    candidates = delivered._candidate_rules(
-        spec, eta=0.1, max_nodes=8, factor_growth_cap=30.0,
-        relative_target=1.0e-5)
-
-    assert len(candidates) == 1
-    assert candidates[0]["evidence"]["provenance"] == "next tighter table"
-    assert len(candidates[0]["attempts"]) == 2
+def test_catalog_candidate_helpers_are_deleted():
+    assert not hasattr(delivered, "_sign_definite_table_candidates")
+    assert not hasattr(delivered, "_crossing_table_candidates")
+    assert not hasattr(delivered, "_catalog_walk")
 
 
 def test_screened_reference_serves_an_accurate_sign_definite_rule(monkeypatch):
@@ -720,11 +646,11 @@ def test_tightening_reaches_second_compounded_round(monkeypatch):
     _plan, report = _patched_test_plan(5.0)
 
     assert select_calls == 4
-    assert len(fitted_allowances) == 3
+    assert len(fitted_allowances) == 4
     np.testing.assert_allclose(
-        fitted_allowances, [1.6e-4, 7.2e-5, 3.24e-5],
+        fitted_allowances, [1.6e-4, 7.2e-5, 3.24e-5, 1.458e-5],
         rtol=0.0, atol=1e-14)
     np.testing.assert_allclose(
         np.asarray(fitted_allowances[1:]) / fitted_allowances[0],
-        [0.45, 0.45 ** 2], rtol=0.0, atol=1e-14)
+        [0.45, 0.45 ** 2, 0.45 ** 3], rtol=0.0, atol=1e-14)
     assert report["n_windows"] == 1
