@@ -121,6 +121,36 @@ def test_unsupported_dtype_refuses():
         D.gemm_plan(mesh, m=4, k=4, n=4, nq=2, dtype="float32")
 
 
+def test_scalapack_plan_never_warms_with_production_sized_zeros(monkeypatch):
+    """PBLAS has no persistent shape workspace, so plan construction must
+    not allocate throwaway arrays at the requested production extents."""
+    import importlib
+    import jax.numpy as jnp
+    plan_mod = importlib.import_module("distrib_la.matmul_plan")
+    scalapack = importlib.import_module("distrib_la._scalapack")
+    mesh = _mesh(px=1, py=1)
+    calls = []
+
+    monkeypatch.setattr(plan_mod, "resolve_matmul_backend",
+                        lambda *args, **kwargs: "scalapack")
+    monkeypatch.setattr(
+        scalapack, "_get_batched_matmul_fn",
+        lambda **kwargs: (lambda *args: args[-1], 7))
+    monkeypatch.setattr(
+        scalapack, "_warm_batched_matmul_context",
+        lambda **kwargs: calls.append(kwargs) or 7)
+    monkeypatch.setattr(
+        plan_mod, "_zeros",
+        lambda *args, **kwargs: pytest.fail(
+            "ScaLAPACK plan allocated production-sized warmup arrays"))
+
+    plan = plan_mod.gemm_plan(
+        mesh, m=4096, k=1024, n=6144, nq=81, dtype=jnp.complex128,
+        backend="scalapack")
+    assert plan.backend == "scalapack"
+    assert calls == [{"mesh": mesh, "dtype": jnp.dtype(jnp.complex128)}]
+
+
 # ---------------------------------------------------------------------------
 # ``GemmPlan.__call__``'s own Python-level guards -- shape/dtype/sharding
 # and the out=/beta interaction -- are pure checks on static metadata, run

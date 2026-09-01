@@ -27,7 +27,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._shard_map import shard_map
 from distrib_la._shape import ipiv_local_len
@@ -87,6 +87,7 @@ _GEMM_TARGET = "lorrax_scalapack_batched_gemm"
 
 # jit(shard_map) cache per signature — eager shard_map re-traces per call.
 _JIT_CACHE: dict = {}
+_GEMM_CONTEXT_WARMED: set = set()
 
 
 def _get_batched_matmul_fn(
@@ -196,6 +197,39 @@ def _get_batched_matmul_fn(
             fn = jax.jit(lambda a, b: _untranspose(_call(a, b)))
         _JIT_CACHE[key] = fn
     return fn, int(ctx)
+
+
+def _warm_batched_matmul_context(*, mesh: Mesh, dtype):
+    """Collectively exercise PBLAS GEMM with one scalar tile per rank.
+
+    PBLAS GEMM has no shape-dependent persistent workspace.  Its persistent
+    state is the BLACS context shared by all exact-shape calls, so warming a
+    production shape would only materialize throwaway production-sized
+    A/B/C arrays.  This tiny call validates the context and handler while
+    exact kernels remain lazy until first use.
+    """
+    dtype = jnp.dtype(dtype)
+    px, py = validate_mesh(mesh)
+    if px != py:
+        raise ValueError(
+            f"scalapack matmul needs a square process grid; got {px}x{py}")
+    ctx = get_or_init_context(mesh)
+    key = (_mesh_key(mesh), dtype, int(ctx))
+    if key in _GEMM_CONTEXT_WARMED:
+        return int(ctx)
+    shape = (1, px, py)
+    fn, fn_ctx = _get_batched_matmul_fn(
+        mesh=mesh, a_shape=shape, b_shape=shape, c_shape=shape,
+        dtype=dtype, with_c=False)
+    if fn_ctx != int(ctx):
+        raise RuntimeError(
+            "scalapack GEMM context changed while warming one plan")
+    sharding = NamedSharding(mesh, P(None, "x", "y"))
+    zero = jax.jit(lambda: jnp.zeros(shape, dtype=dtype),
+                   out_shardings=sharding)()
+    jax.block_until_ready(fn(zero, zero))
+    _GEMM_CONTEXT_WARMED.add(key)
+    return int(ctx)
 
 
 def batched_distributed_matmul(

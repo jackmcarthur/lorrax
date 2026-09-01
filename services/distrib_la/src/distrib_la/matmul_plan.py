@@ -604,7 +604,8 @@ def gemm_plan(
             alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
             with_c=False)) if beta_c == 0 else None)
     else:
-        from distrib_la._scalapack import _get_batched_matmul_fn
+        from distrib_la._scalapack import (
+            _get_batched_matmul_fn, _warm_batched_matmul_context)
         shapes = dict(
             mesh=mesh, a_shape=(nq, m, k), b_shape=(nq, k, n),
             c_shape=(nq, m, n), dtype=dtype, alpha=alpha_c,
@@ -619,19 +620,24 @@ def gemm_plan(
                 raise RuntimeError(
                     "gemm_plan: ScaLAPACK context changed while building "
                     "one plan")
-    # A REAL warmup call, not merely a trace: this is what forces the
-    # cuBLASMp matmul descriptor build and workspace allocation to happen
-    # now, eagerly, rather than on this plan's first use inside a caller's
-    # scan.  The buffers are throwaway (c0 is DONATED away by this call).
-    jax.block_until_ready(fn_with_c(
-        _zeros((nq, m, k), dtype, in_sharding_a),
-        _zeros((nq, k, n), dtype, in_sharding_b),
-        _zeros((nq, m, n), dtype, out_sharding)))
+        warmed_ctx = _warm_batched_matmul_context(mesh=mesh, dtype=dtype)
+        if warmed_ctx != ctx_handle:
+            raise RuntimeError(
+                "gemm_plan: ScaLAPACK context changed during tiny warmup")
 
-    if fn_no_c is not None:
-        jax.block_until_ready(fn_no_c(
+    # cuBLASMp has shape-dependent descriptors/workspace, so execute both
+    # exact shapes eagerly.  PBLAS has neither: its branch above warms one
+    # scalar tile per rank and deliberately avoids full dummy A/B/C arrays.
+    if resolved == "cublasmp":
+        jax.block_until_ready(fn_with_c(
             _zeros((nq, m, k), dtype, in_sharding_a),
-            _zeros((nq, k, n), dtype, in_sharding_b)))
+            _zeros((nq, k, n), dtype, in_sharding_b),
+            _zeros((nq, m, n), dtype, out_sharding)))
+
+        if fn_no_c is not None:
+            jax.block_until_ready(fn_no_c(
+                _zeros((nq, m, k), dtype, in_sharding_a),
+                _zeros((nq, k, n), dtype, in_sharding_b)))
 
     return GemmPlan(
         mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,
