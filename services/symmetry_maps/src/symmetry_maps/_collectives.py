@@ -20,6 +20,52 @@ from __future__ import annotations
 DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000
 
 
+def _transport_context(
+    *,
+    operation: str,
+    timeout_ms: int,
+    client,
+    process_index: int | None,
+    process_count: int | None,
+):
+    """Resolve and validate one byte-KV collective's runtime context."""
+    if int(timeout_ms) <= 0:
+        raise ValueError(f"{operation}: timeout_ms must be positive")
+    if process_index is None or process_count is None:
+        import jax
+        if process_index is None:
+            process_index = int(jax.process_index())
+        if process_count is None:
+            process_count = int(jax.process_count())
+    rank = int(process_index)
+    world = int(process_count)
+    if world < 1 or not 0 <= rank < world:
+        raise ValueError(
+            f"{operation}: invalid process geometry rank={rank}, world={world}")
+    if world == 1:
+        return None, rank, world
+
+    if client is None:
+        from jax._src.distributed import global_state
+        client = global_state.client
+    if client is None:
+        raise RuntimeError(
+            f"{operation}: JAX distributed client is unavailable for "
+            f"world={world}; initialize jax.distributed first")
+    required = (
+        "key_value_set_bytes", "blocking_key_value_get_bytes",
+        "wait_at_barrier",
+    )
+    missing = [
+        name for name in required if not callable(getattr(client, name, None))
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{operation}: distributed client lacks the byte-exact KV API "
+            f"{missing}; this route requires JAX 0.9.x")
+    return client, rank, world
+
+
 def broadcast_root_bytes(
     payload: bytes | None,
     *,
@@ -37,44 +83,16 @@ def broadcast_root_bytes(
     """
     if not isinstance(key, str) or not key:
         raise ValueError("broadcast_root_bytes: key must be a non-empty string")
-    if int(timeout_ms) <= 0:
-        raise ValueError("broadcast_root_bytes: timeout_ms must be positive")
-
-    if process_index is None or process_count is None:
-        import jax
-        if process_index is None:
-            process_index = int(jax.process_index())
-        if process_count is None:
-            process_count = int(jax.process_count())
-    rank = int(process_index)
-    world = int(process_count)
-    if world < 1 or not 0 <= rank < world:
-        raise ValueError(
-            "broadcast_root_bytes: invalid process geometry "
-            f"rank={rank}, world={world}")
+    client, rank, world = _transport_context(
+        operation="broadcast_root_bytes", timeout_ms=timeout_ms,
+        client=client, process_index=process_index,
+        process_count=process_count)
 
     if world == 1:
         if payload is None:
             raise TypeError(
                 "broadcast_root_bytes: rank 0 must supply a bytes payload")
         return bytes(payload)
-
-    if client is None:
-        from jax._src.distributed import global_state
-        client = global_state.client
-    if client is None:
-        raise RuntimeError(
-            "broadcast_root_bytes: JAX distributed client is unavailable "
-            f"for world={world}; initialize jax.distributed first")
-    required = (
-        "key_value_set_bytes", "blocking_key_value_get_bytes",
-        "wait_at_barrier",
-    )
-    missing = [name for name in required if not callable(getattr(client, name, None))]
-    if missing:
-        raise RuntimeError(
-            "broadcast_root_bytes: distributed client lacks the byte-exact "
-            f"KV API {missing}; this route requires JAX 0.9.x")
 
     if rank == 0:
         if payload is None:
@@ -96,4 +114,47 @@ def broadcast_root_bytes(
     return data
 
 
-__all__ = ["broadcast_root_bytes", "DEFAULT_TIMEOUT_MS"]
+def gather_root_bytes(
+    payload: bytes,
+    *,
+    key: str,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    client=None,
+    process_index: int | None = None,
+    process_count: int | None = None,
+) -> tuple[bytes, ...] | None:
+    """Gather one small byte proposal per process onto rank 0.
+
+    Every process publishes before either barrier.  The second barrier is
+    load-bearing: peers cannot enter a subsequent verdict broadcast until
+    rank 0 has retrieved every proposal, so a root-side decision can always
+    be encoded and published before any caller raises.
+    """
+    if not isinstance(key, str) or not key:
+        raise ValueError("gather_root_bytes: key must be a non-empty string")
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TypeError("gather_root_bytes: every process must supply bytes")
+    data = bytes(payload)
+    client, rank, world = _transport_context(
+        operation="gather_root_bytes", timeout_ms=timeout_ms,
+        client=client, process_index=process_index,
+        process_count=process_count)
+    if world == 1:
+        return (data,)
+
+    client.key_value_set_bytes(f"{key}/rank/{rank}", data)
+    client.wait_at_barrier(f"{key}/published", timeout_in_ms=int(timeout_ms))
+    gathered = None
+    if rank == 0:
+        gathered = tuple(
+            data if peer == 0 else bytes(client.blocking_key_value_get_bytes(
+                f"{key}/rank/{peer}", int(timeout_ms)))
+            for peer in range(world)
+        )
+    client.wait_at_barrier(f"{key}/read", timeout_in_ms=int(timeout_ms))
+    return gathered
+
+
+__all__ = [
+    "broadcast_root_bytes", "gather_root_bytes", "DEFAULT_TIMEOUT_MS",
+]

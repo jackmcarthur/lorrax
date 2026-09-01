@@ -33,7 +33,9 @@ CLI mode.
 from __future__ import annotations
 
 import argparse
+import ast
 import os
+from pathlib import Path
 import sys
 
 import numpy as np
@@ -389,7 +391,7 @@ def check_density_report_broadcasts_strict_root_error(mesh):
     module.check_spinor_reference_trs = fail_on_root
     try:
         with pytest.raises(
-                RuntimeError, match="ValueError.*root-only strict sentinel"):
+                ValueError, match="ValueError.*root-only strict sentinel"):
             module.cached_density_symmetry_check(loader)
     finally:
         module.check_spinor_reference_trs = old_compute
@@ -397,7 +399,79 @@ def check_density_report_broadcasts_strict_root_error(mesh):
             os.environ.pop("LORRAX_TRS_CHECK", None)
         else:
             os.environ["LORRAX_TRS_CHECK"] = old_mode
-    return "strict root error reached every rank without a stranded peer"
+    return "strict root ValueError reached every rank without a stranded peer"
+
+
+def check_density_report_agrees_before_invalid_rank_config_raises(mesh):
+    """Real-rank gate: one invalid env produces one identical ValueError."""
+    import jax
+    if int(jax.process_count()) == 1:
+        return "inapplicable: needs a real multi-process runtime"
+    import types
+    import symmetry_maps.density_symmetry_check as module
+
+    loader = types.SimpleNamespace(
+        path="/not-opened/density-invalid-config.WFN.h5",
+        _mesh=mesh, physical_density_band_stop=3)
+    old_mode = os.environ.get("LORRAX_TRS_CHECK")
+    os.environ["LORRAX_TRS_CHECK"] = (
+        "invalid-token" if int(jax.process_index()) == 1 else "on")
+    module._CACHE.clear()
+    try:
+        with pytest.raises(ValueError) as caught:
+            module.cached_density_symmetry_check(loader)
+    finally:
+        if old_mode is None:
+            os.environ.pop("LORRAX_TRS_CHECK", None)
+        else:
+            os.environ["LORRAX_TRS_CHECK"] = old_mode
+    expected = (
+        "distributed density-symmetry request refused (ValueError): "
+        "density-symmetry config/request agreement failed: rank 1 "
+        "ValueError: LORRAX_TRS_CHECK must be 0/off, 1/on, or strict; "
+        "got 'invalid-token'")
+    assert str(caught.value) == expected
+    return "one invalid rank produced the same collective ValueError"
+
+
+def check_density_report_refuses_divergent_rank_request(mesh):
+    """Real-rank gate: divergent valid config refuses before root compute."""
+    import jax
+    if int(jax.process_count()) == 1:
+        return "inapplicable: needs a real multi-process runtime"
+    import types
+    import symmetry_maps.density_symmetry_check as module
+
+    loader = types.SimpleNamespace(
+        path="/not-opened/density-divergent-request.WFN.h5",
+        _mesh=mesh, physical_density_band_stop=3)
+
+    def must_not_compute(*_args, **_kwargs):
+        raise AssertionError("root compute ran before request agreement")
+
+    old_compute = module.check_spinor_reference_trs
+    old_mode = os.environ.get("LORRAX_TRS_CHECK")
+    old_max_k = os.environ.get("LORRAX_TRS_MAX_K")
+    os.environ["LORRAX_TRS_CHECK"] = "on"
+    os.environ["LORRAX_TRS_MAX_K"] = (
+        "13" if int(jax.process_index()) == 1 else "12")
+    module._CACHE.clear()
+    module.check_spinor_reference_trs = must_not_compute
+    try:
+        with pytest.raises(
+                RuntimeError, match="request differs across processes"):
+            module.cached_density_symmetry_check(loader)
+    finally:
+        module.check_spinor_reference_trs = old_compute
+        if old_mode is None:
+            os.environ.pop("LORRAX_TRS_CHECK", None)
+        else:
+            os.environ["LORRAX_TRS_CHECK"] = old_mode
+        if old_max_k is None:
+            os.environ.pop("LORRAX_TRS_MAX_K", None)
+        else:
+            os.environ["LORRAX_TRS_MAX_K"] = old_max_k
+    return "divergent rank request refused collectively before root compute"
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +495,8 @@ def _mesh_here(px=1, py=1):
     check_qirr_umklapp_phase_survives_the_sharded_unfold,
     check_density_report_computes_only_on_root,
     check_density_report_broadcasts_strict_root_error,
+    check_density_report_agrees_before_invalid_rank_config_raises,
+    check_density_report_refuses_divergent_rank_request,
 ], ids=lambda f: f.__name__[len("check_"):])
 def test_the_check_body_passes_on_this_processs_mesh(body):
     """Every L-c body, run at 1x1 (or whatever this process can build).
@@ -441,6 +517,8 @@ def test_the_check_body_passes_on_this_processs_mesh(body):
     check_qirr_umklapp_phase_survives_the_sharded_unfold,
     check_density_report_computes_only_on_root,
     check_density_report_broadcasts_strict_root_error,
+    check_density_report_agrees_before_invalid_rank_config_raises,
+    check_density_report_refuses_divergent_rank_request,
 ], ids=lambda f: f.__name__[len("check_"):])
 def test_the_check_body_passes_on_an_emulated_2x2(body):
     """The same bodies on four emulated devices, when the flag took.
@@ -583,14 +661,61 @@ _CLI_CELLS = [
      lambda mesh: check_density_report_computes_only_on_root(mesh)),
     ("density_strict_error",
      lambda mesh: check_density_report_broadcasts_strict_root_error(mesh)),
+    ("density_invalid_config",
+     lambda mesh: check_density_report_agrees_before_invalid_rank_config_raises(
+         mesh)),
+    ("density_divergent_request",
+     lambda mesh: check_density_report_refuses_divergent_rank_request(mesh)),
 ]
 
 
 def _mesh_from_arg(spec):
-    import jax
-    from jax.sharding import Mesh
     px, py = (int(v) for v in spec.lower().split("x"))
-    return Mesh(np.asarray(jax.devices()).reshape(px, py), ("x", "y"))
+    runtime = globals().get("_RUNTIME")
+    if runtime is None:
+        raise RuntimeError(
+            "the real-rank CLI requires initialize_communicator_stack")
+    mesh = runtime.mesh
+    shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if shape != (px, py):
+        raise ValueError(
+            f"requested test mesh {px}x{py} differs from the production "
+            f"runtime mesh {shape[0]}x{shape[1]}")
+    return mesh
+
+
+def test_real_rank_cli_reuses_runtime_mesh_and_finalizes(monkeypatch):
+    """Pin the production mesh owner and ordered CLI shutdown boundary."""
+    import types
+
+    mesh = types.SimpleNamespace(shape={"x": 2, "y": 2})
+    monkeypatch.setitem(globals(), "_RUNTIME", types.SimpleNamespace(mesh=mesh))
+    assert _mesh_from_arg("2x2") is mesh
+    with pytest.raises(ValueError, match="differs from the production runtime"):
+        _mesh_from_arg("4x1")
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    main_guards = [
+        node for node in tree.body if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "__name__"
+    ]
+    final_calls = [
+        call for guard in main_guards for call in ast.walk(guard)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "run_main_and_finalize"
+    ]
+    raw_exits = [
+        call for guard in main_guards for call in ast.walk(guard)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "sys" and call.func.attr == "exit"
+    ]
+    assert len(final_calls) == 1
+    assert not raw_exits
 
 
 def _cli_main():
@@ -629,4 +754,5 @@ def _cli_main():
 
 
 if __name__ == "__main__":
-    sys.exit(_cli_main())
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(_cli_main)

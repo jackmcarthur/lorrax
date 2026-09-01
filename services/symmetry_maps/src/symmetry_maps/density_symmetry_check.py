@@ -37,6 +37,7 @@ TOL_TRS = 1.0e-6
 MAX_K_DEFAULT = 12
 _ALGORITHM_VERSION = "occupied-density-subspace-v1"
 _REPORT_WIRE_SCHEMA = "lorrax-density-symmetry-report-v1"
+_REQUEST_WIRE_SCHEMA = "lorrax-density-symmetry-request-v1"
 _OUTCOME_WIRE_SCHEMA = "lorrax-density-symmetry-outcome-v1"
 _DISTRIBUTED_CALL_SEQUENCE = itertools.count()
 
@@ -732,11 +733,150 @@ def _distributed_request(loader, *, mode: str, tol_trs, max_k) -> dict:
     }
 
 
+def _exception_wire(error: Exception | tuple[str, str]) -> tuple[str, str]:
+    """Return a stable exception name/message without serializing objects."""
+    if isinstance(error, tuple):
+        error_type, error_message = error
+    else:
+        error_type, error_message = type(error).__name__, str(error)
+    if not isinstance(error_type, str) or not isinstance(error_message, str):
+        raise TypeError("distributed exception wire fields must be strings")
+    return error_type, error_message
+
+
+def _encode_distributed_request_candidate(
+    *,
+    request: dict | None = None,
+    error: Exception | tuple[str, str] | None = None,
+) -> bytes:
+    """Encode exactly one local request candidate or local parse failure."""
+    if (request is None) == (error is None):
+        raise ValueError(
+            "distributed request candidate needs exactly one of request/error")
+    raw = {"schema": _REQUEST_WIRE_SCHEMA}
+    if error is not None:
+        error_type, error_message = _exception_wire(error)
+        raw.update(kind="error", error_type=error_type,
+                   error_message=error_message)
+    else:
+        raw.update(kind="request", request=request)
+    return json.dumps(
+        raw, allow_nan=False, separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8")
+
+
+def _decode_distributed_request_candidate(payload: bytes):
+    """Return ``(kind, request-or-error)`` from a strict candidate wire."""
+    try:
+        raw = json.loads(bytes(payload).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid density-symmetry request wire JSON") from exc
+    if not isinstance(raw, dict) or raw.get("schema") != _REQUEST_WIRE_SCHEMA:
+        raise ValueError("wrong density-symmetry request wire schema")
+    kind = raw.get("kind")
+    if (kind == "request"
+            and set(raw) == {"schema", "kind", "request"}
+            and isinstance(raw["request"], dict)):
+        return kind, raw["request"]
+    if kind == "error" and set(raw) == {
+            "schema", "kind", "error_type", "error_message"}:
+        if not all(isinstance(raw[name], str)
+                   for name in ("error_type", "error_message")):
+            raise ValueError("malformed density-symmetry request error")
+        return kind, (raw["error_type"], raw["error_message"])
+    raise ValueError("unknown or malformed density-symmetry request wire")
+
+
+def _local_distributed_request_candidate(loader) -> bytes:
+    """Parse local config into bytes; no local parse error escapes."""
+    try:
+        mode = trs_check_mode()
+        if mode == "off":
+            tol = None
+            max_k = None
+        else:
+            tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
+            max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
+        request = _distributed_request(
+            loader, mode=mode, tol_trs=tol, max_k=max_k)
+        return _encode_distributed_request_candidate(request=request)
+    except Exception as exc:
+        # The error itself is the proposal.  Every rank still enters the
+        # gather and receives one root-resolved collective verdict.
+        return _encode_distributed_request_candidate(error=exc)
+
+
+def _resolve_distributed_request_candidates(
+    proposals: tuple[bytes, ...],
+) -> bytes:
+    """Resolve all rank proposals into one request or one shared error."""
+    if not proposals:
+        return _encode_distributed_request_candidate(error=(
+            "RuntimeError", "density-symmetry request agreement has no ranks"))
+    decoded = []
+    for rank, proposal in enumerate(proposals):
+        try:
+            decoded.append(_decode_distributed_request_candidate(proposal))
+        except Exception as exc:
+            decoded.append(("error", (
+                type(exc).__name__, f"rank {rank} malformed proposal: {exc}")))
+
+    failures = [
+        (rank, value) for rank, (kind, value) in enumerate(decoded)
+        if kind == "error"
+    ]
+    if failures:
+        error_types = {value[0] for _, value in failures}
+        error_type = (next(iter(error_types)) if len(error_types) == 1
+                      else "RuntimeError")
+        detail = "; ".join(
+            f"rank {rank} {value[0]}: {value[1]}"
+            for rank, value in failures)
+        return _encode_distributed_request_candidate(
+            error=(error_type,
+                   "density-symmetry config/request agreement failed: "
+                   f"{detail}"))
+
+    requests = [value for kind, value in decoded if kind == "request"]
+    if len(requests) != len(proposals):
+        return _encode_distributed_request_candidate(error=(
+            "RuntimeError", "density-symmetry request agreement lost a rank"))
+    reference = requests[0]
+    mismatched = [rank for rank, request in enumerate(requests)
+                  if request != reference]
+    if mismatched:
+        detail = "; ".join(
+            f"rank {rank}={json.dumps(requests[rank], sort_keys=True)}"
+            for rank in [0, *[v for v in mismatched if v != 0]])
+        return _encode_distributed_request_candidate(error=(
+            "RuntimeError",
+            "density-symmetry request differs across processes: " + detail))
+    return _encode_distributed_request_candidate(request=reference)
+
+
+def _raise_distributed_error(
+    error_type: str,
+    error_message: str,
+    *,
+    context: str,
+) -> None:
+    """Raise the useful safe builtin type named by a wire error."""
+    error_classes = {
+        "AssertionError": AssertionError,
+        "RuntimeError": RuntimeError,
+        "TypeError": TypeError,
+        "ValueError": ValueError,
+    }
+    error_class = error_classes.get(error_type, RuntimeError)
+    raise error_class(
+        f"{context} ({error_type}): {error_message}") from None
+
+
 def _encode_distributed_outcome(
     request: dict,
     *,
     report: DensitySymmetryReport | None = None,
-    error: Exception | None = None,
+    error: Exception | tuple[str, str] | None = None,
 ) -> bytes:
     """Encode exactly one of a report, disabled result, or root exception."""
     if report is not None and error is not None:
@@ -746,8 +886,9 @@ def _encode_distributed_outcome(
         "request": request,
     }
     if error is not None:
-        raw.update(kind="error", error_type=type(error).__name__,
-                   error_message=str(error))
+        error_type, error_message = _exception_wire(error)
+        raw.update(kind="error", error_type=error_type,
+                   error_message=error_message)
     elif report is None:
         raw.update(kind="none")
     else:
@@ -857,42 +998,64 @@ def _cached_density_symmetry_check_local(
     return report
 
 
-def _uses_distributed_report(loader) -> bool:
-    """Whether this loader is part of a declared multi-process mesh."""
-    import jax
-    return (int(jax.process_count()) > 1
-            and getattr(loader, "_mesh", None) is not None)
-
-
 def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
-    """Cached front door; on a process mesh, compute once and broadcast.
+    """Cached front door; at P>1, agree, compute once, then broadcast.
 
-    A mesh-bearing ``WfnLoader`` is constructed collectively.  Rank 0 alone
-    reads the large coefficient slabs and evaluates the occupied-subspace
-    overlaps; every process receives only the immutable report.  Root errors
-    are encoded before any process raises, so strict mode cannot strand peers
-    in this preamble.
+    A P>1 call is collective even when local config is invalid.  Every rank
+    first publishes either its parsed request or its parse failure; rank 0
+    resolves one shared verdict before any caller may raise.  Only after
+    request agreement does rank 0 read the large coefficient slabs and
+    evaluate occupied-subspace overlaps.  Root errors are likewise encoded
+    and committed to every peer before any process raises.
     """
-    mode = trs_check_mode()
-    if mode == "off":
-        tol = None
-        max_k = None
-    else:
-        tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
-        max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
-
-    if not _uses_distributed_report(loader):
+    import jax
+    world = int(jax.process_count())
+    if world == 1:
+        mode = trs_check_mode()
+        if mode == "off":
+            tol = None
+            max_k = None
+        else:
+            tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
+            max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
         return _cached_density_symmetry_check_local(
             loader, mode=mode, tol=tol, max_k=max_k)
 
-    import jax
-    from symmetry_maps._collectives import broadcast_root_bytes
+    from symmetry_maps._collectives import (
+        broadcast_root_bytes, gather_root_bytes,
+    )
 
     rank = int(jax.process_index())
-    request = _distributed_request(
-        loader, mode=mode, tol_trs=tol, max_k=max_k)
     call_id = next(_DISTRIBUTED_CALL_SEQUENCE)
     key = f"lorrax/symmetry_maps/density-report/v1/{call_id}"
+    proposal = _local_distributed_request_candidate(loader)
+    proposals = gather_root_bytes(proposal, key=f"{key}/requests")
+    agreement_payload = None
+    if rank == 0:
+        try:
+            assert proposals is not None
+            agreement_payload = _resolve_distributed_request_candidates(
+                proposals)
+        except Exception as exc:
+            agreement_payload = _encode_distributed_request_candidate(
+                error=("RuntimeError",
+                       "rank-0 request agreement failed internally: "
+                       f"{type(exc).__name__}: {exc}"))
+    agreement_payload = broadcast_root_bytes(
+        agreement_payload, key=f"{key}/agreement")
+    agreement_kind, agreement_value = (
+        _decode_distributed_request_candidate(agreement_payload))
+    if agreement_kind == "error":
+        error_type, error_message = agreement_value
+        _raise_distributed_error(
+            error_type, error_message,
+            context="distributed density-symmetry request refused")
+
+    request = agreement_value
+    assert isinstance(request, dict)
+    mode = str(request["mode"])
+    tol = request["tol_trs"]
+    max_k = request["max_k"]
     root_payload = None
     if rank == 0:
         try:
@@ -905,25 +1068,28 @@ def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
             # rank-0 refusal must not leave every peer blocked in the KV get.
             root_payload = _encode_distributed_outcome(request, error=exc)
 
-    payload = broadcast_root_bytes(root_payload, key=key)
+    payload = broadcast_root_bytes(root_payload, key=f"{key}/outcome")
     root_request, kind, value = _decode_distributed_outcome(payload)
     if root_request != request:
         raise RuntimeError(
-            "density-symmetry report request differs across processes: "
-            f"rank0={root_request!r}, rank{rank}={request!r}")
+            "rank-0 density-symmetry outcome changed its agreed request: "
+            f"agreed={request!r}, outcome={root_request!r}")
     if kind == "error":
         error_type, error_message = value
-        raise RuntimeError(
-            "rank-0 density-symmetry check failed "
-            f"({error_type}): {error_message}")
+        _raise_distributed_error(
+            error_type, error_message,
+            context="rank-0 density-symmetry check failed")
     if kind == "none":
         return None
 
     report = value
     assert isinstance(report, DensitySymmetryReport)
     assert tol is not None and max_k is not None
-    key_local = _cache_key(
-        loader, int(loader.physical_density_band_stop), tol, max_k)
+    stamp = request["stamp"]
+    key_local = (
+        request["path"], int(stamp[0]), int(stamp[1]),
+        request["algorithm"], int(request["nocc"]), float(tol), int(max_k),
+    )
     _CACHE[key_local] = report
     if rank != 0:
         _enforce_policy(report, mode, announce=False)

@@ -10,17 +10,23 @@ from __future__ import annotations
 from dataclasses import fields
 import json
 import math
+import types
 
 import numpy as np
 import pytest
 
-from symmetry_maps._collectives import broadcast_root_bytes
+from symmetry_maps._collectives import broadcast_root_bytes, gather_root_bytes
 from symmetry_maps.density_symmetry_check import (
     DensitySymmetryReport,
     _decode_density_symmetry_report,
     _decode_distributed_outcome,
+    _decode_distributed_request_candidate,
     _encode_density_symmetry_report,
     _encode_distributed_outcome,
+    _encode_distributed_request_candidate,
+    _local_distributed_request_candidate,
+    _raise_distributed_error,
+    _resolve_distributed_request_candidates,
 )
 
 
@@ -143,6 +149,66 @@ def test_fake_transport_refuses_wrong_rank_roles_and_missing_byte_api():
         broadcast_root_bytes(
             b"x", key="k", client=object(),
             process_index=0, process_count=2)
+
+
+def test_fake_gather_publishes_every_proposal_before_root_returns_them():
+    client = _FakeClient()
+    for rank in (1, 2, 3):
+        assert gather_root_bytes(
+            f"rank-{rank}".encode(), key="requests/4", client=client,
+            process_index=rank, process_count=4, timeout_ms=19) is None
+    gathered = gather_root_bytes(
+        b"rank-0", key="requests/4", client=client,
+        process_index=0, process_count=4, timeout_ms=19)
+    assert gathered == tuple(f"rank-{rank}".encode() for rank in range(4))
+    assert client.gets == [
+        (f"requests/4/rank/{rank}", 19) for rank in (1, 2, 3)
+    ]
+    assert client.barriers.count(("requests/4/published", 19)) == 4
+    assert client.barriers.count(("requests/4/read", 19)) == 4
+
+
+def test_invalid_local_config_becomes_a_proposal_instead_of_escaping(
+        monkeypatch):
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "invalid-token")
+    loader = types.SimpleNamespace(
+        path="/not-opened/invalid-config.WFN.h5",
+        physical_density_band_stop=3)
+    kind, value = _decode_distributed_request_candidate(
+        _local_distributed_request_candidate(loader))
+    assert kind == "error"
+    assert value[0] == "ValueError"
+    assert "LORRAX_TRS_CHECK" in value[1]
+
+
+def test_request_resolver_returns_one_shared_error_for_invalid_or_divergent_rank():
+    request = {"path": "/shared/WFN.h5", "mode": "strict", "max_k": 12}
+    good = _encode_distributed_request_candidate(request=request)
+    bad = _encode_distributed_request_candidate(
+        error=ValueError("bad rank-local max-k"))
+    kind, value = _decode_distributed_request_candidate(
+        _resolve_distributed_request_candidates((good, bad, good)))
+    assert kind == "error" and value[0] == "ValueError"
+    assert "rank 1 ValueError: bad rank-local max-k" in value[1]
+
+    other = dict(request, max_k=13)
+    kind, value = _decode_distributed_request_candidate(
+        _resolve_distributed_request_candidates((
+            good, _encode_distributed_request_candidate(request=other), good,
+        )))
+    assert kind == "error" and value[0] == "RuntimeError"
+    assert "request differs across processes" in value[1]
+    assert "rank 0=" in value[1] and "rank 1=" in value[1]
+
+
+def test_distributed_error_preserves_safe_builtin_type_and_remote_context():
+    with pytest.raises(ValueError) as caught:
+        _raise_distributed_error(
+            "ValueError", "invalid max-k", context="request refused")
+    assert str(caught.value) == "request refused (ValueError): invalid max-k"
+    with pytest.raises(RuntimeError, match="RemoteLibraryError"):
+        _raise_distributed_error(
+            "RemoteLibraryError", "opaque failure", context="root failed")
 
 
 def test_outcome_codec_carries_report_none_and_root_error():
