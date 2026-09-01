@@ -323,7 +323,8 @@ def check_sigma_sx_chain_face_matches_legacy(
 # ---------------------------------------------------------------------------
 
 def check_four_current_ordered_pair_all16(
-        mesh, dtype="complex128", *, nk=3, nb=4, n_c=6, n_t=8):
+        mesh, dtype="complex128", *, nk=3, nb=4, n_c=6, n_t=8,
+        spin_pair_stream=None):
     """Discriminate AB/BA, q/-q, and rectangular CT/TC orientations."""
     import jax
     from types import SimpleNamespace
@@ -370,7 +371,8 @@ def check_four_current_ordered_pair_all16(
             psi_b = psi_families[B]
             got = _gather(w_isdf.compute_no_pair_dirac_current_block(
                 families[A], families[B], quad, meta, mesh,
-                vertex_left=A, vertex_right=B))
+                vertex_left=A, vertex_right=B,
+                spin_pair_stream=spin_pair_stream))
             want = np.zeros(
                 (nk, extents[A], extents[B]), dtype=np.complex128)
             for q in range(nk):
@@ -428,18 +430,26 @@ def check_four_current_ordered_pair_all16(
     assert wfns_c_clone is not wfns_c
     cc_distinct = _gather(w_isdf.compute_no_pair_dirac_current_block(
         wfns_c, wfns_c_clone, quad, meta, mesh,
-        vertex_left=0, vertex_right=0))
+        vertex_left=0, vertex_right=0,
+        spin_pair_stream=spin_pair_stream))
     cc_charge = _gather(w_isdf.compute_chi0(
         wfns_c, quad, meta, mesh))
-    assert np.array_equal(cc_distinct, cc_charge), (
-        "distinct value-identical CC endpoints differ from charge SSOT: "
-        f"rel={_rel(cc_distinct, cc_charge):.3e}")
+    cc_rel = _rel(cc_distinct, cc_charge)
+    if spin_pair_stream:
+        assert cc_rel < RTOL, (
+            "spin-pair streamed CC endpoints differ from charge SSOT: "
+            f"rel={cc_rel:.3e}")
+    else:
+        assert np.array_equal(cc_distinct, cc_charge), (
+            "distinct value-identical CC endpoints differ from charge SSOT: "
+            f"rel={cc_rel:.3e}")
 
     return {
         "all16_worst_rel": worst_oracle,
         "combined_hermiticity": herm,
         "q_reciprocity": reciprocity,
-        "distinct_cc_bit_equal": True,
+        "distinct_cc_bit_equal": bool(np.array_equal(cc_distinct, cc_charge)),
+        "distinct_cc_rel": cc_rel,
     }
 
 
@@ -458,7 +468,10 @@ _CLI_CELLS = (
              mesh, dt, mu_L=mu_L, nu_L=nu_L)))
        for (mu_L, nu_L) in _LORENTZ_PAIRS]
     + [("four_current_ordered_pair_all16",
-        check_four_current_ordered_pair_all16)]
+        check_four_current_ordered_pair_all16),
+       ("four_current_spin_pair_stream_all16",
+        (lambda mesh, dt: check_four_current_ordered_pair_all16(
+            mesh, dt, spin_pair_stream=True)))]
 )
 
 
