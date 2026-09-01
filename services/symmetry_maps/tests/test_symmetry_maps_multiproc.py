@@ -306,6 +306,98 @@ def check_qirr_umklapp_phase_survives_the_sharded_unfold(mesh):
     return QIRR.check_qirr_umklapp_phase_survives_the_store(mesh)
 
 
+def _density_report(path):
+    from symmetry_maps import DensitySymmetryReport
+    return DensitySymmetryReport(
+        trs_holds=True, trs_basis="raw-subspace", m_rel=2.0e-9,
+        m_rel_total=None, trs_coverage=1.0, tol_trs=1.0e-6,
+        trs_implied_by_mesh=False, spatial_ops_ok=True,
+        spatial_residual=np.zeros(0, dtype=np.float64),
+        spatial_untested=(), spatial_failed=(), tol_spatial=float("nan"),
+        charge=6.0, charge_expected=6.0, charge_rel_err=0.0,
+        rho_min_rel=0.0, invariants_ok=True, manifold_gap=float("nan"),
+        path=path, nocc=3, nspin=1, nspinor=2, n_k_used=2, n_k_total=2,
+        subsampled=False, fft_grid=(4, 4, 4), seconds=1.25,
+        messages=(), method="occupied-density-subspace",
+        subspace_residual=2.0e-9, min_overlap_singular_value=1.0,
+        evidence_counts=(("raw-pair", 1), ("spatial-pair", 0), ("trim", 0)),
+        conclusive=True,
+    )
+
+
+def check_density_report_computes_only_on_root(mesh):
+    """Real-rank gate: only rank 0 enters the expensive check body."""
+    import jax
+    if int(jax.process_count()) == 1:
+        return "inapplicable: needs a real multi-process runtime"
+    import types
+    import symmetry_maps.density_symmetry_check as module
+
+    path = "/not-opened/density-root-broadcast-success.WFN.h5"
+    loader = types.SimpleNamespace(
+        path=path, _mesh=mesh, physical_density_band_stop=3)
+    calls = []
+
+    def compute(_loader, *, tol_trs=None, max_k=None, **_unused):
+        rank = int(jax.process_index())
+        assert rank == 0, f"expensive density check ran on rank {rank}"
+        calls.append((tol_trs, max_k))
+        return _density_report(path)
+
+    old_compute = module.check_spinor_reference_trs
+    old_mode = os.environ.get("LORRAX_TRS_CHECK")
+    os.environ["LORRAX_TRS_CHECK"] = "on"
+    module._CACHE.clear()
+    module.check_spinor_reference_trs = compute
+    try:
+        report = module.cached_density_symmetry_check(loader)
+    finally:
+        module.check_spinor_reference_trs = old_compute
+        if old_mode is None:
+            os.environ.pop("LORRAX_TRS_CHECK", None)
+        else:
+            os.environ["LORRAX_TRS_CHECK"] = old_mode
+    assert report.path == path and report.trs_holds
+    assert report.seconds == 1.25 and report.nocc == 3
+    assert len(calls) == (1 if int(jax.process_index()) == 0 else 0)
+    return "one root computation, identical report on every rank"
+
+
+def check_density_report_broadcasts_strict_root_error(mesh):
+    """Real-rank gate: rank 0 publishes a strict failure before all raise."""
+    import jax
+    if int(jax.process_count()) == 1:
+        return "inapplicable: needs a real multi-process runtime"
+    import types
+    import symmetry_maps.density_symmetry_check as module
+
+    loader = types.SimpleNamespace(
+        path="/not-opened/density-root-broadcast-error.WFN.h5",
+        _mesh=mesh, physical_density_band_stop=3)
+
+    def fail_on_root(_loader, **_unused):
+        rank = int(jax.process_index())
+        assert rank == 0, f"strict density check ran on rank {rank}"
+        raise ValueError("root-only strict sentinel")
+
+    old_compute = module.check_spinor_reference_trs
+    old_mode = os.environ.get("LORRAX_TRS_CHECK")
+    os.environ["LORRAX_TRS_CHECK"] = "strict"
+    module._CACHE.clear()
+    module.check_spinor_reference_trs = fail_on_root
+    try:
+        with pytest.raises(
+                RuntimeError, match="ValueError.*root-only strict sentinel"):
+            module.cached_density_symmetry_check(loader)
+    finally:
+        module.check_spinor_reference_trs = old_compute
+        if old_mode is None:
+            os.environ.pop("LORRAX_TRS_CHECK", None)
+        else:
+            os.environ["LORRAX_TRS_CHECK"] = old_mode
+    return "strict root error reached every rank without a stranded peer"
+
+
 # ---------------------------------------------------------------------------
 # The pytest cells — the same bodies, on whatever mesh this process has
 # ---------------------------------------------------------------------------
@@ -325,6 +417,8 @@ def _mesh_here(px=1, py=1):
     check_spread_rel_is_one_replicated_scalar,
     check_qirr_round_trip_through_the_sharded_unfold,
     check_qirr_umklapp_phase_survives_the_sharded_unfold,
+    check_density_report_computes_only_on_root,
+    check_density_report_broadcasts_strict_root_error,
 ], ids=lambda f: f.__name__[len("check_"):])
 def test_the_check_body_passes_on_this_processs_mesh(body):
     """Every L-c body, run at 1x1 (or whatever this process can build).
@@ -343,6 +437,8 @@ def test_the_check_body_passes_on_this_processs_mesh(body):
     check_spread_rel_is_one_replicated_scalar,
     check_qirr_round_trip_through_the_sharded_unfold,
     check_qirr_umklapp_phase_survives_the_sharded_unfold,
+    check_density_report_computes_only_on_root,
+    check_density_report_broadcasts_strict_root_error,
 ], ids=lambda f: f.__name__[len("check_"):])
 def test_the_check_body_passes_on_an_emulated_2x2(body):
     """The same bodies on four emulated devices, when the flag took.
@@ -481,6 +577,10 @@ _CLI_CELLS = [
      lambda mesh: check_qirr_round_trip_through_the_sharded_unfold(mesh)),
     ("qirr_umklapp",
      lambda mesh: check_qirr_umklapp_phase_survives_the_sharded_unfold(mesh)),
+    ("density_root_only",
+     lambda mesh: check_density_report_computes_only_on_root(mesh)),
+    ("density_strict_error",
+     lambda mesh: check_density_report_broadcasts_strict_root_error(mesh)),
 ]
 
 

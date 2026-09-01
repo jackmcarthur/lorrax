@@ -17,7 +17,10 @@ import os
 import sys
 import time
 import warnings
-from dataclasses import dataclass, field
+import itertools
+import json
+import math
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 
@@ -33,6 +36,9 @@ __all__ = [
 TOL_TRS = 1.0e-6
 MAX_K_DEFAULT = 12
 _ALGORITHM_VERSION = "occupied-density-subspace-v1"
+_REPORT_WIRE_SCHEMA = "lorrax-density-symmetry-report-v1"
+_OUTCOME_WIRE_SCHEMA = "lorrax-density-symmetry-outcome-v1"
+_DISTRIBUTED_CALL_SEQUENCE = itertools.count()
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,132 @@ class DensitySymmetryReport:
             f"| {self.seconds:.2f}s "
             f"(io {self.seconds_io:.2f} + overlap {self.seconds_quad:.2f})"
         )
+
+
+def _wire_value(value):
+    """Convert report values to strict-JSON data without losing type."""
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind not in "biufc":
+            raise TypeError(
+                "DensitySymmetryReport wire format supports only numeric "
+                f"arrays; got dtype={value.dtype}")
+        return {
+            "__kind__": "ndarray",
+            "dtype": value.dtype.str,
+            "shape": [int(v) for v in value.shape],
+            "data": [_wire_value(v.item()) for v in value.reshape(-1)],
+        }
+    if isinstance(value, np.generic):
+        return _wire_value(value.item())
+    if isinstance(value, tuple):
+        return {"__kind__": "tuple", "items": [_wire_value(v) for v in value]}
+    if isinstance(value, complex):
+        return {
+            "__kind__": "complex",
+            "real": _wire_value(float(value.real)),
+            "imag": _wire_value(float(value.imag)),
+        }
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            token = "nan"
+        elif value > 0.0:
+            token = "+inf"
+        else:
+            token = "-inf"
+        return {"__kind__": "float", "value": token}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(
+        "unsupported DensitySymmetryReport wire value "
+        f"{type(value).__name__}")
+
+
+def _unwire_value(value):
+    """Inverse of :func:`_wire_value`, rejecting malformed tagged data."""
+    if not isinstance(value, dict):
+        return value
+    kind = value.get("__kind__")
+    if kind == "tuple" and set(value) == {"__kind__", "items"}:
+        if not isinstance(value["items"], list):
+            raise ValueError("tuple wire payload has non-list items")
+        return tuple(_unwire_value(v) for v in value["items"])
+    if kind == "float" and set(value) == {"__kind__", "value"}:
+        tokens = {"nan": float("nan"), "+inf": float("inf"),
+                  "-inf": -float("inf")}
+        try:
+            return tokens[value["value"]]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("invalid non-finite float wire token") from exc
+    if kind == "complex" and set(value) == {"__kind__", "real", "imag"}:
+        return complex(_unwire_value(value["real"]),
+                       _unwire_value(value["imag"]))
+    if kind == "ndarray" and set(value) == {
+            "__kind__", "dtype", "shape", "data"}:
+        try:
+            dtype = np.dtype(value["dtype"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid ndarray dtype in report wire payload") from exc
+        if dtype.kind not in "biufc":
+            raise ValueError(
+                f"non-numeric ndarray dtype in report wire payload: {dtype}")
+        shape = value["shape"]
+        data = value["data"]
+        if (not isinstance(shape, list) or not isinstance(data, list)
+                or any(not isinstance(v, int) or v < 0 for v in shape)):
+            raise ValueError("invalid ndarray shape/data in report wire payload")
+        size = math.prod(shape)
+        if size != len(data):
+            raise ValueError(
+                "ndarray report wire size mismatch: "
+                f"shape={shape} has {size} entries, payload has {len(data)}")
+        decoded = [_unwire_value(v) for v in data]
+        return np.asarray(decoded, dtype=dtype).reshape(tuple(shape))
+    raise ValueError("unknown or malformed tagged report wire value")
+
+
+def _encode_density_symmetry_report(report: DensitySymmetryReport) -> bytes:
+    """Versioned, non-pickle wire encoding for an in-run report broadcast."""
+    if not isinstance(report, DensitySymmetryReport):
+        raise TypeError(
+            "report codec expected DensitySymmetryReport, got "
+            f"{type(report).__name__}")
+    payload = {
+        "schema": _REPORT_WIRE_SCHEMA,
+        "fields": {
+            item.name: _wire_value(getattr(report, item.name))
+            for item in fields(DensitySymmetryReport)
+        },
+    }
+    return json.dumps(
+        payload, allow_nan=False, separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8")
+
+
+def _decode_density_symmetry_report(payload: bytes) -> DensitySymmetryReport:
+    """Decode and fully schema-check :class:`DensitySymmetryReport`."""
+    try:
+        raw = json.loads(bytes(payload).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid DensitySymmetryReport wire JSON") from exc
+    if (not isinstance(raw, dict)
+            or set(raw) != {"schema", "fields"}
+            or raw.get("schema") != _REPORT_WIRE_SCHEMA
+            or not isinstance(raw.get("fields"), dict)):
+        raise ValueError("wrong DensitySymmetryReport wire schema")
+    expected = {item.name for item in fields(DensitySymmetryReport)}
+    received = set(raw["fields"])
+    if received != expected:
+        raise ValueError(
+            "DensitySymmetryReport wire fields differ: "
+            f"missing={sorted(expected - received)}, "
+            f"extra={sorted(received - expected)}")
+    values = {
+        name: _unwire_value(value) for name, value in raw["fields"].items()
+    }
+    report = DensitySymmetryReport(**values)
+    if not isinstance(report.spatial_residual, np.ndarray):
+        raise ValueError("decoded spatial_residual is not an ndarray")
+    return report
 
 
 @dataclass(frozen=True)
@@ -581,6 +713,84 @@ def _cache_key(loader, nocc: int, tol_trs: float, max_k: int) -> tuple:
             int(max_k))
 
 
+def _distributed_request(loader, *, mode: str, tol_trs, max_k) -> dict:
+    """Small identity every recipient checks before accepting rank 0's report."""
+    path = os.path.realpath(str(getattr(loader, "path", "")))
+    try:
+        st = os.stat(path)
+        stamp = [int(st.st_mtime_ns), int(st.st_size)]
+    except OSError:
+        stamp = [0, 0]
+    return {
+        "path": path,
+        "stamp": stamp,
+        "algorithm": _ALGORITHM_VERSION,
+        "nocc": int(loader.physical_density_band_stop),
+        "mode": str(mode),
+        "tol_trs": None if tol_trs is None else float(tol_trs),
+        "max_k": None if max_k is None else int(max_k),
+    }
+
+
+def _encode_distributed_outcome(
+    request: dict,
+    *,
+    report: DensitySymmetryReport | None = None,
+    error: Exception | None = None,
+) -> bytes:
+    """Encode exactly one of a report, disabled result, or root exception."""
+    if report is not None and error is not None:
+        raise ValueError("distributed outcome cannot carry report and error")
+    raw = {
+        "schema": _OUTCOME_WIRE_SCHEMA,
+        "request": request,
+    }
+    if error is not None:
+        raw.update(kind="error", error_type=type(error).__name__,
+                   error_message=str(error))
+    elif report is None:
+        raw.update(kind="none")
+    else:
+        raw.update(
+            kind="report",
+            report=json.loads(_encode_density_symmetry_report(report)),
+        )
+    return json.dumps(
+        raw, allow_nan=False, separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8")
+
+
+def _decode_distributed_outcome(payload: bytes):
+    """Return ``(request, kind, value)`` from a strict outcome envelope."""
+    try:
+        raw = json.loads(bytes(payload).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid density-symmetry outcome wire JSON") from exc
+    if (not isinstance(raw, dict)
+            or raw.get("schema") != _OUTCOME_WIRE_SCHEMA
+            or not isinstance(raw.get("request"), dict)):
+        raise ValueError("wrong density-symmetry outcome wire schema")
+    kind = raw.get("kind")
+    if kind == "none" and set(raw) == {"schema", "request", "kind"}:
+        return raw["request"], kind, None
+    if kind == "error" and set(raw) == {
+            "schema", "request", "kind", "error_type", "error_message"}:
+        if not all(isinstance(raw[name], str)
+                   for name in ("error_type", "error_message")):
+            raise ValueError("malformed density-symmetry error outcome")
+        return raw["request"], kind, (
+            raw["error_type"], raw["error_message"])
+    if kind == "report" and set(raw) == {
+            "schema", "request", "kind", "report"}:
+        report_wire = json.dumps(
+            raw["report"], allow_nan=False, separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return (raw["request"], kind,
+                _decode_density_symmetry_report(report_wire))
+    raise ValueError("unknown or malformed density-symmetry outcome")
+
+
 def _enforce_policy(
     report: DensitySymmetryReport,
     mode: str,
@@ -608,13 +818,17 @@ def _enforce_policy(
         warnings.warn(text, RuntimeWarning)
 
 
-def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
-    """Process-local cached front door used by ``WfnLoader``."""
-    mode = trs_check_mode()
+def _cached_density_symmetry_check_local(
+    loader,
+    *,
+    mode: str,
+    tol: float | None,
+    max_k: int | None,
+) -> DensitySymmetryReport | None:
+    """The original process-local implementation, used directly at P=1."""
     if mode == "off":
         return None
-    tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
-    max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
+    assert tol is not None and max_k is not None
     nocc = int(loader.physical_density_band_stop)
     key = _cache_key(loader, nocc, tol, max_k)
     report = _CACHE.get(key)
@@ -640,4 +854,77 @@ def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
             conclusive=False, trs_holds=False)
     _CACHE[key] = report
     _enforce_policy(report, mode, announce=True)
+    return report
+
+
+def _uses_distributed_report(loader) -> bool:
+    """Whether this loader is part of a declared multi-process mesh."""
+    import jax
+    return (int(jax.process_count()) > 1
+            and getattr(loader, "_mesh", None) is not None)
+
+
+def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
+    """Cached front door; on a process mesh, compute once and broadcast.
+
+    A mesh-bearing ``WfnLoader`` is constructed collectively.  Rank 0 alone
+    reads the large coefficient slabs and evaluates the occupied-subspace
+    overlaps; every process receives only the immutable report.  Root errors
+    are encoded before any process raises, so strict mode cannot strand peers
+    in this preamble.
+    """
+    mode = trs_check_mode()
+    if mode == "off":
+        tol = None
+        max_k = None
+    else:
+        tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
+        max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
+
+    if not _uses_distributed_report(loader):
+        return _cached_density_symmetry_check_local(
+            loader, mode=mode, tol=tol, max_k=max_k)
+
+    import jax
+    from symmetry_maps._collectives import broadcast_root_bytes
+
+    rank = int(jax.process_index())
+    request = _distributed_request(
+        loader, mode=mode, tol_trs=tol, max_k=max_k)
+    call_id = next(_DISTRIBUTED_CALL_SEQUENCE)
+    key = f"lorrax/symmetry_maps/density-report/v1/{call_id}"
+    root_payload = None
+    if rank == 0:
+        try:
+            root_report = _cached_density_symmetry_check_local(
+                loader, mode=mode, tol=tol, max_k=max_k)
+            root_payload = _encode_distributed_outcome(
+                request, report=root_report)
+        except Exception as exc:
+            # Publishing the failure before raising is load-bearing: a strict
+            # rank-0 refusal must not leave every peer blocked in the KV get.
+            root_payload = _encode_distributed_outcome(request, error=exc)
+
+    payload = broadcast_root_bytes(root_payload, key=key)
+    root_request, kind, value = _decode_distributed_outcome(payload)
+    if root_request != request:
+        raise RuntimeError(
+            "density-symmetry report request differs across processes: "
+            f"rank0={root_request!r}, rank{rank}={request!r}")
+    if kind == "error":
+        error_type, error_message = value
+        raise RuntimeError(
+            "rank-0 density-symmetry check failed "
+            f"({error_type}): {error_message}")
+    if kind == "none":
+        return None
+
+    report = value
+    assert isinstance(report, DensitySymmetryReport)
+    assert tol is not None and max_k is not None
+    key_local = _cache_key(
+        loader, int(loader.physical_density_band_stop), tol, max_k)
+    _CACHE[key_local] = report
+    if rank != 0:
+        _enforce_policy(report, mode, announce=False)
     return report
