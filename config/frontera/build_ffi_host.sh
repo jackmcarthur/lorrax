@@ -20,7 +20,7 @@
 # By default this script builds the phdf5-only lib (4 targets: 3 read + 1
 # write), which needs no external numerical library.  Set
 # LORRAX_SLATE_HOST_INSTALL_DIR to a gpu_backend=none SLATE install and you
-# get all 11 host targets (phdf5×4, slate×5, scalapack×2):
+# get the full host target set (including five ScaLAPACK/PBLAS handlers):
 #
 #   LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
 #     config/frontera/build_ffi_host.sh --fresh
@@ -69,7 +69,7 @@
 #   what is linked here           API LORRAX calls        swap it for
 #   ---------------------------   ---------------------   --------------------
 #   libmkl_scalapack_lp64 +       ScaLAPACK + C-BLACS     Cray LibSci
-#   libmkl_blacs_intelmpi_lp64    (11 Fortran-ABI names,  (libsci_*_mpi_*),
+#   libmkl_blacs_intelmpi_lp64    (13 Fortran-ABI names,  (libsci_*_mpi_*),
 #   (+ the mkl_intel/thread/core  hand-declared in        netlib, AOCL, or
 #   layers they need)             cpp/scalapack/          SLATE's own
 #                                 blacs_grid.h)           libslate_scalapack_api
@@ -270,7 +270,7 @@ lrx_slate_init_mpi_host lrx_slate_context_create_host"
     # without the other.
     WANT="$WANT ScalapackBatchedSolveLuHostFfi \
 ScalapackBatchedGetrfHostFfi ScalapackBatchedGetrsHostFfi \
-ScalapackEighHostFfi \
+ScalapackEighHostFfi ScalapackBatchedGemmHostFfi \
 MklFftFlatKHostFfi MklFftGwConvHostFfi"
 fi
 echo "[build_host] --- exported handlers ---"

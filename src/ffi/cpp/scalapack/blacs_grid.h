@@ -72,6 +72,22 @@ void pzgetrs_(const char* trans, const int* n, const int* nrhs,
               const int* desca, const int* ipiv, std::complex<double>* b,
               const int* ib, const int* jb, const int* descb, int* info);
 
+// PBLAS matrix multiplication (gemm_ffi.cc).
+void pdgemm_(const char* transa, const char* transb, const int* m,
+             const int* n, const int* k, const double* alpha,
+             const double* a, const int* ia, const int* ja,
+             const int* desca, const double* b, const int* ib,
+             const int* jb, const int* descb, const double* beta,
+             double* c, const int* ic, const int* jc, const int* descc);
+void pzgemm_(const char* transa, const char* transb, const int* m,
+             const int* n, const int* k,
+             const std::complex<double>* alpha,
+             const std::complex<double>* a, const int* ia, const int* ja,
+             const int* desca, const std::complex<double>* b,
+             const int* ib, const int* jb, const int* descb,
+             const std::complex<double>* beta, std::complex<double>* c,
+             const int* ic, const int* jc, const int* descc);
+
 // Hermitian/symmetric eigensolver, divide & conquer (eigh_ffi.cc).
 // NOTE the ABI asymmetry: the real routine has no RWORK.
 void pdsyevd_(const char* jobz, const char* uplo, const int* n,
@@ -373,10 +389,10 @@ inline void scalapack_log_providers_once() {
     std::call_once(once, [] {
         static const char* kNames[] = {
             "pzheevd_", "pdsyevd_", "pzgetrf_", "pdgetrf_", "pzgetrs_",
-            "pdgetrs_", "numroc_", "descinit_", "Csys2blacs_handle",
-            "Cblacs_gridinit", "Cblacs_gridinfo"};
+            "pdgetrs_", "pzgemm_", "pdgemm_", "numroc_", "descinit_",
+            "Csys2blacs_handle", "Cblacs_gridinit", "Cblacs_gridinfo"};
         std::fprintf(stderr,
-                     "[scalapack] provider map (the 11 names this library "
+                     "[scalapack] provider map (the 13 names this library "
                      "calls; anything implementing them can back it):\n");
         for (const char* n : kNames) {
             const std::string& lib = scalapack_symbol_provider(n);

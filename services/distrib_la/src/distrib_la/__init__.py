@@ -51,8 +51,9 @@ GemmPlan``
     Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE, for a caller
     that will call it many times from inside its own ``jax.jit``/
     ``lax.scan`` (G construction, per-tau Sigma projection).  ``GemmPlan(A,
-    B, C=None, *, out=None)`` is trace-safe: cuBLASMp only, one replicated
-    leading batch (holds k), no transpose modes.
+    B, C=None, *, out=None)`` is trace-safe through cuBLASMp or ScaLAPACK,
+    with one replicated leading batch (holds k) and no transpose modes.
+    ``GemmPlan.local_call`` is the cuBLASMp-only manual-shard-map entry.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's

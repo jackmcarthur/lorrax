@@ -883,7 +883,7 @@ add_compile_definitions(OMPI_SKIP_MPICXX=1)
 # NUMERICAL LIBRARIES" block further down for what that cost):
 #   LORRAX_FFI_HAVE_PHDF5     (ON)  parallel-HDF5 read + write handlers
 #                                   + lifecycle
-#   LORRAX_HOST_HAVE_SCALAPACK(ON)  ScaLAPACK distributed eigh + fused LU,
+#   LORRAX_HOST_HAVE_SCALAPACK(ON)  ScaLAPACK/PBLAS eigh + LU + GEMM,
 #                                   plus the CBLAS GEMM and MKL-FFT handlers
 #                                   that ride the same link line
 #   LORRAX_HOST_HAVE_SLATE    (ON)  SLATE gpu_backend=none host handlers
@@ -891,8 +891,8 @@ add_compile_definitions(OMPI_SKIP_MPICXX=1)
 # found, so a phdf5-only host lib still builds on a cluster with neither a
 # SLATE install nor a ScaLAPACK.
 #
-# The full 11-target lib (phdf5×4, slate×5, scalapack×2) is built by
-# config/frontera/build_ffi_host.sh (9 targets first built 2026-07-25;
+# The full host library is built by config/frontera/build_ffi_host.sh
+# (the first numerical targets were built 2026-07-25;
 # scalapack eigh added 2026-07-26, workstream V; the phdf5 WRITE handler
 # added 2026-07-26, workstream AE — it is what makes the mpi4py +
 # h5py-parallel overlay unnecessary on CPU).
@@ -1011,11 +1011,11 @@ endif()
 #  family    API it calls              implementations that provide it
 #  --------  ------------------------  -------------------------------------
 #  scalapack ScaLAPACK + C-BLACS       Intel MKL (libmkl_scalapack_lp64
-#            (Fortran ABI; the ELEVEN  defines 8 + libmkl_blacs_<mpi>_lp64
-#            symbols listed below,     defines 3 = all eleven, measured),
+#            (Fortran ABI; the 13      definitions split across ScaLAPACK
+#            symbols listed below,     and libmkl_blacs_<mpi>_lp64),
 #            declared in scalapack/    Cray LibSci (libsci_*_mpi_*), netlib
 #            cpp/blacs_grid.h)         ScaLAPACK, AMD AOCL.  NOT SLATE's
-#                                      libslate_scalapack_api: 6/11, and
+#                                      libslate_scalapack_api: 6/13, and
 #                                      refused -- see RESOLVE 1/4 below.
 #  mklblas   CBLAS (cblas_dgemm /      Intel MKL, Cray LibSci, OpenBLAS,
 #            cblas_zgemm; the batched  BLIS, ATLAS.  Only the *_batch entry
@@ -1117,8 +1117,8 @@ set(_mklblas_on       0)
 #      block COMMENTED OUT ("# todo: requires ScaLAPACK"), so a CMake install
 #      never contains libslate_scalapack_api regardless of that setting.
 #    * Even when built from the GNUmakefile (or
-#      cpp/stage/slate_build_scalapack_api.sh), that library DEFINES only 6 of
-#      the eleven names below — every compute routine, none of the
+#      cpp/stage/slate_build_scalapack_api.sh), that library defines six of
+#      the thirteen names below — the solver routines, none of GEMM or
 #      grid/descriptor tools, and it CALLS numroc_ / Cblacs_gridinfo itself.
 #      It is an OVERLAY on a real ScaLAPACK, never a provider.  LORRAX
 #      REFUSES it at run time (cpp/scalapack/blacs_grid.h) because its
@@ -1478,8 +1478,7 @@ endif()
 # ----------------------------------------------------------------------------
 #  APPEND — sources, link libraries and library search paths, in a FIXED
 #  order.  Keep this order: it is what makes the emitted link line for the
-#  full 11-target Frontera build byte-identical to the pre-2026-07-31 one,
-#  which is how this restructure was checked without a compute node.
+#  host build independent of which optional providers were found.
 # ----------------------------------------------------------------------------
 # LORRAX's MPI mesh context — needed by the slate AND the scalapack handlers.
 if(slate_FOUND OR _scalapack_on)
@@ -1492,6 +1491,7 @@ if(slate_FOUND)
 endif()
 if(_scalapack_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES
+        scalapack/gemm_ffi.cc
         scalapack/solve_lu_ffi.cc
         scalapack/getrf_getrs_ffi.cc
         scalapack/eigh_ffi.cc)
