@@ -232,6 +232,13 @@ def test_prepare_mesh_calls_both_warm_ups_and_merges_neither(monkeypatch):
         "whose absence killed the BSE TDA Lanczos)")
 
 
+def test_mpi_warmup_includes_both_ordered_product_faces():
+    """JAX 0.9.2 keys CPU/MPI communicators by ordered participants."""
+    assert C._warm_axis_groups(("x", "y")) == (
+        "x", "y", ("x", "y"), ("y", "x"))
+    assert C._warm_axis_groups(("x",)) == ("x",)
+
+
 def test_the_warm_up_recorder_can_fail(monkeypatch):
     """NEGATIVE CONTROL: with the P>1 override removed, the same recorder
     sees NOTHING — so the assertion above is reading the branch, not a

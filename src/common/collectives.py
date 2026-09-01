@@ -1320,6 +1320,18 @@ def report_collective_residual(name: str, residual, *,
 _WARMED_MESHES: set = set()
 
 
+def _warm_axis_groups(axis_names):
+    """Ordered mesh-axis groups required by LORRAX's 2-D collectives."""
+    axes = tuple(axis_names)
+    groups = list(axes)
+    if len(axes) > 1:
+        # JAX 0.9.2's CPU/MPI communicator cache distinguishes the order of
+        # participants in a composite axis.  Product faces use both orders:
+        # P(('x','y'), ...) and P(('y','x'), ...).
+        groups.extend((axes, tuple(reversed(axes))))
+    return tuple(groups)
+
+
 def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     """Create every mesh-axis MPI communicator on the calling (main) thread.
 
@@ -1334,25 +1346,30 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
 
     THE MECHANISM THAT FIXES IT.  The guard fires only on communicator
     CREATION, and ``xla::cpu::AcquireCommunicator`` caches communicators in a
-    process-global clique map keyed *only* by the participating-device set:
+    process-global clique map keyed by the ordered participating-device list:
     it takes the map lock and calls ``CreateCommunicator`` only on a MISS.
     Creating each clique once here — from the main thread, inside a jit small
     enough (one 8-byte buffer, <= 8 thunks) that XLA takes
     ``ThunkExecutor::ExecuteSequential`` and runs the thunk inline on the
     caller — makes every later acquisition a cache hit, so the guard is never
-    evaluated again.  Verified live with ``TF_CPP_VMODULE=cpu_cliques=3``:
-    three cliques per rank, created during warm-up, never re-created.
+    evaluated again.  ``TF_CPP_VMODULE=cpu_cliques=3`` exposes each creation
+    and distinguishes a warm-up hit from a worker-thread cache miss.
 
-    WHICH CLIQUES.  Exactly the ones the program will touch: one per mesh
-    axis, plus one over all axes together.  This is **per-clique**, and the
-    discriminating controls (job 7881053) are unambiguous — warming the world
-    clique ALONE fails, ``x`` alone fails, ``x+y`` without the world fails,
-    and only ``x + y + world`` passes.  An earlier helper in
-    ``common.contract_bands`` warmed the world clique only, which is exactly
-    the failing cell; that is why the "world-collective-first contract" looked
-    falsified.  Warm-up does matter — it was warming the wrong device sets.
+    WHICH CLIQUES.  Exactly the ones the 2-D program will touch: one per mesh
+    axis, plus both ordered composite axes.  The second composite matters on
+    JAX 0.9.2: ``('x','y')`` is rank ordered while ``('y','x')`` is the
+    transposed rank order used by product-r reductions.  This is
+    **per-ordered-clique**, and the
+    original BSE discriminating controls (job 7881053) are unambiguous —
+    warming the world clique ALONE fails, ``x`` alone fails, ``x+y`` without
+    the world fails, and only ``x + y + world`` passes that workload.  The
+    product-r workload additionally needs the reverse world order.  An earlier
+    helper in ``common.contract_bands`` warmed the world clique only, which is
+    exactly the failing cell; that is why the "world-collective-first contract"
+    looked falsified.  Warm-up does matter — it was warming the wrong device
+    sets.
 
-    COST.  Three 8-byte ``psum``s for a 2-D mesh; ~150 ms once per process at
+    COST.  Four 8-byte ``psum``s for a 2-D mesh; subsecond once per process at
     P=4, ``O(log P)`` in latency, independent of ``N_mu``/``N_k``/``N_q``.  It
     adds nothing to any solver iteration and leaves the compiled HLO of every
     downstream kernel untouched, so it cannot move the collective table or the
@@ -1392,7 +1409,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     t0 = time.perf_counter()
     tiny = jnp.zeros(1)
     axes = list(mesh.axis_names)
-    groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
+    groups = _warm_axis_groups(axes)
     for ax in groups:
         f = jax.jit(shard_map(lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,
                               in_specs=(P(None),), out_specs=P(None),
