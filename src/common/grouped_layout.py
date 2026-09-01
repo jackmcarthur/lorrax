@@ -16,8 +16,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import heapq
+import operator
+from typing import ClassVar
 
 import numpy as np
+
+
+_GROUPED_SHARD_LAYOUT_SCHEMA = "lorrax.grouped-shard-layout.v1"
 
 
 def _readonly(array, dtype=None) -> np.ndarray:
@@ -51,6 +56,8 @@ class GroupedShardLayout:
     group_start: np.ndarray
     group_size: np.ndarray
     shard_load: np.ndarray
+    __lorrax_grouped_layout_schema__: ClassVar[str] = (
+        _GROUPED_SHARD_LAYOUT_SCHEMA)
 
     def __init__(self, *args, **kwargs):
         del args, kwargs
@@ -154,6 +161,114 @@ class GroupedShardLayout:
         """
         packed = self.pack_permutations_host(permutations)
         return (packed % self.shard_size).astype(np.int32)
+
+
+def validate_grouped_shard_layout(layout):
+    """Authenticate one host layout without relying on module class identity.
+
+    LORRAX supports imports through both ``common.*`` and ``src.common.*``.
+    Python may load those as distinct modules, so a nominal ``isinstance``
+    check rejects a valid factory receipt from the other spelling.  The
+    stable schema marker plus complete invariant check admits either spelling
+    while still refusing independently assembled or mutated metadata.
+    """
+    who = "validate_grouped_shard_layout"
+    if getattr(layout, "__lorrax_grouped_layout_schema__", None) != \
+            _GROUPED_SHARD_LAYOUT_SCHEMA:
+        raise TypeError(f"{who}: layout must come from build_grouped_shard_layout()")
+    scalar_names = (
+        "n_logical", "n_groups", "n_shards", "shard_size", "n_padded")
+    try:
+        n_logical, n_groups, n_shards, shard_size, n_padded = (
+            operator.index(getattr(layout, name)) for name in scalar_names)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{who}: malformed scalar receipt") from error
+    if min(n_logical, n_groups, n_shards, shard_size) < 1:
+        raise ValueError(f"{who}: all logical extents must be positive")
+    if n_padded != n_shards * shard_size or n_padded < n_logical:
+        raise ValueError(f"{who}: padded extent/shard geometry disagrees")
+
+    expected = {
+        "packed_to_canonical": ((n_padded,), np.dtype(np.int64)),
+        "canonical_to_packed": ((n_logical,), np.dtype(np.int64)),
+        "canonical_group_id": ((n_logical,), np.dtype(np.int32)),
+        "packed_group_id": ((n_padded,), np.dtype(np.int32)),
+        "active_mask": ((n_padded,), np.dtype(bool)),
+        "group_owner": ((n_groups,), np.dtype(np.int32)),
+        "group_start": ((n_groups,), np.dtype(np.int64)),
+        "group_size": ((n_groups,), np.dtype(np.int32)),
+        "shard_load": ((n_shards,), np.dtype(np.int64)),
+    }
+    arrays: dict[str, np.ndarray] = {}
+    for name, (shape, dtype) in expected.items():
+        value = getattr(layout, name, None)
+        if not isinstance(value, np.ndarray):
+            raise TypeError(f"{who}: {name} must be a host NumPy array")
+        if value.shape != shape or value.dtype != dtype:
+            raise ValueError(
+                f"{who}: {name} has shape/dtype {value.shape}/{value.dtype}; "
+                f"expected {shape}/{dtype}")
+        if value.flags.writeable:
+            raise ValueError(f"{who}: {name} must be immutable")
+        arrays[name] = value
+
+    packed = arrays["packed_to_canonical"]
+    inverse = arrays["canonical_to_packed"]
+    active = arrays["active_mask"]
+    canonical_group = arrays["canonical_group_id"]
+    packed_group = arrays["packed_group_id"]
+    starts = arrays["group_start"]
+    sizes = arrays["group_size"]
+    owners = arrays["group_owner"]
+    if not np.array_equal(active, packed >= 0):
+        raise ValueError(f"{who}: active mask disagrees with pad sentinels")
+    if not np.all(packed[~active] == -1):
+        raise ValueError(f"{who}: canonical pad sentinels disagree")
+    if np.any(sizes <= 0):
+        raise ValueError(f"{who}: every dense group must be nonempty")
+    active_rows = packed[active]
+    if (active_rows.size != n_logical or np.any(active_rows < 0)
+            or np.any(active_rows >= n_logical)
+            or not np.all(np.bincount(active_rows, minlength=n_logical) == 1)):
+        raise ValueError(f"{who}: packed rows are not one canonical permutation")
+    if np.any(inverse < 0) or np.any(inverse >= n_padded) or not np.array_equal(
+            packed[inverse], np.arange(n_logical)):
+        raise ValueError(f"{who}: canonical inverse map disagrees")
+    if not np.array_equal(
+            inverse[active_rows], np.flatnonzero(active)):
+        raise ValueError(f"{who}: packed inverse map disagrees")
+    if np.any(canonical_group < 0) or np.any(canonical_group >= n_groups):
+        raise ValueError(f"{who}: canonical group IDs leave the dense range")
+    first = np.full((n_groups,), n_logical, dtype=np.int64)
+    np.minimum.at(first, canonical_group, np.arange(n_logical))
+    if first[0] != 0 or np.any(np.diff(first) <= 0):
+        raise ValueError(
+            f"{who}: dense group IDs do not follow first canonical appearance")
+    if not np.array_equal(packed_group[active], canonical_group[packed[active]]):
+        raise ValueError(f"{who}: packed and canonical group IDs disagree")
+    if not np.all(packed_group[~active] == n_groups):
+        raise ValueError(f"{who}: pad group sentinels disagree")
+    if not np.array_equal(
+            sizes, np.bincount(canonical_group, minlength=n_groups)):
+        raise ValueError(f"{who}: group sizes disagree with canonical labels")
+    for group in range(n_groups):
+        start = int(starts[group])
+        stop = start + int(sizes[group])
+        if (start < 0 or stop > n_padded
+                or start // shard_size != (stop - 1) // shard_size):
+            raise ValueError(f"{who}: group {group} is not fine-shard local")
+        if int(owners[group]) != start // shard_size or not np.all(
+                packed_group[start:stop] == group):
+            raise ValueError(f"{who}: group {group} owner/interval disagrees")
+    measured_load = active.reshape(n_shards, shard_size).sum(axis=1)
+    if not np.array_equal(arrays["shard_load"], measured_load):
+        raise ValueError(f"{who}: shard loads disagree with active rows")
+    local_rows = np.arange(shard_size)[None, :]
+    if not np.array_equal(
+            active.reshape(n_shards, shard_size),
+            local_rows < arrays["shard_load"][:, None]):
+        raise ValueError(f"{who}: pads are not shard-local suffixes")
+    return layout
 
 
 @dataclass(frozen=True, init=False)
@@ -265,18 +380,6 @@ def build_grouped_shard_layout(group_id, n_shards: int) -> GroupedShardLayout:
     active = packed_to_canonical >= 0
     canonical_to_packed[packed_to_canonical[active]] = np.flatnonzero(active)
 
-    # Construction assertions are cheap and make the descriptor trustworthy
-    # to communication kernels that cannot afford defensive host reasoning.
-    if np.unique(packed_to_canonical[active]).size != labels.size:
-        raise AssertionError("grouped layout lost or duplicated a canonical row")
-    for group in range(n_groups):
-        start = int(group_start[group])
-        stop = start + int(sizes[group])
-        if not np.all(packed_group_id[start:stop] == group):
-            raise AssertionError("grouped layout split a group")
-        if start // shard_size != (stop - 1) // shard_size:
-            raise AssertionError("grouped layout crossed a shard boundary")
-
     out = object.__new__(GroupedShardLayout)
     fields = {
         "n_logical": int(labels.size),
@@ -296,7 +399,7 @@ def build_grouped_shard_layout(group_id, n_shards: int) -> GroupedShardLayout:
     }
     for name, value in fields.items():
         object.__setattr__(out, name, value)
-    return out
+    return validate_grouped_shard_layout(out)
 
 
 def build_square_grouped_shard_layout(
@@ -322,4 +425,5 @@ __all__ = [
     "SquareGroupedShardLayout",
     "build_grouped_shard_layout",
     "build_square_grouped_shard_layout",
+    "validate_grouped_shard_layout",
 ]

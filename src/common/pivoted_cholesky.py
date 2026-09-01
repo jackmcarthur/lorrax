@@ -32,7 +32,7 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from common.shard_map import shard_map
-from .grouped_layout import GroupedShardLayout
+from .grouped_layout import GroupedShardLayout, validate_grouped_shard_layout
 
 
 __all__ = [
@@ -860,8 +860,7 @@ def make_sharded_group_panel_pivoted_cholesky_select(
     drifting metadata.  Pivots and PSD row receipts are canonical IDs, while
     ``L`` and ``d_final`` remain in the supplied packed row order.
     """
-    if not isinstance(layout, GroupedShardLayout):
-        raise TypeError("layout must come from build_grouped_shard_layout()")
+    layout = validate_grouped_shard_layout(layout)
     n_dev = _mesh_axis_size(
         mesh, mesh_axis, "make_sharded_group_panel_pivoted_cholesky_select")
     if layout.n_shards != n_dev:

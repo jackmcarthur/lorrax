@@ -8,6 +8,7 @@ and shard-local conjugated symmetry gathers.
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -67,20 +68,80 @@ def test_grouped_layout_balances_whole_groups_and_round_trips():
         layout.packed_to_canonical[0] = 99
 
 
-@pytest.mark.parametrize("package", ["common", "src.common"])
-def test_layout_receipt_matches_selector_under_supported_import_styles(package):
-    """A relative sibling import must not manufacture a second receipt type."""
+@pytest.mark.parametrize(
+    ("layout_package", "selector_package"),
+    [
+        ("common", "common"),
+        ("src.common", "src.common"),
+        ("common", "src.common"),
+        ("src.common", "common"),
+    ],
+)
+def test_layout_receipt_crosses_supported_import_styles(
+        layout_package, selector_package):
+    """Receipt validation is structural across Python's two module names."""
     jax = pytest.importorskip("jax")
     from jax.sharding import Mesh
 
-    layout_module = importlib.import_module(f"{package}.grouped_layout")
-    selector_module = importlib.import_module(f"{package}.pivoted_cholesky")
+    layout_module = importlib.import_module(f"{layout_package}.grouped_layout")
+    selector_module = importlib.import_module(
+        f"{selector_package}.pivoted_cholesky")
     labels = _labels_from_sizes([2, 1])
     layout = layout_module.build_grouped_shard_layout(labels, 1)
+    if layout_package != selector_package:
+        assert not isinstance(layout, selector_module.GroupedShardLayout)
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     selector = selector_module.make_sharded_group_panel_pivoted_cholesky_select(
         mesh, 2, layout, mesh_axis=("x", "y"))
     assert callable(selector)
+
+
+def test_structural_receipt_validator_refuses_drifting_inverse_metadata():
+    from common.grouped_layout import (
+        build_grouped_shard_layout,
+        validate_grouped_shard_layout,
+    )
+
+    layout = build_grouped_shard_layout(_labels_from_sizes([2, 3]), 2)
+    assert validate_grouped_shard_layout(layout) is layout
+    fields = dict(vars(layout))
+    fields["__lorrax_grouped_layout_schema__"] = (
+        layout.__lorrax_grouped_layout_schema__)
+    wrong_version = SimpleNamespace(**fields)
+    wrong_version.__lorrax_grouped_layout_schema__ = (
+        "lorrax.grouped-shard-layout.v999")
+    with pytest.raises(TypeError, match="build_grouped_shard_layout"):
+        validate_grouped_shard_layout(wrong_version)
+
+    bad_inverse = layout.canonical_to_packed.copy()
+    bad_inverse[[0, 1]] = bad_inverse[[1, 0]]
+    bad_inverse.setflags(write=False)
+    fields["canonical_to_packed"] = bad_inverse
+    drifted = SimpleNamespace(**fields)
+    with pytest.raises(ValueError, match="inverse"):
+        validate_grouped_shard_layout(drifted)
+
+    def frozen(values, dtype):
+        out = np.asarray(values, dtype=dtype)
+        out.setflags(write=False)
+        return out
+
+    missing = dict(vars(layout))
+    missing["__lorrax_grouped_layout_schema__"] = (
+        layout.__lorrax_grouped_layout_schema__)
+    missing["n_groups"] = layout.n_groups + 1
+    packed_group = layout.packed_group_id.copy()
+    packed_group[~layout.active_mask] = missing["n_groups"]
+    missing["packed_group_id"] = frozen(packed_group, np.int32)
+    missing["group_owner"] = frozen(
+        np.append(layout.group_owner, 0), np.int32)
+    missing["group_start"] = frozen(
+        np.append(layout.group_start, 0), np.int64)
+    missing["group_size"] = frozen(
+        np.append(layout.group_size, 0), np.int32)
+    missing_group = SimpleNamespace(**missing)
+    with pytest.raises(ValueError, match="nonempty"):
+        validate_grouped_shard_layout(missing_group)
 
 
 def test_one_finest_layout_coarsens_to_identical_square_axis_views():
