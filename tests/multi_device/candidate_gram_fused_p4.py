@@ -7,6 +7,7 @@ addressable output tile, and the output must remain distributed over X,Y.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import numpy as np
@@ -120,9 +121,9 @@ def main() -> None:
         ).compile()
         hlo = compiled.as_text().lower()
         forbidden = [op for op in (
-            "all-gather(", "all-to-all(", "all-reduce(",
-            "collective-permute(",
-        ) if op in hlo]
+            "all-gather", "all-to-all", "all-reduce", "reduce-scatter",
+            "collective-permute",
+        ) if re.search(rf"\b{re.escape(op)}(?:-start|-done)?\(", hlo)]
         if forbidden:
             _fail(f"{mode}: unexpected collective(s) {forbidden}")
         mem = aot_kernel_peak_bytes(compiled)
