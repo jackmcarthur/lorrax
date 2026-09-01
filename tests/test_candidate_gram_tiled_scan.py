@@ -11,7 +11,7 @@ import pytest
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 def _mesh11() -> Mesh:
@@ -153,3 +153,23 @@ def test_tiled_executor_scan_and_donation_are_explicit_in_source():
               if kw.arg == "donate_argnums"]
     assert len(donate) == 1
     assert ast.literal_eval(donate[0]) == (0,)
+
+
+def test_terminal_hermitian_fold_preserves_value_and_xy_layout():
+    from centroid.pivoted_cholesky import (
+        _candidate_gram_hermitian_fold_kernel,
+    )
+    from common.collectives import device_put_process_local
+
+    mesh = _mesh11()
+    xy = NamedSharding(mesh, P("x", "y"))
+    raw = np.asarray([
+        [1.0 + 0.2j, 2.0 - 0.4j, -0.5 + 0.7j],
+        [0.3 + 0.1j, -2.0 + 0.8j, 1.1 - 0.2j],
+        [0.6 - 0.9j, -0.7 + 0.5j, 3.0 - 0.3j],
+    ], dtype=np.complex128)
+    got = _candidate_gram_hermitian_fold_kernel(mesh)(
+        device_put_process_local(raw, xy))
+    assert tuple(got.sharding.spec) == ("x", "y")
+    np.testing.assert_array_equal(
+        np.asarray(got), 0.5 * (raw + np.conj(raw.T)))

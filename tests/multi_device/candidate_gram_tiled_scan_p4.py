@@ -54,6 +54,9 @@ def main() -> None:
         _gram_q0_tiled_from_psi_kernel,
     )
     from runtime.aot_memory import aot_kernel_peak_bytes
+    from centroid.pivoted_cholesky import (
+        _candidate_gram_hermitian_fold_kernel,
+    )
 
     if jax.process_count() != 4 or jax.device_count() != 4:
         _fail(
@@ -144,6 +147,19 @@ def main() -> None:
                 _fail(
                     f"{mode}: not bit-identical on rank={jax.process_index()}; "
                     f"max_abs={np.max(np.abs(delta)):.3e}")
+
+        fold_kernel = _candidate_gram_hermitian_fold_kernel(mesh)
+        folded = fold_kernel(got)
+        folded.block_until_ready()
+        if tuple(folded.sharding.spec) != ("x", "y"):
+            _fail(f"{mode}: terminal fold layout is {folded.sharding.spec}")
+        fold_hlo = fold_kernel.lower(expected).compile().as_text().lower()
+        fold_forbidden = [op for op in ("all-gather", "all-to-all")
+                          if re.search(rf"\b{op}(?:-start|-done)?\(", fold_hlo)]
+        if fold_forbidden:
+            _fail(
+                f"{mode}: terminal fold replicated a Gram via "
+                f"{fold_forbidden}")
 
         if mode == "transverse":
             perm, phase = _gammas_perm, _gammas_phase

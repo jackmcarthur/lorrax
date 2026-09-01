@@ -46,6 +46,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+from functools import partial
 
 import numpy as np
 import jax
@@ -88,6 +89,27 @@ _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
 _GRAM_FINAL_FOLD_SLOTS = 3
 _CANDIDATE_GAMMA_MODES = ("charge", "transverse")
+
+
+def _candidate_gram_hermitian_fold_kernel(mesh_xy: Mesh):
+    """Return the donated P(x,y)->P(x,y) terminal Gram fold.
+
+    The transpose exchanges square-mesh owners, but no process may receive a
+    complete Gram.  Keeping both input and output shardings explicit prevents
+    eager ``G + G.T.conj()`` from resolving the public result to ``P()``.
+    """
+    xy = NamedSharding(mesh_xy, PartitionSpec("x", "y"))
+
+    @partial(
+        jax.jit,
+        in_shardings=xy,
+        out_shardings=xy,
+        donate_argnums=(0,),
+    )
+    def _fold(G):
+        return 0.5 * (G + jnp.conj(G.T))
+
+    return _fold
 
 
 def _resolve_candidate_gamma_mode(gamma_mode: str, *, bispinor: bool) -> str:
@@ -1583,7 +1605,7 @@ def build_gram_q0_via_loadwfns(
             )
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
-            G = 0.5 * (G + jnp.conj(G.T))
+            G = _candidate_gram_hermitian_fold_kernel(mesh_xy)(G)
             G.block_until_ready()
         del psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
         return G
