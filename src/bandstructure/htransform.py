@@ -2262,7 +2262,7 @@ def main(argv=None):
             centroid_record_fn=_centroid_records.append,
             rank_record_fn=_rank_records.append,
             require_all_occupied=True,
-            basis_input=args.basis_input, basis_output=args.basis_output,
+            basis_input=args.basis_input, basis_output=basis_output_path,
             distrib_la_batched_route=distrib_la_batched_route)
     _setup_progress.step()
     _setup_progress.finish()

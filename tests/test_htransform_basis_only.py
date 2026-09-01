@@ -50,6 +50,16 @@ def test_basis_only_branch_precedes_every_post_fit_stage():
     assert "return 0" in basis_block
 
 
+def test_basis_publication_receives_the_input_relative_resolved_path():
+    """A caller's cwd must not redirect an input-relative basis output."""
+    from bandstructure import htransform
+
+    source = inspect.getsource(htransform.main)
+    assert "basis_output_path = (" in source
+    assert "basis_output=basis_output_path" in source
+    assert "basis_output=args.basis_output" not in source
+
+
 def test_basis_only_help_names_the_terminal_boundary(capsys):
     from bandstructure import htransform
 
