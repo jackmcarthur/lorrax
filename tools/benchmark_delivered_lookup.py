@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time lookup-first fitting on the frozen six-window Na measure.
+"""Time fitting on the frozen six-window Na measure.
 
 The archive contains the fitting and refined validation lattices.  The
 incumbent targets and achieved residuals below are copied from its companion
@@ -64,7 +64,7 @@ def _fit(problem, validation, pole_sign, target):
         candidates = planner._crossing_table_candidates(
             problem, pole_sign, target, planner.MAX_WINDOW_TAU_PAIRS)
     else:
-        candidates = planner._sign_definite_table_candidates(
+        candidates = planner._sign_definite_candidates(
             problem, target, planner.MAX_WINDOW_TAU_PAIRS)
     for times, weights, evidence in candidates:
         candidate = planner._rule_candidate(
@@ -72,7 +72,7 @@ def _fit(problem, validation, pole_sign, target):
         if planner._rule_accepted(candidate["metrics"], target):
             return candidate
     if planner._window_kind(problem) != "crossing":
-        raise RuntimeError("the noncrossing catalog family was exhausted")
+        raise RuntimeError("the on-demand noncrossing rank ladder was exhausted")
     return planner._rule_candidate(
         problem, validation,
         *planner._fit_crossing_once(

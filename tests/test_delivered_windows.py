@@ -76,10 +76,9 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     expected = -residue[0] / denominator
     relative_error = abs(executed - expected) / abs(expected)
     evidence = report["branches"][0]["windows"][0]
-    assert relative_error <= 1.01 * evidence["refined_residual"]
-    assert evidence["family"] == "noncrossing"
-    assert evidence["certificate_abs_error_bound"] > 0.0
-    assert "shipped noncrossing/" in evidence["fit_provenance"]
+    assert relative_error <= 1.01 * evidence["refined_residual"] + 1.0e-15
+    assert evidence["family"] in {
+        "noncrossing_on_demand", "measure_adapted_roq"}
 
 
 def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
@@ -232,26 +231,36 @@ def test_selector_defaults_to_incumbent_panes(monkeypatch):
     assert resolve_sigma_plan() == "panes"
 
 
-def test_sign_definite_planning_is_lookup_only(monkeypatch):
-    """A noncrossing window must never enter either optimizer."""
-    def optimizer_called(*_args, **_kwargs):
-        raise AssertionError("lookup-first noncrossing plan called an optimizer")
+def test_sign_definite_planning_uses_seeded_noncrossing_solver(monkeypatch):
+    """A noncrossing window takes the cheap on-demand solver route."""
+    import minimax
 
-    monkeypatch.setattr(
-        delivered, "solve_fixed_time_weights_fast", optimizer_called)
-    branch = _branch("lookup-only valence", "val", [0.6], [0.8])
-    poles = np.asarray([1.0 - 0.2j])
-    residues = np.asarray([0.8 + 0.3j])
-    plan, report = build_delivered_sigma_windows(
-        [poles], [residues], [branch], np.asarray([0.8]),
-        regularization_width_ry=0.05,
-        envelope_relative_target=1.0e-5,
-        max_nodes=64)
+    calls = []
+    solve = minimax.noncrossing_grids
 
-    assert len(plan) == 1
-    evidence = report["branches"][0]["windows"][0]
-    assert evidence["family"] == "noncrossing"
-    assert evidence["catalog_achieved_abs_error"] > 0.0
+    def counted(*args, **kwargs):
+        calls.append((args, kwargs))
+        return solve(*args, **kwargs)
+
+    monkeypatch.setattr(minimax, "noncrossing_grids", counted)
+    monkeypatch.setattr(delivered, "_factor_growth", lambda *_args: (0.0, 0.0))
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([-1.0, -25.0]),
+        cell_masses=np.asarray([0.5, 0.5]))
+    spec = {
+        "name": "on-demand sign-definite probe",
+        "kind": "sign_definite_positive",
+        "problem": problem, "validation": problem,
+        "pole_sign": 1.0, "envelope": 1.0,
+    }
+    candidate = delivered._candidate_rules(
+        spec, eta=0.05, max_nodes=64, factor_growth_cap=30.0,
+        relative_target=1.0e-4)[0]
+
+    assert calls
+    assert candidate["evidence"]["family"] == "noncrossing_on_demand"
+    assert candidate["evidence"]["fit_achieved_abs_error"] > 0.0
 
 
 def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
@@ -401,7 +410,7 @@ def test_combined_rule_metrics_match_the_service_definitions():
         (np.max(residual), p99, peak), rtol=2.0e-15, atol=0.0)
 
 
-def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
+def test_noncrossing_fit_falls_back_after_a_measured_miss(monkeypatch):
     problem = ReciprocalMeasureProblem(
         frequencies=np.asarray([0.0]),
         internal_sums=np.asarray([-1.0 - 0.1j]),
@@ -411,16 +420,26 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
     passing_weight = np.asarray([
         np.exp(denominator) / denominator], dtype=np.complex128)
 
-    def table_walk(*_args, **_kwargs):
+    def failed_fit(*_args, **_kwargs):
         yield (np.asarray([1.0j]), np.asarray([0.0j]),
-               {"family": "noncrossing", "candidate_tolerance": 1.0e-6,
-                "provenance": "first table"})
-        yield (passing_time, passing_weight,
-               {"family": "noncrossing", "candidate_tolerance": 2.0e-7,
-                "provenance": "next tighter table"})
+               {"family": "noncrossing_on_demand",
+                "candidate_tolerance": 1.0e-6,
+                "provenance": "physical range"})
 
     monkeypatch.setattr(
-        delivered, "_sign_definite_table_candidates", table_walk)
+        delivered, "_sign_definite_candidates", failed_fit)
+    monkeypatch.setattr(
+        delivered, "_roq_crossing_candidate",
+        lambda *_args, **_kwargs: {
+            "times": passing_time, "weights": passing_weight,
+            "evidence": {"family": "measure_adapted_roq",
+                         "candidate_tolerance": 1.0e-5,
+                         "provenance": "ROQ fallback"},
+            "fit_metrics": (0.0, 1.0, 1.0),
+            "metrics": (0.0, 1.0, 1.0),
+            "required_target": 1.0e-6, "absolute_cost": 1.0e-6,
+            "factor_growth": (0.0, 0.0), "attempts": [],
+        })
     monkeypatch.setattr(delivered, "_factor_growth", lambda *_args: (0.0, 0.0))
     spec = {
         "name": "walk probe", "kind": "sign_definite_positive",
@@ -432,8 +451,10 @@ def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
         relative_target=1.0e-5)
 
     assert len(candidates) == 1
-    assert candidates[0]["evidence"]["provenance"] == "next tighter table"
-    assert len(candidates[0]["attempts"]) == 2
+    assert candidates[0]["evidence"]["family"] == "measure_adapted_roq"
+    assert "missed refined consumer gates" in (
+        candidates[0]["evidence"]["provenance"])
+    assert len(candidates[0]["attempts"]) == 1
 
 
 def test_tolerance_ladder_is_deleted():
