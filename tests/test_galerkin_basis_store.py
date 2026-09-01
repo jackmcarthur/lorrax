@@ -21,7 +21,12 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.sharding_fit import fit_sharding
 from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
-from isdf.galerkin import GalerkinBasis, read_galerkin_basis, write_galerkin_basis
+from isdf.galerkin import (
+    GalerkinBasis,
+    read_galerkin_basis,
+    validate_galerkin_basis_publication,
+    write_galerkin_basis,
+)
 
 
 def _mesh() -> Mesh:
@@ -95,6 +100,8 @@ def test_galerkin_basis_logical_roundtrip_and_provenance(tmp_path, monkeypatch):
     basis, meta, centroids, physical = _fixture(mesh)
     path = _path(tmp_path)
     write_galerkin_basis(path, basis, **_kwargs(mesh, meta, centroids))
+    validate_galerkin_basis_publication(
+        path, basis, **_kwargs(mesh, meta, centroids))
     with pytest.raises(FileExistsError, match="immutable Galerkin"):
         write_galerkin_basis(path, basis, **_kwargs(mesh, meta, centroids))
     with h5py.File(path, "r") as h5:
@@ -127,6 +134,10 @@ def test_galerkin_basis_logical_roundtrip_and_provenance(tmp_path, monkeypatch):
             "pre-paired-k-g", dtype=np.uint8).astype(np.int32)
         del h5["galerkin_transform_scheme"]
         h5.create_dataset("galerkin_transform_scheme", data=encoded)
+    with pytest.raises(
+            ValueError, match="published Galerkin basis validation mismatch"):
+        validate_galerkin_basis_publication(
+            path, basis, **_kwargs(mesh, meta, centroids))
     with pytest.raises(ValueError, match="transform_scheme"):
         read_galerkin_basis(
             path, band_range=(4, 7), **_kwargs(mesh, meta, centroids))

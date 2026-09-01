@@ -432,6 +432,45 @@ def _basis_read_meta(io) -> dict:
     }
 
 
+def validate_galerkin_basis_publication(
+        path, basis: GalerkinBasis, *, wfn, meta, centroid_indices,
+        bispinor, rank_multiplier, qrcp_eps, qrcp_seed,
+        mesh_xy: Mesh) -> None:
+    """Collectively reopen and authenticate a newly published basis.
+
+    This validates the immutable file's completion marker, full provenance,
+    and compact-fit receipts without loading a second copy of its large array
+    payloads.  The writer has already validated the incumbent arrays and
+    completed the collective HDF5 close before making the destination visible.
+    """
+    from file_io.slab_io import SlabIO
+
+    expected = _basis_provenance(
+        wfn=wfn, meta=meta, centroid_indices=centroid_indices,
+        band_range=basis.band_range, bispinor=bispinor,
+        rank_multiplier=rank_multiplier, qrcp_eps=qrcp_eps,
+        qrcp_seed=qrcp_seed)
+    _basis_check(basis, expected)
+    with SlabIO(os.path.abspath(os.fspath(path)), mode="r", mesh=mesh_xy) as io:
+        stored = _basis_read_meta(io)
+    mismatches = [key for key in expected if stored.get(key) != expected[key]]
+    receipt_expected = {
+        "rank": int(basis.rank_physical),
+        "qrcp_raw_rank": int(basis.qrcp_raw_rank),
+        "qrcp_search_rank": int(basis.qrcp_search_rank),
+        "selected": tuple(int(n) for n in basis.selected_state_indices),
+        "candidate_hash": basis.candidate_hash,
+        "pivot_hash": basis.pivot_hash,
+    }
+    mismatches.extend(
+        key for key, value in receipt_expected.items()
+        if stored.get(key) != value)
+    if mismatches:
+        raise ValueError(
+            "published Galerkin basis validation mismatch: "
+            + ", ".join(dict.fromkeys(mismatches)))
+
+
 def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
                         bispinor, rank_multiplier, qrcp_eps, qrcp_seed,
                         mesh_xy: Mesh, extra_rank_pad: int = 0) -> GalerkinBasis:

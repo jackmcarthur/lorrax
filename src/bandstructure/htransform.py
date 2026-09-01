@@ -38,6 +38,7 @@ from isdf.galerkin import (
     fit_galerkin_basis,
     galerkin_rank_record,
     read_galerkin_basis,
+    validate_galerkin_basis_publication,
     validate_rank_multiplier,
     write_galerkin_basis,
 )
@@ -258,9 +259,14 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             centroid_indices=centroid_indices, bispinor=bispinor,
             rank_multiplier=rank_multiplier, qrcp_eps=qr_eps,
             qrcp_seed=qrcp_seed, mesh_xy=mesh_xy)
+        validate_galerkin_basis_publication(
+            os.fspath(basis_output), basis, wfn=wfn, meta=meta,
+            centroid_indices=centroid_indices, bispinor=bispinor,
+            rank_multiplier=rank_multiplier, qrcp_eps=qr_eps,
+            qrcp_seed=qrcp_seed, mesh_xy=mesh_xy)
         log_fn(
-            f"  [galerkin-restart] wrote physical rank "
-            f"{basis.rank_physical} to {basis_output}")
+            f"  [galerkin-restart] wrote and validated physical rank "
+            f"{basis.rank_physical} at {basis_output}")
     return basis
 
 
@@ -2015,6 +2021,43 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
                 fh.write(f"{ik:4d} {ib:4d} {kx: .8f} {ky: .8f} {kz: .8f} {s_coord: .8f} {energies[ik, ib]: .8f}\n")
 
 
+def _close_wfn_collectively(wfn, log_fn) -> None:
+    """Close the mesh-aware WFN loader at one rank-synchronous boundary."""
+    from common.collectives import barrier
+    barrier("htransform.outputs_written")
+    try:
+        wfn.close()
+    except Exception as exc:                                  # noqa: BLE001
+        log_fn(f"WARNING: WfnLoader.close() failed "
+               f"({type(exc).__name__}: {exc}); continuing to exit")
+
+
+def _finalize_driver_timing(*, main_started: float, pre_main: float | None,
+                            debug: bool, log_fn) -> float:
+    """Close the timing table against the process wall for either mode."""
+    import time as _time
+
+    wall = _time.perf_counter() - main_started
+    if pre_main is not None:
+        phases = {}
+        try:
+            phases = dict(RUNTIME.facts.get("elapsed", {}) or {})
+        except Exception:      # noqa: BLE001 — observability never kills a run
+            phases = {}
+        for phase, seconds in sorted(phases.items()):
+            if phase != "total":
+                timing.record(
+                    f"htransform.runtime_stack.{phase}", float(seconds))
+        timing.record(
+            "htransform.imports",
+            max(pre_main - float(phases.get("total", 0.0)), 0.0))
+        wall = pre_main + wall
+    if debug:
+        timing.report(
+            print_fn=log_fn, title="--- Timing (seconds) ---", wall=wall)
+    return wall
+
+
 def main(argv=None):
     import time as _time
     # ── The honesty row, and why these three lines exist ──────────────────
@@ -2071,6 +2114,11 @@ def main(argv=None):
     basis_group.add_argument(
         "--basis-output", default=None,
         help="Fit once and atomically publish an immutable Galerkin basis.")
+    parser.add_argument(
+        "--basis-only", action="store_true",
+        help="Fit, atomically publish, and validate --basis-output, then "
+             "exit before QP rotation, f(H), path eigensolves, and band "
+             "output.")
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
@@ -2101,6 +2149,13 @@ def main(argv=None):
              "backend's robust distributed route; batch_reshard moves q "
              "onto the mesh and runs whole-matrix local JAX linalg.")
     args = parser.parse_args(argv)
+    if args.basis_only and not args.basis_output:
+        parser.error("--basis-only requires --basis-output")
+    if args.basis_only and (args.eqp_file or args.qp_rotations):
+        parser.error(
+            "--basis-only does not consume --eqp-file or --qp-rotations")
+    if args.basis_only and args.plot:
+        parser.error("--basis-only does not produce a plot")
     input_dir = os.path.dirname(os.path.abspath(args.input))
 
     def _output_path(value: str) -> str:
@@ -2108,6 +2163,8 @@ def main(argv=None):
 
     output_path = _output_path(args.output_file)
     report_path = _output_path(args.report_file)
+    basis_output_path = (
+        _output_path(args.basis_output) if args.basis_output else None)
     _debug = debug_print_enabled()
     report = HTransformProductionReport(
         report_path, runtime=RUNTIME, debug=_debug, stdout=rank0_print)
@@ -2125,10 +2182,15 @@ def main(argv=None):
         _energy_source = (
             "diagonal quasiparticle energies from "
             f"{os.path.basename(args.eqp_file)}")
+    elif args.basis_only:
+        _energy_source = "DFT wavefunctions; basis fit only (no f(H) path)"
     else:
         _energy_source = "DFT eigenvalues from the WFN"
-    report.begin(input_file=args.input, output_file=output_path,
-                 energy_source=_energy_source)
+    report.begin(
+        input_file=args.input,
+        output_file=basis_output_path if args.basis_only else output_path,
+        energy_source=_energy_source,
+        output_label="Basis output" if args.basis_only else "Band output")
     report.architecture()
 
     params = read_cohsex_input(args.input)
@@ -2173,14 +2235,16 @@ def main(argv=None):
     mesh_xy = _build_mesh_xy()
     wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
     from distrib_la import plan as _linalg_plan
-    _fine_enabled = bool(params.get("get_centroids_fi", False))
+    _fine_enabled = (
+        bool(params.get("get_centroids_fi", False)) and not args.basis_only)
     _fine_plan = (_linalg_plan(
         "eigh", mesh_xy, backend=eigh_backend, n=None,
         batched_route=distrib_la_batched_route)
         if _fine_enabled else None)
     report.environment(
         params=params, wfn=wfn,
-        fine_plan=_fine_plan, fine_enabled=_fine_enabled)
+        fine_plan=_fine_plan, fine_enabled=_fine_enabled,
+        basis_only=args.basis_only)
 
     from common import sanity
 
@@ -2202,6 +2266,47 @@ def main(argv=None):
             distrib_la_batched_route=distrib_la_batched_route)
     _setup_progress.step()
     _setup_progress.finish()
+    if len(_centroid_records) != 1:
+        raise RuntimeError(
+            "htransform initialize_wfns did not return exactly one centroid "
+            f"closure record; got {len(_centroid_records)}.")
+    if len(_rank_records) != 1:
+        raise RuntimeError(
+            "htransform initialize_wfns did not return exactly one Galerkin "
+            f"rank record; got {len(_rank_records)}.")
+
+    if args.basis_only:
+        if not os.path.isfile(basis_output_path):
+            raise RuntimeError(
+                "--basis-only setup returned without its validated immutable "
+                f"basis output: {basis_output_path}")
+        report.sampling(
+            wfn=wfn, sym=sym, centroids=_centroid_records[0])
+        report.spectral_compression(_rank_records[0])
+        report.basis_only_result(
+            basis_file=basis_output_path,
+            rank_physical=basis.rank_physical)
+        centroid_path = params.get("centroids_file", "centroids_frac.txt")
+        centroid_path = (
+            centroid_path if os.path.isabs(centroid_path) else
+            os.path.join(input_dir, centroid_path))
+        _close_wfn_collectively(wfn, log)
+        wall = _finalize_driver_timing(
+            main_started=_t_main, pre_main=_pre_main,
+            debug=_debug, log_fn=log)
+        report.timings(timing.records(), wall=wall)
+        report.warnings()
+        report.files([
+            ("input deck", "read", args.input),
+            ("DFT wavefunctions", "read", _wfn_path),
+            ("ISDF centroids", "read", centroid_path),
+            ("Galerkin basis", "written and validated", basis_output_path),
+            ("calculation report", "written", report.path),
+        ])
+        report.finish(status="basis-only completed")
+        production_stdout.close()
+        return 0
+
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     qp_corrected_band_range = None
     if _qp_rotations_path is not None:
@@ -2237,14 +2342,6 @@ def main(argv=None):
             0.0, 20.0 * RYD_TO_EV, unit="eV", print_fn=log)
 
     kpath_data = initialize_kpath(wfn, params)
-    if len(_centroid_records) != 1:
-        raise RuntimeError(
-            "htransform initialize_wfns did not return exactly one centroid "
-            f"closure record; got {len(_centroid_records)}.")
-    if len(_rank_records) != 1:
-        raise RuntimeError(
-            "htransform initialize_wfns did not return exactly one Galerkin "
-            f"rank record; got {len(_rank_records)}.")
     report.sampling(
         wfn=wfn, sym=sym, centroids=_centroid_records[0])
     _transform_progress = LoopProgress(
@@ -2382,13 +2479,7 @@ def main(argv=None):
     # the identical shape.  ``close()`` is idempotent and nulls the handles,
     # so the later ``__del__`` becomes a no-op on every rank; at P=1 both
     # the barrier and the SlabIO collective are already no-ops.
-    from common.collectives import barrier
-    barrier("htransform.outputs_written")
-    try:
-        wfn.close()
-    except Exception as exc:                                  # noqa: BLE001
-        log(f"WARNING: WfnLoader.close() failed "
-            f"({type(exc).__name__}: {exc}); continuing to exit")
+    _close_wfn_collectively(wfn, log)
     # Close the table against the PROCESS wall, not against ``main()``'s.
     # ``_pre_main`` is everything above this function: the module body's
     # ``initialize_communicator_stack()`` (env, jax.distributed, backend init,
@@ -2398,21 +2489,9 @@ def main(argv=None):
     # ``gw_jax.py``'s epilogue, and for the same reason: recording the phases
     # AND the whole span would double-count and break the
     # "rows + (untimed) == wall" property that makes the table readable.
-    _wall = _time.perf_counter() - _t_main
-    if _pre_main is not None:
-        _phases = {}
-        try:
-            _phases = dict(RUNTIME.facts.get("elapsed", {}) or {})
-        except Exception:      # noqa: BLE001 — observability never kills a run
-            _phases = {}
-        for _phase, _secs in sorted(_phases.items()):
-            if _phase != "total":
-                timing.record(f"htransform.runtime_stack.{_phase}", float(_secs))
-        timing.record("htransform.imports",
-                      max(_pre_main - float(_phases.get("total", 0.0)), 0.0))
-        _wall = _pre_main + _wall
-    if _debug:
-        timing.report(print_fn=log, title="--- Timing (seconds) ---", wall=_wall)
+    _wall = _finalize_driver_timing(
+        main_started=_t_main, pre_main=_pre_main,
+        debug=_debug, log_fn=log)
 
     _wfn_path = params["wfn_file"]
     _wfn_path = (_wfn_path if os.path.isabs(_wfn_path) else
