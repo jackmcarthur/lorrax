@@ -128,11 +128,14 @@ def test_the_whole_public_surface_answers_with_no_lorrax():
             "import os; os.environ.setdefault('JAX_PLATFORMS', 'cpu')\n"
             "import numpy as np\n"
             "import vcoul as V\n"
-            # 34 = the prior 33-name door + the streamed bare-photon mini-BZ
-            # provider.  Bump
-            # this count IN THE SAME COMMIT as any door change — a stale
-            # pin here reads as an isolation break and is not one.
-            "assert len(V.__all__) == 34, V.__all__\n"
+            # 44 = the 42-name door at `837ed531` plus this lane's two slab
+            # q->0 rule names.  MEASURED, not incremented: the pin read 34
+            # against a 42-name door at that base, so this cell was already
+            # red before the rule change and its message ("isolation break")
+            # was wrong about why.  Bump this count IN THE SAME COMMIT as any
+            # door change — a stale pin here reads as an isolation break and
+            # is not one.
+            "assert len(V.__all__) == 44, V.__all__\n"
             "for _n in V.__all__:\n"
             "    assert hasattr(V, _n), _n\n"
             "class W:\n"
