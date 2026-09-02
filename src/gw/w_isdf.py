@@ -2089,6 +2089,7 @@ def compute_static_photon_response(
     energy_reference=0.0,
     dyson_solver: str = "distributed",
     distrib_la_batched_route: str = "auto",
+    print_fn=print,
 ) -> StaticPhotonResponse:
     """Build the packed static photon body and complete its Gamma cell.
 
@@ -2104,6 +2105,12 @@ def compute_static_photon_response(
     behind a DEBUG banner and is not a production setting (owner ruling
     2026-09-01).  The current q^2/contact/complement terms are omitted by
     model in either case.
+
+    ``print_fn`` is the driver's rank-zero printer.  In production mode the
+    driver sinks ordinary component chatter, so the DEBUG banner below
+    carries a WARNING token (retained in the run record's warning block)
+    and the driver copies the completion / Hall status into its
+    ``Photon head`` record line from the returned ``head_completion``.
     """
     from .gw_config import (
         BispinorGWMode, HeadCorrection, coerce_bispinor_gw_mode)
@@ -2168,13 +2175,13 @@ def compute_static_photon_response(
                 wfn_fingerprint_binding=wfn_fingerprint_binding,
             )
             if jax.process_index() == 0:
-                print(
+                print_fn(
                     "  [photon head] Hall term: sigma_H = "
                     f"{np.asarray(jax.device_get(hall.sigma_H)).tolist()} "
                     f"bohr^-1 from authenticated {hall_path}",
                     flush=True)
         elif jax.process_index() == 0:
-            print(
+            print_fn(
                 "  [photon head] Hall term: sigma_H = 0 (no "
                 f"static_gauge_hall_file at {hall_path}).  For a "
                 "Chern-trivial insulator the static Hall coefficient is "
@@ -2182,9 +2189,10 @@ def compute_static_photon_response(
                 "--static-gauge-hall-only to include a measured value.",
                 flush=True)
     elif jax.process_index() == 0:
-        print(
+        print_fn(
             "\n  ==========================================================\n"
-            "  DEBUG: Gamma-cell head disabled by head_correction=off\n"
+            "  WARNING -- DEBUG: Gamma-cell head disabled by "
+            "head_correction=off\n"
             "  The packed static photon V and W keep a ZERO q=Gamma, G=0\n"
             "  slot: no bare <D> insertion, no charge S00/wing head, no\n"
             "  Hall term.  This is a brute-force k-grid convergence /\n"
@@ -2204,7 +2212,7 @@ def compute_static_photon_response(
             reader.get_tile, reader.n_q_total, layout, mesh_xy)
 
     if jax.process_index() == 0:
-        print(
+        print_fn(
             "  [photon response] DECLARED no-pair model "
             "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
             "j=c*Psi^dagger*alpha*Psi; bubble-screened "
@@ -2281,7 +2289,7 @@ def compute_static_photon_response(
         sanity.refuse_nonfinite(
             "Gamma-completed static photon W", W_packed)
         if jax.process_index() == 0:
-            print(
+            print_fn(
                 "  [photon head] Gamma-cell completion applied: bare <D> "
                 "into V, charge S00/wing head into W; hall_source="
                 f"{response.hall_source}; ward={head_completion.ward_residual:.3e}, "

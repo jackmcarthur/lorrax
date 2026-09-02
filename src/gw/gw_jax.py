@@ -653,7 +653,8 @@ def main(argv=None):
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
-						config.backend.distrib_la_batched_route))
+						config.backend.distrib_la_batched_route),
+					print_fn=print0)
 				# Sigma consumes packed block views directly.  Do not extract a
 				# scalar W00 body solely to satisfy the legacy role mapping.
 				W_by_role = {}
@@ -663,6 +664,24 @@ def main(argv=None):
 					f"current_model={photon_response.current_model}, "
 					f"current_contact={photon_response.current_contact}, "
 					f"packed_extent={photon_response.layout.packed_extent}")
+				# The run record (gwjax.out) must state the Gamma-cell status
+				# of the packed mode in production mode, where print0 sinks
+				# component chatter (owner ruling 2026-09-01: a headless
+				# packed run is a DEBUG setting and must say so).
+				_hc = photon_response.head_completion
+				report.progress(
+					"Photon head    : "
+					+ ("DEBUG: Gamma-cell head disabled by head_correction=off "
+					   "(headless packed body; NOT a production calculation)"
+					   if _hc is None else
+					   "Gamma-cell completion applied (bare <D> into V, "
+					   "charge S00/wing head into W); "
+					   f"hall_source={_hc.hall_source}; "
+					   f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
+					   f"ward={_hc.ward_residual:.3e}; "
+					   f"hermiticity={_hc.hermiticity_residual:.3e}; "
+					   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
+					   f"cubature_orders={_hc.observed_physical_counts}"))
 			else:
 				W_by_role = compute_screening_model(
 					mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
