@@ -1664,6 +1664,71 @@ def _uniform_rule_eps():
     return eps
 
 
+def _rule_cache_dir():
+    """Directory of cached box rules, or None (``LORRAX_UNIFORM_RULE_CACHE``).
+
+    A box rule is a function of ``(box, eps, currency)`` only, so it can be
+    reused by any window of any deck whose box lies INSIDE a cached box:
+    a sup bound on a superset holds on the subset.  Lookup is by containment,
+    not by key, and rules are built on a box widened outward by 3 % so the
+    small drifts of an SC loop (state energies move by meV, the box by less
+    than 1 %) keep hitting.  Files are one ``.npz`` per rule, written by the
+    rank that built it (distinct names, atomic rename), read by every rank.
+    Tempting, and why not: key the cache on the exact box -- an SC iteration
+    or a different omega grid never hits it; a 3 % wider box costs ~3 % of
+    the crossing nodes once and nothing after."""
+    value = os.environ.get("LORRAX_UNIFORM_RULE_CACHE", "").strip()
+    return value or None
+
+
+def _rule_cache_lookup(directory, box, eps, relative):
+    """Smallest-node cached rule whose box contains ``box`` at this eps."""
+    try:
+        names = [n for n in os.listdir(directory) if n.endswith(".npz")]
+    except OSError:
+        return None
+    best = None
+    for name in names:
+        try:
+            with np.load(os.path.join(directory, name)) as z:
+                if (abs(float(z["eps"]) - float(eps)) > 1e-12 * float(eps)
+                        or bool(z["relative"]) != bool(relative)):
+                    continue
+                b = z["box"]
+                if not (b[0] <= box[0] and b[1] >= box[1]
+                        and b[2] <= box[2] and b[3] >= box[3]):
+                    continue
+                times, weights = np.asarray(z["times"]), np.asarray(z["weights"])
+                if best is None or times.size < best[0].size:
+                    best = (times, weights, tuple(float(x) for x in b),
+                            float(z["sup_error"]), float(z["kappa_max"]),
+                            float(z["theta_deg"]), int(z["rank"]), name)
+        except (OSError, KeyError, ValueError):
+            continue
+    return best
+
+
+def _rule_cache_store(directory, rule):
+    """Write one rule; the name is a digest of its (box, eps, currency)."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        key = hashlib.sha256(json.dumps(
+            [list(rule.box), float(rule.eps), bool(rule.relative)]).encode()).hexdigest()[:16]
+        path = os.path.join(directory, f"rule_{key}.npz")
+        if os.path.exists(path):
+            return
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as handle:        # a handle keeps savez from appending .npz
+            np.savez(handle, box=np.asarray(rule.box, np.float64), eps=float(rule.eps),
+                     relative=bool(rule.relative), times=rule.times, weights=rule.weights,
+                     sup_error=float(rule.sup_error), kappa_max=float(rule.kappa_max),
+                     theta_deg=float(rule.theta_deg), rank=int(rule.rank),
+                     seconds=float(rule.seconds))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
                            relative_target):
     """Box rule for one product window: ``(candidate_or_None, metrics)``.
@@ -1757,8 +1822,30 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     if os.environ.get("LORRAX_UNIFORM_RULE_TRACE"):
         print(f"[uniform-box] {spec.get('name', '?')} support_re={support} "
               f"widened_re={(re_lo, re_hi)} box={box} (Ry)")
-    rule = build_uniform_rule(
-        box, float(eps), time_budget=_uniform_rule_budget())
+    from minimax.uniform_rule import UniformRule  # noqa: PLC0415
+    cache_dir = _rule_cache_dir()
+    relative = box[0] > 0.0 or box[1] < 0.0
+    cache_status = "off"
+    hit = _rule_cache_lookup(cache_dir, box, float(eps), relative) if cache_dir else None
+    if hit is not None:
+        times_c, weights_c, box_c, sup_c, kappa_c, theta_c, rank_c, name_c = hit
+        rule = UniformRule(times=times_c, weights=weights_c, box=box_c, eps=float(eps),
+                           relative=relative, theta_deg=theta_c, rank=rank_c,
+                           sup_error=sup_c, kappa_max=kappa_c, seconds=0.0)
+        cache_status = f"hit:{name_c}"
+    else:
+        if cache_dir:
+            # build on a box 3 % wider (outward, never across zero) so that
+            # nearby requests are contained by what gets stored
+            extra = 0.03 * max(box[1] - box[0], float(eta))
+            lo_c = box[0] - extra if box[0] <= 0.0 else max(box[0] - extra, 0.7 * box[0])
+            hi_c = box[1] + extra if box[1] >= 0.0 else min(box[1] + extra, 0.7 * box[1])
+            box = (lo_c, hi_c, box[2] / 1.03, box[3] * 1.03)
+        rule = build_uniform_rule(
+            box, float(eps), time_budget=_uniform_rule_budget())
+        if cache_dir:
+            _rule_cache_store(cache_dir, rule)
+            cache_status = "miss"
     times, weights = rule.times, rule.weights
     if conjugate:
         times, weights = -np.conj(times), np.conj(weights)
@@ -1806,6 +1893,7 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     evidence["incumbent_residual_gate"] = bool(
         _rule_accepted(metrics, gate_target))
     evidence["criterion"] = "relative" if rule.relative else "peak-relative"
+    evidence["rule_cache"] = cache_status
     if (rule.sup_error > float(eps) or not noise_ok
             or max(factor) > float(factor_growth_cap)):
         return None, metrics
