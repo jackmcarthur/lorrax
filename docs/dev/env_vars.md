@@ -11,6 +11,13 @@ First generated 2026-07-25 from an audit of every `os.environ` /
 reorganized 2026-07-27 (workstream AV) around the rule the campaign keeps
 re-learning (QUALITY_PATTERNS #8):
 
+Re-audited 2026-09-02 against the bounded Python roots `src/gw`,
+`src/common`, `src/centroid`, `src/file_io`, and `services/*/src`. The grep
+found 95 read-site lines; every literal spelling is represented below.
+Fallback aliases remain grouped with their owner rows—notably
+`LORRAX_PHDF5_STRIPE_SIZE` under `LORRAX_PHDF5_STRIPE_SIZE_FS`, and
+`JAX_NUM_PROCESSES` in the process-count fallback chain.
+
 > **Environment may grant capability; it must not silently select
 > policy.**  Physics- and routing-relevant choices change only via
 > declared inputs (the input file), where they are parsed, validated,
@@ -485,7 +492,8 @@ them inside the running Python does nothing.
 ## Consistency audit
 
 Every LORRAX-owned variable read at more than one site was checked for
-default drift (re-checked 2026-07-27).
+default drift (re-checked 2026-07-27; bounded Python roots re-checked
+2026-09-02).
 
 > **WHAT THIS AUDIT DOES NOT CHECK, and what that cost (2026-07-30).**  It
 > compares the **default** each site falls back to.  It does not look at the

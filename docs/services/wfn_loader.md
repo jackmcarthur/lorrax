@@ -28,6 +28,14 @@ The package is the door. `import wfn_loader` and use top-level names;
 `from wfn_loader.loader import …` from lorrax is a layering failure
 (`tests/test_layering.py`, with a red twin).
 
+`kweights` has one value per raw WFN k row. The loader validates only its
+storage contract—shape `(nkpts,)`, finite nonnegative values, and a positive
+sum—and preserves the values. It does not infer whether those rows are an IBZ
+wedge or the complete grid and does not spread weights over stars. Consumers
+that need full-grid quadrature make that distinction against authenticated
+symmetry metadata; the centroid implementation is
+`centroid.sampling_metric.full_k_quadrature_weights`.
+
 The transitional shim that used to sit at `src/file_io/wfn_loader.py` is
 gone: the phase-wide cleanup commit deleted it along with the other four
 wave-1 shims, and nothing aliases it back, so `from file_io.wfn_loader
