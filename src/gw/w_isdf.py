@@ -1201,7 +1201,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                                 n_rmu_logical: int,
-                                distrib_la_batched_route: str = "auto"):
+                                distrib_la_batched_route: str = "batch_reshard"):
     """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded.
 
     The DISTRIBUTED plan — the scale-out route for thousands of
@@ -1425,7 +1425,7 @@ def _w_solve_pref_scalar(meta) -> float:
 
 
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
-                        distrib_la_batched_route: str = "auto"):
+                        distrib_la_batched_route: str = "batch_reshard"):
     """Return ``(solve_fn, pref)`` for the requested W plan.
 
     Single source of truth for the two-plan dispatch.  Both ``solve_w``
@@ -1467,7 +1467,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
 
 
 def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
-            distrib_la_batched_route: str = "auto"):
+            distrib_la_batched_route: str = "batch_reshard"):
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
@@ -1930,7 +1930,7 @@ def compute_static_photon_response(
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
     dyson_solver: str = "distributed",
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
     print_fn=print,
 ) -> StaticPhotonResponse:
     """Build the packed static photon body and complete its Gamma cell.
@@ -3413,7 +3413,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
 
 
 def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
-                       distrib_la_batched_route: str = "auto"):
+                       distrib_la_batched_route: str = "batch_reshard"):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
     Goes through the same ``_resolve_w_solve_fn`` dispatch as

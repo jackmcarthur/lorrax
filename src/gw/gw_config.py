@@ -1221,12 +1221,16 @@ def eigh_backend_choices() -> tuple:
     return tuple(BACKEND_CHOICES["eigh"])
 
 
+DISTRIB_LA_BATCHED_ROUTE_DEFAULT = "batch_reshard"
+
+
 def distrib_la_batched_route_choices() -> tuple[str, ...]:
     """User-facing batch-route vocabulary from the ``distrib_la`` door.
 
-    ``auto`` preserves the resolved backend's established scan/stacked-FFI
-    route.  ``batch_reshard`` moves the batch axis onto the device mesh and
-    runs the service's local JAX kernel on whole per-device matrices.  Keep
+    ``batch_reshard`` is the shipping default: it moves the batch axis onto
+    the device mesh and runs the service's local JAX kernel on whole
+    per-device matrices. ``auto`` explicitly restores the resolved
+    backend's scan/stacked-FFI route. Keep
     this resolver beside :func:`eigh_backend_choices`: deck and CLI parsers
     must not grow frozen copies of a service-owned vocabulary.
     """
@@ -1251,9 +1255,12 @@ def resolve_distrib_la_batched_route(
     drivers allocate a matrix.
     """
     raw = (override if override is not None else
-           (params.get("distrib_la_batched_route", "auto")
-            if hasattr(params, "get") else "auto"))
-    route = str("auto" if raw is None else raw).strip().lower()
+           (params.get("distrib_la_batched_route",
+                       DISTRIB_LA_BATCHED_ROUTE_DEFAULT)
+            if hasattr(params, "get")
+            else DISTRIB_LA_BATCHED_ROUTE_DEFAULT))
+    route = str(DISTRIB_LA_BATCHED_ROUTE_DEFAULT
+                if raw is None else raw).strip().lower()
     choices = distrib_la_batched_route_choices()
     if route not in choices:
         raise ValueError(
@@ -1261,6 +1268,18 @@ def resolve_distrib_la_batched_route(
             f"{' / '.join(choices)}.")
     if (route == "batch_reshard" and hasattr(params, "get")
             and bool(params.get("use_low_mem_eigh", False))):
+        named = params.get(_DECK_NAMED_KEYS, None)
+        route_was_named = (
+            override is not None
+            or ("distrib_la_batched_route" in named
+                if named is not None
+                else "distrib_la_batched_route" in params))
+        if not route_was_named:
+            # ``use_low_mem_eigh`` says whole-tile residency is unsafe. This
+            # is the one uncertified envelope for the shipping staged route;
+            # preserve the face-sharded provider/scan path unless the deck
+            # explicitly contradicts itself.
+            return "auto"
         raise ValueError(
             "distrib_la_batched_route='batch_reshard' contradicts "
             "use_low_mem_eigh=true: batch_reshard places one complete "
@@ -1774,13 +1793,13 @@ _DEFAULTS = {
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
     # Universal schedule for every array-returning ``distrib_la.Plan.batched``
-    # call.  ``auto`` preserves the robust distributed/backend-batched route
-    # selected by each plan.  ``batch_reshard`` is the small-matrix/high-HBM
-    # opt-in: P(None,'x','y') -> P(('x','y'),None,None), local JAX linalg on
+    # call. ``batch_reshard`` is the certified small-matrix/high-HBM default:
+    # P(None,'x','y') -> P(('x','y'),None,None), local JAX linalg on
     # each device's whole matrices, then the inverse reshard.  Backend
     # resolution and the Plan I/O contract stay unchanged; this explicit
     # route runs the local JAX kernel in place of that backend for the call.
-    "distrib_la_batched_route": "auto",
+    # Explicit ``auto`` restores the face-sharded provider/scan route.
+    "distrib_la_batched_route": DISTRIB_LA_BATCHED_ROUTE_DEFAULT,
     #   eigh_backend = auto | off | distributed | cusolvermp | slate
     #                | scalapack
     #       Hermitian eigensolver for the BSE/htransform distributed-eigh

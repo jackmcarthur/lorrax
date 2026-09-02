@@ -100,7 +100,8 @@ def main():
     A_j = jax.make_array_from_callback(A.shape, stack_sh, lambda idx: A[idx])
 
     # ---- 1. the native path is untouched --------------------------------
-    W_off, Z_off = dispatch_batched_eigh(A_j, mesh, "off")
+    W_off, Z_off = dispatch_batched_eigh(
+        A_j, mesh, "off", batched_route="auto")
     W_nat, Z_nat = jnp.linalg.eigh(A_j)
     ok1 = (float(jnp.max(jnp.abs(W_off - W_nat))) == 0.0
            and float(jnp.max(jnp.abs(Z_off - Z_nat))) == 0.0)
@@ -108,9 +109,11 @@ def main():
        f"{'PASS' if ok1 else 'FAIL'}")
 
     # ---- 2. batched vs serial -------------------------------------------
-    W_b, Z_b = dispatch_batched_eigh(A_j, mesh, "distributed")
+    W_b, Z_b = dispatch_batched_eigh(
+        A_j, mesh, "distributed", batched_route="auto")
     W_s, Z_s = dispatch_batched_eigh(A_j, mesh, "distributed",
-                                     _force_serial=True)
+                                      batched_route="auto",
+                                      _force_serial=True)
     d_W = _rel(np.asarray(W_s), np.asarray(W_b))          # W is replicated
     # Z is sharded and NOT gauge-invariant across MESHES, but these two
     # calls ran on the SAME mesh, so a per-shard comparison is legitimate.
@@ -166,7 +169,9 @@ def main():
 
     _planmod.resolve_backend = _counting
     try:
-        dispatch_batched_eigh(A_j, mesh, "distributed", _force_serial=True)
+        dispatch_batched_eigh(
+            A_j, mesh, "distributed", batched_route="auto",
+            _force_serial=True)
     finally:
         _planmod.resolve_backend = _orig
     ok5 = len(seen) == 1
@@ -178,13 +183,15 @@ def main():
     if px > 1 or py > 1:
         bad = jnp.zeros((2, N + 1, N + 1), dtype=jnp.complex128)
         try:
-            dispatch_batched_eigh(bad, mesh, "distributed")
+            dispatch_batched_eigh(
+                bad, mesh, "distributed", batched_route="auto")
         except ValueError as exc:
             ok6a = "divisible" in str(exc)
     else:
         ok6a = True                     # no divisibility rule on a 1x1 mesh
     try:
-        dispatch_batched_eigh(A_j, mesh, "cusolvermp")
+        dispatch_batched_eigh(
+            A_j, mesh, "cusolvermp", batched_route="auto")
     except (ValueError, RuntimeError) as exc:
         ok6b = "CUDA-only" in str(exc) or "not usable" in str(exc)
     ok6 = ok6a and ok6b
@@ -245,7 +252,8 @@ def scan_probe():
         p0("[scan] 3. COMPILE ok")
         stage = "run"
         W_s, _ = exe(A_j)
-        W_ref, _ = dispatch_batched_eigh(A_j, mesh, "distributed")
+        W_ref, _ = dispatch_batched_eigh(
+            A_j, mesh, "distributed", batched_route="auto")
         W_nat, _ = jnp.linalg.eigh(A_j)
         d_ffi = _rel(np.asarray(W_s), np.asarray(W_ref))
         # DISTINCTNESS: the scan result matching the FFI result proves

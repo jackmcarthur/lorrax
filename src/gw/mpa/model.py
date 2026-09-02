@@ -138,7 +138,7 @@ def _solve_wc(
     wfn=None,
     config=None,
     print_fn=print,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
 ):
     """THE DEFAULT ``wc_source``: Wc(z) = W(z) - V from the sampled chi.
 
@@ -597,7 +597,7 @@ def build_mpa_fit(
             config=config,
             print_fn=print_fn,
             distrib_la_batched_route=getattr(
-                config.backend, "distrib_la_batched_route", "auto"),
+                config.backend, "distrib_la_batched_route", "batch_reshard"),
         )
     else:
         if iteration_head_response is not None:

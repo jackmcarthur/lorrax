@@ -431,7 +431,7 @@ def compute_static_w(
                                    distrib_la_batched_route=(
                                        getattr(config.backend,
                                                "distrib_la_batched_route",
-                                               "auto")))
+                                               "batch_reshard")))
             if (head_channel is None
                     or str(getattr(head_channel, "mode", "off")) == "off"):
                 with timing.section(
@@ -443,7 +443,7 @@ def compute_static_w(
                         dyson_solver=config.backend.w_dyson_solver,
                         distrib_la_batched_route=(
                             getattr(config.backend,
-                                    "distrib_la_batched_route", "auto")))
+                                    "distrib_la_batched_route", "batch_reshard")))
                     # χ₀ is donated inside solve_w — the reference is
                     # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
                     del chi0_q_solve
@@ -482,14 +482,14 @@ def compute_static_w(
                         dyson_solver=config.backend.w_dyson_solver,
                         distrib_la_batched_route=(
                             getattr(config.backend,
-                                    "distrib_la_batched_route", "auto")))
+                                    "distrib_la_batched_route", "batch_reshard")))
                     del V_body_solve
                     W_bare = solve_w(
                         V_bare_solve, chi0_q_solve, meta, mesh_xy,
                         dyson_solver=config.backend.w_dyson_solver,
                         distrib_la_batched_route=(
                             getattr(config.backend,
-                                    "distrib_la_batched_route", "auto")))
+                                    "distrib_la_batched_route", "batch_reshard")))
                     del chi0_q_solve, V_bare_solve
                     W_q_solve = _hc.combine_head_channel(
                         W_body0, W_bare, head_channel, q_index=q_idx)

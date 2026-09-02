@@ -108,8 +108,9 @@ def test_native2d_factorizes_like_numpy(n, dtype):
     mesh = _mesh(2, 2)
     rng = np.random.default_rng(3)
     A = _hpd(rng, 3, n, dtype)
-    L = np.asarray(D.plan("cholesky", mesh, backend="native2d",
-                          n=n).batched(_put(A, mesh, (None, "x", "y"))))
+    L = np.asarray(D.plan(
+        "cholesky", mesh, backend="native2d", n=n,
+        batched_route="auto").batched(_put(A, mesh, (None, "x", "y"))))
     assert L.shape == A.shape and L.dtype == A.dtype
     recon = _rel(L @ np.conj(np.swapaxes(L, -1, -2)), A)
     vs_np = _rel(np.tril(L), np.linalg.cholesky(A))
@@ -124,7 +125,9 @@ def test_native2d_is_bit_deterministic_on_a_rerun():
     mesh = _mesh(2, 2)
     rng = np.random.default_rng(5)
     A = _put(_hpd(rng, 2, 16, "complex128"), mesh, (None, "x", "y"))
-    p = D.plan("cholesky", mesh, backend="native2d", n=16)
+    p = D.plan(
+        "cholesky", mesh, backend="native2d", n=16,
+        batched_route="auto")
     assert np.array_equal(np.asarray(p.batched(A)), np.asarray(p.batched(A)))
 
 
@@ -199,7 +202,9 @@ def test_a_nondividing_extent_survives_identity_padding(case):
     for i in range(n_log, n_pad):
         A_pad[:, i, i] = 1.0
 
-    L = np.asarray(D.plan("cholesky", mesh, backend="native2d", n=n_pad)
+    L = np.asarray(D.plan(
+        "cholesky", mesh, backend="native2d", n=n_pad,
+        batched_route="auto")
                    .batched(_put(A_pad, mesh, (None, "x", "y"))))
     assert L.shape == (nq, n_pad, n_pad)
 
@@ -230,7 +235,9 @@ def test_the_padding_check_can_fail():
     A_log = _hpd(rng, nq, n_log, "complex128")
     A_bad = np.zeros((nq, n_pad, n_pad), "complex128")
     A_bad[:, :n_log, :n_log] = A_log        # NO identity on the pad diagonal
-    L = np.asarray(D.plan("cholesky", mesh, backend="native2d", n=n_pad)
+    L = np.asarray(D.plan(
+        "cholesky", mesh, backend="native2d", n=n_pad,
+        batched_route="auto")
                    .batched(_put(A_bad, mesh, (None, "x", "y"))))
     pad = L[:, n_log:, n_log:]
     assert not np.array_equal(pad, np.broadcast_to(
@@ -263,9 +270,13 @@ def test_native2d_agrees_between_a_1x1_and_a_2x2_mesh():
     rng = np.random.default_rng(17)
     for n in (8, 16, 32):
         A = _hpd(rng, 2, n, "complex128")
-        L1 = np.asarray(D.plan("cholesky", mesh1, backend="native2d", n=n)
+        L1 = np.asarray(D.plan(
+            "cholesky", mesh1, backend="native2d", n=n,
+            batched_route="auto")
                         .batched(_put(A, mesh1, (None, "x", "y"))))
-        L4 = np.asarray(D.plan("cholesky", mesh4, backend="native2d", n=n)
+        L4 = np.asarray(D.plan(
+            "cholesky", mesh4, backend="native2d", n=n,
+            batched_route="auto")
                         .batched(_put(A, mesh4, (None, "x", "y"))))
         rel = _rel(L4, L1)
         assert rel < RTOL, f"n={n}: 1x1 vs 2x2 rel {rel:.3e}"
@@ -283,9 +294,11 @@ def test_native_eigh_agrees_between_a_1x1_and_a_2x2_mesh():
     mesh1, mesh4 = _mesh(1, 1), _mesh(2, 2)
     rng = np.random.default_rng(19)
     A = _hpd(rng, 2, 16, "complex128")
-    W1, _ = D.plan("eigh", mesh1, backend="off").batched(
+    W1, _ = D.plan(
+        "eigh", mesh1, backend="off", batched_route="auto").batched(
         _put(A, mesh1, (None, "x", "y")))
-    W4, _ = D.plan("eigh", mesh4, backend="off").batched(
+    W4, _ = D.plan(
+        "eigh", mesh4, backend="off", batched_route="auto").batched(
         _put(A, mesh4, (None, "x", "y")))
     assert np.array_equal(np.asarray(W1), np.asarray(W4))
     assert _rel(np.asarray(W4), np.linalg.eigvalsh(A)) < 1e-10
@@ -305,7 +318,9 @@ def test_native_eigh_recovers_a_padded_spectrum_on_a_2x2():
     for i in range(n_log, n_pad):
         A_pad[i, i] = 1.0
     assert n_pad > n_log                      # the pad is not vacuous
-    W, _ = D.plan("eigh", mesh, backend="off")(_put(A_pad, mesh, ("x", "y")))
+    W, _ = D.plan(
+        "eigh", mesh, backend="off", batched_route="auto")(
+            _put(A_pad, mesh, ("x", "y")))
     W = np.sort(np.asarray(W))
     want = np.sort(np.concatenate(
         [np.linalg.eigvalsh(A_log), np.ones(n_pad - n_log)]))
@@ -325,7 +340,9 @@ def test_native_fn_is_traceable_and_matches_the_eager_call():
     mesh = _mesh(2, 2)
     rng = np.random.default_rng(29)
     A = _put(_hpd(rng, 2, 16, "complex128"), mesh, (None, "x", "y"))
-    p = D.plan("cholesky", mesh, backend="native2d", n=16)
+    p = D.plan(
+        "cholesky", mesh, backend="native2d", n=16,
+        batched_route="auto")
     eager = np.asarray(p.batched(A))
     jitted = np.asarray(jax.jit(p.native_fn)(A))
     assert np.array_equal(eager, jitted), (
@@ -409,7 +426,8 @@ def _stand_in_plan(monkeypatch, op, backend, mesh, module):
     return pm.Plan(op=op, requested=backend, backend=backend, mesh=mesh,
                    n=None,
                    in_sharding=NamedSharding(mesh, P("x", "y")),
-                   batch_in_sharding=NamedSharding(mesh, P(None, "x", "y")))
+                   batch_in_sharding=NamedSharding(mesh, P(None, "x", "y")),
+                   requested_batched_route="auto")
 
 
 def _eigh_stand_in(calls, raw_layout=False):

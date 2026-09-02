@@ -1293,7 +1293,7 @@ def _to_host(x):
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                    eigh_backend: str = "auto", q_chunk: int = 48,
-                   distrib_la_batched_route: str = "auto",
+                   distrib_la_batched_route: str = "batch_reshard",
                    keep_host_mirrors: bool = True, degrees=None,
                    fit_ecut=None):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
@@ -2061,7 +2061,7 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
 def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None,
                        *, zeta_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
                        eigh_backend="auto", head_minibz_average=False,
-                       distrib_la_batched_route: str = "auto",
+                       distrib_la_batched_route: str = "batch_reshard",
                        run_diagnostics=True, log_fn=print, fit_ecut=None):
     """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
 
@@ -3175,7 +3175,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
             band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
             return_coeffs=True,
             distrib_la_batched_route=rst.get(
-                "distrib_la_batched_route", "auto"))
+                "distrib_la_batched_route", "batch_reshard"))
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
 

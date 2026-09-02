@@ -203,7 +203,7 @@ def fit_zeta_to_h5(
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_solve: str = "ridge",
     transverse_zeta_rcond: float = TRANSVERSE_ZETA_RCOND_DEFAULT,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,

@@ -171,7 +171,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              basis_input: str | None = None,
                              basis_output: str | None = None,
                              progress_fn=None, rank_record_fn=None,
-                             distrib_la_batched_route: str = "auto"):
+                             distrib_la_batched_route: str = "batch_reshard"):
     """Resolve htransform policy around the reusable Galerkin fit service.
 
     Input and output are deliberately distinct: a requested restart may not

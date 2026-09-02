@@ -996,7 +996,7 @@ def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
         return distributed_eigh_bands(
             H, mesh=mesh_xy, distrib_la_backend="distributed",
             distrib_la_batched_route=getattr(
-                backend_config, "distrib_la_batched_route", "auto"))
+                backend_config, "distrib_la_batched_route", "batch_reshard"))
     if kind == "native":
         return distributed_eigh_bands(
             H, mesh=mesh_xy, distrib_la_backend="off",

@@ -593,6 +593,13 @@ def main(argv=None):
 			"produced (Σ^B would be silently dropped).  Check "
 			"centroids_file_current and, on restart, that the restart "
 			"file carries psi_full_y_transverse.")
+	report.batched_linalg(
+		config=config,
+		n_charge=isdf.n_rmu_charge_logical,
+		n_current=isdf.n_rmu_transverse_logical,
+		nq=meta.nk_tot,
+		processes=RUNTIME.process_count,
+	)
 	bispinor_v_q_path = (
 		os.path.join(tmp_dir, 'v_q_bispinor.h5')
 		if wfns_transverse is not None else None

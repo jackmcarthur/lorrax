@@ -4017,6 +4017,10 @@ def prepare_isdf_and_wavefunctions(
 		# deliberately separate from the primary Wavefunctions pytree so head,
 		# Sigma, density and output kernels cannot inherit unused large inputs.
 		green_parent_carrier=green_parent_carrier,
+		n_rmu_charge_logical=int(meta.n_rmu),
+		n_rmu_transverse_logical=(
+			int(transverse_basis_receipt.n_rmu_logical)
+			if transverse_basis_receipt is not None else 0),
 		# The exact loaded-WFN identity was already scanned while binding the
 		# charge/transverse basis receipts.  Keep that opaque host proof at the
 		# orchestration seam so later artifact gates cannot reopen/resample the

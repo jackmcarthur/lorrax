@@ -19,7 +19,12 @@ def test_deck_route_defaults_normalizes_and_refuses_unknown(tmp_path):
     bare = tmp_path / "bare.in"
     bare.write_text("[cohsex]\n")
     assert resolve_distrib_la_batched_route(
-        read_lorrax_input(str(bare))) == "auto"
+        read_lorrax_input(str(bare))) == "batch_reshard"
+
+    low_mem = tmp_path / "low_mem.in"
+    low_mem.write_text("[cohsex]\nuse_low_mem_eigh = true\n")
+    assert resolve_distrib_la_batched_route(
+        read_lorrax_input(str(low_mem))) == "auto"
 
     opted = tmp_path / "opted.in"
     opted.write_text(
@@ -43,10 +48,13 @@ def test_deck_vocabulary_is_the_service_vocabulary():
     from ffi import _services
     _services.ensure_on_path()
     from distrib_la import BATCHED_ROUTE_CHOICES
-    from gw.gw_config import distrib_la_batched_route_choices
+    from distrib_la import BATCHED_ROUTE_DEFAULT
+    from gw.gw_config import (DISTRIB_LA_BATCHED_ROUTE_DEFAULT,
+                              distrib_la_batched_route_choices)
 
     assert distrib_la_batched_route_choices() == tuple(BATCHED_ROUTE_CHOICES)
     assert tuple(BATCHED_ROUTE_CHOICES) == ("auto", "batch_reshard")
+    assert BATCHED_ROUTE_DEFAULT == DISTRIB_LA_BATCHED_ROUTE_DEFAULT
 
 
 def test_every_direct_plan_batched_site_selects_at_plan_construction():
@@ -140,8 +148,8 @@ def test_exciton_cli_override_reaches_refit_htransform_calls():
 def test_gwjax_routes_reach_zeta_w_and_qsgw_callers():
     checks = {
         "src/gw/gw_init.py": "cfg.backend.distrib_la_batched_route",
-        "src/gw/screening.py": '"distrib_la_batched_route", "auto"',
-        "src/gw/sc_iteration.py": '"distrib_la_batched_route", "auto"',
+        "src/gw/screening.py": '"distrib_la_batched_route", "batch_reshard"',
+        "src/gw/sc_iteration.py": '"distrib_la_batched_route", "batch_reshard"',
     }
     for rel, needle in checks.items():
         assert needle in (ROOT / rel).read_text(), f"{rel} drops {needle}"

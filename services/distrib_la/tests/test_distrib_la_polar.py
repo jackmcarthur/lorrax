@@ -239,13 +239,13 @@ def test_polar_planning_delegates_once_to_eigh_at_twice_the_extent(
         backend = "scalapack"
         is_native = False
 
-    def fake_plan(op, got_mesh, *, backend, n):
-        calls.append((op, got_mesh, backend, n))
+    def fake_plan(op, got_mesh, *, backend, n, batched_route):
+        calls.append((op, got_mesh, backend, n, batched_route))
         return _EighPlan()
 
     monkeypatch.setattr(module, "plan", fake_plan)
     operation = D.plan_polar_factor(mesh, n=8)
-    assert calls == [("eigh", mesh, "distributed", 16)]
+    assert calls == [("eigh", mesh, "distributed", 16, "auto")]
     assert operation.backend == "scalapack"
 
 
