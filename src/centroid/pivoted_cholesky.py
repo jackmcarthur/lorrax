@@ -1199,6 +1199,22 @@ def _gram_meta_band_counts(wfn_nelec: int, max_band: int,
     return occupied, int(max_band) - occupied
 
 
+def _band_window_slice(outer: tuple[int, int],
+                       inner: tuple[int, int]) -> slice | None:
+    """Return the local band slice when ``inner`` is contained in ``outer``."""
+    if outer[0] <= inner[0] and inner[1] <= outer[1]:
+        return slice(inner[0] - outer[0], inner[1] - outer[0])
+    return None
+
+
+def _slice_centroid_wfn_faces(psi_rmu_Y, psi_rmuT_X, band_slice: slice):
+    """Slice the replicated band axis in the canonical Y/X WFN faces."""
+    return (
+        psi_rmu_Y[:, band_slice, :, :],
+        psi_rmuT_X[:, :, band_slice, :],
+    )
+
+
 def build_gram_q0_via_loadwfns(
     wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
@@ -1413,18 +1429,46 @@ def build_gram_q0_via_loadwfns(
               f"band_chunk_size={band_chunk_size}, "
               f"transfer_k_tile={prune_k_tile}")
 
-    # ---- Left window ----
-    with timing.section("left.load"):
-        psi_l_rmu_Y, psi_l_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, cand_idx, bispinor, mesh_xy, left_range,
-            band_chunk_size=band_chunk_size,
-            k_chunk_size=prune_k_tile,
-        )
-        if norms_l_j is not None:
-            # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
-            psi_l_rmu_Y = psi_l_rmu_Y / norms_l_j[None, :, None, None]
-            psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
-        psi_l_rmu_Y.block_until_ready()
+    def _load_face(face_range, norms, timing_name):
+        with timing.section(timing_name):
+            psi_y, psi_x = load_centroids_band_chunked(
+                wfn, sym, meta, cand_idx, bispinor, mesh_xy, face_range,
+                band_chunk_size=band_chunk_size,
+                k_chunk_size=prune_k_tile,
+            )
+            if norms is not None:
+                # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
+                psi_y = psi_y / norms[None, :, None, None]
+                psi_x = psi_x / norms[None, None, :, None]
+            psi_y.block_until_ready()
+        return psi_y, psi_x
+
+    # A nested pair of windows needs one WFN construction. Bands are
+    # replicated in both final face layouts, so the smaller face is an exact
+    # local slice of the larger one. This removes repeated parent I/O and
+    # child FFTs without changing the one-k/band-tile memory policy.
+    left_from_right = _band_window_slice(right_range, left_range)
+    right_from_left = _band_window_slice(left_range, right_range)
+    psi_r_rmu_Y = psi_r_rmuT_X = None
+    if left_from_right is not None and left_range != right_range:
+        psi_r_rmu_Y, psi_r_rmuT_X = _load_face(
+            right_range, norms_r_j, "right.load")
+        psi_l_rmu_Y, psi_l_rmuT_X = _slice_centroid_wfn_faces(
+            psi_r_rmu_Y, psi_r_rmuT_X, left_from_right)
+        if verbose:
+            print(
+                "[pivoted_cholesky] reused right WFN face for nested left "
+                f"window {left_range} within {right_range}")
+    else:
+        psi_l_rmu_Y, psi_l_rmuT_X = _load_face(
+            left_range, norms_l_j, "left.load")
+        if right_from_left is not None:
+            psi_r_rmu_Y, psi_r_rmuT_X = _slice_centroid_wfn_faces(
+                psi_l_rmu_Y, psi_l_rmuT_X, right_from_left)
+            if verbose:
+                print(
+                    "[pivoted_cholesky] reused left WFN face for nested "
+                    f"right window {right_range} within {left_range}")
 
     # ---- 2-D tiled path (size-ladder wall fix) ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
@@ -1480,16 +1524,9 @@ def build_gram_q0_via_loadwfns(
         col_block = 0  # one full block == the original computation
 
     if col_block:
-        with timing.section("right.load"):
-            psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-                wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-                band_chunk_size=band_chunk_size,
-                k_chunk_size=prune_k_tile,
-            )
-            if norms_r_j is not None:
-                psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-                psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
-            psi_r_rmu_Y.block_until_ready()
+        if psi_r_rmu_Y is None:
+            psi_r_rmu_Y, psi_r_rmuT_X = _load_face(
+                right_range, norms_r_j, "right.load")
 
         # Compiler-aware width selection happens only after BOTH canonical
         # WFN windows exist.  The allocator reading is therefore the actual
@@ -1623,16 +1660,9 @@ def build_gram_q0_via_loadwfns(
     del psi_l_rmu_Y, psi_l_rmuT_X
 
     # ---- Right window ----
-    with timing.section("right.load"):
-        psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-            band_chunk_size=band_chunk_size,
-            k_chunk_size=prune_k_tile,
-        )
-        if norms_r_j is not None:
-            psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-            psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
-        psi_r_rmu_Y.block_until_ready()
+    if psi_r_rmu_Y is None:
+        psi_r_rmu_Y, psi_r_rmuT_X = _load_face(
+            right_range, norms_r_j, "right.load")
     with timing.section("right.pair"):
         P_r_k = pair_density(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
         P_r_k.block_until_ready()
