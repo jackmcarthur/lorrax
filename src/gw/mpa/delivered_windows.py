@@ -1680,16 +1680,18 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     # products state + pole_sign*pole over the window's own frequencies, so
     # widen it to the corner extremes of (raw state energy) x (pole cells).
     try:
+        # ``raw_state_energy`` is ``pole_sign * signed`` (see _state_products);
+        # the internal sums are ``signed + pole_sign * pole`` =
+        # ``pole_sign * (raw + pole)``.  Getting this sign wrong widened the
+        # valence boxes across zero (Si arm 15: val:bulk kappa 1.04 -> 66).
         raw = np.asarray(spec["raw_state_energy"], np.float64)
         poles = np.asarray(_selected_pole_values(spec), np.complex128)
         freq = np.asarray(spec["problem"].frequencies, np.float64)
         sign = float(spec["pole_sign"])
-        corners = [float(np.min(freq)) - (e + sign * pr)
+        corners = [f - sign * (e + pr)
+                   for f in (float(np.min(freq)), float(np.max(freq)))
                    for e in (np.min(raw), np.max(raw))
                    for pr in (np.min(poles.real), np.max(poles.real))]
-        corners += [float(np.max(freq)) - (e + sign * pr)
-                    for e in (np.min(raw), np.max(raw))
-                    for pr in (np.min(poles.real), np.max(poles.real))]
         # conjugation flips Im d only; the real corners are unchanged
         re_lo, re_hi = min(re_lo, min(corners)), max(re_hi, max(corners))
     except (KeyError, RuntimeError, ValueError, TypeError):
