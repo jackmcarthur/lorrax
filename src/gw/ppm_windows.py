@@ -582,7 +582,10 @@ def plan_hgl_crossing_cells(
             ownership += ((live > e_lo) & (live <= e_hi)).astype(np.int32)
         if not np.all(ownership == 1):
             raise AssertionError(
-                "GATE hgl_A_partition: A panes do not tile live support exactly")
+                "GATE hgl_A_partition: A_pane_ownership got: "
+                f"min={int(np.min(ownership))}, max={int(np.max(ownership))}; "
+                "want: every live A row owned exactly once; why: missing or "
+                "overlapping rows would corrupt HGL crossing accumulation.")
 
         for e_lo, e_hi, e_min, e_max in panes:
             b_shell_lo = w_lo - e_max - z
@@ -590,8 +593,9 @@ def plan_hgl_crossing_cells(
             A_dim = (delta_w + (e_max - e_min) + z) / xi
             if A_dim > A_max * (1.0 + 8.0 * np.finfo(np.float64).eps):
                 raise AssertionError(
-                    "GATE hgl_shell_capacity: planned shell exceeds "
-                    f"A_dim={A_dim:.16g} > {A_max:.16g}")
+                    "GATE hgl_shell_capacity: HGL_shell_A_dim got: "
+                    f"{A_dim:.16g}; want: <= A_max={A_max:.16g}; why: the "
+                    "certified crossing rule does not cover a wider shell.")
             max_A_dim = max(max_A_dim, A_dim)
             common = dict(
                 omega_indices=np.asarray(omega_indices, dtype=np.int64),
@@ -617,7 +621,11 @@ def plan_hgl_crossing_cells(
         omega_ownership[np.asarray(idx, dtype=np.int64)] += 1
     if not np.all(omega_ownership == 1):
         raise AssertionError(
-            "GATE hgl_omega_partition: omega clusters do not tile the branch")
+            "GATE hgl_omega_partition: omega_cluster_ownership got: "
+            f"min={int(np.min(omega_ownership))}, "
+            f"max={int(np.max(omega_ownership))}; want: every branch omega "
+            "owned exactly once; why: missing or overlapping frequencies "
+            "would corrupt HGL crossing accumulation.")
 
     return HGLCrossingPlan(
         cells=tuple(cells), omega_cluster_count=len(clusters),
@@ -953,17 +961,19 @@ def _assert_bounded_laplace_support(x_min: float, x_max: float) -> None:
     if (not np.isfinite(x_min) or not np.isfinite(x_max)
             or float(x_min) <= 0.0 or float(x_max) < float(x_min)):
         raise AssertionError(
-            "GATE sign_definite_partition: invalid Laplace support reached "
-            f"the minimax door ([{float(x_min):.16g}, "
-            f"{float(x_max):.16g}])")
+            "GATE sign_definite_partition: laplace_support got: "
+            f"[{float(x_min):.16g}, {float(x_max):.16g}]; want: finite "
+            "0 < x_min <= x_max; why: the sign-definite minimax rule is "
+            "defined only on a positive finite interval.")
     R = float(x_max) / float(x_min)
     limit = _SIGN_DEFINITE_PANE_MAX_RANGE * (
         1.0 + 8.0 * np.finfo(np.float64).eps)
     if R > limit:
         raise AssertionError(
-            "GATE sign_definite_partition: unbounded Laplace cell reached "
-            f"the minimax door (R={R:.16g} > "
-            f"{_SIGN_DEFINITE_PANE_MAX_RANGE:.16g})")
+            "GATE sign_definite_partition: laplace_range_ratio got: "
+            f"R={R:.16g}; want: R <= "
+            f"{_SIGN_DEFINITE_PANE_MAX_RANGE:.16g}; why: a wider cell is "
+            "outside the bounded minimax partition contract.")
 
 
 def _build_single_sigma_window(
@@ -1118,8 +1128,10 @@ def _plan_sign_definite_omega_panes(
             threshold = B_min
         if not lo < threshold < hi:
             raise AssertionError(
-                "GATE sign_definite_omega_partition: no legal strict cut "
-                f"inside support ({lo!r}, {hi!r}]")
+                "GATE sign_definite_omega_partition: omega_split got: "
+                f"threshold={threshold!r} for support=({lo!r}, {hi!r}]; "
+                "want: lo < threshold < hi; why: recursive partitioning "
+                "requires a strict interior cut.")
 
         left = _masked_interval_stats_device(
             Omega_q, base_mask_B, lo, threshold)
@@ -1133,19 +1145,24 @@ def _plan_sign_definite_omega_panes(
         owned = sum(p[2] for p in live)
         if owned != count:
             raise AssertionError(
-                "GATE sign_definite_omega_partition: pane counts do not "
-                f"conserve live poles ({owned} != {count})")
+                "GATE sign_definite_omega_partition: child_pole_count got: "
+                f"{owned}; want: parent count={count}; why: a split must "
+                "conserve every live pole exactly once.")
         if len(live) != 2 or any(p[2] >= count for p in live):
             raise AssertionError(
-                "GATE sign_definite_omega_partition: range split made no "
-                "strict progress")
+                "GATE sign_definite_omega_partition: live_children got: "
+                f"counts={[p[2] for p in live]}; want: two nonempty children "
+                f"each smaller than parent count={count}; why: recursive "
+                "partitioning must make strict progress.")
         pending.extend(reversed(live))
 
     panes.sort(key=lambda p: p[0])
     if sum(p[2] for p in panes) != int(mask_B_count):
+        owned = sum(p[2] for p in panes)
         raise AssertionError(
-            "GATE sign_definite_omega_partition: final panes do not own "
-            "every live pole exactly once")
+            "GATE sign_definite_omega_partition: final_pole_count got: "
+            f"{owned}; want: mask_B_count={int(mask_B_count)}; why: final "
+            "panes must own every live pole exactly once.")
     return panes
 
 
@@ -1283,8 +1300,10 @@ def _plan_sign_definite_cells(
 
         if B_min != B_max:
             raise AssertionError(
-                "GATE sign_definite_partition: B owner returned an over-cap "
-                "non-singleton pane")
+                "GATE sign_definite_partition: over_cap_B_support got: "
+                f"[{B_min:.16g}, {B_max:.16g}]; want: B_min == B_max before "
+                "splitting host axes; why: the B owner must exhaust its own "
+                "partition dimension first.")
 
         # Omega is already singleton here: the incumbent B planner only
         # returns an over-cap pane when B_min == B_max.  Split whichever of
@@ -1293,8 +1312,10 @@ def _plan_sign_definite_cells(
         w_span = w_max - w_min
         if e_span <= 0.0 and w_span <= 0.0:
             raise AssertionError(
-                "GATE sign_definite_partition: singleton Cartesian support "
-                f"has irreducible range {x_max / x_min:.16g}")
+                "GATE sign_definite_partition: singleton_range_ratio got: "
+                f"{x_max / x_min:.16g}; want: <= "
+                f"{_SIGN_DEFINITE_PANE_MAX_RANGE:.16g}; why: singleton E and "
+                "omega support cannot be partitioned further for minimax.")
         if e_span >= w_span and e_span > 0.0:
             cut, rows = _bisect_discrete_axis(A_vals, E_idx)
             bounds = ((E_lo, cut), (cut, E_hi))
@@ -1319,8 +1340,9 @@ def _plan_sign_definite_cells(
         for c in cells)
     if owned != expected:
         raise AssertionError(
-            "GATE sign_definite_partition: Cartesian ownership is not exact "
-            f"({owned} != {expected})")
+            "GATE sign_definite_partition: Cartesian_ownership got: "
+            f"{owned}; want: expected={expected}; why: partition cells must "
+            "own every E/B/omega point exactly once.")
     cells.sort(key=lambda c: (int(c.omega_indices[0]), c.E_lo, c.B_lo))
     return cells
 
@@ -1438,8 +1460,10 @@ def _build_three_sigma_windows(
                 if A_core > _CROSSING_A_MAX * (
                         1.0 + 8.0 * np.finfo(np.float64).eps):
                     raise AssertionError(
-                        "GATE hgl_shell_capacity: unpartitioned HGL range "
-                        f"A={A_core:.16g} exceeds {_CROSSING_A_MAX:.16g}")
+                        "GATE hgl_shell_capacity: core_HGL_A got: "
+                        f"{A_core:.16g}; want: <= "
+                        f"A_max={_CROSSING_A_MAX:.16g}; why: the certified "
+                        "crossing rule does not cover a wider core interval.")
                 target_error_hat = _scaled_crossing_error_bound(
                     xi, target_error)
                 q_cross = solve_phase_minimax_bandwidth(
@@ -1607,9 +1631,10 @@ def _build_partitioned_hgl_windows(
                 if float(cell.A_dim) > _CROSSING_A_MAX * (
                         1.0 + 8.0 * np.finfo(np.float64).eps):
                     raise AssertionError(
-                        "GATE hgl_shell_capacity: planned HGL range "
-                        f"A={float(cell.A_dim):.16g} exceeds "
-                        f"{_CROSSING_A_MAX:.16g}")
+                        "GATE hgl_shell_capacity: planned_HGL_A got: "
+                        f"{float(cell.A_dim):.16g}; want: <= "
+                        f"A_max={_CROSSING_A_MAX:.16g}; why: the certified "
+                        "crossing rule does not cover a wider planned cell.")
                 target_error_hat = _scaled_crossing_error_bound(
                     xi, target_error)
                 q_cross = solve_phase_minimax_bandwidth(
@@ -1646,8 +1671,10 @@ def _build_partitioned_hgl_windows(
                         f"Unknown HGL cell kind {cell.kind!r}")
                 if x_min <= 0.0 or x_max < x_min:
                     raise AssertionError(
-                        "GATE hgl_sign_definite_cell: invalid Laplace interval "
-                        f"for {cell.kind}: [{x_min:.16g}, {x_max:.16g}]")
+                        "GATE hgl_sign_definite_cell: laplace_interval got: "
+                        f"kind={cell.kind!r}, [{x_min:.16g}, {x_max:.16g}]; "
+                        "want: 0 < x_min <= x_max; why: a sign-definite HGL "
+                        "cell requires positive ordered Laplace support.")
                 _assert_bounded_laplace_support(x_min, x_max)
                 q = solve_laplace_minimax_interval(
                     x_min,

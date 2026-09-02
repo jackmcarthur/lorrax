@@ -514,10 +514,12 @@ def compute_static_photon_sigma(
     closure_limit = 1.0e-13 + 1.0e-11 * closure_scale
     if closure_abs > closure_limit:
         raise ValueError(
-            "GATE photon_head_sigma_sector_closure: final-block "
-            "CC + CTTC + TT contraction does not close to the direct "
-            f"16-block head total: {closure_abs:.3e} Ry > "
-            f"{closure_limit:.3e} Ry")
+            "GATE photon_head_sigma_sector_closure: projected photon-head "
+            "sectors do not close to the direct contraction.\n"
+            f"  got:  closure_abs = {closure_abs:.3e} Ry\n"
+            f"  want: closure_abs <= {closure_limit:.3e} Ry\n"
+            "  why:  a CC + CTTC + TT sum that differs from the direct "
+            "16-block total has lost or double-counted a Lorentz sector")
     return (
         sig_x, sig_sx, sig_coh,
         StaticPhotonHeadSigmaDiagnostics(components, closure_abs, "dft"),

@@ -3406,11 +3406,13 @@ def build_dft_head_response(
             vnl_velocity_sign=expected_vnl_sign,
             wfn_fingerprint_binding=wfn_fingerprint_binding):
         raise ValueError(
-            "GATE dft_head_dipole_provenance: head_correction=full refuses "
-            "dipole.h5 because its WFN/q→0-coverage/VNL/representation "
-            "provenance does not authenticate the charge-response body. "
-            "Regenerate the "
-            "dipole from this run's deck before building S_direct or wings.")
+            "GATE dft_head_dipole_provenance: the full head received an "
+            "unauthenticated dipole artifact.\n"
+            f"  got:  dipole_file = {dipole_path!r}; at least one WFN, "
+            "q->0 coverage, VNL, or representation stamp mismatched\n"
+            "  want: dipole.h5 regenerated from this run's exact deck\n"
+            "  why:  S_direct and the wings must use the same WFN and "
+            "velocity operator as the finite-q charge response")
     velocity_cart, _ = read_dipole_h5(dipole_path)
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)

@@ -287,8 +287,10 @@ class Slab2D:
             measure = float(np.sum(weight))
             if not np.isfinite(measure) or measure <= 0.0:
                 raise ValueError(
-                    "GATE slab_q0_polygon_measure: provider-issued slab "
-                    f"cubature order {chunk.order} has nonpositive measure")
+                    "GATE slab_q0_polygon_measure: cubature_measure got: "
+                    f"{measure!r} at order={chunk.order}; want: finite and "
+                    "> 0; why: the slab q->0 cell average requires a "
+                    "positive normalized polygon measure.")
             vc0 = complex(np.sum(weight * v) / measure)
             if S2 is None:
                 wcoul0 = None
@@ -306,8 +308,9 @@ class Slab2D:
                 geometry, receipt, epshead)
         if not (np.isfinite(vc0_mean) and np.isfinite(wcoul0)):
             raise ValueError(
-                "GATE slab_q0_polygon_nonfinite: the exact slab q->0 cell "
-                f"average is non-finite (<v>={vc0_mean!r}, <W>={wcoul0!r})")
+                "GATE slab_q0_polygon_nonfinite: q0_cell_average got: "
+                f"<v>={vc0_mean!r}, <W>={wcoul0!r}; want: both finite; "
+                "why: non-finite Coulomb heads cannot enter screening.")
         return (jnp.asarray(vc0_mean, dtype=jnp.complex128),
                 jnp.asarray(wcoul0, dtype=jnp.complex128))
 
@@ -326,14 +329,18 @@ class Slab2D:
                     (delta, scale, abs(current)), dtype=np.float64)
                 if not np.all(np.isfinite(values)):
                     raise ValueError(
-                        "GATE slab_q0_polygon_nonfinite: the fixed 16/24/32 "
-                        "cubature ladder produced non-finite diagnostics")
+                        "GATE slab_q0_polygon_nonfinite: ladder_diagnostics "
+                        f"got: delta={delta!r}, scale={scale!r}, "
+                        f"current_abs={abs(current)!r}; want: all finite; "
+                        "why: the fixed cubature ladder needs a valid "
+                        "convergence certificate.")
                 ratios.append(
                     delta / (_Q0_LADDER_ATOL + _Q0_LADDER_RTOL * scale))
         if not ratios:
             raise ValueError(
-                "GATE slab_q0_polygon_nonfinite: the cubature ladder yielded "
-                "no comparable orders")
+                "GATE slab_q0_polygon_nonfinite: comparable_ladder_pairs "
+                f"got: 0 from orders={receipt.orders!r}; want: at least one; "
+                "why: the slab q->0 average needs a convergence comparison.")
         if ratios[-1] > 1.0:
             raise ValueError(
                 "GATE slab_q0_polygon_not_converged: the final polygon "

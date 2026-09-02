@@ -4435,17 +4435,22 @@ def run_sc_driver(
         or str(config.sc.head_update) != "off")
     if requires_iteration_head and screening.iteration_head is None:
         raise RuntimeError(
-            "GATE sc_final_map_requires_iteration_head: the accepted QSGW "
-            "map completed without the head samples requested by "
+            "GATE sc_final_map_requires_iteration_head: "
+            "screening.iteration_head got: None; want: accepted final-map "
+            "head samples for "
             f"head_correction={config.head.correction.value!r}, "
-            f"sc_head_update={config.sc.head_update!r}")
+            f"sc_head_update={config.sc.head_update!r}; why: final QSGW "
+            "artifacts must carry the response from the accepted map.")
     requires_static_head_terms = (
         bool(config.do_G0)
         and config.head.correction is not HeadCorrection.OFF)
     if requires_static_head_terms and screening.static_head_terms is None:
         raise RuntimeError(
-            "GATE sc_final_map_requires_static_head_terms: the accepted "
-            "QSGW map returned head samples but no static Sigma-head terms")
+            "GATE sc_final_map_requires_static_head_terms: "
+            "screening.static_head_terms got: None; want: static Sigma-head "
+            f"terms for do_G0={bool(config.do_G0)!r}, "
+            f"head_correction={config.head.correction.value!r}; why: the "
+            "accepted final map must supply every requested Sigma term.")
     print_fn(
         f"  SC done: {len(rms_history)} GW map calls"
         + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
@@ -4467,9 +4472,10 @@ def run_sc_driver(
                 config.compute_mode, config):
             if screening.static_w is None:
                 raise RuntimeError(
-                    "GATE persist_sc_requires_final_static_w: the accepted "
-                    "QSGW map returned no static W body for restart "
-                    "persistence")
+                    "GATE persist_sc_requires_final_static_w: "
+                    "screening.static_w got: None; want: the accepted "
+                    "final-map static W body; why: restart persistence must "
+                    "not write head samples without their matching W.")
             from .gw_output import persist_w0_and_head
             with timing.section("gw_jax.persist_w0"):
                 persist_w0_and_head(

@@ -356,11 +356,13 @@ def compute_static_w(
                     compute_chi0_imag_ordered, precompile_chi0_imag_ordered)
                 if use_ibz_w:
                     raise RuntimeError(
-                        "GATE chi0_imag_ordered_full_bz: the ordered "
-                        "orientation route needs the full-BZ q axis "
-                        "(force_full_bz=True); the IBZ cascade was "
-                        "requested for role "
-                        f"{role!r}.")
+                        "GATE chi0_imag_ordered_full_bz: ordered response "
+                        "received an IBZ q cascade.\n"
+                        f"  got:  use_ibz_w = true, role = {role!r}\n"
+                        "  want: force_full_bz = true for this role\n"
+                        "  why:  the ordered kernel pairs each q with its "
+                        "explicit -q row; that involution is not present "
+                        "on the irreducible q axis")
                 from ffi import _services
                 _services.ensure_on_path()
                 from symmetry_maps import q_negation_index

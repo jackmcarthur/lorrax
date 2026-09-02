@@ -527,16 +527,22 @@ def fit_gn_ppm_from_wc_pair(
         budget = n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
         if n_tail_low > budget or n_tail_high > budget:
             raise RuntimeError(
-                "GATE gn_ppm_extreme_tail_budget: selected more than the "
-                f"0.2% budget (low={n_tail_low}, high={n_tail_high}, "
-                f"budget={budget}).")
+                "GATE gn_ppm_extreme_tail_budget: "
+                f"gn_ppm_extreme_tail_counts got: low={n_tail_low}, "
+                f"high={n_tail_high}; want: each count <= budget={budget} "
+                f"({1.0 / GN_PPM_EXTREME_TAIL_DIVISOR:.3%} of valid modes); "
+                "why: tail coarsening may alter only its bounded extreme-mode "
+                "allocation.")
         if n_valid and (
                 omega_min_after < omega_min_host
                 or omega_max_after > omega_max_host):
             raise RuntimeError(
-                "GATE gn_ppm_extreme_tail_range: tail coarsening enlarged "
-                f"the fitted support [{omega_min_host}, {omega_max_host}] "
-                f"-> [{omega_min_after}, {omega_max_after}].")
+                "GATE gn_ppm_extreme_tail_range: omega_support got: "
+                f"before=[{omega_min_host}, {omega_max_host}], "
+                f"after=[{omega_min_after}, {omega_max_after}]; want: "
+                "after support contained in before support; why: tail "
+                "coarsening may contract but must never enlarge fitted pole "
+                "support.")
 
     # THE ODD RESIDUE, from the FINAL pole.  ``D = i a (omega_p^2 +
     # Omega^2) / (2 omega_p)`` is a statement about the pole the Sigma
