@@ -5,12 +5,12 @@ This module derives a runtime view in which every labelled group occupies one
 contiguous interval on one shard.  It knows no centroid or symmetry physics:
 ``group_id`` may describe any partition whose members must remain local.
 
-Square meshes use one hierarchical order, never independently optimized X/Y
-orders.  It is first divided into ``P=s**2`` equal fine shards.  Coarsening
-each ``s`` consecutive fine shards gives the *same* global order and equal
-extent for both X and Y.  Thus a group local to a fine shard is automatically
-local in the X view, the Y view, and the flat selector view.  Files and
-user-visible indices never inherit this runtime order.
+Square meshes use one packed order, never independently optimized X/Y orders.
+It is divided into ``s`` equal axis shards whose size is a multiple of ``s``.
+The same global order is therefore legal under X, Y, and XxY sharding, while
+each group is required to be local only in the X/Y views where symmetry
+permutations execute.  XxY locality is neither required nor promised.  Files
+and user-visible indices never inherit this runtime order.
 """
 from __future__ import annotations
 
@@ -151,11 +151,11 @@ class GroupedShardLayout:
                 "the group partition is not closed under the map.")
         return out.astype(np.int32)
 
-    def pack_fine_local_permutations_host(self, permutations) -> np.ndarray:
-        """Return gather indices local to this layout's finest shards.
+    def pack_local_permutations_host(self, permutations) -> np.ndarray:
+        """Return gather indices local to this layout's shards.
 
         This is the executable form of :meth:`pack_permutations_host`: global
-        packed sources are reduced to offsets inside their owning fine shard.
+        packed sources are reduced to offsets inside their owning shard.
         The parent method first proves that every source and target share that
         owner, so taking these indices inside a shard needs no communication.
         """
@@ -256,7 +256,7 @@ def validate_grouped_shard_layout(layout):
         stop = start + int(sizes[group])
         if (start < 0 or stop > n_padded
                 or start // shard_size != (stop - 1) // shard_size):
-            raise ValueError(f"{who}: group {group} is not fine-shard local")
+            raise ValueError(f"{who}: group {group} is not shard local")
         if int(owners[group]) != start // shard_size or not np.all(
                 packed_group[start:stop] == group):
             raise ValueError(f"{who}: group {group} owner/interval disagrees")
@@ -273,17 +273,17 @@ def validate_grouped_shard_layout(layout):
 
 @dataclass(frozen=True, init=False)
 class SquareGroupedShardLayout:
-    """One finest-grain layout reused by every view of a square mesh.
+    """One axis-local layout reused by every view of a square mesh.
 
-    ``fine`` has ``side**2`` equal contiguous shards.  Both one-axis views
-    split the identical packed sequence into ``side`` chunks, each comprising
-    ``side`` consecutive fine shards.  ``axis_group_owner`` is therefore a
+    ``axis`` has ``side`` equal contiguous shards.  Its shard size is padded
+    to a multiple of ``side``, so the same packed extent is also divisible by
+    ``side**2`` for unrelated XxY-sharded tensors.  ``axis_group_owner`` is a
     numerical owner shared by X and Y; it does not claim that X and Y name the
-    same physical devices.
+    same physical devices.  A group may cross an XxY fine-shard boundary.
     """
 
     side: int
-    fine: GroupedShardLayout
+    axis: GroupedShardLayout
 
     def __init__(self, *args, **kwargs):
         del args, kwargs
@@ -291,25 +291,24 @@ class SquareGroupedShardLayout:
 
     @property
     def axis_shard_size(self) -> int:
-        return self.side * self.fine.shard_size
+        return self.axis.shard_size
 
     @property
     def axis_group_owner(self) -> np.ndarray:
-        return _readonly(self.fine.group_owner // self.side, np.int32)
-
-    @property
-    def gram_extent_multiplier(self) -> float:
-        """Dense square-storage multiplier caused by fine-shard padding."""
-        ratio = self.fine.n_padded / self.fine.n_logical
-        return ratio * ratio
+        return self.axis.group_owner
 
     def pack_axis_local_permutations_host(self, permutations) -> np.ndarray:
         """Return local gather offsets for either identical X/Y axis view."""
-        packed = self.fine.pack_permutations_host(permutations)
+        packed = self.axis.pack_permutations_host(permutations)
         return (packed % self.axis_shard_size).astype(np.int32)
 
 
-def build_grouped_shard_layout(group_id, n_shards: int) -> GroupedShardLayout:
+def build_grouped_shard_layout(
+    group_id,
+    n_shards: int,
+    *,
+    shard_size_multiple: int = 1,
+) -> GroupedShardLayout:
     """Greedily balance complete groups across equal-capacity shards.
 
     Longest groups are placed first on the currently least-loaded shard
@@ -359,7 +358,12 @@ def build_grouped_shard_layout(group_id, n_shards: int) -> GroupedShardLayout:
         loads[owner] = load + int(sizes[group])
         heapq.heappush(load_heap, (int(loads[owner]), owner))
 
-    shard_size = int(loads.max())
+    multiple = int(shard_size_multiple)
+    if multiple < 1:
+        raise ValueError(
+            "build_grouped_shard_layout: shard_size_multiple must be >= 1; "
+            f"got {multiple}.")
+    shard_size = ((int(loads.max()) + multiple - 1) // multiple) * multiple
     n_padded = nshard * shard_size
     packed_to_canonical = np.full((n_padded,), -1, dtype=np.int64)
     packed_group_id = np.full((n_padded,), n_groups, dtype=np.int32)
@@ -406,17 +410,22 @@ def build_square_grouped_shard_layout(
     group_id,
     mesh_shape: tuple[int, int],
 ) -> SquareGroupedShardLayout:
-    """Build the single hierarchical group layout for a square 2-D mesh."""
+    """Build one group layout for both axes of a square 2-D mesh."""
     shape = tuple(int(x) for x in mesh_shape)
     if len(shape) != 2 or shape[0] < 1 or shape[0] != shape[1]:
         raise ValueError(
             "build_square_grouped_shard_layout requires a positive square "
             f"mesh shape; got {shape}.")
     side = shape[0]
-    fine = build_grouped_shard_layout(group_id, side * side)
+    # Only X/Y locality is physically useful.  Padding each axis shard to a
+    # multiple of ``side`` makes the total extent XxY-divisible without
+    # imposing the stronger (and wasteful) condition that an orbit fit inside
+    # one XxY fine shard.
+    axis = build_grouped_shard_layout(
+        group_id, side, shard_size_multiple=side)
     out = object.__new__(SquareGroupedShardLayout)
     object.__setattr__(out, "side", side)
-    object.__setattr__(out, "fine", fine)
+    object.__setattr__(out, "axis", axis)
     return out
 
 
