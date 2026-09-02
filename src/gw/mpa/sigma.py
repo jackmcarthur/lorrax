@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -14,19 +15,61 @@ from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import (SigmaOmegaResult,
+                          _residue_for_space,
                           assert_sharded_sigma_window_divides_mesh,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
-from gw.sigma_plan import (resolve_delivered_plan_cache,
-                           resolve_sigma_plan)
-from gw.wavefunction_bundle import (face_kernel_kwargs,
-                                    projected_state_amplitude_envelope)
+from gw.sigma_box_plan import plan_sigma_windows
+from gw.sigma_plan import resolve_sigma_plan
+from gw.wavefunction_bundle import face_kernel_kwargs
+from runtime.env_flags import env_bool
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                            CROSSING_NODE_FLOOR,
                             build_shared_sigma_windows,
                             summarize_sigma_poles)
 
+
+# The pane route is an immutable comparison instrument, not a production
+# accuracy policy.  Freezing its historical target here lets old/new box-rule
+# comparisons keep the same control while retiring the measured-sector deck
+# dial from the production path.
+_PANE_CONTROL_TARGET_ERROR = 6.5e-4
+
+_DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
+
+
+def _resolve_mpa_odd_residue_debug(ordered_residues, *, print_fn=print):
+    """Resolve the shared GN/MPA odd-residue A/B switch for an MPA fit."""
+    enabled = env_bool(
+        _DEBUG_GN_ODD_RESIDUE_OFF_ENV, False, print_fn=print_fn)
+    if enabled and not bool(ordered_residues):
+        raise ValueError(
+            "GATE debug_gn_odd_residue_off_scope:\n"
+            f"  got:  {_DEBUG_GN_ODD_RESIDUE_OFF_ENV}=1 with an "
+            "MPA single-residue/TRS fit\n"
+            "  want: this debug switch only on a measured-broken-TR "
+            "ordered-residue MPA fit\n"
+            "  why:  a TRS MPA fit has no time-reversal-odd residue to "
+            "discard\n"
+            "  fix:   unset LORRAX_DEBUG_GN_ODD_RESIDUE_OFF")
+    if enabled:
+        print_fn(
+            "WARNING -- DEBUG: LORRAX_DEBUG_GN_ODD_RESIDUE_OFF=1; "
+            "measured-broken-TR MPA fit is discarding the "
+            "anti-Hermitian frequency-odd residue: D=0 and R+=R-=B. "
+            "This arm is for A/B diagnosis only, never production.")
+    return enabled
+
+
+def _geometry_residue(B, B_odd):
+    """Return a liveness witness that covers both ordered residues."""
+    if B_odd is None:
+        return B
+    plus = B + B_odd
+    minus = B - B_odd
+    return jnp.where(jnp.abs(plus) >= jnp.abs(minus), plus, minus)
 
 def _bounded_pole_batch_size(value):
     size = int(value)
@@ -60,10 +103,11 @@ def _batch_rows(row, batch):
     # ``a > +inf`` is false for every finite pole.  Keeping all six values
     # finite-or-infinite (never NaN) also makes the inactive path harmless
     # under XLA predicate motion.
+    region_shape = tuple(np.asarray(row.bounds).shape[1:])
     bounds = np.broadcast_to(
         np.asarray((np.inf, -np.inf, np.inf, np.inf, -np.inf, -np.inf),
                    np.float64),
-        (capacity, 6),
+        (capacity, *region_shape),
     ).copy()
     bounds[:count] = np.asarray(row.bounds[keep], np.float64)
     phase_real = np.zeros(capacity, dtype=bool)
@@ -86,6 +130,9 @@ def _integrate_sigma_batches(
     mesh_xy,
     *,
     pole_batch_size,
+    brackets=None,
+    band_counts=None,
+    odd_residue_off=False,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -94,6 +141,13 @@ def _integrate_sigma_batches(
         raise ValueError("omega_grid_ry must be a nonempty vector")
 
     s = wfns.slices
+    bracketed = brackets is not None
+    if bracketed:
+        brackets = tuple(
+            (int(lo), None if hi is None else int(hi))
+            for lo, hi in brackets)
+        if not brackets:
+            raise ValueError("MPA Sigma band-bracket plan must be nonempty")
     face_kwargs = face_kernel_kwargs(wfns)
     if wfns.layout == "legacy":
         # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
@@ -101,7 +155,8 @@ def _integrate_sigma_batches(
         # one: the public MPA Σ still refuses to run (gw_config.
         # ComputeMode), so this line is wired for consistency and has
         # never executed under a split.
-        psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
+        state_slice = s.full if bracketed else s.sigma_sum
+        psi_coh_xn, psi_coh_yr = wfns.xn(state_slice), wfns.yr(state_slice)
         psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
         # THE SAME precondition the PPM sharded branch owns.  This executor
         # accumulates into a P(None,None,'x','y') array and then strips the pad
@@ -114,8 +169,9 @@ def _integrate_sigma_batches(
             int(psi_proj_xr.shape[1]), mesh_xy, ansatz="compute_mode = mpa")
         psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
             psi_proj_xr, psi_proj_yn, mesh_xy)
-        shape = (omega.size, int(psi_proj_xr.shape[0]),
-                 int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
+        spatial_shape = (int(psi_proj_xr.shape[0]),
+                         int(psi_proj_xr.shape[1]),
+                         int(psi_proj_yn.shape[3]))
     else:
         # Face carrier (2026-08-22, mechanical port sharing
         # ppm_tau_kernel's face dispatch — see gw.ppm_sigma._run_sigma_
@@ -153,16 +209,40 @@ def _integrate_sigma_batches(
         nb_real = int(s.nb_sigma)
         assert_sharded_sigma_window_divides_mesh(
             nb_real, mesh_xy, ansatz="compute_mode = mpa")
-        psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
+        if bracketed and len(brackets) > 1:
+            from gw.wavefunction_bundle import pack_band_window
+            packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
+                      for lo, hi in brackets]
+            psi_coh_xn = tuple(pair[0] for pair in packed)
+            psi_coh_yr = tuple(pair[1] for pair in packed)
+            pack_brackets = True
+        else:
+            psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
+            pack_brackets = False
         psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
-        shape = (omega.size, int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
-    output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        spatial_shape = (int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
+    if wfns.layout == "legacy":
+        pack_brackets = False
+    if bracketed:
+        shape = (len(brackets), omega.size, *spatial_shape)
+        output_sharding = NamedSharding(
+            mesh_xy, P(None, None, None, "x", "y"))
+        sigma_shape = (len(brackets), *spatial_shape)
+        sigma_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    else:
+        shape = (omega.size, *spatial_shape)
+        output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        sigma_shape = spatial_shape
+        sigma_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     accumulator = DeviceOmegaAccumulator(
-        omega, shape=shape, sharding=output_sharding, omega_axis=0)
+        omega, shape=shape, sharding=output_sharding,
+        omega_axis=1 if bracketed else 0)
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=kgrid,
+        brackets=brackets,
+        pack_brackets=pack_brackets,
         **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
@@ -170,7 +250,14 @@ def _integrate_sigma_batches(
     logical_tau_pairs = 0
     batch_size = int(pole_batch_size)
     sweep_started = False
-    for lo, Omega, B in batches:
+    max_b = max_d = 0.0
+    for lo, Omega, B, B_odd in batches:
+        if B_odd is not None:
+            max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
+            max_d = max(
+                max_d, float(jax.device_get(jnp.max(jnp.abs(B_odd)))))
+            if odd_residue_off:
+                B_odd = jnp.zeros_like(B_odd)
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
         for row in plan:
@@ -182,6 +269,7 @@ def _integrate_sigma_batches(
                 device_put_process_local(x, small)
                 for x in (pole_indices, bounds, phase_real))
             win = row.window
+            B_branch = _residue_for_space(row.space, B, B_odd)
             weight = getattr(row, "band_weight", None)
             if weight is None:
                 selector = jnp.asarray(win.mask_A)
@@ -196,7 +284,7 @@ def _integrate_sigma_batches(
                 prewarm_args = (
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
+                    row.E_A, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
@@ -209,9 +297,8 @@ def _integrate_sigma_batches(
                     # to prewarm the same kernels the timed sweep will use.
                     jax.block_until_ready(tau_kernel(*prewarm_args))
                 accumulator.precompile_tau_add(
-                    sigma_shape=shape[1:],
-                    sigma_sharding=NamedSharding(
-                        mesh_xy, P(None, "x", "y")))
+                    sigma_shape=sigma_shape,
+                    sigma_sharding=sigma_sharding)
                 print_fn(
                     "  MPA Sigma sweep begin: shared pane tau kernel "
                     "prewarmed")
@@ -228,7 +315,7 @@ def _integrate_sigma_batches(
                 sigma_tau = tau_kernel(
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
+                    row.E_A, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
@@ -238,21 +325,58 @@ def _integrate_sigma_batches(
             accumulator.end_window()
             n_sweeps += 1
             logical_tau_pairs += win.n_tau
-        del B, Omega
+        del B, B_odd, Omega
         gc.collect()
 
     sigma = strip_sigma_window(
         accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
+    if bracketed:
+        sigma = jax.jit(
+            lambda values: jnp.cumsum(values, axis=0),
+            out_shardings=sigma.sharding)(sigma)
+        if band_counts is None:
+            band_counts = tuple(
+                int(s.nb_sigma_sum) if hi is None else int(hi)
+                for _lo, hi in brackets)
+        else:
+            band_counts = tuple(int(count) for count in band_counts)
+        if len(band_counts) != len(brackets):
+            raise ValueError(
+                "MPA Sigma band_counts must align with band brackets")
     transform_saving = int(logical_tau_pairs - n_tau)
     print_fn(
         f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
         f"({n_poles} poles, batches of {batch_size}); "
         f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
+    ratio = None
+    if max_b or max_d:
+        ratio = max_d / max_b if max_b else np.inf
+        state = "DEBUG ODD OFF (D discarded)" if odd_residue_off else "enabled"
+        print_fn(
+            f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
+            f"max|D|/max|B|={ratio:.12e}")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
-        sigma_c_kij=sigma)
+        sigma_c_kij=sigma,
+        band_counts=(() if band_counts is None else tuple(band_counts)),
+        odd_even_residue_ratio=ratio)
+
+
+def _attach_ordered_odd_sigma(total, even):
+    """Attach the exact production contraction minus its ``D=0`` twin."""
+    if not np.array_equal(total.omega_ry, even.omega_ry):
+        raise ValueError(
+            "GATE mpa_odd_sigma_reference: total and D=0 MPA Sigma used "
+            "different omega grids")
+    if tuple(total.sigma_c_kij.shape) != tuple(even.sigma_c_kij.shape):
+        raise ValueError(
+            "GATE mpa_odd_sigma_reference: total and D=0 MPA Sigma shapes "
+            f"differ: {total.sigma_c_kij.shape} versus "
+            f"{even.sigma_c_kij.shape}")
+    return replace(
+        total, sigma_c_odd_kij=total.sigma_c_kij - even.sigma_c_kij)
 
 
 def integrate_sigma_store(
@@ -265,6 +389,9 @@ def integrate_sigma_store(
     mesh_xy,
     *,
     pole_batch_size=4,
+    brackets=None,
+    band_counts=None,
+    odd_residue_off=False,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -276,23 +403,30 @@ def integrate_sigma_store(
     this executor walk share ONE open handle for the whole iteration
     instead of opening the store once per pole batch (audit A1).  Given a
     path, this function owns a reader for the length of its own walk.
+
+    ``brackets`` optionally partitions the intermediate-state band sum into
+    disjoint slices.  The spatial kernel then returns a leading bracket axis;
+    this executor inserts omega behind it and cumulatively sums the brackets
+    before returning.  ``None`` preserves the ordinary MPA rank-4 result.
     """
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
     def batches(reader):
         for lo in range(0, int(n_poles), batch_size):
             hi = min(lo + batch_size, int(n_poles))
-            Omega, B = reader.read(
+            Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=True, return_sharded=True,
-                to_unit="Ry")
-            yield lo, Omega, B
-            del Omega, B
+                to_unit="Ry", include_odd=True)
+            yield lo, Omega, B, B_odd
+            del Omega, B, B_odd
             gc.collect()
 
     def run(reader):
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
-            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+            mesh_xy, pole_batch_size=batch_size, brackets=brackets,
+            band_counts=band_counts, odd_residue_off=odd_residue_off,
+            print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -364,15 +498,19 @@ def compute_sigma_c_mpa_omega_grid(
     efermi_ry,
     regularization_width_ry,
     edge_factor=1.5,
-    target_error,
-    max_rank,
-    crossing_max_nodes,
+    quadrature_eps,
+    quadrature_reduction_seconds,
+    pair_ceiling,
+    quadrature_cache_dir,
     omega_grid_step_ry,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
     expected_screening_diagrams=None,
     occupation_state=None,
+    sigma_branches=None,
+    band_brackets=None,
+    band_counts=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -388,20 +526,33 @@ def compute_sigma_c_mpa_omega_grid(
     entry points, which is what keeps the branch supports, the pole census
     and the window build on one support.
 
-    Pole tensors are read collectively in their native sharding. Both
-    planners retain only bounded host geometry from each configured pole
-    batch. The spatial executor then rereads and releases the same pole
-    ranges through the one pane/product-window tau kernel.
+    Pole tensors are read collectively in their native sharding.  The box
+    planner first reduces a pole-residue CDF, then retains exact live extrema
+    for disjoint core/outlier selectors; an ordered store uses the
+    branch-neutral ``max(abs(R+), abs(R-))`` witness so neither branch can be
+    omitted.  The pane control consumes one bounded census.  The spatial
+    executor rereads the pole ranges and selects R+ or R- per branch through
+    one shared tau kernel.
+
+    ``sigma_branches`` is an optional already-resolved set of causal branches;
+    it lets another pole model retain its established occupation/Fermi policy
+    while sharing this planner and executor exactly.  ``band_brackets`` and
+    ``band_counts`` similarly carry the optional disjoint band-convergence
+    partition.  They change neither pole interpretation nor window planning.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
         expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
+    ordered_residues = bool(ledger["ordered_residues"])
+    odd_residue_off = _resolve_mpa_odd_residue_debug(
+        ordered_residues, print_fn=print_fn)
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    branches = _branches(
+    branches = (_branches(
         wfns, omega_grid_ry, efermi_ry,
         occupation_state=occupation_state,
         occupation_window_threshold=occupation_window_threshold)
+        if sigma_branches is None else tuple(sigma_branches))
     plan_mode = resolve_sigma_plan()
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
@@ -413,132 +564,105 @@ def compute_sigma_c_mpa_omega_grid(
     # close the handle on every rank.
     with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
         if plan_mode == "panes":
-            # The incumbent path is intentionally kept byte-for-byte in its
-            # own arm: same configured census batches, summaries, builder
-            # arguments, and executor plan.
             summaries = []
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
+                Omega, B, B_odd = reader.read(
                     slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
+                    to_unit="Ry", include_odd=True)
+                if B_odd is not None and odd_residue_off:
+                    B_odd = jnp.zeros_like(B_odd)
                 summaries.extend(summarize_sigma_poles(
-                    Omega, B, branches,
+                    Omega, _geometry_residue(B, B_odd), branches,
                     regularization_width_ry=regularization_width_ry,
                     edge_factor=edge_factor, pole_offset=lo,
                     occupation_window_threshold=occupation_window_threshold))
-                del Omega, B
+                del Omega, B, B_odd
                 gc.collect()
             plan, geometry = build_shared_sigma_windows(
                 summaries, branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, target_error=target_error,
-                max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
+                edge_factor=edge_factor,
+                target_error=_PANE_CONTROL_TARGET_ERROR,
+                max_rank=int(pair_ceiling),
+                crossing_max_nodes=max(
+                    CROSSING_NODE_FLOOR, int(pair_ceiling)),
                 omega_grid_step_ry=omega_grid_step_ry,
                 occupation_window_threshold=occupation_window_threshold)
         else:
-            # The delivered measure needs the residues, not only rectangle
-            # extrema. Pole fields stay sharded and resident only for one
-            # configured batch; the planner retains bounded host cells.
-            from .delivered_windows import (
-                build_delivered_sigma_windows,
-                combine_delivered_sigma_pole_measures,
-                delivered_plan_request_fingerprint,
-                delivered_product_geometry,
-                load_complete_delivered_sigma_plan,
-                measure_delivered_sigma_pole_batch,
-            )
-            # One grid mode only: the shared-grid dial was removed
-            # (owner ruling 2026-08-31; lookup rules carry their own nodes).
-            tau_grid_mode = "free"
-            delivered_cache_path = resolve_delivered_plan_cache()
-            delivered_max_nodes = max(
-                int(max_rank), int(crossing_max_nodes))
-            request_fingerprint = delivered_plan_request_fingerprint(
-                branches, omega_grid_ry, fit_ledger=ledger,
-                parameters={
-                    "regularization_width_ry": regularization_width_ry,
-                    "envelope_relative_target": target_error,
-                    "max_nodes": delivered_max_nodes,
-                    "tau_grid_mode": tau_grid_mode,
-                    # Complete-plan v1 included this retired field in its
-                    # fingerprint.  It is immutable receipt-schema salt, not
-                    # a planner argument or execution limit; keeping it lets
-                    # certified product-only receipts survive the deletion.
-                    "edge_factor": edge_factor,
-                    "pole_batch_size": pole_batch_size,
-                })
-            cached = load_complete_delivered_sigma_plan(
-                delivered_cache_path, request_fingerprint, branches)
-            if cached is not None:
-                plan, geometry = cached
-            else:
-                state_amplitudes = projected_state_amplitude_envelope(
-                    wfns, state_bands=wfns.slices.sigma_sum,
-                    projection_bands=wfns.slices.sigma)
-                product_geometry = delivered_product_geometry(
-                    branches, regularization_width_ry,
-                    edge_factor=edge_factor)
-                measured = [[] for _branch in branches]
+            def pole_batches():
                 for lo in range(0, n_poles, int(pole_batch_size)):
                     hi = min(lo + int(pole_batch_size), n_poles)
-                    Omega, B = reader.read(
+                    Omega, B, B_odd = reader.read(
                         slice(lo, hi), unfold=True, return_sharded=True,
-                        to_unit="Ry")
-                    for branch_index, branch in enumerate(branches):
-                        measured[branch_index].append(
-                            measure_delivered_sigma_pole_batch(
-                                branch, Omega, B,
-                                regularization_width_ry=
-                                regularization_width_ry,
-                                pole_split_ry=
-                                product_geometry["pole_edge_ry"],
-                                state_amplitude=state_amplitudes,
-                                pole_offset=lo, mesh_xy=mesh_xy))
-                    del Omega, B
+                        to_unit="Ry", include_odd=True)
+                    if B_odd is not None and odd_residue_off:
+                        B_odd = jnp.zeros_like(B_odd)
+                    yield lo, Omega, _geometry_residue(B, B_odd)
+                    del Omega, B, B_odd
                     gc.collect()
-                measures_by_branch = [
-                    combine_delivered_sigma_pole_measures(rows)
-                    for rows in measured]
-                plan, geometry = build_delivered_sigma_windows(
-                    None, None, branches, omega_grid_ry,
-                    regularization_width_ry=regularization_width_ry,
-                    envelope_relative_target=target_error,
-                    max_nodes=delivered_max_nodes,
-                    crossing_eps_q=1.0e-3,
-                    use_shipped_minimax_tables=True,
-                    tau_grid_mode=tau_grid_mode,
-                    edge_factor=edge_factor,
-                    measures_by_branch=measures_by_branch, mesh_xy=mesh_xy,
-                    plan_cache_path=delivered_cache_path,
-                    plan_cache_request_fingerprint=request_fingerprint)
+
+            plan, geometry = plan_sigma_windows(
+                pole_batches, branches, omega_grid_ry,
+                regularization_width_ry,
+                eps=quadrature_eps,
+                reduction_seconds=quadrature_reduction_seconds,
+                pair_ceiling=pair_ceiling,
+                cache_dir=quadrature_cache_dir,
+                print_fn=print_fn, edge_factor=edge_factor,
+                occupation_window_threshold=occupation_window_threshold,
+                pole_weight_label=("max(abs(R+), abs(R-))"
+                                   if ordered_residues else "abs(B_p)"))
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
                 f"{geometry['n_windows']} logical windows")
         else:
             print_fn(
-                f"  MPA windows [delivered]: "
+                f"  MPA windows [box]: "
                 f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
-                f"target={geometry['envelope_relative_target']:.3g} "
-                "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
+                f"eps={geometry['eps']:.3g}, "
                 f"{geometry['n_windows']} logical windows, "
-                f"grid={geometry['tau_grid_mode']}, "
-                f"plan_cache={geometry['plan_cache_status']}, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
-                f"{geometry['distinct_tau_count']} branch-distinct tau")
+                f"{geometry['distinct_tau_count']} branch-distinct tau, "
+                f"cache={geometry['cache_dir'] or 'off'}")
+            partition = geometry["pole_partition"]
+            print_fn(
+                f"    pole partition: weight={partition['weight']}, "
+                f"tails={100 * partition['tail_fraction_per_side']:.1f}% "
+                "per side/axis, "
+                f"outlier={100 * partition['outlier_weight_fraction']:.3f}%, "
+                f"a={tuple(partition['a_percentiles_ry'])} Ry, "
+                f"gamma={tuple(partition['gamma_percentiles_ry'])} Ry")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:
                     print_fn(
                         f"    {window['name']}: n_tau={window['node_count']}, "
-                        f"residual={window['refined_residual']:.6g}/"
-                        f"{window['relative_residual_target']:.6g}, "
-                        f"kappa_p99={window['amplification_p99']:.6g}, "
+                        f"box={tuple(window['box_ry'])} Ry, "
+                        f"pole_weight={window['pole_weight_fraction']:.6g}, "
+                        f"sup={window['sup_error']:.6g}/"
+                        f"{window['eps']:.6g} ({window['criterion']}), "
+                        f"kappa_p99={window['kappa_p99']:.6g}, "
+                        f"kappa_max={window['kappa_max']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")
-        return integrate_sigma_store(
+        total = integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+            pole_batch_size=pole_batch_size, brackets=band_brackets,
+            band_counts=band_counts, odd_residue_off=odd_residue_off,
+            print_fn=print_fn)
+        if not ordered_residues:
+            return total
+        # Sigma is linear in the residues.  A second execution of this exact
+        # plan with D=0 is therefore the observability twin, not a separately
+        # approximated diagnostic formula.  In the debug arm both are D=0,
+        # so the public odd contribution closes to zero by construction.
+        even = integrate_sigma_store(
+            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+            pole_batch_size=pole_batch_size, brackets=band_brackets,
+            band_counts=band_counts, odd_residue_off=True,
+            print_fn=lambda *args, **kwargs: None)
+        return _attach_ordered_odd_sigma(total, even)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):

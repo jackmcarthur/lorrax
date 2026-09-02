@@ -2010,13 +2010,13 @@ def read_w_columns_collective(
 def _initialise_fit_metadata(
     grp, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
     centroid_hash, unfold_tables, provenance, diagnostic_keys=None,
-    preserve_payload=False, occupation_state=None,
+    preserve_payload=False, occupation_state=None, ordered_residues=False,
 ):
     """Rank-zero-only small metadata half of fit-store allocation."""
     qs = _qs()
     reset = [MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX]
     if not preserve_payload:
-        reset = ["Omega_p", "B_p"] + [
+        reset = ["Omega_p", "B_p", "B_odd_p"] + [
             k for k in grp if str(k).startswith("fit_")] + reset
     for key in reset:
         if key in grp:
@@ -2037,6 +2037,7 @@ def _initialise_fit_metadata(
     grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
     grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
     grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
+    grp.attrs["mpa_fit_ordered_residues"] = bool(ordered_residues)
     grp.attrs["mpa_fit_complete"] = False
     grp.attrs["mpa_fit_writer"] = "file_io.mpa_store"
     grp.attrs["mpa_fit_generator_commit"] = qs.qirr_generator_commit()
@@ -2066,6 +2067,7 @@ def allocate_fit_store(
     dtype=None,
     provenance=None,
     occupation_state=None,
+    ordered_residues=False,
     mode="a",
 ):
     """Create the staged B_q / Ω_q store with an EMPTY completion ledger.
@@ -2115,11 +2117,15 @@ def allocate_fit_store(
             centroid_hash=centroid_hash, unfold_tables=unfold_tables,
             provenance=provenance,
             diagnostic_keys=PERSISTED_DIAGNOSTICS,
-            occupation_state=occupation_state)
+            occupation_state=occupation_state,
+            ordered_residues=ordered_residues)
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
+        if ordered_residues:
+            grp.create_dataset("B_odd_p", shape=(n_p, n_q, n_mu, n_mu),
+                               dtype=dtype)
         for key in PERSISTED_DIAGNOSTICS:
             grp.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
                                dtype=np.float64)
@@ -2131,6 +2137,7 @@ def allocate_fit_store_collective(
     dest, *, mesh_xy, n_q, n_mu, n_p,
     energy_unit=None, grid_hash=None, table_hash=None, centroid_hash=None,
     unfold_tables=None, dtype=None, provenance=None, occupation_state=None,
+    ordered_residues=False,
     mode="w",
 ):
     """Allocate a fit store without any rank owning a pole tensor.
@@ -2180,6 +2187,9 @@ def allocate_fit_store_collective(
         io.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                           dtype=dtype)
         io.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
+        if ordered_residues:
+            io.create_dataset(
+                "B_odd_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
         for key in keys:
             io.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
                               dtype=np.float64)
@@ -2192,8 +2202,174 @@ def allocate_fit_store_collective(
                 table_hash=table_hash, centroid_hash=centroid_hash,
                 unfold_tables=unfold_tables, provenance=provenance,
                 diagnostic_keys=keys, preserve_payload=True,
-                occupation_state=occupation_state)
+                occupation_state=occupation_state,
+                ordered_residues=ordered_residues)
     barrier("mpa_fit_metadata_allocated")
+    return fit_completion_ledger(dest)
+
+
+def write_complete_pole_store_collective(
+    dest,
+    Omega_p,
+    B_p,
+    *,
+    B_odd_p=None,
+    mesh_xy,
+    n_mu_logical,
+    energy_unit,
+    provenance,
+    certification,
+    occupation_state=None,
+):
+    """Write an already-fitted pole field as a finalized MPA store.
+
+    This is the collective format seam for pole models whose fit is performed
+    in memory rather than by the streamed Padé driver.  ``Omega_p``, ``B_p``
+    and optional ordered-orientation odd residue ``B_odd_p`` have shape
+    ``(n_p, n_q, n_mu_padded, n_mu_padded)`` and remain on
+    ``P(None, None, 'x', 'y')`` throughout the write.  Only the logical
+    ``n_mu_logical`` square reaches disk; the device-count-dependent pad is
+    discarded by :class:`file_io.slab_io.SlabIO`.
+
+    A live pole is an element with nonzero ``B_p`` in the ordinary model, or
+    nonzero ``B_p + B_odd_p`` or ``B_p - B_odd_p`` in the ordered model.
+    Live poles must satisfy
+    the MPA causal convention ``Re(Omega_p) > 0`` and
+    ``Im(Omega_p) <= 0``.  A zero-residue element is an absent pole and may
+    carry zero frequency.  Both arrays must be finite, including absent
+    entries, because a non-finite dormant value can become live after an
+    upstream policy change without changing the file shape.
+
+    ``certification`` and ``provenance`` are required.  An algebraic model has
+    no Padé solve condition or backward error, so this writer records observed
+    values of zero in the completion journal; the provenance must name the
+    algebraic fit protocol, and the caller supplies the positive thresholds
+    that :func:`validate_fit_store` requires.  The stored ``fit_condition``
+    payload remains its allocation-time zero fill.
+
+    Parameters
+    ----------
+    dest
+        Output HDF5 path, replaced collectively.
+    Omega_p, B_p, B_odd_p
+        Pole frequencies and residues in ``energy_unit`` with shape
+        ``(n_p, n_q, n_mu_padded, n_mu_padded)`` and sharding
+        ``P(None, None, 'x', 'y')``.  ``B_odd_p`` is the optional
+        ``D=(R_+-R_-)/2`` field; its presence stamps the store as ordered.
+    mesh_xy
+        Existing named ``('x', 'y')`` device mesh.
+    n_mu_logical
+        Logical ISDF-pair extent written on both trailing axes.
+    energy_unit
+        ``'Ry'`` or ``'Ha'``; both poles and residues carry one energy unit.
+    provenance
+        Artifact provenance stamped as ``prov_*`` attributes.
+    certification
+        Positive condition/backward-error acceptance thresholds.
+
+    Returns
+    -------
+    dict
+        The finalized completion ledger, identically on every rank.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    if not provenance:
+        raise ValueError(
+            "write_complete_pole_store_collective requires provenance "
+            "naming the in-memory fit protocol")
+    _require_certification(certification, dest)
+    arrays = (Omega_p, B_p) if B_odd_p is None else (
+        Omega_p, B_p, B_odd_p)
+    for arr in arrays:
+        _require_layout(
+            arr, mesh_xy, P(None, None, "x", "y"),
+            "write_complete_pole_store_collective requires Omega_p and "
+            "B_p on P(None,None,'x','y')")
+    expected = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    Omega = jax.lax.with_sharding_constraint(
+        jnp.asarray(Omega_p, dtype=jnp.complex128), expected)
+    residue = jax.lax.with_sharding_constraint(
+        jnp.asarray(B_p, dtype=jnp.complex128), expected)
+    odd_residue = (None if B_odd_p is None else
+                   jax.lax.with_sharding_constraint(
+                       jnp.asarray(B_odd_p, dtype=jnp.complex128), expected))
+    if Omega.ndim != 4 or tuple(Omega.shape) != tuple(residue.shape):
+        raise ValueError(
+            "write_complete_pole_store_collective requires equal rank-4 "
+            "Omega_p/B_p arrays shaped (n_p,n_q,n_mu_pad,n_mu_pad); got "
+            f"{tuple(Omega.shape)} and {tuple(residue.shape)}")
+    if odd_residue is not None and tuple(odd_residue.shape) != tuple(Omega.shape):
+        raise ValueError(
+            "write_complete_pole_store_collective requires B_odd_p to "
+            f"match Omega_p/B_p; got {tuple(odd_residue.shape)} and "
+            f"{tuple(Omega.shape)}")
+    n_p, n_q, n_mu_x, n_mu_y = map(int, Omega.shape)
+    n_mu = int(n_mu_logical)
+    if min(n_p, n_q, n_mu) < 1 or n_mu_x < n_mu or n_mu_y < n_mu:
+        raise ValueError(
+            "write_complete_pole_store_collective got incompatible logical "
+            f"extents: poles={tuple(Omega.shape)}, n_mu_logical={n_mu}")
+    finite = (jnp.isfinite(jnp.real(Omega))
+              & jnp.isfinite(jnp.imag(Omega))
+              & jnp.isfinite(jnp.real(residue))
+              & jnp.isfinite(jnp.imag(residue)))
+    if odd_residue is None:
+        live = jnp.abs(residue) > 0.0
+    else:
+        finite = (finite
+                  & jnp.isfinite(jnp.real(odd_residue))
+                  & jnp.isfinite(jnp.imag(odd_residue)))
+        live = ((jnp.abs(residue + odd_residue) > 0.0)
+                | (jnp.abs(residue - odd_residue) > 0.0))
+    bad_causal = live & ((jnp.real(Omega) <= 0.0)
+                         | (jnp.imag(Omega) > 0.0))
+    n_nonfinite, n_bad_causal = map(
+        int, jax.device_get((jnp.sum(~finite, dtype=jnp.int64),
+                             jnp.sum(bad_causal, dtype=jnp.int64))))
+    if n_nonfinite:
+        raise ValueError(
+            "write_complete_pole_store_collective refuses "
+            f"{n_nonfinite} non-finite pole/residue elements")
+    if n_bad_causal:
+        raise ValueError(
+            "write_complete_pole_store_collective refuses "
+            f"{n_bad_causal} live poles with Re Omega <= 0 or Im Omega > 0")
+
+    allocate_fit_store_collective(
+        dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n_p,
+        energy_unit=energy_unit, provenance=provenance,
+        occupation_state=occupation_state,
+        ordered_residues=odd_residue is not None, mode="w")
+    global_shape = (n_p, n_q, n_mu, n_mu)
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        io.create_dataset("Omega_p", shape=global_shape, dtype=np.complex128)
+        io.create_dataset("B_p", shape=global_shape, dtype=np.complex128)
+        if odd_residue is not None:
+            io.create_dataset(
+                "B_odd_p", shape=global_shape, dtype=np.complex128)
+        io.write_slab("Omega_p", Omega, offset=(0, 0, 0, 0),
+                      global_shape=global_shape)
+        io.write_slab("B_p", residue, offset=(0, 0, 0, 0),
+                      global_shape=global_shape)
+        if odd_residue is not None:
+            io.write_slab("B_odd_p", odd_residue, offset=(0, 0, 0, 0),
+                          global_shape=global_shape)
+    barrier("mpa_complete_poles_written")
+
+    if process_rank() == 0:
+        columns = np.arange(n_mu, dtype=np.int64)
+        records = tuple(
+            (iq, columns, 0, n_mu, 0.0, 0.0) for iq in range(n_q))
+        with _h5(dest, "a") as grp:
+            _commit_fit_blocks(_open_fit(grp), records)
+        finalize_fit_store(dest, certification=certification)
+    barrier("mpa_complete_poles_finalized")
     return fit_completion_ledger(dest)
 
 
@@ -3103,6 +3279,14 @@ def fit_completion_ledger(src, *, mode="r"):
             str(key)[len("prov_"):]: grp.attrs[key]
             for key in grp.attrs if str(key).startswith("prov_")
         }
+        ordered_residues = bool(
+            grp.attrs.get("mpa_fit_ordered_residues", False))
+        has_odd = "B_odd_p" in grp
+        if has_odd != ordered_residues:
+            raise ValueError(
+                "mpa_store: fit store's mpa_fit_ordered_residues stamp "
+                f"is {ordered_residues}, but B_odd_p presence is {has_odd}. "
+                "A partial ordered-residue schema is refused.")
         out = {
             "format_version": int(grp.attrs["mpa_fit_format_version"]),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
@@ -3118,6 +3302,7 @@ def fit_completion_ledger(src, *, mode="r"):
                 grp, "mpa_fit_w_centroid_hash"),
             "energy_unit": qs.qirr_attr_str(grp, FIT_ENERGY_UNIT_ATTR),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
+            "ordered_residues": ordered_residues,
             "complete": bool(grp.attrs.get("mpa_fit_complete", False)),
             "blocks_done": done,
             "n_done": int(done.sum()),
@@ -3485,7 +3670,7 @@ def read_fit_unfold_tables(src, *, mode="r"):
         return qs.read_tables(grp, FIT_TABLE_OWNER, mode=mode)
 
 
-def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
+def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy, B_odd_p=None):
     """Unfold one pole wedge without conjugating its frequency dependence."""
     import jax.numpy as jnp
 
@@ -3509,12 +3694,18 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
         jnp.asarray(Omega_p), L_table=zeros, **kwargs)
     B_full = unfold_isdf_operator(
         jnp.asarray(B_p), L_table=can.L_table, **kwargs)
-    return Omega_full, B_full
+    if B_odd_p is None:
+        return Omega_full, B_full
+    if tuple(B_odd_p.shape) != tuple(Omega_p.shape):
+        raise ValueError("odd-residue pole slab must match Omega_p")
+    D_full = unfold_isdf_operator(
+        jnp.asarray(B_odd_p), L_table=can.L_table, **kwargs)
+    return Omega_full, B_full, D_full
 
 
 def _finish_pole_read(
     src, Omega, Bp, ledger, *, mesh_xy, unfold, return_sharded, to_unit,
-    tables=_UNREAD,
+    tables=_UNREAD, B_odd=None, include_odd=False,
 ):
     """Apply the one unit/unfold policy shared by pole readers.
 
@@ -3526,6 +3717,8 @@ def _finish_pole_read(
     if to_unit is not None:
         scale = _unit_scale(ledger["energy_unit"], to_unit, "pole read")
         Omega, Bp = Omega * scale, Bp * scale
+        if B_odd is not None:
+            B_odd = B_odd * scale
 
     if unfold and ledger["q_storage"] == "ibz":
         import jax.numpy as jnp
@@ -3537,15 +3730,27 @@ def _finish_pole_read(
         if tables is None:
             raise ValueError("wedge fit has no unfold tables")
         if Omega.ndim == 3:
-            Omega, Bp = unfold_pole_field(Omega, Bp, tables, mesh_xy=mesh_xy)
+            unfolded = unfold_pole_field(
+                Omega, Bp, tables, mesh_xy=mesh_xy, B_odd_p=B_odd)
+            if B_odd is None:
+                Omega, Bp = unfolded
+            else:
+                Omega, Bp, B_odd = unfolded
         else:
-            Omega, Bp = map(
-                jnp.stack,
-                zip(*(unfold_pole_field(Omega[p], Bp[p], tables,
-                                        mesh_xy=mesh_xy)
-                      for p in range(int(Omega.shape[0])))))
+            unfolded = tuple(
+                unfold_pole_field(
+                    Omega[p], Bp[p], tables, mesh_xy=mesh_xy,
+                    B_odd_p=None if B_odd is None else B_odd[p])
+                for p in range(int(Omega.shape[0])))
+            stacked = tuple(map(jnp.stack, zip(*unfolded)))
+            if B_odd is None:
+                Omega, Bp = stacked
+            else:
+                Omega, Bp, B_odd = stacked
     if return_sharded and mesh_xy is None:
         raise ValueError("return_sharded requires mesh_xy")
+    if include_odd:
+        return Omega, Bp, B_odd
     return Omega, Bp
 
 
@@ -3584,9 +3789,9 @@ class PoleReader:
     """ONE collective handle serving every pole batch of one iteration.
 
     WHY THIS EXISTS (audit A1 fix 2).  The Σ stage walks the pole axis in
-    batches so no complete pole tensor ever exists on host or device, and
-    it walks it TWICE per iteration — once for the census that plans the
-    windows, once for the spatial executor.  Called through
+    batches so no complete pole tensor ever exists on host or device.  The
+    pane control walks it twice (census, executor); the box route walks it
+    three times (pole CDF, selected-region census, executor).  Called through
     :func:`read_poles`, each batch opened and closed its own h5py handle
     (ledger), its own collective ``SlabIO``, and a THIRD h5py handle for
     the unfold tables — and the third one landed *between* the two, so the
@@ -3652,7 +3857,7 @@ class PoleReader:
             io.close()
 
     def read(self, pole_slice=None, *, unfold=False, return_sharded=False,
-             to_unit=None):
+             to_unit=None, include_odd=False):
         """One contiguous pole range, through the handle already open."""
         if self._io is None:
             raise ValueError(
@@ -3670,10 +3875,15 @@ class PoleReader:
         Bp = self._io.read_slab(
             "B_p", shape=shape, offset=(lo, 0, 0, 0),
             partition_spec=P(None, None, "x", "y"))
+        B_odd = None
+        if include_odd and self.ledger["ordered_residues"]:
+            B_odd = self._io.read_slab(
+                "B_odd_p", shape=shape, offset=(lo, 0, 0, 0),
+                partition_spec=P(None, None, "x", "y"))
         return _finish_pole_read(
             self.src, Omega, Bp, self.ledger, mesh_xy=self.mesh_xy,
             unfold=unfold, return_sharded=return_sharded, to_unit=to_unit,
-            tables=self.tables)
+            tables=self.tables, B_odd=B_odd, include_odd=include_odd)
 
 
 def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
@@ -3698,6 +3908,7 @@ def read_poles(
     return_sharded=False,
     to_unit=None,
     allow_partial=False,
+    include_odd=False,
     mode="r",
 ):
     """Read one contiguous pole range with two collective SlabIO reads.
@@ -3742,7 +3953,8 @@ def read_poles(
         with open_pole_reader(src, mesh_xy=mesh_xy,
                               allow_partial=allow_partial, mode=mode) as rd:
             return rd.read(pole_slice, unfold=unfold,
-                           return_sharded=return_sharded, to_unit=to_unit)
+                           return_sharded=return_sharded, to_unit=to_unit,
+                           include_odd=include_odd)
 
     with _h5(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
@@ -3750,6 +3962,9 @@ def read_poles(
         lo, hi = _pole_range(ledger, pole_slice, "read_poles")
         Omega = np.asarray(grp["Omega_p"][lo:hi])
         Bp = np.asarray(grp["B_p"][lo:hi])
+        B_odd = (np.asarray(grp["B_odd_p"][lo:hi])
+                 if include_odd and ledger["ordered_residues"] else None)
     return _finish_pole_read(
         src, Omega, Bp, ledger, mesh_xy=None, unfold=unfold,
-        return_sharded=return_sharded, to_unit=to_unit)
+        return_sharded=return_sharded, to_unit=to_unit,
+        B_odd=B_odd, include_odd=include_odd)

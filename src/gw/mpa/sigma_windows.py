@@ -31,12 +31,17 @@ class SharedSigmaWindow(NamedTuple):
     omega_abs: np.ndarray
     omega_idx: np.ndarray
     pole_indices: np.ndarray
+    #: Per-leading-pole selector rows.  Shape ``(n_poles, 6)`` for pane
+    #: windows or ``(n_poles, n_regions, 6)`` for a disjoint region union.
     bounds: np.ndarray
     phase_real: np.ndarray
     #: The owning branch's fractional weight (f or 1−f), or None for the
     #: incumbent bool-mask semantics.  The executor folds it into the A-side
     #: selector operand; planning here uses only the SUPPORT mask.
     band_weight: jax.Array | None = None
+    #: Green's-function branch owning this row.  Ordered residues use the
+    #: same conduction->R+ / valence->R- selection as GN-PPM.
+    space: str = ""
 
 
 _INF = np.inf
@@ -98,6 +103,67 @@ def _stats_by_pole(Omega, B, bounds):
         else:
             out.append(tuple(float(x[i]) for x in arrays[1:]))
     return tuple(out)
+
+
+def _selected_by_regions(a, gamma, bounds):
+    """Return the union of fixed-shape ``(a, gamma)`` rectangles."""
+    regions = jnp.asarray(bounds)
+    if regions.ndim == 1:
+        regions = regions[None, :]
+
+    def add_region(index, selected):
+        b = jax.lax.dynamic_index_in_dim(
+            regions, index, axis=0, keepdims=False)
+        return selected | (
+            (a > b[0]) & (a <= b[1])
+            & (gamma >= b[2]) & (gamma > b[3])
+            & (gamma < b[4]) & (gamma <= b[5]))
+
+    return jax.lax.fori_loop(
+        0, regions.shape[0], add_region, jnp.zeros(a.shape, dtype=bool))
+
+
+@jax.jit
+def _weighted_stats_all_poles(Omega, B, bounds):
+    """Per-leading-pole geometry and ``sum(abs(B))`` for a region union."""
+    a, gamma = jnp.real(Omega), -jnp.imag(Omega)
+    live = _selected_by_regions(a, gamma, bounds) & (jnp.abs(B) > 0.0)
+    axes = tuple(range(1, Omega.ndim))
+    return (
+        jnp.sum(live, axis=axes, dtype=jnp.int64),
+        jnp.min(jnp.where(live, a, jnp.inf), axis=axes),
+        jnp.max(jnp.where(live, a, -jnp.inf), axis=axes),
+        jnp.min(jnp.where(live, gamma, jnp.inf), axis=axes),
+        jnp.max(jnp.where(live, gamma, -jnp.inf), axis=axes),
+        jnp.sum(jnp.where(live, jnp.abs(B), 0.0), axis=axes),
+    )
+
+
+def summarize_sigma_pole_regions(
+    Omega_poles, B_poles, selectors, *, pole_offset=0,
+):
+    """Reduce disjoint pole-region unions to geometry and residue weight.
+
+    ``Omega_poles`` and ``B_poles`` have shape
+    ``(n_poles, n_q, n_mu, n_mu)``.  Each selector is one or more rows
+    ``(a_gt, a_le, gamma_ge, gamma_gt, gamma_lt, gamma_le)``.  Its rows
+    are ORed, and each nonempty returned value is
+    ``(a_min, a_max, gamma_min, gamma_max, sum_abs_B)``.
+    """
+    if B_poles.shape != Omega_poles.shape:
+        raise ValueError("Omega_poles and B_poles must have identical shapes")
+    output = {name: [] for name in selectors}
+    for name, bounds in selectors.items():
+        arrays = tuple(np.asarray(x) for x in jax.device_get(
+            _weighted_stats_all_poles(Omega_poles, B_poles, bounds)))
+        for local in range(int(Omega_poles.shape[0])):
+            output[name].append(
+                None if not int(arrays[0][local]) else
+                tuple(float(x[local]) for x in arrays[1:]))
+    return tuple(
+        (int(pole_offset) + local,
+         {name: values[local] for name, values in output.items()})
+        for local in range(int(Omega_poles.shape[0])))
 
 
 def _geometry(branches, regularization_width_ry, edge_factor, weight_floor):
@@ -400,8 +466,9 @@ def build_shared_sigma_windows(
     causal branches use the existing rotated-Laplace minimax service.  Pole
     batching is solely an executor memory policy and never a spectral split.
 
-    ``target_error`` bounds the dimensionless residual ``|1-d Q(d)|``.
-    The delivered planner apportions it among windows by delivered mass.
+    ``target_error`` bounds the dimensionless residual ``|1-d Q(d)|`` in
+    this frozen pane-control builder.  Production MPA uses
+    ``gw.sigma_box_plan`` and does not apportion error by delivered mass.
 
     Omega clusters come from the requested grid and its own step
     (``sigma_omega_step_ev``), not from a separate tolerance.  Every patch in
@@ -528,7 +595,7 @@ def build_shared_sigma_windows(
                 win, branch.E_A, branch.omega_abs, branch.omega_idx,
                 np.asarray(pole_i, np.int32), np.asarray(bounds),
                 np.asarray(phases, bool),
-                band_weight=branch.band_weight))
+                band_weight=branch.band_weight, space=branch.space))
 
     gap_ry = 1.5 * float(omega_grid_step_ry)
     if not (np.isfinite(gap_ry) and gap_ry > 0.0):
@@ -596,7 +663,8 @@ def build_shared_sigma_windows(
                     output.append(SharedSigmaWindow(
                         win, _branch.E_A, _branch.omega_abs,
                         _branch.omega_idx, idx, bounds, phase,
-                        band_weight=_branch.band_weight))
+                        band_weight=_branch.band_weight,
+                        space=_branch.space))
         elif idx.size:
             for _branch, neg, clusters in branch_clusters:
                 mask_core, eb_core = a_space(
@@ -668,7 +736,8 @@ def build_shared_sigma_windows(
                             win, _branch.E_A, omega_c, omega_idx_c,
                             np.asarray(idx)[keep], rows_bounds,
                             np.asarray(phase)[keep],
-                            band_weight=_branch.band_weight))
+                            band_weight=_branch.band_weight,
+                            space=_branch.space))
                         deep_rows = [i for i, row in enumerate(stats)
                                      if row[1] > a_cut]
                         if deep_rows:
@@ -705,7 +774,8 @@ def build_shared_sigma_windows(
                                 win, E_A_local, omega_c, omega_idx_c,
                                 np.asarray(idx)[deep_rows], deep_bounds,
                                 kept_phase,
-                                band_weight=_branch.band_weight))
+                                band_weight=_branch.band_weight,
+                                space=_branch.space))
                     if eb_n is not None:
                         rectangles = _stats_rectangles(
                             stats, phases_rows,
@@ -736,7 +806,8 @@ def build_shared_sigma_windows(
                         output.append(SharedSigmaWindow(
                             win, E_A_local, omega_c, omega_idx_c,
                             idx, bounds, phase,
-                            band_weight=_branch.band_weight))
+                            band_weight=_branch.band_weight,
+                            space=_branch.space))
                     if eb_p is not None:
                         rectangles = _stats_rectangles(
                             stats, phases_rows,
@@ -765,7 +836,8 @@ def build_shared_sigma_windows(
                         output.append(SharedSigmaWindow(
                             win, E_A_local, omega_c, omega_idx_c,
                             idx, bounds, phase,
-                            band_weight=_branch.band_weight))
+                            band_weight=_branch.band_weight,
+                            space=_branch.space))
 
     if sliver_branches:
         # Wrong-side slivers of the sign-definite branches × shallow poles:
@@ -823,7 +895,7 @@ def build_shared_sigma_windows(
                 output.append(SharedSigmaWindow(
                     win, branch.E_A, omega_c, omega_idx_c,
                     rows_idx, rows_bounds, rows_phase,
-                    band_weight=branch.band_weight))
+                    band_weight=branch.band_weight, space=branch.space))
 
             def _sliver_laplace(branch, neg, mask_lo, eb_lo, omega_c,
                                 omega_idx_c, w_lo, w_hi, a_floor, note):
@@ -855,7 +927,7 @@ def build_shared_sigma_windows(
                 output.append(SharedSigmaWindow(
                     win, branch.E_A, omega_c, omega_idx_c,
                     rows_idx, rows_bounds, rows_phase,
-                    band_weight=branch.band_weight))
+                    band_weight=branch.band_weight, space=branch.space))
 
             for branch, neg, mask_lo, eb_lo in sliver_branches:
                 omega_all = np.asarray(branch.omega_abs, np.float64)
@@ -927,4 +999,5 @@ def build_shared_sigma_windows(
 __all__ = [
     "CROSSING_NODE_FLOOR", "SharedSigmaWindow",
     "build_shared_sigma_windows", "summarize_sigma_poles",
+    "summarize_sigma_pole_regions",
 ]

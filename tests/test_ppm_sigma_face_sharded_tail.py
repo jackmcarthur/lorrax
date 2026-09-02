@@ -149,7 +149,7 @@ def check_face_sharded_tail_parity(mesh):
                 ppm_sigma, "_run_sigma_branch",
                 side_effect=_analytic_branch_tiles):
             with mesh:
-                return ppm_sigma.compute_sigma_c_ppm_omega_grid(
+                return ppm_sigma._compute_sigma_c_ppm_omega_grid_incumbent(
                     wfns, ppm, meta, mesh,
                     ppm_cfg=ppm_cfg,
                     sigma_cfg=sigma_cfg,

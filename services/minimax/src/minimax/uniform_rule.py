@@ -68,7 +68,10 @@ from numpy.linalg import lstsq, svd
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.linalg import qr as _pivoted_qr
 
-__all__ = ["UniformRule", "build_uniform_rule", "box_samples", "rule_sup_error"]
+__all__ = [
+    "UniformRule", "build_uniform_rule", "box_samples",
+    "rule_amplification_p99", "rule_sup_error",
+]
 
 
 # ----------------------------------------------------------------- support cloud
@@ -965,6 +968,45 @@ def rule_sup_error(times, weights, d, rho=None):
     err = np.abs(Q - 1.0 / d) * (d.imag.min() if rho is None else rho)
     kappa = np.abs(A * weights[None, :]).sum(1) / np.maximum(np.abs(Q), 1e-300)
     return float(err.max()), float(kappa.max())
+
+
+def rule_amplification_p99(times, weights, box, theta_deg):
+    """Area-weighted 99th percentile of term cancellation on a rule box.
+
+    This diagnostic uses the same fine cloud as the builder's sup check, but
+    weights each sample by its Voronoi area in the rectangle.  The weighting
+    removes the adaptive cloud's sampling density, so this remains a function
+    only of ``(rule, box)`` rather than becoming a spectral histogram.  It is
+    the measure-independent analogue of the executor noise gate's historical
+    ``kappa_p99`` statistic.
+    """
+    re_lo, re_hi, im_lo, im_hi = map(float, box)
+    theta = np.deg2rad(float(theta_deg))
+    d = box_samples(
+        re_lo, re_hi, im_lo, im_hi, per_unit=8.0,
+        n_im=2 * _im_levels(theta))
+    weights = np.asarray(weights, np.complex128)
+    A = _cexp(
+        1.0j * d[:, None] * np.asarray(times, np.complex128)[None, :])
+    Q = A @ weights
+    kappa = (np.abs(A * weights[None, :]).sum(axis=1)
+             / np.maximum(np.abs(Q), 1.0e-300))
+
+    levels = np.unique(d.imag)
+    sampled_im_hi = max(im_hi, im_lo * 1.0001)
+    im_edges = np.concatenate((
+        [im_lo], 0.5 * (levels[:-1] + levels[1:]), [sampled_im_hi]))
+    area = np.empty(d.size, dtype=np.float64)
+    for level, im_width in zip(levels, np.diff(im_edges)):
+        indices = np.flatnonzero(d.imag == level)
+        real = d.real[indices]
+        re_edges = np.concatenate((
+            [re_lo], 0.5 * (real[:-1] + real[1:]), [re_hi]))
+        area[indices] = np.diff(re_edges) * im_width
+    order = np.argsort(kappa, kind="stable")
+    cumulative = np.cumsum(area[order])
+    return float(kappa[order][
+        np.searchsorted(cumulative, 0.99 * cumulative[-1])])
 
 
 @dataclass(frozen=True)
