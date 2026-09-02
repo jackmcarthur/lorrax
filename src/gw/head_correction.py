@@ -1824,7 +1824,21 @@ def fit_head_ppm_from_samples(
     *,
     probe_omega: complex,
 ) -> HeadGNParams:
-    """Fit the scalar PPM head from resolved static and probe-frequency samples."""
+    """Fit the scalar PPM head from resolved static and probe-frequency samples.
+
+    THE ``.real`` IS THE HERMITIAN PART, AND IT IS THE WHOLE HEAD.  On a
+    time-reversal-broken deck the Cartesian head tensor ``S_ab(iω)`` has an
+    anti-Hermitian, magnetisation-odd part, but that part is ``∝ ω (P^{ab} −
+    P^{ba})`` — ANTISYMMETRIC in ``ab`` — and the scalar head is the
+    isotropic average ``⟨q̂_a S_ab q̂_b⟩``, which annihilates every
+    antisymmetric tensor.  The scalar GN head is therefore exactly
+    time-reversal-even: its odd residue is identically zero, and taking the
+    real part of a 1×1 Hermitian half is not an approximation
+    (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6; gated in
+    ``tests/test_gnppm_ordered_orientations.py``).  The channel lives only in
+    the antisymmetric (Faraday-like) part of ``S_ab``, which no scalar head
+    can carry.
+    """
     return fit_head_ppm(
         vc0=float(head_static.vc0.real),
         wcoul0_static=float(head_static.wcoul0.real),
