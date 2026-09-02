@@ -581,7 +581,12 @@ def test_slab_gamma_and_nondivisor_8_to_12_c1_use_the_service_channel():
     """The requested slab path: service Γ + LCM overlap, unlike legacy."""
     geom = _geom("sc")
     cg, fg = (8, 8, 1), (12, 12, 1)
-    opts = dict(nsamples=2**8, method="sobol", qmc_reps=2)
+    # No sampler dials.  Since 2026-09-01 the slab Gamma-cell average is the
+    # exact Wigner-Seitz polygon cubature (one owner with the packed photon
+    # completion), which takes no sample count, sequence or replicate count;
+    # passing the old Sobol dials here would have selected nothing and made
+    # this identity pass for the wrong reason.
+    opts = {}
     gamma_c = gamma_cell_head_scalar(
         geom, cg, _S_ISO, sys_dim=2, **opts)
     direct_c = complex(Slab2D().q0_average(

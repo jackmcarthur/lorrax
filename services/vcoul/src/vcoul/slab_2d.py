@@ -4,8 +4,22 @@
 
 :func:`~vcoul.minibz.sample_minibz_qpoints` already sets ``qz=0`` when
 ``is_2d``; this module just supplies the formula.
+
+THE q→0 CELL AVERAGE HAS ONE OWNER (2026-09-01).  ``⟨v⟩`` and
+``⟨v/(1 − v qᵀSq)⟩`` at Γ are evaluated on the exact Wigner--Seitz
+Duffy--Gauss ladder issued by
+:func:`~vcoul.minibz.slab_minibz_photon_cubature` — the same provider
+receipt, the same nodes and the same weights the packed bispinor Γ
+completion (``gw.head_correction.complete_static_slab_photon_q0``)
+consumes, so the scalar route and the packed completion evaluate the same
+integral with the same rule.  The historical scrambled-Sobol draw is the
+named DEBUG rule ``sobol_debug``: it carries a ~0.1–0.2 % sampling error
+on the ``|q|`` cusp that is deterministic per seed and therefore invisible
+as noise (+5.72 meV per occupied state on MoS2 3×3, lane J claim 0586).
 """
 from __future__ import annotations
+
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -15,9 +29,49 @@ from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
                           minibz_inscribed_sphere_r2,
-                          minibz_transverse_head_avg, minibz_voronoi_batches)
+                          minibz_transverse_head_avg, minibz_voronoi_batches,
+                          slab_minibz_photon_cubature)
 
-__all__ = ["Slab2D"]
+__all__ = ["Slab2D", "Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG"]
+
+#: The production q→0 cell-average rule: the exact mini-lattice
+#: Wigner--Seitz polygon, Γ-to-edge Duffy triangulation, fixed 16/24/32
+#: Gauss--Legendre ladder.  ONE owner, shared with the packed completion.
+Q0_RULE_EXACT = "wigner_seitz_polygon"
+#: DEBUG/DIAGNOSTIC ONLY: the historical scrambled-Sobol Voronoi draw.
+#: Reachable only by naming it; never a production rule.
+Q0_RULE_SOBOL_DEBUG = "sobol_debug"
+_Q0_RULES = (Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG)
+
+# Same mixed absolute+relative budget the packed completion applies to its
+# own polygon ladder (``gw.head_correction``
+# ``_STATIC_PHOTON_POLYGON_CONVERGENCE_{ATOL,RTOL}``); the two consumers
+# assert convergence of the same provider ladder, so the budget is one
+# number written twice rather than two policies.
+_Q0_LADDER_RTOL = 1.0e-8
+_Q0_LADDER_ATOL = 1.0e-12
+
+_Q0_RULE_ANNOUNCED: set[str] = set()
+
+
+def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
+    """Name the q→0 rule that answered, once per process.
+
+    ``print`` reaches a direct caller (a test, a tool, a service consumer).
+    A LORRAX production driver routes incidental component stdout to
+    ``os.devnull`` on purpose (``runtime.production_stream.ProductionStdout``)
+    and keeps only its own reporter, so the production certificate does not
+    reach ``gwjax.out`` today; that seam is registered.  ``warn=True`` also
+    raises a ``RuntimeWarning``, which that boundary DOES route into the
+    driver's warning block — reserved for selecting the DEBUG rule, which
+    must never run unnoticed inside a production driver.
+    """
+    if line in _Q0_RULE_ANNOUNCED:
+        return
+    _Q0_RULE_ANNOUNCED.add(line)
+    print(line, flush=True)
+    if warn:
+        warnings.warn(line, RuntimeWarning, stacklevel=3)
 
 
 class Slab2D:
@@ -132,15 +186,209 @@ class Slab2D:
         S_cart=None,
         epshead=None,
         static_kappa2=None,
+        rule: str = Q0_RULE_EXACT,
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
     ):
+        """``(⟨v⟩, ⟨v/(1 − v qᵀSq)⟩)`` over the Γ mini-BZ cell, bare units.
+
+        ONE OWNER.  ``rule`` is a named selection with no silent
+        alternative:
+
+        * ``"wigner_seitz_polygon"`` (default, PRODUCTION) — the exact
+          mini-lattice Wigner--Seitz polygon cubature issued by
+          :func:`~vcoul.minibz.slab_minibz_photon_cubature`.  The scalar
+          charge head and the packed bispinor Γ completion therefore
+          evaluate the same integral on the same nodes and weights.  The
+          16/24/32 ladder's last pair must converge under the mixed
+          absolute+relative budget or the call REFUSES; the certificate is
+          announced once per process.
+        * ``"sobol_debug"`` — DEBUG/DIAGNOSTIC ONLY, the historical
+          scrambled-Sobol Voronoi draw, kept so the superseded estimator
+          stays reproducible.  ``nsamples``/``method``/``qmc_reps`` and
+          ``analytic_sphere`` are ITS dials and have no meaning under the
+          production rule, which is exact and takes no order knob.  It
+          announces itself on stdout.
+
+        ``analytic_sphere`` is the deck's ``head_minibz_average`` key.  For
+        the slab it only ever widened the Sobol draw's Voronoi fold
+        (``nmax`` 1→3); the exact rule integrates the Wigner--Seitz cell
+        itself, so there is no fold to widen and the key is REFUSED rather
+        than silently ignored.
+
+        ``epshead`` (no ``S_cart``) keeps the historical Ismail--Beigi
+        gamma model for ``wcoul0``, now evaluated on the same exact nodes.
+        """
         if static_kappa2 is not None:
             raise NotImplementedError(
                 "static_kappa2 is the 3D Thomas-Fermi model; the 2D metallic "
                 "q->0 form requires its separate |q| kernel")
+        if rule not in _Q0_RULES:
+            raise ValueError(
+                "GATE slab_q0_rule_unknown: the slab q->0 cell average has "
+                f"one production rule and one debug rule; got rule={rule!r}, "
+                f"want one of {_Q0_RULES!r}.  Fix: drop the argument to take "
+                f"{Q0_RULE_EXACT!r}.  doc: docs/services/vcoul.md.")
+        if rule == Q0_RULE_SOBOL_DEBUG:
+            _announce_q0_rule(
+                "[vcoul] q0_average rule = sobol_debug (DEBUG): scrambled-"
+                f"Sobol Voronoi draw, nsamples={nsamples}, method={method!r}, "
+                f"qmc_reps={qmc_reps}, analytic_sphere={bool(analytic_sphere)}."
+                "  This is NOT the production rule; it carries a ~0.1-0.2 % "
+                "sampling error on the |q| cusp (claim 0586).  Production is "
+                f"rule={Q0_RULE_EXACT!r}.", warn=True)
+            return self._q0_average_sobol_debug(
+                geometry, kgrid, S_cart=S_cart, epshead=epshead,
+                nsamples=nsamples, method=method, qmc_reps=qmc_reps,
+                analytic_sphere=analytic_sphere)
+        if analytic_sphere:
+            raise ValueError(
+                "GATE slab_q0_analytic_sphere_unavailable: "
+                "head_minibz_average/analytic_sphere widened the Sobol "
+                "draw's Voronoi fold; got analytic_sphere=True, want False. "
+                f"The production rule {Q0_RULE_EXACT!r} integrates the exact "
+                "Wigner-Seitz cell, so there is no fold to widen and no "
+                "Baldereschi-Tosatti sphere in 2D (the slab head is a |q| "
+                "cusp, not a 1/q^2 pole).  Fix: unset head_minibz_average on "
+                f"a sys_dim=2 deck, or ask for rule={Q0_RULE_SOBOL_DEBUG!r} "
+                "explicitly.  doc: docs/services/vcoul.md.")
+        return self._q0_average_wigner_seitz(
+            geometry, kgrid, S_cart=S_cart, epshead=epshead)
+
+    def _q0_average_wigner_seitz(
+        self, geometry: CoulombGeometry, kgrid, *, S_cart, epshead,
+    ):
+        """The production rule: the provider's exact WS/Duffy ladder.
+
+        Nothing is re-derived here.  The nodes ``q``, the normalized
+        weights ``w`` and the kernel value ``v = D_raw[:, 0, 0]`` are read
+        straight off the authenticated receipt the packed completion
+        consumes, so ``⟨v⟩`` here and ``bare_D_mean[0, 0]`` there are the
+        same reduction of the same numbers.
+        """
+        # ``slab_minibz_photon_cubature`` authenticates the EXACT service
+        # kernel type (a lorrax (wfn, meta)-facing subclass is not it), so
+        # the canonical kernel is constructed when ``self`` is a subclass.
+        # ``_v_bare_per_q`` is inherited, so this is the same arithmetic.
+        base_kernel = self if type(self) is Slab2D else Slab2D()
+        receipt = slab_minibz_photon_cubature(
+            base_kernel, geometry, tuple(int(s) for s in kgrid))
+        S2 = None if S_cart is None else np.asarray(
+            S_cart, dtype=np.complex128)
+        ladder = []
+        for chunk in receipt.chunks:
+            n_valid = int(chunk.physical_count)
+            weight = np.asarray(
+                chunk.sample_weight[:n_valid], dtype=np.float64)
+            q_cart = np.asarray(chunk.q_cart[:n_valid], dtype=np.float64)
+            v = np.asarray(chunk.D_raw[:n_valid, 0, 0], dtype=np.float64)
+            measure = float(np.sum(weight))
+            if not np.isfinite(measure) or measure <= 0.0:
+                raise ValueError(
+                    "GATE slab_q0_polygon_measure: provider-issued slab "
+                    f"cubature order {chunk.order} has nonpositive measure")
+            vc0 = complex(np.sum(weight * v) / measure)
+            if S2 is None:
+                wcoul0 = None
+            else:
+                qSq = np.einsum(
+                    "qi,ij,qj->q", q_cart, S2, q_cart, optimize=True)
+                wcoul0 = complex(
+                    np.sum(weight * (v / (1.0 - v * qSq))) / measure)
+            ladder.append((int(chunk.order), vc0, wcoul0))
+        vc0_mean = ladder[-1][1]
+        wcoul0 = ladder[-1][2]
+        self._require_q0_ladder_converged(receipt, ladder)
+        if wcoul0 is None:
+            wcoul0 = self._q0_epshead_gamma_average(
+                geometry, receipt, epshead)
+        if not (np.isfinite(vc0_mean) and np.isfinite(wcoul0)):
+            raise ValueError(
+                "GATE slab_q0_polygon_nonfinite: the exact slab q->0 cell "
+                f"average is non-finite (<v>={vc0_mean!r}, <W>={wcoul0!r})")
+        return (jnp.asarray(vc0_mean, dtype=jnp.complex128),
+                jnp.asarray(wcoul0, dtype=jnp.complex128))
+
+    @staticmethod
+    def _require_q0_ladder_converged(receipt, ladder) -> None:
+        """Refuse an unconverged ladder; announce the certificate once."""
+        ratios = []
+        for index in range(1, len(ladder)):
+            for slot in (1, 2):
+                previous, current = ladder[index - 1][slot], ladder[index][slot]
+                if previous is None or current is None:
+                    continue
+                delta = abs(current - previous)
+                scale = max(abs(previous), abs(current))
+                values = np.asarray(
+                    (delta, scale, abs(current)), dtype=np.float64)
+                if not np.all(np.isfinite(values)):
+                    raise ValueError(
+                        "GATE slab_q0_polygon_nonfinite: the fixed 16/24/32 "
+                        "cubature ladder produced non-finite diagnostics")
+                ratios.append(
+                    delta / (_Q0_LADDER_ATOL + _Q0_LADDER_RTOL * scale))
+        if not ratios:
+            raise ValueError(
+                "GATE slab_q0_polygon_nonfinite: the cubature ladder yielded "
+                "no comparable orders")
+        if ratios[-1] > 1.0:
+            raise ValueError(
+                "GATE slab_q0_polygon_not_converged: the final polygon "
+                "Duffy--Gauss order pair "
+                f"{receipt.orders[-2]}->{receipt.orders[-1]} did not converge "
+                "the slab q->0 cell average under the mixed absolute+relative "
+                f"budget: error_ratio={ratios[-1]:.3e} > 1 "
+                f"(atol={_Q0_LADDER_ATOL:.1e}, rtol={_Q0_LADDER_RTOL:.1e}).  "
+                "The provider ladder is fixed; refusing the head rather than "
+                "accepting a caller dial.")
+        _announce_q0_rule(
+            f"[vcoul] q0_average rule = {Q0_RULE_EXACT} (production): exact "
+            f"Wigner-Seitz polygon, {len(receipt.polygon_vertices)} edges, "
+            f"orders {receipt.orders}, nodes {receipt.physical_counts}; "
+            f"<v>={ladder[-1][1].real:.9g} a.u.; ladder error_ratio="
+            f"{ratios[-1]:.3e} (<= 1 required).  Same receipt the packed "
+            "Gamma completion consumes.")
+
+    @staticmethod
+    def _q0_epshead_gamma_average(geometry, receipt, epshead):
+        """Historical Ismail-Beigi gamma model, on the exact nodes."""
+        if epshead is None:
+            raise ValueError(
+                "GATE slab_q0_head_source: the slab q->0 screened head needs "
+                "either S_cart (the anisotropic q^2 tensor) or epshead (the "
+                "Ismail-Beigi gamma model); both are None")
+        bvec = np.asarray(geometry.bvec, dtype=np.float64)
+        zc = float(receipt.slab_zc)
+        q0_cart = np.asarray((0.001, 0.0, 0.0), dtype=np.float64) @ bvec
+        q0len = float(np.linalg.norm(q0_cart))
+        vc_q0 = (1.0 - np.exp(-q0len * zc)) / (q0len * q0len)
+        eps_real = float(np.real(np.asarray(epshead)))
+        gamma = (1.0 / eps_real - 1.0) / ((q0len * q0len) * vc_q0)
+        chunk = receipt.chunks[-1]
+        n_valid = int(chunk.physical_count)
+        weight = np.asarray(chunk.sample_weight[:n_valid], dtype=np.float64)
+        kxy = np.linalg.norm(
+            np.asarray(chunk.q_cart[:n_valid, :2], dtype=np.float64), axis=1)
+        vc_q = (1.0 - np.exp(-kxy * zc)) / (kxy * kxy)
+        wq = vc_q / (1.0 + vc_q * (kxy * kxy) * gamma)
+        return complex(
+            8.0 * np.pi * float(np.sum(weight * wq) / np.sum(weight)))
+
+    def _q0_average_sobol_debug(
+        self, geometry: CoulombGeometry, kgrid, *,
+        S_cart, epshead, nsamples: int, method: str, qmc_reps: int,
+        analytic_sphere: bool,
+    ):
+        """DEBUG RULE ONLY — the superseded scrambled-Sobol Voronoi draw.
+
+        Byte-for-byte the estimator that shipped before 2026-09-01, kept so
+        the superseded numbers stay reproducible (claim 0586 measured it
+        against the exact rule).  It has NO production caller; see the
+        module docstring for why.
+        """
         nkx, nky, nkz = (int(s) for s in kgrid)
         bvec = jnp.asarray(geometry.bvec, dtype=jnp.float64)
         self.truncation_half_height(geometry)  # orientation refusal
@@ -207,13 +455,24 @@ class Slab2D:
     ) -> np.ndarray:
         """``T_ab = ⟨v_slab(q) t_ab(q̂)⟩_mBZ`` at q=Γ — the bare Coulomb-
         gauge transverse-projector head (bispinor TT), bare units (no
-        ``1/celvol``).  Same draw as :meth:`q0_average` (``nmax`` 1↔3 on
-        the same ``analytic_sphere`` flag, ``is_2d=True``), so a caller
-        pinned to the CC ``vc0`` sampler gets the SAME sample points for
-        the TT head — see :func:`~vcoul.minibz.minibz_transverse_head_avg`
-        for the estimator and the physics it replaces (the missing q=Γ,
-        G=0 slot of the bare TT tiles,
-        ``docs/BISPINOR_DHFB_DESIGN.md`` §11).
+        ``1/celvol``).  Scrambled-Sobol Voronoi draw (``nmax`` 1↔3 on the
+        ``analytic_sphere`` flag, ``is_2d=True``) — see
+        :func:`~vcoul.minibz.minibz_transverse_head_avg` for the estimator
+        and the physics it replaces (the missing q=Γ, G=0 slot of the bare
+        TT tiles, ``docs/BISPINOR_DHFB_DESIGN.md`` §11).
+
+        NOT THE SAME RULE AS :meth:`q0_average` SINCE 2026-09-01.  The
+        scalar charge head moved to the exact Wigner--Seitz polygon
+        cubature (``Q0_RULE_EXACT``); this TT head is still the Sobol
+        draw, so it still carries the ~0.1–0.2 % cusp sampling error the
+        scalar head shed.  It has one production caller, the incumbent
+        ``bare_transverse`` route's ``gw.v_q_bispinor._tt_head_tensor``;
+        the packed route takes its TT head from the same receipt
+        ``q0_average`` now uses and is unaffected.  Registered in
+        ``KNOWN_LORRAX_ISSUES.md``; the fix is the same three lines
+        (``receipt.chunks[-1].D_raw[:, 1:, 1:] / COULOMB_GAUGE_TT_SIGN``)
+        and it moves the incumbent route's numbers, so it wants its own
+        gate.
         """
         nkx, nky, nkz = (int(s) for s in kgrid)
         bvec = np.asarray(geometry.bvec, dtype=np.float64)

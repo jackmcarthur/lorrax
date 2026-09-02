@@ -169,11 +169,14 @@ the incumbent route moves quasiparticle energies by **0.115 meV MAE /
 
 ## 3. The charge head: `S(ω)`, local fields, and the three frequency models
 
-> **Implementation status (2026-09-01).** The equations are unchanged. §3.5's
+> **Implementation status (2026-09-02).** The equations are unchanged. §3.5's
 > `W[q=0]` Hermiticity consumer is being re-scoped to time-reversal-symmetric
-> decks on `lane/bisp-g-trs-gates-2026-09-01` (in flight), and **§3.6 is new
-> and OPEN**: lane C measured this head against the packed one and they
-> disagree.
+> decks on `lane/bisp-g-trs-gates-2026-09-01` (in flight). **§3.6 is now
+> CLOSED on the quadrature**: the disagreement lane C measured was the
+> incumbent Sobol estimator's sampling error, and the scalar head and the
+> packed completion now evaluate the same integral with the same rule
+> (`lane/bisp-k-one-head-quadrature-2026-09-01`). What remains open there is
+> the *insertion*, which is a different question and is the owner's choice.
 
 ### 3.1 Objects
 
@@ -219,6 +222,17 @@ v_h=\langle v(\mathbf q)\rangle_{mBZ},\qquad
 W_h(\omega)=\left\langle\frac{v(\mathbf q)}{1-v(\mathbf q)\,q_aS^{\rm eff}_{ab}(\omega)q_b}\right\rangle_{mBZ}
 \qquad(\texttt{vcoul.<kernel>.q0\_average}).
 $$
+
+**The cell average has one owner per dimension, and on a slab it is the
+same rule the packed completion of §4 uses.** `Slab2D.q0_average` evaluates
+both brackets on the exact mini-lattice Wigner–Seitz polygon cubature
+(Γ-to-edge Duffy triangulation, fixed 16/24/32 Gauss–Legendre ladder)
+issued by `vcoul.slab_minibz_photon_cubature` — the same authenticated
+receipt, the same nodes and the same weights `complete_static_slab_photon_q0`
+consumes. The superseded scrambled-Sobol draw survives only as the named
+`rule="sobol_debug"`. `Bulk3D` keeps its Sobol + Baldereschi–Tosatti sphere
+rule: the polygon construction is two-dimensional. See §3.6 and
+`docs/services/vcoul.md`.
 
 The body `W_{μν}(q=0)` is solved with the `G = 0` channel removed (the
 `K = 0` slot of `v` is zero), so the scalar head is re-attached to it as a
@@ -301,42 +315,87 @@ in the sandbox):
   the two frequency halves with independent complex poles and does not assume
   a conjugation relation between them.
 
-### 3.6 OPEN: the two charge-head quadratures disagree by 5.4 meV
+### 3.6 CLOSED (quadrature): the 5.4 meV was the Sobol estimator
 
-There are now two evaluations of the **same** Γ-cell charge integral, and they
-do not agree. This is an open question, not a resolved one.
+There were two evaluations of the **same** Γ-cell charge integral and they
+disagreed. Two mechanisms differed at once — the quadrature and the
+insertion — and the quadrature half is now settled and fixed.
 
-| | incumbent | packed |
+| | incumbent (before 2026-09-02) | today, both routes |
 |---|---|---|
-| quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon rule inside the coupled 4×4 solve |
-| insertion | band-diagonal scalar shift (§3.2) | rank-4 low-rank update contracted through the real Σ kernels (§4.2) |
-| convergence certificate | none printed | `ward`, `hermiticity`, `dyson_forward_bound`, `cubature_orders`, printed per run |
+| quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon rule, `vcoul.slab_minibz_photon_cubature` |
+| insertion | band-diagonal scalar shift (§3.2) | scalar route: band-diagonal (§3.2); packed route: rank-4 update through the real Σ kernels (§4.2) |
+| convergence certificate | none printed | scalar: polygon edges/orders/nodes/`⟨v⟩`/24→32 error ratio, refuses above budget. packed: `ward`, `hermiticity`, `dyson_forward_bound`, `cubature_orders` |
 
-Measured on MoS2 3×3, 270 states, static COHSEX, heads on both sides
-(`reports/bisp_c_bare_as_packed_2026-09-01` GATE B, claim 581):
+**What settled it** (lane J, claim 0586, `reports/bisp_j_architecture_review_2026-09-01/report.md` §4).
+Both rules were evaluated on one fitted head function for the MoS2 3×3
+deck. The Wigner–Seitz ladder converges to `⟨v⟩ = 1652.678662 a.u.` at
+order 24 and stays there through order 96 (`|W(32) − W(96)| = 3.7e-10`);
+the production Sobol draw (2^18 × 10) gives `1655.334970` (+0.16 %) and a
+second draw (2^20 × 20) gives `1652.378` (−0.02 %). The two draws straddle
+the exact value. The error is deterministic per seed, so it never
+presented as noise, and a second draw is not a convergence study. In Σ the
+quadrature alone is **+5.72 meV on every occupied state's SX+COH**
+(X +5.719, SX +5.723, COH −0.002); lane C's charge-half median was
+5.55 meV. No k-grid sequence was needed: the two routes evaluate the same
+function, and the difference is measured to 1e-10.
 
-| comparison | MAE | median | max |
+**One owner** (this section's fix, `lane/bisp-k-one-head-quadrature-2026-09-01`).
+`Slab2D.q0_average` now reads its nodes, weights and kernel values off the
+same provider receipt, so the two routes are two reductions of one set of
+numbers rather than two estimators that ought to agree. Measured on the
+MoS2 3×3 deck geometry: `⟨v⟩` agrees to `2.274e-13` and the screened
+companion to `0.000e+00`
+(`runs/MoS2/08_bisp_k_head_quadrature_20260901/head_owner_check.json`).
+Read back from a live GW pair (head on minus head off, legs 00 − 03 of that
+run) the scalar route's `v_h` is `1652.678657 a.u.`, `3.0e-9` relative from
+the exact rule and no longer the Sobol value. The packed legs are
+`0.000 µeV` from `runs/MoS2/07_integ_regate_20260901` on all 270 rows: the
+packed route was already on this rule and did not move.
+Against the matched BerkeleyGW static-COHSEX reference on that deck (48
+rows, 4 k × bands 19–30) the scalar route's `sigTOT` MAE moves
+9.23 → 5.41 meV and its signed mean −8.49 → −4.68 meV, most of the way
+onto the packed route's figure (4.76 / −3.50, claim 582, re-measured
+unchanged here) — an independent referee moving the same way as the exact
+rule, not proof that either is converged.
+
+**Still open: the insertion, and it is the owner's choice.** The scalar
+route keeps the band-diagonal shift of §3.2, which for the bare CC head is
+*exact* (`Σ^X_n = −⟨v⟩f_n/(ΩN_k)` is band diagonal and state independent
+in a plane-wave basis). The packed route inserts the same head as a rank-4
+`(μ,ν)` update through `g_0(μ) = ζ_Γ(μ, G=0)`, and carries the ISDF
+normalisation error of the `G=0` pair density with it: ±3.9 meV std,
+11.5 meV max on bands 7–8 at 640 charge centroids, because
+`Σ_μ ζ_Γ(μ,G=0)|ψ_n(r_μ)|²` is not exactly 1. That residual is now the whole
+of the remaining scalar-vs-packed difference; it is an ISDF question, not
+a quadrature one, and it is registered with two options (insert the CC
+`M_00` band-diagonal part exactly, or price the error by centroid count).
+The wings and the current blocks must stay in the `(μ,ν)` form either way.
+
+Measured with one quadrature owner on both sides (leg 01's packed per-state
+head against leg 00's band-diagonal head, same run):
+
+| column | scalar band diagonal | packed mean ± std | residual mean / MAE / max |
 |---|---|---|---|
-| packed vs incumbent, total | 5.395 meV | 5.417 | **11.857 meV** |
-| the charge half alone (no TT overlay on either side) | 5.485 meV | 5.552 | 12.044 meV |
-| the TT half alone (the overlay, §2.1) | 0.115 meV | 0.112 | 0.251 meV |
-| for scale: the head itself, packed / incumbent | 2094.9 / 2100.2 meV | | 2214.7 / 2216.0 meV |
+| `x_head_CC` (occ, 234) | −3557.994 meV | −3557.077 ± 3.934 | +0.917 / 3.167 / 11.469 |
+| `sex_head_CC` (occ) | −862.634 | −863.925 ± 1.182 | −1.291 / 1.334 / 5.280 |
+| `coh_head_CC` (all 270) | −1347.680 | −1345.985 ± 1.813 | +1.695 / 1.884 / 6.738 |
+| occupied `SX+COH` | −2210.314 | −2209.918 | **+0.396** / 1.769 / 6.155 |
 
-So essentially all of the disagreement is the **charge** head — two quadratures
-of a 2.10 eV term differing by 0.25 % — and almost none of it is the transverse
-head that lane C actually moved. The body is exact between the two routes
-(byte-identical, §2), so the difference is entirely the q→0 mechanism.
+The systematic offset on an occupied state's `SX+COH` was **+6.1 meV**
+before this change (lane J §4.3) and is **+0.40 meV** now; what is left is
+state-dependent and centred near zero, which is what an ISDF fit error
+looks like and what a quadrature error does not.
 
-**Which one is right is not settled.** A gate firing says two things disagree,
-not which is wrong. Only the packed side carries a convergence certificate,
-which is a reason to prefer it, not a measurement that it is correct — the
-incumbent side prints no comparable bound. Settling it needs a third
-evaluation neither shares: a k-grid convergence sequence, which a single 3×3
-deck cannot supply. Two mechanisms also differ at once (quadrature and
-insertion) and the table above separates them from the body but not from each
-other; the "for scale" row shows the insertion difference directly, the
-incumbent head being nearly state-independent (median = max = 2216.0 meV)
-while the packed head varies by state.
+**Not covered by this owner: the bare TT head.**
+`q0_average_transverse_tensor` (the incumbent `bare_transverse` route's
+q=Γ, G=0 slot, §2.1) is still the Sobol draw and still carries the same
+class of error — measured on the MoS2 3×3 geometry it breaks the cell's
+in-plane isotropy by 0.31 % (`diag = 826.41, 828.92` where the exact rule
+gives `826.34, 826.34`) and is 0.16 % high on the `zz` component. The
+packed route takes its TT head from the receipt and is unaffected.
+Registered in `KNOWN_LORRAX_ISSUES.md`; the fix is three lines and moves
+the incumbent route's numbers, so it wants its own gate.
 
 ## 4. The packed static photon head (`full_static_cohsex`)
 

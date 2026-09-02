@@ -56,14 +56,18 @@ pinned to ``whead`` — the very scalar the loader injects at q = 0 today.  This
 is one multiplication, and it is not a fit; it is what makes the on-grid
 identity STRUCTURAL rather than contingent.  Two reasons it has to be there.
 
-*``q0_average`` is a Monte-Carlo estimator.*  It is a scrambled-Sobol average
-over the Voronoi cell, deterministic given its options but not a closed form.
-Recomputing it at the coarse grid reproduces the restart's ``whead`` bit-for-bit
-only if ``nsamples``, ``method``, ``qmc_reps``, ``analytic_sphere`` AND the
-scipy that supplies the generator all match what the GW run used.  Pinning the
-scale to the injected value makes the identity independent of every one of
-those, while the ratio ``whead / S_raw(Γ_coarse)`` — which the wiring logs —
-becomes a free PROVENANCE CHECK on exactly that agreement.
+*``q0_average`` is a quadrature whose rule depends on the dimension.*  In
+3D it is a scrambled-Sobol average over the Voronoi cell, deterministic given
+its options but not a closed form: recomputing it at the coarse grid
+reproduces the restart's ``whead`` bit-for-bit only if ``nsamples``,
+``method``, ``qmc_reps``, ``analytic_sphere`` AND the scipy that supplies the
+generator all match what the GW run used.  On the SLAB it is the exact
+Wigner--Seitz polygon cubature since 2026-09-01 and depends on none of them
+(the same rule the packed Γ completion uses), so there the provenance ratio
+is a check on the geometry and the k-grid alone.  Pinning the scale to the
+injected value makes the identity independent of every one of those, while
+the ratio ``whead / S_raw(Γ_coarse)`` — which the wiring logs — becomes a
+free PROVENANCE CHECK on exactly that agreement.
 
 *Decks override the head.*  ``vhead`` / ``whead_0freq`` in ``cohsex.in`` are a
 cross-code validation knob, and the Si anchor deck uses it
@@ -118,7 +122,8 @@ WHAT THIS MODULE DOES NOT DO
 * It does not modify the q=0 full-expression average.  The selected kernel's
   ``q0_average`` is CALLED here, at a different cell size, and never touched.
   In bulk that estimator is ratified and is better than BerkeleyGW's 3D
-  product-of-averages.
+  product-of-averages; on the slab it is the exact Wigner--Seitz polygon
+  cubature (2026-09-01), one owner with the packed Γ completion.
 * It adds no wing term.  The Γ-cell wing second moment ``N_ab = ⟨S q_a q_b⟩``
   is staged separately, measurement-first, because it moves the 0.41 meV
   cross-code parity.
@@ -315,21 +320,26 @@ def gamma_cell_head_scalar(geometry: CoulombGeometry, kgrid, S_cart, *,
     which is what makes the on-grid identity free and the provenance check
     possible.
 
-    ``analytic_sphere`` is the deck's ``head_minibz_average`` key: it adds the
-    Baldereschi-Tosatti analytic sphere term and widens the Voronoi fold to
-    BGW's ``ncell = 3``.  It MUST match whatever the GW run used, or the
-    coarse-grid call will not reproduce the restart's ``whead`` and the
-    provenance check will say so.
+    ``analytic_sphere`` is the deck's ``head_minibz_average`` key: in 3D it
+    adds the Baldereschi-Tosatti analytic sphere term and widens the Voronoi
+    fold to BGW's ``ncell = 3``.  It MUST match whatever the GW run used, or
+    the coarse-grid call will not reproduce the restart's ``whead`` and the
+    provenance check will say so.  On the slab it is REFUSED by the service
+    (the exact polygon rule has no fold to widen), so a ``sys_dim = 2`` call
+    must leave it False.
 
-    The estimator defaults are ``gw.vcoul.compute_q0_averages``'s, NOT
-    ``vcoul.Bulk3D.q0_average``'s — in particular ``method="auto"`` rather
-    than ``"sobol"``.  That is deliberate: the GW run reached the estimator
-    through ``compute_q0_averages``, so matching its defaults is what makes
-    the provenance ratio a check on the PHYSICS rather than on which wrapper
-    each side happened to call.  (With scipy present the two resolve to the
-    same scrambled-Sobol draw anyway; without it, ``"auto"`` announces the
-    uniform fallback where ``"sobol"`` would refuse, and reproducing the run
-    matters more here than refusing.)
+    THE SAMPLER DEFAULTS BELOW ARE A 3D STATEMENT.  They are
+    ``gw.vcoul.compute_q0_averages``'s, NOT ``vcoul.Bulk3D.q0_average``'s —
+    in particular ``method="auto"`` rather than ``"sobol"``.  That is
+    deliberate: the GW run reached the estimator through
+    ``compute_q0_averages``, so matching its defaults is what makes the
+    provenance ratio a check on the PHYSICS rather than on which wrapper each
+    side happened to call.  (With scipy present the two resolve to the same
+    scrambled-Sobol draw anyway; without it, ``"auto"`` announces the uniform
+    fallback where ``"sobol"`` would refuse, and reproducing the run matters
+    more here than refusing.)  The SLAB takes the exact Wigner--Seitz polygon
+    cubature and these three arguments select nothing there — they are the
+    ``sobol_debug`` rule's dials, and this function never names that rule.
 
     Returns
     -------

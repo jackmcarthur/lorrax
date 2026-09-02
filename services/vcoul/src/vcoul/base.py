@@ -105,7 +105,7 @@ class CoulombKernel(Protocol):
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
-        """Return ``(vc0_mean, wcoul0)`` averaged over the mini-BZ Voronoi cell.
+        """Return ``(vc0_mean, wcoul0)`` averaged over the mini-BZ cell.
 
         - ``S_cart`` (preferred):  ``wcoul0 = ⟨v(q) / (1 - v(q) qᵀSq)⟩``,
           using the same sample points as ``vc0_mean`` (anisotropic).
@@ -118,6 +118,18 @@ class CoulombKernel(Protocol):
         ``Box0D`` ignores everything except ``geometry`` (and the
         ``epshead`` slot, unused) — V(q=G=0) is finite from the cell-box
         FFT.
+
+        THE QUADRATURE IS NOT SHARED ACROSS DIMENSIONS.  ``Slab2D``
+        (``sys_dim = 2``) takes an extra ``rule`` selection and defaults to
+        the EXACT Wigner--Seitz polygon cubature — the same provider
+        receipt the packed bispinor Γ completion consumes — so its
+        ``nsamples``/``method``/``qmc_reps``/``analytic_sphere`` arguments
+        belong to its named ``sobol_debug`` rule only.  ``Bulk3D``
+        (``sys_dim = 3``) keeps the scrambled-Sobol Voronoi draw plus the
+        Baldereschi--Tosatti analytic sphere: the exact polygon rule is a
+        two-dimensional construction and there is no 3D owner for it, so
+        the bulk head's incumbent rule and every one of these dials stand
+        unchanged.  See ``docs/services/vcoul.md``.
         """
         ...
 

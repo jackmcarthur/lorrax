@@ -45,6 +45,17 @@ def compute_q0_averages(
 	term (3D) / widens the Voronoi fold (both dims) to the q→0 head; default
 	False keeps the historical pure-Sobol average bit-identical.
 
+	THE SLAB IGNORES THE SAMPLER DIALS BY DESIGN (2026-09-01).  On a
+	``sys_dim = 2`` deck ``q0_average`` runs the exact Wigner--Seitz
+	polygon cubature — the single q→0 cell-average owner, shared with the
+	packed bispinor Γ completion — which takes no sample count, no
+	sequence and no replicate count; ``nsamples``/``method``/``qmc_reps``
+	below configure that kernel's named ``sobol_debug`` rule, which this
+	wrapper never selects.  ``analytic_sphere`` is REFUSED there rather
+	than ignored, because it is a deck key (``head_minibz_average``).
+	Everything in the paragraphs below is therefore about the 3D bulk and
+	its Baldereschi--Tosatti sphere, whose rule is unchanged.
+
 	``method`` DEFAULTS TO ``"auto"`` since the extraction (it was
 	``"sobol"``).  With scipy present — which is every production machine,
 	and the ``sobol`` extra declares it — ``auto`` resolves to exactly the
