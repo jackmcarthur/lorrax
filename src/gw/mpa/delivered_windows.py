@@ -1670,13 +1670,14 @@ def _rule_cache_dir():
     A box rule is a function of ``(box, eps, currency)`` only, so it can be
     reused by any window of any deck whose box lies INSIDE a cached box:
     a sup bound on a superset holds on the subset.  Lookup is by containment,
-    not by key, and rules are built on a box widened outward by 3 % so the
-    small drifts of an SC loop (state energies move by meV, the box by less
-    than 1 %) keep hitting.  Files are one ``.npz`` per rule, written by the
+    not by key, and rules are built on a box whose far edges are 1 % wider
+    so the small drifts of an SC loop (state energies move by meV, the box
+    by 0.1 %) keep hitting.  Files are one ``.npz`` per rule, written by the
     rank that built it (distinct names, atomic rename), read by every rank.
     Tempting, and why not: key the cache on the exact box -- an SC iteration
-    or a different omega grid never hits it; a 3 % wider box costs ~3 % of
-    the crossing nodes once and nothing after."""
+    or a different omega grid never hits it.  Or widen every edge: the edges
+    near zero are the expensive ones (measured +12 % pairs at 3 % on every
+    edge) and they do not drift."""
     value = os.environ.get("LORRAX_UNIFORM_RULE_CACHE", "").strip()
     return value or None
 
@@ -1835,12 +1836,20 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
         cache_status = f"hit:{name_c}"
     else:
         if cache_dir:
-            # build on a box 3 % wider (outward, never across zero) so that
-            # nearby requests are contained by what gets stored
-            extra = 0.03 * max(box[1] - box[0], float(eta))
-            lo_c = box[0] - extra if box[0] <= 0.0 else max(box[0] - extra, 0.7 * box[0])
-            hi_c = box[1] + extra if box[1] >= 0.0 else min(box[1] + extra, 0.7 * box[1])
-            box = (lo_c, hi_c, box[2] / 1.03, box[3] * 1.03)
+            # Build on a slightly wider box so that nearby requests (an SC
+            # iteration moves state energies by meV, 0.1 % of these boxes)
+            # are contained by what gets stored.  Only the edges AWAY from
+            # zero move, by 1 % of the width: an edge within 3 eta of zero
+            # is set by the omega grid and the pole edges, does not drift,
+            # and is the expensive one -- pushing it across zero raised the
+            # rank of the small resonant tiles from 234 to 254 and their
+            # count from 17 to 28 (Na arm 11, 3 % on every edge: +67 pairs
+            # on 553).  im_lo is the deck's eta and never moves.
+            extra = 0.01 * max(box[1] - box[0], float(eta))
+            near = 3.0 * float(eta)
+            lo_c = box[0] - extra if box[0] < -near else box[0]
+            hi_c = box[1] + extra if box[1] > near else box[1]
+            box = (lo_c, hi_c, box[2], box[3] * 1.01)
         rule = build_uniform_rule(
             box, float(eps), time_budget=_uniform_rule_budget())
         if cache_dir:
