@@ -62,6 +62,39 @@ def test_invalid_box_refuses():
         build_uniform_rule((1.0, 0.0, 0.1, 1.0), 1.0e-4)
 
 
+@pytest.mark.parametrize("box", [
+    (-8.0 * ETA, 8.0 * ETA, ETA, 4.0 * ETA),
+    (2.0 * ETA, 30.0 * ETA, ETA, 4.0 * ETA),
+])
+def test_uniform_profile_reduces_exactly_to_the_box_currency(box):
+    """A uniform state measure is the incumbent peak/relative box rule."""
+    relative = box[0] > 0.0 or box[1] < 0.0
+    base = build_uniform_rule(box, 1.0e-4, reduce=False)
+    rho = ((lambda d: np.abs(d)) if relative
+           else (lambda d: np.full(d.shape, box[2])))
+    profiled = build_uniform_rule(
+        box, 1.0e-4, reduce=False, relative=relative, rho=rho)
+
+    np.testing.assert_array_equal(profiled.times, base.times)
+    np.testing.assert_array_equal(profiled.weights, base.weights)
+    assert profiled.rank == base.rank
+    assert profiled.sup_error == base.sup_error
+    assert profiled.kappa_max == base.kappa_max
+    assert profiled.profiled and not base.profiled
+
+
+def test_profile_currency_refuses_negative_or_empty_weights():
+    box = (-4.0 * ETA, 4.0 * ETA, ETA, 2.0 * ETA)
+    with pytest.raises(ValueError, match="finite, nonnegative"):
+        build_uniform_rule(
+            box, 1.0e-4, reduce=False,
+            rho=lambda d: np.zeros(d.shape))
+    with pytest.raises(ValueError, match="finite, nonnegative"):
+        build_uniform_rule(
+            box, 1.0e-4, reduce=False,
+            rho=lambda d: -np.ones(d.shape))
+
+
 def test_amplification_p99_is_box_intrinsic_and_below_the_boundary_max():
     box = (-3.0 * ETA, 5.0 * ETA, ETA, 4.0 * ETA)
     rule = build_uniform_rule(box, 1.0e-4, reduce=False)
