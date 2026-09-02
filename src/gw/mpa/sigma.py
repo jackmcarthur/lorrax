@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import time
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -12,7 +14,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
-from gw.ppm_accumulators import DeviceOmegaAccumulator
+from gw.ppm_accumulators import (DeviceOmegaAccumulator, _MemoryTileSink,
+                                 _TauAccumulator)
 from gw.ppm_sigma import (SigmaOmegaResult,
                           assert_sharded_sigma_window_divides_mesh,
                           pad_sigma_window, strip_sigma_window)
@@ -87,6 +90,8 @@ def _integrate_sigma_batches(
     *,
     pole_batch_size,
     print_fn,
+    tau_capacity,
+    _executor_arm,
 ):
     """One spatial executor for streamed fit slabs."""
     omega = np.asarray(omega_grid_ry, np.float64)
@@ -156,9 +161,21 @@ def _integrate_sigma_batches(
         psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
         psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
         shape = (omega.size, int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
+    arm = str(_executor_arm).upper()
+    if arm not in {"A", "B", "C"}:
+        raise ValueError(f"unknown experimental MPA executor arm {arm!r}")
     output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-    accumulator = DeviceOmegaAccumulator(
-        omega, shape=shape, sharding=output_sharding, omega_axis=0)
+    if arm == "A":
+        accumulator = _TauAccumulator(
+            omega_vec=omega,
+            sink=_MemoryTileSink(
+                shape=shape, sharding=output_sharding, omega_axis=0))
+    else:
+        accumulator = DeviceOmegaAccumulator(
+            omega, shape=shape, sharding=output_sharding, omega_axis=0)
+    tau_capacity = int(tau_capacity)
+    if tau_capacity < 1:
+        raise ValueError("MPA tau_capacity must be positive")
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
@@ -190,51 +207,83 @@ def _integrate_sigma_batches(
                             * jnp.reshape(
                                 jnp.asarray(weight, jnp.float64),
                                 np.asarray(win.mask_A).shape))
+            t_nodes = np.asarray(
+                jax.device_get(win.nodes.t), np.complex128)
+            alpha_nodes = np.asarray(
+                jax.device_get(win.nodes.alpha), np.complex128)
+            tau_args = (
+                psi_coh_xn, psi_coh_yr,
+                psi_proj_xr, psi_proj_yn,
+                row.E_A, selector, B, Omega,
+                pole_indices, bounds, phase_real,
+                jnp.asarray(win.E_ref_A),
+                jnp.asarray(win.E_ref_B))
+            if arm == "A":
+                accumulator.begin_window(SimpleNamespace(
+                    omega_sign=win.omega_sign,
+                    prefactor=win.prefactor,
+                    project_code=win.project_code,
+                    omega_indices=row.omega_idx,
+                    omega_values=row.omega_abs))
+            else:
+                accumulator.begin_window(
+                    t_nodes, alpha_nodes,
+                    omega_sign=win.omega_sign, prefactor=win.prefactor,
+                    e_ref_sum=win.E_ref_A + win.E_ref_B,
+                    antihermitian=(win.project_code == 1),
+                    omega_indices=row.omega_idx,
+                    omega_values=row.omega_abs,
+                    capacity=(tau_capacity if arm == "C" else None))
             if not sweep_started:
-                first_t = np.asarray(
-                    jax.device_get(win.nodes.t), np.complex128)[0]
-                prewarm_args = (
-                    psi_coh_xn, psi_coh_yr,
-                    psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A),
-                    jnp.asarray(win.E_ref_B),
-                    jnp.asarray(first_t, dtype=jnp.complex128))
-                if hasattr(tau_kernel, "lower"):
-                    tau_kernel.lower(*prewarm_args).compile()
+                started = time.perf_counter()
+                if arm == "C":
+                    if not hasattr(tau_kernel, "lower"):
+                        raise RuntimeError(
+                            "arm C requires the fused jittable tau kernel")
+                    accumulator.precompile_tau_loop(tau_kernel, tau_args)
+                    tau_compile_s = time.perf_counter() - started
+                    accumulator_compile_s = 0.0
                 else:
-                    # The stage-split diagnostic is a Python dispatcher over
-                    # separately-jitted stages.  Execute one real-shape call
-                    # to prewarm the same kernels the timed sweep will use.
-                    jax.block_until_ready(tau_kernel(*prewarm_args))
-                accumulator.precompile_tau_add(
-                    sigma_shape=shape[1:],
-                    sigma_sharding=NamedSharding(
-                        mesh_xy, P(None, "x", "y")))
+                    prewarm_args = tau_args + (
+                        jnp.asarray(t_nodes[0], dtype=jnp.complex128),)
+                    if hasattr(tau_kernel, "lower"):
+                        tau_kernel.lower(*prewarm_args).compile()
+                    else:
+                        # The diagnostic dispatcher is not nestable in C.
+                        jax.block_until_ready(tau_kernel(*prewarm_args))
+                    tau_compile_s = time.perf_counter() - started
+                    accumulator_compile_s = 0.0
+                    if arm == "B":
+                        started = time.perf_counter()
+                        accumulator.precompile_tau_add(
+                            sigma_shape=shape[1:],
+                            sigma_sharding=NamedSharding(
+                                mesh_xy, P(None, "x", "y")))
+                        accumulator_compile_s = time.perf_counter() - started
                 print_fn(
                     "  MPA Sigma sweep begin: shared pane tau kernel "
                     "prewarmed")
+                print_fn(
+                    f"  MPA Sigma compile: arm={arm}, "
+                    f"tau_family_s={tau_compile_s:.6f}, "
+                    f"accumulator_s={accumulator_compile_s:.6f}")
                 sweep_started = True
-            accumulator.begin_window(
-                win.nodes.t, win.nodes.alpha,
-                omega_sign=win.omega_sign, prefactor=win.prefactor,
-                e_ref_sum=win.E_ref_A + win.E_ref_B,
-                antihermitian=(win.project_code == 1),
-                omega_indices=row.omega_idx,
-                omega_values=row.omega_abs)
-            for t in np.asarray(
-                    jax.device_get(win.nodes.t), np.complex128):
-                sigma_tau = tau_kernel(
-                    psi_coh_xn, psi_coh_yr,
-                    psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A),
-                    jnp.asarray(win.E_ref_B),
-                    jnp.asarray(t, dtype=jnp.complex128))
-                accumulator.add_tau(sigma_tau)
-                n_tau += 1
+            if arm == "C":
+                accumulator.add_tau_loop(tau_kernel, tau_args)
+                n_tau += int(t_nodes.size)
+            else:
+                e_ref_sum = complex(win.E_ref_A + win.E_ref_B)
+                for t, alpha in zip(t_nodes, alpha_nodes):
+                    sigma_tau = tau_kernel(
+                        *tau_args,
+                        jnp.asarray(t, dtype=jnp.complex128))
+                    if arm == "A":
+                        alpha_eff = alpha * np.exp(-1j * e_ref_sum * t)
+                        accumulator.add_tau(
+                            sigma_tau, None, complex(t), complex(alpha_eff))
+                    else:
+                        accumulator.add_tau(sigma_tau)
+                    n_tau += 1
             accumulator.end_window()
             n_sweeps += 1
             logical_tau_pairs += win.n_tau
@@ -244,11 +293,15 @@ def _integrate_sigma_batches(
     sigma = strip_sigma_window(
         accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
     transform_saving = int(logical_tau_pairs - n_tau)
+    dispatches = n_sweeps if arm == "C" else n_tau
     print_fn(
-        f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
+        f"  MPA Sigma: {dispatches} tau dispatches in {n_sweeps} sweeps "
         f"({n_poles} poles, batches of {batch_size}); "
         f"{transform_saving} undispatched logical tau; "
-        f"panes and product windows used one shared tau kernel")
+        "panes and product windows used one shared tau kernel")
+    print_fn(
+        f"  MPA Sigma executor arm={arm}: {n_tau} tau evaluations, "
+        f"{dispatches} host-to-device-loop dispatches")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
@@ -266,6 +319,8 @@ def integrate_sigma_store(
     *,
     pole_batch_size=4,
     print_fn=print,
+    tau_capacity=1,
+    _executor_arm="B",
 ):
     """Read, unfold, consume, and release one pole range at a time.
 
@@ -292,7 +347,8 @@ def integrate_sigma_store(
     def run(reader):
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
-            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn,
+            tau_capacity=tau_capacity, _executor_arm=_executor_arm)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -374,6 +430,7 @@ def compute_sigma_c_mpa_omega_grid(
     expected_screening_diagrams=None,
     occupation_state=None,
     print_fn=print,
+    _executor_arm="B",
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
 
@@ -538,7 +595,9 @@ def compute_sigma_c_mpa_omega_grid(
                         f"{window['runtime_noise_budget']:.6g}")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+            pole_batch_size=pole_batch_size, print_fn=print_fn,
+            tau_capacity=max(int(max_rank), int(crossing_max_nodes)),
+            _executor_arm=_executor_arm)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):
