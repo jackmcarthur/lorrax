@@ -71,7 +71,6 @@ from .ppm_windows import (
     window_mask_B_bounds,
     _to_host_np,
     _CROSSING_A_MAX,
-    crossing_regularization_floor,
     hgl_partition_required,
     resolve_sigma_regularization,
 )
@@ -81,9 +80,7 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
-from .sigma_plan import resolve_sigma_plan
-from .wavefunction_bundle import (face_kernel_kwargs,
-                                  projected_state_amplitude_envelope)
+from .wavefunction_bundle import face_kernel_kwargs
 
 
 def _face_g_plan(mesh_xy: Mesh, face_shape):
@@ -1515,7 +1512,6 @@ def compute_sigma_c_ppm_omega_grid(
             jnp.asarray(fermi_reference == "midgap", dtype=bool),
             jnp.asarray(keep_invalid, dtype=bool),
         )
-    efermi = state.efermi
     E_cond = state.E_cond
     H_val = state.H_val
     cond_mask = state.cond_mask
@@ -1639,60 +1635,6 @@ def compute_sigma_c_ppm_omega_grid(
         cond_mask=cond_mask, val_mask=val_mask,
     )
 
-    plan_mode = resolve_sigma_plan()
-    delivered_windows = {}
-    if plan_mode == "delivered" and branches:
-        # GN-PPM has one fitted pole per (q,mu,nu).  Add only the leading
-        # singleton axis expected by the shared MPA planner; the existing
-        # B_mask remains the executor's exact validity selector. Independent
-        # causal branches are still planned independently, so this does not
-        # introduce a time-reversal identification at the W producer seam.
-        from .mpa.delivered_windows import build_delivered_sigma_windows
-        tau_grid_mode = "free"  # single grid mode; shared-grid dial removed (2026-08-31 ruling)
-        Omega_one = jnp.expand_dims(Omega_abs, axis=0)
-        B_one = jnp.expand_dims(jnp.where(B_mask, B_corr, 0.0j), axis=0)
-        state_amplitudes = projected_state_amplitude_envelope(
-            wfns, state_bands=s.full, projection_bands=s.sigma)
-        # GN carries the loaded union because chi0 may own more bands than
-        # Sigma.  The bracketed Sigma executor stops at sigma_sum; make the
-        # planner's real state weight vanish on the same unused tail.
-        state_amplitudes = (
-            state_amplitudes
-            * wfns.band_mask(s.sigma_sum).astype(state_amplitudes.dtype))
-        shared_plan, geometry = build_delivered_sigma_windows(
-            [Omega_one] * len(branches), [B_one] * len(branches), branches,
-            omega_req,
-            regularization_width_ry=regularization_width_ry,
-            envelope_relative_target=target_error,
-            state_amplitudes_by_branch=(
-                [state_amplitudes] * len(branches)),
-            max_nodes=max(int(max_nodes), int(crossing_max_nodes)),
-            crossing_eps_q=crossing_eps_q,
-            use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
-            tau_grid_mode=tau_grid_mode,
-            edge_factor=edge_factor, mesh_xy=mesh_xy)
-        for report in geometry["branches"]:
-            start, stop = int(report["plan_start"]), int(report["plan_stop"])
-            delivered_windows[report["tag"]] = [
-                row.window for row in shared_plan[start:stop]]
-        print_fn(
-            f"  GN-PPM windows [delivered]: {geometry['n_windows']} logical "
-            f"windows, target={geometry['envelope_relative_target']:.3g} "
-            "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
-            f"grid={geometry['tau_grid_mode']}, "
-            f"{geometry['window_tau_pairs']} (window,tau) pairs, "
-            f"{geometry['distinct_tau_count']} branch-distinct tau, "
-            f"plan {geometry['plan_seconds']:.3f} s")
-        for report in geometry["branches"]:
-            for window in report["windows"]:
-                print_fn(
-                    f"    {window['name']}: n_tau={window['node_count']}, "
-                    f"residual={window['refined_residual']:.6g}/"
-                    f"{window['relative_residual_target']:.6g}, "
-                    f"kappa_p99={window['amplification_p99']:.6g}, "
-                    f"noise={window['runtime_noise_bound']:.6g}/"
-                    f"{window['runtime_noise_budget']:.6g}")
-
     # Run each branch and fold its Σc tiles into per-rank HOST tile
     # accumulators at the branch's global ω indices.  cond and val of a
     # given ω-half share those indices, so the second branch's `+=` sums
@@ -1726,8 +1668,7 @@ def compute_sigma_c_ppm_omega_grid(
             E_A=br.E_A, base_mask_A=br.base_mask_A,
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
-            planned_windows=delivered_windows.get(br.tag)
-            if plan_mode == "delivered" else None,
+            planned_windows=None,
             **common_branch_kwargs,
         )
         if branch_tiles is None:
