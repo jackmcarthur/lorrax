@@ -665,6 +665,15 @@ def test_the_driver_prints_the_incumbent_head_record(tmp_path):
     assert "Photon head    : " in src
 
 
+def test_the_driver_replays_config_provenance_into_the_production_report():
+    """Unnamed physics defaults must survive the production chatter filter."""
+    from pathlib import Path
+    src = (Path(__file__).parents[1] / "src/gw/gw_jax.py").read_text()
+    assert 'if "[config provenance]" in text:' in src
+    assert 'report.heading("Configuration provenance")' in src
+    assert "report.emit(line.strip())" in src
+
+
 def test_restart_may_not_swap_the_head_mechanism_on_a_slab_cohsex_deck(
         tmp_path):
     """restart = true used to move a slab bispinor COHSEX deck from the

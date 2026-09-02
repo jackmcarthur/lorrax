@@ -234,9 +234,16 @@ def main(argv=None):
 	timing.reset()
 
 	# Configuration parsing predates the scientific report file.  Its deck
-	# echo is forensic detail, so it follows the driver's ONE debug switch;
-	# production output begins with GWProductionReport below.
-	print0 = debug_print
+	# echo is forensic detail, so it follows the driver's ONE debug switch.
+	# Default/derivation provenance is different: it is part of the scientific
+	# record, so retain just those lines and replay them once the report exists.
+	_config_provenance = []
+	def _config_print(*values, sep=" ", **kwargs):
+		debug_print(*values, sep=sep, **kwargs)
+		text = sep.join(str(value) for value in values)
+		if "[config provenance]" in text:
+			_config_provenance.append(text)
+	print0 = _config_print
 
 	# ---- Configuration ----
 	# The two orthogonal physics axes are resolved + validated up front so
@@ -259,6 +266,10 @@ def main(argv=None):
 	report.begin(input_file=args.input, config=config)
 	report.architecture()
 	report.method(config=config)
+	if _config_provenance:
+		report.heading("Configuration provenance")
+		for line in _config_provenance:
+			report.emit(line.strip())
 	# A mode may be DECLARED on the axis before its Σ stage exists (today:
 	# ``mpa``).  Refusing here — before the WFN read, before ISDF, before
 	# any allocation is spent — is the difference between an operator
