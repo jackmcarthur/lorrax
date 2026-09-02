@@ -193,9 +193,9 @@ def main():
     odd_scale = float(np.max(np.abs(odd)))
     debug_odd_scale = float(np.max(np.abs(debug_odd)))
     scale = float(np.max(np.abs(_EXPECTED_C1020045)))
-    if delta_ref > 5.0e-5 * max(scale, 1.0):
+    if delta_ref > 5.0e-7 * max(scale, 1.0):
         _fail(
-            "ordered box Sigma moved from c1020045 beyond its 5e-5 "
+            "ordered box Sigma moved from c1020045 beyond its 5e-7 "
             f"relative gate: max|delta|={delta_ref:.12e}, scale={scale:.12e}")
     if not odd_scale > 1.0e-6 * max(float(np.max(np.abs(ordered))), 1.0):
         _fail(f"ordered odd Sigma is vacuous: max|Sigma_odd|={odd_scale:.12e}")
