@@ -98,9 +98,11 @@ def test_production_threads_configured_budget_to_stream_resolver():
     assert isinstance(memory, ast.Attribute) and memory.attr == "memory"
     assert isinstance(memory.value, ast.Name) and memory.value.id == "config"
 
+    # Production fusion and the retained per-block oracle both terminate at
+    # the same resolver with the same canonical budget.
     for caller, callee in (
             ("compute_experimental_no_pair_photon_chi0",
-             "compute_no_pair_dirac_current_block"),
+             "_resolve_vertex_spin_pair_stream"),
             ("compute_no_pair_dirac_current_block",
              "_get_chi_minimax_kernel"),
             ("_get_chi_minimax_kernel",
