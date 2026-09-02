@@ -13,16 +13,18 @@ Deck-key semantics are owned by the [input reference](../input_reference.md).
 Module one-liners are owned by [Codebase](codebase.md). Where those pages
 disagree with this one, they win — this page owns the *wiring* only.
 
-> **Pinned to `integ/bispinor-static-cleanup-2026-09-01@3897f89f`, 2026-09-01
-> — a branch, not `origin/main`.** Two changes since `origin/main@8b6e3cc7`
+> **Pinned to `lane/bisp-n-dynamic-packed-2026-09-01`, 2026-09-02 — a
+> branch, not `origin/main`.** Three changes since `origin/main@8b6e3cc7`
 > reshaped this layer: lane B (`41e2b6b2`) collapsed the two packed modes
-> into one and deleted the producerless static-gauge seam, and lane C
+> into one and deleted the producerless static-gauge seam, lane C
 > (`ce3dedcc`) routed `bare_transverse` through the same packed operator
-> inside one envelope. Every `file:line` into a file either lane changed was
-> re-read at this commit; citations into files neither touched are unchanged
-> from `8b6e3cc7` and are byte-identical here. Line numbers are for finding
-> code, never for quoting it. Other lanes of the cleanup are still in flight;
-> the theory page's per-section status notes name which.
+> inside one envelope, and lane N gave that operator's CHARGE block a
+> frequency axis (phase 3) while freezing its current blocks at `ω = 0`.
+> Every `file:line` into a file any of the three lanes changed was re-read at
+> this commit; citations into files none touched are unchanged from
+> `8b6e3cc7` and are byte-identical here. Line numbers are for finding code,
+> never for quoting it. Other lanes of the cleanup are still in flight; the
+> theory page's per-section status notes name which.
 
 ## The routes
 
@@ -38,9 +40,24 @@ There is one packed static photon **operator**. Two deck situations reach it:
 | **packed, bare** | `bispinor_gw ∈ BARE_TRANSVERSE_MODES` **and** the envelope below | twelve current blocks declared **zero**; packed solve skipped, CC screened by the scalar owner and spliced in, so `W_packed = diag(W_00, D_TT)` and `W_CT = 0` | the same `gw.photon_sigma` | **P** |
 | **incumbent, bare** | the same three spellings, **outside** the envelope | none — the bare `D^{ij}` tiles are contracted directly | `gw.sigma_x_bispinor` | **B** |
 
+Orthogonally to *which* packed operator is built, `compute_mode` decides
+**how much of Σ that operator owns** — one axis, two values:
+
+| compute mode | packed Σ blocks | charge Σ | predicate |
+|---|---|---|---|
+| `cohsex` | all sixteen (`blocks = "all"`) | none beside it: the CC block of the packed operator **is** the charge Σ | `packed_photon_replaces_charge_sigma` |
+| `gn_ppm`, `hl_ppm` | the twelve with a current index (`blocks = "current"`), evaluated once at `ω = 0` | the ordinary scalar `Σ_x + Σ_c(ω)` on the same ISDF `W_00`, with `head_resolver`, `static_head_terms`, the `{static, probe}` role W's and the `ppm_pipeline` all unchanged | `uses_dynamic_packed_photon_route` |
+
+`mpa` is refused: `screening_requests_for` returns no independent static role
+for it, so the bare family's CC block of `W_packed` would have no owner
+(`gw_config.PACKED_PHOTON_COMPUTE_MODES`; the Σ dispatch refuses by name at
+`sigma_dispatch.py`'s exhaustiveness branch). The dynamic route's own
+run-record line is `Photon Sigma`, beside `Photon route` and `Photon head`.
+
 The envelope for the packed bare route, in the order the predicate tests it
-(`gw_config.packed_bare_transverse_route`, `:3565-3619`): `bispinor_gw` is a
-bare-transverse spelling, `bispinor = true`, `compute_mode = cohsex`,
+(`gw_config.packed_bare_transverse_route`, `:3584-3646`): `bispinor_gw` is a
+bare-transverse spelling, `bispinor = true`, `compute_mode` in
+`PACKED_PHOTON_COMPUTE_MODES` (`cohsex`, `gn_ppm`, `hl_ppm`),
 `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim = 2`,
 `head_correction ∈ {full, off}`, `restart = false`. It returns
 **`(taken, reason)`**, not a bool: the driver prints the first unmet condition
@@ -51,20 +68,22 @@ reason exists to prevent.
 `bispinor_tt_head_correction` is deliberately **not** in that predicate — a
 head dial must not move a route. A deck asking for the §2.1 overlay inside the
 envelope is refused (`GATE packed_bare_transverse_tt_head_double_count`,
-`gw_config.py:3694`), because the Γ-cell completion already inserts `⟨D_TT⟩`
+`gw_config.py:3755`), because the Γ-cell completion already inserts `⟨D_TT⟩`
 and honouring both would double count it.
 
 The three predicates, all in `src/gw/gw_config.py`:
 
 | predicate | line | answers |
 |---|---|---|
-| `packed_bare_transverse_route(config) -> (taken, reason)` | `:3565` | does a bare-transverse deck take the packed operator, and if not, why not |
-| `packed_photon_screens_current(config) -> bool` | `:3622` | **the one selector between the two packed modes**: `True` only for `full_static_cohsex` |
-| `uses_static_photon_response(config) -> bool` | `:3636` | is the packed operator used at all — `full_static_cohsex` always, plus the bare route inside its envelope |
+| `packed_bare_transverse_route(config) -> (taken, reason)` | `:3584` | does a bare-transverse deck take the packed operator, and if not, why not |
+| `packed_photon_screens_current(config) -> bool` | `:3648` | **the one selector between the two packed modes**: `True` only for `full_static_cohsex` |
+| `uses_static_photon_response(config) -> bool` | `:3662` | is the packed operator used at all — `full_static_cohsex` always, plus the bare route inside its envelope |
+| `packed_photon_replaces_charge_sigma(config) -> bool` | `:3676` | does the packed operator own the CHARGE Σ too (`cohsex`), or only the current blocks — the question every driver seam that skips the scalar charge machinery must ask |
+| `uses_dynamic_packed_photon_route(config) -> bool` | `:3697` | the packed operator on a frequency-dependent Σ |
 
-`uses_coupled_photon_head` (`:3650`) adds `head.correction is FULL` on top and
+`uses_coupled_photon_head` (`:3711`) adds `head.correction is FULL` on top and
 decides **only** whether `gw_init` keeps the four literal-Γ channel vectors.
-`BARE_TRANSVERSE_MODES` (`:3558`) is the three spellings that differ only in
+`BARE_TRANSVERSE_MODES` (`:3558`), `PACKED_PHOTON_COMPUTE_MODES` (`:3577`) is the three spellings that differ only in
 the bispinor lift. The former `charge_hall_cubature` spelling is retired and
 refuses, naming `full_static_cohsex`
 (`GATE bispinor_gw_charge_hall_cubature_retired`, `gw_config.py:326-337`,
@@ -432,23 +451,34 @@ photon-Σ envelope refuses a scalar head overlay if one arrives there anyway
 
 ## Stage 4 — self-energy
 
-The fork is `sigma_dispatch.py:835`, and its three refusals fire before any
-allocation: outside `compute_mode = cohsex` (`:836-841`), with no packed
-response (`:842-846` — "Refusing instead of falling back to charge-only
-screened COHSEX"), and with scalar `static_head_terms` present (`:847-853`,
-which would double count CC and omit the coupled current wings).
+The fork is `sigma_dispatch.py:845`, and it has **three** packed arms plus
+an exhaustiveness refusal:
+
+| arm | line | what it does |
+|---|---|---|
+| `packed_photon_replaces_charge_sigma` (`compute_mode = cohsex`) | `:845-889` | the sixteen-block contraction owns `Σ_X`, `Σ_SX`, `Σ_COH` outright. Its three refusals fire before any allocation: outside `compute_mode = cohsex`, with no packed response ("Refusing instead of falling back to charge-only screened COHSEX"), and with scalar `static_head_terms` present (double count) |
+| `uses_dynamic_packed_photon_route` (the plasmon-pole pair) | `:890-990` | the scalar `compute_sigma_x` runs with the incumbent `Σ^B` arms **explicitly off** (`wfns_transverse=None`, `bispinor_v_q_path=None`) and keeps `static_head_terms` (the CC bare-X head); the packed consumer is called with `blocks = "current"` (`:955`) and its `SX + COH` is booked into `sig_x` (`:973`), which is arithmetically the same `Σ_xc` as adding an `ω`-independent term to `Σ_c` and is the seam the incumbent route already used for `Σ^B`. The current sector's bare-exchange and static-correlation magnitudes are printed at the seam |
+| `uses_static_photon_response` with neither of the above | `:991-1008` | `NotImplementedError` naming `PACKED_PHOTON_COMPUTE_MODES`; today that is `mpa` reached through a hand-built config |
+
+`finalize_dynamic_sigma` carries the packed per-sector Γ diagnostics through
+to `sigma_freq_debug.dat` (`:341-`, passed at `:1206-1207`); on the dynamic
+route the CC sector of those columns is exactly zero, because the charge head
+there is the dynamic model's, not the packed completion's.
 
 | object | producer | shape | sharding | route |
 |---|---|---|---|---|
-| sixteen-block `Σ_X`, `Σ_SX`, `Σ_COH` | `photon_sigma.compute_static_photon_sigma` (`:286-303`), called at `sigma_dispatch.py:860-875` | each `(nk, nb_sigma, nb_sigma)` | **replicated** `P(None,None,None)` at the output boundary (`:443-454`) | P |
+| sixteen-block `Σ_X`, `Σ_SX`, `Σ_COH` (twelve blocks under `blocks = "current"`) | `photon_sigma.compute_static_photon_sigma` (`:296`), called at `sigma_dispatch.py:871` (static) and `:946` (dynamic) | each `(nk, nb_sigma, nb_sigma)` | **replicated** `P(None,None,None)` at the output boundary | P |
 | per-block operands | `photon_layout.photon_block_view` (`:279`), fetched at `photon_sigma.py:364-365` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')` — a `dynamic_slice`, never a gather | P |
 | Green function `G` | `greens_function_kernel.build_G`, face layout | `(nk, ns, μ_L, ns, μ_R)` | `P(None,None,'x',None,'y')` (`wavefunction_bundle.py:236`) | both |
 | head-attribution diagnostics | `photon_sigma.py:373-377` (accumulated `:413-434`) via `photon_layout.photon_q0_low_rank_block` (`:676`) | one `(1, p_A, p_B)` block | `P(None,'x','y')` | P |
-| `Σ^B`, bare transverse — **incumbent route only** | `sigma_x_bispinor.compute_sigma_x_bispinor` (`:91`), nine `(i,j)` tiles at `:200-201`. Retained for the dynamic bispinor route (`gn_ppm` has no static packed `W` to carry `Σ^B`), `x_only`, self-consistent and bulk | `(nk, nb_sigma, nb_sigma)` | replicated after a gather-then-window (`:234-248`) | B |
+| `Σ^B`, bare transverse — **incumbent route only** | `sigma_x_bispinor.compute_sigma_x_bispinor` (`:91`), nine `(i,j)` tiles at `:200-201`. Retained for `mpa`, `x_only`, self-consistent, `restart = true` and bulk — the plasmon-pole pair now reaches `Σ^B` through the packed operator instead | `(nk, nb_sigma, nb_sigma)` | replicated after a gather-then-window (`:234-248`) | B |
 | transverse Hartree | `sigma_dispatch._compute_live_hartree` (`:301-334`) → `kin_ion_io.compute_hartree_matrix` (`:764`) | `charge`, `transverse`, each `(nk_full, nb, nb)` Ry | `P(None,'x','y')` with `return_sharded=True` | **both** |
 
 **The sixteen-block contraction** is a plain nested Python loop (`A` at
-`photon_sigma.py:353`, `B` at `:357`), not a `vmap`. Per block the γ̃ vertices
+`photon_sigma.py:385`, `B` at `:389`), not a `vmap`. The `blocks` selection
+is one `continue` inside it (`:390`) and appears nowhere else, so the static
+and dynamic routes share every kernel, every certificate and the sector
+closure gate. Per block the γ̃ vertices
 are folded into the two G-build operands only (`:355`, `:359`), and the same
 jitted kernel is called three times with a dynamic `term` selector for X, SX
 and COH (`:383`, `:393`, `:403`; COH uses `W − V` with prefactor `−0.5`). Each
@@ -463,18 +493,25 @@ its operator fingerprint went with the deleted seam.
 **`Σ^B` enters twice, differently** — on the incumbent route. In
 `compute_cohsex_sigma` it is added to **both** `sig_x` and `sig_sx`
 (`cohsex_sigma.py:660-668`); in `compute_sigma_x` — the entry every dynamic
-mode and `x_only` takes — it is added to `sig_x` only (`:735-742`). On the
-packed bare route neither fires: `Σ^B` is the TT part of the sixteen-block
-`Σ_X` instead, and `sigma_x_bispinor` is not called. `photon_sigma` and
-`sigma_dispatch` needed **no change** for the bare route — the sixteen-block
-consumer streams whatever `V`/`W` it is handed.
+mode and `x_only` takes — it is added to `sig_x` only (`:735-742`). On
+either packed route neither fires: `Σ^B` is the TT part of the packed `Σ_X`
+instead, and `sigma_x_bispinor` is not called — on the dynamic route the
+`compute_sigma_x` call passes `wfns_transverse=None` explicitly so the arm
+cannot fire by accident. `photon_sigma` and `sigma_dispatch` needed **no
+change** for the packed *bare* route — the sixteen-block consumer streams
+whatever `V`/`W` it is handed — and needed only a block selector and one
+branch for the *dynamic* one.
 
-**No transverse operand reaches a dynamic Σ_c.** `compute_ppm_sigma_pipeline`
-(`ppm_pipeline.py:473-490`, called `sigma_dispatch.py:1175-1186`) and the MPA
-body (`mpa/sigma.py:283-303`, called `:1081-1103`) have no
-`wfns_transverse`, `bispinor_v_q_path` or `photon_response` parameter. On a
-dynamic route the four-current layer reaches Σ through `sig_x` and through the
-transverse Hartree, and nowhere else.
+**No transverse operand reaches a dynamic Σ_c, and that is the design.**
+`compute_ppm_sigma_pipeline` (`ppm_pipeline.py:473-490`) and the MPA body
+(`mpa/sigma.py:283-303`) have no `wfns_transverse`, `bispinor_v_q_path` or
+`photon_response` parameter, and they gained none in phase 3. The dynamic
+packed route splits Σ instead: the charge half is those untouched kernels on
+`W_00(ω)`, the current half is the packed consumer at `ω = 0`, and the two
+meet only in the `sig_x` addition at `sigma_dispatch.py:973`. So the
+four-current layer still reaches a dynamic Σ through `sig_x` and the
+transverse Hartree and nowhere else — what changed is which owner computes
+the `sig_x` transverse part, not how many owners there are.
 
 **The transverse Hartree is on both routes.** Its gate is
 `include_transverse = bool(config.bispinor)` (`sigma_dispatch.py:310`), not
@@ -546,7 +583,8 @@ and again at driver entry (`gw_init.py:3118`).
 | `bispinor_tt_head_unsupported` | `:3895`, `:3910` (in `refuse_unsupported_bispinor_tt_head_correction`, `:3866`) | TT head without `bispinor`, or `sys_dim ∉ {2,3}` |
 | (no id) SC × dynamic | `gw_jax.py:272` | self-consistent solver with a dynamic mode — bispinor QSGW is static-only |
 | (no id) missing current centroids | `gw_jax.py:560-572`, `gw_init.py:1430-1433` | `bispinor = true` without `centroids_file_current` |
-| (no id) photon Σ envelope, ×3 | `sigma_dispatch.py:835` ff. | outside `cohsex`; without a packed response; with scalar `static_head_terms` |
+| (no id) packed route needs a distributed Dyson solve | `gw_config.py:3630` (the last conjunct of `packed_bare_transverse_route`) | `w_dyson_solver ≠ distributed`, i.e. also the shipping default `auto` on a small system. This is a **route** conjunct, not a refusal: the deck falls back to the incumbent path and the run record names the key. It exists because the screening owner refuses anything else (`w_isdf.py:2173`) and `distrib_la` additionally refuses `distributed` on a 1×1 mesh, so without it the predicate claimed decks that then died inside the packed operator — reachable only once the plasmon-pole pair joined the served modes |
+| (no id) photon Σ envelope | `sigma_dispatch.py:845` ff. | the static arm: outside `cohsex`; without a packed response; with scalar `static_head_terms`. The dynamic arm (`:890`) refuses a mode that builds static screened channels, and `:991` refuses a packed deck on a mode with no branch (`mpa`) |
 | (no id) packed response needs a config / distributed Dyson | `w_isdf.py:2178-2186` | the packed path called without the run config, or with a non-distributed Dyson solver |
 | `GATE static_gauge_head_fold_{ward,hermiticity}` | `head_correction.py:1365,1370` | Γ-fold residuals over `1e-8` / `1e-10` (`:158-159`) |
 | `GATE static_photon_{dyson,polygon}_*` | `head_correction.py:1249-1295` (helpers `:1159-1246`) | coupled-solve and polygon certificates, budget `1e-9` |
@@ -608,5 +646,6 @@ uphold when editing, not as something the tree checks for you.
 | the distributed solve behind the Dyson step | [`distrib_la`](../services/distrib_la.md) |
 | bispinor tile symmetry contracts, and why 4-component rotation does not exist | [Symmetry register](symmetry_register.md) |
 | the transverse current Hartree | [Direct Hartree field](../theory/hartree.md) |
-| whether the two Γ-cell head quadratures agree (they do not, by 5.4 meV MAE on MoS2 3×3) | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §3.6 — **open** |
+| whether the two Γ-cell head quadratures agree (the CHARGE pair do not, by 5.4 meV MAE on MoS2 3×3; the TRANSVERSE pair agree to 0.4 µeV, which is 0.16 % of a 0.25 meV term — the same Sobol sampling error, scaled to a much smaller quantity) | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §3.6 — **open** for the charge pair |
+| what freezing the current blocks at ω = 0 inside a dynamic run costs (1.2 × 10⁻⁸ eV on MoS2 3×3, and it bounds the neglected frequency dependence from above) | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §2.2 |
 | the narrative introduction, for a reader rather than an editor | `manual/08_bispinor/` (repo only, not in this site) |
