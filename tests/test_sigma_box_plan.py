@@ -65,6 +65,7 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
         "positive conduction:state_tail",
         "positive conduction:pole_tail",
     ]
+    assert [row.space for row in plan] == ["cond", "cond", "cond"]
     assert geometry["window_tau_pairs"] == 6
     assert geometry["eps"] == 1.0e-4
     assert geometry["rule_eps"] == 1.0e-5

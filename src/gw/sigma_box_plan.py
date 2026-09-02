@@ -677,7 +677,8 @@ def plan_sigma_windows(
             bounds=_pole_bounds(
                 len(spec["pole_indices"]), *spec["pole_bounds"]),
             phase_real=np.zeros(len(spec["pole_indices"]), dtype=bool),
-            band_weight=spec["branch"].band_weight))
+            band_weight=spec["branch"].band_weight,
+            space=spec["branch"].space))
         spec["branch_report"]["windows"].append({
             "name": spec["name"], "kind": spec["kind"],
             "state_interval_ry": list(spec["state_interval"]),
