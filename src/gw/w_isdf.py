@@ -121,6 +121,42 @@ def _complete_static_vertex_orientations(forward_R, reverse_R=None):
 # χ₀ kernel — minimax quadrature
 # ============================================================================
 
+def _resolve_vertex_spin_pair_stream(
+    mesh_xy, face_shape, right_face_shape, requested, *,
+    memory_per_device_gb=None,
+):
+    """Choose the rank-invariant full-spin versus spin-pair workspace."""
+    if requested is not None:
+        return bool(requested)
+    nk_face, _, n_left, nspin = (int(v) for v in face_shape)
+    n_right = int((right_face_shape or face_shape)[2])
+    p = int(mesh_xy.devices.size)
+    # Full route: two open-spin G tensors plus the spin-reduced chi.  Packed
+    # W and resident wavefunction/V state retain the other half of the device
+    # budget.  The configured budget is rank-invariant, unlike allocator
+    # state.  Auto-detection remains only for direct diagnostic callers.
+    full_working_bytes = (
+        (2 * nspin * nspin + 1) * nk_face * n_left * n_right
+        * np.dtype(np.complex128).itemsize // p)
+    if memory_per_device_gb is None:
+        from common.gpu_utils import get_device_memory_gb
+        memory_per_device_gb = get_device_memory_gb()
+    memory_per_device_gb = float(memory_per_device_gb)
+    if not np.isfinite(memory_per_device_gb) or memory_per_device_gb <= 0:
+        raise ValueError(
+            "memory_per_device_gb must be finite and positive; got "
+            f"{memory_per_device_gb!r}")
+    device_budget_bytes = int(memory_per_device_gb * 1e9)
+    stream = full_working_bytes > device_budget_bytes // 2
+    if stream and jax.process_index() == 0:
+        print(
+            "  [chi0] spin-pair stream selected: full open-spin G/FFT "
+            f"working set {full_working_bytes / 1e9:.2f} GB/device exceeds "
+            f"half of the {device_budget_bytes / 1e9:.2f} GB device budget",
+            flush=True)
+    return stream
+
+
 def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             n_out: int = 1, *,
                             complex_contour: bool = False,
@@ -129,6 +165,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             vertex_pair: bool = False,
                             vertex_identity=(False, False),
                             spin_pair_stream=None,
+                            memory_per_device_gb=None,
                             distrib_la_batched_route: str = "auto"):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
 
@@ -182,33 +219,11 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             "wavefunction layout")
     if spin_pair_stream is not None and not vertex_pair:
         raise ValueError("spin_pair_stream applies only to a vertex-pair chi")
-    if spin_pair_stream is None:
-        spin_pair_stream = False
-        if vertex_pair:
-            nk_face, _, n_left, nspin = (int(v) for v in face_shape)
-            n_right = int((right_face_shape or face_shape)[2])
-            p = int(mesh_xy.devices.size)
-            # Full route: two open-spin G tensors plus the spin-reduced chi.
-            # This is the irreducible response-kernel working set; packed W
-            # and the resident wavefunction/V state still need the other half
-            # of the device budget.  bytes_limit is rank-invariant, unlike
-            # live allocator availability, so every process chooses the same
-            # static executable.
-            full_working_bytes = (
-                (2 * nspin * nspin + 1) * nk_face * n_left * n_right
-                * np.dtype(np.complex128).itemsize // p)
-            from common.gpu_utils import get_device_memory_gb
-            device_budget_bytes = int(get_device_memory_gb() * 1e9)
-            spin_pair_stream = full_working_bytes > device_budget_bytes // 2
-            if spin_pair_stream and jax.process_index() == 0:
-                print(
-                    "  [chi0] spin-pair stream selected: full open-spin "
-                    f"G/FFT working set {full_working_bytes / 1e9:.2f} "
-                    f"GB/device exceeds half of the "
-                    f"{device_budget_bytes / 1e9:.2f} GB device budget",
-                    flush=True)
-    else:
-        spin_pair_stream = bool(spin_pair_stream)
+    spin_pair_stream = (
+        _resolve_vertex_spin_pair_stream(
+            mesh_xy, face_shape, right_face_shape, spin_pair_stream,
+            memory_per_device_gb=memory_per_device_gb)
+        if vertex_pair else False)
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_pair, vertex_identity, spin_pair_stream,
@@ -1679,7 +1694,8 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0,
 def compute_no_pair_dirac_current_block(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
-    spin_pair_stream=None, distrib_la_batched_route: str = "auto",
+    spin_pair_stream=None, memory_per_device_gb=None,
+    distrib_la_batched_route: str = "auto",
 ):
     """Compute one raw no-pair Dirac-current response block ``chi_AB``.
 
@@ -1767,6 +1783,7 @@ def compute_no_pair_dirac_current_block(
         right_face_shape=right_shape, vertex_pair=True,
         vertex_identity=(A == 0, B == 0),
         spin_pair_stream=spin_pair_stream,
+        memory_per_device_gb=memory_per_device_gb,
         distrib_la_batched_route=distrib_la_batched_route)
     mask_v = wfns_left.band_mask(s.val)
     mask_c = wfns_left.band_mask(s.cond)
@@ -2149,6 +2166,7 @@ def compute_experimental_no_pair_photon_chi0(
     wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout, *,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
+    memory_per_device_gb=None,
     distrib_la_batched_route: str = "auto",
 ):
     """Build all sixteen no-pair blocks with an experimental TT proxy.
@@ -2187,6 +2205,7 @@ def compute_experimental_no_pair_photon_chi0(
             families[A], families[B], quad, meta, mesh_xy,
             vertex_left=A, vertex_right=B,
             energy_reference=energy_reference,
+            memory_per_device_gb=memory_per_device_gb,
             distrib_la_batched_route=distrib_la_batched_route)
         if A and B:
             # Experimental no-pair Ward completion: TT only.  CC/CT/TC are
@@ -2331,6 +2350,8 @@ def compute_static_photon_response(
         wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
         current_contact=current_contact,
         energy_reference=energy_reference,
+        memory_per_device_gb=(
+            None if config is None else config.memory.per_device_gb),
         distrib_la_batched_route=distrib_la_batched_route)
 
     dyson_started = time.perf_counter()
