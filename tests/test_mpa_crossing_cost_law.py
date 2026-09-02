@@ -26,8 +26,8 @@ from gw.ppm_windows import _SigmaBranch
 
 RYD = 13.605693122994
 ETA_RY = 0.25 / RYD                  # production sigma_regularization_ev
-CROSSING_TOL = 2.0e-3                # production mpa_sigma_crossing_target_error
-SECTOR_TOL = 6.5e-4                  # production mpa_sigma_sector_target_error
+CROSSING_TOL = 2.0e-3                # frozen pane-control crossing target
+SECTOR_TOL = 6.5e-4                  # frozen pane-control sector target
 
 
 def _fe_class_plan(depth_ry):
@@ -49,8 +49,9 @@ def _fe_class_plan(depth_ry):
     return SW.build_shared_sigma_windows(
         summaries, [branch],
         regularization_width_ry=ETA_RY, edge_factor=1.5,
-        target_error=SECTOR_TOL, crossing_target_error=CROSSING_TOL,
-        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        target_error=SECTOR_TOL,
+        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=0.1)
 
 
 def test_fe_class_span_certifies_under_300_nodes_per_rule():
@@ -106,7 +107,7 @@ def _sigma_cfg(patches):
     return DynamicSigmaConfig(
         omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.25,
         regularization_ev=0.25, window_edge_factor=1.5,
-        omega_layout="replicated", fermi_reference="vbm",
+        fermi_reference="vbm",
         sigma_at_dft_extrapolate=False, sigma_at_dft_energies=False,
         omega_patches_ev=patches)
 

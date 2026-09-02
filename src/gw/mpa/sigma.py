@@ -69,8 +69,7 @@ def _geometry_residue(B, B_odd):
         return B
     plus = B + B_odd
     minus = B - B_odd
-    return jnp.where(jnp.abs(plus) > 0.0, plus, minus)
-
+    return jnp.where(jnp.abs(plus) >= jnp.abs(minus), plus, minus)
 
 def _bounded_pole_batch_size(value):
     size = int(value)
@@ -104,10 +103,11 @@ def _batch_rows(row, batch):
     # ``a > +inf`` is false for every finite pole.  Keeping all six values
     # finite-or-infinite (never NaN) also makes the inactive path harmless
     # under XLA predicate motion.
+    region_shape = tuple(np.asarray(row.bounds).shape[1:])
     bounds = np.broadcast_to(
         np.asarray((np.inf, -np.inf, np.inf, np.inf, -np.inf, -np.inf),
                    np.float64),
-        (capacity, 6),
+        (capacity, *region_shape),
     ).copy()
     bounds[:count] = np.asarray(row.bounds[keep], np.float64)
     phase_real = np.zeros(capacity, dtype=bool)
@@ -527,9 +527,12 @@ def compute_sigma_c_mpa_omega_grid(
     and the window build on one support.
 
     Pole tensors are read collectively in their native sharding.  The box
-    planner retains only exact live extrema from each configured pole batch;
-    the pane control consumes the same bounded census.  The spatial executor
-    then rereads and releases the pole ranges through one shared tau kernel.
+    planner first reduces a pole-residue CDF, then retains exact live extrema
+    for disjoint core/outlier selectors; an ordered store uses the
+    branch-neutral ``max(abs(R+), abs(R-))`` witness so neither branch can be
+    omitted.  The pane control consumes one bounded census.  The spatial
+    executor rereads the pole ranges and selects R+ or R- per branch through
+    one shared tau kernel.
 
     ``sigma_branches`` is an optional already-resolved set of causal branches;
     it lets another pole model retain its established occupation/Fermi policy
@@ -560,25 +563,22 @@ def compute_sigma_c_mpa_omega_grid(
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
     with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
-        # One bounded extrema census serves both routes.  In particular, the
-        # production route does not read residues into a host histogram and
-        # never constructs a sampled state-pole lattice.
-        summaries = []
-        for lo in range(0, n_poles, int(pole_batch_size)):
-            hi = min(lo + int(pole_batch_size), n_poles)
-            Omega, B, B_odd = reader.read(
-                slice(lo, hi), unfold=True, return_sharded=True,
-                to_unit="Ry", include_odd=True)
-            if B_odd is not None and odd_residue_off:
-                B_odd = jnp.zeros_like(B_odd)
-            summaries.extend(summarize_sigma_poles(
-                Omega, _geometry_residue(B, B_odd), branches,
-                regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, pole_offset=lo,
-                occupation_window_threshold=occupation_window_threshold))
-            del Omega, B, B_odd
-            gc.collect()
         if plan_mode == "panes":
+            summaries = []
+            for lo in range(0, n_poles, int(pole_batch_size)):
+                hi = min(lo + int(pole_batch_size), n_poles)
+                Omega, B, B_odd = reader.read(
+                    slice(lo, hi), unfold=True, return_sharded=True,
+                    to_unit="Ry", include_odd=True)
+                if B_odd is not None and odd_residue_off:
+                    B_odd = jnp.zeros_like(B_odd)
+                summaries.extend(summarize_sigma_poles(
+                    Omega, _geometry_residue(B, B_odd), branches,
+                    regularization_width_ry=regularization_width_ry,
+                    edge_factor=edge_factor, pole_offset=lo,
+                    occupation_window_threshold=occupation_window_threshold))
+                del Omega, B, B_odd
+                gc.collect()
             plan, geometry = build_shared_sigma_windows(
                 summaries, branches,
                 regularization_width_ry=regularization_width_ry,
@@ -590,14 +590,29 @@ def compute_sigma_c_mpa_omega_grid(
                 omega_grid_step_ry=omega_grid_step_ry,
                 occupation_window_threshold=occupation_window_threshold)
         else:
+            def pole_batches():
+                for lo in range(0, n_poles, int(pole_batch_size)):
+                    hi = min(lo + int(pole_batch_size), n_poles)
+                    Omega, B, B_odd = reader.read(
+                        slice(lo, hi), unfold=True, return_sharded=True,
+                        to_unit="Ry", include_odd=True)
+                    if B_odd is not None and odd_residue_off:
+                        B_odd = jnp.zeros_like(B_odd)
+                    yield lo, Omega, _geometry_residue(B, B_odd)
+                    del Omega, B, B_odd
+                    gc.collect()
+
             plan, geometry = plan_sigma_windows(
-                summaries, branches, omega_grid_ry,
+                pole_batches, branches, omega_grid_ry,
                 regularization_width_ry,
                 eps=quadrature_eps,
                 reduction_seconds=quadrature_reduction_seconds,
                 pair_ceiling=pair_ceiling,
                 cache_dir=quadrature_cache_dir,
-                print_fn=print_fn, edge_factor=edge_factor)
+                print_fn=print_fn, edge_factor=edge_factor,
+                occupation_window_threshold=occupation_window_threshold,
+                pole_weight_label=("max(abs(R+), abs(R-))"
+                                   if ordered_residues else "abs(B_p)"))
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
@@ -611,12 +626,23 @@ def compute_sigma_c_mpa_omega_grid(
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "
                 f"cache={geometry['cache_dir'] or 'off'}")
+            partition = geometry["pole_partition"]
+            print_fn(
+                f"    pole partition: weight={partition['weight']}, "
+                f"tails={100 * partition['tail_fraction_per_side']:.1f}% "
+                "per side/axis, "
+                f"outlier={100 * partition['outlier_weight_fraction']:.3f}%, "
+                f"a={tuple(partition['a_percentiles_ry'])} Ry, "
+                f"gamma={tuple(partition['gamma_percentiles_ry'])} Ry")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:
                     print_fn(
                         f"    {window['name']}: n_tau={window['node_count']}, "
+                        f"box={tuple(window['box_ry'])} Ry, "
+                        f"pole_weight={window['pole_weight_fraction']:.6g}, "
                         f"sup={window['sup_error']:.6g}/"
                         f"{window['eps']:.6g} ({window['criterion']}), "
+                        f"kappa_p99={window['kappa_p99']:.6g}, "
                         f"kappa_max={window['kappa_max']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")

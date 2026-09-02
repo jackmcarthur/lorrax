@@ -1,4 +1,9 @@
-# The crossing-rule cost law, and the ω-clustered core decomposition
+# Historical pane-control crossing-rule cost law
+
+This page records the geometry study behind the frozen
+`LORRAX_SIGMA_PLAN=panes` comparison route. The production MPA path now uses
+direct denominator boxes and exposes no omega-cluster policy; see
+`docs/theory/sigma-quadrature-problem.md`.
 
 **Status: design + diagnosis record, 2026-08-16.**  Companion theory text
 lands in `docs/theory/metallic-mpa-screening.md` (quadrature section) and
@@ -83,11 +88,10 @@ Two facts make the fix possible with zero executor changes:
 ## 3. The decomposition
 
 With a patched ω grid (dense near the valence window, dense near each
-semicore cluster, empty in between — `sigma_omega_patches_ev`), the
-planner clusters each branch's `omega_abs` at gaps >
-`mpa_sigma_omega_cluster_gap_ry` (default 1.0 Ry; a uniform production
-grid is always ONE cluster and reproduces the incumbent plan
-bit-for-bit).  Per crossing branch with ≥ 2 clusters, per cluster
+semicore cluster, empty in between — `sigma_omega_patches_ev`), the pane
+control clusters each branch's `omega_abs` at gaps greater than 1.5 requested
+grid steps (a contiguous grid is one cluster). Per crossing branch with at
+least two clusters, per cluster
 `[w_lo, w_hi]`, the core bands split three ways at margin
 `m = edge_factor·η + excursion` against the shallow-pole bracket
 `[a_lo, a_hi]`:

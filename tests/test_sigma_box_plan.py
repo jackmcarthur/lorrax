@@ -1,4 +1,4 @@
-"""Conventions and wiring gates for the shared denominator-box plan."""
+"""Conventions and wiring gates for the MPA denominator-box plan."""
 
 import ast
 from pathlib import Path
@@ -26,14 +26,22 @@ def _branch(tag="positive conduction", *, space="cond", negative=False):
     )
 
 
-def _summaries():
-    # eta=.1, omega_max=.5, edge=1.5 -> pole edge=.65.
-    shallow = (0.3, 0.3, 0.05, 0.05)
-    deep = (1.0, 1.0, 0.08, 0.08)
-    return (
-        (0, {"all": shallow, "shallow": shallow, "deep": None}),
-        (1, {"all": deep, "shallow": None, "deep": deep}),
-    )
+def _pole_batches():
+    # eta=.1, omega_max=.5, edge=1.5 -> pole edge=.65.  The tiny-residue
+    # third pole is beyond both 99th percentiles and becomes an outlier.
+    Omega = jnp.asarray([
+        [[[0.3 - 0.05j]]],
+        [[[1.0 - 0.08j]]],
+        [[[9.0 - 3.0j]]],
+    ], dtype=jnp.complex128)
+    B = jnp.asarray([
+        [[[100.0]]], [[[100.0]]], [[[0.1]]],
+    ], dtype=jnp.complex128)
+
+    def batches():
+        yield 0, Omega, B
+
+    return batches
 
 
 def _fake_rule(box, eps, **_kwargs):
@@ -48,11 +56,14 @@ def _fake_rule(box, eps, **_kwargs):
 
 def _plan(monkeypatch, branch=None, **kwargs):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_amplification_p99",
+        lambda *_args, **_kwargs: 1.1)
     branch = _branch() if branch is None else branch
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
     return plan_sigma_windows(
-        _summaries(), [branch], omega, 0.1,
+        _pole_batches(), [branch], omega, 0.1,
         eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None,
         **kwargs)
@@ -64,8 +75,9 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
         "positive conduction:resonant",
         "positive conduction:state_tail",
         "positive conduction:pole_tail",
+        "positive conduction:outlier-negative",
     ]
-    assert geometry["window_tau_pairs"] == 6
+    assert geometry["window_tau_pairs"] == 8
     report = geometry["branches"][0]["windows"]
     np.testing.assert_allclose(
         report[0]["box_ry"], [-0.206, 0.106, 0.15, 0.15])
@@ -78,6 +90,30 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     np.testing.assert_array_equal(plan[2].window.mask_A, [[True, True]])
     np.testing.assert_array_equal(plan[0].pole_indices, [0])
     np.testing.assert_array_equal(plan[2].pole_indices, [1])
+    np.testing.assert_array_equal(plan[3].pole_indices, [2])
+    assert geometry["pole_partition"]["weight"] == "abs(B_p)"
+    assert geometry["pole_partition"]["tail_fraction_per_side"] == 0.01
+
+    # The products cover every state/pole tuple exactly once.  The outlier
+    # union changes ownership, never eligibility.
+    coordinates = ((0.3, 0.05), (1.0, 0.08), (9.0, 3.0))
+    for state in range(2):
+        for pole, (a, gamma) in enumerate(coordinates):
+            owners = 0
+            for row in plan:
+                if not np.asarray(row.window.mask_A).reshape(-1)[state]:
+                    continue
+                positions = np.nonzero(row.pole_indices == pole)[0]
+                for position in positions:
+                    regions = np.asarray(row.bounds[position])
+                    selected = (
+                        (a > regions[:, 0]) & (a <= regions[:, 1])
+                        & (gamma >= regions[:, 2])
+                        & (gamma > regions[:, 3])
+                        & (gamma < regions[:, 4])
+                        & (gamma <= regions[:, 5]))
+                    owners += int(np.any(selected))
+            assert owners == 1
 
 
 def test_executor_conventions_and_lower_half_conjugation(monkeypatch):
@@ -111,15 +147,18 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         return _fake_rule(box, eps, **kwargs)
 
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_amplification_p99",
+        lambda *_args, **_kwargs: 1.1)
     args = dict(
         eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
     first, first_geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
-    assert len(calls) == 3
+        _pole_batches(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+    assert len(calls) == 4
     calls.clear()
     second, second_geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+        _pole_batches(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
     assert not calls
     assert all(window["cache_status"].startswith("hit:")
                for window in second_geometry["branches"][0]["windows"])
@@ -134,10 +173,13 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
 
 def test_total_pair_ceiling_refuses(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    with pytest.raises(RuntimeError, match="pair ceiling=5"):
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_amplification_p99",
+        lambda *_args, **_kwargs: 1.1)
+    with pytest.raises(RuntimeError, match="pair ceiling=7"):
         plan_sigma_windows(
-            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=5,
+            _pole_batches(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+            eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=7,
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 
 
@@ -153,6 +195,14 @@ def _range_row(poles):
         phase_real=np.zeros(poles.size, bool))
 
 
+def _union_row(poles):
+    row = _range_row(poles)
+    return SimpleNamespace(
+        pole_indices=row.pole_indices,
+        bounds=np.repeat(row.bounds[:, None, :], 4, axis=1),
+        phase_real=row.phase_real)
+
+
 def test_product_window_ranges_keep_one_batch_width_kernel_signature():
     broad = _batch_rows(_range_row((0, 1, 2)), (0, 1, 2, 3))
     narrow = _batch_rows(_range_row((2,)), (0, 1, 2, 3))
@@ -165,6 +215,10 @@ def test_product_window_ranges_keep_one_batch_width_kernel_signature():
     np.testing.assert_array_equal(narrow[0][:1], [2])
     assert np.isposinf(narrow[1][1:, 0]).all()
     assert np.isneginf(narrow[1][1:, 1]).all()
+
+    union = _batch_rows(_union_row((2,)), (0, 1, 2, 3))
+    assert union[1].shape == (4, 4, 6)
+    assert np.isposinf(union[1][1:, :, 0]).all()
 
 
 def test_mpa_executor_has_one_tau_kernel_factory():

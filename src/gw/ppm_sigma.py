@@ -46,7 +46,7 @@ This driver retains the physics prologue (PPM fit + physics-state prep) plus the
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Callable, NamedTuple
 import os
 import time
@@ -57,7 +57,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import jax_profile, timing
-from common.collectives import process_count
 from common.units import RYD_TO_EV
 from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_config import MinimaxConfig
@@ -70,19 +69,12 @@ from .ppm_windows import (
     _SigmaWindow,
     branches_for_omega_grid,
     _build_windows_for_branch,
-    sigma_window_product_support,
     window_mask_B_bounds,
     _to_host_np,
     _CROSSING_A_MAX,
     hgl_partition_required,
     resolve_sigma_regularization,
 )
-from .sigma_box_plan import (
-    fit_sigma_box_specs,
-    make_sigma_box_spec,
-    sigma_box_executor_nodes,
-)
-from .sigma_plan import resolve_sigma_plan
 from .ppm_tau_kernel import _get_sigma_tau_kernel, get_sigma_spatial_kernel
 from .ppm_accumulators import (
     _SigmaAccumulator,
@@ -1002,204 +994,6 @@ def strip_sigma_window(sigma_kij, nb_real: int, *, mesh_xy: Mesh | None = None):
     return sigma_kij[..., :nb_real, :nb_real]
 
 
-def _plan_ppm_box_windows(
-    *,
-    branches,
-    Omega_q: jax.Array,
-    base_mask_B: jax.Array,
-    regularization_width_ry: float,
-    edge_factor: float,
-    target_error: float,
-    max_nodes: int,
-    crossing_eps_q: float,
-    crossing_max_nodes: int,
-    use_shipped_minimax_tables: bool,
-    partition_hgl: bool,
-    quadrature_eps: float,
-    quadrature_reduction_seconds: float,
-    quadrature_cache_dir: str | None,
-    print_fn=print,
-):
-    """Put every PPM-owned physical pane on the shared denominator-box rule.
-
-    ``ppm_windows`` continues to own the exact factorized product cells
-    ``states(k,n) x poles(q,mu,nu) x omega``.  This orchestrator asks it for
-    those cells without serving the incumbent minimax tables, reduces each
-    live pole pane to scalar extrema, and hands the resulting affine
-    denominator support to :mod:`gw.sigma_box_plan`.
-
-    For conduction the causal denominator is
-    ``d = omega - E_A - Omega + i*eta``; for valence it is
-    ``d = omega + E_A + Omega - i*eta``.  The shared owner constructs the
-    padded box, conjugates the valence rule, checks its sup/noise/growth
-    contracts, and applies ``time_exec=pole_sign*time`` plus the single
-    ``exp(-eta*time_exec)`` damping factor.
-
-    Existing ``project='imag'`` crossing cells remain two-channel.  Their
-    executor weights receive the shared owner's ``i`` multiplier so the
-    incumbent global completion is exactly the Hermitian part of the causal
-    box rule, ``(iQ-(iQ)^dagger)/(2i)=(Q+Q^dagger)/2``.  This is valid for
-    the reducer's general complex times; no sine-grid assumption or channel
-    collapse is made.
-    """
-    started = time.perf_counter()
-    eta = float(regularization_width_ry)
-    specs = []
-    branch_reports = []
-    for branch in branches:
-        physical = _build_windows_for_branch(
-            omega_nonneg_ry=branch.omega_abs,
-            E_A=branch.E_A,
-            base_mask_A=branch.base_mask_A,
-            Omega_q=Omega_q,
-            base_mask_B=base_mask_B,
-            space=branch.space,
-            neg_omega_half=branch.neg_omega_half,
-            regularization_width_ry=eta,
-            edge_factor=edge_factor,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q,
-            crossing_max_nodes=crossing_max_nodes,
-            use_shipped_minimax_tables=use_shipped_minimax_tables,
-            log_tag=branch.tag,
-            print_fn=print_fn,
-            partition_hgl=partition_hgl,
-            defer_quadrature=True,
-        )
-        report = {
-            "tag": branch.tag,
-            "space": branch.space,
-            "negative_frequency_half": bool(branch.neg_omega_half),
-            "plan_start": len(specs),
-            "windows": [],
-        }
-        pole_sign = 1.0 if branch.space == "cond" else -1.0
-        external_sign = -1 if branch.neg_omega_half else 1
-        for index, window in enumerate(physical):
-            support = sigma_window_product_support(
-                window, branch.E_A, Omega_q, base_mask_B,
-                branch.omega_abs)
-            frequencies = external_sign * support["omega_abs"]
-            spec = make_sigma_box_spec(
-                name=f"{branch.tag}:{index}:{window.name}",
-                frequencies=frequencies,
-                states=support["states"],
-                pole_stats=support["pole_stats"],
-                pole_sign=pole_sign,
-                eta_ry=eta,
-            )
-            spec.update({
-                "branch": branch,
-                "window": window,
-                "support": support,
-                "external_sign": external_sign,
-                "branch_report": report,
-            })
-            specs.append(spec)
-        report["plan_stop"] = len(specs)
-        report["window_count"] = report["plan_stop"] - report["plan_start"]
-        branch_reports.append(report)
-
-    fits, fit_rows = fit_sigma_box_specs(
-        specs,
-        eta,
-        eps=quadrature_eps,
-        reduction_seconds=quadrature_reduction_seconds,
-        cache_dir=quadrature_cache_dir,
-    )
-
-    planned = {branch.tag: [] for branch in branches}
-    denominator_tuples = 0
-    for spec, fit in zip(specs, fits):
-        window = spec["window"]
-        one_sided_hermitian = window.project_code == 1
-        nodes = sigma_box_executor_nodes(
-            fit,
-            spec["pole_sign"],
-            eta,
-            one_sided_hermitian=one_sided_hermitian,
-        )
-        if int(nodes.t.shape[0]) == 0:
-            raise RuntimeError(
-                f"Sigma box window {spec['name']!r} retained no tau nodes")
-        executable = replace(
-            window,
-            nodes=nodes,
-            E_ref_A=float(spec["E_ref_A"]),
-            E_ref_B=float(spec["E_ref_B"]),
-            omega_sign=(int(spec["pole_sign"])
-                        * int(spec["external_sign"])),
-            # B_q = -Wc(0)*Omega/2 fixes the same overall sign on all four
-            # causal branches; the old pane prefactors encoded their
-            # Laplace/HGL orientations and do not apply to a direct 1/d rule.
-            prefactor=-1.0,
-            crossing_kind=("uniform_box_hermitian"
-                           if one_sided_hermitian else None),
-            max_error=float(fit["sup_error"]),
-            provenance=(
-                f"uniform denominator box {spec['box']}; "
-                f"{fit['one_line']}; cache={fit['cache_status']}; "
-                f"factor_growth={fit['factor_growth']}; "
-                f"completion={'hermitian' if one_sided_hermitian else 'full'}"
-            ),
-        )
-        planned[spec["branch"].tag].append(executable)
-        support = spec["support"]
-        tuple_count = (int(support["state_count"])
-                       * int(support["pole_count"])
-                       * int(support["omega_abs"].size))
-        denominator_tuples += tuple_count
-        receipt = {
-            "name": spec["name"],
-            "physical_window": window.name,
-            "project": window.project,
-            "completion": ("hermitian" if one_sided_hermitian else "full"),
-            "state_count": int(support["state_count"]),
-            "pole_count": int(support["pole_count"]),
-            "omega_count": int(support["omega_abs"].size),
-            "denominator_tuple_count": tuple_count,
-            "raw_real_support_ry": list(spec["raw_real_support"]),
-            "box_ry": list(spec["box"]),
-            "rule_box_ry": list(fit["rule_box"]),
-            "criterion": ("relative" if fit["relative"]
-                          else "peak-relative"),
-            "node_count": int(fit["node_count"]),
-            "sup_error": float(fit["sup_error"]),
-            "kappa_max": float(fit["kappa_max"]),
-            "factor_growth": list(fit["factor_growth"]),
-            "cache_status": fit["cache_status"],
-            "fit_seconds": float(fit["seconds"]),
-        }
-        spec["branch_report"]["windows"].append(receipt)
-        if os.environ.get("LORRAX_UNIFORM_RULE_TRACE"):
-            print_fn(
-                f"[uniform-box:ppm] {spec['name']} "
-                f"support_re={spec['raw_real_support']} box={spec['box']} "
-                f"nodes={fit['node_count']} project={window.project}")
-
-    window_tau_pairs = sum(int(fit["node_count"]) for fit in fits)
-    geometry = {
-        "planner": "uniform_denominator_boxes",
-        "eta_ry": eta,
-        "eps": float(quadrature_eps),
-        "reduction_seconds": float(quadrature_reduction_seconds),
-        "cache_dir": quadrature_cache_dir,
-        "n_windows": len(specs),
-        "window_tau_pairs": window_tau_pairs,
-        # The incumbent Python tau loop dispatches exactly one device kernel
-        # per (window,tau) pair.
-        "tau_dispatches": window_tau_pairs,
-        "denominator_tuple_count": denominator_tuples,
-        "plan_seconds": time.perf_counter() - started,
-        "planning_process_count": int(process_count()),
-        "critical_fit_wall_seconds": max(
-            (row["wall_seconds"] for row in fit_rows), default=0.0),
-        "branches": branch_reports,
-    }
-    return planned, geometry
-
-
 def _run_sigma_branch(
     *,
     omega_nonneg_ry: np.ndarray,
@@ -1949,37 +1743,6 @@ def _compute_sigma_c_ppm_omega_grid_incumbent(
         cond_mask=cond_mask, val_mask=val_mask,
     )
 
-    plan_mode = resolve_sigma_plan()
-    planned_windows = {}
-    box_geometry = None
-    if plan_mode == "box" and branches:
-        with timing.section("sigma.box_plan"):
-            planned_windows, box_geometry = _plan_ppm_box_windows(
-                branches=branches,
-                Omega_q=Omega_abs,
-                base_mask_B=B_mask,
-                regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor,
-                target_error=target_error,
-                max_nodes=max_nodes,
-                crossing_eps_q=crossing_eps_q,
-                crossing_max_nodes=crossing_max_nodes,
-                use_shipped_minimax_tables=use_shipped_minimax_tables,
-                partition_hgl=partition_hgl,
-                quadrature_eps=float(sigma_cfg.quadrature_eps),
-                quadrature_reduction_seconds=float(
-                    sigma_cfg.quadrature_reduction_seconds),
-                quadrature_cache_dir=quadrature_cache_dir,
-                print_fn=print_fn,
-            )
-        print_fn(
-            f"  GN-PPM windows [box]: {box_geometry['n_windows']} logical "
-            f"windows, {box_geometry['window_tau_pairs']} (window,tau) "
-            f"pairs = {box_geometry['tau_dispatches']} tau dispatches, "
-            f"{box_geometry['denominator_tuple_count']} exact denominator "
-            f"tuples, eps={box_geometry['eps']:.3g}, "
-            f"plan {box_geometry['plan_seconds']:.3f} s")
-
     # Run each branch and fold its Σc tiles into per-rank HOST tile
     # accumulators at the branch's global ω indices.  cond and val of a
     # given ω-half share those indices, so the second branch's `+=` sums
@@ -2018,8 +1781,7 @@ def _compute_sigma_c_ppm_omega_grid_incumbent(
             B_q=_residue_for_space(br.space, B_corr, B_odd_corr),
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
-            planned_windows=(planned_windows.get(br.tag)
-                             if plan_mode == "box" else None),
+            planned_windows=None,
             **common_branch_kwargs,
         )
         executed_windows.extend(branch_windows)
