@@ -1676,11 +1676,29 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     elif not np.all(d.imag > 0.0):
         return None, None
     re_lo, re_hi = float(np.min(d.real)), float(np.max(d.real))
-    # Guard the lattice cells' extremes by 2% of the width, but never let the
-    # padding carry a sign-definite edge across zero: that would turn a
-    # Laplace box into a crossing box of the full width (measured: val:bulk
-    # went from 16 nodes in 3 s to a 414 s fall-through).  The near-zero
-    # edge is padded toward zero by at most 30% of its own distance.
+    # The lattice cells are bin representatives; the box must cover the RAW
+    # products state + pole_sign*pole over the window's own frequencies, so
+    # widen it to the corner extremes of (raw state energy) x (pole cells).
+    try:
+        raw = np.asarray(spec["raw_state_energy"], np.float64)
+        poles = np.asarray(_selected_pole_values(spec), np.complex128)
+        freq = np.asarray(spec["problem"].frequencies, np.float64)
+        sign = float(spec["pole_sign"])
+        corners = [float(np.min(freq)) - (e + sign * pr)
+                   for e in (np.min(raw), np.max(raw))
+                   for pr in (np.min(poles.real), np.max(poles.real))]
+        corners += [float(np.max(freq)) - (e + sign * pr)
+                    for e in (np.min(raw), np.max(raw))
+                    for pr in (np.min(poles.real), np.max(poles.real))]
+        # conjugation flips Im d only; the real corners are unchanged
+        re_lo, re_hi = min(re_lo, min(corners)), max(re_hi, max(corners))
+    except (KeyError, RuntimeError, ValueError, TypeError):
+        pass
+    # Guard the extremes by 2% of the width, but never let the padding carry
+    # a sign-definite edge across zero: that would turn a Laplace box into a
+    # crossing box of the full width (measured: val:bulk went from 16 nodes
+    # in 3 s to a 414 s fall-through).  The near-zero edge is padded toward
+    # zero by at most 30% of its own distance.
     pad = 0.02 * max(re_hi - re_lo, float(eta))
     lo = re_lo - pad if re_lo <= 0.0 else max(re_lo - pad, 0.7 * re_lo)
     hi = re_hi + pad if re_hi >= 0.0 else min(re_hi + pad, 0.7 * re_hi)
