@@ -920,13 +920,9 @@ def solve_qp(
     from .gw_config import QPSolver, qp_solver_semantics
 
     # ONE BASIS ASSUMED across these two reads, and across the sig_x /
-    # omega_dft_rel_ev reads in the FIXED_POINT branch below.  On a
-    # SigmaResult off the SC driver they disagree: ``v_h_kij_ry`` is in
-    # ``sigma_dispatch.ROTATED_TO_DFT_FIELDS`` (DFT basis) and
-    # ``sigma_c_omega_kij_ry`` in ``SIGMA_BASIS_FIELDS`` (QP basis).
-    # Safe because SELF_CONSISTENT never reaches this function —
-    # ``gw_jax`` calls solve_qp in the non-SC branch only — so the object
-    # here is the one-shot one, DFT basis throughout.
+    # omega_dft_rel_ev reads in the FIXED_POINT branch below.  SC owns its
+    # own loop and never reaches this function; the object here is the
+    # one-shot one, DFT basis throughout.
     sig_h = sigma_result.v_h_kij_ry
     sigma_c_omega = sigma_result.sigma_c_omega_kij_ry
 

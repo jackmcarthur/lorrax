@@ -791,6 +791,12 @@ def test_the_env_scan_separates_reads_from_writes():
 # is banned outright.
 
 _L1_LIBRARY_ENV_READS = {
+    # resolve_sigma_plan -- explicit, fail-closed selection of the opt-in
+    # planner.  The shared-grid dial was removed (owner ruling 2026-08-31).
+    "gw.sigma_plan": {
+        "LORRAX_DELIVERED_PLAN_CACHE",
+        "LORRAX_SIGMA_PLAN",
+    },
     # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad — one resolver
     # each, refuse-on-garbage; the entry layer passes resolved values down.
     "bandstructure.htransform": {
@@ -930,6 +936,19 @@ def test_the_resolver_scan_can_fail():
     assert scan_env_reads_outside_resolvers(ok) == [], (
         "the scan flags the sanctioned resolver pattern; the gate would be "
         "turned off")
+
+
+def test_the_l1_env_read_ratchet_rejects_a_new_unregistered_policy(sources):
+    """RED TWIN: a resolver alone does not register a new policy read."""
+    mod = "gw.sigma_plan"
+    injected = (
+        sources[mod]
+        + "\ndef resolve_audit_negative_control():\n"
+        + "    return os.environ.get('LORRAX_UNREGISTERED_POLICY', '')\n")
+    live = {key for key, _line in scan_l1_env_reads(injected)}
+    assert live - _L1_LIBRARY_ENV_READS[mod] == {
+        "LORRAX_UNREGISTERED_POLICY"
+    }, "the exact-set ratchet failed to detect a newly introduced policy read"
 
 
 # ===========================================================================

@@ -8,6 +8,14 @@ from gw.mpa import sigma_windows as SW
 from gw.ppm_tau_kernel import build_shared_w_tau
 from gw.ppm_windows import _SigmaBranch
 
+#: Step of the ω grid the shared fixtures request.  The planner reads the
+#: deck's own sample spacing to tell a patch boundary from an adjacent
+#: sample, so a fixture must declare the step its grid actually uses.
+_STEP = 0.5
+#: The patched fixtures place two isolated samples 3.0 apart; any step below
+#: 2.0 resolves them as separate deliveries.
+_PATCH_STEP = 0.25
+
 
 def _branches():
     omega = np.asarray([0.0, 0.5, 1.0])
@@ -73,7 +81,8 @@ def test_actual_windows_match_all_four_causal_denominators():
         summaries, branches,
         regularization_width_ry=0.2,
         edge_factor=1.5, target_error=1.0e-6, max_rank=96,
-        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
     assert [(row.window.name, row.window.prefactor,
              row.window.omega_sign) for row in plan] == [
         ("single", -1.0, -1), ("single", 1.0, -1),
@@ -137,7 +146,8 @@ def test_actual_stripe_and_slab_match_direct_complex_denominators():
         summaries, [branch],
         regularization_width_ry=0.2, edge_factor=1.5,
         target_error=1.0e-6, max_rank=96,
-        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_PATCH_STEP)
     assert [row.window.name for row in plan] == [
         "b_slab", "a_stripe", "core"]
 
@@ -210,18 +220,17 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     plan, report = SW.build_shared_sigma_windows(
         summaries, _branches(), regularization_width_ry=0.2,
         edge_factor=1.5,
-        target_error=6.5e-4, crossing_target_error=2.0e-3,
-        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        target_error=6.5e-4, max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
     names = [row.window.name for row in plan]
     assert names.count("single") == 2
     assert names.count("b_slab") == 2
     assert names.count("a_stripe") == 2
     assert names.count("core") == 2
     assert report["n_windows"] == 8
-    assert report["sector_target_error"] == 6.5e-4
-    assert report["crossing_target_error"] == 2.0e-3
+    assert report["target_error"] == 6.5e-4
     assert set(seen["sector"]) == {6.5e-4}
-    assert seen["crossing"] == 2.0e-3
+    assert seen["crossing"] == 6.5e-4
 
     single = next(row for row in plan if row.window.name == "single")
     assert single.pole_indices.tolist() == [0, 1]
@@ -258,7 +267,8 @@ def test_a_truly_crossing_sign_definite_cell_refuses(monkeypatch):
             summaries, branches,
             regularization_width_ry=0.2, edge_factor=1.5,
             target_error=1.0e-4, max_rank=96,
-            crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+            crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
     except ValueError as exc:
         assert "crosses zero" in str(exc)
     else:
@@ -302,7 +312,8 @@ def test_exact_zero_residue_pole_does_not_change_geometry(monkeypatch):
         _branches(),
         regularization_width_ry=0.2, edge_factor=1.5,
         target_error=1.0e-4, max_rank=96,
-        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
     dead = jnp.full_like(live, 1.0e4 - 1.0e4j)
     extended, extended_report = SW.build_shared_sigma_windows(
         SW.summarize_sigma_poles(
@@ -312,7 +323,8 @@ def test_exact_zero_residue_pole_does_not_change_geometry(monkeypatch):
         _branches(),
         regularization_width_ry=0.2, edge_factor=1.5,
         target_error=1.0e-4, max_rank=96,
-        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
     assert extended_report == base_report
     assert [(row.window.name, row.window.n_tau,
              row.pole_indices.tolist(), row.bounds.tolist())
@@ -332,7 +344,8 @@ def test_nonpositive_eta_refuses():
                 summaries, _branches(),
                 regularization_width_ry=eta,
                 edge_factor=1.5, target_error=1.0e-4, max_rank=96,
-                crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+                crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
         except ValueError as exc:
             assert "eta must be finite and positive" in str(exc)
         else:
@@ -404,8 +417,8 @@ def test_gapped_omega_grid_decomposes_the_core_and_matches_the_exact_sum():
     plan, geometry = SW.build_shared_sigma_windows(
         summaries, [branch],
         regularization_width_ry=0.2, edge_factor=1.5,
-        target_error=1.0e-6, crossing_target_error=1.0e-6,
-        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        target_error=1.0e-6, max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
 
     names = sorted(row.window.name for row in plan)
     assert names == [
@@ -451,8 +464,8 @@ def test_gapped_omega_grid_decomposes_the_metal_sliver_and_matches():
     plan, geometry = SW.build_shared_sigma_windows(
         summaries, [branch],
         regularization_width_ry=0.2, edge_factor=1.5,
-        target_error=1.0e-6, crossing_target_error=1.0e-6,
-        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        target_error=1.0e-6, max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
 
     names = sorted(row.window.name for row in plan)
     assert "sd_core" in names and "sd_shallow_slab" in names
@@ -478,19 +491,20 @@ def test_contiguous_grid_keeps_the_monolithic_plan_bitwise():
     kwargs = dict(
         regularization_width_ry=0.2, edge_factor=1.5,
         target_error=1.0e-4, max_rank=96,
-        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
     base, base_report = SW.build_shared_sigma_windows(
         summaries, branches, **kwargs)
     huge_gap, huge_report = SW.build_shared_sigma_windows(
-        summaries, branches, omega_cluster_gap_ry=1.0e6, **kwargs)
+        summaries, branches, **{**kwargs, "omega_grid_step_ry": 1.0e6})
     assert [(row.window.name, row.window.provenance,
              row.omega_idx.tolist()) for row in base] == [
         (row.window.name, row.window.provenance,
          row.omega_idx.tolist()) for row in huge_gap]
     assert {k: v for k, v in base_report.items()
-            if k != "omega_cluster_gap_ry"} == {
+            if k != "omega_gap_ry"} == {
         k: v for k, v in huge_report.items()
-        if k != "omega_cluster_gap_ry"}
+        if k != "omega_gap_ry"}
 
 
 def test_wide_pole_spread_is_cut_from_each_cluster_shell():
@@ -517,8 +531,8 @@ def test_wide_pole_spread_is_cut_from_each_cluster_shell():
     plan, geometry = SW.build_shared_sigma_windows(
         summaries, [branch],
         regularization_width_ry=0.2, edge_factor=1.5,
-        target_error=1.0e-6, crossing_target_error=1.0e-6,
-        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        target_error=1.0e-6, max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR,
+        omega_grid_step_ry=_STEP)
 
     shells = [row for row in plan if row.window.name == "core"]
     assert len(shells) == 2

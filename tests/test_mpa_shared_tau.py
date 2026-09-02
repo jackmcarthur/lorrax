@@ -72,7 +72,7 @@ def test_device_frequency_fold_and_one_sided_completion():
     shape = (omega.size, *sigma.shape)
 
     acc = DeviceOmegaAccumulator(omega, shape=shape,
-                                 sharding=output_sharding)
+                                 sharding=output_sharding, omega_axis=0)
     acc.begin_window(t, alpha, omega_sign=sign, prefactor=pref,
                      e_ref_sum=e_ref, antihermitian=True)
     for _ in t:
@@ -87,7 +87,7 @@ def test_device_frequency_fold_and_one_sided_completion():
     np.testing.assert_allclose(got, want, rtol=2e-14, atol=2e-14)
 
     broken = DeviceOmegaAccumulator(omega, shape=shape,
-                                    sharding=output_sharding)
+                                    sharding=output_sharding, omega_axis=0)
     broken.begin_window(t, alpha, omega_sign=sign, prefactor=pref)
     broken.add_tau(sigma)
     with pytest.raises(RuntimeError, match="before all tau nodes"):
@@ -102,7 +102,7 @@ def test_device_frequency_fold_can_target_one_causal_half():
     sigma = jax.device_put(
         np.asarray([[[2.0 + 0.5j]]]), sigma_sharding)
     acc = DeviceOmegaAccumulator(
-        omega, shape=(4, 1, 1, 1), sharding=output_sharding)
+        omega, shape=(4, 1, 1, 1), sharding=output_sharding, omega_axis=0)
     acc.begin_window(
         np.asarray([0.3]), np.asarray([0.7]), omega_sign=1.0,
         prefactor=-1.0, omega_indices=np.asarray([2, 3]),
@@ -113,3 +113,26 @@ def test_device_frequency_fold_can_target_one_causal_half():
     assert np.array_equal(got[:2], np.zeros(2, np.complex128))
     want = -0.7 * np.exp(1j * np.asarray([0.0, 0.4]) * 0.3) * (2 + 0.5j)
     np.testing.assert_allclose(got[2:], want, rtol=2e-14, atol=2e-14)
+
+
+def test_device_frequency_fold_preserves_a_leading_bracket_axis():
+    mesh = _mesh()
+    sigma_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    output_sharding = NamedSharding(
+        mesh, P(None, None, None, "x", "y"))
+    omega = np.asarray([-0.5, 0.25, 0.75])
+    sigma_np = np.arange(16, dtype=np.float64).reshape(2, 2, 2, 2)
+    sigma = jax.device_put(sigma_np * (1.0 - 0.2j), sigma_sharding)
+    acc = DeviceOmegaAccumulator(
+        omega, shape=(2, 3, 2, 2, 2), sharding=output_sharding,
+        omega_axis=1)
+    acc.begin_window(
+        np.asarray([0.4]), np.asarray([0.7]), omega_sign=-1.0,
+        prefactor=0.5)
+    acc.add_tau(sigma)
+    acc.end_window()
+
+    got = np.asarray(acc.finalize())
+    coeff = 0.35 * np.exp(-1j * omega * 0.4)
+    want = coeff.reshape(1, 3, 1, 1, 1) * np.asarray(sigma)[:, None]
+    np.testing.assert_allclose(got, want, rtol=2e-14, atol=2e-14)

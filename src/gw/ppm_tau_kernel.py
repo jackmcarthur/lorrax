@@ -1099,6 +1099,7 @@ def get_shared_sigma_tau_kernel(
 
     ensure_jax_compile_cache()
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+
     sigma_kij = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         layout=layout, face_shape=face_shape)

@@ -61,19 +61,20 @@ yields `(accepted, got, want, klass, why, derived_key)`:
 | 2 | `qp_solver = one_shot_dft` | both | IMPLEMENTATION LIMIT |
 | 3 | `screening_diagrams = w_rpa` | both | IMPLEMENTATION LIMIT |
 | 4 | `head_correction ∈ {full, off}` | both | PHYSICS/POLICY (row 20) |
-| 5 | `restart = false` | both | IMPLEMENTATION LIMIT — normally unreachable on a slab deck, which `GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism` (`:3971`) refuses at parse time |
-| 6 | `mpa_material_class = insulator` | screened | PHYSICS |
-| 7 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived** |
-| 8 | `w_dyson_solver = distributed` | screened | IMPLEMENTATION LIMIT, **derived** |
-| 9 | no scalar q→0 head override named (`scalar_head_overrides_named`, `:3639`) | screened | IMPLEMENTATION LIMIT — ONE conjunct for the eight `use_bgw_vcoul` / `wcoul0_*` / `*head*` / `mc_average_placement*` keys, naming only the ones the deck set |
+| 5 | `restart = false` | both | IMPLEMENTATION LIMIT — normally unreachable on a slab deck, which `GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism` (`:3895`) refuses at parse time |
+| 6 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived** |
+| 7 | `w_dyson_solver = distributed` | screened | IMPLEMENTATION LIMIT, **derived** |
+| 8 | no scalar q→0 head override named (`scalar_head_overrides_named`, `:3621`) | screened | IMPLEMENTATION LIMIT — ONE conjunct for the eight `use_bgw_vcoul` / `wcoul0_*` / `*head*` / `mc_average_placement*` keys, naming only the ones the deck set |
 
-Rows 7 and 8 are **derived, not declared**: `LorraxConfig.from_input_file`
+Rows 6 and 7 are **derived, not declared**: `LorraxConfig.from_input_file`
 sets an unnamed one for `full_static_cohsex` with a `[config provenance]`
 line, promoting only when every other row already passes, so a deck outside
 the envelope for another reason still sees *that* reason. An explicitly named
-conflicting value is refused (rule 13). `sys_dim = 2` is deliberately **not**
-in the table: the bare route treats it as a routing condition
-(`packed_bare_transverse_route`, `:3743`) while the screened mode refuses it
+conflicting value is refused (rule 13). Material class is also outside the
+table: the driver infers it from the loaded WFN occupations, and
+`validate_material_inputs` refuses every fractional-occupation non-MPA run
+before screening. `sys_dim = 2` is deliberately **not** in the table: the bare route treats it as a routing condition
+(`packed_bare_transverse_route`, `:3720`) while the screened mode refuses it
 only under `head_correction = full` (`GATE
 static_bispinor_photon_head_slab_only`, `:4055`), and one row cannot say
 both.
@@ -257,9 +258,9 @@ producer. The surviving lift selector is `RAW_KINETIC_BALANCE_LIFT = "raw"`;
 (`src/common/bispinor_init.py`) remains library code for the jet tests.
 
 **`static_bispinor_photon_envelope` is a gate id, not a function.** It is
-the raise at `gw_config.py:4073`, over the nine rows of
-`packed_static_envelope` (the table in Stage 1). **Nine**, down from
-seventeen in the historical implementation, and each unmet row
+the raise at `gw_config.py:3997`, over the eight rows of
+`packed_static_envelope` (the table in Stage 1). **Eight**, down from
+seventeen (`lane/bisp-l-dials-envelope-2026-09-01`), and each unmet row
 prints `PHYSICS` or `IMPLEMENTATION LIMIT` with its own reason. `full` is the
 default and runs the Γ completion, `off` is a DEBUG skip, and
 `no_local_fields` is refused on EVERY bispinor deck

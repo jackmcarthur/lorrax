@@ -103,7 +103,8 @@ from .gw_config import (
 	packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
-	uses_four_spinor_finite_q_charge, uses_static_photon_response)
+	uses_four_spinor_finite_q_charge, uses_static_photon_response,
+	validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -205,6 +206,67 @@ def _compute_static_head(
 	return terms
 
 
+def _infer_material_class(wfn) -> str:
+	"""Classify the loaded mean field from its supplied occupations."""
+	occ = np.asarray(wfn.occs, dtype=np.float64)
+	if occ.size == 0 or not np.all(np.isfinite(occ)):
+		raise ValueError("WFN occupations must be finite and nonempty")
+	distance = np.abs(occ - np.rint(occ))
+	return "metal" if float(np.max(distance)) > 1.0e-6 else "insulator"
+
+
+def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
+                                  mesh_xy=None, print_fn=print):
+	"""Solve the fixed-N MP1 state consumed by one-shot metallic MPA.
+
+	The self-consistent driver already solves this state at map entry.  A
+	non-SC driver must solve it once from the DFT spectrum and thread that same
+	record to the MPA fit and Sigma; reconstructing either the chemical
+	potential or occupations at a consumer would violate the one-state rule.
+
+	One state per RUN also means one state across RANKS: the head fit is
+	stamped with rank 0's ``occ_hash`` and every rank's Sigma body asserts
+	against it, so the table is solved locally and then rank 0's copy is
+	broadcast (one psum) to all processes.  Measured on Na 8x8x8 at P=16
+	(2026-09-01): ranks 2 and 7 solved a table whose bytes differed from
+	rank 0's at the same mu to 12 digits and refused with "head fit and
+	Sigma body carry different occupation states".
+	"""
+	if material_class != "metal":
+		return None
+	from psp.get_DFT_mtxels import spin_degeneracy_factor
+	from common.collectives import process_count, process_rank, psum_replicate
+	from .efermi import OccupationState
+
+	energies = np.asarray(wfns.enk, dtype=np.float64)
+	if energies.ndim != 2 or min(energies.shape) < 1:
+		raise ValueError(
+			"one-shot metallic MPA occupation energies must be nonempty "
+			f"(nk,nb), got {energies.shape}")
+	nk = int(energies.shape[0])
+	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
+	local = OccupationState.solve_mp1(
+		energies, kweights, float(wfn.num_electrons),
+		float(config.occ_broadening_ry),
+		state_capacity=spin_degeneracy_factor(wfn),
+		clamp_tol=float(config.occupation_clamp_tol))
+	if mesh_xy is None or process_count() <= 1:
+		return local
+	root = 1.0 if process_rank() == 0 else 0.0
+	f_kn = psum_replicate(np.asarray(local.f_kn, dtype=np.float64) * root, mesh_xy)
+	mu_ry = float(psum_replicate(np.array([float(local.mu_ry)]) * root, mesh_xy)[0])
+	state = OccupationState(
+		f_kn=f_kn, mu_ry=mu_ry, smearing_family=local.smearing_family,
+		smearing_width_ry=float(local.smearing_width_ry),
+		n_electrons=float(local.n_electrons))
+	if state.occ_hash != local.occ_hash:
+		print_fn(
+			f"  one-shot occupations: rank {process_rank()} solved occ_hash="
+			f"{local.occ_hash} (mu={float(local.mu_ry):.12g}); using rank 0's "
+			f"{state.occ_hash} (mu={mu_ry:.12g}) so head and body agree")
+	return state
+
+
 def main(argv=None):
 	# Same factory the module-scope seam used, so the two cannot disagree.
 	args = build_parser().parse_args(argv)
@@ -266,30 +328,6 @@ def main(argv=None):
 	# refusal names the mode; a typo'd mode value never reaches this line
 	# because ``config.compute_mode`` already raised on it.
 	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
-	# Dynamic SC currently returns two basis sectors by design: finalized H/X
-	# operators are rotated back to DFT bands, while the full C(omega) operator
-	# remains in QP bands for the QSGW ansatz.  Refuse that unsupported output
-	# contract here, before screening or the expensive SC loop.  A second guard
-	# remains at the post-Sigma seam as an invariant against future routing drift.
-	if qp_solver is QPSolver.SELF_CONSISTENT and mode.is_dynamic:
-		raise ValueError(
-			"REFUSED: qp_solver=self_consistent beside a dynamic compute_mode.\n"
-			f"  got:  qp_solver={qp_solver.value}, compute_mode={mode.value}\n"
-			"  want: self_consistent with a STATIC compute_mode (cohsex), or a "
-			"dynamic compute_mode with qp_solver=one_shot_dft / fixed_point\n"
-			"  why:  the SC finalize rotates V_H / Sigma_x / Sigma_xc / "
-			"Sigma_SX / Sigma_COH to dft_band (gw/sc_iteration.py) and "
-			"leaves the C(omega) cube in qp_band by design, because the "
-			"QSGW ansatz only holds in the basis whose eigenvalues it uses "
-			"(gw.sigma_dispatch.SIGMA_BASIS_FIELDS). Their diagonals add up "
-			"only at U = identity.\n"
-			"  fix:  rotate the correlation operator for output, then delete "
-			"this guard, its twins at the post-Sigma seam and in "
-			"gw_output.write_results, and the qp_solver rows in "
-			"docs/input_reference.md and docs/drivers.md together.\n"
-			"  doc:  tests/KNOWN_FAILURES.md, 'eqp0.dat / eqp1.dat mix two "
-			"bases on the self-consistent path'; "
-			"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md")
 	do_screened = mode.needs_screening
 	print0(
 		f"  Head policy: head_correction={config.head.correction.value}; "
@@ -388,6 +426,9 @@ def main(argv=None):
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
+	material_class = _infer_material_class(wfn)
+	validate_material_inputs(config, material_class)
+	print0(f"  Material class: {material_class} (inferred from WFN occupations)")
 	sym = wfn.symmetry()
 	centroid_basis = load_centroid_basis(
 		config.paths.centroids_file, wfn.fft_grid, sym=sym)
@@ -458,45 +499,7 @@ def main(argv=None):
 	_p_x = int(mesh_xy.devices.shape[0])
 	_p_y = int(mesh_xy.devices.shape[1])
 	_nbs = int(meta.nb_sigma)
-	_wants_sharded_cube = (
-		config.sigma.omega_layout == "sharded"
-		or getattr(mode, "value", str(mode)) == "mpa")
-	if (mode.is_dynamic
-			and not _wants_sharded_cube
-			and int(RUNTIME.process_count) > 1):
-		# The cube is an additional late-stage BFC producer, after the memory
-		# planners have spent their stage budgets.  Price it against the
-		# canonical retained headroom rather than a GPU-model-specific byte
-		# constant.  This leaves the same 10% reserve on a 40- or 80-GB lane;
-		# JID 57638248.29 crossed it at 4.28 GiB against a 35-GB deck budget.
-		from common.gpu_utils import bfc_fragmentation_target_utilization
-		_headroom_fraction = (
-			1.0 - bfc_fragmentation_target_utilization(width_factor=1))
-		_budget_bytes = float(config.memory.per_device_gb) * 1.0e9
-		_replicated_cap_bytes = int(_headroom_fraction * _budget_bytes)
-		_nw = int(np.asarray(config.sigma.omega_grid_ev).size)
-		_nk = int(meta.nk_tot)
-		_cube_bytes = _nw * _nk * _nbs * _nbs * np.dtype(np.complex128).itemsize
-		if _cube_bytes > _replicated_cap_bytes:
-			_mesh_multiple = int(np.lcm(_p_x, _p_y))
-			_next_nb = -(-_nbs // _mesh_multiple) * _mesh_multiple
-			raise ValueError(
-				f"compute_mode = {getattr(mode, 'value', mode)}: "
-				f"sigma_omega_layout = replicated would create "
-				f"complex128 Sigma_c[{_nw},{_nk},{_nbs},{_nbs}] = "
-				f"{_cube_bytes / 2**30:.2f} GiB on every one of "
-				f"{int(RUNTIME.process_count)} ranks, above the "
-				f"{_replicated_cap_bytes / 2**30:.2f}-GiB retained headroom "
-				f"({_headroom_fraction:.0%} of the "
-				f"{float(config.memory.per_device_gb):.1f}-GB/device budget).  "
-				f"The output expressions "
-				f"must materialize that lazy producer after the physics kernels; "
-				f"SlabIO can bound file slabs but cannot bound the producer.  Set "
-				f"sigma_omega_layout = sharded and choose nval+ncond divisible "
-				f"by both mesh axes.  On this {_p_x}x{_p_y} mesh the next "
-				f"compatible window is {_next_nb} bands.  The driver will not "
-				f"silently change an explicit layout or band window.")
-	if mode.is_dynamic and _wants_sharded_cube:
+	if mode.is_dynamic:
 		from .ppm_sigma import assert_sharded_sigma_window_divides_mesh
 		assert_sharded_sigma_window_divides_mesh(
 			_nbs, mesh_xy,
@@ -508,7 +511,7 @@ def main(argv=None):
 		# ``jax.process_count()`` raw instead of the launcher-aware count,
 		# so it was also the weakest.  Nothing can select that writer now.
 		print0(
-			f"  sigma_omega_layout = sharded: Σ_c(ω,k,m,n) stays "
+			f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
 			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh end-to-end "
 			f"(consumers read tiles; no full-cube replication).")
 
@@ -578,6 +581,17 @@ def main(argv=None):
 		from dataclasses import replace as _dc_replace
 		wfns_screening = _dc_replace(
 			wfns, green_parent=green_parent_carrier)
+	oneshot_occupation_state = (
+		_oneshot_mpa_occupation_state(
+			config, wfn, wfns, material_class, mesh_xy=mesh_xy, print_fn=print0)
+		if (qp_solver is not QPSolver.SELF_CONSISTENT
+			and mode.value == "mpa") else None)
+	if oneshot_occupation_state is not None:
+		print0(
+			"  one-shot occupations: fixed-N MP1 state, "
+			f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
+			f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
+			f"occ_hash={oneshot_occupation_state.occ_hash}")
 	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
 	# samples ψ at the transverse-centroid Wfns bundle (None when
 	# bispinor=False or centroids_file_current is unset).
@@ -634,7 +648,15 @@ def main(argv=None):
 				if jax.process_index() != 0:
 					warnings.simplefilter("ignore", RuntimeWarning)
 				quad, e_ref = build_static_quadrature(
-					wfns, config.minimax_config, print_fn=print0)
+					wfns, config.minimax_config,
+					# A metal's fundamental gap is not its smallest MEANINGFUL
+					# transition; the smearing width is.  Insulating decks
+					# carry no smearing and keep the incumbent interval.
+					occupation_width_ry=(
+						float(config.occ_broadening_ry)
+						if getattr(config, "occ_smearing_family", None)
+						else None),
+					print_fn=print0)
 
 	# One-shot and QSGW now share one response/finalization implementation.
 	# Build the irreducible DFT tensor and its wings on the exact chi0 band
@@ -659,7 +681,8 @@ def main(argv=None):
 		if mode.value == "mpa":
 			from .mpa import sample_plan
 			from .mpa.model import make_mpa_plan
-			oneshot_mpa_plan = make_mpa_plan(config, quad)
+			oneshot_mpa_plan = make_mpa_plan(
+				config, quad, material_class=material_class)
 			oneshot_omegas = np.asarray(
 				sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
 		else:
@@ -719,6 +742,8 @@ def main(argv=None):
 						head_channel=getattr(isdf, 'head_channel', None),
 						mpa_plan=oneshot_mpa_plan,
 						iteration_head_response=oneshot_head_response,
+						occupation_state=oneshot_occupation_state,
+						material_class=material_class,
 						tensors_filename=tensors_filename,
 						static_only=not _dynamic_packed,
 						print_fn=print0)
@@ -811,6 +836,8 @@ def main(argv=None):
 					head_channel=getattr(isdf, 'head_channel', None),
 					mpa_plan=oneshot_mpa_plan,
 					iteration_head_response=oneshot_head_response,
+					occupation_state=oneshot_occupation_state,
+					material_class=material_class,
 					tensors_filename=tensors_filename,
 					print_fn=print0)
 		if green_parent_carrier is not None:
@@ -933,6 +960,8 @@ def main(argv=None):
 				wfns_transverse=wfns_transverse,
 				bispinor_v_q_path=bispinor_v_q_path,
 				photon_response=photon_response,
+				occupation_state=oneshot_occupation_state,
+				material_class=material_class,
 				print_fn=print0,
 			)
 		# Screening bodies have no consumer after Sigma.  In the photon mode
@@ -1028,11 +1057,13 @@ def main(argv=None):
 				quad=quad, e_ref=e_ref,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,
+				screening_model_fn=compute_screening_model,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, wfn=wfn, centroid_indices=centroid_indices,
 				band_slices=band_slices, input_dir=input_dir,
 				tensors_filename=tensors_filename,
-				enk_dft=enk_dft, print_fn=print0)
+				enk_dft=enk_dft, material_class=material_class,
+				print_fn=print0)
 		sigma_result = sc_result.sigma_result_dft
 		sigma_total = sc_result.sigma_total_dft
 		rotations_written = sc_result.rotations_written
@@ -1068,16 +1099,10 @@ def main(argv=None):
 	# One extraction for SC and one-shot alike; PPM-only fields are None
 	# in static modes.
 	#
-	# TWO BASES ON ONE OBJECT on the SC path, by design: the finalize
-	# rotated ``sigma_dispatch.ROTATED_TO_DFT_FIELDS`` (sig_h, sig_x,
-	# sig_sx, sig_coh below) back to the DFT basis and left
-	# ``SIGMA_BASIS_FIELDS`` (sigma_c_omega, sigma_c_at_dft_ev) in the QP
-	# basis, where the QSGW ansatz
-	# that consumes Σ_c(ω) is defined.  Their band diagonals meet in
-	# ``sigma_xc_at_dft_ev`` below and in eqp{0,1}.dat
-	# (``eqp_bgw.compute_eqp_diag``); that sum is basis-consistent only
-	# at U = identity.  One-shot: every field is DFT basis and the
-	# question does not arise.  The separable analytic head diagonal is cheap
+	# On the SC path the finalize rotates every matrix consumed here,
+	# including the dynamic correlation cube, to the DFT output basis.  The
+	# original cube was already persisted in the last map's QP compute basis,
+	# where the QSGW ansatz is defined.  The separable analytic head diagonal is cheap
 	# enough to rotate without materialising its dense matrix; SC returns that
 	# as a separate DFT-basis diagnostic while leaving SigmaResult's
 	# basis-of-computation field untouched.
@@ -1106,13 +1131,6 @@ def main(argv=None):
 	e_eval_ev           = sigma_result.e_eval_ev
 	efermi_dft_ev       = sigma_result.efermi_dft_ev
 	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
-	if (qp_solver is QPSolver.SELF_CONSISTENT
-			and sigma_c_omega is not None):
-		raise ValueError(
-			"self-consistent dynamic EQP output is not basis-consistent: H and "
-			"Sigma_x have been rotated to dft_band, while the full C(omega) "
-			"operator remains qp_band. Refusing to combine their diagonals until "
-			"the full C(omega) operator is rotated consistently.")
 	head_sigma_diag_w_kn_ry = (
 		sc_result.head_sigma_diag_dft_w_kn_ry
 		if qp_solver is QPSolver.SELF_CONSISTENT

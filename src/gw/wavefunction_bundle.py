@@ -418,6 +418,77 @@ jax.tree_util.register_dataclass(
 )
 
 
+@functools.partial(
+    jax.jit, static_argnames=("state_bands", "projection_bands"))
+def projected_state_amplitude_envelope(
+    wfns: Wavefunctions,
+    *,
+    state_bands: slice,
+    projection_bands: slice,
+) -> jax.Array:
+    """State weights from the actual Sigma band-projection carriers.
+
+    For one intermediate state ``n``, the ISDF Green function contains the
+    outer product of that state's left/right centroid wavefunctions.  The
+    final Sigma element contains the corresponding left/right projection
+    carriers from the requested output subspace
+    (``docs/theory/physics.md``, section 5).  Cauchy--Schwarz gives the
+    per-k state-side projected matrix-element envelope
+
+    ``A_kn = ||psi^L_kn|| ||psi^R_kn||
+             max_i||psi^L_ki|| max_j||psi^R_kj||``.
+
+    The state factors are returned for ``state_bands``; the projection maxima
+    are measured on ``projection_bands``.  All four legacy carriers, or both
+    orientations of the face carrier, therefore enter with their actual
+    values instead of assuming the nominally equivalent copies are identical.
+    Thus planner mass follows the real requested matrix-element projection
+    instead of assigning unit amplitude to every state.  It remains an
+    operator envelope: spatial pole phases and cancellation are deliberately
+    not converted into a claim of physical relative Sigma accuracy.
+
+    Parameters
+    ----------
+    wfns : Wavefunctions
+        Canonical wavefunction carrier in either legacy or face layout.
+    state_bands : slice
+        Intermediate-state band range used by the Green function.
+    projection_bands : slice
+        Requested Sigma output band range.
+
+    Returns
+    -------
+    jax.Array, shape (nk, n_state_bands)
+        Nonnegative projected state-amplitude envelopes.  Reductions over
+        centroid axes retain the carrier's named sharding semantics.
+    """
+    if wfns.layout == "legacy":
+        state_left = jnp.sqrt(jnp.sum(
+            jnp.abs(wfns.xn(state_bands)) ** 2, axis=(1, 2)))
+        state_right = jnp.sqrt(jnp.sum(
+            jnp.abs(wfns.yr(state_bands)) ** 2, axis=(2, 3)))
+        projection_left = jnp.max(jnp.sqrt(jnp.sum(
+            jnp.abs(wfns.xr(projection_bands)) ** 2, axis=(2, 3))), axis=1)
+        projection_right = jnp.max(jnp.sqrt(jnp.sum(
+            jnp.abs(wfns.yn(projection_bands)) ** 2, axis=(1, 2))), axis=1)
+        return (state_left * state_right
+                * projection_left[:, None] * projection_right[:, None])
+
+    # Face-layout ψ cannot be sliced at an arbitrary band boundary.  Reduce
+    # its full two orientations first, use the canonical small band mask for
+    # the projection maximum, and slice only the resulting (nk, nb) weights.
+    left_norm = jnp.sqrt(jnp.sum(jnp.abs(wfns.psi_mun) ** 2, axis=(1, 2)))
+    right_norm = jnp.sqrt(jnp.sum(jnp.abs(wfns.psi_nmu) ** 2, axis=(2, 3)))
+    projection_mask = wfns.band_mask(projection_bands)
+    projection_left = jnp.max(
+        jnp.where(projection_mask, right_norm, 0.0), axis=1)
+    projection_right = jnp.max(
+        jnp.where(projection_mask, left_norm, 0.0), axis=1)
+    state_weight = (left_norm * right_norm
+                    * projection_left[:, None] * projection_right[:, None])
+    return state_weight[:, state_bands]
+
+
 @dataclass(frozen=True)
 class AuthenticatedWavefunctions:
     """Host orchestration binding of a numerical carrier to its receipt.

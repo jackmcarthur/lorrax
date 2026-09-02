@@ -15,18 +15,64 @@ _CHI = "chi_qmunu_z"
 _WC = "Wc_qmunu_z"
 
 
-def make_mpa_plan(config, quad):
+def make_mpa_plan(config, quad, *, material_class):
     """Build and validate the one frequency plan shared by body and head."""
     n_p = int(config.mpa.n_poles)
     omega_m = float(quad.x_max)
     plan = sample_plan.mpa_plan(
-        n_p, omega_m, material_class=config.mpa.material_class,
+        n_p, omega_m, material_class=material_class,
         alpha=config.mpa.sampling_alpha,
         schedule=config.mpa.sampling_schedule,
         varpi_near=config.mpa.varpi_near_ry,
         varpi_far=config.mpa.varpi_far_ry,
         origin_shift=config.mpa.metal_origin_shift_ry, energy_unit="Ry")
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
+    return plan
+
+
+def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy, material_class):
+    """Rebuild and verify the frequency plan stored by a certified fit.
+
+    A reused fit has no live screening quadrature.  Its scalar-head sample
+    vector is the frequency provenance instead: frequencies are read in Ry,
+    its largest real part supplies the original ``omega_m``, and the normal
+    plan constructor supplies every remaining deck-owned knob.  Exact grid
+    equality is required before the plan can be used by an SC head or body.
+
+    Parameters
+    ----------
+    config : LorraxConfig
+        Runtime configuration whose MPA sampling knobs must match the fit.
+    fit_path : path-like
+        Complete certified MPA body and scalar-head fit store.
+    mesh_xy : jax.sharding.Mesh
+        Process mesh used by the collective fit reader.
+    """
+    head = mpa_store.read_head_fit_collective(
+        fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+    stored_z = np.asarray(head["sample_z"], dtype=np.complex128).reshape(-1)
+    if stored_z.size == 0 or not np.all(np.isfinite(stored_z)):
+        raise ValueError(
+            "MPA certified-fit reuse requires a finite, nonempty stored "
+            f"head sample_z vector; got shape={stored_z.shape} in {fit_path!s}")
+
+    class _StoredFrequencyCeiling:
+        x_max = float(np.max(stored_z.real))
+
+    plan = make_mpa_plan(
+        config, _StoredFrequencyCeiling(), material_class=material_class)
+    planned_z = np.asarray(sample_plan.plan_z(plan), dtype=np.complex128)
+    if planned_z.shape != stored_z.shape or not np.array_equal(
+            planned_z, stored_z):
+        max_delta = (
+            float(np.max(np.abs(planned_z - stored_z)))
+            if planned_z.shape == stored_z.shape else float("inf"))
+        raise ValueError(
+            "MPA certified-fit reuse provenance mismatch: rebuilding the "
+            "deck's frequency plan does not exactly reproduce stored "
+            f"sample_z in {fit_path!s}; planned_shape={planned_z.shape}, "
+            f"stored_shape={stored_z.shape}, max_abs_delta={max_delta:.17g}. "
+            "Use the sampling knobs that created this fit or rebuild it.")
     return plan
 
 
@@ -97,22 +143,43 @@ def _fit_head_samples(
     fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model, solve,
     occupation_state=None,
 ):
-    """Fit scalar Wc_head on the body's exact complex-frequency grid."""
+    """Publish scalar Wc_head on the body's exact complex-frequency grid.
+
+    ``head_correction=off`` is the exact zero model, not an ill-conditioned
+    pole-fitting problem.  It still gets a complete scalar-head record because
+    the Sigma consumer reads one uniformly; zero residues make that record a
+    structural no-op for every real evaluation frequency.
+    """
     wc = np.asarray([
         complex(sample.wcoul0) - complex(sample.vc0)
         for sample in head_samples
     ], dtype=np.complex128)
-    fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
-    provenance = {
-        "solve_mode": fitted["solve"],
-        "solve_affine": fitted["affine"],
-        "solve_rcond": fitted["rcond"],
-        "eig_mode": fitted["eig"],
-        "n_valid": fitted["n_valid"],
-        "condition_max_allowed": 1.0 / fitted["rcond"],
-        "backward_error_max_allowed": float(
-            np.sqrt(np.finfo(np.float64).eps)),
-    }
+    if model == "head_off_zero":
+        if np.any(wc != 0.0):
+            raise ValueError(
+                "head_off_zero received a nonzero scalar-head sample")
+        # A non-real dummy pole avoids a zero denominator in the generic
+        # evaluator.  Its value is immaterial because every residue is zero.
+        fitted = {
+            "Omega_p": np.full(n_p, -1.0j, dtype=np.complex128),
+            "B_p": np.zeros(n_p, dtype=np.complex128),
+            "condition": 0.0,
+            "backward_error": 0.0,
+            "max_abs_residual": 0.0,
+        }
+        provenance = {"solve_mode": "exact_zero", "n_valid": int(n_p)}
+    else:
+        fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
+        provenance = {
+            "solve_mode": fitted["solve"],
+            "solve_affine": fitted["affine"],
+            "solve_rcond": fitted["rcond"],
+            "eig_mode": fitted["eig"],
+            "n_valid": fitted["n_valid"],
+            "condition_max_allowed": 1.0 / fitted["rcond"],
+            "backward_error_max_allowed": float(
+                np.sqrt(np.finfo(np.float64).eps)),
+        }
     mpa_store.write_head_fit_collective(
         fit_path, z, wc, fitted["Omega_p"], fitted["B_p"],
         mesh_xy=mesh_xy, energy_unit="Ry",
@@ -329,11 +396,11 @@ def _metal_kminq_rows(sym, q_idx):
     return rows
 
 
-def _require_metal_occupations(config, occupation_state):
+def _require_metal_occupations(material_class, occupation_state):
     """One owner of the metal-needs-occupations refusal (two gates pin it:
     the build_mpa_fit entry, before any inode exists, and the
     _evaluate_samples seam for direct callers)."""
-    if config.mpa.material_class != "insulator" and occupation_state is None:
+    if material_class == "metal" and occupation_state is None:
         raise ValueError(
             "GATE mpa_metal_needs_occupations: a metal MPA plan requires "
             "occupation_state (gw.efermi.OccupationState); got None. "
@@ -343,6 +410,7 @@ def _require_metal_occupations(config, occupation_state):
 
 def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *,
+    material_class,
     energy_reference, occupation_state, write_full, write_wedge,
     static_gamma_override, gamma_row, kminq_rows,
 ):
@@ -368,8 +436,8 @@ def _evaluate_samples(
         occupation_support_bandwidth,
     )
 
-    metal = config.mpa.material_class != "insulator"
-    _require_metal_occupations(config, occupation_state)
+    metal = material_class == "metal"
+    _require_metal_occupations(material_class, occupation_state)
     omega_m = float(quad.x_max)
     # ONE occupancy window for the whole fit: the rule bandwidth below and
     # every fractional-chi call in this function read the same deck value, so
@@ -462,7 +530,8 @@ def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
-    occupation_state=None, head_channel=None, wc_source=None, print_fn=print,
+    occupation_state=None, material_class, head_channel=None, wc_source=None,
+    print_fn=print,
 ):
     """Write body/head samples and fits; return path plus iteration head.
 
@@ -484,8 +553,8 @@ def build_mpa_fit(
     # any inode exists, and again at the _evaluate_samples seam — and that
     # refusal is now the only gate on the deck path: the driver-level
     # UNIMPLEMENTED_MODES row was deleted when the metal pipeline ran E2E.
-    _require_metal_occupations(config, occupation_state)
-    if wc_source is not None and config.mpa.material_class != "insulator":
+    _require_metal_occupations(material_class, occupation_state)
+    if wc_source is not None and material_class == "metal":
         raise ValueError(
             "GATE w_bse_insulators_only: an alternate ladder wc_source "
             "requires mpa_material_class = insulator; keep the default "
@@ -499,7 +568,8 @@ def build_mpa_fit(
 
     n_p = int(config.mpa.n_poles)
     omega_m = float(quad.x_max)
-    plan = make_mpa_plan(config, quad) if plan is None else plan
+    plan = (make_mpa_plan(config, quad, material_class=material_class)
+            if plan is None else plan)
     z_all = sample_plan.plan_z(plan)
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
     if iteration_head_response is not None:
@@ -558,7 +628,7 @@ def build_mpa_fit(
         sample_path, _WC, mode="a", **common)
 
     routes = sample_plan.plan_routes(plan)
-    metal = config.mpa.material_class != "insulator"
+    metal = material_class == "metal"
     kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
     static_gamma_override = (
         iteration_head_response.static_chi_body_gamma
@@ -579,6 +649,7 @@ def build_mpa_fit(
 
     _evaluate_samples(
         wfns, routes, quad, config, meta, mesh_xy,
+        material_class=material_class,
         energy_reference=energy_reference,
         occupation_state=occupation_state,
         write_full=_write_full, write_wedge=_write_wedge,
@@ -626,7 +697,11 @@ def build_mpa_fit(
     elif iteration_head is None:
         head_fit_samples = tuple(
             head_resolver.at(complex(z)) for z in z_all)
-        head_model = f"dft_direct_{config.mpa.pole_solver}"
+        correction = getattr(
+            config.head.correction, "value", config.head.correction)
+        head_model = (
+            "head_off_zero" if correction == "off"
+            else f"dft_direct_{config.mpa.pole_solver}")
     else:
         head_fit_samples = iteration_head.samples[:z_all.size]
         if bool(getattr(
@@ -663,6 +738,7 @@ def build_mpa_fit(
 __all__ = [
     "build_mpa_fit",
     "make_mpa_plan",
+    "make_mpa_plan_from_fit",
     "retain_iteration_artifacts",
     "iteration_artifact_paths",
 ]

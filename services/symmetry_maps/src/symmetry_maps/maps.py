@@ -1041,7 +1041,15 @@ def _get_unfold_isdf_operator_jit(
          (left_local_perm_arr.shape, left_local_perm_arr.tobytes())),
         (None if right_local_perm_arr is None else
          (right_local_perm_arr.shape, right_local_perm_arr.tobytes())),
-        id(mesh_xy),
+        # Content key, not id(): the streaming sigma path hands a fresh
+        # mesh handle per pole batch, and an identity key then retraces
+        # and recompiles _do_unfold once per batch (observed: banner-only
+        # gwjax.out with per-batch TRACING CACHE MISS for 30+ minutes on
+        # a minutes-long deck). Meshes with identical axis names and
+        # device ordering produce identical shardings and HLO.
+        tuple(mesh_xy.axis_names),
+        tuple(int(d.id) for d in mesh_xy.devices.flat),
+        tuple(int(s) for s in mesh_xy.devices.shape),
     )
     hit = _UNFOLD_ISDF_OPERATOR_JIT_CACHE.get(key)
     if hit is not None:

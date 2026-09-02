@@ -294,7 +294,9 @@ def apply_conduction_scissor_to_tail(
     fit : ScissorFit
         Current active-space fit.  Its conduction law is used regardless
         of energy ordering because this interval is the declared
-        conduction-sum tail.
+        conduction-sum tail.  An empty conduction class carries the identity
+        law from :func:`fit_scissor`, so the tail stays at DFT energy rather
+        than being extrapolated from untrusted grid-edge values.
     tail_start, logical_stop : int
         Local half-open interval ``[b3, b4_user)``.
     """
@@ -310,12 +312,6 @@ def apply_conduction_scissor_to_tail(
             "apply_conduction_scissor_to_tail: expected "
             f"0 <= tail_start <= logical_stop <= {E.shape[1]}, got "
             f"tail_start={lo}, logical_stop={hi}.")
-    if hi > lo and int(fit.n_fit_c) == 0:
-        raise ValueError(
-            "apply_conduction_scissor_to_tail: the logical conduction tail "
-            f"[{lo}, {hi}) is nonempty but ScissorFit has no trusted "
-            "conduction samples.")
-
     out = E.copy()
     out[:, lo:hi] = (
         float(fit.alpha_c) * E[:, lo:hi] + float(fit.beta_c_ev))

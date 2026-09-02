@@ -205,11 +205,33 @@ def _nc_solve_varpro(N, R, lawson_iter=4):
 def noncrossing_grids(R, eps, N_start=2, N_max=60):
     """Find minimum N achieving error < eps on [1, R].
 
+    The Hackbusch error law gives a deterministic rank seed from ``(R,
+    eps)``.  Probe there, then walk toward the first passing rank.  Each rank
+    still takes the same analytic-node VarPro/Lawson refinement and the rule
+    is still accepted only by its measured error; this only avoids solving
+    the known-failing prefix of the ladder.
+
     Returns
     -------
     t, w, N, err
     """
-    for N in range(N_start, N_max + 1):
+    N_start = int(N_start)
+    N_max = int(N_max)
+    if N_start > N_max:
+        raise ValueError("N_start must not exceed N_max")
+
+    seed = int(np.clip(predict_N_noncrossing(R, eps), N_start, N_max))
+    t, w, err = _nc_solve_varpro(seed, R)
+    if err < eps:
+        best = (t, w, seed, err)
+        for N in range(seed - 1, N_start - 1, -1):
+            t, w, err = _nc_solve_varpro(N, R)
+            if err >= eps:
+                break
+            best = (t, w, N, err)
+        return best
+
+    for N in range(seed + 1, N_max + 1):
         t, w, err = _nc_solve_varpro(N, R)
         if err < eps:
             return t, w, N, err

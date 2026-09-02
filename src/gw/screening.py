@@ -850,6 +850,7 @@ def compute_screening_model(
     mpa_plan=None,
     iteration_head_response=None,
     occupation_state=None,
+    material_class,
     static_only=False,
     tensors_filename=None,
     print_fn=print,
@@ -887,6 +888,12 @@ def compute_screening_model(
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
+        if quad is None:
+            raise ValueError(
+                "MPA screening has no quadrature and no certified-fit reuse "
+                "provider served an existing fit. A normal screening build "
+                "requires quad; a reuse harness must return its already-"
+                "resolved path as {'mpa_fit': path}.")
         if head_resolver is None:
             raise ValueError("MPA screening requires a head resolver")
         from .mpa.model import build_mpa_fit
@@ -911,6 +918,7 @@ def compute_screening_model(
             energy_reference=e_ref, plan=mpa_plan,
             iteration_head_response=iteration_head_response,
             occupation_state=occupation_state,
+            material_class=material_class,
             head_channel=head_channel,
             wc_source=wc_source, print_fn=print_fn)
         result = {"mpa_fit": fit_path}
