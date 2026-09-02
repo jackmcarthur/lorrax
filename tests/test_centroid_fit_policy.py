@@ -59,6 +59,51 @@ def test_kmeans_cli_has_no_occupation_weight_fit_option():
     assert "n_occ =" in old
 
 
+def _report_file_assignment():
+    """The `report_file = ...` node in ``kmeans_cli.main``, via AST.
+
+    Matched on the parse tree, not on the source text: a comment or docstring
+    mentioning the filename is not a fact about the code (TASTE.md row 17),
+    and this module's other source test is string-based precisely because it
+    is asserting ABSENCE, where a stray comment can only make it stricter.
+    """
+    tree = ast.parse((ROOT / "src/centroid/kmeans_cli.py").read_text())
+    found = [node.value for node in ast.walk(tree)
+             if isinstance(node, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "report_file"
+                     for t in node.targets)]
+    assert len(found) == 1, f"expected one report_file assignment, got {len(found)}"
+    return found[0]
+
+
+def test_kmeans_report_carries_the_density_mode_suffix():
+    """A charge and a current selection in one directory must not collide.
+
+    The deck names both tables, so both runs happen in the centroid
+    directory.  The table was already suffixed ('' / '_current'); the report
+    was a bare `kmeans.out`, so the second run silently destroyed the first
+    one's provenance -- its band window, seed, candidate pool and achieved
+    rank.  Measured on the MoS2 3x3 deck 2026-09-01: the charge report was
+    gone after the current run.
+    """
+    value = _report_file_assignment()
+    assert isinstance(value, ast.JoinedStr), (
+        "report_file must interpolate the suffix, not be a constant; got "
+        f"{type(value).__name__}")
+    interpolated = {node.value.id for node in ast.walk(value)
+                    if isinstance(node, ast.FormattedValue)
+                    and isinstance(node.value, ast.Name)}
+    assert interpolated == {"out_suffix"}, interpolated
+
+    # The suffix is the one the table uses, so the two names track together.
+    source = (ROOT / "src/centroid/kmeans_cli.py").read_text()
+    assert 'out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"' in source
+
+    # Red twin: the pre-fix constant is exactly what this test rejects.
+    old = ast.parse('report_file = "kmeans.out"').body[0].value
+    assert not isinstance(old, ast.JoinedStr)
+
+
 @pytest.mark.parametrize(
     ("change", "message"),
     (({"no_orbit": True}, "orbit closure"),

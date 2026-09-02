@@ -645,7 +645,13 @@ def main():
                       wall=selection_wall)
 
     if process_rank() == 0:
-        report_file = "kmeans.out"
+        # The report carries the SAME suffix as the table it describes.  A
+        # charge and a current selection are routinely run in one directory
+        # (the deck names both files), and a bare "kmeans.out" meant the
+        # second run silently destroyed the first one's provenance -- the
+        # only record of its band window, seed, candidate pool and achieved
+        # rank.  The centroid table was already suffixed; the report was not.
+        report_file = f"kmeans{out_suffix}.out"
         report_text = format_kmeans_report(
             header=header, source_wfn="WFN.h5", centroid_file=out_file,
             report_file=report_file,
