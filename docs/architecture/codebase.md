@@ -51,6 +51,13 @@ src/
 │   ├── head_correction.py     q→0 head sample + exact static head terms
 │   ├── head_channel.py        WHERE the mini-BZ q≠0 average is applied (mc_average_placement)
 │   ├── head_densify.py        Γ head split off before the coarse→fine densifier, re-attached analytically
+│   ├── v_q_bispinor.py        bare V_q^{μ_L ν_L} tiles for the four Lorentz channels; the bare TT Γ-head slot
+│   ├── sigma_x_bispinor.py    Σ^B, bare transverse (Breit) exchange from the TT tiles
+│   ├── photon_layout.py       the one C⊕T1⊕T2⊕T3 packing / block view of a four-current operator
+│   ├── photon_sigma.py        sixteen-block static Σ from the packed screened photon propagator
+│   ├── static_gauge_response.py  bounded packed-head response (`StaticPhotonHeadResponse`); its docstring is the by-declaration content list
+│   ├── qsgw_head.py           covariant velocity, Cartesian S tensor, head wings, raw Hall pseudovector
+│   ├── w_av.py                finite-q W-av stencil primitives (rotate one source-q row; Adler-Wiser head)
 │   ├── downfold.py            transfer solve, orbit-floored selection, child unfold tables
 │   ├── downfold_run.py        the driver's stages + its gates (see docs/downfold.md)
 │   ├── downfold_cli.py / downfold_config.py   entry point and deck
@@ -63,9 +70,9 @@ src/
 │   ├── wavefunction_bundle.py BandSlices + Wavefunctions; legacy four-copy and
 │   │                          low-memory two-face ψ carriers; band projection
 │   ├── isdf_fitting.py        ζ-file lifecycle and the C/Z/factor/solve pipeline
-│   ├── coulomb/               dimension-aware Coulomb kernels behind get_kernel():
-│   │                            base.py (SysDim, dispatcher, mini-BZ sampler),
-│   │                            bulk_3d.py, slab_2d.py, box_0d.py
+│   ├── coulomb/               COMPAT SHIM over the `vcoul` service (2026-08-07): `get_kernel()`
+│   │                          plus the (wfn, meta)-facing `v_qG` / `q0_average` overrides.
+│   │                          The kernel arithmetic lives in services/vcoul/ — docs/services/vcoul.md
 │   ├── vcoul.py               MC q=0 averages, Voronoi wrap helpers
 │   ├── compute_vcoul.py       V_qμν from ζ (μ-chunked FFT + H5 prefetch); compute_v_q_per_G
 │   ├── compute_vcoul_0d.py    box-truncated Coulomb driver (molecules)
@@ -83,6 +90,7 @@ src/
 │   ├── chi_from_dipole.py     S(ω) tensor from dipole matrix elements
 │   ├── gamma_matrices.py      Pauli / bispinor helpers
 │   ├── bispinor_init.py       spinor → bispinor lift
+│   ├── four_current_model.py  one resolver: `bispinor_gw` → carrier + artifact representation
 │   ├── jax_compile_cache.py   XLA persistent cache activator
 │   ├── jax_profile.py         annotation / trace_section context mgrs
 │   ├── gpu_utils.py           device-memory budget probes
@@ -113,6 +121,7 @@ src/
 │   ├── centroids.py           centroid file loader
 │   ├── paths.py               path resolution helpers
 │   ├── read_bgw_vcoul.py      BGW vcoul table reader (diagnostic override)
+│   ├── static_gauge_head.py   sole format owner of the Hall artifact `static_gauge_hall.h5`
 │   └── slab_io.py             SlabIO: one sharded MPI-IO transport
 │       _slab_io_ffi.py          collective parallel-HDF5 implementation
 │       _slab_io_serial.py       serial tier for the emulated mesh (P=1, D>1, CPU)
@@ -578,6 +587,10 @@ lx test tests/bench/cusolvermp_eigh_test.py
 
 ## 8. Function Call Hierarchy
 
+> The four-current (bispinor) layer has its own end-to-end call map, with
+> each object's shape, sharding and route membership:
+> [Four-current wiring](four_current_wiring.md).
+
 ### 8.1 ISDF fitting
 
 ```
@@ -692,6 +705,7 @@ main                                       [gw/gw_jax.py]
 | **W Dyson solve** | `gw/w_isdf.py : solve_w`, `_get_w_solve_fn` |
 | **Static minimax lookup** | `gw/minimax_screening.py : build_static_minimax_window_pair` |
 | **Build G** | `gw/greens_function_kernel.py : build_G` |
+| **Four-current (bispinor) layer, end to end** | [`architecture/four_current_wiring.md`](four_current_wiring.md) — deck key → config → V tiles → χ₀ → Dyson → Σ → outputs |
 | **Σ band projection** | `gw/wavefunction_bundle.py : project`, `project_ri` |
 | **Reduce-scatter projection** | `gw/ppm_sigma.py : _make_project_ri_reduce_scatter` |
 | **Static Σ_SX / Σ_COH** | `gw/cohsex_sigma.py : compute_cohsex_sigma` |

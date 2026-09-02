@@ -8,7 +8,8 @@ HDF5/FFI write path, mirroring ``tests/test_sigma_x_bispinor.py``'s own
 "CPU-only" scope note.
 
 WHAT IS BEING PINNED.  Design note:
-``docs/bispinor_tt_head_correction_2026-08-23.md``.  Physics source:
+``docs/dev/archive/bispinor_tt_head_correction_2026-08-23.md`` (physics owner:
+``docs/theory/four-current-head-corrections.md``).  Physics source:
 ``docs/BISPINOR_DHFB_DESIGN.md`` §11 (the bi4/MoS2 4×4 measurement) and
 ``KNOWN_LORRAX_ISSUES.md``'s bispinor row (claim 41, job 7885325).
 

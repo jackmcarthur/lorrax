@@ -84,6 +84,7 @@ nav:
       - Symmetry: theory/symmetry.md
       - S-tensor convention: theory/s-tensor-convention.md
       - LT splitting and the exchange head: theory/lt-exchange-head.md
+      - Four-current heads and frequency: theory/four-current-head-corrections.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - MPA compute mode (declared, not yet runnable): theory/THEORY_mpa_implementation.md
       - Metallic MPA screening: theory/metallic-mpa-screening.md
@@ -91,6 +92,7 @@ nav:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
       - Codebase: architecture/codebase.md
+      - Four-current wiring: architecture/four_current_wiring.md
       - Substrate services: architecture/services.md
       - The FFI layer: architecture/ffi_layout.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md

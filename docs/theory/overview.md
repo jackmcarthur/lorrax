@@ -25,6 +25,7 @@ Each arrow has one detailed owner:
 | How are MPA samples, poles, and Sigma windows constructed? | [Multipole frequency integration](THEORY_mpa_implementation.md) |
 | What is the long-wavelength response convention? | [S-tensor convention](s-tensor-convention.md) |
 | Why is the exchange head direction dependent? | [LT splitting and the exchange head](lt-exchange-head.md) |
+| How do the four-current (bispinor) channels treat q→0, and which carry frequency? | [Four-current heads and frequency](four-current-head-corrections.md) |
 
 The theory pages state equations, conventions, validity domains, and the few
 data layouts forced by those equations. Exact input defaults belong to the

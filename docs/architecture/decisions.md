@@ -10,6 +10,39 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-09-01 — COHSEX with bispinors always carries the q→0 head; `head_correction = off` is debug-only
+
+**Ruling (owner, 2026-09-01).** A static COHSEX calculation with
+`bispinor = true` always includes the Γ-cell head corrections. No end-to-end
+mode may require them off or drop them silently. `head_correction = off`
+exists for brute-force k-grid convergence studies and debugging, never as a
+production envelope requirement.
+
+**Why.** The charge head alone is 0.66 eV on the CrI3 static gap at 6×6
+(sandbox `reports/cri3_static_head_gap_attribution_2026-08-27`), decaying
+only as `1/√N_k` in 2D. A "screened bispinor" mode that forbids it is not a
+more complete calculation than the scalar route; it is a less complete one.
+
+**Consequence for the tree.** The `static_bispinor_photon_envelope`
+requirement `head_correction = off` for `bispinor_gw = full_static_cohsex`
+(`gw_config.py`, `required_head`) and the driver's skip of the scalar head
+under every packed mode are defects under this ruling. The target is one
+packed static mode that always runs the Γ completion (`⟨D⟩` bare insertion
+plus the charge `S^{00}`/wing head; the Hall term optional and diagnostic),
+with `off` an explicit banner-printing override.
+
+**Implemented on a branch, 2026-09-01.** That target is built on
+`lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2` — **a branch, not
+`origin/main`**. `full_static_cohsex` is the one packed static mode
+(`charge_hall_cubature` refuses, naming the new spelling); the completion
+runs under the default `head_correction = full`; `required_head` and the
+producerless `StaticGaugeHeadResponse` seam are deleted; `off` prints the
+`WARNING -- DEBUG` banner and is recorded as such in the run record; and
+`no_local_fields` is refused, the coupled solve having no scalar
+diagnostic head. Physics owner:
+[Four-current heads and frequency](../theory/four-current-head-corrections.md);
+wiring: [Four-current wiring](four_current_wiring.md).
+
 ## 2026-08-22 — One mesh-divisibility pad helper, and it returns a NAMED result
 
 `runtime.padding.pad_axis(A, divisor, *, axis, fill=0.0)` is the single
