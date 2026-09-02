@@ -1098,7 +1098,7 @@ def main(argv=None):
 				band_slices=band_slices, input_dir=input_dir,
 				tensors_filename=tensors_filename,
 				enk_dft=enk_dft, material_class=material_class,
-				print_fn=print0)
+				print_fn=print0, record_fn=report.progress)
 		sigma_result = sc_result.sigma_result_dft
 		sigma_total = sc_result.sigma_total_dft
 		rotations_written = sc_result.rotations_written
