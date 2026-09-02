@@ -657,7 +657,19 @@ def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,
 
 
 def parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarray:
-    """Parse sigma_diag rows → (nrows, 7): kpt, band, 3 Σ columns, VH re/im."""
+    """Parse sigma_diag rows → (nrows, 7): kpt, band, 3 Σ columns, VH re/im.
+
+    THE DIRECT-FIELD COLUMN HAS TWO SPELLINGS and this parser accepts both.
+    A scalar deck writes ``VH=``; a ``bispinor = true`` deck writes ``Hdir=``,
+    the aggregate ``Hdir = V_H + H_T`` of the transverse-Hartree split
+    (``file_io/sigma_output.py:138,1141``).  Requiring ``VH=`` alone made
+    every bispinor ``sigma_diag.dat`` unparseable here — including the frozen
+    ``bispinor_debug`` reference gate, which could only ever have passed on
+    its byte-identity fast path and would raise
+    ``No Sigma data rows were parsed`` the moment a last-ULP drift sent it to
+    the atol comparison.  Column 5 of the returned array is whichever of the
+    two the file carries.
+    """
     float_re = r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
     imag_opt = rf"(?:\+\s*{float_re}i)?"  # optional imaginary part
     a, b, c = labels  # COHSEX: sigSX/sigCOH/sigTOT ;  GN-PPM: sigX/sigC/sigXC
@@ -666,7 +678,7 @@ def parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarr
         rf"{a}=\s*{float_re}{imag_opt}\s+"
         rf"{b}=\s*{float_re}{imag_opt}\s+"
         rf"{c}=\s*{float_re}{imag_opt}\s+"
-        rf"VH=\s*{float_re}{imag_opt}"
+        rf"(?:VH|Hdir)=\s*{float_re}{imag_opt}"
     )
     kpt_re = re.compile(r"k-point\s+(\d+)\s*:")
 

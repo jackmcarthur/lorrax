@@ -19,15 +19,18 @@ current density `ψ†α^iψ`).
 
 ## 1. Status in one table
 
-> **Implementation status (2026-09-01).** This table describes
-> `integ/bispinor-static-cleanup-2026-09-01@3897f89f` (a branch, not
-> `origin/main`): lane B collapsed the two packed modes into one and made the
-> Γ-cell completion the default (`41e2b6b2`); lane C then routed
+> **Implementation status (2026-09-02).** This table describes
+> `lane/bisp-n-dynamic-packed-2026-09-01` (a branch, not `origin/main`),
+> which is `integ/bispinor-static-cleanup-2026-09-01@837ed531` plus the
+> dynamic packed route: lane B collapsed the two packed modes into one and
+> made the Γ-cell completion the default (`41e2b6b2`); lane C routed
 > `bare_transverse` through the same packed operator **inside the slab
-> one-shot static-COHSEX envelope only** (`ce3dedcc`, claim 581). On
+> one-shot static-COHSEX envelope** (`ce3dedcc`, claim 581); lane N then
+> added the frequency axis to the charge block of that same operator
+> (phase 3, `reports/bisp_n_dynamic_packed_2026-09-01/`). On
 > `origin/main@8b6e3cc7` there are still two packed modes, the headless one
-> is the defect the ruling names, and `bare_transverse` has its own Σ owner
-> everywhere.
+> is the defect the ruling names, `bare_transverse` has its own Σ owner
+> everywhere, and no packed route reaches a dynamic mode at all.
 
 | self-energy channel | frequency dependence | Γ-cell head | deck route | status |
 |---|---|---|---|---|
@@ -36,7 +39,8 @@ current density `ψ†α^iψ`).
 | bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | **inside the packed envelope**: `⟨D_TT⟩` from the Γ-cell completion, always on. **Outside it**: the `−⟨v P^T⟩_mBZ` tensor slot overlay (§2.1) | inside: `bispinor_gw = bare_transverse` + the §2 envelope. Outside: `bispinor_tt_head_correction = true` | both implemented; the overlay is default off and **refused** inside the envelope |
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | *unscreened* TT via the same packed operator | **static only** | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; Hall **refused** (§4) | `bispinor_gw = bare_transverse` inside the §2 envelope | experimental, slab, one shot; body byte-identical to the incumbent route |
-| retarded / dynamic photon `D^{IJ}(ω)` | — | — | none | **does not exist** |
+| the packed operator on a **dynamic** Σ (phase 3) | **CC dynamic, current blocks static**: `W_packed(ω) = diag(W_00(ω), W_TT, W_CT)` with the current blocks at `ω = 0` | CC: the dynamic model's own head (§3.3/§3.4) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT and CT/TC: the packed Γ-cell completion of §4.2 | `bispinor = true` with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the §2 envelope; `mpa` refuses by name | experimental, slab, one shot; the current blocks' `ω`-dependence is neglected and the price is measured, not assumed (§2.2) |
+| retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
 with bispinors always carries the Γ-cell head; `head_correction = off` is a
@@ -45,11 +49,14 @@ calculation.
 
 Two facts follow from the table and are easy to miss:
 
-* The photon sector has no frequency dependence anywhere. `Σ^B` uses the
-  instantaneous Coulomb-gauge propagator; the packed screened response is
-  built once at `ω = 0`. Every dynamic self-energy (`gn_ppm`, `hl_ppm`,
-  `mpa`) screens the charge channel only and adds `Σ^B` as a bare
-  exchange term.
+* The photon sector's **current** blocks have no frequency dependence
+  anywhere. `Σ^B` uses the instantaneous Coulomb-gauge propagator, and the
+  packed screened current response is built once at `ω = 0`. What phase 3
+  changed is only the **charge** block: on the packed dynamic route
+  `W_00(ω)` carries the run's plasmon-pole model while `W_TT` and `W_CT`
+  stay at `ω = 0`, and `Σ^B` is the TT block of that one operator rather
+  than a separately added bare-exchange term. `mpa` still screens the
+  charge channel only and adds `Σ^B` through the incumbent owner.
 * The only time-reversal-odd term in the screened photon head is the
   static Hall (Chern–Simons) response. For a gapped system that
   coefficient is topologically quantized (§4.4), so for a Chern-trivial
@@ -166,6 +173,45 @@ was re-measured on MoS2 3×3 by lane C: switching the overlay on and off in
 the incumbent route moves quasiparticle energies by **0.115 meV MAE /
 0.251 meV max**, consistent with `BISPINOR_DHFB_DESIGN.md` §11's ≈0.2 meV at
 4×4.
+
+### 2.2 Freezing the current blocks inside a dynamic run
+
+The packed dynamic route (phase 3) evaluates the charge block at every
+frequency and the twelve current blocks once, at `ω = 0`. That is an
+approximation, and it is bounded rather than asserted.
+
+Write the packed screened propagator as
+
+$$
+W_{AB}(\omega) = D_{AB} + \sum_{CD} D_{AC}\,\chi_{CD}(\omega)\,W_{DB}(\omega),
+$$
+
+with `A, B ∈ {C, T1, T2, T3}`. Every current vertex carries one factor of
+`α_FS/2`, so `χ_TT` and `χ_CT` enter `W` at `α_FS²` and `α_FS` × (a
+transverse-charge overlap that vanishes in the Coulomb gauge at `q → 0`)
+respectively. The neglected quantity is therefore
+`W_AB(ω) − W_AB(0)` for `AB ≠ CC`, which is second order in the fine
+structure constant to begin with.
+
+It is bounded above by the **static** current-screening contribution,
+`W_AB(0) − D_AB`, which the code can evaluate directly: the Ward-subtracted
+no-pair current response is a positive-weight spectral integral sampled on
+the imaginary axis, so `|χ_TT(iω)| ≤ |χ_TT(0)|` for every `ω`, and the
+screened-minus-bare current correction at any frequency is no larger in
+magnitude than its value at `ω = 0`. That value is exactly the difference
+between `bispinor_gw = bare_transverse` (`χ_TT = χ_CT = 0`) and
+`bispinor_gw = full_static_cohsex` (the sixteen-block `ω = 0` Dyson solve)
+on the same tip and the same deck.
+
+**Measured on MoS2 3×3, both heads on, 270 quasiparticle states:** lane C
+found `max|ΔE_qp| = 0.012 µeV = 1.2 × 10⁻⁸ eV` in the static COHSEX mode
+(GATE D, claim 581) and lane N re-measured the same pair on the dynamic
+route (`reports/bisp_n_dynamic_packed_2026-09-01/report.md`). Current
+screening is worth ~10⁻⁸ eV on this deck, six orders of magnitude below the
+0.1 meV scale at which the transverse Γ-cell head matters, so freezing its
+frequency dependence is not the leading error in any bispinor number this
+code currently produces. SCOPE: one system, one grid; this is a measurement
+on MoS2 3×3, not a general statement about current screening.
 
 ## 3. The charge head: `S(ω)`, local fields, and the three frequency models
 
@@ -655,24 +701,29 @@ transverse screening".
 
 ## 6. Where the code is
 
-> **Implementation status (2026-09-01).** Lanes A, B and C have landed on
-> `integ/bispinor-static-cleanup-2026-09-01@3897f89f`. The stage-by-stage
-> wiring — every object's shape, sharding, route membership and refusal — is
+> **Implementation status (2026-09-02).** Lanes A, B and C landed on
+> `integ/bispinor-static-cleanup-2026-09-01@837ed531`; lane N's dynamic
+> packed route is on `lane/bisp-n-dynamic-packed-2026-09-01`. The
+> stage-by-stage wiring — every object's shape, sharding, route membership
+> and refusal — is
 > [`architecture/four_current_wiring.md`](../architecture/four_current_wiring.md).
 
 | object | owner |
 |---|---|
 | bare `D^{IJ}` tiles, TT head slot | `src/gw/v_q_bispinor.py` (`_make_per_q_v_builder_for_tile`, `_tt_head_tensor`) |
 | mini-BZ estimators: `⟨v⟩`, `⟨v q q⟩`, `⟨v P^T⟩`, photon cubature | `services/vcoul/src/vcoul/minibz.py` |
-| `Σ^B`, incumbent route only (bulk, dynamic modes, `x_only`, self-consistent) | `src/gw/sigma_x_bispinor.py` |
-| `Σ^B` inside the packed envelope — the TT part of the sixteen-block `Σ_X` | `src/gw/photon_sigma.py`, the same consumer as the screened mode |
+| `Σ^B` — the TT part of the packed `Σ`, static AND dynamic routes alike | `src/gw/photon_sigma.py`, the one sixteen-block consumer (`blocks = "all"` for `compute_mode = cohsex`, `blocks = "current"` for the dynamic route, whose charge block is the scalar `Σ_x + Σ_c(ω)`) |
+| `Σ^B`, incumbent route only — bulk, `mpa`, `x_only`, self-consistent, `restart = true`, the resolvent diagram sets, `no_local_fields`, and any deck whose `w_dyson_solver` is not `distributed` (which includes every 1-GPU deck, since the packed solve needs a true 2-D mesh) | `src/gw/sigma_x_bispinor.py` |
 | which of the two routes a deck takes, and the reason printed in the run record | `gw_config.packed_bare_transverse_route` |
+| which compute modes the packed operator serves | `gw_config.PACKED_PHOTON_COMPUTE_MODES` (`cohsex` + the plasmon-pole pair; `mpa` refuses by name) |
+| whether the packed operator owns the CHARGE Σ too, or only the current blocks | `gw_config.packed_photon_replaces_charge_sigma` (static) / `gw_config.uses_dynamic_packed_photon_route` (dynamic) |
 | which of the two packed modes screens the current blocks | `gw_config.packed_photon_screens_current` |
 | head sources, `HeadResolver`, static terms, PPM/complex-pole head `Σ`, Schur fold, rank-1 injection, packed Γ completion | `src/gw/head_correction.py` |
 | `S(ω)`, Γ wings, velocity, Hall pseudovector, per-iteration head samples | `src/gw/qsgw_head.py` |
 | packed layout and rank-4 updates | `src/gw/photon_layout.py` |
-| packed body response and Dyson, for **both** packed modes | `src/gw/w_isdf.py` (`compute_static_photon_response`, keyword `screen_current`) |
-| sixteen-block `Σ` | `src/gw/photon_sigma.py` |
+| packed body response and Dyson, for **both** packed modes and **both** compute-mode families | `src/gw/w_isdf.py` (`compute_static_photon_response`, keyword `screen_current`) |
+| sixteen-block `Σ`, and its twelve-block current-only selection | `src/gw/photon_sigma.py` |
+| the dynamic route's block split (charge half ↔ current half) | `src/gw/sigma_dispatch.py`, `compute_sigma_xc`'s `uses_dynamic_packed_photon_route` branch |
 | bounded packed-head response record (`StaticPhotonHeadResponse`; Hall optional), and the by-declaration content list | `src/gw/static_gauge_response.py` (the module docstring) |
 | Hall artifact schema | `src/file_io/static_gauge_head.py` |
 | four-current carrier resolution (`bispinor_gw` models) | `src/common/four_current_model.py` |

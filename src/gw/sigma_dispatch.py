@@ -50,7 +50,8 @@ from .gw_config import (
     band_extrapolation_is_consumable,
     mode_builds_channels, refuse_explicit_gij_under_low_mem_bands,
     refuse_unimplemented_compute_mode,
-    sigma_stage_modes, uses_static_photon_response)
+    packed_photon_replaces_charge_sigma, sigma_stage_modes,
+    uses_dynamic_packed_photon_route, uses_static_photon_response)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +362,8 @@ def finalize_dynamic_sigma(
     print_fn: Callable = print,
     efermi_ry=None,
     efermi_provenance=None,
+    photon_head_sigma_diag_tskn_ry=None,
+    photon_head_sigma_basis=None,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
 
@@ -538,6 +541,13 @@ def finalize_dynamic_sigma(
             str(_band_estimator) if _band_estimator is not None else None),
         band_extrapolation_scheme=(
             str(_band_scheme) if _band_scheme is not None else None),
+        # The dynamic PACKED route's per-sector Gamma-cell diagnostics.
+        # None for every scalar dynamic run, so the freq-debug writer's
+        # columns are unchanged there; on the packed route its CC sector is
+        # exactly zero because the charge head is the dynamic model's, not
+        # the packed completion's (DESIGN.md section 1.3).
+        photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag_tskn_ry,
+        photon_head_sigma_basis=photon_head_sigma_basis,
     )
 
 
@@ -832,7 +842,7 @@ def compute_sigma_xc(
         mode, SigmaChannel.SX, SigmaChannel.COH)
     photon_head_sigma_diag = None
     photon_head_sigma_basis = None
-    if uses_static_photon_response(config):
+    if packed_photon_replaces_charge_sigma(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
                 "static packed-photon mode reached Sigma outside "
@@ -877,6 +887,125 @@ def compute_sigma_xc(
             photon_head_sigma_diag = (
                 photon_head_diagnostics.components_tskn_ry)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
+    elif uses_dynamic_packed_photon_route(config):
+        # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
+        # W_packed(w) = diag(W_00(w), W_TT, W_CT): the CHARGE block carries
+        # the run's plasmon-pole model, the twelve CURRENT blocks are frozen
+        # at w = 0.  Because the sixteen-block sum is a plain sum once
+        # W_packed is built, Sigma splits exactly in two and each half keeps
+        # its existing owner:
+        #
+        #   Sigma_xc(w) = [ Sigma_x^CC + Sigma_c^CC(w) ]        <- scalar owner
+        #               + [ sum_{AB != CC} SX(W_AB) + COH(W_AB - V_AB) ]
+        #                                                       <- packed owner
+        #
+        # There is no third implementation here: the first bracket is the
+        # ordinary compute_sigma_x + ppm_pipeline chain below, the second is
+        # the SAME gw.photon_sigma consumer the static packed mode uses,
+        # called with blocks = "current".
+        #
+        # In the BARE family (chi_TT = chi_CT = 0) the second bracket is
+        # SX(D_TT) = X(D_TT) = Sigma^B with COH(D_TT - D_TT) = 0 and CT/TC
+        # identically zero -- i.e. exactly what gw.sigma_x_bispinor returned
+        # and what compute_sigma_x folded into sig_x on the incumbent route,
+        # plus the TT/CT Gamma cell the packed completion carries.
+        # reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md section 1.
+        if photon_response is None:
+            raise RuntimeError(
+                "dynamic packed-photon route reached Sigma without the "
+                "packed static photon response.  Refusing instead of "
+                "falling back to charge-only screened Sigma with no "
+                "transverse channel at all.")
+        if builds_static_screened:
+            raise ValueError(
+                f"dynamic packed-photon route reached Sigma with a mode "
+                f"that builds static screened channels "
+                f"({getattr(mode, 'value', mode)}); the packed current "
+                "blocks and a static screened charge Sigma would both "
+                "claim the SX/COH columns.")
+        from .cohsex_sigma import _resolve_Gij
+        photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
+        # CHARGE CHANNEL: the ordinary scalar bare-exchange owner, with the
+        # incumbent Sigma^B arms EXPLICITLY OFF.  The transverse exchange is
+        # the packed consumer's TT block below; letting compute_sigma_x add
+        # it as well is precisely the double count this route exists to
+        # remove.  ``static_head_terms`` is the scalar band-diagonal q->0
+        # bare-X head, i.e. the CC head, and it stays the scalar owner's --
+        # the packed completion supplies only the TT/CT Gamma cell here.
+        sig_x = compute_sigma_x(
+            wfns, V_q, meta, mesh_xy,
+            Gij=photon_Gij,
+            static_head_terms=static_head_terms,
+            wfns_transverse=None,
+            bispinor_v_q_path=None,
+            occupation_state=None,
+        )
+        from .photon_sigma import (
+            PHOTON_BLOCKS_CURRENT, compute_static_photon_sigma)
+        (cur_x, cur_sx, cur_coh,
+         photon_head_diagnostics) = compute_static_photon_sigma(
+            wfns_charge=wfns,
+            wfns_transverse=wfns_transverse,
+            Gij=photon_Gij,
+            V_packed=photon_response.V_packed,
+            W_packed=photon_response.W_packed,
+            photon_layout=photon_response.layout,
+            meta=meta,
+            mesh_xy=mesh_xy,
+            blocks=PHOTON_BLOCKS_CURRENT,
+            head_completion=photon_response.head_completion,
+            diagnostic_basis_rotation=hartree_basis_rotation,
+            diagnostic_input_basis=(
+                "qp" if hartree_basis_rotation is not None else "dft"),
+            print_fn=print_fn,
+        )
+        # BOOKING.  A genuinely w-independent W_AB gives a w-independent
+        # Sigma contribution, so adding the current sector to sig_x and
+        # adding it to Sigma_c(w) produce the SAME Sigma_xc
+        # (qsgw_utils.build_qsgw_sigma_xc forms sig_x + Sigma_c(E)).  It
+        # goes into sig_x, the seam the incumbent route used for Sigma^B, so
+        # the bare family's sigX column is unchanged from that route and the
+        # A/B against it is like for like.  In the SCREENED family the same
+        # column then also carries the current blocks' static CORRELATION,
+        # which is O(alpha_FS^2) and is printed here rather than left
+        # invisible.
+        current_correlation = (cur_sx - cur_x) + cur_coh
+        sig_x = sig_x + cur_sx + cur_coh
+        sig_x.block_until_ready()
+        sig_sx = sig_coh = jnp.zeros_like(sig_x)
+        if print_fn is not None:
+            _bare_scale = float(jnp.max(jnp.abs(jnp.diagonal(
+                cur_x, axis1=-2, axis2=-1)))) * RYD_TO_EV
+            _corr_scale = float(jnp.max(jnp.abs(jnp.diagonal(
+                current_correlation, axis1=-2, axis2=-1)))) * RYD_TO_EV
+            print_fn(
+                f"  packed photon current sector (static, w = 0): bare "
+                f"exchange max|diag| = {_bare_scale:.6e} eV, static "
+                f"correlation max|diag| = {_corr_scale:.6e} eV "
+                f"(exactly zero in the bare-transverse family, where "
+                f"W_TT = D_TT and W_CT = 0); both booked into sigX")
+        if photon_head_diagnostics is not None:
+            photon_head_sigma_diag = (
+                photon_head_diagnostics.components_tskn_ry)
+            photon_head_sigma_basis = photon_head_diagnostics.output_basis
+    elif uses_static_photon_response(config):
+        # EXHAUSTIVENESS over the packed route's compute modes.  The two
+        # predicates above cover gw_config.PACKED_PHOTON_COMPUTE_MODES; a
+        # packed deck on any other mode (mpa today) reaches here only
+        # through a hand-built config that skipped
+        # refuse_unsupported_bispinor_gw, and is refused by name rather
+        # than served the charge-only scalar path with its transverse
+        # channel silently dropped.
+        raise NotImplementedError(
+            f"packed four-current mode with compute_mode = "
+            f"{getattr(mode, 'value', mode)} has no Sigma branch.  The "
+            "packed operator serves compute_mode = cohsex (static, all "
+            "sixteen blocks) and the two-point plasmon-pole pair (dynamic "
+            "charge block, static current blocks).  mpa has no independent "
+            "static-role W for the bare family's CC block "
+            "(gw.screening.screening_requests_for returns none for it), so "
+            "it is refused rather than approximated; see "
+            "gw_config.PACKED_PHOTON_COMPUTE_MODES.")
     elif builds_static_screened:
         cohsex = compute_cohsex_sigma(
             wfns, V_q, W_static, meta, mesh_xy,
@@ -1188,6 +1317,8 @@ def compute_sigma_xc(
     return finalize_dynamic_sigma(
         ppm_outputs.sigma_c_body_omega,
         ppm_outputs.head_sigma_diag_w_kn_ry,
+        photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
+        photon_head_sigma_basis=photon_head_sigma_basis,
         sig_x=sig_x, sig_h=sig_h,
         v_h_scalar=v_h_scalar, h_transverse=h_transverse,
         hartree_omitted=bool(omit_v_h),

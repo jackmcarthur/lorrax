@@ -67,6 +67,50 @@ in the file's own header; read it there rather than here.
   transverse 668→672 extent class) → **bit-identical** including Σ_C.
 * GN-PPM census: invalid modes 18494/589824 (3.14%).
 
+## 2026-09-02 — the fixture is self-contained again, and the reference is NOT re-frozen
+
+Red since 2026-08-26 as an **ERROR** (the session fixture died before Sigma
+with `ValueError: kin_ion.h5 has no bispinor provenance`), so the gate
+produced no number for a week. Three blockers, all removed on
+`lane/bisp-n-dynamic-packed-2026-09-01`:
+
+* `kin_ion.h5` **regenerated** from this deck; it now carries `bispinor`,
+  `soc` with its measured provenance, `wfn_fingerprint`, `k_storage = ibz`
+  (5 irreducible k of 9) and the pseudopotential list.
+* `Mo.upf` and `S.upf` are **now shipped here**. They were not, so
+  `gw.kin_ion_io` refused outright — and the sandbox holds two incompatible
+  Mo ONCV fully-relativistic PBE pseudos with the same `z_valence` and
+  projector count. The pair here is the v3.3.0 (2017) one, md5
+  `4e1c3579…` / `a7319d53…`, identified from this fixture's own lineage: the
+  640/668 sets named above live in
+  `runs/MoS2_FROM_OLDER_SANDBOX/D_60Ry_bispinor/`, whose `qe/nscf/nscf.in` is
+  the 60 Ry / `noncolin` / `lspinorb` / 82-band calculation this WFN is a
+  34-band truncation of. `cohsex_debug`'s `Mo_ONCV_PBE_FR-1.0.upf` is the
+  2014 generation and is the WRONG file for this deck.
+* `tests/harness.parse_eqp_rows` now accepts the bispinor `Hdir=` column
+  (`Hdir = V_H + H_T`) as well as the scalar `VH=`. Without that no bispinor
+  `sigma_diag.dat` was parseable and this gate could only ever have passed on
+  its byte-identity fast path.
+
+**`sigma_diag_bispinor_ref.dat` is deliberately still the 2026-08-09 file.**
+The gate now runs and reports `max |Δ| = 1.434 eV`; the move is
+`sigX` +0.0040, `sigC` +0.5110, `sigXC` +0.5149 and `Hdir`-vs-old-`VH`
++0.2777 eV in the mean over 270 rows. It is **entirely pre-existing** — the
+same deck at `837ed531` and at the lane tip gives byte-identical data rows —
+and its `sigC` half is undecomposed, so re-cutting the reference would
+certify a state nobody has explained.
+`tests/known_failures/2026-09-02-bispinor-gnppm-fixture-runs-again-reference-not-refrozen.md`
+carries the numbers and the one-line re-freeze command for the owner.
+
+**Which route this deck takes, after phase 3.** It stays on the INCUMBENT
+charge-screened + `Σ^B` route. The packed four-current operator now serves
+`compute_mode` in {`cohsex`, `gn_ppm`, `hl_ppm`}, but its Dyson solve has no
+local plan and `distrib_la` refuses `distributed` on a 1×1 mesh, so a 1-GPU
+gate cannot reach it: `packed_bare_transverse_route` requires
+`w_dyson_solver = distributed` and the run record says so. The packed dynamic
+route's own gates are the P=4 MoS2 legs of
+`runs/MoS2/11_bisp_n_dynamic_packed_20260901/`.
+
 ## Files
 
 - `bispinor_test.in` — GN-PPM bispinor input (Tier-1 gate; the Tier-2
@@ -75,4 +119,5 @@ in the file's own header; read it there rather than here.
 - `centroids_frac_256.txt` / `centroids_frac_209_current.txt` — charge /
   transverse ISDF centroid sets (seed 42).
 - `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC).
-- `WFN.h5` (34 bands), `kin_ion.h5`.
+- `WFN.h5` (34 bands), `kin_ion.h5` (regenerated 2026-09-02, stamped),
+  `Mo.upf` / `S.upf` (added 2026-09-02; see above for which generation).
