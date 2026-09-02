@@ -19,6 +19,7 @@ _PRODUCTION_GEMM_PLAN_INVENTORY = Counter({
     ("src/gw/ppm_sigma.py", "_face_g_plan"): 1,
     ("src/gw/ppm_tau_kernel.py", "_get_sigma_kij_kernel"): 2,
     ("src/gw/w_isdf.py", "_get_chi_minimax_kernel_face"): 1,
+    ("src/gw/w_isdf.py", "_get_fused_photon_chi_kernel"): 1,
     ("src/gw/w_isdf.py", "_get_chi_fractional_contour_kernel_face"): 1,
     ("src/gw/w_isdf.py", "_get_finite_transfer_current_block_kernel"): 1,
     ("src/gw/wavefunction_bundle.py", "_face_rotate_kernel"): 2,
@@ -44,6 +45,7 @@ _ROUTE_KEYED_PLAN_FACTORIES = {
     },
     "src/gw/w_isdf.py": {
         "_get_chi_minimax_kernel": "cache_key",
+        "_get_fused_photon_chi_kernel": "key",
         "_get_chi_fractional_contour_kernel": "cache_key",
         "_get_finite_transfer_current_block_kernel": "key",
     },
