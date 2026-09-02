@@ -8,13 +8,8 @@ catch a bracketing arithmetic error and cheap enough to run in the default
 suite.  What it CANNOT reach is the part of the bracket plumbing that only
 exists at P>1:
 
-  * the stacked σ^τ carries a new LEADING axis, and the accumulator places
-    every host tile by ``addressable_shards[d].index`` — a 4-tuple now, not a
-    3-tuple.  An axis inserted at the wrong position misplaces tiles rather
-    than failing;
-  * ``_MemoryTileSink`` splices the ω slice in BEHIND the bracket axis;
-  * the crossing window's ``(Z − Z†)/2i`` completion reads the band axes off
-    the σ^τ sharding, which now has two leading axes instead of one;
+  * the stacked sigma(tau) carries a new LEADING axis, and the shared device
+    accumulator inserts omega behind it;
   * the reduce-scatter projector's output sharding has to survive the stack.
 
 An in-process 4-device mesh cannot be used for this: the flat-k FFT FFI
@@ -25,7 +20,7 @@ directory the repo already keeps such gates in.
 WHAT IT ASSERTS, on every rank, on every addressable shard:
 
   1. ``cumsum(3 brackets, axis=0)[-1] == 1 full-band bracket`` to 1e-12
-     relative — the partition claim, both channel plans;
+     relative — the partition claim through the sole shared carrier;
   2. the single-bracket kernel is BIT-IDENTICAL (``max|Δ| == 0``) to the
      un-bracketed ``brackets=None`` kernel MPA still uses — the default-path
      claim, at the shape where a sharding drift would show;
@@ -75,7 +70,8 @@ def main() -> None:
               f"devices={n_dev} mesh=2x2 platform={jax.devices()[0].platform}",
               flush=True)
 
-    from gw.ppm_tau_kernel import _get_sigma_kij_kernel, _get_sigma_tau_kernel
+    from gw.ppm_tau_kernel import (_get_sigma_kij_kernel,
+                                   get_shared_sigma_tau_kernel)
     from gw.band_extrapolation import plan_band_brackets
     from common.collectives import device_put_process_local
 
@@ -101,10 +97,13 @@ def main() -> None:
                   P(None, 'x', 'y'))
     mask_B = put(np.ones((nk, n_mu, n_mu), dtype=bool), P(None, 'x', 'y'))
 
-    tau_args = (psi_xn, psi_yr, psi_xr, psi_yn, E_A, mask_A, B_q, Omega_q,
-                mask_B,
-                jnp.asarray(-np.inf, dtype=jnp.float64),
-                jnp.asarray(np.inf, dtype=jnp.float64),
+    tau_args = (psi_xn, psi_yr, psi_xr, psi_yn, E_A, mask_A,
+                jnp.where(mask_B, B_q, 0.0)[None, ...],
+                Omega_q.astype(jnp.complex128)[None, ...],
+                jnp.asarray([0], dtype=jnp.int32),
+                jnp.asarray([[0.0, np.inf, -np.inf, -np.inf,
+                              np.inf, np.inf]], dtype=jnp.float64),
+                jnp.asarray([False]),
                 jnp.asarray(0.25, dtype=jnp.float64),
                 jnp.asarray(0.10, dtype=jnp.float64),
                 jnp.asarray(0.3 - 0.7j, dtype=jnp.complex128))
@@ -122,38 +121,29 @@ def main() -> None:
         print(f"[band-bracket-p4] scheme={plan.bracket_scheme} "
               f"counts={plan.counts} bounds={plan.bounds}", flush=True)
 
-    # ---- 1 + 3: partition, both channel plans, per addressable shard -----
-    for merged_x in (True, False):
-        with mesh:
-            one = _get_sigma_tau_kernel(mesh_xy=mesh, kgrid=kgrid,
-                                        merged_x=merged_x,
-                                        brackets=((0, nb),))(*tau_args)
-            three = _get_sigma_tau_kernel(mesh_xy=mesh, kgrid=kgrid,
-                                          merged_x=merged_x,
-                                          brackets=brk3)(*tau_args)
-        chans1 = (one,) if merged_x else one
-        chans3 = (three,) if merged_x else three
-        for ch, (a1, a3) in enumerate(zip(chans1, chans3)):
-            spec = tuple(a3.sharding.spec)
-            if spec != (None, None, 'x', 'y'):
-                _fail(f"merged_x={merged_x} ch{ch}: stacked σ^τ sharding is "
-                      f"{spec}, expected (None, None, 'x', 'y')")
-            if a1.shape[0] != 1 or a3.shape[0] != 3:
-                _fail(f"merged_x={merged_x} ch{ch}: bracket extents "
-                      f"{a1.shape[0]}/{a3.shape[0]}, expected 1/3")
-            for s1, s3 in zip(a1.addressable_shards, a3.addressable_shards):
-                t1 = np.asarray(s1.data)
-                t3 = np.asarray(s3.data)
-                tot = np.cumsum(t3, axis=0)[-1]
-                scale = max(float(np.max(np.abs(t1[0]))), 1e-300)
-                rel = float(np.max(np.abs(tot - t1[0]))) / scale
-                if not rel < 1e-12:
-                    _fail(f"merged_x={merged_x} ch{ch} rank{rank} "
-                          f"shard{s1.index}: cumulative bracket sum != "
-                          f"full-band sum, rel {rel:.3e}")
-        if rank == 0:
-            print(f"[band-bracket-p4] partition OK (merged_x={merged_x})",
-                  flush=True)
+    # ---- 1 + 3: partition through the shared carrier ---------------------
+    with mesh:
+        one = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh, kgrid=kgrid, brackets=((0, nb),))(*tau_args)
+        three = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh, kgrid=kgrid, brackets=brk3)(*tau_args)
+    spec = tuple(three.sharding.spec)
+    if spec != (None, None, 'x', 'y'):
+        _fail(f"stacked sigma(tau) sharding is {spec}, expected "
+              "(None, None, 'x', 'y')")
+    if one.shape[0] != 1 or three.shape[0] != 3:
+        _fail(f"bracket extents {one.shape[0]}/{three.shape[0]}, expected 1/3")
+    for s1, s3 in zip(one.addressable_shards, three.addressable_shards):
+        t1 = np.asarray(s1.data)
+        t3 = np.asarray(s3.data)
+        tot = np.cumsum(t3, axis=0)[-1]
+        scale = max(float(np.max(np.abs(t1[0]))), 1e-300)
+        rel = float(np.max(np.abs(tot - t1[0]))) / scale
+        if not rel < 1e-12:
+            _fail(f"rank{rank} shard{s1.index}: cumulative bracket sum != "
+                  f"full-band sum, rel {rel:.3e}")
+    if rank == 0:
+        print("[band-bracket-p4] shared-carrier partition OK", flush=True)
 
     # ---- 2: the default path is bit-identical -----------------------------
     kij_args = (psi_xn, psi_yr, psi_xr, psi_yn, E_A, mask_A,

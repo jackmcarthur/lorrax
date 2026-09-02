@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
 import numpy as np
+import jax.numpy as jnp
 
 from gw.mpa.sigma import _batch_rows, _branches
+from gw.ppm_sigma import _SigmaPhysicsState, _ppm_as_one_pole_store_fields
 
 
 def _row(poles):
@@ -18,6 +20,29 @@ def test_batch_rows_relocalize_pole_selection_per_batch():
     np.testing.assert_array_equal(
         _batch_rows(shared, range(4, 8))[0], np.arange(4, dtype=np.int32))
     assert _batch_rows(low_only, range(4, 8)) is None
+
+
+def test_ppm_one_pole_fields_use_the_mpa_residue_normalization():
+    """PPM Wc(0) = -2B/Omega enters the MPA model without rescaling."""
+    Omega = jnp.asarray([[[0.7, 0.8], [0.9, 1.0]]])
+    B = jnp.asarray([[[1.0 + 0.2j, -0.4], [0.3j, 0.6 - 0.1j]]])
+    live = jnp.asarray([[[True, False], [True, False]]])
+    state = _SigmaPhysicsState(
+        efermi=jnp.asarray(0.0),
+        E_cond=jnp.zeros((1, 1)), H_val=jnp.zeros((1, 1)),
+        cond_mask=jnp.ones((1, 1), bool), val_mask=jnp.ones((1, 1), bool),
+        B_corr=B, Omega_abs=Omega, B_mask=live,
+        invalid_mask=~live, n_total_modes=jnp.asarray(4),
+        n_invalid=jnp.asarray(2))
+    Omega_p, B_p = map(np.asarray, _ppm_as_one_pole_store_fields(state))
+
+    assert Omega_p.shape == B_p.shape == (1, 1, 2, 2)
+    np.testing.assert_array_equal(B_p[0][~np.asarray(live)], 0.0)
+    np.testing.assert_array_equal(Omega_p[0][~np.asarray(live)], 0.0)
+    mask = np.asarray(live)
+    ppm_wc0 = -2.0 * np.asarray(B)[mask] / np.asarray(Omega)[mask]
+    mpa_wc0 = -2.0 * B_p[0][mask] / Omega_p[0][mask]
+    np.testing.assert_array_equal(mpa_wc0, ppm_wc0)
 
 
 def test_small_gap_branching_follows_occupation_not_energy_sign():

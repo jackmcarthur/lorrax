@@ -2,9 +2,9 @@
 
 The inputs are analytic, ordered, and non-random.  These gates own only the
 representation-level ruling: exact tail budgets/ties, the preserved static
-identity, changed high-frequency moment, and reduced support seen by the
-existing exact minimax pane planner.  This is not strict BGW pole parity.
-They do not duplicate a Sigma or minimax kernel.
+identity, changed high-frequency moment, and reduced fitted-pole support.
+This is not strict BGW pole parity.  The dynamic window planner is the shared
+MPA route and is gated separately.
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from gw.minimax_screening import (
     GN_PPM_EXTREME_TAIL_DIVISOR,
     _coarsen_gn_ppm_extreme_tails,
 )
-from gw.ppm_windows import _plan_sign_definite_omega_panes
 from symmetry_maps import q_negation_index
 
 
@@ -73,22 +72,10 @@ def test_extreme_tails_reduce_range_and_preserve_static_wc0():
     assert np.all((2.0 * B_after * omega_after)[tail]
                   != (2.0 * B_before * omega)[tail])
 
-    # The canonical exact pane owner sees the intended cost collapse; the
-    # tail policy itself does not grow a second minimax implementation.
-    mask = jnp.ones(omega.shape, dtype=bool)
-    raw_panes = _plan_sign_definite_omega_panes(
-        Omega_q=jnp.asarray(omega), base_mask_B=mask,
-        mask_B_count=omega.size,
-        mask_B_min=float(omega.min()), mask_B_max=float(omega.max()),
-        E_min=0.25, E_max=4.0, omega_max=1.0)
-    reduced_panes = _plan_sign_definite_omega_panes(
-        Omega_q=jnp.asarray(omega_after), base_mask_B=mask,
-        mask_B_count=omega.size,
-        mask_B_min=float(omega_min_after),
-        mask_B_max=float(omega_max_after),
-        E_min=0.25, E_max=4.0, omega_max=1.0)
-    assert len(raw_panes) > 1
-    assert len(reduced_panes) == 1
+    # The live support presented to the one shared MPA planner is bounded.
+    assert float(omega.min()) < 1.0e-10
+    assert float(omega.max()) > 1.0e8
+    assert (float(omega_min_after), float(omega_max_after)) == (1.0, 5.0)
 
 
 def test_boundary_degeneracy_is_not_split_or_over_budget():

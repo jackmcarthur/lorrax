@@ -2,10 +2,10 @@
 import numpy as np
 import pytest
 
-from minimax import (
+from minimax.uniform_rule import (
     box_samples,
     build_uniform_rule,
-    rule_amplification_p99,
+    rule_roundoff_amplification,
     rule_sup_error,
 )
 
@@ -62,12 +62,18 @@ def test_invalid_box_refuses():
         build_uniform_rule((1.0, 0.0, 0.1, 1.0), 1.0e-4)
 
 
-def test_amplification_p99_is_box_intrinsic_and_below_the_boundary_max():
-    box = (-3.0 * ETA, 5.0 * ETA, ETA, 4.0 * ETA)
-    rule = build_uniform_rule(box, 1.0e-4, reduce=False)
-    p99 = rule_amplification_p99(
-        rule.times, rule.weights, box, rule.theta_deg)
-    assert np.isfinite(p99) and 1.0 <= p99 <= rule.kappa_max
+def test_roundoff_amplification_uses_the_error_currency():
+    d = np.asarray([0.0 + 0.1j, 10.0 + 0.1j])
+    times = np.asarray([0.2 + 0.0j, 0.7 + 0.0j])
+    weights = np.asarray([0.6 - 0.1j, 0.3 + 0.05j])
+    terms = np.exp(1j * d[:, None] * times[None, :]) * weights[None, :]
+    mass = np.sum(np.abs(terms), axis=1)
+
+    peak = rule_roundoff_amplification(times, weights, d, 0.1)
+    relative = rule_roundoff_amplification(times, weights, d, np.abs(d))
+    assert peak == pytest.approx(np.max(0.1 * mass))
+    assert relative == pytest.approx(np.max(np.abs(d) * mass))
+    assert relative > 50.0 * peak
 
 
 def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():

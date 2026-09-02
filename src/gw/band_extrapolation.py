@@ -1102,8 +1102,8 @@ def assert_brackets_match_ols_abscissae(plan: BandBracketPlan, slices, *,
         because those are the band sums the kernel will actually deliver;
       * the partition is checked against ``slices``, the SAME
         :class:`~gw.wavefunction_bundle.BandSlices` object from which
-        ``ppm_sigma._run_sigma_branch`` builds the ψ/E/mask operands it then
-        slices.  ``slices.nb_sigma_sum`` is the Σ band sum's extent; a plan
+        the shared MPA Sigma executor builds the psi/E/mask operands it then
+        slices.  ``slices.nb_sigma_sum`` is the Sigma band sum's extent; a plan
         built from ``nb_full`` / ``b_id_4_user`` (the LOADED extent,
         ``max(chi, sigma)``) or from the χ count disagrees with it the moment
         the deck is split.
@@ -1179,8 +1179,8 @@ def assert_brackets_match_ols_abscissae(plan: BandBracketPlan, slices, *,
                    f"bracket {i} is {bounds[i][1]}")
 
     # (2) THE PARTITION MUST BE THE Σ BAND SUM.  ``slices`` is the object
-    # ``_run_sigma_branch`` builds the operands from, so this ties the plan to
-    # the band axis it will actually slice rather than to a repeat of the
+    # The shared MPA executor builds the operands from this bundle, so this
+    # ties the plan to the band axis it will actually slice rather than to a repeat of the
     # arithmetic that built it.
     nb_sigma_padded = int(slices.nb_sigma_sum)
     if int(bounds[-1][1]) != nb_sigma_padded:

@@ -189,15 +189,16 @@ Ranked.  These escape input-file validation, the run log, and provenance.
 3. `LORRAX_WFN_BACKEND` (`""` → config/auto; forces `eager` \| `phdf5`,
    `services/wfn_loader/src/wfn_loader/loader.py`) → the `slab_io`/backend config
    section, so the read path is recorded alongside the write path.
-4. **`LORRAX_SIGMA_PLAN` is now a control selector, not production policy.**
-   Default/blank is `box`, the sole production MPA quadrature;
-   `panes` selects the frozen pane route for comparison controls only
-   (`gw.sigma_plan.resolve_sigma_plan`). `delivered` and every other spelling
-   refuse naming the two legal choices. The box route's numerical policy has
-   been promoted to the three deck keys `sigma_quadrature_eps`,
-   `sigma_quadrature_reduction_seconds`, and
-   `sigma_quadrature_cache_dir`; no accuracy/cache environment override
-   remains. GN/HL-PPM does not read this selector.
+4. **`LORRAX_SIGMA_PLAN` → a Sigma planning key.** Default `box` selects the
+   shared, measure-independent denominator-box planner for MPA and GN/HL-PPM;
+   `panes` selects their independent legacy quadrature controls
+   (`gw.sigma_plan.resolve_sigma_plan`). Grammar is the exact,
+   case-insensitive enum `box` \| `panes` after stripping; blank means `box`,
+   and every other value REFUSES naming both choices. Box construction,
+   acceptance, cache policy, lower-half-plane conjugation, and conversion to
+   executor `(t, alpha)` live once in `gw.sigma_box_plan`.
+5. *(removed 2026-08-31)* `LORRAX_DELIVERED_TAU_GRID` no longer exists:
+   lookup-served rules carry their own nodes and there is one grid mode.
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
 cache (§2 — a machine fact; its mandatory-`""` status during regression
 timing belongs in the job script, not the physics input).

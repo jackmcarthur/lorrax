@@ -2197,6 +2197,142 @@ def allocate_fit_store_collective(
     return fit_completion_ledger(dest)
 
 
+def write_complete_pole_store_collective(
+    dest,
+    Omega_p,
+    B_p,
+    *,
+    mesh_xy,
+    n_mu_logical,
+    energy_unit,
+    provenance,
+    certification,
+    occupation_state=None,
+):
+    """Write an already-fitted pole field as a finalized MPA store.
+
+    This is the collective format seam for pole models whose fit is performed
+    in memory rather than by the streamed Padé driver.  ``Omega_p`` and
+    ``B_p`` have shape ``(n_p, n_q, n_mu_padded, n_mu_padded)`` and remain on
+    ``P(None, None, 'x', 'y')`` throughout the write.  Only the logical
+    ``n_mu_logical`` square reaches disk; the device-count-dependent pad is
+    discarded by :class:`file_io.slab_io.SlabIO`.
+
+    A live pole is an element with ``abs(B_p) > 0``.  Live poles must satisfy
+    the MPA causal convention ``Re(Omega_p) > 0`` and
+    ``Im(Omega_p) <= 0``.  A zero-residue element is an absent pole and may
+    carry zero frequency.  Both arrays must be finite, including absent
+    entries, because a non-finite dormant value can become live after an
+    upstream policy change without changing the file shape.
+
+    ``certification`` and ``provenance`` are required.  An algebraic model has
+    no Padé solve condition or backward error, so this writer records observed
+    values of zero in the completion journal; the provenance must name the
+    algebraic fit protocol, and the caller supplies the positive thresholds
+    that :func:`validate_fit_store` requires.  The stored ``fit_condition``
+    payload remains its allocation-time zero fill.
+
+    Parameters
+    ----------
+    dest
+        Output HDF5 path, replaced collectively.
+    Omega_p, B_p
+        Pole frequencies and residues in ``energy_unit`` with shape
+        ``(n_p, n_q, n_mu_padded, n_mu_padded)`` and sharding
+        ``P(None, None, 'x', 'y')``.
+    mesh_xy
+        Existing named ``('x', 'y')`` device mesh.
+    n_mu_logical
+        Logical ISDF-pair extent written on both trailing axes.
+    energy_unit
+        ``'Ry'`` or ``'Ha'``; both poles and residues carry one energy unit.
+    provenance
+        Artifact provenance stamped as ``prov_*`` attributes.
+    certification
+        Positive condition/backward-error acceptance thresholds.
+
+    Returns
+    -------
+    dict
+        The finalized completion ledger, identically on every rank.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    if not provenance:
+        raise ValueError(
+            "write_complete_pole_store_collective requires provenance "
+            "naming the in-memory fit protocol")
+    _require_certification(certification, dest)
+    for arr in (Omega_p, B_p):
+        _require_layout(
+            arr, mesh_xy, P(None, None, "x", "y"),
+            "write_complete_pole_store_collective requires Omega_p and "
+            "B_p on P(None,None,'x','y')")
+    expected = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    Omega = jax.lax.with_sharding_constraint(
+        jnp.asarray(Omega_p, dtype=jnp.complex128), expected)
+    residue = jax.lax.with_sharding_constraint(
+        jnp.asarray(B_p, dtype=jnp.complex128), expected)
+    if Omega.ndim != 4 or tuple(Omega.shape) != tuple(residue.shape):
+        raise ValueError(
+            "write_complete_pole_store_collective requires equal rank-4 "
+            "Omega_p/B_p arrays shaped (n_p,n_q,n_mu_pad,n_mu_pad); got "
+            f"{tuple(Omega.shape)} and {tuple(residue.shape)}")
+    n_p, n_q, n_mu_x, n_mu_y = map(int, Omega.shape)
+    n_mu = int(n_mu_logical)
+    if min(n_p, n_q, n_mu) < 1 or n_mu_x < n_mu or n_mu_y < n_mu:
+        raise ValueError(
+            "write_complete_pole_store_collective got incompatible logical "
+            f"extents: poles={tuple(Omega.shape)}, n_mu_logical={n_mu}")
+    finite = (jnp.isfinite(jnp.real(Omega))
+              & jnp.isfinite(jnp.imag(Omega))
+              & jnp.isfinite(jnp.real(residue))
+              & jnp.isfinite(jnp.imag(residue)))
+    live = jnp.abs(residue) > 0.0
+    bad_causal = live & ((jnp.real(Omega) <= 0.0)
+                         | (jnp.imag(Omega) > 0.0))
+    n_nonfinite, n_bad_causal = map(
+        int, jax.device_get((jnp.sum(~finite, dtype=jnp.int64),
+                             jnp.sum(bad_causal, dtype=jnp.int64))))
+    if n_nonfinite:
+        raise ValueError(
+            "write_complete_pole_store_collective refuses "
+            f"{n_nonfinite} non-finite pole/residue elements")
+    if n_bad_causal:
+        raise ValueError(
+            "write_complete_pole_store_collective refuses "
+            f"{n_bad_causal} live poles with Re Omega <= 0 or Im Omega > 0")
+
+    allocate_fit_store_collective(
+        dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n_p,
+        energy_unit=energy_unit, provenance=provenance,
+        occupation_state=occupation_state, mode="w")
+    global_shape = (n_p, n_q, n_mu, n_mu)
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        io.create_dataset("Omega_p", shape=global_shape, dtype=np.complex128)
+        io.create_dataset("B_p", shape=global_shape, dtype=np.complex128)
+        io.write_slab("Omega_p", Omega, offset=(0, 0, 0, 0),
+                      global_shape=global_shape)
+        io.write_slab("B_p", residue, offset=(0, 0, 0, 0),
+                      global_shape=global_shape)
+    barrier("mpa_complete_poles_written")
+
+    if process_rank() == 0:
+        columns = np.arange(n_mu, dtype=np.int64)
+        records = tuple(
+            (iq, columns, 0, n_mu, 0.0, 0.0) for iq in range(n_q))
+        with _h5(dest, "a") as grp:
+            _commit_fit_blocks(_open_fit(grp), records)
+        finalize_fit_store(dest, certification=certification)
+    barrier("mpa_complete_poles_finalized")
+    return fit_completion_ledger(dest)
+
+
 def _utc_now():
     return datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0).isoformat()

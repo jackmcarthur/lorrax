@@ -1,14 +1,16 @@
-"""Measure-independent denominator-box quadrature for MPA Sigma(omega).
+"""Measure-independent denominator-box quadrature for dynamic Sigma(omega).
 
 The public path in this module is deliberately short:
 
-``branch -> three Cartesian product windows -> denominator box -> rule``.
+``physical product window -> denominator box -> rule -> executor nodes``.
 
-Pole fields remain distributed.  The caller supplies the bounded per-pole
-extrema returned by :func:`gw.mpa.sigma_windows.summarize_sigma_poles`; no
-residue histogram, sampled lattice, error apportionment, or campaign-wide
-selection enters the quadrature.  Each returned ``SharedSigmaWindow`` is
-consumed unchanged by the existing MPA tau executor.
+Pole fields remain distributed.  MPA supplies the bounded per-pole extrema
+returned by :func:`gw.mpa.sigma_windows.summarize_sigma_poles`; PPM supplies
+the scalar extrema of each exact ``(q, mu, nu)`` pane.  No residue histogram,
+sampled lattice, error apportionment, or campaign-wide selection enters the
+quadrature.  The box construction, lower-half-plane conjugation, cache policy,
+fit guards, and conversion to executor ``(t, alpha)`` live here once for both
+routes.
 """
 
 from __future__ import annotations
@@ -29,14 +31,40 @@ from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaWindow
 from minimax import (
     UniformRule,
+    box_samples,
     build_uniform_rule,
-    rule_amplification_p99,
+    rule_roundoff_amplification,
 )
 
 
 _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
+# A box certificate bounds one denominator kernel.  Sigma is a sum of the
+# independently certified state/pole products, so spending the entire deck
+# ceiling in every product does not deliver that ceiling after accumulation.
+# The fixed reserve is shared by every dynamic mode and is deliberately not a
+# dial: ``sigma_quadrature_eps`` remains the sole requested-accuracy setting.
+_ACCUMULATION_SAFETY = 0.1
+
+
+def resolve_sigma_box_cache_dir(setting, input_dir):
+    """Resolve the deck's uniform-rule cache spelling beside its input.
+
+    ``"auto"`` selects ``<input_dir>/tmp/sigma_quadrature_rules``;
+    ``"off"`` disables the acceleration; any other relative path is resolved
+    against ``input_dir``.  A cache is not an accuracy path: every loaded rule
+    is still checked for box containment and the requested error currency.
+    """
+    raw = str(setting).strip()
+    if raw.lower() == "off":
+        return None
+    root = os.path.abspath(input_dir)
+    if raw.lower() == "auto":
+        return os.path.join(root, "tmp", "sigma_quadrature_rules")
+    expanded = os.path.expanduser(raw)
+    return (expanded if os.path.isabs(expanded)
+            else os.path.join(root, expanded))
 
 
 def _resolve_uniform_rule_trace():
@@ -151,6 +179,63 @@ def _box_for_window(frequencies, states, pole_stats, pole_sign, eta):
             (raw_lo, raw_hi), (a_lo, a_hi, gamma_lo, gamma_hi))
 
 
+def make_sigma_box_spec(
+    *, name, frequencies, states, pole_stats, pole_sign, eta_ry,
+):
+    """Construct one route-neutral denominator-box fit specification.
+
+    Parameters
+    ----------
+    name
+        Stable diagnostic identity for the physical product window.
+    frequencies
+        External frequencies owned by the window, shape ``(nomega,)`` in Ry.
+    states
+        Exact live intermediate-state energies, shape ``(nstate,)`` in Ry.
+    pole_stats
+        Per-pole or per-pane ``(real_min, real_max, gamma_min, gamma_max)``
+        rows in Ry.  These are scalar extrema, never histogram weights.
+    pole_sign
+        ``+1`` for conduction denominators and ``-1`` for valence.
+    eta_ry
+        Positive retarded broadening in Ry.
+
+    Returns
+    -------
+    dict
+        Box, raw support, fit currency, conjugation, and factor references.
+        Route-specific selector metadata may be added by the caller.
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64).reshape(-1)
+    states = np.asarray(states, dtype=np.float64).reshape(-1)
+    rows = tuple(tuple(float(value) for value in row) for row in pole_stats)
+    sign, eta = float(pole_sign), float(eta_ry)
+    if not frequencies.size or not np.all(np.isfinite(frequencies)):
+        raise ValueError(f"Sigma box window {name!r} has no finite frequencies")
+    if not states.size or not np.all(np.isfinite(states)):
+        raise ValueError(f"Sigma box window {name!r} has no finite states")
+    if not rows or any(len(row) != 4 for row in rows):
+        raise ValueError(
+            f"Sigma box window {name!r} needs four pole extrema per row")
+    if sign not in (-1.0, 1.0):
+        raise ValueError("Sigma box pole_sign must be +1 or -1")
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("sigma_quadrature requires eta_ry > 0")
+    box, raw_real, pole_extent = _box_for_window(
+        frequencies, states, rows, sign, eta)
+    kind = ("sign_definite_positive" if box[0] > 0.0 else
+            "sign_definite_negative" if box[1] < 0.0 else
+            "crossing")
+    e_ref_a, e_ref_b = _factor_references(kind, sign, states, rows)
+    return {
+        "name": str(name), "frequencies": frequencies, "states": states,
+        "pole_stats": rows, "pole_sign": sign,
+        "raw_real_support": raw_real, "box": box, "kind": kind,
+        "pole_extent": pole_extent, "conjugate": sign < 0.0,
+        "E_ref_A": e_ref_a, "E_ref_B": e_ref_b,
+    }
+
+
 def _rule_cache_lookup(directory, box, eps, relative):
     """Return the smallest cached rule certified on a containing box."""
     if directory is None:
@@ -188,14 +273,15 @@ def _rule_cache_lookup(directory, box, eps, relative):
     return best
 
 
-def _rule_cache_store(directory, rule):
+def _rule_cache_store(directory, rule, noise_amplification):
     """Atomically store one immutable box certificate."""
     if directory is None:
         return
     try:
         os.makedirs(directory, exist_ok=True)
         digest = hashlib.sha256(json.dumps(
-            [list(rule.box), float(rule.eps), bool(rule.relative)]
+            ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
+             bool(rule.relative)]
         ).encode()).hexdigest()[:16]
         path = os.path.join(directory, f"rule_{digest}.npz")
         if os.path.exists(path):
@@ -208,6 +294,7 @@ def _rule_cache_store(directory, rule):
                 times=rule.times, weights=rule.weights,
                 sup_error=float(rule.sup_error),
                 kappa_max=float(rule.kappa_max),
+                roundoff_amplification=float(noise_amplification),
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
                 seconds=float(rule.seconds))
         os.replace(temporary, path)
@@ -267,33 +354,31 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
                      if cache_dir is not None else requested_box)
         rule = build_uniform_rule(
             build_box, eps, time_budget=reduction_seconds)
-        _rule_cache_store(cache_dir, rule)
         cache_status = "miss" if cache_dir is not None else "off"
 
-    times = np.asarray(rule.times, np.complex128)
-    weights = np.asarray(rule.weights, np.complex128)
     if rule.sup_error > eps:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
             f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
-    # The noise clause remains kappa_p99 * 6e-8 <= 0.05 eps, but its
-    # percentile is now intrinsic to the certified box: the uniform-rule
-    # service area-weights its own fine check cloud.  No physical histogram
-    # or sampled tuple lattice is allowed back into rule determination.
-    # Tempting, and why not: use the single worst boundary point
-    # (rule.kappa_max).  It refused the measured Si crossing rule although
-    # its own sup certificate held; one boundary point is not the historical
-    # percentile noise contract and cannot be improved by retrying at a
-    # tighter eps without reviving the campaign's hidden second stage.
-    kappa_p99 = rule_amplification_p99(
-        times, weights, requested_box, rule.theta_deg)
-    noise_bound = kappa_p99 * _RUNTIME_NOISE_EPSILON
+    # Runtime perturbations must be bounded in the SAME currency as the
+    # approximation.  ``kappa = sum|term|/|Q|`` is already relative for a
+    # sign-definite box, but it overstates a crossing box's peak-relative
+    # error by ~|d|/eta at its far edge.  Measure rho*sum|term| directly.
+    noise_cloud = box_samples(
+        *rule.box, per_unit=8.0, n_im=48)
+    noise_rho = (np.abs(noise_cloud) if rule.relative
+                 else float(np.min(noise_cloud.imag)))
+    noise_amplification = rule_roundoff_amplification(
+        rule.times, rule.weights, noise_cloud, noise_rho)
+    noise_bound = noise_amplification * _RUNTIME_NOISE_EPSILON
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     if noise_bound > noise_budget:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: runtime-noise "
             f"bound {noise_bound:.6g} exceeds {noise_budget:.6g}")
 
+    times = np.asarray(rule.times, np.complex128)
+    weights = np.asarray(rule.weights, np.complex128)
     if spec["conjugate"]:
         # 1/conj(d) = conj(1/d): one upper-half-plane build serves the
         # lower-half-plane causal branch exactly.
@@ -305,15 +390,21 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: factored log "
             f"growth {max(growth):.6g} exceeds {_FACTOR_GROWTH_CAP:g}")
+    if cached is None:
+        # Only executor-acceptable rules enter the shared cache.  In
+        # particular, a service-level rule that meets its broad default
+        # cancellation cap but misses Sigma's eps-scaled noise cap must not
+        # poison every subsequent attempt for this box.
+        _rule_cache_store(cache_dir, rule, noise_amplification)
     return {
         "times": times, "weights": weights,
         "node_count": int(times.size), "rule_box": tuple(rule.box),
         "relative": bool(rule.relative), "sup_error": float(rule.sup_error),
-        "kappa_p99": kappa_p99, "kappa_max": float(rule.kappa_max),
-        "theta_deg": float(rule.theta_deg),
+        "kappa_max": float(rule.kappa_max), "theta_deg": float(rule.theta_deg),
         "rank": int(rule.rank), "seconds": float(rule.seconds),
         "cache_status": cache_status, "factor_growth": growth,
         "noise_bound": noise_bound, "noise_budget": noise_budget,
+        "roundoff_amplification": noise_amplification,
         "one_line": rule.one_line(),
     }
 
@@ -359,6 +450,68 @@ def _parallel_fits(specs, worker):
     return [row["value"] for row in rows], rows
 
 
+def fit_sigma_box_specs(
+    specs, eta_ry, *, eps, reduction_seconds, cache_dir,
+):
+    """Fit independent route-neutral box specifications across processes.
+
+    The input rows must come from :func:`make_sigma_box_spec`.  This function
+    owns the shared cache lookup/build, rule acceptance, lower-half-plane
+    conjugation, runtime-noise guard, and factored-growth guard.  It returns
+    only small replicated rule receipts; route-specific physical selectors
+    stay with the caller.
+    """
+    rows = list(specs)
+    eta, tolerance, budget = (
+        float(eta_ry), float(eps), float(reduction_seconds))
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("sigma_quadrature requires eta_ry > 0")
+    if not 0.0 < tolerance < 1.0:
+        raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
+    if not np.isfinite(budget) or budget <= 0.0:
+        raise ValueError("sigma_quadrature_reduction_seconds must be > 0")
+    return _parallel_fits(
+        rows, lambda index: _fit_rule(
+            rows[index], tolerance, budget, cache_dir, eta))
+
+
+def sigma_box_executor_nodes(
+    fit, pole_sign, eta_ry, *, one_sided_hermitian=False,
+):
+    """Convert one accepted box rule to the dynamic-Sigma executor contract.
+
+    The shared physical convention is
+
+    ``time_exec = pole_sign * time`` and
+    ``alpha_exec = weight * exp(-eta * time_exec)``.
+
+    The fitted lower-half-plane valence rule has already received the exact
+    ``time=-conj(time), weight=conj(weight)`` transformation in
+    :func:`fit_sigma_box_specs`.  ``one_sided_hermitian`` retains PPM's
+    crossing channel and its global completion ``(Z-Z^dagger)/(2i)``.  In
+    that contract the coefficient is multiplied by ``i`` so completion is
+    exactly the Hermitian part of the full causal box sum:
+
+    ``(i Q - (i Q)^dagger)/(2i) = (Q + Q^dagger)/2``.
+
+    No channel is collapsed and the equality holds for general complex box
+    times and weights, not only a real one-sided sine grid.
+    """
+    sign, eta = float(pole_sign), float(eta_ry)
+    if sign not in (-1.0, 1.0):
+        raise ValueError("Sigma box pole_sign must be +1 or -1")
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("sigma_quadrature requires eta_ry > 0")
+    time_exec = sign * np.asarray(fit["times"], np.complex128)
+    alpha_exec = (np.asarray(fit["weights"], np.complex128)
+                  * np.exp(-eta * time_exec))
+    if one_sided_hermitian:
+        alpha_exec = 1.0j * alpha_exec
+    return MinimaxNodes(
+        t=jnp.asarray(time_exec, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128))
+
+
 def plan_sigma_windows(
     pole_summaries,
     branches,
@@ -389,9 +542,10 @@ def plan_sigma_windows(
         Positive retarded broadening in Ry.  It enters both the box's
         imaginary extent and, exactly once, the executor weights.
     eps
-        Per-window uniform sup tolerance.  The rule builder uses relative
-        error on sign-definite boxes and peak-relative error on crossing
-        boxes; this matches the measured Sigma error currency.
+        Requested per-window uniform sup ceiling.  The rule builder certifies
+        at one tenth of this ceiling to reserve accumulation headroom.  It
+        uses relative error on sign-definite boxes and peak-relative error on
+        crossing boxes; this matches the measured Sigma error currency.
     reduction_seconds
         Per-window Gauss-reduction wall budget.  Independent windows are
         assigned round-robin across processes.
@@ -423,12 +577,13 @@ def plan_sigma_windows(
       do not drift; measured 3% all-edge widening added 67 pairs on Na.
     """
     started = time.perf_counter()
-    eta, tolerance = float(eta_ry), float(eps)
+    eta, requested_tolerance = float(eta_ry), float(eps)
+    tolerance = _ACCUMULATION_SAFETY * requested_tolerance
     budget, ceiling = float(reduction_seconds), int(pair_ceiling)
     edge = float(edge_factor)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("sigma_quadrature requires eta_ry > 0")
-    if not 0.0 < tolerance < 1.0:
+    if not 0.0 < requested_tolerance < 1.0:
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     if not np.isfinite(budget) or budget <= 0.0:
         raise ValueError("sigma_quadrature_reduction_seconds must be > 0")
@@ -468,36 +623,29 @@ def plan_sigma_windows(
             if not local.size or not pole_indices.size:
                 continue
             states = raw_energy[local]
-            box, raw_real, pole_extent = _box_for_window(
-                frequencies, states, pole_stats, pole_sign, eta)
-            kind = ("sign_definite_positive" if box[0] > 0.0 else
-                    "sign_definite_negative" if box[1] < 0.0 else
-                    "crossing")
-            e_ref_a, e_ref_b = _factor_references(
-                kind, pole_sign, states, pole_stats)
-            spec = {
-                "name": f"{branch.tag}:{name}", "branch": branch,
-                "states": states, "state_indices": flat_indices[local],
+            spec = make_sigma_box_spec(
+                name=f"{branch.tag}:{name}", frequencies=frequencies,
+                states=states, pole_stats=pole_stats,
+                pole_sign=pole_sign, eta_ry=eta)
+            spec.update({
+                "branch": branch,
+                "state_indices": flat_indices[local],
                 "state_shape": state_shape.shape,
                 "state_interval": (float(state_lo), float(state_hi)),
-                "pole_indices": pole_indices, "pole_stats": pole_stats,
+                "pole_indices": pole_indices,
                 "pole_bounds": (float(pole_lo), float(pole_hi)),
-                "pole_extent": pole_extent, "pole_sign": pole_sign,
                 "omega_abs": np.asarray(branch.omega_abs, np.float64),
-                "omega_idx": positions, "frequencies": frequencies,
-                "raw_real_support": raw_real, "box": box, "kind": kind,
-                "conjugate": pole_sign < 0.0,
-                "E_ref_A": e_ref_a, "E_ref_B": e_ref_b,
+                "omega_idx": positions,
                 "branch_report": report,
-            }
+            })
             specs.append(spec)
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
 
-    fits, fit_rows = _parallel_fits(
-        specs, lambda index: _fit_rule(
-            specs[index], tolerance, budget, cache_dir, eta))
+    fits, fit_rows = fit_sigma_box_specs(
+        specs, eta, eps=tolerance, reduction_seconds=budget,
+        cache_dir=cache_dir)
     pairs = sum(row["node_count"] for row in fits)
     if pairs > ceiling:
         raise RuntimeError(
@@ -506,18 +654,13 @@ def plan_sigma_windows(
 
     output = []
     for spec, fit in zip(specs, fits):
-        time_exec = spec["pole_sign"] * np.asarray(
-            fit["times"], np.complex128)
-        alpha_exec = (np.asarray(fit["weights"], np.complex128)
-                      * np.exp(-eta * time_exec))
         mask = np.zeros(int(np.prod(spec["state_shape"])), dtype=bool)
         mask[np.asarray(spec["state_indices"], np.int64)] = True
         external_sign = -1 if spec["branch"].neg_omega_half else 1
         window = _SigmaWindow(
             name=spec["name"],
-            nodes=MinimaxNodes(
-                t=jnp.asarray(time_exec, dtype=jnp.complex128),
-                alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128)),
+            nodes=sigma_box_executor_nodes(
+                fit, spec["pole_sign"], eta),
             mask_A=mask.reshape(spec["state_shape"]),
             E_ref_A=spec["E_ref_A"], E_ref_B=spec["E_ref_B"],
             omega_sign=int(spec["pole_sign"]) * external_sign,
@@ -546,8 +689,9 @@ def plan_sigma_windows(
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
             "sup_error": fit["sup_error"], "eps": tolerance,
-            "kappa_p99": fit["kappa_p99"],
+            "requested_eps": requested_tolerance,
             "kappa_max": fit["kappa_max"],
+            "roundoff_amplification": fit["roundoff_amplification"],
             "runtime_noise_bound": fit["noise_bound"],
             "runtime_noise_budget": fit["noise_budget"],
             "factor_growth": list(fit["factor_growth"]),
@@ -566,7 +710,8 @@ def plan_sigma_windows(
     }) for report in branch_reports)
     geometry.update({
         "planner": "uniform_denominator_boxes",
-        "eta_ry": eta, "eps": tolerance,
+        "eta_ry": eta, "eps": requested_tolerance,
+        "rule_eps": tolerance,
         "reduction_seconds": budget, "cache_dir": cache_dir,
         "pair_ceiling": ceiling, "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
@@ -579,4 +724,10 @@ def plan_sigma_windows(
     return output, geometry
 
 
-__all__ = ["plan_sigma_windows"]
+__all__ = [
+    "fit_sigma_box_specs",
+    "make_sigma_box_spec",
+    "plan_sigma_windows",
+    "resolve_sigma_box_cache_dir",
+    "sigma_box_executor_nodes",
+]

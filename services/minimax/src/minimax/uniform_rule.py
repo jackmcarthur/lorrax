@@ -70,7 +70,7 @@ from scipy.linalg import qr as _pivoted_qr
 
 __all__ = [
     "UniformRule", "build_uniform_rule", "box_samples",
-    "rule_amplification_p99", "rule_sup_error",
+    "rule_roundoff_amplification", "rule_sup_error",
 ]
 
 
@@ -970,43 +970,31 @@ def rule_sup_error(times, weights, d, rho=None):
     return float(err.max()), float(kappa.max())
 
 
-def rule_amplification_p99(times, weights, box, theta_deg):
-    """Area-weighted 99th percentile of term cancellation on a rule box.
+def rule_roundoff_amplification(times, weights, d, rho):
+    """Worst absolute term mass in the approximation-error currency.
 
-    This diagnostic uses the same fine cloud as the builder's sup check, but
-    weights each sample by its Voronoi area in the rectangle.  The weighting
-    removes the adaptive cloud's sampling density, so this remains a function
-    only of ``(rule, box)`` rather than becoming a spectral histogram.  It is
-    the measure-independent analogue of the executor noise gate's historical
-    ``kappa_p99`` statistic.
+    If each exponential term carries a relative runtime perturbation
+    ``eps_runtime``, the error is bounded by
+
+    ``eps_runtime * max_d rho(d) * sum_k |w_k exp(i t_k d)|``.
+
+    ``rho=|d|`` is the sign-definite rule's relative-error currency, while
+    ``rho=min(Im d)`` is the crossing rule's peak-relative currency.  The
+    cancellation ratio returned by :func:`rule_sup_error` divides by
+    ``|Q(d)|`` and is therefore not in the crossing rule's currency: at a
+    far edge it grows like ``|d|/eta`` while ``eta*|Q(d)|`` shrinks by the
+    reciprocal factor.
     """
-    re_lo, re_hi, im_lo, im_hi = map(float, box)
-    theta = np.deg2rad(float(theta_deg))
-    d = box_samples(
-        re_lo, re_hi, im_lo, im_hi, per_unit=8.0,
-        n_im=2 * _im_levels(theta))
-    weights = np.asarray(weights, np.complex128)
-    A = _cexp(
-        1.0j * d[:, None] * np.asarray(times, np.complex128)[None, :])
-    Q = A @ weights
-    kappa = (np.abs(A * weights[None, :]).sum(axis=1)
-             / np.maximum(np.abs(Q), 1.0e-300))
-
-    levels = np.unique(d.imag)
-    sampled_im_hi = max(im_hi, im_lo * 1.0001)
-    im_edges = np.concatenate((
-        [im_lo], 0.5 * (levels[:-1] + levels[1:]), [sampled_im_hi]))
-    area = np.empty(d.size, dtype=np.float64)
-    for level, im_width in zip(levels, np.diff(im_edges)):
-        indices = np.flatnonzero(d.imag == level)
-        real = d.real[indices]
-        re_edges = np.concatenate((
-            [re_lo], 0.5 * (real[:-1] + real[1:]), [re_hi]))
-        area[indices] = np.diff(re_edges) * im_width
-    order = np.argsort(kappa, kind="stable")
-    cumulative = np.cumsum(area[order])
-    return float(kappa[order][
-        np.searchsorted(cumulative, 0.99 * cumulative[-1])])
+    d = np.asarray(d, dtype=np.complex128)
+    scale = np.asarray(rho, dtype=np.float64)
+    if d.ndim != 1 or scale.ndim > 1 or (
+            scale.ndim == 1 and scale.shape != d.shape):
+        raise ValueError(
+            "roundoff amplification needs d as a vector and rho as a "
+            f"scalar or matching vector; got {d.shape} and {scale.shape}")
+    A = _cexp(1j * d[:, None] * np.asarray(times)[None, :])
+    mass = np.sum(np.abs(A * np.asarray(weights)[None, :]), axis=1)
+    return float(np.max(scale * mass))
 
 
 @dataclass(frozen=True)

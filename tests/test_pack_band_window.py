@@ -1,6 +1,6 @@
 """Algebra parity for the canonical distributed band-window repack
-(``gw.wavefunction_bundle.pack_band_window``) and the packed-bracket τ
-kernel it feeds (``gw.ppm_tau_kernel``, ``pack_brackets=True``), real
+(``gw.wavefunction_bundle.pack_band_window``) and the shared packed-bracket
+tau kernel it feeds (``gw.ppm_tau_kernel``, ``pack_brackets=True``), real
 multi-rank CUDA.
 
 Companion to ``tests/test_ppm_tau_kernel_face_parity.py`` (which gates
@@ -77,7 +77,7 @@ import jax.numpy as jnp
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from gw.ppm_tau_kernel import _get_sigma_tau_kernel
+from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.wavefunction_bundle import (
     BandSlices, PSI_MUN_SPEC, PSI_NMU_SPEC, Wavefunctions,
     pack_band_window,
@@ -170,7 +170,7 @@ def check_pack_full_window_identity(mesh, *, nb_full):
 # ---------------------------------------------------------------------------
 
 def check_packed_kernel_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
-                               nb_sigma, weight_kind, merged_x, brackets,
+                               nb_sigma, weight_kind, brackets,
                                seed):
     from gw.ppm_sigma import pad_sigma_window
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
@@ -192,8 +192,12 @@ def check_packed_kernel_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
         rng.uniform(0.2, 3.0, size=(nk, n_rmu, n_rmu))
         - 1j * rng.uniform(0.0, 0.5, size=(nk, n_rmu, n_rmu)))
     mask_B = jnp.asarray(rng.uniform(size=(nk, n_rmu, n_rmu)) > 0.3)
-    Om_lo = jnp.asarray(-np.inf, dtype=jnp.float64)
-    Om_hi = jnp.asarray(np.inf, dtype=jnp.float64)
+    B_poles = jnp.where(mask_B, B_q, 0.0)[None, ...]
+    Omega_poles = Omega_q[None, ...]
+    pole_indices = jnp.asarray([0], dtype=jnp.int32)
+    bounds = jnp.asarray([[0.0, np.inf, -np.inf, -np.inf,
+                           np.inf, np.inf]], dtype=jnp.float64)
+    phase_real = jnp.asarray([False])
     E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)
     E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
     t_node = jnp.asarray(0.15 + 0.07j, dtype=jnp.complex128)
@@ -212,11 +216,11 @@ def check_packed_kernel_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     psi_proj_xr_L, psi_proj_yn_L, nb_real = pad_sigma_window(
         psi_proj_xr_L0, psi_proj_yn_L0, mesh)
     assert nb_real == nb_sigma
-    tau_kernel_legacy = _get_sigma_tau_kernel(
-        mesh_xy=mesh, kgrid=kgrid, merged_x=merged_x, brackets=brackets)
+    tau_kernel_legacy = get_shared_sigma_tau_kernel(
+        mesh_xy=mesh, kgrid=kgrid, brackets=brackets)
     out_legacy = jax.block_until_ready(tau_kernel_legacy(
         psi_coh_xn_L, psi_coh_yr_L, psi_proj_xr_L, psi_proj_yn_L,
-        E_A, sel, B_q, Omega_q, mask_B, Om_lo, Om_hi,
+        E_A, sel, B_poles, Omega_poles, pole_indices, bounds, phase_real,
         E_ref_A, E_ref_B, t_node,
     ))
 
@@ -226,18 +230,18 @@ def check_packed_kernel_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
                       psi_full=psi_full, psi_full_T=psi_full_T)
 
     # MASK route (pack_brackets=False) -- the parity oracle.
-    tau_kernel_mask = _get_sigma_tau_kernel(
-        mesh_xy=mesh, kgrid=kgrid, merged_x=merged_x, brackets=brackets,
+    tau_kernel_mask = get_shared_sigma_tau_kernel(
+        mesh_xy=mesh, kgrid=kgrid, brackets=brackets,
         layout="face", face_shape=face_shape, pack_brackets=False)
     out_mask = jax.block_until_ready(tau_kernel_mask(
         wfns.psi_mun, wfns.psi_nmu, wfns.psi_nmu, wfns.psi_mun,
-        E_A, sel, B_q, Omega_q, mask_B, Om_lo, Om_hi,
+        E_A, sel, B_poles, Omega_poles, pole_indices, bounds, phase_real,
         E_ref_A, E_ref_B, t_node,
     ))
 
     # PACKED route (pack_brackets=True, the default) -- the new route.
-    tau_kernel_packed = _get_sigma_tau_kernel(
-        mesh_xy=mesh, kgrid=kgrid, merged_x=merged_x, brackets=brackets,
+    tau_kernel_packed = get_shared_sigma_tau_kernel(
+        mesh_xy=mesh, kgrid=kgrid, brackets=brackets,
         layout="face", face_shape=face_shape, pack_brackets=True)
     packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh)
              for lo, hi in brackets]
@@ -252,19 +256,11 @@ def check_packed_kernel_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
             assert mw is not wfns.psi_mun
     out_packed = jax.block_until_ready(tau_kernel_packed(
         psi_coh_xn_tuple, psi_coh_yr_tuple, wfns.psi_nmu, wfns.psi_mun,
-        E_A, sel, B_q, Omega_q, mask_B, Om_lo, Om_hi,
+        E_A, sel, B_poles, Omega_poles, pole_indices, bounds, phase_real,
         E_ref_A, E_ref_B, t_node,
     ))
 
-    def _pair(o):
-        return o if isinstance(o, tuple) else (o,)
-
-    legacy_arrs = _pair(out_legacy)
-    mask_arrs = _pair(out_mask)
-    packed_arrs = _pair(out_packed)
-    assert len(legacy_arrs) == len(mask_arrs) == len(packed_arrs)
-
-    for c, (la, ma, pa) in enumerate(zip(legacy_arrs, mask_arrs, packed_arrs)):
+    for c, (la, ma, pa) in enumerate(((out_legacy, out_mask, out_packed),)):
         la_h = _to_host(la)[..., :nb_sigma, :nb_sigma]
         ma_h = _to_host(ma)[..., :nb_sigma, :nb_sigma]
         pa_h = _to_host(pa)[..., :nb_sigma, :nb_sigma]
@@ -298,15 +294,15 @@ PACK_ISOLATED_CASES = (
 KERNEL_CASES = (
     ("packed_vs_mask_vs_legacy_ns1_3brackets", dict(
         ns=1, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=10, nb_sigma=10,
-        weight_kind="bool", merged_x=True,
+        weight_kind="bool",
         brackets=((0, 3), (3, 7), (7, 10)), seed=201)),
     ("packed_vs_mask_vs_legacy_ns2_3brackets", dict(
         ns=2, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=10, nb_sigma=10,
-        weight_kind="bool", merged_x=True,
+        weight_kind="bool",
         brackets=((0, 3), (3, 7), (7, 10)), seed=202)),
     ("packed_vs_mask_float_weight", dict(
         ns=1, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=10, nb_sigma=6,
-        weight_kind="float", merged_x=False,
+        weight_kind="float",
         brackets=((0, 3), (3, 7), (7, 10)), seed=203)),
 )
 

@@ -214,7 +214,8 @@ _FREQUENCY_FIT_NAMES = (
 # catalog-only import still pays no solver dependency.
 _UNIFORM_RULE_NAMES = (
     "UniformRule", "box_samples", "build_uniform_rule",
-    "rule_amplification_p99", "rule_sup_error")
+    "rule_roundoff_amplification", "rule_sup_error",
+)
 
 # Delivered-error fitting on a weighted complex support.  Also SciPy
 # (linprog), so it lives behind the same lazy door: a production table

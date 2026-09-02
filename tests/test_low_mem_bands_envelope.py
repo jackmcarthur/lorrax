@@ -24,7 +24,7 @@ directly.  This was discovered on real 4-rank CUDA (`tests/multi_device/
 low_mem_bands_one_shot_insulating_envelope_gate.py`, ``claims/0429.md``): a
 ``compute_mode = gn_ppm`` deck ran the ISDF fit and chi0/W screening to
 completion under ``layout='face'`` and then died inside
-``ppm_tau_kernel.precompile_sigma`` with the carrier's own named
+the former PPM tau precompile with the carrier's own named
 ``_require_legacy`` ``ValueError`` — a real crash, not a clean parse-time
 refusal.
 

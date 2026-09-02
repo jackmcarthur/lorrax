@@ -121,19 +121,23 @@ def _operands(mesh, *, nk=8, nb=12, n_mu=8, rng=None):
     )
 
 
-def _run_tau(mesh, op, brackets, *, merged_x, kgrid=(2, 2, 2)):
-    from gw.ppm_tau_kernel import _get_sigma_tau_kernel
+def _run_tau(mesh, op, brackets, *, kgrid=(2, 2, 2)):
+    from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
     try:
-        kern = _get_sigma_tau_kernel(
-            mesh_xy=mesh, kgrid=kgrid, merged_x=merged_x, brackets=brackets)
+        kern = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh, kgrid=kgrid, brackets=brackets)
     except Exception as exc:                       # noqa: BLE001 — see helper
         _skip_if_no_fft_handler(exc)
     with mesh:
         out = kern(
             op['psi_xn'], op['psi_yr'], op['psi_xr'], op['psi_yn'],
-            op['E_A'], op['mask_A'], op['B_q'], op['Omega_q'], op['mask_B'],
-            jnp.asarray(-np.inf, dtype=jnp.float64),
-            jnp.asarray(np.inf, dtype=jnp.float64),
+            op['E_A'], op['mask_A'],
+            jnp.where(op['mask_B'], op['B_q'], 0.0)[None, ...],
+            op['Omega_q'].astype(jnp.complex128)[None, ...],
+            jnp.asarray([0], dtype=jnp.int32),
+            jnp.asarray([[0.0, np.inf, -np.inf, -np.inf,
+                          np.inf, np.inf]], dtype=jnp.float64),
+            jnp.asarray([False]),
             jnp.asarray(0.25, dtype=jnp.float64),
             jnp.asarray(0.10, dtype=jnp.float64),
             jnp.asarray(0.3 - 0.7j, dtype=jnp.complex128),
@@ -141,34 +145,28 @@ def _run_tau(mesh, op, brackets, *, merged_x, kgrid=(2, 2, 2)):
     return jax.tree.map(lambda a: np.asarray(jax.device_get(a)), out)
 
 
-@pytest.mark.parametrize("merged_x", [True, False])
-def test_brackets_partition_the_band_sum(merged_x):
+def test_brackets_partition_the_band_sum():
     """cumsum(brackets)[-1] == the un-bracketed full-band σ^τ, to roundoff.
 
-    THE gate for the feature.  Both channel plans are exercised because they
-    are two different kernels with two different output carriers, and the
-    stack that adds the bracket axis has to be channel-wise in one of them.
+    THE gate for the feature, through the sole shared complex-carrier kernel.
     """
     mesh = _mesh_1x1()
     nb = 12
     op = _operands(mesh, nb=nb)
 
-    one = _run_tau(mesh, op, ((0, nb),), merged_x=merged_x)
-    three = _run_tau(mesh, op, ((0, 5), (5, 9), (9, nb)), merged_x=merged_x)
+    one = _run_tau(mesh, op, ((0, nb),))
+    three = _run_tau(mesh, op, ((0, 5), (5, 9), (9, nb)))
 
-    chans_one = (one,) if merged_x else one
-    chans_three = (three,) if merged_x else three
-    for c1, c3 in zip(chans_one, chans_three):
-        assert c1.shape[0] == 1, "the ordinary path must still carry a length-1 axis"
-        assert c3.shape[0] == 3
-        assert c1.shape[1:] == c3.shape[1:]
-        total = np.cumsum(c3, axis=0)[-1]
-        ref = c1[0]
-        scale = max(float(np.max(np.abs(ref))), 1e-300)
-        err = float(np.max(np.abs(total - ref))) / scale
-        assert err < 1e-12, (
-            f"bracket cumulative sum != full-band sum: rel {err:.3e}.  "
-            f"The brackets do not partition the band sum.")
+    assert one.shape[0] == 1, "the ordinary path must carry a length-1 axis"
+    assert three.shape[0] == 3
+    assert one.shape[1:] == three.shape[1:]
+    total = np.cumsum(three, axis=0)[-1]
+    ref = one[0]
+    scale = max(float(np.max(np.abs(ref))), 1e-300)
+    err = float(np.max(np.abs(total - ref))) / scale
+    assert err < 1e-12, (
+        f"bracket cumulative sum != full-band sum: rel {err:.3e}.  "
+        f"The brackets do not partition the band sum.")
 
 
 def test_single_bracket_is_bit_identical_to_the_full_band_kernel():
@@ -343,7 +341,7 @@ def test_conduction_energy_midpoint_is_conduction_relative_and_rectangular():
     is the nearest rectangular count in the k-mean DFT boundary-energy
     ladder, not an E_ck mask with a different count at every k.
     """
-    nk, nb, n_occ = 3, 200, 80
+    nb, n_occ = 200, 80
     band = np.arange(nb, dtype=float)
     # Non-linear spacing makes the energy midpoint visibly different from
     # the equal-band-count midpoint; k offsets cancel only after the mean.

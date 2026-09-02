@@ -136,3 +136,53 @@ def test_device_frequency_fold_preserves_a_leading_bracket_axis():
     coeff = 0.35 * np.exp(-1j * omega * 0.4)
     want = coeff.reshape(1, 3, 1, 1, 1) * np.asarray(sigma)[:, None]
     np.testing.assert_allclose(got, want, rtol=2e-14, atol=2e-14)
+
+
+def test_device_frequency_fold_carries_a_leading_band_bracket_axis():
+    """The shared fold inserts omega behind, never through, brackets."""
+    mesh = _mesh()
+    sigma_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    output_sharding = NamedSharding(
+        mesh, P(None, None, None, "x", "y"))
+    omega = np.asarray([-0.3, 0.5])
+    sigma_host = (np.arange(16, dtype=np.float64).reshape(2, 2, 2, 2)
+                  * (0.4 - 0.2j))
+    sigma = jax.device_put(sigma_host, sigma_sharding)
+    t = np.asarray([0.25, 0.8])
+    alpha = np.asarray([0.7, -0.1])
+    acc = DeviceOmegaAccumulator(
+        omega, shape=(2, omega.size, 2, 2, 2),
+        sharding=output_sharding, omega_axis=1)
+    acc.begin_window(t, alpha, omega_sign=1.0, prefactor=-1.0)
+    for _ in t:
+        acc.add_tau(sigma)
+    acc.end_window()
+
+    got = np.asarray(acc.finalize())
+    coeff = (-alpha[:, None]
+             * np.exp(1j * omega[None, :] * t[:, None])).sum(axis=0)
+    want = sigma_host[:, None, ...] * coeff[None, :, None, None, None]
+    assert got.shape == (2, 2, 2, 2, 2)
+    np.testing.assert_allclose(got, want, rtol=2e-14, atol=2e-14)
+
+
+def test_shared_tau_factory_forwards_the_band_partition(monkeypatch):
+    """The MPA door reaches the existing bracketed spatial kernel."""
+    import gw.ppm_tau_kernel as tau
+
+    seen = {}
+
+    def fake_spatial(**kwargs):
+        seen.update(kwargs)
+        return lambda *_args: np.zeros((2, 1, 1, 1), np.complex128)
+
+    monkeypatch.setattr(tau, "_get_sigma_kij_kernel", fake_spatial)
+    tau._sigma_shared_tau_kernel_cache.clear()
+    brackets = ((0, 3), (3, 7))
+    tau.get_shared_sigma_tau_kernel(
+        mesh_xy=_mesh(), kgrid=(1, 1, 1), brackets=brackets,
+        pack_brackets=False)
+    assert seen["brackets"] == brackets
+    assert seen["merged_x"] is True
+    assert seen["pack_brackets"] is False
+    tau._sigma_shared_tau_kernel_cache.clear()

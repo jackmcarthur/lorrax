@@ -1,4 +1,4 @@
-"""Fail-closed MPA Sigma route selector for production and pane controls."""
+"""Fail-closed dynamic-Sigma route selector for production and pane controls."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Conventions and wiring gates for the MPA denominator-box plan."""
+"""Conventions and wiring gates for the shared denominator-box plan."""
 
 import ast
 from pathlib import Path
@@ -48,9 +48,6 @@ def _fake_rule(box, eps, **_kwargs):
 
 def _plan(monkeypatch, branch=None, **kwargs):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    monkeypatch.setattr(
-        "gw.sigma_box_plan.rule_amplification_p99",
-        lambda *_args, **_kwargs: 1.1)
     branch = _branch() if branch is None else branch
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
@@ -69,7 +66,11 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
         "positive conduction:pole_tail",
     ]
     assert geometry["window_tau_pairs"] == 6
+    assert geometry["eps"] == 1.0e-4
+    assert geometry["rule_eps"] == 1.0e-5
     report = geometry["branches"][0]["windows"]
+    assert all(row["requested_eps"] == 1.0e-4 for row in report)
+    assert all(row["eps"] == 1.0e-5 for row in report)
     np.testing.assert_allclose(
         report[0]["box_ry"], [-0.206, 0.106, 0.15, 0.15])
     np.testing.assert_allclose(
@@ -114,9 +115,6 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         return _fake_rule(box, eps, **kwargs)
 
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
-    monkeypatch.setattr(
-        "gw.sigma_box_plan.rule_amplification_p99",
-        lambda *_args, **_kwargs: 1.1)
     args = dict(
         eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
@@ -138,11 +136,46 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         "window_tau_pairs"]
 
 
+def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
+    import dataclasses
+
+    def large_relative_kappa(box, eps, **kwargs):
+        # A far crossing edge can have large cancellation RELATIVE to Q while
+        # its term mass remains small relative to the 1/eta peak.
+        return dataclasses.replace(
+            _fake_rule(box, eps, **kwargs), kappa_max=1.0e6)
+
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.build_uniform_rule", large_relative_kappa)
+    plan, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+        cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+    assert len(plan) == 3
+    assert geometry["branches"][0]["windows"][0]["kappa_max"] == 1.0e6
+    assert all(
+        row["runtime_noise_bound"] <= row["runtime_noise_budget"]
+        for row in geometry["branches"][0]["windows"])
+
+
+def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
+    import dataclasses
+
+    def unstable(box, eps, **kwargs):
+        return dataclasses.replace(
+            _fake_rule(box, eps, **kwargs),
+            weights=np.asarray([1.0e5 + 0.0j, -1.0e5 + 0.0j]))
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", unstable)
+    with pytest.raises(RuntimeError, match="runtime-noise"):
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+            eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+            cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+
+
 def test_total_pair_ceiling_refuses(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    monkeypatch.setattr(
-        "gw.sigma_box_plan.rule_amplification_p99",
-        lambda *_args, **_kwargs: 1.1)
     with pytest.raises(RuntimeError, match="pair ceiling=5"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
@@ -236,3 +269,9 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
     with pytest.raises(ValueError, match="retired.*sigma_quadrature_eps"):
         LorraxConfig.from_input_file(
             str(deck), print_fn=lambda *_args, **_kwargs: None)
+
+    for key in ("ppm_sigma_target_error", "ppm_sigma_max_nodes"):
+        deck.write_text(_DECK + f"{key} = 1e-4\n")
+        with pytest.raises(ValueError, match=f"{key}.*retired"):
+            LorraxConfig.from_input_file(
+                str(deck), print_fn=lambda *_args, **_kwargs: None)

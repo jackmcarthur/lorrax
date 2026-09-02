@@ -14,7 +14,8 @@ only sequences them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+import os
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +24,7 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
+from common.collectives import barrier, process_rank
 import common.timing as timing
 
 from .band_extrapolation import (
@@ -48,8 +50,6 @@ from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
     fit_ppm,
 )
-from .ppm_tau_kernel import precompile_sigma
-from .ppm_windows import hgl_partition_required, sigma_regularization_for_config
 
 
 @dataclass(frozen=True)
@@ -619,7 +619,8 @@ def compute_ppm_sigma_pipeline(
         # count, so a wrong-count run is Hermitian, converges, and prints
         # ordinary numbers.  This is the last place that can see it: here the
         # plan and the band slices its brackets will slice are both in scope.
-        # Before precompile_sigma, so a mismatch costs no compile and no Σ.
+        # Before the shared MPA planner opens the fit store, so a mismatch
+        # costs neither I/O nor a compile.
         assert_brackets_match_ols_abscissae(
             plan, s, meta=meta, where="ppm_pipeline plan seam")
         if plan.enabled:
@@ -633,46 +634,29 @@ def compute_ppm_sigma_pipeline(
             # should see before Σ is spent, not after.
             for note in plan.notes:
                 print_fn(f"  Σc band extrapolation: {note}")
-        with timing.section("sigma.compile"):
-            sigma_xi = sigma_regularization_for_config(config)
-            precompile_sigma(
-                wfns, ppm, meta, mesh_xy,
-                brackets=plan.bounds,
-                energy_windows=hgl_partition_required(
-                    config.omega_grid_ry,
-                    sigma_xi.resolved_ry,
-                    config.sigma.window_edge_factor),
-            )
+        from .sigma_box_plan import resolve_sigma_box_cache_dir
+        quadrature_cache_dir = resolve_sigma_box_cache_dir(
+            config.sigma.quadrature_cache_dir, config.input_dir)
+        fit_dir = os.path.join(config.input_dir, "tmp", "mpa")
+        if process_rank() == 0:
+            os.makedirs(fit_dir, exist_ok=True)
+        barrier("ppm_mpa_fit_directory_ready")
+        fit_store_path = os.path.join(fit_dir, "mpa_fit_oneshot.h5")
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
                 ppm_cfg=config.ppm,
                 sigma_cfg=config.sigma,
-                quad=config.sigma_quadrature_config,
+                mpa_cfg=config.mpa,
                 omega_grid_ry=config.omega_grid_ry,
                 ansatz=config.compute_mode,
+                fit_store_path=fit_store_path,
+                screening_diagrams=config.screening.diagrams,
+                quadrature_cache_dir=quadrature_cache_dir,
                 occupation_state=occupation_state,
                 plan=plan,
                 print_fn=print_fn,
             )
-        sigma_omega_even = None
-        if ppm.B_odd_q is not None:
-            # Sigma is linear in the fitted residue.  Reusing the identical
-            # compiled contraction with D=0 gives the exact per-state odd
-            # contribution by subtraction, without introducing a second
-            # parser or a diagnostic-only approximation to the kernel.
-            with timing.section("sigma.exec.odd_reference"):
-                sigma_omega_even = compute_sigma_c_ppm_omega_grid(
-                    wfns, replace(ppm, B_odd_q=None), meta, mesh_xy,
-                    ppm_cfg=config.ppm,
-                    sigma_cfg=config.sigma,
-                    quad=config.sigma_quadrature_config,
-                    omega_grid_ry=config.omega_grid_ry,
-                    ansatz=config.compute_mode,
-                    occupation_state=occupation_state,
-                    plan=plan,
-                    print_fn=lambda *args, **kwargs: None,
-                )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries
         # the leading band-count axis; everything downstream of this line —
         # the head injection, the eqp interpolation, sigma_mnk.h5, the QSGW
@@ -695,11 +679,10 @@ def compute_ppm_sigma_pipeline(
         sigma_c_body_omega = sigma_c_body_omega_n3
         sigma_c_body_omega_unextrap = None
         sigma_c_odd_body_omega = None
-        if sigma_omega_even is not None:
-            even_n3 = _band_count_point(
-                sigma_omega_even.sigma_c_kij,
-                sigma_omega_even.sigma_c_kij.shape[0] - 1)
-            sigma_c_odd_body_omega = sigma_c_body_omega_n3 - even_n3
+        if sigma_omega.sigma_c_odd_kij is not None:
+            sigma_c_odd_body_omega = _band_count_point(
+                sigma_omega.sigma_c_odd_kij,
+                sigma_omega.sigma_c_odd_kij.shape[0] - 1)
 
         # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
