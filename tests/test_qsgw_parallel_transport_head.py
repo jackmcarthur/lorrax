@@ -35,6 +35,7 @@ from gw.qsgw_head import (
     static_gauge_first_order_component_sharded,
     static_gauge_second_order_component_sharded,
 )
+from gw.head_correction import static_hall_linear_response
 
 jax.config.update("jax_enable_x64", True)
 
@@ -785,6 +786,40 @@ def test_raw_hall_matches_orbital_cB_owner_and_documented_sign():
     np.testing.assert_allclose(got, expected, rtol=3e-14, atol=3e-14)
     # Red twin: omitting the occupied-Berry minus is an observable sign flip.
     assert np.max(np.abs(got - (-expected))) > 1.0e-10
+
+    # Name both orientations explicitly.  Hall sums occupied bra (v,c),
+    # whereas the live AW kernel energy-orders bra (c,v) and conjugates that
+    # row.  Hermiticity makes the products equal, but the persisted Hall
+    # tensor carries the occupied-Berry minus.  Its CT insertion therefore
+    # needs the second minus.
+    delta = energies[:, :, None] - energies[:, None, :]
+    separated = np.abs(delta) > 1.0e-10
+    inv_delta2 = np.where(
+        separated, 1.0 / np.square(np.where(separated, delta, 1.0)), 0.0)
+    gamma_dir = np.transpose(gamma_raw, (1, 0, 2, 3))
+    p_charge = gamma_dir[:2] / HALFALPHA
+    F = 2.0 * capacity / (volume * nk)
+    hall_occupied_bra = -F * np.imag(np.einsum(
+        "aknm,iknm,knm->ai", p_charge, np.conj(gamma_dir),
+        occupations[:, :, None] * inv_delta2, optimize=True))
+    axes = np.eye(3, dtype=np.float64)[:2]
+    hall_from_sigma = np.stack(
+        [np.cross(got, axis) for axis in axes], axis=0)
+    np.testing.assert_allclose(
+        hall_from_sigma, hall_occupied_bra, rtol=3e-14, atol=3e-14)
+
+    f_diff = occupations[:, None, :] - occupations[:, :, None]
+    energy_ordered = delta > 0.0
+    direct_aw = F * np.imag(np.einsum(
+        "aknm,iknm,knm->ai", np.conj(p_charge), gamma_dir,
+        np.where(energy_ordered, f_diff * inv_delta2, 0.0),
+        optimize=True))
+    np.testing.assert_allclose(
+        direct_aw, -hall_occupied_bra, rtol=3e-14, atol=3e-14)
+    inserted = np.asarray(static_hall_linear_response(got))[:, 0, 1:].imag
+    np.testing.assert_allclose(
+        inserted, direct_aw, rtol=3e-14, atol=3e-14)
+    assert np.max(np.abs((-inserted) - direct_aw)) > 1.0e-10
 
 
 def test_raw_hall_fractional_occupations_and_degeneracy_refusal():

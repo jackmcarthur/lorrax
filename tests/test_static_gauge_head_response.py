@@ -69,8 +69,8 @@ def test_hall_builder_has_only_transverse_ct_tc_and_fixed_sign():
     np.testing.assert_array_equal(H[:, 0, 0], 0.0)
     np.testing.assert_array_equal(H[:, 1:, 1:], 0.0)
     np.testing.assert_allclose(H, np.conj(np.swapaxes(H, 1, 2)))
-    np.testing.assert_allclose(H[0, 0, 2], 1j * sigma[2])
-    np.testing.assert_allclose(H[1, 0, 1], -1j * sigma[2])
+    np.testing.assert_allclose(H[0, 0, 2], -1j * sigma[2])
+    np.testing.assert_allclose(H[1, 0, 1], 1j * sigma[2])
 
     q = np.asarray((0.23, -0.41))
     Pi = np.einsum("a,aij->ij", q, H)

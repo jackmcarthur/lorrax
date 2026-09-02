@@ -162,6 +162,8 @@ _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX = 1.0e-10
 def static_hall_linear_response(sigma_H) -> jax.Array:
     r"""Return the unique static Hall-only linear CT/TC tensor.
 
+    ``Pi_H[0,i](q) = -i epsilon[b,a,i] sigma_H[b] q[a]`` for the persisted
+    occupied-bra Berry ``sigma_H``; ``TC = CT^dagger``.
     The result has shape ``(2,4,4)`` with coordinate index ``a=(x,y)``.
     Charge is Lorentz row/column zero and currents are columns/rows 1:4.
     Every CC and TT entry is exactly zero; TC is the Hermitian conjugate of
@@ -181,8 +183,15 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
             "imaginary component")
     sigma = np.asarray(np.real(sigma_raw), dtype=np.float64)
     axes = np.eye(3, dtype=np.float64)[:2]
-    # epsilon[b,a,i] sigma[b] = (sigma x e_a)[i].
-    ct = 1j * np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
+    # epsilon[b,a,i] sigma[b] = (sigma x e_a)[i].  The minus is fixed by the
+    # live band orientation P=-Delta*D: the direct Adler--Wiser response
+    # energy-orders the bra and conjugates the row, so its linear CT
+    # imaginary part is the NEGATIVE of the persisted occupied-bra Berry
+    # tensor that sigma_H stores (register row "Hall CT/TC block is inserted
+    # with the wrong sign", taken from 7d7df280; the oracle is
+    # tests/test_qsgw_parallel_transport_head.py::
+    # test_raw_hall_matches_orbital_cB_owner_and_documented_sign).
+    ct = -1j * np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
     linear = np.zeros((2, 4, 4), dtype=np.complex128)
     linear[:, 0, 1:] = ct
     linear[:, 1:, 0] = np.conj(ct)

@@ -54,7 +54,9 @@ def _hall_numpy(sigma_h):
     out = np.zeros((2, 4, 4), dtype=np.complex128)
     for a in range(2):
         for i in range(3):
-            value = 1j * sum(
+            # -i: the persisted sigma_H is the occupied-bra Berry sum and
+            # the live response is energy-ordered (head_correction owner).
+            value = -1j * sum(
                 _levi_civita(b, a, i) * sigma_h[b] for b in range(3))
             out[a, 0, i + 1] = value
             out[a, i + 1, 0] = np.conj(value)

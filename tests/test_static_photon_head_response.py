@@ -139,8 +139,8 @@ def test_producer_with_hall_artifact_has_only_declared_support(monkeypatch):
     np.testing.assert_array_equal(pi1[:, 0, 0], np.zeros(2))
     np.testing.assert_array_equal(pi1[:, 1:, 1:], np.zeros((2, 3, 3)))
     np.testing.assert_array_equal(pi1[:, 1:, 0], np.conj(pi1[:, 0, 1:]))
-    assert pi1[0, 0, 2] == -2.0j
-    assert pi1[1, 0, 1] == 2.0j
+    assert pi1[0, 0, 2] == 2.0j
+    assert pi1[1, 0, 1] == -2.0j
 
 
 def test_producer_without_hall_artifact_uses_sigma_h_zero(monkeypatch):
