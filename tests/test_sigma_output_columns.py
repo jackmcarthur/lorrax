@@ -182,3 +182,20 @@ def test_lorentz_column_closure_refuses_a_bad_decomposition(tmp_path):
             sigma_coh_kij_eV=_diag_array(values),
             sigma_lorentz_skn_eV=bad,
             kpoints_crys=KPTS)
+
+
+def test_z_column_records_raw_value_and_state_local_fallback(tmp_path):
+    out = tmp_path / "z_status.dat"
+    z = np.full((NK, NB), 0.8)
+    bad = np.zeros((NK, NB), dtype=bool)
+    z[1, 2] = -55.8582348939
+    bad[1, 2] = True
+    write_sigma_to_file(
+        _diag_array(np.zeros((NK, NB))), filename=str(out),
+        kpoints_crys=KPTS, z_factor_kn=z, z_pathological_kn=bad)
+    rows = _rows(out)
+    assert sum("Z_status=PATHOLOGICAL_EQP1_FALLBACK" in row
+               for row in rows) == 1
+    assert "Z=  -55.858235" in rows[NB + 2]
+    assert all("Z_status=OK" in row for i, row in enumerate(rows)
+               if i != NB + 2)
