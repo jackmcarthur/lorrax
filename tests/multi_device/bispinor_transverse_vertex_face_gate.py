@@ -47,8 +47,10 @@ Checks:
      literal ordered-band-pair NumPy oracle on deterministic complex
      broken-TR states.  Longitudinal and transverse centroid extents differ,
      so CT/TC reverse axes cannot pass by an accidental square transpose.
-     The combined tensor is Hermitian per q and exactly q-reciprocal; a
-     distinct-but-value-identical CC endpoint matches scalar charge.
+     The same oracle gates the fused packed response in its full and universal
+     batch-reshard routes, including packed/block sharding before any gather.
+     Streamed arithmetic has tolerance parity; the naturally nonstreaming
+     fused CC fixture matches scalar charge bit for bit.
 
 Run:
     lx run -N 1 -G 4 -n 4 bash <pythonpath-wrapper> python3 -u \\
@@ -327,15 +329,17 @@ def check_sigma_sx_chain_face_matches_legacy(
 
 def check_four_current_ordered_pair_all16(
         mesh, dtype="complex128", *, nk=3, nb=4, n_c=6, n_t=8,
-        spin_pair_stream=None, distrib_la_batched_route="auto"):
+        spin_pair_stream=None, distrib_la_batched_route="auto", fused=False):
     """Discriminate AB/BA, q/-q, and rectangular CT/TC orientations."""
     import jax
     from types import SimpleNamespace
 
     from symmetry_maps import q_negation_index
     from gw import w_isdf
+    from gw.photon_layout import PhotonBasisLayout, photon_block_view
     from gw.wavefunction_bundle import (
-        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
+        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC,
+        face_kernel_kwargs)
 
     if dtype != "complex128":
         raise ValueError("four-current ordered-pair gate requires complex128")
@@ -364,6 +368,11 @@ def check_four_current_ordered_pair_all16(
         tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
     meta = SimpleNamespace(nkx=nk, nky=1, nkz=1, nk_tot=nk)
 
+    if fused and spin_pair_stream is not None:
+        raise ValueError(
+            "fused response owns its per-family stream decision")
+
+    oracle_blocks = {}
     got_blocks = {}
     worst_oracle = 0.0
     for A in range(4):
@@ -372,11 +381,6 @@ def check_four_current_ordered_pair_all16(
         for B in range(4):
             gamma_b = _gamma_full(B)
             psi_b = psi_families[B]
-            got = _gather(w_isdf.compute_no_pair_dirac_current_block(
-                families[A], families[B], quad, meta, mesh,
-                vertex_left=A, vertex_right=B,
-                spin_pair_stream=spin_pair_stream,
-                distrib_la_batched_route=distrib_la_batched_route))
             want = np.zeros(
                 (nk, extents[A], extents[B]), dtype=np.complex128)
             for q in range(nk):
@@ -405,18 +409,62 @@ def check_four_current_ordered_pair_all16(
                                 left_vc[:, None] * right_vc[None, :]
                                 + left_cv[:, None] * right_cv[None, :]
                             ) / np.sqrt(float(nk))
-            err = _rel(got, want)
-            worst_oracle = max(worst_oracle, err)
-            assert err < RTOL, (
-                f"four-current ({A},{B}) ordered-pair rel err {err:.3e}")
-            got_blocks[A, B] = got
+            oracle_blocks[A, B] = want
+
+            if not fused:
+                got = _gather(w_isdf.compute_no_pair_dirac_current_block(
+                    families[A], families[B], quad, meta, mesh,
+                    vertex_left=A, vertex_right=B,
+                    spin_pair_stream=spin_pair_stream,
+                    distrib_la_batched_route=distrib_la_batched_route))
+                err = _rel(got, want)
+                worst_oracle = max(worst_oracle, err)
+                assert err < RTOL, (
+                    f"four-current ({A},{B}) ordered-pair rel err {err:.3e}")
+                got_blocks[A, B] = got
+
+    fused_cc_bit_equal = None
+    if fused:
+        from jax.sharding import NamedSharding, PartitionSpec as P
+
+        layout = PhotonBasisLayout.from_centroid_extents(n_c, n_t, mesh)
+        assert layout.padded_extent(0) == n_c
+        assert layout.padded_extent(1) == n_t
+        packed = w_isdf.compute_experimental_no_pair_photon_chi0(
+            wfns_c, wfns_t, quad, meta, mesh, layout,
+            distrib_la_batched_route=distrib_la_batched_route)
+        expected_sharding = NamedSharding(mesh, P(None, "x", "y"))
+        assert packed.sharding.is_equivalent_to(
+            expected_sharding, packed.ndim), (
+                f"fused packed response sharding {packed.sharding}")
+        for A in range(4):
+            for B in range(4):
+                block = photon_block_view(packed, layout, A, B, mesh)
+                assert block.sharding.is_equivalent_to(
+                    expected_sharding, block.ndim), (
+                        f"fused block ({A},{B}) sharding {block.sharding}")
+                got = _gather(block)
+                want = oracle_blocks[A, B]
+                if A and B:
+                    want = want - want[0:1]
+                    want[0] = 0
+                err = _rel(got, want)
+                worst_oracle = max(worst_oracle, err)
+                assert err < RTOL, (
+                    f"fused four-current ({A},{B}) ordered-pair rel err "
+                    f"{err:.3e}")
+                got_blocks[A, B] = got
 
     combined = np.zeros(
         (nk, int(offsets[-1]), int(offsets[-1])), dtype=np.complex128)
+    # The Ward TT contact is an independently gated approximation.  Check
+    # the exact bubble's symmetry here; fused TT values were checked against
+    # the same oracle after applying the production contact above.
+    symmetry_blocks = oracle_blocks if fused else got_blocks
     for A in range(4):
         for B in range(4):
             combined[:, offsets[A]:offsets[A + 1],
-                     offsets[B]:offsets[B + 1]] = got_blocks[A, B]
+                     offsets[B]:offsets[B + 1]] = symmetry_blocks[A, B]
     scale = max(float(np.max(np.abs(combined))), 1e-300)
     herm = max(float(np.max(np.abs(row - row.conj().T)))
                for row in combined) / scale
@@ -450,12 +498,26 @@ def check_four_current_ordered_pair_all16(
             "distinct value-identical CC endpoints differ from charge SSOT: "
             f"rel={cc_rel:.3e}")
 
+    if fused:
+        charge_shape = face_kernel_kwargs(wfns_c)["face_shape"]
+        naturally_streamed = w_isdf._resolve_vertex_spin_pair_stream(
+            mesh, charge_shape, charge_shape, None)
+        assert not naturally_streamed, (
+            "tiny real-P4 fused CC fixture unexpectedly selected streaming; "
+            "bit equality is only a nonstream contract")
+        fused_cc = got_blocks[0, 0]
+        fused_cc_bit_equal = bool(np.array_equal(fused_cc, cc_charge))
+        assert fused_cc_bit_equal, (
+            "naturally nonstreamed fused CC differs from charge SSOT: "
+            f"rel={_rel(fused_cc, cc_charge):.3e}")
+
     return {
         "all16_worst_rel": worst_oracle,
         "combined_hermiticity": herm,
         "q_reciprocity": reciprocity,
         "distinct_cc_bit_equal": bool(np.array_equal(cc_distinct, cc_charge)),
         "distinct_cc_rel": cc_rel,
+        "fused_cc_bit_equal": fused_cc_bit_equal,
     }
 
 
@@ -480,7 +542,14 @@ _CLI_CELLS = (
             mesh, dt, spin_pair_stream=True))),
        ("four_current_batch_reshard_all16",
         (lambda mesh, dt: check_four_current_ordered_pair_all16(
-            mesh, dt, distrib_la_batched_route="batch_reshard")))]
+            mesh, dt, distrib_la_batched_route="batch_reshard"))),
+       ("fused_photon_full_all16",
+        (lambda mesh, dt: check_four_current_ordered_pair_all16(
+            mesh, dt, n_c=8, n_t=12, fused=True))),
+       ("fused_photon_batch_reshard_all16",
+        (lambda mesh, dt: check_four_current_ordered_pair_all16(
+            mesh, dt, n_c=8, n_t=12, fused=True,
+            distrib_la_batched_route="batch_reshard")))]
 )
 
 
