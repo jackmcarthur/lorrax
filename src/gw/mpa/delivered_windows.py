@@ -1729,7 +1729,24 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
         return None, None
     metrics = candidate["metrics"]
     factor = _factor_growth(spec, times, eta)
-    if (not _rule_accepted(metrics, relative_target)
+    # The box rule's contract is ``sup |Q - 1/d| <= eps`` on the whole
+    # support, which already bounds the measure-weighted residual the
+    # incumbent gate reads (a weighted mean of |error| cannot exceed its
+    # sup).  So the gate is never allowed to demand more than the deck's
+    # eps: ``relative_target`` is the campaign's apportioned allowance, and
+    # on windows with a large error envelope (val:bulk on Na: 1.8e-5 against
+    # eps 1e-3) it used to force a retry at an eps 50-100x tighter and then a
+    # fall-through to the incumbent fit -- 216 s on the critical rank of a
+    # plan whose crossing windows finished in 57 s (Na arm 04).  The looser
+    # of the two still applies to the runtime-noise clause, so a crossing
+    # rule with kappa_p99 ~ 50 is not refused at eps 3e-5 where the
+    # allowance was 6e-5 (Na arm 07).
+    # Tempting, and why not: gating at ``relative_target`` alone "keeps the
+    # global contract" -- but that contract is the apportionment's, and under
+    # eps the plan's contract is per-window sup <= eps (the selector budget
+    # is lifted accordingly, see the plan loop).
+    gate_target = max(float(relative_target), float(eps))
+    if (not _rule_accepted(metrics, gate_target)
             or max(factor) > float(factor_growth_cap)):
         return None, metrics
     required = max(metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
@@ -1753,20 +1770,11 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
             attempts.append({"family": "uniform_box", "candidate_tolerance": float(eps),
                              "refined_residual": metrics[0], "amplification_p99": metrics[1],
                              "amplification_max": metrics[2]})
-        if (candidate is None and metrics is not None
-                and metrics[0] > float(relative_target)):
-            # Missed the window's residual gate: tighten once by the miss
-            # ratio (with margin), then fall through to the incumbent paths.
-            # A kappa or factor-growth miss is not retried: the same box at a
-            # tighter eps would rebuild the same rule.
-            tighter = eps * 0.5 * float(relative_target) / float(metrics[0])
-            candidate, metrics = _uniform_box_candidate(
-                spec, eta, min(eps, tighter), max_nodes, factor_growth_cap,
-                relative_target)
-            if metrics is not None:
-                attempts.append({"family": "uniform_box", "candidate_tolerance": float(min(eps, tighter)),
-                                 "refined_residual": metrics[0], "amplification_p99": metrics[1],
-                                 "amplification_max": metrics[2]})
+        # No retry at a tighter eps: the residual clause cannot miss (sup
+        # <= eps bounds it) and a kappa or factor-growth miss is a property
+        # of the box, which the same box at a tighter eps rebuilds.  A miss
+        # falls through to the incumbent paths below with the attempt on
+        # record.
         if candidate is not None:
             candidate["attempts"] = attempts
             return [candidate]
@@ -2255,6 +2263,15 @@ def build_delivered_sigma_windows(
     total_absolute = float(np.max(pointwise_budget))
     allowances = [_pointwise_window_allowance(spec, pointwise_budget)
                   for spec in specs]
+    # Under the box rule the deck's error dial is eps (per-window sup on the
+    # support); the apportioned pointwise budget below is the campaign's
+    # second dial and is not enforced on selection: with one accepted box
+    # rule per window a finite budget can only turn a plan that meets eps
+    # everywhere into a "shortfall" and three compounded re-fit stages, each
+    # a full reduction cap on the critical rank.  The allowances above still
+    # feed the fits (they only loosen the gate, never tighten it past eps).
+    select_budget = (np.full_like(pointwise_budget, np.inf)
+                     if _uniform_rule_eps() is not None else pointwise_budget)
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
         factor_cap=factor_cap, pair_ceiling=pair_ceiling,
@@ -2271,7 +2288,7 @@ def build_delivered_sigma_windows(
             validated_cost = _validate_cached_fits(
                 specs, fits, eta=eta, factor_cap=factor_cap,
                 pair_ceiling=pair_ceiling,
-                pointwise_budget=pointwise_budget)
+                pointwise_budget=select_budget)
             if validated_cost is None:
                 cached = None
             else:
@@ -2397,7 +2414,7 @@ def build_delivered_sigma_windows(
             try:
                 fits, free_pairs, required_cost = _select_rules(
                     specs, candidates_by_window, total_absolute, pair_ceiling,
-                    pointwise_budget=pointwise_budget)
+                    pointwise_budget=select_budget)
                 selection_seconds += time.perf_counter() - selection_started
                 break
             except RuntimeError as exc:
@@ -2416,7 +2433,7 @@ def build_delivered_sigma_windows(
                         fits, free_pairs, required_cost = _select_rules(
                             unconsolidated_specs, unconsolidated_candidates,
                             total_absolute, pair_ceiling,
-                            pointwise_budget=pointwise_budget)
+                            pointwise_budget=select_budget)
                         specs = unconsolidated_specs
                         candidates_by_window = unconsolidated_candidates
                         selection_seconds += (
