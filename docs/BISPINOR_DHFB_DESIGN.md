@@ -261,6 +261,10 @@ correction the code applies, live in
 §2. This section keeps only the provenance measurements that page cites.
 Deck: MoS2 4×4, 402 charge + 143 transverse centroids, P=4, `sys_dim=2`,
 job 7885325 (Frontera; artifacts were machine-local and are not shipped).
+These are historical measurements of the former TT-slot overlay, not a
+current route claim: at `34228021` no deck key reaches that overlay, while
+the packed slab routes obtain `⟨D_TT⟩` from the coupled Γ completion. See the
+single [implementation-status statement](theory/four-current-head-corrections.md#four-current-phase-status).
 
 | quantity | value |
 |---|---|

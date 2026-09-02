@@ -175,7 +175,7 @@ coefficients are obtained, not this spatial contraction:
 | `cohsex` | static screened exchange plus Coulomb hole |
 | `gn_ppm` | one pole fixed by \(W(0)\) and \(W(i\omega_p)\); on a measured-broken-TR deck two Hermitian residues \(R_\pm=B\pm D\) from the Hermitian and anti-Hermitian parts of \(W(i\omega_p)\), \(R_+\) on the empty and \(R_-\) on the occupied branch ([derivation](../dev/notes/DERIVATION_gnppm_nonhermitian.md)) |
 | `hl_ppm` | one pole fixed by static screening and a sum rule |
-| `mpa` | several complex poles fitted from two sampling lines |
+| `mpa` | several complex poles fitted from two sampling lines; at `34228021` its contour completion is still time-reversal-symmetric and does not preserve the magnetic odd channel, so it is not a fallback for magnetic GN-PPM |
 
 The band projection is
 
@@ -190,6 +190,9 @@ $$
 Real or imaginary window projections must be applied before this band map
 unless the map is known to commute with that projection. In general
 \(K[\operatorname{Re}X]\ne\operatorname{Re}K[X]\).
+
+The four-current implementation phases and route boundary are stated once on
+[Four-current heads and frequency](four-current-head-corrections.md#four-current-phase-status).
 
 ## 6. Long-wavelength terms
 
@@ -248,9 +251,10 @@ I/O; no rank should materialize an \(N_\mu^2\) matrix merely to write or fit it.
 
 ## 9. Present validity boundary
 
-The mature static and PPM modes support the current insulating driver
-contracts. MPA components exist but its public mode remains refused pending a
-real-material disk-pipeline gate. Metallic sample geometries exist, but
+The mature static, PPM, and insulating MPA modes support their documented
+driver contracts. MPA remains on the incumbent four-current Sigma route and
+its contour completion does not preserve the magnetic odd residue. Metallic
+sample geometries exist, but
 fractional occupations, intraband response, and denominator cells that
 straddle zero still require explicit physics. A code path that lacks those
 terms must refuse rather than manufacture a gap or threshold occupations.

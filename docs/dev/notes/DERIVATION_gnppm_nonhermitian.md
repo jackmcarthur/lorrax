@@ -1,8 +1,8 @@
 # The GN plasmon-pole model from a non-Hermitian $W(i\omega_p)$
 
-**Scope.** Derivation memo for the time-reversal-broken (magnetic) GN-PPM,
-lane M of the bispinor campaign, 2026-09-01.  Owner target: "a correct GN-PPM
-model using the Hermitian and anti-Hermitian $i\omega_p$ components".  Sources:
+**Scope.** Derivation memo for the time-reversal-broken (magnetic) GN-PPM as
+implemented at `34228021`. The model uses the Hermitian and anti-Hermitian
+$i\omega_p$ components. Sources:
 `src/gw/w_isdf.py` (χ₀ kernels), `src/gw/minimax_screening.py` (the fit),
 `src/gw/ppm_sigma.py` / `ppm_accumulators.py` (the Σ windows), and
 `DERIVATION_channel_hermiticity.md` §1.3 (the crossing-closure premise).
@@ -47,7 +47,7 @@ magnet the odd bracket is the time-reversal-odd channel: anti-Hermitian, odd
 in the magnetisation, zero at $\omega=0$.  $W_q(z)=[1-V_q\chi^0_q(z)]^{-1}V_q$
 inherits every statement above ($V_q$ Hermitian, $V_{-q}=\overline{V_q}$).
 
-## 2. What the incumbent χ₀ route computes, and the one-line repair
+## 2. What the even route computes, and the ordered production route
 
 The Laplace kernel (`w_isdf._get_chi_minimax_kernel`, real τ) forms one
 orientation per node, $A_q(\tau)=\sum P^{\rm kern}_{q}\,e^{-\tau(\Delta-E_{\rm gap})}$,
@@ -55,16 +55,16 @@ where the kernel's own object is $P^{\rm kern}=|\overline{\psi_c}\psi_v\rangle\l
 (the oracle `_direct_node_sum` in `tests/test_chi_contour_kernel.py`), i.e. the
 $-\Delta$-pole orientation, and completes it as $A_q+\overline{A_{-q}}$
 (`_complete_static_vertex_orientations`) before weighting with the EVEN
-kernel $\alpha_l\approx x/(x^2+\omega_p^2)$.  Exact at $\omega=0$ and under
-$\Theta$; it deletes the odd bracket otherwise (lane G, measured).
+kernel $\alpha_l\approx x/(x^2+\omega_p^2)$. Exact at $\omega=0$ and under
+$\Theta$; it deletes the odd bracket otherwise.
 
 The `complex_contour` kernel (`compute_chi0_contour`, what MPA consumes)
 applies its two resolvent rows $-1/(\Delta\mp z)$ to the SAME single
 orientation $P^{\rm kern}$, so it is exactly the $\Theta$-symmetric form
 $\sum P^{\rm kern}\,2\Delta/(z^2-\Delta^2)$ as well.  **It does not carry the
-odd channel either** (KNOWN_LORRAX_ISSUES row, lane M).
+odd channel either**.
 
-The exact object is a linear combination of the same two carriers with
+The production non-TRS object is a linear combination of the same two carriers with
 independent complex weights.  With $\gamma_l\approx-1/(x+i\omega_p)$ fitted on
 $[x_{\min},x_{\max}]$ by real nodes,
 
@@ -169,5 +169,7 @@ incumbent single-residue fit on magnets (registered, not changed).
 
 *MPA.* Samples on complex lines need $\overline{F_{-q}(-\bar z)}$ at the
 reflected frequency, i.e. a sample set symmetric under $\omega\to-\omega$;
-the identity of §2 applies with that pairing.  Registered; not implemented
-here.
+the identity of §2 applies with that pairing. At `34228021` the MPA contour
+still applies both resolvent rows to one orientation and completes with the
+$\Theta$-symmetric conjugate, so it deletes the odd channel. It must not be
+used as a magnetic fallback.

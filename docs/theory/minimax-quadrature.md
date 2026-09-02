@@ -94,6 +94,10 @@ rule unchanged) and gated at the even rule's error; measured 2026-09-01 the
 even nodes alone stall at \(10^{-3}\)–\(10^{-5}\) and one to five extras
 reach \(10^{-6}\). Owner: `minimax_screening.solve_laplace_minimax_imag_interval(with_odd_kernel=True)`;
 physics in [`DERIVATION_gnppm_nonhermitian.md`](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+This quadrature supplies the ordered probe only. The fit owner forms the
+Hermitian `B` and odd Hermitian `D`, and the Sigma owner selects `B+D` for
+empty/conduction branches and `B-D` for occupied/valence branches; the
+quadrature service does not choose a residue.
 
 ## 3. Real-frequency PPM windows
 
