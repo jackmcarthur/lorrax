@@ -76,6 +76,83 @@ def test_isometric_lift_preserves_each_g_point_norm():
     np.testing.assert_allclose(lifted_norm, source_norm, rtol=3e-15, atol=3e-15)
 
 
+def test_isometric_endpoint_jet_is_the_analytic_r_product_rule():
+    source = _large_spinors()[:1]
+    K = np.asarray([[
+        [0.19, -0.17, 0.12],
+        [1.21, 0.08, -0.36],
+        [-0.11, -0.93, 1.04],
+    ]])
+    endpoint = lift_to_4spinor(
+        jnp.asarray(source), jnp.asarray(K), jnp.zeros((1, 3)),
+        jnp.eye(3), representation=ISOMETRIC_KINETIC_BALANCE_LIFT)
+    lifted, d1 = kinetic_balance_lift_jet(
+        endpoint[:, :, :2], jnp.asarray(K),
+        representation=ISOMETRIC_KINETIC_BALANCE_LIFT)
+    np.testing.assert_allclose(lifted, endpoint, rtol=0.0, atol=2.0e-15)
+
+    h = HALFALPHA
+    h2 = h * h
+    sigma_K = np.einsum(
+        "aij,kga,kbjg->kbig", _PAULI, K, source, optimize=True)
+    raw_lift = np.concatenate((source, h * sigma_K), axis=2)
+    r = 1.0 / np.sqrt(1.0 + h2 * np.sum(K * K, axis=-1))
+    raw_d1 = []
+    for a in range(3):
+        small = h * np.einsum(
+            "ij,kbjg->kbig", _PAULI[a], source, optimize=True)
+        raw_d1.append(np.concatenate((np.zeros_like(small), small), axis=2))
+
+    for a in range(3):
+        r_a = -h2 * K[..., a] * r**3
+        expected_d1 = (
+            r_a[:, None, None, :] * raw_lift
+            + r[:, None, None, :] * raw_d1[a])
+        selected = kinetic_balance_lift_jet(
+            endpoint[:, :, :2], jnp.asarray(K),
+            representation=ISOMETRIC_KINETIC_BALANCE_LIFT,
+            cartesian_K_derivative_axes=(a,))
+        np.testing.assert_allclose(
+            selected, expected_d1, rtol=3.0e-15, atol=3.0e-15)
+        np.testing.assert_allclose(
+            d1[a], expected_d1, rtol=3.0e-15, atol=3.0e-15)
+
+        for b in range(3):
+            r_b = -h2 * K[..., b] * r**3
+            r_ab = (
+                -h2 * float(a == b) * r**3
+                + 3.0 * h2 * h2 * K[..., a] * K[..., b] * r**5)
+            expected_d2 = (
+                r_ab[:, None, None, :] * raw_lift
+                + r_a[:, None, None, :] * raw_d1[b]
+                + r_b[:, None, None, :] * raw_d1[a])
+            selected_d2 = kinetic_balance_lift_jet(
+                endpoint[:, :, :2], jnp.asarray(K),
+                representation=ISOMETRIC_KINETIC_BALANCE_LIFT,
+                cartesian_K_derivative_axes=(a, b))
+            np.testing.assert_allclose(
+                selected_d2, expected_d2, rtol=4.0e-15, atol=4.0e-15)
+
+
+def test_raw_endpoint_default_and_selected_families_remain_exactly_affine():
+    psi = jnp.asarray(_large_spinors()[:1])
+    K = jnp.asarray([[
+        [0.19, -0.17, 0.12],
+        [1.21, 0.08, -0.36],
+        [-0.11, -0.93, 1.04],
+    ]])
+    _, default_d1 = kinetic_balance_lift_jet(psi, K)
+    for a in range(3):
+        np.testing.assert_allclose(
+            kinetic_balance_lift_jet(
+                psi, K, cartesian_K_derivative_axes=(a,)),
+            default_d1[a], rtol=0.0, atol=0.0)
+        np.testing.assert_array_equal(
+            kinetic_balance_lift_jet(
+                psi, K, cartesian_K_derivative_axes=(a, a)),
+            np.zeros_like(np.asarray(default_d1[a])))
+
+
 @pytest.mark.parametrize("at_origin", [False, True])
 def test_lift_jet_is_the_cartesian_finite_difference_of_existing_lift(
         at_origin):
