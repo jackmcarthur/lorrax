@@ -21,8 +21,13 @@ current density `ψ†α^iψ`).
 | charge exchange `Σ_X` (CC) | none | `⟨v⟩_mBZ`, band-diagonal (§3.1) | every mode | production |
 | charge correlation `Σ_SX+Σ_COH` / `Σ_c(ω)` (CC) | static, GN-PPM (two samples), HL-PPM, MPA | scalar `W_h(ω)` from `S_eff(ω)` (§3) | `head_correction = full` | production |
 | bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | `−⟨v P^T⟩_mBZ` tensor slot (§2) | `bispinor_tt_head_correction = true` | implemented, default off |
-| screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | none (`full_static_cohsex`) or charge CC `q²` + Hall CT/TC `q¹` (`charge_hall_cubature`, §4) | `bispinor_gw = full_static_cohsex \| charge_hall_cubature` | experimental, insulating slab, one shot |
+| screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | none (`full_static_cohsex`, headless by envelope: a defect under the [2026-09-01 ruling](../architecture/decisions.md)) or charge CC `q²` + Hall CT/TC `q¹` (`charge_hall_cubature`, §4) | `bispinor_gw = full_static_cohsex \| charge_hall_cubature` | experimental, insulating slab, one shot |
 | retarded / dynamic photon `D^{IJ}(ω)` | — | — | none | **does not exist** |
+
+Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
+with bispinors always carries the Γ-cell head; `head_correction = off` is a
+debug setting. A mode whose envelope forbids the head is a defect, not a
+calculation.
 
 Two facts follow from the table and are easy to miss:
 
