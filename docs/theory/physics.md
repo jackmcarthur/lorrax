@@ -122,6 +122,17 @@ then contracts their lattice transforms. Static and GN-PPM rules are described
 in [Minimax quadrature](minimax-quadrature.md); complex MPA samples are
 described in [Multipole frequency integration](THEORY_mpa_implementation.md).
 
+Without time reversal the two ordered particle-hole orientations of the
+bracket above carry different residues — the \(+\Delta\) pole the object built
+from \(\overline{\psi_v}\psi_c\), the \(-\Delta\) pole the conjugate of the
+\(-\mathbf q\) forward object — so \(\chi^0_q(i\omega)\) has an anti-Hermitian,
+magnetisation-odd part that vanishes only at \(\omega=0\). The production
+imaginary-axis route keeps it by weighting the two orientations
+independently, \(\chi^0_q(i\omega_p)=F_q+\overline{F_{-q}}\), on a
+measured-broken-TR deck only; the derivation, the two-residue plasmon-pole
+model it feeds and the Σ assignment are
+[`docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+
 Screening follows from the Dyson equation
 
 $$
@@ -162,7 +173,7 @@ coefficients are obtained, not this spatial contraction:
 |---|---|
 | `x_only` | bare exchange |
 | `cohsex` | static screened exchange plus Coulomb hole |
-| `gn_ppm` | one pole fixed by \(W(0)\) and \(W(i\omega_p)\) |
+| `gn_ppm` | one pole fixed by \(W(0)\) and \(W(i\omega_p)\); on a measured-broken-TR deck two Hermitian residues \(R_\pm=B\pm D\) from the Hermitian and anti-Hermitian parts of \(W(i\omega_p)\), \(R_+\) on the empty and \(R_-\) on the occupied branch ([derivation](../dev/notes/DERIVATION_gnppm_nonhermitian.md)) |
 | `hl_ppm` | one pole fixed by static screening and a sum rule |
 | `mpa` | several complex poles fitted from two sampling lines |
 
