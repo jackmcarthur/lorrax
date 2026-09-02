@@ -238,8 +238,10 @@ ROTATED_TO_DFT_FIELDS = (
 #: element-wise.  ``e_eval_ev`` is the spectrum used by the QSGW ansatz in
 #: the last map's QP basis; it is output provenance rather than an operator.
 SIGMA_BASIS_FIELDS = (
-    "sigma_c_omega_kij_ry",
-    "sigma_c_at_dft_diag_ev",
+    # The even cube and its DFT diagonal live in ROTATED_TO_DFT_FIELDS: the
+    # self-consistent loop rotates the cube (sc_iteration._rotate_sigma_omega_cube)
+    # and rebuilds the diagonal from it.  The odd diagonal (measured-broken-TR
+    # GN decks only) is evaluated once at the DFT states and never rotated.
     "sigma_c_odd_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",
