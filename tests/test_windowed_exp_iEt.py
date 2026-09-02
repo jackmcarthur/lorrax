@@ -314,3 +314,26 @@ def test_build_G_tau_forwards_layout_and_gemm_to_build_G():
     with pytest.raises(ValueError, match="gemm"):
         build_G_tau(jnp.zeros((2, 1, 1, 3)), jnp.zeros((2, 3, 1, 1)),
                    enk, 1.0, layout="face")
+
+
+def test_build_G_and_tau_apply_parent_unfold_after_the_only_contraction():
+    class ParentRows:
+        @staticmethod
+        def unfold_operator(operator):
+            return operator[jnp.asarray([1, 0, 1])]
+
+    xn = jnp.asarray(np.arange(2 * 1 * 2 * 3).reshape(2, 1, 2, 3)
+                     + 1j)
+    yr = jnp.asarray(np.arange(2 * 3 * 1 * 2).reshape(2, 3, 1, 2)
+                     - 2j)
+    parent = build_G(xn, yr)
+    got = build_G(xn, yr, k_unfold_plan=ParentRows())
+    np.testing.assert_array_equal(np.asarray(got),
+                                  np.asarray(parent)[[1, 0, 1]])
+
+    energy = jnp.asarray([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    parent_tau = build_G_tau(xn, yr, energy, 0.7)
+    got_tau = build_G_tau(
+        xn, yr, energy, 0.7, k_unfold_plan=ParentRows())
+    np.testing.assert_array_equal(np.asarray(got_tau),
+                                  np.asarray(parent_tau)[[1, 0, 1]])

@@ -188,7 +188,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
 
 
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
-           gemm=None):
+           gemm=None, k_unfold_plan=None):
     """Build G_μν(k).
 
     ``layout='legacy'`` (default): returns (nk, s, μ_X, s, μ_Y) flat-k,
@@ -202,17 +202,32 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
     layout).  ``gemm`` (a ``distrib_la.GemmPlan``) is then required.  See
     the module docstring for the GEMM-seam design and
     :func:`_build_G_face` for the operand contract.
+
+    ``k_unfold_plan`` is an optional
+    :class:`gw.centroid_k_unfold.CentroidKUnfoldPlan`.  When present, the
+    operands and band weights are on raw WFN parent k rows; this function
+    performs the same contraction once per parent and asks the authenticated
+    plan to transport the completed operator to full k.  No symmetry algebra
+    or second Green implementation lives here.
     """
     if layout == 'legacy':
-        return _build_G_legacy(psi_xn, psi_yr, Gij=Gij, phases=phases)
-    if layout != 'face':
+        G = _build_G_legacy(psi_xn, psi_yr, Gij=Gij, phases=phases)
+    elif layout != 'face':
         raise ValueError(f"build_G: layout must be 'legacy' or 'face', got {layout!r}")
-    if gemm is None:
-        raise ValueError(
-            "build_G(layout='face') requires gemm=<distrib_la.GemmPlan>, "
-            "built ONCE outside this call (see distrib_la.gemm_plan and "
-            "this module's docstring) — never resolved here.")
-    return _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
+    else:
+        if gemm is None:
+            raise ValueError(
+                "build_G(layout='face') requires gemm=<distrib_la.GemmPlan>, "
+                "built ONCE outside this call (see distrib_la.gemm_plan and "
+                "this module's docstring) — never resolved here.")
+        G = _build_G_face(
+            psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
+    if k_unfold_plan is not None:
+        # The contraction above remains the sole Green-function builder.
+        # A CentroidKUnfoldPlan merely changes its k input from full children
+        # to raw parents and transports the completed two-endpoint operator.
+        G = k_unfold_plan.unfold_operator(G)
+    return G
 
 
 def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
@@ -294,7 +309,7 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
 
 def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
-                layout='legacy', gemm=None):
+                layout='legacy', gemm=None, k_unfold_plan=None):
     """G(t)_k(μ, ν) = Σ_n ψ_n(μ) · exp(-t · (e_n - e_ref)) · ψ_n*(ν).
 
     Unified time-evolution G builder shared by χ₀ (imaginary-time) and
@@ -327,7 +342,7 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                  stays out of windowed_exp_iEt so that helper remains the
                  fused phase/window primitive.  Weights are never
                  square-rooted or clipped.
-    layout, gemm: forwarded verbatim to :func:`build_G` — see its
+    layout, gemm, k_unfold_plan: forwarded verbatim to :func:`build_G` — see its
                  docstring.  Under ``layout='face'`` ``enk``/``mask``/
                  ``band_weight`` are expected at the FULL [b0,b4) extent
                  (``Wavefunctions.band_mask`` is the bring-up helper for
@@ -353,4 +368,6 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-    return build_G(psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm)
+    return build_G(
+        psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
+        k_unfold_plan=k_unfold_plan)
