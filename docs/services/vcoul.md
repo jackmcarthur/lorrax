@@ -80,11 +80,15 @@ private copy of it. `minibz_voronoi_batches`, `minibz_average` and
 `minibz_moment_tensor` (`⟨v q_a q_b⟩`) and `minibz_transverse_head_avg`
 (`⟨v (δ_ab − q̂_a q̂_b)⟩`, the bare TT head) are the same draw and the same
 two estimator branches with a tensor weight; `slab_minibz_photon_cubature`
-is the separate exact Wigner–Seitz polygon rule the packed photon head
-uses (`head_correction.complete_static_slab_photon_q0` is its only caller).
+is the exact Wigner–Seitz polygon rule — **the one q→0 cell-average owner
+for the slab**, with two callers: the packed photon head
+(`head_correction.complete_static_slab_photon_q0`) and, since 2026-09-01,
+the scalar charge head `Slab2D.q0_average` (see below).
 The kernel-facing spelling of the TT estimator is
 `Bulk3D`/`Slab2D`.`q0_average_transverse_tensor`, which is what
-`gw/v_q_bispinor.py` calls to value the bare TT Γ-head slot. Physics owner
+`gw/v_q_bispinor.py` calls to value the bare TT Γ-head slot; it is still
+on the Sobol draw and is **not** covered by that owner (registered).
+Physics owner
 for all of them: `docs/theory/four-current-head-corrections.md`; how they
 are wired into the four-current pipeline:
 [`architecture/four_current_wiring.md`](../architecture/four_current_wiring.md);
@@ -114,6 +118,55 @@ else's rank-1 term — except in the 0-D box, where the truncated `v(G=0)`
 is finite and *is* the head. `Box0D` refuses `v(q+G)` at `q ≠ 0` rather
 than serving the q=0 answer, because a box deck is Γ-only and a finite-q
 request means the k-grid is wrong, not the kernel.
+
+### One q→0 cell-average rule per dimension, named (2026-09-01)
+
+`Slab2D.q0_average` takes a `rule` selection with no silent alternative:
+
+| `rule` | what it is | default |
+|---|---|---|
+| `Q0_RULE_EXACT` = `"wigner_seitz_polygon"` | the exact mini-lattice Wigner–Seitz polygon, Γ-to-edge Duffy triangulation, fixed 16/24/32 Gauss–Legendre ladder — `slab_minibz_photon_cubature`'s own receipt | **yes** |
+| `Q0_RULE_SOBOL_DEBUG` = `"sobol_debug"` | the superseded scrambled-Sobol Voronoi draw, kept verbatim so its numbers stay reproducible | no; DEBUG only, announces itself |
+
+The scalar charge head and the packed bispinor Γ completion therefore
+reduce the **same** nodes, weights and kernel values: measured on the
+MoS2 3×3 deck geometry, `⟨v⟩` from `Slab2D.q0_average` and `⟨v⟩` from
+`complete_static_slab_photon_q0`'s own `static_slab_photon_head_moment_chunk`
+reduction agree to `2.274e-13`, and the screened companion
+`⟨v/(1 − v qᵀSq)⟩` to `0.000e+00`
+(`runs/MoS2/08_bisp_k_head_quadrature_20260901/head_owner_check.json`).
+Before this, the two disagreed by 0.16 % of `⟨v⟩` — the Sobol estimator's
+deterministic-per-seed sampling error on the `|q|` cusp — which was
++5.72 meV on every occupied state's SX+COH
+(`reports/bisp_j_architecture_review_2026-09-01/report.md` §4,
+claim 0586) and about half the scalar route's disagreement with
+BerkeleyGW (claim 582).
+
+Consequences a caller sees:
+
+* `nsamples`, `method` and `qmc_reps` are the `sobol_debug` rule's dials
+  and select nothing under the production rule, which is exact and has no
+  order knob. The deck-facing wrappers (`gw.vcoul.compute_q0_averages`,
+  `gw.head_densify.gamma_cell_head_scalar`) still thread their historical
+  values through; on a slab they are inert, and both docstrings say so.
+* `analytic_sphere` — the deck key `head_minibz_average` — is **refused**
+  on the slab rather than ignored (`GATE
+  slab_q0_analytic_sphere_unavailable`): it only ever widened the Sobol
+  draw's Voronoi fold, and the exact rule integrates the Wigner–Seitz
+  cell itself. There is no Baldereschi–Tosatti sphere in 2D; the slab
+  head is a `|q|` cusp, not a `1/q²` pole.
+* The production rule prints its ladder certificate once per process —
+  polygon edges, orders, node counts, `⟨v⟩`, and the 24→32 mixed
+  absolute+relative error ratio — and REFUSES above 1
+  (`GATE slab_q0_polygon_not_converged`, budget `atol 1e-12`,
+  `rtol 1e-8`, the same one the packed completion applies to its own
+  ladder). The scalar head had no convergence bound before.
+
+**`Bulk3D` is unchanged and takes no `rule`.** The polygon construction is
+two-dimensional; there is no 3D owner for it, so the bulk head keeps the
+scrambled-Sobol draw plus the Baldereschi–Tosatti analytic sphere, with
+every dial live. The paragraph below is therefore a statement about the
+3D head and about `sobol_debug`.
 
 Explicit requests refuse; only `auto` demotes, and it announces once.
 `method="sobol"` without scipy is a `RuntimeError` naming the fix;
@@ -258,6 +311,14 @@ Do not add a cubic-only test for anything in the mini-BZ family. Cubic
 cells satisfy `bvec.T = P·bvec`, which makes them structurally blind to
 the entire draw-convention bug class; every new test gets a hexagonal or
 lower-symmetry row or it is not evidence.
+
+Do not evaluate a q→0 cell average with a Monte-Carlo draw when an exact
+rule for that cell exists in this service. The slab head's Sobol estimator
+was correct, converged-looking and wrong by 0.16 %: the error is
+deterministic per seed, so it does not present as noise, and two
+production-style draws straddled the exact value by +0.16 % and −0.02 %.
+A second draw is not a convergence study. If you add a q→0 average, say
+which rule it uses and print a certificate that can refuse.
 
 Do not loosen `ATOL_FROZEN_EV` or any bit-reproducibility pin to absorb a
 physics change. The pin's value is that it cannot absorb one; refreeze

@@ -19,6 +19,8 @@ as noise (+5.72 meV per occupied state on MoS2 3×3, lane J claim 0586).
 """
 from __future__ import annotations
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -52,12 +54,24 @@ _Q0_LADDER_ATOL = 1.0e-12
 _Q0_RULE_ANNOUNCED: set[str] = set()
 
 
-def _announce_q0_rule(line: str) -> None:
-    """One stdout line per process naming the q→0 rule that answered."""
+def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
+    """Name the q→0 rule that answered, once per process.
+
+    ``print`` reaches a direct caller (a test, a tool, a service consumer).
+    A LORRAX production driver routes incidental component stdout to
+    ``os.devnull`` on purpose (``runtime.production_stream.ProductionStdout``)
+    and keeps only its own reporter, so the production certificate does not
+    reach ``gwjax.out`` today; that seam is registered.  ``warn=True`` also
+    raises a ``RuntimeWarning``, which that boundary DOES route into the
+    driver's warning block — reserved for selecting the DEBUG rule, which
+    must never run unnoticed inside a production driver.
+    """
     if line in _Q0_RULE_ANNOUNCED:
         return
     _Q0_RULE_ANNOUNCED.add(line)
     print(line, flush=True)
+    if warn:
+        warnings.warn(line, RuntimeWarning, stacklevel=3)
 
 
 class Slab2D:
@@ -224,7 +238,7 @@ class Slab2D:
                 f"qmc_reps={qmc_reps}, analytic_sphere={bool(analytic_sphere)}."
                 "  This is NOT the production rule; it carries a ~0.1-0.2 % "
                 "sampling error on the |q| cusp (claim 0586).  Production is "
-                f"rule={Q0_RULE_EXACT!r}.")
+                f"rule={Q0_RULE_EXACT!r}.", warn=True)
             return self._q0_average_sobol_debug(
                 geometry, kgrid, S_cart=S_cart, epshead=epshead,
                 nsamples=nsamples, method=method, qmc_reps=qmc_reps,
