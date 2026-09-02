@@ -292,9 +292,15 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
     """
     path = os.path.join(_SRC, "gw", "ppm_pipeline.py")
     calls = _calls(path, "_extrapolated_point")
-    assert len(calls) == 1, f"expected one driving call, got {len(calls)}"
-    args = [ast.unparse(a) for a in calls[0].args]
-    assert args[1] == "extrap_weights", args
+    assert len(calls) == 2, (
+        "expected the total and ordered-odd Sigma to share the one set of "
+        f"driving weights, got {len(calls)} calls")
+    args = [[ast.unparse(a) for a in call.args] for call in calls]
+    assert all(row[1] == "extrap_weights" for row in args), args
+    assert {row[0] for row in args} == {
+        "sigma_omega.sigma_c_kij",
+        "sigma_omega.sigma_c_odd_kij",
+    }, args
     src_pipe = open(path, encoding="utf-8").read()
     assert ("extrap_payload, extrap_weights = _report_band_extrapolation("
             in src_pipe), (
@@ -309,6 +315,28 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
     assert "band_counts=tuple(int(c) for c in plan.counts)" in src, (
         "the Sigma cube's band_counts must come from the bracket plan; if it "
         "is re-derived from a config key the split can disagree with it")
+
+
+def test_ordered_odd_sigma_uses_the_total_extrapolation_weights():
+    """The broken-TR diagnostic follows the same linear 1/N estimator.
+
+    This is the value-level twin of the call-site assertion above.  A stale
+    even-only rerun is not an acceptable proxy because the box executor owns
+    the exact production ``D``-on minus ``D=0`` cube per bracket.
+    """
+    from gw.band_extrapolation import extrapolation_weights
+    from gw.ppm_pipeline import _extrapolated_point
+
+    counts = (80, 90, 100)
+    weights = extrapolation_weights(counts)
+    odd_limit = 0.037 - 0.012j
+    tail = -1.7 + 0.4j
+    odd_at_counts = np.asarray([
+        odd_limit + tail / count for count in counts
+    ], dtype=np.complex128).reshape(3, 1, 1, 1, 1)
+    got = np.asarray(_extrapolated_point(odd_at_counts, weights))
+    np.testing.assert_allclose(
+        got, np.asarray([[[[odd_limit]]]]), rtol=0.0, atol=2.0e-15)
 
 
 def test_the_unextrapolated_twin_exists_only_when_the_feature_drives():
@@ -582,7 +610,7 @@ def test_the_dynamic_branch_does_not_recite_the_static_measurement():
     src = open(os.path.join(_SRC, "gw", "sigma_dispatch.py"),
                encoding="utf-8").read()
     guard = src[src.index("AUTO-DISABLED, LOUDLY"):]
-    guard = guard[:guard.index("Static channels")]
+    guard = guard[:guard.index("# Static exchange is needed by every mode")]
     probe = 'getattr(mode, "is_dynamic", False)'
     assert probe in guard, "the note must branch on whether the stage is dynamic"
     # Slice relative to the branch itself: there is an EARLIER if/else in this

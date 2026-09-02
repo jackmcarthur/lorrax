@@ -720,11 +720,15 @@ def compute_ppm_sigma_pipeline(
             sigma_c_body_omega = _extrapolated_point(
                 sigma_omega.sigma_c_kij, extrap_weights)
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
-            if sigma_omega_even is not None:
-                sigma_c_odd_body_omega = (
-                    sigma_c_body_omega
-                    - _extrapolated_point(
-                        sigma_omega_even.sigma_c_kij, extrap_weights))
+            if sigma_omega.sigma_c_odd_kij is not None:
+                # The shared MPA executor returns the exact ``D``-on minus
+                # ``D=0`` contraction at every cumulative band count.  Apply
+                # the same linear extrapolation weights as the total Sigma;
+                # rebuilding an even-only Sigma here would be a second
+                # execution path and used to leave a stale, undefined
+                # ``sigma_omega_even`` reference after the box-path merge.
+                sigma_c_odd_body_omega = _extrapolated_point(
+                    sigma_omega.sigma_c_odd_kij, extrap_weights)
 
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
