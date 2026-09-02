@@ -68,10 +68,10 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     assert [row.space for row in plan] == ["cond", "cond", "cond"]
     assert geometry["window_tau_pairs"] == 6
     assert geometry["eps"] == 1.0e-4
-    assert geometry["rule_eps"] == 1.0e-5
+    assert geometry["rule_eps"] == 1.0e-4
     report = geometry["branches"][0]["windows"]
     assert all(row["requested_eps"] == 1.0e-4 for row in report)
-    assert all(row["eps"] == 1.0e-5 for row in report)
+    assert all(row["eps"] == 1.0e-4 for row in report)
     np.testing.assert_allclose(
         report[0]["box_ry"], [-0.206, 0.106, 0.15, 0.15])
     np.testing.assert_allclose(
@@ -83,6 +83,26 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     np.testing.assert_array_equal(plan[2].window.mask_A, [[True, True]])
     np.testing.assert_array_equal(plan[0].pole_indices, [0])
     np.testing.assert_array_equal(plan[2].pole_indices, [1])
+
+
+@pytest.mark.parametrize(
+    ("space", "negative"),
+    (("cond", False), ("val", False), ("cond", True), ("val", True)),
+)
+def test_product_windows_partition_every_causal_tuple(
+        monkeypatch, space, negative):
+    tag = f"{'negative' if negative else 'positive'} {space}"
+    branch = _branch(tag, space=space, negative=negative)
+    plan, _geometry = _plan(monkeypatch, branch)
+    for state in range(2):
+        for pole in range(2):
+            owners = [
+                row.window.name
+                for row in plan
+                if bool(np.asarray(row.window.mask_A).reshape(-1)[state])
+                and pole in set(np.asarray(row.pole_indices).tolist())
+            ]
+            assert len(owners) == 1, (tag, state, pole, owners)
 
 
 def test_executor_conventions_and_lower_half_conjugation(monkeypatch):
@@ -157,12 +177,17 @@ def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
     assert all(
         row["runtime_noise_bound"] <= row["runtime_noise_budget"]
         for row in geometry["branches"][0]["windows"])
+    assert all(
+        row["runtime_noise_budget"] == pytest.approx(5.0e-6)
+        for row in geometry["branches"][0]["windows"])
 
 
 def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
     import dataclasses
 
     def unstable(box, eps, **kwargs):
+        # Opposite O(1e5) terms inflate the cancellation ratio in the rule's
+        # own error currency while leaving the mocked certificate unchanged.
         return dataclasses.replace(
             _fake_rule(box, eps, **kwargs),
             weights=np.asarray([1.0e5 + 0.0j, -1.0e5 + 0.0j]))
