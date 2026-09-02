@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from file_io.sigma_output import write_sigma_to_file
+from tests.harness import parse_eqp_rows
 
 
 NK, NB = 2, 4
@@ -165,6 +166,11 @@ def test_bispinor_lorentz_columns_are_additive_and_scalar_schema_is_unchanged(
                and "sigCT=" not in row for row in scalar_rows)
     for row in _rows(bispinor):
         assert row.index("sigCC=") < row.index("sigTT=") < row.index("sigCT=")
+
+    parsed = parse_eqp_rows(
+        bispinor, labels=("sigTOT", "sigCC", "sigTT", "sigCT"))
+    public_closure = parsed[:, 2] - np.sum(parsed[:, 3:6], axis=1)
+    assert np.max(np.abs(public_closure)) <= 1.0e-9
 
 
 def test_lorentz_column_closure_refuses_a_bad_decomposition(tmp_path):

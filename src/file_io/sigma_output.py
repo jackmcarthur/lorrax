@@ -513,7 +513,14 @@ def write_sigma_to_file(
 					# Total COHSEX
 					total_re = sx_re + coh_re
 					total_im = sx_im + coh_im
-					line += f"  {total_label}={total_re:>12.6f}"
+					# A bispinor file publicly promises the independently named
+					# Lorentz columns close back to this value within 1e-9 eV.
+					# Ten decimals leave headroom for three displayed addends.  Keep
+					# the historical six-decimal scalar spelling byte-for-byte.
+					if lorentz_diag is None:
+						line += f"  {total_label}={total_re:>12.6f}"
+					else:
+						line += f"  {total_label}={total_re:>16.10f}"
 					line += _im(total_im, tot_cplx)
 
 				if lorentz_diag is not None:
@@ -522,7 +529,7 @@ def write_sigma_to_file(
 					for label, sector in (("sigCC", 0), ("sigTT", 2),
 					                      ("sigCT", 1)):
 						value = lorentz_diag[sector, k, n]
-						line += f"  {label}={float(np.real(value)):>12.6f}"
+						line += f"  {label}={float(np.real(value)):>16.10f}"
 						line += _im(float(np.imag(value)),
 						            lorentz_cplx[sector])
 
