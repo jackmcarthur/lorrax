@@ -1,6 +1,7 @@
 """Physical-window seams used by the GN/HL-PPM denominator-box planner."""
 
 import numpy as np
+import pytest
 
 from minimax import UniformRule
 
@@ -171,3 +172,55 @@ def test_ppm_box_planner_preserves_crossing_channel_and_completes_full_rule(
     completed = np.asarray(_complete_one_sided_tau(
         [ppm_sigma.jnp.asarray(1.0j * Q)], None, None)[0])
     np.testing.assert_allclose(completed, 0.5 * (Q + Q.conj().T))
+
+
+@pytest.mark.parametrize(
+    ("space", "external_sign"),
+    (("cond", 1), ("cond", -1), ("val", 1), ("val", -1)),
+)
+def test_ppm_executor_nodes_reproduce_each_causal_denominator(
+        monkeypatch, space, external_sign):
+    """The shared time convention maps exactly onto all four PPM branches."""
+    from gw.sigma_box_plan import (
+        fit_sigma_box_specs,
+        make_sigma_box_spec,
+        sigma_box_executor_nodes,
+    )
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    eta, omega, state, pole = 0.1, 0.2, 0.7, 1.1
+    pole_sign = 1.0 if space == "cond" else -1.0
+    frequency = external_sign * omega
+    spec = make_sigma_box_spec(
+        name=f"{space}:{external_sign}",
+        frequencies=np.asarray([frequency]),
+        states=np.asarray([state]),
+        pole_stats=((pole, pole, 0.0, 0.0),),
+        pole_sign=pole_sign,
+        eta_ry=eta,
+    )
+    (fit,), _rows = fit_sigma_box_specs(
+        [spec], eta, eps=1.0e-4, reduction_seconds=120.0, cache_dir=None)
+    nodes = sigma_box_executor_nodes(fit, pole_sign, eta)
+
+    # This is the complete scalar phase assembled by ppm_tau_kernel and the
+    # omega projector after the E_ref_A/E_ref_B factors cancel.  The spatial
+    # kernel's -1 and the box window's prefactor=-1 cancel as well.
+    omega_sign = pole_sign * external_sign
+    executor = np.sum(
+        np.asarray(nodes.alpha)
+        * np.exp(1.0j * (omega_sign * omega - state - pole)
+                 * np.asarray(nodes.t)))
+
+    raw = _fake_rule(spec["box"], 1.0e-4)
+    if space == "cond":
+        physical_time = raw.times
+        physical_weight = raw.weights
+        denominator = frequency - state - pole + 1.0j * eta
+    else:
+        physical_time = -np.conj(raw.times)
+        physical_weight = np.conj(raw.weights)
+        denominator = frequency + state + pole - 1.0j * eta
+    direct = np.sum(
+        physical_weight * np.exp(1.0j * physical_time * denominator))
+    np.testing.assert_allclose(executor, direct, rtol=2.0e-15, atol=2.0e-15)
