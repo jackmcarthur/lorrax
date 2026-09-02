@@ -1326,6 +1326,18 @@ def main(argv=None):
 				sigma_lorentz_diag_skn_ry,
 				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 				tol_ry=float(config.degen_avg_tol_ry))
+		if mode.is_dynamic and sigma_xc_at_dft_ev is not None:
+			# Dynamic sigma_diag owns sigXC as the direct per-state
+			# sigX + sigC(E_DFT) interpolation, whereas the H operator above is
+			# the QSGW-Hermitianized matrix.  Their diagonals can differ at the
+			# micro-eV level because they use distinct interpolation kernels.  The
+			# public Lorentz split is a decomposition of the old sigXC column, so
+			# define its CC residual at that SAME output seam; CT+TC and TT remain
+			# the independently computed static current contributions.
+			_output_total_ry = np.asarray(sigma_xc_at_dft_ev) / RYD_TO_EV
+			sigma_lorentz_diag_skn_ry[0] = (
+				_output_total_ry - sigma_lorentz_diag_skn_ry[1]
+				- sigma_lorentz_diag_skn_ry[2])
 
 	results = GWResults(
 		sig_sx=sig_sx,
