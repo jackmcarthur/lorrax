@@ -81,7 +81,9 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
-from .wavefunction_bundle import face_kernel_kwargs
+from .sigma_plan import resolve_sigma_plan
+from .wavefunction_bundle import (face_kernel_kwargs,
+                                  projected_state_amplitude_envelope)
 
 
 def _face_g_plan(mesh_xy: Mesh, face_shape):
@@ -995,6 +997,7 @@ def _run_sigma_branch(
     use_shipped_minimax_tables: bool = True,
     packed_coh: tuple[tuple, tuple] | None = None,
     partition_hgl: bool = False,
+    planned_windows: list[_SigmaWindow] | None = None,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
 
@@ -1073,19 +1076,23 @@ def _run_sigma_branch(
         return None, []
 
     with timing.section("sigma.windows"):
-        windows = _build_windows_for_branch(
-            omega_nonneg_ry=omega_nonneg_ry,
-            E_A=E_A, base_mask_A=base_mask_A,
-            Omega_q=Omega_q, base_mask_B=base_mask_B,
-            space=space, neg_omega_half=neg_omega_half,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error, max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q, crossing_max_nodes=crossing_max_nodes,
-            use_shipped_minimax_tables=use_shipped_minimax_tables,
-            log_tag=log_tag, print_fn=print_fn,
-            partition_hgl=partition_hgl,
-        )
+        if planned_windows is None:
+            windows = _build_windows_for_branch(
+                omega_nonneg_ry=omega_nonneg_ry,
+                E_A=E_A, base_mask_A=base_mask_A,
+                Omega_q=Omega_q, base_mask_B=base_mask_B,
+                space=space, neg_omega_half=neg_omega_half,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor,
+                target_error=target_error, max_nodes=max_nodes,
+                crossing_eps_q=crossing_eps_q,
+                crossing_max_nodes=crossing_max_nodes,
+                use_shipped_minimax_tables=use_shipped_minimax_tables,
+                log_tag=log_tag, print_fn=print_fn,
+                partition_hgl=partition_hgl,
+            )
+        else:
+            windows = list(planned_windows)
     if not windows:
         return None, []
 
@@ -1661,24 +1668,16 @@ def compute_sigma_c_ppm_omega_grid(
     # 2751 MB/rank at nb=512) is elided, and every consumer reads the tiles
     # at their native sharding.  Movement-only: outputs are bit-identical
     # (A/B gated).  Announced here per doctrine 3.
-    sharded_layout = (str(sigma_cfg.omega_layout) == "sharded")
-    if sharded_layout:
-        # ONE owner for this precondition; the MPA executor calls the same
-        # function (doctrine 3 / pattern #6 -- refuse with the fix named,
-        # never fall back silently).
-        assert_sharded_sigma_window_divides_mesh(
-            nb_proj, mesh_xy, ansatz=ansatz_name)
-        print_fn(
-            "  Σc layout: sharded — Σ_c(ω,k,m,n) stays (m_X, n_Y)-tiled on "
-            "the existing mesh; the end-of-stage full-cube replication "
-            f"gather ({kij_bytes / 1e6:.2f} MB/rank) is ELIDED "
-            "(sigma_omega_layout=sharded).")
-
-    sigma_kij_host = (
-        None if sharded_layout
-        else np.zeros((n_brk, n_omega, nk_proj, nb_proj, nb_proj),
-                      dtype=np.complex128)
-    )
+    # ONE owner for this precondition; the MPA executor calls the same
+    # function. Every dynamic Sigma cube is sharded unconditionally.
+    assert_sharded_sigma_window_divides_mesh(
+        nb_proj, mesh_xy, ansatz=ansatz_name)
+    print_fn(
+        "  Σc layout: sharded — Σ_c(ω,k,m,n) stays (m_X, n_Y)-tiled on "
+        "the existing mesh; the end-of-stage full-cube replication "
+        f"gather ({kij_bytes / 1e6:.2f} MB/rank) is ELIDED.")
+    sharded_layout = True
+    sigma_kij_host = None
 
     common_branch_kwargs = dict(
         Omega_q=Omega_abs,
@@ -1707,6 +1706,60 @@ def compute_sigma_c_ppm_omega_grid(
         E_cond=E_cond, H_val=H_val,
         cond_mask=cond_mask, val_mask=val_mask,
     )
+
+    plan_mode = resolve_sigma_plan()
+    delivered_windows = {}
+    if plan_mode == "delivered" and branches:
+        # GN-PPM has one fitted pole per (q,mu,nu).  Add only the leading
+        # singleton axis expected by the shared MPA planner; the existing
+        # B_mask remains the executor's exact validity selector. Independent
+        # causal branches are still planned independently, so this does not
+        # introduce a time-reversal identification at the W producer seam.
+        from .mpa.delivered_windows import build_delivered_sigma_windows
+        tau_grid_mode = "free"  # single grid mode; shared-grid dial removed (2026-08-31 ruling)
+        Omega_one = jnp.expand_dims(Omega_abs, axis=0)
+        B_one = jnp.expand_dims(jnp.where(B_mask, B_corr, 0.0j), axis=0)
+        state_amplitudes = projected_state_amplitude_envelope(
+            wfns, state_bands=s.full, projection_bands=s.sigma)
+        # GN carries the loaded union because chi0 may own more bands than
+        # Sigma.  The bracketed Sigma executor stops at sigma_sum; make the
+        # planner's real state weight vanish on the same unused tail.
+        state_amplitudes = (
+            state_amplitudes
+            * wfns.band_mask(s.sigma_sum).astype(state_amplitudes.dtype))
+        shared_plan, geometry = build_delivered_sigma_windows(
+            [Omega_one] * len(branches), [B_one] * len(branches), branches,
+            omega_req,
+            regularization_width_ry=regularization_width_ry,
+            envelope_relative_target=target_error,
+            state_amplitudes_by_branch=(
+                [state_amplitudes] * len(branches)),
+            max_nodes=max(int(max_nodes), int(crossing_max_nodes)),
+            crossing_eps_q=crossing_eps_q,
+            use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
+            tau_grid_mode=tau_grid_mode,
+            edge_factor=edge_factor, mesh_xy=mesh_xy)
+        for report in geometry["branches"]:
+            start, stop = int(report["plan_start"]), int(report["plan_stop"])
+            delivered_windows[report["tag"]] = [
+                row.window for row in shared_plan[start:stop]]
+        print_fn(
+            f"  GN-PPM windows [delivered]: {geometry['n_windows']} logical "
+            f"windows, target={geometry['envelope_relative_target']:.3g} "
+            "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
+            f"grid={geometry['tau_grid_mode']}, "
+            f"{geometry['window_tau_pairs']} (window,tau) pairs, "
+            f"{geometry['distinct_tau_count']} branch-distinct tau, "
+            f"plan {geometry['plan_seconds']:.3f} s")
+        for report in geometry["branches"]:
+            for window in report["windows"]:
+                print_fn(
+                    f"    {window['name']}: n_tau={window['node_count']}, "
+                    f"residual={window['refined_residual']:.6g}/"
+                    f"{window['relative_residual_target']:.6g}, "
+                    f"kappa_p99={window['amplification_p99']:.6g}, "
+                    f"noise={window['runtime_noise_bound']:.6g}/"
+                    f"{window['runtime_noise_budget']:.6g}")
 
     # Run each branch and fold its Σc tiles into per-rank HOST tile
     # accumulators at the branch's global ω indices.  cond and val of a
@@ -1745,6 +1798,8 @@ def compute_sigma_c_ppm_omega_grid(
             B_q=_residue_for_space(br.space, B_corr, B_odd_corr),
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
+            planned_windows=delivered_windows.get(br.tag)
+            if plan_mode == "delivered" else None,
             **common_branch_kwargs,
         )
         if branch_tiles is None:

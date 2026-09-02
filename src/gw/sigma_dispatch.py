@@ -188,10 +188,11 @@ class SigmaResult:
 # owes the post-Σ seam a DFT-basis object, so its finalize
 # (``sc_iteration.run_sc_driver``) rotates the matrices named in
 # ``ROTATED_TO_DFT_FIELDS`` with ``O_DFT = U·O_QP·U†`` and leaves the
-# rest untouched.  The returned object therefore holds TWO BASES AT
-# ONCE, deliberately; these four tuples are the record of which field is
-# in which, and they partition ``dataclasses.fields(SigmaResult)``
-# exactly (``tests/test_sigma_result_basis.py`` fails when they do not).
+# rest untouched.  The original Σ_c(ω) cube is written in its QP compute
+# basis before this finalize; the returned copy is rotated for DFT-basis
+# output assembly.  These four tuples record the returned object's basis
+# and partition ``dataclasses.fields(SigmaResult)`` exactly
+# (``tests/test_sigma_result_basis.py`` fails when they do not).
 
 #: Band-basis matrices, rotated together or not at all.  A Σ channel
 #: added to the dataclass and NOT added here comes back from the SC
@@ -205,6 +206,13 @@ ROTATED_TO_DFT_FIELDS = (
     "h_transverse_kij_ry",
     "sigma_x_kij_ry",
     "sigma_xc_kij_ry",
+    # Rotated one omega row at a time on device.  A band-sharded cube keeps
+    # P(None,None,'x','y'); no full-cube device or host gather is permitted.
+    "sigma_c_omega_kij_ry",
+    # A diagonal cannot be rotated element-wise.  The finalize derives this
+    # cache from the diagonal of the once-rotated cube, on the original omega
+    # grid and at the DFT energies, so sigma_diag.dat cannot mix bases.
+    "sigma_c_at_dft_diag_ev",
     # The un-extrapolated N₃ twin of ``sigma_xc_kij_ry``, present only when
     # the band extrapolation is driving.  It is here and not in
     # ``SIGMA_BASIS_FIELDS`` because it is the SAME KIND OF OBJECT as the
@@ -219,19 +227,10 @@ ROTATED_TO_DFT_FIELDS = (
 )
 
 #: Left in the Σ compute basis on purpose — do NOT rotate these.
-#: ``sigma_c_omega_kij_ry`` is the operand of the QSGW ansatz
-#: ``Σ_ij^QSGW = ½[Σ_ij(E_i) + Σ_ij(E_j)]ʰ`` (``qsgw_utils.py``:402),
-#: whose band indices must label the states whose energies E_i, E_j it
-#: is evaluated at, so the construction is only itself in that basis;
-#: it is also the (nω, nk, nb, nb) sharded tensor and the contents of
-#: sigma_mnk.h5.  The other three are already band DIAGONALS, on which a
-#: basis rotation does not act element-wise.  ``e_eval_ev`` belongs here
-#: for the strongest form of that reason: it is the list of energies
-#: E_i whose band index MUST be the one the cube's band index is, since
-#: the ansatz pairs them element-wise.
+#: These are already band DIAGONALS, on which a basis rotation does not act
+#: element-wise.  ``e_eval_ev`` is the spectrum used by the QSGW ansatz in
+#: the last map's QP basis; it is output provenance rather than an operator.
 SIGMA_BASIS_FIELDS = (
-    "sigma_c_omega_kij_ry",
-    "sigma_c_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",
 )
@@ -240,8 +239,8 @@ SIGMA_BASIS_FIELDS = (
 #: path: ``omega_dft_rel_ev`` is E_DFT − E_F, built from
 #: ``get_enk_bandrange`` in ``dynamic_sigma.eval_sigma_c_at_dft_energies``.
 #: TRAP: under self-consistency it labels bands by the DFT index while
-#: ``sigma_c_at_dft_diag_ev`` — the interpolation it drives, in that same
-#: function — labels them by the QP index.
+#: ``sigma_c_at_dft_diag_ev`` is rebuilt from the DFT-basis output cube by
+#: the SC finalize, so these evaluation points and that diagonal agree.
 DFT_BASIS_FIELDS = (
     "omega_dft_rel_ev",
     "photon_head_sigma_diag_tskn_ry",
@@ -581,6 +580,7 @@ def compute_sigma_xc(
     omit_v_h: bool = False,
     iteration_head=None,
     occupation_state=None,
+    material_class: str,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -1148,31 +1148,6 @@ def compute_sigma_xc(
         # would mean gathering the full cube on every rank, which is the
         # P-independent collective the sharded layout exists to elide
         # (decisions.md 2026-08-05, refuse rather than gather).
-        _layout = str(config.sigma.omega_layout)
-        if _layout != "sharded":
-            _seen = getattr(config, "raw_input_keys", None)
-            try:
-                _named = _seen is not None and "sigma_omega_layout" in _seen
-            except TypeError:                            # pragma: no cover
-                _named = False
-            if _named:
-                raise ValueError(
-                    f"compute_mode = mpa requires sigma_omega_layout = "
-                    f"sharded, and this deck NAMES {_layout!r}.  The MPA "
-                    f"Sigma executor accumulates Sigma_c(w,k,m,n) directly "
-                    f"at P(None,None,'x','y') on the existing mesh and has "
-                    f"no replicated plan; honoring 'replicated' would mean "
-                    f"gathering the full cube on every rank, which is the "
-                    f"P-independent collective the sharded layout exists "
-                    f"to elide.  Set sigma_omega_layout = sharded, or drop "
-                    f"the key (its default resolves to sharded under mpa).")
-            print_fn(
-                f"  sigma_omega_layout: resolved to 'sharded' for "
-                f"compute_mode = mpa (deck did not name the key; its "
-                f"default {_layout!r} has no MPA plan -- the executor's "
-                f"accumulator is born P(None,None,'x','y')).  A deck that "
-                f"NAMES 'replicated' under mpa is refused rather than "
-                f"gathered.")
         # The effective Sigma broadening, from the SAME resolver the PPM
         # driver uses.  MPA used to take ``regularization_ev`` raw while
         # GN-PPM silently raised it to a window-dependent conditioning
@@ -1181,7 +1156,7 @@ def compute_sigma_xc(
         # neither output said what xi it ran at.
         _xi = sigma_regularization_for_config(config)
         print_fn(_xi.describe())
-        if config.mpa.material_class == "metal":
+        if material_class == "metal":
             # Metal deck-key consistency is refused at config parse
             # (_validate_occupation_smearing); here the run-level facts:
             # the one-occupation-state rule, and head/body provenance.
@@ -1215,13 +1190,11 @@ def compute_sigma_xc(
             regularization_width_ry=_xi.resolved_ry,
             edge_factor=float(config.sigma.window_edge_factor),
             target_error=float(config.mpa.sigma_sector_target_error),
-            crossing_target_error=float(
-                config.mpa.sigma_crossing_target_error),
             max_rank=int(config.mpa.sigma_max_nodes),
             crossing_max_nodes=max(
                 CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
-            omega_cluster_gap_ry=float(
-                config.mpa.sigma_omega_cluster_gap_ry),
+            omega_grid_step_ry=(
+                float(config.sigma.omega_step_ev) / RYD_TO_EV),
             occupation_window_threshold=float(
                 config.mpa.occupation_window_threshold),
             pole_batch_size=int(config.mpa.pole_batch_size),

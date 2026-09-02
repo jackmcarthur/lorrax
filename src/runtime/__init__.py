@@ -1935,6 +1935,70 @@ def run_main_and_finalize(main, argv=None) -> None:
 # from the log without re-running anything.
 
 
+def _physical_cores_in_affinity() -> int | None:
+    """Physical cores in this process's affinity mask (hyperthreads folded)."""
+    try:
+        affinity = len(os.sched_getaffinity(0))
+        with open("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list") as fh:
+            siblings = fh.read().strip()
+        per_core = 0
+        for part in siblings.split(","):
+            lo, _, hi = part.partition("-")
+            per_core += (int(hi) - int(lo) + 1) if hi else 1
+        return max(1, affinity // max(per_core, 1))
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def default_blas_threads() -> str | None:
+    """Give numpy's OpenBLAS a sane thread count when none was exported.
+
+    Unset, OpenBLAS starts one thread per schedulable CPU of the affinity
+    mask, i.e. one per HYPERTHREAD: on a Perlmutter GPU node a rank owns 16
+    cores / 32 hyperthreads and ran 32 spinning BLAS threads, and the
+    planner's GEMM-bound box-rule solver was 1.5-1.7x slower per window than
+    with 16 (Na +-15 eV, arms 19 vs 20, 2026-09-02).  This sets the count to
+    the PHYSICAL cores of the mask, both in the environment (for libraries
+    loaded later) and through the already-loaded OpenBLAS (numpy's bundled
+    ``libscipy_openblas64_``, via its ``set_num_threads`` symbol).  An
+    explicit ``OPENBLAS_NUM_THREADS`` or ``OMP_NUM_THREADS`` wins and is left
+    alone.  Returns a short description for the startup report, or None.
+
+    Tempting, and why not: "all available threads" -- that is what unset
+    means, and it is the slow case; or setting OMP_NUM_THREADS here too --
+    OpenMP runtimes already initialised in the FFI handlers do not re-read
+    it, and the handlers have their own caps (LORRAX_MKLBLAS_THREADS,
+    LORRAX_SCALAPACK_MKL_THREADS).
+    """
+    if os.environ.get("OPENBLAS_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS"):
+        return None
+    cores = _physical_cores_in_affinity()
+    if cores is None:
+        return None
+    os.environ["OPENBLAS_NUM_THREADS"] = str(cores)
+    applied = "env only"
+    try:
+        import ctypes
+        import glob
+        import numpy
+        base = os.path.dirname(numpy.__file__)
+        libs = glob.glob(os.path.join(base, "..", "numpy.libs", "*openblas*"))
+        for path in libs:
+            lib = ctypes.CDLL(path)
+            for name in ("scipy_openblas_set_num_threads64_",
+                         "openblas_set_num_threads64_", "openblas_set_num_threads"):
+                if hasattr(lib, name):
+                    getattr(lib, name)(ctypes.c_int(cores))
+                    applied = f"applied to {os.path.basename(path)}"
+                    break
+            else:
+                continue
+            break
+    except Exception:                                         # noqa: BLE001
+        pass
+    return f"{cores} (auto: physical cores of the affinity mask; {applied})"
+
+
 def _thread_env() -> dict:
     """Thread-count environment + the affinity XLA:CPU actually gets.
 
@@ -2325,7 +2389,10 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     f["linalg"] = _linalg_facts(mesh)
 
     # -- threads, cache, guards -------------------------------------------
+    blas_auto = default_blas_threads()
     f["threads"] = _thread_env()
+    if blas_auto:
+        f["threads"]["OPENBLAS_NUM_THREADS"] = blas_auto
     try:
         from common.jax_compile_cache import compile_cache_stats
         f["compile_cache"] = compile_cache_stats()

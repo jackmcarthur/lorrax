@@ -1295,15 +1295,18 @@ def resolve_minimax_energy_reference(
 #  Top-level screening helpers (used directly by gw_jax.main)
 # ---------------------------------------------------------------------------
 
-def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
+def build_static_quadrature(wfns, minimax_config, *,
+                            occupation_width_ry=None, print_fn=None):
     """Build static minimax quadrature and energy reference from wavefunction bundle.
 
     Returns (quad, e_ref) where quad is a LaplaceMinimaxQuadrature for 1/x
     on the band-energy interval, and e_ref is the global energy zero.
     """
     s = wfns.slices
-    # TODO(metal-screening): derive this transition window from all pairs
-    # with nonzero f_nk-f_mk, not the ifmax-based b2 cut.
+    # NOTE(metal-screening): the transition window is still cut at the
+    # ifmax-based b2 index rather than enumerated over pairs with nonzero
+    # f_nk - f_mk.  What that cut used to do on a METAL is now handled by the
+    # occupation-width floor on x_min below; see there.
     enk_v = wfns.enk[:, s.val]
     # ``cond_all``, not ``cond``: this quadrature is built once and reused by
     # BOTH χ0 and Σ, so its interval must cover the union of the two band
@@ -1326,7 +1329,25 @@ def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
     vmax = float(np.max(enk_v_host))
     cmin = float(np.min(enk_c_host))
     cmax = float(np.max(enk_c_host))
-    x_min = max(cmin - vmax, _TINY)
+    # ``cmin - vmax`` is the fundamental gap, which is the right x_min for an
+    # insulator and MEANINGLESS on a metal: the bands cross E_F, the gap goes
+    # <= 0, and x_min collapsed to _TINY = 1e-12.  That handed the solver the
+    # degenerate interval [1e-12, ~7] Ry -- measured R = 6.9e12 with a scaled
+    # tolerance of 1e-18, which no rule of any order meets, so the solver ran
+    # its whole node ladder and surrendered the N_max rule after ~18 minutes.
+    #
+    # The floor is the occupation smearing width, and it is physics rather
+    # than a guard.  chi0 needs (f_v - f_c)/x, not 1/x: for two states inside
+    # the smearing window the occupation difference vanishes LINEARLY with x
+    # (f_v - f_c ~ x/width), so the integrand is bounded as x -> 0 and 1/x
+    # accuracy below the smearing width is accuracy nothing asks for.  A deck
+    # with no smearing (an insulator) passes None and keeps the exact
+    # incumbent interval.
+    gap_ry = cmin - vmax
+    floor_ry = _TINY
+    if occupation_width_ry is not None:
+        floor_ry = max(float(occupation_width_ry), _TINY)
+    x_min = max(gap_ry, floor_ry)
     x_max = max(cmax - vmin, x_min * (1.0 + 1.0e-9))
     quad = solve_laplace_minimax_interval(
         x_min,

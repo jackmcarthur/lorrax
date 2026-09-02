@@ -111,7 +111,6 @@ KEYS: dict[str, tuple[str, str]] = {
     "sigma_omega_step_ev": ("Sigma", "Sigma(omega) grid step (eV)."),
     "sigma_regularization_ev": ("Sigma", "Lorentzian regularization of the Sigma(omega) evaluation (eV)."),
     "sigma_window_edge_factor": ("Sigma", "Widens the minimax window past the sigma omega-grid edges (T = omega_max + factor*xi)."),
-    "sigma_omega_layout": ("Sigma", "Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; live for one_shot_dft and fixed_point, since self_consistent refuses beside a dynamic compute_mode; refuses an indivisible window or h5py_allgather at P>1)."),
     "no_degen_averaging": ("Sigma", "Disable BGW-style averaging of diagonal Sigma within degenerate sets."),
     "degen_avg_tol_ry": ("Sigma", "Degeneracy tolerance for the averaging (BGW TOL_Degeneracy = 1e-6 Ry)."),
     "sigma_at_dft_extrapolate": ("Sigma", "Extrapolate Sigma to E_DFT outside the omega grid instead of clamping."),
@@ -133,7 +132,7 @@ KEYS: dict[str, tuple[str, str]] = {
     # ---- Solver ----
     "density_self_consistent": ("Solver", "Rebuild V_H from the current orbitals every SC iteration instead of rotating the fixed DFT V_H into the QP basis; off keeps QSGW fixed-density."),
     "sc_on_ibz": ("Solver", "Run the SC loop's H/E/U and carried state on the STAR wedge (one row per symmetry orbit), broadcasting back at the boundary; Sigma stays on the full BZ. Ignored when every k-star is a singleton. Default TRUE since 2026-08-15: measured equivalent to the full-BZ loop to 1e-6 meV per iterate under linear mixing on gnppm_debug, though rCROP's trajectory is k-set dependent by construction."),
-    "qp_solver": ("Solver", "QP extraction: one_shot_dft (one-shot full-matrix effective Hamiltonian with Sigma evaluated at E_DFT using QSGW Hermitian symmetrization; distinct from fixed-DFT-state diagonal G0W0; auto default) | fixed_point (diagonal on-shell solve followed by a full-matrix effective Hamiltonian) | self_consistent (QSGW loop; STATIC Sigma only -- self_consistent beside a dynamic compute_mode (gn_ppm/hl_ppm/mpa) is REFUSED at driver entry, because the SC finalize leaves the full Sigma_c(omega) cube in qp_band by design while H/Sigma_x are rotated to dft_band, so their diagonals combine exactly only at U = identity; pair it with cohsex, or use one_shot_dft / fixed_point. tests/KNOWN_FAILURES.md, 'eqp0.dat / eqp1.dat mix two bases on the self-consistent path')."),
+    "qp_solver": ("Solver", "QP extraction: one_shot_dft (one-shot full-matrix effective Hamiltonian with Sigma evaluated at E_DFT using QSGW Hermitian symmetrization; distinct from fixed-DFT-state diagonal G0W0; auto default) | fixed_point (diagonal on-shell solve followed by a full-matrix effective Hamiltonian) | self_consistent (QSGW loop for static or dynamic Sigma; the dynamic cube remains in the final QP compute basis for persistence and is rotated once, per omega row on device, to the DFT basis for EQP/output assembly)."),
     "do_G0": ("Solver", "Compute the analytic q->0 static head terms (needs dipole.h5); part of every production run."),
     "self_consistent": ("Solver", "DEPRECATED alias for qp_solver = self_consistent."),
     "sc_max_iter": ("Solver", "Self-consistency iteration cap."),

@@ -614,7 +614,8 @@ def _cohsex_dispatch(explicit, print_fn=None, *, scheme_explicit=False):
         ComputeMode.COHSEX, wfns=None, V_q=None, W_by_role={},
         e_qp_ev=None, static_head_terms=None, head_resolver=None,
         quad=None, config=cfg, meta=None, mesh_xy=None, sym=None,
-        wfn=None, band_slices=None, input_dir=".", **kw)
+        wfn=None, band_slices=None, input_dir=".",
+        material_class="insulator", **kw)
 
 
 def test_dispatch_refuses_an_EXPLICIT_key_on_a_non_ppm_mode():

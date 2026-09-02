@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gw.gw_config import LorraxConfig
+from gw.gw_config import LorraxConfig, _DEFAULTS, validate_material_inputs
 from gw.mpa import model, sample_plan, sampling
 
 
@@ -28,11 +28,9 @@ def _config(tmp_path, extra=""):
 
 _METAL_KEYS = (
     "compute_mode = mpa\n"
-    "mpa_material_class = metal\n"
     "occ_smearing_family = mp1\n"
     "occ_smearing_width_ry = 0.02\n"
     "fermi_reference = mp1_fixed_n\n"
-    "sigma_omega_layout = sharded\n"
 )
 
 
@@ -45,7 +43,7 @@ def test_metal_sampling_flags_build_the_configured_grid(tmp_path):
         "mpa_varpi_near_ry = 0.15\n"
         "mpa_varpi_far_ry = 1.5\n",
     )
-    plan = config.mpa.sample_plan(8.0)
+    plan = config.mpa.sample_plan(8.0, material_class="metal")
     np.testing.assert_array_equal(
         sample_plan.plan_z(plan),
         np.asarray([
@@ -64,7 +62,8 @@ def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
         + "mpa_pole_solver = companion\n")
     assert config.mpa.sampling_schedule == "leon"
     assert config.mpa.pole_solver == "companion"
-    z = sample_plan.plan_z(config.mpa.sample_plan(8.0))
+    z = sample_plan.plan_z(
+        config.mpa.sample_plan(8.0, material_class="metal"))
     expected_real = np.asarray(
         [float(f) ** 2 * 8.0
          for f in sampling.leon_partition_fractions(15)])
@@ -85,9 +84,8 @@ def test_unknown_leon_recipe_selector_refuses(tmp_path, line, value):
         _config(tmp_path, line)
 
 
-def test_unknown_material_class_is_a_parse_error(tmp_path):
-    with pytest.raises(ValueError, match="mpa_material_class"):
-        _config(tmp_path, "mpa_material_class = semimetal\n")
+def test_material_class_is_not_a_deck_key():
+    assert "mpa_material_class" not in _DEFAULTS
 
 
 def test_metal_evaluator_refuses_before_creating_output(tmp_path):
@@ -99,7 +97,7 @@ def test_metal_evaluator_refuses_before_creating_output(tmp_path):
         model.build_mpa_fit(
             run_dir, "metal", wfns=None, V_q=None, quad=None, sym=None,
             centroid_indices=None, head_resolver=None, config=config,
-            meta=None, mesh_xy=None)
+            meta=None, mesh_xy=None, material_class="metal")
     assert not run_dir.exists()
 
 
@@ -109,42 +107,37 @@ def test_metal_evaluator_refuses_before_creating_output(tmp_path):
 
 
 def test_metal_without_the_smearing_pair_refuses_by_name(tmp_path):
+    config = _config(tmp_path, "compute_mode = mpa\nfermi_reference = mp1_fixed_n\n")
     with pytest.raises(ValueError, match="occ_smearing_family"):
-        _config(
-            tmp_path,
-            "mpa_material_class = metal\n"
-            "fermi_reference = mp1_fixed_n\n"
-            "sigma_omega_layout = sharded\n")
+        validate_material_inputs(config, "metal")
 
 
 def test_metal_with_a_gap_fermi_reference_refuses_by_name(tmp_path):
+    config = _config(
+        tmp_path,
+        "compute_mode = mpa\n"
+        "occ_smearing_family = mp1\n"
+        "occ_smearing_width_ry = 0.02\n")
     with pytest.raises(ValueError, match="mp1_fixed_n"):
-        _config(
-            tmp_path,
-            "mpa_material_class = metal\n"
-            "occ_smearing_family = mp1\n"
-            "occ_smearing_width_ry = 0.02\n"
-            "sigma_omega_layout = sharded\n")
+        validate_material_inputs(config, "metal")
 
 
-def test_metal_with_the_replicated_cube_refuses_by_name(tmp_path):
-    with pytest.raises(ValueError, match="sigma_omega_layout"):
-        _config(
-            tmp_path,
-            "mpa_material_class = metal\n"
-            "occ_smearing_family = mp1\n"
-            "occ_smearing_width_ry = 0.02\n"
-            "fermi_reference = mp1_fixed_n\n")
+def test_sigma_layout_is_not_a_deck_key():
+    assert "sigma_omega_layout" not in _DEFAULTS
 
 
 def test_insulator_with_smearing_keys_refuses_the_off_dial(tmp_path):
-    with pytest.raises(ValueError, match="metal-only"):
-        _config(tmp_path, "occ_smearing_family = mp1\n")
+    config = _config(
+        tmp_path,
+        "occ_smearing_family = mp1\nocc_smearing_width_ry = 0.02\n")
+    with pytest.raises(ValueError, match="integer WFN occupations"):
+        validate_material_inputs(config, "insulator")
 
 
 def test_insulator_with_mp1_fermi_reference_refuses(tmp_path):
-    with pytest.raises(ValueError, match="mpa_material_class = metal"):
-        _config(tmp_path, "fermi_reference = mp1_fixed_n\n")
+    config = _config(tmp_path, "fermi_reference = mp1_fixed_n\n")
+    with pytest.raises(ValueError, match="integer WFN occupations"):
+        validate_material_inputs(config, "insulator")
 
 
 def test_uncertified_smearing_family_refuses_by_name(tmp_path):
@@ -158,6 +151,7 @@ def test_uncertified_smearing_family_refuses_by_name(tmp_path):
 
 def test_a_legal_metal_deck_parses_and_carries_the_pair(tmp_path):
     config = _config(tmp_path, _METAL_KEYS)
+    validate_material_inputs(config, "metal")
     assert config.occ_smearing_family == "mp1"
     assert config.occ_smearing_width_ry == 0.02
     assert config.sigma.fermi_reference == "mp1_fixed_n"
@@ -167,27 +161,27 @@ def test_a_legal_metal_deck_parses_and_carries_the_pair(tmp_path):
 def test_a_metal_deck_refuses_every_mode_without_an_occupation_aware_head(
         tmp_path, mode):
     with pytest.raises(ValueError) as excinfo:
-        _config(
+        config = _config(
             tmp_path,
             _METAL_KEYS.replace(
                 "compute_mode = mpa", f"compute_mode = {mode}"))
+        validate_material_inputs(config, "metal")
 
     message = str(excinfo.value)
-    assert "GATE metal_material_class_requires_mpa" in message
-    assert "mpa_material_class = metal" in message
-    assert f"compute_mode = {mode}" in message
-    assert "compute_mode = mpa" in message
-    assert "mpa_material_class = insulator" in message
-    assert "accepts no occupation_state" in message
+    assert "GATE fractional_occupations_require_mpa" in message
+    assert f"compute_mode={mode}" in message
+    assert "compute_mode=mpa" in message
 
 
 def test_a_metal_deck_refuses_auto_after_naming_its_resolved_mode(tmp_path):
     with pytest.raises(ValueError) as excinfo:
-        _config(tmp_path, _METAL_KEYS.replace("compute_mode = mpa\n", ""))
+        config = _config(
+            tmp_path, _METAL_KEYS.replace("compute_mode = mpa\n", ""))
+        validate_material_inputs(config, "metal")
 
     message = str(excinfo.value)
-    assert "compute_mode = auto (resolved to cohsex)" in message
-    assert "compute_mode = mpa" in message
+    assert "compute_mode=cohsex" in message
+    assert "compute_mode=mpa" in message
 
 
 def test_an_insulating_deck_carries_no_smearing_pair(tmp_path):
@@ -405,14 +399,15 @@ def test_the_shift_default_and_ladder_are_a_factor_of_two_apart():
 
 
 def test_insulator_with_the_origin_shift_refuses_the_off_dial(tmp_path):
+    config = _config(tmp_path, "mpa_metal_origin_shift_ry = 2e-4\n")
     with pytest.raises(ValueError, match="mpa_metal_origin_shift_ry"):
-        _config(tmp_path, "mpa_metal_origin_shift_ry = 2e-4\n")
+        validate_material_inputs(config, "insulator")
 
 
 def test_insulator_refusal_says_it_is_metal_only(tmp_path):
-    with pytest.raises(ValueError, match="metal-only") as excinfo:
-        _config(tmp_path, "mpa_metal_origin_shift_ry = 2e-4\n")
-    assert "mpa_material_class = metal" in str(excinfo.value)
+    config = _config(tmp_path, "mpa_metal_origin_shift_ry = 2e-4\n")
+    with pytest.raises(ValueError, match="metal-only"):
+        validate_material_inputs(config, "insulator")
 
 
 @pytest.mark.parametrize("bad", ["0.0", "-2e-4", "0.2", "0.5"])
@@ -456,7 +451,8 @@ def test_an_unset_key_is_the_published_constant_bit_for_bit(tmp_path):
 
     from gw.mpa import sampling
 
-    z = sample_plan.plan_z(config.mpa.sample_plan(8.0))
+    z = sample_plan.plan_z(
+        config.mpa.sample_plan(8.0, material_class="metal"))
     reference = sampling.double_parallel_grid(
         4, 8.0, material_class="metal", varpi_near=0.2, varpi_far=2.0,
         energy_unit="Ry")
@@ -471,15 +467,18 @@ def test_typing_the_default_in_by_hand_changes_no_bit(tmp_path):
         "mpa_n_poles = 4\n" + _METAL_KEYS
         + f"mpa_metal_origin_shift_ry = {_SHIFT_DEFAULT_RY}\n")
     np.testing.assert_array_equal(
-        sample_plan.plan_z(base.mpa.sample_plan(8.0)),
-        sample_plan.plan_z(typed.mpa.sample_plan(8.0)))
+        sample_plan.plan_z(base.mpa.sample_plan(
+            8.0, material_class="metal")),
+        sample_plan.plan_z(typed.mpa.sample_plan(
+            8.0, material_class="metal")))
 
 
 def test_an_insulating_grid_is_untouched_by_the_new_parameter(tmp_path):
     """The other half of default-identity: the key cannot reach an
     insulating plan at all, so z = 0 stays exactly 0."""
     config = _config(tmp_path, "mpa_n_poles = 4\n")
-    z = sample_plan.plan_z(config.mpa.sample_plan(8.0))
+    z = sample_plan.plan_z(
+        config.mpa.sample_plan(8.0, material_class="insulator"))
     assert z[0] == 0.0 + 0.0j
 
 
@@ -494,13 +493,15 @@ def test_each_ladder_rung_lands_where_the_owner_quoted_it(
         "mpa_n_poles = 4\n" + _METAL_KEYS
         + f"mpa_metal_origin_shift_ry = {shift_ry}\n")
     assert config.mpa.metal_origin_shift_ry == shift_ry
-    z = sample_plan.plan_z(config.mpa.sample_plan(8.0))
+    z = sample_plan.plan_z(
+        config.mpa.sample_plan(8.0, material_class="metal"))
     assert z[0] == 1j * shift_ry
     assert z[0].imag == pytest.approx(2.0 * shift_ha, rel=1e-15)
     # Nothing else on either line moved.
     reference = _config(tmp_path / "ref", "mpa_n_poles = 4\n" + _METAL_KEYS)
     np.testing.assert_array_equal(
-        z[1:], sample_plan.plan_z(reference.mpa.sample_plan(8.0))[1:])
+        z[1:], sample_plan.plan_z(reference.mpa.sample_plan(
+            8.0, material_class="metal"))[1:])
 
 
 # (3) STAMPED ROUND-TRIP: the resolved shift reaches the sample store as an

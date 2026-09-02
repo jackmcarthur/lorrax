@@ -527,7 +527,16 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 4      # 5 shared + 4 screened-only
+    assert len(both) == len(shared) + 3      # 5 shared + 3 screened-only
+
+
+def test_material_class_is_owned_by_wfn_validation_not_the_envelope(tmp_path):
+    """The removed material-class deck key must not survive as a shadow row."""
+    from gw import gw_config
+
+    config = _parse(tmp_path, _packed_deck())
+    rows = list(gw_config.packed_static_envelope(config, screened=True))
+    assert all("material_class" not in row[1] + row[2] for row in rows)
 
 
 def test_every_envelope_row_says_physics_or_implementation_limit(tmp_path):

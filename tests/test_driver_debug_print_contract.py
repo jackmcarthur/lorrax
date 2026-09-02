@@ -76,6 +76,14 @@ def test_env_registry_has_one_print_verbosity_row():
     assert stale_rows == []
 
 
+def test_driver_debug_does_not_force_jax_cache_miss_explanations():
+    """Stage cadence must not turn on per-trace forensic construction."""
+    cache = (ROOT / "src" / "common" / "jax_compile_cache.py").read_text()
+    assert '_jax.config.update("jax_explain_cache_misses"' not in cache
+    registry = (ROOT / "docs" / "dev" / "env_vars.md").read_text()
+    assert "`JAX_EXPLAIN_CACHE_MISSES` | `0` (off)" in registry
+
+
 def test_native_and_python_layers_share_the_exact_spelling():
     runtime = (ROOT / "src" / "runtime" / "__init__.py").read_text()
     native = (ROOT / "src" / "ffi" / "cpp" / "common"

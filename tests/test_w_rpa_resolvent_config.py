@@ -258,6 +258,7 @@ def _stub_kwargs(config, tmp_path):
         quad=None, e_ref=0.0, sym=None, centroid_indices=None,
         config=config, meta=None, mesh_xy=None,
         run_dir=str(tmp_path / "mpa"), label="unit",
+        material_class="insulator",
         tensors_filename=str(tmp_path / "isdf_tensors_4.h5"),
         print_fn=lambda *a, **k: None)
 

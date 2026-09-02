@@ -367,15 +367,17 @@ fixed point, different path. So an *unconverged* rCROP run's iterates move
 when this flag moves. NOT established: agreement at a converged fixed point
 (both arms stop at 2–3 map calls, RMS ΔE ≈ 3 eV).
 
-### The one deck that runs it, and the one that cannot
+### The committed deck that exercises it, and the one that cannot
 
 `tests/regression/gnppm_debug/gnppm_sc.in` is the **only** committed deck with
 `qp_solver = self_consistent`. Before it, every deck was `one_shot_dft`, which
 is why this rotted invisibly: flipping the default would have changed no suite
-result. Since 2026-08-27 `gw.gw_jax` refuses this deck at entry —
-`self_consistent` beside the dynamic `gn_ppm` — so it now documents the pair
-the driver refuses rather than a runnable configuration
-(`tests/test_qp_solver_config.py`).
+result. Dynamic self-consistency is now a supported configuration: the final
+correlation cube is rotated from the last map's QP basis to the DFT output
+basis one omega row at a time, and its at-DFT diagonal cache is rebuilt from
+that rotated operator. `tests/test_qp_solver_config.py` keeps this deck as the
+parse-level capability fixture; the full driver still has to satisfy the
+ordinary numerical gates of the chosen ansatz and deck.
 
 `cohsex_debug` (4 vs 3, the sharpest divergence) **cannot run `sc_on_ibz` at
 all**: `centroids_frac_60.txt` is not orbit-closed, so the k-star spread of

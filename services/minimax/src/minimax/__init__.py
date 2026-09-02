@@ -209,6 +209,34 @@ _FREQUENCY_FIT_NAMES = (
     "DampedReciprocalFit", "fit_damped_reciprocal",
 )
 
+# Delivered-error fitting on a weighted complex support.  Also SciPy
+# (linprog), so it lives behind the same lazy door: a production table
+# lookup must not import an optimiser.
+_RECIPROCAL_FIT_NAMES = (
+    "ReciprocalMeasureProblem", "ComplexTimeRule",
+    "evaluate_rule", "delivered_error", "rule_amplification",
+    "solve_fixed_time_weights",
+    "solve_fixed_time_weights_fast",
+)
+_TIME_NODE_SEARCH_NAMES = (
+    "ComplexTimeSearchOptions", "support_arc",
+    "candidate_time_dictionary", "fit_reciprocal_measure",
+)
+_MEASURE_WINDOW_NAMES = (
+    "MeasureWindow", "WindowErrorBudget", "tail_refined_lattice_measure",
+    "partition_measure_windows", "apportion_true_error",
+)
+_WINDOWED_FIT_NAMES = (
+    "PhaseBoundedReciprocalFit", "fit_phase_bounded_candidates",
+)
+_ROQ_FIT_NAMES = (
+    "RoqWindow", "RoqGroup", "RoqRule", "RoqBranchEvidence", "RoqPlan",
+    "RoqPlanningRefusal",
+    "roq_select_times", "fit_roq_group", "fit_roq_branch",
+    "branch_delivered_error", "branch_noise_gate",
+    "plan_measure_adapted_roq",
+)
+
 
 def __getattr__(name: str):
     """PEP 562 lazy door for the solver half.
@@ -222,12 +250,32 @@ def __getattr__(name: str):
     if name in _FREQUENCY_FIT_NAMES:
         from minimax import frequency_fit as _fit      # noqa: PLC0415
         return getattr(_fit, name)
+    if name in _RECIPROCAL_FIT_NAMES:
+        from minimax import reciprocal_fit as _measure  # noqa: PLC0415
+        return getattr(_measure, name)
+    if name in _TIME_NODE_SEARCH_NAMES:
+        from minimax import time_node_search as _search  # noqa: PLC0415
+        return getattr(_search, name)
+    if name in _MEASURE_WINDOW_NAMES:
+        from minimax import measure_windows as _windows  # noqa: PLC0415
+        return getattr(_windows, name)
+    if name in _WINDOWED_FIT_NAMES:
+        from minimax import windowed_fit as _windowed_fit  # noqa: PLC0415
+        return getattr(_windowed_fit, name)
+    if name in _ROQ_FIT_NAMES:
+        from minimax import roq_fit as _roq  # noqa: PLC0415
+        return getattr(_roq, name)
     raise AttributeError(f"module 'minimax' has no attribute {name!r}")
 
 
 def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
-                  | set(_FREQUENCY_FIT_NAMES))
+                  | set(_FREQUENCY_FIT_NAMES)
+                  | set(_RECIPROCAL_FIT_NAMES)
+                  | set(_TIME_NODE_SEARCH_NAMES)
+                  | set(_MEASURE_WINDOW_NAMES)
+                  | set(_WINDOWED_FIT_NAMES)
+                  | set(_ROQ_FIT_NAMES))
 
 
 __all__ = [
@@ -252,6 +300,14 @@ __all__ = [
     "UncertifiedSolveRefused", "SamplingUnsupported",
     # --- generic complex-frequency fitting (lazy; scipy) -------------------
     *_FREQUENCY_FIT_NAMES,
+    # --- delivered-error fitting on a weighted support (lazy; scipy) -------
+    *_RECIPROCAL_FIT_NAMES,
+    *_TIME_NODE_SEARCH_NAMES,
+    # --- measure-apportioned window planning (lazy; numpy/scipy) -----------
+    *_MEASURE_WINDOW_NAMES,
+    *_WINDOWED_FIT_NAMES,
+    # --- measure-weighted ROQ node discovery (lazy; scipy) -----------------
+    *_ROQ_FIT_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
 ]

@@ -209,6 +209,7 @@ PERSISTED_DIAGNOSTICS = ("condition",)
 #: interpret.  The reader refuses an unknown model rather than serving
 #: poles whose fitting protocol nobody can name.
 _HEAD_FIT_MODELS = (
+    "head_off_zero",
     "fixed_dft_gn",
     "dft_direct_loewner",
     "bgw_q0shift_loewner",

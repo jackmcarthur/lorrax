@@ -343,7 +343,17 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
     phases = windowed_exp_iEt(enk, t, E_min, E_max, e_ref=e_ref)
     if band_weight is not None:
         band_weight = jnp.reshape(band_weight, enk.shape)
-        phases = phases * band_weight.astype(phases.dtype)
+        weight = band_weight.astype(phases.dtype)
+        # A sparse tuple selector is an exact support gate, not merely a
+        # post-hoc scale.  Complex delivered nodes can overflow the phase on
+        # an UNSELECTED high-energy band even though the planner certified
+        # every selected factor.  Multiplication would turn that lane into
+        # ``0 * inf = nan`` and poison the whole G contraction.  ``where``
+        # preserves the identical multiplication on every live lane and the
+        # exact mathematical zero on every dead one.
+        phases = jnp.where(
+            weight != 0.0, phases * weight,
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
     if mask is not None:
         # mask gates phases per (k, n), so it must share enk's shape.  Some Σ
         # branches deliver it as (1, nk, nb) on a 1×1 processor mesh — the occ

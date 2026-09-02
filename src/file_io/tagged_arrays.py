@@ -870,15 +870,19 @@ def assert_restart_window_matches(filename, band_slices=None,
     if stored_w is not None and band_slices is not None:
         want = [int(band_slices.b0), int(band_slices.b1), int(band_slices.b2),
                 int(band_slices.b3), int(band_slices.b4)]
-        if [int(x) for x in stored_w] != want:
+        stored_stable = [int(stored_w[index]) for index in (0, 1, 2, 4)]
+        want_stable = [want[index] for index in (0, 1, 2, 4)]
+        if stored_stable != want_stable:
             raise ValueError(
-                f"Restart file {filename} was written under band window "
-                f"(b0,b1,b2,b3,b4)={tuple(int(x) for x in stored_w)} but this "
-                f"run has {tuple(want)}.  V_qmunu / psi_full_y / enk_full are "
-                f"indexed by that window, so reusing them would MISINDEX "
+                f"Restart file {filename} was written under stable restart "
+                f"window (b0,b1,b2,b4)={tuple(stored_stable)} but this run "
+                f"has {tuple(want_stable)}. V_qmunu / psi_full_y / enk_full "
+                f"are indexed by that window, so reusing them would MISINDEX "
                 f"Sigma silently (no crash, wrong QP energies -- see job "
-                f"7874375).  Either restore the original nval/ncond/nband, or "
-                f"set restart=false to rebuild the tensors for the new window."
+                f"7874375). Either restore the original nval and loaded/chi "
+                f"band extent, or set restart=false to rebuild the tensors. "
+                f"The Sigma-only b3 edge may change because no restart "
+                f"tensor depends on number_bands_sigma."
             )
     if stored_mu is not None and n_rmu_logical is not None:
         if int(stored_mu) != int(n_rmu_logical):

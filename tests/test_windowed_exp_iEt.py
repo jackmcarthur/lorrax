@@ -257,6 +257,20 @@ def test_build_G_tau_band_identity_mask_is_a_bit_exact_no_op(psis, enk, tag, t):
         np.asarray(old))
 
 
+def test_build_G_tau_zero_weight_gates_an_overflowing_unselected_band():
+    """Sparse delivered selectors cannot turn an excluded overflow into NaN."""
+    energies = jnp.asarray([[0.1, 1000.0]])
+    weight = jnp.asarray([[1.0, 0.0]])
+    psi_xn = jnp.ones((1, 1, 1, 2), dtype=jnp.complex128)
+    psi_yr = jnp.ones((1, 2, 1, 1), dtype=jnp.complex128)
+
+    got = np.asarray(build_G_tau(
+        psi_xn, psi_yr, energies, -1.0, band_weight=weight))
+
+    assert np.all(np.isfinite(got))
+    np.testing.assert_allclose(got, np.exp(0.1), rtol=1.0e-15, atol=0.0)
+
+
 @pytest.mark.parametrize("tag,t", TIMES[:2], ids=[x[0] for x in TIMES[:2]])
 def test_build_G_tau_bounds_route_equals_the_materialised_mask_route(psis, enk, tag, t):
     """The conversion itself: E_min/E_max reproduces the mask array it replaces."""
