@@ -33,7 +33,6 @@ file write, QSGW build).
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable
@@ -1063,17 +1062,9 @@ def compute_sigma_xc(
         sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
             config.sigma.fermi_reference,
             occupation_state=occupation_state, wfn=wfn)
-        cache_setting = str(config.sigma.quadrature_cache_dir).strip()
-        if cache_setting.lower() == "off":
-            quadrature_cache_dir = None
-        elif cache_setting.lower() == "auto":
-            quadrature_cache_dir = os.path.join(
-                os.path.abspath(input_dir), "tmp", "sigma_quadrature_rules")
-        else:
-            expanded = os.path.expanduser(cache_setting)
-            quadrature_cache_dir = (
-                expanded if os.path.isabs(expanded)
-                else os.path.join(os.path.abspath(input_dir), expanded))
+        from .sigma_box_plan import resolve_sigma_box_cache_dir
+        quadrature_cache_dir = resolve_sigma_box_cache_dir(
+            config.sigma.quadrature_cache_dir, input_dir)
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,

@@ -1,14 +1,16 @@
-"""Measure-independent denominator-box quadrature for MPA Sigma(omega).
+"""Measure-independent denominator-box quadrature for dynamic Sigma(omega).
 
 The public path in this module is deliberately short:
 
-``branch -> three Cartesian product windows -> denominator box -> rule``.
+``physical product window -> denominator box -> rule -> executor nodes``.
 
-Pole fields remain distributed.  The caller supplies the bounded per-pole
-extrema returned by :func:`gw.mpa.sigma_windows.summarize_sigma_poles`; no
-residue histogram, sampled lattice, error apportionment, or campaign-wide
-selection enters the quadrature.  Each returned ``SharedSigmaWindow`` is
-consumed unchanged by the existing MPA tau executor.
+Pole fields remain distributed.  MPA supplies the bounded per-pole extrema
+returned by :func:`gw.mpa.sigma_windows.summarize_sigma_poles`; PPM supplies
+the scalar extrema of each exact ``(q, mu, nu)`` pane.  No residue histogram,
+sampled lattice, error apportionment, or campaign-wide selection enters the
+quadrature.  The box construction, lower-half-plane conjugation, cache policy,
+fit guards, and conversion to executor ``(t, alpha)`` live here once for both
+routes.
 """
 
 from __future__ import annotations
@@ -33,6 +35,25 @@ from minimax import UniformRule, build_uniform_rule
 _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
+
+
+def resolve_sigma_box_cache_dir(setting, input_dir):
+    """Resolve the deck's uniform-rule cache spelling beside its input.
+
+    ``"auto"`` selects ``<input_dir>/tmp/sigma_quadrature_rules``;
+    ``"off"`` disables the acceleration; any other relative path is resolved
+    against ``input_dir``.  A cache is not an accuracy path: every loaded rule
+    is still checked for box containment and the requested error currency.
+    """
+    raw = str(setting).strip()
+    if raw.lower() == "off":
+        return None
+    root = os.path.abspath(input_dir)
+    if raw.lower() == "auto":
+        return os.path.join(root, "tmp", "sigma_quadrature_rules")
+    expanded = os.path.expanduser(raw)
+    return (expanded if os.path.isabs(expanded)
+            else os.path.join(root, expanded))
 
 
 def _resolve_uniform_rule_trace():
@@ -145,6 +166,63 @@ def _box_for_window(frequencies, states, pole_stats, pole_sign, eta):
     raw_lo, raw_hi = float(min(corners)), float(max(corners))
     return (_box(raw_lo, raw_hi, gamma_lo, gamma_hi, eta),
             (raw_lo, raw_hi), (a_lo, a_hi, gamma_lo, gamma_hi))
+
+
+def make_sigma_box_spec(
+    *, name, frequencies, states, pole_stats, pole_sign, eta_ry,
+):
+    """Construct one route-neutral denominator-box fit specification.
+
+    Parameters
+    ----------
+    name
+        Stable diagnostic identity for the physical product window.
+    frequencies
+        External frequencies owned by the window, shape ``(nomega,)`` in Ry.
+    states
+        Exact live intermediate-state energies, shape ``(nstate,)`` in Ry.
+    pole_stats
+        Per-pole or per-pane ``(real_min, real_max, gamma_min, gamma_max)``
+        rows in Ry.  These are scalar extrema, never histogram weights.
+    pole_sign
+        ``+1`` for conduction denominators and ``-1`` for valence.
+    eta_ry
+        Positive retarded broadening in Ry.
+
+    Returns
+    -------
+    dict
+        Box, raw support, fit currency, conjugation, and factor references.
+        Route-specific selector metadata may be added by the caller.
+    """
+    frequencies = np.asarray(frequencies, dtype=np.float64).reshape(-1)
+    states = np.asarray(states, dtype=np.float64).reshape(-1)
+    rows = tuple(tuple(float(value) for value in row) for row in pole_stats)
+    sign, eta = float(pole_sign), float(eta_ry)
+    if not frequencies.size or not np.all(np.isfinite(frequencies)):
+        raise ValueError(f"Sigma box window {name!r} has no finite frequencies")
+    if not states.size or not np.all(np.isfinite(states)):
+        raise ValueError(f"Sigma box window {name!r} has no finite states")
+    if not rows or any(len(row) != 4 for row in rows):
+        raise ValueError(
+            f"Sigma box window {name!r} needs four pole extrema per row")
+    if sign not in (-1.0, 1.0):
+        raise ValueError("Sigma box pole_sign must be +1 or -1")
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("sigma_quadrature requires eta_ry > 0")
+    box, raw_real, pole_extent = _box_for_window(
+        frequencies, states, rows, sign, eta)
+    kind = ("sign_definite_positive" if box[0] > 0.0 else
+            "sign_definite_negative" if box[1] < 0.0 else
+            "crossing")
+    e_ref_a, e_ref_b = _factor_references(kind, sign, states, rows)
+    return {
+        "name": str(name), "frequencies": frequencies, "states": states,
+        "pole_stats": rows, "pole_sign": sign,
+        "raw_real_support": raw_real, "box": box, "kind": kind,
+        "pole_extent": pole_extent, "conjugate": sign < 0.0,
+        "E_ref_A": e_ref_a, "E_ref_B": e_ref_b,
+    }
 
 
 def _rule_cache_lookup(directory, box, eps, relative):
@@ -343,6 +421,68 @@ def _parallel_fits(specs, worker):
     return [row["value"] for row in rows], rows
 
 
+def fit_sigma_box_specs(
+    specs, eta_ry, *, eps, reduction_seconds, cache_dir,
+):
+    """Fit independent route-neutral box specifications across processes.
+
+    The input rows must come from :func:`make_sigma_box_spec`.  This function
+    owns the shared cache lookup/build, rule acceptance, lower-half-plane
+    conjugation, runtime-noise guard, and factored-growth guard.  It returns
+    only small replicated rule receipts; route-specific physical selectors
+    stay with the caller.
+    """
+    rows = list(specs)
+    eta, tolerance, budget = (
+        float(eta_ry), float(eps), float(reduction_seconds))
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("sigma_quadrature requires eta_ry > 0")
+    if not 0.0 < tolerance < 1.0:
+        raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
+    if not np.isfinite(budget) or budget <= 0.0:
+        raise ValueError("sigma_quadrature_reduction_seconds must be > 0")
+    return _parallel_fits(
+        rows, lambda index: _fit_rule(
+            rows[index], tolerance, budget, cache_dir, eta))
+
+
+def sigma_box_executor_nodes(
+    fit, pole_sign, eta_ry, *, one_sided_hermitian=False,
+):
+    """Convert one accepted box rule to the dynamic-Sigma executor contract.
+
+    The shared physical convention is
+
+    ``time_exec = pole_sign * time`` and
+    ``alpha_exec = weight * exp(-eta * time_exec)``.
+
+    The fitted lower-half-plane valence rule has already received the exact
+    ``time=-conj(time), weight=conj(weight)`` transformation in
+    :func:`fit_sigma_box_specs`.  ``one_sided_hermitian`` retains PPM's
+    crossing channel and its global completion ``(Z-Z^dagger)/(2i)``.  In
+    that contract the coefficient is multiplied by ``i`` so completion is
+    exactly the Hermitian part of the full causal box sum:
+
+    ``(i Q - (i Q)^dagger)/(2i) = (Q + Q^dagger)/2``.
+
+    No channel is collapsed and the equality holds for general complex box
+    times and weights, not only a real one-sided sine grid.
+    """
+    sign, eta = float(pole_sign), float(eta_ry)
+    if sign not in (-1.0, 1.0):
+        raise ValueError("Sigma box pole_sign must be +1 or -1")
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("sigma_quadrature requires eta_ry > 0")
+    time_exec = sign * np.asarray(fit["times"], np.complex128)
+    alpha_exec = (np.asarray(fit["weights"], np.complex128)
+                  * np.exp(-eta * time_exec))
+    if one_sided_hermitian:
+        alpha_exec = 1.0j * alpha_exec
+    return MinimaxNodes(
+        t=jnp.asarray(time_exec, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128))
+
+
 def plan_sigma_windows(
     pole_summaries,
     branches,
@@ -452,36 +592,29 @@ def plan_sigma_windows(
             if not local.size or not pole_indices.size:
                 continue
             states = raw_energy[local]
-            box, raw_real, pole_extent = _box_for_window(
-                frequencies, states, pole_stats, pole_sign, eta)
-            kind = ("sign_definite_positive" if box[0] > 0.0 else
-                    "sign_definite_negative" if box[1] < 0.0 else
-                    "crossing")
-            e_ref_a, e_ref_b = _factor_references(
-                kind, pole_sign, states, pole_stats)
-            spec = {
-                "name": f"{branch.tag}:{name}", "branch": branch,
-                "states": states, "state_indices": flat_indices[local],
+            spec = make_sigma_box_spec(
+                name=f"{branch.tag}:{name}", frequencies=frequencies,
+                states=states, pole_stats=pole_stats,
+                pole_sign=pole_sign, eta_ry=eta)
+            spec.update({
+                "branch": branch,
+                "state_indices": flat_indices[local],
                 "state_shape": state_shape.shape,
                 "state_interval": (float(state_lo), float(state_hi)),
-                "pole_indices": pole_indices, "pole_stats": pole_stats,
+                "pole_indices": pole_indices,
                 "pole_bounds": (float(pole_lo), float(pole_hi)),
-                "pole_extent": pole_extent, "pole_sign": pole_sign,
                 "omega_abs": np.asarray(branch.omega_abs, np.float64),
-                "omega_idx": positions, "frequencies": frequencies,
-                "raw_real_support": raw_real, "box": box, "kind": kind,
-                "conjugate": pole_sign < 0.0,
-                "E_ref_A": e_ref_a, "E_ref_B": e_ref_b,
+                "omega_idx": positions,
                 "branch_report": report,
-            }
+            })
             specs.append(spec)
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
 
-    fits, fit_rows = _parallel_fits(
-        specs, lambda index: _fit_rule(
-            specs[index], tolerance, budget, cache_dir, eta))
+    fits, fit_rows = fit_sigma_box_specs(
+        specs, eta, eps=tolerance, reduction_seconds=budget,
+        cache_dir=cache_dir)
     pairs = sum(row["node_count"] for row in fits)
     if pairs > ceiling:
         raise RuntimeError(
@@ -490,18 +623,13 @@ def plan_sigma_windows(
 
     output = []
     for spec, fit in zip(specs, fits):
-        time_exec = spec["pole_sign"] * np.asarray(
-            fit["times"], np.complex128)
-        alpha_exec = (np.asarray(fit["weights"], np.complex128)
-                      * np.exp(-eta * time_exec))
         mask = np.zeros(int(np.prod(spec["state_shape"])), dtype=bool)
         mask[np.asarray(spec["state_indices"], np.int64)] = True
         external_sign = -1 if spec["branch"].neg_omega_half else 1
         window = _SigmaWindow(
             name=spec["name"],
-            nodes=MinimaxNodes(
-                t=jnp.asarray(time_exec, dtype=jnp.complex128),
-                alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128)),
+            nodes=sigma_box_executor_nodes(
+                fit, spec["pole_sign"], eta),
             mask_A=mask.reshape(spec["state_shape"]),
             E_ref_A=spec["E_ref_A"], E_ref_B=spec["E_ref_B"],
             omega_sign=int(spec["pole_sign"]) * external_sign,
@@ -562,4 +690,10 @@ def plan_sigma_windows(
     return output, geometry
 
 
-__all__ = ["plan_sigma_windows"]
+__all__ = [
+    "fit_sigma_box_specs",
+    "make_sigma_box_spec",
+    "plan_sigma_windows",
+    "resolve_sigma_box_cache_dir",
+    "sigma_box_executor_nodes",
+]

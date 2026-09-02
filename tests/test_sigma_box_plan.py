@@ -1,4 +1,4 @@
-"""Conventions and wiring gates for the MPA denominator-box plan."""
+"""Conventions and wiring gates for the shared denominator-box plan."""
 
 import ast
 from pathlib import Path
@@ -11,7 +11,7 @@ import pytest
 from gw.mpa.sigma import _batch_rows
 from gw.ppm_windows import _SigmaBranch
 from gw.sigma_box_plan import plan_sigma_windows
-from minimax.uniform_rule import UniformRule
+from minimax import UniformRule
 
 
 def _branch(tag="positive conduction", *, space="cond", negative=False):
