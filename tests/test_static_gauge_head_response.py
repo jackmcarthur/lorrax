@@ -378,6 +378,107 @@ def test_packed_deck_off_head_keeps_the_bulk_body_reachable(tmp_path):
     assert not uses_coupled_photon_head(config)
 
 
+# ---------------------------------------------------------------------------
+# ONE envelope table, labelled, with the mode-required settings DERIVED
+# (lane J architecture review section 3)
+# ---------------------------------------------------------------------------
+
+def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
+    """The envelope had two owners; a condition written twice will differ.
+
+    ``packed_bare_transverse_route``'s conditions and
+    ``refuse_unsupported_bispinor_gw``'s requirements restated five
+    conjuncts with separately formatted got/want strings.  Both now walk
+    ``packed_static_envelope``.
+    """
+    import inspect
+    from gw import gw_config
+
+    for fn in (gw_config.packed_bare_transverse_route,
+               gw_config.refuse_unsupported_bispinor_gw):
+        assert "packed_static_envelope(" in inspect.getsource(fn), fn.__name__
+    shared = [row[2] for row in gw_config.packed_static_envelope(
+        _parse(tmp_path, _packed_deck()), screened=False)]
+    both = [row[2] for row in gw_config.packed_static_envelope(
+        _parse(tmp_path, _packed_deck()), screened=True)]
+    assert both[:len(shared)] == shared
+    assert len(both) == len(shared) + 4      # 5 shared + 4 screened-only
+
+
+def test_every_envelope_row_says_physics_or_implementation_limit(tmp_path):
+    """A refusal that does not say WHICH cannot be acted on.
+
+    "the envelope refuses this" tells a reader nothing about whether the
+    deck is wrong or the tree is incomplete.
+    """
+    from gw import gw_config
+    config = _parse(tmp_path, _packed_deck())
+    for row in gw_config.packed_static_envelope(config, screened=True):
+        assert row[3] in (gw_config._ENV_PHYSICS, gw_config._ENV_IMPL), row
+
+
+def test_the_eight_scalar_head_overrides_are_one_conjunct(tmp_path):
+    """Eight hand-written got/want rows became one predicate that names
+    only what the deck actually set."""
+    from gw.gw_config import scalar_head_overrides_named
+    assert scalar_head_overrides_named(_parse(tmp_path, _packed_deck())) == ()
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, _packed_deck(
+            extra="wcoul0_eta = 0.05\nuse_bgw_vcoul = true\n"))
+    message = str(exc.value)
+    assert "static_bispinor_photon_envelope" in message
+    assert "use_bgw_vcoul = true" in message
+    assert "wcoul0_eta = 0.05" in message
+    assert "no scalar q->0 head override named" in message
+    # and it names ONLY what was set
+    assert "vhead" not in message and "mc_average_placement" not in message
+
+
+def test_mode_required_settings_are_derived_not_declared(tmp_path):
+    """``low_mem_bands`` / ``w_dyson_solver`` are the only layout and the
+    only Dyson plan the packed screened mode has, so the deck must not
+    have to write them."""
+    lines = []
+    deck = (_packed_deck()
+            .replace("low_mem_bands = true\n", "")
+            .replace("w_dyson_solver = distributed\n", ""))
+    path = tmp_path / "derived.in"
+    path.write_text(deck)
+    config = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert config.memory.low_mem_bands is True
+    assert str(config.backend.w_dyson_solver) == "distributed"
+    assert uses_static_photon_response(config)
+    assert any("low_mem_bands was not named" in ln for ln in lines), lines
+    assert any("w_dyson_solver was not named" in ln for ln in lines), lines
+
+
+def test_an_explicit_conflicting_value_is_still_refused_not_overridden(
+        tmp_path):
+    """Rule 13: derive what the deck left unsaid, refuse what it said."""
+    deck = _packed_deck().replace(
+        "low_mem_bands = true", "low_mem_bands = false")
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, deck)
+    message = str(exc.value)
+    assert "static_bispinor_photon_envelope" in message
+    assert "low_mem_bands = false" in message
+
+
+def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):
+    """The promotion must not fire for a deck that is outside the envelope
+    for some OTHER reason, or a bad deck would be told about a key it
+    never wrote."""
+    deck = (_packed_deck()
+            .replace("low_mem_bands = true\n", "")
+            .replace("compute_mode = cohsex", "compute_mode = gn_ppm"))
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, deck)
+    message = str(exc.value)
+    assert "compute_mode = gn_ppm" in message
+    assert "low_mem_bands" not in message
+
+
 def test_retired_charge_hall_cubature_spelling_names_the_new_mode(tmp_path):
     deck = _packed_deck().replace(
         "bispinor_gw = full_static_cohsex",

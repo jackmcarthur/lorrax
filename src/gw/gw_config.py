@@ -3596,6 +3596,146 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
+#: How a reader should read an unmet envelope condition.  PHYSICS means the
+#: quantity does not exist outside the condition; IMPLEMENTATION LIMIT means
+#: it exists and nobody has written it.  Printed in every refusal, because
+#: "the envelope refuses this" says nothing about whether the deck is wrong
+#: or the tree is incomplete.
+_ENV_PHYSICS = "PHYSICS"
+_ENV_IMPL = "IMPLEMENTATION LIMIT"
+
+
+#: Scalar q->0 head controls that the packed Gamma-cell completion does not
+#: read.  ONE predicate instead of eight separately formatted conjuncts
+#: (lane J section 3): the completion builds its own S/Y/Z from the
+#: canonical qsgw response and performs its own bordered mini-BZ solve, so
+#: accepting any of these would falsely claim they entered that algebra.
+#: Rule 13 -- refuse rather than ignore.
+_SCALAR_HEAD_OVERRIDES: tuple[tuple[str, object], ...] = (
+    # BGW vcoul is a scalar parity diagnostic, not a certified four-current
+    # kernel: applying it to CC only would make the finite-q packed photon
+    # operator internally hybrid, and propagating it through TT needs a
+    # canonical scalar sampler and its own photon certification.
+    # Every probe returns None for "the deck left this alone" -- NOT False:
+    # ``False`` is a value, and reading it as one is how a default deck came
+    # to be refused for naming an override it never wrote.
+    ("use_bgw_vcoul = true",
+     lambda c: True if bool(c.head.use_bgw_vcoul) else None),
+    ("wcoul0_source = {}", lambda c: (
+        None if str(c.head.wcoul0_source).strip().lower() == "s_tensor"
+        else c.head.wcoul0_source)),
+    # eta does reach the analytic charge response, but no matching
+    # broadening exists in the finite-q current response, so a nonzero eta
+    # is an inconsistent charge-only prescription, not a knob.
+    ("wcoul0_eta = {}", lambda c: (
+        None if float(c.head.wcoul0_eta) == 0.0 else c.head.wcoul0_eta)),
+    ("vhead = {}", lambda c: c.head.vhead),
+    ("whead_0freq = {}", lambda c: c.head.whead_0freq),
+    ("whead_imfreq = {}", lambda c: c.head.whead_imfreq),
+    ("mc_average_placement = {}", lambda c: (
+        None if str(c.head.mc_average_placement) == "off"
+        else c.head.mc_average_placement)),
+    ("mc_average_placement_vcoul = {}",
+     lambda c: c.head.mc_average_placement_vcoul),
+)
+
+
+def scalar_head_overrides_named(config) -> tuple[str, ...]:
+    """Which scalar-head overrides this deck names, formatted for a message.
+
+    Empty for every deck that leaves them alone, which is the whole point:
+    the envelope's ``got``/``want`` used to be eight hand-written rows and
+    is now one line naming only what the deck actually set.
+    """
+    named = []
+    for template, probe in _SCALAR_HEAD_OVERRIDES:
+        value = probe(config)
+        if value is None:
+            continue
+        named.append(template.format(value) if "{}" in template else template)
+    return tuple(named)
+
+
+def packed_static_envelope(config, *, screened: bool):
+    """THE envelope of the packed static photon operator, as ONE table.
+
+    It used to be two: six conditions inside
+    :func:`packed_bare_transverse_route` and seventeen inside
+    :func:`refuse_unsupported_bispinor_gw`, five of them restated with
+    separately formatted ``got``/``want`` strings (lane J section 6.2,
+    quality pattern #3 -- shadow accounting).  A condition that is written
+    twice is a condition that will differ.
+
+    Yields ``(accepted, got, want, klass, why, derived_key)`` in the order
+    a reader should meet them.  ``derived_key`` names the deck key that
+    :meth:`LorraxConfig.from_input_file` SETS for this mode when the deck
+    did not name it (``None`` for a row the deck must satisfy itself), so
+    the promotion and the refusal read the same table instead of
+    re-deriving each other.  ``screened`` selects the packed SCREENED mode
+    (``full_static_cohsex``): the extra rows are the ones that only bite
+    when the twelve current ``chi`` blocks and the packed Dyson solve are
+    actually built.  ``sys_dim`` is deliberately NOT here -- the bare route
+    treats it as a routing condition while the screened mode refuses it
+    only under ``head_correction = full`` (``GATE
+    static_bispinor_photon_head_slab_only``), and one row cannot honestly
+    say both.
+    """
+    yield (config.compute_mode is ComputeMode.COHSEX,
+           f"compute_mode = {config.compute_mode.value}",
+           "compute_mode = cohsex", _ENV_PHYSICS,
+           "the photon response is built once at omega = 0; the four-current "
+           "sector has no frequency axis at all", None)
+    yield (config.qp_solver is QPSolver.ONE_SHOT_DFT,
+           f"qp_solver = {config.qp_solver.value}",
+           "qp_solver = one_shot_dft", _ENV_IMPL,
+           "no self-consistent map exists for the packed 4x4 operator", None)
+    yield (config.screening.diagrams is ScreeningDiagrams.W_RPA,
+           f"screening_diagrams = {config.screening.diagrams.value}",
+           "screening_diagrams = w_rpa", _ENV_IMPL,
+           "the ladder/resolvent facade has no packed four-current operand",
+           None)
+    yield (config.head.correction in (HeadCorrection.FULL, HeadCorrection.OFF),
+           f"head_correction = {config.head.correction.value}",
+           "head_correction = full (the default), or off for a DEBUG "
+           "headless body", _ENV_PHYSICS,
+           "heads are always on with bispinors and 'off' is the announced "
+           "DEBUG skip (owner ruling 2026-09-01, "
+           "docs/architecture/decisions.md; TASTE.md row 20)", None)
+    yield (not bool(config.restart), "restart = true", "restart = false",
+           _ENV_IMPL,
+           "there is no photon restart storage: the packed V/W and the "
+           "Gamma-cell completion are not in the restart schema, so a "
+           "restarted deck would silently fall back to a different q->0 "
+           "head mechanism", None)
+    if not screened:
+        return
+    yield (str(config.mpa.material_class).strip().lower() == "insulator",
+           f"mpa_material_class = {config.mpa.material_class}",
+           "mpa_material_class = insulator", _ENV_PHYSICS,
+           "the completion evaluates S(0) of an insulator; the Hall "
+           "producer refuses metals for the same reason", None)
+    yield (bool(config.memory.low_mem_bands), "low_mem_bands = false",
+           "low_mem_bands = true", _ENV_IMPL,
+           "the sixteen-block no-pair chi0 kernel is written against the "
+           "face layout only.  DERIVED: an unnamed low_mem_bands is set to "
+           "true for this mode at parse time, so this row can only fire on "
+           "an explicit conflicting value", "low_mem_bands")
+    yield (str(config.backend.w_dyson_solver) == "distributed",
+           f"w_dyson_solver = {config.backend.w_dyson_solver}",
+           "w_dyson_solver = distributed", _ENV_IMPL,
+           "the packed Dyson solve has only the distributed plan.  DERIVED: "
+           "an unnamed w_dyson_solver is set to distributed for this mode at "
+           "parse time, so this row can only fire on an explicit conflicting "
+           "value", "w_dyson_solver")
+    _overrides = scalar_head_overrides_named(config)
+    yield (not _overrides, ", ".join(_overrides),
+           "no scalar q->0 head override named", _ENV_IMPL,
+           "the coupled photon path builds its own direct S/Y/Z from the "
+           "canonical qsgw response and performs its own bordered mini-BZ "
+           "solve; scalar HeadResolver source/override controls never enter "
+           "that algebra, so accepting one would claim it did", None)
+
+
 def packed_bare_transverse_route(config) -> tuple[bool, str]:
     """Is the bare-transverse family served by the packed photon path?
 
@@ -3633,21 +3773,13 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     # resolving property that can itself refuse) touched by this predicate.
     if not bool(config.bispinor):
         return False, "bispinor = false (no transverse channels to pack)"
-    conditions = (
-        (config.compute_mode is ComputeMode.COHSEX,
-         f"compute_mode = {config.compute_mode.value}", "compute_mode = cohsex"),
-        (config.qp_solver is QPSolver.ONE_SHOT_DFT,
-         f"qp_solver = {config.qp_solver.value}", "qp_solver = one_shot_dft"),
-        (config.screening.diagrams is ScreeningDiagrams.W_RPA,
-         f"screening_diagrams = {config.screening.diagrams.value}",
-         "screening_diagrams = w_rpa"),
-        (int(config.sys_dim) == 2, f"sys_dim = {config.sys_dim}", "sys_dim = 2"),
-        (config.head.correction in (HeadCorrection.FULL, HeadCorrection.OFF),
-         f"head_correction = {config.head.correction.value}",
-         "head_correction = full (the default) or off"),
-        (not bool(config.restart), "restart = true", "restart = false"),
-    )
-    for accepted, got, want in conditions:
+    if int(config.sys_dim) != 2:
+        # Not in the shared table: the screened mode refuses a bulk deck
+        # only under head_correction = full, and one row cannot say both.
+        return False, (f"sys_dim = {config.sys_dim} "
+                       "(the packed bare route wants sys_dim = 2)")
+    for accepted, got, want, _klass, _why, _derived in packed_static_envelope(
+            config, screened=False):
         if not accepted:
             return False, f"{got} (the packed bare route wants {want})"
     return True, "bispinor slab one-shot static COHSEX"
@@ -3738,16 +3870,18 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"density_self_consistent = {bool(config.density_self_consistent)}\n"
             "  want: density_self_consistent = true (or "
             "qp_solver = one_shot_dft)")
-    if mode is BispinorGWMode.BARE_TRANSVERSE:
-        # The packed bare route inserts the bare <D_TT> q=Gamma head through
-        # the SAME Gamma-cell completion that carries the charge head, so the
-        # hand overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
-        # (gw.v_q_bispinor._tt_head_tensor) would be counted twice.  Refuse
-        # rather than let the key move the route: which route runs must not
-        # depend on a head dial (docs/input_reference.md, bispinor_gw).
-        route_taken, _route_reason = packed_bare_transverse_route(config)
-        if route_taken and bool(config.head.bispinor_tt_head_correction):
-            raise ValueError(
+    # EITHER packed static mode inserts the bare <D_TT> q=Gamma head through
+    # the Gamma-cell completion that carries the charge head, so the hand
+    # overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
+    # (gw.v_q_bispinor._tt_head_tensor) would be counted twice.  ONE gate for
+    # both, no longer a row of the envelope table: the deck key is gone, so
+    # this is the hand-built-config guard, and a route must never be moved by
+    # a head dial.  (The gate id keeps its bare-route name so the docs, the
+    # tests and this message stay one string; lane N deletes it with the
+    # overlay.)
+    if (uses_static_photon_response(config)
+            and bool(config.head.bispinor_tt_head_correction)):
+        raise ValueError(
                 "GATE packed_bare_transverse_tt_head_double_count: "
                 f"bispinor_gw = {mode.value} is refused with "
                 "bispinor_tt_head_correction = true inside the packed "
@@ -3769,6 +3903,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "head is on by default with the charge head\n"
                 "  doc:  docs/input_reference.md, "
                 "bispinor_tt_head_correction.")
+    if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if not bool(config.bispinor):
         raise ValueError(
@@ -3796,70 +3931,8 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "  fix:  set sys_dim = 2, or head_correction = off for a "
             "DEBUG headless body (not a production calculation)\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
-    requirements = (
-        (config.compute_mode is ComputeMode.COHSEX,
-         f"compute_mode = {config.compute_mode.value}",
-         "compute_mode = cohsex"),
-        (config.screening.diagrams is ScreeningDiagrams.W_RPA,
-         f"screening_diagrams = {config.screening.diagrams.value}",
-         "screening_diagrams = w_rpa"),
-        (config.head.correction in (HeadCorrection.FULL, HeadCorrection.OFF),
-         f"head_correction = {config.head.correction.value}",
-         "head_correction = full (the default), or off for a DEBUG "
-         "headless body"),
-        (config.qp_solver is QPSolver.ONE_SHOT_DFT,
-         f"qp_solver = {config.qp_solver.value}",
-         "qp_solver = one_shot_dft"),
-        (str(config.mpa.material_class).strip().lower() == "insulator",
-         f"mpa_material_class = {config.mpa.material_class}",
-         "mpa_material_class = insulator"),
-        (not bool(config.restart), "restart = true", "restart = false"),
-        (bool(config.memory.low_mem_bands), "low_mem_bands = false",
-         "low_mem_bands = true"),
-        (str(config.backend.w_dyson_solver) == "distributed",
-         f"w_dyson_solver = {config.backend.w_dyson_solver}",
-         "w_dyson_solver = distributed"),
-        (not bool(config.head.bispinor_tt_head_correction),
-         "bispinor_tt_head_correction = true",
-         "bispinor_tt_head_correction = false"),
-        # BGW vcoul is a scalar parity diagnostic, not a certified
-        # four-current kernel.  Applying it to CC only would make the finite-q
-        # packed photon operator internally hybrid; propagating it through TT
-        # needs a canonical scalar sampler and its own photon certification.
-        (not bool(config.head.use_bgw_vcoul),
-         "use_bgw_vcoul = true",
-         "use_bgw_vcoul = false (the default)"),
-        # The coupled photon path constructs its direct S/Y/Z from the
-        # canonical qsgw response and performs its own bordered mini-BZ solve.
-        # Scalar HeadResolver source/override controls do not enter that
-        # algebra; accepting a non-default value would falsely claim they did.
-        # eta does reach the analytic charge response, but no matching
-        # broadening exists in the finite-q current response, so nonzero eta
-        # is refused as an inconsistent charge-only prescription.
-        (str(config.head.wcoul0_source).strip().lower() == "s_tensor",
-         f"wcoul0_source = {config.head.wcoul0_source}",
-         "wcoul0_source = s_tensor (the default)"),
-        (float(config.head.wcoul0_eta) == 0.0,
-         f"wcoul0_eta = {config.head.wcoul0_eta}",
-         "wcoul0_eta = 0 (the default)"),
-        (config.head.vhead is None,
-         f"vhead = {config.head.vhead}",
-         "vhead unset"),
-        (config.head.whead_0freq is None,
-         f"whead_0freq = {config.head.whead_0freq}",
-         "whead_0freq unset"),
-        (config.head.whead_imfreq is None,
-         f"whead_imfreq = {config.head.whead_imfreq}",
-         "whead_imfreq unset"),
-        (str(config.head.mc_average_placement) == "off",
-         f"mc_average_placement = {config.head.mc_average_placement}",
-         "mc_average_placement = off (the default)"),
-        (config.head.mc_average_placement_vcoul is None,
-         ("mc_average_placement_vcoul = "
-          f"{config.head.mc_average_placement_vcoul}"),
-         "mc_average_placement_vcoul unset"),
-    )
-    for accepted, got, want in requirements:
+    for accepted, got, want, klass, why, _derived in packed_static_envelope(
+            config, screened=True):
         if accepted:
             continue
         raise ValueError(
@@ -3867,14 +3940,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"bispinor_gw = {mode.value} is refused with {got}.\n"
             f"  got:  {got}\n"
             f"  want: {want}\n"
-            "  why:  the packed-photon mode is a deliberately narrow "
+            f"  why:  {klass}.  {why}.\n"
+            "  note: the packed-photon mode is a deliberately narrow "
             "full-BZ, one-shot insulating static calculation whose "
             "Gamma-cell completion carries the charge CC q^2 head, the "
-            "charge wings and the optional Hall CT/TC term (the "
-            "current q^2/contact/complement terms are omitted by model). "
-            "Photon restart storage, self-consistency, scalar head "
-            "overlays and dynamic photon models are not silently "
-            "approximated here.\n"
+            "charge wings and the optional Hall CT/TC term; the current "
+            "q^2/contact/complement terms are omitted by model.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
 
 
@@ -5786,6 +5857,37 @@ class LorraxConfig:
                 "  [config provenance] bispinor qp_solver=self_consistent: "
                 "density_self_consistent was not named; enabling the "
                 "required live (rho, J) Hartree rebuild")
+        # DERIVED, NOT DECLARED (lane J section 3).  ``low_mem_bands`` and
+        # ``w_dyson_solver`` are not dials of the packed screened static
+        # photon mode -- they are the only layout and the only Dyson plan it
+        # is written against -- so the deck should not have to write them.
+        # Promote only when EVERY OTHER envelope row already passes: a deck
+        # that is outside the envelope for some other reason must still see
+        # that reason, not a low_mem_bands refusal it never asked for.  An
+        # explicitly named conflicting value is left alone and refused by
+        # the envelope (rule 13: refuse rather than ignore).
+        if (bool(resolved.bispinor)
+                and resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX):
+            _unmet = [row for row in packed_static_envelope(
+                resolved, screened=True) if not row[0]]
+            if _unmet and all(row[5] for row in _unmet):
+                _promotions = {
+                    "low_mem_bands": ("memory", True),
+                    "w_dyson_solver": ("backend", "distributed"),
+                }
+                for row in _unmet:
+                    key = row[5]
+                    if key in _named_keys:
+                        continue
+                    group, value = _promotions[key]
+                    resolved = _dc_replace(resolved, **{group: _dc_replace(
+                        getattr(resolved, group), **{key: value})})
+                    print_fn(
+                        "  [config provenance] bispinor_gw = "
+                        f"full_static_cohsex: {key} was not named; setting "
+                        f"{key} = {value} (the packed response is written "
+                        "against the face layout and the distributed Dyson "
+                        "plan; docs/input_reference.md, bispinor_gw)")
         # CROSS-KEY, and therefore after the record exists: the w_bse
         # refusals read resolved axes (compute_mode / qp_solver fold in the
         # legacy flags), and the honest way to ask which mode a deck chose
