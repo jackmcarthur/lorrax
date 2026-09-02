@@ -258,8 +258,8 @@ producer. The surviving lift selector is `RAW_KINETIC_BALANCE_LIFT = "raw"`;
 (`src/common/bispinor_init.py`) remains library code for the jet tests.
 
 **`static_bispinor_photon_envelope` is a gate id, not a function.** It is
-the raise at `gw_config.py:3997`, over the nine rows of
-`packed_static_envelope` (the table in Stage 1). **Nine**, down from
+the raise at `gw_config.py:3997`, over the eight rows of
+`packed_static_envelope` (the table in Stage 1). **Eight**, down from
 seventeen (`lane/bisp-l-dials-envelope-2026-09-01`), and each unmet row
 prints `PHYSICS` or `IMPLEMENTATION LIMIT` with its own reason. `full` is the
 default and runs the Γ completion, `off` is a DEBUG skip, and
