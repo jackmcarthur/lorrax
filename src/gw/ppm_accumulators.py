@@ -370,8 +370,16 @@ class _WindowAccum:
         self.omega_indices = (
             None if window.omega_indices is None
             else np.asarray(window.omega_indices, dtype=np.int64))
-        self.omega_vec = (omega_vec if self.omega_indices is None
-                          else omega_vec[self.omega_indices])
+        omega_values = getattr(window, "omega_values", None)
+        if omega_values is not None and self.omega_indices is None:
+            raise ValueError("omega_values requires omega_indices")
+        self.omega_vec = (
+            omega_vec if self.omega_indices is None
+            else (omega_vec[self.omega_indices] if omega_values is None
+                  else np.asarray(omega_values, dtype=np.complex128)))
+        if (self.omega_indices is not None
+                and self.omega_vec.shape != self.omega_indices.shape):
+            raise ValueError("omega_values must match omega_indices")
         self.win_shards: list | None = None
         self.pending_count = 0
         self.closed = False
@@ -563,11 +571,19 @@ def _device_output_zeros(shape, sharding):
         out_shardings=sharding)
 
 
-@lru_cache(maxsize=8)
-def _device_omega_add(sharding):
+def _omega_fold(acc, sigma, coeff, omega_axis):
+    """Add ``coeff[omega] * sigma`` with an explicit omega-axis position."""
+    coeff_shape = ((1,) * omega_axis + (coeff.shape[0],)
+                   + (1,) * (acc.ndim - omega_axis - 1))
+    return acc + coeff.reshape(coeff_shape) * jnp.expand_dims(
+        sigma, axis=omega_axis)
+
+
+@lru_cache(maxsize=16)
+def _device_omega_add(sharding, omega_axis):
     return jax.jit(
-        lambda acc, sigma, coeff: (
-            acc + coeff.reshape((-1, 1, 1, 1)) * sigma[None, ...]),
+        lambda acc, sigma, coeff: _omega_fold(
+            acc, sigma, coeff, omega_axis),
         donate_argnums=(0,), out_shardings=sharding)
 
 
@@ -589,14 +605,21 @@ class DeviceOmegaAccumulator:
     overflowing two factors whose product is well conditioned.
     """
 
-    def __init__(self, omega_vec, *, shape, sharding):
+    def __init__(self, omega_vec, *, shape, sharding, omega_axis):
         self._shape = tuple(int(n) for n in shape)
         self._sharding = sharding
         self._replicated = NamedSharding(sharding.mesh, P())
         self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
-        if self._shape[0] != self._omega.size:
+        self._omega_axis = int(omega_axis)
+        if self._omega_axis < 0:
+            self._omega_axis += len(self._shape)
+        if not 0 <= self._omega_axis < len(self._shape):
             raise ValueError(
-                "DeviceOmegaAccumulator: shape[0] must equal n_omega")
+                "DeviceOmegaAccumulator: omega_axis outside output rank")
+        if self._shape[self._omega_axis] != self._omega.size:
+            raise ValueError(
+                "DeviceOmegaAccumulator: shape[omega_axis] must equal "
+                "n_omega")
         # Per-rank ω-cube: nω·nk·(nb_pad/p_x)·(nb_pad/p_y)·16 bytes (c128),
         # ×2 while a crossing window holds its temporary cube open.
         self._total = _device_output_zeros(self._shape, sharding)()
@@ -646,7 +669,7 @@ class DeviceOmegaAccumulator:
         coeff = jax.ShapeDtypeStruct(
             (self._omega.size,), jnp.complex128,
             sharding=self._replicated)
-        _device_omega_add(self._sharding).lower(
+        _device_omega_add(self._sharding, self._omega_axis).lower(
             self._total, sigma, coeff).compile()
 
     def add_tau(self, sigma_tau):
@@ -658,10 +681,12 @@ class DeviceOmegaAccumulator:
             self._coeff[self._index], self._replicated)
         self._index += 1
         if self._window is None:
-            self._total = _device_omega_add(self._sharding)(
+            self._total = _device_omega_add(
+                self._sharding, self._omega_axis)(
                 self._total, sigma_tau, coeff)
         else:
-            self._window = _device_omega_add(self._sharding)(
+            self._window = _device_omega_add(
+                self._sharding, self._omega_axis)(
                 self._window, sigma_tau, coeff)
 
     def end_window(self):
@@ -696,7 +721,8 @@ class DeviceOmegaAccumulator:
         coeff = np.zeros(self._omega.size, dtype=np.complex128)
         coeff[index] = complex(coefficient)
         coeff = device_put_process_local(coeff, self._replicated)
-        self._total = _device_omega_add(self._sharding)(
+        self._total = _device_omega_add(
+            self._sharding, self._omega_axis)(
             self._total, sigma_omega, coeff)
 
     def finalize(self):
@@ -732,9 +758,15 @@ class _MemoryTileSink(_WindowSink):
     (``sigma_kij_host`` add, ``_to_host_np``) sees the same (m_X, n_Y) sharding.
     """
 
-    def __init__(self, shape: tuple[int, ...], sharding: NamedSharding):
+    def __init__(self, shape: tuple[int, ...], sharding: NamedSharding,
+                 *, omega_axis: int):
         self._shape = shape
         self._sharding = sharding
+        self._omega_axis = int(omega_axis)
+        if self._omega_axis < 0:
+            self._omega_axis += len(self._shape)
+        if not 0 <= self._omega_axis < len(self._shape):
+            raise ValueError("_MemoryTileSink: omega_axis outside output rank")
         self._total_shards: list[np.ndarray] | None = None
         self._devices: list | None = None
         self._omega_clustered: bool | None = None
@@ -762,7 +794,8 @@ class _MemoryTileSink(_WindowSink):
                 self._total_shards = []
                 for w in win_shards:
                     shape = list(w.shape)
-                    shape[1] = int(self._shape[1])
+                    shape[self._omega_axis] = int(
+                        self._shape[self._omega_axis])
                     self._total_shards.append(
                         np.zeros(tuple(shape), dtype=w.dtype))
             self._devices = list(shard_devices)
@@ -820,11 +853,11 @@ class _MemoryTileSink(_WindowSink):
                      for _ in devices]
             index4 = [tuple(dmap[d]) for d in devices]
             return tiles, index4, devices
-        # _index holds the 4-D σ^τ indices (n_brk, nk, m, n); the sink's
-        # global shape inserts the ω axis BEHIND the leading bracket axis →
-        # splice a full slice in at position 1.
-        index5 = [(ix[0], slice(None)) + tuple(ix[1:]) for ix in self._index]
-        return self._total_shards, index5, self._devices
+        # The sink inserts the omega axis at the same explicit position in
+        # the global shape and in each sigma(tau) shard index.
+        index_out = [tuple(ix[:self._omega_axis]) + (slice(None),)
+                     + tuple(ix[self._omega_axis:]) for ix in self._index]
+        return self._total_shards, index_out, self._devices
 
     def result(self) -> jax.Array:
         if self._total_shards is None:

@@ -407,7 +407,8 @@ def test_memory_tile_sink_splices_disjoint_omega_clusters():
     """Cluster rows assemble on the existing bracket-then-omega layout."""
     from gw.ppm_accumulators import _MemoryTileSink
 
-    sink = _MemoryTileSink(shape=(1, 5, 1, 1, 1), sharding=None)
+    sink = _MemoryTileSink(
+        shape=(1, 5, 1, 1, 1), sharding=None, omega_axis=1)
     shard_index = [(slice(None), slice(None), slice(None), slice(None))]
     devices = [None]
     sink.consume_window(

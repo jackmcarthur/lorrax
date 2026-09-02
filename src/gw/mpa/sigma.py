@@ -158,7 +158,7 @@ def _integrate_sigma_batches(
         shape = (omega.size, int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
     output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     accumulator = DeviceOmegaAccumulator(
-        omega, shape=shape, sharding=output_sharding)
+        omega, shape=shape, sharding=output_sharding, omega_axis=0)
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
