@@ -1628,6 +1628,19 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
 UNIFORM_RULE_TIME_BUDGET_SECONDS = 15.0   # Gauss reduction cap per window; the interpolatory rule is ready after ~1 s
 
 
+def _uniform_rule_budget():
+    """Seconds the Gauss reduction may spend per window.
+
+    ``LORRAX_UNIFORM_RULE_BUDGET_S`` overrides the 15 s default.  The rule
+    depends only on (box, eps), so the budget trades planning seconds for
+    nodes: about 15 s keeps the crossing windows near 0.75 of the family
+    rank, about 100 s reaches the Gauss count (~0.5 rank).  The right
+    setting is a fraction of the Sigma execution the plan serves.
+    """
+    value = os.environ.get("LORRAX_UNIFORM_RULE_BUDGET_S", "").strip()
+    return float(value) if value else UNIFORM_RULE_TIME_BUDGET_SECONDS
+
+
 def _uniform_rule_eps():
     """Sup-norm tolerance of the measure-independent box rule, or None.
 
@@ -1673,7 +1686,7 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     hi = re_hi + pad if re_hi >= 0.0 else min(re_hi + pad, 0.7 * re_hi)
     box = (lo, hi, float(np.min(d.imag)), float(np.max(d.imag)))
     rule = build_uniform_rule(
-        box, float(eps), time_budget=UNIFORM_RULE_TIME_BUDGET_SECONDS)
+        box, float(eps), time_budget=_uniform_rule_budget())
     times, weights = rule.times, rule.weights
     if conjugate:
         times, weights = -np.conj(times), np.conj(weights)
