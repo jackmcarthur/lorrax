@@ -89,6 +89,39 @@ def _run(W, req, trs_allowed, strict=True, monkeypatch=None):
 
 
 # ---------------------------------------------------------------------------
+# Which tree is this file actually testing?
+# ---------------------------------------------------------------------------
+
+def test_this_file_is_testing_the_tree_it_was_launched_from():
+    """The launcher's banner is not evidence about the import path.
+
+    ``lx run`` announces ``[lx] source tree: $LORRAX_CHECKOUT/src`` and then
+    exports ``PYTHONPATH=$LORRAX_ROOT/src`` from the BASE MODULE, so a payload
+    can import a different checkout than the one the banner names -- measured
+    2026-09-01 on this worktree, where a bare ``lx run`` canary resolved
+    ``gw.screening`` under ``lorrax_A`` (KNOWN_SANDBOX_ERRORS.md).  A gate that
+    passed under that condition is a statement about somebody else's source.
+
+    So this cell answers the question in-band, from inside the same process
+    that runs every other cell in this file, and it fails loudly rather than
+    skipping when ``LORRAX_CHECKOUT`` is unset -- an unanswerable provenance
+    question reported as a pass is the failure mode it exists to prevent.
+    """
+    import os
+
+    from gw import screening
+
+    want = os.environ.get("LORRAX_CHECKOUT")
+    assert want, ("LORRAX_CHECKOUT is unset, so this file cannot say which "
+                  "tree it tested; set it before trusting any verdict here")
+    root = os.path.realpath(want) + os.sep
+    for mod in (sanity, screening):
+        assert os.path.realpath(mod.__file__).startswith(root), (
+            f"{mod.__name__} resolved to {mod.__file__}, which is NOT under "
+            f"{want} -- this run tested a different checkout")
+
+
+# ---------------------------------------------------------------------------
 # The two-by-two
 # ---------------------------------------------------------------------------
 
