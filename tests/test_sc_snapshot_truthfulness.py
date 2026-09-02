@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ast
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -198,3 +199,20 @@ def test_the_verdict_dataclass_still_carries_what_the_stamp_reads():
     for field in ("max_abs_ev", "rms_protected_ev", "n_protected",
                   "n_total", "cutoff_ev", "converged"):
         assert hasattr(v, field), field
+
+
+def test_sc_dump_persists_the_exact_map_rotation(tmp_path, monkeypatch):
+    """The mechanism audit needs U for every map, not only final energies."""
+    rotation = np.array(
+        [[[0.0, 1.0j], [1.0, 0.0]]], dtype=np.complex128)
+    inputs = SimpleNamespace(
+        config=SimpleNamespace(sc=SimpleNamespace(dump_dir=str(tmp_path))),
+        print_fn=lambda *_args, **_kwargs: None,
+    )
+    state = SimpleNamespace(outputs=SimpleNamespace(sigma_basis_U=rotation))
+    monkeypatch.setattr(sc_iteration, "barrier", lambda *_a, **_k: None)
+
+    path = sc_iteration._dump_sc_rotation(inputs, state, call_index=7)
+
+    assert path == str(tmp_path / "rotation_iter0007.npy")
+    np.testing.assert_array_equal(np.load(path), rotation)

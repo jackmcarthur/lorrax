@@ -2620,13 +2620,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             fit_mask_kn=fit_mask_kn,
             k_weights=k_star_weights(ks),
             # The sum-band tail is not part of the rotated QP subspace. Its
-            # update is a rigid edge scissor defined by a fixed physical
-            # manifold, not an affine regression whose sample count changes
-            # with ncond. Reuse the deck's explicit near-degeneracy scale: it
-            # identifies the SOC-split frontier and is independent of the SC
-            # stopping tolerance.
-            conduction_frontier_tol_ev=(
-                float(inputs.config.degen_avg_tol_ry) * RYD_TO_EV),
+            # update is a rigid edge scissor defined by the lowest accidental-
+            # degeneracy manifold, not by a user-expanded near-degenerate/SOC
+            # scale.  A resolved 1.7 meV pair is physics and remains two
+            # distinct samples; only <=0.1 meV may be grouped here.
+            conduction_frontier_tol_ev=float(
+                inputs.config.sc.exact_degeneracy_tol_ev),
         )
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
@@ -3004,11 +3003,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             if transverse is None else
             _add_exact_four_current_hartree(
                 delta_h_dft, scalar, transverse))
-    # Apply the same BGW degenerate-manifold conditioning that the terminal
-    # driver applies, but at the map seam where it can affect the trajectory.
-    # Doing this only after the loop cannot cure a basis-dependent two-cycle.
-    # Average the correction, not H itself, so the immutable DFT splitting is
-    # retained exactly (the one-shot driver follows the same arithmetic).
+    # Symmetric averaging is confined to accidental/exact degeneracies.  It
+    # is intentionally NOT tied to ``degen_avg_tol_ry``: that general output
+    # convention may be user-expanded, while QSGW state identity must never
+    # erase a resolved SOC splitting to make a trajectory converge.  Average
+    # the correction, not H itself, so the immutable DFT splitting survives.
     e_dft_map = inputs.e_dft_active_kn_ry
     if not ks.is_identity:
         e_dft_map = ks.select(e_dft_map)
@@ -3017,7 +3016,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         delta_h_dft = average_matrix_diagonal(
             delta_h_dft,
             energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
-            tol_ry=float(inputs.config.degen_avg_tol_ry),
+            tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
+                    / RYD_TO_EV),
             mesh_xy=inputs.mesh_xy,
         )
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
@@ -3051,7 +3051,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             delta_h_dft_n3 = average_matrix_diagonal(
                 delta_h_dft_n3,
                 energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
-                tol_ry=float(inputs.config.degen_avg_tol_ry),
+                tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
+                        / RYD_TO_EV),
                 mesh_xy=inputs.mesh_xy,
             )
         _report_extrapolation_eqp_shift(
@@ -3541,6 +3542,36 @@ def _write_sc_z_snapshot(
                     f"{z_factor[ik, ib]:16.9f}\n")
 
 
+def _dump_sc_rotation(
+    inputs: SCInputs,
+    state_out: SCState,
+    *,
+    call_index: int,
+) -> str | None:
+    """Persist the exact DFT→QP rotation consumed by one SC map.
+
+    ``sigma_basis_U`` is already the full-BZ rotation paired with this map's
+    Sigma result.  The dump is opt-in through ``sc_dump_dir`` and is small for
+    diagnostic windows.  Every rank joins the gather and the post-write
+    barrier; only rank zero writes the ``.npy`` file.
+    """
+    dump_dir = inputs.config.sc.dump_dir
+    if not dump_dir:
+        return None
+
+    from common.collectives import gather_to_host, process_rank
+
+    rotation = gather_to_host(state_out.outputs.sigma_basis_U)
+    path = os.path.join(
+        dump_dir, f"rotation_iter{int(call_index):04d}.npy")
+    if process_rank() == 0:
+        os.makedirs(dump_dir, exist_ok=True)
+        np.save(path, np.asarray(rotation, dtype=np.complex128))
+    barrier(f"sc.rotation.{int(call_index):04d}.write",
+            print_fn=inputs.print_fn)
+    return path
+
+
 def _band_ranges(mask, *, band_offset: int) -> str:
     """Format a one-dimensional band mask as compact 1-based ranges."""
     indices = np.flatnonzero(np.asarray(mask, dtype=bool)) + band_offset + 1
@@ -3656,6 +3687,9 @@ def _write_sc_eqp_snapshot(
         detail="this is the renormalization table written beside the map "
                "spectrum; non-finite Z is a dynamic-Sigma pathology")
 
+    rotation_path = _dump_sc_rotation(
+        inputs, state_out, call_index=call_index)
+
     if process_rank() != 0:
         return None
 
@@ -3750,6 +3784,8 @@ def _write_sc_eqp_snapshot(
     # a sibling artifact, not a suffix that makes the map line unparsable.
     _record_sc(inputs, f"  SC map energies: {path}")
     _record_sc(inputs, f"  SC map Z factors: {z_path}")
+    if rotation_path is not None:
+        _record_sc(inputs, f"  SC map rotation: {rotation_path}")
     _record_sc(
         inputs,
         f"    SC iteration: call={int(call_index):04d} role={role} "
@@ -3770,6 +3806,23 @@ def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
         barrier_tag="sc.eqp_snapshots.clear", print_fn=print_fn)
     if removed:
         print_fn(f"  SC map energies: cleared {len(removed)} stale snapshots")
+
+
+def _clear_sc_rotation_snapshots(
+    dump_dir: str | None,
+    *,
+    print_fn=print,
+) -> None:
+    """Remove only rotation snapshots managed by ``sc_dump_dir``."""
+    if not dump_dir:
+        return
+    from .qsgw_utils import remove_managed
+
+    removed = remove_managed(
+        dump_dir, r"rotation_iter[0-9]{4}\.npy\Z",
+        barrier_tag="sc.rotation_snapshots.clear", print_fn=print_fn)
+    if removed:
+        print_fn(f"  SC map rotations: cleared {len(removed)} stale snapshots")
 
 
 # ---------------------------------------------------------------------------
@@ -3826,6 +3879,7 @@ def run_self_consistency(
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
     # deprecated override, applied at config construction).
     _dump_dir = inputs.config.sc.dump_dir
+    _clear_sc_rotation_snapshots(_dump_dir, print_fn=print_fn)
 
     # One-shot fast path: no acceleration needed.
     if max_iter == 1:
@@ -4954,7 +5008,8 @@ def run_sc_driver(
     _record_sc(
         inputs,
         f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
-        f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}"
+        f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}, "
+        f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV"
         + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
            else f", α={sc.mixing:.2f}"))
     state_final, rms_history = run_self_consistency(

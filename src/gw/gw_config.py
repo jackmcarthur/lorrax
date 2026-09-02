@@ -1717,7 +1717,11 @@ _DEFAULTS = {
     "sc_accelerator": "rcrop",   # rcrop | linear
     "sc_history_depth": 5,       # rCROP history depth
     "sc_mixing": 1.0,            # linear-mixing α (accelerator=linear only)
-    "sc_dump_dir": "",           # E-history npy dump dir ("" = off)
+    "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
+    # Symmetric correction averaging is legal only for accidental/exact
+    # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
+    # than an order below MoS2's physical 1.7--3.6 meV SOC-split K pair.
+    "sc_exact_degeneracy_tol_ev": 1.0e-4,
     "sc_eigh": "auto",           # auto | native | distributed (per-iteration
                                  # eigh of the (nk, nb, nb) carry; a LAYOUT
                                  # choice, independent of the physics knobs)
@@ -4536,7 +4540,10 @@ class SCConfig:
       calls per accelerator iteration (trial + residual).
     - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
     - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
-    - ``dump_dir``: per-iteration E-history .npy dump dir (None = off).
+    - ``dump_dir``: per-iteration E/U-history .npy dump dir (None = off).
+    - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
+      accidental-degeneracy average.  The default is 0.1 meV; physical SOC
+      splittings above it remain distinct states.
     - ``eigh``: which eigh diagonalises the ``(nk, nb, nb)`` carry each
       iteration — ``"native"`` (k-sharded batch: one WHOLE ``(nb, nb)``
       tile per device), ``"distributed"`` (one tile spread over the mesh),
@@ -4551,6 +4558,7 @@ class SCConfig:
     history_depth: int
     mixing: float
     dump_dir: str | None
+    exact_degeneracy_tol_ev: float = 1.0e-4
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
     #: values are the METAL head modes: both run the per-iteration head
@@ -4575,6 +4583,11 @@ class SCConfig:
             raise ValueError("sc_history_depth must be >= 1.")
         if not (0.0 < self.mixing <= 1.0):
             raise ValueError("sc_mixing must be in (0, 1].")
+        if not (0.0 < self.exact_degeneracy_tol_ev <= 1.0e-4):
+            raise ValueError(
+                "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
+                "The 0.1 meV ceiling separates accidental degeneracy from "
+                "resolved physical splittings; it is not an SC damping knob.")
         if self.eigh not in ("auto", "native", "distributed"):
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
@@ -5473,6 +5486,8 @@ class LorraxConfig:
             dump_dir=_sc_env(
                 "LORRAX_SC_DUMP_DIR", str, str(_g("sc_dump_dir") or ""),
                 "sc_dump_dir") or None,
+            exact_degeneracy_tol_ev=float(
+                _g("sc_exact_degeneracy_tol_ev")),
             # No env override: the LORRAX_SC_* envs are deprecated and a
             # new knob must not add one.
             eigh=str(_g("sc_eigh")).strip().lower(),

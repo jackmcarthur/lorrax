@@ -166,10 +166,9 @@ def average_matrix_diagonal(
 
     Notes
     -----
-    This is the matrix primitive behind both the terminal BGW-style Sigma
-    conditioning and the QSGW map.  Keeping one implementation matters:
-    conditioning only after the SC loop lets the loop iterate a
-    basis-dependent operator and cannot repair a two-cycle afterwards.
+    This primitive implements only the tolerance its caller supplies.  The
+    QSGW caller caps that tolerance at 1e-4 eV: a resolved meV-scale SOC pair
+    is not a degenerate manifold and must not be averaged or damped here.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
     import jax
