@@ -225,7 +225,7 @@ def make_sigma_box_spec(
     }
 
 
-def _rule_cache_lookup(directory, box, eps, relative):
+def _rule_cache_lookup(directory, box, eps, relative, kappa_cap):
     """Return the smallest cached rule certified on a containing box."""
     if directory is None:
         return None
@@ -255,6 +255,12 @@ def _rule_cache_lookup(directory, box, eps, relative):
                     rank=int(data["rank"]),
                     sup_error=float(data["sup_error"]),
                     kappa_max=float(data["kappa_max"]), seconds=0.0)
+                # The uniform-rule service has its own broad numerical
+                # sanity cap.  Sigma's runtime-noise budget is tighter and
+                # depends on eps, so an older cache entry can be a perfectly
+                # valid approximation yet be unusable by this executor.
+                if rule.kappa_max > kappa_cap:
+                    continue
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
         except (OSError, KeyError, ValueError):
@@ -262,14 +268,15 @@ def _rule_cache_lookup(directory, box, eps, relative):
     return best
 
 
-def _rule_cache_store(directory, rule):
+def _rule_cache_store(directory, rule, kappa_cap):
     """Atomically store one immutable box certificate."""
     if directory is None:
         return
     try:
         os.makedirs(directory, exist_ok=True)
         digest = hashlib.sha256(json.dumps(
-            [list(rule.box), float(rule.eps), bool(rule.relative)]
+            ["sigma-noise-v1", list(rule.box), float(rule.eps),
+             bool(rule.relative), float(kappa_cap)]
         ).encode()).hexdigest()[:16]
         path = os.path.join(directory, f"rule_{digest}.npz")
         if os.path.exists(path):
@@ -282,6 +289,7 @@ def _rule_cache_store(directory, rule):
                 times=rule.times, weights=rule.weights,
                 sup_error=float(rule.sup_error),
                 kappa_max=float(rule.kappa_max),
+                kappa_cap=float(kappa_cap),
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
                 seconds=float(rule.seconds))
         os.replace(temporary, path)
@@ -332,7 +340,10 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    cached = _rule_cache_lookup(cache_dir, requested_box, eps, relative)
+    noise_budget = _RUNTIME_NOISE_SAFETY * eps
+    kappa_cap = noise_budget / _RUNTIME_NOISE_EPSILON
+    cached = _rule_cache_lookup(
+        cache_dir, requested_box, eps, relative, kappa_cap)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
@@ -340,8 +351,8 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None else requested_box)
         rule = build_uniform_rule(
-            build_box, eps, time_budget=reduction_seconds)
-        _rule_cache_store(cache_dir, rule)
+            build_box, eps, time_budget=reduction_seconds,
+            kappa_cap=kappa_cap)
         cache_status = "miss" if cache_dir is not None else "off"
 
     if rule.sup_error > eps:
@@ -349,7 +360,6 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
             f"Sigma box window {spec['name']!r} refused: rule sup error "
             f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
     noise_bound = rule.kappa_max * _RUNTIME_NOISE_EPSILON
-    noise_budget = _RUNTIME_NOISE_SAFETY * eps
     if noise_bound > noise_budget:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: runtime-noise "
@@ -368,6 +378,12 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: factored log "
             f"growth {max(growth):.6g} exceeds {_FACTOR_GROWTH_CAP:g}")
+    if cached is None:
+        # Only executor-acceptable rules enter the shared cache.  In
+        # particular, a service-level rule that meets its broad default
+        # cancellation cap but misses Sigma's eps-scaled noise cap must not
+        # poison every subsequent attempt for this box.
+        _rule_cache_store(cache_dir, rule, kappa_cap)
     return {
         "times": times, "weights": weights,
         "node_count": int(times.size), "rule_box": tuple(rule.box),

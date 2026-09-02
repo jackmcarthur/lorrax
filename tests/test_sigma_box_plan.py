@@ -132,6 +132,51 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         "window_tau_pairs"]
 
 
+def test_rule_builder_receives_the_executor_noise_cap(monkeypatch):
+    caps = []
+
+    def captured(box, eps, **kwargs):
+        caps.append(kwargs["kappa_cap"])
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", captured)
+    plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+        cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+    expected = 0.05 * 1.0e-4 / 6.0e-8
+    np.testing.assert_allclose(caps, expected, rtol=0.0, atol=1.0e-14)
+
+
+def test_cache_skips_a_rule_above_the_executor_noise_cap(
+        monkeypatch, tmp_path):
+    import dataclasses
+    from gw.sigma_box_plan import _rule_cache_store
+
+    for box, relative in (
+            ((-100.0, 100.0, 0.1, 100.0), False),
+            ((0.001, 100.0, 0.1, 100.0), True),
+            ((-100.0, -0.001, 0.1, 100.0), True)):
+        unstable = dataclasses.replace(
+            _fake_rule(box, 1.0e-4), relative=relative, kappa_max=100.0)
+        _rule_cache_store(str(tmp_path), unstable, 1.0e4)
+
+    args = dict(
+        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+        cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
+    calls = []
+
+    def stable(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", stable)
+    plan, _geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+    assert len(plan) == 3
+    assert len(calls) == 3
+
+
 def test_total_pair_ceiling_refuses(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
     with pytest.raises(RuntimeError, match="pair ceiling=5"):
