@@ -1,9 +1,25 @@
 """One packed C⊕T1⊕T2⊕T3 layout for four-current operators.
 
-Physics code names logical blocks ``O[A,B]``; the distributed Dyson solve
-sees one square matrix.  This module owns the only conversion between those
-representations.  It contains no response kernel, propagator formula, or
-symmetry operation.
+Physics code names logical blocks ``O[A,B]`` (Lorentz ``A,B in {C, T1, T2,
+T3}``, each block a ``(nq, n_mu_A, n_mu_B)`` centroid tile); the distributed
+Dyson solve of ``bispinor_gw = full_static_cohsex`` sees one square matrix
+of extent ``packed_extent``.  This module owns the only conversion between
+those representations, and everything that must know the packed ordering:
+
+* :class:`PhotonBasisLayout` -- the immutable extents/padding/mesh record;
+* :func:`pack_photon_operator` / :func:`photon_block_view` -- pack sixteen
+  tiles into one ``P(None,'x','y')`` operator and view one block of it
+  (local ``shard_map`` slices, no redistribution);
+* :func:`pack_photon_channel_vectors` -- pack four per-channel row vectors
+  (the literal ``G = 0`` vectors ``g0``, the head wings) into one packed row;
+* :func:`add_photon_q0_low_rank` -- the bounded rank-4 update
+  ``O[q=0] += L R`` by which ``gw.head_correction.complete_static_slab_photon_q0``
+  inserts the bare ``<D>`` and the nine screened Gamma-cell moments; and
+* :func:`photon_q0_low_rank_block` -- its diagnostic twin that materializes
+  one ``(A,B)`` block of those updates alone, so ``gw.photon_sigma`` can
+  attribute Sigma per Lorentz sector without a second packed body.
+
+It contains no response kernel, propagator formula, or symmetry operation.
 
 The packed order is mesh-interleaved.  On a square ``p x p`` mesh, packed row
 shard ``x`` contains that same shard's local ``C,T1,T2,T3`` row chunks, and

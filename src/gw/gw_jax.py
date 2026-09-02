@@ -303,11 +303,12 @@ def main(argv=None):
 				" (normalized Pauli two-spinor charge/CC reference; raw "
 				"kinetic-balance only at spatial-current vertices)"),
 			"full_static_cohsex": (
-				" (experimental no-pair packed 4x4 static response; "
-				"head_correction=off)"),
-			"charge_hall_cubature": (
-				" (experimental no-pair packed 4x4 body plus charge/Hall "
-				"slab cubature; not FULL)"),
+				" (packed no-pair 4x4 static response with the Gamma-cell "
+				"completion: bare <D> into V, charge S00/wing head into W, "
+				"Hall CT/TC from static_gauge_hall_file when present)"
+				if config.head.correction is HeadCorrection.FULL else
+				" (packed no-pair 4x4 static response; DEBUG: Gamma-cell "
+				"head disabled by head_correction=off)"),
 		}.get(config.bispinor_gw.value, "")
 		print0(
 			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
@@ -652,7 +653,8 @@ def main(argv=None):
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
-						config.backend.distrib_la_batched_route))
+						config.backend.distrib_la_batched_route),
+					print_fn=print0)
 				# Sigma consumes packed block views directly.  Do not extract a
 				# scalar W00 body solely to satisfy the legacy role mapping.
 				W_by_role = {}
@@ -662,6 +664,24 @@ def main(argv=None):
 					f"current_model={photon_response.current_model}, "
 					f"current_contact={photon_response.current_contact}, "
 					f"packed_extent={photon_response.layout.packed_extent}")
+				# The run record (gwjax.out) must state the Gamma-cell status
+				# of the packed mode in production mode, where print0 sinks
+				# component chatter (owner ruling 2026-09-01: a headless
+				# packed run is a DEBUG setting and must say so).
+				_hc = photon_response.head_completion
+				report.progress(
+					"Photon head    : "
+					+ ("DEBUG: Gamma-cell head disabled by head_correction=off "
+					   "(headless packed body; NOT a production calculation)"
+					   if _hc is None else
+					   "Gamma-cell completion applied (bare <D> into V, "
+					   "charge S00/wing head into W); "
+					   f"hall_source={_hc.hall_source}; "
+					   f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
+					   f"ward={_hc.ward_residual:.3e}; "
+					   f"hermiticity={_hc.hermiticity_residual:.3e}; "
+					   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
+					   f"cubature_orders={_hc.observed_physical_counts}"))
 			else:
 				W_by_role = compute_screening_model(
 					mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
@@ -941,8 +961,6 @@ def main(argv=None):
 	           else jnp.zeros_like(sig_x))
 	photon_head_sigma_diag_tskn_ry = (
 		sigma_result.photon_head_sigma_diag_tskn_ry)
-	photon_head_sigma_operator_fingerprint = (
-		sigma_result.photon_head_sigma_operator_fingerprint)
 	photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
 	if photon_head_sigma_diag_tskn_ry is None:
 		photon_head_sigma_diag_tskn_ry = np.zeros(
@@ -1168,8 +1186,6 @@ def main(argv=None):
 		             else float(config.eqp2.tol_ev)),
 		photon_head_sigma_diag_tskn_ry=np.asarray(
 			photon_head_sigma_diag_tskn_ry),
-		photon_head_sigma_operator_fingerprint=(
-			photon_head_sigma_operator_fingerprint),
 		photon_head_sigma_basis=photon_head_sigma_basis,
 	)
 	if meta.rank == 0:

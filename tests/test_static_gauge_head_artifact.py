@@ -1,6 +1,5 @@
-"""Focused SlabIO schema and photon-tile adapter gates."""
+"""SlabIO gates for the immutable Hall artifact and the photon-tile adapters."""
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import jax
@@ -8,23 +7,27 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.parallel_transport import wfn_fingerprint
 from file_io.slab_io import SlabIO
 from file_io.static_gauge_head import (
-    LoadedStaticGaugeHeadResponse,
-    STATIC_GAUGE_HEAD_SCHEMA_VERSION,
-    load_static_gauge_head_artifact,
-    write_static_gauge_head_artifact,
+    STATIC_GAUGE_HALL_SCHEMA_VERSION,
+    load_static_gauge_hall_artifact,
+    write_static_gauge_hall_artifact,
 )
-from gw.head_correction import StaticGaugeHeadResponse
 from gw.photon_layout import (
     PhotonBasisLayout,
     pack_photon_response_tiles,
     unpack_photon_response_tiles,
 )
+from gw.qsgw_head import (
+    StaticGaugeHallTransaction,
+    _static_gauge_hall_transaction_from_artifact,
+)
 
 
 _OPERATOR_FINGERPRINT = "sha256:" + "a" * 64
-_BODY_FINGERPRINT = "sha256:" + "b" * 64
+_SIGMA_H = (1.9528890297769742e-11, 4.1597624292025984e-11,
+            -4.223240852693869e-08)
 
 
 def _mesh():
@@ -48,159 +51,104 @@ def _wfn(*, energy_shift=0.0):
     )
 
 
-def _ward_closed_S():
-    S = np.zeros((2, 2, 4, 4), dtype=np.complex128)
-    S[0, 0, 0, 0] = 0.4
-    S[0, 1, 0, 0] = S[1, 0, 0, 0] = 0.1
-    S[1, 1, 0, 0] = 0.7
-    beta = 1.3
-    S[1, 1, 1, 1] = beta
-    S[0, 0, 2, 2] = beta
-    for a, b in ((0, 1), (1, 0)):
-        S[a, b, 1, 2] = -0.5 * beta
-        S[a, b, 2, 1] = -0.5 * beta
-    return S
-
-
-def _response(mesh):
-    layout = PhotonBasisLayout.from_centroid_extents(1, 1, mesh)
-    n_body = layout.packed_extent
-    Y = (np.arange(2 * 4 * n_body).reshape(2, 4, n_body)
-         + 0.25j).astype(np.complex128)
-    Z = (np.arange(2 * n_body * 4).reshape(2, n_body, 4)
-         - 0.5j).astype(np.complex128)
-    return StaticGaugeHeadResponse(
-        layout=layout,
-        S_direct=jax.device_put(
-            _ward_closed_S(), NamedSharding(mesh, P())),
-        sigma_H=np.asarray((0.0, 0.0, 0.37), dtype=np.float64),
-        Y_x=jax.device_put(Y, NamedSharding(mesh, P(None, None, "x"))),
-        Z_y=jax.device_put(Z, NamedSharding(mesh, P(None, "y", None))),
+def _transaction(mesh, wfn):
+    return _static_gauge_hall_transaction_from_artifact(
+        sigma_H=np.asarray(_SIGMA_H, dtype=np.float64),
         hamiltonian_config_operator_fingerprint=_OPERATOR_FINGERPRINT,
-        operator_current_equivalent=True,
-        contact_is_exact=True,
-        ward_residual=0.0,
-        hermiticity_residual=0.0,
-    )
+        wfn_fingerprint=wfn_fingerprint(wfn),
+        band_start=0, band_stop=4, nk_tot=6, mesh=mesh)
 
 
-def _write(path, response, mesh, wfn):
-    write_static_gauge_head_artifact(
-        path,
-        response,
-        mesh_xy=mesh,
-        wfn=wfn,
-        band_start=0,
-        band_stop=4,
-        body_response_fingerprint=_BODY_FINGERPRINT,
-        source_write_ibz_only=True,
-        source_low_mem_bands=True,
-    )
-
-
-def _load(path, response, mesh, default_wfn, **changes):
+def _load(path, mesh, wfn=None, **changes):
+    """Load with the writer's identity unless ``changes`` overrides one."""
     kwargs = dict(
-        mesh_xy=mesh,
-        wfn=default_wfn,
-        expected_band_start=0,
-        expected_band_stop=4,
-        expected_layout=response.layout,
-        expected_body_response_fingerprint=_BODY_FINGERPRINT,
-        expected_hamiltonian_config_operator_fingerprint=(
-            _OPERATOR_FINGERPRINT),
-    )
+        mesh_xy=mesh, wfn=_wfn() if wfn is None else wfn,
+        expected_band_start=0, expected_band_stop=4, expected_nk_tot=6)
     kwargs.update(changes)
-    return load_static_gauge_head_artifact(path, **kwargs)
+    return load_static_gauge_hall_artifact(path, **kwargs)
 
 
-def test_static_gauge_head_roundtrip_is_sharded_sealed_and_immutable(tmp_path):
+def test_hall_artifact_roundtrip_is_sealed_and_immutable(tmp_path):
     mesh = _mesh()
     wfn = _wfn()
-    response = _response(mesh)
-    path = tmp_path / "static_gauge_head.h5"
+    transaction = _transaction(mesh, wfn)
+    path = tmp_path / "static_gauge_hall.h5"
 
-    _write(path, response, mesh, wfn)
+    write_static_gauge_hall_artifact(path, transaction, mesh_xy=mesh)
     assert path.is_file()
-    assert not (tmp_path / "static_gauge_head.h5.partial").exists()
+    assert not (tmp_path / "static_gauge_hall.h5.partial").exists()
 
-    loaded = _load(path, response, mesh, wfn)
-    assert isinstance(loaded, LoadedStaticGaugeHeadResponse)
-    assert not isinstance(response, LoadedStaticGaugeHeadResponse)
-    assert loaded.source_write_ibz_only
-    assert loaded.source_low_mem_bands
-    assert loaded.band_start == 0 and loaded.band_stop == 4
-    assert loaded.body_response_fingerprint == _BODY_FINGERPRINT
+    loaded = _load(path, mesh, wfn)
+    assert isinstance(loaded, StaticGaugeHallTransaction)
     np.testing.assert_array_equal(
-        np.asarray(jax.device_get(loaded.S_direct)),
-        np.asarray(jax.device_get(response.S_direct)))
-    np.testing.assert_array_equal(
-        np.asarray(jax.device_get(loaded.Y_x)),
-        np.asarray(jax.device_get(response.Y_x)))
-    np.testing.assert_array_equal(
-        np.asarray(jax.device_get(loaded.Z_y)),
-        np.asarray(jax.device_get(response.Z_y)))
-    np.testing.assert_array_equal(loaded.sigma_H, response.sigma_H)
-    assert loaded.Y_x.sharding.is_equivalent_to(
-        NamedSharding(mesh, P(None, None, "x")), 3)
-    assert loaded.Z_y.sharding.is_equivalent_to(
-        NamedSharding(mesh, P(None, "y", None)), 3)
+        np.asarray(jax.device_get(loaded.sigma_H)),
+        np.asarray(_SIGMA_H, dtype=np.float64))
+    assert loaded.sigma_H.sharding.is_equivalent_to(
+        NamedSharding(mesh, P()), 1)
+    assert (loaded.band_start, loaded.band_stop, loaded.nk_tot) == (0, 4, 6)
+    assert loaded.wfn_fingerprint == wfn_fingerprint(wfn)
+    assert (loaded.hamiltonian_config_operator_fingerprint
+            == _OPERATOR_FINGERPRINT)
 
-    with pytest.raises(FileExistsError, match="immutable StaticGaugeHead"):
-        _write(path, response, mesh, wfn)
-    with pytest.raises(TypeError, match="issued only"):
-        replace(loaded, _loader_token=object())
+    with pytest.raises(FileExistsError, match="immutable StaticGaugeHall"):
+        write_static_gauge_hall_artifact(path, transaction, mesh_xy=mesh)
+    with pytest.raises(TypeError, match="sealed canonical Hall"):
+        write_static_gauge_hall_artifact(
+            tmp_path / "other.h5", SimpleNamespace(sigma_H=np.zeros(3)),
+            mesh_xy=mesh)
 
 
 @pytest.mark.parametrize(
-    "changes",
+    ("changes", "message"),
     (
-        {"wfn": _wfn(energy_shift=0.01)},
-        {"expected_band_stop": 3},
-        {"expected_body_response_fingerprint": "sha256:" + "c" * 64},
-        {"expected_hamiltonian_config_operator_fingerprint":
-         "sha256:" + "d" * 64},
+        ({"wfn": _wfn(energy_shift=0.01)}, "WFN identity differs"),
+        ({"expected_band_stop": 3}, "band_stop=4, expected 3"),
+        ({"expected_nk_tot": 5}, "nk_tot=6, expected 5"),
     ),
 )
-def test_static_gauge_head_refuses_mismatched_runtime_identity(
-        tmp_path, changes):
+def test_hall_artifact_refuses_mismatched_runtime_identity(
+        tmp_path, changes, message):
     mesh = _mesh()
     wfn = _wfn()
-    response = _response(mesh)
-    path = tmp_path / "static_gauge_head.h5"
-    _write(path, response, mesh, wfn)
-    with pytest.raises(ValueError, match="static_gauge_head_artifact_mismatch"):
-        _load(path, response, mesh, wfn, **changes)
+    path = tmp_path / "static_gauge_hall.h5"
+    write_static_gauge_hall_artifact(path, _transaction(mesh, wfn), mesh_xy=mesh)
+    with pytest.raises(ValueError, match=message):
+        _load(path, mesh, **changes)
 
 
-def test_static_gauge_head_refuses_absent_partial_and_incomplete(tmp_path):
+def test_hall_artifact_refuses_absent_partial_and_incomplete(tmp_path):
     mesh = _mesh()
     wfn = _wfn()
-    response = _response(mesh)
     with pytest.raises(FileNotFoundError, match="artifact_absent"):
-        _load(tmp_path / "absent.h5", response, mesh, wfn)
-    with pytest.raises(ValueError, match="static_gauge_head_partial"):
-        _load(tmp_path / "candidate.h5.partial", response, mesh, wfn)
+        _load(tmp_path / "absent.h5", mesh, wfn)
+    with pytest.raises(ValueError, match="static_gauge_hall_partial"):
+        _load(tmp_path / "candidate.h5.partial", mesh, wfn)
 
-    incomplete = tmp_path / "incomplete.h5"
-    with SlabIO(incomplete, mode="w", mesh=mesh) as io:
+    path = tmp_path / "static_gauge_hall.h5"
+    write_static_gauge_hall_artifact(path, _transaction(mesh, wfn), mesh_xy=mesh)
+    with SlabIO(path, mode="a", mesh=mesh) as io:
         io.write_attr("complete", np.int32(0))
-    with pytest.raises(ValueError, match="static_gauge_head_incomplete"):
-        _load(incomplete, response, mesh, wfn)
+    with pytest.raises(ValueError, match="incomplete"):
+        _load(path, mesh, wfn)
+
+    bare = tmp_path / "bare.h5"
+    with SlabIO(bare, mode="w", mesh=mesh) as io:
+        io.write_attr("complete", np.int32(1))
+    with pytest.raises(ValueError, match="static_gauge_hall_schema"):
+        _load(bare, mesh, wfn)
 
 
-def test_static_gauge_head_schema_version_has_a_red_twin(tmp_path):
+def test_hall_artifact_schema_version_has_a_red_twin(tmp_path):
     mesh = _mesh()
     wfn = _wfn()
-    response = _response(mesh)
-    path = tmp_path / "static_gauge_head.h5"
-    _write(path, response, mesh, wfn)
+    path = tmp_path / "static_gauge_hall.h5"
+    write_static_gauge_hall_artifact(path, _transaction(mesh, wfn), mesh_xy=mesh)
     with SlabIO(path, mode="a", mesh=mesh) as io:
         io.write_attr(
             "schema_version",
-            np.int32(STATIC_GAUGE_HEAD_SCHEMA_VERSION + 1))
-    with pytest.raises(
-            ValueError, match="static_gauge_head_artifact_mismatch"):
-        _load(path, response, mesh, wfn)
+            np.int32(STATIC_GAUGE_HALL_SCHEMA_VERSION + 1))
+    with pytest.raises(ValueError, match="schema_version"):
+        _load(path, mesh, wfn)
 
 
 def test_response_tile_adapters_delegate_canonical_pack_and_views():

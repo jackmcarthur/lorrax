@@ -1,4 +1,35 @@
-"""One resolver for four-current carrier and artifact representations."""
+"""One resolver for four-current carrier and artifact representations.
+
+A bispinor run carries two independent choices that several stages must
+agree on: which four-component carrier represents the *charge* density and
+scalar (CC) screening/exchange/correlation, and which represents the
+*spatial current* channels (transverse Hartree, bare TT exchange, the packed
+photon body).  ``bispinor_gw`` selects a model, and this module is the single
+place that turns a model name into those carrier decisions
+(:class:`FourCurrentRepresentation`), so preprocessing
+(``psp.get_dipole_mtxels``, ``gw.kin_ion_io``), the charge and transverse
+ISDF fits, the exact Hartree, the scalar head producer and the Sigma
+dispatch never derive the representation split on their own.
+
+Models:
+
+* ``bare_transverse`` (default) and ``full_static_cohsex`` (the packed
+  static photon mode): the raw kinetic-balance lift
+  ``Psi = (Psi_L, (alpha_FS/2) sigma.p Psi_L)`` for both charge and current,
+  and the four-spinor scalar head/dipole artifact
+  (``scalar_head_bispinor = True``).
+* ``pauli_reference_bare_transverse``: an explicit comparison model -- the
+  normalized QE Pauli two-spinor for charge, the raw kinetic-balance current.
+* ``isometric_kinetic_balance_bare_transverse``: the pointwise isometry
+  ``[I;X](I+X^dagger X)^{-1/2}`` for every finite-q carrier; its scalar head
+  remains the canonical two-spinor artifact until normalized endpoint jets
+  exist.
+
+The representation strings are the provenance stamps written into and
+authenticated from the ``dipole.h5`` / ``kin_ion.h5`` / zeta artifacts.  This
+module imports nothing from the GW driver so it can be used at artifact
+altitude.
+"""
 
 from dataclasses import dataclass
 

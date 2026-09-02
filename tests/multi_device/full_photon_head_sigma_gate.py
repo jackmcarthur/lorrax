@@ -1,11 +1,15 @@
 """P4 gate for post-Dyson CC / CT+TC / TT photon-head Sigma attribution.
 
 The mini-BZ geometry is read from a caller-supplied real WFN.  A small
-Ward-closed response with nonzero Hall coefficient is completed by the
-canonical 4x4 Dyson/cubature path, then its retained factor carrier is
-contracted through the production static-photon Sigma loop.  V/W contain
-only that completed head in this discriminator, so the aggregate Sigma
-diagonal is an independent oracle for the sum of the three reported sectors.
+charge-only response with a nonzero Hall coefficient is built by the
+production producer (``gw.static_gauge_response.
+build_static_photon_head_response``, its scalar direct response replaced by
+a synthetic one) and completed by the canonical 4x4 Dyson/cubature path;
+its retained factor carrier is then contracted through the production
+static-photon Sigma loop.  V/W contain only that completed head in this
+discriminator, so the aggregate Sigma diagonal is an independent oracle for
+the sum of the three reported sectors.  The ``sigma_H = 0`` twin exercises
+the absent-Hall-artifact default of the one packed mode.
 """
 from __future__ import annotations
 
@@ -50,7 +54,9 @@ def _hall_numpy(sigma_h):
     out = np.zeros((2, 4, 4), dtype=np.complex128)
     for a in range(2):
         for i in range(3):
-            value = 1j * sum(
+            # -i: the persisted sigma_H is the occupied-bra Berry sum and
+            # the live response is energy-ordered (head_correction owner).
+            value = -1j * sum(
                 _levi_civita(b, a, i) * sigma_h[b] for b in range(3))
             out[a, 0, i + 1] = value
             out[a, i + 1, 0] = np.conj(value)
@@ -78,36 +84,75 @@ def _direct_moment_oracle(receipt, sigma_h):
     return per_order[-1]
 
 
-def _response(mesh, layout, sigma_h):
-    from gw.head_correction import StaticGaugeHeadResponse
+def _packed_index(layout, mesh, channel, logical):
+    """Global packed index of one logical centroid, read off the packer.
 
-    n = layout.packed_extent
-    # Nonzero analytic wings are required for the mixed (1,qx,qy) moments
-    # to reach the packed body.  Their body supports are disjoint under the
-    # diagonal analytic body below, so Y W Z is exactly zero and the folded
-    # S tensor remains the Ward-closed zero tensor.
-    Y = np.zeros((2, 4, n), np.complex128)
-    Z = np.zeros((2, n, 4), np.complex128)
-    i_support = layout.local_offset(0)
-    j_support = layout.local_offset(1)
+    Padding is to a multiple of the device count, not the mesh side, so
+    the index is not a closed-form offset; ask the canonical packer with a
+    one-hot channel vector instead of hand-addressing the interleaving.
+    """
+    from gw.photon_layout import pack_photon_channel_vectors
+
+    vectors = []
+    for row in range(4):
+        vector = np.zeros((1, layout.padded_extent(row)), dtype=np.complex128)
+        if row == channel:
+            vector[0, logical] = 1.0
+        vectors.append(_put(vector, mesh, (None, "x")))
+    packed = _gather(pack_photon_channel_vectors(
+        tuple(vectors), layout, mesh, axis_name="x")[0][channel])
+    hits = np.flatnonzero(np.abs(packed) > 0)
+    if hits.size != 1:
+        raise AssertionError(
+            f"one-hot channel {channel} logical {logical} packed to {hits}")
+    return int(hits[0])
+
+
+def _response(mesh, layout, sigma_h, *, wfn, wfn_binding, meta):
+    """Build the bounded response through the production producer.
+
+    The scalar direct response is synthetic: zero ``S`` and nonzero charge
+    wings on charge centroid 0 only, with ``Z = conj(Y)`` as the static
+    Adler--Wiser weight requires.  The analytic body below couples that
+    centroid only to charge centroid 1, so ``Y W Z`` is exactly zero and the
+    folded ``S`` stays the Ward-closed zero tensor while ``YW``/``WZ`` are
+    nonzero and the mixed ``(1,qx,qy)`` moments reach the packed body.
+    """
+    import gw.qsgw_head as qsgw_head
+    from common.parallel_transport import fingerprint_from_binding
+    from gw.static_gauge_response import build_static_photon_head_response
+
+    charge_extent = layout.padded_extent(0)
+    Y = np.zeros((1, 3, charge_extent), np.complex128)
     for a in range(2):
-        for A in range(4):
-            Y[a, A, i_support] = (0.11 + 0.03j) * (a + 1) * (A + 1)
-    for b in range(2):
-        for B in range(4):
-            Z[b, j_support, B] = (0.07 - 0.02j) * (b + 1) * (B + 1)
-    return StaticGaugeHeadResponse(
-        layout=layout,
-        S_direct=_put(np.zeros((2, 2, 4, 4), np.complex128), mesh, ()),
-        sigma_H=np.asarray(sigma_h, dtype=np.float64),
+        Y[0, a, 0] = (0.11 + 0.03j) * (a + 1)
+    Z = np.conj(np.transpose(Y, (0, 2, 1)))
+    direct = SimpleNamespace(
+        S_direct=_put(np.zeros((1, 3, 3), np.complex128), mesh, ()),
         Y_x=_put(Y, mesh, (None, None, "x")),
         Z_y=_put(Z, mesh, (None, "y", None)),
-        hamiltonian_config_operator_fingerprint="sha256:" + "7" * 64,
-        operator_current_equivalent=True,
-        contact_is_exact=True,
-        ward_residual=0.0,
-        hermiticity_residual=0.0,
     )
+    saved = qsgw_head.build_dft_head_response
+    qsgw_head.build_dft_head_response = lambda *args, **kwargs: direct
+    try:
+        sigma = np.asarray(sigma_h, dtype=np.float64)
+        if np.any(sigma != 0.0):
+            hall = qsgw_head._static_gauge_hall_transaction_from_artifact(
+                sigma_H=sigma,
+                hamiltonian_config_operator_fingerprint="sha256:" + "7" * 64,
+                wfn_fingerprint=fingerprint_from_binding(wfn_binding, wfn),
+                band_start=int(meta.b_id_0),
+                band_stop=int(meta.b_id_4_chi_user),
+                nk_tot=int(meta.nk_tot),
+                mesh=mesh)
+        else:
+            hall = None
+        return build_static_photon_head_response(
+            None, input_dir="unused", mesh=mesh, wfn=wfn, meta=meta,
+            config=SimpleNamespace(), layout=layout,
+            hall_transaction=hall, wfn_fingerprint_binding=wfn_binding)
+    finally:
+        qsgw_head.build_dft_head_response = saved
 
 
 def _read_debug_table(path):
@@ -146,9 +191,7 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
             f"{stem}_total.Re", f"{stem}_total.Im",
         ))
 
-    exact_fingerprint = "sha256:" + "9" * 64
-
-    def emit(name, diag, present, explicit, *, fingerprint=None):
+    def emit(name, diag, present, explicit):
         path = os.path.join(output_dir, name)
         results = GWResults(
             sig_sx=plus["aggregate"][1],
@@ -162,9 +205,6 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
             band_start=0,
             band_stop=nb,
             photon_head_sigma_diag_tskn_ry=diag,
-            photon_head_sigma_operator_fingerprint=(
-                (exact_fingerprint if fingerprint is None else fingerprint)
-                if present else None),
             photon_head_sigma_basis=("dft" if present else None),
         )
         config = SimpleNamespace(
@@ -196,7 +236,6 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
     with open(full_path, "r", encoding="utf-8") as stream:
         full_receipt_text = stream.read()
     required_metadata = (
-        f"# metadata photon_head_operator_fingerprint={exact_fingerprint}\n",
         "# metadata photon_head_basis=dft\n",
         ("# metadata photon_head_sector_convention="
          "final_post_dyson_lorentz_blocks\n"),
@@ -227,19 +266,6 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
     if zero_receipt_leak != 0.0:
         raise AssertionError(
             f"ordinary-mode zero receipt leaks {zero_receipt_leak:.3e} eV")
-    malformed_path = os.path.join(output_dir, "sigma_freq_debug.bad.dat")
-    try:
-        emit("sigma_freq_debug.bad.dat", plus["components"], True, False,
-             fingerprint="sha256:BAD")
-    except ValueError as error:
-        if "64 lowercase hex" not in str(error):
-            raise AssertionError(
-                f"malformed fingerprint failed for the wrong reason: {error}")
-    else:
-        raise AssertionError("malformed operator fingerprint was accepted")
-    if os.path.exists(malformed_path):
-        raise AssertionError(
-            "malformed fingerprint emitted an unauthenticated Sigma receipt")
     return {
         "full_receipt": full_path,
         "zero_receipt": zero_path,
@@ -302,8 +328,17 @@ def _bundle(mesh, psi, enk, occ, slices):
 def run_gate(mesh, wfn_path, output_dir):
     from ffi import _services
     _services.ensure_on_path()
-    import vcoul
     from wfn_loader import WfnLoader
+
+    # The producer authenticates the Hall term against the loaded WFN's
+    # identity, so the loader stays open for the whole gate.
+    with WfnLoader(wfn_path, backend="eager") as wfn:
+        return _run_gate(mesh, wfn, output_dir)
+
+
+def _run_gate(mesh, wfn, output_dir):
+    import vcoul
+    from common.parallel_transport import bind_wfn_fingerprint
 
     from gw.head_correction import complete_static_slab_photon_q0
     from gw.photon_layout import (
@@ -318,13 +353,16 @@ def run_gate(mesh, wfn_path, output_dir):
             "batched rotated-diagonal oracle error "
             f"{rotated_diagonal_error:.3e}")
 
-    with WfnLoader(wfn_path, backend="eager") as wfn:
-        geometry = vcoul.CoulombGeometry.from_wfn(wfn)
-        material_kgrid = tuple(int(v) for v in wfn.kgrid)
+    geometry = vcoul.CoulombGeometry.from_wfn(wfn)
+    material_kgrid = tuple(int(v) for v in wfn.kgrid)
+    wfn_binding = bind_wfn_fingerprint(wfn)
     receipt = vcoul.slab_minibz_photon_cubature(
         vcoul.get_kernel(2), geometry, material_kgrid)
 
-    layout = PhotonBasisLayout.from_centroid_extents(1, 1, mesh)
+    # Two logical charge centroids (wing support on 0, analytic body coupling
+    # 0 <-> 1) and two transverse; equal padded extents keep the q0 block
+    # graph count at exactly two (bare / screened factor counts).
+    layout = PhotonBasisLayout.from_centroid_extents(2, 2, mesh)
     n = layout.packed_extent
     nq = 2
     packed_sharding = NamedSharding(mesh, P(None, "x", "y"))
@@ -362,11 +400,19 @@ def run_gate(mesh, wfn_path, output_dir):
     idx = np.arange(nb)
     Gij[:, idx, idx] = occ
     Gij = _put(Gij, mesh, (None, None, None))
-    meta = SimpleNamespace(kgrid=(nq, 1, 1), nk_tot=nq)
+    meta = SimpleNamespace(
+        kgrid=(nq, 1, 1), nk_tot=nq, b_id_0=0, b_id_4_chi_user=nb)
 
     V_host = np.zeros((nq, n, n), np.complex128)
     W_host = np.zeros((nq, n, n), np.complex128)
     W_host[0] = 0.1 * np.eye(n, dtype=np.complex128)
+    # Charge centroid 0 (the wing support) couples only to charge centroid
+    # 1, so Y W Z = 0 while W Z and Y W are nonzero (see _response).
+    charge_0 = _packed_index(layout, mesh, 0, 0)
+    charge_1 = _packed_index(layout, mesh, 0, 1)
+    W_host[0, charge_0, charge_0] = 0.0
+    W_host[0, charge_0, charge_1] = 0.1
+    W_host[0, charge_1, charge_0] = 0.1
 
     def base_operators():
         return (
@@ -394,9 +440,16 @@ def run_gate(mesh, wfn_path, output_dir):
 
     def one_case(sigma_h):
         V, W = base_operators()
+        response = _response(
+            mesh, layout, sigma_h, wfn=wfn, wfn_binding=wfn_binding,
+            meta=meta)
         V, W, completion = complete_static_slab_photon_q0(
-            V, W, _response(mesh, layout, sigma_h), g0_x, g0_y, receipt,
-            mesh_xy=mesh)
+            V, W, response, g0_x, g0_y, receipt, mesh_xy=mesh)
+        if not np.array_equal(
+                np.asarray(completion.sigma_H),
+                np.asarray(sigma_h, dtype=np.float64)):
+            raise AssertionError(
+                "completion did not record the sigma_H it consumed")
         bare_v_q0 = _gather(V[0])
         bare_v_hermiticity_residual = float(np.max(np.abs(
             bare_v_q0 - np.conj(bare_v_q0.T))))

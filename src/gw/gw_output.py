@@ -147,9 +147,6 @@ class GWResults:
     #: (term=X/SX/COH, sector=CC/CT+TC/TT, k, band).  ``None`` is accepted
     #: for historical constructors; the debug writer emits exact-zero columns.
     photon_head_sigma_diag_tskn_ry: np.ndarray | None = None
-    #: Optional whole-response identity.  The bounded charge+Hall mode leaves
-    #: this unset because its Hall identifier does not identify charge S/Y/Z.
-    photon_head_sigma_operator_fingerprint: str | None = None
     photon_head_sigma_basis: str | None = None
 
     def __post_init__(self) -> None:
@@ -796,17 +793,6 @@ def write_freq_debug(
             "photon_head_sector_convention": (
                 "final_post_dyson_lorentz_blocks"),
         }
-        if results.photon_head_sigma_operator_fingerprint is not None:
-            from .head_correction import require_canonical_operator_fingerprint
-            _fingerprint = require_canonical_operator_fingerprint(
-                results.photon_head_sigma_operator_fingerprint,
-                gate="photon_head_sigma_receipt_fingerprint",
-            )
-            _photon_head_metadata[
-                "photon_head_operator_fingerprint"] = _fingerprint
-    elif results.photon_head_sigma_operator_fingerprint is not None:
-        raise ValueError(
-            "photon head Sigma operator identity exists without a basis")
     if _photon_head is None:
         _photon_head = np.zeros(
             (3, 3, _nk, _nb), dtype=np.complex128)
