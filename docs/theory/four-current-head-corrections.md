@@ -654,7 +654,7 @@ transverse screening".
 | bare `D^{IJ}` tiles, TT head slot | `src/gw/v_q_bispinor.py` (`_make_per_q_v_builder_for_tile`, `_tt_head_tensor`) |
 | mini-BZ estimators: `⟨v⟩`, `⟨v q q⟩`, `⟨v P^T⟩`, photon cubature | `services/vcoul/src/vcoul/minibz.py` |
 | `Σ^B` — the TT part of the packed `Σ`, static AND dynamic routes alike | `src/gw/photon_sigma.py`, the one sixteen-block consumer (`blocks = "all"` for `compute_mode = cohsex`, `blocks = "current"` for the dynamic route, whose charge block is the scalar `Σ_x + Σ_c(ω)`) |
-| `Σ^B`, incumbent route only (bulk, `mpa`, `x_only`, self-consistent, `restart = true`) | `src/gw/sigma_x_bispinor.py` |
+| `Σ^B`, incumbent route only — bulk, `mpa`, `x_only`, self-consistent, `restart = true`, the resolvent diagram sets, `no_local_fields`, and any deck whose `w_dyson_solver` is not `distributed` (which includes every 1-GPU deck, since the packed solve needs a true 2-D mesh) | `src/gw/sigma_x_bispinor.py` |
 | which of the two routes a deck takes, and the reason printed in the run record | `gw_config.packed_bare_transverse_route` |
 | which compute modes the packed operator serves | `gw_config.PACKED_PHOTON_COMPUTE_MODES` (`cohsex` + the plasmon-pole pair; `mpa` refuses by name) |
 | whether the packed operator owns the CHARGE Σ too, or only the current blocks | `gw_config.packed_photon_replaces_charge_sigma` (static) / `gw_config.uses_dynamic_packed_photon_route` (dynamic) |
