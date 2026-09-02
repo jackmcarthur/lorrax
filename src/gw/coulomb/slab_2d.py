@@ -58,6 +58,7 @@ class Slab2D(vcoul.Slab2D):
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
+        certificate_fn=None,
     ):
         """``(wfn, meta)``-facing :meth:`vcoul.Slab2D.q0_average`.
 
@@ -75,4 +76,5 @@ class Slab2D(vcoul.Slab2D):
             nsamples=nsamples,
             method=method, qmc_reps=qmc_reps,
             analytic_sphere=analytic_sphere,
+            certificate_fn=certificate_fn,
         )

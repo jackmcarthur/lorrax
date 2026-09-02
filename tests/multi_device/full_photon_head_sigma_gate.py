@@ -421,7 +421,8 @@ def _run_gate(mesh, wfn, output_dir):
         )
 
     V_reference, W_reference = base_operators()
-    baseline_x, baseline_sx, baseline_coh, baseline_diagnostics = (
+    (baseline_x, baseline_sx, baseline_coh, baseline_diagnostics,
+     baseline_sigma_diagnostics) = (
         compute_static_photon_sigma(
             wfns_charge=wfns_c,
             wfns_transverse=wfns_t,
@@ -435,6 +436,8 @@ def _run_gate(mesh, wfn, output_dir):
         ))
     if baseline_diagnostics is not None:
         raise AssertionError("headless photon Sigma returned diagnostics")
+    if baseline_sigma_diagnostics is None:
+        raise AssertionError("headless photon Sigma omitted its block split")
     baseline = tuple(
         _gather(value) for value in (baseline_x, baseline_sx, baseline_coh))
 
@@ -454,7 +457,8 @@ def _run_gate(mesh, wfn, output_dir):
         bare_v_hermiticity_residual = float(np.max(np.abs(
             bare_v_q0 - np.conj(bare_v_q0.T))))
         bare_v_scale = float(np.max(np.abs(bare_v_q0)))
-        sig_x, sig_sx, sig_coh, diagnostics = compute_static_photon_sigma(
+        (sig_x, sig_sx, sig_coh, diagnostics,
+         sigma_diagnostics) = compute_static_photon_sigma(
             wfns_charge=wfns_c,
             wfns_transverse=wfns_t,
             Gij=Gij,
@@ -469,6 +473,10 @@ def _run_gate(mesh, wfn, output_dir):
         )
         aggregate = tuple(_gather(x) for x in (sig_x, sig_sx, sig_coh))
         components = _gather(diagnostics.components_tskn_ry)
+        sigma_components = _gather(sigma_diagnostics.components_skij_ry)
+        np.testing.assert_allclose(
+            np.sum(sigma_components, axis=0), aggregate[1] + aggregate[2],
+            rtol=1.0e-11, atol=1.0e-13)
         block_errors = []
         for A, B in ((0, 0), (0, 2), (2, 0), (2, 3)):
             for packed, pairs in (

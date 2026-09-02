@@ -36,6 +36,7 @@ def compute_q0_averages(
 	method: str = "auto",
 	qmc_reps: int = 10,
 	analytic_sphere: bool = False,
+	certificate_fn=None,
 ):
 	"""Compute q=0 averages (vc0_mean, wcoul0) for the system's dimensionality.
 
@@ -71,9 +72,14 @@ def compute_q0_averages(
 	exclusive with the finite-frequency ``S_cart`` representation.
 	"""
 	from .coulomb import get_kernel
-	return get_kernel(getattr(meta, 'sys_dim', None)).q0_average(
+	kernel = get_kernel(getattr(meta, 'sys_dim', None))
+	kwargs = {}
+	if int(getattr(meta, 'sys_dim', 3)) == 2:
+		kwargs["certificate_fn"] = certificate_fn
+	return kernel.q0_average(
 		wfn, meta,
 		S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
 		nsamples=nsamples, method=method, qmc_reps=qmc_reps,
 		analytic_sphere=analytic_sphere,
+		**kwargs,
 	)

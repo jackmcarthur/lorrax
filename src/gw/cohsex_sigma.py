@@ -620,6 +620,7 @@ def compute_cohsex_sigma(
         sig_coh.block_until_ready()
 
     sig_x = None
+    sig_x_b = None
     if compute_bare_x:
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
@@ -671,6 +672,7 @@ def compute_cohsex_sigma(
         "sig_sx":  sig_sx,
         "sig_coh": sig_coh,
         "sig_x":   sig_x,
+        "sig_x_b": sig_x_b,
     }
 
 
@@ -685,7 +687,8 @@ def compute_sigma_x(
     wfns_transverse=None,
     bispinor_v_q_path=None,
     occupation_state=None,
-)-> jax.Array:
+    return_transverse: bool = False,
+):
     """Bare-exchange-only path for modes without static screening.
 
     Skips the screened SX/COH kernels entirely — used by callers that
@@ -727,6 +730,7 @@ def compute_sigma_x(
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
+    sig_x_b = None
     if wfns_transverse is not None and bispinor_v_q_path is not None:
         # face-layout defensive backstop REMOVED 2026-08-23 — see
         # compute_cohsex_sigma's identical removal, same session/reason.
@@ -741,4 +745,6 @@ def compute_sigma_x(
         sig_x_b.block_until_ready()
         sig_x = sig_x + sig_x_b
 
+    if return_transverse:
+        return sig_x, sig_x_b
     return sig_x

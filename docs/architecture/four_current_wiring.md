@@ -571,6 +571,8 @@ every non-packed route (initialized `:833-834`, harvested `:876-879`, set at
 |---|---|---|
 | `photon_head_sigma_diag_tskn_ry` | `:124` | `(3, 3, nk, nb)` — axes `(term = X/SX/COH, sector = CC / CT+TC / TT, k, band)`, DFT basis |
 | `photon_head_sigma_basis` | `:125` | `"dft"` when populated; also in `BASIS_FREE_FIELDS` (`:257`) |
+| `sigma_lorentz_skij_ry` | `sigma_dispatch.py` | `(3, nk, nb, nb)` — physical `Sigma_xc` sectors `(CC, CT+TC, TT)`. Packed routes accumulate the computed blocks in `photon_sigma.py`; incumbent routes retain the computed `Sigma^B` as TT and define CC as the exact total-minus-current residual. It rotates with the total under static self-consistency. |
+| `sigma_c_odd_at_dft_diag_ev` | `sigma_dispatch.py` | `(nk, nb)` only on a measured-broken-TR GN deck: `Sigma_c[B,D] - Sigma_c[B,D=0]` evaluated at each DFT state. `None` on measured-TRS decks. |
 
 A third field, `photon_head_sigma_operator_fingerprint`, existed on
 `origin/main@8b6e3cc7` and is **deleted**
@@ -584,15 +586,25 @@ driver at `gw_jax.py:1019-1021` (schema zeros `:1023`, final record
 `head_total` (`gw_output.py:814-819`) and the per-term `{term}_head_{sector}`
 columns (`:820-830`), gated on `photon_head_sigma_basis is not None` at
 `:726` and refusing a basis other than `dft` at `:784-787`;
-`sigma_diag.dat`'s Hartree column is relabelled `Hdir` (`:1653-1654`) and
-gains an `H_T` column whenever the transverse Hartree ran (`:767-768`).
+`sigma_diag.dat`'s Hartree column is relabelled `Hdir` on a bispinor run.
+Those runs add `sigCC`, `sigTT`, and `sigCT` (`sigCT = CT+TC`) without
+changing `sigTOT`/`sigXC`; their sum is gated against that old total before
+write. A measured-broken-TR GN deck additionally adds `sigC_odd`; a
+measured-TRS deck omits it. Scalar files take the `None` branch and retain
+their historical columns byte-for-byte.
 
 **Reading `gwjax.out`.** These lines tell you which route ran:
 
 | line | file:line | means |
 |---|---|---|
 | `Photon head    : …` | `gw_jax.py:339` (packed) and `:346` via `gw_config.incumbent_bispinor_head_record` `:3813` (incumbent) | **which Γ-cell head ran, on every bispinor deck.** Packed: the completion's `hall_source`, `σ_H`, Ward / Hermiticity / Dyson-bound residuals and cubature orders, or the `DEBUG … NOT a production calculation` line under `head_correction = off`. Incumbent: the same DEBUG line under `off`, and under `full` a statement that the charge head is the scalar band-diagonal one and that there is **no** transverse q=Γ head on that route |
-| `Photon route   : …` | `gw_jax.py:328` | **which of the two bare routes ran.** Either "packed static photon operator (chi_TT = chi_CT = 0; scalar Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell completion carries both the charge head and the bare `<D_TT>`)" or "incumbent charge-screened W + Sigma^B (gw.sigma_x_bispinor) with the scalar band-diagonal q->0 head" — each followed by the predicate's **reason**, which for a refusal names the first unmet envelope condition. Printed for every non-`full_static_cohsex` deck |
+| `Photon route   : …` | `gw_jax.py` | **which route ran, on every bispinor deck.** It names packed screened static, packed bare/dynamic, or incumbent charge-screened + `Sigma^B`; an incumbent selection includes the first predicate condition that decided it. |
+| `Photon Sigma   : …` | `gw_jax.py` | Whether the packed Sigma is all sixteen static blocks or a dynamic CC block plus twelve static current blocks. |
+| `Sigma blocks   : …` | `gw_jax.py` | Max and mean `|diag|` in eV over the Sigma window for CC, CT+TC and TT. These reduce the same per-state fields written to `sigma_diag.dat`. |
+| `Head Sigma     : …` | `gw_jax.py` | Max and mean `|diag|` of the Gamma-cell contribution, split CC, CT+TC and TT. Dynamic CC combines the scalar bare-X and dynamic-correlation head owners; current sectors come from the packed completion. |
+| `GN odd Sigma   : …` | `gw_jax.py` | Measured-broken-TR only: max/mean `|sigC_odd|`, its max/mean shares of `|Sigma_xc|`, the `W(iomega_p)` Hermiticity residual, and `max|D|/max|B|`. Its absence on a TRS deck is part of the schema. |
+| `Slab WS cert   : …` / `Photon WS cert : …` | `gw_jax.py` | Exact Wigner-Seitz cubature order ladder, physical node counts and final mixed-tolerance error ratio. The photon line also reports the coupled solve's maximum Dyson backward residual. |
+| `Global TRS     : …` | `common/scientific_output.py` | The measured global verdict and provenance used by the screening/ordered-residue route. Route selection reads this verdict; it is not inferred again from a deck flag. |
 | `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:315` | the carrier banner. Under `full_static_cohsex` the parenthetical names the **head state**, not "experimental", and reads `DEBUG: Gamma-cell head disabled by head_correction=off` when the completion is off |
 | `Σ^B tile (μ_L=i, ν_L=j): tr Σ = …` ×9 | `sigma_x_bispinor.py:228` | the **incumbent** bare route ran. Their absence beside a `Photon route: packed …` line is the packed bare route |
 | `WARNING -- DEBUG: Gamma-cell head disabled by head_correction=off` | `w_isdf.py:2305-2306` | the packed body ran **headless**; the `WARNING` token is what the production sink keeps in the run record's warning block |

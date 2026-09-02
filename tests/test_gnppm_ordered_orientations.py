@@ -482,6 +482,50 @@ def test_sigma_assigns_R_plus_to_empty_states_and_R_minus_to_occupied():
     np.testing.assert_allclose(_residue_for_space("val", B, D), R_minus)
 
 
+def test_broken_tr_sigma_table_prints_the_measured_odd_contribution(tmp_path):
+    """The public ``sigC_odd`` value is ordered Sigma minus its D=0 twin."""
+    from file_io.sigma_output import write_sigma_to_file
+    from tests.harness import parse_eqp_rows
+
+    rng = np.random.default_rng(1501)
+    nmu, nb, nocc = 3, 4, 2
+    psi, _ = np.linalg.qr(
+        rng.normal(size=(nmu, nb)) + 1j * rng.normal(size=(nmu, nb)))
+    eps = np.array([-1.0, -0.6, 0.7, 1.2])
+    Om = 1.5 + 0.3 * rng.uniform(size=(nmu, nmu))
+    Om = 0.5 * (Om + Om.T)
+
+    def herm():
+        m = rng.normal(size=(nmu, nmu)) + 1j * rng.normal(size=(nmu, nmu))
+        return 0.5 * (m + m.conj().T)
+
+    R_plus, R_minus = herm(), herm()
+    B = 0.5 * (R_plus + R_minus)
+    total = _sigma_closed_form(
+        psi, eps, nocc, R_plus, R_minus, Om, 0.05)
+    even = _sigma_closed_form(psi, eps, nocc, B, B, Om, 0.05)
+    odd_diag = np.diagonal(total - even)[None, :]
+    corr_diag = np.diagonal(total)[None, :]
+    zero = np.zeros_like(corr_diag)
+
+    out = tmp_path / "broken_tr_sigma.dat"
+    write_sigma_to_file(
+        zero, filename=str(out), sigma_coh_kij_eV=corr_diag,
+        hartree_kij_eV=zero, kpoints_crys=np.zeros((1, 3)),
+        sx_label="sigX", corr_label="sigC", total_label="sigXC",
+        sigma_c_odd_kn_eV=odd_diag)
+    rows = parse_eqp_rows(
+        out, labels=("sigX", "sigC", "sigXC", "sigC_odd"))
+    np.testing.assert_allclose(rows[:, 5], np.real(odd_diag[0]), atol=5.1e-7)
+
+    trs = tmp_path / "trs_sigma.dat"
+    write_sigma_to_file(
+        zero, filename=str(trs), sigma_coh_kij_eV=corr_diag,
+        hartree_kij_eV=zero, kpoints_crys=np.zeros((1, 3)),
+        sx_label="sigX", corr_label="sigC", total_label="sigXC")
+    assert "sigC_odd=" not in trs.read_text()
+
+
 # ---------------------------------------------------------------------------
 #  6. Magnetisation flip: the odd residue is exactly odd, the even fit is
 #     invariant, the two residues swap.

@@ -4593,6 +4593,13 @@ def run_sc_driver(
         sigma_coh_kij_ry=(
             _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_coh_kij_ry is not None else None),
+        sigma_lorentz_skij_ry=(
+            jnp.stack([
+                _rotate_to_dft_basis(
+                    sigma_result.sigma_lorentz_skij_ry[sector], U,
+                    mesh=mesh_xy)
+                for sector in range(3)
+            ]) if sigma_result.sigma_lorentz_skij_ry is not None else None),
         # The un-extrapolated N₃ twin travels with its partner or not at all.
         # It is None on every non-extrapolating run; when it is present,
         # leaving it in the QP basis while ``sigma_xc_kij_ry`` beside it is

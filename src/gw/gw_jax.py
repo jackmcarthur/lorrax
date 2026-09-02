@@ -320,7 +320,12 @@ def main(argv=None):
 		# q->0 head mechanism, so the reader must be told which one ran and,
 		# when it is the incumbent one, the first condition that decided it.
 		_bare_taken, _bare_reason = packed_bare_transverse_route(config)
-		if config.bispinor_gw.value != "full_static_cohsex":
+		if config.bispinor_gw.value == "full_static_cohsex":
+			report.progress(
+				"Photon route   : packed screened static photon operator "
+				"(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
+				"Gamma-cell completion carries charge, mixed, and transverse heads)")
+		else:
 			# In production mode print0 sinks component chatter, so this goes
 			# into the RUN RECORD: which of two physically equivalent-inside-
 			# the-envelope routes ran is exactly the fact a later reader needs
@@ -530,7 +535,10 @@ def main(argv=None):
 	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
 	# head all read from the same plumbing (overrides → epshead → s_tensor)
 	# so they share one cache.  See ``head_correction.HeadResolver``.
-	head_resolver = HeadResolver(config, input_dir, wfn, sym, meta, print0)
+	q0_certificates = []
+	head_resolver = HeadResolver(
+		config, input_dir, wfn, sym, meta, print0,
+		q0_certificate_fn=q0_certificates.append)
 
 	# Optional BGW vcoul override (purely diagnostic — bit-reproducible BGW
 	# comparisons).  Returns None when ``use_bgw_vcoul`` is False.
@@ -770,6 +778,12 @@ def main(argv=None):
 						"q->0 head is the packed Gamma-cell completion's. "
 						"Sigma^B is the TT block of the packed operator, not "
 						"a separate term.")
+				else:
+					report.progress(
+						"Photon Sigma   : static packed route -- all sixteen "
+						"Lorentz blocks contracted once; Sigma_xc = Sigma_SX + "
+						"Sigma_COH and the per-state CC / CT+TC / TT split is "
+						"written to sigma_diag.dat.")
 				_hc = photon_response.head_completion
 				report.progress(
 					"Photon head    : "
@@ -781,9 +795,18 @@ def main(argv=None):
 					   f"hall_source={_hc.hall_source}; "
 					   f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
 					   f"ward={_hc.ward_residual:.3e}; "
-					   f"hermiticity={_hc.hermiticity_residual:.3e}; "
-					   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
-					   f"cubature_orders={_hc.observed_physical_counts}"))
+						   f"hermiticity={_hc.hermiticity_residual:.3e}; "
+						   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
+						   f"cubature_orders={_hc.cubature_receipt.orders}"))
+				if _hc is not None:
+					report.progress(
+						"Photon WS cert : "
+						f"orders={_hc.cubature_receipt.orders}; "
+						f"nodes={_hc.observed_physical_counts}; "
+						f"final_error_ratio="
+						f"{_hc.mixed_convergence_error_ratios[-1]:.3e}; "
+						f"max_dyson_backward_residual="
+						f"{_hc.max_backward_residual:.3e}")
 			else:
 				W_by_role = compute_screening_model(
 					mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
@@ -1067,6 +1090,8 @@ def main(argv=None):
 	photon_head_sigma_diag_tskn_ry = (
 		sigma_result.photon_head_sigma_diag_tskn_ry)
 	photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
+	sigma_lorentz_skij_ry = sigma_result.sigma_lorentz_skij_ry
+	sigma_c_odd_at_dft_ev = sigma_result.sigma_c_odd_at_dft_diag_ev
 	if photon_head_sigma_diag_tskn_ry is None:
 		photon_head_sigma_diag_tskn_ry = np.zeros(
 			(3, 3) + tuple(np.asarray(enk_dft).shape), dtype=np.complex128)
@@ -1228,6 +1253,11 @@ def main(argv=None):
 				sigma_c_omega_diag_ev,
 				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 				tol_ry=float(config.degen_avg_tol_ry))
+			if sigma_c_odd_at_dft_ev is not None:
+				sigma_c_odd_at_dft_ev = average_within_degenerate_sets(
+					np.asarray(sigma_c_odd_at_dft_ev),
+					energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+					tol_ry=float(config.degen_avg_tol_ry))
 		omega_rel_ev = omega_grid_ev
 	else:
 		sigma_c_omega_diag_ev = None
@@ -1238,6 +1268,39 @@ def main(argv=None):
 		if (mode.is_dynamic and sigma_c_at_dft_ev is not None)
 		else None
 	)
+
+	# Per-state Gamma-cell attribution in the same conditioned DFT basis as
+	# sigma_diag.dat.  The packed diagnostic owns CC/CT+TC/TT for its static
+	# completion; the dynamic scalar owner contributes the X and C charge head.
+	head_sigma_split_skn_ry = None
+	if config.bispinor:
+		head_sigma_split_skn_ry = np.asarray(
+			photon_head_sigma_diag_tskn_ry[1]
+			+ photon_head_sigma_diag_tskn_ry[2]).copy()
+		charge_head = None
+		if final_static_head_terms is not None:
+			if mode is ComputeMode.X_ONLY or mode.is_dynamic:
+				charge_head = np.asarray(final_static_head_terms.sigma_x_diag)
+			else:
+				charge_head = np.asarray(
+					final_static_head_terms.sigma_sx_diag
+					+ final_static_head_terms.sigma_coh_diag)
+			if charge_head.ndim == 1:
+				charge_head = np.broadcast_to(
+					charge_head, np.asarray(enk_dft).shape)
+		if mode.is_dynamic and head_sigma_diag_w_kn_ry is not None:
+			from .qsgw_utils import (interp_along_omega,
+			                         resolve_out_of_range_policy)
+			charge_corr = interp_along_omega(
+				np.asarray(head_sigma_diag_w_kn_ry),
+				np.asarray(omega_grid_ev), np.asarray(omega_dft_rel_ev),
+				out_of_range=resolve_out_of_range_policy(),
+				context="charge-head Sigma_c at E_DFT",
+				print_fn=lambda *args, **kwargs: None)
+			charge_head = (charge_corr if charge_head is None
+			               else charge_head + charge_corr)
+		if charge_head is not None:
+			head_sigma_split_skn_ry[0] += charge_head
 
 	# ---- Output ----
 	# Collectively extract only the bounded static diagonals before the
@@ -1251,6 +1314,18 @@ def main(argv=None):
 	h_transverse_diag_ry = (
 		None if h_transverse is None
 		else static_sigma_diag_to_host(h_transverse, mesh_xy))
+	sigma_lorentz_diag_skn_ry = None
+	if sigma_lorentz_skij_ry is not None:
+		sigma_lorentz_diag_skn_ry = np.stack([
+			static_sigma_diag_to_host(
+				sigma_lorentz_skij_ry[sector], mesh_xy)
+			for sector in range(3)
+		])
+		if not config.no_degen_averaging:
+			sigma_lorentz_diag_skn_ry = average_within_degenerate_sets(
+				sigma_lorentz_diag_skn_ry,
+				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+				tol_ry=float(config.degen_avg_tol_ry))
 
 	results = GWResults(
 		sig_sx=sig_sx,
@@ -1292,6 +1367,10 @@ def main(argv=None):
 		photon_head_sigma_diag_tskn_ry=np.asarray(
 			photon_head_sigma_diag_tskn_ry),
 		photon_head_sigma_basis=photon_head_sigma_basis,
+		sigma_lorentz_diag_skn_ry=sigma_lorentz_diag_skn_ry,
+		sigma_c_odd_diag_at_dft_ry=(
+			None if sigma_c_odd_at_dft_ev is None
+			else np.asarray(sigma_c_odd_at_dft_ev) / RYD_TO_EV),
 	)
 	if meta.rank == 0:
 		# Canonical Σ-decomposition table.  Explicit debug requests it for all
@@ -1368,6 +1447,51 @@ def main(argv=None):
 		# whole PROCESS when /proc gave us the pre-main span, else main().
 		timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
 
+	if sigma_lorentz_diag_skn_ry is not None:
+		_labels = ("CC", "CT+TC", "TT")
+		_parts_ev = np.asarray(sigma_lorentz_diag_skn_ry) * RYD_TO_EV
+		report.progress(
+			"Sigma blocks   : " + "; ".join(
+				f"{label} max|diag|={np.max(np.abs(part)):.6e} eV, "
+				f"mean|diag|={np.mean(np.abs(part)):.6e} eV"
+				for label, part in zip(_labels, _parts_ev)))
+	if head_sigma_split_skn_ry is not None:
+		_head_parts_ev = np.asarray(head_sigma_split_skn_ry) * RYD_TO_EV
+		report.progress(
+			"Head Sigma     : Gamma-cell contribution; " + "; ".join(
+				f"{label} max|diag|={np.max(np.abs(part)):.6e} eV, "
+				f"mean|diag|={np.mean(np.abs(part)):.6e} eV"
+				for label, part in zip(("CC", "CT+TC", "TT"),
+				                       _head_parts_ev)))
+	if sigma_c_odd_at_dft_ev is not None:
+		_odd_abs = np.abs(np.asarray(sigma_c_odd_at_dft_ev))
+		_xc_diag_ev = (
+			np.sum(np.asarray(sigma_lorentz_diag_skn_ry), axis=0) * RYD_TO_EV
+			if sigma_lorentz_diag_skn_ry is not None else
+			np.asarray(sig_x_diag_ry) * RYD_TO_EV
+			+ np.asarray(sigma_c_at_dft_ev))
+		_xc_abs = np.abs(_xc_diag_ev)
+		_max_share = (np.max(_odd_abs) / np.max(_xc_abs)
+		              if np.max(_xc_abs) > 0.0 else np.max(_odd_abs))
+		_mean_share = (np.mean(_odd_abs) / np.mean(_xc_abs)
+		               if np.mean(_xc_abs) > 0.0 else np.mean(_odd_abs))
+		report.progress(
+			"GN odd Sigma   : measured-broken-TR ordered residue; "
+			f"max|sigC_odd|={np.max(_odd_abs):.6e} eV; "
+			f"mean|sigC_odd|={np.mean(_odd_abs):.6e} eV; "
+			f"max-share-of-|Sigma_xc|={_max_share:.6e}; "
+			f"mean-share-of-|Sigma_xc|={_mean_share:.6e}; "
+			f"W(iomega_p)-Hermiticity="
+			f"{sigma_result.ppm_probe_hermiticity_residual:.3e}; "
+			f"max|D|/max|B|={sigma_result.ppm_odd_even_residue_ratio:.3e}")
+	if q0_certificates:
+		_q0_cert = max(q0_certificates, key=lambda item: item.final_error_ratio)
+		report.progress(
+			"Slab WS cert   : exact q=0 charge-head cubature; "
+			f"orders={_q0_cert.orders}; nodes={_q0_cert.physical_counts}; "
+			f"polygon_edges={_q0_cert.polygon_edges}; evaluations="
+			f"{len(q0_certificates)}; max_final_error_ratio="
+			f"{_q0_cert.final_error_ratio:.3e} (<=1 required)")
 	report.sigma_coverage(
 		config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
 		sigma_result=sigma_result)

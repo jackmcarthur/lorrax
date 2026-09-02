@@ -148,6 +148,12 @@ class GWResults:
     #: for historical constructors; the debug writer emits exact-zero columns.
     photon_head_sigma_diag_tskn_ry: np.ndarray | None = None
     photon_head_sigma_basis: str | None = None
+    #: Physical Sigma_xc Lorentz split, axes (CC, CT+TC, TT, k, band), Ry.
+    #: None on scalar runs, which keeps their text schema unchanged.
+    sigma_lorentz_diag_skn_ry: np.ndarray | None = None
+    #: Ordered-residue contribution to dynamic correlation, Ry.  Present only
+    #: when the measured Global TRS verdict is broken.
+    sigma_c_odd_diag_at_dft_ry: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.sig_h_scalar is None:
@@ -1590,6 +1596,10 @@ def write_results(
         """full BZ -> the file wedge, through the service."""
         return np.asarray(reduce_full_bz_to_file_wedge(sym, np.asarray(a)))
 
+    def _wedge_sectors(a):
+        """Apply the canonical k reduction to each Lorentz sector."""
+        return np.stack([_wedge(sector) for sector in np.asarray(a)])
+
     # The wedge's k-list is the full-BZ list put through the SAME
     # reduction, so the coordinates and the rows cannot disagree about
     # which k they are: one selection applied twice.
@@ -1652,6 +1662,12 @@ def write_results(
         total_label="sigXC" if results.use_ppm else "sigTOT",
         hartree_label=(
             "Hdir" if results.h_transverse is not None else "VH"),
+        sigma_lorentz_skn_eV=(
+            None if results.sigma_lorentz_diag_skn_ry is None
+            else r2e * _wedge_sectors(results.sigma_lorentz_diag_skn_ry)),
+        sigma_c_odd_kn_eV=(
+            None if results.sigma_c_odd_diag_at_dft_ry is None
+            else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
     )
 
     # ── BGW-format eqp0.dat / eqp1.dat ────────────────────────────────────
