@@ -92,6 +92,7 @@ nav:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
       - Codebase: architecture/codebase.md
+      - Four-current wiring: architecture/four_current_wiring.md
       - Substrate services: architecture/services.md
       - The FFI layer: architecture/ffi_layout.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md

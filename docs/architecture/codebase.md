@@ -587,6 +587,10 @@ lx test tests/bench/cusolvermp_eigh_test.py
 
 ## 8. Function Call Hierarchy
 
+> The four-current (bispinor) layer has its own end-to-end call map, with
+> each object's shape, sharding and route membership:
+> [Four-current wiring](four_current_wiring.md).
+
 ### 8.1 ISDF fitting
 
 ```
@@ -701,6 +705,7 @@ main                                       [gw/gw_jax.py]
 | **W Dyson solve** | `gw/w_isdf.py : solve_w`, `_get_w_solve_fn` |
 | **Static minimax lookup** | `gw/minimax_screening.py : build_static_minimax_window_pair` |
 | **Build G** | `gw/greens_function_kernel.py : build_G` |
+| **Four-current (bispinor) layer, end to end** | [`architecture/four_current_wiring.md`](four_current_wiring.md) — deck key → config → V tiles → χ₀ → Dyson → Σ → outputs |
 | **Σ band projection** | `gw/wavefunction_bundle.py : project`, `project_ri` |
 | **Reduce-scatter projection** | `gw/ppm_sigma.py : _make_project_ri_reduce_scatter` |
 | **Static Σ_SX / Σ_COH** | `gw/cohsex_sigma.py : compute_cohsex_sigma` |

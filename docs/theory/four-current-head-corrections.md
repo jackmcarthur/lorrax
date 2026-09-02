@@ -7,7 +7,10 @@ frequencies, what is omitted by construction, and what is known to be
 zero or unsupported. Deck keys are in the
 [input reference](../input_reference.md); the phase-1 physics record is
 [`BISPINOR_DHFB_DESIGN.md`](../BISPINOR_DHFB_DESIGN.md); the S-tensor
-convention is [its own page](s-tensor-convention.md).
+convention is [its own page](s-tensor-convention.md). **How this layer is
+wired into the rest of the code** — every producer, object, shape, sharding
+and refusal, stage by stage — is
+[Four-current wiring](../architecture/four_current_wiring.md).
 
 Rydberg units throughout. Lorentz index `I,J ∈ {0,1,2,3}` with `0` the
 charge channel `C` and `1..3` the Cartesian current channels `T`. The
