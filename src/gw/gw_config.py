@@ -6022,6 +6022,30 @@ class LorraxConfig:
         # that reason, not a low_mem_bands refusal it never asked for.  An
         # explicitly named conflicting value is left alone and refused by
         # the envelope (rule 13: refuse rather than ignore).
+        # The bare family (lane C's packed route) has the same one Dyson
+        # plan requirement as a ROUTING condition (lane N): the screening
+        # owner refuses anything but 'distributed', so an unnamed key must be
+        # derived here too, or a default slab deck would silently take the
+        # incumbent route and lose the transverse q=Gamma head (owner ruling
+        # 2026-09-01: heads are always on).  An EXPLICIT non-distributed
+        # value is left alone and keeps the deck on the incumbent route,
+        # with the reason printed as the `Photon route` line.
+        if (bool(resolved.bispinor)
+                and resolved.bispinor_gw is BispinorGWMode.BARE_TRANSVERSE
+                and int(resolved.sys_dim) == 2
+                and "w_dyson_solver" not in _named_keys
+                and all(row[0] for row in packed_static_envelope(
+                    resolved, screened=False))):
+            resolved = _dc_replace(resolved, backend=_dc_replace(
+                resolved.backend, w_dyson_solver="distributed"))
+            print_fn(
+                "  [config provenance] bispinor slab bare_transverse inside "
+                "the packed envelope: w_dyson_solver was not named; setting "
+                "w_dyson_solver = distributed so the packed route is taken "
+                "(the packed photon response accepts only that plan; name "
+                "w_dyson_solver = local explicitly to stay on the incumbent "
+                "route, which carries no transverse q=Gamma head); "
+                "docs/input_reference.md, bispinor_gw")
         if (bool(resolved.bispinor)
                 and resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX):
             _unmet = [row for row in packed_static_envelope(

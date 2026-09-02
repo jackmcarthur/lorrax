@@ -37,7 +37,10 @@ head_correction = full
 #: The same deck WITHOUT the backend key, i.e. at the shipping default
 #: ``w_dyson_solver = auto``.
 _PACKED_BARE_AUTO_SOLVER = _PACKED_BARE.replace(
-    "w_dyson_solver = distributed\n", "")
+    "w_dyson_solver = distributed\n", "w_dyson_solver = local\n")
+#: An UNNAMED w_dyson_solver is now derived to "distributed" for the bare
+#: family inside its envelope at parse time (heads always on), so the
+#: routing case below needs an EXPLICIT non-distributed value.
 
 _PPM_KEYS = """\
 use_ppm_sigma = true
@@ -127,8 +130,10 @@ def test_the_hand_tt_overlay_is_refused_on_the_dynamic_packed_route(tmp_path):
             "bispinor_tt_head_correction = true\n",
             name="gnppm_overlay.in")
     message = str(exc.value)
-    assert "packed_bare_transverse_tt_head_double_count" in message
-    assert "gn_ppm" in message
+    # Since lane L the key is not a deck key at all: the parse-time tombstone
+    # fires before the route's own double-count gate could, on any value.
+    assert "bispinor_tt_head_correction" in message
+    assert "REMOVED" in message
 
 
 def test_the_route_is_not_taken_when_its_dyson_solver_would_refuse(tmp_path):

@@ -596,11 +596,13 @@ def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):
     never wrote."""
     deck = (_packed_deck()
             .replace("low_mem_bands = true\n", "")
-            .replace("compute_mode = cohsex", "compute_mode = gn_ppm"))
+            .replace("compute_mode = cohsex", "compute_mode = mpa"))
+    # ``mpa`` is the one dynamic mode OUTSIDE PACKED_PHOTON_COMPUTE_MODES
+    # (the plasmon-pole pair joined it with the dynamic packed route, lane N).
     with pytest.raises(ValueError) as exc:
         _parse(tmp_path, deck)
     message = str(exc.value)
-    assert "compute_mode = gn_ppm" in message
+    assert "compute_mode = mpa" in message
     assert "low_mem_bands" not in message
 
 
