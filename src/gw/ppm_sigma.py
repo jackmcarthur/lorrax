@@ -1134,6 +1134,7 @@ def _run_sigma_branch(
     sink = _MemoryTileSink(
         shape=(n_brk, n_omega, nk_proj, m_pad, n_pad),
         sharding=NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')),
+        omega_axis=1,
     )
     accumulator: _SigmaAccumulator = _TauAccumulator(
         omega_vec=omega_vec, sink=sink)
