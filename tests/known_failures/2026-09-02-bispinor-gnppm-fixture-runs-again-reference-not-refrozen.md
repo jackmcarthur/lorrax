@@ -100,3 +100,5 @@ registered nowhere, and offered two exits: refuse the route until phase 3,
 or regenerate and re-freeze. Phase 3 landed (this lane), the regeneration is
 done, and the re-freeze is deliberately not. The row is AMENDED, not closed:
 the gate is red for a **different, now-measured** reason.
+
+**2026-09-02 (integ reconciliation).** The deck now names `w_dyson_solver = local` explicitly: an unnamed solver on a slab bare_transverse deck is derived to `distributed` at parse time (heads always on), which `distrib_la` refuses on this fixture's 1x1 mesh. With `local` the fixture stays on the incumbent route the reference was cut from and keeps failing at the pre-existing drift documented above.
