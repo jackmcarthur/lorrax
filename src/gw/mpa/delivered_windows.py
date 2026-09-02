@@ -2372,7 +2372,15 @@ def build_delivered_sigma_windows(
             # 6.58e9 after a tightened re-merge).  Tightening and merging are
             # separate optimisations; letting them interact loses both.
             trial_rows = []
-            if stage != "tightened":
+            # Under the box rule there is nothing to merge: the merged trial
+            # is fitted on the branch's MEASURE (adapted_only), which is the
+            # dependence the box rule removes.  Measured on Na 8x8x8 at
+            # P=16 (-5..+5 eV, eps 1e-4): the merged 'val:consolidated' roq
+            # rule (10 nodes) replaced three box rules and put the state at
+            # E_F at Gamma 0.95 meV off the pane control at omega = 0, while
+            # the +-15 eV plan of the same deck, which did not merge, sat at
+            # 0.10 meV.
+            if stage != "tightened" and _uniform_rule_eps() is None:
                 (specs, candidates_by_window, trial_rows,
                  consolidation_cache) = _consolidate_branches(
                     specs, candidates_by_window, eta, pair_ceiling, factor_cap,
