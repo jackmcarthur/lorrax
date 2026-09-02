@@ -18,7 +18,7 @@ in every executable weight. The GN/HL one-pole adapter retains the incumbent
 PPM convention: crossing boxes and sign-definite boxes within the established
 `edge_factor*eta` resonance handoff receive the resolved `eta`, while safely
 separated sign-definite Laplace boxes are unbroadened. The same box rule is
-built on the ordinary physical-`eta` support with fixed tenfold accuracy
+built on the ordinary physical-`eta` support with fixed hundredfold accuracy
 headroom, then its unchanged nodes and weights are separately certified on
 the translated real-axis support before execution.
 

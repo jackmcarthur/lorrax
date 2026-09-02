@@ -54,8 +54,8 @@ def _fake_rule(box, eps, **_kwargs):
         kappa_max=1.2, seconds=0.01)
 
 
-def _plan(monkeypatch, branch=None, **kwargs):
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+def _plan(monkeypatch, branch=None, *, builder=_fake_rule, **kwargs):
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", builder)
     monkeypatch.setattr(
         "gw.sigma_box_plan.rule_amplification_p99",
         lambda *_args, **_kwargs: 1.1)
@@ -144,7 +144,14 @@ def test_executor_conventions_and_lower_half_conjugation(monkeypatch):
 
 
 def test_ppm_compatibility_broadens_only_crossing_boxes(monkeypatch):
-    plan, geometry = _plan(monkeypatch, broaden_sign_definite=False)
+    build_eps = []
+
+    def recording_rule(box, eps, **kwargs):
+        build_eps.append(eps)
+        return _fake_rule(box, eps, **kwargs)
+
+    plan, geometry = _plan(
+        monkeypatch, builder=recording_rule, broaden_sign_definite=False)
     crossing, tail = plan[:2]
     fake_crossing = _fake_rule(
         geometry["branches"][0]["windows"][0]["box_ry"], 1.0e-4)
@@ -157,6 +164,9 @@ def test_ppm_compatibility_broadens_only_crossing_boxes(monkeypatch):
     assert geometry["branches"][0]["windows"][0][
         "external_regularization_ry"] == 0.1
     assert tail_eta == 0.0
+    np.testing.assert_allclose(
+        build_eps, [1.0e-4, 1.0e-6, 1.0e-6, 1.0e-6], rtol=0.0,
+        atol=1.0e-18)
     np.testing.assert_allclose(
         crossing.window.nodes.alpha,
         fake_crossing.weights * np.exp(-0.1 * fake_crossing.times))
