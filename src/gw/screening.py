@@ -884,6 +884,15 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    trs_allowed = _trs_verdict(sym)
+    if diagrams is ScreeningDiagrams.W_BSE and not trs_allowed:
+        raise RuntimeError(
+            "GATE w_bse_requires_measured_trs: screening_diagrams = w_bse "
+            "uses a time-reversal pair gauge for the ladder's anti-resonant "
+            "channel, but SymMaps.trs_allowed is false.  The measured DFT "
+            "reference therefore does not license that construction; use "
+            "screening_diagrams = w_rpa (or w_rpa_resolvent) until the "
+            "ladder owns a general ordered-response construction.")
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
