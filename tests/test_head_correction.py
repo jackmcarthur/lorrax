@@ -24,7 +24,12 @@ def _resolver(policy, monkeypatch, *, screened=True):
         vhead=None, whead_0freq=None, whead_imfreq=None,
         head_minibz_average=False, bgw_metal_q0_treatment="exact")
     config = SimpleNamespace(
-        head=head, do_screened=screened, nval=4, ncond=4, nband=8)
+        head=head, do_screened=screened, nval=4, ncond=4, nband=8,
+        # HeadResolver resolves the four-current representation from the GW
+        # run controls (head_correction.py, resolve_four_current_representation),
+        # so a hand-built config must carry them.  Scalar defaults: this suite
+        # is about the head POLICY, not the bispinor carrier.
+        bispinor=False, bispinor_gw="bare_transverse")
     direct = HeadSample(
         vc0=100.0 + 0.0j, wcoul0=25.0 + 0.0j,
         source="unit direct", omega=0.0j,
@@ -86,7 +91,8 @@ def test_head_resolver_forwards_the_gw_run_dipole_window():
         bgw_metal_q0_treatment="off",
     )
     config = types.SimpleNamespace(
-        head=head, nval=8, ncond=32, nband=40)
+        head=head, nval=8, ncond=32, nband=40,
+        bispinor=False, bispinor_gw="bare_transverse")
     wfn = types.SimpleNamespace(nbands=62, nelec=10)
     resolver = HeadResolver(
         config, ".", wfn, sym=None, meta=None, print_fn=lambda _msg: None)
