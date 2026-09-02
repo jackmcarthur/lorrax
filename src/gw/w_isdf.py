@@ -125,7 +125,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             layout: str = "legacy", face_shape=None,
                             right_face_shape=None,
                             vertex_pair: bool = False,
-                            vertex_identity=(False, False)):
+                            vertex_identity=(False, False),
+                            k_unfold_plan=None):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
 
     ``n_out`` (static): number of χ outputs accumulated over the SAME τ
@@ -176,7 +177,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             "wavefunction layout")
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_pair, vertex_identity)
+                 vertex_pair, vertex_identity, id(k_unfold_plan))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -192,7 +193,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
             right_face_shape=right_face_shape,
             vertex_pair=vertex_pair,
-            vertex_identity=vertex_identity)
+            vertex_identity=vertex_identity,
+            k_unfold_plan=k_unfold_plan)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -409,7 +411,8 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
                                  vertex_pair=False,
-                                 vertex_identity=(False, False)):
+                                 vertex_identity=(False, False),
+                                 k_unfold_plan=None):
     """Face-layout sibling of :func:`_get_chi_minimax_kernel_legacy`.
 
     G construction is the only part that forks (module-level docstring):
@@ -443,15 +446,36 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         right_face_shape = face_shape
     nk_right, nb_right, n_rmu_right, ns_right = (
         int(v) for v in right_face_shape)
-    if nk_shape != nk:
+    expected_input_nk = (
+        nk if k_unfold_plan is None else int(k_unfold_plan.n_parent))
+    if nk_shape != expected_input_nk:
         raise ValueError(
             f"_get_chi_minimax_kernel_face: face_shape nk={nk_shape} does "
-            f"not match kgrid's prod={nk}")
-    if (nk_right, nb_right, ns_right) != (nk, nb_full, ns):
+            f"not match expected input k extent {expected_input_nk}")
+    if (nk_right, nb_right, ns_right) != (
+            expected_input_nk, nb_full, ns):
         raise ValueError(
             "_get_chi_minimax_kernel_face: left/right endpoint bundles "
             "must share (nk, nb_full, nspinor); got "
             f"{face_shape} and {right_face_shape}")
+    if k_unfold_plan is not None:
+        if int(k_unfold_plan.n_full) != nk:
+            raise ValueError(
+                "_get_chi_minimax_kernel_face: parent plan full-k extent "
+                f"{k_unfold_plan.n_full} != prod(kgrid)={nk}.")
+        if vertex_pair or n_rmu_left != n_rmu_right:
+            raise ValueError(
+                "_get_chi_minimax_kernel_face: parent-k bring-up owns the "
+                "ordinary square charge response only; rectangular/four-"
+                "current blocks remain on full k.")
+        # Keep every per-node Green function in the orbit-packed basis.  Its
+        # parent->full symmetry action is then process-local; canonicalize the
+        # accumulated chi only once after the complete tau sweep.
+        n_rmu_out_left = int(k_unfold_plan.n_centroid_packed)
+        n_rmu_out_right = n_rmu_out_left
+    else:
+        n_rmu_out_left = n_rmu_left
+        n_rmu_out_right = n_rmu_right
 
     _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
@@ -470,7 +494,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     # "hoist this call out of every per-k/per-tau loop" instruction.
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
-        n=n_rmu_right * ns, nq=nk, dtype=jnp.complex128)
+        n=n_rmu_right * ns, nq=expected_input_nk, dtype=jnp.complex128)
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
@@ -488,12 +512,20 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         Gv_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
-                       mask=mask_v, layout="face", gemm=g_plan),
+                       mask=mask_v, layout="face", gemm=g_plan,
+                       k_unfold_plan=k_unfold_plan,
+                       k_unfold_output=(
+                           "packed" if k_unfold_plan is not None
+                           else "canonical")),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
-                       mask=mask_c, layout="face", gemm=g_plan),
+                       mask=mask_c, layout="face", gemm=g_plan,
+                       k_unfold_plan=k_unfold_plan,
+                       k_unfold_output=(
+                           "packed" if k_unfold_plan is not None
+                           else "canonical")),
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
@@ -501,6 +533,12 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         t=NamedSharding(mesh_xy, _rep1),
         alpha=NamedSharding(mesh_xy, _rep1 if n_out == 1 else P()),
     )
+
+    def _finish_chi(value):
+        value_q = _chi_fftn_local(value)
+        if k_unfold_plan is not None:
+            value_q = k_unfold_plan.restore_operator_basis(value_q)
+        return value_q
 
     if n_out >= 2:
         _chi_R_out = tuple(_chi_R_shard for _ in range(n_out))
@@ -518,7 +556,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
         ):
             zero = jax.lax.with_sharding_constraint(
-                jnp.zeros((nk, n_rmu_left, n_rmu_right),
+                jnp.zeros((nk, n_rmu_out_left, n_rmu_out_right),
                           dtype=jnp.complex128),
                 _chi_R_shard)
             acc0 = tuple(zero for _ in range(n_out))
@@ -542,7 +580,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
             final_R, _ = jax.lax.scan(
                 _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)), unroll=1)
-            return tuple(_chi_fftn_local(f) for f in final_R)
+            return tuple(_finish_chi(f) for f in final_R)
 
         return minimax_tau_integrate_chi_multi
 
@@ -555,7 +593,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         vertex_operands,
     ):
         chi_R_zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_rmu_left, n_rmu_right),
+            jnp.zeros((nk, n_rmu_out_left, n_rmu_out_right),
                       dtype=jnp.complex128), _chi_R_shard)
 
         def _body(chi_R_acc, xs):
@@ -612,7 +650,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
         final_R, _ = jax.lax.scan(
             _body, chi_R_zero, (nodes.t, nodes.alpha), unroll=1)
-        return _chi_fftn_local(final_R)
+        return _finish_chi(final_R)
 
     _base_in = (_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
                 NamedSharding(mesh_xy, _rep2),
@@ -1471,13 +1509,26 @@ def _chi_face_kwargs(wfns) -> dict:
     return face_kernel_kwargs(wfns)
 
 
+def _chi_parent_face_kwargs(wfns) -> dict:
+    """Minimax-G shape kwargs, including raw-parent transport when present.
+
+    Fractional-occupation response still consumes the primary full-k carrier
+    directly.  Keeping that dispatch on :func:`_chi_face_kwargs` prevents an
+    attached acceleration carrier from changing a kernel whose symmetry
+    transport has not been derived yet.
+    """
+    from .wavefunction_bundle import green_face_kernel_kwargs
+    return green_face_kernel_kwargs(wfns)
+
+
 def _chi_layout_operands(wfns, eref):
     """The ψ/energy operand tuple :func:`_get_chi_minimax_kernel`'s
     returned kernel expects AFTER ``nodes``, dispatched on ``wfns.layout``
     — the one place :func:`compute_chi0`, :func:`_chi0_multi_kernel_args`
     and :func:`_chi0_contour_kernel_args` turn a bundle into kernel
     operands, so those three callers stop extracting legacy views
-    (``.xn()``/``.yr()``) themselves.  Pair with :func:`_chi_face_kwargs`
+    (``.xn()``/``.yr()``) themselves.  Pair with
+    :func:`_chi_parent_face_kwargs`
     at the SAME call site to build the matching kernel — the two tuples
     differ in length (legacy's four windowed ψ views vs face's two
     full-extent ψ copies plus two band masks) because the two kernel
@@ -1495,10 +1546,14 @@ def _chi_layout_operands(wfns, eref):
         enk_c = wfns.enk[:, s.cond] - eref_j
         return (wfns.xn(s.val), wfns.yr(s.val),
                wfns.yr(s.cond), wfns.xn(s.cond), enk_v, enk_c)
-    mask_v = wfns.band_mask(s.val)
-    mask_c = wfns.band_mask(s.cond)
-    enk_full = wfns.enk - eref_j
-    return (wfns.psi_mun, wfns.psi_nmu, mask_v, mask_c, enk_full)
+    carrier = wfns.green_parent
+    if carrier is None:
+        carrier = wfns
+    mask_v = carrier.band_mask(s.val)
+    mask_c = carrier.band_mask(s.cond)
+    enk_full = carrier.enk - eref_j
+    return (carrier.psi_mun, carrier.psi_nmu,
+            mask_v, mask_c, enk_full)
 
 
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
@@ -1545,7 +1600,8 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, **_chi_face_kwargs(wfns))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, **_chi_parent_face_kwargs(wfns))
     return kernel(
         nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),
@@ -2323,7 +2379,7 @@ def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     args, n_out = _chi0_multi_kernel_args(
         wfns, tau, alpha_rows, energy_reference)
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
-                                     **_chi_face_kwargs(wfns))
+                                     **_chi_parent_face_kwargs(wfns))
     return kernel(*args)
 
 
@@ -2338,7 +2394,7 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     args, n_out = _chi0_multi_kernel_args(
         wfns, tau, alpha_rows, energy_reference)
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
-                                     **_chi_face_kwargs(wfns))
+                                     **_chi_parent_face_kwargs(wfns))
     kernel.lower(*args).compile()
 
 
@@ -2409,7 +2465,7 @@ def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=True,
-        **_chi_face_kwargs(wfns))
+        **_chi_parent_face_kwargs(wfns))
     return kernel(*args)
 
 
@@ -2425,7 +2481,7 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=True,
-        **_chi_face_kwargs(wfns))
+        **_chi_parent_face_kwargs(wfns))
     kernel.lower(*args).compile()
 
 
@@ -3340,7 +3396,8 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, **_chi_face_kwargs(wfns))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, **_chi_parent_face_kwargs(wfns))
     kernel.lower(
         nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),

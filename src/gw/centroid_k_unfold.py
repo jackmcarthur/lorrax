@@ -26,8 +26,38 @@ from common.grouped_layout import (
 from symmetry_maps import (
     centroid_source_map_and_wrap,
     permutation_orbit_labels,
+    reorder_isdf_operator_basis,
     unfold_spin_centroid_operator,
 )
+
+
+# Conservative P=4 A100 crossover after postponing canonicalization to one
+# completed chi operator.  This is an internal scheduling constant, not a
+# user-tunable physics/runtime knob.  The dimensionless work proxy scales out
+# the full-k count and refuses the small-band region where local symmetry
+# transport is bandwidth-dominated despite reducing the GEMM count.
+_MIN_AVOIDED_BAND_WORK = 192.0
+
+
+def parent_k_contraction_profitable(
+    *, n_full: int, n_parent: int, n_bands: int,
+) -> bool:
+    """Conservative automatic admission for parent-k Green contractions.
+
+    The saved band contraction is proportional to
+    ``n_bands * (1 - n_parent/n_full)``; the required full-k operator
+    transport is not.  The measured Si P=4 crossover was below 192 (128 bands
+    at 64->8 remained slower; 256 bands was faster), so 192 is a conservative
+    no-regression boundary rather than a fitted optimum.  Callers additionally
+    restrict this measured policy to GPU execution.
+    """
+    full = int(n_full)
+    parent = int(n_parent)
+    bands = int(n_bands)
+    if full < 1 or parent < 1 or parent >= full or bands < 1:
+        return False
+    avoided = bands * (full - parent) / full
+    return avoided >= _MIN_AVOIDED_BAND_WORK
 
 
 def _readonly(value, dtype) -> np.ndarray:
@@ -56,6 +86,7 @@ class CentroidKUnfoldPlan:
     spin_action_full: np.ndarray
     n_sym_spatial: int
     nspinor: int
+    canonical_centroid_extent: int
 
     @property
     def n_parent(self) -> int:
@@ -141,6 +172,45 @@ class CentroidKUnfoldPlan:
                 psi_mun, axis=2, spec=P(None, None, 'x', 'y')),
         )
 
+    @property
+    def supports_canonical_bridge(self) -> bool:
+        """Whether the canonical basis is a prefix after packed reordering.
+
+        The square grouped layout pads to a complete-mesh multiple, while the
+        canonical carrier uses the smallest complete-mesh multiple covering
+        the logical rows.  Orbit imbalance can therefore make the packed
+        extent larger, never smaller.  Reorder at the packed extent first;
+        the surplus rows are then known-zero shard padding and may be cropped
+        with both operator axes still distributed.
+        """
+        canonical = int(self.canonical_centroid_extent)
+        complete_mesh = int(self.mesh_xy.size)
+        return (
+            canonical >= self.n_centroid_logical
+            and canonical <= self.n_centroid_packed
+            and canonical % complete_mesh == 0
+            and self.n_centroid_packed % complete_mesh == 0
+        )
+
+    def _canonical_source_map(self) -> np.ndarray:
+        """Complete destination-to-source map, including padding rows."""
+        if not self.supports_canonical_bridge:
+            raise ValueError(
+                "CentroidKUnfoldPlan: canonical centroid extent must cover "
+                "the logical basis, not exceed the orbit-packed extent, and "
+                "divide the complete mesh; got logical/packed/canonical="
+                f"{self.n_centroid_logical}/{self.n_centroid_packed}/"
+                f"{self.canonical_centroid_extent}.")
+        extent = self.n_centroid_packed
+        logical = self.n_centroid_logical
+        source = np.empty((extent,), dtype=np.int32)
+        source[:logical] = self.layout.axis.canonical_to_packed
+        packed_pad = np.flatnonzero(~self.layout.axis.active_mask)
+        if packed_pad.size != extent - logical:
+            raise AssertionError("packed/canonical padding cardinality drift")
+        source[logical:] = packed_pad
+        return source
+
     def unfold_operator(self, operator_parent):
         """Transport ``(k_parent,s,mu,s,nu)`` to full k locally."""
         return unfold_spin_centroid_operator(
@@ -153,9 +223,100 @@ class CentroidKUnfoldPlan:
             spin_action_full=self.spin_action_full,
             n_sym_spatial=self.n_sym_spatial,
             mesh_xy=self.mesh_xy,
-            logical_centroid_extent=self.n_centroid_logical,
+            # Grouped-layout padding is a suffix of EACH owner shard, not a
+            # single global suffix.  The packed source maps permute those pad
+            # rows among themselves and pack_centroid_axis made them exactly
+            # zero, so the prefix-mask convention of the generic service is
+            # neither needed nor correct here.  Treat the complete packed
+            # extent as active for transport; finish_green removes the known
+            # pad rows after restoring canonical order.
+            logical_centroid_extent=self.n_centroid_packed,
             axis_local=True,
         )
+
+    def finish_green(self, operator_parent):
+        """Unfold parent k locally, then restore today's canonical basis.
+
+        The one-time basis move is the bring-up bridge while V/W and
+        projection remain in canonical centroid order.  It uses the symmetry
+        service's volume-preserving two-axis permutation: every intermediate
+        remains ``P(None,'x','y')`` and no rank materializes a complete
+        centroid axis.  Once those consumers use this same packed plan, the
+        bridge disappears without changing the Green contraction or symmetry
+        algebra.
+        """
+        packed = self.unfold_operator(operator_parent)
+        ns = int(self.nspinor)
+        extent = self.n_centroid_packed
+        source_mu = self._canonical_source_map()
+        spin = np.arange(ns, dtype=np.int32)
+        source_endpoint = (
+            source_mu[:, None] * ns + spin[None, :]).reshape(extent * ns)
+        flat_sharding = NamedSharding(self.mesh_xy, P(None, 'x', 'y'))
+        flat = jax.lax.with_sharding_constraint(
+            jnp.transpose(packed, (0, 2, 1, 4, 3)).reshape(
+                self.n_full, extent * ns, extent * ns),
+            flat_sharding)
+        canonical_flat = self.restore_operator_basis(
+            flat,
+            source_map=source_endpoint,
+            canonical_extent=int(self.canonical_centroid_extent) * ns)
+        canonical_extent = int(self.canonical_centroid_extent)
+        canonical = jnp.transpose(
+            canonical_flat.reshape(
+                self.n_full, canonical_extent, ns,
+                canonical_extent, ns),
+            (0, 2, 1, 4, 3))
+        return jax.lax.with_sharding_constraint(
+            canonical,
+            NamedSharding(self.mesh_xy, P(None, None, 'x', None, 'y')))
+
+    def restore_operator_basis(
+        self,
+        operator_packed,
+        *,
+        source_map=None,
+        canonical_extent=None,
+    ):
+        """Restore one packed ``P(batch,X,Y)`` operator to canonical order.
+
+        Reordering happens before cropping, at the complete packed extent.
+        Thus the only nonlocal operation is the symmetry service's
+        volume-preserving all-to-all backend; surplus owner-padding rows are
+        discarded only after they have been moved to the global suffix.
+        ``source_map``/``canonical_extent`` generalize the scalar-centroid
+        operation to the merged ``(mu,spin)`` endpoints used by Green's
+        functions.
+        """
+        packed = jnp.asarray(operator_packed)
+        if packed.ndim != 3 or packed.shape[1] != packed.shape[2]:
+            raise ValueError(
+                "CentroidKUnfoldPlan.restore_operator_basis requires a "
+                f"square rank-three operator; got {packed.shape}.")
+        if source_map is None:
+            source = self._canonical_source_map()
+        else:
+            source = np.asarray(source_map, dtype=np.int32)
+        extent = int(packed.shape[1])
+        if source.shape != (extent,):
+            raise ValueError(
+                "CentroidKUnfoldPlan.restore_operator_basis source map "
+                f"must have shape ({extent},); got {source.shape}.")
+        target = (
+            int(self.canonical_centroid_extent)
+            if canonical_extent is None else int(canonical_extent))
+        if not 0 < target <= extent:
+            raise ValueError(
+                "CentroidKUnfoldPlan.restore_operator_basis canonical "
+                f"extent must lie in (0,{extent}]; got {target}.")
+        reordered = reorder_isdf_operator_basis(
+            packed,
+            left_source_map=source,
+            right_source_map=source,
+            mesh_xy=self.mesh_xy)
+        canonical = reordered[:, :target, :target]
+        return jax.lax.with_sharding_constraint(
+            canonical, NamedSharding(self.mesh_xy, P(None, 'x', 'y')))
 
 
 def build_centroid_k_unfold_plan(
@@ -166,6 +327,7 @@ def build_centroid_k_unfold_plan(
     *,
     nspinor: int,
     parent_k_frac=None,
+    canonical_centroid_extent=None,
 ) -> CentroidKUnfoldPlan:
     """Bind canonical symmetry tables to one orbit-packed centroid basis.
 
@@ -220,6 +382,16 @@ def build_centroid_k_unfold_plan(
             f"raw parent table of length {parent_k.shape[0]}.")
     spin = np.asarray(sym.spinor_action(sym_idx, nspinor=ns),
                       dtype=np.complex128)
+    canonical_extent = (
+        int(len(centroid_fft_idx)) if canonical_centroid_extent is None
+        else int(canonical_centroid_extent))
+    if (canonical_extent < int(len(centroid_fft_idx))
+            or canonical_extent % shape[0]):
+        raise ValueError(
+            "build_centroid_k_unfold_plan: canonical_centroid_extent must "
+            "cover every logical centroid and divide both square mesh axes; "
+            f"got {canonical_extent} for {len(centroid_fft_idx)} centroids "
+            f"on {shape}.")
 
     return CentroidKUnfoldPlan(
         mesh_xy=mesh_xy,
@@ -232,7 +404,12 @@ def build_centroid_k_unfold_plan(
         spin_action_full=_readonly(spin, np.complex128),
         n_sym_spatial=n_spatial,
         nspinor=ns,
+        canonical_centroid_extent=canonical_extent,
     )
 
 
-__all__ = ["CentroidKUnfoldPlan", "build_centroid_k_unfold_plan"]
+__all__ = [
+    "CentroidKUnfoldPlan",
+    "build_centroid_k_unfold_plan",
+    "parent_k_contraction_profitable",
+]

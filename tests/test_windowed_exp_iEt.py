@@ -319,7 +319,7 @@ def test_build_G_tau_forwards_layout_and_gemm_to_build_G():
 def test_build_G_and_tau_apply_parent_unfold_after_the_only_contraction():
     class ParentRows:
         @staticmethod
-        def unfold_operator(operator):
+        def finish_green(operator):
             return operator[jnp.asarray([1, 0, 1])]
 
     xn = jnp.asarray(np.arange(2 * 1 * 2 * 3).reshape(2, 1, 2, 3)

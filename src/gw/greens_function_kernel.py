@@ -188,7 +188,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
 
 
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
-           gemm=None, k_unfold_plan=None):
+           gemm=None, k_unfold_plan=None, k_unfold_output='canonical'):
     """Build G_μν(k).
 
     ``layout='legacy'`` (default): returns (nk, s, μ_X, s, μ_Y) flat-k,
@@ -207,8 +207,12 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
     :class:`gw.centroid_k_unfold.CentroidKUnfoldPlan`.  When present, the
     operands and band weights are on raw WFN parent k rows; this function
     performs the same contraction once per parent and asks the authenticated
-    plan to transport the completed operator to full k.  No symmetry algebra
-    or second Green implementation lives here.
+    plan to transport the completed operator to full k.  The default
+    ``k_unfold_output='canonical'`` also restores canonical centroid order.
+    ``'packed'`` leaves the full-k operator in the plan's orbit-local basis so
+    a surrounding multi-node quadrature can postpone that communication until
+    after its Green functions have been contracted.  No symmetry algebra or
+    second Green implementation lives here.
     """
     if layout == 'legacy':
         G = _build_G_legacy(psi_xn, psi_yr, Gij=Gij, phases=phases)
@@ -226,7 +230,18 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
         # The contraction above remains the sole Green-function builder.
         # A CentroidKUnfoldPlan merely changes its k input from full children
         # to raw parents and transports the completed two-endpoint operator.
-        G = k_unfold_plan.unfold_operator(G)
+        output = str(k_unfold_output).strip().lower()
+        if output == 'canonical':
+            G = k_unfold_plan.finish_green(G)
+        elif output == 'packed':
+            G = k_unfold_plan.unfold_operator(G)
+        else:
+            raise ValueError(
+                "build_G: k_unfold_output must be 'canonical' or 'packed'; "
+                f"got {k_unfold_output!r}.")
+    elif str(k_unfold_output).strip().lower() != 'canonical':
+        raise ValueError(
+            "build_G: k_unfold_output='packed' requires k_unfold_plan.")
     return G
 
 
@@ -309,7 +324,8 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
 
 def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
-                layout='legacy', gemm=None, k_unfold_plan=None):
+                layout='legacy', gemm=None, k_unfold_plan=None,
+                k_unfold_output='canonical'):
     """G(t)_k(μ, ν) = Σ_n ψ_n(μ) · exp(-t · (e_n - e_ref)) · ψ_n*(ν).
 
     Unified time-evolution G builder shared by χ₀ (imaginary-time) and
@@ -342,8 +358,9 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                  stays out of windowed_exp_iEt so that helper remains the
                  fused phase/window primitive.  Weights are never
                  square-rooted or clipped.
-    layout, gemm, k_unfold_plan: forwarded verbatim to :func:`build_G` — see its
-                 docstring.  Under ``layout='face'`` ``enk``/``mask``/
+    layout, gemm, k_unfold_plan, k_unfold_output: forwarded verbatim to
+                 :func:`build_G` — see its docstring.  Under
+                 ``layout='face'`` ``enk``/``mask``/
                  ``band_weight`` are expected at the FULL [b0,b4) extent
                  (``Wavefunctions.band_mask`` is the bring-up helper for
                  turning a logical band slice into this ``mask``, per
@@ -370,4 +387,5 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
-        k_unfold_plan=k_unfold_plan)
+        k_unfold_plan=k_unfold_plan,
+        k_unfold_output=k_unfold_output)

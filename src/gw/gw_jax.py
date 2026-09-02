@@ -531,6 +531,17 @@ def main(argv=None):
 		)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
+	green_parent_carrier = getattr(isdf, 'green_parent_carrier', None)
+	if green_parent_carrier is None:
+		wfns_screening = wfns
+	else:
+		# Keep the acceleration carrier out of the primary Wavefunctions
+		# pytree.  Only chi0's Green contraction sees these extra arrays; head,
+		# Sigma, density, output and restart kernels retain their established
+		# full-k argument trees.
+		from dataclasses import replace as _dc_replace
+		wfns_screening = _dc_replace(
+			wfns, green_parent=green_parent_carrier)
 	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
 	# samples ψ at the transverse-centroid Wfns bundle (None when
 	# bispinor=False or centroids_file_current is unset).
@@ -664,7 +675,7 @@ def main(argv=None):
 					f"packed_extent={photon_response.layout.packed_extent}")
 			else:
 				W_by_role = compute_screening_model(
-					mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+					mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
 					centroid_indices=centroid_indices, config=config, meta=meta,
 					mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
 					label="oneshot", head_resolver=head_resolver,
@@ -673,6 +684,15 @@ def main(argv=None):
 					iteration_head_response=oneshot_head_response,
 					tensors_filename=tensors_filename,
 					print_fn=print0)
+		if green_parent_carrier is not None:
+			# Every chi0 call above blocks before returning.  Release the parent
+			# carrier before W persistence and Sigma so it cannot inflate those
+			# unrelated live sets or become an unused jit operand.
+			isdf.green_parent_carrier = None
+			wfns_screening = None
+			green_parent_carrier = None
+			gc.collect()
+			print0("  Parent-k Green carrier released after screening.")
 
 	if (oneshot_head_response is not None
 			and not uses_static_photon_response(config)):

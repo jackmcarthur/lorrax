@@ -3131,6 +3131,7 @@ def prepare_isdf_and_wavefunctions(
 	transverse_basis_receipt = None
 	basis_wfn_fingerprint_binding = None
 	photon_g0_vectors = None
+	green_parent_carrier = None
 
 	if not cfg.restart:
 		# One bounded canonical HDF5 scan supplies every receipt for this
@@ -3173,6 +3174,87 @@ def prepare_isdf_and_wavefunctions(
 					is_bispinor=bool(int(meta.nspinor) == 4),
 					print_fn=print0)
 
+			# Parent-k Green acceleration is internal and shape-derived: only
+			# the face layout can contract its band axis safely, only scalar/2c
+			# symmetry transport is owned, and an SC map rotates the DFT bundle
+			# before subsequent response builds.  Keep the established full-k
+			# route whenever any condition is false.
+			_parent_green_plan = None
+			_parent_green_faces = None
+			_parent_green_bytes = 0.0
+			from .centroid_k_unfold import parent_k_contraction_profitable
+			_parent_green_work_ok = parent_k_contraction_profitable(
+				n_full=int(meta.nk_tot), n_parent=int(wfn.nkpts),
+				n_bands=int(band_slices.nb_full))
+			_parent_green_candidate = (
+				bool(cfg.memory.low_mem_bands)
+				and bool(cfg.compute_mode.needs_screening)
+				and str(getattr(cfg.qp_solver, 'value', cfg.qp_solver))
+					!= 'self_consistent'
+				and int(meta.nspinor) in (1, 2)
+				and int(wfn.nkpts) < int(meta.nk_tot)
+				and jax.default_backend() == 'gpu'
+				and _parent_green_work_ok)
+			if (bool(cfg.memory.low_mem_bands)
+					and bool(cfg.compute_mode.needs_screening)
+					and int(wfn.nkpts) < int(meta.nk_tot)
+					and not _parent_green_work_ok):
+				_avoided = (int(band_slices.nb_full)
+					* (int(meta.nk_tot) - int(wfn.nkpts))
+					/ int(meta.nk_tot))
+				print0(
+					"  Parent-k Green contraction inactive: automatic work "
+					f"score {_avoided:.1f} is below the measured safe "
+					"crossover 192; using full k for this small band window.")
+			if _parent_green_candidate:
+				from .centroid_k_unfold import build_centroid_k_unfold_plan
+				try:
+					_candidate_plan = build_centroid_k_unfold_plan(
+						sym, centroid_indices, meta.fft_grid, mesh_xy,
+						nspinor=int(meta.nspinor),
+						parent_k_frac=wfn.kvecs(k='ibz'),
+						canonical_centroid_extent=int(meta.n_rmu_padded))
+				except ValueError as _parent_plan_error:
+					print0(
+						"  Parent-k Green contraction inactive: the centroid "
+						"basis cannot form an exact orbit-local plan "
+						f"({_parent_plan_error}); using the full-k path.")
+					_candidate_plan = None
+				if _candidate_plan is not None:
+					# Reordering stays at the orbit-packed all-P extent.  Any
+					# surplus rows are known-zero per-owner suffixes and are
+					# cropped only after canonical rows occupy both prefixes.
+					_parent_green_basis_compatible = (
+						_candidate_plan.supports_canonical_bridge)
+					_parent_green_bytes = (
+						2.0 * int(_candidate_plan.n_parent)
+						* int(band_slices.nb_full) * int(meta.nspinor)
+						* int(_candidate_plan.n_centroid_packed) * 16.0
+						/ int(mesh_xy.devices.size))
+					# A fresh fit's planner did not know about this retained
+					# carrier.  Admit it only inside its utilization target.
+					_parent_green_fits = (
+						gflat_plan is None
+						or (float(gflat_plan.hwm_bytes) + _parent_green_bytes
+							<= float(gflat_plan.budget_bytes)
+							* float(gflat_plan.target_utilization)))
+					if not _parent_green_basis_compatible:
+						print0(
+							"  Parent-k Green contraction inactive: orbit packing "
+							"cannot bridge logical/packed/canonical centroid extents "
+							f"{_candidate_plan.n_centroid_logical}/"
+							f"{_candidate_plan.n_centroid_packed}/"
+							f"{meta.n_rmu_padded} while preserving all-P matrix "
+							"storage; using the full-k path.")
+					elif _parent_green_fits:
+						_parent_green_plan = _candidate_plan
+					else:
+						print0(
+							"  Parent-k Green contraction inactive: its retained "
+							f"carrier adds {_parent_green_bytes / 1e9:.3f} GB/dev "
+							"beyond the fresh-fit memory target; using the full-k "
+							"Green path for this run.")
+
 			# Load centroid ψ once for the full [b0, b4) range; reused by
 			# a fresh zeta fit (sliced into halves internally) and always by
 			# the downstream Wavefunctions bundle.  The loader owns its own
@@ -3182,7 +3264,7 @@ def prepare_isdf_and_wavefunctions(
 				chunks['band_chunk'] if chunks is not None
 				else zeta_contract.loader_band_chunk)
 			with timing.section("gw_jax.load_centroid_wfns"):
-				psi_rmu_Y, psi_rmuT_X = load_centroids_band_chunked(
+				_loaded_centroid_faces = load_centroids_band_chunked(
 					wfn, sym, meta, centroid_indices,
 					bool(int(meta.nspinor) == 4), mesh_xy,
 					band_range=band_slices.full_range,
@@ -3192,7 +3274,15 @@ def prepare_isdf_and_wavefunctions(
 						if chunks is not None
 						else zeta_contract.loader_k_chunk),
 					bispinor_lift=(representation.charge_lift or "raw"),
+					return_ibz_parents=(_parent_green_plan is not None),
 				)
+			if _parent_green_plan is None:
+				psi_rmu_Y, psi_rmuT_X = _loaded_centroid_faces
+				_parent_rmu_Y = _parent_rmuT_X = None
+			else:
+				(psi_rmu_Y, psi_rmuT_X,
+				 _parent_rmu_Y, _parent_rmuT_X) = _loaded_centroid_faces
+			del _loaded_centroid_faces
 
 			# ``low_mem_bands = true``: convert to the two-face carrier
 			# RIGHT AWAY and drop BOTH single-axis ψ copies before the ζ
@@ -3215,7 +3305,8 @@ def prepare_isdf_and_wavefunctions(
 			psi_mun_fresh = None
 			if cfg.memory.low_mem_bands:
 				from jax.sharding import NamedSharding
-				from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+				from .wavefunction_bundle import (
+					PSI_MUN_SPEC, PSI_NMU_SPEC, pack_parent_green_faces)
 				with mesh_xy:
 					psi_nmu_fresh = jax.lax.with_sharding_constraint(
 						psi_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
@@ -3225,6 +3316,11 @@ def prepare_isdf_and_wavefunctions(
 				del psi_rmu_Y, psi_rmuT_X
 				psi_rmu_Y = None
 				psi_rmuT_X = None
+				if _parent_green_plan is not None:
+					_parent_green_faces = pack_parent_green_faces(
+						_parent_rmu_Y, _parent_rmuT_X,
+						plan=_parent_green_plan, mesh_xy=mesh_xy)
+					del _parent_rmu_Y, _parent_rmuT_X
 				print0("  ψ face conversion (low_mem_bands): psi_nmu/"
 				       "psi_mun built from the fresh load; BOTH "
 				       "single-axis copies (psi_rmu_Y, psi_rmuT_X) "
@@ -3318,6 +3414,21 @@ def prepare_isdf_and_wavefunctions(
 						psi_nmu_fresh, psi_mun_fresh, enk_full=_enk_full_face,
 						slices=band_slices, mesh_xy=mesh_xy,
 						basis_receipt=charge_basis_receipt)
+				green_parent_carrier = None
+				if _parent_green_plan is not None:
+					from .wavefunction_bundle import (
+						build_packed_parent_green_carrier)
+					green_parent_carrier = (
+						build_packed_parent_green_carrier(
+							wfns, *_parent_green_faces,
+							plan=_parent_green_plan, mesh_xy=mesh_xy))
+					del _parent_green_faces
+					print0(
+						"  Parent-k Green contraction ready: "
+						f"{_parent_green_plan.n_parent} raw WFN parents -> "
+						f"{_parent_green_plan.n_full} full k rows; orbit-packed "
+						f"centroid carrier {_parent_green_bytes / 1e9:.3f} "
+						"GB/dev.  Full-k FFTs and observables remain unchanged.")
 				print0(f"  Wavefunctions built (b0:b4={band_slices.nb_full} "
 				       f"bands, face layout: psi_nmu/psi_mun; "
 				       f"low_mem_bands=true) — V_q's baseline is the "
@@ -3926,6 +4037,10 @@ def prepare_isdf_and_wavefunctions(
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
 		wf_bundle_scalar_head=wfns_scalar_head,
+		# Raw-parent, orbit-packed ψ is a screening-only acceleration carrier,
+		# deliberately separate from the primary Wavefunctions pytree so head,
+		# Sigma, density and output kernels cannot inherit unused large inputs.
+		green_parent_carrier=green_parent_carrier,
 		# The exact loaded-WFN identity was already scanned while binding the
 		# charge/transverse basis receipts.  Keep that opaque host proof at the
 		# orchestration seam so later artifact gates cannot reopen/resample the

@@ -867,6 +867,145 @@ def unfold_isdf_operator(
     return fn(V_q_ibz, pair_source) if pair_source is not None else fn(V_q_ibz)
 
 
+def _permute_isdf_operator_axes_local(
+    operator_local,
+    left_source_map,
+    right_source_map,
+    *,
+    mesh_x: int,
+    mesh_y: int,
+    left_local_source_map=None,
+    right_local_source_map=None,
+):
+    """Apply two source maps without ever replicating an operator axis.
+
+    This is the single device backend for both the canonical symmetry action
+    in :func:`unfold_isdf_operator` and a pure basis reorder.  Its input and
+    output are one local tile of a global ``P(None,'x','y')`` operator.
+    A nonlocal map uses a volume-preserving all-to-all round trip: the other
+    endpoint is split while this endpoint is concatenated, the permutation
+    is applied, and the original 2-D sharding is restored.  Consequently no
+    intermediate is larger than the input tile on any rank.
+    """
+    n_left_local = int(operator_local.shape[1])
+    n_right_local = int(operator_local.shape[2])
+    x_idx = jax.lax.axis_index('x')
+    y_idx = jax.lax.axis_index('y')
+
+    if left_local_source_map is not None:
+        local_left = jax.lax.dynamic_slice_in_dim(
+            left_local_source_map, x_idx * n_left_local, n_left_local,
+            axis=1)
+        permuted_left = jnp.take_along_axis(
+            operator_local, local_left[:, :, None], axis=1,
+            mode='promise_in_bounds')
+    elif mesh_x > 1:
+        left_full = jax.lax.all_to_all(
+            operator_local, 'x', split_axis=2, concat_axis=1, tiled=True)
+        gathered_left = jnp.take_along_axis(
+            left_full, left_source_map[:, :, None], axis=1,
+            mode='promise_in_bounds')
+        permuted_left = jax.lax.all_to_all(
+            gathered_left, 'x', split_axis=1, concat_axis=2, tiled=True)
+    else:
+        permuted_left = jnp.take_along_axis(
+            operator_local, left_source_map[:, :, None], axis=1,
+            mode='promise_in_bounds')
+
+    if right_local_source_map is not None:
+        local_right = jax.lax.dynamic_slice_in_dim(
+            right_local_source_map, y_idx * n_right_local, n_right_local,
+            axis=1)
+        return jnp.take_along_axis(
+            permuted_left, local_right[:, None, :], axis=2,
+            mode='promise_in_bounds')
+    if mesh_y > 1:
+        right_full = jax.lax.all_to_all(
+            permuted_left, 'y', split_axis=1, concat_axis=2, tiled=True)
+        gathered_right = jnp.take_along_axis(
+            right_full, right_source_map[:, None, :], axis=2,
+            mode='promise_in_bounds')
+        return jax.lax.all_to_all(
+            gathered_right, 'y', split_axis=2, concat_axis=1, tiled=True)
+    return jnp.take_along_axis(
+        permuted_left, right_source_map[:, None, :], axis=2,
+        mode='promise_in_bounds')
+
+
+_REORDER_ISDF_OPERATOR_JIT_CACHE: dict = {}
+
+
+def reorder_isdf_operator_basis(
+    operator,
+    *,
+    left_source_map,
+    right_source_map,
+    mesh_xy,
+):
+    """Reorder both axes of an all-P sharded ISDF operator.
+
+    ``operator`` is ``(n_batch,n_left,n_right)`` with
+    ``P(None,'x','y')`` sharding.  Each rank-one map is destination-to-source
+    and must be a permutation of its complete endpoint.  The endpoint
+    extents are unchanged; on a multi-rank axis the implementation uses the
+    same volume-preserving all-to-all backend as the canonical symmetry
+    unfold, never an all-gather or a one-axis-sharded matrix transient.
+    """
+    shape = tuple(int(v) for v in operator.shape)
+    if len(shape) != 3:
+        raise ValueError(
+            "reorder_isdf_operator_basis: operator must have shape "
+            f"(n_batch,n_left,n_right); got {shape}.")
+    left = np.asarray(left_source_map, dtype=np.int32)
+    right = np.asarray(right_source_map, dtype=np.int32)
+    for label, source, extent in (
+            ("left", left, shape[1]), ("right", right, shape[2])):
+        if source.shape != (extent,):
+            raise ValueError(
+                "reorder_isdf_operator_basis: "
+                f"{label}_source_map must have shape ({extent},); got "
+                f"{source.shape}.")
+        if not np.array_equal(np.sort(source), np.arange(extent)):
+            raise ValueError(
+                "reorder_isdf_operator_basis: "
+                f"{label}_source_map must be a complete permutation.")
+    px = int(mesh_xy.shape['x'])
+    py = int(mesh_xy.shape['y'])
+    if shape[1] % (px * py) or shape[2] % (px * py):
+        raise ValueError(
+            "reorder_isdf_operator_basis: endpoint extents must divide the "
+            f"complete mesh ({px}x{py}) for volume-preserving all-to-all; "
+            f"got {shape[1]}/{shape[2]}.")
+    key = (
+        shape,
+        left.shape, left.tobytes(),
+        right.shape, right.tobytes(),
+        id(mesh_xy),
+    )
+    fn = _REORDER_ISDF_OPERATOR_JIT_CACHE.get(key)
+    if fn is None:
+        # Keep closure constants as host arrays.  This factory is legal inside
+        # a surrounding jit trace (the chi tau-scan first reaches it there);
+        # constructing JAX arrays here would capture DynamicJaxprTracers in
+        # the global cache and poison the next specialization.
+        left_rows = np.broadcast_to(left, (shape[0], shape[1])).copy()
+        right_rows = np.broadcast_to(right, (shape[0], shape[2])).copy()
+        sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=P(None, 'x', 'y'),
+                 out_specs=P(None, 'x', 'y'),
+                 check_vma=False)
+        def _kernel(local_operator):
+            return _permute_isdf_operator_axes_local(
+                local_operator, left_rows, right_rows,
+                mesh_x=px, mesh_y=py)
+
+        fn = jax.jit(_kernel, in_shardings=sharding, out_shardings=sharding)
+        _REORDER_ISDF_OPERATOR_JIT_CACHE[key] = fn
+    return fn(operator)
+
+
 _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
 
 
@@ -908,20 +1047,22 @@ def _get_unfold_isdf_operator_jit(
     if hit is not None:
         return hit
 
-    # Promote to jax arrays once at trace-build time.  Closure capture
-    # makes these constants in the compiled HLO.
-    fwd_perm_j = jnp.asarray(fwd_perm_arr)
-    fwd_perm_right_j = jnp.asarray(fwd_perm_right_arr)
-    idx_j = jnp.asarray(idx_arr)
-    sym_j = jnp.asarray(sym_arr)
-    L_j = jnp.asarray(L_arr)
-    L_right_j = jnp.asarray(L_right_arr)
-    q_irr_j = jnp.asarray(q_irr_arr)
-    trs_mask_j = jnp.asarray(trs_mask_arr)
-    left_local_perm_j = (None if left_local_perm_arr is None else
-                         jnp.asarray(left_local_perm_arr))
-    right_local_perm_j = (None if right_local_perm_arr is None else
-                          jnp.asarray(right_local_perm_arr))
+    # Closure constants stay as host arrays.  This factory can be entered
+    # while a larger caller is itself being traced (for example the first
+    # parent-k chi tau scan).  Creating JAX arrays here would then create
+    # DynamicJaxprTracers and store them in this process-global cache; a later
+    # specialization would fail with UnexpectedTracerError.  NumPy constants
+    # are embedded by the inner trace just as effectively and cannot leak.
+    fwd_perm_j = fwd_perm_arr
+    fwd_perm_right_j = fwd_perm_right_arr
+    idx_j = idx_arr
+    sym_j = sym_arr
+    L_j = L_arr
+    L_right_j = L_right_arr
+    q_irr_j = q_irr_arr
+    trs_mask_j = trs_mask_arr
+    left_local_perm_j = left_local_perm_arr
+    right_local_perm_j = right_local_perm_arr
     # Memory contract: never exceed 1× single-tile per rank.  Canonical
     # ordering uses volume-preserving all_to_all redistributions.  An
     # authenticated orbit-packed order instead gathers each axis locally.
@@ -972,57 +1113,15 @@ def _get_unfold_isdf_operator_jit(
         nu_local = n_right_padded // Py
         x_idx = jax.lax.axis_index('x')
         y_idx = jax.lax.axis_index('y')
-
-        # μ permute on 'x'.  all_to_all redistributes:
-        #   split  ν (local, /Py)  → ν / (Py·Px)
-        #   concat μ (/Px sharded) → full μ
-        # Volume per rank: n_q · μ · ν / (Px·Py) — unchanged from 1× tile.
-        # Required: ν/Py divisible by Px (ensured by the right pad).
-        if left_local_perm_j is not None:
-            perm_left_local_q = jax.lax.dynamic_slice_in_dim(
-                left_local_perm_j[sym_j], x_idx * mu_local, mu_local,
-                axis=1)
-            V_perm_mu = jnp.take_along_axis(
-                V_at_irr, perm_left_local_q[:, :, None], axis=1,
-                mode='promise_in_bounds')
-        elif Px > 1:
-            V_x = jax.lax.all_to_all(
-                V_at_irr, 'x', split_axis=2, concat_axis=1, tiled=True)
-            # (n_q_full, μ, ν/(Px·Py))
-            V_x_perm = jnp.take_along_axis(
-                V_x, perm_left_q[:, :, None], axis=1,
-                mode='promise_in_bounds')
-            V_perm_mu = jax.lax.all_to_all(
-                V_x_perm, 'x', split_axis=1, concat_axis=2, tiled=True)
-            # (n_q_full, μ/Px, ν/Py)  — back to canonical
-        else:
-            V_perm_mu = jnp.take_along_axis(
-                V_at_irr, perm_left_q[:, :, None], axis=1,
-                mode='promise_in_bounds')
-
-        # ν permute on 'y'.  Mirror trick on the 'y' axis.
-        # Required: μ/Px divisible by Py (ensured by the left pad).
-        if right_local_perm_j is not None:
-            perm_right_local_q = jax.lax.dynamic_slice_in_dim(
-                right_local_perm_j[sym_j], y_idx * nu_local, nu_local,
-                axis=1)
-            V_full_local = jnp.take_along_axis(
-                V_perm_mu, perm_right_local_q[:, None, :], axis=2,
-                mode='promise_in_bounds')
-        elif Py > 1:
-            V_y = jax.lax.all_to_all(
-                V_perm_mu, 'y', split_axis=1, concat_axis=2, tiled=True)
-            # (n_q_full, μ/(Px·Py), ν)
-            V_y_perm = jnp.take_along_axis(
-                V_y, perm_right_q[:, None, :], axis=2,
-                mode='promise_in_bounds')
-            V_full_local = jax.lax.all_to_all(
-                V_y_perm, 'y', split_axis=2, concat_axis=1, tiled=True)
-            # (n_q_full, μ/Px, ν/Py)  — back to canonical
-        else:
-            V_full_local = jnp.take_along_axis(
-                V_perm_mu, perm_right_q[:, None, :], axis=2,
-                mode='promise_in_bounds')
+        left_local_q = (None if left_local_perm_j is None else
+                        left_local_perm_j[sym_j])
+        right_local_q = (None if right_local_perm_j is None else
+                         right_local_perm_j[sym_j])
+        V_full_local = _permute_isdf_operator_axes_local(
+            V_at_irr, perm_left_q, perm_right_q,
+            mesh_x=Px, mesh_y=Py,
+            left_local_source_map=left_local_q,
+            right_local_source_map=right_local_q)
 
         # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here
         # is L_table[s(q), μ] — wrap of centroid μ under sym op

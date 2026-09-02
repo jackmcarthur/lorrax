@@ -250,6 +250,32 @@ _LAYOUTS = ('legacy', 'face')
 
 
 @dataclass
+class ParentGreenCarrier:
+    """Orbit-packed raw-parent operands for Green-function contractions."""
+
+    psi_nmu: jax.Array
+    psi_mun: jax.Array
+    enk: jax.Array
+    occ: jax.Array
+    plan: object
+
+    @functools.partial(jax.jit, static_argnames=('bands',))
+    def band_mask(self, bands: slice) -> jax.Array:
+        nb = int(self.enk.shape[1])
+        lo = int(bands.start or 0)
+        hi = int(bands.stop if bands.stop is not None else nb)
+        row = (jnp.arange(nb) >= lo) & (jnp.arange(nb) < hi)
+        return jnp.broadcast_to(row[None, :], self.enk.shape)
+
+
+jax.tree_util.register_dataclass(
+    ParentGreenCarrier,
+    data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ'],
+    meta_fields=['plan'],
+)
+
+
+@dataclass
 class Wavefunctions:
     """ψ_nk(r_μ) spanning [b0, b4), in ONE of two mutually exclusive
     representations selected by the static ``layout`` tag.  See the module
@@ -287,6 +313,10 @@ class Wavefunctions:
     # ---- face (two 2-D-sharded copies); None under layout="legacy" -----
     psi_nmu: jax.Array | None = None  # (nk, n_X, s, μ_Y)
     psi_mun: jax.Array | None = None  # (nk, s, μ_X, n_Y)
+    #: Optional raw-parent, orbit-packed operands.  This is an acceleration
+    #: carrier only; all observable/runtime operators remain in the primary
+    #: bundle's canonical full-k basis until their own packed seam lands.
+    green_parent: ParentGreenCarrier | None = None
     #: STATIC (pytree meta, never traced).  "legacy" | "face".
     layout: str = "legacy"
     def __post_init__(self) -> None:
@@ -383,7 +413,7 @@ class Wavefunctions:
 jax.tree_util.register_dataclass(
     Wavefunctions,
     data_fields=['psi_xn', 'psi_xr', 'psi_yr', 'psi_yn',
-                 'psi_nmu', 'psi_mun', 'enk', 'occ'],
+                 'psi_nmu', 'psi_mun', 'green_parent', 'enk', 'occ'],
     meta_fields=['slices', 'layout'],
 )
 
@@ -449,6 +479,102 @@ def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
     if right_shape != left_shape:
         result["right_face_shape"] = right_shape
     return result
+
+
+def green_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
+    """Face G shape plus optional raw-parent transport plan.
+
+    Projection factories continue to use :func:`face_kernel_kwargs`, whose
+    k extent is full BZ.  This separate seam exists because only the Green
+    band contraction moves to raw parents; its completed operator returns to
+    full k before any FFT or projection sees it.
+    """
+    result = face_kernel_kwargs(wfns)
+    parent = wfns.green_parent
+    if not result or parent is None:
+        return result
+    nk, ns, nmu, nb = (int(v) for v in parent.psi_mun.shape)
+    if tuple(int(v) for v in parent.psi_nmu.shape) != (nk, nb, ns, nmu):
+        raise ValueError(
+            "green_face_kernel_kwargs: parent face orientations disagree: "
+            f"{parent.psi_mun.shape}/{parent.psi_nmu.shape}.")
+    return {
+        "layout": "face",
+        "face_shape": (nk, nb, nmu, ns),
+        "k_unfold_plan": parent.plan,
+    }
+
+
+def pack_parent_green_faces(
+    psi_rmu_Y_parent, psi_rmuT_X_parent, *, plan, mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array]:
+    """Convert raw-parent loader outputs to the orbit-packed face layout."""
+    with mesh_xy:
+        psi_nmu = jax.lax.with_sharding_constraint(
+            psi_rmu_Y_parent, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+        psi_mun = jax.lax.with_sharding_constraint(
+            jnp.conj(psi_rmuT_X_parent).transpose(0, 3, 1, 2),
+            NamedSharding(mesh_xy, PSI_MUN_SPEC))
+        return plan.pack_face_pair(psi_nmu, psi_mun)
+
+
+def build_packed_parent_green_carrier(
+    wfns: "Wavefunctions", psi_nmu_parent, psi_mun_parent, *, plan,
+    mesh_xy: Mesh,
+) -> ParentGreenCarrier:
+    """Bind packed raw-parent faces to the full-k bundle's scalar tables."""
+    if wfns.layout != "face":
+        raise ValueError(
+            "build_packed_parent_green_carrier requires layout='face'; "
+            "the legacy bundle retains its established full-k local GEMMs.")
+    expected_nmu = (
+        int(plan.n_parent), int(wfns.slices.nb_full), int(plan.nspinor),
+        int(plan.n_centroid_packed))
+    expected_mun = (
+        int(plan.n_parent), int(plan.nspinor),
+        int(plan.n_centroid_packed), int(wfns.slices.nb_full))
+    if tuple(int(v) for v in psi_nmu_parent.shape) != expected_nmu:
+        raise ValueError(
+            "build_packed_parent_green_carrier: psi_nmu shape "
+            f"{psi_nmu_parent.shape} != {expected_nmu}.")
+    if tuple(int(v) for v in psi_mun_parent.shape) != expected_mun:
+        raise ValueError(
+            "build_packed_parent_green_carrier: psi_mun shape "
+            f"{psi_mun_parent.shape} != {expected_mun}.")
+    with mesh_xy:
+        psi_nmu = jax.lax.with_sharding_constraint(
+            psi_nmu_parent, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+        psi_mun = jax.lax.with_sharding_constraint(
+            psi_mun_parent, NamedSharding(mesh_xy, PSI_MUN_SPEC))
+        enk = plan.parent_rows(wfns.enk)
+        occ = plan.parent_rows(wfns.occ)
+        rep2 = NamedSharding(mesh_xy, P(None, None))
+        enk = jax.lax.with_sharding_constraint(enk, rep2)
+        occ = jax.lax.with_sharding_constraint(occ, rep2)
+    return ParentGreenCarrier(
+        psi_nmu=psi_nmu, psi_mun=psi_mun, enk=enk, occ=occ, plan=plan)
+
+
+def attach_packed_parent_green_carrier(
+    wfns: "Wavefunctions", psi_nmu_parent, psi_mun_parent, *, plan,
+    mesh_xy: Mesh,
+) -> "Wavefunctions":
+    """Attach already-packed raw-parent faces to a full-k face bundle."""
+    carrier = build_packed_parent_green_carrier(
+        wfns, psi_nmu_parent, psi_mun_parent, plan=plan, mesh_xy=mesh_xy)
+    import dataclasses
+    return dataclasses.replace(wfns, green_parent=carrier)
+
+
+def attach_parent_green_carrier(
+    wfns: "Wavefunctions", psi_rmu_Y_parent, psi_rmuT_X_parent, *, plan,
+    mesh_xy: Mesh,
+) -> "Wavefunctions":
+    """Pack and attach raw-parent loader outputs to a face bundle."""
+    psi_nmu, psi_mun = pack_parent_green_faces(
+        psi_rmu_Y_parent, psi_rmuT_X_parent, plan=plan, mesh_xy=mesh_xy)
+    return attach_packed_parent_green_carrier(
+        wfns, psi_nmu, psi_mun, plan=plan, mesh_xy=mesh_xy)
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +682,11 @@ def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
     single-axis one).
 
     Returns ``{field: bytes, ..., 'total': bytes}`` over
-    :func:`psi_field_names` for this bundle's own ``layout``.
+    :func:`psi_field_names` for this bundle's own ``layout``.  When a
+    raw-parent Green carrier is attached, its two ψ faces are included under
+    ``green_parent.psi_nmu``/``green_parent.psi_mun``; the small replicated
+    energy/occupation tables follow the established convention and are not
+    part of this ψ inventory.
 
     Named consumer: the bispinor Σ^B transverse-centroid bundle DOUBLES
     whichever psi inventory a run already carries — a second, independent
@@ -578,6 +708,11 @@ def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
         if arr is None:
             continue
         out[f] = int(sum(int(s.data.nbytes) for s in arr.addressable_shards))
+    if wfns.green_parent is not None:
+        for f in ("psi_nmu", "psi_mun"):
+            arr = getattr(wfns.green_parent, f)
+            out[f"green_parent.{f}"] = int(sum(
+                int(s.data.nbytes) for s in arr.addressable_shards))
     out["total"] = int(sum(out.values()))
     return out
 
