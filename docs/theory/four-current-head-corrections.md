@@ -16,6 +16,10 @@ current density `ψ†α^iψ`).
 
 ## 1. Status in one table
 
+> **Implementation status (2026-09-01, in flight).** The two packed-mode rows
+> collapse to one on `lane/bisp-b-one-packed-mode-2026-09-01`; the headless
+> `full_static_cohsex` row is the defect that lane removes.
+
 | self-energy channel | frequency dependence | Γ-cell head | deck route | status |
 |---|---|---|---|---|
 | charge exchange `Σ_X` (CC) | none | `⟨v⟩_mBZ`, band-diagonal (§3.1) | every mode | production |
@@ -43,6 +47,11 @@ Two facts follow from the table and are easy to miss:
   to the charge-only head of §3.
 
 ## 2. The bare propagator and its Γ-cell average
+
+> **Implementation status (2026-09-01, in flight).** No lane changes the bare
+> propagator or its Γ-cell average. `lane/bisp-c-bare-as-packed-2026-09-01`
+> would route `Σ^B` through the packed contraction with `W = D`, which must
+> leave §2.1 bit-identical — that is its gate.
 
 In Coulomb gauge the bare electron–electron interaction, after eliminating
 the photon field, is block diagonal in `(C, T)`:
@@ -101,6 +110,10 @@ This term is frequency independent because `Σ^B` is. It is the only Γ-cell
 correction on the transverse channels outside the packed modes of §4.
 
 ## 3. The charge head: `S(ω)`, local fields, and the three frequency models
+
+> **Implementation status (2026-09-01, in flight).** Unchanged by the current
+> lanes except §3.5: the `W[q=0]` Hermiticity consumer is being re-scoped to
+> time-reversal-symmetric decks on `lane/bisp-g-trs-gates-2026-09-01`.
 
 ### 3.1 Objects
 
@@ -229,6 +242,11 @@ in the sandbox):
   a conjugation relation between them.
 
 ## 4. The packed static photon head (`charge_hall_cubature`)
+
+> **Implementation status (2026-09-01, in flight).**
+> `lane/bisp-b-one-packed-mode-2026-09-01` makes the §4.2 Γ completion
+> mandatory (one packed mode, `head_correction = off` demoted to a debug
+> setting) and deletes the producerless `StaticGaugeHeadResponse` seam of §4.3.
 
 ### 4.1 Body and layout
 
@@ -367,6 +385,10 @@ former.
 
 ### 4.5 Open items on this route
 
+> **Implementation status (2026-09-01, in flight).** The wing sign is
+> `lane/bisp-a-fix-deltas-2026-09-01`; the `bare_transverse` transverse
+> Hartree is `lane/bisp-c-bare-as-packed-2026-09-01`.
+
 * The interband Γ wings use `+F\,\overline{P}\,b/(z²−Δ²)` where the shared
   head convention `P = −ΔD` implies a minus sign; a common sign flip cancels
   in `Y W Z` (§3) but not in the single-wing moments `M_{0a}`, `M_{a0}` here
@@ -376,6 +398,11 @@ former.
   row).
 
 ## 5. Lineage: which branch holds which screened four-current solve
+
+> **Implementation status (2026-09-01).** Historical; no lane changes it.
+> Manual chapter 8 and appendix B named at the end of this section have since
+> been revived in the repo at `manual/08_bispinor/` and `manual/appendices/`
+> (not part of the rendered site).
 
 The packed Lorentz Dyson solve `W^{IJ}_q(μ,ν) = [(1 − Dχ_0)^{-1}D]^{IJ}` over
 the compound index `(I⊗μ, J⊗ν)` was built twice. Neither incarnation ever
@@ -433,6 +460,11 @@ and were never merged; chapter 8.4 already records "Not yet built:
 transverse screening".
 
 ## 6. Where the code is
+
+> **Implementation status (2026-09-01, in flight).** Owners move with lanes A,
+> B and C. The stage-by-stage wiring — every object's shape, sharding, route
+> membership and refusal — is
+> [`architecture/four_current_wiring.md`](../architecture/four_current_wiring.md).
 
 | object | owner |
 |---|---|
