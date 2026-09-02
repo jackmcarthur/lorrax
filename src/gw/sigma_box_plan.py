@@ -366,6 +366,19 @@ def _box_for_window(frequencies, states, pole_stats, pole_sign, eta):
             (raw_lo, raw_hi), (a_lo, a_hi, gamma_lo, gamma_hi))
 
 
+def _ppm_box_is_unbroadened(kind, box, eta, edge_factor):
+    """Whether the incumbent PPM plan assigns this box to Laplace.
+
+    A box can be sign-definite by a few ulps yet still belong to the old
+    crossing shell.  The established handoff margin is ``edge_factor*eta``;
+    only boxes beyond it were unbroadened Laplace products.
+    """
+    if kind == "crossing":
+        return False
+    distance = min(abs(float(box[0])), abs(float(box[1])))
+    return distance >= float(edge_factor) * float(eta)
+
+
 def _rule_cache_lookup(directory, box, eps, relative):
     """Return the smallest cached rule certified on a containing box."""
     if directory is None:
@@ -657,9 +670,9 @@ def plan_sigma_windows(
         Apply the external ``eta`` to sign-definite denominators.  This is
         the MPA convention and the default.  The GN/HL one-pole adapter sets
         it false to retain its established unbroadened Laplace branches;
-        crossing boxes still receive ``eta``.  The same box rule is fitted
-        with fixed accuracy headroom and explicitly certified after
-        translation to the real line.
+        crossing and near-resonant boxes still receive ``eta``.  The same
+        safely separated box rule is fitted with fixed accuracy headroom and
+        explicitly certified after translation to the real line.
 
     Returns
     -------
@@ -780,7 +793,8 @@ def plan_sigma_windows(
                     "sign_definite_negative" if box[1] < 0.0 else
                     "crossing")
             eta_exec = eta
-            if kind != "crossing" and not broaden_sign_definite:
+            if (not broaden_sign_definite
+                    and _ppm_box_is_unbroadened(kind, box, eta, edge)):
                 # Fit on the ordinary physical-eta box (cheap rotated ray),
                 # but execute and separately certify its real-axis translate.
                 # Intrinsic fitted pole widths remain in Omega_p.

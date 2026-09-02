@@ -10,7 +10,7 @@ import pytest
 
 from gw.mpa.sigma import _batch_rows
 from gw.ppm_windows import _SigmaBranch
-from gw.sigma_box_plan import plan_sigma_windows
+from gw.sigma_box_plan import _ppm_box_is_unbroadened, plan_sigma_windows
 from minimax import UniformRule
 
 
@@ -163,6 +163,19 @@ def test_ppm_compatibility_broadens_only_crossing_boxes(monkeypatch):
     np.testing.assert_allclose(
         tail.window.nodes.alpha,
         fake_tail.weights * np.exp(-tail_eta * fake_tail.times))
+
+
+def test_ppm_near_resonant_sign_definite_box_keeps_eta():
+    # Frozen from the packed MoS2 3x3 gate.  Its real support misses zero by
+    # only 2.49e-5 Ry and therefore belonged to PPM's crossing shell, despite
+    # being strictly negative after direct-box padding.
+    near = (-6.18815891529289, -2.489627130359828e-05,
+            0.055998946780564385, 0.055998946780564385)
+    assert not _ppm_box_is_unbroadened(
+        "sign_definite_negative", near, 0.055998946780564385, 1.5)
+    assert _ppm_box_is_unbroadened(
+        "sign_definite_negative", (-4.34, -0.476, 0.056, 0.056),
+        0.056, 1.5)
 
 
 def test_containment_cache_reuses_rules_without_a_builder_call(

@@ -15,11 +15,12 @@ R_np / d_jnp,       d_jnp = omega_j - sigma_b (E_n + Omega_p),
 where `sigma_b=+1` for conduction and `-1` for valence. The fitted retarded
 poles have `Im Omega_p <= 0`. MPA applies the requested broadening `eta` once
 in every executable weight. The GN/HL one-pole adapter retains the incumbent
-PPM convention: crossing boxes receive the resolved `eta`, while
-sign-definite Laplace boxes are unbroadened. The same box rule is built on
-the ordinary physical-`eta` support with fixed tenfold accuracy headroom,
-then its unchanged nodes and weights are separately certified on the
-translated real-axis support before execution.
+PPM convention: crossing boxes and sign-definite boxes within the established
+`edge_factor*eta` resonance handoff receive the resolved `eta`, while safely
+separated sign-definite Laplace boxes are unbroadened. The same box rule is
+built on the ordinary physical-`eta` support with fixed tenfold accuracy
+headroom, then its unchanged nodes and weights are separately certified on
+the translated real-axis support before execution.
 
 The reciprocal is replaced by a short exponential sum,
 
