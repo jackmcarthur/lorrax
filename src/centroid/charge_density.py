@@ -1,14 +1,7 @@
-"""Weighting-density providers for k-means ISDF centroid selection.
+"""Physical real-space charge fields and scalar-grid symmetrization.
 
-The k-means weight decides WHERE the ISDF quadrature has points, hence
-which states the ISDF can represent at all.  Two weights are offered
-(``kmeans_cli --centroid-weight``):
-
-* ``charge_density`` — the ground-state (OCCUPIED) ρ(r), sources 1 & 2
-  below.  Correct for valence/near-gap work; starves any region the
-  occupied states do not occupy.
-* ``band_range`` — :func:`rho_from_band_range`, w(r) = Σ_{n∈range} Σ_k
-  w_k |ψ_nk(r)|² over the bands the calculation actually uses.
+Centroid feature weights live in :mod:`centroid.sampling_metric`; physical
+ground-state density readers remain here for Hartree and diagnostics.
 
 Two ρ(r) sources are supported:
 
@@ -25,9 +18,8 @@ Two ρ(r) sources are supported:
    ``centroid/get_charge_density.py`` (now removed): for a 4×4×4 k-grid
    with 48 symmetries → 8 IBZ points, this does 8× fewer FFTs.
 
-   Caveat: the raw IBZ sum is *not* point-group symmetrized. For
-   symmetry-preserving centroid selection prefer the ``qe_save`` path, or
-   apply ``SymMaps`` symmetrization afterwards.
+   Caveat: the raw IBZ sum is *not* point-group symmetrized. Apply
+   ``SymMaps`` symmetrization when a physical diagnostic requires it.
 
 ``get_charge_density(...)`` is the unified entry point. When called without
 an explicit source, it auto-detects an adjacent ``<prefix>.save`` directory
@@ -52,7 +44,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from wfn_loader import WfnLoader, uniform_band_windows              # noqa: E402
+from wfn_loader import WfnLoader                                    # noqa: E402
 import symmetry_maps                                            # noqa: E402
 
 
@@ -161,9 +153,9 @@ def rho_from_wfn_ibz(
         Not point-group symmetrized. The density is the correct IBZ sum
         weighted by ``wfn.kweights``, but cross-star-member averaging is
         not applied — two k-points related by a rotation contribute the
-        un-rotated |ψ|² at each real-space point. For centroid selection
-        this is usually fine; for cases where symmetric centroid output
-        is required, use ``rho_from_qe_save`` instead.
+        un-rotated |ψ|² at each real-space point. Use
+        ``rho_from_qe_save`` when the already-symmetrized physical density is
+        required.
     """
     # Lazy import: psp brings in JAX + pseudos code that the qe_save path
     # does not need.
@@ -190,270 +182,54 @@ def rho_from_wfn_ibz(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Source 3: band-range weight — Σ_{n ∈ range} Σ_k w_k |ψ_nk(r)|²
+# Scalar-grid symmetry projection used by centroid feature weights
 # ═══════════════════════════════════════════════════════════════════════
 
-def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
-    """Average ``field`` over a symmorphic integer point group on the grid.
+def symmetrize_on_grid(
+    field: np.ndarray,
+    sym_ops: np.ndarray,
+    translations_frac: np.ndarray | None = None,
+) -> np.ndarray:
+    """Average ``field`` over spatial Seitz operations on the FFT grid.
 
-    ``sym_ops`` are the r-action matrices ``M`` (BGW ``Rinv``, τ=0) of a
-    group that maps the FFT grid to itself, e.g. the output of
-    :func:`symmetry_maps.recover_symmorphic_density_point_group`.
-    Returns ``(1/|G|) Σ_M field[(M·n) mod N]`` — invariant because the
-    group is closed.
+    With no translations, ``sym_ops`` are direct integer r-actions (the
+    historical symmorphic API).  With ``translations_frac``, ``sym_ops`` are
+    BGW reciprocal-space ``mtrx`` rows and the service builds the exact
+    nonsymmorphic real-space pullback.  The latter is the centroid driver's
+    atom-derived space-group path.
     """
     f = np.asarray(field, dtype=np.float64)
     N = np.asarray(f.shape, dtype=np.int64)
     ops = np.asarray(sym_ops, dtype=np.int64).reshape(-1, 3, 3)
-    if ops.shape[0] <= 1:
+    if ops.shape[0] <= 1 and translations_frac is None:
         return f
     flat = f.ravel()
     acc = np.zeros_like(flat)
-    for M in ops:
-        # THROUGH THE SERVICE.  This used to open-code the grid permutation
-        # and its radix flatten, byte-identically with the copy inside
-        # ``symmetry_maps.recover_symmorphic_density_point_group`` — the two
-        # were the same eleven characters of index arithmetic in two packages.
-        acc += flat[symmetry_maps.grid_point_image_perm(N, M)]
+    if translations_frac is None:
+        for M in ops:
+            acc += flat[symmetry_maps.grid_point_image_perm(N, M)]
+    else:
+        tau = np.asarray(translations_frac, dtype=np.float64).reshape(-1, 3)
+        if tau.shape[0] != ops.shape[0]:
+            raise ValueError(
+                "translations_frac must have one row per symmetry; "
+                f"got {tau.shape[0]} for {ops.shape[0]} operations")
+        # Stream one service-owned row.  A stacked ``(n_ops, n_grid)`` int64
+        # table is needless persistent state (366 MiB already at one million
+        # grid points and 48 operations), while the scalar accumulator is the
+        # only object this projection needs to retain.
+        for op, shift in zip(ops, tau):
+            row = symmetry_maps.fft_grid_pullback_perm(
+                op[None, ...], shift[None, ...] * (2.0 * np.pi), N,
+                validate=True)
+            if row.shape != (1, flat.size):
+                raise ValueError(
+                    "symmetry-service FFT-grid pullback has wrong shape: "
+                    f"{row.shape} != {(1, flat.size)}")
+            acc += flat[row[0]]
     return (acc / ops.shape[0]).reshape(f.shape)
 
 
-def rho_from_band_range(
-    wfn: WfnLoader,
-    band_range: tuple[int, int],
-    *,
-    sym_ops: np.ndarray | None = None,
-    chunk_gb: float = 4.0,
-    verbose: bool = True,
-    dist_mesh=None,
-    chunk_bands: int | None = None,
-) -> np.ndarray:
-    """k-means weight from the density of the BAND RANGE IN USE.
-
-    ``w(r) = Σ_{n ∈ [b_lo, b_hi)} Σ_k w_k |ψ_nk(r)|²`` (the k-average over
-    the WFN's stored k-set, using its k-weights), in the same
-    normalisation as :func:`rho_from_qe_save` **for the nspinor=2 decks
-    LORRAX runs**.  Unlike ``psp.get_DFT_mtxels.valence_density_from_kpoint``
-    this applies NO ``spin_degeneracy_factor``: the spinor components are
-    summed over, which is the f_spin=1 case.  On a spin-restricted scalar
-    deck (f_spin=2) the two would differ by that factor.  Harmless here —
-    the k-means normalises its weight, so only the SHAPE of w matters — but
-    do not reuse this array as a physical ρ without checking f_spin.
-
-    Point-group treatment, and how it differs from the psp density: that
-    routine is handed either the IBZ (⇒ ``wfn.kweights``) or an already
-    UNFOLDED full-BZ k-set (⇒ equal 1/nk_tot), and never symmetrises ρ,
-    because the rotation is already carried by the unfolded ψ.  This
-    routine reads the RAW IBZ (``k='ibz'``, no unfold) and symmetrises the
-    summed density afterwards instead — the dual operation, since averaging
-    the un-rotated IBZ sum over G reproduces the star sum.  Avoiding the
-    unfold is deliberate: it keeps the weight independent of the machinery
-    that ``symmetry_maps.check_density_symmetries`` exists to test.
-
-    WHY THIS FEATURE EXISTS: the occupied-only ρ(r) is entirely inside the
-    slab, so a ρ-weighted k-means puts ZERO centroids in the vacuum and the
-    vacuum-localized far-conduction states have no quadrature support —
-    their ⟨nk|V_H|nk⟩ (a pure centroid sum) comes back +139.75 eV where the
-    truth is −139.6 eV, and the whole error lands on Vxc = E_dft − kin_ion
-    − V_H (|ΔVxc| vs QE correlates with the vacuum weight at +0.958).
-    Weighting by the bands actually in use puts centroids where those
-    states live.
-
-    Parameters
-    ----------
-    wfn : open ``WFNReader`` (only ``_filename``/``kweights``/
-        ``cell_volume`` are used; ψ is streamed through ``WfnLoader``).
-    band_range : ``(b_lo, b_hi)``, 0-based half-open.
-    sym_ops : optional (n_op, 3, 3) integer r-action matrices.  The raw
-        k-sum is NOT point-group symmetric (star members contribute
-        un-rotated |ψ|² at each r); pass the recovered density point group
-        to symmetrize, so the weight cannot itself break the k-star
-        symmetry the orbit closure is there to protect.
-    chunk_gb : band-chunk size target for the r-space buffer.
-    dist_mesh : the run's GLOBAL mesh (``devices.size == process_count()``).
-        Supplied ⇒ the band sweep is split across ranks and reassembled with
-        ONE psum for the whole sweep; omitted ⇒ every rank recomputes the
-        whole sweep (the historical behaviour).  This is the only knob:
-        there is no env opt-out, because the distributed form is a work
-        split, not a different quadrature.  NOTE the split also cuts the
-        per-rank ψ read by ``P`` — this loader is opened process-locally
-        (eager h5py), so ranks reading disjoint bands is safe; do not
-        "improve" it into a collective read without making the call counts
-        rank-independent.  Peak memory only FALLS: the chunk is also the
-        unit of work, so it is shrunk (never grown) to give every rank one,
-        and the accumulator is the same size as the replicated ``w``.
-    chunk_bands : TEST-ONLY override of the band-chunk size, bypassing both
-        the memory budget and the per-rank split.  No caller in ``src``
-        passes it; it exists so an A/B can force the replicated leg to use
-        the SAME chunk boundaries as the distributed one, which is what
-        separates "the work split changed the answer" from "re-chunking
-        changed the answer" — two different questions that the default
-        sizing would otherwise confound.  Do not use it in a driver.
-
-    Returns
-    -------
-    (Nx, Ny, Nz) float64 real-space weight on the WFN FFT grid.
-    """
-    import jax
-    from wfn_loader import WfnLoader
-    from common.wfn_transforms import to_rbox
-
-    from common.collectives import (single_device_mesh, process_count,
-                                    process_rank, psum_replicate)
-
-    b_lo, b_hi = int(band_range[0]), int(band_range[1])
-    if b_hi <= b_lo:
-        raise ValueError(f"empty band range: {band_range}")
-
-    with WfnLoader(wfn.path) as loader:
-        nb_file = int(loader.nbands)
-        if b_hi > nb_file:
-            raise ValueError(
-                f"--weight-bands upper edge {b_hi} exceeds the WFN's "
-                f"{nb_file} bands; lower it or regenerate the NSCF.")
-        fft_grid = tuple(int(s) for s in loader.fft_grid)
-        n_r = int(np.prod(fft_grid))
-        nspinor = int(loader.nspinor)
-        g_index = loader.box_index(k="ibz")
-        n_k = int(g_index.shape[0])
-        kw = np.asarray(wfn.kweights, dtype=np.float64)[:n_k]
-        # PROCESS-LOCAL, same reasoning (and same measured SIGSEGV) as
-        # ``_load_wfn_k_fftbox_ibz`` above: this weight is a pure function of
-        # the WFN and must not be built as a global band-sharded object on a
-        # mesh pinned to ``jax.devices()[0]``.  single_device_mesh() IS the
-        # process-local mesh (process_local_mesh is its alias).
-        mesh = single_device_mesh()
-        # r-space buffer is (n_k, nb, nspinor, Nr) complex128 → size the
-        # band chunk against the budget (≥1 band, ≤ the whole range).
-        per_band = n_k * nspinor * n_r * 16
-        nb_chunk = int(max(1, min(b_hi - b_lo,
-                                  (chunk_gb * 1024 ** 3) // max(per_band, 1))))
-        # The memory budget alone sizes chunks for a SERIAL sweep, where
-        # fewer/larger chunks are strictly better.  Distributed, the chunk is
-        # also the unit of work: at 600 bands / 4 GB this deck yields THREE
-        # chunks, which caps the split at 3 ranks no matter how many are
-        # available (measured job 7885968: 0.70x, i.e. slower).  Shrink to at
-        # least one chunk per rank -- never above the budget, so peak memory
-        # only falls.  Chunk boundaries are part of the summation grouping,
-        # so this changes the weight in the last bits; that is measured
-        # against the legacy chunking rather than assumed harmless.
-        if chunk_bands is not None:
-            nb_chunk = int(max(1, min(b_hi - b_lo, chunk_bands)))
-        elif dist_mesh is not None and process_count() > 1:
-            nb_chunk = int(max(1, min(
-                nb_chunk,
-                -(-(b_hi - b_lo) // int(process_count())))))
-        scale = float(np.sqrt(n_r / float(wfn.cell_volume)))
-        kw_j = jnp.asarray(kw).reshape(-1, 1, 1, 1, 1, 1)  # (n_k,b,s,x,y,z)
-        chunks = [(lo, min(lo + nb_chunk, b_hi))
-                  for lo in range(b_lo, b_hi, nb_chunk)]
-        world, rank = process_count(), process_rank()
-        # The band sum is separable, so at P>1 each rank computes only the
-        # chunks it owns, sums them LOCALLY, and ONE psum puts the whole back
-        # on every rank.  Ownership is round-robin over the SAME canonical
-        # chunk list on every rank, and the psum is outside the loop, so the
-        # collective call count is rank-independent by construction (a rank
-        # owning no chunk reduces its zero accumulator) — a rank-dependent
-        # count would deadlock.  Summing locally first REGROUPS the additions
-        # relative to the serial left-fold, so the result is NOT bit-identical
-        # to it; that is deliberate and measured (see the else: branch), not
-        # an oversight.  P=1 keeps the original fused loop verbatim and cannot
-        # regress.
-        distribute = world > 1 and dist_mesh is not None
-        if verbose:
-            how = (f"{len(chunks)} chunk(s) over {world} ranks, one psum total"
-                   if distribute else
-                   f"{len(chunks)} chunk(s), replicated on every rank"
-                   + ("" if world <= 1 else
-                      "  [no dist_mesh passed — sweep NOT distributed]"))
-            print(f"[band_range weight] bands [{b_lo},{b_hi}) over {n_k} "
-                  f"stored k (Σw_k={kw.sum():.4f}), grid {fft_grid}, "
-                  f"chunk={nb_chunk} bands, {how}")
-        if not distribute:
-            w = jnp.zeros(fft_grid, dtype=jnp.float64)
-            for lo, hi in chunks:
-                psi = loader.load_process_local(bands=(lo, hi), k="ibz")
-                psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh, norm="ortho")
-                # ``load_process_local`` returns exactly ``hi - lo`` bands (no
-                # mesh-divisibility padding — nothing about it is global), so
-                # this slice is a no-op there and still drops ``load``'s pad
-                # rows at P=1.
-                psi_r = psi_r[:, :hi - lo] * scale   # drop band-axis pad rows
-                w = w + jnp.sum(
-                    (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j, axis=(0, 1, 2))
-            w = np.asarray(jax.device_get(w), dtype=np.float64)
-        else:
-            # ONE psum for the whole sweep, not one per chunk.  Per-chunk
-            # psums are bit-identical to the serial left-fold, but the
-            # collective's FIXED cost dominates at this payload (368 KB):
-            # measured 0.85 s per call, job 7885969 — 4 chunks made the
-            # distributed sweep 12x SLOWER than replicated on the sparse leg,
-            # and at P=64 it would have cost ~50 s of pure latency.  Summing
-            # locally first and reducing once regroups the additions, which
-            # perturbs the last bits exactly like re-chunking does (measured
-            # 6.6e-16 relative, ~3 ulp).  The weight is a SAMPLING DENSITY
-            # whose consumers snap to grid points, so the gate that matters
-            # is "the centroid set does not move", not bit-identity.
-            # ONE COMPILED PROGRAM, ON EVERY RANK — the cache contract.
-            #
-            # The chunk list above is canonical, but its LAST entry is short
-            # whenever the band range does not divide, and `i % world` gave
-            # that short entry to exactly one rank.  ``to_rbox`` keys its
-            # kernel cache on ``psi.shape`` (common/wfn_transforms.py), so
-            # that one rank compiled a SECOND to_rbox — a 3-D IFFT over a
-            # band batch no peer ever compiled — held a persistent-cache key
-            # no peer held, and, because JAX writes entries from process 0
-            # only, missed where its peers hit.  Asymmetric hit/miss across
-            # ranks is the collective-compile deadlock precondition
-            # (FIX_multislice_cachekey.md; this is its §6.1 sibling 3).
-            # The `continue` was the other half: with fewer chunks than
-            # ranks, the surplus ranks compiled NOTHING at all.
-            #
-            # Both are removed by making the WINDOW uniform instead of the
-            # chunk: every window is exactly ``width`` bands, the last one
-            # OVERLAPS its predecessor rather than being short, and a
-            # per-window 0/1 band mask removes the overlap from the sum.
-            # Every rank then runs the same number of rounds of the same
-            # program, and a rank with no work runs one fully-masked round.
-            windows = uniform_band_windows(b_lo, b_hi, nb_chunk)
-            width = int(windows[0][1].shape[0])
-            n_rounds = -(-len(windows) // world)
-            w_loc = jnp.zeros(fft_grid, dtype=jnp.float64)
-            for r in range(n_rounds):
-                i = r * world + rank          # the same round-robin as before
-                if i < len(windows):
-                    lo, band_mask = windows[i]
-                else:
-                    # SURPLUS RANK.  Re-run window 0 with an all-zero mask:
-                    # it costs one chunk and it buys the symmetry, which is
-                    # the entire point of this loop's shape.
-                    lo = windows[0][0]
-                    band_mask = np.zeros(width, dtype=np.float64)
-                psi = loader.load_process_local(bands=(lo, lo + width),
-                                                k="ibz")
-                psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh,
-                                norm="ortho")
-                psi_r = psi_r[:, :width] * scale
-                mask_j = jnp.asarray(band_mask).reshape(1, -1, 1, 1, 1, 1)
-                w_loc = w_loc + jnp.sum(
-                    (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j * mask_j,
-                    axis=(0, 1, 2))
-            w = psum_replicate(
-                np.asarray(jax.device_get(w_loc), dtype=np.float64), dist_mesh)
-
-    if sym_ops is not None:
-        n_op = int(np.asarray(sym_ops).reshape(-1, 3, 3).shape[0])
-        w_sym = symmetrize_on_grid(w, sym_ops)
-        if verbose:
-            dev = float(np.max(np.abs(w_sym - w)) / (np.max(np.abs(w)) or 1.0))
-            print(f"[band_range weight] symmetrized over {n_op} op(s); "
-                  f"raw k-sum asymmetry was {dev:.2e} (relative)")
-        w = w_sym
-    if verbose:
-        print(f"[band_range weight] Σ_r w = {w.sum():.4f} over {b_hi - b_lo} "
-              f"bands (rho_from_qe_save normalisation at f_spin=1, whose "
-              f"Σ_r ρ covers the {int(wfn.nelec)} occupied)")
-    return w
 
 
 # ═══════════════════════════════════════════════════════════════════════

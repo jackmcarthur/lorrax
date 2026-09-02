@@ -827,13 +827,10 @@ def main(argv=None):
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	#
-	# Sharding: kin_ion + all four static-COHSEX components (Σ_SX, Σ_COH,
-	# V_H, Σ_X) are loaded **fully replicated** on the device mesh.  The
-	# only sharded object surviving past this point is the dynamic-Σ_c
-	# ω-tensor produced by ``compute_ppm_sigma_pipeline``, which is
-	# collapsed into a replicated Σ_xc^QSGW by ``build_qsgw_sigma_xc``
-	# below.  This lets the rest of post-processing (eigh, scissor,
-	# eqp output) operate on replicated arrays without resharding seams.
+	# Static operators retain the layout selected by their producers through
+	# the H build and diagonalisation.  Rank-0 text output consumes bounded
+	# ``(nk,nb)`` diagonal mirrors; it never gathers a band-sharded
+	# ``(nk,nb,nb)`` component merely to print its diagonal.
 	# Provenance gate BEFORE the read.  In particular, refuse the retired
 	# format that folded V_H into kin_ion: this driver always adds the live
 	# G-space field.
@@ -1013,6 +1010,12 @@ def main(argv=None):
 			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 			tol_ry=float(config.degen_avg_tol_ry))
 
+	# The PPM output below needs only bare exchange's diagonal.  Extract it
+	# collectively while every rank is still in lockstep; never host-convert
+	# the full band-sharded operator.
+	from gw.qsgw_utils import static_sigma_diag_to_host
+	sig_x_diag_ry = static_sigma_diag_to_host(sig_x, mesh_xy)
+
 	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
 	# only).  Form it AFTER the one canonical conditioning seam above: forming
 	# this sum before ``average_sigma_components`` made eqp_g0w0 retain raw,
@@ -1020,11 +1023,11 @@ def main(argv=None):
 	# the conditioned X/C pair.  With averaging disabled the seam is a no-op,
 	# so this same expression deliberately preserves the raw red twin.
 	sigma_xc_at_dft_ev = (
-		np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
+		sig_x_diag_ry * RYD_TO_EV
 		+ sigma_c_at_dft_ev
 		if sigma_c_at_dft_ev is not None else None)
 
-	# ---- Single H-build + diagonalization on replicated arrays ----
+	# ---- Single H-build + diagonalization on the producer-selected layout ----
 	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
 	# on a NaN-bearing matrix returns without complaining, and the garbage
 	# then propagates into eqp0/eqp1/WFN_qp.h5 with rc=0.  ``kin_ion`` also
@@ -1104,14 +1107,31 @@ def main(argv=None):
 	)
 
 	# ---- Output ----
+	# Collectively extract only the bounded static diagonals before the
+	# rank-0-only writers.  The full operators remain on their original mesh;
+	# calling ``np.array`` on one here would either fail at multi-host P>1 or
+	# silently reintroduce the full-matrix replication this layout avoids.
+	sig_sx_diag_ry = static_sigma_diag_to_host(sig_sx, mesh_xy)
+	sig_coh_diag_ry = static_sigma_diag_to_host(sig_coh, mesh_xy)
+	sig_h_diag_ry = static_sigma_diag_to_host(sig_h, mesh_xy)
+	sig_h_scalar_diag_ry = static_sigma_diag_to_host(sig_h_scalar, mesh_xy)
+	h_transverse_diag_ry = (
+		None if h_transverse is None
+		else static_sigma_diag_to_host(h_transverse, mesh_xy))
+
 	results = GWResults(
-		sig_sx=np.array(sig_sx),
-		sig_coh=np.array(sig_coh),
-		sig_h=np.array(sig_h),
-		sig_h_scalar=np.array(sig_h_scalar),
-		h_transverse=(
-			None if h_transverse is None else np.array(h_transverse)),
-		sig_x=np.array(sig_x),
+		sig_sx=sig_sx,
+		sig_coh=sig_coh,
+		sig_h=sig_h,
+		sig_h_scalar=sig_h_scalar,
+		h_transverse=h_transverse,
+		sig_x=sig_x,
+		sig_sx_diag_ry=sig_sx_diag_ry,
+		sig_coh_diag_ry=sig_coh_diag_ry,
+		sig_h_diag_ry=sig_h_diag_ry,
+		sig_h_scalar_diag_ry=sig_h_scalar_diag_ry,
+		h_transverse_diag_ry=h_transverse_diag_ry,
+		sig_x_diag_ry=sig_x_diag_ry,
 		E_qp_ry=np.array(E_full),
 		U_qp=np.array(U_full),
 		E_dft_ry=np.array(enk_dft),

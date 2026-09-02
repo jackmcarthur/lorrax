@@ -161,41 +161,6 @@ def orbital_pieces_at_k(v, eps, nocc, deps_tol):
     return cross * Wa[None], cross * Wb[None]         # PA, PB : (3, nb, nb)
 
 
-# ----------------------------------------------------------------------
-#  Symmetry-reduced (IBZ) mode: magnetic point group + axial-vector unfold
-# ----------------------------------------------------------------------
-def magnetic_point_group(sym, m_axis_cart, tol=1e-6):
-    """Cartesian rotations R_g and det(R_g) of the MAGNETIC point group.
-
-    Returns (R_mpg (|G|,3,3), det_mpg (|G|,), idx (|G|,)).  We take the
-    spatial-only half of sym.R_cart (rows [0,ntran); the [ntran:] half is the
-    time-reversal-augmented -R, symmetry_maps.py:~1217) and keep operation s
-    iff it preserves the magnetization AXIAL vector:  det(R_s) R_s @ m == m.
-    This drops time reversal AND the field-reversing unitary ops (vertical
-    mirrors, in-plane C2) that survive only as products with T — exactly the
-    magnetic point group QE uses to reduce a noncollinear FM k-grid.
-    """
-    ntran = int(sym.sym_matrices.shape[0])               # spatial-only count
-    Rc = np.asarray(sym.R_cart[:ntran], dtype=np.float64)  # (ntran,3,3) Cartesian
-    detR = np.linalg.det(Rc)                              # +1 proper / -1 improper
-    m = np.asarray(m_axis_cart, dtype=np.float64)
-    m = m / np.linalg.norm(m)
-    keep = np.array([np.allclose(detR[s] * (Rc[s] @ m), m, atol=tol)
-                     for s in range(ntran)])
-    idx = np.where(keep)[0]
-    return Rc[idx], detR[idx], idx
-
-
-def axial_projector(R_mpg, det_mpg):
-    """Pmat = (1/|G|) sum_g det(R_g) R_g — the (3,3) trivial-rep projector for
-    an AXIAL vector.  Real; idempotent on little-group-invariant input.  NB the
-    per-op R_cart differs from the velocity's K-frame rotation by a transpose,
-    but the group is closed under inverse so this projector is transpose-
-    invariant (test Pmat at the group level, not per op)."""
-    G = R_mpg.shape[0]
-    return (det_mpg[:, None, None] * R_mpg).sum(axis=0) / G   # (3,3) real
-
-
 def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
     """Symmetry-reduced orbital-magnetization accumulation.
 
@@ -213,13 +178,37 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
         w_ibz = w_ibz / w_ibz.sum()
     B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
 
-    R_mpg, det_mpg, idx_mpg = magnetic_point_group(sym, m_axis)
-    Pmat = axial_projector(R_mpg, det_mpg)
-    ntran = int(sym.sym_matrices.shape[0])
+    active_rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
+    # This is a cell-integrated q=0 vector, so every Seitz translation phase
+    # is unity; the shared typed action owns the remaining rotation/TR signs.
+    action = sym.cartesian_action(
+        active_rows, axial=True, time_odd=True)
+    m = np.asarray(m_axis, dtype=np.float64)
+    m_norm = float(np.linalg.norm(m))
+    if m.shape != (3,) or not np.all(np.isfinite(m)) or m_norm <= 1.0e-12:
+        raise ValueError(
+            "orbmag IBZ magnetization axis must be a finite nonzero 3-vector; "
+            f"got {m_axis!r}.")
+    m = m / m_norm
+    if not bool(sym.trs_allowed):
+        if str(sym.operation_typing_source) != "qe-schema":
+            raise RuntimeError(
+                "orbmag IBZ on a time-reversal-broken reference requires "
+                "authenticated QE operation typing.")
+        mapped_m = np.einsum('sij,j->si', action, m)
+        bad = np.flatnonzero(~np.all(np.isclose(
+            mapped_m, m[None, :], rtol=0.0, atol=1.0e-6), axis=1))
+        if bad.size:
+            raise ValueError(
+                "orbmag magnetization axis is inconsistent with active "
+                f"typed operation row {int(active_rows[bad[0]])}.")
+    # Do not select a second subgroup here. In particular, pure time reversal
+    # must remain present on a nonmagnet and project a time-odd moment to zero.
+    Pmat = np.asarray(action, dtype=np.float64).mean(axis=0)
     print(f"[orbmag-ibz] nk_ibz={nrk}  full-BZ={int(sym.nk_tot)}  "
-          f"|G|={len(idx_mpg)} of {ntran} spatial ops (T + field-reversing "
-          f"ops excluded)  mag-axis={tuple(float(x) for x in m_axis)}")
-    print(f"[orbmag-ibz] kept op indices {idx_mpg.tolist()}; "
+          f"|G|={len(active_rows)} active typed ops  "
+          f"mag-axis={tuple(float(x) for x in m)}")
+    print(f"[orbmag-ibz] operation rows {active_rows.tolist()}; "
           f"Pmat@[0,0,1]={np.round(Pmat @ np.array([0,0,1.0]),4).tolist()} "
           f"Pmat@[1,0,0]={np.round(Pmat @ np.array([1.0,0,0]),4).tolist()}")
 
@@ -232,7 +221,7 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
     cA = np.zeros(3, dtype=np.complex128); cB = np.zeros(3, dtype=np.complex128)
     PA_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
     PB_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
-    S_sum = 0.0
+    S_sum = np.zeros(3, dtype=np.float64)
     E = np.zeros((nrk, nbnd), dtype=np.float64)
     for i in range(nrk):
         G_pad, g_mask = gtab.at(i)
@@ -253,8 +242,14 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
             v = v + sign * np.asarray(vnl_ops.vnl_velocity_matrix(
                 psi_phys, kdata.Z, kdata.dZ, kdata.E_super))
         psi_np = np.asarray(psi_G)
-        sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
-        S_sum += w_ibz[i] * float(sz[:nocc].sum())
+        overlap = np.sum(np.conj(psi_np[:, 0]) * psi_np[:, 1], axis=1)
+        spin = np.stack((
+            2.0 * overlap.real,
+            2.0 * overlap.imag,
+            (np.abs(psi_np[:, 0]) ** 2
+             - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real,
+        ), axis=1)
+        S_sum += w_ibz[i] * spin[:nocc].sum(axis=0)
         pa, pb = orbital_pieces_at_k(v, eps, nocc, deps_tol)
         cA += w_ibz[i] * pa.sum(axis=(1, 2)); cB += w_ibz[i] * pb.sum(axis=(1, 2))
         PA_band += w_ibz[i] * pa; PB_band += w_ibz[i] * pb
@@ -263,10 +258,11 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
 
     cA = Pmat.astype(np.complex128) @ cA                 # symmetrize the (3,) vector
     cB = Pmat.astype(np.complex128) @ cB
+    S_sum = Pmat @ S_sum
     PA_band_z = np.einsum('a,anm->nm', Pmat[2], PA_band)  # z-row band-resolved
     PB_band_z = np.einsum('a,anm->nm', Pmat[2], PB_band)
-    info = {"nk_ibz": nrk, "nG": len(idx_mpg), "idx": idx_mpg.tolist()}
-    return cA, cB, PA_band_z, PB_band_z, -1.0 * S_sum, E, info
+    info = {"nk_ibz": nrk, "nG": len(active_rows), "idx": active_rows.tolist()}
+    return cA, cB, PA_band_z, PB_band_z, -float(S_sum[2]), E, info
 
 
 # ----------------------------------------------------------------------
@@ -471,13 +467,10 @@ def main(argv=None):
                    help="DIAGNOSTIC: kinetic-only velocity (physically incomplete)")
     p.add_argument("--ibz", action="store_true",
                    help="Symmetry-reduced mode: loop the stored IBZ k-points "
-                        "(no psi unfold) and symmetrize the axial-vector moment "
-                        "density over the magnetic point group.")
+                        "and project the moment with typed magnetic operations.")
     p.add_argument("--mag-axis", type=float, nargs=3, default=(0.0, 0.0, 1.0),
                    metavar=("MX", "MY", "MZ"),
-                   help="Cartesian magnetization direction selecting the magnetic "
-                        "point group (default +z = crystal c). Op g kept iff "
-                        "det(R_g) R_g @ axis == axis.")
+                   help="Cartesian magnetization direction (default +z).")
     p.add_argument("--method", choices=["sos", "sternheimer"], default="sos",
                    help="Evaluation route: 'sos' = direct sum-over-states (band-"
                         "convergence pathological); 'sternheimer' = band-sum-free "
@@ -551,8 +544,7 @@ def main(argv=None):
     nrk = int(wfn.nkpts)
     if not args.ibz and nrk < int(sym.nk_tot):
         print(f"[orbmag] NOTE: WFN is symmetry-reduced (nrk={nrk} < nk_full="
-              f"{int(sym.nk_tot)}); pass --ibz for the magnetic-symmetry "
-              "axial-vector unfold (faster + exact).")
+              f"{int(sym.nk_tot)}); pass --ibz for typed magnetic symmetry.")
 
     out_extra = {}                                   # branch-specific --out payload
     if args.method == "sternheimer":

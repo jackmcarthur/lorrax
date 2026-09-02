@@ -37,6 +37,8 @@ from common.gamma_matrices import (
     gamma_perm_phase as _gamma_perm_phase_mu,
     gamma_apply,
     gamma_double_contract,
+    gammas_perm as _gammas_perm,
+    gammas_phase as _gammas_phase,
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
 from common.wfn_transforms import take_rchunk_padded, to_rchunk_inner
@@ -107,10 +109,11 @@ def host_rss_gb() -> float:
 #                              · γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
 #                              · P_{α'β'}(μ,ν;k)
 #
-# The :func:`pair_density` standalone (rank-5 P_k_ab carrier) is kept
-# for ``centroid.pivoted_cholesky``'s q=0 valence-conduction Gram —
-# its caller can hold the full P_k_ab in HBM at the centroid-selection
-# stage.  The hot CCT/ZCT path in :func:`fit_zeta_to_h5` never
+# The :func:`pair_density` standalone (rank-5 P_k_ab carrier) is kept for
+# tests, planning and the centroid selector's sequential low-residency route.
+# Its blocked route uses :func:`gram_q0_from_psi_sm`, which folds both band
+# contractions and the normal matrix into one compiled program.  The hot
+# CCT/ZCT path in :func:`fit_zeta_to_h5` likewise never
 # materialises P_k_ab globally; everything happens inside the
 # monolithic shard_map kernels below.
 
@@ -294,6 +297,69 @@ _isdf_pipeline_cache = {}  # ISDF pipeline (z_q/c_q from psi_sm) kernel
 # the answer.  Used by :mod:`centroid.pivoted_cholesky` to score
 # candidate centroids on valence × conduction pair products.
 
+
+def _gram_q0_fold_local(
+	P_v: jax.Array,
+	P_c: jax.Array,
+	kw: jax.Array,
+	perm_L: jax.Array,
+	phase_L: jax.Array,
+	perm_R: jax.Array,
+	phase_R: jax.Array,
+	*,
+	lhs_id: bool,
+	rhs_id: bool,
+	symmetrize: bool,
+	transverse_feature_sum: bool,
+) -> jax.Array:
+	"""Fold open-spin pair densities into one local q=0 Gram tile."""
+	if transverse_feature_sum:
+		# Candidate pruning needs a positive metric on the STACKED
+		# transition-density features
+		#
+		#   Z_i(a,mn,k) = <psi^R_m(a)|gamma_i|psi^L_n(a)>,
+		#   G_perp = sum_i Z_i Z_i^H.
+		#
+		# In the pair-density factorisation the first endpoint therefore
+		# carries gamma_i^* and the second gamma_i.  This conjugated left
+		# phase is load-bearing for imaginary gamma_2: using the raw CCT
+		# contraction (gamma_i, gamma_i) gives its NEGATIVE and is not a
+		# candidate Gram.  Accumulate one component at a time so no
+		# three-component rank-3 stack is materialised.
+		def _one_component(G_acc, mu_lorentz):
+			perm = perm_L[mu_lorentz]
+			phase = phase_L[mu_lorentz]
+			prod = gamma_double_contract(
+				jnp.conj(P_v), P_c,
+				perm_L=perm,
+				phase_L=jnp.conj(phase),
+				perm_R=perm,
+				phase_R=phase,
+				spin_axes=(1, 2),
+			)
+			return (G_acc
+			        + jnp.sum(kw[:, None, None] * prod, axis=0), None)
+
+		G, _ = jax.lax.scan(
+			_one_component,
+			jnp.zeros(P_v.shape[-2:], dtype=P_v.dtype),
+			jnp.arange(1, 4, dtype=jnp.int32),
+			unroll=1,
+		)
+	else:
+		prod = gamma_double_contract(
+			jnp.conj(P_v), P_c,
+			perm_L=None if lhs_id else perm_L,
+			phase_L=None if lhs_id else phase_L,
+			perm_R=None if rhs_id else perm_R,
+			phase_R=None if rhs_id else phase_R,
+			spin_axes=(1, 2),
+		)
+		G = jnp.sum(kw[:, None, None] * prod, axis=0)
+	if symmetrize:
+		G = 0.5 * (G + jnp.conj(G.T))
+	return G
+
 def _gram_q0_kernel(
 	mesh_xy: Mesh,
 	nk: int,
@@ -305,10 +371,12 @@ def _gram_q0_kernel(
 	lhs_id: bool,
 	rhs_id: bool,
 	symmetrize: bool,
+	transverse_feature_sum: bool = False,
 ):
 	"""Return the one cached q=0 executable used by run and planning."""
 	cache_key = ('gram_q0_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu,
-	             n_col, lhs_id, rhs_id, symmetrize)
+	             n_col, lhs_id, rhs_id, symmetrize,
+	             transverse_feature_sum)
 
 	if cache_key not in _isdf_pipeline_cache:
 		in_spin = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
@@ -319,27 +387,18 @@ def _gram_q0_kernel(
 		_lhs_id = lhs_id
 		_rhs_id = rhs_id
 		_symmetrize = symmetrize
+		_transverse_feature_sum = transverse_feature_sum
 
 		@partial(jax.jit,
 		         in_shardings=(in_spin, in_spin, kw_rep, rep, rep, rep, rep),
 		         out_shardings=out_xy)
 		def _gram_q0(P_v, P_c, kw, perm_L_, phase_L_, perm_R_, phase_R_):
-			# γ̃-contracted spin reduction (5 → 3 rank, dropping (a,b)).
-			# spin axes are (1, 2) on the (k, a, b, μ, ν) layout.
-			prod = gamma_double_contract(
-				jnp.conj(P_v), P_c,
-				perm_L=None if _lhs_id else perm_L_,
-				phase_L=None if _lhs_id else phase_L_,
-				perm_R=None if _rhs_id else perm_R_,
-				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(1, 2),
+			return _gram_q0_fold_local(
+				P_v, P_c, kw, perm_L_, phase_L_, perm_R_, phase_R_,
+				lhs_id=_lhs_id, rhs_id=_rhs_id,
+				symmetrize=_symmetrize,
+				transverse_feature_sum=_transverse_feature_sum,
 			)
-			G = jnp.sum(kw[:, None, None] * prod, axis=0)
-			# Symmetrize: q=0 Gram is Hermitian by construction; fp roundoff
-			# can break it.  (Skipped for rectangular column blocks.)
-			if _symmetrize:
-				G = 0.5 * (G + jnp.conj(G.T))
-			return G
 
 		_isdf_pipeline_cache[cache_key] = _gram_q0
 
@@ -409,8 +468,552 @@ def gram_q0_from_pair(
 	return _gram_q0_kernel(
 		mesh_xy, nk, ns1, ns2, n_rmu, n_col,
 		lhs_id=lhs_id, rhs_id=rhs_id, symmetrize=symmetrize,
+		transverse_feature_sum=False,
 	)(
 		P_v_k, P_c_k, k_weights, perm_L, phase_L, perm_R, phase_R)
+
+
+def transverse_gram_q0_from_pair(
+	P_l_k: jax.Array,
+	P_r_k: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	symmetrize: bool = True,
+) -> jax.Array:
+	"""PSD q=0 Gram of the three stacked transverse transition features.
+
+	For ``Z_i(a,mn,k) = <psi^R_m(a)|gamma_i|psi^L_n(a)>`` this computes
+
+	``G_perp(a,b) = sum_{i=1}^3 sum_{nmk} w_k Z_i(a,mn,k) conj(Z_i(b,mn,k))``.
+
+	Since every transverse gamma is Hermitian, this ``Z_i`` is the conjugate
+	of ``<psi^L|gamma_i|psi^R>``; the pair-density factorisation therefore
+	uses ``gamma_i^*`` on its first endpoint and ``gamma_i`` on its second.
+	Components have equal weight and are never normalised separately, so an
+	orthogonal rotation among the three Cartesian current components leaves
+	the Gram invariant.  The computation
+	reuses :func:`gamma_double_contract` and scans one component at a time;
+	neither band-pair features nor a three-component pair-density stack is
+	materialised.
+	"""
+	nk, ns1, ns2, n_rmu, n_col = P_l_k.shape
+	if int(ns1) != 4 or int(ns2) != 4:
+		raise ValueError(
+			"transverse_gram_q0_from_pair requires the four-component "
+			f"bispinor carrier; got spin axes ({int(ns1)}, {int(ns2)})")
+	if P_r_k.shape != P_l_k.shape:
+		raise ValueError(
+			"transverse_gram_q0_from_pair requires matching left/right pair "
+			f"shapes; got {P_l_k.shape} and {P_r_k.shape}")
+	return _gram_q0_kernel(
+		mesh_xy, nk, ns1, ns2, n_rmu, n_col,
+		lhs_id=False, rhs_id=False, symmetrize=symmetrize,
+		transverse_feature_sum=True,
+	)(P_l_k, P_r_k, k_weights,
+	  _gammas_perm, _gammas_phase, _gammas_perm, _gammas_phase)
+
+
+def _gram_q0_from_psi_kernel(
+	mesh_xy: Mesh,
+	nk: int,
+	n_rows: int,
+	n_cols: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	*,
+	gamma_mode: str,
+	symmetrize: bool,
+):
+	"""Return the fused pair-density + q=0 normal-matrix executable."""
+	transverse = gamma_mode == "transverse"
+	cache_key = (
+		'gram_q0_from_psi_sm', id(mesh_xy), nk, n_rows, n_cols,
+		nb_l, nb_r, nspinor, gamma_mode, symmetrize,
+	)
+	if cache_key not in _isdf_pipeline_cache:
+		x_spec = P(None, 'x', None, None)
+		y_spec = P(None, None, None, 'y')
+		out_spec = P('x', 'y')
+		x_sh = NamedSharding(mesh_xy, x_spec)
+		y_sh = NamedSharding(mesh_xy, y_spec)
+		rep = NamedSharding(mesh_xy, P())
+		out_sh = NamedSharding(mesh_xy, out_spec)
+
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(x_spec, y_spec, x_spec, y_spec,
+		                   P(), P(), P(), P(), P()),
+		         out_specs=out_spec, check_vma=False)
+		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			P_l = jnp.einsum(
+				'kmna,knbr->kabmr', psi_l_X_, psi_l_Y_, optimize=True)
+			P_r = jnp.einsum(
+				'kmna,knbr->kabmr', psi_r_X_, psi_r_Y_, optimize=True)
+			return _gram_q0_fold_local(
+				P_l, P_r, kw_, perm_L_, phase_L_, perm_R_, phase_R_,
+				lhs_id=not transverse, rhs_id=not transverse,
+				symmetrize=False,
+				transverse_feature_sum=transverse,
+			)
+
+		@partial(jax.jit,
+		         in_shardings=(x_sh, y_sh, x_sh, y_sh,
+		                       rep, rep, rep, rep, rep),
+		         out_shardings=out_sh)
+		def _fused(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			G = _local(
+				psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+				perm_L_, phase_L_, perm_R_, phase_R_)
+			# This must be outside the manual shard_map: on a 2-D mesh, the
+			# conjugate-transpose tile lives on the rank with swapped X/Y
+			# coordinates. Production tiles request ``False`` and symmetrize
+			# only after assembly; the public square-matrix route remains exact.
+			if symmetrize:
+				G = 0.5 * (G + jnp.conj(G.T))
+			return G
+
+		_isdf_pipeline_cache[cache_key] = _fused
+	return _isdf_pipeline_cache[cache_key]
+
+
+def gram_q0_from_psi_sm(
+	psi_l_X: jax.Array,
+	psi_l_Y: jax.Array,
+	psi_r_X: jax.Array,
+	psi_r_Y: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	gamma_mode: str = "charge",
+	symmetrize: bool = True,
+) -> jax.Array:
+	"""Fused candidate Gram from two left/right centroid-WFN faces.
+
+	Inputs use the same single-axis face convention as
+	:func:`c_q_from_psi_sm`'s legacy route.  The two band contractions and
+	the q=0 normal-matrix fold are one compiled program, so their rank-5
+	pair densities are compiler-internal temporaries rather than committed
+	outputs of separate dispatches.
+
+	``gamma_mode='charge'`` computes the scalar q=0 CCT normal matrix.
+	``gamma_mode='transverse'`` requires four-component bispinors and computes
+	the PSD sum ``sum_i Z_i Z_i^H`` used by centroid selection; it is not the
+	individual indefinite transverse ``C_q^i`` used by the zeta solve.
+	"""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if any(arr.ndim != 4 for arr in
+	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
+		raise ValueError("gram_q0_from_psi_sm requires four rank-4 WFN faces")
+	nk, n_rows, nb_l, ns = (int(v) for v in psi_l_X.shape)
+	if tuple(int(v) for v in psi_l_Y.shape[:3]) != (nk, nb_l, ns):
+		raise ValueError(
+			"left WFN faces disagree: "
+			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
+	n_cols = int(psi_l_Y.shape[3])
+	if (int(psi_r_X.shape[0]) != nk or int(psi_r_X.shape[1]) != n_rows
+	        or int(psi_r_X.shape[3]) != ns):
+		raise ValueError(
+			"right X face disagrees with left X face: "
+			f"left={psi_l_X.shape}, right={psi_r_X.shape}")
+	nb_r = int(psi_r_X.shape[2])
+	if tuple(int(v) for v in psi_r_Y.shape) != (nk, nb_r, ns, n_cols):
+		raise ValueError(
+			"right WFN faces disagree: "
+			f"X={psi_r_X.shape}, Y={psi_r_Y.shape}")
+	if tuple(int(v) for v in k_weights.shape) != (nk,):
+		raise ValueError(
+			f"k_weights must have shape ({nk},); got {k_weights.shape}")
+	if mode == "transverse" and ns != 4:
+		raise ValueError(
+			"gamma_mode='transverse' requires four-component bispinors; "
+			f"got nspinor={ns}")
+	if mode == "transverse":
+		perm = _gammas_perm
+		phase = _gammas_phase
+	else:
+		perm = jnp.arange(ns, dtype=jnp.int32)
+		phase = jnp.ones(ns, dtype=psi_l_X.dtype)
+	return _gram_q0_from_psi_kernel(
+		mesh_xy, nk, n_rows, n_cols, nb_l, nb_r, ns,
+		gamma_mode=mode, symmetrize=bool(symmetrize),
+	)(psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
+	  perm, phase, perm, phase)
+
+
+def _gram_q0_tiled_from_psi_kernel(
+	mesh_xy: Mesh,
+	nk: int,
+	n_points: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	tile_width: int,
+	*,
+	gamma_mode: str,
+):
+	"""Return one donated executable for a complete tiled q=0 Gram build.
+
+	The manual shard-map body owns each rank's complete WFN faces and local
+	``P('x','y')`` Gram shard.  Its scan walks the caller's fixed square-tile
+	schedule in column-major order, matching the historical Python loop.  Thus
+	the four face slices, two pair densities, Gram fold and local insertion are
+	compiler-internal to one dispatch; only the full WFN faces and the donated
+	Gram persist across tiles.
+	"""
+	transverse = gamma_mode == "transverse"
+	n_x = int(mesh_xy.shape['x'])
+	n_y = int(mesh_xy.shape['y'])
+	local_rows = int(n_points) // n_x
+	local_cols = int(n_points) // n_y
+	local_tile_rows = int(tile_width) // n_x
+	local_tile_cols = int(tile_width) // n_y
+	n_row_tiles = -(-local_rows // local_tile_rows)
+	n_col_tiles = -(-local_cols // local_tile_cols)
+	n_tiles = n_row_tiles * n_col_tiles
+	row_tail = local_rows - (n_row_tiles - 1) * local_tile_rows
+	col_tail = local_cols - (n_col_tiles - 1) * local_tile_cols
+	has_tail = (row_tail != local_tile_rows or col_tail != local_tile_cols)
+	cache_key = (
+		'gram_q0_tiled_from_psi_sm', id(mesh_xy), nk, n_points,
+		nb_l, nb_r, nspinor, tile_width, gamma_mode,
+	)
+	if cache_key not in _isdf_pipeline_cache:
+		x_spec = P(None, 'x', None, None)
+		y_spec = P(None, None, None, 'y')
+		out_spec = P('x', 'y')
+		x_sh = NamedSharding(mesh_xy, x_spec)
+		y_sh = NamedSharding(mesh_xy, y_spec)
+		out_sh = NamedSharding(mesh_xy, out_spec)
+		rep = NamedSharding(mesh_xy, P())
+
+		def _slice_pad_local(a, start, *, axis, size):
+			"""Slice one already-owned shard and zero its out-of-range tail."""
+			n_local = int(a.shape[axis])
+			ids = jnp.asarray(start, dtype=jnp.int32) + jnp.arange(
+				size, dtype=jnp.int32)
+			safe = jnp.minimum(ids, jnp.int32(n_local - 1))
+			out = jnp.take(a, safe, axis=axis)
+			mask_shape = [1] * a.ndim
+			mask_shape[axis] = size
+			valid = (ids < jnp.int32(n_local)).reshape(mask_shape)
+			return jnp.where(valid, out, jnp.zeros((), dtype=a.dtype))
+
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(out_spec, x_spec, y_spec, x_spec, y_spec,
+		                   P(), P(), P(), P(), P()),
+		         out_specs=out_spec, check_vma=False)
+		def _local(G_local, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			def _one_tile(G_acc, tile_idx):
+				# Preserve the incumbent c-outer/r-inner tile order.  There is no
+				# arithmetic dependence between tiles, but the order is useful HLO
+				# evidence that this is the same fixed schedule in one executable.
+				c_idx = tile_idx // jnp.int32(n_row_tiles)
+				r_idx = tile_idx - c_idx * jnp.int32(n_row_tiles)
+				r_start = r_idx * jnp.int32(local_tile_rows)
+				c_start = c_idx * jnp.int32(local_tile_cols)
+
+				row_l = _slice_pad_local(
+					psi_l_X_, r_start, axis=1, size=local_tile_rows)
+				col_l = _slice_pad_local(
+					psi_l_Y_, c_start, axis=3, size=local_tile_cols)
+				row_r = _slice_pad_local(
+					psi_r_X_, r_start, axis=1, size=local_tile_rows)
+				col_r = _slice_pad_local(
+					psi_r_Y_, c_start, axis=3, size=local_tile_cols)
+				P_l = jnp.einsum(
+					'kmna,knbr->kabmr', row_l, col_l, optimize=True)
+				P_r = jnp.einsum(
+					'kmna,knbr->kabmr', row_r, col_r, optimize=True)
+				G_tile = _gram_q0_fold_local(
+					P_l, P_r, kw_, perm_L_, phase_L_, perm_R_, phase_R_,
+					lhs_id=not transverse, rhs_id=not transverse,
+					symmetrize=False,
+					transverse_feature_sum=transverse,
+				)
+				# A two-index ``.at[].set(mode='drop')`` lowers this contiguous
+				# tile store to one scalar scatter iteration per matrix element.
+				# At CrI3 M=588/P4 that was 294^2=86,436 iterations and four
+				# tiny GPU kernels each.  DUS expresses the actual operation.  A
+				# static four-way tail switch keeps the final partial row/column
+				# exact without a larger padded Gram or a read/merge of G_acc.
+				if not has_tail:
+					G_acc = jax.lax.dynamic_update_slice(
+						G_acc, G_tile, (r_start, c_start))
+				else:
+					row_last = r_idx == jnp.int32(n_row_tiles - 1)
+					col_last = c_idx == jnp.int32(n_col_tiles - 1)
+					branch = (jnp.asarray(row_last, dtype=jnp.int32) * 2
+					          + jnp.asarray(col_last, dtype=jnp.int32))
+
+					def _store_full(args):
+						G_, tile_, r_, c_ = args
+						return jax.lax.dynamic_update_slice(
+							G_, tile_, (r_, c_))
+
+					def _store_col_tail(args):
+						G_, tile_, r_, c_ = args
+						return jax.lax.dynamic_update_slice(
+							G_, tile_[:, :col_tail], (r_, c_))
+
+					def _store_row_tail(args):
+						G_, tile_, r_, c_ = args
+						return jax.lax.dynamic_update_slice(
+							G_, tile_[:row_tail, :], (r_, c_))
+
+					def _store_corner(args):
+						G_, tile_, r_, c_ = args
+						return jax.lax.dynamic_update_slice(
+							G_, tile_[:row_tail, :col_tail], (r_, c_))
+
+					G_acc = jax.lax.switch(
+						branch,
+						(_store_full, _store_col_tail,
+						 _store_row_tail, _store_corner),
+						(G_acc, G_tile, r_start, c_start),
+					)
+				return G_acc, None
+
+			G_local, _ = jax.lax.scan(
+				_one_tile,
+				G_local,
+				jnp.arange(n_tiles, dtype=jnp.int32),
+				unroll=1,
+			)
+			return G_local
+
+		@partial(jax.jit,
+		         in_shardings=(out_sh, x_sh, y_sh, x_sh, y_sh,
+		                       rep, rep, rep, rep, rep),
+		         out_shardings=out_sh, donate_argnums=(0,))
+		def _tiled(G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+		           perm_L_, phase_L_, perm_R_, phase_R_):
+			return _local(
+				G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+				perm_L_, phase_L_, perm_R_, phase_R_)
+
+		_isdf_pipeline_cache[cache_key] = _tiled
+	return _isdf_pipeline_cache[cache_key]
+
+
+def gram_q0_tiled_from_psi_sm(
+	G_xy: jax.Array,
+	psi_l_X: jax.Array,
+	psi_l_Y: jax.Array,
+	psi_r_X: jax.Array,
+	psi_r_Y: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	tile_width: int,
+	gamma_mode: str = "charge",
+) -> jax.Array:
+	"""Assemble every q=0 candidate-Gram tile in one donated executable.
+
+	This is the blocked counterpart of :func:`gram_q0_from_psi_sm`.  ``G_xy``
+	is a square destination sharded ``P('x','y')`` and is donated.  The WFN
+	faces keep their full candidate extent and their canonical X/Y layouts;
+	each scan step slices only the already-owned local shards.  The final
+	Hermitian fold remains the caller's operation, exactly as in the historical
+	blocked schedule.
+
+	``tile_width`` is the existing global square-tile width, not a tuning
+	choice made here.  It must divide both mesh axes.  Tail tiles are padded
+	with exact zeros locally; the final partial row and column are trimmed to
+	their static in-range shapes before the contiguous destination update.
+	The transverse route calls the unchanged three-component scan in
+	:func:`_gram_q0_fold_local`, preserving its component and reduction order.
+	"""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if any(arr.ndim != 4 for arr in
+	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
+		raise ValueError(
+			"gram_q0_tiled_from_psi_sm requires four rank-4 WFN faces")
+	if G_xy.ndim != 2 or int(G_xy.shape[0]) != int(G_xy.shape[1]):
+		raise ValueError(
+			"gram_q0_tiled_from_psi_sm requires a square rank-2 destination; "
+			f"got {G_xy.shape}")
+	nk, n_points, nb_l, ns = (int(v) for v in psi_l_X.shape)
+	if tuple(int(v) for v in G_xy.shape) != (n_points, n_points):
+		raise ValueError(
+			"Gram destination and WFN point extents disagree: "
+			f"G={G_xy.shape}, psi_l_X={psi_l_X.shape}")
+	if tuple(int(v) for v in psi_l_Y.shape) != (nk, nb_l, ns, n_points):
+		raise ValueError(
+			"left WFN faces disagree: "
+			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
+	if (int(psi_r_X.shape[0]) != nk
+	        or int(psi_r_X.shape[1]) != n_points
+	        or int(psi_r_X.shape[3]) != ns):
+		raise ValueError(
+			"right X face disagrees with left X face: "
+			f"left={psi_l_X.shape}, right={psi_r_X.shape}")
+	nb_r = int(psi_r_X.shape[2])
+	if tuple(int(v) for v in psi_r_Y.shape) != (nk, nb_r, ns, n_points):
+		raise ValueError(
+			"right WFN faces disagree: "
+			f"X={psi_r_X.shape}, Y={psi_r_Y.shape}")
+	if tuple(int(v) for v in k_weights.shape) != (nk,):
+		raise ValueError(
+			f"k_weights must have shape ({nk},); got {k_weights.shape}")
+	if mode == "transverse" and ns != 4:
+		raise ValueError(
+			"gamma_mode='transverse' requires four-component bispinors; "
+			f"got nspinor={ns}")
+	width = int(tile_width)
+	if width <= 0:
+		raise ValueError(f"tile_width must be positive; got {width}")
+	n_x = int(mesh_xy.shape['x'])
+	n_y = int(mesh_xy.shape['y'])
+	if n_points % n_x or n_points % n_y:
+		raise ValueError(
+			"candidate extent must divide both mesh axes for a P('x','y') "
+			f"destination; got n_points={n_points}, mesh={n_x}x{n_y}")
+	if width % n_x or width % n_y:
+		raise ValueError(
+			"tile_width must divide both mesh axes; "
+			f"got tile_width={width}, mesh={n_x}x{n_y}")
+	if mode == "transverse":
+		perm = _gammas_perm
+		phase = _gammas_phase
+	else:
+		perm = jnp.arange(ns, dtype=jnp.int32)
+		phase = jnp.ones(ns, dtype=psi_l_X.dtype)
+	return _gram_q0_tiled_from_psi_kernel(
+		mesh_xy, nk, n_points, nb_l, nb_r, ns, width,
+		gamma_mode=mode,
+	)(G_xy, psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
+	  perm, phase, perm, phase)
+
+
+def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
+	*,
+	mesh_xy: Mesh,
+	nk: int,
+	n_points: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	tile_width: int,
+	dtype=jnp.complex128,
+	gamma_mode: str = "charge",
+) -> int:
+	"""Compiled bytes above the already-resident WFN faces and donated G.
+
+	This lowers the exact production scan executable.  The caller's live-set
+	model already counts all arguments (the four complete WFN faces and the
+	local ``P('x','y')`` destination), so ``resident_increment`` is the relevant
+	compiler fact: temporary bytes plus any non-aliased output bytes.  Donation
+	should make the latter zero; the focused P=4 HLO gate asserts the alias.
+	"""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
+	n_x = int(mesh_xy.shape['x'])
+	n_y = int(mesh_xy.shape['y'])
+	width = int(tile_width)
+	if (int(n_points) <= 0 or width <= 0
+	        or int(n_points) % n_x or int(n_points) % n_y
+	        or width % n_x or width % n_y):
+		raise ValueError(
+			"tiled Gram planning requires positive candidate/tile extents "
+			"divisible by both mesh axes; got "
+			f"n_points={int(n_points)}, tile_width={width}, mesh={n_x}x{n_y}")
+	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
+	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+	xy_sh = NamedSharding(mesh_xy, P('x', 'y'))
+	rep = NamedSharding(mesh_xy, P())
+	G = jax.ShapeDtypeStruct(
+		(int(n_points), int(n_points)), dtype, sharding=xy_sh)
+	x_l = jax.ShapeDtypeStruct(
+		(int(nk), int(n_points), int(nb_l), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_l = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_l), int(nspinor), int(n_points)), dtype,
+		sharding=y_sh)
+	x_r = jax.ShapeDtypeStruct(
+		(int(nk), int(n_points), int(nb_r), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_r = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_r), int(nspinor), int(n_points)), dtype,
+		sharding=y_sh)
+	kw = jax.ShapeDtypeStruct((int(nk),), jnp.float64, sharding=rep)
+	gamma_shape = ((4, int(nspinor)) if mode == "transverse"
+	               else (int(nspinor),))
+	perm = jax.ShapeDtypeStruct(gamma_shape, jnp.int32, sharding=rep)
+	phase = jax.ShapeDtypeStruct(gamma_shape, dtype, sharding=rep)
+	compiled = _gram_q0_tiled_from_psi_kernel(
+		mesh_xy, int(nk), int(n_points), int(nb_l), int(nb_r),
+		int(nspinor), width, gamma_mode=mode,
+	).lower(
+		G, x_l, y_l, x_r, y_r, kw, perm, phase, perm, phase,
+	).compile()
+	from runtime.aot_memory import aot_kernel_peak_bytes
+	return int(aot_kernel_peak_bytes(compiled).resident_increment)
+
+
+def gram_q0_from_psi_aot_peak_bytes(
+	*,
+	mesh_xy: Mesh,
+	nk: int,
+	n_rows: int,
+	n_cols: int,
+	nb_l: int,
+	nb_r: int,
+	nspinor: int,
+	dtype=jnp.complex128,
+	gamma_mode: str = "charge",
+	symmetrize: bool = False,
+) -> int:
+	"""Per-rank compiled peak of :func:`gram_q0_from_psi_sm`."""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
+	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
+	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+	rep = NamedSharding(mesh_xy, P())
+	x_l = jax.ShapeDtypeStruct(
+		(int(nk), int(n_rows), int(nb_l), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_l = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_l), int(nspinor), int(n_cols)), dtype,
+		sharding=y_sh)
+	x_r = jax.ShapeDtypeStruct(
+		(int(nk), int(n_rows), int(nb_r), int(nspinor)), dtype,
+		sharding=x_sh)
+	y_r = jax.ShapeDtypeStruct(
+		(int(nk), int(nb_r), int(nspinor), int(n_cols)), dtype,
+		sharding=y_sh)
+	kw = jax.ShapeDtypeStruct((int(nk),), jnp.float64, sharding=rep)
+	gamma_shape = ((4, int(nspinor)) if mode == "transverse"
+	               else (int(nspinor),))
+	perm = jax.ShapeDtypeStruct(gamma_shape, jnp.int32, sharding=rep)
+	phase = jax.ShapeDtypeStruct(gamma_shape, dtype, sharding=rep)
+	compiled = _gram_q0_from_psi_kernel(
+		mesh_xy, int(nk), int(n_rows), int(n_cols), int(nb_l), int(nb_r),
+		int(nspinor), gamma_mode=mode, symmetrize=bool(symmetrize),
+	).lower(x_l, y_l, x_r, y_r, kw, perm, phase, perm, phase).compile()
+	from runtime.aot_memory import aot_kernel_peak_bytes
+	return int(aot_kernel_peak_bytes(compiled).total)
 
 
 def gram_q0_aot_peak_bytes(
@@ -421,8 +1024,17 @@ def gram_q0_aot_peak_bytes(
 	n_rmu: int,
 	n_col: int,
 	dtype=jnp.complex128,
+	gamma_mode: str = "charge",
 ) -> int:
-	"""Per-rank compiled peak for the canonical charge q=0 tile fold."""
+	"""Per-rank compiled peak for the canonical q=0 candidate tile fold."""
+	mode = str(gamma_mode).strip().lower()
+	if mode not in ("charge", "transverse"):
+		raise ValueError(
+			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
 	pair_sh = NamedSharding(
 		mesh_xy, P(None, None, None, 'x', 'y'),
 	)
@@ -432,11 +1044,14 @@ def gram_q0_aot_peak_bytes(
 		dtype, sharding=pair_sh,
 	)
 	kw = jax.ShapeDtypeStruct((int(nk),), jnp.float64, sharding=rep)
-	perm = jax.ShapeDtypeStruct((int(nspinor),), jnp.int32, sharding=rep)
-	phase = jax.ShapeDtypeStruct((int(nspinor),), dtype, sharding=rep)
+	gamma_shape = ((4, int(nspinor)) if mode == "transverse"
+	               else (int(nspinor),))
+	perm = jax.ShapeDtypeStruct(gamma_shape, jnp.int32, sharding=rep)
+	phase = jax.ShapeDtypeStruct(gamma_shape, dtype, sharding=rep)
 	compiled = _gram_q0_kernel(
 		mesh_xy, int(nk), int(nspinor), int(nspinor), int(n_rmu),
-		int(n_col), lhs_id=True, rhs_id=True, symmetrize=False,
+		int(n_col), lhs_id=(mode == "charge"), rhs_id=(mode == "charge"),
+		symmetrize=False, transverse_feature_sum=(mode == "transverse"),
 	).lower(pair, pair, kw, perm, phase, perm, phase).compile()
 	from runtime.aot_memory import aot_kernel_peak_bytes
 	return int(aot_kernel_peak_bytes(compiled).total)

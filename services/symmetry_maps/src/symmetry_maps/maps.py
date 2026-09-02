@@ -1049,12 +1049,10 @@ def unfold_isdf_one_leg(
     under time reversal, matching :func:`unfold_psi`.
 
     ``component_action='scalar'`` returns that scalar leg.  The ``'polar'``
-    action takes one streamed source Cartesian component and returns its
-    contributions to all three target components using exactly the named
-    ``SymMaps.R_cart_forward`` column.  Its TRS-augmented row already carries
-    the single time-reversal minus for a polar current; no second parity sign
-    is applied.  Summing the three calls with ``source_component=0,1,2`` is
-    the full vector action, while only one large zeta slab is resident.
+    action streams one source Cartesian component through the canonical
+    polar, time-odd :meth:`SymMaps.cartesian_action`.  Summing the three
+    source components gives the full vector action while only one large zeta
+    slab is resident.
 
     ``sym_idx`` is deliberately explicit: callers must pass the measured
     :class:`QgridTrsPolicy`'s ``unfold_sym_idx``.  This function never falls
@@ -1267,12 +1265,8 @@ def unfold_isdf_one_leg(
     trs = rows >= n_spatial
     R_column = None
     if action == "polar":
-        R = np.asarray(sym.R_cart_forward, dtype=np.float64)
-        if R.shape != (S_all.shape[0], 3, 3):
-            raise ValueError(
-                "unfold_isdf_one_leg: SymMaps.R_cart_forward has shape "
-                f"{R.shape}, expected {(S_all.shape[0], 3, 3)}.")
-        R_column = R[rows, :, source]
+        R_column = sym.cartesian_action(
+            rows, axial=False, time_odd=True)[:, :, source]
 
     fn = _get_unfold_isdf_one_leg_jit(
         zeta_shape=zshape, idx=idx, rows=rows, perm=perm,
@@ -1387,51 +1381,16 @@ def _get_unfold_isdf_one_leg_jit(
 def mix_channels_by_proper_rotation(
     V_tt_per_channel,
     *,
+    sym,
     sym_idx,
-    R_proper_table,
     mesh_xy,
 ):
-    """Apply the 3-vector Lorentz mixing on the bispinor TT-block tiles.
+    """Mix the two Pauli-vector indices on bispinor TT tiles.
 
-    Operates on the (μ_L, ν_L) ∈ {1,2,3}² block of bispinor V_q tiles that
-    have already been passed through :func:`unfold_isdf_operator` (centroid
-    double-permute + L-phase + TRS conj-wrap).  Implements the rule from
-    ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A5::
-
-        V^{i,j}_mixed[q, μ, ν]
-            = Σ_{α, β ∈ {1,2,3}} R_proper[s(q), i-1, α-1]
-                                  · R_proper[s(q), j-1, β-1]
-                                  · V^{α,β}_unfolded[q, μ, ν]
-
-    where ``s(q) = sym_idx[q]`` and ``R_proper`` is the derivation's own
-    Cartesian rotation ``R_deriv = Aᵀ · mtrx⁻¹ · (Aᵀ)⁻¹``.
-
-    THE FORMULA ABOVE IS THE DERIVATION'S; THE TABLE THIS FUNCTION TAKES
-    IS ITS TRANSPOSE, AND THE CONTRACTION COMPENSATES.  ``SymMaps.R_proper``
-    is built from ``R_cart = Aᵀ · mtrx · (Aᵀ)⁻¹`` (with the det-flip), the
-    rotation ``get_spinor_rotations`` consumes and the one LORRAX's
-    ``U_spinor`` actually satisfies the σ-sandwich identity for.  Because
-    ``mtrx`` is orthogonal, that is ``R_deriv`` transposed row-wise, so
-    ``R_deriv^{i,α} = R_proper^{α,i}`` and the implemented contraction is
-
-        V^{i,j}_mixed[q, μ, ν]
-            = Σ_{α, β} R_proper[s(q), α, i-1] · R_proper[s(q), β, j-1]
-                       · V^{α,β}_unfolded[q, μ, ν]
-
-    (einsum ``'qai,qbj,abqmn->ijqmn'``).  Passing a table in the
-    derivation-text convention — e.g. the offline fixture
-    ``reports/bispinor_ibz_2026-05-16/cri3_R_proper.npz`` — WITHOUT
-    transposing it first applies the inverse rotation, which leaves norms,
-    hermiticity and traces intact.  This is the same inversion
-    ``syms_crystal_to_cartesian``'s docstring warns about; ``R_cart`` /
-    ``R_proper`` are the INVERSE Cartesian rotation and
-    ``SymMaps.R_cart_forward`` is the forward one.
-
-    TRS rows reuse the spatial
-    ``R_proper``: the σ-flip TRS sigma-sign on (μ_L, ν_L) ∈ {1,2,3}²
-    factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and is
-    absorbed by the existing scalar ``unfold_isdf_operator`` conj-wrap
-    (derivation §A4).
+    Each index requests the canonical axial, time-odd action from ``sym``.
+    The two antiunitary signs cancel while :func:`unfold_isdf_operator` owns
+    the single complex conjugation.  Keeping the action typed here prevents
+    callers from choosing a transpose, determinant sign, or TR convention.
 
     Parameters
     ----------
@@ -1441,13 +1400,11 @@ def mix_channels_by_proper_rotation(
         shape, sharded ``P(None, 'x', 'y')``.  Callers may pass the 6
         unique tiles + the 3 Hermitian-redundant tiles synthesised via
         ``conj(swapaxes(V[i,j], -1, -2))``.
-    sym_idx : np.ndarray | jax.Array
-        ``(n_q_full,)`` int — ``SymMaps.sym_idx_q`` (TRS-augmented).
-    R_proper_table : np.ndarray
-        ``(2·n_sym_spatial, 3, 3)`` float64 — ``SymMaps.R_proper``, in
-        the LORRAX ``Aᵀ · mtrx · (Aᵀ)⁻¹`` convention, NOT the derivation
-        text's transpose of it (see above).  Both spatial and TRS halves
-        contain the same spatial ``R_proper`` per the derivation.
+    sym_idx : numpy.ndarray
+        Host ``(n_q_full,)`` integer metadata from ``SymMaps.sym_idx_q``.
+        Device arrays and tracers are refused before the compiled tile path.
+    sym : SymMaps
+        Canonical operation and representation source.
     mesh_xy : jax.sharding.Mesh
         Device mesh (used to lock the output sharding).
 
@@ -1456,17 +1413,21 @@ def mix_channels_by_proper_rotation(
     dict[(i, j) -> jax.Array]
         Same keys, same shapes, sharded ``P(None, 'x', 'y')``.
     """
-    sym_arr = np.asarray(sym_idx, dtype=np.int32)
-    R_arr = np.asarray(R_proper_table, dtype=np.float64)
-    if R_arr.ndim != 3 or R_arr.shape[1:] != (3, 3):
+    if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
+        raise TypeError(
+            "mix_channels_by_proper_rotation: sym_idx is host metadata; "
+            "pass a NumPy array, not a JAX array or tracer.")
+    sym_raw = np.asarray(sym_idx)
+    if sym_raw.ndim != 1:
         raise ValueError(
-            f"mix_channels_by_proper_rotation: R_proper_table must have shape "
-            f"(2·n_sym_spatial, 3, 3); got {R_arr.shape}.")
-    # Per-q 3×3 mixer baked into the jit closure as a constant — same
-    # caching pattern as ``unfold_isdf_operator`` (small int + float table
-    # folded into HLO).  ``R_per_q[q]`` ∈ R^{3×3} is the spatial rotation that
-    # mixes the (1,2,3) Lorentz indices for full-BZ q.
-    R_per_q = R_arr[sym_arr]                                # (n_q_full, 3, 3)
+            "mix_channels_by_proper_rotation: sym_idx must be rank one; "
+            f"got {sym_raw.shape}.")
+    R_per_q = np.asarray(sym.cartesian_action(
+        sym_raw, axial=True, time_odd=True), dtype=np.float64)
+    if R_per_q.shape != (sym_raw.size, 3, 3):
+        raise ValueError(
+            "mix_channels_by_proper_rotation: typed Cartesian actions must "
+            f"have shape {(sym_raw.size, 3, 3)}; got {R_per_q.shape}.")
 
     # Build the 9×9 source array V_in[α, β] at full-BZ shape, contract,
     # write back into the same 6 unique slots (plus 3 redundants).
@@ -1480,8 +1441,6 @@ def mix_channels_by_proper_rotation(
                 f"Hermitian-redundant entries).")
     sample = V_tt_per_channel[(1, 1)]
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    R_dev = jnp.asarray(R_per_q)                            # closure constant
-
     fn = _get_mix_channels_jit(
         V_shape=tuple(int(s) for s in sample.shape),
         R_per_q_arr=R_per_q,
@@ -1527,18 +1486,9 @@ def _get_mix_channels_jit(*, V_shape, R_per_q_arr, mesh_xy):
 
     @partial(jax.jit, in_shardings=in_sh, out_shardings=V_sh)
     def _do_mix(V_in):
-        # V_in: (3, 3, n_q, μ, ν).  Derivation §A5 (in its own R_proper
-        # convention ``R_deriv = A.T · inv(mtrx) · inv(A.T)``):
-        #     V^{i,j} = Σ_{α,β} R_deriv^{i,α} · R_deriv^{j,β} · V^{α,β}.
-        # The LIVE ``R_per_q`` here is ``R_LORRAX`` (``A.T · mtrx ·
-        # inv(A.T)`` with the det-flip; see ``SymMaps.R_proper``
-        # docstring).  For orthogonal mtrx ``R_LORRAX = R_deriv.T``
-        # row-wise, so ``R_deriv^{i,α} = R_LORRAX^{α,i}`` and the
-        # contraction becomes
-        #     V^{i,j} = Σ R_LORRAX^{α,i}(q) · R_LORRAX^{β,j}(q) · V^{α,β}(q).
-        # In einsum letters with R indexed [q, row, col]:
+        # V_in: (3, 3, n_q, μ, ν); R is the forward action [q,out,in].
         return jnp.einsum(
-            'qai,qbj,abqmn->ijqmn',
+            'qia,qjb,abqmn->ijqmn',
             R_per_q_j, R_per_q_j, V_in,
         )
 
@@ -1723,6 +1673,41 @@ def tau_phase_row(sym_mat_k, tau, g_kbar):
     S = np.asarray(sym_mat_k, dtype=np.int32)
     rotated = (S @ np.asarray(g_kbar).T).T.astype(np.float64)      # (ngk, 3)
     return np.exp(-1j * (rotated @ tau))                          # (ngk,)
+
+
+def tau_phase_row_jax(sym_mat_k, tau, g_kbar):
+    """Device form of :func:`tau_phase_row`, including the identity case.
+
+    This owns the same ``exp(-i (S G) . tau)`` convention but is intended
+    for fusion into a larger JAX action.  Unlike the host helper it returns
+    an explicit all-one row at zero translation; avoiding that allocation is
+    then the compiler's job, not a Python branch on traced data.
+    """
+    S = jnp.asarray(sym_mat_k, dtype=jnp.int32)
+    tau_j = jnp.asarray(tau, dtype=jnp.float64)
+    g = jnp.asarray(g_kbar)
+    # Contract the three-vector first.  Forming ``S @ g.T`` explicitly
+    # would create an avoidable ``(ngk, 3)`` temporary exactly where the
+    # streamed loader must remain usable for very large G spheres.
+    rotated_tau = jnp.einsum('ij,i->j', S, tau_j, optimize=True)
+    return jnp.exp(-1j * jnp.einsum(
+        'gj,j->g', g, rotated_tau, optimize=True))
+
+
+def unfold_reciprocal_carriers(sym_mat_k, g_parent, umklapp):
+    """Map parent reciprocal carriers to one full-zone child.
+
+    Implements ``G_child = S G_parent - G_umklapp`` for NumPy or JAX
+    operands. This is the shared algebra used by the host G-table builder and
+    device-side parent/bispinor realization.
+    """
+    is_jax = any(isinstance(value, (jax.Array, jax.core.Tracer)) for value in (
+        sym_mat_k, g_parent, umklapp))
+    xp = jnp if is_jax else np
+    S = xp.asarray(sym_mat_k)
+    g = xp.asarray(g_parent)
+    shift = xp.asarray(umklapp)
+    return xp.einsum('ij,gj->gi', S, g, optimize=True) - shift[None, :]
 
 
 def unfold_psi(
@@ -1951,14 +1936,13 @@ class SymMaps:
                 ``True`` (the historical, permissive behaviour) for
                 wfn-shaped objects that carry no verdict.
 
-                When False, ``sym_mats_k`` keeps its ``2·ntran`` length
-                (``unfold_psi`` hard-requires that shape — §Q) but the
-                k-mapping searches only the SPATIAL half, so
-                ``sym_idx_k`` / ``sym_idx_q`` can never name a
-                time-reversal row and no ψ is ever conjugated.  A
-                magnetic system whose file nevertheless claims a
-                TRS-reduced mesh therefore fails loudly instead of
-                silently returning iσ_y·conj(ψ).
+                When False, arbitrary global-TR partners are disabled.  An
+                authenticated QE schema may still authorize individual
+                antiunitary magnetic-space-group operations; without that
+                receipt the search conservatively keeps only the WFN
+                header's presumed-unitary half.  ``sym_mats_k`` always keeps
+                its ``2·ntran`` candidate layout because wavefunction and
+                nonsymmorphic-phase consumers key conjugation from the row.
         """
         # Measured-TRS gate.  ``allow_trs=None`` → consult the wfn object;
         # objects with no verdict (legacy WFNReader, hand-built stubs) get
@@ -1966,6 +1950,33 @@ class SymMaps:
         if allow_trs is None:
             allow_trs = getattr(wfn, 'trs_holds', None)
         self.trs_allowed = True if allow_trs is None else bool(allow_trs)
+
+        # WFN.h5 omits QE's per-operation antiunitary bit.  WfnLoader
+        # attaches a receipt only after a nearby QE schema has matched the
+        # WFN's active Seitz rows and stored k coordinates.  The legacy
+        # fallback remains available, but its epistemic limit is announced
+        # at the exact seam where symmetry becomes executable.
+        self.qe_symmetry_binding = getattr(wfn, "qe_symmetry_binding", None)
+        self.qe_symmetry_diagnostic = str(getattr(
+            wfn, "qe_symmetry_diagnostic",
+            "the WFN-shaped input carries no QE schema receipt"))
+        self.operation_typing_source = (
+            "qe-schema" if self.qe_symmetry_binding is not None
+            else "wfn-fallback")
+        if self.qe_symmetry_binding is None:
+            import warnings as _warnings
+            _warnings.warn(
+                "SYMMETRY PROVENANCE WARNING: no authenticated QE "
+                "data-file-schema.xml is available at SymMaps "
+                f"initialization ({self.qe_symmetry_diagnostic}). WFN.h5 "
+                "does not record which operations are composed with time "
+                "reversal. LORRAX is using the legacy all-spatial header "
+                "interpretation plus the global DFT-reference TRS verdict. "
+                "RESULTS WILL BE WRONG if time reversal is broken and QE "
+                "used an antiunitary magnetic-space-group operation. "
+                "Co-stage the WFN-generating QE *.save directory or pass "
+                "WfnLoader(..., qe_schema=...).",
+                RuntimeWarning)
 
         # get symmetry matrices from wfn file
         try:
@@ -1975,6 +1986,34 @@ class SymMaps:
         if ntran < 1:
             raise ValueError(
                 f"SymMaps: WFN ntran must be positive, got {ntran}.")
+        if self.qe_symmetry_binding is None:
+            _qe_antiunitary = np.zeros(ntran, dtype=bool)
+            _qe_base_rows = np.arange(ntran, dtype=np.int32)
+            self.qe_permitted_pure_time_reversal = None
+            self.qe_schema_path = None
+            self.qe_schema_sha256 = None
+        else:
+            _qe_antiunitary = np.asarray(
+                self.qe_symmetry_binding.antiunitary, dtype=bool)
+            if _qe_antiunitary.shape != (ntran,):
+                raise ValueError(
+                    "SymMaps: authenticated QE operation typing has shape "
+                    f"{_qe_antiunitary.shape}, expected ({ntran},).")
+            _qe_base_rows = (
+                np.arange(ntran, dtype=np.int32)
+                + _qe_antiunitary.astype(np.int32) * ntran)
+            self.qe_permitted_pure_time_reversal = bool(
+                self.qe_symmetry_binding.qe_permitted_pure_time_reversal)
+            self.qe_schema_path = str(self.qe_symmetry_binding.schema_path)
+            self.qe_schema_sha256 = str(
+                self.qe_symmetry_binding.schema_sha256)
+        self.qe_operation_antiunitary = _qe_antiunitary.copy()
+        self.qe_antiunitary_rows = _qe_base_rows[_qe_antiunitary].copy()
+        # Candidate row layout remains [S, -S] everywhere.  This array is
+        # the one authority for which candidates are physically permitted.
+        self.active_symmetry_rows = (
+            np.arange(2 * ntran, dtype=np.int32)
+            if self.trs_allowed else _qe_base_rows.copy())
         _kgrid = np.asarray(wfn.kgrid, dtype=np.int64)
         if _kgrid.shape != (3,) or np.any(_kgrid <= 0):
             raise ValueError(
@@ -1987,8 +2026,9 @@ class SymMaps:
                 f"SymMaps: WFN stores {_nk_stored} k-points but its kgrid "
                 f"declares only {_nfull_declared} full-BZ rows.")
 
-        # ``ntran=1`` says only that identity is the sole SPATIAL operation.
-        # It does not say the file stores the full BZ: a nonmagnetic WFN may
+        # ``ntran=1`` says only that identity is the sole stored Seitz
+        # operation.  It does not say the file stores the full BZ: a
+        # nonmagnetic WFN may
         # still contain a TR-reduced half mesh which needs the synthesized
         # ``-I`` row below.  Keep the fast identity path only when every
         # declared grid point is genuinely present and the active row is I.
@@ -2036,8 +2076,9 @@ class SymMaps:
             # In this branch ``sym_idx_k`` is identically zero anyway, so
             # the restriction is documentation of intent; it is still set
             # so every code path can read one attribute.
-            self._sym_mats_k_search = (
-                self.sym_mats_k if self.trs_allowed else _sym_mats_k)
+            self._sym_row_ids_search = self.active_symmetry_rows.copy()
+            self._sym_mats_k_search = self.sym_mats_k[
+                self._sym_row_ids_search]
             self.translations = np.zeros((1, 3), dtype=np.float64)
 
             # In no-symmetry case, unfolded grid equals irreducible grid
@@ -2058,7 +2099,7 @@ class SymMaps:
             self.Rinv_grid = self.R_grid.copy()
             # Keep the same augmented-row invariant as ``sym_mats_k``:
             # the TRS row is the negative Cartesian row.  The old one-row
-            # special case made ``R_cart_forward[sym_idx]`` fail exactly on
+            # special case made ``cartesian_action(sym_idx, ...)`` fail on
             # an identity-only WFN if a measured policy selected its TRS
             # partner, despite the reciprocal table correctly having two
             # rows.
@@ -2066,14 +2107,6 @@ class SymMaps:
             self.R_cart = np.concatenate(
                 [_R_identity, -_R_identity], axis=0)
             self.U_spinor = np.eye(2, dtype=complex)[None, :, :]
-            # ``R_proper`` is the proper (det = +1) Cartesian rotation used
-            # by the bispinor 3-vector vertex mixing.  Identity case: a
-            # spatial identity is its own proper part; the TRS-augmented
-            # half reuses it, as in the general branch.  See
-            # ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A2.
-            self.R_proper = np.repeat(
-                np.eye(3, dtype=np.float64)[None, :, :], 2, axis=0)
-
             # Build direct integer-grid lookup for the identity/no-symmetry case.
             kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
             shift = np.asarray(getattr(wfn, "shift", (0.0, 0.0, 0.0)), dtype=np.float64)
@@ -2189,28 +2222,36 @@ class SymMaps:
         time_reversal_syms = -self.sym_mats_k  # S @ k -> -S @ k
         self.sym_mats_k = np.concatenate([self.sym_mats_k, time_reversal_syms], axis=0)
 
-        # ...but only SELECT from the TRS half when time reversal has been
-        # established for these wavefunctions.  The table itself always
+        # ...but SELECT only the rows authorized above.  With global TRS the
+        # complete pair is physical.  Without it, an authenticated receipt
+        # selects each raw WFN operation from the unitary or antiunitary half;
+        # the legacy fallback selects only the presumed-unitary half.  The
+        # table itself always
         # keeps its ``2·ntran`` length — ``unfold_psi`` derives
         # ``n_sym_spatial = len(sym_mats_k)//2`` and hard-raises on any
         # other shape (§Q) — so the gate lives in the SEARCH set used by
         # ``create_kpoint_symmetry_map`` / ``find_symmetry_ops_simple`` /
-        # ``find_irreducible_bz_points``.  With TRS disallowed those can
-        # only ever return ``sym_idx < ntran``, i.e. no ψ is conjugated
-        # anywhere in the pipeline.
-        self._sym_mats_k_search = (
-            self.sym_mats_k if self.trs_allowed
-            else self.sym_mats_k[:wfn.ntran])
+        # ``find_irreducible_bz_points``.
+        self._sym_row_ids_search = self.active_symmetry_rows.copy()
+        self._sym_mats_k_search = self.sym_mats_k[
+            self._sym_row_ids_search]
         if not self.trs_allowed:
             import warnings as _warnings
-            _warnings.warn(
-                "SymMaps: the two-component DFT reference says TIME-REVERSAL "
-                "SYMMETRY IS BROKEN for this WFN, so the time-reversal rows "
-                "of sym_mats_k will not be used to map the full BZ. If this "
-                "file's IBZ was reduced using time reversal the mapping "
-                "below will fail loudly — which is the correct outcome: a "
-                "TRS-reduced mesh for a magnetic system is not physical.",
-                RuntimeWarning)
+            if self.qe_symmetry_binding is None:
+                _warnings.warn(
+                    "SymMaps: the two-component DFT reference says GLOBAL "
+                    "TIME-REVERSAL SYMMETRY IS BROKEN. With no authenticated QE "
+                    "operation typing, only the WFN header's presumed-unitary "
+                    "rows may map the full BZ; an incomplete map refuses.",
+                    RuntimeWarning)
+            else:
+                _warnings.warn(
+                    "SymMaps: the two-component DFT reference says GLOBAL "
+                    "TIME-REVERSAL SYMMETRY IS BROKEN. The authenticated QE schema "
+                    f"still authorizes {len(self.qe_antiunitary_rows)} "
+                    "operation-specific antiunitary row(s); arbitrary "
+                    "k<->-k partners remain disabled.",
+                    RuntimeWarning)
 
         # The list of full-zone k-points.  The k_full -> k_irr PARENT MAP
         # this used to compute alongside it is gone (design decision 4):
@@ -2218,6 +2259,9 @@ class SymMaps:
         # relationship ``find_symmetry_ops_simple`` produces below, it was
         # published as ``self.kpoint_map``, and nothing live read it.
         self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
+        # Validate the WFN's own stored rows before a coverage failure can
+        # hide a contradictory kgrid/shift behind a generic symmetry error.
+        self.kirr_fullids = self._match_file_wedge_rows(wfn)
 
         # ``None`` for the retired parent map: the parameter stays in the
         # signature for older callers, and the method has discarded its
@@ -2282,27 +2326,6 @@ class SymMaps:
         # row to return in that case and it raises instead of guessing.  The
         # tolerance is ``find_symmetry_ops_simple``'s 1e-6, the same number
         # the star map two lines up was built with.
-        kirr_fullids = np.empty(self.nk_red, dtype=np.int32)
-        _kpts_irr = np.asarray(wfn.kpoints, dtype=np.float64)
-        for kirr in range(self.nk_red):
-            metric = np.max(np.abs(self._periodic_delta(
-                self.unfolded_kpts, _kpts_irr[kirr])), axis=1)
-            hit = int(np.argmin(metric))
-            if metric[hit] > 1e-6:
-                raise RuntimeError(
-                    f"SymMaps: irreducible k-point {kirr} "
-                    f"{_kpts_irr[kirr].tolist()} is not on the uniform "
-                    f"{tuple(int(x) for x in np.asarray(wfn.kgrid))} k-grid "
-                    f"that this WFN's own kgrid/shift generate — the closest "
-                    f"full-BZ row is {hit} at "
-                    f"{self.unfolded_kpts[hit].tolist()}, off by "
-                    f"{metric[hit]:.3e}.  ``kirr_fullids`` cannot name a row "
-                    f"for it, and every wedge-shaped output (eqp0.dat, "
-                    f"eqp1.dat, WFN_qp.h5) would then be indexed with a "
-                    f"guess.  Fix the file's k-list or its kgrid/shift.")
-            kirr_fullids[kirr] = hit
-        self.kirr_fullids = kirr_fullids
-
         # useful maps:
         # k (full zone) to kbar 
         # k,q (both full zone) to k-q (full zone)
@@ -2324,40 +2347,6 @@ class SymMaps:
         # Site #6 for the per-element derivation.
         self.R_cart = _operator_tables.R_cart
         self.U_spinor = _operator_tables.U_spinor
-        # ``R_proper[s]`` is the PROPER (det=+1) Cartesian rotation that
-        # mixes the bispinor 3-vector vertices ``γ̃^{1,2,3} = (σ_x, σ_y,
-        # σ_z)`` per the SO(3) image of ``U_spinor``'s SU(2) sandwich:
-        #   ``U_spinor[s]† σ^i U_spinor[s] = Σ_j R_proper[s]^{j,i} σ^j``.
-        # This is the SAME rotation matrix that ``get_spinor_rotations``
-        # consumes (``A · mtrx · A⁻¹`` with the det-flip — see
-        # ``syms_crystal_to_cartesian`` docstring), so ``R_proper`` is
-        # just ``R_cart`` with the same proper-flip that
-        # ``get_spinor_rotations`` applies internally at line 1069.
-        # Derivation: ``reports/bispinor_ibz_2026-05-16/derivation.md``
-        # §A2; mixing rule §A5
-        #   ``V^{i,j}_full[q] = R_proper^{i,α}(s) · R_proper^{j,β}(s) ·
-        #                       V^{α,β}_unfolded[q]``.
-        #
-        # NOTE: this differs from the OFFLINE fixture
-        # ``reports/bispinor_ibz_2026-05-16/cri3_R_proper.npz`` by a
-        # transpose on every row — the fixture follows the derivation
-        # TEXT (``O = A · U · A⁻¹``, ``U = mtrx⁻¹``), while the live
-        # code follows the σ-sandwich identity that LORRAX's actual
-        # ``U_spinor`` satisfies (built from ``A · mtrx · A⁻¹``).  The
-        # two are inverses of each other for orthogonal mtrx and pick
-        # up a transpose on the (i, j) indices of the §A5 formula.
-        #
-        # TRS half reuses the SPATIAL R_proper (NOT ``−R_spatial``): the
-        # σ-flip TRS sigma-sign on the (μ_L, ν_L) ∈ {1,2,3}² block
-        # factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and
-        # is absorbed by the existing ``unfold_isdf_operator`` conj-wrap.  See
-        # derivation §A4.
-        _R_spatial = np.asarray(self.R_cart[:wfn.ntran], dtype=np.float64)
-        _R_proper_spatial = np.where(
-            np.linalg.det(_R_spatial)[:, None, None] < 0,
-            -_R_spatial, _R_spatial)
-        self.R_proper = np.concatenate(
-            [_R_proper_spatial, _R_proper_spatial], axis=0)
         self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
         self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
 
@@ -2385,11 +2374,12 @@ class SymMaps:
         # q lives on the same kgrid as k (q = k - k'), so we reuse
         # ``sym_mats_k`` (which already includes time-reversal). Note that
         # `is_trs[i_full] = sym_idx_q[i_full] >= ntran` is implicit; not stored.
-        irr_idx_q, sym_idx_q, q_irr_kgrid_int = find_irreducible_bz_points(
+        irr_idx_q, sym_idx_q_search, q_irr_kgrid_int = find_irreducible_bz_points(
             self.kvecs_asints, self._sym_mats_k_search, irr_kgrid_int=None,
         )
         self.irr_idx_q = irr_idx_q
-        self.sym_idx_q = sym_idx_q
+        self.sym_idx_q = self._sym_row_ids_search[
+            np.asarray(sym_idx_q_search, dtype=np.int32)]
         self.q_irr_kgrid_int = q_irr_kgrid_int
         # q_irr_full_idx[i_irr] = full-BZ row index for IBZ q i_irr.
         # Derived as first-occurrence of i_irr in irr_idx_q (ordered to match
@@ -2417,6 +2407,25 @@ class SymMaps:
         """Return shortest-image fractional-coordinate differences."""
         delta = np.asarray(points, dtype=np.float64) - np.asarray(target, dtype=np.float64)[None, :]
         return delta - np.round(delta)
+
+    def _match_file_wedge_rows(self, wfn):
+        """Map stored WFN k rows to the generated uniform grid or refuse."""
+        rows = np.empty(int(wfn.nkpts), dtype=np.int32)
+        stored = np.asarray(wfn.kpoints, dtype=np.float64)
+        for kirr, kpoint in enumerate(stored):
+            metric = np.max(np.abs(self._periodic_delta(
+                self.unfolded_kpts, kpoint)), axis=1)
+            hit = int(np.argmin(metric))
+            if metric[hit] > 1.0e-6:
+                raise RuntimeError(
+                    f"SymMaps: irreducible k-point {kirr} {kpoint.tolist()} "
+                    f"is not on the uniform "
+                    f"{tuple(int(x) for x in np.asarray(wfn.kgrid))} k-grid "
+                    f"that this WFN's own kgrid/shift generate; closest row "
+                    f"{hit} is {self.unfolded_kpts[hit].tolist()}, off by "
+                    f"{metric[hit]:.3e}. Fix the file's k-list or kgrid/shift.")
+            rows[kirr] = hit
+        return rows
 
     def _generate_uniform_full_kpoints(self, wfn):
         """Return the full uniform crystal-coordinate k-grid implied by the WFN metadata."""
@@ -2462,13 +2471,32 @@ class SymMaps:
 
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
         del kpoint_map  # kept in signature for compatibility with older callers
-        # Searches ``_sym_mats_k_search`` — the full TRS-augmented table
-        # unless the DFT reference check says TRS is broken, in which case
-        # only the spatial half is eligible.  The planner owns the registered
-        # highest-parent/lowest-operation tie break and exposes coverage.
-        irk_to_k_map, irk_sym_map, matched = (
+        # Searches ``_sym_mats_k_search``: the full paired table when global
+        # TRS holds, the schema-typed unitary/antiunitary rows when it does
+        # not, or the presumed-unitary half in the receipt-free fallback.
+        # The planner owns the registered highest-parent/lowest-operation
+        # tie break and exposes coverage.
+        irk_to_k_map, irk_sym_map_search, matched = (
             map_full_kpoints_to_irreducible(
                 wfn.kpoints, self._sym_mats_k_search, full_kpts))
+        irk_sym_map = self._sym_row_ids_search[
+            np.asarray(irk_sym_map_search, dtype=np.int32)]
+
+        if self.qe_symmetry_binding is not None and not np.all(matched):
+            bad = np.where(~matched)[0]
+            pure_tr_note = (
+                " QE allowed pure k<->-k folding, but the measured global "
+                "TRS verdict forbids using it."
+                if (not self.trs_allowed
+                    and bool(self.qe_permitted_pure_time_reversal)) else "")
+            raise ValueError(
+                f"SymMaps: authenticated QE symmetry operations are "
+                f"incomplete for this WFN: {bad.size} of "
+                f"{full_kpts.shape[0]} full-BZ k-points cannot be reached "
+                f"using {len(self._sym_row_ids_search)} authorized typed "
+                f"rows from {self.qe_schema_path}. First unmatched: "
+                f"{full_kpts[bad[0]].tolist()}. Refusing rather than adding "
+                f"an unrecorded spatial or antiunitary operation.{pure_tr_note}")
 
         if not self.trs_allowed and not np.all(matched):
             n_bad = int(np.count_nonzero(~matched))
@@ -2664,45 +2692,88 @@ class SymMaps:
             and np.array_equal(
                 np.asarray(self.q_irr_kgrid_int, dtype=np.int32), q_full))
 
-    @property
-    def R_cart_forward(self):
-        """The FORWARD Cartesian rotation per op: ``R_cart[s].T``.
+    def operation_rows(self, rows):
+        """Return reciprocal action, spatial translation and TR bit.
 
-        ``R_cart`` is the cartesian image of ``mtrx``, and ``mtrx`` is the
-        INVERSE real-space rotation.  ``syms_crystal_to_cartesian``'s own
-        caution says what follows, and it is quoted here rather than
-        paraphrased because paraphrasing it is how it got lost the first
-        time (061f8a3 added it as a comment on the wrong side of the call):
-
-            CAUTION FOR OTHER CONSUMERS.  Because ``mtrx`` is the inverse
-            real-space rotation while ``mtrx.T`` is what acts on k and G,
-            this matrix is the INVERSE of the Cartesian rotation that
-            carries k_irr to S·k_irr.  ``get_spinor_rotations`` is
-            unaffected — its quaternion extraction uses the transposed
-            Shepperd form, so the two inversions cancel — but anything
-            rotating a Cartesian INDEX (a dipole or any rank≥1 operator)
-            must use the TRANSPOSE of this matrix.  Using it untransposed
-            leaves norms, hermiticity and traces intact, so the error is
-            invisible to the obvious checks.
-
-        So: ``R_cart`` for the spinor sandwich, ``R_cart_forward`` for a
-        Cartesian INDEX.  This property is the named spelling of "the
-        transpose of this matrix" — an ADDITIVE surface, with no rename and
-        no change to either live consumer's math (both are provably
-        self-consistent today; their adoption of the name is registered
-        post-wave).  Its whole value is that the wrong pattern now has a
-        right one to sit beside, and the docs' Antipatterns section can
-        name it: *rotating a Cartesian index with ``sym.R_cart[s]``
-        untransposed*.
-
-        Shape and rows are ``R_cart``'s: ``(2·ntran, 3, 3)``, spatial ops
-        first, the time-reversal half duplicating them with the sign
-        convention ``R_cart[ntran:] = −R_cart[:ntran]``.  Orthogonal per
-        op, so the transpose IS the inverse — which is exactly why the two
-        spellings are so easy to confuse and so hard to tell apart by any
-        norm-, trace- or hermiticity-based check.
+        Rows use the one canonical ``[unitary, antiunitary]`` layout.  The
+        reciprocal matrix already contains the antiunitary minus; the
+        translation always belongs to the underlying spatial Seitz row.
         """
-        return np.swapaxes(np.asarray(self.R_cart), -1, -2)
+        raw = np.asarray(rows)
+        if (not np.issubdtype(raw.dtype, np.integer)
+                or np.any(raw < 0)):
+            raise ValueError(
+                f"SymMaps.operation_rows: rows must be nonnegative integers; "
+                f"got {raw!r}.")
+        idx = raw.astype(np.int32, copy=False)
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        if np.any(idx >= 2 * n):
+            raise ValueError(
+                f"SymMaps.operation_rows: row outside [0,{2 * n}); "
+                f"got {raw!r}.")
+        spatial = idx % n
+        return (np.asarray(self.sym_mats_k)[idx],
+                np.asarray(self.translations)[spatial], idx >= n)
+
+    def fft_grid_pullback(self, rows, fft_grid, *, validate=True):
+        """Return real-space FFT pullbacks for canonical operation rows."""
+        raw = np.asarray(rows)
+        if raw.ndim != 1:
+            raise ValueError(
+                "SymMaps.fft_grid_pullback: rows must be rank one; "
+                f"got {raw.shape}.")
+        _, translations, _ = self.operation_rows(raw)
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        spatial = raw.astype(np.int32, copy=False) % n
+        from .orbit_syms import fft_grid_pullback_perm
+        return fft_grid_pullback_perm(
+            np.asarray(self.sym_matrices)[spatial], translations, fft_grid,
+            validate=validate)
+
+    def cartesian_action(self, rows, *, axial, time_odd):
+        """Forward action for a typed Cartesian index.
+
+        ``axial`` selects ``det(R) R`` instead of the polar ``R``;
+        ``time_odd`` supplies the minus on antiunitary rows.  Antiunitary
+        complex conjugation is applied by the tensor action, not this real
+        representation table.
+        """
+        if not isinstance(axial, (bool, np.bool_)):
+            raise TypeError("SymMaps.cartesian_action: axial must be bool.")
+        if not isinstance(time_odd, (bool, np.bool_)):
+            raise TypeError("SymMaps.cartesian_action: time_odd must be bool.")
+        raw = np.asarray(rows)
+        _, _, antiunitary = self.operation_rows(raw)
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        spatial = raw.astype(np.int32, copy=False) % n
+        forward = np.swapaxes(
+            np.asarray(self.R_cart[:n], dtype=np.float64), -1, -2)[spatial]
+        if axial:
+            forward = (np.linalg.det(forward)[..., None, None] * forward)
+        if time_odd:
+            forward = np.where(
+                np.asarray(antiunitary)[..., None, None], -forward, forward)
+        return forward
+
+    def spinor_action(self, rows, *, nspinor):
+        """Canonical unitary/antiunitary spinor factor for operation rows."""
+        self.operation_rows(rows)  # validate against this instance
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        return spinor_rotation_for_sym_row(
+            self.U_spinor, rows, n, nspinor=nspinor)
+
+    def reciprocal_phase(self, row, carriers):
+        """Nonsymmorphic phase for reciprocal carriers under one typed row."""
+        reciprocal, translation, _ = self.operation_rows(row)
+        return tau_phase_row(reciprocal, translation, carriers)
+
+    def unfold_wavefunction(self, coefficients, *, row, g_parent):
+        """Apply one complete spatial/translation/TR wavefunction action."""
+        self.operation_rows(row)  # validate against this instance
+        return unfold_psi(
+            coefficients, sym_idx=row, g_kbar=g_parent,
+            sym_mats_k=self.sym_mats_k, translations=self.translations,
+            U_spinor_spatial=self.U_spinor)
 
     @staticmethod
     def get_spinor_rotations(wfn, sym_matrices_cart):
@@ -3401,6 +3472,46 @@ def unfold_file_wedge_to_full_bz(sym, data):
     return star_broadcast(data, irr, sidx, nss,
                           irr_labels=np.arange(n_rows, dtype=np.int32),
                           trs_reference="ibz_slab")
+
+
+def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
+    """FILE-wedge polar band matrix → full BZ, on the input's backend.
+
+    This is the canonical route for a cheap same-k observable such as
+    ``<m k|v_i|n k>``.  The stored rows have no operation applied.  The
+    ordinary file-wedge unfold first gathers their band matrices and applies
+    antiunitary conjugation.  The target row's forward Cartesian action then
+    mixes the explicit polar-vector axis.  Its antiunitary half already
+    contains the time-odd minus sign, so no second velocity-parity rule is
+    accepted here.
+
+    Nonsymmorphic translation phases cancel between the equal-k bra and ket.
+    Quantities with distinct endpoints must instead use the directed-edge
+    service, whose endpoint sewing carries those phases.
+
+    ``data`` has shape ``(sym.nk_red, ..., 3, nb, nb)`` by default.  A NumPy
+    input stays on the host; a JAX input stays on device and keeps its band
+    sharding.
+    """
+    out = unfold_file_wedge_to_full_bz(sym, data)
+    sym_rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
+    rotations = np.asarray(sym.cartesian_action(
+        sym_rows, axial=False, time_odd=True), dtype=np.float64)
+    if sym_rows.shape != (int(sym.nk_tot),):
+        raise ValueError(
+            "unfold_file_wedge_polar_matrix: sym.sym_idx_k must have one "
+            f"row per full k-point; got {sym_rows.shape}, expected "
+            f"({int(sym.nk_tot)},).")
+    if (rotations.ndim != 3 or rotations.shape[1:] != (3, 3)
+            or rotations.shape[0] != sym_rows.shape[0]):
+        raise ValueError(
+            "unfold_file_wedge_polar_matrix: invalid canonical symmetry-row "
+            f"map {sym_rows.shape} for Cartesian actions {rotations.shape}.")
+    return apply_band_matrix_symmetry(
+        out,
+        component_mix=rotations,
+        component_axis=component_axis,
+    )
 
 
 def reduce_full_bz_to_file_wedge(sym, data):

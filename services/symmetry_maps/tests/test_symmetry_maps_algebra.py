@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import time
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -48,6 +49,8 @@ from symmetry_maps import (SymMaps, apply_spinor_rotation,
                            kgrid_shift_map, q_negation_index,
                            recover_symmorphic_density_point_group,
                            spinor_rotation_for_sym_row, tau_phase_row,
+                           tau_phase_row_jax,
+                           unfold_reciprocal_carriers,
                            unfold_psi)
 from symmetry_maps.maps import _I_SIGMA_Y
 
@@ -498,6 +501,33 @@ def test_tau_phase_row_is_none_at_tau_zero():
     # si_cohsex_debug deck (tnp = π ⇒ τ_frac = 1/2).
     np.testing.assert_allclose(tau_phase_row(-S, tau, g), np.conj(ph),
                                atol=1e-14)
+
+
+def test_tau_phase_row_jax_matches_the_host_convention():
+    g = np.array([
+        [0.0, 0.0, 0.0], [1.25, -2.0, 3.0], [-4.0, 5.5, 1.0],
+    ], dtype=np.float64)
+    S = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=np.int32)
+    tau = np.array([np.pi / 2, -np.pi / 3, np.pi / 5])
+    np.testing.assert_allclose(
+        np.asarray(tau_phase_row_jax(S, tau, g)),
+        tau_phase_row(S, tau, g), rtol=0.0, atol=2e-15)
+    np.testing.assert_array_equal(
+        np.asarray(tau_phase_row_jax(S, np.zeros(3), g)),
+        np.ones(len(g), dtype=np.complex128))
+
+
+def test_unfold_reciprocal_carriers_has_one_numpy_jax_convention():
+    g = np.asarray([[0, 0, 0], [1, -2, 3], [-4, 5, 1]], dtype=np.int32)
+    S = np.asarray([[0, 1, 0], [-1, 0, 0], [0, 0, -1]], dtype=np.int32)
+    shift = np.asarray([2, -1, 3], dtype=np.int32)
+    expected = np.einsum('ij,gj->gi', S, g) - shift[None, :]
+    np.testing.assert_array_equal(
+        unfold_reciprocal_carriers(S, g, shift), expected)
+    np.testing.assert_array_equal(
+        np.asarray(unfold_reciprocal_carriers(
+            jnp.asarray(S), jnp.asarray(g), jnp.asarray(shift))),
+        expected)
 
 
 def test_unfold_psi_refuses_a_sym_table_that_is_not_twice_ntran():

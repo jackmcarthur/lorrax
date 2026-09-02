@@ -44,6 +44,8 @@ Public surface
   ``sym_matrices``, ``translations``, …).  Drop-in source.
 * :meth:`load` — one call: ψ array for a (band_range, k) window.
 * :meth:`bands` — band-chunked iterator for GW driver loops.
+* :meth:`full_k_parent_groups` / :meth:`unfold_parent_to_full_k` — ordered
+  parent/star streaming without re-reading a raw IBZ row for every child.
 * :meth:`gvecs` — cached G-vector lists per k-set.
 * :meth:`ngk_valid` — per-k logical ngk (for callers that care).
 * :meth:`get_gvec_nk` — deprecated thin shim for legacy vcoul / qp_wfn.
@@ -232,11 +234,20 @@ class WfnLoader:
         *,
         mesh: Mesh | None = None,
         backend: Literal["auto", "eager", "phdf5"] = "auto",
+        qe_schema: str | Path | None = None,
     ) -> None:
         self._path = str(path)
         self._filename = self._path  # legacy WFNReader compat
         self._mesh = mesh
         self._backend_was_auto = (backend == "auto")
+        # ``None`` means bounded WFN-anchored discovery, not "disabled".
+        # Resolution is lazy at symmetry initialization so header-only users
+        # pay no XML cost.  An explicit path is authenticated and mismatch is
+        # a refusal rather than a fallback.
+        self._qe_schema_request = qe_schema
+        self._qe_symmetry_checked = False
+        self.qe_symmetry_binding = None
+        self.qe_symmetry_diagnostic = "symmetry has not been initialized"
 
         if backend == "auto":
             backend = self._auto_pick_backend()
@@ -358,6 +369,11 @@ class WfnLoader:
         # different meshes (rare) get distinct buffers; same loader+mesh
         # always returns the same ``jax.Array``.
         self._gvecs_dev_cache: dict[tuple, "jax.Array"] = {}
+        # One parent-G row for the streamed symmetry action.  Parent-major
+        # consumers reuse it across band tiles and every child in that star;
+        # replacing the single slot at the next parent keeps residency O(1)
+        # in k even for extremely large reciprocal spheres.
+        self._parent_unfold_g_cache: tuple[int, "jax.Array"] | None = None
 
         # Two-component DFT-reference TRS check (default on).  It compares
         # occupied one-particle density operators in G space, using only raw
@@ -501,6 +517,7 @@ class WfnLoader:
             except Exception:
                 pass
             self._slab_io = None
+        self._parent_unfold_g_cache = None
 
     def __enter__(self) -> "WfnLoader":
         return self
@@ -687,6 +704,16 @@ class WfnLoader:
         """
         from symmetry_maps import SymMaps
         if self._sym is None:
+            if not self._qe_symmetry_checked:
+                from symmetry_maps import resolve_qe_symmetry_binding
+                binding, diagnostic = resolve_qe_symmetry_binding(
+                    self,
+                    wfn_path=self._path,
+                    schema=self._qe_schema_request,
+                )
+                self.qe_symmetry_binding = binding
+                self.qe_symmetry_diagnostic = diagnostic
+                self._qe_symmetry_checked = True
             self._sym = SymMaps(self._sym_wfn_stub())
         return self._sym
 
@@ -705,6 +732,7 @@ class WfnLoader:
             kgrid=self.kgrid,
             shift=self.shift,
             nkpts=int(self.nkpts),
+            nspinor=int(self.nspinor),
             bvec=self.bvec,
             avec=self.avec,
             atom_types=self.atom_types,
@@ -718,6 +746,10 @@ class WfnLoader:
             # select time-reversal rows when this is False, whatever the
             # ``ntran``/k-weight flags imply.
             trs_holds=bool(getattr(self, "trs_holds", True)),
+            # Authenticated QE operation typing, or an explicit explanation
+            # that SymMaps must announce before using the WFN-only fallback.
+            qe_symmetry_binding=self.qe_symmetry_binding,
+            qe_symmetry_diagnostic=self.qe_symmetry_diagnostic,
         )
 
     def _resolve_k(self, k: KSpec) -> tuple[np.ndarray, bool]:
@@ -745,6 +777,197 @@ class WfnLoader:
         if isinstance(k, str):
             return (k,)
         return ("list", tuple(int(v) for v in k))
+
+    def full_k_parent_groups(
+        self,
+        full_k: Sequence[int] | None = None,
+    ) -> tuple[tuple[int, np.ndarray], ...]:
+        """Group ordered full-BZ rows by their raw WFN parent.
+
+        This is the loader-side star-order primitive for streaming consumers.
+        A caller receives ``(parent, children)`` pairs, loads the raw
+        ``parent`` row once, and realizes the listed full-BZ ``children`` in
+        their requested order.  The caller never reads or re-groups
+        ``SymMaps.irr_idx_k`` itself.
+
+        Parent groups follow first occurrence in ``full_k``; rows within a
+        group retain their input order.  The default is the canonical complete
+        full-BZ row order.  Duplicate requested rows refuse because inserting
+        the same logical full-k output twice would make the streaming schedule
+        ambiguous.
+        """
+        sym = self._ensure_sym()
+        nk_full = int(sym.nk_tot)
+        if full_k is None:
+            requested = np.arange(nk_full, dtype=np.int32)
+        else:
+            raw = np.asarray(full_k)
+            if raw.ndim != 1 or not np.issubdtype(raw.dtype, np.integer):
+                raise ValueError(
+                    "WfnLoader.full_k_parent_groups: full_k must be a "
+                    f"one-dimensional integer sequence; got {raw!r}.")
+            if np.any(raw < 0) or np.any(raw >= nk_full):
+                raise ValueError(
+                    "WfnLoader.full_k_parent_groups: full-k row outside "
+                    f"[0,{nk_full}); got {raw.tolist()}.")
+            requested = raw.astype(np.int32, copy=False)
+        if np.any(requested < 0) or np.any(requested >= nk_full):
+            raise ValueError(
+                "WfnLoader.full_k_parent_groups: full-k row outside "
+                f"[0,{nk_full}); got {requested.tolist()}.")
+        parent_for_full = np.asarray(sym.irr_idx_k, dtype=np.int32)
+        if parent_for_full.shape != (nk_full,):
+            raise ValueError(
+                "WfnLoader.full_k_parent_groups: SymMaps parent table has "
+                f"shape {parent_for_full.shape}, want {(nk_full,)}.")
+        requested_parents = parent_for_full[requested]
+        if (np.any(requested_parents < 0)
+                or np.any(requested_parents >= int(self.nkpts))):
+            raise ValueError(
+                "WfnLoader.full_k_parent_groups: SymMaps parent row outside "
+                f"the raw WFN k axis [0,{int(self.nkpts)}); got "
+                f"{requested_parents.tolist()}.")
+
+        # Python dict insertion order gives the required stable order in one
+        # pass: first parent occurrence orders groups, and append order keeps
+        # each parent's requested children ordered.  Do not boolean-scan the
+        # complete k axis once per parent; that turns a star schedule into
+        # O(n_parent * nk_full) host work on dense production grids.
+        grouped: dict[int, list[int]] = {}
+        seen_children: set[int] = set()
+        for child_value, parent_value in zip(requested, requested_parents):
+            child = int(child_value)
+            if child in seen_children:
+                raise ValueError(
+                    "WfnLoader.full_k_parent_groups: duplicate full-k rows "
+                    "are not a valid streaming schedule; got "
+                    f"{requested.tolist()}.")
+            seen_children.add(child)
+            grouped.setdefault(int(parent_value), []).append(child)
+        return tuple(
+            (parent, np.asarray(children, dtype=np.int32))
+            for parent, children in grouped.items()
+        )
+
+    def unfold_parent_to_full_k(
+        self,
+        parent_psi: jax.Array,
+        *,
+        parent: int,
+        full_k: int,
+        bispinor: bool = False,
+        bispinor_lift: str = "raw",
+    ) -> jax.Array:
+        """Realize one full-BZ child from one already-loaded raw parent.
+
+        ``parent_psi`` must be the one-row, raw 1c/2c G-flat payload returned
+        by ``load(..., k=IBZRows((parent,)))`` with the canonical band-sharded
+        layout.  Rotation, nonsymmorphic phase, antiunitary conjugation and
+        spinor action come from the loader's cached typed ``SymMaps`` tables.
+        The optional four-component lift is deliberately applied *after* this
+        two-component unfold, exactly as in :meth:`load`; it therefore retains
+        the existing ``sigma.(k+G)`` small-component convention instead of
+        inventing a block-diagonal 4c symmetry action.
+
+        The method validates that ``full_k`` really belongs to ``parent``.
+        It returns a one-k carrier with the same band/G sharding, so callers
+        can keep a strict one-k transform workspace while reusing the parent
+        read for every child in its star.
+        """
+        if self._mesh is None:
+            raise ValueError(
+                "WfnLoader.unfold_parent_to_full_k requires the loader's "
+                "mesh; construct with mesh= or call adopt_mesh first.")
+        if bispinor and int(self.nspinor) != 2:
+            raise ValueError(
+                "WfnLoader.unfold_parent_to_full_k(bispinor=True) "
+                "requires a 2-spinor WFN; file has nspinor="
+                f"{int(self.nspinor)}.")
+        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
+            raise ValueError(
+                "bispinor_lift selects a four-spinor transform and requires "
+                "bispinor=True")
+        parent = int(parent)
+        full_k = int(full_k)
+        sym = self._ensure_sym()
+        nk_full = int(sym.nk_tot)
+        if parent < 0 or parent >= int(self.nkpts):
+            raise ValueError(
+                "WfnLoader.unfold_parent_to_full_k: parent outside the raw "
+                f"WFN k axis [0,{int(self.nkpts)}); got {parent}.")
+        if full_k < 0 or full_k >= nk_full:
+            raise ValueError(
+                "WfnLoader.unfold_parent_to_full_k: full_k outside "
+                f"[0,{nk_full}); got {full_k}.")
+        expected_parent = int(np.asarray(
+            sym.irr_idx_k, dtype=np.int32)[full_k])
+        if expected_parent != parent:
+            raise ValueError(
+                "WfnLoader.unfold_parent_to_full_k: requested child does not "
+                f"belong to the supplied parent: full_k={full_k} maps to "
+                f"parent {expected_parent}, got parent={parent}.")
+
+        shape = tuple(int(v) for v in parent_psi.shape)
+        expected_tail = (int(self.nspinor), int(self.ngkmax))
+        if (len(shape) != 4 or shape[0] != 1
+                or shape[2:] != expected_tail):
+            raise ValueError(
+                "WfnLoader.unfold_parent_to_full_k: parent_psi must be "
+                "(1, nb, nspinor, ngkmax) in the raw WFN representation; "
+                f"got {shape}, want tail {expected_tail}.")
+        sharding = getattr(parent_psi, "sharding", None)
+        expected_spec = P(None, ("x", "y"), None, None)
+        if (not isinstance(sharding, NamedSharding)
+                or sharding.mesh != self._mesh
+                or sharding.spec != expected_spec):
+            raise ValueError(
+                "WfnLoader.unfold_parent_to_full_k requires the canonical "
+                f"band-sharded parent layout {expected_spec}; got "
+                f"{sharding!r}.")
+
+        static = self._ensure_phdf5_static()
+        sym_row = int(np.asarray(sym.sym_idx_k, dtype=np.int32)[full_k])
+        _, translation_host, _ = sym.operation_rows(sym_row)
+        with_phase = bool(np.any(
+            np.abs(np.asarray(translation_host, dtype=np.float64)) > 1e-12))
+        g_parent = None
+        if with_phase or bispinor:
+            g_parent = self._parent_g_row_device(parent)
+        if with_phase:
+            # Keep exp() in its own ngk-vector executable. Otherwise XLA may
+            # fuse it into the band/spin multiply and recompute it per
+            # coefficient. The returned row is consumed immediately and is
+            # never cached across children.
+            phase_child = _parent_phase_kernel(self._mesh)(
+                static["reciprocal_per_full"][full_k],
+                static["translation_per_full"][full_k],
+                g_parent,
+            )
+            child = _parent_to_full_k_unfold_kernel(
+                self._mesh, True)(
+                    parent_psi,
+                    static["U_per_full"][full_k],
+                    phase_child,
+                    static["tr_mask_per_full"][full_k],
+                )
+        else:
+            child = _parent_to_full_k_unfold_kernel(
+                self._mesh, False)(
+                    parent_psi,
+                    static["U_per_full"][full_k],
+                    static["tr_mask_per_full"][full_k],
+                )
+        if bispinor:
+            child = _parent_bispinor_lift_kernel(
+                self._mesh, str(bispinor_lift).strip().lower())(
+                    child,
+                    g_parent,
+                    static["reciprocal_per_full"][full_k],
+                    static["umklapp_per_full"][full_k],
+                    static["kvec_per_full"][full_k],
+                    static["bvec_cart_bohr"],
+                )
+        return child
 
     # ------------------------------------------------------------------
     # G-vector and ngk_valid accessors
@@ -809,6 +1032,8 @@ class WfnLoader:
                 end = start + int(self.ngk[int(ik)])
                 rows.append(self._gvecs_raw[start:end])
         else:
+            from symmetry_maps import unfold_reciprocal_carriers
+
             sym = self._ensure_sym()
             rows = []
             for nk in k_idxs:
@@ -820,14 +1045,15 @@ class WfnLoader:
                 nk_int = int(nk)
                 sym_idx = int(sym.sym_idx_k[nk_int])
                 kbar = int(sym.irr_idx_k[nk_int])
-                sym_krep = np.asarray(
-                    sym.sym_mats_k[sym_idx], dtype=np.int32)
+                sym_krep, _, _ = sym.operation_rows(sym_idx)
+                sym_krep = np.asarray(sym_krep, dtype=np.int32)
                 start = int(self._kpt_starts[kbar])
                 end = start + int(self.ngk[kbar])
                 k_gvecs = self._gvecs_raw[start:end]
                 Gkk = sym.get_umklapp_vector(
                     self, nk_int, sym_idx, kbar, sym_krep)
-                rows.append(np.einsum('ij,kj->ki', sym_krep, k_gvecs) - Gkk)
+                rows.append(unfold_reciprocal_carriers(
+                    sym_krep, k_gvecs, Gkk))
 
         # ``ngkmax=self.ngkmax`` (the FILE's max), not max(len(rows)):
         # an explicit k-subset may not contain the widest k, but every
@@ -1083,15 +1309,130 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # phdf5 backend — collective FFI read + on-device unfold
     # ------------------------------------------------------------------
+    def _host_parent_g_row(self, parent: int) -> np.ndarray:
+        """Return one zero-padded raw-parent G row for a device action."""
+        parent = int(parent)
+        if parent < 0 or parent >= int(self.nkpts):
+            raise ValueError(
+                "WfnLoader parent-G row outside the raw WFN k axis "
+                f"[0,{int(self.nkpts)}); got {parent}.")
+        ngk = int(self.ngk[parent])
+        start = int(self._kpt_starts[parent])
+        row = np.zeros((int(self.ngkmax), 3), dtype=np.int32)
+        row[:ngk] = self._gvecs_raw[start:start + ngk]
+        return row
+
+    def _parent_g_row_device(self, parent: int) -> jax.Array:
+        """Stage at most one replicated parent-G row per loader."""
+        parent = int(parent)
+        cached = self._parent_unfold_g_cache
+        if cached is not None and cached[0] == parent:
+            return cached[1]
+        host_row = self._host_parent_g_row(parent)
+        # Every preceding child is synchronized by the streaming consumer.
+        # Drop the sole old device reference before allocating its successor
+        # so a parent transition does not transiently require two huge rows.
+        self._parent_unfold_g_cache = None
+        del cached
+        sharding = NamedSharding(self._mesh, P(None, None))
+        row = device_put_process_local(
+            host_row, sharding)
+        self._parent_unfold_g_cache = (parent, row)
+        return row
+
+    def full_k_box_index_one_dev(self, full_k: int) -> jax.Array:
+        """Build one full-zone child's FFT gather index on device.
+
+        The general :meth:`box_index_dev` API intentionally caches a complete
+        requested k set. A strict one-k parent stream must not ask it for
+        ``"full_bz"``: that would retain both ``O(nk*ngkmax)`` host G vectors
+        and an ``O(nk*n_r)`` replicated device index. This door instead
+        reuses the loader's single parent-G slot and returns only
+        ``(1,nx,ny,nz)`` for the requested child.
+        """
+        if self._mesh is None:
+            raise ValueError(
+                "WfnLoader.full_k_box_index_one_dev requires the loader's "
+                "mesh; construct with mesh= or call adopt_mesh first.")
+        full_k = int(full_k)
+        sym = self._ensure_sym()
+        nk_full = int(sym.nk_tot)
+        if full_k < 0 or full_k >= nk_full:
+            raise ValueError(
+                "WfnLoader.full_k_box_index_one_dev: full_k outside "
+                f"[0,{nk_full}); got {full_k}.")
+        parent = int(np.asarray(sym.irr_idx_k, dtype=np.int32)[full_k])
+        static = self._ensure_phdf5_static()
+        return _parent_box_index_kernel(
+            self._mesh, tuple(int(v) for v in self.fft_grid),
+            int(self.ngkmax))(
+                self._parent_g_row_device(parent),
+                static["reciprocal_per_full"][full_k],
+                static["umklapp_per_full"][full_k],
+                static["ngk_per_parent"][parent],
+            )
+
+    def _host_phase_rows_for_full_k(
+        self, full_k_rows: np.ndarray,
+    ) -> np.ndarray:
+        """Build canonical nonsymmorphic phases for requested full-k rows.
+
+        ``SymMaps.reciprocal_phase`` remains the physics owner.  This helper
+        owns only loader padding and row selection.  It returns exactly the
+        requested rows and never caches them, so one-child parent streaming
+        cannot grow into a dense ``(nk_full, ngkmax)`` resident table.
+        """
+        raw = np.asarray(full_k_rows)
+        sym = self._ensure_sym()
+        nk_full = int(sym.nk_tot)
+        if (raw.ndim != 1 or not np.issubdtype(raw.dtype, np.integer)
+                or np.any(raw < 0) or np.any(raw >= nk_full)):
+            raise ValueError(
+                "WfnLoader typed-action rows must be one-dimensional full-k "
+                f"indices in [0,{nk_full}); got {raw!r}.")
+        rows = raw.astype(np.int32, copy=False)
+        sym_rows_all = np.asarray(sym.sym_idx_k, dtype=np.int32)
+        parents_all = np.asarray(sym.irr_idx_k, dtype=np.int32)
+        if sym_rows_all.shape != (nk_full,) or parents_all.shape != (nk_full,):
+            raise ValueError(
+                "WfnLoader typed-action map shape mismatch: "
+                f"sym={sym_rows_all.shape}, parent={parents_all.shape}, "
+                f"want {(nk_full,)}.")
+        sym_rows = sym_rows_all[rows]
+        parents = parents_all[rows]
+        if (np.any(parents < 0)
+                or np.any(parents >= int(self.nkpts))):
+            raise ValueError(
+                "WfnLoader typed-action parent row outside the raw WFN k "
+                f"axis [0,{int(self.nkpts)}); got {parents.tolist()}.")
+
+        ngkmax = int(self.ngkmax)
+        phase = np.ones((len(rows), ngkmax), dtype=np.complex128)
+        for out, (sym_row, parent) in enumerate(zip(sym_rows, parents)):
+            ngk_k = int(self.ngk[int(parent)])
+            start = int(self._kpt_starts[int(parent)])
+            g_parent = self._gvecs_raw[start:start + ngk_k]
+            phase_valid = sym.reciprocal_phase(int(sym_row), g_parent)
+            if phase_valid is not None:
+                phase_valid = np.asarray(phase_valid, dtype=np.complex128)
+                if (phase_valid.shape != (ngk_k,)
+                        or not np.all(np.isfinite(phase_valid))):
+                    raise ValueError(
+                        "SymMaps.reciprocal_phase returned an invalid row: "
+                        f"shape={phase_valid.shape}, want {(ngk_k,)}, "
+                        f"finite={bool(np.all(np.isfinite(phase_valid)))}.")
+                phase[out, :ngk_k] = phase_valid
+        return np.ascontiguousarray(phase)
+
     def _ensure_phdf5_static(self) -> dict:
         """Lazy build of the per-full-BZ-k symmetry tables on device.
 
-        Builds once per ``WfnLoader`` instance; subsequent ``load()``
-        calls reuse the staged arrays.  Mirrors
-        ``PhdfWfnReader._build_symmetry_tables`` +
-        ``_compute_phases_all_full_k`` + ``_device_put_static_tables``
-        but without the FFT-box machinery (which lives downstream in
-        ``wfn_transforms``).
+        Builds once per ``WfnLoader`` instance; subsequent ``load()`` calls
+        reuse the O(nk) parent, row, TR, reciprocal, translation and spin
+        tables. Bulk nonsymmorphic phase rows are request-local through
+        :meth:`_host_phase_rows_for_full_k`; parent streaming generates one
+        child phase inside the device action. Neither route retains
+        O(nk*ngkmax) phase state.
 
         Touches NO FFI: these are numpy tables staged process-locally, so
         the collective handle lives in :meth:`_ensure_slab_io` instead of
@@ -1104,62 +1445,27 @@ class WfnLoader:
 
         sym = self._ensure_sym()
         nk_full = int(sym.nk_tot)
-        ngkmax = int(self.ngkmax)
         ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)[:nk_full]
         sym_idx_per_full = np.asarray(sym.sym_idx_k, dtype=np.int32)[:nk_full]
         n_tran = int(sym.sym_matrices.shape[0])
-        tr_mask = (sym_idx_per_full >= n_tran).astype(np.bool_)
-
-        # Per-k spinor rotation matrix, single-sourced via the ψ-unfold
-        # spinor rule (spatial rows → ``sym.U_spinor[s]``; TRS rows →
-        # ``iσ_y · conj(sym.U_spinor[s − ntran])``, the T = iσ_y K rule).
-        # See ``common.symmetry_maps.{unfold_psi,trs_augment_U}`` and
-        # ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.  ``sym.U_spinor``
-        # is length ``ntran`` (PR3); the TRS half is built inside the helper.
-        # ``nspinor`` is NOT optional here.  ``sym.U_spinor`` is always
-        # (ntran, 2, 2) — it is built from the CARTESIAN rotations and
-        # knows nothing about how many components psi has — so on a scalar
-        # (nspinor=1) WFN the un-told helper hands back a 2x2; the former
-        # unfold einsum BROADCASTED the size-1 spinor axis instead of raising,
-        # and psi came back 2-component holding ``U[a,0]+U[a,1]`` times
-        # itself.  Told ``nspinor``, the helper returns the 1x1 identity and
-        # the static service application is a genuine no-op.  Registered
-        # nspinor=1 loader defect, fixed 2026-08-09;
-        # see ``tests/KNOWN_FAILURES.md``.
-        from symmetry_maps import trs_augment_U
-        U_per = trs_augment_U(
-            sym.U_spinor, sym_idx_per_full, n_tran,
-            nspinor=int(self.nspinor))                        # (nk_full, ns, ns)
-
-        # τ-phase per full-BZ k on the ibz-source ngkmax-padded G-list.
-        # Use the SAME formula for spatial and TRS rows:
-        #   phase = exp(-i (sym_mats_k[s] · G_kbar) · τ_{s_spatial})
-        # For TRS rows ``sym_mats_k[s] = -S_spatial`` so the formula yields
-        # ``exp(+i (S_spatial · G_kbar) · τ)``, which is ``conj`` of the
-        # spatial-row phase. Combined with the downstream kernel's
-        # ``where(tr_mask, conj(cnk), cnk)`` step, the per-element TRS rule
-        # ``ψ_full = (iσ_y · conj(U)) · conj(ψ_kbar) · conj(phase_spatial)``
-        # is reproduced. Pre-PR3 the TRS rows were set to 1 (skipped the
-        # phase entirely) — that bug fired on non-symmorphic non-inversion
-        # bispinor systems.
-        from symmetry_maps import tau_phase_row
-        phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
-        for nk in range(nk_full):
-            s = int(sym_idx_per_full[nk])
-            s_spatial = s - n_tran if s >= n_tran else s
-            ibz = int(ibz_per_full[nk])
-            ngk_k = int(self.ngk[ibz])
-            start = int(self._kpt_starts[ibz])
-            g_bar = self._gvecs_raw[start:start + ngk_k]
-            ph = tau_phase_row(
-                sym.sym_mats_k[s], sym.translations[s_spatial], g_bar)
-            if ph is not None:
-                phase[nk, :ngk_k] = ph
+        reciprocal_per, translation_per, tr_mask = sym.operation_rows(
+            sym_idx_per_full)
+        U_per = sym.spinor_action(
+            sym_idx_per_full, nspinor=int(self.nspinor))
+        umklapp_per = np.stack([
+            sym.get_umklapp_vector(
+                self, full_k, int(sym_idx_per_full[full_k]),
+                int(ibz_per_full[full_k]), reciprocal_per[full_k])
+            for full_k in range(nk_full)
+        ]).astype(np.int32, copy=False)
+        ngk_per_parent = np.asarray(self.ngk, dtype=np.int32)
+        kvec_per = np.asarray(sym.unfolded_kpts, dtype=np.float64)[:nk_full]
+        bvec_cart_bohr = (
+            float(self.blat) * np.asarray(self.bvec, dtype=np.float64))
 
         # Device-stage the static tables once.  Sharding choice mirrors
         # ``PhdfWfnReader._device_put_static_tables`` — all replicated
         # since they're per-full-BZ-k metadata, not per-band data.
-        rep0 = NamedSharding(self._mesh, P())
         rep1 = NamedSharding(self._mesh, P(None))
         rep2 = NamedSharding(self._mesh, P(None, None))
         rep3 = NamedSharding(self._mesh, P(None, None, None))
@@ -1167,18 +1473,23 @@ class WfnLoader:
         # On a multi-process mesh the latter fires JAX's silent
         # ``multihost_utils.assert_equal`` → ``process_allgather(tiled=True)``
         # per table (see ``common.collectives.device_put_process_local``).
-        # ``phase`` is the second of scorecard Y.3's two P-LINEAR loader
-        # allgathers: ``P·nk·ngkmax·16`` = 1.27 GB/rank at P=64, 2.85 GB
-        # projected at P=144.  Every rank computes these tables from the
-        # same file with the same code, so they are bit-identical by
-        # construction and the assertion buys nothing.
         self._phdf5_static_dev = {
             "ibz_per_full": device_put_process_local(ibz_per_full, rep1),
             "sym_idx_per_full": device_put_process_local(
                 sym_idx_per_full, rep1),
             "tr_mask_per_full": device_put_process_local(tr_mask, rep1),
+            "reciprocal_per_full": device_put_process_local(
+                reciprocal_per, rep3),
+            "translation_per_full": device_put_process_local(
+                translation_per, rep2),
+            "umklapp_per_full": device_put_process_local(
+                umklapp_per, rep2),
+            "ngk_per_parent": device_put_process_local(
+                ngk_per_parent, rep1),
+            "kvec_per_full": device_put_process_local(kvec_per, rep2),
+            "bvec_cart_bohr": device_put_process_local(
+                bvec_cart_bohr, rep2),
             "U_per_full": device_put_process_local(U_per, rep3),
-            "phase_per_full": device_put_process_local(phase, rep2),
             "n_tran": n_tran,
             "nk_full": nk_full,
         }
@@ -1325,8 +1636,11 @@ class WfnLoader:
         if unfold:
             U_k = jnp.take(static["U_per_full"],
                            jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
-            phase_k = jnp.take(static["phase_per_full"],
-                                jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            phase_sh = NamedSharding(self._mesh, P(None, None))
+            phase_k = device_put_process_local(
+                self._host_phase_rows_for_full_k(
+                    np.asarray(k_idxs, dtype=np.int32)),
+                phase_sh)
             tr_mask_k = jnp.take(static["tr_mask_per_full"],
                                   jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
             psi = unfold_jit(cnk_at_ibz, U_k, phase_k, tr_mask_k,
@@ -1665,9 +1979,7 @@ class WfnLoader:
           1. For each requested k, look up (sym_idx, kbar_idx, sym_krep).
           2. Read raw IBZ band-block from ``self._coeffs_raw`` at
              ``kpt_starts[kbar]:..+ngk[kbar]``; convert (re, im) → c128.
-          3. If TRS (sym_idx >= ntran): conjugate.
-             Else apply ``exp(-i (S·G_bar)·τ)`` per-G phase.
-          4. Apply U_spinor[sym_idx] rotation.
+          3. Apply the canonical rotation, translation phase and TR action.
           5. Place into output at ``[j, :nb_logical, :, :ngk]``; rest zero.
         """
         nb_logical = b_hi - b_lo
@@ -1688,9 +2000,7 @@ class WfnLoader:
             return out
 
         # Full-BZ unfold path.
-        from symmetry_maps import unfold_psi
         sym = self._ensure_sym()
-        ntran = int(sym.sym_matrices.shape[0])
         for j, nk in enumerate(k_idxs):
             nk_int = int(nk)
             sym_idx = int(sym.sym_idx_k[nk_int])
@@ -1702,14 +2012,8 @@ class WfnLoader:
             raw = self._coeffs_ds[b_lo:b_hi, :, start:end, :]
             cnk = raw[..., 0] + 1j * raw[..., 1]                    # (nb, ns, ngk_k)
             g_bar = self._gvecs_raw[start:end]                      # (ngk_k, 3)
-            cnk = unfold_psi(
-                cnk,
-                sym_idx=sym_idx,
-                g_kbar=g_bar,
-                sym_mats_k=sym.sym_mats_k,
-                translations=self.translations,
-                U_spinor_spatial=sym.U_spinor,
-            )
+            cnk = sym.unfold_wavefunction(
+                cnk, row=sym_idx, g_parent=g_bar)
             out[j, :nb_logical, :, :ngk_k] = cnk
         return out
 
@@ -1804,6 +2108,25 @@ def _sharded_zero_proto_fn(global_shape: tuple, dtype, sharding):
 # trace-cache hit on every inner op (``_where``, ``_take``,
 # ``broadcast_in_dim`` …) instead of re-tracing them on each call.
 
+
+def _apply_typed_2c_action(coeff_last, U, phase, antiunitary):
+    """Canonical typed action on spinor-last raw 1c/2c coefficients.
+
+    Callers own only their carrier layout: they move the spinor axis last and
+    shape the replicated row operands for broadcasting.  This helper owns the
+    physical order shared by collective unfolds and parent/star realization:
+    antiunitary conjugation, nonsymmorphic reciprocal phase, then the
+    canonical scalar/Pauli spinor factor.  The four-component lift is
+    deliberately downstream and never enters this action.
+    """
+    from symmetry_maps import apply_spinor_rotation
+
+    coeff = jnp.where(antiunitary, jnp.conj(coeff_last), coeff_last)
+    if phase is not None:
+        coeff = coeff * phase
+    return apply_spinor_rotation(U, coeff)
+
+
 @functools.lru_cache(maxsize=None)
 def _phdf5_unfold_kernel(
     mesh: Mesh,
@@ -1836,21 +2159,20 @@ def _phdf5_unfold_kernel(
     ``(n_k, nb_padded, ns, ngkmax)``.
     """
     if unfold:
-        from symmetry_maps import apply_spinor_rotation
-
         def _per_rank(cnk_at_ibz, U_per_k, phase_per_k, tr_mask_per_k,
                        position_in_reads):
             cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
             cnk = jnp.take(cnk, position_in_reads, axis=2)
-            cnk = jnp.where(
-                tr_mask_per_k[None, None, :, None], jnp.conj(cnk), cnk)
-            cnk = cnk * phase_per_k[None, None, :, :]
             # Normalize to spinor-last so symmetry_maps owns the same static
             # ns=1/ns=2 application as the eager host unfold.  U's inserted
             # singleton axes align k without materializing a broadcast.
             cnk_last = jnp.transpose(cnk, (0, 2, 3, 1))
-            cnk_last = apply_spinor_rotation(
-                U_per_k[None, :, None, :, :], cnk_last)
+            cnk_last = _apply_typed_2c_action(
+                cnk_last,
+                U_per_k[None, :, None, :, :],
+                phase_per_k[None, :, :, None],
+                tr_mask_per_k[None, :, None, None],
+            )
             # (bpr, n_k, ngkmax, ns) → (n_k, bpr, ns, ngkmax)
             return jnp.transpose(cnk_last, (1, 0, 3, 2))
 
@@ -1876,5 +2198,137 @@ def _phdf5_unfold_kernel(
     out_specs = P(None, ("x", "y"), None, None)        # (n_k, bpr→band, ns, ngkmax)
     return jax.jit(shard_map(
         _per_rank, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
+        check_vma=False,
+    ))
+
+
+@functools.lru_cache(maxsize=None)
+def _parent_phase_kernel(mesh: Mesh):
+    """One replicated ``ngk`` phase row, computed exactly once per G."""
+    from symmetry_maps import tau_phase_row_jax
+
+    return jax.jit(shard_map(
+        tau_phase_row_jax,
+        mesh=mesh,
+        in_specs=(P(None, None), P(None), P(None, None)),
+        out_specs=P(None),
+        check_vma=False,
+    ))
+
+
+@functools.lru_cache(maxsize=None)
+def _parent_box_index_kernel(
+    mesh: Mesh,
+    fft_grid: tuple[int, int, int],
+    ngkmax: int,
+):
+    """One child's replicated FFT gather index from one parent G row."""
+    from symmetry_maps import unfold_reciprocal_carriers
+
+    fft_grid = tuple(int(v) for v in fft_grid)
+    ngkmax = int(ngkmax)
+    n_rtot = int(np.prod(fft_grid))
+
+    def _per_rank(g_parent, reciprocal_child, umklapp_child, ngk_child):
+        g_child = unfold_reciprocal_carriers(
+            reciprocal_child, g_parent, umklapp_child)
+        gx = jnp.mod(g_child[:, 0], fft_grid[0])
+        gy = jnp.mod(g_child[:, 1], fft_grid[1])
+        gz = jnp.mod(g_child[:, 2], fft_grid[2])
+        cells = (gx * (fft_grid[1] * fft_grid[2])
+                 + gy * fft_grid[2] + gz)
+        valid = jnp.arange(ngkmax, dtype=jnp.int32) < ngk_child
+        # Pad carriers are sent out of bounds and dropped. Physical reciprocal
+        # vectors occupy unique FFT cells by the WFN contract, licensing the
+        # parallel unique-scatter lowering instead of a scalar update loop.
+        cells = jnp.where(valid, cells, jnp.int32(n_rtot))
+        values = jnp.arange(ngkmax, dtype=jnp.int32)
+        flat = jnp.full((n_rtot,), ngkmax, dtype=jnp.int32)
+        flat = flat.at[cells].set(
+            values, mode="drop", unique_indices=True)
+        return flat.reshape((1, *fft_grid))
+
+    return jax.jit(shard_map(
+        _per_rank,
+        mesh=mesh,
+        in_specs=(P(None, None), P(None, None), P(None), P()),
+        out_specs=P(None, None, None, None),
+        check_vma=False,
+    ))
+
+
+@functools.lru_cache(maxsize=None)
+def _parent_to_full_k_unfold_kernel(mesh: Mesh, with_phase: bool):
+    """One-k typed symmetry action on an already-loaded raw parent.
+
+    The large operand stays band-sharded over the full XY mesh.  All typed
+    action tables are replicated operands supplied by the loader's canonical
+    typed-action builder. The nonzero-translation route consumes one phase row
+    from :func:`_parent_phase_kernel`; the zero-translation route has no phase
+    operand or exponential. No dense full-k phase table is initialized.
+    """
+    with_phase = bool(with_phase)
+
+    def _action(parent_psi, U_child, tr_child, phase_child):
+        coeff_last = jnp.moveaxis(parent_psi, 2, -1)
+        coeff_last = _apply_typed_2c_action(
+            coeff_last,
+            U_child[None, None, None, :, :],
+            phase_child,
+            tr_child,
+        )
+        return jnp.moveaxis(coeff_last, -1, 2)
+
+    band_spec = P(None, ("x", "y"), None, None)
+    if with_phase:
+        def _per_rank(parent_psi, U_child, phase_child, tr_child):
+            return _action(
+                parent_psi, U_child, tr_child,
+                phase_child[None, None, :, None])
+
+        in_specs = (band_spec, P(None, None), P(None), P())
+    else:
+        def _per_rank(parent_psi, U_child, tr_child):
+            return _action(parent_psi, U_child, tr_child, None)
+
+        in_specs = (band_spec, P(None, None), P())
+
+    return jax.jit(shard_map(
+        _per_rank,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=band_spec,
+        check_vma=False,
+    ))
+
+
+@functools.lru_cache(maxsize=None)
+def _parent_bispinor_lift_kernel(mesh: Mesh, representation: str):
+    """Lift one unfolded child without host child-G construction/staging."""
+    from common.bispinor_init import lift_to_4spinor
+    from symmetry_maps import unfold_reciprocal_carriers
+
+    representation = str(representation).strip().lower()
+
+    def _per_rank(
+            psi_2, g_parent, reciprocal_child, umklapp_child, kvec_child,
+            bvec_cart_bohr):
+        g_child = unfold_reciprocal_carriers(
+            reciprocal_child, g_parent, umklapp_child)
+        return lift_to_4spinor(
+            psi_2,
+            g_child[None, :, :].astype(jnp.float64),
+            kvec_child[None, :],
+            bvec_cart_bohr,
+            representation=representation,
+        )
+
+    band_spec = P(None, ("x", "y"), None, None)
+    return jax.jit(shard_map(
+        _per_rank,
+        mesh=mesh,
+        in_specs=(band_spec, P(None, None), P(None, None), P(None),
+                  P(None), P(None, None)),
+        out_specs=band_spec,
         check_vma=False,
     ))

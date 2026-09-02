@@ -4,7 +4,10 @@ Implements the q=0 candidate-pruning stage described in
 ``pivoted_cholesky.md`` (sandbox root). The idea: k-means gives a set of M
 candidate points ``{r̃_a}`` (M > N_μ); the pair-product rows
 ``z_{a,(vck)} = φ*_{v,k}(r̃_a) ψ_{c,k}(r̃_a)`` define a Hermitian PSD Gram
-matrix ``G^{(0)} ∈ ℂ^{M×M}``. Greedy pivoted Cholesky picks the N_μ pivots
+matrix ``G^{(0)} ∈ ℂ^{M×M}``.  For the transverse bispinor channel the
+features are stacked over all three current components and the Gram is
+``G_perp = Σ_i Z_i Z_i†`` with equal component weights. Greedy pivoted
+Cholesky picks the N_μ pivots
 with the largest residual Schur-complement diagonal, and the corresponding
 ``r̃_a`` become the final ISDF points. This is strictly better than picking
 on amplitude alone because it targets the coherence structure of the
@@ -43,13 +46,13 @@ from __future__ import annotations
 import gc
 import math
 import os
+from functools import lru_cache, partial
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.experimental import multihost_utils as _mh
-from functools import partial
 from typing import TYPE_CHECKING
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -71,6 +74,7 @@ from common import timing
 from common.collectives import device_put_process_local
 from common.gpu_utils import worst_process_resident_bytes
 from common.pivoted_cholesky import (
+    make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
 )
 from runtime.padding import round_up
@@ -84,6 +88,108 @@ _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
 _GRAM_FINAL_FOLD_SLOTS = 3
+_CANDIDATE_GAMMA_MODES = ("charge", "transverse")
+
+
+@lru_cache(maxsize=None)
+def _candidate_gram_hermitian_fold_kernel(mesh_xy: Mesh):
+    """Return the donated P(x,y)->P(x,y) terminal Gram fold.
+
+    The transpose exchanges square-mesh owners, but no process may receive a
+    complete Gram.  Keeping both input and output shardings explicit prevents
+    eager ``G + G.T.conj()`` from resolving the public result to ``P()``.
+    """
+    xy = NamedSharding(mesh_xy, PartitionSpec("x", "y"))
+
+    @partial(
+        jax.jit,
+        in_shardings=xy,
+        out_shardings=xy,
+        donate_argnums=(0,),
+    )
+    def _fold(G):
+        return 0.5 * (G + jnp.conj(G.T))
+
+    return _fold
+
+
+@lru_cache(maxsize=None)
+def _candidate_gram_zero_kernel(mesh_xy: Mesh, n_points: int):
+    """Return the stable donated-Gram destination initializer."""
+    xy = NamedSharding(mesh_xy, PartitionSpec("x", "y"))
+    n_points = int(n_points)
+
+    @jax.jit(out_shardings=xy)
+    def _zero():
+        return jnp.zeros((n_points, n_points), dtype=jnp.complex128)
+
+    return _zero
+
+
+def _resolve_candidate_gamma_mode(gamma_mode: str, *, bispinor: bool) -> str:
+    """Validate the candidate feature family before loading wavefunctions."""
+    mode = str(gamma_mode).strip().lower()
+    if mode not in _CANDIDATE_GAMMA_MODES:
+        raise ValueError(
+            "gamma_mode must be 'charge' or 'transverse'; got "
+            f"{gamma_mode!r}")
+    if mode == "transverse" and not bispinor:
+        raise ValueError(
+            "gamma_mode='transverse' requires bispinor=True so the canonical "
+            "four-component gamma algebra can be applied")
+    return mode
+
+
+def candidate_gram_q0_from_pair(
+    P_l_k: jax.Array,
+    P_r_k: jax.Array,
+    k_weights: jax.Array,
+    *,
+    mesh_xy: Mesh,
+    gamma_mode: str = "charge",
+    symmetrize: bool = True,
+) -> jax.Array:
+    """Fold canonical pair densities into the selected candidate metric.
+
+    ``charge`` delegates byte-for-byte to the historical scalar q=0 fold.
+    ``transverse`` delegates to :mod:`isdf.core`'s fused three-component
+    transition-feature fold, which computes the PSD sum
+    ``G_perp = sum_i Z_i Z_i†`` without materialising ``Z_i`` or summing raw
+    indefinite transverse CCTs.
+    """
+    mode = str(gamma_mode).strip().lower()
+    if mode == "charge":
+        from isdf import gram_q0_from_pair
+        return gram_q0_from_pair(
+            P_l_k, P_r_k, k_weights,
+            mesh_xy=mesh_xy, symmetrize=symmetrize)
+    if mode == "transverse":
+        from isdf import transverse_gram_q0_from_pair
+        return transverse_gram_q0_from_pair(
+            P_l_k, P_r_k, k_weights,
+            mesh_xy=mesh_xy, symmetrize=symmetrize)
+    raise ValueError(
+        "gamma_mode must be 'charge' or 'transverse'; got "
+        f"{gamma_mode!r}")
+
+
+def candidate_gram_q0_from_psi(
+    psi_l_X: jax.Array,
+    psi_l_Y: jax.Array,
+    psi_r_X: jax.Array,
+    psi_r_Y: jax.Array,
+    k_weights: jax.Array,
+    *,
+    mesh_xy: Mesh,
+    gamma_mode: str = "charge",
+    symmetrize: bool = True,
+) -> jax.Array:
+    """Build one candidate Gram tile through the fused ISDF owner."""
+    from isdf import gram_q0_from_psi_sm
+    return gram_q0_from_psi_sm(
+        psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
+        mesh_xy=mesh_xy, gamma_mode=gamma_mode, symmetrize=symmetrize,
+    )
 
 
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
@@ -166,48 +272,43 @@ def gram_col_block_device_bytes(
     return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
 
 
-def gram_block_live_set_bytes(
+def gram_scan_live_set_bytes(
     *,
     resident_bytes: int,
-    pair_left_peak_bytes: int,
-    pair_right_peak_bytes: int,
-    gram_fold_peak_bytes: int,
-    one_pair_tile_bytes: int,
+    scan_resident_increment_bytes: int,
     gram_matrix_local_bytes: int,
-    extract_left_increment_bytes: int = 0,
-    extract_right_increment_bytes: int = 0,
-    one_left_input_tile_bytes: int = 0,
-    one_right_input_tile_bytes: int = 0,
 ) -> dict[str, int]:
-    """Complete per-device live set for one 2-D Gram tile.
+    """Complete per-device live set for the one-dispatch tiled Gram scan.
 
-    ``resident_bytes`` is read from the live XLA allocator after BOTH WFN
-    windows have been produced by ``load_centroids_band_chunked``.  The three
-    executable peaks come from ``runtime.aot_memory`` applied to the exact
-    canonical pair-density and q=0-fold JITs.  The right pair build adds the
-    completed left pair tile; the fold peak already includes both pair inputs.
-    The donated shard-local update keeps one full local Gram at every tile
-    stage.  Finally, input + transpose/conjugate + output are conservatively
-    three full local-Gram slots; there is no global concatenate.
+    ``resident_bytes`` is sampled after both complete candidate-WFN windows
+    exist.  The exact production executable reports only its bytes above
+    those four inputs and the donated local ``P('x','y')`` Gram.  The final
+    Hermitian fold can hold input, transpose/conjugate and output: three
+    local-Gram slots, with no global concatenate.
     """
     resident = int(resident_bytes)
-    pair_tile = int(one_pair_tile_bytes)
     gram_local = int(gram_matrix_local_bytes)
     stages = {
-        "extract_left": (resident + gram_local
-                         + int(one_left_input_tile_bytes)
-                         + int(extract_left_increment_bytes)),
-        "pair_left": resident + gram_local + int(pair_left_peak_bytes),
-        "extract_right": (resident + gram_local + pair_tile
-                          + int(one_right_input_tile_bytes)
-                          + int(extract_right_increment_bytes)),
-        "pair_right": (resident + gram_local + pair_tile
-                       + int(pair_right_peak_bytes)),
-        "gram_fold": resident + gram_local + int(gram_fold_peak_bytes),
+        "scan": (resident + gram_local
+                 + int(scan_resident_increment_bytes)),
         "final_fold": resident + _GRAM_FINAL_FOLD_SLOTS * gram_local,
     }
     stages["peak"] = max(stages.values())
     return stages
+
+
+def gram_tile_schedule(extent: int, width: int) -> tuple[int, int, float]:
+    """Return tile count, padded extent and square-work inflation."""
+    extent_i = int(extent)
+    width_i = int(width)
+    if extent_i < 1 or width_i < 1:
+        raise ValueError(
+            f"Gram extent and tile width must be positive; got "
+            f"extent={extent_i}, width={width_i}")
+    ntiles = -(-extent_i // width_i)
+    executed = ntiles * width_i
+    inflation = float(executed * executed) / float(extent_i * extent_i)
+    return ntiles, executed, inflation
 
 
 def _auto_gram_width_from_compiled_peaks(
@@ -218,13 +319,15 @@ def _auto_gram_width_from_compiled_peaks(
     budget_bytes: int,
     peak_for_width,
 ) -> tuple[int, dict[str, int]]:
-    """Geometrically grow/shrink to the largest certified rung.
+    """Find a certified rung, then remove padding at the same tile count.
 
     Each rung compiles the SAME canonical tile executables production will
     run.  A geometric ladder avoids a dozen throw-away production-shape
-    compilations while retaining a strict property: the returned rung itself
-    was queried and fits.  Tail tiles are zero-padded to this width, so there
-    is only one static executable shape to certify.
+    compilations. Once the largest feasible rung is known, its tile count is
+    fixed and the width is reduced to the smallest mesh-aligned value that
+    covers the logical extent in that many tiles. This preserves scan-iteration
+    count while minimizing zero-padded pair-density work. The returned width
+    itself is always queried and certified.
     """
     d = max(1, int(divisor))
     floor = ((max(1, _GRAM_MIN_COL_BLOCK) + d - 1) // d) * d
@@ -257,6 +360,18 @@ def _auto_gram_width_from_compiled_peaks(
         if wider_facts["peak"] > int(budget_bytes):
             break
         width, facts = wider, wider_facts
+
+    # Largest-width is not a runtime optimum with fixed-shape tail padding.
+    # Example: extent 3008, width 3004 executes two 3004-wide tiles per axis,
+    # nearly 4x the useful square work.  Keep the SAME number of scan iterations
+    # and shrink to the minimum aligned width that still covers the extent.
+    ntiles, _, _ = gram_tile_schedule(ceiling, width)
+    compact = round_up(-(-ceiling // ntiles), d)
+    compact = min(width, max(floor, compact))
+    if compact != width:
+        compact_facts = check(compact)
+        if compact_facts["peak"] <= int(budget_bytes):
+            width, facts = compact, compact_facts
     return width, facts
 
 
@@ -503,25 +618,12 @@ POINT_RANK_CAP_DEFAULT = 4096
 
 
 def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
-    """Independent directions in the DELIVERED POINT SET, not in the orbits.
+    """Independent directions in a delivered point set.
 
-    THE CONFUSION THIS REMOVES.  In orbit mode the greedy select deflates
-    the Schur complement by ONE direction per orbit while removing all
-    ``n_sym`` members from contention, so the rank it reports counts
-    ORBITS.  D3's gate passed at "42 of 42 directions certified" and the
-    file it blessed contained 1908 POINTS; the ζ back-solve then truncated
-    to 1440-1455 modes per q (23.7-24.5 %, logged eight times per leg and
-    read by nobody) because the 60-band pair-product space on a 24³ grid
-    saturates around 1450 numerical directions.  Asking for 1908 centroids
-    does not raise that ceiling — it hands the pseudo-inverse a
-    rank-deficient Gram.
-
-    Nothing in the centroid pipeline ever checked the delivered set at
-    point granularity, and in orbit mode it structurally cannot: the number
-    the rank gate reads is not comparable to the point count.  This is that
-    number, measured directly, so the log can say "42 orbits, 1908 points,
-    N independent directions" and an operator can see the ζ truncation
-    coming before spending a 7 GiB restart file on it.
+    The production whole-orbit block selector computes this rank directly as
+    it pivots every delivered point. This O(n³) host diagnostic remains for
+    the explicit representative-group compatibility path, whose select rank
+    counts representatives rather than emitted points.
 
     Returns ``(rank, n_points, reason)``.  ``rank`` is ``None`` when the
     measurement was skipped and ``reason`` says why — never a silent
@@ -556,11 +658,9 @@ def _report_point_granularity(G, keep_mask, rank_selected, *, unit,
                               tol_rel=None, verbose=True):
     """Say the certification at the granularity of the FILE being written.
 
-    ONE implementation for both modes.  ``rank_selected`` is what the select
-    certified — ORBITS in orbit mode, POINTS in point mode — and ``unit``
-    names which, because a number whose unit is ambiguous is how
-    "18/18 directions certified — PASS" came to be said over a delivered set
-    of 768 points.
+    ``rank_selected`` is what the compatibility selector certified. ``unit``
+    makes its granularity explicit; the production block path does not need
+    this second eigensolve because it already pivots every emitted point.
 
     This reports; it never refuses.  A rank-deficient delivered set is a
     fact about an over-complete interpolation basis and is measured
@@ -588,7 +688,7 @@ def _report_point_granularity(G, keep_mask, rank_selected, *, unit,
               f"on the Si anchor deck the 960-point set with ~160 dependent "
               f"points is the most accurate one measured.")
     _note = point_rank_closure_note(G, keep_mask, pt_rank, tol_rel=tol_rel)
-    print(f"  [point rank] closure: " + (
+    print("  [point rank] closure: " + (
         _note if _note else
         "the rank cut falls in a gap — no degenerate block is "
         "sliced at this tolerance."))
@@ -635,6 +735,31 @@ def point_rank_closure_note(G, keep_mask, rank, *, tol_rel=None):
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _emit_complete_groups(cand_idx, dense_group_id, piv):
+    """Map point pivots back to an exactly complete-group coordinate set."""
+    cand_idx = np.asarray(cand_idx)
+    dense_group_id = np.asarray(dense_group_id, dtype=np.int32)
+    piv_used = np.asarray(piv, dtype=np.int32)
+    piv_used = piv_used[piv_used >= 0]
+    picked_groups = dense_group_id[piv_used]
+    order = picked_groups[np.sort(np.unique(
+        picked_groups, return_index=True)[1])]
+    in_kept = np.isin(dense_group_id, order)
+    sizes = np.bincount(dense_group_id)
+    pivot_counts = np.bincount(picked_groups, minlength=sizes.size)
+    if not np.array_equal(pivot_counts[order], sizes[order]):
+        raise RuntimeError(
+            "group-block pivoted Cholesky returned a partial group; "
+            "the point-budget admission contract is broken")
+    keep_idx = cand_idx[in_kept]
+    if int(keep_idx.shape[0]) != int(piv_used.size):
+        raise RuntimeError(
+            "group-block pivot/emission count mismatch: "
+            f"pivoted {piv_used.size} point rows but emitted "
+            f"{keep_idx.shape[0]}")
+    return keep_idx, in_kept, order, piv_used
+
+
 def prune_candidates_by_pivoted_cholesky(
     wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
@@ -650,9 +775,11 @@ def prune_candidates_by_pivoted_cholesky(
     k_weights: np.ndarray | None = None,
     verbose: bool = True,
     bispinor: bool = False,
+    gamma_mode: str = "charge",
     orbit_id: np.ndarray | None = None,
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
+    group_block: bool = False,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -662,11 +789,12 @@ def prune_candidates_by_pivoted_cholesky(
     G-space path; the prune driver does not select an HDF5 implementation.
 
     When ``orbit_id`` is provided (one int per candidate, equal for sym-
-    equivalent candidates), PC picks one pivot per orbit and the returned
-    ``keep_idx`` is the union of orbits of the picked pivots — guaranteed
-    orbit-closed under the sym group used to assign ``orbit_id``. In that
-    mode ``n_keep`` counts ORBITS (final unfolded centroid count is
-    ``Σ orbit_size`` for picked orbits).
+    equivalent candidates), the returned set is a union of complete orbits.
+    With ``group_block=False`` the compatibility path picks one representative
+    per orbit and ``n_keep`` counts orbits.  With ``group_block=True``, every
+    emitted orbit member participates in the Schur recurrence and
+    ``n_point_budget`` is the selection budget; this is the physically correct
+    centroid-pruning path.
 
     Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG,
     psd_info)``.
@@ -684,6 +812,11 @@ def prune_candidates_by_pivoted_cholesky(
     historical behaviour: ``n_keep`` orbits, whatever that costs in points.
     Ignored outside orbit mode, where ``n_keep`` already IS the point count.
 
+    ``group_block=True`` requires both ``orbit_id`` and ``n_point_budget``.
+    It admits an orbit only if the complete orbit fits, so the kernel itself
+    returns the largest greedy whole-orbit set no larger than the point budget;
+    there is no partial last block for the host to repair.
+
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
     ``LORRAX_CENTROID_PC_TOL`` from the environment and falls back to
@@ -692,14 +825,22 @@ def prune_candidates_by_pivoted_cholesky(
     LAPACK ``?pstrf``'s own policy is ``n·eps``; pass it explicitly to get
     it.
 
-    REFUSES, rather than returning a plausible-looking set, when the kernel
-    could not do what was asked: a non-PSD Gram, a pool that runs out of
-    orbits, a pool that is numerically rank-deficient, or a pivot outside
-    the candidate range.  ``rank == n_keep`` on every path that returns.
-    Those refusals are the assessment's R1 and they are stated in full
-    beside the kernel; the short version is that each one used to be a
-    silent wrong answer that passed every downstream shape check.
+    REFUSES on a non-PSD Gram, structural pool exhaustion, or a pivot outside
+    the candidate range.  Numerical rank deficiency is reported by default;
+    ``LORRAX_CENTROID_SELECT=strict`` promotes it to a refusal.  The policy is
+    owned once by :func:`refuse_unless_select_certified`.
     """
+    if group_block and orbit_id is None:
+        raise ValueError("group_block=True requires orbit_id")
+    if group_block and n_point_budget is None:
+        raise ValueError("group_block=True requires n_point_budget")
+    gamma_mode = _resolve_candidate_gamma_mode(
+        gamma_mode, bispinor=bispinor)
+    if gamma_mode == "transverse" and band_norms is not None:
+        raise ValueError(
+            "transverse candidate pruning uses unit weight for every band "
+            "in the requested left/right fit windows; band_norms must be None")
+
     M = int(cand_idx.shape[0])
     n_tot = int(wfn.nbands)
     asymmetric = (band_range_left is not None and band_range_right is not None)
@@ -781,7 +922,8 @@ def prune_candidates_by_pivoted_cholesky(
         window_tag = (f"left={band_range_left}, right={band_range_right}, "
                       f"norms={'on' if band_norms is not None else 'off'}"
                       if asymmetric else f"n_val={n_val}, n_cond={n_cond}")
-        print(f"[pivoted_cholesky] M={M}, n_keep={n_keep}, {window_tag} "
+        print(f"[pivoted_cholesky] M={M}, n_keep={n_keep}, {window_tag}, "
+              f"gamma_mode={gamma_mode} "
               f"(load_wfns 2-D, mesh axes {mesh.axis_names})")
 
     with timing.section("prune.gram"):
@@ -792,6 +934,8 @@ def prune_candidates_by_pivoted_cholesky(
             band_range_left=band_range_left,
             band_range_right=band_range_right,
             band_norms=band_norms,
+            k_weights=k_weights,
+            gamma_mode=gamma_mode,
         )
         # Reshard ('x','y') → row-sharded for the column-major pivot scan.
         G = jax.lax.with_sharding_constraint(
@@ -820,10 +964,74 @@ def prune_candidates_by_pivoted_cholesky(
                   f"M {M} -> {M_pad} (+{n_pad} inactive rows) so M_pad % "
                   f"{n_dev} == 0; pads carry d=0 and start INACTIVE")
 
-    # Run select on the row-sharded Gram. Orbit-aware mode passes orbit_id
-    # row-sharded the same way as G; the body marks the whole orbit
-    # inactive after each pivot pick (orbit_id of the pivot is broadcast
-    # via psum-with-mask, same idiom as the L[p, :] broadcast).
+    if group_block:
+        orbit_id_np = np.asarray(orbit_id, dtype=np.int32)
+        labels, dense_id = np.unique(orbit_id_np, return_inverse=True)
+        n_groups = int(labels.size)
+        budget = min(int(n_point_budget), M)
+        dense_pad = dense_id.astype(np.int32)
+        active_init = None
+        if n_pad:
+            dense_pad = np.concatenate([
+                dense_pad, np.full((n_pad,), n_groups, dtype=np.int32)])
+            active_host = np.ones((M_pad,), dtype=bool)
+            active_host[M:] = False
+            active_init = device_put_process_local(
+                active_host,
+                NamedSharding(mesh, PartitionSpec(select_axis)),
+            )
+        group_id_jax = device_put_process_local(
+            dense_pad, NamedSharding(mesh, PartitionSpec(select_axis)))
+        with timing.section("prune.select"):
+            select_step = _make_sharded_block_select(
+                mesh, M_pad, budget, n_groups,
+                mesh_axis=select_axis, tol_rel=tol_rel)
+            (piv, L, rank, d_final, d_taken, trR_over_trG,
+             psd_info) = select_step(G, group_id_jax, active_init)
+            piv.block_until_ready()
+        del L
+
+        piv_np = np.asarray(piv)
+        piv_used = piv_np[piv_np >= 0]
+        if piv_used.size == 0:
+            sizes = np.bincount(dense_id, minlength=n_groups)
+            raise RuntimeError(
+                f"pivoted-Cholesky REFUSES: point budget {budget} is smaller "
+                f"than every complete group (minimum size {int(sizes.min())})")
+        keep_idx, in_kept, order, piv_used = _emit_complete_groups(
+            cand_idx, dense_id, piv_used)
+        n_delivered = int(keep_idx.shape[0])
+        rank_i = int(rank)
+        diag_host = np.real(np.asarray(jnp.diag(G)))[:M]
+        psd_host = (
+            float(np.asarray(psd_info[0])), int(np.asarray(psd_info[1])),
+            int(np.asarray(psd_info[2])))
+        refuse_unless_select_certified(
+            piv_used, rank_i, psd_host, n_keep=n_delivered, M=M,
+            M_pad=M_pad, orbit_id=None, d0max=float(diag_host.max()),
+            tol_rel=tol_rel)
+        d_final_np = np.asarray(
+            _mh.process_allgather(d_final, tiled=True))[:M]
+        if n_pad:
+            G = G[:M, :M]
+        if verbose:
+            last = max(n_delivered - 1, 0)
+            print(
+                f"[pivoted_cholesky] GROUP-BLOCK: {len(order)} groups -> "
+                f"{n_delivered}/{budget} points, rank={rank_i}; every "
+                f"delivered point updated the residual")
+            print(f"[pivoted_cholesky] picked-pivot residuals: "
+                  f"first={float(d_taken[0]):.3e}, "
+                  f"last-delivered={float(d_taken[last]):.3e}")
+            print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
+                  f"first={float(trR_over_trG[1]):.3e}, "
+                  f"last-delivered={float(trR_over_trG[n_delivered]):.3e}")
+        return (keep_idx, rank_i, G, d_final_np, np.asarray(d_taken),
+                np.asarray(trR_over_trG), psd_host)
+
+    # Compatibility selector: orbit-aware mode chooses one representative and
+    # then emits its whole orbit. Production centroid pruning returns above
+    # through the group-block selector, which pivots every emitted point.
     with timing.section("prune.select"):
         select_step = _make_sharded_select(
             mesh, M_pad, n_keep, mesh_axis=select_axis, tol_rel=tol_rel,
@@ -977,9 +1185,18 @@ def prune_candidates_by_pivoted_cholesky(
 # The conj() on P_v_k flips it from gw_jax's Σ_v φ*(μ)φ(ν) to the
 # valence-projector form Σ_v φ(a)φ*(b) the Gram definition needs.
 #
-# Uses full-BZ unfold with uniform k-weights = 1/nk_tot (read_Gvecs_to_devices
-# unfolds symmetry, so IBZ-weighted IBZ data are not the inputs). This is the
-# correct convention to match gw_jax's pair-density pipeline exactly.
+# Uses full-BZ unfold.  The centroid driver expands each normalized IBZ
+# parent weight uniformly over its star and gives both its cheap candidate
+# metric and this exact Gram the same full-k quadrature table.
+
+
+def _gram_meta_band_counts(wfn_nelec: int, max_band: int,
+                           n_val: int | None, n_cond: int | None):
+    """Keep physical occupancy separate from an explicit feature window."""
+    if n_val is not None:
+        return int(n_val), int(n_cond)
+    occupied = min(int(wfn_nelec), int(max_band))
+    return occupied, int(max_band) - occupied
 
 
 def build_gram_q0_via_loadwfns(
@@ -991,16 +1208,18 @@ def build_gram_q0_via_loadwfns(
     mesh_xy: Mesh | None = None,
     *,
     bispinor: bool = False,
+    gamma_mode: str = "charge",
     verbose: bool = True,
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
+    k_weights: np.ndarray | None = None,
     band_chunk_size: int = 64,
     memory_per_device_gb: float | None = None,
 ) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
 
-    Two call modes:
+    Two band-window call modes:
 
     * Simple ``(n_val, n_cond)`` (legacy): left window = ``(0, n_val)``,
       right window = ``(n_val, n_val + n_cond)``. This is the literal
@@ -1014,11 +1233,16 @@ def build_gram_q0_via_loadwfns(
       normalization ``ψ /= max(norm, 1.0)`` on both left and right
       (same clamp recipe as ``isdf_fitting.py:838-847``).
 
-    Full-BZ unfold: one ``load_wfns.read_Gvecs_to_devices`` per window,
-    ``get_sharded_wfns_centroids`` at the candidate indices, sharded
-    pair densities via ``compute_pair_density_spin_traced``, combined
-    with the q=0 sum via ``compute_gram_q0_from_left_right``. k-weights
-    are uniform ``1 / nk_tot`` because we've unfolded.
+    ``gamma_mode='charge'`` preserves the historical scalar pair-product
+    Gram exactly. ``gamma_mode='transverse'`` requires ``bispinor=True`` and
+    uses the equal-weight PSD sum of the three current transition-feature
+    Grams. It never consumes occupations or ``band_norms``.
+
+    The shared WFN transform service unfolds each band window onto candidate
+    points. Small Grams retain the sequential low-residency pair route; large
+    Grams keep both final WFN faces and fuse each bounded pair-density/q=0
+    tile through :mod:`isdf`. k-weights are supplied in full-BZ order.
+    ``None`` retains uniform ``1 / nk_tot`` for standalone callers.
 
     Args:
         wfn: open WFNReader.
@@ -1035,6 +1259,9 @@ def build_gram_q0_via_loadwfns(
             ``'y'`` at present — we follow that convention.)
         bispinor: if True, upcast the spin structure to 4 components
             (matches gw_jax's bispinor mode). Default False.
+        gamma_mode: ``'charge'`` or ``'transverse'``. The latter requires
+            the four-component bispinor carrier and gives all three current
+            components equal weight without per-component normalisation.
         verbose: print progress lines.
         band_range_left: optional explicit left window (start, end).
             When given, takes precedence over (n_val, n_cond).
@@ -1044,6 +1271,10 @@ def build_gram_q0_via_loadwfns(
             applied to both left and right ψ via
             ``ψ /= max(norm_slice, 1.0)`` before the pair-density
             einsum.
+        k_weights: optional normalized full-BZ quadrature weights.  The
+            centroid driver expands each stored IBZ parent weight uniformly
+            over its star and passes the same table to candidate generation
+            and pruning.
 
     Returns:
         G: (M, M) complex, sharded ``P('x','y')`` on the mesh — ready to
@@ -1056,14 +1287,16 @@ def build_gram_q0_via_loadwfns(
     from common.wfn_transforms import load_centroids_band_chunked
     from isdf import (
         pair_density,
-        pair_density_aot_peak_bytes,
-        gram_q0_from_pair,
-        gram_q0_aot_peak_bytes,
+        gram_q0_tiled_from_psi_sm,
+        gram_q0_tiled_from_psi_aot_resident_increment_bytes,
     )
-    from common.staged_reshard import (
-        shard_local_slice_pad,
-        shard_local_update,
-    )
+
+    gamma_mode = _resolve_candidate_gamma_mode(
+        gamma_mode, bispinor=bispinor)
+    if gamma_mode == "transverse" and band_norms is not None:
+        raise ValueError(
+            "transverse candidate pruning uses unit weight for every band "
+            "in the requested left/right fit windows; band_norms must be None")
 
     # Resolve windows.
     if band_range_left is None or band_range_right is None:
@@ -1098,11 +1331,10 @@ def build_gram_q0_via_loadwfns(
 
     # Meta's nband must cover whichever of left/right reaches higher.
     max_band = max(left_range[1], right_range[1])
-    # Keep Meta.b0..b4 consistent with the *legacy* nval/ncond semantics
-    # when the caller passed those; otherwise use (max_band, max_band) so
-    # the metadata bounds don't constrain anything downstream.
-    meta_nval = int(n_val) if n_val is not None else nb_left
-    meta_ncond = int(n_cond) if n_cond is not None else max(1, max_band - meta_nval)
+    # Meta.nval is physical occupancy, not the width of the left feature
+    # window.  Explicit windows may cross the occupied boundary.
+    meta_nval, meta_ncond = _gram_meta_band_counts(
+        wfn.nelec, max_band, n_val, n_cond)
 
     M = int(cand_idx.shape[0])
     cand_idx = jnp.asarray(cand_idx, dtype=jnp.int64)
@@ -1115,7 +1347,21 @@ def build_gram_q0_via_loadwfns(
         bispinor=bispinor,
     )
 
-    kw = jnp.ones((sym.nk_tot,), dtype=jnp.float64) / float(sym.nk_tot)
+    if k_weights is None:
+        kw_np = np.full(int(sym.nk_tot), 1.0 / float(sym.nk_tot),
+                        dtype=np.float64)
+    else:
+        kw_np = np.asarray(k_weights, dtype=np.float64)
+        if kw_np.shape != (int(sym.nk_tot),):
+            raise ValueError(
+                "k_weights must have one entry per unfolded full-BZ k point; "
+                f"got {kw_np.shape}, expected {(int(sym.nk_tot),)}")
+        if (not np.all(np.isfinite(kw_np)) or np.any(kw_np < 0.0)
+                or not np.isclose(kw_np.sum(), 1.0, rtol=1e-12, atol=1e-14)):
+            raise ValueError(
+                "k_weights must be finite, nonnegative, and sum to one; "
+                f"got sum={kw_np.sum():.17g}")
+    kw = jnp.asarray(kw_np, dtype=jnp.float64)
 
     # Memory budget for the band-+k-chunker. ``load_centroids_band_chunked``
     # reads ``meta.memory_per_device_gb`` to size the FFT-box per chunk; if
@@ -1160,6 +1406,7 @@ def build_gram_q0_via_loadwfns(
         print(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
               f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
               f"right={right_range} (nb={nb_right}), M={M}, "
+              f"gamma_mode={gamma_mode}, "
               f"norms={'on' if band_norms is not None else 'off'}, "
               f"backend=WfnLoader(auto), "
               f"budget={meta.memory_per_device_gb:g} GB/device, "
@@ -1251,6 +1498,18 @@ def build_gram_q0_via_loadwfns(
         gc.collect()
         from common.gpu_utils import _get_jax_gpu_memory_bytes
         _, live_now, _ = _get_jax_gpu_memory_bytes()
+        if live_now is None and jax.default_backend() in ("gpu", "cuda"):
+            from common.gpu_utils import (
+                get_gpu_used_memory_bytes_nvidia_smi)
+            live_now = get_gpu_used_memory_bytes_nvidia_smi()
+            if live_now is not None:
+                from runtime.aot_memory import announce_once
+                announce_once(
+                    "gram-live-nvidia-smi",
+                    "allocator bytes_in_use unavailable for the Gram planner; "
+                    "using this rank's conservative nvidia-smi whole-device "
+                    "memory.used sample",
+                )
         if live_now is None:
             # CPU/fallback accounting: sum the returned WFN shards.  Announce
             # that this is weaker because it cannot see service tables.
@@ -1283,98 +1542,29 @@ def build_gram_q0_via_loadwfns(
             * _GRAM_COMPLEX_BYTES
         )
 
-        rep_sh = NamedSharding(mesh_xy, PartitionSpec())
-        row_spec = PartitionSpec(None, 'x', None, None)
-        col_spec = PartitionSpec(None, None, None, 'y')
-        tile_spec = PartitionSpec('x', 'y')
-        tile_services = {}
-
-        def _services_for_width(tile_width):
-            tile_width = int(tile_width)
-            if tile_width not in tile_services:
-                tile_services[tile_width] = (
-                    shard_local_slice_pad(
-                        mesh_xy, spec=row_spec, axis=1, mesh_axis='x',
-                        local_size=tile_width // n_x),
-                    shard_local_slice_pad(
-                        mesh_xy, spec=col_spec, axis=3, mesh_axis='y',
-                        local_size=tile_width // n_y),
-                )
-            return tile_services[tile_width]
-
-        def _extract_increment(extractor, arr):
-            from runtime.aot_memory import aot_kernel_peak_bytes
-            arr_arg = jax.ShapeDtypeStruct(
-                tuple(int(s) for s in arr.shape), arr.dtype,
-                sharding=arr.sharding)
-            start_arg = jax.ShapeDtypeStruct(
-                (), jnp.int32, sharding=rep_sh)
-            compiled = extractor.lower(arr_arg, start_arg).compile()
-            return int(aot_kernel_peak_bytes(compiled).resident_increment)
-
         def _compiled_live_set(tile_width):
             tile_width = int(tile_width)
-            extract_x, extract_y = _services_for_width(tile_width)
-            extract_left = max(
-                _extract_increment(extract_x, psi_l_rmuT_X),
-                _extract_increment(extract_y, psi_l_rmu_Y),
+            scan_increment = (
+                gram_q0_tiled_from_psi_aot_resident_increment_bytes(
+                    mesh_xy=mesh_xy, nk=nk_, n_points=M_cols,
+                    nb_l=nb_left, nb_r=nb_right, nspinor=ns_,
+                    tile_width=tile_width, gamma_mode=gamma_mode,
+                )
             )
-            extract_right = max(
-                _extract_increment(extract_x, psi_r_rmuT_X),
-                _extract_increment(extract_y, psi_r_rmu_Y),
-            )
-            left_peak = pair_density_aot_peak_bytes(
-                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_left,
-                nspinor=ns_, n_col=tile_width,
-            )
-            right_peak = pair_density_aot_peak_bytes(
-                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_right,
-                nspinor=ns_, n_col=tile_width,
-            )
-            fold_peak = gram_q0_aot_peak_bytes(
-                mesh_xy=mesh_xy, nk=nk_, nspinor=ns_,
-                n_rmu=tile_width, n_col=tile_width,
-            )
-            one_pair_local = (
-                nk_ * ns_ * ns_
-                * ((tile_width + n_x - 1) // n_x)
-                * ((tile_width + n_y - 1) // n_y)
-                * _GRAM_COMPLEX_BYTES
-            )
-            one_left_input_local = (
-                nk_ * (tile_width // n_x) * nb_left * ns_
-                * _GRAM_COMPLEX_BYTES
-            )
-            one_right_input_local = (
-                nk_ * (tile_width // n_x) * nb_right * ns_
-                * _GRAM_COMPLEX_BYTES
-            )
-            facts = gram_block_live_set_bytes(
+            facts = gram_scan_live_set_bytes(
                 resident_bytes=resident_bytes,
-                pair_left_peak_bytes=left_peak,
-                pair_right_peak_bytes=right_peak,
-                gram_fold_peak_bytes=fold_peak,
-                one_pair_tile_bytes=one_pair_local,
+                scan_resident_increment_bytes=scan_increment,
                 gram_matrix_local_bytes=gram_local_bytes,
-                extract_left_increment_bytes=extract_left,
-                extract_right_increment_bytes=extract_right,
-                one_left_input_tile_bytes=one_left_input_local,
-                one_right_input_tile_bytes=one_right_input_local,
             )
-            facts.update({
-                "extract_left": int(extract_left),
-                "extract_right": int(extract_right),
-                "pair_left_compiled": int(left_peak),
-                "pair_right_compiled": int(right_peak),
-                "gram_compiled": int(fold_peak),
-                "pair_tile": int(one_pair_local),
-            })
+            facts["scan_increment"] = int(scan_increment)
             return facts
 
-        # Keep a genuine blocked path: the sequential full-M path below has
-        # a smaller WFN live set and remains preferable whenever the cheap
-        # b6 square-law screen said it fits.
-        max_tile_width = ((M_cols - 1) // tile_divisor) * tile_divisor
+        # The sequential full-M path below still has the smaller WFN live set
+        # and wins whenever the cheap square-law screen selected it. Once the
+        # blocked route is entered, however, a full-width fused tile is valid
+        # if its exact compiled live set fits; stopping at M-1 forced two
+        # almost-full padded tiles per axis.
+        max_tile_width = M_cols
         if not env_cb:
             col_block, live_facts = _auto_gram_width_from_compiled_peaks(
                 col_block,
@@ -1394,82 +1584,35 @@ def build_gram_q0_via_loadwfns(
                 nk_, ns_, M_cols, col_block,
                 x_shards=n_x, y_shards=n_y,
             ) / 2**30
-            ntiles = -(-M_cols // col_block)
+            ntiles, executed_extent, work_inflation = gram_tile_schedule(
+                M_cols, col_block)
             print(
                 f"[pivoted_cholesky] 2-D blocked Gram: M={M_cols}, "
                 f"tile={col_block} ({ntiles}x{ntiles} tiles; "
+                f"executed_extent={executed_extent}, "
+                f"padded_work={work_inflation:.3f}x; "
                 f"{n_dev_total}-device path; {block_source}; "
                 f"square-law={square_gib:.2f} GiB global, "
-                f"two-pair local={local_gib:.2f} GiB/device; "
+                f"pair-workspace model={local_gib:.2f} GiB/device; "
                 f"resident(two WFN windows; worst rank)="
                 f"{resident_bytes / 2**30:.2f}, "
-                f"compiled L/R/fold="
-                f"{live_facts['pair_left_compiled'] / 2**30:.2f}/"
-                f"{live_facts['pair_right_compiled'] / 2**30:.2f}/"
-                f"{live_facts['gram_compiled'] / 2**30:.2f}, "
-                f"extract L/R increment="
-                f"{live_facts['extract_left'] / 2**30:.2f}/"
-                f"{live_facts['extract_right'] / 2**30:.2f}, "
+                f"compiled scan increment="
+                f"{live_facts['scan_increment'] / 2**30:.2f}, "
                 f"full-live peak={live_facts['peak'] / 2**30:.2f} "
                 f"of target={target_bytes / 2**30:.2f} GiB/device)"
             )
-        extract_x, extract_y = _services_for_width(col_block)
-        tile_xy = NamedSharding(mesh_xy, tile_spec)
-        update_g = shard_local_update(mesh_xy, spec=tile_spec)
-        local_rows = M_cols // n_x
-        local_cols = M_cols // n_y
-        local_row_tile = col_block // n_x
-        local_col_tile = col_block // n_y
+        G = _candidate_gram_zero_kernel(mesh_xy, M_cols)()
 
-        @partial(jax.jit, out_shardings=tile_xy)
-        def _zero_gram():
-            return jnp.zeros((M_cols, M_cols), dtype=jnp.complex128)
-
-        G = _zero_gram()
-        G.block_until_ready()
-
-        def _rep_i32(value):
-            return device_put_process_local(
-                np.asarray(value, dtype=np.int32), rep_sh)
-
-        with timing.section("q0_sum"):
-            for c0 in range(0, local_cols, local_col_tile):
-                c_start = _rep_i32(c0)
-                for r0 in range(0, local_rows, local_row_tile):
-                    r_start = _rep_i32(r0)
-
-                    # Slice inside each already-owned X/Y shard.  The generic
-                    # layout primitive zero-pads the local tail, so no smaller
-                    # global extent is ever repartitioned and the pair/fold
-                    # executables keep one static shape.
-                    row_l = extract_x(psi_l_rmuT_X, r_start)
-                    block_l = extract_y(psi_l_rmu_Y, c_start)
-                    P_l_b = pair_density(row_l, block_l, mesh_xy)
-                    # This barrier makes the planner's stage max real: the
-                    # left compiler arena is gone before the right one starts.
-                    P_l_b.block_until_ready()
-                    del row_l, block_l
-
-                    row_r = extract_x(psi_r_rmuT_X, r_start)
-                    block_r = extract_y(psi_r_rmu_Y, c_start)
-                    P_r_b = pair_density(row_r, block_r, mesh_xy)
-                    P_r_b.block_until_ready()
-                    del row_r, block_r
-
-                    G_b = gram_q0_from_pair(
-                        P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
-                        symmetrize=False,
-                    )
-                    G_b.block_until_ready()
-                    del P_l_b, P_r_b
-                    starts = _rep_i32((r0, c0))
-                    G = update_g(G, G_b, starts)
-                    G.block_until_ready()
-                    del G_b, r_start, starts
-                del c_start
+        with timing.section("q0_sum.fused"):
+            G = gram_q0_tiled_from_psi_sm(
+                G, psi_l_rmuT_X, psi_l_rmu_Y,
+                psi_r_rmuT_X, psi_r_rmu_Y, kw,
+                mesh_xy=mesh_xy, tile_width=col_block,
+                gamma_mode=gamma_mode,
+            )
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
-            G = 0.5 * (G + jnp.conj(G.T))
+            G = _candidate_gram_hermitian_fold_kernel(mesh_xy)(G)
             G.block_until_ready()
         del psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
         return G
@@ -1497,7 +1640,9 @@ def build_gram_q0_via_loadwfns(
 
     # ---- q=0 Gram: sum_k w_k · Σ_{αβ} conj(P_l_k,αβ) · P_r_k,αβ ----
     # γ̃ identity (charge channel) — open-spin Frobenius reduction.
-    with timing.section("q0_sum"):
-        G = gram_q0_from_pair(P_l_k, P_r_k, kw, mesh_xy=mesh_xy)
+    with timing.section("q0_sum.sequential"):
+        G = candidate_gram_q0_from_pair(
+            P_l_k, P_r_k, kw, mesh_xy=mesh_xy,
+            gamma_mode=gamma_mode)
         G.block_until_ready()
     return G

@@ -120,7 +120,7 @@ tool; deeper breakage fails visibly at regen).
 **`extra` marker** (deselected by default via pyproject `addopts`; run
 with `-m extra`): tooling/experimental/out-of-repo-fixture suites —
 `test_sternheimer_solvers`, `test_head_wing_schur`, `test_aot_memory`,
-`test_R_proper_cri3`, `test_reshard_all_to_all`.
+`test_cartesian_actions_cri3`, `test_reshard_all_to_all`.
 
 `-m "not regression"` remains the 1–2 min unit-only loop.
 

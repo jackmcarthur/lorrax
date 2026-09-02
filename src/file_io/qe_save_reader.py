@@ -21,9 +21,9 @@ Key methods:
 
 The IBZ reduction reproduces QE's kpoint_grid.f90: same enumeration order
 (dir 3 fastest), forward-only equivalence, optional time reversal.
-Translation convention: stored as τ_crys × (−2π) to match BGW's tnp.
-Note: 24/48 non-symmorphic translations have a sign mismatch vs pw2bgw;
-rotation matrices match exactly.
+Translation convention: QE's affine shift is converted to BGW ``tnp`` as
+``2π inv(mtrx) τ_qe``.  Rotation arrays match the raw WFN arrays exactly;
+the transpose belongs only to the later reciprocal k/G action.
 
 Usage
 -----
@@ -150,6 +150,9 @@ class CrystalData:
         atom_types = np.array([_SYMBOL_TO_Z[a.attrib["name"]] for a in atoms], dtype=np.int32)
 
         # ── symmetry operations ──
+        # Lazy service import keeps importing this XML/HDF5 reader itself
+        # device-stack-free; the conversion is used only when parsing.
+        from symmetry_maps import qe_xml_seitz_to_bgw
         sym_elems = _all(root, "symmetry")
         rotations, frac_trans, has_time_rev = [], [], []
         for sym_elem in sym_elems:
@@ -160,8 +163,9 @@ class CrystalData:
             rotations.append(np.round(R).astype(int))
             tau = (_vec(children["fractional_translation"].text)
                    if "fractional_translation" in children else np.zeros(3))
-            # BGW convention: opposite sign from QE XML, × 2π
-            frac_trans.append(-tau * 2.0 * np.pi)
+            # One owner for the QE-XML -> BGW Seitz boundary.
+            frac_trans.append(qe_xml_seitz_to_bgw(
+                np.round(R).astype(int), tau))
             # QE marks operations that include time reversal
             info = children.get("info")
             tr = (info is not None and info.attrib.get("time_reversal") == "true")
@@ -330,6 +334,15 @@ class CrystalData:
         _chk("ntran", self.ntran, wfn.ntran, tol=0.5)
         _chk("sym_matrices", self.sym_matrices[:self.ntran],
              wfn.sym_matrices[:wfn.ntran], tol=0.5)
+        if self.ntran == int(wfn.ntran):
+            delta_tau = (
+                self.translations[:self.ntran]
+                - np.asarray(wfn.translations[:wfn.ntran])) / (2.0 * np.pi)
+            delta_tau -= np.rint(delta_tau)
+            tau_error = float(np.max(np.abs(delta_tau), initial=0.0))
+            assert tau_error < atol, (
+                "translations: max periodic fractional |delta| = "
+                f"{tau_error:.2e} (tol {atol:.0e})")
         print("validate_against_wfn: all checks passed")
 
 

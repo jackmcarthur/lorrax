@@ -1,20 +1,20 @@
 """Diagonal-Σ(E) fixed point, QSGW Σ_xc build, and SC-COHSEX diagnostics.
 
-The post-self-energy plumbing in ``gw_jax`` operates on **replicated**
-``(nk, nb, nb)`` arrays uniformly; the only object that must remain
-sharded is the dynamic correlation ``Σ_c(ω, k, m_X, n_Y)`` produced by
-``ppm_sigma`` because its ω-axis fan-out makes the full tensor too
-large to replicate.  Everything in this module is structured around
-that seam:
+The post-self-energy plumbing in ``gw_jax`` accepts replicated or
+band-sharded ``(nk, nb, nb)`` arrays.  The dynamic correlation
+``Σ_c(ω, k, m_X, n_Y)`` and any matrix derived from its sharded path retain
+their band tiles; diagonal-only operations extract and return only the bounded
+``(nk, nb)`` diagonal.  Everything in this module is structured around that
+seam:
 
 - :func:`solve_diagonal_sigma_fixed_point` runs on host NumPy with
   vectorised linear interpolation over the (nk, nb) energy grid.  Its
   input ``Σ_diag(ω, k, n)`` is small enough to live replicated.
 - :func:`build_qsgw_sigma_xc` is a JIT'd JAX kernel that takes the
   on-device sharded ``Σ_c(ω)`` and the QP energies ``E_kn`` (replicated)
-  and returns the Hermitised QSGW Σ_xc replicated on the mesh.  No disk
-  round-trip; restart-friendly because the same kernel can be re-called
-  with a refreshed ``Σ_c(ω)`` and ``E_kn`` at every QSGW iteration.
+  and returns the Hermitised QSGW Σ_xc in the selected replicated or
+  two-axis band-sharded layout.  No disk round-trip; restart-friendly because
+  the same kernel can be re-called with refreshed ``Σ_c(ω)`` and ``E_kn``.
 """
 
 from __future__ import annotations
@@ -352,6 +352,15 @@ def is_band_sharded_sigma_omega(a) -> bool:
     return spec[2] is not None or spec[3] is not None
 
 
+def _is_band_sharded_static(a) -> bool:
+    """True when a static ``(nk,nb,nb)`` operator partitions a band axis."""
+    spec = getattr(getattr(a, "sharding", None), "spec", None)
+    if spec is None or getattr(a, "ndim", 0) != 3:
+        return False
+    spec = tuple(spec) + (None,) * (3 - len(tuple(spec)))
+    return spec[1] is not None or spec[2] is not None
+
+
 # Kernel cache: one jit'd extractor per mesh.  Module-scope (NOT a
 # closure inside the caller) so SC iterations hit the pjit cache instead
 # of retracing+recompiling a fresh function object every call.
@@ -361,6 +370,7 @@ _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
 # the band-diagonal adder used by the ``sigma_omega_layout=sharded`` path.
 _EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
 _ADD_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
+_SET_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
 
 def _extract_diag_sharded_kernel(mesh_xy: Mesh):
@@ -470,6 +480,58 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     return fn(sigma_w_kij, diag_rep)
 
 
+def set_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
+    """Replace the diagonal of a band-sharded matrix without gathering it.
+
+    ``sigma_w_kij`` is ``(nlead,nk,nb,nb)`` with
+    ``P(None,None,'x','y')``.  Each device updates only the intersection of
+    its local band tile with the global diagonal; off-diagonal values and the
+    input/output sharding are unchanged.  The only replicated operand is the
+    bounded ``(nlead,nk,nb)`` diagonal.
+    """
+    from common.collectives import device_put_process_local
+
+    if not is_band_sharded_sigma_omega(sigma_w_kij):
+        raise ValueError(
+            "set_band_diag_sharded requires a 4-D band-sharded matrix")
+    diag_np = np.asarray(diag_w_kn, dtype=np.dtype(sigma_w_kij.dtype))
+    if diag_np.shape != tuple(int(v) for v in sigma_w_kij.shape[:3]):
+        raise ValueError(
+            "replacement diagonal shape must match (nlead,nk,nb): "
+            f"got {diag_np.shape}, expected {sigma_w_kij.shape[:3]}")
+
+    mesh_xy = sigma_w_kij.sharding.mesh
+    key = id(mesh_xy)
+    fn = _SET_BAND_DIAG_KERNEL_CACHE.get(key)
+    if fn is None:
+        from functools import partial
+        from common.shard_map import shard_map
+
+        @jax.jit
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=(P(None, None, 'x', 'y'), P(None, None, None)),
+                 out_specs=P(None, None, 'x', 'y'),
+                 check_vma=False)
+        def _set_diag(tile, diag):
+            ix = jax.lax.axis_index('x')
+            iy = jax.lax.axis_index('y')
+            mb, nbl = tile.shape[2], tile.shape[3]
+            rows = ix * mb + jnp.arange(mb)
+            cols = iy * nbl + jnp.arange(nbl)
+            diagonal_tile = rows[:, None] == cols[None, :]
+            replacement = jnp.take(diag, rows, axis=2)[..., :, None]
+            return jnp.where(
+                diagonal_tile[None, None, :, :], replacement, tile)
+
+        fn = _set_diag
+        _SET_BAND_DIAG_KERNEL_CACHE[key] = fn
+
+    diag_rep = device_put_process_local(
+        np.ascontiguousarray(diag_np),
+        NamedSharding(mesh_xy, P(None, None, None)))
+    return fn(sigma_w_kij, diag_rep)
+
+
 def gather_sigma_omega_replicated_host(sigma_w_kij: jax.Array) -> np.ndarray:
     """Explicit escape hatch: reconstruct the FULL Σ_c(ω,k,m,n) on every
     rank's host from the sharded layout (the memo's ``.replicated()`` seam).
@@ -537,13 +599,46 @@ def extract_sigma_diag_replicated(
     return _extract_diag_kernel(mesh_xy)(sigma_w_kij)
 
 
+def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
+    """Return only a static operator's bounded ``(nk,nb)`` diagonal.
+
+    A canonical ``P(None,'x','y')`` input stays tiled: it is promoted by a
+    length-one leading axis and uses the dynamic-Sigma diagonal psum.  A
+    replicated/local input retains the historical host diagonal.  Any other
+    matrix-axis partition refuses instead of causing an implicit all-gather.
+    """
+    from common.collectives import gather_to_host
+
+    arr = jnp.asarray(sigma_knn)
+    if arr.ndim != 3 or int(arr.shape[1]) != int(arr.shape[2]):
+        raise ValueError(
+            "static Sigma diagonal extraction requires (nk,nb,nb); got "
+            f"{arr.shape}")
+    spec = getattr(getattr(arr, "sharding", None), "spec", None)
+    if spec is not None:
+        spec = tuple(spec) + (None,) * (3 - len(tuple(spec)))
+        if spec[1] is not None or spec[2] is not None:
+            if spec != (None, "x", "y"):
+                raise ValueError(
+                    "static Sigma diagonal extraction requires canonical "
+                    "P(None,'x','y') band sharding; got "
+                    f"PartitionSpec{spec}")
+            arr4 = jax.lax.with_sharding_constraint(
+                jnp.expand_dims(arr, axis=0),
+                NamedSharding(mesh_xy, P(None, None, "x", "y")))
+            return np.asarray(gather_to_host(
+                extract_sigma_diag_replicated(arr4, mesh_xy)))[0]
+    host = np.asarray(gather_to_host(arr))
+    return np.diagonal(host, axis1=1, axis2=2).copy()
+
+
 # ---------------------------------------------------------------------------
-# QSGW Σ_xc build — sharded ω-tensor + replicated E_kn → replicated (k, m, n)
+# QSGW Σ_xc build — sharded ω-tensor + replicated E_kn → selected layout
 # ---------------------------------------------------------------------------
 
 # Kernel cache: one jit'd QSGW-build kernel per mesh (the index/weight
-# arrays are runtime args; only the replicated output sharding closes
-# over the mesh).  Module-scope for the same reason as
+# arrays are runtime args; only the selected output sharding closes over the
+# mesh).  Module-scope for the same reason as
 # ``_extract_diag_kernel``: a closure inside ``build_qsgw_sigma_xc``
 # retraced+recompiled the full (nω, nk, nb, nb) gather every SC
 # iteration.
@@ -751,11 +846,9 @@ def write_qsgw_sigma_cube(
       converged single write, and BEFORE ``run_sc_driver`` rotates the
       matrix back to the DFT basis.
 
-    The cube arrives replicated — ``build_qsgw_sigma_xc`` pins it so with
-    a ``with_sharding_constraint`` before it Hermitises — so the rank-0
-    h5py append below has a whole array to write on every process, and
-    the barrier lets the caller rely on the file being complete when this
-    returns.
+    A replicated cube is appended by rank 0.  A band-sharded cube is not
+    gathered for this optional appendix; the omission is announced and all
+    ranks meet the same barrier.
     """
     if not bool(getattr(config, "write_qsgw_datasets", False)):
         return False
@@ -763,6 +856,14 @@ def write_qsgw_sigma_cube(
         return False
     from common.collectives import barrier
     from file_io import append_qsgw_datasets_h5
+
+    if _is_band_sharded_static(sigma_xc_qsgw_kij_ry):
+        print_fn(
+            "  QSGW cube appendix omitted: the live operator is "
+            "P(None,'x','y')-sharded and this optional rank-0 writer does "
+            "not gather it")
+        barrier("qsgw_sigma_cube_append_sharded_skip")
+        return False
 
     if jax.process_index() == 0:
         append_qsgw_datasets_h5(
@@ -842,11 +943,12 @@ def solve_qp(
     sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
         sigma_c_omega, mesh_xy))
     sigma_x_diag_kn_ry = np.real(
-        np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
+        static_sigma_diag_to_host(sig_x, mesh_xy))
     sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
 
-    h0_diag_ry = np.real(
-        np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
+    h0_diag_ry = (
+        np.real(static_sigma_diag_to_host(kin_ion, mesh_xy))
+        + np.real(static_sigma_diag_to_host(sig_h, mesh_xy)))
     efermi_ry = float(sigma_result.efermi_dft_ev) / RYD_TO_EV
     E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
         h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
@@ -906,14 +1008,13 @@ def solve_qp(
         E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
     E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
 
-    # QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
+    # QSGW Σ_xc^QSGW: preserve band sharding when the ω-tensor uses it.
     # Build kernel takes ω-grid and evaluation energies in **eV**; we
     # convert at the seam (kernel internals convert; result is Ry).
-    sig_x_rep = jax.device_put(jnp.asarray(sig_x),
-        NamedSharding(mesh_xy, P(None, None, None)))
     sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
-        sigma_c_omega, sig_x_rep,
+        sigma_c_omega, sig_x,
         omega_grid_ry * RYD_TO_EV, E_sc_rel_ev, mesh_xy,
+        replicated_output=not is_band_sharded_sigma_omega(sigma_c_omega),
     )
     print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
         f"({100*qsgw_diag['frac_clipped']:.1f}%)")
@@ -1012,6 +1113,7 @@ def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
 __all__ = [
     "build_qsgw_sigma_xc",
     "extract_sigma_diag_replicated",
+    "static_sigma_diag_to_host",
     "interp_along_omega",
     "omega_coverage",
     "resolve_out_of_range_policy",

@@ -51,12 +51,11 @@ on the loader as ``trs_holds`` and gates antiunitary rows in :class:`SymMaps`.
 The surface
 -----------
 ``SymMaps(wfn)``
-    The eager table builder.  Publishes ``irr_idx_k``/``sym_idx_k`` (the
-    full-BZ → IBZ row and the operator that gets you there), the q-axis
-    twins, the rotation tables (``R_grid``, ``Rinv_grid``, ``R_cart``,
-    ``R_proper``, ``U_spinor``) and the k−q maps.  ``R_cart`` is the
-    INVERSE Cartesian rotation; rotating a Cartesian index with it
-    untransposed passes norms, traces and hermiticity while being wrong.
+    The eager table builder and operation source of truth.  Consumers use
+    ``operation_rows`` for reciprocal rotation/translation/TR typing,
+    ``cartesian_action`` for polar or axial and time-even or time-odd
+    indices, ``fft_grid_pullback`` for typed real-space gathers, and
+    ``spinor_action``/``unfold_wavefunction`` for states.
 ``KStarMap`` / ``star_select`` / ``star_broadcast`` / ``star_spread``
     IBZ⇄full-BZ for band-index objects, and the residual that checks the
     premise.
@@ -65,7 +64,8 @@ The surface
     unitary/antiunitary band-matrix action.  Nonsymmorphic phases enter through
     the endpoint sewing matrices; vector/covector mixing is an explicit
     caller-supplied component representation.
-``unfold_file_wedge_to_full_bz`` / ``unfold_star_wedge_to_full_bz``
+``unfold_file_wedge_to_full_bz`` / ``unfold_star_wedge_to_full_bz`` /
+``unfold_file_wedge_polar_matrix``
     THE TWO NAMED UNFOLDS, taking a ``SymMaps`` rather than index tables
     so a driver never holds one.  TWO, because there are two different
     IBZs and they are NOT the same size: the FILE wedge (``wfn.kpoints``,
@@ -89,9 +89,7 @@ The surface
     contract on an ``('x','y')`` mesh.
 ``unfold_psi`` / ``spinor_rotation_for_sym_row`` /
 ``apply_spinor_rotation`` / ``tau_phase_row``
-    The ψ-unfold rule, and the single sources of the spinor TRS
-    augmentation, its static one- or two-component application, and the τ
-    phase.
+    Pure-array backends used by the corresponding ``SymMaps`` methods.
 ``kgrid_shift_map`` / ``bgw_signed_q_representative`` /
 ``bgw_integer_q_to_fractional`` / ``common_uniform_grid_indices`` /
 ``find_irreducible_bz_points``
@@ -101,7 +99,8 @@ The surface
     the IBZ reduction (derive-IBZ and anchored-IBZ branches).
 ``real_space_action_tables`` / ``orbit_images`` / ``canonicalize_orbit`` /
 ``unfold_orbit_unique_with_id`` / ``centroid_source_map_and_wrap`` /
-``fft_grid_pullback_perm`` / ``recover_symmorphic_density_point_group``
+``fft_grid_pullback_perm`` / ``recover_atomic_space_group`` /
+``recover_symmorphic_density_point_group``
     Real space: the FFT-grid permutation tables the ISDF centroids and
     the ρ symmetrisation ride on, and the holohedry recovery for decks
     whose header symmetry list is a subset of the true point group.
@@ -209,11 +208,14 @@ from symmetry_maps.maps import (
     star_broadcast,
     reduce_full_bz_to_file_wedge,
     star_tables_of,
+    unfold_file_wedge_polar_matrix,
     unfold_file_wedge_to_full_bz,
     unfold_star_wedge_to_full_bz,
     star_select,
     star_spread,
     tau_phase_row,
+    tau_phase_row_jax,
+    unfold_reciprocal_carriers,
     spinor_rotation_for_sym_row,
     apply_spinor_rotation,
     unfold_psi,
@@ -259,9 +261,11 @@ from symmetry_maps.orbit_syms import (
     project_polar_fft_field,
     grid_point_image_perm,
     orbit_images,
+    permutation_orbit_labels,
     r_action_forward,
     r_action_forward_one,
     snap_to_grid_and_split_wrap,
+    recover_atomic_space_group,
     recover_symmorphic_density_point_group,
     resolve_qgrid_symmetry,
     unfold_orbit_unique_with_id,
@@ -280,6 +284,15 @@ from symmetry_maps.qgrid_trs import (
     trs_pair_coherent_unfold_sym_idx,
     trs_project_self_negative_q_rows,
 )
+from symmetry_maps.qe_schema import (
+    QESymmetryBinding,
+    QESymmetryReceipt,
+    bind_qe_symmetry_receipt,
+    discover_qe_schema_paths,
+    qe_xml_seitz_to_bgw,
+    read_qe_symmetry_receipt,
+    resolve_qe_symmetry_binding,
+)
 from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
@@ -291,6 +304,11 @@ __all__ = [
     "common_uniform_grid_indices",
     "find_irreducible_bz_points",
     "map_full_kpoints_to_irreducible",
+    # QE schema receipt: the operation-type provenance missing from WFN.h5
+    "QESymmetryBinding", "QESymmetryReceipt",
+    "bind_qe_symmetry_receipt", "discover_qe_schema_paths",
+    "qe_xml_seitz_to_bgw", "read_qe_symmetry_receipt",
+    "resolve_qe_symmetry_binding",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
     # directed band-matrix edges: pure table + the one symmetry action
@@ -298,20 +316,23 @@ __all__ = [
     "apply_band_matrix_symmetry",
     # the two named unfolds (file wedge vs star wedge)
     "unfold_file_wedge_to_full_bz", "unfold_star_wedge_to_full_bz",
+    "unfold_file_wedge_polar_matrix",
     "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator", "unfold_isdf_one_leg",
     "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
-    "tau_phase_row",
+    "tau_phase_row", "tau_phase_row_jax", "unfold_reciprocal_carriers",
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
+    "permutation_orbit_labels",
     "fft_grid_pullback_perm", "grid_point_image_perm",
     "PolarFFTFieldProjection", "project_polar_fft_field",
     "r_action_forward", "r_action_forward_one",
     "snap_to_grid_and_split_wrap",
+    "recover_atomic_space_group",
     "recover_symmorphic_density_point_group",
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",

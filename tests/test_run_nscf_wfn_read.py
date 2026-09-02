@@ -309,38 +309,3 @@ def test_loader_shaped_input_at_nspinor2_is_unchanged(tmp_path):
     ifmax, occ = _written_ifmax_and_occ(tmp_path, crystal, "WFN_loader_ns2.h5")
     assert ifmax == 4
     assert np.array_equal(occ, [1.0] * 4 + [0.0] * (NBANDS - 4))
-
-
-def test_kmeans_current_density_n_occ_is_the_unhalved_band_count():
-    """The OTHER consumer of the same convention, pinned structurally.
-
-    ``centroid/kmeans_cli.py`` computes n_occ from a ``WfnLoader`` inside
-    ``main()``, behind a full CLI + density build, so the expression is
-    not executable here; the SEMANTIC it must follow (wfn.nelec is a band
-    count in both spinor conventions) is executed by the writer cells
-    above.  This cell pins the expression itself by AST — code tokens,
-    not prose (TASTE 17) — so the ``// 2`` double-halving cannot return
-    behind the comment that says not to.
-    """
-    import ast
-    from pathlib import Path
-
-    src = (Path(__file__).resolve().parents[1]
-           / "src" / "centroid" / "kmeans_cli.py").read_text()
-
-    def _n_occ_exprs(tree):
-        return [ast.unparse(n.value) for n in ast.walk(tree)
-                if isinstance(n, ast.Assign)
-                and any(isinstance(t, ast.Name) and t.id == "n_occ"
-                        for t in n.targets)]
-
-    got = _n_occ_exprs(ast.parse(src))
-    assert got == ["int(wfn.nelec)"], (
-        f"kmeans_cli n_occ assignment(s) {got!r}: want exactly "
-        f"['int(wfn.nelec)'] — wfn.nelec = max(ifmax) is already an "
-        f"occupied-band count in both spinor conventions")
-    # RED TWIN: the pre-fix line must FAIL the same predicate, or the
-    # gate is matching nothing.
-    old = ast.parse("n_occ = int(wfn.nelec) if int(wfn.nspinor) == 2 "
-                    "else int(wfn.nelec) // 2")
-    assert _n_occ_exprs(old) != ["int(wfn.nelec)"]

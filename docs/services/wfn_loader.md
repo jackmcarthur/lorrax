@@ -55,10 +55,13 @@ for the real one, which is exactly what the deleted shim was.
 
 | name | what it is |
 |---|---|
-| `WfnLoader(path, *, mesh=None, backend='auto')` | Open the WFN, read metadata, and check a 2c DFT reference before TRS unfolding. |
+| `WfnLoader(path, *, mesh=None, backend='auto', qe_schema=None)` | Open the WFN and check a 2c DFT reference before symmetry unfolding. `qe_schema=None` performs bounded WFN-anchored discovery at first `symmetry()`; an explicit schema must authenticate or the call refuses. |
 | `load(*, bands, k='full_bz', sharding=None, bispinor=False)` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. |
 | `load_process_local(*, bands, k, bispinor=False)` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. |
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
+| `full_k_parent_groups(full_k=None)` | Stable O(nk) grouping of requested full-BZ rows by raw IBZ parent. |
+| `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False)` | Apply the canonical typed unitary/antiunitary action to one already-loaded raw parent row. Consumers can realize a star with one child workspace and no parent re-read. |
+| `full_k_box_index_one_dev(full_k)` | Build one child's replicated FFT gather index from the current parent G row; strict one-k streams avoid retained full-BZ G/index tables. |
 | `gvecs(k=...)` | `(n_k, ngkmax, 3)` int32, pad rows = the FFT-box **pad sentinel**, never zeros. |
 | `ngk_valid(k=...)` | The mask that makes the pad rows discountable. The pair is the contract. |
 | `box_index(k=...)` / `box_index_dev(...)` | FFT-box gather table, host / device-cached (the replicated-buffer-leak fix). |
@@ -67,6 +70,7 @@ for the real one, which is exactly what the deleted shim was.
 | `get_gvec_nk(ik)` | Deprecated one-k shim for legacy vcoul/qp_wfn; one release. |
 | header surface | The `MfHeader` fields (`nkpts`, `nbands`, `nspinor`, `kgrid`, `fft_grid`, `bvec`, …) plus derived `nelec/vbm/cbm/efermi/atom_crys`, same names `WFNReader` exposed. |
 | `trs_holds`, `trs_reference` | 2c occupied-subspace verdict and receipt. `density_symmetry` is a temporary compatibility alias. |
+| `qe_symmetry_binding`, `qe_symmetry_diagnostic` | Authenticated per-operation unitary/antiunitary provenance, or the reason initialization must use and loudly announce the WFN-only fallback. |
 | `close()` / context manager | Releases the h5py handle and the SlabIO handle. |
 
 ## Contract
@@ -96,6 +100,13 @@ for the real one, which is exactly what the deleted shim was.
   array (every rank must request the same window); `load_process_local`
   is the k-parallel primitive (per-rank windows, combination explicit).
   They are different primitives, not a flag.
+* **Parent/star streaming keeps one-k memory.** Every full-k star loads its
+  raw IBZ parent once per band tile and realizes children serially through
+  `unfold_parent_to_full_k`. One parent G row and its symmetry-bounded star of
+  FFT indices are retained across those tiles, then released. A nonzero child
+  phase is one separate device vector; zero translations skip it. No dense
+  full-k phase, G-vector, or FFT-index table exists on this path. The
+  four-component lift derives child G on device from the same parent row.
 * **Late mesh binding is narrow.** `adopt_mesh` switches only a
   multi-process, auto-picked, currently-eager loader; explicit requests
   are never overridden.

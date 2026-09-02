@@ -1442,8 +1442,8 @@ _DEFAULTS = {
     "wfn_file": "WFN.h5",
     "centroids_file": "centroids_frac.txt",
     # Optional second centroid file used by the bispinor pipeline:
-    # μ_L=1,2,3 (transverse) ζ-fits use Gordon-current-density centroids
-    # rather than the charge-density centroids in ``centroids_file``.
+    # μ_L=1,2,3 fits use the three-current feature metric rather than the
+    # charge feature metric used by ``centroids_file``.
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
@@ -3167,7 +3167,7 @@ class FilePaths:
     """Output filenames + non-WFN inputs.  Resolved to absolute paths."""
     wfn_file: str
     centroids_file: str
-    # Bispinor: optional Gordon-current-density centroid file for μ_L=1,2,3.
+    # Bispinor: optional three-current centroid file for μ_L=1,2,3.
     # ``None`` falls back to the scalar charge-only path (CC tile only).
     centroids_file_current: str | None
     kin_ion_file: str

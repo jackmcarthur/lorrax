@@ -249,7 +249,8 @@ def write_sigma_to_file(
 	"""Write self-energy components to file.
 
 	Args:
-		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb)
+		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb),
+			or its already-extracted diagonal with shape (nk, nb).
 		filename: Output file path
 		kpoints_crys: (nk, 3) crystal coordinates, ONE ROW PER Sigma ROW.
 			REQUIRED, and checked against ``nk``.  See the k-BASIS note
@@ -304,7 +305,15 @@ def write_sigma_to_file(
 	A separate ``#`` line is invisible to every one of them, exactly as
 	the existing ruler line already is.
 	"""
-	nk, nbands, _ = sigma_sx_kij_eV.shape
+	_shape = np.shape(sigma_sx_kij_eV)
+	if len(_shape) == 2:
+		nk, nbands = _shape
+	elif len(_shape) == 3 and _shape[1] == _shape[2]:
+		nk, nbands, _ = _shape
+	else:
+		raise ValueError(
+			"sigma_sx_kij_eV must be (nk,nb) or (nk,nb,nb); got "
+			f"{_shape}")
 	kpts = np.asarray(kpoints_crys, dtype=np.float64)
 	if kpts.shape != (nk, 3):
 		# The structural guard: handing 64 rows of full-BZ Sigma an
@@ -344,7 +353,14 @@ def write_sigma_to_file(
 		"""The (nk, nbands) diagonal actually written, or None."""
 		if a is None:
 			return None
-		return np.asarray(a)[:, np.arange(nbands), np.arange(nbands)]
+		arr = np.asarray(a)
+		if arr.shape == (nk, nbands):
+			return arr
+		if arr.shape == (nk, nbands, nbands):
+			return arr[:, np.arange(nbands), np.arange(nbands)]
+		raise ValueError(
+			"Sigma output component must match the leading component as "
+			f"(nk,nb) or (nk,nb,nb); got {arr.shape}")
 
 	sx_diag = _diag(sigma_sx_kij_eV)
 	coh_diag = _diag(sigma_coh_kij_eV)

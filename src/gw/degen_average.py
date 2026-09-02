@@ -103,29 +103,60 @@ def average_sigma_components(
     - ``sig_sx, sig_coh, sig_h, sig_x``   → consistent sigma_diag.dat
     - ``sigma_c_at_dft_ev`` (1-D, or None) → consistent eqp.dat ``sigC``
 
-    Off-diagonals are preserved.  The averaging is cheap (a host loop
-    over k of contiguous degeneracy groups) so the redundancy across
-    components is not a perf concern.  Matrices come back replicated on
-    ``mesh_xy`` (``P(None, None, None)``), matching the post-Σ seam.
+    Off-diagonals are preserved.  A replicated input remains replicated.  A
+    ``P(None,'x','y')`` input extracts only its ``nk*nb`` diagonal, averages
+    that bounded table on host, and writes it back into the existing tiles;
+    the ``nk*nb^2`` component is never gathered or replicated.
 
     Returns the eight inputs, averaged, in the same order.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
+    import jax
+    import jax.numpy as jnp
     from common.collectives import device_put_process_local, gather_to_host
+    from gw.qsgw_utils import (
+        is_band_sharded_sigma_omega,
+        set_band_diag_sharded,
+        static_sigma_diag_to_host,
+    )
 
     rep = NamedSharding(mesh_xy, P(None, None, None))
+    band_4d = NamedSharding(mesh_xy, P(None, None, "x", "y"))
 
-    # Process-local replication, NOT plain ``jax.device_put``: the latter
-    # fires JAX's hidden ``assert_equal`` all-gather on a multi-process
-    # mesh — P × nk × nb² × 16 B per matrix, six matrices (scorecard
-    # AA.1).  Each averaged matrix is a deterministic host function of
-    # the (replicated) Σ components, identical on every rank;
-    # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
+    def _is_band_sharded_3d(M):
+        spec = getattr(getattr(M, "sharding", None), "spec", None)
+        if spec is None or getattr(M, "ndim", 0) != 3:
+            return False
+        spec = tuple(spec) + (None,) * (3 - len(tuple(spec)))
+        if spec[1] is None and spec[2] is None:
+            return False
+        if spec != (None, "x", "y"):
+            raise ValueError(
+                "static Sigma degeneracy averaging requires canonical "
+                "P(None,'x','y') band sharding; got "
+                f"PartitionSpec{spec}")
+        return True
+
     def _dav(M):
-        # gather_to_host, not np.asarray: under sigma_omega_layout=sharded
-        # (mandatory for MPA metals) M spans other processes' devices and a
-        # host fetch raises; the gather returns the identical full array on
-        # every process, so the averaged result stays replica-consistent.
+        # Reuse the dynamic-Sigma diagonal backend by adding a length-one
+        # leading axis.  Its shard_map extracts exactly nk*nb values with one
+        # psum; the setter changes only diagonal entries in each owned tile.
+        if _is_band_sharded_3d(M):
+            M4 = jax.lax.with_sharding_constraint(
+                jnp.expand_dims(M, axis=0), band_4d)
+            if not is_band_sharded_sigma_omega(M4):
+                raise ValueError(
+                    "band-sharded Sigma lost its matrix-axis layout while "
+                    "adding the temporary leading axis")
+            diag = static_sigma_diag_to_host(M, mesh_xy)
+            averaged = average_within_degenerate_sets(
+                diag, energies_kn_ry, tol_ry)
+            return set_band_diag_sharded(M4, averaged[None, ...])[0]
+
+        # Process-local replication, NOT plain ``jax.device_put``: the latter
+        # fires JAX's hidden ``assert_equal`` all-gather on a multi-process
+        # mesh.  Replication is retained only when the input already selected
+        # that bounded post-Sigma layout.
         return device_put_process_local(apply_to_matrix_diagonals(
             gather_to_host(M), energies_kn_ry, tol_ry), rep)
 

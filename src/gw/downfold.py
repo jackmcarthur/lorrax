@@ -610,37 +610,18 @@ def centroid_orbit_id(sym_perm) -> np.ndarray:
     construction.
 
     Labels are CONTIGUOUS from 0 and ordered by first appearance, so
-    ``np.bincount`` of the result is the orbit census.  Union-find with path
-    compression: O(n_sym · n_rmu) and no allocation past the parent array.
+    ``np.bincount`` of the result is the orbit census.  The conversion itself
+    is owned by the ``symmetry_maps`` service.
     """
-    perm = np.asarray(sym_perm, dtype=np.int64)
-    if perm.ndim != 2:
-        raise ValueError(
-            f"downfold.centroid_orbit_id: sym_perm must be (n_sym, n_rmu); "
-            f"got shape {perm.shape}.")
-    n = int(perm.shape[1])
-    parent = np.arange(n, dtype=np.int64)
+    # The symmetry service owns action-table -> orbit identity.  Keep this
+    # public spelling as the downfold compatibility surface, but do not carry
+    # a second union-find implementation in a physics driver.
+    from symmetry_maps import permutation_orbit_labels
 
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    for s in range(int(perm.shape[0])):
-        row = perm[s]
-        if int(row.min()) < 0 or int(row.max()) >= n:
-            raise ValueError(
-                f"downfold.centroid_orbit_id: sym_perm row {s} leaves the "
-                f"centroid index range [0, {n}) — it is not a permutation of "
-                f"the parent's centroid table.")
-        for mu in range(n):
-            ra, rb = find(mu), find(int(row[mu]))
-            if ra != rb:
-                parent[max(ra, rb)] = min(ra, rb)
-    roots = np.array([find(i) for i in range(n)], dtype=np.int64)
-    _, label = np.unique(roots, return_inverse=True)
-    return label.astype(np.int32)
+    try:
+        return permutation_orbit_labels(sym_perm)
+    except ValueError as exc:
+        raise ValueError(f"downfold.centroid_orbit_id: {exc}") from exc
 
 
 def _orbit_census_line(sizes: np.ndarray) -> str:

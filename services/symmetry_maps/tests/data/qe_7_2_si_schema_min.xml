@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<!-- Minimized from DEV-126's QE 7.2 Si data-file-schema.xml, SHA256
+     87c14906642f...; numeric text and element nesting are unchanged. -->
+<espresso>
+  <input>
+    <symmetry_flags>
+      <nosym>false</nosym><noinv>false</noinv><no_t_rev>true</no_t_rev>
+      <force_symmorphic>false</force_symmorphic>
+    </symmetry_flags>
+  </input>
+  <output>
+    <symmetries>
+      <symmetry>
+        <info name="identity">crystal_symmetry</info>
+        <rotation rank="2" dims="3 3">
+ 1.000000000000000E+000 0.000000000000000E+000 0.000000000000000E+000
+ 0.000000000000000E+000 1.000000000000000E+000 0.000000000000000E+000
+ 0.000000000000000E+000 0.000000000000000E+000 1.000000000000000E+000
+        </rotation>
+        <fractional_translation>
+ 0.000000000000000E+000 0.000000000000000E+000 0.000000000000000E+000
+        </fractional_translation>
+      </symmetry>
+      <symmetry>
+        <info name="180 deg rotation - cart. axis [0,0,1]">crystal_symmetry</info>
+        <rotation rank="2" dims="3 3">
+-1.000000000000000E+000 -1.000000000000000E+000 -1.000000000000000E+000
+ 0.000000000000000E+000  0.000000000000000E+000  1.000000000000000E+000
+ 0.000000000000000E+000  1.000000000000000E+000  0.000000000000000E+000
+        </rotation>
+        <fractional_translation>
+-4.999999999999999E-001 2.775557561562891E-017 -2.775557561562891E-017
+        </fractional_translation>
+      </symmetry>
+    </symmetries>
+    <basis_set><reciprocal_lattice>
+      <b1>7.071067811865476E-001 7.071067811865476E-001 -7.071067811865476E-001</b1>
+      <b2>-7.071067811865476E-001 7.071067811865476E-001 7.071067811865476E-001</b2>
+      <b3>7.071067811865476E-001 -7.071067811865476E-001 7.071067811865476E-001</b3>
+    </reciprocal_lattice></basis_set>
+    <magnetization><noncolin>false</noncolin></magnetization>
+    <band_structure>
+      <noncolin>false</noncolin>
+      <starting_k_points><nk>1</nk></starting_k_points>
+      <ks_energies><k_point weight="1.0">0 0 0</k_point></ks_energies>
+    </band_structure>
+  </output>
+</espresso>

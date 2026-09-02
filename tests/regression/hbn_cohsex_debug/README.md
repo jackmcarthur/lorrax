@@ -189,11 +189,14 @@ this directory are the **as-run** ones.
 
 ### How the 330-centroid set was made — orbit-closed, 330 not 320
 
-    python3 -u -m centroid.kmeans_cli 320 --qe-save <prep>/qe/hbn.save
+    python3 -u -m centroid.kmeans_cli 320
 
-run from the prep directory.  The generator recovered a **12-op symmorphic
-point group from the charge density** (`[orbit] WFN stores 1 sym op(s)`,
-because the nscf is `nosym`), unfolded 40 representatives to 468 distinct
+The committed fixture predates the current selector: its generating checkout
+used the now-retired `--qe-save` density route and recovered a **12-op
+symmorphic point group from the charge density**. The current command above
+uses the decorated atoms' spatial Seitz group and a unit-band feature metric;
+it is the migration command, not a promise to reproduce the historical set.
+The historical run unfolded 40 representatives to 468 distinct
 centroids, and — selecting whole ORBITS, which is the shipping default —
 picked **28 orbits → 330 unfolded centroids (orbit-closed)**, rank gate
 `28/28 directions certified (floor 28, tol 0.01) — PASS`.

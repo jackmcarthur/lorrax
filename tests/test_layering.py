@@ -104,6 +104,7 @@ _L3_MODULES = frozenset({
     # import, and a startup fact that only ``runtime`` consumes is a sibling
     # of ``runtime``, not something above it.
     "runtime", "runtime.aot_memory", "runtime.padding",
+    "common.grouped_layout",
     "runtime.production_stream", "runtime.xla_memory",
     "runtime.jax_support", "runtime.pjrt_log_filter",
     # ``runtime.env_flags`` — THE boolean-env grammar, and its level is the
