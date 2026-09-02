@@ -419,10 +419,14 @@ class StaticGaugeFirstOrderComponent:
     ``energy_scaled_d1_raw[a,I]`` is
     ``P^(I,a)=-DeltaE*D^(I,a)`` in the canonical in-plane ``(a,I)=(2,4)``
     order.  ``S_first_first`` is only the corresponding bilinear response
-    term, shaped ``(n_omega,2,2,4,4)``.  It is deliberately not a
-    :class:`gw.head_correction.StaticGaugeHeadResponse`: response-weight
-    second derivatives, the complete second state/vertex jet, and contact
-    terms are absent.
+    term, shaped ``(n_omega,2,2,4,4)``.  It is deliberately not a head
+    response record: response-weight second derivatives, the complete
+    second state/vertex jet, and contact terms are absent.  The full
+    static-gauge response this once fed (``StaticGaugeHeadResponse``) was
+    deleted 2026-09-01 with its producerless seam; the one head record the
+    packed completion reads today is
+    :class:`gw.static_gauge_response.StaticPhotonHeadResponse`, which has
+    charge support only and does not consume this component.
 
     The band-linear fields retain the mesh-padded band extent.  They are
     derivatives with respect to Cartesian transfer q for the bra ``k-q``
@@ -454,9 +458,10 @@ class StaticGaugeSecondOrderComponent:
     derivative, not the coefficient of ``q_a q_b`` (the latter is one half).
 
     This object is deliberately retained-manifold and bubble-only.  It is
-    not a :class:`gw.head_correction.StaticGaugeHeadResponse`: complement-
-    space state response, metallic occupation derivatives, contact response,
-    body lineage, and persistence are absent.
+    not a head response record: complement-space state response, metallic
+    occupation derivatives, contact response, body lineage, and persistence
+    are absent, and no production path consumes it (see
+    :class:`StaticGaugeFirstOrderComponent`).
     """
 
     first_order: StaticGaugeFirstOrderComponent
@@ -478,7 +483,8 @@ class StaticGaugeSecondOrderComponent:
         ``(xx,xy,yy)`` as ``S_bubble_second_derivative``.  Taylor's theorem
         supplies the factor ``1/2``.  This view expands the result to
         ``(n_omega,2,2,4,4)`` so that its axes match the ``S_direct``
-        convention of :class:`gw.head_correction.StaticGaugeHeadResponse`::
+        convention of
+        :class:`gw.static_gauge_response.StaticPhotonHeadResponse`::
 
             Pi_bubble(q) = q_a q_b S_bubble_q2_coefficient_cart[a,b]
 

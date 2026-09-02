@@ -62,6 +62,7 @@ from .v_q_bispinor import BispinorVqReader
 from .wavefunction_bundle import (
     bundle_bytes_per_rank,
     face_kernel_kwargs,
+    padded_centroid_extent,
     with_lorentz_vertices,
 )
 
@@ -71,21 +72,6 @@ from .wavefunction_bundle import (
 # (0, 0) bare-CC tile is handled by the existing scalar
 # compute_cohsex_sigma path.
 _TRANSVERSE_INDICES = (1, 2, 3)
-
-
-def _n_rmu_padded(wfns) -> int:
-    """PADDED μ (centroid) extent of a transverse bundle, whichever field
-    it lives on for ``wfns.layout`` — the extent :func:`_pad_V_to_padded`
-    below pads the on-disk V tile up to.  ``psi_yr``'s trailing axis
-    under legacy, ``psi_mun``'s μ axis (index 2) under face — both are
-    the SAME logical quantity (``load_centroids_band_chunked``'s padded
-    n_rmu), just carried by a different field per layout (module
-    docstring of ``gw.wavefunction_bundle``)."""
-    if wfns.layout == "legacy":
-        return int(wfns.psi_yr.shape[-1])
-    if wfns.layout == "face":
-        return int(wfns.psi_mun.shape[2])
-    raise ValueError(f"_n_rmu_padded: unknown layout {wfns.layout!r}")
 
 
 def compute_sigma_x_bispinor(
@@ -181,7 +167,10 @@ def compute_sigma_x_bispinor(
     # to mesh-product); V tiles on disk are at LOGICAL extent.  Pad V to
     # match ψ's μ-axis so the convolve broadcasts correctly.  Pad rows
     # of ψ are zero (Phase 3a invariant), so zero-padding V is exact.
-    n_rmu_T_padded = _n_rmu_padded(wfns_transverse)
+    # The extent :func:`_pad_V_to_padded` pads the on-disk V tile up to;
+    # one owner (gw.wavefunction_bundle.padded_centroid_extent) for this
+    # module, the packed response and the sixteen-block Sigma.
+    n_rmu_T_padded = padded_centroid_extent(wfns_transverse)
 
     def _pad_V_to_padded(V_logical: jax.Array) -> jax.Array:
         n_l = int(V_logical.shape[-2])

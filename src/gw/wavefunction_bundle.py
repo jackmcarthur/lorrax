@@ -546,6 +546,24 @@ def psi_field_names(layout: str) -> tuple[str, ...]:
     raise ValueError(f"psi_field_names: unknown layout {layout!r}")
 
 
+def padded_centroid_extent(wfns: "Wavefunctions") -> int:
+    """PADDED centroid (μ) extent of ``wfns``, whichever field carries it.
+
+    ``psi_yr``'s trailing axis under ``'legacy'``, ``psi_mun``'s μ axis
+    (index 2) under ``'face'`` — the SAME logical quantity
+    (``load_centroids_band_chunked``'s mesh-padded ``n_rmu``), carried by a
+    different field per layout.  The ONE owner of that read: the packed
+    photon response, the sixteen-block photon Σ and the bare Σ^B all pad
+    their on-disk V tiles up to this extent and must agree on it.
+    """
+    if wfns.layout == "legacy":
+        return int(wfns.psi_yr.shape[-1])
+    if wfns.layout == "face":
+        return int(wfns.psi_mun.shape[2])
+    raise ValueError(
+        f"padded_centroid_extent: unknown layout {wfns.layout!r}")
+
+
 def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
     """MEASURED (never modeled) per-rank byte residency of this bundle's
     ψ fields, read off each array's OWN ``.addressable_shards`` — the

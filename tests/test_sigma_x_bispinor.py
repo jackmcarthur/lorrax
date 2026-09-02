@@ -70,14 +70,16 @@ def test_gamma_apply_matches_dense_matmul_yr_axis():
 
 
 def test_wfns_replace_no_op_for_00():
-    """For (μ_L, ν_L) = (0, 0), ``_wfns_with_lorentz_vertices`` must
-    return a Wavefunctions whose psi_xn / psi_yr are the *same*
+    """For (μ_L, ν_L) = (0, 0), ``gw.wavefunction_bundle.
+    with_lorentz_vertices`` (the vertex-fold owner since 2026-08-23; the
+    private ``sigma_x_bispinor._wfns_with_lorentz_vertices`` it replaced is
+    gone) must return a Wavefunctions whose psi_xn / psi_yr are the *same*
     arrays as the input (bit-identical, not just equal-valued).
 
     This is the bispinor → scalar reduction safeguard: a downstream
     σ_X^B at (0,0) is byte-equivalent to today's scalar Σ_X.
     """
-    from src.gw.sigma_x_bispinor import _wfns_with_lorentz_vertices
+    from gw.wavefunction_bundle import with_lorentz_vertices
 
     rng = np.random.default_rng(3)
     nk, ns, mu_x, nb, mu_y = 2, 4, 5, 3, 6
@@ -88,6 +90,9 @@ def test_wfns_replace_no_op_for_00():
         psi_xr: jax.Array
         psi_yr: jax.Array
         psi_yn: jax.Array
+        # The owner dispatches on the bundle's layout (legacy folds into
+        # psi_xn / psi_yr); the synthetic bundle must therefore say which.
+        layout: str = "legacy"
 
     wfns = WfnsLike(
         psi_xn=jnp.asarray(rng.standard_normal((nk, ns, mu_x, nb)).astype(np.complex128)),
@@ -96,8 +101,10 @@ def test_wfns_replace_no_op_for_00():
         psi_yn=jnp.asarray(rng.standard_normal((nk, ns, mu_y, nb)).astype(np.complex128)),
     )
 
-    out = _wfns_with_lorentz_vertices(wfns, 0, 0)
-    # No-op short-circuit: the same array objects come back.
+    out = with_lorentz_vertices(wfns, 0, 0)
+    # No-op short-circuit: the same bundle object comes back, so the same
+    # array objects do too.
+    assert out is wfns
     assert out.psi_xn is wfns.psi_xn
     assert out.psi_yr is wfns.psi_yr
     # The other two are passed through dataclasses.replace so they're
@@ -111,7 +118,7 @@ def dataclass_with_replace_fixture():
 
     The real ``Wavefunctions`` class has many fields we don't need
     here; this fixture builds the minimal surface so we can exercise
-    ``_wfns_with_lorentz_vertices``.
+    ``with_lorentz_vertices``.
     """
     from dataclasses import dataclass
     return dataclass
