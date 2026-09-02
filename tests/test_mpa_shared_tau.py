@@ -58,6 +58,28 @@ def test_selector_boundary_is_strict_below_and_inclusive_above():
     np.testing.assert_allclose(got, want, rtol=2e-15, atol=2e-15)
 
 
+def test_selector_regions_are_or_not_repeated():
+    B = np.ones((1, 1, 1, 3), dtype=np.complex128)
+    Omega = np.asarray([[[[
+        0.2 - 0.1j, 1.0 - 0.2j, 4.0 - 0.3j,
+    ]]]])
+    bounds = np.asarray([[[
+        -np.inf, 0.5, -np.inf, -np.inf, np.inf, np.inf,
+    ], [
+        3.0, np.inf, -np.inf, -np.inf, np.inf, np.inf,
+    ]]])
+    t = 0.3
+    got = np.asarray(build_shared_w_tau(
+        B, Omega, np.asarray([0]), bounds,
+        np.asarray([False]), 0.0, t))
+    want = np.asarray([[[
+        np.exp(-1j * Omega[0, 0, 0, 0] * t),
+        0.0,
+        np.exp(-1j * Omega[0, 0, 0, 2] * t),
+    ]]])
+    np.testing.assert_allclose(got, want, rtol=2e-15, atol=2e-15)
+
+
 def test_device_frequency_fold_and_one_sided_completion():
     mesh = _mesh()
     sigma_sharding = NamedSharding(mesh, P(None, "x", "y"))

@@ -3584,9 +3584,9 @@ class PoleReader:
     """ONE collective handle serving every pole batch of one iteration.
 
     WHY THIS EXISTS (audit A1 fix 2).  The Σ stage walks the pole axis in
-    batches so no complete pole tensor ever exists on host or device, and
-    it walks it TWICE per iteration — once for the census that plans the
-    windows, once for the spatial executor.  Called through
+    batches so no complete pole tensor ever exists on host or device.  The
+    pane control walks it twice (census, executor); the box route walks it
+    three times (pole CDF, selected-region census, executor).  Called through
     :func:`read_poles`, each batch opened and closed its own h5py handle
     (ledger), its own collective ``SlabIO``, and a THIRD h5py handle for
     the unfold tables — and the third one landed *between* the two, so the

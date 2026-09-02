@@ -1038,11 +1038,12 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
                        phase_real, E_ref_B, t_node):
     """Build one W(tau) tile from selected multipole fields.
 
-    ``bounds`` rows are ``(a_gt, a_le, gamma_ge, gamma_gt, gamma_lt,
-    gamma_le)``.  Each row selects one pole field; ``phase_real`` chooses
-    the accepted near-axis functional ``Re(Omega)`` for that row, otherwise
-    the fitted complex pole is used.  The pole axis is never materialized in
-    W: the loop carries one ``(q, mu, nu)`` tile.
+    ``bounds`` has shape ``(n_poles, 6)`` or ``(n_poles, n_regions, 6)``;
+    the last-axis rows are ``(a_gt, a_le, gamma_ge, gamma_gt, gamma_lt,
+    gamma_le)`` and regions for one pole field are ORed.  ``phase_real``
+    chooses the accepted near-axis functional ``Re(Omega)`` for that row,
+    otherwise the fitted complex pole is used.  The pole axis is never
+    materialized in W: the loop carries one ``(q, mu, nu)`` tile.
     """
     def _add(index, W_t):
         pole = jax.lax.dynamic_index_in_dim(
@@ -1057,9 +1058,19 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
             phase_real, index, axis=0, keepdims=False)
         a = jnp.real(omega)
         gamma = -jnp.imag(omega)
-        selected = ((a > b[0]) & (a <= b[1])
-                    & (gamma >= b[2]) & (gamma > b[3])
-                    & (gamma < b[4]) & (gamma <= b[5]))
+        if b.ndim == 1:
+            b = b[None, :]
+
+        def add_region(region, selected):
+            r = jax.lax.dynamic_index_in_dim(
+                b, region, axis=0, keepdims=False)
+            return selected | (
+                (a > r[0]) & (a <= r[1])
+                & (gamma >= r[2]) & (gamma > r[3])
+                & (gamma < r[4]) & (gamma <= r[5]))
+
+        selected = jax.lax.fori_loop(
+            0, b.shape[0], add_region, jnp.zeros(a.shape, dtype=bool))
         phase = jnp.where(use_real, a + 0.0j, omega)
         return W_t + jnp.where(
             selected,
