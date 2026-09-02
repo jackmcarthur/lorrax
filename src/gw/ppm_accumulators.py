@@ -116,11 +116,18 @@ def _project_tau_onto_omega_np(
     ``sigma_im is None`` and ``sigma_re`` carries X (bilinearity:
     ψ†σψ = ψ†σ_Rψ + i·ψ†σ_Iψ, so coeff·X equals the recombined two-channel
     product to GEMM-association roundoff; gated at 1e-12).  Crossing
-    (code=1): GN-PPM arrives as the real/imag pair ``(sigma_re, sigma_im)``
-    and this consumer recombines them into X on host; MPA's shared tau kernel
-    arrives as the already-merged X.  The completion needs only X, so both
-    carriers are mathematically equivalent at this boundary.  A two-channel
-    pair at code=0 remains a dispatch bug (its recombine branch died when the
+    (code=1): σ^τ arrives as the real/imag pair ``(sigma_re, sigma_im)``,
+    and this consumer recombines them into X on host.  Since the crossing
+    completion turned out to need only X (2026-08-09), that split is now a
+    channel-plan/perf choice, NOT a mathematical necessity — the old
+    rationale ("the crossing math cannot be recovered from X") was the
+    elementwise-Im defect talking, and collapsing crossing onto the merged
+    single-chain kernel is a real, owner-scoped option that is deliberately
+    NOT taken here (it would move the τ-kernel dispatch, the collective
+    payloads and the D2H volume, none of which this physics fix should
+    touch).  Until it is taken, the carrier contract stands and any
+    cross-pairing is a dispatch bug and raises: a merged tile at code=1,
+    and a two-channel pair at code=0 (whose recombine branch died when the
     merge became the default).
     """
     # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
@@ -135,11 +142,13 @@ def _project_tau_onto_omega_np(
     coeff = _omega_coefficient(
         np, omega_vec, t_node, alpha_eff, omega_sign, pref)
     if sigma_im is None:
-        # Merged plan: sigma_re IS the complex X = S_R + i·S_I.  GN uses
-        # this carrier for Laplace windows; MPA uses it for both window kinds
-        # and closes a crossing window with the same global band adjoint.
-        if project_code not in (0, 1):
-            raise ValueError(f"Unknown project_code {project_code}")
+        # Laplace plan: sigma_re IS the complex X = S_R + i·S_I.
+        if project_code != 0:
+            raise ValueError(
+                "merged single-chain σ (X = ψ†σψ) reached a crossing "
+                "consumer (project_code=1) — the crossing window needs the "
+                "(S_R, S_I) pair and must dispatch the two-channel kernel "
+                "(ppm_sigma window dispatch bug).")
         contrib = _coeff_times_x(np, coeff, sigma_re)
         return np.asarray(contrib, dtype=np.complex128)
     # Two-channel (S_R, S_I) pair: crossing windows only.  The Laplace
@@ -580,30 +589,6 @@ def _device_omega_add(sharding, omega_axis):
 
 
 @lru_cache(maxsize=8)
-def _device_tau_window_loop(tau_kernel, sharding, omega_axis):
-    """One runtime-bounded tau loop over a fixed-capacity node carrier.
-
-    The large physics operands are loop invariants and the live loop state is
-    only the running omega accumulator.  Each iteration calls the existing
-    one-tau kernel and immediately folds its transient ``(k, m_X, n_Y)`` tile;
-    no ``sigma_tau[capacity, ...]`` history exists.
-    """
-    def _loop(acc, t_pad, coeff_pad, n_tau, *tau_args):
-        def _body(index, running):
-            t_node = jax.lax.dynamic_index_in_dim(
-                t_pad, index, axis=0, keepdims=False)
-            coeff = jax.lax.dynamic_index_in_dim(
-                coeff_pad, index, axis=0, keepdims=False)
-            sigma_tau = tau_kernel(*tau_args, t_node)
-            return _omega_fold(running, sigma_tau, coeff, omega_axis)
-
-        return jax.lax.fori_loop(0, n_tau, _body, acc)
-
-    return jax.jit(
-        _loop, donate_argnums=(0,), out_shardings=sharding)
-
-
-@lru_cache(maxsize=8)
 def _device_output_add(sharding):
     return jax.jit(
         lambda total, window: total + window,
@@ -641,13 +626,11 @@ class DeviceOmegaAccumulator:
         self._total = _device_output_zeros(self._shape, sharding)()
         self._window = None
         self._coeff = None
-        self._t_pad = None
-        self._n_tau = 0
         self._index = 0
 
     def begin_window(self, t, alpha, *, omega_sign, prefactor,
                      e_ref_sum=0.0, antihermitian=False,
-                     omega_indices=None, omega_values=None, capacity=None):
+                     omega_indices=None, omega_values=None):
         if self._coeff is not None:
             raise RuntimeError("previous frequency window is still open")
         t = np.asarray(jax.device_get(t), np.complex128)
@@ -669,22 +652,12 @@ class DeviceOmegaAccumulator:
             np, omega[None, :], t[:, None], alpha[:, None],
             float(omega_sign), float(prefactor), float(e_ref_sum)),
             np.complex128)
-        n_tau = int(t.size)
-        capacity = n_tau if capacity is None else int(capacity)
-        if capacity < n_tau:
-            raise ValueError(
-                f"tau capacity {capacity} is smaller than n_tau {n_tau}")
-        self._t_pad = np.zeros(capacity, dtype=np.complex128)
-        self._t_pad[:n_tau] = t
         if indices is None:
-            self._coeff = np.zeros(
-                (capacity, self._omega.size), dtype=np.complex128)
-            self._coeff[:n_tau] = active
+            self._coeff = active
         else:
             self._coeff = np.zeros(
-                (capacity, self._omega.size), dtype=np.complex128)
-            self._coeff[:n_tau, indices] = active
-        self._n_tau = n_tau
+                (t.size, self._omega.size), dtype=np.complex128)
+            self._coeff[:, indices] = active
         self._index = 0
         self._window = (_device_output_zeros(
             self._shape, self._sharding)() if antihermitian else None)
@@ -700,44 +673,10 @@ class DeviceOmegaAccumulator:
         _device_omega_add(self._sharding, self._omega_axis).lower(
             self._total, sigma, coeff).compile()
 
-    def _device_tau_inputs(self):
-        t_pad = device_put_process_local(self._t_pad, self._replicated)
-        coeff = device_put_process_local(self._coeff, self._replicated)
-        n_tau = device_put_process_local(
-            np.asarray(self._n_tau, dtype=np.int32), self._replicated)
-        return t_pad, coeff, n_tau
-
-    def precompile_tau_loop(self, tau_kernel, tau_args):
-        """Compile the runtime-bounded loop for the current fixed capacity."""
-        if self._coeff is None or self._t_pad is None:
-            raise RuntimeError("no open frequency window")
-        t_pad, coeff, n_tau = self._device_tau_inputs()
-        target = self._total if self._window is None else self._window
-        return _device_tau_window_loop(
-            tau_kernel, self._sharding, self._omega_axis).lower(
-                target, t_pad, coeff, n_tau, *tau_args).compile()
-
-    def add_tau_loop(self, tau_kernel, tau_args):
-        """Execute every active tau in one dynamic device-loop dispatch."""
-        if self._coeff is None or self._t_pad is None:
-            raise RuntimeError("no open frequency window")
-        if self._index:
-            raise RuntimeError("tau loop must start at the first node")
-        t_pad, coeff, n_tau = self._device_tau_inputs()
-        loop = _device_tau_window_loop(
-            tau_kernel, self._sharding, self._omega_axis)
-        if self._window is None:
-            self._total = loop(
-                self._total, t_pad, coeff, n_tau, *tau_args)
-        else:
-            self._window = loop(
-                self._window, t_pad, coeff, n_tau, *tau_args)
-        self._index = self._n_tau
-
     def add_tau(self, sigma_tau):
         if self._coeff is None:
             raise RuntimeError("no open frequency window")
-        if self._index >= self._n_tau:
+        if self._index >= self._coeff.shape[0]:
             raise RuntimeError("more sigma(tau) tiles than quadrature nodes")
         coeff = device_put_process_local(
             self._coeff[self._index], self._replicated)
@@ -754,7 +693,7 @@ class DeviceOmegaAccumulator:
     def end_window(self):
         if self._coeff is None:
             raise RuntimeError("no open frequency window")
-        if self._index != self._n_tau:
+        if self._index != self._coeff.shape[0]:
             raise RuntimeError("frequency window ended before all tau nodes")
         if self._window is not None:
             completed = _antiherm_band_fn(self._sharding)(self._window)
@@ -762,8 +701,6 @@ class DeviceOmegaAccumulator:
                 self._total, completed)
         self._window = None
         self._coeff = None
-        self._t_pad = None
-        self._n_tau = 0
         self._index = 0
 
     def add_direct(self, sigma_omega, omega_index, *, coefficient=1.0):
