@@ -13,26 +13,40 @@ Deck-key semantics are owned by the [input reference](../input_reference.md).
 Module one-liners are owned by [Codebase](codebase.md). Where those pages
 disagree with this one, they win — this page owns the *wiring* only.
 
-> **Pinned to `origin/main@8b6e3cc7`, 2026-09-01.** Every `file:line` below
-> was read at that commit. Line numbers are for finding code, never for
-> quoting it. Six lanes of the bispinor static cleanup are in flight against
-> these files; the theory page's per-section status notes name which.
+> **Pinned to `lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2`, 2026-09-01 —
+> a branch, not `origin/main`.** Lane B collapsed the two packed modes into
+> one and deleted the producerless static-gauge seam, so every `file:line`
+> into the eleven files it changed (`gw_config`, `gw_jax`, `gw_output`,
+> `head_correction`, `photon_layout`, `photon_sigma`, `sigma_dispatch`,
+> `static_gauge_response`, `w_isdf`, `file_io/static_gauge_head`,
+> `common/four_current_model`) was re-read at that commit; citations into
+> files lane B did not touch are unchanged from `origin/main@8b6e3cc7` and
+> are byte-identical there. Line numbers are for finding code, never for
+> quoting it. Other lanes of the cleanup are still in flight against these
+> files; the theory page's per-section status notes name which.
 
 ## The two routes
 
 Everything on this page belongs to one of two routes, and the fork is a
-single predicate.
+single predicate. There is exactly **one** packed mode: the former
+`charge_hall_cubature` spelling is retired and refuses, naming
+`full_static_cohsex` (`GATE bispinor_gw_charge_hall_cubature_retired`,
+`gw_config.py:326-337`, inside `coerce_bispinor_gw_mode` `:321-345`).
 
 | route | selected by | screening of the transverse channels | marked below |
 |---|---|---|---|
 | **bare** | `bispinor = true` with `bispinor_gw ∈ {bare_transverse (default), pauli_reference_bare_transverse, isometric_kinetic_balance_bare_transverse}` | none — `Σ^B` contracts the *bare* `D^{ij}` tiles | **B** |
-| **packed** | `bispinor_gw ∈ {full_static_cohsex, charge_hall_cubature}` | one packed 4×4 Lorentz Dyson solve, `ω = 0`, `compute_mode = cohsex` only | **P** |
+| **packed** | `bispinor_gw = full_static_cohsex` | one packed 4×4 Lorentz Dyson solve, `ω = 0`, `compute_mode = cohsex` only, plus the Γ-cell completion by default | **P** |
 
-`gw_config.uses_static_photon_response(config)` (`src/gw/gw_config.py:3532-3539`)
-is that fork and returns True for exactly the two packed modes. Its companion
-`uses_coupled_photon_head` (`:3542-3545`) adds `head.correction is FULL`.
-Consulted at `gw_jax.py:103,595,637,678,711,732`, `sigma_dispatch.py:53,838`
-and `gw_init.py:55,2880`.
+`gw_config.uses_static_photon_response(config)` (`src/gw/gw_config.py:3555-3559`)
+is that fork: `mode is BispinorGWMode.FULL_STATIC_COHSEX`, one value. Its
+companion `uses_coupled_photon_head` (`:3562-3573`) adds
+`head.correction is FULL`, and decides **only** whether `gw_init` keeps the
+four literal-Γ channel vectors — under the DEBUG `head_correction = off` the
+packed V/W keep a zero `q = Γ, G = 0` slot. No third value exists: the
+envelope refuses `no_local_fields` for this mode. Consulted at
+`gw_jax.py:103,596,638,698,731,752`, `sigma_dispatch.py:53,835` and
+`gw_init.py:55,2880`.
 
 ## The map
 
@@ -47,7 +61,7 @@ flowchart TD
   subgraph CFG["config — gw_config.py, common/four_current_model.py"]
     R["resolve_four_current_representation<br/>FourCurrentRepresentation:<br/>carrier + lift + stamps"]
     F{"uses_static_photon_response"}
-    E["refuse_unsupported_bispinor_gw<br/>18-conjunct envelope"]
+    E["refuse_unsupported_bispinor_gw<br/>17-conjunct envelope"]
   end
 
   subgraph INIT["initialization — gw_init.py"]
@@ -111,53 +125,57 @@ object each key ends up on and who reads it.
 
 | key | default (`gw_config.py`) | lands on | route |
 |---|---|---|---|
-| `bispinor` | `False` (`:1653`, parse `:5572`) | `config.bispinor` (`:4681`) — the master switch | both |
-| `bispinor_gw` | `bare_transverse` (`:1656`, parse `:5573`, enum `:293-307`) | `config.bispinor_gw` (`:4682`) | both |
-| `centroids_file_current` | `""` (`:1477`, parse `:5066-5071`) | `config.paths.centroids_file_current` (`:3229`) | both |
-| `head_correction` | `full` (`:1989`, parse `:5082,5106`) | `config.head.correction` (`:3849`) | both |
-| `bispinor_tt_head_correction` | `False` (`:1985`, parse `:5120`) | `config.head.bispinor_tt_head_correction` (`:3861`) | B |
-| `static_gauge_hall_file` | `static_gauge_hall.h5` (`:1466`, parse `:5074`) | `config.paths.static_gauge_hall_file` (`:3232`) | P (`charge_hall_cubature` only) |
-| `transverse_zeta_solve` | `ridge` (`:1871`, validate `:5348-5365`) | `config.backend.transverse_zeta_solve` (`:4404`) | both |
-| `transverse_zeta_rcond` | `1e-10` (`:1879`, validate `:5366-5370`) | `config.backend.transverse_zeta_rcond` (`:4405`) | both |
-| `distrib_la_batched_route` | `auto` (`:1746`, resolve `:1214-1242`, parse `:5312`) | `config.backend.distrib_la_batched_route` (`:4395`) | both |
+| `bispinor` | `False` (`:1676`, parse `:5600`) | `config.bispinor` (`:4709`) — the master switch | both |
+| `bispinor_gw` | `bare_transverse` (`:1679`, parse `:5601` via `coerce_bispinor_gw_mode` `:321-345`; enum `:293-315`, four members — `CHARGE_HALL_CUBATURE` deleted) | `config.bispinor_gw` (`:4710`) | both |
+| `centroids_file_current` | `""` (`:1500`, parse `:5094-5099`) | `config.paths.centroids_file_current` (`:3252`) | both |
+| `head_correction` | `full` (`:2012`, coerced `:541`, read `:5110`, built into `HeadConfig` `:5134`) | `config.head.correction` (`:3877`) | both |
+| `bispinor_tt_head_correction` | `False` (`:2008`, parse `:5148`) | `config.head.bispinor_tt_head_correction` (`:3889`) | B |
+| `static_gauge_hall_file` | `static_gauge_hall.h5` (`:1489`, parse `:5102`) | `config.paths.static_gauge_hall_file` (`:3255`) | P — **optional**: an absent file means `σ_H = 0`, announced; a present but mismatched one refuses in the loader |
+| `transverse_zeta_solve` | `ridge` (`:1894`, validate `:5376-5393`) | `config.backend.transverse_zeta_solve` (`:4432`) | both |
+| `transverse_zeta_rcond` | `1e-10` (`:1902`, validate `:5394-5398`) | `config.backend.transverse_zeta_rcond` (`:4433`) | both |
+| `distrib_la_batched_route` | `auto` (`:1769`, resolve `:1237-1266`, parse `:5340`) | `config.backend.distrib_la_batched_route` (`:4423`) | both |
 
 There is no `transverse_zeta_*` key beyond those two, and no `LORRAX_*`
 variable reads any key in this table.
 
 **The one resolver.** `common/four_current_model.resolve_four_current_representation(bispinor, model)`
-(`src/common/four_current_model.py:54-106`) returns a frozen
-`FourCurrentRepresentation` (`:35-51`) with seven fields: `charge_bispinor`,
+(`src/common/four_current_model.py:85-137`) returns a frozen
+`FourCurrentRepresentation` (`:66-82`) with seven fields: `charge_bispinor`,
 `charge_lift`, `current_bispinor`, `current_lift`, `scalar_head_bispinor`,
 `charge_representation`, `spatial_current_representation`. **It is not stored
-on the config** — a dozen sites call it locally (`gw_config.py:348`,
+on the config** — a dozen sites call it locally (`gw_config.py:371`,
 `gw_init.py:804,1464,1991,2817,3123`, `sigma_dispatch.py:310`,
 `sc_iteration.py:1588,1736`, `head_correction.py:667,1715`,
 `qsgw_head.py:3938`, `kin_ion_io.py:1168`, `file_io/kin_ion.py:393`,
 `psp/get_dipole_mtxels.py:1103`), so grep for
 `resolve_four_current_representation`, not for a config attribute.
 
-The four branches: non-bispinor (`:64-73`, everything False);
-`pauli_reference_bare_transverse` (`:74-84`, charge stays a two-spinor Pauli
+The four branches: non-bispinor (`:95-104`, everything False);
+`pauli_reference_bare_transverse` (`:105-115`, charge stays a two-spinor Pauli
 density, current lifted `raw`); `isometric_kinetic_balance_bare_transverse`
-(`:85-96`, both `isometric`, `scalar_head_bispinor=False`); and the
-fall-through for `bare_transverse`, `full_static_cohsex` and
-`charge_hall_cubature` (`:97-106`, both `raw`, `scalar_head_bispinor=True`).
-The lift selectors are `RAW_KINETIC_BALANCE_LIFT = "raw"` and
+(`:116-127`, both `isometric`, `scalar_head_bispinor=False`); and the
+fall-through for `bare_transverse` and `full_static_cohsex` (`:128-137`, both
+`raw`, `scalar_head_bispinor=True`). The lift selectors are
+`RAW_KINETIC_BALANCE_LIFT = "raw"` and
 `ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"`
 (`src/common/bispinor_init.py:40-41`).
 
 **`static_bispinor_photon_envelope` is a gate id, not a function.** The
-conjunct table is `gw_config.py:3635-3699`, the loop `:3700-3702`, the raise
-`:3703-3715`, and it is reached only for the two packed modes. Eighteen
-conjuncts; two are mode-dependent (`:3631-3634`, `:3652-3654`):
-`charge_hall_cubature` **requires** `head_correction = full` and `sys_dim = 2`,
-`full_static_cohsex` **requires** `head_correction = off` and waives `sys_dim`.
+conjunct table is `gw_config.py:3664-3726`, the loop `:3727-3729`, the raise
+`:3730-3743`. **Seventeen** conjuncts now, down from eighteen: the
+mode-dependent `required_head` is gone (`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`): the head conjunct
+is now `head.correction in (FULL, OFF)` — `full` is the default and runs the
+Γ completion, `off` is a DEBUG skip, and `no_local_fields` is refused because
+the coupled solve has no scalar diagnostic head. A separate gate,
+`GATE static_bispinor_photon_head_slab_only` (`:3649-3663`), refuses
+`sys_dim != 2` **while the completion is on**; the DEBUG headless body keeps
+the bulk reach the old envelope gave it.
 
 ## Stage 2 — initialization (`gw_init.py`)
 
 | object | producer | shape / dtype | sharding | route |
 |---|---|---|---|---|
-| charge centroid indices | `gw_jax.py:356-359` → `file_io/centroids.load_centroid_basis` (`:122-174`) | `(n_mu_C, 3)` i64 | host | both |
+| charge centroid indices | `gw_jax.py:357-360` → `file_io/centroids.load_centroid_basis` (`:122-174`) | `(n_mu_C, 3)` i64 | host | both |
 | current centroid indices | `gw_init.py:1434-1446` (refusal `:1430-1433` if the key is unset) | `(n_mu_T, 3)` i32 | host until needed | both |
 | `meta_transverse` | `gw_init.py:1447-1452` | `Meta` with `n_rmu = n_mu_T`, `nspinor = 4`, `npol = 4`, `n_rmu_padded = padded_mu_extent(...)` | — | both |
 | four-spinor ψ | `common/bispinor_init.lift_to_4spinor` (`:151-206`) | `(n_k, nb, 4, ngkmax)` c128, `[ψ_L; ψ_S]` on the spinor axis | caller wraps; no sharding inside | both |
@@ -206,125 +224,162 @@ compensates that sign.
 
 ### 3a. The packed body (route P only)
 
-Fork at `gw_jax.py:637-655` → `w_isdf.compute_static_photon_response`
-(`:2079`, signature `:2079-2093`), the only production caller.
+Fork at `gw_jax.py:638-657` → `w_isdf.compute_static_photon_response`
+(`:2079`, signature `:2079-2093`), the only production caller. Lane B
+removed its `gauge_head_response=` argument and made `config` required
+(`cff884e7`), so a caller can no longer inject a fabricated head record.
 
 | object | producer | shape | sharding |
 |---|---|---|---|
 | one no-pair block `χ^{IJ}_0` | `w_isdf.compute_no_pair_dirac_current_block` (`:1556`) | `(nq, μ_L, μ_R)` c128 | `P(None,'x','y')` |
 | the sixteen blocks | `compute_experimental_no_pair_photon_chi0` (`:2016`); families `(charge, transverse, transverse, transverse)` (`:2049-2050`) — T1/T2/T3 share one bundle, no copies | — | — |
-| TT Ward subtraction | `_subtract_static_tt_contact` (`:2004`), applied to the nine blocks with both indices nonzero (`:2057-2061`) | `Π(q) − Π(0)` | in place, buffer donated |
-| packed `V`, `χ_0`, `W` | `photon_layout.pack_photon_operator` (`:203`), `w_isdf.solve_w` (`:1431`) | `(nq, N_packed, N_packed)` c128 | `P(None,'x','y')` |
+| TT Ward subtraction | `_subtract_static_tt_contact` (`:2004`), applied to the nine blocks with both indices nonzero (`:2060`) | `Π(q) − Π(0)` | in place, buffer donated |
+| packed `V`, `χ_0`, `W` | `photon_layout.pack_photon_operator` (`:219`), `w_isdf.solve_w` (`:1431`) | `(nq, N_packed, N_packed)` c128 | `P(None,'x','y')` |
 
-`N_packed = p_C + 3·p_T` (`photon_layout.py:91-93`), with `p_C`, `p_T` the
-mesh-padded centroid extents. The packing is **mesh-interleaved**, not a
-contiguous direct sum: packed row shard `x` holds that shard's own local
-`C,T1,T2,T3` row chunks, and the column shard applies the same permutation
-(`photon_layout.py:1-20`, offsets `:103-107`). A packed operator is therefore
-`P O Pᵀ`, Dyson algebra is unchanged, and both `pack_photon_operator` and
-`photon_block_view` (`:263`) are local `shard_map` slices with no
-redistribution. Ordering stamp `mesh_interleaved_direct_sum_v1` (`:39`).
+`N_packed` is `PhotonBasisLayout.packed_extent` (`photon_layout.py:107-109`),
+`p_C + 3·p_T` over the mesh-padded centroid extents built by
+`from_centroid_extents` (`:88-101`); one transverse centroid family must serve
+T1/T2/T3, and `__post_init__` (`:69`) refuses otherwise. The packing is
+**mesh-interleaved**, not a contiguous direct sum: packed row shard `x` holds
+that shard's own local `C,T1,T2,T3` row chunks, and the column shard applies
+the same permutation (`photon_layout.py:24-31`, offsets `local_offset`
+`:119-123`). A packed operator is therefore `P O Pᵀ`, Dyson algebra is
+unchanged, and both `pack_photon_operator` and `photon_block_view` (`:279`)
+are local `shard_map` slices with no redistribution. Ordering stamp
+`PHOTON_BASIS_ORDERING = mesh_interleaved_direct_sum_v1` (`:55`).
 
-The sixteen-block enumeration lives in `pack_photon_operator`'s double loop
-(`photon_layout.py:217-218`), which calls the block builder once per `(A,B)`
-and `block_until_ready()`s each (`:231`) so only one block is resident.
+The sixteen-block enumeration lives in `pack_photon_operator`'s double loop,
+which calls the block builder once per `(A,B)` and `block_until_ready()`s each
+(`:247`) so only one block is resident.
 
 **The Dyson solve** is `solve_w` (`w_isdf.py:1431`) with
-`dyson_solver="distributed"` hard-coded on this path (`:2199`), dispatching to
+`dyson_solver="distributed"` on this path (`:2229`), dispatching to
 `_get_w_solve_fn_distributed` (`:1164`), which plans through the `distrib_la`
-service (`plan("solve_lu", mesh_xy, backend="distributed", …)` at `:1258-1260`,
+service (`plan("solve_lu", mesh_xy, backend="distributed", …)` at `:1259-1260`,
 executed at `:1328`). Inputs, the assembled `A`, the LU factors and `W` all
-stay `P(None,'x','y')`. The source states the invariant at `:1191-1195` and
-`:1450-1452`: no rank ever materialises a full `(μ, μ)` tile — the largest
-per-rank transient is the `μ·μ/min(Px,Py)` gathered GEMM operand.
+stay `P(None,'x','y')`. The source states the invariant at `:1191-1195`: **no
+rank ever materialises a full `(μ, μ)` tile** — the largest per-rank transient
+is the `μ·μ/min(Px,Py)` gathered GEMM operand.
 
-`StaticPhotonResponse` (`w_isdf.py:2066`) carries `layout`, `V_packed`,
+`StaticPhotonResponse` (`w_isdf.py:2067`) carries `layout`, `V_packed`,
 `W_packed` (both as above), `current_contact` (always
 `ward_subtracted_no_pair`, `:1998`), `head_completion`, `current_model`
 (`positive_energy_kinetic_balance_dirac_current_v1`,
 `common/bispinor_init.py:31`) and `approximation` — either
-`experimental_no_pair_bubble_screened_breit_v1` (`:2271`) or
-`charge_hall_cubature_on_experimental_no_pair_body_v1` (`:2269`).
+`gamma_completed_no_pair_static_photon_v1` (the completion ran) or
+`DEBUG_headless_no_pair_static_photon_v1` (`head_correction = off`)
+(`:2306-2309`). Both stamps are new on
+`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`; the two older strings are
+gone, and no sandbox parser read them.
 
-### 3b. The Γ completion (route P, `charge_hall_cubature`)
+Under the DEBUG setting the module prints a boxed
+`WARNING -- DEBUG: Gamma-cell head disabled by head_correction=off`
+(`:2194`); the `WARNING` token is what the production sink retains into the
+run record's warning block.
 
-`head_correction.complete_static_slab_photon_q0` (`:1390-1399`) takes
-`V_packed`, `W_packed`, a response record, the two `(4, N_packed)` `g_0`
-vectors (`g0_X` at `P(None,'x')`, `g0_Y` at `P(None,'y')`, packed at
-`w_isdf.py:2243-2249`) and a cubature receipt, and returns updated `V`, `W`
-plus a `StaticSlabPhotonHeadCompletion` (`:1225`).
+### 3b. The Γ completion (route P, on by default)
+
+`head_correction.complete_static_slab_photon_q0` (`:1298-1307`) takes
+`V_packed`, `W_packed`, a **sealed** response record, the two
+`(4, N_packed)` `g_0` vectors (`g0_X` at `P(None,'x')`, `g0_Y` at
+`P(None,'y')`) and a cubature receipt, and returns updated `V`, `W` plus a
+`StaticSlabPhotonHeadCompletion` (`:1130`, fields `:1133-1151`, carrying
+`sigma_H` `:1149` and `hall_source` `:1150` alongside the certificates). The
+old `isinstance` fork over two response types is gone: the single path is
+`require_static_photon_head_response(response, mesh_xy)` at `:1326`. It runs whenever
+`head_correction = full`, which is the default — it is no longer opt-in.
 
 | input | producer | shape | sharding |
 |---|---|---|---|
 | cubature receipt | `vcoul.slab_minibz_photon_cubature` (`services/vcoul/src/vcoul/minibz.py:821`) — exact Wigner–Seitz polygon, fixed 16/24/32 Duffy–Gauss ladder (`:124`) | host chunks: `q_cart (n,3)`, `D_raw (n,4,4)`, `sample_weight (n,)` f64 | host, write-locked |
-| `ChargeHallCubatureResponse` | `static_gauge_response.build_charge_hall_cubature_response` (`:214-325`) | `S_direct (2,2,4,4)`, `sigma_H (3,)`, `Y_x (2,4,N_packed)`, `Z_y (2,N_packed,4)` | `P()`, `P()`, `P(None,None,'x')`, `P(None,'y',None)` |
-| Hall artifact | `file_io/static_gauge_head.load_static_gauge_hall_artifact` (`:237`), called from `w_isdf.py:2166-2174`; sole writer `psp/get_dipole_mtxels.py:1326` | `static_gauge_hall.h5`, schema 1 (`:66`), `sigma_H_cart (3,)` f64 | replicated |
+| `StaticPhotonHeadResponse` (`:64`, sealed — only its producer can build one) | `static_gauge_response.build_static_photon_head_response` (`:169-293`, called `w_isdf.py:2257-2267`); `require_static_photon_head_response` (`:103-155`) | `S_direct (2,2,4,4)`, `sigma_H (3,)` real, `hall_source` str, `Y_x (2,4,N_packed)`, `Z_y (2,N_packed,4)` | `P()`, `P()`, —, `P(None,None,'x')`, `P(None,'y',None)` |
+| Hall artifact — **optional** | `file_io/static_gauge_head.load_static_gauge_hall_artifact` (`:180-189`), called from `w_isdf.py:2168-2176` behind an existence check at `:2162`; sole writer `write_static_gauge_hall_artifact` (`:130-135`) via `psp/get_dipole_mtxels.py` | `static_gauge_hall.h5`, schema 1 (`STATIC_GAUGE_HALL_SCHEMA_VERSION`, `:35`), `sigma_H_cart (3,)` f64 | replicated |
 
-The updates are **one bare rank-4 outer product into `V`** (`:1583-1585`) and
-**nine screened rank-4 outer products into `W`** (`:1594-1606`), all through
-`photon_layout.add_photon_q0_low_rank` (`:540`), which takes left rows at
+If no `static_gauge_hall_file` is present the builder sets `sigma_H = 0` and
+`hall_source = HALL_SOURCE_NONE` (`static_gauge_response.py:51,214`; the shape/sharding contract is re-asserted at `:114-121`) and says
+so; a present but mismatched artifact still **refuses** in the loader, so a
+stale file cannot degrade a run silently. For a Chern-trivial insulator that
+default is the exact answer — see
+[the theory page](../theory/four-current-head-corrections.md) §4.4.
+
+The updates are **one bare rank-4 outer product into `V`** (`:1480-1482`) and
+**nine screened rank-4 outer products into `W`** (`:1491-1503`), all through
+`photon_layout.add_photon_q0_low_rank` (`:556`), which takes left rows at
 `P(None,'x')` and right rows at `P(None,'y')`, donates the packed buffer, and
-does a purely local outer product (`:560-563`). Gates on this path:
-`GATE static_gauge_head_fold_ward` (`:1468`, `1e-8`),
-`GATE static_gauge_head_fold_hermiticity` (`:1473`, `1e-10`), and the
+does a purely local outer product (`:576-579`). Gates on this path:
+`GATE static_gauge_head_fold_ward` (`:1365`) and
+`GATE static_gauge_head_fold_hermiticity` (`:1370`), against
+`_STATIC_GAUGE_WARD_RESIDUAL_MAX = 1e-8` and
+`_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX = 1e-10` (`:158-159`), plus the
 `static_photon_dyson_*` / `static_photon_polygon_*` numerical certificates
-(`:1246-1387`, budget `1e-9`).
+(`:1249-1295`, helpers `:1159-1246`, budget `1e-9` at `:1154`).
 
-**What the mode declares it does not have.**
-`static_gauge_response.CHARGE_HALL_CUBATURE_AVAILABILITY` (`:97`) is the
-complete list, and `is_complete_for` (`:62-73`) requires an exact match — an
-extra `complete` fails as loudly as an `unavailable`. Complete (5): `cc_q2`,
-`ct_q1`, `tc_q1`, `y_charge`, `z_charge`. `omitted_by_model` (10): `ct_q2`,
-`tc_q2`, `tt_q0`, `tt_q1`, `tt_q2`, `y_current`, `z_current`, `contact_q0`,
-`contact_q2`, `complement_space`. What that list means physically is
+**What the mode declares it does not have.** The **module docstring of
+`gw.static_gauge_response`** is the complete list. It replaced the
+`CHARGE_HALL_CUBATURE_AVAILABILITY` availability grammar and its
+`StaticGaugeTermAvailability` / `require_full_static_gauge_availability`
+machinery, which are deleted
+(`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`). Present: the charge CC
+`q²` head `S^{00}`, the charge wings `Y^0`/`Z^0`, and the Hall CT/TC `q¹`
+term. Omitted by model: the current `q²` response (TT and CT/TC), the current
+wings, the uniform static current response (zero by gauge invariance for an
+insulator), the diamagnetic/contact terms and the complement-space closure —
+and they are never stored as accidental zeros, because `S_direct` has charge
+support only. What that list means physically is
 [the theory page](../theory/four-current-head-corrections.md) §4.3.
 
-**A dead seam you will find and should not follow.** `StaticGaugeHeadResponse`
-(`head_correction.py:122`), `require_static_gauge_head_response` (`:267`),
-`require_full_static_gauge_availability` (`static_gauge_response.py:328`), the
-v2 schema and loader in `file_io/static_gauge_head.py` (`:41-64`, `:322`,
-`:436`) and the `else` arm at `head_correction.py:1427` have **no production
-caller**: the only path in always passes a `ChargeHallCubatureResponse`
-(`w_isdf.py:2229,2253`), a caller-supplied `gauge_head_response=` is refused
-(`w_isdf.py:2148-2152`), and the config refuses the mode first
-(`gw_config.py:3616-3630`).
+**The dead seam is gone.** On `origin/main@8b6e3cc7` this route carried a
+producerless full-static-gauge seam — `StaticGaugeHeadResponse`,
+`require_canonical_operator_fingerprint`, `require_static_gauge_head_response`
+and its five `GATE static_gauge_head_*`, `LoadedStaticGaugeHeadResponse`,
+`write`/`load_static_gauge_head_artifact`, the v2 head schema, the
+`gauge_head_response=` argument, `GATE static_gauge_head_end_to_end_uncertified`
+and the `GATE full_static_bispinor_gauge_head_unavailable` that made it
+unreachable. All of it is **deleted**
+(`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`); `file_io/static_gauge_head.py`
+is now the Hall artifact's format owner and nothing else. If you are reading
+`origin/main`, expect to find those symbols and to find them unreachable.
 
 ### 3c. The scalar charge head (route B)
 
 Unchanged from the scalar code and owned elsewhere: `HeadResolver`
-(`head_correction.py:1691`) built at `gw_jax.py:497`; `head_correction = full`
-installs `qsgw_head.build_dft_head_response` (`gw_jax.py:600-617`), finalized
-at `:686-691`, applied through `_compute_static_head` (`gw_jax.py:186,742`) →
-`cohsex_sigma.py:631-637,720-728`. It is **skipped entirely** under the packed
-modes (`gw_jax.py:731-732`), and `sigma_dispatch.py:850-856` refuses a scalar
-head overlay if one arrives there anyway.
+(`head_correction.py:1589`) built at `gw_jax.py:498`; `head_correction = full`
+installs `qsgw_head.build_dft_head_response` (`gw_jax.py:601-618`), finalized
+by `finalize_iteration_head_samples` (`:706-711`), applied through
+`_compute_static_head` (`gw_jax.py:186,762`) → `cohsex_sigma.py:631-637,720-728`.
+It is **skipped entirely** under the packed mode (`gw_jax.py:751-752`), and the
+photon-Σ envelope refuses a scalar head overlay if one arrives there anyway
+(`sigma_dispatch.py:835` ff.).
 
 ## Stage 4 — self-energy
 
-The fork is `sigma_dispatch.py:838`, and its three refusals fire before any
-allocation: outside `compute_mode = cohsex` (`:839-844`), with no packed
-response (`:845-849` — "Refusing instead of falling back to charge-only
-screened COHSEX"), and with scalar `static_head_terms` present (`:850-856`,
+The fork is `sigma_dispatch.py:835`, and its three refusals fire before any
+allocation: outside `compute_mode = cohsex` (`:836-841`), with no packed
+response (`:842-846` — "Refusing instead of falling back to charge-only
+screened COHSEX"), and with scalar `static_head_terms` present (`:847-853`,
 which would double count CC and omit the coupled current wings).
 
 | object | producer | shape | sharding | route |
 |---|---|---|---|---|
-| sixteen-block `Σ_X`, `Σ_SX`, `Σ_COH` | `photon_sigma.compute_static_photon_sigma` (`:276`), called at `sigma_dispatch.py:863-878` | each `(nk, nb_sigma, nb_sigma)` | **replicated** `P(None,None,None)` at the output boundary (`:433-444`) | P |
-| per-block operands | `photon_layout.photon_block_view` (`:263`), fetched at `photon_sigma.py:354-355` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')` — a `dynamic_slice`, never a gather | P |
+| sixteen-block `Σ_X`, `Σ_SX`, `Σ_COH` | `photon_sigma.compute_static_photon_sigma` (`:286-303`), called at `sigma_dispatch.py:860-875` | each `(nk, nb_sigma, nb_sigma)` | **replicated** `P(None,None,None)` at the output boundary (`:443-454`) | P |
+| per-block operands | `photon_layout.photon_block_view` (`:279`), fetched at `photon_sigma.py:364-365` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')` — a `dynamic_slice`, never a gather | P |
 | Green function `G` | `greens_function_kernel.build_G`, face layout | `(nk, ns, μ_L, ns, μ_R)` | `P(None,None,'x',None,'y')` (`wavefunction_bundle.py:236`) | both |
-| head-attribution diagnostics | `photon_sigma.py:363-367` via `photon_layout.photon_q0_low_rank_block` (`:660`) | one `(1, p_A, p_B)` block | `P(None,'x','y')` | P |
+| head-attribution diagnostics | `photon_sigma.py:373-377` (accumulated `:413-434`) via `photon_layout.photon_q0_low_rank_block` (`:676`) | one `(1, p_A, p_B)` block | `P(None,'x','y')` | P |
 | `Σ^B`, bare transverse | `sigma_x_bispinor.compute_sigma_x_bispinor` (`:91`), nine `(i,j)` tiles at `:200-201` | `(nk, nb_sigma, nb_sigma)` | replicated after a gather-then-window (`:234-248`) | B |
-| transverse Hartree | `sigma_dispatch._compute_live_hartree` (`:303-336`) → `kin_ion_io.compute_hartree_matrix` (`:764`) | `charge`, `transverse`, each `(nk_full, nb, nb)` Ry | `P(None,'x','y')` with `return_sharded=True` | **both** |
+| transverse Hartree | `sigma_dispatch._compute_live_hartree` (`:301-334`) → `kin_ion_io.compute_hartree_matrix` (`:764`) | `charge`, `transverse`, each `(nk_full, nb, nb)` Ry | `P(None,'x','y')` with `return_sharded=True` | **both** |
 
 **The sixteen-block contraction** is a plain nested Python loop (`A` at
-`photon_sigma.py:343`, `B` at `:347`), not a `vmap`. Per block the γ̃ vertices
-are folded into the two G-build operands only (`:345`, `:349`), and the same
+`photon_sigma.py:353`, `B` at `:357`), not a `vmap`. Per block the γ̃ vertices
+are folded into the two G-build operands only (`:355`, `:359`), and the same
 jitted kernel is called three times with a dynamic `term` selector for X, SX
-and COH (`:373`, `:383`, `:393`; COH uses `W − V` with prefactor `−0.5`).
-Each accumulator is `block_until_ready()`d before advancing — the source names
-this "the lifetime boundary that prevents two W/G body tiles from coexisting"
-(`:426-428`). `GATE photon_head_sigma_sector_closure` (`:468-473`) then checks
-that CC + (CT+TC) + TT closes on the direct sixteen-block total.
+and COH (`:383`, `:393`, `:403`; COH uses `W − V` with prefactor `−0.5`). Each
+accumulator is `block_until_ready()`d before advancing (`:392`, `:402`,
+`:439`) — the source names this "the lifetime boundary that prevents two W/G
+body tiles" from coexisting (`:436-438`).
+`GATE photon_head_sigma_sector_closure` (`:478-483`) then checks that
+CC + (CT+TC) + TT closes on the direct sixteen-block total. The diagnostics
+record `StaticPhotonHeadSigmaDiagnostics` (`:60-82`) now has three fields;
+its operator fingerprint went with the deleted seam.
 
 **`Σ^B` enters twice, differently.** In `compute_cohsex_sigma` it is added to
 **both** `sig_x` and `sig_sx` (`cohsex_sigma.py:660-668`); in
@@ -332,77 +387,91 @@ that CC + (CT+TC) + TT closes on the direct sixteen-block total.
 added to `sig_x` only (`:735-742`).
 
 **No transverse operand reaches a dynamic Σ_c.** `compute_ppm_sigma_pipeline`
-(`ppm_pipeline.py:473-490`, called `sigma_dispatch.py:1185-1196`) and the MPA
-body (`mpa/sigma.py:283-303`, called `:1091-1113`) have no
+(`ppm_pipeline.py:473-490`, called `sigma_dispatch.py:1175-1186`) and the MPA
+body (`mpa/sigma.py:283-303`, called `:1081-1103`) have no
 `wfns_transverse`, `bispinor_v_q_path` or `photon_response` parameter. On a
 dynamic route the four-current layer reaches Σ through `sig_x` and through the
 transverse Hartree, and nowhere else.
 
 **The transverse Hartree is on both routes.** Its gate is
-`include_transverse = bool(config.bispinor)` (`sigma_dispatch.py:312`), not
+`include_transverse = bool(config.bispinor)` (`sigma_dispatch.py:310`), not
 `bispinor_gw`, so every bispinor mode and every compute mode gets it unless
 `omit_v_h` (density self-consistency, which rebuilds both fields itself). It
-is added to `sig_h` at `:944`, under the guard at `:936`. Physics owner:
+is added to `sig_h` at `:937`, under the guard at `:930`. Physics owner:
 [Direct Hartree field](../theory/hartree.md).
 
 ## Stage 5 — outputs
 
-`SigmaResult` (`sigma_dispatch.py:60-61`) carries three fields, `None` on
-every non-packed route (initialized `:835-837`, set at `:958-961` for `x_only`
-and `:974-977` for `cohsex`):
+`SigmaResult` (`sigma_dispatch.py:61`) carries **two** such fields, `None` on
+every non-packed route (initialized `:833-834`, harvested `:876-879`, set at
+`:952-953` for `x_only` and `:966-967` for `cohsex`):
 
 | field | line | shape / value |
 |---|---|---|
 | `photon_head_sigma_diag_tskn_ry` | `:124` | `(3, 3, nk, nb)` — axes `(term = X/SX/COH, sector = CC / CT+TC / TT, k, band)`, DFT basis |
-| `photon_head_sigma_operator_fingerprint` | `:125` | `str \| None` |
-| `photon_head_sigma_basis` | `:126` | `"dft"` when populated |
+| `photon_head_sigma_basis` | `:125` | `"dft"` when populated; also in `BASIS_FREE_FIELDS` (`:257`) |
 
-Mirrored onto the output record at `gw_output.py:149,152,153` and forwarded by
-the driver at `gw_jax.py:942-946,1169-1173` (schema zeros at `:947-949`).
-`sigma_freq_debug` gains `head_CC`, `head_CTTC`, `head_TT`, `head_total` and
-the per-term `{term}_head_{sector}` columns (`gw_output.py:821-843`);
-`sigma_diag.dat`'s Hartree column is relabelled `Hdir` and gains an `H_T`
-column whenever the transverse Hartree ran (`gw_output.py:770-771,1667-1668`).
+A third field, `photon_head_sigma_operator_fingerprint`, existed on
+`origin/main@8b6e3cc7` and is **deleted**
+(`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`) along with the
+fingerprint field of `StaticPhotonHeadSigmaDiagnostics` — it belonged to the
+removed full-static-gauge seam.
+
+Mirrored onto the output record at `gw_output.py:149-150` and forwarded by the
+driver at `gw_jax.py:962-964` (schema zeros `:965-967`, final record
+`:1187-1189`). `sigma_freq_debug` gains `head_CC`, `head_CTTC`, `head_TT`,
+`head_total` (`gw_output.py:814-819`) and the per-term `{term}_head_{sector}`
+columns (`:820-830`), gated on `photon_head_sigma_basis is not None` at
+`:726` and refusing a basis other than `dft` at `:784-787`;
+`sigma_diag.dat`'s Hartree column is relabelled `Hdir` (`:1653-1654`) and
+gains an `H_T` column whenever the transverse Hartree ran (`:767-768`).
 
 **Reading `gwjax.out`.** These lines tell you which route ran:
 
 | line | file:line | means |
 |---|---|---|
-| `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:300-314` | the route banner; the parenthetical note marks the packed modes experimental |
+| `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:313-315` | the route banner. Under the packed mode the parenthetical names the **head state**, not "experimental": it is conditional on `head.correction is FULL` (`:305-311`) and reads `DEBUG: Gamma-cell head disabled by head_correction=off` otherwise |
 | `Σ^B tile (μ_L=i, ν_L=j): tr Σ = …` ×9 | `sigma_x_bispinor.py:228` | the bare route ran |
-| `[photon response] DECLARED no-pair model …` | `w_isdf.py:2187-2193` | the packed screening ran |
-| `static photon response: approximation=…, packed_extent=…` | `gw_jax.py:659-664` | which packed approximation, and `N_packed` |
-| `packed photon COHSEX block (A,B) complete` ×16 | `photon_sigma.py:431` | the packed Σ ran — and there will be no `Σ^B tile` lines |
+| `WARNING -- DEBUG: Gamma-cell head disabled by head_correction=off` | `w_isdf.py:2191-2202` (text `:2194-2195`) | the packed body ran **headless**; the `WARNING` token is what the production sink keeps in the run record's warning block |
+| `static photon response: approximation=…` | `gw_jax.py:661-666` | `gamma_completed_no_pair_static_photon_v1` or `DEBUG_headless_no_pair_static_photon_v1`, and `N_packed` |
+| `Photon head    : Gamma-cell completion applied …` with `hall_source=`, `sigma_H=`, `ward=`, `hermiticity=`, `dyson_forward_bound=`, `cubature_orders=` | `gw_jax.py:672-684` (source `:671`) | **the production run record's head line** (`41e2b6b2`). It reads `DEBUG: … NOT a production calculation` when the head was skipped, and `hall_source` says whether the Hall artifact was used or `σ_H = 0` |
+| `packed photon COHSEX block (A,B) complete` ×16 | `photon_sigma.py:441` | the packed Σ ran — and there will be no `Σ^B tile` lines |
 | `rho + signed J/c sweep` | `kin_ion_io.py:694-697` | the transverse Hartree ran |
 | the `V_H` matrix label carrying `+ <m\|sum_i alpha_i A_i\|n>` | `kin_ion_io.py:996-1001` | same, at the matrix sweep |
 
 ## Refusals, compressed
 
 Every entry is a hard refusal, not a demotion. The `bispinor` refusals live in
-`gw_config.refuse_unsupported_bispinor_gw` (`:3548-3715`), called at parse
-(`:5626,5637`) and again at driver entry (`gw_init.py:3118,3121`).
+`gw_config.refuse_unsupported_bispinor_gw` (`:3576-3743`), called at parse
+(`:5654`) and again at driver entry (`gw_init.py:3118`).
 
 | rule id | file:line | fires when |
 |---|---|---|
-| `bispinor_self_consistency_requires_live_four_current` | `gw_config.py:3552-3565` | bispinor QSGW with an explicit `density_self_consistent = false` |
-| `bispinor_gw_requires_bispinor` | `:3568-3573` | a non-default `bispinor_gw` with `bispinor = false` |
-| `{pauli_reference,isometric_kinetic_balance}_restart{,_write}_unavailable` | `:3574-3597` | either comparison carrier with `restart` / `write_restart_tensors`. **The id is composed at runtime** (`gate_prefix`, `:3578-3581`) — grepping the literal string finds nothing |
-| `isometric_kinetic_balance_current_head_unavailable` | `:3598-3605` | isometric carrier with `bispinor_tt_head_correction = true` |
-| `isometric_kinetic_balance_ladder_head_unavailable` | `:3606-3614` | isometric carrier, `head_correction = full`, `screening_diagrams ≠ w_rpa` |
-| `full_static_bispinor_gauge_head_unavailable` | `:3616-3630` | `full_static_cohsex` with `head_correction = full`. This is why the FULL screened head is unreachable from any deck |
-| `static_bispinor_photon_envelope` | `:3635-3715` | any of the eighteen conjuncts (Stage 1) |
-| `bispinor_tt_head_unsupported` | `:3718-3773` | TT head without `bispinor`, or `sys_dim ∉ {2,3}` |
+| `bispinor_gw_charge_hall_cubature_retired` | `gw_config.py:326-337` (in `coerce_bispinor_gw_mode` `:321-345`) | the deck says `charge_hall_cubature`. It is a **refusal, not an alias**: the coercer runs from a dozen resolution sites, so an alias would print from each, and the same reasoning retired `ctsp` for `screening_method` |
+| `bispinor_self_consistency_requires_live_four_current` | `:3584` | bispinor QSGW with an explicit `density_self_consistent = false` |
+| `bispinor_gw_requires_bispinor` | `:3598` | a non-default `bispinor_gw` with `bispinor = false` |
+| `{pauli_reference,isometric_kinetic_balance}_restart{,_write}_unavailable` | `:3612`, `:3621` | either comparison carrier with `restart` / `write_restart_tensors`. **The id is composed at runtime** (`gate_prefix`, `:3606`) — grepping the literal string finds nothing |
+| `isometric_kinetic_balance_current_head_unavailable` | `:3629` | isometric carrier with `bispinor_tt_head_correction = true` |
+| `isometric_kinetic_balance_ladder_head_unavailable` | `:3638` | isometric carrier, `head_correction = full`, `screening_diagrams ≠ w_rpa` |
+| `static_bispinor_photon_head_slab_only` | `:3649-3663` | the packed mode with the completion on (`head_correction = full`) and `sys_dim ≠ 2`. The coupled 4×4 solve on the in-plane cubature cannot take a bulk analytic-sphere correction after the nonlinear solve, and no bulk integrator has been derived. The DEBUG headless body keeps the bulk reach |
+| `static_bispinor_photon_envelope` | `:3664-3743` | any of the seventeen conjuncts (Stage 1). The head conjunct (`:3671-3674`) is `head.correction in (FULL, OFF)`, so `no_local_fields` refuses here |
+| `bispinor_tt_head_unsupported` | `:3775`, `:3790` (in `refuse_unsupported_bispinor_tt_head_correction`, `:3746`) | TT head without `bispinor`, or `sys_dim ∉ {2,3}` |
 | (no id) SC × dynamic | `gw_jax.py:271-289` | self-consistent solver with a dynamic mode — bispinor QSGW is static-only |
-| (no id) missing current centroids | `gw_jax.py:544`, `gw_init.py:1430-1433` | `bispinor = true` without `centroids_file_current` |
-| (no id) photon Σ envelope, ×3 | `sigma_dispatch.py:839-856` | outside `cohsex`; without a packed response; with scalar `static_head_terms` |
-| `GATE static_gauge_head_end_to_end_uncertified` | `w_isdf.py:2134-2146` | `head_correction = full` on a packed mode other than `charge_hall_cubature` — unreachable, the config refuses first |
-| `GATE static_gauge_availability` | `static_gauge_response.py:79` | the availability record is not an exact match for the mode |
-| `GATE static_gauge_head_fold_{ward,hermiticity}` | `head_correction.py:1468,1473` | Γ-fold residuals over `1e-8` / `1e-10` |
-| `GATE static_photon_{dyson,polygon}_*` | `head_correction.py:1257-1387` | coupled-solve certificates, budget `1e-9` |
-| `GATE photon_head_sigma_sector_closure` | `photon_sigma.py:468-473` | CC + CT/TC + TT does not close on the sixteen-block total |
-| `GATE static_gauge_hall_*` | `file_io/static_gauge_head.py:253,256,291-307` | Hall artifact absent, partial, or not authenticating against this WFN, band count or operator |
+| (no id) missing current centroids | `gw_jax.py:545`, `gw_init.py:1430-1433` | `bispinor = true` without `centroids_file_current` |
+| (no id) photon Σ envelope, ×3 | `sigma_dispatch.py:835` ff. | outside `cohsex`; without a packed response; with scalar `static_head_terms` |
+| (no id) packed response needs a config / distributed Dyson | `w_isdf.py:2124-2130` | the packed path called without the run config, or with a non-distributed Dyson solver |
+| `GATE static_gauge_head_fold_{ward,hermiticity}` | `head_correction.py:1365,1370` | Γ-fold residuals over `1e-8` / `1e-10` (`:158-159`) |
+| `GATE static_photon_{dyson,polygon}_*` | `head_correction.py:1249-1295` (helpers `:1159-1246`) | coupled-solve and polygon certificates, budget `1e-9` |
+| `GATE photon_head_sigma_sector_closure` | `photon_sigma.py:478-483` | CC + CT/TC + TT does not close on the direct sixteen-block total |
+| `GATE static_gauge_hall_{schema,partial,artifact_absent}` and the authentication gates | `file_io/static_gauge_head.py:69,77,83,200,203`; identity checks `:235-256` | Hall artifact partial, wrong schema, or not authenticating against this WFN, band manifold or `nk_tot`. **An absent file is not one of these** on the packed path: it means `σ_H = 0`, announced |
 | `GATE static_gauge_raw_hall_degenerate` | `qsgw_head.py:3233-3237` | degenerate differently-occupied states |
 | (no id) insulating-only Hall | `qsgw_head.py:3352-3355` | any fractional occupation |
+
+**Three refusals that are gone.** `full_static_bispinor_gauge_head_unavailable`,
+`GATE static_gauge_head_end_to_end_uncertified` and
+`GATE static_gauge_availability` guarded the deleted full-static-gauge seam and
+were removed with it (`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`). A
+mode that cannot be requested needs no refusal.
 
 ## Memory invariants
 
@@ -412,14 +481,14 @@ two-plans-per-solve-family entry; the plan table is
 [`docs/dev/large_nmu_operation.md`](../dev/large_nmu_operation.md)). Where it
 is enforced on this layer, and how:
 
-* **Packed Dyson.** Enforced by construction: `w_isdf.py:1191-1195,1450-1452`
+* **Packed Dyson.** Enforced by construction: `w_isdf.py:1191-1195`
   states that inputs, `A`, the LU factors and `W` all stay `P(None,'x','y')`
   and no rank materialises a full `(μ,μ)` tile.
 * **Packed Σ.** Enforced by an **assertion**:
-  `photon_sigma._require_packed_operator` (`:116-124`) raises unless both
+  `photon_sigma._require_packed_operator` (`:126-134`, message `:132-134`) raises unless both
   packed operators are still `P(None,'x','y')` — "A photon body may not be
   gathered or placed on fewer than all ranks." Block views are
-  `dynamic_slice`s, not gathers (`photon_layout.py:243-258`).
+  `dynamic_slice`s, not gathers (`photon_layout.py:259-274`).
 * **`V_q` construction.** Structural, documented rather than asserted: one
   tile at a time, streamed to HDF5 and freed, so peak equals one scalar `V_q`
   tile (`v_q_bispinor.py:29-31`); Hermitian companions never stored (`:32-35`);
