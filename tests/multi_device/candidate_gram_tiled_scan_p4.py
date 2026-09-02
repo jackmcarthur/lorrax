@@ -155,13 +155,21 @@ def main() -> None:
         folded.block_until_ready()
         if tuple(folded.sharding.spec) != ("x", "y"):
             _fail(f"{mode}: terminal fold layout is {folded.sharding.spec}")
-        fold_hlo = fold_kernel.lower(expected).compile().as_text().lower()
+        fold_compiled = fold_kernel.lower(expected).compile()
+        fold_hlo = fold_compiled.as_text().lower()
         fold_forbidden = [op for op in ("all-gather", "all-to-all")
                           if re.search(rf"\b{op}(?:-start|-done)?\(", fold_hlo)]
         if fold_forbidden:
             _fail(
                 f"{mode}: terminal fold replicated a Gram via "
                 f"{fold_forbidden}")
+        local_g_bytes = (npoint // 2) ** 2 * np.dtype(np.complex128).itemsize
+        fold_alias_bytes = int(
+            fold_compiled.memory_analysis().alias_size_in_bytes)
+        if fold_alias_bytes < local_g_bytes:
+            _fail(
+                f"{mode}: donated terminal-fold alias={fold_alias_bytes} B "
+                f"is smaller than one local Gram shard={local_g_bytes} B")
 
         if mode == "transverse":
             perm, phase = _gammas_perm, _gammas_phase
@@ -198,7 +206,6 @@ def main() -> None:
                 "a per-tile repeated fusion path may have reappeared")
 
         analysis = compiled.memory_analysis()
-        local_g_bytes = (npoint // 2) ** 2 * np.dtype(np.complex128).itemsize
         alias_bytes = int(analysis.alias_size_in_bytes)
         if alias_bytes < local_g_bytes:
             _fail(

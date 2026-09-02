@@ -173,6 +173,7 @@ def test_tiled_executor_scan_and_donation_are_explicit_in_source():
 def test_terminal_hermitian_fold_preserves_value_and_xy_layout():
     from centroid.pivoted_cholesky import (
         _candidate_gram_hermitian_fold_kernel,
+        _candidate_gram_zero_kernel,
     )
     from common.collectives import device_put_process_local
 
@@ -183,7 +184,11 @@ def test_terminal_hermitian_fold_preserves_value_and_xy_layout():
         [0.3 + 0.1j, -2.0 + 0.8j, 1.1 - 0.2j],
         [0.6 - 0.9j, -0.7 + 0.5j, 3.0 - 0.3j],
     ], dtype=np.complex128)
-    got = _candidate_gram_hermitian_fold_kernel(mesh)(
+    fold = _candidate_gram_hermitian_fold_kernel(mesh)
+    assert fold is _candidate_gram_hermitian_fold_kernel(mesh)
+    assert (_candidate_gram_zero_kernel(mesh, 3)
+            is _candidate_gram_zero_kernel(mesh, 3))
+    got = fold(
         device_put_process_local(raw, xy))
     assert tuple(got.sharding.spec) == ("x", "y")
     np.testing.assert_array_equal(

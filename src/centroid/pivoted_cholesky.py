@@ -46,7 +46,7 @@ from __future__ import annotations
 import gc
 import math
 import os
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy as np
 import jax
@@ -91,6 +91,7 @@ _GRAM_FINAL_FOLD_SLOTS = 3
 _CANDIDATE_GAMMA_MODES = ("charge", "transverse")
 
 
+@lru_cache(maxsize=None)
 def _candidate_gram_hermitian_fold_kernel(mesh_xy: Mesh):
     """Return the donated P(x,y)->P(x,y) terminal Gram fold.
 
@@ -110,6 +111,19 @@ def _candidate_gram_hermitian_fold_kernel(mesh_xy: Mesh):
         return 0.5 * (G + jnp.conj(G.T))
 
     return _fold
+
+
+@lru_cache(maxsize=None)
+def _candidate_gram_zero_kernel(mesh_xy: Mesh, n_points: int):
+    """Return the stable donated-Gram destination initializer."""
+    xy = NamedSharding(mesh_xy, PartitionSpec("x", "y"))
+    n_points = int(n_points)
+
+    @jax.jit(out_shardings=xy)
+    def _zero():
+        return jnp.zeros((n_points, n_points), dtype=jnp.complex128)
+
+    return _zero
 
 
 def _resolve_candidate_gamma_mode(gamma_mode: str, *, bispinor: bool) -> str:
@@ -1587,14 +1601,7 @@ def build_gram_q0_via_loadwfns(
                 f"full-live peak={live_facts['peak'] / 2**30:.2f} "
                 f"of target={target_bytes / 2**30:.2f} GiB/device)"
             )
-        tile_xy = NamedSharding(mesh_xy, PartitionSpec('x', 'y'))
-
-        @jax.jit(out_shardings=tile_xy)
-        def _zero_gram():
-            return jnp.zeros((M_cols, M_cols), dtype=jnp.complex128)
-
-        G = _zero_gram()
-        G.block_until_ready()
+        G = _candidate_gram_zero_kernel(mesh_xy, M_cols)()
 
         with timing.section("q0_sum.fused"):
             G = gram_q0_tiled_from_psi_sm(
