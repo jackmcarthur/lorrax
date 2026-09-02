@@ -19,18 +19,23 @@ current density `ψ†α^iψ`).
 
 ## 1. Status in one table
 
-> **Implementation status (2026-09-01).** This table now describes
-> `lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2` (pushed, not on
-> `origin/main`), which collapsed the two packed modes into one and made the
-> Γ-cell completion the default. On `origin/main@8b6e3cc7` there are still
-> two packed modes and the headless one is the defect the ruling names.
+> **Implementation status (2026-09-01).** This table describes
+> `integ/bispinor-static-cleanup-2026-09-01@3897f89f` (a branch, not
+> `origin/main`): lane B collapsed the two packed modes into one and made the
+> Γ-cell completion the default (`41e2b6b2`); lane C then routed
+> `bare_transverse` through the same packed operator **inside the slab
+> one-shot static-COHSEX envelope only** (`ce3dedcc`, claim 581). On
+> `origin/main@8b6e3cc7` there are still two packed modes, the headless one
+> is the defect the ruling names, and `bare_transverse` has its own Σ owner
+> everywhere.
 
 | self-energy channel | frequency dependence | Γ-cell head | deck route | status |
 |---|---|---|---|---|
 | charge exchange `Σ_X` (CC) | none | `⟨v⟩_mBZ`, band-diagonal (§3.1) | every mode | production |
 | charge correlation `Σ_SX+Σ_COH` / `Σ_c(ω)` (CC) | static, GN-PPM (two samples), HL-PPM, MPA | scalar `W_h(ω)` from `S_eff(ω)` (§3) | `head_correction = full` | production |
-| bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | `−⟨v P^T⟩_mBZ` tensor slot (§2) | `bispinor_tt_head_correction = true` | implemented, default off |
+| bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | **inside the packed envelope**: `⟨D_TT⟩` from the Γ-cell completion, always on. **Outside it**: the `−⟨v P^T⟩_mBZ` tensor slot overlay (§2.1) | inside: `bispinor_gw = bare_transverse` + the §2 envelope. Outside: `bispinor_tt_head_correction = true` | both implemented; the overlay is default off and **refused** inside the envelope |
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
+| *unscreened* TT via the same packed operator | **static only** | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; Hall **refused** (§4) | `bispinor_gw = bare_transverse` inside the §2 envelope | experimental, slab, one shot; body byte-identical to the incumbent route |
 | retarded / dynamic photon `D^{IJ}(ω)` | — | — | none | **does not exist** |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -54,10 +59,47 @@ Two facts follow from the table and are easy to miss:
 
 ## 2. The bare propagator and its Γ-cell average
 
-> **Implementation status (2026-09-01, in flight).** No lane changes the bare
-> propagator or its Γ-cell average. `lane/bisp-c-bare-as-packed-2026-09-01`
-> would route `Σ^B` through the packed contraction with `W = D`, which must
-> leave §2.1 bit-identical — that is its gate.
+> **Implementation status (2026-09-01).** The propagator and its Γ-cell
+> average are unchanged. What changed is **which code contracts them**:
+> `lane/bisp-c-bare-as-packed-2026-09-01@ce3dedcc` (claim 581) routes
+> `bare_transverse` through the packed static photon operator inside one
+> envelope. See "Two routes to the same `Σ^B`" below.
+
+### Two routes to the same `Σ^B`
+
+`bare_transverse` **is** the packed static mode with `χ_TT = χ_CT = 0`. The
+packed Dyson equation is then block diagonal, so `W_packed = diag(W_00,
+D_TT)`, `W_CT = 0`, and the sixteen-block `Σ_X` reproduces exactly the CC
+screened COHSEX plus `Σ^B = X(D_TT)`, with `COH(D_TT − D_TT) = 0`. The two
+descriptions below are the same physics; which code runs depends only on the
+envelope.
+
+| | inside the envelope | outside it |
+|---|---|---|
+| envelope | `bispinor`, `compute_mode = cohsex`, `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim = 2`, `head_correction ∈ {full, off}`, `restart = false` | bulk, the dynamic modes, `x_only`, self-consistent — everything else |
+| who contracts `Σ^B` | `gw.photon_sigma`, the TT part of the sixteen-block `Σ_X` | `gw.sigma_x_bispinor`, the nine bare TT tiles |
+| the TT Γ-cell head | `⟨D_TT⟩` out of the Γ-cell completion, always on | the §2.1 overlay, `bispinor_tt_head_correction = true`, default off |
+| status | experimental; body byte-identical to the incumbent (below) | **the only certified route**, and unchanged |
+
+The route is a predicate with a reason attached,
+`gw_config.packed_bare_transverse_route(config) -> (taken, reason)`, and the
+driver writes that reason into the run record as the `Photon route` line —
+the two routes differ in the q→0 head mechanism, so which one ran is a fact a
+later reader needs. `bispinor_tt_head_correction` is deliberately **not** in
+the predicate: a head dial must not move a route, so a deck asking for the
+overlay inside the envelope is refused
+(`GATE packed_bare_transverse_tt_head_double_count`) rather than quietly
+routed elsewhere.
+
+**Measured** (`reports/bisp_c_bare_as_packed_2026-09-01`, MoS2 3×3, 270
+states, claim 581): with the head off the two routes are **byte-identical** —
+`max|dE_qp| = 0.000 µeV`, `eqp1.dat` and every `sigma_diag.dat` data row
+identical, despite entirely different contraction order and operator packing.
+Declaring the twelve current `χ` blocks zero costs **0.012 µeV** (1.2e-8 eV)
+against the screened packed mode on the same deck — the current vertices each
+carry `α_FS/2`, so `χ_TT` enters at `α_FS²`. With the head **on** the two
+routes differ by 5.4 meV MAE; that is the open question of §3.6, not a
+property of the body.
 
 In Coulomb gauge the bare electron–electron interaction, after eliminating
 the photon field, is block diagonal in `(C, T)`:
@@ -89,6 +131,12 @@ The point `K = 0` is undefined in every block, but for different reasons:
 
 ### 2.1 The bare TT head
 
+This is the **incumbent route's** TT head. Inside the packed envelope of §2
+the same physics arrives as `⟨D_TT⟩` from the Γ-cell completion instead, and
+asking for this overlay there is refused
+(`GATE packed_bare_transverse_tt_head_double_count`) — the two would double
+count.
+
 `bispinor_tt_head_correction = true` replaces the `q = Γ, G = 0` slot of the
 nine TT `V` tiles by `−T_{ij}/Ω_{\rm cell}`, where `T` is sampled by the
 same mini-BZ estimator that produces `⟨v⟩` for the charge head
@@ -113,13 +161,19 @@ the slot and is refused. Bulk (`sys_dim = 3`) uses the Baldereschi–Tosatti
 analytic sphere for the `1/q²` part, as `⟨v⟩` does.
 
 This term is frequency independent because `Σ^B` is. It is the only Γ-cell
-correction on the transverse channels outside the packed modes of §4.
+correction on the transverse channels outside the packed routes. Its own size
+was re-measured on MoS2 3×3 by lane C: switching the overlay on and off in
+the incumbent route moves quasiparticle energies by **0.115 meV MAE /
+0.251 meV max**, consistent with `BISPINOR_DHFB_DESIGN.md` §11's ≈0.2 meV at
+4×4.
 
 ## 3. The charge head: `S(ω)`, local fields, and the three frequency models
 
-> **Implementation status (2026-09-01, in flight).** Unchanged by the current
-> lanes except §3.5: the `W[q=0]` Hermiticity consumer is being re-scoped to
-> time-reversal-symmetric decks on `lane/bisp-g-trs-gates-2026-09-01`.
+> **Implementation status (2026-09-01).** The equations are unchanged. §3.5's
+> `W[q=0]` Hermiticity consumer is being re-scoped to time-reversal-symmetric
+> decks on `lane/bisp-g-trs-gates-2026-09-01` (in flight), and **§3.6 is new
+> and OPEN**: lane C measured this head against the packed one and they
+> disagree.
 
 ### 3.1 Objects
 
@@ -247,14 +301,52 @@ in the sandbox):
   the two frequency halves with independent complex poles and does not assume
   a conjugation relation between them.
 
+### 3.6 OPEN: the two charge-head quadratures disagree by 5.4 meV
+
+There are now two evaluations of the **same** Γ-cell charge integral, and they
+do not agree. This is an open question, not a resolved one.
+
+| | incumbent | packed |
+|---|---|---|
+| quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon rule inside the coupled 4×4 solve |
+| insertion | band-diagonal scalar shift (§3.2) | rank-4 low-rank update contracted through the real Σ kernels (§4.2) |
+| convergence certificate | none printed | `ward`, `hermiticity`, `dyson_forward_bound`, `cubature_orders`, printed per run |
+
+Measured on MoS2 3×3, 270 states, static COHSEX, heads on both sides
+(`reports/bisp_c_bare_as_packed_2026-09-01` GATE B, claim 581):
+
+| comparison | MAE | median | max |
+|---|---|---|---|
+| packed vs incumbent, total | 5.395 meV | 5.417 | **11.857 meV** |
+| the charge half alone (no TT overlay on either side) | 5.485 meV | 5.552 | 12.044 meV |
+| the TT half alone (the overlay, §2.1) | 0.115 meV | 0.112 | 0.251 meV |
+| for scale: the head itself, packed / incumbent | 2094.9 / 2100.2 meV | | 2214.7 / 2216.0 meV |
+
+So essentially all of the disagreement is the **charge** head — two quadratures
+of a 2.10 eV term differing by 0.25 % — and almost none of it is the transverse
+head that lane C actually moved. The body is exact between the two routes
+(byte-identical, §2), so the difference is entirely the q→0 mechanism.
+
+**Which one is right is not settled.** A gate firing says two things disagree,
+not which is wrong. Only the packed side carries a convergence certificate,
+which is a reason to prefer it, not a measurement that it is correct — the
+incumbent side prints no comparable bound. Settling it needs a third
+evaluation neither shares: a k-grid convergence sequence, which a single 3×3
+deck cannot supply. Two mechanisms also differ at once (quadrature and
+insertion) and the table above separates them from the body but not from each
+other; the "for scale" row shows the insertion difference directly, the
+incumbent head being nearly state-independent (median = max = 2216.0 meV)
+while the packed head varies by state.
+
 ## 4. The packed static photon head (`full_static_cohsex`)
 
 > **Implementation status (2026-09-01).** This section describes
-> `lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2` (`cff884e7` made the §4.2
-> completion the default under one mode and deleted the producerless
-> `StaticGaugeHeadResponse` seam; `cacc4e07` fixed the Hall sign of §4.2).
-> On `origin/main@8b6e3cc7` the mode is still named `charge_hall_cubature`
-> and the completion is opt-in.
+> `integ/bispinor-static-cleanup-2026-09-01@3897f89f` (`cff884e7` made the
+> §4.2 completion the default under one mode and deleted the producerless
+> `StaticGaugeHeadResponse` seam; `cacc4e07` fixed the Hall sign of §4.2;
+> `ce3dedcc` gave the bare route the same completion). On
+> `origin/main@8b6e3cc7` the mode is still named `charge_hall_cubature` and
+> the completion is opt-in.
 
 ### 4.1 Body and layout
 
@@ -290,7 +382,11 @@ only admitted `q`-linear CT/TC structure is generated from it. It is also
 **optional**: an absent `static_gauge_hall_file` means `σ_H = 0`, announced
 with its reason, which by §4.4 is the exact answer for the systems this mode
 admits; a present but mismatched artifact still refuses in the loader, so a
-stale file cannot degrade the run silently. The sign is the live band
+stale file cannot degrade the run silently. On the **unscreened** packed
+route of §2 a present artifact is refused outright
+(`GATE packed_bare_transverse_hall_unavailable`): with the current channels
+unscreened, `W_CT = 0` at every finite `q`, so a Γ-only CT/TC block would not
+be the `q → 0` limit of anything the model computes. The sign is the live band
 orientation's: the persisted `σ_H` is the occupied-bra Berry sum while the
 live Adler–Wiser response is energy-ordered (`P = −ΔD`), which is the minus
 above (`lane/bisp-b-one-packed-mode-2026-09-01@cacc4e07`, from lane A's
@@ -350,7 +446,7 @@ C=\frac{1}{2\pi}\sum_{n\in{\rm occ}}\int_{\rm BZ}\Omega_n^z\,d^2k\in\mathbb Z .
 $$
 
 The producer computes exactly this occupied Berry-curvature sum
-(`gw.qsgw_head.raw_hall_pseudovector_sharded`,
+(`gw.qsgw_head.raw_hall_pseudovector_sharded`, `:3250`,
 `σ_H^b = −(α_{FS}C_s/2Ω)\,\operatorname{Im}c_B^b`), and it refuses metals
 (exact `0/1` occupations are required). Consequently:
 
@@ -408,7 +504,10 @@ former.
 ### 4.5 Open items on this route
 
 > **Implementation status (2026-09-01).** Both items below are closed; the
-> section is kept because neither fix is on `origin/main` yet.
+> section is kept because neither fix is on `origin/main` yet. The live open
+> question on this route is **§3.6**: the packed Γ-cell quadrature and the
+> incumbent scalar one disagree by 5.4 meV MAE on MoS2 3×3, and which is
+> right is unsettled.
 
 * **Interband Γ wing sign — fixed, on a branch.** Both wing kernels built the
   mixed head/body interband weight as `+F\,\overline{P}\,b/(z²−Δ²)`, while the
@@ -420,7 +519,8 @@ former.
   `lane/bisp-a-fix-deltas-2026-09-01@60b7bbb7`, with both layouts routed
   through one owner (`_head_wing_interband_weight`) so they cannot drift
   apart again. Still open on `origin/main@8b6e3cc7`
-  (`qsgw_head.py:1525,1844`).
+  (`qsgw_head.py:1525,1844`); on this tree both wing kernels call the one
+  owner `_head_wing_interband_weight` (`:1219`, from `:1539` and `:1864`).
 * **The transverse current Hartree is on both routes** — the earlier
   statement here, that it is computed only on the packed routes and omitted
   by `bare_transverse`, was wrong. Its gate is
@@ -496,20 +596,23 @@ transverse screening".
 
 ## 6. Where the code is
 
-> **Implementation status (2026-09-01, in flight).** Owners move with lanes A,
-> B and C. The stage-by-stage wiring — every object's shape, sharding, route
-> membership and refusal — is
+> **Implementation status (2026-09-01).** Lanes A, B and C have landed on
+> `integ/bispinor-static-cleanup-2026-09-01@3897f89f`. The stage-by-stage
+> wiring — every object's shape, sharding, route membership and refusal — is
 > [`architecture/four_current_wiring.md`](../architecture/four_current_wiring.md).
 
 | object | owner |
 |---|---|
 | bare `D^{IJ}` tiles, TT head slot | `src/gw/v_q_bispinor.py` (`_make_per_q_v_builder_for_tile`, `_tt_head_tensor`) |
 | mini-BZ estimators: `⟨v⟩`, `⟨v q q⟩`, `⟨v P^T⟩`, photon cubature | `services/vcoul/src/vcoul/minibz.py` |
-| `Σ^B` | `src/gw/sigma_x_bispinor.py` |
+| `Σ^B`, incumbent route only (bulk, dynamic modes, `x_only`, self-consistent) | `src/gw/sigma_x_bispinor.py` |
+| `Σ^B` inside the packed envelope — the TT part of the sixteen-block `Σ_X` | `src/gw/photon_sigma.py`, the same consumer as the screened mode |
+| which of the two routes a deck takes, and the reason printed in the run record | `gw_config.packed_bare_transverse_route` |
+| which of the two packed modes screens the current blocks | `gw_config.packed_photon_screens_current` |
 | head sources, `HeadResolver`, static terms, PPM/complex-pole head `Σ`, Schur fold, rank-1 injection, packed Γ completion | `src/gw/head_correction.py` |
 | `S(ω)`, Γ wings, velocity, Hall pseudovector, per-iteration head samples | `src/gw/qsgw_head.py` |
 | packed layout and rank-4 updates | `src/gw/photon_layout.py` |
-| packed body response and Dyson | `src/gw/w_isdf.py` (`compute_static_photon_response`) |
+| packed body response and Dyson, for **both** packed modes | `src/gw/w_isdf.py` (`compute_static_photon_response`, keyword `screen_current`) |
 | sixteen-block `Σ` | `src/gw/photon_sigma.py` |
 | bounded packed-head response record (`StaticPhotonHeadResponse`; Hall optional), and the by-declaration content list | `src/gw/static_gauge_response.py` (the module docstring) |
 | Hall artifact schema | `src/file_io/static_gauge_head.py` |
