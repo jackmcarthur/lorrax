@@ -105,6 +105,44 @@ def test_conduction_tail_scissor_does_not_touch_mesh_padding():
         got[:, 3:6], 0.8 * energies[:, 3:6] + 1.0)
 
 
+def test_frontier_scissor_is_rigid_and_ignores_higher_conduction_samples():
+    """The SC tail law is defined by one physical frontier manifold."""
+    e_dft = np.array([
+        [-2.0, -1.0, 1.000, 1.002, 3.0],
+        [-2.2, -0.8, 1.100, 1.100, 3.2],
+    ])
+    e_qp = e_dft + np.array([
+        [0.1, 0.1, 0.5, 0.7, 2.0],
+        [0.1, 0.1, 0.6, 0.8, 3.0],
+    ])
+    valence = np.broadcast_to(
+        np.array([True, True, False, False, False]), e_dft.shape)
+    weights = np.array([1.0, 2.0])
+
+    fit_wide = fit_scissor(
+        e_dft, e_qp, valence, np.ones_like(valence),
+        k_weights=weights, conduction_frontier_tol_ev=0.003)
+    fit_narrow = fit_scissor(
+        e_dft[:, :4], e_qp[:, :4], valence[:, :4],
+        np.ones_like(valence[:, :4]),
+        k_weights=weights, conduction_frontier_tol_ev=0.003)
+
+    assert fit_wide.alpha_c == 1.0
+    assert fit_wide.n_fit_c == 4
+    assert fit_wide.w_fit_c == 6.0
+    assert fit_wide.beta_c_ev == fit_narrow.beta_c_ev
+    assert fit_wide.rmse_c_ev == fit_narrow.rmse_c_ev
+
+
+def test_frontier_scissor_refuses_an_invalid_tolerance():
+    e = np.array([[-1.0, 1.0]])
+    valence = np.array([[True, False]])
+    with pytest.raises(ValueError, match="conduction_frontier_tol_ev"):
+        fit_scissor(
+            e, e, valence, np.ones_like(valence),
+            k_weights=np.ones(1), conduction_frontier_tol_ev=np.nan)
+
+
 # ---------------------------------------------------------------------------
 # The pre-weighting arithmetic, transcribed verbatim for property 2
 # ---------------------------------------------------------------------------

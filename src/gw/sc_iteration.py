@@ -2619,6 +2619,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             valence_mask_kn=valence_kn,
             fit_mask_kn=fit_mask_kn,
             k_weights=k_star_weights(ks),
+            # The sum-band tail is not part of the rotated QP subspace. Its
+            # update is a rigid edge scissor defined by a fixed physical
+            # manifold, not an affine regression whose sample count changes
+            # with ncond. Reuse the deck's explicit near-degeneracy scale: it
+            # identifies the SOC-split frontier and is independent of the SC
+            # stopping tolerance.
+            conduction_frontier_tol_ev=(
+                float(inputs.config.degen_avg_tol_ry) * RYD_TO_EV),
         )
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
