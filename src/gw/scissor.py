@@ -619,6 +619,7 @@ def fit_scissor(
     fit_mask_kn: np.ndarray,
     *,
     k_weights: np.ndarray,
+    conduction_frontier_tol_ev: float | None = None,
 ) -> ScissorFit:
     """Fit valence / conduction scissor lines to (E_DFT, ΔE) samples.
 
@@ -668,6 +669,15 @@ def fit_scissor(
         reduction over k and an unweighted fit on a reduced k-set returns
         a plausible wrong scissor that no downstream check catches — see
         the module docstring for the measured size (0.386 eV in eqp0).
+    conduction_frontier_tol_ev : float, optional
+        Replace the conduction affine regression by a rigid shift fitted to
+        the lowest conduction multiplet. Starting at the first clean
+        conduction band, adjacent bands join that multiplet while their
+        minimum separation over k is at most this tolerance. This is a
+        manifold-identification tolerance, not an SC convergence tolerance.
+        It makes the energy-only sum-band tail independent of how many higher
+        conduction bands happen to lie inside the active QP matrix. ``None``
+        preserves the general all-conduction affine fit.
     """
     E_dft = np.asarray(E_dft_kn_ev, dtype=np.float64)
     E_qp = np.real(np.asarray(E_qp_kn_ev, dtype=np.complex128))
@@ -725,6 +735,43 @@ def fit_scissor(
         E_dft_sorted[mask_v], E_qp_sorted[mask_v], w_v)
     alpha_c, beta_c, _ = _wls_line(
         E_dft_sorted[mask_c], E_qp_sorted[mask_c], w_c)
+
+    if conduction_frontier_tol_ev is not None and np.any(mask_c):
+        tol_ev = float(conduction_frontier_tol_ev)
+        if not np.isfinite(tol_ev) or tol_ev < 0.0:
+            raise ValueError(
+                "fit_scissor: conduction_frontier_tol_ev must be finite and "
+                f"non-negative; got {conduction_frontier_tol_ev!r}.")
+
+        # Work in sorted-energy position space, matching the fit itself. A
+        # frontier position must be clean conduction data at every k; a
+        # Fermi-crossing or partially in-grid position is not evidence for a
+        # tail law. Once the first such position is found, extend only across
+        # multiplet boundaries. The minimum-over-k rule is the same rule used
+        # by common.band_degeneracy: if two bands touch anywhere, cutting
+        # between them does not define a global band subspace.
+        clean_c_pos = np.all((~vm_sorted) & fm_sorted, axis=0)
+        clean_positions = np.flatnonzero(clean_c_pos)
+        if clean_positions.size:
+            first = int(clean_positions[0])
+            stop = first + 1
+            while stop < E_dft_sorted.shape[1] and clean_c_pos[stop]:
+                min_gap_ev = float(np.min(np.abs(
+                    E_dft_sorted[:, stop] - E_dft_sorted[:, stop - 1])))
+                if min_gap_ev > tol_ev:
+                    break
+                stop += 1
+            frontier_pos = np.arange(first, stop, dtype=np.int64)
+            frontier_mask = np.zeros_like(mask_c)
+            frontier_mask[:, frontier_pos] = True
+            frontier_mask &= mask_c
+            w_frontier = w_kn[frontier_mask]
+            correction = (E_qp_sorted - E_dft_sorted)[frontier_mask]
+            alpha_c = 1.0
+            beta_c = float(
+                np.sum(w_frontier * correction) / np.sum(w_frontier))
+            mask_c = frontier_mask
+            w_c = w_frontier
     # No-information laws.  _wls_line returns (0, 0) on an empty class and
     # (0, y0) on a single sample; as an E_QP = α·E + β scissor those
     # extrapolate every band to ZERO / to a constant — on the metallic

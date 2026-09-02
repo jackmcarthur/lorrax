@@ -204,8 +204,8 @@ def test_per_map_files_are_output_diagnostics_not_final_eqp_math():
     body = _block("_write_sc_eqp_snapshot")
     assert "write_bgw_eqp(" in body
     assert "assemble_eqp" not in body
-    assert "output_candidate_active_scissor" in body
-    assert "input_tail_scissor" in body
+    assert "shared_map_input_active_scissor" in body
+    assert "shared_input_tail_scissor" in body
     # The rows are the FILE wedge (wfn.kpoints), like every other .dat.
     # This used to assert ``"kirr_fullids" in body`` — the same fact
     # spelled as the index table the writer gathered by.  It now goes

@@ -503,12 +503,32 @@ def finalize_dynamic_sigma(
             sigma_omega_h5_path = None
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
+        one_sided_core_mask = None
+        sc_cfg = getattr(config, "sc", None)
+        if (sc_cfg is not None
+                and int(sc_cfg.buffer_nbands) > 0
+                and sc_cfg.buffer_mode == "one_sided"
+                and getattr(config.qp_solver, "value", config.qp_solver)
+                == "self_consistent"):
+            band_ids = np.arange(
+                int(band_slices.b0), int(band_slices.b3), dtype=np.int64)
+            one_sided_core_mask = (
+                (band_ids >= int(meta.nelec) - int(config.nval))
+                & (band_ids < int(meta.nelec) + int(config.ncond)))
+        qsgw_edge_kwargs = ({"one_sided_core_mask": one_sided_core_mask}
+                             if one_sided_core_mask is not None else {})
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
+            **qsgw_edge_kwargs,
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+        if one_sided_core_mask is not None:
+            print_fn(
+                "  QSGW window edge: one-sided Sigma(E_core) on "
+                f"{int(qsgw_diag['n_one_sided_edges'])} ordered "
+                "(k,m,n) couplings")
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
@@ -537,6 +557,7 @@ def finalize_dynamic_sigma(
             sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
                 sigma_c_omega_unextrap, sig_x_rep,
                 omega_grid_ev, e_qp_rel_ev, mesh_xy,
+                **qsgw_edge_kwargs,
             )
 
         # Only append when this call created the base file.  SC iterations

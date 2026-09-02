@@ -642,11 +642,12 @@ def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
 # ``_extract_diag_kernel``: a closure inside ``build_qsgw_sigma_xc``
 # retraced+recompiled the full (nω, nk, nb, nb) gather every SC
 # iteration.
-_QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
+_QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool, bool], object] = {}
 
 
-def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
-    key = (id(mesh_xy), bool(replicated_output))
+def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool,
+                        one_sided: bool):
+    key = (id(mesh_xy), bool(replicated_output), bool(one_sided))
     fn = _QSGW_BUILD_KERNEL_CACHE.get(key)
     if fn is None:
         out_3d = NamedSharding(
@@ -655,7 +656,7 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
             else P(None, "x", "y"))
 
         @jax.jit
-        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):
+        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi, core_mask):
             # ilo/ihi/wlo/whi: (nk, nb) replicated; sig_w: (nω, nk, nb_m_X, nb_n_Y).
             # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
             # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
@@ -680,12 +681,29 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
             B_hi = jnp.take_along_axis(sig_w, ihi_n, axis=0)[0]
             B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
 
-            # Half-sum, then add static Σ_x.  Historical callers request a
+            # At a named SC-window edge, the optional one-sided rule evaluates
+            # a core↔buffer coupling at the CORE state's energy.  For row m in
+            # core / column n outside use A=Σ_mn(E_m); for the Hermitian
+            # partner use B=Σ_mn(E_n).  Same-side pairs retain the standard
+            # QSGW half-sum.  Hermitisation below then makes the two cross-edge
+            # entries exact adjoints without referring to the buffer energy.
+            sigma_c = 0.5 * (A + B)
+            if one_sided:
+                m_core = core_mask[:, None]
+                n_core = core_mask[None, :]
+                sigma_c = jnp.where(
+                    m_core[None, :, :] & ~n_core[None, :, :], A,
+                    jnp.where(
+                        ~m_core[None, :, :] & n_core[None, :, :], B,
+                        sigma_c))
+
+            # Half-sum (or the explicit one-sided cross edge above), then add
+            # static Σ_x.  Historical callers request a
             # replicated matrix before Hermitisation.  The fixed-Sigma evSC
             # loop instead keeps the matrix on both band axes: its next
             # operation is a distributed eigh, so gathering it here would
             # create exactly the O(nb^2)-per-rank object that loop avoids.
-            M = 0.5 * (A + B) + sig_x
+            M = sigma_c + sig_x
             M = jax.lax.with_sharding_constraint(M, out_3d)
             Mh = 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
             return jax.lax.with_sharding_constraint(Mh, out_3d)
@@ -703,6 +721,7 @@ def build_qsgw_sigma_xc(
     mesh_xy: Mesh,
     *,
     replicated_output: bool = True,
+    one_sided_core_mask: np.ndarray | None = None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
@@ -713,6 +732,11 @@ def build_qsgw_sigma_xc(
     where ``[·]ʰ`` denotes the Hermitian part (real-symmetrisation against
     interpolation noise).  Σ_xc = Σ_c + Σ_x; Σ_x is ω-independent so it
     is added once after the Σ_c(ω) interpolation.
+
+    ``one_sided_core_mask`` is the explicit window-edge diagnostic rule.  A
+    coupling with exactly one core endpoint is evaluated at that endpoint's
+    energy rather than half-averaged with the buffer endpoint.  ``None`` is
+    the historical QSGW ansatz bit-for-bit.
 
     Energy domain
     -------------
@@ -760,6 +784,19 @@ def build_qsgw_sigma_xc(
     if E.shape != (nk, nb):
         raise ValueError(
             f"e_qp_kn_ev must have shape ({nk}, {nb}); got {E.shape}.")
+    one_sided = one_sided_core_mask is not None
+    if one_sided:
+        core_mask = np.asarray(one_sided_core_mask, dtype=bool).reshape(-1)
+        if core_mask.shape != (nb,):
+            raise ValueError(
+                "one_sided_core_mask must have one entry per Sigma band; "
+                f"got {core_mask.shape}, expected ({nb},).")
+        if not core_mask.any() or core_mask.all():
+            raise ValueError(
+                "one_sided_core_mask must identify nonempty core and buffer "
+                "subspaces.")
+    else:
+        core_mask = np.zeros(nb, dtype=bool)
 
     # Linear-interp index/weight arrays, host-side then pushed replicated.
     omega_lo = float(omega[0])
@@ -792,11 +829,13 @@ def build_qsgw_sigma_xc(
     idx_hi_j = device_put_process_local(idx_hi.astype(np.int32), rep_2d)
     w_lo_j   = device_put_process_local(w_lo.astype(np.complex128), rep_2d)
     w_hi_j   = device_put_process_local(w_hi.astype(np.complex128), rep_2d)
+    core_j = device_put_process_local(core_mask, NamedSharding(mesh_xy, P(None)))
 
     sigma_xc_qsgw = _qsgw_build_kernel(
-        mesh_xy, replicated_output=bool(replicated_output))(
+        mesh_xy, replicated_output=bool(replicated_output),
+        one_sided=one_sided)(
         sigma_c_omega_ry, sigma_x_kij_ry,
-        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
+        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, core_j,
     )
     sigma_xc_qsgw.block_until_ready()
 
@@ -805,6 +844,8 @@ def build_qsgw_sigma_xc(
         "frac_clipped": float(n_clipped) / float(nk * nb) if nk * nb else 0.0,
         "omega_min_ev": omega_lo,
         "omega_max_ev": omega_hi,
+        "n_one_sided_edges": float(
+            2 * int(core_mask.sum()) * int((~core_mask).sum()) * nk),
     }
     return sigma_xc_qsgw, diagnostics
 
