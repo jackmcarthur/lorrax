@@ -53,11 +53,6 @@ import jax.numpy as jnp
 import h5py
 
 from common import Meta
-from common.four_current_model import (
-    is_isometric_kinetic_balance_model,
-    is_pauli_reference_model,
-    resolve_four_current_representation,
-)
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
 from common.collectives import (barrier, local_share, process_rank_world,
                                 psum_replicate, resolve_mesh)
@@ -1157,21 +1152,12 @@ def main(argv=None):
     bispinor = bool(params.get("bispinor", False))
     bispinor_gw_mode = coerce_bispinor_gw_mode(
         params.get("bispinor_gw", "bare_transverse"))
-    if (bispinor_gw_mode in (
-            BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
-            BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
+    if (bispinor_gw_mode is BispinorGWMode.FULL_STATIC_COHSEX
             and not bispinor):
         raise SystemExit(
             f"bispinor_gw={bispinor_gw_mode.value} requires "
             "bispinor=true; the selector does not enable spatial-current "
             "channels implicitly.")
-    representation = resolve_four_current_representation(
-        bispinor, bispinor_gw_mode)
-    pauli_reference = bispinor and is_pauli_reference_model(bispinor_gw_mode)
-    charge_representation = representation.charge_representation
-    explicit_comparison = bool(
-        pauli_reference
-        or is_isometric_kinetic_balance_model(bispinor_gw_mode))
     # Band window the GW run will actually ask for: ``load_kin_ion_submatrix``
     # reads [b_id_0, b_id_3) = [0, nelec + ncond).  Sizing the file below
     # that silently truncates the run's window, so it is a hard floor;
@@ -1485,11 +1471,6 @@ def main(argv=None):
                 ds.attrs["nband_input"] = nband
                 ds.attrs["nelec_bands"] = int(wfn.nelec)
                 ds.attrs["bispinor"] = bool(bispinor)
-                if explicit_comparison:
-                    ds.attrs["bispinor_gw_mode"] = bispinor_gw_mode.value
-                    ds.attrs["charge_representation"] = charge_representation
-                    ds.attrs["spatial_current_representation"] = (
-                        representation.spatial_current_representation)
                 ds.attrs["nspinor"] = int(wfn.nspinor)
                 # WHICH V_NL PROJECTORS.  ``nspinor`` alone does NOT say:
                 # noncollinear is not spin-orbit, and a file written with

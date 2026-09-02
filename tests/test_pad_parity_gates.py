@@ -372,26 +372,21 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     }
     assert not ({"PSI_NMU_SPEC", "PSI_MUN_SPEC"} & bundle_assignments)
     assert "from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC" in bundle
-    assert "from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC, band_sphere_spec" in mtxel
-    assert "NamedSharding(geom.mesh, PSI_NMU_SPEC)" in mtxel
-    assert "NamedSharding(geom.mesh, PSI_MUN_SPEC)" in mtxel
-    endpoint = next(
-        node for node in ast.parse(mtxel).body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "finite_transfer_current_to_centroids")
-    old_face_literals = {
-        (None, "x", None, None, "y"),
-        (None, None, None, "x", "y"),
+    # mtxel_sweep's two face-sharded producers (the complete uniform-gauge
+    # sweep and the finite-transfer endpoint) were deleted on 2026-09-02 --
+    # no production caller -- and the PSI_*_SPEC asserts went with them.
+    # What survives is the property, not the spelling: mtxel_sweep takes
+    # every layout it uses from the wfn_layout owner and defines none of
+    # its own.
+    assert "from common.wfn_layout import" in mtxel
+    mtxel_assignments = {
+        target.id
+        for node in ast.walk(ast.parse(mtxel))
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
     }
-    endpoint_literals = {
-        tuple(arg.value for arg in node.args)
-        for node in ast.walk(endpoint)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "P"
-        and all(isinstance(arg, ast.Constant) for arg in node.args)
-    }
-    assert endpoint_literals.isdisjoint(old_face_literals), endpoint_literals
+    assert not ({"PSI_NMU_SPEC", "PSI_MUN_SPEC"} & mtxel_assignments)
 
     # The old mtxel_sweep location is not a compatibility facade.  Scan import
     # nodes over the bounded source root so a new indirect consumer cannot make

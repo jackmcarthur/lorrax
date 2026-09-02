@@ -99,7 +99,8 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver,
-	ScreeningDiagrams, packed_bare_transverse_route,
+	ScreeningDiagrams, incumbent_bispinor_head_record,
+	packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response)
@@ -301,9 +302,6 @@ def main(argv=None):
 		}[config.head.correction]))
 	if config.bispinor:
 		_bispinor_note = {
-			"pauli_reference_bare_transverse": (
-				" (normalized Pauli two-spinor charge/CC reference; raw "
-				"kinetic-balance only at spatial-current vertices)"),
 			"full_static_cohsex": (
 				" (packed no-pair 4x4 static response with the Gamma-cell "
 				"completion: bare <D> into V, charge S00/wing head into W, "
@@ -337,6 +335,19 @@ def main(argv=None):
 				   "incumbent charge-screened W + Sigma^B "
 				   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
 				   f"head -- {_bare_reason}"))
+		# HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
+		# docs/architecture/decisions.md; TASTE.md row 20).  The packed route
+		# already prints a boxed WARNING banner and a `Photon head` record
+		# line when head_correction=off (gw.w_isdf, lane B).  The INCUMBENT
+		# route printed only "no special Gamma-cell contribution" in the
+		# component chatter that production mode sinks, so a headless
+		# bispinor bulk / dynamic / x_only run reached eqp1.dat with no
+		# DEBUG token anywhere in the run record (lane J section 3.c).
+		if not uses_static_photon_response(config):
+			_banner, _head_record = incumbent_bispinor_head_record(config)
+			if _banner:
+				print0(_banner)
+			report.progress(f"Photon head    : {_head_record}")
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -560,7 +571,6 @@ def main(argv=None):
 	# samples ψ at the transverse-centroid Wfns bundle (None when
 	# bispinor=False or centroids_file_current is unset).
 	wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
-	wfns_scalar_head = getattr(isdf, 'wf_bundle_scalar_head', None)
 	# LOUD guard (quality pattern #7): the Σ kernels' Σ^B fold-in is a
 	# structural no-op when ``wfns_transverse``/``bispinor_v_q_path`` is
 	# None — a bispinor run reaching Σ without them would exit rc=0 with
@@ -640,21 +650,19 @@ def main(argv=None):
 				[complex(r.omega_ry) for r in oneshot_head_requests],
 				dtype=np.complex128)
 		if oneshot_omegas.size:
+			# ONE charge bundle: both shipped bispinor_gw values ride the
+			# raw kinetic-balance carrier, so the scalar q->0 head/wings are
+			# built on the run's own charge centroids.  The separate
+			# source-Pauli head bundle went with the two retired
+			# carrier-comparison modes (2026-09-01).
 			oneshot_head_response = build_dft_head_response(
-				(wfns if wfns_scalar_head is None else wfns_scalar_head),
-				oneshot_omegas,
+				wfns, oneshot_omegas,
 				input_dir=input_dir, mesh=mesh_xy,
 				wfn=wfn, meta=meta, config=config)
 			print0(
 				"  head_correction=full: built direct DFT response and "
 				"head/body wings on the chi0 transition manifold; finalizing "
 				"once against the resident W(Gamma).")
-			if wfns_scalar_head is not None:
-				# The source-Pauli comparison bundle has no consumer after its
-				# scalar Y/Z wings are materialized and synchronized above.
-				isdf.wf_bundle_scalar_head = None
-				wfns_scalar_head = None
-				gc.collect()
 	# SC solves W inside each map and persists only the final accepted map.
 	# Do not perform a redundant DFT screening solve here: besides its cost,
 	# that seed body used to survive long enough to be paired with a final head.

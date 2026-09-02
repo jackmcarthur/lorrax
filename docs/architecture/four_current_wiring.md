@@ -13,18 +13,20 @@ Deck-key semantics are owned by the [input reference](../input_reference.md).
 Module one-liners are owned by [Codebase](codebase.md). Where those pages
 disagree with this one, they win — this page owns the *wiring* only.
 
-> **Pinned to `lane/bisp-n-dynamic-packed-2026-09-01`, 2026-09-02 — a
-> branch, not `origin/main`.** Three changes since `origin/main@8b6e3cc7`
+> **Pinned to `integ/bispinor-static-cleanup-2026-09-01`, 2026-09-02 — a
+> branch, not `origin/main`.** Four changes since `origin/main@8b6e3cc7`
 > reshaped this layer: lane B (`41e2b6b2`) collapsed the two packed modes
 > into one and deleted the producerless static-gauge seam, lane C
 > (`ce3dedcc`) routed `bare_transverse` through the same packed operator
-> inside one envelope, and lane N gave that operator's CHARGE block a
-> frequency axis (phase 3) while freezing its current blocks at `ω = 0`.
-> Every `file:line` into a file any of the three lanes changed was re-read at
-> this commit; citations into files none touched are unchanged from
-> `8b6e3cc7` and are byte-identical here. Line numbers are for finding code,
-> never for quoting it. Other lanes of the cleanup are still in flight; the
-> theory page's per-section status notes name which.
+> inside one envelope, lane L (`44ae4713`) cut the dial set to five keys and
+> two mode values, folded the two envelope tables into one nine-row table
+> with PHYSICS / IMPLEMENTATION-LIMIT labels, labelled the incumbent route's
+> head and deleted 1,446 lines of stranded FULL-seam producers, and lane N
+> (`9bf291c6`) gave that operator's CHARGE block a frequency axis on the
+> plasmon-pole compute modes (phase 3) while freezing its current blocks at
+> `ω = 0`. Line numbers below were re-read at each lane's own tip and may be
+> off by the other lanes' insertions; they are for finding code, never for
+> quoting it.
 
 ## The routes
 
@@ -37,8 +39,8 @@ There is one packed static photon **operator**. Two deck situations reach it:
 | route | selected by | current `χ` blocks | `Σ^B` contracted by | marked below |
 |---|---|---|---|---|
 | **packed, screened** | `bispinor_gw = full_static_cohsex` | all sixteen `χ^{IJ}` built, one packed Dyson solve | `gw.photon_sigma`, TT part of the sixteen-block `Σ_X` | **P** |
-| **packed, bare** | `bispinor_gw ∈ BARE_TRANSVERSE_MODES` **and** the envelope below | twelve current blocks declared **zero**; packed solve skipped, CC screened by the scalar owner and spliced in, so `W_packed = diag(W_00, D_TT)` and `W_CT = 0` | the same `gw.photon_sigma` | **P** |
-| **incumbent, bare** | the same three spellings, **outside** the envelope | none — the bare `D^{ij}` tiles are contracted directly | `gw.sigma_x_bispinor` | **B** |
+| **packed, bare** | `bispinor_gw = bare_transverse` **and** the envelope below | twelve current blocks declared **zero**; packed solve skipped, CC screened by the scalar owner and spliced in, so `W_packed = diag(W_00, D_TT)` and `W_CT = 0` | the same `gw.photon_sigma` | **P** |
+| **incumbent, bare** | `bispinor_gw = bare_transverse`, **outside** the envelope | none — the bare `D^{ij}` tiles are contracted directly | `gw.sigma_x_bispinor` | **B** |
 
 Orthogonally to *which* packed operator is built, `compute_mode` decides
 **how much of Σ that operator owns** — one axis, two values:
@@ -54,22 +56,51 @@ for it, so the bare family's CC block of `W_packed` would have no owner
 `sigma_dispatch.py`'s exhaustiveness branch). The dynamic route's own
 run-record line is `Photon Sigma`, beside `Photon route` and `Photon head`.
 
-The envelope for the packed bare route, in the order the predicate tests it
-(`gw_config.packed_bare_transverse_route`, `:3584-3646`): `bispinor_gw` is a
-bare-transverse spelling, `bispinor = true`, `compute_mode` in
-`PACKED_PHOTON_COMPUTE_MODES` (`cohsex`, `gn_ppm`, `hl_ppm`),
-`qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim = 2`,
-`head_correction ∈ {full, off}`, `restart = false`. It returns
-**`(taken, reason)`**, not a bool: the driver prints the first unmet condition
-into the run record as the `Photon route` line, because the two routes differ
-in the `q → 0` head mechanism and switching physics silently is the hazard the
-reason exists to prevent.
+**ONE envelope table, since 2026-09-02** (`lane/bisp-l-dials-envelope-2026-09-01`).
+It used to be written twice — six conditions in
+`packed_bare_transverse_route` and seventeen in
+`refuse_unsupported_bispinor_gw`, five of them restated with separately
+formatted `got`/`want` strings. Both now walk
+`gw_config.packed_static_envelope(config, *, screened)` (`:3637`), which
+yields `(accepted, got, want, klass, why, derived_key)`:
 
-`bispinor_tt_head_correction` is deliberately **not** in that predicate — a
-head dial must not move a route. A deck asking for the §2.1 overlay inside the
-envelope is refused (`GATE packed_bare_transverse_tt_head_double_count`,
-`gw_config.py:3755`), because the Γ-cell completion already inserts `⟨D_TT⟩`
-and honouring both would double count it.
+| # | row | applies to | class |
+|---|---|---|---|
+| 1 | `compute_mode ∈ {cohsex, gn_ppm, hl_ppm}` (`PACKED_PHOTON_COMPUTE_MODES`) | both | IMPLEMENTATION LIMIT — `cohsex` is the static packed mode, the plasmon-pole pair is the dynamic packed route (charge block dynamic, current blocks frozen at `ω = 0`, lane N); `mpa` has no independent static-role W and refuses by name |
+| 2 | `qp_solver = one_shot_dft` | both | IMPLEMENTATION LIMIT |
+| 3 | `screening_diagrams = w_rpa` | both | IMPLEMENTATION LIMIT |
+| 4 | `head_correction ∈ {full, off}` | both | PHYSICS/POLICY (row 20) |
+| 5 | `restart = false` | both | IMPLEMENTATION LIMIT — normally unreachable on a slab deck, which `GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism` (`:3895`) refuses at parse time |
+| 6 | `mpa_material_class = insulator` | screened | PHYSICS |
+| 7 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived** |
+| 8 | `w_dyson_solver = distributed` | screened | IMPLEMENTATION LIMIT, **derived** |
+| 9 | no scalar q→0 head override named (`scalar_head_overrides_named`, `:3621`) | screened | IMPLEMENTATION LIMIT — ONE conjunct for the eight `use_bgw_vcoul` / `wcoul0_*` / `*head*` / `mc_average_placement*` keys, naming only the ones the deck set |
+
+Rows 7 and 8 are **derived, not declared**: `LorraxConfig.from_input_file`
+sets an unnamed one for `full_static_cohsex` with a `[config provenance]`
+line, promoting only when every other row already passes, so a deck outside
+the envelope for another reason still sees *that* reason. An explicitly named
+conflicting value is refused (rule 13). `sys_dim = 2` is deliberately **not**
+in the table: the bare route treats it as a routing condition
+(`packed_bare_transverse_route`, `:3720`) while the screened mode refuses it
+only under `head_correction = full` (`GATE
+static_bispinor_photon_head_slab_only`, `:3979`), and one row cannot say
+both.
+
+The route predicate returns **`(taken, reason)`**, not a bool: the driver
+prints the first unmet condition into the run record as the `Photon route`
+line, because the two routes differ in the `q → 0` head mechanism and
+switching physics silently is the hazard the reason exists to prevent.
+
+`bispinor_tt_head_correction` **is no longer a deck key** (removed
+2026-09-01, refused by name in `read_lorrax_input`). The double-count
+refusal survives as ONE gate covering *both* packed modes
+(`GATE packed_bare_transverse_tt_head_double_count`, `gw_config.py:3943`,
+keyed on `uses_static_photon_response`), reachable only from a hand-built
+config: the Γ-cell completion already inserts `⟨D_TT⟩` and honouring an
+overlay too would double count it.
+
+The bare route additionally requires `w_dyson_solver = distributed` as a ROUTING condition (not a table row: for the screened mode the key is derived at parse time; for the bare family a deck at the default `auto` stays on the incumbent route, because the packed Dyson solve has no local plan and `distrib_la` refuses `distributed` on a 1×1 mesh). `bispinor_tt_head_correction` is no longer a deck key (lane L); the packed completion is the only producer of a transverse q→0 head.
 
 The three predicates, all in `src/gw/gw_config.py`:
 
@@ -81,13 +112,19 @@ The three predicates, all in `src/gw/gw_config.py`:
 | `packed_photon_replaces_charge_sigma(config) -> bool` | `:3676` | does the packed operator own the CHARGE Σ too (`cohsex`), or only the current blocks — the question every driver seam that skips the scalar charge machinery must ask |
 | `uses_dynamic_packed_photon_route(config) -> bool` | `:3697` | the packed operator on a frequency-dependent Σ |
 
-`uses_coupled_photon_head` (`:3711`) adds `head.correction is FULL` on top and
+`uses_coupled_photon_head` (`:3797`) adds `head.correction is FULL` on top and
 decides **only** whether `gw_init` keeps the four literal-Γ channel vectors.
-`BARE_TRANSVERSE_MODES` (`:3558`), `PACKED_PHOTON_COMPUTE_MODES` (`:3577`) is the three spellings that differ only in
-the bispinor lift. The former `charge_hall_cubature` spelling is retired and
-refuses, naming `full_static_cohsex`
-(`GATE bispinor_gw_charge_hall_cubature_retired`, `gw_config.py:326-337`,
-inside `coerce_bispinor_gw_mode` `:321-345`).
+
+**`BispinorGWMode` has TWO members** (`:289`), `bare_transverse` and
+`full_static_cohsex`, and they resolve to the SAME carrier — the axis picks
+which Lorentz blocks are screened, never which four-spinor represents them.
+Three retired spellings refuse by name from ONE table,
+`_RETIRED_BISPINOR_GW_MODES` (`:324`, read by `coerce_bispinor_gw_mode`
+`:353`): `charge_hall_cubature` → `full_static_cohsex`, and the two
+carrier-comparison modes `pauli_reference_bare_transverse` and
+`isometric_kinetic_balance_bare_transverse` → `bare_transverse`. Refusals,
+not aliases: the coercer runs from a dozen resolution sites, and a mode value
+is the one deck word that decides which physics runs.
 
 **A row marked P below applies to both packed modes** unless it says
 otherwise; **B** means the incumbent route only. Rows marked "both" are
@@ -110,7 +147,7 @@ property of the body.
 flowchart TD
   subgraph DECK["deck (cohsex.in)"]
     K1["bispinor · bispinor_gw<br/>centroids_file_current"]
-    K2["head_correction<br/>bispinor_tt_head_correction<br/>static_gauge_hall_file"]
+    K2["head_correction<br/>static_gauge_hall_file"]
     K3["transverse_zeta_solve / _rcond<br/>distrib_la_batched_route"]
   end
 
@@ -118,7 +155,7 @@ flowchart TD
     R["resolve_four_current_representation<br/>FourCurrentRepresentation:<br/>carrier + lift + stamps"]
     F{"uses_static_photon_response"}
     S{"packed_photon_screens_current"}
-    E["refuse_unsupported_bispinor_gw<br/>17-conjunct envelope<br/>packed_bare_transverse_route"]
+    E["refuse_unsupported_bispinor_gw<br/>packed_static_envelope (9 rows)<br/>packed_bare_transverse_route"]
   end
 
   subgraph INIT["initialization — gw_init.py"]
@@ -185,11 +222,11 @@ object each key ends up on and who reads it.
 | key | default (`gw_config.py`) | lands on | route |
 |---|---|---|---|
 | `bispinor` | `False` (`:1676`, parse `:5720`) | `config.bispinor` (`:4829`) — the master switch | both |
-| `bispinor_gw` | `bare_transverse` (`:1679`, parse `:5721` via `coerce_bispinor_gw_mode` `:321-345`; enum `:293-315`, four members — `CHARGE_HALL_CUBATURE` deleted) | `config.bispinor_gw` (`:4830`) | both |
+| `bispinor_gw` | `bare_transverse` (parse via `coerce_bispinor_gw_mode` `:353`; enum `:289`, **two** members; three retired spellings in `_RETIRED_BISPINOR_GW_MODES` `:324`) | `config.bispinor_gw` | both |
 | `centroids_file_current` | `""` (`:1500`, parse `:5214-5219`) | `config.paths.centroids_file_current` (`:3252`) | both |
 | `head_correction` | `full` (`:2012`, coerced `:541`, read `:5230`, built into `HeadConfig` `:5254`) | `config.head.correction` (`:3997`) | both |
-| `bispinor_tt_head_correction` | `False` (`:2008`, parse `:5268`) | `config.head.bispinor_tt_head_correction` (`:4009`) | **B only** — refused on the packed bare route (`GATE packed_bare_transverse_tt_head_double_count`), and deliberately not part of the route predicate |
-| `static_gauge_hall_file` | `static_gauge_hall.h5` (`:1489`, parse `:5222`) | `config.paths.static_gauge_hall_file` (`:3255`) | P, **screened mode only** (refused on the packed bare route) — **optional**: an absent file means `σ_H = 0`, announced; a present but mismatched one refuses in the loader |
+| ~~`bispinor_tt_head_correction`~~ | **REMOVED as a deck key 2026-09-01**; the field is wired to `False` (`gw_config.py:5419`) for the incumbent V-tile builder lane N is retiring | `config.head.bispinor_tt_head_correction` | **B only**, and now only from a hand-built config |
+| `static_gauge_hall_file` | `""` — EMPTY (`:1503`) | `config.paths.static_gauge_hall_file` | P, **screened mode only** (refused on the packed bare route) — **optional**: an UNNAMED file means `σ_H = 0`, announced; a NAMED but absent one refuses (`GATE static_gauge_hall_file_missing`, `w_isdf.py:1912`); a present but mismatched one refuses in the loader |
 | `transverse_zeta_solve` | `ridge` (`:1894`, validate `:5496-5513`) | `config.backend.transverse_zeta_solve` (`:4552`) | both |
 | `transverse_zeta_rcond` | `1e-10` (`:1902`, validate `:5514-5518`) | `config.backend.transverse_zeta_rcond` (`:4553`) | both |
 | `distrib_la_batched_route` | `auto` (`:1769`, resolve `:1237-1266`, parse `:5460`) | `config.backend.distrib_la_batched_route` (`:4543`) | both |
@@ -198,8 +235,7 @@ There is no `transverse_zeta_*` key beyond those two, and no `LORRAX_*`
 variable reads any key in this table.
 
 **The one resolver.** `common/four_current_model.resolve_four_current_representation(bispinor, model)`
-(`src/common/four_current_model.py:85-137`) returns a frozen
-`FourCurrentRepresentation` (`:66-82`) with seven fields: `charge_bispinor`,
+returns a frozen `FourCurrentRepresentation` with seven fields: `charge_bispinor`,
 `charge_lift`, `current_bispinor`, `current_lift`, `scalar_head_bispinor`,
 `charge_representation`, `spatial_current_representation`. **It is not stored
 on the config** — a dozen sites call it locally (`gw_config.py:371`,
@@ -209,24 +245,29 @@ on the config** — a dozen sites call it locally (`gw_config.py:371`,
 `psp/get_dipole_mtxels.py:1103`), so grep for
 `resolve_four_current_representation`, not for a config attribute.
 
-The four branches: non-bispinor (`:95-104`, everything False);
-`pauli_reference_bare_transverse` (`:105-115`, charge stays a two-spinor Pauli
-density, current lifted `raw`); `isometric_kinetic_balance_bare_transverse`
-(`:116-127`, both `isometric`, `scalar_head_bispinor=False`); and the
-fall-through for `bare_transverse` and `full_static_cohsex` (`:128-137`, both
-`raw`, `scalar_head_bispinor=True`). The lift selectors are
-`RAW_KINETIC_BALANCE_LIFT = "raw"` and
+**TWO branches since 2026-09-01**: non-bispinor (everything False) and
+bispinor (both `raw`, `scalar_head_bispinor=True`) — the two shipped
+`bispinor_gw` values ride the same carrier, so `model` is accepted and
+ignored. The two carrier-comparison branches went with their deck spellings.
+It stays a resolver rather than collapsing into `bool(bispinor)` because the
+`charge_representation` / `spatial_current_representation` provenance stamps
+the `dipole.h5` / `kin_ion.h5` / ζ authenticators compare against need ONE
+producer. The surviving lift selector is `RAW_KINETIC_BALANCE_LIFT = "raw"`;
 `ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"`
-(`src/common/bispinor_init.py:40-41`).
+(`src/common/bispinor_init.py`) remains library code for the jet tests.
 
-**`static_bispinor_photon_envelope` is a gate id, not a function.** The
-conjunct table is `gw_config.py:3784-3846`, the loop `:3847-3849`, the raise
-`:3850-3863`. **Seventeen** conjuncts, down from eighteen: the
-mode-dependent `required_head` is gone (`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`): the head conjunct
-is now `head.correction in (FULL, OFF)` — `full` is the default and runs the
-Γ completion, `off` is a DEBUG skip, and `no_local_fields` is refused because
-the coupled solve has no scalar diagnostic head. A separate gate,
-`GATE static_bispinor_photon_head_slab_only` (`:3769-3783`), refuses
+**`static_bispinor_photon_envelope` is a gate id, not a function.** It is
+the raise at `gw_config.py:3997`, over the nine rows of
+`packed_static_envelope` (the table in Stage 1). **Nine**, down from
+seventeen (`lane/bisp-l-dials-envelope-2026-09-01`), and each unmet row
+prints `PHYSICS` or `IMPLEMENTATION LIMIT` with its own reason. `full` is the
+default and runs the Γ completion, `off` is a DEBUG skip, and
+`no_local_fields` is refused on EVERY bispinor deck
+(`GATE bispinor_head_correction_no_local_fields_unavailable`, `:3867`) —
+the coupled solve has no scalar diagnostic head, and on the bare route the
+value used to move the deck off the packed path, which is a head dial
+choosing a route. A separate gate,
+`GATE static_bispinor_photon_head_slab_only` (`:3979`), refuses
 `sys_dim != 2` **while the completion is on**; the DEBUG headless body keeps
 the bulk reach the old envelope gave it.
 
@@ -265,11 +306,11 @@ this fit through `gw_init.py:2083-2084` → `:2472`, so the same key that
 governs generic batched linalg governs the transverse ζ schedule.
 Full design: [Face-ψ ζ fitting](zeta_fit_face_psi_cct.md).
 
-**The bare TT head slot** (route B). Two things refuse it on the packed
-route: the envelope conjunct `not config.head.bispinor_tt_head_correction`
-(`gw_config.py:3807-3809`) and, for the bare packed route,
-`GATE packed_bare_transverse_tt_head_double_count` (`:3684-3713`, trigger at
-`:3692`). Config plumbing `gw_init.py:2856-2857` →
+**The bare TT head slot** (route B). ONE gate refuses it on either packed
+route now that the deck key is gone:
+`GATE packed_bare_transverse_tt_head_double_count` (`gw_config.py:3943`,
+keyed on `uses_static_photon_response`), reachable only from a hand-built
+config. Config plumbing `gw_init.py` →
 `v_q_bispinor.py:423` → the per-tile builder
 (`_make_per_q_v_builder_for_tile`, `:141-253`). The tensor
 `T_ab = ⟨v(q) P^T_ab(q̂)⟩_mBZ` is `(3,3)` f64 from `_tt_head_tensor`
@@ -550,7 +591,8 @@ gains an `H_T` column whenever the transverse Hartree ran (`:767-768`).
 
 | line | file:line | means |
 |---|---|---|
-| `Photon route   : …` | `gw_jax.py:323-338` (string `:330`) | **which of the two bare routes ran.** Either "packed static photon operator (chi_TT = chi_CT = 0; scalar Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell completion carries both the charge head and the bare `<D_TT>`)" or "incumbent charge-screened W + Sigma^B (gw.sigma_x_bispinor) with the scalar band-diagonal q->0 head" — each followed by the predicate's **reason**, which for a refusal names the first unmet envelope condition. Printed for every non-`full_static_cohsex` deck |
+| `Photon head    : …` | `gw_jax.py:339` (packed) and `:346` via `gw_config.incumbent_bispinor_head_record` `:3813` (incumbent) | **which Γ-cell head ran, on every bispinor deck.** Packed: the completion's `hall_source`, `σ_H`, Ward / Hermiticity / Dyson-bound residuals and cubature orders, or the `DEBUG … NOT a production calculation` line under `head_correction = off`. Incumbent: the same DEBUG line under `off`, and under `full` a statement that the charge head is the scalar band-diagonal one and that there is **no** transverse q=Γ head on that route |
+| `Photon route   : …` | `gw_jax.py:328` | **which of the two bare routes ran.** Either "packed static photon operator (chi_TT = chi_CT = 0; scalar Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell completion carries both the charge head and the bare `<D_TT>`)" or "incumbent charge-screened W + Sigma^B (gw.sigma_x_bispinor) with the scalar band-diagonal q->0 head" — each followed by the predicate's **reason**, which for a refusal names the first unmet envelope condition. Printed for every non-`full_static_cohsex` deck |
 | `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:315` | the carrier banner. Under `full_static_cohsex` the parenthetical names the **head state**, not "experimental", and reads `DEBUG: Gamma-cell head disabled by head_correction=off` when the completion is off |
 | `Σ^B tile (μ_L=i, ν_L=j): tr Σ = …` ×9 | `sigma_x_bispinor.py:228` | the **incumbent** bare route ran. Their absence beside a `Photon route: packed …` line is the packed bare route |
 | `WARNING -- DEBUG: Gamma-cell head disabled by head_correction=off` | `w_isdf.py:2305-2306` | the packed body ran **headless**; the `WARNING` token is what the production sink keeps in the run record's warning block |
@@ -569,18 +611,19 @@ and again at driver entry (`gw_init.py:3118`).
 
 | rule id | file:line | fires when |
 |---|---|---|
-| `packed_bare_transverse_tt_head_double_count` | `gw_config.py:3694` | `bispinor_tt_head_correction = true` on a deck that takes the packed bare route. The Γ completion already inserts `⟨D_TT⟩`; honouring the overlay too would double count it. Outside the envelope the overlay is the supported head |
-| `packed_bare_transverse_hall_unavailable` | `w_isdf.py:2246-2266` | a present `static_gauge_hall_file` on the packed **bare** route. With the current channels unscreened `W_CT = 0` at every finite `q`, so a Γ-only CT/TC block is not the limit of anything the model computes |
+| `packed_bare_transverse_tt_head_double_count` | `gw_config.py:3943` | `head.bispinor_tt_head_correction = true` on a deck that takes EITHER packed route. The deck key is gone (2026-09-01), so this is the hand-built-config guard. The Γ completion already inserts `⟨D_TT⟩`; honouring the overlay too would double count it |
+| `static_gauge_hall_file_missing` | `w_isdf.py:1912` | the deck NAMES a Hall artifact that does not exist. `static_gauge_hall_file` is empty by default: unnamed means `σ_H = 0`, announced, and a mistyped path must not give the same silent answer |
+| `packed_bare_transverse_hall_unavailable` | `w_isdf.py:1932` | a named, present `static_gauge_hall_file` on the packed **bare** route. With the current channels unscreened `W_CT = 0` at every finite `q`, so a Γ-only CT/TC block is not the limit of anything the model computes |
 | (no id) `screen_current` inconsistency | `w_isdf.py:2195-2226` | the `screen_current` argument disagrees with `packed_photon_screens_current(config)` for the resolved `bispinor_gw`, or `W_charge` is missing on the bare branch |
-| `bispinor_gw_charge_hall_cubature_retired` | `gw_config.py:326-337` (in `coerce_bispinor_gw_mode` `:321-345`) | the deck says `charge_hall_cubature`. It is a **refusal, not an alias**: the coercer runs from a dozen resolution sites, so an alias would print from each, and the same reasoning retired `ctsp` for `screening_method` |
-| `bispinor_self_consistency_requires_live_four_current` | `:3674` | bispinor QSGW with an explicit `density_self_consistent = false` |
-| `bispinor_gw_requires_bispinor` | `:3718` | a non-default `bispinor_gw` with `bispinor = false` |
-| `{pauli_reference,isometric_kinetic_balance}_restart{,_write}_unavailable` | `:3732`, `:3741` | either comparison carrier with `restart` / `write_restart_tensors`. **The id is composed at runtime** (`gate_prefix`, `:3726`) — grepping the literal string finds nothing |
-| `isometric_kinetic_balance_current_head_unavailable` | `:3749` | isometric carrier with `bispinor_tt_head_correction = true` |
-| `isometric_kinetic_balance_ladder_head_unavailable` | `:3758` | isometric carrier, `head_correction = full`, `screening_diagrams ≠ w_rpa` |
-| `static_bispinor_photon_head_slab_only` | `:3769-3783` | the packed mode with the completion on (`head_correction = full`) and `sys_dim ≠ 2`. The coupled 4×4 solve on the in-plane cubature cannot take a bulk analytic-sphere correction after the nonlinear solve, and no bulk integrator has been derived. The DEBUG headless body keeps the bulk reach |
-| `static_bispinor_photon_envelope` | `:3784-3863` | any of the seventeen conjuncts (Stage 1). The head conjunct is `head.correction in (FULL, OFF)`, so `no_local_fields` refuses here |
-| `bispinor_tt_head_unsupported` | `:3895`, `:3910` (in `refuse_unsupported_bispinor_tt_head_correction`, `:3866`) | TT head without `bispinor`, or `sys_dim ∉ {2,3}` |
+| `bispinor_gw_charge_hall_cubature_retired`, `bispinor_gw_pauli_reference_retired`, `bispinor_gw_isometric_kinetic_balance_retired` | `gw_config.py:324` (`_RETIRED_BISPINOR_GW_MODES`, read by `coerce_bispinor_gw_mode` `:353`) | the deck names a retired mode value. **Refusals, not aliases**: the coercer runs from a dozen resolution sites, so an alias would print from each, and a mode value is the one deck word that decides which physics runs. Each names its replacement |
+| `bispinor_head_correction_no_local_fields_unavailable` | `:3867` | `head_correction = no_local_fields` with `bispinor = true`, on EVERY bispinor deck. A scalar diagnostic the coupled solve does not produce, and on the bare route it silently moved the deck off the packed path |
+| `bispinor_slab_cohsex_restart_changes_the_head_mechanism` | `:3895` | an EXPLICIT `restart = true` with `bispinor`, `compute_mode = cohsex`, `sys_dim = 2`. An UNNAMED `restart` is set to false for this deck class at parse time instead. There is no photon restart storage, so the key alone used to swap the packed completion for the incumbent scalar head (+5.72 meV, plus the whole transverse head) |
+| (deck key, not a gate) `bispinor_tt_head_correction` | `read_lorrax_input` | the key is REMOVED and refused at any value, naming the Γ-cell completion that carries the head |
+| `bispinor_self_consistency_requires_live_four_current` | `:3915` | bispinor QSGW with an explicit `density_self_consistent = false` |
+| `bispinor_gw_requires_bispinor` | `:3968` | `bispinor_gw = full_static_cohsex` with `bispinor = false` |
+| `static_bispinor_photon_head_slab_only` | `:3979` | the packed mode with the completion on (`head_correction = full`) and `sys_dim ≠ 2`. The coupled 4×4 solve on the in-plane cubature cannot take a bulk analytic-sphere correction after the nonlinear solve, and no bulk integrator has been derived. The DEBUG headless body keeps the bulk reach |
+| `static_bispinor_photon_envelope` | `:3997`, over `packed_static_envelope` `:3637` | any of the NINE rows (Stage 1). Each unmet row prints `PHYSICS` or `IMPLEMENTATION LIMIT` and its own reason |
+| `bispinor_tt_head_unsupported` | in `refuse_unsupported_bispinor_tt_head_correction`, `:4010` | a hand-built TT head without `bispinor`, or `sys_dim ∉ {2,3}` |
 | (no id) SC × dynamic | `gw_jax.py:272` | self-consistent solver with a dynamic mode — bispinor QSGW is static-only |
 | (no id) missing current centroids | `gw_jax.py:560-572`, `gw_init.py:1430-1433` | `bispinor = true` without `centroids_file_current` |
 | (no id) packed route needs a distributed Dyson solve | `gw_config.py:3630` (the last conjunct of `packed_bare_transverse_route`) | `w_dyson_solver ≠ distributed`, i.e. also the shipping default `auto` on a small system. This is a **route** conjunct, not a refusal: the deck falls back to the incumbent path and the run record names the key. It exists because the screening owner refuses anything else (`w_isdf.py:2173`) and `distrib_la` additionally refuses `distributed` on a 1×1 mesh, so without it the predicate claimed decks that then died inside the packed operator — reachable only once the plasmon-pole pair joined the served modes |

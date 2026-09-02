@@ -1767,343 +1767,6 @@ def compute_no_pair_dirac_current_block(
     return kernel(*args, perm_l, phase_l, perm_r, phase_r)
 
 
-def _get_finite_transfer_current_block_kernel(
-    mesh_xy, *, nk: int, nb: int, ns: int, n_rmu: int,
-):
-    """One-q current block through the incumbent face Green builder.
-
-    The exact finite-transfer endpoint already contains its Lorentz vertex,
-    so this kernel has no gamma-matrix arm.  It differs from the all-q
-    minimax kernel only in the unavoidable outer convolution: a jointly
-    ``(k,q)`` endpoint must be contracted at its fixed q, not sent through
-    the q-independent k-FFT.  Both one-particle factors remain the canonical
-    :func:`greens_function_kernel.build_G_tau` with one hoisted distributed
-    GEMM plan.
-    """
-    from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau
-    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
-
-    key = ("finite_transfer_current_block", id(mesh_xy), int(nk), int(nb),
-           int(ns), int(n_rmu))
-    hit = _chi_minimax_kernel_cache.get(key)
-    if hit is not None:
-        return hit
-
-    g_plan = gemm_plan(
-        mesh_xy, m=int(n_rmu) * int(ns), k=int(nb),
-        n=int(n_rmu) * int(ns), nq=int(nk), dtype=jnp.complex128)
-    mun_sharding = NamedSharding(mesh_xy, PSI_MUN_SPEC)
-    nmu_sharding = NamedSharding(mesh_xy, PSI_NMU_SPEC)
-    rep2 = NamedSharding(mesh_xy, P(None, None))
-    rep0 = NamedSharding(mesh_xy, P())
-    out_sharding = NamedSharding(mesh_xy, P("x", "y"))
-    nodes_sharding = MinimaxNodes(
-        t=NamedSharding(mesh_xy, P(None)),
-        alpha=NamedSharding(mesh_xy, P(None)))
-
-    @partial(
-        jax.jit,
-        in_shardings=(nodes_sharding, mun_sharding, nmu_sharding,
-                      mun_sharding, nmu_sharding, rep2, rep2, rep2, rep2,
-                      rep0, rep0),
-        out_shardings=out_sharding,
-    )
-    def kernel(nodes, current_mun_A, current_nmu_B,
-               target_mun, target_nmu, mask_v, mask_c_target,
-               energy_source, energy_target, vmax, cmin):
-        zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((int(n_rmu), int(n_rmu)), dtype=jnp.complex128),
-            out_sharding)
-
-        def body(accumulator, xs):
-            tau, alpha = xs
-            tau_kernel = jnp.real(tau).astype(jnp.float64)
-            Gv_current = build_G_tau(
-                current_mun_A, current_nmu_B, energy_source, -tau_kernel,
-                e_ref=vmax, mask=mask_v, layout="face", gemm=g_plan)
-            Gc_target = build_G_tau(
-                target_mun, target_nmu, energy_target, tau_kernel,
-                e_ref=cmin, mask=mask_c_target,
-                layout="face", gemm=g_plan)
-            # D_i(c,v,mu)=<c,k-q|Gamma_i(k,q)|v,k> at the current
-            # centroids.  Gc*conj(Gv_AB) therefore gives
-            # conj(D_A(mu))*D_B(nu), with the two open spin sums retained
-            # until this contraction.  The 1/sqrt(Nk) is the fixed-q
-            # specialization of the incumbent three unitary k FFTs.
-            chi_tau = jnp.einsum(
-                "kambn,kambn->mn", Gc_target, jnp.conj(Gv_current),
-                optimize=True) / jnp.sqrt(jnp.asarray(nk, jnp.float64))
-            chi_tau = jax.lax.with_sharding_constraint(
-                chi_tau, out_sharding)
-            return accumulator + alpha * chi_tau, None
-
-        result, _ = jax.lax.scan(
-            body, zero, (nodes.t, nodes.alpha), unroll=1)
-        return result
-
-    _chi_minimax_kernel_cache[key] = kernel
-    return kernel
-
-
-def compute_finite_transfer_current_block_row(
-    endpoint, wfns_transverse, quad, meta, mesh_xy, *,
-    vertex_left: int, vertex_right: int, energy_reference=0.0,
-):
-    """Keep public finite-q/FULL publication fail-closed.
-
-    Basis authentication now exists in the private algebra oracle.  It is not
-    the q-resolved C/Z side, completion, rectangular IBZ action, or artifact
-    provenance still required to publish FULL.
-    """
-    raise NotImplementedError(
-        "finite-transfer current body publication remains refused after "
-        "basis-receipt authentication: q-resolved C/Z, exact contact/"
-        "downfolded completion, rectangular IBZ response action, and "
-        "artifact provenance are not complete; FULL remains unavailable.")
-
-
-def _compute_finite_transfer_current_block_row_unverified(
-    endpoint, endpoint_minus_q, target_basis_binding, quad, meta, mesh_xy, *,
-    vertex_left: int, vertex_right: int, energy_reference=0.0,
-):
-    r"""Private fixed-q TT algebra oracle at one stored q row.
-
-    ``endpoint`` and ``endpoint_minus_q`` must come from
-    :func:`common.mtxel_sweep.finite_transfer_current_to_centroids` for the
-    same transverse centroid set and band window, at transfers ``q`` and
-    ``-q`` respectively.  The pair is authenticated with the symmetry
-    service's q-negation involution and the existing operator receipts.  Both
-    endpoints and the target wavefunction faces must also have the exact same
-    immutable WFN/band/FFT/centroid receipt; the target receipt is retained by
-    the ISDF orchestration result, outside the numerical Wavefunctions pytree,
-    and equality is checked before any Green contraction.  The routine reuses
-    the incumbent distributed face Green builder and minimax
-    normalization; it neither constructs a second Green-function mechanism
-    nor materializes a band-pair carrier.  One block is returned so the
-    existing photon packer can retain its one-live-block memory schedule.
-
-    This remains deliberately private because authenticated fixed-q algebra is
-    not the missing rectangular IBZ response action or the rest of FULL's
-    completion.  Deterministic tests use it to pin the fixed-q Green
-    normalization, conjugation, and exact ordered pair
-    ``-[F_AB(q)+F_BA(-q)^dagger]``.  Production reaches only the refusing
-    public seam above.  The transverse zeta/V side also still needs the
-    matching q-resolved C/Z contraction, exact contact/downfolded completion,
-    and vector-symmetry reciprocity gate.
-    """
-    from .wavefunction_bundle import AuthenticatedWavefunctions
-    if not isinstance(target_basis_binding, AuthenticatedWavefunctions):
-        raise TypeError(
-            "finite-transfer current requires the host-only "
-            "AuthenticatedWavefunctions binding; got "
-            f"{type(target_basis_binding).__name__}")
-    wfns_transverse = target_basis_binding.wavefunctions
-    target_basis_receipt = target_basis_binding.receipt
-    A, B = int(vertex_left), int(vertex_right)
-    if A not in (1, 2, 3) or B not in (1, 2, 3):
-        raise ValueError(
-            "finite-transfer current row is a TT block and requires "
-            f"vertices in {{1,2,3}}; got ({A},{B})")
-    if getattr(wfns_transverse, "layout", None) != "face":
-        raise ValueError(
-            "finite-transfer current row requires the canonical face "
-            "wavefunction bundle (low_mem_bands=true)")
-    target_basis_receipt.assert_matches_carrier(
-        wfns_transverse,
-        where="finite-transfer target Wavefunctions before Green contraction")
-    for endpoint_label, current_endpoint in (
-            ("q", endpoint), ("-q", endpoint_minus_q)):
-        endpoint_receipt = getattr(current_endpoint, "basis_receipt", None)
-        if endpoint_receipt is None:
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint carries no "
-                "WavefunctionBasisReceipt")
-        target_basis_receipt.assert_same_carrier(
-            endpoint_receipt,
-            where=(f"finite-transfer {endpoint_label} endpoint vs target "
-                   "Wavefunctions before Green contraction"))
-    mesh_shape = tuple(int(v) for v in mesh_xy.devices.shape)
-    if (tuple(mesh_xy.axis_names) != ("x", "y")
-            or len(mesh_shape) != 2 or mesh_shape[0] != mesh_shape[1]):
-        raise ValueError(
-            "finite-transfer current row requires the canonical square "
-            f"(x,y) processor mesh; got axes={tuple(mesh_xy.axis_names)}, "
-            f"shape={mesh_shape}")
-    ensure_jax_compile_cache()
-    validated = []
-    for endpoint_label, current_endpoint in (
-            ("q", endpoint), ("-q", endpoint_minus_q)):
-        current_nmu = current_endpoint.current_nmu
-        current_mun = current_endpoint.current_mun
-        nk, nb, ncart, ns, n_rmu = (
-            int(v) for v in current_nmu.shape)
-        if (ncart, ns) != (3, 4):
-            raise ValueError(
-                f"finite-transfer {endpoint_label} current endpoint must "
-                f"have (cart,spin)=(3,4); got {(ncart, ns)}")
-        if tuple(int(v) for v in current_mun.shape) != (
-                nk, 3, 4, n_rmu, nb):
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint face "
-                f"orientations disagree: nmu={current_nmu.shape}, "
-                f"mun={current_mun.shape}")
-        if int(current_endpoint.n_rmu_logical) > n_rmu:
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint logical "
-                f"centroid extent exceeds its padded face: "
-                f"{int(current_endpoint.n_rmu_logical)} > {n_rmu}")
-        if nk != int(meta.nk_tot):
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint nk={nk} != "
-                f"meta.nk_tot={int(meta.nk_tot)}")
-        if int(current_endpoint.iq_irr) < 0:
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint carries a "
-                "negative q-IBZ row")
-        q_label = np.asarray(
-            current_endpoint.q_irr_kgrid_int, dtype=np.int32)
-        q_crys = np.asarray(current_endpoint.q_crys, dtype=np.float64)
-        if q_label.shape != (3,) or q_crys.shape != (3,) or not np.all(
-                np.isfinite(q_crys)):
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint q labels must "
-                f"be finite 3-vectors; got q_int={q_label}, "
-                f"q_crys={q_crys}")
-        kminq = np.asarray(current_endpoint.kminq_idx, dtype=np.int32)
-        if kminq.shape != (nk,) or np.any(kminq < 0) or np.any(kminq >= nk):
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint carries an "
-                "invalid k-q row map")
-        if not np.array_equal(
-                np.sort(kminq), np.arange(nk, dtype=np.int32)):
-            raise ValueError(
-                f"finite-transfer {endpoint_label} endpoint k-q row map "
-                "must be a full-BZ permutation")
-        for fingerprint_label, fingerprint in (
-            ("Hamiltonian",
-             current_endpoint.hamiltonian_config_operator_fingerprint),
-            ("finite-path", current_endpoint.vnl_path_operator_fingerprint),
-        ):
-            value = str(fingerprint).strip()
-            if (not value.startswith("sha256:")
-                    or len(value) != len("sha256:") + 64
-                    or any(c not in "0123456789abcdef" for c in value[7:])):
-                raise ValueError(
-                    f"finite-transfer {endpoint_label} endpoint carries an "
-                    f"invalid {fingerprint_label} operator fingerprint")
-        validated.append((current_endpoint, current_mun, current_nmu,
-                          nk, nb, ns, n_rmu, q_label, q_crys, kminq))
-
-    (endpoint_q, current_mun_q, current_nmu_q,
-     nk, nb, ns, n_rmu, q_label, q_crys, kminq_q), (
-     endpoint_mq, current_mun_mq, current_nmu_mq,
-     nk_mq, nb_mq, ns_mq, n_rmu_mq,
-     mq_label, mq_crys, kminq_mq) = validated
-    if (nk_mq, nb_mq, ns_mq, n_rmu_mq) != (nk, nb, ns, n_rmu):
-        raise ValueError(
-            "finite-transfer q/-q endpoint carrier shapes differ: "
-            f"q={(nk, nb, ns, n_rmu)}, "
-            f"-q={(nk_mq, nb_mq, ns_mq, n_rmu_mq)}")
-    if int(endpoint_q.n_rmu_logical) != int(endpoint_mq.n_rmu_logical):
-        raise ValueError(
-            "finite-transfer q/-q endpoint logical centroid extents differ: "
-            f"{int(endpoint_q.n_rmu_logical)} != "
-            f"{int(endpoint_mq.n_rmu_logical)}")
-    if (endpoint_q.hamiltonian_config_operator_fingerprint
-            != endpoint_mq.hamiltonian_config_operator_fingerprint
-            or endpoint_q.vnl_path_operator_fingerprint
-            != endpoint_mq.vnl_path_operator_fingerprint):
-        raise ValueError(
-            "finite-transfer q/-q endpoints carry different Hamiltonian "
-            "or finite-path operator receipts")
-    kgrid = np.asarray(
-        (int(meta.nkx), int(meta.nky), int(meta.nkz)), dtype=np.int64)
-    if int(np.prod(kgrid)) != nk:
-        raise ValueError(
-            f"finite-transfer meta kgrid={tuple(kgrid)} has product "
-            f"{int(np.prod(kgrid))}, expected nk={nk}")
-    from symmetry_maps import (
-        bgw_integer_q_to_fractional, q_negation_index)
-    q_index = int(np.ravel_multi_index(
-        tuple(np.mod(q_label, kgrid)), tuple(kgrid)))
-    mq_index = int(np.ravel_multi_index(
-        tuple(np.mod(mq_label, kgrid)), tuple(kgrid)))
-    expected_mq_index = int(q_negation_index(kgrid)[q_index])
-    if mq_index != expected_mq_index:
-        raise ValueError(
-            "finite-transfer endpoint pair is not q/-q under the symmetry "
-            f"service: q_index={q_index}, supplied_minus_q={mq_index}, "
-            f"expected_minus_q={expected_mq_index}")
-    expected_q_crys = bgw_integer_q_to_fractional(q_label, kgrid)
-    expected_mq_crys = bgw_integer_q_to_fractional(mq_label, kgrid)
-    if (not np.array_equal(q_crys, expected_q_crys)
-            or not np.array_equal(mq_crys, expected_mq_crys)):
-        raise ValueError(
-            "finite-transfer endpoint fractional q representatives do not "
-            "match the symmetry service's positive-half convention")
-
-    if (tuple(int(v) for v in wfns_transverse.psi_nmu.shape)
-            != (nk, nb, 4, n_rmu)
-            or tuple(int(v) for v in wfns_transverse.psi_mun.shape)
-            != (nk, 4, n_rmu, nb)):
-        raise ValueError(
-            "finite-transfer current endpoint and transverse WFN faces must "
-            "share (nk,nb,spin,n_rmu); got endpoint "
-            f"{current_nmu_q.shape} and WFN "
-            f"{wfns_transverse.psi_nmu.shape}/"
-            f"{wfns_transverse.psi_mun.shape}")
-
-    eref = 0.0 if energy_reference is None else float(energy_reference)
-    energy_source = wfns_transverse.enk - eref
-    s = wfns_transverse.slices
-    mask_v = wfns_transverse.band_mask(s.val)
-
-    val_host = np.asarray(jax.device_get(
-        energy_source[:, s.val]), dtype=np.float64)
-    cond_host = np.asarray(jax.device_get(
-        energy_source[:, s.cond]), dtype=np.float64)
-    vmax = float(np.max(val_host))
-    cmin = float(np.min(cond_host))
-    gap = cmin - vmax
-    tau = np.asarray(quad.tau, dtype=np.float64)
-    alpha_chi = (-1.0 * np.asarray(quad.alpha, dtype=np.float64)
-                 * np.exp(-tau * gap))
-    nodes = MinimaxNodes(
-        t=jnp.asarray(tau, dtype=jnp.complex128),
-        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128))
-    kernel = _get_finite_transfer_current_block_kernel(
-        mesh_xy, nk=nk, nb=nb, ns=ns, n_rmu=n_rmu)
-    orientations = []
-    for current_mun, current_nmu, kminq, left_vertex, right_vertex in (
-        (current_mun_q, current_nmu_q, kminq_q, A, B),
-        (current_mun_mq, current_nmu_mq, kminq_mq, B, A),
-    ):
-        energy_target = jnp.take(energy_source, kminq, axis=0)
-        mask_c_target = jnp.take(
-            wfns_transverse.band_mask(s.cond), kminq, axis=0)
-        target_mun = jnp.take(wfns_transverse.psi_mun, kminq, axis=0)
-        target_nmu = jnp.take(wfns_transverse.psi_nmu, kminq, axis=0)
-        orientations.append(kernel(
-            nodes,
-            current_mun[:, left_vertex - 1],
-            current_nmu[:, :, right_vertex - 1],
-            target_mun, target_nmu, mask_v, mask_c_target,
-            energy_source, energy_target,
-            jnp.asarray(vmax, dtype=jnp.float64),
-            jnp.asarray(cmin, dtype=jnp.float64)))
-    # The natural -q BA block is itself P('x','y') in (mu_B,mu_A).
-    # Its dagger swaps that layout; request the incumbent block layout on
-    # output so JAX performs the required distributed transpose rather than
-    # choosing a replicated eager result.
-    block_sharding = NamedSharding(mesh_xy, P("x", "y"))
-    complete_orientations = jax.jit(
-        _complete_static_vertex_orientations,
-        in_shardings=(block_sharding, block_sharding),
-        out_shardings=block_sharding)
-    return complete_orientations(*orientations)
-
-
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
 
 STATIC_PHOTON_NO_PAIR_MODEL = NO_PAIR_DIRAC_CURRENT_MODEL
@@ -2271,7 +1934,7 @@ def compute_static_photon_response(
     ``Photon head`` record line from the returned ``head_completion``.
     """
     from .gw_config import (
-        BARE_TRANSVERSE_MODES, BispinorGWMode, HeadCorrection,
+        BispinorGWMode, HeadCorrection,
         coerce_bispinor_gw_mode, packed_bare_transverse_route,
         packed_photon_screens_current)
     from .photon_layout import (
@@ -2305,10 +1968,10 @@ def compute_static_photon_response(
             "gw_config.packed_photon_screens_current and must not be "
             "restated at the call site")
     if not screen_current:
-        if photon_mode not in BARE_TRANSVERSE_MODES:
+        if photon_mode is not BispinorGWMode.BARE_TRANSVERSE:
             raise ValueError(
-                "the unscreened-current packed route serves only the "
-                f"bare-transverse family; got {photon_mode.value!r}")
+                "the unscreened-current packed route serves only "
+                f"bare_transverse; got {photon_mode.value!r}")
         route_taken, route_reason = packed_bare_transverse_route(config)
         if not route_taken:
             raise ValueError(
@@ -2346,14 +2009,34 @@ def compute_static_photon_response(
                 raise ValueError(
                     f"packed static photon {role} wavefunction binding does "
                     "not name the supplied carrier")
-        hall_path = str(config.paths.static_gauge_hall_file)
+        # ``static_gauge_hall_file`` defaults to EMPTY: unnamed means "no
+        # Hall term", and a NAMED path that does not exist is a typo or a
+        # missing preprocessing step, not a request for sigma_H = 0.  The
+        # two used to be the same answer (lane B's open item, lane J
+        # section 2 item 9).
+        hall_path = str(config.paths.static_gauge_hall_file).strip()
+        hall_named = bool(hall_path)
+        if hall_named and not os.path.exists(hall_path):
+            raise ValueError(
+                "GATE static_gauge_hall_file_missing: the deck names a "
+                f"Hall artifact that does not exist ({hall_path}).\n"
+                f"  got:  static_gauge_hall_file = {hall_path} (absent)\n"
+                "  want: the file, produced by get_dipole_mtxels "
+                "--static-gauge-hall-only --static-gauge-hall-out, or an "
+                "UNSET static_gauge_hall_file (the default) for sigma_H = 0\n"
+                "  why:  IMPLEMENTATION.  The key is optional, so an "
+                "unnamed one means 'no Hall term' and is announced.  A "
+                "named-but-absent one used to give the same silent "
+                "sigma_H = 0, which makes a mistyped path indistinguishable "
+                "from a deliberate Chern-trivial run.\n"
+                "  doc:  docs/input_reference.md, static_gauge_hall_file.")
         if not screen_current:
             # R(q) = q_a H_a(sigma_H) + q_a q_b S_ab with a nonzero Hall
             # term makes the coupled 4x4 solve return CT/TC blocks, i.e. a
             # screened charge-current coupling in the Gamma cell that this
             # route has at no other q.  Refuse rather than ignore a named
             # deck artifact (a parsed-but-ignored key is a defect).
-            if os.path.exists(hall_path):
+            if hall_named:
                 raise ValueError(
                     "GATE packed_bare_transverse_hall_unavailable: "
                     f"bispinor_gw = {photon_mode.value} is refused with a "
@@ -2374,7 +2057,7 @@ def compute_static_photon_response(
                     "bare-transverse route (no screened CT/TC channel to "
                     "carry it); sigma_H = 0",
                     flush=True)
-        elif os.path.exists(hall_path):
+        elif hall_named:
             # A present artifact must authenticate (WFN identity, band
             # manifold, nk); a stale one refuses inside the loader rather
             # than silently degrading to sigma_H = 0.
@@ -2398,9 +2081,9 @@ def compute_static_photon_response(
         elif jax.process_index() == 0:
             print_fn(
                 "  [photon head] Hall term: sigma_H = 0 (no "
-                f"static_gauge_hall_file at {hall_path}).  For a "
-                "Chern-trivial insulator the static Hall coefficient is "
-                "exactly zero; supply the artifact from get_dipole_mtxels "
+                "static_gauge_hall_file named).  For a Chern-trivial "
+                "insulator the static Hall coefficient is exactly zero; "
+                "supply the artifact from get_dipole_mtxels "
                 "--static-gauge-hall-only to include a measured value.",
                 flush=True)
     elif jax.process_index() == 0:

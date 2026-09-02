@@ -1077,29 +1077,19 @@ def main(argv=None):
 	four_current_bispinor = bool(params.get("bispinor", False))
 	bispinor_gw_mode = coerce_bispinor_gw_mode(
 		params.get("bispinor_gw", "bare_transverse"))
-	if (bispinor_gw_mode in (
-			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
-			BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
+	if (bispinor_gw_mode is BispinorGWMode.FULL_STATIC_COHSEX
 			and not four_current_bispinor):
 		parser.error(
 			f"bispinor_gw={bispinor_gw_mode.value} requires "
 			"bispinor=true; the selector does not enable spatial-current "
 			"channels implicitly")
-	if (args.static_gauge_hall_only and bispinor_gw_mode in (
-			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
-			BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)):
-		parser.error(
-			f"bispinor_gw={bispinor_gw_mode.value} is a bare-TT "
-			"current-only comparison and does not define the FULL/static-Hall "
-			"response requested by --static-gauge-hall-only")
 	if args.static_gauge_hall_only and not four_current_bispinor:
 		parser.error(
 			"--static-gauge-hall-only requires bispinor=true so the canonical "
 			"kinetic-balance four-current is present")
-	# This producer owns the scalar charge/head vertex.  The comparison mode
-	# therefore loads the normalized QE two-spinor carrier here; the accepted
-	# raw four-spinor spatial-current vertices live only in the transverse
-	# Hartree and bare-TT exchange owners.
+	# This producer owns the scalar charge/head vertex.  One carrier for both
+	# shipped bispinor_gw values, resolved in ONE place so this stage cannot
+	# disagree with the ISDF fits or Sigma about what a four-spinor is.
 	bispinor = resolve_four_current_representation(
 		four_current_bispinor, bispinor_gw_mode).scalar_head_bispinor
 

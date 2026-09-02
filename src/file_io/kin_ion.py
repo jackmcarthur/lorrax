@@ -43,11 +43,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.four_current_model import (
-	is_pauli_reference_model,
-	is_isometric_kinetic_balance_model,
-	resolve_four_current_representation,
-)
+from common.four_current_model import resolve_four_current_representation
 
 from .slab_io import SlabIO
 
@@ -402,17 +398,11 @@ def validate_kin_ion_against_run(
 			if stored is not None and str(stored) != str(expected):
 				raise ValueError(
 					f"kin_ion.h5 {attr}={stored!r}, expected {expected!r}.")
-		if (is_pauli_reference_model(expected_bispinor_gw_mode)
-				or is_isometric_kinetic_balance_model(
-					expected_bispinor_gw_mode)):
-			expected_mode = str(getattr(
-				expected_bispinor_gw_mode, "value",
-				expected_bispinor_gw_mode))
-			if str(attrs.get("bispinor_gw_mode")) != expected_mode:
-				raise ValueError(
-					f"kin_ion.h5 bispinor_gw_mode="
-					f"{attrs.get('bispinor_gw_mode')!r}, expected "
-					f"{expected_mode!r}.")
+		# No per-mode ``bispinor_gw_mode`` check: both shipped values ride
+		# the one raw kinetic-balance carrier, so the two representation
+		# attrs above ARE the carrier identity.  A file written by one of
+		# the two retired carrier-comparison modes (2026-09-01) carries a
+		# different ``charge_representation`` and is refused there.
 
 	stored_sys_dim = attrs.get("sys_dim")
 	if (sys_dim is not None and stored_sys_dim is not None

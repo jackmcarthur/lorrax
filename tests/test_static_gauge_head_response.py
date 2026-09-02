@@ -475,7 +475,15 @@ def test_packed_deck_off_head_is_an_announced_debug_skip(tmp_path):
 
 
 def test_packed_deck_refuses_no_local_fields(tmp_path):
-    with pytest.raises(ValueError, match="static_bispinor_photon_envelope"):
+    """Refused for EVERY bispinor deck now, not only the packed envelope.
+
+    The gate moved up (2026-09-01): ``no_local_fields`` is a scalar
+    diagnostic, and on the bare-transverse route it also silently moved a
+    deck off the packed path -- a head dial choosing a route.
+    """
+    with pytest.raises(
+            ValueError,
+            match="bispinor_head_correction_no_local_fields_unavailable"):
         _parse(tmp_path,
                _packed_deck(extra="head_correction = no_local_fields\n"))
 
@@ -493,6 +501,226 @@ def test_packed_deck_off_head_keeps_the_bulk_body_reachable(tmp_path):
     config = _parse(
         tmp_path, _packed_deck(sys_dim=3, extra="head_correction = off\n"))
     assert not uses_coupled_photon_head(config)
+
+
+# ---------------------------------------------------------------------------
+# ONE envelope table, labelled, with the mode-required settings DERIVED
+# (lane J architecture review section 3)
+# ---------------------------------------------------------------------------
+
+def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
+    """The envelope had two owners; a condition written twice will differ.
+
+    ``packed_bare_transverse_route``'s conditions and
+    ``refuse_unsupported_bispinor_gw``'s requirements restated five
+    conjuncts with separately formatted got/want strings.  Both now walk
+    ``packed_static_envelope``.
+    """
+    import inspect
+    from gw import gw_config
+
+    for fn in (gw_config.packed_bare_transverse_route,
+               gw_config.refuse_unsupported_bispinor_gw):
+        assert "packed_static_envelope(" in inspect.getsource(fn), fn.__name__
+    shared = [row[2] for row in gw_config.packed_static_envelope(
+        _parse(tmp_path, _packed_deck()), screened=False)]
+    both = [row[2] for row in gw_config.packed_static_envelope(
+        _parse(tmp_path, _packed_deck()), screened=True)]
+    assert both[:len(shared)] == shared
+    assert len(both) == len(shared) + 4      # 5 shared + 4 screened-only
+
+
+def test_every_envelope_row_says_physics_or_implementation_limit(tmp_path):
+    """A refusal that does not say WHICH cannot be acted on.
+
+    "the envelope refuses this" tells a reader nothing about whether the
+    deck is wrong or the tree is incomplete.
+    """
+    from gw import gw_config
+    config = _parse(tmp_path, _packed_deck())
+    for row in gw_config.packed_static_envelope(config, screened=True):
+        assert row[3] in (gw_config._ENV_PHYSICS, gw_config._ENV_IMPL), row
+
+
+def test_the_eight_scalar_head_overrides_are_one_conjunct(tmp_path):
+    """Eight hand-written got/want rows became one predicate that names
+    only what the deck actually set."""
+    from gw.gw_config import scalar_head_overrides_named
+    assert scalar_head_overrides_named(_parse(tmp_path, _packed_deck())) == ()
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, _packed_deck(
+            extra="wcoul0_eta = 0.05\nuse_bgw_vcoul = true\n"))
+    message = str(exc.value)
+    assert "static_bispinor_photon_envelope" in message
+    assert "use_bgw_vcoul = true" in message
+    assert "wcoul0_eta = 0.05" in message
+    assert "no scalar q->0 head override named" in message
+    # and it names ONLY what was set
+    assert "vhead" not in message and "mc_average_placement" not in message
+
+
+def test_mode_required_settings_are_derived_not_declared(tmp_path):
+    """``low_mem_bands`` / ``w_dyson_solver`` are the only layout and the
+    only Dyson plan the packed screened mode has, so the deck must not
+    have to write them."""
+    lines = []
+    deck = (_packed_deck()
+            .replace("low_mem_bands = true\n", "")
+            .replace("w_dyson_solver = distributed\n", ""))
+    path = tmp_path / "derived.in"
+    path.write_text(deck)
+    config = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert config.memory.low_mem_bands is True
+    assert str(config.backend.w_dyson_solver) == "distributed"
+    assert uses_static_photon_response(config)
+    assert any("low_mem_bands was not named" in ln for ln in lines), lines
+    assert any("w_dyson_solver was not named" in ln for ln in lines), lines
+
+
+def test_an_explicit_conflicting_value_is_still_refused_not_overridden(
+        tmp_path):
+    """Rule 13: derive what the deck left unsaid, refuse what it said."""
+    deck = _packed_deck().replace(
+        "low_mem_bands = true", "low_mem_bands = false")
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, deck)
+    message = str(exc.value)
+    assert "static_bispinor_photon_envelope" in message
+    assert "low_mem_bands = false" in message
+
+
+def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):
+    """The promotion must not fire for a deck that is outside the envelope
+    for some OTHER reason, or a bad deck would be told about a key it
+    never wrote."""
+    deck = (_packed_deck()
+            .replace("low_mem_bands = true\n", "")
+            .replace("compute_mode = cohsex", "compute_mode = gn_ppm"))
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, deck)
+    message = str(exc.value)
+    assert "compute_mode = gn_ppm" in message
+    assert "low_mem_bands" not in message
+
+
+# ---------------------------------------------------------------------------
+# Heads are always on: the incumbent route must say what it did, and
+# `restart` must not swap the head mechanism behind the deck's back
+# (owner ruling 2026-09-01 / TASTE.md row 20; lane J section 3)
+# ---------------------------------------------------------------------------
+
+_INCUMBENT_DECK = (
+    "[cohsex]\n"
+    "nval = 2\n"
+    "ncond = 2\n"
+    "number_bands = 8\n"
+    "memory_per_device_gb = 4.0\n"
+    "sys_dim = 3\n"                      # bulk: outside the slab envelope
+    "bispinor = true\n"
+    "bispinor_gw = bare_transverse\n"
+    "compute_mode = cohsex\n"
+    "restart = false\n")
+
+
+def test_incumbent_head_off_gets_the_same_debug_labelling_as_the_packed_route(
+        tmp_path):
+    from gw.gw_config import incumbent_bispinor_head_record
+    config = _parse(tmp_path,
+                    _INCUMBENT_DECK + "head_correction = off\n")
+    assert not uses_static_photon_response(config)
+    banner, record = incumbent_bispinor_head_record(config)
+    assert "WARNING -- DEBUG" in banner
+    assert "head_correction=off" in banner
+    assert "NOT a production calculation" in banner
+    assert record.startswith("DEBUG:")
+    assert "NOT a production calculation" in record
+
+
+def test_incumbent_head_full_says_it_has_no_transverse_gamma_head(tmp_path):
+    """A bulk bispinor number must not look complete.
+
+    The incumbent route's only transverse q=Gamma head was the overlay,
+    whose deck key is gone; the packed completion is the only producer of
+    <D_TT> and this deck is outside its envelope.
+    """
+    from gw.gw_config import incumbent_bispinor_head_record
+    config = _parse(tmp_path, _INCUMBENT_DECK)
+    assert not uses_static_photon_response(config)
+    banner, record = incumbent_bispinor_head_record(config)
+    assert banner == ""
+    assert "NO transverse q=Gamma head" in record
+    assert "StaticHeadTerms" in record
+
+
+def test_the_driver_prints_the_incumbent_head_record(tmp_path):
+    """The one owner is gw_config; gw_jax must not grow a second copy."""
+    import inspect
+    from gw import gw_jax
+    src = inspect.getsource(gw_jax.main)
+    assert "incumbent_bispinor_head_record(config)" in src
+    assert "Photon head    : " in src
+
+
+def test_restart_may_not_swap_the_head_mechanism_on_a_slab_cohsex_deck(
+        tmp_path):
+    """restart = true used to move a slab bispinor COHSEX deck from the
+    packed Gamma-cell completion to the incumbent scalar head, silently,
+    for 5.7 meV plus the whole transverse head."""
+    deck = (_INCUMBENT_DECK
+            .replace("sys_dim = 3", "sys_dim = 2")
+            .replace("restart = false", "restart = true"))
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, deck)
+    message = str(exc.value)
+    assert ("bispinor_slab_cohsex_restart_changes_the_head_mechanism"
+            in message)
+    # it must NAME BOTH mechanisms, not just say "unsupported"
+    assert "Wigner-Seitz" in message and "StaticHeadTerms" in message
+    assert "5.72 meV" in message
+    assert "IMPLEMENTATION LIMIT" in message
+
+
+def test_an_unnamed_restart_is_derived_false_on_a_slab_cohsex_deck(tmp_path):
+    """``restart`` DEFAULTS TO TRUE, so the default alone used to pick the
+    head mechanism.  A default deck must acquire neither a refusal nor a
+    worse head from a feature existing: an unnamed restart is set to false
+    for this deck class, announced, and only an EXPLICIT true refuses."""
+    lines = []
+    deck = (_INCUMBENT_DECK
+            .replace("sys_dim = 3", "sys_dim = 2")
+            .replace("restart = false\n", ""))
+    path = tmp_path / "unnamed_restart.in"
+    path.write_text(deck)
+    config = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert config.restart is False
+    assert uses_static_photon_response(config)
+    assert any("restart was not named" in ln for ln in lines), lines
+    assert any("5.72 meV" in ln for ln in lines), lines
+
+
+def test_a_scalar_deck_keeps_the_restart_default(tmp_path):
+    """The promotion is aimed at one bispinor deck class, not at restart."""
+    deck = (_INCUMBENT_DECK
+            .replace("sys_dim = 3", "sys_dim = 2")
+            .replace("bispinor = true\n", "")
+            .replace("bispinor_gw = bare_transverse\n", "")
+            .replace("restart = false\n", ""))
+    path = tmp_path / "scalar_restart.in"
+    path.write_text(deck)
+    assert LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *_: None).restart is True
+
+
+def test_a_bulk_bispinor_restart_deck_is_untouched(tmp_path):
+    """The gate is aimed at the deck class the packed route would have
+    served, not at every bispinor restart."""
+    config = _parse(tmp_path,
+                    _INCUMBENT_DECK.replace("restart = false",
+                                            "restart = true"))
+    assert config.restart is True
+    assert not uses_static_photon_response(config)
 
 
 def test_retired_charge_hall_cubature_spelling_names_the_new_mode(tmp_path):
