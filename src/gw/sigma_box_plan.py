@@ -27,7 +27,11 @@ from common.collectives import (all_gather_processes, gather_to_host,
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaWindow
-from minimax import UniformRule, build_uniform_rule
+from minimax import (
+    UniformRule,
+    build_uniform_rule,
+    rule_amplification_p99,
+)
 
 
 _FACTOR_GROWTH_CAP = 30.0
@@ -266,19 +270,30 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         _rule_cache_store(cache_dir, rule)
         cache_status = "miss" if cache_dir is not None else "off"
 
+    times = np.asarray(rule.times, np.complex128)
+    weights = np.asarray(rule.weights, np.complex128)
     if rule.sup_error > eps:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
             f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
-    noise_bound = rule.kappa_max * _RUNTIME_NOISE_EPSILON
+    # The noise clause remains kappa_p99 * 6e-8 <= 0.05 eps, but its
+    # percentile is now intrinsic to the certified box: the uniform-rule
+    # service area-weights its own fine check cloud.  No physical histogram
+    # or sampled tuple lattice is allowed back into rule determination.
+    # Tempting, and why not: use the single worst boundary point
+    # (rule.kappa_max).  It refused the measured Si crossing rule although
+    # its own sup certificate held; one boundary point is not the historical
+    # percentile noise contract and cannot be improved by retrying at a
+    # tighter eps without reviving the campaign's hidden second stage.
+    kappa_p99 = rule_amplification_p99(
+        times, weights, requested_box, rule.theta_deg)
+    noise_bound = kappa_p99 * _RUNTIME_NOISE_EPSILON
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     if noise_bound > noise_budget:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: runtime-noise "
             f"bound {noise_bound:.6g} exceeds {noise_budget:.6g}")
 
-    times = np.asarray(rule.times, np.complex128)
-    weights = np.asarray(rule.weights, np.complex128)
     if spec["conjugate"]:
         # 1/conj(d) = conj(1/d): one upper-half-plane build serves the
         # lower-half-plane causal branch exactly.
@@ -294,7 +309,8 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         "times": times, "weights": weights,
         "node_count": int(times.size), "rule_box": tuple(rule.box),
         "relative": bool(rule.relative), "sup_error": float(rule.sup_error),
-        "kappa_max": float(rule.kappa_max), "theta_deg": float(rule.theta_deg),
+        "kappa_p99": kappa_p99, "kappa_max": float(rule.kappa_max),
+        "theta_deg": float(rule.theta_deg),
         "rank": int(rule.rank), "seconds": float(rule.seconds),
         "cache_status": cache_status, "factor_growth": growth,
         "noise_bound": noise_bound, "noise_budget": noise_budget,
@@ -530,6 +546,7 @@ def plan_sigma_windows(
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
             "sup_error": fit["sup_error"], "eps": tolerance,
+            "kappa_p99": fit["kappa_p99"],
             "kappa_max": fit["kappa_max"],
             "runtime_noise_bound": fit["noise_bound"],
             "runtime_noise_budget": fit["noise_budget"],

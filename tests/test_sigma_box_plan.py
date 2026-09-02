@@ -11,7 +11,7 @@ import pytest
 from gw.mpa.sigma import _batch_rows
 from gw.ppm_windows import _SigmaBranch
 from gw.sigma_box_plan import plan_sigma_windows
-from minimax.uniform_rule import UniformRule
+from minimax import UniformRule
 
 
 def _branch(tag="positive conduction", *, space="cond", negative=False):
@@ -48,6 +48,9 @@ def _fake_rule(box, eps, **_kwargs):
 
 def _plan(monkeypatch, branch=None, **kwargs):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_amplification_p99",
+        lambda *_args, **_kwargs: 1.1)
     branch = _branch() if branch is None else branch
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
@@ -111,6 +114,9 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         return _fake_rule(box, eps, **kwargs)
 
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_amplification_p99",
+        lambda *_args, **_kwargs: 1.1)
     args = dict(
         eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
@@ -134,6 +140,9 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
 
 def test_total_pair_ceiling_refuses(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_amplification_p99",
+        lambda *_args, **_kwargs: 1.1)
     with pytest.raises(RuntimeError, match="pair ceiling=5"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,

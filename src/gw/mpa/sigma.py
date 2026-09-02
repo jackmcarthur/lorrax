@@ -469,6 +469,7 @@ def compute_sigma_c_mpa_omega_grid(
                         f"box={tuple(window['box_ry'])} Ry, "
                         f"sup={window['sup_error']:.6g}/"
                         f"{window['eps']:.6g} ({window['criterion']}), "
+                        f"kappa_p99={window['kappa_p99']:.6g}, "
                         f"kappa_max={window['kappa_max']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")

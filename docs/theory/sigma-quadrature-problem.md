@@ -105,11 +105,15 @@ The planner rechecks the rule's own sup certificate, the float32-runtime noise
 allowance
 
 ```
-kappa_max * 6e-8 <= 0.05 * eps,
+kappa_p99 * 6e-8 <= 0.05 * eps,
 ```
 
-and a maximum separately factored log growth of 30. A refusal is final. It
-does not trigger a hidden tighter-`eps` retry or a second quadrature family.
+where the percentile uses Voronoi area weights on the rule builder's own fine
+certification cloud, not a physical histogram. The area weights remove the
+cloud's adaptive sampling density, so the statistic remains a function of the
+box and rule only. The planner also requires a maximum separately factored log
+growth of 30. A refusal is final. It does not trigger a hidden tighter-`eps`
+retry or a second quadrature family.
 
 ## 5. Causal conjugation and executor conventions
 
