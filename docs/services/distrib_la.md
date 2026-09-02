@@ -7,6 +7,12 @@ reach — ScaLAPACK/PBLAS, SLATE, cuSOLVERMp/cuBLASMp — appears behind exactly
 one dependency edge (`distrib_la.loader`, which `dlopen`s an optional provider `.so` by path)
 and in zero declared Python dependencies.
 
+Contract audit, 2026-09-02: the package door exports 37 names. Its current
+surface is plan/factor/solve, matmul, polar factorization, backend reporting,
+and their records and constants. There is no centroid-extent policy or
+`padded_centroid_extent` dial in the service; logical and padded matrix extents
+are properties of the resolved plan and its shape descriptor.
+
 ## Standalone installation and capability model
 
 Python 3.12 or newer is required. From this source tree, install `lxkit` and

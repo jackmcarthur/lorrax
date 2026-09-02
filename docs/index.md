@@ -20,7 +20,12 @@ needs no GPU:
 ```bash
 uv sync
 bash src/ffi/cpp/build_host.sh      # see below: this step is NOT optional
-uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
+LORRAX_SOURCE=$PWD
+LORRAX_QUICKSTART=$(mktemp -d)
+mkdir -p "$LORRAX_QUICKSTART/tests/regression"
+cp -a tests/regression/cohsex_debug "$LORRAX_QUICKSTART/tests/regression/"
+chmod -R u+w "$LORRAX_QUICKSTART"
+(cd "$LORRAX_QUICKSTART" && uv run --project "$LORRAX_SOURCE" python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in)
 ```
 
 !!! warning "There is no longer a pure-JAX path that skips the native build"
@@ -70,12 +75,18 @@ one sentence and a link.
 |---|---|---|
 | **why the code does something the way it does** | [Design decisions](architecture/decisions.md) | dated, binding owner rulings. Overrides older prose *anywhere* in the tree, including this table's other rows. |
 | **where a module may live, and what it may import** | [The three levels](architecture/layers.md) | L1/L2/L3 assignment, the import direction, the sanctioned exceptions, and what deliberately is *not* unified. |
-| **what calls what, and where the code is** | [Codebase](architecture/codebase.md) | the module map, the class inventory, the call hierarchy and the file formats. |
-| **which capabilities are services, and what a caller has to know** | [Substrate services](architecture/services.md) | what makes something a service here, the service inventory, **which services deliberately expose a backend choice and which deliberately hide one, and why**, and the public call signature + contract of each. Pairs with the FFI row below: that one records what is *underneath* a service, this one what a *caller* sees. |
+| **where a source module or service package lives** | [Codebase](codebase.md) | the one-line inventory of every GW, common, centroid, file-I/O, and service source package. |
+| **which capabilities are services** | [Substrate services](architecture/services.md) | the service inventory, layering boundary, and which services expose or hide backend choice. Individual caller contracts live on the service pages below. |
+| **how distributed dense linear algebra is requested** | [`distrib_la`](services/distrib_la.md) | the top-level API, plan/factor/solve and matmul contracts, backend resolution, layouts, and refusals. |
+| **how crystal symmetry data is represented and applied** | [`symmetry_maps`](services/symmetry_maps.md) | the top-level API, canonical maps and actions, storage boundaries, unfold contracts, and TRS checks. |
+| **how Coulomb kernels and q=0 cell averages are selected** | [`vcoul`](services/vcoul.md) | dimensional kernels, exact slab q=0 default, explicit debug alternatives, tensor-cell sampling, and refusals. |
+| **how wavefunctions are loaded** | [`wfn_loader`](services/wfn_loader.md) | header and coefficient surfaces, eager/collective backends, raw-row metadata, and loader validation. |
+| **how certified quadrature rules are obtained** | [`minimax`](services/minimax.md) | lookup and runtime-solve boundaries, family vocabulary, provenance, refusals, and the LORRAX odd-kernel adapter boundary. |
 | **how LORRAX reaches a vendor library** | [The FFI layer](architecture/ffi_layout.md) | the five layers, the two build legs, which nvhpc stage selects which communication path, which FFT engine a `.so` actually links, the C++ phdf5 context defaults and their boolean grammar, and how to tell the native-layer failure modes apart. **§3a is the dependency matrix** — one row per routine we call a vendor for, naming the library on each machine, the gate that proves it built right, and whether that gate is passing; **§3b is the list of routines with no check at all.** |
 | **how a sharded array reaches disk** | [SlabIO](architecture/slab_io.md) | the tile contract, the caller-facing API **and what a call site may and may not assume of it**, the launcher requirement, the striping and collective-I/O measurements, the restart-read path, the multi-node certification, **the one-owner-per-file rule and the refusal that enforces it**, **the HDF5 operation journal**, and **the three measured failure signatures (S1/S2/S3) with their shared mechanism**. There is one transport; the three tiers and their router were deleted 2026-08-06. |
 | **how much memory a stage needs** | [Memory model](architecture/memory-model.md) | the per-stage closed forms and the planner's calibration. |
 | **how the face-layout ζ fit moves and shards data** | [Face-ψ ζ fitting](architecture/zeta_fit_face_psi_cct.md) | the `C_q`/`Z_q` constructions, face-Y cache, coupled transverse schedule, and local/distributed solve boundaries. |
+| **how exact finite-occupation response uses the two-face carrier** | [Fractional χ₀ response face](architecture/fractional_chi0_response_face.md) | the full-BZ/IBZ storage branches, ordered-pair schedule, layouts, and memory bounds for the finite-occupation response paths. |
 | **how to run in the thousands-of-ranks regime** | [`docs/dev/large_nmu_operation.md`](dev/large_nmu_operation.md) | the LOCAL-vs-DISTRIBUTED plan table, per-stage per-rank scaling, and the fully-distributed deck. |
 | **what an environment variable is called and what it defaults to** | [`docs/dev/env_vars.md`](dev/env_vars.md) | **spelling, default, class, and parse grammar — and nothing else.** Machine-enforced by `tests/test_env_registry.py`. Every row's *explanation* lives on the owner page it links to. |
 | **which JAX generation may run** | [`docs/dev/jax_support.md`](dev/jax_support.md) | the single JAX/JAXLIB 0.9 contract, its package/preflight/runtime enforcement, and the Perlmutter launch pins. Historical run records do not redefine this policy. |
@@ -88,6 +99,7 @@ one sentence and a link.
 | **why CPU collectives run on `impl=mpi`** | [Collective transports](environment/transports.md) · [`docs/dev/mpi_collectives.md`](dev/mpi_collectives.md) | the gloo corruption evidence and the MPIwrapper recipe. |
 | **how to judge whether a claim or a check is any good** | [`docs/dev/QUALITY_PATTERNS.md`](dev/QUALITY_PATTERNS.md) | the ten failure classes and the assessment rubric. Cited by number (`#8`) from other pages. |
 | **how the four-current (bispinor) self-energy treats q→0 and frequency** | [Four-current heads and frequency](theory/four-current-head-corrections.md) | the Γ-cell head of every Lorentz channel (charge `S(ω)` and its Schur fold, the bare TT tensor head, the packed static photon head with its Hall term and its declared omissions), which frequency model each channel carries, what time-reversal breaking changes, and the code owner of each object. |
+| **how GN-PPM is derived when the imaginary-axis matrix is non-Hermitian** | [Non-Hermitian GN-PPM derivation](dev/notes/DERIVATION_gnppm_nonhermitian.md) | the derivation memo, code correspondence, limiting identities, and test oracles for the even and odd components. |
 | **what the four-current (bispinor) layer calls, and what each object's shape and sharding is** | [Four-current wiring](architecture/four_current_wiring.md) | the stage-by-stage map from deck key through `gw_config` resolution, `gw_init` (two centroid sets, the bispinor lift, four ζ fits, the `V_q` tiles), screening (packed `χ_0`, the distributed Dyson, the Γ completion), Σ and the output records — with every object's producer, shape, sharding and **route membership (bare / packed / both)**, the compressed refusal table, and which `gwjax.out` lines identify the route that ran. Physics belongs to the theory row above; module one-liners to the Codebase row. |
 | **when a rank/spectrum may be truncated, and what refuses if it may not** | [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md) | the one criterion (`common/rank_criterion`), the degeneracy closure (`common/spectral_closure`) and its band-axis twin (`common/band_degeneracy`); the certified κ ceiling and its measurements; **what is refuted as a gate and must not be re-proposed**; the site register with each site's certification status; and the two dials. |
 

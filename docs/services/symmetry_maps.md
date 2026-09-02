@@ -34,6 +34,14 @@ failure that `tests/test_layering.py` fails on (with a red twin). Since
 top-level package — the door rule made structural, not an exception entry —
 so reaching *past* the door is the thing that still flags.
 
+The service owns star membership and symmetry actions, not the quadrature
+meaning of a WFN's stored k rows. The centroid consumer
+`centroid.sampling_metric.full_k_quadrature_weights` distinguishes full-BZ
+storage (`wfn.nkpts == sym.nk_tot`, stored weights pass through and every
+parent is a self-image) from IBZ storage (each stored parent weight is spread
+over its star). That branch is intentional: `SymMaps` supplies the authenticated
+indices and actions but does not reinterpret `kweights`.
+
 ## API
 
 | name | what it is |
