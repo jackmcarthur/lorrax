@@ -98,7 +98,7 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	HeadCorrection, LorraxConfig, QPSolver,
+	ComputeMode, HeadCorrection, LorraxConfig, QPSolver,
 	ScreeningDiagrams, incumbent_bispinor_head_record,
 	packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
