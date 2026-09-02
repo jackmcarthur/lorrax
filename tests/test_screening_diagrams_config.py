@@ -27,6 +27,7 @@ import ast
 import os
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -811,6 +812,7 @@ def test_w_bse_w_gate_is_a_five_part_refusal_regardless_of_sanity_default(
         screening_bse._gate_w_or_refuse(
             W, ScreeningRequest(0.0 + 0.0j, "static"),
             stage="assembled ladder W[static]", kgrid=(3, 1, 1),
+            sym=SimpleNamespace(trs_allowed=True),
             print_fn=lambda *a, **k: None)
     message = str(exc.value)
     assert "w_bse_w_stage_invariants" in message
@@ -832,6 +834,7 @@ def test_w_bse_w_gate_restores_sanity_after_a_healthy_stage(monkeypatch):
     screening_bse._gate_w_or_refuse(
         W, ScreeningRequest(0.0 + 0.0j, "static"),
         stage="healthy scalar ladder W[static]", kgrid=(3, 1, 1),
+        sym=SimpleNamespace(trs_allowed=True),
         print_fn=lambda *a, **k: None)
     assert os.environ["LORRAX_SANITY"] == "off"
 

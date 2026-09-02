@@ -38,7 +38,7 @@ so reaching *past* the door is the thing that still flags.
 
 | name | what it is |
 |---|---|
-| `SymMaps(wfn)` | Canonical operation source. `operation_rows` returns reciprocal rotation, Seitz translation, and the antiunitary bit. `cartesian_action` selects polar/axial and time parity; `fft_grid_pullback`, `spinor_action`, `reciprocal_phase`, and `unfold_wavefunction` use the same typed rows. |
+| `SymMaps(wfn)` | Canonical operation source. `wfn.trs_holds` is required and becomes the sole consumer verdict `trs_allowed`; a missing verdict refuses. The retired `allow_trs=` argument refuses by name because it could override the measured DFT state. `operation_rows` returns reciprocal rotation, Seitz translation, and the antiunitary bit. `cartesian_action` selects polar/axial and time parity; `fft_grid_pullback`, `spinor_action`, `reciprocal_phase`, and `unfold_wavefunction` use the same typed rows. |
 | `read_qe_symmetry_receipt` / `bind_qe_symmetry_receipt` / `resolve_qe_symmetry_binding` | Bounded `data-file-schema.xml` reader and WFN authentication gate. Pins raw matrix orientation, Seitz translation, k rows/grid, spinor count, per-operation antiunitary bits, and QE's pure-TR k-reduction permission. |
 | `build_spatial_operator_tables(wfn)` | Canonical `mtrx.T`, translation, Cartesian and spinor action tables without a k-map. The 2c reference check uses this to measure an inconsistent reduced WFN before `SymMaps` refuses its mesh coverage. |
 | `KStarMap(irr_idx, sym_idx, n_sym_spatial)` / `.from_sym(sym, nss)` | Band-index IBZ ⇄ full BZ. Bundles the three arrays that always travel together so no call site can supply two of the three. `.identity(nk)` is the no-reduction map, so a driver reads the same whether or not symmetry is in use. `select` / `broadcast` / `spread` / `spread_rel`. |
@@ -65,6 +65,19 @@ kept rather than deleted, with the case where it returns FALSE constructed
 
 ## Contract
 
+* **The time-reversal verdict is measured once and applied automatically.**
+  `WfnLoader` discovers and authenticates the QE `data-file-schema.xml`, the
+  occupied-density checker measures the two-component DFT state without ever
+  using an antiunitary-generated partner as evidence, and the only executable
+  verdict is `WfnLoader.trs_holds` → `SymMaps.trs_allowed`. Missing or
+  inconclusive evidence disables global TR; it never defaults to true.
+  `SymMaps(..., allow_trs=...)` is retired and refuses by name, as do the old
+  `LORRAX_TRS_CHECK=0/off` values that skipped the measurement. The run record
+  prints `QE schema`, `Stored QE type`, `DFT 2c TRS`, `Global TRS`, and the
+  active operation rows. The q-grid policy, W gates, GN probe, MPA contour,
+  QSGW velocity parity, and every other consumer read `SymMaps.trs_allowed`;
+  none accepts an override. The MPA ordered-orientation equation is owned by
+  [Multipole frequency integration](../theory/THEORY_mpa_implementation.md#21-ordered-orientations-when-time-reversal-is-broken).
 * **`_star_conj_flags` is the single source of conjugation truth.** One
   predicate — `trs(member) XOR trs(reference_row)` — read by four entry
   points: `star_broadcast`'s `star_row` branch, `star_spread` via
@@ -100,8 +113,8 @@ kept rather than deleted, with the case where it returns FALSE constructed
   point declared by `kgrid`; missing rows never fall back to Γ/identity.
   `ntran=1` reaches the fast full-grid path only when all grid points are
   actually stored; otherwise it uses the ordinary `[I,-I]` planner.
-  TRS-disallowed construction names `noinv=.true.` and the
-  `LORRAX_TRS_CHECK=0` escape hatch; the
+  TRS-disallowed construction names `noinv=.true.` and states that the
+  measured verdict has no input/environment override; the
   orbit-closure refusal names the regeneration fix; `unfold_v_q`'s four
   shape refusals exist because `promise_in_bounds` gathers clip SILENTLY on
   an out-of-bounds index, so an unrefused shape is a wrong answer rather
@@ -115,7 +128,9 @@ kept rather than deleted, with the case where it returns FALSE constructed
   to TRS alone. The metric is the occupied one-particle-subspace residual in
   G space, invariant to band phases and rotations inside degenerate blocks.
   TRIM-only or absent evidence is inconclusive and disables antiunitary
-  unfolding; only an explicit `LORRAX_TRS_CHECK=0` restores permissive mode.
+  unfolding. The former `LORRAX_TRS_CHECK=0/off` permissive mode is retired
+  because skipping the measurement asserted global TR rather than merely
+  disabling a diagnostic.
 * **The q axis CONSUMES that verdict and the QE row typing; it never re-derives
   either.**
   `QgridTrsPolicy` is the whole of the q-axis time-reversal contract, and
@@ -146,10 +161,10 @@ kept rather than deleted, with the case where it returns FALSE constructed
   q and −q converts an ordinary fit error into a forbidden reciprocity
   error — which is what the pair-coherent row map removes, and what
   `measure_covariance` reports so the fit, not the unfold, gets diagnosed.
-* Env surface: `LORRAX_TRS_CHECK` (`1` | `0` | `strict`), `LORRAX_TRS_TOL`,
+* Env surface: `LORRAX_TRS_CHECK` (`1` | `strict`; `0/off` refuses), `LORRAX_TRS_TOL`,
   `LORRAX_TRS_MAX_K` — all in
-  `docs/dev/env_vars.md`. Env grants and tunes the measurement; it never
-  selects a symmetry convention.
+  `docs/dev/env_vars.md`. Env tunes the measurement or makes a failing result
+  strict; it never grants a symmetry convention.
 
 ### Directed band-matrix edges
 

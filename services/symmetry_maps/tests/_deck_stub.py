@@ -23,11 +23,10 @@ four decks' ``(irr_idx_k, sym_idx_k)`` bit-compared against
 ``data/star_tables_e9340d1.json`` — is a property of ``symmetry_maps``
 alone and not of the loader that usually feeds it.
 
-``trs_holds=True`` IS PINNED, NOT DEFAULTED.  ``SymMaps`` falls back to the
-permissive ``True`` for an object carrying no verdict. The automatic check
-is 2c-only; other layouts keep that permissive setting. The stub records the
-expected effective value explicitly. If a 2c deck's verdict flips, the
-parity arm against
+``trs_holds=True`` IS PINNED AND REQUIRED, NOT DEFAULTED.  ``SymMaps`` refuses
+an object carrying no verdict because omission cannot assert a symmetry. The
+automatic occupied-density check is 2c-only; the loader records the applicable
+layout verdict explicitly. If a 2c deck's verdict flips, the parity arm against
 ``SymMaps(WfnLoader(...))`` is what says so, and it can only say so because
 the two sides disagree about a value that was written down.
 

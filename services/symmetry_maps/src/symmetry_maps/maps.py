@@ -1919,14 +1919,11 @@ class SymMaps:
         
         Args:
             wfn: WFNReader instance
-            allow_trs: whether time-reversal rows of ``sym_mats_k`` may be
-                SELECTED when mapping the full BZ onto the IBZ.  ``None``
-                (default) takes the value from ``wfn.trs_holds`` — the
-                verdict that ``WfnLoader`` obtains from the occupied
-                two-component DFT subspaces (``density_symmetry_check``) —
-                falling back to
-                ``True`` (the historical, permissive behaviour) for
-                wfn-shaped objects that carry no verdict.
+            allow_trs: retired override.  It must be ``None``.  SymMaps takes
+                the required ``wfn.trs_holds`` verdict that ``WfnLoader``
+                obtains from the occupied two-component DFT subspaces
+                (``density_symmetry_check``); a caller cannot assert or
+                negate time reversal at this consumer.
 
                 When False, arbitrary global-TR partners are disabled.  An
                 authenticated QE schema may still authorize individual
@@ -1936,12 +1933,24 @@ class SymMaps:
                 its ``2·ntran`` candidate layout because wavefunction and
                 nonsymmorphic-phase consumers key conjugation from the row.
         """
-        # Measured-TRS gate.  ``allow_trs=None`` → consult the wfn object;
-        # objects with no verdict (legacy WFNReader, hand-built stubs) get
-        # the permissive default so this is a pure no-op for them.
-        if allow_trs is None:
-            allow_trs = getattr(wfn, 'trs_holds', None)
-        self.trs_allowed = True if allow_trs is None else bool(allow_trs)
+        # Measured-TRS gate.  The old allow_trs override and the missing-field
+        # permissive default could both assert a symmetry the DFT state had
+        # not established.  Refuse those paths by name; every executable
+        # consumer downstream reads this one boolean.
+        if allow_trs is not None:
+            raise ValueError(
+                "GATE retired_SymMaps_allow_trs: allow_trs="
+                f"{allow_trs!r} is retired because it overrides the DFT "
+                "reference verdict. Construct SymMaps(WfnLoader(...)); "
+                "SymMaps.trs_allowed now comes only from "
+                "WfnLoader.trs_holds.")
+        verdict = getattr(wfn, 'trs_holds', None)
+        if not isinstance(verdict, (bool, np.bool_)):
+            raise ValueError(
+                "GATE SymMaps_needs_measured_trs: wfn.trs_holds must be an "
+                "explicit boolean from WfnLoader; got "
+                f"{verdict!r}. Missing verdicts no longer default to True.")
+        self.trs_allowed = bool(verdict)
 
         # WFN.h5 omits QE's per-operation antiunitary bit.  WfnLoader
         # attaches a receipt only after a nearby QE schema has matched the
@@ -2501,8 +2510,8 @@ class SymMaps:
                 f"time-reversal rows must not be used. This WFN's k-mesh was "
                 f"reduced with an assumption its own wavefunctions "
                 f"contradict; regenerate it with `noinv=.true.` (or fix the "
-                f"magnetic ground state). Set LORRAX_TRS_CHECK=0 to restore "
-                f"the old flags-only behaviour at your own risk."
+                f"magnetic ground state). The measured verdict cannot be "
+                f"overridden by an input or environment key."
             )
 
         if self.trs_allowed and not np.all(matched):

@@ -295,10 +295,7 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
         "translations",
     ]
     qe_binding = getattr(sym, "qe_symmetry_binding", None)
-    active = np.asarray(
-        getattr(sym, "active_symmetry_rows",
-                np.arange(2 * n_sym if bool(sym.trs_allowed) else n_sym)),
-        dtype=np.int32).reshape(-1)
+    active = np.asarray(sym.active_symmetry_rows, dtype=np.int32).reshape(-1)
     active_set = {int(row) for row in active}
     n_active_unitary = sum(row < n_sym for row in active_set)
     n_active_anti = sum(row >= n_sym for row in active_set)

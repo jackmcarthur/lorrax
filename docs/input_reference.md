@@ -84,6 +84,15 @@ page has to read it from.
 
 ## Screening
 
+There is deliberately no deck key for time reversal. The QE-schema receipt
+and occupied two-component DFT measurement automatically produce
+`SymMaps.trs_allowed`, and every screening/PPM/MPA consumer uses that result.
+The historical non-deck override `SymMaps(..., allow_trs=...)` and the
+measurement-skipping environment values `LORRAX_TRS_CHECK=0/off` are retired
+and refused by name; see the
+[symmetry-service contract](services/symmetry_maps.md#contract) and
+[environment reference](dev/env_vars.md#3b-opt-in-probes-dumps-test-hooks).
+
 | key | default | meaning |
 |---|---|---|
 | `do_screened` | true | **LEGACY spelling of the self-energy axis.** Build W and the screened Sigma terms (false = bare exchange only); `compute_mode = auto` reads it. Honored, and naming it prints a deprecation note quoting the resolved `compute_mode` / `qp_solver` (`gw_config.LEGACY_SIGMA_AXIS_KEYS`). Write `compute_mode` instead. An explicit non-`x_only` `compute_mode` beside `do_screened = false` refuses rather than picking a winner. |
@@ -130,7 +139,7 @@ page has to read it from.
 | `ppm_omega_p` | `2.0` | Second PPM probe frequency (Ry): i*omega_p for GN, real omega_p for HL. |
 | `ppm_fallback_omega` | `2.0` | Positive real fallback pole (Ry) for elements with no valid Omega^2 fit. |
 | `ppm_head_omega_h_ry` | None | Override the q->0 head pole Omega_h (Ry) directly; None = compute normally. BGW comparison aid. |
-| `ppm_probe_chi_reuse` | `"off"` | off \| auto. auto (GN only): represent the probe integrand on the static tau nodes plus the minimal augmentation from the dedicated quadrature's node set, and accumulate the probe chi0 inside ONE fused tau sweep — shared nodes' G-build/FFT/contraction tensors are computed once, only the k extra nodes cost new compute. Error gated at max(dedicated err, target_error) with a guaranteed exact-dedicated fallback. Same quadrature-error contract, not bit-identical to off — keep off for pinned-baseline decks. |
+| `ppm_probe_chi_reuse` | `"off"` | off \| auto. auto (GN only): represent the probe integrand on the static tau nodes plus the minimal augmentation from the dedicated quadrature's node set, and accumulate the probe chi0 inside ONE fused tau sweep — shared nodes' G-build/FFT/contraction tensors are computed once, only the k extra nodes cost new compute. Error gated at max(dedicated err, target_error) with a guaranteed exact-dedicated fallback. Same quadrature-error contract, not bit-identical to off — keep off for pinned-baseline decks. On a measured-broken-TR deck `auto` refuses by this key's name because the reuse basis has no ordered odd-kernel augmentation; set `off`, which automatically selects the ordered GN probe from `SymMaps.trs_allowed`. |
 | `ppm_invalid_mode` | `"static_limit"` | Invalid-pole treatment: static_limit (default, BGW mode 3) | zero (BGW 0) | 2ry (BGW 2). |
 
 ## Sigma

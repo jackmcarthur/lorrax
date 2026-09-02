@@ -111,16 +111,26 @@ class _TRSEvidence:
 
 
 def trs_check_mode() -> str:
-    """Return ``off``, ``on``, or ``strict`` from ``LORRAX_TRS_CHECK``."""
+    """Return ``on`` or ``strict`` from ``LORRAX_TRS_CHECK``.
+
+    The historical off values are refused: disabling the measurement made
+    ``WfnLoader.trs_holds`` fall back to True and was therefore an input-side
+    assertion of time reversal, not merely a diagnostic opt-out.
+    """
     raw = os.environ.get("LORRAX_TRS_CHECK", "1").strip().lower()
     if raw in {"0", "false", "off", "no"}:
-        return "off"
+        raise ValueError(
+            "GATE retired_LORRAX_TRS_CHECK_off: LORRAX_TRS_CHECK="
+            f"{raw!r} is retired because it asserted time reversal by "
+            "skipping the occupied-density verdict. Leave the variable "
+            "unset (automatic measurement) or use 'strict' to turn a "
+            "broken/inconclusive verdict into a refusal.")
     if raw == "strict":
         return "strict"
     if raw in {"", "1", "true", "on", "yes"}:
         return "on"
     raise ValueError(
-        "LORRAX_TRS_CHECK must be 0/off, 1/on, or strict; "
+        "LORRAX_TRS_CHECK must be 1/on or strict; "
         f"got {raw!r}")
 
 
@@ -510,7 +520,7 @@ def _check_two_component_trs(
         # A pass with only TRIM closure cannot establish TRS away from the
         # measured point.  Likewise, no evidence is not permissive evidence.
         # Disable antiunitary unfolding unless the test is both passing and
-        # conclusive; an explicit LORRAX_TRS_CHECK=0 remains the opt-out.
+        # conclusive.  There is no flags-only or input-controlled opt-out.
         trs_holds=bool(not broken and conclusive), trs_basis=basis,
         m_rel=max_residual, m_rel_total=None,
         trs_coverage=float(np.sum(weights[covered]) / weight_norm),
@@ -608,11 +618,9 @@ def _enforce_policy(
         warnings.warn(text, RuntimeWarning)
 
 
-def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
+def cached_density_symmetry_check(loader) -> DensitySymmetryReport:
     """Process-local cached front door used by ``WfnLoader``."""
     mode = trs_check_mode()
-    if mode == "off":
-        return None
     tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
     max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
     nocc = int(loader.physical_density_band_stop)
@@ -630,9 +638,9 @@ def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
             raise
         warnings.warn(
             "two-component TRS reference check failed to run on "
-            f"{getattr(loader, 'path', '<wfn>')}: {exc!r}. Proceeding with "
-            "the permissive symmetry treatment. Set LORRAX_TRS_CHECK=0 "
-            "to disable the check.", RuntimeWarning)
+            f"{getattr(loader, 'path', '<wfn>')}: {exc!r}. Global time "
+            "reversal is disabled because a failed measurement is not "
+            "evidence that it holds.", RuntimeWarning)
         report = _empty_report(
             loader, basis="skipped", message=repr(exc), tol_trs=tol,
             nspin=int(getattr(loader, "nspin", 0) or 0),

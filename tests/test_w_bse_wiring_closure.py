@@ -577,7 +577,8 @@ def test_the_ladder_w_passes_the_production_w_gate_at_finite_q(
 
     monkeypatch.setenv("LORRAX_SANITY", "strict")
     _gate_w(W_q, ScreeningRequest(0.0 + 0.0j, "static"),
-            print_fn=print, kgrid=tuple(meta.kgrid))
+            print_fn=print, kgrid=tuple(meta.kgrid),
+            trs_allowed=bool(sym.trs_allowed))
 
     # (3) THE COVERAGE EXTENSION, stated as its own assertion: the
     #     production gate checks hermiticity at q=0 only, so the finite-q

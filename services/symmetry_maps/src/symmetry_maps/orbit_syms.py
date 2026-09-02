@@ -1800,11 +1800,7 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
             "non-finite values.")
 
     fft_grid = np.asarray(value.shape[-3:], dtype=np.int64)
-    active_rows = np.asarray(
-        getattr(sym, "active_symmetry_rows",
-                np.arange(2 * n_spatial if bool(sym.trs_allowed)
-                          else n_spatial)),
-        dtype=np.int32)
+    active_rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
     if (active_rows.ndim != 1 or active_rows.size < 1
             or np.unique(active_rows).size != active_rows.size
             or np.any(active_rows < 0)

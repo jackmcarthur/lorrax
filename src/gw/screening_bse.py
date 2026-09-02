@@ -534,7 +534,7 @@ def _assert_restart_is_loadable(tensors_filename, *, include_w=True,
 # Stage 1+2: the RPA static leg and its persist
 # ---------------------------------------------------------------------------
 
-def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None,
+def _gate_w_or_refuse(W, req, *, stage, sym, print_fn=print, kgrid=None,
                       include_w=True):
     """Run ``_gate_w`` as a non-negotiable resolvent-stage refusal.
 
@@ -558,7 +558,9 @@ def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None,
     previous = os.environ.get("LORRAX_SANITY")
     os.environ["LORRAX_SANITY"] = "strict"
     try:
-        _gate_w(W, req, print_fn=print_fn, kgrid=kgrid)
+        _gate_w(
+            W, req, print_fn=print_fn, kgrid=kgrid,
+            trs_allowed=bool(sym.trs_allowed))
     except sanity.SanityError as exc:
         raise ValueError(
             f"GATE {rule_id}: screening_diagrams = {diagram_name} "
@@ -643,7 +645,8 @@ def prepare_ladder_restart(
         _gate_w_or_refuse(
             W0_rpa, ScreeningRequest(0.0 + 0.0j, "static"),
             stage="RPA input W[static] for the ladder kernel",
-            print_fn=print_fn, kgrid=tuple(meta.kgrid), include_w=include_w)
+            sym=sym, print_fn=print_fn, kgrid=tuple(meta.kgrid),
+            include_w=include_w)
 
     rpa_iteration_head = None
     from .gw_config import HeadCorrection
@@ -1071,7 +1074,7 @@ def compute_screening_ladder(
                                   f"finiteness + hermiticity gate"):
             _gate_w_or_refuse(
                 W_q, req, stage=f"assembled {diagram_name} W[{req.role}]",
-                print_fn=print_fn, kgrid=tuple(meta.kgrid),
+                sym=sym, print_fn=print_fn, kgrid=tuple(meta.kgrid),
                 include_w=include_w)
         W_by_role[req.role] = W_q
     return W_by_role

@@ -70,6 +70,7 @@ def test_symmetry_receipt_fractional_ops_and_ibz_use_five_decimals():
         Rinv_grid=np.array([np.eye(3, dtype=int), np.eye(3, dtype=int)]),
         translations=np.array([[0.0, 0.0, 0.0],
                                [np.pi, np.pi, np.pi]]),
+        active_symmetry_rows=np.arange(4, dtype=np.int32),
         trs_allowed=True, nk_tot=8, nk_red=2,
     )
     text = "\n".join(symmetry_sampling_lines(wfn, sym))
@@ -101,6 +102,7 @@ def test_two_component_trs_receipt_names_evidence_and_inconclusive_state():
     sym = SimpleNamespace(
         Rinv_grid=np.eye(3, dtype=int)[None],
         translations=np.zeros((1, 3)), trs_allowed=True,
+        active_symmetry_rows=np.arange(2, dtype=np.int32),
         nk_tot=8, nk_red=1,
     )
     text = "\n".join(symmetry_sampling_lines(wfn, sym))
@@ -123,6 +125,7 @@ def test_two_component_trs_receipt_is_not_applied_to_scalar_reference():
     sym = SimpleNamespace(
         Rinv_grid=np.eye(3, dtype=int)[None],
         translations=np.zeros((1, 3)), trs_allowed=True,
+        active_symmetry_rows=np.arange(2, dtype=np.int32),
         nk_tot=1, nk_red=1,
     )
     text = "\n".join(symmetry_sampling_lines(wfn, sym))

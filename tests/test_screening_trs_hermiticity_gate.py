@@ -161,19 +161,17 @@ def test_omega_zero_is_gated_on_a_magnet_too(monkeypatch):
     assert log.failures, log.text
 
 
-def test_no_verdict_supplied_keeps_the_incumbent_unconditional_gate(
+def test_no_verdict_supplied_refuses_instead_of_selecting_a_trs_branch(
         monkeypatch):
-    """``None`` is 'no symmetry tables in hand', not 'time reversal is
-    broken'.  The fork may err toward reporting physics as a defect; it may
-    never err toward silence."""
-    raised, _ = _run(NON_HERMITIAN, PROBE, None, monkeypatch=monkeypatch)
-    assert raised, "an unsupplied verdict silently disabled the gate"
+    monkeypatch.setenv("LORRAX_SANITY", "strict")
+    with pytest.raises(ValueError, match="W_gate_needs_measured_trs"):
+        _gate_w(NON_HERMITIAN, PROBE, trs_allowed=None)
 
 
 def test_the_real_axis_probe_is_not_gated_under_either_verdict(monkeypatch):
     """A dynamical W obeys Kramers-Kronig and legitimately has W'' != 0.
     Gating that branch would check something false by construction."""
-    for verdict in (True, False, None):
+    for verdict in (True, False):
         raised, log = _run(NON_HERMITIAN, REAL_AXIS, verdict,
                            monkeypatch=monkeypatch)
         assert not raised, f"the real-axis probe was gated at trs={verdict}"
@@ -195,8 +193,9 @@ def test_the_verdict_comes_from_the_measurement_and_nowhere_else():
     assert _trs_verdict(_Sym()) is False
     _Sym.trs_allowed = 1                       # numpy/bool0 verdicts coerce
     assert _trs_verdict(_Sym()) is True
-    assert _trs_verdict(None) is None
-    with pytest.raises(AttributeError):
+    with pytest.raises(ValueError, match="screening_needs_measured_trs"):
+        _trs_verdict(None)
+    with pytest.raises(ValueError, match="screening_needs_measured_trs"):
         _trs_verdict(object())
 
 
@@ -208,13 +207,19 @@ def test_the_production_call_sites_all_thread_the_verdict():
     import inspect
     import re
 
-    from gw import screening
+    from gw import screening, screening_bse
 
     src = inspect.getsource(screening.compute_screening)
     calls = re.findall(r"_gate_w\((?:[^()]|\([^()]*\))*\)", src)
     assert len(calls) == 3, f"expected 3 _gate_w call sites, found {calls}"
     for call in calls:
         assert "trs_allowed=" in call, call
+
+    ladder_src = inspect.getsource(screening_bse._gate_w_or_refuse)
+    ladder_calls = re.findall(
+        r"_gate_w\((?:[^()]|\([^()]*\))*\)", ladder_src)
+    assert len(ladder_calls) == 1, ladder_calls
+    assert "trs_allowed=" in ladder_calls[0], ladder_calls[0]
 
 
 def test_there_is_exactly_one_hermiticity_reporter():

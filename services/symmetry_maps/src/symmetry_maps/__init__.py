@@ -149,8 +149,9 @@ The surface
     not to a table library.
 ``DensitySymmetryReport`` / ``check_density_symmetries`` /
 ``cached_density_symmetry_check`` / ``trs_check_mode``
-    The measurement, its cached front door, and the ``LORRAX_TRS_CHECK``
-    switch.
+    The automatic measurement, its cached front door, and the
+    ``LORRAX_TRS_CHECK`` strictness control. Historical ``0/off`` values
+    refuse because they asserted TR by skipping the verdict.
 ``QgridTrsPolicy`` / ``build_qgrid_trs_policy`` /
 ``little_group_covariance_residual``
     What the MEASURED verdict is allowed to do to the q axis, in one

@@ -268,7 +268,7 @@ def _run(args: argparse.Namespace) -> int:
         )
     else:
         pt = load_parallel_transport_head(
-            pt_file, mesh=mesh, wfn=wfn, meta=meta
+            pt_file, mesh=mesh, sym=sym, wfn=wfn, meta=meta
         )
     nb_available = int(pt.nb_logical)
     nb_logical = (
