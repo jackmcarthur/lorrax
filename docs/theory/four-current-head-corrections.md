@@ -19,16 +19,18 @@ current density `ψ†α^iψ`).
 
 ## 1. Status in one table
 
-> **Implementation status (2026-09-01, in flight).** The two packed-mode rows
-> collapse to one on `lane/bisp-b-one-packed-mode-2026-09-01`; the headless
-> `full_static_cohsex` row is the defect that lane removes.
+> **Implementation status (2026-09-01).** This table now describes
+> `lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2` (pushed, not on
+> `origin/main`), which collapsed the two packed modes into one and made the
+> Γ-cell completion the default. On `origin/main@8b6e3cc7` there are still
+> two packed modes and the headless one is the defect the ruling names.
 
 | self-energy channel | frequency dependence | Γ-cell head | deck route | status |
 |---|---|---|---|---|
 | charge exchange `Σ_X` (CC) | none | `⟨v⟩_mBZ`, band-diagonal (§3.1) | every mode | production |
 | charge correlation `Σ_SX+Σ_COH` / `Σ_c(ω)` (CC) | static, GN-PPM (two samples), HL-PPM, MPA | scalar `W_h(ω)` from `S_eff(ω)` (§3) | `head_correction = full` | production |
 | bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | `−⟨v P^T⟩_mBZ` tensor slot (§2) | `bispinor_tt_head_correction = true` | implemented, default off |
-| screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | none (`full_static_cohsex`, headless by envelope: a defect under the [2026-09-01 ruling](../architecture/decisions.md)) or charge CC `q²` + Hall CT/TC `q¹` (`charge_hall_cubature`, §4) | `bispinor_gw = full_static_cohsex \| charge_hall_cubature` | experimental, insulating slab, one shot |
+| screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | retarded / dynamic photon `D^{IJ}(ω)` | — | — | none | **does not exist** |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -46,8 +48,9 @@ Two facts follow from the table and are easy to miss:
 * The only time-reversal-odd term in the screened photon head is the
   static Hall (Chern–Simons) response. For a gapped system that
   coefficient is topologically quantized (§4.4), so for a Chern-trivial
-  insulator it is exactly zero and the `charge_hall_cubature` head reduces
-  to the charge-only head of §3.
+  insulator it is exactly zero, so the packed mode's head reduces to the
+  charge-only head of §3 — its Hall term is zero both by default (an absent
+  `static_gauge_hall_file` sets `σ_H = 0`, announced) and by physics.
 
 ## 2. The bare propagator and its Γ-cell average
 
@@ -244,16 +247,18 @@ in the sandbox):
   the two frequency halves with independent complex poles and does not assume
   a conjugation relation between them.
 
-## 4. The packed static photon head (`charge_hall_cubature`)
+## 4. The packed static photon head (`full_static_cohsex`)
 
-> **Implementation status (2026-09-01, in flight).**
-> `lane/bisp-b-one-packed-mode-2026-09-01` makes the §4.2 Γ completion
-> mandatory (one packed mode, `head_correction = off` demoted to a debug
-> setting) and deletes the producerless `StaticGaugeHeadResponse` seam of §4.3.
+> **Implementation status (2026-09-01).** This section describes
+> `lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2` (`cff884e7` made the §4.2
+> completion the default under one mode and deleted the producerless
+> `StaticGaugeHeadResponse` seam; `cacc4e07` fixed the Hall sign of §4.2).
+> On `origin/main@8b6e3cc7` the mode is still named `charge_hall_cubature`
+> and the completion is opt-in.
 
 ### 4.1 Body and layout
 
-`full_static_cohsex` and `charge_hall_cubature` build one packed
+`full_static_cohsex` builds one packed
 `C ⊕ T_1 ⊕ T_2 ⊕ T_3` operator (`gw.photon_layout`): the sixteen bare blocks
 `D^{IJ}_q(μ,ν)` from `v_q_bispinor.h5`, the sixteen no-pair response blocks
 `χ^{IJ}_0` from the kinetic-balance current
@@ -266,14 +271,14 @@ charge body and carries the same missing `K = 0` slot in every block.
 
 ### 4.2 The coupled Γ-cell solve
 
-`charge_hall_cubature` completes the Γ slot of both `V` and `W` by solving
+The mode completes the Γ slot of both `V` and `W` by solving
 the 4×4 Lorentz Dyson equation at every point of an exact Wigner–Seitz
 cubature of the mini-BZ polygon (fixed 16/24/32 Duffy–Gauss ladder,
 `vcoul.slab_minibz_photon_cubature`; slab geometry only):
 
 $$
 R(\mathbf q)=q_a H^a+q_aq_b S^{\rm eff,ab},\qquad
-H^a_{0i}=+i\,\epsilon_{bai}\,\sigma_H^b,\; H^a_{i0}=\overline{H^a_{0i}},\qquad
+H^a_{0i}=-i\,\epsilon_{bai}\,\sigma_H^b,\; H^a_{i0}=\overline{H^a_{0i}},\qquad
 W_h(\mathbf q)=\left[1-D(\mathbf q)R(\mathbf q)\right]^{-1}D(\mathbf q).
 $$
 
@@ -281,8 +286,17 @@ Each `S^{\rm eff,ab}` is a 4×4 Lorentz block, folded with the Γ wings
 through the headless packed body exactly as in §3.1. The Hall pseudovector
 `σ_H` is never fitted: it is a separately produced input
 (`static_gauge_hall.h5`, `gw.qsgw_head.static_gauge_hall_transaction`) and the
-only admitted `q`-linear CT/TC structure is generated from it. Only the nine
-monomial moments survive the cubature,
+only admitted `q`-linear CT/TC structure is generated from it. It is also
+**optional**: an absent `static_gauge_hall_file` means `σ_H = 0`, announced
+with its reason, which by §4.4 is the exact answer for the systems this mode
+admits; a present but mismatched artifact still refuses in the loader, so a
+stale file cannot degrade the run silently. The sign is the live band
+orientation's: the persisted `σ_H` is the occupied-bra Berry sum while the
+live Adler–Wiser response is energy-ordered (`P = −ΔD`), which is the minus
+above (`lane/bisp-b-one-packed-mode-2026-09-01@cacc4e07`, from lane A's
+register row; the oracle is
+`tests/test_qsgw_parallel_transport_head.py::test_raw_hall_matches_orbital_cB_owner_and_documented_sign`).
+Only the nine monomial moments survive the cubature,
 
 $$
 M_{uv}=\left\langle b_u(\mathbf q)\,W_h(\mathbf q)\,b_v(\mathbf q)\right\rangle_{mBZ},
@@ -310,16 +324,20 @@ sector sum closes on the sixteen-block total.
 
 ### 4.3 What the mode contains, by declaration
 
-`gw.static_gauge_response.CHARGE_HALL_CUBATURE_AVAILABILITY` is the
-complete list. Present: charge `S^{00}` (`cc_q2`), Hall `ct_q1`/`tc_q1`, and
+The **module docstring of `gw.static_gauge_response`** is the complete list
+(it replaced the `CHARGE_HALL_CUBATURE_AVAILABILITY` availability grammar,
+which is deleted). Present: charge `S^{00}` (`cc_q2`), Hall `ct_q1`/`tc_q1`, and
 the charge wings `y_charge`/`z_charge`. Omitted by model: the current
 quadratic response `tt_q2`, the mixed quadratic response `ct_q2`/`tc_q2`,
 the current wings, the diamagnetic/contact terms `contact_q0`/`contact_q2`,
 and the negative-energy (complement-space) closure. `tt_q0` (the uniform
 static current response) is zero by gauge invariance for an insulator and is
-omitted rather than computed. The full-static-gauge response that would
-carry all of these (`StaticGaugeHeadResponse`) has a schema and loader but no
-producer, and the driver refuses it.
+omitted rather than computed. They are never stored as accidental zeros of a
+larger schema: `S_direct` has charge support only. The full-static-gauge
+response that would carry all of these (`StaticGaugeHeadResponse`, its v2
+head schema and loader, and both of the refusals that guarded it) had no
+producer and **is deleted**
+(`lane/bisp-b-one-packed-mode-2026-09-01@cff884e7`).
 
 ### 4.4 The Hall coefficient is a topological invariant
 
@@ -338,9 +356,10 @@ The producer computes exactly this occupied Berry-curvature sum
 
 * For a Chern-trivial insulator, `σ_H = 0` exactly in the complete-basis,
   converged-`k` limit. Whatever the producer returns is a band-truncation and
-  `k`-sampling residue, and the CT/TC Γ-cell physics of `charge_hall_cubature`
-  is empty: the mode reduces to the charge-only head of §3 (with the Γ wings
-  carried, §3.1) at the cost of the full packed body.
+  `k`-sampling residue, and the CT/TC Γ-cell physics of the packed head is
+  empty: the head reduces to the charge-only head of §3 (with the Γ wings
+  carried, §3.1). This is why an absent `static_gauge_hall_file` defaulting
+  to `σ_H = 0` is a correct default and not a silent omission.
 * For a Chern insulator, `σ_H` is an integer times
   `α_{FS}C_s/(8\pi L_z)` in the code's units (`L_z` the periodic cell height),
   known before the calculation.
@@ -388,17 +407,28 @@ former.
 
 ### 4.5 Open items on this route
 
-> **Implementation status (2026-09-01, in flight).** The wing sign is
-> `lane/bisp-a-fix-deltas-2026-09-01`; the `bare_transverse` transverse
-> Hartree is `lane/bisp-c-bare-as-packed-2026-09-01`.
+> **Implementation status (2026-09-01).** Both items below are closed; the
+> section is kept because neither fix is on `origin/main` yet.
 
-* The interband Γ wings use `+F\,\overline{P}\,b/(z²−Δ²)` where the shared
-  head convention `P = −ΔD` implies a minus sign; a common sign flip cancels
-  in `Y W Z` (§3) but not in the single-wing moments `M_{0a}`, `M_{a0}` here
-  (sandbox `KNOWN_LORRAX_ISSUES.md`, `qsgw_head` wing-sign row).
-* The transverse current Hartree term is computed only on the packed
-  routes; `bare_transverse` omits it (sandbox register, `sigma_dispatch`
-  row).
+* **Interband Γ wing sign — fixed, on a branch.** Both wing kernels built the
+  mixed head/body interband weight as `+F\,\overline{P}\,b/(z²−Δ²)`, while the
+  shared head convention `P = −ΔD` implies a minus: the wing replaces one
+  density-jet leg by the energy-scaled head vertex, and that substitution
+  carries a sign the kernels never applied. It cancels in the scalar Schur
+  fold `Y W Z` (§3) but not in the single-wing moments `M_{0a}`, `M_{a0}`
+  here — exactly the moments the packed head reads. Fixed on
+  `lane/bisp-a-fix-deltas-2026-09-01@60b7bbb7`, with both layouts routed
+  through one owner (`_head_wing_interband_weight`) so they cannot drift
+  apart again. Still open on `origin/main@8b6e3cc7`
+  (`qsgw_head.py:1525,1844`).
+* **The transverse current Hartree is on both routes** — the earlier
+  statement here, that it is computed only on the packed routes and omitted
+  by `bare_transverse`, was wrong. Its gate is
+  `include_transverse = bool(config.bispinor)` (`gw.sigma_dispatch:310`),
+  which is the master bispinor switch and not `bispinor_gw`, and the term is
+  added unconditionally wherever it was built (`:930,937`). Every bispinor
+  mode and every compute mode carries it unless `omit_v_h` (density
+  self-consistency, which rebuilds both fields itself).
 
 ## 5. Lineage: which branch holds which screened four-current solve
 
@@ -425,7 +455,7 @@ component dumps.
 | incarnation | where | what it solves | frequency | status |
 |---|---|---|---|---|
 | `src/gw/w_bispinor.py`: channel-blocked supermatrix `[C n_C \| T1 n_T \| T2 n_T \| T3 n_T]`, the scalar `solve_w` at size `n_C + 3n_T` | `origin/agent/bispinor-supermatrix-w` (2026-06-16/17), carried to `origin/agent/bispinor-ibz-lorentz-unfold` with an IBZ→full-BZ Lorentz unfold, Σ^B folded into the static QP Σ_xc, and a screened-versus-unscreened Breit comparison (`breit_comparison.dat`) | milestone A: charge χ⁰⁰ only (W^{ij} = bare); milestone B: six TT χ^{ij} plus the three charge–current cross χ^{0i} by folding `γ̃` into the conduction ket of the scalar χ⁰ kernel | ω = 0 only, inside the static-quadrature section; GN-PPM probe screening charge-only | never merged. Measured on FM CrI3 6×6 (640/200 centroids): deeper bands −17…−40 meV Breit, screened vs unscreened differ by < 10 μeV |
-| `src/gw/photon_layout.py` + `w_isdf.compute_static_photon_response` + `src/gw/photon_sigma.py`: mesh-interleaved direct sum, distributed Dyson, sixteen-block Σ | `origin/main` since the 2026-08-24/25 integration branches (`integ/full-screened-bispinor-2026-08-24`, `integ/full-bispinor-*`) | all sixteen no-pair `χ^{IJ}_0` blocks (`compute_no_pair_dirac_current_block`, TT Ward-subtracted) and the exact-slab Γ completion of §4 | ω = 0 only (`compute_mode = cohsex`) | on main as `full_static_cohsex` / `charge_hall_cubature` |
+| `src/gw/photon_layout.py` + `w_isdf.compute_static_photon_response` + `src/gw/photon_sigma.py`: mesh-interleaved direct sum, distributed Dyson, sixteen-block Σ | `origin/main` since the 2026-08-24/25 integration branches (`integ/full-screened-bispinor-2026-08-24`, `integ/full-bispinor-*`) | all sixteen no-pair `χ^{IJ}_0` blocks (`compute_no_pair_dirac_current_block`, TT Ward-subtracted) and the exact-slab Γ completion of §4 | ω = 0 only (`compute_mode = cohsex`) | on `origin/main@8b6e3cc7` as the two modes `full_static_cohsex` / `charge_hall_cubature`; collapsed to the single `full_static_cohsex` on `lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2` |
 
 What is on `origin/main` (2026-08-26 and 2026-08-28 integrations), judged
 by content rather than commit ancestry: the packed layout, the sixteen-block
@@ -440,10 +470,12 @@ head (`gw.four_current_head.FrequencyResolvedFourCurrentHead`, holding
 `Q0_direct`, `H_linear`, `S_direct` per stored ω, with an immutable writer
 that refuses dynamic rows "until Q0/H/S share one causal response kernel";
 its only producer call passes `(0.0+0.0j,)`), the normalized retained
-static-response producer with the mixed CT response, the Hall CT sign
-reconciliation across band orientations, the Adler–Wiser interband wing-sign
-fix (§4.5's first item), the separated q→0 wing face endpoints, and the
-completion-receipt persistence. Its mode envelope is still `cohsex`-only.
+static-response producer with the mixed CT response, the separated q→0 wing
+face endpoints, and the completion-receipt persistence. Two items that were
+on that list have since been taken from it: the Hall CT sign reconciliation
+(`lane/bisp-b-one-packed-mode-2026-09-01@cacc4e07`) and the Adler–Wiser
+interband wing-sign fix (`lane/bisp-a-fix-deltas-2026-09-01@60b7bbb7`,
+§4.5). Its mode envelope is still `cohsex`-only.
 
 The two 2026-08-22 design audits that preceded the second incarnation
 (sandbox `RUNS_INFLIGHT.md` rows "codex-full-screened-bispinor-gw-audit"
@@ -479,7 +511,7 @@ transverse screening".
 | packed layout and rank-4 updates | `src/gw/photon_layout.py` |
 | packed body response and Dyson | `src/gw/w_isdf.py` (`compute_static_photon_response`) |
 | sixteen-block `Σ` | `src/gw/photon_sigma.py` |
-| bounded charge+Hall response record and availability grammar | `src/gw/static_gauge_response.py` |
+| bounded packed-head response record (`StaticPhotonHeadResponse`; Hall optional), and the by-declaration content list | `src/gw/static_gauge_response.py` (the module docstring) |
 | Hall artifact schema | `src/file_io/static_gauge_head.py` |
 | four-current carrier resolution (`bispinor_gw` models) | `src/common/four_current_model.py` |
 | head-source frequency plan (GN/HL/MPA) | `src/gw/ppm_pipeline.py`, `src/gw/screening.py` |

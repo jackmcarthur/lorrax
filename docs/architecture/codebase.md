@@ -55,7 +55,7 @@ src/
 │   ├── sigma_x_bispinor.py    Σ^B, bare transverse (Breit) exchange from the TT tiles
 │   ├── photon_layout.py       the one C⊕T1⊕T2⊕T3 packing / block view of a four-current operator
 │   ├── photon_sigma.py        sixteen-block static Σ from the packed screened photon propagator
-│   ├── static_gauge_response.py  charge+Hall cubature inputs and the availability grammar (what the mode omits by model)
+│   ├── static_gauge_response.py  bounded packed-head response (`StaticPhotonHeadResponse`); its docstring is the by-declaration content list
 │   ├── qsgw_head.py           covariant velocity, Cartesian S tensor, head wings, raw Hall pseudovector
 │   ├── w_av.py                finite-q W-av stencil primitives (rotate one source-q row; Adler-Wiser head)
 │   ├── downfold.py            transfer solve, orbit-floored selection, child unfold tables
@@ -121,7 +121,7 @@ src/
 │   ├── centroids.py           centroid file loader
 │   ├── paths.py               path resolution helpers
 │   ├── read_bgw_vcoul.py      BGW vcoul table reader (diagnostic override)
-│   ├── static_gauge_head.py   sole format owner of `StaticGaugeHeadResponse` / `static_gauge_hall.h5`
+│   ├── static_gauge_head.py   sole format owner of the Hall artifact `static_gauge_hall.h5`
 │   └── slab_io.py             SlabIO: one sharded MPI-IO transport
 │       _slab_io_ffi.py          collective parallel-HDF5 implementation
 │       _slab_io_serial.py       serial tier for the emulated mesh (P=1, D>1, CPU)
