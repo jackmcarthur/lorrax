@@ -425,6 +425,7 @@ def report_hermitian_residual(
     detail: str = "",
     always: bool = False,
     cause: str | None = None,
+    measurement: bool = False,
 ) -> bool:
     """Verdict + message for a Hermiticity residual already reduced to scalars.
 
@@ -456,17 +457,57 @@ def report_hermitian_residual(
     property of the screened-Coulomb tile W.  A caller that has done that
     work should be able to say so in the message instead of pointing every
     future reader at a collective bug that was ruled out.
+
+    ``measurement=True`` says the residual is a QUANTITY THIS RUN IS
+    MEASURING, not an invariant it is asserting, and it requires ``cause``.
+    The line is then printed with its value on EVERY call — pass or fail —
+    and the verdict is ``True`` whatever the tolerance says.  It exists for
+    the caller whose property is conditional on the physics of the deck in
+    hand rather than on the arithmetic: ``gw/screening._gate_w`` at
+    ``ω = iω_p`` on a deck whose measured time-reversal verdict is false,
+    where an anti-Hermitian part of ``W`` is the TR-odd response and not an
+    index fault.  Reporting it as a defect there would refuse correct
+    physics under ``LORRAX_SANITY=strict``; reporting NOTHING would be
+    worse still, because a gate that says nothing looks the same whether it
+    found nothing or checked nothing — hence "always print the number".
+
+    Two things keep this from being an off-switch.  ``cause`` is MANDATORY,
+    so an unexplained residual can never be waved through as expected; and
+    a NON-FINITE residual stays a defect in this mode too, because a NaN is
+    never the physics anybody meant to measure.
     """
     if not (always or sanity_enabled()):
         return True
     dev = float(dev)
     scale = float(scale)
     suffix = f"  {detail}" if detail else ""
+    if measurement and cause is None:
+        raise ValueError(
+            "GATE hermitian_measurement_needs_cause: a Hermiticity residual "
+            "may not be reported as an expected measurement without naming "
+            "what produces it.\n"
+            f"  got:  report_hermitian_residual({name!r}, measurement=True) "
+            "with cause=None\n"
+            "  want: cause=<the physical component this residual is>\n"
+            "  fix:  pass the cause, or drop measurement=True and let the "
+            "residual be judged as a defect\n"
+            "  why:  'expected' without a stated reason is how a live gate "
+            "becomes a gate that cannot fail\n"
+            "  doc:  docs/dev/QUALITY_PATTERNS.md")
     if not np.isfinite(dev) or not np.isfinite(scale):
+        # A defect in EVERY mode, ``measurement`` included: no physics is
+        # expected to come out NaN, so this is the branch that keeps the
+        # measurement path falsifiable.
         warn(f"{name} hermiticity residual is not finite "
              f"(max|A-Aᴴ|={dev}, max|A|={scale}).{suffix}", print_fn=print_fn)
         return False
     rel = dev / scale if scale > 0.0 else dev
+    if measurement:
+        print_fn(f"  sanity[{name}]: hermiticity residual = {rel:.3e} "
+                 f"(abs {dev:.3e}, scale {scale:.3e}) -- MEASURED, not "
+                 f"gated (tol {float(rtol):.1e} would have applied).  "
+                 f"{cause}{suffix}")
+        return True
     if verbose:
         print_fn(f"  sanity[{name}]: hermiticity residual = {rel:.3e} "
                  f"(abs {dev:.3e}, scale {scale:.3e})")
@@ -492,6 +533,8 @@ def check_hermitian(
     rtol: float = 1e-8,
     verbose: bool = False,
     always: bool = False,
+    cause: str | None = None,
+    measurement: bool = False,
 ) -> bool:
     """Hermiticity residual on a ``(..., μ, μ)`` tile, at construction.
 
@@ -508,6 +551,14 @@ def check_hermitian(
     ``always=True`` performs the shared reduction even when ``LORRAX_SANITY``
     is off; callers that make the boolean a hard stage invariant use this
     instead of growing a second Hermiticity implementation.
+
+    ``cause`` and ``measurement`` are passed straight through to
+    :func:`report_hermitian_residual` and are documented there.  They are
+    forwarded rather than duplicated so that a caller whose tile is only
+    CONDITIONALLY Hermitian keeps this function's one reduction — the
+    sharding note below is the reason a second implementation is not an
+    option — and differs from the construction-site callers in the verdict
+    only.
     """
     if not (always or sanity_enabled()):
         return True
@@ -538,7 +589,7 @@ def check_hermitian(
         scale = float(np.max(np.abs(a)))
     return report_hermitian_residual(
         name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose,
-        always=always)
+        always=always, cause=cause, measurement=measurement)
 
 
 _NEGQ_STATS_CACHE: dict = {}
