@@ -1,3 +1,9 @@
+> **ARCHIVED 2026-09-01.** Session note for the landing of
+> `bispinor_tt_head_correction`. The physics and the current contract are
+> owned by `docs/theory/four-current-head-corrections.md` §2; the deck key
+> by `docs/input_reference.md`. The two `reports/…_2026-08-22` guides this
+> note cites are sandbox reports that do not ship with the repository.
+
 # Bispinor TT (transverse-transverse) q=Γ head/wing correction — design note
 
 Date: 2026-08-23

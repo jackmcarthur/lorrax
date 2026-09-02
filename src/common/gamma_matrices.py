@@ -1,12 +1,15 @@
-
-import jax
-import jax.numpy as jnp
-import numpy as _np
-
 """Dirac gamma matrices represented as JAX arrays.
 
 The matrices are provided in the standard Dirac representation
 and stored as ``jax.numpy`` arrays.
+
+CONVENTION.  The stored Lorentz vertices are ``gamma_tilde^mu = gamma^0 gamma^mu``,
+so ``gamma0`` is the 4x4 identity and ``gamma_i`` is the Dirac ``alpha^i``.
+Every channel density is written with ``psi^dagger`` (never ``psi-bar``):
+``rho^mu = psi^dagger gamma_tilde^mu psi`` -- charge for ``mu = 0``, the
+current ``psi^dagger alpha^i psi`` for ``mu = i``.  Physics owner:
+``docs/theory/four-current-head-corrections.md`` and
+``docs/BISPINOR_DHFB_DESIGN.md`` section 2.
 
 WHY THE LITERALS ARE BUILT THROUGH NUMPY.  Every constant below is a fixed
 4x4 (or 2x2) table, and this module is on the import path of every driver
@@ -28,6 +31,10 @@ So: build with numpy, hand to jax once.  Do not "simplify" these back into
 ``jnp.array([[...]])`` — the shorter spelling costs a third of a second on
 every driver that imports this file.
 """
+
+import jax
+import jax.numpy as jnp
+import numpy as _np
 
 def _t128(rows):
     """The HOST table.  Every constant in this module starts life here."""
