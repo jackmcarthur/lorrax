@@ -523,6 +523,7 @@ def compute_sigma_c_mpa_omega_grid(
                 f"  MPA windows [box]: "
                 f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
                 f"eps={geometry['eps']:.3g}, "
+                f"certificate={geometry['rule_eps']:.3g}, "
                 f"{geometry['n_windows']} logical windows, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "

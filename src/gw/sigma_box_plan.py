@@ -40,6 +40,12 @@ from minimax import (
 _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
+# A box certificate bounds one denominator kernel.  Sigma is a sum of the
+# independently certified state/pole products, so spending the entire deck
+# ceiling in every product does not deliver that ceiling after accumulation.
+# The fixed reserve is shared by every dynamic mode and is deliberately not a
+# dial: ``sigma_quadrature_eps`` remains the sole requested-accuracy setting.
+_ACCUMULATION_SAFETY = 0.1
 
 
 def resolve_sigma_box_cache_dir(setting, input_dir):
@@ -536,9 +542,10 @@ def plan_sigma_windows(
         Positive retarded broadening in Ry.  It enters both the box's
         imaginary extent and, exactly once, the executor weights.
     eps
-        Per-window uniform sup tolerance.  The rule builder uses relative
-        error on sign-definite boxes and peak-relative error on crossing
-        boxes; this matches the measured Sigma error currency.
+        Requested per-window uniform sup ceiling.  The rule builder certifies
+        at one tenth of this ceiling to reserve accumulation headroom.  It
+        uses relative error on sign-definite boxes and peak-relative error on
+        crossing boxes; this matches the measured Sigma error currency.
     reduction_seconds
         Per-window Gauss-reduction wall budget.  Independent windows are
         assigned round-robin across processes.
@@ -570,12 +577,13 @@ def plan_sigma_windows(
       do not drift; measured 3% all-edge widening added 67 pairs on Na.
     """
     started = time.perf_counter()
-    eta, tolerance = float(eta_ry), float(eps)
+    eta, requested_tolerance = float(eta_ry), float(eps)
+    tolerance = _ACCUMULATION_SAFETY * requested_tolerance
     budget, ceiling = float(reduction_seconds), int(pair_ceiling)
     edge = float(edge_factor)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("sigma_quadrature requires eta_ry > 0")
-    if not 0.0 < tolerance < 1.0:
+    if not 0.0 < requested_tolerance < 1.0:
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     if not np.isfinite(budget) or budget <= 0.0:
         raise ValueError("sigma_quadrature_reduction_seconds must be > 0")
@@ -681,6 +689,7 @@ def plan_sigma_windows(
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
             "sup_error": fit["sup_error"], "eps": tolerance,
+            "requested_eps": requested_tolerance,
             "kappa_max": fit["kappa_max"],
             "roundoff_amplification": fit["roundoff_amplification"],
             "runtime_noise_bound": fit["noise_bound"],
@@ -701,7 +710,8 @@ def plan_sigma_windows(
     }) for report in branch_reports)
     geometry.update({
         "planner": "uniform_denominator_boxes",
-        "eta_ry": eta, "eps": tolerance,
+        "eta_ry": eta, "eps": requested_tolerance,
+        "rule_eps": tolerance,
         "reduction_seconds": budget, "cache_dir": cache_dir,
         "pair_ceiling": ceiling, "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,

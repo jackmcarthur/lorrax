@@ -66,7 +66,11 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
         "positive conduction:pole_tail",
     ]
     assert geometry["window_tau_pairs"] == 6
+    assert geometry["eps"] == 1.0e-4
+    assert geometry["rule_eps"] == 1.0e-5
     report = geometry["branches"][0]["windows"]
+    assert all(row["requested_eps"] == 1.0e-4 for row in report)
+    assert all(row["eps"] == 1.0e-5 for row in report)
     np.testing.assert_allclose(
         report[0]["box_ry"], [-0.206, 0.106, 0.15, 0.15])
     np.testing.assert_allclose(
