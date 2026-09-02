@@ -34,6 +34,11 @@ restart = false
 head_correction = full
 """
 
+#: The same deck WITHOUT the backend key, i.e. at the shipping default
+#: ``w_dyson_solver = auto``.
+_PACKED_BARE_AUTO_SOLVER = _PACKED_BARE.replace(
+    "w_dyson_solver = distributed\n", "")
+
 _PPM_KEYS = """\
 use_ppm_sigma = true
 ppm_omega_p = 2.0
@@ -124,6 +129,32 @@ def test_the_hand_tt_overlay_is_refused_on_the_dynamic_packed_route(tmp_path):
     message = str(exc.value)
     assert "packed_bare_transverse_tt_head_double_count" in message
     assert "gn_ppm" in message
+
+
+def test_the_route_is_not_taken_when_its_dyson_solver_would_refuse(tmp_path):
+    """A route predicate must not claim a deck its screening owner refuses.
+
+    ``w_isdf.compute_static_photon_response``'s first statement refuses
+    anything but ``dyson_solver = 'distributed'`` (the packed solve has no
+    local plan, and ``distrib_la`` additionally needs a true 2-D mesh).  The
+    ``full_static_cohsex`` envelope has always required the key; the bare
+    route's predicate did not, so a deck at the shipping default
+    ``auto`` -- which resolves to ``local`` on a small system -- was routed
+    to the packed operator and then died inside it.  Unreachable while only
+    ``cohsex`` decks took this route; reachable the moment the plasmon-pole
+    pair joined ``PACKED_PHOTON_COMPUTE_MODES``.
+    """
+    from gw.gw_config import (packed_bare_transverse_route,
+                              uses_dynamic_packed_photon_route,
+                              uses_static_photon_response)
+    cfg = _config(
+        tmp_path, _PACKED_BARE_AUTO_SOLVER + _PPM_KEYS + "compute_mode = gn_ppm\n",
+        name="gnppm_auto_solver.in")
+    taken, reason = packed_bare_transverse_route(cfg)
+    assert not taken
+    assert "w_dyson_solver" in reason, reason
+    assert not uses_static_photon_response(cfg)
+    assert not uses_dynamic_packed_photon_route(cfg)
 
 
 # ---------------------------------------------------------------------------

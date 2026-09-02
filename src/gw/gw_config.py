@@ -3633,6 +3633,22 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
          f"head_correction = {config.head.correction.value}",
          "head_correction = full (the default) or off"),
         (not bool(config.restart), "restart = true", "restart = false"),
+        # THE SCREENING OWNER REFUSES ANYTHING ELSE, so the route predicate
+        # must not claim the deck.  compute_static_photon_response's first
+        # statement is `dyson_solver != 'distributed' -> ValueError`, and the
+        # full_static_cohsex envelope has always required this key; the bare
+        # route's predicate did not, so a deck at the DEFAULT
+        # `w_dyson_solver = auto` (which resolves to `local` on a small
+        # system) was routed to the packed operator and then died inside it.
+        # Unreachable while only `compute_mode = cohsex` decks took this
+        # route -- every one of those sets the key -- and reachable the
+        # moment the plasmon-pole pair joined PACKED_PHOTON_COMPUTE_MODES:
+        # tests/regression/bispinor_debug is exactly such a deck.
+        (str(config.backend.w_dyson_solver) == "distributed",
+         f"w_dyson_solver = {config.backend.w_dyson_solver}",
+         "w_dyson_solver = distributed (the packed Dyson solve has no "
+         "local plan; the default 'auto' resolves to 'local' on a small "
+         "system)"),
     )
     for accepted, got, want in conditions:
         if not accepted:
