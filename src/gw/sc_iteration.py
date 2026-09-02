@@ -3745,7 +3745,11 @@ def _write_sc_eqp_snapshot(
     partition = _state_partition(state_out, inputs)
     protected = np.asarray(partition.protected_mask, dtype=bool)
     in_range = np.asarray(partition.in_range_mask, dtype=bool)
-    _record_sc(inputs, f"  SC map energies: {path}; Z factors: {z_path}")
+    # Keep the established map-artifact line schema intact: the canonical
+    # convergence parser keys the following verdict to this exact line.  Z is
+    # a sibling artifact, not a suffix that makes the map line unparsable.
+    _record_sc(inputs, f"  SC map energies: {path}")
+    _record_sc(inputs, f"  SC map Z factors: {z_path}")
     _record_sc(
         inputs,
         f"    SC iteration: call={int(call_index):04d} role={role} "
