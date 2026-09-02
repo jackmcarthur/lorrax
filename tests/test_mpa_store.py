@@ -262,6 +262,86 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
         "open", "create", "close", "open", "write", "close"]
 
 
+def test_complete_pole_writer_preserves_2d_sharding_and_finalizes(
+        tmpdir_path, monkeypatch):
+    """An algebraic pole model enters the ordinary MPA store unchanged."""
+    import common.collectives as collectives
+    import file_io.slab_io as slab_io
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    calls = []
+
+    class RecordingSlabIO(HostSlabIO):
+        def __init__(self, path, *, mode, mesh):
+            calls.append(("open", mode))
+            super().__init__(path, mode=mode, mesh=mesh)
+
+        def write_slab(self, name, value, **kw):
+            calls.append(("write", name, value.sharding.spec))
+            super().write_slab(name, value, **kw)
+
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
+    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+
+    mesh = _mesh()
+    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    # The final row/column are device-count-dependent pad and must not land.
+    shape = (1, 2, 4, 4)
+    Omega = np.full(shape, 0.8, dtype=np.float64)
+    B = np.arange(np.prod(shape), dtype=np.float64).reshape(shape) / 100.0
+    Omega[..., -1, :] = 0.0
+    Omega[..., :, -1] = 0.0
+    B[..., -1, :] = 0.0
+    B[..., :, -1] = 0.0
+    ledger = MS.write_complete_pole_store_collective(
+        tmpdir_path,
+        jax.device_put(Omega, sharding),
+        jax.device_put(B.astype(np.complex128), sharding),
+        mesh_xy=mesh,
+        n_mu_logical=3,
+        energy_unit="Ry",
+        provenance={"fit_protocol": "synthetic_algebraic",
+                    "screening_diagrams": "rpa"},
+        certification={"condition_max_allowed": 1.0,
+                       "backward_error_max_allowed": 1.0},
+    )
+
+    assert ledger["complete"] and ledger["n_p"] == 1
+    assert ledger["n_done"] == ledger["n_total"] == 6
+    assert ledger["condition_max"] == ledger["backward_error_max"] == 0.0
+    assert ledger["provenance"]["fit_protocol"] == "synthetic_algebraic"
+    got_Omega, got_B = MS.read_poles(tmpdir_path)
+    np.testing.assert_array_equal(got_Omega, Omega[..., :3, :3])
+    np.testing.assert_array_equal(got_B, B[..., :3, :3])
+    writes = [row for row in calls if row[0] == "write"]
+    assert [row[1] for row in writes] == ["Omega_p", "B_p"]
+    assert all(row[2] == P(None, None, "x", "y") for row in writes)
+
+
+def test_complete_pole_writer_refuses_noncausal_live_poles(
+        tmpdir_path, monkeypatch):
+    """A dormant zero pole is legal; the same pole with residue is not."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    mesh = _mesh()
+    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    Omega = jax.device_put(
+        np.asarray([[[[0.0 + 0.0j, 0.7 + 0.1j],
+                      [0.9 + 0.0j, 1.1 + 0.0j]]]]), sharding)
+    B = jax.device_put(
+        np.asarray([[[[0.0 + 0.0j, 0.2 + 0.0j],
+                      [0.3 + 0.0j, 0.4 + 0.0j]]]]), sharding)
+    with pytest.raises(ValueError, match="1 live poles.*Im Omega > 0"):
+        MS.write_complete_pole_store_collective(
+            tmpdir_path, Omega, B, mesh_xy=mesh, n_mu_logical=2,
+            energy_unit="Ry", provenance={"fit_protocol": "bad"},
+            certification={"condition_max_allowed": 1.0,
+                           "backward_error_max_allowed": 1.0})
+
+
 def test_the_collective_w_writers_answer_the_same_on_every_rank(
         tmpdir_path, monkeypatch):
     """RED: a collective whose RETURN TYPE depends on the rank is a trap.
