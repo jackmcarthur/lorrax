@@ -20,8 +20,7 @@ from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_box_plan import plan_sigma_windows
 from gw.sigma_plan import resolve_sigma_plan
-from gw.wavefunction_bundle import (face_kernel_kwargs,
-                                    projected_state_amplitude_envelope)
+from gw.wavefunction_bundle import face_kernel_kwargs
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             CROSSING_NODE_FLOOR,
@@ -391,10 +390,9 @@ def compute_sigma_c_mpa_omega_grid(
     and the window build on one support.
 
     Pole tensors are read collectively in their native sharding.  The box
-    planner retains exact live extrema and selector-wise residue histograms;
-    the pane control consumes only the bounded extrema census.  The spatial
-    executor then rereads and releases the pole ranges through one shared tau
-    kernel.
+    planner retains only exact live extrema from each configured pole batch;
+    the pane control consumes the same bounded census.  The spatial executor
+    then rereads and releases the pole ranges through one shared tau kernel.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
@@ -415,25 +413,23 @@ def compute_sigma_c_mpa_omega_grid(
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
     with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
-        def pole_batches():
-            for lo in range(0, n_poles, int(pole_batch_size)):
-                hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
-                    slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
-                yield lo, Omega, B
-                del Omega, B
-                gc.collect()
-
+        # One bounded extrema census serves both routes.  In particular, the
+        # production route does not read residues into a host histogram and
+        # never constructs a sampled state-pole lattice.
+        summaries = []
+        for lo in range(0, n_poles, int(pole_batch_size)):
+            hi = min(lo + int(pole_batch_size), n_poles)
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True,
+                to_unit="Ry")
+            summaries.extend(summarize_sigma_poles(
+                Omega, B, branches,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor, pole_offset=lo,
+                occupation_window_threshold=occupation_window_threshold))
+            del Omega, B
+            gc.collect()
         if plan_mode == "panes":
-            summaries = []
-            for lo, Omega, B in pole_batches():
-                summaries.extend(summarize_sigma_poles(
-                    Omega, B, branches,
-                    regularization_width_ry=regularization_width_ry,
-                    edge_factor=edge_factor, pole_offset=lo,
-                    occupation_window_threshold=(
-                        occupation_window_threshold)))
             plan, geometry = build_shared_sigma_windows(
                 summaries, branches,
                 regularization_width_ry=regularization_width_ry,
@@ -445,27 +441,21 @@ def compute_sigma_c_mpa_omega_grid(
                 omega_grid_step_ry=omega_grid_step_ry,
                 occupation_window_threshold=occupation_window_threshold)
         else:
-            state_amplitude = projected_state_amplitude_envelope(
-                wfns, state_bands=wfns.slices.sigma_sum,
-                projection_bands=wfns.slices.sigma)
             plan, geometry = plan_sigma_windows(
-                pole_batches, branches, omega_grid_ry,
+                summaries, branches, omega_grid_ry,
                 regularization_width_ry,
                 eps=quadrature_eps,
                 reduction_seconds=quadrature_reduction_seconds,
                 pair_ceiling=pair_ceiling,
                 cache_dir=quadrature_cache_dir,
-                print_fn=print_fn, edge_factor=edge_factor,
-                occupation_window_threshold=occupation_window_threshold,
-                state_amplitudes_by_branch=(
-                    [state_amplitude] * len(branches)))
+                print_fn=print_fn, edge_factor=edge_factor)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
                 f"{geometry['n_windows']} logical windows")
         else:
             print_fn(
-                f"  MPA windows [per-state-bound crossing profile]: "
+                f"  MPA windows [box]: "
                 f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
                 f"eps={geometry['eps']:.3g}, "
                 f"{geometry['n_windows']} logical windows, "
@@ -479,8 +469,6 @@ def compute_sigma_c_mpa_omega_grid(
                         f"box={tuple(window['box_ry'])} Ry, "
                         f"sup={window['sup_error']:.6g}/"
                         f"{window['eps']:.6g} ({window['criterion']}), "
-                        f"uniform_recheck="
-                        f"{window['uniform_recheck_sup_error']:.6g}, "
                         f"kappa_p99={window['kappa_p99']:.6g}, "
                         f"kappa_max={window['kappa_max']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"

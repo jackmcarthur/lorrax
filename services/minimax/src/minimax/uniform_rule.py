@@ -1,4 +1,4 @@
-"""Generalized-Gauss time rules for ``1/d`` on a box.
+"""Measure-independent generalized-Gauss time rules for ``1/d`` on a box.
 
 One rule per product window.  The only inputs are the window's support box
 ``[re_lo, re_hi] x [im_lo, im_hi]`` in the denominator ``d = omega - z``
@@ -9,15 +9,10 @@ states at ``|d| ~ 200 eta`` included), the error relative to the ``1/eta``
 peak, ``eta |Q - 1/d|``, on a crossing box (where ``1/d`` is bounded only by
 the peak and a relative bound at the edges would cost +50 % nodes for no
 delivered gain).  See ``build_uniform_rule``.
-By default nothing about the spectral measure enters: the same box gives the
-same rule on every deck, which is what makes the result reproducible and
-cacheable.  A caller may instead pass a normalized ``rho(d)`` profile.  It
-then replaces only the acceptance currency; the box, ray construction,
-finer-cloud acceptance, cancellation gate, and reduction algorithm stay the
-same.  The profile owner is responsible for its physical normalization and
-cache identity.  In particular, a summed-state histogram is not a valid
-profile: that was the campaign failure mode that missed a low-mass state at
-E_F.
+Nothing about the spectral measure enters: the same box gives the same rule
+on every deck, which is what makes the result reproducible and cacheable
+(rules are keyed by ``(box, eps)``) and what removed the campaign's failure
+mode of histogram-weighted fits that missed a low-mass state at E_F.
 
 The identity being discretised is ``1/d = -i int_0^inf exp(i t d) dt``
 (``Im d > 0``), so ``sum_k w_k exp(i t_k d)`` with the time nodes ``t_k`` is
@@ -1031,19 +1026,15 @@ class UniformRule:
     sup_error: float
     kappa_max: float
     seconds: float
-    profiled: bool = False
 
     @property
     def node_count(self) -> int:
         return int(self.times.size)
 
     def one_line(self) -> str:
-        currency = ('profiled-relative' if self.relative else
-                    'profiled-peak-relative') if self.profiled else (
-                        'relative' if self.relative else 'peak-relative')
         return (f"uniform box rule: {self.node_count} nodes, ray {self.theta_deg:.0f} deg, "
                 f"rank {self.rank}, sup {self.sup_error:.2e} (eps {self.eps:g}, "
-                f"{currency}), "
+                f"{'relative' if self.relative else 'peak-relative'}), "
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
 
 
@@ -1071,7 +1062,7 @@ def _select_backend(backend, n_start, cloud_size):
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
                        reduce=True, time_budget=None, relative=None,
-                       backend=None, rho=None):
+                       backend=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
 
@@ -1091,15 +1082,6 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     far edges by ``|d|/eta`` (up to 40x) for terms whose size the peak
     already dominates: measured +50 % nodes on the Na conduction crossing
     box (76 -> 115) for no delivered-error gain.
-
-    ``rho`` may be a callable ``rho(d: complex ndarray) -> nonnegative
-    ndarray`` defining a problem-specific acceptance currency.  Its return
-    must have ``d.shape``, contain at least one positive value, and already be
-    normalized so that ``max rho(d) |Q(d)-1/d| <= eps`` has the intended
-    meaning.  The callable is evaluated independently on the fit and finer
-    check clouds.  When ``relative`` is true, the fit-only log-density factor
-    is still applied on top of ``rho``; it never enters acceptance.  Omitting
-    ``rho`` takes the historical path exactly.
 
     ``im_cap`` bounds ``|Im t| * (box half-width)`` so no family member grows
     by more than ``exp(im_cap)`` off the ray (and never more than ``0.3 S``
@@ -1129,33 +1111,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     t0 = time.perf_counter()
     if relative is None:
         relative = re_lo > 0.0 or re_hi < 0.0
-    profiled = rho is not None
-
-    def _profile_values(x):
-        values = np.asarray(rho(x), dtype=np.float64)
-        if values.shape != x.shape:
-            raise ValueError(
-                "rho(d) must return one value per denominator: "
-                f"got {values.shape}, want {x.shape}")
-        if (not np.all(np.isfinite(values)) or np.any(values < 0.0)
-                or not np.any(values > 0.0)):
-            raise ValueError(
-                "rho(d) must be finite, nonnegative, and positive somewhere")
-        return values
-
     # rho_of: the acceptance currency (sup); fit_of: the same currency with
-    # the cloud's log-density folded in, for the basis and least squares.
-    # Keep the rho=None lambdas textually and arithmetically unchanged: this
-    # is the production box-rule path whose default must stay identical.
-    if profiled:
-        rho_of = _profile_values
-        fit_of = ((lambda x: rho_of(x) * _log_density_weights(x))
-                  if relative else rho_of)
-    else:
-        rho_of = ((lambda x: np.abs(x)) if relative
-                  else (lambda x: np.full(x.size, im_lo)))
-        fit_of = ((lambda x: np.abs(x) * _log_density_weights(x))
-                  if relative else rho_of)
+    # the cloud's log-density folded in, for the basis and the least squares
+    rho_of = (lambda x: np.abs(x)) if relative else (lambda x: np.full(x.size, im_lo))
+    fit_of = ((lambda x: np.abs(x) * _log_density_weights(x)) if relative
+              else rho_of)
     d = box_samples(re_lo, re_hi, im_lo, im_hi)
     _r0, theta, S, _rate = _choose_angle(d, eps, fit_of(d))
     n_im = _im_levels(theta)
@@ -1169,8 +1129,8 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     # the failures were all rotated-ray boxes whose rule was exact at the
     # sampled Im levels and off between them.
     d_check = box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=8.0, n_im=2 * n_im)
-    rho_fit, rho_check = fit_of(d), rho_of(d_check)
-    fam = _RayFamily(d, theta, S, eps / trunc, rho_fit)
+    rho, rho_check = fit_of(d), rho_of(d_check)
+    fam = _RayFamily(d, theta, S, eps / trunc, rho)
     s, w = fam.interpolatory()
     if reduce:
         Bp = max(re_hi, 1e-3 * im_lo)
@@ -1190,20 +1150,15 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         red = None
         for extra in (1.0, 10.0, 100.0):
             if extra > 1.0:
-                fam = _RayFamily(
-                    d, theta, S, eps / (trunc * extra), rho_fit)
+                fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
                 s, w = fam.interpolatory()
             # the cloud solver works in the executor's convention t = phase*s
             # with weights -i*phase*w: the sup test uses exactly that map
             if _select_backend(backend, w.size, d.size) == "jax":
                 fit = _JaxCloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w,
-                                   rho=rho_fit,
-                                   check_cloud=(d_check, rho_check, eps,
-                                                kappa_cap))
+                                   rho=rho, check_cloud=(d_check, rho_check, eps, kappa_cap))
             else:
-                fit = _CloudFit(
-                    d, fam.phase, S, im_lo_s, im_hi_s, eps,
-                    w_ref=w, rho=rho_fit)
+                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
             red = fit.reduce(s, ok, deadline)       # start acceptance ignores the deadline
             if red is not None:
                 break
@@ -1219,7 +1174,7 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         times=times, weights=weights, box=(re_lo, re_hi, im_lo, im_hi),
         eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),
         rank=int(fam.r), sup_error=sup, kappa_max=kappa,
-        seconds=time.perf_counter() - t0, profiled=profiled)
+        seconds=time.perf_counter() - t0)
 
 
 def _score_cloud(fit, s, w, d, rho):
