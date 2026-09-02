@@ -161,7 +161,7 @@ def test_exact_origin_radial_moment_and_contact_action():
         rab=np.full_like(r, dr), vloc_r=np.zeros_like(r),
         rho_core_r=np.zeros_like(r), has_nlcc=False, n_proj=1,
         beta_r=beta_over_r, proj_l=np.asarray([0]),
-        proj_j=np.asarray([0.5]), dij=np.ones((1, 1)), nspinor=1)
+        dij=np.ones((1, 1)))
     tables = radial_tables.build_all_tables(
         [species], q_max=0.1, n_q=3, second_derivatives=True)
     sw = np.ones_like(r)
@@ -385,7 +385,7 @@ def test_icl_q2_physical_radial_third_derivative_and_operator_jet():
         rab=np.full_like(r, dr), vloc_r=np.zeros_like(r),
         rho_core_r=np.zeros_like(r), has_nlcc=False, n_proj=1,
         beta_r=beta_over_r, proj_l=np.asarray([0]),
-        proj_j=np.asarray([0.5]), dij=np.ones((1, 1)), nspinor=1)
+        dij=np.ones((1, 1)))
     tables = radial_tables.build_all_tables(
         [species], q_max=0.6, n_q=61,
         second_derivatives=True, third_derivatives=True)
