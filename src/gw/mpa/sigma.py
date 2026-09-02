@@ -466,6 +466,7 @@ def compute_sigma_c_mpa_omega_grid(
                 for window in branch["windows"]:
                     print_fn(
                         f"    {window['name']}: n_tau={window['node_count']}, "
+                        f"box={tuple(window['box_ry'])} Ry, "
                         f"sup={window['sup_error']:.6g}/"
                         f"{window['eps']:.6g} ({window['criterion']}), "
                         f"kappa_max={window['kappa_max']:.6g}, "
