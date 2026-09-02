@@ -209,6 +209,13 @@ _FREQUENCY_FIT_NAMES = (
     "DampedReciprocalFit", "fit_damped_reciprocal",
 )
 
+# Uniform denominator-box rules are a production service surface.  Keep the
+# numerical module lazy, like every other SciPy-backed builder below, so a
+# catalog-only import still pays no solver dependency.
+_UNIFORM_RULE_NAMES = (
+    "UniformRule", "box_samples", "build_uniform_rule",
+    "rule_amplification_p99", "rule_sup_error")
+
 # Delivered-error fitting on a weighted complex support.  Also SciPy
 # (linprog), so it lives behind the same lazy door: a production table
 # lookup must not import an optimiser.
@@ -250,6 +257,9 @@ def __getattr__(name: str):
     if name in _FREQUENCY_FIT_NAMES:
         from minimax import frequency_fit as _fit      # noqa: PLC0415
         return getattr(_fit, name)
+    if name in _UNIFORM_RULE_NAMES:
+        from minimax import uniform_rule as _uniform   # noqa: PLC0415
+        return getattr(_uniform, name)
     if name in _RECIPROCAL_FIT_NAMES:
         from minimax import reciprocal_fit as _measure  # noqa: PLC0415
         return getattr(_measure, name)
@@ -271,6 +281,7 @@ def __getattr__(name: str):
 def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
                   | set(_FREQUENCY_FIT_NAMES)
+                  | set(_UNIFORM_RULE_NAMES)
                   | set(_RECIPROCAL_FIT_NAMES)
                   | set(_TIME_NODE_SEARCH_NAMES)
                   | set(_MEASURE_WINDOW_NAMES)
@@ -300,6 +311,8 @@ __all__ = [
     "UncertifiedSolveRefused", "SamplingUnsupported",
     # --- generic complex-frequency fitting (lazy; scipy) -------------------
     *_FREQUENCY_FIT_NAMES,
+    # --- uniform denominator-box rules (lazy; scipy) -----------------------
+    *_UNIFORM_RULE_NAMES,
     # --- delivered-error fitting on a weighted support (lazy; scipy) -------
     *_RECIPROCAL_FIT_NAMES,
     *_TIME_NODE_SEARCH_NAMES,

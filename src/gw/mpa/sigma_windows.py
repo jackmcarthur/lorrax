@@ -400,8 +400,9 @@ def build_shared_sigma_windows(
     causal branches use the existing rotated-Laplace minimax service.  Pole
     batching is solely an executor memory policy and never a spectral split.
 
-    ``target_error`` bounds the dimensionless residual ``|1-d Q(d)|``.
-    The delivered planner apportions it among windows by delivered mass.
+    ``target_error`` bounds the dimensionless residual ``|1-d Q(d)|`` in
+    this frozen pane-control builder.  Production MPA uses
+    ``gw.sigma_box_plan`` and does not apportion error by delivered mass.
 
     Omega clusters come from the requested grid and its own step
     (``sigma_omega_step_ev``), not from a separate tolerance.  Every patch in

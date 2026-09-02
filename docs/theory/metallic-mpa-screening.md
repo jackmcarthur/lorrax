@@ -635,33 +635,25 @@ cross-check of 5.3. `occ_hash` is bound to the bytes of `f_kn` in the
 state's `__post_init__`, so a stamp can never describe a table it was not
 computed from.
 
-### 5.6 Dynamic range: the crossing rule's cost is per cluster, not per span
+### 5.6 Dynamic range: the direct denominator box
 
-A Σ window deep enough to reach semicore QP energies used to scale the
-positive damped crossing rule linearly — measured `n = 87·f_max + 10`
-nodes on the sodium semicore scan, a REFUSAL past the 500-node floor and
-709 nodes at [−56, +7] eV — because one rule had to resolve the η-scale
-crossing feature uniformly over the whole evaluation-window × transition
-product set. That linearity is a Landau-density floor of the real-time
-exponential representation on the sign-symmetric window (the global Gauss
-rule sits near it; panels and free complex nodes cannot beat it), so the
-fix is geometric, not algorithmic: only a thin shell
-`|ω − e − a| ≲ margins` of each ω cluster actually crosses.
+The production planner now constructs the exact product-window support from
+the live metallic branch energies and fitted-pole extrema, then certifies a
+uniform exponential rule on that box.  The three products are set by
+`state_edge = edge_factor*eta` and
+`pole_edge = max(abs(omega)) + state_edge + negative-state excursion`; no
+residue histogram or omega-cluster campaign decides where accuracy is spent.
 
-With `sigma_omega_patches_ev` gapping the evaluation grid to where QP
-energies live (2s cluster, 2p cluster, Fermi window — the Σ(ω)→E
-interpolation is piecewise linear and needs nothing in between; a solved
-energy inside a hole refuses at the QSGW seam) and
-`mpa_sigma_omega_cluster_gap_ry` clustering the planner, the core and the
-metallic `sd_core` sliver decompose per cluster into an η-resolved shell
-whose bandwidth is set by the cluster span and pole bracket — independent
-of the dynamic range — plus sign-definite bulk cells on the logarithmic
-sector family. Contiguous grids keep the monolithic plan bit for bit.
-Measured at production η/tolerances on the synthetic Fe-class geometry:
-44–52 total nodes flat from a 52 eV to a 419 eV span, against 344→2689
-for the linear law. Full derivation and the executor-safety constraints:
-`docs/theory/THEORY_mpa_implementation.md` §10.1 and
-`docs/dev/crossing-rule-cost-law.md`.
+This changes the contract of a gapped `sigma_omega_patches_ev` grid: the grid
+still saves Sigma evaluation/output points and the QSGW hole guard still
+refuses an energy inside a missing patch, but each causal branch's box spans
+its minimum and maximum requested frequencies.  Dynamic-range cost is
+therefore visible in the reported box and total `(window,tau)` pairs rather
+than hidden behind a second clustering policy.  Sign-definite tails remain
+logarithmic because their rule uses relative error; crossing boxes retain the
+linear-in-bandwidth lower bound.  `mpa_sigma_max_nodes` is the explicit total
+pair refusal.  Full construction and cache conventions are in
+`docs/theory/sigma-quadrature-problem.md`.
 
 ## 6. The QSGW occupation cycle
 
