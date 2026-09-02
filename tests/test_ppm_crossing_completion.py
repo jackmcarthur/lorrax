@@ -176,14 +176,12 @@ def test_crossing_consumer_returns_the_one_sided_half():
 
 
 def test_dispatch_guards_still_refuse_cross_pairing():
-    """MPA's merged crossing carrier works; a Laplace pair still refuses."""
+    """The load-bearing carrier guards survive the fix: a merged tile at
+    project_code=1 and a two-channel pair at project_code=0 both raise."""
     S_R, S_I = _make_channels(nk=1, nb=2, nmu=3, complex_symmetric=False)
-    merged = _project_tau_onto_omega_np(
-        S_R + 1j * S_I, None, OMEGA,
-        0.1 + 0.0j, 1.0 + 0.0j, 1.0, 1.0, 1)
-    want = np.exp(1j * OMEGA * 0.1).reshape(-1, 1, 1, 1) * (
-        S_R + 1j * S_I)[None]
-    np.testing.assert_allclose(merged, want, rtol=2e-15, atol=2e-15)
+    with pytest.raises(ValueError, match="crossing"):
+        _project_tau_onto_omega_np(
+            S_R + 1j * S_I, None, OMEGA, 0.1 + 0.0j, 1.0 + 0.0j, 1.0, 1.0, 1)
     with pytest.raises(ValueError, match="Laplace"):
         _project_tau_onto_omega_np(
             S_R, S_I, OMEGA, 0.1 + 0.0j, 1.0 + 0.0j, 1.0, 1.0, 0)
