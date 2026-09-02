@@ -65,6 +65,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.linalg import lstsq, svd
+from scipy.linalg import cho_factor, cho_solve
 from scipy.linalg import qr as _pivoted_qr
 
 __all__ = ["UniformRule", "build_uniform_rule", "box_samples", "rule_sup_error"]
@@ -217,10 +218,17 @@ def _grid_size(d, theta, S, eps=1e-5, points_per_half_wave=3.0, cap=6000):
     return int(min(max(interior, near_zero, near_decay) + 100, cap))
 
 
+def _cexp(z):
+    """``exp(z)`` for complex ``z`` as ``exp(Re z) (cos Im z + i sin Im z)``.
+    numpy's complex ``exp`` is scalar code (44 ns per element measured); the
+    three real ufuncs are SIMD and about 3x faster.  Same values."""
+    return np.exp(z.real) * (np.cos(z.imag) + 1j * np.sin(z.imag))
+
+
 def _family(d, theta, s):
     """``exp(i t d)`` for ``t = s exp(-i theta)``: rows are cloud points,
     columns are ray positions."""
-    return np.exp(1j * d[:, None] * (s * np.exp(-1j * theta))[None, :])
+    return _cexp(1j * d[:, None] * (s * np.exp(-1j * theta))[None, :])
 
 
 def _choose_angle(d, eps, rho, scan=(-85, -70, -55, -40, -20, 0, 20, 40, 55, 70, 85)):
@@ -375,20 +383,39 @@ class _CloudFit:
 
     def A(self, s):
         """Design matrix ``exp(i d t)`` with the rows in the rule's currency."""
-        return np.exp(self.idp[:, None] * s[None, :]) * self.scale[:, None]
+        return _cexp(self.idp[:, None] * s[None, :]) * self.scale[:, None]
 
     def ls(self, s):
-        """Penalised least-squares weights for nodes ``s``: QR of ``[A; mu I]``.
-        Returns ``w``, the full residual (cloud rows then penalty rows), ``Q``
-        and ``A``; the Jacobian below reuses ``Q``."""
+        """Penalised least-squares weights for nodes ``s``.
+
+        Solves ``min |A w - b|^2 + mu^2 |w|^2`` through the normal equations
+        ``(A^H A + mu^2 I) w = A^H b`` (one Gram, one Cholesky) followed by two
+        steps of iterative refinement on the augmented residual, which brings
+        the solution to the accuracy of the QR solve it replaced (residuals
+        agree to four digits over a 10-step LM run).  Returns ``w``, the full
+        residual ``[b - A w; -mu w]``, the Cholesky factor and ``A``; the
+        Jacobian projection reuses the factor.
+
+        Tempting, and why not: the QR of ``[A; mu I]`` (what this replaced).
+        It is the textbook-stable form, but LAPACK's tall-skinny complex QR
+        ran at 15 Gflop/s where the GEMMs of this class run at 200-290, and it
+        was called twice per LM step: 300 ms of a 440 ms iteration on the
+        Na +-15 eV crossing box (m = 2055, n = 346).  Cholesky-QR (a QR from
+        the same Gram) would be as fast but adds nothing over refinement here.
+        """
         A = self.A(s)
         n = s.size
-        Aa = np.concatenate([A, self.mu * np.eye(n, dtype=complex)], 0)
-        Q, R = np.linalg.qr(Aa)
-        ba = np.concatenate([self.b, np.zeros(n, complex)])
-        c = Q.conj().T @ ba
-        w = np.linalg.solve(R, c)
-        return w, ba - Q @ c, Q, A
+        G = A.conj().T @ A
+        G[np.diag_indices(n)] += self.mu ** 2
+        factor = cho_factor(G, lower=False, check_finite=False)
+        Ab = A.conj().T @ self.b
+        w = cho_solve(factor, Ab, check_finite=False)
+        for _ in range(2):
+            r_top = self.b - A @ w
+            w = w + cho_solve(factor, A.conj().T @ r_top - self.mu ** 2 * w,
+                              check_finite=False)
+        F = np.concatenate([self.b - A @ w, -self.mu * w])
+        return w, F, factor, A
 
     def _y_of(self, s):
         # Im s = c + h tanh(y): the off-ray cap is part of the model, so no
@@ -416,13 +443,22 @@ class _CloudFit:
         Tempting, and why not: a plain Gauss-Newton or lstsq step per
         damping.  Undamped steps move clustered nodes past each other and
         the residual explodes; a separate lstsq per damping costs 12 solves
-        of a tall system per step where the eigendecomposition costs one Gram
-        of size ``2n``."""
+        of a tall system per step where one Gram of size ``2n`` serves every
+        damping.  The damped system ``(G + lam I) p = -J^T F`` is solved by a
+        Cholesky per damping (0.1 Gflop at ``2n = 692``) rather than by one
+        eigendecomposition of ``G`` (3.3 Gflop, 45 ms): the same step, and
+        one or two dampings are usually enough.  The real ``2n x 2n`` Gram is
+        assembled from the complex ``n x n`` one (``Re``/``Im`` blocks of
+        ``Jc^H Jc``, exact identities) instead of forming the real Jacobian and
+        multiplying: 4x fewer flops for the same matrix.  The projection
+        ``P_perp [J; 0] = [J - A X; -mu X]`` with ``X = G^-1 A^H J`` reuses
+        the Cholesky factor of ``ls`` -- no ``Q`` is ever formed."""
         s = s.real.clip(0.0, self.S) + 1j * s.imag.clip(self.im_lo, self.im_hi)
         y = self._y_of(s)
         s = self._s_of(s.real, y)
-        w, F, Q, A = self.ls(s)
+        w, F, factor, A = self.ls(s)
         n = s.size
+        m = self.d.size
         lam = 1e-3
         n_last = np.linalg.norm(F)
         for it in range(steps):
@@ -430,39 +466,47 @@ class _CloudFit:
             if nF < tol * self.nb:
                 break
             if it > 0 and it % chunk == 0:
-                if check is not None and check(s, w, np.linalg.norm(F[:self.d.size]) / self.nb):
+                if check is not None and check(s, w, np.linalg.norm(F[:m]) / self.nb):
                     break
                 if nF > (1.0 - stall) * n_last:
                     break
                 n_last = nF
-            Jc = np.concatenate([-(self.idp[:, None] * A) * w[None, :],
-                                 np.zeros((n, n), complex)], 0)
-            Jc -= Q @ (Q.conj().T @ Jc)
+            J = -(self.idp[:, None] * A) * w[None, :]
+            X = cho_solve(factor, A.conj().T @ J, check_finite=False)
+            Jc = np.concatenate([J - A @ X, -self.mu * X], 0)
             dIm = self.h / np.cosh(y) ** 2
-            Jr = np.block([[Jc.real, -Jc.imag * dIm[None, :]],
-                           [Jc.imag, Jc.real * dIm[None, :]]])
-            Fr = np.concatenate([F.real, F.imag])
-            D = np.linalg.norm(Jr, axis=0)
+            # column norms of the real Jacobian [[Re, -Im dIm], [Im, Re dIm]]
+            cn = np.sqrt(np.sum(np.abs(Jc) ** 2, axis=0))
+            D = np.concatenate([cn, cn * dIm])
             D = np.where(D > 0, D, 1.0)
-            Jd = Jr / D[None, :]
-            ev, V = np.linalg.eigh(Jd.T @ Jd)
-            sj2 = np.maximum(ev, 0.0)
-            g = V.T @ (Jd.T @ (-Fr))
+            Gc = Jc.conj().T @ Jc
+            ReG, ImG = Gc.real, Gc.imag
+            Gr = np.block([[ReG, -ImG * dIm[None, :]],
+                           [dIm[:, None] * ImG.T, dIm[:, None] * ReG * dIm[None, :]]])
+            Gr /= D[:, None] * D[None, :]
+            v = Jc.conj().T @ (-F)
+            g = np.concatenate([v.real, dIm * v.imag]) / D
             improved = False
             for _lm in range(12):
-                p = (V @ (g / (sj2 + lam))) / D
+                Gl = Gr.copy()
+                Gl[np.diag_indices(2 * n)] += lam
+                try:
+                    p = cho_solve(cho_factor(Gl, lower=False, check_finite=False), g,
+                                  check_finite=False) / D
+                except np.linalg.LinAlgError:
+                    p = np.linalg.solve(Gl, g) / D
                 y_new = np.clip(y + np.clip(p[n:], -3.0, 3.0), -8.0, 8.0)
                 s_new = self._s_of(s.real + p[:n], y_new)
-                w_new, F_new, Q_new, A_new = self.ls(s_new)
+                w_new, F_new, factor_new, A_new = self.ls(s_new)
                 if np.linalg.norm(F_new) < nF:
-                    s, w, F, Q, A, y = s_new, w_new, F_new, Q_new, A_new, y_new
+                    s, w, F, factor, A, y = s_new, w_new, F_new, factor_new, A_new, y_new
                     lam = max(lam / 3.0, 1e-9)
                     improved = True
                     break
                 lam *= 4.0
             if not improved:
                 break
-        return s, w, np.linalg.norm(F[:self.d.size]) / self.nb
+        return s, w, np.linalg.norm(F[:m]) / self.nb
 
     def loo_scores(self, s, w):
         """Residual increase when node ``k`` is dropped and the weights
@@ -905,7 +949,7 @@ def rule_sup_error(times, weights, d, rho=None):
     is the term-cancellation ratio: the factor by which the executor's
     per-term noise is amplified in the sum.  Both are what the planner's
     gates read."""
-    A = np.exp(1j * d[:, None] * times[None, :])
+    A = _cexp(1j * d[:, None] * times[None, :])
     Q = A @ weights
     err = np.abs(Q - 1.0 / d) * (d.imag.min() if rho is None else rho)
     kappa = np.abs(A * weights[None, :]).sum(1) / np.maximum(np.abs(Q), 1e-300)
@@ -948,7 +992,7 @@ def _select_backend(backend, n_start, cloud_size):
     problem is large enough to pay its launch and compile overhead (start
     rank >= 40, cloud >= 2000): the small sign-definite tails finish in a few
     seconds on numpy and would spend longer compiling."""
-    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "auto")).strip().lower()
+    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy")).strip().lower()
     if choice not in ("numpy", "jax", "auto"):
         raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
     if choice == "numpy":
