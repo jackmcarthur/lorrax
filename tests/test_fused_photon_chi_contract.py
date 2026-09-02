@@ -143,7 +143,7 @@ def test_fused_factory_cache_separates_ffi_backend_dials(monkeypatch):
 
 
 def test_fused_value_against_independent_dense_band_sum(monkeypatch):
-    """Three-q/two-tau all-16 proof independent of perm/phase contraction."""
+    """Three-q/two-tau all-16 tolerance proof independent of gamma gathers."""
     from types import SimpleNamespace
 
     import common.fft_helpers as fft_helpers
@@ -264,8 +264,10 @@ def test_fused_value_against_independent_dense_band_sum(monkeypatch):
                 got[A, B], expected[A, B], rtol=2.0e-12, atol=2.0e-12)
     assert np.max(np.abs(got[1, 1][1:, :logical_t, :logical_t])) > 1.0e-6
 
-    # The nonstreamed CC vertex route remains bit-identical to charge SSOT;
-    # streamed production CC is separately covered by the dense oracle above.
+    # Fused production CC streams in this fixture.  Its regrouped pairwise
+    # packed accumulation has tolerance parity with the dense oracle above,
+    # not a bit-identity contract.  Only the forced-nonstream incumbent route
+    # below retains its established bit-equality claim.
     cc_vertex = w_isdf.compute_no_pair_dirac_current_block(
         charge, charge, quad, meta, mesh,
         vertex_left=0, vertex_right=0, spin_pair_stream=False)
@@ -300,6 +302,16 @@ def test_production_uses_one_fused_path_and_keeps_block_oracle():
     assert "photon_block_view" in fused_calls
     assert "replace_photon_block" in fused_calls
 
+    shared = _function("_streamed_face_vertex_orientations")
+    shared_calls = [_call_name(node) for node in ast.walk(shared)
+                    if isinstance(node, ast.Call)]
+    assert shared_calls.count("build_gc_pair") == 1
+    incumbent = _function("_get_chi_minimax_kernel_face")
+    incumbent_calls = [_call_name(node) for node in ast.walk(incumbent)
+                       if isinstance(node, ast.Call)]
+    assert incumbent_calls.count("_streamed_face_vertex_orientations") == 1
+    assert fused_calls.count("_streamed_face_vertex_orientations") == 1
+
     scans = [node for node in ast.walk(fused)
              if isinstance(node, ast.Call) and _call_name(node) == "scan"]
     assert scans
@@ -314,3 +326,15 @@ def test_production_uses_one_fused_path_and_keeps_block_oracle():
     oracle_calls = [_call_name(node) for node in ast.walk(oracle)
                     if isinstance(node, ast.Call)]
     assert "_get_chi_minimax_kernel" in oracle_calls
+
+
+def test_real_p4_gate_registers_fused_full_and_batch_reshard_cells():
+    gate = (ROOT / "tests/multi_device/"
+            "bispinor_transverse_vertex_face_gate.py").read_text()
+    assert '("fused_photon_full_all16",' in gate
+    assert '("fused_photon_batch_reshard_all16",' in gate
+    assert gate.count("n_c=8, n_t=12, fused=True") == 2
+    fused_batch = gate[gate.index('(\"fused_photon_batch_reshard_all16\",'):]
+    assert 'distrib_la_batched_route="batch_reshard"' in fused_batch
+    assert "packed.sharding.is_equivalent_to(" in gate
+    assert "block.sharding.is_equivalent_to(" in gate

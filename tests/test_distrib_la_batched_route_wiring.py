@@ -142,6 +142,14 @@ _TRANSITIVE_ROUTE_SEAMS = {
         "rotate_wavefunctions": {"_rotate_wavefunctions_face": 1},
         "_rotate_wavefunctions_face": {"_face_rotate_kernel": 1},
     },
+    "src/gw/w_isdf.py": {
+        "compute_static_photon_response": {
+            "compute_experimental_no_pair_photon_chi0": 1,
+        },
+        "compute_experimental_no_pair_photon_chi0": {
+            "_get_fused_photon_chi_kernel": 1,
+        },
+    },
 }
 
 

@@ -175,6 +175,32 @@ def _contract_face_vertex_orientations(
     return forward, reverse
 
 
+def _streamed_face_vertex_orientations(
+    Gv_pair, build_gc_pair: Callable, spin_l, spin_r,
+    perm_l, phase_l, perm_r, phase_r, *,
+    left_identity: bool, right_identity: bool,
+):
+    """Build/contract one streamed spin pair in both endpoint orders.
+
+    ``build_gc_pair(gc_l,gc_r)`` remains the canonical Green-builder closure;
+    this primitive solely owns the gamma permutation, right-row conjugation,
+    and reverse-orientation convention shared by the incumbent block kernel
+    and the fused family kernel.  Raw forward/reverse contributions are
+    returned separately so the incumbent preserves its established pair-sum
+    accumulation order.
+    """
+    gc_l = spin_l if left_identity else perm_l[spin_l]
+    gc_r = spin_r if right_identity else perm_r[spin_r]
+    coeff_l = (jnp.asarray(1, jnp.complex128)
+               if left_identity else phase_l[spin_l])
+    # gamma_double_contract's right endpoint is the conjugated row phase.
+    coeff_r = (jnp.asarray(1, jnp.complex128)
+               if right_identity else jnp.conj(phase_r[spin_r]))
+    Gc_pair = build_gc_pair(gc_l, gc_r)
+    forward = coeff_l * coeff_r * Gc_pair * jnp.conj(Gv_pair)
+    return forward, jnp.swapaxes(forward, -1, -2)
+
+
 
 # ============================================================================
 # χ₀ kernel — minimax quadrature
@@ -694,36 +720,27 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                     forward_acc, reverse_acc = pair_accs
                     spin_l = pair_index // ns
                     spin_r = pair_index % ns
-                    gc_l = (spin_l if left_identity else perm_l[spin_l])
-                    gc_r = (spin_r if right_identity else perm_r[spin_r])
-                    coeff_l = (jnp.asarray(1, jnp.complex128)
-                               if left_identity else phase_l[spin_l])
-                    # gamma_double_contract's right-endpoint convention is
-                    # the conjugated row phase (the incumbent full-spin
-                    # branch immediately below uses the same convention).
-                    coeff_r = (jnp.asarray(1, jnp.complex128)
-                               if right_identity
-                               else jnp.conj(phase_r[spin_r]))
 
                     Gv_k_pair = _build_G_pair(
                         psi_mun, psi_nmu, mask_v, enk_full, -tau_kernel,
                         vmax, spin_l, spin_r)
                     t_c = (jnp.conj(tau_kernel)
                            if complex_contour else tau_kernel)
-                    Gc_k_pair = _build_G_pair(
-                        psi_mun, psi_nmu, mask_c, enk_full, t_c,
-                        cmin, gc_l, gc_r)
                     Gv_R_pair = _Gv_fftn(Gv_k_pair)[:, 0, :, 0, :]
-                    Gc_R_pair = _Gc_fftn(Gc_k_pair)[:, 0, :, 0, :]
-                    contribution = ((coeff_l * coeff_r)
-                                    * Gc_R_pair * jnp.conj(Gv_R_pair))
-                    # The incumbent reverse orientation transposes the same
-                    # two G tensors and swaps the vertex tables.  For this
-                    # (spin_l,spin_r) term that is exactly contribution^T in
-                    # its natural (mu_B,mu_A) endpoint order.
-                    return (forward_acc + contribution,
-                            reverse_acc
-                            + jnp.swapaxes(contribution, -1, -2)), None
+
+                    def build_gc_pair(gc_l, gc_r):
+                        Gc_k_pair = _build_G_pair(
+                            psi_mun, psi_nmu, mask_c, enk_full, t_c,
+                            cmin, gc_l, gc_r)
+                        return _Gc_fftn(Gc_k_pair)[:, 0, :, 0, :]
+
+                    forward, reverse = _streamed_face_vertex_orientations(
+                        Gv_R_pair, build_gc_pair, spin_l, spin_r,
+                        perm_l, phase_l, perm_r, phase_r,
+                        left_identity=left_identity,
+                        right_identity=right_identity)
+                    return (forward_acc + forward,
+                            reverse_acc + reverse), None
 
                 (chi_tau_raw, reverse_tau_raw), _ = jax.lax.scan(
                     _pair_body, (pair_zero, jnp.swapaxes(pair_zero, -1, -2)),
@@ -949,18 +966,18 @@ def _get_fused_photon_chi_kernel(
                 for A, B in vertices:
                     perm_l, phase_l = gamma_tables[A]
                     perm_r, phase_r = gamma_tables[B]
-                    gc_l = spin_l if A == 0 else perm_l[spin_l]
-                    gc_r = spin_r if B == 0 else perm_r[spin_r]
-                    coeff_l = (jnp.asarray(1, jnp.complex128)
-                               if A == 0 else phase_l[spin_l])
-                    coeff_r = (jnp.asarray(1, jnp.complex128)
-                               if B == 0 else jnp.conj(phase_r[spin_r]))
-                    Gc_pair = build_pair(
-                        psi_mun, psi_nmu, mask_c, enk, tau_scalar, cmin,
-                        gc_l, gc_r, fft_c)
-                    contribution = coeff_l * coeff_r * Gc_pair * jnp.conj(Gv_pair)
+
+                    def build_gc_pair(gc_l, gc_r):
+                        return build_pair(
+                            psi_mun, psi_nmu, mask_c, enk, tau_scalar, cmin,
+                            gc_l, gc_r, fft_c)
+
+                    forward, reverse = _streamed_face_vertex_orientations(
+                        Gv_pair, build_gc_pair, spin_l, spin_r,
+                        perm_l, phase_l, perm_r, phase_r,
+                        left_identity=(A == 0), right_identity=(B == 0))
                     chi_tau = _complete_static_vertex_orientations(
-                        contribution, jnp.swapaxes(contribution, -1, -2))
+                        forward, reverse)
                     acc = accumulate_photon_block(
                         acc, alpha_scalar * chi_tau, layout, A, B, mesh_xy)
                 return acc, None
@@ -2438,6 +2455,9 @@ def compute_experimental_no_pair_photon_chi0(
     Lorentz block in that family.  The response is accumulated in R space in
     one packed buffer and each block is transformed in place afterward.  The
     three transverse channels remain views of one wavefunction bundle.
+    Streamed families accumulate each spin-pair contribution directly into
+    that buffer, so their parity with the incumbent pair-summed block route is
+    tolerance-level rather than a bit-identity contract.
     """
 
     layout.assert_mesh(mesh_xy)
