@@ -25,7 +25,7 @@ import pytest
 from gw.gw_config import (
     BispinorGWMode, LorraxConfig, QPSolver,
     qp_solver_semantics,
-    uses_four_spinor_finite_q_charge, uses_raw_kinetic_balance_charge,
+    uses_four_spinor_finite_q_charge,
 )
 from common.four_current_model import resolve_four_current_representation
 
@@ -167,7 +167,6 @@ def test_both_shipped_modes_ride_the_one_raw_carrier():
     assert reps[0] == reps[1]
     assert reps[0].charge_lift == reps[0].current_lift == "raw"
     assert reps[0].scalar_head_bispinor
-    assert uses_raw_kinetic_balance_charge(True, "bare_transverse")
     assert uses_four_spinor_finite_q_charge(True, "full_static_cohsex")
 
 

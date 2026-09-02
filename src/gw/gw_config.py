@@ -373,28 +373,6 @@ def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
         ) from exc
 
 
-def uses_raw_kinetic_balance_charge(
-    bispinor: bool,
-    bispinor_gw,
-) -> bool:
-    """Whether scalar charge channels use the raw four-spinor carrier.
-
-    ``bispinor`` continues to mean that spatial-current channels are enabled.
-    The explicitly named Pauli-reference comparison is the sole exception to
-    the historical rule that the same raw kinetic-balance carrier also enters
-    charge density, scalar screening, and scalar self-energy.  Keeping this
-    decision here prevents preprocessing, charge ISDF, and the live driver
-    from deriving the representation split independently.
-    """
-    if not bool(bispinor):
-        return False
-    mode = coerce_bispinor_gw_mode(bispinor_gw)
-    return mode in (
-        BispinorGWMode.BARE_TRANSVERSE,
-        BispinorGWMode.FULL_STATIC_COHSEX,
-    )
-
-
 def uses_four_spinor_finite_q_charge(bispinor: bool, bispinor_gw) -> bool:
     """Whether finite-q scalar channels use a four-spinor carrier."""
     return resolve_four_current_representation(
