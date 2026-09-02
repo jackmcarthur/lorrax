@@ -2676,7 +2676,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             np.asarray(partition.in_range_mask, dtype=bool)[None, :],
             e_dft_fit_ev.shape)
         if inputs.config.sc.tail_fit == "buffer_edges":
-            fit_mask_kn &= np.broadcast_to(
+            fit_mask_kn = fit_mask_kn & np.broadcast_to(
                 buffer_mask[None, :], e_dft_fit_ev.shape)
         # SAME three-way classification as the active-window scissor below.
         # It matters here too: the tail law that gets applied is the
