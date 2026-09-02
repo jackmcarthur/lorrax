@@ -1194,7 +1194,7 @@ def _interband_degenerate_weight(
     SCOPE.  This formula (``prefactor * f_diff / (dE * (z**2 - dE**2))``)
     is ``_s_tensor_kernel``'s ONLY; the wing kernels
     (``_head_wing_kernel_legacy``/``_face``) build a structurally
-    DIFFERENT ``F_ij = pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
+    DIFFERENT ``F_ij = -pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
     power of ``dE`` (documented explicitly in ``head_wings_sharded``'s own
     docstring), because a wing pairs one velocity leg with one
     dimension-1-in-energy density vertex where the head pairs two
@@ -1214,6 +1214,26 @@ def _interband_degenerate_weight(
     z_ok = jnp.abs(z) > 1.0e-15
     degenerate = prefactor * s_avg / (z * z)
     return jnp.where(near_degenerate & z_ok, degenerate, clipped)
+
+
+def _head_wing_interband_weight(
+    dE, f_diff, z, prefactor, transition,
+):
+    r"""Adler--Wiser mixed head/body weight in the ``P=-dE*D`` basis.
+
+    Replacing one density-jet leg ``D`` of the direct response by the
+    energy-scaled head vertex ``P=-dE*D`` contributes the explicit minus
+    below.  Both wing layouts call this owner.  The finite-frequency
+    intraband surface term is not a ``D -> P`` substitution and remains the
+    separate positive ``pref_surface*surface_weight/z`` contribution in the
+    two kernels.
+    """
+    denom = z * z - dE * dE
+    return jnp.where(
+        transition & (jnp.abs(denom) > 1.0e-16),
+        -prefactor * f_diff / denom,
+        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+    )
 
 
 def _s_tensor_kernel(
@@ -1516,14 +1536,12 @@ def _head_wing_kernel_legacy(
         ):
             def _block(block_acc, node):
                 block_index, z_block, inv_z_block = node
-                denom = (
-                    z_block[:, None, None, None] ** 2
-                    - dE[None, :, :, :] ** 2)
-                weight = jnp.where(
-                    transition[None, :, :, :]
-                    & (jnp.abs(denom) > 1.0e-16),
-                    pref_inter * f_diff[None, :, :, :] / denom,
-                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                weight = _head_wing_interband_weight(
+                    dE[None, :, :, :],
+                    f_diff[None, :, :, :],
+                    z_block[:, None, None, None],
+                    pref_inter,
+                    transition[None, :, :, :],
                 )
                 if include_surface:
                     weight = weight + (
@@ -1747,10 +1765,12 @@ def _head_wing_kernel_face(
       OTHER mesh axis assembles the full ``nb_full``-wide band vector for
       exactly that block — bounded by ``nk * ns * nb_full * mu_block``,
       independent of how many mu values this rank owns in total.  ``i``
-      and ``j`` then read the SAME gathered array (two labels on one
-      operand, matching ``b_ij``'s own definition), so no second ring or
-      gather is needed for the "other" band index the way a naive
-      transcription of the legacy ring might suggest.
+      and ``j`` read separately supplied bra/ket face blocks.  This is the
+      minimal seam needed for a Lorentz vertex on only one endpoint:
+      aliasing the two inputs after applying gamma to both would instead
+      form ``gamma^dagger gamma = I`` and silently reduce a current body
+      vertex back to charge.  Both gathers have the same bounded extent;
+      no full face or band-replicated carrier is formed.
     * The (i,j)-operator itself — ``conj(v[a,i,j]) * F_ij(omega)`` — is
       ``nb_full x nb_full``, INDEPENDENT of mu.  It is built once (one
       two-axis ``lax.all_gather`` of the small, already band-mesh-sharded
@@ -1776,8 +1796,9 @@ def _head_wing_kernel_face(
     ``2*S/(Px*Py)``, the carrier's own number):
     ``v_full`` (``3*nk*nb_full^2``, gathered once) +
     ``weight`` (``omega_block*nk*nb_full^2``, rebuilt once per mu block) +
-    the gathered psi block (``nk*ns*nb_full*mu_block``, small).  None of
-    these three terms contains ``mu_local`` or ``mu_pad``.
+    the two gathered endpoint blocks
+    (``2*nk*ns*nb_full*mu_block``, small).  None of these three terms
+    contains ``mu_local`` or ``mu_pad``.
     """
     key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface))
     hit = _KERNEL_CACHE.get(key)
@@ -1787,8 +1808,10 @@ def _head_wing_kernel_face(
 
     def _local(
         v_local,
-        psi_mun_local,
-        psi_nmu_local,
+        bra_mun_local,
+        ket_mun_local,
+        bra_nmu_local,
+        ket_nmu_local,
         energies,
         occupations,
         surface_weight,
@@ -1801,9 +1824,9 @@ def _head_wing_kernel_face(
         v_full = jax.lax.all_gather(v_local, ax_x, axis=2, tiled=True)
         v_full = jax.lax.all_gather(v_full, ax_y, axis=3, tiled=True)
         nb_full = v_full.shape[-1]
-        ns = psi_mun_local.shape[1]
-        mu_x_local = psi_mun_local.shape[2]
-        mu_y_local = psi_nmu_local.shape[-1]
+        ns = bra_mun_local.shape[1]
+        mu_x_local = bra_mun_local.shape[2]
+        mu_y_local = bra_nmu_local.shape[-1]
 
         idx = jnp.arange(nb_full)
         logical1d = idx < nb_logical
@@ -1838,11 +1861,10 @@ def _head_wing_kernel_face(
             frequencies (unlike the legacy ring's cross-RING-STEP carry)."""
             def _step(_carry, node):
                 z_block, inv_z_block = node
-                denom = z_block[:, None, None, None] ** 2 - dE[None] ** 2
-                weight = jnp.where(
-                    transition[None] & (jnp.abs(denom) > 1.0e-16),
-                    pref_inter * f_diff[None] / denom,
-                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                weight = _head_wing_interband_weight(
+                    dE[None], f_diff[None],
+                    z_block[:, None, None, None], pref_inter,
+                    transition[None],
                 )
                 if include_surface:
                     weight = weight + (
@@ -1857,23 +1879,32 @@ def _head_wing_kernel_face(
         mu_x_block = min(_HEAD_WING_MU_BLOCK, int(mu_x_local))
         n_x_blocks = -(-int(mu_x_local) // mu_x_block)
         mu_x_padded = n_x_blocks * mu_x_block
-        psi_mun_padded = jnp.pad(
-            psi_mun_local,
+        bra_mun_padded = jnp.pad(
+            bra_mun_local,
+            ((0, 0), (0, 0), (0, mu_x_padded - mu_x_local), (0, 0)))
+        ket_mun_padded = jnp.pad(
+            ket_mun_local,
             ((0, 0), (0, 0), (0, mu_x_padded - mu_x_local), (0, 0)))
 
         def _x_step(_carry, blk):
             zero = jnp.zeros((), dtype=blk.dtype)
             start = blk * mu_x_block
-            tile = jax.lax.dynamic_slice(
-                psi_mun_padded, (zero, zero, start, zero),
-                (nk, ns, mu_x_block, psi_mun_padded.shape[-1]))
-            psi_full = jax.lax.all_gather(tile, ax_y, axis=3, tiled=True)
+            bra_tile = jax.lax.dynamic_slice(
+                bra_mun_padded, (zero, zero, start, zero),
+                (nk, ns, mu_x_block, bra_mun_padded.shape[-1]))
+            ket_tile = jax.lax.dynamic_slice(
+                ket_mun_padded, (zero, zero, start, zero),
+                (nk, ns, mu_x_block, ket_mun_padded.shape[-1]))
+            bra_full = jax.lax.all_gather(
+                bra_tile, ax_y, axis=3, tiled=True)
+            ket_full = jax.lax.all_gather(
+                ket_tile, ax_y, axis=3, tiled=True)
 
             def _contract_left(weight):
                 return jnp.einsum(
                     "akij,wkij,ksmi,ksmj->wam",
                     jnp.conj(v_full), weight,
-                    jnp.conj(psi_full), psi_full,
+                    jnp.conj(bra_full), ket_full,
                     optimize=True,
                 )
             blocks = _weighted_stack(_contract_left)
@@ -1891,23 +1922,33 @@ def _head_wing_kernel_face(
         mu_y_block = min(_HEAD_WING_MU_BLOCK, int(mu_y_local))
         n_y_blocks = -(-int(mu_y_local) // mu_y_block)
         mu_y_padded = n_y_blocks * mu_y_block
-        psi_nmu_padded = jnp.pad(
-            psi_nmu_local,
+        bra_nmu_padded = jnp.pad(
+            bra_nmu_local,
+            ((0, 0), (0, 0), (0, 0), (0, mu_y_padded - mu_y_local)))
+        ket_nmu_padded = jnp.pad(
+            ket_nmu_local,
             ((0, 0), (0, 0), (0, 0), (0, mu_y_padded - mu_y_local)))
 
         def _y_step(_carry, blk):
             zero = jnp.zeros((), dtype=blk.dtype)
             start = blk * mu_y_block
-            tile = jax.lax.dynamic_slice(
-                psi_nmu_padded, (zero, zero, zero, start),
-                (nk, psi_nmu_padded.shape[1], ns, mu_y_block))
-            gathered = jax.lax.all_gather(tile, ax_x, axis=1, tiled=True)
-            psi_full = jnp.transpose(gathered, (0, 2, 3, 1))
+            bra_tile = jax.lax.dynamic_slice(
+                bra_nmu_padded, (zero, zero, zero, start),
+                (nk, bra_nmu_padded.shape[1], ns, mu_y_block))
+            ket_tile = jax.lax.dynamic_slice(
+                ket_nmu_padded, (zero, zero, zero, start),
+                (nk, ket_nmu_padded.shape[1], ns, mu_y_block))
+            bra_gathered = jax.lax.all_gather(
+                bra_tile, ax_x, axis=1, tiled=True)
+            ket_gathered = jax.lax.all_gather(
+                ket_tile, ax_x, axis=1, tiled=True)
+            bra_full = jnp.transpose(bra_gathered, (0, 2, 3, 1))
+            ket_full = jnp.transpose(ket_gathered, (0, 2, 3, 1))
 
             def _contract_right(weight):
                 return jnp.einsum(
                     "ksmi,ksmj,wkij,bkij->wmb",
-                    psi_full, jnp.conj(psi_full), weight, v_full,
+                    bra_full, jnp.conj(ket_full), weight, v_full,
                     optimize=True,
                 )
             blocks = _weighted_stack(_contract_right)
@@ -1927,8 +1968,10 @@ def _head_wing_kernel_face(
         mesh=mesh,
         in_specs=(
             P(None, None, "x", "y"),   # v_local
-            P(None, None, "x", "y"),   # psi_mun_local  (PSI_MUN_SPEC)
-            P(None, "x", None, "y"),   # psi_nmu_local  (PSI_NMU_SPEC)
+            P(None, None, "x", "y"),   # bra_mun_local  (PSI_MUN_SPEC)
+            P(None, None, "x", "y"),   # ket_mun_local  (PSI_MUN_SPEC)
+            P(None, "x", None, "y"),   # bra_nmu_local  (PSI_NMU_SPEC)
+            P(None, "x", None, "y"),   # ket_nmu_local  (PSI_NMU_SPEC)
             P(None, None),             # energies (nk, nb_full), replicated
             P(None, None),             # occupations
             P(None, None),             # surface_weight
@@ -2002,16 +2045,20 @@ def head_wings_sharded(
     nspinor: int,
     eta_ry: float = 0.0,
     surface_weight_kn=None,
+    body_bra_wfns=None,
+    body_ket_wfns=None,
 ):
     r"""Build q-linear head/body wings in the current band basis.
 
     For every energy-ordered interband pair, with
-    ``b_ij(mu)=sum_s psi_i(mu)^* psi_j(mu)``, this evaluates
+    ``b_ij(mu)=sum_s bra_i(mu)^* ket_j(mu)``, this evaluates
 
     ``Y[a,mu] = sum conj(v[a,ij]) F_ij b_ij(mu)`` and
     ``Z[mu,b] = sum conj(b_ij(mu)) F_ij v[b,ij]``,
 
-    where ``F_ij = 4(f_j-f_i)/(Nk*nspin*nspinor*(z^2-dE^2))``.  This is
+    where ``F_ij = -4(f_j-f_i)/(Nk*nspin*nspinor*(z^2-dE^2))``.  The minus
+    is the one-leg conversion from the density jet ``D`` to the accepted
+    energy-scaled vertex ``P=-dE*D``.  This is
     exactly the normalization paired with ``head_s_tensor_sharded``:
     ``S_direct`` owns ``1/cell_volume`` and the later Schur fold introduces
     the sole additional ``1/cell_volume`` multiplying ``Y W Z``.
@@ -2019,7 +2066,9 @@ def head_wings_sharded(
     With tetrahedron surface weights, the finite-frequency intraband wings
     ``sum delta(E-mu) v_a b_nn / z`` are included as well.  The strictly
     static metal limit is not obtained by setting ``z=0`` in that expression;
-    its head remains on the separate Thomas-Fermi path.
+    its head remains on the separate Thomas-Fermi path.  This surface term
+    keeps its positive sign; it does not undergo the interband ``D -> P``
+    conversion.
 
     Every rank owns the same ``(nb/Px) * (nb/Py)`` band-pair tile.  The
     x-sharded and y-sharded centroid wavefunction copies build Y and Z,
@@ -2027,6 +2076,14 @@ def head_wings_sharded(
     axis.  Frequencies are blocked inside each ring step, so a tile is sent
     once rather than once per frequency block and no all-frequency pair
     tensor is formed.
+
+    ``body_bra_wfns`` and ``body_ket_wfns`` are a face-layout-only seam for
+    separately operator-applied endpoints.  Either omitted endpoint defaults
+    to ``wfns``, preserving the incumbent charge-density algebra exactly.
+    Operator application belongs to
+    :func:`gw.wavefunction_bundle.with_lorentz_vertices`; this routine only
+    contracts the resulting canonical faces.  Supplying endpoint bundles to
+    the legacy layout refuses rather than reconstructing face replicas.
 
     Layout dispatch on ``wfns.layout`` (report §5, single owner): the body
     below, unchanged, is ``layout='legacy'``.  ``layout='face'`` routes to
@@ -2053,11 +2110,17 @@ def head_wings_sharded(
             velocity_cart, wfns, energies_kn_ry, occupations_kn, omegas_ry,
             mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
             nspinor=nspinor, eta_ry=eta_ry,
-            surface_weight_kn=surface_weight_kn)
+            surface_weight_kn=surface_weight_kn,
+            body_bra_wfns=body_bra_wfns,
+            body_ket_wfns=body_ket_wfns)
     if layout != "legacy":
         raise ValueError(
             f"head_wings_sharded: wfns.layout must be 'legacy' or 'face', "
             f"got {layout!r}")
+    if body_bra_wfns is not None or body_ket_wfns is not None:
+        raise ValueError(
+            "head_wings_sharded: separate body endpoints are face-layout "
+            "only; legacy refuses rather than materializing face replicas")
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
@@ -2126,6 +2189,8 @@ def _head_wings_sharded_face(
     nspinor: int,
     eta_ry: float = 0.0,
     surface_weight_kn=None,
+    body_bra_wfns=None,
+    body_ket_wfns=None,
 ):
     """``layout='face'`` body of :func:`head_wings_sharded`.  Same physics
     and normalization as the legacy body's docstring; only the carrier and
@@ -2134,8 +2199,54 @@ def _head_wings_sharded_face(
     which truncates ``wfns.psi_xn``/``psi_yn`` down to the velocity's own
     ``nb_pad`` — this pads ``v``/``e``/``f``/``surface`` UP to that full
     extent instead (:func:`_pad_head_band_manifold_to`); the kernel masks
-    anything beyond ``nb_logical`` to zero.
+    anything beyond ``nb_logical`` to zero.  The independently supplied
+    endpoint bundles remain in those same two canonical face orientations;
+    this helper neither applies operators nor creates an alternate carrier.
     """
+    bra_wfns = wfns if body_bra_wfns is None else body_bra_wfns
+    ket_wfns = wfns if body_ket_wfns is None else body_ket_wfns
+
+    face_shapes = None
+    for endpoint_name, endpoint in (
+            ("wfns", wfns), ("body_bra_wfns", bra_wfns),
+            ("body_ket_wfns", ket_wfns)):
+        if getattr(endpoint, "layout", None) != "face":
+            raise ValueError(
+                f"head_wings_sharded(layout='face'): {endpoint_name}.layout "
+                f"must be 'face', got {getattr(endpoint, 'layout', None)!r}")
+        if endpoint.psi_mun is None or endpoint.psi_nmu is None:
+            raise ValueError(
+                f"head_wings_sharded(layout='face') requires "
+                f"{endpoint_name}.psi_mun and {endpoint_name}.psi_nmu "
+                "(got None)")
+        nk_mun, s_mun, mu_x, n_mun = endpoint.psi_mun.shape
+        nk_nmu, n_nmu, s_nmu, mu_y = endpoint.psi_nmu.shape
+        shapes = (int(nk_mun), int(s_mun), int(mu_x), int(n_mun),
+                  int(nk_nmu), int(n_nmu), int(s_nmu), int(mu_y))
+        if nk_mun != nk_nmu or s_mun != s_nmu or n_mun != n_nmu:
+            raise ValueError(
+                f"head_wings_sharded(layout='face'): {endpoint_name} face "
+                f"axes disagree: psi_mun={endpoint.psi_mun.shape}, "
+                f"psi_nmu={endpoint.psi_nmu.shape}")
+        if (tuple(endpoint.enk.shape) != (nk_mun, n_mun)
+                or tuple(endpoint.occ.shape) != (nk_mun, n_mun)):
+            raise ValueError(
+                f"head_wings_sharded(layout='face'): {endpoint_name} "
+                f"energy/occupation shapes {endpoint.enk.shape}/"
+                f"{endpoint.occ.shape} do not match its face k/band axes "
+                f"{(nk_mun, n_mun)}")
+        if endpoint.slices != wfns.slices:
+            raise ValueError(
+                f"head_wings_sharded(layout='face'): {endpoint_name}.slices "
+                "does not match wfns.slices")
+        if face_shapes is None:
+            face_shapes = shapes
+        elif shapes != face_shapes:
+            raise ValueError(
+                f"head_wings_sharded(layout='face'): {endpoint_name} face "
+                f"shapes {shapes} do not match wfns face shapes "
+                f"{face_shapes}")
+
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
@@ -2149,11 +2260,6 @@ def _head_wings_sharded_face(
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
             f"velocity (nk,nb)={v.shape[1:3]}.")
-    if wfns.psi_mun is None or wfns.psi_nmu is None:
-        raise ValueError(
-            "head_wings_sharded(layout='face') requires wfns.psi_mun and "
-            "wfns.psi_nmu (got None) — this bundle is not a face carrier "
-            "despite wfns.layout=='face'.")
     nk_mun, s_mun, _mu_x, n_mun = wfns.psi_mun.shape
     nk_nmu, n_nmu, s_nmu, _mu_y = wfns.psi_nmu.shape
     if nk_mun != int(v.shape[1]) or nk_nmu != int(v.shape[1]):
@@ -2184,7 +2290,9 @@ def _head_wings_sharded_face(
     return _head_wing_kernel(
         mesh, nb_logical=int(nb_logical),
         include_surface=bool(include_surface), layout="face")(
-            v, wfns.psi_mun, wfns.psi_nmu, e, f, surface, omega,
+            v, bra_wfns.psi_mun, ket_wfns.psi_mun,
+            bra_wfns.psi_nmu, ket_wfns.psi_nmu,
+            e, f, surface, omega,
             jnp.asarray(pref_inter, dtype=jnp.complex128),
             jnp.asarray(pref_surface, dtype=jnp.complex128),
             jnp.asarray(float(eta_ry), dtype=jnp.float64),

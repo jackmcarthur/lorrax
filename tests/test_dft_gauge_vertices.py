@@ -12,7 +12,12 @@ import jax
 import jax.numpy as jnp
 
 from common import mtxel_sweep
-from common.bispinor_init import ALPHA_FS, HALFALPHA, lift_to_4spinor
+from common.bispinor_init import (
+    ALPHA_FS,
+    HALFALPHA,
+    ISOMETRIC_KINETIC_BALANCE_LIFT,
+    lift_to_4spinor,
+)
 from common.collectives import single_device_mesh
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common.wfn_transforms import gflat_to_rmu
@@ -96,10 +101,13 @@ def _setup(
     )
 
 
-def _basis_receipt(wfn, geom, r_mu, band_start, band_stop):
+def _basis_receipt(
+    wfn, geom, r_mu, band_start, band_stop, *, bispinor_lift="raw",
+):
     from runtime.padding import padded_mu_extent
     return WavefunctionBasisReceipt.from_source(
         wfn=wfn, role='transverse', bispinor=True,
+        bispinor_lift=bispinor_lift,
         band_interval=(band_start, band_stop),
         fft_grid=geom.fft_grid, centroid_fft_idx=r_mu,
         n_rmu_logical=len(r_mu),
@@ -161,7 +169,7 @@ def test_exact_origin_radial_moment_and_contact_action():
         rab=np.full_like(r, dr), vloc_r=np.zeros_like(r),
         rho_core_r=np.zeros_like(r), has_nlcc=False, n_proj=1,
         beta_r=beta_over_r, proj_l=np.asarray([0]),
-        proj_j=np.asarray([0.5]), dij=np.ones((1, 1)), nspinor=1)
+        dij=np.ones((1, 1)))
     tables = radial_tables.build_all_tables(
         [species], q_max=0.1, n_q=3, second_derivatives=True)
     sw = np.ones_like(r)
@@ -385,7 +393,7 @@ def test_icl_q2_physical_radial_third_derivative_and_operator_jet():
         rab=np.full_like(r, dr), vloc_r=np.zeros_like(r),
         rho_core_r=np.zeros_like(r), has_nlcc=False, n_proj=1,
         beta_r=beta_over_r, proj_l=np.asarray([0]),
-        proj_j=np.asarray([0.5]), dij=np.ones((1, 1)), nspinor=1)
+        dij=np.ones((1, 1)))
     tables = radial_tables.build_all_tables(
         [species], q_max=0.6, n_q=61,
         second_derivatives=True, third_derivatives=True)
@@ -484,7 +492,8 @@ def test_fixed_large_component_photon_vertex_jet_taylor_ward_and_hermiticity():
     contact = packed_mtx[3:12].reshape(3, 3, 2, 2)
     q1_source = packed_mtx[12:21].reshape(3, 3, 2, 2)
     q1 = -np.swapaxes(np.conj(q1_source), -1, -2)
-    q2 = packed_mtx[21:].reshape(3, 3, 3, 2, 2)
+    q2_source = packed_mtx[21:].reshape(3, 3, 3, 2, 2)
+    q2 = np.swapaxes(np.conj(q2_source), -1, -2)
 
     uniform = apply_uniform_vnl_derivatives_to_ket(
         psi_L, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
@@ -572,6 +581,101 @@ def test_fixed_large_component_photon_vertex_jet_taylor_ward_and_hermiticity():
     np.testing.assert_allclose(
         q2, np.swapaxes(np.conj(q2), -1, -2),
         rtol=3e-11, atol=3e-11)
+    # The historical raw q2 action was exposed directly.  The public carrier
+    # now gives both q1 and q2 the same source orientation and performs their
+    # (-dagger,+dagger) rules at one band-matrix boundary.  Hermiticity makes
+    # the raw physical value invariant under that cleanup.
+    np.testing.assert_allclose(
+        q2, q2_source, rtol=3e-11, atol=3e-11)
+
+
+def test_isometric_photon_vertex_jet_matches_the_direct_kminusq_endpoint():
+    setup = _setup(curved=False, third_derivatives=True)
+    G = jnp.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
+    mask = jnp.asarray([1.0, 1.0, 1.0, 0.0])
+    source = _states() * mask[None, None, :]
+    k = np.asarray([0.19, -0.17, 0.12])
+    B = np.asarray(setup.B)
+    Binv = np.linalg.inv(B)
+    ket = lift_to_4spinor(
+        source[None], G[None], jnp.asarray(k[None]), jnp.asarray(B),
+        representation=ISOMETRIC_KINETIC_BALANCE_LIFT)[0]
+
+    geom = SimpleNamespace(ns=4, ngkmax=int(G.shape[0]))
+    operator = mtxel_sweep.uniform_gauge_operator(
+        geom, bvec=B, blat=1.0, vnl_setup=setup,
+        include_transfer_q2=True,
+        kinetic_balance_lift=ISOMETRIC_KINETIC_BALANCE_LIFT)
+    packed_action = np.moveaxis(np.asarray(operator.apply(
+        ket[None], G, mask, jnp.zeros((1, 1, 1, 1), jnp.int32),
+        jnp.asarray(k))), -1, 0)[:, 0]
+    packed_mtx = np.einsum(
+        "msg,xnsg->xmn", np.conj(np.asarray(ket)), packed_action,
+        optimize=True)
+    gamma0 = packed_mtx[:3]
+    q1_source = packed_mtx[12:21].reshape(3, 3, 2, 2)
+    q2_source = packed_mtx[21:].reshape(3, 3, 3, 2, 2)
+    q1 = -np.swapaxes(np.conj(q1_source), -1, -2)
+    q2 = np.swapaxes(np.conj(q2_source), -1, -2)
+
+    @jax.jit
+    def vnl_gamma_at(k_crys):
+        return apply_uniform_vnl_derivatives_to_ket(
+            ket[:, :2], G, k_crys, setup, mask,
+            projector_row_chunk=1, g_chunk=2).gamma_cart_ket
+
+    gauss_x, gauss_w = np.polynomial.legendre.leggauss(8)
+    segment_s = 0.5 * (gauss_x + 1.0)
+    segment_w = 0.5 * gauss_w
+    alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+
+    def direct_vertex(q_cart):
+        q_crys = q_cart @ Binv
+        bra = lift_to_4spinor(
+            source[None], G[None],
+            jnp.asarray((k - q_crys)[None]), jnp.asarray(B),
+            representation=ISOMETRIC_KINETIC_BALANCE_LIFT)[0]
+        gamma_kin = np.stack([
+            np.asarray(gamma_apply(ket, perm, phase, axis=1))
+            for perm, phase in alpha_vertices
+        ])
+        gamma_vnl = sum(
+            weight * np.asarray(vnl_gamma_at(k - s * q_crys))
+            for s, weight in zip(segment_s, segment_w))
+        action = gamma_kin.copy()
+        action[:, :, :2] += HALFALPHA * gamma_vnl
+        return np.einsum(
+            "msg,insg->imn", np.conj(np.asarray(bra)), action,
+            optimize=True)
+
+    # The differentiated endpoint is K_bra=k-q: q-first carries one minus,
+    # q-second carries no sign.  These central differences independently pin
+    # both signs before the directional Taylor discriminator below.
+    step = 2.0e-4
+    for a in range(3):
+        direction = np.zeros(3)
+        direction[a] = 1.0
+        first_fd = (
+            direct_vertex(step * direction)
+            - direct_vertex(-step * direction)) / (2.0 * step)
+        np.testing.assert_allclose(
+            q1[:, a], first_fd, rtol=2.0e-7, atol=3.0e-9)
+
+    direction = np.asarray([0.31, -0.47, 0.29])
+
+    def taylor_error(scale):
+        q_cart = scale * direction
+        direct = direct_vertex(q_cart)
+        taylor = (
+            gamma0
+            + np.einsum("a,iamn->imn", q_cart, q1)
+            + 0.5 * np.einsum(
+                "a,b,iabmn->imn", q_cart, q_cart, q2))
+        return np.linalg.norm(direct - taylor)
+
+    err_big = taylor_error(4.0e-3)
+    err_small = taylor_error(2.0e-3)
+    assert err_small < 0.14 * err_big  # cubic remainder: ideal ratio 1/8
 
 
 def test_exact_icl_finite_transfer_matches_q0_and_landed_q2_jet():
@@ -950,6 +1054,31 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
         include_transfer_q2=True)
     assert (endpoint.hamiltonian_config_operator_fingerprint
             == uniform.hamiltonian_config_operator_fingerprint)
+    raw_explicit_fingerprint = (
+        mtxel_sweep._gauge_hamiltonian_operator_fingerprint(
+            wfn=wfn, vnl_setup=setup, band_start=0, band_stop=2,
+            geom=geom, include_transfer_q2=True,
+            kinetic_balance_lift="raw"))
+    isometric_fingerprint = (
+        mtxel_sweep._gauge_hamiltonian_operator_fingerprint(
+            wfn=wfn, vnl_setup=setup, band_start=0, band_stop=2,
+            geom=geom, include_transfer_q2=True,
+            kinetic_balance_lift=ISOMETRIC_KINETIC_BALANCE_LIFT))
+    assert raw_explicit_fingerprint == (
+        uniform.hamiltonian_config_operator_fingerprint)
+    assert isometric_fingerprint != raw_explicit_fingerprint
+
+    # Representation identity is checked before the finite endpoint can be
+    # reused: equal WFN/bands/centroids do not make raw and isometric carriers
+    # the same physical sampled basis.
+    with pytest.raises(ValueError, match="bispinor_lift_provenance"):
+        mtxel_sweep.finite_transfer_current_to_centroids(
+            psi_4[None], wfn=wfn, band_start=0, band_stop=2,
+            geom=geom, vnl_setup=setup, r_mu=r_mu,
+            basis_receipt=_basis_receipt(wfn, geom, r_mu, 0, 2),
+            iq_irr=0, path_order=8, projector_row_chunk=1, g_chunk=2,
+            include_transfer_q2_identity=True,
+            kinetic_balance_lift=ISOMETRIC_KINETIC_BALANCE_LIFT)
     assert endpoint.vnl_path_operator_fingerprint.startswith('sha256:')
     current_only = mtxel_sweep.sweep_uniform_current_matrix_elements(
         psi_4[None], wfn=wfn, band_start=0, band_stop=2, geom=geom,

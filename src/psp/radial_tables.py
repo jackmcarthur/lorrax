@@ -481,17 +481,17 @@ def build_all_tables(
             for l_val in np.unique(ls + 2):
                 idx = np.where(ls + 2 == l_val)[0]
                 J_block = spherical_hankel_table_batch_jax(
-                    int(l_val), r_j,
-                    jnp.asarray(beta_full[idx] * sp.r[None, :],
+                    int(l_val), rb_j,
+                    jnp.asarray(beta_full[idx] * sp.r[None, :kkb],
                                 dtype=jnp.float64),
-                    q_j, w_j,
+                    q_j, wb_j,
                 )
                 J_table[idx] = np.asarray(J_block)
 
             Gpp_table = np.empty_like(F_table)
             for ip, l_val in enumerate(ls):
                 origin_moment = float(np.sum(
-                    beta_full[ip] * sp.r ** (int(l_val) + 3) * weights_np))
+                    beta_full[ip] * sp.r[:kkb] ** (int(l_val) + 3) * wb_np))
                 Gpp_table[ip] = _reduced_projector_second_derivative(
                     q, int(l_val), H_table[ip], J_table[ip], origin_moment)
 
@@ -501,10 +501,10 @@ def build_all_tables(
                 for l_val in np.unique(ls + 3):
                     idx = np.where(ls + 3 == l_val)[0]
                     K_block = spherical_hankel_table_batch_jax(
-                        int(l_val), r_j,
-                        jnp.asarray(beta_full[idx] * sp.r[None, :] ** 2,
+                        int(l_val), rb_j,
+                        jnp.asarray(beta_full[idx] * sp.r[None, :kkb] ** 2,
                                     dtype=jnp.float64),
-                        q_j, w_j,
+                        q_j, wb_j,
                     )
                     K_table[idx] = np.asarray(K_block)
                 Gppp_table = np.empty_like(F_table)

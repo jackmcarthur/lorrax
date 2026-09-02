@@ -57,6 +57,14 @@ def kinetic_balance_lift_provenance(representation: str) -> str:
         f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
 
 
+def _isometric_kinetic_balance_factor(K_cart_bohr_inv):
+    """The sole pointwise ``(I + X^dagger X)^(-1/2)`` spelling."""
+    K = jnp.asarray(K_cart_bohr_inv)
+    h2 = jnp.float64(HALFALPHA) ** 2
+    return jnp.reciprocal(jnp.sqrt(
+        jnp.float64(1.0) + h2 * jnp.sum(K * K, axis=-1)))
+
+
 def sigma_dot_cartesian(psi_L, vector_cart):
     r"""Apply ``sigma . vector_cart`` to a large-component spinor block.
 
@@ -84,39 +92,114 @@ def sigma_dot_cartesian(psi_L, vector_cart):
         optimize=True)
 
 
-def kinetic_balance_lift_jet(psi_L, K_cart_bohr_inv):
-    r"""Return the kinetic-balance lift and its three endpoint derivatives.
+def kinetic_balance_lift_jet(
+    psi_L,
+    K_cart_bohr_inv,
+    *,
+    representation: str = RAW_KINETIC_BALANCE_LIFT,
+    cartesian_K_derivative_axes: tuple[int, ...] | None = None,
+):
+    r"""Return one representation-aware kinetic-balance endpoint jet.
 
-    Holding the explicit two-component ``psi_L`` fixed, this is the exact
-    Cartesian jet of
+    ``psi_L`` is the large block *in the selected representation* at the
+    expansion point.  For ``raw`` it is the source Pauli spinor.  For
+    ``isometric`` it is already ``r(K) psi_source``; the function must not
+    normalize it a second time.  Holding ``psi_source`` fixed, the lifted
+    endpoint is
 
-    ``Psi(K) = [psi_L; (ALPHA_FS/2) (sigma.K) psi_L]``.
+    ``Psi(K) = [I; h sigma.K] psi_L(K)``, ``h=ALPHA_FS/2``.
 
     ``K_cart_bohr_inv`` has shape ``(..., G, 3)`` in bohr^-1, paired with
     ``psi_L`` of shape ``(..., band, 2, G)``.  The returned value has shape
-    ``(..., band, 4, G)`` and ``dPsi_dK`` has shape
-    ``(3, ..., band, 4, G)`` with the Cartesian derivative axis first.
+    ``(..., band, 4, G)``.
 
-    The embedding is affine in each endpoint momentum, so
-    ``d2Psi/dK_a dK_b = 0`` exactly.  No ninefold zero wavefunction carrier
-    is allocated or returned.  Bra/ket endpoint routing, product rules, and
-    charge/current/contact prefactors belong to the downstream operator
-    owner; this neutral helper adds none of them.
+    With ``cartesian_K_derivative_axes=None`` the historical return contract
+    is retained: ``(Psi, dPsi_dK)`` with the Cartesian derivative axis first.
+    The raw branch is the historical operation sequence unchanged.  Supplying
+    one or two axes returns only that ``K`` first- or second-derivative family.
+    This helper never inserts the signs from ``K_bra=k-q``: the downstream
+    operator supplies one minus at q-first order and none at q-second order.
+    The bounded selector lets that operator consume a derivative immediately
+    instead of materializing a three- or nine-WFN jet.
+
+    For the isometric representation,
+
+    ``r=(1+h^2 K^2)^(-1/2)``,
+    ``r_a/r=-h^2 K_a r^2``, and
+    ``r_ab/r=-h^2 delta_ab r^2+3 h^4 K_a K_b r^4``.
+
+    These analytic factors include both product-rule terms in the endpoint
+    derivative.  For the raw affine embedding the selected second derivative
+    is exact zero.  Bra/ket orientation and vertex/contact prefactors remain
+    with the downstream operator owner.
     """
     psi = jnp.asarray(psi_L)
-    sigma_K_psi = sigma_dot_cartesian(psi, K_cart_bohr_inv)
+    K = jnp.asarray(K_cart_bohr_inv)
+    sigma_K_psi = sigma_dot_cartesian(psi, K)
     halfalpha = jnp.complex128(HALFALPHA)
     lifted = jnp.concatenate((psi, halfalpha * sigma_K_psi), axis=-2)
 
-    # First form (..., cart, band, spin, G), then keep the bounded Cartesian
-    # jet axis first for direct endpoint selection by a response consumer.
-    dpsi_small = halfalpha * jnp.einsum(
-        "aij,...bjg->...abig", paulis, psi, optimize=True)
-    cart_axis = psi.ndim - 3
-    dpsi_small = jnp.moveaxis(dpsi_small, cart_axis, 0)
-    dpsi_dK = jnp.concatenate(
-        (jnp.zeros_like(dpsi_small), dpsi_small), axis=-2)
-    return lifted, dpsi_dK
+    mode = str(representation).strip().lower()
+    # Validate through the one representation/provenance owner.  Keeping the
+    # returned string unused is deliberate: this numerical helper does not
+    # manufacture an artifact identity.
+    kinetic_balance_lift_provenance(mode)
+    axes = (None if cartesian_K_derivative_axes is None else tuple(
+        int(axis) for axis in cartesian_K_derivative_axes))
+    if axes is not None and len(axes) not in (1, 2):
+        raise ValueError(
+            "kinetic_balance_lift_jet cartesian_K_derivative_axes must "
+            f"contain one or two axes; got {axes}")
+    if axes is not None and any(axis < 0 or axis >= 3 for axis in axes):
+        raise ValueError(
+            "kinetic_balance_lift_jet Cartesian axes must lie in [0,3); "
+            f"got {axes}")
+
+    if axes is None and mode == RAW_KINETIC_BALANCE_LIFT:
+        # Historical raw path: preserve its operation sequence and returned
+        # bytes.  New selected-family code stays entirely off this branch.
+        dpsi_small = halfalpha * jnp.einsum(
+            "aij,...bjg->...abig", paulis, psi, optimize=True)
+        cart_axis = psi.ndim - 3
+        dpsi_small = jnp.moveaxis(dpsi_small, cart_axis, 0)
+        dpsi_dK = jnp.concatenate(
+            (jnp.zeros_like(dpsi_small), dpsi_small), axis=-2)
+        return lifted, dpsi_dK
+
+    def raw_first(axis: int):
+        small = halfalpha * jnp.einsum(
+            "ij,...bjg->...big", paulis[axis], psi, optimize=True)
+        return jnp.concatenate((jnp.zeros_like(small), small), axis=-2)
+
+    if mode == RAW_KINETIC_BALANCE_LIFT:
+        if len(axes) == 1:
+            return raw_first(axes[0])
+        return jnp.zeros_like(lifted)
+
+    h2 = jnp.float64(HALFALPHA) ** 2
+    r = _isometric_kinetic_balance_factor(K)
+    r2 = r * r
+
+    def first(axis: int):
+        r_a_over_r = -h2 * K[..., axis] * r2
+        return (r_a_over_r[..., None, None, :] * lifted
+                + raw_first(axis))
+
+    if axes is None:
+        return lifted, jnp.stack(tuple(first(axis) for axis in range(3)))
+    if len(axes) == 1:
+        return first(axes[0])
+
+    a, b = axes
+    r_a_over_r = -h2 * K[..., a] * r2
+    r_b_over_r = -h2 * K[..., b] * r2
+    r_ab_over_r = (
+        -h2 * jnp.asarray(a == b, dtype=jnp.float64) * r2
+        + 3.0 * h2 * h2 * K[..., a] * K[..., b] * r2 * r2)
+    return (
+        r_ab_over_r[..., None, None, :] * lifted
+        + r_a_over_r[..., None, None, :] * raw_first(b)
+        + r_b_over_r[..., None, None, :] * raw_first(a))
 
 
 def get_small_psi_component(gvecs, kvec, bvec_cart_bohr, psi_G):
@@ -201,6 +284,5 @@ def lift_to_4spinor(
             f"unknown kinetic-balance representation {representation!r}; "
             f"expected {RAW_KINETIC_BALANCE_LIFT!r} or "
             f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
-    x2 = jnp.float64(HALFALPHA) ** 2 * jnp.sum(p_cart * p_cart, axis=-1)
-    r = jnp.reciprocal(jnp.sqrt(jnp.float64(1.0) + x2))
+    r = _isometric_kinetic_balance_factor(p_cart)
     return lifted * r[:, None, None, :]
