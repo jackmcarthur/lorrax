@@ -37,6 +37,7 @@ product is introduced: claim 618 measured that partition and rejected it.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -541,6 +542,8 @@ def plan_sigma_windows(
             regularization_width_ry=eta, edge_factor=edge,
             pole_offset=pole_offset,
             occupation_window_threshold=occupation_window_threshold))
+        del Omega, B
+        gc.collect()
     if not summaries:
         raise ValueError("Sigma box planning needs at least one pole batch")
     summaries = tuple(summaries)
@@ -567,6 +570,8 @@ def plan_sigma_windows(
             Omega, B, selectors, *profile_grid_nodes, eta)
         for name, histogram in batch_histograms.items():
             profile_histograms[name] += histogram
+        del Omega, B
+        gc.collect()
 
     specs, branch_reports = [], []
     for branch, (state_shape, raw_energy, flat_indices,
