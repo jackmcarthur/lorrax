@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from file_io.sigma_output import write_sigma_to_file
+from tests.harness import parse_eqp_rows
 
 
 NK, NB = 2, 4
@@ -140,3 +141,44 @@ def test_the_totals_column_decides_on_its_own_sum(tmp_path):
             f"{tot!r}")
         # ...while both PARTS keep theirs, or the cell proves nothing.
         assert "i" in r.split("sigSX=")[1].split("sigCOH=")[0]
+
+
+def test_bispinor_lorentz_columns_are_additive_and_scalar_schema_is_unchanged(
+        tmp_path):
+    sx = np.arange(NK * NB).reshape(NK, NB) * 0.25 - 2.0
+    coh = np.arange(NK * NB).reshape(NK, NB) * 0.05 + 0.1
+    total = sx + coh
+    parts = np.stack((0.9 * total, 0.025 * total, 0.075 * total))
+    scalar = tmp_path / "scalar.dat"
+    bispinor = tmp_path / "bispinor.dat"
+    kwargs = dict(
+        sigma_coh_kij_eV=_diag_array(coh),
+        hartree_kij_eV=_diag_array(np.zeros_like(total)),
+        kpoints_crys=KPTS,
+    )
+    write_sigma_to_file(_diag_array(sx), filename=str(scalar), **kwargs)
+    write_sigma_to_file(
+        _diag_array(sx), filename=str(bispinor),
+        sigma_lorentz_skn_eV=parts, **kwargs)
+
+    scalar_rows = _rows(scalar)
+    assert all("sigCC=" not in row and "sigTT=" not in row
+               and "sigCT=" not in row for row in scalar_rows)
+    for row in _rows(bispinor):
+        assert row.index("sigCC=") < row.index("sigTT=") < row.index("sigCT=")
+
+    parsed = parse_eqp_rows(
+        bispinor, labels=("sigTOT", "sigCC", "sigTT", "sigCT"))
+    public_closure = parsed[:, 2] - np.sum(parsed[:, 3:6], axis=1)
+    assert np.max(np.abs(public_closure)) <= 1.0e-9
+
+
+def test_lorentz_column_closure_refuses_a_bad_decomposition(tmp_path):
+    values = np.ones((NK, NB))
+    bad = np.zeros((3, NK, NB))
+    with pytest.raises(ValueError, match="sigma_lorentz_column_closure"):
+        write_sigma_to_file(
+            _diag_array(values), filename=str(tmp_path / "bad.dat"),
+            sigma_coh_kij_eV=_diag_array(values),
+            sigma_lorentz_skn_eV=bad,
+            kpoints_crys=KPTS)

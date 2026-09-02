@@ -667,6 +667,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
             meta,
             S_cart=None,
             analytic_sphere=_analytic_q0_sphere(params),
+            certificate_fn=params.get("_q0_certificate_fn"),
         )
         source = "epshead(0)" if abs(omega_val) > 1.0e-14 else "epshead"
         return HeadSample(
@@ -694,6 +695,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
                 meta,
                 S_cart=S_cart_omega,
                 analytic_sphere=_analytic_q0_sphere(params),
+                certificate_fn=params.get("_q0_certificate_fn"),
             )
         source = "s_tensor" if abs(omega_val) <= 1.0e-14 else f"s_tensor(omega={omega_val} Ry)"
         return HeadSample(
@@ -1606,7 +1608,8 @@ class HeadResolver:
                  "_print_fn", "_cache", "_direct_cache", "_policy",
                  "_screened")
 
-    def __init__(self, config, input_dir, wfn, sym, meta, print_fn):
+    def __init__(self, config, input_dir, wfn, sym, meta, print_fn,
+                 q0_certificate_fn=None):
         head = config.head
         from common.four_current_model import (
             resolve_four_current_representation)
@@ -1631,6 +1634,7 @@ class HeadResolver:
             "whead_imfreq": head.whead_imfreq,
             "head_minibz_average": head.head_minibz_average,
             "bgw_metal_q0_treatment": head.bgw_metal_q0_treatment,
+            "_q0_certificate_fn": q0_certificate_fn,
         }
         from gw.gw_config import coerce_head_correction
         self._policy = coerce_head_correction(

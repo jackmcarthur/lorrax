@@ -100,6 +100,27 @@ class StaticPhotonHeadSigmaDiagnostics:
                 f"the DFT output basis; got {self.output_basis!r}")
 
 
+@dataclass(frozen=True)
+class StaticPhotonSigmaDiagnostics:
+    """Lorentz-sector split of the physical static self-energy.
+
+    ``components_skij_ry`` has sector order ``(CC, CT+TC, TT)`` and contains
+    ``Sigma_SX + Sigma_COH`` for the selected blocks.  Unlike the head-only
+    diagnostic above, these are band-space operators so the self-consistent
+    driver can rotate them with the total Sigma before taking diagonals.
+    """
+
+    components_skij_ry: jax.Array
+    max_closure_residual_ry: float
+
+    def __post_init__(self) -> None:
+        shape = tuple(self.components_skij_ry.shape)
+        if len(shape) != 4 or shape[0] != 3 or shape[-2] != shape[-1]:
+            raise ValueError(
+                "static photon Sigma diagnostics must be "
+                f"(3 sectors,nk,nb,nb); got {shape}")
+
+
 def _head_sector(A: int, B: int) -> int:
     if int(A) == 0 and int(B) == 0:
         return _HEAD_CC
@@ -311,6 +332,7 @@ def compute_static_photon_sigma(
     verbose: bool = True,
 ) -> tuple[
     jax.Array, jax.Array, jax.Array, StaticPhotonHeadSigmaDiagnostics | None,
+    StaticPhotonSigmaDiagnostics,
 ]:
     """Stream the ``D^{AB}`` blocks into full static COHSEX.
 
@@ -378,6 +400,7 @@ def compute_static_photon_sigma(
     sig_coh = None
     head_diag = [[None for _ in range(3)] for _ in range(3)]
     head_total_diag = [None for _ in range(3)]
+    sigma_sector = [None for _ in range(3)]
 
     from .wavefunction_bundle import (
         padded_centroid_extent, with_lorentz_vertices)
@@ -447,8 +470,15 @@ def compute_static_photon_sigma(
                 coh_AB, coh_head_AB = coh_result
             sig_coh = coh_AB if sig_coh is None else sig_coh + coh_AB
 
+            sector = _head_sector(A, B)
+            physical_AB = sx_AB + coh_AB
+            sector_previous = sigma_sector[sector]
+            sigma_sector[sector] = (
+                physical_AB if sector_previous is None
+                else sector_previous + physical_AB)
+            sigma_sector[sector].block_until_ready()
+
             if q0_factors is not None:
-                sector = _head_sector(A, B)
                 # Batch the orthogonal X/SX/COH terms through one canonical
                 # diagonal rotation.  This is one half-rotation per Lorentz
                 # block, not three full dense U A U^dagger materialisations.
@@ -481,16 +511,41 @@ def compute_static_photon_sigma(
     sig_x = _replicate_band_sigma(sig_x, mesh_xy)
     sig_sx = _replicate_band_sigma(sig_sx, mesh_xy)
     sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
+    sigma_sector = [
+        None if value is None else _replicate_band_sigma(value, mesh_xy)
+        for value in sigma_sector]
     if wfns_charge.layout == "face":
         nb_sigma = wfns_charge.slices.nb_sigma
         sig_x = sig_x[:, :nb_sigma, :nb_sigma]
         sig_sx = sig_sx[:, :nb_sigma, :nb_sigma]
         sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
+        sigma_sector = [
+            None if value is None
+            else value[:, :nb_sigma, :nb_sigma]
+            for value in sigma_sector]
     sig_x.block_until_ready()
     sig_sx.block_until_ready()
     sig_coh.block_until_ready()
+    zero_matrix = jnp.zeros_like(sig_sx)
+    sigma_components = jnp.stack([
+        zero_matrix if value is None else value for value in sigma_sector])
+    sigma_components = device_put_process_local(
+        sigma_components, NamedSharding(mesh_xy, P(None, None, None, None)))
+    sigma_components.block_until_ready()
+    sigma_closure_abs = float(jax.device_get(jnp.max(jnp.abs(
+        jnp.sum(sigma_components, axis=0) - (sig_sx + sig_coh)))))
+    sigma_closure_scale = float(jax.device_get(jnp.max(jnp.abs(
+        sig_sx + sig_coh))))
+    sigma_closure_limit = 1.0e-13 + 1.0e-11 * sigma_closure_scale
+    if sigma_closure_abs > sigma_closure_limit:
+        raise ValueError(
+            "GATE photon_sigma_sector_closure: CC + CTTC + TT does not "
+            f"close to Sigma_SX + Sigma_COH: {sigma_closure_abs:.3e} Ry > "
+            f"{sigma_closure_limit:.3e} Ry")
+    sigma_diagnostics = StaticPhotonSigmaDiagnostics(
+        sigma_components, sigma_closure_abs)
     if q0_factors is None:
-        return sig_x, sig_sx, sig_coh, None
+        return sig_x, sig_sx, sig_coh, None, sigma_diagnostics
     diag_shape = (int(sig_x.shape[0]), int(sig_x.shape[1]))
     zero_diag = jnp.zeros(
         diag_shape, dtype=sig_x.dtype,
@@ -521,4 +576,5 @@ def compute_static_photon_sigma(
     return (
         sig_x, sig_sx, sig_coh,
         StaticPhotonHeadSigmaDiagnostics(components, closure_abs, "dft"),
+        sigma_diagnostics,
     )

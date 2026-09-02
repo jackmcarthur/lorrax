@@ -245,6 +245,8 @@ def write_sigma_to_file(
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
 	hartree_label: str = "VH",
+	sigma_lorentz_skn_eV=None,
+	sigma_c_odd_kn_eV=None,
 ):
 	"""Write self-energy components to file.
 
@@ -267,6 +269,12 @@ def write_sigma_to_file(
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
 		hartree_label: Text label for the direct-field column
+		sigma_lorentz_skn_eV: Optional physical Sigma total split with axes
+			(CC, CT+TC, TT, k, band), or the same with two band-matrix axes.
+			When present the named ``sigCC``, ``sigTT``, ``sigCT`` columns are
+			written.  None leaves the historical scalar file byte-identical.
+		sigma_c_odd_kn_eV: Optional measured broken-TR contribution to Sigma_c,
+			shape (nk, band), written as ``sigC_odd``.  None omits the column.
 
 	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
 	------------------------------------------------
@@ -366,6 +374,30 @@ def write_sigma_to_file(
 	coh_diag = _diag(sigma_coh_kij_eV)
 	hv_diag = _diag(hartree_kij_eV)
 	tot_diag = None if coh_diag is None else sx_diag + coh_diag
+	lorentz_diag = None
+	if sigma_lorentz_skn_eV is not None:
+		_parts = np.asarray(sigma_lorentz_skn_eV)
+		if _parts.shape == (3, nk, nbands):
+			lorentz_diag = _parts
+		elif _parts.shape == (3, nk, nbands, nbands):
+			idx = np.arange(nbands)
+			lorentz_diag = _parts[:, :, idx, idx]
+		else:
+			raise ValueError(
+				"sigma_lorentz_skn_eV must be (3,nk,nb) or "
+				f"(3,nk,nb,nb); got {_parts.shape}")
+		if tot_diag is None:
+			raise ValueError(
+				"sigma_lorentz_skn_eV requires the two physical Sigma columns")
+		_closure = np.max(np.abs(np.sum(lorentz_diag, axis=0) - tot_diag))
+		_scale = np.max(np.abs(tot_diag)) if tot_diag.size else 0.0
+		_limit = 1.0e-12 + 1.0e-10 * _scale
+		if _closure > _limit:
+			raise ValueError(
+				"GATE sigma_lorentz_column_closure: sigCC + sigCT + sigTT "
+				f"does not equal {total_label}: {_closure:.3e} eV > "
+				f"{_limit:.3e} eV")
+	odd_diag = _diag(sigma_c_odd_kn_eV)
 
 	def _is_complex(d):
 		return d is not None and bool(np.any(np.abs(np.imag(d)) > _IM_TOL))
@@ -374,6 +406,9 @@ def write_sigma_to_file(
 	coh_cplx = _is_complex(coh_diag)
 	tot_cplx = _is_complex(tot_diag)
 	hv_cplx = _is_complex(hv_diag)
+	lorentz_cplx = ([ _is_complex(lorentz_diag[s]) for s in range(3)]
+	                 if lorentz_diag is not None else None)
+	odd_cplx = _is_complex(odd_diag)
 
 	#: Width of the omitted "+x.xxxxxxi" field, so a real column occupies
 	#: exactly as many characters as a complex one would.
@@ -400,6 +435,12 @@ def write_sigma_to_file(
 		f.write(provenance_header())
 		f.write("# Sigma output (all in eV)\n")
 		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
+		if lorentz_diag is not None:
+			f.write(f"# {total_label} = sigCC + sigTT + sigCT; "
+			        "sigCT is CT+TC\n")
+		if odd_diag is not None:
+			f.write("# sigC_odd = ordered broken-TR GN residue contribution "
+			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
 		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
 		        f"states its crystal coordinate on a '# kcrys' line\n")
 		# The star-spread diagnostic, MEASURED ON THE FULL BZ upstream (see
@@ -474,6 +515,31 @@ def write_sigma_to_file(
 					total_im = sx_im + coh_im
 					line += f"  {total_label}={total_re:>12.6f}"
 					line += _im(total_im, tot_cplx)
+
+				if lorentz_diag is not None:
+					# Stable public order follows the requested names, while the
+					# internal sector order remains CC, CT+TC, TT.  The old total's
+					# six-decimal spelling is a compatibility contract.  Quantize the
+					# two independently computed current sectors to that same public
+					# precision, then spell CC as the residual, so parsing the text
+					# preserves sigCC+sigTT+sigCT=total below 1e-9 eV without moving
+					# or respelling any incumbent column.
+					display_re = [
+						float(f"{float(np.real(lorentz_diag[s, k, n])):.6f}")
+						for s in range(3)]
+					display_re[0] = (
+						float(f"{total_re:.6f}") - display_re[1] - display_re[2])
+					for label, sector in (("sigCC", 0), ("sigTT", 2),
+					                      ("sigCT", 1)):
+						value = lorentz_diag[sector, k, n]
+						line += f"  {label}={display_re[sector]:>12.6f}"
+						line += _im(float(np.imag(value)),
+						            lorentz_cplx[sector])
+
+				if odd_diag is not None:
+					value = odd_diag[k, n]
+					line += f"  sigC_odd={float(np.real(value)):>12.6f}"
+					line += _im(float(np.imag(value)), odd_cplx)
 
 				if hv_diag is not None:
 					hv_re = float(np.real(hv_diag[k, n]))

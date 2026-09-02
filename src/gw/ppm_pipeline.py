@@ -14,7 +14,7 @@ only sequences them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
@@ -77,6 +77,11 @@ class PPMOutputs:
     # absent from every downstream branch, which is what keeps that path
     # bit-identical.
     sigma_c_body_omega_unextrap: jax.Array | None = None
+    # Exact ordered-residue contribution, defined as Sigma_c[B,D] -
+    # Sigma_c[B,D=0].  None on every measured-TRS deck.
+    sigma_c_odd_body_omega: jax.Array | None = None
+    probe_hermiticity_residual: float | None = None
+    odd_even_residue_ratio: float | None = None
 
 
 def _fit_head_correction(
@@ -650,6 +655,24 @@ def compute_ppm_sigma_pipeline(
                 plan=plan,
                 print_fn=print_fn,
             )
+        sigma_omega_even = None
+        if ppm.B_odd_q is not None:
+            # Sigma is linear in the fitted residue.  Reusing the identical
+            # compiled contraction with D=0 gives the exact per-state odd
+            # contribution by subtraction, without introducing a second
+            # parser or a diagnostic-only approximation to the kernel.
+            with timing.section("sigma.exec.odd_reference"):
+                sigma_omega_even = compute_sigma_c_ppm_omega_grid(
+                    wfns, replace(ppm, B_odd_q=None), meta, mesh_xy,
+                    ppm_cfg=config.ppm,
+                    sigma_cfg=config.sigma,
+                    quad=config.sigma_quadrature_config,
+                    omega_grid_ry=config.omega_grid_ry,
+                    ansatz=config.compute_mode,
+                    occupation_state=occupation_state,
+                    plan=plan,
+                    print_fn=lambda *args, **kwargs: None,
+                )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries
         # the leading band-count axis; everything downstream of this line —
         # the head injection, the eqp interpolation, sigma_mnk.h5, the QSGW
@@ -671,6 +694,12 @@ def compute_ppm_sigma_pipeline(
         # is byte-for-byte what it was when it happened at this line.
         sigma_c_body_omega = sigma_c_body_omega_n3
         sigma_c_body_omega_unextrap = None
+        sigma_c_odd_body_omega = None
+        if sigma_omega_even is not None:
+            even_n3 = _band_count_point(
+                sigma_omega_even.sigma_c_kij,
+                sigma_omega_even.sigma_c_kij.shape[0] - 1)
+            sigma_c_odd_body_omega = sigma_c_body_omega_n3 - even_n3
 
         # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
@@ -708,10 +737,18 @@ def compute_ppm_sigma_pipeline(
             sigma_c_body_omega = _extrapolated_point(
                 sigma_omega.sigma_c_kij, extrap_weights)
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
+            if sigma_omega_even is not None:
+                sigma_c_odd_body_omega = (
+                    sigma_c_body_omega
+                    - _extrapolated_point(
+                        sigma_omega_even.sigma_c_kij, extrap_weights))
 
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
         band_extrapolation=extrap_payload,
         sigma_c_body_omega_unextrap=sigma_c_body_omega_unextrap,
+        sigma_c_odd_body_omega=sigma_c_odd_body_omega,
+        probe_hermiticity_residual=ppm.probe_hermiticity_residual,
+        odd_even_residue_ratio=ppm.odd_even_residue_ratio,
     )

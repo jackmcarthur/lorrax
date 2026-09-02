@@ -161,6 +161,12 @@ Consequences a caller sees:
   (`GATE slab_q0_polygon_not_converged`, budget `atol 1e-12`,
   `rtol 1e-8`, the same one the packed completion applies to its own
   ladder). The scalar head had no convergence bound before.
+  It also emits the typed `SlabQ0Certificate` through an optional
+  `certificate_fn`. LORRAX's `HeadResolver` sends that receipt to the
+  top-level production reporter, so `gwjax.out` contains `Slab WS cert`
+  with the actual order ladder, physical node counts, polygon edge count,
+  evaluation count and worst final error ratio; the run record no longer
+  depends on component stdout escaping the production sink.
 
 **`Bulk3D` is unchanged and takes no `rule`.** The polygon construction is
 two-dimensional; there is no 3D owner for it, so the bulk head keeps the

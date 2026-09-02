@@ -657,7 +657,14 @@ def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,
 
 
 def parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarray:
-    """Parse sigma_diag rows → (nrows, 7): kpt, band, 3 Σ columns, VH re/im.
+    """Parse named ``sigma_diag`` columns plus the direct field.
+
+    The returned columns are ``kpt, band, *labels, H_re, H_im``.  The default
+    remains the historical seven-column array.  Callers auditing a bispinor
+    file can request ``("sigSX", "sigCOH", "sigTOT", "sigCC", "sigTT",
+    "sigCT")``; a broken-TR PPM caller can additionally request
+    ``sigC_odd``.  Parsing is label-based, so additive columns do not move an
+    old field and old files still parse with the default labels.
 
     THE DIRECT-FIELD COLUMN HAS TWO SPELLINGS and this parser accepts both.
     A scalar deck writes ``VH=``; a ``bispinor = true`` deck writes ``Hdir=``,
@@ -670,16 +677,11 @@ def parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarr
     the atol comparison.  Column 5 of the returned array is whichever of the
     two the file carries.
     """
-    float_re = r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
-    imag_opt = rf"(?:\+\s*{float_re}i)?"  # optional imaginary part
-    a, b, c = labels  # COHSEX: sigSX/sigCOH/sigTOT ;  GN-PPM: sigX/sigC/sigXC
-    data_re = re.compile(
-        rf"n=\s*(\d+)\s+"
-        rf"{a}=\s*{float_re}{imag_opt}\s+"
-        rf"{b}=\s*{float_re}{imag_opt}\s+"
-        rf"{c}=\s*{float_re}{imag_opt}\s+"
-        rf"(?:VH|Hdir)=\s*{float_re}{imag_opt}"
-    )
+    float_token = r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+    data_re = re.compile(r"n=\s*(\d+)")
+    field_re = re.compile(
+        rf"([A-Za-z][A-Za-z0-9_]*)=\s*({float_token})"
+        rf"(?:\+\s*({float_token})i)?")
     kpt_re = re.compile(r"k-point\s+(\d+)\s*:")
 
     kpt = -1
@@ -692,11 +694,15 @@ def parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarr
         m = data_re.search(line)
         if not m:
             continue
+        fields = {name: (float(real), float(imag) if imag else 0.0)
+                  for name, real, imag in field_re.findall(line)}
+        direct = fields.get("VH", fields.get("Hdir"))
+        if direct is None or any(label not in fields for label in labels):
+            continue
         band = int(m.group(1))
-        # Groups: 2=A_re, 3=A_im, 4=B_re, 5=B_im, 6=C_re, 7=C_im, 8=VH_re, 9=VH_im
-        rows.append([float(kpt), float(band), float(m.group(2)),
-                     float(m.group(4)), float(m.group(6)), float(m.group(8)),
-                     float(m.group(9)) if m.group(9) else 0.0])
+        rows.append([float(kpt), float(band),
+                     *(fields[label][0] for label in labels),
+                     direct[0], direct[1]])
     if not rows:
         raise ValueError(f"No Sigma data rows were parsed from {path}")
     return np.asarray(rows, dtype=np.float64)

@@ -119,6 +119,9 @@ class SigmaResult:
     hartree_omitted: bool = False
     sigma_sx_kij_ry: jax.Array | None = None
     sigma_coh_kij_ry: jax.Array | None = None
+    #: Physical Sigma_xc split by Lorentz sector, axes
+    #: (CC, CT+TC, TT, k, band, band).  Present only on bispinor routes.
+    sigma_lorentz_skij_ry: jax.Array | None = None
     #: Exact final-block q=0 photon-head diagonals, already in the DFT
     #: output basis.  Axes are (term=X/SX/COH, sector=CC/CT+TC/TT, k, band).
     #: Non-full modes carry None; the debug writer supplies schema zeros.
@@ -133,6 +136,7 @@ class SigmaResult:
     sigma_xc_kij_ry_unextrap: jax.Array | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
+    sigma_c_odd_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
     e_eval_ev: np.ndarray | None = None
     omega_grid_ev: np.ndarray | None = None
@@ -159,6 +163,8 @@ class SigmaResult:
     band_extrapolation_counts: tuple[int, ...] | None = None
     band_extrapolation_estimator: str | None = None
     band_extrapolation_scheme: str | None = None
+    ppm_probe_hermiticity_residual: float | None = None
+    ppm_odd_even_residue_ratio: float | None = None
 
     def __post_init__(self) -> None:
         if self.hartree_omitted:
@@ -224,6 +230,7 @@ ROTATED_TO_DFT_FIELDS = (
     "sigma_xc_kij_ry_unextrap",
     "sigma_sx_kij_ry",
     "sigma_coh_kij_ry",
+    "sigma_lorentz_skij_ry",
 )
 
 #: Left in the Σ compute basis on purpose — do NOT rotate these.
@@ -231,6 +238,9 @@ ROTATED_TO_DFT_FIELDS = (
 #: element-wise.  ``e_eval_ev`` is the spectrum used by the QSGW ansatz in
 #: the last map's QP basis; it is output provenance rather than an operator.
 SIGMA_BASIS_FIELDS = (
+    "sigma_c_omega_kij_ry",
+    "sigma_c_at_dft_diag_ev",
+    "sigma_c_odd_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",
 )
@@ -261,6 +271,8 @@ BASIS_FREE_FIELDS = (
     "band_extrapolation_estimator",
     "band_extrapolation_scheme",
     "hartree_omitted",
+    "ppm_probe_hermiticity_residual",
+    "ppm_odd_even_residue_ratio",
 )
 
 
@@ -363,6 +375,10 @@ def finalize_dynamic_sigma(
     efermi_provenance=None,
     photon_head_sigma_diag_tskn_ry=None,
     photon_head_sigma_basis=None,
+    sigma_lorentz_static_skij_ry=None,
+    sigma_c_odd_body_omega=None,
+    ppm_probe_hermiticity_residual=None,
+    ppm_odd_even_residue_ratio=None,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
 
@@ -413,6 +429,26 @@ def finalize_dynamic_sigma(
             efermi_ry=efermi_ry,
             efermi_provenance=efermi_provenance,
         )
+        sigma_c_odd_at_dft_ev = None
+        if sigma_c_odd_body_omega is not None:
+            (sigma_c_odd_at_dft_ev,
+             odd_omega_dft_rel_ev,
+             odd_efermi_dft_ev,
+             odd_reference_provenance,
+             _) = eval_sigma_c_at_dft_energies(
+                sigma_c_odd_body_omega,
+                config=config,
+                band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
+                mesh_xy=mesh_xy, print_fn=lambda *args, **kwargs: None,
+                efermi_ry=efermi_ry,
+                efermi_provenance=efermi_provenance,
+            )
+            if (not np.array_equal(odd_omega_dft_rel_ev, omega_dft_rel_ev)
+                    or odd_efermi_dft_ev != efermi_dft_ev
+                    or odd_reference_provenance != omega_reference_provenance):
+                raise ValueError(
+                    "GATE ppm_odd_sigma_reference: ordered-residue and total "
+                    "Sigma_c were evaluated on different energy references")
 
         # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
         # reference the interpolation above used — one omega reference per
@@ -472,6 +508,18 @@ def finalize_dynamic_sigma(
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
 
+        sigma_lorentz = None
+        if sigma_lorentz_static_skij_ry is not None:
+            # The dynamic charge sector is the residual after removing the
+            # explicitly computed static current sectors.  This is an exact
+            # decomposition of the very Sigma_xc matrix that drives H_QP;
+            # it does not run a second Sigma consumer or reconstruct blocks
+            # from output columns.
+            current = jnp.asarray(
+                sigma_lorentz_static_skij_ry, dtype=sigma_xc_qsgw.dtype)
+            sigma_lorentz = current.at[0].set(
+                sigma_xc_qsgw - current[1] - current[2])
+
         # ── THE SECOND QSGW MATRIX: N₃, UN-EXTRAPOLATED ─────────────────
         # Built only when the band extrapolation is driving, and built the
         # SAME way as the one above so the pair differs in exactly one thing:
@@ -517,9 +565,11 @@ def finalize_dynamic_sigma(
         hartree_omitted=bool(hartree_omitted),
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_qsgw,
+        sigma_lorentz_skij_ry=sigma_lorentz,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
         sigma_c_omega_kij_ry=sigma_c_omega,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
+        sigma_c_odd_at_dft_diag_ev=sigma_c_odd_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
         # The energies THIS call's Σ spectrum was evaluated at, kept so the
         # eqp1 writer can centre its linearization where the QP pole
@@ -540,6 +590,8 @@ def finalize_dynamic_sigma(
             str(_band_estimator) if _band_estimator is not None else None),
         band_extrapolation_scheme=(
             str(_band_scheme) if _band_scheme is not None else None),
+        ppm_probe_hermiticity_residual=ppm_probe_hermiticity_residual,
+        ppm_odd_even_residue_ratio=ppm_odd_even_residue_ratio,
         # The dynamic PACKED route's per-sector Gamma-cell diagnostics.
         # None for every scalar dynamic run, so the freq-debug writer's
         # columns are unchanged there; on the packed route its CC sector is
@@ -842,6 +894,8 @@ def compute_sigma_xc(
         mode, SigmaChannel.SX, SigmaChannel.COH)
     photon_head_sigma_diag = None
     photon_head_sigma_basis = None
+    sigma_lorentz = None
+    sig_x_b = None
     if packed_photon_replaces_charge_sigma(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
@@ -868,7 +922,8 @@ def compute_sigma_xc(
         photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
         from .photon_sigma import compute_static_photon_sigma
         (sig_x, sig_sx, sig_coh,
-         photon_head_diagnostics) = compute_static_photon_sigma(
+         photon_head_diagnostics,
+         photon_sigma_diagnostics) = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
             Gij=photon_Gij,
@@ -887,6 +942,7 @@ def compute_sigma_xc(
             photon_head_sigma_diag = (
                 photon_head_diagnostics.components_tskn_ry)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
+        sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
     elif uses_dynamic_packed_photon_route(config):
         # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
         # W_packed(w) = diag(W_00(w), W_TT, W_CT): the CHARGE block carries
@@ -943,7 +999,8 @@ def compute_sigma_xc(
         from .photon_sigma import (
             PHOTON_BLOCKS_CURRENT, compute_static_photon_sigma)
         (cur_x, cur_sx, cur_coh,
-         photon_head_diagnostics) = compute_static_photon_sigma(
+         photon_head_diagnostics,
+         photon_sigma_diagnostics) = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
             Gij=photon_Gij,
@@ -988,6 +1045,7 @@ def compute_sigma_xc(
             photon_head_sigma_diag = (
                 photon_head_diagnostics.components_tskn_ry)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
+        sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
     elif uses_static_photon_response(config):
         # EXHAUSTIVENESS over the packed route's compute modes.  The two
         # predicates above cover gw_config.PACKED_PHOTON_COMPUTE_MODES; a
@@ -1020,15 +1078,35 @@ def compute_sigma_xc(
         sig_x = cohsex["sig_x"]
         sig_sx = cohsex["sig_sx"]
         sig_coh = cohsex["sig_coh"]
+        sig_x_b = cohsex["sig_x_b"]
+        if sig_x_b is not None:
+            sigma_xc_incumbent = sig_sx + sig_coh
+            sigma_lorentz = jnp.stack((
+                sigma_xc_incumbent - sig_x_b,
+                jnp.zeros_like(sig_x_b),
+                sig_x_b,
+            ))
     else:
-        sig_x = compute_sigma_x(
+        _bispinor_sigma = (
+            wfns_transverse is not None and bispinor_v_q_path is not None)
+        sigma_x_result = compute_sigma_x(
             wfns, V_q, meta, mesh_xy,
             Gij=Gij,
             static_head_terms=static_head_terms,
             wfns_transverse=wfns_transverse,
             bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
+            return_transverse=_bispinor_sigma,
         )
+        if _bispinor_sigma:
+            sig_x, sig_x_b = sigma_x_result
+            sigma_lorentz = jnp.stack((
+                sig_x - sig_x_b,
+                jnp.zeros_like(sig_x_b),
+                sig_x_b,
+            ))
+        else:
+            sig_x = sigma_x_result
         sig_sx = sig_coh = jnp.zeros_like(sig_x)
 
     # Density-SC rebuilds this same exact G-space operator from the evolving
@@ -1078,6 +1156,7 @@ def compute_sigma_xc(
             sigma_xc_kij_ry=sig_x,
             sigma_sx_kij_ry=sig_x,
             sigma_coh_kij_ry=jnp.zeros_like(sig_x),
+            sigma_lorentz_skij_ry=sigma_lorentz,
             photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
             photon_head_sigma_basis=photon_head_sigma_basis,
         )
@@ -1092,6 +1171,7 @@ def compute_sigma_xc(
             sigma_xc_kij_ry=sigma_xc,
             sigma_sx_kij_ry=sig_sx,
             sigma_coh_kij_ry=sig_coh,
+            sigma_lorentz_skij_ry=sigma_lorentz,
             photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
             photon_head_sigma_basis=photon_head_sigma_basis,
         )
@@ -1236,6 +1316,7 @@ def compute_sigma_xc(
             sym=sym, wfn=wfn, band_slices=band_slices,
             input_dir=input_dir,
             write_sigma_omega_h5=write_sigma_omega_h5,
+            sigma_lorentz_static_skij_ry=sigma_lorentz,
             print_fn=print_fn,
             # The MPA grid was built against this reference (one per
             # iteration); the finalizer must read it back against the same
@@ -1292,6 +1373,7 @@ def compute_sigma_xc(
         ppm_outputs.head_sigma_diag_w_kn_ry,
         photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
         photon_head_sigma_basis=photon_head_sigma_basis,
+        sigma_lorentz_static_skij_ry=sigma_lorentz,
         sig_x=sig_x, sig_h=sig_h,
         v_h_scalar=v_h_scalar, h_transverse=h_transverse,
         hartree_omitted=bool(omit_v_h),
@@ -1303,6 +1385,10 @@ def compute_sigma_xc(
         band_extrapolation=ppm_outputs.band_extrapolation,
         sigma_c_body_omega_unextrap=(
             ppm_outputs.sigma_c_body_omega_unextrap),
+        sigma_c_odd_body_omega=ppm_outputs.sigma_c_odd_body_omega,
+        ppm_probe_hermiticity_residual=(
+            ppm_outputs.probe_hermiticity_residual),
+        ppm_odd_even_residue_ratio=ppm_outputs.odd_even_residue_ratio,
         print_fn=print_fn,
     )
 

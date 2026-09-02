@@ -124,6 +124,8 @@ class PPMBuildResult:
     #: single-residue model, the only one a time-reversal-symmetric deck
     #: sees; ``_residue_for_space`` is the one place the selection happens.
     B_odd_q: jax.Array | None = None
+    probe_hermiticity_residual: float | None = None
+    odd_even_residue_ratio: float | None = None
 
 
 def _residue_for_space(space: str, B_q, B_odd_q=None):
@@ -454,17 +456,28 @@ def fit_ppm(
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
     t1 = _t.perf_counter()
 
-    if B_odd is not None and print_fn is not None:
+    probe_hermiticity_residual = None
+    odd_even_residue_ratio = None
+    if B_odd is not None:
         # The size of the odd residue, as one scalar census: max|D| over
         # max|B|.  Two scalar reductions on the fitted tiles' own sharding.
         _d_max = float(jax.device_get(jnp.max(jnp.abs(B_odd))))
         _b_max = float(jax.device_get(jnp.max(jnp.abs(B))))
-        print_fn(
-            f"  {model_label} ORDERED residues (measured-broken-TR deck): "
-            f"R± = B ± D with D from the anti-Hermitian part of "
-            f"W^c(iω_p); max|D|/max|B| = "
-            f"{(_d_max / _b_max if _b_max > 0.0 else _d_max):.3e}; "
-            "conduction branches evolve R+, valence branches R-.")
+        odd_even_residue_ratio = (
+            _d_max / _b_max if _b_max > 0.0 else _d_max)
+        _probe_scale = float(jax.device_get(jnp.max(jnp.abs(Wprobe_q))))
+        _probe_anti = float(jax.device_get(jnp.max(jnp.abs(
+            Wprobe_q - jnp.conj(jnp.swapaxes(Wprobe_q, -1, -2))))))
+        probe_hermiticity_residual = (
+            _probe_anti / _probe_scale if _probe_scale > 0.0 else _probe_anti)
+        if print_fn is not None:
+            print_fn(
+                f"  {model_label} ORDERED residues (measured-broken-TR deck): "
+                f"R± = B ± D with D from the anti-Hermitian part of "
+                f"W^c(iω_p); max|D|/max|B| = "
+                f"{odd_even_residue_ratio:.3e}; W(iω_p) Hermiticity "
+                f"residual = {probe_hermiticity_residual:.3e}; conduction "
+                "branches evolve R+, valence branches R-.")
 
     # Deck-level ε_H measurement (env-gated observability; channel-
     # hermiticity memo §1.3/§3.5): the Laplace-family symmetry diagnostics
@@ -531,6 +544,8 @@ def fit_ppm(
         unfulfilled_fraction=fit.unfulfilled_fraction,
         n_nodes_static=n_nodes_static,
         B_odd_q=B_odd,
+        probe_hermiticity_residual=probe_hermiticity_residual,
+        odd_even_residue_ratio=odd_even_residue_ratio,
     )
 
 

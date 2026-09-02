@@ -135,7 +135,8 @@ from vcoul.minibz import (
     sample_minibz_qpoints,
     wrap_points_to_voronoi,
 )
-from vcoul.slab_2d import Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG, Slab2D
+from vcoul.slab_2d import (Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG, Slab2D,
+                           SlabQ0Certificate)
 from vcoul.sphere import (
     bare_coulomb_sphere_indices,
     bare_coulomb_sphere_mask,
@@ -157,7 +158,7 @@ __all__ = [
     "HeadSlotTable", "head_slot_table",
     "Bulk3D", "Slab2D", "Box0D",
     # the slab q->0 cell-average rule selection (no silent alternative)
-    "Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG",
+    "Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG", "SlabQ0Certificate",
     # standalone host quadrature owner
     "GAUSS_LEGENDRE_INTERVAL_PROVENANCE", "gauss_legendre_interval",
     # mini-BZ sampling / averaging

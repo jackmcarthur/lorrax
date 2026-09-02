@@ -19,6 +19,7 @@ as noise (+5.72 meV per occupied state on MoS2 3×3, lane J claim 0586).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import warnings
 
 import jax
@@ -32,7 +33,8 @@ from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
                           minibz_transverse_head_avg, minibz_voronoi_batches,
                           slab_minibz_photon_cubature)
 
-__all__ = ["Slab2D", "Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG"]
+__all__ = ["Slab2D", "SlabQ0Certificate", "Q0_RULE_EXACT",
+           "Q0_RULE_SOBOL_DEBUG"]
 
 #: The production q→0 cell-average rule: the exact mini-lattice
 #: Wigner--Seitz polygon, Γ-to-edge Duffy triangulation, fixed 16/24/32
@@ -52,6 +54,16 @@ _Q0_LADDER_RTOL = 1.0e-8
 _Q0_LADDER_ATOL = 1.0e-12
 
 _Q0_RULE_ANNOUNCED: set[str] = set()
+
+
+@dataclass(frozen=True)
+class SlabQ0Certificate:
+    """Public certificate for one exact slab q=0 cell average."""
+
+    orders: tuple[int, ...]
+    physical_counts: tuple[int, ...]
+    polygon_edges: int
+    final_error_ratio: float
 
 
 def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
@@ -191,6 +203,7 @@ class Slab2D:
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
+        certificate_fn=None,
     ):
         """``(⟨v⟩, ⟨v/(1 − v qᵀSq)⟩)`` over the Γ mini-BZ cell, bare units.
 
@@ -255,10 +268,12 @@ class Slab2D:
                 f"a sys_dim=2 deck, or ask for rule={Q0_RULE_SOBOL_DEBUG!r} "
                 "explicitly.  doc: docs/services/vcoul.md.")
         return self._q0_average_wigner_seitz(
-            geometry, kgrid, S_cart=S_cart, epshead=epshead)
+            geometry, kgrid, S_cart=S_cart, epshead=epshead,
+            certificate_fn=certificate_fn)
 
     def _q0_average_wigner_seitz(
         self, geometry: CoulombGeometry, kgrid, *, S_cart, epshead,
+        certificate_fn=None,
     ):
         """The production rule: the provider's exact WS/Duffy ladder.
 
@@ -300,7 +315,9 @@ class Slab2D:
             ladder.append((int(chunk.order), vc0, wcoul0))
         vc0_mean = ladder[-1][1]
         wcoul0 = ladder[-1][2]
-        self._require_q0_ladder_converged(receipt, ladder)
+        certificate = self._require_q0_ladder_converged(receipt, ladder)
+        if certificate_fn is not None:
+            certificate_fn(certificate)
         if wcoul0 is None:
             wcoul0 = self._q0_epshead_gamma_average(
                 geometry, receipt, epshead)
@@ -312,7 +329,7 @@ class Slab2D:
                 jnp.asarray(wcoul0, dtype=jnp.complex128))
 
     @staticmethod
-    def _require_q0_ladder_converged(receipt, ladder) -> None:
+    def _require_q0_ladder_converged(receipt, ladder) -> SlabQ0Certificate:
         """Refuse an unconverged ladder; announce the certificate once."""
         ratios = []
         for index in range(1, len(ladder)):
@@ -351,6 +368,12 @@ class Slab2D:
             f"<v>={ladder[-1][1].real:.9g} a.u.; ladder error_ratio="
             f"{ratios[-1]:.3e} (<= 1 required).  Same receipt the packed "
             "Gamma completion consumes.")
+        return SlabQ0Certificate(
+            orders=tuple(int(v) for v in receipt.orders),
+            physical_counts=tuple(int(v) for v in receipt.physical_counts),
+            polygon_edges=len(receipt.polygon_vertices),
+            final_error_ratio=float(ratios[-1]),
+        )
 
     @staticmethod
     def _q0_epshead_gamma_average(geometry, receipt, epshead):
