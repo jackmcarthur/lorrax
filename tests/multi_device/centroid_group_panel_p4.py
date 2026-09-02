@@ -32,7 +32,10 @@ def main() -> None:
         make_sharded_group_panel_pivoted_cholesky_select,
     )
     from common.shard_map import shard_map
-    from common.grouped_layout import build_square_grouped_shard_layout
+    from common.grouped_layout import (
+        build_grouped_shard_layout,
+        build_square_grouped_shard_layout,
+    )
     from symmetry_maps import (
         centroid_source_map_and_wrap,
         permutation_orbit_labels,
@@ -50,8 +53,9 @@ def main() -> None:
     labels = np.repeat(np.arange(sizes.size, dtype=np.int32), sizes)
     logical = int(labels.size)
     budget = 28
-    square = build_square_grouped_shard_layout(labels, (2, 2))
-    layout = square.fine
+    # The selector itself needs groups local on the flattened P4 row axis.
+    # This is deliberately distinct from the later X/Y-local symmetry view.
+    layout = build_grouped_shard_layout(labels, 4)
     if layout.n_padded % 4:
         _fail(f"packed extent {layout.n_padded} is not divisible by P4")
     for group in range(layout.n_groups):
@@ -122,8 +126,7 @@ def main() -> None:
     floor_ref = group_block_pivoted_cholesky_select(
         jnp.asarray(floor_gram), floor_budget, jnp.asarray(floor_labels),
         n_groups=floor_sizes.size, tol_rel=1e-10)
-    floor_square = build_square_grouped_shard_layout(floor_labels, (2, 2))
-    floor_layout = floor_square.fine
+    floor_layout = build_grouped_shard_layout(floor_labels, 4)
     if floor_layout.n_pad <= 0:
         _fail("rank-floor fixture must exercise internal fine-shard pads")
     floor_packed = floor_layout.pack_host(
@@ -163,8 +166,7 @@ def main() -> None:
     sparse_ref = group_block_pivoted_cholesky_select(
         jnp.asarray(sparse_gram), 8, jnp.asarray(sparse_labels),
         n_groups=2, tol_rel=1e-10)
-    sparse_square = build_square_grouped_shard_layout(sparse_labels, (2, 2))
-    sparse_layout = sparse_square.fine
+    sparse_layout = build_grouped_shard_layout(sparse_labels, 4)
     if np.count_nonzero(sparse_layout.shard_load == 0) != 2:
         _fail("all-pad-shard fixture did not create two empty owners")
     sparse_packed = sparse_layout.pack_host(
@@ -181,8 +183,9 @@ def main() -> None:
         _fail(f"all-pad-shard fixture rank={int(sparse_got[2])}, expected 8")
 
     # Real symmetry-service tables: a glide reflection on a 10x2 grid gives
-    # ten two-point orbits, nonzero lattice wraps, and four internal pads
-    # under P4.  TR rows duplicate the coordinate action.
+    # ten two-point orbits and nonzero lattice wraps.  The X/Y runtime layout
+    # has no pad here; the former XxY-local layout needed four.  TR rows
+    # duplicate the coordinate action.
     fft = np.asarray([10, 2, 1], dtype=np.int32)
     coords = np.indices(tuple(fft), dtype=np.int32).reshape(3, -1).T
     sym_matrices = np.stack([
@@ -200,31 +203,31 @@ def main() -> None:
         _fail("nonsymmorphic fixture did not produce a lattice wrap")
     action_labels = permutation_orbit_labels(permutations)
     action_square = build_square_grouped_shard_layout(action_labels, (2, 2))
-    action_layout = action_square.fine
-    if action_layout.n_pad != 4:
-        _fail(f"expected four internal pads, got {action_layout.n_pad}")
+    action_layout = action_square.axis
+    if action_layout.n_pad != 0:
+        _fail(f"expected no axis-layout pads, got {action_layout.n_pad}")
+    fine_size = action_layout.n_padded // 4
+    crosses_fine = False
     for group in range(action_layout.n_groups):
         rows = np.flatnonzero(action_layout.packed_group_id == group)
-        if np.unique(rows // action_layout.shard_size).size != 1:
-            _fail(f"action orbit {group} crosses a fine selector shard")
         if np.unique(rows // action_square.axis_shard_size).size != 1:
             _fail(f"action orbit {group} crosses the shared X/Y view")
+        crosses_fine |= np.unique(rows // fine_size).size > 1
+    if not crosses_fine:
+        _fail("fixture did not prove that XxY fine locality is unnecessary")
 
     n_action = int(coords.shape[0])
     canonical_values = (
         np.arange(n_action, dtype=np.float64)
         + 1j * np.arange(n_action, dtype=np.float64)[::-1])
     packed_values = action_layout.pack_host(canonical_values, fill_value=0.0)
-    flat_sharding = NamedSharding(mesh, P(("x", "y")))
     x_sharding = NamedSharding(mesh, P("x"))
     y_sharding = NamedSharding(mesh, P("y"))
-    flat_values = device_put_process_local(packed_values, flat_sharding)
     x_values = device_put_process_local(packed_values, x_sharding)
     y_values = device_put_process_local(packed_values, y_sharding)
 
     # Authenticate JAX's actual mesh-order split rather than assuming it.
     for array, expected_local in (
-        (flat_values, action_layout.shard_size),
         (x_values, action_square.axis_shard_size),
         (y_values, action_square.axis_shard_size),
     ):
@@ -235,13 +238,9 @@ def main() -> None:
         np.testing.assert_array_equal(
             np.asarray(shard.data), packed_values[slc])
 
-    local_indices = action_layout.pack_fine_local_permutations_host(
-        permutations[1:2])[0]
-    index_dev = device_put_process_local(local_indices, flat_sharding)
     packed_wrap = action_layout.pack_host(wraps[1], axis=0, fill_value=0)
     q_frac = np.asarray([0.125, 0.0, 0.0])
     packed_phase = np.exp(2j * np.pi * (packed_wrap @ q_frac))
-    phase_dev = device_put_process_local(packed_phase, flat_sharding)
 
     def make_local_action(spec):
         @jax.jit
@@ -254,16 +253,9 @@ def main() -> None:
             )(values, indices, phase)
         return local_action
 
-    flat_action = make_local_action(P(("x", "y")))
-    acted = flat_action(flat_values, index_dev, phase_dev)
-    jax.block_until_ready(acted)
-    acted_host = np.asarray(mh.process_allgather(acted, tiled=True))
     expected_action = (
         canonical_values[permutations[1]]
         * np.exp(2j * np.pi * (wraps[1] @ q_frac)))
-    np.testing.assert_allclose(
-        action_layout.unpack_host(acted_host), expected_action,
-        rtol=2e-14, atol=2e-14)
     forbidden = (
         "all-reduce(", "all-gather(", "all-to-all(",
         "collective-permute(", "reduce-scatter(",
@@ -274,8 +266,6 @@ def main() -> None:
         present = [name for name in forbidden if name in hlo]
         if present:
             _fail(f"packed {view} action introduced collectives: {present}")
-
-    check_hlo(flat_action, flat_values, index_dev, phase_dev, "flat")
 
     axis_indices = action_square.pack_axis_local_permutations_host(
         permutations[1:2])[0]
@@ -307,7 +297,7 @@ def main() -> None:
             "[centroid-group-panel-p4] square views/local nonsymmorphic "
             f"action PASS: logical/padded={n_action}/"
             f"{action_layout.n_padded}, "
-            "HLO collectives=0",
+            "X/Y HLO collectives=0; XxY locality intentionally absent",
             flush=True)
         print("[centroid-group-panel-p4] PASS", flush=True)
 

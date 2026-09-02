@@ -480,6 +480,8 @@ def unfold_isdf_operator(
     left_logical_extent=None,
     right_logical_extent=None,
     trs_pair_q_ibz=None,
+    axis_local_sym_perm=None,
+    right_axis_local_sym_perm=None,
 ):
     """Expand ``V_q_ibz`` over the IBZ to the full BZ.
 
@@ -579,6 +581,14 @@ def unfold_isdf_operator(
         Reversed-axis partner ``(n_q_ibz,n_right,n_left)`` for rectangular
         ``trs_rule='pair_transpose'``.  Square callers retain the historical
         self-transpose default.
+    axis_local_sym_perm, right_axis_local_sym_perm
+        Optional packed-view gather offsets with the same shapes as the
+        corresponding global permutation tables.  Each value is local to
+        its target X or Y shard.  Supplying these certifies an orbit-packed
+        basis and replaces the two all-to-all permutation round trips with
+        local gathers.  The global tables remain required and are checked
+        against these offsets.  A rectangular basis supplies both local
+        tables together.
     Returns
     -------
     V_q_full
@@ -596,7 +606,8 @@ def unfold_isdf_operator(
     square_defaults = (
         right_sym_perm is None and right_L_table is None
         and left_logical_extent is None and right_logical_extent is None
-        and trs_pair_q_ibz is None)
+        and trs_pair_q_ibz is None and axis_local_sym_perm is None
+        and right_axis_local_sym_perm is None)
     if (square_defaults
             and idx_np.shape[0] == int(V_q_ibz.shape[0])
             and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
@@ -614,6 +625,20 @@ def unfold_isdf_operator(
     left_L = np.asarray(L_table, dtype=np.float64)
     right_L = (left_L if right_L_table is None else
                np.asarray(right_L_table, dtype=np.float64))
+    if right_axis_local_sym_perm is not None and axis_local_sym_perm is None:
+        raise ValueError(
+            "unfold_isdf_operator: right_axis_local_sym_perm requires "
+            "axis_local_sym_perm")
+    left_local_perm = (None if axis_local_sym_perm is None else
+                       np.asarray(axis_local_sym_perm, dtype=np.int32))
+    right_local_perm = (
+        left_local_perm if right_axis_local_sym_perm is None
+        else np.asarray(right_axis_local_sym_perm, dtype=np.int32))
+    if (not same_basis_tables and left_local_perm is not None
+            and right_axis_local_sym_perm is None):
+        raise ValueError(
+            "unfold_isdf_operator: a rectangular endpoint action must "
+            "supply right_axis_local_sym_perm with axis_local_sym_perm")
     if left_perm.ndim != 2 or right_perm.ndim != 2:
         raise ValueError(
             "unfold_isdf_operator: left/right sym_perm tables must both be "
@@ -733,6 +758,42 @@ def unfold_isdf_operator(
             "unfold_isdf_operator: right L_table extent "
             f"{int(L_arr_right.shape[1])} != V_q_ibz right extent {n_right}.")
 
+    Px = int(mesh_xy.shape['x'])
+    Py = int(mesh_xy.shape['y'])
+    if left_local_perm is not None:
+        if left_local_perm.shape != fwd_perm.shape:
+            raise ValueError(
+                "unfold_isdf_operator: axis_local_sym_perm must match "
+                f"sym_perm shape {fwd_perm.shape}; got "
+                f"{left_local_perm.shape}.")
+        if right_local_perm.shape != fwd_perm_right.shape:
+            raise ValueError(
+                "unfold_isdf_operator: right_axis_local_sym_perm must match "
+                f"the right sym_perm shape {fwd_perm_right.shape}; got "
+                f"{right_local_perm.shape}.")
+        if n_left % Px or n_right % Py:
+            raise ValueError(
+                "unfold_isdf_operator: axis-local maps require endpoint "
+                f"extents divisible by X/Y; got {n_left}/{Px} and "
+                f"{n_right}/{Py}.")
+        left_chunk, right_chunk = n_left // Px, n_right // Py
+        for label, global_perm, local_perm, chunk in (
+                ("left", fwd_perm, left_local_perm, left_chunk),
+                ("right", fwd_perm_right, right_local_perm, right_chunk)):
+            target_owner = np.arange(global_perm.shape[1]) // chunk
+            source_owner = global_perm // chunk
+            if not np.array_equal(
+                    source_owner, np.broadcast_to(
+                        target_owner, source_owner.shape)):
+                raise ValueError(
+                    "unfold_isdf_operator: axis-local certification failed: "
+                    f"the {label} global source map crosses an axis shard.")
+            if not np.array_equal(local_perm, global_perm % chunk):
+                raise ValueError(
+                    "unfold_isdf_operator: axis-local certification failed: "
+                    f"the {label} local offsets disagree with the global "
+                    "source map modulo its shard extent.")
+
     logical_left = n_left if left_logical_extent is None else int(
         left_logical_extent)
     logical_right = n_right if right_logical_extent is None else int(
@@ -800,8 +861,149 @@ def unfold_isdf_operator(
         logical_right=logical_right,
         n_sym_spatial=int(n_sym_spatial),
         trs_rule=trs_rule,
+        left_local_perm_arr=left_local_perm,
+        right_local_perm_arr=right_local_perm,
         mesh_xy=mesh_xy)
     return fn(V_q_ibz, pair_source) if pair_source is not None else fn(V_q_ibz)
+
+
+def _permute_isdf_operator_axes_local(
+    operator_local,
+    left_source_map,
+    right_source_map,
+    *,
+    mesh_x: int,
+    mesh_y: int,
+    left_local_source_map=None,
+    right_local_source_map=None,
+):
+    """Apply two source maps without ever replicating an operator axis.
+
+    This is the single device backend for both the canonical symmetry action
+    in :func:`unfold_isdf_operator` and a pure basis reorder.  Its input and
+    output are one local tile of a global ``P(None,'x','y')`` operator.
+    A nonlocal map uses a volume-preserving all-to-all round trip: the other
+    endpoint is split while this endpoint is concatenated, the permutation
+    is applied, and the original 2-D sharding is restored.  Consequently no
+    intermediate is larger than the input tile on any rank.
+    """
+    n_left_local = int(operator_local.shape[1])
+    n_right_local = int(operator_local.shape[2])
+    x_idx = jax.lax.axis_index('x')
+    y_idx = jax.lax.axis_index('y')
+
+    if left_local_source_map is not None:
+        local_left = jax.lax.dynamic_slice_in_dim(
+            left_local_source_map, x_idx * n_left_local, n_left_local,
+            axis=1)
+        permuted_left = jnp.take_along_axis(
+            operator_local, local_left[:, :, None], axis=1,
+            mode='promise_in_bounds')
+    elif mesh_x > 1:
+        left_full = jax.lax.all_to_all(
+            operator_local, 'x', split_axis=2, concat_axis=1, tiled=True)
+        gathered_left = jnp.take_along_axis(
+            left_full, left_source_map[:, :, None], axis=1,
+            mode='promise_in_bounds')
+        permuted_left = jax.lax.all_to_all(
+            gathered_left, 'x', split_axis=1, concat_axis=2, tiled=True)
+    else:
+        permuted_left = jnp.take_along_axis(
+            operator_local, left_source_map[:, :, None], axis=1,
+            mode='promise_in_bounds')
+
+    if right_local_source_map is not None:
+        local_right = jax.lax.dynamic_slice_in_dim(
+            right_local_source_map, y_idx * n_right_local, n_right_local,
+            axis=1)
+        return jnp.take_along_axis(
+            permuted_left, local_right[:, None, :], axis=2,
+            mode='promise_in_bounds')
+    if mesh_y > 1:
+        right_full = jax.lax.all_to_all(
+            permuted_left, 'y', split_axis=1, concat_axis=2, tiled=True)
+        gathered_right = jnp.take_along_axis(
+            right_full, right_source_map[:, None, :], axis=2,
+            mode='promise_in_bounds')
+        return jax.lax.all_to_all(
+            gathered_right, 'y', split_axis=2, concat_axis=1, tiled=True)
+    return jnp.take_along_axis(
+        permuted_left, right_source_map[:, None, :], axis=2,
+        mode='promise_in_bounds')
+
+
+_REORDER_ISDF_OPERATOR_JIT_CACHE: dict = {}
+
+
+def reorder_isdf_operator_basis(
+    operator,
+    *,
+    left_source_map,
+    right_source_map,
+    mesh_xy,
+):
+    """Reorder both axes of an all-P sharded ISDF operator.
+
+    ``operator`` is ``(n_batch,n_left,n_right)`` with
+    ``P(None,'x','y')`` sharding.  Each rank-one map is destination-to-source
+    and must be a permutation of its complete endpoint.  The endpoint
+    extents are unchanged; on a multi-rank axis the implementation uses the
+    same volume-preserving all-to-all backend as the canonical symmetry
+    unfold, never an all-gather or a one-axis-sharded matrix transient.
+    """
+    shape = tuple(int(v) for v in operator.shape)
+    if len(shape) != 3:
+        raise ValueError(
+            "reorder_isdf_operator_basis: operator must have shape "
+            f"(n_batch,n_left,n_right); got {shape}.")
+    left = np.asarray(left_source_map, dtype=np.int32)
+    right = np.asarray(right_source_map, dtype=np.int32)
+    for label, source, extent in (
+            ("left", left, shape[1]), ("right", right, shape[2])):
+        if source.shape != (extent,):
+            raise ValueError(
+                "reorder_isdf_operator_basis: "
+                f"{label}_source_map must have shape ({extent},); got "
+                f"{source.shape}.")
+        if not np.array_equal(np.sort(source), np.arange(extent)):
+            raise ValueError(
+                "reorder_isdf_operator_basis: "
+                f"{label}_source_map must be a complete permutation.")
+    px = int(mesh_xy.shape['x'])
+    py = int(mesh_xy.shape['y'])
+    if shape[1] % (px * py) or shape[2] % (px * py):
+        raise ValueError(
+            "reorder_isdf_operator_basis: endpoint extents must divide the "
+            f"complete mesh ({px}x{py}) for volume-preserving all-to-all; "
+            f"got {shape[1]}/{shape[2]}.")
+    key = (
+        shape,
+        left.shape, left.tobytes(),
+        right.shape, right.tobytes(),
+        id(mesh_xy),
+    )
+    fn = _REORDER_ISDF_OPERATOR_JIT_CACHE.get(key)
+    if fn is None:
+        # Keep closure constants as host arrays.  This factory is legal inside
+        # a surrounding jit trace (the chi tau-scan first reaches it there);
+        # constructing JAX arrays here would capture DynamicJaxprTracers in
+        # the global cache and poison the next specialization.
+        left_rows = np.broadcast_to(left, (shape[0], shape[1])).copy()
+        right_rows = np.broadcast_to(right, (shape[0], shape[2])).copy()
+        sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=P(None, 'x', 'y'),
+                 out_specs=P(None, 'x', 'y'),
+                 check_vma=False)
+        def _kernel(local_operator):
+            return _permute_isdf_operator_axes_local(
+                local_operator, left_rows, right_rows,
+                mesh_x=px, mesh_y=py)
+
+        fn = jax.jit(_kernel, in_shardings=sharding, out_shardings=sharding)
+        _REORDER_ISDF_OPERATOR_JIT_CACHE[key] = fn
+    return fn(operator)
 
 
 _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
@@ -810,7 +1012,8 @@ _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
 def _get_unfold_isdf_operator_jit(
     *, V_q_shape, fwd_perm_arr, fwd_perm_right_arr, idx_arr, sym_arr,
     L_arr, L_right_arr, q_irr_arr, trs_mask_arr, logical_left,
-    logical_right, n_sym_spatial, mesh_xy,
+    logical_right, n_sym_spatial, mesh_xy, left_local_perm_arr=None,
+    right_local_perm_arr=None,
     trs_rule="conj",
 ):
     """Cache the inner ``_do_unfold`` jit by (shape, sym table content).
@@ -834,35 +1037,42 @@ def _get_unfold_isdf_operator_jit(
         int(logical_left), int(logical_right),
         int(n_sym_spatial),
         str(trs_rule),
+        (None if left_local_perm_arr is None else
+         (left_local_perm_arr.shape, left_local_perm_arr.tobytes())),
+        (None if right_local_perm_arr is None else
+         (right_local_perm_arr.shape, right_local_perm_arr.tobytes())),
         id(mesh_xy),
     )
     hit = _UNFOLD_ISDF_OPERATOR_JIT_CACHE.get(key)
     if hit is not None:
         return hit
 
-    # Promote to jax arrays once at trace-build time.  Closure capture
-    # makes these constants in the compiled HLO.
-    fwd_perm_j = jnp.asarray(fwd_perm_arr)
-    fwd_perm_right_j = jnp.asarray(fwd_perm_right_arr)
-    idx_j = jnp.asarray(idx_arr)
-    sym_j = jnp.asarray(sym_arr)
-    L_j = jnp.asarray(L_arr)
-    L_right_j = jnp.asarray(L_right_arr)
-    q_irr_j = jnp.asarray(q_irr_arr)
-    trs_mask_j = jnp.asarray(trs_mask_arr)
-    # Memory contract: never exceed 1× single-tile per rank.  Use
-    # ``shard_map`` + ``lax.all_to_all`` to redistribute axes between
-    # ranks volume-preservingly — at no point does any rank hold a
-    # full μ or ν axis (which would be Px× or Py× the single-tile
-    # memory).  The all_to_all calls split the OTHER big spatial axis
-    # (ν during the μ-permute step, μ during the ν-permute step), so
-    # this works for arbitrary Px·Py even when n_q < Px·Py.
+    # Closure constants stay as host arrays.  This factory can be entered
+    # while a larger caller is itself being traced (for example the first
+    # parent-k chi tau scan).  Creating JAX arrays here would then create
+    # DynamicJaxprTracers and store them in this process-global cache; a later
+    # specialization would fail with UnexpectedTracerError.  NumPy constants
+    # are embedded by the inner trace just as effectively and cannot leak.
+    fwd_perm_j = fwd_perm_arr
+    fwd_perm_right_j = fwd_perm_right_arr
+    idx_j = idx_arr
+    sym_j = sym_arr
+    L_j = L_arr
+    L_right_j = L_right_arr
+    q_irr_j = q_irr_arr
+    trs_mask_j = trs_mask_arr
+    left_local_perm_j = left_local_perm_arr
+    right_local_perm_j = right_local_perm_arr
+    # Memory contract: never exceed 1× single-tile per rank.  Canonical
+    # ordering uses volume-preserving all_to_all redistributions.  An
+    # authenticated orbit-packed order instead gathers each axis locally.
     n_left_padded = int(V_q_shape[-2])
     n_right_padded = int(V_q_shape[-1])
     Px = int(mesh_xy.shape['x'])
     Py = int(mesh_xy.shape['y'])
-    if (n_left_padded % (Px * Py) != 0
-            or n_right_padded % (Px * Py) != 0):
+    if (left_local_perm_arr is None
+            and (n_left_padded % (Px * Py) != 0
+                 or n_right_padded % (Px * Py) != 0)):
         if n_left_padded == n_right_padded:
             raise ValueError(
                 f"unfold_isdf_operator: n_rmu_padded={n_left_padded} must be "
@@ -899,42 +1109,19 @@ def _get_unfold_isdf_operator_jit(
         else:
             V_at_irr = V_ibz_local[idx_j]
 
-        # μ permute on 'x'.  all_to_all redistributes:
-        #   split  ν (local, /Py)  → ν / (Py·Px)
-        #   concat μ (/Px sharded) → full μ
-        # Volume per rank: n_q · μ · ν / (Px·Py) — unchanged from 1× tile.
-        # Required: ν/Py divisible by Px (ensured by the right pad).
-        if Px > 1:
-            V_x = jax.lax.all_to_all(
-                V_at_irr, 'x', split_axis=2, concat_axis=1, tiled=True)
-            # (n_q_full, μ, ν/(Px·Py))
-            V_x_perm = jnp.take_along_axis(
-                V_x, perm_left_q[:, :, None], axis=1,
-                mode='promise_in_bounds')
-            V_perm_mu = jax.lax.all_to_all(
-                V_x_perm, 'x', split_axis=1, concat_axis=2, tiled=True)
-            # (n_q_full, μ/Px, ν/Py)  — back to canonical
-        else:
-            V_perm_mu = jnp.take_along_axis(
-                V_at_irr, perm_left_q[:, :, None], axis=1,
-                mode='promise_in_bounds')
-
-        # ν permute on 'y'.  Mirror trick on the 'y' axis.
-        # Required: μ/Px divisible by Py (ensured by the left pad).
-        if Py > 1:
-            V_y = jax.lax.all_to_all(
-                V_perm_mu, 'y', split_axis=1, concat_axis=2, tiled=True)
-            # (n_q_full, μ/(Px·Py), ν)
-            V_y_perm = jnp.take_along_axis(
-                V_y, perm_right_q[:, None, :], axis=2,
-                mode='promise_in_bounds')
-            V_full_local = jax.lax.all_to_all(
-                V_y_perm, 'y', split_axis=2, concat_axis=1, tiled=True)
-            # (n_q_full, μ/Px, ν/Py)  — back to canonical
-        else:
-            V_full_local = jnp.take_along_axis(
-                V_perm_mu, perm_right_q[:, None, :], axis=2,
-                mode='promise_in_bounds')
+        mu_local = n_left_padded // Px
+        nu_local = n_right_padded // Py
+        x_idx = jax.lax.axis_index('x')
+        y_idx = jax.lax.axis_index('y')
+        left_local_q = (None if left_local_perm_j is None else
+                        left_local_perm_j[sym_j])
+        right_local_q = (None if right_local_perm_j is None else
+                         right_local_perm_j[sym_j])
+        V_full_local = _permute_isdf_operator_axes_local(
+            V_at_irr, perm_left_q, perm_right_q,
+            mesh_x=Px, mesh_y=Py,
+            left_local_source_map=left_local_q,
+            right_local_source_map=right_local_q)
 
         # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here
         # is L_table[s(q), μ] — wrap of centroid μ under sym op
@@ -953,10 +1140,6 @@ def _get_unfold_isdf_operator_jit(
             2j * jnp.pi * qL_left.astype(jnp.complex128))
         phase_right = jnp.exp(
             2j * jnp.pi * qL_right.astype(jnp.complex128))
-        mu_local = n_left_padded // Px
-        nu_local = n_right_padded // Py
-        x_idx = jax.lax.axis_index('x')
-        y_idx = jax.lax.axis_index('y')
         phase_mu = jax.lax.dynamic_slice_in_dim(
             phase_left, x_idx * mu_local, mu_local, axis=1)
         phase_nu = jax.lax.dynamic_slice_in_dim(
@@ -998,6 +1181,175 @@ def _get_unfold_isdf_operator_jit(
 
     _UNFOLD_ISDF_OPERATOR_JIT_CACHE[key] = _do_unfold
     return _do_unfold
+
+
+def _rotate_open_spin_centroid_operator(spatial, spin):
+    """Apply ``U O U†`` without routing the fixed 2c case through GEMM.
+
+    The generic two-sided einsum is mathematically compact, but on CUDA XLA
+    lowers its two length-two contractions to two enormous skinny cuBLAS
+    GEMMs with a complete operator transpose on each side.  For ``ns=2``
+    the contraction is a fixed four-scalar block action.  Writing that block
+    explicitly keeps it in one elementwise fusion and avoids all four
+    full-operator layout moves used by a valence/conduction Green pair.
+
+    Other spin extents retain the generic expression.  This helper owns only
+    the spin representation; centroid permutation, nonsymmorphic phases and
+    the antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
+    """
+    U = jnp.asarray(spin)
+    ns = int(spatial.shape[1])
+    if int(spatial.shape[3]) != ns or tuple(U.shape[1:]) != (ns, ns):
+        raise ValueError(
+            "_rotate_open_spin_centroid_operator: spatial spin axes and "
+            f"spin action disagree: {spatial.shape}/{U.shape}.")
+    if ns == 1:
+        factor = U[:, 0, 0] * jnp.conj(U[:, 0, 0])
+        return spatial * factor[:, None, None, None, None]
+    if ns != 2:
+        return jnp.einsum(
+            'kac,kcmdn,kbd->kambn', U, spatial, jnp.conj(U),
+            optimize=True)
+
+    u00 = U[:, 0, 0, None, None]
+    u01 = U[:, 0, 1, None, None]
+    u10 = U[:, 1, 0, None, None]
+    u11 = U[:, 1, 1, None, None]
+    g00 = spatial[:, 0, :, 0, :]
+    g01 = spatial[:, 0, :, 1, :]
+    g10 = spatial[:, 1, :, 0, :]
+    g11 = spatial[:, 1, :, 1, :]
+    l00 = u00 * g00 + u01 * g10
+    l01 = u00 * g01 + u01 * g11
+    l10 = u10 * g00 + u11 * g10
+    l11 = u10 * g01 + u11 * g11
+    o00 = l00 * jnp.conj(u00) + l01 * jnp.conj(u01)
+    o01 = l00 * jnp.conj(u10) + l01 * jnp.conj(u11)
+    o10 = l10 * jnp.conj(u00) + l11 * jnp.conj(u01)
+    o11 = l10 * jnp.conj(u10) + l11 * jnp.conj(u11)
+    return jnp.stack((
+        jnp.stack((o00, o01), axis=2),
+        jnp.stack((o10, o11), axis=2),
+    ), axis=1)
+
+
+def unfold_spin_centroid_operator(
+    operator_ibz,
+    *,
+    irr_idx,
+    sym_idx,
+    sym_perm,
+    L_table,
+    k_irr_frac,
+    spin_action_full,
+    n_sym_spatial,
+    mesh_xy,
+    logical_centroid_extent=None,
+    axis_local=False,
+):
+    r"""Unfold an open-spin centroid operator from k parents to full k.
+
+    ``operator_ibz`` has shape ``(nk_parent,s,mu,s,nu)`` and sharding
+    ``P(None,None,'x',None,'y')``.  The two endpoint pairs are merged in
+    centroid-major order, transported by :func:`unfold_isdf_operator`, then
+    rotated by the canonical spin representation::
+
+        O_k[a,mu,b,nu] = U_k[a,c]
+            O_parent[c,alpha(mu),d,alpha(nu)] U_k[b,d]^* .
+
+    On an antiunitary row the parent operator is transposed in the complete
+    ``(spin,centroid)`` endpoint space, not merely conjugated.  This matters
+    for a real-time Green function whose band weights are complex:
+    ``Theta G(t) Theta^-1`` uses ``G(t)^T``; ``conj(G(t))`` would silently
+    reverse ``t``.  The underlying ``pair_transpose`` rule also owns the
+    nonsymmorphic lattice-wrap phase.
+
+    ``axis_local=True`` is accepted only when the supplied packed global
+    source maps prove that every endpoint gather stays within its X/Y shard.
+    The lower-level owner authenticates that claim before compiling the
+    collective-free local-gather kernel.
+    """
+    shape = tuple(int(v) for v in operator_ibz.shape)
+    if len(shape) != 5 or shape[1] != shape[3]:
+        raise ValueError(
+            "unfold_spin_centroid_operator: operator_ibz must have shape "
+            f"(nk,s,mu,s,nu); got {shape}.")
+    nk_parent, ns, n_left, _, n_right = shape
+    if n_left != n_right:
+        raise ValueError(
+            "unfold_spin_centroid_operator: the first implementation owns "
+            "one square centroid basis; mixed endpoint bases must use one "
+            "authenticated rectangular plan, not truncate or pad implicitly.")
+    spin = np.asarray(spin_action_full, dtype=np.complex128)
+    n_full = int(np.asarray(irr_idx).shape[0])
+    if spin.shape != (n_full, ns, ns):
+        raise ValueError(
+            "unfold_spin_centroid_operator: spin_action_full must be "
+            f"({n_full},{ns},{ns}); got {spin.shape}.")
+    if int(np.asarray(k_irr_frac).shape[0]) != nk_parent:
+        raise ValueError(
+            "unfold_spin_centroid_operator: k_irr_frac and operator_ibz "
+            f"must share nk_parent={nk_parent} rows.")
+
+    perm = np.asarray(sym_perm, dtype=np.int32)
+    wraps = np.asarray(L_table)
+    if perm.shape[1:] != (n_left,) or wraps.shape != perm.shape + (3,):
+        raise ValueError(
+            "unfold_spin_centroid_operator: sym_perm/L_table must have "
+            f"shapes (n_sym,{n_left})/(n_sym,{n_left},3); got "
+            f"{perm.shape}/{wraps.shape}.")
+
+    # Merge order is (mu, spin), so a source centroid alpha(mu) expands to
+    # the contiguous source rows alpha(mu)*ns + spin.  L is spin-independent.
+    spin_slot = np.arange(ns, dtype=np.int32)
+    perm_ms = (perm[:, :, None] * ns + spin_slot[None, None, :]).reshape(
+        perm.shape[0], n_left * ns)
+    wraps_ms = np.repeat(wraps, ns, axis=1)
+    logical_mu = (n_left if logical_centroid_extent is None else
+                  int(logical_centroid_extent))
+    if not 0 < logical_mu <= n_left:
+        raise ValueError(
+            "unfold_spin_centroid_operator: logical_centroid_extent must be "
+            f"inside (0,{n_left}]; got {logical_mu}.")
+
+    flat_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    out_sh = NamedSharding(mesh_xy, P(None, None, 'x', None, 'y'))
+    flat = jax.lax.with_sharding_constraint(
+        jnp.transpose(operator_ibz, (0, 2, 1, 4, 3)).reshape(
+            nk_parent, n_left * ns, n_right * ns),
+        flat_sh)
+    local_perm = None
+    if bool(axis_local):
+        px = int(mesh_xy.shape['x'])
+        if (n_left * ns) % px:
+            raise ValueError(
+                "unfold_spin_centroid_operator: merged endpoint extent "
+                f"{n_left * ns} is not divisible by X={px}.")
+        local_perm = perm_ms % ((n_left * ns) // px)
+    flat_full = unfold_isdf_operator(
+        flat,
+        irr_idx=irr_idx,
+        sym_idx=sym_idx,
+        sym_perm=perm_ms,
+        L_table=wraps_ms,
+        q_irr_frac=k_irr_frac,
+        mesh_xy=mesh_xy,
+        n_sym_spatial=n_sym_spatial,
+        trs_rule="pair_transpose",
+        left_logical_extent=logical_mu * ns,
+        right_logical_extent=logical_mu * ns,
+        axis_local_sym_perm=local_perm,
+    )
+    spatial = jnp.transpose(
+        flat_full.reshape(n_full, n_left, ns, n_right, ns),
+        (0, 2, 1, 4, 3))
+    # Keep the irregular centroid gather and the small dense spin action as
+    # two device kernels.  Fusing them makes each gathered value feed four
+    # output blocks and was 1.58x slower on the real P4 Si operator, whereas
+    # this barrier measures at the sum of the independent bandwidth kernels.
+    spatial = jax.lax.optimization_barrier(spatial)
+    rotated = _rotate_open_spin_centroid_operator(spatial, spin)
+    return jax.lax.with_sharding_constraint(rotated, out_sh)
 
 
 def unfold_isdf_one_leg(

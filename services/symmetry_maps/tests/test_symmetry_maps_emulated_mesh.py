@@ -44,8 +44,11 @@ import pytest
 from lxkit.testing import require_devices
 from symmetry_maps import (KStarMap, centroid_source_map_and_wrap,
                            mix_channels_by_proper_rotation, star_broadcast,
+                           reorder_isdf_operator_basis,
                            star_select, star_spread,
-                           unfold_isdf_operator)
+                           spinor_rotation_for_sym_row,
+                           unfold_isdf_operator,
+                           unfold_spin_centroid_operator)
 
 #: {I, σ_y} on a 12x12x1 FFT grid — the smallest thing with a non-trivial
 #: permutation, a real umklapp wrap, and a TRS half.
@@ -314,6 +317,180 @@ def test_pair_transpose_unfolds_a_nonhermitian_operator(px, py):
         q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN,
         trs_rule="pair_transpose"))
     np.testing.assert_allclose(got, ref, rtol=1.0e-13, atol=1.0e-13)
+
+
+def test_axis_local_packed_unfold_matches_canonical_without_collectives():
+    """Orbit packing removes both permutation all-to-all round trips."""
+    import jax
+    import jax.numpy as jnp
+    from common.grouped_layout import build_square_grouped_shard_layout
+    from symmetry_maps import permutation_orbit_labels
+
+    mesh = _mesh(2, 2)
+    perm, L, n_rmu = _divisible_geometry()
+    V = _nonhermitian_ibz(n_rmu)
+    canonical = _hand_unfold(
+        V, perm=perm, L=L, n_rmu=n_rmu, trs_rule="pair_transpose")
+
+    square = build_square_grouped_shard_layout(
+        permutation_orbit_labels(perm), (2, 2))
+    layout = square.axis
+    packed_V = layout.pack_host(layout.pack_host(V, axis=1), axis=2)
+    packed_perm = layout.pack_permutations_host(perm)
+    packed_L = layout.pack_host(L, axis=1, fill_value=0)
+    local_perm = square.pack_axis_local_permutations_host(perm)
+
+    def run(value):
+        return unfold_isdf_operator(
+            value, irr_idx=_IRR, sym_idx=_SYM,
+            sym_perm=packed_perm, L_table=packed_L,
+            q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN,
+            trs_rule="pair_transpose",
+            axis_local_sym_perm=local_perm)
+
+    got = np.asarray(run(jnp.asarray(packed_V)))
+    expected = layout.pack_host(
+        layout.pack_host(canonical, axis=1), axis=2)
+    np.testing.assert_allclose(got, expected, rtol=1.0e-13, atol=1.0e-13)
+
+    hlo = jax.jit(run).lower(jnp.asarray(packed_V)).compiler_ir(
+        dialect="hlo").as_hlo_text().lower()
+    forbidden = ("all-to-all(", "all-gather(", "collective-permute(",
+                 "reduce-scatter(", "all-reduce(")
+    assert not [name for name in forbidden if name in hlo]
+
+
+def test_operator_basis_reorder_crosses_both_shards_without_replication():
+    """The public bridge applies arbitrary rectangular endpoint maps."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    mesh = _mesh(2, 2)
+    rng = np.random.default_rng(2026090103)
+    host = (rng.standard_normal((3, 8, 12))
+            + 1j * rng.standard_normal((3, 8, 12)))
+    left = np.asarray([6, 1, 4, 7, 0, 5, 2, 3], dtype=np.int32)
+    right = np.asarray([9, 2, 11, 4, 1, 8, 0, 7, 5, 10, 3, 6],
+                       dtype=np.int32)
+    sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    operand = jax.device_put(jnp.asarray(host), sharding)
+    got = reorder_isdf_operator_basis(
+        operand, left_source_map=left, right_source_map=right,
+        mesh_xy=mesh)
+    expected = host[:, left][:, :, right]
+    np.testing.assert_allclose(np.asarray(got), expected, rtol=0, atol=0)
+    assert got.sharding.spec == sharding.spec
+    hlo = jax.jit(lambda x: reorder_isdf_operator_basis(
+        x, left_source_map=left, right_source_map=right,
+        mesh_xy=mesh)).lower(operand).compiler_ir(
+            dialect="hlo").as_hlo_text().lower()
+    assert "all-gather(" not in hlo
+    assert hlo.count("all-to-all(") == 4
+
+
+def test_open_spin_green_unfold_uses_transpose_not_conjugation_for_tr():
+    """Complex real-time weights make the antiunitary rule observable."""
+    import jax.numpy as jnp
+
+    mesh = _mesh(2, 2)
+    perm, L, n_rmu = _divisible_geometry()
+    rng = np.random.default_rng(9142)
+    nb, ns = 4, 2
+    psi = (rng.standard_normal((3, nb, ns, n_rmu))
+           + 1j * rng.standard_normal((3, nb, ns, n_rmu)))
+    weight = np.exp(-1j * rng.uniform(0.2, 1.1, size=(3, nb)))
+    parent = np.einsum(
+        'pnsm,pn,pntv->psmtv', psi, weight, np.conj(psi), optimize=True)
+
+    U_spatial = np.asarray([
+        np.eye(2, dtype=np.complex128),
+        [[0.0, 1j], [1j, 0.0]],
+    ])
+    U_full = spinor_rotation_for_sym_row(
+        U_spatial, _SYM, _NTRAN, nspinor=2)
+    direct = np.empty((len(_IRR), ns, n_rmu, ns, n_rmu),
+                      dtype=np.complex128)
+    for k, (p, row) in enumerate(zip(_IRR, _SYM)):
+        p, row = int(p), int(row)
+        gathered = psi[p][:, :, perm[row]]
+        qL = np.asarray(L[row], dtype=float) @ _Q_IRR[p]
+        phase = np.exp(2j * np.pi * qL)
+        if row >= _NTRAN:
+            gathered = np.conj(gathered)
+            phase = np.conj(phase)
+        child = np.einsum(
+            'ac,ncm->nam', U_full[k], gathered, optimize=True)
+        child = child * phase[None, None, :]
+        direct[k] = np.einsum(
+            'nsm,n,ntv->smtv', child, weight[p], np.conj(child),
+            optimize=True)
+
+    got = np.asarray(unfold_spin_centroid_operator(
+        jnp.asarray(parent), irr_idx=_IRR, sym_idx=_SYM,
+        sym_perm=perm, L_table=L, k_irr_frac=_Q_IRR,
+        spin_action_full=U_full, n_sym_spatial=_NTRAN, mesh_xy=mesh))
+    np.testing.assert_allclose(got, direct, rtol=2.0e-13, atol=2.0e-13)
+
+    # A naive conjugation reverses every complex band phase.  Require this
+    # fixture to distinguish the exact pair-transpose rule by a wide margin.
+    trs_rows = np.flatnonzero(_SYM >= _NTRAN)
+    naive = np.conj(got[trs_rows])
+    scale = float(np.max(np.abs(direct[trs_rows])))
+    assert float(np.max(np.abs(naive - direct[trs_rows]))) / scale > 0.1
+
+
+def test_two_spin_operator_rotation_is_explicit_and_matches_dense_reference():
+    """The 2c backend must not regress to skinny GEMMs plus layout copies."""
+    import jax
+    import jax.numpy as jnp
+
+    from symmetry_maps.maps import _rotate_open_spin_centroid_operator
+
+    rng = np.random.default_rng(2026090104)
+    spatial = (rng.standard_normal((5, 2, 7, 2, 9))
+               + 1j * rng.standard_normal((5, 2, 7, 2, 9)))
+    raw = (rng.standard_normal((5, 2, 2))
+           + 1j * rng.standard_normal((5, 2, 2)))
+    U = np.empty_like(raw)
+    for k in range(raw.shape[0]):
+        U[k], _ = np.linalg.qr(raw[k])
+    expected = np.einsum(
+        'kac,kcmdn,kbd->kambn', U, spatial, np.conj(U), optimize=True)
+    got = _rotate_open_spin_centroid_operator(
+        jnp.asarray(spatial), np.asarray(U))
+    np.testing.assert_allclose(
+        np.asarray(got), expected, rtol=2.0e-13, atol=2.0e-13)
+
+    hlo = jax.jit(lambda x: _rotate_open_spin_centroid_operator(
+        x, np.asarray(U))).lower(jnp.asarray(spatial)).compiler_ir(
+            dialect='hlo').as_hlo_text().lower()
+    assert 'dot(' not in hlo
+
+
+def test_scalar_operator_rotation_is_explicit_and_matches_dense_reference():
+    """Scalar parent-k transport has the same dot-free lowering contract."""
+    import jax
+    import jax.numpy as jnp
+
+    from symmetry_maps.maps import _rotate_open_spin_centroid_operator
+
+    rng = np.random.default_rng(2026090201)
+    spatial = (rng.standard_normal((5, 1, 7, 1, 9))
+               + 1j * rng.standard_normal((5, 1, 7, 1, 9)))
+    angle = rng.uniform(-np.pi, np.pi, size=5)
+    U = np.exp(1j * angle)[:, None, None]
+    expected = np.einsum(
+        'kac,kcmdn,kbd->kambn', U, spatial, np.conj(U), optimize=True)
+    got = _rotate_open_spin_centroid_operator(
+        jnp.asarray(spatial), np.asarray(U))
+    np.testing.assert_allclose(
+        np.asarray(got), expected, rtol=2.0e-13, atol=2.0e-13)
+
+    hlo = jax.jit(lambda x: _rotate_open_spin_centroid_operator(
+        x, np.asarray(U))).lower(jnp.asarray(spatial)).compiler_ir(
+            dialect='hlo').as_hlo_text().lower()
+    assert 'dot(' not in hlo
 
 
 @pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])

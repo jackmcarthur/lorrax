@@ -144,42 +144,49 @@ def test_structural_receipt_validator_refuses_drifting_inverse_metadata():
         validate_grouped_shard_layout(missing_group)
 
 
-def test_one_finest_layout_coarsens_to_identical_square_axis_views():
+def test_one_axis_layout_serves_identical_square_views_without_xy_locality():
     from common.grouped_layout import build_square_grouped_shard_layout
 
-    labels = _labels_from_sizes([13, 11, 8, 7, 6, 5, 4, 3, 2, 1])
+    labels = _labels_from_sizes([9, 7, 5, 3])
     square = build_square_grouped_shard_layout(labels, (2, 2))
-    layout = square.fine
+    layout = square.axis
 
-    assert layout.n_shards == 4
-    assert square.axis_shard_size == 2 * layout.shard_size
+    assert layout.n_shards == 2
+    assert square.axis_shard_size == layout.shard_size
+    assert layout.n_padded % 4 == 0
     np.testing.assert_array_equal(
         layout.unpack_host(layout.pack_host(np.arange(layout.n_logical))),
         np.arange(layout.n_logical))
+    crosses_fine = False
+    fine_size = layout.n_padded // 4
     for group in range(layout.n_groups):
         rows = np.flatnonzero(layout.packed_group_id == group)
-        fine_owners = np.unique(rows // layout.shard_size)
-        axis_owners = np.unique(rows // square.axis_shard_size)
-        assert fine_owners.tolist() == [int(layout.group_owner[group])]
-        # This one numerical coarse owner is reused for both X and Y.
+        axis_owners = np.unique(rows // layout.shard_size)
         assert axis_owners.tolist() == [int(square.axis_group_owner[group])]
-    assert square.gram_extent_multiplier == pytest.approx(
-        (layout.n_padded / layout.n_logical) ** 2)
+        crosses_fine |= np.unique(rows // fine_size).size > 1
+    assert crosses_fine, "the fixture must prove XxY locality is not imposed"
 
     with pytest.raises(ValueError, match="square"):
         build_square_grouped_shard_layout(labels, (2, 4))
 
 
 def test_finest_layout_allows_all_pad_shards_without_splitting_groups():
-    from common.grouped_layout import build_square_grouped_shard_layout
+    from common.grouped_layout import build_grouped_shard_layout
 
-    square = build_square_grouped_shard_layout(
-        _labels_from_sizes([5, 3]), (2, 2))
-    layout = square.fine
+    layout = build_grouped_shard_layout(_labels_from_sizes([5, 3]), 4)
     assert np.count_nonzero(layout.shard_load == 0) == 2
     for group in range(layout.n_groups):
         rows = np.flatnonzero(layout.packed_group_id == group)
         assert np.unique(rows // layout.shard_size).size == 1
+
+
+def test_grouped_layout_refuses_nonpositive_shard_multiple():
+    from common.grouped_layout import build_grouped_shard_layout
+
+    with pytest.raises(ValueError, match="shard_size_multiple"):
+        build_grouped_shard_layout(
+            np.asarray([0, 1], dtype=np.int32), 2,
+            shard_size_multiple=0)
 
 
 def test_symmetry_maps_become_shard_local_after_packing():
@@ -202,7 +209,7 @@ def test_symmetry_maps_become_shard_local_after_packing():
     np.testing.assert_array_equal(np.bincount(labels), sizes)
     layout = build_grouped_shard_layout(labels, 3)
     packed_perm = layout.pack_permutations_host(permutations)
-    local_perm = layout.pack_fine_local_permutations_host(permutations)
+    local_perm = layout.pack_local_permutations_host(permutations)
 
     owner = np.arange(layout.n_padded) // layout.shard_size
     assert np.all(owner[None, :] == owner[packed_perm])
