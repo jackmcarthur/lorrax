@@ -1319,6 +1319,8 @@ def compute_sigma_xc(
             input_dir=input_dir,
             write_sigma_omega_h5=write_sigma_omega_h5,
             sigma_lorentz_static_skij_ry=sigma_lorentz,
+            sigma_c_odd_body_omega=body.sigma_c_odd_kij,
+            ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
             print_fn=print_fn,
             # The MPA grid was built against this reference (one per
             # iteration); the finalizer must read it back against the same

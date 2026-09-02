@@ -124,8 +124,9 @@ class _FakeReader:
         assert not self.closed, "read after close"
         self.log.append((pole_slice.start, pole_slice.stop, kwargs))
         n = pole_slice.stop - pole_slice.start
-        return (jnp.zeros((n, 1, 1, 1), jnp.complex128),
+        pair = (jnp.zeros((n, 1, 1, 1), jnp.complex128),
                 jnp.zeros((n, 1, 1, 1), jnp.complex128))
+        return (*pair, None) if kwargs.get("include_odd") else pair
 
     def __enter__(self):
         return self
@@ -148,7 +149,7 @@ def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
 
     def consume(_wfns, batches, n_poles, *_args, **_kwargs):
         got = [(lo, int(O.shape[0]), int(B.shape[0]))
-               for lo, O, B in batches]
+               for lo, O, B, _D in batches]
         assert n_poles == 10
         return got
 
@@ -181,7 +182,7 @@ def test_sigma_store_reuses_a_reader_the_caller_already_opened(monkeypatch):
     reads = []
 
     def consume(_wfns, batches, *_args, **_kwargs):
-        return [lo for lo, _O, _B in batches]
+        return [lo for lo, _O, _B, _D in batches]
 
     def open_reader(*_a, **_k):
         raise AssertionError("a live reader must not be reopened")
@@ -206,7 +207,8 @@ def test_sigma_store_accepts_eight_and_refuses_more_resident_poles(monkeypatch):
         mpa_sigma, "open_pole_reader", lambda *_a, **_k: _FakeReader(reads))
     monkeypatch.setattr(
         mpa_sigma, "_integrate_sigma_batches",
-        lambda _w, batches, *_a, **_k: [int(O.shape[0]) for _, O, _ in batches])
+        lambda _w, batches, *_a, **_k: [
+            int(O.shape[0]) for _, O, _B, _D in batches])
     got = mpa_sigma.integrate_sigma_store(
         None, "poles.h5", 8, (), np.array([0.0]), None, _mesh(),
         pole_batch_size=8)

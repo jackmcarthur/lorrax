@@ -136,7 +136,9 @@ def _residue_for_space(space: str, B_q, B_odd_q=None):
     (occupied) A-space the −Ω one (derivation §4, verified against the
     imaginary-axis contour in ``tests/test_gnppm_ordered_orientations.py``).
     With ``B_odd_q=None`` both branches get ``B_q`` and nothing about the
-    incumbent path changes, not even the object identity.
+    incumbent path changes, not even the object identity.  A zero-valued
+    ``B_odd_q`` (the explicit broken-TR debug A/B arm) likewise gives
+    ``R_+ = R_- = B_q`` while retaining the odd-channel observability seam.
     """
     if space not in ("cond", "val"):
         raise ValueError(
@@ -163,6 +165,12 @@ class SigmaOmegaResult:
     # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
+    #: Optional exact ordered-residue contribution on the SAME omega grid:
+    #: ``Sigma_c[B,D] - Sigma_c[B,D=0]``.  GN-PPM carries this beside the
+    #: result in ``PPMOutputs`` because of its band-bracket pipeline; MPA has
+    #: no bracket tail and carries it here.  ``None`` is the TRS/incumbent
+    #: route and preserves its object graph.
+    sigma_c_odd_kij: jax.Array | None = None
     #: The LOGICAL band count each leading-axis element sums to.  Aligned
     #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
     #: and nothing else needs either.
@@ -177,6 +185,9 @@ class SigmaOmegaResult:
     #: how much of ``S_inf`` was never extrapolated
     #: (``band_extrapolation.static_limit_tail_ruling``).
     static_coh_at_counts: np.ndarray | None = None
+    #: Measured fit-level ``max|D|/max|B|`` for an ordered MPA store.  Kept
+    #: here so the shared driver report does not re-read or re-fit poles.
+    odd_even_residue_ratio: float | None = None
 
 
 class _SigmaBranchTiles(NamedTuple):
@@ -442,7 +453,8 @@ def fit_ppm(
          n_mu_logical=int(n_mu_logical),
          q_neg_index=q_neg_index,
          coarsen_extreme_tails=bool(coarsen_extreme_tails),
-         ordered_orientations=bool(ordered_orientations))
+         ordered_orientations=bool(ordered_orientations),
+         print_fn=print_fn if print_fn is not None else print)
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(

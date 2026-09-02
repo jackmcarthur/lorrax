@@ -1544,15 +1544,25 @@ def main(argv=None):
 		              if np.max(_xc_abs) > 0.0 else np.max(_odd_abs))
 		_mean_share = (np.mean(_odd_abs) / np.mean(_xc_abs)
 		               if np.mean(_xc_abs) > 0.0 else np.mean(_odd_abs))
-		report.progress(
-			"GN odd Sigma   : measured-broken-TR ordered residue; "
+		_odd_prefix = (
+			"MPA odd Sigma  "
+			if getattr(config.compute_mode, "value", config.compute_mode) == "mpa"
+			else "GN odd Sigma   ")
+		_odd_line = (
+			f"{_odd_prefix}: measured-broken-TR ordered residue; "
 			f"max|sigC_odd|={np.max(_odd_abs):.6e} eV; "
 			f"mean|sigC_odd|={np.mean(_odd_abs):.6e} eV; "
 			f"max-share-of-|Sigma_xc|={_max_share:.6e}; "
-			f"mean-share-of-|Sigma_xc|={_mean_share:.6e}; "
-			f"W(iomega_p)-Hermiticity="
-			f"{sigma_result.ppm_probe_hermiticity_residual:.3e}; "
-			f"max|D|/max|B|={sigma_result.ppm_odd_even_residue_ratio:.3e}")
+			f"mean-share-of-|Sigma_xc|={_mean_share:.6e}")
+		if sigma_result.ppm_probe_hermiticity_residual is not None:
+			_odd_line += (
+				f"; W(iomega_p)-Hermiticity="
+				f"{sigma_result.ppm_probe_hermiticity_residual:.3e}")
+		if sigma_result.ppm_odd_even_residue_ratio is not None:
+			_odd_line += (
+				f"; max|D|/max|B|="
+				f"{sigma_result.ppm_odd_even_residue_ratio:.3e}")
+		report.progress(_odd_line)
 	if q0_certificates:
 		_q0_cert = max(q0_certificates, key=lambda item: item.final_error_ratio)
 		report.progress(

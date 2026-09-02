@@ -2010,13 +2010,13 @@ def read_w_columns_collective(
 def _initialise_fit_metadata(
     grp, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
     centroid_hash, unfold_tables, provenance, diagnostic_keys=None,
-    preserve_payload=False, occupation_state=None,
+    preserve_payload=False, occupation_state=None, ordered_residues=False,
 ):
     """Rank-zero-only small metadata half of fit-store allocation."""
     qs = _qs()
     reset = [MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX]
     if not preserve_payload:
-        reset = ["Omega_p", "B_p"] + [
+        reset = ["Omega_p", "B_p", "B_odd_p"] + [
             k for k in grp if str(k).startswith("fit_")] + reset
     for key in reset:
         if key in grp:
@@ -2037,6 +2037,7 @@ def _initialise_fit_metadata(
     grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
     grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
     grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
+    grp.attrs["mpa_fit_ordered_residues"] = bool(ordered_residues)
     grp.attrs["mpa_fit_complete"] = False
     grp.attrs["mpa_fit_writer"] = "file_io.mpa_store"
     grp.attrs["mpa_fit_generator_commit"] = qs.qirr_generator_commit()
@@ -2066,6 +2067,7 @@ def allocate_fit_store(
     dtype=None,
     provenance=None,
     occupation_state=None,
+    ordered_residues=False,
     mode="a",
 ):
     """Create the staged B_q / Ω_q store with an EMPTY completion ledger.
@@ -2115,11 +2117,15 @@ def allocate_fit_store(
             centroid_hash=centroid_hash, unfold_tables=unfold_tables,
             provenance=provenance,
             diagnostic_keys=PERSISTED_DIAGNOSTICS,
-            occupation_state=occupation_state)
+            occupation_state=occupation_state,
+            ordered_residues=ordered_residues)
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
+        if ordered_residues:
+            grp.create_dataset("B_odd_p", shape=(n_p, n_q, n_mu, n_mu),
+                               dtype=dtype)
         for key in PERSISTED_DIAGNOSTICS:
             grp.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
                                dtype=np.float64)
@@ -2131,6 +2137,7 @@ def allocate_fit_store_collective(
     dest, *, mesh_xy, n_q, n_mu, n_p,
     energy_unit=None, grid_hash=None, table_hash=None, centroid_hash=None,
     unfold_tables=None, dtype=None, provenance=None, occupation_state=None,
+    ordered_residues=False,
     mode="w",
 ):
     """Allocate a fit store without any rank owning a pole tensor.
@@ -2180,6 +2187,9 @@ def allocate_fit_store_collective(
         io.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                           dtype=dtype)
         io.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
+        if ordered_residues:
+            io.create_dataset(
+                "B_odd_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
         for key in keys:
             io.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
                               dtype=np.float64)
@@ -2192,7 +2202,8 @@ def allocate_fit_store_collective(
                 table_hash=table_hash, centroid_hash=centroid_hash,
                 unfold_tables=unfold_tables, provenance=provenance,
                 diagnostic_keys=keys, preserve_payload=True,
-                occupation_state=occupation_state)
+                occupation_state=occupation_state,
+                ordered_residues=ordered_residues)
     barrier("mpa_fit_metadata_allocated")
     return fit_completion_ledger(dest)
 
@@ -2662,6 +2673,7 @@ def write_fit_block(
     B_p_block,
     diag_block,
     *,
+    B_odd_p_block=None,
     mode="a",
 ):
     """Append one column block's poles and residues as the fit completes.
@@ -2695,11 +2707,17 @@ def write_fit_block(
     qs = _qs()
     Om = np.asarray(Omega_p_block)
     Bp = np.asarray(B_p_block)
+    Dp = None if B_odd_p_block is None else np.asarray(B_odd_p_block)
     with _h5(dest, mode) as grp:
         led = _open_fit(grp)
         n_p = int(grp.attrs["mpa_fit_n_p"])
         n_q = int(grp.attrs["mpa_fit_n_q"])
         n_mu = int(grp.attrs["mpa_fit_n_mu_logical"])
+        ordered = bool(grp.attrs.get("mpa_fit_ordered_residues", False))
+        if ordered != (Dp is not None):
+            raise ValueError(
+                "write_fit_block: B_odd_p_block presence must match the "
+                f"store's ordered-residue stamp ({ordered})")
         if bool(grp.attrs.get("mpa_fit_complete", False)):
             raise ValueError(
                 "write_fit_block: this store is FINALIZED.  Appending "
@@ -2712,7 +2730,10 @@ def write_fit_block(
                 f"write_fit_block: q={iq} is outside [0, {n_q})")
         cols = normalise_columns(mu_cols, n_mu)
         want = (n_p, n_mu, int(cols.size))
-        for label, arr in (("Omega_p_block", Om), ("B_p_block", Bp)):
+        arrays = [("Omega_p_block", Om), ("B_p_block", Bp)]
+        if Dp is not None:
+            arrays.append(("B_odd_p_block", Dp))
+        for label, arr in arrays:
             if arr.shape != want:
                 raise ValueError(
                     f"write_fit_block: {label} is {arr.shape}, expected "
@@ -2750,6 +2771,8 @@ def write_fit_block(
         sel = slice(lo, hi) if sel is None else sel
         grp["Omega_p"][:, iq, :, sel] = Om
         grp["B_p"][:, iq, :, sel] = Bp
+        if Dp is not None:
+            grp["B_odd_p"][:, iq, :, sel] = Dp
         for key in PERSISTED_DIAGNOSTICS:
             grp["fit_" + key][iq, :, sel] = diag[key]
 
@@ -2826,6 +2849,10 @@ class FitWriter:
                                 dtype=np.complex128)
         self._io.create_dataset("B_p", shape=pole_shape,
                                 dtype=np.complex128)
+        self.ordered_residues = bool(self.ledger["ordered_residues"])
+        if self.ordered_residues:
+            self._io.create_dataset("B_odd_p", shape=pole_shape,
+                                    dtype=np.complex128)
         for key in self.diagnostic_keys:
             self._io.create_dataset("fit_" + key, shape=diag_shape,
                                     dtype=np.float64)
@@ -2874,6 +2901,7 @@ class FitWriter:
         B_p_block,
         diag_block,
         *,
+        B_odd_p_block=None,
         block_condition_max,
         block_backward_error_max,
         diagnostics_finite,
@@ -2917,7 +2945,13 @@ class FitWriter:
         # JAX canonicalizes trailing replicated entries away on rank-3 arrays.
         diag_spec = P(None, ("x", "y"))
         Om, Bp = Omega_p_block, B_p_block
-        for arr in (Om, Bp):
+        Dp = B_odd_p_block
+        if self.ordered_residues != (Dp is not None):
+            raise ValueError(
+                "FitWriter.write_block: B_odd_p_block presence must match "
+                f"the store's ordered-residue stamp ({self.ordered_residues})")
+        arrays = (Om, Bp) if Dp is None else (Om, Bp, Dp)
+        for arr in arrays:
             _require_layout(
                 arr, self.mesh_xy, pole_spec,
                 "FitWriter.write_block requires Omega_p and B_p on "
@@ -2927,6 +2961,9 @@ class FitWriter:
             raise ValueError(
                 "FitWriter.write_block: pole blocks must agree and have "
                 "shape (n_p,1,n_mu_padded,n_cols_buffer)")
+        if Dp is not None and tuple(Dp.shape) != tuple(Om.shape):
+            raise ValueError(
+                "FitWriter.write_block: B_odd_p must match the pole block")
         if n_p != ledger["n_p"] or n_rows < ledger["n_mu"] \
                 or width < int(cols.size):
             raise ValueError(
@@ -2960,6 +2997,10 @@ class FitWriter:
         self._io.write_slab("B_p", Bp, offset=(0, iq, 0, lo),
                             global_shape=global_pole,
                             valid_shape=valid_pole)
+        if Dp is not None:
+            self._io.write_slab("B_odd_p", Dp, offset=(0, iq, 0, lo),
+                                global_shape=global_pole,
+                                valid_shape=valid_pole)
         for key in keys:
             self._io.write_slab(
                 "fit_" + key, diag_block[key], offset=(iq, 0, lo),
@@ -2996,6 +3037,7 @@ def write_fit_block_collective(
     B_p_block,
     diag_block,
     *,
+    B_odd_p_block=None,
     mesh_xy,
     block_condition_max,
     block_backward_error_max,
@@ -3011,6 +3053,7 @@ def write_fit_block_collective(
     with FitWriter(dest, mesh_xy=mesh_xy) as writer:
         writer.write_block(
             q, mu_cols, Omega_p_block, B_p_block, diag_block,
+            B_odd_p_block=B_odd_p_block,
             block_condition_max=block_condition_max,
             block_backward_error_max=block_backward_error_max,
             diagnostics_finite=diagnostics_finite)
@@ -3103,6 +3146,14 @@ def fit_completion_ledger(src, *, mode="r"):
             str(key)[len("prov_"):]: grp.attrs[key]
             for key in grp.attrs if str(key).startswith("prov_")
         }
+        ordered_residues = bool(
+            grp.attrs.get("mpa_fit_ordered_residues", False))
+        has_odd = "B_odd_p" in grp
+        if has_odd != ordered_residues:
+            raise ValueError(
+                "mpa_store: fit store's mpa_fit_ordered_residues stamp "
+                f"is {ordered_residues}, but B_odd_p presence is {has_odd}. "
+                "A partial ordered-residue schema is refused.")
         out = {
             "format_version": int(grp.attrs["mpa_fit_format_version"]),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
@@ -3118,6 +3169,7 @@ def fit_completion_ledger(src, *, mode="r"):
                 grp, "mpa_fit_w_centroid_hash"),
             "energy_unit": qs.qirr_attr_str(grp, FIT_ENERGY_UNIT_ATTR),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
+            "ordered_residues": ordered_residues,
             "complete": bool(grp.attrs.get("mpa_fit_complete", False)),
             "blocks_done": done,
             "n_done": int(done.sum()),
@@ -3485,7 +3537,7 @@ def read_fit_unfold_tables(src, *, mode="r"):
         return qs.read_tables(grp, FIT_TABLE_OWNER, mode=mode)
 
 
-def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
+def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy, B_odd_p=None):
     """Unfold one pole wedge without conjugating its frequency dependence."""
     import jax.numpy as jnp
 
@@ -3509,12 +3561,18 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
         jnp.asarray(Omega_p), L_table=zeros, **kwargs)
     B_full = unfold_isdf_operator(
         jnp.asarray(B_p), L_table=can.L_table, **kwargs)
-    return Omega_full, B_full
+    if B_odd_p is None:
+        return Omega_full, B_full
+    if tuple(B_odd_p.shape) != tuple(Omega_p.shape):
+        raise ValueError("odd-residue pole slab must match Omega_p")
+    D_full = unfold_isdf_operator(
+        jnp.asarray(B_odd_p), L_table=can.L_table, **kwargs)
+    return Omega_full, B_full, D_full
 
 
 def _finish_pole_read(
     src, Omega, Bp, ledger, *, mesh_xy, unfold, return_sharded, to_unit,
-    tables=_UNREAD,
+    tables=_UNREAD, B_odd=None, include_odd=False,
 ):
     """Apply the one unit/unfold policy shared by pole readers.
 
@@ -3526,6 +3584,8 @@ def _finish_pole_read(
     if to_unit is not None:
         scale = _unit_scale(ledger["energy_unit"], to_unit, "pole read")
         Omega, Bp = Omega * scale, Bp * scale
+        if B_odd is not None:
+            B_odd = B_odd * scale
 
     if unfold and ledger["q_storage"] == "ibz":
         import jax.numpy as jnp
@@ -3537,15 +3597,27 @@ def _finish_pole_read(
         if tables is None:
             raise ValueError("wedge fit has no unfold tables")
         if Omega.ndim == 3:
-            Omega, Bp = unfold_pole_field(Omega, Bp, tables, mesh_xy=mesh_xy)
+            unfolded = unfold_pole_field(
+                Omega, Bp, tables, mesh_xy=mesh_xy, B_odd_p=B_odd)
+            if B_odd is None:
+                Omega, Bp = unfolded
+            else:
+                Omega, Bp, B_odd = unfolded
         else:
-            Omega, Bp = map(
-                jnp.stack,
-                zip(*(unfold_pole_field(Omega[p], Bp[p], tables,
-                                        mesh_xy=mesh_xy)
-                      for p in range(int(Omega.shape[0])))))
+            unfolded = tuple(
+                unfold_pole_field(
+                    Omega[p], Bp[p], tables, mesh_xy=mesh_xy,
+                    B_odd_p=None if B_odd is None else B_odd[p])
+                for p in range(int(Omega.shape[0])))
+            stacked = tuple(map(jnp.stack, zip(*unfolded)))
+            if B_odd is None:
+                Omega, Bp = stacked
+            else:
+                Omega, Bp, B_odd = stacked
     if return_sharded and mesh_xy is None:
         raise ValueError("return_sharded requires mesh_xy")
+    if include_odd:
+        return Omega, Bp, B_odd
     return Omega, Bp
 
 
@@ -3652,7 +3724,7 @@ class PoleReader:
             io.close()
 
     def read(self, pole_slice=None, *, unfold=False, return_sharded=False,
-             to_unit=None):
+             to_unit=None, include_odd=False):
         """One contiguous pole range, through the handle already open."""
         if self._io is None:
             raise ValueError(
@@ -3670,10 +3742,15 @@ class PoleReader:
         Bp = self._io.read_slab(
             "B_p", shape=shape, offset=(lo, 0, 0, 0),
             partition_spec=P(None, None, "x", "y"))
+        B_odd = None
+        if include_odd and self.ledger["ordered_residues"]:
+            B_odd = self._io.read_slab(
+                "B_odd_p", shape=shape, offset=(lo, 0, 0, 0),
+                partition_spec=P(None, None, "x", "y"))
         return _finish_pole_read(
             self.src, Omega, Bp, self.ledger, mesh_xy=self.mesh_xy,
             unfold=unfold, return_sharded=return_sharded, to_unit=to_unit,
-            tables=self.tables)
+            tables=self.tables, B_odd=B_odd, include_odd=include_odd)
 
 
 def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
@@ -3698,6 +3775,7 @@ def read_poles(
     return_sharded=False,
     to_unit=None,
     allow_partial=False,
+    include_odd=False,
     mode="r",
 ):
     """Read one contiguous pole range with two collective SlabIO reads.
@@ -3742,7 +3820,8 @@ def read_poles(
         with open_pole_reader(src, mesh_xy=mesh_xy,
                               allow_partial=allow_partial, mode=mode) as rd:
             return rd.read(pole_slice, unfold=unfold,
-                           return_sharded=return_sharded, to_unit=to_unit)
+                           return_sharded=return_sharded, to_unit=to_unit,
+                           include_odd=include_odd)
 
     with _h5(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
@@ -3750,6 +3829,9 @@ def read_poles(
         lo, hi = _pole_range(ledger, pole_slice, "read_poles")
         Omega = np.asarray(grp["Omega_p"][lo:hi])
         Bp = np.asarray(grp["B_p"][lo:hi])
+        B_odd = (np.asarray(grp["B_odd_p"][lo:hi])
+                 if include_odd and ledger["ordered_residues"] else None)
     return _finish_pole_read(
         src, Omega, Bp, ledger, mesh_xy=None, unfold=unfold,
-        return_sharded=return_sharded, to_unit=to_unit)
+        return_sharded=return_sharded, to_unit=to_unit,
+        B_odd=B_odd, include_odd=include_odd)

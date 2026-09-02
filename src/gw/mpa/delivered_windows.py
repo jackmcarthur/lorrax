@@ -563,7 +563,7 @@ def load_complete_delivered_sigma_plan(path, request_fingerprint, branches):
             pole_indices=np.asarray(saved["pole_indices"], np.int32),
             bounds=np.asarray(saved["bounds"], np.float64),
             phase_real=np.asarray(saved["phase_real"], bool),
-            band_weight=branch.band_weight))
+            band_weight=branch.band_weight, space=branch.space))
     geometry = dict(payload["geometry"])
     geometry.update(plan_cache_status="complete_hit",
                     plan_cache_path=path, plan_seconds=0.0)
@@ -2671,7 +2671,7 @@ def build_delivered_sigma_windows(
             pole_indices=spec["pole_indices"],
             bounds=_pole_bounds(len(spec["pole_indices"]), pole_lo, pole_hi),
             phase_real=np.zeros(len(spec["pole_indices"]), dtype=bool),
-            band_weight=branch.band_weight))
+            band_weight=branch.band_weight, space=branch.space))
         spec["branch_report"]["windows"].append({
             "name": spec["name"], "kind": spec["kind"],
             "omega_abs_ry": np.asarray(spec["omega_abs"]).tolist(),

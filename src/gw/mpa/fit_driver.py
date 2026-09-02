@@ -136,7 +136,7 @@ def fit_scalar_samples(
 
 
 @functools.lru_cache(maxsize=None)
-def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
+def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve, ordered=False):
     """One compiled local-row fit; columns remain replicated."""
     import jax
     import jax.numpy as jnp
@@ -153,17 +153,29 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
     n = int(n_p)
     eig = _fit_eig(solve)
 
-    def _local(block, z, row_ids, n_mu_logical, n_cols_logical):
+    def _local(block, negative_block, z, row_ids, n_mu_logical,
+               n_cols_logical):
         samples = jnp.transpose(block[:, 0], (1, 2, 0))
         n_rows, n_cols, n_omega = samples.shape
         tile = samples.reshape(n_rows * n_cols, n_omega)
-        Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
-            tile, z, n, guards=guards, rcond=rcond,
-            eig=eig, solve=solve)
+        if ordered:
+            negative = jnp.transpose(
+                negative_block[:, 0], (1, 2, 0)).reshape(
+                    n_rows * n_cols, n_omega)
+            Omega, Bp, Dp, diag = pade_fit.fit_mpa_poles_batched(
+                tile, z, n, W_negative_tile=negative, return_odd=True,
+                guards=guards, rcond=rcond, eig=eig, solve=solve)
+        else:
+            Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
+                tile, z, n, guards=guards, rcond=rcond,
+                eig=eig, solve=solve)
+            Dp = jnp.zeros_like(Bp)
         Omega = jnp.transpose(
             Omega.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
         Bp = jnp.transpose(
             Bp.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
+        Dp = jnp.transpose(
+            Dp.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
         valid = ((row_ids[:, None] < n_mu_logical)
                  & (jnp.arange(n_cols)[None, :] < n_cols_logical))
 
@@ -178,8 +190,10 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
         backward = _diag(diag["backward_error"])
         Omega = jnp.where(valid[None, None], Omega, 0.0 + 0.0j)
         Bp = jnp.where(valid[None, None], Bp, 0.0 + 0.0j)
+        Dp = jnp.where(valid[None, None], Dp, 0.0 + 0.0j)
         finite = (
             jnp.all(jnp.isfinite(Omega)) & jnp.all(jnp.isfinite(Bp))
+            & jnp.all(jnp.isfinite(Dp))
             & jnp.all(jnp.isfinite(condition))
             & jnp.all(jnp.isfinite(backward))
             & _diag_finite(diag["cond_support"])
@@ -199,13 +213,24 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
         )), row_axes)
         maxima = summary[:2]
         finite = (summary[2] == 0.0).astype(jnp.int32)
-        return Omega, Bp, condition, maxima, finite
+        return Omega, Bp, Dp, condition, maxima, finite
 
-    mapped = shard_map(
-        _local, mesh=mesh_xy,
-        in_specs=(block_spec, P(None), P(row_axes), P(), P()),
-        out_specs=(pole_spec, pole_spec, diag_spec, P(None), P()),
-        check_vma=True)
+    out_specs = (pole_spec, pole_spec, pole_spec, diag_spec, P(None), P())
+    if ordered:
+        mapped = shard_map(
+            _local, mesh=mesh_xy,
+            in_specs=(
+                block_spec, block_spec, P(None), P(row_axes), P(), P()),
+            out_specs=out_specs, check_vma=True)
+    else:
+        def _incumbent(block, z, row_ids, n_mu_logical, n_cols_logical):
+            return _local(
+                block, block, z, row_ids, n_mu_logical, n_cols_logical)
+
+        mapped = shard_map(
+            _incumbent, mesh=mesh_xy,
+            in_specs=(block_spec, P(None), P(row_axes), P(), P()),
+            out_specs=out_specs, check_vma=True)
     return jax.jit(mapped)
 
 
@@ -218,6 +243,8 @@ def fit_one_block(
     z_samples,
     n_p,
     *,
+    w_negative_name=None,
+    negative_header=None,
     mesh_xy,
     n_cols_buffer=None,
     tile_bytes=None,
@@ -284,6 +311,12 @@ def fit_one_block(
     block = mpa_store.read_w_columns_collective(
         w_src, w_name, q, cols, mesh_xy=mesh_xy,
         n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes, header=hdr)
+    negative_block = block
+    if w_negative_name is not None:
+        negative_block = mpa_store.read_w_columns_collective(
+            w_src, w_negative_name, q, cols, mesh_xy=mesh_xy,
+            n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes,
+            header=negative_header)
     t_read = time.perf_counter() - t_read
 
     n_omega, _, n_mu_padded, _ = map(int, block.shape)
@@ -307,14 +340,22 @@ def fit_one_block(
 
     t_fit = time.perf_counter()
     pade_fit._check_solve_mode(solve)
-    kernel = _sharded_fit_kernel(mesh_xy, n, float(rcond), solve)
+    ordered = w_negative_name is not None
+    kernel = _sharded_fit_kernel(
+        mesh_xy, n, float(rcond), solve, ordered)
     z_dev = device_put_process_local(
         z, NamedSharding(mesh_xy, P(None)))
     row_ids = device_put_process_local(
         np.arange(n_mu_padded, dtype=np.int32),
         NamedSharding(mesh_xy, P(("x", "y"))))
-    Omega, B, condition, maxima, finite = kernel(
-        block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
+    if ordered:
+        outputs = kernel(
+            block, negative_block, z_dev, row_ids,
+            np.int32(n_mu), np.int32(n_cols))
+    else:
+        outputs = kernel(
+            block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
+    Omega, B, B_odd, condition, maxima, finite = outputs
     Omega.block_until_ready()
     t_fit = time.perf_counter() - t_fit
 
@@ -328,12 +369,14 @@ def fit_one_block(
     if fit_writer is None:
         ledger = write(
             fit_dest, q, cols, Omega, B, diag_block, mesh_xy=mesh_xy,
+            B_odd_p_block=B_odd if ordered else None,
             block_condition_max=maxima_host[0],
             block_backward_error_max=maxima_host[1],
             diagnostics_finite=finite_host)
     else:
         ledger = write(
             q, cols, Omega, B, diag_block,
+            B_odd_p_block=B_odd if ordered else None,
             block_condition_max=maxima_host[0],
             block_backward_error_max=maxima_host[1],
             diagnostics_finite=finite_host)
@@ -344,7 +387,7 @@ def fit_one_block(
         "q": int(q),
         "n_cols": int(n_cols),
         "n_elements": int(n_mu * n_cols),
-        "bytes_read": (n_omega * n_mu * n_cols
+        "bytes_read": ((2 if ordered else 1) * n_omega * n_mu * n_cols
                        * mpa_store.COMPLEX128_BYTES),
         "fit_dispatches": 1,
         "pade_solves": int(n_mu * n_cols),
@@ -361,6 +404,7 @@ def run_fit_driver(
     z_samples,
     n_p,
     *,
+    w_negative_name=None,
     mesh_xy,
     tile_bytes=None,
     rcond=1.0e-13,
@@ -400,6 +444,10 @@ def run_fit_driver(
     }
     t_total = time.perf_counter()
     header = mpa_store.read_w_header(w_src, w_name)
+    negative_header = None
+    ordered = w_negative_name is not None
+    if ordered:
+        negative_header = mpa_store.read_w_header(w_src, w_negative_name)
     n_mu = header["n_mu"]
     n_omega = header["n_omega"]
     n_q = header["n_q_on_disk"]
@@ -418,8 +466,24 @@ def run_fit_driver(
             "precisely so a fit cannot be run against the wrong "
             "abscissae; re-deriving the grid and hoping it agrees is "
             "the failure that stamp exists to catch.")
+    if ordered:
+        negative_stamped = np.asarray(
+            negative_header["omega"], dtype=np.complex128)
+        identity_keys = (
+            "n_mu", "n_omega", "n_q_on_disk", "omega_units",
+            "table_hash", "centroid_hash")
+        mismatched = [key for key in identity_keys
+                      if negative_header[key] != header[key]]
+        if mismatched or negative_stamped.shape != z.shape \
+                or not np.array_equal(negative_stamped, -z):
+            raise ValueError(
+                "run_fit_driver: ordered W(-z) samples do not match the "
+                f"positive sample store; mismatched={mismatched}, "
+                f"negative_shape={negative_stamped.shape}, z_shape={z.shape}, "
+                "required negative omega == -z exactly")
 
-    plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
+    plan = tiling.plan_column_walk(
+        n_mu, n_omega * (2 if ordered else 1), tile_bytes)
     fit_provenance = dict(provenance or {})
     fit_provenance.update({
         "solve_mode": solve,
@@ -435,13 +499,15 @@ def run_fit_driver(
         centroid_hash=header["centroid_hash"],
         unfold_tables=mpa_store.read_w_tables(w_src, w_name),
         provenance=fit_provenance,
-        occupation_state=occupation_state)
+        occupation_state=occupation_state,
+        ordered_residues=ordered)
 
     report = {
         "n_q": int(n_q),
         "n_mu": int(n_mu),
         "n_omega": int(n_omega),
         "n_p": n,
+        "ordered_residues": ordered,
         "solve": solve,
         "eig": _fit_eig(solve),
         "rcond": rcond,
@@ -466,10 +532,12 @@ def run_fit_driver(
     report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
     try:
         for q, lo, hi in tiling.fit_schedule(
-                n_q, n_mu, n_omega, tile_bytes):
+                n_q, n_mu, n_omega * (2 if ordered else 1), tile_bytes):
             stats = fit_one_block(
                 w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
                 mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
+                w_negative_name=w_negative_name,
+                negative_header=negative_header,
                 tile_bytes=tile_bytes, rcond=rcond,
                 solve=solve, header=header, fit_writer=fit_writer)
             ledger = stats["ledger"]
@@ -504,7 +572,8 @@ def run_fit_driver(
     ledger = mpa_store.fit_completion_ledger(fit_dest)
     report["seconds"]["finalize"] = time.perf_counter() - t_fin
 
-    report["logical_outputs"] = 2 * n * report["elements_fitted"]
+    report["logical_outputs"] = (
+        (3 if ordered else 2) * n * report["elements_fitted"])
     report["bytes_budget_total"] = (report["blocks_walked"]
                                     * report["tile_bytes"])
     report["condition_max"] = ledger["condition_max"]
@@ -549,7 +618,9 @@ def format_cost_report(report):
         f"(= {r['n_q']} q x {r['n_mu']} columns)",
         f"  elements fitted {r['elements_fitted']}",
         f"  logical outputs {r['logical_outputs']} "
-        f"(= 2*n_p per element: n_p Omega + n_p B)",
+        + ("(= 3*n_p per element: n_p Omega + n_p B + n_p D)"
+           if r.get("ordered_residues", False)
+           else "(= 2*n_p per element: n_p Omega + n_p B)"),
         f"  dispatches      {r['fit_dispatches']} fit, vmapped",
         f"  pole solves     {r['pade_solves']} "
         f"(1 per element; diagnostics reuse the same solve)",
