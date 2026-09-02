@@ -2420,6 +2420,129 @@ def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
     return kernel(*args)
 
 
+def compute_chi0_contour_ordered(
+    wfns,
+    time,
+    weights,
+    z_values,
+    meta,
+    mesh_xy,
+    *,
+    q_neg_index,
+    energy_reference=0.0,
+):
+    r"""Evaluate magnetic contour samples with both ordered orientations.
+
+    For an upper-half-plane sample ``z`` the independent-particle response is
+
+    ``chi0_q(z) = F_q(z) + conj(F_{-q}(-conj(z)))``,
+
+    where the kernel's native orientation is
+    ``F_q(z) = -P_q/(z+Delta)``.  Both ``F(z)`` and
+    ``F(-conj(z))`` are outputs of ONE contour sweep through the existing
+    response kernel.  The second orientation is then a flat-q negation
+    gather and conjugation; no second response kernel is evaluated and no
+    large intermediate is rematerialized on fewer than all processors.
+
+    This is the complex-contour analogue of
+    :func:`compute_chi0_imag_ordered`.  The incumbent
+    :func:`compute_chi0_contour` applies the two scalar resolvents to the same
+    transition orientation, which is valid after a time-reversal completion
+    but deletes the magnetisation-odd channel when time reversal is broken.
+    Callers therefore select this route only from ``SymMaps.trs_allowed``.
+
+    Parameters
+    ----------
+    wfns
+        Wavefunction bundle.  Its flat k axis remains sharded as in the
+        ordinary contour kernel.
+    time, weights
+        Positive real-time quadrature nodes and weights, shape ``(L,)``, in
+        reciprocal-energy and time units respectively.
+    z_values
+        Upper-half-plane complex frequencies, shape ``(n_z,)``, in the same
+        energy unit used by ``wfns.enk``.
+    meta, mesh_xy
+        Runtime metadata and the two-dimensional processor mesh.
+    q_neg_index
+        Public ``symmetry_maps.q_negation_index`` permutation, shape
+        ``(n_q,)``.  It must be an involution on the complete flat q grid.
+    energy_reference
+        Common energy origin subtracted from valence and conduction bands.
+
+    Returns
+    -------
+    jax.Array or tuple[jax.Array, ...]
+        One flat-q ``(n_q, n_mu, n_mu)`` response for one frequency, or an
+        ``n_z`` tuple for several frequencies.  Arrays retain
+        ``P(None, 'x', 'y')`` sharding.
+    """
+    time = np.asarray(time, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    z = np.asarray(z_values, dtype=np.complex128)
+    if (time.ndim != 1 or time.size == 0 or weights.shape != time.shape
+            or z.ndim != 1 or z.size == 0):
+        raise ValueError(
+            "compute_chi0_contour_ordered: time/weights must be nonempty "
+            f"(L,) arrays and z_values a nonempty (n_z,) array; got "
+            f"{time.shape}, {weights.shape}, {z.shape}.")
+    if (not np.all(np.isfinite(time)) or not np.all(np.isfinite(weights))
+            or not np.all(np.isfinite(z)) or np.any(time <= 0.0)
+            or np.any(np.imag(z) <= 0.0)):
+        raise ValueError(
+            "GATE chi0_contour_ordered_domain: nodes and weights must be "
+            "finite, every time node must be positive, and every z value "
+            "must be finite with Im(z) > 0. FALSE case: the damped-line "
+            "quadrature and upper-half-plane MPA samples satisfy all three "
+            "conditions.")
+
+    # The reflected point remains in the upper half plane.  Both rows use
+    # the kernel's native ``-1/(z+Delta)`` orientation: negative imaginary
+    # time, frequency sign -1, and weights -i*h.  This is the orientation
+    # whose imaginary-axis limit is exactly compute_chi0_imag_ordered's
+    # ``-(alpha-i*beta)`` carrier.  Their partner relation is applied only
+    # after this single response-kernel invocation.
+    z_sweep = np.concatenate((z, -np.conj(z)))
+    tau = -1j * time
+    signs = -np.ones(time.size, dtype=np.int8)
+    weight_rows = np.broadcast_to(
+        -1j * weights, (z_sweep.size, time.size))
+
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    args, n_out = _chi0_contour_kernel_args(
+        wfns, tau, weight_rows, signs, z_sweep, energy_reference)
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=n_out, complex_contour=True,
+        **_chi_face_kwargs(wfns))
+    orientations = kernel(*args)
+    if not isinstance(orientations, tuple):  # n_out == 2*n_z >= 2
+        orientations = (orientations,)
+
+    q_neg = np.asarray(q_neg_index)
+    nq = int(orientations[0].shape[0])
+    if (q_neg.shape != (nq,)
+            or np.any(q_neg < 0) or np.any(q_neg >= nq)
+            or not np.array_equal(q_neg[q_neg], np.arange(nq))):
+        raise ValueError(
+            "compute_chi0_contour_ordered: q_neg_index must be an "
+            f"involution over the full flat-q axis [0, {nq}); got shape "
+            f"{q_neg.shape}.")
+    q_neg_jax = jnp.asarray(q_neg, dtype=jnp.int32)
+    completed = tuple(
+        _complete_contour_ordered(
+            orientations[i], orientations[z.size + i], q_neg_jax)
+        for i in range(z.size)
+    )
+    return completed[0] if z.size == 1 else completed
+
+
+@jax.jit
+def _complete_contour_ordered(F_q_z, F_q_reflected, q_neg):
+    """``F_q(z) + conj(F_{-q}(-conj(z)))``; sharding-preserving."""
+    return F_q_z + jnp.conj(jnp.take(F_q_reflected, q_neg, axis=0))
+
+
 def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
                             z_values, meta, mesh_xy, *,
                             energy_reference=None):

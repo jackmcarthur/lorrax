@@ -35,6 +35,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 from gw import minimax_screening as ms  # noqa: E402
 from gw import w_isdf  # noqa: E402
+from gw.mpa import evaluator as mpa_evaluator  # noqa: E402
 from gw.ppm_sigma import _residue_for_space  # noqa: E402
 from gw.screening import assert_probe_chi_reuse_supported  # noqa: E402
 from gw.wavefunction_bundle import (  # noqa: E402
@@ -303,6 +304,66 @@ def test_ordered_route_refuses_a_quadrature_without_the_odd_kernel(monkeypatch):
         w_isdf.compute_chi0_imag_ordered(
             wfns, quad, SimpleNamespace(nkx=3, nky=1, nkz=1), mesh,
             q_neg_index=q_negation_index((3, 1, 1)))
+
+
+def test_ordered_contour_route_reproduces_exact_imaginary_chi0_in_one_sweep(
+        monkeypatch):
+    """The MPA contour route keeps the broken-TR anti-Hermitian channel.
+
+    The negative control is the former symmetric ``+/-time`` completion on
+    exactly the same wavefunctions, nodes and frequency.  The production
+    kernel factory is counted because a numerically right result obtained by
+    a second response sweep would violate the route's scaling contract.
+    """
+    import common.fft_helpers as fft_helpers
+    from symmetry_maps import q_negation_index
+
+    monkeypatch.setattr(fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(20260902)
+    psi, enk, slices, wfns = _toy_bundle(mesh, rng)
+    nk = psi.shape[0]
+    meta = SimpleNamespace(nkx=nk, nky=1, nkz=1, nk_tot=nk)
+    q_neg = q_negation_index((nk, 1, 1))
+    z = np.asarray([1j * OMEGA_P], dtype=np.complex128)
+    rule = mpa_evaluator.damped_line_rule(
+        OMEGA_P, 1.5, rel_tol=1.0e-14, max_order=256)
+
+    kernel_calls = 0
+    get_kernel = w_isdf._get_chi_minimax_kernel
+
+    def _counted_kernel(*args, **kwargs):
+        nonlocal kernel_calls
+        kernel_calls += 1
+        return get_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(w_isdf, "_get_chi_minimax_kernel", _counted_kernel)
+    got = np.asarray(jax.device_get(w_isdf.compute_chi0_contour_ordered(
+        wfns, rule["t"], rule["h"], z, meta, mesh,
+        q_neg_index=q_neg)))
+    assert kernel_calls == 1, "ordered contour used more than one chi kernel"
+
+    want = _exact_ordered_chi0_flat_q(psi, enk, slices, z[0])
+    scale = np.max(np.abs(want))
+    assert np.max(np.abs(got - want)) < 1.0e-12 * scale
+    _want_h, want_a = _herm_split(want[0])
+    _got_h, got_a = _herm_split(got[0])
+    assert np.max(np.abs(want_a)) > 1.0e-2 * scale, (
+        "negative-control model degenerated to time-reversal symmetry")
+    assert np.max(np.abs(got_a - want_a)) < 1.0e-12 * scale
+
+    # RED TWIN: the incumbent contour assigns both resolvents to the same
+    # orientation and therefore returns the Hermitian half at imaginary z.
+    t, h = rule["t"], rule["h"]
+    tau = np.concatenate((1j * t, -1j * t))
+    signs = np.concatenate((np.ones(t.size, np.int8),
+                            -np.ones(t.size, np.int8)))
+    weights = np.broadcast_to(
+        np.concatenate((1j * h, -1j * h)), (1, 2 * t.size))
+    incumbent = np.asarray(jax.device_get(w_isdf.compute_chi0_contour(
+        wfns, tau, weights, signs, z, meta, mesh)))
+    assert np.max(np.abs(incumbent[0] - want[0])) > 1.0e-2 * scale
+    assert np.max(np.abs(_herm_split(incumbent[0])[1])) < 1.0e-12 * scale
 
 
 # ---------------------------------------------------------------------------

@@ -342,14 +342,17 @@ def _require_metal_occupations(config, occupation_state):
 
 
 def _evaluate_samples(
-    wfns, routes, quad, config, meta, mesh_xy, *,
+    wfns, routes, quad, config, meta, mesh_xy, *, sym,
     energy_reference, occupation_state, write_full, write_wedge,
-    static_gamma_override, gamma_row, kminq_rows,
+    static_gamma_override, gamma_row, kminq_rows, print_fn=print,
 ):
     """Evaluate every plan point through its route's kernel.
 
-    Insulating plans keep the historical kernels on a byte-identical code
-    path.  Metal plans (shifted-origin double-parallel protocol) route the
+    Insulating plans whose measured verdict permits time reversal keep the
+    historical kernels on a byte-identical code path.  Broken-TR insulating
+    plans use one ordered-orientation contour sweep and obtain its partner by
+    q-negated conjugation.  Metal plans (shifted-origin double-parallel
+    protocol) route the
     near line's first sample through the exact direct ordered-pair kernel —
     the damped contour rule at varpi = 2e-5 Ry needs ~1.0e6 nodes
     (probe record runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md)
@@ -363,6 +366,7 @@ def _evaluate_samples(
     from gw.w_isdf import (
         compute_chi0,
         compute_chi0_contour,
+        compute_chi0_contour_ordered,
         compute_chi0_contour_fractional,
         compute_chi0_direct_fractional,
         occupation_support_bandwidth,
@@ -370,6 +374,34 @@ def _evaluate_samples(
 
     metal = config.mpa.material_class != "insulator"
     _require_metal_occupations(config, occupation_state)
+    if not hasattr(sym, "trs_allowed"):
+        raise ValueError(
+            "GATE mpa_needs_measured_trs: the MPA response route requires "
+            "SymMaps.trs_allowed; the supplied symmetry object carries no "
+            "measured verdict. Construct SymMaps from WfnLoader instead of "
+            "asserting time reversal in the MPA consumer.")
+    trs_allowed = bool(sym.trs_allowed)
+    ordered = bool(not metal and not trs_allowed)
+    q_neg = None
+    if ordered:
+        from symmetry_maps import q_negation_index
+
+        q_neg = q_negation_index(
+            (int(meta.nkx), int(meta.nky), int(meta.nkz)))
+    if metal:
+        print_fn(
+            "  MPA chi0 orientation route: fractional-occupation ordered "
+            "pairs (independent of global TRS completion).")
+    elif ordered:
+        print_fn(
+            "  MPA chi0 orientation route: global time reversal MEASURED "
+            "BROKEN; ordered orientations use one contour sweep plus the "
+            "q-negated conjugate partner, retaining the TR-odd channel.")
+    else:
+        print_fn(
+            "  MPA chi0 orientation route: global time reversal MEASURED "
+            "to hold; incumbent symmetric completion retained bit-for-bit.")
+
     omega_m = float(quad.x_max)
     # ONE occupancy window for the whole fit: the rule bandwidth below and
     # every fractional-chi call in this function read the same deck value, so
@@ -384,14 +416,37 @@ def _evaluate_samples(
 
     for point in routes["existing"]:
         if not metal:
-            used = quad if point["character"] == "static" else \
-                build_imag_quadrature(
+            if point["character"] == "static":
+                chi = compute_chi0(
+                    wfns, quad, meta, mesh_xy,
+                    energy_reference=energy_reference)
+            elif ordered and point["character"] == "imag":
+                rule = evaluator.damped_line_rule(
+                    point["varpi"], omega_m,
+                    rel_tol=config.minimax_config.target_error,
+                    max_order=config.minimax_config.max_nodes)
+                chi = compute_chi0_contour_ordered(
+                    wfns, rule["t"], rule["h"],
+                    np.asarray([point["z"]], dtype=np.complex128),
+                    meta, mesh_xy, q_neg_index=q_neg,
+                    energy_reference=energy_reference)
+            elif ordered:
+                raise ValueError(
+                    "GATE mpa_broken_tr_existing_sample: a measured-broken-"
+                    "TR insulating MPA plan contains an incumbent-only "
+                    f"{point['character']!r} sample at z={point['z']!r}. "
+                    "Only static and upper-imaginary existing-kernel cells "
+                    "have an ordered-orientation completion; use the "
+                    "double-parallel MPA plan.")
+            else:
+                used = build_imag_quadrature(
                     quad, point["varpi"],
                     MinimaxConfig(
                         target_error=config.minimax_config.target_error,
                         max_nodes=config.minimax_config.max_nodes))
-            chi = compute_chi0(
-                wfns, used, meta, mesh_xy, energy_reference=energy_reference)
+                chi = compute_chi0(
+                    wfns, used, meta, mesh_xy,
+                    energy_reference=energy_reference)
             if (
                 point["character"] == "static"
                 and static_gamma_override is not None
@@ -444,6 +499,10 @@ def _evaluate_samples(
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
                 occupation_window_threshold=occ_window)
+        elif ordered:
+            values = compute_chi0_contour_ordered(
+                wfns, t, h, z, meta, mesh_xy, q_neg_index=q_neg,
+                energy_reference=energy_reference)
         else:
             tau = np.concatenate((1j * t, -1j * t))
             signs = np.concatenate((np.ones(t.size, np.int8),
@@ -579,11 +638,12 @@ def build_mpa_fit(
 
     _evaluate_samples(
         wfns, routes, quad, config, meta, mesh_xy,
+        sym=sym,
         energy_reference=energy_reference,
         occupation_state=occupation_state,
         write_full=_write_full, write_wedge=_write_wedge,
         static_gamma_override=static_gamma_override,
-        gamma_row=gamma_row, kminq_rows=kminq_rows)
+        gamma_row=gamma_row, kminq_rows=kminq_rows, print_fn=print_fn)
 
     V = _to_wedge(V_q, q_idx, mesh_xy)
     if wc_source is None:
