@@ -212,7 +212,10 @@ _FREQUENCY_FIT_NAMES = (
 # Uniform denominator-box rules are a production service surface.  Keep the
 # numerical module lazy, like every other SciPy-backed builder below, so a
 # catalog-only import still pays no solver dependency.
-_UNIFORM_RULE_NAMES = ("UniformRule", "build_uniform_rule")
+_UNIFORM_RULE_NAMES = (
+    "UniformRule", "box_samples", "build_uniform_rule",
+    "rule_roundoff_amplification",
+)
 
 # Delivered-error fitting on a weighted complex support.  Also SciPy
 # (linprog), so it lives behind the same lazy door: a production table

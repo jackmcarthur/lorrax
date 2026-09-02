@@ -2,7 +2,12 @@
 import numpy as np
 import pytest
 
-from minimax.uniform_rule import box_samples, build_uniform_rule, rule_sup_error
+from minimax.uniform_rule import (
+    box_samples,
+    build_uniform_rule,
+    rule_roundoff_amplification,
+    rule_sup_error,
+)
 
 ETA = 0.02
 
@@ -55,6 +60,20 @@ def test_invalid_box_refuses():
         build_uniform_rule((0.0, 1.0, 0.0, 1.0), 1.0e-4)
     with pytest.raises(ValueError):
         build_uniform_rule((1.0, 0.0, 0.1, 1.0), 1.0e-4)
+
+
+def test_roundoff_amplification_uses_the_error_currency():
+    d = np.asarray([0.0 + 0.1j, 10.0 + 0.1j])
+    times = np.asarray([0.2 + 0.0j, 0.7 + 0.0j])
+    weights = np.asarray([0.6 - 0.1j, 0.3 + 0.05j])
+    terms = np.exp(1j * d[:, None] * times[None, :]) * weights[None, :]
+    mass = np.sum(np.abs(terms), axis=1)
+
+    peak = rule_roundoff_amplification(times, weights, d, 0.1)
+    relative = rule_roundoff_amplification(times, weights, d, np.abs(d))
+    assert peak == pytest.approx(np.max(0.1 * mass))
+    assert relative == pytest.approx(np.max(np.abs(d) * mass))
+    assert relative > 50.0 * peak
 
 
 def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():

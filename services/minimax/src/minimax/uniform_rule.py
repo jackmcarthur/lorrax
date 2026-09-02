@@ -68,7 +68,10 @@ from numpy.linalg import lstsq, svd
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.linalg import qr as _pivoted_qr
 
-__all__ = ["UniformRule", "build_uniform_rule", "box_samples", "rule_sup_error"]
+__all__ = [
+    "UniformRule", "build_uniform_rule", "box_samples",
+    "rule_roundoff_amplification", "rule_sup_error",
+]
 
 
 # ----------------------------------------------------------------- support cloud
@@ -965,6 +968,33 @@ def rule_sup_error(times, weights, d, rho=None):
     err = np.abs(Q - 1.0 / d) * (d.imag.min() if rho is None else rho)
     kappa = np.abs(A * weights[None, :]).sum(1) / np.maximum(np.abs(Q), 1e-300)
     return float(err.max()), float(kappa.max())
+
+
+def rule_roundoff_amplification(times, weights, d, rho):
+    """Worst absolute term mass in the approximation-error currency.
+
+    If each exponential term carries a relative runtime perturbation
+    ``eps_runtime``, the error is bounded by
+
+    ``eps_runtime * max_d rho(d) * sum_k |w_k exp(i t_k d)|``.
+
+    ``rho=|d|`` is the sign-definite rule's relative-error currency, while
+    ``rho=min(Im d)`` is the crossing rule's peak-relative currency.  The
+    cancellation ratio returned by :func:`rule_sup_error` divides by
+    ``|Q(d)|`` and is therefore not in the crossing rule's currency: at a
+    far edge it grows like ``|d|/eta`` while ``eta*|Q(d)|`` shrinks by the
+    reciprocal factor.
+    """
+    d = np.asarray(d, dtype=np.complex128)
+    scale = np.asarray(rho, dtype=np.float64)
+    if d.ndim != 1 or scale.ndim > 1 or (
+            scale.ndim == 1 and scale.shape != d.shape):
+        raise ValueError(
+            "roundoff amplification needs d as a vector and rho as a "
+            f"scalar or matching vector; got {d.shape} and {scale.shape}")
+    A = _cexp(1j * d[:, None] * np.asarray(times)[None, :])
+    mass = np.sum(np.abs(A * np.asarray(weights)[None, :]), axis=1)
+    return float(np.max(scale * mass))
 
 
 @dataclass(frozen=True)

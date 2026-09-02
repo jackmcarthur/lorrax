@@ -132,49 +132,42 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         "window_tau_pairs"]
 
 
-def test_rule_builder_receives_the_executor_noise_cap(monkeypatch):
-    caps = []
+def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
+    import dataclasses
 
-    def captured(box, eps, **kwargs):
-        caps.append(kwargs["kappa_cap"])
-        return _fake_rule(box, eps, **kwargs)
+    def large_relative_kappa(box, eps, **kwargs):
+        # A far crossing edge can have large cancellation RELATIVE to Q while
+        # its term mass remains small relative to the 1/eta peak.
+        return dataclasses.replace(
+            _fake_rule(box, eps, **kwargs), kappa_max=1.0e6)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", captured)
-    plan_sigma_windows(
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.build_uniform_rule", large_relative_kappa)
+    plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
-    expected = 0.05 * 1.0e-4 / 6.0e-8
-    np.testing.assert_allclose(caps, expected, rtol=0.0, atol=1.0e-14)
-
-
-def test_cache_skips_a_rule_above_the_executor_noise_cap(
-        monkeypatch, tmp_path):
-    import dataclasses
-    from gw.sigma_box_plan import _rule_cache_store
-
-    for box, relative in (
-            ((-100.0, 100.0, 0.1, 100.0), False),
-            ((0.001, 100.0, 0.1, 100.0), True),
-            ((-100.0, -0.001, 0.1, 100.0), True)):
-        unstable = dataclasses.replace(
-            _fake_rule(box, 1.0e-4), relative=relative, kappa_max=100.0)
-        _rule_cache_store(str(tmp_path), unstable, 1.0e4)
-
-    args = dict(
-        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
-        cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
-    calls = []
-
-    def stable(box, eps, **kwargs):
-        calls.append(tuple(box))
-        return _fake_rule(box, eps, **kwargs)
-
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", stable)
-    plan, _geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
     assert len(plan) == 3
-    assert len(calls) == 3
+    assert geometry["branches"][0]["windows"][0]["kappa_max"] == 1.0e6
+    assert all(
+        row["runtime_noise_bound"] <= row["runtime_noise_budget"]
+        for row in geometry["branches"][0]["windows"])
+
+
+def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
+    import dataclasses
+
+    def unstable(box, eps, **kwargs):
+        return dataclasses.replace(
+            _fake_rule(box, eps, **kwargs),
+            weights=np.asarray([1.0e5 + 0.0j, -1.0e5 + 0.0j]))
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", unstable)
+    with pytest.raises(RuntimeError, match="runtime-noise"):
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+            eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+            cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 
 
 def test_total_pair_ceiling_refuses(monkeypatch):

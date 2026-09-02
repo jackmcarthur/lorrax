@@ -29,7 +29,12 @@ from common.collectives import (all_gather_processes, gather_to_host,
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaWindow
-from minimax import UniformRule, build_uniform_rule
+from minimax import (
+    UniformRule,
+    box_samples,
+    build_uniform_rule,
+    rule_roundoff_amplification,
+)
 
 
 _FACTOR_GROWTH_CAP = 30.0
@@ -225,7 +230,7 @@ def make_sigma_box_spec(
     }
 
 
-def _rule_cache_lookup(directory, box, eps, relative, kappa_cap):
+def _rule_cache_lookup(directory, box, eps, relative):
     """Return the smallest cached rule certified on a containing box."""
     if directory is None:
         return None
@@ -255,12 +260,6 @@ def _rule_cache_lookup(directory, box, eps, relative, kappa_cap):
                     rank=int(data["rank"]),
                     sup_error=float(data["sup_error"]),
                     kappa_max=float(data["kappa_max"]), seconds=0.0)
-                # The uniform-rule service has its own broad numerical
-                # sanity cap.  Sigma's runtime-noise budget is tighter and
-                # depends on eps, so an older cache entry can be a perfectly
-                # valid approximation yet be unusable by this executor.
-                if rule.kappa_max > kappa_cap:
-                    continue
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
         except (OSError, KeyError, ValueError):
@@ -268,15 +267,15 @@ def _rule_cache_lookup(directory, box, eps, relative, kappa_cap):
     return best
 
 
-def _rule_cache_store(directory, rule, kappa_cap):
+def _rule_cache_store(directory, rule, noise_amplification):
     """Atomically store one immutable box certificate."""
     if directory is None:
         return
     try:
         os.makedirs(directory, exist_ok=True)
         digest = hashlib.sha256(json.dumps(
-            ["sigma-noise-v1", list(rule.box), float(rule.eps),
-             bool(rule.relative), float(kappa_cap)]
+            ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
+             bool(rule.relative)]
         ).encode()).hexdigest()[:16]
         path = os.path.join(directory, f"rule_{digest}.npz")
         if os.path.exists(path):
@@ -289,7 +288,7 @@ def _rule_cache_store(directory, rule, kappa_cap):
                 times=rule.times, weights=rule.weights,
                 sup_error=float(rule.sup_error),
                 kappa_max=float(rule.kappa_max),
-                kappa_cap=float(kappa_cap),
+                roundoff_amplification=float(noise_amplification),
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
                 seconds=float(rule.seconds))
         os.replace(temporary, path)
@@ -340,10 +339,7 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    noise_budget = _RUNTIME_NOISE_SAFETY * eps
-    kappa_cap = noise_budget / _RUNTIME_NOISE_EPSILON
-    cached = _rule_cache_lookup(
-        cache_dir, requested_box, eps, relative, kappa_cap)
+    cached = _rule_cache_lookup(cache_dir, requested_box, eps, relative)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
@@ -351,15 +347,25 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None else requested_box)
         rule = build_uniform_rule(
-            build_box, eps, time_budget=reduction_seconds,
-            kappa_cap=kappa_cap)
+            build_box, eps, time_budget=reduction_seconds)
         cache_status = "miss" if cache_dir is not None else "off"
 
     if rule.sup_error > eps:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
             f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
-    noise_bound = rule.kappa_max * _RUNTIME_NOISE_EPSILON
+    # Runtime perturbations must be bounded in the SAME currency as the
+    # approximation.  ``kappa = sum|term|/|Q|`` is already relative for a
+    # sign-definite box, but it overstates a crossing box's peak-relative
+    # error by ~|d|/eta at its far edge.  Measure rho*sum|term| directly.
+    noise_cloud = box_samples(
+        *rule.box, per_unit=8.0, n_im=48)
+    noise_rho = (np.abs(noise_cloud) if rule.relative
+                 else float(np.min(noise_cloud.imag)))
+    noise_amplification = rule_roundoff_amplification(
+        rule.times, rule.weights, noise_cloud, noise_rho)
+    noise_bound = noise_amplification * _RUNTIME_NOISE_EPSILON
+    noise_budget = _RUNTIME_NOISE_SAFETY * eps
     if noise_bound > noise_budget:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: runtime-noise "
@@ -383,7 +389,7 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         # particular, a service-level rule that meets its broad default
         # cancellation cap but misses Sigma's eps-scaled noise cap must not
         # poison every subsequent attempt for this box.
-        _rule_cache_store(cache_dir, rule, kappa_cap)
+        _rule_cache_store(cache_dir, rule, noise_amplification)
     return {
         "times": times, "weights": weights,
         "node_count": int(times.size), "rule_box": tuple(rule.box),
@@ -392,6 +398,7 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         "rank": int(rule.rank), "seconds": float(rule.seconds),
         "cache_status": cache_status, "factor_growth": growth,
         "noise_bound": noise_bound, "noise_budget": noise_budget,
+        "roundoff_amplification": noise_amplification,
         "one_line": rule.one_line(),
     }
 
@@ -675,6 +682,7 @@ def plan_sigma_windows(
                           else "peak-relative"),
             "sup_error": fit["sup_error"], "eps": tolerance,
             "kappa_max": fit["kappa_max"],
+            "roundoff_amplification": fit["roundoff_amplification"],
             "runtime_noise_bound": fit["noise_bound"],
             "runtime_noise_budget": fit["noise_budget"],
             "factor_growth": list(fit["factor_growth"]),
