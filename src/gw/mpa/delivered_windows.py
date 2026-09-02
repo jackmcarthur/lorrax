@@ -1856,7 +1856,7 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     evidence = {
         "family": "uniform_box",
         "candidate_tolerance": float(eps),
-        "provenance": rule.one_line(),
+        "provenance": f"{rule.one_line()}, rule_cache={cache_status}",
     }
     try:
         candidate = _rule_candidate(
