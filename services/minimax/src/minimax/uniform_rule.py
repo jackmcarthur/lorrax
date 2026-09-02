@@ -59,6 +59,15 @@ def _re_line(lo, hi, h, near):
     return np.sort(np.unique(np.concatenate([re, [lo, hi]])))
 
 
+def _im_levels(theta):
+    """Log-spaced ``Im d`` levels needed on a ray: on real time the family
+    only decays in ``Im d``, six levels resolve it; on a rotated ray it also
+    oscillates in ``Im d`` (phase ``sin(theta) s Im d``), and the members
+    alive longest sit at the small-``|Re d|`` edge with up to ~20 rad of
+    phase across the box, so about four times as many levels are needed."""
+    return 6 if abs(np.sin(theta)) < 0.15 else 24
+
+
 def box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=5.0, n_im=6, near=30.0):
     """Sample cloud on the box.  Along ``Re d`` the spacing is ``im/per_unit``
     within ``near*im_lo`` of zero (the rule's error oscillates on the scale
@@ -397,6 +406,14 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     t0 = time.perf_counter()
     d = box_samples(re_lo, re_hi, im_lo, im_hi)
     _r0, theta, S, _rate = _choose_angle(d, eps)
+    n_im = _im_levels(theta)
+    if n_im != 6:
+        d = box_samples(re_lo, re_hi, im_lo, im_hi, n_im=n_im)
+    # Acceptance is judged on a cloud finer than the fit cloud in both
+    # directions, so a rule that is exact between fit samples only is
+    # rejected (property test: 17 of 80 random rotated-ray boxes failed a
+    # finer check before this).
+    d_check = box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=8.0, n_im=2 * n_im)
     fam = _RayFamily(d, theta, S, eps / trunc)
     s, w = fam.interpolatory()
     if reduce:
@@ -408,7 +425,7 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w)
 
         def ok(s_, w_):
-            e_, k_ = _score_cloud(fit, s_, w_, d)
+            e_, k_ = _score_cloud(fit, s_, w_, d_check)
             return e_ <= eps and k_ <= kappa_cap
 
         deadline = t0 + (float(time_budget) if time_budget is not None else 1e30)
@@ -420,7 +437,7 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             times, weights = fam.to_rule(s, w)
     else:
         times, weights = fam.to_rule(s, w)
-    sup, kappa = rule_sup_error(times, weights, d)
+    sup, kappa = rule_sup_error(times, weights, d_check)
     return UniformRule(
         times=times, weights=weights, box=(re_lo, re_hi, im_lo, im_hi),
         eps=float(eps), theta_deg=float(np.rad2deg(theta)), rank=int(fam.r),

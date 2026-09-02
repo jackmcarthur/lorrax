@@ -48,3 +48,30 @@ def test_invalid_box_refuses():
         build_uniform_rule((0.0, 1.0, 0.0, 1.0), 1.0e-4)
     with pytest.raises(ValueError):
         build_uniform_rule((1.0, 0.0, 0.1, 1.0), 1.0e-4)
+
+
+def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():
+    """Property test: every finite box yields an accepted rule, and the sup
+    bound holds on a cloud finer than the one the rule was fitted on.
+    Crossing, sign-definite (R up to 1e4) and nearly sign-definite boxes."""
+    rng = np.random.default_rng(7)
+    for _ in range(10):
+        kind = rng.choice(["crossing", "sd+", "sd-", "near+", "near-"])
+        im_hi = ETA * 10 ** rng.uniform(0, 2)
+        if kind == "crossing":
+            lo, hi = -ETA * rng.uniform(5, 40), ETA * rng.uniform(5, 30)
+        elif kind == "sd+":
+            lo = ETA * 10 ** rng.uniform(-0.5, 1.5); hi = lo * 10 ** rng.uniform(0.5, 4)
+        elif kind == "sd-":
+            hi = -ETA * 10 ** rng.uniform(-0.5, 1.5); lo = hi * 10 ** rng.uniform(0.5, 4)
+        elif kind == "near+":
+            lo = -ETA * rng.uniform(0.1, 3); hi = ETA * rng.uniform(10, 200)
+        else:
+            hi = ETA * rng.uniform(0.1, 3); lo = -ETA * rng.uniform(10, 200)
+        eps = float(rng.choice([1e-3, 1e-4]))
+        box = (lo, hi, ETA, im_hi)
+        rule = build_uniform_rule(box, eps, time_budget=5.0)
+        d = box_samples(*box, per_unit=10.0, n_im=48)
+        sup, kappa = rule_sup_error(rule.times, rule.weights, d)
+        assert sup <= 1.5 * eps, (kind, box, sup, eps)
+        assert kappa <= 1.0e4 and np.all(rule.times != 0.0)
