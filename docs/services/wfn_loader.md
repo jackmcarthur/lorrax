@@ -61,6 +61,7 @@ for the real one, which is exactly what the deleted shim was.
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
 | `full_k_parent_groups(full_k=None)` | Stable O(nk) grouping of requested full-BZ rows by raw IBZ parent. |
 | `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False)` | Apply the canonical typed unitary/antiunitary action to one already-loaded raw parent row. Consumers can realize a star with one child workspace and no parent re-read. |
+| `full_k_box_index_one_dev(full_k)` | Build one child's replicated FFT gather index from the current parent G row; strict one-k streams avoid retained full-BZ G/index tables. |
 | `gvecs(k=...)` | `(n_k, ngkmax, 3)` int32, pad rows = the FFT-box **pad sentinel**, never zeros. |
 | `ngk_valid(k=...)` | The mask that makes the pad rows discountable. The pair is the contract. |
 | `box_index(k=...)` / `box_index_dev(...)` | FFT-box gather table, host / device-cached (the replicated-buffer-leak fix). |
@@ -99,11 +100,13 @@ for the real one, which is exactly what the deleted shim was.
   array (every rank must request the same window); `load_process_local`
   is the k-parallel primitive (per-rank windows, combination explicit).
   They are different primitives, not a flag.
-* **Parent/star streaming keeps one-k memory.** Non-singleton full-k stars
-  load each raw IBZ parent once and realize children serially through
-  `unfold_parent_to_full_k`; its phase row is child-local rather than a dense
-  full-k table. Singleton stars retain the direct full-k path.
-  Both use the same typed symmetry action and keep one transformed child live.
+* **Parent/star streaming keeps one-k memory.** Every full-k star loads its
+  raw IBZ parent once per band tile and realizes children serially through
+  `unfold_parent_to_full_k`. One parent G row and its symmetry-bounded star of
+  FFT indices are retained across those tiles, then released. A nonzero child
+  phase is one separate device vector; zero translations skip it. No dense
+  full-k phase, G-vector, or FFT-index table exists on this path. The
+  four-component lift derives child G on device from the same parent row.
 * **Late mesh binding is narrow.** `adopt_mesh` switches only a
   multi-process, auto-picked, currently-eager loader; explicit requests
   are never overridden.

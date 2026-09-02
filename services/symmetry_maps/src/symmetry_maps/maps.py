@@ -1667,6 +1667,41 @@ def tau_phase_row(sym_mat_k, tau, g_kbar):
     return np.exp(-1j * (rotated @ tau))                          # (ngk,)
 
 
+def tau_phase_row_jax(sym_mat_k, tau, g_kbar):
+    """Device form of :func:`tau_phase_row`, including the identity case.
+
+    This owns the same ``exp(-i (S G) . tau)`` convention but is intended
+    for fusion into a larger JAX action.  Unlike the host helper it returns
+    an explicit all-one row at zero translation; avoiding that allocation is
+    then the compiler's job, not a Python branch on traced data.
+    """
+    S = jnp.asarray(sym_mat_k, dtype=jnp.int32)
+    tau_j = jnp.asarray(tau, dtype=jnp.float64)
+    g = jnp.asarray(g_kbar)
+    # Contract the three-vector first.  Forming ``S @ g.T`` explicitly
+    # would create an avoidable ``(ngk, 3)`` temporary exactly where the
+    # streamed loader must remain usable for very large G spheres.
+    rotated_tau = jnp.einsum('ij,i->j', S, tau_j, optimize=True)
+    return jnp.exp(-1j * jnp.einsum(
+        'gj,j->g', g, rotated_tau, optimize=True))
+
+
+def unfold_reciprocal_carriers(sym_mat_k, g_parent, umklapp):
+    """Map parent reciprocal carriers to one full-zone child.
+
+    Implements ``G_child = S G_parent - G_umklapp`` for NumPy or JAX
+    operands. This is the shared algebra used by the host G-table builder and
+    device-side parent/bispinor realization.
+    """
+    is_jax = any(isinstance(value, (jax.Array, jax.core.Tracer)) for value in (
+        sym_mat_k, g_parent, umklapp))
+    xp = jnp if is_jax else np
+    S = xp.asarray(sym_mat_k)
+    g = xp.asarray(g_parent)
+    shift = xp.asarray(umklapp)
+    return xp.einsum('ij,gj->gi', S, g, optimize=True) - shift[None, :]
+
+
 def unfold_psi(
     cnk_kbar,
     *,

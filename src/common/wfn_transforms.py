@@ -2473,20 +2473,22 @@ def load_centroids_band_chunked(
     nk_accum = round_up(nk_tot, k_tile)
     nb_accum = round_up(nb_total, band_tile)
     parent_groups = None
-    parent_reuse_active = False
+    parent_stream_active = False
     if stream_tiles and k_tile == 1:
         # The loader owns canonical parent/star membership and child order;
         # this consumer never reads or re-groups raw SymMaps tables.
         from wfn_loader import IBZRows
         parent_groups = loader.full_k_parent_groups()
-        parent_reuse_active = any(
-            len(children) > 1 for _, children in parent_groups)
+        parent_stream_active = True
+    max_parent_star = (
+        max(len(children) for _, children in parent_groups)
+        if parent_groups else 0)
 
-    # Persistent term for the transfer.  Bulk retains the complete sharded
-    # G-flat input.  Streaming retains one fixed child tile (plus one raw
-    # parent for a non-singleton k=1 star) beside the donated final X/Y
-    # accumulators; tile sample/reshard faces are priced too because they
-    # coexist at the insert boundary.
+    # Persistent term for the transfer. Bulk retains the complete sharded
+    # G-flat input. Streaming retains one fixed child tile, one raw parent,
+    # and at most one physical symmetry star of int32 FFT indices beside the
+    # donated final X/Y accumulators. Tile sample/reshard faces are priced too
+    # because they coexist at the insert boundary.
     nb_per_band_shard = (
         band_tile // p_band if stream_tiles
         else round_up(nb_total, p_band) // p_band
@@ -2501,19 +2503,36 @@ def load_centroids_band_chunked(
     gflat_local_bytes = (
         k_tile * nb_per_band_shard * nspinor * int(loader.ngkmax) * 16
     )
-    # A non-singleton k=1 parent/star schedule retains one raw file-spinor
-    # parent while one transformed child is sampled.  It is still O(1) in k,
-    # but both carriers coexist at the FFT boundary and therefore both belong
-    # in the refusal model.  In 4c mode the unfolded 2c child also coexists
-    # during the post-unfold lift, so price that short-lived carrier as well.
-    parent_reuse_extra_bytes = 0
-    if parent_reuse_active:
+    # A k=1 parent/star schedule retains one raw file-spinor parent, its
+    # integer G row, and the current physical star's FFT gather indices.
+    # It is bounded by the symmetry-group order, not nk; these carriers coexist
+    # at the FFT boundary
+    # and therefore belong in the refusal model.  In 4c mode the unfolded 2c
+    # child also coexists during the post-unfold lift, so price that
+    # short-lived carrier as well.
+    parent_stream_extra_bytes = 0
+    if parent_stream_active:
         one_raw_2c_local_bytes = (
             nb_per_band_shard * int(loader.nspinor)
             * int(loader.ngkmax) * 16
         )
-        parent_reuse_extra_bytes = one_raw_2c_local_bytes * (
+        parent_stream_extra_bytes = one_raw_2c_local_bytes * (
             2 if bispinor else 1)
+        parent_stream_extra_bytes += int(loader.ngkmax) * 3 * 4
+        # One-child FFT-index construction is a functional scatter. Price one
+        # star of outputs plus a deliberately conservative live temporary set:
+        # rotated
+        # G/components/cells/mask/update indices and a scatter output copy.
+        # All terms remain bounded by one symmetry star, never O(nk).
+        parent_stream_extra_bytes += (
+            int(loader.ngkmax) * 40
+            + max_parent_star * n_rtot * 4
+            + n_rtot * 4)
+        if bispinor:
+            # The fused child-G transform/kinetic-balance lift needs one
+            # float64 Cartesian momentum row. It is device-local and never
+            # enters the loader's host full-k G cache.
+            parent_stream_extra_bytes += int(loader.ngkmax) * 3 * 8
     output_local_bytes = (
         nk_accum * nb_accum * nspinor * 16
         * (((n_rmu_padded + n_x - 1) // n_x)
@@ -2533,13 +2552,14 @@ def load_centroids_band_chunked(
     # A caller-provided G-flat tensor is already in memory_stats(); only price
     # it here when this call will allocate it.  This avoids double-charging
     # htransform's shared-window reuse path.
-    # Every loader unfold stages request-local c128 nonsymmorphic phase rows.
-    # They are deliberately uncached to keep extreme-G parent streaming O(1)
-    # in k; charge the maximum rows held by this call alongside G-flat data.
+    # Every loader unfold has a request-local c128 nonsymmorphic phase
+    # temporary.  Parent streaming generates it inside the device action from
+    # the one cached integer G row above; other routes stage the same logical
+    # rows.  Charge the maximum simultaneous rows alongside G-flat data.
     phase_rows = k_tile if stream_tiles else nk_tot
     request_phase_bytes = phase_rows * int(loader.ngkmax) * 16
     new_gflat_bytes = (
-        gflat_local_bytes + parent_reuse_extra_bytes + request_phase_bytes
+        gflat_local_bytes + parent_stream_extra_bytes + request_phase_bytes
         if psi_G_flat is None else 0
     )
     persistent_bytes = (
@@ -2594,13 +2614,13 @@ def load_centroids_band_chunked(
         f"stream={'on' if stream_tiles else 'off'}, "
         f"k_tile={k_tile}, band_tile={band_tile}"
     )
-    # Pass the loader-cached device-resident sphere index directly to
-    # gflat_to_rmu.  It is a runtime operand shared with psi_G_store's
-    # _g_index_dev, so streaming neither retains a per-tile constant nor
-    # constructs a duplicate device buffer.
-    g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
-    # Use the k representatives paired with this loader's full-BZ G table;
-    # see the identical streamed-r door above.
+    # The one-k parent schedule builds each current-star child index from the
+    # resident parent G row. Other streaming/bulk schedules retain the
+    # established complete cached table.
+    g_index_full = None
+    if parent_groups is None:
+        g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
+    # Use the k representatives paired with this loader's typed full-BZ map.
     kvecs_frac_full = loader.kvecs(k="full_bz")
 
     # One reshard owner for both the bulk and streamed paths.  The input is
@@ -2676,8 +2696,7 @@ def load_centroids_band_chunked(
             return acc_y, acc_x
 
         def _sample_and_insert_one(
-                acc_y, acc_x, psi_G_one, child, b_rel):
-            g_index_one = g_index_full[child:child + 1]
+                acc_y, acc_x, psi_G_one, g_index_one, child, b_rel):
             kvecs_one = jnp.asarray(kvecs_frac_full[child:child + 1])
             with timing.section("load_centroids.gflat_to_rmu"):
                 psi_rmu_band = gflat_to_rmu(
@@ -2685,7 +2704,7 @@ def load_centroids_band_chunked(
                     mesh=mesh_xy, fft_grid=meta.fft_grid,
                     kvecs_frac=kvecs_one, norm="ortho", chunk_size=cs)
                 jax.block_until_ready(psi_rmu_band)
-            del g_index_one, kvecs_one
+            del kvecs_one
 
             with timing.section("load_centroids.reshard_insert"):
                 acc_y, acc_x = _insert_tile(
@@ -2696,38 +2715,27 @@ def load_centroids_band_chunked(
             return acc_y, acc_x
 
         psi_rmu_all, psi_rmuT_all = _zero_faces()
-        from common.collectives import barrier as _sync_barrier
-        _sync_barrier("load_centroids_pre_stream")
 
-        for b_rel in range(0, nb_total, band_tile):
-            b_hi_rel = min(b_rel + band_tile, nb_total)
-            band_window = (b_start + b_rel, b_start + b_hi_rel)
-            if parent_groups is not None:
-                # For a non-singleton star, read its raw IBZ parent once for
-                # this band tile, then keep the established one-full-k
-                # transform/IFFT workspace while realizing children.  The 4c
-                # lift remains after the canonical 2c unfold in WfnLoader.
-                for parent, full_children in parent_groups:
-                    if len(full_children) == 1:
-                        # No star reuse is available.  Keep the incumbent
-                        # direct full-child load so singleton parents pay no
-                        # raw-parent carrier or separate unfold dispatch.
-                        child = int(full_children[0])
-                        with timing.section("load_centroids.loader_load"):
-                            psi_G_tile = load_psi_gflat_padded(
-                                loader, band_window, mesh_xy=mesh_xy,
-                                bispinor=bispinor, pad_to=band_tile,
-                                k=[child], sharding=sharding_load,
-                                bispinor_lift=bispinor_lift)
-                            if psi_G_tile is None:
-                                continue
-                            jax.block_until_ready(psi_G_tile)
-                        psi_rmu_all, psi_rmuT_all = _sample_and_insert_one(
-                            psi_rmu_all, psi_rmuT_all, psi_G_tile,
-                            child, b_rel)
-                        del psi_G_tile
-                        continue
-
+        if parent_groups is not None:
+            # Keep each parent's integer G row resident across all of its
+            # band tiles and children.  This avoids rebuilding or transferring
+            # an ngk-sized phase row per child while retaining the established
+            # one-full-k transform/IFFT workspace. Every group, including a
+            # singleton, uses the same raw-parent door. Its star of child
+            # indices is reused across band tiles, then released before the
+            # next parent, so neither G vectors nor indices accumulate with nk.
+            for parent, full_children in parent_groups:
+                with timing.section("load_centroids.parent_box_indices"):
+                    child_indices = [
+                        (int(child), loader.full_k_box_index_one_dev(
+                            int(child)))
+                        for child in full_children
+                    ]
+                    jax.block_until_ready(
+                        tuple(index for _, index in child_indices))
+                for b_rel in range(0, nb_total, band_tile):
+                    b_hi_rel = min(b_rel + band_tile, nb_total)
+                    band_window = (b_start + b_rel, b_start + b_hi_rel)
                     with timing.section("load_centroids.loader_load"):
                         parent_psi = load_psi_gflat_padded(
                             loader, band_window, mesh_xy=mesh_xy,
@@ -2740,8 +2748,7 @@ def load_centroids_band_chunked(
                             continue
                         jax.block_until_ready(parent_psi)
 
-                    for child_value in full_children:
-                        child = int(child_value)
+                    for child, g_index_one in child_indices:
                         with timing.section("load_centroids.parent_unfold"):
                             psi_G_tile = loader.unfold_parent_to_full_k(
                                 parent_psi, parent=int(parent), full_k=child,
@@ -2750,50 +2757,55 @@ def load_centroids_band_chunked(
                             jax.block_until_ready(psi_G_tile)
 
                         psi_rmu_all, psi_rmuT_all = _sample_and_insert_one(
-                            psi_rmu_all, psi_rmuT_all, psi_G_tile,
+                            psi_rmu_all, psi_rmuT_all, psi_G_tile, g_index_one,
                             child, b_rel)
                         del psi_G_tile
                     del parent_psi
-                continue
+                del child_indices
 
-            for k0 in range(0, nk_tot, k_tile):
-                k1 = min(k0 + k_tile, nk_tot)
-                k_ids = list(range(k0, k1))
-                with timing.section("load_centroids.loader_load"):
-                    psi_G_tile = load_psi_gflat_padded(
-                        loader, band_window, mesh_xy=mesh_xy,
-                        bispinor=bispinor, pad_to=band_tile, k=k_ids,
-                        sharding=sharding_load,
-                        bispinor_lift=bispinor_lift)
-                    # A terminal band tile can lie wholly beyond mnband when
-                    # Meta rounded the user's logical edge to the mesh.  The
-                    # accumulator is already exact zero there.
-                    if psi_G_tile is None:
-                        continue
-                    psi_G_tile = pad_axis(
-                        psi_G_tile, k_tile, axis=0).array
-                    jax.block_until_ready(psi_G_tile)
+        else:
+            for b_rel in range(0, nb_total, band_tile):
+                b_hi_rel = min(b_rel + band_tile, nb_total)
+                band_window = (b_start + b_rel, b_start + b_hi_rel)
 
-                g_index_tile = pad_axis(
-                    g_index_full[k0:k1], k_tile, axis=0).array
-                kvecs_tile = pad_axis(
-                    jnp.asarray(kvecs_frac_full[k0:k1]),
-                    k_tile, axis=0).array
-                with timing.section("load_centroids.gflat_to_rmu"):
-                    psi_rmu_band = gflat_to_rmu(
-                        psi_G_tile, g_index_tile, centroid_idx_np,
-                        mesh=mesh_xy, fft_grid=meta.fft_grid,
-                        kvecs_frac=kvecs_tile, norm="ortho",
-                        chunk_size=cs)
-                    jax.block_until_ready(psi_rmu_band)
-                del psi_G_tile, g_index_tile, kvecs_tile
+                for k0 in range(0, nk_tot, k_tile):
+                    k1 = min(k0 + k_tile, nk_tot)
+                    k_ids = list(range(k0, k1))
+                    with timing.section("load_centroids.loader_load"):
+                        psi_G_tile = load_psi_gflat_padded(
+                            loader, band_window, mesh_xy=mesh_xy,
+                            bispinor=bispinor, pad_to=band_tile, k=k_ids,
+                            sharding=sharding_load,
+                            bispinor_lift=bispinor_lift)
+                        # A terminal band tile can lie wholly beyond mnband
+                        # when Meta rounded the user's logical edge to the
+                        # mesh.  The accumulator is already exact zero there.
+                        if psi_G_tile is None:
+                            continue
+                        psi_G_tile = pad_axis(
+                            psi_G_tile, k_tile, axis=0).array
+                        jax.block_until_ready(psi_G_tile)
 
-                with timing.section("load_centroids.reshard_insert"):
-                    psi_rmu_all, psi_rmuT_all = _insert_tile(
-                        psi_rmu_all, psi_rmuT_all, psi_rmu_band,
-                        jnp.int32(k0), jnp.int32(b_rel))
-                    jax.block_until_ready((psi_rmu_all, psi_rmuT_all))
-                del psi_rmu_band
+                    g_index_tile = pad_axis(
+                        g_index_full[k0:k1], k_tile, axis=0).array
+                    kvecs_tile = pad_axis(
+                        jnp.asarray(kvecs_frac_full[k0:k1]),
+                        k_tile, axis=0).array
+                    with timing.section("load_centroids.gflat_to_rmu"):
+                        psi_rmu_band = gflat_to_rmu(
+                            psi_G_tile, g_index_tile, centroid_idx_np,
+                            mesh=mesh_xy, fft_grid=meta.fft_grid,
+                            kvecs_frac=kvecs_tile, norm="ortho",
+                            chunk_size=cs)
+                        jax.block_until_ready(psi_rmu_band)
+                    del psi_G_tile, g_index_tile, kvecs_tile
+
+                    with timing.section("load_centroids.reshard_insert"):
+                        psi_rmu_all, psi_rmuT_all = _insert_tile(
+                            psi_rmu_all, psi_rmuT_all, psi_rmu_band,
+                            jnp.int32(k0), jnp.int32(b_rel))
+                        jax.block_until_ready((psi_rmu_all, psi_rmuT_all))
+                    del psi_rmu_band
 
         gc.collect()
         return _finish_faces(psi_rmu_all, psi_rmuT_all)

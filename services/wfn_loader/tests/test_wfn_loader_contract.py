@@ -259,7 +259,7 @@ def test_full_k_parent_groups_stably_group_one_interleaved_k_pass():
 
 
 def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
-        synth_wfn_path):
+        synth_wfn_path, monkeypatch):
     """Hostile typed action: improper spatial op + tau + antiunitarity.
 
     The reference comes from ``symmetry_maps.unfold_psi``.  The loader
@@ -268,6 +268,7 @@ def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
     parent.  Nonzero tau and the TR row make conjugation/phase order visible.
     """
     import jax
+    import wfn_loader.loader as loader_module
     from jax.sharding import NamedSharding, PartitionSpec as P
     from symmetry_maps import (
         spinor_rotation_for_sym_row, tau_phase_row, unfold_psi)
@@ -307,6 +308,7 @@ def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
         phase = np.ones((1, int(loader.ngkmax)), dtype=np.complex128)
         phase[0, :n] = phase_valid
         rep1 = NamedSharding(mesh, P(None))
+        rep2 = NamedSharding(mesh, P(None, None))
         rep3 = NamedSharding(mesh, P(None, None, None))
 
         def _phase_for_child(row, carriers):
@@ -314,16 +316,25 @@ def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
             np.testing.assert_array_equal(carriers, g_parent)
             return phase_valid
 
+        def _operation_rows(row):
+            assert int(row) == tr_row
+            return sym_mats_k[tr_row], tau, np.asarray(True)
+
         loader._sym = SimpleNamespace(
             nk_tot=1,
             irr_idx_k=np.asarray([0], dtype=np.int32),
             sym_idx_k=np.asarray([tr_row], dtype=np.int32),
             reciprocal_phase=_phase_for_child,
+            operation_rows=_operation_rows,
         )
         loader._phdf5_static_dev = {
             "U_per_full": jax.device_put(U_eff[None, ...], rep3),
             "tr_mask_per_full": jax.device_put(
                 np.asarray([True]), rep1),
+            "reciprocal_per_full": jax.device_put(
+                sym_mats_k[tr_row][None, ...], rep3),
+            "translation_per_full": jax.device_put(
+                tau[None, ...], rep2),
             # Unused by this primitive, but retained as a truthful typed
             # table bundle rather than a partial fake of another format.
             "ibz_per_full": jax.device_put(
@@ -334,8 +345,23 @@ def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
             "nk_full": 1,
         }
 
+        phase_factory_calls = []
+        original_phase_factory = loader_module._parent_phase_kernel
+
+        def _counted_phase_factory(phase_mesh):
+            phase_factory_calls.append(phase_mesh)
+            return original_phase_factory(phase_mesh)
+
+        monkeypatch.setattr(
+            loader_module, "_parent_phase_kernel", _counted_phase_factory)
         got = np.asarray(loader.unfold_parent_to_full_k(
             parent_psi, parent=0, full_k=0))[0]
+        assert phase_factory_calls == [mesh]
+        parent_g_row = loader._host_parent_g_row(0)
+        np.testing.assert_array_equal(parent_g_row[:n], g_parent)
+        np.testing.assert_array_equal(
+            parent_g_row[n:],
+            np.zeros((int(loader.ngkmax) - n, 3), dtype=np.int32))
         expected = np.zeros_like(got)
         expected[:, :, :n] = expected_valid
         np.testing.assert_allclose(got, expected, rtol=0, atol=1e-14)
@@ -365,14 +391,25 @@ def test_parent_child_unfold_uses_typed_improper_nonsymmorphic_tr_action(
 
 
 def test_parent_child_unfold_matches_full_loader_for_tr_and_post_unfold_4c(
-        gnppm_wfn):
+        gnppm_wfn, monkeypatch):
     """Real full-k parity, including the delicate post-unfold 4c lift."""
     from jax.sharding import PartitionSpec as P
+    import wfn_loader.loader as loader_module
 
     mesh = _mesh_1x1()
     band_spec = P(None, ("x", "y"), None, None)
     with WfnLoader(gnppm_wfn, backend="eager", mesh=mesh) as loader:
         sym = loader.symmetry()
+        assert not np.any(np.abs(loader.translations) > 1e-12)
+        phase_factory_calls = []
+        original_phase_factory = loader_module._parent_phase_kernel
+
+        def _counted_phase_factory(phase_mesh):
+            phase_factory_calls.append(phase_mesh)
+            return original_phase_factory(phase_mesh)
+
+        monkeypatch.setattr(
+            loader_module, "_parent_phase_kernel", _counted_phase_factory)
         compact_static = loader._ensure_phdf5_static()
         assert "phase_per_full" not in compact_static
         assert not any(
@@ -396,6 +433,9 @@ def test_parent_child_unfold_matches_full_loader_for_tr_and_post_unfold_4c(
         }
         raw_by_parent = {}
         for child in children:
+            np.testing.assert_array_equal(
+                np.asarray(loader.full_k_box_index_one_dev(child)),
+                loader.box_index(k=[child]))
             parent = group_for_child[child]
             if parent not in raw_by_parent:
                 raw_by_parent[parent] = loader.load(
@@ -431,6 +471,10 @@ def test_parent_child_unfold_matches_full_loader_for_tr_and_post_unfold_4c(
             np.testing.assert_allclose(
                 got_4c[:, :, :2, :], got_2c, rtol=0, atol=0)
             assert np.linalg.norm(got_4c[:, :, 2:, :]) > 0.0
+
+        # Every exercised row is symmorphic, so the parent door must use its
+        # static no-phase executable: no G-sized exponential was dispatched.
+        assert phase_factory_calls == []
 
         # The spatial identity row is a bit-parity anchor: no phase,
         # conjugation, or spinor arithmetic is allowed to perturb it.

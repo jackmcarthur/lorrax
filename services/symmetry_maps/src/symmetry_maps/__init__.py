@@ -214,6 +214,8 @@ from symmetry_maps.maps import (
     star_select,
     star_spread,
     tau_phase_row,
+    tau_phase_row_jax,
+    unfold_reciprocal_carriers,
     spinor_rotation_for_sym_row,
     apply_spinor_rotation,
     unfold_psi,
@@ -321,7 +323,7 @@ __all__ = [
     "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
-    "tau_phase_row",
+    "tau_phase_row", "tau_phase_row_jax", "unfold_reciprocal_carriers",
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",

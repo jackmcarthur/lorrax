@@ -559,18 +559,27 @@ def test_streamed_centroid_transfer_matches_bulk(
         len(children) == 1 for _, children in singleton_groups), (
         "the synthetic deck must pin the no-reuse singleton path")
     singleton_requests = []
+    singleton_unfolds = []
     original_load = synth_loader.load
+    original_unfold = synth_loader.unfold_parent_to_full_k
 
     def _counted_singleton_load(*args, **kwargs):
         singleton_requests.append(kwargs.get("k"))
         return original_load(*args, **kwargs)
 
-    def _forbid_parent_unfold(*_args, **_kwargs):
-        raise AssertionError("singleton star dispatched parent unfold")
+    def _counted_parent_unfold(*args, **kwargs):
+        singleton_unfolds.append((
+            int(kwargs["parent"]), int(kwargs["full_k"])))
+        return original_unfold(*args, **kwargs)
+
+    def _forbid_full_box_index(*_args, **_kwargs):
+        raise AssertionError("one-k stream built the full-k FFT index")
 
     monkeypatch.setattr(synth_loader, "load", _counted_singleton_load)
     monkeypatch.setattr(
-        synth_loader, "unfold_parent_to_full_k", _forbid_parent_unfold)
+        synth_loader, "unfold_parent_to_full_k", _counted_parent_unfold)
+    monkeypatch.setattr(
+        synth_loader, "box_index_dev", _forbid_full_box_index)
     stream_y, stream_x = load_centroids_band_chunked(
         synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
         band_chunk_size=4, k_chunk_size=1)
@@ -583,20 +592,25 @@ def test_streamed_centroid_transfer_matches_bulk(
         if key[0] == "gflat_to_rmu"
     ]
     assert len(families) == 1
-    # One direct full-child request per singleton group: no IBZRows raw
-    # parent carrier and no separate parent unfold for a star of size one.
-    # The production loop is band-major then parent-major.
+    # Singleton and non-singleton stars use the same bounded parent door. This
+    # keeps full-k G/index caches absent even on a low-symmetry 1000-k deck.
     expected_singletons = [
-        [int(children[0])]
+        (int(parent),)
+        for parent, _ in singleton_groups
         for _b_rel in range(0, nb, 4)
-        for _, children in singleton_groups
     ]
-    assert singleton_requests == expected_singletons
-    assert all(not isinstance(req, IBZRows) for req in singleton_requests)
+    assert [request.rows for request in singleton_requests] == expected_singletons
+    assert all(isinstance(req, IBZRows) for req in singleton_requests)
+    assert singleton_unfolds == [
+        (int(parent), int(children[0]))
+        for parent, children in singleton_groups
+        for _b_rel in range(0, nb, 4)
+    ]
 
 
+@pytest.mark.parametrize("bispinor", [False, True])
 def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
-        monkeypatch):
+        monkeypatch, bispinor):
     """The production schedule reduces real WFN reads, not FFT count.
 
     ``gnppm`` has non-singleton full-k stars.  The strict inequalities and
@@ -619,7 +633,9 @@ def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
         assert len(groups) < nk_full
         assert any(len(children) > 1 for _, children in groups)
 
-        nb = 2
+        nb = min(3, int(loader.nbands))
+        band_tile = 2
+        n_band_tiles = (nb + band_tile - 1) // band_tile
         nx, ny, nz = (int(v) for v in loader.fft_grid)
         r_mu = jnp.asarray([
             [0, 0, 0],
@@ -627,7 +643,7 @@ def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
         ], dtype=jnp.int32)
         meta = SimpleNamespace(
             nk_tot=nk_full,
-            nspinor=int(loader.nspinor),
+            nspinor=4 if bispinor else int(loader.nspinor),
             fft_grid=tuple(int(v) for v in loader.fft_grid),
             memory_per_device_gb=1000.0,
             b_id_4_user=nb,
@@ -636,17 +652,30 @@ def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
         # Independent full-k carrier through the established bulk path.
         preloaded = loader.load(
             bands=(0, nb), k="full_bz",
-            sharding=P(None, ("x", "y"), None, None))
+            sharding=P(None, ("x", "y"), None, None),
+            bispinor=bispinor)
         ref_y, ref_x = load_centroids_band_chunked(
-            loader, sym, meta, r_mu, False, MESH, (0, nb),
+            loader, sym, meta, r_mu, bispinor, MESH, (0, nb),
             band_chunk_size=nb, psi_G_flat=preloaded)
+        # The reference deliberately uses the incumbent full-k path. Remove
+        # its loader caches before measuring the one-k route so this test can
+        # prove that route does not merely inherit a retained full table.
+        loader._gvecs_cache.clear()
+        loader._gvecs_dev_cache.clear()
+        loader._parent_unfold_g_cache = None
 
         load_requests = []
         fft_k_extents = []
-        phase_requests = []
+        parent_g_requests = []
+        legacy_lift_requests = []
+        host_gvec_requests = []
+        one_box_requests = []
         original_load = loader.load
         original_fft = _wfn_transforms.gflat_to_rmu
-        original_phase_rows = loader._host_phase_rows_for_full_k
+        original_parent_g_row = loader._host_parent_g_row
+        original_legacy_lift = loader._apply_bispinor_lift
+        original_gvecs = loader.gvecs
+        original_one_box = loader.full_k_box_index_one_dev
 
         def _counted_load(*args, **kwargs):
             load_requests.append(kwargs.get("k"))
@@ -656,40 +685,83 @@ def test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft(
             fft_k_extents.append(int(args[0].shape[0]))
             return original_fft(*args, **kwargs)
 
-        def _counted_phase_rows(rows):
-            phase_requests.append(tuple(int(v) for v in np.asarray(rows)))
-            return original_phase_rows(rows)
+        def _counted_parent_g_row(parent):
+            parent_g_requests.append(int(parent))
+            return original_parent_g_row(parent)
+
+        def _counted_legacy_lift(*args, **kwargs):
+            legacy_lift_requests.append(tuple(
+                int(v) for v in np.asarray(kwargs["k"]).reshape(-1)))
+            return original_legacy_lift(*args, **kwargs)
+
+        def _counted_gvecs(*args, **kwargs):
+            raw = kwargs.get("k", "full_bz")
+            if isinstance(raw, str):
+                host_gvec_requests.append(raw)
+            else:
+                host_gvec_requests.append(tuple(
+                    int(v) for v in np.asarray(raw).reshape(-1)))
+            return original_gvecs(*args, **kwargs)
+
+        def _counted_one_box(full_k):
+            one_box_requests.append(int(full_k))
+            return original_one_box(full_k)
+
+        def _forbid_full_box_index(*_args, **_kwargs):
+            raise AssertionError("one-k stream built the full-k FFT index")
 
         monkeypatch.setattr(loader, "load", _counted_load)
         monkeypatch.setattr(
             _wfn_transforms, "gflat_to_rmu", _counted_fft)
         monkeypatch.setattr(
-            loader, "_host_phase_rows_for_full_k", _counted_phase_rows)
+            loader, "_host_parent_g_row", _counted_parent_g_row)
+        monkeypatch.setattr(
+            loader, "_apply_bispinor_lift", _counted_legacy_lift)
+        monkeypatch.setattr(loader, "gvecs", _counted_gvecs)
+        monkeypatch.setattr(
+            loader, "full_k_box_index_one_dev", _counted_one_box)
+        monkeypatch.setattr(
+            loader, "box_index_dev", _forbid_full_box_index)
         got_y, got_x = load_centroids_band_chunked(
-            loader, sym, meta, r_mu, False, MESH, (0, nb),
-            band_chunk_size=nb, k_chunk_size=1)
+            loader, sym, meta, r_mu, bispinor, MESH, (0, nb),
+            band_chunk_size=band_tile, k_chunk_size=1)
 
         assert "phase_per_full" not in loader._ensure_phdf5_static()
-        assert len(load_requests) == len(groups)
-        for request, (parent, children) in zip(load_requests, groups):
-            if len(children) == 1:
-                assert request == [int(children[0])]
-                assert not isinstance(request, IBZRows)
-            else:
-                assert isinstance(request, IBZRows)
-                assert request.rows == (int(parent),)
+        expected_group_visits = [
+            (parent, children)
+            for parent, children in groups
+            for _ in range(n_band_tiles)
+        ]
+        assert len(load_requests) == len(expected_group_visits)
+        for request, (parent, children) in zip(
+                load_requests, expected_group_visits):
+            assert isinstance(request, IBZRows)
+            assert request.rows == (int(parent),)
         raw_parent_rows = [
             request.rows for request in load_requests
             if isinstance(request, IBZRows)]
-        assert len(raw_parent_rows) == len(set(raw_parent_rows))
-        assert len(fft_k_extents) == nk_full
-        assert fft_k_extents == [1] * nk_full
-        expected_phase_children = [
+        expected_raw_parent_rows = [
+            (int(parent),)
+            for parent, _children in groups
+            for _ in range(n_band_tiles)
+        ]
+        assert raw_parent_rows == expected_raw_parent_rows
+        assert len(fft_k_extents) == nk_full * n_band_tiles
+        assert fft_k_extents == [1] * (nk_full * n_band_tiles)
+        all_parents = [int(parent) for parent, _children in groups]
+        expected_children = [
             int(child)
-            for _, children in groups if len(children) > 1
+            for _parent, children in groups
             for child in children
         ]
-        assert phase_requests == [(child,) for child in expected_phase_children]
+        # The one-child box index requires G in both 2c and 4c. Its one-slot
+        # parent cache survives every band tile in the parent-major schedule.
+        assert parent_g_requests == all_parents
+        assert one_box_requests == expected_children
+        assert legacy_lift_requests == []
+        assert host_gvec_requests == []
+        assert loader._gvecs_cache == {}
+        assert loader._gvecs_dev_cache == {}
         np.testing.assert_allclose(
             np.asarray(got_y), np.asarray(ref_y), rtol=1e-10, atol=1e-12)
         np.testing.assert_allclose(
