@@ -3283,10 +3283,15 @@ def raw_hall_pseudovector_sharded(
     directly, so ``cB_raw=(alpha_FS/2)^2 cB`` and the applied prefactor is
     equivalently ``-C/(Omega_cell*Nk*(alpha_FS/2))``.  The minus sign is the
     documented occupied-Berry/Hall sign; ``static_hall_linear_response``
-    later inserts the independent ``-i epsilon[b,a,i]`` CT convention (the
-    live band orientation ``P = -Delta*D``; its oracle is
+    later inserts ``CT[a,i] = -i epsilon[b,a,i] sigma_H[b]`` -- the MINUS
+    is not independent of this one.  The live Adler--Wiser response
+    energy-orders the bra and conjugates the row (``P = -Delta*D``), so its
+    linear CT imaginary part is the negative of the occupied-bra Berry
+    tensor stored here (``cacc4e07``; oracles
     ``tests/test_qsgw_parallel_transport_head.py::
-    test_raw_hall_matches_orbital_cB_owner_and_documented_sign``).
+    test_raw_hall_matches_orbital_cB_owner_and_documented_sign`` and
+    ``tests/test_photon_head_sign_oracle.py::
+    test_part_a_definitions_share_one_convention``).
     """
     from common.bispinor_init import HALFALPHA
 
