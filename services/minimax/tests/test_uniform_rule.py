@@ -84,3 +84,19 @@ def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():
         assert rule.relative == kind.startswith("sd")
         assert sup <= 1.5 * eps, (kind, box, sup, eps)
         assert kappa <= 1.0e4 and np.all(rule.times != 0.0)
+
+
+def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
+    """The jax reducer (forced, on the CPU device) reaches an accepted rule
+    within a few nodes of the numpy one: same algorithm, different
+    floating-point route (CholeskyQR2 weights, Cholesky per damping)."""
+    pytest.importorskip("jax")
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
+    box = (-8.0 * ETA, 8.0 * ETA, ETA, 5.0 * ETA)          # rank ~35: both finish in seconds
+    ref = build_uniform_rule(box, 1.0e-4, time_budget=30.0, backend="numpy")
+    rule = build_uniform_rule(box, 1.0e-4, time_budget=30.0, backend="jax")
+    _check(rule, box, 1.0e-4)
+    d = box_samples(*box, per_unit=10.0, n_im=48)
+    sup, kappa = rule_sup_error(rule.times, rule.weights, d)
+    assert sup <= 1.5e-4 and kappa <= 1.0e4
+    assert abs(rule.node_count - ref.node_count) <= 3, (rule.node_count, ref.node_count)

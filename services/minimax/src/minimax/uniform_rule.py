@@ -59,6 +59,7 @@ the geometry of the window it is given.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 
@@ -572,6 +573,331 @@ class _CloudFit:
         return best
 
 
+
+class _JaxCloudFit(_CloudFit):
+    """``_CloudFit`` with the inner solves on the rank's local accelerator.
+
+    Same model, same acceptance, same ``reduce`` (inherited): only ``newton``
+    and ``_solve_pick`` are replaced by ONE jitted Levenberg-Marquardt step
+    that is ``vmap``-ed over a fixed batch of ``B = 6`` candidates on fixed
+    padded shapes.  The numpy path spends 99 % of a crossing reduction in
+    ~5,500 least-squares solves of ~4 ms (5565 solves for 58 removals, 64 s);
+    each removal step tries ``K = 6`` starts serially.  On the GPU those six
+    are one batched call, so the lookahead costs about one solve.
+
+    Padded shapes.  The node count only ever falls, so every array is sized
+    to the start rank ``n_pad`` and a boolean ``mask`` marks the live nodes:
+    a dead node's column of ``A`` is zeroed and the Tikhonov ``mu`` on the
+    diagonal keeps the system regular (its weight solves to exactly zero, its
+    Jacobian column is zero, its step is zero).  One compiled step serves the
+    whole reduction; a recompile happens only when the trunc escalation
+    rebuilds the start at a new rank (~2-4 s each, reported by the timing
+    table in results/jax_reducer.md).
+
+    Batch over starts, not over removals.  Removals are sequential by nature
+    (each depends on the accepted state before it); the K lookahead starts of
+    one removal are independent, and so are the ``keep`` long solves.  Single
+    solves (the start polish, batch moves) run as one live candidate in a
+    batch of ``B``: on a GPU a batch of six small problems costs about the
+    same as one, and one batch size means one compilation.
+
+    Numerics that differ from numpy, on purpose: the weights come from
+    CholeskyQR2 on ``[A; mu I]`` (two Gram/Cholesky rounds; Householder
+    accuracy for condition numbers below ~1e8, and a jitted fallback to
+    ``jnp.linalg.qr`` when the Cholesky is not finite) instead of a
+    Householder QR, and the damping trials solve ``(J^T J + lam I) p = g`` by
+    a Cholesky instead of reusing one eigendecomposition (on the GPU a
+    700x700 ``eigh`` costs ~20 ms where a Cholesky costs ~1 ms).  The
+    acceptance check (sup and kappa on the finer check cloud) runs on the
+    device too, so a long solve needs no host round trip except the
+    per-step scalars.
+
+    Measured (results/jax_reducer.md, A100, eps 1e-4): one step of the batch
+    of six costs 72 ms on the +-5 eV crossing box (n = 134) and 296 ms on the
+    +-15 eV one (n = 346), i.e. 12 and 49 ms per candidate-step against
+    numpy's 92 and 525 ms -- 7.7x and 10.6x per step.  End to end the
+    reduction only reaches numpy parity (73 vs 74 nodes at 120 s; 227 vs
+    223): the batch runs every candidate for the full short/long solve while
+    numpy's per-candidate early exits (stall, no improving damping) skip
+    most of that work, and a single-candidate solve (start polish, batch
+    moves) still pays for the batch of six.  Making the batch adaptive
+    (drop frozen candidates, run single solves at B = 1 with a second
+    compilation) is the next step and was not done here.
+
+    Tempting, and why not: (1) normal equations with a plain ``solve`` --
+    they lose ``kappa(A)`` digits and the clustered exponential columns reach
+    1e6-1e8; CholeskyQR2 keeps the accuracy at matmul cost.  (2) ``jnp.qr``
+    for every solve -- a tall-skinny complex QR on the GPU is 5-15 ms, no
+    faster than numpy, and the batch does not help cuSOLVER.  (3) Putting the
+    removal loop itself inside ``lax.while_loop`` -- the per-removal host
+    decision (leave-one-out ranking, successive halving, deadline) is a few
+    hundred microseconds and keeps the numpy ``reduce`` shared, which is what
+    keeps the two backends provably the same algorithm.
+    """
+
+    B = 6                     # batch of candidates per compiled call
+
+    def __init__(self, d, phase, S, im_lo, im_hi, eps, w_ref, rho, alpha=0.3,
+                 check_cloud=None):
+        super().__init__(d, phase, S, im_lo, im_hi, eps, w_ref, rho, alpha)
+        import jax
+        import jax.numpy as jnp
+        if not jax.config.jax_enable_x64:
+            jax.config.update("jax_enable_x64", True)
+        self._jax, self._jnp = jax, jnp
+        self.n_pad = int(np.asarray(w_ref).size)
+        self._d_dev = jnp.asarray(self.d)
+        self._idp_dev = jnp.asarray(self.idp)
+        self._check = None
+        if check_cloud is not None:
+            d_check, rho_check, eps_c, kappa_cap = check_cloud
+            self._check = (jnp.asarray(d_check), jnp.asarray(rho_check),
+                           float(eps_c), float(kappa_cap))
+        self._compiled = None
+        self.compile_seconds = 0.0
+
+    # ---------------------------------------------------------------- padding
+    def _pad(self, s):
+        s = np.asarray(s, np.complex128)
+        if s.size > self.n_pad:
+            raise ValueError("candidate larger than the padded start rank")
+        out = np.zeros(self.n_pad, np.complex128)
+        mask = np.zeros(self.n_pad, bool)
+        out[:s.size], mask[:s.size] = s, True
+        return out, mask
+
+    # ------------------------------------------------------------ compiled step
+    def _build(self):
+        jax, jnp = self._jax, self._jnp
+        m, n = self.d.size, self.n_pad
+        S, c, h, mu = float(self.S), float(self.c), float(self.h), float(self.mu)
+        idp = self._idp_dev
+        eye_n = jnp.eye(n, dtype=jnp.complex128)
+
+        def s_of(re, y):
+            return jnp.clip(re, 0.0, S) + 1j * (c + h * jnp.tanh(y))
+
+        def qr_aug(Aa):
+            # CholeskyQR2 on the mu-augmented design matrix; Householder if the
+            # Cholesky is not finite.
+            def cholqr(M):
+                R1 = jnp.linalg.cholesky(M.conj().T @ M).conj().T
+                Q1 = jax.scipy.linalg.solve_triangular(R1, M.T, trans="T").T
+                R2 = jnp.linalg.cholesky(Q1.conj().T @ Q1).conj().T
+                Q2 = jax.scipy.linalg.solve_triangular(R2, Q1.T, trans="T").T
+                return Q2, R2 @ R1
+            Q, R = cholqr(Aa)
+            good = jnp.all(jnp.isfinite(Q)) & jnp.all(jnp.isfinite(R))
+            def householder():
+                q, r = jnp.linalg.qr(Aa, mode="reduced")
+                return q, r
+            return jax.lax.cond(good, lambda: (Q, R), householder)
+
+        def ls(s, mask, scale, b):
+            A = jnp.exp(idp[:, None] * s[None, :]) * scale[:, None] * mask[None, :]
+            Aa = jnp.concatenate([A, mu * eye_n], 0)
+            Q, R = qr_aug(Aa)
+            ba = jnp.concatenate([b, jnp.zeros(n, jnp.complex128)])
+            cc = Q.conj().T @ ba
+            w = jax.scipy.linalg.solve_triangular(R, cc)
+            return w, ba - Q @ cc, Q, A
+
+        n_trial = 12
+        eye2 = jnp.eye(2 * n)
+
+        def step(s_re, y, lam, mask, active, scale, b):
+            s = s_of(s_re, y)
+            w, F, Q, A = ls(s, mask, scale, b)
+            nF = jnp.linalg.norm(F)
+            Jc = jnp.concatenate([-(idp[:, None] * A) * w[None, :],
+                                  jnp.zeros((n, n), jnp.complex128)], 0)
+            Jc = Jc - Q @ (Q.conj().T @ Jc)
+            dIm = h / jnp.cosh(y) ** 2
+            Jr = jnp.block([[Jc.real, -Jc.imag * dIm[None, :]],
+                            [Jc.imag, Jc.real * dIm[None, :]]])
+            Fr = jnp.concatenate([F.real, F.imag])
+            D = jnp.linalg.norm(Jr, axis=0)
+            D = jnp.where(D > 0, D, 1.0)
+            Jd = Jr / D[None, :]
+            H = Jd.T @ Jd
+            g = Jd.T @ (-Fr)
+            # Dampings lam, 4 lam, 16 lam, ... are tried in order and the first
+            # that lowers the residual is taken, exactly as in numpy.
+            # Tempting, and why not: vmap the twelve trials into one batched
+            # solve + one batched least squares.  Measured on the GPU: 402 ms
+            # per step against 72 ms serial on the +-5 eV box (B = 6, n = 134)
+            # and 4140 ms against 296 ms on the +-15 eV box (n = 346) -- the
+            # batched cuSOLVER/trsm paths are loops, and the batch does
+            # twelve-fold flops where the serial loop stops at the first
+            # improvement (1-3 trials).
+            lams = lam * 4.0 ** jnp.arange(n_trial)
+
+            def trial(lam_k):
+                p = jax.scipy.linalg.solve(H + lam_k * eye2, g, assume_a="pos") / D
+                y_new = jnp.clip(y + jnp.clip(p[n:], -3.0, 3.0), -8.0, 8.0)
+                s_re_new = jnp.clip(s_re + p[:n], 0.0, S)
+                w_new, F_new, _Q, _A = ls(s_of(s_re_new, y_new), mask, scale, b)
+                return s_re_new, y_new, w_new, F_new, jnp.linalg.norm(F_new)
+
+            def trial_cond(carry):
+                kk, _l, improved, *_ = carry
+                return (kk < n_trial) & jnp.logical_not(improved)
+
+            def trial_body(carry):
+                kk, lam_k, _improved, s_c, y_c, w_c, F_c, nF_c = carry
+                s_n, y_n, w_n, F_n, nF_n = trial(lam_k)
+                acc = nF_n < nF
+                return (kk + 1,
+                        jnp.where(acc, jnp.maximum(lam_k / 3.0, 1e-9), lam_k * 4.0),
+                        acc,
+                        jnp.where(acc, s_n, s_c), jnp.where(acc, y_n, y_c),
+                        jnp.where(acc, w_n, w_c), jnp.where(acc, F_n, F_c),
+                        jnp.where(acc, nF_n, nF_c))
+
+            _kk, lam_t, improved, s_t, y_t, w_t, F_t, nF_t = jax.lax.while_loop(
+                trial_cond, trial_body, (0, lam, False, s_re, y, w, F, nF))
+            take = active & improved
+            s_re_o = jnp.where(take, s_t, s_re)
+            y_o = jnp.where(take, y_t, y)
+            w_o = jnp.where(take, w_t, w)
+            F_o = jnp.where(take, F_t, F)
+            nF_o = jnp.where(take, nF_t, nF)
+            lam_o = jnp.where(take, lam_t, lam)
+            res_cloud = jnp.linalg.norm(F_o[:m]) / jnp.linalg.norm(b)
+            return s_re_o, y_o, lam_o, w_o, nF_o, res_cloud, take
+
+        step_b = jax.jit(jax.vmap(step, in_axes=(0, 0, 0, 0, 0, None, None)))
+
+        def evaluate(s_re, y, mask, scale, b):
+            # weights and residuals of a state without a step (start of a run)
+            w, F, _Q, _A = ls(s_of(s_re, y), mask, scale, b)
+            return w, jnp.linalg.norm(F), jnp.linalg.norm(F[:m]) / jnp.linalg.norm(b)
+
+        eval_b = jax.jit(jax.vmap(evaluate, in_axes=(0, 0, 0, None, None)))
+
+        check_b = None
+        if self._check is not None:
+            d_check, rho_check, eps_c, kappa_cap = self._check
+            phase = complex(self.phase)
+
+            def check(s_re, y, mask, w):
+                times = phase * s_of(s_re, y)
+                Ac = jnp.exp(1j * d_check[:, None] * times[None, :]) * mask[None, :]
+                Qv = Ac @ w
+                err = jnp.max(jnp.abs(Qv - 1.0 / d_check) * rho_check)
+                kappa = jnp.max(jnp.abs(Ac * w[None, :]).sum(1)
+                                / jnp.maximum(jnp.abs(Qv), 1e-300))
+                return (err <= eps_c) & (kappa <= kappa_cap)
+
+            check_b = jax.jit(jax.vmap(check, in_axes=(0, 0, 0, 0)))
+        return step_b, eval_b, check_b
+
+    def _kernels(self):
+        # jit compiles on the first call, not at build time: the first
+        # step/eval/check calls are timed in ``_run`` into ``compile_seconds``
+        if self._compiled is None:
+            self._compiled = self._build()
+            self._warm = False
+        return self._compiled
+
+    # ------------------------------------------------------------- batched run
+    def _run(self, starts, steps, *, check, chunk=10, stall=1e-3, tol=1e-14):
+        """LM on up to ``B`` candidates at once.  Returns per candidate
+        ``(s, w, res_cloud, accepted)`` with the numpy ``newton`` stopping
+        rules applied per candidate on the host: converged, no damping
+        improved the residual, stalled over a chunk, or (with ``check``)
+        accepted on the check cloud at a chunk boundary."""
+        jnp = self._jnp
+        step_b, eval_b, check_b = self._kernels()
+        Bn = self.B
+        assert 1 <= len(starts) <= Bn
+        s_pad = np.zeros((Bn, self.n_pad), np.complex128)
+        mask = np.zeros((Bn, self.n_pad), bool)
+        for i, s0 in enumerate(starts):
+            s_pad[i], mask[i] = self._pad(s0)
+        for i in range(len(starts), Bn):          # dead copies fill the batch
+            s_pad[i], mask[i] = s_pad[0], mask[0]
+        s = s_pad.real.clip(0.0, self.S) + 1j * s_pad.imag.clip(self.im_lo, self.im_hi)
+        y = self._y_of(s)
+        s_re = jnp.asarray(s.real)
+        y = jnp.asarray(y)
+        mask_d = jnp.asarray(mask)
+        scale_d, b_d = jnp.asarray(self.scale), jnp.asarray(self.b)
+        lam = jnp.full(Bn, 1e-3)
+        live = np.zeros(Bn, bool)
+        live[:len(starts)] = True
+        active = live.copy()
+        accepted = np.zeros(Bn, bool)
+        if not self._warm:
+            t_c = time.perf_counter()
+            w, nF, res = eval_b(s_re, y, mask_d, scale_d, b_d)
+            _ = step_b(s_re, y, lam, mask_d, jnp.asarray(live), scale_d, b_d)
+            if check_b is not None:
+                _ = check_b(s_re, y, mask_d, w)
+            np.asarray(nF)
+            self.compile_seconds += time.perf_counter() - t_c
+            self._warm = True
+        w, nF, res = eval_b(s_re, y, mask_d, scale_d, b_d)
+        n_last = np.asarray(nF)
+        active &= n_last >= tol * self.nb
+        for it in range(steps):
+            if it > 0 and it % chunk == 0 and active.any():
+                if check and check_b is not None:
+                    okv = np.asarray(check_b(s_re, y, mask_d, w))
+                    accepted |= okv & active
+                    active &= ~okv
+                nF_h = np.asarray(nF)
+                active &= ~(nF_h > (1.0 - stall) * n_last)
+                n_last = nF_h
+            if not active.any():
+                break
+            s_re, y, lam, w, nF, res, improved = step_b(
+                s_re, y, lam, mask_d, jnp.asarray(active), scale_d, b_d)
+            improved = np.asarray(improved)
+            nF_h = np.asarray(nF)
+            active &= improved
+            active &= nF_h >= tol * self.nb
+        s_out = np.asarray(self._s_of(np.asarray(s_re), np.asarray(y)))
+        w_out, res_out = np.asarray(w), np.asarray(res)
+        out = []
+        for i, s0 in enumerate(starts):
+            nn = np.asarray(s0).size
+            out.append((s_out[i, :nn], w_out[i, :nn], float(res_out[i]), bool(accepted[i])))
+        return out
+
+    def newton(self, s, steps=30, tol=1e-14, check=None, chunk=10, stall=1e-3):
+        s_t, w_t, res, acc = self._run([np.asarray(s, np.complex128)], steps,
+                                       check=check is not None, chunk=chunk,
+                                       stall=stall, tol=tol)[0]
+        return s_t, w_t, res
+
+    def _solve_pick(self, starts, ok, nstep, keep, rank_steps=8):
+        """Successive halving as in numpy, batched: all ``K`` short solves in
+        one run, the ``keep`` best in a second run with the device-side check
+        at every chunk; the winner is re-confirmed with the host ``ok`` (the
+        same arithmetic on the same check cloud)."""
+        Bn = self.B
+        short = []
+        for lo in range(0, len(starts), Bn):
+            for s_t, w_t, res, _acc in self._run(starts[lo:lo + Bn], rank_steps,
+                                                 check=False, chunk=100):
+                short.append((res, s_t, w_t))
+        short.sort(key=lambda z: z[0])
+        cands = short[:keep]
+        found = None
+        pending = []
+        for res, s_t, w_t in cands:
+            if ok(s_t, w_t) and res <= self.eps:
+                if found is None or res < found[2]:
+                    found = (s_t, w_t, res)
+            else:
+                pending.append(s_t)
+        if pending:
+            for s_t, w_t, res, acc in self._run(pending, nstep, check=True):
+                if ok(s_t, w_t) and (found is None or res < found[2]):
+                    found = (s_t, w_t, res)
+        return found
+
 def rule_sup_error(times, weights, d, rho=None):
     """``(max rho |Q(d) - 1/d|, max kappa)`` on the cloud ``d``, where ``rho``
     is ``min Im d`` (error relative to the ``1/eta`` peak, the default) or
@@ -615,8 +941,31 @@ class UniformRule:
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
 
 
+def _select_backend(backend, n_start, cloud_size):
+    """``numpy`` | ``jax`` | ``auto`` (env ``LORRAX_UNIFORM_RULE_BACKEND``).
+
+    ``auto`` takes the jax path only when an accelerator is present and the
+    problem is large enough to pay its launch and compile overhead (start
+    rank >= 40, cloud >= 2000): the small sign-definite tails finish in a few
+    seconds on numpy and would spend longer compiling."""
+    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "auto")).strip().lower()
+    if choice not in ("numpy", "jax", "auto"):
+        raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
+    if choice == "numpy":
+        return "numpy"
+    try:
+        import jax
+        accelerator = any(dev.platform != "cpu" for dev in jax.devices())
+    except Exception:  # noqa: BLE001 - no jax, or no usable backend: numpy
+        return "numpy"
+    if choice == "jax":
+        return "jax"
+    return "jax" if (accelerator and n_start >= 40 and cloud_size >= 2000) else "numpy"
+
+
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
-                       reduce=True, time_budget=None, relative=None):
+                       reduce=True, time_budget=None, relative=None,
+                       backend=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
 
@@ -647,6 +996,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     returns the best accepted rule at the deadline; the interpolatory rule is
     always available after about a second, so the budget trades planning
     wall for node count and nothing else.  Never refuses a finite box.
+    ``backend`` (``numpy`` | ``jax`` | ``auto``, default the environment's
+    ``LORRAX_UNIFORM_RULE_BACKEND`` or ``auto``) chooses where the reduction's
+    inner solves run; see ``_JaxCloudFit``.  Both backends run the same
+    algorithm with the same acceptance; the jax one differs in floating-point
+    detail only.
 
     Tempting, and why not: judge acceptance on the fit cloud ``d`` itself
     (17 of 80 random boxes passed there and failed on a finer cloud), or skip
@@ -703,7 +1057,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
                 s, w = fam.interpolatory()
             # the cloud solver works in the executor's convention t = phase*s
             # with weights -i*phase*w: the sup test uses exactly that map
-            fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
+            if _select_backend(backend, w.size, d.size) == "jax":
+                fit = _JaxCloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w,
+                                   rho=rho, check_cloud=(d_check, rho_check, eps, kappa_cap))
+            else:
+                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
             red = fit.reduce(s, ok, deadline)       # start acceptance ignores the deadline
             if red is not None:
                 break
