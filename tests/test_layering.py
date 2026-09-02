@@ -858,11 +858,15 @@ def test_the_env_scan_separates_reads_from_writes():
 # is banned outright.
 
 _L1_LIBRARY_ENV_READS = {
-    # resolve_sigma_plan -- explicit, fail-closed selection of the opt-in
-    # planner.  The shared-grid dial was removed (owner ruling 2026-08-31).
+    # resolve_sigma_plan -- explicit, fail-closed selection of the box
+    # production route or the frozen pane comparison control.
     "gw.sigma_plan": {
-        "LORRAX_DELIVERED_PLAN_CACHE",
         "LORRAX_SIGMA_PLAN",
+    },
+    # Debug-only support-box trace.  Accuracy, reduction wall and cache
+    # location are deck keys; no numerical policy is read here.
+    "gw.sigma_box_plan": {
+        "LORRAX_UNIFORM_RULE_TRACE",
     },
     # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad — one resolver
     # each, refuse-on-garbage; the entry layer passes resolved values down.

@@ -33,6 +33,7 @@ file write, QSGW build).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable
@@ -988,7 +989,6 @@ def compute_sigma_xc(
         from file_io import mpa_store
         from .head_correction import compute_complex_pole_head_sigma_diag
         from .mpa.sigma import compute_sigma_c_mpa_omega_grid
-        from .mpa.sigma_windows import CROSSING_NODE_FLOOR
         from .efermi import resolve_sigma_efermi_ry
         from .ppm_windows import sigma_regularization_for_config
 
@@ -1063,6 +1063,17 @@ def compute_sigma_xc(
         sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
             config.sigma.fermi_reference,
             occupation_state=occupation_state, wfn=wfn)
+        cache_setting = str(config.sigma.quadrature_cache_dir).strip()
+        if cache_setting.lower() == "off":
+            quadrature_cache_dir = None
+        elif cache_setting.lower() == "auto":
+            quadrature_cache_dir = os.path.join(
+                os.path.abspath(input_dir), "tmp", "sigma_quadrature_rules")
+        else:
+            expanded = os.path.expanduser(cache_setting)
+            quadrature_cache_dir = (
+                expanded if os.path.isabs(expanded)
+                else os.path.join(os.path.abspath(input_dir), expanded))
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
@@ -1070,10 +1081,11 @@ def compute_sigma_xc(
             occupation_state=occupation_state,
             regularization_width_ry=_xi.resolved_ry,
             edge_factor=float(config.sigma.window_edge_factor),
-            target_error=float(config.mpa.sigma_sector_target_error),
-            max_rank=int(config.mpa.sigma_max_nodes),
-            crossing_max_nodes=max(
-                CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
+            quadrature_eps=float(config.sigma.quadrature_eps),
+            quadrature_reduction_seconds=float(
+                config.sigma.quadrature_reduction_seconds),
+            pair_ceiling=int(config.mpa.sigma_max_nodes),
+            quadrature_cache_dir=quadrature_cache_dir,
             omega_grid_step_ry=(
                 float(config.sigma.omega_step_ev) / RYD_TO_EV),
             occupation_window_threshold=float(

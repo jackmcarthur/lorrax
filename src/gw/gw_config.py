@@ -2099,9 +2099,17 @@ _DEFAULTS = {
     # key, and therefore TWICE the Ha value the papers quote.
     "mpa_metal_origin_shift_ry": None,
     "mpa_pole_batch_size": 4,
-    # One delivered-error target. The planner apportions it among windows
-    # according to their measured delivered mass.
+    # Retired parser tombstone.  It remains recognized so old decks receive
+    # the precise refusal in LorraxConfig.from_input_file instead of an
+    # unknown-key warning; the box rule has no sector apportionment.
     "mpa_sigma_sector_target_error": 6.5e-4,
+    # The MPA Sigma box rule owns one accuracy target and one reduction-wall
+    # budget.  Its immutable rules are cached under the run's tmp directory
+    # by default; "off" disables caching and any other spelling is a path
+    # (relative paths are resolved beside the input deck).
+    "sigma_quadrature_eps": 1.0e-4,
+    "sigma_quadrature_reduction_seconds": 120.0,
+    "sigma_quadrature_cache_dir": "auto",
     "mpa_sigma_max_nodes": 96,
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
@@ -3917,6 +3925,11 @@ class DynamicSigmaConfig:
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
+    #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
+    #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
+    quadrature_eps: float = 1.0e-4
+    quadrature_reduction_seconds: float = 120.0
+    quadrature_cache_dir: str = "auto"
     #: ``sigma_regularization_floor_ev``: "auto" or a float in eV.  See
     #: :func:`gw.ppm_windows.resolve_sigma_regularization`, which is the
     #: ONLY place this is interpreted -- the drivers and the sigma_mnk.h5
@@ -3925,14 +3938,12 @@ class DynamicSigmaConfig:
     regularization_floor_ev: str | float = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
-    #: patches at ``omega_step_ev``, replacing the contiguous grid.  This
-    #: is how a semicore run buys its dynamic range: dense points near
-    #: the valence window and near each semicore QP cluster, NO points
-    #: in the empty gap between them, so the MPA crossing rule never has
-    #: to resolve the gap (docs/dev/crossing-rule-cost-law.md).  The
+    #: patches at ``omega_step_ev``, replacing the contiguous grid.  The
     #: Σ(ω)→E interpolation is searchsorted piecewise-linear and needs no
-    #: uniformity; solved QP energies landing inside a hole are refused
-    #: at the QSGW seam (gw.qsgw_utils.assert_omega_grid_covers).
+    #: uniformity; solved QP energies landing inside a hole are refused at
+    #: the QSGW seam (gw.qsgw_utils.assert_omega_grid_covers).  MPA's box
+    #: planner certifies each branch's min/max frequency corners, so a hole
+    #: saves evaluation/output points but does not add a second partition.
     omega_patches_ev: str = ""
     #: Band-convergence extrapolation of Sigma_c, resolved from
     #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
@@ -3972,6 +3983,15 @@ class DynamicSigmaConfig:
         if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
             raise ValueError(
                 "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
+        if not 0.0 < self.quadrature_eps < 1.0:
+            raise ValueError("sigma_quadrature_eps must lie in (0, 1).")
+        if not (np.isfinite(self.quadrature_reduction_seconds)
+                and self.quadrature_reduction_seconds > 0.0):
+            raise ValueError(
+                "sigma_quadrature_reduction_seconds must be finite and > 0.")
+        if not str(self.quadrature_cache_dir).strip():
+            raise ValueError(
+                "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")
         # 'auto' or a non-negative float in eV.  A TYPO must refuse here,
         # not resolve to 'auto' -- a floor key that silently defaults is the
         # confound the key was added to remove.
@@ -4107,7 +4127,6 @@ class MPAConfig:
     #: ``sampling._METAL_ORIGIN_SHIFT`` default (2e-5 Ry = 1e-5 Ha).
     metal_origin_shift_ry: float | None
     pole_batch_size: int
-    sigma_sector_target_error: float
     sigma_max_nodes: int
     #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
     #: counting toward a metallic Green's-function branch.  The Σ planner's
@@ -4915,6 +4934,14 @@ class LorraxConfig:
                 f"sys_dim = {int(_g('sys_dim'))}.")
         _named_keys = frozenset(params.get(_DECK_NAMED_KEYS, ()))
         _effective_named_keys = set(_named_keys)
+        if "mpa_sigma_sector_target_error" in _named_keys:
+            raise ValueError(
+                "mpa_sigma_sector_target_error is retired: MPA Sigma now "
+                "uses one uniform denominator-box rule per product window "
+                "and has no measured-sector error apportionment. Remove the "
+                "key and use sigma_quadrature_eps (default 1e-4); "
+                "mpa_sigma_max_nodes remains the total (window,tau) pair "
+                "ceiling.")
         if _bgw_q0_mode == "exact":
             # An explicit spelling of the shipping default must serialize to
             # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
@@ -5044,8 +5071,6 @@ class LorraxConfig:
                 float(_g("mpa_metal_origin_shift_ry"))
                 if _g("mpa_metal_origin_shift_ry") is not None else None),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
-            sigma_sector_target_error=float(
-                _g("mpa_sigma_sector_target_error")),
             sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
@@ -5057,6 +5082,11 @@ class LorraxConfig:
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
+            quadrature_eps=float(_g("sigma_quadrature_eps")),
+            quadrature_reduction_seconds=float(
+                _g("sigma_quadrature_reduction_seconds")),
+            quadrature_cache_dir=str(
+                _g("sigma_quadrature_cache_dir")).strip(),
             regularization_floor_ev=_g("sigma_regularization_floor_ev"),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),

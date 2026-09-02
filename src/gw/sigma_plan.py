@@ -1,4 +1,4 @@
-"""One fail-closed selector for every frequency-dependent Sigma route."""
+"""Fail-closed MPA Sigma route selector for production and pane controls."""
 
 from __future__ import annotations
 
@@ -6,30 +6,19 @@ import os
 
 
 def resolve_sigma_plan() -> str:
-    """Resolve ``LORRAX_SIGMA_PLAN`` as ``panes`` or ``delivered``.
+    """Resolve ``LORRAX_SIGMA_PLAN`` as ``box`` or ``panes``.
 
-    Unset and blank preserve the incumbent panes planner. Unknown values
-    refuse before either GN-PPM or MPA performs planning work.
+    The box rule is the production default.  ``panes`` is retained solely as
+    the independent comparison route; no third planner is reachable.
     """
-    raw = os.environ.get("LORRAX_SIGMA_PLAN", "panes").strip().lower()
-    mode = raw or "panes"
-    if mode not in ("panes", "delivered"):
+    raw = os.environ.get("LORRAX_SIGMA_PLAN", "box").strip().lower()
+    mode = raw or "box"
+    if mode not in ("box", "panes"):
         raise ValueError(
-            "LORRAX_SIGMA_PLAN must be 'panes' or 'delivered'; "
+            "LORRAX_SIGMA_PLAN must be 'box' (default) or 'panes' "
+            "(control); "
             f"got {raw!r}")
     return mode
 
 
-def resolve_delivered_plan_cache() -> str | None:
-    """Resolve the optional measured-problem delivered-plan cache path.
-
-    The cache stores only fitted quadrature rules.  Its fingerprint is made
-    after the live pole-measure pass, so changing restart tensors or any
-    planning input invalidates the receipt instead of reusing stale nodes.
-    """
-    raw = os.environ.get("LORRAX_DELIVERED_PLAN_CACHE", "").strip()
-    return os.path.abspath(os.path.expanduser(raw)) if raw else None
-
-
-__all__ = ["resolve_delivered_plan_cache",
-           "resolve_sigma_plan"]
+__all__ = ["resolve_sigma_plan"]

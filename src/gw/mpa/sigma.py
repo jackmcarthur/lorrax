@@ -18,14 +18,21 @@ from gw.ppm_sigma import (SigmaOmegaResult,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
-from gw.sigma_plan import (resolve_delivered_plan_cache,
-                           resolve_sigma_plan)
-from gw.wavefunction_bundle import (face_kernel_kwargs,
-                                    projected_state_amplitude_envelope)
+from gw.sigma_box_plan import plan_sigma_windows
+from gw.sigma_plan import resolve_sigma_plan
+from gw.wavefunction_bundle import face_kernel_kwargs
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                            CROSSING_NODE_FLOOR,
                             build_shared_sigma_windows,
                             summarize_sigma_poles)
+
+
+# The pane route is an immutable comparison instrument, not a production
+# accuracy policy.  Freezing its historical target here lets old/new box-rule
+# comparisons keep the same control while retiring the measured-sector deck
+# dial from the production path.
+_PANE_CONTROL_TARGET_ERROR = 6.5e-4
 
 
 def _bounded_pole_batch_size(value):
@@ -357,9 +364,10 @@ def compute_sigma_c_mpa_omega_grid(
     efermi_ry,
     regularization_width_ry,
     edge_factor=1.5,
-    target_error,
-    max_rank,
-    crossing_max_nodes,
+    quadrature_eps,
+    quadrature_reduction_seconds,
+    pair_ceiling,
+    quadrature_cache_dir,
     omega_grid_step_ry,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
@@ -381,10 +389,10 @@ def compute_sigma_c_mpa_omega_grid(
     entry points, which is what keeps the branch supports, the pole census
     and the window build on one support.
 
-    Pole tensors are read collectively in their native sharding. Both
-    planners retain only bounded host geometry from each configured pole
-    batch. The spatial executor then rereads and releases the same pole
-    ranges through the one pane/product-window tau kernel.
+    Pole tensors are read collectively in their native sharding.  The box
+    planner retains only exact live extrema from each configured pole batch;
+    the pane control consumes the same bounded census.  The spatial executor
+    then rereads and releases the pole ranges through one shared tau kernel.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
@@ -405,128 +413,62 @@ def compute_sigma_c_mpa_omega_grid(
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
     with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
+        # One bounded extrema census serves both routes.  In particular, the
+        # production route does not read residues into a host histogram and
+        # never constructs a sampled state-pole lattice.
+        summaries = []
+        for lo in range(0, n_poles, int(pole_batch_size)):
+            hi = min(lo + int(pole_batch_size), n_poles)
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True,
+                to_unit="Ry")
+            summaries.extend(summarize_sigma_poles(
+                Omega, B, branches,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor, pole_offset=lo,
+                occupation_window_threshold=occupation_window_threshold))
+            del Omega, B
+            gc.collect()
         if plan_mode == "panes":
-            # The incumbent path is intentionally kept byte-for-byte in its
-            # own arm: same configured census batches, summaries, builder
-            # arguments, and executor plan.
-            summaries = []
-            for lo in range(0, n_poles, int(pole_batch_size)):
-                hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
-                    slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
-                summaries.extend(summarize_sigma_poles(
-                    Omega, B, branches,
-                    regularization_width_ry=regularization_width_ry,
-                    edge_factor=edge_factor, pole_offset=lo,
-                    occupation_window_threshold=occupation_window_threshold))
-                del Omega, B
-                gc.collect()
             plan, geometry = build_shared_sigma_windows(
                 summaries, branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, target_error=target_error,
-                max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
+                edge_factor=edge_factor,
+                target_error=_PANE_CONTROL_TARGET_ERROR,
+                max_rank=int(pair_ceiling),
+                crossing_max_nodes=max(
+                    CROSSING_NODE_FLOOR, int(pair_ceiling)),
                 omega_grid_step_ry=omega_grid_step_ry,
                 occupation_window_threshold=occupation_window_threshold)
         else:
-            # The delivered measure needs the residues, not only rectangle
-            # extrema. Pole fields stay sharded and resident only for one
-            # configured batch; the planner retains bounded host cells.
-            from .delivered_windows import (
-                build_delivered_sigma_windows,
-                combine_delivered_sigma_pole_measures,
-                delivered_plan_request_fingerprint,
-                delivered_product_geometry,
-                load_complete_delivered_sigma_plan,
-                measure_delivered_sigma_pole_batch,
-            )
-            # One grid mode only: the shared-grid dial was removed
-            # (owner ruling 2026-08-31; lookup rules carry their own nodes).
-            tau_grid_mode = "free"
-            delivered_cache_path = resolve_delivered_plan_cache()
-            delivered_max_nodes = max(
-                int(max_rank), int(crossing_max_nodes))
-            request_fingerprint = delivered_plan_request_fingerprint(
-                branches, omega_grid_ry, fit_ledger=ledger,
-                parameters={
-                    "regularization_width_ry": regularization_width_ry,
-                    "envelope_relative_target": target_error,
-                    "max_nodes": delivered_max_nodes,
-                    "tau_grid_mode": tau_grid_mode,
-                    # Complete-plan v1 included this retired field in its
-                    # fingerprint.  It is immutable receipt-schema salt, not
-                    # a planner argument or execution limit; keeping it lets
-                    # certified product-only receipts survive the deletion.
-                    "edge_factor": edge_factor,
-                    "pole_batch_size": pole_batch_size,
-                })
-            cached = load_complete_delivered_sigma_plan(
-                delivered_cache_path, request_fingerprint, branches)
-            if cached is not None:
-                plan, geometry = cached
-            else:
-                state_amplitudes = projected_state_amplitude_envelope(
-                    wfns, state_bands=wfns.slices.sigma_sum,
-                    projection_bands=wfns.slices.sigma)
-                product_geometry = delivered_product_geometry(
-                    branches, regularization_width_ry,
-                    edge_factor=edge_factor)
-                measured = [[] for _branch in branches]
-                for lo in range(0, n_poles, int(pole_batch_size)):
-                    hi = min(lo + int(pole_batch_size), n_poles)
-                    Omega, B = reader.read(
-                        slice(lo, hi), unfold=True, return_sharded=True,
-                        to_unit="Ry")
-                    for branch_index, branch in enumerate(branches):
-                        measured[branch_index].append(
-                            measure_delivered_sigma_pole_batch(
-                                branch, Omega, B,
-                                regularization_width_ry=
-                                regularization_width_ry,
-                                pole_split_ry=
-                                product_geometry["pole_edge_ry"],
-                                state_amplitude=state_amplitudes,
-                                pole_offset=lo, mesh_xy=mesh_xy))
-                    del Omega, B
-                    gc.collect()
-                measures_by_branch = [
-                    combine_delivered_sigma_pole_measures(rows)
-                    for rows in measured]
-                plan, geometry = build_delivered_sigma_windows(
-                    None, None, branches, omega_grid_ry,
-                    regularization_width_ry=regularization_width_ry,
-                    envelope_relative_target=target_error,
-                    max_nodes=delivered_max_nodes,
-                    crossing_eps_q=1.0e-3,
-                    use_shipped_minimax_tables=True,
-                    tau_grid_mode=tau_grid_mode,
-                    edge_factor=edge_factor,
-                    measures_by_branch=measures_by_branch, mesh_xy=mesh_xy,
-                    plan_cache_path=delivered_cache_path,
-                    plan_cache_request_fingerprint=request_fingerprint)
+            plan, geometry = plan_sigma_windows(
+                summaries, branches, omega_grid_ry,
+                regularization_width_ry,
+                eps=quadrature_eps,
+                reduction_seconds=quadrature_reduction_seconds,
+                pair_ceiling=pair_ceiling,
+                cache_dir=quadrature_cache_dir,
+                print_fn=print_fn, edge_factor=edge_factor)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
                 f"{geometry['n_windows']} logical windows")
         else:
             print_fn(
-                f"  MPA windows [delivered]: "
+                f"  MPA windows [box]: "
                 f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
-                f"target={geometry['envelope_relative_target']:.3g} "
-                "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
+                f"eps={geometry['eps']:.3g}, "
                 f"{geometry['n_windows']} logical windows, "
-                f"grid={geometry['tau_grid_mode']}, "
-                f"plan_cache={geometry['plan_cache_status']}, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
-                f"{geometry['distinct_tau_count']} branch-distinct tau")
+                f"{geometry['distinct_tau_count']} branch-distinct tau, "
+                f"cache={geometry['cache_dir'] or 'off'}")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:
                     print_fn(
                         f"    {window['name']}: n_tau={window['node_count']}, "
-                        f"residual={window['refined_residual']:.6g}/"
-                        f"{window['relative_residual_target']:.6g}, "
-                        f"kappa_p99={window['amplification_p99']:.6g}, "
+                        f"sup={window['sup_error']:.6g}/"
+                        f"{window['eps']:.6g} ({window['criterion']}), "
+                        f"kappa_max={window['kappa_max']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")
         return integrate_sigma_store(
