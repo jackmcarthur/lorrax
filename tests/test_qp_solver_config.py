@@ -351,12 +351,15 @@ def test_eqp2_dynamic_one_shot_keys_parse(tmp_path):
     assert cfg.sigma.omega_layout == "sharded"
 
 
-def test_sigma_omega_layout_keeps_the_replicated_default(tmp_path):
+def test_sigma_omega_layout_defaults_sharded_with_provenance(tmp_path):
+    lines = []
     path = tmp_path / "dynamic_default_layout.in"
     path.write_text(BASE_INPUT + "compute_mode = gn_ppm\n")
     cfg = LorraxConfig.from_input_file(
-        str(path), print_fn=lambda *_: None)
-    assert cfg.sigma.omega_layout == "replicated"
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert cfg.sigma.omega_layout == "sharded"
+    assert any("[config provenance] sigma_omega_layout was not named" in line
+               and "sigma_omega_layout = sharded" in line for line in lines)
 
 
 def test_explicit_replicated_sigma_layout_is_preserved_for_its_control_arm(

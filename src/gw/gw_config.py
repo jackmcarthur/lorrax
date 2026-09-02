@@ -2219,7 +2219,11 @@ _DEFAULTS = {
     #       absent from the finalize `replace` at sc_iteration.py:1321),
     #       so there is no rotation seam to port, and the two layouts
     #       measure bit-identical under SC (jobs 7889782/7889789).
-    "sigma_omega_layout": "replicated",
+    # Sharded is the production default: it is movement-only relative to
+    # replicated, avoids a P-independent full cube on every rank, and
+    # reproduces the canonical multi-rank output ordering.  Explicit
+    # ``replicated`` remains a supported, capacity-gated comparison arm.
+    "sigma_omega_layout": "sharded",
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
     # poles (BGW mode 0); '2ry' keeps the fit's fallback pole (BGW mode 2);
@@ -5543,19 +5547,12 @@ class LorraxConfig:
         _sigma_omega_layout = str(
             _g("sigma_omega_layout")).strip().lower()
         if _eqp2_enabled and _sigma_omega_layout != "sharded":
-            if "sigma_omega_layout" in _named_keys:
-                raise ValueError(
-                    "write_eqp2=true requires sigma_omega_layout=sharded; "
-                    "the full Sigma(omega,k,m,n) cube is the fixed operand "
-                    "of every eqp2 iteration and may not be replicated on "
-                    "each rank.  Set sigma_omega_layout=sharded or disable "
-                    "write_eqp2.")
-            _sigma_omega_layout = "sharded"
-            print_fn(
-                "  [config provenance] write_eqp2=true: resolving the "
-                "unnamed sigma_omega_layout default replicated -> sharded; "
-                "the fixed full Sigma(omega) cube stays distributed through "
-                "every eigenvalue-consistency iteration.")
+            raise ValueError(
+                "write_eqp2=true requires sigma_omega_layout=sharded; "
+                "the full Sigma(omega,k,m,n) cube is the fixed operand "
+                "of every eqp2 iteration and may not be replicated on "
+                "each rank.  Set sigma_omega_layout=sharded or disable "
+                "write_eqp2.")
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
             omega_max_ev=float(_g("sigma_omega_max_ev")),
@@ -5995,6 +5992,13 @@ class LorraxConfig:
                 "never selected from mere presence; set restart = true "
                 "explicitly to enter the authenticated restart loader "
                 "(docs/input_reference.md, restart)")
+        if ("sigma_omega_layout" not in _named_keys
+                and resolved.compute_mode.is_dynamic):
+            print_fn(
+                "  [config provenance] sigma_omega_layout was not named; "
+                "using sigma_omega_layout = sharded so the dynamic Sigma "
+                "cube stays tiled over the process mesh "
+                "(docs/input_reference.md, sigma_omega_layout)")
         # DERIVED, NOT DECLARED (lane J section 3).  ``low_mem_bands`` and
         # ``w_dyson_solver`` are not physics dials of a packed photon mode --
         # they are the layouts/plans its envelope is written against -- so

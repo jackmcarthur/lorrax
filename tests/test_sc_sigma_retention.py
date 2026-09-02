@@ -1,7 +1,7 @@
 """The SC loop must not hold two ω-cubes at once.
 
 ``SigmaResult.sigma_c_omega_kij_ry`` is ``(nω, nk, nb, nb)`` and, at the
-default ``sigma_omega_layout = "replicated"``, it is replicated on every
+explicit ``sigma_omega_layout = "replicated"`` control, it is replicated on every
 rank: ``gw_config.py`` prices it at 2751 MB/rank at nb=512, and that
 figure does not shrink with P.  Both accelerator drivers used to keep
 iteration *i−1*'s ``SigmaResult`` alive for the whole of iteration *i* —

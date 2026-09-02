@@ -134,7 +134,8 @@ def test_metal_with_the_replicated_cube_refuses_by_name(tmp_path):
             "mpa_material_class = metal\n"
             "occ_smearing_family = mp1\n"
             "occ_smearing_width_ry = 0.02\n"
-            "fermi_reference = mp1_fixed_n\n")
+            "fermi_reference = mp1_fixed_n\n"
+            "sigma_omega_layout = replicated\n")
 
 
 def test_insulator_with_smearing_keys_refuses_the_off_dial(tmp_path):

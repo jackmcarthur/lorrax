@@ -3693,8 +3693,9 @@ def _run_rcrop(
         # ``state.H_qp_dft`` and nothing else, so the previous result was
         # passed in and held in this cell for the whole call for no
         # reader.  Its ``sigma_c_omega_kij_ry`` is the largest object on
-        # the SC path and, at the default ``sigma_omega_layout =
-        # "replicated"``, does not shrink with P: 2751 MB/rank at nb=512
+        # the SC path and, on the explicit ``sigma_omega_layout =
+        # "replicated"`` control, does not shrink with P: 2751 MB/rank at
+        # nb=512
         # (``gw_config.py``), so holding two generations was a
         # P-independent doubling of the peak.  Only the LAST one has a
         # consumer -- ``dump_sigma_omega_h5_final`` -- and it survives:
