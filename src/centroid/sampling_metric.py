@@ -157,30 +157,58 @@ def _window_mask(lo: int, canonical_mask, band_range) -> np.ndarray:
 
 
 def _quadrature_tables(wfn, sym):
-    """Return authenticated star rows and their full-BZ quadrature weights."""
+    """Return authenticated star rows, their weights and the full-BZ quadrature.
+
+    Two WFN k storages reach this function and they normalise DIFFERENTLY.
+    The distinguishing fact is whether the raw WFN k axis is the irreducible
+    wedge or the whole grid, i.e. ``wfn.nkpts`` against ``sym.nk_tot``:
+
+    * **IBZ storage** (``wfn.nkpts < sym.nk_tot``): one stored row per star,
+      and ``kweights`` already carries the WHOLE star's weight.  The stored
+      parents must therefore cover the entire normalised weight, and each
+      full-BZ member of a star takes ``w_parent / n_members``.
+    * **Full-BZ storage** (``wfn.nkpts == sym.nk_tot``): every point of the
+      grid is stored and ``kweights`` IS the full-BZ quadrature already.
+      Each member keeps its own stored weight; the parents cover only
+      ``n_parents / nk_tot`` of it by construction, so the IBZ precondition
+      is not merely unnecessary here, it is false for every unfolded NSCF
+      grid.  Requiring it refused every such WFN, including the repo's own
+      ``tests/regression/bispinor_debug/WFN.h5`` (KNOWN_LORRAX_ISSUES.md,
+      2026-09-01).
+
+    The two branches coincide wherever they overlap: a full-BZ file whose
+    stars are all singletons hits ``w_parent / 1 == w_member``, so the
+    discriminant never changes an answer it did not have to change.
+
+    Returns ``(parents_used, star_plan, full_weights)``.  ``star_plan[parent]``
+    is ``(sym_rows, member_weights)``, aligned row by row, and is the ONLY
+    place member weights are formed — the metric builder consumes it rather
+    than re-deriving the same normalisation.  ``full_weights`` is the
+    normalised full-BZ quadrature indexed by full-BZ k.
+    """
     from symmetry_maps import star_tables_of
 
     parent_for_k, sym_row_for_k, _ = star_tables_of(sym)
     nk_full = int(sym.nk_tot)
+    nk_raw = int(wfn.nkpts)
     if parent_for_k.shape != (nk_full,) or sym_row_for_k.shape != (nk_full,):
         raise ValueError(
             "SymMaps full-k tables disagree with nk_tot: "
             f"irr_idx_k={parent_for_k.shape}, sym_idx_k={sym_row_for_k.shape}, "
             f"nk_tot={nk_full}")
-    if (np.any(parent_for_k < 0)
-            or np.any(parent_for_k >= int(wfn.nkpts))):
+    if np.any(parent_for_k < 0) or np.any(parent_for_k >= nk_raw):
         raise ValueError(
             "SymMaps.irr_idx_k contains a row outside the raw WFN k axis "
-            f"[0,{int(wfn.nkpts)})")
+            f"[0,{nk_raw})")
     parents_used = np.unique(parent_for_k)
     if parents_used.size == 0:
         raise ValueError("SymMaps contains no full-BZ parent rows")
 
     kweights = np.asarray(wfn.kweights, dtype=np.float64)
-    if kweights.shape != (int(wfn.nkpts),):
+    if kweights.shape != (nk_raw,):
         raise ValueError(
             "WfnLoader.kweights must have one entry per raw WFN k row; "
-            f"got {kweights.shape}, expected {(int(wfn.nkpts),)}")
+            f"got {kweights.shape}, expected {(nk_raw,)}")
     weight_sum = float(kweights.sum())
     if (not np.all(np.isfinite(kweights)) or np.any(kweights < 0.0)
             or not np.isfinite(weight_sum) or weight_sum <= 0.0):
@@ -188,31 +216,57 @@ def _quadrature_tables(wfn, sym):
             "WfnLoader.kweights must be finite, nonnegative, and have "
             f"positive sum; got sum={weight_sum}")
     kweights = kweights / weight_sum
-    used_weight = float(kweights[parents_used].sum())
-    if not np.isclose(used_weight, 1.0, rtol=1.0e-12, atol=1.0e-14):
-        raise ValueError(
-            "SymMaps full-BZ parents omit nonzero WFN quadrature weight: "
-            f"selected normalized weight={used_weight:.17g}, want 1")
 
-    star_rows = {
-        int(parent): np.asarray(
-            sym_row_for_k[parent_for_k == parent], dtype=np.int32)
-        for parent in parents_used
-    }
+    full_bz_storage = nk_raw == nk_full
     full_weights = np.empty(nk_full, dtype=np.float64)
-    for parent in parents_used:
-        member_rows = np.flatnonzero(parent_for_k == parent)
-        full_weights[member_rows] = (
-            float(kweights[parent]) / float(member_rows.size))
+    if full_bz_storage:
+        # The raw axis IS the full BZ, so a parent must be its own star
+        # representative.  If it is not, the two index spaces are not the
+        # same axis and no weight assignment here would mean anything.
+        fixed_points = parent_for_k[parents_used]
+        if not np.array_equal(fixed_points, parents_used):
+            raise ValueError(
+                "full-BZ WFN storage (nkpts == nk_tot == "
+                f"{nk_full}) requires SymMaps.irr_idx_k to map every star "
+                "parent to itself, so that the full-BZ and raw WFN k axes "
+                f"are the same axis; got irr_idx_k[{parents_used.tolist()}] "
+                f"= {fixed_points.tolist()}")
+        full_weights[:] = kweights
+    else:
+        used_weight = float(kweights[parents_used].sum())
+        if not np.isclose(used_weight, 1.0, rtol=1.0e-12, atol=1.0e-14):
+            raise ValueError(
+                "SymMaps full-BZ parents omit nonzero WFN quadrature weight: "
+                f"selected normalized weight={used_weight:.17g}, want 1. "
+                f"The raw WFN k axis ({nk_raw} rows) is read as the IBZ "
+                f"because it is shorter than nk_tot={nk_full}; an IBZ file "
+                "must store one row per star and carry the whole star weight "
+                "on it")
+        for parent in parents_used:
+            member_rows = np.flatnonzero(parent_for_k == parent)
+            full_weights[member_rows] = (
+                float(kweights[parent]) / float(member_rows.size))
+
     if not np.isclose(full_weights.sum(), 1.0, rtol=1.0e-12, atol=1.0e-14):
         raise ValueError(
             "expanded full-BZ quadrature weights do not sum to one: "
             f"sum={full_weights.sum():.17g}")
-    return parents_used, star_rows, full_weights
+
+    star_plan = {}
+    for parent in parents_used:
+        member_rows = np.flatnonzero(parent_for_k == parent)
+        star_plan[int(parent)] = (
+            np.asarray(sym_row_for_k[member_rows], dtype=np.int32),
+            np.asarray(full_weights[member_rows], dtype=np.float64))
+    return parents_used, star_plan, full_weights
 
 
 def full_k_quadrature_weights(wfn, sym) -> np.ndarray:
-    """Expand each normalized IBZ parent weight uniformly over its star."""
+    """Normalised full-BZ quadrature weight of every unfolded k point.
+
+    IBZ storage spreads each parent weight uniformly over its star; full-BZ
+    storage passes the stored weights through.  See :func:`_quadrature_tables`.
+    """
     return _quadrature_tables(wfn, sym)[2].copy()
 
 
@@ -302,9 +356,7 @@ def build_feature_metric_diagonal(
     wavefunction_scale = float(np.sqrt(n_grid / cell_volume))
     ns = 4 if mode == "transverse" else int(wfn.nspinor)
 
-    parents_used, star_rows, _ = _quadrature_tables(wfn, sym)
-    parent_weights = np.asarray(wfn.kweights, dtype=np.float64)
-    parent_weights = parent_weights / parent_weights.sum()
+    parents_used, star_plan, _ = _quadrature_tables(wfn, sym)
 
     rank, world = process_rank_world()
     if world > 1 and dist_mesh is None:
@@ -381,10 +433,10 @@ def build_feature_metric_diagonal(
             parent_metric = _transverse_metric_diagonal(
                 density_left, density_right, wavefunction_scale)
         if include_parent:
-            # Every row in one parent star carries the same expanded weight.
-            member_weight = float(
-                parent_weights[parent] / float(star_rows[parent].size))
-            for row in star_rows[parent]:
+            # Weights come from _quadrature_tables, which is the one place
+            # that knows whether this WFN stores the IBZ or the full BZ.
+            star_sym_rows, star_weights = star_plan[parent]
+            for row, member_weight in zip(star_sym_rows, star_weights):
                 pullback = sym.fft_grid_pullback(
                     np.asarray([int(row)], dtype=np.int32),
                     fft_grid, validate=True)
@@ -395,7 +447,7 @@ def build_feature_metric_diagonal(
                 pullback_dev = jnp.asarray(pullback[0], dtype=jnp.int32)
                 metric_local = _accumulate_grid_pullback(
                     metric_local, parent_metric, pullback_dev,
-                    jnp.asarray(member_weight, dtype=jnp.float64))
+                    jnp.asarray(float(member_weight), dtype=jnp.float64))
                 metric_local.block_until_ready()
                 pullback_rows_done += 1
                 del pullback, pullback_dev

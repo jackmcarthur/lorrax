@@ -199,6 +199,102 @@ def test_nonuniform_parent_weights_are_divided_over_unequal_stars(monkeypatch):
         np.array([0.7, 0.1, 0.1, 0.1]), rtol=0.0, atol=1e-15)
 
 
+def _legacy_ibz_expansion(loader, sym):
+    """The pre-fix weight expansion, transcribed verbatim from
+    ``sampling_metric._quadrature_tables`` at ``origin/main@8b6e3cc7``.
+
+    It is the IBZ identity reference: the fix must not move a single bit of
+    the IBZ answer, so this is compared with ``==``, not ``allclose``.
+    """
+    parent_for_k = np.asarray(sym.irr_idx_k, dtype=np.int32)
+    parents_used = np.unique(parent_for_k)
+    kweights = np.asarray(loader.kweights, dtype=np.float64)
+    kweights = kweights / float(kweights.sum())
+    full_weights = np.empty(int(sym.nk_tot), dtype=np.float64)
+    for parent in parents_used:
+        member_rows = np.flatnonzero(parent_for_k == parent)
+        full_weights[member_rows] = (
+            float(kweights[parent]) / float(member_rows.size))
+    return full_weights
+
+
+def test_ibz_storage_weights_are_bit_identical_to_the_legacy_expansion():
+    """IBZ identity: nkpts < nk_tot must reproduce the pre-fix numbers exactly.
+
+    Scope: this pins the ONLY quantity the full-BZ fix changes on the IBZ
+    path -- the per-member quadrature weight.  Everything downstream of it
+    (the density accumulation, the pullback, the psum) is untouched code.
+    """
+    for weights, parents, rows in (
+            ([0.7, 0.3], [0, 1, 1, 1], [0, 0, 1, 2]),
+            ([1.0, 3.0, 2.0], [0, 1, 1, 2, 2, 2], [0, 0, 1, 0, 1, 2]),
+            ([0.25, 0.75], [0, 0, 1, 1], [0, 1, 0, 1]),
+    ):
+        loader = _fake_loader(
+            _current_psi(len(weights), 1), weights,
+            raw_nspinor=2, bispinor=True)
+        sym = _Star(parents, rows)
+        assert int(loader.nkpts) < int(sym.nk_tot)
+        got = full_k_quadrature_weights(loader, sym)
+        np.testing.assert_array_equal(got, _legacy_ibz_expansion(loader, sym))
+
+
+def test_full_bz_storage_uses_the_stored_weights_and_does_not_refuse(
+        monkeypatch):
+    """nkpts == nk_tot: every point is stored, so kweights IS the quadrature.
+
+    Pre-fix this refused at ``selected normalized weight=0.5, want 1`` and
+    would have handed each 2-member star half its true weight
+    (KNOWN_LORRAX_ISSUES.md, 2026-09-01).
+    """
+    import common.collectives as C
+    import common.wfn_transforms as T
+
+    psi = _current_psi(4, 1)
+    loader = _fake_loader(
+        psi, [0.25, 0.25, 0.25, 0.25], raw_nspinor=2, bispinor=True)
+    sym = _Star([0, 0, 2, 2], [0, 1, 0, 1])
+    assert int(loader.nkpts) == int(sym.nk_tot) == 4
+    np.testing.assert_allclose(
+        full_k_quadrature_weights(loader, sym),
+        np.full(4, 0.25), rtol=0.0, atol=1e-16)
+
+    monkeypatch.setattr(T, "to_rbox", lambda values, *a, **k: values)
+    monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
+    got = build_feature_metric_diagonal(
+        loader, sym, (0, 1), (0, 1), gamma_mode="transverse", verbose=False)
+
+    p0 = _direct_pairs(psi[0], [1], [1], 1.0, "transverse")
+    p2 = _direct_pairs(psi[2], [1], [1], 1.0, "transverse")
+    np.testing.assert_allclose(got, 0.5 * p0 + 0.5 * p2,
+                               rtol=3e-14, atol=3e-14)
+    # Red twin: the pre-fix expansion w_parent/n_members halves every star.
+    assert np.max(np.abs(got - (0.25 * p0 + 0.25 * p2))) > 1.0
+    # Only the parents are loaded; the other two rows arrive by pullback.
+    assert loader.requests == [(0, 0, 1), (2, 0, 1)]
+    assert sym.pullback_calls == [0, 1, 0, 1]
+
+
+def test_full_bz_storage_refuses_when_parents_are_not_their_own_image():
+    """The full-BZ branch needs the raw and full-BZ k axes to be one axis."""
+    loader = _fake_loader(
+        _current_psi(3, 1), [1.0, 1.0, 1.0], raw_nspinor=2, bispinor=True)
+    sym = _Star([1, 0, 2], [0, 1, 0])       # parent 0 is stored at full-BZ 1
+    assert int(loader.nkpts) == int(sym.nk_tot) == 3
+    with pytest.raises(ValueError, match="map every star parent to itself"):
+        full_k_quadrature_weights(loader, sym)
+
+
+def test_ibz_storage_still_refuses_uncovered_quadrature_weight():
+    """The IBZ precondition survives: a short axis must cover weight one."""
+    loader = _fake_loader(
+        _current_psi(3, 1), [0.5, 0.25, 0.25], raw_nspinor=2, bispinor=True)
+    sym = _Star([0, 0, 1, 1, 1, 1], [0, 1, 0, 1, 2, 3])   # row 2 never a parent
+    assert int(loader.nkpts) < int(sym.nk_tot)
+    with pytest.raises(ValueError, match="omit nonzero WFN quadrature weight"):
+        full_k_quadrature_weights(loader, sym)
+
+
 def test_projector_memory_plan_prices_and_refuses():
     nbytes, cap = _projector_memory_plan(
         1000, 4, device_memory_bytes=40 * 1024 ** 3)
