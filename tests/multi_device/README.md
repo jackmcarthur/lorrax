@@ -11,6 +11,14 @@ exact-zero reported odd contribution.
     GNPPM_BOX_GATE_DIR=/path/to/evidence \
       <launcher> -n 4 python3 tests/multi_device/gnppm_box_ordered_sigma_p4.py
 
+GN-PPM Fermi-seam gate: `gnppm_box_fermi_seam_p4.py`, exactly P=4. It uses
+the same ordered-residue toy, but gives the box planner the CrI3
+`[-90,+20] eV` frequency extent and samples both one-sided limits densely
+around zero. Both the ordered path and forced-`D=0` red twin must be smooth.
+
+    GNPPM_FERMI_SEAM_GATE_DIR=/path/to/evidence \
+      <launcher> -n 4 python3 tests/multi_device/gnppm_box_fermi_seam_p4.py
+
 MPA disk-stream gate: `mpa_fit_stream_gate.py`, exactly P=4.  It writes ten
 q-irreducible W samples through real SlabIO, fits a deliberately
 nondivisible `N_mu=P+1` five-pole field with the production row-sharded Padé
