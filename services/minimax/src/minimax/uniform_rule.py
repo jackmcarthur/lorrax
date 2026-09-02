@@ -65,7 +65,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.linalg import lstsq, svd
-from scipy.linalg import cho_factor, cho_solve
+from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.linalg import qr as _pivoted_qr
 
 __all__ = ["UniformRule", "build_uniform_rule", "box_samples", "rule_sup_error"]
@@ -216,6 +216,19 @@ def _grid_size(d, theta, S, eps=1e-5, points_per_half_wave=3.0, cap=6000):
     near_decay = np.pi * np.sqrt(
         points_per_half_wave * S * np.max(lam) / (2.0 * np.log(10.0 / eps)))
     return int(min(max(interior, near_zero, near_decay) + 100, cap))
+
+
+def _cholesky_qr2(M):
+    """Economy QR of a tall matrix by two Cholesky-QR passes (all GEMM);
+    Householder QR when a Gram is not positive definite."""
+    try:
+        R1 = np.linalg.cholesky(M.conj().T @ M).conj().T          # upper
+        Q1 = M @ np.linalg.inv(R1)                                # n x n inverse: cheap
+        R2 = np.linalg.cholesky(Q1.conj().T @ Q1).conj().T
+        Q = Q1 @ np.linalg.inv(R2)
+        return Q, R2 @ R1
+    except np.linalg.LinAlgError:
+        return np.linalg.qr(M)
 
 
 def _cexp(z):
@@ -386,36 +399,36 @@ class _CloudFit:
         return _cexp(self.idp[:, None] * s[None, :]) * self.scale[:, None]
 
     def ls(self, s):
-        """Penalised least-squares weights for nodes ``s``.
+        """Penalised least-squares weights for nodes ``s``: QR of ``[A; mu I]``
+        by CholeskyQR2.  Returns ``w``, the full residual (cloud rows then
+        penalty rows), ``Q`` and ``A``; the Jacobian projection reuses ``Q``.
 
-        Solves ``min |A w - b|^2 + mu^2 |w|^2`` through the normal equations
-        ``(A^H A + mu^2 I) w = A^H b`` (one Gram, one Cholesky) followed by two
-        steps of iterative refinement on the augmented residual, which brings
-        the solution to the accuracy of the QR solve it replaced (residuals
-        agree to four digits over a 10-step LM run).  Returns ``w``, the full
-        residual ``[b - A w; -mu w]``, the Cholesky factor and ``A``; the
-        Jacobian projection reuses the factor.
+        CholeskyQR2: ``R1 = chol(Aa^H Aa)``, ``Q1 = Aa R1^-1``, then once more
+        on ``Q1`` -- two Gram matrices and two triangular solves, all GEMM
+        (200-290 Gflop/s here), and ``Q`` orthonormal to machine precision
+        after the second pass whenever the first Cholesky succeeds (it fails
+        only for ``kappa(Aa) > ~1e8``, and then the Householder QR is used).
+        The solution is the QR solution; the reduction's endpoints are the
+        old ones.
 
-        Tempting, and why not: the QR of ``[A; mu I]`` (what this replaced).
-        It is the textbook-stable form, but LAPACK's tall-skinny complex QR
-        ran at 15 Gflop/s where the GEMMs of this class run at 200-290, and it
-        was called twice per LM step: 300 ms of a 440 ms iteration on the
-        Na +-15 eV crossing box (m = 2055, n = 346).  Cholesky-QR (a QR from
-        the same Gram) would be as fast but adds nothing over refinement here.
+        Tempting, and why not: (1) LAPACK's Householder QR (what this
+        replaced): textbook-stable but 15 Gflop/s on this tall-skinny complex
+        shape and called twice per LM step -- 300 ms of a 440 ms iteration on
+        the Na +-15 eV crossing box (m = 2055, n = 346).  (2) The normal
+        equations with iterative refinement: 4.3x faster per step, residuals
+        equal to four digits, and yet the reduction on that box stalled at 234
+        nodes where the QR path reached 223 -- near the acceptance edge the
+        refined weights are not the least-squares weights for these
+        exponentially clustered columns, and candidates fail the sup test.
         """
         A = self.A(s)
         n = s.size
-        G = A.conj().T @ A
-        G[np.diag_indices(n)] += self.mu ** 2
-        factor = cho_factor(G, lower=False, check_finite=False)
-        Ab = A.conj().T @ self.b
-        w = cho_solve(factor, Ab, check_finite=False)
-        for _ in range(2):
-            r_top = self.b - A @ w
-            w = w + cho_solve(factor, A.conj().T @ r_top - self.mu ** 2 * w,
-                              check_finite=False)
-        F = np.concatenate([self.b - A @ w, -self.mu * w])
-        return w, F, factor, A
+        Aa = np.concatenate([A, self.mu * np.eye(n, dtype=complex)], 0)
+        ba = np.concatenate([self.b, np.zeros(n, complex)])
+        Q, R = _cholesky_qr2(Aa)
+        c = Q.conj().T @ ba
+        w = solve_triangular(R, c, check_finite=False)
+        return w, ba - Q @ c, Q, A
 
     def _y_of(self, s):
         # Im s = c + h tanh(y): the off-ray cap is part of the model, so no
@@ -450,13 +463,11 @@ class _CloudFit:
         one or two dampings are usually enough.  The real ``2n x 2n`` Gram is
         assembled from the complex ``n x n`` one (``Re``/``Im`` blocks of
         ``Jc^H Jc``, exact identities) instead of forming the real Jacobian and
-        multiplying: 4x fewer flops for the same matrix.  The projection
-        ``P_perp [J; 0] = [J - A X; -mu X]`` with ``X = G^-1 A^H J`` reuses
-        the Cholesky factor of ``ls`` -- no ``Q`` is ever formed."""
+        multiplying: 4x fewer flops for the same matrix."""
         s = s.real.clip(0.0, self.S) + 1j * s.imag.clip(self.im_lo, self.im_hi)
         y = self._y_of(s)
         s = self._s_of(s.real, y)
-        w, F, factor, A = self.ls(s)
+        w, F, Q, A = self.ls(s)
         n = s.size
         m = self.d.size
         lam = 1e-3
@@ -471,9 +482,9 @@ class _CloudFit:
                 if nF > (1.0 - stall) * n_last:
                     break
                 n_last = nF
-            J = -(self.idp[:, None] * A) * w[None, :]
-            X = cho_solve(factor, A.conj().T @ J, check_finite=False)
-            Jc = np.concatenate([J - A @ X, -self.mu * X], 0)
+            Jc = np.concatenate([-(self.idp[:, None] * A) * w[None, :],
+                                 np.zeros((n, n), complex)], 0)
+            Jc -= Q @ (Q.conj().T @ Jc)
             dIm = self.h / np.cosh(y) ** 2
             # column norms of the real Jacobian [[Re, -Im dIm], [Im, Re dIm]]
             cn = np.sqrt(np.sum(np.abs(Jc) ** 2, axis=0))
@@ -497,9 +508,9 @@ class _CloudFit:
                     p = np.linalg.solve(Gl, g) / D
                 y_new = np.clip(y + np.clip(p[n:], -3.0, 3.0), -8.0, 8.0)
                 s_new = self._s_of(s.real + p[:n], y_new)
-                w_new, F_new, factor_new, A_new = self.ls(s_new)
+                w_new, F_new, Q_new, A_new = self.ls(s_new)
                 if np.linalg.norm(F_new) < nF:
-                    s, w, F, factor, A, y = s_new, w_new, F_new, factor_new, A_new, y_new
+                    s, w, F, Q, A, y = s_new, w_new, F_new, Q_new, A_new, y_new
                     lam = max(lam / 3.0, 1e-9)
                     improved = True
                     break
