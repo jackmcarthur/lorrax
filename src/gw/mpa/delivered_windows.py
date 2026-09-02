@@ -1634,8 +1634,15 @@ def _uniform_rule_budget():
     ``LORRAX_UNIFORM_RULE_BUDGET_S`` overrides the 15 s default.  The rule
     depends only on (box, eps), so the budget trades planning seconds for
     nodes: about 15 s keeps the crossing windows near 0.75 of the family
-    rank, about 100 s reaches the Gauss count (~0.5 rank).  The right
-    setting is a fraction of the Sigma execution the plan serves.
+    rank, about 100 s reaches the Gauss count (~0.5 rank).  Measured on Na
+    8x8x8: the -5..+5 eV crossing rules go 95 -> 45 nodes between 15 s and
+    120 s at eps 1e-3 and the reduction stops by itself at ~57 s; the
+    +-15 eV ones (rank ~350) are still improving at 120 s.  Windows are
+    fitted one per rank (``_run_parallel_planner_jobs``), so the plan wall
+    is ONE crossing window's budget plus geometry (~9 s) and exchange, not
+    the sum over windows.  The right setting is a fraction of the Sigma
+    execution the plan serves; the interpolatory rule is always ready after
+    about a second, so a small budget never refuses.
     """
     value = os.environ.get("LORRAX_UNIFORM_RULE_BUDGET_S", "").strip()
     return float(value) if value else UNIFORM_RULE_TIME_BUDGET_SECONDS
@@ -1662,14 +1669,48 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     """Box rule for one product window: ``(candidate_or_None, metrics)``.
 
     The rule depends on the window only through the support box of its
-    denominators (fit and validation cells together, padded by 2%); the
-    measure then only scores it through the ordinary consumer gates.
+    denominators ``d = omega - z`` (fit and validation cells together, padded
+    by 2%): ``minimax.uniform_rule`` builds ``1/d ~= sum_k w_k exp(i t_k d)``
+    with ``sup |error| <= eps`` on the whole box.  The window's histogram
+    (its cell masses) never reaches the builder; it only scores the finished
+    rule through the ordinary consumer gates below.
+
+    Why the histogram is kept out.  The measure-adapted fits it replaced
+    were accurate where the mass is and nowhere else: a metal's single state
+    at E_F at Gamma carries negligible mass and came out 0.95 meV wrong
+    (Na, KNOWN_LORRAX_ISSUES 2026-09-01), and their residual gate did not
+    predict delivered error.  A sup bound on the support is the same
+    statement for every state in the window.
+
+    Tempting, and why not:
+    * Weighting the builder's sample cloud by the cell masses "to save
+      nodes" re-creates exactly that failure.
+    * Using the window's apportioned ``relative_target`` as the builder's
+      eps: on windows with a large error envelope it is 50-100x tighter than
+      the deck's eps, doubles the node count of the tails and used to force
+      a second full reduction (see the gate below).
+    * Building only on the fit cells: the campaign's rules were exact on
+      the lattice representatives and wrong between them; the validation
+      cells (a different lattice) and the raw-corner widening are what make
+      the box the support and not a sample of it.
+    * Building a second rule for the ``Im d < 0`` windows: ``1/conj(d) =
+      conj(1/d)``, so the same rule serves with ``t -> -conj(t)``,
+      ``w -> conj(w)``; a second build is the same rule at twice the
+      planning wall.
+
+    Cost: the rule is a function of ``(box, eps)`` only, so it is cached by
+    the plan cache and would be shareable across decks with the same box.
     """
     from minimax.uniform_rule import build_uniform_rule  # noqa: PLC0415
 
     d = np.concatenate([
         np.asarray(spec["problem"].denominators, np.complex128).ravel(),
         np.asarray(spec["validation"].denominators, np.complex128).ravel()])
+    # The builder assumes ``Im d > 0`` (decay along real time).  Windows on
+    # the other omega sign have ``Im d < 0`` everywhere; their rule is the
+    # conjugate of the ``Im d > 0`` rule (applied at the end).  A window with
+    # both signs cannot be a box rule (it is not one of ours: every product
+    # window has a definite pole sign).
     conjugate = bool(np.all(d.imag < 0.0))
     if conjugate:
         d = np.conj(d)
@@ -1680,6 +1721,12 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     # The lattice cells are bin representatives; the box must cover the RAW
     # products state + pole_sign*pole over the window's own frequencies, so
     # widen it to the corner extremes of (raw state energy) x (pole cells).
+    # On Na 8x8x8 (25 bins per axis) this never moved an edge
+    # (LORRAX_UNIFORM_RULE_TRACE, arm 04); it is kept because it is free and
+    # a coarser lattice would need it.  The corners are the extremes of the
+    # two factors taken independently, i.e. a superset of the true (state +
+    # pole) range; that is deliberate -- a box that is too small silently
+    # loses the sup guarantee, one that is too wide only costs nodes.
     try:
         # ``raw_state_energy`` is ``pole_sign * signed`` (see _state_products);
         # the internal sums are ``signed + pole_sign * pole`` =
@@ -1715,6 +1762,8 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     times, weights = rule.times, rule.weights
     if conjugate:
         times, weights = -np.conj(times), np.conj(weights)
+    # Over the pair ceiling is a refusal of this family, not a reason to
+    # tighten anything: the ceiling is a plan-level cap the selector owns.
     if int(times.size) > int(max_nodes):
         return None, None
     evidence = {
@@ -1760,7 +1809,19 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                      relative_target, *, acceptance_rank_margin=None):
-    """Return the first on-demand rule passing the gates and rank margin."""
+    """Return the first on-demand rule passing the gates and rank margin.
+
+    With ``LORRAX_UNIFORM_RULE_EPS`` set the box rule is tried first for
+    every window kind and is the only candidate when it passes; the
+    incumbent measure-adapted (crossing) and Hackbusch-seeded
+    (sign-definite) fits below are reached only on a kappa or
+    factor-growth miss.  Tempting, and why not: offering the incumbent
+    rules alongside the box rule "so the selector can pick the cheaper
+    one" -- the selector minimises nodes under a budget the incumbent
+    rules meet on the histogram, not on the support, so it would pick a
+    rule with the delivered-error failure the box rule exists to remove
+    (Na: 0.95 meV from a 10-node merged roq rule against 0.16 meV).
+    """
     eps = _uniform_rule_eps()
     if eps is not None:
         candidate, metrics = _uniform_box_candidate(
