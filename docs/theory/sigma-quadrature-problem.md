@@ -16,9 +16,10 @@ where `sigma_b=+1` for conduction and `-1` for valence. The fitted retarded
 poles have `Im Omega_p <= 0`. MPA applies the requested broadening `eta` once
 in every executable weight. The GN/HL one-pole adapter retains the incumbent
 PPM convention: crossing boxes receive the resolved `eta`, while
-sign-definite Laplace boxes are unbroadened (implemented with a strictly
-positive, error-subordinate offset so the shared box rule remains in its
-declared upper-half-plane domain).
+sign-definite Laplace boxes are unbroadened. The same box rule is built on
+the ordinary physical-`eta` support with fixed fourfold accuracy headroom,
+then its unchanged nodes and weights are separately certified on the
+translated real-axis support before execution.
 
 The reciprocal is replaced by a short exponential sum,
 
@@ -114,11 +115,11 @@ omega - sigma_b * (E + Re Omega)
 
 over that window's external frequencies, live state energies, and selected
 pole extrema. The positive imaginary support presented to the rule builder is
-`[-Im Omega_min + eta, -Im Omega_max + eta]` for MPA and crossing PPM boxes.
-For a sign-definite PPM box, `eta` in that expression is replaced by an
-offset bounded by `1e-3*eps` times the nearest real-axis distance. This is the
-pre-box PPM Laplace limit to below the rule's own error budget, not a second
-quadrature path.
+`[-Im Omega_min + eta, -Im Omega_max + eta]`. For a sign-definite PPM box,
+the fitted rule is additionally evaluated on that complete support translated
+by `-i*eta`; only a rule whose relative sup error there meets the requested
+`eps` is executed without the external damping. This is the pre-box PPM
+Laplace limit with an explicit certificate, not a second execution path.
 
 The real interval is padded by 2% of `max(width,eta)`. A sign-definite edge is
 allowed to move at most 30% toward zero, so padding never changes a

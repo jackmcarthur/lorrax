@@ -59,6 +59,9 @@ def _plan(monkeypatch, branch=None, **kwargs):
     monkeypatch.setattr(
         "gw.sigma_box_plan.rule_amplification_p99",
         lambda *_args, **_kwargs: 1.1)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_sup_error",
+        lambda *_args, **_kwargs: (5.0e-5, 1.2))
     branch = _branch() if branch is None else branch
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
@@ -153,7 +156,7 @@ def test_ppm_compatibility_broadens_only_crossing_boxes(monkeypatch):
     assert geometry["broaden_sign_definite"] is False
     assert geometry["branches"][0]["windows"][0][
         "external_regularization_ry"] == 0.1
-    assert 0.0 < tail_eta < 1.0e-6
+    assert tail_eta == 0.0
     np.testing.assert_allclose(
         crossing.window.nodes.alpha,
         fake_crossing.weights * np.exp(-0.1 * fake_crossing.times))

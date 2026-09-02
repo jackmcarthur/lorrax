@@ -51,8 +51,10 @@ from gw.mpa.sigma_windows import (
 from gw.ppm_windows import _SigmaWindow
 from minimax import (
     UniformRule,
+    box_samples,
     build_uniform_rule,
     rule_amplification_p99,
+    rule_sup_error,
 )
 
 
@@ -467,11 +469,17 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
 
 def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     requested_box = spec["box"]
+    unbroadened = bool(spec.get("unbroadened", False))
+    # A rule fitted on the physical-eta line remains cheap.  PPM's real-axis
+    # Laplace limit is a fixed second certificate of those SAME nodes, not a
+    # retry: reserve fourfold headroom before measuring the translated line.
+    fit_eps = 0.25 * eps if unbroadened else eps
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    cached = _rule_cache_lookup(cache_dir, requested_box, eps, relative)
+    cached = _rule_cache_lookup(
+        cache_dir, requested_box, fit_eps, relative)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
@@ -479,16 +487,28 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None else requested_box)
         rule = build_uniform_rule(
-            build_box, eps, time_budget=reduction_seconds)
+            build_box, fit_eps, time_budget=reduction_seconds)
         _rule_cache_store(cache_dir, rule)
         cache_status = "miss" if cache_dir is not None else "off"
 
     times = np.asarray(rule.times, np.complex128)
     weights = np.asarray(rule.weights, np.complex128)
-    if rule.sup_error > eps:
+    if rule.sup_error > fit_eps:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
-            f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
+            f"{rule.sup_error:.6g} exceeds fit eps={fit_eps:.6g}")
+    delivered_error = float(rule.sup_error)
+    delivered_kappa = float(rule.kappa_max)
+    if unbroadened:
+        target = box_samples(
+            *requested_box, per_unit=8.0, n_im=12) - 1.0j * eta
+        delivered_error, delivered_kappa = rule_sup_error(
+            times, weights, target, np.abs(target))
+        if delivered_error > eps:
+            raise RuntimeError(
+                f"Sigma box window {spec['name']!r} refused: translated "
+                f"unbroadened relative sup error {delivered_error:.6g} "
+                f"exceeds eps={eps:.6g}")
     # The noise clause remains kappa_p99 * 6e-8 <= 0.05 eps, but its
     # percentile is now intrinsic to the certified box: the uniform-rule
     # service area-weights its own fine check cloud.  No physical histogram
@@ -500,6 +520,10 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     # tighter eps without reviving the campaign's hidden second stage.
     kappa_p99 = rule_amplification_p99(
         times, weights, requested_box, rule.theta_deg)
+    if unbroadened:
+        # The max on the exact translated target is stronger than a p99 and
+        # prevents the compatibility line from weakening the noise gate.
+        kappa_p99 = max(kappa_p99, delivered_kappa)
     noise_bound = kappa_p99 * _RUNTIME_NOISE_EPSILON
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     if noise_bound > noise_budget:
@@ -521,13 +545,15 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     return {
         "times": times, "weights": weights,
         "node_count": int(times.size), "rule_box": tuple(rule.box),
-        "relative": bool(rule.relative), "sup_error": float(rule.sup_error),
-        "kappa_p99": kappa_p99, "kappa_max": float(rule.kappa_max),
+        "relative": bool(rule.relative), "sup_error": delivered_error,
+        "kappa_p99": kappa_p99, "kappa_max": delivered_kappa,
         "theta_deg": float(rule.theta_deg),
         "rank": int(rule.rank), "seconds": float(rule.seconds),
         "cache_status": cache_status, "factor_growth": growth,
         "noise_bound": noise_bound, "noise_budget": noise_budget,
-        "one_line": rule.one_line(),
+        "one_line": (rule.one_line()
+                     + (f"; translated real-line sup {delivered_error:.2e}"
+                        if unbroadened else "")),
     }
 
 
@@ -631,8 +657,9 @@ def plan_sigma_windows(
         Apply the external ``eta`` to sign-definite denominators.  This is
         the MPA convention and the default.  The GN/HL one-pole adapter sets
         it false to retain its established unbroadened Laplace branches;
-        crossing boxes still receive ``eta``.  An error-subordinate positive
-        offset keeps the common upper-half-plane rule in its declared domain.
+        crossing boxes still receive ``eta``.  The same box rule is fitted
+        with fixed accuracy headroom and explicitly certified after
+        translation to the real line.
 
     Returns
     -------
@@ -754,20 +781,10 @@ def plan_sigma_windows(
                     "crossing")
             eta_exec = eta
             if kind != "crossing" and not broaden_sign_definite:
-                # PPM's incumbent Laplace branches evaluate the real-axis
-                # reciprocal.  Keep the common box service's Im(d)>0
-                # contract with an offset whose induced relative model
-                # change is <= 1e-3*eps at the nearest real edge.  Intrinsic
-                # fitted pole widths remain in both this box and Omega_p.
-                distance = min(abs(float(box[0])), abs(float(box[1])))
-                eta_exec = max(
-                    np.finfo(np.float64).tiny,
-                    distance * tolerance * 1.0e-3)
-                box = (
-                    box[0], box[1],
-                    box[2] - eta + eta_exec,
-                    box[3] - eta + eta_exec,
-                )
+                # Fit on the ordinary physical-eta box (cheap rotated ray),
+                # but execute and separately certify its real-axis translate.
+                # Intrinsic fitted pole widths remain in Omega_p.
+                eta_exec = 0.0
             e_ref_a, e_ref_b = _factor_references(
                 kind, pole_sign, states, pole_stats)
             specs.append({
@@ -786,6 +803,7 @@ def plan_sigma_windows(
                 "raw_real_support": raw_real, "box": box,
                 "old_box": old_box, "kind": kind,
                 "regularization_width_ry": eta_exec,
+                "unbroadened": eta_exec == 0.0,
                 "conjugate": pole_sign < 0.0,
                 "E_ref_A": e_ref_a, "E_ref_B": e_ref_b,
                 "branch_report": report,
