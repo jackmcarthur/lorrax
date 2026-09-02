@@ -1072,7 +1072,8 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
-    layout: str = "legacy", face_shape=None,
+    brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
+    layout: str = "legacy", face_shape=None, pack_brackets: bool = True,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -1083,17 +1084,20 @@ def get_shared_sigma_tau_kernel(
     complex projection carrier; HGL's missing sine arm is completed once by
     :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
 
-    This is the entry point ``gw.mpa.sigma`` calls (insulating MPA shares
-    this exact kernel with GN-PPM's merged Laplace plan — no bracket plan,
-    the MPA/shared-multipole ``brackets=None`` shape); ``layout``/
-    ``face_shape`` (2026-08-22) forward to :func:`_get_sigma_kij_kernel`
-    unchanged.
+    This is the entry point ``gw.mpa.sigma`` calls for every dynamic pole
+    model.  ``brackets=None`` retains the ordinary MPA shape; a tuple asks the
+    same spatial kernel for a leading disjoint band-bracket axis.  ``layout``,
+    ``face_shape`` and ``pack_brackets`` forward to
+    :func:`_get_sigma_kij_kernel` unchanged.
     """
     kgrid = tuple(int(x) for x in kgrid)
+    if brackets is not None:
+        brackets = tuple((int(lo), None if hi is None else int(hi))
+                         for lo, hi in brackets)
     from ffi import ffi_dial_key
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           layout, face_shape)
+           brackets, layout, face_shape, bool(pack_brackets))
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
@@ -1102,7 +1106,8 @@ def get_shared_sigma_tau_kernel(
 
     sigma_kij = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
-        layout=layout, face_shape=face_shape)
+        brackets=brackets, layout=layout, face_shape=face_shape,
+        pack_brackets=pack_brackets)
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,

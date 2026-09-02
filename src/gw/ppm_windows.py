@@ -892,9 +892,101 @@ def window_mask_B_bounds(window: _SigmaWindow) -> tuple[float, float]:
     raise ValueError(f"Unknown mask_B_mode={mode!r}")
 
 
+def sigma_window_product_support(
+    window: _SigmaWindow,
+    E_A: jax.Array,
+    Omega_q: jax.Array,
+    base_mask_B: jax.Array,
+    omega_abs: np.ndarray,
+) -> dict:
+    """Return one physical window's exact scalar product support.
+
+    The executor represents a Cartesian product without materialising it:
+    selected intermediate states ``(k,n)`` times selected elementwise PPM
+    poles ``(q,mu,nu)`` times this window's external-frequency points.  Since
+    the denominator is affine in all three coordinates, the live extrema are
+    sufficient to construct all eight real-support corners.  Pole statistics
+    remain scalar device reductions; no ``(q,mu,nu)`` host array is gathered.
+
+    Parameters
+    ----------
+    window
+        Physical PPM pane and its ``(lo, hi]`` state/pole selectors.
+    E_A
+        Positive branch energies, shape ``(nk, nb)`` in Ry.
+    Omega_q
+        Elementwise PPM pole frequencies, shape ``(nq, nmu, nmu)`` in Ry.
+    base_mask_B
+        Live-pole selector with the same shape as ``Omega_q``.
+    omega_abs
+        Non-negative branch frequency grid, shape ``(nomega,)`` in Ry.
+
+    Returns
+    -------
+    dict
+        Host scalar/vector support used by ``gw.sigma_box_plan``.  The pole
+        width extrema are exactly zero for the real GN/HL-PPM carrier.
+    """
+    energy = _to_host_np(E_A, dtype=np.float64, tiled=False)
+    selected_A = np.array(window.mask_A, dtype=bool, copy=True)
+    if selected_A.shape != energy.shape:
+        if selected_A.size != energy.size:
+            raise ValueError(
+                "Sigma window state selector and E_A have different sizes")
+        selected_A = selected_A.reshape(energy.shape)
+    if window.E_min is not None:
+        selected_A &= energy > float(window.E_min)
+    if window.E_max is not None:
+        selected_A &= energy <= float(window.E_max)
+    selected_A &= np.isfinite(energy)
+    states = np.asarray(energy[selected_A], dtype=np.float64)
+    if not states.size:
+        raise ValueError(f"Sigma window {window.name!r} has no live states")
+
+    B_lo, B_hi = window_mask_B_bounds(window)
+    _, pole_count, pole_min, pole_max = _masked_interval_stats_device(
+        Omega_q, base_mask_B, B_lo, B_hi)
+    if pole_count == 0 or pole_min is None or pole_max is None:
+        raise ValueError(f"Sigma window {window.name!r} has no live PPM poles")
+
+    omega = np.asarray(omega_abs, dtype=np.float64)
+    if window.omega_indices is None:
+        omega_indices = np.arange(omega.size, dtype=np.int64)
+    else:
+        omega_indices = np.asarray(window.omega_indices, dtype=np.int64)
+    if (not omega_indices.size or np.any(omega_indices < 0)
+            or np.any(omega_indices >= omega.size)):
+        raise ValueError(
+            f"Sigma window {window.name!r} has invalid omega indices")
+
+    return {
+        "states": states,
+        "state_count": int(states.size),
+        "pole_stats": ((float(pole_min), float(pole_max), 0.0, 0.0),),
+        "pole_count": int(pole_count),
+        "omega_indices": omega_indices,
+        "omega_abs": np.asarray(omega[omega_indices], dtype=np.float64),
+        "B_lo": float(B_lo),
+        "B_hi": float(B_hi),
+    }
+
+
 # ---------------------------------------------------------------------------
 #  Minimax window construction
 # ---------------------------------------------------------------------------
+
+
+def _deferred_box_nodes() -> MinimaxNodes:
+    """Empty carrier between physical-pane planning and the shared box fit.
+
+    A box run must not first request an unrelated shipped minimax rule merely
+    to obtain this module's state/pole/omega selectors.  The orchestrator
+    replaces this carrier before execution and refuses if an empty rule ever
+    survives that handoff.
+    """
+    empty = jnp.asarray(np.empty(0, dtype=np.complex128))
+    return MinimaxNodes(t=empty, alpha=empty)
+
 
 def _sign_definite_support(
     E_min: float,
@@ -990,6 +1082,7 @@ def _build_single_sigma_window(
     max_nodes: int,
     use_shipped_tables: bool,
     sign_definite_cells: list[_SignDefiniteCell] | None = None,
+    defer_quadrature: bool = False,
 ) -> list[_SigmaWindow]:
     A_vals = E_A[base_mask_A]
     if A_vals.size == 0 or mask_B_count == 0 or mask_B_min is None or mask_B_max is None:
@@ -1027,19 +1120,27 @@ def _build_single_sigma_window(
             E_ref_A = float(np.min(A_vals))
             E_lo = E_hi = omega_indices = None
         _assert_bounded_laplace_support(x_min, x_max)
-        q = solve_laplace_minimax_interval(
-            x_min, x_max,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            use_shipped_tables=use_shipped_tables,
-        )
+        if defer_quadrature:
+            nodes = _deferred_box_nodes()
+            max_error = None
+            provenance = "uniform denominator box pending"
+        else:
+            q = solve_laplace_minimax_interval(
+                x_min, x_max,
+                target_error=target_error,
+                max_nodes=max_nodes,
+                use_shipped_tables=use_shipped_tables,
+            )
+            nodes = q.to_minimax_nodes(time_axis='imag')
+            max_error = float(q.max_error)
+            provenance = q.provenance
         omega_sign = +1 if denom_can_cross else -1
         prefactor = ((1.0 if denom_can_cross else -1.0)
                      * (-1.0 if neg_omega_half else 1.0))
         one_pane = len(panes) == 1
         windows.append(_SigmaWindow(
             name="single" if one_pane else f"single_pane_{pane_idx}",
-            nodes=q.to_minimax_nodes(time_axis='imag'),
+            nodes=nodes,
             mask_A=np.asarray(base_mask_A, dtype=bool),
             E_ref_A=float(E_ref_A),
             E_ref_B=float(B_min),
@@ -1047,8 +1148,8 @@ def _build_single_sigma_window(
             project="full",
             prefactor=float(prefactor),
             mask_B_mode="all",
-            max_error=float(q.max_error),
-            provenance=q.provenance,
+            max_error=max_error,
+            provenance=provenance,
             B_lo=None if one_pane else float(B_lo),
             B_hi=None if one_pane else float(B_hi),
             E_min=E_lo,
@@ -1404,6 +1505,7 @@ def _build_three_sigma_windows(
     crossing_max_nodes: int,
     use_shipped_tables: bool,
     laplace_cells_by_name: dict[str, list[_SignDefiniteCell]] | None = None,
+    defer_quadrature: bool = False,
 ) -> list[_SigmaWindow]:
     # This is the crossing branch: the pole S can coincide with a grid ω, so
     # the denominator is ω̃ − S and ω enters the kernel as exp(+i·ω·τ)
@@ -1457,30 +1559,38 @@ def _build_three_sigma_windows(
 
             if name == "core":
                 A_core = max(2.0 * T / xi, 1.0e-8)
-                if A_core > _CROSSING_A_MAX * (
-                        1.0 + 8.0 * np.finfo(np.float64).eps):
+                if (not defer_quadrature
+                        and A_core > _CROSSING_A_MAX * (
+                        1.0 + 8.0 * np.finfo(np.float64).eps)):
                     raise AssertionError(
                         "GATE hgl_shell_capacity: core_HGL_A got: "
                         f"{A_core:.16g}; want: <= "
                         f"A_max={_CROSSING_A_MAX:.16g}; why: the certified "
                         "crossing rule does not cover a wider core interval.")
-                target_error_hat = _scaled_crossing_error_bound(
-                    xi, target_error)
-                q_cross = solve_phase_minimax_bandwidth(
-                    A_core,
-                    target_error=target_error_hat,
-                    max_nodes=crossing_max_nodes,
-                    eps_q=crossing_eps_q,
-                    target_kind="hgl",
-                    use_shipped_tables=use_shipped_tables,
-                )
-                raw = q_cross.to_minimax_nodes(time_axis='crossing_hgl')
-                # Crossing scaling: t = τ/ξ, α = α/ξ (both divided by ξ).
-                nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
                 project = "imag"
                 prefactor = -1.0 * neg
-                max_error = float(q_cross.max_error) / xi
-                provenance = q_cross.provenance
+                if defer_quadrature:
+                    nodes = _deferred_box_nodes()
+                    max_error = None
+                    provenance = "uniform denominator box pending"
+                else:
+                    target_error_hat = _scaled_crossing_error_bound(
+                        xi, target_error)
+                    q_cross = solve_phase_minimax_bandwidth(
+                        A_core,
+                        target_error=target_error_hat,
+                        max_nodes=crossing_max_nodes,
+                        eps_q=crossing_eps_q,
+                        target_kind="hgl",
+                        use_shipped_tables=use_shipped_tables,
+                    )
+                    raw = q_cross.to_minimax_nodes(
+                        time_axis='crossing_hgl')
+                    # Crossing scaling: t = τ/ξ, α = α/ξ.
+                    nodes = MinimaxNodes(
+                        t=raw.t / xi, alpha=raw.alpha / xi)
+                    max_error = float(q_cross.max_error) / xi
+                    provenance = q_cross.provenance
             else:
                 if cell is None:
                     x_min, x_max = _sign_definite_support(
@@ -1490,17 +1600,22 @@ def _build_three_sigma_windows(
                 else:
                     x_min, x_max = cell.x_min, cell.x_max
                 _assert_bounded_laplace_support(x_min, x_max)
-                q = solve_laplace_minimax_interval(
-                    x_min, x_max,
-                    target_error=target_error,
-                    max_nodes=max_nodes,
-                    use_shipped_tables=use_shipped_tables,
-                )
-                nodes = q.to_minimax_nodes(time_axis='imag')
                 project = "full"
                 prefactor = +1.0 * neg
-                max_error = float(q.max_error)
-                provenance = q.provenance
+                if defer_quadrature:
+                    nodes = _deferred_box_nodes()
+                    max_error = None
+                    provenance = "uniform denominator box pending"
+                else:
+                    q = solve_laplace_minimax_interval(
+                        x_min, x_max,
+                        target_error=target_error,
+                        max_nodes=max_nodes,
+                        use_shipped_tables=use_shipped_tables,
+                    )
+                    nodes = q.to_minimax_nodes(time_axis='imag')
+                    max_error = float(q.max_error)
+                    provenance = q.provenance
 
             many_panes = len(pane_rows) > 1
             E_lo = (None if cell is None or np.isneginf(cell.E_lo)
@@ -1551,6 +1666,7 @@ def _build_partitioned_hgl_windows(
     crossing_eps_q: float,
     crossing_max_nodes: int,
     use_shipped_tables: bool,
+    defer_quadrature: bool = False,
 ) -> tuple[list[_SigmaWindow], HGLCrossingPlan]:
     """Build certified rules for the exact HGL pane plan.
 
@@ -1628,32 +1744,40 @@ def _build_partitioned_hgl_windows(
             sign_cell = (None if laplace_cells is None
                          else laplace_cells[pane_idx])
             if cell.kind == "crossing":
-                if float(cell.A_dim) > _CROSSING_A_MAX * (
-                        1.0 + 8.0 * np.finfo(np.float64).eps):
+                if (not defer_quadrature
+                        and float(cell.A_dim) > _CROSSING_A_MAX * (
+                        1.0 + 8.0 * np.finfo(np.float64).eps)):
                     raise AssertionError(
                         "GATE hgl_shell_capacity: planned_HGL_A got: "
                         f"{float(cell.A_dim):.16g}; want: <= "
                         f"A_max={_CROSSING_A_MAX:.16g}; why: the certified "
                         "crossing rule does not cover a wider planned cell.")
-                target_error_hat = _scaled_crossing_error_bound(
-                    xi, target_error)
-                q_cross = solve_phase_minimax_bandwidth(
-                    float(cell.A_dim),
-                    target_error=target_error_hat,
-                    max_nodes=crossing_max_nodes,
-                    eps_q=crossing_eps_q,
-                    target_kind="hgl",
-                    use_shipped_tables=use_shipped_tables,
-                )
-                raw = q_cross.to_minimax_nodes(time_axis="crossing_hgl")
-                nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
                 E_ref_A = float(cell.e_min)
                 E_ref_B = float(pane_min)
                 project = "imag"
                 prefactor = -1.0 * neg
-                max_error = float(q_cross.max_error) / xi
-                provenance = q_cross.provenance
                 crossing_kind = "hgl"
+                if defer_quadrature:
+                    nodes = _deferred_box_nodes()
+                    max_error = None
+                    provenance = "uniform denominator box pending"
+                else:
+                    target_error_hat = _scaled_crossing_error_bound(
+                        xi, target_error)
+                    q_cross = solve_phase_minimax_bandwidth(
+                        float(cell.A_dim),
+                        target_error=target_error_hat,
+                        max_nodes=crossing_max_nodes,
+                        eps_q=crossing_eps_q,
+                        target_kind="hgl",
+                        use_shipped_tables=use_shipped_tables,
+                    )
+                    raw = q_cross.to_minimax_nodes(
+                        time_axis="crossing_hgl")
+                    nodes = MinimaxNodes(
+                        t=raw.t / xi, alpha=raw.alpha / xi)
+                    max_error = float(q_cross.max_error) / xi
+                    provenance = q_cross.provenance
             else:
                 x_min, x_max = sign_cell.x_min, sign_cell.x_max
                 if cell.kind == "negative":
@@ -1676,20 +1800,25 @@ def _build_partitioned_hgl_windows(
                         "want: 0 < x_min <= x_max; why: a sign-definite HGL "
                         "cell requires positive ordered Laplace support.")
                 _assert_bounded_laplace_support(x_min, x_max)
-                q = solve_laplace_minimax_interval(
-                    x_min,
-                    max(x_max, x_min * (1.0 + 1.0e-9)),
-                    target_error=target_error,
-                    max_nodes=max_nodes,
-                    use_shipped_tables=use_shipped_tables,
-                )
-                raw = q.to_minimax_nodes(time_axis="imag")
-                nodes = (MinimaxNodes(t=-raw.t, alpha=raw.alpha)
-                         if conjugate else raw)
                 project = "full"
-                max_error = float(q.max_error)
-                provenance = q.provenance
                 crossing_kind = None
+                if defer_quadrature:
+                    nodes = _deferred_box_nodes()
+                    max_error = None
+                    provenance = "uniform denominator box pending"
+                else:
+                    q = solve_laplace_minimax_interval(
+                        x_min,
+                        max(x_max, x_min * (1.0 + 1.0e-9)),
+                        target_error=target_error,
+                        max_nodes=max_nodes,
+                        use_shipped_tables=use_shipped_tables,
+                    )
+                    raw = q.to_minimax_nodes(time_axis="imag")
+                    nodes = (MinimaxNodes(t=-raw.t, alpha=raw.alpha)
+                             if conjugate else raw)
+                    max_error = float(q.max_error)
+                    provenance = q.provenance
 
             windows.append(_SigmaWindow(
                 name=f"pane_{cell.kind}",
@@ -1745,6 +1874,7 @@ def _build_windows_for_branch(
     log_tag: str,
     print_fn,
     partition_hgl: bool = False,
+    defer_quadrature: bool = False,
 ) -> list[_SigmaWindow]:
     """Host-side window construction for a single branch.
 
@@ -1790,6 +1920,7 @@ def _build_windows_for_branch(
                 crossing_eps_q=crossing_eps_q,
                 crossing_max_nodes=crossing_max_nodes,
                 use_shipped_tables=bool(use_shipped_minimax_tables),
+                defer_quadrature=defer_quadrature,
             )
             counts = {
                 kind: sum(win.name == f"pane_{kind}" for win in windows)
@@ -1845,6 +1976,7 @@ def _build_windows_for_branch(
                 crossing_max_nodes=crossing_max_nodes,
                 use_shipped_tables=bool(use_shipped_minimax_tables),
                 laplace_cells_by_name=laplace_cells_by_name,
+                defer_quadrature=defer_quadrature,
             )
     else:
         A_live = E_A_host[base_A_host]
@@ -1879,6 +2011,7 @@ def _build_windows_for_branch(
             target_error=target_error, max_nodes=max_nodes,
             use_shipped_tables=bool(use_shipped_minimax_tables),
             sign_definite_cells=sign_definite_cells,
+            defer_quadrature=defer_quadrature,
         )
 
     for win in windows:
@@ -1894,11 +2027,13 @@ def _build_windows_for_branch(
         # orders printed exactly the same string as one served by a
         # certified table that met it.
         achieved = (
+            "uniform-box rule pending" if defer_quadrature else
             "err~unrecorded" if win.max_error is None
             else f"err~{win.max_error:.2e} (asked <{target_error:.0e})")
+        node_count = ("pending" if defer_quadrature else str(win.n_tau))
         print_fn(
             f"    {log_tag} window \"{win.name}\" ({kind}): "
-            f"{win.n_tau} nodes, {achieved}, "
+            f"{node_count} nodes, {achieved}, "
             f"E_A=[{float(np.min(A_vals)):.4f}, {float(np.max(A_vals)):.4f}] Ry, "
             f"project={win.project}"
             f"  [{win.provenance or 'provenance unrecorded'}]"

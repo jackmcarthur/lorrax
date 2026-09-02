@@ -46,9 +46,10 @@ This driver retains the physics prologue (PPM fit + physics-state prep) plus the
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, NamedTuple
 import os
+import time
 
 import jax
 import jax.numpy as jnp
@@ -56,6 +57,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import jax_profile, timing
+from common.collectives import process_count
 from common.units import RYD_TO_EV
 from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_config import MinimaxConfig
@@ -68,22 +70,26 @@ from .ppm_windows import (
     _SigmaWindow,
     branches_for_omega_grid,
     _build_windows_for_branch,
+    sigma_window_product_support,
     window_mask_B_bounds,
     _to_host_np,
     _CROSSING_A_MAX,
-    crossing_regularization_floor,
     hgl_partition_required,
     resolve_sigma_regularization,
 )
+from .sigma_box_plan import (
+    fit_sigma_box_specs,
+    make_sigma_box_spec,
+    sigma_box_executor_nodes,
+)
+from .sigma_plan import resolve_sigma_plan
 from .ppm_tau_kernel import _get_sigma_tau_kernel, get_sigma_spatial_kernel
 from .ppm_accumulators import (
     _SigmaAccumulator,
     _TauAccumulator,
     _MemoryTileSink,
 )
-from .sigma_plan import resolve_sigma_plan
-from .wavefunction_bundle import (face_kernel_kwargs,
-                                  projected_state_amplitude_envelope)
+from .wavefunction_bundle import face_kernel_kwargs
 
 
 def _face_g_plan(mesh_xy: Mesh, face_shape):
@@ -165,6 +171,10 @@ class SigmaOmegaResult:
     # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
+    #: Optional exact ordered-residue contribution on the same omega grid:
+    #: ``Sigma_c[B,D] - Sigma_c[B,D=0]``.  ``None`` is the ordinary
+    #: single-residue route.
+    sigma_c_odd_kij: jax.Array | None = None
     #: The LOGICAL band count each leading-axis element sums to.  Aligned
     #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
     #: and nothing else needs either.
@@ -179,6 +189,8 @@ class SigmaOmegaResult:
     #: how much of ``S_inf`` was never extrapolated
     #: (``band_extrapolation.static_limit_tail_ruling``).
     static_coh_at_counts: np.ndarray | None = None
+    #: Fit-level ``max|D|/max|B|`` for an ordered pole store.
+    odd_even_residue_ratio: float | None = None
 
 
 class _SigmaBranchTiles(NamedTuple):
@@ -990,6 +1002,204 @@ def strip_sigma_window(sigma_kij, nb_real: int, *, mesh_xy: Mesh | None = None):
     return sigma_kij[..., :nb_real, :nb_real]
 
 
+def _plan_ppm_box_windows(
+    *,
+    branches,
+    Omega_q: jax.Array,
+    base_mask_B: jax.Array,
+    regularization_width_ry: float,
+    edge_factor: float,
+    target_error: float,
+    max_nodes: int,
+    crossing_eps_q: float,
+    crossing_max_nodes: int,
+    use_shipped_minimax_tables: bool,
+    partition_hgl: bool,
+    quadrature_eps: float,
+    quadrature_reduction_seconds: float,
+    quadrature_cache_dir: str | None,
+    print_fn=print,
+):
+    """Put every PPM-owned physical pane on the shared denominator-box rule.
+
+    ``ppm_windows`` continues to own the exact factorized product cells
+    ``states(k,n) x poles(q,mu,nu) x omega``.  This orchestrator asks it for
+    those cells without serving the incumbent minimax tables, reduces each
+    live pole pane to scalar extrema, and hands the resulting affine
+    denominator support to :mod:`gw.sigma_box_plan`.
+
+    For conduction the causal denominator is
+    ``d = omega - E_A - Omega + i*eta``; for valence it is
+    ``d = omega + E_A + Omega - i*eta``.  The shared owner constructs the
+    padded box, conjugates the valence rule, checks its sup/noise/growth
+    contracts, and applies ``time_exec=pole_sign*time`` plus the single
+    ``exp(-eta*time_exec)`` damping factor.
+
+    Existing ``project='imag'`` crossing cells remain two-channel.  Their
+    executor weights receive the shared owner's ``i`` multiplier so the
+    incumbent global completion is exactly the Hermitian part of the causal
+    box rule, ``(iQ-(iQ)^dagger)/(2i)=(Q+Q^dagger)/2``.  This is valid for
+    the reducer's general complex times; no sine-grid assumption or channel
+    collapse is made.
+    """
+    started = time.perf_counter()
+    eta = float(regularization_width_ry)
+    specs = []
+    branch_reports = []
+    for branch in branches:
+        physical = _build_windows_for_branch(
+            omega_nonneg_ry=branch.omega_abs,
+            E_A=branch.E_A,
+            base_mask_A=branch.base_mask_A,
+            Omega_q=Omega_q,
+            base_mask_B=base_mask_B,
+            space=branch.space,
+            neg_omega_half=branch.neg_omega_half,
+            regularization_width_ry=eta,
+            edge_factor=edge_factor,
+            target_error=target_error,
+            max_nodes=max_nodes,
+            crossing_eps_q=crossing_eps_q,
+            crossing_max_nodes=crossing_max_nodes,
+            use_shipped_minimax_tables=use_shipped_minimax_tables,
+            log_tag=branch.tag,
+            print_fn=print_fn,
+            partition_hgl=partition_hgl,
+            defer_quadrature=True,
+        )
+        report = {
+            "tag": branch.tag,
+            "space": branch.space,
+            "negative_frequency_half": bool(branch.neg_omega_half),
+            "plan_start": len(specs),
+            "windows": [],
+        }
+        pole_sign = 1.0 if branch.space == "cond" else -1.0
+        external_sign = -1 if branch.neg_omega_half else 1
+        for index, window in enumerate(physical):
+            support = sigma_window_product_support(
+                window, branch.E_A, Omega_q, base_mask_B,
+                branch.omega_abs)
+            frequencies = external_sign * support["omega_abs"]
+            spec = make_sigma_box_spec(
+                name=f"{branch.tag}:{index}:{window.name}",
+                frequencies=frequencies,
+                states=support["states"],
+                pole_stats=support["pole_stats"],
+                pole_sign=pole_sign,
+                eta_ry=eta,
+            )
+            spec.update({
+                "branch": branch,
+                "window": window,
+                "support": support,
+                "external_sign": external_sign,
+                "branch_report": report,
+            })
+            specs.append(spec)
+        report["plan_stop"] = len(specs)
+        report["window_count"] = report["plan_stop"] - report["plan_start"]
+        branch_reports.append(report)
+
+    fits, fit_rows = fit_sigma_box_specs(
+        specs,
+        eta,
+        eps=quadrature_eps,
+        reduction_seconds=quadrature_reduction_seconds,
+        cache_dir=quadrature_cache_dir,
+    )
+
+    planned = {branch.tag: [] for branch in branches}
+    denominator_tuples = 0
+    for spec, fit in zip(specs, fits):
+        window = spec["window"]
+        one_sided_hermitian = window.project_code == 1
+        nodes = sigma_box_executor_nodes(
+            fit,
+            spec["pole_sign"],
+            eta,
+            one_sided_hermitian=one_sided_hermitian,
+        )
+        if int(nodes.t.shape[0]) == 0:
+            raise RuntimeError(
+                f"Sigma box window {spec['name']!r} retained no tau nodes")
+        executable = replace(
+            window,
+            nodes=nodes,
+            E_ref_A=float(spec["E_ref_A"]),
+            E_ref_B=float(spec["E_ref_B"]),
+            omega_sign=(int(spec["pole_sign"])
+                        * int(spec["external_sign"])),
+            # B_q = -Wc(0)*Omega/2 fixes the same overall sign on all four
+            # causal branches; the old pane prefactors encoded their
+            # Laplace/HGL orientations and do not apply to a direct 1/d rule.
+            prefactor=-1.0,
+            crossing_kind=("uniform_box_hermitian"
+                           if one_sided_hermitian else None),
+            max_error=float(fit["sup_error"]),
+            provenance=(
+                f"uniform denominator box {spec['box']}; "
+                f"{fit['one_line']}; cache={fit['cache_status']}; "
+                f"factor_growth={fit['factor_growth']}; "
+                f"completion={'hermitian' if one_sided_hermitian else 'full'}"
+            ),
+        )
+        planned[spec["branch"].tag].append(executable)
+        support = spec["support"]
+        tuple_count = (int(support["state_count"])
+                       * int(support["pole_count"])
+                       * int(support["omega_abs"].size))
+        denominator_tuples += tuple_count
+        receipt = {
+            "name": spec["name"],
+            "physical_window": window.name,
+            "project": window.project,
+            "completion": ("hermitian" if one_sided_hermitian else "full"),
+            "state_count": int(support["state_count"]),
+            "pole_count": int(support["pole_count"]),
+            "omega_count": int(support["omega_abs"].size),
+            "denominator_tuple_count": tuple_count,
+            "raw_real_support_ry": list(spec["raw_real_support"]),
+            "box_ry": list(spec["box"]),
+            "rule_box_ry": list(fit["rule_box"]),
+            "criterion": ("relative" if fit["relative"]
+                          else "peak-relative"),
+            "node_count": int(fit["node_count"]),
+            "sup_error": float(fit["sup_error"]),
+            "kappa_max": float(fit["kappa_max"]),
+            "factor_growth": list(fit["factor_growth"]),
+            "cache_status": fit["cache_status"],
+            "fit_seconds": float(fit["seconds"]),
+        }
+        spec["branch_report"]["windows"].append(receipt)
+        if os.environ.get("LORRAX_UNIFORM_RULE_TRACE"):
+            print_fn(
+                f"[uniform-box:ppm] {spec['name']} "
+                f"support_re={spec['raw_real_support']} box={spec['box']} "
+                f"nodes={fit['node_count']} project={window.project}")
+
+    window_tau_pairs = sum(int(fit["node_count"]) for fit in fits)
+    geometry = {
+        "planner": "uniform_denominator_boxes",
+        "eta_ry": eta,
+        "eps": float(quadrature_eps),
+        "reduction_seconds": float(quadrature_reduction_seconds),
+        "cache_dir": quadrature_cache_dir,
+        "n_windows": len(specs),
+        "window_tau_pairs": window_tau_pairs,
+        # The incumbent Python tau loop dispatches exactly one device kernel
+        # per (window,tau) pair.
+        "tau_dispatches": window_tau_pairs,
+        "denominator_tuple_count": denominator_tuples,
+        "plan_seconds": time.perf_counter() - started,
+        "planning_process_count": int(process_count()),
+        "critical_fit_wall_seconds": max(
+            (row["wall_seconds"] for row in fit_rows), default=0.0),
+        "branches": branch_reports,
+    }
+    return planned, geometry
+
+
 def _run_sigma_branch(
     *,
     omega_nonneg_ry: np.ndarray,
@@ -1093,6 +1303,7 @@ def _run_sigma_branch(
     if n_omega == 0:
         return None, []
 
+    window_plan_started = time.perf_counter()
     with timing.section("sigma.windows"):
         if planned_windows is None:
             windows = _build_windows_for_branch(
@@ -1111,6 +1322,9 @@ def _run_sigma_branch(
             )
         else:
             windows = list(planned_windows)
+    print_fn(
+        f"    {log_tag} window handoff: {len(windows)} windows in "
+        f"{time.perf_counter() - window_plan_started:.6f} s")
     if not windows:
         return None, []
 
@@ -1396,7 +1610,22 @@ def _invalid_static_coh_by_bracket(
 #  Top-level sigma driver
 # ---------------------------------------------------------------------------
 
-def compute_sigma_c_ppm_omega_grid(
+def _resolve_ppm_band_plan(wfns, meta, plan, *, where):
+    """One band-bracket validation seam for both transition executors."""
+    from .band_extrapolation import (
+        assert_brackets_match_ols_abscissae, trivial_plan)
+
+    s = wfns.slices
+    if plan is None:
+        plan = trivial_plan(
+            int(s.nb_sigma_sum), int(s.b2 - s.b0),
+            int(meta.b_id_4_sigma_user or s.b4) - int(s.b0))
+    assert_brackets_match_ols_abscissae(
+        plan, s, meta=meta, where=where)
+    return plan
+
+
+def _compute_sigma_c_ppm_omega_grid_incumbent(
     wfns,
     ppm,
     meta,
@@ -1407,6 +1636,7 @@ def compute_sigma_c_ppm_omega_grid(
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
     ansatz: str,
+    quadrature_cache_dir: str | None = None,
     occupation_state=None,
     plan: 'BandBracketPlan | None' = None,
     print_fn=print,
@@ -1436,16 +1666,12 @@ def compute_sigma_c_ppm_omega_grid(
     bracket loop and shared verbatim by every bracket — which is what
     makes the three points differ by band count and nothing else.
     """
-    from .band_extrapolation import (
-        assert_brackets_match_ols_abscissae, trivial_plan)
-
     s = wfns.slices
-    if plan is None:
-        # The Σ count, not the loaded extent — see the comment at the
-        # ``plan_band_brackets`` call in ``ppm_pipeline`` for why these are
-        # different numbers on a split deck and the same one otherwise.
-        plan = trivial_plan(int(s.nb_sigma_sum), int(s.b2 - s.b0),
-                            int(meta.b_id_4_sigma_user or s.b4) - int(s.b0))
+    # The Σ count, not the loaded extent — see the comment at the
+    # ``plan_band_brackets`` call in ``ppm_pipeline`` for why these are
+    # different numbers on a split deck and the same one otherwise.
+    plan = _resolve_ppm_band_plan(
+        wfns, meta, plan, where="ppm_sigma bracket partition")
     # THE PARTITION IS ENTERED ON THE NEXT LINE.  Checked here as well as at
     # the ``ppm_pipeline`` plan seam because this is where ``plan.bounds``
     # stops being a description and becomes the slices ``_run_sigma_branch``
@@ -1454,8 +1680,6 @@ def compute_sigma_c_ppm_omega_grid(
     # guarantee.  ``psi_coh_*`` below are built over ``s.full``, the LOADED
     # extent, so nothing about the slicing itself would complain if the
     # brackets ran past the Σ band sum: it would silently sum χ-only bands.
-    assert_brackets_match_ols_abscissae(
-        plan, s, meta=meta, where="ppm_sigma bracket partition")
     brackets = plan.bounds
     n_brk = plan.n_brackets
     # SIGMA-PROCEDURE START: build each bracket's packed carrier pair ONCE
@@ -1588,7 +1812,6 @@ def compute_sigma_c_ppm_omega_grid(
             jnp.asarray(fermi_reference == "midgap", dtype=bool),
             jnp.asarray(keep_invalid, dtype=bool),
         )
-    efermi = state.efermi
     E_cond = state.E_cond
     H_val = state.H_val
     cond_mask = state.cond_mask
@@ -1727,58 +1950,35 @@ def compute_sigma_c_ppm_omega_grid(
     )
 
     plan_mode = resolve_sigma_plan()
-    delivered_windows = {}
-    if plan_mode == "delivered" and branches:
-        # GN-PPM has one fitted pole per (q,mu,nu).  Add only the leading
-        # singleton axis expected by the shared MPA planner; the existing
-        # B_mask remains the executor's exact validity selector. Independent
-        # causal branches are still planned independently, so this does not
-        # introduce a time-reversal identification at the W producer seam.
-        from .mpa.delivered_windows import build_delivered_sigma_windows
-        tau_grid_mode = "free"  # single grid mode; shared-grid dial removed (2026-08-31 ruling)
-        Omega_one = jnp.expand_dims(Omega_abs, axis=0)
-        B_one = jnp.expand_dims(jnp.where(B_mask, B_corr, 0.0j), axis=0)
-        state_amplitudes = projected_state_amplitude_envelope(
-            wfns, state_bands=s.full, projection_bands=s.sigma)
-        # GN carries the loaded union because chi0 may own more bands than
-        # Sigma.  The bracketed Sigma executor stops at sigma_sum; make the
-        # planner's real state weight vanish on the same unused tail.
-        state_amplitudes = (
-            state_amplitudes
-            * wfns.band_mask(s.sigma_sum).astype(state_amplitudes.dtype))
-        shared_plan, geometry = build_delivered_sigma_windows(
-            [Omega_one] * len(branches), [B_one] * len(branches), branches,
-            omega_req,
-            regularization_width_ry=regularization_width_ry,
-            envelope_relative_target=target_error,
-            state_amplitudes_by_branch=(
-                [state_amplitudes] * len(branches)),
-            max_nodes=max(int(max_nodes), int(crossing_max_nodes)),
-            crossing_eps_q=crossing_eps_q,
-            use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
-            tau_grid_mode=tau_grid_mode,
-            edge_factor=edge_factor, mesh_xy=mesh_xy)
-        for report in geometry["branches"]:
-            start, stop = int(report["plan_start"]), int(report["plan_stop"])
-            delivered_windows[report["tag"]] = [
-                row.window for row in shared_plan[start:stop]]
+    planned_windows = {}
+    box_geometry = None
+    if plan_mode == "box" and branches:
+        with timing.section("sigma.box_plan"):
+            planned_windows, box_geometry = _plan_ppm_box_windows(
+                branches=branches,
+                Omega_q=Omega_abs,
+                base_mask_B=B_mask,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor,
+                target_error=target_error,
+                max_nodes=max_nodes,
+                crossing_eps_q=crossing_eps_q,
+                crossing_max_nodes=crossing_max_nodes,
+                use_shipped_minimax_tables=use_shipped_minimax_tables,
+                partition_hgl=partition_hgl,
+                quadrature_eps=float(sigma_cfg.quadrature_eps),
+                quadrature_reduction_seconds=float(
+                    sigma_cfg.quadrature_reduction_seconds),
+                quadrature_cache_dir=quadrature_cache_dir,
+                print_fn=print_fn,
+            )
         print_fn(
-            f"  GN-PPM windows [delivered]: {geometry['n_windows']} logical "
-            f"windows, target={geometry['envelope_relative_target']:.3g} "
-            "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
-            f"grid={geometry['tau_grid_mode']}, "
-            f"{geometry['window_tau_pairs']} (window,tau) pairs, "
-            f"{geometry['distinct_tau_count']} branch-distinct tau, "
-            f"plan {geometry['plan_seconds']:.3f} s")
-        for report in geometry["branches"]:
-            for window in report["windows"]:
-                print_fn(
-                    f"    {window['name']}: n_tau={window['node_count']}, "
-                    f"residual={window['refined_residual']:.6g}/"
-                    f"{window['relative_residual_target']:.6g}, "
-                    f"kappa_p99={window['amplification_p99']:.6g}, "
-                    f"noise={window['runtime_noise_bound']:.6g}/"
-                    f"{window['runtime_noise_budget']:.6g}")
+            f"  GN-PPM windows [box]: {box_geometry['n_windows']} logical "
+            f"windows, {box_geometry['window_tau_pairs']} (window,tau) "
+            f"pairs = {box_geometry['tau_dispatches']} tau dispatches, "
+            f"{box_geometry['denominator_tuple_count']} exact denominator "
+            f"tuples, eps={box_geometry['eps']:.3g}, "
+            f"plan {box_geometry['plan_seconds']:.3f} s")
 
     # Run each branch and fold its Σc tiles into per-rank HOST tile
     # accumulators at the branch's global ω indices.  cond and val of a
@@ -1807,8 +2007,9 @@ def compute_sigma_c_ppm_omega_grid(
     tile_acc = None     # per-shard host accumulators, full ω extent
     tile_meta = None    # first branch's _SigmaBranchTiles (layout metadata)
     sigma_kij_sharded = None  # sharded-layout result (set in tile_finalize)
+    executed_windows = []
     for br in branches:
-        branch_tiles, _ = _run_sigma_branch(
+        branch_tiles, branch_windows = _run_sigma_branch(
             omega_nonneg_ry=br.omega_abs,
             E_A=br.E_A, base_mask_A=br.base_mask_A,
             # R_+ for the conduction A-space, R_- for the valence one; the
@@ -1817,10 +2018,11 @@ def compute_sigma_c_ppm_omega_grid(
             B_q=_residue_for_space(br.space, B_corr, B_odd_corr),
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
-            planned_windows=delivered_windows.get(br.tag)
-            if plan_mode == "delivered" else None,
+            planned_windows=(planned_windows.get(br.tag)
+                             if plan_mode == "box" else None),
             **common_branch_kwargs,
         )
+        executed_windows.extend(branch_windows)
         if branch_tiles is None:
             continue
         idx = np.asarray(br.omega_idx, dtype=np.int64)
@@ -1844,6 +2046,14 @@ def compute_sigma_c_ppm_omega_grid(
         with timing.section("sigma.branch_fold"):
             for d, t in enumerate(branch_tiles.tiles):
                 tile_acc[d][:, idx] += t
+
+    if plan_mode == "panes":
+        pane_pairs = sum(window.n_tau for window in executed_windows)
+        print_fn(
+            f"  GN-PPM windows [panes]: {len(executed_windows)} logical "
+            f"windows, {pane_pairs} (window,tau) pairs = {pane_pairs} "
+            "tau dispatches; plan seconds are the summed sigma.windows "
+            "timing row")
 
     # Single end-of-stage gather: assemble the global padded Σ_c from the
     # per-rank host tiles and reconstruct it on every rank's host — ONCE,
@@ -2030,3 +2240,227 @@ def compute_sigma_c_ppm_omega_grid(
         band_counts=tuple(int(c) for c in plan.counts),
         static_coh_at_counts=static_coh_at_counts,
     )
+
+
+@jax.jit
+def _ppm_as_one_pole_store_fields(
+    state: _SigmaPhysicsState,
+    B_odd_q=None,
+):
+    """Policy-resolved PPM poles in the MPA ``(p,q,mu,nu)`` convention.
+
+    Both ansatzes use
+
+    ``Wc(z) = 2*Omega*B/(z**2 - Omega**2)`` and therefore
+    ``Wc(0) = -2*B/Omega``.  No residue rescaling or sign flip is needed.
+    ``state.B_mask`` has already applied ``ppm_invalid_mode``; absent modes
+    are encoded by the MPA store's ordinary zero-residue convention and their
+    frequency is zeroed as well.  When the ordered GN fit supplied
+    ``B_odd_q=D``, that field is masked by the same policy and stored beside
+    ``B`` so the shared executor can consume ``R_+=B+D`` on conduction rows
+    and ``R_-=B-D`` on valence rows.  GN/HL poles retained here are positive
+    real frequencies, i.e. causal MPA poles with zero fitted width.
+    """
+    live = jnp.asarray(state.B_mask, dtype=bool)
+    if B_odd_q is not None and tuple(B_odd_q.shape) != tuple(state.B_corr.shape):
+        raise ValueError(
+            "ordered PPM B_odd_q must match B_q; got "
+            f"{tuple(B_odd_q.shape)} and {tuple(state.B_corr.shape)}")
+    Omega = jnp.where(live, state.Omega_abs, 0.0).astype(jnp.complex128)
+    B = jnp.where(live, state.B_corr, 0.0 + 0.0j).astype(jnp.complex128)
+    D = (None if B_odd_q is None else
+         jnp.where(live, jnp.asarray(B_odd_q), 0.0 + 0.0j)
+         .astype(jnp.complex128)[None, ...])
+    return Omega[None, ...], B[None, ...], D
+
+
+def _add_static_ppm_term(sigma_c_kij, sigma_static_host, mesh_xy):
+    """Add one static invalid-pole term to every cumulative band count."""
+    from common.collectives import device_put_process_local
+
+    static_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    static = device_put_process_local(
+        np.asarray(sigma_static_host, dtype=np.complex128), static_sharding)
+    return jax.jit(
+        lambda sigma, term: sigma + term[None, None, ...],
+        out_shardings=sigma_c_kij.sharding)(sigma_c_kij, static)
+
+
+def compute_sigma_c_ppm_omega_grid(
+    wfns,
+    ppm,
+    meta,
+    mesh_xy: Mesh,
+    *,
+    ppm_cfg: PPMConfig,
+    sigma_cfg: DynamicSigmaConfig,
+    mpa_cfg,
+    omega_grid_ry: np.ndarray,
+    ansatz: str,
+    fit_store_path: str,
+    screening_diagrams,
+    quadrature_cache_dir: str | None = None,
+    occupation_state=None,
+    plan: 'BandBracketPlan | None' = None,
+    print_fn=print,
+) -> SigmaOmegaResult:
+    """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
+
+    The PPM fit remains the two-point algebra in :func:`fit_ppm`.  This stage
+    applies the established invalid-pole policy, writes that result as a
+    finalized one-pole MPA store, and then delegates window construction,
+    denominator-box rules, cache lookup, pole batching, the tau executor and
+    omega accumulation to :func:`gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`.
+
+    ``plan`` retains the PPM band-convergence contract: disjoint brackets are
+    evaluated by the shared spatial kernel and returned as cumulative band
+    counts.  The optional static-COHSEX invalid-pole term remains separate
+    from the dynamic store and is added exactly once to each cumulative count.
+    """
+    from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+
+    s = wfns.slices
+    plan = _resolve_ppm_band_plan(
+        wfns, meta, plan, where="ppm_sigma shared MPA bracket partition")
+
+    enk_full = wfns.enk[:, s.full]
+    occ_full = wfns.occ[:, s.full]
+    omega_req = np.asarray(omega_grid_ry, dtype=np.float64)
+    if omega_req.ndim != 1 or not omega_req.size:
+        raise ValueError("omega_grid_ry must be a nonempty vector")
+    if int(meta.nk_tot) != int(enk_full.shape[0]):
+        raise ValueError(
+            "enk_full shape mismatch: expected first dim "
+            f"{int(meta.nk_tot)}, got {enk_full.shape[0]}")
+
+    invalid_mode = str(ppm_cfg.invalid_mode).strip().lower()
+    if invalid_mode == "imaginary":
+        raise NotImplementedError(
+            "ppm_invalid_mode='imaginary' (BGW mode 1) needs a "
+            "complex-Omega path.")
+    if invalid_mode not in (
+            "zero", "skip", "2ry", "static_limit", "infinity"):
+        raise ValueError(
+            "ppm_invalid_mode must be zero/skip/2ry/static_limit/infinity; "
+            f"got {invalid_mode!r}")
+    keep_invalid = invalid_mode == "2ry"
+    invalid_static = invalid_mode in ("static_limit", "infinity")
+
+    assert_gapped_occupations_for_ppm(occ_full, print_fn=print_fn)
+    valid_mask = ppm.valid_mask_q
+    if valid_mask is None:
+        valid_mask = jnp.ones(ppm.Omega_q.shape, dtype=bool)
+    with timing.section("sigma.state"):
+        state = _prepare_sigma_state(
+            enk_full, occ_full, ppm.B_q, ppm.Omega_q, valid_mask,
+            jnp.asarray(sigma_cfg.fermi_reference == "midgap", dtype=bool),
+            jnp.asarray(keep_invalid, dtype=bool))
+
+    regularization_width_ry = (
+        float(sigma_cfg.regularization_ev) / RYD_TO_EV)
+    ansatz_name = str(getattr(ansatz, "value", ansatz)).strip().lower()
+    resolved_xi = resolve_sigma_regularization(
+        requested_ry=regularization_width_ry,
+        omega_grid_ry=omega_req,
+        edge_factor=float(sigma_cfg.window_edge_factor),
+        ansatz=ansatz_name,
+        floor_ev=sigma_cfg.regularization_floor_ev)
+    print_fn(resolved_xi.describe())
+    regularization_width_ry = resolved_xi.resolved_ry
+
+    n_total_modes, n_invalid = map(
+        int, jax.device_get((state.n_total_modes, state.n_invalid)))
+    if n_invalid:
+        print_fn(
+            f"  PPM invalid modes: {n_invalid}/{n_total_modes} "
+            f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)")
+        n_invalid_q = np.asarray(jax.device_get(
+            jnp.sum(state.invalid_mask, axis=(1, 2), dtype=jnp.int64)))
+        print_fn(
+            "  PPM invalid modes per q: "
+            f"min={int(n_invalid_q.min())} max={int(n_invalid_q.max())} "
+            f"counts={np.array2string(n_invalid_q, max_line_width=100, threshold=64)}")
+
+    sigma_static_host = None
+    static_coh_at_counts = None
+    if invalid_static and n_invalid:
+        sigma_static_host = _compute_invalid_static_sigma(
+            wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
+            occupation_state=occupation_state)
+        print_fn(
+            "  PPM invalid modes -> static COHSEX: max|Sigma_static| = "
+            f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV")
+        if plan.n_brackets > 1:
+            static_coh_at_counts = np.cumsum(
+                _invalid_static_coh_by_bracket(
+                    wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
+                    plan.bounds),
+                axis=0)
+
+    Omega_p, B_p, B_odd_p = _ppm_as_one_pole_store_fields(
+        state, ppm.B_odd_q)
+    from file_io.mpa_store import write_complete_pole_store_collective
+
+    diagram_value = str(getattr(
+        screening_diagrams, "value", screening_diagrams))
+    write_complete_pole_store_collective(
+        fit_store_path, Omega_p, B_p,
+        B_odd_p=B_odd_p,
+        mesh_xy=mesh_xy,
+        n_mu_logical=int(meta.n_rmu),
+        energy_unit="Ry",
+        provenance={
+            "fit_protocol": "two_point_ppm",
+            "pole_model": ansatz_name,
+            "ppm_invalid_mode": invalid_mode,
+            "screening_diagrams": diagram_value,
+            "certification_basis": "algebraic_no_linear_solve",
+            "probe_frequency_ry": float(ppm.omega_p),
+            "unfulfilled_fraction": float(ppm.unfulfilled_fraction),
+        },
+        certification={
+            "condition_max_allowed": 1.0,
+            "backward_error_max_allowed": 1.0,
+        },
+        occupation_state=occupation_state,
+    )
+    print_fn(
+        f"  {ansatz_name} fit -> MPA store: one pole per ISDF pair at "
+        f"{fit_store_path}; invalid policy={invalid_mode}")
+
+    branches = branches_for_omega_grid(
+        omega_req,
+        E_cond=state.E_cond,
+        H_val=state.H_val,
+        cond_mask=state.cond_mask,
+        val_mask=state.val_mask)
+    result = compute_sigma_c_mpa_omega_grid(
+        wfns, fit_store_path, meta, mesh_xy,
+        omega_grid_ry=omega_req,
+        efermi_ry=float(jax.device_get(state.efermi)),
+        regularization_width_ry=regularization_width_ry,
+        edge_factor=float(sigma_cfg.window_edge_factor),
+        quadrature_eps=float(sigma_cfg.quadrature_eps),
+        quadrature_reduction_seconds=float(
+            sigma_cfg.quadrature_reduction_seconds),
+        pair_ceiling=int(mpa_cfg.sigma_max_nodes),
+        quadrature_cache_dir=quadrature_cache_dir,
+        omega_grid_step_ry=float(sigma_cfg.omega_step_ev) / RYD_TO_EV,
+        pole_batch_size=int(mpa_cfg.pole_batch_size),
+        expected_screening_diagrams=screening_diagrams,
+        sigma_branches=branches,
+        band_brackets=plan.bounds,
+        band_counts=plan.counts,
+        print_fn=print_fn)
+    sigma_c_kij = result.sigma_c_kij
+    if sigma_static_host is not None:
+        sigma_c_kij = _add_static_ppm_term(
+            sigma_c_kij, sigma_static_host, mesh_xy)
+    return SigmaOmegaResult(
+        omega_ry=result.omega_ry,
+        omega_ev=result.omega_ev,
+        sigma_c_kij=sigma_c_kij,
+        sigma_c_odd_kij=result.sigma_c_odd_kij,
+        band_counts=result.band_counts,
+        static_coh_at_counts=static_coh_at_counts,
+        odd_even_residue_ratio=result.odd_even_residue_ratio)
