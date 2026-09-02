@@ -4013,7 +4013,6 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
-		wf_bundle_scalar_head=wfns_scalar_head,
 		# Raw-parent, orbit-packed ψ is a screening-only acceleration carrier,
 		# deliberately separate from the primary Wavefunctions pytree so head,
 		# Sigma, density and output kernels cannot inherit unused large inputs.
