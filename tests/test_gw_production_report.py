@@ -98,6 +98,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     sym = SimpleNamespace(
         Rinv_grid=np.eye(3, dtype=int)[None],
         translations=np.zeros((1, 3)), trs_allowed=True,
+        active_symmetry_rows=np.array([0], dtype=np.int32),
         nk_tot=2, nk_red=2, kirr_fullids=np.array([0, 1]),
     )
     bands = SimpleNamespace(
@@ -361,3 +362,22 @@ def test_nonzero_rank_never_creates_report(tmp_path):
     report.emit("must not be emitted")
     report.finish()
     assert not path.exists()
+
+
+def test_mpa_trs_route_is_part_of_the_scientific_run_record(tmp_path):
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
+    config = _config()
+    config.compute_mode = SimpleNamespace(value="mpa", is_dynamic=True)
+    config.mpa = SimpleNamespace(material_class="insulator")
+
+    report.trs_pathways(
+        config=config, sym=SimpleNamespace(trs_allowed=False))
+    report.finish()
+
+    text = path.read_text(encoding="utf-8")
+    assert ("TRS pathways   : automatic from SymMaps.trs_allowed=false; "
+            "no input override") in text
+    assert "global time reversal MEASURED BROKEN" in text
+    assert "one contour sweep plus the q-negated conjugate partner" in text

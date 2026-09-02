@@ -522,6 +522,7 @@ def main(argv=None):
 		band_slices, zeta_fit_edge, log=lambda *args, **kwargs: None)
 	report.environment(config=config, wfn=wfn)
 	report.sampling(wfn=wfn, sym=sym, centroids=centroid_basis)
+	report.trs_pathways(config=config, sym=sym)
 	report.bands(
 		config=config, wfn=wfn, band_slices=band_slices,
 		zeta_ranges=_zeta_ranges)

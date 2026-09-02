@@ -341,6 +341,22 @@ def _require_metal_occupations(config, occupation_state):
             "OccupationState was passed.")
 
 
+def chi0_orientation_route(material_class: str, *, trs_allowed: bool) -> str:
+    """Return the single run-record description of the MPA chi0 route."""
+    if str(material_class) != "insulator":
+        return (
+            "fractional-occupation ordered pairs (independent of global "
+            "TRS completion)")
+    if not bool(trs_allowed):
+        return (
+            "global time reversal MEASURED BROKEN; ordered orientations use "
+            "one contour sweep plus the q-negated conjugate partner, "
+            "retaining the TR-odd channel")
+    return (
+        "global time reversal MEASURED to hold; incumbent symmetric "
+        "completion retained bit-for-bit")
+
+
 def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *, sym,
     energy_reference, occupation_state, write_full, write_wedge,
@@ -388,19 +404,11 @@ def _evaluate_samples(
 
         q_neg = q_negation_index(
             (int(meta.nkx), int(meta.nky), int(meta.nkz)))
-    if metal:
-        print_fn(
-            "  MPA chi0 orientation route: fractional-occupation ordered "
-            "pairs (independent of global TRS completion).")
-    elif ordered:
-        print_fn(
-            "  MPA chi0 orientation route: global time reversal MEASURED "
-            "BROKEN; ordered orientations use one contour sweep plus the "
-            "q-negated conjugate partner, retaining the TR-odd channel.")
-    else:
-        print_fn(
-            "  MPA chi0 orientation route: global time reversal MEASURED "
-            "to hold; incumbent symmetric completion retained bit-for-bit.")
+    print_fn(
+        "  MPA chi0 orientation route: "
+        + chi0_orientation_route(
+            config.mpa.material_class, trs_allowed=trs_allowed)
+        + ".")
 
     omega_m = float(quad.x_max)
     # ONE occupancy window for the whole fit: the rule bandwidth below and
