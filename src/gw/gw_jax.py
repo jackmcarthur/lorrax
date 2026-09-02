@@ -322,14 +322,20 @@ def main(argv=None):
 		# when it is the incumbent one, the first condition that decided it.
 		_bare_taken, _bare_reason = packed_bare_transverse_route(config)
 		if config.bispinor_gw.value != "full_static_cohsex":
-			print0(
-				"  Bispinor GW route: "
-				+ ("packed static photon operator (chi_TT = chi_CT = 0; the "
-				   "Gamma-cell completion carries both the charge head and the "
-				   f"bare <D_TT>) -- {_bare_reason}"
+			# In production mode print0 sinks component chatter, so this goes
+			# into the RUN RECORD: which of two physically equivalent-inside-
+			# the-envelope routes ran is exactly the fact a later reader needs
+			# (they differ in the q->0 head mechanism).
+			report.progress(
+				"Photon route   : "
+				+ ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
+				   "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
+				   "completion carries both the charge head and the bare "
+				   f"<D_TT>) -- {_bare_reason}"
 				   if _bare_taken else
-				   "incumbent charge-screened W + Sigma^B (gw.sigma_x_bispinor) "
-				   f"with the scalar band-diagonal q->0 head -- {_bare_reason}"))
+				   "incumbent charge-screened W + Sigma^B "
+				   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
+				   f"head -- {_bare_reason}"))
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
