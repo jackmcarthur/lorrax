@@ -70,6 +70,7 @@ for the real one, which is exactly what the deleted shim was.
 | `full_k_parent_groups(full_k=None)` | Stable O(nk) grouping of requested full-BZ rows by raw IBZ parent. |
 | `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False)` | Apply the canonical typed unitary/antiunitary action to one already-loaded raw parent row. Consumers can realize a star with one child workspace and no parent re-read. |
 | `full_k_box_index_one_dev(full_k)` | Build one child's replicated FFT gather index from the current parent G row; strict one-k streams avoid retained full-BZ G/index tables. |
+| `ibz_box_index_one_dev(parent)` | Build the matching FFT gather index for one raw WFN parent without creating a complete IBZ index table. |
 | `gvecs(k=...)` | `(n_k, ngkmax, 3)` int32, pad rows = the FFT-box **pad sentinel**, never zeros. |
 | `ngk_valid(k=...)` | The mask that makes the pad rows discountable. The pair is the contract. |
 | `box_index(k=...)` / `box_index_dev(...)` | FFT-box gather table, host / device-cached (the replicated-buffer-leak fix). |

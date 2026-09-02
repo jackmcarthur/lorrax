@@ -220,6 +220,8 @@ from symmetry_maps.maps import (
     apply_spinor_rotation,
     unfold_psi,
     unfold_isdf_operator,
+    reorder_isdf_operator_basis,
+    unfold_spin_centroid_operator,
     unfold_isdf_one_leg,
     mix_channels_by_proper_rotation,
 )
@@ -319,7 +321,9 @@ __all__ = [
     "unfold_file_wedge_polar_matrix",
     "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
-    "slice_q_full_to_ibz", "unfold_isdf_operator", "unfold_isdf_one_leg",
+    "slice_q_full_to_ibz", "unfold_isdf_operator",
+    "reorder_isdf_operator_basis",
+    "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
     "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",

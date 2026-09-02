@@ -57,6 +57,7 @@ indices and actions but does not reinterpret `kweights`.
 | `q_stencil_orbit_table(...)` | Pure-array reduction of a finite-q stencil through canonical q tables and required `active_symmetry_rows`. Returns exact q-IBZ sources plus target-to-source symmetry metadata; it has no second TR authorization switch. |
 | `apply_band_matrix_symmetry(...)` | The one band-matrix action: optional adjoint, antiunitary conjugation, endpoint sewing, and optional component mixing. `star_broadcast` uses its identity-sewing antiunitary path rather than maintaining a second algebra. |
 | `unfold_v_q(V_q_ibz, *, irr_idx, sym_idx, sym_perm, L_table, q_irr_frac, mesh_xy, n_sym_spatial)` | Sharded centroid double-gather + umklapp L-phase + TRS conj. `shard_map` + paired `all_to_all`, 1× single-tile peak memory per rank. |
+| `reorder_isdf_operator_basis(...)` | Apply destination-to-source maps to both axes of a `P(None,'x','y')` operator. Uses volume-preserving all-to-all round trips; no endpoint is replicated. |
 | `mix_channels_by_proper_rotation(..., sym=...)` | Pauli-vector mixing on the bispinor TT block. It requests axial, time-odd actions from `SymMaps`; callers cannot supply a rotation convention. |
 | `unfold_psi(cnk_kbar, *, sym_idx, g_kbar, sym_mats_k, translations, U_spinor_spatial)` | The (★) ψ derivation: spinor rotation, τ phase, G-list negation, TRS conjugation. Hard-raises unless `len(sym_mats_k) == 2·len(U_spinor_spatial)`. |
 | `slice_q_full_to_ibz` | Full-BZ → IBZ q-axis gather, sharding-preserving and jit-cached. |

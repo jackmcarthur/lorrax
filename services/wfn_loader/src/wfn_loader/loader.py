@@ -1372,6 +1372,33 @@ class WfnLoader:
                 static["ngk_per_parent"][parent],
             )
 
+    def ibz_box_index_one_dev(self, parent: int) -> jax.Array:
+        """Build one raw WFN parent's FFT gather index on device.
+
+        This is the raw-parent twin of :meth:`full_k_box_index_one_dev`.
+        It reuses the same one-row G-vector slot and the same scatter kernel,
+        with identity reciprocal action and zero umklapp.  It never populates
+        the complete host/device IBZ index caches, so a parent-major centroid
+        stream stays bounded by one FFT box.
+        """
+        if self._mesh is None:
+            raise ValueError(
+                "WfnLoader.ibz_box_index_one_dev requires the loader's "
+                "mesh; construct with mesh= or call adopt_mesh first.")
+        parent = int(parent)
+        if parent < 0 or parent >= int(self.nkpts):
+            raise ValueError(
+                "WfnLoader.ibz_box_index_one_dev: parent outside the raw "
+                f"WFN k axis [0,{int(self.nkpts)}); got {parent}.")
+        return _parent_box_index_kernel(
+            self._mesh, tuple(int(v) for v in self.fft_grid),
+            int(self.ngkmax))(
+                self._parent_g_row_device(parent),
+                jnp.eye(3, dtype=jnp.int32),
+                jnp.zeros((3,), dtype=jnp.int32),
+                jnp.asarray(int(self.ngk[parent]), dtype=jnp.int32),
+            )
+
     def _host_phase_rows_for_full_k(
         self, full_k_rows: np.ndarray,
     ) -> np.ndarray:

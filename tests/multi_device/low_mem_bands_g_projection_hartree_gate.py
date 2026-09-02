@@ -232,6 +232,75 @@ def check_g_dense_gij_refuses(mesh, dtype="complex128", *, ns=1, mu=8,
     return True
 
 
+def check_g_parent_unfold(mesh, dtype="complex128", *, ns=2, mu=8, nb=8,
+                          nk_parent=2, nk_full=6):
+    """Real distributed GEMM on parent k, then authenticated local unfold."""
+    from types import SimpleNamespace
+
+    import jax.numpy as jnp
+
+    from distrib_la import gemm_plan
+    from gw.centroid_k_unfold import build_centroid_k_unfold_plan
+    from gw.greens_function_kernel import build_G
+
+    identity = np.eye(3, dtype=np.int32)
+    irr = np.arange(nk_full, dtype=np.int32) % nk_parent
+
+    def spinor_action(rows, *, nspinor):
+        rows = np.asarray(rows)
+        return np.broadcast_to(
+            np.eye(nspinor, dtype=np.complex128),
+            rows.shape + (nspinor, nspinor)).copy()
+
+    sym = SimpleNamespace(
+        sym_matrices=identity[None],
+        translations=np.zeros((1, 3), dtype=np.float64),
+        irr_idx_k=irr,
+        sym_idx_k=np.zeros((nk_full,), dtype=np.int32),
+        unfolded_kpts=np.zeros((nk_full, 3), dtype=np.float64),
+        kirr_fullids=np.arange(nk_parent, dtype=np.int32),
+        spinor_action=spinor_action,
+    )
+    centroids = np.stack((
+        np.arange(mu, dtype=np.int32),
+        np.zeros(mu, dtype=np.int32),
+        np.zeros(mu, dtype=np.int32)), axis=1)
+    plan = build_centroid_k_unfold_plan(
+        sym, centroids, (mu, 1, 1), mesh, nspinor=ns,
+        parent_k_frac=np.zeros((nk_parent, 3), dtype=np.float64),
+        canonical_centroid_extent=mu)
+
+    rng = np.random.default_rng(2026090101 + ns)
+    parent_np = _rng_mat(rng, (nk_parent, nb, ns, mu), dtype)
+    full_np = parent_np[irr]
+    full_mun = _put(
+        full_np.transpose(0, 2, 3, 1), mesh,
+        (None, None, "x", "y"))
+    full_nmu = _put(full_np, mesh, (None, "x", None, "y"))
+    parent_mun = _put(
+        parent_np.transpose(0, 2, 3, 1), mesh,
+        (None, None, "x", "y"))
+    parent_nmu = _put(parent_np, mesh, (None, "x", None, "y"))
+    with mesh:
+        parent_nmu, parent_mun = plan.pack_face_pair(
+            parent_nmu, parent_mun)
+
+    full_gemm = gemm_plan(
+        mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk_full, dtype=dtype)
+    parent_gemm = gemm_plan(
+        mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk_parent, dtype=dtype)
+    got_full = build_G(
+        full_mun, full_nmu, layout="face", gemm=full_gemm)
+    got_parent = build_G(
+        parent_mun, parent_nmu, layout="face", gemm=parent_gemm,
+        k_unfold_plan=plan)
+    jnp.asarray(got_parent).block_until_ready()
+
+    err = _rel(_gather(got_parent), _gather(got_full))
+    assert err < RTOL, f"parent-k unfolded G rel err {err:.3e}"
+    return {"rel": err, "nk": f"{nk_parent}->{nk_full}"}
+
+
 # ---------------------------------------------------------------------------
 # 5. Projection.
 # ---------------------------------------------------------------------------
@@ -284,6 +353,8 @@ _CLI_CELLS = [
     ("g_hostile_pad_ns1", lambda mesh, dt: check_g_hostile_pad(mesh, dt, ns=1)),
     ("g_dense_gij_refuses",
      lambda mesh, dt: check_g_dense_gij_refuses(mesh, dt)),
+    ("g_parent_unfold_ns2",
+     lambda mesh, dt: check_g_parent_unfold(mesh, dt, ns=2)),
     ("projection_ns1", lambda mesh, dt: check_projection(mesh, dt, ns=1)),
     ("projection_ns2", lambda mesh, dt: check_projection(mesh, dt, ns=2)),
 ]

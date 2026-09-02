@@ -551,6 +551,35 @@ def test_streamed_centroid_transfer_matches_bulk(
     np.testing.assert_allclose(
         np.asarray(reused_x), np.asarray(bulk_x), rtol=1e-10, atol=1e-12)
 
+    # The same transform/scheduling owner samples raw WFN parents when asked;
+    # only the typed k domain changes.  Bulk and streamed parent carriers must
+    # agree without going through the full-BZ unfold.
+    ibz_bulk_y, ibz_bulk_x = load_centroids_band_chunked(
+        synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+        band_chunk_size=nb, k_domain="ibz")
+    ibz_stream_y, ibz_stream_x = load_centroids_band_chunked(
+        synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+        band_chunk_size=4, k_chunk_size=1, k_domain="ibz")
+    np.testing.assert_allclose(
+        np.asarray(ibz_stream_y), np.asarray(ibz_bulk_y),
+        rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(ibz_stream_x), np.asarray(ibz_bulk_x),
+        rtol=1e-10, atol=1e-12)
+
+    retained_y, retained_x, parent_y, parent_x = (
+        load_centroids_band_chunked(
+            synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+            band_chunk_size=4, return_ibz_parents=True))
+    np.testing.assert_allclose(
+        np.asarray(retained_y), np.asarray(bulk_y), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(retained_x), np.asarray(bulk_x), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(parent_y), np.asarray(ibz_bulk_y), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(parent_x), np.asarray(ibz_bulk_x), rtol=1e-10, atol=1e-12)
+
     for key in list(_wfn_transforms._KERNEL_CACHE):
         if key[0] == "gflat_to_rmu":
             del _wfn_transforms._KERNEL_CACHE[key]
