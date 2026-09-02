@@ -20,7 +20,12 @@ needs no GPU:
 ```bash
 uv sync
 bash src/ffi/cpp/build_host.sh      # see below: this step is NOT optional
-uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
+LORRAX_SOURCE=$PWD
+LORRAX_QUICKSTART=$(mktemp -d)
+mkdir -p "$LORRAX_QUICKSTART/tests/regression"
+cp -a tests/regression/cohsex_debug "$LORRAX_QUICKSTART/tests/regression/"
+chmod -R u+w "$LORRAX_QUICKSTART"
+(cd "$LORRAX_QUICKSTART" && uv run --project "$LORRAX_SOURCE" python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in)
 ```
 
 !!! warning "There is no longer a pure-JAX path that skips the native build"
