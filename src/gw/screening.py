@@ -685,7 +685,8 @@ def compute_screening(
                         if iteration_head_response is not None else None))
             with timing.section("W.gate"):
                 _gate_w(W_static, req, print_fn=print_fn,
-                        kgrid=tuple(meta.kgrid))
+                        kgrid=tuple(meta.kgrid),
+                        trs_allowed=_trs_verdict(sym))
             _store_role(req.role, idx, W_static)
             bar.step()
             continue
@@ -711,7 +712,8 @@ def compute_screening(
                 head_channel=head_channel)
             chi0_probe_reused = None   # donated into solve_w — dead ref
             with timing.section("W.gate"):
-                _gate_w(W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid))
+                _gate_w(W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid),
+                        trs_allowed=_trs_verdict(sym))
             _store_role(req.role, idx, W)
             bar.step()
             continue
@@ -743,7 +745,8 @@ def compute_screening(
             role=req.role, force_full_bz=True, section="chi0_W_probe",
             head_channel=head_channel)
         with timing.section("W.gate"):
-            _gate_w(W, req, print_fn=print_fn)
+            _gate_w(W, req, print_fn=print_fn,
+                    trs_allowed=_trs_verdict(sym))
         _store_role(req.role, idx, W)
         bar.step()
 
@@ -916,8 +919,40 @@ def driver_persists_w0(mode, config) -> bool:
     return diagrams is ScreeningDiagrams.W_RPA
 
 
+#: Why a non-Hermitian ``W(iω_p)`` is the answer rather than the bug, on a
+#: deck whose measured time-reversal verdict is false.  Passed to
+#: ``sanity.report_hermitian_residual``'s ``cause``, which is the one seam
+#: for "this residual is a quantity, not a violation" — see ``_gate_w``.
+_TR_ODD_W_HERMITICITY_CAUSE = (
+    "TR-odd anti-Hermitian part of W(iω_p).  Hermiticity of W on the "
+    "imaginary axis away from ω = 0 is a time-reversal consequence, not a "
+    "construction invariant: χ₀(r,r';iω) is real for any system once both "
+    "particle-hole orientations are summed, but its real antisymmetric "
+    "part 2ω Σ Im[conj(ρ_vc(r)) ρ_vc(r')]/(ω²+Δ²) cancels only when the "
+    "reverse transition set is the conjugate of the forward one.  This "
+    "deck's measured verdict is trs_allowed = False, so the residual above "
+    "is that component — odd in the magnetisation, zero at ω = 0 — and NOT "
+    "an index/shard mixing fault.  Judge it against the same run's ω = 0 "
+    "role, which is gated unconditionally."
+)
+
+
+def _trs_verdict(sym) -> bool | None:
+    """The deck's MEASURED time-reversal verdict, or ``None`` when absent.
+
+    ``SymMaps.trs_allowed`` comes from ``WfnLoader.trs_holds``, which
+    ``density_symmetry_check`` obtained from the occupied DFT subspaces —
+    the same single measurement ``gw/qgrid_symmetry.qgrid_trs_policy_for``
+    consumes, and read the same way (attribute access, so a real SymMaps
+    that somehow lacks it raises rather than defaulting).  ``None`` means
+    "no symmetry tables in hand", which is a test-harness state, not a
+    physical answer, and the gate below treats it as such.
+    """
+    return None if sym is None else bool(sym.trs_allowed)
+
+
 def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
-            kgrid=None) -> None:
+            kgrid=None, trs_allowed: bool | None = None) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
 
     ``W = (1 − Vχ₀)⁻¹V`` is the only place in the GW flow where a matrix
@@ -928,10 +963,11 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
     finiteness reduction plus one hermiticity residual here names the
     stage instead.
 
-    ``W`` is Hermitian for the two frequencies LORRAX evaluates (ω = 0 and
-    ω = iω_p, both on axes where χ₀ is Hermitian); the real-axis HL probe
-    is *not* Hermitian in general, so hermiticity is only asserted on the
-    imaginary/zero-frequency branch.
+    ``W`` is Hermitian at ω = 0 for any system; the real-axis HL probe is
+    *not* Hermitian in general, so hermiticity is never asserted on that
+    branch.  At ω = iω_p it is a TIME-REVERSAL consequence rather than a
+    construction invariant — see the SCOPE note at the check itself, and
+    ``trs_allowed``, which carries this deck's measured verdict.
 
     THE HERMITICITY CHECK IS NOT THE ONE THE BSE NEEDS, and on its own it
     is how this seam stayed green while broken.  ``W[q=0]`` passes
@@ -950,10 +986,63 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
     label = f"W[{req.role}]"
     sanity.check_finite(label, W, print_fn=print_fn)
     if abs(complex(req.omega_ry).real) == 0.0:
-        # ω on the imaginary axis (including ω=0): W is Hermitian.
+        # HERMITICITY, and the one frequency at which it is unconditional.
+        #
         # rtol is generous — this catches structural mixing, not roundoff.
-        sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
-                               print_fn=print_fn)
+        #
+        # SCOPE.  With BOTH particle-hole orientations summed, χ₀(r,r';iω)
+        # is REAL for any system, but it is Hermitian in (r,r') only when
+        # time reversal holds.  Writing the ordered pair sum out, a v→c
+        # transition of gap Δ contributes
+        #
+        #     [2ω Im(P) − 2Δ Re(P)] / (ω² + Δ²),    P = |ρ_vc⟩⟨ρ_vc|
+        #
+        # whose second term is real symmetric and whose FIRST term is real
+        # ANTIsymmetric.  Im(P) cancels pairwise between k and −k exactly
+        # when the reverse transition set is the conjugate of the forward
+        # one, i.e. under Θ; on a magnet it survives, is odd in the
+        # magnetisation, and carries the TR-odd dynamic screening.  It also
+        # carries the factor ω, so it vanishes IDENTICALLY at ω = 0 whatever
+        # the deck.  Derivation and a random-state model:
+        # reports/four_current_head_frequency_audit_2026-09-01 §F2 (relative
+        # anti-Hermitian part 2.9e-1 at z=2i without Θ, 2e-16 with it, 1e-17
+        # at z=0 either way).
+        #
+        # So ω = 0 is gated for every deck, and ω = iω_p is gated only where
+        # the deck's MEASURED verdict says Hermiticity is owed.  Elsewhere
+        # the same residual is REPORTED, with its number, through the same
+        # reducer — the framing ``check_q_conjugate_reciprocity`` below
+        # already uses for its own TRS-independent statistic.
+        #
+        # ``trs_allowed is None`` is "no verdict supplied" (no symmetry
+        # tables — a test harness, not a deck) and keeps the incumbent
+        # unconditional check: this fork may err toward reporting a residual
+        # that is really physics, never toward silence.
+        #
+        # WHAT THIS DOES NOT COST.  The probe role's W comes off the SAME
+        # ``compute_static_w`` → ``solve_w`` path, on the same tiles and the
+        # same mesh, as the static role in the same run — and the static
+        # role's gate is unconditional.  A column-sharding fault in the
+        # Dyson back-solve (the failure this gate was built for: NaN with
+        # rc=0, caught downstream by counting floats in eqp0.dat) therefore
+        # still refuses, through the ω = 0 role, on a magnet.  What changes
+        # is only which of the two roles is allowed to call a residual a
+        # defect.  Measured on today's builder the reported number is
+        # ~machine-zero anyway: ``w_isdf._complete_static_vertex_orientations``
+        # forms ``forward_R + conj(forward_R)``, i.e. χ_q + conj(χ_{−q}),
+        # which is Hermitian for every q with no Θ assumption — so the
+        # TR-odd channel is absent from χ₀(iω_p) BEFORE W is solved (four
+        # bispinor SOC CrI3 GN-PPM runs, all `Time reversal: BROKEN`, all
+        # silent at rtol=1e-6: runs 129/142/150/157).  That is a defect in
+        # the χ₀ completion, registered separately; this gate must not
+        # assert a property only that defect is supplying.
+        if abs(complex(req.omega_ry).imag) == 0.0 or trs_allowed is not False:
+            sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
+                                   print_fn=print_fn)
+        else:
+            sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
+                                   print_fn=print_fn, measurement=True,
+                                   cause=_TR_ODD_W_HERMITICITY_CAUSE)
         # The load-bearing property, over ALL q.
         #
         # SCOPE.  This sits inside the ω-real == 0 branch deliberately.  On

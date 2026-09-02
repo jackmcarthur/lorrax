@@ -231,6 +231,111 @@ def test_check_hermitian_ignores_non_square():
 
 
 # ---------------------------------------------------------------------------
+# check_hermitian / report_hermitian_residual — MEASUREMENT mode
+#
+# The mode exists for a residual whose size is a physical quantity of the
+# deck rather than a violation of an invariant (``gw/screening._gate_w`` at
+# omega = i*omega_p when the measured time-reversal verdict is false).  What
+# has to be true of it: it never raises under strict, it never emits the
+# grep token, it ALWAYS prints the number, it cannot be entered without a
+# stated cause, and a NaN still fails.  The last two are what keep it from
+# being an off-switch wearing a measurement's clothes.
+# ---------------------------------------------------------------------------
+
+_CAUSE = "TR-odd anti-Hermitian part of W(i*omega_p)."
+
+
+def _broken_hermitian(scale=1.0):
+    """A tile whose Hermiticity residual is ~1e-1 relative — well over rtol."""
+    m = np.eye(4, dtype=np.complex128) * scale
+    m[0, 1] = 0.1 * scale
+    m[1, 0] = -0.1 * scale
+    return m
+
+
+def test_measurement_mode_reports_the_number_and_does_not_fail():
+    log = _Log()
+    ok = sanity.check_hermitian("W[probe][q=0]", _broken_hermitian(),
+                                rtol=1e-6, print_fn=log,
+                                measurement=True, cause=_CAUSE)
+    assert ok is True, "a measurement is not a verdict on the run"
+    assert log.failures == [], log.text
+    assert "hermiticity residual = 2.000e-01" in log.text, log.text
+    assert "MEASURED, not gated" in log.text, log.text
+    assert _CAUSE in log.text, log.text
+
+
+def test_measurement_mode_prints_even_when_the_residual_is_tiny():
+    """A gate reporting nothing looks the same whether it found nothing or
+    checked nothing.  In measurement mode there is always a number."""
+    log = _Log()
+    assert sanity.check_hermitian("W[probe][q=0]", np.eye(4, dtype=complex),
+                                  rtol=1e-6, print_fn=log,
+                                  measurement=True, cause=_CAUSE) is True
+    assert "hermiticity residual = 0.000e+00" in log.text, log.text
+
+
+def test_measurement_mode_does_not_raise_under_strict():
+    """The whole point: strict must not refuse correct physics."""
+    log = _Log()
+    ok = _with_level("strict", lambda: sanity.check_hermitian(
+        "W[probe][q=0]", _broken_hermitian(), rtol=1e-6, print_fn=log,
+        measurement=True, cause=_CAUSE))
+    assert ok is True
+    assert log.failures == [], log.text
+
+
+def test_the_same_tile_without_measurement_mode_still_refuses_under_strict():
+    """The negative control for the cell above, on the SAME array: the mode
+    is what changes the verdict, not the input."""
+    log = _Log()
+    try:
+        _with_level("strict", lambda: sanity.check_hermitian(
+            "W[probe][q=0]", _broken_hermitian(), rtol=1e-6, print_fn=log))
+    except sanity.SanityError:
+        pass
+    else:
+        raise AssertionError("strict accepted a non-Hermitian tile")
+    assert log.failures, log.text
+
+
+def test_measurement_mode_without_a_cause_refuses():
+    """'Expected' with no stated reason is how a gate stops being able to
+    fail, so the mode cannot be entered anonymously."""
+    try:
+        sanity.report_hermitian_residual(
+            "W[probe][q=0]", 1.0, 1.0, print_fn=_Log(), measurement=True)
+    except ValueError as exc:
+        message = str(exc)
+        assert "hermitian_measurement_needs_cause" in message, message
+        for part in ("got:", "want:", "fix:", "why:", "doc:"):
+            assert part in message, message
+    else:
+        raise AssertionError("measurement=True was accepted with no cause")
+
+
+def test_measurement_mode_still_fails_on_a_non_finite_residual():
+    """No physics is expected to come out NaN — this is the branch that keeps
+    the measurement path falsifiable."""
+    log = _Log()
+    ok = sanity.report_hermitian_residual(
+        "W[probe][q=0]", float("nan"), 1.0, print_fn=log,
+        measurement=True, cause=_CAUSE)
+    assert ok is False
+    assert log.failures, log.text
+
+
+def test_the_default_reporter_is_untouched_by_the_new_argument():
+    """Every existing caller passes neither argument and must be bit-identical
+    in behaviour AND in wording (the default diagnosis names a shard bug)."""
+    log = _Log()
+    assert sanity.report_hermitian_residual(
+        "V_q[0]", 1.0, 1.0, print_fn=log, rtol=1e-6) is False
+    assert "is NOT Hermitian" in log.failures[0], log.text
+    assert "index/shard mixing bug" in log.failures[0], log.text
+
+
+# ---------------------------------------------------------------------------
 # check_positive / check_in_range / check_sign
 # ---------------------------------------------------------------------------
 
