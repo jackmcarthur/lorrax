@@ -1183,6 +1183,56 @@ def _get_unfold_isdf_operator_jit(
     return _do_unfold
 
 
+def _rotate_open_spin_centroid_operator(spatial, spin):
+    """Apply ``U O U†`` without routing the fixed 2c case through GEMM.
+
+    The generic two-sided einsum is mathematically compact, but on CUDA XLA
+    lowers its two length-two contractions to two enormous skinny cuBLAS
+    GEMMs with a complete operator transpose on each side.  For ``ns=2``
+    the contraction is a fixed four-scalar block action.  Writing that block
+    explicitly keeps it in one elementwise fusion and avoids all four
+    full-operator layout moves used by a valence/conduction Green pair.
+
+    Other spin extents retain the generic expression.  This helper owns only
+    the spin representation; centroid permutation, nonsymmorphic phases and
+    the antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
+    """
+    U = jnp.asarray(spin)
+    ns = int(spatial.shape[1])
+    if int(spatial.shape[3]) != ns or tuple(U.shape[1:]) != (ns, ns):
+        raise ValueError(
+            "_rotate_open_spin_centroid_operator: spatial spin axes and "
+            f"spin action disagree: {spatial.shape}/{U.shape}.")
+    if ns == 1:
+        factor = U[:, 0, 0] * jnp.conj(U[:, 0, 0])
+        return spatial * factor[:, None, None, None, None]
+    if ns != 2:
+        return jnp.einsum(
+            'kac,kcmdn,kbd->kambn', U, spatial, jnp.conj(U),
+            optimize=True)
+
+    u00 = U[:, 0, 0, None, None]
+    u01 = U[:, 0, 1, None, None]
+    u10 = U[:, 1, 0, None, None]
+    u11 = U[:, 1, 1, None, None]
+    g00 = spatial[:, 0, :, 0, :]
+    g01 = spatial[:, 0, :, 1, :]
+    g10 = spatial[:, 1, :, 0, :]
+    g11 = spatial[:, 1, :, 1, :]
+    l00 = u00 * g00 + u01 * g10
+    l01 = u00 * g01 + u01 * g11
+    l10 = u10 * g00 + u11 * g10
+    l11 = u10 * g01 + u11 * g11
+    o00 = l00 * jnp.conj(u00) + l01 * jnp.conj(u01)
+    o01 = l00 * jnp.conj(u10) + l01 * jnp.conj(u11)
+    o10 = l10 * jnp.conj(u00) + l11 * jnp.conj(u01)
+    o11 = l10 * jnp.conj(u10) + l11 * jnp.conj(u11)
+    return jnp.stack((
+        jnp.stack((o00, o01), axis=2),
+        jnp.stack((o10, o11), axis=2),
+    ), axis=1)
+
+
 def unfold_spin_centroid_operator(
     operator_ibz,
     *,
@@ -1293,9 +1343,12 @@ def unfold_spin_centroid_operator(
     spatial = jnp.transpose(
         flat_full.reshape(n_full, n_left, ns, n_right, ns),
         (0, 2, 1, 4, 3))
-    U = jnp.asarray(spin)
-    rotated = jnp.einsum(
-        'kac,kcmdn,kbd->kambn', U, spatial, jnp.conj(U), optimize=True)
+    # Keep the irregular centroid gather and the small dense spin action as
+    # two device kernels.  Fusing them makes each gathered value feed four
+    # output blocks and was 1.58x slower on the real P4 Si operator, whereas
+    # this barrier measures at the sum of the independent bandwidth kernels.
+    spatial = jax.lax.optimization_barrier(spatial)
+    rotated = _rotate_open_spin_centroid_operator(spatial, spin)
     return jax.lax.with_sharding_constraint(rotated, out_sh)
 
 

@@ -3207,9 +3207,11 @@ def prepare_isdf_and_wavefunctions(
 					* (int(meta.nk_tot) - int(wfn.nkpts))
 					/ int(meta.nk_tot))
 				print0(
-					"  Parent-k Green contraction inactive: automatic work "
-					f"score {_avoided:.1f} is below the measured safe "
-					"crossover 192; using full k for this small band window.")
+					"  Parent-k Green contraction inactive: shape "
+					f"(full k={int(meta.nk_tot)}, parent k={int(wfn.nkpts)}, "
+					f"bands={int(band_slices.nb_full)}, avoided-band score="
+					f"{_avoided:.1f}) is outside the measured safe envelope "
+					"(at least 2x k reduction and score >= 3.5); using full k.")
 			if _parent_green_candidate:
 				from .centroid_k_unfold import build_centroid_k_unfold_plan
 				try:

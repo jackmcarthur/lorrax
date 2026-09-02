@@ -31,12 +31,14 @@ from symmetry_maps import (
 )
 
 
-# Conservative P=4 A100 crossover after postponing canonicalization to one
-# completed chi operator.  This is an internal scheduling constant, not a
-# user-tunable physics/runtime knob.  The dimensionless work proxy scales out
-# the full-k count and refuses the small-band region where local symmetry
-# transport is bandwidth-dominated despite reducing the GEMM count.
-_MIN_AVOIDED_BAND_WORK = 192.0
+# P=4 A100 crossover after the fixed-size spin action was made dot-free and
+# canonicalization was postponed to one completed chi operator.  This is an
+# internal scheduling policy, not a user-tunable physics/runtime knob.  The
+# lower boundary is the measured 64->8, four-band case; require a separate 2x
+# k-reduction floor so an almost-unreduced grid cannot satisfy the scalar work
+# proxy merely by carrying many bands.
+_MIN_AVOIDED_BAND_WORK = 3.5
+_MIN_PARENT_K_REDUCTION = 2.0
 
 
 def parent_k_contraction_profitable(
@@ -46,15 +48,18 @@ def parent_k_contraction_profitable(
 
     The saved band contraction is proportional to
     ``n_bands * (1 - n_parent/n_full)``; the required full-k operator
-    transport is not.  The measured Si P=4 crossover was below 192 (128 bands
-    at 64->8 remained slower; 256 bands was faster), so 192 is a conservative
-    no-regression boundary rather than a fitted optimum.  Callers additionally
-    restrict this measured policy to GPU execution.
+    transport is not.  On the real Si P=4 64->8 geometry, the dot-free
+    transport kept complete eight-node chi builds faster at 4, 8 and 16
+    bands.  Four bands gives the boundary score 3.5.  A distinct 2x reduction
+    floor prevents extrapolation to grids with almost no symmetry reduction.
+    Callers additionally restrict this measured policy to GPU execution.
     """
     full = int(n_full)
     parent = int(n_parent)
     bands = int(n_bands)
     if full < 1 or parent < 1 or parent >= full or bands < 1:
+        return False
+    if full / parent < _MIN_PARENT_K_REDUCTION:
         return False
     avoided = bands * (full - parent) / full
     return avoided >= _MIN_AVOIDED_BAND_WORK

@@ -53,11 +53,13 @@ def _symmetry_fixture():
     )
 
 
-def test_parent_k_profitability_refuses_measured_small_band_region():
-    assert not parent_k_contraction_profitable(
-        n_full=64, n_parent=8, n_bands=128)
+def test_parent_k_profitability_uses_measured_small_band_envelope():
     assert parent_k_contraction_profitable(
-        n_full=64, n_parent=8, n_bands=256)
+        n_full=64, n_parent=8, n_bands=4)
+    assert not parent_k_contraction_profitable(
+        n_full=64, n_parent=8, n_bands=3)
+    assert not parent_k_contraction_profitable(
+        n_full=64, n_parent=40, n_bands=256)
     assert not parent_k_contraction_profitable(
         n_full=64, n_parent=64, n_bands=1024)
 

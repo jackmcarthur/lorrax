@@ -440,6 +440,59 @@ def test_open_spin_green_unfold_uses_transpose_not_conjugation_for_tr():
     assert float(np.max(np.abs(naive - direct[trs_rows]))) / scale > 0.1
 
 
+def test_two_spin_operator_rotation_is_explicit_and_matches_dense_reference():
+    """The 2c backend must not regress to skinny GEMMs plus layout copies."""
+    import jax
+    import jax.numpy as jnp
+
+    from symmetry_maps.maps import _rotate_open_spin_centroid_operator
+
+    rng = np.random.default_rng(2026090104)
+    spatial = (rng.standard_normal((5, 2, 7, 2, 9))
+               + 1j * rng.standard_normal((5, 2, 7, 2, 9)))
+    raw = (rng.standard_normal((5, 2, 2))
+           + 1j * rng.standard_normal((5, 2, 2)))
+    U = np.empty_like(raw)
+    for k in range(raw.shape[0]):
+        U[k], _ = np.linalg.qr(raw[k])
+    expected = np.einsum(
+        'kac,kcmdn,kbd->kambn', U, spatial, np.conj(U), optimize=True)
+    got = _rotate_open_spin_centroid_operator(
+        jnp.asarray(spatial), np.asarray(U))
+    np.testing.assert_allclose(
+        np.asarray(got), expected, rtol=2.0e-13, atol=2.0e-13)
+
+    hlo = jax.jit(lambda x: _rotate_open_spin_centroid_operator(
+        x, np.asarray(U))).lower(jnp.asarray(spatial)).compiler_ir(
+            dialect='hlo').as_hlo_text().lower()
+    assert 'dot(' not in hlo
+
+
+def test_scalar_operator_rotation_is_explicit_and_matches_dense_reference():
+    """Scalar parent-k transport has the same dot-free lowering contract."""
+    import jax
+    import jax.numpy as jnp
+
+    from symmetry_maps.maps import _rotate_open_spin_centroid_operator
+
+    rng = np.random.default_rng(2026090201)
+    spatial = (rng.standard_normal((5, 1, 7, 1, 9))
+               + 1j * rng.standard_normal((5, 1, 7, 1, 9)))
+    angle = rng.uniform(-np.pi, np.pi, size=5)
+    U = np.exp(1j * angle)[:, None, None]
+    expected = np.einsum(
+        'kac,kcmdn,kbd->kambn', U, spatial, np.conj(U), optimize=True)
+    got = _rotate_open_spin_centroid_operator(
+        jnp.asarray(spatial), np.asarray(U))
+    np.testing.assert_allclose(
+        np.asarray(got), expected, rtol=2.0e-13, atol=2.0e-13)
+
+    hlo = jax.jit(lambda x: _rotate_open_spin_centroid_operator(
+        x, np.asarray(U))).lower(jnp.asarray(spatial)).compiler_ir(
+            dialect='hlo').as_hlo_text().lower()
+    assert 'dot(' not in hlo
+
+
 @pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])
 def test_rectangular_ct_uses_distinct_bases_explicit_tc_partner_and_padding(
         px, py):
