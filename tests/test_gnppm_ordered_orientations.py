@@ -625,7 +625,8 @@ def test_mpa_nonhermitian_fit_and_sigma_close_the_imaginary_contour():
                 mpa_pade_fit.eval_mpa_model(
                     Omega_f[:, mu, nu], B_f[:, mu, nu], dense_z,
                     B_odd=D_f[:, mu, nu]))
-    assert np.max(np.abs(fitted_dense - exact_dense)) < 1.0e-9
+    dense_error = np.max(np.abs(fitted_dense - exact_dense))
+    assert dense_error < 1.0e-9
 
     E = 0.04
     direct = sum(
@@ -638,7 +639,8 @@ def test_mpa_nonhermitian_fit_and_sigma_close_the_imaginary_contour():
             _residue_for_space("cond", B_f[p], D_f[p]),
             _residue_for_space("val", B_f[p], D_f[p]), Omega_f[p], E)
         for p in range(n_p))
-    assert np.max(np.abs(fitted - direct)) < 1.0e-9
+    sigma_error = np.max(np.abs(fitted - direct))
+    assert sigma_error < 1.0e-9
 
     # RED TWIN: Hermitising W(i nu) removes its odd half and makes R+=R-=B.
     W_hermitian = 0.5 * (W_positive + _adj(W_positive))
@@ -650,14 +652,21 @@ def test_mpa_nonhermitian_fit_and_sigma_close_the_imaginary_contour():
     Om_h = Om_h.reshape(nmu, nmu, n_p).transpose(2, 0, 1)
     B_h = B_h.reshape(nmu, nmu, n_p).transpose(2, 0, 1)
     D_h = D_h.reshape(nmu, nmu, n_p).transpose(2, 0, 1)
-    assert np.max(np.abs(D_h)) < 1.0e-12
+    hermitian_d = np.max(np.abs(D_h))
+    assert hermitian_d < 1.0e-12
     hermitian_sigma = sum(
         _sigma_closed_form(
             psi, eps, nocc,
             _residue_for_space("cond", B_h[p], D_h[p]),
             _residue_for_space("val", B_h[p], D_h[p]), Om_h[p], E)
         for p in range(n_p))
-    assert np.max(np.abs(hermitian_sigma - direct)) > 1.0e-3
+    negative_control = np.max(np.abs(hermitian_sigma - direct))
+    assert negative_control > 1.0e-3
+    print(
+        "MPA_ORDERED_CLOSURE "
+        f"dense_W={dense_error:.12e} sigma_contour={sigma_error:.12e} "
+        f"hermitized_D={hermitian_d:.12e} "
+        f"hermitized_sigma_shift={negative_control:.12e}")
 
 
 def test_broken_tr_sigma_table_prints_the_measured_odd_contribution(tmp_path):
