@@ -19,21 +19,35 @@ current density `ψ†α^iψ`).
 
 ## 1. Status in one table
 
-> **Implementation status (2026-09-01).** This table describes
-> `integ/bispinor-static-cleanup-2026-09-01@3897f89f` (a branch, not
+> **Implementation status (2026-09-02).** This table describes
+> `lane/bisp-l-dials-envelope-2026-09-01@0dab1b89` (a branch, not
 > `origin/main`): lane B collapsed the two packed modes into one and made the
 > Γ-cell completion the default (`41e2b6b2`); lane C then routed
 > `bare_transverse` through the same packed operator **inside the slab
-> one-shot static-COHSEX envelope only** (`ce3dedcc`, claim 581). On
+> one-shot static-COHSEX envelope only** (`ce3dedcc`, claim 581); lane L then
+> removed every deck dial that could turn a head off or move a route. On
 > `origin/main@8b6e3cc7` there are still two packed modes, the headless one
 > is the defect the ruling names, and `bare_transverse` has its own Σ owner
 > everywhere.
+>
+> **What lane L changed in this table.** `bispinor_tt_head_correction` is no
+> longer a deck key, so the overlay row below has no deck route: the packed
+> Γ-cell completion is now the ONLY producer of a transverse q→0 head
+> anywhere in the tree, and a deck outside its envelope gets none. That is
+> stated in the run record rather than left to be inferred — the incumbent
+> route now writes a `Photon head` line saying the charge head is the scalar
+> band-diagonal one and that there is no transverse q=Γ head, and prints the
+> same boxed `WARNING -- DEBUG` banner as the packed route under
+> `head_correction = off`. `head_correction = no_local_fields` is refused on
+> every bispinor deck, and an explicit `restart = true` is refused on a slab
+> bispinor COHSEX deck (an unnamed one is set to `false`), because either
+> value used to change the head mechanism by itself.
 
 | self-energy channel | frequency dependence | Γ-cell head | deck route | status |
 |---|---|---|---|---|
 | charge exchange `Σ_X` (CC) | none | `⟨v⟩_mBZ`, band-diagonal (§3.1) | every mode | production |
 | charge correlation `Σ_SX+Σ_COH` / `Σ_c(ω)` (CC) | static, GN-PPM (two samples), HL-PPM, MPA | scalar `W_h(ω)` from `S_eff(ω)` (§3) | `head_correction = full` | production |
-| bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | **inside the packed envelope**: `⟨D_TT⟩` from the Γ-cell completion, always on. **Outside it**: the `−⟨v P^T⟩_mBZ` tensor slot overlay (§2.1) | inside: `bispinor_gw = bare_transverse` + the §2 envelope. Outside: `bispinor_tt_head_correction = true` | both implemented; the overlay is default off and **refused** inside the envelope |
+| bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | **inside the packed envelope**: `⟨D_TT⟩` from the Γ-cell completion, always on. **Outside it**: none — the `−⟨v P^T⟩_mBZ` tensor slot overlay (§2.1) survives as library code with no deck route | inside: `bispinor_gw = bare_transverse` + the §2 envelope. Outside: no deck key since 2026-09-01 | completion implemented and always on; the overlay is unreachable from a deck and **refused** on either packed route |
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | *unscreened* TT via the same packed operator | **static only** | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; Hall **refused** (§4) | `bispinor_gw = bare_transverse` inside the §2 envelope | experimental, slab, one shot; body byte-identical to the incumbent route |
 | retarded / dynamic photon `D^{IJ}(ω)` | — | — | none | **does not exist** |
@@ -41,7 +55,11 @@ current density `ψ†α^iψ`).
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
 with bispinors always carries the Γ-cell head; `head_correction = off` is a
 debug setting. A mode whose envelope forbids the head is a defect, not a
-calculation.
+calculation. Since 2026-09-02 the grammar enforces it: a bispinor deck has
+exactly two head values (`full`, `off`), `off` is labelled `WARNING -- DEBUG`
+on **both** routes, and no other key — not
+`bispinor_tt_head_correction`, not `restart`, not `no_local_fields` — can
+reach a different head.
 
 Two facts follow from the table and are easy to miss:
 
@@ -76,20 +94,22 @@ envelope.
 
 | | inside the envelope | outside it |
 |---|---|---|
-| envelope | `bispinor`, `compute_mode = cohsex`, `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim = 2`, `head_correction ∈ {full, off}`, `restart = false` | bulk, the dynamic modes, `x_only`, self-consistent — everything else |
+| envelope | `bispinor`, `compute_mode = cohsex`, `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim = 2`, `head_correction ∈ {full, off}`, `restart = false` (unnamed → derived false; explicit true refuses) | bulk, the dynamic modes, `x_only`, self-consistent — everything else |
 | who contracts `Σ^B` | `gw.photon_sigma`, the TT part of the sixteen-block `Σ_X` | `gw.sigma_x_bispinor`, the nine bare TT tiles |
-| the TT Γ-cell head | `⟨D_TT⟩` out of the Γ-cell completion, always on | the §2.1 overlay, `bispinor_tt_head_correction = true`, default off |
+| the TT Γ-cell head | `⟨D_TT⟩` out of the Γ-cell completion, always on | **none** — the §2.1 overlay lost its deck key on 2026-09-01, and the run record says so |
 | status | experimental; body byte-identical to the incumbent (below) | **the only certified route**, and unchanged |
 
 The route is a predicate with a reason attached,
-`gw_config.packed_bare_transverse_route(config) -> (taken, reason)`, and the
-driver writes that reason into the run record as the `Photon route` line —
-the two routes differ in the q→0 head mechanism, so which one ran is a fact a
-later reader needs. `bispinor_tt_head_correction` is deliberately **not** in
-the predicate: a head dial must not move a route, so a deck asking for the
-overlay inside the envelope is refused
-(`GATE packed_bare_transverse_tt_head_double_count`) rather than quietly
-routed elsewhere.
+`gw_config.packed_bare_transverse_route(config) -> (taken, reason)`, reading
+the same nine-row `packed_static_envelope` table the screened mode's refusal
+walks, and the driver writes that reason into the run record as the
+`Photon route` line — the two routes differ in the q→0 head mechanism, so
+which one ran is a fact a later reader needs. No head dial moves the route:
+`bispinor_tt_head_correction` is gone as a deck key (a hand-built `True` on
+either packed route is refused,
+`GATE packed_bare_transverse_tt_head_double_count`), `no_local_fields` is
+refused rather than routed, and `restart = true` is refused on this deck
+class rather than routed.
 
 **Measured** (`reports/bisp_c_bare_as_packed_2026-09-01`, MoS2 3×3, 270
 states, claim 581): with the head off the two routes are **byte-identical** —
@@ -131,13 +151,24 @@ The point `K = 0` is undefined in every block, but for different reasons:
 
 ### 2.1 The bare TT head
 
-This is the **incumbent route's** TT head. Inside the packed envelope of §2
+This **was** the incumbent route's TT head. Inside the packed envelope of §2
 the same physics arrives as `⟨D_TT⟩` from the Γ-cell completion instead, and
 asking for this overlay there is refused
 (`GATE packed_bare_transverse_tt_head_double_count`) — the two would double
 count.
 
-`bispinor_tt_head_correction = true` replaces the `q = Γ, G = 0` slot of the
+> **Status (2026-09-02).** `bispinor_tt_head_correction` is no longer a deck
+> key: heads are always on, so a dial that turns one off is not a dial
+> (owner ruling 2026-09-01). The code below survives as
+> `gw.v_q_bispinor._tt_head_tensor`, wired to `False`, for the incumbent
+> non-packed route that lane N is retiring; it is reachable only from a
+> hand-built config. **Consequence: a bispinor deck outside the packed
+> envelope — bulk, dynamic, `x_only`, self-consistent — carries NO transverse
+> q→0 head at all**, and its run record now says so on the `Photon head`
+> line. The section is kept because the identities below are the gates the
+> packed completion's `⟨D_TT⟩` is checked against.
+
+Setting the flag replaces the `q = Γ, G = 0` slot of the
 nine TT `V` tiles by `−T_{ij}/Ω_{\rm cell}`, where `T` is sampled by the
 same mini-BZ estimator that produces `⟨v⟩` for the charge head
 (`vcoul.minibz_transverse_head_avg`, weighted by `P^T` instead of `1`).
