@@ -332,6 +332,33 @@ of `6.8×10^{-6}` bohr⁻¹, i.e. `|C_{eff}| ≈ 6×10^{-3}`, sign- and
 magnitude-unstable with band count (sandbox
 `reports/cri3_full_ct_hall_head_2026-08-26`). That is the expected zero.
 
+For a Chern-trivial insulator the CT sector of the Gamma-cell head is bounded
+by symmetry and by the current vertices, not assumed away. The surviving CT
+moment is the crossed first moment ⟨W^{0i} q_a⟩ with W^{0i} = D_00 R^{0i} D_ii
+to first order, and R^{0i}(q) = iε σ_H q + q_a q_b S^{0i,ab} + O(q³). The Hall
+term is quantized (zero for C = 0). The quadratic coefficient is the static
+linear magnetoelectric response (a charge density induced at O(q²) by a vector
+potential is ∇·(α_ME B)), which requires both inversion and time reversal
+broken; monolayer CrI3 is D3d and has inversion, so it vanishes and CT starts
+at O(q³), giving W^{0i} ~ (1/q)·q³·(1/q) = O(q) and a moment O(q_cell²) ∝
+1/N_k, which is body-discretization order. Without inversion, W^{0i} ~
+(1/q)·q²·(1/q) = O(1) survives averaging exactly like the CC screening
+correction (0.66 eV on the CrI3 gap); its size relative to that is (Zα)² for
+two current vertices (≲ 0.15 for iodine 5p states) times α_ME, whose natural
+ceiling is α_FS/2 (axion strength) and whose ordinary value is a hundred times
+smaller. The ceiling is therefore about 0.66 eV × 0.15 × 0.0036 ≈ 0.4 meV for
+a heavy-element, inversion-broken, axion-strength magnet, tens of μeV for
+ordinary magnetoelectrics, and zero for anything centrosymmetric. The finite-q
+body is different: all sixteen W^{IJ}(q≠0) blocks, CT included, enter Σ at
+first order and are computed by the packed Dyson; their size on CrI3 was
+measured once (June 2026 supermatrix, screened versus unscreened Breit under
+10 μeV, with the −2F shortcut) and is (Zα)²-suppressed.
+
+The physically largest transverse screening channel in a ferromagnet, the
+Goldstone-enhanced transverse spin susceptibility, is a ladder (vertex) effect
+outside RPA; the bubble gives only M/Δ_exchange, α²-suppressed in the TT
+response, and the code's ladder screening (`w_bse`) is charge-only.
+
 The time-reversal-odd photon physics that is *not* quantized, the
 finite-frequency Hall/Kerr response `σ_{xy}(ω)` and the antisymmetric part of
 the TT response, lives at `ω ≠ 0` and at `O(q²)`. Neither is present in the
