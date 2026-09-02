@@ -136,7 +136,9 @@ def _residue_for_space(space: str, B_q, B_odd_q=None):
     (occupied) A-space the −Ω one (derivation §4, verified against the
     imaginary-axis contour in ``tests/test_gnppm_ordered_orientations.py``).
     With ``B_odd_q=None`` both branches get ``B_q`` and nothing about the
-    incumbent path changes, not even the object identity.
+    incumbent path changes, not even the object identity.  A zero-valued
+    ``B_odd_q`` (the explicit broken-TR debug A/B arm) likewise gives
+    ``R_+ = R_- = B_q`` while retaining the odd-channel observability seam.
     """
     if space not in ("cond", "val"):
         raise ValueError(
@@ -442,7 +444,8 @@ def fit_ppm(
          n_mu_logical=int(n_mu_logical),
          q_neg_index=q_neg_index,
          coarsen_extreme_tails=bool(coarsen_extreme_tails),
-         ordered_orientations=bool(ordered_orientations))
+         ordered_orientations=bool(ordered_orientations),
+         print_fn=print_fn if print_fn is not None else print)
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(
