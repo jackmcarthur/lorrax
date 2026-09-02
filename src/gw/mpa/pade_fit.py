@@ -802,12 +802,35 @@ def _residue_lstsq(x_hat, w, b_hat, valid, x_max, Omega, rcond):
     return B
 
 
-def eval_mpa_model(Omega, B, z, valid=None):
-    """Evaluate ``sum_p 2 Omega_p B_p / (z**2 - Omega_p**2)``.
+def _odd_residue_lstsq(z, w_odd, Omega, valid, rcond):
+    """Fit the ordered-pair half-difference at fixed MPA poles.
+
+    The non-Hermitian model is
+
+    ``Wc(z) = sum_p [2 Omega_p B_p + 2 z D_p] / (z**2-Omega_p**2)``.
+
+    Once the even samples have fixed ``Omega`` and ``B``, this is one
+    element-wise least-squares solve for ``D`` over the same sample grid.
+    No matrix factorisation or Hermitian completion enters the solve.
+    """
+    denom = z[:, None] ** 2 - Omega[None, :] ** 2
+    safe = jnp.where(jnp.abs(denom) > 0, denom, 1.0)
+    matrix = jnp.where(
+        valid[None, :], 2.0 * z[:, None] / safe, 0.0 + 0.0j)
+    D, _, _, _ = _solve_normalised(
+        matrix, w_odd, rcond, equilibrate=False)
+    return jnp.where(valid, D, 0.0 + 0.0j)
+
+
+def eval_mpa_model(Omega, B, z, valid=None, B_odd=None):
+    """Evaluate the even or ordered two-residue MPA model.
 
     ``z`` broadcasts against a trailing pole axis, so this works for a
     single element's pole set against a vector of frequencies and, under
-    ``vmap``, for a batch.
+    ``vmap``, for a batch.  ``B_odd=None`` preserves the incumbent
+    ``sum_p 2 Omega_p B_p/(z**2-Omega_p**2)`` path exactly.  Otherwise
+    ``B_odd = (R_+ - R_-)/2`` supplies the additional odd numerator
+    ``2 z B_odd``.
     """
 
     om = jnp.asarray(Omega, dtype=jnp.complex128)
@@ -817,7 +840,13 @@ def eval_mpa_model(Omega, B, z, valid=None):
         b = jnp.where(jnp.asarray(valid), b, 0.0 + 0.0j)
     denom = zz[..., None] ** 2 - om ** 2
     safe = jnp.where(jnp.abs(denom) > 0, denom, 1.0)
-    terms = jnp.where(jnp.abs(denom) > 0, 2.0 * om * b / safe, 0.0 + 0.0j)
+    numerator = 2.0 * om * b
+    if B_odd is not None:
+        d = jnp.asarray(B_odd, dtype=jnp.complex128)
+        if valid is not None:
+            d = jnp.where(jnp.asarray(valid), d, 0.0 + 0.0j)
+        numerator = numerator + 2.0 * zz[..., None] * d
+    terms = jnp.where(jnp.abs(denom) > 0, numerator / safe, 0.0 + 0.0j)
     return jnp.sum(terms, axis=-1)
 
 
@@ -826,6 +855,8 @@ def fit_mpa_poles(
     z_samples,
     n_p,
     *,
+    W_negative_samples=None,
+    return_odd=False,
     guards=None,
     refit_after_guards=True,
     rcond=1.0e-13,
@@ -839,6 +870,16 @@ def fit_mpa_poles(
     W_samples
         ``(2*n_p,)`` complex128 -- ``W_c(z_j)`` for one ISDF element.
         Under ``jax.vmap`` this is the mapped axis.
+    W_negative_samples
+        Optional ``(2*n_p,)`` values of the SAME ordered element at
+        ``-z_j``.  When supplied, the existing pole solve consumes the
+        algebraic even half and a fixed-pole least-squares solve retains the
+        odd half as ``B_odd=(R_+-R_-)/2``.  These values are not inferred by
+        Hermitising ``W_samples``.
+    return_odd
+        Return ``B_odd`` as a fourth result.  Requires
+        ``W_negative_samples``.  The default three-result API and arithmetic
+        remain unchanged for every incumbent caller.
     z_samples
         ``(2*n_p,)`` complex128 -- the sample grid, shared across a tile.
         Build it with ``sampling.double_parallel_grid``.
@@ -871,7 +912,7 @@ def fit_mpa_poles(
 
     Returns
     -------
-    ``(Omega_p, B_p, diag)``
+    ``(Omega_p, B_p, diag)`` or ``(Omega_p, B_p, B_odd_p, diag)``
         ``Omega_p`` ``(n_p,)`` complex128, ascending in ``Re Omega``;
         ``B_p`` ``(n_p,)`` complex128, zero on pruned poles;
         ``diag`` a dict of jax arrays (a pytree, so it survives ``vmap``)
@@ -881,12 +922,25 @@ def fit_mpa_poles(
 
     _require_x64()
     _check_sample_support(W_samples, z_samples, n_p)
+    if return_odd and W_negative_samples is None:
+        raise ValueError(
+            "return_odd=True requires W_negative_samples at -z")
+    if W_negative_samples is not None:
+        _check_sample_support(W_negative_samples, z_samples, n_p)
     cfg = _resolve_guards(guards)
     _check_eig_mode(eig)
     _check_solve_mode(solve)
     n = int(n_p)
 
-    w = jnp.asarray(W_samples, dtype=jnp.complex128)
+    w_positive = jnp.asarray(W_samples, dtype=jnp.complex128)
+    if W_negative_samples is None:
+        w = w_positive
+        w_odd = None
+    else:
+        w_negative = jnp.asarray(
+            W_negative_samples, dtype=jnp.complex128)
+        w = 0.5 * (w_positive + w_negative)
+        w_odd = 0.5 * (w_positive - w_negative)
     z = jnp.asarray(z_samples, dtype=jnp.complex128)
     x, x_max = _x_normalisation(z)
     x_hat = x / x_max.astype(jnp.complex128)
@@ -1015,9 +1069,15 @@ def fit_mpa_poles(
         refit_performed = jnp.zeros((), dtype=bool)
 
     # --- Stage 6: achieved residual on the fitted samples.
-    model = eval_mpa_model(Omega, B, z, valid=valid)
-    resid = jnp.abs(model - w)
-    w_scale = jnp.maximum(jnp.max(jnp.abs(w)), jnp.finfo(jnp.float64).tiny)
+    B_odd = None
+    if w_odd is not None:
+        B_odd = _odd_residue_lstsq(z, w_odd, Omega, valid, rcond)
+    model = eval_mpa_model(
+        Omega, B, z, valid=valid, B_odd=B_odd)
+    residual_target = w if w_odd is None else w_positive
+    resid = jnp.abs(model - residual_target)
+    w_scale = jnp.maximum(
+        jnp.max(jnp.abs(residual_target)), jnp.finfo(jnp.float64).tiny)
 
     diag = {
         "valid": valid,
@@ -1060,6 +1120,8 @@ def fit_mpa_poles(
         "rsd_eq28": (
             jnp.sqrt(jnp.sum(resid ** 2) / (2.0 * n - 1.0)) / w_scale),
     }
+    if return_odd:
+        return Omega, B, B_odd, diag
     return Omega, B, diag
 
 
@@ -1068,6 +1130,8 @@ def fit_mpa_poles_batched(
     z_samples,
     n_p,
     *,
+    W_negative_tile=None,
+    return_odd=False,
     guards=None,
     refit_after_guards=True,
     rcond=1.0e-13,
@@ -1092,16 +1156,32 @@ def fit_mpa_poles_batched(
             "case: W_tile.ndim == 2, i.e. (n_elements, 2*n_p); reshape a "
             "(q, mu, nu, 2*n_p) tensor to two axes before calling.")
 
-    def _one(w_row):
+    if W_negative_tile is None:
+        def _one(w_row):
+            return fit_mpa_poles(
+                w_row, z_samples, n_p, guards=guards,
+                refit_after_guards=refit_after_guards, rcond=rcond, eig=eig,
+                solve=solve, return_odd=return_odd)
+
+        return jax.vmap(_one)(tile)
+
+    negative = jnp.asarray(W_negative_tile, dtype=jnp.complex128)
+    if negative.shape != tile.shape:
+        raise ValueError(
+            "W_negative_tile must have the same shape as W_tile; got "
+            f"{tuple(negative.shape)} and {tuple(tile.shape)}")
+
+    def _one_ordered(w_row, w_negative_row):
         return fit_mpa_poles(
-            w_row, z_samples, n_p, guards=guards,
-            refit_after_guards=refit_after_guards, rcond=rcond, eig=eig,
-            solve=solve)
+            w_row, z_samples, n_p,
+            W_negative_samples=w_negative_row, return_odd=return_odd,
+            guards=guards, refit_after_guards=refit_after_guards,
+            rcond=rcond, eig=eig, solve=solve)
 
-    return jax.vmap(_one)(tile)
+    return jax.vmap(_one_ordered)(tile, negative)
 
 
-def synthesize_w_samples(Omega, B, z_samples):
+def synthesize_w_samples(Omega, B, z_samples, B_odd=None):
     """Host-side ``W_c(z_j)`` from a known pole set.  Test/validation aid.
 
     Uses the same model as ``eval_mpa_model`` but in numpy, so a test can
@@ -1122,4 +1202,11 @@ def synthesize_w_samples(Omega, B, z_samples):
             "synthesized pole, so W_c is infinite there. FALSE case: no "
             "z_j**2 equals any Omega_p**2 -- give the poles a nonzero "
             "width, which the physical model has anyway.")
-    return np.sum(2.0 * om[None, :] * b[None, :] / denom, axis=1)
+    numerator = 2.0 * om[None, :] * b[None, :]
+    if B_odd is not None:
+        d = np.asarray(B_odd, dtype=np.complex128)
+        if d.shape != om.shape:
+            raise ValueError(
+                "GATE odd_residue_shapes: B_odd must match Omega and B")
+        numerator = numerator + 2.0 * z[:, None] * d[None, :]
+    return np.sum(numerator / denom, axis=1)

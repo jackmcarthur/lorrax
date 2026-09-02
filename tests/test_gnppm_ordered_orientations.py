@@ -36,6 +36,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 from gw import minimax_screening as ms  # noqa: E402
 from gw import w_isdf  # noqa: E402
 from gw.mpa import evaluator as mpa_evaluator  # noqa: E402
+from gw.mpa import pade_fit as mpa_pade_fit  # noqa: E402
 from gw.ppm_sigma import _residue_for_space  # noqa: E402
 from gw.screening import assert_probe_chi_reuse_supported  # noqa: E402
 from gw.wavefunction_bundle import (  # noqa: E402
@@ -568,6 +569,95 @@ def test_sigma_assigns_R_plus_to_empty_states_and_R_minus_to_occupied():
     B, D = 0.5 * (R_plus + R_minus), 0.5 * (R_plus - R_minus)
     np.testing.assert_allclose(_residue_for_space("cond", B, D), R_plus)
     np.testing.assert_allclose(_residue_for_space("val", B, D), R_minus)
+
+
+def test_mpa_nonhermitian_fit_and_sigma_close_the_imaginary_contour():
+    """Ordered MPA samples retain D through the fit and Sigma branches.
+
+    The pole model is sampled at four imaginary frequencies, reconstructed
+    on a dense imaginary-axis grid, and consumed by the same R+/R- branch
+    algebra as production.  Hermitising those samples is the red twin.
+    """
+    rng = np.random.default_rng(20260903)
+    nmu, nb, nocc, n_p = 3, 4, 2, 2
+    psi, _ = np.linalg.qr(
+        rng.normal(size=(nmu, nb)) + 1j * rng.normal(size=(nmu, nb)))
+    eps = np.array([-1.1, -0.55, 0.65, 1.25])
+    poles = np.array([0.9, 1.8])
+
+    def hermitian():
+        value = (rng.normal(size=(n_p, nmu, nmu))
+                 + 1j * rng.normal(size=(n_p, nmu, nmu)))
+        return 0.5 * (value + _adj(value))
+
+    R_plus, R_minus = hermitian(), hermitian()
+    B = 0.5 * (R_plus + R_minus)
+    D = 0.5 * (R_plus - R_minus)
+    z_fit = 1j * np.array([0.22, 0.61, 1.37, 3.1])
+
+    def model(z, b=B, d=D):
+        zz = np.asarray(z, np.complex128)
+        den = zz[:, None, None, None] ** 2 - poles[None, :, None, None] ** 2
+        num = (2.0 * poles[None, :, None, None] * b[None]
+               + 2.0 * zz[:, None, None, None] * d[None])
+        return np.sum(num / den, axis=1)
+
+    W_positive = model(z_fit)
+    W_negative = model(-z_fit)
+    positive_tile = W_positive.transpose(1, 2, 0).reshape(nmu * nmu, -1)
+    negative_tile = W_negative.transpose(1, 2, 0).reshape(nmu * nmu, -1)
+    Omega_f, B_f, D_f, diagnostics = mpa_pade_fit.fit_mpa_poles_batched(
+        jnp.asarray(positive_tile), jnp.asarray(z_fit), n_p,
+        W_negative_tile=jnp.asarray(negative_tile), return_odd=True)
+    Omega_f, B_f, D_f, diagnostics = jax.device_get(
+        (Omega_f, B_f, D_f, diagnostics))
+    Omega_f = np.asarray(Omega_f).reshape(nmu, nmu, n_p).transpose(2, 0, 1)
+    B_f = np.asarray(B_f).reshape(nmu, nmu, n_p).transpose(2, 0, 1)
+    D_f = np.asarray(D_f).reshape(nmu, nmu, n_p).transpose(2, 0, 1)
+    assert np.all(np.asarray(diagnostics["valid"]))
+
+    dense_z = 1j * np.linspace(-40.0, 40.0, 2001)
+    exact_dense = model(dense_z)
+    fitted_dense = np.empty_like(exact_dense)
+    for mu in range(nmu):
+        for nu in range(nmu):
+            fitted_dense[:, mu, nu] = np.asarray(
+                mpa_pade_fit.eval_mpa_model(
+                    Omega_f[:, mu, nu], B_f[:, mu, nu], dense_z,
+                    B_odd=D_f[:, mu, nu]))
+    assert np.max(np.abs(fitted_dense - exact_dense)) < 1.0e-9
+
+    E = 0.04
+    direct = sum(
+        _sigma_contour(
+            psi, eps, R_plus[p], R_minus[p], poles[p], E)
+        for p in range(n_p))
+    fitted = sum(
+        _sigma_closed_form(
+            psi, eps, nocc,
+            _residue_for_space("cond", B_f[p], D_f[p]),
+            _residue_for_space("val", B_f[p], D_f[p]), Omega_f[p], E)
+        for p in range(n_p))
+    assert np.max(np.abs(fitted - direct)) < 1.0e-9
+
+    # RED TWIN: Hermitising W(i nu) removes its odd half and makes R+=R-=B.
+    W_hermitian = 0.5 * (W_positive + _adj(W_positive))
+    herm_tile = W_hermitian.transpose(1, 2, 0).reshape(nmu * nmu, -1)
+    Om_h, B_h, D_h, _ = mpa_pade_fit.fit_mpa_poles_batched(
+        jnp.asarray(herm_tile), jnp.asarray(z_fit), n_p,
+        W_negative_tile=jnp.asarray(herm_tile), return_odd=True)
+    Om_h, B_h, D_h = map(np.asarray, jax.device_get((Om_h, B_h, D_h)))
+    Om_h = Om_h.reshape(nmu, nmu, n_p).transpose(2, 0, 1)
+    B_h = B_h.reshape(nmu, nmu, n_p).transpose(2, 0, 1)
+    D_h = D_h.reshape(nmu, nmu, n_p).transpose(2, 0, 1)
+    assert np.max(np.abs(D_h)) < 1.0e-12
+    hermitian_sigma = sum(
+        _sigma_closed_form(
+            psi, eps, nocc,
+            _residue_for_space("cond", B_h[p], D_h[p]),
+            _residue_for_space("val", B_h[p], D_h[p]), Om_h[p], E)
+        for p in range(n_p))
+    assert np.max(np.abs(hermitian_sigma - direct)) > 1.0e-3
 
 
 def test_broken_tr_sigma_table_prints_the_measured_odd_contribution(tmp_path):

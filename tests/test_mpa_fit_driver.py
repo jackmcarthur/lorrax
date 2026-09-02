@@ -59,6 +59,7 @@ _N_MU = 24
 _N_P = 4
 _OMEGA_M = 4.0
 _W_NAME = "W_qmunu_omega"
+_W_NEGATIVE_NAME = "W_qmunu_minus_omega"
 
 #: The certification a hand-driven ``finalize_fit_store`` must carry
 #: since 2026-08-15 — a store the validator would refuse cannot be
@@ -422,6 +423,54 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     # complex128 round-trips exactly, so the disk leg must cost nothing.
     assert d_omega < 1.0e-7
     assert d_b < 1.0e-6
+
+
+def test_ordered_end_to_end_stores_and_recovers_the_odd_residue(
+        tmp_path, mesh_xy):
+    """The disk driver fits W(z), W(-z) through one element-wise kernel."""
+    tables, verdict, n_mu = _geometry()
+    z = _protocol_grid()
+    Omega, B = _planted_field(_N_P, _N_Q_IBZ, n_mu)
+    D = (0.17 - 0.09j) * B
+
+    def synth(points):
+        zz = np.asarray(points, np.complex128)
+        denom = zz[:, None, None, None, None] ** 2 - Omega[None] ** 2
+        numerator = (2.0 * Omega[None] * B[None]
+                     + 2.0 * zz[:, None, None, None, None] * D[None])
+        return np.sum(numerator / denom, axis=1)
+
+    positive, negative = synth(z), synth(-z)
+    line = np.array([0] * _N_P + [1] * _N_P, dtype=np.int32)
+    sample_path = tmp_path / "W_ordered.h5"
+    common = dict(
+        n_omega=2 * _N_P, n_q_on_disk=_N_Q_IBZ, n_mu=n_mu,
+        tables=tables, sampling=_SAMPLING, omega_line=line,
+        closure_verdict=verdict,
+        provenance={"deck": "synthetic-ordered-mpa-driver"})
+    MS.allocate_w_omega(
+        str(sample_path), _W_NAME, omega=z, **common)
+    MS.allocate_w_omega(
+        str(sample_path), _W_NEGATIVE_NAME, omega=-z, **common)
+    for index in range(2 * _N_P):
+        MS.write_w_slab(
+            str(sample_path), _W_NAME, index, positive[index], ready=True)
+        MS.write_w_slab(
+            str(sample_path), _W_NEGATIVE_NAME, index, negative[index],
+            ready=True)
+
+    fit_path = tmp_path / "fit_ordered.h5"
+    ledger, report = fit_driver.run_fit_driver(
+        str(sample_path), _W_NAME, str(fit_path), z, _N_P,
+        w_negative_name=_W_NEGATIVE_NAME, mesh_xy=mesh_xy)
+    Omega_f, B_f, D_f = MS.read_poles(
+        str(fit_path), include_odd=True)
+    assert ledger["ordered_residues"]
+    assert report["ordered_residues"]
+    assert D_f is not None
+    assert np.max(np.abs(Omega_f - Omega)) < 1.0e-7
+    assert np.max(np.abs(B_f - B)) < 1.0e-6
+    assert np.max(np.abs(D_f - D)) < 1.0e-6
 
 
 def test_thiele_end_to_end_keeps_only_condition_payload(tmp_path, mesh_xy):

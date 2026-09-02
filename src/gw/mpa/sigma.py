@@ -14,6 +14,7 @@ from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import (SigmaOmegaResult,
+                          _residue_for_space,
                           assert_sharded_sigma_window_divides_mesh,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
@@ -22,10 +23,46 @@ from gw.sigma_plan import (resolve_delivered_plan_cache,
                            resolve_sigma_plan)
 from gw.wavefunction_bundle import (face_kernel_kwargs,
                                     projected_state_amplitude_envelope)
+from runtime.env_flags import env_bool
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             build_shared_sigma_windows,
                             summarize_sigma_poles)
+
+
+_DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
+
+
+def _resolve_mpa_odd_residue_debug(ordered_residues, *, print_fn=print):
+    """Resolve the shared GN/MPA odd-residue A/B switch for an MPA fit."""
+    enabled = env_bool(
+        _DEBUG_GN_ODD_RESIDUE_OFF_ENV, False, print_fn=print_fn)
+    if enabled and not bool(ordered_residues):
+        raise ValueError(
+            "GATE debug_gn_odd_residue_off_scope:\n"
+            f"  got:  {_DEBUG_GN_ODD_RESIDUE_OFF_ENV}=1 with an "
+            "MPA single-residue/TRS fit\n"
+            "  want: this debug switch only on a measured-broken-TR "
+            "ordered-residue MPA fit\n"
+            "  why:  a TRS MPA fit has no time-reversal-odd residue to "
+            "discard\n"
+            "  fix:   unset LORRAX_DEBUG_GN_ODD_RESIDUE_OFF")
+    if enabled:
+        print_fn(
+            "WARNING -- DEBUG: LORRAX_DEBUG_GN_ODD_RESIDUE_OFF=1; "
+            "measured-broken-TR MPA fit is discarding the "
+            "anti-Hermitian frequency-odd residue: D=0 and R+=R-=B. "
+            "This arm is for A/B diagnosis only, never production.")
+    return enabled
+
+
+def _geometry_residue(B, B_odd):
+    """A nonzero witness for either ordered residue, or incumbent ``B``."""
+    if B_odd is None:
+        return B
+    plus = B + B_odd
+    minus = B - B_odd
+    return jnp.where(jnp.abs(plus) > 0.0, plus, minus)
 
 
 def _bounded_pole_batch_size(value):
@@ -86,6 +123,7 @@ def _integrate_sigma_batches(
     mesh_xy,
     *,
     pole_batch_size,
+    odd_residue_off=False,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -170,7 +208,14 @@ def _integrate_sigma_batches(
     logical_tau_pairs = 0
     batch_size = int(pole_batch_size)
     sweep_started = False
-    for lo, Omega, B in batches:
+    max_b = max_d = 0.0
+    for lo, Omega, B, B_odd in batches:
+        if B_odd is not None:
+            max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
+            max_d = max(
+                max_d, float(jax.device_get(jnp.max(jnp.abs(B_odd)))))
+            if odd_residue_off:
+                B_odd = jnp.zeros_like(B_odd)
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
         for row in plan:
@@ -182,6 +227,7 @@ def _integrate_sigma_batches(
                 device_put_process_local(x, small)
                 for x in (pole_indices, bounds, phase_real))
             win = row.window
+            B_branch = _residue_for_space(row.space, B, B_odd)
             weight = getattr(row, "band_weight", None)
             if weight is None:
                 selector = jnp.asarray(win.mask_A)
@@ -196,7 +242,7 @@ def _integrate_sigma_batches(
                 prewarm_args = (
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
+                    row.E_A, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
@@ -228,7 +274,7 @@ def _integrate_sigma_batches(
                 sigma_tau = tau_kernel(
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
+                    row.E_A, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
@@ -238,7 +284,7 @@ def _integrate_sigma_batches(
             accumulator.end_window()
             n_sweeps += 1
             logical_tau_pairs += win.n_tau
-        del B, Omega
+        del B, B_odd, Omega
         gc.collect()
 
     sigma = strip_sigma_window(
@@ -249,6 +295,12 @@ def _integrate_sigma_batches(
         f"({n_poles} poles, batches of {batch_size}); "
         f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
+    if max_b or max_d:
+        ratio = max_d / max_b if max_b else np.inf
+        state = "DEBUG ODD OFF (D discarded)" if odd_residue_off else "enabled"
+        print_fn(
+            f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
+            f"max|D|/max|B|={ratio:.12e}")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
@@ -265,6 +317,7 @@ def integrate_sigma_store(
     mesh_xy,
     *,
     pole_batch_size=4,
+    odd_residue_off=False,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -282,17 +335,18 @@ def integrate_sigma_store(
     def batches(reader):
         for lo in range(0, int(n_poles), batch_size):
             hi = min(lo + batch_size, int(n_poles))
-            Omega, B = reader.read(
+            Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=True, return_sharded=True,
-                to_unit="Ry")
-            yield lo, Omega, B
-            del Omega, B
+                to_unit="Ry", include_odd=True)
+            yield lo, Omega, B, B_odd
+            del Omega, B, B_odd
             gc.collect()
 
     def run(reader):
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
-            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+            mesh_xy, pole_batch_size=batch_size,
+            odd_residue_off=odd_residue_off, print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -397,6 +451,9 @@ def compute_sigma_c_mpa_omega_grid(
         fit_src, expected_identity=fit_identity,
         expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
+    ordered_residues = bool(ledger["ordered_residues"])
+    odd_residue_off = _resolve_mpa_odd_residue_debug(
+        ordered_residues, print_fn=print_fn)
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     branches = _branches(
         wfns, omega_grid_ry, efermi_ry,
@@ -419,15 +476,17 @@ def compute_sigma_c_mpa_omega_grid(
             summaries = []
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
+                Omega, B, B_odd = reader.read(
                     slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
+                    to_unit="Ry", include_odd=True)
+                if B_odd is not None and odd_residue_off:
+                    B_odd = jnp.zeros_like(B_odd)
                 summaries.extend(summarize_sigma_poles(
-                    Omega, B, branches,
+                    Omega, _geometry_residue(B, B_odd), branches,
                     regularization_width_ry=regularization_width_ry,
                     edge_factor=edge_factor, pole_offset=lo,
                     occupation_window_threshold=occupation_window_threshold))
-                del Omega, B
+                del Omega, B, B_odd
                 gc.collect()
             plan, geometry = build_shared_sigma_windows(
                 summaries, branches,
@@ -467,6 +526,8 @@ def compute_sigma_c_mpa_omega_grid(
                     # certified product-only receipts survive the deletion.
                     "edge_factor": edge_factor,
                     "pole_batch_size": pole_batch_size,
+                    "ordered_residues": ordered_residues,
+                    "odd_residue_off": odd_residue_off,
                 })
             cached = load_complete_delivered_sigma_plan(
                 delivered_cache_path, request_fingerprint, branches)
@@ -482,20 +543,24 @@ def compute_sigma_c_mpa_omega_grid(
                 measured = [[] for _branch in branches]
                 for lo in range(0, n_poles, int(pole_batch_size)):
                     hi = min(lo + int(pole_batch_size), n_poles)
-                    Omega, B = reader.read(
+                    Omega, B, B_odd = reader.read(
                         slice(lo, hi), unfold=True, return_sharded=True,
-                        to_unit="Ry")
+                        to_unit="Ry", include_odd=True)
+                    if B_odd is not None and odd_residue_off:
+                        B_odd = jnp.zeros_like(B_odd)
                     for branch_index, branch in enumerate(branches):
+                        B_branch = _residue_for_space(
+                            branch.space, B, B_odd)
                         measured[branch_index].append(
                             measure_delivered_sigma_pole_batch(
-                                branch, Omega, B,
+                                branch, Omega, B_branch,
                                 regularization_width_ry=
                                 regularization_width_ry,
                                 pole_split_ry=
                                 product_geometry["pole_edge_ry"],
                                 state_amplitude=state_amplitudes,
                                 pole_offset=lo, mesh_xy=mesh_xy))
-                    del Omega, B
+                    del Omega, B, B_odd
                     gc.collect()
                 measures_by_branch = [
                     combine_delivered_sigma_pole_measures(rows)
@@ -538,7 +603,8 @@ def compute_sigma_c_mpa_omega_grid(
                         f"{window['runtime_noise_budget']:.6g}")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+            pole_batch_size=pole_batch_size,
+            odd_residue_off=odd_residue_off, print_fn=print_fn)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):

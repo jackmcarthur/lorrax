@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -12,7 +13,9 @@ from gw.mpa import evaluator, fit_driver, sample_plan
 
 
 _CHI = "chi_qmunu_z"
+_CHI_REFLECTED = "chi_qmunu_minus_conj_z"
 _WC = "Wc_qmunu_z"
+_WC_NEGATIVE = "Wc_qmunu_minus_z"
 
 
 def make_mpa_plan(config, quad, *, material_class):
@@ -130,11 +133,11 @@ def _to_wedge(value, q_idx, mesh_xy):
         out_sharding=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
-def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z):
+def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
     value = _to_wedge(value, q_idx, mesh_xy)
     value.block_until_ready()
     mpa_store.write_w_slab_collective(
-        path, _CHI, index, value, mesh_xy=mesh_xy,
+        path, name, index, value, mesh_xy=mesh_xy,
         global_shape=(n_z, q_idx.size, meta.n_rmu, meta.n_rmu))
     del value
 
@@ -206,6 +209,8 @@ def _solve_wc(
     config=None,
     print_fn=print,
     distrib_la_batched_route: str = "batch_reshard",
+    reflected_chi_name=None,
+    negative_wc_name=None,
 ):
     """THE DEFAULT ``wc_source``: Wc(z) = W(z) - V from the sampled chi.
 
@@ -226,6 +231,11 @@ def _solve_wc(
         finalize_iteration_head_sample,
     )
     from gw.w_isdf import solve_w
+
+    if (reflected_chi_name is None) != (negative_wc_name is None):
+        raise ValueError(
+            "_solve_wc requires reflected_chi_name and negative_wc_name "
+            "together")
 
     raw_z = np.asarray(z)
     if raw_z.ndim == 0 and np.issubdtype(raw_z.dtype, np.integer):
@@ -333,6 +343,28 @@ def _solve_wc(
             global_shape=shape)
         del chi, W, Wc
 
+        if reflected_chi_name is not None:
+            import jax
+
+            chi_reflected, _ = mpa_store.read_w_slab_collective(
+                sample_path, reflected_chi_name, index, mesh_xy=mesh_xy)
+            W_reflected = solve_w(
+                V, chi_reflected, meta, mesh_xy,
+                dyson_solver=dyson_solver,
+                distrib_la_batched_route=distrib_la_batched_route)
+            # The ordered sweep supplies W(-conj(z)) in the upper half
+            # plane.  Causality gives W(-z)=W(-conj(z))^dagger.  This is an
+            # independently sampled partner, not a Hermitisation of W(z).
+            Wc_negative = jnp.conj(jnp.swapaxes(W_reflected - V, -1, -2))
+            Wc_negative = jax.lax.with_sharding_constraint(
+                Wc_negative,
+                NamedSharding(mesh_xy, P(None, "x", "y")))
+            Wc_negative.block_until_ready()
+            mpa_store.write_w_slab_collective(
+                sample_path, negative_wc_name, index, Wc_negative,
+                mesh_xy=mesh_xy, global_shape=shape)
+            del chi_reflected, W_reflected, Wc_negative
+
     if head_response is None:
         return tuple(head_samples) if bgw_q0 is not None else None
     for index in range(int(n_z), len(head_response.omegas)):
@@ -365,9 +397,11 @@ def _solve_wc(
 
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
-              provenance=None, occupation_state=None, solve="loewner"):
+              provenance=None, occupation_state=None, solve="loewner",
+              w_negative_name=None):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
+        w_negative_name=w_negative_name,
         tile_bytes=tile_bytes, provenance=provenance,
         occupation_state=occupation_state, solve=solve)
 
@@ -428,7 +462,8 @@ def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *,
     material_class, sym,
     energy_reference, occupation_state, write_full, write_wedge,
-    static_gamma_override, gamma_row, kminq_rows, print_fn=print,
+    static_gamma_override, gamma_row, kminq_rows, write_reflected=None,
+    print_fn=print,
 ):
     """Evaluate every plan point through its route's kernel.
 
@@ -466,6 +501,9 @@ def _evaluate_samples(
             "asserting time reversal in the MPA consumer.")
     trs_allowed = bool(sym.trs_allowed)
     ordered = bool(not metal and not trs_allowed)
+    if ordered and write_reflected is None:
+        raise ValueError(
+            "measured-broken-TR MPA sampling requires a reflected writer")
     q_neg = None
     if ordered:
         from symmetry_maps import q_negation_index
@@ -501,11 +539,12 @@ def _evaluate_samples(
                     point["varpi"], omega_m,
                     rel_tol=config.minimax_config.target_error,
                     max_order=config.minimax_config.max_nodes)
-                chi = compute_chi0_contour_ordered(
+                chi, chi_reflected = compute_chi0_contour_ordered(
                     wfns, rule["t"], rule["h"],
                     np.asarray([point["z"]], dtype=np.complex128),
                     meta, mesh_xy, q_neg_index=q_neg,
-                    energy_reference=energy_reference)
+                    energy_reference=energy_reference,
+                    return_reflected=True)
             elif ordered:
                 raise ValueError(
                     "GATE mpa_broken_tr_existing_sample: a measured-broken-"
@@ -528,7 +567,11 @@ def _evaluate_samples(
                 and static_gamma_override is not None
             ):
                 chi = chi.at[0].set(static_gamma_override[0])
+            if ordered and point["character"] == "static":
+                chi_reflected = chi
             write_full(point, chi)
+            if ordered:
+                write_reflected(point, chi_reflected)
         elif point["role"].startswith("near"):
             # Evaluate the literal shifted coordinate.  The shift avoids an
             # interpolation point at the metal's singular origin; writing a
@@ -576,9 +619,10 @@ def _evaluate_samples(
                 energy_reference=float(occupation_state.mu_ry),
                 occupation_window_threshold=occ_window)
         elif ordered:
-            values = compute_chi0_contour_ordered(
+            values, reflected_values = compute_chi0_contour_ordered(
                 wfns, t, h, z, meta, mesh_xy, q_neg_index=q_neg,
-                energy_reference=energy_reference)
+                energy_reference=energy_reference,
+                return_reflected=True)
         else:
             tau = np.concatenate((1j * t, -1j * t))
             signs = np.concatenate((np.ones(t.size, np.int8),
@@ -589,8 +633,16 @@ def _evaluate_samples(
                 wfns, tau, weights, signs, z, meta, mesh_xy,
                 energy_reference=energy_reference)
         values = (values,) if z.size == 1 else values
-        for point, chi in zip(points, values):
+        if ordered:
+            reflected_values = (
+                (reflected_values,) if z.size == 1 else reflected_values)
+        else:
+            reflected_values = (None,) * len(points)
+        for point, chi, chi_reflected in zip(
+                points, values, reflected_values):
             write_full(point, chi)
+            if ordered:
+                write_reflected(point, chi_reflected)
 
 
 def build_mpa_fit(
@@ -658,6 +710,15 @@ def build_mpa_fit(
                 "single-frequency vhead/whead overrides")
 
     q_idx, tables, closure_verdict = _q_wedge(sym, centroid_indices, meta)
+    ordered = bool(
+        material_class == "insulator" and not bool(sym.trs_allowed))
+    if ordered and wc_source is not None:
+        raise ValueError(
+            "GATE mpa_ordered_ladder_unimplemented: measured-broken-TR "
+            "MPA currently requires the RPA Dyson source so both ordered "
+            "frequency partners can be solved; use screening_diagrams = "
+            "w_rpa or implement the reflected ladder source at the one "
+            "wc_source seam.")
     sample_path, fit_path = iteration_artifact_paths(root, label)
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
@@ -693,6 +754,19 @@ def build_mpa_fit(
         sample_path, _CHI, mode="w", **common)
     mpa_store.allocate_w_omega_collective(
         sample_path, _WC, mode="a", **common)
+    if ordered:
+        reflected_common = dict(common)
+        reflected_common.update(
+            omega=-np.conj(z_all),
+            omega_line=line)
+        mpa_store.allocate_w_omega_collective(
+            sample_path, _CHI_REFLECTED, mode="a", **reflected_common)
+        negative_common = dict(common)
+        negative_common.update(
+            omega=-z_all,
+            omega_line=line)
+        mpa_store.allocate_w_omega_collective(
+            sample_path, _WC_NEGATIVE, mode="a", **negative_common)
 
     routes = sample_plan.plan_routes(plan)
     metal = material_class == "metal"
@@ -714,6 +788,11 @@ def build_mpa_fit(
             sample_path, _CHI, point["index"], chi_wedge, mesh_xy=mesh_xy,
             global_shape=(z_all.size, q_idx.size, meta.n_rmu, meta.n_rmu))
 
+    def _write_reflected(point, chi):
+        _write_sample(
+            sample_path, point["index"], chi, q_idx, meta, mesh_xy,
+            z_all.size, name=_CHI_REFLECTED)
+
     _evaluate_samples(
         wfns, routes, quad, config, meta, mesh_xy,
         material_class=material_class,
@@ -722,7 +801,9 @@ def build_mpa_fit(
         occupation_state=occupation_state,
         write_full=_write_full, write_wedge=_write_wedge,
         static_gamma_override=static_gamma_override,
-        gamma_row=gamma_row, kminq_rows=kminq_rows, print_fn=print_fn)
+        gamma_row=gamma_row, kminq_rows=kminq_rows,
+        write_reflected=_write_reflected if ordered else None,
+        print_fn=print_fn)
 
     V = _to_wedge(V_q, q_idx, mesh_xy)
     if wc_source is None:
@@ -737,6 +818,8 @@ def build_mpa_fit(
             print_fn=print_fn,
             distrib_la_batched_route=getattr(
                 config.backend, "distrib_la_batched_route", "batch_reshard"),
+            reflected_chi_name=_CHI_REFLECTED if ordered else None,
+            negative_wc_name=_WC_NEGATIVE if ordered else None,
         )
     else:
         if iteration_head_response is not None:
@@ -750,7 +833,8 @@ def build_mpa_fit(
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
         provenance=provenance, occupation_state=occupation_state,
-        solve=config.mpa.pole_solver)
+        solve=config.mpa.pole_solver,
+        w_negative_name=_WC_NEGATIVE if ordered else None)
     # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
     # writer opens the same file through serial h5py.  A context-manager
     # return is rank-local: without this process barrier rank 0 can enter

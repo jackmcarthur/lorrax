@@ -2477,6 +2477,7 @@ def compute_chi0_contour_ordered(
     *,
     q_neg_index,
     energy_reference=0.0,
+    return_reflected=False,
 ):
     r"""Evaluate magnetic contour samples with both ordered orientations.
 
@@ -2516,6 +2517,12 @@ def compute_chi0_contour_ordered(
         ``(n_q,)``.  It must be an involution on the complete flat q grid.
     energy_reference
         Common energy origin subtracted from valence and conduction bands.
+    return_reflected
+        When true, also return the independently completed response at
+        ``-conj(z)``.  Both orientations already belong to the same contour
+        sweep; this option exposes the second completion without evaluating
+        another response kernel.  The default preserves the incumbent return
+        object exactly.
 
     Returns
     -------
@@ -2581,7 +2588,16 @@ def compute_chi0_contour_ordered(
             orientations[i], orientations[z.size + i], q_neg_jax)
         for i in range(z.size)
     )
-    return completed[0] if z.size == 1 else completed
+    primary = completed[0] if z.size == 1 else completed
+    if not return_reflected:
+        return primary
+    reflected = tuple(
+        _complete_contour_ordered(
+            orientations[z.size + i], orientations[i], q_neg_jax)
+        for i in range(z.size)
+    )
+    reflected = reflected[0] if z.size == 1 else reflected
+    return primary, reflected
 
 
 @jax.jit

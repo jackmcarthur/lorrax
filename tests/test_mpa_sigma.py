@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from gw.mpa.sigma import _batch_rows, _branches
+from gw.mpa.sigma import (_batch_rows, _branches,
+                          _resolve_mpa_odd_residue_debug)
 
 
 def _row(poles):
@@ -18,6 +20,17 @@ def test_batch_rows_relocalize_pole_selection_per_batch():
     np.testing.assert_array_equal(
         _batch_rows(shared, range(4, 8))[0], np.arange(4, dtype=np.int32))
     assert _batch_rows(low_only, range(4, 8)) is None
+
+
+def test_mpa_debug_odd_residue_switch_warns_and_refuses_trs(monkeypatch):
+    messages = []
+    monkeypatch.setenv("LORRAX_DEBUG_GN_ODD_RESIDUE_OFF", "1")
+    assert _resolve_mpa_odd_residue_debug(
+        True, print_fn=messages.append)
+    assert any("WARNING -- DEBUG" in line and "MPA" in line and "D=0" in line
+               for line in messages)
+    with pytest.raises(ValueError, match="debug_gn_odd_residue_off_scope"):
+        _resolve_mpa_odd_residue_debug(False, print_fn=messages.append)
 
 
 def test_small_gap_branching_follows_occupation_not_energy_sign():
