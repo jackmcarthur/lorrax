@@ -454,11 +454,11 @@ def _refuse_unusable_restart(config, meta, sym, centroid_indices,
                "never produced -- tests/test_bse_w0_ready_gate.py)."))
     if not os.path.exists(tensors_filename):
         raise ValueError(
-            f"GATE {diagram_name}_needs_restart_writes: {tensors_filename} "
-            f"does not exist, so the W0 persist would be skipped and the "
-            f"ladder would read nothing.  A restart = true run reuses "
-            f"tensors it did not write; point the deck at the directory "
-            f"that has them.")
+            f"GATE {diagram_name}_needs_restart_writes: "
+            f"tensors_filename got: {tensors_filename!r} (absent); want: an "
+            "existing writable restart file; why: otherwise W0 persistence "
+            "is skipped and the ladder has no tensors to read.  A restart "
+            "= true run must point at the directory that owns them.")
     decision = resolve_restart_q_storage_for_run(
         config, sym=sym, centroid_indices=centroid_indices,
         fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
@@ -615,11 +615,10 @@ def prepare_ladder_restart(
     diagram_name = _resolvent_diagram_name(include_w)
     if head_channel is not None:
         raise ValueError(
-            f"GATE {diagram_name}_head_placement_unimplemented: a "
-            f"head_channel reached the {diagram_name} stage helper, which "
-            f"means mc_average_placement != off got past the parse-time "
-            f"refusal in gw_config.refuse_unsupported_screening_diagrams.  "
-            f"v1 policy is that the q=0 head/wing channel stays RPA and "
+            f"GATE {diagram_name}_head_placement_unimplemented: "
+            f"head_channel got: {type(head_channel).__name__}; want: None "
+            "from mc_average_placement = off; why: v1 keeps the q=0 "
+            "head/wing channel RPA and "
             f"the resolvent replaces the body only; a post-solve head "
             f"rescale is a second opinion about the same channel.  Fix the "
             f"parse gate, do not serve this here.")
@@ -703,12 +702,12 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
 
     if not input_file:
         raise ValueError(
-            "GATE w_bse_needs_the_deck_path: the ladder facade resolves the "
-            "irreducible q wedge from SymMaps, built from the WFN named by "
-            "the GW DECK, and no restart file records which deck that was.  "
-            "This config carries no input_file, which means it was built by "
-            "hand rather than parsed (LorraxConfig.from_input_file sets it). "
-            "Pass a parsed config, or keep screening_diagrams = w_rpa.")
+            "GATE w_bse_needs_the_deck_path: config.input_file got: None; "
+            "want: a parsed deck path; why: the ladder facade resolves the "
+            "irreducible q wedge from SymMaps built from the deck's WFN, "
+            "and the restart file does not record that identity.  Pass a "
+            "LorraxConfig.from_input_file config, or keep "
+            "screening_diagrams = w_rpa.")
     z = np.asarray(z_list_ry, dtype=np.complex128)
     tol = _GMRES_TOL if gmres_tol is None else float(gmres_tol)
     ceiling = _residual_ceiling(tol)
@@ -892,9 +891,9 @@ def _assert_mu_width(tile, mu_target, *, where):
     n_mu = int(tile.shape[-1])
     if n_mu != int(mu_target):
         raise ValueError(
-            f"GATE w_bse_mu_width_mismatch ({where}): the ladder tile is "
-            f"{n_mu} wide and this run's padded mu extent is {mu_target}.\n"
-            f"  why:  both are runtime.padding.padded_mu_extent(n_rmu, "
+            f"GATE w_bse_mu_width_mismatch ({where}): tile_mu_width got: "
+            f"{n_mu}; want: padded_mu_extent={int(mu_target)}.\n"
+            f"  why: both are runtime.padding.padded_mu_extent(n_rmu, "
             f"px*py) — the BSE loader's n_rmu_pad and the GW leg's sym "
             f"tables — so they cannot differ unless the two legs saw "
             f"different meshes or different centroid counts.\n"

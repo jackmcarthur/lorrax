@@ -51,6 +51,7 @@ from common.scientific_output import band_range, pseudopotential_file_rows
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 blocks_to_host, dipole_operator,
+                                require_vnl_velocity_sign,
                                 sweep_matrix_elements,
                                 sweep_uniform_current_matrix_elements)
 from common.parallel_transport import (
@@ -474,14 +475,6 @@ _PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
                "prov_nspinor", "prov_soc",
                "prov_q0_operator_scheme")
 
-#: Word spellings of the two arms, so a deck can say which one it means
-#: rather than carrying a bare ``-1`` whose meaning is a source comment.
-_VNL_SIGN_WORDS = {"shipped": VNL_VELOCITY_SIGN_SHIPPED,
-                   "minus": VNL_VELOCITY_SIGN_SHIPPED,
-                   "flipped": VNL_VELOCITY_SIGN_FLIPPED,
-                   "plus": VNL_VELOCITY_SIGN_FLIPPED}
-
-
 def resolve_vnl_velocity_sign(cli_value, deck_value):
     """Which sign the i[r, V_NL] term enters this run's velocity with.
 
@@ -501,26 +494,9 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
     attribute.
     """
     raw = cli_value if cli_value is not None else deck_value
-    if isinstance(raw, str):
-        raw = raw.strip().lower()
-        raw = _VNL_SIGN_WORDS.get(raw, raw)
-    if raw is None or raw == "":
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
         return VNL_VELOCITY_SIGN_FLIPPED
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        val = None
-    if val not in (VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED):
-        raise ValueError(
-            f"GATE vnl_velocity_sign: {raw!r} resolves to no arm.  The only "
-            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (legacy shipped) "
-            f"and {VNL_VELOCITY_SIGN_FLIPPED} (flipped, the default); the "
-            f"words "
-            f"{sorted(_VNL_SIGN_WORDS)} spell the same two.  This is a "
-            f"SIGN, not a scale: an arbitrary multiplier would produce a "
-            f"velocity operator that is neither arm of the open question "
-            f"and that no comparison with BerkeleyGW characterises.")
-    return val
+    return require_vnl_velocity_sign(raw)
 
 
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,

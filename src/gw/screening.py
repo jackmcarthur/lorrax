@@ -356,11 +356,13 @@ def compute_static_w(
                     compute_chi0_imag_ordered, precompile_chi0_imag_ordered)
                 if use_ibz_w:
                     raise RuntimeError(
-                        "GATE chi0_imag_ordered_full_bz: the ordered "
-                        "orientation route needs the full-BZ q axis "
-                        "(force_full_bz=True); the IBZ cascade was "
-                        "requested for role "
-                        f"{role!r}.")
+                        "GATE chi0_imag_ordered_full_bz: ordered response "
+                        "received an IBZ q cascade.\n"
+                        f"  got:  use_ibz_w = true, role = {role!r}\n"
+                        "  want: force_full_bz = true for this role\n"
+                        "  why:  the ordered kernel pairs each q with its "
+                        "explicit -q row; that involution is not present "
+                        "on the irreducible q axis")
                 from ffi import _services
                 _services.ensure_on_path()
                 from symmetry_maps import q_negation_index
@@ -1030,14 +1032,14 @@ def assert_probe_chi_reuse_supported(reuse_mode: str, *, tr_odd: bool) -> None:
     serve a probe χ₀ with the channel silently deleted (TASTE 13)."""
     if tr_odd and str(reuse_mode).strip().lower() == "auto":
         raise RuntimeError(
-            "GATE gn_probe_chi_reuse_tr_broken: ppm_probe_chi_reuse = auto "
-            "reuses the static tau sweep's EVEN orientation completion for "
-            "the probe chi0, and this deck's measured time-reversal verdict "
-            "is BROKEN, where chi0(i*omega_p) has an anti-Hermitian, "
-            "magnetisation-odd channel that completion deletes.  got: "
-            "ppm_probe_chi_reuse = auto.  want: the ordered-orientation "
-            "probe route.  fix: set ppm_probe_chi_reuse = off (the default) "
-            "on this deck.  doc: docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
+            "GATE gn_probe_chi_reuse_tr_broken: the even static sweep "
+            "cannot supply a broken-TR probe.\n"
+            "  got:  ppm_probe_chi_reuse = auto, trs_allowed = false\n"
+            "  want: ppm_probe_chi_reuse = off (the default)\n"
+            "  why:  auto reuses the static tau sweep's even-orientation "
+            "completion, which deletes the anti-Hermitian, magnetisation-"
+            "odd channel of chi0(i*omega_p) when time reversal is broken\n"
+            "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
 
 
 def _trs_verdict(sym) -> bool:

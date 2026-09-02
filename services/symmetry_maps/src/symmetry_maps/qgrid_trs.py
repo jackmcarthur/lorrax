@@ -102,8 +102,9 @@ def self_negative_q_mask(q_full_idx, *, kgrid) -> np.ndarray:
     n_full = int(np.prod(grid))
     if np.any(qidx < 0) or np.any(qidx >= n_full):
         raise ValueError(
-            "GATE trs_fixed_q_projector: q_full_idx lies outside the "
-            f"full k-grid extent {n_full}: {qidx.tolist()}.")
+            "GATE trs_fixed_q_projector: q_full_idx got: "
+            f"{qidx.tolist()}; want: every index in [0, {n_full}); why: "
+            "the fixed-q projector can act only on named full-grid rows.")
     coords = np.stack(np.unravel_index(qidx, tuple(grid)), axis=1)
     return np.all((2 * coords) % grid[None, :] == 0, axis=1)
 
@@ -146,17 +147,19 @@ def trs_pair_coherent_unfold_sym_idx(
     n_spatial = int(n_sym_spatial)
     if irr.shape != (n_full,) or original.shape != (n_full,):
         raise ValueError(
-            "GATE trs_pair_unfold_map: irr_idx and sym_idx must each have "
-            f"the full k-grid extent {n_full}; got {irr.shape} and "
-            f"{original.shape} for kgrid={grid}.")
+            "GATE trs_pair_unfold_map: table_shapes got: "
+            f"irr_idx={irr.shape}, sym_idx={original.shape}; want: each "
+            f"({n_full},) for kgrid={grid}; why: q/-q pairing addresses "
+            "every full-grid row.")
     if (n_spatial <= 0 or np.any(original < 0)
             or np.any(original >= 2 * n_spatial)):
         lo = int(original.min()) if original.size else 0
         hi = int(original.max()) if original.size else -1
         raise ValueError(
-            "GATE trs_pair_unfold_map: symmetry rows must lie in "
-            f"[0, 2*n_sym_spatial) with n_sym_spatial={n_spatial}; got "
-            f"range [{lo}, {hi}].")
+            "GATE trs_pair_unfold_map: sym_idx range got: "
+            f"[{lo}, {hi}] with n_sym_spatial={n_spatial}; want: every row "
+            f"in [0, {2 * n_spatial}); why: each unfold row must name an "
+            "authenticated unitary or antiunitary action.")
 
     reps = set(int(v) for v in np.asarray(q_irr_full_idx).reshape(-1))
     out = original.copy()
@@ -177,9 +180,10 @@ def trs_pair_coherent_unfold_sym_idx(
             continue
         if int(irr[iq]) != int(irr[jq]):
             raise ValueError(
-                "GATE trs_pair_unfold_map: q and -q do not share an "
-                f"irreducible parent ({iq}->{int(irr[iq])}, "
-                f"{jq}->{int(irr[jq])}).  A TRS composition is valid only "
+                "GATE trs_pair_unfold_map: q_pair_parents got: "
+                f"q={iq}->{int(irr[iq])}, -q={jq}->{int(irr[jq])}; want: "
+                "one shared irreducible parent; why: a TRS composition is "
+                "valid only "
                 "for one solved wedge row; do not fabricate reciprocity "
                 "across two independently solved rows.  On a deck whose "
                 "DFT reference check says TIME REVERSAL IS BROKEN this is the "
@@ -229,8 +233,9 @@ def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
     n_rows = int(fixed.size)
     if int(operator.shape[0]) != n_rows:
         raise ValueError(
-            "GATE trs_fixed_q_projector: operator q extent does not match "
-            f"q_full_idx ({int(operator.shape[0])} != {n_rows}).")
+            "GATE trs_fixed_q_projector: operator_q_extent got: "
+            f"{int(operator.shape[0])}; want: q_full_idx extent={n_rows}; "
+            "why: the projector mask must address every operator q row.")
     mask = jnp.asarray(fixed).reshape((n_rows,) + (1,) * (operator.ndim - 1))
     projected = 0.5 * (operator + jnp.conj(operator))
     return jnp.where(mask, projected, operator)
@@ -554,9 +559,10 @@ class QgridTrsPolicy:
         fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)
         if int(operator.shape[0]) != int(fixed.size):
             raise ValueError(
-                "GATE trs_fixed_q_projector: operator q extent does not "
-                f"match q_full_idx ({int(operator.shape[0])} != "
-                f"{int(fixed.size)}).")
+                "GATE trs_fixed_q_projector: operator_q_extent got: "
+                f"{int(operator.shape[0])}; want: q_full_idx extent="
+                f"{int(fixed.size)}; why: the projector mask must address "
+                "every operator q row.")
         if not np.any(fixed):
             return operator, None
         import jax
@@ -639,8 +645,9 @@ def build_qgrid_trs_policy(
     n_spatial = int(n_sym_spatial)
     if selected.shape != (n_full,):
         raise ValueError(
-            "GATE trs_pair_unfold_map: sym_idx_q must have the full k-grid "
-            f"extent {n_full}; got {selected.shape} for kgrid={grid}.")
+            "GATE trs_pair_unfold_map: sym_idx_q.shape got: "
+            f"{selected.shape}; want: ({n_full},) for kgrid={grid}; why: "
+            "q/-q pairing addresses every full-grid row.")
 
     if active_symmetry_rows is None:
         active = np.arange(
@@ -652,8 +659,10 @@ def build_qgrid_trs_policy(
             or np.unique(active).size != active.size
             or np.any(active < 0) or np.any(active >= 2 * n_spatial)):
         raise ValueError(
-            "GATE trs_active_rows: active_symmetry_rows must be a nonempty "
-            f"unique subset of [0,{2 * n_spatial}); got {active.tolist()}.")
+            "GATE trs_active_rows: active_symmetry_rows got: "
+            f"{active.tolist()}; want: a nonempty unique subset of "
+            f"[0, {2 * n_spatial}); why: the TRS policy may select only "
+            "authenticated unitary or antiunitary actions.")
 
     if not bool(trs_measured):
         # No guard, no branch, no projector: on a magnetic deck the policy

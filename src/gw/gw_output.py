@@ -526,22 +526,21 @@ def persist_w0_and_head(
         and (_head_correction == "full" or _sc_head_update != "off"))
     if requires_iteration_head and iteration_head is None:
         raise ValueError(
-            "GATE persist_sc_requires_iteration_head: refusing to persist "
-            "self-consistent W with the DFT seed head_resolver when "
-            f"head_correction={_head_correction!r}, "
-            f"sc_head_update={_sc_head_update!r}. Pass the accepted QSGW "
-            "map's iteration_head samples.")
+            "GATE persist_sc_requires_iteration_head: iteration_head got: "
+            f"None for head_correction={_head_correction!r}, "
+            f"sc_head_update={_sc_head_update!r}; want: accepted QSGW map "
+            "iteration_head samples; why: persisting self-consistent W with "
+            "the DFT seed head would mix iteration provenances.")
     head_static = None
     if iteration_head is not None:
         head_static = iteration_head.at(0.0 + 0.0j)
         if head_static.S_cart is None:
             raise ValueError(
-                "GATE persist_iteration_head_requires_s_cart: the QSGW "
-                "iteration's static head sample carries S_cart=None "
-                f"(source={head_static.source!r}). Refusing before writing "
-                "W0/head data: a BSE reload would otherwise rebuild a DFT "
-                "S tensor from dipole.h5 and report a false-green provenance "
-                "ratio.")
+                "GATE persist_iteration_head_requires_s_cart: "
+                f"iteration_head.S_cart got: None (source="
+                f"{head_static.source!r}); want: the accepted QSGW static "
+                "response tensor; why: a restart must not pair iteration W "
+                "with a DFT S tensor rebuilt from dipole.h5.")
     head_source = iteration_head if iteration_head is not None else head_resolver
     # Resolve the complete scalar sample set BEFORE writing W.  A missing
     # probe or unsupported dynamic grid must not leave a new W body paired

@@ -51,9 +51,9 @@ def _wfn(*, energy_shift=0.0):
     )
 
 
-def _transaction(mesh, wfn):
+def _transaction(mesh, wfn, *, sigma_H=_SIGMA_H):
     return _static_gauge_hall_transaction_from_artifact(
-        sigma_H=np.asarray(_SIGMA_H, dtype=np.float64),
+        sigma_H=np.asarray(sigma_H, dtype=np.float64),
         hamiltonian_config_operator_fingerprint=_OPERATOR_FINGERPRINT,
         wfn_fingerprint=wfn_fingerprint(wfn),
         band_start=0, band_stop=4, nk_tot=6, mesh=mesh)
@@ -119,8 +119,10 @@ def test_hall_artifact_refuses_mismatched_runtime_identity(
 def test_hall_artifact_refuses_absent_partial_and_incomplete(tmp_path):
     mesh = _mesh()
     wfn = _wfn()
-    with pytest.raises(FileNotFoundError, match="artifact_absent"):
+    with pytest.raises(FileNotFoundError, match="static_gauge_hall_file_missing") as exc:
         _load(tmp_path / "absent.h5", mesh, wfn)
+    for part in ("got:", "want:", "why:"):
+        assert part in str(exc.value)
     with pytest.raises(ValueError, match="static_gauge_hall_partial"):
         _load(tmp_path / "candidate.h5.partial", mesh, wfn)
 
@@ -136,6 +138,54 @@ def test_hall_artifact_refuses_absent_partial_and_incomplete(tmp_path):
         io.write_attr("complete", np.int32(1))
     with pytest.raises(ValueError, match="static_gauge_hall_schema"):
         _load(bare, mesh, wfn)
+
+
+def test_bare_route_accepts_authenticated_exact_zero_hall(tmp_path):
+    """Positive control for the narrowed bare-route Hall refusal.
+
+    The exact consumer tensor is identically zero, so this admitted named
+    artifact produces the same Hall contribution as the unnamed default.
+    """
+    from gw.head_correction import static_hall_linear_response
+    from gw.w_isdf import _load_static_photon_hall
+
+    mesh = _mesh()
+    wfn = _wfn()
+    path = tmp_path / "zero_hall.h5"
+    write_static_gauge_hall_artifact(
+        path, _transaction(mesh, wfn, sigma_H=np.zeros(3)), mesh_xy=mesh)
+    config = SimpleNamespace(
+        paths=SimpleNamespace(static_gauge_hall_file=str(path)))
+    meta = SimpleNamespace(b_id_0=0, b_id_4_chi_user=4, nk_tot=6)
+
+    hall = _load_static_photon_hall(
+        config, meta, mesh, wfn, None, screen_current=False,
+        print_fn=lambda *args, **kwargs: None)
+    np.testing.assert_array_equal(np.asarray(jax.device_get(hall.sigma_H)), 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(static_hall_linear_response(hall.sigma_H))),
+        0.0)
+
+
+def test_bare_route_still_refuses_authenticated_nonzero_hall(tmp_path):
+    """Negative control: a nonzero Gamma-only CT/TC block still refuses."""
+    from gw.w_isdf import _load_static_photon_hall
+
+    mesh = _mesh()
+    wfn = _wfn()
+    path = tmp_path / "nonzero_hall.h5"
+    write_static_gauge_hall_artifact(
+        path, _transaction(mesh, wfn), mesh_xy=mesh)
+    config = SimpleNamespace(
+        paths=SimpleNamespace(static_gauge_hall_file=str(path)))
+    meta = SimpleNamespace(b_id_0=0, b_id_4_chi_user=4, nk_tot=6)
+
+    with pytest.raises(
+            ValueError,
+            match="(?s)packed_bare_transverse_hall_unavailable.*got:.*want:.*why:"):
+        _load_static_photon_hall(
+            config, meta, mesh, wfn, None, screen_current=False,
+            print_fn=lambda *args, **kwargs: None)
 
 
 def test_hall_artifact_schema_version_has_a_red_twin(tmp_path):

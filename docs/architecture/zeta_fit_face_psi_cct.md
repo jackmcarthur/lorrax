@@ -788,9 +788,9 @@ Both `_c_q_face` and `_z_q_face` accept `gamma_L`/`gamma_R` — the same
 `(perm, phase)` tuple calling convention `_c_q_legacy`/`_z_q_legacy`
 already had — closing the LAST gap in the bispinor+`low_mem_bands`
 census row. `gw.isdf_fitting.fit_zeta_to_h5`'s `vertex_mu_L != 0`
-refusal under `low_mem_bands` is dropped; `gw.gw_config.
-_LOW_MEM_BANDS_REFUSALS`'s `low_mem_bands_bispinor_unported` row is
-DELETED. Full narrative and every verification number: `claims/0442.md`.
+refusal under `low_mem_bands` is dropped; the former
+`low_mem_bands_bispinor_unported` row was deleted. Full narrative and every
+verification number: `claims/0442.md`.
 
 ### The mechanism: endpoint application, not post-IFFT contraction
 

@@ -581,9 +581,13 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     except Exception as exc:            # psp stack unavailable (h5py-less env)
         if explicit_comparison:
             raise ValueError(
-                "GATE comparison_charge_dipole_provenance: the "
-                "dipole provenance checker is unavailable, so the explicit "
-                "Pauli charge representation cannot be authenticated.") from exc
+                "GATE comparison_charge_dipole_provenance: the explicit "
+                "Pauli comparison cannot authenticate its dipole artifact.\n"
+                f"  got:  provenance checker import failed with "
+                f"{type(exc).__name__}: {exc}\n"
+                "  want: an available check_dipole_provenance owner\n"
+                "  why:  without the checker the run cannot establish "
+                "that dipole.h5 was built for the scalar charge carrier") from exc
         print_fn(f"  [dipole provenance] check unavailable "
                  f"({type(exc).__name__}: {exc})")
         return
@@ -594,9 +598,14 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     if explicit_comparison and not authenticated:
         raise ValueError(
             "GATE comparison_charge_dipole_provenance: the explicit "
-            "four-current comparison refuses a dipole/head artifact that "
-            "does not authenticate prov_bispinor=false. Regenerate dipole.h5 "
-            "from this exact deck.")
+            "four-current comparison received an unauthenticated dipole.\n"
+            f"  got:  dipole_file = {dipole_path!r}, "
+            f"prov_bispinor != {expected_bispinor!r} or another provenance "
+            "field mismatched\n"
+            "  want: dipole.h5 regenerated from this exact deck with "
+            "prov_bispinor = false\n"
+            "  why:  the comparison's charge head uses the Pauli carrier; "
+            "a four-spinor or stale artifact measures a different operator")
 
 
 def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:
@@ -1164,7 +1173,12 @@ def _finite_static_photon_values(values, *, gate: str, label: str):
     if (array.ndim != 1 or array.size == 0
             or not np.all(np.isfinite(array))):
         raise ValueError(
-            f"GATE {gate}: {label} contains non-finite or empty diagnostics")
+            f"GATE {gate}: a photon-head certificate vector is invalid.\n"
+            f"  got:  {label}: shape = {array.shape}, size = {array.size}, "
+            f"all_finite = {bool(np.all(np.isfinite(array)))}\n"
+            f"  want: {label} to be a nonempty finite 1-D vector\n"
+            "  why:  reducing an empty or nonfinite diagnostic would let "
+            "an unmeasured cubature/Dyson result pass its certificate")
     return array
 
 
@@ -1172,8 +1186,13 @@ def _static_photon_mixed_error_ratio(previous_blocks, current_blocks) -> float:
     """Return one finite mixed-error maximum without Python NaN swallowing."""
     if len(previous_blocks) != len(current_blocks) or not previous_blocks:
         raise ValueError(
-            "GATE static_photon_polygon_nonfinite: cubature comparison "
-            "requires equal nonempty block lists")
+            "GATE static_photon_polygon_nonfinite: cubature block lists "
+            "cannot be compared.\n"
+            f"  got:  previous_blocks = {len(previous_blocks)}, "
+            f"current_blocks = {len(current_blocks)}\n"
+            "  want: equal nonzero block counts at adjacent orders\n"
+            "  why:  convergence is a pairwise norm ratio; unequal or "
+            "empty lists do not define that ratio")
     ratios = []
     for block_index, (previous, current) in enumerate(
             zip(previous_blocks, current_blocks)):
@@ -1215,8 +1234,12 @@ def _reduce_static_photon_order_diagnostics(
     )
     if any(vector.shape != vectors[0].shape for vector in vectors[1:]):
         raise ValueError(
-            "GATE static_photon_dyson_nonfinite: per-order diagnostic "
-            "vectors have inconsistent lengths")
+            "GATE static_photon_dyson_nonfinite: per-order Dyson "
+            "diagnostics have inconsistent shapes.\n"
+            f"  got:  diagnostic shapes = {[v.shape for v in vectors]}\n"
+            "  want: one equal-length vector per diagnostic\n"
+            "  why:  maxima/minima from different cubature orders cannot "
+            "form one numerical certificate")
     return (
         float(np.max(vectors[0])),
         float(np.min(vectors[1])),
@@ -1233,7 +1256,11 @@ def _static_photon_dyson_forward_error_bound(
     if not np.isfinite(theta) or theta < 0.0:
         raise ValueError(
             "GATE static_photon_dyson_nonfinite: conditioned backward "
-            f"error theta is invalid ({theta!r})")
+            "error is invalid.\n"
+            f"  got:  theta = {theta!r}\n"
+            "  want: finite theta >= 0\n"
+            "  why:  a negative or nonfinite error cannot bound the "
+            "forward error of the Dyson solve")
     if theta >= 1.0:
         raise ValueError(
             "GATE static_photon_dyson_forward_bound_denominator: the rigorous "
@@ -1244,7 +1271,10 @@ def _static_photon_dyson_forward_error_bound(
     if not np.isfinite(bound):
         raise ValueError(
             "GATE static_photon_dyson_nonfinite: transformed forward-error "
-            f"bound is non-finite ({bound!r})")
+            "bound is nonfinite.\n"
+            f"  got:  forward_error_bound = {bound!r}, theta = {theta!r}\n"
+            "  want: a finite forward-error bound\n"
+            "  why:  a nonfinite bound cannot certify the inserted head")
     return bound
 
 
@@ -1267,25 +1297,38 @@ def _require_static_photon_numerical_certificate(
             or min_sigma <= 0.0):
         raise ValueError(
             "GATE static_photon_dyson_nonfinite: coupled photon mini-BZ "
-            "average or solve diagnostic is non-finite")
+            "data fail the numerical certificate.\n"
+            f"  got:  D_finite = {bool(np.all(np.isfinite(D_mean)))}, "
+            f"moments_finite = {bool(np.all(np.isfinite(moments_mean)))}, "
+            f"diagnostics = {diagnostics}, min_sigma = {min_sigma!r}\n"
+            "  want: finite averages/diagnostics and min_sigma > 0\n"
+            "  why:  a singular or nonfinite 4x4 Dyson solve has no "
+            "trustworthy Gamma-cell limit")
     max_forward_error_bound = _static_photon_dyson_forward_error_bound(
         max_conditioned_backward)
     if max_forward_error_bound > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
         raise ValueError(
-            "GATE static_photon_dyson_conditioning: the observed 4x4 "
-            "Dyson solve cannot keep its rigorous forward-error bound "
-            "inside the budget: 2*theta/(1-theta)="
-            f"{max_forward_error_bound:.3e} > "
-            f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}, "
-            "theta=kappa_F*max(backward_error,eps)="
-            f"{max_conditioned_backward:.3e}, "
-            f"backward_error={max_backward:.3e}, "
-            f"min_sigma={min_sigma:.3e}, kappa={max_condition:.3e}")
+            "GATE static_photon_dyson_conditioning: the 4x4 Dyson solve "
+            "missed its forward-error budget.\n"
+            f"  got:  forward_error_bound = 2*theta/(1-theta) = "
+            f"{max_forward_error_bound:.3e}, "
+            f"theta = {max_conditioned_backward:.3e}, backward_error = "
+            f"{max_backward:.3e}, min_sigma = {min_sigma:.3e}, "
+            f"kappa = {max_condition:.3e}\n"
+            f"  want: forward_error_bound <= "
+            f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}\n"
+            "  why:  inserting a head whose rigorous error exceeds the "
+            "budget would publish uncertified q=0 matrix elements")
     convergence = np.asarray(mixed_error_ratios, dtype=np.float64)
     if (convergence.shape != (2,) or not np.all(np.isfinite(convergence))):
         raise ValueError(
-            "GATE static_photon_polygon_nonfinite: the fixed 16/24/32 "
-            "cubature ladder produced non-finite convergence diagnostics")
+            "GATE static_photon_polygon_nonfinite: the fixed cubature "
+            "ladder produced invalid convergence diagnostics.\n"
+            f"  got:  convergence shape = {convergence.shape}, values = "
+            f"{convergence.tolist()}\n"
+            "  want: two finite error ratios for 16/24/32 orders\n"
+            "  why:  without both adjacent-order ratios the fixed ladder "
+            "cannot certify convergence")
     if convergence[-1] > 1.0:
         raise ValueError(
             "GATE static_photon_polygon_not_converged: the final polygon "
@@ -1364,15 +1407,22 @@ def complete_static_slab_photon_q0(
         S_effective)
     if effective_ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX:
         raise ValueError(
-            "GATE static_gauge_head_fold_ward: the actual Y-W-Z-folded "
-            f"response violates the Ward identity: {effective_ward:.6e} > "
-            f"{_STATIC_GAUGE_WARD_RESIDUAL_MAX:.1e}")
+            "GATE static_gauge_head_fold_ward: the folded response violates "
+            "the Ward identity.\n"
+            f"  got:  ward_residual = {effective_ward:.6e}\n"
+            f"  want: ward_residual <= "
+            f"{_STATIC_GAUGE_WARD_RESIDUAL_MAX:.1e}\n"
+            "  why:  a nonconserving folded response cannot define the "
+            "charge q->0 head")
     if effective_hermiticity > _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:
         raise ValueError(
-            "GATE static_gauge_head_fold_hermiticity: the actual Y-W-Z-"
-            f"folded response violates Hermiticity: "
-            f"{effective_hermiticity:.6e} > "
-            f"{_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}")
+            "GATE static_gauge_head_fold_hermiticity: the folded response "
+            "violates Hermiticity.\n"
+            f"  got:  hermiticity_residual = {effective_hermiticity:.6e}\n"
+            f"  want: hermiticity_residual <= "
+            f"{_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}\n"
+            "  why:  a non-Hermitian static response would insert a "
+            "nonphysical q->0 screened interaction")
 
     # Exactly three provider-issued rules are solved sequentially.  All three
     # have the same padded carrier, so the JAX graph compiles once; the

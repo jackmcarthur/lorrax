@@ -1401,8 +1401,10 @@ def _projector_derivatives_cartesian_rows(
         raise ValueError("derivative_order must be 0, 1, 2, or 3")
     if int(derivative_order) == 3 and setup.Gppp_table is None:
         raise ValueError(
-            "GATE EM-VERTEX-VNL-GPPP-MISSING: rebuild VNLSetup with "
-            "compute_transfer_q2=True")
+            "GATE EM-VERTEX-VNL-GPPP-MISSING: setup.Gppp_table got: None "
+            f"for derivative_order={int(derivative_order)}; want: third "
+            "radial derivatives from compute_transfer_q2=True; why: the "
+            "third-order VNL vertex cannot be evaluated without them.")
     B = jnp.asarray(setup.B, dtype=jnp.float64)
     Binv = jnp.linalg.inv(B)
 
@@ -1517,44 +1519,53 @@ def _coupled_projector_row_blocks(setup: VNLSetup, max_rows: int):
     blocks = tuple(setup.coupled_row_blocks)
     if int(setup.total_R) and not blocks:
         raise ValueError(
-            "GATE EM-VERTEX-VNL-ROW-PROVENANCE: rebuild VNLSetup with "
-            "canonical coupled_row_blocks")
+            "GATE EM-VERTEX-VNL-ROW-PROVENANCE: coupled_row_blocks got: "
+            f"empty for total_R={int(setup.total_R)}; want: canonical "
+            "coupled row provenance; why: projector rows must stay aligned "
+            "with their PP/SOC coupling blocks.")
     expected = 0
     normalized = []
     for raw_block in blocks:
         if len(raw_block) != 3:
             raise ValueError(
-                "GATE EM-VERTEX-VNL-ROW-PROVENANCE: coupled blocks must "
-                "carry (start,stop,channel_index)")
+                "GATE EM-VERTEX-VNL-ROW-PROVENANCE: coupled_row_block got: "
+                f"{raw_block!r}; want: (start, stop, channel_index); why: "
+                "each projector row block must name its exact coupling "
+                "channel.")
         block_start, block_stop, channel_index = raw_block
         start, stop = int(block_start), int(block_stop)
         ich = int(channel_index)
         if start != expected or stop <= start:
             raise ValueError(
-                "GATE EM-VERTEX-VNL-ROW-COVERAGE: coupled blocks must "
-                f"cover [0,total_R) once; expected {expected}, got "
-                f"({start},{stop})")
+                "GATE EM-VERTEX-VNL-ROW-COVERAGE: coupled_row_interval got: "
+                f"({start}, {stop}); want: next interval starting at "
+                f"{expected} with stop > start; why: blocks must cover "
+                "[0, total_R) once without gaps or overlap.")
         if ich < 0 or ich >= len(setup.channels):
             raise ValueError(
-                "GATE EM-VERTEX-VNL-E-PROVENANCE: invalid channel index "
-                f"{ich} for {len(setup.channels)} channels")
+                "GATE EM-VERTEX-VNL-E-PROVENANCE: channel_index got: "
+                f"{ich}; want: in [0, {len(setup.channels)}); why: each "
+                "projector row block must use its authenticated ChannelMeta.E.")
         expected_width = int(setup.channels[ich].R)
         if stop - start != expected_width:
             raise ValueError(
-                "GATE EM-VERTEX-VNL-E-PROVENANCE: coupled row width "
-                f"{stop - start} does not match ChannelMeta.R="
-                f"{expected_width} for channel {ich}")
+                "GATE EM-VERTEX-VNL-E-PROVENANCE: coupled_row_width got: "
+                f"{stop - start} for channel={ich}; want: "
+                f"ChannelMeta.R={expected_width}; why: the coupling matrix "
+                "must address exactly that channel's projector rows.")
         if stop - start > int(max_rows):
             raise ValueError(
-                "GATE EM-VERTEX-VNL-ROW-CHUNK: a coupled projector block "
-                f"has {stop - start} rows, exceeding projector_row_chunk="
-                f"{int(max_rows)}; splitting its PP/SOC E block is forbidden")
+                "GATE EM-VERTEX-VNL-ROW-CHUNK: coupled_row_width got: "
+                f"{stop - start}; want: <= projector_row_chunk="
+                f"{int(max_rows)}; why: a PP/SOC E coupling block cannot be "
+                "split across row chunks.")
         normalized.append((start, stop, ich))
         expected = stop
     if expected != int(setup.total_R):
         raise ValueError(
-            "GATE EM-VERTEX-VNL-ROW-COVERAGE: coupled blocks end at "
-            f"{expected}, total_R={int(setup.total_R)}")
+            "GATE EM-VERTEX-VNL-ROW-COVERAGE: final_row_stop got: "
+            f"{expected}; want: total_R={int(setup.total_R)}; why: coupled "
+            "blocks must cover every canonical projector row exactly once.")
 
     cursor = 0
     for start, stop, _ in normalized:
@@ -1581,8 +1592,10 @@ def _compact_channel_couplings(setup: VNLSetup, row_width: int):
         R = int(channel.R)
         if E.shape != (2, 2, R, R):
             raise ValueError(
-                "GATE EM-VERTEX-VNL-E-PROVENANCE: ChannelMeta.E for "
-                f"channel {ich} has shape {E.shape}, expected (2,2,{R},{R})")
+                "GATE EM-VERTEX-VNL-E-PROVENANCE: ChannelMeta.E.shape got: "
+                f"{E.shape} for channel={ich}; want: (2, 2, {R}, {R}); "
+                "why: Pauli spin and projector-row axes must match the "
+                "authenticated channel metadata.")
         blocks.append(jnp.pad(
             E, ((0, 0), (0, 0), (0, row_width - R),
                 (0, row_width - R))))
@@ -1627,25 +1640,39 @@ def _apply_vnl_derivatives_between_g_carriers(
     mask_target = jnp.asarray(g_mask_target, dtype=jnp.float64)
     if psi.ndim != 3 or int(psi.shape[1]) != 2:
         raise ValueError(
-            "GATE EM-VERTEX-LARGE-COMPONENTS: expected explicit Psi_L "
-            f"with shape (band,2,G), got {tuple(psi.shape)}")
+            "GATE EM-VERTEX-LARGE-COMPONENTS: psi_G.shape got: "
+            f"{tuple(psi.shape)}; want: explicit large components with "
+            "shape (band, 2, G); why: the Pauli VNL action is defined on "
+            "the two-component large block only.")
     if int(setup.nspinor) != 2:
         raise ValueError(
-            "GATE EM-VERTEX-PAULI-VNL: VNLSetup.nspinor must be 2, got "
-            f"{int(setup.nspinor)}")
+            "GATE EM-VERTEX-PAULI-VNL: VNLSetup.nspinor got: "
+            f"{int(setup.nspinor)}; want: 2; why: this nonlocal "
+            "pseudopotential vertex uses the two-component Pauli coupling.")
     if order >= 2 and setup.Gpp_table is None:
         raise ValueError(
-            "GATE EM-VERTEX-VNL-GPP-MISSING: rebuild VNLSetup with "
-            "compute_contact=True")
+            "GATE EM-VERTEX-VNL-GPP-MISSING: setup.Gpp_table got: None "
+            f"for derivative_order={order}; want: second radial derivatives "
+            "from compute_contact=True; why: the VNL contact vertex cannot "
+            "be evaluated without them.")
     if order == 3 and setup.Gppp_table is None:
         raise ValueError(
-            "GATE EM-VERTEX-VNL-GPPP-MISSING: rebuild VNLSetup with "
-            "compute_transfer_q2=True")
+            "GATE EM-VERTEX-VNL-GPPP-MISSING: setup.Gppp_table got: None "
+            f"for derivative_order={order}; want: third radial derivatives "
+            "from compute_transfer_q2=True; why: the third-order VNL vertex "
+            "cannot be evaluated without them.")
     if (setup.row_beta_idx is None or setup.row_l is None
             or setup.row_m is None
             or setup.row_tau is None):
+        missing = [
+            name for name in ("row_beta_idx", "row_l", "row_m", "row_tau")
+            if getattr(setup, name) is None
+        ]
         raise ValueError(
-            "GATE EM-VERTEX-VNL-SETUP: incomplete canonical VNLSetup")
+            "GATE EM-VERTEX-VNL-SETUP: canonical row metadata got: "
+            f"missing={missing}; want: all row_beta_idx/row_l/row_m/row_tau "
+            "arrays; why: the VNL action must preserve canonical projector "
+            "row provenance.")
     if (G_source.shape != (psi.shape[-1], 3)
             or mask_source.shape != (psi.shape[-1],)):
         raise ValueError(

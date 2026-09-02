@@ -408,10 +408,14 @@ def fit_gn_ppm_from_wc_pair(
         if (not np.isfinite(_zh.real) or not np.isfinite(_zh.imag)
                 or abs(_zh.real) > 0.0 or abs(_zh.imag) == 0.0):
             raise ValueError(
-                "GATE gn_ppm_ordered_probe_axis: ordered_orientations=True "
-                "needs a purely imaginary, nonzero probe (the odd residue "
-                "is read off the anti-Hermitian part of W^c(i*omega_p), "
-                f"which a real-axis probe cannot carry); got {probe_omega!r}.")
+                "GATE gn_ppm_ordered_probe_axis: the ordered probe is not "
+                "on the nonzero imaginary axis.\n"
+                f"  got:  probe_omega = {probe_omega!r}\n"
+                "  want: Re(probe_omega) = 0 and Im(probe_omega) != 0\n"
+                "  why:  the odd residue is read from the anti-Hermitian "
+                "part of Wc(i*omega_p), which a real or zero probe cannot "
+                "carry\n"
+                "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
 
     # --- q-CHUNKED EVALUATION (movement-only; see the note above the kernel).
     # Leading axis is the q family; the trailing two are (mu, nu).  One q-slice
@@ -523,16 +527,22 @@ def fit_gn_ppm_from_wc_pair(
         budget = n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
         if n_tail_low > budget or n_tail_high > budget:
             raise RuntimeError(
-                "GATE gn_ppm_extreme_tail_budget: selected more than the "
-                f"0.2% budget (low={n_tail_low}, high={n_tail_high}, "
-                f"budget={budget}).")
+                "GATE gn_ppm_extreme_tail_budget: "
+                f"gn_ppm_extreme_tail_counts got: low={n_tail_low}, "
+                f"high={n_tail_high}; want: each count <= budget={budget} "
+                f"({1.0 / GN_PPM_EXTREME_TAIL_DIVISOR:.3%} of valid modes); "
+                "why: tail coarsening may alter only its bounded extreme-mode "
+                "allocation.")
         if n_valid and (
                 omega_min_after < omega_min_host
                 or omega_max_after > omega_max_host):
             raise RuntimeError(
-                "GATE gn_ppm_extreme_tail_range: tail coarsening enlarged "
-                f"the fitted support [{omega_min_host}, {omega_max_host}] "
-                f"-> [{omega_min_after}, {omega_max_after}].")
+                "GATE gn_ppm_extreme_tail_range: omega_support got: "
+                f"before=[{omega_min_host}, {omega_max_host}], "
+                f"after=[{omega_min_after}, {omega_max_after}]; want: "
+                "after support contained in before support; why: tail "
+                "coarsening may contract but must never enlarge fitted pole "
+                "support.")
 
     # THE ODD RESIDUE, from the FINAL pole.  ``D = i a (omega_p^2 +
     # Omega^2) / (2 omega_p)`` is a statement about the pole the Sigma
@@ -1055,14 +1065,17 @@ def _augment_odd_kernel_nodes(tau, x_min, x_max, omega_p, *,
         k += 1
     if err > float(gate_error):
         raise RuntimeError(
-            "GATE odd_kernel_representation: the time-reversal-odd probe "
-            f"kernel omega_p/(x^2+omega_p^2) on [{float(x_min):.6g}, "
-            f"{float(x_max):.6g}] Ry (omega_p={wp:.6g}) reached sup error "
-            f"{err:.3e} with {k} extra nodes, above the gate "
-            f"{float(gate_error):.3e}; ceiling {int(max_extra)} extras.  "
-            "Want: an odd rule at the served even rule's accuracy.  Fix: "
-            "raise minimax_max_nodes / relax minimax_target_error, or run "
-            "this magnet under compute_mode = mpa.")
+            "GATE odd_kernel_representation: the odd probe kernel missed "
+            "the configured representation accuracy.\n"
+            f"  got:  sup_error = {err:.3e}, target = "
+            f"{float(gate_error):.3e}, extra_nodes = {k}, "
+            f"max_extra = {int(max_extra)}, interval = "
+            f"[{float(x_min):.6g}, {float(x_max):.6g}] Ry, "
+            f"omega_p = {wp:.6g} Ry\n"
+            "  want: sup_error <= minimax_target_error\n"
+            "  why:  a less accurate odd rule would model broken-TR W at "
+            "lower accuracy than the served even rule\n"
+            "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
     return cur, np.asarray(beta, dtype=np.float64), int(k), float(err)
 
 
