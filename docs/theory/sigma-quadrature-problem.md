@@ -17,7 +17,7 @@ poles have `Im Omega_p <= 0`. MPA applies the requested broadening `eta` once
 in every executable weight. The GN/HL one-pole adapter retains the incumbent
 PPM convention: crossing boxes receive the resolved `eta`, while
 sign-definite Laplace boxes are unbroadened. The same box rule is built on
-the ordinary physical-`eta` support with fixed fourfold accuracy headroom,
+the ordinary physical-`eta` support with fixed tenfold accuracy headroom,
 then its unchanged nodes and weights are separately certified on the
 translated real-axis support before execution.
 

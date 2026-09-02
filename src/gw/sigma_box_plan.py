@@ -472,8 +472,8 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     unbroadened = bool(spec.get("unbroadened", False))
     # A rule fitted on the physical-eta line remains cheap.  PPM's real-axis
     # Laplace limit is a fixed second certificate of those SAME nodes, not a
-    # retry: reserve fourfold headroom before measuring the translated line.
-    fit_eps = 0.25 * eps if unbroadened else eps
+    # retry: reserve tenfold headroom before measuring the translated line.
+    fit_eps = 0.1 * eps if unbroadened else eps
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
