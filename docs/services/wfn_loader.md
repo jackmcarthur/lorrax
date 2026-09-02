@@ -113,6 +113,18 @@ for the real one, which is exactly what the deleted shim was.
 * **The loader instance is open to attribute attachment.** `psp` attaches
   `grid_rho` at runtime; `__slots__`/strict `__setattr__` are forbidden
   forever (see Antipatterns).
+* **QE schema binding is bounded discovery, not a search.**
+  `qe_schema=None` calls `symmetry_maps.discover_qe_schema_paths(wfn_path)`:
+  candidates are a `data-file-schema.xml` beside the WFN, or one inside any
+  `*.save/` under `.`, `scf`, `nscf`, `qe/scf` or `qe/nscf`, anchored at the
+  WFN's directory (given and resolved) and at most two directories above it.
+  An explicit `qe_schema=` that does not authenticate against the WFN is a
+  refusal; failure to find one in auto mode is not — `SymMaps` falls back to
+  the **conservative legacy all-spatial header interpretation plus the global
+  DFT-reference TRS verdict, and announces it** with a
+  `SYMMETRY PROVENANCE WARNING` naming `qe_symmetry_diagnostic` as the reason
+  (`services/symmetry_maps/src/symmetry_maps/maps.py:1958-1971`). What an
+  authenticated binding pins: [`symmetry_maps`](symmetry_maps.md).
 
 ## Backends
 
