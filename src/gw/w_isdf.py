@@ -82,12 +82,31 @@ from .minimax_screening import MinimaxNodes
 # ============================================================================
 
 _chi_minimax_kernel_cache: dict = {}
+_fused_photon_chi_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
 
 # The static metal fallback streams one small ordered band-pair tile at a
 # time.  This is deliberately a compile-time constant: changing it is a
 # memory/performance choice, not physics or an input-file option.
 _STATIC_FRACTIONAL_PAIR_TILE = 8
+
+_PHOTON_FAMILY_VERTICES = (
+    ((0, 0),),
+    ((0, 1), (0, 2), (0, 3)),
+    ((1, 0), (2, 0), (3, 0)),
+    tuple((A, B) for A in (1, 2, 3) for B in (1, 2, 3)),
+)
+
+
+def _fused_photon_gemm_calls_per_tau(stream_by_family, nspin=4):
+    """Static GemmPlan call count for one fused Lorentz-family tau node."""
+    streams = tuple(bool(x) for x in stream_by_family)
+    if len(streams) != len(_PHOTON_FAMILY_VERTICES):
+        raise ValueError("fused photon chi requires four family stream flags")
+    ns2 = int(nspin) ** 2
+    return sum(
+        ns2 * (1 + len(vertices)) if stream else 2
+        for stream, vertices in zip(streams, _PHOTON_FAMILY_VERTICES))
 
 
 def _complete_static_vertex_orientations(forward_R, reverse_R=None):
@@ -114,6 +133,46 @@ def _complete_static_vertex_orientations(forward_R, reverse_R=None):
         # Preserve the incumbent scalar graph and arithmetic order exactly.
         return forward_R + jnp.conj(forward_R)
     return forward_R + jnp.conj(jnp.swapaxes(reverse_R, -1, -2))
+
+
+def _contract_face_vertex_orientations(
+    Gv_R, Gc_R, perm_l, phase_l, perm_r, phase_r, *,
+    left_identity: bool, right_identity: bool,
+):
+    """Contract one full-spin Green pair for both ordered orientations.
+
+    This is the sole owner of the Lorentz row-phase conventions shared by
+    the per-block oracle and the fused packed-response path.
+    """
+    if left_identity and right_identity:
+        forward = jnp.einsum(
+            'Rambn,Rambn->Rmn', Gc_R, jnp.conj(Gv_R), optimize=True)
+        return forward, None
+
+    from common.gamma_matrices import gamma_double_contract
+    forward = gamma_double_contract(
+        jnp.conj(Gv_R), Gc_R,
+        perm_L=None if left_identity else perm_l,
+        phase_L=None if left_identity else phase_l,
+        # The trace uses Gamma_B[c,d], whereas the helper's row form is
+        # Gamma_B[d,c].  Hermitian monomial vertices therefore need the
+        # conjugated row phase on the right endpoint.
+        perm_R=None if right_identity else perm_r,
+        phase_R=None if right_identity else jnp.conj(phase_r),
+        spin_axes=(1, 3))
+
+    # Natural BA endpoint order is (mu_B,mu_A).  These are local views of
+    # the same Green tensors; the completion owner applies its dagger.
+    Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
+    Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
+    reverse = gamma_double_contract(
+        jnp.conj(Gv_R_ba), Gc_R_ba,
+        perm_L=None if right_identity else perm_r,
+        phase_L=None if right_identity else jnp.conj(phase_r),
+        perm_R=None if left_identity else perm_l,
+        phase_R=None if left_identity else phase_l,
+        spin_axes=(1, 3))
+    return forward, reverse
 
 
 
@@ -155,7 +214,6 @@ def _resolve_vertex_spin_pair_stream(
             f"half of the {device_budget_bytes / 1e9:.2f} GB device budget",
             flush=True)
     return stream
-
 
 def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             n_out: int = 1, *,
@@ -622,8 +680,6 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
         return minimax_tau_integrate_chi_multi
 
-    if vertex_pair:
-        from common.gamma_matrices import gamma_double_contract
     left_identity, right_identity = vertex_identity
 
     def _single_impl(
@@ -694,43 +750,19 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                       enk_full, tau_kernel, vmax, cmin)
             Gv_R = _Gv_fftn(Gv_k)
             Gc_R = _Gc_fftn(Gc_k)
-            reverse_tau_raw = None
-            if vertex_operands is None or (left_identity and right_identity):
+            if vertex_operands is None:
+                # Non-vertex scalar caller: retain the exact incumbent
+                # charge contraction without constructing gamma operands.
                 chi_tau_raw = jnp.einsum(
                     'Rambn,Rambn->Rmn',
                     Gc_R, jnp.conj(Gv_R), optimize=True)
+                reverse_tau_raw = None
             else:
-                perm_l, phase_l, perm_r, phase_r = vertex_operands
-                chi_tau_raw = gamma_double_contract(
-                    jnp.conj(Gv_R), Gc_R,
-                    perm_L=None if left_identity else perm_l,
-                    phase_L=None if left_identity else phase_l,
-                    # Right endpoint orientation: the trace uses
-                    # Gamma_B[c,d], whereas the helper's row form is
-                    # Gamma_B[d,c].  Canonical alpha matrices are Hermitian
-                    # monomials, so conjugating the row phase transposes it.
-                    perm_R=None if right_identity else perm_r,
-                    phase_R=(None if right_identity else jnp.conj(phase_r)),
-                    spin_axes=(1, 3))
-                # The reverse ordered transition has natural endpoint axes
-                # (mu_B,mu_A) and swapped Lorentz labels (B,A).  The local
-                # transposes are views of the SAME two Green tensors: no
-                # second G build or FFT is required.  Only the orientation
-                # owner below applies its dagger back to (mu_A,mu_B).
-                Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
-                Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
-                reverse_tau_raw = gamma_double_contract(
-                    jnp.conj(Gv_R_ba), Gc_R_ba,
-                    perm_L=None if right_identity else perm_r,
-                    # Taking the natural BA endpoint adjoint conjugates
-                    # both Hermitian vertex tables.  On the left that is
-                    # the conjugated row phase; on the helper's transposed
-                    # right convention the two conjugations cancel.
-                    phase_L=(None if right_identity
-                             else jnp.conj(phase_r)),
-                    perm_R=None if left_identity else perm_l,
-                    phase_R=None if left_identity else phase_l,
-                    spin_axes=(1, 3))
+                chi_tau_raw, reverse_tau_raw = (
+                    _contract_face_vertex_orientations(
+                        Gv_R, Gc_R, *vertex_operands,
+                        left_identity=left_identity,
+                        right_identity=right_identity))
             chi_tau = jax.lax.with_sharding_constraint(
                 chi_tau_raw, _chi_R_shard)
             if not complex_contour:
@@ -773,6 +805,249 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             vmax, cmin, None)
 
     return minimax_tau_integrate_chi
+
+
+def _get_fused_photon_chi_kernel(
+    mesh_xy, kgrid, layout, charge_shape, transverse_shape, *,
+    stream_by_family, distrib_la_batched_route,
+):
+    """One static packed-response kernel with family-shared Green pairs.
+
+    The four endpoint families are CC, CT, TC and TT.  Each non-streamed
+    family builds its valence/conduction Green pair once per tau and applies
+    all of that family's Lorentz vertices to it.  A streamed family keeps one
+    Gv/Gc spin pair live and reuses Gv across its Lorentz blocks.  Both paths
+    update the same packed R-space accumulator directly.
+    """
+    from common.fft_helpers import make_flat_k_fftn
+    from common.gamma_matrices import gamma_perm_phase
+    from distrib_la import gemm_plan
+    from .greens_function_kernel import build_G_tau
+    from .photon_layout import (
+        accumulate_photon_block, photon_block_view, replace_photon_block)
+    from .wavefunction_bundle import (
+        CHI_Q_SPEC as _chi_spec,
+        CHI_R_SPEC as _chi_R_spec,
+        G_FFT7D_SPEC as _G_spec,
+        G_FLATK_SPEC as _G_out_flatk,
+        PSI_MUN_SPEC as _psi_mun_spec,
+        PSI_NMU_SPEC as _psi_nmu_spec,
+    )
+
+    distrib_la_batched_route = str(
+        distrib_la_batched_route).strip().lower()
+    family_shapes = (
+        (charge_shape, charge_shape),
+        (charge_shape, transverse_shape),
+        (transverse_shape, charge_shape),
+        (transverse_shape, transverse_shape),
+    )
+    stream_by_family = tuple(bool(x) for x in stream_by_family)
+    key = (id(mesh_xy), tuple(kgrid), layout, tuple(family_shapes),
+           stream_by_family, distrib_la_batched_route)
+    hit = _fused_photon_chi_kernel_cache.get(key)
+    if hit is not None:
+        return hit
+
+    nk = int(np.prod(kgrid))
+    ns = int(charge_shape[3])
+    if ns != 4 or int(transverse_shape[3]) != ns:
+        raise ValueError("fused photon chi requires four-component bispinors")
+    if any(int(shape[0]) != nk or int(shape[1]) != int(charge_shape[1])
+           for pair in family_shapes for shape in pair):
+        raise ValueError(
+            "fused photon chi endpoint bundles must share nk and band extent")
+
+    _G_k_shard = NamedSharding(mesh_xy, _G_out_flatk)
+    _chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
+    _packed_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    _psi_mun_shard = NamedSharding(mesh_xy, _psi_mun_spec)
+    _psi_nmu_shard = NamedSharding(mesh_xy, _psi_nmu_spec)
+
+    family_plans = tuple(
+        gemm_plan(
+            mesh_xy,
+            m=int(left_shape[2]) * (1 if stream else ns),
+            k=int(left_shape[1]),
+            n=int(right_shape[2]) * (1 if stream else ns),
+            nq=nk, dtype=jnp.complex128,
+            batched_route=distrib_la_batched_route)
+        for (left_shape, right_shape), stream in
+        zip(family_shapes, stream_by_family))
+
+    def make_family(pair_shapes, stream, plan):
+        left_shape, right_shape = pair_shapes
+        fft_v = make_flat_k_fftn(mesh_xy, kgrid, _G_spec, norm='ortho')
+        fft_c = make_flat_k_fftn(mesh_xy, kgrid, _G_spec, norm='ortho')
+        fft_chi = make_flat_k_fftn(
+            mesh_xy, kgrid, _chi_spec, norm='ortho')
+
+        def build_full(psi_mun, psi_nmu, mask_v, mask_c, enk,
+                       tau_scalar, vmax, cmin):
+            Gv_k = build_G_tau(
+                psi_mun, psi_nmu, enk, -tau_scalar, e_ref=vmax,
+                mask=mask_v, layout="face", gemm=plan)
+            Gc_k = build_G_tau(
+                psi_mun, psi_nmu, enk, tau_scalar, e_ref=cmin,
+                mask=mask_c, layout="face", gemm=plan)
+            return (
+                fft_v(jax.lax.with_sharding_constraint(
+                    jnp.conj(Gv_k), _G_k_shard)),
+                fft_c(jax.lax.with_sharding_constraint(
+                    jnp.conj(Gc_k), _G_k_shard)),
+            )
+
+        def build_pair(psi_mun, psi_nmu, mask, enk, tau_scalar, e_ref,
+                       spin_left, spin_right, fft):
+            psi_mun_pair = jax.lax.dynamic_slice_in_dim(
+                psi_mun, spin_left, 1, axis=1)
+            psi_nmu_pair = jax.lax.dynamic_slice_in_dim(
+                psi_nmu, spin_right, 1, axis=2)
+            G_k = build_G_tau(
+                psi_mun_pair, psi_nmu_pair, enk, tau_scalar,
+                e_ref=e_ref, mask=mask, layout="face", gemm=plan)
+            G_k = jax.lax.with_sharding_constraint(jnp.conj(G_k), _G_k_shard)
+            return fft(G_k)[:, 0, :, 0, :]
+
+        return build_full, build_pair, fft_v, fft_c, fft_chi
+
+    family_programs = tuple(
+        make_family(shapes, stream, plan)
+        for shapes, stream, plan in
+        zip(family_shapes, stream_by_family, family_plans))
+    gamma_tables = tuple(gamma_perm_phase(i) for i in range(4))
+
+    def make_family_branch(family_index):
+        build_full, build_pair, fft_v, fft_c, _ = family_programs[family_index]
+        vertices = _PHOTON_FAMILY_VERTICES[family_index]
+        stream = stream_by_family[family_index]
+
+        def branch(operand):
+            packed, tau_scalar, alpha_scalar, psi_c_mun, psi_c_nmu, \
+                psi_t_mun, psi_t_nmu, mask_v, mask_c, enk, vmax, cmin = operand
+            if family_index == 0:
+                psi_mun, psi_nmu = psi_c_mun, psi_c_nmu
+            elif family_index == 1:
+                psi_mun, psi_nmu = psi_c_mun, psi_t_nmu
+            elif family_index == 2:
+                psi_mun, psi_nmu = psi_t_mun, psi_c_nmu
+            else:
+                psi_mun, psi_nmu = psi_t_mun, psi_t_nmu
+
+            if not stream:
+                Gv_R, Gc_R = build_full(
+                    psi_mun, psi_nmu, mask_v, mask_c, enk,
+                    tau_scalar, vmax, cmin)
+                for A, B in vertices:
+                    forward, reverse = _contract_face_vertex_orientations(
+                        Gv_R, Gc_R, *gamma_tables[A], *gamma_tables[B],
+                        left_identity=(A == 0), right_identity=(B == 0))
+                    chi_tau = jax.lax.with_sharding_constraint(
+                        _complete_static_vertex_orientations(forward, reverse),
+                        _chi_R_shard)
+                    packed = accumulate_photon_block(
+                        packed, alpha_scalar * chi_tau, layout, A, B, mesh_xy)
+                return packed
+
+            def stream_pair_body(acc, pair_index):
+                spin_l = pair_index // ns
+                spin_r = pair_index % ns
+                Gv_pair = build_pair(
+                    psi_mun, psi_nmu, mask_v, enk, -tau_scalar, vmax,
+                    spin_l, spin_r, fft_v)
+                for A, B in vertices:
+                    perm_l, phase_l = gamma_tables[A]
+                    perm_r, phase_r = gamma_tables[B]
+                    gc_l = spin_l if A == 0 else perm_l[spin_l]
+                    gc_r = spin_r if B == 0 else perm_r[spin_r]
+                    coeff_l = (jnp.asarray(1, jnp.complex128)
+                               if A == 0 else phase_l[spin_l])
+                    coeff_r = (jnp.asarray(1, jnp.complex128)
+                               if B == 0 else jnp.conj(phase_r[spin_r]))
+                    Gc_pair = build_pair(
+                        psi_mun, psi_nmu, mask_c, enk, tau_scalar, cmin,
+                        gc_l, gc_r, fft_c)
+                    contribution = coeff_l * coeff_r * Gc_pair * jnp.conj(Gv_pair)
+                    chi_tau = _complete_static_vertex_orientations(
+                        contribution, jnp.swapaxes(contribution, -1, -2))
+                    acc = accumulate_photon_block(
+                        acc, alpha_scalar * chi_tau, layout, A, B, mesh_xy)
+                return acc, None
+
+            packed, _ = jax.lax.scan(
+                stream_pair_body, packed,
+                jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
+            return packed
+
+        return branch
+
+    family_branches = tuple(make_family_branch(i) for i in range(4))
+
+    def make_finalize_branch(A, B):
+        family_index = (0 if A == 0 and B == 0 else
+                        1 if A == 0 else 2 if B == 0 else 3)
+        fft_chi = family_programs[family_index][4]
+
+        def branch(packed):
+            block_R = photon_block_view(packed, layout, A, B, mesh_xy)
+            block_q = fft_chi(block_R)
+            if A and B:
+                block_q = _subtract_static_tt_contact(block_q)
+            return replace_photon_block(
+                packed, block_q, layout, A, B, mesh_xy)
+
+        return branch
+
+    finalize_branches = tuple(
+        make_finalize_branch(A, B) for A in range(4) for B in range(4))
+
+    _rep0 = NamedSharding(mesh_xy, P())
+    _rep1 = NamedSharding(mesh_xy, P(None))
+    _rep2 = NamedSharding(mesh_xy, P(None, None))
+    _nodes_shard = MinimaxNodes(t=_rep1, alpha=_rep1)
+
+    @partial(
+        jax.jit,
+        in_shardings=(
+            _nodes_shard, _psi_mun_shard, _psi_nmu_shard,
+            _psi_mun_shard, _psi_nmu_shard,
+            _rep2, _rep2, _rep2, _rep0, _rep0),
+        out_shardings=_packed_shard,
+    )
+    def fused_kernel(
+        nodes, psi_c_mun, psi_c_nmu, psi_t_mun, psi_t_nmu,
+        mask_v, mask_c, enk, vmax, cmin,
+    ):
+        packed0 = jax.lax.with_sharding_constraint(
+            jnp.zeros(
+                (nk, layout.packed_extent, layout.packed_extent),
+                dtype=jnp.complex128),
+            _packed_shard)
+
+        def tau_body(packed, xs):
+            tau_scalar, alpha_scalar = xs
+            tau_scalar = jnp.real(tau_scalar).astype(jnp.float64)
+
+            def family_body(i, packed_state):
+                operand = (
+                    packed_state, tau_scalar, alpha_scalar,
+                    psi_c_mun, psi_c_nmu, psi_t_mun, psi_t_nmu,
+                    mask_v, mask_c, enk, vmax, cmin)
+                return jax.lax.switch(i, family_branches, operand)
+
+            packed = jax.lax.fori_loop(0, 4, family_body, packed)
+            return packed, None
+
+        packed_R, _ = jax.lax.scan(
+            tau_body, packed0, (nodes.t, nodes.alpha), unroll=1)
+
+        def finalize_body(i, packed):
+            return jax.lax.switch(i, finalize_branches, packed)
+
+        return jax.lax.fori_loop(0, 16, finalize_body, packed_R)
+
+    _fused_photon_chi_kernel_cache[key] = fused_kernel
+    return fused_kernel
 
 
 
@@ -2169,13 +2444,13 @@ def compute_experimental_no_pair_photon_chi0(
     memory_per_device_gb=None,
     distrib_la_batched_route: str = "auto",
 ):
-    """Build all sixteen no-pair blocks with an experimental TT proxy.
+    """Build the packed no-pair response with an experimental TT proxy.
 
-    Only one response block and the donated packed accumulator are live at a
-    time.  The three transverse channels reuse ``wfns_transverse`` and differ
-    only by their gamma vertex; no T1/T2/T3 wavefunction copies are made.
+    CC/CT/TC/TT each build one Green family per tau, then reuse it for every
+    Lorentz block in that family.  The response is accumulated in R space in
+    one packed buffer and each block is transformed in place afterward.  The
+    three transverse channels remain views of one wavefunction bundle.
     """
-    from .photon_layout import pack_photon_operator
 
     layout.assert_mesh(mesh_xy)
     if current_contact != _WARD_SUBTRACTED_NO_PAIR:
@@ -2196,26 +2471,75 @@ def compute_experimental_no_pair_photon_chi0(
             "photon layout padded extents do not match wavefunction "
             f"bundles: layout C/T=({layout.padded_extent(0)},"
             f"{layout.padded_extent(1)}), wfns C/T=({n_c},{n_t})")
-    nq = int(meta.nk_tot)
-    families = (wfns_charge, wfns_transverse,
-                wfns_transverse, wfns_transverse)
+    if (wfns_charge.slices != wfns_transverse.slices or
+            tuple(wfns_charge.enk.shape) != tuple(wfns_transverse.enk.shape)):
+        raise ValueError(
+            "fused photon response requires charge/transverse bundles to "
+            "share band slices and energy-table shape")
 
-    def get_block(A, B):
-        chi_ab = compute_no_pair_dirac_current_block(
-            families[A], families[B], quad, meta, mesh_xy,
-            vertex_left=A, vertex_right=B,
-            energy_reference=energy_reference,
-            memory_per_device_gb=memory_per_device_gb,
-            distrib_la_batched_route=distrib_la_batched_route)
-        if A and B:
-            # Experimental no-pair Ward completion: TT only.  CC/CT/TC are
-            # left untouched and no diamagnetic contact is invented.
-            return _subtract_static_tt_contact(chi_ab)
-        return chi_ab
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    enk_charge_host = np.asarray(
+        jax.device_get(wfns_charge.enk), dtype=np.float64)
+    enk_transverse_host = np.asarray(
+        jax.device_get(wfns_transverse.enk), dtype=np.float64)
+    if not np.array_equal(
+            enk_charge_host, enk_transverse_host, equal_nan=True):
+        raise ValueError(
+            "fused photon response requires identical charge/transverse "
+            "band energies; per-block API remains available for diagnostics")
+    s = wfns_charge.slices
+    shifted = enk_charge_host - eref
+    vmax = float(np.max(shifted[:, s.val]))
+    cmin = float(np.min(shifted[:, s.cond]))
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    alpha_chi = (-np.asarray(quad.alpha, dtype=np.float64)
+                 * np.exp(-tau * (cmin - vmax)))
+    nodes = MinimaxNodes(
+        t=jnp.asarray(tau, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128))
 
-    return pack_photon_operator(
-        get_block, nq, layout, mesh_xy,
-        progress_label="packed photon chi0")
+    from .wavefunction_bundle import face_kernel_kwargs
+    charge_shape = face_kernel_kwargs(wfns_charge)["face_shape"]
+    transverse_shape = face_kernel_kwargs(wfns_transverse)["face_shape"]
+    family_shapes = (
+        (charge_shape, charge_shape),
+        (charge_shape, transverse_shape),
+        (transverse_shape, charge_shape),
+        (transverse_shape, transverse_shape),
+    )
+    stream_by_family = tuple(
+        _resolve_vertex_spin_pair_stream(
+            mesh_xy, left, right, None,
+            memory_per_device_gb=memory_per_device_gb)
+        for left, right in family_shapes)
+    if jax.process_index() == 0:
+        calls_per_tau = _fused_photon_gemm_calls_per_tau(stream_by_family)
+        print(
+            "  [chi0] fused Lorentz families "
+            f"stream(CC,CT,TC,TT)={stream_by_family}; "
+            f"GemmPlan calls/tau={calls_per_tau}, "
+            f"total={calls_per_tau * len(tau)}",
+            flush=True)
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    kernel = _get_fused_photon_chi_kernel(
+        mesh_xy, kgrid, layout, charge_shape, transverse_shape,
+        stream_by_family=stream_by_family,
+        distrib_la_batched_route=distrib_la_batched_route)
+    mask_v = wfns_charge.band_mask(s.val)
+    mask_c = wfns_charge.band_mask(s.cond)
+    enk = wfns_charge.enk - jnp.asarray(
+        eref, dtype=wfns_charge.enk.dtype)
+    started = time.perf_counter()
+    packed = kernel(
+        nodes,
+        wfns_charge.psi_mun, wfns_charge.psi_nmu,
+        wfns_transverse.psi_mun, wfns_transverse.psi_nmu,
+        mask_v, mask_c, enk,
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64))
+    timing.completion_receipt(
+        "packed photon chi0", packed, started_at=started)
+    return packed
 
 
 @dataclass(frozen=True)

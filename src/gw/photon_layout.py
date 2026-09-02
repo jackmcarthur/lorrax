@@ -129,7 +129,7 @@ class PhotonBasisLayout:
 
 
 _zero_cache: dict = {}
-_insert_cache: dict = {}
+_block_update_cache: dict = {}
 _view_cache: dict = {}
 _vector_pack_cache: dict = {}
 _q0_update_cache: dict = {}
@@ -150,12 +150,14 @@ def _empty(nq, layout, mesh_xy, dtype):
     return _zero_cache[key]()
 
 
-def _insert_program(layout, mesh_xy, nq, p_left, p_right):
-    """Shape-specialized insert; offsets/valid lengths stay runtime data."""
+def _block_update_program(
+    layout, mesh_xy, nq, p_left, p_right, *, accumulate,
+):
+    """Shape-specialized set/add; offsets and valid lengths stay runtime."""
     key = (id(mesh_xy), int(nq), layout.packed_extent,
-           int(p_left), int(p_right))
-    if key in _insert_cache:
-        return _insert_cache[key]
+           int(p_left), int(p_right), bool(accumulate))
+    if key in _block_update_cache:
+        return _block_update_cache[key]
     from common.shard_map import shard_map
 
     side = layout.mesh_side
@@ -167,26 +169,36 @@ def _insert_program(layout, mesh_xy, nq, p_left, p_right):
     @partial(shard_map, mesh=mesh_xy,
              in_specs=(spec, spec, scalar, scalar, scalar, scalar),
              out_specs=spec, check_vma=False)
-    def insert_local(acc, block, off_left, off_right, n_left, n_right):
+    def update_local(acc, block, off_left, off_right, n_left, n_right):
         x0 = jax.lax.axis_index('x') * (p_left // side)
         y0 = jax.lax.axis_index('y') * (p_right // side)
         valid_left = x0 + jnp.arange(p_left // side) < n_left
         valid_right = y0 + jnp.arange(p_right // side) < n_right
         block = jnp.where(
             valid_left[None, :, None] & valid_right[None, None, :], block, 0)
+        if accumulate:
+            old = jax.lax.dynamic_slice(
+                acc, (jnp.asarray(0, dtype=jnp.int32), off_left, off_right),
+                (int(nq), p_left // side, p_right // side))
+            block = old + block
         return jax.lax.dynamic_update_slice(
-            acc, block, (jnp.asarray(0, dtype=jnp.int32),
-                         off_left, off_right))
+            acc, block,
+            (jnp.asarray(0, dtype=jnp.int32), off_left, off_right))
 
     @partial(jax.jit,
              in_shardings=(nat, nat, rep0, rep0, rep0, rep0),
              out_shardings=nat, donate_argnums=(0,))
-    def insert(acc, block, off_left, off_right, n_left, n_right):
-        return insert_local(
+    def update(acc, block, off_left, off_right, n_left, n_right):
+        return update_local(
             acc, block, off_left, off_right, n_left, n_right)
 
-    _insert_cache[key] = insert
-    return insert
+    _block_update_cache[key] = update
+    return update
+
+
+def _insert_program(layout, mesh_xy, nq, p_left, p_right):
+    return _block_update_program(
+        layout, mesh_xy, nq, p_left, p_right, accumulate=False)
 
 
 def _insert(packed, block, layout, A, B, mesh_xy):
@@ -200,6 +212,47 @@ def _insert(packed, block, layout, A, B, mesh_xy):
             packed, block,
             scalar(layout.local_offset(A)), scalar(layout.local_offset(B)),
             scalar(layout.logical_extent(A)), scalar(layout.logical_extent(B)))
+
+
+def _accumulate_program(layout, mesh_xy, nq, p_left, p_right):
+    return _block_update_program(
+        layout, mesh_xy, nq, p_left, p_right, accumulate=True)
+
+
+def accumulate_photon_block(
+    packed: jax.Array, block: jax.Array, layout: PhotonBasisLayout,
+    channel_left: int, channel_right: int, mesh_xy: Mesh,
+) -> jax.Array:
+    """Add one padded block locally to the canonical packed operator.
+
+    This is the additive sibling of :func:`pack_photon_operator`'s internal
+    insert.  It preserves ``P(None,'x','y')`` and structurally ignores the
+    block's internal padding, so response kernels can carry one packed
+    accumulator instead of sixteen block accumulators.
+    """
+    layout.assert_mesh(mesh_xy)
+    A, B = int(channel_left), int(channel_right)
+    expected = layout.block_shape(int(packed.shape[0]), A, B)
+    if tuple(block.shape) != expected:
+        raise ValueError(
+            f"photon block ({A},{B}) shape {block.shape} != {expected}")
+    scalar = lambda x: jnp.asarray(int(x), dtype=jnp.int32)
+    return _accumulate_program(
+        layout, mesh_xy, int(packed.shape[0]),
+        layout.padded_extent(A), layout.padded_extent(B))(
+            packed, block,
+            scalar(layout.local_offset(A)), scalar(layout.local_offset(B)),
+            scalar(layout.logical_extent(A)), scalar(layout.logical_extent(B)))
+
+
+def replace_photon_block(
+    packed: jax.Array, block: jax.Array, layout: PhotonBasisLayout,
+    channel_left: int, channel_right: int, mesh_xy: Mesh,
+) -> jax.Array:
+    """Replace one packed block locally, preserving padding invariants."""
+    layout.assert_mesh(mesh_xy)
+    return _insert(
+        packed, block, layout, int(channel_left), int(channel_right), mesh_xy)
 
 
 def pack_photon_operator(
@@ -718,6 +771,7 @@ def photon_q0_low_rank_block(
 __all__ = [
     "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
     "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
+    "accumulate_photon_block", "replace_photon_block",
     "pack_photon_response_tiles", "unpack_photon_response_tiles",
     "pack_photon_channel_vectors", "add_photon_q0_low_rank",
     "photon_q0_low_rank_block",
