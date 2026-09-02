@@ -100,7 +100,8 @@ import common.timing as timing
 from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver,
 	ScreeningDiagrams, packed_bare_transverse_route,
-	packed_photon_screens_current, refuse_unimplemented_compute_mode,
+	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
+	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
@@ -616,7 +617,12 @@ def main(argv=None):
 	if (do_screened
 			and config.head.correction is HeadCorrection.FULL
 			and config.screening.diagrams is ScreeningDiagrams.W_RPA
-			and not uses_static_photon_response(config)
+			# The DYNAMIC packed route keeps the scalar charge owner (its CC
+			# channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
+			# the direct DFT response its q->0 head samples are finalized
+			# from.  Only the STATIC packed mode, whose packed Gamma-cell
+			# completion replaces that machinery outright, skips it.
+			and not packed_photon_replaces_charge_sigma(config)
 			# Every self-consistent mode builds its exact frequency plan and
 			# response inside the map.  A pre-map response would exist only to
 			# seed a restart artifact and could be mistaken for final physics.
@@ -669,8 +675,15 @@ def main(argv=None):
 				# bare-transverse family declares chi_TT = chi_CT = 0 and screens
 				# only CC, whose owner is the incumbent scalar screening model.
 				_screens_current = packed_photon_screens_current(config)
+				# PHASE 3.  On the dynamic packed route the CHARGE block is
+				# frequency dependent and is owned end to end by the scalar
+				# Sigma_c machinery, so this run needs the mode's FULL role
+				# set ({static, probe} for the plasmon-pole pair) rather than
+				# the single static role the bare family's packed CC block is
+				# assembled from -- and it must KEEP them past this block.
+				_dynamic_packed = uses_dynamic_packed_photon_route(config)
 				_W_charge = None
-				if not _screens_current:
+				if not _screens_current or _dynamic_packed:
 					W_by_role = compute_screening_model(
 						mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
 						centroid_indices=centroid_indices, config=config,
@@ -681,14 +694,15 @@ def main(argv=None):
 						mpa_plan=oneshot_mpa_plan,
 						iteration_head_response=oneshot_head_response,
 						tensors_filename=tensors_filename,
-						static_only=True,
+						static_only=not _dynamic_packed,
 						print_fn=print0)
-					_W_charge = W_by_role.get("static")
-					if _W_charge is None:
-						raise RuntimeError(
-							"the packed bare-transverse route needs the incumbent "
-							"static W(omega=0) on the charge block; the screening "
-							"model returned no 'static' role.")
+					if not _screens_current:
+						_W_charge = W_by_role.get("static")
+						if _W_charge is None:
+							raise RuntimeError(
+								"the packed bare-transverse route needs the incumbent "
+								"static W(omega=0) on the charge block; the screening "
+								"model returned no 'static' role.")
 				from .w_isdf import compute_static_photon_response
 				photon_response = compute_static_photon_response(
 					wfns, wfns_transverse, quad, bispinor_v_q_path,
@@ -707,14 +721,21 @@ def main(argv=None):
 					print_fn=print0)
 				# Sigma consumes packed block views directly.  Do not extract a
 				# scalar W00 body solely to satisfy the legacy role mapping.
+				# The DYNAMIC route keeps W_by_role: its charge channel is the
+				# ordinary Sigma_c(omega) on those same role W's.
 				_W_charge = None
-				W_by_role = {}
+				if not _dynamic_packed:
+					W_by_role = {}
 				print0(
 					"  static photon route: "
 					+ ("full_static_cohsex (sixteen chi blocks, one packed "
 					   "Dyson solve)" if _screens_current else
 					   "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
-					   "scalar Dyson on CC, W_packed = diag(W_00, D_TT))"))
+					   "scalar Dyson on CC, W_packed = diag(W_00, D_TT))")
+					+ ("" if not _dynamic_packed else
+					   "; DYNAMIC packed route: the CC block carries "
+					   f"compute_mode = {mode.value} at every omega and the "
+					   "twelve current blocks are frozen at omega = 0"))
 				print0(
 					"  static photon response: "
 					f"approximation={photon_response.approximation}, "
@@ -725,6 +746,22 @@ def main(argv=None):
 				# of the packed mode in production mode, where print0 sinks
 				# component chatter (owner ruling 2026-09-01: a headless
 				# packed run is a DEBUG setting and must say so).
+				if _dynamic_packed:
+					# THE RUN RECORD MUST SAY WHICH SIGMA RAN.  A bispinor
+					# plasmon-pole deck used to take the incumbent
+					# charge-screened + Sigma^B route with no TT Gamma head;
+					# it now takes the packed operator, and the current blocks
+					# are an omega = 0 approximation inside a dynamic run.
+					# Both facts are physics, so neither is left to a log.
+					report.progress(
+						"Photon Sigma   : dynamic packed route -- "
+						f"W_packed(omega) = diag(W_00(omega), W_TT, W_CT) with "
+						f"compute_mode = {mode.value} on the CHARGE block and "
+						"the twelve current blocks STATIC (omega = 0). The "
+						"charge q->0 head is the dynamic model's; the TT/CT "
+						"q->0 head is the packed Gamma-cell completion's. "
+						"Sigma^B is the TT block of the packed operator, not "
+						"a separate term.")
 				_hc = photon_response.head_completion
 				report.progress(
 					"Photon head    : "
@@ -752,7 +789,7 @@ def main(argv=None):
 					print_fn=print0)
 
 	if (oneshot_head_response is not None
-			and not uses_static_photon_response(config)):
+			and not packed_photon_replaces_charge_sigma(config)):
 		if mode.value == "mpa":
 			final_head = W_by_role.get("iteration_head")
 			if final_head is None:
@@ -785,7 +822,7 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	if (not uses_static_photon_response(config)
+	if (not packed_photon_replaces_charge_sigma(config)
 			and driver_persists_w0(mode, config)
 			and qp_solver is not QPSolver.SELF_CONSISTENT):
 		with timing.section("gw_jax.persist_w0"):
@@ -806,7 +843,10 @@ def main(argv=None):
 	# correlation), so only the X-head survives — which is the piece needed.
 	static_head_terms = None
 	if (config.do_G0
-			and not uses_static_photon_response(config)):
+			# The dynamic packed route's CC head is this scalar one; only the
+			# static packed mode refuses it (its packed completion carries the
+			# charge sector, and a scalar overlay would double count it).
+			and not packed_photon_replaces_charge_sigma(config)):
 		# A screened SC+FULL map always builds/folds its own head.  Supplying
 		# and printing a direct DFT seed here would be false provenance even
 		# though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep

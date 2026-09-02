@@ -30,6 +30,17 @@ by ``GATE photon_head_sigma_sector_closure`` (the three sectors must sum to
 the direct sixteen-block head total).  These diagnostics are what
 ``gw.gw_output.write_freq_debug`` prints as the ``*_CC/_CTTC/_TT`` columns.
 
+This is ALSO the Sigma owner of the dynamic packed route (phase 3,
+``compute_mode`` in the plasmon-pole pair with ``bispinor = true``).  There
+the charge block's frequency dependence is carried by the ordinary scalar
+Sigma_c machinery (:mod:`gw.ppm_pipeline` on the same ISDF ``W_00``) and the
+current blocks are frozen at ``omega = 0``, so this function is called with
+``blocks = "current"`` and contracts the twelve non-CC blocks only.  The
+``(0,0)`` block is then skipped in the loop below and nowhere else: there is
+one consumer, one head-sector closure gate and one set of kernels for both
+routes.  See ``docs/theory/four-current-head-corrections.md`` and
+``gw.sigma_dispatch.compute_sigma_xc``.
+
 The accumulator stays 2-D sharded until the ordinary static-Sigma result
 boundary (the face carrier first gathers its canonical full-band result, then
 windows it exactly as scalar COHSEX does).  A photon body or Green tensor is
@@ -54,6 +65,13 @@ _TERM_COH = 2
 _HEAD_CC = 0
 _HEAD_CTTC = 1
 _HEAD_TT = 2
+#: ``blocks`` selections of :func:`compute_static_photon_sigma`.  ``all`` is
+#: the sixteen-block static COHSEX Sigma; ``current`` is the twelve non-CC
+#: blocks, used by the dynamic packed route whose CC block is owned by the
+#: scalar Sigma_c machinery at every frequency.
+PHOTON_BLOCKS_ALL = "all"
+PHOTON_BLOCKS_CURRENT = "current"
+_PHOTON_BLOCK_SELECTIONS = (PHOTON_BLOCKS_ALL, PHOTON_BLOCKS_CURRENT)
 _photon_sigma_kernel_cache: dict[tuple[object, ...], object] = {}
 
 
@@ -285,6 +303,7 @@ def compute_static_photon_sigma(
     photon_layout,
     meta,
     mesh_xy: Mesh,
+    blocks: str = PHOTON_BLOCKS_ALL,
     head_completion=None,
     diagnostic_basis_rotation=None,
     diagnostic_input_basis=None,
@@ -293,13 +312,33 @@ def compute_static_photon_sigma(
 ) -> tuple[
     jax.Array, jax.Array, jax.Array, StaticPhotonHeadSigmaDiagnostics | None,
 ]:
-    """Stream all sixteen ``D^{AB}`` blocks into full static COHSEX.
+    """Stream the ``D^{AB}`` blocks into full static COHSEX.
 
     ``V_packed`` and ``W_packed`` must stay at ``P(None, 'x', 'y')``.
     :func:`gw.photon_layout.photon_block_view` returns a mesh-aligned padded
     view, whose two extents must equal those of the corresponding charge or
     transverse wavefunction bundle.  No logical block is copied or gathered.
+
+    ``blocks`` selects which of the sixteen are summed, and is the ONLY
+    difference between the static and the dynamic packed route's use of this
+    function:
+
+    * ``"all"`` (the default, ``compute_mode = cohsex``) -- all sixteen.
+    * ``"current"`` (the dynamic packed route) -- the twelve blocks with at
+      least one current index.  The ``(0,0)`` block is skipped because the
+      dynamic route's charge channel is owned end to end by the scalar
+      ``Sigma_x + Sigma_c(omega)`` machinery on the same ``W_00``; summing it
+      here as well would double count it, statically.
+
+    The head-sector closure gate is unaffected by the selection: the skipped
+    blocks are absent from the direct total and from the per-sector sums
+    alike, so the CC sector is exactly zero under ``"current"`` rather than
+    partially populated.
     """
+    if blocks not in _PHOTON_BLOCK_SELECTIONS:
+        raise ValueError(
+            f"photon Sigma block selection must be one of "
+            f"{_PHOTON_BLOCK_SELECTIONS}; got {blocks!r}")
     if wfns_charge.layout != wfns_transverse.layout:
         raise ValueError(
             "photon Sigma requires charge and transverse wavefunction "
@@ -348,6 +387,11 @@ def compute_static_photon_sigma(
         left_g = with_lorentz_vertices(left, A, 0)
         n_left = padded_centroid_extent(left)
         for B in _CHANNELS:
+            if blocks == PHOTON_BLOCKS_CURRENT and A == 0 and B == 0:
+                # The dynamic packed route's charge channel is the scalar
+                # Sigma_x + Sigma_c(omega); the packed operator's CC block is
+                # its omega = 0 sample and is not summed a second time here.
+                continue
             right = _bundle_for_channel(wfns_charge, wfns_transverse, B)
             right_g = with_lorentz_vertices(right, 0, B)
             n_right = padded_centroid_extent(right)

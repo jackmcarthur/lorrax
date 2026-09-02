@@ -3562,6 +3562,25 @@ BARE_TRANSVERSE_MODES: tuple[BispinorGWMode, ...] = (
 )
 
 
+#: The compute modes the packed four-current operator serves.  ``cohsex`` is
+#: the phase-1 static mode (the packed operator owns the WHOLE Sigma); the
+#: two-point plasmon-pole pair is the phase-3 dynamic packed route, where the
+#: CHARGE block is dynamic (the ordinary scalar Sigma_c on the same ISDF
+#: W_00) and the twelve current blocks are frozen at omega = 0.
+#:
+#: ``mpa`` is deliberately absent.  ``gw.screening.screening_requests_for``
+#: returns NO independent static role for it (its shared double-parallel
+#: frequency walk is not a set of role requests), so the bare-transverse
+#: family's CC block of ``W_packed`` would have no owner, and no gate in the
+#: phase-3 lane covers the fit-store plumbing.  It refuses by name rather
+#: than being served the plasmon-pole branch's assembly.
+PACKED_PHOTON_COMPUTE_MODES: tuple[ComputeMode, ...] = (
+    ComputeMode.COHSEX,
+    ComputeMode.GN_PPM,
+    ComputeMode.HL_PPM,
+)
+
+
 def packed_bare_transverse_route(config) -> tuple[bool, str]:
     """Is the bare-transverse family served by the packed photon path?
 
@@ -3600,8 +3619,10 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     if not bool(config.bispinor):
         return False, "bispinor = false (no transverse channels to pack)"
     conditions = (
-        (config.compute_mode is ComputeMode.COHSEX,
-         f"compute_mode = {config.compute_mode.value}", "compute_mode = cohsex"),
+        (config.compute_mode in PACKED_PHOTON_COMPUTE_MODES,
+         f"compute_mode = {config.compute_mode.value}",
+         "compute_mode in {"
+         + ", ".join(m.value for m in PACKED_PHOTON_COMPUTE_MODES) + "}"),
         (config.qp_solver is QPSolver.ONE_SHOT_DFT,
          f"qp_solver = {config.qp_solver.value}", "qp_solver = one_shot_dft"),
         (config.screening.diagrams is ScreeningDiagrams.W_RPA,
@@ -3616,7 +3637,12 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     for accepted, got, want in conditions:
         if not accepted:
             return False, f"{got} (the packed bare route wants {want})"
-    return True, "bispinor slab one-shot static COHSEX"
+    if config.compute_mode is ComputeMode.COHSEX:
+        return True, "bispinor slab one-shot static COHSEX"
+    return True, (
+        f"bispinor slab one-shot {config.compute_mode.value} -- the DYNAMIC "
+        "packed route: W_00(omega) on the charge block, the twelve current "
+        "blocks frozen at omega = 0")
 
 
 def packed_photon_screens_current(config) -> bool:
@@ -3645,6 +3671,41 @@ def uses_static_photon_response(config) -> bool:
     if mode is BispinorGWMode.FULL_STATIC_COHSEX:
         return True
     return packed_bare_transverse_route(config)[0]
+
+
+def packed_photon_replaces_charge_sigma(config) -> bool:
+    """Does the packed operator own the WHOLE Sigma, charge channel included?
+
+    True only for ``compute_mode = cohsex``: the sixteen-block consumer
+    produces Sigma_X, Sigma_SX and Sigma_COH from the packed V/W and no
+    scalar charge Sigma, scalar q->0 head or scalar W role survives beside
+    it.
+
+    False on the DYNAMIC packed route, where the charge block is the
+    ordinary scalar ``Sigma_x + Sigma_c(omega)`` on the same ISDF ``W_00``
+    and the packed consumer contributes only the twelve current blocks
+    (``gw.photon_sigma`` ``blocks = "current"``).  Every driver seam that
+    asks "may I skip the scalar charge machinery?" asks THIS, not
+    :func:`uses_static_photon_response` -- the difference is exactly the
+    four call sites in ``gw.gw_jax`` that install head samples, persist W0,
+    build ``static_head_terms`` and read the scalar ``W_by_role``.
+    """
+    return (uses_static_photon_response(config)
+            and config.compute_mode is ComputeMode.COHSEX)
+
+
+def uses_dynamic_packed_photon_route(config) -> bool:
+    """The packed four-current operator on a frequency-dependent Sigma.
+
+    ``W_packed(omega) = diag(W_00(omega), W_TT, W_CT)``: the charge block
+    carries the run's plasmon-pole model, the current blocks are the
+    ``omega = 0`` packed response.  See
+    ``reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md`` for the block
+    algebra and the measured bound on what freezing the current blocks
+    costs.
+    """
+    return (uses_static_photon_response(config)
+            and config.compute_mode.ppm_model is not None)
 
 
 def uses_coupled_photon_head(config) -> bool:
@@ -3782,9 +3843,13 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "DEBUG headless body (not a production calculation)\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
     requirements = (
-        (config.compute_mode is ComputeMode.COHSEX,
+        (config.compute_mode in PACKED_PHOTON_COMPUTE_MODES,
          f"compute_mode = {config.compute_mode.value}",
-         "compute_mode = cohsex"),
+         "compute_mode in {"
+         + ", ".join(m.value for m in PACKED_PHOTON_COMPUTE_MODES)
+         + "} (cohsex is the static packed mode; the plasmon-pole pair is "
+         "the dynamic packed route with static current blocks; mpa has no "
+         "independent static-role W and is refused here)"),
         (config.screening.diagrams is ScreeningDiagrams.W_RPA,
          f"screening_diagrams = {config.screening.diagrams.value}",
          "screening_diagrams = w_rpa"),
