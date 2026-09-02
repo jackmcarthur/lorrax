@@ -13,8 +13,12 @@ R_np / d_jnp,       d_jnp = omega_j - sigma_b (E_n + Omega_p),
 ```
 
 where `sigma_b=+1` for conduction and `-1` for valence. The fitted retarded
-poles have `Im Omega_p <= 0`; the requested broadening `eta` is applied once in
-the executable weights.
+poles have `Im Omega_p <= 0`. MPA applies the requested broadening `eta` once
+in every executable weight. The GN/HL one-pole adapter retains the incumbent
+PPM convention: crossing boxes receive the resolved `eta`, while
+sign-definite Laplace boxes are unbroadened (implemented with a strictly
+positive, error-subordinate offset so the shared box rule remains in its
+declared upper-half-plane domain).
 
 The reciprocal is replaced by a short exponential sum,
 
@@ -110,7 +114,11 @@ omega - sigma_b * (E + Re Omega)
 
 over that window's external frequencies, live state energies, and selected
 pole extrema. The positive imaginary support presented to the rule builder is
-`[-Im Omega_min + eta, -Im Omega_max + eta]`.
+`[-Im Omega_min + eta, -Im Omega_max + eta]` for MPA and crossing PPM boxes.
+For a sign-definite PPM box, `eta` in that expression is replaced by an
+offset bounded by `1e-3*eps` times the nearest real-axis distance. This is the
+pre-box PPM Laplace limit to below the rule's own error budget, not a second
+quadrature path.
 
 The real interval is padded by 2% of `max(width,eta)`. A sign-definite edge is
 allowed to move at most 30% toward zero, so padding never changes a
@@ -161,15 +169,17 @@ The rule service builds on `Im d > 0`. A lower-half-plane window is served by
 
 ```
 time_exec = pole_sign * t
-alpha_exec = w * exp(-eta * time_exec)
+alpha_exec = w * exp(-eta_window * time_exec)
 omega_sign = pole_sign * external_sign
 project = "full"
 prefactor = -1
 ```
 
-and with state/pole reference shifts chosen at the bounded endpoint of each
-factored exponential. `gw/sigma_box_plan.py` is the sole owner of these box
-plan conventions; `gw/mpa/sigma.py` only dispatches the finished windows.
+where `eta_window=eta` except on the unbroadened sign-definite PPM boxes just
+described, and with state/pole reference shifts chosen at the bounded endpoint
+of each factored exponential. `gw/sigma_box_plan.py` is the sole owner of
+these box plan conventions; `gw/mpa/sigma.py` only dispatches the finished
+windows.
 
 ## 6. Cache and process independence
 

@@ -511,6 +511,7 @@ def compute_sigma_c_mpa_omega_grid(
     sigma_branches=None,
     band_brackets=None,
     band_counts=None,
+    broaden_sign_definite=True,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -539,6 +540,9 @@ def compute_sigma_c_mpa_omega_grid(
     while sharing this planner and executor exactly.  ``band_brackets`` and
     ``band_counts`` similarly carry the optional disjoint band-convergence
     partition.  They change neither pole interpretation nor window planning.
+    ``broaden_sign_definite`` defaults to MPA's literal-eta convention; the
+    GN/HL one-pole adapter disables only that part to preserve its historical
+    unbroadened Laplace branches while sharing this executor.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
@@ -612,7 +616,8 @@ def compute_sigma_c_mpa_omega_grid(
                 print_fn=print_fn, edge_factor=edge_factor,
                 occupation_window_threshold=occupation_window_threshold,
                 pole_weight_label=("max(abs(R+), abs(R-))"
-                                   if ordered_residues else "abs(B_p)"))
+                                   if ordered_residues else "abs(B_p)"),
+                broaden_sign_definite=broaden_sign_definite)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "

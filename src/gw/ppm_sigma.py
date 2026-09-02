@@ -2189,6 +2189,9 @@ def compute_sigma_c_ppm_omega_grid(
     print_fn(
         f"  {ansatz_name} fit -> MPA store: one pole per ISDF pair at "
         f"{fit_store_path}; invalid policy={invalid_mode}")
+    print_fn(
+        "  PPM denominator broadening: resolved eta on crossing boxes; "
+        "sign-definite Laplace boxes retain the unbroadened PPM limit")
 
     branches = branches_for_omega_grid(
         omega_req,
@@ -2213,6 +2216,7 @@ def compute_sigma_c_ppm_omega_grid(
         sigma_branches=branches,
         band_brackets=plan.bounds,
         band_counts=plan.counts,
+        broaden_sign_definite=False,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:

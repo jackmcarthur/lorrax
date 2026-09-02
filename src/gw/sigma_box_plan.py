@@ -542,7 +542,11 @@ def _parallel_fits(specs, worker):
             error = None
         except Exception as exc:  # refusals cross ranks as data, then raise
             value = None
-            error = f"{type(exc).__name__}: {exc}"
+            spec = specs[index]
+            error = (
+                f"Sigma box window {spec['name']!r} failed while fitting "
+                f"box={tuple(spec['box'])} Ry at kind={spec['kind']!r}: "
+                f"{type(exc).__name__}: {exc}")
         local.append({
             "index": index, "source_rank": rank, "value": value,
             "error": error, "wall_seconds": time.perf_counter() - started,
@@ -586,6 +590,7 @@ def plan_sigma_windows(
     edge_factor=1.5,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_weight_label="abs(B_p)",
+    broaden_sign_definite=True,
 ):
     """Build the MPA Sigma quadrature from core/outlier pole products.
 
@@ -622,6 +627,12 @@ def plan_sigma_windows(
     pole_weight_label
         Report label for the pole field supplied as ``B``.  Ordered GN uses
         a branch-neutral witness for both residues; ordinary MPA uses B_p.
+    broaden_sign_definite
+        Apply the external ``eta`` to sign-definite denominators.  This is
+        the MPA convention and the default.  The GN/HL one-pole adapter sets
+        it false to retain its established unbroadened Laplace branches;
+        crossing boxes still receive ``eta``.  An error-subordinate positive
+        offset keeps the common upper-half-plane rule in its declared domain.
 
     Returns
     -------
@@ -741,6 +752,22 @@ def plan_sigma_windows(
             kind = ("sign_definite_positive" if box[0] > 0.0 else
                     "sign_definite_negative" if box[1] < 0.0 else
                     "crossing")
+            eta_exec = eta
+            if kind != "crossing" and not broaden_sign_definite:
+                # PPM's incumbent Laplace branches evaluate the real-axis
+                # reciprocal.  Keep the common box service's Im(d)>0
+                # contract with an offset whose induced relative model
+                # change is <= 1e-3*eps at the nearest real edge.  Intrinsic
+                # fitted pole widths remain in both this box and Omega_p.
+                distance = min(abs(float(box[0])), abs(float(box[1])))
+                eta_exec = max(
+                    np.finfo(np.float64).tiny,
+                    distance * tolerance * 1.0e-3)
+                box = (
+                    box[0], box[1],
+                    box[2] - eta + eta_exec,
+                    box[3] - eta + eta_exec,
+                )
             e_ref_a, e_ref_b = _factor_references(
                 kind, pole_sign, states, pole_stats)
             specs.append({
@@ -758,6 +785,7 @@ def plan_sigma_windows(
                 "omega_idx": positions, "frequencies": frequencies,
                 "raw_real_support": raw_real, "box": box,
                 "old_box": old_box, "kind": kind,
+                "regularization_width_ry": eta_exec,
                 "conjugate": pole_sign < 0.0,
                 "E_ref_A": e_ref_a, "E_ref_B": e_ref_b,
                 "branch_report": report,
@@ -793,7 +821,8 @@ def plan_sigma_windows(
         time_exec = spec["pole_sign"] * np.asarray(
             fit["times"], np.complex128)
         alpha_exec = (np.asarray(fit["weights"], np.complex128)
-                      * np.exp(-eta * time_exec))
+                      * np.exp(
+                          -spec["regularization_width_ry"] * time_exec))
         mask = np.zeros(int(np.prod(spec["state_shape"])), dtype=bool)
         mask[np.asarray(spec["state_indices"], np.int64)] = True
         external_sign = -1 if spec["branch"].neg_omega_half else 1
@@ -834,6 +863,8 @@ def plan_sigma_windows(
             "old_box_ry": (None if spec["old_box"] is None
                            else list(spec["old_box"])),
             "box_ry": list(spec["box"]), "rule_box_ry": list(fit["rule_box"]),
+            "external_regularization_ry": spec[
+                "regularization_width_ry"],
             "node_count": fit["node_count"],
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
@@ -872,6 +903,7 @@ def plan_sigma_windows(
             "branch_coverage_residuals": coverage_residuals,
         },
         "eta_ry": eta, "eps": tolerance,
+        "broaden_sign_definite": bool(broaden_sign_definite),
         "reduction_seconds": budget, "cache_dir": cache_dir,
         "pair_ceiling": ceiling, "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,

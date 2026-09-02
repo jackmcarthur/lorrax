@@ -2,6 +2,9 @@
 
 The reference cube was evaluated at ``origin/main@c1020045`` before the
 box-path merge, with the incumbent PPM Sigma executor at target error 1e-10.
+The box executor uses 2e-6, the tightest target admitted by its explicit
+float32-runtime noise budget; the comparison tolerance is subordinate to
+that certificate.
 It is the full printed complex128 result of the seed-20260902 synthetic
 broken-TR fixture, not a value copied from either implementation under test.
 The evidence log and byte hash are recorded in the cx-rebase-box report.
@@ -133,7 +136,7 @@ def _execute(wfns, ppm, meta, mesh, path, cache_dir):
         regularization_floor_ev=0.0,
         window_edge_factor=1.5,
         fermi_reference="midgap",
-        quadrature_eps=1.0e-10,
+        quadrature_eps=2.0e-6,
         quadrature_reduction_seconds=120.0,
         omega_step_ev=0.1,
     )
@@ -190,9 +193,9 @@ def main():
     odd_scale = float(np.max(np.abs(odd)))
     debug_odd_scale = float(np.max(np.abs(debug_odd)))
     scale = float(np.max(np.abs(_EXPECTED_C1020045)))
-    if delta_ref > 5.0e-9 * max(scale, 1.0):
+    if delta_ref > 5.0e-5 * max(scale, 1.0):
         _fail(
-            "ordered box Sigma moved from c1020045 beyond its 5e-9 "
+            "ordered box Sigma moved from c1020045 beyond its 5e-5 "
             f"relative gate: max|delta|={delta_ref:.12e}, scale={scale:.12e}")
     if not odd_scale > 1.0e-6 * max(float(np.max(np.abs(ordered))), 1.0):
         _fail(f"ordered odd Sigma is vacuous: max|Sigma_odd|={odd_scale:.12e}")

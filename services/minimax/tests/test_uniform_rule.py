@@ -45,6 +45,20 @@ def test_negative_sign_definite_box_rotates_the_other_way():
     assert rule.node_count <= 16
 
 
+def test_near_zero_negative_box_samples_stay_inside_support():
+    # Frozen from MoS2 3x3 GN-PPM at ccedb42c: the negative outlier product
+    # ends much less than one sampling step below zero.  The former inclusive
+    # arange overshot that edge, injected Re d = 0 into this sign-definite
+    # box, and log-density weighting made the rule's SVD fail to converge.
+    box = (-6.195715306999824, -2.48806956292924e-05,
+           0.055998946780564385, 0.055998946780564385)
+    samples = box_samples(*box)
+    assert np.all(samples.real >= box[0])
+    assert np.all(samples.real <= box[1])
+    assert np.all(samples.real < 0.0)
+    assert np.all(np.isfinite(np.log(np.abs(samples.real))))
+
+
 def test_crossing_box_count_follows_bandwidth():
     # Symmetric crossing box of real width B = 40 eta: real-time ray,
     # count near the Gauss estimate 0.5*(B/eta)*ln(10/eps)/pi ~= 73 for 1e-4.

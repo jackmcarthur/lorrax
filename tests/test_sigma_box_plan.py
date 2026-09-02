@@ -140,6 +140,28 @@ def test_executor_conventions_and_lower_half_conjugation(monkeypatch):
     assert val[0].window.omega_sign == -1
 
 
+def test_ppm_compatibility_broadens_only_crossing_boxes(monkeypatch):
+    plan, geometry = _plan(monkeypatch, broaden_sign_definite=False)
+    crossing, tail = plan[:2]
+    fake_crossing = _fake_rule(
+        geometry["branches"][0]["windows"][0]["box_ry"], 1.0e-4)
+    fake_tail = _fake_rule(
+        geometry["branches"][0]["windows"][1]["box_ry"], 1.0e-4)
+    tail_eta = geometry["branches"][0]["windows"][1][
+        "external_regularization_ry"]
+
+    assert geometry["broaden_sign_definite"] is False
+    assert geometry["branches"][0]["windows"][0][
+        "external_regularization_ry"] == 0.1
+    assert 0.0 < tail_eta < 1.0e-6
+    np.testing.assert_allclose(
+        crossing.window.nodes.alpha,
+        fake_crossing.weights * np.exp(-0.1 * fake_crossing.times))
+    np.testing.assert_allclose(
+        tail.window.nodes.alpha,
+        fake_tail.weights * np.exp(-tail_eta * fake_tail.times))
+
+
 def test_containment_cache_reuses_rules_without_a_builder_call(
         monkeypatch, tmp_path):
     calls = []

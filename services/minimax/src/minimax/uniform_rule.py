@@ -89,7 +89,13 @@ def _re_line(lo, hi, h, near):
     parts = []
     a, b = max(lo, -near), min(hi, near)
     if a < b:
-        parts.append(np.arange(a, b + 0.5 * h, h))
+        # Keep every fitted sample inside the advertised support.  Rounding
+        # the stop upward by half a step can cross zero when a sign-definite
+        # box ends less than h/2 from it; relative weighting then evaluates
+        # log(abs(Re d)) at the injected zero and poisons the SVD with NaNs.
+        # The exact upper endpoint is appended below, so a half-open lattice
+        # loses neither boundary coverage nor the requested local spacing.
+        parts.append(np.arange(a, b, h))
     for sign, edge in ((1.0, hi), (-1.0, lo)):
         if sign * edge > near:
             n = int(1.5 * np.log(sign * edge / near) * near / h) + 8
