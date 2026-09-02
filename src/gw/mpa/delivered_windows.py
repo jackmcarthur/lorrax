@@ -1778,24 +1778,35 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
         return None, None
     metrics = candidate["metrics"]
     factor = _factor_growth(spec, times, eta)
-    # The box rule's contract is ``sup |Q - 1/d| <= eps`` on the whole
-    # support, which already bounds the measure-weighted residual the
-    # incumbent gate reads (a weighted mean of |error| cannot exceed its
-    # sup).  So the gate is never allowed to demand more than the deck's
-    # eps: ``relative_target`` is the campaign's apportioned allowance, and
-    # on windows with a large error envelope (val:bulk on Na: 1.8e-5 against
-    # eps 1e-3) it used to force a retry at an eps 50-100x tighter and then a
-    # fall-through to the incumbent fit -- 216 s on the critical rank of a
-    # plan whose crossing windows finished in 57 s (Na arm 04).  The looser
-    # of the two still applies to the runtime-noise clause, so a crossing
-    # rule with kappa_p99 ~ 50 is not refused at eps 3e-5 where the
-    # allowance was 6e-5 (Na arm 07).
-    # Tempting, and why not: gating at ``relative_target`` alone "keeps the
-    # global contract" -- but that contract is the apportionment's, and under
-    # eps the plan's contract is per-window sup <= eps (the selector budget
-    # is lifted accordingly, see the plan loop).
+    # Acceptance.  The box rule's contract is its own sup on the support in
+    # the currency that matches Sigma's error: relative error on a
+    # sign-definite box, peak-relative on a crossing box (see
+    # ``minimax.uniform_rule.build_uniform_rule``; ``rule.sup_error <= eps``
+    # is checked by the builder on its finer check cloud and re-checked
+    # here).  The incumbent residual clause -- a measure-weighted error
+    # relative to the LOCAL 1/|d| -- is recorded but does not gate: with the
+    # peak-relative criterion it used to refuse box rules on tails carrying
+    # semicore states (rightly: 4 meV at the Na 2s state, arm 09), and with
+    # the apportioned allowance as its target it forced a rebuild at an eps
+    # 50-100x tighter and a fall-through to the incumbent fit (216 s on the
+    # critical rank of a plan whose crossing windows finished in 57 s, Na
+    # arm 04).  The runtime-noise clause and the factor-growth cap still
+    # gate, the noise clause at the looser of the allowance and eps so a
+    # crossing rule with kappa_p99 ~ 50 is not refused at eps 3e-5 where
+    # the allowance was 6e-5 (Na arm 07).
+    # Tempting, and why not: (1) gating at ``relative_target`` alone "keeps
+    # the global contract" -- that contract is the apportionment's; under eps
+    # the plan's contract is per-window sup <= eps and the selector budget
+    # is lifted accordingly (plan loop).  (2) Dropping the incumbent
+    # residual from the record: it is the one measure-weighted number that
+    # would show a box that failed to cover its support.
     gate_target = max(float(relative_target), float(eps))
-    if (not _rule_accepted(metrics, gate_target)
+    noise_ok = (metrics[1] * RUNTIME_NOISE_EPSILON
+                <= AMPLIFICATION_NOISE_SAFETY * gate_target)
+    evidence["incumbent_residual_gate"] = bool(
+        _rule_accepted(metrics, gate_target))
+    evidence["criterion"] = "relative" if rule.relative else "peak-relative"
+    if (rule.sup_error > float(eps) or not noise_ok
             or max(factor) > float(factor_growth_cap)):
         return None, metrics
     required = max(metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON

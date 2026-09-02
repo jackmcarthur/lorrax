@@ -12,24 +12,31 @@ def _check(rule, box, eps):
     sup, kappa = rule_sup_error(rule.times, rule.weights, d)
     assert sup <= 3.0 * eps, (sup, eps)                  # fit cloud vs check cloud
     assert kappa <= 1.0e4
+    if rule.relative:                                    # sign-definite: relative error too
+        sup_rel, _ = rule_sup_error(rule.times, rule.weights, d, np.abs(d))
+        assert sup_rel <= 3.0 * eps, (sup_rel, eps)
     assert np.all(np.isfinite(rule.times)) and np.all(rule.times != 0.0)
     return sup
 
 
 def test_sign_definite_box_is_laplace_cheap():
-    # 1/d on Re d in [2 eta, 400 eta]: Braess-Hackbusch regime, ~10 nodes.
+    # 1/d on Re d in [2 eta, 400 eta]: Braess-Hackbusch regime.  In RELATIVE
+    # error (the currency of a sign-definite box) with Im d up to 30 eta this
+    # is 17 nodes; Hackbusch's real-interval tables give ~12 for R = 200.
     box = (2.0 * ETA, 400.0 * ETA, ETA, 30.0 * ETA)
     rule = build_uniform_rule(box, 1.0e-4, time_budget=30.0)
     _check(rule, box, 1.0e-4)
+    assert rule.relative
     assert rule.theta_deg < -40.0                        # rotated toward imaginary time
-    assert rule.node_count <= 16
+    assert rule.node_count <= 20
 
 
 def test_negative_sign_definite_box_rotates_the_other_way():
     box = (-100.0 * ETA, -4.0 * ETA, ETA, 20.0 * ETA)
     rule = build_uniform_rule(box, 1.0e-4, time_budget=30.0)
     _check(rule, box, 1.0e-4)
-    assert rule.theta_deg > 40.0
+    assert rule.relative
+    assert rule.theta_deg >= 40.0                        # the scan's grid includes 40 exactly
     assert rule.node_count <= 16
 
 
@@ -72,6 +79,8 @@ def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():
         box = (lo, hi, ETA, im_hi)
         rule = build_uniform_rule(box, eps, time_budget=5.0)
         d = box_samples(*box, per_unit=10.0, n_im=48)
-        sup, kappa = rule_sup_error(rule.times, rule.weights, d)
+        sup, kappa = rule_sup_error(rule.times, rule.weights, d,
+                                    np.abs(d) if rule.relative else None)
+        assert rule.relative == kind.startswith("sd")
         assert sup <= 1.5 * eps, (kind, box, sup, eps)
         assert kappa <= 1.0e4 and np.all(rule.times != 0.0)

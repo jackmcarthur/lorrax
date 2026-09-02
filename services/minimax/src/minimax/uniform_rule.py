@@ -2,7 +2,13 @@
 
 One rule per product window.  The only inputs are the window's support box
 ``[re_lo, re_hi] x [im_lo, im_hi]`` in the denominator ``d = omega - z``
-(``im_lo = eta``) and ``eps``, the sup error relative to the ``1/eta`` peak.
+(``im_lo = eta``) and ``eps``, a sup bound on the box in the currency that
+matches Sigma's error: the RELATIVE error ``|d| |Q - 1/d|`` on a
+sign-definite box (its terms are far from resonance and large, semicore
+states at ``|d| ~ 200 eta`` included), the error relative to the ``1/eta``
+peak, ``eta |Q - 1/d|``, on a crossing box (where ``1/d`` is bounded only by
+the peak and a relative bound at the edges would cost +50 % nodes for no
+delivered gain).  See ``build_uniform_rule``.
 Nothing about the spectral measure enters: the same box gives the same rule
 on every deck, which is what makes the result reproducible and cacheable
 (rules are keyed by ``(box, eps)``) and what removed the campaign's failure
@@ -20,7 +26,11 @@ flips ``Im d`` and leaves the real corners alone.
    the smallest numerical rank wins.  Symmetric crossing boxes get real time,
    sign-definite boxes rotate toward imaginary time (the Laplace family).
 2. **Start.** Interpolatory rule from a pivoted QR of the ray family's SVD
-   basis (``r`` nodes at ``eps/10``), ready after about a second.
+   basis (``r`` nodes at ``eps/10``), ready after about a second.  In the
+   relative currency the basis and the least squares carry the cloud's
+   log-density (every decade of ``|d|`` counts once) and the start is
+   polished by a few Lawson reweighting rounds toward the sup, because the
+   L2 optimum leaves the near corner 3-7x above ``eps``.
 3. **Reduction.** Bremer-Gimbutas-Rokhlin style: nodes are removed one at a
    time (batches while far above the target), the survivors re-solved by a
    variable-projection Levenberg-Marquardt on the CLOUD residual
@@ -115,6 +125,26 @@ def box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=5.0, n_im=6, near=30.0):
     return np.concatenate(out)
 
 
+def _log_density_weights(d):
+    """Per-sample weights ``sqrt(q_i)`` with ``q_i`` the spacing of ``log|Re d|``
+    within each ``Im`` level (mean 1).  In the relative currency the basis
+    truncation and the least-squares steps should count every decade of
+    ``|d|`` equally (the natural measure for ``1/x`` on ``[a, b]``); the cloud
+    itself is denser far out, and without this the truncated basis is all
+    about the far region and the start misses the relative criterion at the
+    near corner by 30x (measured: sup_rel 2.8e-3 at eps 1e-4 on the Na
+    val:bulk box, worst point ``d = re_lo + i im_lo``)."""
+    q = np.empty(d.size)
+    for level in np.unique(d.imag):
+        idx = np.nonzero(d.imag == level)[0]
+        x = np.log(np.abs(d.real[idx]))
+        order = np.argsort(x)
+        g = np.gradient(x[order]) if idx.size > 1 else np.ones(1)
+        q[idx[order]] = np.abs(g)
+    q /= max(q.mean(), 1e-300)
+    return np.sqrt(q)
+
+
 def _legal_angles(d, margin=0.25):
     """Ray angles (1 degree steps) whose slowest family member still decays at
     a rate of at least ``margin * min(Im d)``:
@@ -173,7 +203,17 @@ def _grid_size(d, theta, S, eps=1e-5, points_per_half_wave=3.0, cap=6000):
     life = np.minimum(S, np.log(10.0 / eps) / lam)
     interior = points_per_half_wave * np.max(nu * life) / np.pi
     near_zero = np.sqrt(points_per_half_wave * np.pi * S * np.max(nu) / 2.0)
-    return int(min(max(interior, near_zero) + 100, cap))
+    # The near-zero spacing must also resolve the shortest LIFETIME, not only
+    # the fastest oscillation: on a rotated ray the far members of a wide
+    # sign-definite box die within ``1/(|Re d| sin th)``, which in the
+    # relative currency they must be integrated to ``eps`` over (in the
+    # peak-relative currency they hardly count).  Measured on a box with
+    # ``R ~ 9000`` at 85 deg: the oscillation rule gave 138 points, the first
+    # interval was ten lifetimes wide, and the start rule was wrong
+    # everywhere (relative error 0.6, kappa 2e4).
+    near_decay = np.pi * np.sqrt(
+        points_per_half_wave * S * np.max(lam) / (2.0 * np.log(10.0 / eps)))
+    return int(min(max(interior, near_zero, near_decay) + 100, cap))
 
 
 def _family(d, theta, s):
@@ -182,8 +222,9 @@ def _family(d, theta, s):
     return np.exp(1j * d[:, None] * (s * np.exp(-1j * theta))[None, :])
 
 
-def _choose_angle(d, eps, scan=(-85, -70, -55, -40, -20, 0, 20, 40, 55, 70, 85)):
-    """Minimum ``eps``-rank ray angle over the legal interval.
+def _choose_angle(d, eps, rho, scan=(-85, -70, -55, -40, -20, 0, 20, 40, 55, 70, 85)):
+    """Minimum ``eps``-rank ray angle over the legal interval (rank in the
+    ``rho``-weighted norm, see ``build_uniform_rule``).
 
     Eleven candidate angles, each snapped to the nearest legal degree and
     skipped if none is within 0.6 degrees; the rank is measured on a thinned
@@ -197,7 +238,8 @@ def _choose_angle(d, eps, scan=(-85, -70, -55, -40, -20, 0, 20, 40, 55, 70, 85))
     a finer search changes the count by a node while costing an SVD per
     angle; the coarse scan is about a second."""
     th_ok, rate_ok = _legal_angles(d)
-    thin = d[::max(1, d.size // 500)]
+    step = max(1, d.size // 500)
+    thin, thin_rho = d[::step], rho[::step]
     best = None
     for deg in scan:
         i = int(np.argmin(np.abs(th_ok - np.deg2rad(deg))))
@@ -205,7 +247,8 @@ def _choose_angle(d, eps, scan=(-85, -70, -55, -40, -20, 0, 20, 40, 55, 70, 85))
             continue
         S = np.log(10.0 / eps) / rate_ok[i]
         s, w = _cheb_grid(S, _grid_size(thin, th_ok[i], S, eps))
-        sv = svd(_family(thin, th_ok[i], s) * np.sqrt(w)[None, :], compute_uv=False)
+        sv = svd(thin_rho[:, None] * _family(thin, th_ok[i], s) * np.sqrt(w)[None, :],
+                 compute_uv=False)
         r = int(np.sum(sv > eps * sv[0]))
         if best is None or r < best[0]:
             best = (r, th_ok[i], S, rate_ok[i])
@@ -235,12 +278,15 @@ class _RayFamily:
     projection is not the interpolant, so the pivoted QR below picked nodes
     the rule then could not reproduce."""
 
-    def __init__(self, d, theta, S, eps):
+    def __init__(self, d, theta, S, eps, rho):
         self.d, self.theta, self.S = d, theta, S
         self.phase = np.exp(-1j * theta)
         n_s = _grid_size(d, theta, S, eps)
         s, ws = _cheb_grid(S, n_s)
-        M = _family(d, theta, s) * np.sqrt(ws)[None, :]
+        # rows weighted by rho: the basis is truncated in the same norm the
+        # rule is accepted in (relative on a sign-definite box), otherwise
+        # the start misses the criterion and the reducer has nothing to keep
+        M = rho[:, None] * _family(d, theta, s) * np.sqrt(ws)[None, :]
         _P, sig, Qh = svd(M, full_matrices=False)
         r = int(np.sum(sig > eps * sig[0]))
         self.r = r
@@ -292,8 +338,10 @@ class _RayFamily:
 class _CloudFit:
     """Nonlinear least squares of the rule against ``1/d`` on the cloud.
 
-    Residual ``E_i = sum_k w_k exp(i d_i t_k) - 1/d_i`` scaled by ``im_lo`` so
-    ``|E|`` is relative to the ``1/eta`` peak (the same currency as ``eps``).
+    Residual ``E_i = sum_k w_k exp(i d_i t_k) - 1/d_i`` scaled by ``rho_i``:
+    ``im_lo`` (relative to the ``1/eta`` peak) on a crossing box, ``|d_i|``
+    (relative to the term's own size) on a sign-definite box -- the same
+    currency ``eps`` is stated in, see ``build_uniform_rule``.
     Nodes ``t = phase * s`` with ``Re s`` in ``[0, S]`` and ``Im s`` in
     ``[im_lo, im_hi]`` (the caller's off-ray cap); weights are eliminated by
     penalised least squares (variable projection with the Kaufman Jacobian).
@@ -305,10 +353,10 @@ class _CloudFit:
     exactly at every node step is what keeps the LM steps meaningful.
     """
 
-    def __init__(self, d, phase, S, im_lo, im_hi, eps, w_ref, alpha=0.3):
+    def __init__(self, d, phase, S, im_lo, im_hi, eps, w_ref, rho, alpha=0.3):
         self.d, self.phase, self.S, self.im_lo, self.im_hi = d, phase, S, im_lo, im_hi
         self.eps = eps
-        self.scale = d.imag.min()
+        self.scale = rho
         self.b = self.scale / d
         self.nb = np.linalg.norm(self.b)
         self.idp = 1j * d * phase
@@ -325,8 +373,8 @@ class _CloudFit:
         self.h = 0.5 * (im_hi - im_lo)
 
     def A(self, s):
-        """Design matrix ``exp(i d t)`` scaled to the ``1/eta`` currency."""
-        return np.exp(self.idp[:, None] * s[None, :]) * self.scale
+        """Design matrix ``exp(i d t)`` with the rows in the rule's currency."""
+        return np.exp(self.idp[:, None] * s[None, :]) * self.scale[:, None]
 
     def ls(self, s):
         """Penalised least-squares weights for nodes ``s``: QR of ``[A; mu I]``.
@@ -467,6 +515,27 @@ class _CloudFit:
         finish in the budget), or a fixed batch (one failure at batch 30
         would end the batch phase 30 nodes early)."""
         s, w, _res = self.newton(s.astype(complex), steps=nstep)     # polish the start
+        # A least-squares polish is L2-optimal, and on a sign-definite box in
+        # the relative currency its sup sits at the near corner, 3-7x above
+        # the L2 level (the corner is a small region in the log measure that
+        # carries the slowest ray members).  Lawson's reweighting -- rows
+        # re-weighted by their own residual and re-solved -- moves the L2
+        # optimum toward the minimax one; a handful of tempered rounds is
+        # enough to bring the corner under eps.  Tempting, and why not: a
+        # larger trunc (eps/100) instead -- it costs 4-5 nodes and kappa and
+        # still misses (measured 2.6e-4 at eps 1e-4 on the Na val:bulk box).
+        # The start's acceptance is not subject to the deadline: the budget
+        # bounds the REDUCTION, and a rule must exist at any budget (the
+        # rounds are bounded by construction, ~30 s on an R ~ 1e4 box).
+        for _round in range(6):
+            if ok(s, w):
+                break
+            E = np.abs(self.A(s) @ w - self.b)
+            factor = np.clip(np.sqrt(E / max(E.mean(), 1e-300)), 0.5, 2.0)
+            self.scale = self.scale * factor
+            self.scale *= self.nb / max(np.linalg.norm(self.scale / self.d), 1e-300)
+            self.b = self.scale / self.d
+            s, w, _res = self.newton(s, steps=nstep)
         if not ok(s, w):
             return None                                             # caller keeps the start
         best = (s.copy(), w.copy())
@@ -503,16 +572,18 @@ class _CloudFit:
         return best
 
 
-def rule_sup_error(times, weights, d):
-    """``(max |Q(d) - 1/d| * min Im d, max kappa)`` on the cloud ``d``, where
-    ``kappa = sum_k |w_k exp(i t_k d)| / |Q(d)|`` is the term-cancellation
-    ratio: the factor by which the executor's per-term noise is amplified in
-    the sum.  Both are what the planner's gates read."""
+def rule_sup_error(times, weights, d, rho=None):
+    """``(max rho |Q(d) - 1/d|, max kappa)`` on the cloud ``d``, where ``rho``
+    is ``min Im d`` (error relative to the ``1/eta`` peak, the default) or
+    ``|d|`` (relative error), and ``kappa = sum_k |w_k exp(i t_k d)| / |Q(d)|``
+    is the term-cancellation ratio: the factor by which the executor's
+    per-term noise is amplified in the sum.  Both are what the planner's
+    gates read."""
     A = np.exp(1j * d[:, None] * times[None, :])
     Q = A @ weights
-    err = np.abs(Q - 1.0 / d)
+    err = np.abs(Q - 1.0 / d) * (d.imag.min() if rho is None else rho)
     kappa = np.abs(A * weights[None, :]).sum(1) / np.maximum(np.abs(Q), 1e-300)
-    return float(err.max() * d.imag.min()), float(kappa.max())
+    return float(err.max()), float(kappa.max())
 
 
 @dataclass(frozen=True)
@@ -526,6 +597,7 @@ class UniformRule:
     weights: np.ndarray
     box: tuple
     eps: float
+    relative: bool
     theta_deg: float
     rank: int
     sup_error: float
@@ -538,14 +610,32 @@ class UniformRule:
 
     def one_line(self) -> str:
         return (f"uniform box rule: {self.node_count} nodes, ray {self.theta_deg:.0f} deg, "
-                f"rank {self.rank}, sup {self.sup_error:.2e} (eps {self.eps:g}), "
+                f"rank {self.rank}, sup {self.sup_error:.2e} (eps {self.eps:g}, "
+                f"{'relative' if self.relative else 'peak-relative'}), "
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
 
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
-                       reduce=True, time_budget=None):
+                       reduce=True, time_budget=None, relative=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
-    ``Im d > 0``.  ``eps`` is the sup error relative to the ``1/im_lo`` peak.
+    ``Im d > 0``.
+
+    ``eps`` is a sup bound on the box in the rule's currency: on a
+    sign-definite box (``re_lo > 0`` or ``re_hi < 0``) the RELATIVE error
+    ``|d| |Q(d) - 1/d| <= eps``; on a crossing box the error relative to the
+    ``1/im_lo`` peak, ``im_lo |Q(d) - 1/d| <= eps`` (``relative`` overrides
+    the choice).  The distinction is physics, not taste: a term's error in
+    Sigma scales with the term's own size ``1/|d|``.  A sign-definite tail
+    carries states far from resonance whose terms are large (semicore
+    states at ``|d| ~ 200 eta``), and a peak-relative sup of ``eps`` there is
+    a ``200 eps`` relative error: measured 4 meV at the Na 2s state where the
+    relative rule gives 0.1 meV.  Exponential sums for ``1/x`` on ``[a, b]``
+    are uniform in relative error at ``O(log(b/a))`` terms anyway, so the
+    relative criterion is free on those boxes.  On a crossing box ``1/d`` is
+    bounded only by the peak, and the relative criterion would tighten the
+    far edges by ``|d|/eta`` (up to 40x) for terms whose size the peak
+    already dominates: measured +50 % nodes on the Na conduction crossing
+    box (76 -> 115) for no delivered-error gain.
 
     ``im_cap`` bounds ``|Im t| * (box half-width)`` so no family member grows
     by more than ``exp(im_cap)`` off the ray (and never more than ``0.3 S``
@@ -568,8 +658,15 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             and 0.0 < im_lo <= im_hi):
         raise ValueError(f"invalid support box {box!r}")
     t0 = time.perf_counter()
+    if relative is None:
+        relative = re_lo > 0.0 or re_hi < 0.0
+    # rho_of: the acceptance currency (sup); fit_of: the same currency with
+    # the cloud's log-density folded in, for the basis and the least squares
+    rho_of = (lambda x: np.abs(x)) if relative else (lambda x: np.full(x.size, im_lo))
+    fit_of = ((lambda x: np.abs(x) * _log_density_weights(x)) if relative
+              else rho_of)
     d = box_samples(re_lo, re_hi, im_lo, im_hi)
-    _r0, theta, S, _rate = _choose_angle(d, eps)
+    _r0, theta, S, _rate = _choose_angle(d, eps, fit_of(d))
     n_im = _im_levels(theta)
     if n_im != 6:
         d = box_samples(re_lo, re_hi, im_lo, im_hi, n_im=n_im)
@@ -581,22 +678,35 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     # the failures were all rotated-ray boxes whose rule was exact at the
     # sampled Im levels and off between them.
     d_check = box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=8.0, n_im=2 * n_im)
-    fam = _RayFamily(d, theta, S, eps / trunc)
+    rho, rho_check = fit_of(d), rho_of(d_check)
+    fam = _RayFamily(d, theta, S, eps / trunc, rho)
     s, w = fam.interpolatory()
     if reduce:
         Bp = max(re_hi, 1e-3 * im_lo)
         Bm = max(-re_lo, 1e-3 * im_lo)
         im_lo_s, im_hi_s = max(-im_cap / Bp, -0.3 * S), min(im_cap / Bm, 0.3 * S)
-        # the cloud solver works in the executor's convention t = phase*s with
-        # weights -i*phase*w: the sup test below uses exactly that map
-        fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w)
 
         def ok(s_, w_):
-            e_, k_ = _score_cloud(fit, s_, w_, d_check)
+            e_, k_ = _score_cloud(fit, s_, w_, d_check, rho_check)
             return e_ <= eps and k_ <= kappa_cap
 
         deadline = t0 + (float(time_budget) if time_budget is not None else 1e30)
-        red = fit.reduce(s, ok, deadline)
+        # The start must be accepted before anything can be removed.  In the
+        # relative currency a loose eps (1e-3) with the default eps/10 basis
+        # can leave the near corner of a wide box (R ~ 500) above eps even
+        # after the Lawson rounds; a basis one order tighter costs ~2 nodes
+        # at the start and a few seconds, so escalate rather than refuse.
+        red = None
+        for extra in (1.0, 10.0, 100.0):
+            if extra > 1.0:
+                fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
+                s, w = fam.interpolatory()
+            # the cloud solver works in the executor's convention t = phase*s
+            # with weights -i*phase*w: the sup test uses exactly that map
+            fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
+            red = fit.reduce(s, ok, deadline)       # start acceptance ignores the deadline
+            if red is not None:
+                break
         if red is not None:
             s, w_fit = red
             times, weights = fam.phase * s, w_fit          # A w - b = scale (Q - 1/d): w is the rule weight
@@ -604,13 +714,14 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             times, weights = fam.to_rule(s, w)
     else:
         times, weights = fam.to_rule(s, w)
-    sup, kappa = rule_sup_error(times, weights, d_check)
+    sup, kappa = rule_sup_error(times, weights, d_check, rho_check)
     return UniformRule(
         times=times, weights=weights, box=(re_lo, re_hi, im_lo, im_hi),
-        eps=float(eps), theta_deg=float(np.rad2deg(theta)), rank=int(fam.r),
-        sup_error=sup, kappa_max=kappa, seconds=time.perf_counter() - t0)
+        eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),
+        rank=int(fam.r), sup_error=sup, kappa_max=kappa,
+        seconds=time.perf_counter() - t0)
 
 
-def _score_cloud(fit, s, w, d):
+def _score_cloud(fit, s, w, d, rho):
     """Sup error and kappa of the cloud-solver state ``(s, w)`` in rule form."""
-    return rule_sup_error(fit.phase * s, w, d)
+    return rule_sup_error(fit.phase * s, w, d, rho)
