@@ -1725,7 +1725,12 @@ _DEFAULTS = {
     # The frontier law is the production window-stable tail update.  The
     # all_conduction spelling retains the historical affine-fit control for
     # diagnosing window-edge cycles; it never changes degeneracy treatment.
-    "sc_tail_fit": "frontier",   # frontier | all_conduction
+    "sc_tail_fit": "frontier",   # frontier | all_conduction | buffer_edges
+    # Optional symmetric diagonal buffer around the named nval/ncond window.
+    # Zero preserves the historical window exactly.  Nonzero values are
+    # interpreted only by qp_solver=self_consistent.
+    "sc_buffer_nbands": 0,
+    "sc_buffer_mode": "diagonal",  # diagonal | one_sided | carry
     "sc_eigh": "auto",           # auto | native | distributed (per-iteration
                                  # eigh of the (nk, nb, nb) carry; a LAYOUT
                                  # choice, independent of the physics knobs)
@@ -4550,7 +4555,14 @@ class SCConfig:
       splittings above it remain distinct states.
     - ``tail_fit``: ``"frontier"`` uses the lowest accidental-degeneracy
       conduction manifold for the energy-only sum-band tail;
-      ``"all_conduction"`` is the historical affine-fit diagnostic control.
+      ``"all_conduction"`` is the historical affine-fit diagnostic control;
+      ``"buffer_edges"`` fits the two tails only to their adjacent diagonal
+      buffers.
+    - ``buffer_nbands``: number of extra valence and conduction states
+      evaluated around the named nval/ncond SC window.  Zero is the exact
+      historical path.
+    - ``buffer_mode``: treatment of those extra states: diagonal-only Sigma,
+      one-sided cross-edge Sigma, or a carried previous-energy reference.
     - ``eigh``: which eigh diagonalises the ``(nk, nb, nb)`` carry each
       iteration — ``"native"`` (k-sharded batch: one WHOLE ``(nb, nb)``
       tile per device), ``"distributed"`` (one tile spread over the mesh),
@@ -4567,6 +4579,8 @@ class SCConfig:
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
     tail_fit: str = "frontier"
+    buffer_nbands: int = 0
+    buffer_mode: str = "diagonal"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
     #: values are the METAL head modes: both run the per-iteration head
@@ -4596,10 +4610,20 @@ class SCConfig:
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
                 "The 0.1 meV ceiling separates accidental degeneracy from "
                 "resolved physical splittings; it is not an SC damping knob.")
-        if self.tail_fit not in ("frontier", "all_conduction"):
+        if self.tail_fit not in ("frontier", "all_conduction", "buffer_edges"):
             raise ValueError(
-                "sc_tail_fit must be 'frontier' or 'all_conduction'; "
+                "sc_tail_fit must be 'frontier', 'all_conduction' or "
+                "'buffer_edges'; "
                 f"got {self.tail_fit!r}.")
+        if self.buffer_nbands < 0:
+            raise ValueError("sc_buffer_nbands must be >= 0.")
+        if self.buffer_mode not in ("diagonal", "one_sided", "carry"):
+            raise ValueError(
+                "sc_buffer_mode must be 'diagonal', 'one_sided' or 'carry'; "
+                f"got {self.buffer_mode!r}.")
+        if self.tail_fit == "buffer_edges" and self.buffer_nbands == 0:
+            raise ValueError(
+                "sc_tail_fit='buffer_edges' requires sc_buffer_nbands > 0.")
         if self.eigh not in ("auto", "native", "distributed"):
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
@@ -5501,6 +5525,8 @@ class LorraxConfig:
             exact_degeneracy_tol_ev=float(
                 _g("sc_exact_degeneracy_tol_ev")),
             tail_fit=str(_g("sc_tail_fit")).strip().lower(),
+            buffer_nbands=int(_g("sc_buffer_nbands")),
+            buffer_mode=str(_g("sc_buffer_mode")).strip().lower(),
             # No env override: the LORRAX_SC_* envs are deprecated and a
             # new knob must not add one.
             eigh=str(_g("sc_eigh")).strip().lower(),

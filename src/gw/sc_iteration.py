@@ -323,6 +323,68 @@ class SCInputs:
     record_fn: Callable | None = None
 
 
+def _sc_buffer_mask(inputs: SCInputs) -> np.ndarray:
+    """Boolean mask for the symmetric buffer outside the named SC window."""
+    n_buffer = int(inputs.config.sc.buffer_nbands)
+    nb = int(inputs.band_slices.sigma.stop)
+    if n_buffer == 0:
+        return np.zeros(nb, dtype=bool)
+
+    band_ids = np.arange(
+        int(inputs.band_slices.b0), int(inputs.band_slices.b3),
+        dtype=np.int64)
+    core_lo = int(inputs.meta.nelec) - int(inputs.config.nval)
+    core_hi = int(inputs.meta.nelec) + int(inputs.config.ncond)
+    expected_lo = core_lo - n_buffer
+    expected_hi = core_hi + n_buffer
+    if (int(inputs.band_slices.b1), int(inputs.band_slices.b3)) != (
+            expected_lo, expected_hi):
+        raise ValueError(
+            "SC buffer execution edges disagree with the named window: "
+            f"got b1/b3={(inputs.band_slices.b1, inputs.band_slices.b3)}, "
+            f"expected {(expected_lo, expected_hi)} from nval/ncond="
+            f"{(inputs.config.nval, inputs.config.ncond)} plus "
+            f"sc_buffer_nbands={n_buffer}.")
+    return ((band_ids >= expected_lo) & (band_ids < core_lo)) | (
+        (band_ids >= core_hi) & (band_ids < expected_hi))
+
+
+def _apply_sc_buffer_partition(
+    partition: BandPartition,
+    inputs: SCInputs,
+) -> BandPartition:
+    """Make diagonal/carry buffers diagonal-only while retaining their Sigma."""
+    buffer = _sc_buffer_mask(inputs)
+    if not buffer.any() or inputs.config.sc.buffer_mode == "one_sided":
+        return partition
+    in_range = np.asarray(partition.in_range_mask, dtype=bool).reshape(-1)
+    outside = np.flatnonzero(buffer & ~in_range)
+    if outside.size:
+        raise ValueError(
+            "SC diagonal buffer left the sampled Sigma(omega) domain at "
+            f"local band(s) {outside.tolist()}; endpoint-clamped Sigma is not "
+            "a diagonal buffer. Widen sigma_omega_min/max_ev or reduce "
+            "sc_buffer_nbands.")
+    protected = np.asarray(
+        partition.protected_mask, dtype=bool).reshape(-1).copy()
+    protected[buffer] = False
+    return BandPartition(
+        protected_mask=jnp.asarray(protected),
+        in_range_mask=partition.in_range_mask)
+
+
+@jax.jit
+def _carry_sc_buffer_diagonal(H_new, H_input, buffer_mask):
+    """Replace buffer diagonals by the preceding map input's references."""
+    nb = H_new.shape[-1]
+    idx = jnp.arange(nb)
+    diagonal = jnp.where(
+        buffer_mask[None, :],
+        jnp.diagonal(H_input, axis1=-2, axis2=-1),
+        jnp.diagonal(H_new, axis1=-2, axis2=-1))
+    return H_new.at[:, idx, idx].set(diagonal)
+
+
 @dataclass(frozen=True)
 class SCMapScreeningArtifacts:
     """Screening artifacts owned by one completed QSGW map evaluation.
@@ -2513,6 +2575,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
             label=f"SC map {int(state.iteration)} (mu-anchored)",
             print_fn=inputs.print_fn)
+    partition = _apply_sc_buffer_partition(partition, inputs)
+    buffer_mask = _sc_buffer_mask(inputs)
+    if buffer_mask.any():
+        buffer_ids = np.flatnonzero(buffer_mask) + int(inputs.band_slices.b0) + 1
+        inputs.print_fn(
+            f"    SC window buffer: mode={inputs.config.sc.buffer_mode}, "
+            f"bands={_band_ranges(buffer_mask, band_offset=int(inputs.band_slices.b0))} "
+            f"(n={buffer_ids.size}); named core="
+            f"{int(inputs.meta.nelec) - int(inputs.config.nval) + 1}-"
+            f"{int(inputs.meta.nelec) + int(inputs.config.ncond)}")
 
     # Resolve an external MPA seed before any occupation consumer runs.  The
     # provider remains the sole owner of path resolution; production then
@@ -2603,6 +2675,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         fit_mask_kn = np.broadcast_to(
             np.asarray(partition.in_range_mask, dtype=bool)[None, :],
             e_dft_fit_ev.shape)
+        if inputs.config.sc.tail_fit == "buffer_edges":
+            fit_mask_kn &= np.broadcast_to(
+                buffer_mask[None, :], e_dft_fit_ev.shape)
         # SAME three-way classification as the active-window scissor below.
         # It matters here too: the tail law that gets applied is the
         # CONDUCTION one, and under the old index mask a Fermi-crossing
@@ -3023,6 +3098,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             mesh_xy=inputs.mesh_xy,
         )
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+    if (buffer_mask.any()
+            and inputs.config.sc.buffer_mode == "carry"
+            and int(state.iteration) > 0):
+        # Map zero earns a Sigma-derived reference for every buffer state.
+        # Later maps carry that reference instead of snapping the states back
+        # to DFT (or repeatedly reevaluating it).  Applying this on map zero
+        # would merely freeze the buffer at DFT and would not test option (c).
+        H_qp_dft_full = _carry_sc_buffer_diagonal(
+            H_qp_dft_full, state.H_qp_dft,
+            jnp.asarray(buffer_mask, dtype=bool))
 
     # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
     # Present only when ``use_band_extrapolation`` drove this stage's Σ.
@@ -3109,6 +3194,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
         scissor_fit=tail_fit,
+        use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
@@ -3211,6 +3297,7 @@ def _scissor_E_qp_for_outofrange(
     band_classes=None,
     scissor_fit: ScissorFit | None = None,
     fermi_displacement_ry: float,
+    use_valence_fit: bool = False,
     print_fn=None,
 ) -> tuple[jax.Array, object | None]:
     """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
@@ -3298,13 +3385,18 @@ def _scissor_E_qp_for_outofrange(
     # a band cannot be fit as one class and extrapolated as another.  Crossing
     # bands stay at E_DFT.  In practice they are protected/in-range, but the
     # identity is the honest no-information fallback if one is not.
-    out_ev = qsgw_out_of_range_energies(
-        e_dft_np * RYD_TO_EV,
-        fit,
-        valence_kn,
-        fermi_displacement_ev=float(fermi_displacement_ry) * RYD_TO_EV,
-        crossing_mask_kn=crossing_kn,
-    )
+    if use_valence_fit:
+        e_dft_ev = e_dft_np * RYD_TO_EV
+        out_ev = e_dft_ev + fit.predict(
+            e_dft_ev, valence_kn, crossing_mask=crossing_kn)
+    else:
+        out_ev = qsgw_out_of_range_energies(
+            e_dft_np * RYD_TO_EV,
+            fit,
+            valence_kn,
+            fermi_displacement_ev=float(fermi_displacement_ry) * RYD_TO_EV,
+            crossing_mask_kn=crossing_kn,
+        )
     return jnp.asarray(out_ev / RYD_TO_EV), fit
 
 
@@ -3320,6 +3412,7 @@ def _apply_scissor_partition_policy(
     candidate_efermi_fn: Callable[[jax.Array], float],
     band_classes=None,
     scissor_fit: ScissorFit | None = None,
+    use_valence_fit: bool = False,
     label: str = "SC",
     print_fn=print,
 ) -> tuple[jax.Array, ScissorFit | None]:
@@ -3340,6 +3433,7 @@ def _apply_scissor_partition_policy(
         band_classes=band_classes,
         scissor_fit=scissor_fit,
         fermi_displacement_ry=0.0,
+        use_valence_fit=use_valence_fit,
         print_fn=print_fn,
     )
     scissor_E_qp_kn_ry = scissor_provisional_ry
@@ -3381,15 +3475,20 @@ def _apply_scissor_partition_policy(
         crossing_kn = None
         if band_classes is not None:
             valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
-        scissor_E_qp_kn_ry = jnp.asarray(
-            qsgw_out_of_range_energies(
+        if use_valence_fit:
+            e_dft_ev = e_dft_np * RYD_TO_EV
+            candidate_ev = e_dft_ev + scissor_fit.predict(
+                e_dft_ev, valence_kn, crossing_mask=crossing_kn)
+        else:
+            candidate_ev = qsgw_out_of_range_energies(
                 e_dft_np * RYD_TO_EV,
                 scissor_fit,
                 valence_kn,
                 fermi_displacement_ev=(
                     fermi_displacement_ry * RYD_TO_EV),
                 crossing_mask_kn=crossing_kn,
-            ) / RYD_TO_EV)
+            )
+        scissor_E_qp_kn_ry = jnp.asarray(candidate_ev / RYD_TO_EV)
         print_fn(
             f"    {label} low-valence anchor: "
             f"E_F(DFT)={float(efermi_dft_ry) * RYD_TO_EV:+.6f} eV, "
@@ -5012,7 +5111,8 @@ def run_sc_driver(
         f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
         f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}, "
         f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV, "
-        f"tail_fit={sc.tail_fit}"
+        f"tail_fit={sc.tail_fit}, buffer={sc.buffer_nbands}/edge, "
+        f"buffer_mode={sc.buffer_mode}"
         + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
            else f", α={sc.mixing:.2f}"))
     state_final, rms_history = run_self_consistency(

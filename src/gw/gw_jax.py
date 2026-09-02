@@ -463,10 +463,25 @@ def main(argv=None):
 
 	charge_bispinor = uses_four_spinor_finite_q_charge(
 		config.bispinor, config.bispinor_gw)
-	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband,
+	# A self-consistent diagonal buffer evaluates a bounded number of real
+	# states immediately outside the user-named nval/ncond window.  The named
+	# counts remain the physical/full-matrix window; only Meta's execution
+	# edges expand.  Other solvers and buffer_nbands=0 retain their exact
+	# historical Meta construction.
+	_sc_buffer = (int(config.sc.buffer_nbands)
+	              if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
+	meta = Meta.from_system(wfn, sym,
+	                        int(config.nval) + _sc_buffer,
+	                        int(config.ncond) + _sc_buffer, config.nband,
 	                        n_rmu, charge_bispinor,
 	                        nband_chi=config.bands.chi,
 	                        nband_sigma=config.bands.sigma)
+	if _sc_buffer:
+		print0(
+			f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
+			f"valence/conduction window + {_sc_buffer} diagonal state(s) "
+			f"at each edge; mode={config.sc.buffer_mode}, "
+			f"tail_fit={config.sc.tail_fit}")
 	meta.rank = RUNTIME.process_index
 	meta.n_proc = RUNTIME.process_count
 	meta.sys_dim = config.sys_dim
