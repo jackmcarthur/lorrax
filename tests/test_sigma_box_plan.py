@@ -71,6 +71,7 @@ def _plan(monkeypatch, branch=None, **kwargs):
 
 def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     plan, geometry = _plan(monkeypatch)
+    assert {row.space for row in plan} == {"cond"}
     assert [row.window.name for row in plan] == [
         "positive conduction:resonant",
         "positive conduction:state_tail",
@@ -130,6 +131,7 @@ def test_executor_conventions_and_lower_half_conjugation(monkeypatch):
 
     val_branch = _branch("positive valence", space="val")
     val, _ = _plan(monkeypatch, val_branch)
+    assert {row.space for row in val} == {"val"}
     # builder t,w -> -conj(t),conj(w), then executor t=pole_sign*t.
     np.testing.assert_allclose(val[0].window.nodes.t, np.conj(fake.times))
     np.testing.assert_allclose(

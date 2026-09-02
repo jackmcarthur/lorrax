@@ -803,7 +803,6 @@ minimax_target_error = 1e-6
 minimax_max_nodes = 64
 
 mpa_n_poles = 8
-mpa_material_class = insulator
 mpa_sampling_alpha = 1
 mpa_sampling_schedule = nested
 mpa_pole_solver = loewner
@@ -817,7 +816,6 @@ sigma_quadrature_cache_dir = auto
 mpa_sigma_max_nodes = 96
 sigma_regularization_ev = 0.25
 sigma_window_edge_factor = 1.5
-sigma_omega_layout = sharded
 ```
 
 The measured output grid was $[-7,7]$ eV in $0.5$ eV steps. On four A100

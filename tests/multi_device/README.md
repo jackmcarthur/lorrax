@@ -1,5 +1,16 @@
 # Multi-device gates (not in the default pytest suite)
 
+Ordered-GN box-Sigma closure gate:
+`gnppm_box_ordered_sigma_p4.py`, exactly P=4. It freezes the full
+seed-20260902 broken-TR Sigma cube evaluated at `origin/main@c1020045`, then
+runs the one-pole store through the production shared-MPA denominator-box
+planner/executor. It also repeats that exact route with
+`LORRAX_DEBUG_GN_ODD_RESIDUE_OFF=1` and requires a nonzero Sigma flip plus an
+exact-zero reported odd contribution.
+
+    GNPPM_BOX_GATE_DIR=/path/to/evidence \
+      <launcher> -n 4 python3 tests/multi_device/gnppm_box_ordered_sigma_p4.py
+
 MPA disk-stream gate: `mpa_fit_stream_gate.py`, exactly P=4.  It writes ten
 q-irreducible W samples through real SlabIO, fits a deliberately
 nondivisible `N_mu=P+1` five-pole field with the production row-sharded Padé

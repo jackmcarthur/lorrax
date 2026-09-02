@@ -1,4 +1,4 @@
-# The MPA Sigma(omega) denominator-box quadrature
+# The dynamic Sigma(omega) denominator-box quadrature
 
 Implementation: `gw/sigma_box_plan.py`. Executor:
 `gw/mpa/sigma.py::_integrate_sigma_batches`. Numerical rule service:
@@ -28,10 +28,38 @@ Green-function/screened-interaction transform, rather than an explicit
 state-by-pole contraction. The total number of `(window,tau)` pairs is the
 resource currency and is refused when it exceeds `mpa_sigma_max_nodes`.
 
+### 1.1 Ordered one-pole completion on a magnet
+
+GN/HL one-pole fits are persisted in the same pole store and execute through
+this MPA planner and spatial kernel. On a measured-broken-TR GN deck the
+imaginary probe is not replaced by its Hermitian half: ordered odd-kernel
+nodes retain the anti-Hermitian, frequency-odd channel of
+$\chi^0(i\omega_p)$. The two-point fit therefore produces two Hermitian pole
+residues,
+
+$$
+B=\frac{R_++R_-}{2},\qquad D=\frac{R_+-R_-}{2},\qquad
+R_+=B+D,\quad R_-=B-D.
+$$
+
+The algebraic store stamps this as an ordered fit and writes `B_odd_p = D`
+beside `B_p = B`. Every executable row carries its Green-function space:
+conduction rows contract $R_+$ and valence rows contract $R_-$. Thus the box
+plan changes the reciprocal approximation, not the magnetic contour
+completion. The planner uses `max(abs(R+), abs(R-))` as a branch-neutral
+liveness and partition witness, so a pole live in either branch is retained;
+the executor still receives the exact residue for that row.
+`LORRAX_DEBUG_GN_ODD_RESIDUE_OFF=1` is the named diagnostic twin: it keeps the
+ordered route but sets $D=0$, making both rows consume $B$ and making the
+reported odd Sigma contribution vanish. It refuses on a single-residue/TRS
+store. The response and residue derivation is in
+[GN-PPM without global time reversal](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+
 ## 2. Product windows
 
 Each of the four causal branches (positive/negative external frequency,
-conduction/valence) is partitioned into at most three Cartesian products. Let
+conduction/valence) first partitions its central pole rectangle into at most
+three Cartesian products. Let
 
 ```
 state_edge = sigma_window_edge_factor * eta
@@ -54,6 +82,13 @@ resonant   : E <= state_edge, Re Omega <= pole_edge
 pole_tail  : E <= state_edge, Re Omega >  pole_edge
 ```
 
+Before those products are built, residue-weighted CDFs of `Re Omega` and
+`-Im Omega` identify the central 1st--99th percentile pole rectangle. Poles
+outside it are not dropped: they enter disjoint outlier selectors, split by
+the sign of the complete branch denominator where possible, and are crossed
+with every live state. The resulting central and outlier products cover each
+live state/pole tuple exactly once.
+
 These are products because the executor windows `G` and `W` independently.
 A diagonal predicate coupling one state to one pole would destroy that
 separability. Empty products are omitted. Products are not merged: a
@@ -63,10 +98,11 @@ removed.
 
 ## 3. Direct support boxes
 
-The caller reduces each distributed pole field to exact live extrema per pole
-and shallow/deep selector. Residues are used only to decide whether a pole
-entry is live; their magnitudes never weight the quadrature. For every product
-window, the real support is the extrema of the literal corners
+The caller first reduces distributed pole fields into the CDF described above,
+then reduces exact live extrema for every central/outlier selector. Residue
+magnitudes choose only that disjoint product partition; they never weight a
+rule fit, its error, or its acceptance. For every product window, the real
+support is the extrema of the literal corners
 
 ```
 omega - sigma_b * (E + Re Omega)
@@ -83,9 +119,11 @@ changes the linear-in-bandwidth crossing rank, whereas far-edge widening of a
 tail costs only logarithmically.
 
 No histogram, lattice representative, envelope, or error apportionment enters
-this construction. The former measure-adapted campaign produced small
-weighted residuals while missing a low-mass Na state at the Fermi level by
-0.95 meV. The direct box makes the same statement for every live tuple.
+the construction or certification of a rule. The pole CDF partitions products
+only, and every resulting product receives a uniform certificate on its
+complete box. The former measure-adapted campaign produced small weighted
+residuals while missing a low-mass Na state at the Fermi level by 0.95 meV.
+The direct box makes the same statement for every live tuple.
 
 ## 4. Rule and error currency
 
@@ -149,9 +187,10 @@ plan without gathering a pole field or state-pole product.
 
 ## 7. Controls and dials
 
-The production/default MPA route is the box plan. `LORRAX_SIGMA_PLAN=panes`
-selects the frozen pane implementation only for comparison controls; there is
-no campaign-planner route. Numerical policy is carried by three deck keys:
+The production/default MPA and GN/HL-PPM route is the shared box plan.
+`LORRAX_SIGMA_PLAN=panes` selects the frozen pane implementation only for
+comparison controls; there is no campaign-planner route. Numerical policy is
+carried by three deck keys:
 
 ```
 sigma_quadrature_eps = 1e-4
