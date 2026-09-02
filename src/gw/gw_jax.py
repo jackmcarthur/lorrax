@@ -474,7 +474,7 @@ def main(argv=None):
 			1.0 - bfc_fragmentation_target_utilization(width_factor=1))
 		_budget_bytes = float(config.memory.per_device_gb) * 1.0e9
 		_replicated_cap_bytes = int(_headroom_fraction * _budget_bytes)
-		_nw = int(np.asarray(config.sigma.omega_grid_ev).size)
+		_nw = int(np.asarray(config.omega_grid_ev).size)
 		_nk = int(meta.nk_tot)
 		_cube_bytes = _nw * _nk * _nbs * _nbs * np.dtype(np.complex128).itemsize
 		if _cube_bytes > _replicated_cap_bytes:

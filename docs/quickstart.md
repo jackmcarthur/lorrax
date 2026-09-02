@@ -134,6 +134,10 @@ lx test --census                 # on Perlmutter: the census
 You need a `WFN.h5` first — see [Preparing inputs from DFT](preprocessing.md). Given one,
 you produce three preprocessing artifacts, then run GW:
 
+### Defaults for bispinor decks
+
+Start from the canonical [input-key defaults and derived packed-route settings](input_reference.md#system), then use the [four-current physics scope](theory/four-current-head-corrections.md) and [runtime wiring record](architecture/four_current_wiring.md) to decide which explicitly conditional artifacts your material needs. The driver prints every automatic choice as `[config provenance]`; do not copy routing/layout keys from an older deck merely to make them explicit.
+
 1. **Centroids** — `python -m centroid.kmeans_cli <N> --seed 42` → `centroids_frac_<N>.txt`
 2. **Dipoles** — `python -m psp.get_dipole_mtxels -i cohsex.in` → `dipole.h5`
 3. **Kinetic + ionic** — `python -m gw.kin_ion_io -i cohsex.in` → `kin_ion.h5`

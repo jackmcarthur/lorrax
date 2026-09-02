@@ -1531,8 +1531,12 @@ _DEFAULTS = {
     # remain in the launcher's own log.
     "report_file": "gwjax.out",
     "sigma_omega_h5_file": "sigma_mnk.h5",
-    # Core flags
-    "restart": True,
+    # Core flags.  Fresh physics is the safe default: a tensor bundle is
+    # loaded only when the deck explicitly requests ``restart = true``, at
+    # which point the restart path authenticates its WFN/band/centroid
+    # provenance before use.  Never infer a restart from file presence: a
+    # stale file beside a deck must not silently replace live physics.
+    "restart": False,
     # ``write_restart_tensors``: does this run PERSIST tmp/isdf_tensors_*.h5
     # at all?  DEFAULT true — today's behaviour, unchanged, until the owner
     # rules otherwise (SPEC_qirr_restart_tensors.md §7 and
@@ -1693,10 +1697,10 @@ _DEFAULTS = {
     "bispinor_gw": "bare_transverse",
     # The relative sign of the i[r, V_NL] commutator in the assembled
     # velocity, read by ``psp.get_dipole_mtxels`` and passed to
-    # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the shipped
+    # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the legacy shipped
     # assembly and ``+1`` the arm that reproduces BerkeleyGW's q -> 0
     # head; the words "shipped" / "flipped" spell the same two.  Empty is
-    # NOT DECLARED and resolves to the shipped sign -- and for that
+    # NOT DECLARED and resolves to ``+1`` -- and for that
     # reason it must be a STRING default: a float default would make
     # "unset" and an explicit "-1" indistinguishable, and the whole point
     # of the stamp this feeds is to say which arm a dipole.h5 was built
@@ -3553,10 +3557,10 @@ def refuse_unsupported_low_mem_bands(config) -> None:
     harness, a future direct caller) safe without having to remember the
     parser check.
 
-    NO-OP FOR ``low_mem_bands = false`` (the default), evaluated first and
-    returning before any predicate is touched: a default deck must not
-    acquire a new parse-time resolution — and hence a new possible
-    refusal — from this feature existing.
+    NO-OP FOR ``low_mem_bands = false`` (the global default), evaluated
+    first and returning before any predicate is touched.  The packed
+    screened-current envelope derives an unnamed value to true before this
+    gate; every other default deck retains the no-op behavior.
     """
     if not bool(config.memory.low_mem_bands):
         return
@@ -3668,9 +3672,11 @@ def packed_static_envelope(config, *, screened: bool):
     did not name it (``None`` for a row the deck must satisfy itself), so
     the promotion and the refusal read the same table instead of
     re-deriving each other.  ``screened`` selects the packed SCREENED mode
-    (``full_static_cohsex``): the extra rows are the ones that only bite
-    when the twelve current ``chi`` blocks and the packed Dyson solve are
-    actually built.  ``sys_dim`` is deliberately NOT here -- the bare route
+    (``full_static_cohsex``): its extra rows are the ones that only bite
+    when the twelve current ``chi`` blocks are actually built.  The
+    distributed-plan row is shared because the packed response facade has
+    that one plan even when the bare route can skip the block-diagonal
+    current solve.  ``sys_dim`` is deliberately NOT here -- the bare route
     treats it as a routing condition while the screened mode refuses it
     only under ``head_correction = full`` (``GATE
     static_bispinor_photon_head_slab_only``), and one row cannot honestly
@@ -3711,6 +3717,13 @@ def packed_static_envelope(config, *, screened: bool):
            "unreachable: GATE "
            "bispinor_slab_cohsex_restart_changes_the_head_mechanism refuses "
            "at parse time, naming both mechanisms", None)
+    yield (str(config.backend.w_dyson_solver) == "distributed",
+           f"w_dyson_solver = {config.backend.w_dyson_solver}",
+           "w_dyson_solver = distributed", _ENV_IMPL,
+           "the packed response facade has only the distributed plan.  "
+           "DERIVED: an unnamed w_dyson_solver is set to distributed for "
+           "every packed route at parse time, so this row can only fire on "
+           "an explicit conflicting value", "w_dyson_solver")
     if not screened:
         return
     yield (str(config.mpa.material_class).strip().lower() == "insulator",
@@ -3724,13 +3737,6 @@ def packed_static_envelope(config, *, screened: bool):
            "face layout only.  DERIVED: an unnamed low_mem_bands is set to "
            "true for this mode at parse time, so this row can only fire on "
            "an explicit conflicting value", "low_mem_bands")
-    yield (str(config.backend.w_dyson_solver) == "distributed",
-           f"w_dyson_solver = {config.backend.w_dyson_solver}",
-           "w_dyson_solver = distributed", _ENV_IMPL,
-           "the packed Dyson solve has only the distributed plan.  DERIVED: "
-           "an unnamed w_dyson_solver is set to distributed for this mode at "
-           "parse time, so this row can only fire on an explicit conflicting "
-           "value", "w_dyson_solver")
     _overrides = scalar_head_overrides_named(config)
     yield (not _overrides, ", ".join(_overrides),
            "no scalar q->0 head override named", _ENV_IMPL,
@@ -3786,19 +3792,6 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
             config, screened=False):
         if not accepted:
             return False, f"{got} (the packed bare route wants {want})"
-    # THE SCREENING OWNER REFUSES ANYTHING ELSE (lane N): compute_static_photon_
-    # response's first statement is `dyson_solver != "distributed" -> ValueError`,
-    # and distrib_la refuses "distributed" on a 1x1 mesh, so a deck at the
-    # DEFAULT `w_dyson_solver = auto` (local on a small system) stays on the
-    # incumbent route instead of dying inside the packed operator.  Not in the
-    # shared envelope table: for the screened mode that key is DERIVED at parse
-    # time; for the bare family it is a routing condition.
-    if str(config.backend.w_dyson_solver) != "distributed":
-        return False, (f"w_dyson_solver = {config.backend.w_dyson_solver} "
-                       "(the packed bare route wants w_dyson_solver = "
-                       "distributed: the packed Dyson solve has no local plan "
-                       "and the default 'auto' resolves to 'local' on a small "
-                       "system)")
     if config.compute_mode is ComputeMode.COHSEX:
         return True, "bispinor slab one-shot static COHSEX"
     return True, (
@@ -5991,65 +5984,42 @@ class LorraxConfig:
                 "  [config provenance] bispinor qp_solver=self_consistent: "
                 "density_self_consistent was not named; enabling the "
                 "required live (rho, J) Hartree rebuild")
-        # ``restart`` DEFAULTS TO TRUE, and on a bispinor slab COHSEX deck
-        # that default alone used to choose the q->0 head mechanism (lane J
-        # section 3.a).  A default deck must not acquire a refusal from a
-        # feature existing, and it must not acquire a WORSE head from one
-        # either, so an UNNAMED restart is set to false for this deck class
-        # -- taking it to the packed Gamma-cell completion -- and only an
-        # EXPLICIT ``restart = true`` reaches
-        # GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism.
-        if (bool(resolved.bispinor)
-                and "restart" not in _named_keys
-                and bool(resolved.restart)
-                and int(resolved.sys_dim) == 2
-                and resolved.compute_mode is ComputeMode.COHSEX):
-            resolved = _dc_replace(resolved, restart=False)
+        # Fresh physics is the global default.  A file existing in ``tmp``
+        # is not permission to replace a live fit: only an explicit
+        # ``restart = true`` enters the restart loader, whose provenance
+        # gates authenticate the tensor set before use.
+        if "restart" not in _named_keys:
             print_fn(
-                "  [config provenance] bispinor slab static COHSEX: restart "
-                "was not named; setting restart = false so the packed "
-                "Gamma-cell completion runs.  There is no photon restart "
-                "storage, so a restarted deck would carry the incumbent "
-                "scalar band-diagonal head instead (+5.72 meV on an "
-                "occupied SX+COH, and no transverse q=Gamma head); "
-                "docs/input_reference.md, restart")
+                "  [config provenance] restart was not named; using the "
+                "fresh-physics default restart = false.  Tensor files are "
+                "never selected from mere presence; set restart = true "
+                "explicitly to enter the authenticated restart loader "
+                "(docs/input_reference.md, restart)")
         # DERIVED, NOT DECLARED (lane J section 3).  ``low_mem_bands`` and
-        # ``w_dyson_solver`` are not dials of the packed screened static
-        # photon mode -- they are the only layout and the only Dyson plan it
-        # is written against -- so the deck should not have to write them.
+        # ``w_dyson_solver`` are not physics dials of a packed photon mode --
+        # they are the layouts/plans its envelope is written against -- so
+        # the deck should not have to write them.
         # Promote only when EVERY OTHER envelope row already passes: a deck
         # that is outside the envelope for some other reason must still see
         # that reason, not a low_mem_bands refusal it never asked for.  An
         # explicitly named conflicting value is left alone and refused by
         # the envelope (rule 13: refuse rather than ignore).
-        # The bare family (lane C's packed route) has the same one Dyson
-        # plan requirement as a ROUTING condition (lane N): the screening
-        # owner refuses anything but 'distributed', so an unnamed key must be
-        # derived here too, or a default slab deck would silently take the
-        # incumbent route and lose the transverse q=Gamma head (owner ruling
-        # 2026-09-01: heads are always on).  An EXPLICIT non-distributed
-        # value is left alone and keeps the deck on the incumbent route,
-        # with the reason printed as the `Photon route` line.
-        if (bool(resolved.bispinor)
-                and resolved.bispinor_gw is BispinorGWMode.BARE_TRANSVERSE
-                and int(resolved.sys_dim) == 2
-                and "w_dyson_solver" not in _named_keys
-                and all(row[0] for row in packed_static_envelope(
-                    resolved, screened=False))):
-            resolved = _dc_replace(resolved, backend=_dc_replace(
-                resolved.backend, w_dyson_solver="distributed"))
-            print_fn(
-                "  [config provenance] bispinor slab bare_transverse inside "
-                "the packed envelope: w_dyson_solver was not named; setting "
-                "w_dyson_solver = distributed so the packed route is taken "
-                "(the packed photon response accepts only that plan; name "
-                "w_dyson_solver = local explicitly to stay on the incumbent "
-                "route, which carries no transverse q=Gamma head); "
-                "docs/input_reference.md, bispinor_gw")
-        if (bool(resolved.bispinor)
-                and resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX):
+        # ONE derivation site for every packed route.  Applicability and the
+        # derived-key names come from ``packed_static_envelope``; this code
+        # knows only how to set a named field.  Explicit conflicts survive
+        # and are refused (screened mode) or select the incumbent route
+        # (bare mode), never overwritten.
+        _packed_candidate = (
+            bool(resolved.bispinor)
+            and (resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX
+                 or (resolved.bispinor_gw
+                     is BispinorGWMode.BARE_TRANSVERSE
+                     and int(resolved.sys_dim) == 2)))
+        if _packed_candidate:
+            _screened = (
+                resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX)
             _unmet = [row for row in packed_static_envelope(
-                resolved, screened=True) if not row[0]]
+                resolved, screened=_screened) if not row[0]]
             if _unmet and all(row[5] for row in _unmet):
                 _promotions = {
                     "low_mem_bands": ("memory", True),
@@ -6063,11 +6033,12 @@ class LorraxConfig:
                     resolved = _dc_replace(resolved, **{group: _dc_replace(
                         getattr(resolved, group), **{key: value})})
                     print_fn(
-                        "  [config provenance] bispinor_gw = "
-                        f"full_static_cohsex: {key} was not named; setting "
+                        "  [config provenance] packed_static_envelope "
+                        f"(bispinor_gw = {resolved.bispinor_gw.value}): "
+                        f"{key} was not named; setting "
                         f"{key} = {value} (the packed response is written "
-                        "against the face layout and the distributed Dyson "
-                        "plan; docs/input_reference.md, bispinor_gw)")
+                        "against this derived layout/plan; "
+                        "docs/input_reference.md, bispinor_gw)")
         # CROSS-KEY, and therefore after the record exists: the w_bse
         # refusals read resolved axes (compute_mode / qp_solver fold in the
         # legacy flags), and the honest way to ask which mode a deck chose

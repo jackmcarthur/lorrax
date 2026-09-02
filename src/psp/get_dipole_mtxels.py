@@ -513,8 +513,9 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
     if val not in (VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED):
         raise ValueError(
             f"GATE vnl_velocity_sign: {raw!r} resolves to no arm.  The only "
-            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (shipped, the default) "
-            f"and {VNL_VELOCITY_SIGN_FLIPPED} (flipped); the words "
+            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (legacy shipped) "
+            f"and {VNL_VELOCITY_SIGN_FLIPPED} (flipped, the default); the "
+            f"words "
             f"{sorted(_VNL_SIGN_WORDS)} spell the same two.  This is a "
             f"SIGN, not a scale: an arbitrary multiplier would produce a "
             f"velocity operator that is neither arm of the open question "

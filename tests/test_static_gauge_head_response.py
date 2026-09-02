@@ -527,7 +527,8 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 4      # 5 shared + 4 screened-only
+    assert len(both) == len(shared) + 3      # 6 shared + 3 screened-only
+    assert "w_dyson_solver = distributed" in shared
 
 
 def test_every_envelope_row_says_physics_or_implementation_limit(tmp_path):
@@ -559,7 +560,7 @@ def test_the_eight_scalar_head_overrides_are_one_conjunct(tmp_path):
     assert "vhead" not in message and "mc_average_placement" not in message
 
 
-def test_mode_required_settings_are_derived_not_declared(tmp_path):
+def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
     """``low_mem_bands`` / ``w_dyson_solver`` are the only layout and the
     only Dyson plan the packed screened mode has, so the deck must not
     have to write them."""
@@ -683,11 +684,8 @@ def test_restart_may_not_swap_the_head_mechanism_on_a_slab_cohsex_deck(
     assert "IMPLEMENTATION LIMIT" in message
 
 
-def test_an_unnamed_restart_is_derived_false_on_a_slab_cohsex_deck(tmp_path):
-    """``restart`` DEFAULTS TO TRUE, so the default alone used to pick the
-    head mechanism.  A default deck must acquire neither a refusal nor a
-    worse head from a feature existing: an unnamed restart is set to false
-    for this deck class, announced, and only an EXPLICIT true refuses."""
+def test_an_unnamed_restart_uses_the_fresh_physics_default(tmp_path):
+    """The global default is fresh physics and its provenance is visible."""
     lines = []
     deck = (_INCUMBENT_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
@@ -699,11 +697,11 @@ def test_an_unnamed_restart_is_derived_false_on_a_slab_cohsex_deck(tmp_path):
     assert config.restart is False
     assert uses_static_photon_response(config)
     assert any("restart was not named" in ln for ln in lines), lines
-    assert any("5.72 meV" in ln for ln in lines), lines
+    assert any("restart = false" in ln for ln in lines), lines
+    assert any("authenticated restart loader" in ln for ln in lines), lines
 
 
-def test_a_scalar_deck_keeps_the_restart_default(tmp_path):
-    """The promotion is aimed at one bispinor deck class, not at restart."""
+def test_a_scalar_deck_gets_the_same_fresh_restart_default(tmp_path):
     deck = (_INCUMBENT_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
             .replace("bispinor = true\n", "")
@@ -711,8 +709,12 @@ def test_a_scalar_deck_keeps_the_restart_default(tmp_path):
             .replace("restart = false\n", ""))
     path = tmp_path / "scalar_restart.in"
     path.write_text(deck)
-    assert LorraxConfig.from_input_file(
-        str(path), print_fn=lambda *_: None).restart is True
+    lines = []
+    config = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert config.restart is False
+    assert any("[config provenance] restart was not named" in line
+               for line in lines)
 
 
 def test_a_bulk_bispinor_restart_deck_is_untouched(tmp_path):

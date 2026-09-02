@@ -351,6 +351,22 @@ def test_eqp2_dynamic_one_shot_keys_parse(tmp_path):
     assert cfg.sigma.omega_layout == "sharded"
 
 
+def test_sigma_omega_layout_keeps_the_replicated_default(tmp_path):
+    path = tmp_path / "dynamic_default_layout.in"
+    path.write_text(BASE_INPUT + "compute_mode = gn_ppm\n")
+    cfg = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *_: None)
+    assert cfg.sigma.omega_layout == "replicated"
+
+
+def test_explicit_replicated_sigma_layout_is_preserved_for_its_control_arm(
+        tmp_path):
+    cfg = _config(
+        tmp_path,
+        "compute_mode = gn_ppm\nsigma_omega_layout = replicated\n")
+    assert cfg.sigma.omega_layout == "replicated"
+
+
 def test_eqp2_explicit_replicated_sigma_cube_refuses(tmp_path):
     with pytest.raises(ValueError, match="requires sigma_omega_layout=sharded"):
         _config(
