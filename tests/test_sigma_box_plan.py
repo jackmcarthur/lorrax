@@ -14,26 +14,32 @@ from gw.sigma_box_plan import plan_sigma_windows
 from minimax import UniformRule
 
 
-def _branch(tag="positive conduction", *, space="cond", negative=False):
+def _branch(tag="positive conduction", *, space="cond", negative=False,
+            energies=(0.1, 3.0)):
     omega_abs = np.asarray([0.2, 0.5], np.float64)
+    energies = np.asarray(energies, np.float64).reshape(1, -1)
     return _SigmaBranch(
         tag=tag,
-        E_A=jnp.asarray([[0.1, 3.0]], dtype=jnp.float64),
-        base_mask_A=jnp.asarray([[True, True]]),
+        E_A=jnp.asarray(energies, dtype=jnp.float64),
+        base_mask_A=jnp.ones(energies.shape, dtype=bool),
         space=space, neg_omega_half=negative,
         omega_abs=omega_abs,
         omega_idx=np.arange(omega_abs.size, dtype=np.int64),
     )
 
 
-def _summaries():
+def _pole_batches(residues=(1.0, 0.2)):
     # eta=.1, omega_max=.5, edge=1.5 -> pole edge=.65.
-    shallow = (0.3, 0.3, 0.05, 0.05)
-    deep = (1.0, 1.0, 0.08, 0.08)
-    return (
-        (0, {"all": shallow, "shallow": shallow, "deep": None}),
-        (1, {"all": deep, "shallow": None, "deep": deep}),
-    )
+    omega = jnp.asarray(
+        [0.3 - 0.05j, 1.0 - 0.08j], dtype=jnp.complex128
+    ).reshape(2, 1, 1, 1)
+    residue = jnp.asarray(residues, dtype=jnp.complex128).reshape(
+        2, 1, 1, 1)
+
+    def batches():
+        yield 0, omega, residue
+
+    return batches
 
 
 def _fake_rule(box, eps, **_kwargs):
@@ -43,7 +49,8 @@ def _fake_rule(box, eps, **_kwargs):
         weights=np.asarray([0.6 - 0.1j, 0.3 + 0.05j]),
         box=tuple(box), eps=float(eps), relative=relative,
         theta_deg=5.0, rank=3, sup_error=0.5 * eps,
-        kappa_max=1.2, seconds=0.01)
+        kappa_max=1.2, seconds=0.01,
+        profiled=_kwargs.get("rho") is not None)
 
 
 def _plan(monkeypatch, branch=None, **kwargs):
@@ -51,11 +58,14 @@ def _plan(monkeypatch, branch=None, **kwargs):
     monkeypatch.setattr(
         "gw.sigma_box_plan.rule_amplification_p99",
         lambda *_args, **_kwargs: 1.1)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_sup_error",
+        lambda *_args, **_kwargs: (5.0e-5, 1.1))
     branch = _branch() if branch is None else branch
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
     return plan_sigma_windows(
-        _summaries(), [branch], omega, 0.1,
+        _pole_batches(), [branch], omega, 0.1,
         eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None,
         **kwargs)
@@ -117,15 +127,18 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
     monkeypatch.setattr(
         "gw.sigma_box_plan.rule_amplification_p99",
         lambda *_args, **_kwargs: 1.1)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_sup_error",
+        lambda *_args, **_kwargs: (5.0e-5, 1.1))
     args = dict(
         eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
     first, first_geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+        _pole_batches(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
     assert len(calls) == 3
     calls.clear()
     second, second_geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+        _pole_batches(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
     assert not calls
     assert all(window["cache_status"].startswith("hit:")
                for window in second_geometry["branches"][0]["windows"])
@@ -138,6 +151,42 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         "window_tau_pairs"]
 
 
+def test_profile_digest_prevents_cache_reuse_for_changed_profile(
+        monkeypatch, tmp_path):
+    calls = []
+    profile_version = ["profile-a"]
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.build_tolerance_profile",
+        lambda box, *_args, **_kwargs: (
+            lambda d: np.full(np.asarray(d).shape, box[2]),
+            profile_version[0], {"applied": True}))
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_amplification_p99",
+        lambda *_args, **_kwargs: 1.1)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.rule_sup_error",
+        lambda *_args, **_kwargs: (5.0e-5, 1.1))
+    args = dict(
+        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+        cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
+    branch = _branch()
+    plan_sigma_windows(
+        _pole_batches(), [branch], np.asarray([0.2, 0.5]), 0.1,
+        state_amplitudes_by_branch=[jnp.ones((1, 2))], **args)
+    calls.clear()
+    profile_version[0] = "profile-b"
+    plan_sigma_windows(
+        _pole_batches(), [branch], np.asarray([0.2, 0.5]), 0.1,
+        state_amplitudes_by_branch=[jnp.ones((1, 2))], **args)
+    assert calls, "a rule certified for a looser profile was reused"
+
+
 def test_total_pair_ceiling_refuses(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
     monkeypatch.setattr(
@@ -145,7 +194,7 @@ def test_total_pair_ceiling_refuses(monkeypatch):
         lambda *_args, **_kwargs: 1.1)
     with pytest.raises(RuntimeError, match="pair ceiling=5"):
         plan_sigma_windows(
-            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+            _pole_batches(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
             eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=5,
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 

@@ -1,18 +1,52 @@
-"""Measure-independent denominator-box quadrature for MPA Sigma(omega).
+"""Per-state-mass denominator-box quadrature for MPA Sigma(omega).
 
 The public path in this module is deliberately short:
 
 ``branch -> three Cartesian product windows -> denominator box -> rule``.
 
-Pole fields remain distributed.  The caller supplies the bounded per-pole
-extrema returned by :func:`gw.mpa.sigma_windows.summarize_sigma_poles`; no
-residue histogram, sampled lattice, error apportionment, or campaign-wide
-selection enters the quadrature.  Each returned ``SharedSigmaWindow`` is
-consumed unchanged by the existing MPA tau executor.
+Pole fields remain distributed.  The planner first retains the bounded
+per-pole extrema returned by
+:func:`gw.mpa.sigma_windows.summarize_sigma_poles`, then reduces the exact
+executor residue magnitude into a small histogram for the shallow selector
+used by crossing windows.  The box geometry and its three Cartesian product
+windows are unchanged.  Sign-definite windows retain the incumbent relative
+rule; only crossing windows use the measure-dependent acceptance currency.
+
+For a selected state/pole tuple the executor forms
+
+``d_knp = omega - s_pole * (E_kn + Omega_p) + i eta``
+
+and its scalar coefficient is bounded by
+
+``|M_knp| <= |u_kn| A_kn |B_p(q, mu, nu)| / N_k``.
+
+Here ``u_kn`` is the branch's exact occupation factor, ``B_p`` is the pole
+residue multiplied in :func:`gw.ppm_tau_kernel.build_shared_w_tau`, and
+``A_kn`` is the Cauchy--Schwarz envelope of the state and final projection
+carriers from
+:func:`gw.wavefunction_bundle.projected_state_amplitude_envelope`.  The two
+orthonormal flat-k factors give ``1/N_k``.  The inequality uses no phase or
+cancellation.  With ``m[n,b]`` the sum of this bound over tuples in bin ``b``,
+``m[n] = sum_b m[n,b]``, and ``B[n]`` occupied bins, the profile is
+
+``rho[b] = eta * max_n B[n] * m[n,b] / m[n]``.
+
+Thus ``rho |Q-1/d| <= eps`` implies
+``sum_b m[n,b] |Q-1/d| <= m[n] eps/eta`` for every state, exactly the
+uniform crossing rule's delivered bound.  The common state factor
+``|u_kn| A_kn/N_k`` cancels only inside that state's ratio; exact residue
+magnitudes still define ``m[n,b]`` and ``m[n]``.
+
+Tempting, and why not: normalizing by one global profile peak omits both the
+per-state total and the division of a state's error budget across its occupied
+bins.  That first attempt made the protected Na Fermi state 0.997 meV wrong
+(claim 621).  No tuple is excluded, no box edge moves, and no outlier-pole
+product is introduced: claim 618 measured that partition and rejected it.
 """
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -25,12 +59,19 @@ import numpy as np
 from common.collectives import (all_gather_processes, gather_to_host,
                                 process_count, process_rank)
 from gw.minimax_screening import MinimaxNodes
-from gw.mpa.sigma_windows import SharedSigmaWindow
+from gw.mpa.sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                                  SharedSigmaWindow,
+                                  summarize_sigma_poles)
 from gw.ppm_windows import _SigmaWindow
+from gw.sigma_tolerance_profile import (build_tolerance_profile,
+                                        profile_grid,
+                                        profile_histogram_batch)
 from minimax import (
     UniformRule,
+    box_samples,
     build_uniform_rule,
     rule_amplification_p99,
+    rule_sup_error,
 )
 
 
@@ -44,12 +85,13 @@ def _resolve_uniform_rule_trace():
     return bool(os.environ.get("LORRAX_UNIFORM_RULE_TRACE"))
 
 
-def _live_states(branch):
-    """Return the executor's exact live state support on the host."""
+def _live_states(branch, amplitude=None):
+    """Return the executor's exact support and state-mass bound on host."""
     energy = np.asarray(gather_to_host(branch.E_A), dtype=np.float64)
     base = np.asarray(gather_to_host(branch.base_mask_A), dtype=bool)
     if base.shape != energy.shape:
         base = np.reshape(base, energy.shape)
+    occupation = np.ones(energy.shape, dtype=np.float64)
     live = base & np.isfinite(energy)
     if branch.band_weight is not None:
         weight = np.asarray(
@@ -59,22 +101,35 @@ def _live_states(branch):
         # threshold.  This final nonzero test mirrors the multiplicative
         # executor and prevents an exactly absent state from widening a box.
         live &= np.isfinite(weight) & (np.abs(weight) > 0.0)
+        occupation = np.abs(weight)
+    if amplitude is None:
+        projected = np.ones(energy.shape, dtype=np.float64)
+    else:
+        projected = np.abs(np.asarray(
+            gather_to_host(amplitude), dtype=np.complex128
+        )).reshape(energy.shape)
+        if not np.all(np.isfinite(projected[live])):
+            raise ValueError(
+                f"Sigma box branch {branch.tag!r} has nonfinite projected "
+                "state amplitudes")
     indices = np.flatnonzero(live.reshape(-1)).astype(np.int32)
     if not indices.size:
         raise ValueError(f"Sigma box branch {branch.tag!r} has no live states")
-    return energy, energy.reshape(-1)[indices], indices
+    state_mass = occupation * projected / int(energy.shape[0])
+    return (energy, energy.reshape(-1)[indices], indices,
+            state_mass.reshape(-1)[indices])
 
 
-def _product_geometry(branches, eta, edge_factor):
+def _product_geometry(branches, eta, edge_factor, amplitudes):
     omega_max = max(
         (float(np.max(branch.omega_abs)) for branch in branches
          if branch.omega_abs.size), default=0.0)
     excursion = 0.0
     state_rows = []
-    for branch in branches:
-        shape, energy, indices = _live_states(branch)
+    for branch, amplitude in zip(branches, amplitudes):
+        shape, energy, indices, mass = _live_states(branch, amplitude)
         excursion = max(excursion, -min(float(np.min(energy)), 0.0))
-        state_rows.append((shape, energy, indices))
+        state_rows.append((shape, energy, indices, mass))
     state_edge = float(edge_factor) * eta
     return state_rows, {
         "omega_max_ry": omega_max,
@@ -151,7 +206,7 @@ def _box_for_window(frequencies, states, pole_stats, pole_sign, eta):
             (raw_lo, raw_hi), (a_lo, a_hi, gamma_lo, gamma_hi))
 
 
-def _rule_cache_lookup(directory, box, eps, relative):
+def _rule_cache_lookup(directory, box, eps, relative, profile_digest, rho):
     """Return the smallest cached rule certified on a containing box."""
     if directory is None:
         return None
@@ -167,6 +222,11 @@ def _rule_cache_lookup(directory, box, eps, relative):
                 if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
                         or bool(data["relative"]) != relative):
                     continue
+                cached_profile = (
+                    str(data["profile_digest"].item())
+                    if "profile_digest" in data.files else "")
+                if cached_profile != str(profile_digest or ""):
+                    continue
                 cached_box = tuple(float(value) for value in data["box"])
                 if not (cached_box[0] <= box[0]
                         and cached_box[1] >= box[1]
@@ -180,7 +240,14 @@ def _rule_cache_lookup(directory, box, eps, relative):
                     theta_deg=float(data["theta_deg"]),
                     rank=int(data["rank"]),
                     sup_error=float(data["sup_error"]),
-                    kappa_max=float(data["kappa_max"]), seconds=0.0)
+                    kappa_max=float(data["kappa_max"]), seconds=0.0,
+                    profiled=bool(profile_digest))
+                if rho is not None:
+                    check = box_samples(*box, per_unit=8.0, n_im=48)
+                    profile_sup, _ = rule_sup_error(
+                        rule.times, rule.weights, check, rho(check))
+                    if profile_sup > eps:
+                        continue
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
         except (OSError, KeyError, ValueError):
@@ -188,14 +255,15 @@ def _rule_cache_lookup(directory, box, eps, relative):
     return best
 
 
-def _rule_cache_store(directory, rule):
+def _rule_cache_store(directory, rule, profile_digest):
     """Atomically store one immutable box certificate."""
     if directory is None:
         return
     try:
         os.makedirs(directory, exist_ok=True)
         digest = hashlib.sha256(json.dumps(
-            [list(rule.box), float(rule.eps), bool(rule.relative)]
+            [list(rule.box), float(rule.eps), bool(rule.relative),
+             str(profile_digest or "")]
         ).encode()).hexdigest()[:16]
         path = os.path.join(directory, f"rule_{digest}.npz")
         if os.path.exists(path):
@@ -205,6 +273,7 @@ def _rule_cache_store(directory, rule):
             np.savez(
                 handle, box=np.asarray(rule.box, np.float64),
                 eps=float(rule.eps), relative=bool(rule.relative),
+                profile_digest=str(profile_digest or ""),
                 times=rule.times, weights=rule.weights,
                 sup_error=float(rule.sup_error),
                 kappa_max=float(rule.kappa_max),
@@ -252,13 +321,25 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
     return green, screened
 
 
-def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
+def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta,
+              profile_grid_nodes):
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    cached = _rule_cache_lookup(cache_dir, requested_box, eps, relative)
+    rho = None
+    profile_digest = ""
+    profile_report = {"applied": False, "reason": "sign-definite-relative"}
+    if spec["kind"] == "crossing":
+        u_nodes, v_nodes = profile_grid_nodes
+        rho, profile_digest, profile_report = build_tolerance_profile(
+            requested_box, spec["kind"], spec["pole_sign"], spec["states"],
+            spec["state_masses"], spec["frequencies"],
+            spec["pole_histogram"], u_nodes, v_nodes, eta, eps)
+        profile_report = {**profile_report, "applied": True}
+    cached = _rule_cache_lookup(
+        cache_dir, requested_box, eps, relative, profile_digest, rho)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
@@ -266,8 +347,9 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None else requested_box)
         rule = build_uniform_rule(
-            build_box, eps, time_budget=reduction_seconds)
-        _rule_cache_store(cache_dir, rule)
+            build_box, eps, time_budget=reduction_seconds,
+            relative=relative, rho=rho)
+        _rule_cache_store(cache_dir, rule, profile_digest)
         cache_status = "miss" if cache_dir is not None else "off"
 
     times = np.asarray(rule.times, np.complex128)
@@ -276,6 +358,11 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
             f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
+    uniform_check = box_samples(*requested_box, per_unit=8.0, n_im=48)
+    incumbent_rho = (np.abs(uniform_check) if relative else
+                     np.full(uniform_check.shape, requested_box[2]))
+    uniform_sup_error, _ = rule_sup_error(
+        times, weights, uniform_check, incumbent_rho)
     # The noise clause remains kappa_p99 * 6e-8 <= 0.05 eps, but its
     # percentile is now intrinsic to the certified box: the uniform-rule
     # service area-weights its own fine check cloud.  No physical histogram
@@ -315,6 +402,9 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         "cache_status": cache_status, "factor_growth": growth,
         "noise_bound": noise_bound, "noise_budget": noise_budget,
         "one_line": rule.one_line(),
+        "profile_digest": profile_digest,
+        "profile": profile_report,
+        "uniform_sup_error": float(uniform_sup_error),
     }
 
 
@@ -360,7 +450,7 @@ def _parallel_fits(specs, worker):
 
 
 def plan_sigma_windows(
-    pole_summaries,
+    pole_batches,
     branches,
     omega_ry,
     eta_ry,
@@ -371,14 +461,18 @@ def plan_sigma_windows(
     cache_dir,
     print_fn=print,
     edge_factor=1.5,
+    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+    state_amplitudes_by_branch=None,
 ):
-    """Build the complete MPA Sigma quadrature from raw support boxes.
+    """Build the MPA Sigma quadrature from profiled raw support boxes.
 
     Parameters
     ----------
-    pole_summaries
-        Concatenated output of ``summarize_sigma_poles``.  Each row contains
-        only live per-pole extrema for the all/shallow/deep selectors.
+    pole_batches
+        Zero-argument callable returning a fresh iterator of
+        ``(pole_offset, Omega, B)`` resident batches.  One walk obtains the
+        exact old-box extrema and a second reduces the profile histograms;
+        neither walk gathers a pole field.
     branches
         Causal ``_SigmaBranch`` rows.  Their masks and optional occupation
         weights are exactly the state support the executor will consume.
@@ -399,6 +493,13 @@ def plan_sigma_windows(
         Hard ceiling on the sum of ``(window, tau)`` pairs.
     cache_dir
         Directory for immutable box-rule certificates, or ``None``.
+    occupation_window_threshold
+        The branch support threshold already used by the executor.  It is
+        forwarded unchanged to the box census.
+    state_amplitudes_by_branch
+        Per-branch Cauchy--Schwarz projection envelopes with the same shape
+        as ``branch.E_A``.  ``None`` uses unit envelopes for synthetic tests;
+        production supplies the wavefunction-derived envelope.
 
     Returns
     -------
@@ -410,8 +511,8 @@ def plan_sigma_windows(
     -----
     Tempting, and why not:
 
-    * Histogram-weight the support: that made a low-mass Fermi state 0.95 meV
-      wrong on Na.  Every live tuple gets the same box certificate instead.
+    * Sum state histograms: that made a low-mass Fermi state 0.95 meV wrong
+      on Na.  The profile takes the pointwise maximum of state-owned rows.
     * Merge a whole branch: it replaces three cheap sign-aware boxes by one
       wide crossing box and can silently reintroduce measure dependence.
     * Use peak-relative sup on sign-definite tails: a semicore term at
@@ -437,14 +538,55 @@ def plan_sigma_windows(
     if not np.isfinite(edge) or edge < 0.0:
         raise ValueError("sigma_window_edge_factor must be nonnegative")
     branch_rows = list(branches)
-    summaries = tuple(pole_summaries)
-    if not summaries:
-        raise ValueError("Sigma box planning needs at least one pole summary")
+    if state_amplitudes_by_branch is None:
+        amplitude_rows = [None] * len(branch_rows)
+    else:
+        amplitude_rows = list(state_amplitudes_by_branch)
+        if len(amplitude_rows) != len(branch_rows):
+            raise ValueError(
+                "state_amplitudes_by_branch must have one row per branch")
     omega_grid = np.asarray(omega_ry, dtype=np.float64)
-    state_rows, geometry = _product_geometry(branch_rows, eta, edge)
+    state_rows, geometry = _product_geometry(
+        branch_rows, eta, edge, amplitude_rows)
+
+    summaries = []
+    for pole_offset, Omega, B in pole_batches():
+        summaries.extend(summarize_sigma_poles(
+            Omega, B, branch_rows,
+            regularization_width_ry=eta, edge_factor=edge,
+            pole_offset=pole_offset,
+            occupation_window_threshold=occupation_window_threshold))
+        del Omega, B
+        gc.collect()
+    if not summaries:
+        raise ValueError("Sigma box planning needs at least one pole batch")
+    summaries = tuple(summaries)
+    all_stats = [evidence["all"] for _pole, evidence in summaries
+                 if evidence["all"] is not None]
+    profile_grid_nodes = profile_grid(
+        max(row[1] for row in all_stats),
+        max(row[3] for row in all_stats), eta, tolerance)
+    selectors = {
+        "shallow": _pole_bounds(
+            1, 0.0, geometry["pole_edge_ry"]),
+    }
+    profile_histograms = {
+        name: np.zeros(
+            (len(profile_grid_nodes[0]), len(profile_grid_nodes[1])),
+            dtype=np.float64)
+        for name in selectors
+    }
+    for _pole_offset, Omega, B in pole_batches():
+        batch_histograms = profile_histogram_batch(
+            Omega, B, selectors, *profile_grid_nodes, eta)
+        for name, histogram in batch_histograms.items():
+            profile_histograms[name] += histogram
+        del Omega, B
+        gc.collect()
 
     specs, branch_reports = [], []
-    for branch, (state_shape, raw_energy, flat_indices) in zip(
+    for branch, (state_shape, raw_energy, flat_indices,
+                 raw_state_mass) in zip(
             branch_rows, state_rows):
         positions = np.asarray(branch.omega_idx, dtype=np.int64)
         frequencies = omega_grid[positions]
@@ -478,10 +620,12 @@ def plan_sigma_windows(
             spec = {
                 "name": f"{branch.tag}:{name}", "branch": branch,
                 "states": states, "state_indices": flat_indices[local],
+                "state_masses": raw_state_mass[local],
                 "state_shape": state_shape.shape,
                 "state_interval": (float(state_lo), float(state_hi)),
                 "pole_indices": pole_indices, "pole_stats": pole_stats,
                 "pole_bounds": (float(pole_lo), float(pole_hi)),
+                "pole_histogram": profile_histograms.get(selector),
                 "pole_extent": pole_extent, "pole_sign": pole_sign,
                 "omega_abs": np.asarray(branch.omega_abs, np.float64),
                 "omega_idx": positions, "frequencies": frequencies,
@@ -497,7 +641,8 @@ def plan_sigma_windows(
 
     fits, fit_rows = _parallel_fits(
         specs, lambda index: _fit_rule(
-            specs[index], tolerance, budget, cache_dir, eta))
+            specs[index], tolerance, budget, cache_dir, eta,
+            profile_grid_nodes))
     pairs = sum(row["node_count"] for row in fits)
     if pairs > ceiling:
         raise RuntimeError(
@@ -524,7 +669,7 @@ def plan_sigma_windows(
             project="full", prefactor=-1.0,
             max_error=fit["sup_error"],
             provenance=(
-                f"uniform denominator box {spec['box']}; "
+                f"per-state-mass denominator box {spec['box']}; "
                 f"{fit['one_line']}; cache={fit['cache_status']}; "
                 f"factor_growth={fit['factor_growth']}"))
         output.append(SharedSigmaWindow(
@@ -543,9 +688,14 @@ def plan_sigma_windows(
             "raw_real_support_ry": list(spec["raw_real_support"]),
             "box_ry": list(spec["box"]), "rule_box_ry": list(fit["rule_box"]),
             "node_count": fit["node_count"],
-            "criterion": ("relative" if fit["relative"]
-                          else "peak-relative"),
+            "criterion": (("relative" if fit["relative"]
+                           else "peak-relative")
+                          + (":per-state-bound-profile"
+                             if fit["profile_digest"] else ":uniform")),
             "sup_error": fit["sup_error"], "eps": tolerance,
+            "uniform_recheck_sup_error": fit["uniform_sup_error"],
+            "profile_digest": fit["profile_digest"],
+            "profile": fit["profile"],
             "kappa_p99": fit["kappa_p99"],
             "kappa_max": fit["kappa_max"],
             "runtime_noise_bound": fit["noise_bound"],
@@ -565,8 +715,10 @@ def plan_sigma_windows(
         for value in np.asarray(row.window.nodes.t)
     }) for report in branch_reports)
     geometry.update({
-        "planner": "uniform_denominator_boxes",
+        "planner": "per_state_bound_profiled_crossing_boxes",
         "eta_ry": eta, "eps": tolerance,
+        "profile_grid_shape": [
+            len(profile_grid_nodes[0]), len(profile_grid_nodes[1])],
         "reduction_seconds": budget, "cache_dir": cache_dir,
         "pair_ceiling": ceiling, "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
