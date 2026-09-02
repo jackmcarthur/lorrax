@@ -27,7 +27,8 @@ from common.scientific_output import (
     symmetry_sampling_lines,
 )
 from common.units import RYD_TO_EV
-from .gw_config import qp_solver_semantics
+from .gw_config import (DISTRIB_LA_BATCHED_ROUTE_DEFAULT,
+                        qp_solver_semantics)
 
 
 _WARNING_WORDS = (
@@ -41,6 +42,46 @@ EQP0_FILE_ROLE = "fixed-DFT-state diagonal zeroth-order energies"
 EQP1_FILE_ROLE = "fixed-DFT-state diagonal Z-linearized energies"
 QP_ROTATIONS_FILE_ROLE = "full-matrix effective-H rotations"
 QP_WFN_FILE_ROLE = "matched full-matrix QP wavefunctions"
+
+
+def batched_la_record_lines(
+        *, config, n_charge: int, n_current: int, nq: int,
+        processes: int) -> tuple[str, ...]:
+    """Build the run-record provenance and optional capacity warning."""
+    route = str(config.backend.distrib_la_batched_route).strip().lower()
+    lines: list[str] = []
+    if (route == DISTRIB_LA_BATCHED_ROUTE_DEFAULT
+            and "distrib_la_batched_route" not in config.raw_input_keys):
+        lines.append(
+            "[config provenance] distrib_la_batched_route = batch_reshard "
+            "(shipping default; the input deck did not name the key)")
+    if route != "batch_reshard":
+        return tuple(lines)
+
+    n_charge = int(n_charge)
+    n_current = int(n_current)
+    n_total = n_charge + n_current
+    from .gflat_memory_model import batch_reshard_square_solve_capacity
+    capacity = batch_reshard_square_solve_capacity(
+        batch=int(nq), processes=int(processes),
+        memory_per_device_gb=float(config.memory.per_device_gb),
+        centroids=n_total)
+    if n_total > int(capacity["threshold"]):
+        lines.append(
+            "WARNING [distrib_la batch_reshard capacity]: "
+            f"charge+current centroids={n_total} "
+            f"({n_charge}+{n_current}) exceeds threshold="
+            f"{int(capacity['threshold'])} for nq={int(nq)}, "
+            f"P={int(processes)}, memory_per_device_gb="
+            f"{float(config.memory.per_device_gb):.2f}; the measured "
+            "three-arena complex128 square-solve floor is "
+            f"{float(capacity['floor_bytes']) / 1.0e9:.2f} GB/rank, above "
+            "the 50% placement limit "
+            f"{float(capacity['limit_bytes']) / 1.0e9:.2f} "
+            "GB/rank. Very large centroid counts may require "
+            "distrib_la_batched_route = auto (the direct distributed/provider "
+            "path).")
+    return tuple(lines)
 
 
 class GWProductionReport:
@@ -108,6 +149,14 @@ class GWProductionReport:
     def progress(self, line: str) -> None:
         """Write one deliberately selected rank-zero progress line."""
         self.emit(line)
+
+    def batched_linalg(self, *, config, n_charge: int, n_current: int,
+                       nq: int, processes: int) -> None:
+        """Record the universal batched-LA default and its capacity advice."""
+        for line in batched_la_record_lines(
+                config=config, n_charge=n_charge, n_current=n_current,
+                nq=nq, processes=processes):
+            self.progress(line)
 
     def begin(self, *, input_file: str, config) -> None:
         self.emit("=" * 78)

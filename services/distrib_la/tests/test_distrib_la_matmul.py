@@ -88,8 +88,9 @@ def test_provider_vocabulary_and_off_refusal():
     assert "slate" in D.MATMUL_BACKEND_CHOICES
     assert D.resolve_matmul_backend(
         "off", mesh, batched_route="batch_reshard") == "off"
+    assert D.resolve_matmul_backend("off", mesh) == "off"
     with pytest.raises(RuntimeError, match="no distributed provider"):
-        D.resolve_matmul_backend("off", mesh)
+        D.resolve_matmul_backend("off", mesh, batched_route="auto")
 
 
 def test_mesh_axes_must_be_exact_and_y_minor():

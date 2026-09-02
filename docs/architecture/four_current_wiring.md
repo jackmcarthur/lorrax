@@ -229,7 +229,7 @@ object each key ends up on and who reads it.
 | `static_gauge_hall_file` | `""` — EMPTY (`:1503`) | `config.paths.static_gauge_hall_file` | P, **screened mode only** (refused on the packed bare route) — **optional**: an UNNAMED file means `σ_H = 0`, announced; a NAMED but absent one refuses (`GATE static_gauge_hall_file_missing`, `w_isdf.py:1912`); a present but mismatched one refuses in the loader |
 | `transverse_zeta_solve` | `ridge` (`:1894`, validate `:5496-5513`) | `config.backend.transverse_zeta_solve` (`:4552`) | both |
 | `transverse_zeta_rcond` | `1e-10` (`:1902`, validate `:5514-5518`) | `config.backend.transverse_zeta_rcond` (`:4553`) | both |
-| `distrib_la_batched_route` | `auto` (`:1769`, resolve `:1237-1266`, parse `:5460`) | `config.backend.distrib_la_batched_route` (`:4543`) | both |
+| `distrib_la_batched_route` | `batch_reshard` (explicit `auto` remains available; `use_low_mem_eigh=true` derives it when the key is absent) | `config.backend.distrib_la_batched_route` | both |
 
 There is no `transverse_zeta_*` key beyond those two, and no `LORRAX_*`
 variable reads any key in this table.

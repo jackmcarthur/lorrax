@@ -5136,7 +5136,7 @@ def _factor_c_q_distributed_rank_truncate(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     indefinite: bool = False,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
 ) -> jax.Array:
     """Truncated pseudo-inverse ``C⁺``, formed and kept 2D-SHARDED.
 
@@ -5491,7 +5491,7 @@ def factor_c_q(
     zeta_ridge: float = 0.0,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_rcond: float = TRANSVERSE_ZETA_RCOND_DEFAULT,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
     transverse_trace_per_q: jax.Array | None = None,
 ) -> jax.Array:
     """
@@ -5918,7 +5918,7 @@ def solve_zeta(
     n_rmu_logical: int | None = None,
     zeta_gather: str = "replicated",
     lu_piv: jax.Array | None = None,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -6649,7 +6649,7 @@ def _make_fit_one_rchunk_kernel(
     q_neg_idx: np.ndarray | None = None,
     zeta_gather: str = 'replicated',
     lu_hoisted: bool = False,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
     layout: str = "legacy",
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
@@ -6901,7 +6901,7 @@ def fit_one_rchunk(
     cct_trace_per_q: jax.Array | None = None,
     zeta_gather: str = 'replicated',
     lu_piv: jax.Array | None = None,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
     layout: str = "legacy",
     psi_mun: jax.Array | None = None,
     weight_l: jax.Array | None = None,

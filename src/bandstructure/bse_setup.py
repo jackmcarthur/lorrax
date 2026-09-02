@@ -315,7 +315,7 @@ def compute_wfns_fi(
     return_coeffs: bool = False,
     eigh_backend: str = "auto",
     use_low_mem_eigh: bool = False,
-    distrib_la_batched_route: str = "auto",
+    distrib_la_batched_route: str = "batch_reshard",
     reshard_route: str | None = None,
     htransform_quality_record_fn=None,
     log_fn=None,

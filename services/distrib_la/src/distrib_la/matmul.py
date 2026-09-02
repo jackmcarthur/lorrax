@@ -1,12 +1,13 @@
 """Top-level distributed GEMM across the :mod:`distrib_la` providers.
 
-The default route calls an actual 2-D provider operation: cuBLASMp next to
+The explicit ``batched_route='auto'`` route calls an actual 2-D provider
+operation: cuBLASMp next to
 cuSOLVERMp, PBLAS ``pdgemm``/``pzgemm`` next to ScaLAPACK, or
 ``slate::multiply`` next to SLATE.  Unlike :func:`distrib_la.plan`,
 ``backend='auto'`` here selects that platform provider; it does not select a
 native JAX floor.
 
-The explicit ``batched_route='batch_reshard'`` route performs x-then-y staged
+The default ``batched_route='batch_reshard'`` route performs x-then-y staged
 face-to-batch exchanges for A, B, and C, runs local ``jnp.matmul``, then
 applies the literal y-then-x inverse exchanges to D.  Use ``backend='off'``
 with that route for a provider-free call.  A non-``off`` request is still
@@ -24,8 +25,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import loader
 from distrib_la._shard_map import shard_map
-from distrib_la.plan import (BATCHED_ROUTE_CHOICES, ROUTE_BATCH_RESHARD,
-                             ensure_sharding)
+from distrib_la.plan import (BATCHED_ROUTE_CHOICES, BATCHED_ROUTE_DEFAULT,
+                             ROUTE_BATCH_RESHARD, ensure_sharding)
 from distrib_la.resolve import mesh_key, mesh_platform
 
 __all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend"]
@@ -98,7 +99,7 @@ def _require_provider(provider: str, mesh: Mesh) -> None:
 
 
 def resolve_matmul_backend(requested: str, mesh: Mesh, *,
-                           batched_route: str = "auto") -> str:
+                           batched_route: str = BATCHED_ROUTE_DEFAULT) -> str:
     """Resolve a public request to an actual GEMM provider.
 
     ``cusolvermp`` maps to its matrix-multiply sibling ``cublasmp``.
@@ -323,7 +324,7 @@ def matmul(
     transa: str = "N",
     transb: str = "N",
     backend: str = "auto",
-    batched_route: str = "auto",
+    batched_route: str = BATCHED_ROUTE_DEFAULT,
 ) -> jax.Array:
     """Compute ``alpha * op(A) @ op(B) + beta * C`` over ``mesh``.
 
@@ -353,10 +354,11 @@ def matmul(
         and SLATE on ROCm. ``'cusolvermp'`` is an alias for its cuBLASMp
         sibling. ``'off'`` is provider-free and requires the staged route.
     batched_route
-        ``'auto'`` calls the resolved distributed provider.  Explicit
-        ``'batch_reshard'`` pads a ragged leading batch with zero matrices,
-        exchanges each face x then y into whole per-device matrices, runs
-        local JAX GEMM, and returns D through the inverse y then x exchanges.
+        ``'batch_reshard'`` (the default) pads a ragged leading batch with
+        zero matrices, exchanges each face x then y into whole per-device
+        matrices, runs local JAX GEMM, and returns D through the inverse y
+        then x exchanges. Explicit ``'auto'`` calls the resolved distributed
+        provider.
 
     Returns
     -------

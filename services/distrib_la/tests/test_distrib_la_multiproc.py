@@ -179,7 +179,8 @@ def check_resolution_is_a_promise(mesh, dtype="complex128"):
             A = jnp.asarray(_hpd(rng, 2, n, dtype))
             if op == "solve_lu":
                 B = jnp.asarray(_rng_mat(rng, (2, n, 32), dtype))
-                D.plan(op, mesh, backend=backend, n=n).batched(A, B)
+                D.plan(op, mesh, backend=backend, n=n,
+                       batched_route="auto").batched(A, B)
             elif op == "cholesky" and resolved in _HANDLE_CHOLESKY:
                 # MEASURED, Perlmutter CPU 2x2, 2026-08-07: plan.batched
                 # REFUSES slate cholesky --
@@ -196,7 +197,8 @@ def check_resolution_is_a_promise(mesh, dtype="complex128"):
                 D.solve(D.factor(op, A, mesh, backend=backend, n=n),
                         jnp.asarray(_rng_mat(rng, (2, n, 8), dtype)))
             else:
-                D.plan(op, mesh, backend=backend, n=n).batched(A)
+                D.plan(op, mesh, backend=backend, n=n,
+                       batched_route="auto").batched(A)
             called.append(f"{op}/{backend}->{resolved}")
     assert called, (
         "no FFI backend was both available and callable on this mesh, so "
@@ -240,7 +242,8 @@ def check_scalapack_factor_solve(mesh, dtype="complex128", nq=2, n=64,
     assert r1 < 1e-10 and r2 < 1e-10, (
         f"scalapack factor/solve residuals: rhs1={r1:.3e} rhs2={r2:.3e}")
 
-    fused = _gather(D.plan("solve_lu", mesh, backend="scalapack", n=n)
+    fused = _gather(D.plan("solve_lu", mesh, backend="scalapack", n=n,
+                           batched_route="auto")
                     .batched(_put(A_np, mesh, (None, "x", "y")),
                              _put(B2_np, mesh, (None, "x", "y"))))
     assert np.array_equal(X2, fused), (
@@ -308,7 +311,8 @@ def check_cusolvermp_lu_factor_solve(mesh, dtype="complex128", nq=2, n=64,
     assert r1 < 1e-10 and r2 < 1e-10, (
         f"cusolvermp split residuals rhs1={r1:.3e} rhs2={r2:.3e}")
 
-    fused = _gather(D.plan("solve_lu", mesh, backend="cusolvermp", n=n)
+    fused = _gather(D.plan("solve_lu", mesh, backend="cusolvermp", n=n,
+                           batched_route="auto")
                     .batched(_put(A_np, mesh, (None, "x", "y")),
                              _put(B2_np, mesh, (None, "x", "y"))))
     assert np.array_equal(X2, fused), (
@@ -437,7 +441,9 @@ def check_hostile_extents_through_the_ffi(mesh, dtype="complex128",
         B_pad = np.zeros((nq, n_pad, nrhs), dtype)
         B_pad[:, :n_log, :] = B_log
         assert n_pad > n_log or (n_log % px == 0 and n_log % py == 0)
-        X = _gather(D.plan(op, mesh, backend=backend, n=n_pad).batched(
+        X = _gather(D.plan(
+            op, mesh, backend=backend, n=n_pad,
+            batched_route="auto").batched(
             _put(A_pad, mesh, (None, "x", "y")),
             _put(B_pad, mesh, (None, "x", "y"))))
         ran += 1
@@ -489,15 +495,18 @@ def check_batched_eigh_dispatch(mesh, dtype="complex128", nq=6, n=64):
     A_j = _put(A, mesh, (None, "x", "y"))
     out = {}
 
-    W_off, Z_off = D.dispatch_batched_eigh(A_j, mesh, "off")
+    W_off, Z_off = D.dispatch_batched_eigh(
+        A_j, mesh, "off", batched_route="auto")
     W_nat, Z_nat = jnp.linalg.eigh(A_j)
     assert float(jnp.max(jnp.abs(W_off - W_nat))) == 0.0, \
         "backend 'off' is no longer bit-identical to jnp.linalg.eigh (W)"
     assert float(jnp.max(jnp.abs(Z_off - Z_nat))) == 0.0, \
         "backend 'off' is no longer bit-identical to jnp.linalg.eigh (Z)"
 
-    W_b, Z_b = D.dispatch_batched_eigh(A_j, mesh, "distributed")
+    W_b, Z_b = D.dispatch_batched_eigh(
+        A_j, mesh, "distributed", batched_route="auto")
     W_s, Z_s = D.dispatch_batched_eigh(A_j, mesh, "distributed",
+                                       batched_route="auto",
                                        _force_serial=True)
     d_W = _rel(_gather(W_s), _gather(W_b))
     d_Z, exact_Z = 0.0, True
@@ -544,7 +553,9 @@ def check_batched_eigh_dispatch(mesh, dtype="complex128", nq=6, n=64):
 
     planmod.resolve_backend = _counting
     try:
-        D.dispatch_batched_eigh(A_j, mesh, "distributed", _force_serial=True)
+        D.dispatch_batched_eigh(
+            A_j, mesh, "distributed", batched_route="auto",
+            _force_serial=True)
     finally:
         planmod.resolve_backend = orig
     out["resolves_for_serial_dispatch"] = len(seen)
@@ -556,7 +567,8 @@ def check_batched_eigh_dispatch(mesh, dtype="complex128", nq=6, n=64):
     if px > 1 or py > 1:
         bad = jnp.zeros((2, n + 1, n + 1), dtype=jnp.complex128)
         with _raises((ValueError, RuntimeError), "divisible"):
-            D.dispatch_batched_eigh(bad, mesh, "distributed")
+            D.dispatch_batched_eigh(
+                bad, mesh, "distributed", batched_route="auto")
     del jax
     return out
 
@@ -1046,7 +1058,8 @@ def test_batched_eigh_dispatch_gate_native_arm():
     mesh = _mesh_1x1("cpu")
     A = _put(_herm(np.random.default_rng(20260804), 4, 32, "complex128"),
              mesh, (None, "x", "y"))
-    W_off, Z_off = D.dispatch_batched_eigh(A, mesh, "off")
+    W_off, Z_off = D.dispatch_batched_eigh(
+        A, mesh, "off", batched_route="auto")
     W_nat, Z_nat = jnp.linalg.eigh(A)
     assert float(jnp.max(jnp.abs(W_off - W_nat))) == 0.0
     assert float(jnp.max(jnp.abs(Z_off - Z_nat))) == 0.0

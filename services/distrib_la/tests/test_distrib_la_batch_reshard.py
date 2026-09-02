@@ -43,7 +43,13 @@ def test_public_route_grammar_and_plan_provenance():
     mesh = _mesh()
     assert D.BATCHED_ROUTE_CHOICES == ("auto", D.ROUTE_BATCH_RESHARD)
 
-    auto = D.plan("eigh", mesh, backend="off")
+    default = D.plan("eigh", mesh, backend="off")
+    assert default.requested_batched_route == D.BATCHED_ROUTE_DEFAULT
+    assert default.batched_route == D.ROUTE_BATCH_RESHARD
+    assert default.in_sharding.spec == P("x", "y")
+    assert default.batch_in_sharding.spec == P(None, "x", "y")
+
+    auto = D.plan("eigh", mesh, backend="off", batched_route="auto")
     assert auto.batched_route == D.ROUTE_BACKEND_BATCHED
     assert auto.in_sharding is None and auto.batch_in_sharding is None
 

@@ -684,7 +684,7 @@ def fit_galerkin_basis(
         extra_rank_pad: int = 0,
         progress_fn=None,
         rank_record_fn=None,
-        distrib_la_batched_route: str = "auto",
+        distrib_la_batched_route: str = "batch_reshard",
 ) -> GalerkinBasis:
     """Fit the published whole-state Hamiltonian-transform basis.
 

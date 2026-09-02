@@ -24,7 +24,7 @@ polar_factor(A, mesh, ...) -> (L, s)
     Square distributed polar/SVD through a Hermitian dilation and one planned
     Hermitian eigensolve.  The planned form separates eager resolution from
     the trace-safe operation used in streamed k-point loops.
-``plan(op, mesh, *, backend='auto', n=None, batched_route='auto') -> Plan``
+``plan(op, mesh, *, backend='auto', n=None, batched_route='batch_reshard') -> Plan``
     Resolve once, then call.  ``Plan(A)`` for one tile at ``P('x','y')``,
     ``Plan.batched(A_stack)`` for ``P(None,'x','y')``.  Eigenvalues come
     back replicated, eigenvectors as COLUMNS, on every backend.
@@ -33,19 +33,21 @@ polar_factor(A, mesh, ...) -> (L, s)
     ``batched_route`` is the ONE place that says how a given stack will
     actually run: the scan, or the backend's own stacked entry where the
     library has one (a backend-internal optimization behind the same
-    interface, never a second surface).  The opt-in third route moves the
+    interface, never a second surface). The default third route moves the
     batch axis onto the mesh, runs the device-local native kernel, and moves
-    matrix outputs back through explicit staged collectives.  Production
-    selection is ``BATCHED_ROUTE_CHOICES = ('auto', 'batch_reshard')``.
+    matrix outputs back through explicit staged collectives. It is the
+    shipping default; explicit ``auto`` restores provider/scan selection.
+    Production selection is
+    ``BATCHED_ROUTE_CHOICES = ('auto', 'batch_reshard')``.
 ``Plan.native_fn``
     A pure, trace-safe closure — native backends only — for a call site
     that needs the math INSIDE its own ``jit``.
 ``matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N',
-backend='auto', batched_route='auto')``
+backend='auto', batched_route='batch_reshard')``
     Distributed rank-2 or batched rank-3 GEMM in the same face layout as a
-    plan.  The default dispatches to cuBLASMp, PBLAS or SLATE; the explicit
-    opt-in performs x/y face-to-batch exchanges, local GEMM, then y/x inverse
-    exchanges. ``backend='off'`` makes that route provider-free.
+    plan. The default performs x/y face-to-batch exchanges, local GEMM, then
+    y/x inverse exchanges; explicit ``auto`` dispatches to cuBLASMp, PBLAS or
+    SLATE. ``backend='off'`` makes the staged route provider-free.
 ``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) ->
 GemmPlan``
     Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE, for a caller
@@ -102,6 +104,7 @@ from distrib_la.matmul import (
 from distrib_la.matmul_plan import GemmPlan, gemm_plan
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
+    BATCHED_ROUTE_DEFAULT,
     BATCHED_ROUTES,
     BATCHED_SCAN_UNROLL,
     DONATES,
@@ -139,7 +142,8 @@ __all__ = [
     "GemmPlan", "gemm_plan",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
-    "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_SCAN_UNROLL",
+    "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_ROUTE_DEFAULT",
+    "BATCHED_SCAN_UNROLL",
     # factor / solve
     "FactorToken", "factor", "solve",
     # resolution

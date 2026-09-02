@@ -708,7 +708,7 @@ _EIGH_PAD_SENTINEL_RY = 1e10
 
 @timing.timed("sc.eigh", watch=True)
 def distributed_eigh_bands(H, *, mesh: Mesh,
-                           distrib_la_batched_route: str = "auto",
+                           distrib_la_batched_route: str = "batch_reshard",
                            distrib_la_backend: str = "distributed"):
     """(E, U_qp) for every k through the ``distrib_la`` batched surface.
 

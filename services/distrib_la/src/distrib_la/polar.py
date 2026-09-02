@@ -270,7 +270,11 @@ def plan_polar_factor(
     _mesh_contract(mesh, n)
     rcond = _as_rcond(rcond)
     requested = str(backend)
-    eig = plan("eigh", mesh, backend=backend, n=2 * n)
+    # Polar is a single distributed dilation, not a batched operation. Keep
+    # it on the provider/native face route when the public batched default is
+    # ``batch_reshard``.
+    eig = plan("eigh", mesh, backend=backend, n=2 * n,
+               batched_route="auto")
     return PolarPlan(
         mesh=mesh,
         n=n,

@@ -263,6 +263,66 @@ _GFLAT_CHUNK_FLOOR = 4  # cuFFT plan amortisation
 _ARENA_PLACEMENT_FRAC = 0.5
 
 
+def batch_reshard_square_solve_capacity(
+        *, batch: int, processes: int, memory_per_device_gb: float,
+        centroids: int) -> dict[str, float | int]:
+    """Return the advisory capacity of a batched complex128 square solve.
+
+    The distributed W solve is the conservative array-returning case: each
+    batch member has an ``(mu, mu)`` coefficient and a square RHS. The
+    measured reshard floor is therefore
+
+    ``3 * 16 * ceil(batch / processes) * mu * (mu + mu)`` bytes/rank.
+
+    The warning threshold reserves the same 50% placement ceiling used by
+    the coupled transverse-route admission above. This is an advisory, not
+    an admission decision: other resident arrays are intentionally excluded.
+
+    Parameters
+    ----------
+    batch
+        Number of q-point matrices.
+    processes
+        Number of ranks/devices sharing the batch.
+    memory_per_device_gb
+        Configured decimal GB per device.
+    centroids
+        Logical charge-plus-current centroid count to price.
+
+    Returns
+    -------
+    dict
+        ``floor_bytes``, ``limit_bytes``, ``threshold`` and ``batch_local``.
+    """
+    batch = int(batch)
+    processes = int(processes)
+    centroids = int(centroids)
+    memory_per_device_gb = float(memory_per_device_gb)
+    if batch <= 0:
+        raise ValueError(f"batch must be positive, got {batch}")
+    if processes <= 0:
+        raise ValueError(f"processes must be positive, got {processes}")
+    if centroids < 0:
+        raise ValueError(f"centroids must be non-negative, got {centroids}")
+    if memory_per_device_gb <= 0:
+        raise ValueError(
+            "memory_per_device_gb must be positive, got "
+            f"{memory_per_device_gb}")
+    batch_local = (batch + processes - 1) // processes
+    limit_bytes = (
+        _ARENA_PLACEMENT_FRAC * memory_per_device_gb * 1.0e9)
+    bytes_per_mu2 = 3 * _C128 * batch_local * 2
+    threshold = math.isqrt(int(limit_bytes // bytes_per_mu2))
+    floor_bytes = _batch_reshard_operand_floor_bytes(
+        batch=batch, mu=centroids, nrhs=centroids, processes=processes)
+    return {
+        "floor_bytes": float(floor_bytes),
+        "limit_bytes": float(limit_bytes),
+        "threshold": int(threshold),
+        "batch_local": int(batch_local),
+    }
+
+
 def _factor_mesh(pp: int) -> tuple[int, int]:
     """Most-square factorization ``p_x·p_y = pp`` with ``p_x = floor(√pp)``
     decremented until it divides — matches ``gw_jax`` mesh construction."""

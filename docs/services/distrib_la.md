@@ -183,7 +183,7 @@ hang documented at the top applies to the dilation extent 2n as well.
 
 | name | what it is |
 |---|---|
-| `plan(op, mesh, *, backend='auto', n=None, batched_route='auto') -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. `batched_route='batch_reshard'` opts into the staged local route. |
+| `plan(op, mesh, *, backend='auto', n=None, batched_route='batch_reshard') -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. The staged local route is the default; explicit `auto` restores backend batching/scan. |
 | `Plan(A)` / `Plan.batched(A_stack)` | One tile at `P('x','y')` / a stack at `P(None,'x','y')`. **Trace-safe** — no dlopen, no `device_put`, no process count inside. |
 | `Plan.is_native`, `.backend`, `.describe()` | The resolved fact, readable; never something a caller must branch on to be correct. |
 | `Plan.batched_route`, `BATCHED_ROUTES`, `BATCHED_ROUTE_CHOICES`, `BATCHED_SCAN_UNROLL` | HOW a stack runs: a `lax.scan` over the single-matrix op, the backend's stacked entry, or staged batch-axis movement around a local native kernel. **The one place that decides.** Public selection is `auto|batch_reshard`; `scan`/`backend_batched` remain internal resolutions. |
@@ -196,9 +196,9 @@ hang documented at the top applies to the dilation extent 2n as well.
 | `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | Stable hashable mesh identity (axes, extents, platform, device ids) and its two predicates. `mesh_key` is for any cache whose stored value does **not** retain the mesh; `id(mesh)` there is the documented drift. |
 | `dial_key()` | Factory-time dials folded into one tuple, for kernel cache keys. |
 | `probe_target`, `has_target` | Capability, with the ABSENT / BROKEN split (`lxkit.probe`). |
-| `dispatch_batched_eigh(A, mesh, backend, *, batched_route='auto')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
-| `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='auto')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. Unlike `plan`, `backend='auto'` selects a distributed provider. |
-| `resolve_matmul_backend(requested, mesh, *, batched_route='auto') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
+| `dispatch_batched_eigh(A, mesh, backend, *, batched_route='batch_reshard')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
+| `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. The default stages complete local matrices; explicit `auto` uses the distributed provider chosen by `backend`. |
+| `resolve_matmul_backend(requested, mesh, *, batched_route='batch_reshard') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
 | `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe: safe inside a caller's own `jax.jit`/`lax.scan`. |
 
 Two phases and they stay two: only platform and handler guards can fire at
@@ -218,13 +218,89 @@ the batch route.
 `Plan.batched` call. It does not choose whether an application uses a Plan,
 an opaque `FactorToken`, or a larger multi-channel schedule. LORRAX's coupled
 transverse-zeta caller is one deliberate higher-level policy: for an eligible
-all-fresh fit, its `auto` request tries certified local `batch_reshard`, then
+all-fresh fit, an explicit `auto` request tries certified local
+`batch_reshard`, then
 a distributed split-factor token, then sequential channels as capacity
 requires. Explicit `batch_reshard` never switches to the token route; failure
 to fit the coupled local live set selects sequential calls that retain the
 explicit route. Partial reuse is sequential. Both coupled schedules share Z
 construction but keep three ordered q-batch solves; there is no public or
 private fused three-channel cuSOLVERMp route.
+
+### Default, explicit `auto`, and certification envelope
+
+`BATCHED_ROUTE_DEFAULT` is `batch_reshard` for every array-returning public
+surface: `plan`, `dispatch_batched_eigh`, `matmul`, and
+`resolve_matmul_backend`. It is not applied to the single-matrix polar
+dilation, `gemm_plan`, or opaque `factor`/`solve`; those APIs retain their
+direct provider plans. LORRAX's backend selectors (`eigh_backend`,
+`distributed_cholesky`, `distributed_lu`, `distributed_zeta_solve`, and
+`w_dyson_solver`) remain `auto`: they choose a library or a higher-level
+algorithm, not this batch schedule.
+
+On CUDA, with the named provider handlers present, an explicit
+`batched_route='auto'` resolves as follows. The mesh does not change the
+eigh backend choice; it changes automatic Cholesky/LU only at the true-2-D
+boundary.
+
+| surface and requested backend | 1x1 | 2x2 | 4x4 |
+|---|---|---|---|
+| `plan('eigh', backend='auto'|'off')` | native `backend_batched` | native `backend_batched` | native `backend_batched` |
+| `plan('eigh', backend='distributed')` / `dispatch_batched_eigh` | cuSOLVERMp `scan` | cuSOLVERMp `scan` | cuSOLVERMp `scan` |
+| `plan('cholesky', backend='auto')` | native caller-owned path; array-returning `Plan.batched(auto)` is unavailable | cuSOLVERMp `backend_batched` | cuSOLVERMp `backend_batched` |
+| `plan('solve_lu', backend='auto')` | native caller-owned path; array-returning `Plan.batched(auto)` is unavailable | cuSOLVERMp `backend_batched` | cuSOLVERMp `backend_batched` |
+| `matmul(backend='auto')` | cuBLASMp provider | cuBLASMp provider | cuBLASMp provider |
+
+The default staged route bypasses those resolved implementations only for the
+array operation; explicit backend requests are still capability-probed. The
+certification evidence is compositional and bounded:
+
+| route component | 1x1 | 2x2 | 4x4 | evidence |
+|---|---|---|---|---|
+| shared face-to-batch transport, ragged padding, inverse | certified | certified | certified through the same transport in the production solve | `test_distrib_la_batch_reshard.py`; P4 JID 57038615; P16 JID 57708736 |
+| local eigh / Cholesky / LU kernels | certified | certified, both float64 and complex128; worst residual 1.496e-15 | LU certified directly; eigh/Cholesky inherit the already-certified transport and the same device-local kernels | sandbox claims 199 and 497; `test_distrib_la_multiproc.py::check_batch_reshard_local_ops` |
+| local `matmul` | certified | certified, float64 and complex128; worst residual below 9.6e-16 | certified by the shared transport plus the mesh-independent local GEMM kernel; no separate P16 matmul timing claim | sandbox claim 210; `test_distrib_la_matmul.py` |
+
+This does not certify arbitrary matrix sizes. Every staged operation requires
+complete per-device matrices. A deck naming `use_low_mem_eigh=true` states
+that this residency is unsafe: an unnamed route default therefore derives
+`auto`, while explicitly naming `batch_reshard` with that key refuses.
+
+GW also records a capacity advisory after both centroid sets are known. For
+logical `M = M_charge + M_current`, `B=nq`, and `P` ranks, the conservative
+square-RHS solve floor is
+
+    floor_bytes/rank = 3 * 16 * ceil(B/P) * M * (M + M).
+
+The three factor counts the measured input/output/workspace arenas and 16 is
+complex128 bytes. The warning threshold is the largest integer M whose floor
+is at most `0.50 * memory_per_device_gb * 1e9`; 50% is the same
+fragmentation-safe placement ceiling used by the transverse route admission.
+The line reports both bytes/rank and the threshold and points to explicit
+`distrib_la_batched_route = auto`, meaning the direct distributed/provider
+path. `direct` is a description, not a legal route value.
+
+### LORRAX call-site inventory
+
+The current direct `Plan.batched` inventory is seven calls; the structural
+test fails if it changes. The repository has no `src/htransform` directory:
+htransform lives under `src/bandstructure`, and its selected-state factor is
+owned by `src/isdf/galerkin.py`.
+
+| owner | operation | setting source |
+|---|---|---|
+| `bandstructure/bse_setup.py::compute_wfns_fi` | fine-grid htransform Hermitian eigh | universal route |
+| `bse/vq_interp.py::prepare_coarse` | coarse interpolation Hermitian eigh | universal route |
+| `gw/w_isdf.py::_get_w_solve_fn_distributed` | distributed W `solve_lu` | universal route; inert when W uses its local solver |
+| `isdf/core.py::_factor_c_q_distributed_rank_truncate` | charge rank-truncation eigh | universal route |
+| `isdf/core.py::factor_c_q` | native2d charge Cholesky | universal route |
+| `isdf/core.py::_dist_ridged_lu` | transverse ridge `solve_lu` | universal route |
+| `isdf/galerkin.py::fit_galerkin_basis` | htransform selected-state Cholesky | universal route |
+
+`gw.qsgw_density.distributed_eigh_bands` reaches the same plan through
+`dispatch_batched_eigh`; GW, BSE, and htransform wrappers only propagate the
+resolved setting. `gemm_plan` call sites in G/Sigma hot loops are excluded by
+construction because the plan must remain provider-owned and trace-safe.
 
 ## Contract
 
@@ -739,8 +815,8 @@ separate calls the compiler never sees together, and there is nowhere in
 it to put "run this batch some other way". A scan is one node, so the
 choice collapses to **`Plan.batched_route`, the one place that decides**:
 
-* **(a)** `ROUTE_SCAN` — a scan of the *distributed* single-matrix op.
-  The default, and the definition of the surface.
+* **(a)** `ROUTE_SCAN` — a scan of the *distributed* single-matrix op,
+  selected by explicit `auto` when no stacked provider entry exists.
 * **(b)** `ROUTE_BACKEND_BATCHED` — the backend's stacked entry where the
   library has one. Its saving is in C++, around ONE descriptor and ONE
   workspace, and no scan can recover it.
@@ -807,7 +883,7 @@ Backend-only `block_size` is consumed at the route boundary and never reaches
 public result always contains eigenvectors; any other unsupported keyword
 refuses with `TypeError` instead of leaking into a local kernel.
 
-The public opt-in is construction-time:
+The shipping default is construction-time:
 `plan(..., batched_route='batch_reshard')`; `Plan.batched(...)` remains the
 single call surface. Route selection and backend selection are orthogonal:
 the requested backend is still resolved and, if explicit, probed before route
@@ -829,8 +905,9 @@ each device holds `Bp/(Px·Py)` complete `N×N` matrices and runs a native
 dense solver on them. At least one full matrix, its matrix-shaped output, and
 the solver workspace must fit on one device; multiple local batch elements
 increase that peak further. The exchanges are volume-preserving, but they do
-not make a single matrix smaller. When one full matrix cannot fit, retain the
-default/distributed tile route rather than selecting `batch_reshard`.
+not make a single matrix smaller. When one full matrix cannot fit, select
+explicit `auto` for the distributed tile/provider route rather than using
+`batch_reshard`.
 
 #### What the restructure cost and bought
 

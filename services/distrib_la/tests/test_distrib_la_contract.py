@@ -415,7 +415,8 @@ def check_cublasmp_gemm(mesh, dtype, transa="C", transb="N"):
         C = _put(C_np, mesh, (None, "x", "y"))
         return _gather(linalg.matmul(
             A, B, C, mesh=mesh, alpha=alpha, beta=beta,
-            transa=transa, transb=transb, backend="cublasmp"))
+            transa=transa, transb=transb, backend="cublasmp",
+            batched_route="auto"))
 
     D1 = solve()
     D2 = solve()
@@ -1087,7 +1088,7 @@ def test_plan_native_contract():
     import distrib_la as linalg
     mesh = _mesh_cpu_1x1()
 
-    p = linalg.plan("eigh", mesh, backend="auto")
+    p = linalg.plan("eigh", mesh, backend="auto", batched_route="auto")
     assert p.is_native and p.in_sharding is None
     rng = np.random.default_rng(0)
     A = _herm(rng, 1, 8, "complex128")[0]
@@ -1099,7 +1100,7 @@ def test_plan_native_contract():
     assert lam_b.shape == (3, 8) and R_b.shape == (3, 8, 8)
 
     for op in ("cholesky", "solve_lu"):
-        q = linalg.plan(op, mesh, backend="auto")
+        q = linalg.plan(op, mesh, backend="auto", batched_route="auto")
         assert q.is_native
         with pytest.raises(NotImplementedError, match="isdf/core"):
             q(jnp.asarray(A))

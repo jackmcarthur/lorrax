@@ -87,7 +87,8 @@ from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
 __all__ = ["Plan", "plan", "ensure_sharding", "BATCHED_SCAN_UNROLL",
-           "BATCHED_ROUTES", "BATCHED_ROUTE_CHOICES", "ROUTE_SCAN",
+           "BATCHED_ROUTES", "BATCHED_ROUTE_CHOICES",
+           "BATCHED_ROUTE_DEFAULT", "ROUTE_SCAN",
            "ROUTE_BACKEND_BATCHED", "ROUTE_BATCH_RESHARD"]
 
 
@@ -107,7 +108,8 @@ __all__ = ["Plan", "plan", "ensure_sharding", "BATCHED_SCAN_UNROLL",
 #: wins, so it stays 1 — changing it is a measurement, not a preference.
 BATCHED_SCAN_UNROLL = 1
 
-#: (a) ``lax.scan`` over this package's own single-matrix op.  The default.
+#: (a) ``lax.scan`` over this package's own single-matrix op. Selected by
+#: explicit ``auto`` when the backend has no stacked entry.
 ROUTE_SCAN = "scan"
 #: (b) the backend's own stacked FFI entry point, where the library has one.
 ROUTE_BACKEND_BATCHED = "backend_batched"
@@ -120,9 +122,12 @@ ROUTE_BATCH_RESHARD = "batch_reshard"
 BATCHED_ROUTES = (ROUTE_SCAN, ROUTE_BACKEND_BATCHED, ROUTE_BATCH_RESHARD)
 
 #: Public construction-time grammar.  ``scan`` and ``backend_batched`` stay
-#: implementation details selected by ``auto``; the one user-facing opt-in is
-#: route (c), which changes the memory/capacity tradeoff deliberately.
+#: implementation details selected by ``auto``; route (c) is the shipping
+#: default and changes the memory/capacity tradeoff deliberately.
 BATCHED_ROUTE_CHOICES = ("auto", ROUTE_BATCH_RESHARD)
+#: Shipping route for array-returning batched operations. ``auto`` remains
+#: a public explicit choice for the face-sharded provider/scan path.
+BATCHED_ROUTE_DEFAULT = ROUTE_BATCH_RESHARD
 
 #: ``jit``-compiled batched scans, one per (op, backend, mesh, signature).
 #:
@@ -347,7 +352,7 @@ class Plan:
     n: int | None
     in_sharding: NamedSharding | None
     batch_in_sharding: NamedSharding | None
-    requested_batched_route: str = "auto"
+    requested_batched_route: str = BATCHED_ROUTE_DEFAULT
 
     # ---- introspection -------------------------------------------------
     @property
@@ -375,8 +380,8 @@ class Plan:
         caller — reads the answer or ignores it; nothing re-derives it.
 
         (a) ``ROUTE_SCAN`` — ``lax.scan`` (:data:`BATCHED_SCAN_UNROLL`) over
-            this plan's own single-matrix op.  The default, and the
-            definition of the batched surface.
+            this plan's own single-matrix op. The fallback selected by an
+            explicit ``auto`` request when no stacked entry exists.
 
         (b) ``ROUTE_BACKEND_BATCHED`` — the backend's own stacked FFI entry
             point, taken whenever the library has one.  ScaLAPACK's eigh
@@ -410,8 +415,9 @@ class Plan:
             a second, parallel API.
 
         ``plan(..., batched_route=...)`` is the one caller-facing selection:
-        ``'auto'`` preserves the historical route, while ``'batch_reshard'``
-        opts into (c).  ``batched()`` also keeps a private ``_route``
+        ``'batch_reshard'`` is the shipping default, while ``'auto'``
+        preserves the historical provider/scan route. ``batched()`` also
+        keeps a private ``_route``
         override solely for route-comparison gates.
         """
         if self.requested_batched_route not in BATCHED_ROUTE_CHOICES:
@@ -646,7 +652,8 @@ class Plan:
 
 
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
-         n: int | None = None, batched_route: str = "auto") -> Plan:
+         n: int | None = None,
+         batched_route: str = BATCHED_ROUTE_DEFAULT) -> Plan:
     """Resolve ``op`` on ``mesh_xy`` ONCE and return the callable plan.
 
     Every guard (vocabulary, platform, known-broken combinations,
@@ -673,9 +680,10 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         Matrix extent, when known.  Passing it turns the divisibility rule
         into a resolve-time error instead of a call-time one.
     batched_route
-        ``'auto'`` preserves the historical backend-batched/scan choice;
-        ``'batch_reshard'`` stages the batch over the mesh and runs the
-        device-local native JAX operation.  See :attr:`Plan.batched_route`.
+        ``'batch_reshard'`` (the default) stages the batch over the mesh and
+        runs the device-local native JAX operation. ``'auto'`` explicitly
+        requests the backend-batched/scan choice. See
+        :attr:`Plan.batched_route`.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
