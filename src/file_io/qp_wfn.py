@@ -806,9 +806,20 @@ def _validate_qp_state_source(record, *, path: str) -> dict:
             and record.get("schema") == QP_STATE_SOURCE_SCHEMA
             and record.get("wfn_fingerprint_scheme")
             == WFN_FINGERPRINT_SCHEME)
+        _stamp_base = {"scheme", "band_start", "band_stop", "source"}
+        _stamp_method = {
+            QP_SOLVER_ATTR,
+            QP_ENERGY_DEFINITION_ATTR,
+            SIGMA_EVAL_PROVENANCE_ATTR,
+        }
+        _stamp_keys = set(stamp) if isinstance(stamp, dict) else set()
+        _method_present = (
+            sum(stamp.get(key) is not None for key in _stamp_method)
+            if isinstance(stamp, dict) else 0)
         valid = valid and (stamp is None or (
-            isinstance(stamp, dict) and set(stamp) == {
-                "scheme", "band_start", "band_stop", "source"}))
+            isinstance(stamp, dict)
+            and _stamp_keys in (_stamp_base, _stamp_base | _stamp_method)
+            and _method_present in (0, len(_stamp_method))))
     except (KeyError, TypeError, ValueError):
         valid = False
     if not valid:

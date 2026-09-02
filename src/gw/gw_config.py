@@ -4159,7 +4159,7 @@ def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
     ``low_mem_bands = false``, so this feature existing changes nothing for
     the vastly more common calls that never touch either axis.
     """
-    if not bool(config.memory.low_mem_bands) or Gij is None:
+    if Gij is None or not bool(config.memory.low_mem_bands):
         return
     raise ValueError(
         "GATE low_mem_bands_explicit_gij_unported: "
