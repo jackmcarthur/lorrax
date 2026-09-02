@@ -26,19 +26,23 @@ The producers and their shardings are in
 `docs/architecture/four_current_wiring.md`. The S-tensor sign and index
 convention is `docs/theory/s-tensor-convention.md`.
 
-## Deck keys, in one place
+## Relevant deck-key pointers
+
+The [input reference](../../docs/input_reference.md) owns the grammar and
+defaults. The table below is only a navigation summary.
 
 | key | what it decides |
 |---|---|
-| `head_correction` | `full` (Schur fold applied) \| `no_local_fields` (direct $\epsilon$ head, diagnostic) \| `off` (no Γ contribution — debug only; see the 2026-09-01 ruling in `docs/architecture/decisions.md`) |
+| `head_correction` | `full` applies the production head; `off` is debug-only. `no_local_fields` remains a scalar diagnostic and refuses when `bispinor = true` (see the 2026-09-01 ruling in `docs/architecture/decisions.md`). |
 | `wcoul0_source` | `s_tensor` (default, from `dipole.h5`) \| `epshead` (import a static BGW `epsmat` head, for parity work) |
 | `vhead`, `whead_0freq`, `whead_imfreq` | explicit overrides of the bare head and of $W_h$ at $\omega=0$ / $i\omega_p$. The override fires only when both the bare value and the frequency-matched $W$ are set; setting one and omitting the other is warned about, not silently half-applied |
 | `ppm_head_omega_h_ry` | pin $\Omega_h$ directly instead of fitting it |
 | `head_minibz_average`, `mc_average_placement` | the analytic-sphere / widened-Voronoi fold for $q=0$, and where the mini-BZ average is applied at $q \ne 0$ |
-| `bispinor_tt_head_correction` | the bare transverse tensor head of Chapter 8 |
+| `bispinor_gw` | selects bare or screened current blocks; route resolution and the six incumbent classes are summarized by the theory owner linked above |
 
 In 2D the truncated kernel diverges only as $1/q$ and the same construction
 applies with the slab kernel's angular structure. In 3D the $1/q^2$ part uses
 the Baldereschi–Tosatti analytic sphere. Box truncation (`sys_dim = 0`) has no
-divergence to repair, and the transverse head is refused there rather than
-silently zeroed.
+divergence to repair. The removed `bispinor_tt_head_correction` deck key no
+longer selects any transverse-head overlay; on a packed slab route the
+coupled Γ completion owns that tensor.

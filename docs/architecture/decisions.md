@@ -23,23 +23,16 @@ production envelope requirement.
 only as `1/√N_k` in 2D. A "screened bispinor" mode that forbids it is not a
 more complete calculation than the scalar route; it is a less complete one.
 
-**Consequence for the tree.** The `static_bispinor_photon_envelope`
-requirement `head_correction = off` for `bispinor_gw = full_static_cohsex`
-(`gw_config.py`, `required_head`) and the driver's skip of the scalar head
-under every packed mode are defects under this ruling. The target is one
-packed static mode that always runs the Γ completion (`⟨D⟩` bare insertion
-plus the charge `S^{00}`/wing head; the Hall term optional and diagnostic),
-with `off` an explicit banner-printing override.
-
-**Implemented on a branch, 2026-09-01.** That target is built on
-`lane/bisp-b-one-packed-mode-2026-09-01@41e2b6b2` — **a branch, not
-`origin/main`**. `full_static_cohsex` is the one packed static mode
-(`charge_hall_cubature` refuses, naming the new spelling); the completion
-runs under the default `head_correction = full`; `required_head` and the
-producerless `StaticGaugeHeadResponse` seam are deleted; `off` prints the
-`WARNING -- DEBUG` banner and is recorded as such in the run record; and
-`no_local_fields` is refused, the coupled solve having no scalar
-diagnostic head. Physics owner:
+**Consequence for the tree, implemented at `34228021`.**
+`full_static_cohsex` is the one packed screened-current mode and
+`charge_hall_cubature` is a refused retired spelling. The Γ completion runs
+under the default `head_correction = full`; it inserts `⟨D⟩` into the bare
+operator and the charge `S^{00}`/wing head into the screened operator, with
+the Hall term optional and diagnostic. `off` prints `WARNING -- DEBUG` and
+is recorded in the run report. `no_local_fields` is refused on every
+bispinor deck because the coupled solve has no scalar diagnostic head.
+The old `required_head` condition and producerless `StaticGaugeHeadResponse`
+seam are absent. Physics owner:
 [Four-current heads and frequency](../theory/four-current-head-corrections.md);
 wiring: [Four-current wiring](four_current_wiring.md).
 
