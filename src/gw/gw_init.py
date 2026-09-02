@@ -3186,9 +3186,13 @@ def prepare_isdf_and_wavefunctions(
 			_parent_green_work_ok = parent_k_contraction_profitable(
 				n_full=int(meta.nk_tot), n_parent=int(wfn.nkpts),
 				n_bands=int(band_slices.nb_full))
+			_parent_green_rpa = (
+				str(getattr(cfg.screening.diagrams, 'value',
+				            cfg.screening.diagrams)) == 'w_rpa')
 			_parent_green_candidate = (
 				bool(cfg.memory.low_mem_bands)
 				and bool(cfg.compute_mode.needs_screening)
+				and _parent_green_rpa
 				and str(getattr(cfg.qp_solver, 'value', cfg.qp_solver))
 					!= 'self_consistent'
 				and int(meta.nspinor) in (1, 2)
@@ -3234,8 +3238,8 @@ def prepare_isdf_and_wavefunctions(
 					# A fresh fit's planner did not know about this retained
 					# carrier.  Admit it only inside its utilization target.
 					_parent_green_fits = (
-						gflat_plan is None
-						or (float(gflat_plan.hwm_bytes) + _parent_green_bytes
+						gflat_plan is not None
+						and (float(gflat_plan.hwm_bytes) + _parent_green_bytes
 							<= float(gflat_plan.budget_bytes)
 							* float(gflat_plan.target_utilization)))
 					if not _parent_green_basis_compatible:
@@ -3248,6 +3252,12 @@ def prepare_isdf_and_wavefunctions(
 							"storage; using the full-k path.")
 					elif _parent_green_fits:
 						_parent_green_plan = _candidate_plan
+					elif gflat_plan is None:
+						print0(
+							"  Parent-k Green contraction inactive: this run "
+							"reuses an existing zeta fit and therefore has no "
+							"fresh-fit live-set plan that can safely price the "
+							"extra carrier; using the full-k Green path.")
 					else:
 						print0(
 							"  Parent-k Green contraction inactive: its retained "
