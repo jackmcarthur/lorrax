@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -295,6 +296,7 @@ def _integrate_sigma_batches(
         f"({n_poles} poles, batches of {batch_size}); "
         f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
+    ratio = None
     if max_b or max_d:
         ratio = max_d / max_b if max_b else np.inf
         state = "DEBUG ODD OFF (D discarded)" if odd_residue_off else "enabled"
@@ -304,7 +306,30 @@ def _integrate_sigma_batches(
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
-        sigma_c_kij=sigma)
+        sigma_c_kij=sigma,
+        odd_even_residue_ratio=ratio)
+
+
+def _attach_ordered_odd_sigma(total, even):
+    """Attach the exact ordered-residue MPA contribution to ``total``.
+
+    Both inputs must be executions of the same fitted poles, planner and tau
+    grid; only the second execution has ``D=0``.  Keeping the subtraction at
+    this seam makes ``sigC_odd`` a diagnostic of the production contraction,
+    not a separately approximated formula.
+    """
+    if not np.array_equal(total.omega_ry, even.omega_ry):
+        raise ValueError(
+            "GATE mpa_odd_sigma_reference: total and D=0 MPA Sigma used "
+            "different omega grids")
+    if tuple(total.sigma_c_kij.shape) != tuple(even.sigma_c_kij.shape):
+        raise ValueError(
+            "GATE mpa_odd_sigma_reference: total and D=0 MPA Sigma shapes "
+            f"differ: {total.sigma_c_kij.shape} versus "
+            f"{even.sigma_c_kij.shape}")
+    return replace(
+        total,
+        sigma_c_odd_kij=total.sigma_c_kij - even.sigma_c_kij)
 
 
 def integrate_sigma_store(
@@ -601,10 +626,23 @@ def compute_sigma_c_mpa_omega_grid(
                         f"kappa_p99={window['amplification_p99']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")
-        return integrate_sigma_store(
+        total = integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size,
             odd_residue_off=odd_residue_off, print_fn=print_fn)
+        if not ordered_residues:
+            return total
+        # Exact observability twin, shared in algebra with the GN arm in
+        # ppm_pipeline: Sigma is linear in the fitted residues, so the same
+        # plan and compiled contraction with D=0 isolates the ordered term.
+        # A debug-off arm deliberately emits a zero twin, letting the public
+        # sigC_odd column check its own A/B.
+        even = integrate_sigma_store(
+            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+            pole_batch_size=pole_batch_size,
+            odd_residue_off=True,
+            print_fn=lambda *args, **kwargs: None)
+        return _attach_ordered_odd_sigma(total, even)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):
@@ -641,4 +679,5 @@ __all__ = [
     "assert_head_body_occupation_match",
     "compute_sigma_c_mpa_omega_grid",
     "integrate_sigma_store",
+    "_attach_ordered_odd_sigma",
 ]

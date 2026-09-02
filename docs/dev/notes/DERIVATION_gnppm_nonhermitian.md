@@ -251,3 +251,10 @@ $W$, fits the ordered samples, reconstructs a dense imaginary-axis grid, and
 compares the branch-selected $\Sigma_c$ with an independent imaginary-axis
 contour.  Its red twin Hermitises the samples before fitting and is required to
 move the answer macroscopically.
+
+For observability, ordered MPA executes that same planned contraction once
+more with $D=0$, exactly as GN-PPM does, and records
+`sigC_odd = Sigma_c[B,D] - Sigma_c[B,0]`.  The debug-off arm therefore emits
+an exactly zero `sigC_odd` column.  This is deliberately not reconstructed
+from a fitted scalar or from an on-shell QP difference: it is the difference
+of the two production Sigma cubes on the same omega grid.

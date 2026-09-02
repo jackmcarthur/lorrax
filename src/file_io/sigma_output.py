@@ -439,7 +439,7 @@ def write_sigma_to_file(
 			f.write(f"# {total_label} = sigCC + sigTT + sigCT; "
 			        "sigCT is CT+TC\n")
 		if odd_diag is not None:
-			f.write("# sigC_odd = ordered broken-TR GN residue contribution "
+			f.write("# sigC_odd = ordered broken-TR residue contribution "
 			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
 		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
 		        f"states its crystal coordinate on a '# kcrys' line\n")

@@ -3,8 +3,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gw.mpa.sigma import (_batch_rows, _branches,
+from gw.mpa.sigma import (_attach_ordered_odd_sigma, _batch_rows, _branches,
                           _resolve_mpa_odd_residue_debug)
+from gw.ppm_sigma import SigmaOmegaResult
 
 
 def _row(poles):
@@ -31,6 +32,26 @@ def test_mpa_debug_odd_residue_switch_warns_and_refuses_trs(monkeypatch):
                for line in messages)
     with pytest.raises(ValueError, match="debug_gn_odd_residue_off_scope"):
         _resolve_mpa_odd_residue_debug(False, print_fn=messages.append)
+
+
+def test_mpa_odd_sigma_is_exact_production_twin_difference():
+    """MPA's public sigC_odd is the full contraction minus its D=0 twin."""
+    omega = np.asarray([-0.5, 0.0, 0.5])
+    even = np.arange(12, dtype=np.float64).reshape(3, 1, 2, 2)
+    odd = (0.25 + 0.5j) * np.ones_like(even, dtype=np.complex128)
+    total = SigmaOmegaResult(
+        omega_ry=omega, omega_ev=omega * 13.605693,
+        sigma_c_kij=even + odd, odd_even_residue_ratio=0.125)
+    reference = SigmaOmegaResult(
+        omega_ry=omega.copy(), omega_ev=omega * 13.605693,
+        sigma_c_kij=even)
+    got = _attach_ordered_odd_sigma(total, reference)
+    np.testing.assert_array_equal(got.sigma_c_odd_kij, odd)
+    assert got.odd_even_residue_ratio == 0.125
+
+    debug_off = _attach_ordered_odd_sigma(reference, reference)
+    np.testing.assert_array_equal(
+        debug_off.sigma_c_odd_kij, np.zeros_like(even))
 
 
 def test_small_gap_branching_follows_occupation_not_energy_sign():

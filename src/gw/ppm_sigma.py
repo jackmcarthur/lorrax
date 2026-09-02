@@ -165,6 +165,12 @@ class SigmaOmegaResult:
     # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
+    #: Optional exact ordered-residue contribution on the SAME omega grid:
+    #: ``Sigma_c[B,D] - Sigma_c[B,D=0]``.  GN-PPM carries this beside the
+    #: result in ``PPMOutputs`` because of its band-bracket pipeline; MPA has
+    #: no bracket tail and carries it here.  ``None`` is the TRS/incumbent
+    #: route and preserves its object graph.
+    sigma_c_odd_kij: jax.Array | None = None
     #: The LOGICAL band count each leading-axis element sums to.  Aligned
     #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
     #: and nothing else needs either.
@@ -179,6 +185,9 @@ class SigmaOmegaResult:
     #: how much of ``S_inf`` was never extrapolated
     #: (``band_extrapolation.static_limit_tail_ruling``).
     static_coh_at_counts: np.ndarray | None = None
+    #: Measured fit-level ``max|D|/max|B|`` for an ordered MPA store.  Kept
+    #: here so the shared driver report does not re-read or re-fit poles.
+    odd_even_residue_ratio: float | None = None
 
 
 class _SigmaBranchTiles(NamedTuple):
