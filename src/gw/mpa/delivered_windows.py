@@ -1676,6 +1676,7 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     elif not np.all(d.imag > 0.0):
         return None, None
     re_lo, re_hi = float(np.min(d.real)), float(np.max(d.real))
+    support = (re_lo, re_hi)   # the sampled denominators before widening
     # The lattice cells are bin representatives; the box must cover the RAW
     # products state + pole_sign*pole over the window's own frequencies, so
     # widen it to the corner extremes of (raw state energy) x (pole cells).
@@ -1705,6 +1706,10 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     lo = re_lo - pad if re_lo <= 0.0 else max(re_lo - pad, 0.7 * re_lo)
     hi = re_hi + pad if re_hi >= 0.0 else min(re_hi + pad, 0.7 * re_hi)
     box = (lo, hi, float(np.min(d.imag)), float(np.max(d.imag)))
+    box_record = {"support_re": support, "widened_re": (re_lo, re_hi), "box": box}
+    if os.environ.get("LORRAX_UNIFORM_RULE_TRACE"):
+        print(f"[uniform-box] {spec.get('name', '?')} support_re={support} "
+              f"widened_re={(re_lo, re_hi)} box={box} (Ry)")
     rule = build_uniform_rule(
         box, float(eps), time_budget=_uniform_rule_budget())
     times, weights = rule.times, rule.weights
@@ -1732,7 +1737,7 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     candidate.update(
         required_target=float(required),
         absolute_cost=float(spec["envelope"] * required),
-        factor_growth=factor, attempts=[])
+        factor_growth=factor, attempts=[], box_record=box_record)
     return candidate, metrics
 
 
