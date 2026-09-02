@@ -39,6 +39,13 @@ WHO CALLS WHAT
     The ``(vc0_mean, wcoul0)`` pair at q→0.  ``gw.vcoul.compute_q0_averages``
     is the deck-facing wrapper (called by ``gw.head_correction``'s
     HeadResolver in both the epshead and the anisotropic-S(ω) flavour).
+    **The slab (``sys_dim = 2``) evaluates it on the exact Wigner--Seitz
+    polygon cubature** ``slab_minibz_photon_cubature`` issues below — ONE
+    q→0 cell-average owner shared with the packed bispinor Γ completion —
+    and reaches the superseded scrambled-Sobol draw only through the named
+    ``rule="sobol_debug"`` (``Q0_RULE_EXACT`` / ``Q0_RULE_SOBOL_DEBUG``).
+    The bulk (``sys_dim = 3``) keeps its incumbent Sobol + Baldereschi
+    sphere rule: the polygon construction is two-dimensional.
 ``minibz_voronoi_batches`` / ``minibz_average`` / ``minibz_inscribed_sphere_r2``
     The BGW ``Common/minibzaverage.f90`` port.  Used by the 3D and 2D
     ``q0_average`` above, and directly by ``bse.vq_interp.minibz_head_vlr``
@@ -128,7 +135,7 @@ from vcoul.minibz import (
     sample_minibz_qpoints,
     wrap_points_to_voronoi,
 )
-from vcoul.slab_2d import Slab2D
+from vcoul.slab_2d import Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG, Slab2D
 from vcoul.sphere import (
     bare_coulomb_sphere_indices,
     bare_coulomb_sphere_mask,
@@ -149,6 +156,8 @@ __all__ = [
     "SysDim", "CoulombKernel", "get_kernel", "v_qG_table", "v_qG_single",
     "HeadSlotTable", "head_slot_table",
     "Bulk3D", "Slab2D", "Box0D",
+    # the slab q->0 cell-average rule selection (no silent alternative)
+    "Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG",
     # standalone host quadrature owner
     "GAUSS_LEGENDRE_INTERVAL_PROVENANCE", "gauss_legendre_interval",
     # mini-BZ sampling / averaging

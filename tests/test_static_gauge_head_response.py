@@ -169,6 +169,131 @@ def test_static_head_moment_applies_deterministic_cubature_weights():
         np.asarray(conditioned_backward), expected_theta, rtol=2e-14)
 
 
+# A hexagonal slab shaped like the MoS2 3x3 gate deck (a = 5.9 bohr,
+# c = 23.3 bohr, k = 3x3x1, cell volume 702 bohr^3), so the cells below
+# exercise the rule on the integrand production actually integrates rather
+# than on an invented one.  ``_S_ISOTROPIC`` is lane J's fitted in-plane
+# scalar for that deck (claim 0586: s = -0.317143 bohr^2).
+_SLAB_A_BOHR = 5.9
+_SLAB_C_BOHR = 23.3
+_S_ISOTROPIC = -0.317143
+
+
+def _hex_slab_geometry():
+    """One hexagonal slab cell and k-grid, shared by the owner cells below."""
+    import vcoul
+    a = _SLAB_A_BOHR
+    bvec = np.asarray((
+        (2.0 * np.pi / a, 2.0 * np.pi / (a * np.sqrt(3.0)), 0.0),
+        (0.0, 4.0 * np.pi / (a * np.sqrt(3.0)), 0.0),
+        (0.0, 0.0, 2.0 * np.pi / _SLAB_C_BOHR),
+    ), dtype=np.float64)
+    celvol = float(a * a * np.sqrt(3.0) / 2.0 * _SLAB_C_BOHR)
+    return vcoul.CoulombGeometry(bvec=bvec, cell_volume=celvol), (3, 3, 1)
+
+
+def test_scalar_head_owner_and_packed_completion_share_one_q0_quadrature():
+    """ONE q->0 cell-average owner: same nodes, same weights, same numbers.
+
+    The scalar charge head (``vcoul.Slab2D.q0_average``) and the packed
+    completion's bare/screened Gamma average must be the SAME reduction of
+    the SAME provider receipt, not two estimators that happen to agree.
+    Measured on both companions:
+
+    * bare       ``<v>``                 == ``D_mean[0, 0]``
+    * screened   ``<v/(1 - v qSq)>``     == ``moments[0, 0][0, 0] / measure``
+      with the charge-only ``S_quadratic`` block, which reduces the coupled
+      4x4 Dyson solve to exactly the scalar denominator.
+
+    RED TWIN: the same comparison against the superseded ``sobol_debug``
+    rule, which must MISS by ~0.1 % -- the +5.72 meV/state error lane J
+    measured (claim 0586).  Without it a broken owner and a coincidence
+    look the same.
+    """
+    import vcoul
+    from vcoul import Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG
+
+    geometry, kgrid = _hex_slab_geometry()
+    kernel = vcoul.get_kernel(2)
+    S_cart = np.diag(
+        (_S_ISOTROPIC, _S_ISOTROPIC, 0.0)).astype(np.complex128)
+
+    receipt = vcoul.slab_minibz_photon_cubature(kernel, geometry, kgrid)
+    chunk = receipt.chunks[-1]
+    n_valid = int(chunk.physical_count)
+    measure = float(np.sum(chunk.sample_weight[:n_valid]))
+
+    S_quadratic = np.zeros((2, 2, 4, 4), dtype=np.complex128)
+    S_quadratic[:, :, 0, 0] = S_cart[:2, :2]
+    moments, D_sum, count, *_ = static_slab_photon_head_moment_chunk(
+        np.asarray(chunk.q_cart), np.asarray(chunk.D_raw), np.zeros(3),
+        S_quadratic, n_valid, np.asarray(chunk.sample_weight))
+    assert int(np.asarray(count)) == n_valid
+    packed_bare = complex(np.asarray(D_sum)[0, 0] / measure)
+    packed_screened = complex(np.asarray(moments)[0, 0, 0, 0] / measure)
+
+    scalar_bare, _ = kernel.q0_average(
+        geometry, kgrid, S_cart=np.zeros((3, 3)), rule=Q0_RULE_EXACT)
+    _, scalar_screened = kernel.q0_average(
+        geometry, kgrid, S_cart=S_cart, rule=Q0_RULE_EXACT)
+
+    assert abs(complex(scalar_bare) - packed_bare) <= 1.0e-10
+    assert abs(complex(scalar_screened) - packed_screened) <= 1.0e-10
+
+    sobol_bare, sobol_screened = kernel.q0_average(
+        geometry, kgrid, S_cart=S_cart, rule=Q0_RULE_SOBOL_DEBUG)
+    assert abs(complex(sobol_bare) - packed_bare) > 1.0e-6 * abs(packed_bare)
+    assert (abs(complex(sobol_screened) - packed_screened)
+            > 1.0e-6 * abs(packed_screened))
+
+
+def test_slab_q0_ladder_certificate_can_refuse():
+    """NEGATIVE CONTROL: the ladder gate is reachable in the FAIL direction.
+
+    A check that cannot fail is not evidence (TASTE.md).  A screened head
+    whose denominator varies far more sharply across the cell than any
+    measured deck (a much thicker slab at the same fitted ``S``) leaves the
+    24->32 pair above the mixed budget, and the production rule REFUSES
+    instead of returning the order-32 value.  The gate is the same
+    absolute+relative budget the packed completion applies to its own
+    polygon ladder.
+    """
+    import vcoul
+
+    a = _SLAB_A_BOHR
+    thick_c = 4.0 * _SLAB_C_BOHR
+    bvec = np.asarray((
+        (2.0 * np.pi / a, 2.0 * np.pi / (a * np.sqrt(3.0)), 0.0),
+        (0.0, 4.0 * np.pi / (a * np.sqrt(3.0)), 0.0),
+        (0.0, 0.0, 2.0 * np.pi / thick_c),
+    ), dtype=np.float64)
+    geometry = vcoul.CoulombGeometry(
+        bvec=bvec, cell_volume=float(a * a * np.sqrt(3.0) / 2.0 * thick_c))
+    S_cart = np.diag(
+        (_S_ISOTROPIC, _S_ISOTROPIC, 0.0)).astype(np.complex128)
+    with pytest.raises(ValueError, match="slab_q0_polygon_not_converged"):
+        vcoul.get_kernel(2).q0_average(geometry, (3, 3, 1), S_cart=S_cart)
+
+
+def test_slab_q0_rule_is_a_named_selection_that_refuses_its_alternatives():
+    """No silent rule: an unknown name and the 3D sphere key both refuse."""
+    import vcoul
+
+    geometry, kgrid = _hex_slab_geometry()
+    kernel = vcoul.get_kernel(2)
+    zero = np.zeros((3, 3))
+    with pytest.raises(ValueError, match="slab_q0_rule_unknown"):
+        kernel.q0_average(geometry, kgrid, S_cart=zero, rule="sobol")
+    with pytest.raises(
+            ValueError, match="slab_q0_analytic_sphere_unavailable"):
+        kernel.q0_average(geometry, kgrid, S_cart=zero, analytic_sphere=True)
+    # The bulk head keeps its incumbent Sobol + Baldereschi rule and takes
+    # no ``rule`` selection: the polygon construction is two-dimensional.
+    with pytest.raises(TypeError):
+        vcoul.get_kernel(3).q0_average(
+            geometry, kgrid, S_cart=zero, rule=vcoul.Q0_RULE_EXACT)
+
+
 def test_static_head_numerical_certificate_gates_transformed_forward_bound():
     finite = np.zeros((4, 4), dtype=np.complex128)
     theta = 0.75e-9
