@@ -565,9 +565,18 @@ def _device_output_zeros(shape, sharding):
 
 @lru_cache(maxsize=8)
 def _device_omega_add(sharding):
+    def _add(acc, sigma, coeff):
+        if sigma.ndim == 4:  # (n_bracket, nk, i, j)
+            return (acc + coeff.reshape((1, -1, 1, 1, 1))
+                    * sigma[:, None, ...])
+        if sigma.ndim == 3:  # (nk, i, j)
+            return (acc + coeff.reshape((-1, 1, 1, 1))
+                    * sigma[None, ...])
+        raise ValueError(
+            "DeviceOmegaAccumulator sigma tile must have rank 3 or 4")
+
     return jax.jit(
-        lambda acc, sigma, coeff: (
-            acc + coeff.reshape((-1, 1, 1, 1)) * sigma[None, ...]),
+        _add,
         donate_argnums=(0,), out_shardings=sharding)
 
 
@@ -594,9 +603,17 @@ class DeviceOmegaAccumulator:
         self._sharding = sharding
         self._replicated = NamedSharding(sharding.mesh, P())
         self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
-        if self._shape[0] != self._omega.size:
+        if len(self._shape) == 4:
+            self._omega_axis = 0
+        elif len(self._shape) == 5:
+            self._omega_axis = 1
+        else:
             raise ValueError(
-                "DeviceOmegaAccumulator: shape[0] must equal n_omega")
+                "DeviceOmegaAccumulator shape must be (n_omega,nk,i,j) "
+                "or (n_bracket,n_omega,nk,i,j)")
+        if self._shape[self._omega_axis] != self._omega.size:
+            raise ValueError(
+                "DeviceOmegaAccumulator: omega extent must equal n_omega")
         # Per-rank ω-cube: nω·nk·(nb_pad/p_x)·(nb_pad/p_y)·16 bytes (c128),
         # ×2 while a crossing window holds its temporary cube open.
         self._total = _device_output_zeros(self._shape, sharding)()

@@ -93,6 +93,8 @@ def _integrate_sigma_batches(
     mesh_xy,
     *,
     pole_batch_size,
+    brackets=None,
+    band_counts=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -101,6 +103,13 @@ def _integrate_sigma_batches(
         raise ValueError("omega_grid_ry must be a nonempty vector")
 
     s = wfns.slices
+    bracketed = brackets is not None
+    if bracketed:
+        brackets = tuple(
+            (int(lo), None if hi is None else int(hi))
+            for lo, hi in brackets)
+        if not brackets:
+            raise ValueError("MPA Sigma band-bracket plan must be nonempty")
     face_kwargs = face_kernel_kwargs(wfns)
     if wfns.layout == "legacy":
         # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
@@ -108,7 +117,8 @@ def _integrate_sigma_batches(
         # one: the public MPA Σ still refuses to run (gw_config.
         # ComputeMode), so this line is wired for consistency and has
         # never executed under a split.
-        psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
+        state_slice = s.full if bracketed else s.sigma_sum
+        psi_coh_xn, psi_coh_yr = wfns.xn(state_slice), wfns.yr(state_slice)
         psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
         # THE SAME precondition the PPM sharded branch owns.  This executor
         # accumulates into a P(None,None,'x','y') array and then strips the pad
@@ -121,8 +131,9 @@ def _integrate_sigma_batches(
             int(psi_proj_xr.shape[1]), mesh_xy, ansatz="compute_mode = mpa")
         psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
             psi_proj_xr, psi_proj_yn, mesh_xy)
-        shape = (omega.size, int(psi_proj_xr.shape[0]),
-                 int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
+        spatial_shape = (int(psi_proj_xr.shape[0]),
+                         int(psi_proj_xr.shape[1]),
+                         int(psi_proj_yn.shape[3]))
     else:
         # Face carrier (2026-08-22, mechanical port sharing
         # ppm_tau_kernel's face dispatch — see gw.ppm_sigma._run_sigma_
@@ -160,16 +171,39 @@ def _integrate_sigma_batches(
         nb_real = int(s.nb_sigma)
         assert_sharded_sigma_window_divides_mesh(
             nb_real, mesh_xy, ansatz="compute_mode = mpa")
-        psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
+        if bracketed and len(brackets) > 1:
+            from gw.wavefunction_bundle import pack_band_window
+            packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
+                      for lo, hi in brackets]
+            psi_coh_xn = tuple(pair[0] for pair in packed)
+            psi_coh_yr = tuple(pair[1] for pair in packed)
+            pack_brackets = True
+        else:
+            psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
+            pack_brackets = False
         psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
-        shape = (omega.size, int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
-    output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        spatial_shape = (int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
+    if wfns.layout == "legacy":
+        pack_brackets = False
+    if bracketed:
+        shape = (len(brackets), omega.size, *spatial_shape)
+        output_sharding = NamedSharding(
+            mesh_xy, P(None, None, None, "x", "y"))
+        sigma_shape = (len(brackets), *spatial_shape)
+        sigma_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    else:
+        shape = (omega.size, *spatial_shape)
+        output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        sigma_shape = spatial_shape
+        sigma_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     accumulator = DeviceOmegaAccumulator(
         omega, shape=shape, sharding=output_sharding)
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=kgrid,
+        brackets=brackets,
+        pack_brackets=pack_brackets,
         **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
@@ -209,9 +243,8 @@ def _integrate_sigma_batches(
                     jnp.asarray(win.E_ref_B),
                     jnp.asarray(first_t, dtype=jnp.complex128)).compile()
                 accumulator.precompile_tau_add(
-                    sigma_shape=shape[1:],
-                    sigma_sharding=NamedSharding(
-                        mesh_xy, P(None, "x", "y")))
+                    sigma_shape=sigma_shape,
+                    sigma_sharding=sigma_sharding)
                 print_fn(
                     "  MPA Sigma sweep begin: shared pane tau kernel "
                     "prewarmed")
@@ -243,6 +276,19 @@ def _integrate_sigma_batches(
 
     sigma = strip_sigma_window(
         accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
+    if bracketed:
+        sigma = jax.jit(
+            lambda values: jnp.cumsum(values, axis=0),
+            out_shardings=sigma.sharding)(sigma)
+        if band_counts is None:
+            band_counts = tuple(
+                int(s.nb_sigma_sum) if hi is None else int(hi)
+                for _lo, hi in brackets)
+        else:
+            band_counts = tuple(int(count) for count in band_counts)
+        if len(band_counts) != len(brackets):
+            raise ValueError(
+                "MPA Sigma band_counts must align with band brackets")
     transform_saving = int(logical_tau_pairs - n_tau)
     print_fn(
         f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
@@ -252,7 +298,8 @@ def _integrate_sigma_batches(
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
-        sigma_c_kij=sigma)
+        sigma_c_kij=sigma,
+        band_counts=(() if band_counts is None else tuple(band_counts)))
 
 
 def integrate_sigma_store(
@@ -265,6 +312,8 @@ def integrate_sigma_store(
     mesh_xy,
     *,
     pole_batch_size=4,
+    brackets=None,
+    band_counts=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -276,6 +325,11 @@ def integrate_sigma_store(
     this executor walk share ONE open handle for the whole iteration
     instead of opening the store once per pole batch (audit A1).  Given a
     path, this function owns a reader for the length of its own walk.
+
+    ``brackets`` optionally partitions the intermediate-state band sum into
+    disjoint slices.  The spatial kernel then returns a leading bracket axis;
+    this executor inserts omega behind it and cumulatively sums the brackets
+    before returning.  ``None`` preserves the ordinary MPA rank-4 result.
     """
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
@@ -292,7 +346,8 @@ def integrate_sigma_store(
     def run(reader):
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
-            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+            mesh_xy, pole_batch_size=batch_size, brackets=brackets,
+            band_counts=band_counts, print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -374,6 +429,9 @@ def compute_sigma_c_mpa_omega_grid(
     fit_identity=None,
     expected_screening_diagrams=None,
     occupation_state=None,
+    sigma_branches=None,
+    band_brackets=None,
+    band_counts=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -393,16 +451,23 @@ def compute_sigma_c_mpa_omega_grid(
     planner retains only exact live extrema from each configured pole batch;
     the pane control consumes the same bounded census.  The spatial executor
     then rereads and releases the pole ranges through one shared tau kernel.
+
+    ``sigma_branches`` is an optional already-resolved set of causal branches;
+    it lets another pole model retain its established occupation/Fermi policy
+    while sharing this planner and executor exactly.  ``band_brackets`` and
+    ``band_counts`` similarly carry the optional disjoint band-convergence
+    partition.  They change neither pole interpretation nor window planning.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
         expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    branches = _branches(
+    branches = (_branches(
         wfns, omega_grid_ry, efermi_ry,
         occupation_state=occupation_state,
         occupation_window_threshold=occupation_window_threshold)
+        if sigma_branches is None else tuple(sigma_branches))
     plan_mode = resolve_sigma_plan()
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
@@ -473,7 +538,8 @@ def compute_sigma_c_mpa_omega_grid(
                         f"{window['runtime_noise_budget']:.6g}")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+            pole_batch_size=pole_batch_size, brackets=band_brackets,
+            band_counts=band_counts, print_fn=print_fn)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):
