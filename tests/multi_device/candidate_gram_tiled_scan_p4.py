@@ -33,7 +33,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 def _fail(message: str) -> None:
     print(f"[candidate-gram-tiled-scan-p4] FAIL: {message}", flush=True)
-    raise SystemExit(1)
+    raise RuntimeError(message)
 
 
 def _rep_i32(value, rep_sh):

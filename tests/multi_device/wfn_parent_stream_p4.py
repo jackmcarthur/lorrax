@@ -30,7 +30,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 def _fail(message: str) -> None:
     print(f"[wfn-parent-stream-p4] FAIL: {message}", flush=True)
-    raise SystemExit(1)
+    raise RuntimeError(message)
 
 
 def _assert_local_equal(got, expected, *, label: str, atol: float = 0.0):
@@ -103,11 +103,20 @@ def _direct_kernel_gate(mesh: Mesh) -> tuple[int, int, int, int, int]:
     phase_fn = _parent_phase_kernel(mesh)
     phase_compiled = phase_fn.lower(S, tau, g_parent).compile()
     phase_hlo = phase_compiled.as_text().lower()
-    phase_exp = len(re.findall(r"\bexponential\(", phase_hlo))
-    if phase_exp != 1:
+    phase_exp_lines = [
+        line.strip() for line in phase_hlo.splitlines()
+        if re.search(r"\bexponential\(", line)
+    ]
+    phase_exp = len(phase_exp_lines)
+    if phase_exp not in (1, 2):
         _fail(
-            "nonzero phase executable must contain exactly one vector "
-            f"exponential, found {phase_exp}")
+            "one complex phase-vector executable must lower to one complex "
+            f"or two real exponentials, found {phase_exp}")
+    expected_exp_extent = f"f64[{ng}]"
+    if any(expected_exp_extent not in line for line in phase_exp_lines):
+        _fail(
+            "phase exponential escaped the one-G-row extent: "
+            + " | ".join(phase_exp_lines))
     forbidden = _forbidden_collectives(phase_hlo)
     if forbidden:
         _fail(f"phase executable has unexpected collective(s) {forbidden}")
@@ -352,7 +361,7 @@ def main() -> None:
     schedule_receipt = _real_multiband_schedule_gate(mesh)
     if jax.process_index() == 0:
         print(
-            "[wfn-parent-stream-p4] PASS: one exponential/G executable; "
+            "[wfn-parent-stream-p4] PASS: one phase-vector/G executable; "
             "zero-phase skip; zero kernel collectives; P4 4c parity; "
             f"phase={phase_receipt}; schedule={schedule_receipt}; "
             f"source={os.path.realpath(__file__)}",
