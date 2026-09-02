@@ -300,7 +300,9 @@ wall time, and those carry their measured scope.
 
 ## 3. Debug / diagnostic env
 
-None of these change results.  Stage-boundary telemetry stays on where its
+These do not change production defaults.  The one entry explicitly labelled
+**physics A/B switch** changes results only when set and loudly marks the run
+as debug-only.  Stage-boundary telemetry stays on where its
 absence has already cost 72-node hours (the AC/AF.4c observability failures).
 Per-file and per-operation HDF5 diagnostics are opt-in because they are
 incident instruments, not production results.
@@ -323,6 +325,7 @@ incident instruments, not production results.
 
 | var | default | effect |
 |---|---|---|
+| `LORRAX_DEBUG_GN_ODD_RESIDUE_OFF` | `0` (off) | **DEBUG-ONLY physics A/B switch; never production.** On a measured-broken-TR GN-PPM fit, `1`/`true`/`yes`/`on` discards the anti-Hermitian half of `W(i omega_p)` at `fit_gn_ppm_from_wc_pair`, returning `D=0` so `_residue_for_space` gives `R+=R-=B`; the even fit, screening, and every other input stay unchanged. The run record prints `WARNING -- DEBUG`. It REFUSES on a TRS/single-residue fit because there is no TR-odd residue to discard. Canonical `runtime.env_flags.env_bool` grammar. |
 | `LORRAX_SIGMA_TAU_TIMING` | `0` | Per-stage blocking timing rows for the staged τ kernel (`gw/ppm_tau_kernel.py:66`; the sub-rows are documented at `gw/ppm_sigma.py:377`).  Numerics identical (same primitives, same order, separate XLA modules); walltime NOT comparable to the fused path.  Scale-neutral: O(1) host work per τ stage. |
 | `LORRAX_PPM_ALLOW_CROSSING_BANDS` | unset (→ off) | Debugging override of `GATE ppm_sigma_gapped_occupations` (`gw/ppm_sigma.py::assert_gapped_occupations_for_ppm`), which REFUSES a GN/HL plasmon-pole Sigma whose occupation table has a Fermi-crossing band -- one occupied at some k and empty at others.  The GN/HL driver splits bands by a hard `occ > 0.5` step at a Fermi level it derives itself as `0.5*(vbm+cbm)`; with a crossing band `vbm > cbm`, so that reference is not in any gap, and `E_cond`/`H_val` are clipped at zero so a wrong-side band cannot be represented.  Nothing about that changes an array shape or the exit code.  The deck key `mpa_material_class = metal` is already refused outside `compute_mode = mpa` at parse time, but `insulator` is the DEFAULT, so this measures the SPECTRUM rather than trusting the declaration.  `1`/`true`/`on` downgrades the refusal to a loud line and continues.  `AGENT_PREAMBLE`: never set it to make a gate pass. |
 | `LORRAX_PPM_HERM_DIAG` | `0` | Deck-level ε_H measurement of the PPM amplitude's inherited hermiticity residual — `check_hermitian` over B_q and Ω_q, all q, rtol 1.0 (`gw/ppm_sigma.py:275`).  Diagnostic, not a gate (the channel merge needs no hermiticity). |

@@ -448,6 +448,33 @@ def test_ordered_fit_is_the_incumbent_fit_on_a_hermitian_probe():
     np.testing.assert_allclose(B_o, B_i, rtol=0, atol=1.0e-13 * np.max(np.abs(B_i)))
 
 
+def test_debug_odd_residue_off_reproduces_even_only_residues_and_refuses_trs(
+        monkeypatch):
+    """The debug A/B arm keeps ordered B but makes D=0, and is magnet-only."""
+    rng = np.random.default_rng(1202)
+    _Om, _R_plus, _R_minus, Wc0, Wcp = _pole_model(rng)
+    messages = []
+    monkeypatch.setenv("LORRAX_DEBUG_GN_ODD_RESIDUE_OFF", "1")
+
+    fit = ms.fit_gn_ppm_from_wc_pair(
+        jnp.asarray(Wc0), jnp.asarray(Wcp), 1j * OMEGA_P,
+        fallback_omega=2.0, n_mu_logical=Wc0.shape[-1],
+        ordered_orientations=True, print_fn=messages.append)
+    B = np.asarray(jax.device_get(fit.B_qmunu))
+    D = np.asarray(jax.device_get(fit.B_odd_qmunu))
+    assert np.array_equal(D, np.zeros_like(D))
+    np.testing.assert_array_equal(_residue_for_space("cond", B, D), B)
+    np.testing.assert_array_equal(_residue_for_space("val", B, D), B)
+    assert any("WARNING -- DEBUG" in line and "D=0" in line
+               for line in messages)
+
+    with pytest.raises(ValueError, match="debug_gn_odd_residue_off_scope"):
+        ms.fit_gn_ppm_from_wc_pair(
+            jnp.asarray(Wc0), jnp.asarray(Wcp), 1j * OMEGA_P,
+            fallback_omega=2.0, n_mu_logical=Wc0.shape[-1],
+            ordered_orientations=False, print_fn=messages.append)
+
+
 def test_ordered_fit_refuses_a_real_axis_probe():
     rng = np.random.default_rng(13)
     _Om, _Rp, _Rm, Wc0, Wcp = _pole_model(rng)
