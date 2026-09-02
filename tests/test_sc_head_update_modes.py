@@ -193,8 +193,7 @@ def _stub_wfn_meta(nb: int = 4):
     ``kgrid`` is a clean 8x8x8 so the per-axis stencil preflight
     (``parallel_transport`` mode only) is silent too.
     """
-    wfn = SimpleNamespace(
-        energies=np.zeros((1, nb)), kgrid=(8, 8, 8), trs_holds=None)
+    wfn = SimpleNamespace(energies=np.zeros((1, nb)), kgrid=(8, 8, 8))
     meta = SimpleNamespace(b_id_4_user=nb)
     return wfn, meta
 
@@ -225,7 +224,8 @@ def test_dft_velocity_never_calls_the_parallel_transport_loader(
     wfn, meta = _stub_wfn_meta()
     got = load_head_velocity_source(
         _stub_config("dft_velocity"), str(tmp_path),
-        mesh=None, wfn=wfn, meta=meta, print_fn=lambda *a, **k: None)
+        mesh=None, sym=SimpleNamespace(trs_allowed=True), wfn=wfn,
+        meta=meta, print_fn=lambda *a, **k: None)
     assert got is _SENTINEL
     assert "parallel_transport" not in armed_loaders
     assert armed_loaders["dft_velocity"] == str(
@@ -239,14 +239,16 @@ def test_the_transport_arm_does_call_it(armed_loaders, tmp_path):
     with pytest.raises(AssertionError, match="must not be reached"):
         load_head_velocity_source(
             _stub_config("parallel_transport"), str(tmp_path),
-            mesh=None, wfn=wfn, meta=meta, print_fn=lambda *a, **k: None)
+            mesh=None, sym=SimpleNamespace(trs_allowed=True), wfn=wfn,
+            meta=meta, print_fn=lambda *a, **k: None)
     assert "parallel_transport" in armed_loaders
 
 
 def test_head_update_off_loads_neither(armed_loaders, tmp_path):
     got = load_head_velocity_source(
         _stub_config("off"), str(tmp_path),
-        mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+        mesh=None, sym=None, wfn=None, meta=None,
+        print_fn=lambda *a, **k: None)
     assert got is None
     assert armed_loaders == {}
 
@@ -257,7 +259,8 @@ def test_both_modes_refuse_without_do_G0(armed_loaders, tmp_path, mode):
     with pytest.raises(ValueError, match=mode):
         load_head_velocity_source(
             _stub_config(mode, do_G0=False), str(tmp_path),
-            mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+            mesh=None, sym=None, wfn=None, meta=None,
+            print_fn=lambda *a, **k: None)
     assert armed_loaders == {}
 
 
@@ -267,7 +270,7 @@ def test_the_dispatch_announces_the_dropped_correction(
     lines: list[str] = []
     load_head_velocity_source(
         _stub_config("dft_velocity"), str(tmp_path),
-        mesh=None, wfn=wfn, meta=meta,
+        mesh=None, sym=SimpleNamespace(trs_allowed=True), wfn=wfn, meta=meta,
         print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     said = "\n".join(lines)
     assert "DFT p-matrix velocity" in said

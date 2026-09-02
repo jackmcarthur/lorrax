@@ -382,8 +382,23 @@ def test_file_wedge_polar_matrix_uses_forward_not_inverse_rotation():
     assert not np.array_equal(got, wrong)
 
 
+def test_allow_trs_override_is_retired_before_missing_schema_fallback():
+    stub = _typed_symmaps_stub(None)
+    del stub.qe_symmetry_binding
+    with pytest.raises(ValueError, match="retired_SymMaps_allow_trs"):
+        SymMaps(stub, allow_trs=True)
+
+
+def test_missing_trs_verdict_refuses_instead_of_defaulting_true():
+    stub = _typed_symmaps_stub(None)
+    del stub.trs_holds
+    with pytest.raises(ValueError, match="SymMaps_needs_measured_trs"):
+        SymMaps(stub)
+
+
 def test_missing_schema_warning_says_results_can_be_wrong():
     stub = _typed_symmaps_stub(None)
     del stub.qe_symmetry_binding
     with pytest.warns(RuntimeWarning, match="RESULTS WILL BE WRONG"):
-        SymMaps(stub, allow_trs=True)
+        with pytest.raises(ValueError, match=r"1 of 3 full-BZ k-points"):
+            SymMaps(stub)

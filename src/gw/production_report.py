@@ -308,6 +308,32 @@ class GWProductionReport:
         if centroids is not None:
             self.emit(centroid_orbit_line(centroids))
 
+    def trs_pathways(self, *, config, sym, material_class="insulator") -> None:
+        """Record the automatic TRS-dependent branch taken by this run."""
+        allowed = bool(sym.trs_allowed)
+        self.emit(
+            "TRS pathways   : automatic from SymMaps.trs_allowed="
+            f"{str(allowed).lower()}; no input override")
+        mode = config.compute_mode.value
+        if mode == "mpa":
+            from .mpa.model import chi0_orientation_route
+
+            self.emit(
+                "MPA chi0 route : "
+                + chi0_orientation_route(
+                    material_class, trs_allowed=allowed))
+        elif mode == "gn_ppm":
+            reuse = str(getattr(config.ppm, "probe_chi_reuse", "off"))
+            route = (
+                "ordered orientations with the TR-odd channel"
+                if not allowed else "incumbent symmetric completion")
+            self.emit(f"GN probe route  : {route}; ppm_probe_chi_reuse={reuse}")
+        elif mode == "hl_ppm":
+            self.emit(
+                "HL probe route  : incumbent real-axis completion"
+                + ("; measured-broken-TR limitation retained"
+                   if not allowed else ""))
+
     def bands(self, *, config, wfn, band_slices, zeta_ranges) -> None:
         b = band_slices
         n_e = float(getattr(wfn, "num_electrons", np.nan))

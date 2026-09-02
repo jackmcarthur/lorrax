@@ -182,7 +182,8 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
     meta = SimpleNamespace(b_id_4_user=8, nspinor=1, nk_tot=8)
     with pytest.raises(ValueError, match="mandatory finite-link DFT head"):
         load_parallel_transport_head(
-            "parallel_transport.h5", mesh=_mesh(), wfn=wfn, meta=meta
+            "parallel_transport.h5", mesh=_mesh(),
+            sym=SimpleNamespace(trs_allowed=True), wfn=wfn, meta=meta
         )
 
     assert opens == [("parallel_transport.h5", "r")], (
@@ -280,7 +281,7 @@ def test_pt_loader_refuses_a_velocity_only_artifact_instead_of_crashing(
     with pytest.raises(ValueError, match="connection_complete is not 1"):
         load_parallel_transport_head(
             "parallel_transport_velocity_only.h5", mesh=_mesh(), wfn=wfn,
-            meta=meta,
+            sym=SimpleNamespace(trs_allowed=True), meta=meta,
         )
 
 

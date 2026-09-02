@@ -27,6 +27,7 @@ import ast
 import os
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -481,12 +482,26 @@ class _Reached(Exception):
 
 def _stub_kwargs(config, tmp_path):
     return dict(
-        quad=None, e_ref=0.0, sym=None, centroid_indices=None,
+        quad=None, e_ref=0.0, sym=SimpleNamespace(trs_allowed=True),
+        centroid_indices=None,
         config=config, meta=None, mesh_xy=None,
         run_dir=str(tmp_path / "mpa"), label="unit",
         material_class="insulator",
         tensors_filename=str(tmp_path / "isdf_tensors_4.h5"),
         print_fn=lambda *a, **k: None)
+
+
+def test_w_bse_refuses_when_the_measured_trs_verdict_is_broken(tmp_path):
+    """The ladder's anti-resonant pair gauge is not a magnetic fallback."""
+    from gw import screening
+
+    config = _config(tmp_path, "screening_diagrams = w_bse\n"
+                               "compute_mode = cohsex\n")
+    kwargs = _stub_kwargs(config, tmp_path)
+    kwargs["sym"] = SimpleNamespace(trs_allowed=False)
+    with pytest.raises(RuntimeError, match="w_bse_requires_measured_trs"):
+        screening.compute_screening_model(
+            ComputeMode.COHSEX, None, None, **kwargs)
 
 
 def test_w_bse_reaches_the_ladder_helper_and_not_the_rpa_executor(
@@ -812,6 +827,7 @@ def test_w_bse_w_gate_is_a_five_part_refusal_regardless_of_sanity_default(
         screening_bse._gate_w_or_refuse(
             W, ScreeningRequest(0.0 + 0.0j, "static"),
             stage="assembled ladder W[static]", kgrid=(3, 1, 1),
+            sym=SimpleNamespace(trs_allowed=True),
             print_fn=lambda *a, **k: None)
     message = str(exc.value)
     assert "w_bse_w_stage_invariants" in message
@@ -833,6 +849,7 @@ def test_w_bse_w_gate_restores_sanity_after_a_healthy_stage(monkeypatch):
     screening_bse._gate_w_or_refuse(
         W, ScreeningRequest(0.0 + 0.0j, "static"),
         stage="healthy scalar ladder W[static]", kgrid=(3, 1, 1),
+        sym=SimpleNamespace(trs_allowed=True),
         print_fn=lambda *a, **k: None)
     assert os.environ["LORRAX_SANITY"] == "off"
 

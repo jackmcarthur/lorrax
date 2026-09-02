@@ -657,9 +657,9 @@ def compute_screening(
     chi0_probe_reused = None
     _reuse_mode = str(getattr(config.ppm, "probe_chi_reuse", "off"))
     # ORDERED ORIENTATIONS on the imaginary-axis probe: exactly when the
-    # deck's MEASURED time-reversal verdict is false.  ``None`` (no symmetry
-    # tables — a harness, not a deck) keeps the incumbent route, as the
-    # gate below does.  See ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md``.
+    # deck's MEASURED time-reversal verdict is false. Missing symmetry tables
+    # refuse in ``_trs_verdict`` rather than selecting a branch. See
+    # ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md``.
     _tr_odd = _trs_verdict(sym) is False
     assert_probe_chi_reuse_supported(_reuse_mode, tr_odd=_tr_odd)
     if _reuse_mode == "auto":
@@ -885,6 +885,15 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    trs_allowed = _trs_verdict(sym)
+    if diagrams is ScreeningDiagrams.W_BSE and not trs_allowed:
+        raise RuntimeError(
+            "GATE w_bse_requires_measured_trs: screening_diagrams = w_bse "
+            "uses a time-reversal pair gauge for the ladder's anti-resonant "
+            "channel, but SymMaps.trs_allowed is false.  The measured DFT "
+            "reference therefore does not license that construction; use "
+            "screening_diagrams = w_rpa (or w_rpa_resolvent) until the "
+            "ladder owns a general ordered-response construction.")
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
@@ -1031,22 +1040,24 @@ def assert_probe_chi_reuse_supported(reuse_mode: str, *, tr_odd: bool) -> None:
             "on this deck.  doc: docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
 
 
-def _trs_verdict(sym) -> bool | None:
-    """The deck's MEASURED time-reversal verdict, or ``None`` when absent.
+def _trs_verdict(sym) -> bool:
+    """Return the deck's required MEASURED time-reversal verdict.
 
     ``SymMaps.trs_allowed`` comes from ``WfnLoader.trs_holds``, which
     ``density_symmetry_check`` obtained from the occupied DFT subspaces —
     the same single measurement ``gw/qgrid_symmetry.qgrid_trs_policy_for``
-    consumes, and read the same way (attribute access, so a real SymMaps
-    that somehow lacks it raises rather than defaulting).  ``None`` means
-    "no symmetry tables in hand", which is a test-harness state, not a
-    physical answer, and the gate below treats it as such.
+    consumes, and read the same way. Missing symmetry tables are not a
+    physical answer and no longer select an incumbent TRS branch.
     """
-    return None if sym is None else bool(sym.trs_allowed)
+    if sym is None or not hasattr(sym, "trs_allowed"):
+        raise ValueError(
+            "GATE screening_needs_measured_trs: screening requires "
+            "SymMaps.trs_allowed; no measured verdict was supplied.")
+    return bool(sym.trs_allowed)
 
 
 def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
-            kgrid=None, trs_allowed: bool | None = None) -> None:
+            kgrid=None, trs_allowed: bool) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
 
     ``W = (1 − Vχ₀)⁻¹V`` is the only place in the GW flow where a matrix
@@ -1077,6 +1088,11 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
     """
     from common import sanity
 
+    if not isinstance(trs_allowed, (bool, np.bool_)):
+        raise ValueError(
+            "GATE W_gate_needs_measured_trs: _gate_w requires the boolean "
+            "SymMaps.trs_allowed verdict; got "
+            f"{trs_allowed!r}.")
     label = f"W[{req.role}]"
     sanity.check_finite(label, W, print_fn=print_fn)
     if abs(complex(req.omega_ry).real) == 0.0:
@@ -1108,11 +1124,6 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
         # reducer — the framing ``check_q_conjugate_reciprocity`` below
         # already uses for its own TRS-independent statistic.
         #
-        # ``trs_allowed is None`` is "no verdict supplied" (no symmetry
-        # tables — a test harness, not a deck) and keeps the incumbent
-        # unconditional check: this fork may err toward reporting a residual
-        # that is really physics, never toward silence.
-        #
         # WHAT THIS DOES NOT COST.  The probe role's W comes off the SAME
         # ``compute_static_w`` → ``solve_w`` path, on the same tiles and the
         # same mesh, as the static role in the same run — and the static
@@ -1130,7 +1141,7 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
         # silent at rtol=1e-6: runs 129/142/150/157).  That is a defect in
         # the χ₀ completion, registered separately; this gate must not
         # assert a property only that defect is supplying.
-        if abs(complex(req.omega_ry).imag) == 0.0 or trs_allowed is not False:
+        if abs(complex(req.omega_ry).imag) == 0.0 or trs_allowed:
             sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
                                    print_fn=print_fn)
         else:

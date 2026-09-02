@@ -389,15 +389,14 @@ def test_symmaps_gate_refuses_trs_rows_for_a_magnetic_deck(tmp_path):
     assert int(np.max(sym.sym_idx_q)) < ntran
 
 
-def test_check_is_a_no_op_when_disabled(tmp_path, monkeypatch):
+def test_check_off_value_is_retired_instead_of_asserting_trs(
+        tmp_path, monkeypatch):
     path = _kramers_deck(tmp_path, magnetic=True)
     monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
-    assert trs_check_mode() == "off"
-    loader = WfnLoader(path)
-    assert loader.density_symmetry is None
-    assert loader.trs_holds is True          # permissive, historical behaviour
-    sym = loader._ensure_sym()
-    assert sym.trs_allowed is True
+    with pytest.raises(ValueError, match="retired_LORRAX_TRS_CHECK_off"):
+        trs_check_mode()
+    with pytest.raises(ValueError, match="retired_LORRAX_TRS_CHECK_off"):
+        WfnLoader(path)
 
 
 def test_strict_mode_raises_on_a_broken_deck(tmp_path, monkeypatch):

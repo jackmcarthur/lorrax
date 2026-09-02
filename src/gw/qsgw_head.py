@@ -157,7 +157,8 @@ the elementwise number only as a diagnostic.
 AND IT IS AN IDENTITY ONLY WHERE TIME REVERSAL HOLDS.  On a ferromagnet
 ``Theta`` is not a symmetry, ``tr v_i(−k) != −tr v_i(k)`` in general (that
 asymmetry is the anomalous-velocity physics, not a bug), and the residual
-must not be gated.  The measured verdict is ``WfnLoader.trs_holds``.
+must not be gated.  Every head consumer reads the measured verdict from
+``SymMaps.trs_allowed``.
 """
 
 from __future__ import annotations
@@ -435,6 +436,7 @@ def load_parallel_transport_head(
     path: str,
     *,
     mesh: Mesh,
+    sym,
     wfn,
     meta,
 ) -> ParallelTransportHeadData:
@@ -624,12 +626,16 @@ def load_parallel_transport_head(
     # ``-i[A, Sigma]`` to it, all three terms carrying the SAME odd parity
     # (module docstring, eq. 2) — so a sign error anywhere in that sum is
     # visible in exactly this statistic and invisible in every other gate
-    # the artifact carries.  The verdict comes off the WFN rather than the
-    # artifact because time reversal is a property of the DFT solution,
-    # and the fingerprint check above has already established that these
-    # are the same solution.  ``None`` (no measurement on this object) is
-    # reported as no-verdict, never as a pass.
-    trs_measured = getattr(wfn, "trs_holds", None)
+    # the artifact carries.  The verdict comes from the run's canonical
+    # SymMaps rather than the artifact because time reversal is a property
+    # of the DFT solution, and the fingerprint check above has already
+    # established that these are the same solution.
+    if not hasattr(sym, "trs_allowed"):
+        raise ValueError(
+            "GATE qsgw_head_needs_measured_trs: load_parallel_transport_"
+            "head requires SymMaps.trs_allowed; the supplied symmetry "
+            "object has no verdict.")
+    trs_measured = bool(sym.trs_allowed)
     report_trs_velocity_parity(
         f"{path}: v^DFT", trs_velocity_parity_residual(
             velocity[..., :expected_nb, :expected_nb],
@@ -3528,10 +3534,10 @@ def trs_velocity_parity_residual(
     the sum.
 
     ``trs_measured`` is REQUIRED and has no default.  Pass
-    ``WfnLoader.trs_holds`` (the spin-density measurement).  ``None`` means
-    the verdict is unavailable, and the statistic is then returned with
-    ``verdict = nan`` rather than being read as a pass — an unmeasured
-    system is not a TRS system.
+    ``SymMaps.trs_allowed`` (the canonical consumer-facing result of the
+    spin-density measurement).  ``None`` means the verdict is unavailable,
+    and the statistic is then returned with ``verdict = nan`` rather than
+    being read as a pass — an unmeasured system is not a TRS system.
 
     THE VERDICT STATISTIC IS THE BAND TRACE, and the reason is in the
     module docstring's SCOPE paragraph: ``tr v_i(k)`` is invariant under

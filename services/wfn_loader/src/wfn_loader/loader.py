@@ -383,7 +383,7 @@ class WfnLoader:
         self.trs_reference = None
         # Compatibility name retained while report consumers migrate.
         self.density_symmetry = None
-        self.trs_holds = True
+        self.trs_holds = None
         self._run_density_symmetry_check()
 
     # ------------------------------------------------------------------
@@ -495,8 +495,6 @@ class WfnLoader:
         """Check the two-component DFT reference before TRS unfolding."""
         from symmetry_maps import cached_density_symmetry_check
         report = cached_density_symmetry_check(self)
-        if report is None:
-            return
         self.trs_reference = report
         self.density_symmetry = report
         self.trs_holds = bool(report.trs_holds)
@@ -745,12 +743,23 @@ class WfnLoader:
             # ``_run_density_symmetry_check``.  ``SymMaps`` refuses to
             # select time-reversal rows when this is False, whatever the
             # ``ntran``/k-weight flags imply.
-            trs_holds=bool(getattr(self, "trs_holds", True)),
+            trs_holds=self._required_trs_verdict(),
             # Authenticated QE operation typing, or an explicit explanation
             # that SymMaps must announce before using the WFN-only fallback.
             qe_symmetry_binding=self.qe_symmetry_binding,
             qe_symmetry_diagnostic=self.qe_symmetry_diagnostic,
         )
+
+    def _required_trs_verdict(self) -> bool:
+        """Return the automatic loader verdict, refusing an absent result."""
+        verdict = getattr(self, "trs_holds", None)
+        if not isinstance(verdict, (bool, np.bool_)):
+            raise ValueError(
+                "GATE wfn_loader_needs_trs_verdict: WfnLoader has no "
+                "completed time-reversal verdict. The occupied-density "
+                "check is automatic and cannot be replaced by a permissive "
+                "default; reconstruct the loader and inspect trs_reference.")
+        return bool(verdict)
 
     def _resolve_k(self, k: KSpec) -> tuple[np.ndarray, bool]:
         """Resolve a k-spec to (k_idxs, unfold).

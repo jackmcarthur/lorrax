@@ -4385,6 +4385,7 @@ def load_head_velocity_source(
     input_dir: str,
     *,
     mesh,
+    sym,
     wfn,
     meta,
     print_fn=print,
@@ -4430,7 +4431,12 @@ def load_head_velocity_source(
             "otherwise the rebuilt head has no consumer.")
 
     nb_active = int(meta.b_id_4_user)
-    trs_measured = getattr(wfn, "trs_holds", None)
+    if not hasattr(sym, "trs_allowed"):
+        raise ValueError(
+            "GATE sc_head_needs_measured_trs: load_head_velocity_source "
+            "requires SymMaps.trs_allowed; the supplied symmetry object "
+            "has no verdict.")
+    trs_measured = bool(sym.trs_allowed)
     _refuse_degenerate_window_edge(
         np.asarray(wfn.energies)[0], nb_active,
         where=f"sc_head_update={mode}", trs_measured=trs_measured)
@@ -4458,7 +4464,7 @@ def load_head_velocity_source(
     from .qsgw_head import load_parallel_transport_head
 
     source = load_parallel_transport_head(
-        pt_path, mesh=mesh, wfn=wfn, meta=meta)
+        pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
     _refuse_hybridized_window_edge(
         source.singular_values, source.nb_logical,
         where=f"sc_head_update={mode}")
@@ -4710,7 +4716,7 @@ def run_sc_driver(
             kin_ion = kstar.select(kin_ion)
 
     parallel_transport = load_head_velocity_source(
-        config, input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
+        config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
         print_fn=print_fn)
     fixed_dft_head_response = None
     if (parallel_transport is None

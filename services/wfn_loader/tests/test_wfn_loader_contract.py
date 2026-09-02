@@ -127,13 +127,12 @@ def synth_wfn_path(tmp_path):
 
 
 def test_physical_density_occupations_keep_signed_tails_and_explicit_k_map(
-        tmp_path, monkeypatch):
+        tmp_path):
     path = _synth_wfn(tmp_path)
     occs = np.asarray([[[1.0, 0.8, 0.2, -0.05, 0.0, 0.0],
                         [1.0, 0.6, 0.4, -0.02, 0.01, 0.0]]])
     with h5py.File(path, "r+") as h5:
         h5["mf_header/kpoints/occ"][...] = occs
-    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
     loader = WfnLoader(path)
     assert not loader.occupations_are_exact_integer
     assert loader.physical_density_band_stop == 5
@@ -1374,11 +1373,10 @@ def _scalar_wfn_from(spinor_path, dst):
 
 
 def test_parent_child_unfold_matches_full_loader_for_scalar_tr(
-        gnppm_wfn, tmp_path, monkeypatch):
+        gnppm_wfn, tmp_path):
     """A scalar TR child is plain conjugation; no Pauli factor appears."""
     from jax.sharding import PartitionSpec as P
 
-    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
     path = _scalar_wfn_from(
         gnppm_wfn, str(tmp_path / "WFN_parent_star_ns1.h5"))
     mesh = _mesh_1x1()
@@ -1402,7 +1400,7 @@ def test_parent_child_unfold_matches_full_loader_for_scalar_tr(
 
 
 def test_a_scalar_wfn_unfolds_to_the_full_bz_with_no_spinor_factor(
-        gnppm_wfn, tmp_path, monkeypatch):
+        gnppm_wfn, tmp_path):
     """The registered nspinor=1 defect, end to end, on a real HDF5 file.
 
     UNTIL 2026-08-09 THIS RAISED.  ``symmetry_maps.unfold_psi`` asked for
@@ -1426,7 +1424,6 @@ def test_a_scalar_wfn_unfolds_to_the_full_bz_with_no_spinor_factor(
     ``unfold_psi`` returns on the IBZ G-axis, so the comparison is
     element-for-element against the IBZ block it came from.
     """
-    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")   # see _scalar_wfn_from
     path = _scalar_wfn_from(gnppm_wfn, str(tmp_path / "WFN_ns1.h5"))
 
     with WfnLoader(path, backend="eager") as loader:
@@ -1462,7 +1459,7 @@ def test_a_scalar_wfn_unfolds_to_the_full_bz_with_no_spinor_factor(
 
 
 def test_the_device_spinor_table_is_1x1_on_a_scalar_wfn(
-        gnppm_wfn, tmp_path, monkeypatch):
+        gnppm_wfn, tmp_path):
     """The OTHER consumer — the phdf5 path — carries the same defect.
 
     ``_ensure_phdf5_static`` builds one spinor matrix per full-BZ k and
@@ -1476,7 +1473,6 @@ def test_the_device_spinor_table_is_1x1_on_a_scalar_wfn(
     import jax
     from jax.sharding import Mesh
 
-    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
     path = _scalar_wfn_from(gnppm_wfn, str(tmp_path / "WFN_ns1_dev.h5"))
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 

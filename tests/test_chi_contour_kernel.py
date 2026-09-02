@@ -594,6 +594,8 @@ def test_metal_plan_dispatch_census(monkeypatch):
     monkeypatch.setattr(
         w_isdf, "compute_chi0_contour", _fake("insulating_contour"))
     monkeypatch.setattr(
+        w_isdf, "compute_chi0_contour_ordered", _fake("ordered_contour"))
+    monkeypatch.setattr(
         w_isdf, "compute_chi0_contour_fractional",
         _fake("fractional_contour"))
     monkeypatch.setattr(
@@ -617,7 +619,8 @@ def test_metal_plan_dispatch_census(monkeypatch):
 
     model._evaluate_samples(
         SimpleNamespace(enk=np.array([[0.0]]), occ=None), routes, quad,
-        config, meta=None, mesh_xy=None, energy_reference=0.0,
+        config, meta=None, mesh_xy=None,
+        sym=SimpleNamespace(trs_allowed=False), energy_reference=0.0,
         occupation_state=state,
         write_full=lambda p, chi: written.append(("full", p["role"])),
         write_wedge=lambda p, chi: written.append(("wedge", p["role"])),
@@ -648,19 +651,44 @@ def test_metal_plan_dispatch_census(monkeypatch):
     model._evaluate_samples(
         SimpleNamespace(enk=np.array([[0.0]]), occ=None),
         sample_plan.plan_routes(plan_i), quad, config_i, meta=None,
-        mesh_xy=None, energy_reference=0.0, occupation_state=None,
+        mesh_xy=None, sym=SimpleNamespace(trs_allowed=True),
+        energy_reference=0.0, occupation_state=None,
         write_full=lambda p, chi: written.append(("full", p["role"])),
         write_wedge=lambda p, chi: written.append(("wedge", p["role"])),
         static_gamma_override=None, gamma_row=None, kminq_rows=None)
     assert "fractional_contour" not in calls
     assert "static_dd" not in calls
+    assert "ordered_contour" not in calls
     assert len(written) == 6
+
+    # Broken-global-TR insulator: static remains exact and every nonzero
+    # imaginary/strip point uses the ordered completion.  The run record says
+    # that this was selected from the measured verdict.
+    calls.clear()
+    written.clear()
+    announced = []
+    model._evaluate_samples(
+        SimpleNamespace(enk=np.array([[0.0]]), occ=None),
+        sample_plan.plan_routes(plan_i), quad, config_i,
+        meta=SimpleNamespace(nkx=3, nky=1, nkz=1), mesh_xy=None,
+        sym=SimpleNamespace(trs_allowed=False), energy_reference=0.0,
+        occupation_state=None,
+        write_full=lambda p, chi: written.append(("full", p["role"])),
+        write_wedge=lambda p, chi: written.append(("wedge", p["role"])),
+        static_gamma_override=None, gamma_row=None, kminq_rows=None,
+        print_fn=lambda line: announced.append(line))
+    assert calls.count("insulating_static") == 1
+    assert calls.count("ordered_contour") == 3
+    assert "insulating_contour" not in calls
+    assert len(written) == 6
+    assert "MEASURED BROKEN" in "\n".join(announced)
 
     # A metal plan with no occupations refuses by name.
     with pytest.raises(ValueError, match="mpa_metal_needs_occupations"):
         model._evaluate_samples(
             SimpleNamespace(enk=None, occ=None), routes, quad, config,
-            meta=None, mesh_xy=None, energy_reference=0.0,
+            meta=None, mesh_xy=None, sym=SimpleNamespace(trs_allowed=False),
+            energy_reference=0.0,
             occupation_state=None,
             write_full=lambda p, chi: None, write_wedge=lambda p, chi: None,
             static_gamma_override=None, gamma_row=None, kminq_rows=None)

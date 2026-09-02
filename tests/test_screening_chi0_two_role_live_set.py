@@ -35,6 +35,8 @@ control.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -240,7 +242,8 @@ def test_compute_screening_spills_an_earlier_role_before_a_later_roles_build(
 
     result = screening.compute_screening(
         wfns=None, V_q=None, requests=requests,
-        quad=None, e_ref=0.0, sym=None, centroid_indices=None,
+        quad=None, e_ref=0.0,
+        sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
         config=_StubConfig(), meta=_StubMeta(), mesh_xy=None,
         print_fn=lambda *a, **k: None)
 
@@ -277,7 +280,8 @@ def test_a_single_role_scheme_never_spills(monkeypatch):
 
     result = screening.compute_screening(
         wfns=None, V_q=None, requests=[ScreeningRequest(0.0 + 0.0j, "static")],
-        quad=None, e_ref=0.0, sym=None, centroid_indices=None,
+        quad=None, e_ref=0.0,
+        sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
         config=_StubConfig(), meta=_StubMeta(), mesh_xy=None,
         print_fn=lambda *a, **k: None)
 

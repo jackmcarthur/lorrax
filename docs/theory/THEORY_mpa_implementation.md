@@ -103,6 +103,46 @@ The closed form is a scalar oracle; production evaluates the time integral
 because one time node replaces the explicit transition-pair sum by separable
 band sums.
 
+### 2.1 Ordered orientations when time reversal is broken
+
+The scalar kernel above multiplies a single completed transition carrier only
+when global time reversal holds. That is not inferred from the deck. The
+loader authenticates the nearby QE schema, measures the occupied
+two-component DFT subspaces, and `SymMaps.trs_allowed` carries the resulting
+verdict to screening. The full receipt and active operation rows are printed
+in the run record; the authoritative measurement and authorization contract
+is [the symmetry service](../services/symmetry_maps.md#contract). No input key
+can assert time reversal.
+
+On a measured-broken-TR insulator the two ordered carriers must keep their own
+resolvents. With the contour kernel's native orientation written as
+
+$$
+F_{\mathbf q}(z)=-\sum_{vc\mathbf k}
+ \frac{P^{\mathbf q}_{vc\mathbf k}}{z+\Delta_{vc\mathbf k}},
+$$
+
+the complete response is
+
+$$
+\chi^0_{\mathbf q}(z)=F_{\mathbf q}(z)
+ +F_{-\mathbf q}(-z^*)^*.
+$$
+
+Both $F(z)$ and $F(-z^*)$ are accumulated as separate output rows in one
+positive-node contour sweep. The partner is then only a flat-q negation
+gather and conjugation. There is no second response kernel, no explicit
+transition-pair loop, and no change to the cubic-scaling band sums. At a pure
+imaginary sample this retains the real antisymmetric (anti-Hermitian)
+magnetisation-odd channel. Applying the old even completion there would set
+that channel to zero.
+
+When `SymMaps.trs_allowed` is true, MPA deliberately retains the incumbent
+symmetric contour path byte-for-byte; it does not execute the ordered helper
+and simplify it afterward. Metallic MPA already evaluates explicit
+fractional-occupation ordered pairs and is independent of this global-TR
+completion. Each MPA run prints which of these three routes ran.
+
 ## 3. The double-parallel sample grid
 
 Let
