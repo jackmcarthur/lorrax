@@ -1793,9 +1793,24 @@ def _uniform_box_candidate(spec, eta, eps, max_nodes, factor_growth_cap,
     # Tempting, and why not: gating at ``relative_target`` alone "keeps the
     # global contract" -- but that contract is the apportionment's, and under
     # eps the plan's contract is per-window sup <= eps (the selector budget
-    # is lifted accordingly, see the plan loop).
+    # is lifted accordingly, see the plan loop).  Likewise the campaign's
+    # residual metric is reported (``metrics[0]``) but does not gate, see
+    # below.
+    # The residual clause of ``_rule_accepted`` is not applied to a box rule:
+    # its currency is the error relative to the LOCAL kernel size ``1/|d|``
+    # (``error_currency = inverse_gap_envelope_relative``), while eps is
+    # relative to the peak ``1/eta``.  On a sign-definite window with ``|d|``
+    # up to 650 eta the same absolute error reads 650x larger in that
+    # currency, so a rule with sup 1e-4 on the box was refused against an
+    # allowance of 1.8e-5 and the window fell through to the incumbent fit
+    # (Na +-15 eV arm 08: four tails served by Hackbusch-seeded rules).  The
+    # box rule's own acceptance (sup on the check cloud, kappa_max <= 1e4)
+    # is the contract; the noise clause and the factor-growth cap still
+    # apply, at the looser of the allowance and eps.
     gate_target = max(float(relative_target), float(eps))
-    if (not _rule_accepted(metrics, gate_target)
+    noise_ok = (metrics[1] * RUNTIME_NOISE_EPSILON
+                <= AMPLIFICATION_NOISE_SAFETY * gate_target)
+    if (rule.sup_error > float(eps) or not noise_ok
             or max(factor) > float(factor_growth_cap)):
         return None, metrics
     required = max(metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
