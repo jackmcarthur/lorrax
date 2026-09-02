@@ -589,8 +589,10 @@ columns (`:820-830`), gated on `photon_head_sigma_basis is not None` at
 `sigma_diag.dat`'s Hartree column is relabelled `Hdir` on a bispinor run.
 Those runs add `sigCC`, `sigTT`, and `sigCT` (`sigCT = CT+TC`) without
 changing `sigTOT`/`sigXC`; their sum is gated against that old total before
-write. Their displayed total and addends use ten decimals so that identity
-also closes within 1e-9 eV in the public text. A measured-broken-TR GN deck additionally adds `sigC_odd`; a
+write. The independently computed current sectors are rounded to the legacy
+six-decimal precision and displayed CC is their residual from the unchanged
+displayed total, so the identity also closes within 1e-9 eV in public text. A
+measured-broken-TR GN deck additionally adds `sigC_odd`; a
 measured-TRS deck omits it. Scalar files take the `None` branch and retain
 their historical columns byte-for-byte.
 

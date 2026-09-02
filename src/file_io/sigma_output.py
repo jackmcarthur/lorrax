@@ -513,23 +513,26 @@ def write_sigma_to_file(
 					# Total COHSEX
 					total_re = sx_re + coh_re
 					total_im = sx_im + coh_im
-					# A bispinor file publicly promises the independently named
-					# Lorentz columns close back to this value within 1e-9 eV.
-					# Ten decimals leave headroom for three displayed addends.  Keep
-					# the historical six-decimal scalar spelling byte-for-byte.
-					if lorentz_diag is None:
-						line += f"  {total_label}={total_re:>12.6f}"
-					else:
-						line += f"  {total_label}={total_re:>16.10f}"
+					line += f"  {total_label}={total_re:>12.6f}"
 					line += _im(total_im, tot_cplx)
 
 				if lorentz_diag is not None:
 					# Stable public order follows the requested names, while the
-					# internal sector order remains CC, CT+TC, TT.
+					# internal sector order remains CC, CT+TC, TT.  The old total's
+					# six-decimal spelling is a compatibility contract.  Quantize the
+					# two independently computed current sectors to that same public
+					# precision, then spell CC as the residual, so parsing the text
+					# preserves sigCC+sigTT+sigCT=total below 1e-9 eV without moving
+					# or respelling any incumbent column.
+					display_re = [
+						float(f"{float(np.real(lorentz_diag[s, k, n])):.6f}")
+						for s in range(3)]
+					display_re[0] = (
+						float(f"{total_re:.6f}") - display_re[1] - display_re[2])
 					for label, sector in (("sigCC", 0), ("sigTT", 2),
 					                      ("sigCT", 1)):
 						value = lorentz_diag[sector, k, n]
-						line += f"  {label}={float(np.real(value)):>16.10f}"
+						line += f"  {label}={display_re[sector]:>12.6f}"
 						line += _im(float(np.imag(value)),
 						            lorentz_cplx[sector])
 
