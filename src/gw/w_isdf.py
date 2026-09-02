@@ -2063,16 +2063,6 @@ def compute_experimental_no_pair_photon_chi0(
     return pack_photon_operator(get_block, nq, layout, mesh_xy)
 
 
-def _padded_bundle_centroid_extent(wfns) -> int:
-    """PADDED centroid extent of a bundle, whichever field carries it."""
-    if wfns.layout == "legacy":
-        return int(wfns.psi_yr.shape[-1])
-    if wfns.layout == "face":
-        return int(wfns.psi_mun.shape[2])
-    raise ValueError(
-        f"static photon response: unknown wavefunction layout {wfns.layout!r}")
-
-
 #: Provenance of the unscreened-current packed body.  The bare-transverse
 #: family declares NO current response model: the twelve current blocks of
 #: chi are zero, not approximated.
@@ -2088,9 +2078,14 @@ class StaticPhotonResponse:
     V_packed: jax.Array
     W_packed: jax.Array
     current_contact: str
+    #: The approximation stamp: ``gamma_completed_*`` when the Gamma-cell
+    #: completion ran, ``DEBUG_headless_*`` under ``head_correction = off``
+    #: (see :func:`compute_static_photon_response`).  Required: no
+    #: constructor may leave it at a default naming a mode that no longer
+    #: exists.
+    approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
-    approximation: str = "experimental_no_pair_bubble_screened_breit_v1"
 
 
 def compute_static_photon_response(
@@ -2371,8 +2366,9 @@ def compute_static_photon_response(
         # compute_experimental_no_pair_photon_chi0; the bare branch builds no
         # chi, so assert it here rather than let photon_sigma fail on a
         # block/bundle shape mismatch several stages later.
-        n_c = _padded_bundle_centroid_extent(wfns_charge)
-        n_t = _padded_bundle_centroid_extent(wfns_transverse)
+        from .wavefunction_bundle import padded_centroid_extent
+        n_c = padded_centroid_extent(wfns_charge)
+        n_t = padded_centroid_extent(wfns_transverse)
         if (n_c != layout.padded_extent(0) or n_t != layout.padded_extent(1)):
             raise ValueError(
                 "photon layout padded extents do not match wavefunction "

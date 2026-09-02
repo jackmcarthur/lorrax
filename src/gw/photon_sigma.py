@@ -111,14 +111,6 @@ def _diagnostic_diagonal(matrix, basis_rotation, mesh_xy):
         diag, NamedSharding(mesh_xy, P(*([None] * diag.ndim))))
 
 
-def _padded_centroid_extent(wfns) -> int:
-    if wfns.layout == "legacy":
-        return int(wfns.psi_yr.shape[-1])
-    if wfns.layout == "face":
-        return int(wfns.psi_mun.shape[2])
-    raise ValueError(f"photon Sigma: unknown wavefunction layout {wfns.layout!r}")
-
-
 def _bundle_for_channel(wfns_charge, wfns_transverse, channel: int):
     return wfns_charge if int(channel) == 0 else wfns_transverse
 
@@ -348,16 +340,17 @@ def compute_static_photon_sigma(
     head_diag = [[None for _ in range(3)] for _ in range(3)]
     head_total_diag = [None for _ in range(3)]
 
-    from .wavefunction_bundle import with_lorentz_vertices
+    from .wavefunction_bundle import (
+        padded_centroid_extent, with_lorentz_vertices)
 
     for A in _CHANNELS:
         left = _bundle_for_channel(wfns_charge, wfns_transverse, A)
         left_g = with_lorentz_vertices(left, A, 0)
-        n_left = _padded_centroid_extent(left)
+        n_left = padded_centroid_extent(left)
         for B in _CHANNELS:
             right = _bundle_for_channel(wfns_charge, wfns_transverse, B)
             right_g = with_lorentz_vertices(right, 0, B)
-            n_right = _padded_centroid_extent(right)
+            n_right = padded_centroid_extent(right)
             contract_block = _make_photon_static_block_kernel(
                 mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
                 with_q0_diagnostic=q0_factors is not None)

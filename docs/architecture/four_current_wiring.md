@@ -27,6 +27,32 @@ disagree with this one, they win — this page owns the *wiring* only.
 
 ## The two routes
 
+> **Status note, 2026-09-01 (lane C, `lane/bisp-c-bare-as-packed-2026-09-01`,
+> merged on `integ/bispinor-static-cleanup-2026-09-01@3897f89f`).** The
+> table and the paragraph below describe lane B's tree and are one step
+> stale. Inside the envelope `bispinor = true`, `compute_mode = cohsex`,
+> `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim = 2`,
+> `head_correction ∈ {full, off}`, `restart = false`
+> (`gw_config.packed_bare_transverse_route`, which returns `(taken, reason)`),
+> the whole bare-transverse family is ALSO served by the packed route: the
+> same `compute_static_photon_response` with `screen_current = False`
+> (`W_packed = diag(W_00, D_TT)`, no current `χ` blocks, no packed Dyson
+> solve; the CC block comes from the incumbent scalar `solve_w`), the same
+> Γ completion with the charge-only `R(q)` (which inserts the bare
+> `⟨D_TT⟩` head, so `bispinor_tt_head_correction = true` is refused there,
+> `GATE packed_bare_transverse_tt_head_double_count`, and a present
+> `static_gauge_hall_file` is refused, `GATE packed_bare_transverse_hall_unavailable`),
+> and the same sixteen-block `photon_sigma`. `uses_static_photon_response`
+> is therefore `FULL_STATIC_COHSEX or packed_bare_transverse_route(config)[0]`,
+> and the ONE selector between the two packed modes is
+> `gw_config.packed_photon_screens_current`. Route **B** (`Σ^B` through
+> `gw.sigma_x_bispinor`, the scalar band-diagonal head, the TT overlay) is
+> now taken only OUTSIDE that envelope — bulk, `restart = true`,
+> `no_local_fields`, self-consistent, `x_only` and every dynamic mode — and
+> the run record says which ran (`Photon route   :` line, `gw_jax.py`).
+> Line numbers below are lane B's; `packed_bare_transverse_route` is at
+> `gw_config.py:3565`, `packed_photon_screens_current` at `:3622`.
+
 Everything on this page belongs to one of two routes, and the fork is a
 single predicate. There is exactly **one** packed mode: the former
 `charge_hall_cubature` spelling is retired and refuses, naming
