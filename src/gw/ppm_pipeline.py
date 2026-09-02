@@ -554,6 +554,16 @@ def compute_ppm_sigma_pipeline(
             _services.ensure_on_path()
             from symmetry_maps import q_negation_index
             q_neg = q_negation_index(tuple(int(v) for v in meta.kgrid))
+        # ORDERED ORIENTATIONS: GN on a deck whose MEASURED time-reversal
+        # verdict is false.  The same predicate that routed the probe χ₀
+        # through the ordered kernel in ``gw.screening.compute_screening``
+        # (one measurement, ``SymMaps.trs_allowed``, read the same way) now
+        # tells the fit to split W(iω_p) into its Hermitian and
+        # anti-Hermitian halves.  HL keeps the incumbent single-residue fit
+        # everywhere: a real-axis probe cannot carry the odd residue
+        # (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6).
+        from .screening import _trs_verdict
+        ordered = bool((not is_hl) and (_trs_verdict(sym) is False))
         ppm = fit_ppm(
             W_static_q, W_probe_q, V_q, probe_omega, mesh_xy,
             fallback_omega=config.ppm.fallback_omega,
@@ -567,6 +577,7 @@ def compute_ppm_sigma_pipeline(
             # support.  This is lossy versus BGW finite-pole parity; HL is a
             # different real-axis model and is deliberately unchanged.
             coarsen_extreme_tails=not is_hl,
+            ordered_orientations=ordered,
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)

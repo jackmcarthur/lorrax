@@ -1553,6 +1553,115 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     )
 
 
+def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
+    """Nodes/operands of the ordered imaginary-axis route (see below)."""
+    if getattr(quad, "alpha_odd", None) is None:
+        raise ValueError(
+            "GATE chi0_imag_ordered_needs_odd_kernel: the ordered "
+            "imaginary-axis chi0 route needs a quadrature built with "
+            "with_odd_kernel=True (minimax_screening.build_imag_quadrature); "
+            "this one carries no odd weights, so the time-reversal-odd "
+            "channel it exists to keep would be zero by construction.")
+    s = wfns.slices
+    enk_v = wfns.enk[:, s.val]
+    enk_c = wfns.enk[:, s.cond]
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    E_gap = cmin - vmax
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    alpha = np.asarray(quad.alpha, dtype=np.float64)
+    beta = np.asarray(quad.alpha_odd, dtype=np.float64)
+    if tau.shape != alpha.shape or tau.shape != beta.shape:
+        raise ValueError(
+            "chi0_imag_ordered: tau, alpha and alpha_odd must share one "
+            f"node axis; got {tau.shape}, {alpha.shape}, {beta.shape}")
+    # gamma_l = -(alpha_l - i beta_l) e^{-tau_l E_gap}: the resolvent
+    # -1/(x + i omega_p) of the kernel's OWN orientation (the -Delta pole,
+    # DERIVATION_gnppm_nonhermitian.md section 2).  The conjugate partner
+    # receives conj(gamma) through the q-negated conjugate below.
+    gamma = -(alpha - 1j * beta) * np.exp(-tau * E_gap)
+    nodes = MinimaxNodes(
+        t=jnp.asarray(tau, dtype=jnp.complex128),
+        alpha=jnp.asarray(gamma, dtype=jnp.complex128),
+    )
+    return (
+        nodes, *_chi_layout_operands(wfns, eref),
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64),
+    )
+
+
+def compute_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *, q_neg_index,
+                              energy_reference=0.0):
+    """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own
+    frequency weight — the route for a deck whose measured time-reversal
+    verdict is false.  Returns flat-q (nq, μ, μ), ``P(None, 'x', 'y')``.
+
+    :func:`compute_chi0` applies the EVEN kernel ``x/(x²+ωp²)`` to the
+    orientation sum ``A_R + conj(A_R)``, which deletes the anti-Hermitian,
+    magnetisation-odd channel ``iω(P^q − conj(P^{−q}))/(ω²+Δ²)`` of χ₀(iω)
+    (lane G, measured on CrI3 run 128).  The exact object is the SAME two
+    carriers with independent complex weights::
+
+        χ₀_q(iωp) = F_q + conj(F_{−q}),
+        F_q       = Σ_l γ_l e^{−τ_l E_gap} A_q(τ_l),   γ_l = −(α_l − iβ_l),
+
+    with ``α`` the served even rule (unchanged) and ``β`` the odd rule
+    ``ωp/(x²+ωp²)`` on the same nodes (``quad.alpha_odd``).  ``F_q`` is one
+    sweep of the existing ``complex_contour`` kernel (real nodes, complex
+    weights, no in-kernel completion) — no second response implementation —
+    and the partner is the flat-q negation gather of its conjugate, which
+    ``FFT_R[conj(A_R)] = conj(A_{−q})`` makes exact.  On a Θ deck
+    ``conj(A_{−q}) = A_q`` and this equals :func:`compute_chi0` to roundoff;
+    the caller keeps the incumbent path there so Θ decks stay bit-identical.
+    Reciprocity ``χ_{−q} = conj(χ_q)`` holds by construction.
+
+    ``q_neg_index`` is the public ``symmetry_maps.q_negation_index`` row
+    permutation for ``meta.kgrid`` — passed in, never rebuilt here (TASTE 4).
+    The probe roles run on the FULL BZ, which is the only grid on which the
+    involution is meaningful.
+    """
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=1, complex_contour=True,
+        **_chi_face_kwargs(wfns))
+    F_q = kernel(*args)
+    q_neg = np.asarray(q_neg_index)
+    nq = int(F_q.shape[0])
+    if (q_neg.shape != (nq,)
+            or not np.array_equal(q_neg[q_neg], np.arange(nq))):
+        raise ValueError(
+            "compute_chi0_imag_ordered: q_neg_index must be an involution "
+            f"over the full flat-q axis [0, {nq}); got shape {q_neg.shape}.")
+    return _complete_imag_ordered(F_q, jnp.asarray(q_neg, dtype=jnp.int32))
+
+
+@jax.jit
+def _complete_imag_ordered(F_q, q_neg):
+    """``F_q + conj(F_{-q})`` — a leading-axis gather, sharding-preserving."""
+    return F_q + jnp.conj(jnp.take(F_q, q_neg, axis=0))
+
+
+def precompile_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *,
+                                 energy_reference=None):
+    """AOT sibling of :func:`compute_chi0_imag_ordered` (the contour
+    kernel's compile; the completion gather is negligible)."""
+    if len(np.asarray(quad.tau)) == 0:
+        return
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=1, complex_contour=True,
+        **_chi_face_kwargs(wfns))
+    kernel.lower(*args).compile()
+
+
 def compute_no_pair_dirac_current_block(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,

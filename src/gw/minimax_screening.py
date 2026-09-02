@@ -231,6 +231,17 @@ class LaplaceMinimaxQuadrature:
     #: every existing construction site is untouched; ``None`` means the
     #: object was built by hand (a test fixture) rather than served.
     provenance: str | None = None
+    #: THE ODD KERNEL (ordered particle-hole orientations, magnets only).
+    #: ``alpha_odd`` fits ``omega_p/(x^2+omega_p^2)`` on the SAME ``tau``
+    #: nodes -- the imaginary part of ``-1/(x+i*omega_p)`` whose real part
+    #: ``alpha`` fits.  Present only when the rule was built with
+    #: ``with_odd_kernel=True``; the last ``n_odd_extra`` nodes of ``tau``
+    #: then carry ``alpha == 0`` (they exist for the odd part alone, so the
+    #: even accumulation is numerically the served even rule).  See
+    #: ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` section 2.
+    alpha_odd: np.ndarray | None = None
+    max_error_odd: float = float("nan")
+    n_odd_extra: int = 0
 
     @property
     def node_count(self) -> int:
@@ -286,6 +297,12 @@ class GNPPMFitResult:
     omega_min_after: float = float("nan")
     omega_max_after: float = float("nan")
     tail_anchor_omega: float = float("nan")
+    #: The ODD residue ``D = (R_+ - R_-)/2`` of the ordered-orientation fit
+    #: (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` section 3),
+    #: Hermitian elementwise, zero on dead modes.  ``None`` is the incumbent
+    #: single-residue model (``R_+ = R_- = B_qmunu``), the only model a
+    #: time-reversal-symmetric deck ever sees.
+    B_odd_qmunu: jax.Array | None = None
 
 
 def fit_gn_ppm_from_wc_pair(
@@ -297,6 +314,7 @@ def fit_gn_ppm_from_wc_pair(
     n_mu_logical: int,
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
+    ordered_orientations: bool = False,
 ) -> GNPPMFitResult:
     """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
 
@@ -309,6 +327,21 @@ def fit_gn_ppm_from_wc_pair(
     probe_omega
         Complex probe frequency ``z_probe`` in Ry. For the standard GN fit this is
         purely imaginary, e.g. ``2j``.
+    ordered_orientations
+        THE MAGNET MODEL.  ``False`` (default) is the incumbent single-residue
+        fit, bit-for-bit: ``W^c(z_probe)`` is consumed as given and both pole
+        branches share ``B``.  ``True`` splits ``W^c(i*omega_p)`` elementwise
+        into its Hermitian half ``h`` (which fixes ``Omega`` and ``B`` through
+        the incumbent algebra) and its anti-Hermitian half ``a``, and returns
+        the odd residue ``D = i*a*(omega_p^2 + Omega^2)/(2*omega_p)`` in
+        ``B_odd_qmunu`` so that the conduction branch of Sigma consumes
+        ``R_+ = B + D`` and the valence branch ``R_- = B - D``
+        (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` sections 3-4).
+        Requires a purely imaginary probe: at a real probe ``W^c`` is Hermitian
+        for any system and the odd residue is unobservable.  On a Hermitian
+        input ``D`` is exactly zero and ``Omega``/``B`` agree with the incumbent
+        to roundoff (a different XLA program: not bit-identical, which is why
+        the caller routes only measured-broken-TR decks here).
     fallback_omega
         Positive real fallback pole in Ry for entries that do not produce a valid
         positive-real ``Omega^2`` estimate.
@@ -369,6 +402,16 @@ def fit_gn_ppm_from_wc_pair(
     _z = jnp.asarray(probe_omega, dtype=jnp.complex128)
     _fb = jnp.asarray(fallback_host, dtype=jnp.float64)
     _W0 = jnp.asarray(Wc0_qmunu)
+    ordered = bool(ordered_orientations)
+    if ordered:
+        _zh = complex(probe_omega)
+        if (not np.isfinite(_zh.real) or not np.isfinite(_zh.imag)
+                or abs(_zh.real) > 0.0 or abs(_zh.imag) == 0.0):
+            raise ValueError(
+                "GATE gn_ppm_ordered_probe_axis: ordered_orientations=True "
+                "needs a purely imaginary, nonzero probe (the odd residue "
+                "is read off the anti-Hermitian part of W^c(i*omega_p), "
+                f"which a real-axis probe cannot carry); got {probe_omega!r}.")
 
     # --- q-CHUNKED EVALUATION (movement-only; see the note above the kernel).
     # Leading axis is the q family; the trailing two are (mu, nu).  One q-slice
@@ -399,13 +442,23 @@ def fit_gn_ppm_from_wc_pair(
     _per_q *= _W0.dtype.itemsize
     _qb = _gn_ppm_fit_q_block(_nq, _per_q)
 
+    # The anti-Hermitian half of the probe, kept only on the ordered path
+    # (one extra (nq, mu, nu) c128 tile, needed again after the tail policy
+    # has fixed the final Omega).
+    a_odd = None
     if _qb >= _nq:
-        # Whole thing fits: the historical single-shot call, untouched.
-        (omega_vals, B_vals, good, n_good, n_modes,
-         omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
-            Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
+        if ordered:
+            (omega_vals, B_vals, good, n_good, n_modes,
+             omega_min, omega_max, pair_rel_min,
+             a_odd) = _gn_ppm_fit_kernel_ordered(
+                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
+        else:
+            # Whole thing fits: the historical single-shot call, untouched.
+            (omega_vals, B_vals, good, n_good, n_modes,
+             omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
+                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
     else:
-        _om, _bv, _gd = [], [], []
+        _om, _bv, _gd, _aod = [], [], [], []
         n_good = jnp.asarray(0.0, dtype=jnp.float64)
         n_modes = jnp.asarray(0.0, dtype=jnp.float64)
         omega_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
@@ -413,10 +466,17 @@ def fit_gn_ppm_from_wc_pair(
         pair_rel_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
         for _q0 in range(0, _nq, _qb):
             _q1 = min(_q0 + _qb, _nq)
-            (_o, _b, _g, _ng, _nm,
-             _omin, _omax, _rmin) = _gn_ppm_fit_kernel(
-                 Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
-                 _z, _fb, n_log)
+            if ordered:
+                (_o, _b, _g, _ng, _nm,
+                 _omin, _omax, _rmin, _a) = _gn_ppm_fit_kernel_ordered(
+                     Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
+                     _z, _fb, n_log)
+                _aod.append(_a)
+            else:
+                (_o, _b, _g, _ng, _nm,
+                 _omin, _omax, _rmin) = _gn_ppm_fit_kernel(
+                     Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
+                     _z, _fb, n_log)
             _om.append(_o); _bv.append(_b); _gd.append(_g)
             # Exact integer counts -> summation order is irrelevant.
             n_good = n_good + _ng
@@ -427,7 +487,9 @@ def fit_gn_ppm_from_wc_pair(
         omega_vals = jnp.concatenate(_om, axis=0)
         B_vals = jnp.concatenate(_bv, axis=0)
         good = jnp.concatenate(_gd, axis=0)
-        del _om, _bv, _gd
+        if ordered:
+            a_odd = jnp.concatenate(_aod, axis=0)
+        del _om, _bv, _gd, _aod
 
     fulfilled = n_good / jnp.maximum(n_modes, 1.0)
     # Every host transfer in the fit is a scalar and deliberately outside
@@ -472,6 +534,18 @@ def fit_gn_ppm_from_wc_pair(
                 f"the fitted support [{omega_min_host}, {omega_max_host}] "
                 f"-> [{omega_min_after}, {omega_max_after}].")
 
+    # THE ODD RESIDUE, from the FINAL pole.  ``D = i a (omega_p^2 +
+    # Omega^2) / (2 omega_p)`` is a statement about the pole the Sigma
+    # kernel will actually evolve, so it is formed after the optional tail
+    # policy has re-anchored Omega -- the same order in which ``B`` was
+    # recomputed from the anchored pole.  Dead modes (Omega = 0) carry
+    # D = 0 exactly, which keeps every downstream ``Omega > 1e-14`` mask
+    # sufficient for the odd residue too.
+    B_odd_vals = None
+    if ordered:
+        B_odd_vals = _gn_ppm_odd_residue(a_odd, omega_vals, _z)
+        del a_odd
+
     return GNPPMFitResult(
         omega_qmunu=omega_vals,
         B_qmunu=B_vals,
@@ -486,6 +560,7 @@ def fit_gn_ppm_from_wc_pair(
         omega_min_after=omega_min_after,
         omega_max_after=omega_max_after,
         tail_anchor_omega=tail_anchor,
+        B_odd_qmunu=B_odd_vals,
     )
 
 
@@ -826,6 +901,53 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
     )
 
 
+@partial(jax.jit, static_argnums=(4,))
+def _gn_ppm_fit_kernel_ordered(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback,
+                               n_log):
+    """The ordered-orientation twin of :func:`_gn_ppm_fit_kernel`.
+
+    Same module, same eight outputs, plus the anti-Hermitian half of the
+    probe.  The elementwise fit is handed the HERMITIAN half of
+    ``W^c(i*omega_p)`` -- ``(W + W^H)/2`` over the trailing ``(mu, nu)`` pair
+    -- so ``Omega`` stays real symmetric and ``B`` Hermitian whatever the
+    deck (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` section 3).
+    The adjoint is taken INSIDE the jit for the same reason
+    ``common.sanity.check_hermitian`` takes its transpose inside one: on the
+    ``P(None, 'x', 'y')`` layout the transpose is an X<->Y resharding, and
+    fused under one module GSPMD moves the tile locally instead of
+    all-gathering both operands.  This is a separate XLA program from the
+    incumbent kernel by design: the incumbent stays bit-identical.
+    """
+    Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
+    Wc_probe_adj = jnp.conj(jnp.swapaxes(Wc_probe, -1, -2))
+    herm = 0.5 * (Wc_probe + Wc_probe_adj)
+    anti = 0.5 * (Wc_probe - Wc_probe_adj)
+    (omega_vals, B_vals, good, n_good, n_modes,
+     omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
+        Wc0_qmunu, herm, z_probe, fallback, n_log)
+    return (
+        omega_vals, B_vals, good, n_good, n_modes,
+        omega_min, omega_max, pair_rel_min, anti,
+    )
+
+
+@jax.jit
+def _gn_ppm_odd_residue(anti_qmunu, omega_qmunu, z_probe):
+    """``D = i a (omega_p^2 + Omega^2) / (2 omega_p)`` on live modes, else 0.
+
+    ``a`` is the anti-Hermitian half of ``W^c(i*omega_p)`` and ``Omega`` the
+    FINAL fitted pole (after any tail policy).  ``omega_p = |Im z|``.  ``D`` is
+    Hermitian because ``i*a`` is and the multiplier is real symmetric.
+    """
+    anti = jnp.asarray(anti_qmunu, dtype=jnp.complex128)
+    omega = jnp.asarray(omega_qmunu, dtype=jnp.float64)
+    omega_p = jnp.abs(jnp.imag(jnp.asarray(z_probe, dtype=jnp.complex128)))
+    scale = (omega_p * omega_p + omega * omega) / (2.0 * omega_p)
+    D = (1j * anti) * scale.astype(jnp.complex128)
+    return jnp.where(omega > 0.0, D,
+                     jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+
+
 def solve_laplace_minimax_interval(
     x_min: float,
     x_max: float,
@@ -880,6 +1002,70 @@ def solve_laplace_minimax_interval(
 LAST_IMAG_TABLE_REFUSAL: _beta_selector.TableRefusal | None = None
 
 
+#: Ceiling on the nodes the odd-kernel augmentation may add to a served
+#: imaginary-axis rule.  Measured 2026-09-01 on MoS2-, CrI3- and Si-like
+#: (x_min, x_max, omega_p) triples: 5, 1 and 5 extras reach 1e-6 from the 7,
+#: 11 and 11 even nodes; a weights-only refit on the even nodes alone stalls
+#: at 1.8e-3 / 1.3e-5 / 5.7e-4.  Beyond this ceiling the rule refuses by
+#: name rather than ship an odd channel it cannot represent.
+ODD_KERNEL_MAX_EXTRA_NODES = 16
+
+
+def _augment_odd_kernel_nodes(tau, x_min, x_max, omega_p, *,
+                              gate_error: float,
+                              max_extra: int = ODD_KERNEL_MAX_EXTRA_NODES,
+                              n_grid: int = 4096, n_candidates: int = 48):
+    """Nodes and weights for ``omega_p/(x^2+omega_p^2)`` on ``[x_min, x_max]``.
+
+    The served even rule's nodes are kept as they are and the odd kernel is
+    represented on them PLUS the fewest extra nodes, drawn greedily from a
+    geometric candidate grid around the even nodes, that bring the measured
+    sup-norm error under ``gate_error`` -- the same weights-only Lawson
+    machinery and the same greedy pattern as
+    :func:`refit_imag_alpha_augmented`, whose measured lesson applies here
+    too: the even nodes do not resolve the odd kernel on their own.
+
+    Returns ``(tau_full, beta, k_extra, max_err)``; the first ``len(tau)``
+    entries of ``tau_full`` are the input nodes unchanged.  Raises when the
+    ceiling is hit: an odd channel represented to 1e-3 is not the physics
+    the caller asked for, and there is no even-rule fallback that is
+    correct here.
+    """
+    tau_s = np.asarray(tau, dtype=np.float64)
+    x = np.geomspace(float(x_min), float(x_max), int(n_grid))
+    wp = float(omega_p)
+    f_odd = wp / (x * x + wp * wp)
+    cand = np.geomspace(float(np.min(tau_s)) / 8.0,
+                        float(np.max(tau_s)) * 8.0, int(n_candidates))
+    cur = tau_s.copy()
+    beta, err = _lawson_weights_fit(cur, f_odd, x)
+    k = 0
+    while err > float(gate_error) and k < int(max_extra):
+        best = None
+        for c in cand:
+            if np.any(np.abs(np.log(c / cur)) < 1.0e-9):
+                continue
+            b_try, e_try = _lawson_weights_fit(np.append(cur, c), f_odd, x)
+            if best is None or e_try < best[1]:
+                best = (c, e_try, b_try)
+        if best is None:
+            break
+        cur = np.append(cur, best[0])
+        beta, err = best[2], best[1]
+        k += 1
+    if err > float(gate_error):
+        raise RuntimeError(
+            "GATE odd_kernel_representation: the time-reversal-odd probe "
+            f"kernel omega_p/(x^2+omega_p^2) on [{float(x_min):.6g}, "
+            f"{float(x_max):.6g}] Ry (omega_p={wp:.6g}) reached sup error "
+            f"{err:.3e} with {k} extra nodes, above the gate "
+            f"{float(gate_error):.3e}; ceiling {int(max_extra)} extras.  "
+            "Want: an odd rule at the served even rule's accuracy.  Fix: "
+            "raise minimax_max_nodes / relax minimax_target_error, or run "
+            "this magnet under compute_mode = mpa.")
+    return cur, np.asarray(beta, dtype=np.float64), int(k), float(err)
+
+
 def solve_laplace_minimax_imag_interval(
     x_min: float,
     x_max: float,
@@ -890,11 +1076,20 @@ def solve_laplace_minimax_imag_interval(
     use_shipped_tables: bool = True,
     beta_clause: str = _beta_selector.HEIGHT,
     print_fn=None,
+    with_odd_kernel: bool = False,
 ) -> LaplaceMinimaxQuadrature:
     """Fit ``x/(x^2+omega_p^2) ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
 
     Used for chi0(i*omega_p) where the resonant+antiresonant sum gives
     2*x/(x^2+omega_p^2) with x = E_c - E_v.
+
+    ``with_odd_kernel=True`` (ordered orientations, magnets) additionally
+    fits ``omega_p/(x^2+omega_p^2)`` -- the imaginary part of
+    ``-1/(x+i*omega_p)`` whose real part this rule has always fitted -- and
+    returns it in ``alpha_odd`` on the same nodes: the certified complex
+    table's ``Im alpha`` when one answers, otherwise the even nodes plus a
+    few greedily added ones (:func:`_augment_odd_kernel_nodes`), with the
+    even weights zero on the extras so the even accumulation is unchanged.
 
     ``target_error`` is the requested physical L-infinity absolute error.
     As for :func:`solve_laplace_minimax_interval`, the scaled service request
@@ -975,6 +1170,27 @@ def solve_laplace_minimax_imag_interval(
     alpha = w_hat / x_min
     err_abs = err_hat / x_min
 
+    alpha_odd = None
+    err_odd = float("nan")
+    n_extra = 0
+    if with_odd_kernel:
+        tau = np.asarray(tau, dtype=np.float64)
+        alpha = np.asarray(alpha, dtype=np.float64)
+        if isinstance(picked, _beta_selector.TableSelection):
+            # One certified payload, both parts: the complex table fits
+            # 1/(u - i beta) in modulus, so its imaginary part on the same
+            # nodes IS the odd kernel, at the certified modulus error.
+            alpha_odd = np.ascontiguousarray(
+                np.imag(picked.alpha), dtype=np.float64) / x_min
+            err_odd = float(picked.modulus_error) / x_min
+        else:
+            tau_full, beta, n_extra, err_odd = _augment_odd_kernel_nodes(
+                tau, x_min, x_max, omega_p,
+                gate_error=max(float(target_error), float(err_abs)))
+            alpha = np.concatenate([alpha, np.zeros(n_extra)])
+            tau = tau_full
+            alpha_odd = beta
+
     return LaplaceMinimaxQuadrature(
         x_min=x_min,
         x_max=x_max,
@@ -982,6 +1198,9 @@ def solve_laplace_minimax_imag_interval(
         alpha=np.asarray(alpha, dtype=np.float64),
         max_error=float(err_abs),
         provenance=provenance,
+        alpha_odd=alpha_odd,
+        max_error_odd=err_odd,
+        n_odd_extra=int(n_extra),
     )
 
 
@@ -1130,10 +1349,14 @@ def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
     return quad, e_ref
 
 
-def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
+def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None,
+                          with_odd_kernel: bool = False):
     """Build imaginary-frequency minimax quadrature for x/(x²+ωp²).
 
     Uses the same energy interval as the static quadrature.
+    ``with_odd_kernel`` adds the odd kernel ``ωp/(x²+ωp²)`` for the
+    ordered-orientation χ₀ route (magnets) — see
+    :func:`solve_laplace_minimax_imag_interval`.
     """
     quad_imag = solve_laplace_minimax_imag_interval(
         quad.x_min, quad.x_max, float(omega_p),
@@ -1141,13 +1364,22 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
         max_nodes=int(minimax_config.max_nodes),
         use_shipped_tables=bool(minimax_config.use_shipped_tables),
         print_fn=print_fn,
+        with_odd_kernel=bool(with_odd_kernel),
     )
     if print_fn is not None:
         R = quad_imag.x_max / quad_imag.x_min
+        n_even = quad_imag.node_count - int(quad_imag.n_odd_extra)
         print_fn(
             f"  PPM imag-freq quadrature (ωp={float(omega_p):.4f} Ry): "
-            f"R={R:.1f}, nodes={quad_imag.node_count}, err~{quad_imag.max_error:.1e}"
+            f"R={R:.1f}, nodes={n_even}, err~{quad_imag.max_error:.1e}"
             f"  [{quad_imag.provenance or 'provenance unrecorded'}]")
+        if quad_imag.alpha_odd is not None:
+            print_fn(
+                "  PPM imag-freq ODD kernel ωp/(x²+ωp²) (ordered "
+                f"orientations, TR-odd channel): +{quad_imag.n_odd_extra} "
+                f"nodes -> {quad_imag.node_count} total, "
+                f"err~{quad_imag.max_error_odd:.1e} (gate "
+                f"{max(float(minimax_config.target_error), float(quad_imag.max_error)):.1e})")
     return quad_imag
 
 

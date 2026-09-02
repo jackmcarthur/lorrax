@@ -160,8 +160,15 @@ def compute_static_w(
     chi0_override: jax.Array | None = None,
     gamma_chi_override: jax.Array | None = None,
     head_channel=None,
+    ordered_orientations: bool = False,
 ):
     """W = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge when legal.
+
+    ``ordered_orientations`` (probe roles on a measured-broken-TR deck):
+    build χ₀ through :func:`gw.w_isdf.compute_chi0_imag_ordered`, which
+    keeps the time-reversal-odd channel the even Laplace completion deletes.
+    Needs ``quad`` built with ``with_odd_kernel=True`` and the full BZ
+    (``force_full_bz``); ``False`` is the incumbent path, bit-for-bit.
 
     One cadence for EVERY W role: AOT compile split (chi.compile /
     chi.exec / W.compile / W.exec), ``block_until_ready`` discipline, and
@@ -338,6 +345,43 @@ def compute_static_w(
                         energy_reference=e_ref)
                     chi0_q.block_until_ready()
                     chi0_extra_q.block_until_ready()
+            elif ordered_orientations:
+                # ORDERED ORIENTATIONS (measured-broken-TR deck, imaginary
+                # probe): the kernel's own orientation and its q-negated
+                # conjugate partner each get their own resolvent weight, so
+                # χ₀(iω_p) keeps its anti-Hermitian, magnetisation-odd
+                # channel.  Full BZ only: the q-negation involution is a
+                # full-grid statement.
+                from .w_isdf import (
+                    compute_chi0_imag_ordered, precompile_chi0_imag_ordered)
+                if use_ibz_w:
+                    raise RuntimeError(
+                        "GATE chi0_imag_ordered_full_bz: the ordered "
+                        "orientation route needs the full-BZ q axis "
+                        "(force_full_bz=True); the IBZ cascade was "
+                        "requested for role "
+                        f"{role!r}.")
+                from ffi import _services
+                _services.ensure_on_path()
+                from symmetry_maps import q_negation_index
+                _q_neg = q_negation_index(tuple(int(v) for v in meta.kgrid))
+                with timing.section(
+                        "chi.compile", announce=True,
+                        label=f"{_w} chi0 compile (ordered orientations)"):
+                    precompile_chi0_imag_ordered(
+                        wfns, quad, meta, mesh_xy, energy_reference=e_ref)
+                with timing.section(
+                        "chi.exec", announce=True,
+                        label=f"{_w} chi0 build ORDERED ORIENTATIONS "
+                              f"(TR-odd channel kept; "
+                              f"{len(np.asarray(quad.tau))} tau nodes = "
+                              f"{len(np.asarray(quad.tau)) - int(quad.n_odd_extra)}"
+                              f" even + {int(quad.n_odd_extra)} odd, "
+                              f"{int(meta.nk_tot)} q, mu={_mu})"):
+                    chi0_q = compute_chi0_imag_ordered(
+                        wfns, quad, meta, mesh_xy, q_neg_index=_q_neg,
+                        energy_reference=e_ref)
+                    chi0_q.block_until_ready()
             else:
                 with timing.section("chi.compile", announce=True,
                                     label=f"{_w} chi0 compile"):
@@ -612,6 +656,12 @@ def compute_screening(
     fused_plan = None
     chi0_probe_reused = None
     _reuse_mode = str(getattr(config.ppm, "probe_chi_reuse", "off"))
+    # ORDERED ORIENTATIONS on the imaginary-axis probe: exactly when the
+    # deck's MEASURED time-reversal verdict is false.  ``None`` (no symmetry
+    # tables — a harness, not a deck) keeps the incumbent route, as the
+    # gate below does.  See ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md``.
+    _tr_odd = _trs_verdict(sym) is False
+    assert_probe_chi_reuse_supported(_reuse_mode, tr_odd=_tr_odd)
     if _reuse_mode == "auto":
         _imag_probes = [
             r for r in requests
@@ -720,11 +770,28 @@ def compute_screening(
         if on_imag:
             quad_used = build_imag_quadrature(
                 quad, abs(req.omega_ry.imag),
-                config.minimax_config, print_fn=print_fn)
+                config.minimax_config, print_fn=print_fn,
+                with_odd_kernel=_tr_odd)
+            if _tr_odd:
+                print_fn(
+                    f"  {_w}: measured time-reversal verdict is BROKEN — "
+                    "χ₀(iω_p) is built with ORDERED particle-hole "
+                    "orientations (TR-odd anti-Hermitian channel kept; "
+                    "w_isdf.compute_chi0_imag_ordered).  W(iω_p) is then "
+                    "legitimately non-Hermitian; its residual is reported "
+                    "by the gate, not refused.")
         else:
             quad_used = build_real_quadrature(
                 quad, abs(req.omega_ry.real),
                 config.minimax_config, print_fn=print_fn)
+            if _tr_odd:
+                print_fn(
+                    f"  {_w}: measured time-reversal verdict is BROKEN, "
+                    "but a REAL-axis probe cannot carry the TR-odd "
+                    "residue (W^c(z)^H = W^c(conj z) is Hermitian at real "
+                    "z), so this HL probe keeps the incumbent even "
+                    "orientation completion; the odd channel of χ₀(Ω) is "
+                    "NOT represented here (KNOWN_LORRAX_ISSUES, lane M).")
 
         # The probe-ω W runs through the SAME cadence function as the
         # static role (compute_static_w: chi.compile → chi.exec →
@@ -743,7 +810,8 @@ def compute_screening(
             sym=sym, centroid_indices=centroid_indices,
             config=config, meta=meta, mesh_xy=mesh_xy,
             role=req.role, force_full_bz=True, section="chi0_W_probe",
-            head_channel=head_channel)
+            head_channel=head_channel,
+            ordered_orientations=bool(_tr_odd and on_imag))
         with timing.section("W.gate"):
             _gate_w(W, req, print_fn=print_fn,
                     trs_allowed=_trs_verdict(sym))
@@ -935,6 +1003,24 @@ _TR_ODD_W_HERMITICITY_CAUSE = (
     "an index/shard mixing fault.  Judge it against the same run's ω = 0 "
     "role, which is gated unconditionally."
 )
+
+
+def assert_probe_chi_reuse_supported(reuse_mode: str, *, tr_odd: bool) -> None:
+    """``ppm_probe_chi_reuse = auto`` folds the probe χ₀ into the STATIC τ
+    sweep as a second even-weighted accumulation (``compute_chi0_multi``),
+    which cannot carry the time-reversal-odd channel the ordered route
+    exists for.  Refuse by name on a measured-broken-TR deck rather than
+    serve a probe χ₀ with the channel silently deleted (TASTE 13)."""
+    if tr_odd and str(reuse_mode).strip().lower() == "auto":
+        raise RuntimeError(
+            "GATE gn_probe_chi_reuse_tr_broken: ppm_probe_chi_reuse = auto "
+            "reuses the static tau sweep's EVEN orientation completion for "
+            "the probe chi0, and this deck's measured time-reversal verdict "
+            "is BROKEN, where chi0(i*omega_p) has an anti-Hermitian, "
+            "magnetisation-odd channel that completion deletes.  got: "
+            "ppm_probe_chi_reuse = auto.  want: the ordered-orientation "
+            "probe route.  fix: set ppm_probe_chi_reuse = off (the default) "
+            "on this deck.  doc: docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
 
 
 def _trs_verdict(sym) -> bool | None:

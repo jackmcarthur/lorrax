@@ -84,6 +84,17 @@ automatically certify the cosine-weighted kernel. A shared-node augmentation
 may reuse static nodes, but only after the combined rule passes the
 imaginary-axis residual gate.
 
+On a measured-broken-TR deck the probe needs the sine-weighted kernel as
+well, \(\omega_p/(\Delta^2+\omega_p^2)=\int_0^\infty e^{-\Delta t}\sin(\omega_p t)\,dt\),
+because the two particle-hole orientations then carry the complex weights
+\(-1/(\Delta\pm i\omega_p)\) separately. The odd kernel is represented on the
+served even nodes plus the fewest greedily added nodes (weights-only fits,
+the even weights zero on the extras, so the even accumulation is the served
+rule unchanged) and gated at the even rule's error; measured 2026-09-01 the
+even nodes alone stall at \(10^{-3}\)–\(10^{-5}\) and one to five extras
+reach \(10^{-6}\). Owner: `minimax_screening.solve_laplace_minimax_imag_interval(with_odd_kernel=True)`;
+physics in [`DERIVATION_gnppm_nonhermitian.md`](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+
 ## 3. Real-frequency PPM windows
 
 A PPM self-energy denominator is schematically

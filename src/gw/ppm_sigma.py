@@ -110,11 +110,36 @@ class PPMBuildResult:
                               # seam for the invalid-pole static-COHSEX term
                               # (ppm_invalid_mode="static_limit", BGW mode 3).
                               # Identity: Wc0 = −2·B_q/Ω_q elementwise.
-    B_q: jax.Array            # (nq, μ, μ) PPM amplitude
+    B_q: jax.Array            # (nq, μ, μ) PPM amplitude: (R_+ + R_-)/2
     Omega_q: jax.Array        # (nq, μ, μ) PPM pole frequency
     valid_mask_q: jax.Array   # (nq, μ, μ)
     unfulfilled_fraction: float
     n_nodes_static: int
+    #: The ODD residue D = (R_+ − R_-)/2 of the ordered-orientation fit on a
+    #: measured-broken-TR deck (``docs/dev/notes/DERIVATION_gnppm_
+    #: nonhermitian.md`` §3-4): the conduction branches consume R_+ = B + D,
+    #: the valence branches R_- = B − D.  ``None`` is the incumbent
+    #: single-residue model, the only one a time-reversal-symmetric deck
+    #: sees; ``_residue_for_space`` is the one place the selection happens.
+    B_odd_q: jax.Array | None = None
+
+
+def _residue_for_space(space: str, B_q, B_odd_q=None):
+    """The pole residue one Σ branch evolves: ``R_+`` (cond) or ``R_-`` (val).
+
+    ``Σ_c(E) = Σ_occ ψψ†⊙R_-/(E−ε+Ω) + Σ_emp ψψ†⊙R_+/(E−ε−Ω)`` — the
+    conduction (empty) A-space carries the +Ω residue, the valence
+    (occupied) A-space the −Ω one (derivation §4, verified against the
+    imaginary-axis contour in ``tests/test_gnppm_ordered_orientations.py``).
+    With ``B_odd_q=None`` both branches get ``B_q`` and nothing about the
+    incumbent path changes, not even the object identity.
+    """
+    if space not in ("cond", "val"):
+        raise ValueError(
+            f"_residue_for_space: space must be 'cond' or 'val'; got {space!r}")
+    if B_odd_q is None:
+        return B_q
+    return B_q + B_odd_q if space == "cond" else B_q - B_odd_q
 
 
 @dataclass(frozen=True)
@@ -370,12 +395,20 @@ def fit_ppm(
     n_mu_logical: int,
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
+    ordered_orientations: bool = False,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
     Model-agnostic over the pole-fit ansatz: the same algebra serves
     both Godby-Needs (purely imaginary ``probe_omega = i·ωp``) and
     Hybertsen-Louie (real ``probe_omega = Ω`` above all transitions).
+
+    ``ordered_orientations=True`` (GN on a measured-broken-TR deck): the
+    probe is split into Hermitian and anti-Hermitian halves and the odd
+    residue ``D`` is returned in ``B_odd_q`` — see
+    :func:`gw.minimax_screening.fit_gn_ppm_from_wc_pair` and
+    ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md``.  ``False`` is the
+    incumbent single-residue fit, bit-for-bit.
 
     All input arrays are flat-q (nq, μ, μ).  Returns PPMBuildResult with
     B_q, Omega_q, valid_mask_q sharded as P(None, 'x', 'y').
@@ -404,16 +437,32 @@ def fit_ppm(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
          q_neg_index=q_neg_index,
-         coarsen_extreme_tails=bool(coarsen_extreme_tails))
+         coarsen_extreme_tails=bool(coarsen_extreme_tails),
+         ordered_orientations=bool(ordered_orientations))
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.omega_qmunu), q_shard)
     B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
+    B_odd = (None if fit.B_odd_qmunu is None else
+             jax.lax.with_sharding_constraint(
+                 jnp.asarray(fit.B_odd_qmunu), q_shard))
     valid_mask = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
     t1 = _t.perf_counter()
+
+    if B_odd is not None and print_fn is not None:
+        # The size of the odd residue, as one scalar census: max|D| over
+        # max|B|.  Two scalar reductions on the fitted tiles' own sharding.
+        _d_max = float(jax.device_get(jnp.max(jnp.abs(B_odd))))
+        _b_max = float(jax.device_get(jnp.max(jnp.abs(B))))
+        print_fn(
+            f"  {model_label} ORDERED residues (measured-broken-TR deck): "
+            f"R± = B ± D with D from the anti-Hermitian part of "
+            f"W^c(iω_p); max|D|/max|B| = "
+            f"{(_d_max / _b_max if _b_max > 0.0 else _d_max):.3e}; "
+            "conduction branches evolve R+, valence branches R-.")
 
     # Deck-level ε_H measurement (env-gated observability; channel-
     # hermiticity memo §1.3/§3.5): the Laplace-family symmetry diagnostics
@@ -432,6 +481,10 @@ def fit_ppm(
                                rtol=1.0, verbose=True, print_fn=_pf)
         sanity.check_hermitian(f"{model_label} Omega_q (symmetry, all q)",
                                Omega, rtol=1.0, verbose=True, print_fn=_pf)
+        if B_odd is not None:
+            sanity.check_hermitian(f"{model_label} D_q (odd residue, all q)",
+                                   B_odd, rtol=1.0, verbose=True,
+                                   print_fn=_pf)
 
     # ω_p in PPMBuildResult historically meant the imaginary-axis magnitude;
     # carry the probe magnitude there for diagnostics.  Downstream Σ kernels
@@ -475,6 +528,7 @@ def fit_ppm(
         valid_mask_q=valid_mask,
         unfulfilled_fraction=fit.unfulfilled_fraction,
         n_nodes_static=n_nodes_static,
+        B_odd_q=B_odd,
     )
 
 
@@ -1518,6 +1572,21 @@ def compute_sigma_c_ppm_omega_grid(
     B_mask = state.B_mask
     n_total_modes = int(jax.device_get(state.n_total_modes))
     n_invalid = int(jax.device_get(state.n_invalid))
+    # The odd residue rides beside B unchanged by the state trace: it is
+    # masked by the SAME ``mask_B`` inside ``_build_W_t_q`` (the kernel
+    # selects ``where(mask_B & in_window, B*phase, 0)`` on whatever residue
+    # the branch hands it), and dead modes already carry D = 0 from the fit.
+    B_odd_corr = getattr(ppm, "B_odd_q", None)
+    if B_odd_corr is not None:
+        B_odd_corr = jnp.asarray(B_odd_corr, dtype=jnp.complex128)
+        if B_odd_corr.shape != B_corr.shape:
+            raise ValueError(
+                "PPM odd residue B_odd_q must match B_q's shape; got "
+                f"{B_odd_corr.shape} versus {B_corr.shape}.")
+        print_fn(
+            "  Σc branches: ORDERED residues — cond branches evolve "
+            "R+ = B + D, val branches R- = B - D (TR-odd channel; "
+            "docs/dev/notes/DERIVATION_gnppm_nonhermitian.md §4).")
 
     omega_step_ev = float(omega_req[1] - omega_req[0]) * RYD_TO_EV if omega_req.size > 1 else 0.0
     print_fn(
@@ -1612,7 +1681,6 @@ def compute_sigma_c_ppm_omega_grid(
     )
 
     common_branch_kwargs = dict(
-        B_q=B_corr,
         Omega_q=Omega_abs,
         base_mask_B=B_mask,
         regularization_width_ry=regularization_width_ry,
@@ -1671,6 +1739,10 @@ def compute_sigma_c_ppm_omega_grid(
         branch_tiles, _ = _run_sigma_branch(
             omega_nonneg_ry=br.omega_abs,
             E_A=br.E_A, base_mask_A=br.base_mask_A,
+            # R_+ for the conduction A-space, R_- for the valence one; the
+            # very same ``B_corr`` object for both when there is no odd
+            # residue (every time-reversal-symmetric deck).
+            B_q=_residue_for_space(br.space, B_corr, B_odd_corr),
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
             **common_branch_kwargs,
