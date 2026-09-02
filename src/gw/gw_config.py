@@ -3334,14 +3334,9 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         "bgw_metal_q0_treatment.")
 
 
-#: WHICH COMBINATIONS OF ``low_mem_bands = true`` v1 REFUSES, and why.
-#:
-#: Same shape as ``_W_BSE_REFUSALS`` above: ``rule_id -> (predicate, got,
-#: want, fix, doc)``, assembled into one five-part message so a rule cannot
-#: be added without answering all five.  Predicates take the resolved
-#: :class:`LorraxConfig` and check only their OWN axis — the caller,
-#: :func:`refuse_unsupported_low_mem_bands`, has already established
-#: ``low_mem_bands = true`` before the loop runs.
+#: HISTORICAL LIFT RECORD for the former ``low_mem_bands = true`` refusal
+#: table.  Its last row was lifted on 2026-08-23; the empty table and its
+#: parser/driver no-op were deleted by the gate survey on 2026-09-02.
 #:
 #: SUPPORTED, deliberately absent from this table (guide
 #: ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §6):
@@ -3350,14 +3345,13 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
 #: standard chi0, COHSEX / GN-PPM / HL-PPM / insulating MPA, restart
 #: read/write.
 #:
-#: A FIFTH combination the guide names — an explicit dense ``Gij`` operand
-#: — has no deck key (every shipped driver call site leaves it at its
+#: The one remaining limitation — an explicit dense ``Gij`` operand
+#: has no deck key (every shipped driver call site leaves it at its
 #: ``None`` default; see ``cohsex_sigma._resolve_Gij``), so it cannot be a
-#: row in a config-resolution table keyed on parsed values.  It is guarded
+#: config-resolution row keyed on parsed values.  It is guarded
 #: separately by :func:`refuse_explicit_gij_under_low_mem_bands`, called
 #: from ``compute_sigma_xc`` at the one seam that ever sees both operands
 #: together.
-_LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
     # LIFTED 2026-08-23 (feat/qsgw-face-rotations-2026-08-23) per this row's
     # own recorded lift condition: rotate_wavefunctions now dispatches on
     # wfns_dft.layout and routes layout='face' through
@@ -3533,47 +3527,6 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # remains refused, by the metal row alone; see that row's own
         # updated comment for why (three named infra obstacles this
         # session, none of them in gw.mpa.sigma's own code).
-)
-
-
-def refuse_unsupported_low_mem_bands(config) -> None:
-    """Refuse the ``low_mem_bands = true`` combinations v1 does not serve.
-
-    BEFORE ALLOCATION.  Called from :meth:`LorraxConfig.from_input_file`
-    once the resolved record exists (predicates read ``compute_mode`` /
-    ``qp_solver``, which fold in the legacy flags — the same reason
-    :func:`refuse_unsupported_screening_diagrams` is called there and not
-    re-derived), so a doomed deck refuses in the first second of a run
-    rather than after the chi0 build or the ISDF fit that would otherwise
-    silently rebuild a one-axis replica to serve it.  Also called from
-    ``gw.gw_init.prepare_isdf_and_wavefunctions`` at entry, mirroring
-    :func:`refuse_unimplemented_compute_mode`'s two call sites: the parser
-    call is what saves the operator's allocation on the production path,
-    the driver-entry call is what makes a hand-built config (a test
-    harness, a future direct caller) safe without having to remember the
-    parser check.
-
-    NO-OP FOR ``low_mem_bands = false`` (the default), evaluated first and
-    returning before any predicate is touched: a default deck must not
-    acquire a new parse-time resolution — and hence a new possible
-    refusal — from this feature existing.
-    """
-    if not bool(config.memory.low_mem_bands):
-        return
-    for rule_id, predicate, got, want, fix, doc in _LOW_MEM_BANDS_REFUSALS:
-        if not predicate(config):
-            continue
-        raise ValueError(
-            f"GATE {rule_id}: low_mem_bands = true is refused with "
-            f"{got(config)}.\n"
-            f"  got:  low_mem_bands = true, {got(config)}\n"
-            f"  want: {want}\n"
-            f"  fix:  {fix}\n"
-            f"  why:  {doc}.\n"
-            f"  doc:  docs/input_reference.md '## ISDF / zeta', "
-            f"low_mem_bands.")
-
-
 #: How a reader should read an unmet envelope condition.  PHYSICS means the
 #: quantity does not exist outside the condition; IMPLEMENTATION LIMIT means
 #: it exists and nobody has written it.  Printed in every refusal, because
@@ -3995,15 +3948,15 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             and not bool(config.density_self_consistent)):
         raise ValueError(
             "GATE bispinor_self_consistency_requires_live_four_current: "
-            "bispinor QSGW changes the occupied orbitals, so its scalar "
-            "charge and signed Dirac current must both be rebuilt on every "
-            "map call. Bispinor QSGW selects the live four-current path by "
-            "default; refusing this explicit or hand-built request for a "
-            "frozen DFT direct field.\n"
-            f"  got: qp_solver = {config.qp_solver.value}, "
+            "a frozen direct field is inconsistent with bispinor QSGW.\n"
+            f"  got:  qp_solver = {config.qp_solver.value}, "
             f"density_self_consistent = {bool(config.density_self_consistent)}\n"
             "  want: density_self_consistent = true (or "
-            "qp_solver = one_shot_dft)")
+            "qp_solver = one_shot_dft)\n"
+            "  why:  QSGW changes the occupied orbitals, so both scalar "
+            "charge and signed Dirac current must be rebuilt on every map; "
+            "freezing the DFT direct field mixes two orbital states\n"
+            "  doc:  docs/input_reference.md, density_self_consistent.")
     # EITHER packed static mode inserts the bare <D_TT> q=Gamma head through
     # the Gamma-cell completion that carries the charge head, so the hand
     # overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
@@ -4041,10 +3994,14 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         return
     if not bool(config.bispinor):
         raise ValueError(
-            f"GATE bispinor_gw_requires_bispinor: bispinor_gw = "
-            f"{mode.value} requires bispinor = true.  This axis selects "
-            "four-current screening; it does not turn four-spinor "
-            "wavefunctions on implicitly.")
+            "GATE bispinor_gw_requires_bispinor: a four-current screening "
+            "mode needs four-spinor wavefunctions.\n"
+            f"  got:  bispinor_gw = {mode.value}, bispinor = false\n"
+            "  want: bispinor = true, or bispinor_gw = bare_transverse "
+            "left at its inert scalar default\n"
+            "  why:  bispinor_gw selects the screening model; it cannot "
+            "implicitly change the WFN representation named by bispinor\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
     # The one packed static mode.  The Gamma-cell completion is part of the
     # calculation (owner ruling 2026-09-01, docs/architecture/decisions.md):
     # ``full`` runs it, ``off`` is the announced DEBUG skip, and there is no
@@ -4145,9 +4102,8 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
 def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
     """Refuse an explicit dense ``Gij`` operand under ``low_mem_bands = true``.
 
-    THE ONE ROW ``_LOW_MEM_BANDS_REFUSALS`` CANNOT HOLD.  Every other
-    combination in the envelope is a deck key readable at parse time; an
-    explicit ``Gij`` is a keyword-only Python parameter of
+    This cannot be a deck-key refusal: an explicit ``Gij`` is a keyword-only
+    Python parameter of
     ``compute_sigma_xc`` / ``compute_cohsex_sigma`` that every shipped
     driver call site (``gw_jax.py``, ``sc_iteration.py``) leaves at its
     ``None`` default — ``cohsex_sigma._resolve_Gij``'s docstring names the
@@ -6076,14 +6032,6 @@ class LorraxConfig:
         refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
         refuse_unsupported_bispinor_gw(resolved)
-        # Same position/reason as the two calls above: low_mem_bands=false
-        # (the default) returns before any predicate is touched, so this
-        # adds no new resolution to a default deck.  See
-        # refuse_unsupported_low_mem_bands's docstring for why this call
-        # (parser altitude) and the mirrored call in
-        # gw.gw_init.prepare_isdf_and_wavefunctions (driver-entry altitude,
-        # for hand-built configs) both exist.
-        refuse_unsupported_low_mem_bands(resolved)
         # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
         # the other one.  Same position and same reason as the two refusals
         # above: the announcement quotes the RESOLVED axes, which only the

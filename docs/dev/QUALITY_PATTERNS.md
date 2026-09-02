@@ -148,6 +148,22 @@ For any new distributed-physics code, ask in order:
 9. What artifacts does it read that could postdate their config? Stamp and
    assert. (10)
 
+## Refusal-gate rubric
+
+Classify a refusal by the reason the rejected value cannot run: **PHYSICS**
+when the requested quantity/model does not exist, **IMPLEMENTATION LIMIT**
+when it exists but this tree cannot compute it, **STALE** when no reachable
+input can satisfy the predicate, **DUPLICATE** when another owner checks the
+same fact, and **OVER-BROAD** when a valid input is rejected with the invalid
+ones. Keep physics and live implementation gates. Delete stale gates, route
+duplicates through one owner, and relax an over-broad predicate only with a
+positive result check plus a negative control.
+
+Every refusal names `GATE <id>`, the deck key or API argument and observed
+value (`got:`), the accepted condition (`want:`), and the consequence of
+continuing (`why:`). A test that only sees the accepted case is not gate
+coverage; each live gate needs a control that makes its real predicate fire.
+
 ## Current standing of the codebase against this rubric
 - **ζ-fit pipeline**: modeled, traced, lattice-gated, provenance-guarded —
   first-principles confidence. Failures here would be infra-class.

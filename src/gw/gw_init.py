@@ -45,7 +45,6 @@ from .gw_config import (
 	classify_xla_pool,
 	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_bispinor_gw,
-	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
 	uses_coupled_photon_head,
 )
@@ -3092,12 +3091,6 @@ def prepare_isdf_and_wavefunctions(
 	from .restart_q_storage import (resolve_restart_q_storage_for_run,
 	                                take_pre_unfold)
 
-	# Driver-entry mirror of the parse-time low_mem_bands compatibility
-	# resolver for hand-built configs.  The deck-key refusal table is now
-	# empty: standard charge/bispinor fresh and restart paths are certified;
-	# retaining the one centralized call keeps future capability rows from
-	# growing ad-hoc guards in either branch.
-	refuse_unsupported_low_mem_bands(cfg)
 	refuse_unsupported_bispinor_gw(cfg)
 	# Same shape, same two-call-site reason: parser-altitude coverage is
 	# duplicated here for a hand-built cfg.  No-op at the default (false).

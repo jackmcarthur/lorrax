@@ -768,6 +768,45 @@ VNL_VELOCITY_SIGN_SHIPPED = -1.0
 VNL_VELOCITY_SIGN_FLIPPED = +1.0
 
 
+_VNL_VELOCITY_SIGN_WORDS = {
+    "shipped": VNL_VELOCITY_SIGN_SHIPPED,
+    "minus": VNL_VELOCITY_SIGN_SHIPPED,
+    "flipped": VNL_VELOCITY_SIGN_FLIPPED,
+    "plus": VNL_VELOCITY_SIGN_FLIPPED,
+}
+
+
+def require_vnl_velocity_sign(value) -> float:
+    """Return one of the two characterized nonlocal-velocity signs.
+
+    ``value`` is the resolved ``vnl_velocity_sign`` deck/CLI value or the
+    direct :func:`dipole_operator` argument.  This is the single owner of
+    both the word aliases and the two-arm validation, so the producer and
+    operator cannot drift on which values are meaningful.
+    """
+    raw = value
+    if isinstance(raw, str):
+        raw = raw.strip().lower()
+        raw = _VNL_VELOCITY_SIGN_WORDS.get(raw, raw)
+    try:
+        sign = float(raw)
+    except (TypeError, ValueError):
+        sign = None
+    if sign not in (VNL_VELOCITY_SIGN_SHIPPED,
+                    VNL_VELOCITY_SIGN_FLIPPED):
+        raise ValueError(
+            "GATE vnl_velocity_sign: the nonlocal velocity has only two "
+            "characterized sign arms.\n"
+            f"  got:  vnl_velocity_sign = {value!r}\n"
+            "  want: vnl_velocity_sign in {-1, +1, shipped, minus, "
+            "flipped, plus}\n"
+            "  why:  this is a sign, not a scale; any other multiplier "
+            "would produce a velocity operator that is neither measured "
+            "arm and that no BerkeleyGW comparison characterizes\n"
+            "  doc:  docs/input_reference.md, vnl_velocity_sign.")
+    return sign
+
+
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                     vnl_setup=None,
                     vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED) -> Operator:
@@ -848,15 +887,7 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     from psp.dft_operators import apply_kinetic_velocity_to_ket
     from psp import vnl_ops
 
-    sign = float(vnl_velocity_sign)
-    if sign not in (VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED):
-        raise ValueError(
-            f"GATE vnl_velocity_sign: got {vnl_velocity_sign!r}; the only "
-            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (shipped) and "
-            f"{VNL_VELOCITY_SIGN_FLIPPED} (flipped).  This is a SIGN, not "
-            f"a scale: an arbitrary multiplier would let a run report a "
-            f"velocity operator that is neither arm of the open question "
-            f"and that no comparison with BerkeleyGW characterises.")
+    sign = require_vnl_velocity_sign(vnl_velocity_sign)
 
     B = jnp.asarray(np.asarray(bvec, dtype=np.float64) * float(blat),
                     dtype=jnp.float64)

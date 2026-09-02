@@ -1557,11 +1557,13 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
     """Nodes/operands of the ordered imaginary-axis route (see below)."""
     if getattr(quad, "alpha_odd", None) is None:
         raise ValueError(
-            "GATE chi0_imag_ordered_needs_odd_kernel: the ordered "
-            "imaginary-axis chi0 route needs a quadrature built with "
-            "with_odd_kernel=True (minimax_screening.build_imag_quadrature); "
-            "this one carries no odd weights, so the time-reversal-odd "
-            "channel it exists to keep would be zero by construction.")
+            "GATE chi0_imag_ordered_needs_odd_kernel: the ordered response "
+            "received no odd quadrature weights.\n"
+            "  got:  quad.alpha_odd = None\n"
+            "  want: build_imag_quadrature(..., with_odd_kernel = true)\n"
+            "  why:  without odd weights the time-reversal-odd response "
+            "channel is zero by construction\n"
+            "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
     s = wfns.slices
     enk_v = wfns.enk[:, s.val]
     enk_c = wfns.enk[:, s.cond]
@@ -1860,6 +1862,67 @@ class StaticPhotonResponse:
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
 
 
+def _load_static_photon_hall(
+    config, meta, mesh_xy, wfn, wfn_fingerprint_binding, *,
+    screen_current: bool, print_fn=print,
+):
+    """Load/authenticate the optional Hall artifact and gate its model.
+
+    An unnamed ``static_gauge_hall_file`` is the declared ``sigma_H = 0``
+    default.  A named path always reaches the one artifact loader, including
+    the absent-path refusal.  The bare-transverse model admits an authenticated
+    artifact only when its value is exactly zero: then the Hall response is
+    identically absent and the packed operator is the same charge/TT block
+    diagonal model as the unnamed case.  Any nonzero component still refuses.
+    """
+    hall_path = str(config.paths.static_gauge_hall_file).strip()
+    if not hall_path:
+        if jax.process_index() == 0:
+            print_fn(
+                "  [photon head] Hall term: sigma_H = 0 (no "
+                "static_gauge_hall_file named).  For a Chern-trivial "
+                "insulator the static Hall coefficient is exactly zero; "
+                "supply the artifact from get_dipole_mtxels "
+                "--static-gauge-hall-only to include a measured value.",
+                flush=True)
+        return None
+
+    from file_io.static_gauge_head import load_static_gauge_hall_artifact
+    hall = load_static_gauge_hall_artifact(
+        hall_path,
+        mesh_xy=mesh_xy,
+        wfn=wfn,
+        expected_band_start=int(meta.b_id_0),
+        expected_band_stop=int(meta.b_id_4_chi_user),
+        expected_nk_tot=int(meta.nk_tot),
+        wfn_fingerprint_binding=wfn_fingerprint_binding,
+    )
+    sigma_h = np.asarray(jax.device_get(hall.sigma_H), dtype=np.float64)
+    if not bool(screen_current) and np.any(sigma_h != 0.0):
+        raise ValueError(
+            "GATE packed_bare_transverse_hall_unavailable: a nonzero Hall "
+            "artifact has no channel in the bare-transverse model.\n"
+            f"  got:  static_gauge_hall_file = {hall_path}, "
+            f"sigma_H = {sigma_h.tolist()} bohr^-1\n"
+            "  want: an authenticated artifact with sigma_H = [0, 0, 0], "
+            "an unnamed static_gauge_hall_file, or "
+            "bispinor_gw = full_static_cohsex\n"
+            "  why:  bare_transverse declares chi_TT = chi_CT = 0, hence "
+            "W_CT = 0 at every finite q; a nonzero Gamma-only CT/TC block "
+            "would not be a limit of that model\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
+    if jax.process_index() == 0:
+        suffix = (
+            " (exact zero is compatible with bare_transverse)"
+            if not bool(screen_current) else "")
+        print_fn(
+            "  [photon head] Hall term: sigma_H = "
+            f"{sigma_h.tolist()} bohr^-1 from authenticated {hall_path}"
+            f"{suffix}",
+            flush=True)
+    return hall
+
+
 def compute_static_photon_response(
     wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
     meta, mesh_xy, *,
@@ -1912,8 +1975,10 @@ def compute_static_photon_response(
     ``bispinor_tt_head_correction`` overlay writes into the TT V tiles on
     the incumbent route (that key is refused here, GATE
     ``packed_bare_transverse_tt_head_double_count``).  The Hall term needs a
-    screened CT/TC channel to live in and is therefore refused on the bare
-    route.  The completion runs under ``head_correction = full`` (the
+    screened CT/TC channel to live in, so a nonzero Hall artifact is refused
+    on the bare route; an authenticated exact-zero artifact is admitted and
+    gives the same operator as the unnamed zero-Hall default.  The completion
+    runs under ``head_correction = full`` (the
     default); ``off`` skips it behind a DEBUG banner and is not a production
     setting (owner ruling 2026-09-01).  The current q^2/contact/complement
     terms are omitted by model in either case.
@@ -2009,83 +2074,9 @@ def compute_static_photon_response(
                 raise ValueError(
                     f"packed static photon {role} wavefunction binding does "
                     "not name the supplied carrier")
-        # ``static_gauge_hall_file`` defaults to EMPTY: unnamed means "no
-        # Hall term", and a NAMED path that does not exist is a typo or a
-        # missing preprocessing step, not a request for sigma_H = 0.  The
-        # two used to be the same answer (lane B's open item, lane J
-        # section 2 item 9).
-        hall_path = str(config.paths.static_gauge_hall_file).strip()
-        hall_named = bool(hall_path)
-        if hall_named and not os.path.exists(hall_path):
-            raise ValueError(
-                "GATE static_gauge_hall_file_missing: the deck names a "
-                f"Hall artifact that does not exist ({hall_path}).\n"
-                f"  got:  static_gauge_hall_file = {hall_path} (absent)\n"
-                "  want: the file, produced by get_dipole_mtxels "
-                "--static-gauge-hall-only --static-gauge-hall-out, or an "
-                "UNSET static_gauge_hall_file (the default) for sigma_H = 0\n"
-                "  why:  IMPLEMENTATION.  The key is optional, so an "
-                "unnamed one means 'no Hall term' and is announced.  A "
-                "named-but-absent one used to give the same silent "
-                "sigma_H = 0, which makes a mistyped path indistinguishable "
-                "from a deliberate Chern-trivial run.\n"
-                "  doc:  docs/input_reference.md, static_gauge_hall_file.")
-        if not screen_current:
-            # R(q) = q_a H_a(sigma_H) + q_a q_b S_ab with a nonzero Hall
-            # term makes the coupled 4x4 solve return CT/TC blocks, i.e. a
-            # screened charge-current coupling in the Gamma cell that this
-            # route has at no other q.  Refuse rather than ignore a named
-            # deck artifact (a parsed-but-ignored key is a defect).
-            if hall_named:
-                raise ValueError(
-                    "GATE packed_bare_transverse_hall_unavailable: "
-                    f"bispinor_gw = {photon_mode.value} is refused with a "
-                    f"present static_gauge_hall_file ({hall_path}).\n"
-                    f"  got:  static_gauge_hall_file = {hall_path} (exists)\n"
-                    "  want: no Hall artifact on this path (remove or "
-                    "rename it), or bispinor_gw = full_static_cohsex\n"
-                    "  why:  the bare-transverse route leaves the current "
-                    "channels unscreened (chi_TT = chi_CT = 0), so "
-                    "W_CT = 0 at every finite q.  A nonzero sigma_H would "
-                    "put a screened CT/TC block into the Gamma cell alone, "
-                    "which is not a limit of this model.\n"
-                    "  doc:  docs/input_reference.md, "
-                    "static_gauge_hall_file.")
-            if jax.process_index() == 0:
-                print_fn(
-                    "  [photon head] Hall term: not read on the "
-                    "bare-transverse route (no screened CT/TC channel to "
-                    "carry it); sigma_H = 0",
-                    flush=True)
-        elif hall_named:
-            # A present artifact must authenticate (WFN identity, band
-            # manifold, nk); a stale one refuses inside the loader rather
-            # than silently degrading to sigma_H = 0.
-            from file_io.static_gauge_head import (
-                load_static_gauge_hall_artifact)
-            hall = load_static_gauge_hall_artifact(
-                hall_path,
-                mesh_xy=mesh_xy,
-                wfn=wfn,
-                expected_band_start=int(meta.b_id_0),
-                expected_band_stop=int(meta.b_id_4_chi_user),
-                expected_nk_tot=int(meta.nk_tot),
-                wfn_fingerprint_binding=wfn_fingerprint_binding,
-            )
-            if jax.process_index() == 0:
-                print_fn(
-                    "  [photon head] Hall term: sigma_H = "
-                    f"{np.asarray(jax.device_get(hall.sigma_H)).tolist()} "
-                    f"bohr^-1 from authenticated {hall_path}",
-                    flush=True)
-        elif jax.process_index() == 0:
-            print_fn(
-                "  [photon head] Hall term: sigma_H = 0 (no "
-                "static_gauge_hall_file named).  For a Chern-trivial "
-                "insulator the static Hall coefficient is exactly zero; "
-                "supply the artifact from get_dipole_mtxels "
-                "--static-gauge-hall-only to include a measured value.",
-                flush=True)
+        hall = _load_static_photon_hall(
+            config, meta, mesh_xy, wfn, wfn_fingerprint_binding,
+            screen_current=screen_current, print_fn=print_fn)
     elif jax.process_index() == 0:
         print_fn(
             "\n  ==========================================================\n"
@@ -3216,11 +3207,13 @@ def compute_chi0_direct_fractional(
     family = getattr(occupation_state, "smearing_family", None)
     if family != "mp1":
         raise ValueError(
-            "GATE static_fractional_needs_mp1: direct fractional chi "
-            "requires OccupationState.smearing_family == 'mp1' "
-            f"(analytic -df/dE diagonal); got {family!r}. A step-function "
-            "static body is the insulating compute_chi0 kernel's job. "
-            "FALSE case: smearing_family == 'mp1'.")
+            "GATE static_fractional_needs_mp1: direct fractional chi0 "
+            "received an unsupported smearing family.\n"
+            f"  got:  occupation_state.smearing_family = {family!r}\n"
+            "  want: occupation_state.smearing_family = 'mp1'\n"
+            "  why:  this path's intraband diagonal is the analytic MP1 "
+            "-df/dE; a step occupation belongs to the insulating chi0 path\n"
+            "  doc:  docs/theory/metallic-mpa-screening.md")
     e = jnp.asarray(wfns.enk, dtype=jnp.float64)
     f = jnp.asarray(occupation_state.f_kn, dtype=jnp.float64)
     if f.shape != e.shape:

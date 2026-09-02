@@ -1,12 +1,11 @@
-"""``low_mem_bands = true`` — the named-refusal envelope.
+"""``low_mem_bands = true`` — supported routes and the live Gij refusal.
 
 WHAT IS BEING PINNED.  Guide: ``reports/gwjax_low_mem_bands_audit_2026-08-22/
 report.md`` §6, "Unsupported combinations must refuse before allocation".
-Five of the six unsupported combinations are deck keys and refuse AT PARSE
-TIME through ``gw_config.refuse_unsupported_low_mem_bands``, called from
-``LorraxConfig.from_input_file`` (and again, for a hand-built config, from
-``gw.gw_init.prepare_isdf_and_wavefunctions`` at entry).  The sixth — an
-explicit dense ``Gij`` operand — has no deck key (it is a keyword-only
+All former deck-key refusal rows were lifted by 2026-08-23.  Their empty
+table and no-op parser/driver calls were removed by the 2026-09-02 gate
+survey.  The remaining explicit dense ``Gij`` operand has no deck key (it is
+a keyword-only
 Python parameter every shipped driver call site leaves at its ``None``
 default), so it is guarded separately by
 ``gw_config.refuse_explicit_gij_under_low_mem_bands``, called from
@@ -103,7 +102,6 @@ from gw.gw_config import (
     LorraxConfig,
     QPSolver,
     refuse_explicit_gij_under_low_mem_bands,
-    refuse_unsupported_low_mem_bands,
 )
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -136,46 +134,6 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
     path.write_text(_BASE + extra)
     return LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: None)
-
-
-# ---------------------------------------------------------------------------
-# 1. The refusal matrix — every row refuses at PARSE time, by rule id
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("rule_id, extra", [
-    # low_mem_bands_metal_material_class_unported LIFTED 2026-08-23
-    # (fix/mpa-head-status-line-2026-08-23): the envelope is EMPTY.  The
-    # matrix keeps one synthetic always-absent row so the machinery that
-    # checks refusal MESSAGE GRAMMAR still runs if a future row lands;
-    # pytest.param(..., marks=skip) documents the empty state loudly.
-    pytest.param("no_rows_left", "", marks=pytest.mark.skip(
-        reason="envelope empty since 2026-08-23; re-enable with the "
-               "first future refusal row")),
-    # low_mem_bands_dynamic_ppm_unported DELETED 2026-08-23 (feat/
-    # mpa-executor-face-gate-2026-08-23): insulating compute_mode = mpa
-    # is now supported (positive-twin matrix below); metal MPA is caught
-    # by the row above ALONE, since mpa_material_class == 'metal'
-    # implies compute_mode == mpa (_validate_metal_compute_mode) and so
-    # is a strict subset of that row's own predicate -- a second,
-    # metal-only-narrowed dynamic_ppm row would never be reached (see
-    # gw_config.py's own comment at the deletion site).
-    # gn_ppm/hl_ppm/qp_solver=fixed_point(+gn_ppm) LIFTED 2026-08-22;
-    # qp_solver=self_consistent LIFTED 2026-08-23; bispinor LIFTED (row
-    # DELETED) 2026-08-23 -- see the positive-twin matrix below.
-])
-def test_each_unsupported_combination_refuses_at_parse_time(
-        tmp_path, rule_id, extra):
-    """AT PARSE TIME, before the ISDF fit or any device allocation.
-
-    The message carries got / want / fix / why / doc so an operator does
-    not have to come to this file to know what to change.
-    """
-    with pytest.raises(ValueError) as exc:
-        _config(tmp_path, "low_mem_bands = true\n" + extra)
-    message = str(exc.value)
-    assert rule_id in message
-    for part in ("got:", "want:", "fix:", "why:", "doc:"):
-        assert part in message, f"{rule_id} refusal is missing '{part}'"
 
 
 def test_head_correction_full_is_lifted_on_the_bare_default():
@@ -287,27 +245,6 @@ def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
     """
     config = _config(tmp_path, "low_mem_bands = true\n" + extra)
     assert config.memory.low_mem_bands is True
-    refuse_unsupported_low_mem_bands(config)   # must not raise (again)
-
-
-def test_low_mem_bands_false_decks_are_untouched_by_every_rule(tmp_path):
-    """FROZEN-PIN CELL.  Not one row fires under the default.
-
-    The refusal function returns before touching a single predicate on a
-    ``low_mem_bands = false`` deck, so a default deck cannot acquire a NEW
-    parse-time resolution -- and therefore a new possible error -- from
-    this feature existing.  Every combination that DOES refuse above is
-    tried here with the key left at its default (or explicitly false).
-    """
-    for extra in (
-            "",
-            "qp_solver = self_consistent\n",
-            _METAL_KEYS,   # already names compute_mode = mpa
-            "bispinor = true\n",
-    ):
-        config = _config(tmp_path, extra, name="lmb_false.in")
-        assert config.memory.low_mem_bands is False
-        refuse_unsupported_low_mem_bands(config)   # must not raise
 
 
 def test_the_key_is_registered_so_it_is_not_an_unknown_key(tmp_path):
@@ -319,36 +256,7 @@ def test_the_key_is_registered_so_it_is_not_an_unknown_key(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 3. The table ratchet — every row has all five parts and a unique id
-# ---------------------------------------------------------------------------
-
-def test_every_rule_has_all_five_parts_and_a_unique_id():
-    """A rule added without a ``fix`` or a ``why`` stops a run without
-    telling anyone what to do about it — the shape this table exists to
-    make impossible."""
-    from gw.gw_config import _LOW_MEM_BANDS_REFUSALS
-
-    ids = [row[0] for row in _LOW_MEM_BANDS_REFUSALS]
-    assert len(ids) == len(set(ids)), f"duplicate rule id in {ids}"
-    assert len(ids) == 0, (
-        "the table grew or shrank -- update this test AND the docs "
-        "envelope table in docs/input_reference.md together. "
-        "(2026-08-23: low_mem_bands_dynamic_ppm_unported DELETED -- "
-        "insulating MPA lifted, and metal MPA's predicate is a strict "
-        "subset of low_mem_bands_metal_material_class_unported's own, "
-        "which fires first, so a metal-narrowed dynamic_ppm row would "
-        "be unreachable; see gw_config.py's own comment.)")
-    for row in _LOW_MEM_BANDS_REFUSALS:
-        rule_id, predicate, got, want, fix, doc = row
-        assert callable(predicate) and callable(got)
-        for text, part in ((rule_id, "id"), (want, "want"), (fix, "fix"),
-                           (doc, "why")):
-            assert isinstance(text, str) and len(text) > 8, (
-                f"{rule_id}: {part} is missing or too short to be advice")
-
-
-# ---------------------------------------------------------------------------
-# 4. The fifth row — explicit dense Gij (no deck key)
+# 3. The remaining row — explicit dense Gij (no deck key)
 # ---------------------------------------------------------------------------
 
 def test_an_explicit_gij_under_low_mem_bands_refuses(tmp_path):
@@ -375,34 +283,6 @@ def test_gij_none_under_low_mem_bands_is_the_positive_twin(tmp_path):
         off, "an explicit Gij is FINE under low_mem_bands=false")
 
 
-# ---------------------------------------------------------------------------
-# 5. Driver-entry mirror — gw_init calls the same function on a hand-built
-#    config, not a second ad hoc guard
-# ---------------------------------------------------------------------------
-
-def test_gw_init_calls_the_canonical_envelope_function_once():
-    """``prepare_isdf_and_wavefunctions`` no longer carries its own
-    bispinor-only guards (one per fresh/restart branch) -- it calls the
-    ONE table-driven function, which covers all four deck-key rows, before
-    either branch runs.  Guards against the exact duplication the sibling
-    carrier branch flagged as a remaining risk in its own report."""
-    import inspect
-    from gw import gw_init
-
-    src = inspect.getsource(gw_init.prepare_isdf_and_wavefunctions)
-    assert src.count("refuse_unsupported_low_mem_bands(cfg)") == 1
-    assert "does not support bispinor" not in src, (
-        "an ad hoc bispinor-only guard survived beside the canonical "
-        "table-driven refusal -- these should not both exist")
-    # The call must precede BOTH branches it used to guard separately.
-    order = [src.index(name) for name in (
-        "refuse_unsupported_low_mem_bands(cfg)",
-        "if not cfg.restart:")]
-    assert order == sorted(order), (
-        "the envelope refusal must run before the fresh/restart branch, "
-        "not after either one has started allocating")
-
-
 def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
     """The Gij row runs at the top of the dispatch, beside the mode-
     unimplemented check it is modeled on -- before either the COHSEX/PPM
@@ -424,15 +304,10 @@ def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
 # 6. Docs
 # ---------------------------------------------------------------------------
 
-def test_the_docs_envelope_table_names_every_rule_id():
-    """docs/input_reference.md is hand-maintained; the table must name
-    every rule id in the code, or the two will drift apart silently."""
+def test_the_docs_name_the_live_gij_refusal():
+    """The input reference must name the one live low-memory refusal."""
     page = (_REPO / "docs" / "input_reference.md").read_text()
     assert "low_mem_bands = true` envelope" in page
-    from gw.gw_config import _LOW_MEM_BANDS_REFUSALS
-
-    for rule_id, *_ in _LOW_MEM_BANDS_REFUSALS:
-        assert rule_id in page, f"{rule_id} is not named in the docs table"
     assert "low_mem_bands_explicit_gij_unported" in page
 
 

@@ -388,9 +388,12 @@ def test_operator_refuses_anything_that_is_not_a_sign(bad):
     *_, bvec, blat = _fixture()
     with mesh:
         geom = _geom(mesh)
-        with pytest.raises((ValueError, TypeError)):
+        with pytest.raises(ValueError) as exc:
             dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=None,
                             vnl_velocity_sign=bad)
+    message = str(exc.value)
+    for part in ("got:", "want:", "why:"):
+        assert part in message
 
 
 @pytest.mark.parametrize("cli, deck, want", [
@@ -414,8 +417,22 @@ def test_producer_resolution_order(cli, deck, want):
 def test_producer_refuses_a_deck_key_that_is_not_a_sign(deck):
     from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
 
-    with pytest.raises(ValueError, match="vnl_velocity_sign"):
+    with pytest.raises(ValueError, match="vnl_velocity_sign") as exc:
         resolve_vnl_velocity_sign(None, deck)
+    for part in ("got:", "want:", "why:"):
+        assert part in str(exc.value)
+
+
+def test_producer_and_operator_share_one_sign_validation_owner():
+    """The parser resolves precedence; common.mtxel_sweep owns validity."""
+    import inspect
+    from common import mtxel_sweep
+    from psp import get_dipole_mtxels
+
+    assert "GATE vnl_velocity_sign" in inspect.getsource(
+        mtxel_sweep.require_vnl_velocity_sign)
+    assert "GATE vnl_velocity_sign" not in inspect.getsource(
+        get_dipole_mtxels.resolve_vnl_velocity_sign)
 
 
 def _deck(tmp_path, body):

@@ -519,10 +519,11 @@ only admitted `q`-linear CT/TC structure is generated from it. It is also
 with its reason, which by §4.4 is the exact answer for the systems this mode
 admits; a present but mismatched artifact still refuses in the loader, so a
 stale file cannot degrade the run silently. On the **unscreened** packed
-route of §2 a present artifact is refused outright
-(`GATE packed_bare_transverse_hall_unavailable`): with the current channels
-unscreened, `W_CT = 0` at every finite `q`, so a Γ-only CT/TC block would not
-be the `q → 0` limit of anything the model computes. The sign is the live band
+route of §2 an authenticated exact-zero artifact is equivalent to the
+unnamed default and is accepted. `GATE packed_bare_transverse_hall_unavailable`
+refuses any nonzero component: with the current channels unscreened,
+`W_CT = 0` at every finite `q`, so a Γ-only CT/TC block would not be the
+`q → 0` limit of anything the model computes. The sign is the live band
 orientation's: the persisted `σ_H` is the occupied-bra Berry sum while the
 live Adler–Wiser response is energy-ordered (`P = −ΔD`), which is the minus
 above (`lane/bisp-b-one-packed-mode-2026-09-01@cacc4e07`, from lane A's

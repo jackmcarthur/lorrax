@@ -66,22 +66,41 @@ def _read_required_small(io: SlabIO, name: str, *, dtype=None):
         return io.read_small(name, dtype=dtype)
     except (KeyError, RuntimeError, ValueError) as exc:
         raise ValueError(
-            "GATE static_gauge_hall_schema: artifact is missing or cannot "
-            f"read required field {name!r}") from exc
+            "GATE static_gauge_hall_schema: a required artifact field is "
+            "unreadable.\n"
+            f"  got:  StaticGaugeHall field {name!r}: "
+            f"{type(exc).__name__}: {exc}\n"
+            f"  want: a readable {name!r} field in a complete schema-v"
+            f"{STATIC_GAUGE_HALL_SCHEMA_VERSION} artifact\n"
+            "  why:  the Hall value is accepted only with its WFN, band, "
+            "operator, and k-count provenance; a missing field makes that "
+            "authentication impossible\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.") from exc
 
 
 def _decode_i32_text(value, *, field_name: str, encoding: str) -> str:
     raw = np.asarray(value, dtype=np.int32).reshape(-1)
     if np.any(raw < 0) or np.any(raw > 255):
         raise ValueError(
-            "GATE static_gauge_hall_schema: "
-            f"{field_name!r} contains a non-byte value")
+            "GATE static_gauge_hall_schema: an encoded text field contains "
+            "a non-byte value.\n"
+            f"  got:  {field_name} value range "
+            f"[{int(raw.min())}, {int(raw.max())}]\n"
+            f"  want: every {field_name} value in [0, 255]\n"
+            "  why:  values outside one byte cannot encode the provenance "
+            "text needed to authenticate this artifact\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
     try:
         return raw.astype(np.uint8).tobytes().decode(encoding)
     except UnicodeDecodeError as exc:
         raise ValueError(
-            "GATE static_gauge_hall_schema: "
-            f"{field_name!r} is not valid {encoding}") from exc
+            "GATE static_gauge_hall_schema: an encoded provenance field "
+            "cannot be decoded.\n"
+            f"  got:  {field_name} is not valid {encoding}: {exc}\n"
+            f"  want: {field_name} encoded as valid {encoding}\n"
+            "  why:  undecodable provenance cannot authenticate the Hall "
+            "artifact against the consuming calculation\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.") from exc
 
 
 def _immutable_partial_paths(
@@ -197,11 +216,24 @@ def load_static_gauge_hall_artifact(
     artifact_path = Path(path)
     if artifact_path.name.endswith(".partial"):
         raise ValueError(
-            "GATE static_gauge_hall_partial: refusing a partial artifact path")
+            "GATE static_gauge_hall_partial: static_gauge_hall_file names "
+            "an unpublished partial artifact.\n"
+            f"  got:  static_gauge_hall_file = {artifact_path}\n"
+            "  want: a completed artifact path without the .partial suffix\n"
+            "  why:  .partial is the writer's in-flight inode and has not "
+            "passed the collective completion/publication barrier\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
     if not artifact_path.exists():
         raise FileNotFoundError(
-            "GATE static_gauge_hall_artifact_absent: no completed artifact "
-            f"exists at {artifact_path}")
+            "GATE static_gauge_hall_file_missing: static_gauge_hall_file "
+            "names no completed artifact.\n"
+            f"  got:  static_gauge_hall_file = {artifact_path} (absent)\n"
+            "  want: the completed artifact produced by "
+            "get_dipole_mtxels --static-gauge-hall-only, or an unnamed key "
+            "for sigma_H = 0\n"
+            "  why:  treating a mistyped or missing named file as the "
+            "unnamed zero-Hall default would silently change the model\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
 
     expected_wfn = _require_wfn_sha256(
         wfn_fingerprint(wfn)

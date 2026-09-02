@@ -330,8 +330,8 @@ def fit_zeta_to_h5(
         # 2026-08-23 -- isdf.core._c_q_face/_z_q_face both accept
         # gamma_L=gamma_R=gamma_mu, mirroring the legacy branches' own
         # convention exactly (see the STEP 2/STEP 6 call sites below).
-        # gw_config.refuse_unsupported_low_mem_bands's bispinor row is
-        # narrowed accordingly (see that module's own comment).
+        # The former low_mem_bands bispinor refusal was deleted when this
+        # face path gained the transverse endpoint vertices.
         if band_norms is not None:
             raise NotImplementedError(
                 "fit_zeta_to_h5: low_mem_bands=True with pseudobands "

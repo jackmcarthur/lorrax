@@ -1,9 +1,9 @@
 # Exact finite-occupation χ₀ on the two-face ψ carrier (`low_mem_bands=true`)
 
 Ports census row "Exact finite-occupation response"
-(`reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`,
-`gw_config._LOW_MEM_BANDS_REFUSALS`'s `low_mem_bands_metal_material_class_
-unported`) plus the fractional/contour χ₀ kernel the same report's revision
+(`reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`, former gate
+`low_mem_bands_metal_material_class_unported`) plus the fractional/contour χ₀
+kernel the same report's revision
 noted as a second, separate non-consumer of `_build_Gv_Gc`
 (`gw.w_isdf._get_chi_fractional_contour_kernel`). Landed
 `feat/metal-response-face-2026-08-23`, on top of
@@ -251,7 +251,7 @@ session but never end-to-end gated). So **lifting
 immediately refuse at the OTHER row instead, with a different rule id. This
 is not a gap in this session's port; it is a genuinely separate, unrelated
 census item this session was not scoped to touch. `docs/input_reference.md`
-and `gw_config._LOW_MEM_BANDS_REFUSALS`'s row 2 comment say this explicitly
+and the historical lift record in `gw_config.py` say this explicitly
 so the next reader does not have to re-derive it — the row STAYS REFUSING,
 narrowed to name the real remaining blocker, per this session's own
 verification section below.
