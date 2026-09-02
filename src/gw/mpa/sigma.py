@@ -14,6 +14,7 @@ from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import (SigmaOmegaResult,
+                          _residue_for_space,
                           assert_sharded_sigma_window_divides_mesh,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
@@ -33,6 +34,15 @@ from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 # comparisons keep the same control while retiring the measured-sector deck
 # dial from the production path.
 _PANE_CONTROL_TARGET_ERROR = 6.5e-4
+
+
+def _geometry_residue(B, B_odd):
+    """Return a liveness witness covering both ordered pole residues."""
+    if B_odd is None:
+        return B
+    plus = B + B_odd
+    minus = B - B_odd
+    return jnp.where(jnp.abs(plus) > 0.0, plus, minus)
 
 
 def _bounded_pole_batch_size(value):
@@ -197,7 +207,8 @@ def _integrate_sigma_batches(
         sigma_shape = spatial_shape
         sigma_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     accumulator = DeviceOmegaAccumulator(
-        omega, shape=shape, sharding=output_sharding, omega_axis=0)
+        omega, shape=shape, sharding=output_sharding,
+        omega_axis=1 if bracketed else 0)
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
@@ -211,7 +222,7 @@ def _integrate_sigma_batches(
     logical_tau_pairs = 0
     batch_size = int(pole_batch_size)
     sweep_started = False
-    for lo, Omega, B in batches:
+    for lo, Omega, B, B_odd in batches:
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
         for row in plan:
@@ -223,6 +234,7 @@ def _integrate_sigma_batches(
                 device_put_process_local(x, small)
                 for x in (pole_indices, bounds, phase_real))
             win = row.window
+            B_branch = _residue_for_space(row.space, B, B_odd)
             weight = getattr(row, "band_weight", None)
             if weight is None:
                 selector = jnp.asarray(win.mask_A)
@@ -237,7 +249,7 @@ def _integrate_sigma_batches(
                 prewarm_args = (
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
+                    row.E_A, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
@@ -268,7 +280,7 @@ def _integrate_sigma_batches(
                 sigma_tau = tau_kernel(
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
+                    row.E_A, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
@@ -278,7 +290,7 @@ def _integrate_sigma_batches(
             accumulator.end_window()
             n_sweeps += 1
             logical_tau_pairs += win.n_tau
-        del B, Omega
+        del B, B_odd, Omega
         gc.collect()
 
     sigma = strip_sigma_window(
@@ -343,11 +355,11 @@ def integrate_sigma_store(
     def batches(reader):
         for lo in range(0, int(n_poles), batch_size):
             hi = min(lo + batch_size, int(n_poles))
-            Omega, B = reader.read(
+            Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=True, return_sharded=True,
-                to_unit="Ry")
-            yield lo, Omega, B
-            del Omega, B
+                to_unit="Ry", include_odd=True)
+            yield lo, Omega, B, B_odd
+            del Omega, B, B_odd
             gc.collect()
 
     def run(reader):
@@ -490,15 +502,15 @@ def compute_sigma_c_mpa_omega_grid(
         summaries = []
         for lo in range(0, n_poles, int(pole_batch_size)):
             hi = min(lo + int(pole_batch_size), n_poles)
-            Omega, B = reader.read(
+            Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=True, return_sharded=True,
-                to_unit="Ry")
+                to_unit="Ry", include_odd=True)
             summaries.extend(summarize_sigma_poles(
-                Omega, B, branches,
+                Omega, _geometry_residue(B, B_odd), branches,
                 regularization_width_ry=regularization_width_ry,
                 edge_factor=edge_factor, pole_offset=lo,
                 occupation_window_threshold=occupation_window_threshold))
-            del Omega, B
+            del Omega, B, B_odd
             gc.collect()
         if plan_mode == "panes":
             plan, geometry = build_shared_sigma_windows(

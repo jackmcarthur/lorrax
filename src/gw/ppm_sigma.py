@@ -1147,4 +1147,4 @@ def compute_sigma_c_ppm_omega_grid(
         sigma_c_odd_kij=result.sigma_c_odd_kij,
         band_counts=result.band_counts,
         static_coh_at_counts=static_coh_at_counts,
-        odd_even_residue_ratio=result.odd_even_residue_ratio)
+        odd_even_residue_ratio=ppm.odd_even_residue_ratio)

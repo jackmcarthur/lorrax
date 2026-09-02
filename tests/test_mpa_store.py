@@ -320,6 +320,42 @@ def test_complete_pole_writer_preserves_2d_sharding_and_finalizes(
     assert all(row[2] == P(None, None, "x", "y") for row in writes)
 
 
+def test_complete_pole_writer_round_trips_ordered_residues(
+        tmpdir_path, monkeypatch):
+    """The algebraic GN store carries D beside B with an integrity stamp."""
+    import common.collectives as collectives
+    import file_io.slab_io as slab_io
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    monkeypatch.setattr(slab_io, "SlabIO", HostSlabIO)
+    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+
+    mesh = _mesh()
+    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    Omega = np.asarray([[[[0.8, 0.9], [1.0, 1.1]]]], np.complex128)
+    B = np.asarray([[[[0.4, 0.3j], [-0.2j, 0.5]]]], np.complex128)
+    D = np.asarray([[[[0.1j, 0.02], [0.02, -0.1j]]]], np.complex128)
+    ledger = MS.write_complete_pole_store_collective(
+        tmpdir_path, jax.device_put(Omega, sharding),
+        jax.device_put(B, sharding), B_odd_p=jax.device_put(D, sharding),
+        mesh_xy=mesh, n_mu_logical=2, energy_unit="Ry",
+        provenance={"fit_protocol": "ordered_two_point_ppm"},
+        certification={"condition_max_allowed": 1.0,
+                       "backward_error_max_allowed": 1.0})
+
+    assert ledger["ordered_residues"] is True
+    got_Omega, got_B, got_D = MS.read_poles(tmpdir_path, include_odd=True)
+    np.testing.assert_array_equal(got_Omega, Omega)
+    np.testing.assert_array_equal(got_B, B)
+    np.testing.assert_array_equal(got_D, D)
+    with h5py.File(tmpdir_path, "a") as grp:
+        del grp["B_odd_p"]
+    with pytest.raises(ValueError, match="partial ordered-residue schema"):
+        MS.fit_completion_ledger(tmpdir_path)
+
+
 def test_complete_pole_writer_refuses_noncausal_live_poles(
         tmpdir_path, monkeypatch):
     """A dormant zero pole is legal; the same pole with residue is not."""
