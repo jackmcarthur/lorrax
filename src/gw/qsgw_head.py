@@ -1194,7 +1194,7 @@ def _interband_degenerate_weight(
     SCOPE.  This formula (``prefactor * f_diff / (dE * (z**2 - dE**2))``)
     is ``_s_tensor_kernel``'s ONLY; the wing kernels
     (``_head_wing_kernel_legacy``/``_face``) build a structurally
-    DIFFERENT ``F_ij = pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
+    DIFFERENT ``F_ij = -pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
     power of ``dE`` (documented explicitly in ``head_wings_sharded``'s own
     docstring), because a wing pairs one velocity leg with one
     dimension-1-in-energy density vertex where the head pairs two
@@ -1214,6 +1214,26 @@ def _interband_degenerate_weight(
     z_ok = jnp.abs(z) > 1.0e-15
     degenerate = prefactor * s_avg / (z * z)
     return jnp.where(near_degenerate & z_ok, degenerate, clipped)
+
+
+def _head_wing_interband_weight(
+    dE, f_diff, z, prefactor, transition,
+):
+    r"""Adler--Wiser mixed head/body weight in the ``P=-dE*D`` basis.
+
+    Replacing one density-jet leg ``D`` of the direct response by the
+    energy-scaled head vertex ``P=-dE*D`` contributes the explicit minus
+    below.  Both wing layouts call this owner.  The finite-frequency
+    intraband surface term is not a ``D -> P`` substitution and remains the
+    separate positive ``pref_surface*surface_weight/z`` contribution in the
+    two kernels.
+    """
+    denom = z * z - dE * dE
+    return jnp.where(
+        transition & (jnp.abs(denom) > 1.0e-16),
+        -prefactor * f_diff / denom,
+        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+    )
 
 
 def _s_tensor_kernel(
@@ -1516,14 +1536,12 @@ def _head_wing_kernel_legacy(
         ):
             def _block(block_acc, node):
                 block_index, z_block, inv_z_block = node
-                denom = (
-                    z_block[:, None, None, None] ** 2
-                    - dE[None, :, :, :] ** 2)
-                weight = jnp.where(
-                    transition[None, :, :, :]
-                    & (jnp.abs(denom) > 1.0e-16),
-                    pref_inter * f_diff[None, :, :, :] / denom,
-                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                weight = _head_wing_interband_weight(
+                    dE[None, :, :, :],
+                    f_diff[None, :, :, :],
+                    z_block[:, None, None, None],
+                    pref_inter,
+                    transition[None, :, :, :],
                 )
                 if include_surface:
                     weight = weight + (
@@ -1843,11 +1861,10 @@ def _head_wing_kernel_face(
             frequencies (unlike the legacy ring's cross-RING-STEP carry)."""
             def _step(_carry, node):
                 z_block, inv_z_block = node
-                denom = z_block[:, None, None, None] ** 2 - dE[None] ** 2
-                weight = jnp.where(
-                    transition[None] & (jnp.abs(denom) > 1.0e-16),
-                    pref_inter * f_diff[None] / denom,
-                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                weight = _head_wing_interband_weight(
+                    dE[None], f_diff[None],
+                    z_block[:, None, None, None], pref_inter,
+                    transition[None],
                 )
                 if include_surface:
                     weight = weight + (
@@ -2039,7 +2056,9 @@ def head_wings_sharded(
     ``Y[a,mu] = sum conj(v[a,ij]) F_ij b_ij(mu)`` and
     ``Z[mu,b] = sum conj(b_ij(mu)) F_ij v[b,ij]``,
 
-    where ``F_ij = 4(f_j-f_i)/(Nk*nspin*nspinor*(z^2-dE^2))``.  This is
+    where ``F_ij = -4(f_j-f_i)/(Nk*nspin*nspinor*(z^2-dE^2))``.  The minus
+    is the one-leg conversion from the density jet ``D`` to the accepted
+    energy-scaled vertex ``P=-dE*D``.  This is
     exactly the normalization paired with ``head_s_tensor_sharded``:
     ``S_direct`` owns ``1/cell_volume`` and the later Schur fold introduces
     the sole additional ``1/cell_volume`` multiplying ``Y W Z``.
@@ -2047,7 +2066,9 @@ def head_wings_sharded(
     With tetrahedron surface weights, the finite-frequency intraband wings
     ``sum delta(E-mu) v_a b_nn / z`` are included as well.  The strictly
     static metal limit is not obtained by setting ``z=0`` in that expression;
-    its head remains on the separate Thomas-Fermi path.
+    its head remains on the separate Thomas-Fermi path.  This surface term
+    keeps its positive sign; it does not undergo the interband ``D -> P``
+    conversion.
 
     Every rank owns the same ``(nb/Px) * (nb/Py)`` band-pair tile.  The
     x-sharded and y-sharded centroid wavefunction copies build Y and Z,
