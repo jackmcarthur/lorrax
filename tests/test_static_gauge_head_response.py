@@ -296,7 +296,8 @@ def test_packed_runtime_refuses_a_config_less_call_before_opening_a_body():
     mesh = _mesh()
     with pytest.raises(ValueError, match="requires the run config"):
         compute_static_photon_response(
-            None, None, None, None, None, mesh, config=None)
+            None, None, None, None, None, mesh, screen_current=True,
+            config=None)
 
 
 def test_packed_runtime_refuses_no_local_fields_before_opening_a_body():
@@ -307,7 +308,8 @@ def test_packed_runtime_refuses_no_local_fields_before_opening_a_body():
     )
     with pytest.raises(ValueError, match="head_correction=full"):
         compute_static_photon_response(
-            None, None, None, None, None, mesh, config=config)
+            None, None, None, None, None, mesh, screen_current=True,
+            config=config)
 
 
 def _packed_deck(*, sys_dim=2, extra=""):
