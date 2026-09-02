@@ -59,9 +59,10 @@ def _transaction(mesh, wfn):
         band_start=0, band_stop=4, nk_tot=6, mesh=mesh)
 
 
-def _load(path, mesh, wfn, **changes):
+def _load(path, mesh, wfn=None, **changes):
+    """Load with the writer's identity unless ``changes`` overrides one."""
     kwargs = dict(
-        mesh_xy=mesh, wfn=wfn,
+        mesh_xy=mesh, wfn=_wfn() if wfn is None else wfn,
         expected_band_start=0, expected_band_stop=4, expected_nk_tot=6)
     kwargs.update(changes)
     return load_static_gauge_hall_artifact(path, **kwargs)
@@ -112,7 +113,7 @@ def test_hall_artifact_refuses_mismatched_runtime_identity(
     path = tmp_path / "static_gauge_hall.h5"
     write_static_gauge_hall_artifact(path, _transaction(mesh, wfn), mesh_xy=mesh)
     with pytest.raises(ValueError, match=message):
-        _load(path, mesh, wfn, **changes)
+        _load(path, mesh, **changes)
 
 
 def test_hall_artifact_refuses_absent_partial_and_incomplete(tmp_path):

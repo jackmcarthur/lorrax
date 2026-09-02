@@ -82,12 +82,28 @@ def _direct_moment_oracle(receipt, sigma_h):
     return per_order[-1]
 
 
-#: Global packed index of charge logical centroid 0 (shard 0) and 1 (shard 1)
-#: on the 2x2 mesh-interleaved layout with padded extents (2,2,2,2).
-def _charge_indices(layout):
-    side = int(layout.mesh_side)
-    return (layout.local_offset(0),
-            layout.packed_extent // side + layout.local_offset(0))
+def _packed_index(layout, mesh, channel, logical):
+    """Global packed index of one logical centroid, read off the packer.
+
+    Padding is to a multiple of the device count, not the mesh side, so
+    the index is not a closed-form offset; ask the canonical packer with a
+    one-hot channel vector instead of hand-addressing the interleaving.
+    """
+    from gw.photon_layout import pack_photon_channel_vectors
+
+    vectors = []
+    for row in range(4):
+        vector = np.zeros((1, layout.padded_extent(row)), dtype=np.complex128)
+        if row == channel:
+            vector[0, logical] = 1.0
+        vectors.append(_put(vector, mesh, (None, "x")))
+    packed = _gather(pack_photon_channel_vectors(
+        tuple(vectors), layout, mesh, axis_name="x")[0][channel])
+    hits = np.flatnonzero(np.abs(packed) > 0)
+    if hits.size != 1:
+        raise AssertionError(
+            f"one-hot channel {channel} logical {logical} packed to {hits}")
+    return int(hits[0])
 
 
 def _response(mesh, layout, sigma_h, *, wfn, wfn_binding, meta):
@@ -390,7 +406,8 @@ def _run_gate(mesh, wfn, output_dir):
     W_host[0] = 0.1 * np.eye(n, dtype=np.complex128)
     # Charge centroid 0 (the wing support) couples only to charge centroid
     # 1, so Y W Z = 0 while W Z and Y W are nonzero (see _response).
-    charge_0, charge_1 = _charge_indices(layout)
+    charge_0 = _packed_index(layout, mesh, 0, 0)
+    charge_1 = _packed_index(layout, mesh, 0, 1)
     W_host[0, charge_0, charge_0] = 0.0
     W_host[0, charge_0, charge_1] = 0.1
     W_host[0, charge_1, charge_0] = 0.1
