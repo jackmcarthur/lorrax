@@ -193,14 +193,21 @@ def _integrate_sigma_batches(
             if not sweep_started:
                 first_t = np.asarray(
                     jax.device_get(win.nodes.t), np.complex128)[0]
-                tau_kernel.lower(
+                prewarm_args = (
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
                     row.E_A, selector, B, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
-                    jnp.asarray(first_t, dtype=jnp.complex128)).compile()
+                    jnp.asarray(first_t, dtype=jnp.complex128))
+                if hasattr(tau_kernel, "lower"):
+                    tau_kernel.lower(*prewarm_args).compile()
+                else:
+                    # The stage-split diagnostic is a Python dispatcher over
+                    # separately-jitted stages.  Execute one real-shape call
+                    # to prewarm the same kernels the timed sweep will use.
+                    jax.block_until_ready(tau_kernel(*prewarm_args))
                 accumulator.precompile_tau_add(
                     sigma_shape=shape[1:],
                     sigma_sharding=NamedSharding(
