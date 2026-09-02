@@ -479,6 +479,125 @@ def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):
     assert "low_mem_bands" not in message
 
 
+# ---------------------------------------------------------------------------
+# Heads are always on: the incumbent route must say what it did, and
+# `restart` must not swap the head mechanism behind the deck's back
+# (owner ruling 2026-09-01 / TASTE.md row 20; lane J section 3)
+# ---------------------------------------------------------------------------
+
+_INCUMBENT_DECK = (
+    "[cohsex]\n"
+    "nval = 2\n"
+    "ncond = 2\n"
+    "number_bands = 8\n"
+    "memory_per_device_gb = 4.0\n"
+    "sys_dim = 3\n"                      # bulk: outside the slab envelope
+    "bispinor = true\n"
+    "bispinor_gw = bare_transverse\n"
+    "compute_mode = cohsex\n"
+    "restart = false\n")
+
+
+def test_incumbent_head_off_gets_the_same_debug_labelling_as_the_packed_route(
+        tmp_path):
+    from gw.gw_config import incumbent_bispinor_head_record
+    config = _parse(tmp_path,
+                    _INCUMBENT_DECK + "head_correction = off\n")
+    assert not uses_static_photon_response(config)
+    banner, record = incumbent_bispinor_head_record(config)
+    assert "WARNING -- DEBUG" in banner
+    assert "head_correction=off" in banner
+    assert "NOT a production calculation" in banner
+    assert record.startswith("DEBUG:")
+    assert "NOT a production calculation" in record
+
+
+def test_incumbent_head_full_says_it_has_no_transverse_gamma_head(tmp_path):
+    """A bulk bispinor number must not look complete.
+
+    The incumbent route's only transverse q=Gamma head was the overlay,
+    whose deck key is gone; the packed completion is the only producer of
+    <D_TT> and this deck is outside its envelope.
+    """
+    from gw.gw_config import incumbent_bispinor_head_record
+    config = _parse(tmp_path, _INCUMBENT_DECK)
+    assert not uses_static_photon_response(config)
+    banner, record = incumbent_bispinor_head_record(config)
+    assert banner == ""
+    assert "NO transverse q=Gamma head" in record
+    assert "StaticHeadTerms" in record
+
+
+def test_the_driver_prints_the_incumbent_head_record(tmp_path):
+    """The one owner is gw_config; gw_jax must not grow a second copy."""
+    import inspect
+    from gw import gw_jax
+    src = inspect.getsource(gw_jax.main)
+    assert "incumbent_bispinor_head_record(config)" in src
+    assert "Photon head    : " in src
+
+
+def test_restart_may_not_swap_the_head_mechanism_on_a_slab_cohsex_deck(
+        tmp_path):
+    """restart = true used to move a slab bispinor COHSEX deck from the
+    packed Gamma-cell completion to the incumbent scalar head, silently,
+    for 5.7 meV plus the whole transverse head."""
+    deck = (_INCUMBENT_DECK
+            .replace("sys_dim = 3", "sys_dim = 2")
+            .replace("restart = false", "restart = true"))
+    with pytest.raises(ValueError) as exc:
+        _parse(tmp_path, deck)
+    message = str(exc.value)
+    assert ("bispinor_slab_cohsex_restart_changes_the_head_mechanism"
+            in message)
+    # it must NAME BOTH mechanisms, not just say "unsupported"
+    assert "Wigner-Seitz" in message and "StaticHeadTerms" in message
+    assert "5.72 meV" in message
+    assert "IMPLEMENTATION LIMIT" in message
+
+
+def test_an_unnamed_restart_is_derived_false_on_a_slab_cohsex_deck(tmp_path):
+    """``restart`` DEFAULTS TO TRUE, so the default alone used to pick the
+    head mechanism.  A default deck must acquire neither a refusal nor a
+    worse head from a feature existing: an unnamed restart is set to false
+    for this deck class, announced, and only an EXPLICIT true refuses."""
+    lines = []
+    deck = (_INCUMBENT_DECK
+            .replace("sys_dim = 3", "sys_dim = 2")
+            .replace("restart = false\n", ""))
+    path = tmp_path / "unnamed_restart.in"
+    path.write_text(deck)
+    config = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert config.restart is False
+    assert uses_static_photon_response(config)
+    assert any("restart was not named" in ln for ln in lines), lines
+    assert any("5.72 meV" in ln for ln in lines), lines
+
+
+def test_a_scalar_deck_keeps_the_restart_default(tmp_path):
+    """The promotion is aimed at one bispinor deck class, not at restart."""
+    deck = (_INCUMBENT_DECK
+            .replace("sys_dim = 3", "sys_dim = 2")
+            .replace("bispinor = true\n", "")
+            .replace("bispinor_gw = bare_transverse\n", "")
+            .replace("restart = false\n", ""))
+    path = tmp_path / "scalar_restart.in"
+    path.write_text(deck)
+    assert LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *_: None).restart is True
+
+
+def test_a_bulk_bispinor_restart_deck_is_untouched(tmp_path):
+    """The gate is aimed at the deck class the packed route would have
+    served, not at every bispinor restart."""
+    config = _parse(tmp_path,
+                    _INCUMBENT_DECK.replace("restart = false",
+                                            "restart = true"))
+    assert config.restart is True
+    assert not uses_static_photon_response(config)
+
+
 def test_retired_charge_hall_cubature_spelling_names_the_new_mode(tmp_path):
     deck = _packed_deck().replace(
         "bispinor_gw = full_static_cohsex",

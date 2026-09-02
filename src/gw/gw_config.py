@@ -3706,7 +3706,10 @@ def packed_static_envelope(config, *, screened: bool):
            "there is no photon restart storage: the packed V/W and the "
            "Gamma-cell completion are not in the restart schema, so a "
            "restarted deck would silently fall back to a different q->0 "
-           "head mechanism", None)
+           "head mechanism.  On a slab COHSEX deck this row is normally "
+           "unreachable: GATE "
+           "bispinor_slab_cohsex_restart_changes_the_head_mechanism refuses "
+           "at parse time, naming both mechanisms", None)
     if not screened:
         return
     yield (str(config.mpa.material_class).strip().lower() == "insulator",
@@ -3829,6 +3832,47 @@ def uses_coupled_photon_head(config) -> bool:
             and config.head.correction is HeadCorrection.FULL)
 
 
+def incumbent_bispinor_head_record(config) -> tuple[str, str]:
+    """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route.
+
+    Heads are always on (owner ruling 2026-09-01,
+    ``docs/architecture/decisions.md``; TASTE.md row 20).  The packed route
+    has said so since lane B: a boxed ``WARNING -- DEBUG`` banner and a
+    ``Photon head`` line naming the completion.  The incumbent route said
+    only "no special Gamma-cell contribution", in component chatter that
+    production mode sinks -- so a headless bispinor bulk / dynamic /
+    ``x_only`` run reached ``eqp1.dat`` with no DEBUG token anywhere in the
+    run record (lane J section 3.c).
+
+    Returned rather than printed so the policy has ONE owner and a test can
+    read it without a driver.  ``banner`` is ``""`` when there is nothing
+    loud to say.  The caller is :mod:`gw.gw_jax`, and only for decks with
+    ``uses_static_photon_response(config)`` false.
+    """
+    if config.head.correction is HeadCorrection.OFF:
+        return (
+            "\n  ==========================================================\n"
+            "  WARNING -- DEBUG: Gamma-cell head disabled by\n"
+            "  head_correction=off on the INCUMBENT bispinor route.\n"
+            "  No scalar <v>/W_h band-diagonal head and no transverse\n"
+            "  q=Gamma head.  This is a brute-force k-grid convergence /\n"
+            "  debugging setting, NOT a production calculation\n"
+            "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
+            "  ==========================================================\n",
+            "DEBUG: no Gamma-cell head at all (head_correction=off on the "
+            "incumbent route); NOT a production calculation")
+    # head_correction = full here (no_local_fields is refused on every
+    # bispinor deck).  The CHARGE head is the scalar band-diagonal one and
+    # there is NO transverse q=Gamma head on this route now that the overlay
+    # has no deck key -- say so rather than let a bulk number look complete.
+    return (
+        "",
+        "scalar band-diagonal charge head only (gw.head_correction "
+        "StaticHeadTerms); NO transverse q=Gamma head on the incumbent "
+        "route -- the packed Gamma-cell completion is the only producer of "
+        "<D_TT> and this deck is outside its envelope")
+
+
 def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW.
 
@@ -3856,6 +3900,42 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "never choose a route (lane J section 2/3.d).  Bispinor heads "
             "are on by default and 'off' is the announced DEBUG skip.\n"
             "  doc:  docs/input_reference.md, head_correction.")
+    # A DECK KEY THAT IS NOT A HEAD DIAL MUST NOT CHANGE THE HEAD.  On a
+    # bispinor slab COHSEX deck, flipping ``restart`` alone used to move the
+    # calculation from the packed Gamma-cell completion to the incumbent
+    # scalar band-diagonal head -- silently, with no run-record difference
+    # beyond the routing reason, and worth 5.7 meV on an occupied state's
+    # SX+COH (lane J section 4.2: the two quadratures measured on the SAME
+    # head function, exact Wigner-Seitz vs the production Sobol draw), plus
+    # the whole transverse q=Gamma head.  Photon restart storage is not
+    # built, so the honest answer is to refuse, not to route.
+    if (bool(config.bispinor)
+            and config.compute_mode is ComputeMode.COHSEX
+            and int(config.sys_dim) == 2
+            and bool(config.restart)):
+        raise ValueError(
+            "GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism: "
+            "restart = true is refused on a bispinor slab static-COHSEX "
+            "deck.\n"
+            f"  got:  bispinor = true, compute_mode = cohsex, sys_dim = "
+            f"{config.sys_dim}, restart = true\n"
+            "  want: restart = false, or leave restart unnamed (an unnamed "
+            "restart is set to false for this deck class at parse time, "
+            "with a [config provenance] line)\n"
+            "  why:  IMPLEMENTATION LIMIT.  There is no photon restart "
+            "storage: neither the packed 4x4 V/W nor the Gamma-cell "
+            "completion is in the restart schema.  A restarted deck would "
+            "therefore silently swap ONE q->0 head mechanism for ANOTHER -- "
+            "from the packed completion (exact slab Wigner-Seitz cubature "
+            "of the coupled 4x4 Dyson equation: charge CC q^2 head, charge "
+            "wings, the bare <D_TT> transverse head, optional Hall CT/TC) "
+            "to the incumbent one (a Sobol mini-BZ <v>/W_h inserted band "
+            "diagonally by gw.head_correction's StaticHeadTerms, and NO "
+            "transverse head at all).  Measured difference on MoS2 3x3: "
+            "+5.72 meV on an occupied state's SX+COH from the quadrature "
+            "alone (reports/bisp_j_architecture_review_2026-09-01 section "
+            "4.2), before the missing transverse head.\n"
+            "  doc:  docs/input_reference.md, bispinor_gw / restart.")
     if (bool(config.bispinor)
             and config.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(config.density_self_consistent)):
@@ -5857,6 +5937,28 @@ class LorraxConfig:
                 "  [config provenance] bispinor qp_solver=self_consistent: "
                 "density_self_consistent was not named; enabling the "
                 "required live (rho, J) Hartree rebuild")
+        # ``restart`` DEFAULTS TO TRUE, and on a bispinor slab COHSEX deck
+        # that default alone used to choose the q->0 head mechanism (lane J
+        # section 3.a).  A default deck must not acquire a refusal from a
+        # feature existing, and it must not acquire a WORSE head from one
+        # either, so an UNNAMED restart is set to false for this deck class
+        # -- taking it to the packed Gamma-cell completion -- and only an
+        # EXPLICIT ``restart = true`` reaches
+        # GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism.
+        if (bool(resolved.bispinor)
+                and "restart" not in _named_keys
+                and bool(resolved.restart)
+                and int(resolved.sys_dim) == 2
+                and resolved.compute_mode is ComputeMode.COHSEX):
+            resolved = _dc_replace(resolved, restart=False)
+            print_fn(
+                "  [config provenance] bispinor slab static COHSEX: restart "
+                "was not named; setting restart = false so the packed "
+                "Gamma-cell completion runs.  There is no photon restart "
+                "storage, so a restarted deck would carry the incumbent "
+                "scalar band-diagonal head instead (+5.72 meV on an "
+                "occupied SX+COH, and no transverse q=Gamma head); "
+                "docs/input_reference.md, restart")
         # DERIVED, NOT DECLARED (lane J section 3).  ``low_mem_bands`` and
         # ``w_dyson_solver`` are not dials of the packed screened static
         # photon mode -- they are the only layout and the only Dyson plan it

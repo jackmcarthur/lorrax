@@ -99,7 +99,8 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver,
-	ScreeningDiagrams, packed_bare_transverse_route,
+	ScreeningDiagrams, incumbent_bispinor_head_record,
+	packed_bare_transverse_route,
 	packed_photon_screens_current, refuse_unimplemented_compute_mode,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response)
 from .gw_init import (prepare_isdf_and_wavefunctions,
@@ -333,6 +334,19 @@ def main(argv=None):
 				   "incumbent charge-screened W + Sigma^B "
 				   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
 				   f"head -- {_bare_reason}"))
+		# HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
+		# docs/architecture/decisions.md; TASTE.md row 20).  The packed route
+		# already prints a boxed WARNING banner and a `Photon head` record
+		# line when head_correction=off (gw.w_isdf, lane B).  The INCUMBENT
+		# route printed only "no special Gamma-cell contribution" in the
+		# component chatter that production mode sinks, so a headless
+		# bispinor bulk / dynamic / x_only run reached eqp1.dat with no
+		# DEBUG token anywhere in the run record (lane J section 3.c).
+		if not uses_static_photon_response(config):
+			_banner, _head_record = incumbent_bispinor_head_record(config)
+			if _banner:
+				print0(_banner)
+			report.progress(f"Photon head    : {_head_record}")
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
