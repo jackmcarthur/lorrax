@@ -614,7 +614,7 @@ and again at driver entry (`gw_init.py:3101`).
 | `bispinor_tt_head_unsupported` | `:4086-4137` | a hand-built TT head lacks bispinor or has unsupported dimensionality |
 | (no id) SC × dynamic | `gw_jax.py:274-285` | self-consistent solver with a dynamic mode |
 | (no id) missing current centroids | `gw_jax.py:579-584`, `gw_init.py:1425-1428` | `bispinor = true` without `centroids_file_current` |
-| (no id) packed route needs a distributed Dyson solve | `gw_config.py:3796-3801` | explicit `local` stays incumbent. Eligible unnamed slab decks are promoted at `:6028-6066`; one-GPU operation needs explicit `local` because the distributed service refuses a 1×1 mesh |
+| (no id) packed route needs a distributed Dyson solve | `gw_config.packed_static_envelope` (shared derived-key row) | Every packed route derives an unnamed `w_dyson_solver` to `distributed` with a provenance line. An explicit `local` remains a route conjunct for `bare_transverse` (incumbent fallback, named in the run record) and a refusal for `full_static_cohsex`. `distrib_la` still refuses `distributed` on a 1×1 mesh; the derivation never downgrades silently. |
 | (no id) photon Σ envelope | `sigma_dispatch.py:845` ff. | the static arm: outside `cohsex`; without a packed response; with scalar `static_head_terms`. The dynamic arm (`:890`) refuses a mode that builds static screened channels, and `:991` refuses a packed deck on a mode with no branch (`mpa`) |
 | (no id) packed response needs a config / distributed Dyson | `w_isdf.py:1945-1953` | the packed path is called without the run config, or with a non-distributed Dyson solver |
 | `GATE static_gauge_head_fold_{ward,hermiticity}` | `head_correction.py:1365,1370` | Γ-fold residuals over `1e-8` / `1e-10` (`:158-159`) |

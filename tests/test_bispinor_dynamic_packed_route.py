@@ -34,13 +34,10 @@ restart = false
 head_correction = full
 """
 
-#: The same deck WITHOUT the backend key, i.e. at the shipping default
-#: ``w_dyson_solver = auto``.
-_PACKED_BARE_AUTO_SOLVER = _PACKED_BARE.replace(
+#: The explicit non-distributed negative control.  An unnamed solver is
+#: derived to ``distributed`` from ``packed_static_envelope``.
+_PACKED_BARE_LOCAL_SOLVER = _PACKED_BARE.replace(
     "w_dyson_solver = distributed\n", "w_dyson_solver = local\n")
-#: An UNNAMED w_dyson_solver is now derived to "distributed" for the bare
-#: family inside its envelope at parse time (heads always on), so the
-#: routing case below needs an EXPLICIT non-distributed value.
 
 _PPM_KEYS = """\
 use_ppm_sigma = true
@@ -142,24 +139,39 @@ def test_the_route_is_not_taken_when_its_dyson_solver_would_refuse(tmp_path):
     ``w_isdf.compute_static_photon_response``'s first statement refuses
     anything but ``dyson_solver = 'distributed'`` (the packed solve has no
     local plan, and ``distrib_la`` additionally needs a true 2-D mesh).  The
-    ``full_static_cohsex`` envelope has always required the key; the bare
-    route's predicate did not, so a deck at the shipping default
-    ``auto`` -- which resolves to ``local`` on a small system -- was routed
-    to the packed operator and then died inside it.  Unreachable while only
-    ``cohsex`` decks took this route; reachable the moment the plasmon-pole
-    pair joined ``PACKED_PHOTON_COMPUTE_MODES``.
+    An unnamed solver is derived to ``distributed`` from the envelope table.
+    This explicit ``local`` arm proves a user request is preserved and keeps
+    the deck on the incumbent route rather than being silently overwritten.
     """
     from gw.gw_config import (packed_bare_transverse_route,
                               uses_dynamic_packed_photon_route,
                               uses_static_photon_response)
     cfg = _config(
-        tmp_path, _PACKED_BARE_AUTO_SOLVER + _PPM_KEYS + "compute_mode = gn_ppm\n",
+        tmp_path, _PACKED_BARE_LOCAL_SOLVER + _PPM_KEYS + "compute_mode = gn_ppm\n",
         name="gnppm_auto_solver.in")
     taken, reason = packed_bare_transverse_route(cfg)
     assert not taken
     assert "w_dyson_solver" in reason, reason
     assert not uses_static_photon_response(cfg)
     assert not uses_dynamic_packed_photon_route(cfg)
+
+
+def test_unnamed_solver_is_derived_for_the_dynamic_packed_route(tmp_path):
+    from gw.gw_config import LorraxConfig, uses_dynamic_packed_photon_route
+
+    path = tmp_path / "gnppm_derived_solver.in"
+    path.write_text(
+        _BASE
+        + _PACKED_BARE.replace("w_dyson_solver = distributed\n", "")
+        + _PPM_KEYS
+        + "compute_mode = gn_ppm\n")
+    lines = []
+    cfg = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert cfg.backend.w_dyson_solver == "distributed"
+    assert uses_dynamic_packed_photon_route(cfg)
+    assert any("packed_static_envelope" in line
+               and "w_dyson_solver was not named" in line for line in lines)
 
 
 # ---------------------------------------------------------------------------

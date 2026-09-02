@@ -12,4 +12,4 @@ from gw_isdf.cohsex_isdf import read_cohsex_input
 def test_read_cohsex_test_in():
     params = read_cohsex_input('examples/cohsex_test/cohsex_test.in')
     assert params['wfn_file'] == 'WFNsmall.h5'
-    assert params['restart'] is True
+    assert params['restart'] is False

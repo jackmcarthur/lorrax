@@ -175,7 +175,8 @@ until fixed.  File:line references as of this page's commit.
    (`sigma_dispatch`'s gspace V_H route).
 7. **eigenvalue vectors** — `lambda (nq, mu)` replicated in the
    distributed zeta tier (ScaLAPACK's own contract); `Sigma_c(omega,k,m,n)`
-   cube replicated under the default `sigma_omega_layout = replicated`.
+   cube replicated under the explicit control `sigma_omega_layout = replicated`;
+   the production default is `sharded`.
    `sharded` removes that residency (the layout's own `self_consistent`
    refusal was deleted 2026-08-05; since 2026-08-27 `self_consistent`
    itself is refused at driver entry beside a dynamic `compute_mode`, so
