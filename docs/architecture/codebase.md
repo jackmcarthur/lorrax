@@ -425,27 +425,17 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
     │
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ GN-PPM Σ^c(ω)  —  if config.use_ppm_sigma                             │
+│ GN/HL-PPM Σ^c(ω)                                                       │
 │ ─────────────────────────────────────────────────────────────────────│
 │   quad_imag = w_isdf.build_imag_quadrature(quad, ωp, minimax_config)  │
 │   χ₀(iωp)   = w_isdf.compute_chi0(..., quad_imag)                     │
 │   W(iωp)    = w_isdf.solve_w(V_q, χ₀(iωp), ...)                        │
-│   ppm       = ppm_sigma.fit_gn_ppm(W(0), W(iωp), V_q, ωp, mesh_xy)     │
+│   ppm       = ppm_sigma.fit_ppm(W(0), W(probe), V_q, ωp, mesh_xy)      │
 │                → B_q, Ω_q, valid_mask_q  (all P(None,'x','y'))        │
-│   Σ^c(ω)    = ppm_sigma.compute_sigma_c_ppm_omega_grid(...)           │
-│     └─ 4 branches ×   (+ω cond / +ω val / -ω cond / -ω val)           │
-│        each branch:                                                   │
-│          _build_windows_for_branch   (host-side minimax window build) │
-│          _integrate_tau_windows_for_branch                            │
-│            └─ for each window (Laplace / crossing / slab):            │
-│                 _get_sigma_tau_scan_kernel                            │
-│                   lax.scan over τ nodes:                              │
-│                     tau_kernel: σ^τ = project[IFFT(G·W_τ)/√Nk]        │
-│                     _project_tau_onto_omega: apply e^{iω·τ} kernel    │
-│                       onto acc(n_ω, nk, m_X, n_Y)                     │
-│          accumulator:                                                 │
-│            _ReduceScatterGpuAccumulator   (kij in GPU)                │
-│            _StreamedH5Accumulator          (sigma_kij.h5, 1-proc only)│
+│   store     = tmp/mpa/mpa_fit_oneshot.h5  (one pole per ISDF pair)    │
+│   Σ^c(ω)    = mpa.sigma.compute_sigma_c_mpa_omega_grid(...)           │
+│     └─ shared four branches + denominator-box plan + rule cache       │
+│        get_shared_sigma_tau_kernel → DeviceOmegaAccumulator           │
 │   + diagonal SC fixed-point (qsgw_utils.solve_diagonal_sigma_fixed_point)│
 │   + scissor fit for out-of-grid bands (scissor.fit_scissor)           │
 │   + QSGW Σ^xc construction (qsgw_utils.build_qsgw_sigma_xc_from_h5)   │
@@ -631,25 +621,17 @@ main                                       [gw/gw_jax.py]
  ├─ build_imag_quadrature                   [gw/w_isdf.py]
  ├─ compute_chi0 (imag ω)                   [gw/w_isdf.py]
  ├─ solve_w (imag ω)                        [gw/w_isdf.py]
- ├─ fit_gn_ppm                              [gw/ppm_sigma.py]
- │   └─ fit_gn_ppm_from_wc_pair              [gw/minimax_screening.py]
+ ├─ fit_ppm                                 [gw/ppm_sigma.py]
+│   └─ fit_gn_ppm_from_wc_pair              [gw/minimax_screening.py]
  └─ compute_sigma_c_ppm_omega_grid          [gw/ppm_sigma.py]
      ├─ _prepare_sigma_state                 (fused Fermi / masks)
-     ├─ _iter_branches                       (4-branch enumerator)
-     └─ _run_sigma_branch (×4)
-         ├─ _build_windows_for_branch       (host: window + minimax)
-         │   ├─ _build_single_sigma_window  (Laplace)
-         │   └─ _build_three_sigma_windows  (Laplace + crossing + slab)
-         └─ _integrate_tau_windows_for_branch
-             └─ _get_sigma_tau_scan_kernel  (device: scan over τ)
-                 ├─ _get_sigma_tau_kernel
-                 │   ├─ _build_tau_operands  (Gij, W_τ_q)
-                 │   └─ _get_sigma_kij_kernel
-                 │       ├─ build_G         [greens_function_kernel.py]
-                 │       ├─ _convolve via fft_helpers
-                 │       └─ _make_project_ri_reduce_scatter  (reduce-scatter on m,n)
-                 └─ _project_tau_onto_omega  (e^{iωτ} kernel ⊗ σ^τ)
-     → _ReduceScatterGpuAccumulator  or  _StreamedH5Accumulator
+     ├─ write_complete_pole_store_collective (MPA v2, n_poles=1)
+     └─ compute_sigma_c_mpa_omega_grid       [gw/mpa/sigma.py]
+         ├─ branches_for_omega_grid          (shared 4-branch enumerator)
+         ├─ plan_sigma_windows               (shared box plan + cache)
+         ├─ get_shared_sigma_tau_kernel      [gw/ppm_tau_kernel.py]
+         │   └─ _get_sigma_kij_kernel
+         └─ DeviceOmegaAccumulator           [gw/ppm_accumulators.py]
 ```
 
 ### 8.4 Post-processing (all rank-0 host)
@@ -699,9 +681,9 @@ main                                       [gw/gw_jax.py]
 | **q→0 head resolution** | `gw/head_correction.py : resolve_head_sample` |
 | **Exact static head terms** | `gw/head_correction.py : compute_static_head_terms`, `static_head_terms_to_kij` |
 | **Dipole S(ω)** | `common/chi_from_dipole.py : compute_S_omega` |
-| **GN-PPM fit** | `gw/ppm_sigma.py : fit_gn_ppm` → `gw/minimax_screening.py : fit_gn_ppm_from_wc_pair` |
-| **Σ^c(ω) driver** | `gw/ppm_sigma.py : compute_sigma_c_ppm_omega_grid` |
-| **σ^τ kernel** | `gw/ppm_sigma.py : _get_sigma_tau_kernel`, `_get_sigma_tau_scan_kernel` |
+| **GN/HL-PPM fit** | `gw/ppm_sigma.py : fit_ppm` → `gw/minimax_screening.py : fit_gn_ppm_from_wc_pair` |
+| **Σ^c(ω) driver** | `gw/mpa/sigma.py : compute_sigma_c_mpa_omega_grid`; PPM adapter `gw/ppm_sigma.py : compute_sigma_c_ppm_omega_grid` |
+| **sigma(tau) kernel** | `gw/ppm_tau_kernel.py : get_shared_sigma_tau_kernel` |
 | **Diagonal fixed-point** | `gw/qsgw_utils.py : solve_diagonal_sigma_fixed_point` |
 | **Scissor extrapolation** | `gw/scissor.py : fit_scissor` |
 | **QSGW Σ^xc** | `gw/qsgw_utils.py : build_qsgw_sigma_xc_from_h5` |

@@ -2077,8 +2077,6 @@ _DEFAULTS = {
     # their references are re-pinned).  HL probes (real axis) always take
     # the dedicated path.
     "ppm_probe_chi_reuse": "off",
-    "ppm_sigma_target_error": 1.0e-6,
-    "ppm_sigma_max_nodes": 64,
     # Multipole W sampling / bounded Sigma consumption.
     "mpa_n_poles": 8,
     "mpa_sampling_alpha": 1,
@@ -2323,6 +2321,10 @@ _LEGACY_DECK_KEYS = frozenset({
     "use_ffi_io",                   # refused (one transport now)
     "gspace_mode",                  # refused (one ψ(G) lifecycle now)
     "hartree_source",               # refused (live G-space is the only path)
+    # Removed with the PPM-specific dynamic-Sigma executor.  GN/HL stores use
+    # the same three box-rule controls and pair ceiling as MPA.
+    "ppm_sigma_target_error",
+    "ppm_sigma_max_nodes",
     # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
     # keeps its dedicated parse refusal; other values warn-and-ignore.
@@ -2958,6 +2960,17 @@ def read_lorrax_input(filename: str) -> dict:
                 "the key; stored, folded, and ISDF Hartree paths no longer "
                 "exist."
             )
+        for legacy_key in ("ppm_sigma_target_error", "ppm_sigma_max_nodes"):
+            if section.get(legacy_key, fallback=None) is not None:
+                raise ValueError(
+                    f"Input key '{legacy_key}' is retired: GN/HL-PPM now "
+                    "writes a one-pole MPA store and uses the shared dynamic "
+                    "Sigma route. Remove the key and use "
+                    "sigma_quadrature_eps, "
+                    "sigma_quadrature_reduction_seconds, "
+                    "sigma_quadrature_cache_dir, and the existing "
+                    "mpa_sigma_max_nodes pair ceiling."
+                )
         # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
         # accumulation is the only mode, so the key steered nothing.  The
         # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
@@ -3366,12 +3379,11 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # 2026-08-22): a low_mem_bands=true, compute_mode=gn_ppm deck (the
         # supported-table's own claimed envelope) ran ISDF fit + chi0/W
         # construction to completion under layout='face', then died in
-        # ``ppm_tau_kernel.precompile_sigma`` at the FIRST legacy accessor
+        # the former PPM tau precompile at the FIRST legacy accessor
         # call (``wfns.xn(s.full)``) with the carrier's own named
         # ``_require_legacy`` ValueError -- not a clean parse-time refusal.
         # The dynamic two-point plasmon-pole Sigma_c(omega) pipeline
-        # (ppm_tau_kernel.py's ``precompile_sigma``/``_get_sigma_tau_kernel``
-        # /``_get_sigma_kij_kernel``, ``common.contract_bands``'s
+        # (the spatial ``_get_sigma_kij_kernel``, ``common.contract_bands``'s
         # channels="split_reim" face arm, and ppm_sigma.py's per-branch
         # sigma builders + invalid-pole static-limit term) now dispatches
         # on ``wfns.layout`` and routes through
@@ -4089,10 +4101,6 @@ class PPMConfig:
     #: folded into the static sweep when the error gate passes — see
     #: _DEFAULTS["ppm_probe_chi_reuse"]).
     probe_chi_reuse: str
-
-    # --- σ-quadrature minimax ---
-    sigma_target_error: float
-    sigma_max_nodes: int
 
     invalid_mode: str             # "zero" | "2ry" | "static_limit" | "infinity"(alias)
 
@@ -4825,18 +4833,6 @@ class LorraxConfig:
         )
 
     @property
-    def sigma_quadrature_config(self):
-        """Math-internal :class:`gw.minimax_config.MinimaxConfig` for Σ^c."""
-        from .minimax_config import MinimaxConfig
-        return MinimaxConfig(
-            target_error=self.ppm.sigma_target_error,
-            max_nodes=self.ppm.sigma_max_nodes,
-            crossing_max_nodes=max(500, self.ppm.sigma_max_nodes),
-            crossing_eps_q=1.0e-3,
-            regenerate_tables=self.screening.regenerate_minimax_tables,
-        )
-
-    @property
     def omega_grid_ev(self):
         """Σ_c(ω) frequency grid in eV (length-stable single formula).
 
@@ -5055,8 +5051,6 @@ class LorraxConfig:
                 float(_g("ppm_head_omega_h_ry"))
                 if _g("ppm_head_omega_h_ry") is not None else None),
             probe_chi_reuse=str(_g("ppm_probe_chi_reuse")).strip().lower(),
-            sigma_target_error=float(_g("ppm_sigma_target_error")),
-            sigma_max_nodes=int(_g("ppm_sigma_max_nodes")),
             invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
         )
         mpa = MPAConfig(

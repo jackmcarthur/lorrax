@@ -355,8 +355,7 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
     ):
         """Full τ sweep accumulating χ_R, then one R→q FFT.
 
-        Sibling of ``ppm_sigma.minimax_tau_integrate_sigma`` — takes a
-        ``MinimaxNodes`` pytree in the same slot.  For chi0 the nodes
+        The chi0 tau sweep consumes a ``MinimaxNodes`` pytree.  For chi0 the nodes
         arrive with purely-real τ (``time_axis='real'``) and complex α
         whose Im part is zero; ``alpha`` includes the one-orientation
         prefactor ``-α_quad·exp(-τ·E_gap)``.  The scan body explicitly adds

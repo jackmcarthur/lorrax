@@ -403,28 +403,6 @@ def test_subtractive_sign_definite_support_refuses_a_crossing_interval():
             omega_min=0.9, subtract_omega=True)
 
 
-def test_memory_tile_sink_splices_disjoint_omega_clusters():
-    """Cluster rows assemble on the existing bracket-then-omega layout."""
-    from gw.ppm_accumulators import _MemoryTileSink
-
-    sink = _MemoryTileSink(shape=(1, 5, 1, 1, 1), sharding=None)
-    shard_index = [(slice(None), slice(None), slice(None), slice(None))]
-    devices = [None]
-    sink.consume_window(
-        [np.array([2.0, 3.0], dtype=np.complex128).reshape(1, 2, 1, 1, 1)],
-        shard_index, devices, omega_indices=np.array([0, 3]))
-    sink.consume_window(
-        [np.array([5.0, 7.0], dtype=np.complex128).reshape(1, 2, 1, 1, 1)],
-        shard_index, devices, omega_indices=np.array([1, 4]))
-    tiles, _, _ = sink.host_tiles()
-    np.testing.assert_array_equal(
-        tiles[0].reshape(-1), np.array([2.0, 5.0, 0.0, 3.0, 7.0]))
-    with pytest.raises(RuntimeError, match="cannot mix clustered"):
-        sink.consume_window(
-            [np.zeros((1, 5, 1, 1, 1), dtype=np.complex128)],
-            shard_index, devices)
-
-
 def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     """CrI3-shaped pole tails are partitioned, never dropped/staticised."""
     import jax.numpy as jnp

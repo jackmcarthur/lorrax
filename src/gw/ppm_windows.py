@@ -317,7 +317,7 @@ class _SigmaWindow:
 
     @property
     def project_code(self) -> int:
-        """Int form of ``project`` — the code branch in _project_tau_onto_omega_np."""
+        """Integer projection code consumed by DeviceOmegaAccumulator."""
         if self.project == "full":
             return 0
         if self.project == "imag":

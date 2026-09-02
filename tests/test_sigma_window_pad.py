@@ -40,7 +40,7 @@ def _mesh(p_x: int, p_y: int):
 def _psi_pair(nk: int, nb: int, ns: int, nmu: int):
     """(psi_xr, psi_yn) with distinct, reproducible values.
 
-    Layouts match the production call site (_run_sigma_branch):
+    Layouts match the shared Sigma spatial kernel call site:
       psi_xr : (nk, m, s, mu)   band axis 1
       psi_yn : (nk, s, mu, n)   band axis 3
     """
@@ -144,7 +144,7 @@ def test_strip_noop_and_none():
 def test_pad_strip_round_trip(p_x, p_y, nb):
     """A Σ-shaped bilinear contraction of the padded ψ pair has an
     exactly-zero pad block, and strip recovers exactly the unpadded
-    contraction — the guarantee _run_sigma_branch relies on."""
+    contraction — the guarantee the shared spatial kernel relies on."""
     xr, yn = _psi_pair(nk=1, nb=nb, ns=1, nmu=2)
     xr_p, yn_p, nb_real = pad_sigma_window(xr, yn, _mesh(p_x, p_y))
 
