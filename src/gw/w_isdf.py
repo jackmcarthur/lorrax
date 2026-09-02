@@ -2063,6 +2063,23 @@ def compute_experimental_no_pair_photon_chi0(
     return pack_photon_operator(get_block, nq, layout, mesh_xy)
 
 
+def _padded_bundle_centroid_extent(wfns) -> int:
+    """PADDED centroid extent of a bundle, whichever field carries it."""
+    if wfns.layout == "legacy":
+        return int(wfns.psi_yr.shape[-1])
+    if wfns.layout == "face":
+        return int(wfns.psi_mun.shape[2])
+    raise ValueError(
+        f"static photon response: unknown wavefunction layout {wfns.layout!r}")
+
+
+#: Provenance of the unscreened-current packed body.  The bare-transverse
+#: family declares NO current response model: the twelve current blocks of
+#: chi are zero, not approximated.
+STATIC_PHOTON_BARE_CURRENT_MODEL = "bare_breit_no_current_response_v1"
+STATIC_PHOTON_BARE_CURRENT_CONTACT = "none: current channels unscreened"
+
+
 @dataclass(frozen=True)
 class StaticPhotonResponse:
     """Declared no-pair full-body static photon response and provenance."""
@@ -2079,6 +2096,8 @@ class StaticPhotonResponse:
 def compute_static_photon_response(
     wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
     meta, mesh_xy, *,
+    screen_current: bool,
+    W_charge=None,
     wfn=None,
     config=None,
     photon_g0_vectors=None,
@@ -2093,18 +2112,53 @@ def compute_static_photon_response(
 ) -> StaticPhotonResponse:
     """Build the packed static photon body and complete its Gamma cell.
 
-    This is the screening owner of ``bispinor_gw = full_static_cohsex``: the
-    sixteen no-pair blocks, one distributed Dyson solve at omega=0, then the
-    Gamma-cell completion (:func:`gw.head_correction.
-    complete_static_slab_photon_q0`) from the bounded response of
+    THE SCREENING OWNER OF BOTH PACKED STATIC MODES.  ``screen_current``
+    (resolved once by :func:`gw_config.packed_photon_screens_current`, never
+    defaulted here) selects which:
+
+    ``screen_current = True`` -- ``bispinor_gw = full_static_cohsex``: the
+    sixteen no-pair blocks of ``chi``, one distributed Dyson solve at
+    omega=0.
+
+    ``screen_current = False`` -- the ``bare_transverse`` family: the twelve
+    current blocks of ``chi`` are ZERO by declaration, so the packed Dyson
+    equation is block diagonal and neither the current blocks nor the packed
+    solve are built at all.  The CC block is screened by the incumbent
+    scalar owner (``gw.screening.compute_screening_model`` -> :func:`solve_w`
+    at ``n_C``) and arrives as ``W_charge``; this function assembles
+    ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0`` through the sole
+    packer.  The sixteen-block Sigma consumer then returns the screened
+    charge COHSEX in CC, the bare Breit exchange ``Sigma^B`` in TT
+    (``SX(D_TT) = X(D_TT)``, ``COH(D_TT - D_TT) = 0``) and zero in CT/TC --
+    the incumbent ``gw.sigma_x_bispinor`` result, block for block.
+
+    Both modes then run ONE Gamma-cell completion
+    (:func:`gw.head_correction.complete_static_slab_photon_q0`) from the
+    bounded response of
     :func:`gw.static_gauge_response.build_static_photon_head_response` --
     bare ``<D>`` into V, the charge ``S^{00}``/wing head into W, the Hall
     CT/TC term from ``config.paths.static_gauge_hall_file`` when that
-    artifact exists (``sigma_H = 0`` otherwise, announced).  The completion
-    runs under ``head_correction = full`` (the default); ``off`` skips it
-    behind a DEBUG banner and is not a production setting (owner ruling
-    2026-09-01).  The current q^2/contact/complement terms are omitted by
-    model in either case.
+    artifact exists (``sigma_H = 0`` otherwise, announced).  With the
+    charge-only ``R(q)`` the coupled 4x4 solve returns
+    ``diag(W^{00}_h(q), D_TT(q))``, so the same completion inserts the
+    charge head AND the bare ``<D_TT> = -<v P^T>`` that the
+    ``bispinor_tt_head_correction`` overlay writes into the TT V tiles on
+    the incumbent route (that key is refused here, GATE
+    ``packed_bare_transverse_tt_head_double_count``).  The Hall term needs a
+    screened CT/TC channel to live in and is therefore refused on the bare
+    route.  The completion runs under ``head_correction = full`` (the
+    default); ``off`` skips it behind a DEBUG banner and is not a production
+    setting (owner ruling 2026-09-01).  The current q^2/contact/complement
+    terms are omitted by model in either case.
+
+    MEMORY.  Both modes keep the packed body resident: ``V_packed`` and
+    ``W_packed`` are each ``(nq, N_packed, N_packed)`` complex128 at
+    ``P(None,'x','y')`` with ``N_packed = n_C + 3 n_T``, i.e.
+    ``16 nq N_packed^2 / P`` bytes per rank each.  The bare route's
+    incumbent predecessor held one TT tile at a time instead, so this IS a
+    new resident carrier for that route (it is the same object the screened
+    mode already holds).  The figure is printed at this site below; the
+    per-block streaming inside ``gw.photon_sigma`` is unchanged.
 
     ``print_fn`` is the driver's rank-zero printer.  In production mode the
     driver sinks ordinary component chatter, so the DEBUG banner below
@@ -2113,11 +2167,13 @@ def compute_static_photon_response(
     ``Photon head`` record line from the returned ``head_completion``.
     """
     from .gw_config import (
-        BispinorGWMode, HeadCorrection, coerce_bispinor_gw_mode)
+        BARE_TRANSVERSE_MODES, BispinorGWMode, HeadCorrection,
+        coerce_bispinor_gw_mode, packed_bare_transverse_route,
+        packed_photon_screens_current)
     from .photon_layout import (
-        PhotonBasisLayout, pack_photon_channel_vectors,
+        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
         pack_photon_operator)
-    from .v_q_bispinor import BispinorVqReader
+    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
 
     if str(dyson_solver).strip().lower() != "distributed":
         raise ValueError(
@@ -2136,10 +2192,38 @@ def compute_static_photon_response(
     coupled_head = head_policy is HeadCorrection.FULL
     photon_mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-    if photon_mode is not BispinorGWMode.FULL_STATIC_COHSEX:
+    screen_current = bool(screen_current)
+    if screen_current != packed_photon_screens_current(config):
+        raise ValueError(
+            "packed static photon response received screen_current="
+            f"{screen_current} for bispinor_gw={photon_mode.value!r}; the "
+            "selector is resolved once by "
+            "gw_config.packed_photon_screens_current and must not be "
+            "restated at the call site")
+    if not screen_current:
+        if photon_mode not in BARE_TRANSVERSE_MODES:
+            raise ValueError(
+                "the unscreened-current packed route serves only the "
+                f"bare-transverse family; got {photon_mode.value!r}")
+        route_taken, route_reason = packed_bare_transverse_route(config)
+        if not route_taken:
+            raise ValueError(
+                "packed static photon response reached with "
+                f"bispinor_gw={photon_mode.value!r} outside its envelope: "
+                f"{route_reason}")
+        if W_charge is None:
+            raise ValueError(
+                "the packed bare-transverse route requires the incumbent "
+                "scalar W(omega=0) on the charge block; refusing to build a "
+                "second charge screening owner here")
+    elif photon_mode is not BispinorGWMode.FULL_STATIC_COHSEX:
         raise ValueError(
             "packed static photon response received bispinor_gw="
             f"{photon_mode.value!r}")
+    elif W_charge is not None:
+        raise ValueError(
+            "full_static_cohsex screens the charge block inside the packed "
+            "Dyson solve; an external W_charge would be ignored")
     hall = None
     if coupled_head:
         if (wfn is None or photon_g0_vectors is None
@@ -2159,7 +2243,34 @@ def compute_static_photon_response(
                     f"packed static photon {role} wavefunction binding does "
                     "not name the supplied carrier")
         hall_path = str(config.paths.static_gauge_hall_file)
-        if os.path.exists(hall_path):
+        if not screen_current:
+            # R(q) = q_a H_a(sigma_H) + q_a q_b S_ab with a nonzero Hall
+            # term makes the coupled 4x4 solve return CT/TC blocks, i.e. a
+            # screened charge-current coupling in the Gamma cell that this
+            # route has at no other q.  Refuse rather than ignore a named
+            # deck artifact (a parsed-but-ignored key is a defect).
+            if os.path.exists(hall_path):
+                raise ValueError(
+                    "GATE packed_bare_transverse_hall_unavailable: "
+                    f"bispinor_gw = {photon_mode.value} is refused with a "
+                    f"present static_gauge_hall_file ({hall_path}).\n"
+                    f"  got:  static_gauge_hall_file = {hall_path} (exists)\n"
+                    "  want: no Hall artifact on this path (remove or "
+                    "rename it), or bispinor_gw = full_static_cohsex\n"
+                    "  why:  the bare-transverse route leaves the current "
+                    "channels unscreened (chi_TT = chi_CT = 0), so "
+                    "W_CT = 0 at every finite q.  A nonzero sigma_H would "
+                    "put a screened CT/TC block into the Gamma cell alone, "
+                    "which is not a limit of this model.\n"
+                    "  doc:  docs/input_reference.md, "
+                    "static_gauge_hall_file.")
+            if jax.process_index() == 0:
+                print_fn(
+                    "  [photon head] Hall term: not read on the "
+                    "bare-transverse route (no screened CT/TC channel to "
+                    "carry it); sigma_H = 0",
+                    flush=True)
+        elif os.path.exists(hall_path):
             # A present artifact must authenticate (WFN identity, band
             # manifold, nk); a stale one refuses inside the loader rather
             # than silently degrading to sigma_H = 0.
@@ -2212,27 +2323,86 @@ def compute_static_photon_response(
             reader.get_tile, reader.n_q_total, layout, mesh_xy)
 
     if jax.process_index() == 0:
+        # MEASURED at the site, per lane C's design note: the packed body is
+        # the resident carrier of BOTH modes and is new to the bare route.
+        n_packed = int(layout.packed_extent)
+        n_ranks = max(int(jax.process_count()), 1)
+        body_bytes = 16.0 * int(meta.nk_tot) * n_packed * n_packed / n_ranks
         print_fn(
             "  [photon response] DECLARED no-pair model "
             "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
-            "j=c*Psi^dagger*alpha*Psi; bubble-screened "
-            f"Breit; current_contact={current_contact}; "
-            f"head_correction={head_policy.value}",
+            "j=c*Psi^dagger*alpha*Psi; "
+            + ("bubble-screened Breit; "
+               f"current_contact={current_contact}; "
+               if screen_current else
+               "BARE Breit (chi_TT = chi_CT = 0: no current blocks, no "
+               "packed Dyson solve); ")
+            + f"head_correction={head_policy.value}",
             flush=True)
-    chi_packed = compute_experimental_no_pair_photon_chi0(
-        wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
-        current_contact=current_contact,
-        energy_reference=energy_reference)
+        print_fn(
+            f"  [photon response] packed body N_packed={n_packed} "
+            f"(n_C={layout.padded_extent(0)} + 3*n_T="
+            f"{layout.padded_extent(1)}), nq={int(meta.nk_tot)}: "
+            f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W",
+            flush=True)
+    if screen_current:
+        chi_packed = compute_experimental_no_pair_photon_chi0(
+            wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
+            current_contact=current_contact,
+            energy_reference=energy_reference)
 
-    W_packed = solve_w(
-        V_packed, chi_packed, meta, mesh_xy,
-        dyson_solver="distributed",
-        distrib_la_batched_route=distrib_la_batched_route)
-    # The bare Hartree/exchange stage that follows does not depend on W and
-    # could otherwise begin allocating its Green/operator workspaces while
-    # the asynchronous distributed LU still owns A, RHS and donated chi.
-    # Finish the response here, inside its timing/lifetime boundary.
-    W_packed.block_until_ready()
+        W_packed = solve_w(
+            V_packed, chi_packed, meta, mesh_xy,
+            dyson_solver="distributed",
+            distrib_la_batched_route=distrib_la_batched_route)
+        # The bare Hartree/exchange stage that follows does not depend on W
+        # and could otherwise begin allocating its Green/operator workspaces
+        # while the asynchronous distributed LU still owns A, RHS and donated
+        # chi.  Finish the response here, inside its timing/lifetime boundary.
+        W_packed.block_until_ready()
+    else:
+        # chi_TT = chi_CT = 0 makes the packed Dyson equation block diagonal:
+        #     W_packed = diag((1 - D_00 chi_00)^-1 D_00, D_TT),  W_CT = 0.
+        # Neither the twelve current blocks of chi nor the (n_C + 3 n_T)^2
+        # solve is built.  The CC block was solved by the incumbent scalar
+        # owner at n_C; the rest of W is V, block for block, through the sole
+        # packer -- one local write per block, no gather.
+        # The screened branch checks this inside
+        # compute_experimental_no_pair_photon_chi0; the bare branch builds no
+        # chi, so assert it here rather than let photon_sigma fail on a
+        # block/bundle shape mismatch several stages later.
+        n_c = _padded_bundle_centroid_extent(wfns_charge)
+        n_t = _padded_bundle_centroid_extent(wfns_transverse)
+        if (n_c != layout.padded_extent(0) or n_t != layout.padded_extent(1)):
+            raise ValueError(
+                "photon layout padded extents do not match wavefunction "
+                f"bundles: layout C/T=({layout.padded_extent(0)},"
+                f"{layout.padded_extent(1)}), wfns C/T=({n_c},{n_t})")
+        W_cc = jnp.asarray(W_charge)
+        expected_cc = layout.block_shape(int(meta.nk_tot), 0, 0)
+        if tuple(W_cc.shape) != expected_cc:
+            raise ValueError(
+                "the packed bare-transverse route needs the incumbent scalar "
+                f"W on the CC block: expected {expected_cc} from the photon "
+                f"layout, got {tuple(W_cc.shape)}.  The charge centroid "
+                "padding of the scalar and packed paths must agree.")
+        with mesh_xy:
+            W_cc = jax.lax.with_sharding_constraint(
+                W_cc.astype(V_packed.dtype),
+                NamedSharding(mesh_xy, P(None, "x", "y")))
+
+        def _bare_W_block(A, B):
+            if (int(A), int(B)) == (0, 0):
+                return W_cc
+            if (int(A), int(B)) in ZERO_TILES:
+                # Coulomb-gauge zero: V_CT = 0 and chi_CT = 0, so W_CT = 0.
+                return None
+            return photon_block_view(V_packed, layout, A, B, mesh_xy)
+
+        W_packed = pack_photon_operator(
+            _bare_W_block, int(meta.nk_tot), layout, mesh_xy)
+        W_packed.block_until_ready()
+        del W_cc
     # This packed path bypasses screening._gate_w, so apply its two valid
     # static stage invariants here through the shared sanity owner.  Full-q
     # scalar reciprocity is deliberately not borrowed: Lorentz current
@@ -2298,15 +2468,26 @@ def compute_static_photon_response(
                 f"{head_completion.max_dyson_forward_error_bound:.3e}",
                 flush=True)
 
+    if screen_current:
+        return StaticPhotonResponse(
+            layout=layout, V_packed=V_packed, W_packed=W_packed,
+            current_contact=current_contact,
+            head_completion=head_completion,
+            current_model=STATIC_PHOTON_NO_PAIR_MODEL,
+            approximation=(
+                "gamma_completed_no_pair_static_photon_v1"
+                if coupled_head
+                else "DEBUG_headless_no_pair_static_photon_v1"),
+        )
     return StaticPhotonResponse(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
-        current_contact=current_contact,
+        current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
         head_completion=head_completion,
-        current_model=STATIC_PHOTON_NO_PAIR_MODEL,
+        current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
         approximation=(
-            "gamma_completed_no_pair_static_photon_v1"
+            "gamma_completed_bare_transverse_photon_v1"
             if coupled_head
-            else "DEBUG_headless_no_pair_static_photon_v1"),
+            else "DEBUG_headless_bare_transverse_photon_v1"),
     )
 
 

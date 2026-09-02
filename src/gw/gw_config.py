@@ -3552,22 +3552,112 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
-def uses_static_photon_response(config) -> bool:
-    """Whether screening and Sigma use the packed 4x4 photon response."""
+#: The bare-transverse family: charge-screened CC plus the BARE transverse
+#: propagator.  The three members differ only in the four-spinor carrier
+#: (the lift), never in the response path, so they route identically.
+BARE_TRANSVERSE_MODES: tuple[BispinorGWMode, ...] = (
+    BispinorGWMode.BARE_TRANSVERSE,
+    BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+    BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE,
+)
+
+
+def packed_bare_transverse_route(config) -> tuple[bool, str]:
+    """Is the bare-transverse family served by the packed photon path?
+
+    ``bare_transverse`` IS the packed static mode with the twelve current
+    blocks of ``chi`` set to zero: the packed Dyson equation is then block
+    diagonal, ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0``, and the
+    sixteen-block Sigma consumer returns the screened charge COHSEX in CC,
+    the bare Breit exchange ``Sigma^B`` in TT (``SX(D_TT) = X(D_TT)``,
+    ``COH(D_TT - D_TT) = 0``) and zero in CT/TC -- the incumbent
+    ``gw.sigma_x_bispinor`` result, block for block.  The Gamma completion
+    is the same :func:`gw.head_correction.complete_static_slab_photon_q0`
+    with the charge-only ``R(q)``, which returns ``diag(W^00_h, D_TT)`` and
+    so inserts BOTH the charge head and the bare ``<D_TT>`` that the
+    ``bispinor_tt_head_correction`` overlay writes into the V tiles today.
+
+    The route is taken exactly inside the envelope that completion is
+    derived for, and NOWHERE else: outside it the incumbent
+    charge-screened + ``Sigma^B`` route is the only certified one, and it
+    is unchanged.  Returns ``(taken, reason)`` so the driver can print the
+    first unmet condition instead of switching physics in silence; the
+    predicate and its narration have one owner.
+
+    Not in the predicate on purpose: ``bispinor_tt_head_correction``.  Its
+    value must not move the route -- a deck that asks for the hand TT
+    overlay inside this envelope is REFUSED by
+    :func:`refuse_unsupported_bispinor_gw` (the completion already carries
+    that head, so honouring both would double count it).
+    """
+    mode = coerce_bispinor_gw_mode(getattr(
+        config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if mode not in BARE_TRANSVERSE_MODES:
+        return False, f"bispinor_gw = {mode.value} is not a bare-transverse mode"
+    # SHORT-CIRCUIT before the table below: its rows format their own ``got``
+    # strings eagerly, and a scalar deck must not have ``compute_mode`` (a
+    # resolving property that can itself refuse) touched by this predicate.
+    if not bool(config.bispinor):
+        return False, "bispinor = false (no transverse channels to pack)"
+    conditions = (
+        (config.compute_mode is ComputeMode.COHSEX,
+         f"compute_mode = {config.compute_mode.value}", "compute_mode = cohsex"),
+        (config.qp_solver is QPSolver.ONE_SHOT_DFT,
+         f"qp_solver = {config.qp_solver.value}", "qp_solver = one_shot_dft"),
+        (config.screening.diagrams is ScreeningDiagrams.W_RPA,
+         f"screening_diagrams = {config.screening.diagrams.value}",
+         "screening_diagrams = w_rpa"),
+        (int(config.sys_dim) == 2, f"sys_dim = {config.sys_dim}", "sys_dim = 2"),
+        (config.head.correction in (HeadCorrection.FULL, HeadCorrection.OFF),
+         f"head_correction = {config.head.correction.value}",
+         "head_correction = full (the default) or off"),
+        (not bool(config.restart), "restart = true", "restart = false"),
+    )
+    for accepted, got, want in conditions:
+        if not accepted:
+            return False, f"{got} (the packed bare route wants {want})"
+    return True, "bispinor slab one-shot static COHSEX"
+
+
+def packed_photon_screens_current(config) -> bool:
+    """Whether the packed response builds and screens the current blocks.
+
+    The ONE selector between the two packed static modes.  ``True`` for
+    ``full_static_cohsex``: sixteen ``chi`` blocks and one packed Dyson
+    solve.  ``False`` for the bare-transverse family on the packed route:
+    ``chi_TT = chi_CT = 0``, so the packed solve is skipped and the CC
+    block alone is screened by the incumbent scalar owner.
+    """
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     return mode is BispinorGWMode.FULL_STATIC_COHSEX
 
 
+def uses_static_photon_response(config) -> bool:
+    """Whether screening and Sigma use the packed 4x4 photon response.
+
+    Both packed static modes: ``full_static_cohsex`` always, and the
+    bare-transverse family inside :func:`packed_bare_transverse_route`'s
+    envelope.  :func:`packed_photon_screens_current` says which.
+    """
+    mode = coerce_bispinor_gw_mode(getattr(
+        config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if mode is BispinorGWMode.FULL_STATIC_COHSEX:
+        return True
+    return packed_bare_transverse_route(config)[0]
+
+
 def uses_coupled_photon_head(config) -> bool:
     """Whether the packed photon response runs its Gamma-cell completion.
 
-    True for the packed mode under ``head_correction = full`` (the default;
-    the completion needs the four literal-Gamma channel vectors, which
-    ``gw_init`` retains only when this is true).  False under the DEBUG
-    setting ``head_correction = off``, where the packed V/W keep a zero
-    q=Gamma, G=0 slot.  No third value exists: the envelope refuses
-    ``no_local_fields`` for this mode.
+    True for either packed static mode under ``head_correction = full``
+    (the default; the completion needs the four literal-Gamma channel
+    vectors, which ``gw_init`` retains only when this is true).  False
+    under the DEBUG setting ``head_correction = off``, where the packed
+    V/W keep a zero q=Gamma, G=0 slot.  No third value reaches here:
+    ``full_static_cohsex`` refuses ``no_local_fields`` in its envelope,
+    and a ``no_local_fields`` bare-transverse deck never takes the packed
+    route at all (:func:`packed_bare_transverse_route`).
     """
     return (uses_static_photon_response(config)
             and config.head.correction is HeadCorrection.FULL)
@@ -3591,6 +3681,36 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"density_self_consistent = {bool(config.density_self_consistent)}\n"
             "  want: density_self_consistent = true (or "
             "qp_solver = one_shot_dft)")
+    if mode in BARE_TRANSVERSE_MODES:
+        # The packed bare route inserts the bare <D_TT> q=Gamma head through
+        # the SAME Gamma-cell completion that carries the charge head, so the
+        # hand overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
+        # (gw.v_q_bispinor._tt_head_tensor) would be counted twice.  Refuse
+        # rather than let the key move the route: which route runs must not
+        # depend on a head dial (docs/input_reference.md, bispinor_gw).
+        route_taken, _route_reason = packed_bare_transverse_route(config)
+        if route_taken and bool(config.head.bispinor_tt_head_correction):
+            raise ValueError(
+                "GATE packed_bare_transverse_tt_head_double_count: "
+                f"bispinor_gw = {mode.value} is refused with "
+                "bispinor_tt_head_correction = true inside the packed "
+                "static-photon envelope.\n"
+                "  got:  bispinor_tt_head_correction = true, "
+                f"bispinor = true, compute_mode = "
+                f"{config.compute_mode.value}, sys_dim = {config.sys_dim}, "
+                f"head_correction = {config.head.correction.value}, "
+                f"qp_solver = {config.qp_solver.value}\n"
+                "  want: bispinor_tt_head_correction = false\n"
+                "  why:  this deck routes through the packed static photon "
+                "operator, whose Gamma-cell completion already inserts the "
+                "bare <D_TT> = -<v P^T> head into the TT blocks of V (and, "
+                "unscreened, of W).  The overlay writes the same quantity "
+                "into the q=Gamma, G=0 slot of the TT V tiles, so keeping "
+                "both would double count it.\n"
+                "  fix:  set bispinor_tt_head_correction = false; the TT "
+                "head is now on by default with the charge head\n"
+                "  doc:  docs/input_reference.md, "
+                "bispinor_tt_head_correction.")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if not bool(config.bispinor):

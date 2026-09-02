@@ -99,7 +99,8 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver,
-	ScreeningDiagrams, refuse_unimplemented_compute_mode,
+	ScreeningDiagrams, packed_bare_transverse_route,
+	packed_photon_screens_current, refuse_unimplemented_compute_mode,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
@@ -313,6 +314,28 @@ def main(argv=None):
 		print0(
 			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
 			f"{_bispinor_note}")
+		# Which route a bare-transverse deck takes is deck-visible, never
+		# silent: the packed path and the incumbent charge-screened + Sigma^B
+		# path are the SAME physics inside the envelope below (lane C gate,
+		# reports/bisp_c_bare_as_packed_2026-09-01), but they differ in the
+		# q->0 head mechanism, so the reader must be told which one ran and,
+		# when it is the incumbent one, the first condition that decided it.
+		_bare_taken, _bare_reason = packed_bare_transverse_route(config)
+		if config.bispinor_gw.value != "full_static_cohsex":
+			# In production mode print0 sinks component chatter, so this goes
+			# into the RUN RECORD: which of two physically equivalent-inside-
+			# the-envelope routes ran is exactly the fact a later reader needs
+			# (they differ in the q->0 head mechanism).
+			report.progress(
+				"Photon route   : "
+				+ ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
+				   "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
+				   "completion carries both the charge head and the bare "
+				   f"<D_TT>) -- {_bare_reason}"
+				   if _bare_taken else
+				   "incumbent charge-screened W + Sigma^B "
+				   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
+				   f"head -- {_bare_reason}"))
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -641,10 +664,37 @@ def main(argv=None):
 						"static packed-photon screening requires the transverse "
 						"wavefunction "
 						"bundle and v_q_bispinor.h5; refusing a charge-only W.")
+				# ONE selector, resolved in gw_config: full_static_cohsex screens
+				# all sixteen blocks inside the packed Dyson solve; the
+				# bare-transverse family declares chi_TT = chi_CT = 0 and screens
+				# only CC, whose owner is the incumbent scalar screening model.
+				_screens_current = packed_photon_screens_current(config)
+				_W_charge = None
+				if not _screens_current:
+					W_by_role = compute_screening_model(
+						mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+						centroid_indices=centroid_indices, config=config,
+						meta=meta, mesh_xy=mesh_xy,
+						run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
+						label="oneshot", head_resolver=head_resolver,
+						head_channel=getattr(isdf, 'head_channel', None),
+						mpa_plan=oneshot_mpa_plan,
+						iteration_head_response=oneshot_head_response,
+						tensors_filename=tensors_filename,
+						static_only=True,
+						print_fn=print0)
+					_W_charge = W_by_role.get("static")
+					if _W_charge is None:
+						raise RuntimeError(
+							"the packed bare-transverse route needs the incumbent "
+							"static W(omega=0) on the charge block; the screening "
+							"model returned no 'static' role.")
 				from .w_isdf import compute_static_photon_response
 				photon_response = compute_static_photon_response(
 					wfns, wfns_transverse, quad, bispinor_v_q_path,
 					meta, mesh_xy,
+					screen_current=_screens_current,
+					W_charge=_W_charge,
 					wfn=wfn, config=config,
 					photon_g0_vectors=isdf.photon_g0_vectors,
 					wf_binding_charge=isdf.wf_binding_charge,
@@ -657,7 +707,14 @@ def main(argv=None):
 					print_fn=print0)
 				# Sigma consumes packed block views directly.  Do not extract a
 				# scalar W00 body solely to satisfy the legacy role mapping.
+				_W_charge = None
 				W_by_role = {}
+				print0(
+					"  static photon route: "
+					+ ("full_static_cohsex (sixteen chi blocks, one packed "
+					   "Dyson solve)" if _screens_current else
+					   "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
+					   "scalar Dyson on CC, W_packed = diag(W_00, D_TT))"))
 				print0(
 					"  static photon response: "
 					f"approximation={photon_response.approximation}, "

@@ -222,6 +222,125 @@ def test_tt_head_tensor_matches_measured_slab_reference_ratio():
 
 
 # ---------------------------------------------------------------------------
+# 5-8: the PACKED route's transverse head.  Same physical quantity, different
+# owner: on the packed bare-transverse route the TT q=Gamma head is not this
+# overlay at all -- it is the ``<D_TT>`` half of the bare ``<D>`` that
+# ``gw.head_correction.complete_static_slab_photon_q0`` inserts, from vcoul's
+# EXACT Wigner-Seitz Duffy--Gauss polygon rule rather than the Sobol Voronoi
+# draw above.  These pin that owner against the same analytic identities, so
+# a regression in either owner is visible without comparing them to each
+# other (a path-vs-path comparison cannot establish an invariance both paths
+# share -- TASTE.md 2026-08-15).
+# ---------------------------------------------------------------------------
+
+
+def _photon_cubature_chunk():
+    """The finest chunk of the provider-issued slab photon cubature."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from vcoul import (CoulombGeometry, get_kernel,
+                       slab_minibz_photon_cubature)
+
+    geometry = CoulombGeometry(bvec=_BVEC, cell_volume=_CELL_VOLUME)
+    receipt = slab_minibz_photon_cubature(get_kernel(2), geometry, _KGRID)
+    chunk = receipt.chunks[-1]
+    weight = np.asarray(chunk.sample_weight, dtype=np.float64)
+    measure = float(np.sum(weight[: int(chunk.physical_count)]))
+    assert measure > 0.0
+    return chunk, weight, measure
+
+
+def _zero_S():
+    return np.zeros((2, 2, 4, 4), dtype=np.complex128)
+
+
+def _moment_solve(chunk, weight, S):
+    """Run the production coupled-head kernel on one cubature chunk."""
+    from gw.head_correction import static_slab_photon_head_moment_chunk
+
+    moments, D_sum, *_ = static_slab_photon_head_moment_chunk(
+        chunk.q_cart, chunk.D_raw, np.zeros(3, dtype=np.float64),
+        np.asarray(S, dtype=np.complex128),
+        int(chunk.physical_count), weight)
+    return np.asarray(moments), np.asarray(D_sum)
+
+
+def test_packed_completion_bare_D_TT_is_the_transverse_projector_average():
+    """``<D>``'s TT block is ``-<v P^T>``, checked by three identities that
+    hold for ANY slab cell plus one that needs in-plane isotropy.
+
+    ``P^T_ab(qhat) = delta_ab - qhat_a qhat_b`` with ``qhat`` in-plane, so
+    per sample and hence under any positive weight:
+
+      * ``P^T_zz = 1`` exactly  -> ``<D>_zz = -<v>``;
+      * ``tr P^T = 3 - |qhat|^2 = 2`` exactly -> ``tr <D>_TT = -2 <v>``;
+      * ``P^T_xz = P^T_yz = 0``  -> those entries vanish;
+      * CT/TC vanish by Coulomb gauge at every q.
+
+    None can be satisfied by a wrong sign, a transposed index or a missing
+    volume factor, and the first three are cell-shape independent -- the
+    isotropic ``diag(1/2, 1/2, 1)`` split is the only one that is not.
+    """
+    chunk, weight, measure = _photon_cubature_chunk()
+    _, D_sum = _moment_solve(chunk, weight, _zero_S())
+    D_mean = D_sum / measure
+    v_mean = complex(D_mean[0, 0])
+    assert v_mean.real > 0.0 and abs(v_mean.imag) < 1e-14
+
+    np.testing.assert_allclose(D_mean[0, 1:], 0.0, atol=1e-14)
+    np.testing.assert_allclose(D_mean[1:, 0], 0.0, atol=1e-14)
+    np.testing.assert_allclose(
+        D_mean[3, 3].real, -v_mean.real, rtol=1e-12)
+    np.testing.assert_allclose(
+        np.trace(D_mean[1:, 1:]).real, -2.0 * v_mean.real, rtol=1e-12)
+    np.testing.assert_allclose(D_mean[1, 3], 0.0, atol=1e-13 * v_mean.real)
+    np.testing.assert_allclose(D_mean[2, 3], 0.0, atol=1e-13 * v_mean.real)
+    # In-plane-isotropic (square) synthetic cell: the exact WS polygon rule
+    # reproduces the same diag(1/2, 1/2, 1) shape the Sobol overlay above
+    # measures, on a rule that shares no sampler with it.
+    ratio = np.real(np.diag(D_mean[1:, 1:])) / v_mean.real
+    np.testing.assert_allclose(ratio, [-0.5, -0.5, -1.0], atol=5e-3)
+
+
+def test_packed_completion_charge_only_R_returns_diag_W00_and_bare_D_TT():
+    """THE identity the packed bare-transverse route rests on.
+
+    With ``chi_TT = chi_CT = 0`` the response entering the completion has
+    charge support only, so ``R(q) = q_a q_b S^{00}_{ab} e_0 e_0^T`` and
+
+        ``W_h = [I - D R]^-1 D = diag(v/(1 - r v), D_TT)``
+
+    exactly, because ``D`` is block diagonal and ``D e_0 = v e_0``.  The TT
+    block therefore comes out of the completion BARE -- which is what makes
+    ``SX(W_TT) = X(V_TT) = Sigma^B`` and puts ``<D_TT>`` into both V and W.
+
+    SENSITIVITY: the CC assertion at the end is the control.  It fails if
+    ``S`` never acted, so this test cannot pass by the solve being a no-op.
+    """
+    chunk, weight, measure = _photon_cubature_chunk()
+    moments_bare, D_sum = _moment_solve(chunk, weight, _zero_S())
+    S = _zero_S()
+    S[0, 0, 0, 0] = 3.0        # charge support only: q_x q_x S^{00}_xx
+    S[1, 1, 0, 0] = 3.0
+    moments, _ = _moment_solve(chunk, weight, S)
+
+    W = moments[0, 0] / measure
+    D_mean = D_sum / measure
+    # TT block untouched by the charge-only screening, to solver precision.
+    np.testing.assert_allclose(
+        W[1:, 1:], D_mean[1:, 1:], rtol=1e-12,
+        atol=1e-12 * abs(D_mean[0, 0]))
+    # No CT/TC block is generated.
+    np.testing.assert_allclose(W[0, 1:], 0.0, atol=1e-13 * abs(D_mean[0, 0]))
+    np.testing.assert_allclose(W[1:, 0], 0.0, atol=1e-13 * abs(D_mean[0, 0]))
+    # CONTROL: the charge head IS screened, so the CC entry must move.
+    assert abs(W[0, 0]) < 0.9 * abs(D_mean[0, 0])
+    np.testing.assert_allclose(
+        moments_bare[0, 0] / measure, D_mean, rtol=1e-12,
+        atol=1e-12 * abs(D_mean[0, 0]))
+
+
+# ---------------------------------------------------------------------------
 # Refusal envelope (parse time), mirroring test_low_mem_bands_envelope.py
 # ---------------------------------------------------------------------------
 
@@ -319,3 +438,96 @@ def test_refusal_doc_pointer_names_a_section_that_actually_exists(tmp_path):
     assert cited_section in headings, (
         f"refusal cites {cited_section!r}, which is not a heading in "
         f"docs/input_reference.md (have: {sorted(headings)})")
+
+
+# ---------------------------------------------------------------------------
+# The packed bare-transverse route owns the TT head, so the overlay is
+# refused there rather than silently added on top of it.
+# ---------------------------------------------------------------------------
+
+_PACKED_BARE_DECK = """\
+bispinor = true
+bispinor_gw = bare_transverse
+sys_dim = 2
+compute_mode = cohsex
+qp_solver = one_shot_dft
+low_mem_bands = true
+w_dyson_solver = distributed
+restart = false
+head_correction = full
+"""
+
+
+def test_packed_bare_route_refuses_the_hand_tt_overlay(tmp_path):
+    with pytest.raises(ValueError) as exc:
+        _config(
+            tmp_path,
+            _PACKED_BARE_DECK + "bispinor_tt_head_correction = true\n",
+            name="packed_bare_overlay.in")
+    message = str(exc.value)
+    assert "packed_bare_transverse_tt_head_double_count" in message
+    for part in ("got:", "want:", "why:", "fix:", "doc:"):
+        assert part in message, f"refusal is missing '{part}'"
+
+
+def test_packed_bare_route_accepts_the_default_and_takes_the_packed_path(
+        tmp_path):
+    from gw.gw_config import (packed_bare_transverse_route,
+                              packed_photon_screens_current,
+                              uses_static_photon_response)
+    cfg = _config(tmp_path, _PACKED_BARE_DECK, name="packed_bare_ok.in")
+    taken, reason = packed_bare_transverse_route(cfg)
+    assert taken, reason
+    assert uses_static_photon_response(cfg)
+    assert not packed_photon_screens_current(cfg)
+    assert cfg.head.bispinor_tt_head_correction is False
+
+
+def test_outside_the_packed_envelope_the_overlay_is_still_accepted(tmp_path):
+    """The incumbent route keeps the overlay: it is its ONLY TT head.
+
+    A bulk (sys_dim = 3) bispinor COHSEX deck is outside the slab
+    completion's envelope, so it must still parse with the overlay on --
+    otherwise this change would delete a capability rather than move it.
+    """
+    from gw.gw_config import (packed_bare_transverse_route,
+                              uses_static_photon_response)
+    cfg = _config(
+        tmp_path,
+        _PACKED_BARE_DECK.replace("sys_dim = 2", "sys_dim = 3")
+        + "bispinor_tt_head_correction = true\n",
+        name="bulk_bare_overlay.in")
+    taken, reason = packed_bare_transverse_route(cfg)
+    assert not taken
+    assert "sys_dim = 3" in reason
+    assert not uses_static_photon_response(cfg)
+    assert cfg.head.bispinor_tt_head_correction is True
+
+
+# ---------------------------------------------------------------------------
+# In-band import canary.  `lx run` can resolve `src/` and, separately,
+# `services/*/src` to the BASE MODULE's checkout rather than the one under
+# test (KNOWN_SANDBOX_ERRORS.md, four 2026-09-01 rows).  `lx test` has not
+# been observed to do it, but "not observed" is not a gate, and a suite that
+# silently graded another tree would look exactly like a passing suite.
+# The failing case is reachable: force lorrax_A's roots onto sys.path ahead
+# of this tree and the same predicate reports offenders (lane E measured it,
+# step lx-Xg1-192850-1967865-4443).
+# ---------------------------------------------------------------------------
+
+
+def test_this_file_grades_the_checkout_it_lives_in():
+    import importlib
+    import gw
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for name in ("gw.gw_config", "gw.w_isdf", "gw.head_correction",
+                 "gw.v_q_bispinor", "vcoul", "vcoul.minibz"):
+        module = importlib.import_module(name)
+        origin = pathlib.Path(module.__file__).resolve()
+        if repo not in origin.parents:
+            offenders.append(f"{name} -> {origin}")
+    assert not offenders, (
+        f"these modules came from outside {repo}: " + "; ".join(offenders))
+    assert pathlib.Path(gw.__file__).resolve().parents[1] == repo / "src"
