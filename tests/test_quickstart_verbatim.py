@@ -60,6 +60,15 @@ WHAT THIS FILE DOES **NOT** CHECK — read this before citing it
   ships its own pseudopotentials, so it is the only one whose artifacts can
   be regenerated from a clean checkout; nothing here covers ``gnppm``,
   ``bispinor``, Si or hBN.
+
+One cell here is not about the quickstart at all —
+``test_this_suite_imports_the_checkout_it_lives_in``.  It belongs in whatever
+file runs first, and this one is cheap.  ``bin/lx`` records why: a run whose
+``PYTHONPATH`` resolves to the base module's checkout instead of the one it
+announces produces numbers about the wrong tree and says nothing, and an agent
+once "measured" a 128-passed delta on both legs of an A/B while testing
+NEITHER branch.  Lane F measured that exact resolution failure on 2026-09-01,
+so the canary is now a cell rather than a habit.
 """
 
 import re
@@ -159,3 +168,34 @@ def test_the_docs_still_name_the_deck_this_file_runs(page):
     assert deck_path, "the invocation constant lost its -i argument"
     assert (REPO_ROOT / deck_path.group(1)).is_file(), (
         f"{page} points at {deck_path.group(1)}, which does not exist")
+
+
+def test_this_suite_imports_the_checkout_it_lives_in():
+    """The canary: is pytest testing THIS tree, or the base module's?
+
+    ``lx`` announces ``source tree: <LORRAX_CHECKOUT>/src`` and then rewrites
+    ``PYTHONPATH``, but the announcement is not the measurement — lane F
+    measured a payload importing ``lorrax_A`` under a correct-looking banner on
+    2026-09-01.  Every driver and service this suite touches must resolve
+    under ``REPO_ROOT``, or every number in the session is about another tree.
+
+    Cheap, no GPU, no marker: it should run in every selection.
+    """
+    import importlib
+
+    offenders = []
+    for name in ("gw.gw_jax", "psp.get_dipole_mtxels", "centroid.kmeans_cli",
+                 "wfn_loader", "symmetry_maps"):
+        try:
+            mod = importlib.import_module(name)
+        except ImportError as exc:            # a service may not be staged
+            offenders.append(f"{name}: not importable ({exc})")
+            continue
+        path = Path(getattr(mod, "__file__", "") or "")
+        if REPO_ROOT not in path.parents:
+            offenders.append(f"{name} -> {path}")
+    assert not offenders, (
+        "this pytest session is importing code from OUTSIDE the checkout it "
+        f"lives in ({REPO_ROOT}):\n  " + "\n  ".join(offenders) +
+        "\nEvery result in this session is about another tree.  Pin "
+        "PYTHONPATH to <checkout>/src plus <checkout>/services/*/src.")
