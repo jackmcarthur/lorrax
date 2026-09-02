@@ -14,9 +14,14 @@ def resolve_input_paths(params: dict, input_dir: str) -> dict:
 	Returns:
 		params with resolved paths
 	"""
+	# ONE join rule, the one :func:`resolve_input_path` below already
+	# states: an EMPTY optional path stays empty.  Joining "" onto the deck
+	# directory yields the DIRECTORY, which ``os.path.exists`` then reports
+	# as present -- exactly how an unset ``static_gauge_hall_file`` (empty
+	# by default since 2026-09-01) would have looked like a Hall artifact.
 	def _resolve_path(path: str) -> str:
-		return path if os.path.isabs(path) else os.path.join(input_dir, path)
-	
+		return resolve_input_path(input_dir, path)
+
 	path_keys = [
 		"wfn_file", "centroids_file", "kin_ion_file",
 		"parallel_transport_file", "static_gauge_hall_file",

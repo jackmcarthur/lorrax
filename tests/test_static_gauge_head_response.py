@@ -350,7 +350,15 @@ def test_packed_deck_off_head_is_an_announced_debug_skip(tmp_path):
 
 
 def test_packed_deck_refuses_no_local_fields(tmp_path):
-    with pytest.raises(ValueError, match="static_bispinor_photon_envelope"):
+    """Refused for EVERY bispinor deck now, not only the packed envelope.
+
+    The gate moved up (2026-09-01): ``no_local_fields`` is a scalar
+    diagnostic, and on the bare-transverse route it also silently moved a
+    deck off the packed path -- a head dial choosing a route.
+    """
+    with pytest.raises(
+            ValueError,
+            match="bispinor_head_correction_no_local_fields_unavailable"):
         _parse(tmp_path,
                _packed_deck(extra="head_correction = no_local_fields\n"))
 

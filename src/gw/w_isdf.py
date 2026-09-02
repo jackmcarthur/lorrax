@@ -2162,7 +2162,7 @@ def compute_static_photon_response(
     ``Photon head`` record line from the returned ``head_completion``.
     """
     from .gw_config import (
-        BARE_TRANSVERSE_MODES, BispinorGWMode, HeadCorrection,
+        BispinorGWMode, HeadCorrection,
         coerce_bispinor_gw_mode, packed_bare_transverse_route,
         packed_photon_screens_current)
     from .photon_layout import (
@@ -2196,10 +2196,10 @@ def compute_static_photon_response(
             "gw_config.packed_photon_screens_current and must not be "
             "restated at the call site")
     if not screen_current:
-        if photon_mode not in BARE_TRANSVERSE_MODES:
+        if photon_mode is not BispinorGWMode.BARE_TRANSVERSE:
             raise ValueError(
-                "the unscreened-current packed route serves only the "
-                f"bare-transverse family; got {photon_mode.value!r}")
+                "the unscreened-current packed route serves only "
+                f"bare_transverse; got {photon_mode.value!r}")
         route_taken, route_reason = packed_bare_transverse_route(config)
         if not route_taken:
             raise ValueError(
@@ -2237,14 +2237,34 @@ def compute_static_photon_response(
                 raise ValueError(
                     f"packed static photon {role} wavefunction binding does "
                     "not name the supplied carrier")
-        hall_path = str(config.paths.static_gauge_hall_file)
+        # ``static_gauge_hall_file`` defaults to EMPTY: unnamed means "no
+        # Hall term", and a NAMED path that does not exist is a typo or a
+        # missing preprocessing step, not a request for sigma_H = 0.  The
+        # two used to be the same answer (lane B's open item, lane J
+        # section 2 item 9).
+        hall_path = str(config.paths.static_gauge_hall_file).strip()
+        hall_named = bool(hall_path)
+        if hall_named and not os.path.exists(hall_path):
+            raise ValueError(
+                "GATE static_gauge_hall_file_missing: the deck names a "
+                f"Hall artifact that does not exist ({hall_path}).\n"
+                f"  got:  static_gauge_hall_file = {hall_path} (absent)\n"
+                "  want: the file, produced by get_dipole_mtxels "
+                "--static-gauge-hall-only --static-gauge-hall-out, or an "
+                "UNSET static_gauge_hall_file (the default) for sigma_H = 0\n"
+                "  why:  IMPLEMENTATION.  The key is optional, so an "
+                "unnamed one means 'no Hall term' and is announced.  A "
+                "named-but-absent one used to give the same silent "
+                "sigma_H = 0, which makes a mistyped path indistinguishable "
+                "from a deliberate Chern-trivial run.\n"
+                "  doc:  docs/input_reference.md, static_gauge_hall_file.")
         if not screen_current:
             # R(q) = q_a H_a(sigma_H) + q_a q_b S_ab with a nonzero Hall
             # term makes the coupled 4x4 solve return CT/TC blocks, i.e. a
             # screened charge-current coupling in the Gamma cell that this
             # route has at no other q.  Refuse rather than ignore a named
             # deck artifact (a parsed-but-ignored key is a defect).
-            if os.path.exists(hall_path):
+            if hall_named:
                 raise ValueError(
                     "GATE packed_bare_transverse_hall_unavailable: "
                     f"bispinor_gw = {photon_mode.value} is refused with a "
@@ -2265,7 +2285,7 @@ def compute_static_photon_response(
                     "bare-transverse route (no screened CT/TC channel to "
                     "carry it); sigma_H = 0",
                     flush=True)
-        elif os.path.exists(hall_path):
+        elif hall_named:
             # A present artifact must authenticate (WFN identity, band
             # manifold, nk); a stale one refuses inside the loader rather
             # than silently degrading to sigma_H = 0.
@@ -2289,9 +2309,9 @@ def compute_static_photon_response(
         elif jax.process_index() == 0:
             print_fn(
                 "  [photon head] Hall term: sigma_H = 0 (no "
-                f"static_gauge_hall_file at {hall_path}).  For a "
-                "Chern-trivial insulator the static Hall coefficient is "
-                "exactly zero; supply the artifact from get_dipole_mtxels "
+                "static_gauge_hall_file named).  For a Chern-trivial "
+                "insulator the static Hall coefficient is exactly zero; "
+                "supply the artifact from get_dipole_mtxels "
                 "--static-gauge-hall-only to include a measured value.",
                 flush=True)
     elif jax.process_index() == 0:

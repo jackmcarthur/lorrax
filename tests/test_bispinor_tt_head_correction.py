@@ -361,14 +361,44 @@ def _config(tmp_path, extra="", name="bispinor_tt_head.in"):
         str(path), print_fn=lambda *a, **k: None)
 
 
+def _with_overlay(cfg):
+    """Turn the overlay on the ONLY way that is still possible: by hand.
+
+    The deck key was removed on 2026-09-01 (heads are always on; the packed
+    Gamma-cell completion carries the TT head).  The field survives for the
+    incumbent non-packed route's V-tile builder, so the refusals below
+    still have to hold for a hand-built config -- which is precisely what
+    ``refuse_unsupported_bispinor_tt_head_correction``'s docstring now says
+    it guards.
+    """
+    import dataclasses
+    return dataclasses.replace(
+        cfg,
+        head=dataclasses.replace(
+            cfg.head, bispinor_tt_head_correction=True))
+
+
+def test_the_deck_key_is_tombstoned(tmp_path):
+    """The removed key refuses BY NAME and says what carries the head now."""
+    for value in ("true", "false"):
+        with pytest.raises(ValueError) as exc:
+            _config(tmp_path, f"bispinor_tt_head_correction = {value}\n")
+        message = str(exc.value)
+        assert "'bispinor_tt_head_correction' has been REMOVED" in message
+        assert "Gamma-cell" in message
+        assert "docs/input_reference.md" in message
+
+
 def test_default_is_off_and_never_refuses(tmp_path):
     cfg = _config(tmp_path)
     assert cfg.head.bispinor_tt_head_correction is False
 
 
 def test_refuses_without_bispinor(tmp_path):
+    from gw.gw_config import refuse_unsupported_bispinor_tt_head_correction
     with pytest.raises(ValueError) as exc:
-        _config(tmp_path, "bispinor_tt_head_correction = true\n")
+        refuse_unsupported_bispinor_tt_head_correction(
+            _with_overlay(_config(tmp_path)))
     message = str(exc.value)
     assert "bispinor_tt_head_unsupported" in message
     for part in ("got:", "want:", "fix:", "why:", "doc:"):
@@ -376,21 +406,21 @@ def test_refuses_without_bispinor(tmp_path):
 
 
 def test_refuses_sys_dim_zero(tmp_path):
+    from gw.gw_config import refuse_unsupported_bispinor_tt_head_correction
     with pytest.raises(ValueError) as exc:
-        _config(
-            tmp_path,
-            "bispinor = true\nbispinor_tt_head_correction = true\n"
-            "sys_dim = 0\n")
+        refuse_unsupported_bispinor_tt_head_correction(
+            _with_overlay(
+                _config(tmp_path, "bispinor = true\nsys_dim = 0\n")))
     assert "bispinor_tt_head_unsupported" in str(exc.value)
 
 
 def test_supported_combination_parses_without_refusing(tmp_path):
-    cfg = _config(
-        tmp_path,
-        "bispinor = true\nbispinor_tt_head_correction = true\n"
-        "sys_dim = 2\n")
+    from gw.gw_config import refuse_unsupported_bispinor_tt_head_correction
+    cfg = _with_overlay(
+        _config(tmp_path, "bispinor = true\nsys_dim = 2\n"))
     assert cfg.bispinor is True
     assert cfg.head.bispinor_tt_head_correction is True
+    refuse_unsupported_bispinor_tt_head_correction(cfg)   # no raise
 
 
 def test_bispinor_false_decks_are_untouched(tmp_path):
@@ -430,8 +460,10 @@ def test_refusal_doc_pointer_names_a_section_that_actually_exists(tmp_path):
         (repo / "docs" / "input_reference.md").read_text().splitlines()
         if line.startswith("## ")}
 
+    from gw.gw_config import refuse_unsupported_bispinor_tt_head_correction
     with pytest.raises(ValueError) as exc:
-        _config(tmp_path, "bispinor_tt_head_correction = true\n")
+        refuse_unsupported_bispinor_tt_head_correction(
+            _with_overlay(_config(tmp_path)))
     message = str(exc.value)
     doc_line = next(ln for ln in message.splitlines() if ln.strip().startswith("doc:"))
     cited_section = doc_line.split("'")[1]
@@ -459,11 +491,12 @@ head_correction = full
 
 
 def test_packed_bare_route_refuses_the_hand_tt_overlay(tmp_path):
+    from gw.gw_config import refuse_unsupported_bispinor_gw
     with pytest.raises(ValueError) as exc:
-        _config(
-            tmp_path,
-            _PACKED_BARE_DECK + "bispinor_tt_head_correction = true\n",
-            name="packed_bare_overlay.in")
+        refuse_unsupported_bispinor_gw(
+            _with_overlay(
+                _config(tmp_path, _PACKED_BARE_DECK,
+                        name="packed_bare_overlay.in")))
     message = str(exc.value)
     assert "packed_bare_transverse_tt_head_double_count" in message
     for part in ("got:", "want:", "why:", "fix:", "doc:"):
@@ -491,12 +524,13 @@ def test_outside_the_packed_envelope_the_overlay_is_still_accepted(tmp_path):
     otherwise this change would delete a capability rather than move it.
     """
     from gw.gw_config import (packed_bare_transverse_route,
+                              refuse_unsupported_bispinor_gw,
                               uses_static_photon_response)
-    cfg = _config(
+    cfg = _with_overlay(_config(
         tmp_path,
-        _PACKED_BARE_DECK.replace("sys_dim = 2", "sys_dim = 3")
-        + "bispinor_tt_head_correction = true\n",
-        name="bulk_bare_overlay.in")
+        _PACKED_BARE_DECK.replace("sys_dim = 2", "sys_dim = 3"),
+        name="bulk_bare_overlay.in"))
+    refuse_unsupported_bispinor_gw(cfg)     # no double-count refusal here
     taken, reason = packed_bare_transverse_route(cfg)
     assert not taken
     assert "sys_dim = 3" in reason

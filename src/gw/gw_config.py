@@ -39,11 +39,7 @@ from pathlib import Path
 import numpy as np
 
 from common.units import RYD_TO_EV
-from common.four_current_model import (
-    ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
-    PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
-    resolve_four_current_representation,
-)
+from common.four_current_model import resolve_four_current_representation
 
 # The estimator vocabulary lives with the estimators, not here: a second copy
 # of the value list is a second thing to keep in step.  ``band_extrapolation``
@@ -298,6 +294,16 @@ class BispinorGWMode(str, enum.Enum):
     and contracted.  ``bare_transverse`` is the historical charge-screened +
     bare-TT behavior and remains the default.
 
+    TWO VALUES, and that is the whole grammar (owner ruling 2026-09-01,
+    ``docs/architecture/decisions.md``; lane J's dial review,
+    ``reports/bisp_j_architecture_review_2026-09-01/report.md`` section 2).
+    The three retired spellings -- ``charge_hall_cubature`` and the two
+    carrier-comparison modes ``pauli_reference_bare_transverse`` and
+    ``isometric_kinetic_balance_bare_transverse`` -- are refused BY NAME in
+    :func:`coerce_bispinor_gw_mode`, never aliased: a mode value is the one
+    thing in the grammar that decides which physics runs, so a stale deck
+    must stop, not be silently re-pointed.
+
     ``full_static_cohsex`` is the ONE packed static mode: the sixteen-block
     no-pair photon body, screened once at omega=0 under ``compute_mode =
     cohsex``, plus the Gamma-cell completion (bare ``<D>`` into V, the charge
@@ -309,13 +315,39 @@ class BispinorGWMode(str, enum.Enum):
     """
 
     BARE_TRANSVERSE = "bare_transverse"
-    PAULI_REFERENCE_BARE_TRANSVERSE = PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
-    ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE = (
-        ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
     FULL_STATIC_COHSEX = "full_static_cohsex"
 
 
-_RETIRED_CHARGE_HALL_CUBATURE_MODE = "charge_hall_cubature"
+#: Retired ``bispinor_gw`` spellings: {value: (gate id, want, why)}.  ONE
+#: table so a retired value cannot be refused in one message shape here and
+#: another one three releases later.
+_RETIRED_BISPINOR_GW_MODES: dict[str, tuple[str, str, str]] = {
+    "charge_hall_cubature": (
+        "bispinor_gw_charge_hall_cubature_retired",
+        "bispinor_gw = full_static_cohsex",
+        "the packed static COHSEX mode always runs the Gamma-cell "
+        "completion this spelling used to select (bare <D> into V, the "
+        "charge S00/wing head into W); the Hall CT/TC term is taken from "
+        "static_gauge_hall_file when that artifact exists and is "
+        "sigma_H = 0 otherwise (owner ruling 2026-09-01)"),
+    "pauli_reference_bare_transverse": (
+        "bispinor_gw_pauli_reference_retired",
+        "bispinor_gw = bare_transverse",
+        "this was a carrier-comparison mode, not a physics mode: it kept "
+        "the normalized QE Pauli two-spinor for charge/CC while the "
+        "current vertices stayed raw kinetic balance, and it could never "
+        "restart or write restart tensors.  The shipped grammar has two "
+        "values, both on the raw kinetic-balance carrier; a carrier study "
+        "belongs in a branch, not in the deck grammar (lane J section 2)"),
+    "isometric_kinetic_balance_bare_transverse": (
+        "bispinor_gw_isometric_kinetic_balance_retired",
+        "bispinor_gw = bare_transverse",
+        "this was a carrier-comparison mode whose own scalar q->0 head was "
+        "the two-spinor artifact -- a mode that admits its own head is not "
+        "a calculation.  The isometric lift itself remains library code "
+        "(common.bispinor_init.kinetic_balance_lift_jet) for the jet tests "
+        "that own it (lane J section 2)"),
+}
 
 
 def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
@@ -323,17 +355,14 @@ def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
         return value
     raw = getattr(value, "value", value)
     spelling = str(raw).strip().lower()
-    if spelling == _RETIRED_CHARGE_HALL_CUBATURE_MODE:
+    retired = _RETIRED_BISPINOR_GW_MODES.get(spelling)
+    if retired is not None:
+        gate, want, why = retired
         raise ValueError(
-            "GATE bispinor_gw_charge_hall_cubature_retired: "
-            "bispinor_gw = charge_hall_cubature no longer exists.\n"
-            "  got:  bispinor_gw = charge_hall_cubature\n"
-            "  want: bispinor_gw = full_static_cohsex\n"
-            "  why:  the packed static COHSEX mode always runs the "
-            "Gamma-cell completion this spelling used to select (bare <D> "
-            "into V, the charge S00/wing head into W); the Hall CT/TC term "
-            "is taken from static_gauge_hall_file when that artifact exists "
-            "and is sigma_H = 0 otherwise (owner ruling 2026-09-01).\n"
+            f"GATE {gate}: bispinor_gw = {spelling} no longer exists.\n"
+            f"  got:  bispinor_gw = {spelling}\n"
+            f"  want: {want}\n"
+            f"  why:  {why}.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
     try:
         return BispinorGWMode(spelling)
@@ -1486,7 +1515,14 @@ _DEFAULTS = {
     # p-matrix velocity stage only, without the links.
     "sc_head_update": "off",       # off | parallel_transport | dft_velocity
     "parallel_transport_file": "parallel_transport.h5",
-    "static_gauge_hall_file": "static_gauge_hall.h5",
+    # Optional Hall (Chern-Simons) artifact for the packed static photon
+    # Gamma-cell completion.  EMPTY BY DEFAULT (lane J section 2, item 9):
+    # a default that names a file cannot tell "the deck asked for no Hall
+    # term" from "the deck asked for one and mistyped the path", and the
+    # consumer used to answer both with sigma_H = 0.  Unnamed -> sigma_H = 0,
+    # announced (exact for a Chern-trivial insulator).  Named but absent ->
+    # REFUSED at gw.w_isdf.compute_static_photon_response.
+    "static_gauge_hall_file": "",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -1991,21 +2027,6 @@ _DEFAULTS = {
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
     # Bispinor TT (transverse-transverse) q=Γ, G=0 mini-BZ head correction.
-    # False (default): the bare TT tiles' q=Γ, G=0 slot stays zero (the
-    # transverse projector P^T_ij(q̂) has no
-    # limit as q→0, so a naive point evaluation is undefined there and the
-    # shipped code leaves it at zero rather than guess).  True replaces
-    # that slot with the Coulomb-gauge spatial block
-    # −⟨v(q) P^T_ij(q̂)⟩_mBZ
-    # (vcoul.{slab_2d,bulk_3d}.*.q0_average_transverse_tensor) — the
-    # current-current analogue of the charge channel's ⟨v⟩ head, needed
-    # because the current structure factor ⟨m|α^i|n⟩ does NOT collapse to
-    # δ_mn the way the charge one does.  Only meaningful under
-    # bispinor=true; requires sys_dim in (2, 3) (box truncation's q=Γ,
-    # G=0 slot is already finite and needs no substitute).  See
-    # docs/BISPINOR_DHFB_DESIGN.md §11 and
-    # gw.v_q_bispinor._make_per_q_v_builder_for_tile's docstring.
-    "bispinor_tt_head_correction": False,
     # Singular Gamma-cell policy.  ``full`` is the shipping macroscopic W
     # head (microscopic local fields folded exactly once); the other two are
     # convergence/diagnostic arms, not alternative diagram sets.
@@ -2395,6 +2416,9 @@ _LEGACY_DECK_KEYS = frozenset({
     "use_ffi_io",                   # refused (one transport now)
     "gspace_mode",                  # refused (one ψ(G) lifecycle now)
     "hartree_source",               # refused (live G-space is the only path)
+    # 2026-09-01: the transverse Gamma head is carried by the packed
+    # Gamma-cell completion, and heads are always on -- refused by name.
+    "bispinor_tt_head_correction",
     # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
     # keeps its dedicated parse refusal; other values warn-and-ignore.
@@ -3023,6 +3047,26 @@ def read_lorrax_input(filename: str) -> dict:
                 "r-chunk loop.  The former file_reread mode no longer "
                 "described a distinct execution path."
             )
+        if section.get(
+                "bispinor_tt_head_correction", fallback=None) is not None:
+            raise ValueError(
+                "Input key 'bispinor_tt_head_correction' has been REMOVED "
+                "and must be deleted from the deck (any value, including "
+                "the old default false).\n"
+                "  want: nothing -- the transverse q=Gamma, G=0 head is "
+                "carried by the packed static photon route's Gamma-cell "
+                "completion (bispinor_gw = bare_transverse or "
+                "full_static_cohsex, head_correction = full), which inserts "
+                "the same <D_TT> = -<v P^T> the overlay wrote.\n"
+                "  why:  heads are always on with bispinors (owner ruling "
+                "2026-09-01, docs/architecture/decisions.md; TASTE.md row "
+                "20), so a deck dial that turns one off is not a dial.  The "
+                "overlay code (gw.v_q_bispinor._tt_head_tensor) survives "
+                "only for the incumbent non-packed route, which is being "
+                "retired; nothing reads a deck value for it.\n"
+                "  doc:  docs/input_reference.md, bispinor_gw / "
+                "head_correction."
+            )
         if section.get("hartree_source", fallback=None) is not None:
             raise ValueError(
                 "Input key 'hartree_source' has been removed: Hartree is "
@@ -3552,16 +3596,6 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
-#: The bare-transverse family: charge-screened CC plus the BARE transverse
-#: propagator.  The three members differ only in the four-spinor carrier
-#: (the lift), never in the response path, so they route identically.
-BARE_TRANSVERSE_MODES: tuple[BispinorGWMode, ...] = (
-    BispinorGWMode.BARE_TRANSVERSE,
-    BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
-    BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE,
-)
-
-
 def packed_bare_transverse_route(config) -> tuple[bool, str]:
     """Is the bare-transverse family served by the packed photon path?
 
@@ -3592,8 +3626,8 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     """
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-    if mode not in BARE_TRANSVERSE_MODES:
-        return False, f"bispinor_gw = {mode.value} is not a bare-transverse mode"
+    if mode is not BispinorGWMode.BARE_TRANSVERSE:
+        return False, f"bispinor_gw = {mode.value} is not bare_transverse"
     # SHORT-CIRCUIT before the table below: its rows format their own ``got``
     # strings eagerly, and a scalar deck must not have ``compute_mode`` (a
     # resolving property that can itself refuse) touched by this predicate.
@@ -3664,9 +3698,32 @@ def uses_coupled_photon_head(config) -> bool:
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:
-    """Validate four-current modes and require live direct fields for QSGW."""
+    """Validate four-current modes and require live direct fields for QSGW.
+
+    ``head_correction`` has TWO values on a bispinor deck, ``full`` and
+    ``off`` (owner ruling 2026-09-01, ``docs/architecture/decisions.md``;
+    TASTE.md row 20).  The third scalar value is refused here for EVERY
+    bispinor deck, not just the packed ones -- see the gate below.
+    """
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if (bool(config.bispinor)
+            and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS):
+        raise ValueError(
+            "GATE bispinor_head_correction_no_local_fields_unavailable: "
+            "head_correction = no_local_fields is refused with "
+            "bispinor = true.\n"
+            "  got:  bispinor = true, head_correction = no_local_fields\n"
+            "  want: head_correction = full (the default), or off for a "
+            "DEBUG headless body\n"
+            "  why:  PHYSICS/POLICY.  no_local_fields names a SCALAR "
+            "diagnostic -- the direct epsilon head with the microscopic "
+            "local fields left unfolded.  The coupled 4x4 photon solve does "
+            "not produce it, and on the bare-transverse route the value "
+            "silently moved the deck off the packed path: a head dial must "
+            "never choose a route (lane J section 2/3.d).  Bispinor heads "
+            "are on by default and 'off' is the announced DEBUG skip.\n"
+            "  doc:  docs/input_reference.md, head_correction.")
     if (bool(config.bispinor)
             and config.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(config.density_self_consistent)):
@@ -3681,7 +3738,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"density_self_consistent = {bool(config.density_self_consistent)}\n"
             "  want: density_self_consistent = true (or "
             "qp_solver = one_shot_dft)")
-    if mode in BARE_TRANSVERSE_MODES:
+    if mode is BispinorGWMode.BARE_TRANSVERSE:
         # The packed bare route inserts the bare <D_TT> q=Gamma head through
         # the SAME Gamma-cell completion that carries the charge head, so the
         # hand overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
@@ -3707,11 +3764,11 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "unscreened, of W).  The overlay writes the same quantity "
                 "into the q=Gamma, G=0 slot of the TT V tiles, so keeping "
                 "both would double count it.\n"
-                "  fix:  set bispinor_tt_head_correction = false; the TT "
-                "head is now on by default with the charge head\n"
+                "  fix:  leave head.bispinor_tt_head_correction at its "
+                "default (False) -- it is not a deck key any more; the TT "
+                "head is on by default with the charge head\n"
                 "  doc:  docs/input_reference.md, "
                 "bispinor_tt_head_correction.")
-    if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if not bool(config.bispinor):
         raise ValueError(
@@ -3719,48 +3776,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"{mode.value} requires bispinor = true.  This axis selects "
             "four-current screening; it does not turn four-spinor "
             "wavefunctions on implicitly.")
-    if mode in (
-        BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
-        BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE,
-    ):
-        gate_prefix = (
-            "pauli_reference" if mode is
-            BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE
-            else "isometric_kinetic_balance")
-        if bool(config.restart):
-            raise ValueError(
-                f"GATE {gate_prefix}_restart_unavailable: "
-                f"bispinor_gw = {mode.value} requires "
-                "restart = false. Existing restart tensors do not carry "
-                "an authenticated carrier representation and could silently "
-                "substitute a different four-current basis. Fresh runs may "
-                "still reuse each zeta file "
-                "through its carrier-specific provenance.")
-        if bool(config.write_restart_tensors):
-            raise ValueError(
-                f"GATE {gate_prefix}_restart_write_unavailable: "
-                f"bispinor_gw = {mode.value} requires "
-                "write_restart_tensors = false. The current restart schema "
-                "cannot authenticate this explicit comparison "
-                "representation for a later consumer.")
-        if (mode is BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE
-                and bool(config.head.bispinor_tt_head_correction)):
-            raise ValueError(
-                "GATE isometric_kinetic_balance_current_head_unavailable: "
-                "the normalized finite-q carrier has no authenticated "
-                "endpoint jets. Set bispinor_tt_head_correction = false; "
-                "the ordinary scalar q->0 head remains available from the "
-                "canonical QE two-spinor dipole artifact.")
-        if (mode is BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE
-                and config.head.correction is HeadCorrection.FULL
-                and config.screening.diagrams is not ScreeningDiagrams.W_RPA):
-            raise ValueError(
-                "GATE isometric_kinetic_balance_ladder_head_unavailable: "
-                "the ladder-screening facade does not accept the separate "
-                "source-Pauli centroid bundle required by the normalized "
-                "mode's scalar q->0 wings. Use screening_diagrams = w_rpa, "
-                "or head_correction = off.")
-        return
     # The one packed static mode.  The Gamma-cell completion is part of the
     # calculation (owner ruling 2026-09-01, docs/architecture/decisions.md):
     # ``full`` runs it, ``off`` is the announced DEBUG skip, and there is no
@@ -3866,10 +3881,14 @@ def refuse_unsupported_bispinor_gw(config) -> None:
 def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
     """Refuse ``bispinor_tt_head_correction = true`` outside its envelope.
 
-    NO-OP for the default ``false`` (returns before any predicate is
-    touched, same shape as :func:`refuse_unsupported_low_mem_bands`) and
-    for ``bispinor = false`` decks read through a hand-built config that
-    never sets the flag at all.
+    NOT REACHABLE FROM A DECK since 2026-09-01: the key is tombstoned in
+    ``read_lorrax_input`` and :class:`HeadConfig` is built with ``False``,
+    so every parsed config returns on the first line.  This function is
+    the guard for a HAND-BUILT config (tests, tools, an embedded caller)
+    that sets the field itself, which is why the driver-entry call in
+    ``gw.gw_init.prepare_isdf_and_wavefunctions`` remains and the
+    parser-altitude call was dropped.  Lane N deletes both with the
+    incumbent non-packed route.
 
     Two named conditions, GATE ``bispinor_tt_head_unsupported``:
 
@@ -3882,11 +3901,6 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
        (``gw.v_q_g_flat`` refuses sys_dim not in (2, 3) at its own
        entry), so this is a defensive, not merely a redundant, refusal.
 
-    Called at parser altitude (``LorraxConfig.from_input_file``) and at
-    driver-entry altitude (``gw.gw_init.prepare_isdf_and_wavefunctions``),
-    mirroring :func:`refuse_unsupported_low_mem_bands`'s two call sites
-    for the same reason: the parser call saves the allocation on the
-    production path, the driver-entry call protects a hand-built config.
     """
     if not bool(config.head.bispinor_tt_head_correction):
         return
@@ -3897,8 +3911,9 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
             "bispinor = false.\n"
             "  got:  bispinor_tt_head_correction = true, bispinor = false\n"
             "  want: bispinor = true\n"
-            "  fix:  set bispinor = true, or leave "
-            "bispinor_tt_head_correction at its default (false)\n"
+            "  fix:  set bispinor = true, or leave the field at its "
+            "default (False) -- it has not been a deck key since "
+            "2026-09-01\n"
             "  why:  the correction replaces the q=Γ, G=0 slot of the "
             "bare bispinor TT (transverse-transverse) V-tiles, which a "
             "non-bispinor run never builds\n"
@@ -3912,8 +3927,9 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
             f"sys_dim = {sys_dim}.\n"
             f"  got:  bispinor_tt_head_correction = true, sys_dim = {sys_dim}\n"
             "  want: sys_dim in {2, 3} (slab / bulk)\n"
-            "  fix:  set sys_dim to 2 or 3, or leave "
-            "bispinor_tt_head_correction at its default (false)\n"
+            "  fix:  set sys_dim to 2 or 3, or leave the field at its "
+            "default (False) -- it has not been a deck key since "
+            "2026-09-01\n"
             "  why:  box truncation (sys_dim=0) never zeros its q=Γ, G=0 "
             "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
             "there is no missing slot for this correction to fill\n"
@@ -5265,7 +5281,13 @@ class LorraxConfig:
             mc_average_placement_vcoul=(
                 str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
-            bispinor_tt_head_correction=bool(_g("bispinor_tt_head_correction")),
+            # NOT a deck key any more (tombstoned above).  The field stays
+            # so the incumbent non-packed TT overlay owner
+            # (gw.v_q_bispinor._make_per_q_v_builder_for_tile) keeps ONE
+            # place to read, and so a hand-built config that sets it True
+            # still meets refuse_unsupported_bispinor_tt_head_correction.
+            # Lane N deletes the field with the incumbent route.
+            bispinor_tt_head_correction=False,
             w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
             w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
@@ -5780,9 +5802,6 @@ class LorraxConfig:
         # gw.gw_init.prepare_isdf_and_wavefunctions (driver-entry altitude,
         # for hand-built configs) both exist.
         refuse_unsupported_low_mem_bands(resolved)
-        # Same position/reason again: bispinor_tt_head_correction = false
-        # (the default) returns before either predicate is touched.
-        refuse_unsupported_bispinor_tt_head_correction(resolved)
         # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
         # the other one.  Same position and same reason as the two refusals
         # above: the announcement quotes the RESOLVED axes, which only the

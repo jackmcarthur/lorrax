@@ -126,18 +126,49 @@ def test_kij_stream_refused_even_in_static_modes(tmp_path):
             "sigma_omega_accumulation = kij_stream\n")
 
 
-def test_pauli_reference_selector_splits_charge_from_current(tmp_path):
-    cfg = _config(
-        tmp_path,
-        "bispinor = true\n"
-        "bispinor_gw = pauli_reference_bare_transverse\n"
-        "restart = false\n"
-        "write_restart_tensors = false\n")
-    assert cfg.bispinor_gw is (
-        BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE)
-    assert not uses_raw_kinetic_balance_charge(
-        cfg.bispinor, cfg.bispinor_gw)
+# ---------------------------------------------------------------------------
+# bispinor_gw: TWO values, and the retired spellings refuse BY NAME
+# (owner ruling 2026-09-01; lane J architecture review section 2)
+# ---------------------------------------------------------------------------
+
+def test_bispinor_gw_grammar_is_exactly_two_values():
+    assert [m.value for m in BispinorGWMode] == [
+        "bare_transverse", "full_static_cohsex"]
+
+
+@pytest.mark.parametrize("spelling,gate,replacement", [
+    ("charge_hall_cubature",
+     "bispinor_gw_charge_hall_cubature_retired", "full_static_cohsex"),
+    ("pauli_reference_bare_transverse",
+     "bispinor_gw_pauli_reference_retired", "bare_transverse"),
+    ("isometric_kinetic_balance_bare_transverse",
+     "bispinor_gw_isometric_kinetic_balance_retired", "bare_transverse"),
+])
+def test_retired_bispinor_gw_spellings_refuse_and_name_the_replacement(
+        tmp_path, spelling, gate, replacement):
+    """A retired MODE VALUE stops the run and says what replaced it.
+
+    Never an alias: the mode value is the one deck word that decides which
+    physics runs, so a stale deck must not be silently re-pointed at a
+    different calculation.
+    """
+    with pytest.raises(ValueError) as exc:
+        _config(tmp_path, f"bispinor = true\nbispinor_gw = {spelling}\n")
+    text = str(exc.value)
+    assert gate in text
+    assert f"bispinor_gw = {replacement}" in text
+    assert "docs/input_reference.md" in text
+
+
+def test_both_shipped_modes_ride_the_one_raw_carrier():
+    """``bispinor_gw`` picks which Lorentz blocks are screened, not a lift."""
+    reps = [resolve_four_current_representation(True, mode)
+            for mode in ("bare_transverse", "full_static_cohsex")]
+    assert reps[0] == reps[1]
+    assert reps[0].charge_lift == reps[0].current_lift == "raw"
+    assert reps[0].scalar_head_bispinor
     assert uses_raw_kinetic_balance_charge(True, "bare_transverse")
+    assert uses_four_spinor_finite_q_charge(True, "full_static_cohsex")
 
 
 def test_default_bispinor_self_consistency_uses_live_four_current(tmp_path):
@@ -156,27 +187,23 @@ def test_default_bispinor_self_consistency_uses_live_four_current(tmp_path):
                for line in lines)
 
 
-def test_pauli_reference_explicit_frozen_density_is_refused(tmp_path):
+def test_bispinor_explicit_frozen_density_is_refused(tmp_path):
     with pytest.raises(
             ValueError,
             match="bispinor_self_consistency_requires_live_four_current"):
         _config(
             tmp_path,
             "bispinor = true\n"
-            "bispinor_gw = pauli_reference_bare_transverse\n"
-            "restart = false\n"
-            "write_restart_tensors = false\n"
+            "bispinor_gw = bare_transverse\n"
             "qp_solver = self_consistent\n"
             "density_self_consistent = false\n")
 
 
-def test_pauli_reference_accepts_live_four_current_self_consistency(tmp_path):
+def test_bispinor_accepts_live_four_current_self_consistency(tmp_path):
     cfg = _config(
         tmp_path,
         "bispinor = true\n"
-        "bispinor_gw = pauli_reference_bare_transverse\n"
-        "restart = false\n"
-        "write_restart_tensors = false\n"
+        "bispinor_gw = bare_transverse\n"
         "qp_solver = self_consistent\n"
         "density_self_consistent = true\n")
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
@@ -194,61 +221,59 @@ def test_legacy_bispinor_self_consistency_gets_same_live_default(tmp_path):
         cfg = _config(
             tmp_path,
             "bispinor = true\n"
-            "bispinor_gw = pauli_reference_bare_transverse\n"
-            "restart = false\n"
-            "write_restart_tensors = false\n"
+            "bispinor_gw = bare_transverse\n"
             "self_consistent = true\n")
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
     assert cfg.density_self_consistent
 
 
-def test_pauli_reference_requires_four_current_enablement(tmp_path):
+def test_packed_mode_requires_four_current_enablement(tmp_path):
     with pytest.raises(ValueError, match="bispinor_gw_requires_bispinor"):
         _config(
             tmp_path,
-            "bispinor = false\n"
-            "bispinor_gw = pauli_reference_bare_transverse\n"
-            "restart = false\n"
-            "write_restart_tensors = false\n")
+            "bispinor = false\nbispinor_gw = full_static_cohsex\n")
 
 
-def test_pauli_reference_refuses_restart_read(tmp_path):
-    with pytest.raises(ValueError, match="pauli_reference_restart_unavailable"):
-        _config(
-            tmp_path,
-            "bispinor = true\n"
-            "bispinor_gw = pauli_reference_bare_transverse\n"
-            "restart = true\n"
-            "write_restart_tensors = false\n")
+def test_bispinor_refuses_no_local_fields_head(tmp_path):
+    """PHYSICS/POLICY row 20: two head values on a bispinor deck.
 
-
-def test_pauli_reference_refuses_restart_write(tmp_path):
+    ``no_local_fields`` is a scalar diagnostic; on the bare-transverse
+    route it also silently moved the deck off the packed path, which is a
+    head dial choosing a route.
+    """
     with pytest.raises(
-            ValueError, match="pauli_reference_restart_write_unavailable"):
+            ValueError,
+            match="bispinor_head_correction_no_local_fields_unavailable"):
         _config(
             tmp_path,
-            "bispinor = true\n"
-            "bispinor_gw = pauli_reference_bare_transverse\n"
-            "restart = false\n"
-            "write_restart_tensors = true\n")
+            "bispinor = true\nhead_correction = no_local_fields\n")
 
 
-def test_isometric_selector_splits_finite_q_from_scalar_head(tmp_path):
-    cfg = _config(
-        tmp_path,
-        "bispinor = true\n"
-        "bispinor_gw = isometric_kinetic_balance_bare_transverse\n"
-        "restart = false\n"
-        "write_restart_tensors = false\n")
-    rep = resolve_four_current_representation(
-        cfg.bispinor, cfg.bispinor_gw)
-    assert cfg.bispinor_gw is (
-        BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
-    assert uses_four_spinor_finite_q_charge(
-        cfg.bispinor, cfg.bispinor_gw)
-    assert rep.charge_bispinor and rep.current_bispinor
-    assert rep.charge_lift == rep.current_lift == "isometric"
-    assert not rep.scalar_head_bispinor
+def test_scalar_deck_keeps_no_local_fields(tmp_path):
+    cfg = _config(tmp_path, "head_correction = no_local_fields\n")
+    assert cfg.head.correction.value == "no_local_fields"
+
+
+def test_bispinor_tt_head_correction_key_is_tombstoned(tmp_path):
+    """The deleted key refuses BY NAME, at either value."""
+    for value in ("true", "false"):
+        with pytest.raises(ValueError) as exc:
+            _config(
+                tmp_path,
+                f"bispinor = true\nbispinor_tt_head_correction = {value}\n")
+        text = str(exc.value)
+        assert "'bispinor_tt_head_correction' has been REMOVED" in text
+        assert "Gamma-cell" in text
+
+
+def test_static_gauge_hall_file_is_unset_by_default(tmp_path):
+    """An unnamed optional artifact must stay EMPTY, not become the deck dir.
+
+    ``resolve_input_paths`` used to join "" onto the input directory, and
+    ``os.path.exists`` reports a directory as present -- an unset Hall file
+    would then have looked like a Hall artifact to the completion.
+    """
+    assert _config(tmp_path).paths.static_gauge_hall_file == ""
 
 
 # ---------------------------------------------------------------------------

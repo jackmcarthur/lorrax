@@ -27,11 +27,6 @@ from common import jax_profile
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
 from common.four_current_model import (
-	ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION,
-	ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
-	is_pauli_reference_model,
-	PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
-	PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
 	RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
 	resolve_four_current_representation,
 )
@@ -1463,14 +1458,12 @@ def _resolve_zeta_fit_contract(
 
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
-	_normalized_charge_lift = (
-		representation.charge_lift
-		if representation.charge_representation ==
-		ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION else None)
-	_normalized_current_lift = (
-		representation.current_lift
-		if representation.spatial_current_representation ==
-		ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION else None)
+	# One carrier for both shipped bispinor_gw values (the raw kinetic
+	# balance lift), so the zeta provenance names no alternate lift.  The
+	# two comparison carriers that did were retired from the deck grammar
+	# on 2026-09-01 (gw_config._RETIRED_BISPINOR_GW_MODES).
+	_normalized_charge_lift = None
+	_normalized_current_lift = None
 	provenance = _zeta_fit_provenance(
 		wfn=wfn, meta=meta, cfg=cfg,
 		band_range_left=band_range_left,
@@ -2813,13 +2806,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 		with timing.section("gw_jax.V_q_compute"), \
 		     jax_profile.trace_section("V_q_compute_bispinor"):
-			_pauli_reference = is_pauli_reference_model(cfg.bispinor_gw)
-			_representation = resolve_four_current_representation(
-				cfg.bispinor, cfg.bispinor_gw)
-			_explicit_representation = bool(
-				_pauli_reference
-				or _representation.charge_representation ==
-				ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION)
 			# G-flat path: per-q + G-chunked, one orchestrator per
 			# four ζ files.  No legacy compute_V_q_tile chooser /
 			# μ × ν tiling / in-V_q FFT — see
@@ -2855,15 +2841,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						use_ibz=_use_ibz_bispinor,
 						tt_head_correction=bool(
 							cfg.head.bispinor_tt_head_correction),
-						bispinor_gw_mode=(
-							str(getattr(cfg.bispinor_gw, "value", cfg.bispinor_gw))
-							if _explicit_representation else None),
-						charge_representation=(
-							_representation.charge_representation
-							if _explicit_representation else None),
-						spatial_current_representation=(
-							_representation.spatial_current_representation
-							if _explicit_representation else None),
+						# No explicit-carrier stamp: both shipped
+						# bispinor_gw values ride the one raw
+						# kinetic-balance carrier.
+						bispinor_gw_mode=None,
+						charge_representation=None,
+						spatial_current_representation=None,
 					)
 
 		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
@@ -3857,61 +3840,6 @@ def prepare_isdf_and_wavefunctions(
 				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
 
-	# The normalized finite-q carrier has no normalized endpoint jet.  Build
-	# the scalar FULL-head wings on the source QE two-spinor at the SAME charge
-	# centroids, through the existing loader and bundle constructors.  This is
-	# head-only and fresh-only (the mode's restart gate fired above); H0 and the
-	# finite-q normalized body remain untouched.
-	wfns_scalar_head = None
-	if (representation.charge_representation ==
-			ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION
-			and bool(cfg.compute_mode.needs_screening)
-			and str(getattr(cfg.head.correction, "value", cfg.head.correction)) ==
-			"full"):
-		meta_head = replace(
-			meta, nspinor=int(wfn.nspinor), npol=int(wfn.nspinor))
-		meta_head.sys_dim = meta.sys_dim
-		meta_head.bispinor = False
-		with timing.section("gw_jax.load_scalar_head_wfns"):
-			psi_head_y, psi_head_x = load_centroids_band_chunked(
-				wfn, sym, meta_head, centroid_indices, False, mesh_xy,
-				band_range=band_slices.full_range,
-				band_chunk_size=load_band_chunk,
-				k_chunk_size=(
-					chunks['centroid_k_chunk'] if chunks is not None
-					else zeta_contract.loader_k_chunk))
-		head_receipt = WavefunctionBasisReceipt.from_bound_source(
-			wfn=wfn,
-			wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
-			role='charge', bispinor=False,
-			band_interval=_basis_band_interval,
-			fft_grid=meta.fft_grid,
-			centroid_fft_idx=centroid_indices,
-			n_rmu_logical=int(meta.n_rmu),
-			n_rmu_padded=int(meta.n_rmu_padded))
-		if cfg.memory.low_mem_bands:
-			from jax.sharding import NamedSharding
-			from .wavefunction_bundle import (
-				PSI_MUN_SPEC, PSI_NMU_SPEC, wavefunctions_face_from_restart)
-			with mesh_xy:
-				psi_head_nmu = jax.lax.with_sharding_constraint(
-					psi_head_y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
-				psi_head_mun = jax.lax.with_sharding_constraint(
-					jnp.conj(psi_head_x).transpose(0, 3, 1, 2),
-					NamedSharding(mesh_xy, PSI_MUN_SPEC))
-			wfns_scalar_head = wavefunctions_face_from_restart(
-				psi_head_nmu, psi_head_mun, enk_full=enk_full,
-				slices=band_slices, mesh_xy=mesh_xy,
-				basis_receipt=head_receipt)
-			del psi_head_y, psi_head_x
-		else:
-			wfns_scalar_head = build_wavefunction_bundle(
-				wfn, sym, meta_head, band_slices, mesh_xy,
-				psi_rmu_Y=psi_head_y, psi_rmuT_X=psi_head_x,
-				basis_receipt=head_receipt, enk_full=enk_full,
-				print_fn=print0)
-		print0("  normalized kinetic balance: scalar q->0 head/wings use "
-		       "a separate canonical QE two-spinor centroid bundle")
 
 	from .wavefunction_bundle import AuthenticatedWavefunctions
 	charge_basis_binding = (
@@ -3925,7 +3853,6 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
-		wf_bundle_scalar_head=wfns_scalar_head,
 		# The exact loaded-WFN identity was already scanned while binding the
 		# charge/transverse basis receipts.  Keep that opaque host proof at the
 		# orchestration seam so later artifact gates cannot reopen/resample the
