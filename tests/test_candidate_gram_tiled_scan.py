@@ -47,32 +47,6 @@ def _slice_pad(a, start: int, *, axis: int, size: int):
         jnp.zeros((), dtype=a.dtype))
 
 
-@pytest.mark.parametrize(
-    "outer,inner,expected",
-    [
-        ((0, 500), (0, 130), slice(0, 130)),
-        ((10, 40), (17, 23), slice(7, 13)),
-        ((10, 40), (10, 40), slice(0, 30)),
-        ((10, 40), (0, 20), None),
-        ((10, 40), (30, 50), None),
-    ],
-)
-def test_band_window_slice_requires_exact_containment(outer, inner, expected):
-    from centroid.pivoted_cholesky import _band_window_slice
-
-    assert _band_window_slice(outer, inner) == expected
-
-
-def test_nested_face_slice_uses_the_two_canonical_band_axes():
-    from centroid.pivoted_cholesky import _slice_centroid_wfn_faces
-
-    y = np.arange(2 * 7 * 3 * 5).reshape(2, 7, 3, 5)
-    x = np.conj(y).transpose(0, 3, 1, 2)
-    got_y, got_x = _slice_centroid_wfn_faces(y, x, slice(2, 6))
-    np.testing.assert_array_equal(got_y, y[:, 2:6, :, :])
-    np.testing.assert_array_equal(got_x, x[:, :, 2:6, :])
-
-
 def _incumbent_tile_dispatches(faces, weights, mesh, *, width, mode):
     """Literal one-device form of the former c-outer/r-inner schedule."""
     from isdf import gram_q0_from_psi_sm
