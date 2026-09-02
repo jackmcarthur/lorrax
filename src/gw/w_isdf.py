@@ -811,6 +811,7 @@ def _get_fused_photon_chi_kernel(
     from common.fft_helpers import make_flat_k_fftn
     from common.gamma_matrices import gamma_perm_phase
     from distrib_la import gemm_plan
+    from ffi import ffi_dial_key
     from .greens_function_kernel import build_G_tau
     from .photon_layout import (
         accumulate_photon_block, photon_block_view, replace_photon_block)
@@ -832,7 +833,8 @@ def _get_fused_photon_chi_kernel(
         (transverse_shape, transverse_shape),
     )
     stream_by_family = tuple(bool(x) for x in stream_by_family)
-    key = (id(mesh_xy), tuple(kgrid), layout, tuple(family_shapes),
+    key = (id(mesh_xy), tuple(kgrid), ffi_dial_key(), layout,
+           tuple(family_shapes),
            stream_by_family, distrib_la_batched_route)
     hit = _fused_photon_chi_kernel_cache.get(key)
     if hit is not None:
