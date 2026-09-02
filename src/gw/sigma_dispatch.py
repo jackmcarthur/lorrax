@@ -122,7 +122,6 @@ class SigmaResult:
     #: output basis.  Axes are (term=X/SX/COH, sector=CC/CT+TC/TT, k, band).
     #: Non-full modes carry None; the debug writer supplies schema zeros.
     photon_head_sigma_diag_tskn_ry: jax.Array | None = None
-    photon_head_sigma_operator_fingerprint: str | None = None
     photon_head_sigma_basis: str | None = None
     #: The un-extrapolated (N₃, ordinary full-band) QSGW Σ_xc, populated only
     #: when ``use_band_extrapolation`` is driving this stage.  ``sigma_xc_
@@ -255,7 +254,6 @@ BASIS_FREE_FIELDS = (
     "omega_grid_ev",
     "omega_grid_ry",
     "sigma_omega_h5_path",
-    "photon_head_sigma_operator_fingerprint",
     "photon_head_sigma_basis",
     "efermi_dft_ev",
     "omega_reference_provenance",
@@ -833,7 +831,6 @@ def compute_sigma_xc(
     builds_static_screened = mode_builds_channels(
         mode, SigmaChannel.SX, SigmaChannel.COH)
     photon_head_sigma_diag = None
-    photon_head_sigma_operator_fingerprint = None
     photon_head_sigma_basis = None
     if uses_static_photon_response(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
@@ -879,9 +876,6 @@ def compute_sigma_xc(
         if photon_head_diagnostics is not None:
             photon_head_sigma_diag = (
                 photon_head_diagnostics.components_tskn_ry)
-            photon_head_sigma_operator_fingerprint = (
-                photon_head_diagnostics
-                .hamiltonian_config_operator_fingerprint)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
     elif builds_static_screened:
         cohsex = compute_cohsex_sigma(
@@ -956,8 +950,6 @@ def compute_sigma_xc(
             sigma_sx_kij_ry=sig_x,
             sigma_coh_kij_ry=jnp.zeros_like(sig_x),
             photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
-            photon_head_sigma_operator_fingerprint=(
-                photon_head_sigma_operator_fingerprint),
             photon_head_sigma_basis=photon_head_sigma_basis,
         )
     if mode is ComputeMode.COHSEX:
@@ -972,8 +964,6 @@ def compute_sigma_xc(
             sigma_sx_kij_ry=sig_sx,
             sigma_coh_kij_ry=sig_coh,
             photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
-            photon_head_sigma_operator_fingerprint=(
-                photon_head_sigma_operator_fingerprint),
             photon_head_sigma_basis=photon_head_sigma_basis,
         )
 

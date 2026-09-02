@@ -297,6 +297,15 @@ class BispinorGWMode(str, enum.Enum):
     frequency ansatz, while this one selects which Lorentz blocks are screened
     and contracted.  ``bare_transverse`` is the historical charge-screened +
     bare-TT behavior and remains the default.
+
+    ``full_static_cohsex`` is the ONE packed static mode: the sixteen-block
+    no-pair photon body, screened once at omega=0 under ``compute_mode =
+    cohsex``, plus the Gamma-cell completion (bare ``<D>`` into V, the charge
+    ``S^{00}``/wing head into W, the Hall CT/TC term when a Hall artifact is
+    present).  The completion runs by default (owner ruling 2026-09-01,
+    ``docs/architecture/decisions.md``); ``head_correction = off`` skips it
+    behind a DEBUG banner.  The former ``charge_hall_cubature`` spelling is
+    refused by :func:`coerce_bispinor_gw_mode` naming this mode.
     """
 
     BARE_TRANSVERSE = "bare_transverse"
@@ -304,15 +313,30 @@ class BispinorGWMode(str, enum.Enum):
     ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE = (
         ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
     FULL_STATIC_COHSEX = "full_static_cohsex"
-    CHARGE_HALL_CUBATURE = "charge_hall_cubature"
+
+
+_RETIRED_CHARGE_HALL_CUBATURE_MODE = "charge_hall_cubature"
 
 
 def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
     if isinstance(value, BispinorGWMode):
         return value
     raw = getattr(value, "value", value)
+    spelling = str(raw).strip().lower()
+    if spelling == _RETIRED_CHARGE_HALL_CUBATURE_MODE:
+        raise ValueError(
+            "GATE bispinor_gw_charge_hall_cubature_retired: "
+            "bispinor_gw = charge_hall_cubature no longer exists.\n"
+            "  got:  bispinor_gw = charge_hall_cubature\n"
+            "  want: bispinor_gw = full_static_cohsex\n"
+            "  why:  the packed static COHSEX mode always runs the "
+            "Gamma-cell completion this spelling used to select (bare <D> "
+            "into V, the charge S00/wing head into W); the Hall CT/TC term "
+            "is taken from static_gauge_hall_file when that artifact exists "
+            "and is sigma_H = 0 otherwise (owner ruling 2026-09-01).\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
     try:
-        return BispinorGWMode(str(raw).strip().lower())
+        return BispinorGWMode(spelling)
     except ValueError as exc:
         raise ValueError(
             f"bispinor_gw={raw!r} is not a known mode; expected one of: "
@@ -339,7 +363,6 @@ def uses_raw_kinetic_balance_charge(
     return mode in (
         BispinorGWMode.BARE_TRANSVERSE,
         BispinorGWMode.FULL_STATIC_COHSEX,
-        BispinorGWMode.CHARGE_HALL_CUBATURE,
     )
 
 
@@ -3533,14 +3556,19 @@ def uses_static_photon_response(config) -> bool:
     """Whether screening and Sigma use the packed 4x4 photon response."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-    return mode in (
-        BispinorGWMode.FULL_STATIC_COHSEX,
-        BispinorGWMode.CHARGE_HALL_CUBATURE,
-    )
+    return mode is BispinorGWMode.FULL_STATIC_COHSEX
 
 
 def uses_coupled_photon_head(config) -> bool:
-    """Whether the packed photon response needs literal-Gamma vectors."""
+    """Whether the packed photon response runs its Gamma-cell completion.
+
+    True for the packed mode under ``head_correction = full`` (the default;
+    the completion needs the four literal-Gamma channel vectors, which
+    ``gw_init`` retains only when this is true).  False under the DEBUG
+    setting ``head_correction = off``, where the packed V/W keep a zero
+    q=Gamma, G=0 slot.  No third value exists: the envelope refuses
+    ``no_local_fields`` for this mode.
+    """
     return (uses_static_photon_response(config)
             and config.head.correction is HeadCorrection.FULL)
 
@@ -3613,25 +3641,26 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "mode's scalar q->0 wings. Use screening_diagrams = w_rpa, "
                 "or head_correction = off.")
         return
-    if (mode is BispinorGWMode.FULL_STATIC_COHSEX
-            and config.head.correction is HeadCorrection.FULL):
+    # The one packed static mode.  The Gamma-cell completion is part of the
+    # calculation (owner ruling 2026-09-01, docs/architecture/decisions.md):
+    # ``full`` runs it, ``off`` is the announced DEBUG skip, and there is no
+    # third value because ``no_local_fields`` names a scalar diagnostic that
+    # the coupled 4x4 solve does not produce.
+    if config.head.correction is HeadCorrection.FULL and int(config.sys_dim) != 2:
         raise ValueError(
-            "GATE full_static_bispinor_gauge_head_unavailable: production "
-            "FULL_SCREENED bispinor q=0 completion is unavailable.\n"
-            "  got:  bispinor_gw = full_static_cohsex, "
-            "head_correction = full\n"
-            "  want: a versioned StaticGaugeHeadResponse carrying "
-            "S_direct, separately sourced sigma_H, sharded Y/Z, exact "
-            "contact/operator provenance, and certified Ward/Hermiticity "
-            "residuals\n"
-            "  fix:  complete the gauged VNL/downfolded operator artifact "
-            "and its loader, or set head_correction = off for the explicitly "
-            "experimental no-pair finite-body calculation\n"
+            "GATE static_bispinor_photon_head_slab_only: the packed static "
+            "photon Gamma-cell completion is derived for a slab.\n"
+            f"  got:  bispinor_gw = {mode.value}, head_correction = full, "
+            f"sys_dim = {config.sys_dim}\n"
+            "  want: sys_dim = 2\n"
+            "  why:  the completion solves the coupled 4x4 Lorentz Dyson "
+            "equation at every point of an exact in-plane Wigner-Seitz "
+            "cubature (vcoul.slab_minibz_photon_cubature) before averaging; "
+            "a bulk analytic-sphere completion cannot be added after that "
+            "nonlinear solve and has no derived integrator yet.\n"
+            "  fix:  set sys_dim = 2, or head_correction = off for a "
+            "DEBUG headless body (not a production calculation)\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
-    required_head = (
-        HeadCorrection.FULL
-        if mode is BispinorGWMode.CHARGE_HALL_CUBATURE
-        else HeadCorrection.OFF)
     requirements = (
         (config.compute_mode is ComputeMode.COHSEX,
          f"compute_mode = {config.compute_mode.value}",
@@ -3639,9 +3668,10 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         (config.screening.diagrams is ScreeningDiagrams.W_RPA,
          f"screening_diagrams = {config.screening.diagrams.value}",
          "screening_diagrams = w_rpa"),
-        (config.head.correction is required_head,
+        (config.head.correction in (HeadCorrection.FULL, HeadCorrection.OFF),
          f"head_correction = {config.head.correction.value}",
-         f"head_correction = {required_head.value}"),
+         "head_correction = full (the default), or off for a DEBUG "
+         "headless body"),
         (config.qp_solver is QPSolver.ONE_SHOT_DFT,
          f"qp_solver = {config.qp_solver.value}",
          "qp_solver = one_shot_dft"),
@@ -3649,9 +3679,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
          f"mpa_material_class = {config.mpa.material_class}",
          "mpa_material_class = insulator"),
         (not bool(config.restart), "restart = true", "restart = false"),
-        (mode is BispinorGWMode.FULL_STATIC_COHSEX
-         or int(config.sys_dim) == 2,
-         f"sys_dim = {config.sys_dim}", "sys_dim = 2"),
         (bool(config.memory.low_mem_bands), "low_mem_bands = false",
          "low_mem_bands = true"),
         (str(config.backend.w_dyson_solver) == "distributed",
@@ -3705,12 +3732,13 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"bispinor_gw = {mode.value} is refused with {got}.\n"
             f"  got:  {got}\n"
             f"  want: {want}\n"
-            "  why:  the packed-photon modes are deliberately narrow "
-            "full-BZ, one-shot insulating static calculations. "
-            "The charge_hall_cubature mode includes only the explicitly "
-            "declared charge CC and Hall CT/TC long-wave terms. Photon "
-            "restart storage, bulk coupled heads, "
-            "self-consistency, and dynamic photon models are not silently "
+            "  why:  the packed-photon mode is a deliberately narrow "
+            "full-BZ, one-shot insulating static calculation whose "
+            "Gamma-cell completion carries the charge CC q^2 head, the "
+            "charge wings and the optional Hall CT/TC term (the "
+            "current q^2/contact/complement terms are omitted by model). "
+            "Photon restart storage, self-consistency, scalar head "
+            "overlays and dynamic photon models are not silently "
             "approximated here.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
 

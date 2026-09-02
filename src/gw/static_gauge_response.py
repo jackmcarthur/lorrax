@@ -1,19 +1,42 @@
-"""Inputs for the bounded static charge-plus-Hall response.
+"""Inputs of the packed static photon Gamma-cell completion.
 
-``charge_hall_cubature`` is a deliberately restricted effective response:
-the existing scalar-density head/wings at omega=0 plus the separately computed
-Hall Chern--Simons term.  Ordinary current response,
-contact and complement-space closure are omitted *by model*, never stored as
-accidental zeros and never promoted to ``full_static_gauge``.
+``bispinor_gw = full_static_cohsex`` completes the ``q = Gamma, G = 0`` slot
+of the packed sixteen-block V and W (``gw.head_correction.
+complete_static_slab_photon_q0``) from one bounded response
 
-This module owns no WFN load, symmetry unfold, current, FFT, body-response or
-packing implementation.  It composes the existing routines and retains
-only O(N_mu) wing carriers.
+    ``R(q) = q_a H_a(sigma_H) + q_a q_b S_ab``
+
+that this module assembles.  Its content, by declaration:
+
+* present: the charge CC ``q^2`` head ``S^{00}`` from the incumbent scalar
+  producer (:func:`gw.qsgw_head.build_dft_head_response` at ``omega = 0``),
+  the charge one-leg wings ``Y^{0}``/``Z^{0}`` that fold it through the
+  packed body, and the Hall CT/TC ``q^1`` term generated structurally from
+  ``sigma_H`` (:func:`gw.head_correction.static_hall_linear_response`);
+* omitted by model: the current ``q^2`` response (TT, CT/TC), the current
+  wings, the uniform static current response ``tt_q0`` (zero by gauge
+  invariance for an insulator), the diamagnetic/contact terms and the
+  negative-energy (complement-space) closure.  They are never stored as
+  accidental zeros of a larger schema; ``S_direct`` has charge support only.
+
+The Hall term is optional.  ``sigma_H`` comes from the immutable artifact
+written by ``get_dipole_mtxels --static-gauge-hall-only`` when the deck's
+``static_gauge_hall_file`` exists and authenticates against the run's WFN,
+band manifold and k-count; when the file is absent ``sigma_H = 0`` and
+``hall_source`` says so.  For a Chern-trivial insulator the static Hall
+coefficient is exactly zero in the converged limit (it is the occupied
+Berry-curvature sum, i.e. a Chern number), so the absent-artifact default is
+the exact answer for the systems this mode admits.
+
+This module owns no WFN load, symmetry unfold, current, FFT, body-response
+or packing implementation.  It composes the existing routines and retains
+only O(N_mu) wing carriers.  The record it issues is sealed: only the
+producer below can construct it, so a fabricated response cannot reach the
+completion.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-import enum
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -24,78 +47,8 @@ from common.collectives import device_put_process_local
 from gw.photon_layout import PhotonBasisLayout, pack_photon_channel_vectors
 
 
-class StaticGaugeResponseCapability(str, enum.Enum):
-    CHARGE_HALL_CUBATURE = "charge_hall_cubature"
-    FULL_STATIC_GAUGE = "full_static_gauge"
-
-
-class StaticGaugeTermStatus(str, enum.Enum):
-    COMPLETE = "complete"
-    OMITTED_BY_MODEL = "omitted_by_model"
-    UNAVAILABLE = "unavailable"
-
-
-@dataclass(frozen=True)
-class StaticGaugeTermAvailability:
-    """Fixed response-jet availability grammar; fields are never inferred."""
-
-    cc_q2: StaticGaugeTermStatus
-    ct_q1: StaticGaugeTermStatus
-    tc_q1: StaticGaugeTermStatus
-    ct_q2: StaticGaugeTermStatus
-    tc_q2: StaticGaugeTermStatus
-    tt_q0: StaticGaugeTermStatus
-    tt_q1: StaticGaugeTermStatus
-    tt_q2: StaticGaugeTermStatus
-    y_charge: StaticGaugeTermStatus
-    y_current: StaticGaugeTermStatus
-    z_charge: StaticGaugeTermStatus
-    z_current: StaticGaugeTermStatus
-    contact_q0: StaticGaugeTermStatus
-    contact_q2: StaticGaugeTermStatus
-    complement_space: StaticGaugeTermStatus
-
-    def as_tokens(self) -> dict[str, str]:
-        return {field.name: getattr(self, field.name).value
-                for field in fields(self)}
-
-    def is_complete_for(self, capability: StaticGaugeResponseCapability) -> bool:
-        capability = StaticGaugeResponseCapability(capability)
-        status = self.as_tokens()
-        if capability is StaticGaugeResponseCapability.FULL_STATIC_GAUGE:
-            return all(value == StaticGaugeTermStatus.COMPLETE.value
-                       for value in status.values())
-        required = {"cc_q2", "ct_q1", "tc_q1", "y_charge", "z_charge"}
-        return all(
-            (value == StaticGaugeTermStatus.COMPLETE.value) == (name in required)
-            and (name in required
-                 or value == StaticGaugeTermStatus.OMITTED_BY_MODEL.value)
-            for name, value in status.items())
-
-    def require_for(self, capability: StaticGaugeResponseCapability) -> None:
-        capability = StaticGaugeResponseCapability(capability)
-        if not self.is_complete_for(capability):
-            raise ValueError(
-                f"GATE static_gauge_availability: status {self.as_tokens()} "
-                f"does not satisfy capability {capability.value!r}")
-
-
-def _charge_hall_availability() -> StaticGaugeTermAvailability:
-    complete = StaticGaugeTermStatus.COMPLETE
-    omitted = StaticGaugeTermStatus.OMITTED_BY_MODEL
-    return StaticGaugeTermAvailability(
-        cc_q2=complete, ct_q1=complete, tc_q1=complete,
-        ct_q2=omitted, tc_q2=omitted,
-        tt_q0=omitted, tt_q1=omitted, tt_q2=omitted,
-        y_charge=complete, y_current=omitted,
-        z_charge=complete, z_current=omitted,
-        contact_q0=omitted, contact_q2=omitted,
-        complement_space=omitted,
-    )
-
-
-CHARGE_HALL_CUBATURE_AVAILABILITY = _charge_hall_availability()
 _PRODUCER_TOKEN = object()
+HALL_SOURCE_NONE = "none: sigma_H = 0 (no static_gauge_hall_file)"
 
 
 def _canonical_wfn_sha256(value) -> str:
@@ -103,24 +56,26 @@ def _canonical_wfn_sha256(value) -> str:
     if (len(value) != 64
             or any(c not in "0123456789abcdef" for c in value)):
         raise ValueError(
-            "charge/Hall WFN identifier must be 64 lowercase hex")
+            "static photon head WFN identifier must be 64 lowercase hex")
     return value
 
 
 @dataclass(frozen=True)
-class ChargeHallCubatureResponse:
+class StaticPhotonHeadResponse:
     r"""Inputs for ``R(q)=q_a H_a(sigma_H)+q_a q_b S_ab``.
 
     ``S_direct`` and the wings have charge support only.  The Hall tensor is
-    intentionally not stored: :func:`static_hall_linear_response` constructs
-    it from ``sigma_H`` at the numerical kernel that consumes it.
+    intentionally not stored: :func:`gw.head_correction.
+    static_hall_linear_response` constructs it from ``sigma_H`` at the
+    numerical kernel that consumes it.  ``hall_source`` records where
+    ``sigma_H`` came from (the authenticated artifact path, or
+    :data:`HALL_SOURCE_NONE`).
     """
 
-    capability: StaticGaugeResponseCapability
-    availability: StaticGaugeTermAvailability
     layout: PhotonBasisLayout
     S_direct: jax.Array               # (2,2,4,4), replicated charge CC
     sigma_H: jax.Array                # (3,), replicated real bohr^-1
+    hall_source: str
     Y_x: jax.Array                    # (2,4,Npacked), P(None,None,'x')
     Z_y: jax.Array                    # (2,Npacked,4), P(None,'y',None)
     ward_residual: float
@@ -131,8 +86,8 @@ class ChargeHallCubatureResponse:
     def __post_init__(self) -> None:
         if self._producer_token is not _PRODUCER_TOKEN:
             raise TypeError(
-                "ChargeHallCubatureResponse is issued only by "
-                "build_charge_hall_cubature_response")
+                "StaticPhotonHeadResponse is issued only by "
+                "build_static_photon_head_response")
 
 
 def _same_mesh_sharding(array, mesh: Mesh, spec: P) -> bool:
@@ -145,17 +100,14 @@ def _same_mesh_sharding(array, mesh: Mesh, spec: P) -> bool:
     )
 
 
-def require_charge_hall_cubature_response(
-    response: ChargeHallCubatureResponse, mesh_xy: Mesh,
-) -> ChargeHallCubatureResponse:
+def require_static_photon_head_response(
+    response: StaticPhotonHeadResponse, mesh_xy: Mesh,
+) -> StaticPhotonHeadResponse:
     """Check the bounded model's support, dtype and sharding."""
-    if not isinstance(response, ChargeHallCubatureResponse):
+    if not isinstance(response, StaticPhotonHeadResponse):
         raise TypeError(
-            "charge_hall_cubature requires ChargeHallCubatureResponse; got "
-            f"{type(response).__name__}")
-    if response.capability is not StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE:
-        raise ValueError("charge/Hall producer cannot issue a FULL capability")
-    response.availability.require_for(response.capability)
+            "the packed static photon completion requires "
+            f"StaticPhotonHeadResponse; got {type(response).__name__}")
     response.layout.assert_mesh(mesh_xy)
 
     n_packed = int(response.layout.packed_extent)
@@ -178,9 +130,9 @@ def require_charge_hall_cubature_response(
     S = np.asarray(jax.device_get(response.S_direct))
     sigma = np.asarray(jax.device_get(response.sigma_H))
     if not np.all(np.isfinite(sigma)):
-        raise ValueError("charge_hall_cubature sigma_H is not finite")
+        raise ValueError("static photon head sigma_H is not finite")
     if np.any(S[:, :, 0, 1:] != 0.0) or np.any(S[:, :, 1:, :] != 0.0):
-        raise ValueError("charge_hall_cubature S has non-charge support")
+        raise ValueError("static photon head S has non-charge support")
     from gw.head_correction import static_gauge_tensor_residuals
     structural_ward, structural_hermiticity = (
         static_gauge_tensor_residuals(S))
@@ -189,14 +141,17 @@ def require_charge_hall_cubature_response(
         response.wing_reciprocity_residual,
         structural_ward, structural_hermiticity), dtype=np.float64)
     if np.any(~np.isfinite(residuals)) or np.any(residuals < 0.0):
-        raise ValueError("charge/Hall response has invalid residuals")
+        raise ValueError("static photon head response has invalid residuals")
     if max(response.ward_residual, structural_ward) > 1.0e-8:
-        raise ValueError("charge/Hall response violates the static Ward gate")
+        raise ValueError(
+            "static photon head response violates the static Ward gate")
     if max(response.hermiticity_residual,
            structural_hermiticity) > 1.0e-10:
-        raise ValueError("charge/Hall response violates the Hermiticity gate")
+        raise ValueError(
+            "static photon head response violates the Hermiticity gate")
     if response.wing_reciprocity_residual > 1.0e-10:
-        raise ValueError("charge/Hall response violates wing reciprocity")
+        raise ValueError(
+            "static photon head response violates wing reciprocity")
     return response
 
 
@@ -211,7 +166,7 @@ def _channel_zeros(nq: int, extent: int, mesh: Mesh, axis: str):
         NamedSharding(mesh, P(None, axis)))
 
 
-def build_charge_hall_cubature_response(
+def build_static_photon_head_response(
     wfns,
     *,
     input_dir: str,
@@ -220,17 +175,20 @@ def build_charge_hall_cubature_response(
     meta,
     config,
     layout: PhotonBasisLayout,
-    hall_transaction,
+    hall_transaction=None,
     wfn_fingerprint_binding=None,
-) -> ChargeHallCubatureResponse:
-    r"""Compose charge CC and Hall CT/TC response at omega=0.
+) -> StaticPhotonHeadResponse:
+    r"""Compose the charge CC head, its wings and the optional Hall term.
 
     The scalar response is evaluated once by
-    :func:`gw.qsgw_head.build_dft_head_response`.  Its two in-plane velocity
-    rows become the qx/qy derivatives of the charge head and charge-only
-    wings.  Three exact-zero transverse vectors are passed to the canonical
-    packer; no current wing is inferred.  The Hall input must be the full-BZ
-    result of :func:`gw.qsgw_head.static_gauge_hall_transaction`.
+    :func:`gw.qsgw_head.build_dft_head_response` at ``omega = 0``.  Its two
+    in-plane velocity rows become the qx/qy derivatives of the charge head
+    and charge-only wings.  Three exact-zero transverse vectors are passed to
+    the canonical packer; no current wing is inferred.
+
+    ``hall_transaction`` is either ``None`` (``sigma_H = 0``) or the full-BZ
+    result of :func:`gw.qsgw_head.static_gauge_hall_transaction`, which must
+    name the same WFN identity and band manifold as the charge response.
     """
     from common.parallel_transport import (
         fingerprint_from_binding, wfn_fingerprint)
@@ -242,25 +200,40 @@ def build_charge_hall_cubature_response(
         StaticGaugeHallTransaction, build_dft_head_response)
 
     if not isinstance(layout, PhotonBasisLayout):
-        raise TypeError("charge/Hall response requires PhotonBasisLayout")
-    layout.assert_mesh(mesh)
-    if not isinstance(hall_transaction, StaticGaugeHallTransaction):
         raise TypeError(
-            "charge/Hall response requires the full-BZ Hall transaction")
+            "static photon head response requires PhotonBasisLayout")
+    layout.assert_mesh(mesh)
 
     wfn_fp = _canonical_wfn_sha256(
         wfn_fingerprint(wfn)
         if wfn_fingerprint_binding is None
         else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
     start, stop = int(meta.b_id_0), int(meta.b_id_4_chi_user)
-    if (int(hall_transaction.band_start), int(hall_transaction.band_stop)) != (
-            start, stop):
-        raise ValueError(
-            "charge and Hall responses use different band manifolds: "
-            f"charge=[{start},{stop}), Hall=[{hall_transaction.band_start},"
-            f"{hall_transaction.band_stop})")
-    if _canonical_wfn_sha256(hall_transaction.wfn_fingerprint) != wfn_fp:
-        raise ValueError("charge and Hall responses use different WFN identities")
+    if hall_transaction is None:
+        sigma_host = np.zeros(3, dtype=np.float64)
+        hall_source = HALL_SOURCE_NONE
+    else:
+        if not isinstance(hall_transaction, StaticGaugeHallTransaction):
+            raise TypeError(
+                "static photon head response requires the sealed full-BZ "
+                "Hall transaction or None")
+        if (int(hall_transaction.band_start),
+                int(hall_transaction.band_stop)) != (start, stop):
+            raise ValueError(
+                "charge and Hall responses use different band manifolds: "
+                f"charge=[{start},{stop}), Hall=[{hall_transaction.band_start},"
+                f"{hall_transaction.band_stop})")
+        if _canonical_wfn_sha256(hall_transaction.wfn_fingerprint) != wfn_fp:
+            raise ValueError(
+                "charge and Hall responses use different WFN identities")
+        sigma_host = np.asarray(
+            jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
+        if sigma_host.shape != (3,) or not np.all(np.isfinite(sigma_host)):
+            raise ValueError("Hall transaction has an invalid sigma_H")
+        hall_source = (
+            f"{hall_transaction.producer_id} "
+            f"(operator {hall_transaction.hamiltonian_config_operator_fingerprint})")
+
     direct = build_dft_head_response(
         wfns, (0.0 + 0.0j,), input_dir=input_dir, mesh=mesh,
         wfn=wfn, meta=meta, config=config,
@@ -295,10 +268,6 @@ def build_charge_hall_cubature_response(
     S_host[:, :, 0, 0] = charge_S
     S_direct = canonicalize_static_gauge_q2_tensor(
         _replicated(S_host, mesh, dtype=np.complex128))
-    sigma_host = np.asarray(
-        jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
-    if sigma_host.shape != (3,) or not np.all(np.isfinite(sigma_host)):
-        raise ValueError("Hall transaction has an invalid sigma_H")
     sigma_H = _replicated(sigma_host, mesh, dtype=np.float64)
     # At static imaginary frequency the Adler--Wiser weight is real, hence
     # the two incumbent wing orientations obey Z[b,mu]=conj(Y[b,mu]).  Move
@@ -313,32 +282,20 @@ def build_charge_hall_cubature_response(
         np.asarray(jax.device_get(wing_delta / wing_scale)))
     ward, hermiticity = static_gauge_tensor_residuals(S_direct)
 
-    availability = CHARGE_HALL_CUBATURE_AVAILABILITY
-    response = ChargeHallCubatureResponse(
-        capability=StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE,
-        availability=availability, layout=layout,
-        S_direct=S_direct, sigma_H=sigma_H, Y_x=Y_x, Z_y=Z_y,
+    response = StaticPhotonHeadResponse(
+        layout=layout,
+        S_direct=S_direct, sigma_H=sigma_H, hall_source=hall_source,
+        Y_x=Y_x, Z_y=Z_y,
         ward_residual=float(ward), hermiticity_residual=float(hermiticity),
         wing_reciprocity_residual=wing_reciprocity,
         _producer_token=_PRODUCER_TOKEN,
     )
-    return require_charge_hall_cubature_response(response, mesh)
-
-
-def require_full_static_gauge_availability(
-    availability: StaticGaugeTermAvailability,
-) -> None:
-    """The explicit refusal seam for consumers that claim FULL closure."""
-    availability.require_for(StaticGaugeResponseCapability.FULL_STATIC_GAUGE)
+    return require_static_photon_head_response(response, mesh)
 
 
 __all__ = [
-    "CHARGE_HALL_CUBATURE_AVAILABILITY",
-    "ChargeHallCubatureResponse",
-    "StaticGaugeResponseCapability",
-    "StaticGaugeTermAvailability",
-    "StaticGaugeTermStatus",
-    "build_charge_hall_cubature_response",
-    "require_charge_hall_cubature_response",
-    "require_full_static_gauge_availability",
+    "HALL_SOURCE_NONE",
+    "StaticPhotonHeadResponse",
+    "build_static_photon_head_response",
+    "require_static_photon_head_response",
 ]

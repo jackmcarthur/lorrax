@@ -1,30 +1,37 @@
-"""Focused algebra and fail-closed gates for the static photon q=0 schema."""
+"""Algebra and fail-closed gates of the packed static photon q=0 completion.
 
-from dataclasses import replace
+Covers the pure kernels of ``gw.head_correction`` (Hall tensor, coupled 4x4
+moment chunk, numerical certificates, response residuals) and the deck /
+runtime envelope of ``bispinor_gw = full_static_cohsex``: the completion runs
+by default, ``off`` is an announced DEBUG skip, ``no_local_fields`` and the
+retired ``charge_hall_cubature`` spelling refuse, and no caller-supplied
+response can reach the completion.
+"""
+
 import inspect
 from types import SimpleNamespace
 
 import jax
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh
 
 from gw.gw_config import (
     HeadCorrection,
     LorraxConfig,
+    uses_coupled_photon_head,
+    uses_static_photon_response,
 )
 from gw.head_correction import (
-    StaticGaugeHeadResponse,
     _reduce_static_photon_order_diagnostics,
     _require_static_photon_numerical_certificate,
     _static_photon_mixed_error_ratio,
     complete_static_slab_photon_q0,
-    require_static_gauge_head_response,
     static_gauge_tensor_residuals,
     static_hall_linear_response,
     static_slab_photon_head_moment_chunk,
 )
-from gw.photon_layout import PhotonBasisLayout
+from gw.static_gauge_response import StaticPhotonHeadResponse
 from gw.w_isdf import compute_static_photon_response
 
 
@@ -55,33 +62,6 @@ def _ward_closed_S():
     return S
 
 
-def _response(mesh, *, S=None, **changes):
-    layout = PhotonBasisLayout.from_centroid_extents(1, 1, mesh)
-    n_body = layout.packed_extent
-    base = StaticGaugeHeadResponse(
-        layout=layout,
-        S_direct=jax.device_put(
-            _ward_closed_S() if S is None else S,
-            NamedSharding(mesh, P()),
-        ),
-        sigma_H=np.asarray((0.0, 0.0, 0.37), dtype=np.float64),
-        Y_x=jax.device_put(
-            np.zeros((2, 4, n_body), dtype=np.complex128),
-            NamedSharding(mesh, P(None, None, "x")),
-        ),
-        Z_y=jax.device_put(
-            np.zeros((2, n_body, 4), dtype=np.complex128),
-            NamedSharding(mesh, P(None, "y", None)),
-        ),
-        hamiltonian_config_operator_fingerprint="sha256:" + "a" * 64,
-        operator_current_equivalent=True,
-        contact_is_exact=True,
-        ward_residual=0.0,
-        hermiticity_residual=0.0,
-    )
-    return replace(base, **changes)
-
-
 def test_hall_builder_has_only_transverse_ct_tc_and_fixed_sign():
     sigma = np.asarray((0.0, 0.0, 0.37))
     H = np.asarray(static_hall_linear_response(sigma))
@@ -96,6 +76,11 @@ def test_hall_builder_has_only_transverse_ct_tc_and_fixed_sign():
     Pi = np.einsum("a,aij->ij", q, H)
     np.testing.assert_allclose(q @ Pi[1:3, :], 0.0, atol=1.0e-15)
     np.testing.assert_allclose(Pi[:, 1:3] @ q, 0.0, atol=1.0e-15)
+
+
+def test_hall_builder_with_zero_sigma_is_exactly_zero():
+    H = np.asarray(static_hall_linear_response(np.zeros(3)))
+    np.testing.assert_array_equal(H, 0.0)
 
 
 def test_static_head_moment_matches_direct_coupled_dyson_algebra():
@@ -273,88 +258,122 @@ def test_static_head_completion_has_no_independent_cell_volume_seam():
         complete_static_slab_photon_q0).parameters
 
 
-def test_static_gauge_response_accepts_a_nonzero_ward_closed_tensor():
-    mesh = _mesh()
-    response = _response(mesh)
-    ward, hermiticity = static_gauge_tensor_residuals(response.S_direct)
+def test_static_gauge_tensor_residuals_accept_a_nonzero_ward_closed_tensor():
+    ward, hermiticity = static_gauge_tensor_residuals(_ward_closed_S())
     assert ward < 1.0e-15
     assert hermiticity == 0.0
-    assert require_static_gauge_head_response(response, mesh) is response
 
 
-def test_static_gauge_response_refuses_ward_breaking_tensor():
-    mesh = _mesh()
+def test_static_gauge_tensor_residuals_flag_a_ward_breaking_tensor():
     S = _ward_closed_S()
     S[0, 0, 1, 1] += 0.2
-    with pytest.raises(ValueError, match="static_gauge_head_ward"):
-        require_static_gauge_head_response(_response(mesh, S=S), mesh)
+    ward, _ = static_gauge_tensor_residuals(S)
+    assert ward > 1.0e-2
 
 
-def test_static_gauge_response_refuses_nonhermitian_tensor():
-    mesh = _mesh()
+def test_static_gauge_tensor_residuals_flag_a_nonhermitian_tensor():
     S = _ward_closed_S()
     S[0, 0, 0, 3] = 0.2j
-    with pytest.raises(ValueError, match="static_gauge_head_hermiticity"):
-        require_static_gauge_head_response(_response(mesh, S=S), mesh)
+    _, hermiticity = static_gauge_tensor_residuals(S)
+    assert hermiticity > 1.0e-2
 
 
-def test_static_gauge_response_refuses_a_wrong_wing_axis():
+def test_static_photon_head_response_is_sealed_to_its_producer():
+    with pytest.raises(TypeError, match="issued only by"):
+        StaticPhotonHeadResponse(
+            layout=None, S_direct=None, sigma_H=None, hall_source="",
+            Y_x=None, Z_y=None, ward_residual=0.0,
+            hermiticity_residual=0.0, wing_reciprocity_residual=0.0,
+            _producer_token=object())
+
+
+def test_packed_runtime_has_no_caller_supplied_head_response_seam():
+    parameters = inspect.signature(compute_static_photon_response).parameters
+    assert "gauge_head_response" not in parameters
+
+
+def test_packed_runtime_refuses_a_config_less_call_before_opening_a_body():
     mesh = _mesh()
-    if int(mesh.shape["x"]) == 1:
-        pytest.skip("x/y shardings are equivalent on a 1x1 mesh")
-    response = _response(mesh)
-    wrong_Y = jax.device_put(
-        np.zeros(response.Y_x.shape, dtype=np.complex128),
-        NamedSharding(mesh, P(None, None, "y")),
-    )
-    with pytest.raises(ValueError, match="Y_x must arrive"):
-        require_static_gauge_head_response(
-            replace(response, Y_x=wrong_Y), mesh)
+    with pytest.raises(ValueError, match="requires the run config"):
+        compute_static_photon_response(
+            None, None, None, None, None, mesh, config=None)
 
 
-@pytest.mark.parametrize(
-    ("changes", "gate"),
-    (
-        ({"operator_current_equivalent": False}, "static_gauge_head_operator"),
-        ({"contact_is_exact": False}, "static_gauge_head_contact"),
-        ({"hamiltonian_config_operator_fingerprint": ""},
-         "static_gauge_head_fingerprint"),
-    ),
-)
-def test_static_gauge_response_refuses_missing_physics_provenance(changes, gate):
-    mesh = _mesh()
-    with pytest.raises(ValueError, match=gate):
-        require_static_gauge_head_response(
-            _response(mesh, **changes), mesh)
-
-
-@pytest.mark.parametrize("caller_response", (None, "fabricated"))
-def test_full_screened_runtime_refuses_before_opening_a_body(caller_response):
+def test_packed_runtime_refuses_no_local_fields_before_opening_a_body():
     mesh = _mesh()
     config = SimpleNamespace(
-        head=SimpleNamespace(correction=HeadCorrection.FULL),
+        head=SimpleNamespace(correction=HeadCorrection.NO_LOCAL_FIELDS),
+        bispinor_gw="full_static_cohsex",
     )
-    response = None if caller_response is None else _response(mesh)
-    with pytest.raises(
-            ValueError, match="static_gauge_head_end_to_end_uncertified"):
+    with pytest.raises(ValueError, match="head_correction=full"):
         compute_static_photon_response(
-            None, None, None, None, None, mesh, config=config,
-            gauge_head_response=response,
-        )
+            None, None, None, None, None, mesh, config=config)
 
 
-def test_full_screened_deck_refuses_on_the_real_parse_path(tmp_path):
-    deck = tmp_path / "full_static_bispinor.in"
-    deck.write_text(
+def _packed_deck(*, sys_dim=2, extra=""):
+    return (
         "[cohsex]\n"
         "nval = 2\n"
         "ncond = 2\n"
         "number_bands = 8\n"
         "memory_per_device_gb = 4.0\n"
+        f"sys_dim = {sys_dim}\n"
         "bispinor = true\n"
         "bispinor_gw = full_static_cohsex\n"
-        "head_correction = full\n"
+        "compute_mode = cohsex\n"
+        "low_mem_bands = true\n"
+        "w_dyson_solver = distributed\n"
+        "restart = false\n"
+        + extra
     )
+
+
+def _parse(tmp_path, deck_text):
+    deck = tmp_path / "packed.in"
+    deck.write_text(deck_text)
+    return LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
+
+
+def test_packed_deck_default_head_runs_the_completion(tmp_path):
+    config = _parse(tmp_path, _packed_deck())
+    assert config.head.correction is HeadCorrection.FULL
+    assert uses_static_photon_response(config)
+    assert uses_coupled_photon_head(config)
+
+
+def test_packed_deck_off_head_is_an_announced_debug_skip(tmp_path):
+    config = _parse(tmp_path, _packed_deck(extra="head_correction = off\n"))
+    assert uses_static_photon_response(config)
+    assert not uses_coupled_photon_head(config)
+
+
+def test_packed_deck_refuses_no_local_fields(tmp_path):
+    with pytest.raises(ValueError, match="static_bispinor_photon_envelope"):
+        _parse(tmp_path,
+               _packed_deck(extra="head_correction = no_local_fields\n"))
+
+
+def test_packed_deck_completion_is_slab_only_and_says_why(tmp_path):
     with pytest.raises(
-            ValueError, match="full_static_bispinor_gauge_head_unavailable"):
-        LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
+            ValueError,
+            match="(?s)static_bispinor_photon_head_slab_only.*no derived "
+                  "integrator") as info:
+        _parse(tmp_path, _packed_deck(sys_dim=3))
+    assert "sys_dim = 2" in str(info.value)
+
+
+def test_packed_deck_off_head_keeps_the_bulk_body_reachable(tmp_path):
+    config = _parse(
+        tmp_path, _packed_deck(sys_dim=3, extra="head_correction = off\n"))
+    assert not uses_coupled_photon_head(config)
+
+
+def test_retired_charge_hall_cubature_spelling_names_the_new_mode(tmp_path):
+    deck = _packed_deck().replace(
+        "bispinor_gw = full_static_cohsex",
+        "bispinor_gw = charge_hall_cubature")
+    with pytest.raises(
+            ValueError,
+            match="(?s)bispinor_gw_charge_hall_cubature_retired.*"
+                  "full_static_cohsex"):
+        _parse(tmp_path, deck)

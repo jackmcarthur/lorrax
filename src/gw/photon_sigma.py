@@ -1,8 +1,16 @@
-"""Blockwise static self-energy for a screened four-current propagator.
+"""Sixteen-block static COHSEX self-energy of ``bispinor_gw = full_static_cohsex``.
 
-The response owner stores ``D^{AB}`` as one packed, two-dimensionally sharded
-operator.  This module only schedules its sixteen rectangular block views and
-contracts them.  The physics kernels remain the existing owners:
+This is the Sigma owner of the packed static photon mode.  The screening
+owner (:func:`gw.w_isdf.compute_static_photon_response`) stores the bare and
+screened four-current propagators ``V^{AB}``, ``W^{AB}`` (Lorentz ``A,B in
+{C, T1, T2, T3}``) as one packed, two-dimensionally sharded operator with
+its Gamma cell already completed.  :func:`compute_static_photon_sigma`
+streams the sixteen rectangular block views through the ordinary static
+COHSEX kernels with the Lorentz vertices folded into the wavefunction
+bundles, accumulating ``Sigma_X`` (bare), ``Sigma_SX`` and ``Sigma_COH``
+(screened) as one loop; ``Sigma^B`` (bare transverse exchange) is the TT
+part of ``Sigma_X`` here, not a separate term.  The physics kernels remain
+the existing owners:
 
 * :func:`gw.greens_function_kernel.build_G` builds the rectangular Green
   function;
@@ -10,6 +18,17 @@ contracts them.  The physics kernels remain the existing owners:
   convolution; and
 * :func:`common.contract_bands.contract_bands_block_reshard` projects the
   exchange/correlation operator back to band space.
+
+When the response carries a Gamma-cell completion
+(:class:`gw.head_correction.StaticSlabPhotonHeadCompletion`, always under
+``head_correction = full``), the same loop re-contracts the completion's
+bounded rank-4 factors alone (``q0_only`` convolution,
+:func:`gw.photon_layout.photon_q0_low_rank_block`) and reports the exact
+diagonal contribution of the completed Gamma blocks per ``(X, SX, COH) x
+(CC, CT+TC, TT)`` sector in :class:`StaticPhotonHeadSigmaDiagnostics`, gated
+by ``GATE photon_head_sigma_sector_closure`` (the three sectors must sum to
+the direct sixteen-block head total).  These diagnostics are what
+``gw.gw_output.write_freq_debug`` prints as the ``*_CC/_CTTC/_TT`` columns.
 
 The accumulator stays 2-D sharded until the ordinary static-Sigma result
 boundary (the face carrier first gathers its canonical full-band result, then
@@ -49,7 +68,6 @@ class StaticPhotonHeadSigmaDiagnostics:
 
     components_tskn_ry: jax.Array
     max_closure_residual_ry: float
-    hamiltonian_config_operator_fingerprint: str | None
     output_basis: str
 
     def __post_init__(self) -> None:
@@ -58,14 +76,6 @@ class StaticPhotonHeadSigmaDiagnostics:
             raise ValueError(
                 "static photon head diagnostics must be (3 terms,3 sectors,"
                 f"nk,nb); got {shape}")
-        if self.hamiltonian_config_operator_fingerprint is not None:
-            from .head_correction import require_canonical_operator_fingerprint
-            fingerprint = require_canonical_operator_fingerprint(
-                self.hamiltonian_config_operator_fingerprint,
-                gate="static_photon_head_sigma_fingerprint",
-            )
-            object.__setattr__(
-                self, "hamiltonian_config_operator_fingerprint", fingerprint)
         if self.output_basis != "dft":
             raise ValueError(
                 "static photon head Sigma diagnostics must be stamped in "
@@ -473,10 +483,5 @@ def compute_static_photon_sigma(
             f"{closure_limit:.3e} Ry")
     return (
         sig_x, sig_sx, sig_coh,
-        StaticPhotonHeadSigmaDiagnostics(
-            components,
-            closure_abs,
-            head_completion.hamiltonian_config_operator_fingerprint,
-            "dft",
-        ),
+        StaticPhotonHeadSigmaDiagnostics(components, closure_abs, "dft"),
     )

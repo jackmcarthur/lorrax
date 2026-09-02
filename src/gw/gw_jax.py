@@ -303,11 +303,12 @@ def main(argv=None):
 				" (normalized Pauli two-spinor charge/CC reference; raw "
 				"kinetic-balance only at spatial-current vertices)"),
 			"full_static_cohsex": (
-				" (experimental no-pair packed 4x4 static response; "
-				"head_correction=off)"),
-			"charge_hall_cubature": (
-				" (experimental no-pair packed 4x4 body plus charge/Hall "
-				"slab cubature; not FULL)"),
+				" (packed no-pair 4x4 static response with the Gamma-cell "
+				"completion: bare <D> into V, charge S00/wing head into W, "
+				"Hall CT/TC from static_gauge_hall_file when present)"
+				if config.head.correction is HeadCorrection.FULL else
+				" (packed no-pair 4x4 static response; DEBUG: Gamma-cell "
+				"head disabled by head_correction=off)"),
 		}.get(config.bispinor_gw.value, "")
 		print0(
 			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
@@ -941,8 +942,6 @@ def main(argv=None):
 	           else jnp.zeros_like(sig_x))
 	photon_head_sigma_diag_tskn_ry = (
 		sigma_result.photon_head_sigma_diag_tskn_ry)
-	photon_head_sigma_operator_fingerprint = (
-		sigma_result.photon_head_sigma_operator_fingerprint)
 	photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
 	if photon_head_sigma_diag_tskn_ry is None:
 		photon_head_sigma_diag_tskn_ry = np.zeros(
@@ -1168,8 +1167,6 @@ def main(argv=None):
 		             else float(config.eqp2.tol_ev)),
 		photon_head_sigma_diag_tskn_ry=np.asarray(
 			photon_head_sigma_diag_tskn_ry),
-		photon_head_sigma_operator_fingerprint=(
-			photon_head_sigma_operator_fingerprint),
 		photon_head_sigma_basis=photon_head_sigma_basis,
 	)
 	if meta.rank == 0:

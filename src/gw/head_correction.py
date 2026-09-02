@@ -1,21 +1,62 @@
-"""Helpers for the q=0, G=G'=0 Coulomb head.
+"""The q=0, G=G'=0 (Gamma-cell) head of the Coulomb / photon interaction.
 
-The modern GWJAX paths keep the head separate from the ISDF body tensors:
+A finite k-grid never samples the singular ``q -> 0, G = 0`` slot of ``v``
+or ``W``.  This module owns every way LORRAX fills that slot, for the scalar
+charge channel and for the packed four-current (photon) operator; the
+physics is stated in ``docs/theory/four-current-head-corrections.md`` and the
+``S(omega)`` convention in ``docs/theory/s-tensor-convention.md``.
 
-- Dynamic GN-PPM uses scalar head samples ``(v_h, W_h(0), W_h(iω_p))``.
-- Static COHSEX uses exact band-diagonal head shifts for ``Σ^X``, ``Σ^SX``,
-  ``Σ^(SX-X)``, and ``Σ^COH``.
-- Downstream BSE / Σ-builders that already consume ``V_qmunu``/``W_qmunu``
-  can absorb the head as a rank-1 update at ``q=0`` via
-  ``apply_q0_head_rank1`` (see below).
+What the module owns
+--------------------
 
-This module centralizes:
+* **Scalar head resolution** -- :class:`HeadResolver`, :func:`resolve_head_sample`
+  and :func:`build_S_cart_omega`: the ``head_correction`` policy
+  (``full`` / ``no_local_fields`` / ``off``), the head source order
+  (deck overrides, ``epshead``, the ``dipole.h5`` ``S`` tensor), the
+  ``dipole.h5`` coverage and provenance gates, and the memoized per-frequency
+  :class:`HeadSample` ``(v_h, W_h(omega))`` every Sigma route reads.
+* **The Schur fold of head against body** --
+  :func:`fold_cartesian_head_wings_sharded` (scalar ``S_eff = S + Y W Z /
+  Omega``), :func:`fold_small_head_wings_sharded` and
+  :func:`small_head_wing_halves_sharded` (the same fold for one Lorentz block
+  of the packed photon body, wings sharded on the mesh; nothing gathers).
+* **Static COHSEX head terms** -- :class:`StaticHeadTerms` and
+  :func:`compute_static_head_terms`: the exact band-diagonal ``Sigma^X``,
+  ``Sigma^SX``, ``Sigma^(SX-X)``, ``Sigma^COH`` shifts.
+* **Dynamic heads** -- :func:`fit_head_ppm` (GN / HL single pole from two
+  samples) and :func:`compute_complex_pole_head_sigma_diag` (MPA poles on the
+  stamped complex grid).
+* **Rank-1 re-attachment** -- :func:`apply_q0_head_rank1` and
+  :func:`resolve_head_S_cart`: the ``(W_h/Omega) conj(g0) x g0`` update that
+  downstream W consumers (BSE, densifiers) apply to a headless ``W(q=0)``.
+* **The BGW finite-q0 channel** -- :class:`BGWQ0Channel`,
+  :func:`resolve_bgw_q0_channel` (``bgw_metal_q0_treatment``).
+* **The packed static photon Gamma-cell completion** --
+  :func:`static_hall_linear_response` (the unique Hall-only CT/TC tensor from
+  ``sigma_H``), :func:`canonicalize_static_gauge_q2_tensor` and
+  :func:`static_gauge_tensor_residuals` (the in-plane Ward / Hermiticity
+  certificates of a ``(2,2,4,4)`` response), the fixed-size coupled 4x4
+  Dyson/cubature kernel :func:`static_slab_photon_head_moment_chunk`, and
+  :func:`complete_static_slab_photon_q0`, which folds the bounded
+  :class:`gw.static_gauge_response.StaticPhotonHeadResponse` through the
+  headless packed body, solves ``W_h(q) = [1 - D(q) R(q)]^{-1} D(q)`` on the
+  exact slab Wigner-Seitz cubature, and inserts the bare and nine screened
+  rank-4 moments into packed V and W (:func:`gw.photon_layout.
+  add_photon_q0_low_rank`).  Its evidence record
+  :class:`StaticSlabPhotonHeadCompletion` carries the numerical
+  certificates and the bounded factor carrier
+  :class:`StaticPhotonQ0FactorCarrier` that ``gw.photon_sigma`` uses to
+  attribute Sigma per Lorentz sector.  Slab only: a bulk analytic-sphere
+  completion cannot be added after the nonlinear coupled solve and has no
+  derived integrator.
 
-- head source resolution (`override`, `epshead`, `s_tensor`)
-- scalar GN-PPM head fitting
-- exact static COHSEX head terms
-- bounded small-field/body Schur folding on the 2-D mesh
-- rank-1 (μ,ν)-basis head injection at q=0
+What it does not own
+--------------------
+
+The velocity / ``S`` / wing / Hall producers (``gw.qsgw_head``), the mini-BZ
+estimators and the photon cubature (``vcoul``), the packed layout
+(``gw.photon_layout``), the bare TT head slot (``gw.v_q_bispinor``), and the
+Hall artifact format (``file_io.static_gauge_head``).
 """
 
 from __future__ import annotations
@@ -118,47 +159,6 @@ _STATIC_GAUGE_WARD_RESIDUAL_MAX = 1.0e-8
 _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX = 1.0e-10
 
 
-@dataclass(frozen=True)
-class StaticGaugeHeadResponse:
-    r"""Gauge-closed static slab head/wings supplied by an operator artifact.
-
-    For in-plane Cartesian momentum ``q=(qx,qy)``, the regular response is
-
-    ``Pi_reg(q) = q_a q_b S_direct[a,b]``.
-
-    The only admitted linear CT/TC term is generated structurally from the
-    separately sourced Hall pseudovector ``sigma_H`` by
-
-    ``Pi_H[0,i](q) = i epsilon[b,a,i] sigma_H[b] q[a]``.
-
-    Thus this record has no arbitrary ``H_direct`` field.  ``Y_x`` and ``Z_y``
-    are the incumbent qsgw-head one-leg orientations and remain sharded on the
-    packed photon body.  The two reported residuals are dimensionless relative
-    certificates evaluated by the artifact producer on the complete operator;
-    this module independently rechecks the bounded ``S_direct`` tensor before
-    the mini-BZ solve.
-
-    ``hamiltonian_config_operator_fingerprint`` is one SHA-256 identity for
-    the Hamiltonian/configuration and the complete operator construction.  It
-    binds sigma.p, the VNL/downfolded contact, and the Hall response together;
-    per-component provenance strings are deliberately absent because they can
-    drift independently.  ``operator_current_equivalent`` and
-    ``contact_is_exact`` are required in production; the raw kinetic-balance
-    alpha-current bubble cannot set either flag merely by fitting finite q.
-    """
-
-    layout: object
-    S_direct: jax.Array                # (2, 2, 4, 4), replicated
-    sigma_H: object                    # (3,), real Hall pseudovector
-    Y_x: jax.Array                     # (2, 4, N_packed), x-sharded
-    Z_y: jax.Array                     # (2, N_packed, 4), y-sharded
-    hamiltonian_config_operator_fingerprint: str
-    operator_current_equivalent: bool
-    contact_is_exact: bool
-    ward_residual: float
-    hermiticity_residual: float
-
-
 def static_hall_linear_response(sigma_H) -> jax.Array:
     r"""Return the unique static Hall-only linear CT/TC tensor.
 
@@ -243,111 +243,6 @@ def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
     ), axis=0)
     ward_error = float(max(np.max(np.abs(left)), np.max(np.abs(right))))
     return ward_error / scale, max(coordinate_error, lorentz_error) / scale
-
-
-def require_canonical_operator_fingerprint(
-    value: object, *, gate: str = "operator_fingerprint",
-) -> str:
-    """Return one canonical ``sha256:<64 lowercase hex>`` fingerprint.
-
-    This is the single parser for the response transaction and every
-    downstream authenticated receipt.  Callers may add physics-specific
-    context around its error, but must not weaken or respell the token.
-    """
-    fingerprint = str(value).strip()
-    if (not fingerprint.startswith("sha256:")
-            or len(fingerprint) != len("sha256:") + 64
-            or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
-        raise ValueError(
-            f"GATE {gate}: expected sha256:<64 lowercase hex>; "
-            f"got {fingerprint!r}")
-    return fingerprint
-
-
-def require_static_gauge_head_response(
-    response: StaticGaugeHeadResponse, mesh_xy: Mesh,
-) -> StaticGaugeHeadResponse:
-    """Validate the production artifact without gathering either body wing."""
-    if not isinstance(response, StaticGaugeHeadResponse):
-        raise TypeError(
-            "production photon q0 completion requires StaticGaugeHeadResponse; "
-            f"got {type(response).__name__}")
-    from .photon_layout import PhotonBasisLayout
-    if not isinstance(response.layout, PhotonBasisLayout):
-        raise TypeError(
-            "StaticGaugeHeadResponse.layout must be the canonical "
-            f"PhotonBasisLayout; got {type(response.layout).__name__}")
-    response.layout.assert_mesh(mesh_xy)
-    n_body = int(response.layout.packed_extent)
-    expected_shapes = (
-        (response.S_direct, "S_direct", (2, 2, 4, 4), P()),
-        (response.Y_x, "Y_x", (2, 4, n_body), P(None, None, "x")),
-        (response.Z_y, "Z_y", (2, n_body, 4), P(None, "y", None)),
-    )
-    for array, name, shape, spec in expected_shapes:
-        if tuple(array.shape) != shape:
-            raise ValueError(f"{name} shape {array.shape} != {shape}")
-        sharding = getattr(array, "sharding", None)
-        wanted = NamedSharding(mesh_xy, spec)
-        same_mesh = (
-            isinstance(sharding, NamedSharding)
-            and tuple(sharding.mesh.axis_names) == tuple(mesh_xy.axis_names)
-            and np.array_equal(sharding.mesh.devices, mesh_xy.devices)
-        )
-        if not same_mesh or not sharding.is_equivalent_to(wanted, array.ndim):
-            raise ValueError(
-                f"{name} must arrive on the production mesh with sharding "
-                f"{spec}; got {sharding!r}. Refusing an implicit response "
-                "reshard.")
-
-    # Constructs and validates the small Hall tensor; its return is consumed by
-    # the mini-BZ stage, so no second Hall spelling exists.
-    static_hall_linear_response(response.sigma_H)
-    fingerprint = require_canonical_operator_fingerprint(
-        response.hamiltonian_config_operator_fingerprint,
-        gate="static_gauge_head_fingerprint",
-    )
-    if not bool(response.operator_current_equivalent):
-        raise ValueError(
-            "GATE static_gauge_head_operator: the supplied current/multipoles "
-            "are not certified as derivatives of their named Hamiltonian.\n"
-            f"  got:  fingerprint={fingerprint!r}, "
-            "operator_current_equivalent=false\n"
-            "  want: one current-equivalent charge/current/multipole operator\n"
-            "  fix:  complete the raw no-pair alpha vertex with the gauged "
-            "VNL/downfolded operator track\n"
-            "  doc:  docs/input_reference.md, bispinor_gw.")
-    if not bool(response.contact_is_exact):
-        raise ValueError(
-            "GATE static_gauge_head_contact: the supplied contact is not the "
-            "same Hamiltonian's exact second gauge-field variation.\n"
-            f"  got:  fingerprint={fingerprint!r}, "
-            "contact_is_exact=false\n"
-            "  want: exact second-variation/contact provenance\n"
-            "  fix:  supply the VNL plus negative-energy/downfolded contact; "
-            "a Pi(q)-Pi(0) proxy is diagnostic only\n"
-            "  doc:  docs/input_reference.md, bispinor_gw.")
-
-    reported = (float(response.ward_residual),
-                float(response.hermiticity_residual))
-    if not np.all(np.isfinite(reported)) or min(reported) < 0.0:
-        raise ValueError(
-            "static gauge response reports invalid Ward/Hermiticity "
-            f"residuals: {reported}")
-    structural = static_gauge_tensor_residuals(response.S_direct)
-    ward = max(reported[0], structural[0])
-    hermiticity = max(reported[1], structural[1])
-    if ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX:
-        raise ValueError(
-            "GATE static_gauge_head_ward: response violates the static Ward "
-            f"identity: max_relative={ward:.6e} > "
-            f"{_STATIC_GAUGE_WARD_RESIDUAL_MAX:.1e}")
-    if hermiticity > _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:
-        raise ValueError(
-            "GATE static_gauge_head_hermiticity: response violates its "
-            f"canonical Hermiticity contract: max_relative={hermiticity:.6e} "
-            f"> {_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}")
-    return response
 
 
 @dataclass(frozen=True)
@@ -1239,7 +1134,11 @@ class StaticSlabPhotonHeadCompletion:
     mixed_convergence_error_ratios: tuple[float, float]
     ward_residual: float
     hermiticity_residual: float
-    hamiltonian_config_operator_fingerprint: str | None
+    #: The Hall pseudovector that entered ``R(q)`` (bohr^-1) and where it
+    #: came from (the authenticated artifact producer, or the announced
+    #: ``sigma_H = 0`` default when no ``static_gauge_hall_file`` exists).
+    sigma_H: np.ndarray
+    hall_source: str
     q0_factors: StaticPhotonQ0FactorCarrier
 
 
@@ -1399,34 +1298,23 @@ def complete_static_slab_photon_q0(
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
     r"""Complete bare and screened packed photon operators in the Γ cell.
 
-    ``cubature_receipt`` is the sole vcoul provider's authenticated exact
-    Wigner--Seitz/Duffy ladder and the sole cell-volume source for the
-    completion.  Each sample first solves the coupled
-    four-field head Dyson
-    equation; only its ``(1,qx,qy)`` moments survive.  The packed body is
-    then updated by one bare and nine screened rank-four outer products.
-    No sample-by-centroid tensor or second photon packing convention exists.
+    ``response`` is the sealed bounded
+    :class:`gw.static_gauge_response.StaticPhotonHeadResponse` (charge
+    ``S^{00}``, charge wings, ``sigma_H``); the kernel below constructs the
+    Hall tensor from ``sigma_H`` itself, so no arbitrary linear CT/TC matrix
+    can enter.  ``cubature_receipt`` is the sole vcoul provider's
+    authenticated exact Wigner--Seitz/Duffy ladder and the sole cell-volume
+    source for the completion.  Each sample first solves the coupled
+    four-field head Dyson equation; only its ``(1,qx,qy)`` moments survive.
+    The packed body is then updated by one bare and nine screened rank-four
+    outer products.  No sample-by-centroid tensor or second photon packing
+    convention exists.
     """
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
+    from .static_gauge_response import require_static_photon_head_response
 
-    # The exact/full response and the deliberately truncated charge+Hall
-    # response share this numerical path.  The bounded response stores only
-    # the independent inputs; the kernel below constructs its Hall tensor
-    # directly from sigma_H.
-    from .static_gauge_response import (
-        ChargeHallCubatureResponse,
-        require_charge_hall_cubature_response,
-    )
-    if isinstance(response, ChargeHallCubatureResponse):
-        response = require_charge_hall_cubature_response(response, mesh_xy)
-        # The Hall identifier says nothing about the independently built
-        # charge S/Y/Z response.  Do not publish it as a whole-head identity.
-        operator_fingerprint = None
-    else:
-        response = require_static_gauge_head_response(response, mesh_xy)
-        operator_fingerprint = (
-            response.hamiltonian_config_operator_fingerprint)
+    response = require_static_photon_head_response(response, mesh_xy)
     layout = response.layout
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
@@ -1620,8 +1508,9 @@ def complete_static_slab_photon_q0(
         ward_residual=max(float(response.ward_residual), effective_ward),
         hermiticity_residual=max(
             float(response.hermiticity_residual), effective_hermiticity),
-        hamiltonian_config_operator_fingerprint=(
-            operator_fingerprint),
+        sigma_H=np.asarray(
+            jax.device_get(response.sigma_H), dtype=np.float64),
+        hall_source=str(response.hall_source),
         q0_factors=StaticPhotonQ0FactorCarrier(
             bare_pair=(left_bare, right_bare),
             screened_pairs=tuple(screened_pairs)),
