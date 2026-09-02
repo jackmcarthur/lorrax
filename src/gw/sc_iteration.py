@@ -2624,8 +2624,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # degeneracy manifold, not by a user-expanded near-degenerate/SOC
             # scale.  A resolved 1.7 meV pair is physics and remains two
             # distinct samples; only <=0.1 meV may be grouped here.
-            conduction_frontier_tol_ev=float(
-                inputs.config.sc.exact_degeneracy_tol_ev),
+            conduction_frontier_tol_ev=(
+                float(inputs.config.sc.exact_degeneracy_tol_ev)
+                if inputs.config.sc.tail_fit == "frontier" else None),
         )
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
@@ -2641,7 +2642,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"{logical_stop}) with conduction "
             f"alpha={tail_fit.alpha_c:+.4f}, "
             f"beta={tail_fit.beta_c_ev:+.4f} eV "
-            f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f})")
+            f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
+            f"policy={inputs.config.sc.tail_fit})")
 
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
@@ -5009,7 +5011,8 @@ def run_sc_driver(
         inputs,
         f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
         f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}, "
-        f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV"
+        f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV, "
+        f"tail_fit={sc.tail_fit}"
         + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
            else f", α={sc.mixing:.2f}"))
     state_final, rms_history = run_self_consistency(

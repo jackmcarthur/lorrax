@@ -1722,6 +1722,10 @@ _DEFAULTS = {
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
     # than an order below MoS2's physical 1.7--3.6 meV SOC-split K pair.
     "sc_exact_degeneracy_tol_ev": 1.0e-4,
+    # The frontier law is the production window-stable tail update.  The
+    # all_conduction spelling retains the historical affine-fit control for
+    # diagnosing window-edge cycles; it never changes degeneracy treatment.
+    "sc_tail_fit": "frontier",   # frontier | all_conduction
     "sc_eigh": "auto",           # auto | native | distributed (per-iteration
                                  # eigh of the (nk, nb, nb) carry; a LAYOUT
                                  # choice, independent of the physics knobs)
@@ -4544,6 +4548,9 @@ class SCConfig:
     - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
       accidental-degeneracy average.  The default is 0.1 meV; physical SOC
       splittings above it remain distinct states.
+    - ``tail_fit``: ``"frontier"`` uses the lowest accidental-degeneracy
+      conduction manifold for the energy-only sum-band tail;
+      ``"all_conduction"`` is the historical affine-fit diagnostic control.
     - ``eigh``: which eigh diagonalises the ``(nk, nb, nb)`` carry each
       iteration — ``"native"`` (k-sharded batch: one WHOLE ``(nb, nb)``
       tile per device), ``"distributed"`` (one tile spread over the mesh),
@@ -4559,6 +4566,7 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
+    tail_fit: str = "frontier"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
     #: values are the METAL head modes: both run the per-iteration head
@@ -4588,6 +4596,10 @@ class SCConfig:
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
                 "The 0.1 meV ceiling separates accidental degeneracy from "
                 "resolved physical splittings; it is not an SC damping knob.")
+        if self.tail_fit not in ("frontier", "all_conduction"):
+            raise ValueError(
+                "sc_tail_fit must be 'frontier' or 'all_conduction'; "
+                f"got {self.tail_fit!r}.")
         if self.eigh not in ("auto", "native", "distributed"):
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
@@ -5488,6 +5500,7 @@ class LorraxConfig:
                 "sc_dump_dir") or None,
             exact_degeneracy_tol_ev=float(
                 _g("sc_exact_degeneracy_tol_ev")),
+            tail_fit=str(_g("sc_tail_fit")).strip().lower(),
             # No env override: the LORRAX_SC_* envs are deprecated and a
             # new knob must not add one.
             eigh=str(_g("sc_eigh")).strip().lower(),
