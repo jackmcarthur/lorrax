@@ -501,3 +501,32 @@ def test_outside_the_packed_envelope_the_overlay_is_still_accepted(tmp_path):
     assert "sys_dim = 3" in reason
     assert not uses_static_photon_response(cfg)
     assert cfg.head.bispinor_tt_head_correction is True
+
+
+# ---------------------------------------------------------------------------
+# In-band import canary.  `lx run` can resolve `src/` and, separately,
+# `services/*/src` to the BASE MODULE's checkout rather than the one under
+# test (KNOWN_SANDBOX_ERRORS.md, four 2026-09-01 rows).  `lx test` has not
+# been observed to do it, but "not observed" is not a gate, and a suite that
+# silently graded another tree would look exactly like a passing suite.
+# The failing case is reachable: force lorrax_A's roots onto sys.path ahead
+# of this tree and the same predicate reports offenders (lane E measured it,
+# step lx-Xg1-192850-1967865-4443).
+# ---------------------------------------------------------------------------
+
+
+def test_this_file_grades_the_checkout_it_lives_in():
+    import importlib
+    import gw
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for name in ("gw.gw_config", "gw.w_isdf", "gw.head_correction",
+                 "gw.v_q_bispinor", "vcoul", "vcoul.minibz"):
+        module = importlib.import_module(name)
+        origin = pathlib.Path(module.__file__).resolve()
+        if repo not in origin.parents:
+            offenders.append(f"{name} -> {origin}")
+    assert not offenders, (
+        f"these modules came from outside {repo}: " + "; ".join(offenders))
+    assert pathlib.Path(gw.__file__).resolve().parents[1] == repo / "src"
