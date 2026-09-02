@@ -247,6 +247,8 @@ def write_sigma_to_file(
 	hartree_label: str = "VH",
 	sigma_lorentz_skn_eV=None,
 	sigma_c_odd_kn_eV=None,
+	z_factor_kn=None,
+	z_pathological_kn=None,
 ):
 	"""Write self-energy components to file.
 
@@ -275,6 +277,11 @@ def write_sigma_to_file(
 			written.  None leaves the historical scalar file byte-identical.
 		sigma_c_odd_kn_eV: Optional measured broken-TR contribution to Sigma_c,
 			shape (nk, band), written as ``sigC_odd``.  None omits the column.
+		z_factor_kn: Optional raw quasiparticle residue, shape ``(nk, band)``.
+			When present, every row records ``Z`` without clipping it.
+		z_pathological_kn: Boolean twin of ``z_factor_kn``.  True means the
+			raw Z was non-finite or outside ``0 < Z <= 1`` and ``eqp1`` used
+			the state-local ``eqp0`` fallback.
 
 	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
 	------------------------------------------------
@@ -398,6 +405,19 @@ def write_sigma_to_file(
 				f"does not equal {total_label}: {_closure:.3e} eV > "
 				f"{_limit:.3e} eV")
 	odd_diag = _diag(sigma_c_odd_kn_eV)
+	z_diag = None if z_factor_kn is None else np.asarray(
+		z_factor_kn, dtype=np.float64)
+	z_bad = None if z_pathological_kn is None else np.asarray(
+		z_pathological_kn, dtype=bool)
+	if (z_diag is None) != (z_bad is None):
+		raise ValueError(
+			"z_factor_kn and z_pathological_kn are one diagnostic pair; pass "
+			"both or neither.")
+	if z_diag is not None and (z_diag.shape != (nk, nbands)
+			or z_bad.shape != (nk, nbands)):
+		raise ValueError(
+			"Z diagnostics must both have shape "
+			f"({nk},{nbands}); got {z_diag.shape} and {z_bad.shape}.")
 
 	def _is_complex(d):
 		return d is not None and bool(np.any(np.abs(np.imag(d)) > _IM_TOL))
@@ -441,6 +461,10 @@ def write_sigma_to_file(
 		if odd_diag is not None:
 			f.write("# sigC_odd = ordered broken-TR GN residue contribution "
 			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
+		if z_diag is not None:
+			f.write("# Z_status=PATHOLOGICAL_EQP1_FALLBACK means raw Z is "
+			        "non-finite or outside 0 < Z <= 1; that state's eqp1 "
+			        "equals eqp0\n")
 		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
 		        f"states its crystal coordinate on a '# kcrys' line\n")
 		# The star-spread diagnostic, MEASURED ON THE FULL BZ upstream (see
@@ -553,6 +577,11 @@ def write_sigma_to_file(
 				# existing sigSX/sigCOH/sigTOT/VH parsers are unaffected.
 				if energies_dft_ev is not None:
 					line += f"  Eo={float(energies_dft_ev[k, n]):>12.6f}"
+
+				if z_diag is not None:
+					line += f"  Z={float(z_diag[k, n]):>12.6f}"
+					line += ("  Z_status=PATHOLOGICAL_EQP1_FALLBACK"
+					         if z_bad[k, n] else "  Z_status=OK")
 
 				f.write(line + "\n")
 
