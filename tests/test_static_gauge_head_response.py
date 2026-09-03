@@ -519,6 +519,11 @@ def test_charge_head_insertion_norm_stats_is_a_sharded_scalar_reduction():
         rtol=0.0, atol=1.0e-14)
 
 
+def test_packed_response_selects_literal_gamma_before_norm_reduction():
+    source = inspect.getsource(compute_static_photon_response)
+    assert "photon_g0_vectors[0][0], mesh_xy=mesh_xy" in source
+
+
 def test_completed_photon_head_record_exposes_moments_ws_and_norm_stats():
     moments = np.arange(3 * 3 * 4 * 4, dtype=np.float64).reshape(3, 3, 4, 4)
     completion = SimpleNamespace(

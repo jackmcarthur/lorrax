@@ -2332,7 +2332,7 @@ def compute_static_photon_response(
         g0_X = pack_photon_channel_vectors(
             tuple(photon_g0_vectors), layout, mesh_xy, axis_name="x")[0]
         charge_head_insertion_stats = charge_head_insertion_norm_stats(
-            wfns_charge, photon_g0_vectors[0], mesh_xy=mesh_xy)
+            wfns_charge, photon_g0_vectors[0][0], mesh_xy=mesh_xy)
         y_sharding = NamedSharding(mesh_xy, P(None, "y"))
         g0_Y = pack_photon_channel_vectors(
             tuple(device_put_process_local(vector, y_sharding)
