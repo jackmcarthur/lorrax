@@ -367,14 +367,17 @@ def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
     assert spec["kind"] == "crossing"
     padded = _sc_padded_box_spec(spec, eta)
     expanded_poles = ((0.9, 2.2, 0.45, 1.1),)
-    pole_box, _, _ = _box_for_window(
-        spec["frequencies"], spec["states"], expanded_poles,
+    policy_box, _, _ = _box_for_window(
+        spec["frequencies"],
+        (min(spec["states"]) - 2.0 / RYD_TO_EV,
+         max(spec["states"]) + 2.0 / RYD_TO_EV),
+        expanded_poles,
         spec["pole_sign"], eta)
     expected = (
-        min(spec["box"][0], pole_box[0]) - 2.0 / RYD_TO_EV,
-        max(spec["box"][1], pole_box[1]) + 2.0 / RYD_TO_EV,
-        min(spec["box"][2], pole_box[2]),
-        max(spec["box"][3], pole_box[3]),
+        min(spec["box"][0], policy_box[0]),
+        max(spec["box"][1], policy_box[1]),
+        min(spec["box"][2], policy_box[2]),
+        max(spec["box"][3], policy_box[3]),
     )
     np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
     assert padded["sc_state_pad_ev"] == 2.0
@@ -389,15 +392,28 @@ def test_two_level_sc_rule_padding_is_quarter_ev_with_fixed_poles():
         eta_ry=eta)
     padded = _sc_padded_box_spec(
         spec, eta, state_pad_ev=0.25, pole_pad_fraction=0.0)
-    expected = (
-        spec["box"][0] - 0.25 / RYD_TO_EV,
-        spec["box"][1] + 0.25 / RYD_TO_EV,
-        spec["box"][2],
-        spec["box"][3],
-    )
+    expected, _, _ = _box_for_window(
+        spec["frequencies"],
+        (min(spec["states"]) - 0.25 / RYD_TO_EV,
+         max(spec["states"]) + 0.25 / RYD_TO_EV),
+        (spec["pole_extent"],), spec["pole_sign"], eta)
     np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
     assert padded["sc_state_pad_ev"] == 0.25
     assert padded["sc_pole_pad_fraction"] == 0.0
+
+
+def test_state_padding_contains_both_edges_of_a_sign_definite_box():
+    eta = 0.1
+    spec = make_sigma_box_spec(
+        name="positive", frequencies=(4.0, 5.0), states=(0.1, 0.2),
+        pole_stats=((1.0, 2.0, 0.5, 1.0),), pole_sign=1.0,
+        eta_ry=eta)
+    assert spec["kind"] == "sign_definite_positive"
+    padded = _sc_padded_box_spec(
+        spec, eta, state_pad_ev=0.25, pole_pad_fraction=0.0)
+
+    assert padded["box"][0] < spec["box"][0]
+    assert padded["box"][1] > spec["box"][1]
 
 
 def test_fixed_sc_accepts_the_box_services_finite_fallback(monkeypatch):

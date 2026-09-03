@@ -551,20 +551,21 @@ def _sc_padded_box_spec(
         max(0.0, gamma_lo - frac * abs(gamma_lo)),
         gamma_hi + frac * abs(gamma_hi),
     ),)
-    pole_box, _, _ = _box_for_window(
-        spec["frequencies"], spec["states"], padded_poles,
+    state_pad_ry = float(state_pad_ev) / RYD_TO_EV
+    states = np.asarray(spec["states"], dtype=np.float64)
+    padded_states = (
+        float(np.min(states)) - state_pad_ry,
+        float(np.max(states)) + state_pad_ry,
+    )
+    policy_box, _, _ = _box_for_window(
+        spec["frequencies"], padded_states, padded_poles,
         spec["pole_sign"], eta)
     box = [
-        min(spec["box"][0], pole_box[0]),
-        max(spec["box"][1], pole_box[1]),
-        min(spec["box"][2], pole_box[2]),
-        max(spec["box"][3], pole_box[3]),
+        min(spec["box"][0], policy_box[0]),
+        max(spec["box"][1], policy_box[1]),
+        min(spec["box"][2], policy_box[2]),
+        max(spec["box"][3], policy_box[3]),
     ]
-    state_pad_ry = float(state_pad_ev) / RYD_TO_EV
-    if spec["kind"] in ("crossing", "sign_definite_negative"):
-        box[0] -= state_pad_ry
-    if spec["kind"] in ("crossing", "sign_definite_positive"):
-        box[1] += state_pad_ry
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
