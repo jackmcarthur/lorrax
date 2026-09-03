@@ -66,6 +66,11 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
     calls = {}
 
     class _Tables:
+        def logical(self, n_rmu):
+            assert n_rmu == 5
+            calls["logical_extent"] = n_rmu
+            return self
+
         def canonical(self):
             return self
 
@@ -117,6 +122,72 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
     }
     assert kwargs["expected_screening_diagrams"] == "w_rpa"
     assert calls["occupation"][0] == str(fit.resolve())
+    assert calls["logical_extent"] == 5
+
+
+def test_explicit_fit_reuse_hashes_logical_table_not_runtime_padding(
+        tmp_path, monkeypatch):
+    """P36's 2070 -> 2088 carrier pad is absent from the fit identity."""
+    fit = tmp_path / "mpa_fit_oneshot.h5"
+    fit.touch()
+
+    class _LogicalTables:
+        def canonical(self):
+            return self
+
+        def digest(self):
+            return "logical-table"
+
+    logical = _LogicalTables()
+
+    class _PaddedTables:
+        def logical(self, n_rmu):
+            assert n_rmu == 5
+            return logical
+
+        def canonical(self):
+            return self
+
+        def digest(self):
+            return "device-padded-table"
+
+    padded = _PaddedTables()
+    monkeypatch.setattr(
+        model, "_q_wedge",
+        lambda *_args: (
+            np.array([0], np.int32), padded,
+            SimpleNamespace(centroid_hash="centroids-current")))
+    seen = {}
+
+    def validate(_path, **kwargs):
+        seen.update(kwargs["expected_identity"])
+        return {
+            "n_p": 8, "n_q": 1, "n_mu": 5,
+            "ordered_residues": False,
+        }
+
+    monkeypatch.setattr(model.mpa_store, "validate_fit_store", validate)
+    stored_plan, live_plan = object(), object()
+    monkeypatch.setattr(
+        model, "make_mpa_plan_from_fit",
+        lambda *_args, **_kwargs: stored_plan)
+    z = np.asarray([2.0e-5j, 1.0 + 0.2j])
+    monkeypatch.setattr(model.sample_plan, "plan_z", lambda _plan: z)
+    config = SimpleNamespace(
+        mpa=SimpleNamespace(n_poles=8),
+        screening=SimpleNamespace(diagrams="w_rpa"))
+
+    model.validate_reused_mpa_fit(
+        fit, config=config, live_plan=live_plan,
+        sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
+        meta=SimpleNamespace(n_rmu=5), mesh_xy=None,
+        occupation_state=None, material_class="insulator",
+        print_fn=lambda *_args: None)
+
+    assert seen == {
+        "w_table_hash": logical.digest(),
+        "w_centroid_hash": "centroids-current",
+    }
 
 
 def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):

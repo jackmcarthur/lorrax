@@ -97,10 +97,18 @@ def validate_reused_mpa_fit(
 
     q_idx, tables, closure_verdict = _q_wedge(
         sym, centroid_indices, meta)
+    # ``allocate_w_omega_collective`` writes the device-independent logical
+    # q-table contract: its writer strips the product padding after asserting
+    # that the permutation tail is identity and the wrap tail is zero.  Hash
+    # that same logical object here.  Hashing the live table directly makes a
+    # P=36 run with 2070 centroids compare its 2088-row carrier digest against
+    # the fit's 2070-row on-disk digest, refusing a byte-identical physical
+    # table solely because the reader's device count added a pad.
+    logical_tables = tables.logical(int(meta.n_rmu))
     ledger = mpa_store.validate_fit_store(
         path,
         expected_identity={
-            "w_table_hash": tables.canonical().digest(),
+            "w_table_hash": logical_tables.canonical().digest(),
             "w_centroid_hash": closure_verdict.centroid_hash,
         },
         expected_screening_diagrams=config.screening.diagrams,
