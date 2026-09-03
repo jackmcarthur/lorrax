@@ -903,18 +903,29 @@ def main(argv=None):
 	if (oneshot_head_response is not None
 			and not packed_photon_replaces_charge_sigma(config)):
 		if mode.value == "mpa":
-			final_head = W_by_role.get("iteration_head")
-			if final_head is None:
-				raise RuntimeError(
-					"head_correction=full: MPA screening returned no finalized "
-					"head samples")
+			if W_by_role.get("mpa_fit_reused", False):
+				# The certified fit carries its already-folded scalar head and
+				# Sigma reads that head directly.  Re-folding the current direct
+				# response without resident W would be both impossible and a
+				# second head path.
+				final_head = None
+				print0(
+					"  MPA screening reuse: consuming the certified stored "
+					"body/head; no second head fold performed.")
+			else:
+				final_head = W_by_role.get("iteration_head")
+				if final_head is None:
+					raise RuntimeError(
+						"head_correction=full: MPA screening returned no "
+						"finalized head samples")
 		else:
 			from .qsgw_head import finalize_iteration_head_samples
 			final_head = finalize_iteration_head_samples(
 				oneshot_head_response, wfn=wfn, meta=meta, config=config,
 				mesh=mesh_xy, requests=oneshot_head_requests,
 				W_by_role=W_by_role)
-		head_resolver.install_samples(final_head.samples)
+		if final_head is not None:
+			head_resolver.install_samples(final_head.samples)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened

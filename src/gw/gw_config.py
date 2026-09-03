@@ -2155,6 +2155,9 @@ _DEFAULTS = {
     # key, and therefore TWICE the Ha value the papers quote.
     "mpa_metal_origin_shift_ry": None,
     "mpa_pole_batch_size": 4,
+    # Optional finalized MPA body/head fit consumed read-only by a one-shot
+    # run.  Empty means build screening in this run.
+    "mpa_fit_reuse_file": "",
     # Retired parser tombstone.  It remains recognized so old decks receive
     # the precise refusal in LorraxConfig.from_input_file instead of an
     # unknown-key warning; the box rule has no sector apportionment.
@@ -4457,6 +4460,9 @@ class MPAConfig:
     #: its consumer (``gw.mpa.sigma_windows._weight_floor``) per the ruling
     #: below.
     occupation_window_threshold: float = 0.995
+    #: Explicit finalized pole store for a read-only one-shot reuse.  This is
+    #: not the ISDF ``restart`` flag: that flag does not own screening state.
+    fit_reuse_file: str | None = None
 
     # pole_batch_size and the two Sigma target errors are validated at their
     # consumers (gw.mpa.sigma / gw.mpa.sigma_windows) — single owner.
@@ -4982,6 +4988,16 @@ class LorraxConfig:
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""
+        if self.mpa.fit_reuse_file is not None:
+            if self.compute_mode is not ComputeMode.MPA:
+                raise ValueError(
+                    "mpa_fit_reuse_file is only meaningful with "
+                    "compute_mode = mpa")
+            if self.qp_solver is not QPSolver.ONE_SHOT_DFT:
+                raise ValueError(
+                    "mpa_fit_reuse_file currently supports only "
+                    "qp_solver = one_shot_dft; self-consistent maps must "
+                    "rebuild W from their current occupations")
         if self.eqp2.enabled:
             if self.qp_solver is not QPSolver.ONE_SHOT_DFT:
                 raise ValueError(
@@ -5429,6 +5445,7 @@ class LorraxConfig:
             pole_batch_size=int(_g("mpa_pole_batch_size")),
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
+            fit_reuse_file=(str(_g("mpa_fit_reuse_file")) or None),
         )
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),

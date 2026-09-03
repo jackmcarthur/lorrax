@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -73,6 +75,21 @@ def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
 def test_thiele_solver_is_deck_selectable(tmp_path):
     config = _config(tmp_path, "mpa_pole_solver = thiele\n")
     assert config.mpa.pole_solver == "thiele"
+
+
+def test_explicit_mpa_fit_reuse_path_resolves_beside_deck(tmp_path):
+    config = _config(
+        tmp_path,
+        "compute_mode = mpa\n"
+        "mpa_fit_reuse_file = ../parent/mpa_fit_oneshot.h5\n",
+    )
+    assert os.path.normpath(config.mpa.fit_reuse_file) == os.path.normpath(
+        tmp_path / "../parent/mpa_fit_oneshot.h5")
+
+
+def test_mpa_fit_reuse_refuses_a_non_mpa_mode(tmp_path):
+    with pytest.raises(ValueError, match="mpa_fit_reuse_file.*compute_mode"):
+        _config(tmp_path, "mpa_fit_reuse_file = poles.h5\n")
 
 
 @pytest.mark.parametrize(

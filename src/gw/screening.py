@@ -906,6 +906,23 @@ def compute_screening_model(
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
+        reuse_path = getattr(config.mpa, "fit_reuse_file", None)
+        if reuse_path is not None:
+            if mpa_plan is None:
+                if quad is None:
+                    raise ValueError(
+                        "mpa_fit_reuse_file needs either the live MPA plan "
+                        "or the current screening quadrature")
+                from .mpa.model import make_mpa_plan
+                mpa_plan = make_mpa_plan(
+                    config, quad, material_class=material_class)
+            from .mpa.model import validate_reused_mpa_fit
+            fit_path = validate_reused_mpa_fit(
+                reuse_path, config=config, live_plan=mpa_plan, sym=sym,
+                centroid_indices=centroid_indices, meta=meta,
+                mesh_xy=mesh_xy, occupation_state=occupation_state,
+                material_class=material_class, print_fn=print_fn)
+            return {"mpa_fit": fit_path, "mpa_fit_reused": True}
         if quad is None:
             raise ValueError(
                 "MPA screening has no quadrature and no certified-fit reuse "
