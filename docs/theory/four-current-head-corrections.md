@@ -380,7 +380,7 @@ insertion — and the quadrature half is now settled and fixed.
 |---|---|---|
 | quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon rule, `vcoul.slab_minibz_photon_cubature` |
 | insertion | band-diagonal scalar shift (§3.2) | scalar route: band-diagonal (§3.2); packed route: rank-4 update through the real Σ kernels (§4.2) |
-| convergence certificate | none printed | scalar: polygon edges/orders/nodes/`⟨v⟩`/24→32 error ratio, refuses above budget. packed: `ward`, `hermiticity`, `dyson_forward_bound`, `cubature_orders` |
+| convergence certificate | none printed | scalar: polygon edges/orders/nodes/`⟨v⟩`/24→32 error ratio, refuses above budget. packed: one `Photon head` record with `<D>[0,0]`, `M_00[0,0]`, the four family norms, occupied-state insertion statistics, the WS orders/nodes/error ratio, and the Ward/Hermiticity/Dyson bounds |
 
 **What settled it** (claim 0586,
 `reports/bisp_j_architecture_review_2026-09-01/report.md` §4).
@@ -415,18 +415,45 @@ onto the packed route's figure (4.76 / −3.50, claim 582, re-measured
 unchanged here) — an independent referee moving the same way as the exact
 rule, not proof that either is converged.
 
-**Still open: the insertion, and it is the owner's choice.** The scalar
-route keeps the band-diagonal shift of §3.2, which for the bare CC head is
-*exact* (`Σ^X_n = −⟨v⟩f_n/(ΩN_k)` is band diagonal and state independent
-in a plane-wave basis). The packed route inserts the same head as a rank-4
-`(μ,ν)` update through `g_0(μ) = ζ_Γ(μ, G=0)`, and carries the ISDF
-normalisation error of the `G=0` pair density with it: ±3.9 meV std,
-11.5 meV max on bands 7–8 at 640 charge centroids, because
-`Σ_μ ζ_Γ(μ,G=0)|ψ_n(r_μ)|²` is not exactly 1. That residual is now the whole
-of the remaining scalar-vs-packed difference; it is an ISDF question, not
-a quadrature one, and it is registered with two options (insert the CC
-`M_00` band-diagonal part exactly, or price the error by centroid count).
-The wings and the current blocks must stay in the `(μ,ν)` form either way.
+**CLOSED (2026-09-02): the insertion and wing attachment have the advertised
+absolute normalisation.** The scalar route keeps the band-diagonal shift of
+§3.2. The packed route inserts the same head as a rank-4 `(μ,ν)` update
+through `g_0(μ) = ζ_Γ(μ,G=0)`. Its bare CC exchange is not linear in the
+one-state insertion
+
+$$N_{kn}=\sum_\mu g_{0\mu}\sum_s|\psi_{kns}(r_\mu)|^2.$$
+
+Projection of the rank-one centroid operator through the occupied Green
+function makes it the occupied-projector quadratic form
+
+$$Q_{kn}=\sum_{m\in\mathrm{occ}}
+ \left|\sum_{\mu s}\overline{g_{0\mu}}
+ \overline{\psi_{kns}(r_\mu)}\psi_{kms}(r_\mu)\right|^2,
+\qquad
+\Sigma^{X,\mathrm{CC-head}}_{kn}
+=-\frac{\langle v\rangle}{\Omega N_k}Q_{kn}.$$
+
+On the MoS2 3×3 artifact (234 occupied states), `N` is
+`0.9998681 ± 0.0005557` (`0.998159..1.001067`). The previously inferred
+linear formula misses the recorded `x_head_CC` by 1.582 meV MAE and
+5.720 meV maximum. The `Q` formula, after the same degenerate-subspace
+average as the output, agrees within 0.495 µeV, the six-decimal text
+rounding ceiling; `Q-1` versus `N-1` has slope 1.99817. Thus the observed
+spread was real ISDF projection error, but the earlier *linear* explanation
+was wrong.
+
+The remaining claim-585 units question was closed independently. In the
+centroid storage convention the physical body is
+`W_body^physical = Ω W_body^code`, while the direct Adler–Wiser wings are
+`χ_hb = Y/Ω`, `χ_bh = Z/Ω`. Therefore
+`(ΩW)(Z/Ω)=WZ` and `(Y/Ω)(ΩW)=YW`; converting the completed physical body
+back to storage supplies exactly the single `/Ω` shown in §4.2. On the same
+MoS2 artifact, direct and code-spelled attachments agree to `2.72e-13`, and
+the `(a,b)` family alone to `2.42e-13`. Omitting that last `/Ω` changes its
+norm by `702.201163353318`; applying it twice changes the norm by
+`0.001424093340`. An exact all-grid-point/delta-ζ model in
+`tests/test_photon_head_sign_oracle.py` checks all four families and carries
+the same factor-Ω negative control. No normalisation factor was changed.
 
 Measured with one quadrature owner on both sides (leg 01's packed per-state
 head against leg 00's band-diagonal head, same run):
@@ -530,6 +557,12 @@ term averages to zero in `M_{00}` but survives in the crossed first moments
 blocks to `Σ` per `(X, SX, COH) × (CC, CT+TC, TT)` sector and checks that the
 sector sum closes on the sixteen-block total.
 
+The single production record line also prints `<D>[0,0]`, `M_00[0,0]`,
+Frobenius norms for `(00,0a,a0,ab)`, the WS certificate, and the mean/std/
+range of `N_kn` over occupied states. This makes the distinct linear
+insertion diagnostic `N` and the quadratic Sigma projection `Q` impossible
+to conflate in later audits.
+
 ### 4.3 What the mode contains, by declaration
 
 The **module docstring of `gw.static_gauge_response`** is the complete list
@@ -614,9 +647,9 @@ former.
 
 ### 4.5 Audited seams and remaining limitation
 
-At `34228021` the two implementation defects below are fixed. The remaining
-head limitation is the insertion difference in §3.6; the scalar and packed
-routes already share one slab quadrature.
+At `34228021` the two implementation defects below are fixed. The absolute
+insertion/wing normalisation that remained open after that change is closed
+numerically in §3.6; the scalar and packed routes share one slab quadrature.
 
 * **Interband Γ wing sign.** Both wing kernels built the
   mixed head/body interband weight as `+F\,\overline{P}\,b/(z²−Δ²)`, while the
@@ -625,8 +658,10 @@ routes already share one slab quadrature.
   carries a sign the kernels never applied. It cancels in the scalar Schur
   fold `Y W Z` (§3) but not in the single-wing moments `M_{0a}`, `M_{a0}`
   here — exactly the moments the packed head reads. Both layouts now call
-  the single owner `_head_wing_interband_weight` (`qsgw_head.py:1124`, from
-  `:1357` and `:1682`).
+  the single owner `_head_wing_interband_weight` (`qsgw_head.py`, called by
+  both the legacy and face kernels). Commit `60b7bbb7` (2026-09-01) is an
+  ancestor of `origin/main@8576f9f9`; the earlier frequency-audit F3 label
+  saying the fix was not on main is superseded.
 * **The transverse current Hartree is on both routes** — the earlier
   statement here, that it is computed only on the packed routes and omitted
   by `bare_transverse`, was wrong. Its gate is

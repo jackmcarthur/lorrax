@@ -854,29 +854,10 @@ def main(argv=None):
 						"Lorentz blocks contracted once; Sigma_xc = Sigma_SX + "
 						"Sigma_COH and the per-state CC / CT+TC / TT split is "
 						"written to sigma_diag.dat.")
-				_hc = photon_response.head_completion
+				from .w_isdf import format_photon_head_run_record
 				report.progress(
 					"Photon head    : "
-					+ ("DEBUG: Gamma-cell head disabled by head_correction=off "
-					   "(headless packed body; NOT a production calculation)"
-					   if _hc is None else
-					   "Gamma-cell completion applied (bare <D> into V, "
-					   "charge S00/wing head into W); "
-					   f"hall_source={_hc.hall_source}; "
-					   f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
-					   f"ward={_hc.ward_residual:.3e}; "
-						   f"hermiticity={_hc.hermiticity_residual:.3e}; "
-						   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
-						   f"cubature_orders={_hc.cubature_receipt.orders}"))
-				if _hc is not None:
-					report.progress(
-						"Photon WS cert : "
-						f"orders={_hc.cubature_receipt.orders}; "
-						f"nodes={_hc.observed_physical_counts}; "
-						f"final_error_ratio="
-						f"{_hc.mixed_convergence_error_ratios[-1]:.3e}; "
-						f"max_dyson_backward_residual="
-						f"{_hc.max_backward_residual:.3e}")
+					+ format_photon_head_run_record(photon_response))
 			else:
 				W_by_role = compute_screening_model(
 					mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,

@@ -1162,6 +1162,101 @@ class StaticSlabPhotonHeadCompletion:
     q0_factors: StaticPhotonQ0FactorCarrier
 
 
+_CHARGE_HEAD_NORM_KERNEL_CACHE: dict[tuple, object] = {}
+
+
+def _charge_head_insertion_norm_kernel(mesh_xy: Mesh, wfns, n_occ: int):
+    """Return the cached scalar reduction for ``sum_mu g0_mu |psi|^2``."""
+    layout = str(getattr(wfns, "layout", "legacy"))
+    if layout == "face":
+        psi = wfns.psi_mun
+        spec = P(None, None, "x", "y")
+    elif layout == "legacy":
+        psi = wfns.psi_xn
+        spec = P(None, None, "x", None)
+    else:
+        raise ValueError(
+            "charge head insertion normalisation requires wavefunction "
+            f"layout 'legacy' or 'face'; got {layout!r}")
+    if psi is None or int(n_occ) <= 0 or int(n_occ) > int(psi.shape[-1]):
+        raise ValueError(
+            "charge head insertion normalisation needs a nonempty occupied "
+            f"window inside the wavefunction carrier; n_occ={n_occ}, "
+            f"psi_shape={getattr(psi, 'shape', None)}")
+    key = (layout, id(mesh_xy), tuple(int(v) for v in psi.shape), int(n_occ))
+    hit = _CHARGE_HEAD_NORM_KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = tuple(mesh_xy.axis_names)
+
+    if layout == "face":
+        def _local(g0_local, psi_local):
+            values = jax.lax.psum(
+                jnp.einsum(
+                    "m,ksmn,ksmn->kn", g0_local, jnp.conj(psi_local),
+                    psi_local, optimize=True),
+                ax_x)
+            n_local = int(psi_local.shape[-1])
+            global_n = (
+                jax.lax.axis_index(ax_y) * n_local
+                + jnp.arange(n_local, dtype=jnp.int32))
+            mask = global_n < int(n_occ)
+            real = jnp.real(values)
+            count = jax.lax.psum(
+                jnp.asarray(values.shape[0], dtype=jnp.float64)
+                * jnp.sum(mask.astype(jnp.float64)), ax_y)
+            total = jax.lax.psum(jnp.sum(jnp.where(mask[None], real, 0.0)), ax_y)
+            total2 = jax.lax.psum(
+                jnp.sum(jnp.where(mask[None], real * real, 0.0)), ax_y)
+            minimum = jax.lax.pmin(
+                jnp.min(jnp.where(mask[None], real, jnp.inf)), ax_y)
+            maximum = jax.lax.pmax(
+                jnp.max(jnp.where(mask[None], real, -jnp.inf)), ax_y)
+            imag_max = jax.lax.pmax(
+                jnp.max(jnp.where(
+                    mask[None], jnp.abs(jnp.imag(values)), 0.0)), ax_y)
+            mean = total / count
+            std = jnp.sqrt(jnp.maximum(total2 / count - mean * mean, 0.0))
+            return jnp.stack((mean, std, minimum, maximum, imag_max))
+    else:
+        def _local(g0_local, psi_local):
+            values = jax.lax.psum(
+                jnp.einsum(
+                    "m,ksmn,ksmn->kn", g0_local, jnp.conj(psi_local),
+                    psi_local, optimize=True),
+                ax_x)[:, :int(n_occ)]
+            real = jnp.real(values)
+            return jnp.stack((
+                jnp.mean(real), jnp.std(real), jnp.min(real), jnp.max(real),
+                jnp.max(jnp.abs(jnp.imag(values)))))
+
+    kernel = jax.jit(shard_map(
+        _local, mesh=mesh_xy,
+        in_specs=(P("x"), spec), out_specs=P(), check_vma=False))
+    _CHARGE_HEAD_NORM_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def charge_head_insertion_norm_stats(wfns, g0_X, *, mesh_xy: Mesh):
+    r"""Measure the occupied-state literal-Gamma insertion ``N_n``.
+
+    ``N_kn = sum_mu zeta_Gamma(mu,G=0) sum_s |psi_kns(r_mu)|^2``.
+    Only the small five-number reduction is replicated; neither wavefunction
+    face is gathered.  The result is ``(mean, std, min, max, max_abs_imag)``
+    over every occupied ``(k,n)`` state.
+    """
+    n_occ = int(wfns.slices.occ.stop)
+    values = _charge_head_insertion_norm_kernel(
+        mesh_xy, wfns, n_occ)(g0_X, (
+            wfns.psi_mun if wfns.layout == "face" else wfns.psi_xn))
+    host = np.asarray(jax.device_get(values), dtype=np.float64)
+    if host.shape != (5,) or not np.all(np.isfinite(host)):
+        raise ValueError(
+            "GATE photon_head_insertion_norm_nonfinite: occupied-state "
+            f"Gamma insertion statistics are invalid; got {host!r}")
+    return tuple(float(v) for v in host)
+
+
 _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET = 1.0e-9
 _STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL = 1.0e-8
 _STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL = 1.0e-12
