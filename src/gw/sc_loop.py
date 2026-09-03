@@ -9,8 +9,11 @@ The protected/outer split is structural and immutable:
 
 ``P = [b0, b3)`` and ``U = [b3, b4_user)``.
 
-No energy-window membership, hysteresis, state matching, or degeneracy
-damping enters this module.  See ``docs/dev/notes/DESIGN_self_consistent_loop.md``.
+No mutable band partition, hysteresis, or state matching enters this module.
+The only state-identification convention is the owner-set exact-degeneracy
+symmetrisation (at most 0.1 meV), which makes the update independent of the
+arbitrary eigenvector gauge inside an unresolved QP block.  See
+``docs/dev/notes/DESIGN_self_consistent_loop.md``.
 """
 
 from __future__ import annotations
@@ -285,12 +288,89 @@ def _adjoint(matrix):
     return jnp.conj(jnp.swapaxes(matrix, -1, -2))
 
 
+def _symmetrize_exact_qp_blocks(
+    sigma_pp,
+    energies_kp_ev: np.ndarray,
+    tol_ev: float,
+):
+    """Make unresolved QP blocks scalar in their degenerate subspaces.
+
+    For a block ``B`` whose adjacent QP energies differ by less than
+    ``tol_ev``, this applies the unitary-group average
+
+    ``Sigma_B -> trace(Sigma_B) / dim(B) * I_B``.
+
+    That is the unique within-block operator invariant under an arbitrary
+    unitary choice of eigenvectors.  It is deliberately stronger than merely
+    averaging the diagonal: retaining an off-diagonal component would select
+    a preferred basis and allow an exact multiplet to alternate gauges from
+    one map to the next.  Couplings to resolved states are left untouched.
+
+    Parameters
+    ----------
+    sigma_pp : array, shape (nk, P, P)
+        Hermitian effective self-energy on the protected block, in Ry.
+    energies_kp_ev : np.ndarray, shape (nk, P)
+        Sorted current QP energies in eV.
+    tol_ev : float
+        Maximum adjacent splitting treated as unresolved, in eV.  Zero
+        disables the convention; callers cap enabled values at 0.1 meV.
+
+    Returns
+    -------
+    array, shape (nk, P, P)
+        Symmetrised effective self-energy.
+    tuple[int, int]
+        Number of nontrivial blocks and largest block size.
+    """
+    tol = float(tol_ev)
+    if not (0.0 <= tol <= 1.0e-4):
+        raise ValueError(
+            "exact QP degeneracy tolerance must be in [0, 1e-4] eV; "
+            f"got {tol_ev!r}.")
+    energies = np.asarray(energies_kp_ev, dtype=np.float64)
+    if energies.ndim != 2 or tuple(np.shape(sigma_pp)) != (
+            energies.shape[0], energies.shape[1], energies.shape[1]):
+        raise ValueError(
+            "exact QP block symmetrisation needs Sigma (nk,P,P) and "
+            f"energies (nk,P); got {np.shape(sigma_pp)} and "
+            f"{energies.shape}.")
+    if tol == 0.0:
+        return sigma_pp, (0, 1)
+
+    out = sigma_pp
+    n_blocks = 0
+    largest = 1
+    nk, n_p = energies.shape
+    for k in range(nk):
+        start = 0
+        for stop in range(1, n_p + 1):
+            at_edge = stop == n_p
+            split = (not at_edge
+                     and abs(energies[k, stop] - energies[k, stop - 1])
+                     >= tol)
+            if not (at_edge or split):
+                continue
+            size = stop - start
+            if size > 1:
+                block = out[k, start:stop, start:stop]
+                scalar = jnp.trace(block) / size
+                out = out.at[k, start:stop, start:stop].set(
+                    scalar * jnp.eye(size, dtype=out.dtype))
+                n_blocks += 1
+                largest = max(largest, size)
+            start = stop
+    return out, (n_blocks, largest)
+
+
 def effective_sigma(
     table: SigmaTable,
     classes: BandClasses,
     policy: EvaluationPolicy | str,
     energies_kn_ev,
     efermi_ev: float,
+    *,
+    exact_degeneracy_tol_ev: float,
 ):
     """Build the sole fixed-index effective self-energy update.
 
@@ -303,7 +383,9 @@ def effective_sigma(
     Equation
     --------
     ``Sigma^QSGW_mn = 1/2 [Sigma_mn(E_m) + Sigma_mn(E_n)]`` on P x P,
-    followed by ``(M + M^dagger)/2``.
+    followed by ``(M + M^dagger)/2``.  Within a current-QP block unresolved
+    at ``exact_degeneracy_tol_ev``, the protected operator is replaced by
+    its unitary-group average ``trace(block)/dim(block) * I``.
     """
     selected = EvaluationPolicy.coerce(policy)
     energy = np.asarray(energies_kn_ev, dtype=np.float64)
@@ -325,6 +407,7 @@ def effective_sigma(
     row = table.at(e_clip)
     column = table.at_columns(e_clip)
     correlation = 0.5 * (row + column)
+    inside = None
     if selected is EvaluationPolicy.FERMI:
         # Membership is one boolean per BAND over the whole k mesh.  A band
         # flips coherently; a single out-of-domain k sends every pair that
@@ -340,6 +423,9 @@ def effective_sigma(
                 + jnp.asarray(table.sigma_x_pp_kij_ry)
                 + jnp.asarray(table.v_h_pp_kij_ry))
     sigma_pp = 0.5 * (sigma_pp + _adjoint(sigma_pp))
+    sigma_pp, (n_degenerate_blocks, largest_degenerate_block) = (
+        _symmetrize_exact_qp_blocks(
+            sigma_pp, energy[:, :n_p], exact_degeneracy_tol_ev))
 
     # Delta is the mean QP-minus-DFT correction of the two highest
     # protected conduction indices.  ``dft_h_qp`` is the immutable DFT
@@ -382,6 +468,10 @@ def effective_sigma(
             * RYD_TO_EV),
         "n_outside": int(np.count_nonzero(
             (e_rel < omega_min) | (e_rel > omega_max))),
+        "inside_bands": (None if inside is None else tuple(
+            bool(value) for value in inside)),
+        "n_degenerate_blocks": n_degenerate_blocks,
+        "largest_degenerate_block": largest_degenerate_block,
         "policy": selected.value,
     }
     return sigma_eff, diagnostics

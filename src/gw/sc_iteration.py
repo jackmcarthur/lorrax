@@ -2411,29 +2411,13 @@ def _fixed_index_hamiltonian(
         EvaluationPolicy.coerce(inputs.config.sc.evaluation_policy),
         np.asarray(energies_full_ry, dtype=np.float64) * RYD_TO_EV,
         float(efermi_ry) * RYD_TO_EV,
+        exact_degeneracy_tol_ev=(
+            0.0 if bool(getattr(inputs.config, "no_degen_averaging", False))
+            else float(inputs.config.sc.exact_degeneracy_tol_ev)),
     )
     H_qp = QpHamiltonian(kin_qp).build(sigma_effective)
     H_dft_full = _rotate_fixed_matrix(
         H_qp, U_full, mesh=inputs.mesh_xy, to_qp=False)
-    # Exact DFT multiplets have no preferred eigenvector gauge.  Preserve
-    # the established <=0.1 meV gauge convention on the correction's
-    # diagonal so a different legal basis in an exactly degenerate space
-    # cannot look like fixed-point motion.  This is not damping of a
-    # resolved near-degenerate pair: the configuration validator caps the
-    # tolerance at 1e-4 eV, and the immutable DFT spectrum alone defines
-    # membership.  The fixed-index update law above remains the sole owner
-    # of every P/U and frequency decision.
-    if not bool(getattr(inputs.config, "no_degen_averaging", False)):
-        from .degen_average import average_matrix_diagonal
-        delta_h_dft = average_matrix_diagonal(
-            H_dft_full - jnp.asarray(inputs.kin_ion_full_dft),
-            energies_kn_ry=np.asarray(
-                inputs.e_dft_full_kn_ry, dtype=np.float64),
-            tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
-                    / RYD_TO_EV),
-            mesh_xy=inputs.mesh_xy,
-        )
-        H_dft_full = jnp.asarray(inputs.kin_ion_full_dft) + delta_h_dft
     ks = _kstar(inputs)
     H_dft = H_dft_full if ks.is_identity else ks.select(H_dft_full)
     inputs.print_fn(
@@ -2442,7 +2426,14 @@ def _fixed_index_hamiltonian(
         f"U={classes.n_outer}, outside(k,n)={diagnostics['n_outside']}, "
         f"Delta={float(diagnostics['delta_ev']):+.9f} eV, "
         f"P/U mismatch="
-        f"{float(diagnostics['boundary_mismatch_ev']):.9f} eV")
+        f"{float(diagnostics['boundary_mismatch_ev']):.9f} eV, "
+        f"exact_QP_blocks={diagnostics['n_degenerate_blocks']} "
+        f"(max multiplicity {diagnostics['largest_degenerate_block']})")
+    if diagnostics["inside_bands"] is not None:
+        bits = "".join(
+            "1" if inside else "0"
+            for inside in diagnostics["inside_bands"])
+        inputs.print_fn(f"    fixed-index fermi membership: {bits}")
     if not ks.is_identity:
         _check_kstar_spread(
             ks, ks.broadcast(H_dft), print_fn=inputs.print_fn)

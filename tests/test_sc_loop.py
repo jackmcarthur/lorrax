@@ -60,7 +60,8 @@ def test_fermi_pair_switches_both_ends_to_fermi():
     classes = _classes()
     energies = np.array([[-0.5, 0.25, 0.75, 1.5, 4.0, 5.0]])
     sigma, diagnostics = effective_sigma(
-        table, classes, EvaluationPolicy.FERMI, energies, 0.0)
+        table, classes, EvaluationPolicy.FERMI, energies, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
     sigma = np.asarray(sigma)
 
     # Band 3 is outside. Every pair touching it reads the whole matrix at
@@ -97,7 +98,9 @@ def test_fermi_membership_is_one_boolean_per_band_over_all_k():
         [-0.5, 0.25, 0.75, 0.5, 4.0, 5.0],
         [-0.5, 0.25, 0.75, 1.5, 4.0, 5.0],
     ])
-    sigma, _ = effective_sigma(table, _classes(), "fermi", energies, 0.0)
+    sigma, _ = effective_sigma(
+        table, _classes(), "fermi", energies, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
     at_zero = np.asarray(table.at(np.zeros((2, 4))))
     expected = 0.5 * (at_zero + np.conj(at_zero.swapaxes(-1, -2)))
     # Band 3 is outside at only k=1, but every k/pair touching band 3 uses
@@ -112,8 +115,12 @@ def test_clamp_is_continuous_at_window_edge():
     below = np.array([[-0.5, 0.25, 0.75, 1.0 - 1.0e-8, 4.0, 5.0]])
     above = below.copy()
     above[0, 3] = 1.0 + 1.0e-8
-    left, _ = effective_sigma(table, classes, "clamp", below, 0.0)
-    right, _ = effective_sigma(table, classes, "clamp", above, 0.0)
+    left, _ = effective_sigma(
+        table, classes, "clamp", below, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
+    right, _ = effective_sigma(
+        table, classes, "clamp", above, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
     np.testing.assert_allclose(left, right, rtol=0.0, atol=3.0e-8)
 
 
@@ -122,7 +129,8 @@ def test_outer_law_and_hamiltonian_are_hermitian():
     classes = _classes()
     energies = np.array([[-0.5, 0.25, 0.75, 1.5, 4.0, 5.0]])
     sigma, diagnostics = effective_sigma(
-        table, classes, "clamp", energies, 0.0)
+        table, classes, "clamp", energies, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
     hamiltonian = np.asarray(QpHamiltonian(
         table.kin_ion_qp_kij_ry).build(sigma))
 
@@ -143,3 +151,65 @@ def test_band_classes_ignore_padding_and_require_scissor_samples():
     with pytest.raises(ValueError, match="at least two protected conduction"):
         BandClasses(
             band_start=0, occupied_stop=3, protected_stop=4, outer_stop=6)
+
+
+def test_exact_qp_block_is_invariant_to_random_unitary_gauge():
+    """One map must not depend on the eigenvectors of an exact QP pair."""
+    rng = np.random.default_rng(20260903)
+    classes = BandClasses(
+        band_start=0, occupied_stop=2, protected_stop=4, outer_stop=4)
+    energies = np.array([[0.25, 0.25 + 5.0e-5, 0.6, 0.9]])
+    omega = np.array([-1.0, 0.0, 1.0])
+    sigma_diag = np.array([0.3, -0.7, 0.2, 0.5])
+    cube = np.broadcast_to(
+        np.diag(sigma_diag)[None, None, :, :], (3, 1, 4, 4)).copy()
+    kin_a = np.array([[
+        [0.8, 0.2j, 0.0, 0.0],
+        [-0.2j, -0.1, 0.0, 0.0],
+        [0.0, 0.0, 0.4, 0.0],
+        [0.0, 0.0, 0.0, 0.7],
+    ]], dtype=np.complex128)
+    raw = (rng.standard_normal((2, 2))
+           + 1j * rng.standard_normal((2, 2)))
+    q2, _ = np.linalg.qr(raw)
+    gauge = np.eye(4, dtype=np.complex128)
+    gauge[:2, :2] = q2
+
+    def make_table(kin):
+        return SigmaTable(
+            omega_ev=omega,
+            sigma_c_pp_wkij_ry=cube,
+            sigma_x_pp_kij_ry=np.zeros((1, 4, 4), np.complex128),
+            v_h_pp_kij_ry=np.zeros((1, 4, 4), np.complex128),
+            sigma_xc_pu_fermi_kij_ry=np.zeros((1, 4, 0), np.complex128),
+            v_h_pu_kij_ry=np.zeros((1, 4, 0), np.complex128),
+            kin_ion_qp_kij_ry=kin,
+            dft_h_qp_kij_ry=np.zeros((1, 4, 4), np.complex128),
+            e_dft_kn_ry=np.zeros((1, 4)),
+        )
+
+    sigma_a, diagnostics = effective_sigma(
+        make_table(kin_a), classes, "fermi", energies, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
+    h_a = np.asarray(QpHamiltonian(kin_a).build(sigma_a))[0]
+
+    # A different legal eigensolver gauge rotates the fixed kin+ion
+    # operator, while the band-labelled diagonal Sigma samples can arrive
+    # in either order.  Scalarising the unresolved block removes that
+    # arbitrary label/gauge choice before rotating the map back to DFT.
+    kin_b = (np.conj(gauge.T) @ kin_a[0] @ gauge)[None]
+    sigma_b, _ = effective_sigma(
+        make_table(kin_b), classes, "fermi", energies, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
+    h_b_qp = np.asarray(QpHamiltonian(kin_b).build(sigma_b))[0]
+    h_b_dft = gauge @ h_b_qp @ np.conj(gauge.T)
+
+    sigma_b_unsym, _ = effective_sigma(
+        make_table(kin_b), classes, "fermi", energies, 0.0,
+        exact_degeneracy_tol_ev=0.0)
+    h_b_unsym = gauge @ np.asarray(
+        QpHamiltonian(kin_b).build(sigma_b_unsym))[0] @ np.conj(gauge.T)
+    assert diagnostics["n_degenerate_blocks"] == 1
+    assert diagnostics["largest_degenerate_block"] == 2
+    assert np.max(np.abs(h_b_unsym - h_a)) > 1.0e-2
+    np.testing.assert_allclose(h_b_dft, h_a, rtol=0.0, atol=3.0e-15)
