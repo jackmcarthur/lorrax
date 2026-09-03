@@ -236,6 +236,42 @@ def test_distributed_solve_cache_is_keyed_by_logical_extent(monkeypatch):
     assert scalar is not packed
 
 
+def test_static_gamma_override_accepts_the_chi_carrier_not_logical_prefix(
+        monkeypatch):
+    """The metallic Gamma row follows product padding through screening."""
+    from types import SimpleNamespace
+
+    import jax.numpy as jnp
+    import numpy as np
+
+    from gw import screening
+    import gw.w_isdf as w_isdf
+
+    captured = {}
+    monkeypatch.setattr(w_isdf, "precompile_solve_w", lambda *_a, **_k: None)
+
+    def _capture_solve(_V, chi, *_args, **_kwargs):
+        captured["chi"] = np.asarray(chi)
+        return jnp.zeros_like(chi)
+
+    monkeypatch.setattr(w_isdf, "solve_w", _capture_solve)
+    chi = jnp.zeros((1, 4, 4), dtype=jnp.complex128)
+    gamma = jnp.arange(16, dtype=jnp.float64).reshape(1, 4, 4)
+    meta = SimpleNamespace(
+        nk_tot=1, n_rmu=3, kgrid=(1, 1, 1), fft_grid=(4, 1, 1))
+    config = SimpleNamespace(backend=SimpleNamespace(
+        w_dyson_solver="distributed",
+        distrib_la_batched_route="batch_reshard"))
+    result = screening.compute_static_w(
+        None, jnp.zeros_like(chi), None, e_ref=0.0,
+        sym=SimpleNamespace(q_irr_full_idx=None), centroid_indices=None,
+        config=config, meta=meta, mesh_xy=SimpleNamespace(),
+        force_full_bz=True, chi0_override=chi,
+        gamma_chi_override=gamma)
+    result.block_until_ready()
+    np.testing.assert_array_equal(captured["chi"][0], np.asarray(gamma[0]))
+
+
 def test_mpa_reader_and_distributed_dyson_a_build_on_true_6x6_mesh():
     """Logical 42 must reach ``_a_local`` as one zero-padded 72 carrier."""
     repo = Path(__file__).resolve().parents[1]
