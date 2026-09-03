@@ -1692,24 +1692,39 @@ def main(argv=None):
 		report.progress(_odd_line)
 	if sigma_ct_hall_at_dft_ev is not None:
 		_hall_abs = np.abs(np.asarray(sigma_ct_hall_at_dft_ev))
-		if (sigma_result.faraday_head_omega_h_ry is None
-				or sigma_result.faraday_probe_even_fit_relative_error is None
+		if (sigma_result.faraday_selected_n_poles is None
+				or sigma_result.faraday_gram_rank is None
+				or sigma_result.faraday_head_poles_ry is None
+				or sigma_result.faraday_fit_ladder_pole_counts is None
+				or sigma_result.faraday_fit_ladder_relative_errors is None
+				or sigma_result.faraday_fit_relative_error is None
+				or sigma_result.faraday_gram_projection_relative_error is None
 				or sigma_result.faraday_odd_even_residue_ratio is None
-				or sigma_result.faraday_sigma_h_static_bohr_inv is None
-				or sigma_result.faraday_sigma_h_probe_bohr_inv is None):
+				or sigma_result.faraday_sample_frequencies_ry is None
+				or sigma_result.faraday_sigma_h_frequency_bohr_inv is None):
 			raise RuntimeError(
 				"applied dynamic Faraday Sigma lacks its fitted-pole record")
+		_hall_samples = list(zip(
+			sigma_result.faraday_sample_frequencies_ry,
+			sigma_result.faraday_sigma_h_frequency_bohr_inv,
+			strict=True))
+		_fit_ladder = list(zip(
+			sigma_result.faraday_fit_ladder_pole_counts,
+			sigma_result.faraday_fit_ladder_relative_errors,
+			strict=True))
 		report.progress(
-			"Faraday head   : APPLIED (ordered one-pole CT/TC Gamma head; "
-			f"sigma_H(0) = "
-			f"{list(sigma_result.faraday_sigma_h_static_bohr_inv)} bohr^-1; "
-			f"sigma_H(i omega_p) = "
-			f"{list(sigma_result.faraday_sigma_h_probe_bohr_inv)} bohr^-1; "
-			f"Omega_H = {sigma_result.faraday_head_omega_h_ry:.17e} Ry; "
+			"Faraday head   : APPLIED (ordered multipole CT/TC Gamma head; "
+			f"n_p={sigma_result.faraday_selected_n_poles}; "
+			f"Gram rank={sigma_result.faraday_gram_rank}; "
+			f"samples={_hall_samples}; "
+			f"poles={list(sigma_result.faraday_head_poles_ry)} Ry; "
 			"||D_H||/||B_H|| = "
 			f"{sigma_result.faraday_odd_even_residue_ratio:.6e}; "
-			"even-probe-fit residual = "
-			f"{sigma_result.faraday_probe_even_fit_relative_error:.6e}; "
+			f"fit ladder = {_fit_ladder}; "
+			"dense-contour residual = "
+			f"{sigma_result.faraday_fit_relative_error:.6e}; "
+			"Gram odd-projection residual = "
+			f"{sigma_result.faraday_gram_projection_relative_error:.6e}; "
 			f"sigCT_hall max/mean = {np.max(_hall_abs):.6e}/"
 			f"{np.mean(_hall_abs):.6e} eV)")
 	if q0_certificates:

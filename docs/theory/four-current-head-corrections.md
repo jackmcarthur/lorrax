@@ -41,7 +41,7 @@ current density `ψ†α^iψ`).
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + charge wings + optional Hall CT/TC `q¹` (§4), completed on the exact dimensioned WS cell; `off` is DEBUG | `bispinor_gw = full_static_cohsex`, `sys_dim` 2 or 3 | experimental, insulating, one shot |
 | *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`; static COHSEX uses packed `W = diag(W_00,D_TT)`, while dynamic GN/HL/MPA uses `W_CURRENT = V_CURRENT` with packed CC absent | static COHSEX uses the coupled dimensioned completion; dynamic mode inserts bare `⟨D⟩` only into V/logical current W and skips the base charge S/wings; measured-broken-TR GN separately fits the dynamic Hall pole (§4.5) | `bispinor_gw = bare_transverse`, `sys_dim` 2 or 3 | experimental; dynamic mode supports one-shot and self-consistent QP maps |
 | the packed operator on a **dynamic** Σ | **CC dynamic scalar owner, current blocks static**: GN/HL/MPA own `W_00(ω)` outside the bare packed carrier; twelve current blocks are evaluated at `ω = 0`; magnetic GN adds the analytic CT/TC Γ pole | CC: the dynamic model's own head for `Σ_c` plus scalar bare-X head; current: the packed bare Γ completion, plus the Hall-on/off CT/TC pole when prepared | `compute_mode` in {`gn_ppm`, `hl_ppm`} for either packed family, plus `mpa` for `bare_transverse`; `sys_dim` 2 or 3; magnetic Faraday insertion is GN and magnetic HL refuses by name | experimental; current-frequency dependence neglected as bounded in §2.2; bare SC re-contracts per-map orbitals |
-| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled at `0` and `i*omega_p` | one sharded Kubo producer, authenticated schema-v2 transaction, two coupled completion samples retained as CT/TC rank-four factors, and one ordered analytic pole (§4.5) | measured-broken-TR, insulating packed GN | **conditionally applied** when the one-even-pole residual is at most `1e-4`; otherwise `GATE dynamic_hall_head_unimplemented_second_even_pole` refuses because schema v2 has no third sample from which to identify the required second even pole |
+| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled on the 32-point nested imaginary-axis MPA oracle from `0` through `i*omega_p` | one sharded Kubo producer, authenticated schema-v3 transaction, coupled completion samples retained as CT/TC rank-four factors, and the minimal adequate ordered 1…12-pole MPA fit (§4.5) | measured-broken-TR, insulating packed GN | **conditionally applied** when the first causal rung has a maximum 32-sample residual at most `1e-4`; an inadequate ladder refuses before Sigma, and a plateau names the required non-pole treatment |
 | retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -689,9 +689,9 @@ no response kernel, and no pairwise Sigma stage: the same sharded band-pair
 reduction that owns `sigma_H(0)` evaluates all requested frequencies in one
 bounded sweep.
 
-#### Ordered one-pole completion and Sigma insertion
+#### Ordered multipole completion and Sigma insertion
 
-For any head family represented by
+For every pole of a head family represented by
 
 $$
 W_h^c(z)=\frac{R_+}{z-\Omega_h}-\frac{R_-}{z+\Omega_h}
@@ -710,57 +710,70 @@ operator and every factor-Gram Frobenius overlap are exactly invariant.
 
 The dynamic packed GN route keeps its ordinary packed current body as the
 literal `sigma_H=0` twin. On the absent-CC bare route that resident is
-`V_CURRENT`; O(N) charge-wing adapters fold the scalar owner's `W_00(0)` and
-`W_00(i*omega_p)` into the small system without constructing packed W or
-giving the CC block a Sigma consumer. It then executes the same
-dimension-general coupled 4x4 Gamma-cell moment owner for Hall-on and Hall-off
-at both frequencies. Only two rank-four factor pairs leave those solves: one
-CT pair and one TC pair, each stored as `left_rows_X` and `right_rows_Y`. No
-probe-frequency packed body is constructed.
-
-Writing the combined CT/TC Hall-on/off operators as `F_0` and `F_p`, the
-named GN ordered selection is
+`V_CURRENT`; O(N) charge-wing adapters fold the scalar owner's `W_00(z_s)`
+into the small system without constructing packed W or giving the CC block a
+Sigma consumer. The Hall schema-v3 producer evaluates `S(z_s)`, both wing
+orientations, and `sigma_H(z_s)` at the same ordered points
 
 $$
-H_p={F_p+F_p^\dagger\over2},\qquad
-A_p={F_p-F_p^\dagger\over2}.
+z_s\in \operatorname{faraday\_imaginary\_plan}(16,\omega_p),
 $$
 
-The static anchor is Hermitian.  Its overlap with `H_p` fixes the ordinary
-pole,
+which are 32 nested samples from `0` through `i*omega_p`. The charge owner's
+incumbent GN pole is evaluated at those same points to provide `W_00(z_s)`;
+this is an evaluation of the existing scalar fit, not another screening
+kernel or quadrature. The exact `z=0` and `z=i*omega_p` charge arrays remain
+the owner's original endpoint arrays. Schema v3 stamps the complete sample
+plan (label, pole count, exponent, schedule, endpoint, and hash) beside the
+WFN/operator/band provenance. Schema v2 remains readable for static COHSEX,
+but a broken-TR dynamic deck using it refuses by name because it cannot
+authenticate the multipole oracle.
+
+At every `z_s`, the code executes the same dimension-general coupled 4x4
+Gamma-cell moment owner for Hall-on and Hall-off. Only two rank-four factor
+pairs leave each difference: one CT pair and one TC pair, each stored as
+`left_rows_X` and `right_rows_Y`. No probe-frequency packed body is
+constructed and the energy-ordered Adler--Wiser pair loop runs once for the
+whole frequency batch.
+
+Writing the combined CT/TC Hall-on/off operator at sample `s` as `F_s`, the
+named ordered split is
 
 $$
-r={\mathrm{Re}\langle F_0,H_p\rangle_F\over
-        \langle F_0,F_0\rangle_F},\qquad
-\Omega_H=\omega_p\sqrt{r\over1-r},\qquad
-B_H=-{\Omega_H\over2}F_0,
+H_s={F_s+F_s^\dagger\over2},\qquad
+A_s={F_s-F_s^\dagger\over2}.
 $$
 
-while the anti-Hermitian sample fixes the ordered residue without another
-frequency point,
+The static anchor must be Hermitian. The small Frobenius Gram of all `H_s`
+is diagonalised to obtain a bounded orthonormal operator basis; all `H_s`
+and `A_s` are projected into its coordinates. This is element-wise MPA
+fitting on the rank-four factor Gram, never a centroid-square
+materialisation. For rung `n_p`, the existing ordered MPA fitter consumes the
+bit-exact nested `2*n_p` subset and produces causal-sheet poles and paired
+residues `B_{r,p}`, `D_{r,p}` for every retained coordinate `r`. It is then
+scored against all 32 authenticated samples using the factor-Gram Frobenius
+norm. Production reports the complete `n_p=1…12` ladder and selects the first
+causal rung whose maximum sample-relative residual is at most `1e-4`.
 
-$$
-D_H=iA_p{\omega_p^2+\Omega_H^2\over2\omega_p}.
-$$
-
-Thus
-`F_H(z)=(2*Omega_H*B_H+2*z*D_H)/(z^2-Omega_H^2)`.  The fit works on 4x4
-factor Gram matrices.  `D_H` is a four-factor sum (the probe plus its
-adjoint), still O(N) storage; no dense body is formed.  Both branches pass
-through `ppm_sigma._residue_for_space`, selecting `B_H+D_H` for conduction
-and `B_H-D_H` for valence.  The Sigma consumer streams one final CT or TC
-Lorentz block at a time through the incumbent q=0 convolution and analytic
+Each selected coordinate/pole pair is converted back into bounded CT/TC
+factor families. Both Sigma branches pass through
+`ppm_sigma._residue_for_space`, selecting `B_{r,p}+D_{r,p}` for conduction
+and `B_{r,p}-D_{r,p}` for valence. The Sigma consumer streams one final CT or
+TC Lorentz block at a time through the incumbent q=0 convolution and analytic
 pole denominators. Heads are analytic per pole: there is no quadrature work,
 no new response kernel, and no per-band-pair stage.
 
-The residual of the one-pole fit to `H_p` is printed separately from
-`||D_H||/||B_H||`.  The dense-contour oracle fixes `1e-4` as the largest
-admitted relative residual.  A larger value refuses as
-`GATE dynamic_hall_head_unimplemented_second_even_pole`, before Sigma.  A
-second even pole cannot be identified from the two schema-v2 samples: it
-requires at least one additional authenticated Hall, charge-head/wing and
-`W_00` frequency.  It must never be inferred by phase-rotating one factor
-side, because that changes the physical operator.
+The run writes `faraday_head_fit.json` before entering Sigma. The record binds
+the Hall plan and producer provenance; lists `sigma_H`, `S`, both wings, and
+`W_00` norms at every sample; and records the factor-Gram rank and projection
+residual, the full 1…12 residual ladder, the selected pole terms, and
+`||D_H||/||B_H||`. If no rung passes, Sigma does not run. A high-order
+plateau refuses as `GATE dynamic_hall_head_nonpole_plateau`; a still-improving
+but inadequate ladder refuses as `GATE dynamic_hall_head_multipole_inadequate`.
+The legacy schema-v2 boundary retains
+`GATE dynamic_hall_head_unimplemented_second_even_pole`. Phase-rotating one
+factor side is never an escape hatch because it changes the represented
+physical operator.
 
 This distinguishes two diagnostics that must not be conflated:
 
@@ -772,9 +785,10 @@ This distinguishes two diagnostics that must not be conflated:
   `D_H`.
 
 There is therefore no `sigCT_odd` column. On a representable
-measured-broken-TR packed GN run the record says `Faraday head : APPLIED`, names both Hall samples and
-`Omega_H`, `||D_H||/||B_H||`, the even-probe residual, and the maximum and
-mean per-state `|sigCT_hall|`.
+measured-broken-TR packed GN run the record says `Faraday head : APPLIED`,
+names the 32-sample plan, selected pole count, Gram rank, flattened pole
+terms, full residual ladder, `||D_H||/||B_H||`, and the maximum and mean
+per-state `|sigCT_hall|`.
 `SymMaps.trs_allowed=true` takes no new producer, completion, or Sigma path
 and records `EXACT ZERO`; `head_correction=off` records the DEBUG skip. A
 measured-broken-TR run without an authenticated artifact records `ABSENT`

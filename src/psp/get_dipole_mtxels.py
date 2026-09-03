@@ -1274,13 +1274,13 @@ def main(argv=None):
 			parser.error(
 				"--static-gauge-hall-only requires finite ppm_omega_p > 0 "
 				"for its dynamic Hall sample")
-		# The three-pole Hall ceiling needs six samples.  Their positions are
-		# the nested 1/2/3-pole supports from the existing MPA partition owner,
-		# placed on the imaginary axis required by the charge-head completion.
+		# The dense Hall oracle uses 32 samples.  Every 1..12-pole fit support
+		# is a bit-exact subset of this existing MPA partition, placed on the
+		# imaginary axis required by the charge-head completion.
 		# No new deck key is introduced: alpha/schedule are the MPA deck values
 		# and the incumbent GN probe is the exact upper endpoint.
 		hall_sample_plan = faraday_imaginary_plan(
-			3, omega_p,
+			16, omega_p,
 			alpha=int(params.get("mpa_sampling_alpha", 1)),
 			schedule=str(params.get("mpa_sampling_schedule", "nested")))
 		hall_frequencies = plan_z(hall_sample_plan)
@@ -1327,7 +1327,8 @@ def main(argv=None):
 				f"sigma_H_raw_bohr^-1="
 				f"[{sigma_H[0]:.17e},{sigma_H[1]:.17e},"
 				f"{sigma_H[2]:.17e}]")
-			for z, sigma_z in zip(hall_frequencies, sigma_H_frequency):
+			for z, sigma_z in zip(
+					hall_frequencies, sigma_H_frequency, strict=True):
 				print(
 					"DYNAMIC_GAUGE_HALL_SAMPLE "
 					f"z_ry={z.real:.17e}{z.imag:+.17e}j "

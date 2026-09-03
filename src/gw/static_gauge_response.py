@@ -202,11 +202,14 @@ def build_static_photon_head_response(
     hall_transaction=None,
     wfn_fingerprint_binding=None,
     frequency_ry: complex = 0.0 + 0.0j,
+    direct_response=None,
 ) -> StaticPhotonHeadResponse:
     r"""Compose one imaginary-frequency charge/Hall head sample.
 
-    The scalar response is evaluated once by
-    :func:`gw.qsgw_head.build_dft_head_response` at ``frequency_ry``.  Its
+    The scalar response is evaluated by
+    :func:`gw.qsgw_head.build_dft_head_response`.  ``direct_response`` may
+    carry a batched evaluation containing ``frequency_ry``; this is how the
+    32-point Faraday plan pays the energy-ordered pair loop once.  Its
     periodic-direction velocity rows become the derivatives of the charge
     head and charge-only wings.  Three exact-zero transverse vectors are
     passed to the canonical packer; no current wing is inferred.
@@ -283,23 +286,33 @@ def build_static_photon_head_response(
             f"(operator {hall_transaction.hamiltonian_config_operator_fingerprint}; "
             f"z={frequency!r} Ry)")
 
-    direct = build_dft_head_response(
-        wfns, (frequency,), input_dir=input_dir, mesh=mesh,
-        wfn=wfn, meta=meta, config=config,
-        wfn_fingerprint_binding=wfn_fingerprint_binding)
+    direct = direct_response
+    if direct is None:
+        direct = build_dft_head_response(
+            wfns, (frequency,), input_dir=input_dir, mesh=mesh,
+            wfn=wfn, meta=meta, config=config,
+            wfn_fingerprint_binding=wfn_fingerprint_binding)
+    try:
+        frequency_index = tuple(complex(value) for value in direct.omegas).index(
+            frequency)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(
+            "batched direct photon-head response does not contain exact "
+            f"frequency {frequency!r} Ry") from exc
     if direct.Y_x is None or direct.Z_y is None:
         raise ValueError("incumbent charge response returned no body wings")
     charge_extent = int(layout.padded_extent(0))
-    if (tuple(direct.Y_x.shape) != (1, 3, charge_extent)
-            or tuple(direct.Z_y.shape) != (1, charge_extent, 3)):
+    n_frequency = len(direct.omegas)
+    if (tuple(direct.Y_x.shape) != (n_frequency, 3, charge_extent)
+            or tuple(direct.Z_y.shape) != (n_frequency, charge_extent, 3)):
         raise ValueError(
             "charge response/layout mismatch: "
             f"Y={direct.Y_x.shape}, Z={direct.Z_y.shape}, "
             f"charge padded extent={charge_extent}")
 
-    charge_y = direct.Y_x[0, :dimension, :]
+    charge_y = direct.Y_x[frequency_index, :dimension, :]
     charge_z = jnp.transpose(
-        direct.Z_y[0, :, :dimension], (1, 0))
+        direct.Z_y[frequency_index, :, :dimension], (1, 0))
     zeros_x = tuple(
         _channel_zeros(dimension, layout.padded_extent(A), mesh, "x")
         for A in range(1, 4))
@@ -315,7 +328,8 @@ def build_static_photon_head_response(
     S_host = np.zeros(
         (dimension, dimension, 4, 4), dtype=np.complex128)
     charge_S = np.asarray(
-        jax.device_get(direct.S_direct[0, :dimension, :dimension]),
+        jax.device_get(direct.S_direct[
+            frequency_index, :dimension, :dimension]),
         dtype=np.complex128)
     S_host[:, :, 0, 0] = charge_S
     S_direct = canonicalize_static_gauge_q2_tensor(

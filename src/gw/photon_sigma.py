@@ -373,12 +373,13 @@ def compute_ppm_faraday_head_sigma_omega(
     efermi_ry: float,
     eta_ry: float = 1.0e-6,
 ):
-    r"""Contract an ordered one-pole CT/TC Gamma head on the Sigma grid.
+    r"""Contract an ordered multipole CT/TC Gamma head on the Sigma grid.
 
     The interaction remains two rank-four factor families until one CT or TC
-    Lorentz block is streamed into the shared q=0 convolution.  Pole
-    denominators weight the intermediate bands inside a ``lax.map``; there is
-    no pairwise stage, frequency quadrature, or probe-frequency packed body.
+    Lorentz block from one retained Gram-coordinate pole is streamed into the
+    shared q=0 convolution.  Pole denominators weight the intermediate bands
+    inside a ``lax.map``; there is no pairwise stage, frequency quadrature, or
+    probe-frequency packed body.
     """
     from .head_correction import FaradayHeadPPMFactorCarrier
     from .photon_layout import photon_q0_low_rank_block
@@ -396,17 +397,13 @@ def compute_ppm_faraday_head_sigma_omega(
             "dynamic Faraday Sigma endpoints must use one band plan")
 
     # The outer-product representation cannot add/subtract factor tuples
-    # elementwise.  Ask the one shared selector for the physical branch sign,
-    # then concatenate signed D factors with B.  Materializing either sum as a
-    # packed body would defeat the bounded-factor contract.
-    def residue_pairs(space):
+    # elementwise. Ask the shared selector for the physical branch sign and
+    # concatenate signed D factors with B for one analytic pole at a time.
+    def residue_pairs(B_pairs, D_pairs, space):
         odd_sign = _residue_for_space(space, 0.0, 1.0)
-        return faraday_ppm.B_pairs + tuple(
+        return tuple(B_pairs) + tuple(
             (odd_sign * left, right)
-            for left, right in faraday_ppm.D_pairs)
-
-    cond_pairs = residue_pairs("cond")
-    val_pairs = residue_pairs("val")
+            for left, right in tuple(D_pairs))
 
     omega = jnp.asarray(omega_grid_ry, dtype=jnp.float64).reshape(-1)
     energies = jnp.asarray(wfns_charge.enk, dtype=jnp.float64)
@@ -425,13 +422,7 @@ def compute_ppm_faraday_head_sigma_omega(
     empty = jnp.where(live, 1.0 - occupations, 0.0)
     delta = (omega[:, None, None]
              - (energies[None, :, :] - float(efermi_ry)))
-    pole = float(faraday_ppm.omega_h_ry)
     eta = float(eta_ry)
-    # The q0 convolution owns a leading minus.  Negating the analytic branch
-    # weights here recovers the same +R/(omega-epsilon +/- Omega) convention
-    # as compute_ppm_head_sigma_diag.
-    phases_val = -occ[None, :, :] / (delta + pole - 1j * eta)
-    phases_cond = -empty[None, :, :] / (delta - pole + 1j * eta)
 
     sigma = None
     for A, B in ((0, 1), (0, 2), (0, 3),
@@ -443,19 +434,35 @@ def compute_ppm_faraday_head_sigma_omega(
         _, contract_ppm_head = _make_photon_static_block_kernel(
             mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
             with_q0_diagnostic=True, ppm_head_only=True)
-        residue_cond_AB = photon_q0_low_rank_block(
-            cond_pairs, photon_layout, A, B, mesh_xy)
-        residue_val_AB = photon_q0_low_rank_block(
-            val_pairs, photon_layout, A, B, mesh_xy)
-        contribution = (
-            contract_ppm_head(
-                left, right, left_g, right_g,
-                residue_cond_AB, phases_cond)
-            + contract_ppm_head(
-                left, right, left_g, right_g,
-                residue_val_AB, phases_val))
-        sigma = contribution if sigma is None else sigma + contribution
-        sigma.block_until_ready()
+        for pole, B_pairs, D_pairs in zip(
+                faraday_ppm.pole_frequencies_ry,
+                faraday_ppm.B_pole_pairs,
+                faraday_ppm.D_pole_pairs, strict=True):
+            pole = complex(pole)
+            # The q0 convolution owns a leading minus. Negating the analytic
+            # branch weights recovers the same +R/(omega-epsilon +/- Omega)
+            # convention as compute_complex_pole_head_sigma_diag.  A causal
+            # MPA pole already carries Im(Omega)<=0; eta retains the incumbent
+            # real-pole boundary value without changing sheets.
+            phases_val = -occ[None, :, :] / (
+                delta + pole - 1j * eta)
+            phases_cond = -empty[None, :, :] / (
+                delta - pole + 1j * eta)
+            residue_cond_AB = photon_q0_low_rank_block(
+                residue_pairs(B_pairs, D_pairs, "cond"),
+                photon_layout, A, B, mesh_xy)
+            residue_val_AB = photon_q0_low_rank_block(
+                residue_pairs(B_pairs, D_pairs, "val"),
+                photon_layout, A, B, mesh_xy)
+            contribution = (
+                contract_ppm_head(
+                    left, right, left_g, right_g,
+                    residue_cond_AB, phases_cond)
+                + contract_ppm_head(
+                    left, right, left_g, right_g,
+                    residue_val_AB, phases_val))
+            sigma = contribution if sigma is None else sigma + contribution
+            sigma.block_until_ready()
 
     if wfns_charge.layout == "face":
         from .ppm_sigma import strip_sigma_window

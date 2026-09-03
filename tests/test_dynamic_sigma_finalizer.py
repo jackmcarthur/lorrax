@@ -171,11 +171,18 @@ def test_finalizer_adds_faraday_once_and_books_it_to_ct(monkeypatch):
         dispatch, "device_put_process_local", lambda value, _sharding: value)
 
     faraday = SimpleNamespace(
-        omega_h_ry=1.25,
-        probe_fit_relative_error=3.0e-5,
+        selected_n_poles=2,
+        gram_rank=3,
+        pole_frequencies_ry=(0.8 - 0.02j, 1.25 - 0.03j),
+        fit_ladder_pole_counts=(1, 2),
+        fit_ladder_relative_errors=(0.2, 3.0e-5),
+        fit_relative_error=3.0e-5,
+        gram_projection_relative_error=2.0e-8,
         odd_even_residue_ratio=0.2,
-        sigma_H_static=np.array([0.0, 0.0, 4.0e-8]),
-        sigma_H_probe=np.array([0.0, 0.0, 1.5e-8]))
+        sample_frequencies_ry=(0.0j, 0.5j, 1.0j, 2.0j),
+        sigma_H_frequency=np.array((
+            (0.0, 0.0, 4.0e-8), (0.0, 0.0, 3.0e-8),
+            (0.0, 0.0, 2.0e-8), (0.0, 0.0, 1.5e-8))))
     config = SimpleNamespace(
         omega_grid_ev=np.asarray([-1.0, 1.0]),
         omega_grid_ry=np.asarray([-0.1, 0.1]), sc=None)
@@ -199,10 +206,15 @@ def test_finalizer_adds_faraday_once_and_books_it_to_ct(monkeypatch):
         np.asarray(result.sigma_lorentz_skij_ry[:, 0]),
         np.stack((np.ones((2, 2)), 5.0 * np.ones((2, 2)),
                   4.0 * np.ones((2, 2)))))
-    assert result.faraday_head_omega_h_ry == 1.25
-    assert result.faraday_probe_even_fit_relative_error == 3.0e-5
+    assert result.faraday_selected_n_poles == 2
+    assert result.faraday_gram_rank == 3
+    assert result.faraday_head_poles_ry == (0.8 - 0.02j, 1.25 - 0.03j)
+    assert result.faraday_fit_ladder_pole_counts == (1, 2)
+    assert result.faraday_fit_ladder_relative_errors == (0.2, 3.0e-5)
+    assert result.faraday_fit_relative_error == 3.0e-5
     assert result.faraday_odd_even_residue_ratio == 0.2
-    assert result.faraday_sigma_h_probe_bohr_inv == (0.0, 0.0, 1.5e-8)
+    assert result.faraday_sigma_h_frequency_bohr_inv[-1] == (
+        0.0, 0.0, 1.5e-8)
 
 
 def test_the_sc_driver_does_not_overwrite_the_finalize_omega_reference():

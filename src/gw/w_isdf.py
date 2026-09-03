@@ -2086,11 +2086,193 @@ def _gate_dynamic_hall_head(
     static = np.asarray(
         jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
     magnitude_value = float(np.max(np.abs(sample)))
+    if int(hall_transaction.artifact_schema_version) < 3:
+        raise NotImplementedError(
+            "GATE dynamic_hall_head_unimplemented_second_even_pole:\n"
+            "  got:  readable schema-v2 Hall artifact with only z=0 and "
+            f"z=i*omega_p; max|sigma_H(i*omega_p)|="
+            f"{magnitude_value:.17e} bohr^-1\n"
+            "  want: schema-v3 Hall, charge-head/wing, and W_00 samples on "
+            "the nested 32-point Faraday MPA plan\n"
+            "  why:  the CrI3 one-even-pole factor fit measured a 5.963e-1 "
+            "dense-contour residual; two samples cannot select the required "
+            "second or third pole\n"
+            "  fix:  regenerate static_gauge_hall_file with the current "
+            "--static-gauge-hall-only producer\n"
+            "  doc:  docs/theory/four-current-head-corrections.md, Dynamic "
+            "Hall/Faraday Gamma head.")
+    from .mpa.sample_plan import faraday_imaginary_plan, plan_z
+
+    expected_plan = faraday_imaginary_plan(
+        16, omega_p,
+        alpha=int(hall_transaction.sample_plan_alpha),
+        schedule=str(hall_transaction.sample_plan_schedule))
+    artifact_frequencies = np.asarray(
+        jax.device_get(hall_transaction.frequencies_ry),
+        dtype=np.complex128)
+    if (int(hall_transaction.sample_plan_n_poles) != 16
+            or float(hall_transaction.sample_plan_omega_max_ry) != omega_p
+            or str(hall_transaction.sample_plan_label)
+            != str(expected_plan["label"])
+            or not np.array_equal(
+                artifact_frequencies, plan_z(expected_plan))):
+        raise ValueError(
+            "GATE dynamic_hall_head_sample_plan: schema-v3 Hall artifact "
+            "does not carry the 32-point dense nested plan ending at this "
+            f"deck's ppm_omega_p={omega_p:.17e} Ry")
     record = (
-        "PREPARED (authenticated z=0 and z=i*omega_p Hall samples; "
+        "PREPARED (authenticated 32-point Faraday MPA Hall plan; "
         f"max|sigma_H(i*omega_p)| = {magnitude_value:.17e} bohr^-1; "
         f"static sigma_H = {static.tolist()} bohr^-1)")
     return record
+
+
+def _faraday_charge_gamma_samples(
+    V_charge_gamma,
+    W_static_charge_gamma,
+    W_probe_charge_gamma,
+    frequencies_ry,
+    *,
+    probe_frequency_ry: complex,
+    n_mu_logical: int,
+    fallback_omega_ry: float,
+    print_fn=print,
+):
+    r"""Evaluate the incumbent ordered GN charge model on the Hall plan.
+
+    The packed dynamic route has exact scalar-owner ``W_00`` samples only at
+    ``z=0`` and ``z=i*omega_p``.  Fit those through the existing GN owner and
+    evaluate its same analytic pole at the intermediate Faraday frequencies;
+    the endpoint arrays are returned verbatim.  This supplies the coupled
+    4x4 completion without constructing a second packed response body.
+    """
+    from .minimax_screening import fit_gn_ppm_from_wc_pair
+
+    V = jnp.asarray(V_charge_gamma, dtype=jnp.complex128)
+    W0 = jnp.asarray(W_static_charge_gamma, dtype=jnp.complex128)
+    Wp = jnp.asarray(W_probe_charge_gamma, dtype=jnp.complex128)
+    if V.ndim != 2 or W0.shape != V.shape or Wp.shape != V.shape:
+        raise ValueError(
+            "Faraday scalar charge samples must be matching Gamma matrices")
+    z_probe = complex(probe_frequency_ry)
+    fit = fit_gn_ppm_from_wc_pair(
+        (W0 - V)[None, :, :], (Wp - V)[None, :, :], z_probe,
+        fallback_omega=float(fallback_omega_ry),
+        n_mu_logical=int(n_mu_logical),
+        coarsen_extreme_tails=False, ordered_orientations=True,
+        print_fn=print_fn)
+    Omega = jnp.asarray(fit.omega_qmunu[0], dtype=jnp.float64)
+    B = jnp.asarray(fit.B_qmunu[0], dtype=jnp.complex128)
+    D = jnp.asarray(fit.B_odd_qmunu[0], dtype=jnp.complex128)
+    valid = jnp.asarray(fit.valid_qmunu[0], dtype=bool)
+    samples = []
+    for frequency in tuple(complex(value) for value in frequencies_ry):
+        if frequency == 0.0 + 0.0j:
+            value = W0
+        elif frequency == z_probe:
+            value = Wp
+        else:
+            z = jnp.asarray(frequency, dtype=jnp.complex128)
+            denominator = z * z - Omega * Omega
+            safe = jnp.where(jnp.abs(denominator) > 0.0, denominator, 1.0)
+            wc = jnp.where(
+                valid, (2.0 * Omega * B + 2.0 * z * D) / safe,
+                0.0 + 0.0j)
+            value = V + wc
+        samples.append(value)
+    jax.block_until_ready(tuple(samples))
+    return tuple(samples)
+
+
+def _publish_faraday_fit_record(
+    input_dir, hall_transaction, sample_records, *, carrier=None,
+    failure=None,
+) -> str:
+    """Publish the small authenticated Faraday fit receipt exactly once."""
+    import hashlib
+    import json
+    import os
+
+    from common.collectives import barrier
+
+    path = Path(input_dir) / "faraday_head_fit.json"
+    if (carrier is None) == (failure is None):
+        raise ValueError(
+            "Faraday fit record requires exactly one carrier or failure")
+    payload = {
+        "schema_version": 1,
+        "hall_artifact_schema_version": int(
+            hall_transaction.artifact_schema_version),
+        "hall_sample_plan_label": str(hall_transaction.sample_plan_label),
+        "hall_sample_plan_n_poles": int(
+            hall_transaction.sample_plan_n_poles),
+        "hall_sample_plan_alpha": int(hall_transaction.sample_plan_alpha),
+        "hall_sample_plan_schedule": str(
+            hall_transaction.sample_plan_schedule),
+        "hall_sample_plan_omega_max_ry": float(
+            hall_transaction.sample_plan_omega_max_ry),
+        "hall_operator_fingerprint": str(
+            hall_transaction.hamiltonian_config_operator_fingerprint),
+        "wfn_fingerprint": str(hall_transaction.wfn_fingerprint),
+        "band_interval": [int(hall_transaction.band_start),
+                          int(hall_transaction.band_stop)],
+        "nk_tot": int(hall_transaction.nk_tot),
+        "samples": list(sample_records),
+    }
+    source = carrier if carrier is not None else failure
+    payload.update({
+        "fit_ladder": [
+            {"n_poles": int(n_poles), "max_sample_relative_error": float(error)}
+            for n_poles, error in zip(
+                (carrier.fit_ladder_pole_counts if carrier is not None
+                 else failure.pole_counts),
+                (carrier.fit_ladder_relative_errors if carrier is not None
+                 else failure.relative_errors), strict=True)],
+        "selected_n_poles": (
+            int(carrier.selected_n_poles) if carrier is not None else None),
+        "factor_gram_rank": int(source.gram_rank),
+        "factor_gram_odd_projection_relative_error": float(
+            source.gram_projection_relative_error),
+        "fit_max_sample_relative_error": (
+            float(carrier.fit_relative_error)
+            if carrier is not None else None),
+        "odd_even_residue_ratio": (
+            float(carrier.odd_even_residue_ratio)
+            if carrier is not None else None),
+        "gate": None if carrier is not None else str(failure.gate),
+        "failure": None if carrier is not None else str(failure),
+        "pole_terms": ([] if carrier is None else [
+            {
+                "coordinate": int(coordinate),
+                "pole_index": int(pole_index),
+                "omega_ry": [float(complex(pole).real),
+                             float(complex(pole).imag)],
+            }
+            for pole, coordinate, pole_index in zip(
+                carrier.pole_frequencies_ry,
+                carrier.pole_coordinate_indices, carrier.pole_indices,
+                strict=True)]),
+    })
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload["record_sha256"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if jax.process_index() == 0:
+        if path.exists():
+            if path.read_text() != text:
+                raise FileExistsError(
+                    "existing faraday_head_fit.json differs from this "
+                    "authenticated fit")
+        else:
+            partial = Path(str(path) + ".partial")
+            with partial.open("x", encoding="utf-8") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(partial, path)
+            partial.unlink()
+    barrier("faraday_head_fit_record_published")
+    return str(path)
 
 
 def _load_static_photon_hall(
@@ -2500,6 +2682,21 @@ def compute_static_photon_response(
             uses_dynamic_packed_photon_route(config)
             and not bool(trs_allowed)
             and hall is not None)
+        faraday_frequencies = None
+        faraday_direct_response = None
+        if dynamic_hall:
+            from .qsgw_head import build_dft_head_response
+
+            faraday_frequencies = tuple(complex(value) for value in np.asarray(
+                jax.device_get(hall.frequencies_ry), dtype=np.complex128))
+            # One energy-ordered pair sweep for all 32 samples.  Calling the
+            # single-frequency composer below 32 times without this carrier
+            # would repeat the expensive Adler--Wiser producer 32 times.
+            faraday_direct_response = build_dft_head_response(
+                wfns_charge, faraday_frequencies,
+                input_dir=config.input_dir, mesh=mesh_xy, wfn=wfn,
+                meta=meta, config=config,
+                wfn_fingerprint_binding=wfn_fingerprint_binding)
         response = None
         if (charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT
                 or dynamic_hall):
@@ -2513,6 +2710,7 @@ def compute_static_photon_response(
                 layout=layout,
                 hall_transaction=hall,
                 wfn_fingerprint_binding=wfn_fingerprint_binding,
+                direct_response=faraday_direct_response,
             )
         completion_response = response
         if (dynamic_hall
@@ -2565,36 +2763,92 @@ def compute_static_photon_response(
                 raise RuntimeError(
                     "dynamic Faraday completion requires scalar W_00 at "
                     "z=0 and z=i*omega_p")
-            from .head_correction import fit_dynamic_photon_cttc_q0
-            probe = 1j * float(config.ppm.omega_p)
-            probe_response = build_static_photon_head_response(
-                wfns_charge,
-                input_dir=config.input_dir,
-                mesh=mesh_xy,
-                wfn=wfn,
-                meta=meta,
-                config=config,
-                layout=layout,
-                hall_transaction=hall,
-                wfn_fingerprint_binding=wfn_fingerprint_binding,
-                frequency_ry=probe,
+            from .head_correction import (
+                DynamicHallHeadFitError,
+                fit_dynamic_photon_cttc_q0,
             )
+            probe = 1j * float(config.ppm.omega_p)
             resident_body = W_packed if screen_current else V_packed
             resident_charge_gamma = photon_block_view(
                 resident_body, layout, 0, 0, mesh_xy)[0]
             static_charge_gamma = (
                 resident_charge_gamma if screen_current else W_charge_head[0])
-            faraday_ppm = fit_dynamic_photon_cttc_q0(
-                response, probe_response,
-                W_resident_body_gamma=resident_body[0],
-                W_resident_charge_gamma=resident_charge_gamma,
-                W_static_charge_gamma=static_charge_gamma,
-                W_probe_charge_gamma=W_charge_probe[0],
-                g0_X=g0_X, g0_Y=g0_Y,
-                cubature_receipt=cubature,
-                mesh_xy=mesh_xy,
-                print_fn=print_fn,
-            )
+            charge_samples = _faraday_charge_gamma_samples(
+                resident_charge_gamma, static_charge_gamma,
+                W_charge_probe[0], faraday_frequencies,
+                probe_frequency_ry=probe,
+                n_mu_logical=int(meta.n_rmu),
+                fallback_omega_ry=float(config.ppm.omega_p),
+                print_fn=print_fn)
+            responses = [response]
+            for frequency in faraday_frequencies[1:]:
+                responses.append(build_static_photon_head_response(
+                    wfns_charge,
+                    input_dir=config.input_dir,
+                    mesh=mesh_xy,
+                    wfn=wfn,
+                    meta=meta,
+                    config=config,
+                    layout=layout,
+                    hall_transaction=hall,
+                    wfn_fingerprint_binding=wfn_fingerprint_binding,
+                    frequency_ry=frequency,
+                    direct_response=faraday_direct_response,
+                ))
+            faraday_sample_records = []
+            for sample_response, W_charge in zip(
+                    responses, charge_samples, strict=True):
+                sigma_h, S_norm, Y_norm, Z_norm, W00_norm = jax.device_get((
+                    sample_response.sigma_H,
+                    jnp.linalg.norm(sample_response.S_direct),
+                    jnp.linalg.norm(sample_response.charge_Y_x),
+                    jnp.linalg.norm(sample_response.charge_Z_y),
+                    jnp.linalg.norm(W_charge)))
+                frequency = complex(sample_response.frequency_ry)
+                faraday_sample_records.append({
+                    "frequency_ry": [float(frequency.real),
+                                     float(frequency.imag)],
+                    "sigma_H_bohr_inv": [float(value) for value in
+                                          np.asarray(sigma_h).reshape(3)],
+                    "charge_S_frobenius": float(S_norm),
+                    "charge_Y_frobenius": float(Y_norm),
+                    "charge_Z_frobenius": float(Z_norm),
+                    "W_00_frobenius": float(W00_norm),
+                })
+                if jax.process_index() == 0:
+                    print_fn(
+                        "  [photon head] Faraday authenticated sample: "
+                        f"z={frequency!r} Ry; "
+                        f"sigma_H={np.asarray(sigma_h).tolist()} bohr^-1; "
+                        f"||S_charge||={float(S_norm):.17e}; "
+                        f"||Y_charge||={float(Y_norm):.17e}; "
+                        f"||Z_charge||={float(Z_norm):.17e}; "
+                        f"||W_00||={float(W00_norm):.17e}", flush=True)
+            try:
+                faraday_ppm = fit_dynamic_photon_cttc_q0(
+                    responses,
+                    W_resident_body_gamma=resident_body[0],
+                    W_resident_charge_gamma=resident_charge_gamma,
+                    W_charge_gamma_samples=charge_samples,
+                    g0_X=g0_X, g0_Y=g0_Y,
+                    cubature_receipt=cubature,
+                    mesh_xy=mesh_xy,
+                    sampling_alpha=int(hall.sample_plan_alpha),
+                    sampling_schedule=str(hall.sample_plan_schedule),
+                    print_fn=print_fn,
+                )
+            except DynamicHallHeadFitError as error:
+                failed_record = _publish_faraday_fit_record(
+                    config.input_dir, hall, faraday_sample_records,
+                    failure=error)
+                if jax.process_index() == 0:
+                    print_fn(
+                        "  [photon head] Faraday inadequate-fit record: "
+                        f"{failed_record}", flush=True)
+                raise
+            faraday_fit_record_path = _publish_faraday_fit_record(
+                config.input_dir, hall, faraday_sample_records,
+                carrier=faraday_ppm)
 
         V_packed, W_packed, head_completion = (
             complete_static_photon_q0(
@@ -2654,20 +2908,24 @@ def compute_static_photon_response(
             head_completion = replace(
                 head_completion, faraday_ppm=faraday_ppm)
             faraday_head_record = (
-                "PREPARED (ordered one-pole CT/TC Gamma-head factors; "
-                f"Omega_H={faraday_ppm.omega_h_ry:.17e} Ry; "
+                "PREPARED (ordered multipole CT/TC Gamma-head factors; "
+                f"n_p={faraday_ppm.selected_n_poles}; "
+                f"Gram rank={faraday_ppm.gram_rank}; "
+                f"fit_record={faraday_fit_record_path}; "
                 "||D_H||/||B_H||="
                 f"{faraday_ppm.odd_even_residue_ratio:.3e}; "
                 "Sigma insertion pending the shared PPM head branch)")
             if jax.process_index() == 0:
                 print_fn(
                     "  [photon head] Faraday factors: Hall-on minus "
-                    "sigma_H=0; Omega_H="
-                    f"{faraday_ppm.omega_h_ry:.8e} Ry; "
+                    "sigma_H=0; selected n_p="
+                    f"{faraday_ppm.selected_n_poles}; Gram rank="
+                    f"{faraday_ppm.gram_rank}; "
                     "ordered ||D_H||/||B_H||="
                     f"{faraday_ppm.odd_even_residue_ratio:.3e}; "
-                    "even-probe-fit residual="
-                    f"{faraday_ppm.probe_fit_relative_error:.3e}",
+                    "dense-contour fit residual="
+                    f"{faraday_ppm.fit_relative_error:.3e}; ladder="
+                    f"{list(faraday_ppm.fit_ladder_relative_errors)}",
                     flush=True)
 
     if screen_current:

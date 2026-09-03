@@ -169,11 +169,16 @@ class SigmaResult:
     band_extrapolation_scheme: str | None = None
     ppm_probe_hermiticity_residual: float | None = None
     ppm_odd_even_residue_ratio: float | None = None
-    faraday_head_omega_h_ry: float | None = None
-    faraday_probe_even_fit_relative_error: float | None = None
+    faraday_selected_n_poles: int | None = None
+    faraday_gram_rank: int | None = None
+    faraday_head_poles_ry: tuple[complex, ...] | None = None
+    faraday_fit_ladder_pole_counts: tuple[int, ...] | None = None
+    faraday_fit_ladder_relative_errors: tuple[float, ...] | None = None
+    faraday_fit_relative_error: float | None = None
+    faraday_gram_projection_relative_error: float | None = None
     faraday_odd_even_residue_ratio: float | None = None
-    faraday_sigma_h_static_bohr_inv: tuple[float, float, float] | None = None
-    faraday_sigma_h_probe_bohr_inv: tuple[float, float, float] | None = None
+    faraday_sample_frequencies_ry: tuple[complex, ...] | None = None
+    faraday_sigma_h_frequency_bohr_inv: tuple[tuple[float, float, float], ...] | None = None
 
     def __post_init__(self) -> None:
         if self.hartree_omitted:
@@ -285,11 +290,16 @@ BASIS_FREE_FIELDS = (
     "hartree_omitted",
     "ppm_probe_hermiticity_residual",
     "ppm_odd_even_residue_ratio",
-    "faraday_head_omega_h_ry",
-    "faraday_probe_even_fit_relative_error",
+    "faraday_selected_n_poles",
+    "faraday_gram_rank",
+    "faraday_head_poles_ry",
+    "faraday_fit_ladder_pole_counts",
+    "faraday_fit_ladder_relative_errors",
+    "faraday_fit_relative_error",
+    "faraday_gram_projection_relative_error",
     "faraday_odd_even_residue_ratio",
-    "faraday_sigma_h_static_bohr_inv",
-    "faraday_sigma_h_probe_bohr_inv",
+    "faraday_sample_frequencies_ry",
+    "faraday_sigma_h_frequency_bohr_inv",
 )
 
 
@@ -682,21 +692,40 @@ def finalize_dynamic_sigma(
             str(_band_scheme) if _band_scheme is not None else None),
         ppm_probe_hermiticity_residual=ppm_probe_hermiticity_residual,
         ppm_odd_even_residue_ratio=ppm_odd_even_residue_ratio,
-        faraday_head_omega_h_ry=(
+        faraday_selected_n_poles=(
             None if faraday_ppm is None
-            else float(faraday_ppm.omega_h_ry)),
-        faraday_probe_even_fit_relative_error=(
+            else int(faraday_ppm.selected_n_poles)),
+        faraday_gram_rank=(
             None if faraday_ppm is None
-            else float(faraday_ppm.probe_fit_relative_error)),
+            else int(faraday_ppm.gram_rank)),
+        faraday_head_poles_ry=(
+            None if faraday_ppm is None else tuple(
+                complex(value) for value in
+                faraday_ppm.pole_frequencies_ry)),
+        faraday_fit_ladder_pole_counts=(
+            None if faraday_ppm is None else tuple(
+                int(value) for value in faraday_ppm.fit_ladder_pole_counts)),
+        faraday_fit_ladder_relative_errors=(
+            None if faraday_ppm is None else tuple(
+                float(value) for value in
+                faraday_ppm.fit_ladder_relative_errors)),
+        faraday_fit_relative_error=(
+            None if faraday_ppm is None
+            else float(faraday_ppm.fit_relative_error)),
+        faraday_gram_projection_relative_error=(
+            None if faraday_ppm is None else float(
+                faraday_ppm.gram_projection_relative_error)),
         faraday_odd_even_residue_ratio=(
             None if faraday_ppm is None
             else float(faraday_ppm.odd_even_residue_ratio)),
-        faraday_sigma_h_static_bohr_inv=(
-            None if faraday_ppm is None else tuple(float(v) for v in
-                np.asarray(faraday_ppm.sigma_H_static).reshape(3))),
-        faraday_sigma_h_probe_bohr_inv=(
-            None if faraday_ppm is None else tuple(float(v) for v in
-                np.asarray(faraday_ppm.sigma_H_probe).reshape(3))),
+        faraday_sample_frequencies_ry=(
+            None if faraday_ppm is None else tuple(
+                complex(value) for value in
+                faraday_ppm.sample_frequencies_ry)),
+        faraday_sigma_h_frequency_bohr_inv=(
+            None if faraday_ppm is None else tuple(
+                tuple(float(v) for v in row) for row in
+                np.asarray(faraday_ppm.sigma_H_frequency).reshape(-1, 3))),
         # The dynamic PACKED route's per-sector Gamma-cell diagnostics.
         # None for every scalar dynamic run, so the freq-debug writer's
         # columns are unchanged there; on the packed route its CC sector is

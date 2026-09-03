@@ -60,8 +60,11 @@ def _patch_direct(monkeypatch, mesh):
         Y_x=_placed(Y, mesh, P(None, None, "x")),
         Z_y=_placed(Z, mesh, P(None, "y", None)),
     )
-    monkeypatch.setattr(qsgw_head, "build_dft_head_response",
-                        lambda *args, **kwargs: direct)
+    monkeypatch.setattr(
+        qsgw_head, "build_dft_head_response",
+        lambda _wfns, omegas, **_kwargs: SimpleNamespace(
+            omegas=tuple(complex(value) for value in omegas),
+            S_direct=direct.S_direct, Y_x=direct.Y_x, Z_y=direct.Z_y))
     monkeypatch.setattr(parallel_transport, "wfn_fingerprint",
                         lambda _wfn: _WFN_SHA)
 
@@ -186,6 +189,7 @@ def test_bulk_producer_keeps_all_three_scalar_head_directions(monkeypatch):
                      [0.0, 0.0, 3.0]]], dtype=np.complex128)
     Z = np.conj(np.transpose(Y, (0, 2, 1)))
     direct = SimpleNamespace(
+        omegas=(0.0j,),
         S_direct=_placed(_S, mesh, P()),
         Y_x=_placed(Y, mesh, P(None, None, "x")),
         Z_y=_placed(Z, mesh, P(None, "y", None)),

@@ -3,12 +3,13 @@
 This is the sole format owner for the frequency-indexed Hall pseudovector
 ``sigma_H(z)`` produced by :func:`gw.qsgw_head.static_gauge_hall_transaction`
 (``get_dipole_mtxels --static-gauge-hall-only``) and consumed, optionally, by
-the packed static photon Gamma-cell completion
+the packed photon Gamma-cell completion
 (:func:`gw.w_isdf.compute_static_photon_response` under
-``bispinor_gw = full_static_cohsex``).  The artifact is small (one complex
-frequency and three complex components per sample, plus identity attributes)
-and replicated; SlabIO is still the only transport so that every rank reads
-the same completed inode collectively.
+the static or dynamic supported envelope). Schema v3 contains the 32-point
+nested imaginary-axis Faraday MPA oracle, three complex components per sample,
+and the exact plan identity; schema v2 remains readable for its static row.
+The artifact is small and replicated; SlabIO is still the only transport so
+that every rank reads the same completed inode collectively.
 
 The loader authenticates the artifact against the consuming run: the WFN
 identity (:func:`common.parallel_transport.wfn_fingerprint`), the band

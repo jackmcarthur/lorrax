@@ -25,7 +25,8 @@ What the module owns
   ``Sigma^SX``, ``Sigma^(SX-X)``, ``Sigma^COH`` shifts.
 * **Dynamic heads** -- :func:`fit_head_ppm` (GN / HL scalar pole from two
   samples), :func:`fit_dynamic_photon_cttc_q0` (the GN Hall-on/off CT/TC
-  completion retained as rank-four factors), and
+  completion fitted on bounded rank-four factor-Gram coordinates through the
+  existing ordered MPA machinery), and
   :func:`compute_complex_pole_head_sigma_diag` (MPA poles on the stamped
   complex grid).
 * **Rank-1 re-attachment** -- :func:`apply_q0_head_rank1` and
@@ -1196,48 +1197,97 @@ STATIC_PHOTON_CHARGE_BLOCK_STATES = (
 )
 
 
+class DynamicHallHeadFitError(NotImplementedError):
+    """Named inadequate-fit refusal carrying its bounded ladder evidence."""
+
+    def __init__(
+        self,
+        gate: str,
+        message: str,
+        *,
+        pole_counts,
+        relative_errors,
+        gram_rank: int,
+        gram_projection_relative_error: float,
+    ) -> None:
+        super().__init__(message)
+        self.gate = str(gate)
+        self.pole_counts = tuple(int(value) for value in pole_counts)
+        self.relative_errors = tuple(
+            float(value) for value in relative_errors)
+        self.gram_rank = int(gram_rank)
+        self.gram_projection_relative_error = float(
+            gram_projection_relative_error)
+
+
 @dataclass(frozen=True)
 class FaradayHeadPPMFactorCarrier:
-    """Ordered one-pole CT/TC Gamma head, kept only as rank-four factors.
+    """Ordered multipole CT/TC Gamma head as bounded factor families.
 
-    ``static_pairs`` and ``probe_pairs`` are the screened Hall-on minus
-    ``sigma_H=0`` CT and TC samples.  ``B_pairs`` is their fitted ordinary
-    pole residue ``B=(R_+ + R_-)/2``.  ``D_pairs`` is the ordered residue
-    ``D=(R_+ - R_-)/2`` read from the anti-Hermitian part of the completed
-    probe sample.  The bare Hall coefficient is even in frequency, but its
-    CT/TC completion is embedded in the same non-Hermitian imaginary-axis
-    screening environment as the GN body; the two parities must not be
-    conflated.  Sigma selects ``B+D`` / ``B-D`` through the one shared
-    :func:`gw.ppm_sigma._residue_for_space` convention.
+    ``pole_frequencies_ry``, ``B_pole_pairs`` and ``D_pole_pairs`` flatten
+    the retained factor-Gram-coordinate and selected-MPA-pole axes in
+    row-major order, omitting only poles pruned by the incumbent MPA guards.
+    The parallel coordinate/pole index tuples retain that provenance. Each
+    entry remains a bounded CT/TC rank-four factor family.
+    Sigma selects ``B+D`` / ``B-D`` through the same
+    :func:`gw.ppm_sigma._residue_for_space` convention as the body.
     """
 
-    omega_h_ry: float
-    B_pairs: tuple[tuple[jax.Array, jax.Array], ...]
-    D_pairs: tuple[tuple[jax.Array, jax.Array], ...]
-    static_pairs: tuple[tuple[jax.Array, jax.Array], ...]
-    probe_pairs: tuple[tuple[jax.Array, jax.Array], ...]
-    sigma_H_static: np.ndarray
-    sigma_H_probe: np.ndarray
-    probe_frequency_ry: complex
-    probe_fit_relative_error: float
+    selected_n_poles: int
+    gram_rank: int
+    pole_frequencies_ry: tuple[complex, ...]
+    pole_coordinate_indices: tuple[int, ...]
+    pole_indices: tuple[int, ...]
+    B_pole_pairs: tuple[tuple[tuple[jax.Array, jax.Array], ...], ...]
+    D_pole_pairs: tuple[tuple[tuple[jax.Array, jax.Array], ...], ...]
+    sample_pairs: tuple[tuple[tuple[jax.Array, jax.Array], ...], ...]
+    sample_frequencies_ry: tuple[complex, ...]
+    sigma_H_frequency: np.ndarray
+    fit_ladder_pole_counts: tuple[int, ...]
+    fit_ladder_relative_errors: tuple[float, ...]
+    fit_relative_error: float
     odd_even_residue_ratio: float
-    raw_pair_overlaps: tuple[complex, complex]
+    gram_projection_relative_error: float
 
     def __post_init__(self) -> None:
-        if (len(self.B_pairs), len(self.D_pairs), len(self.static_pairs),
-                len(self.probe_pairs)) != (2, 4, 2, 2):
+        n_terms = len(self.pole_frequencies_ry)
+        if (len(self.B_pole_pairs), len(self.D_pole_pairs),
+                len(self.pole_coordinate_indices), len(self.pole_indices)) != (
+                    n_terms, n_terms, n_terms, n_terms):
             raise ValueError(
-                "Faraday head needs two B/static/probe factor families "
-                "(CT and TC) and four ordered-D factors")
-        if not np.isfinite(self.omega_h_ry) or self.omega_h_ry <= 0.0:
-            raise ValueError("Faraday head pole frequency must be positive")
-        if (not np.isfinite(self.probe_fit_relative_error)
+                "Faraday head pole metadata and B/D factor families differ")
+        if not 1 <= int(self.selected_n_poles) <= 12:
+            raise ValueError("Faraday head selected pole count must be 1..12")
+        if int(self.gram_rank) <= 0:
+            raise ValueError("Faraday head factor Gram must have positive rank")
+        if (len(self.fit_ladder_relative_errors)
+                != len(self.fit_ladder_pole_counts)
+                or int(self.selected_n_poles)
+                not in tuple(self.fit_ladder_pole_counts)):
+            raise ValueError(
+                "Faraday head fit ladder metadata is inconsistent")
+        if len(self.sample_pairs) != len(self.sample_frequencies_ry):
+            raise ValueError("Faraday head sample factors/frequencies differ")
+        sigma = np.asarray(self.sigma_H_frequency)
+        if sigma.shape != (len(self.sample_frequencies_ry), 3):
+            raise ValueError("Faraday head Hall samples have invalid shape")
+        poles = np.asarray(self.pole_frequencies_ry, dtype=np.complex128)
+        if (poles.size == 0 or np.any(~np.isfinite(poles))
+                or np.any(np.real(poles) <= 0.0)
+                or np.any(np.imag(poles) > 1.0e-12 * np.abs(poles))):
+            raise ValueError("Faraday head poles must lie on the causal sheet")
+        if (not np.isfinite(self.fit_relative_error)
                 or not np.isfinite(self.odd_even_residue_ratio)
-                or self.probe_fit_relative_error < 0.0
-                or self.odd_even_residue_ratio < 0.0):
+                or not np.isfinite(self.gram_projection_relative_error)
+                or self.fit_relative_error < 0.0
+                or self.odd_even_residue_ratio < 0.0
+                or self.gram_projection_relative_error < 0.0):
             raise ValueError("Faraday head fit diagnostics must be finite")
-        if len(self.raw_pair_overlaps) != 2:
-            raise ValueError("Faraday head needs one raw overlap per CT/TC pair")
+
+    @property
+    def sigma_H_static(self) -> np.ndarray:
+        """The exact authenticated ``z=0`` Hall row."""
+        return np.asarray(self.sigma_H_frequency[0], dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -2202,6 +2252,34 @@ def _factor_family_inner(first, second):
         for pair_a in tuple(first) for pair_b in tuple(second))
 
 
+def _factor_family_gram_matrix(first_families, second_families):
+    """Batched Frobenius Gram of like-shaped bounded factor families."""
+    first = tuple(tuple(family) for family in first_families)
+    second = tuple(tuple(family) for family in second_families)
+    if not first or not second:
+        raise ValueError("factor-family Gram requires nonempty operands")
+    n_pairs = len(first[0])
+    if (n_pairs == 0 or any(len(family) != n_pairs for family in first)
+            or any(len(family) != n_pairs for family in second)):
+        raise ValueError("factor-family Gram operands differ in factor count")
+    left_first = jnp.stack(tuple(jnp.stack(tuple(
+        pair[0] for pair in family)) for family in first))
+    right_first = jnp.stack(tuple(jnp.stack(tuple(
+        pair[1] for pair in family)) for family in first))
+    left_second = jnp.stack(tuple(jnp.stack(tuple(
+        pair[0] for pair in family)) for family in second))
+    right_second = jnp.stack(tuple(jnp.stack(tuple(
+        pair[1] for pair in family)) for family in second))
+    left_gram = jnp.einsum(
+        "ipam,jqbm->ipjqab", jnp.conj(left_first), left_second,
+        optimize=True)
+    right_gram = jnp.einsum(
+        "ipam,jqbm->ipjqab", jnp.conj(right_first), right_second,
+        optimize=True)
+    return jnp.einsum("ipjqab,ipjqab->ij", left_gram, right_gram,
+                      optimize=True)
+
+
 def _scale_factor_family(pairs, scale):
     """Scale a low-rank operator without changing either factor layout."""
     value = jnp.asarray(scale, dtype=jnp.complex128)
@@ -2229,248 +2307,424 @@ def _adjoint_factor_family(pairs, mesh_xy: Mesh):
     return tuple(result)
 
 
-def _fit_ordered_faraday_factor_samples(
-    static_pairs,
-    probe_pairs,
-    probe_frequency: complex,
-    *,
-    mesh_xy: Mesh,
-    print_fn=print,
-):
-    r"""Fit ``B`` and ordered ``D`` from two CT/TC factor samples.
+def _linear_combination_faraday_samples(sample_families, coefficients):
+    """Combine the four structurally shared CT/TC sample factors exactly.
 
-    A factor gauge is ``L -> c L, R -> R/c`` because the represented update
-    is ``L.T R``.  :func:`_factor_family_inner` is exactly invariant under
-    that transformation, so an imaginary raw overlap cannot be repaired by
-    a legitimate factor phase convention.  The named physical selection is
-    instead the GN ordered split of the completed probe operator,
-    ``H=(Wp+Wp^dagger)/2`` and ``A=(Wp-Wp^dagger)/2``.  ``H`` fixes the
-    static-anchored even pole; ``A`` fixes ``D`` exactly as in the body fit.
-
-    Returns
-    -------
-    tuple
-        ``(Omega, B_pairs, D_pairs, even_fit_error, |D|/|B|,
-        raw_pair_overlaps)``.  Each residue remains a bounded sequence of
-        rank-four factors.
+    ``CT`` and ``TC^dagger`` share their right factors over frequency; ``TC``
+    and ``CT^dagger`` share their left factors.  This is fixed by
+    :func:`_faraday_cttc_factor_pairs`, not inferred from a numerical gauge.
+    Summing the other factor retains four rank-four pairs independent of the
+    32-point oracle size.
     """
-    static_pairs = tuple(static_pairs)
-    probe_pairs = tuple(probe_pairs)
-    if len(static_pairs) != 2 or len(probe_pairs) != 2:
-        raise ValueError("ordered Faraday fit requires CT and TC factor pairs")
-    probe = complex(probe_frequency)
-    if (not np.isfinite(probe.real) or not np.isfinite(probe.imag)
-            or probe.real != 0.0 or probe.imag == 0.0):
+    families = tuple(tuple(family) for family in sample_families)
+    coeff = np.asarray(coefficients, dtype=np.complex128).reshape(-1)
+    if not families or len(families) != int(coeff.size):
+        raise ValueError("Faraday sample combination has inconsistent size")
+    if any(len(family) != 4 for family in families):
+        raise ValueError("Faraday Hermitian sample families need four pairs")
+    result = []
+    for pair_index in range(4):
+        pairs = tuple(family[pair_index] for family in families)
+        if pair_index in (0, 3):
+            left = sum(
+                jnp.asarray(value, dtype=jnp.complex128) * pair[0]
+                for value, pair in zip(coeff, pairs, strict=True))
+            right = pairs[0][1]
+        else:
+            left = pairs[0][0]
+            right = sum(
+                jnp.asarray(value, dtype=jnp.complex128) * pair[1]
+                for value, pair in zip(coeff, pairs, strict=True))
+        result.append((left, right))
+    return tuple(result)
+
+
+def _faraday_hermitian_coordinate_basis(
+    hermitian_samples, antihermitian_samples, *, mesh_xy: Mesh,
+):
+    """Orthonormalize the even samples through their small factor Gram.
+
+    Returns the bounded factor basis, even/odd sample coordinates, each
+    sample's even/odd norm outside that basis, and their combined relative
+    projection error. No centroid-square operator is materialized.
+    """
+    hermitian = tuple(tuple(sample) for sample in hermitian_samples)
+    anti = tuple(tuple(sample) for sample in antihermitian_samples)
+    if not hermitian or len(hermitian) != len(anti):
+        raise ValueError("Faraday even/odd sample counts differ")
+    gram_device = _factor_family_gram_matrix(hermitian, hermitian)
+    anti_gram_device = _factor_family_gram_matrix(anti, anti)
+    gram, anti_gram = jax.device_get((gram_device, anti_gram_device))
+    gram = np.asarray(gram, dtype=np.complex128)
+    anti_norm = np.real(np.diag(np.asarray(
+        anti_gram, dtype=np.complex128)))
+    scale = max(float(np.max(np.abs(gram))), 1.0e-300)
+    anti_roundoff_floor = scale * (
+        64.0 * np.sqrt(np.finfo(np.float64).eps)) ** 2
+    anti_norm = np.where(anti_norm <= anti_roundoff_floor, 0.0, anti_norm)
+    hermiticity_error = float(
+        np.max(np.abs(gram - np.conj(gram.T))) / scale)
+    if hermiticity_error > 1.0e-10:
         raise ValueError(
-            "GATE dynamic_hall_head_ordered_probe_axis: the ordered Hall "
-            f"probe must be nonzero and purely imaginary; got {probe!r}")
-
-    static_adjoint = _adjoint_factor_family(static_pairs, mesh_xy)
-    probe_adjoint = _adjoint_factor_family(probe_pairs, mesh_xy)
-    static_anti = (
-        _scale_factor_family(static_pairs, 0.5)
-        + _scale_factor_family(static_adjoint, -0.5))
-    probe_herm = (
-        _scale_factor_family(probe_pairs, 0.5)
-        + _scale_factor_family(probe_adjoint, 0.5))
-    probe_anti = (
-        _scale_factor_family(probe_pairs, 0.5)
-        + _scale_factor_family(probe_adjoint, -0.5))
-
-    pair_cross = tuple(
-        _factor_pair_inner(anchor, sample)
-        for anchor, sample in zip(static_pairs, probe_pairs))
-    static_norm = _factor_family_inner(static_pairs, static_pairs)
-    probe_norm = _factor_family_inner(probe_pairs, probe_pairs)
-    static_anti_norm = _factor_family_inner(static_anti, static_anti)
-    probe_herm_norm = _factor_family_inner(probe_herm, probe_herm)
-    probe_anti_norm = _factor_family_inner(probe_anti, probe_anti)
-    raw_cross = _factor_family_inner(static_pairs, probe_pairs)
-    herm_cross = _factor_family_inner(static_pairs, probe_herm)
-    values = jax.device_get((
-        *pair_cross, static_norm, probe_norm, static_anti_norm,
-        probe_herm_norm, probe_anti_norm, raw_cross, herm_cross))
-    (ct_cross_h, tc_cross_h, static_norm_h, probe_norm_h,
-     static_anti_norm_h, probe_herm_norm_h, probe_anti_norm_h,
-     raw_cross_h, herm_cross_h) = (complex(value) for value in values)
-    pair_cross_h = (ct_cross_h, tc_cross_h)
-    scale = max(abs(static_norm_h), abs(probe_norm_h), 1.0e-300)
-    if (static_norm_h.real <= 1.0e-300
-            or abs(static_norm_h.imag) > 1.0e-12 * scale):
+            "GATE dynamic_hall_head_factor_gram: the even-sample "
+            f"Frobenius Gram is non-Hermitian by {hermiticity_error:.3e}")
+    eigenvalues, eigenvectors = np.linalg.eigh(
+        0.5 * (gram + np.conj(gram.T)))
+    largest = float(max(np.max(eigenvalues), 0.0))
+    if largest <= 1.0e-300:
         raise ValueError(
             "GATE dynamic_hall_head_static_anchor: the Hall-on/off CT/TC "
-            "static factor family has no positive finite Frobenius norm")
+            "sample family has no positive finite Frobenius norm")
+    cutoff = largest * max(
+        128.0 * len(hermitian) * np.finfo(np.float64).eps, 1.0e-13)
+    keep = eigenvalues > cutoff
+    if not np.any(keep):
+        raise ValueError("dynamic Faraday factor Gram has numerical rank zero")
+    values = eigenvalues[keep]
+    vectors = eigenvectors[:, keep]
+    basis = tuple(
+        _linear_combination_faraday_samples(
+            hermitian, vectors[:, index] / np.sqrt(values[index]))
+        for index in range(int(values.size)))
+    # <e_r,H_j> = sqrt(lambda_r) conj(U_jr).  Re-evaluate the odd
+    # coordinates against the actual bounded factors because they need not
+    # lie in the span of the even samples.
+    even_coordinates = np.sqrt(values)[None, :] * np.conj(vectors)
+    odd_device = jnp.swapaxes(
+        _factor_family_gram_matrix(basis, anti), 0, 1)
+    odd_coordinates = np.asarray(
+        jax.device_get(odd_device), dtype=np.complex128)
+    even_scale = max(float(np.max(np.abs(even_coordinates))), 1.0e-300)
+    odd_scale = max(float(np.max(np.abs(odd_coordinates))), 1.0e-300)
+    if np.max(np.abs(np.imag(even_coordinates))) > 1.0e-10 * even_scale:
+        raise ValueError(
+            "GATE dynamic_hall_head_complex_fit: Hermitian sample "
+            "coordinates are not real")
+    if odd_scale <= 1.0e-10 * even_scale:
+        # The Hermitian negative control subtracts two independently
+        # contracted O(||H||) factor families.  Its O(eps*||H||) remainder
+        # is an exact-zero certificate, not a resolvable ordered response.
+        odd_coordinates = np.zeros_like(odd_coordinates)
+        odd_scale = 1.0e-300
+    elif np.max(np.abs(np.real(odd_coordinates))) > 1.0e-10 * odd_scale:
+        raise ValueError(
+            "GATE dynamic_hall_head_complex_fit: anti-Hermitian sample "
+            "coordinates are not imaginary; max|Re|/max|coordinate|="
+            f"{np.max(np.abs(np.real(odd_coordinates))) / odd_scale:.3e}")
+    even_coordinates = np.real(even_coordinates).astype(np.complex128)
+    odd_coordinates = (
+        1j * np.imag(odd_coordinates)).astype(np.complex128)
+    even_norm = np.real(np.diag(gram))
+    even_orthogonal_sq = np.maximum(
+        even_norm - np.sum(np.abs(even_coordinates) ** 2, axis=1), 0.0)
+    orthogonal_sq = np.maximum(
+        anti_norm - np.sum(np.abs(odd_coordinates) ** 2, axis=1), 0.0)
+    # Both differences subtract independently accumulated O(||F||^2)
+    # quantities. Below the Gram reduction's roundoff floor they certify
+    # numerical zero, not a resolvable discarded factor direction.
+    even_orthogonal_sq = np.where(
+        even_orthogonal_sq <= anti_roundoff_floor, 0.0,
+        even_orthogonal_sq)
+    orthogonal_sq = np.where(
+        orthogonal_sq <= anti_roundoff_floor, 0.0, orthogonal_sq)
+    total_norm = max(float(np.sum(
+        np.maximum(even_norm, 0.0) + np.maximum(anti_norm, 0.0))),
+        1.0e-300)
+    projection_error = float(np.sqrt(
+        np.sum(even_orthogonal_sq + orthogonal_sq) / total_norm))
+    return (
+        basis, even_coordinates, odd_coordinates, even_orthogonal_sq,
+        orthogonal_sq, projection_error)
+
+
+def _fit_ordered_faraday_factor_samples(
+    sample_pairs,
+    sample_frequencies,
+    *,
+    mesh_xy: Mesh,
+    sampling_alpha: int = 1,
+    sampling_schedule: str = "nested",
+    adequacy_tolerance: float = 1.0e-4,
+    print_fn=print,
+):
+    r"""Fit the minimal 1..12-pole ordered MPA model on factor coordinates.
+
+    The Hermitian halves of all authenticated samples define a small
+    orthonormal operator basis through their Frobenius Gram.  Each coordinate
+    is then an ordinary element for :func:`gw.mpa.pade_fit.fit_mpa_poles`,
+    including its ordered ``B``/``D`` split and causal guards.  Rung ``n`` is
+    fitted on the nested ``2*n``-sample support and scored against every
+    supplied sample.  The full ladder through 12 is reported, and its first
+    maximum relative residual no larger than ``adequacy_tolerance`` is used.
+    """
+    from .mpa.pade_fit import eval_mpa_model, fit_mpa_poles_batched
+    from .mpa.sample_plan import faraday_imaginary_plan, plan_z
+
+    samples = tuple(tuple(sample) for sample in sample_pairs)
+    frequencies = np.asarray(
+        sample_frequencies, dtype=np.complex128).reshape(-1)
+    if (len(samples) != int(frequencies.size) or len(samples) % 2 != 0
+            or not 2 <= len(samples) <= 32
+            or any(len(sample) != 2 for sample in samples)):
+        raise ValueError(
+            "ordered Faraday MPA fit requires 2..32 even-count CT/TC samples")
+    if frequencies[0] != 0.0 + 0.0j:
+        raise ValueError("ordered Faraday sample zero must be z=0")
+    if (np.any(~np.isfinite(frequencies)) or np.any(frequencies.real != 0.0)
+            or np.any(frequencies.imag < 0.0)):
+        raise ValueError(
+            "GATE dynamic_hall_head_ordered_probe_axis: all Hall fit "
+            "samples must lie on the nonnegative imaginary axis")
+    max_sample_poles = len(samples) // 2
+    full_plan = faraday_imaginary_plan(
+        max_sample_poles, float(frequencies[-1].imag), alpha=sampling_alpha,
+        schedule=sampling_schedule)
+    if not np.array_equal(frequencies, plan_z(full_plan)):
+        raise ValueError(
+            "GATE dynamic_hall_head_sample_plan: Hall factor samples differ "
+            "from their nested MPA imaginary-axis plan")
+
+    adjoints = tuple(
+        _adjoint_factor_family(sample, mesh_xy) for sample in samples)
+    hermitian = tuple(
+        _scale_factor_family(sample, 0.5)
+        + _scale_factor_family(adjoint, 0.5)
+        for sample, adjoint in zip(samples, adjoints, strict=True))
+    antihermitian = tuple(
+        _scale_factor_family(sample, 0.5)
+        + _scale_factor_family(adjoint, -0.5)
+        for sample, adjoint in zip(samples, adjoints, strict=True))
+    static_norm, static_anti_norm = (
+        complex(value) for value in jax.device_get((
+            _factor_family_inner(samples[0], samples[0]),
+            _factor_family_inner(antihermitian[0], antihermitian[0]))))
     static_anti_ratio = np.sqrt(
-        max(static_anti_norm_h.real, 0.0) / static_norm_h.real)
-    # This norm is obtained by subtracting two independently contracted
-    # O(||W0||^2) Gram sums before taking a square root, so its floating-point
-    # resolution is O(sqrt(eps)), not O(eps).  The complex-overlap gate below
-    # remains at 1e-10; this separate certificate only rejects a resolvable
-    # static anti-Hermitian operator.
-    static_anti_tolerance = 64.0 * np.sqrt(np.finfo(np.float64).eps)
-    if static_anti_ratio > static_anti_tolerance:
+        max(static_anti_norm.real, 0.0)
+        / max(static_norm.real, 1.0e-300))
+    if static_anti_ratio > 64.0 * np.sqrt(np.finfo(np.float64).eps):
         raise ValueError(
             "GATE dynamic_hall_head_static_anchor: the z=0 Hall factor "
             "family is not Hermitian; ||A0||/||W0||="
             f"{static_anti_ratio:.3e}")
-    if abs(herm_cross_h.imag) > 1.0e-10 * scale:
-        raise ValueError(
-            "GATE dynamic_hall_head_complex_fit: the ordered Hermitian "
-            "probe overlap is not real; Im<W0,Hp>="
-            f"{herm_cross_h.imag:.3e}")
 
-    ratio = herm_cross_h.real / static_norm_h.real
-    if not 0.0 < ratio < 1.0:
-        raise ValueError(
-            "GATE dynamic_hall_head_one_pole: an even positive-frequency "
-            "one-pole fit requires 0 < <W0,Hp>/<W0,W0> < 1; "
-            f"got {ratio:.17e}")
-    probe_magnitude = abs(probe.imag)
-    omega_h = probe_magnitude * np.sqrt(ratio / (1.0 - ratio))
-    even_residual_sq = max(
-        probe_herm_norm_h.real - 2.0 * ratio * herm_cross_h.real
-        + ratio * ratio * static_norm_h.real,
-        0.0)
-    even_fit_error = np.sqrt(
-        even_residual_sq / max(probe_herm_norm_h.real, 1.0e-300))
-    B_pairs = _scale_factor_family(static_pairs, -0.5 * omega_h)
-    odd_scale = 1j * (
-        probe_magnitude * probe_magnitude + omega_h * omega_h
-    ) / (2.0 * probe_magnitude)
-    D_pairs = _scale_factor_family(probe_anti, odd_scale)
-    B_norm = 0.5 * omega_h * np.sqrt(static_norm_h.real)
-    D_norm = abs(odd_scale) * np.sqrt(max(probe_anti_norm_h.real, 0.0))
-    odd_even_ratio = D_norm / max(B_norm, 1.0e-300)
+    (basis, even_coordinates, odd_coordinates, even_orthogonal_sq,
+     odd_orthogonal_sq, projection_error) = (
+        _faraday_hermitian_coordinate_basis(
+            hermitian, antihermitian, mesh_xy=mesh_xy))
+    sample_gram = np.asarray(jax.device_get(
+        _factor_family_gram_matrix(samples, samples)), dtype=np.complex128)
+    sample_norms = np.real(np.diag(sample_gram))
+    ladder = []
+    ladder_counts = []
+    selected = None
+    max_fit_poles = min(max_sample_poles, 12)
+    for n_poles in range(1, max_fit_poles + 1):
+        plan = faraday_imaginary_plan(
+            n_poles, float(frequencies[-1].imag), alpha=sampling_alpha,
+            schedule=sampling_schedule)
+        support_frequencies = plan_z(plan)
+        indices = np.asarray(tuple(
+            int(np.flatnonzero(frequencies == value)[0])
+            for value in support_frequencies), dtype=np.int64)
+        positive = np.swapaxes(
+            even_coordinates[indices] + odd_coordinates[indices], 0, 1)
+        negative = np.swapaxes(
+            even_coordinates[indices] - odd_coordinates[indices], 0, 1)
+        omega, B, D, diagnostics = fit_mpa_poles_batched(
+            jnp.asarray(positive), jnp.asarray(support_frequencies), n_poles,
+            W_negative_tile=jnp.asarray(negative), return_odd=True)
+        omega_host, B_host, D_host, valid_host = jax.device_get((
+            omega, B, D, diagnostics["valid"]))
+        omega_host = np.asarray(omega_host, dtype=np.complex128)
+        B_host = np.asarray(B_host, dtype=np.complex128)
+        D_host = np.asarray(D_host, dtype=np.complex128)
+        valid_host = np.asarray(valid_host, dtype=bool)
+        model_rows = []
+        for value in frequencies:
+            frequency_value = jnp.asarray(value, dtype=jnp.complex128)
+            row = jax.vmap(
+                eval_mpa_model, in_axes=(0, 0, None, 0, 0))(
+                    omega, B, frequency_value, diagnostics["valid"], D)
+            model_rows.append(np.asarray(
+                jax.device_get(row), dtype=np.complex128))
+        model_coordinates = np.stack(model_rows, axis=0)
+        target_coordinates = even_coordinates + odd_coordinates
+        coordinate_error_sq = np.sum(
+            np.abs(model_coordinates - target_coordinates) ** 2, axis=1)
+        error_sq = (
+            coordinate_error_sq + even_orthogonal_sq + odd_orthogonal_sq)
+        relative_by_sample = np.sqrt(
+            error_sq / np.maximum(sample_norms, 1.0e-300))
+        residual = float(np.max(relative_by_sample))
+        ladder.append(residual)
+        ladder_counts.append(n_poles)
+        causal = (
+            np.all(np.real(omega_host[valid_host]) > 0.0)
+            and np.all(np.imag(omega_host[valid_host])
+                       <= 1.0e-12 * np.abs(omega_host[valid_host])))
+        if jax.process_index() == 0:
+            print_fn(
+                "  [photon head] Faraday MPA ladder: "
+                f"n_p={n_poles}; gram_rank={len(basis)}; "
+                f"max-sample residual={residual:.17e}; "
+                f"valid={int(np.sum(valid_host))}/{valid_host.size}; "
+                f"causal={bool(causal)}")
+        if (selected is None and residual <= float(adequacy_tolerance)
+                and causal):
+            selected = (
+                n_poles, omega_host, B_host, D_host, valid_host)
 
+    if selected is None:
+        gate = (
+            "dynamic_hall_head_unimplemented_second_even_pole"
+            if max_fit_poles == 1 else
+            "dynamic_hall_head_nonpole_plateau"
+            if (max_fit_poles >= 8 and ladder[-1] > adequacy_tolerance
+                and min(ladder[-4:]) > 1.0e-3
+                and min(ladder[-4:]) >= 0.8 * min(ladder[-8:-4])) else
+            "dynamic_hall_head_multipole_inadequate")
+        message = (
+            f"GATE {gate}:\n"
+            f"  got:  ordered Faraday n_p=1..{max_fit_poles} maximum-sample "
+            f"residuals = {ladder}, all above {adequacy_tolerance:.1e} or "
+            "with a noncausal guarded pole\n"
+            "  want: the minimal causal even-in-z MPA model whose dense "
+            "imaginary-contour residual is <= 1e-4\n"
+            "  why:  an under-resolved Gamma-head pole would silently "
+            "replace the authenticated CT/TC response by another operator\n"
+            "  fix:  request the owner-ruled non-pole imaginary-axis-to-time "
+            "treatment for a plateau, or authenticate an owner-approved "
+            "denser plan for a still-falling ladder\n"
+            "  doc:  docs/theory/four-current-head-corrections.md, Dynamic "
+            "Hall/Faraday Gamma head.")
+        raise DynamicHallHeadFitError(
+            gate, message,
+            pole_counts=ladder_counts,
+            relative_errors=ladder,
+            gram_rank=len(basis),
+            gram_projection_relative_error=projection_error)
+
+    n_poles, omega_host, B_host, D_host, valid_host = selected
+    poles = []
+    coordinate_indices = []
+    pole_indices = []
+    B_families = []
+    D_families = []
+    for coordinate in range(len(basis)):
+        for pole_index in range(n_poles):
+            if not valid_host[coordinate, pole_index]:
+                continue
+            poles.append(complex(omega_host[coordinate, pole_index]))
+            coordinate_indices.append(coordinate)
+            pole_indices.append(pole_index)
+            B_families.append(_scale_factor_family(
+                basis[coordinate], B_host[coordinate, pole_index]))
+            D_families.append(_scale_factor_family(
+                basis[coordinate], D_host[coordinate, pole_index]))
+    B_norm_sq = float(np.sum(np.abs(B_host[valid_host]) ** 2))
+    D_norm_sq = float(np.sum(np.abs(D_host[valid_host]) ** 2))
+    odd_even_ratio = float(np.sqrt(
+        D_norm_sq / max(B_norm_sq, 1.0e-300)))
     if jax.process_index() == 0:
         print_fn(
-            "  [photon head] Faraday ordered factors: "
-            f"CT <W0,Wp>={ct_cross_h.real:.17e}{ct_cross_h.imag:+.17e}j; "
-            f"TC <W0,Wp>={tc_cross_h.real:.17e}{tc_cross_h.imag:+.17e}j; "
-            "combined raw <W0,Wp>="
-            f"{raw_cross_h.real:.17e}{raw_cross_h.imag:+.17e}j; "
-            f"ordered Im<W0,Hp>={herm_cross_h.imag:.3e}; "
-            f"||A0||/||W0||={static_anti_ratio:.3e}; "
-            f"||D_H||/||B_H||={odd_even_ratio:.3e}; "
-            f"even-fit residual={even_fit_error:.3e}")
-    # The synthetic dense-contour oracle closes below 1e-4.  Above that
-    # scale the single even pole has changed not merely the magnitude but
-    # the operator direction of the completed probe.  Two samples cannot
-    # determine a second even pole, so consuming the projected approximation
-    # would hide a model failure behind a successful complex-overlap gate.
-    if even_fit_error > 1.0e-4:
-        raise NotImplementedError(
-            "GATE dynamic_hall_head_unimplemented_second_even_pole:\n"
-            f"  got:  ordered one-pole even-fit residual = "
-            f"{even_fit_error:.17e} (> 1.0e-4) from the z=0 and "
-            "z=i*omega_p samples\n"
-            "  want: an even CT/TC head model that reproduces the "
-            "Hermitian probe to the dense-contour oracle tolerance\n"
-            "  why:  the two available samples fix one even pole; a second "
-            "even pole is not identifiable without at least one additional "
-            "authenticated Hall, charge-head/wing, and W_00 sample\n"
-            "  fix:  extend the immutable Hall transaction and GN head "
-            "sample plan by one nonzero imaginary frequency, then fit and "
-            "gate the minimal two-even-pole model\n"
-            "  doc:  docs/theory/four-current-head-corrections.md, "
-            "Dynamic Hall/Faraday Gamma head.")
-    return (
-        float(omega_h), B_pairs, D_pairs, float(even_fit_error),
-        float(odd_even_ratio), pair_cross_h)
+            "  [photon head] Faraday MPA selected: "
+            f"n_p={n_poles}; gram_rank={len(basis)}; "
+            f"pole_terms={len(poles)}; ||D_H||/||B_H||="
+            f"{odd_even_ratio:.3e}; Gram odd-projection residual="
+            f"{projection_error:.3e}; fit residual="
+            f"{ladder[n_poles - 1]:.3e}")
+    return {
+        "selected_n_poles": int(n_poles),
+        "gram_rank": int(len(basis)),
+        "pole_frequencies_ry": tuple(poles),
+        "pole_coordinate_indices": tuple(coordinate_indices),
+        "pole_indices": tuple(pole_indices),
+        "B_pole_pairs": tuple(B_families),
+        "D_pole_pairs": tuple(D_families),
+        "fit_ladder_pole_counts": tuple(ladder_counts),
+        "fit_ladder_relative_errors": tuple(float(value) for value in ladder),
+        "fit_relative_error": float(ladder[n_poles - 1]),
+        "odd_even_residue_ratio": odd_even_ratio,
+        "gram_projection_relative_error": float(projection_error),
+    }
 
 
 def fit_dynamic_photon_cttc_q0(
-    static_response,
-    probe_response,
+    responses,
     *,
     W_resident_body_gamma: jax.Array,
     W_resident_charge_gamma: jax.Array,
-    W_static_charge_gamma: jax.Array,
-    W_probe_charge_gamma: jax.Array,
+    W_charge_gamma_samples,
     static_off_moments=None,
     g0_X: jax.Array,
     g0_Y: jax.Array,
     cubature_receipt,
     mesh_xy: Mesh,
+    sampling_alpha: int = 1,
+    sampling_schedule: str = "nested",
     print_fn=print,
 ) -> FaradayHeadPPMFactorCarrier:
-    r"""Fit the Hall-on/off CT/TC completion to one ordered analytic pole.
+    r"""Fit Hall-on/off CT/TC completions to a minimal ordered MPA model.
 
     Each frequency executes the incumbent coupled 4x4 mini-BZ solve twice,
     with the authenticated ``sigma_H(z)`` and with literal ``sigma_H=0``.
-    Their
-    difference is collapsed to one rank-four factor pair for CT and one for
-    TC.  A shared scalar pole is fitted in the operators' Frobenius metric,
-    evaluated from 4x4 Gram matrices; no centroid-square probe body exists.
-
-    The model is ``W_H(z)=(2*Omega_H*B_H+2*z*D_H)/
-    (z^2-Omega_H^2)``.  The Hall coefficient is even in ``z``; the completed
-    ordered response can nevertheless have ``D_H`` because its imaginary-axis
-    screening environment is non-Hermitian without time reversal.
+    Their difference is collapsed to one rank-four factor pair for CT and TC.
+    The existing MPA fitter acts elementwise on the retained factor-Gram
+    coordinates.  No centroid-square probe body exists.
     """
     from vcoul import validate_minibz_photon_receipt
 
+    responses = tuple(responses)
+    charge_samples = tuple(W_charge_gamma_samples)
+    if (len(responses) % 2 != 0 or not 2 <= len(responses) <= 32
+            or len(charge_samples) != len(responses)):
+        raise ValueError(
+            "dynamic Faraday completion requires 2..32 even-count matching "
+            "response and W_00 samples")
     receipt = validate_minibz_photon_receipt(cubature_receipt)
     dimension = int(receipt.dimension)
-    if (int(static_response.dimension), int(probe_response.dimension)) != (
-            dimension, dimension):
+    if any(int(response.dimension) != dimension for response in responses):
         raise ValueError(
             "dynamic Faraday response/cubature dimensions differ: "
-            f"static={static_response.dimension}, "
-            f"probe={probe_response.dimension}, receipt={dimension}")
-    static_S, static_YW, static_WZ = _dynamic_photon_head_small_system(
-        static_response, W_resident_body_gamma,
-        W_resident_charge_gamma=W_resident_charge_gamma,
-        W_target_charge_gamma=W_static_charge_gamma,
-        cell_volume=float(receipt.cell_volume), mesh_xy=mesh_xy)
-    probe_S, probe_YW, probe_WZ = _dynamic_photon_head_small_system(
-        probe_response, W_resident_body_gamma,
-        W_resident_charge_gamma=W_resident_charge_gamma,
-        W_target_charge_gamma=W_probe_charge_gamma,
-        cell_volume=float(receipt.cell_volume), mesh_xy=mesh_xy)
+            f"samples={[response.dimension for response in responses]}, "
+            f"receipt={dimension}")
     zero_sigma = np.zeros(3, dtype=np.float64)
-    static_on = _dynamic_photon_head_moments(
-        static_response.sigma_H, static_S, receipt)
-    static_off = (
-        _dynamic_photon_head_moments(zero_sigma, static_S, receipt)
-        if static_off_moments is None else
-        np.asarray(static_off_moments, dtype=np.complex128))
-    if static_off.shape != static_on.shape:
-        raise ValueError(
-            "dynamic Faraday static Hall-off moments must have shape "
-            f"{static_on.shape}; got {static_off.shape}")
-    probe_on = _dynamic_photon_head_moments(
-        probe_response.sigma_H, probe_S, receipt)
-    probe_off = _dynamic_photon_head_moments(
-        zero_sigma, probe_S, receipt)
+    sample_pairs = []
+    for index, (response, W_charge) in enumerate(zip(
+            responses, charge_samples, strict=True)):
+        S_effective, YW_y, WZ_x = _dynamic_photon_head_small_system(
+            response, W_resident_body_gamma,
+            W_resident_charge_gamma=W_resident_charge_gamma,
+            W_target_charge_gamma=W_charge,
+            cell_volume=float(receipt.cell_volume), mesh_xy=mesh_xy)
+        on_moments = _dynamic_photon_head_moments(
+            response.sigma_H, S_effective, receipt)
+        off_moments = (
+            np.asarray(static_off_moments, dtype=np.complex128)
+            if index == 0 and static_off_moments is not None else
+            _dynamic_photon_head_moments(zero_sigma, S_effective, receipt))
+        if off_moments.shape != on_moments.shape:
+            raise ValueError(
+                "dynamic Faraday Hall-off moments differ from Hall-on shape")
+        sample_pairs.append(_faraday_cttc_factor_pairs(
+            on_moments - off_moments,
+            g0_X=g0_X, g0_Y=g0_Y, YW_y=YW_y, WZ_x=WZ_x,
+            layout=response.layout, mesh_xy=mesh_xy,
+            cell_volume=float(receipt.cell_volume)))
 
-    static_delta = static_on - static_off
-    probe_delta = probe_on - probe_off
-    static_pairs = _faraday_cttc_factor_pairs(
-        static_delta, g0_X=g0_X, g0_Y=g0_Y,
-        YW_y=static_YW, WZ_x=static_WZ, layout=static_response.layout,
-        mesh_xy=mesh_xy, cell_volume=float(receipt.cell_volume))
-    probe_pairs = _faraday_cttc_factor_pairs(
-        probe_delta, g0_X=g0_X, g0_Y=g0_Y,
-        YW_y=probe_YW, WZ_x=probe_WZ, layout=probe_response.layout,
-        mesh_xy=mesh_xy, cell_volume=float(receipt.cell_volume))
-
-    probe_frequency = complex(probe_response.frequency_ry)
-    (omega_h, B_pairs, D_pairs, probe_fit_error, odd_even_ratio,
-     pair_overlaps) = _fit_ordered_faraday_factor_samples(
-         static_pairs, probe_pairs, probe_frequency,
-         mesh_xy=mesh_xy, print_fn=print_fn)
+    frequencies = tuple(complex(response.frequency_ry)
+                        for response in responses)
+    fit = _fit_ordered_faraday_factor_samples(
+        sample_pairs, frequencies, mesh_xy=mesh_xy,
+        sampling_alpha=sampling_alpha,
+        sampling_schedule=sampling_schedule, print_fn=print_fn)
     return FaradayHeadPPMFactorCarrier(
-        omega_h_ry=float(omega_h), B_pairs=B_pairs, D_pairs=D_pairs,
-        static_pairs=static_pairs, probe_pairs=probe_pairs,
-        sigma_H_static=np.asarray(
-            jax.device_get(static_response.sigma_H), dtype=np.float64),
-        sigma_H_probe=np.asarray(
-            jax.device_get(probe_response.sigma_H), dtype=np.float64),
-        probe_frequency_ry=probe_frequency,
-        probe_fit_relative_error=float(probe_fit_error),
-        odd_even_residue_ratio=float(odd_even_ratio),
-        raw_pair_overlaps=tuple(pair_overlaps),
+        **fit,
+        sample_pairs=tuple(sample_pairs),
+        sample_frequencies_ry=frequencies,
+        sigma_H_frequency=np.asarray(tuple(
+            np.asarray(jax.device_get(response.sigma_H), dtype=np.float64)
+            for response in responses), dtype=np.float64),
     )
 
 

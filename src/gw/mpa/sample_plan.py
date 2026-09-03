@@ -385,9 +385,9 @@ def faraday_imaginary_plan(
     imaginary-axis samples only.  Reuse the MPA partition owner rather than
     introducing a second abscissa rule: an ``n_p``-pole Hall fit receives
     ``2*n_p`` points from :func:`sampling.partition_omegas`, placed at
-    ``z=i*omega``.  Consequently the one-, two-, and three-pole supports are
-    nested sets.  For the standard 2 Ry endpoint their union is
-    ``{0, .25i, .5i, 1i, 1.5i, 2i}`` Ry.
+    ``z=i*omega``.  Consequently every smaller pole support is a bit-exact
+    subset.  Production publishes the 32-point ``n_p=16`` oracle plan and
+    scores the 1..12 pole ladder against all 32 points.
 
     This is sampling geometry only.  It does not change the double-parallel
     body MPA plan or any screening/Sigma quadrature.

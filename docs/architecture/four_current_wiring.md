@@ -21,9 +21,9 @@ implementation.
 
 The absent-CC layout lets dynamic MPA keep its disk-backed charge fit and its
 ordered residues unchanged. On a measured-broken-TR GN run, the authenticated
-Hall samples additionally produce the dynamic Faraday CT/TC Γ contribution.
-HL refuses that magnetic case because its scalar probe is real-axis while the
-Hall artifact is authenticated at an imaginary probe.
+32-point imaginary-axis Hall plan additionally produces the dynamic Faraday
+CT/TC Γ contribution. HL refuses that magnetic case because its scalar probe
+is real-axis while the Hall artifact is authenticated on the imaginary axis.
 
 The route predicates in `gw.gw_config` have distinct questions:
 
@@ -111,15 +111,21 @@ For broken TR, `file_io.static_gauge_head` owns Hall-artifact authentication.
 Static screened COHSEX consumes the zero-frequency mixed completion. Dynamic
 GN uses `fit_dynamic_photon_cttc_q0` and
 `photon_sigma.compute_ppm_faraday_head_sigma_omega` to stream the six CT/TC
-blocks without allocating a second packed W body. The completed probe is split
-into its Hermitian and anti-Hermitian operator halves through factor-Gram
-contractions: the first fixes the static-anchored even pole and the second is
-the ordered residue selected as `B_H+D_H` / `B_H-D_H` by the shared
-`ppm_sigma._residue_for_space` owner. A schema-v2 artifact has only the static
-and `i*omega_p` samples; if its one-even-pole reconstruction exceeds the
-dense-contour tolerance it refuses as
-`dynamic_hall_head_unimplemented_second_even_pole`. `SymMaps.trs_allowed=true`
-takes an exact-zero fast path. `head_correction=off` skips with a DEBUG record.
+blocks without allocating a second packed W body. Schema v3 authenticates
+`sigma_H(z)`, `S(z)`, and the wings on the 32-point nested
+`faraday_imaginary_plan(16, omega_p)`; the existing scalar GN fit supplies
+`W_00(z)` on exactly that plan. The completed samples are split into Hermitian
+and anti-Hermitian operator halves through factor-Gram contractions. Their
+bounded coordinates go through the existing ordered MPA fitter for every rung
+`n_p=1…12`; all rungs are scored against all 32 samples, and the first causal
+fit below `1e-4` is selected. Its residues are selected as `B_H+D_H` /
+`B_H-D_H` by the shared `ppm_sigma._residue_for_space` owner. The fit and
+sample provenance are written to `faraday_head_fit.json` before Sigma. A
+schema-v2 artifact remains readable for static work but refuses broken-TR
+dynamic use as `dynamic_hall_head_unimplemented_second_even_pole`; a failed
+schema-v3 ladder refuses as `dynamic_hall_head_nonpole_plateau` or
+`dynamic_hall_head_multipole_inadequate`. `SymMaps.trs_allowed=true` takes an
+exact-zero fast path. `head_correction=off` skips with a DEBUG record.
 
 ### Self-energy
 
@@ -180,6 +186,12 @@ Runtime facts add these important boundaries:
   supported only on a true 1x1 mesh.
 - `dynamic_hall_head_hl_imaginary_probe`: broken-TR HL cannot pair its
   real-axis charge probe with an imaginary-axis Hall sample.
+- `dynamic_hall_head_unimplemented_second_even_pole`: a readable schema-v2
+  Hall artifact lacks the authenticated dense samples required by production.
+- `dynamic_hall_head_nonpole_plateau`: all causal 1…12-pole rungs miss the
+  dense-sample tolerance and the high-order residual has plateaued.
+- `dynamic_hall_head_multipole_inadequate`: the 1…12-pole ladder remains
+  above tolerance without satisfying the plateau certificate.
 - `packed_dynamic_sc_requires_current_operator`: a served bare dynamic SC
   map must receive both the immutable packed response and transverse bundle.
 - `bispinor_packed_restart_binding_*`, `bispinor_packed_restart_gamma_*`, and
@@ -199,8 +211,8 @@ matrix: parsing tombstones it before a `LorraxConfig` exists.
   `P(None,'x','y')` on a square mesh.
 - Per-block views are dynamic slices, not host gathers.
 - Only the band-space Sigma result is replicated at the output seam.
-- Dynamic Faraday retains low-rank CT/TC factor pairs, never a second packed
-  frequency-dependent body.
+- Dynamic Faraday retains low-rank CT/TC factor pairs for 32 samples and its
+  selected MPA poles, never a second packed frequency-dependent body.
 - The transverse wavefunction bundle is measured with
   `wavefunction_bundle.bundle_bytes_per_rank`; it is not hidden in a scalar
   memory estimate.

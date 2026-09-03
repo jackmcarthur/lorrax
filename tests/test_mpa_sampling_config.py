@@ -53,6 +53,19 @@ def test_metal_sampling_flags_build_the_configured_grid(tmp_path):
     )
 
 
+def test_faraday_dense_plan_contains_every_one_to_twelve_pole_support():
+    dense = sample_plan.faraday_imaginary_plan(16, 2.0)
+    z_dense = sample_plan.plan_z(dense)
+    assert z_dense.shape == (32,)
+    assert z_dense[0] == 0.0j
+    assert z_dense[-1] == 2.0j
+    for n_poles in range(1, 13):
+        support = sample_plan.plan_z(
+            sample_plan.faraday_imaginary_plan(n_poles, 2.0))
+        assert all(np.count_nonzero(z_dense == value) == 1
+                   for value in support)
+
+
 def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
     config = _config(
         tmp_path,

@@ -478,8 +478,9 @@ def test_hermitian_faraday_ct_family_has_zero_ordered_residue():
     np.testing.assert_array_equal(B_h, B)
 
 
+@pytest.mark.parametrize("n_poles", (1, 2))
 def test_faraday_sigma_consumer_is_hall_on_off_and_magnetisation_odd(
-        monkeypatch):
+        monkeypatch, n_poles):
     """The rank-four analytic head reaches Sigma; its zero twin does not."""
     from gw.head_correction import FaradayHeadPPMFactorCarrier
     from gw.photon_layout import (
@@ -542,27 +543,36 @@ def test_faraday_sigma_consumer_is_hall_on_off_and_magnetisation_odd(
     omega_h = 1.3
     static_pairs = tuple(
         (-2.0 * left / omega_h, right) for left, right in B_pairs)
-    probe_ratio = omega_h ** 2 / (OMEGA_P ** 2 + omega_h ** 2)
-    probe_pairs = tuple(
-        (probe_ratio * left, right) for left, right in static_pairs)
 
     def carrier(sign):
+        frequencies = tuple(1j * value for value in np.linspace(
+            0.0, OMEGA_P, 2 * n_poles))
         return FaradayHeadPPMFactorCarrier(
-            omega_h_ry=omega_h,
-            B_pairs=tuple((sign * left, right)
-                          for left, right in B_pairs),
-            D_pairs=tuple((sign * left, right)
-                          for left, right in D_pairs),
-            static_pairs=tuple((sign * left, right)
-                               for left, right in static_pairs),
-            probe_pairs=tuple((sign * left, right)
-                              for left, right in probe_pairs),
-            sigma_H_static=sign * np.array([0.0, 0.0, 1.0e-4]),
-            sigma_H_probe=sign * np.array([0.0, 0.0, 3.0e-5]),
-            probe_frequency_ry=1j * OMEGA_P,
-            probe_fit_relative_error=0.0,
+            selected_n_poles=n_poles,
+            gram_rank=1,
+            pole_frequencies_ry=tuple(
+                omega_h + 0.2 * index - 0.01j
+                for index in range(n_poles)),
+            pole_coordinate_indices=(0,) * n_poles,
+            pole_indices=tuple(range(n_poles)),
+            B_pole_pairs=tuple(tuple(
+                (sign * left / n_poles, right)
+                for left, right in B_pairs) for _ in range(n_poles)),
+            D_pole_pairs=tuple(tuple(
+                (sign * left / n_poles, right)
+                for left, right in D_pairs) for _ in range(n_poles)),
+            sample_pairs=tuple(tuple(
+                (sign * left, right) for left, right in static_pairs)
+                for _ in frequencies),
+            sample_frequencies_ry=frequencies,
+            sigma_H_frequency=np.tile(
+                sign * np.array([0.0, 0.0, 1.0e-4]),
+                (len(frequencies), 1)),
+            fit_ladder_pole_counts=tuple(range(1, n_poles + 1)),
+            fit_ladder_relative_errors=(0.0,) * n_poles,
+            fit_relative_error=0.0,
             odd_even_residue_ratio=0.2,
-            raw_pair_overlaps=(0.0j, 0.0j))
+            gram_projection_relative_error=0.0)
 
     kwargs = dict(
         wfns_charge=charge, wfns_transverse=transverse,

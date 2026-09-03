@@ -372,6 +372,7 @@ def test_screened_local_solver_refuses_on_a_multi_process_mesh(
 def test_dynamic_hall_gate_admits_trs_zero_and_prepares_authenticated_magnet(
         tmp_path):
     """The dynamic route is never silent about the Faraday Gamma head."""
+    from gw.mpa.sample_plan import faraday_imaginary_plan, plan_z
     from gw.w_isdf import _gate_dynamic_hall_head
 
     cfg = _config(
@@ -381,6 +382,13 @@ def test_dynamic_hall_gate_admits_trs_zero_and_prepares_authenticated_magnet(
     class _Hall:
         sigma_H = np.asarray((4.0e-8, -5.0e-8, 6.0e-8),
                              dtype=np.float64)
+        artifact_schema_version = 3
+        sample_plan_n_poles = 16
+        sample_plan_alpha = 1
+        sample_plan_schedule = "nested"
+        sample_plan_omega_max_ry = 2.0
+        sample_plan_label = faraday_imaginary_plan(16, 2.0)["label"]
+        frequencies_ry = plan_z(faraday_imaginary_plan(16, 2.0))
 
         def sigma_H_at(self, frequency):
             assert frequency == 2.0j
@@ -403,7 +411,7 @@ def test_dynamic_hall_gate_admits_trs_zero_and_prepares_authenticated_magnet(
         hall_transaction=_Hall(),
         print_fn=lambda text, **kwargs: records.append(text))
     assert record == (
-        "PREPARED (authenticated z=0 and z=i*omega_p Hall samples; "
+        "PREPARED (authenticated 32-point Faraday MPA Hall plan; "
         "max|sigma_H(i*omega_p)| = 3.00000000000000008e-06 bohr^-1; "
         "static sigma_H = [4e-08, -5e-08, 6e-08] bohr^-1)")
     # PREPARED is internal state, not a second run-record line. The driver
@@ -416,6 +424,64 @@ def test_dynamic_hall_gate_admits_trs_zero_and_prepares_authenticated_magnet(
         print_fn=lambda text, **kwargs: records.append(text))
     assert "unmeasured (static_gauge_hall_file unnamed)" in record
     assert records == ["WARNING Faraday head : " + record]
+
+    class _HallV2(_Hall):
+        artifact_schema_version = 2
+        sample_plan_n_poles = None
+        sample_plan_alpha = None
+        sample_plan_schedule = None
+        sample_plan_omega_max_ry = None
+        sample_plan_label = None
+
+    with pytest.raises(
+            NotImplementedError,
+            match="dynamic_hall_head_unimplemented_second_even_pole"):
+        _gate_dynamic_hall_head(
+            cfg, trs_allowed=False, coupled_head=True,
+            hall_transaction=_HallV2(), print_fn=lambda *_args, **_kwargs: None)
+
+
+def test_inadequate_faraday_ladder_publishes_machine_readable_record(
+        tmp_path, monkeypatch):
+    """A pre-Sigma refusal still leaves the authenticated fit evidence."""
+    import json
+    from types import SimpleNamespace
+
+    from gw.head_correction import DynamicHallHeadFitError
+    from gw.w_isdf import _publish_faraday_fit_record
+
+    monkeypatch.setattr("common.collectives.barrier", lambda *_args, **_kwargs: None)
+    failure = DynamicHallHeadFitError(
+        "dynamic_hall_head_nonpole_plateau",
+        "GATE dynamic_hall_head_nonpole_plateau: measured plateau",
+        pole_counts=range(1, 13),
+        relative_errors=np.linspace(0.6, 0.02, 12),
+        gram_rank=3,
+        gram_projection_relative_error=2.0e-12)
+    hall = SimpleNamespace(
+        artifact_schema_version=3,
+        sample_plan_label="faraday-imaginary-mpa-n_p=16-alpha=1-schedule=nested",
+        sample_plan_n_poles=16,
+        sample_plan_alpha=1,
+        sample_plan_schedule="nested",
+        sample_plan_omega_max_ry=2.0,
+        hamiltonian_config_operator_fingerprint="sha256:" + "a" * 64,
+        wfn_fingerprint="b" * 64,
+        band_start=0,
+        band_stop=250,
+        nk_tot=36)
+
+    path = _publish_faraday_fit_record(
+        tmp_path, hall, (), failure=failure)
+    record = json.loads(pathlib.Path(path).read_text())
+
+    assert record["gate"] == "dynamic_hall_head_nonpole_plateau"
+    assert record["selected_n_poles"] is None
+    assert [row["n_poles"] for row in record["fit_ladder"]] == list(
+        range(1, 13))
+    assert record["factor_gram_rank"] == 3
+    assert record["pole_terms"] == []
+    assert record["record_sha256"].startswith("sha256:")
 
 
 # ---------------------------------------------------------------------------
