@@ -1724,6 +1724,12 @@ _DEFAULTS = {
     # between W refits for either accelerator.  The unmixed outer residual is
     # the convergence test, so alpha cannot manufacture convergence.
     "sc_mixing": 1.0,
+    # Pole positions are a discrete nonlinear fit and are not a continuous
+    # outer-map variable.  Production QSGW therefore keeps the first accepted
+    # positions and refits only residues until their sample reconstruction
+    # ceases to meet the bootstrap fit's own residual ceiling.  ``full`` is
+    # the measured discontinuous control.
+    "sc_outer_refit_policy": "fixed_poles",  # fixed_poles | full
     "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
     # Symmetric correction averaging is legal only for accidental/exact
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
@@ -2388,6 +2394,7 @@ _NORMALIZE_STR = {
     "bispinor_gw",
     "qp_solver",
     "sc_accelerator",
+    "sc_outer_refit_policy",
     "sc_eigh",
     "sc_head_update",
     "wcoul0_source", "head_correction", "screening_method",
@@ -4544,6 +4551,10 @@ class SCConfig:
     - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
     - ``mixing``: linear-mixing α for a linear inner solve and the outer-H
       update between W refits.  Outer convergence is tested before mixing.
+    - ``outer_refit_policy``: ``"fixed_poles"`` holds the first accepted
+      pole positions and linearly refits their residues, escaping to a full
+      fit only when the new samples exceed the bootstrap reconstruction
+      residual; ``"full"`` reoptimizes positions at every outer step.
     - ``dump_dir``: per-iteration E/U-history .npy dump dir (None = off).
     - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
       accidental-degeneracy average.  The default is 0.1 meV; physical SOC
@@ -4572,6 +4583,7 @@ class SCConfig:
     history_depth: int
     mixing: float
     dump_dir: str | None
+    outer_refit_policy: str = "fixed_poles"
     exact_degeneracy_tol_ev: float = 1.0e-4
     tail_fit: str = "frontier"
     buffer_nbands: int = 0
@@ -4600,6 +4612,10 @@ class SCConfig:
             raise ValueError("sc_history_depth must be >= 1.")
         if not (0.0 < self.mixing <= 1.0):
             raise ValueError("sc_mixing must be in (0, 1].")
+        if self.outer_refit_policy not in ("fixed_poles", "full"):
+            raise ValueError(
+                "sc_outer_refit_policy must be 'fixed_poles' or 'full'; "
+                f"got {self.outer_refit_policy!r}.")
         if not (0.0 < self.exact_degeneracy_tol_ev <= 1.0e-4):
             raise ValueError(
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
@@ -5521,6 +5537,8 @@ class LorraxConfig:
             dump_dir=_sc_env(
                 "LORRAX_SC_DUMP_DIR", str, str(_g("sc_dump_dir") or ""),
                 "sc_dump_dir") or None,
+            outer_refit_policy=str(
+                _g("sc_outer_refit_policy")).strip().lower(),
             exact_degeneracy_tol_ev=float(
                 _g("sc_exact_degeneracy_tol_ev")),
             tail_fit=str(_g("sc_tail_fit")).strip().lower(),

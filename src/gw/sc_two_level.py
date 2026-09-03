@@ -143,7 +143,8 @@ def run_two_level_self_consistency(
     inputs.print_fn(
         "[ SC two-level | outer chi0/W/pole refit; inner frozen screening "
         f"| max_outer={max_iter}, max_inner={max_iter}, "
-        f"tol={tol_ev:.3e} eV | outer alpha={mixing:.3f} ]")
+        f"tol={tol_ev:.3e} eV | outer alpha={mixing:.3f}, pole_refit="
+        f"{inputs.config.sc.outer_refit_policy} ]")
 
     for outer_index in range(int(max_iter)):
         outer_number = outer_index + 1
@@ -154,8 +155,21 @@ def run_two_level_self_consistency(
         # One ordinary map is both the outer screening refit and the first
         # evaluation F_W(H) of the new inner problem.  Reusing its result
         # avoids paying a duplicate Sigma build merely to obtain W.
+        # One quadrature transaction per outer model.  The frozen pole census
+        # cannot drift inside this solve, so it needs only a small state-edge
+        # allowance and no pole padding.  The next outer refit gets a fresh
+        # session and is therefore free to replan for its new pole set.
+        outer_rule_session = {
+            "state_edge_padding_ev": 0.25,
+            "pole_extent_padding_fraction": 0.0,
+        }
+        live_inputs = replace(
+            inputs,
+            frozen_screening=None,
+            fixed_quadrature_session=outer_rule_session,
+        )
         first_map, _ = sc_iteration.run_self_consistency(
-            outer_input, replace(inputs, frozen_screening=None),
+            outer_input, live_inputs,
             max_iter=1, tol_ev=tol_ev,
             accelerator=accelerator, history_depth=history_depth,
             mixing=mixing,
@@ -200,7 +214,11 @@ def run_two_level_self_consistency(
             )
             inner_calls = 1
         else:
-            frozen_inputs = replace(inputs, frozen_screening=screening)
+            frozen_inputs = replace(
+                inputs,
+                frozen_screening=screening,
+                fixed_quadrature_session=outer_rule_session,
+            )
             inner_seed = _carry_only(first_map, sc_iteration)
             inner_final, inner_history = sc_iteration.run_self_consistency(
                 inner_seed, frozen_inputs,

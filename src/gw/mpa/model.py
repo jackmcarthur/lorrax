@@ -144,7 +144,7 @@ def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
 
 def _fit_head_samples(
     fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model, solve,
-    occupation_state=None,
+    occupation_state=None, fixed_pole_source=None, oracle_ceiling=None,
 ):
     """Publish scalar Wc_head on the body's exact complex-frequency grid.
 
@@ -157,6 +157,7 @@ def _fit_head_samples(
         complex(sample.wcoul0) - complex(sample.vc0)
         for sample in head_samples
     ], dtype=np.complex128)
+    used_fixed_poles = False
     if model == "head_off_zero":
         if np.any(wc != 0.0):
             raise ValueError(
@@ -171,6 +172,42 @@ def _fit_head_samples(
             "max_abs_residual": 0.0,
         }
         provenance = {"solve_mode": "exact_zero", "n_valid": int(n_p)}
+    elif fixed_pole_source is not None:
+        anchor = mpa_store.read_head_fit_collective(
+            fixed_pole_source, mesh_xy=mesh_xy)
+        anchor_z = np.asarray(anchor["sample_z"], dtype=np.complex128)
+        if anchor_z.shape != np.asarray(z).shape or not np.array_equal(
+                anchor_z, np.asarray(z, dtype=np.complex128)):
+            raise ValueError(
+                "fixed-pole MPA head anchor uses a different sample grid")
+        refitted = fit_driver.refit_scalar_samples_at_fixed_poles(
+            wc, z, anchor["Omega_p"])
+        ceiling = float(oracle_ceiling)
+        fixed_attempt_residual = float(refitted["rel_rms_residual"])
+        adequate = bool(fixed_attempt_residual <= ceiling)
+        if adequate:
+            used_fixed_poles = True
+            fitted = {
+                **refitted,
+                "condition": float(
+                    anchor["diagnostics"]["fit_condition"]),
+                "backward_error": float(
+                    anchor["diagnostics"]["fit_backward_error"]),
+            }
+            provenance = dict(anchor["provenance"])
+            provenance["solve_mode"] = "fixed_pole_residues"
+        else:
+            fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
+            provenance = {
+                "solve_mode": fitted["solve"],
+                "solve_affine": fitted["affine"],
+                "solve_rcond": fitted["rcond"],
+                "eig_mode": fitted["eig"],
+                "n_valid": fitted["n_valid"],
+                "condition_max_allowed": 1.0 / fitted["rcond"],
+                "backward_error_max_allowed": float(
+                    np.sqrt(np.finfo(np.float64).eps)),
+            }
     else:
         fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
         provenance = {
@@ -191,6 +228,18 @@ def _fit_head_samples(
         fit_max_abs_residual=fitted["max_abs_residual"],
         grid_hash=grid_hash, fit_provenance=provenance, model=model,
         occupation_state=occupation_state)
+    residual = float(fitted.get("rel_rms_residual", 0.0))
+    return {
+        "residual": residual,
+        "fixed_attempt_residual": (
+            fixed_attempt_residual
+            if fixed_pole_source is not None and model != "head_off_zero"
+            else None),
+        "fixed_ceiling": (
+            float(oracle_ceiling) if fixed_pole_source is not None else None),
+        "adequate": bool(fixed_pole_source is None or used_fixed_poles),
+        "used_fixed_poles": used_fixed_poles,
+    }
 
 
 def _solve_wc(
@@ -398,12 +447,13 @@ def _solve_wc(
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
               provenance=None, occupation_state=None, solve="loewner",
-              w_negative_name=None):
+              w_negative_name=None, fixed_pole_source=None):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
         w_negative_name=w_negative_name,
         tile_bytes=tile_bytes, provenance=provenance,
-        occupation_state=occupation_state, solve=solve)
+        occupation_state=occupation_state, solve=solve,
+        fixed_pole_source=fixed_pole_source)
 
 
 def _metal_kminq_rows(sym, q_idx):
@@ -650,6 +700,7 @@ def build_mpa_fit(
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
     occupation_state=None, material_class, head_channel=None, wc_source=None,
+    outer_refit_session=None,
     print_fn=print,
 ):
     """Write body/head samples and fits; return path plus iteration head.
@@ -830,11 +881,56 @@ def build_mpa_fit(
         iteration_head = wc_source(
             sample_path, V, z_all, q_idx, meta, mesh_xy,
             config.backend.w_dyson_solver)
+    refit_policy = (
+        "full" if outer_refit_session is None else
+        str(outer_refit_session.get("policy", "full")))
+    fixed_source = (
+        outer_refit_session.get("mpa_fit")
+        if refit_policy == "fixed_poles" and outer_refit_session is not None
+        else None)
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
         provenance=provenance, occupation_state=occupation_state,
         solve=config.mpa.pole_solver,
-        w_negative_name=_WC_NEGATIVE if ordered else None)
+        w_negative_name=_WC_NEGATIVE if ordered else None,
+        fixed_pole_source=fixed_source)
+    body_residual = float(report["sample_residual_rel_max"])
+    body_action = "full" if fixed_source is None else "fixed_poles"
+    if fixed_source is not None:
+        body_ceiling = float(outer_refit_session["mpa_body_oracle_ceiling"])
+        fixed_attempt_residual = body_residual
+        if body_residual > body_ceiling:
+            body_action = "reoptimized_full"
+            print_fn(
+                "  MPA outer body refit: policy=fixed_poles, sample "
+                f"reconstruction residual={fixed_attempt_residual:.8e}, "
+                f"oracle ceiling={body_ceiling:.8e}, verdict=REOPTIMIZE")
+            _, report = _fit_body(
+                sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
+                provenance=provenance, occupation_state=occupation_state,
+                solve=config.mpa.pole_solver,
+                w_negative_name=_WC_NEGATIVE if ordered else None)
+            body_residual = float(report["sample_residual_rel_max"])
+        else:
+            print_fn(
+                "  MPA outer body refit: policy=fixed_poles, sample "
+                f"reconstruction residual={fixed_attempt_residual:.8e}, "
+                f"oracle ceiling={body_ceiling:.8e}, verdict=ADEQUATE")
+    if outer_refit_session is not None and (
+            fixed_source is None or body_action == "reoptimized_full"):
+        body_ceiling = max(
+            body_residual * (1.0 + 64.0 * np.finfo(np.float64).eps),
+            64.0 * np.finfo(np.float64).eps,
+        )
+        if refit_policy == "fixed_poles":
+            outer_refit_session["mpa_body_oracle_ceiling"] = body_ceiling
+        seen = bool(outer_refit_session.get("mpa_seen", False))
+        print_fn(
+            f"  MPA outer body refit: policy={refit_policy}, "
+            f"action={'full' if seen else 'bootstrap_full'}, "
+            f"sample reconstruction residual={body_residual:.8e}, "
+            f"oracle ceiling={body_ceiling:.8e}")
+        outer_refit_session["mpa_seen"] = True
     # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
     # writer opens the same file through serial h5py.  A context-manager
     # return is rank-local: without this process barrier rank 0 can enter
@@ -872,7 +968,9 @@ def build_mpa_fit(
                 else f"qsgw_direct_{config.mpa.pole_solver}"
             )
     fit_ledger = mpa_store.fit_completion_ledger(fit_path)
-    _fit_head_samples(
+    head_fixed_source = (
+        fixed_source if refit_policy == "fixed_poles" else None)
+    head_report = _fit_head_samples(
         fit_path,
         head_fit_samples,
         z_all,
@@ -882,7 +980,31 @@ def build_mpa_fit(
         model=head_model,
         solve=config.mpa.pole_solver,
         occupation_state=occupation_state,
+        fixed_pole_source=head_fixed_source,
+        oracle_ceiling=(
+            outer_refit_session.get("mpa_head_oracle_ceiling")
+            if head_fixed_source is not None else None),
     )
+    head_residual = float(head_report["residual"])
+    if outer_refit_session is not None:
+        if refit_policy == "fixed_poles" and not head_report["used_fixed_poles"]:
+            outer_refit_session["mpa_head_oracle_ceiling"] = max(
+                head_residual * (1.0 + 64.0 * np.finfo(np.float64).eps),
+                64.0 * np.finfo(np.float64).eps,
+            )
+        if refit_policy == "fixed_poles":
+            outer_refit_session["mpa_fit"] = fit_path
+        attempted = head_report["fixed_attempt_residual"]
+        if attempted is not None:
+            print_fn(
+                "  MPA outer head refit: policy=fixed_poles, sample "
+                f"reconstruction residual={attempted:.8e}, oracle ceiling="
+                f"{float(head_report['fixed_ceiling']):.8e}, "
+                f"verdict={'ADEQUATE' if head_report['used_fixed_poles'] else 'REOPTIMIZE'}")
+        print_fn(
+            f"  MPA outer head refit: policy={refit_policy}, sample "
+            f"reconstruction residual={head_residual:.8e}, action="
+            f"{'fixed_poles' if head_report['used_fixed_poles'] else 'full'}")
     print_fn(fit_driver.format_cost_report(report))
     return fit_path, iteration_head
 

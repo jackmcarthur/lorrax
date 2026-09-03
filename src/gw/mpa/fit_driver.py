@@ -51,6 +51,7 @@ from gw.mpa import pade_fit, tiling
 
 __all__ = [
     "fit_scalar_samples",
+    "refit_scalar_samples_at_fixed_poles",
     "fit_one_block",
     "format_cost_report",
     "run_fit_driver",
@@ -127,10 +128,40 @@ def fit_scalar_samples(
             np.asarray(diagnostics["backward_error_denominator"])),
         "max_abs_residual": float(
             np.asarray(diagnostics["max_abs_residual"])),
+        "rel_rms_residual": float(
+            np.asarray(diagnostics["rel_rms_residual"])),
         "n_valid": int(np.asarray(diagnostics["n_valid"])),
         "solve": solve,
         "affine": solve == "loewner",
         "eig": _fit_eig(solve),
+        "rcond": float(rcond),
+    }
+
+
+def refit_scalar_samples_at_fixed_poles(
+    Wc, z_samples, Omega_p, *, rcond=1.0e-13,
+):
+    """Refit a scalar-head residue with the body fit's linear owner."""
+    import jax
+    import jax.numpy as jnp
+
+    wc = np.asarray(Wc, dtype=np.complex128)
+    z = np.asarray(z_samples, dtype=np.complex128)
+    omega = np.asarray(Omega_p, dtype=np.complex128)
+    if wc.ndim != 1 or wc.shape != z.shape or omega.ndim != 1:
+        raise ValueError(
+            "scalar fixed-pole MPA refit requires matching 1-D Wc/z and "
+            "a 1-D Omega array")
+    B, diagnostics = jax.jit(
+        lambda w, zz, om: pade_fit.refit_mpa_residues_at_fixed_poles(
+            w, zz, om, jnp.ones(om.shape, dtype=bool), rcond=float(rcond))
+    )(jnp.asarray(wc), jnp.asarray(z), jnp.asarray(omega))
+    B, diagnostics = jax.device_get((B, diagnostics))
+    return {
+        "Omega_p": omega,
+        "B_p": np.asarray(B, dtype=np.complex128),
+        "max_abs_residual": float(diagnostics["max_abs_residual"]),
+        "rel_rms_residual": float(diagnostics["rel_rms_residual"]),
         "rcond": float(rcond),
     }
 
@@ -209,10 +240,16 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve, ordered=False):
         summary = lax.pmax(jnp.stack((
             jnp.max(condition),
             jnp.max(backward),
+            jnp.max(jnp.where(
+                valid, diag["rel_rms_residual"].reshape(n_rows, n_cols),
+                0.0)),
+            jnp.max(jnp.where(
+                valid, diag["max_abs_residual"].reshape(n_rows, n_cols),
+                0.0)),
             (~finite).astype(jnp.float64),
         )), row_axes)
-        maxima = summary[:2]
-        finite = (summary[2] == 0.0).astype(jnp.int32)
+        maxima = summary[:4]
+        finite = (summary[4] == 0.0).astype(jnp.int32)
         return Omega, Bp, Dp, condition, maxima, finite
 
     out_specs = (pole_spec, pole_spec, pole_spec, diag_spec, P(None), P())
@@ -230,6 +267,100 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve, ordered=False):
         mapped = shard_map(
             _incumbent, mesh=mesh_xy,
             in_specs=(block_spec, P(None), P(row_axes), P(), P()),
+            out_specs=out_specs, check_vma=True)
+    return jax.jit(mapped)
+
+
+@functools.lru_cache(maxsize=None)
+def _sharded_residue_refit_kernel(mesh_xy, n_p, rcond, ordered=False):
+    """Continuous residue-only twin of :func:`_sharded_fit_kernel`."""
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+
+    from common.shard_map import shard_map
+
+    row_axes = ("x", "y")
+    block_spec = P(None, None, row_axes, None)
+    pole_spec = P(None, None, row_axes, None)
+    diag_spec = P(None, row_axes, None)
+    n = int(n_p)
+
+    def _local(block, negative_block, Omega_old, B_old, D_old,
+               condition_old, z, row_ids, n_mu_logical, n_cols_logical):
+        samples = jnp.transpose(block[:, 0], (1, 2, 0))
+        n_rows, n_cols, n_omega = samples.shape
+        tile = samples.reshape(n_rows * n_cols, n_omega)
+        omega = jnp.transpose(
+            Omega_old[:, 0], (1, 2, 0)).reshape(n_rows * n_cols, n)
+        old_b = jnp.transpose(
+            B_old[:, 0], (1, 2, 0)).reshape(n_rows * n_cols, n)
+        old_d = jnp.transpose(
+            D_old[:, 0], (1, 2, 0)).reshape(n_rows * n_cols, n)
+        valid_poles = jnp.abs(old_b) > 0.0
+        if ordered:
+            valid_poles = valid_poles | (jnp.abs(old_d) > 0.0)
+            negative = jnp.transpose(
+                negative_block[:, 0], (1, 2, 0)).reshape(
+                    n_rows * n_cols, n_omega)
+            Bp, Dp, diag = pade_fit.refit_mpa_residues_batched(
+                tile, z, omega, valid_poles,
+                W_negative_tile=negative, return_odd=True, rcond=rcond)
+        else:
+            Bp, diag = pade_fit.refit_mpa_residues_batched(
+                tile, z, omega, valid_poles, rcond=rcond)
+            Dp = jnp.zeros_like(Bp)
+        Bp = jnp.transpose(
+            Bp.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
+        Dp = jnp.transpose(
+            Dp.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
+        valid = ((row_ids[:, None] < n_mu_logical)
+                 & (jnp.arange(n_cols)[None, :] < n_cols_logical))
+        Bp = jnp.where(valid[None, None], Bp, 0.0 + 0.0j)
+        Dp = jnp.where(valid[None, None], Dp, 0.0 + 0.0j)
+        condition = jnp.where(
+            valid[None], condition_old, 0.0)
+        rel = jnp.where(
+            valid, diag["rel_rms_residual"].reshape(n_rows, n_cols), 0.0)
+        absolute = jnp.where(
+            valid, diag["max_abs_residual"].reshape(n_rows, n_cols), 0.0)
+        finite = (
+            jnp.all(jnp.isfinite(Omega_old))
+            & jnp.all(jnp.isfinite(Bp))
+            & jnp.all(jnp.isfinite(Dp))
+            & jnp.all(jnp.isfinite(condition))
+            & jnp.all(jnp.isfinite(rel))
+            & jnp.all(jnp.isfinite(absolute)))
+        summary = lax.pmax(jnp.stack((
+            jnp.max(rel), jnp.max(absolute),
+            (~finite).astype(jnp.float64),
+        )), row_axes)
+        return (
+            Omega_old, Bp, Dp, condition, summary[:2],
+            (summary[2] == 0.0).astype(jnp.int32),
+        )
+
+    out_specs = (pole_spec, pole_spec, pole_spec, diag_spec, P(None), P())
+    if ordered:
+        mapped = shard_map(
+            _local, mesh=mesh_xy,
+            in_specs=(
+                block_spec, block_spec, pole_spec, pole_spec, pole_spec,
+                diag_spec, P(None), P(row_axes), P(), P()),
+            out_specs=out_specs, check_vma=True)
+    else:
+        def _incumbent(block, Omega_old, B_old, D_old, condition_old,
+                       z, row_ids, n_mu_logical, n_cols_logical):
+            return _local(
+                block, block, Omega_old, B_old, D_old, condition_old,
+                z, row_ids, n_mu_logical, n_cols_logical)
+
+        mapped = shard_map(
+            _incumbent, mesh=mesh_xy,
+            in_specs=(
+                block_spec, pole_spec, pole_spec, pole_spec, diag_spec,
+                P(None), P(row_axes), P(), P()),
             out_specs=out_specs, check_vma=True)
     return jax.jit(mapped)
 
@@ -252,6 +383,8 @@ def fit_one_block(
     solve="loewner",
     header=None,
     fit_writer=None,
+    fixed_pole_source=None,
+    fixed_pole_ledger=None,
 ):
     """Read one ``(q, column block)``, fit it, stage it.  Returns stats.
 
@@ -297,6 +430,7 @@ def fit_one_block(
 
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
+    import jax.numpy as jnp
 
     from common.collectives import device_put_process_local
 
@@ -317,6 +451,11 @@ def fit_one_block(
             w_src, w_negative_name, q, cols, mesh_xy=mesh_xy,
             n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes,
             header=negative_header)
+    anchor = None
+    if fixed_pole_source is not None:
+        anchor = mpa_store.read_fit_columns_collective(
+            fixed_pole_source, q, cols, mesh_xy=mesh_xy,
+            n_cols_buffer=n_cols_buffer, ledger=fixed_pole_ledger)
     t_read = time.perf_counter() - t_read
 
     n_omega, _, n_mu_padded, _ = map(int, block.shape)
@@ -341,14 +480,30 @@ def fit_one_block(
     t_fit = time.perf_counter()
     pade_fit._check_solve_mode(solve)
     ordered = w_negative_name is not None
-    kernel = _sharded_fit_kernel(
-        mesh_xy, n, float(rcond), solve, ordered)
+    kernel = (
+        _sharded_fit_kernel(mesh_xy, n, float(rcond), solve, ordered)
+        if anchor is None else
+        _sharded_residue_refit_kernel(
+            mesh_xy, n, float(rcond), ordered))
     z_dev = device_put_process_local(
         z, NamedSharding(mesh_xy, P(None)))
     row_ids = device_put_process_local(
         np.arange(n_mu_padded, dtype=np.int32),
         NamedSharding(mesh_xy, P(("x", "y"))))
-    if ordered:
+    if anchor is not None:
+        Omega_old, B_old, D_old, condition_old = anchor
+        if D_old is None:
+            D_old = jnp.zeros_like(B_old)
+        if ordered:
+            outputs = kernel(
+                block, negative_block, Omega_old, B_old, D_old,
+                condition_old, z_dev, row_ids,
+                np.int32(n_mu), np.int32(n_cols))
+        else:
+            outputs = kernel(
+                block, Omega_old, B_old, D_old, condition_old, z_dev,
+                row_ids, np.int32(n_mu), np.int32(n_cols))
+    elif ordered:
         outputs = kernel(
             block, negative_block, z_dev, row_ids,
             np.int32(n_mu), np.int32(n_cols))
@@ -366,19 +521,30 @@ def fit_one_block(
     t_write = time.perf_counter()
     write = (mpa_store.write_fit_block_collective
              if fit_writer is None else fit_writer.write_block)
+    if anchor is None:
+        block_condition_max = maxima_host[0]
+        block_backward_error_max = maxima_host[1]
+        sample_residual_rel_max = maxima_host[2]
+        sample_residual_abs_max = maxima_host[3]
+    else:
+        block_condition_max = float(fixed_pole_ledger["condition_max"])
+        block_backward_error_max = float(
+            fixed_pole_ledger["backward_error_max"])
+        sample_residual_rel_max = maxima_host[0]
+        sample_residual_abs_max = maxima_host[1]
     if fit_writer is None:
         ledger = write(
             fit_dest, q, cols, Omega, B, diag_block, mesh_xy=mesh_xy,
             B_odd_p_block=B_odd if ordered else None,
-            block_condition_max=maxima_host[0],
-            block_backward_error_max=maxima_host[1],
+            block_condition_max=block_condition_max,
+            block_backward_error_max=block_backward_error_max,
             diagnostics_finite=finite_host)
     else:
         ledger = write(
             q, cols, Omega, B, diag_block,
             B_odd_p_block=B_odd if ordered else None,
-            block_condition_max=maxima_host[0],
-            block_backward_error_max=maxima_host[1],
+            block_condition_max=block_condition_max,
+            block_backward_error_max=block_backward_error_max,
             diagnostics_finite=finite_host)
     t_write = time.perf_counter() - t_write
 
@@ -391,6 +557,8 @@ def fit_one_block(
                        * mpa_store.COMPLEX128_BYTES),
         "fit_dispatches": 1,
         "pade_solves": int(n_mu * n_cols),
+        "sample_residual_rel_max": float(sample_residual_rel_max),
+        "sample_residual_abs_max": float(sample_residual_abs_max),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
         "seconds_write": t_write,
@@ -411,6 +579,7 @@ def run_fit_driver(
     solve="loewner",
     provenance=None,
     occupation_state=None,
+    fixed_pole_source=None,
     report_stream=None,
 ):
     """The whole fit stage: allocate, walk, stage, finalize, report.
@@ -444,6 +613,9 @@ def run_fit_driver(
     }
     t_total = time.perf_counter()
     header = mpa_store.read_w_header(w_src, w_name)
+    anchor_ledger = None
+    if fixed_pole_source is not None:
+        anchor_ledger = mpa_store.validate_fit_store(fixed_pole_source)
     negative_header = None
     ordered = w_negative_name is not None
     if ordered:
@@ -481,6 +653,26 @@ def run_fit_driver(
                 f"positive sample store; mismatched={mismatched}, "
                 f"negative_shape={negative_stamped.shape}, z_shape={z.shape}, "
                 "required negative omega == -z exactly")
+    if anchor_ledger is not None:
+        expected = {
+            "n_p": n,
+            "n_q": int(n_q),
+            "n_mu": int(n_mu),
+            "energy_unit": header["omega_units"],
+            "w_grid_hash": header["grid_hash"],
+            "w_table_hash": header["table_hash"],
+            "w_centroid_hash": header["centroid_hash"],
+            "ordered_residues": ordered,
+        }
+        mismatched = {
+            key: (anchor_ledger.get(key), value)
+            for key, value in expected.items()
+            if anchor_ledger.get(key) != value
+        }
+        if mismatched:
+            raise ValueError(
+                "fixed-pole MPA anchor does not match the new W sample "
+                f"store: {mismatched}")
 
     plan = tiling.plan_column_walk(
         n_mu, n_omega * (2 if ordered else 1), tile_bytes)
@@ -490,6 +682,8 @@ def run_fit_driver(
         "solve_rcond": rcond,
         "eig_mode": _fit_eig(solve),
         "fit_fused": True,
+        "outer_refit": (
+            "fixed_pole_residues" if anchor_ledger is not None else "full"),
     })
     mpa_store.allocate_fit_store_collective(
         fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
@@ -522,6 +716,8 @@ def run_fit_driver(
         "peak_block_bytes": 0,
         "fit_dispatches": 0,
         "pade_solves": 0,
+        "sample_residual_rel_max": 0.0,
+        "sample_residual_abs_max": 0.0,
         "seconds": {"read": 0.0, "fit": 0.0, "write": 0.0,
                     "finalize": 0.0, "total": 0.0},
     }
@@ -539,7 +735,11 @@ def run_fit_driver(
                 w_negative_name=w_negative_name,
                 negative_header=negative_header,
                 tile_bytes=tile_bytes, rcond=rcond,
-                solve=solve, header=header, fit_writer=fit_writer)
+                solve=solve, header=header, fit_writer=fit_writer,
+                # The anchor path is passed only after the destination store
+                # has been allocated, so it can never alias this inode.
+                fixed_pole_source=fixed_pole_source,
+                fixed_pole_ledger=anchor_ledger)
             ledger = stats["ledger"]
             report["blocks_walked"] += 1
             report["columns_read"] += stats["n_cols"]
@@ -549,6 +749,12 @@ def run_fit_driver(
                                              stats["bytes_read"])
             report["fit_dispatches"] += stats["fit_dispatches"]
             report["pade_solves"] += stats["pade_solves"]
+            report["sample_residual_rel_max"] = max(
+                report["sample_residual_rel_max"],
+                stats["sample_residual_rel_max"])
+            report["sample_residual_abs_max"] = max(
+                report["sample_residual_abs_max"],
+                stats["sample_residual_abs_max"])
             report["seconds"]["read"] += stats["seconds_read"]
             report["seconds"]["fit"] += stats["seconds_fit"]
             report["seconds"]["write"] += stats["seconds_write"]
@@ -578,6 +784,8 @@ def run_fit_driver(
                                     * report["tile_bytes"])
     report["condition_max"] = ledger["condition_max"]
     report["backward_error_max"] = ledger["backward_error_max"]
+    report["outer_refit"] = (
+        "fixed_pole_residues" if anchor_ledger is not None else "full")
     report["seconds"]["total"] = time.perf_counter() - t_total
 
     if report_stream is not None and process_rank() == 0:
@@ -610,6 +818,9 @@ def format_cost_report(report):
         f"  geometry        n_q={r['n_q']} N_mu={r['n_mu']} "
         f"n_omega={r['n_omega']} n_p={r['n_p']}",
         f"  solve           {r['solve']}, rcond={r['rcond']:.1e}",
+        f"  outer refit     {r.get('outer_refit', 'full')}; sample residual "
+        f"rel={r.get('sample_residual_rel_max', float('nan')):.3e}, "
+        f"abs={r.get('sample_residual_abs_max', float('nan')):.3e}",
         f"  eig             {r['eig']}, fused=yes",
         f"  walk            {r['blocks_walked']} blocks "
         f"({r['n_blocks_per_q']} per q x {r['n_q']} q), "

@@ -425,6 +425,25 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     assert d_b < 1.0e-6
 
 
+def test_fixed_pole_driver_streams_anchor_and_refits_residues(
+        planted, fitted, tmp_path, mesh_xy):
+    """The outer policy copies Omega by blocks and re-solves only B."""
+    fit_path = tmp_path / "mpa_fit_fixed_poles.h5"
+    ledger, report = fit_driver.run_fit_driver(
+        str(planted["w_path"]), _W_NAME, str(fit_path),
+        planted["z"], planted["n_p"], mesh_xy=mesh_xy,
+        fixed_pole_source=str(fitted["path"]),
+    )
+    anchor_omega, _, _, _ = MS.read_fit_tensors(str(fitted["path"]))
+    omega, residues, _, _ = MS.read_fit_tensors(str(fit_path))
+
+    assert ledger["complete"]
+    assert report["outer_refit"] == "fixed_pole_residues"
+    assert report["sample_residual_rel_max"] < 1e-6
+    np.testing.assert_array_equal(omega, anchor_omega)
+    assert np.max(np.abs(residues - planted["B"])) < 1e-6
+
+
 def test_ordered_end_to_end_stores_and_recovers_the_odd_residue(
         tmp_path, mesh_xy):
     """The disk driver fits W(z), W(-z) through one element-wise kernel."""

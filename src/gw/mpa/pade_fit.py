@@ -822,6 +822,111 @@ def _odd_residue_lstsq(z, w_odd, Omega, valid, rcond):
     return jnp.where(valid, D, 0.0 + 0.0j)
 
 
+def refit_mpa_residues_at_fixed_poles(
+    W_samples,
+    z_samples,
+    Omega,
+    valid,
+    *,
+    W_negative_samples=None,
+    return_odd=False,
+    rcond=1.0e-13,
+):
+    """Solve only MPA residues for an immutable set of pole positions.
+
+    This is the continuous outer-QSGW update of the residue stage already
+    used by :func:`fit_mpa_poles`: all sample points enter the same complex
+    least-squares solve, while no denominator/root/guard stage is rerun.
+    ``valid`` is the anchor fit's live-pole mask.  The returned diagnostics
+    measure reconstruction of the new samples and are the adequacy oracle
+    that decides whether the nonlinear pole fit must be entered again.
+    """
+    _require_x64()
+    w_positive = jnp.asarray(W_samples, dtype=jnp.complex128)
+    z = jnp.asarray(z_samples, dtype=jnp.complex128)
+    omega = jnp.asarray(Omega, dtype=jnp.complex128)
+    live = jnp.asarray(valid, dtype=bool)
+    if w_positive.ndim != 1 or z.ndim != 1:
+        raise ValueError("fixed-pole MPA refit requires 1-D sample vectors")
+    if w_positive.shape != z.shape:
+        raise ValueError("fixed-pole MPA W and z sample shapes must match")
+    if omega.ndim != 1 or live.shape != omega.shape:
+        raise ValueError("fixed-pole MPA Omega and valid shapes must match")
+    if return_odd and W_negative_samples is None:
+        raise ValueError(
+            "fixed-pole MPA return_odd=True requires W(-z) samples")
+    if W_negative_samples is None:
+        w = w_positive
+        w_odd = None
+    else:
+        w_negative = jnp.asarray(W_negative_samples, dtype=jnp.complex128)
+        if w_negative.shape != w_positive.shape:
+            raise ValueError("fixed-pole MPA W(-z) samples must match W(z)")
+        w = 0.5 * (w_positive + w_negative)
+        w_odd = 0.5 * (w_positive - w_negative)
+
+    x, x_max = _x_normalisation(z)
+    x_hat = x / x_max.astype(jnp.complex128)
+    b_hat = omega * omega / x_max.astype(jnp.complex128)
+    B = _residue_lstsq(
+        x_hat, w, b_hat, live, x_max, omega, float(rcond))
+    B_odd = None
+    if w_odd is not None:
+        B_odd = _odd_residue_lstsq(
+            z, w_odd, omega, live, float(rcond))
+    model = eval_mpa_model(
+        omega, B, z, valid=live, B_odd=B_odd)
+    target = w_positive if w_odd is not None else w
+    residual = jnp.abs(model - target)
+    scale = jnp.maximum(
+        jnp.max(jnp.abs(target)), jnp.finfo(jnp.float64).tiny)
+    diagnostics = {
+        "max_abs_residual": jnp.max(residual),
+        "rel_rms_residual": jnp.sqrt(jnp.mean(residual ** 2)) / scale,
+    }
+    if return_odd:
+        return B, B_odd, diagnostics
+    return B, diagnostics
+
+
+def refit_mpa_residues_batched(
+    W_tile,
+    z_samples,
+    Omega_tile,
+    valid_tile,
+    *,
+    W_negative_tile=None,
+    return_odd=False,
+    rcond=1.0e-13,
+):
+    """Vectorized fixed-pole residue solve over matrix elements."""
+    samples = jnp.asarray(W_tile, dtype=jnp.complex128)
+    omega = jnp.asarray(Omega_tile, dtype=jnp.complex128)
+    valid = jnp.asarray(valid_tile, dtype=bool)
+    if samples.ndim != 2 or omega.ndim != 2 or valid.shape != omega.shape:
+        raise ValueError(
+            "batched fixed-pole MPA inputs require (element,sample) W and "
+            "matching (element,pole) Omega/valid arrays")
+    if samples.shape[0] != omega.shape[0]:
+        raise ValueError("fixed-pole MPA element counts must match")
+    if W_negative_tile is None:
+        def _one(w, om, live):
+            return refit_mpa_residues_at_fixed_poles(
+                w, z_samples, om, live, rcond=rcond,
+                return_odd=return_odd)
+        return jax.vmap(_one)(samples, omega, valid)
+
+    negative = jnp.asarray(W_negative_tile, dtype=jnp.complex128)
+    if negative.shape != samples.shape:
+        raise ValueError("fixed-pole MPA W(-z) tile must match W(z)")
+
+    def _one_ordered(w, wn, om, live):
+        return refit_mpa_residues_at_fixed_poles(
+            w, z_samples, om, live, W_negative_samples=wn,
+            return_odd=return_odd, rcond=rcond)
+    return jax.vmap(_one_ordered)(samples, negative, omega, valid)
+
+
 def eval_mpa_model(Omega, B, z, valid=None, B_odd=None):
     """Evaluate the even or ordered two-residue MPA model.
 

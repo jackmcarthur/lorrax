@@ -2003,6 +2003,75 @@ def read_w_columns_collective(
             partition_spec=spec)
 
 
+def read_fit_columns_collective(
+    src,
+    q,
+    mu_cols,
+    *,
+    mesh_xy,
+    n_cols_buffer,
+    ledger=None,
+):
+    """Read one anchor-fit column tile for a fixed-pole residue refit.
+
+    Pole arrays return as ``(n_p, 1, n_mu_padded, n_cols_buffer)`` and the
+    retained condition map as ``(1, n_mu_padded, n_cols_buffer)``.  The row
+    axis alone is sharded over ``('x', 'y')``, exactly like the W sample
+    block consumed beside it.  No whole pole tensor is materialized.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    from file_io.slab_io import SlabIO, mesh_divisible_shape
+
+    led = validate_fit_store(src) if ledger is None else ledger
+    iq = int(q)
+    if not 0 <= iq < int(led["n_q"]):
+        raise IndexError(
+            f"read_fit_columns_collective: q={iq} outside "
+            f"[0,{int(led['n_q'])})")
+    cols = normalise_columns(mu_cols, int(led["n_mu"]))
+    lo, hi, sel = _column_span(cols)
+    if sel is not None:
+        raise ValueError(
+            "read_fit_columns_collective requires contiguous columns")
+    width = int(n_cols_buffer)
+    if width < int(cols.size):
+        raise ValueError(
+            "read_fit_columns_collective requires buffer width >= actual "
+            f"columns; got {width} < {int(cols.size)}")
+
+    pole_spec = P(None, None, ("x", "y"), None)
+    pole_shape = mesh_divisible_shape(
+        (int(led["n_p"]), 1, int(led["n_mu"]), width),
+        mesh_xy, pole_spec)
+    diag_spec = P(None, ("x", "y"), None)
+    diag_shape = mesh_divisible_shape(
+        (1, int(led["n_mu"]), width), mesh_xy, diag_spec)
+    with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+        Omega = io.read_slab(
+            "Omega_p", shape=pole_shape, offset=(0, iq, 0, lo),
+            valid_shape=(int(led["n_p"]), 1, int(led["n_mu"]),
+                         int(cols.size)),
+            partition_spec=pole_spec)
+        B = io.read_slab(
+            "B_p", shape=pole_shape, offset=(0, iq, 0, lo),
+            valid_shape=(int(led["n_p"]), 1, int(led["n_mu"]),
+                         int(cols.size)),
+            partition_spec=pole_spec)
+        B_odd = None
+        if bool(led["ordered_residues"]):
+            B_odd = io.read_slab(
+                "B_odd_p", shape=pole_shape, offset=(0, iq, 0, lo),
+                valid_shape=(int(led["n_p"]), 1, int(led["n_mu"]),
+                             int(cols.size)),
+                partition_spec=pole_spec)
+        condition = io.read_slab(
+            "fit_condition", shape=diag_shape, offset=(iq, 0, lo),
+            valid_shape=(1, int(led["n_mu"]), int(cols.size)),
+            partition_spec=diag_spec)
+    return Omega, B, B_odd, condition
+
+
 # ---------------------------------------------------------------------------
 # The staged B/Ω fit store
 # ---------------------------------------------------------------------------

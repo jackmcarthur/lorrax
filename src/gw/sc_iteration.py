@@ -330,6 +330,9 @@ class SCInputs:
     #: reuses the exact node arrays thereafter.  A padded-box escape refuses
     #: instead of changing the quadrature inside the fixed-point map.
     fixed_quadrature_session: dict | None = None
+    #: Run-local anchor positions and reconstruction ceilings for the outer
+    #: screening refit policy.  None on the exact one-map path.
+    outer_refit_session: dict | None = None
     #: Frozen χ0/W/pole-model transaction for a two-level inner solve.
     #: ``None`` builds screening from this map's orbitals; otherwise the map
     #: rebuilds G and Sigma from the retained model without entering the
@@ -2991,6 +2994,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
             material_class=inputs.material_class,
+            outer_refit_session=inputs.outer_refit_session,
             print_fn=inputs.print_fn)
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
@@ -3266,6 +3270,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         material_class=inputs.material_class,
         write_sigma_omega_h5=False,
         fixed_quadrature_session=inputs.fixed_quadrature_session,
+        outer_refit_session=inputs.outer_refit_session,
         # Map 1 stays on the historical half-sum exactly, preserving the
         # one-shot identity gate.  Every later dynamic SC map uses the
         # owner-selected diagonal-at-E_m / off-diagonal-at-E_F law.
@@ -5403,6 +5408,9 @@ def run_sc_driver(
         screening_seed_cache={},
         fixed_quadrature_session=(
             {} if int(config.sc.max_iter) > 1 else None),
+        outer_refit_session=(
+            {"policy": str(config.sc.outer_refit_policy)}
+            if int(config.sc.max_iter) > 1 else None),
         two_level_enabled=int(config.sc.max_iter) > 1,
         two_level_cost=(
             {"sigma_walls_s": [], "w_refits": 0}

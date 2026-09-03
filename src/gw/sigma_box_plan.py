@@ -511,15 +511,18 @@ def _box_escape_reasons(outer, inner):
     ]
 
 
-def _sc_padded_box_spec(spec, eta):
+def _sc_padded_box_spec(
+    spec, eta, *, state_pad_ev=_SC_STATE_PAD_EV,
+    pole_pad_fraction=_SC_POLE_PAD_FRACTION,
+):
     """Return the iteration-1 SC certificate box required by policy.
 
-    State drift gets 2 eV on the movable real edge(s).  Pole drift is
-    covered independently by widening every real and imaginary pole extent
-    by ten percent before recomputing the denominator box.
+    The ordinary multi-map policy supplies the conservative module defaults.
+    A two-level QSGW outer step passes 0.25 eV and zero pole padding because
+    its inner solve freezes the pole census and replans at the next refit.
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
-    frac = _SC_POLE_PAD_FRACTION
+    frac = float(pole_pad_fraction)
     padded_poles = ((
         a_lo - frac * abs(a_lo),
         a_hi + frac * abs(a_hi),
@@ -535,7 +538,7 @@ def _sc_padded_box_spec(spec, eta):
         min(spec["box"][2], pole_box[2]),
         max(spec["box"][3], pole_box[3]),
     ]
-    state_pad_ry = _SC_STATE_PAD_EV / RYD_TO_EV
+    state_pad_ry = float(state_pad_ev) / RYD_TO_EV
     if spec["kind"] in ("crossing", "sign_definite_negative"):
         box[0] -= state_pad_ry
     if spec["kind"] in ("crossing", "sign_definite_positive"):
@@ -546,8 +549,8 @@ def _sc_padded_box_spec(spec, eta):
         "sign_definite_positive" if box[0] > 0.0 else
         "sign_definite_negative" if box[1] < 0.0 else "crossing")
     padded["sc_unpadded_box"] = tuple(spec["box"])
-    padded["sc_state_pad_ev"] = _SC_STATE_PAD_EV
-    padded["sc_pole_pad_fraction"] = _SC_POLE_PAD_FRACTION
+    padded["sc_state_pad_ev"] = float(state_pad_ev)
+    padded["sc_pole_pad_fraction"] = frac
     if not _box_contains(padded["box"], spec["box"]):
         raise RuntimeError(
             f"SC fixed-rule padding failed to contain {spec['name']!r}")
@@ -580,12 +583,27 @@ def _fit_fixed_sc_rules(
     escape is a policy failure, not permission to change nodes mid-loop.
     """
     rows = list(specs)
+    state_pad_ev = float(session.get(
+        "state_edge_padding_ev", _SC_STATE_PAD_EV))
+    pole_pad_fraction = float(session.get(
+        "pole_extent_padding_fraction", _SC_POLE_PAD_FRACTION))
+    if (not np.isfinite(state_pad_ev) or state_pad_ev < 0.0
+            or not np.isfinite(pole_pad_fraction)
+            or pole_pad_fraction < 0.0):
+        raise ValueError(
+            "SC fixed quadrature padding must be finite and non-negative; "
+            f"got state={state_pad_ev} eV, pole={pole_pad_fraction}")
     iteration = int(session.get("call_count", 0)) + 1
     session["call_count"] = iteration
     if "rules" not in session:
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
-        padded = [_sc_padded_box_spec(spec, eta) for spec in rows]
+        padded = [
+            _sc_padded_box_spec(
+                spec, eta, state_pad_ev=state_pad_ev,
+                pole_pad_fraction=pole_pad_fraction)
+            for spec in rows
+        ]
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
             cache_dir=cache_dir, cache_build_widen=False,
@@ -913,8 +931,12 @@ def plan_sigma_windows(
             "sc_fixed_total_rebuild_count": 0,
             "sc_fixed_initial_window_tau_pairs": int(
                 fixed_rule_session["initial_window_tau_pairs"]),
-            "sc_state_edge_padding_ev": _SC_STATE_PAD_EV,
-            "sc_pole_extent_padding_fraction": _SC_POLE_PAD_FRACTION,
+            "sc_state_edge_padding_ev": float(fixed_rule_session.get(
+                "state_edge_padding_ev", _SC_STATE_PAD_EV)),
+            "sc_pole_extent_padding_fraction": float(
+                fixed_rule_session.get(
+                    "pole_extent_padding_fraction",
+                    _SC_POLE_PAD_FRACTION)),
         })
     else:
         geometry["sc_fixed_quadrature"] = False

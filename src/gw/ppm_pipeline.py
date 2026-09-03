@@ -91,6 +91,8 @@ def _fit_head_correction(
     probe_omega: complex,
     print_fn,
     iteration_head=None,
+    outer_refit_session=None,
+    frozen: bool = False,
 ):
     """Fit the GN-PPM scalar head from the user-selected source."""
     from .head_correction import (
@@ -100,6 +102,15 @@ def _fit_head_correction(
         format_head_diagnostics,
     )
 
+    head_session = None
+    if outer_refit_session is not None:
+        head_session = outer_refit_session.setdefault("head", {})
+        head_session.setdefault(
+            "policy", outer_refit_session.get("policy", "full"))
+    if frozen and head_session is not None \
+            and head_session.get("current") is not None:
+        print_fn("  PPM head outer refit: frozen pole model reused")
+        return head_session["current"]
     head_source = iteration_head if iteration_head is not None else head_resolver
     head_static = head_source.at(0.0 + 0.0j)
     omega_h_override = config.ppm.head_omega_h_ry
@@ -109,6 +120,7 @@ def _fit_head_correction(
     # entry (``compute_ppm_sigma_pipeline``) has already refused a mode
     # with no pole model, so 'gn' / 'hl' are the only two values here.
     is_hl = config.compute_mode.ppm_model == "hl"
+    policy = "full" if head_session is None else head_session["policy"]
 
     if omega_h_override is not None:
         # User-supplied head pole Ω_h (e.g. BGW's analytic value).  Static
@@ -119,24 +131,74 @@ def _fit_head_correction(
             f"  PPM head: Ω_h override = {float(omega_h_override):.6f} Ry "
             f"({float(omega_h_override) * RYD_TO_EV:.4f} eV)"
         )
-    elif is_hl:
-        # BGW-style analytic head pole: Ω_h² = ω_p² / (1 − ε_head⁻¹).
-        # ω_p² = 16π · N_e / V_cell in Ry² (Hartree-AU energies → Ry²
-        # has factor 4 → 16π).
-        omega_p_sq_ry = 16.0 * float(np.pi) * float(meta.nelec) / float(meta.cell_volume)
-        head_gn = fit_head_hl_analytic_from_sample(
-            head_static, omega_p_sq_ry=omega_p_sq_ry)
-        print_fn(
-            f"  HL head: ω_p (analytic, BGW-style) = "
-            f"{omega_p_sq_ry**0.5:.6f} Ry "
-            f"({(omega_p_sq_ry**0.5) * RYD_TO_EV:.4f} eV)"
-        )
     else:
         head_probe = head_source.at(probe_omega)
-        head_gn = fit_head_ppm_from_samples(
-            head_static, head_probe, probe_omega=probe_omega)
+        fixed_used = False
+        if (policy == "fixed_poles" and head_session is not None
+                and head_session.get("anchor_omega") is not None):
+            head_gn = fit_head_with_fixed_omega_from_sample(
+                head_static,
+                omega_h_ry=float(head_session["anchor_omega"]),
+            )
+            predicted = head_gn.B_h / (
+                complex(probe_omega) ** 2 - head_gn.omega_h_sq)
+            target = float(head_probe.wcoul0.real - head_probe.vc0.real)
+            scale = max(abs(target), np.finfo(np.float64).tiny)
+            residual = abs(predicted - target) / scale
+            ceiling = float(head_session["oracle_ceiling"])
+            fixed_used = residual <= ceiling
+            print_fn(
+                "  PPM head outer refit: policy=fixed_poles, probe "
+                f"reconstruction residual={residual:.8e}, oracle "
+                f"ceiling={ceiling:.8e}, verdict="
+                f"{'ADEQUATE' if fixed_used else 'REOPTIMIZE'}")
+        if not fixed_used:
+            had_model = (
+                head_session is not None
+                and head_session.get("current") is not None)
+            if is_hl:
+                # BGW-style analytic head pole:
+                # Ω_h² = ω_p² / (1 − ε_head⁻¹), with
+                # ω_p² = 16π N_e/V_cell in Ry².  This is the nonlinear
+                # full-refit owner; later fixed-pole steps use only its Ω_h.
+                omega_p_sq_ry = (
+                    16.0 * float(np.pi) * float(meta.nelec)
+                    / float(meta.cell_volume))
+                head_gn = fit_head_hl_analytic_from_sample(
+                    head_static, omega_p_sq_ry=omega_p_sq_ry)
+                print_fn(
+                    f"  HL head: ω_p (analytic, BGW-style) = "
+                    f"{omega_p_sq_ry**0.5:.6f} Ry "
+                    f"({(omega_p_sq_ry**0.5) * RYD_TO_EV:.4f} eV)"
+                )
+            else:
+                head_gn = fit_head_ppm_from_samples(
+                    head_static, head_probe, probe_omega=probe_omega)
+            if head_session is not None:
+                predicted = head_gn.B_h / (
+                    complex(probe_omega) ** 2 - head_gn.omega_h_sq)
+                target = float(
+                    head_probe.wcoul0.real - head_probe.vc0.real)
+                scale = max(abs(target), np.finfo(np.float64).tiny)
+                residual = abs(predicted - target) / scale
+                ceiling = max(
+                    residual * (1.0 + 64.0 * np.finfo(np.float64).eps),
+                    64.0 * np.finfo(np.float64).eps,
+                )
+                if policy == "fixed_poles":
+                    head_session.update(
+                        anchor_omega=float(head_gn.omega_h),
+                        oracle_ceiling=float(ceiling),
+                    )
+                print_fn(
+                    f"  PPM head outer refit: policy={policy}, action="
+                    f"{'full' if had_model else 'bootstrap_full'}, probe "
+                    f"reconstruction residual={residual:.8e}, oracle "
+                    f"ceiling={ceiling:.8e}")
 
     print_fn(format_head_diagnostics(head_gn, cell_volume=meta.cell_volume))
+    if head_session is not None:
+        head_session["current"] = head_gn
     return head_gn
 
 
@@ -492,6 +554,8 @@ def compute_ppm_sigma_pipeline(
     iteration_head=None,
     occupation_state=None,
     fixed_quadrature_session=None,
+    outer_refit_session=None,
+    frozen_screening_model: bool = False,
     w_time_factor_cache=None,
     print_fn=print,
 ) -> PPMOutputs:
@@ -585,6 +649,8 @@ def compute_ppm_sigma_pipeline(
             # different real-axis model and is deliberately unchanged.
             coarsen_extreme_tails=not is_hl,
             ordered_orientations=ordered,
+            outer_refit_session=outer_refit_session,
+            frozen=bool(frozen_screening_model),
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)
@@ -729,6 +795,8 @@ def compute_ppm_sigma_pipeline(
             head_resolver, config=config, meta=meta,
             probe_omega=probe_omega, print_fn=print_fn,
             iteration_head=iteration_head,
+            outer_refit_session=outer_refit_session,
+            frozen=bool(frozen_screening_model),
         )
         head_sigma_diag_w_kn_ry = _compute_analytic_head_diag(
             head_gn,

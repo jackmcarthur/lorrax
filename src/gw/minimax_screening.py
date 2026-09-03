@@ -986,6 +986,71 @@ def _gn_ppm_odd_residue(anti_qmunu, omega_qmunu, z_probe):
                      jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
 
 
+@partial(jax.jit, static_argnums=(4,))
+def _refit_gn_ppm_residues_kernel(
+    Wc0_qmunu, Wc_probe_qmunu, omega_qmunu, z_probe,
+    ordered_orientations,
+):
+    """Refit the one-pole strength at fixed ``Omega`` and test W samples.
+
+    At a fixed mode frequency the static identity is linear,
+    ``B = -Wc(0) Omega / 2``.  For an ordered imaginary-axis response the
+    anti-Hermitian probe fixes ``D`` through the existing odd-residue owner.
+    The returned residual is the global max error at the independent probe,
+    normalized by its global max magnitude.
+    """
+    W0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
+    Wi = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
+    omega = jnp.asarray(omega_qmunu, dtype=jnp.float64)
+    live = omega > 0.0
+    B = jnp.where(
+        live, -0.5 * W0 * omega.astype(jnp.complex128), 0.0 + 0.0j)
+    Wi_target = Wi
+    D = jnp.zeros_like(B)
+    if ordered_orientations:
+        Wi_adj = jnp.conj(jnp.swapaxes(Wi, -1, -2))
+        anti = 0.5 * (Wi - Wi_adj)
+        D = _gn_ppm_odd_residue(anti, omega, z_probe)
+    z = jnp.asarray(z_probe, dtype=jnp.complex128)
+    denom = z * z - omega.astype(jnp.complex128) ** 2
+    safe = jnp.where(jnp.abs(denom) > 0.0, denom, 1.0 + 0.0j)
+    predicted = jnp.where(
+        live,
+        (2.0 * omega.astype(jnp.complex128) * B + 2.0 * z * D) / safe,
+        0.0 + 0.0j,
+    )
+    scale = jnp.maximum(
+        jnp.max(jnp.abs(Wi_target)), jnp.finfo(jnp.float64).tiny)
+    residual = jnp.max(jnp.abs(predicted - Wi_target)) / scale
+    return B, D, residual
+
+
+def refit_gn_ppm_residues_at_fixed_poles(
+    Wc0_qmunu,
+    Wc_probe_qmunu,
+    omega_qmunu,
+    probe_omega,
+    *,
+    ordered_orientations=False,
+):
+    """Return continuous GN/HL strengths at fixed mode frequencies.
+
+    This is the fixed-pole counterpart of :func:`fit_gn_ppm_from_wc_pair`.
+    It owns no pole finder: it applies that fit's exact static/odd identities
+    and returns ``(B, B_odd_or_None, probe_relative_residual)``.  Arrays keep
+    their input sharding and only the scalar adequacy residual reaches host.
+    """
+    B, D, residual = _refit_gn_ppm_residues_kernel(
+        Wc0_qmunu,
+        Wc_probe_qmunu,
+        omega_qmunu,
+        jnp.asarray(complex(probe_omega), dtype=jnp.complex128),
+        bool(ordered_orientations),
+    )
+    residual_host = _scalar_to_host_float(residual)
+    return B, (D if ordered_orientations else None), residual_host
+
+
 def solve_laplace_minimax_interval(
     x_min: float,
     x_max: float,

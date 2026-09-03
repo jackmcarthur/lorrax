@@ -42,6 +42,26 @@ the second refit). rCROP history is reset at each outer refit; the outer variabl
 be linearly mixed (`sc_mixing`) if the diagnostic shows the W refit itself is not
 contractive.
 
+The outer pole representation has two explicit policies. `full` repeats the nonlinear
+pole-position fit at every W refit and is retained as the discontinuous diagnostic
+control. `fixed_poles` (the production default) bootstraps positions from the first
+full fit and subsequently runs only the existing linear residue solve on each new W
+sample set. The MPA body uses the same all-sample least-squares residue owner as the
+ordinary Loewner/companion fit; its scalar dynamic head follows the identical policy.
+The GN/HL analogue preserves each mode frequency and refits the strength from Wc(0),
+including the scalar PPM head. Every outer step prints the W-sample reconstruction
+residual. If it exceeds the bootstrap full fit's own achieved residual (with only a
+machine-epsilon comparison floor), that component re-enters the full nonlinear fit
+and establishes a new certified anchor. Thus the continuous path is tested for
+adequacy rather than freezing a model blindly.
+
+Each outer model also owns one SCFIX quadrature transaction. Its frozen-pole inner
+solve pads movable state edges by 0.25 eV and pole extents by 0%, then reuses those
+exact rules for the whole inner solve. The transaction is discarded at the next
+outer W/pole refit, which replans and repads for the new model. This is narrower than
+SCFIX's 2 eV/10% conservative cross-refit defaults and avoids paying that 230-pair
+MoS2 geometry when only meV-scale state motion remains.
+
 **Update law.** Owner's proposal (2026-09-03): every off-diagonal Σ̃_mn (m ≠ n) at E_F,
 the diagonal Σ̃_mm at E_m (on-shell, eqp0-type, no Z anywhere in the iteration). The
 off-diagonal block is then a static Hermitian matrix that changes only with the
@@ -60,3 +80,6 @@ converge monotonically after two maps; the outer loop converges in ≤ 5 refits;
 converged QP energies agree between windows within the protected states to ≤ 10 meV;
 iteration 1 remains bit-exact to one-shot; the frozen-W control from SCDIAG is
 reproduced. Per-iteration history plots and eqp0/eqp1 tables as in the SC study.
+For Si GN and MPA, run both `fixed_poles` and `full` outer policies and report their
+outer residual sequences; only the fixed-pole arm is expected to pass through the
+measured refit noise floor.

@@ -25,6 +25,7 @@ from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_screening import (
     GN_PPM_EXTREME_TAIL_DIVISOR,
     fit_gn_ppm_from_wc_pair,
+    refit_gn_ppm_residues_at_fixed_poles,
 )
 from .ppm_windows import (
     branches_for_omega_grid,
@@ -338,6 +339,8 @@ def fit_ppm(
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
     ordered_orientations: bool = False,
+    outer_refit_session: dict | None = None,
+    frozen: bool = False,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -370,23 +373,97 @@ def fit_ppm(
     z = complex(probe_omega)
     t0 = _t.perf_counter()
 
+    session = outer_refit_session
+    if frozen and session is not None and session.get("current") is not None:
+        if print_fn is not None:
+            print_fn(
+                f"  {model_label} outer refit: frozen pole model reused "
+                "without another fit")
+        return session["current"]
+
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
-    fit = fit_gn_ppm_from_wc_pair(
-         Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
-         n_mu_logical=int(n_mu_logical),
-         q_neg_index=q_neg_index,
-         coarsen_extreme_tails=bool(coarsen_extreme_tails),
-         ordered_orientations=bool(ordered_orientations),
-         print_fn=print_fn if print_fn is not None else print)
+
+    policy = "full" if session is None else session.get("policy", "full")
+    fixed_used = False
+    residual = None
+    if (policy == "fixed_poles" and session is not None
+            and session.get("anchor_omega") is not None):
+        Omega = session["anchor_omega"]
+        B, B_odd, residual = refit_gn_ppm_residues_at_fixed_poles(
+            Wc0_q, Wci_q, Omega, z,
+            ordered_orientations=bool(ordered_orientations))
+        ceiling = float(session["oracle_ceiling"])
+        fixed_used = bool(residual <= ceiling)
+        if print_fn is not None:
+            print_fn(
+                f"  {model_label} outer refit: policy=fixed_poles, "
+                f"probe reconstruction residual={residual:.8e}, "
+                f"oracle ceiling={ceiling:.8e}, "
+                f"verdict={'ADEQUATE' if fixed_used else 'REOPTIMIZE'}")
+
+    if fixed_used:
+        from types import SimpleNamespace
+        fit = SimpleNamespace(
+            **session["anchor_census"],
+            valid_qmunu=session["anchor_valid"],
+        )
+    else:
+        fit = fit_gn_ppm_from_wc_pair(
+             Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
+             n_mu_logical=int(n_mu_logical),
+             q_neg_index=q_neg_index,
+             coarsen_extreme_tails=bool(coarsen_extreme_tails),
+             ordered_orientations=bool(ordered_orientations),
+             print_fn=print_fn if print_fn is not None else print)
+        Omega = fit.omega_qmunu
+        B = fit.B_qmunu
+        B_odd = fit.B_odd_qmunu
+        if session is not None:
+            _, _, residual = refit_gn_ppm_residues_at_fixed_poles(
+                Wc0_q, Wci_q, Omega, z,
+                ordered_orientations=bool(ordered_orientations))
+            had_model = session.get("current") is not None
+            # The pole finder itself defines the adequacy oracle.  A small
+            # floating floor prevents an exact synthetic fit from escaping
+            # merely because two equivalent reductions differ at epsilon.
+            ceiling = max(
+                float(residual) * (1.0 + 64.0 * np.finfo(np.float64).eps),
+                64.0 * np.finfo(np.float64).eps,
+            )
+            if policy == "fixed_poles":
+                session.update(
+                    anchor_omega=Omega,
+                    anchor_valid=fit.valid_qmunu,
+                    anchor_census={
+                        key: getattr(fit, key) for key in (
+                            "unfulfilled_fraction", "n_valid",
+                            "omega_min_raw", "omega_max_raw",
+                            "pair_relative_separation_min", "n_tail_low",
+                            "n_tail_high", "omega_min_after",
+                            "omega_max_after", "tail_anchor_omega",
+                        )
+                    },
+                    oracle_ceiling=ceiling,
+                )
+            if print_fn is not None:
+                kind = "bootstrap_full" if not had_model else "full"
+                print_fn(
+                    f"  {model_label} outer refit: policy={policy}, "
+                    f"action={kind}, probe reconstruction residual="
+                    f"{float(residual):.8e}, oracle ceiling={ceiling:.8e}")
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    if not fixed_used:
+        Omega = fit.omega_qmunu
+        B = fit.B_qmunu
+        B_odd = fit.B_odd_qmunu
     Omega = jax.lax.with_sharding_constraint(
-        jnp.asarray(fit.omega_qmunu), q_shard)
-    B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
-    B_odd = (None if fit.B_odd_qmunu is None else
+        jnp.asarray(Omega), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(B), q_shard)
+    B_odd = (None if B_odd is None else
              jax.lax.with_sharding_constraint(
-                 jnp.asarray(fit.B_odd_qmunu), q_shard))
+                 jnp.asarray(B_odd), q_shard))
     valid_mask = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
@@ -466,7 +543,7 @@ def fit_ppm(
                 "BGW finite-pole parity; exact panes remain downstream."
             )
 
-    return PPMBuildResult(
+    result = PPMBuildResult(
         omega_p=probe_mag,
         Wc0_q=Wc0_q,
         B_q=B,
@@ -478,6 +555,9 @@ def fit_ppm(
         probe_hermiticity_residual=probe_hermiticity_residual,
         odd_even_residue_ratio=odd_even_residue_ratio,
     )
+    if session is not None:
+        session["current"] = result
+    return result
 
 
 # ---------------------------------------------------------------------------

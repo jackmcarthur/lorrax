@@ -686,6 +686,7 @@ def compute_sigma_xc(
     occupation_state=None,
     material_class: str,
     fixed_quadrature_session=None,
+    outer_refit_session=None,
     qsgw_update_policy: QSGWUpdatePolicy = QSGWUpdatePolicy.HALF_SUM,
     frozen_screening_model: bool = False,
     w_time_factor_cache=None,
@@ -1440,6 +1441,12 @@ def compute_sigma_xc(
             f"compute_sigma_xc: PPM mode {mode!r} requires "
             f"W_by_role['probe'] (set by screening_requests_for).")
 
+    ppm_refit_session = None
+    if outer_refit_session is not None:
+        ppm_refit_session = outer_refit_session.setdefault("ppm", {})
+        ppm_refit_session.setdefault(
+            "policy", outer_refit_session.get("policy", "full"))
+
     ppm_outputs = compute_ppm_sigma_pipeline(
         wfns=wfns,
         V_q=V_q,
@@ -1453,6 +1460,8 @@ def compute_sigma_xc(
         fixed_quadrature_session=(
             None if fixed_quadrature_session is None else
             fixed_quadrature_session.setdefault("ppm", {})),
+        outer_refit_session=ppm_refit_session,
+        frozen_screening_model=frozen_screening_model,
         w_time_factor_cache=w_time_factor_cache,
         print_fn=print_fn,
     )

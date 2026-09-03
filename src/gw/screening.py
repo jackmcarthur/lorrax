@@ -853,6 +853,7 @@ def compute_screening_model(
     iteration_head_response=None,
     occupation_state=None,
     material_class,
+    outer_refit_session=None,
     static_only=False,
     tensors_filename=None,
     print_fn=print,
@@ -931,6 +932,7 @@ def compute_screening_model(
             occupation_state=occupation_state,
             material_class=material_class,
             head_channel=head_channel,
+            outer_refit_session=outer_refit_session,
             wc_source=wc_source, print_fn=print_fn)
         result = {"mpa_fit": fit_path}
         if iteration_head is not None:

@@ -335,6 +335,25 @@ def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
     assert padded["sc_pole_pad_fraction"] == 0.10
 
 
+def test_two_level_sc_rule_padding_is_quarter_ev_with_fixed_poles():
+    eta = 0.1
+    spec = make_sigma_box_spec(
+        name="crossing", frequencies=(-2.0, 2.0), states=(-0.2, 0.2),
+        pole_stats=((1.0, 2.0, 0.5, 1.0),), pole_sign=1.0,
+        eta_ry=eta)
+    padded = _sc_padded_box_spec(
+        spec, eta, state_pad_ev=0.25, pole_pad_fraction=0.0)
+    expected = (
+        spec["box"][0] - 0.25 / RYD_TO_EV,
+        spec["box"][1] + 0.25 / RYD_TO_EV,
+        spec["box"][2],
+        spec["box"][3],
+    )
+    np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
+    assert padded["sc_state_pad_ev"] == 0.25
+    assert padded["sc_pole_pad_fraction"] == 0.0
+
+
 def test_fixed_sc_accepts_the_box_services_finite_fallback(monkeypatch):
     import dataclasses
 

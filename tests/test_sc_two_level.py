@@ -1,6 +1,6 @@
 """Two-level QSGW orchestration without running a physics kernel."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +21,9 @@ class _Inputs:
     frozen_screening: object = None
     mesh_xy: object = None
     partition: object = None
+    fixed_quadrature_session: object = None
+    config: object = field(default_factory=lambda: SimpleNamespace(
+        sc=SimpleNamespace(outer_refit_policy="fixed_poles")))
     print_fn: object = lambda *_args: None
 
 
@@ -70,7 +73,8 @@ def test_outer_refits_freeze_each_model_and_reset_inner_history(monkeypatch):
 
     def _run(state, passed_inputs, **kwargs):
         calls.append((float(np.asarray(state.H_qp_dft)[0, 0, 0]),
-                      passed_inputs.frozen_screening, dict(kwargs)))
+                      passed_inputs.frozen_screening, dict(kwargs),
+                      passed_inputs.fixed_quadrature_session))
         if passed_inputs.frozen_screening is None:
             live_count[0] += 1
             model = {"outer": live_count[0]}
@@ -110,6 +114,13 @@ def test_outer_refits_freeze_each_model_and_reset_inner_history(monkeypatch):
     assert [call[2]["reset_diagnostics"] for call in calls] == [
         True, False, False, False]
     assert [call[2]["snapshot_offset"] for call in calls] == [0, 1, 3, 4]
+    assert calls[0][3] is calls[1][3]
+    assert calls[2][3] is calls[3][3]
+    assert calls[0][3] is not calls[2][3]
+    assert calls[0][3] == {
+        "state_edge_padding_ev": 0.25,
+        "pole_extent_padding_fraction": 0.0,
+    }
 
 
 def test_two_level_refuses_a_pre_frozen_initial_input():
