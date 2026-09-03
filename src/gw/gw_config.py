@@ -1712,11 +1712,17 @@ _DEFAULTS = {
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
     # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
     # still honored as deprecated overrides.
+    # Two-level QSGW uses this as BOTH the outer W-refit cap and each
+    # frozen-screening inner solve's accelerator cap.  sc_max_iter=1 remains
+    # the historical one-map diagnostic, not a nested solve.
     "sc_max_iter": 20,
     "sc_tol_ev": 1.0e-4,
     "sc_accelerator": "rcrop",   # rcrop | linear
     "sc_history_depth": 5,       # rCROP history depth
-    "sc_mixing": 1.0,            # linear-mixing α (accelerator=linear only)
+    # Inner Picard damping when accelerator=linear, and outer-H damping
+    # between W refits for either accelerator.  The unmixed outer residual is
+    # the convergence test, so alpha cannot manufacture convergence.
+    "sc_mixing": 1.0,
     "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
     # Symmetric correction averaging is legal only for accidental/exact
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
@@ -4526,13 +4532,16 @@ class SCConfig:
     envs are still honored as deprecated overrides at config construction
     (``from_input_file`` prints a note when one is active).
 
-    - ``max_iter`` / ``tol_ev``: loop length and RMS-ΔE convergence (eV).
+    - ``max_iter`` / ``tol_ev``: ``max_iter`` bounds both outer W refits and
+      each frozen-screening inner solve; ``tol_ev`` is the L-infinity
+      protected-energy convergence cutoff at both levels (eV).
     - ``accelerator``: ``"rcrop"`` (Anderson-style restart-CROP, default —
       required for QSGW's typical 2-cycle Jacobian) or ``"linear"``
       (plain α-mixing, diagnostic).  rCROP makes TWO ``gw_iteration_map``
       calls per accelerator iteration (trial + residual).
     - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
-    - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
+    - ``mixing``: linear-mixing α for a linear inner solve and the outer-H
+      update between W refits.  Outer convergence is tested before mixing.
     - ``dump_dir``: per-iteration E/U-history .npy dump dir (None = off).
     - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
       accidental-degeneracy average.  The default is 0.1 meV; physical SOC
