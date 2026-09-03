@@ -230,7 +230,9 @@ def make_sigma_box_spec(
     }
 
 
-def _rule_cache_lookup(directory, box, eps, relative):
+def _rule_cache_lookup(
+    directory, box, eps, relative, *, noise_amplification_cap,
+):
     """Return the smallest cached rule certified on a containing box."""
     if directory is None:
         return None
@@ -245,6 +247,14 @@ def _rule_cache_lookup(directory, box, eps, relative):
             with np.load(os.path.join(directory, name)) as data:
                 if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
                         or bool(data["relative"]) != relative):
+                    continue
+                # Cache entries pre-dating the executor-noise stamp, or
+                # entries built for a looser consumer, are not compatible.
+                # A cache hit is an acceleration only; it must never hide a
+                # builder attempt that can satisfy the active Sigma gate.
+                if ("roundoff_amplification" not in data
+                        or float(data["roundoff_amplification"])
+                        > noise_amplification_cap):
                     continue
                 cached_box = tuple(float(value) for value in data["box"])
                 if not (cached_box[0] <= box[0]
@@ -339,15 +349,29 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    cached = _rule_cache_lookup(cache_dir, requested_box, eps, relative)
+    noise_budget = _RUNTIME_NOISE_SAFETY * eps
+    noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
+    cached = _rule_cache_lookup(
+        cache_dir, requested_box, eps, relative,
+        noise_amplification_cap=noise_amplification_cap)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
     else:
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None else requested_box)
-        rule = build_uniform_rule(
-            build_box, eps, time_budget=reduction_seconds)
+        build_kwargs = {"time_budget": reduction_seconds}
+        if relative:
+            # For a sign-definite rule the service's kappa is
+            # sum|term|/|Q|, while Sigma's noise amplification is
+            # |d|*sum|term|.  The certified relative sup error gives
+            # |d Q(d)| <= 1 + eps, so this cap is sufficient for the
+            # executor's stricter, eps-scaled noise condition.  Crossing
+            # rules use peak-relative term mass instead and retain the
+            # service's ordinary cancellation cap.
+            build_kwargs["kappa_cap"] = (
+                noise_amplification_cap / (1.0 + eps))
+        rule = build_uniform_rule(build_box, eps, **build_kwargs)
         cache_status = "miss" if cache_dir is not None else "off"
 
     if rule.sup_error > eps:
@@ -365,7 +389,6 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
     noise_amplification = rule_roundoff_amplification(
         rule.times, rule.weights, noise_cloud, noise_rho)
     noise_bound = noise_amplification * _RUNTIME_NOISE_EPSILON
-    noise_budget = _RUNTIME_NOISE_SAFETY * eps
     if noise_bound > noise_budget:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: runtime-noise "
