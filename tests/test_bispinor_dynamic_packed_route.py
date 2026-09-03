@@ -191,10 +191,11 @@ def test_dynamic_hall_gate_admits_trs_zero_and_names_broken_tr_refusal(
                               dtype=np.complex128)
 
     records = []
-    _gate_dynamic_hall_head(
+    record = _gate_dynamic_hall_head(
         cfg, trs_allowed=True, coupled_head=True,
         hall_transaction=object(),
         print_fn=lambda text, **kwargs: records.append(text))
+    assert record.startswith("EXACT ZERO")
     assert records == [
         "Faraday head : EXACT ZERO (SymMaps.trs_allowed=true; "
         "no Hall producer or consumer path taken)"]
@@ -240,6 +241,11 @@ def test_the_dispatch_asks_for_the_current_blocks_only():
     assert "blocks=PHOTON_BLOCKS_CURRENT" in source
     # and the scalar bare-X call in that branch must not fold Sigma^B twice
     assert "bispinor_v_q_path=None," in source
+
+    driver = (pathlib.Path(__file__).resolve().parents[1]
+              / "src" / "gw" / "gw_jax.py").read_text()
+    assert '"Faraday head   : "' in driver
+    assert "photon_response.faraday_head_record" in driver
 
 
 # ---------------------------------------------------------------------------

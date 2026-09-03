@@ -1915,12 +1915,13 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
+    faraday_head_record: str | None = None
 
 
 def _gate_dynamic_hall_head(
     config, *, trs_allowed, coupled_head: bool, hall_transaction,
     print_fn=print,
-) -> None:
+) -> str | None:
     """Admit the exact TRS zero or refuse the unowned dynamic Hall insertion.
 
     The Hall producer is frequency complete, but the packed Sigma route does
@@ -1933,23 +1934,25 @@ def _gate_dynamic_hall_head(
     from .gw_config import uses_dynamic_packed_photon_route
 
     if not uses_dynamic_packed_photon_route(config):
-        return
+        return None
     if not isinstance(trs_allowed, (bool, np.bool_)):
         raise ValueError(
             "GATE dynamic_hall_head_needs_measured_trs: the dynamic packed "
             "Hall boundary requires a boolean SymMaps.trs_allowed verdict")
     if not coupled_head:
+        record = (
+            "ABSENT (head_correction=off DEBUG skip; no Gamma-cell head is "
+            "applied)")
         if jax.process_index() == 0:
-            print_fn(
-                "WARNING Faraday head : ABSENT (head_correction=off DEBUG "
-                "skip; no Gamma-cell head is applied)", flush=True)
-        return
+            print_fn("WARNING Faraday head : " + record, flush=True)
+        return record
     if bool(trs_allowed):
+        record = (
+            "EXACT ZERO (SymMaps.trs_allowed=true; no Hall producer or "
+            "consumer path taken)")
         if jax.process_index() == 0:
-            print_fn(
-                "Faraday head : EXACT ZERO (SymMaps.trs_allowed=true; "
-                "no Hall producer or consumer path taken)", flush=True)
-        return
+            print_fn("Faraday head : " + record, flush=True)
+        return record
 
     omega_p = float(config.ppm.omega_p)
     probe = 1j * omega_p
@@ -2212,7 +2215,7 @@ def compute_static_photon_response(
             "  ==========================================================\n",
             flush=True)
 
-    _gate_dynamic_hall_head(
+    faraday_head_record = _gate_dynamic_hall_head(
         config, trs_allowed=trs_allowed, coupled_head=coupled_head,
         hall_transaction=hall, print_fn=print_fn)
 
@@ -2379,6 +2382,7 @@ def compute_static_photon_response(
             current_contact=current_contact,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
+            faraday_head_record=faraday_head_record,
             approximation=(
                 "gamma_completed_no_pair_static_photon_v1"
                 if coupled_head
@@ -2389,6 +2393,7 @@ def compute_static_photon_response(
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
+        faraday_head_record=faraday_head_record,
         approximation=(
             "gamma_completed_bare_transverse_photon_v1"
             if coupled_head

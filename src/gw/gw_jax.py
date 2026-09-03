@@ -849,6 +849,9 @@ def main(argv=None):
 						"q->0 head is the packed Gamma-cell completion's. "
 						"Sigma^B is the TT block of the packed operator, not "
 						"a separate term.")
+					report.progress(
+						"Faraday head   : "
+						f"{photon_response.faraday_head_record}")
 				else:
 					report.progress(
 						"Photon Sigma   : static packed route -- all sixteen "
