@@ -200,6 +200,60 @@ def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 
 
+def test_sign_definite_builder_receives_executor_noise_cap(monkeypatch):
+    calls = []
+
+    def conditioned(box, eps, **kwargs):
+        calls.append((tuple(box), dict(kwargs)))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", conditioned)
+    plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        eps=1.0e-4, reduction_seconds=120.0,
+        cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+    expected = (0.05 * 1.0e-4) / (6.0e-8 * (1.0 + 1.0e-4))
+    crossing = [kwargs for box, kwargs in calls if box[0] <= 0.0 <= box[1]]
+    sign_definite = [
+        kwargs for box, kwargs in calls if box[0] > 0.0 or box[1] < 0.0
+    ]
+    assert crossing and all("kappa_cap" not in kwargs for kwargs in crossing)
+    assert sign_definite and all(
+        kwargs["kappa_cap"] == pytest.approx(expected)
+        for kwargs in sign_definite)
+
+
+def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    args = dict(
+        eps=1.0e-4, reduction_seconds=120.0,
+        cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
+    plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+    paths = list(tmp_path.glob("*.npz"))
+    assert len(paths) == 3
+    for path in paths:
+        with np.load(path) as data:
+            payload = {name: np.asarray(data[name]) for name in data.files}
+        payload["roundoff_amplification"] = np.asarray(1.0e6)
+        np.savez(path, **payload)
+
+    calls = []
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    _plan, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+    assert len(calls) == 3
+    assert all(
+        row["cache_status"] == "miss"
+        for row in geometry["branches"][0]["windows"])
+
+
 def test_no_pair_ceiling(monkeypatch):
     # Owner ruling 2026-09-02: the plan reports its pair count, never refuses on it.
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
