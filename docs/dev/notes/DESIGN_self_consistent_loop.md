@@ -40,10 +40,11 @@ the owner picks one from the measurement and the other is deleted:
 function, Hermitian by construction:
 - P×P: ½[Σ_mn(ω_m) + Σ_mn(ω_n)] with (ω_m, ω_n) from the policy, Hermitized;
 - P×U and U×P: Σ_mn(E_F) — the U states rotate with the protected block;
-- U×U: zero off-diagonal; diagonal E^DFT_n + Δ;
-- Δ (the scissor): one number per iteration and spin, the mean over k and over the two
-  highest protected conduction bands of [Σ̃_nn − V_xc,nn]. No affine fit, no per-band
-  law. Its sensitivity is measured (§4), not tuned.
+- U×U: zero off-diagonal; diagonal E^DFT_n + Δ_k;
+- Δ_k (the scissor): at each k, the correction of the highest protected band,
+  [Σ̃_nn − V_xc,nn] at n = b3 - 1.  The U block is therefore continuous with P at
+  its boundary by construction.  There is no affine or per-outer-band fit; its
+  sensitivity is measured (§4), not tuned.
 
 **`QpHamiltonian`** — H_k = h0_k + Σ̃_k − V_xc,k in the DFT basis (the rotate-back seam as
 today), `eigh` → (E, U) ascending; the Fermi level as today (midgap for insulators,
@@ -76,9 +77,9 @@ produced by a single-ω evaluation at E_F (it is static in ω), which is cheap.
   the study arms, the shipped behaviour reverts to the literature method, `clamp`
   (mode A at the energies, edge-clamped), without a further ruling; both are reported.
 - Rules P×U at E_F and U×U scissor are the standard static outer block. Because P/U
-  is by index there is no reclassification; the only artifact is a mismatch between the
-  protected block's correction at its top and Δ, visible at the P/U boundary and
-  measured by the nb_P ladder (§4).
+  is by index there is no reclassification.  The local Δ_k removes the diagonal
+  correction mismatch at the P/U boundary; sensitivity to where that boundary is
+  placed remains measured by the nb_P ladder (§4).
 - Metals: classes by index, Fermi level from occupations, and the E_F-evaluated P×U
   block is the natural choice; nothing metal-specific is added.
 

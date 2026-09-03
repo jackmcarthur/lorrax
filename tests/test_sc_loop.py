@@ -140,17 +140,61 @@ def test_outer_law_and_hamiltonian_are_hermitian():
     np.testing.assert_allclose(
         hamiltonian[:, :4, 4:], 2.5 + 2.25j)
     np.testing.assert_allclose(hamiltonian[:, 4:, 4:], np.diag(
-        np.asarray(table.e_dft_kn_ry)[0, 4:] + diagnostics["delta_ry"])[None])
+        np.asarray(table.e_dft_kn_ry)[0, 4:]
+        + np.asarray(diagnostics["delta_ry"])[0])[None])
 
 
-def test_band_classes_ignore_padding_and_require_scissor_samples():
+def test_band_classes_ignore_padding_and_need_a_boundary_band():
     classes = _classes()
     assert classes.n_protected == 4
     assert classes.n_outer == 2
     assert classes.n_total == 6
-    with pytest.raises(ValueError, match="at least two protected conduction"):
+    one_boundary_band = BandClasses(
+        band_start=0, occupied_stop=0, protected_stop=1, outer_stop=6)
+    assert one_boundary_band.n_protected == 1
+    with pytest.raises(ValueError, match="at least one protected band"):
         BandClasses(
-            band_start=0, occupied_stop=3, protected_stop=4, outer_stop=6)
+            band_start=0, occupied_stop=0, protected_stop=0, outer_stop=6)
+
+
+def test_outer_scissor_is_highest_protected_correction_at_each_k():
+    """The P/U boundary correction is local in k, not a global mean."""
+    one = _table()
+    sigma_x = np.repeat(np.asarray(one.sigma_x_pp_kij_ry), 2, axis=0)
+    sigma_x[1, -1, -1] = 2.0
+    table = replace(
+        one,
+        sigma_c_pp_wkij_ry=np.repeat(
+            np.asarray(one.sigma_c_pp_wkij_ry), 2, axis=1),
+        sigma_x_pp_kij_ry=sigma_x,
+        v_h_pp_kij_ry=np.repeat(
+            np.asarray(one.v_h_pp_kij_ry), 2, axis=0),
+        sigma_xc_pu_fermi_kij_ry=np.repeat(
+            np.asarray(one.sigma_xc_pu_fermi_kij_ry), 2, axis=0),
+        v_h_pu_kij_ry=np.repeat(
+            np.asarray(one.v_h_pu_kij_ry), 2, axis=0),
+        kin_ion_qp_kij_ry=np.repeat(
+            np.asarray(one.kin_ion_qp_kij_ry), 2, axis=0),
+        dft_h_qp_kij_ry=np.repeat(
+            np.asarray(one.dft_h_qp_kij_ry), 2, axis=0),
+        e_dft_kn_ry=np.repeat(
+            np.asarray(one.e_dft_kn_ry), 2, axis=0),
+    )
+    energies = np.repeat(
+        np.array([[-0.5, 0.25, 0.75, 0.9, 4.0, 5.0]]), 2, axis=0)
+    sigma, diagnostics = effective_sigma(
+        table, _classes(), "clamp", energies, 0.0,
+        exact_degeneracy_tol_ev=1.0e-4)
+    hamiltonian = np.asarray(QpHamiltonian(
+        table.kin_ion_qp_kij_ry).build(sigma))
+    delta = np.asarray(diagnostics["delta_ry"])
+
+    np.testing.assert_allclose(delta[1] - delta[0], 2.0)
+    for k in range(2):
+        np.testing.assert_allclose(
+            np.diag(hamiltonian[k, 4:, 4:]),
+            np.asarray(table.e_dft_kn_ry)[k, 4:] + delta[k])
+    assert float(diagnostics["boundary_mismatch_ev"]) == 0.0
 
 
 def test_exact_qp_block_is_invariant_to_random_unitary_gauge():
