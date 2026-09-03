@@ -97,10 +97,16 @@ def validate_reused_mpa_fit(
 
     q_idx, tables, closure_verdict = _q_wedge(
         sym, centroid_indices, meta)
+    # The writer strips the process-mesh μ pad before stamping its table
+    # digest.  Validate in that same logical coordinate system: hashing the
+    # live padded table instead makes an artifact disagree with itself even
+    # on the producer's own mesh (2070 logical centroids hash differently
+    # from its P36 carrier extent 2088), and also makes reuse mesh-dependent.
+    logical_tables = tables.logical(int(meta.n_rmu)).canonical()
     ledger = mpa_store.validate_fit_store(
         path,
         expected_identity={
-            "w_table_hash": tables.canonical().digest(),
+            "w_table_hash": logical_tables.digest(),
             "w_centroid_hash": closure_verdict.centroid_hash,
         },
         expected_screening_diagrams=config.screening.diagrams,

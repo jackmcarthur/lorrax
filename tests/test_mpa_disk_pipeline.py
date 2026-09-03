@@ -66,6 +66,10 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
     calls = {}
 
     class _Tables:
+        def logical(self, n_mu):
+            calls["logical_n_mu"] = n_mu
+            return self
+
         def canonical(self):
             return self
 
@@ -115,6 +119,7 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
         "w_table_hash": "table-current",
         "w_centroid_hash": "centroids-current",
     }
+    assert calls["logical_n_mu"] == 5
     assert kwargs["expected_screening_diagrams"] == "w_rpa"
     assert calls["occupation"][0] == str(fit.resolve())
 

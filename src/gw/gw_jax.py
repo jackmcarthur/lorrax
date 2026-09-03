@@ -725,7 +725,13 @@ def main(argv=None):
 			oneshot_omegas = np.asarray(
 				[complex(r.omega_ry) for r in oneshot_head_requests],
 				dtype=np.complex128)
-		if oneshot_omegas.size:
+		# An explicit MPA fit is validate-or-refuse and already owns its
+		# finalized scalar head.  Keep the live plan above for authentication,
+		# but do not allocate a direct response the reuse branch must discard.
+		reused_mpa_fit_owns_head = (
+			mode is ComputeMode.MPA
+			and config.mpa.fit_reuse_file is not None)
+		if oneshot_omegas.size and not reused_mpa_fit_owns_head:
 			# ONE charge bundle: both shipped bispinor_gw values ride the
 			# raw kinetic-balance carrier, so the scalar q->0 head/wings are
 			# built on the run's own charge centroids.  The separate
@@ -739,6 +745,11 @@ def main(argv=None):
 				"  head_correction=full: built direct DFT response and "
 				"head/body wings on the chi0 transition manifold; finalizing "
 				"once against the resident W(Gamma).")
+		elif oneshot_omegas.size:
+			print0(
+				"  MPA fit reuse: deferring to the stored finalized full head; "
+				"skipped the redundant direct DFT head/body-wing allocation. "
+				"The live fit and sampling plan will still be authenticated.")
 	# SC solves W inside each map and persists only the final accepted map.
 	# Do not perform a redundant DFT screening solve here: besides its cost,
 	# that seed body used to survive long enough to be paired with a final head.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -90,6 +91,15 @@ def test_explicit_mpa_fit_reuse_path_resolves_beside_deck(tmp_path):
 def test_mpa_fit_reuse_refuses_a_non_mpa_mode(tmp_path):
     with pytest.raises(ValueError, match="mpa_fit_reuse_file.*compute_mode"):
         _config(tmp_path, "mpa_fit_reuse_file = poles.h5\n")
+
+
+def test_explicit_mpa_fit_reuse_gates_the_fresh_head_allocation():
+    source = (Path(__file__).parents[1] / "src/gw/gw_jax.py").read_text()
+    plan_start = source.index("oneshot_mpa_plan = None")
+    screening_start = source.index("# SC solves W inside each map", plan_start)
+    head_setup = source[plan_start:screening_start]
+    assert "config.mpa.fit_reuse_file is not None" in head_setup
+    assert "if oneshot_omegas.size and not reused_mpa_fit_owns_head" in head_setup
 
 
 @pytest.mark.parametrize(
