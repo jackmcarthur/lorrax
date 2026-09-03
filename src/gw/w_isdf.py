@@ -2222,12 +2222,42 @@ def _publish_faraday_fit_record(
     source = carrier if carrier is not None else failure
     payload.update({
         "fit_ladder": [
-            {"n_poles": int(n_poles), "max_sample_relative_error": float(error)}
-            for n_poles, error in zip(
+            {
+                "n_poles": int(n_poles),
+                "max_block_dense_relative_error": float(error),
+                "cc_dense_relative_error": (
+                    float(block[0]) if len(block) == 4 else None),
+                "ct_dense_relative_error": (
+                    float(block[1]) if len(block) == 4 else None),
+                "tc_dense_relative_error": (
+                    float(block[2]) if len(block) == 4 else None),
+                "tt_dense_relative_error": (
+                    float(block[3]) if len(block) == 4 else None),
+                "max_sample_relative_error": (
+                    float(max_sample) if max_sample is not None else None),
+                "causal": None if causal is None else bool(causal),
+            }
+            for n_poles, error, block, max_sample, causal in zip(
                 (carrier.fit_ladder_pole_counts if carrier is not None
                  else failure.pole_counts),
                 (carrier.fit_ladder_relative_errors if carrier is not None
-                 else failure.relative_errors), strict=True)],
+                 else failure.relative_errors),
+                (getattr(carrier, "fit_ladder_block_relative_errors", ())
+                 if carrier is not None
+                 else getattr(failure, "block_relative_errors", ()))
+                or ((),) * len(source.relative_errors if failure is not None
+                                   else carrier.fit_ladder_relative_errors),
+                (getattr(
+                    carrier, "fit_ladder_max_sample_relative_errors", ())
+                 if carrier is not None else getattr(
+                    failure, "max_sample_relative_errors", ()))
+                or (None,) * len(source.relative_errors if failure is not None
+                                     else carrier.fit_ladder_relative_errors),
+                (getattr(carrier, "fit_ladder_causal", ())
+                 if carrier is not None else getattr(failure, "causal", ()))
+                or (None,) * len(source.relative_errors if failure is not None
+                                     else carrier.fit_ladder_relative_errors),
+                strict=True)],
         "selected_n_poles": (
             int(carrier.selected_n_poles) if carrier is not None else None),
         "factor_gram_rank": int(source.gram_rank),

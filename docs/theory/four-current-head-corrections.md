@@ -752,8 +752,13 @@ materialisation. For rung `n_p`, the existing ordered MPA fitter consumes the
 bit-exact nested `2*n_p` subset and produces causal-sheet poles and paired
 residues `B_{r,p}`, `D_{r,p}` for every retained coordinate `r`. It is then
 scored against all 32 authenticated samples using the factor-Gram Frobenius
-norm. Production reports the complete `n_p=1…12` ladder and selects the first
-causal rung whose maximum sample-relative residual is at most `1e-4`.
+norm. The dense-contour residual is accumulated separately for the physical
+CC, CT, TC, and TT tensor sectors,
+`sqrt(sum_s ||delta F_s||^2 / sum_s ||F_s||^2)`, so a physical zero crossing
+cannot turn a bounded absolute miss into a divergent relative error. The
+maximum per-sample value remains a diagnostic, not the acceptance criterion.
+Production reports the complete `n_p=1…12` ladder and selects the first causal
+rung whose largest nonzero-sector dense-contour residual is at most `1e-4`.
 
 Each selected coordinate/pole pair is converted back into bounded CT/TC
 factor families. Both Sigma branches pass through
@@ -766,7 +771,8 @@ no new response kernel, and no per-band-pair stage.
 The run writes `faraday_head_fit.json` before entering Sigma. The record binds
 the Hall plan and producer provenance; lists `sigma_H`, `S`, both wings, and
 `W_00` norms at every sample; and records the factor-Gram rank and projection
-residual, the full 1…12 residual ladder, the selected pole terms, and
+residual, the per-CC/CT/TC/TT dense residuals plus maximum-sample diagnostic for
+the full 1…12 ladder, the selected pole terms, and
 `||D_H||/||B_H||`. If no rung passes, Sigma does not run. A high-order
 plateau refuses as `GATE dynamic_hall_head_nonpole_plateau`; a still-improving
 but inadequate ladder refuses as `GATE dynamic_hall_head_multipole_inadequate`.

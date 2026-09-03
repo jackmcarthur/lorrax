@@ -992,7 +992,7 @@ def test_dynamic_faraday_mpa_synthetic_ordered_closure(n_poles):
     samples = tuple(_scale_factor_family(base, amplitude)
                     for amplitude in amplitudes)
     fit = _fit_ordered_faraday_factor_samples(
-        samples, frequencies, mesh_xy=mesh,
+        samples, frequencies, mesh_xy=mesh, layout=fixture.layout,
         print_fn=lambda _message: None)
     assert fit["selected_n_poles"] == n_poles
     assert fit["fit_relative_error"] <= 1.0e-8
@@ -1000,7 +1000,8 @@ def test_dynamic_faraday_mpa_synthetic_ordered_closure(n_poles):
 
     minus = _fit_ordered_faraday_factor_samples(
         tuple(_scale_factor_family(sample, -1.0) for sample in samples),
-        frequencies, mesh_xy=mesh, print_fn=lambda _message: None)
+        frequencies, mesh_xy=mesh, layout=fixture.layout,
+        print_fn=lambda _message: None)
     assert minus["selected_n_poles"] == n_poles
     np.testing.assert_allclose(
         minus["fit_ladder_relative_errors"],
@@ -1029,7 +1030,7 @@ def test_dynamic_faraday_dense_oracle_reports_full_ladder():
                     for amplitude in amplitudes)
 
     fit = _fit_ordered_faraday_factor_samples(
-        samples, frequencies, mesh_xy=mesh,
+        samples, frequencies, mesh_xy=mesh, layout=fixture.layout,
         print_fn=lambda _message: None)
 
     assert fit["fit_ladder_pole_counts"] == tuple(range(1, 13))

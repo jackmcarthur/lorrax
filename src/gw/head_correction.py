@@ -1209,6 +1209,9 @@ class DynamicHallHeadFitError(NotImplementedError):
         relative_errors,
         gram_rank: int,
         gram_projection_relative_error: float,
+        max_sample_relative_errors=(),
+        block_relative_errors=(),
+        causal=(),
     ) -> None:
         super().__init__(message)
         self.gate = str(gate)
@@ -1218,6 +1221,12 @@ class DynamicHallHeadFitError(NotImplementedError):
         self.gram_rank = int(gram_rank)
         self.gram_projection_relative_error = float(
             gram_projection_relative_error)
+        self.max_sample_relative_errors = tuple(
+            float(value) for value in max_sample_relative_errors)
+        self.block_relative_errors = tuple(
+            tuple(float(value) for value in row)
+            for row in block_relative_errors)
+        self.causal = tuple(bool(value) for value in causal)
 
 
 @dataclass(frozen=True)
@@ -1248,6 +1257,9 @@ class FaradayHeadPPMFactorCarrier:
     fit_relative_error: float
     odd_even_residue_ratio: float
     gram_projection_relative_error: float
+    fit_ladder_max_sample_relative_errors: tuple[float, ...] = ()
+    fit_ladder_block_relative_errors: tuple[tuple[float, ...], ...] = ()
+    fit_ladder_causal: tuple[bool, ...] = ()
 
     def __post_init__(self) -> None:
         n_terms = len(self.pole_frequencies_ry)
@@ -1266,6 +1278,15 @@ class FaradayHeadPPMFactorCarrier:
                 not in tuple(self.fit_ladder_pole_counts)):
             raise ValueError(
                 "Faraday head fit ladder metadata is inconsistent")
+        optional_ladders = (
+            self.fit_ladder_max_sample_relative_errors,
+            self.fit_ladder_block_relative_errors,
+            self.fit_ladder_causal,
+        )
+        if any(value and len(value) != len(self.fit_ladder_pole_counts)
+               for value in optional_ladders):
+            raise ValueError(
+                "Faraday head optional fit ladders have inconsistent size")
         if len(self.sample_pairs) != len(self.sample_frequencies_ry):
             raise ValueError("Faraday head sample factors/frequencies differ")
         sigma = np.asarray(self.sigma_H_frequency)
@@ -2258,10 +2279,14 @@ def _factor_family_gram_matrix(first_families, second_families):
     second = tuple(tuple(family) for family in second_families)
     if not first or not second:
         raise ValueError("factor-family Gram requires nonempty operands")
-    n_pairs = len(first[0])
-    if (n_pairs == 0 or any(len(family) != n_pairs for family in first)
-            or any(len(family) != n_pairs for family in second)):
-        raise ValueError("factor-family Gram operands differ in factor count")
+    n_pairs_first = len(first[0])
+    n_pairs_second = len(second[0])
+    if (n_pairs_first == 0 or n_pairs_second == 0
+            or any(len(family) != n_pairs_first for family in first)
+            or any(len(family) != n_pairs_second for family in second)):
+        raise ValueError(
+            "each side of a factor-family Gram must have a stable nonzero "
+            "factor count")
     left_first = jnp.stack(tuple(jnp.stack(tuple(
         pair[0] for pair in family)) for family in first))
     right_first = jnp.stack(tuple(jnp.stack(tuple(
@@ -2281,9 +2306,36 @@ def _factor_family_gram_matrix(first_families, second_families):
 
 
 def _scale_factor_family(pairs, scale):
-    """Scale a low-rank operator without changing either factor layout."""
+    """Scale a structural Faraday factor family without raising its rank."""
     value = jnp.asarray(scale, dtype=jnp.complex128)
-    return tuple((value * left, right) for left, right in tuple(pairs))
+    family = tuple(pairs)
+    # Two-term samples are (CT,TC): CT has a shared right factor and TC a
+    # shared left factor. Four-term Hermitian coordinates append
+    # (CT^dagger,TC^dagger), giving shared-left terms (1,2) and shared-right
+    # terms (0,3). Keep those invariants explicit so the rank-four linear
+    # combination below is the represented operator, not a gauge guess.
+    if len(family) == 2:
+        scale_left = (True, False)
+    elif len(family) == 4:
+        scale_left = (True, False, False, True)
+    else:
+        scale_left = (True,) * len(family)
+    return tuple(
+        (value * left, right) if on_left else (left, value * right)
+        for (left, right), on_left in zip(
+            family, scale_left, strict=True))
+
+
+def _ordered_hermitian_factor_family(sample, adjoint, sign):
+    """Return ``(sample + sign*sample^dagger)/2`` in canonical order."""
+    half = jnp.asarray(0.5, dtype=jnp.complex128)
+    signed_half = jnp.asarray(0.5 * sign, dtype=jnp.complex128)
+    return (
+        (half * sample[0][0], sample[0][1]),
+        (sample[1][0], half * sample[1][1]),
+        (adjoint[0][0], signed_half * adjoint[0][1]),
+        (signed_half * adjoint[1][0], adjoint[1][1]),
+    )
 
 
 def _adjoint_factor_family(pairs, mesh_xy: Mesh):
@@ -2337,6 +2389,44 @@ def _linear_combination_faraday_samples(sample_families, coefficients):
                 for value, pair in zip(coeff, pairs, strict=True))
         result.append((left, right))
     return tuple(result)
+
+
+def _packed_channel_mask(layout, channels):
+    """Return one global mask for mesh-interleaved packed channels."""
+    selected = frozenset(int(channel) for channel in channels)
+    side = int(layout.mesh_side)
+    local_extent = int(layout.packed_extent) // side
+    mask = np.zeros((int(layout.packed_extent),), dtype=np.float64)
+    for shard in range(side):
+        base = shard * local_extent
+        for channel in selected:
+            offset = int(layout.local_offset(channel))
+            size = int(layout.padded_extent(channel)) // side
+            mask[base + offset:base + offset + size] = 1.0
+    return mask
+
+
+def _mask_factor_families_block(
+    families, layout, mesh_xy: Mesh, *, left_channels, right_channels,
+):
+    """Mask bounded factor families to one Lorentz tensor sector."""
+    left_mask = jax.device_put(
+        _packed_channel_mask(layout, left_channels),
+        NamedSharding(mesh_xy, P("x")))
+    right_mask = jax.device_put(
+        _packed_channel_mask(layout, right_channels),
+        NamedSharding(mesh_xy, P("y")))
+    sh_x = NamedSharding(mesh_xy, P(None, "x"))
+    sh_y = NamedSharding(mesh_xy, P(None, "y"))
+    with mesh_xy:
+        result = tuple(tuple((
+            jax.lax.with_sharding_constraint(
+                left * left_mask[None, :], sh_x),
+            jax.lax.with_sharding_constraint(
+                right * right_mask[None, :], sh_y),
+        ) for left, right in family) for family in families)
+    jax.block_until_ready(result)
+    return result
 
 
 def _faraday_hermitian_coordinate_basis(
@@ -2442,6 +2532,7 @@ def _fit_ordered_faraday_factor_samples(
     sample_frequencies,
     *,
     mesh_xy: Mesh,
+    layout=None,
     sampling_alpha: int = 1,
     sampling_schedule: str = "nested",
     adequacy_tolerance: float = 1.0e-4,
@@ -2455,7 +2546,8 @@ def _fit_ordered_faraday_factor_samples(
     including its ordered ``B``/``D`` split and causal guards.  Rung ``n`` is
     fitted on the nested ``2*n``-sample support and scored against every
     supplied sample.  The full ladder through 12 is reported, and its first
-    maximum relative residual no larger than ``adequacy_tolerance`` is used.
+    largest physical-block dense-contour residual no larger than
+    ``adequacy_tolerance`` is used.
     """
     from .mpa.pade_fit import eval_mpa_model, fit_mpa_poles_batched
     from .mpa.sample_plan import faraday_imaginary_plan, plan_z
@@ -2487,12 +2579,10 @@ def _fit_ordered_faraday_factor_samples(
     adjoints = tuple(
         _adjoint_factor_family(sample, mesh_xy) for sample in samples)
     hermitian = tuple(
-        _scale_factor_family(sample, 0.5)
-        + _scale_factor_family(adjoint, 0.5)
+        _ordered_hermitian_factor_family(sample, adjoint, +1.0)
         for sample, adjoint in zip(samples, adjoints, strict=True))
     antihermitian = tuple(
-        _scale_factor_family(sample, 0.5)
-        + _scale_factor_family(adjoint, -0.5)
+        _ordered_hermitian_factor_family(sample, adjoint, -1.0)
         for sample, adjoint in zip(samples, adjoints, strict=True))
     static_norm, static_anti_norm = (
         complex(value) for value in jax.device_get((
@@ -2514,7 +2604,63 @@ def _fit_ordered_faraday_factor_samples(
     sample_gram = np.asarray(jax.device_get(
         _factor_family_gram_matrix(samples, samples)), dtype=np.complex128)
     sample_norms = np.real(np.diag(sample_gram))
+    if layout is None:
+        raise ValueError(
+            "ordered Faraday MPA fit needs the owning packed photon layout")
+    layout.assert_mesh(mesh_xy)
+    sectors = (
+        ((0,), (0,)),
+        ((0,), (1, 2, 3)),
+        ((1, 2, 3), (0,)),
+        ((1, 2, 3), (1, 2, 3)),
+    )
+    # Mask the bounded factors themselves to CC/CT/TC/TT.  Packed storage is
+    # mesh-interleaved, so pair position is not a block label.  The small
+    # masked Grams provide physical per-sector residuals without a dense
+    # centroid-square block.
+    basis_by_block = tuple(
+        _mask_factor_families_block(
+            basis, layout, mesh_xy, left_channels=left,
+            right_channels=right)
+        for left, right in sectors)
+    samples_by_block = tuple(
+        _mask_factor_families_block(
+            samples, layout, mesh_xy, left_channels=left,
+            right_channels=right)
+        for left, right in sectors)
+    block_grams = tuple(tuple(np.asarray(value, dtype=np.complex128)
+        for value in jax.device_get((
+            _factor_family_gram_matrix(block_basis, block_basis),
+            _factor_family_gram_matrix(block_basis, block_samples),
+            _factor_family_gram_matrix(block_samples, block_samples),
+        ))) for block_basis, block_samples in zip(
+            basis_by_block, samples_by_block, strict=True))
+
+    def _dense_block_residual(model_coordinates, grams):
+        basis_gram, cross_gram, target_gram = grams
+        model_norm = np.einsum(
+            "ir,rs,is->i", np.conj(model_coordinates), basis_gram,
+            model_coordinates, optimize=True)
+        cross = np.einsum(
+            "ir,ri->i", np.conj(model_coordinates), cross_gram,
+            optimize=True)
+        target_norm = np.maximum(np.real(np.diag(target_gram)), 0.0)
+        error_sq = np.maximum(
+            np.real(model_norm - 2.0 * cross) + target_norm, 0.0)
+        cancellation_floor = 64.0 * np.finfo(np.float64).eps * (
+            np.abs(model_norm) + 2.0 * np.abs(cross) + target_norm)
+        error_sq = np.where(
+            error_sq <= cancellation_floor, 0.0, error_sq)
+        dense = float(np.sqrt(
+            np.sum(error_sq) / max(np.sum(target_norm), 1.0e-300)))
+        maximum = float(np.max(np.sqrt(
+            error_sq / np.maximum(target_norm, 1.0e-300))))
+        return dense, maximum
+
     ladder = []
+    ladder_max_sample = []
+    ladder_blocks = []
+    ladder_causal = []
     ladder_counts = []
     selected = None
     max_fit_poles = min(max_sample_poles, 12)
@@ -2555,18 +2701,29 @@ def _fit_ordered_faraday_factor_samples(
             coordinate_error_sq + even_orthogonal_sq + odd_orthogonal_sq)
         relative_by_sample = np.sqrt(
             error_sq / np.maximum(sample_norms, 1.0e-300))
-        residual = float(np.max(relative_by_sample))
-        ladder.append(residual)
-        ladder_counts.append(n_poles)
+        max_sample_residual = float(np.max(relative_by_sample))
+        block_metrics = tuple(
+            _dense_block_residual(model_coordinates, grams)
+            for grams in block_grams)
+        block_residuals = tuple(value[0] for value in block_metrics)
+        block_max_samples = tuple(value[1] for value in block_metrics)
+        residual = float(max(block_residuals))
         causal = (
             np.all(np.real(omega_host[valid_host]) > 0.0)
             and np.all(np.imag(omega_host[valid_host])
                        <= 1.0e-12 * np.abs(omega_host[valid_host])))
+        ladder.append(residual)
+        ladder_max_sample.append(max_sample_residual)
+        ladder_blocks.append(block_residuals)
+        ladder_causal.append(bool(causal))
+        ladder_counts.append(n_poles)
         if jax.process_index() == 0:
             print_fn(
                 "  [photon head] Faraday MPA ladder: "
                 f"n_p={n_poles}; gram_rank={len(basis)}; "
-                f"max-sample residual={residual:.17e}; "
+                f"dense CC/CT/TC/TT residuals={list(block_residuals)}; "
+                f"max-sample residual={max_sample_residual:.17e}; "
+                f"block max-sample residuals={list(block_max_samples)}; "
                 f"valid={int(np.sum(valid_host))}/{valid_host.size}; "
                 f"causal={bool(causal)}")
         if (selected is None and residual <= float(adequacy_tolerance)
@@ -2585,8 +2742,11 @@ def _fit_ordered_faraday_factor_samples(
             "dynamic_hall_head_multipole_inadequate")
         message = (
             f"GATE {gate}:\n"
-            f"  got:  ordered Faraday n_p=1..{max_fit_poles} maximum-sample "
-            f"residuals = {ladder}, all above {adequacy_tolerance:.1e} or "
+            f"  got:  ordered Faraday n_p=1..{max_fit_poles} maximum "
+            f"CC/CT/TC/TT dense-contour residuals = {ladder}; per-block "
+            f"(CC,CT,TC,TT) = "
+            f"{ladder_blocks}; max-sample = {ladder_max_sample}; all above "
+            f"{adequacy_tolerance:.1e} or "
             "with a noncausal guarded pole\n"
             "  want: the minimal causal even-in-z MPA model whose dense "
             "imaginary-contour residual is <= 1e-4\n"
@@ -2602,7 +2762,10 @@ def _fit_ordered_faraday_factor_samples(
             pole_counts=ladder_counts,
             relative_errors=ladder,
             gram_rank=len(basis),
-            gram_projection_relative_error=projection_error)
+            gram_projection_relative_error=projection_error,
+            max_sample_relative_errors=ladder_max_sample,
+            block_relative_errors=ladder_blocks,
+            causal=ladder_causal)
 
     n_poles, omega_host, B_host, D_host, valid_host = selected
     poles = []
@@ -2643,6 +2806,11 @@ def _fit_ordered_faraday_factor_samples(
         "D_pole_pairs": tuple(D_families),
         "fit_ladder_pole_counts": tuple(ladder_counts),
         "fit_ladder_relative_errors": tuple(float(value) for value in ladder),
+        "fit_ladder_max_sample_relative_errors": tuple(
+            float(value) for value in ladder_max_sample),
+        "fit_ladder_block_relative_errors": tuple(
+            tuple(float(value) for value in row) for row in ladder_blocks),
+        "fit_ladder_causal": tuple(bool(value) for value in ladder_causal),
         "fit_relative_error": float(ladder[n_poles - 1]),
         "odd_even_residue_ratio": odd_even_ratio,
         "gram_projection_relative_error": float(projection_error),
@@ -2716,6 +2884,7 @@ def fit_dynamic_photon_cttc_q0(
                         for response in responses)
     fit = _fit_ordered_faraday_factor_samples(
         sample_pairs, frequencies, mesh_xy=mesh_xy,
+        layout=responses[0].layout,
         sampling_alpha=sampling_alpha,
         sampling_schedule=sampling_schedule, print_fn=print_fn)
     return FaradayHeadPPMFactorCarrier(
