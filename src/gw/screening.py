@@ -35,6 +35,7 @@ from typing import Callable
 
 import numpy as np
 import jax
+import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import collectives, jax_profile
@@ -399,7 +400,13 @@ def compute_static_w(
                     chi0_q.block_until_ready()
             if gamma_chi_override is not None:
                 gamma = jnp.asarray(gamma_chi_override)
-                expected = (1, int(meta.n_rmu), int(meta.n_rmu))
+                # The fractional-Gamma producer returns the same canonical
+                # product-padded carrier as chi0_q.  ``meta.n_rmu`` is the
+                # logical prefix and is deliberately smaller on geometries
+                # such as P=36 Bi (2070 -> 2088), so validating against it
+                # rejects the correct producer and would make the following
+                # sharded update shape-incompatible.
+                expected = (1,) + tuple(int(n) for n in chi0_q.shape[-2:])
                 if tuple(gamma.shape) != expected:
                     raise ValueError(
                         "Gamma chi override must have shape "
