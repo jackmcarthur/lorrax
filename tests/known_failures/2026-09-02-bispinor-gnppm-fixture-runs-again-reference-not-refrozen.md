@@ -162,10 +162,12 @@ GN probe and `Re Omega^2` changes postdate `837ed531`, and this run reports
 algebraically equal when the ordered orientation is related by TRS, but its
 exact fixture contribution remains inside the unprobed interval.  The
 unresolved `sigC` move is confined to that ABI-blocked scalar-charge
-screening/zeta interval, which includes the legitimate TRS-coherent q-grid
-reconstruction `07071457` and later charge-zeta/face work.  No per-commit
-number is assigned to any candidate in that interval: doing so would be a
-guess.
+q-grid/screening interval, which includes the legitimate TRS-coherent q-grid
+reconstruction `07071457`.  The low-memory face-layout zeta changes are not
+active because this deck leaves `low_mem_bands` at its false default; the
+face-wing fixes are separately excluded by the head-off/zero-head inputs.
+No per-commit number is assigned to a remaining candidate in the interval:
+doing so would be a guess.
 
 This follow-up still does **not** authorize a re-freeze.  A literal incumbent
 tip copy would be:
