@@ -2732,13 +2732,15 @@ def _fit_ordered_faraday_factor_samples(
                 n_poles, omega_host, B_host, D_host, valid_host)
 
     if selected is None:
+        high_order_plateau = (
+            max_fit_poles >= 12
+            and min(ladder[-3:]) > 1.0e-3
+            and min(ladder[-2:]) >= 0.8 * ladder[-3])
         gate = (
             "dynamic_hall_head_unimplemented_second_even_pole"
             if max_fit_poles == 1 else
             "dynamic_hall_head_nonpole_plateau"
-            if (max_fit_poles >= 8 and ladder[-1] > adequacy_tolerance
-                and min(ladder[-4:]) > 1.0e-3
-                and min(ladder[-4:]) >= 0.8 * min(ladder[-8:-4])) else
+            if high_order_plateau else
             "dynamic_hall_head_multipole_inadequate")
         message = (
             f"GATE {gate}:\n"
