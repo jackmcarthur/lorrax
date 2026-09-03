@@ -449,6 +449,35 @@ def test_ordered_fit_is_the_incumbent_fit_on_a_hermitian_probe():
     np.testing.assert_allclose(B_o, B_i, rtol=0, atol=1.0e-13 * np.max(np.abs(B_i)))
 
 
+def test_faraday_ct_family_has_exact_zero_ordered_residue_and_sigct_odd():
+    """Negative control for the refused production-minus-D=0 diagnostic.
+
+    A Hall CT/TC head is magnetisation-odd but frequency-even.  Its
+    imaginary-axis sample is therefore Hermitian, so the ordered GN split
+    has ``D=0`` and a ``sigCT_odd`` defined by subtracting a D=0 twin is
+    identically blind to the Hall term.
+    """
+    omega = np.full((1, 4, 4), 1.7, dtype=np.float64)
+    residue = np.zeros((1, 4, 4), dtype=np.complex128)
+    ct = np.asarray((0.2j, -0.35j, 0.11j))
+    residue[0, 0, 1:] = ct
+    residue[0, 1:, 0] = np.conj(ct)
+    Wc0 = -2.0 * residue / omega
+    Wcp = -2.0 * residue * omega / (OMEGA_P ** 2 + omega ** 2)
+    np.testing.assert_array_equal(Wcp, _adj(Wcp))
+
+    _om, B, D, _good = _fit(Wc0, Wcp, ordered=True)
+    np.testing.assert_array_equal(D, np.zeros_like(D))
+    production = _residue_for_space("cond", B, D)
+    d_zero_twin = _residue_for_space("cond", B, np.zeros_like(D))
+    np.testing.assert_array_equal(production - d_zero_twin, 0.0)
+
+    Wcp_hermitized = 0.5 * (Wcp + _adj(Wcp))
+    _om_h, B_h, D_h, _good_h = _fit(Wc0, Wcp_hermitized, ordered=True)
+    np.testing.assert_array_equal(D_h, np.zeros_like(D_h))
+    np.testing.assert_array_equal(B_h, B)
+
+
 def test_debug_odd_residue_off_reproduces_even_only_residues_and_refuses_trs(
         monkeypatch):
     """The debug A/B arm keeps ordered B but makes D=0, and is magnet-only."""

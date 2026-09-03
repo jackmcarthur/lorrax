@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pathlib
 
+import numpy as np
 import pytest
 
 
@@ -172,6 +173,44 @@ def test_unnamed_solver_is_derived_for_the_dynamic_packed_route(tmp_path):
     assert uses_dynamic_packed_photon_route(cfg)
     assert any("packed_static_envelope" in line
                and "w_dyson_solver was not named" in line for line in lines)
+
+
+def test_dynamic_hall_gate_admits_trs_zero_and_names_broken_tr_refusal(
+        tmp_path):
+    """The dynamic route is never silent about the Faraday Gamma head."""
+    from gw.w_isdf import _gate_dynamic_hall_head
+
+    cfg = _config(
+        tmp_path, _PACKED_BARE + _PPM_KEYS + "compute_mode = gn_ppm\n",
+        name="gnppm_faraday_gate.in")
+
+    class _Hall:
+        def sigma_H_at(self, frequency):
+            assert frequency == 2.0j
+            return np.asarray((1.0e-6, -2.0e-6, 3.0e-6),
+                              dtype=np.complex128)
+
+    records = []
+    _gate_dynamic_hall_head(
+        cfg, trs_allowed=True, coupled_head=True,
+        hall_transaction=object(),
+        print_fn=lambda text, **kwargs: records.append(text))
+    assert records == [
+        "Faraday head : EXACT ZERO (SymMaps.trs_allowed=true; "
+        "no Hall producer or consumer path taken)"]
+
+    records.clear()
+    with pytest.raises(
+            NotImplementedError,
+            match="dynamic_hall_head_unimplemented_sigma_consumer") as exc:
+        _gate_dynamic_hall_head(
+            cfg, trs_allowed=False, coupled_head=True,
+            hall_transaction=_Hall(),
+            print_fn=lambda text, **kwargs: records.append(text))
+    message = str(exc.value)
+    assert "3.00000000000000008e-06 bohr^-1" in message
+    assert "production-minus-D=0 sigCT_odd is identically zero" in message
+    assert records and records[0].startswith("WARNING Faraday head : ABSENT")
 
 
 # ---------------------------------------------------------------------------

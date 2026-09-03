@@ -1917,6 +1917,72 @@ class StaticPhotonResponse:
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
 
 
+def _gate_dynamic_hall_head(
+    config, *, trs_allowed, coupled_head: bool, hall_transaction,
+    print_fn=print,
+) -> None:
+    """Admit the exact TRS zero or refuse the unowned dynamic Hall insertion.
+
+    The Hall producer is frequency complete, but the packed Sigma route does
+    not yet own the probe-frequency rank-four completion.  This gate runs
+    before the packed body is opened.  It is deliberately separate from the
+    static Hall loader: authentication remains the loader's job, while this
+    function owns the dynamic-route capability verdict and its run-record
+    line.
+    """
+    from .gw_config import uses_dynamic_packed_photon_route
+
+    if not uses_dynamic_packed_photon_route(config):
+        return
+    if not isinstance(trs_allowed, (bool, np.bool_)):
+        raise ValueError(
+            "GATE dynamic_hall_head_needs_measured_trs: the dynamic packed "
+            "Hall boundary requires a boolean SymMaps.trs_allowed verdict")
+    if not coupled_head:
+        if jax.process_index() == 0:
+            print_fn(
+                "WARNING Faraday head : ABSENT (head_correction=off DEBUG "
+                "skip; no Gamma-cell head is applied)", flush=True)
+        return
+    if bool(trs_allowed):
+        if jax.process_index() == 0:
+            print_fn(
+                "Faraday head : EXACT ZERO (SymMaps.trs_allowed=true; "
+                "no Hall producer or consumer path taken)", flush=True)
+        return
+
+    omega_p = float(config.ppm.omega_p)
+    probe = 1j * omega_p
+    if hall_transaction is None:
+        magnitude = "unmeasured (no authenticated Hall artifact)"
+        sample_text = "static_gauge_hall_file is unnamed"
+    else:
+        sample = np.asarray(
+            jax.device_get(hall_transaction.sigma_H_at(probe)),
+            dtype=np.complex128)
+        magnitude_value = float(np.max(np.abs(sample)))
+        magnitude = f"{magnitude_value:.17e} bohr^-1"
+        sample_text = f"sigma_H({probe!r})={sample.tolist()} bohr^-1"
+    message = (
+        "GATE dynamic_hall_head_unimplemented_sigma_consumer: measured-broken-"
+        "TR dynamic packed screening has a finite-frequency Hall sample but "
+        "no owned rank-four Sigma insertion.\n"
+        f"  got:  SymMaps.trs_allowed=false; {sample_text}; "
+        f"max|sigma_H(i*omega_p)|={magnitude}\n"
+        "  want: one bounded probe-frequency CT/TC completion and a named "
+        "Hall-on/off Sigma diagnostic\n"
+        "  why:  sigma_H(z) is frequency-even, so the requested production-"
+        "minus-D=0 sigCT_odd is identically zero; additionally retaining a "
+        "second full packed body violates the current memory envelope\n"
+        "  fix:   derive a streamed low-rank completion carrier and name the "
+        "magnetisation-odd Hall-on/off observable before enabling this route\n"
+        "  doc:   docs/theory/four-current-head-corrections.md, Dynamic "
+        "Hall/Faraday Gamma head")
+    if jax.process_index() == 0:
+        print_fn("WARNING Faraday head : ABSENT; " + message, flush=True)
+    raise NotImplementedError(message)
+
+
 def _load_static_photon_hall(
     config, meta, mesh_xy, wfn, wfn_fingerprint_binding, *,
     screen_current: bool, print_fn=print,
@@ -1989,6 +2055,7 @@ def compute_static_photon_response(
     wf_binding_charge=None,
     wf_binding_transverse=None,
     wfn_fingerprint_binding=None,
+    trs_allowed=None,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
     dyson_solver: str = "distributed",
@@ -2144,6 +2211,10 @@ def compute_static_photon_response(
             "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
             "  ==========================================================\n",
             flush=True)
+
+    _gate_dynamic_hall_head(
+        config, trs_allowed=trs_allowed, coupled_head=coupled_head,
+        hall_transaction=hall, print_fn=print_fn)
 
     with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
         if int(reader.n_q_total) != int(meta.nk_tot):

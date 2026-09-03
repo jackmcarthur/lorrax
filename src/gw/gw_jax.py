@@ -800,6 +800,7 @@ def main(argv=None):
 					wf_binding_charge=isdf.wf_binding_charge,
 					wf_binding_transverse=isdf.wf_binding_transverse,
 					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+					trs_allowed=sym.trs_allowed,
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
