@@ -12,8 +12,8 @@ those representations, and everything that must know the packed ordering:
   (local ``shard_map`` slices, no redistribution);
 * :func:`pack_photon_channel_vectors` -- pack four per-channel row vectors
   (the literal ``G = 0`` vectors ``g0``, the head wings) into one packed row;
-* :func:`add_photon_q0_low_rank` -- the bounded rank-4 update
-  ``O[q=0] += L R`` by which ``gw.head_correction.complete_static_slab_photon_q0``
+* :func:`add_photon_q0_low_rank` -- the bounded factor update
+  ``O[q=0] += L R`` by which ``gw.head_correction.complete_static_photon_q0``
   inserts the bare ``<D>`` and the nine screened Gamma-cell moments; and
 * :func:`photon_q0_low_rank_block` -- its diagnostic twin that materializes
   one ``(A,B)`` block of those updates alone, so ``gw.photon_sigma`` can
@@ -51,7 +51,6 @@ from runtime.padding import padded_mu_extent
 N_LORENTZ = 4
 CHARGE = 0
 TRANSVERSE = (1, 2, 3)
-MAX_Q0_UPDATE_RANK = 4
 PHOTON_BASIS_ORDERING = "mesh_interleaved_direct_sum_v1"
 PHOTON_BARE_PROPAGATOR = "instantaneous_coulomb_gauge_v1"
 
@@ -126,6 +125,14 @@ class PhotonBasisLayout:
                     channel_right: int) -> tuple[int, int, int]:
         return (int(nq), self.padded_extent(channel_left),
                 self.padded_extent(channel_right))
+
+    def q0_basis_size(self, dimension: int) -> int:
+        """Number of ``(1,q_1,...,q_dimension)`` completion rows."""
+        dim = int(dimension)
+        if dim not in (2, 3):
+            raise ValueError(
+                f"photon q=0 basis dimension must be 2 or 3; got {dimension}")
+        return 1 + dim
 
     def assert_mesh(self, mesh_xy: Mesh) -> None:
         px = int(mesh_xy.shape['x'])
@@ -462,13 +469,13 @@ def pack_photon_channel_vectors(
             *vectors_by_channel, logical)
 
 
-def _q0_local_factor_piece(rows, *, axis_name, local_extent, local_offset,
-                           logical_extent):
+def _q0_local_factor_piece(rows, *, factor_rank, axis_name, local_extent,
+                           local_offset, logical_extent):
     """Canonical local slice + padding mask for one q=0 factor channel."""
     local_offset = jnp.asarray(local_offset, dtype=jnp.int32)
     zero = jnp.asarray(0, dtype=jnp.int32)
     piece = jax.lax.dynamic_slice(
-        rows, (zero, local_offset), (MAX_Q0_UPDATE_RANK, local_extent))
+        rows, (zero, local_offset), (int(factor_rank), local_extent))
     valid = (
         jax.lax.axis_index(axis_name) * local_extent
         + jnp.arange(local_extent) < logical_extent)
@@ -481,10 +488,14 @@ def _q0_local_outer(left_rows, right_rows):
 
 
 def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
-    factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
-    if tuple(left.shape) != factor_shape or tuple(right.shape) != factor_shape:
+    if (getattr(left, "ndim", None) != 2
+            or getattr(right, "ndim", None) != 2
+            or tuple(left.shape) != tuple(right.shape)
+            or int(left.shape[0]) < 1
+            or int(left.shape[1]) != layout.packed_extent):
         raise ValueError(
-            f"{label} q=0 factor pair must have two {factor_shape} arrays; "
+            f"{label} q=0 factor pair must have equal nonempty "
+            f"(rank,{layout.packed_extent}) arrays; "
             f"got {left.shape}/{right.shape}")
     if (np.dtype(left.dtype) != np.dtype(dtype)
             or np.dtype(right.dtype) != np.dtype(dtype)):
@@ -502,12 +513,13 @@ def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
             raise ValueError(
                 f"{label} {name} must already have sharding {spec}; got "
                 f"{sharding}. Refusing an implicit factor reshard.")
+    return int(left.shape[0])
 
 
-def _q0_update_program(layout, mesh_xy, nq, dtype):
+def _q0_update_program(layout, mesh_xy, nq, dtype, factor_rank):
     """One shape-stable local graph per padded q=0 update geometry."""
     key = (id(mesh_xy), tuple(layout.padded_extents), int(nq),
-           np.dtype(dtype).str)
+           np.dtype(dtype).str, int(factor_rank))
     if key in _q0_update_cache:
         return _q0_update_cache[key]
     from common.shard_map import shard_map
@@ -530,11 +542,13 @@ def _q0_update_program(layout, mesh_xy, nq, dtype):
         for channel in range(N_LORENTZ):
             local = layout.padded_extent(channel) // layout.mesh_side
             left_pieces.append(_q0_local_factor_piece(
-                left_rows, axis_name="x", local_extent=local,
+                left_rows, factor_rank=factor_rank, axis_name="x",
+                local_extent=local,
                 local_offset=layout.local_offset(channel),
                 logical_extent=logical_extents[channel]))
             right_pieces.append(_q0_local_factor_piece(
-                right_rows, axis_name="y", local_extent=local,
+                right_rows, factor_rank=factor_rank, axis_name="y",
+                local_extent=local,
                 local_offset=layout.local_offset(channel),
                 logical_extent=logical_extents[channel]))
         delta_q0 = _q0_local_outer(
@@ -563,11 +577,12 @@ def add_photon_q0_low_rank(
 ) -> jax.Array:
     """Add one bounded low-rank update to the packed q=Gamma operator.
 
-    The mathematical update is ``O[0] += L @ R`` with rank at most four.
+    The mathematical update is ``O[0] += L @ R`` with the factor rank taken
+    from the supplied arrays.
     For local 2-D placement, callers supply ``left_rows_X = L.T`` and
-    ``right_rows_Y = R``, both stored as fixed-capacity ``(4, N_packed)``
-    row arrays.  Their shardings are respectively ``P(None, 'x')`` and
-    ``P(None, 'y')``; unused rows are exactly zero.  No conjugation or
+    ``right_rows_Y = R``, both stored as ``(rank, N_packed)`` row arrays.
+    Their shardings are respectively ``P(None, 'x')`` and ``P(None, 'y')``.
+    No conjugation or
     physical prefactor is implicit: directed response factors must already
     contain both.  This convention admits general non-Hermitian bordered
     response updates rather than silently imposing a head model here.
@@ -576,7 +591,7 @@ def add_photon_q0_low_rank(
     is a local outer-product sum on each device and the donated packed
     accumulator never gathers or reshards.  Calls with both factors absent
     return the identical object without dispatch; supplying only one factor,
-    a non-capacity-four factor, or a non-native sharding is refused.
+    unequal factor ranks, or a non-native sharding is refused.
     """
     if left_rows_X is None and right_rows_Y is None:
         return packed
@@ -594,7 +609,7 @@ def add_photon_q0_low_rank(
     if int(packed.shape[0]) < 1 or tuple(packed.shape) != packed_shape:
         raise ValueError(
             f"packed photon operator shape {packed.shape} != {packed_shape}")
-    _validate_q0_factor_pair(
+    factor_rank = _validate_q0_factor_pair(
         left_rows_X, right_rows_Y, layout, mesh_xy, dtype=packed.dtype,
         label="packed update")
     wanted_packed = NamedSharding(mesh_xy, P(None, "x", "y"))
@@ -606,7 +621,7 @@ def add_photon_q0_low_rank(
             "packed-body reshard.")
 
     updated = _q0_update_program(
-        layout, mesh_xy, packed_shape[0], packed.dtype)(
+        layout, mesh_xy, packed_shape[0], packed.dtype, factor_rank)(
             packed, left_rows_X, right_rows_Y,
             jnp.asarray(layout.logical_extents, dtype=jnp.int32))
     # Repeated bounded updates reuse the donated accumulator.  This explicit
@@ -616,10 +631,12 @@ def add_photon_q0_low_rank(
     return updated
 
 
-def _q0_block_program(mesh_xy, p_left, p_right, dtype, n_pairs):
+def _q0_block_program(
+    mesh_xy, p_left, p_right, dtype, n_pairs, factor_rank,
+):
     """One q-extent-one graph per padded shape class and factor count."""
     key = (id(mesh_xy), int(p_left), int(p_right), np.dtype(dtype).str,
-           int(n_pairs))
+           int(n_pairs), int(factor_rank))
     if key in _q0_block_cache:
         return _q0_block_cache[key]
     from common.shard_map import shard_map
@@ -651,10 +668,12 @@ def _q0_block_program(mesh_xy, p_left, p_right, dtype, n_pairs):
         delta = jnp.zeros((local_left, local_right), dtype=dtype)
         for left, right in zip(left_rows, right_rows):
             left_piece = _q0_local_factor_piece(
-                left, axis_name="x", local_extent=local_left,
+                left, factor_rank=factor_rank, axis_name="x",
+                local_extent=local_left,
                 local_offset=off_left, logical_extent=n_left)
             right_piece = _q0_local_factor_piece(
-                right, axis_name="y", local_extent=local_right,
+                right, factor_rank=factor_rank, axis_name="y",
+                local_extent=local_right,
                 local_offset=off_right, logical_extent=n_right)
             delta = delta + _q0_local_outer(left_piece, right_piece)
         out = jnp.zeros((1, local_left, local_right), dtype=dtype)
@@ -700,28 +719,35 @@ def photon_q0_low_rank_block(
     lefts = []
     rights = []
     dtype = np.dtype(pairs[0][0].dtype)
+    factor_rank = None
     for index, pair in enumerate(pairs):
         if not isinstance(pair, tuple) or len(pair) != 2:
             raise TypeError(
                 "q=0 factor pairs must be (left_rows_X,right_rows_Y); "
                 f"entry {index} is {type(pair).__name__}")
         left, right = pair
-        _validate_q0_factor_pair(
+        pair_rank = _validate_q0_factor_pair(
             left, right, layout, mesh_xy, dtype=dtype,
             label=f"factor pair {index}")
+        if factor_rank is None:
+            factor_rank = pair_rank
+        elif pair_rank != factor_rank:
+            raise ValueError(
+                "q=0 diagnostic factor pairs must share one rank; got "
+                f"{factor_rank} and {pair_rank}")
         lefts.append(left)
         rights.append(right)
     scalar = lambda value: jnp.asarray(int(value), dtype=jnp.int32)
     return _q0_block_program(
         mesh_xy, layout.padded_extent(A), layout.padded_extent(B), dtype,
-        len(pairs))(
+        len(pairs), factor_rank)(
             *lefts, *rights,
             scalar(layout.local_offset(A)), scalar(layout.local_offset(B)),
             scalar(layout.logical_extent(A)), scalar(layout.logical_extent(B)))
 
 
 __all__ = [
-    "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
+    "CHARGE", "TRANSVERSE", "N_LORENTZ",
     "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
     "pack_photon_response_tiles", "unpack_photon_response_tiles",
     "pack_photon_channel_vectors", "add_photon_q0_low_rank",

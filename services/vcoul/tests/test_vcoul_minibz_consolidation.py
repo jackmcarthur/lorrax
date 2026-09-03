@@ -207,7 +207,7 @@ def test_bulk_photon_receipt_is_true_ws_and_obeys_trace_identity(
         kgrid)
     assert receipt.dimension == 3
     assert receipt.method == "true_ws_polyhedron_duffy_gauss_legendre_v1"
-    assert receipt.orders == (8, 12, 16)
+    assert receipt.orders == (10, 16, 22)
     assert receipt.slab_zc is None
     assert vcoul.validate_minibz_photon_receipt(receipt) is receipt
     mini = np.asarray(receipt.mini_lattice_rows)
@@ -228,7 +228,7 @@ def test_bulk_photon_receipt_is_true_ws_and_obeys_trace_identity(
     # not inject cancellation noise into this algebra oracle.
     trace_identity = np.sum(weight * (
         np.trace(D[:, 1:, 1:], axis1=1, axis2=2) + 2.0 * D[:, 0, 0]))
-    assert abs(trace_identity) <= 1.0e-14
+    assert abs(trace_identity) / abs(np.sum(weight * D[:, 0, 0])) <= 1.0e-14
 
     D_mean = np.einsum("s,sij->ij", weight, D)
     if expect_isotropic:

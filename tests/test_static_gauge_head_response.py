@@ -26,10 +26,10 @@ from gw.head_correction import (
     _reduce_static_photon_order_diagnostics,
     _require_static_photon_numerical_certificate,
     _static_photon_mixed_error_ratio,
-    complete_static_slab_photon_q0,
+    complete_static_photon_q0,
     static_gauge_tensor_residuals,
     static_hall_linear_response,
-    static_slab_photon_head_moment_chunk,
+    static_photon_head_moment_chunk,
 )
 from gw.static_gauge_response import StaticPhotonHeadResponse
 from gw.w_isdf import compute_static_photon_response
@@ -42,6 +42,34 @@ def _mesh():
         np.asarray(devices[:side * side]).reshape(side, side),
         axis_names=("x", "y"),
     )
+
+
+def test_q0_factor_update_rank_is_derived_not_truncated():
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.photon_layout import (
+        PhotonBasisLayout, add_photon_q0_low_rank)
+
+    mesh = _mesh()
+    layout = PhotonBasisLayout.from_centroid_extents(2, 2, mesh)
+    packed_sharding = NamedSharding(mesh, P(None, "x", "y"))
+    left_sharding = NamedSharding(mesh, P(None, "x"))
+    right_sharding = NamedSharding(mesh, P(None, "y"))
+    rank = 5
+    left = np.arange(
+        rank * layout.packed_extent, dtype=np.float64).reshape(
+            rank, layout.packed_extent).astype(np.complex128)
+    right = (left + 0.5j).astype(np.complex128)
+    packed = jax.device_put(
+        np.zeros((1, layout.packed_extent, layout.packed_extent),
+                 dtype=np.complex128), packed_sharding)
+    got = add_photon_q0_low_rank(
+        packed, layout, mesh,
+        left_rows_X=jax.device_put(left, left_sharding),
+        right_rows_Y=jax.device_put(right, right_sharding))
+    np.testing.assert_array_equal(
+        np.asarray(got[0]), np.einsum("ai,aj->ij", left, right))
+    assert layout.q0_basis_size(2) == 3
+    assert layout.q0_basis_size(3) == 4
 
 
 def _ward_closed_S():
@@ -64,7 +92,7 @@ def _ward_closed_S():
 
 def test_hall_builder_has_only_transverse_ct_tc_and_fixed_sign():
     sigma = np.asarray((0.0, 0.0, 0.37))
-    H = np.asarray(static_hall_linear_response(sigma))
+    H = np.asarray(static_hall_linear_response(sigma, dimension=2))
 
     np.testing.assert_array_equal(H[:, 0, 0], 0.0)
     np.testing.assert_array_equal(H[:, 1:, 1:], 0.0)
@@ -79,7 +107,8 @@ def test_hall_builder_has_only_transverse_ct_tc_and_fixed_sign():
 
 
 def test_hall_builder_with_zero_sigma_is_exactly_zero():
-    H = np.asarray(static_hall_linear_response(np.zeros(3)))
+    H = np.asarray(static_hall_linear_response(
+        np.zeros(3), dimension=2))
     np.testing.assert_array_equal(H, 0.0)
 
 
@@ -97,10 +126,10 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     weight = np.asarray((1.0, 1.0, 0.0), dtype=np.float64)
     (moments, D_sum, count, residual, sigma_min,
      condition_max,
-     conditioned_backward) = static_slab_photon_head_moment_chunk(
+     conditioned_backward) = static_photon_head_moment_chunk(
         q, D, sigma, S, 2, weight)
 
-    H = np.asarray(static_hall_linear_response(sigma))
+    H = np.asarray(static_hall_linear_response(sigma, dimension=2))
     R = (
         np.einsum("sa,aij->sij", q[:2, :2], H)
         + np.einsum("sa,sb,abij->sij", q[:2, :2], q[:2, :2], S)
@@ -133,9 +162,9 @@ def test_static_head_moment_applies_deterministic_cubature_weights():
 
     (moments, D_sum, count, residual, sigma_min,
      condition_max,
-     conditioned_backward) = static_slab_photon_head_moment_chunk(
+     conditioned_backward) = static_photon_head_moment_chunk(
         q, D, sigma, S, 2, weight)
-    H = np.asarray(static_hall_linear_response(sigma))
+    H = np.asarray(static_hall_linear_response(sigma, dimension=2))
     R = (
         np.einsum("sa,aij->sij", q[:2, :2], H)
         + np.einsum("sa,sb,abij->sij", q[:2, :2], q[:2, :2], S)
@@ -225,7 +254,7 @@ def test_scalar_head_owner_and_packed_completion_share_one_q0_quadrature():
 
     S_quadratic = np.zeros((2, 2, 4, 4), dtype=np.complex128)
     S_quadratic[:, :, 0, 0] = S_cart[:2, :2]
-    moments, D_sum, count, *_ = static_slab_photon_head_moment_chunk(
+    moments, D_sum, count, *_ = static_photon_head_moment_chunk(
         np.asarray(chunk.q_cart), np.asarray(chunk.D_raw), np.zeros(3),
         S_quadratic, n_valid, np.asarray(chunk.sample_weight))
     assert int(np.asarray(count)) == n_valid
@@ -345,7 +374,7 @@ def test_static_head_numerical_certificate_refuses_nonfinite_theta():
 
 def test_static_head_numerical_certificate_refuses_nonfinite_convergence():
     finite = np.zeros((4, 4), dtype=np.complex128)
-    with pytest.raises(ValueError, match="static_photon_polygon_nonfinite"):
+    with pytest.raises(ValueError, match="static_photon_cell_nonfinite"):
         _require_static_photon_numerical_certificate(
             finite, finite,
             max_backward=1.0e-16,
@@ -359,7 +388,7 @@ def test_static_head_mixed_error_refuses_nonfinite_nonfirst_block():
     finite = np.eye(4, dtype=np.complex128)
     nonfinite = finite.copy()
     nonfinite[0, 0] = np.nan
-    with pytest.raises(ValueError, match="static_photon_polygon_nonfinite"):
+    with pytest.raises(ValueError, match="static_photon_cell_nonfinite"):
         _static_photon_mixed_error_ratio(
             (finite, finite), (finite, nonfinite))
 
@@ -380,7 +409,7 @@ def test_static_head_order_reduction_refuses_later_nonfinite_diagnostic(
 
 def test_static_head_completion_has_no_independent_cell_volume_seam():
     assert "cell_volume" not in inspect.signature(
-        complete_static_slab_photon_q0).parameters
+        complete_static_photon_q0).parameters
 
 
 def test_static_gauge_tensor_residuals_accept_a_nonzero_ward_closed_tensor():
@@ -406,7 +435,7 @@ def test_static_gauge_tensor_residuals_flag_a_nonhermitian_tensor():
 def test_static_photon_head_response_is_sealed_to_its_producer():
     with pytest.raises(TypeError, match="issued only by"):
         StaticPhotonHeadResponse(
-            layout=None, S_direct=None, sigma_H=None, hall_source="",
+            layout=None, dimension=2, S_direct=None, sigma_H=None, hall_source="",
             Y_x=None, Z_y=None, ward_residual=0.0,
             hermiticity_residual=0.0, wing_reciprocity_residual=0.0,
             _producer_token=object())
@@ -488,19 +517,17 @@ def test_packed_deck_refuses_no_local_fields(tmp_path):
                _packed_deck(extra="head_correction = no_local_fields\n"))
 
 
-def test_packed_deck_completion_is_slab_only_and_says_why(tmp_path):
-    with pytest.raises(
-            ValueError,
-            match="(?s)static_bispinor_photon_head_slab_only.*no derived "
-                  "integrator") as info:
-        _parse(tmp_path, _packed_deck(sys_dim=3))
-    assert "sys_dim = 2" in str(info.value)
+def test_packed_deck_bulk_completion_is_reachable(tmp_path):
+    config = _parse(tmp_path, _packed_deck(sys_dim=3))
+    assert uses_static_photon_response(config)
+    assert uses_coupled_photon_head(config)
 
 
 def test_packed_deck_off_head_keeps_the_bulk_body_reachable(tmp_path):
     config = _parse(
         tmp_path, _packed_deck(sys_dim=3, extra="head_correction = off\n"))
     assert not uses_coupled_photon_head(config)
+    assert uses_static_photon_response(config)
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +554,8 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 2      # 6 shared (incl. w_dyson_solver) + 2 screened-only
+    assert len(both) == len(shared) + 2
+    assert "sys_dim in {2, 3}" in shared
     assert "w_dyson_solver = distributed" in shared
 
 
@@ -628,41 +656,25 @@ _INCUMBENT_DECK = (
     "ncond = 2\n"
     "number_bands = 8\n"
     "memory_per_device_gb = 4.0\n"
-    "sys_dim = 3\n"                      # bulk: outside the slab envelope
+    "sys_dim = 3\n"
     "bispinor = true\n"
     "bispinor_gw = bare_transverse\n"
     "compute_mode = cohsex\n"
     "restart = false\n")
 
 
-def test_incumbent_head_off_gets_the_same_debug_labelling_as_the_packed_route(
+def test_bulk_head_off_takes_the_packed_debug_route(
         tmp_path):
-    from gw.gw_config import incumbent_bispinor_head_record
     config = _parse(tmp_path,
                     _INCUMBENT_DECK + "head_correction = off\n")
-    assert not uses_static_photon_response(config)
-    banner, record = incumbent_bispinor_head_record(config)
-    assert "WARNING -- DEBUG" in banner
-    assert "head_correction=off" in banner
-    assert "NOT a production calculation" in banner
-    assert record.startswith("DEBUG:")
-    assert "NOT a production calculation" in record
+    assert uses_static_photon_response(config)
+    assert not uses_coupled_photon_head(config)
 
 
-def test_incumbent_head_full_says_it_has_no_transverse_gamma_head(tmp_path):
-    """A bulk bispinor number must not look complete.
-
-    The incumbent route's only transverse q=Gamma head was the overlay,
-    whose deck key is gone; the packed completion is the only producer of
-    <D_TT> and this deck is outside its envelope.
-    """
-    from gw.gw_config import incumbent_bispinor_head_record
+def test_bulk_head_full_takes_the_packed_completion(tmp_path):
     config = _parse(tmp_path, _INCUMBENT_DECK)
-    assert not uses_static_photon_response(config)
-    banner, record = incumbent_bispinor_head_record(config)
-    assert banner == ""
-    assert "NO transverse q=Gamma head" in record
-    assert "StaticHeadTerms" in record
+    assert uses_static_photon_response(config)
+    assert uses_coupled_photon_head(config)
 
 
 def test_the_driver_prints_the_incumbent_head_record(tmp_path):

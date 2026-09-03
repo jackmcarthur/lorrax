@@ -3629,11 +3629,8 @@ def packed_static_envelope(config, *, screened: bool):
     row.  The distributed-plan row (``w_dyson_solver = distributed``) is
     shared because the packed response facade has that one plan even when
     the bare route can skip the block-diagonal current solve.  ``sys_dim`` is
-    also deliberately NOT here -- the bare route treats it as a routing
-    condition while the screened mode refuses it only under
-    ``head_correction = full`` (``GATE
-    static_bispinor_photon_head_slab_only``), and one row cannot honestly
-    say both.
+    shared too: the provider issues an exact polygon or polyhedron receipt,
+    while the coupled completion algebra remains one owner.
     """
     yield (config.compute_mode in PACKED_PHOTON_COMPUTE_MODES,
            f"compute_mode = {config.compute_mode.value}",
@@ -3645,6 +3642,11 @@ def packed_static_envelope(config, *, screened: bool):
            "packed route (W_00(omega) on the charge block, the twelve current "
            "blocks frozen at omega = 0); mpa has no independent static-role W, "
            "so its CC block would have no owner and it refuses by name", None)
+    yield (int(config.sys_dim) in (2, 3),
+           f"sys_dim = {config.sys_dim}", "sys_dim in {2, 3}",
+           _ENV_IMPL,
+           "the packed photon Gamma-cell provider has exact slab and bulk "
+           "Wigner-Seitz rules; a 0-D box has no finite Gamma cell", None)
     yield (config.qp_solver is QPSolver.ONE_SHOT_DFT,
            f"qp_solver = {config.qp_solver.value}",
            "qp_solver = one_shot_dft", _ENV_IMPL,
@@ -3704,7 +3706,7 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     the bare Breit exchange ``Sigma^B`` in TT (``SX(D_TT) = X(D_TT)``,
     ``COH(D_TT - D_TT) = 0``) and zero in CT/TC -- the incumbent
     ``gw.sigma_x_bispinor`` result, block for block.  The Gamma completion
-    is the same :func:`gw.head_correction.complete_static_slab_photon_q0`
+    is the same :func:`gw.head_correction.complete_static_photon_q0`
     with the charge-only ``R(q)``, which returns ``diag(W^00_h, D_TT)`` and
     so inserts BOTH the charge head and the bare ``<D_TT>`` that the
     ``bispinor_tt_head_correction`` overlay writes into the V tiles today.
@@ -3731,19 +3733,16 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     # resolving property that can itself refuse) touched by this predicate.
     if not bool(config.bispinor):
         return False, "bispinor = false (no transverse channels to pack)"
-    if int(config.sys_dim) != 2:
-        # Not in the shared table: the screened mode refuses a bulk deck
-        # only under head_correction = full, and one row cannot say both.
-        return False, (f"sys_dim = {config.sys_dim} "
-                       "(the packed bare route wants sys_dim = 2)")
     for accepted, got, want, _klass, _why, _derived in packed_static_envelope(
             config, screened=False):
         if not accepted:
             return False, f"{got} (the packed bare route wants {want})"
     if config.compute_mode is ComputeMode.COHSEX:
-        return True, "bispinor slab one-shot static COHSEX"
+        return True, (
+            f"bispinor sys_dim={config.sys_dim} one-shot static COHSEX")
     return True, (
-        f"bispinor slab one-shot {config.compute_mode.value} -- the DYNAMIC "
+        f"bispinor sys_dim={config.sys_dim} one-shot "
+        f"{config.compute_mode.value} -- the DYNAMIC "
         "packed route: W_00(omega) on the charge block, the twelve current "
         "blocks frozen at omega = 0")
 
@@ -3995,21 +3994,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     # ``full`` runs it, ``off`` is the announced DEBUG skip, and there is no
     # third value because ``no_local_fields`` names a scalar diagnostic that
     # the coupled 4x4 solve does not produce.
-    if config.head.correction is HeadCorrection.FULL and int(config.sys_dim) != 2:
-        raise ValueError(
-            "GATE static_bispinor_photon_head_slab_only: the packed static "
-            "photon Gamma-cell completion is derived for a slab.\n"
-            f"  got:  bispinor_gw = {mode.value}, head_correction = full, "
-            f"sys_dim = {config.sys_dim}\n"
-            "  want: sys_dim = 2\n"
-            "  why:  the completion solves the coupled 4x4 Lorentz Dyson "
-            "equation at every point of an exact in-plane Wigner-Seitz "
-            "cubature (vcoul.slab_minibz_photon_cubature) before averaging; "
-            "a bulk analytic-sphere completion cannot be added after that "
-            "nonlinear solve and has no derived integrator yet.\n"
-            "  fix:  set sys_dim = 2, or head_correction = off for a "
-            "DEBUG headless body (not a production calculation)\n"
-            "  doc:  docs/input_reference.md, bispinor_gw.")
     for accepted, got, want, klass, why, _derived in packed_static_envelope(
             config, screened=True):
         if accepted:
@@ -5930,8 +5914,7 @@ class LorraxConfig:
             bool(resolved.bispinor)
             and (resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX
                  or (resolved.bispinor_gw
-                     is BispinorGWMode.BARE_TRANSVERSE
-                     and int(resolved.sys_dim) == 2)))
+                     is BispinorGWMode.BARE_TRANSVERSE)))
         if _packed_candidate:
             _screened = (
                 resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX)

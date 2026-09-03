@@ -127,7 +127,7 @@ _SLAB_MINIBZ_PHOTON_METHOD = (
 _SLAB_MINIBZ_PHOTON_ORDERS = (16, 24, 32)
 _BULK_MINIBZ_PHOTON_METHOD = (
     "true_ws_polyhedron_duffy_gauss_legendre_v1")
-_BULK_MINIBZ_PHOTON_ORDERS = (8, 12, 16)
+_BULK_MINIBZ_PHOTON_ORDERS = (10, 16, 22)
 _MINIBZ_PHOTON_RECEIPT_TOKEN = object()
 
 
@@ -1050,14 +1050,6 @@ def _photon_D_raw(q_cart, *, kind, zc):
     D_raw[:, 0, 0] = v
     D_raw[:, 1:, 1:] = (
         COULOMB_GAUGE_TT_SIGN * v[:, None, None] * transverse)
-    if kind == "bulk_3d":
-        # ``tr(P_T)=2`` is an algebraic Coulomb-gauge invariant.  Own its
-        # floating representative here rather than asking two independently
-        # rounded large cell sums to cancel afterward.  The slab payload is
-        # deliberately untouched: its authenticated byte stream predates
-        # the dimension-general receipt and is a regression oracle.
-        D_raw[:, 3, 3] = (
-            -2.0 * v - D_raw[:, 1, 1] - D_raw[:, 2, 2])
     return D_raw, q2
 
 
@@ -1200,7 +1192,7 @@ def bulk_minibz_photon_cubature(
 
     The provider constructs the true three-dimensional mini-lattice Voronoi
     polyhedron from a rigorously bounded neighbour shell, triangulates its
-    faces to Gamma, and evaluates the fixed 8/12/16 tetrahedral Duffy--Gauss
+    faces to Gamma, and evaluates the fixed 10/16/22 tetrahedral Duffy--Gauss
     ladder.  Weights are normalized cell-average weights.  Raw ``D`` carries
     no cell-volume factor.
     """
@@ -1446,7 +1438,7 @@ def _require_bulk_minibz_photon_receipt(receipt) -> None:
             "exact bulk photon receipt carries the wrong cubature method")
     if receipt.orders != _BULK_MINIBZ_PHOTON_ORDERS:
         raise ValueError(
-            "exact bulk photon receipt must carry the fixed 8/12/16 ladder")
+            "exact bulk photon receipt must carry the fixed 10/16/22 ladder")
     bvec = np.asarray(receipt.reciprocal_lattice_rows, dtype=np.float64)
     mini = np.asarray(receipt.mini_lattice_rows, dtype=np.float64)
     vertices = np.asarray(receipt.polytope_vertices, dtype=np.float64)

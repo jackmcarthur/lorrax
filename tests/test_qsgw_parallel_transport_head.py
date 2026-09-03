@@ -457,7 +457,8 @@ def test_raw_hall_matches_orbital_cB_owner_and_documented_sign():
         optimize=True))
     np.testing.assert_allclose(
         direct_aw, -hall_occupied_bra, rtol=3e-14, atol=3e-14)
-    inserted = np.asarray(static_hall_linear_response(got))[:, 0, 1:].imag
+    inserted = np.asarray(static_hall_linear_response(
+        got, dimension=2))[:, 0, 1:].imag
     np.testing.assert_allclose(
         inserted, direct_aw, rtol=3e-14, atol=3e-14)
     assert np.max(np.abs((-inserted) - direct_aw)) > 1.0e-10

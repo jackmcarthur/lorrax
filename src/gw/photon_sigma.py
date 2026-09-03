@@ -20,7 +20,7 @@ the existing owners:
   exchange/correlation operator back to band space.
 
 When the response carries a Gamma-cell completion
-(:class:`gw.head_correction.StaticSlabPhotonHeadCompletion`, always under
+(:class:`gw.head_correction.StaticPhotonHeadCompletion`, always under
 ``head_correction = full``), the same loop re-contracts the completion's
 bounded rank-4 factors alone (``q0_only`` convolution,
 :func:`gw.photon_layout.photon_q0_low_rank_block`) and reports the exact

@@ -2018,7 +2018,7 @@ def compute_static_photon_response(
     the incumbent ``gw.sigma_x_bispinor`` result, block for block.
 
     Both modes then run ONE Gamma-cell completion
-    (:func:`gw.head_correction.complete_static_slab_photon_q0`) from the
+    (:func:`gw.head_correction.complete_static_photon_q0`) from the
     bounded response of
     :func:`gw.static_gauge_response.build_static_photon_head_response` --
     bare ``<D>`` into V, the charge ``S^{00}``/wing head into W, the Hall
@@ -2252,9 +2252,8 @@ def compute_static_photon_response(
 
     head_completion = None
     if coupled_head:
-        from vcoul import (
-            CoulombGeometry, get_kernel, slab_minibz_photon_cubature)
-        from .head_correction import complete_static_slab_photon_q0
+        from vcoul import CoulombGeometry, get_kernel, minibz_photon_cubature
+        from .head_correction import complete_static_photon_q0
         from .static_gauge_response import (
             build_static_photon_head_response)
 
@@ -2281,10 +2280,12 @@ def compute_static_photon_response(
                   for vector in photon_g0_vectors),
             layout, mesh_xy, axis_name="y")[0]
         geometry = CoulombGeometry.from_wfn(wfn)
-        cubature = slab_minibz_photon_cubature(
-            get_kernel(2), geometry, tuple(int(v) for v in meta.kgrid))
+        dimension = int(config.sys_dim)
+        cubature = minibz_photon_cubature(
+            get_kernel(dimension), geometry,
+            tuple(int(v) for v in meta.kgrid))
         V_packed, W_packed, head_completion = (
-            complete_static_slab_photon_q0(
+            complete_static_photon_q0(
                 V_packed, W_packed, response, g0_X, g0_Y, cubature,
                 mesh_xy=mesh_xy))
         jax.block_until_ready((V_packed, W_packed))
@@ -2294,7 +2295,14 @@ def compute_static_photon_response(
             "Gamma-completed static photon W", W_packed)
         if jax.process_index() == 0:
             print_fn(
-                "  [photon head] Gamma-cell completion applied: bare <D> "
+                "  [photon head] Gamma-cell completion applied: "
+                f"dimension={dimension}, method={cubature.method}, "
+                f"orders={cubature.orders}, physical={cubature.physical_counts}, "
+                f"weight_defect_max={max(cubature.weight_sum_defects):.3e}, "
+                f"<v>={head_completion.bare_D_mean[0, 0].real:.12e}, "
+                "tr<D_TT>="
+                f"{np.trace(head_completion.bare_D_mean[1:, 1:]).real:.12e}; "
+                "bare <D> "
                 "into V, charge S00/wing head into W; hall_source="
                 f"{response.hall_source}; ward={head_completion.ward_residual:.3e}, "
                 f"hermiticity={head_completion.hermiticity_residual:.3e}, "

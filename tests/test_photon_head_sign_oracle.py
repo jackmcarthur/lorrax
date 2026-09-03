@@ -73,7 +73,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 import common.parallel_transport as parallel_transport  # noqa: E402
 import gw.qsgw_head as qsgw_head  # noqa: E402
 from gw.head_correction import (  # noqa: E402
-    complete_static_slab_photon_q0,
+    complete_static_photon_q0,
     static_hall_linear_response,
 )
 from gw.photon_layout import (  # noqa: E402
@@ -210,11 +210,13 @@ def part_a_residuals(mesh):
         D_jet[:2], gamma_dir, m.energies, m.occupations,
         cell_volume=m.cell_volume, nk_tot=m.nk, nspin=m.nspin,
         nspinor=m.nspinor)                                 # (2,3), a x i
-    CT_code = np.asarray(static_hall_linear_response(sigma_H))[:, 0, 1:]
+    CT_code = np.asarray(static_hall_linear_response(
+        sigma_H, dimension=2))[:, 0, 1:]
     out["hall_CT_imag"] = (_rel(CT_code.imag, chi_0i.imag), chi_0i.imag)
     out["hall_CT_imag_flipped"] = (_rel(CT_code.imag, -chi_0i.imag), None)
     out["hall_TC_is_CT_dagger"] = (
-        _rel(np.asarray(static_hall_linear_response(sigma_H))[:, 1:, 0],
+        _rel(np.asarray(static_hall_linear_response(
+            sigma_H, dimension=2))[:, 1:, 0],
              np.conj(CT_code)), None)
     return out
 
@@ -253,7 +255,25 @@ def _receipt():
         vcoul.get_kernel(2), _geometry(), _KGRID)
 
 
-def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
+def _bulk_receipt(*, hexagonal):
+    """Production bulk receipt for cubic or elongated hexagonal mini-cell."""
+    import vcoul
+    if hexagonal:
+        bvec = np.asarray((
+            (1.0, 0.0, 0.0),
+            (0.5, np.sqrt(3.0) / 2.0, 0.0),
+            (0.0, 0.0, 1.0 / 3.0),
+        ))
+    else:
+        bvec = np.eye(3)
+    cell_volume = float((2.0 * np.pi) ** 3 / abs(np.linalg.det(bvec)))
+    geometry = vcoul.CoulombGeometry(
+        bvec=bvec, cell_volume=cell_volume)
+    return vcoul.minibz_photon_cubature(
+        vcoul.get_kernel(3), geometry, (3, 3, 3))
+
+
+def _fixture(mesh, *, sigma_H, dimension=2, wings=True, seed=20260901):
     """Sealed response + packed body + Gamma vectors, everything nonzero."""
     rng = np.random.default_rng(seed)
     layout = PhotonBasisLayout.from_centroid_extents(4, 3, mesh)
@@ -265,16 +285,18 @@ def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
     # the Hall strength is 8*pi*zc*sigma_H.  Both are kept O(0.1) so the
     # provider's fixed 16/24/32 polygon ladder converges inside its own
     # GATE static_photon_polygon_not_converged budget.
-    charge_S = np.array([[-1.2e-2, 3.0e-3], [3.0e-3, -8.0e-3]])
+    charge_S = np.diag(
+        np.asarray((-1.2e-2, -8.0e-3, -5.0e-3)[:dimension]))
+    if dimension >= 2:
+        charge_S[0, 1] = charge_S[1, 0] = 3.0e-3
     S_host = np.zeros((1, 3, 3), dtype=np.complex128)
-    S_host[0, :2, :2] = charge_S
-    S_host[0, 2, 2] = -5.0e-3                    # out-of-plane, never read
+    S_host[0, :dimension, :dimension] = charge_S
 
     Y_host = np.zeros((1, 3, charge_extent), dtype=np.complex128)
     if wings:
-        wing = (rng.normal(size=(2, charge_extent))
-                + 1j * rng.normal(size=(2, charge_extent))) * 1.0
-        Y_host[0, :2, :] = wing
+        wing = (rng.normal(size=(dimension, charge_extent))
+                + 1j * rng.normal(size=(dimension, charge_extent))) * 1.0
+        Y_host[0, :dimension, :] = wing
     Z_host = np.conj(np.transpose(Y_host, (0, 2, 1))).copy()
 
     direct = SimpleNamespace(
@@ -307,7 +329,7 @@ def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
             input_dir="/bounded/not-read", mesh=mesh,
             wfn=SimpleNamespace(nspin=1),
             meta=SimpleNamespace(b_id_0=0, b_id_4_chi_user=4),
-            config=SimpleNamespace(),
+            config=SimpleNamespace(sys_dim=dimension),
             layout=layout, hall_transaction=hall)
     finally:
         qsgw_head.build_dft_head_response = saved_direct
@@ -397,12 +419,12 @@ def _levi_civita():
     return eps
 
 
-def hall_response_reference(sigma_H, *, ct_sign=-1.0):
+def hall_response_reference(sigma_H, *, dimension=2, ct_sign=-1.0):
     """``chi_0i^{(a)} = ct_sign * i * eps[b,a,i] sigma_b``; TC = CT^dagger."""
     eps = _levi_civita()
     sigma = np.asarray(sigma_H, dtype=np.float64)
-    H = np.zeros((2, 4, 4), dtype=np.complex128)
-    for a in range(2):
+    H = np.zeros((dimension, 4, 4), dtype=np.complex128)
+    for a in range(dimension):
         for i in range(3):
             value = ct_sign * 1j * float(
                 sum(eps[b, a, i] * sigma[b] for b in range(3)))
@@ -417,8 +439,9 @@ def schur_folded_response(response, W_gamma, cell_volume, *, wing_sign=1.0):
     Y = _gather(response.Y_x)
     Z = _gather(response.Z_y)
     out = np.array(S, dtype=np.complex128)
-    for a in range(2):
-        for b in range(2):
+    dimension = int(response.dimension)
+    for a in range(dimension):
+        for b in range(dimension):
             out[a, b] = S[a, b] + wing_sign * (
                 Y[a] @ W_gamma @ Z[b]) / cell_volume
     return 0.5 * (out + np.swapaxes(out, 0, 1))
@@ -435,13 +458,15 @@ def head_propagator_bruteforce(q, D, R, *, tt_sign=-1.0):
     """
     q = np.asarray(q, dtype=np.float64)
     qn = q / np.linalg.norm(q)
-    zhat = np.array([0.0, 0.0, 1.0])
-    t1 = np.cross(zhat, qn)
+    axes = np.eye(3)
+    reference = axes[int(np.argmin(np.abs(axes @ qn)))]
+    t1 = np.cross(reference, qn)
     t1 = t1 / np.linalg.norm(t1)
+    t2 = np.cross(qn, t1)
     Pi = np.zeros((4, 3), dtype=np.complex128)
     Pi[0, 0] = 1.0
     Pi[1:, 1] = t1
-    Pi[1:, 2] = zhat
+    Pi[1:, 2] = t2
     v = float(np.real(D[0, 0]))
     D_red = np.diag(np.array([v, tt_sign * v, tt_sign * v],
                              dtype=np.complex128))
@@ -452,20 +477,26 @@ def head_propagator_bruteforce(q, D, R, *, tt_sign=-1.0):
 
 def reference_moments(receipt, S_eff, sigma_H, *, ct_sign=-1.0, tt_sign=-1.0):
     """``<b_u W_h b_v>`` and ``<D>`` on the receipt's final rule."""
-    H = hall_response_reference(sigma_H, ct_sign=ct_sign)
+    dimension = int(receipt.dimension)
+    H = hall_response_reference(
+        sigma_H, dimension=dimension, ct_sign=ct_sign)
     chunk = receipt.chunks[-1]
     n = int(chunk.physical_count)
     q = np.asarray(chunk.q_cart[:n], dtype=np.float64)
     D = np.asarray(chunk.D_raw[:n], dtype=np.complex128)
     w = np.asarray(chunk.sample_weight[:n], dtype=np.float64)
     measure = float(np.sum(w))
-    moments = np.zeros((3, 3, 4, 4), dtype=np.complex128)
+    basis_size = 1 + dimension
+    moments = np.zeros(
+        (basis_size, basis_size, 4, 4), dtype=np.complex128)
     D_mean = np.zeros((4, 4), dtype=np.complex128)
     for s in range(n):
-        R = (np.einsum("a,aij->ij", q[s, :2], H)
-             + np.einsum("a,b,abij->ij", q[s, :2], q[s, :2], S_eff))
+        R = (np.einsum("a,aij->ij", q[s, :dimension], H)
+             + np.einsum(
+                 "a,b,abij->ij", q[s, :dimension], q[s, :dimension],
+                 S_eff))
         W_h = head_propagator_bruteforce(q[s], D[s], R, tt_sign=tt_sign)
-        basis = np.array([1.0, q[s, 0], q[s, 1]])
+        basis = np.concatenate(([1.0], q[s, :dimension]))
         moments += w[s] * np.einsum("u,ij,v->uvij", basis, W_h, basis)
         D_mean += w[s] * D[s]
     return moments / measure, D_mean / measure
@@ -478,14 +509,17 @@ def reference_insertion(fixture, moments, D_mean, cell_volume):
     Z = _gather(fixture.response.Z_y)
     g0x = _gather(fixture.g0_X)
     g0y = _gather(fixture.g0_Y)
-    left = [np.conj(g0x), (W0 @ Z[0]).T, (W0 @ Z[1]).T]
-    right = [g0y, Y[0] @ W0, Y[1] @ W0]
+    dimension = int(fixture.response.dimension)
+    left = [np.conj(g0x)] + [
+        (W0 @ Z[direction]).T for direction in range(dimension)]
+    right = [g0y] + [
+        Y[direction] @ W0 for direction in range(dimension)]
     V_ref = fixture.V_host[0] + np.einsum(
         "Ai,AB,Bj->ij", np.conj(g0x), D_mean, g0y,
         optimize=True) / cell_volume
     W_ref = np.array(W0, dtype=np.complex128)
-    for u in range(3):
-        for v in range(3):
+    for u in range(1 + dimension):
+        for v in range(1 + dimension):
             W_ref = W_ref + np.einsum(
                 "Ai,AB,Bj->ij", left[u], moments[u, v], right[v],
                 optimize=True) / cell_volume
@@ -505,9 +539,11 @@ def run_case(mesh, sigma_H, *, wings=True, seed=20260901,
     """Run the production completion and the reference; return residuals."""
     receipt = _receipt() if receipt is None else receipt
     cell_volume = float(receipt.cell_volume)
-    fixture = _fixture(mesh, sigma_H=sigma_H, wings=wings, seed=seed)
+    dimension = int(receipt.dimension)
+    fixture = _fixture(
+        mesh, sigma_H=sigma_H, dimension=dimension, wings=wings, seed=seed)
     V_in, W_in = _packed_pair(fixture, mesh)
-    V_out, W_out, evidence = complete_static_slab_photon_q0(
+    V_out, W_out, evidence = complete_static_photon_q0(
         V_in, W_in, fixture.response, fixture.g0_X, fixture.g0_Y,
         receipt, mesh_xy=mesh)
 
@@ -542,8 +578,8 @@ def run_case(mesh, sigma_H, *, wings=True, seed=20260901,
             - moments[:, :, rows, cols]))) / scale
         residual[f"weight_{name}"] = float(np.max(np.abs(
             moments[:, :, rows, cols]))) / scale
-    for u in range(3):
-        for v in range(3):
+    for u in range(1 + dimension):
+        for v in range(1 + dimension):
             residual[f"moment_{u}{v}"] = float(np.max(np.abs(
                 got_moments[u, v] - moments[u, v]))) / scale
     W_done = _gather(W_out)[0]
@@ -613,7 +649,7 @@ def test_completed_gamma_body_is_hermitian():
     # ... and the completion actually moved the body, so the invariant is
     # not being read off an untouched Hermitian input.
     _, W_in = _packed_pair(fixture, _mesh(1))
-    _, W_out, _ = complete_static_slab_photon_q0(
+    _, W_out, _ = complete_static_photon_q0(
         *_packed_pair(fixture, _mesh(1)), fixture.response,
         fixture.g0_X, fixture.g0_Y, _receipt(), mesh_xy=_mesh(1))
     delta = _gather(W_out)[0] - fixture.W_host[0]
@@ -640,6 +676,49 @@ def test_zero_hall_decouples_into_charge_head_plus_bare_transverse():
         1.0e-13 * abs(D_got[0, 0]))
 
 
+@pytest.mark.parametrize("hexagonal", (False, True))
+def test_bulk_completion_matches_subspace_inverse_and_geometry_oracles(
+        hexagonal):
+    """The one completion owner consumes cubic and elongated-hex bulk rules.
+
+    Hall physics is deliberately not inferred here: ``sigma_H=0`` is the
+    bulk default.  That limit must decouple CT/TC exactly, zero wings must
+    leave ``S_eff=S``, and the independent ``D^-1-R`` inverse on the
+    non-null Coulomb-gauge subspace must reproduce both packed insertions.
+    """
+    receipt = _bulk_receipt(hexagonal=hexagonal)
+    residual, evidence, fixture, _, _, S_eff = run_case(
+        _mesh(1), np.zeros(3), wings=False, receipt=receipt)
+    for key in ("V_packed", "W_packed"):
+        assert residual[key] <= 1.0e-13, (key, residual[key])
+    assert residual["moments_all"] <= 3.0e-13
+    np.testing.assert_array_equal(
+        np.asarray(evidence.screened_moments)[:, :, 0, 1:], 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(evidence.screened_moments)[:, :, 1:, 0], 0.0)
+    np.testing.assert_array_equal(S_eff, _gather(fixture.response.S_direct))
+    assert len(evidence.q0_factors.screened_pairs) == 16
+
+    chunk = receipt.chunks[-1]
+    physical = int(chunk.physical_count)
+    weight = np.asarray(chunk.sample_weight[:physical])
+    D = np.asarray(chunk.D_raw[:physical])
+    trace_identity = np.sum(weight * (
+        np.trace(D[:, 1:, 1:], axis1=1, axis2=2) + 2.0 * D[:, 0, 0]))
+    assert abs(trace_identity) / abs(np.sum(weight * D[:, 0, 0])) <= 1.0e-14
+    D_mean = np.einsum("s,sij->ij", weight, D)
+    if hexagonal:
+        np.testing.assert_allclose(
+            D_mean[1, 1], D_mean[2, 2], rtol=1.0e-12, atol=1.0e-12)
+        assert not np.isclose(
+            D_mean[1, 1], D_mean[3, 3], rtol=1.0e-3, atol=0.0)
+    else:
+        np.testing.assert_allclose(
+            D_mean[1:, 1:],
+            -(2.0 / 3.0) * D_mean[0, 0] * np.eye(3),
+            rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_zero_wings_reduce_the_folded_response_to_S():
     receipt = _receipt()
     fixture = _fixture(_mesh(1), sigma_H=_SIGMA_FULL, wings=False)
@@ -659,7 +738,7 @@ def _reference_bare_tt_moments(receipt):
     q = np.asarray(chunk.q_cart[:n], dtype=np.float64)
     D = np.asarray(chunk.D_raw[:n], dtype=np.complex128)
     w = np.asarray(chunk.sample_weight[:n], dtype=np.float64)
-    basis = np.column_stack((np.ones(n), q[:, :2]))
+    basis = np.column_stack((np.ones(n), q[:, :receipt.dimension]))
     return np.einsum("s,su,sij,sv->uvij", w, basis, D[:, 1:, 1:], basis,
                      optimize=True) / float(np.sum(w))
 
@@ -765,7 +844,7 @@ def main():  # pragma: no cover - reporting entry point
     print(f"\n[oracle] cubature: orders={receipt.orders} "
           f"physical={receipt.physical_counts} "
           f"cell_volume={receipt.cell_volume:.6f} "
-          f"polygon_area={receipt.polygon_area:.6e}")
+          f"minibz_measure={receipt.minibz_measure:.6e}")
     print("\n== PART B: merged completion, all blocks nonzero ==")
     worst = 0.0
     for label, sigma in (("sigma_H = +z", _SIGMA_PLUS),

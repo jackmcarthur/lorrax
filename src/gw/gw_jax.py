@@ -371,7 +371,8 @@ def main(argv=None):
 		_bare_taken, _bare_reason = packed_bare_transverse_route(config)
 		if config.bispinor_gw.value == "full_static_cohsex":
 			report.progress(
-				"Photon route   : packed screened static photon operator "
+				f"Photon route   : sys_dim={config.sys_dim} packed screened "
+				"static photon operator "
 				"(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
 				"Gamma-cell completion carries charge, mixed, and transverse heads)")
 		else:
@@ -381,7 +382,8 @@ def main(argv=None):
 			# (they differ in the q->0 head mechanism).
 			report.progress(
 				"Photon route   : "
-				+ ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
+				+ (f"sys_dim={config.sys_dim} packed static photon operator "
+				   "(chi_TT = chi_CT = 0; scalar "
 				   "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
 				   "completion carries both the charge head and the bare "
 				   f"<D_TT>) -- {_bare_reason}"
@@ -862,17 +864,26 @@ def main(argv=None):
 					   if _hc is None else
 					   "Gamma-cell completion applied (bare <D> into V, "
 					   "charge S00/wing head into W); "
+					   f"dimension={_hc.cubature_receipt.dimension}; "
 					   f"hall_source={_hc.hall_source}; "
 					   f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
 					   f"ward={_hc.ward_residual:.3e}; "
 						   f"hermiticity={_hc.hermiticity_residual:.3e}; "
 						   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
-						   f"cubature_orders={_hc.cubature_receipt.orders}"))
+						   f"cubature_method={_hc.cubature_receipt.method}; "
+						   f"cubature_orders={_hc.cubature_receipt.orders}; "
+						   f"<v>={_hc.bare_D_mean[0, 0].real:.12e}; "
+						   "tr<D_TT>="
+						   f"{np.trace(_hc.bare_D_mean[1:, 1:]).real:.12e}"))
 				if _hc is not None:
 					report.progress(
 						"Photon WS cert : "
+						f"dimension={_hc.cubature_receipt.dimension}; "
+						f"method={_hc.cubature_receipt.method}; "
 						f"orders={_hc.cubature_receipt.orders}; "
 						f"nodes={_hc.observed_physical_counts}; "
+						"weight_defect_max="
+						f"{max(_hc.cubature_receipt.weight_sum_defects):.3e}; "
 						f"final_error_ratio="
 						f"{_hc.mixed_convergence_error_ratios[-1]:.3e}; "
 						f"max_dyson_backward_residual="
