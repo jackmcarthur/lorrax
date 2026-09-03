@@ -470,6 +470,13 @@ def effective_sigma(
             (e_rel < omega_min) | (e_rel > omega_max))),
         "inside_bands": (None if inside is None else tuple(
             bool(value) for value in inside)),
+        # Debug consumers can select a small physical probe without
+        # gathering the full Sigma cube.  This is the raw row-frequency
+        # correlation diagonal before exact-block symmetrisation, which is
+        # the quantity that distinguishes a noisy store from the update law.
+        "sigma_c_on_shell_diag_ev": (
+            jnp.diagonal(row, axis1=-2, axis2=-1) * RYD_TO_EV),
+        "protected_energies_ev": energy[:, :n_p],
         "n_degenerate_blocks": n_degenerate_blocks,
         "largest_degenerate_block": largest_degenerate_block,
         "policy": selected.value,

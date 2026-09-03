@@ -2434,6 +2434,19 @@ def _fixed_index_hamiltonian(
             "1" if inside else "0"
             for inside in diagnostics["inside_bands"])
         inputs.print_fn(f"    fixed-index fermi membership: {bits}")
+    if (bool(inputs.config.debug.sigma_freq_debug_output)
+            and classes.n_protected >= 2):
+        probe_e = np.asarray(
+            diagnostics["protected_energies_ev"], dtype=np.float64)[0, :2]
+        probe_sigma = np.asarray(
+            diagnostics["sigma_c_on_shell_diag_ev"],
+            dtype=np.complex128)[0, :2]
+        inputs.print_fn(
+            "    fixed-index Sigma_c probe: k=0 bands=0,1 "
+            f"E=[{probe_e[0]:+.12e},{probe_e[1]:+.12e}] eV "
+            "Sigma_c=["
+            f"{probe_sigma[0].real:+.12e}{probe_sigma[0].imag:+.12e}j,"
+            f"{probe_sigma[1].real:+.12e}{probe_sigma[1].imag:+.12e}j] eV")
     if not ks.is_identity:
         _check_kstar_spread(
             ks, ks.broadcast(H_dft), print_fn=inputs.print_fn)
