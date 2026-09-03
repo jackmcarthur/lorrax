@@ -1788,9 +1788,13 @@ def write_results(
         sigma_c_odd_kn_eV=(
             None if results.sigma_c_odd_diag_at_dft_ry is None
             else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
-        z_factor_kn=assembly.z_factor,
-        z_pathological_kn=assembly.z_pathological,
-    )
+		# The legacy sigma text diagnostic defines Z together with a guarded
+		# fallback-status twin.  SC has no such status by owner ruling: its raw
+		# central-difference Z is represented only by the resulting eqp1 file.
+		z_factor_kn=(None if results.self_consistent else assembly.z_factor),
+		z_pathological_kn=(
+			None if results.self_consistent else assembly.z_pathological),
+	)
 
     # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing
     # their diagonals in place would alter QSGW/SC semantics.  Persist only

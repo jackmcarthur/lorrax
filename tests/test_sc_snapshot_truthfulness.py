@@ -152,6 +152,7 @@ def test_snapshot_writes_eqp1_but_never_uses_z_to_drive_the_map():
     gw_output = open(os.path.join(_SRC, "gw", "gw_output.py"),
                      encoding="utf-8").read()
     assert "guard_pathological_z=not results.self_consistent" in gw_output
+    assert "None if results.self_consistent else assembly.z_factor" in gw_output
 
 
 def test_the_legacy_stamp_names_the_previous_calls_role():
