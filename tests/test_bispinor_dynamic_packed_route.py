@@ -175,7 +175,7 @@ def test_unnamed_solver_is_derived_for_the_dynamic_packed_route(tmp_path):
                and "w_dyson_solver was not named" in line for line in lines)
 
 
-def test_dynamic_hall_gate_admits_trs_zero_and_names_broken_tr_refusal(
+def test_dynamic_hall_gate_admits_trs_zero_and_announces_broken_tr_omission(
         tmp_path):
     """The dynamic route is never silent about the Faraday Gamma head."""
     from gw.w_isdf import _gate_dynamic_hall_head
@@ -185,6 +185,9 @@ def test_dynamic_hall_gate_admits_trs_zero_and_names_broken_tr_refusal(
         name="gnppm_faraday_gate.in")
 
     class _Hall:
+        sigma_H = np.asarray((4.0e-8, -5.0e-8, 6.0e-8),
+                             dtype=np.float64)
+
         def sigma_H_at(self, frequency):
             assert frequency == 2.0j
             return np.asarray((1.0e-6, -2.0e-6, 3.0e-6),
@@ -201,17 +204,22 @@ def test_dynamic_hall_gate_admits_trs_zero_and_names_broken_tr_refusal(
         "no Hall producer or consumer path taken)"]
 
     records.clear()
-    with pytest.raises(
-            NotImplementedError,
-            match="dynamic_hall_head_unimplemented_sigma_consumer") as exc:
-        _gate_dynamic_hall_head(
-            cfg, trs_allowed=False, coupled_head=True,
-            hall_transaction=_Hall(),
-            print_fn=lambda text, **kwargs: records.append(text))
-    message = str(exc.value)
-    assert "3.00000000000000008e-06 bohr^-1" in message
-    assert "production-minus-D=0 sigCT_odd is identically zero" in message
-    assert records and records[0].startswith("WARNING Faraday head : ABSENT")
+    record = _gate_dynamic_hall_head(
+        cfg, trs_allowed=False, coupled_head=True,
+        hall_transaction=_Hall(),
+        print_fn=lambda text, **kwargs: records.append(text))
+    assert record == (
+        "ABSENT (unowned rank-four probe-frequency CT/TC Sigma insertion; "
+        "max|sigma_H(i*omega_p)| = 3.00000000000000008e-06 bohr^-1; "
+        "static sigma_H = [4e-08, -5e-08, 6e-08] bohr^-1)")
+    assert records == ["WARNING Faraday head : " + record]
+
+    records.clear()
+    record = _gate_dynamic_hall_head(
+        cfg, trs_allowed=False, coupled_head=True, hall_transaction=None,
+        print_fn=lambda text, **kwargs: records.append(text))
+    assert "unmeasured (static_gauge_hall_file unnamed)" in record
+    assert records == ["WARNING Faraday head : " + record]
 
 
 # ---------------------------------------------------------------------------

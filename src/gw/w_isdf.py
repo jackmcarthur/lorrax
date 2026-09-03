@@ -1922,7 +1922,7 @@ def _gate_dynamic_hall_head(
     config, *, trs_allowed, coupled_head: bool, hall_transaction,
     print_fn=print,
 ) -> str | None:
-    """Admit the exact TRS zero or refuse the unowned dynamic Hall insertion.
+    """Admit the exact TRS zero or announce the unowned Hall insertion.
 
     The Hall producer is frequency complete, but the packed Sigma route does
     not yet own the probe-frequency rank-four completion.  This gate runs
@@ -1957,33 +1957,24 @@ def _gate_dynamic_hall_head(
     omega_p = float(config.ppm.omega_p)
     probe = 1j * omega_p
     if hall_transaction is None:
-        magnitude = "unmeasured (no authenticated Hall artifact)"
-        sample_text = "static_gauge_hall_file is unnamed"
+        magnitude = "unmeasured (static_gauge_hall_file unnamed)"
+        static_text = "unmeasured (static_gauge_hall_file unnamed)"
     else:
         sample = np.asarray(
             jax.device_get(hall_transaction.sigma_H_at(probe)),
             dtype=np.complex128)
+        static = np.asarray(
+            jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
         magnitude_value = float(np.max(np.abs(sample)))
         magnitude = f"{magnitude_value:.17e} bohr^-1"
-        sample_text = f"sigma_H({probe!r})={sample.tolist()} bohr^-1"
-    message = (
-        "GATE dynamic_hall_head_unimplemented_sigma_consumer: measured-broken-"
-        "TR dynamic packed screening has a finite-frequency Hall sample but "
-        "no owned rank-four Sigma insertion.\n"
-        f"  got:  SymMaps.trs_allowed=false; {sample_text}; "
-        f"max|sigma_H(i*omega_p)|={magnitude}\n"
-        "  want: one bounded probe-frequency CT/TC completion and a named "
-        "Hall-on/off Sigma diagnostic\n"
-        "  why:  sigma_H(z) is frequency-even, so the requested production-"
-        "minus-D=0 sigCT_odd is identically zero; additionally retaining a "
-        "second full packed body violates the current memory envelope\n"
-        "  fix:   derive a streamed low-rank completion carrier and name the "
-        "magnetisation-odd Hall-on/off observable before enabling this route\n"
-        "  doc:   docs/theory/four-current-head-corrections.md, Dynamic "
-        "Hall/Faraday Gamma head")
+        static_text = f"{static.tolist()} bohr^-1"
+    record = (
+        "ABSENT (unowned rank-four probe-frequency CT/TC Sigma insertion; "
+        f"max|sigma_H(i*omega_p)| = {magnitude}; "
+        f"static sigma_H = {static_text})")
     if jax.process_index() == 0:
-        print_fn("WARNING Faraday head : ABSENT; " + message, flush=True)
-    raise NotImplementedError(message)
+        print_fn("WARNING Faraday head : " + record, flush=True)
+    return record
 
 
 def _load_static_photon_hall(
