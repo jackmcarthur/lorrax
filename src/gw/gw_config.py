@@ -3568,21 +3568,18 @@ _SCALAR_HEAD_OVERRIDES: tuple[tuple[str, object], ...] = (
 
 #: The compute modes the packed four-current operator serves.  ``cohsex`` is
 #: the phase-1 static mode (the packed operator owns the WHOLE Sigma); the
-#: two-point plasmon-pole pair is the phase-3 dynamic packed route, where the
-#: CHARGE block is dynamic (the ordinary scalar Sigma_c on the same ISDF
-#: W_00) and the twelve current blocks are frozen at omega = 0.
-#:
-#: ``mpa`` is deliberately absent.  ``gw.screening.screening_requests_for``
-#: returns NO independent static role for it (its shared double-parallel
-#: frequency walk is not a set of role requests), so the bare-transverse
-#: family's CC block of ``W_packed`` would have no owner, and no gate in the
-#: phase-3 lane covers the fit-store plumbing.  It refuses by name rather
-#: than being served the plasmon-pole branch's assembly.
+#: dynamic modes are the phase-3 route, where the CHARGE block remains with
+#: the ordinary scalar Sigma_c owner and the twelve current blocks are frozen
+#: at omega = 0.  In the bare family the packed operator therefore declares
+#: its CC block ABSENT instead of inventing a static role beside the dynamic
+#: owner.  This is what lets MPA join the route without touching its ordered
+#: fit/residue machinery.
 PACKED_PHOTON_COMPUTE_MODES: tuple[ComputeMode, ...] = (
     ComputeMode.X_ONLY,
     ComputeMode.COHSEX,
     ComputeMode.GN_PPM,
     ComputeMode.HL_PPM,
+    ComputeMode.MPA,
 )
 
 def scalar_head_overrides_named(config) -> tuple[str, ...]:
@@ -3638,15 +3635,22 @@ def packed_static_envelope(config, *, screened: bool):
            + ", ".join(m.value for m in PACKED_PHOTON_COMPUTE_MODES) + "}",
            _ENV_IMPL,
            "the photon response is built once at omega = 0: cohsex is the "
-           "static packed mode; the two-point plasmon-pole pair is the DYNAMIC "
-           "packed route (W_00(omega) on the charge block, the twelve current "
-           "blocks frozen at omega = 0); x_only uses scalar charge X plus "
-           "the packed current X blocks; mpa has no independent static-role W, "
-           "so its CC block would have no owner and it refuses by name", None)
-    yield (config.qp_solver is QPSolver.ONE_SHOT_DFT,
+           "static packed mode; x_only uses scalar charge X plus the packed "
+           "current X blocks; gn_ppm, hl_ppm and mpa are the DYNAMIC packed "
+           "route (the scalar owner carries W_00(omega), the packed CC block "
+           "is absent, and the twelve current blocks are frozen at omega = 0)",
+           None)
+    _bare_dynamic_sc = (
+        not screened
+        and config.qp_solver is QPSolver.SELF_CONSISTENT
+        and config.compute_mode.is_dynamic)
+    yield (config.qp_solver is QPSolver.ONE_SHOT_DFT or _bare_dynamic_sc,
            f"qp_solver = {config.qp_solver.value}",
-           "qp_solver = one_shot_dft", _ENV_IMPL,
-           "no self-consistent map exists for the packed 4x4 operator", None)
+           "qp_solver = one_shot_dft, or qp_solver = self_consistent for a "
+           "bare-transverse dynamic mode", _ENV_IMPL,
+           "the orbital-independent bare current operator is reusable across "
+           "a QP map; coupled/static charge completion and screened-current "
+           "responses still require per-map owners", None)
     yield (config.screening.diagrams is ScreeningDiagrams.W_RPA,
            f"screening_diagrams = {config.screening.diagrams.value}",
            "screening_diagrams = w_rpa", _ENV_IMPL,
@@ -3734,10 +3738,12 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
         return True, (
             "bispinor slab one-shot x_only -- scalar charge X plus packed "
             "current X blocks, with no W solve")
+    solver = config.qp_solver.value.replace("_", "-")
     return True, (
-        f"bispinor slab one-shot {config.compute_mode.value} -- the DYNAMIC "
-        "packed route: W_00(omega) on the charge block, the twelve current "
-        "blocks frozen at omega = 0")
+        f"bispinor slab {solver} {config.compute_mode.value} -- the DYNAMIC "
+        "packed route: the scalar owner carries W_00(omega), the packed CC "
+        "block is absent, and the twelve current blocks are frozen at "
+        "omega = 0")
 
 
 def packed_photon_screens_current(config) -> bool:
@@ -3792,15 +3798,15 @@ def packed_photon_replaces_charge_sigma(config) -> bool:
 def uses_dynamic_packed_photon_route(config) -> bool:
     """The packed four-current operator on a frequency-dependent Sigma.
 
-    ``W_packed(omega) = diag(W_00(omega), W_TT, W_CT)``: the charge block
-    carries the run's plasmon-pole model, the current blocks are the
-    ``omega = 0`` packed response.  See
+    The scalar dynamic owner carries ``W_00(omega)``; the packed operator's
+    CC block is explicitly absent and its current blocks are the ``omega =
+    0`` response.  See
     ``reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md`` for the block
     algebra and the measured bound on what freezing the current blocks
     costs.
     """
     return (uses_static_photon_response(config)
-            and config.compute_mode.ppm_model is not None)
+            and config.compute_mode.is_dynamic)
 
 
 def uses_coupled_photon_head(config) -> bool:
@@ -3987,6 +3993,59 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "head is on by default with the charge head\n"
                 "  doc:  docs/input_reference.md, "
                 "bispinor_tt_head_correction.")
+    if bool(config.bispinor):
+        if (mode is BispinorGWMode.FULL_STATIC_COHSEX
+                and config.compute_mode is ComputeMode.MPA):
+            raise ValueError(
+                "GATE packed_screened_mpa_static_role_unimplemented: "
+                "screened-current MPA has no owned static charge role.\n"
+                "  got:  bispinor_gw = full_static_cohsex, "
+                "compute_mode = mpa\n"
+                "  want: bispinor_gw = bare_transverse, or compute_mode in "
+                "{cohsex, gn_ppm, hl_ppm}\n"
+                "  why:  the screened packed solve needs W_00(0) in the "
+                "same static operator as its current blocks.  MPA stores "
+                "the exact z=0 sample inside its fit transaction but does "
+                "not expose a static-role W; adding another static-W builder "
+                "would create a second owner\n"
+                "  fix:  expose the MPA fit transaction's exact static W "
+                "through the existing screening seam before enabling this "
+                "cell\n"
+                "  doc:  docs/input_reference.md, bispinor_gw.")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and mode is BispinorGWMode.FULL_STATIC_COHSEX):
+            raise ValueError(
+                "GATE packed_screened_self_consistency_unimplemented: "
+                "the screened packed response has no per-map owner.\n"
+                "  got:  bispinor_gw = full_static_cohsex, "
+                "qp_solver = self_consistent\n"
+                "  want: qp_solver = one_shot_dft, or "
+                "bispinor_gw = bare_transverse with a dynamic compute_mode\n"
+                "  why:  every QP map would have to rebuild all sixteen "
+                "chi blocks, the packed Dyson solve and its coupled charge "
+                "head.  The scalar SC hook owns only scalar W today; reusing "
+                "the pre-map packed response would freeze orbital-dependent "
+                "screening\n"
+                "  fix:  install compute_static_photon_response at the SC "
+                "map's screening seam before enabling this cell\n"
+                "  doc:  docs/input_reference.md, qp_solver.")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and mode is BispinorGWMode.BARE_TRANSVERSE
+                and config.compute_mode is ComputeMode.COHSEX):
+            raise ValueError(
+                "GATE packed_bare_cohsex_self_consistency_unimplemented: "
+                "static packed COHSEX has no per-map charge completion.\n"
+                "  got:  bispinor_gw = bare_transverse, "
+                "compute_mode = cohsex, qp_solver = self_consistent\n"
+                "  want: qp_solver = one_shot_dft, or a dynamic compute_mode "
+                "in {gn_ppm, hl_ppm, mpa}\n"
+                "  why:  COHSEX consumes the packed CC block, so each QP "
+                "map must rebuild W_00(0), charge S/wings and the coupled "
+                "Gamma completion from the current orbitals.  The dynamic "
+                "bare route consumes no packed CC block and needs none\n"
+                "  fix:  install the sole photon completion beside the "
+                "scalar SC map's static-W update before enabling this cell\n"
+                "  doc:  docs/input_reference.md, qp_solver.")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if not bool(config.bispinor):

@@ -25,12 +25,13 @@ disagree with this one, they win — this page owns the *wiring* only.
 Lorentz blocks are screened and which Sigma owner contracts them; it does not
 select a carrier.
 
-There is one packed static photon **operator**. Two deck situations reach it:
+There is one packed static photon **operator**. Three deck situations reach it:
 
 | route | selected by | current `χ` blocks | `Σ^B` contracted by | marked below |
 |---|---|---|---|---|
 | **packed, screened** | `bispinor_gw = full_static_cohsex` | all sixteen `χ^{IJ}` built, one packed Dyson solve | `gw.photon_sigma`, TT part of the sixteen-block `Σ_X` | **P** |
-| **packed, bare** | `bispinor_gw = bare_transverse` **and** the envelope below | twelve current blocks declared **zero**; packed solve skipped, CC screened by the scalar owner and spliced in, so `W_packed = diag(W_00, D_TT)` and `W_CT = 0` | the same `gw.photon_sigma` | **P** |
+| **packed, bare static** | `bispinor_gw = bare_transverse`, `compute_mode = cohsex`, and the envelope below | twelve current-response blocks declared **zero**; packed solve skipped, CC screened by the scalar owner and spliced in, so `W_packed = diag(W_00, D_TT)` and `W_CT = 0` | the same `gw.photon_sigma` | **P** |
+| **packed, bare dynamic** | `bispinor_gw = bare_transverse`, `compute_mode` in `{gn_ppm, hl_ppm, mpa}`, and the envelope below | packed CC block **absent**, not zero-filled; no packed W carrier; `W_CURRENT = V_CURRENT` | the same `gw.photon_sigma`, current blocks only | **P** |
 | **incumbent, bare** | `bispinor_gw = bare_transverse`, **outside** the envelope | none — the bare `D^{ij}` tiles are contracted directly | `gw.sigma_x_bispinor` | **B** |
 
 Orthogonally to *which* packed operator is built, `compute_mode` decides
@@ -39,12 +40,15 @@ Orthogonally to *which* packed operator is built, `compute_mode` decides
 | compute mode | packed Σ blocks | charge Σ | predicate |
 |---|---|---|---|
 | `cohsex` | all sixteen (`blocks = "all"`) | none beside it: the CC block of the packed operator **is** the charge Σ | `packed_photon_replaces_charge_sigma` |
-| `gn_ppm`, `hl_ppm` | the twelve with a current index (`blocks = "current"`), evaluated once at `ω = 0` | the ordinary scalar `Σ_x + Σ_c(ω)` on the same ISDF `W_00`, with `head_resolver`, `static_head_terms`, the `{static, probe}` role W's and the `ppm_pipeline` all unchanged | `uses_dynamic_packed_photon_route` |
+| `gn_ppm`, `hl_ppm`, `mpa` | the twelve with a current index (`blocks = "current"`), evaluated once at `ω = 0`; the sole consumer enforces `W_CURRENT = V_CURRENT` | the ordinary scalar `Σ_x + Σ_c(ω)` owner, with its head and GN/HL role-W or MPA fit transaction unchanged | `uses_dynamic_packed_photon_route` |
 | `x_only` (bare family only) | the twelve current-index X blocks; `SX(D_TT)=X(D_TT)`, `COH=0` | ordinary scalar charge X, with the incumbent `Σ^B` arms explicitly disabled | `uses_static_photon_response` plus `compute_mode = x_only` |
 
-`mpa` ownership is being resolved by lane SCMPA; this lane does not create a
-fallback. The packed dynamic route's run-record line is `Photon Sigma`, beside
-`Photon route` and `Photon head`.
+The absent-CC layout is what admits `mpa`: it needs no independent static role
+because no packed consumer reads CC. `gw.mpa.sigma` remains the charge owner,
+including ordered residues and `sigC_odd`. Screened-current MPA does need a
+static CC role and refuses as `packed_screened_mpa_static_role_unimplemented`.
+The packed dynamic route's run-record line is `Photon Sigma`, beside `Photon
+route` and `Photon head`.
 
 **ONE envelope table at `34228021`.**
 It used to be written twice — six conditions in
@@ -56,8 +60,8 @@ yields `(accepted, got, want, klass, why, derived_key)`:
 
 | # | row | applies to | class |
 |---|---|---|---|
-| 1 | `compute_mode ∈ {x_only, cohsex, gn_ppm, hl_ppm}` (`PACKED_PHOTON_COMPUTE_MODES`) | both | IMPLEMENTATION LIMIT — `cohsex` is static, the plasmon-pole pair is dynamic (charge block dynamic, current blocks frozen at `ω = 0`), and bare `x_only` consumes scalar charge X plus packed current X; screened `x_only` has its own named refusal |
-| 2 | `qp_solver = one_shot_dft` | both | IMPLEMENTATION LIMIT |
+| 1 | `compute_mode ∈ {x_only, cohsex, gn_ppm, hl_ppm, mpa}` (`PACKED_PHOTON_COMPUTE_MODES`) | both | IMPLEMENTATION LIMIT — `cohsex` is static; the three dynamic modes keep charge with their scalar owner and use the absent-CC current layout; bare `x_only` consumes scalar charge X plus packed current X. Screened `x_only` and screened MPA have their own named refusals (no screened operand / missing static CC role) |
+| 2 | `qp_solver = one_shot_dft`, or `self_consistent` for bare dynamic mode | both | IMPLEMENTATION LIMIT — the bare current operator is orbital-independent and reused while each SC map re-contracts rotated orbitals; charge-consuming and screened-current maps have named refusals |
 | 3 | `screening_diagrams = w_rpa` | both | IMPLEMENTATION LIMIT |
 | 4 | `head_correction ∈ {full, off}` | both | PHYSICS/POLICY (row 20) |
 | 5 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived** |
@@ -504,8 +508,8 @@ an exhaustiveness refusal:
 |---|---|---|
 | `packed_photon_replaces_charge_sigma` (`compute_mode = cohsex`) | `:845-889` | the sixteen-block contraction owns `Σ_X`, `Σ_SX`, `Σ_COH` outright. Its three refusals fire before any allocation: outside `compute_mode = cohsex`, with no packed response ("Refusing instead of falling back to charge-only screened COHSEX"), and with scalar `static_head_terms` present (double count) |
 | bare-family `compute_mode = x_only` | before the dynamic arm | scalar charge X is computed with the incumbent transverse arms disabled; the packed current blocks contribute X with `SX=X` and `COH=0`. Residual checks refuse if that algebra is violated |
-| `uses_dynamic_packed_photon_route` (the plasmon-pole pair) | `:890-990` | the scalar `compute_sigma_x` runs with the incumbent `Σ^B` arms **explicitly off** (`wfns_transverse=None`, `bispinor_v_q_path=None`) and keeps `static_head_terms` (the CC bare-X head); the packed consumer is called with `blocks = "current"` (`:955`) and its `SX + COH` is booked into `sig_x` (`:973`), which is arithmetically the same `Σ_xc` as adding an `ω`-independent term to `Σ_c` and is the seam the incumbent route already used for `Σ^B`. The current sector's bare-exchange and static-correlation magnitudes are printed at the seam |
-| `uses_static_photon_response` with neither of the above | after the dynamic arm | `NotImplementedError` naming `PACKED_PHOTON_COMPUTE_MODES`; it is an internal exhaustiveness guard, not a fallback |
+| `uses_dynamic_packed_photon_route` (GN/HL/MPA) | `:890-990` | the scalar `compute_sigma_x` runs with the incumbent `Σ^B` arms **explicitly off** (`wfns_transverse=None`, `bispinor_v_q_path=None`) and keeps `static_head_terms` (the CC bare-X head); the packed consumer is called with `blocks = "current"` and `charge_block_state = absent_dynamic_scalar_owner`. It aliases `W_CURRENT` to `V_CURRENT`, so `SX = X`, `COH = 0`, and books that static contribution into `sig_x`. Control then reaches the mode's unchanged GN/HL or MPA charge-Sigma branch |
+| `uses_static_photon_response` with neither of the above | `:991-1008` | exhaustiveness refusal naming `PACKED_PHOTON_COMPUTE_MODES`; no parsed supported deck reaches it |
 
 `finalize_dynamic_sigma` carries the packed per-sector Γ diagnostics through
 to `sigma_freq_debug.dat` (`:342-549`, passed at `:1320`); on the dynamic
@@ -518,7 +522,7 @@ there is the dynamic model's, not the packed completion's.
 | per-block operands | `photon_layout.photon_block_view` (`:279`), fetched at `photon_sigma.py:401-402` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')` — a `dynamic_slice`, never a gather | P |
 | Green function `G` | `greens_function_kernel.build_G`, face layout | `(nk, ns, μ_L, ns, μ_R)` | `P(None,None,'x',None,'y')` (`wavefunction_bundle.py:236`) | both |
 | head-attribution diagnostics | `photon_sigma.py:410-414` (accumulated at `:450-471`) via `photon_layout.photon_q0_low_rank_block` (`:676`) | one `(1, p_A, p_B)` block | `P(None,'x','y')` | P |
-| `Σ^B`, bare transverse — **incumbent route only** | `sigma_x_bispinor.compute_sigma_x_bispinor` (`:77`), nine `(i,j)` tiles at `:189-190`. This lane adds no fallback to it: restart, local/one-GPU and bare `x_only` all use the packed operator; `no_local_fields` and ladder diagrams refuse by name. SC/MPA and bulk ownership belong to lanes SCMPA and BULK | `(nk, nb_sigma, nb_sigma)` | replicated after a gather-then-window (`:221-235`) | B |
+| `Σ^B`, bare transverse — **incumbent route only** | `sigma_x_bispinor.compute_sigma_x_bispinor` (`:77`), nine `(i,j)` tiles at `:189-190`. Retained only for the classes still outside the packed envelope (bulk, until lane BULK lands). Restart, local/one-GPU, bare `x_only`, and slab GN/HL/MPA including the supported bare dynamic SC class reach `Σ^B` through the packed current consumer; `no_local_fields`, ladder/resolvent diagrams, screened restart, screened `x_only`, screened MPA, screened SC and bare COHSEX SC refuse by name rather than falling back | `(nk, nb_sigma, nb_sigma)` | replicated after a gather-then-window (`:221-235`) | B |
 | transverse Hartree | `sigma_dispatch._compute_live_hartree` (`:302-335`) → `kin_ion_io.compute_hartree_matrix` (`:759`) | `charge`, `transverse`, each `(nk_full, nb, nb)` Ry | `P(None,'x','y')` with `return_sharded=True` | **both** |
 
 **The sixteen-block contraction** is a plain nested Python loop (`A` at
@@ -642,14 +646,17 @@ and again at driver entry (`gw_init.py:3101`).
 | `bispinor_packed_restart_gamma_{missing,shape}` / `bispinor_packed_restart_w0_missing` | `file_io.tagged_arrays` | the bare rebuild lacks its four authenticated literal-Gamma vectors or its ready scalar W0 (for a W-consuming mode) |
 | (deck key, not a gate) `bispinor_tt_head_correction` | `read_lorrax_input` | the key is REMOVED and refused at any value, naming the Γ-cell completion that carries the head |
 | `bispinor_self_consistency_requires_live_four_current` | `:3997` | bispinor QSGW with explicit `density_self_consistent = false` |
+| `packed_screened_mpa_static_role_unimplemented` | `gw_config.refuse_unsupported_bispinor_gw` | `full_static_cohsex` with `compute_mode = mpa`; the MPA fit transaction does not expose its exact static W to the packed screened assembly |
+| `packed_screened_self_consistency_unimplemented` | `gw_config.refuse_unsupported_bispinor_gw` | screened-current QSGW; all sixteen chi blocks, the packed solve and coupled head would need rebuilding per map |
+| `packed_bare_cohsex_self_consistency_unimplemented` | `gw_config.refuse_unsupported_bispinor_gw` | bare-family COHSEX QSGW; CC and the charge S/wing completion are consumed and have no per-map packed owner |
 | `bispinor_gw_requires_bispinor` | `:4044` | `bispinor_gw = full_static_cohsex` with `bispinor = false` |
 | `static_bispinor_photon_head_slab_only` | `:4055` | the coupled completion is requested outside a slab; no bulk integrator exists |
 | `static_bispinor_photon_envelope` | `gw_config.refuse_unsupported_bispinor_gw`, over `packed_static_envelope` | any envelope row fails |
 | `bispinor_tt_head_unsupported` | `:4086-4137` | a hand-built TT head lacks bispinor or has unsupported dimensionality |
-| (no id) SC × dynamic | `gw_jax.py:274-285` | self-consistent solver with a dynamic mode |
+| `packed_dynamic_sc_requires_current_operator` | `sc_iteration.run_sc_driver` | a served bare dynamic SC route reaches the map without both the immutable photon response and transverse DFT bundle |
 | (no id) missing current centroids | `gw_jax.py:579-584`, `gw_init.py:1425-1428` | `bispinor = true` without `centroids_file_current` |
-| (no id) photon Σ envelope | `sigma_dispatch.py:845` ff. | the static arm: outside `cohsex`; without a packed response; with scalar `static_head_terms`. The dynamic arm (`:890`) refuses a mode that builds static screened channels, and `:991` refuses a packed deck on a mode with no branch (`mpa`) |
-| (no id) packed response needs a config | `w_isdf.compute_static_photon_response` | the packed path is called without the run config, or its explicit `screen_current` disagrees with `bispinor_gw` |
+| (no id) photon Σ envelope | `sigma_dispatch.py:845` ff. | the static arm: outside `cohsex`; without a packed response; with scalar `static_head_terms`. The dynamic arm refuses a mode that builds static screened channels; `photon_sigma` refuses an absent CC block unless `blocks = current` and no W carrier is supplied; the exhaustiveness guard names `PACKED_PHOTON_COMPUTE_MODES` |
+| (no id) packed response needs a config | `w_isdf.compute_static_photon_response` | the packed path is called without the run config, or its explicit `screen_current` disagrees with `bispinor_gw`; the Dyson plan is `distributed` on a square multi-rank mesh and `local` on a true 1×1 mesh (the bare family needs no packed solve) |
 | `GATE static_gauge_head_fold_{ward,hermiticity}` | `head_correction.py:1365,1370` | Γ-fold residuals over `1e-8` / `1e-10` (`:158-159`) |
 | `GATE static_photon_{dyson,polygon}_*` | `head_correction.py:1249-1295` (helpers `:1159-1246`) | coupled-solve and polygon certificates, budget `1e-9` |
 | `GATE photon_head_sigma_sector_closure` | `photon_sigma.py:515-520` | CC + CT/TC + TT does not close on the direct sixteen-block total |

@@ -80,6 +80,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 import common.parallel_transport as parallel_transport  # noqa: E402
 import gw.qsgw_head as qsgw_head  # noqa: E402
 from gw.head_correction import (  # noqa: E402
+    STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+    STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
     complete_static_slab_photon_q0,
     static_hall_linear_response,
 )
@@ -516,7 +518,8 @@ def run_case(mesh, sigma_H, *, wings=True, seed=20260901,
     V_in, W_in = _packed_pair(fixture, mesh)
     V_out, W_out, evidence = complete_static_slab_photon_q0(
         V_in, W_in, fixture.response, fixture.g0_X, fixture.g0_Y,
-        receipt, mesh_xy=mesh)
+        receipt, mesh_xy=mesh,
+        charge_block_state=STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
 
     S_eff = schur_folded_response(
         fixture.response, fixture.W_host[0], cell_volume, wing_sign=wing_sign)
@@ -622,7 +625,8 @@ def test_completed_gamma_body_is_hermitian():
     _, W_in = _packed_pair(fixture, _mesh(1))
     _, W_out, _ = complete_static_slab_photon_q0(
         *_packed_pair(fixture, _mesh(1)), fixture.response,
-        fixture.g0_X, fixture.g0_Y, _receipt(), mesh_xy=_mesh(1))
+        fixture.g0_X, fixture.g0_Y, _receipt(), mesh_xy=_mesh(1),
+        charge_block_state=STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
     delta = _gather(W_out)[0] - fixture.W_host[0]
     assert float(np.max(np.abs(delta))) > 1.0e-6
 
@@ -645,6 +649,33 @@ def test_zero_hall_decouples_into_charge_head_plus_bare_transverse():
     D_got = np.asarray(evidence.bare_D_mean)
     assert abs(np.trace(D_got[1:, 1:]) + 2.0 * D_got[0, 0]) <= (
         1.0e-13 * abs(D_got[0, 0]))
+
+
+def test_absent_charge_completion_inserts_only_bare_D():
+    """Dynamic bare routes must not evaluate a hidden charge-head fold."""
+    mesh = _mesh(1)
+    receipt = _receipt()
+    fixture = _fixture(mesh, sigma_H=np.zeros(3))
+    V_in, _ = _packed_pair(fixture, mesh)
+    V_out, W_out, evidence = complete_static_slab_photon_q0(
+        V_in, None, None, fixture.g0_X, fixture.g0_Y, receipt,
+        mesh_xy=mesh,
+        charge_block_state=STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+        layout=fixture.response.layout)
+    _, D_mean = reference_moments(
+        receipt, np.zeros((2, 2, 4, 4), dtype=np.complex128), np.zeros(3))
+    g0x = _gather(fixture.g0_X)
+    g0y = _gather(fixture.g0_Y)
+    V_ref = fixture.V_host[0] + np.einsum(
+        "Ai,AB,Bj->ij", np.conj(g0x), D_mean, g0y,
+        optimize=True) / float(receipt.cell_volume)
+    assert W_out is None
+    assert evidence.screened_moments is None
+    assert evidence.max_backward_residual is None
+    assert evidence.charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_ABSENT
+    assert len(evidence.q0_factors.screened_pairs) == 1
+    assert _rel(np.asarray(evidence.bare_D_mean), D_mean) < _TOL
+    assert _rel(_gather(V_out)[0], V_ref) < _TOL
 
 
 def test_zero_wings_reduce_the_folded_response_to_S():
