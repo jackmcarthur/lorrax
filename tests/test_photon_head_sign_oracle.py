@@ -50,6 +50,13 @@ SCOPE, stated up front (TASTE.md: state what a check could NOT have seen).
   the SAME provider-issued cubature.  It consumes the response record, so
   it is blind to a joint wing flip and to a sign error inside the shared
   ``vcoul`` D; negative controls N2/N3 measure that sensitivity explicitly.
+* Part C tests the ABSOLUTE CENTROID MEASURE in an exact ISDF model:
+  centroids are every real-space point and ``zeta_mu(r)=delta_mu,r``.  The
+  physical body operator is ``Omega*W_code``, while the directly evaluated
+  Adler--Wiser wings are ``chi_hb=Y/Omega`` and ``chi_bh=Z/Omega``.  It
+  forms the wing attachment and all four reattachment families through
+  those two independent representations.  Omitting the final physical-to-
+  stored ``1/Omega`` is an explicit factor-``Omega`` negative control.
 * Meshes are 1x1 (and 2x2 when four devices are visible).  Sharding,
   collectives and the padded-channel mask are NOT the subject here; a 2x2
   arm exercises the mask only incidentally.
@@ -735,6 +742,144 @@ def test_schur_fold_and_rank4_reattachment_are_one_block_inverse_identity():
     assert np.max(np.abs(unfolded - W[:nh, :nh])) > 1.0e-3
 
 
+# --------------------------------------------------------------------------
+# Part C -- exact centroid measure and absolute wing normalisation.
+# --------------------------------------------------------------------------
+
+def part_c_exact_measure_residuals(seed=585):
+    r"""Close the absolute wing relation in an exact discrete ISDF basis.
+
+    With every grid point selected as a centroid,
+    ``zeta_mu(r)=delta_mu,r`` and the forward Fourier convention gives
+    ``g0_mu=1/N_r``.  Real-space wavefunctions use the matching FFT
+    normalisation ``sum_r |psi_n(r)|^2=N_r``, hence the literal-Gamma
+    insertion is exactly one.  A physical real-space body kernel is
+    ``Omega`` times its stored LORRAX matrix, while Part A's independently
+    evaluated Adler--Wiser wings obey ``Y=Omega*chi_hb`` and
+    ``Z=Omega*chi_bh``.  Therefore
+
+    ``(Omega W_code)(Z/Omega) = W_code Z``
+
+    on the left (and analogously on the right), and converting the physical
+    completed body back to storage supplies exactly one final ``1/Omega``.
+    """
+    rng = np.random.default_rng(seed)
+    n_r, n_band, n_occ = 7, 4, 2
+    cell_volume = 17.25
+    energies = np.asarray([[-1.4, -0.5, 0.7, 1.9]], dtype=np.float64)
+    occupations = np.zeros_like(energies)
+    occupations[:, :n_occ] = 1.0
+
+    psi = (rng.normal(size=(1, 1, n_r, n_band))
+           + 1j * rng.normal(size=(1, 1, n_r, n_band)))
+    psi *= np.sqrt(
+        n_r / np.sum(np.abs(psi) ** 2, axis=(1, 2), keepdims=True))
+    g0 = np.full(n_r, 1.0 / n_r, dtype=np.complex128)
+    insertion = np.einsum(
+        "m,ksmn,ksmn->kn", g0, np.conj(psi), psi, optimize=True)
+
+    raw_v = (rng.normal(size=(2, 1, n_band, n_band))
+             + 1j * rng.normal(size=(2, 1, n_band, n_band)))
+    velocity = 0.5 * (raw_v + np.conj(np.swapaxes(raw_v, -1, -2)))
+    D_jet = density_jet(velocity, energies)
+    body_vertex = _centroid_vertex(psi)
+    chi_hb = adler_wiser_chi(
+        D_jet, body_vertex, energies, occupations,
+        cell_volume=cell_volume, nk_tot=1, nspin=1, nspinor=1)
+    chi_bh = adler_wiser_chi(
+        body_vertex, D_jet, energies, occupations,
+        cell_volume=cell_volume, nk_tot=1, nspin=1, nspinor=1)
+    Y = cell_volume * chi_hb
+    Z = cell_volume * chi_bh
+
+    raw_W = (rng.normal(size=(n_r, n_r))
+             + 1j * rng.normal(size=(n_r, n_r)))
+    W_code = 0.04 * (raw_W + np.conj(raw_W.T))
+    W_physical = cell_volume * W_code
+    left_direct = W_physical @ chi_bh
+    right_direct = chi_hb @ W_physical
+    left_rank4 = W_code @ Z
+    right_rank4 = Y @ W_code
+
+    # Scalar charge-head moments for u,v in (0,x,y).  The values are
+    # deliberately nonsymmetric so every family is independently nonzero.
+    moments = np.asarray(
+        [[1.3, -0.17, 0.09],
+         [0.21, 0.031, -0.014],
+         [-0.08, 0.019, 0.027]], dtype=np.complex128)
+    direct_families = {
+        "00": moments[0, 0] * np.outer(np.conj(g0), g0) / cell_volume,
+        "0a": sum(
+            moments[0, a + 1] * np.outer(np.conj(g0), right_direct[a])
+            for a in range(2)) / cell_volume,
+        "a0": sum(
+            moments[a + 1, 0] * np.outer(left_direct[:, a], g0)
+            for a in range(2)) / cell_volume,
+        "ab": sum(
+            moments[a + 1, b + 1]
+            * np.outer(left_direct[:, a], right_direct[b])
+            for a in range(2) for b in range(2)) / cell_volume,
+    }
+    rank4_families = {
+        "00": moments[0, 0] * np.outer(np.conj(g0), g0) / cell_volume,
+        "0a": sum(
+            moments[0, a + 1] * np.outer(np.conj(g0), right_rank4[a])
+            for a in range(2)) / cell_volume,
+        "a0": sum(
+            moments[a + 1, 0] * np.outer(left_rank4[:, a], g0)
+            for a in range(2)) / cell_volume,
+        "ab": sum(
+            moments[a + 1, b + 1]
+            * np.outer(left_rank4[:, a], right_rank4[b])
+            for a in range(2) for b in range(2)) / cell_volume,
+    }
+
+    residuals = {
+        "insertion": float(np.max(np.abs(insertion - 1.0))),
+        "left_attachment": _rel(left_rank4, left_direct),
+        "right_attachment": _rel(right_rank4, right_direct),
+        # This is claim 585's relation written literally; g0 is nonzero at
+        # every point in the exact delta basis.
+        "quoted_relation": _rel(
+            left_direct / np.conj(g0)[:, None],
+            left_rank4 / np.conj(g0)[:, None]),
+    }
+    for family in ("00", "0a", "a0", "ab"):
+        residuals[f"family_{family}"] = _rel(
+            rank4_families[family], direct_families[family])
+
+    direct_ab_physical = direct_families["ab"] * cell_volume
+    direct_ab_extra_divide = direct_families["ab"] / cell_volume
+    residuals["omega_omitted"] = _rel(
+        rank4_families["ab"], direct_ab_physical)
+    residuals["omega_doubled"] = _rel(
+        rank4_families["ab"], direct_ab_extra_divide)
+    residuals["omega_omitted_norm_ratio"] = float(
+        np.linalg.norm(direct_ab_physical)
+        / np.linalg.norm(rank4_families["ab"]))
+    residuals["omega_doubled_norm_ratio"] = float(
+        np.linalg.norm(direct_ab_extra_divide)
+        / np.linalg.norm(rank4_families["ab"]))
+    residuals["cell_volume"] = cell_volume
+    return residuals
+
+
+def test_part_c_exact_measure_closes_absolute_wing_normalisation():
+    result = part_c_exact_measure_residuals()
+    for key in ("insertion", "left_attachment", "right_attachment",
+                "quoted_relation", "family_00", "family_0a", "family_a0",
+                "family_ab"):
+        assert result[key] < 1.0e-12, (key, result[key])
+    np.testing.assert_allclose(
+        result["omega_omitted_norm_ratio"], result["cell_volume"],
+        rtol=1.0e-14, atol=0.0)
+    np.testing.assert_allclose(
+        result["omega_doubled_norm_ratio"], 1.0 / result["cell_volume"],
+        rtol=1.0e-14, atol=0.0)
+    assert result["omega_omitted"] > 0.9
+    assert result["omega_doubled"] > 0.9
+
+
 def test_receipt_samples_never_reach_the_singular_origin():
     receipt = _receipt()
     for chunk in receipt.chunks:
@@ -836,6 +981,24 @@ def main():  # pragma: no cover - reporting entry point
               f"  TT {residual['moments_TT']:.3e}"
               f"  W {residual['W_packed']:.3e}")
 
+    print("\n== PART C: exact centroid measure / absolute normalisation ==")
+    exact = part_c_exact_measure_residuals()
+    for key in ("insertion", "left_attachment", "right_attachment",
+                "quoted_relation", "family_00", "family_0a", "family_a0",
+                "family_ab"):
+        print(f"  {key:28s} rel = {exact[key]:.3e}")
+    print(f"  omitted 1/Omega control ratio = "
+          f"{exact['omega_omitted_norm_ratio']:.12f} "
+          f"(Omega={exact['cell_volume']:.12f})")
+    print(f"  doubled 1/Omega control ratio = "
+          f"{exact['omega_doubled_norm_ratio']:.12f} "
+          f"(1/Omega={1.0 / exact['cell_volume']:.12f})")
+
+    worst = max(worst, max(
+        exact[key] for key in (
+            "insertion", "left_attachment", "right_attachment",
+            "quoted_relation", "family_00", "family_0a", "family_a0",
+            "family_ab")))
     print(f"\n[oracle] WORST residual over every positive case = {worst:.3e}")
     return 0 if worst < _TOL else 1
 
