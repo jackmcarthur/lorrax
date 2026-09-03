@@ -121,6 +121,13 @@ class GWProductionReport:
         end.  Exceptions still use stderr through the shared fail-fast path.
         """
         text = sep.join(str(v) for v in args)
+        # Fixed-SC quadrature identity is a physics invariant, not backend
+        # chatter: retain its compact receipt so every map's exact node set
+        # and zero-rebuild claim remain auditable after live stdout is gone.
+        if (text.startswith("  SC fixed quadrature: ")
+                or text.startswith("    SC fixed window: ")):
+            self.progress(text)
+            return
         # The long-loop cadence is part of the scientific run record, not
         # component chatter.  LoopProgress owns these three stable shapes.
         if (text.startswith("Started ") or text.startswith("Finished ")
