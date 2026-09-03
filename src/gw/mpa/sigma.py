@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import device_put_process_local
+from common.collectives import device_put_process_local, gather_to_host
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
@@ -138,6 +138,7 @@ def _integrate_sigma_batches(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
+    include_fermi_pu=False,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -154,6 +155,13 @@ def _integrate_sigma_batches(
         if not brackets:
             raise ValueError("MPA Sigma band-bracket plan must be nonempty")
     face_kwargs = face_kernel_kwargs(wfns)
+    n_protected = int(s.nb_sigma)
+    n_total_logical = int(meta.b_id_4_user) - int(s.b0)
+    if not n_protected <= n_total_logical <= int(s.nb_full):
+        raise ValueError(
+            "MPA Sigma fixed-index extents require P <= P+U <= loaded; "
+            f"got P={n_protected}, P+U={n_total_logical}, "
+            f"loaded={int(s.nb_full)}.")
     if wfns.layout == "legacy":
         # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
         # extent.  Identical on an unsplit deck.  UNVERIFIED on a split
@@ -162,7 +170,9 @@ def _integrate_sigma_batches(
         # never executed under a split.
         state_slice = s.full if bracketed else s.sigma_sum
         psi_coh_xn, psi_coh_yr = wfns.xn(state_slice), wfns.yr(state_slice)
-        psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
+        psi_proj_xr = wfns.xr(s.sigma)
+        psi_proj_yn = wfns.yn(
+            slice(0, n_total_logical) if include_fermi_pu else s.sigma)
         # THE SAME precondition the PPM sharded branch owns.  This executor
         # accumulates into a P(None,None,'x','y') array and then strips the pad
         # block off both trailing axes, which on an indivisible window leaves a
@@ -172,8 +182,25 @@ def _integrate_sigma_batches(
         # at one seam.
         assert_sharded_sigma_window_divides_mesh(
             int(psi_proj_xr.shape[1]), mesh_xy, ansatz="compute_mode = mpa")
-        psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
-            psi_proj_xr, psi_proj_yn, mesh_xy)
+        if include_fermi_pu:
+            p_x = int(mesh_xy.shape['x'])
+            p_y = int(mesh_xy.shape['y'])
+            m = int(psi_proj_xr.shape[1])
+            n = int(psi_proj_yn.shape[3])
+            m_pad = -(-m // p_x) * p_x
+            n_pad = -(-n // p_y) * p_y
+            if m_pad != m:
+                psi_proj_xr = jnp.pad(
+                    psi_proj_xr,
+                    ((0, 0), (0, m_pad - m), (0, 0), (0, 0)))
+            if n_pad != n:
+                psi_proj_yn = jnp.pad(
+                    psi_proj_yn,
+                    ((0, 0), (0, 0), (0, 0), (0, n_pad - n)))
+            nb_real = n_protected
+        else:
+            psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
+                psi_proj_xr, psi_proj_yn, mesh_xy)
         spatial_shape = (int(psi_proj_xr.shape[0]),
                          int(psi_proj_xr.shape[1]),
                          int(psi_proj_yn.shape[3]))
@@ -333,12 +360,11 @@ def _integrate_sigma_batches(
         del B, B_odd, Omega
         gc.collect()
 
-    sigma = strip_sigma_window(
-        accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
+    sigma_wide = accumulator.finalize()
     if bracketed:
-        sigma = jax.jit(
+        sigma_wide = jax.jit(
             lambda values: jnp.cumsum(values, axis=0),
-            out_shardings=sigma.sharding)(sigma)
+            out_shardings=sigma_wide.sharding)(sigma_wide)
         if band_counts is None:
             band_counts = tuple(
                 int(s.nb_sigma_sum) if hi is None else int(hi)
@@ -348,6 +374,35 @@ def _integrate_sigma_batches(
         if len(band_counts) != len(brackets):
             raise ValueError(
                 "MPA Sigma band_counts must align with band brackets")
+    sigma_c_fermi_pu = None
+    if include_fermi_pu and n_total_logical > n_protected:
+        # P x U is needed at one frequency only.  The face carrier already
+        # built the full band face; legacy widened only the projector's
+        # right endpoint in this same sweep.  Gather ONE interpolated matrix,
+        # never the omega cube, then retain just the logical rectangular
+        # block replicated for the small Hamiltonian assembly.
+        omega_hi = int(np.clip(np.searchsorted(omega, 0.0, side="left"),
+                               1, omega.size - 1))
+        omega_lo = omega_hi - 1
+        denom = float(omega[omega_hi] - omega[omega_lo])
+        weight_hi = float((0.0 - omega[omega_lo]) / denom)
+        weight_lo = 1.0 - weight_hi
+        source = sigma_wide[-1] if bracketed else sigma_wide
+        at_fermi = (weight_lo * source[omega_lo]
+                    + weight_hi * source[omega_hi])
+        at_fermi_host = gather_to_host(at_fermi)
+        outer_host = np.ascontiguousarray(
+            at_fermi_host[:, :n_protected,
+                           n_protected:n_total_logical])
+        sigma_c_fermi_pu = device_put_process_local(
+            outer_host,
+            NamedSharding(mesh_xy, P(None, None, None)))
+        print_fn(
+            "  MPA Sigma fixed-index outer face: retained "
+            f"Sigma_c(E_F) P×U = ({n_protected},{n_total_logical - n_protected}) "
+            "from the shared sweep")
+    sigma = strip_sigma_window(
+        sigma_wide, nb_real, mesh_xy=mesh_xy)
     transform_saving = int(logical_tau_pairs - n_tau)
     print_fn(
         f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
@@ -365,6 +420,7 @@ def _integrate_sigma_batches(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
         sigma_c_kij=sigma,
+        sigma_c_fermi_pu_kij=sigma_c_fermi_pu,
         band_counts=(() if band_counts is None else tuple(band_counts)),
         odd_even_residue_ratio=ratio)
 
@@ -404,6 +460,7 @@ def integrate_sigma_store(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
+    include_fermi_pu=False,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -438,6 +495,7 @@ def integrate_sigma_store(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
+            include_fermi_pu=include_fermi_pu,
             print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
@@ -522,6 +580,7 @@ def compute_sigma_c_mpa_omega_grid(
     sigma_branches=None,
     band_brackets=None,
     band_counts=None,
+    include_fermi_pu=False,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -635,6 +694,7 @@ def compute_sigma_c_mpa_omega_grid(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
+            include_fermi_pu=include_fermi_pu,
             print_fn=print_fn)
         if not ordered_residues:
             return total

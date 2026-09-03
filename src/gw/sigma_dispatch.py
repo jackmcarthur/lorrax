@@ -136,6 +136,11 @@ class SigmaResult:
     #: keeps the default path's object graph unchanged.
     sigma_xc_kij_ry_unextrap: jax.Array | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
+    #: Internal fixed-index SC face at one frequency.  These rectangular
+    #: matrices are consumed by ``sc_iteration.gw_iteration_map`` before the
+    #: final result is rotated back for the ordinary P x P writers.
+    sigma_xc_pu_fermi_kij_ry: jax.Array | None = None
+    v_h_pu_kij_ry: jax.Array | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     sigma_c_odd_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
@@ -246,6 +251,8 @@ SIGMA_BASIS_FIELDS = (
     "sigma_c_odd_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",
+    "sigma_xc_pu_fermi_kij_ry",
+    "v_h_pu_kij_ry",
 )
 
 #: Band-indexed but read from the WFN file, hence DFT basis on every
@@ -314,7 +321,7 @@ def _rotate_v_h_to_qp(v_h_dft, U, *, mesh: Mesh):
 
 
 def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
-                          print_fn=print):
+                          include_outer=False, print_fn=print):
     """Build the sole Hartree representation: exact, live, and G-space."""
     from dataclasses import replace
     from common.four_current_model import resolve_four_current_representation
@@ -329,10 +336,12 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
         "  V_H: exact FFT-grid matrix built live in G-space "
         "(ρ: one psum; Poisson: replicated; matrix elements: two-axis "
         "band sharded; star broadcast stays on device).")
+    logical_stop = (int(meta.b_id_4_user) if include_outer
+                    else int(band_slices.b3))
     exact = compute_hartree_matrix(
         wfn, sym, hartree_meta,
         truncation_2d=(int(config.sys_dim) == 2),
-        nb=int(band_slices.b3), mesh=mesh_xy,
+        nb=logical_stop, mesh=mesh_xy,
         band_chunk_size=int(config.memory.band_chunk_size),
         include_transverse=include_transverse,
         charge_nspinor=(
@@ -343,8 +352,8 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
         print_fn=print_fn, return_sharded=True)
     charge = exact.charge if include_transverse else exact
     window = (slice(None),
-              slice(int(band_slices.b0), int(band_slices.b3)),
-              slice(int(band_slices.b0), int(band_slices.b3)))
+              slice(int(band_slices.b0), logical_stop),
+              slice(int(band_slices.b0), logical_stop))
     return charge[window], (exact.transverse[window]
                             if include_transverse else None)
 
@@ -359,6 +368,9 @@ def finalize_dynamic_sigma(
     *,
     sig_x: jax.Array,
     sig_h: jax.Array,
+    sig_x_pu: jax.Array | None = None,
+    sig_c_fermi_pu: jax.Array | None = None,
+    sig_h_pu: jax.Array | None = None,
     v_h_scalar: jax.Array | None = None,
     h_transverse: jax.Array | None = None,
     hartree_omitted: bool = False,
@@ -592,6 +604,10 @@ def finalize_dynamic_sigma(
         sigma_lorentz_skij_ry=sigma_lorentz,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
         sigma_c_omega_kij_ry=sigma_c_omega,
+        sigma_xc_pu_fermi_kij_ry=(
+            None if sig_c_fermi_pu is None or sig_x_pu is None
+            else sig_x_pu + sig_c_fermi_pu),
+        v_h_pu_kij_ry=sig_h_pu,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         sigma_c_odd_at_dft_diag_ev=sigma_c_odd_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
@@ -743,6 +759,12 @@ def compute_sigma_xc(
     # entry check.  It is a dict lookup on a resolved enum, so it costs
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
+    need_sc_outer = (
+        mode.is_dynamic
+        and getattr(config.qp_solver, "value", config.qp_solver)
+        == "self_consistent"
+        and int(meta.b_id_4_user) > int(band_slices.b3))
+    sig_x_pu = None
 
     # ── THE ONE ENVELOPE ROW NO DECK KEY CAN EXPRESS ─────────────────────
     # low_mem_bands's other four unsupported combinations (head_correction,
@@ -1012,6 +1034,12 @@ def compute_sigma_xc(
         # remove.  ``static_head_terms`` is the scalar band-diagonal q->0
         # bare-X head, i.e. the CC head, and it stays the scalar owner's --
         # the packed completion supplies only the TT/CT Gamma cell here.
+        if need_sc_outer:
+            raise NotImplementedError(
+                "fixed-index SC P x U Sigma is not implemented for the "
+                "dynamic packed-photon route; its rectangular current "
+                "projection must be added before this route can use the "
+                "new full-band Hamiltonian.")
         sig_x = compute_sigma_x(
             wfns, V_q, meta, mesh_xy,
             Gij=photon_Gij,
@@ -1121,20 +1149,32 @@ def compute_sigma_xc(
             bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
             return_transverse=_bispinor_sigma,
+            return_outer=need_sc_outer,
         )
-        if _bispinor_sigma:
+        if _bispinor_sigma and need_sc_outer:
+            sig_x, sig_x_b, sig_x_pu = sigma_x_result
+            sigma_lorentz = jnp.stack((
+                sig_x - sig_x_b,
+                jnp.zeros_like(sig_x_b),
+                sig_x_b,
+            ))
+        elif _bispinor_sigma:
             sig_x, sig_x_b = sigma_x_result
             sigma_lorentz = jnp.stack((
                 sig_x - sig_x_b,
                 jnp.zeros_like(sig_x_b),
                 sig_x_b,
             ))
+        elif need_sc_outer:
+            sig_x, sig_x_pu = sigma_x_result
         else:
             sig_x = sigma_x_result
         sig_sx = sig_coh = jnp.zeros_like(sig_x)
 
     # Density-SC rebuilds this same exact G-space operator from the evolving
     # orbitals directly in the DFT basis.  Other paths build it once here.
+    sig_h_pu = None
+    h_transverse_pu = None
     if omit_v_h:
         # A scalar zero preserves SigmaResult's arithmetic-compatible field
         # contract without allocating an otherwise dead (nk,nb,nb) matrix.
@@ -1144,20 +1184,32 @@ def compute_sigma_xc(
         sig_h = jnp.asarray(0, dtype=sig_x.dtype)
         h_transverse = None
     else:
-        sig_h, h_transverse = _compute_live_hartree(
+        sig_h_full, h_transverse_full = _compute_live_hartree(
             config, meta, band_slices, mesh_xy,
-            wfn=wfn, sym=sym, print_fn=print_fn)
-        sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
+            wfn=wfn, sym=sym, include_outer=need_sc_outer,
+            print_fn=print_fn)
+        sig_h_full = jnp.asarray(sig_h_full, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
             rotation = _place_band_rotation(
-                hartree_basis_rotation, mesh_xy, sig_h.dtype)
-            sig_h = _rotate_v_h_to_qp(sig_h, rotation, mesh=mesh_xy)
+                hartree_basis_rotation, mesh_xy, sig_h_full.dtype)
+            sig_h_full = _rotate_v_h_to_qp(
+                sig_h_full, rotation, mesh=mesh_xy)
+        if (h_transverse_full is not None
+                and hartree_basis_rotation is not None):
+            h_transverse_full = _rotate_v_h_to_qp(
+                jnp.asarray(h_transverse_full, dtype=sig_h_full.dtype),
+                rotation,
+                mesh=mesh_xy)
+        n_p = int(band_slices.nb_sigma)
+        sig_h = sig_h_full[:, :n_p, :n_p]
+        h_transverse = (None if h_transverse_full is None else
+                        h_transverse_full[:, :n_p, :n_p])
+        sig_h_pu = (sig_h_full[:, :n_p, n_p:]
+                    if need_sc_outer else None)
+        h_transverse_pu = (
+            h_transverse_full[:, :n_p, n_p:]
+            if need_sc_outer and h_transverse_full is not None else None)
     v_h_scalar = sig_h
-    if h_transverse is not None and hartree_basis_rotation is not None:
-        h_transverse = _rotate_v_h_to_qp(
-            jnp.asarray(h_transverse, dtype=sig_h.dtype),
-            rotation,
-            mesh=mesh_xy)
     if h_transverse is not None:
         # The exact periodic G-space current artifact is a separate operator,
         # so append it independently after the scalar source replacement.
@@ -1167,6 +1219,9 @@ def compute_sigma_xc(
         # H_T while silently mixing two densities.
         sig_h = sig_h + h_transverse
         sig_h.block_until_ready()
+        if sig_h_pu is not None:
+            sig_h_pu = sig_h_pu + h_transverse_pu
+            sig_h_pu.block_until_ready()
     if mode is ComputeMode.X_ONLY:
         # sigma_sx ← sig_x so the static sigma_diag.dat writer's sigSX
         # column reports Σ_X (incl. the bispinor Σ^B fold-in) instead of
@@ -1308,6 +1363,7 @@ def compute_sigma_xc(
             # this run's screening_diagrams either did or did not produce,
             # and the two are indistinguishable in the bytes.
             expected_screening_diagrams=config.screening.diagrams,
+            include_fermi_pu=need_sc_outer,
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
@@ -1335,6 +1391,9 @@ def compute_sigma_xc(
         return finalize_dynamic_sigma(
             body.sigma_c_kij, head_diag,
             sig_x=sig_x, sig_h=sig_h,
+            sig_x_pu=sig_x_pu,
+            sig_c_fermi_pu=body.sigma_c_fermi_pu_kij,
+            sig_h_pu=sig_h_pu,
             v_h_scalar=v_h_scalar, h_transverse=h_transverse,
             hartree_omitted=bool(omit_v_h),
             e_qp_ev=e_qp_ev,
@@ -1403,6 +1462,9 @@ def compute_sigma_xc(
         photon_head_sigma_basis=photon_head_sigma_basis,
         sigma_lorentz_static_skij_ry=sigma_lorentz,
         sig_x=sig_x, sig_h=sig_h,
+        sig_x_pu=sig_x_pu,
+        sig_c_fermi_pu=ppm_outputs.sigma_c_fermi_pu_kij_ry,
+        sig_h_pu=sig_h_pu,
         v_h_scalar=v_h_scalar, h_transverse=h_transverse,
         hartree_omitted=bool(omit_v_h),
         e_qp_ev=e_qp_ev,

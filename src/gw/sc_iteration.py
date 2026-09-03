@@ -81,6 +81,9 @@ from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
 from .gw_config import ComputeMode, HeadCorrection
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
+from .sc_loop import (
+    BandClasses, EvaluationPolicy, QpHamiltonian, SigmaTable,
+    effective_sigma)
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
 from .wavefunction_bundle import (
     BandSlices, Wavefunctions, rotate_wavefunctions)
@@ -221,6 +224,17 @@ def protected_band_convergence(
     )
 
 
+def _fixed_protected_count(inputs, width: int) -> int:
+    """Protected width, with compatibility for small synthetic loop tests."""
+    classes = getattr(inputs, "band_classes", None)
+    if classes is not None:
+        return int(classes.n_protected)
+    partition = getattr(inputs, "partition", None)
+    if partition is not None:
+        return int(np.asarray(partition.protected_mask).size)
+    return int(width)
+
+
 class _Converged(Exception):
     """Internal: stop the rCROP solve because the criterion was met.
 
@@ -266,6 +280,7 @@ class SCInputs:
     wfns_dft: Wavefunctions
     V_q: jax.Array
     kin_ion_dft: jax.Array
+    kin_ion_full_dft: jax.Array
     # ``gw.head_channel.HeadChannel`` or None.  Carried per-iteration because
     # every SC iteration re-solves W from the SAME V_q, so the Coulomb
     # placement has to travel with it or iteration 2 would quietly revert to
@@ -290,6 +305,8 @@ class SCInputs:
     input_dir: str
     partition: BandPartition
     e_dft_active_kn_ry: jax.Array      # (nk, nb_active) DFT energies for scissor fit
+    e_dft_full_kn_ry: jax.Array        # (nk, P+U) immutable DFT energies
+    band_classes: BandClasses
     valence_mask_active_kn: jax.Array  # (nk, nb_active) bool — for scissor val/cond split
     # Canonical DFT Fermi reference for the active scissor.  On an insulator
     # this is the SC map's own fixed-band-cut midgap (not the loader's possible
@@ -540,7 +557,8 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     from common.wfn_transforms import get_enk_bandrange
     enk_dft, _ = get_enk_bandrange(
         inputs.wfn, inputs.sym,
-        inputs.band_slices.sigma_range, inputs.band_slices.sigma_range,
+        (inputs.band_slices.b0, inputs.band_classes.outer_stop),
+        (inputs.band_slices.b0, inputs.band_classes.outer_stop),
         nspinor=inputs.meta.nspinor)
     enk_dft_ry = np.asarray(enk_dft, dtype=np.float64)
     nk, nb_active = enk_dft_ry.shape
@@ -1800,14 +1818,13 @@ def _dft_psi_sphere(inputs):
     """
     from common.wfn_layout import band_sphere_spec
 
-    b_lo, b_hi = inputs.band_slices.sigma_range
-    nb_sigma = int(inputs.kin_ion_dft.shape[1])
-    if (b_hi - b_lo) != nb_sigma:
+    b_lo = int(inputs.band_classes.band_start)
+    b_hi = int(inputs.band_classes.outer_stop)
+    nb_total = int(inputs.kin_ion_full_dft.shape[1])
+    if (b_hi - b_lo) != nb_total:
         raise ValueError(
-            f"_dft_psi_sphere: band_slices.sigma_range={(b_lo, b_hi)} spans "
-            f"{b_hi - b_lo} bands but the SC carry is {nb_sigma} wide.  These "
-            f"describe the same active subspace and a mismatch means one of "
-            f"them is b0-relative where the other is global.")
+            f"_dft_psi_sphere: fixed-index range={(b_lo, b_hi)} spans "
+            f"{b_hi - b_lo} bands but the SC carry is {nb_total} wide.")
     # Key on the GLOBAL RANGE, not on its width: two windows of equal
     # extent at different b0 are different ψ and must not share a cache
     # entry.
@@ -2319,6 +2336,100 @@ def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
     return state.partition if state.partition is not None else inputs.partition
 
 
+def _fixed_index_hamiltonian(
+    sigma_result: SigmaResult,
+    energies_full_ry,
+    U_full,
+    efermi_ry: float,
+    exact_hartree_dft: SCExactHartree | None,
+    inputs: SCInputs,
+):
+    """Apply the one fixed-index update law and return the DFT-basis map.
+
+    Sigma is produced on the full BZ in the current QP basis.  The update is
+    therefore assembled there, rotated once to the immutable DFT basis, and
+    only then selected to the loop's k-set.  This keeps the P/U block rule
+    independent of whether the optional IBZ carry is enabled.
+    """
+    classes = inputs.band_classes
+    missing = [name for name in (
+        "sigma_c_omega_kij_ry",
+        "sigma_xc_pu_fermi_kij_ry",
+        "v_h_pu_kij_ry",
+        "omega_grid_ev",
+    ) if getattr(sigma_result, name) is None]
+    if missing and classes.n_outer:
+        raise ValueError(
+            "fixed-index SC map is missing its P x U/table fields: "
+            + ", ".join(missing))
+    if sigma_result.sigma_c_omega_kij_ry is None:
+        raise NotImplementedError(
+            "the fixed-index self-consistent loop requires a dynamic "
+            "Sigma(omega) table; static X_ONLY/COHSEX SC has not been "
+            "defined by DESIGN_self_consistent_loop.md.")
+
+    kin_qp = _rotate_fixed_matrix(
+        inputs.kin_ion_full_dft, U_full,
+        mesh=inputs.mesh_xy, to_qp=True)
+    dft_h_full = jnp.asarray(inputs.e_dft_full_kn_ry)[:, :, None] * jnp.eye(
+        classes.n_total, dtype=jnp.complex128)[None, :, :]
+    dft_h_qp = _rotate_fixed_matrix(
+        dft_h_full, U_full, mesh=inputs.mesh_xy, to_qp=True)
+
+    if exact_hartree_dft is None:
+        v_h_pp = sigma_result.v_h_kij_ry
+        v_h_pu = sigma_result.v_h_pu_kij_ry
+    else:
+        v_h_full_dft = exact_hartree_dft.total
+        v_h_full_qp = _rotate_fixed_matrix(
+            v_h_full_dft, U_full, mesh=inputs.mesh_xy, to_qp=True)
+        v_h_pp = v_h_full_qp[:, :classes.n_protected,
+                             :classes.n_protected]
+        v_h_pu = v_h_full_qp[:, :classes.n_protected,
+                             classes.n_protected:]
+
+    table = SigmaTable(
+        omega_ev=np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
+        sigma_c_pp_wkij_ry=sigma_result.sigma_c_omega_kij_ry,
+        sigma_x_pp_kij_ry=sigma_result.sigma_x_kij_ry,
+        v_h_pp_kij_ry=v_h_pp,
+        sigma_xc_pu_fermi_kij_ry=(
+            sigma_result.sigma_xc_pu_fermi_kij_ry
+            if classes.n_outer else
+            jnp.zeros((int(inputs.meta.nk_tot), classes.n_protected, 0),
+                      dtype=jnp.complex128)),
+        v_h_pu_kij_ry=(
+            v_h_pu if classes.n_outer else
+            jnp.zeros((int(inputs.meta.nk_tot), classes.n_protected, 0),
+                      dtype=jnp.complex128)),
+        kin_ion_qp_kij_ry=kin_qp,
+        dft_h_qp_kij_ry=dft_h_qp,
+        e_dft_kn_ry=inputs.e_dft_full_kn_ry,
+    )
+    sigma_effective, diagnostics = effective_sigma(
+        table, classes,
+        EvaluationPolicy.coerce(inputs.config.sc.evaluation_policy),
+        np.asarray(energies_full_ry, dtype=np.float64) * RYD_TO_EV,
+        float(efermi_ry) * RYD_TO_EV,
+    )
+    H_qp = QpHamiltonian(kin_qp).build(sigma_effective)
+    H_dft_full = _rotate_fixed_matrix(
+        H_qp, U_full, mesh=inputs.mesh_xy, to_qp=False)
+    ks = _kstar(inputs)
+    H_dft = H_dft_full if ks.is_identity else ks.select(H_dft_full)
+    inputs.print_fn(
+        "    fixed-index SC update: "
+        f"policy={diagnostics['policy']}, P={classes.n_protected}, "
+        f"U={classes.n_outer}, outside(k,n)={diagnostics['n_outside']}, "
+        f"Delta={float(diagnostics['delta_ev']):+.9f} eV, "
+        f"P/U mismatch="
+        f"{float(diagnostics['boundary_mismatch_ev']):.9f} eV")
+    if not ks.is_identity:
+        _check_kstar_spread(
+            ks, H_dft_full, print_fn=inputs.print_fn)
+    return H_dft
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -2529,7 +2640,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     with inputs.mesh_xy:
         enk_entry = jax.lax.with_sharding_constraint(
             jnp.asarray(inputs.wfns_dft.enk).at[
-                :, inputs.band_slices.sigma].set(
+                :, slice(0, inputs.band_classes.n_total)].set(
                     jnp.asarray(E_full, dtype=inputs.wfns_dft.enk.dtype)),
             NamedSharding(inputs.mesh_xy, P(None, None)))
     entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
@@ -2557,34 +2668,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # mu, so this reproduces the frozen partition exactly; it only starts
     # to differ once the spectrum has actually moved.
     # ------------------------------------------------------------------
-    partition = inputs.partition
-    if entry_occ_state is not None:
-        _mu_ev = float(entry_occ_state.mu_ry) * RYD_TO_EV
-        # E_full is this map's active table on the full BZ -- the same rows
-        # and bands as inputs.e_dft_active_kn_ry, which is what the partition
-        # masks are applied to.
-        _e_active_now = np.asarray(E_full, dtype=np.float64)
-        partition = build_omega_band_partition(
-            _e_active_now, np.asarray(enk_entry, dtype=np.float64),
-            band_offset=int(inputs.band_slices.b0),
-            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
-            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
-            previous_partition=(state.partition
-                                if state.partition is not None
-                                else inputs.partition),
-            hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
-            label=f"SC map {int(state.iteration)} (mu-anchored)",
-            print_fn=inputs.print_fn)
-    partition = _apply_sc_buffer_partition(partition, inputs)
-    buffer_mask = _sc_buffer_mask(inputs)
-    if buffer_mask.any():
-        buffer_ids = np.flatnonzero(buffer_mask) + int(inputs.band_slices.b0) + 1
-        inputs.print_fn(
-            f"    SC window buffer: mode={inputs.config.sc.buffer_mode}, "
-            f"bands={_band_ranges(buffer_mask, band_offset=int(inputs.band_slices.b0))} "
-            f"(n={buffer_ids.size}); named core="
-            f"{int(inputs.meta.nelec) - int(inputs.config.nval) + 1}-"
-            f"{int(inputs.meta.nelec) + int(inputs.config.ncond)}")
+    # The band classes are fixed once by index.  Keep the legacy state field
+    # populated only until the old partition API is deleted after the study;
+    # it is not consulted by the map.
+    partition = (state.partition
+                 if state.partition is not None else inputs.partition)
+    buffer_mask = np.zeros(inputs.band_classes.n_total, dtype=bool)
 
     # Resolve an external MPA seed before any occupation consumer runs.  The
     # provider remains the sole owner of path resolution; production then
@@ -2645,12 +2734,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # ``None`` on an insulating deck: the caller keeps the index mask, which
     # IS this rule when nothing crosses.
     scissor_classes = None
-    if entry_occ_state is not None:
-        scissor_classes = classify_scissor_bands(entry_occ_state.f_kn)
-        if str(entry_occ_state.smearing_family) == "fixed":
-            _assert_index_mask_matches_classes(inputs, scissor_classes)
-        inputs.print_fn(
-            f"    SC scissor classes: {scissor_classes.summary()}")
 
     # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
     # the fit is derived from the current carry's eigenspectrum and the
@@ -2658,74 +2741,18 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # b4; apply_conduction_scissor_to_tail copies padding bit-for-bit.  The
     # optional ladder is consumed by rotate_wavefunctions, which remains the
     # single owner of occupation rebuilding after an energy change.
+    # P and U rotate together.  U's energies come from the full fixed-index
+    # Hamiltonian below; there is no separate energy-only tail or moving
+    # classification.
     enk_base = None
     tail_fit = None
-    tail_start = int(inputs.band_slices.sigma.stop)
-    logical_stop = (
-        int(inputs.meta.b_id_4_user) - int(inputs.band_slices.b0))
-    if logical_stop > tail_start:
-        from .scissor import k_star_weights
-
-        e_dft_fit = inputs.e_dft_active_kn_ry
-        valence_fit = inputs.valence_mask_active_kn
-        if not ks.is_identity:
-            e_dft_fit = ks.select(e_dft_fit)
-            valence_fit = ks.select(valence_fit)
-        e_dft_fit_ev = np.asarray(e_dft_fit, dtype=np.float64) * RYD_TO_EV
-        fit_mask_kn = np.broadcast_to(
-            np.asarray(partition.in_range_mask, dtype=bool)[None, :],
-            e_dft_fit_ev.shape)
-        if inputs.config.sc.tail_fit == "buffer_edges":
-            fit_mask_kn = fit_mask_kn & np.broadcast_to(
-                buffer_mask[None, :], e_dft_fit_ev.shape)
-        # SAME three-way classification as the active-window scissor below.
-        # It matters here too: the tail law that gets applied is the
-        # CONDUCTION one, and under the old index mask a Fermi-crossing
-        # band above the occupied cut (sodium's band 10 of nval = 10) was a
-        # conduction sample.
-        valence_kn = np.asarray(valence_fit, dtype=bool)
-        if scissor_classes is not None:
-            valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
-            fit_mask_kn = fit_mask_kn & ~crossing_kn
-        tail_fit = fit_scissor(
-            E_dft_kn_ev=e_dft_fit_ev,
-            E_qp_kn_ev=(
-                np.asarray(E_qp_ry, dtype=np.float64) * RYD_TO_EV),
-            valence_mask_kn=valence_kn,
-            fit_mask_kn=fit_mask_kn,
-            k_weights=k_star_weights(ks),
-            # The sum-band tail is not part of the rotated QP subspace. Its
-            # update is a rigid edge scissor defined by the lowest accidental-
-            # degeneracy manifold, not by a user-expanded near-degenerate/SOC
-            # scale.  A resolved 1.7 meV pair is physics and remains two
-            # distinct samples; only <=0.1 meV may be grouped here.
-            conduction_frontier_tol_ev=(
-                float(inputs.config.sc.exact_degeneracy_tol_ev)
-                if inputs.config.sc.tail_fit == "frontier" else None),
-        )
-        enk_base_ev = apply_conduction_scissor_to_tail(
-            np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
-            tail_fit,
-            tail_start=tail_start,
-            logical_stop=logical_stop,
-        )
-        enk_base = device_put_process_local(
-            enk_base_ev / RYD_TO_EV,
-            NamedSharding(inputs.mesh_xy, P(None, None)))
-        inputs.print_fn(
-            f"    SC sum-band tail: scissored [{tail_start}, "
-            f"{logical_stop}) with conduction "
-            f"alpha={tail_fit.alpha_c:+.4f}, "
-            f"beta={tail_fit.beta_c_ev:+.4f} eV "
-            f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
-            f"policy={inputs.config.sc.tail_fit})")
 
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
         enk_active_new=E_full, enk_base=enk_base,
         efermi=float(efermi_ry),
         mesh_xy=inputs.mesh_xy,
-        active_slice=inputs.band_slices.sigma,
+        active_slice=slice(0, inputs.band_classes.n_total),
     )
 
     # (``entry_occ_state`` was solved above, before the tail scissor that
@@ -3002,7 +3029,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
-        e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
+        e_qp_ev=(np.asarray(E_full)[:, :inputs.band_classes.n_protected]
+                 * RYD_TO_EV),
         static_head_terms=iteration_static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad,
@@ -3029,6 +3057,56 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             "SigmaResult Hartree-omission receipt disagrees with the "
             "density-SC direct-field owner")
     _check_sigma_stage(sigma_result, print_fn=inputs.print_fn)
+
+    H_qp_dft_new = _fixed_index_hamiltonian(
+        sigma_result, E_full, U_full, float(efermi_ry),
+        exact_hartree_dft, inputs)
+    if state.iteration == 0:
+        _residency_census(
+            (("kin_ion_dft P+U", inputs.kin_ion_full_dft),
+             ("H_qp_dft (carry in)", state.H_qp_dft),
+             ("U_qp P+U", U_qp),
+             ("Sigma_c(omega) P x P",
+              sigma_result.sigma_c_omega_kij_ry),
+             ("Sigma_xc(E_F) P x U",
+              sigma_result.sigma_xc_pu_fermi_kij_ry),
+             ("H_qp_dft (map out)", H_qp_dft_new)),
+            inputs.print_fn)
+
+    if entry_occ_state is not None:
+        drift = (abs(entry_occ_state.mu_ry - state.occupation_state.mu_ry)
+                 if state.occupation_state is not None else float("nan"))
+        inputs.print_fn(
+            "    SC occupations: entry-solved BGW-MP1 state, "
+            f"mu={entry_occ_state.mu_ry * RYD_TO_EV:.8f} eV, "
+            f"|dmu|={drift * RYD_TO_EV:.3e} eV vs previous map input, "
+            f"occ_hash {entry_occ_state.occ_hash}")
+
+    if inputs.config.compute_mode is ComputeMode.MPA:
+        from .mpa.model import retain_iteration_artifacts
+        retain_iteration_artifacts(
+            os.path.join(inputs.input_dir, "tmp", "mpa"),
+            f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
+        from file_io.hdf5_owner import probe as _hdf5_probe
+        _hdf5_probe(f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
+
+    return SCState(
+        H_qp_dft=H_qp_dft_new,
+        iteration=state.iteration + 1,
+        partition=partition,
+        occupation_state=entry_occ_state,
+        head_surface_weight_kn=entry_surface_weight_kn,
+        outputs=SCOutputs(
+            sigma_result=sigma_result,
+            sigma_basis_U=U_full,
+            scissor_fit=None,
+            tail_scissor_fit=None,
+            screening=SCMapScreeningArtifacts(
+                static_w=W_by_role.get("static"),
+                iteration_head=iteration_head,
+                static_head_terms=iteration_static_head_terms),
+            exact_hartree_dft=exact_hartree_dft),
+    )
 
     # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
     # (as if every band were protected); the partition step below masks
@@ -3990,16 +4068,15 @@ def run_self_consistency(
         e_new_ev = (
             np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
         rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
+        n_p = _fixed_protected_count(inputs, e_new_ev.shape[1])
+        fixed_mask = np.ones(n_p, dtype=bool)
         verdict = protected_band_convergence(
-            e_new_ev, e_initial_ev,
-            np.asarray(_state_partition(state_new, inputs).protected_mask,
-                       dtype=bool).reshape(-1),
-            np.asarray(_state_partition(state_new, inputs).in_range_mask,
-                       dtype=bool).reshape(-1),
+            e_new_ev[:, :n_p], e_initial_ev[:, :n_p],
+            fixed_mask, fixed_mask,
             tol_ev)
         state_new = replace(state_new, convergence_verdict=verdict)
         _write_sc_eqp_snapshot(
-            inputs, state_new, e_new_ev,
+            inputs, state_new, e_new_ev[:, :n_p],
             call_index=0, role="one_shot", rms_ev=rms,
             rms2_ev=float("nan"),
             # There is no previous map call; the "previous output" the RMS
@@ -4119,12 +4196,12 @@ def _run_linear_mixing(
         # break on ``rms < tol_ev`` -- an RMS over ALL active bands
         # including the scissored ones, both the looser test and a
         # different set.
+        n_p = _fixed_protected_count(inputs, E_candidate_ev.shape[1])
         verdict = protected_band_convergence(
-            E_candidate_ev, E_prev_ev,
-            np.asarray(_state_partition(state_map, inputs).protected_mask,
-                       dtype=bool),
-            np.asarray(_state_partition(state_map, inputs).in_range_mask,
-                       dtype=bool),
+            E_candidate_ev[:, :n_p],
+            E_prev_ev[:, :n_p],
+            np.ones(n_p, dtype=bool),
+            np.ones(n_p, dtype=bool),
             tol_ev)
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
@@ -4140,7 +4217,8 @@ def _run_linear_mixing(
             float(np.sqrt(np.mean((E_candidate_ev - _out_history[-3]) ** 2)))
             if len(_out_history) >= 3 else float("nan"))
         _write_sc_eqp_snapshot(
-            inputs, state_map, E_candidate_ev,
+            inputs, state_map,
+            E_candidate_ev[:, :n_p],
             call_index=it, role="linear",
             rms_ev=cand_rms, rms2_ev=cand_rms2,
             prev_output_role=("dft_seed" if it == 0 else "linear"),
@@ -4383,12 +4461,12 @@ def _run_rcrop(
         # difference can be driven small by damping while F still has no
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
+        n_p = _fixed_protected_count(inputs, E_new.shape[1])
         _verdict = protected_band_convergence(
-            E_new, E_in,
-            np.asarray(_state_partition(state_out, inputs).protected_mask,
-                       dtype=bool),
-            np.asarray(_state_partition(state_out, inputs).in_range_mask,
-                       dtype=bool),
+            E_new[:, :n_p],
+            E_in[:, :n_p],
+            np.ones(n_p, dtype=bool),
+            np.ones(n_p, dtype=bool),
             tol_ev)
         _last_verdict[0] = _verdict
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
@@ -4410,7 +4488,8 @@ def _run_rcrop(
 
         role = _role_of(call_index)
         _write_sc_eqp_snapshot(
-            inputs, state_out, E_new,
+            inputs, state_out,
+            E_new[:, :n_p],
             call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
             # NAMING THE PREVIOUS CALL'S ROLE IS THE FIX.  ``rms`` is
             # measured against ``_e_history[-1]``, i.e. the immediately
@@ -4973,7 +5052,24 @@ def run_sc_driver(
             f"or use qp_solver = one_shot_dft.  Changing nval cannot fix "
             f"this: nval moves b1, not b0.")
 
-    e_dft_active_kn_ry = jnp.asarray(np.asarray(enk_dft, dtype=np.float64))
+    classes = BandClasses.from_run(band_slices, meta)
+    from common.wfn_transforms import get_enk_bandrange
+    e_dft_full, _ = get_enk_bandrange(
+        wfn, sym,
+        (int(band_slices.b0), int(meta.b_id_4_user)),
+        (int(band_slices.b0), int(meta.b_id_4_user)),
+        nspinor=meta.nspinor)
+    e_dft_full_kn_ry = jnp.asarray(
+        np.asarray(e_dft_full, dtype=np.float64))
+    expected_full = (int(meta.nk_tot), classes.n_total, classes.n_total)
+    if tuple(kin_ion.shape) != expected_full:
+        raise ValueError(
+            "run_sc_driver: fixed-index kin+ion block must span P+U; "
+            f"got {tuple(kin_ion.shape)}, expected {expected_full} from "
+            f"[b0,b4_user)=({classes.band_start},{classes.outer_stop}).")
+    kin_ion_full_dft = kin_ion
+    e_dft_active_kn_ry = jnp.asarray(
+        np.asarray(enk_dft, dtype=np.float64))
     nb_active = e_dft_active_kn_ry.shape[1]
     val_mask_active = jnp.broadcast_to(
         jnp.arange(nb_active) < int(meta.nelec),
@@ -5080,6 +5176,7 @@ def run_sc_driver(
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+        kin_ion_full_dft=kin_ion_full_dft,
         head_channel=head_channel,
         quad=quad, e_ref=e_ref,
         static_head_terms=static_head_terms,
@@ -5090,6 +5187,8 @@ def run_sc_driver(
         band_slices=band_slices, input_dir=input_dir,
         partition=partition,
         e_dft_active_kn_ry=e_dft_active_kn_ry,
+        e_dft_full_kn_ry=e_dft_full_kn_ry,
+        band_classes=classes,
         valence_mask_active_kn=val_mask_active,
         # One SC convention at both endpoints: fixed-band midgap on an
         # insulator, the existing initial fixed-N _mu_ry on a metal.
@@ -5267,7 +5366,13 @@ def run_sc_driver(
     # than a slow success — and plain ``jax.device_put`` of a host array
     # fires the hidden replica ``assert_equal`` all-gather.  ``_place``
     # routes each kind correctly; only the spec changed.
-    U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
+    U_full_fixed = _place(
+        state_final.outputs.sigma_basis_U, mesh_xy, _band_rotation_spec())
+    n_p = inputs.band_classes.n_protected
+    # Returned/public Sigma fields remain P x P.  The last map's unitary is
+    # P+U x P+U, so rotate an embedded protected operator by taking exactly
+    # its protected QP columns and protected DFT output rows.
+    U = _place(U_full_fixed[:, :n_p, :n_p], mesh_xy,
                _band_rotation_spec())
     sigma_c_omega_dft = (
         _rotate_sigma_omega_cube(
@@ -5336,6 +5441,10 @@ def run_sc_driver(
                     mesh=mesh_xy)
                 for sector in range(3)
             ]) if sigma_result.sigma_lorentz_skij_ry is not None else None),
+        # Internal rectangular faces have completed their only job in the
+        # fixed-index map; public writers are P x P and never consume them.
+        sigma_xc_pu_fermi_kij_ry=None,
+        v_h_pu_kij_ry=None,
         # The un-extrapolated N₃ twin travels with its partner or not at all.
         # It is None on every non-extrapolating run; when it is present,
         # leaving it in the QP basis while ``sigma_xc_kij_ry`` beside it is
@@ -5525,6 +5634,7 @@ def dump_sigma_omega_h5_final(
         # components INTO that QP basis once for this file rather than
         # mixing bases or repeating the rotation on every SC iteration.
         U = _place(sigma_basis_U, mesh_xy, _band_rotation_spec())
+        n_p = int(sigma_result.sigma_x_kij_ry.shape[-1])
         scalar_qp = _rotate_fixed_matrix(
             exact_hartree_dft.scalar_dft, U, mesh=mesh_xy, to_qp=True)
         transverse_qp = (
@@ -5532,6 +5642,9 @@ def dump_sigma_omega_h5_final(
                 exact_hartree_dft.transverse_dft, U,
                 mesh=mesh_xy, to_qp=True)
             if exact_hartree_dft.transverse_dft is not None else None)
+        scalar_qp = scalar_qp[:, :n_p, :n_p]
+        if transverse_qp is not None:
+            transverse_qp = transverse_qp[:, :n_p, :n_p]
         total_qp = (scalar_qp if transverse_qp is None
                     else scalar_qp + transverse_qp)
         import dataclasses
@@ -5745,10 +5858,13 @@ def dump_qp_wfn_artifacts(
                 tail_start=int(band_slices.b3),
                 logical_stop=int(logical_band_stop),
             ) / RYD_TO_EV
+        fixed_stop = (int(logical_band_stop)
+                      if logical_band_stop is not None
+                      else int(band_slices.b3))
         write_qp_wfn_h5(
             qp_wfn_path, wfn=wfn,
             U_kmn=U_wfn, enk_active_qp_ry=enk_wfn_ry,
-            band_start=band_slices.b0, band_stop=band_slices.b3,
+            band_start=band_slices.b0, band_stop=fixed_stop,
             enk_full_base_ry=enk_full_base_ry,
         )
         # The tables come from the SERVICE's own accessor, never re-spelled
@@ -5762,7 +5878,7 @@ def dump_qp_wfn_artifacts(
             qp_rot_path,
             U_mnk=U_full,
             E_qp_nk=enk_full_ry * 0.5,                     # Ry → Hartree
-            band_start=band_slices.b0, band_stop=band_slices.b3,
+            band_start=band_slices.b0, band_stop=fixed_stop,
             kpoints_crys=np.asarray(sym.unfolded_kpts, dtype=np.float64),
             nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
             kpoints_reduced=np.asarray(wfn.kpoints, dtype=np.float64),

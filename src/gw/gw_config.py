@@ -1722,6 +1722,9 @@ _DEFAULTS = {
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
     # than an order below MoS2's physical 1.7--3.6 meV SOC-split K pair.
     "sc_exact_degeneracy_tol_ev": 1.0e-4,
+    # Temporary measurement axis for the fixed-index SC study.  The losing
+    # spelling and this key are removed after the window-consistency ruling.
+    "sc_evaluation_policy": "fermi",  # fermi | clamp (study only)
     # The frontier law is the production window-stable tail update.  The
     # all_conduction spelling retains the historical affine-fit control for
     # diagnosing window-edge cycles; it never changes degeneracy treatment.
@@ -4562,6 +4565,7 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
+    evaluation_policy: str = "fermi"
     tail_fit: str = "frontier"
     buffer_nbands: int = 0
     buffer_mode: str = "diagonal"
@@ -4594,6 +4598,10 @@ class SCConfig:
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
                 "The 0.1 meV ceiling separates accidental degeneracy from "
                 "resolved physical splittings; it is not an SC damping knob.")
+        if self.evaluation_policy not in ("fermi", "clamp"):
+            raise ValueError(
+                "sc_evaluation_policy must be 'fermi' or 'clamp' during "
+                f"the window-consistency study; got {self.evaluation_policy!r}.")
         if self.tail_fit not in ("frontier", "all_conduction", "buffer_edges"):
             raise ValueError(
                 "sc_tail_fit must be 'frontier', 'all_conduction' or "
@@ -5512,6 +5520,8 @@ class LorraxConfig:
                 "sc_dump_dir") or None,
             exact_degeneracy_tol_ev=float(
                 _g("sc_exact_degeneracy_tol_ev")),
+            evaluation_policy=str(
+                _g("sc_evaluation_policy")).strip().lower(),
             tail_fit=str(_g("sc_tail_fit")).strip().lower(),
             buffer_nbands=int(_g("sc_buffer_nbands")),
             buffer_mode=str(_g("sc_buffer_mode")).strip().lower(),

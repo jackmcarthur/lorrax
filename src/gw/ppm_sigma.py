@@ -114,6 +114,11 @@ class SigmaOmegaResult:
     # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
+    #: Optional single-frequency outer block ``Sigma_c(E_F; k, P, U)``.
+    #: It is produced only for the self-consistent fixed-index map.  The
+    #: ordinary P x P omega cube above is unchanged, preserving the
+    #: iteration-1/one-shot contract.
+    sigma_c_fermi_pu_kij: jax.Array | None = None
     #: Optional exact ordered-residue contribution on the SAME omega grid:
     #: ``Sigma_c[B,D] - Sigma_c[B,D=0]``.  GN-PPM carries this beside the
     #: result in ``PPMOutputs`` because of its band-bracket pipeline; MPA has
@@ -1001,6 +1006,7 @@ def compute_sigma_c_ppm_omega_grid(
     quadrature_cache_dir: str | None = None,
     occupation_state=None,
     plan: 'BandBracketPlan | None' = None,
+    include_fermi_pu: bool = False,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
@@ -1145,6 +1151,7 @@ def compute_sigma_c_ppm_omega_grid(
         sigma_branches=branches,
         band_brackets=plan.bounds,
         band_counts=plan.counts,
+        include_fermi_pu=include_fermi_pu,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:
@@ -1154,6 +1161,7 @@ def compute_sigma_c_ppm_omega_grid(
         omega_ry=result.omega_ry,
         omega_ev=result.omega_ev,
         sigma_c_kij=sigma_c_kij,
+        sigma_c_fermi_pu_kij=result.sigma_c_fermi_pu_kij,
         sigma_c_odd_kij=result.sigma_c_odd_kij,
         band_counts=result.band_counts,
         static_coh_at_counts=static_coh_at_counts,

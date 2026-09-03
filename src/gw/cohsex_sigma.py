@@ -228,6 +228,7 @@ def _face_kwargs(wfns) -> dict:
 
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
 _static_convolution_cache: dict[tuple[object, ...], object] = {}
+_sigma_x_outer_kernel_cache: dict[tuple[object, ...], object] = {}
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
@@ -367,6 +368,36 @@ def _make_cohsex_kernels_legacy(_convolve):
                         _convolve(G_ri, W_q - V_q, -0.5))
 
     return sigma_sx, sigma_coh
+
+
+def _make_sigma_x_outer_kernel(mesh_xy: Mesh, kgrid, nk_tot: int):
+    """Legacy bare-X kernel with protected rows and logical outer columns.
+
+    This is the rectangular counterpart of ``sigma_sx`` above.  It is used
+    only by the fixed-index SC map: the G build and convolution are unchanged,
+    while the right projection spans ``P + U`` so the caller can retain the
+    one required ``P x U`` block.  The ordinary square kernel remains the
+    byte-identical path for every other caller.
+    """
+    from ffi import ffi_dial_key
+
+    key = (id(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(),
+           int(nk_tot))
+    fn = _sigma_x_outer_kernel_cache.get(key)
+    if fn is not None:
+        return fn
+    convolve = _make_static_convolution(mesh_xy, kgrid, int(nk_tot))
+
+    @partial(jax.jit, static_argnames=("outer_stop",))
+    def _kernel(wfns, Gij, V_q, outer_stop):
+        s = wfns.slices
+        G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
+        return _project(
+            wfns.xr(s.sigma), wfns.yn(slice(0, outer_stop)),
+            convolve(G_occ, V_q, 1.0))
+
+    _sigma_x_outer_kernel_cache[key] = _kernel
+    return _kernel
 
 
 def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve):
@@ -688,6 +719,7 @@ def compute_sigma_x(
     bispinor_v_q_path=None,
     occupation_state=None,
     return_transverse: bool = False,
+    return_outer: bool = False,
 ):
     """Bare-exchange-only path for modes without static screening.
 
@@ -712,13 +744,30 @@ def compute_sigma_x(
     Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _ = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
+    n_protected = int(wfns.slices.nb_sigma)
+    n_total_logical = int(meta.b_id_4_user) - int(wfns.slices.b0)
+    if not n_protected <= n_total_logical <= int(wfns.slices.nb_full):
+        raise ValueError(
+            "compute_sigma_x fixed-index extents require P <= P+U <= "
+            f"loaded; got P={n_protected}, P+U={n_total_logical}, "
+            f"loaded={int(wfns.slices.nb_full)}.")
     with mesh_xy:
-        sig_x = sigma_sx_k(wfns, Gij, V_q)
-        sig_x = _replicate_band_sigma(sig_x, mesh_xy)
-        if wfns.layout == "face":
-            nb_sigma = wfns.slices.nb_sigma
-            sig_x = sig_x[:, :nb_sigma, :nb_sigma]
+        if return_outer and wfns.layout == "legacy":
+            outer_kernel = _make_sigma_x_outer_kernel(
+                mesh_xy, meta.kgrid, int(meta.nk_tot))
+            sig_x_wide = outer_kernel(
+                wfns, Gij, V_q, n_total_logical)
+        else:
+            sig_x_wide = sigma_sx_k(wfns, Gij, V_q)
+        sig_x_wide = _replicate_band_sigma(sig_x_wide, mesh_xy)
+        sig_x = sig_x_wide[:, :n_protected, :n_protected]
         sig_x.block_until_ready()
+
+    sig_x_pu = None
+    if return_outer:
+        sig_x_pu = sig_x_wide[
+            :, :n_protected, n_protected:n_total_logical]
+        sig_x_pu.block_until_ready()
 
     if static_head_terms is not None:
         x_head, _ = static_head_terms_to_kij(
@@ -732,6 +781,11 @@ def compute_sigma_x(
 
     sig_x_b = None
     if wfns_transverse is not None and bispinor_v_q_path is not None:
+        if return_outer and n_total_logical > n_protected:
+            raise NotImplementedError(
+                "fixed-index SC P x U bare exchange is not implemented for "
+                "the legacy transverse-vertex Sigma path; use the scalar "
+                "route until its rectangular photon projection is ported.")
         # face-layout defensive backstop REMOVED 2026-08-23 — see
         # compute_cohsex_sigma's identical removal, same session/reason.
         from .sigma_x_bispinor import compute_sigma_x_bispinor
@@ -745,6 +799,10 @@ def compute_sigma_x(
         sig_x_b.block_until_ready()
         sig_x = sig_x + sig_x_b
 
+    if return_transverse and return_outer:
+        return sig_x, sig_x_b, sig_x_pu
     if return_transverse:
         return sig_x, sig_x_b
+    if return_outer:
+        return sig_x, sig_x_pu
     return sig_x

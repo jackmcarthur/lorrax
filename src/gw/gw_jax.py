@@ -1067,20 +1067,27 @@ def main(argv=None):
 	from file_io import validate_kin_ion_against_run
 	# TIMED as one row: the gate and slab read are one logical stage.
 	_t_kin = time.perf_counter()
+	kin_ion_stop = (int(meta.b_id_4_user)
+	                 if qp_solver is QPSolver.SELF_CONSISTENT
+	                 else int(band_slices.b3))
 	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
 		expected_bispinor=config.bispinor,
 		expected_bispinor_gw_mode=config.bispinor_gw.value,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
-		band_stop=band_slices.b3,
+		band_stop=kin_ion_stop,
 		nspinor=int(wfn.nspinor),
 		print_fn=print0,
 	)
-	kin_ion = load_kin_ion_submatrix(
-		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
+	kin_ion_loaded = load_kin_ion_submatrix(
+		config.paths.kin_ion_file, band_slices.b0, kin_ion_stop,
 		mesh=mesh_xy,
 	)
+	# The fixed-index SC Hamiltonian spans P+U.  Ordinary output and every
+	# non-SC solver retain the historical protected P x P mean-field block.
+	kin_ion = kin_ion_loaded[
+		:, :band_slices.nb_sigma, :band_slices.nb_sigma]
 	timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
 
 	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
@@ -1102,7 +1109,7 @@ def main(argv=None):
 		with timing.section("gw_jax.sc_driver", announce=True,
 		                    label="self-consistent QSGW driver"):
 			sc_result = run_sc_driver(
-				wfns, V_q, kin_ion,
+				wfns, V_q, kin_ion_loaded,
 				head_channel=getattr(isdf, 'head_channel', None),
 				quad=quad, e_ref=e_ref,
 				static_head_terms=static_head_terms,

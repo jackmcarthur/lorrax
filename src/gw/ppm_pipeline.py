@@ -57,6 +57,7 @@ class PPMOutputs:
     """Ansatz-specific PPM outputs handed to the dynamic finalizer."""
 
     sigma_c_body_omega: jax.Array          # (n_omega, nk, nb, nb)  Ry
+    sigma_c_fermi_pu_kij_ry: jax.Array | None = None
     # Kept separate: injection is shared by every dynamic ansatz in
     # ``dynamic_sigma.add_head_sigma_diag``.
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
@@ -655,6 +656,9 @@ def compute_ppm_sigma_pipeline(
                 quadrature_cache_dir=quadrature_cache_dir,
                 occupation_state=occupation_state,
                 plan=plan,
+                include_fermi_pu=(
+                    getattr(config.qp_solver, "value", config.qp_solver)
+                    == "self_consistent"),
                 print_fn=print_fn,
             )
         sigma_omega_even = None
@@ -751,6 +755,7 @@ def compute_ppm_sigma_pipeline(
 
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
+        sigma_c_fermi_pu_kij_ry=sigma_omega.sigma_c_fermi_pu_kij,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
         band_extrapolation=extrap_payload,
         sigma_c_body_omega_unextrap=sigma_c_body_omega_unextrap,
