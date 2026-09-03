@@ -463,10 +463,25 @@ def main(argv=None):
 
 	charge_bispinor = uses_four_spinor_finite_q_charge(
 		config.bispinor, config.bispinor_gw)
-	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband,
+	# A self-consistent diagonal buffer evaluates a bounded number of real
+	# states immediately outside the user-named nval/ncond window.  The named
+	# counts remain the physical/full-matrix window; only Meta's execution
+	# edges expand.  Other solvers and buffer_nbands=0 retain their exact
+	# historical Meta construction.
+	_sc_buffer = (int(config.sc.buffer_nbands)
+	              if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
+	meta = Meta.from_system(wfn, sym,
+	                        int(config.nval) + _sc_buffer,
+	                        int(config.ncond) + _sc_buffer, config.nband,
 	                        n_rmu, charge_bispinor,
 	                        nband_chi=config.bands.chi,
 	                        nband_sigma=config.bands.sigma)
+	if _sc_buffer:
+		print0(
+			f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
+			f"valence/conduction window + {_sc_buffer} diagonal state(s) "
+			f"at each edge; mode={config.sc.buffer_mode}, "
+			f"tail_fit={config.sc.tail_fit}")
 	meta.rank = RUNTIME.process_index
 	meta.n_proc = RUNTIME.process_count
 	meta.sys_dim = config.sys_dim
@@ -1098,7 +1113,7 @@ def main(argv=None):
 				band_slices=band_slices, input_dir=input_dir,
 				tensors_filename=tensors_filename,
 				enk_dft=enk_dft, material_class=material_class,
-				print_fn=print0)
+				print_fn=print0, record_fn=report.progress)
 		sigma_result = sc_result.sigma_result_dft
 		sigma_total = sc_result.sigma_total_dft
 		rotations_written = sc_result.rotations_written
@@ -1544,15 +1559,25 @@ def main(argv=None):
 		              if np.max(_xc_abs) > 0.0 else np.max(_odd_abs))
 		_mean_share = (np.mean(_odd_abs) / np.mean(_xc_abs)
 		               if np.mean(_xc_abs) > 0.0 else np.mean(_odd_abs))
-		report.progress(
-			"GN odd Sigma   : measured-broken-TR ordered residue; "
+		_odd_prefix = (
+			"MPA odd Sigma  "
+			if getattr(config.compute_mode, "value", config.compute_mode) == "mpa"
+			else "GN odd Sigma   ")
+		_odd_line = (
+			f"{_odd_prefix}: measured-broken-TR ordered residue; "
 			f"max|sigC_odd|={np.max(_odd_abs):.6e} eV; "
 			f"mean|sigC_odd|={np.mean(_odd_abs):.6e} eV; "
 			f"max-share-of-|Sigma_xc|={_max_share:.6e}; "
-			f"mean-share-of-|Sigma_xc|={_mean_share:.6e}; "
-			f"W(iomega_p)-Hermiticity="
-			f"{sigma_result.ppm_probe_hermiticity_residual:.3e}; "
-			f"max|D|/max|B|={sigma_result.ppm_odd_even_residue_ratio:.3e}")
+			f"mean-share-of-|Sigma_xc|={_mean_share:.6e}")
+		if sigma_result.ppm_probe_hermiticity_residual is not None:
+			_odd_line += (
+				f"; W(iomega_p)-Hermiticity="
+				f"{sigma_result.ppm_probe_hermiticity_residual:.3e}")
+		if sigma_result.ppm_odd_even_residue_ratio is not None:
+			_odd_line += (
+				f"; max|D|/max|B|="
+				f"{sigma_result.ppm_odd_even_residue_ratio:.3e}")
+		report.progress(_odd_line)
 	if q0_certificates:
 		_q0_cert = max(q0_certificates, key=lambda item: item.final_error_ratio)
 		report.progress(

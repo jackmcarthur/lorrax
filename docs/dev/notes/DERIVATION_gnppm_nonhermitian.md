@@ -169,7 +169,92 @@ incumbent single-residue fit on magnets (registered, not changed).
 
 *MPA.* Samples on complex lines need $\overline{F_{-q}(-\bar z)}$ at the
 reflected frequency, i.e. a sample set symmetric under $\omega\to-\omega$;
-the identity of §2 applies with that pairing. At `34228021` the MPA contour
-still applies both resolvent rows to one orientation and completes with the
-$\Theta$-symmetric conjugate, so it deletes the odd channel. It must not be
-used as a magnetic fallback.
+the identity of §2 applies with that pairing. Before the ordered MPA change,
+the contour completion had been corrected but the Padé model was still a
+function of $z^2$ only.  It therefore deleted the odd channel downstream even
+though the samples contained it.  The ordered fit and its Sigma assignment are
+derived next.
+
+## 7. Multipole fit from an ordered complex-frequency pair
+
+For each sampled upper-half-plane point $z_j$, one response sweep produces the
+two native orientations at $z_j$ and $-\bar z_j$.  Completing them in both
+orders gives the independently sampled pair
+
+$$
+\chi_q(z_j)=F_q(z_j)+\overline{F_{-q}(-\bar z_j)},\qquad
+\chi_q(-\bar z_j)=F_q(-\bar z_j)+\overline{F_{-q}(z_j)}.
+$$
+
+The two Dyson solves preserve the causal adjoint identity
+$W_q(z)^\dagger=W_q(\bar z)$.  Thus the value needed to separate frequency
+parity at the SAME ordered element is
+
+$$
+W_q^c(-z_j)=W_q^c(-\bar z_j)^\dagger.
+$$
+
+This adjoint is taken on the independently evaluated partner; it is **not**
+$[W(z_j)+W(z_j)^\dagger]/2$ and imposes no Hermiticity on $W(z_j)$.  At a
+pure-imaginary point the two upper-plane coordinates coincide, but their lower
+partner is still the matrix adjoint, so the anti-Hermitian part remains the
+odd-frequency datum.
+
+The general $n_p$-pole extension of §3 is
+
+$$
+\boxed{
+W^c(z)=\sum_p\left[\frac{R_{p,+}}{z-\Omega_p}
+-\frac{R_{p,-}}{z+\Omega_p}\right]
+=\sum_p\frac{2\Omega_p B_p+2zD_p}{z^2-\Omega_p^2},
+\quad B_p=\frac{R_{p,+}+R_{p,-}}2,\quad
+D_p=\frac{R_{p,+}-R_{p,-}}2 .}
+$$
+
+The ordered sample pair supplies
+
+$$
+W_{\rm even}(z_j)=\frac{W(z_j)+W(-z_j)}2,
+\qquad
+W_{\rm odd}(z_j)=\frac{W(z_j)-W(-z_j)}2.
+$$
+
+The existing Padé/Loewner/Thiele implementation is used once, element by
+element in $(q,\mu,\nu)$, on $W_{\rm even}$ to determine the shared
+$\Omega_p$ and $B_p$.  There is no eigenchannel decomposition, Hermitian
+factorisation, lower-triangle fill, or real projection.  After the existing
+pole guards, one fixed-pole complex least-squares solve determines $D_p$ from
+
+$$
+W_{\rm odd}(z_j)=\sum_p\frac{2z_jD_p}{z_j^2-\Omega_p^2}.
+$$
+
+The staged fit store carries $B_p$ and $D_p$ on the same row-sharded layout.
+A TRS fit has no $D_p$ dataset and follows the incumbent arithmetic and I/O
+path.  A measured-broken-TR fit carries the explicit ordered-residue stamp;
+an absent dataset with a true stamp, or a present dataset with a false stamp,
+is a refused partial schema.
+
+## 8. Multipole Sigma consumes the two residues per causal branch
+
+The contour closure in §4 applies pole by pole, so no new MPA Sigma formula is
+needed.  Every conduction Green's-function branch consumes
+$R_{p,+}=B_p+D_p$ and every valence branch consumes
+$R_{p,-}=B_p-D_p$, through the same `_residue_for_space` selector used by
+GN-PPM.  Pole-window planning uses the union of the live support of both
+residues; the delivered-error planner measures the selected residue separately
+for each branch.  The scalar charge head remains the even object of §6 and
+therefore retains the single-residue fit.
+
+`tests/test_gnppm_ordered_orientations.py` plants a two-pole non-Hermitian
+$W$, fits the ordered samples, reconstructs a dense imaginary-axis grid, and
+compares the branch-selected $\Sigma_c$ with an independent imaginary-axis
+contour.  Its red twin Hermitises the samples before fitting and is required to
+move the answer macroscopically.
+
+For observability, ordered MPA executes that same planned contraction once
+more with $D=0$, exactly as GN-PPM does, and records
+`sigC_odd = Sigma_c[B,D] - Sigma_c[B,0]`.  The debug-off arm therefore emits
+an exactly zero `sigC_odd` column.  This is deliberately not reconstructed
+from a fitted scalar or from an on-shell QP difference: it is the difference
+of the two production Sigma cubes on the same omega grid.

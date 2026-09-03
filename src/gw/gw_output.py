@@ -1644,30 +1644,9 @@ def write_results(
     _spread_multiplet = _star_spread_over_multiplets(
         sx_out + corr_out, sym, np.asarray(results.E_dft_ry, dtype=np.float64))
 
-    write_sigma_to_file(
-        _wedge(sx_out),
-        sigma_diag_file,
-        star_spread_ev=_star_spread_ev,
-        star_spread_per_band_ev=_spread_per_band,
-        star_spread_multiplet_ev=_spread_multiplet,
-        n_star_members=_nstar,
-        sigma_coh_kij_eV=_wedge(corr_out),
-        hartree_kij_eV=_wedge(sig_h_out),
-        energies_dft_ev=(
-            r2e * _wedge(np.asarray(results.E_dft_ry, dtype=np.float64))),
-        kpoints_crys=kpts_irr,
-        sx_label="sigX" if results.use_ppm else "sigSX",
-        corr_label="sigC" if results.use_ppm else "sigCOH",
-        total_label="sigXC" if results.use_ppm else "sigTOT",
-        hartree_label=(
-            "Hdir" if results.h_transverse is not None else "VH"),
-        sigma_lorentz_skn_eV=(
-            None if results.sigma_lorentz_diag_skn_ry is None
-            else r2e * _wedge_sectors(results.sigma_lorentz_diag_skn_ry)),
-        sigma_c_odd_kn_eV=(
-            None if results.sigma_c_odd_diag_at_dft_ry is None
-            else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
-    )
+    # The table write is deferred until the EqpAssembly exists: that object
+    # is the one owner of raw Z and its pathology mask, and sigma_diag.dat
+    # must report the exact decision that eqp1.dat used.
 
     # ── BGW-format eqp0.dat / eqp1.dat ────────────────────────────────────
     # Single source of truth for the linearization math: ``eqp_bgw``
@@ -1780,6 +1759,33 @@ def write_results(
         dE_ev=eqp_dE_ev,
         nspin=1,
         print_fn=print_fn,
+    )
+
+    write_sigma_to_file(
+        _wedge(sx_out),
+        sigma_diag_file,
+        star_spread_ev=_star_spread_ev,
+        star_spread_per_band_ev=_spread_per_band,
+        star_spread_multiplet_ev=_spread_multiplet,
+        n_star_members=_nstar,
+        sigma_coh_kij_eV=_wedge(corr_out),
+        hartree_kij_eV=_wedge(sig_h_out),
+        energies_dft_ev=(
+            r2e * _wedge(np.asarray(results.E_dft_ry, dtype=np.float64))),
+        kpoints_crys=kpts_irr,
+        sx_label="sigX" if results.use_ppm else "sigSX",
+        corr_label="sigC" if results.use_ppm else "sigCOH",
+        total_label="sigXC" if results.use_ppm else "sigTOT",
+        hartree_label=(
+            "Hdir" if results.h_transverse is not None else "VH"),
+        sigma_lorentz_skn_eV=(
+            None if results.sigma_lorentz_diag_skn_ry is None
+            else r2e * _wedge_sectors(results.sigma_lorentz_diag_skn_ry)),
+        sigma_c_odd_kn_eV=(
+            None if results.sigma_c_odd_diag_at_dft_ry is None
+            else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
+        z_factor_kn=assembly.z_factor,
+        z_pathological_kn=assembly.z_pathological,
     )
 
     # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing

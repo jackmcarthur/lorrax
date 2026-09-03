@@ -415,6 +415,17 @@ def compute_z_factor_from_omega_grid(
 	return sigma_c_at_dft, z_factor
 
 
+def pathological_z_factor_mask(z_factor: np.ndarray) -> np.ndarray:
+	"""Return states whose linearized QP update is not physically admissible.
+
+	A quasiparticle residue must be finite and lie in ``0 < Z <= 1``.  Keep
+	the raw value for diagnostics, but never let a pole/grid crossing turn the
+	Newton correction into an unbounded ``eqp1`` energy.
+	"""
+	z = np.asarray(z_factor, dtype=np.float64)
+	return ~(np.isfinite(z) & (z > 0.0) & (z <= 1.0))
+
+
 def _implied_vxc_window_ev() -> tuple[float, float]:
 	"""The physical window for ``V_xc = E_DFT − (kin_ion + V_H)``, in eV.
 
@@ -521,6 +532,9 @@ def compute_eqp_diag(
 	For dynamic modes (GN-PPM, HL-PPM, MPA) the caller obtains
 	``sigma_c_at_dft_diag_ev``, ``sigma_c_at_eval_diag_ev`` and
 	``z_factor`` from :func:`compute_z_factor_from_omega_grid`.
+	A raw non-finite Z or value outside ``0 < Z <= 1`` is diagnostic evidence
+	of a pole/grid/linearization pathology, not permission for an unbounded
+	Newton step: ``eqp1`` falls back state-by-state to the finite ``eqp0``.
 	"""
 	if (sigma_c_at_eval_diag_ev is None) != (e_eval_ev is None):
 		raise ValueError(
@@ -554,6 +568,8 @@ def compute_eqp_diag(
 			+ sigma_x_diag_ev + sigma_c_at_eval_diag_ev - e_eval_ev
 		).real
 		eqp1 = e_eval_ev + z_factor * delta_at_eval
+	if z_factor is not None:
+		eqp1 = np.where(pathological_z_factor_mask(z_factor), eqp0, eqp1)
 	return eqp0, eqp1
 
 
@@ -590,6 +606,7 @@ class EqpAssembly:
 	#: operator cube remains raw; this smaller curve is an assembly operand.
 	sigma_c_omega_diag_ev: np.ndarray | None
 	z_factor: np.ndarray | None
+	z_pathological: np.ndarray | None
 	implied_vxc_ev: np.ndarray | None
 	hartree_transverse_diag_ev: np.ndarray | None = None
 	nspin: int = 1
@@ -649,7 +666,9 @@ def assemble_eqp(
 	   Z there, which is where eqp1 is linearized
 	   (:func:`compute_z_factor_from_omega_grid`, and
 	   :func:`compute_eqp_diag` for why);
-	4. the Newton update (:func:`compute_eqp_diag`).
+	4. the Newton update (:func:`compute_eqp_diag`);
+	5. state-local fallback ``eqp1 = eqp0`` wherever raw Z is non-finite or
+	   outside the quasiparticle interval ``0 < Z <= 1``.
 
 	**The evaluation point, and the one-omega-reference rule.**
 	``e_eval_ev`` / ``e_eval_rel_ev`` are the same energies in absolute
@@ -763,6 +782,30 @@ def assemble_eqp(
 		else:
 			e_eval_ev = None
 
+	z_pathological = (
+		None if z_factor is None else pathological_z_factor_mask(z_factor))
+	if z_pathological is not None:
+		n_bad = int(np.count_nonzero(z_pathological))
+		finite = np.asarray(z_factor)[np.isfinite(z_factor)]
+		range_text = (
+			"no finite values" if finite.size == 0 else
+			f"finite range [{float(np.min(finite)):.8g}, "
+			f"{float(np.max(finite)):.8g}]")
+		severity = "WARNING: " if n_bad else "  "
+		print_fn(
+			f"{severity}Z-factor guard: "
+			f"pathological={n_bad}/{z_pathological.size} "
+			"(valid iff finite and 0 < Z <= 1); "
+			f"{range_text}; flagged eqp1 states fall back to eqp0.")
+		if n_bad:
+			bad_rows = np.argwhere(z_pathological)
+			preview = ", ".join(
+				f"(k={int(k)}, band={int(band_offset) + int(n) + 1}, "
+				f"Z={float(np.asarray(z_factor)[k, n]):.8g})"
+				for k, n in bad_rows[:8])
+			more = "" if n_bad <= 8 else f", ... +{n_bad - 8} more"
+			print_fn(f"WARNING: pathological Z states: {preview}{more}")
+
 	eqp0_ev, eqp1_ev = compute_eqp_diag(
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=hartree_used,
@@ -787,6 +830,7 @@ def assemble_eqp(
 			None if sigma_c_omega_diag_ev is None
 			else np.asarray(sigma_c_omega_diag_ev, dtype=np.complex128)),
 		z_factor=z_factor,
+		z_pathological=z_pathological,
 		implied_vxc_ev=implied_vxc,
 		hartree_transverse_diag_ev=hartree_transverse_used,
 		nspin=int(nspin),

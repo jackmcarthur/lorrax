@@ -37,8 +37,8 @@ class SharedSigmaWindow(NamedTuple):
     #: incumbent bool-mask semantics.  The executor folds it into the A-side
     #: selector operand; planning here uses only the SUPPORT mask.
     band_weight: jax.Array | None = None
-    #: Green's-function branch owning this row.  Ordered residues use the
-    #: same conduction->R+ / valence->R- selection as GN-PPM.
+    #: Green's-function branch owning this row.  Ordered MPA residues use
+    #: the same conduction->R+ / valence->R- selection as GN-PPM.
     space: str = ""
 
 

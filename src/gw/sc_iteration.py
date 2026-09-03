@@ -62,7 +62,7 @@ from __future__ import annotations
 import functools as _functools
 import math as _math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import numpy as np
@@ -317,6 +317,72 @@ class SCInputs:
     #: state exists; later maps read the path as immutable grid provenance.
     screening_seed_cache: dict | None = None
     print_fn: Callable = print
+    # Selected ladder/iteration/verdict lines go to the driver's production
+    # record.  Component chatter remains on ``print_fn`` and can still be
+    # sunk when ``debug=false``.
+    record_fn: Callable | None = None
+
+
+def _sc_buffer_mask(inputs: SCInputs) -> np.ndarray:
+    """Boolean mask for the symmetric buffer outside the named SC window."""
+    n_buffer = int(inputs.config.sc.buffer_nbands)
+    nb = int(inputs.band_slices.sigma.stop)
+    if n_buffer == 0:
+        return np.zeros(nb, dtype=bool)
+
+    band_ids = np.arange(
+        int(inputs.band_slices.b0), int(inputs.band_slices.b3),
+        dtype=np.int64)
+    core_lo = int(inputs.meta.nelec) - int(inputs.config.nval)
+    core_hi = int(inputs.meta.nelec) + int(inputs.config.ncond)
+    expected_lo = core_lo - n_buffer
+    expected_hi = core_hi + n_buffer
+    if (int(inputs.band_slices.b1), int(inputs.band_slices.b3)) != (
+            expected_lo, expected_hi):
+        raise ValueError(
+            "SC buffer execution edges disagree with the named window: "
+            f"got b1/b3={(inputs.band_slices.b1, inputs.band_slices.b3)}, "
+            f"expected {(expected_lo, expected_hi)} from nval/ncond="
+            f"{(inputs.config.nval, inputs.config.ncond)} plus "
+            f"sc_buffer_nbands={n_buffer}.")
+    return ((band_ids >= expected_lo) & (band_ids < core_lo)) | (
+        (band_ids >= core_hi) & (band_ids < expected_hi))
+
+
+def _apply_sc_buffer_partition(
+    partition: BandPartition,
+    inputs: SCInputs,
+) -> BandPartition:
+    """Make diagonal/carry buffers diagonal-only while retaining their Sigma."""
+    buffer = _sc_buffer_mask(inputs)
+    if not buffer.any() or inputs.config.sc.buffer_mode == "one_sided":
+        return partition
+    in_range = np.asarray(partition.in_range_mask, dtype=bool).reshape(-1)
+    outside = np.flatnonzero(buffer & ~in_range)
+    if outside.size:
+        raise ValueError(
+            "SC diagonal buffer left the sampled Sigma(omega) domain at "
+            f"local band(s) {outside.tolist()}; endpoint-clamped Sigma is not "
+            "a diagonal buffer. Widen sigma_omega_min/max_ev or reduce "
+            "sc_buffer_nbands.")
+    protected = np.asarray(
+        partition.protected_mask, dtype=bool).reshape(-1).copy()
+    protected[buffer] = False
+    return BandPartition(
+        protected_mask=jnp.asarray(protected),
+        in_range_mask=partition.in_range_mask)
+
+
+@jax.jit
+def _carry_sc_buffer_diagonal(H_new, H_input, buffer_mask):
+    """Replace buffer diagonals by the preceding map input's references."""
+    nb = H_new.shape[-1]
+    idx = jnp.arange(nb)
+    diagonal = jnp.where(
+        buffer_mask[None, :],
+        jnp.diagonal(H_input, axis1=-2, axis2=-1),
+        jnp.diagonal(H_new, axis1=-2, axis2=-1))
+    return H_new.at[:, idx, idx].set(diagonal)
 
 
 @dataclass(frozen=True)
@@ -457,6 +523,7 @@ class SCState:
     occupation_state: OccupationState | None = None  # full-BZ, padded PT head manifold
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
+    convergence_verdict: ConvergenceVerdict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -2508,6 +2575,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
             label=f"SC map {int(state.iteration)} (mu-anchored)",
             print_fn=inputs.print_fn)
+    partition = _apply_sc_buffer_partition(partition, inputs)
+    buffer_mask = _sc_buffer_mask(inputs)
+    if buffer_mask.any():
+        buffer_ids = np.flatnonzero(buffer_mask) + int(inputs.band_slices.b0) + 1
+        inputs.print_fn(
+            f"    SC window buffer: mode={inputs.config.sc.buffer_mode}, "
+            f"bands={_band_ranges(buffer_mask, band_offset=int(inputs.band_slices.b0))} "
+            f"(n={buffer_ids.size}); named core="
+            f"{int(inputs.meta.nelec) - int(inputs.config.nval) + 1}-"
+            f"{int(inputs.meta.nelec) + int(inputs.config.ncond)}")
 
     # Resolve an external MPA seed before any occupation consumer runs.  The
     # provider remains the sole owner of path resolution; production then
@@ -2586,7 +2663,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     tail_start = int(inputs.band_slices.sigma.stop)
     logical_stop = (
         int(inputs.meta.b_id_4_user) - int(inputs.band_slices.b0))
-    if state.iteration > 0 and logical_stop > tail_start:
+    if logical_stop > tail_start:
         from .scissor import k_star_weights
 
         e_dft_fit = inputs.e_dft_active_kn_ry
@@ -2598,6 +2675,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         fit_mask_kn = np.broadcast_to(
             np.asarray(partition.in_range_mask, dtype=bool)[None, :],
             e_dft_fit_ev.shape)
+        if inputs.config.sc.tail_fit == "buffer_edges":
+            fit_mask_kn = fit_mask_kn & np.broadcast_to(
+                buffer_mask[None, :], e_dft_fit_ev.shape)
         # SAME three-way classification as the active-window scissor below.
         # It matters here too: the tail law that gets applied is the
         # CONDUCTION one, and under the old index mask a Fermi-crossing
@@ -2614,6 +2694,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             valence_mask_kn=valence_kn,
             fit_mask_kn=fit_mask_kn,
             k_weights=k_star_weights(ks),
+            # The sum-band tail is not part of the rotated QP subspace. Its
+            # update is a rigid edge scissor defined by the lowest accidental-
+            # degeneracy manifold, not by a user-expanded near-degenerate/SOC
+            # scale.  A resolved 1.7 meV pair is physics and remains two
+            # distinct samples; only <=0.1 meV may be grouped here.
+            conduction_frontier_tol_ev=(
+                float(inputs.config.sc.exact_degeneracy_tol_ev)
+                if inputs.config.sc.tail_fit == "frontier" else None),
         )
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
@@ -2629,7 +2717,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"{logical_stop}) with conduction "
             f"alpha={tail_fit.alpha_c:+.4f}, "
             f"beta={tail_fit.beta_c_ev:+.4f} eV "
-            f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f})")
+            f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
+            f"policy={inputs.config.sc.tail_fit})")
 
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
@@ -2991,7 +3080,34 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             if transverse is None else
             _add_exact_four_current_hartree(
                 delta_h_dft, scalar, transverse))
+    # Symmetric averaging is confined to accidental/exact degeneracies.  It
+    # is intentionally NOT tied to ``degen_avg_tol_ry``: that general output
+    # convention may be user-expanded, while QSGW state identity must never
+    # erase a resolved SOC splitting to make a trajectory converge.  Average
+    # the correction, not H itself, so the immutable DFT splitting survives.
+    e_dft_map = inputs.e_dft_active_kn_ry
+    if not ks.is_identity:
+        e_dft_map = ks.select(e_dft_map)
+    if not bool(getattr(inputs.config, "no_degen_averaging", False)):
+        from .degen_average import average_matrix_diagonal
+        delta_h_dft = average_matrix_diagonal(
+            delta_h_dft,
+            energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
+            tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
+                    / RYD_TO_EV),
+            mesh_xy=inputs.mesh_xy,
+        )
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+    if (buffer_mask.any()
+            and inputs.config.sc.buffer_mode == "carry"
+            and int(state.iteration) > 0):
+        # Map zero earns a Sigma-derived reference for every buffer state.
+        # Later maps carry that reference instead of snapping the states back
+        # to DFT (or repeatedly reevaluating it).  Applying this on map zero
+        # would merely freeze the buffer at DFT and would not test option (c).
+        H_qp_dft_full = _carry_sc_buffer_diagonal(
+            H_qp_dft_full, state.H_qp_dft,
+            jnp.asarray(buffer_mask, dtype=bool))
 
     # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
     # Present only when ``use_band_extrapolation`` drove this stage's Σ.
@@ -3018,6 +3134,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if transverse is None else
                 _add_exact_four_current_hartree(
                     delta_h_dft_n3, scalar, transverse))
+        if not bool(getattr(inputs.config, "no_degen_averaging", False)):
+            delta_h_dft_n3 = average_matrix_diagonal(
+                delta_h_dft_n3,
+                energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
+                tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
+                        / RYD_TO_EV),
+                mesh_xy=inputs.mesh_xy,
+            )
         _report_extrapolation_eqp_shift(
             H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
             mesh_xy=inputs.mesh_xy, n_occ=n_occ,
@@ -3069,6 +3193,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             H, inputs=inputs, kstar=ks, n_occ=n_occ,
             use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
+        scissor_fit=tail_fit,
+        use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
@@ -3169,16 +3295,20 @@ def _scissor_E_qp_for_outofrange(
     kstar,
     *,
     band_classes=None,
+    scissor_fit: ScissorFit | None = None,
     fermi_displacement_ry: float,
+    use_valence_fit: bool = False,
     print_fn=None,
 ) -> tuple[jax.Array, object | None]:
     """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
     that are out of the ω-grid range.
 
-    Mechanism: take the diagonal of ``H_qp_dft_full`` (the candidate
-    QP energies if the iteration kept all off-diagonals), restrict to
-    in-range bands as the scissor's reference set, and fit α/β per
-    val/cond.  The conduction candidate remains
+    Mechanism: use ``scissor_fit`` when supplied; otherwise take the
+    diagonal of ``H_qp_dft_full`` (the candidate QP energies if the
+    iteration kept all off-diagonals), restrict to in-range bands as the
+    scissor's reference set, and fit α/β per val/cond.  The shared-fit
+    form lets the active and sum-band sides of ``b3`` use the exact same
+    law from the map input.  The conduction candidate remains
     ``E_QP = α_c·E_DFT + β_c``.  The valence fit is diagnostic only: every
     valence candidate is ``E_DFT + fermi_displacement_ry``, so its binding
     relative to the candidate Fermi level is unchanged.  The masking
@@ -3223,8 +3353,6 @@ def _scissor_E_qp_for_outofrange(
     if bool(in_range.all()):
         return e_dft_kn_ry, None
 
-    H_diag_np = np.real(np.asarray(jnp.diagonal(
-        H_qp_dft_full, axis1=1, axis2=2)))
     in_range_kn = np.broadcast_to(
         in_range[None, :], e_dft_np.shape).astype(bool)
     # THE THREE-WAY CLASSIFICATION.  ``band_classes`` is None on an
@@ -3237,13 +3365,17 @@ def _scissor_E_qp_for_outofrange(
     if band_classes is not None:
         valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
         fit_mask_kn = in_range_kn & ~crossing_kn
-    fit = fit_scissor(
-        e_dft_np * RYD_TO_EV,
-        H_diag_np * RYD_TO_EV,
-        valence_mask_kn=valence_kn,
-        fit_mask_kn=fit_mask_kn,
-        k_weights=k_star_weights(kstar),
-    )
+    fit = scissor_fit
+    if fit is None:
+        H_diag_np = np.real(np.asarray(jnp.diagonal(
+            H_qp_dft_full, axis1=1, axis2=2)))
+        fit = fit_scissor(
+            e_dft_np * RYD_TO_EV,
+            H_diag_np * RYD_TO_EV,
+            valence_mask_kn=valence_kn,
+            fit_mask_kn=fit_mask_kn,
+            k_weights=k_star_weights(kstar),
+        )
     if print_fn is not None:
         # The two arms' agreement is readable here: ``n`` differs with the
         # k-set, ``w`` must not.
@@ -3253,13 +3385,18 @@ def _scissor_E_qp_for_outofrange(
     # a band cannot be fit as one class and extrapolated as another.  Crossing
     # bands stay at E_DFT.  In practice they are protected/in-range, but the
     # identity is the honest no-information fallback if one is not.
-    out_ev = qsgw_out_of_range_energies(
-        e_dft_np * RYD_TO_EV,
-        fit,
-        valence_kn,
-        fermi_displacement_ev=float(fermi_displacement_ry) * RYD_TO_EV,
-        crossing_mask_kn=crossing_kn,
-    )
+    if use_valence_fit:
+        e_dft_ev = e_dft_np * RYD_TO_EV
+        out_ev = e_dft_ev + fit.predict(
+            e_dft_ev, valence_kn, crossing_mask=crossing_kn)
+    else:
+        out_ev = qsgw_out_of_range_energies(
+            e_dft_np * RYD_TO_EV,
+            fit,
+            valence_kn,
+            fermi_displacement_ev=float(fermi_displacement_ry) * RYD_TO_EV,
+            crossing_mask_kn=crossing_kn,
+        )
     return jnp.asarray(out_ev / RYD_TO_EV), fit
 
 
@@ -3274,23 +3411,29 @@ def _apply_scissor_partition_policy(
     n_occ: int,
     candidate_efermi_fn: Callable[[jax.Array], float],
     band_classes=None,
+    scissor_fit: ScissorFit | None = None,
+    use_valence_fit: bool = False,
     label: str = "SC",
     print_fn=print,
 ) -> tuple[jax.Array, ScissorFit | None]:
     """Apply the shared semicore/conduction policy to one full H map.
 
     In-range states keep their Sigma-derived Hamiltonian.  Out-of-range
-    conduction states take the affine fit derived from those in-range
-    states; out-of-range valence states preserve ``E - E_F`` using this
-    map output's own Fermi level.  The provisional/final Fermi check makes
-    that anchor non-circular.  Both the ordinary SC loop and fixed-Sigma
-    EQP2 call this function on every map evaluation.
+    conduction states take the supplied shared map-input fit when present,
+    otherwise the historical fit derived from this map output.  The SC
+    loop supplies the same fit already used by the sum-band tail, so moving
+    ``b3`` cannot switch one physical band between two update laws.
+    Out-of-range valence states preserve ``E - E_F`` using this map output's
+    own Fermi level.  The provisional/final Fermi check makes that anchor
+    non-circular.  Fixed-Sigma EQP2 keeps the output-fit form.
     """
     scissor_provisional_ry, scissor_fit = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, e_dft_kn_ry, valence_mask_kn,
         partition.in_range_mask, kstar,
         band_classes=band_classes,
+        scissor_fit=scissor_fit,
         fermi_displacement_ry=0.0,
+        use_valence_fit=use_valence_fit,
         print_fn=print_fn,
     )
     scissor_E_qp_kn_ry = scissor_provisional_ry
@@ -3332,15 +3475,20 @@ def _apply_scissor_partition_policy(
         crossing_kn = None
         if band_classes is not None:
             valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
-        scissor_E_qp_kn_ry = jnp.asarray(
-            qsgw_out_of_range_energies(
+        if use_valence_fit:
+            e_dft_ev = e_dft_np * RYD_TO_EV
+            candidate_ev = e_dft_ev + scissor_fit.predict(
+                e_dft_ev, valence_kn, crossing_mask=crossing_kn)
+        else:
+            candidate_ev = qsgw_out_of_range_energies(
                 e_dft_np * RYD_TO_EV,
                 scissor_fit,
                 valence_kn,
                 fermi_displacement_ev=(
                     fermi_displacement_ry * RYD_TO_EV),
                 crossing_mask_kn=crossing_kn,
-            ) / RYD_TO_EV)
+            )
+        scissor_E_qp_kn_ry = jnp.asarray(candidate_ev / RYD_TO_EV)
         print_fn(
             f"    {label} low-valence anchor: "
             f"E_F(DFT)={float(efermi_dft_ry) * RYD_TO_EV:+.6f} eV, "
@@ -3424,6 +3572,125 @@ def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
             f"downstream residual reads zero, i.e. FALSE converged.")
 
 
+def _record_sc(inputs: SCInputs, line: str) -> None:
+    """Send one selected SC line to the production record."""
+    record_fn = getattr(inputs, "record_fn", None)
+    fallback = getattr(inputs, "print_fn", None)
+    if record_fn is not None:
+        record_fn(line)
+    elif fallback is not None:
+        fallback(line)
+
+
+def _sc_z_factors(inputs: SCInputs, state_out: SCState) -> np.ndarray:
+    """Return per-state Z for the exact dynamic Sigma built by one map.
+
+    The Sigma cube and evaluation ladder are full-BZ quantities in the
+    current QP basis.  Diagonal extraction is collective for a band-sharded
+    cube, so every rank calls this before the snapshot writer's rank gate.
+    Static modes have zero frequency derivative and therefore return one.
+    """
+    sigma = state_out.outputs.sigma_result
+    e_eval = np.asarray(sigma.e_eval_ev, dtype=np.float64)
+    cube = sigma.sigma_c_omega_kij_ry
+    omega = sigma.omega_grid_ev
+    if cube is None or omega is None:
+        return np.ones_like(e_eval, dtype=np.float64)
+
+    from .eqp_bgw import compute_z_factor_from_omega_grid
+    from .qsgw_utils import extract_sigma_diag_replicated
+
+    sigma_c_diag_ev = np.asarray(
+        extract_sigma_diag_replicated(cube, inputs.mesh_xy),
+        dtype=np.complex128,
+    ) * RYD_TO_EV
+    _, z_factor = compute_z_factor_from_omega_grid(
+        sigma_c_omega_diag_ev=sigma_c_diag_ev,
+        omega_rel_ev=np.asarray(omega, dtype=np.float64),
+        e_dft_rel_ev=e_eval - float(sigma.efermi_dft_ev),
+    )
+    return np.asarray(z_factor, dtype=np.float64)
+
+
+def _write_sc_z_snapshot(
+    path: str,
+    kpoints: np.ndarray,
+    e_eval_ev: np.ndarray,
+    z_factor: np.ndarray,
+    *,
+    band_offset: int,
+    call_index: int,
+    role: str,
+) -> None:
+    """Write one compact per-map Z table on the canonical file wedge."""
+    if e_eval_ev.shape != z_factor.shape:
+        raise ValueError(
+            "SC Z snapshot shape mismatch: evaluation energies "
+            f"{e_eval_ev.shape}, Z {z_factor.shape}")
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(
+            "# LORRAX SC Z factors; columns: ispin iband "
+            "E_eval_eV Z\n")
+        stream.write(f"# SC map={call_index:04d} role={role}\n")
+        for ik, kpt in enumerate(np.asarray(kpoints, dtype=np.float64)):
+            stream.write(
+                f"{kpt[0]:15.9f} {kpt[1]:15.9f} {kpt[2]:15.9f} "
+                f"{z_factor.shape[1]:7d}\n")
+            for ib in range(z_factor.shape[1]):
+                stream.write(
+                    f"{1:8d} {band_offset + ib + 1:8d} "
+                    f"{e_eval_ev[ik, ib]:16.9f} "
+                    f"{z_factor[ik, ib]:16.9f}\n")
+
+
+def _dump_sc_rotation(
+    inputs: SCInputs,
+    state_out: SCState,
+    *,
+    call_index: int,
+) -> str | None:
+    """Persist the exact DFT→QP rotation consumed by one SC map.
+
+    ``sigma_basis_U`` is already the full-BZ rotation paired with this map's
+    Sigma result.  The dump is opt-in through ``sc_dump_dir`` and is small for
+    diagnostic windows.  Every rank joins the gather and the post-write
+    barrier; only rank zero writes the ``.npy`` file.
+    """
+    dump_dir = inputs.config.sc.dump_dir
+    if not dump_dir:
+        return None
+
+    from common.collectives import gather_to_host, process_rank
+
+    rotation = gather_to_host(state_out.outputs.sigma_basis_U)
+    path = os.path.join(
+        dump_dir, f"rotation_iter{int(call_index):04d}.npy")
+    if process_rank() == 0:
+        os.makedirs(dump_dir, exist_ok=True)
+        np.save(path, np.asarray(rotation, dtype=np.complex128))
+    barrier(f"sc.rotation.{int(call_index):04d}.write",
+            print_fn=inputs.print_fn)
+    return path
+
+
+def _band_ranges(mask, *, band_offset: int) -> str:
+    """Format a one-dimensional band mask as compact 1-based ranges."""
+    indices = np.flatnonzero(np.asarray(mask, dtype=bool)) + band_offset + 1
+    if indices.size == 0:
+        return "none"
+    ranges = []
+    start = previous = int(indices[0])
+    for value in indices[1:]:
+        value = int(value)
+        if value != previous + 1:
+            ranges.append((start, previous))
+            start = value
+        previous = value
+    ranges.append((start, previous))
+    return ",".join(
+        str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
+
+
 def _write_sc_eqp_snapshot(
     inputs: SCInputs,
     state_out: SCState,
@@ -3438,9 +3705,9 @@ def _write_sc_eqp_snapshot(
 ) -> str | None:
     """Write one small BGW-shaped record of a completed SC map call.
 
-    The QP column is ``eigvalsh(F(H_in))``.  The active-band scissor is fit
-    to that same output candidate; the sum-band tail scissor is explicitly
-    labelled as the input law that was used to build this map's chi/W/Sigma.
+    The QP column is ``eigvalsh(F(H_in))``.  The active-band and sum-band
+    scissor are the same input law used to build this map's chi/W/Sigma;
+    recording both ranges makes the closure across ``b3`` auditable.
     rCROP trial outputs are useful diagnostics but are not accepted iterates.
     This is not a second implementation of BGW's final ``eqp0`` / ``eqp1``
     equations; those remain solely in :mod:`gw.eqp_bgw`.
@@ -3514,6 +3781,16 @@ def _write_sc_eqp_snapshot(
         detail="this is the column the eqp snapshot reports as the map "
                "output, and its RMS stamp is the convergence criterion.")
 
+    z_factor_full = _sc_z_factors(inputs, state_out)
+    sanity.refuse_nonfinite(
+        f"SC Z factor (call {int(call_index)}, role {role})", z_factor_full,
+        print_fn=inputs.print_fn,
+        detail="this is the renormalization table written beside the map "
+               "spectrum; non-finite Z is a dynamic-Sigma pathology")
+
+    rotation_path = _dump_sc_rotation(
+        inputs, state_out, call_index=call_index)
+
     if process_rank() != 0:
         return None
 
@@ -3533,6 +3810,10 @@ def _write_sc_eqp_snapshot(
     else:
         e_output = _to_file_wedge(                    # loop ran star-wedge
             unfold_star_wedge_to_full_bz(sym, e_output))
+    e_eval = _to_file_wedge(
+        np.asarray(state_out.outputs.sigma_result.e_eval_ev,
+                   dtype=np.float64))
+    z_factor = _to_file_wedge(z_factor_full)
 
     active_scissored = np.flatnonzero(
         ~np.asarray(inputs.partition.in_range_mask, dtype=bool))
@@ -3569,9 +3850,9 @@ def _write_sc_eqp_snapshot(
         f"active_scissored_bands_1based={active_labels}",
         ("active_scissor=none (all active bands lie on the Sigma grid)"
          if active_fit is None else
-         "output_candidate_active_scissor: " + active_fit.summary()),
+         "shared_map_input_active_scissor: " + active_fit.summary()),
         (f"sum_band_tail=[{tail_start + band_offset + 1},"
-         f"{tail_stop + band_offset}] 1-based; input_tail_scissor="
+         f"{tail_stop + band_offset}] 1-based; shared_input_tail_scissor="
          + ("none (DFT energies)" if tail_fit is None else
             f"E_QP={tail_fit.alpha_c:+.10e}*E_DFT"
             f"{tail_fit.beta_c_ev:+.10e} eV; "
@@ -3584,7 +3865,36 @@ def _write_sc_eqp_snapshot(
         path, kpoints, e_dft, e_output,
         band_offset=band_offset, nspin=1, comments=comments,
     )
-    inputs.print_fn(f"  SC map energies: {path}")
+    z_path = os.path.join(
+        inputs.input_dir, f"z_factor_iter{int(call_index):04d}.dat")
+    _write_sc_z_snapshot(
+        z_path, kpoints, e_eval, z_factor,
+        band_offset=band_offset, call_index=int(call_index), role=role)
+
+    n_occ = int(inputs.meta.nelec) - band_offset
+    gap_ev = float(np.min(e_output[:, n_occ])
+                   - np.max(e_output[:, n_occ - 1]))
+    z_min = float(np.min(z_factor))
+    z_max = float(np.max(z_factor))
+    z_bad = int(np.count_nonzero((z_factor <= 0.0) | (z_factor > 1.0)))
+    partition = _state_partition(state_out, inputs)
+    protected = np.asarray(partition.protected_mask, dtype=bool)
+    in_range = np.asarray(partition.in_range_mask, dtype=bool)
+    # Keep the established map-artifact line schema intact: the canonical
+    # convergence parser keys the following verdict to this exact line.  Z is
+    # a sibling artifact, not a suffix that makes the map line unparsable.
+    _record_sc(inputs, f"  SC map energies: {path}")
+    _record_sc(inputs, f"  SC map Z factors: {z_path}")
+    if rotation_path is not None:
+        _record_sc(inputs, f"  SC map rotation: {rotation_path}")
+    _record_sc(
+        inputs,
+        f"    SC iteration: call={int(call_index):04d} role={role} "
+        f"gap={gap_ev:.9f} eV max|dE|={float(verdict.max_abs_ev):.9e} eV "
+        f"Z=[{z_min:.9f},{z_max:.9f}] bad_Z={z_bad}/{z_factor.size} "
+        f"active={band_offset + 1}-{band_offset + e_output.shape[1]} "
+        f"protected={_band_ranges(protected, band_offset=band_offset)} "
+        f"in_range={_band_ranges(in_range, band_offset=band_offset)}")
     return path
 
 
@@ -3593,10 +3903,27 @@ def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
     from .qsgw_utils import remove_managed
 
     removed = remove_managed(
-        input_dir, r"eqp0_iter[0-9]{4}\.dat\Z",
+        input_dir, r"(?:eqp0|z_factor)_iter[0-9]{4}\.dat\Z",
         barrier_tag="sc.eqp_snapshots.clear", print_fn=print_fn)
     if removed:
         print_fn(f"  SC map energies: cleared {len(removed)} stale snapshots")
+
+
+def _clear_sc_rotation_snapshots(
+    dump_dir: str | None,
+    *,
+    print_fn=print,
+) -> None:
+    """Remove only rotation snapshots managed by ``sc_dump_dir``."""
+    if not dump_dir:
+        return
+    from .qsgw_utils import remove_managed
+
+    removed = remove_managed(
+        dump_dir, r"rotation_iter[0-9]{4}\.npy\Z",
+        barrier_tag="sc.rotation_snapshots.clear", print_fn=print_fn)
+    if removed:
+        print_fn(f"  SC map rotations: cleared {len(removed)} stale snapshots")
 
 
 # ---------------------------------------------------------------------------
@@ -3653,6 +3980,7 @@ def run_self_consistency(
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
     # deprecated override, applied at config construction).
     _dump_dir = inputs.config.sc.dump_dir
+    _clear_sc_rotation_snapshots(_dump_dir, print_fn=print_fn)
 
     # One-shot fast path: no acceleration needed.
     if max_iter == 1:
@@ -3662,6 +3990,14 @@ def run_self_consistency(
         e_new_ev = (
             np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
         rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
+        verdict = protected_band_convergence(
+            e_new_ev, e_initial_ev,
+            np.asarray(_state_partition(state_new, inputs).protected_mask,
+                       dtype=bool).reshape(-1),
+            np.asarray(_state_partition(state_new, inputs).in_range_mask,
+                       dtype=bool).reshape(-1),
+            tol_ev)
+        state_new = replace(state_new, convergence_verdict=verdict)
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
             call_index=0, role="one_shot", rms_ev=rms,
@@ -3670,14 +4006,9 @@ def run_self_consistency(
             # is against is the DFT seed spectrum, and saying so is what
             # stops it being read as a convergence residual.
             prev_output_role="dft_seed",
-            verdict=protected_band_convergence(
-                e_new_ev, e_initial_ev,
-                np.asarray(_state_partition(state_new, inputs).protected_mask,
-                           dtype=bool).reshape(-1),
-                np.asarray(_state_partition(state_new, inputs).in_range_mask,
-                           dtype=bool).reshape(-1),
-                tol_ev),
+            verdict=verdict,
         )
+        _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         return state_new, []
 
     if accelerator == "rcrop":
@@ -3795,7 +4126,6 @@ def _run_linear_mixing(
             np.asarray(_state_partition(state_map, inputs).in_range_mask,
                        dtype=bool),
             tol_ev)
-        print_fn(f"    SC convergence: {verdict.summary()}")
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
         # a stamp computed from ``E_new_ev`` (post-mix) described a
@@ -3816,6 +4146,9 @@ def _run_linear_mixing(
             prev_output_role=("dft_seed" if it == 0 else "linear"),
             verdict=verdict,
         )
+        _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
+        last_evaluated = replace(
+            last_evaluated, convergence_verdict=verdict)
         if verdict.converged:
             state = last_evaluated
             break
@@ -3995,6 +4328,8 @@ def _run_rcrop(
     _e_history: list[np.ndarray] = [
         np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
     _last_outputs: list = [None]
+    _last_input_H: list = [None]
+    _last_verdict: list[ConvergenceVerdict | None] = [None]
     _occ_state: list = [state_init.occupation_state]
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _iter_idx = [0]
@@ -4011,6 +4346,7 @@ def _run_rcrop(
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
         H = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
+        _last_input_H[0] = H
         E_in = np.asarray(eigvalsh_kshard(H)) * RYD_TO_EV
         # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
         # ``gw_iteration_map`` reads ``state.iteration`` and
@@ -4054,6 +4390,7 @@ def _run_rcrop(
             np.asarray(_state_partition(state_out, inputs).in_range_mask,
                        dtype=bool),
             tol_ev)
+        _last_verdict[0] = _verdict
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new.copy())
@@ -4086,7 +4423,7 @@ def _run_rcrop(
                               else _role_of(call_index - 1)),
             verdict=_verdict,
         )
-        print_fn(f"    SC convergence: {_verdict.summary()}")
+        _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
         _iter_idx[0] += 1
         # Non-trial calls only: there the INPUT is the accepted iterate
         # (rcrop_nojit's ``f_new = residual_fn(x_new)``), so this is the
@@ -4099,7 +4436,8 @@ def _run_rcrop(
                         partition=_state_partition(state_out, inputs),
                         occupation_state=state_out.occupation_state,
                         head_surface_weight_kn=state_out.head_surface_weight_kn,
-                        outputs=state_out.outputs),
+                        outputs=state_out.outputs,
+                        convergence_verdict=_verdict),
                 _verdict)
         return _to_entry(state_out.H_qp_dft - H)
 
@@ -4189,14 +4527,16 @@ def _run_rcrop(
             f"max|H| over the pad zone = {pad_max:.3e} "
             f"(exactly 0.0: {pad_max == 0.0})")
 
-    # Final state: use the last x from rCROP (Hermitised) and the last
-    # captured SCOutputs so the writer downstream has the full
-    # frequency-grid Σ_c, head pieces, etc.
+    # Final state: use the last EVALUATED map input and its exact outputs.
+    # ``result.x`` is a new mixed candidate that has not passed through the
+    # GW map, so pairing it with ``_last_outputs`` would make the terminal
+    # energy ladder and Sigma belong to different states.
     # Back to the REPLICATED carry layout: every consumer of the returned
     # state (``_scissor_E_qp_for_outofrange``, ``final_qp_eigenstates``,
     # the h5 writers) reads it back on the host.
-    H_final = _to_carry(result.x)
-    H_final = 0.5 * (H_final + jnp.conj(jnp.swapaxes(H_final, -1, -2)))
+    H_final = _last_input_H[0]
+    if H_final is None or _last_verdict[0] is None:
+        raise RuntimeError("rCROP completed without an evaluated SC map")
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
@@ -4204,6 +4544,7 @@ def _run_rcrop(
         occupation_state=_occ_state[0],
         head_surface_weight_kn=_head_surface_weight[0],
         outputs=_last_outputs[0],
+        convergence_verdict=_last_verdict[0],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state_final, rms_history
@@ -4560,6 +4901,7 @@ def run_sc_driver(
     enk_dft,
     material_class: str,
     print_fn: Callable = print,
+    record_fn: Callable | None = None,
 ) -> SCDriverResult:
     """Self-consistent QSGW, driver-facing: DFT inputs in, DFT-basis Σ out.
 
@@ -4758,15 +5100,21 @@ def run_sc_driver(
         fixed_dft_head_response=fixed_dft_head_response,
         screening_seed_cache={},
         print_fn=print_fn,
+        record_fn=record_fn,
     )
     state_init = make_initial_state_from_dft(inputs)
     # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
     # deprecated overrides, applied at config construction).
     sc = config.sc
-    print_fn(f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
-             f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}"
-             + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
-                else f", α={sc.mixing:.2f}"))
+    _record_sc(
+        inputs,
+        f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
+        f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}, "
+        f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV, "
+        f"tail_fit={sc.tail_fit}, buffer={sc.buffer_nbands}/edge, "
+        f"buffer_mode={sc.buffer_mode}"
+        + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
+           else f", α={sc.mixing:.2f}"))
     state_final, rms_history = run_self_consistency(
         state_init, inputs,
         max_iter=sc.max_iter, tol_ev=sc.tol_ev,
@@ -4774,6 +5122,29 @@ def run_sc_driver(
         history_depth=sc.history_depth,
         mixing=sc.mixing,
     )
+    verdict = state_final.convergence_verdict
+    if verdict is None:
+        raise RuntimeError(
+            "GATE sc_missing_convergence_verdict: the last evaluated SC map "
+            "returned no fixed-point verdict")
+    if sc.max_iter == 1:
+        _record_sc(
+            inputs, "  SC verdict: ONE-MAP DIAGNOSTIC (convergence was not "
+            f"requested); {verdict.summary()}")
+    elif not verdict.converged:
+        _record_sc(
+            inputs, f"  SC verdict: NOT CONVERGED after {len(rms_history)} "
+            f"GW map calls; {verdict.summary()}")
+        raise RuntimeError(
+            "GATE sc_fixed_point_not_converged: the SC iteration budget was "
+            "exhausted without satisfying the protected-band fixed-point "
+            f"criterion. {verdict.summary()} Per-map eqp0_iterNNNN.dat and "
+            "z_factor_iterNNNN.dat diagnostics were retained; no terminal "
+            "QP result is reported as converged.")
+    else:
+        _record_sc(
+            inputs, f"  SC verdict: CONVERGED after {len(rms_history)} GW "
+            f"map calls; {verdict.summary()}")
     sigma_result = state_final.outputs.sigma_result
     screening = state_final.outputs.screening
     requires_iteration_head = (
@@ -4797,7 +5168,8 @@ def run_sc_driver(
             f"terms for do_G0={bool(config.do_G0)!r}, "
             f"head_correction={config.head.correction.value!r}; why: the "
             "accepted final map must supply every requested Sigma term.")
-    print_fn(
+    _record_sc(
+        inputs,
         f"  SC done: {len(rms_history)} GW map calls"
         + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
             if rms_history else " (one-shot)"))

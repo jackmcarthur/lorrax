@@ -2838,6 +2838,7 @@ def write_fit_block(
     B_p_block,
     diag_block,
     *,
+    B_odd_p_block=None,
     mode="a",
 ):
     """Append one column block's poles and residues as the fit completes.
@@ -2871,11 +2872,17 @@ def write_fit_block(
     qs = _qs()
     Om = np.asarray(Omega_p_block)
     Bp = np.asarray(B_p_block)
+    Dp = None if B_odd_p_block is None else np.asarray(B_odd_p_block)
     with _h5(dest, mode) as grp:
         led = _open_fit(grp)
         n_p = int(grp.attrs["mpa_fit_n_p"])
         n_q = int(grp.attrs["mpa_fit_n_q"])
         n_mu = int(grp.attrs["mpa_fit_n_mu_logical"])
+        ordered = bool(grp.attrs.get("mpa_fit_ordered_residues", False))
+        if ordered != (Dp is not None):
+            raise ValueError(
+                "write_fit_block: B_odd_p_block presence must match the "
+                f"store's ordered-residue stamp ({ordered})")
         if bool(grp.attrs.get("mpa_fit_complete", False)):
             raise ValueError(
                 "write_fit_block: this store is FINALIZED.  Appending "
@@ -2888,7 +2895,10 @@ def write_fit_block(
                 f"write_fit_block: q={iq} is outside [0, {n_q})")
         cols = normalise_columns(mu_cols, n_mu)
         want = (n_p, n_mu, int(cols.size))
-        for label, arr in (("Omega_p_block", Om), ("B_p_block", Bp)):
+        arrays = [("Omega_p_block", Om), ("B_p_block", Bp)]
+        if Dp is not None:
+            arrays.append(("B_odd_p_block", Dp))
+        for label, arr in arrays:
             if arr.shape != want:
                 raise ValueError(
                     f"write_fit_block: {label} is {arr.shape}, expected "
@@ -2926,6 +2936,8 @@ def write_fit_block(
         sel = slice(lo, hi) if sel is None else sel
         grp["Omega_p"][:, iq, :, sel] = Om
         grp["B_p"][:, iq, :, sel] = Bp
+        if Dp is not None:
+            grp["B_odd_p"][:, iq, :, sel] = Dp
         for key in PERSISTED_DIAGNOSTICS:
             grp["fit_" + key][iq, :, sel] = diag[key]
 
@@ -3002,6 +3014,10 @@ class FitWriter:
                                 dtype=np.complex128)
         self._io.create_dataset("B_p", shape=pole_shape,
                                 dtype=np.complex128)
+        self.ordered_residues = bool(self.ledger["ordered_residues"])
+        if self.ordered_residues:
+            self._io.create_dataset("B_odd_p", shape=pole_shape,
+                                    dtype=np.complex128)
         for key in self.diagnostic_keys:
             self._io.create_dataset("fit_" + key, shape=diag_shape,
                                     dtype=np.float64)
@@ -3050,6 +3066,7 @@ class FitWriter:
         B_p_block,
         diag_block,
         *,
+        B_odd_p_block=None,
         block_condition_max,
         block_backward_error_max,
         diagnostics_finite,
@@ -3093,7 +3110,13 @@ class FitWriter:
         # JAX canonicalizes trailing replicated entries away on rank-3 arrays.
         diag_spec = P(None, ("x", "y"))
         Om, Bp = Omega_p_block, B_p_block
-        for arr in (Om, Bp):
+        Dp = B_odd_p_block
+        if self.ordered_residues != (Dp is not None):
+            raise ValueError(
+                "FitWriter.write_block: B_odd_p_block presence must match "
+                f"the store's ordered-residue stamp ({self.ordered_residues})")
+        arrays = (Om, Bp) if Dp is None else (Om, Bp, Dp)
+        for arr in arrays:
             _require_layout(
                 arr, self.mesh_xy, pole_spec,
                 "FitWriter.write_block requires Omega_p and B_p on "
@@ -3103,6 +3126,9 @@ class FitWriter:
             raise ValueError(
                 "FitWriter.write_block: pole blocks must agree and have "
                 "shape (n_p,1,n_mu_padded,n_cols_buffer)")
+        if Dp is not None and tuple(Dp.shape) != tuple(Om.shape):
+            raise ValueError(
+                "FitWriter.write_block: B_odd_p must match the pole block")
         if n_p != ledger["n_p"] or n_rows < ledger["n_mu"] \
                 or width < int(cols.size):
             raise ValueError(
@@ -3136,6 +3162,10 @@ class FitWriter:
         self._io.write_slab("B_p", Bp, offset=(0, iq, 0, lo),
                             global_shape=global_pole,
                             valid_shape=valid_pole)
+        if Dp is not None:
+            self._io.write_slab("B_odd_p", Dp, offset=(0, iq, 0, lo),
+                                global_shape=global_pole,
+                                valid_shape=valid_pole)
         for key in keys:
             self._io.write_slab(
                 "fit_" + key, diag_block[key], offset=(iq, 0, lo),
@@ -3172,6 +3202,7 @@ def write_fit_block_collective(
     B_p_block,
     diag_block,
     *,
+    B_odd_p_block=None,
     mesh_xy,
     block_condition_max,
     block_backward_error_max,
@@ -3187,6 +3218,7 @@ def write_fit_block_collective(
     with FitWriter(dest, mesh_xy=mesh_xy) as writer:
         writer.write_block(
             q, mu_cols, Omega_p_block, B_p_block, diag_block,
+            B_odd_p_block=B_odd_p_block,
             block_condition_max=block_condition_max,
             block_backward_error_max=block_backward_error_max,
             diagnostics_finite=diagnostics_finite)

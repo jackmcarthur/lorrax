@@ -327,4 +327,51 @@ def test_static_modes_ignore_an_evaluation_point_and_keep_eqp1_eq_eqp0():
 		mean_field_gate=False,
 		print_fn=lambda *_a, **_k: None)
 	np.testing.assert_array_equal(got.eqp0_ev, got.eqp1_ev)
-	assert got.z_factor is None and got.e_eval_ev is None
+	assert got.z_factor is None and got.z_pathological is None
+	assert got.e_eval_ev is None
+
+
+def test_pole_crossing_pathological_z_falls_back_to_eqp0():
+	"""A sampled pole may diagnose bad Z; it may not launch eqp1 to infinity."""
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
+	pole, eta, strength = 0.20, 0.05, 0.30
+	x = omega - pole
+	curve = (strength * x / (x * x + eta * eta))[:, None, None]
+	messages = []
+	got = assemble_eqp(
+		kpoints_irr_frac=np.zeros((1, 3)), band_offset=12,
+		e_dft_ev=np.zeros((1, 1)), kin_ion_diag_ev=np.ones((1, 1)),
+		hartree_diag_ev=np.zeros((1, 1)),
+		sigma_x_diag_ev=np.zeros((1, 1)),
+		sigma_c_omega_diag_ev=curve.astype(np.complex128),
+		omega_rel_ev=omega, e_dft_rel_ev=np.zeros((1, 1)),
+		dE_ev=0.5, mean_field_gate=False, print_fn=messages.append,
+	)
+	assert float(got.z_factor[0, 0]) < 0.0
+	assert bool(got.z_pathological[0, 0])
+	np.testing.assert_array_equal(got.eqp1_ev, got.eqp0_ev)
+	assert any("pathological=1/1" in line for line in messages)
+	assert any("band=13" in line for line in messages)
+	assert all(line.startswith("WARNING: ") for line in messages)
+
+
+def test_smooth_negative_slope_keeps_the_linearized_eqp1():
+	"""Negative control: a physical 0 < Z <= 1 is reported and retained."""
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
+	curve = (0.3 - 0.2 * omega)[:, None, None].astype(np.complex128)
+	messages = []
+	got = assemble_eqp(
+		kpoints_irr_frac=np.zeros((1, 3)), band_offset=0,
+		e_dft_ev=np.zeros((1, 1)), kin_ion_diag_ev=np.ones((1, 1)),
+		hartree_diag_ev=np.zeros((1, 1)),
+		sigma_x_diag_ev=np.zeros((1, 1)),
+		sigma_c_omega_diag_ev=curve, omega_rel_ev=omega,
+		e_dft_rel_ev=np.zeros((1, 1)), dE_ev=0.5,
+		mean_field_gate=False, print_fn=messages.append,
+	)
+	np.testing.assert_allclose(got.z_factor, [[1.0 / 1.2]], atol=1.0e-12)
+	assert not bool(got.z_pathological[0, 0])
+	np.testing.assert_allclose(got.eqp0_ev, [[1.3]], atol=1.0e-12)
+	np.testing.assert_allclose(got.eqp1_ev, [[(1.0 / 1.2) * 1.3]], atol=1.0e-12)
+	assert any("pathological=0/1" in line for line in messages)
+	assert all(not line.startswith("WARNING: ") for line in messages)

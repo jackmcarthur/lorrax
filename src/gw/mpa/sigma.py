@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +23,7 @@ from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_box_plan import plan_sigma_windows
 from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import face_kernel_kwargs
+from runtime.env_flags import env_bool
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             CROSSING_NODE_FLOOR,
@@ -36,8 +38,34 @@ from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 _PANE_CONTROL_TARGET_ERROR = 6.5e-4
 
 
+_DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
+
+
+def _resolve_mpa_odd_residue_debug(ordered_residues, *, print_fn=print):
+    """Resolve the shared GN/MPA odd-residue A/B switch for an MPA fit."""
+    enabled = env_bool(
+        _DEBUG_GN_ODD_RESIDUE_OFF_ENV, False, print_fn=print_fn)
+    if enabled and not bool(ordered_residues):
+        raise ValueError(
+            "GATE debug_gn_odd_residue_off_scope:\n"
+            f"  got:  {_DEBUG_GN_ODD_RESIDUE_OFF_ENV}=1 with an "
+            "MPA single-residue/TRS fit\n"
+            "  want: this debug switch only on a measured-broken-TR "
+            "ordered-residue MPA fit\n"
+            "  why:  a TRS MPA fit has no time-reversal-odd residue to "
+            "discard\n"
+            "  fix:   unset LORRAX_DEBUG_GN_ODD_RESIDUE_OFF")
+    if enabled:
+        print_fn(
+            "WARNING -- DEBUG: LORRAX_DEBUG_GN_ODD_RESIDUE_OFF=1; "
+            "measured-broken-TR MPA fit is discarding the "
+            "anti-Hermitian frequency-odd residue: D=0 and R+=R-=B. "
+            "This arm is for A/B diagnosis only, never production.")
+    return enabled
+
+
 def _geometry_residue(B, B_odd):
-    """Return a liveness witness covering both ordered pole residues."""
+    """A nonzero witness for either ordered residue, or incumbent ``B``."""
     if B_odd is None:
         return B
     plus = B + B_odd
@@ -105,6 +133,7 @@ def _integrate_sigma_batches(
     pole_batch_size,
     brackets=None,
     band_counts=None,
+    odd_residue_off=False,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -222,7 +251,14 @@ def _integrate_sigma_batches(
     logical_tau_pairs = 0
     batch_size = int(pole_batch_size)
     sweep_started = False
+    max_b = max_d = 0.0
     for lo, Omega, B, B_odd in batches:
+        if B_odd is not None:
+            max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
+            max_d = max(
+                max_d, float(jax.device_get(jnp.max(jnp.abs(B_odd)))))
+            if odd_residue_off:
+                B_odd = jnp.zeros_like(B_odd)
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
         for row in plan:
@@ -314,11 +350,41 @@ def _integrate_sigma_batches(
         f"({n_poles} poles, batches of {batch_size}); "
         f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
+    ratio = None
+    if max_b or max_d:
+        ratio = max_d / max_b if max_b else np.inf
+        state = "DEBUG ODD OFF (D discarded)" if odd_residue_off else "enabled"
+        print_fn(
+            f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
+            f"max|D|/max|B|={ratio:.12e}")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
         sigma_c_kij=sigma,
-        band_counts=(() if band_counts is None else tuple(band_counts)))
+        band_counts=(() if band_counts is None else tuple(band_counts)),
+        odd_even_residue_ratio=ratio)
+
+
+def _attach_ordered_odd_sigma(total, even):
+    """Attach the exact ordered-residue MPA contribution to ``total``.
+
+    Both inputs must be executions of the same fitted poles, planner and tau
+    grid; only the second execution has ``D=0``.  Keeping the subtraction at
+    this seam makes ``sigC_odd`` a diagnostic of the production contraction,
+    not a separately approximated formula.
+    """
+    if not np.array_equal(total.omega_ry, even.omega_ry):
+        raise ValueError(
+            "GATE mpa_odd_sigma_reference: total and D=0 MPA Sigma used "
+            "different omega grids")
+    if tuple(total.sigma_c_kij.shape) != tuple(even.sigma_c_kij.shape):
+        raise ValueError(
+            "GATE mpa_odd_sigma_reference: total and D=0 MPA Sigma shapes "
+            f"differ: {total.sigma_c_kij.shape} versus "
+            f"{even.sigma_c_kij.shape}")
+    return replace(
+        total,
+        sigma_c_odd_kij=total.sigma_c_kij - even.sigma_c_kij)
 
 
 def integrate_sigma_store(
@@ -333,6 +399,7 @@ def integrate_sigma_store(
     pole_batch_size=4,
     brackets=None,
     band_counts=None,
+    odd_residue_off=False,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -366,7 +433,8 @@ def integrate_sigma_store(
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
-            band_counts=band_counts, print_fn=print_fn)
+            band_counts=band_counts, odd_residue_off=odd_residue_off,
+            print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -480,6 +548,9 @@ def compute_sigma_c_mpa_omega_grid(
         fit_src, expected_identity=fit_identity,
         expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
+    ordered_residues = bool(ledger["ordered_residues"])
+    odd_residue_off = _resolve_mpa_odd_residue_debug(
+        ordered_residues, print_fn=print_fn)
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     branches = (_branches(
         wfns, omega_grid_ry, efermi_ry,
@@ -505,6 +576,8 @@ def compute_sigma_c_mpa_omega_grid(
             Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=True, return_sharded=True,
                 to_unit="Ry", include_odd=True)
+            if B_odd is not None and odd_residue_off:
+                B_odd = jnp.zeros_like(B_odd)
             summaries.extend(summarize_sigma_poles(
                 Omega, _geometry_residue(B, B_odd), branches,
                 regularization_width_ry=regularization_width_ry,
@@ -556,10 +629,24 @@ def compute_sigma_c_mpa_omega_grid(
                         f"kappa_max={window['kappa_max']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")
-        return integrate_sigma_store(
+        total = integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
-            band_counts=band_counts, print_fn=print_fn)
+            band_counts=band_counts, odd_residue_off=odd_residue_off,
+            print_fn=print_fn)
+        if not ordered_residues:
+            return total
+        # Exact observability twin, shared in algebra with the GN arm in
+        # ppm_pipeline: Sigma is linear in the fitted residues, so the same
+        # plan and compiled contraction with D=0 isolates the ordered term.
+        # A debug-off arm deliberately emits a zero twin, letting the public
+        # sigC_odd column check its own A/B.
+        even = integrate_sigma_store(
+            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+            pole_batch_size=pole_batch_size, brackets=band_brackets,
+            band_counts=band_counts, odd_residue_off=True,
+            print_fn=lambda *args, **kwargs: None)
+        return _attach_ordered_odd_sigma(total, even)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):
@@ -596,4 +683,5 @@ __all__ = [
     "assert_head_body_occupation_match",
     "compute_sigma_c_mpa_omega_grid",
     "integrate_sigma_store",
+    "_attach_ordered_odd_sigma",
 ]

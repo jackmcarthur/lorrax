@@ -28,7 +28,7 @@ def _assemble(curve):
 def test_degenerate_conditioning_averages_intercepts_and_unequal_slopes():
     omega = np.array([-1.0, 0.0, 1.0])
     intercept = np.array([[1.0, 3.0]])
-    unequal_slopes = np.array([[0.2, 0.4]])
+    unequal_slopes = np.array([[-0.2, -0.4]])
     raw_curve = intercept[None, :, :] + omega[:, None, None] * unequal_slopes
 
     conditioned_curve = average_within_degenerate_sets(
@@ -38,7 +38,7 @@ def test_degenerate_conditioning_averages_intercepts_and_unequal_slopes():
     )
     expected_curve = (
         np.full((1, 2), 2.0)[None, :, :]
-        + omega[:, None, None] * np.full((1, 2), 0.3)
+        + omega[:, None, None] * np.full((1, 2), -0.3)
     )
     np.testing.assert_allclose(conditioned_curve, expected_curve)
 
@@ -50,7 +50,7 @@ def test_degenerate_conditioning_averages_intercepts_and_unequal_slopes():
 
     # Both the value and derivative came from the SAME averaged curve: the
     # unequal raw slopes become their group mean, so Z is equal too.
-    expected_z = np.full((1, 2), 1.0 / (1.0 - 0.3))
+    expected_z = np.full((1, 2), 1.0 / (1.0 + 0.3))
     np.testing.assert_allclose(conditioned.z_factor, expected_z)
     np.testing.assert_allclose(conditioned.eqp1_ev, expected_z * 10.0)
 

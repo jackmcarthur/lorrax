@@ -110,55 +110,10 @@ def average_sigma_components(
 
     Returns the eight inputs, averaged, in the same order.
     """
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    import jax
-    import jax.numpy as jnp
-    from common.collectives import device_put_process_local, gather_to_host
-    from gw.qsgw_utils import (
-        is_band_sharded_sigma_omega,
-        set_band_diag_sharded,
-        static_sigma_diag_to_host,
-    )
-
-    rep = NamedSharding(mesh_xy, P(None, None, None))
-    band_4d = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-
-    def _is_band_sharded_3d(M):
-        spec = getattr(getattr(M, "sharding", None), "spec", None)
-        if spec is None or getattr(M, "ndim", 0) != 3:
-            return False
-        spec = tuple(spec) + (None,) * (3 - len(tuple(spec)))
-        if spec[1] is None and spec[2] is None:
-            return False
-        if spec != (None, "x", "y"):
-            raise ValueError(
-                "static Sigma degeneracy averaging requires canonical "
-                "P(None,'x','y') band sharding; got "
-                f"PartitionSpec{spec}")
-        return True
-
     def _dav(M):
-        # Reuse the dynamic-Sigma diagonal backend by adding a length-one
-        # leading axis.  Its shard_map extracts exactly nk*nb values with one
-        # psum; the setter changes only diagonal entries in each owned tile.
-        if _is_band_sharded_3d(M):
-            M4 = jax.lax.with_sharding_constraint(
-                jnp.expand_dims(M, axis=0), band_4d)
-            if not is_band_sharded_sigma_omega(M4):
-                raise ValueError(
-                    "band-sharded Sigma lost its matrix-axis layout while "
-                    "adding the temporary leading axis")
-            diag = static_sigma_diag_to_host(M, mesh_xy)
-            averaged = average_within_degenerate_sets(
-                diag, energies_kn_ry, tol_ry)
-            return set_band_diag_sharded(M4, averaged[None, ...])[0]
-
-        # Process-local replication, NOT plain ``jax.device_put``: the latter
-        # fires JAX's hidden ``assert_equal`` all-gather on a multi-process
-        # mesh.  Replication is retained only when the input already selected
-        # that bounded post-Sigma layout.
-        return device_put_process_local(apply_to_matrix_diagonals(
-            gather_to_host(M), energies_kn_ry, tol_ry), rep)
+        return average_matrix_diagonal(
+            M, energies_kn_ry=energies_kn_ry, tol_ry=tol_ry,
+            mesh_xy=mesh_xy)
 
     sigma_total = _dav(sigma_total)
     sig_sx, sig_coh, sig_x = _dav(sig_sx), _dav(sig_coh), _dav(sig_x)
@@ -179,6 +134,84 @@ def average_sigma_components(
             energies_kn_ry, tol_ry)
     return (sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
             h_transverse, sig_x, sigma_c_at_dft_ev)
+
+
+def average_matrix_diagonal(
+    matrix_knn,
+    *,
+    energies_kn_ry: np.ndarray,
+    tol_ry: float = TOL_DEGENERACY_RY,
+    mesh_xy,
+):
+    """Average one matrix diagonal over DFT-degenerate manifolds.
+
+    Parameters
+    ----------
+    matrix_knn : jax.Array, shape (nk, nb, nb)
+        Matrix in the fixed DFT band basis.  A canonical
+        ``P(None, 'x', 'y')`` band-sharded input stays band-sharded; a
+        replicated input stays replicated.
+    energies_kn_ry : np.ndarray, shape (nk, nb)
+        Immutable DFT eigenvalues in Ry that define the manifolds.
+    tol_ry : float
+        Adjacent-band degeneracy tolerance in Ry.
+    mesh_xy : jax.sharding.Mesh
+        Mesh owning the matrix layout.
+
+    Returns
+    -------
+    jax.Array, shape (nk, nb, nb)
+        A copy with only the diagonal averaged.  Off-diagonal entries and
+        the input's replicated/band-sharded layout are preserved.
+
+    Notes
+    -----
+    This primitive implements only the tolerance its caller supplies.  The
+    QSGW caller caps that tolerance at 1e-4 eV: a resolved meV-scale SOC pair
+    is not a degenerate manifold and must not be averaged or damped here.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    import jax
+    import jax.numpy as jnp
+    from common.collectives import device_put_process_local, gather_to_host
+    from gw.qsgw_utils import (
+        is_band_sharded_sigma_omega,
+        set_band_diag_sharded,
+        static_sigma_diag_to_host,
+    )
+
+    rep = NamedSharding(mesh_xy, P(None, None, None))
+    band_4d = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    spec = getattr(getattr(matrix_knn, "sharding", None), "spec", None)
+    band_sharded = False
+    if spec is not None and getattr(matrix_knn, "ndim", 0) == 3:
+        spec = tuple(spec) + (None,) * (3 - len(tuple(spec)))
+        band_sharded = spec[1] is not None or spec[2] is not None
+        if band_sharded and spec != (None, "x", "y"):
+            raise ValueError(
+                "static Sigma degeneracy averaging requires canonical "
+                "P(None,'x','y') band sharding; got "
+                f"PartitionSpec{spec}")
+
+    if band_sharded:
+        # Reuse the dynamic-Sigma diagonal backend by adding a length-one
+        # leading axis.  Its shard_map extracts exactly nk*nb values with one
+        # psum; the setter changes only diagonal entries in each owned tile.
+        matrix_4d = jax.lax.with_sharding_constraint(
+            jnp.expand_dims(matrix_knn, axis=0), band_4d)
+        if not is_band_sharded_sigma_omega(matrix_4d):
+            raise ValueError(
+                "band-sharded Sigma lost its matrix-axis layout while "
+                "adding the temporary leading axis")
+        diag = static_sigma_diag_to_host(matrix_knn, mesh_xy)
+        averaged = average_within_degenerate_sets(
+            diag, energies_kn_ry, tol_ry)
+        return set_band_diag_sharded(matrix_4d, averaged[None, ...])[0]
+
+    # Process-local replication, NOT plain ``jax.device_put``: the latter
+    # fires JAX's hidden ``assert_equal`` all-gather on a multi-process mesh.
+    return device_put_process_local(apply_to_matrix_diagonals(
+        gather_to_host(matrix_knn), energies_kn_ry, tol_ry), rep)
 
 
 def apply_to_matrix_diagonals(
