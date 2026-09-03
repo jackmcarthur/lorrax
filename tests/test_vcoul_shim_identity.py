@@ -19,6 +19,7 @@ re-implement.
 # guarantees another test module has put services/*/src on sys.path yet.
 from ffi import _services
 _services.ensure_on_path()
+import numpy as np  # noqa: E402
 import vcoul  # noqa: E402
 
 
@@ -60,6 +61,33 @@ def test_kernel_adapters_subclass_and_inherit_the_arithmetic():
         # re-implements _v_bare_per_q is a second physics copy, the exact
         # failure mode the extraction exists to end.
         assert old._v_bare_per_q is new._v_bare_per_q
+
+
+def test_bulk_adapter_forwards_the_exact_rule_and_certificate(monkeypatch):
+    """The wfn/Meta shim cannot drop the production owner's new contract."""
+    from types import SimpleNamespace
+
+    import gw.coulomb as gc
+
+    seen = {}
+
+    def fake_q0(self, geometry, kgrid, **kwargs):
+        seen.update(geometry=geometry, kgrid=kgrid, **kwargs)
+        return 1.0, 2.0
+
+    monkeypatch.setattr(vcoul.Bulk3D, "q0_average", fake_q0)
+    wfn = SimpleNamespace(
+        blat=2.0, bvec=np.eye(3),
+        cell_volume=8.0)
+    meta = SimpleNamespace(nkx=2, nky=3, nkz=4)
+    callback = object()
+    assert gc.Bulk3D().q0_average(
+        wfn, meta, S_cart="S", rule=vcoul.BULK_Q0_RULE_EXACT,
+        certificate_fn=callback) == (1.0, 2.0)
+    assert seen["kgrid"] == (2, 3, 4)
+    assert seen["rule"] == vcoul.BULK_Q0_RULE_EXACT
+    assert seen["certificate_fn"] is callback
+    assert seen["S_cart"] == "S"
 
 
 def test_identity_pin_can_fail():

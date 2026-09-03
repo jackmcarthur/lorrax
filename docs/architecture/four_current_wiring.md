@@ -138,7 +138,7 @@ contraction order and operator packing. Declaring the twelve current `χ` blocks
 zero costs **0.012 µeV** against the screened packed mode. The former head-on
 difference of **5.4 meV MAE / 11.9 meV max** compared different Γ-cell
 quadratures as well as different insertion rules. Both routes now use the
-Wigner–Seitz polygon cubature; the remaining insertion distinction is owned
+dimension-matched Wigner–Seitz polygon/polyhedron cubature; the remaining insertion distinction is owned
 by [theory §3.6](../theory/four-current-head-corrections.md).
 
 ## The map
@@ -610,7 +610,7 @@ their historical columns byte-for-byte.
 | `Sigma blocks   : …` | `gw_jax.py:1461-1468` | Max and mean `|diag|` in eV over the Sigma window for CC, CT+TC and TT. These reduce the same per-state fields written to `sigma_diag.dat`. |
 | `Head Sigma     : …` | `gw_jax.py:1470-1475` | Max and mean `|diag|` of the Gamma-cell contribution, split CC, CT+TC and TT. Dynamic CC combines the scalar bare-X and dynamic-correlation head owners; current sectors come from the packed completion. |
 | `GN odd Sigma   : …` | `gw_jax.py:1478-1498` | Measured-broken-TR only: max/mean `|sigC_odd|`, its max/mean shares of `|Sigma_xc|`, the `W(iomega_p)` Hermiticity residual, and `max|D|/max|B|`. Its absence on a TRS deck is part of the schema. |
-| `Slab WS cert   : …` / `Photon WS cert : …` | `gw_jax.py:803-809,1500-1506` | Exact Wigner-Seitz cubature order ladder, physical node counts and final mixed-tolerance error ratio. The photon line also reports the coupled solve's maximum Dyson backward residual. |
+| `Gamma WS cert  : …` / `Photon WS cert : …` | `gw_jax.py:803-809,1500-1506` | Dimension, exact polygon/polyhedron method, order ladder, physical node counts and final mixed-tolerance error ratio. The photon line also reports the coupled solve's maximum Dyson backward residual. |
 | `Global TRS     : …` | `common/scientific_output.py:352-386` | The measured global verdict and provenance used by the screening/ordered-residue route. Route selection reads this verdict; it is not inferred again from a deck flag. |
 | `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:314` | the carrier banner. Under `full_static_cohsex` the parenthetical names the **head state**, not "experimental", and reads `DEBUG: Gamma-cell head disabled by head_correction=off` when the completion is off |
 | `Σ^B tile (μ_L=i, ν_L=j): tr Σ = …` ×9 | `sigma_x_bispinor.py:217` | the **incumbent** bare route ran. Their absence beside a `Photon route: packed …` line is the packed bare route |
@@ -713,6 +713,6 @@ uphold when editing, not as something the tree checks for you.
 | the local/distributed plans behind the Dyson step | [`distrib_la`](../services/distrib_la.md) |
 | bispinor tile symmetry contracts, and why 4-component rotation does not exist | [Symmetry register](symmetry_register.md) |
 | the transverse current Hartree | [Direct Hartree field](../theory/hartree.md) |
-| Γ-cell quadrature ownership and the remaining scalar-versus-packed insertion distinction | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §3.6 — both routes use the Wigner–Seitz polygon cubature; insertion is still route-specific |
+| Γ-cell quadrature ownership and the remaining scalar-versus-packed insertion distinction | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §3.6 — both routes use the dimension-matched Wigner–Seitz polygon/polyhedron cubature; insertion is still route-specific |
 | what freezing the current blocks at ω = 0 inside a dynamic run costs (1.2 × 10⁻⁸ eV on MoS2 3×3, and it bounds the neglected frequency dependence from above) | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §2.2 |
 | the narrative introduction, for a reader rather than an editor | `manual/08_bispinor/` (repo only, not in this site) |

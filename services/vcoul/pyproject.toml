@@ -41,6 +41,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not extra'"
 # The SAME two markers the monorepo registers.  Declared in both places on
 # purpose: `pytest services/vcoul/tests` from the monorepo root picks THIS
 # file as its rootdir config (it is the nearest pyproject.toml above the
@@ -50,4 +51,7 @@ testpaths = ["tests"]
 markers = [
     "services: a standalone service's own suite, staged into the main one",
     "vcoul: the vcoul service suite",
+    "gpu: tests that require a CUDA-capable JAX backend",
+    "extra: staged compute/tooling tests excluded from the ordinary service suite",
+    "compute_node: long acceptance/certification cells that must run on an allocated compute node",
 ]

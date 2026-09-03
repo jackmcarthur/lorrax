@@ -39,13 +39,11 @@ WHO CALLS WHAT
     The ``(vc0_mean, wcoul0)`` pair at q→0.  ``gw.vcoul.compute_q0_averages``
     is the deck-facing wrapper (called by ``gw.head_correction``'s
     HeadResolver in both the epshead and the anisotropic-S(ω) flavour).
-    **The slab (``sys_dim = 2``) evaluates it on the exact Wigner--Seitz
-    polygon cubature** ``slab_minibz_photon_cubature`` issues below — ONE
-    q→0 cell-average owner shared with the packed bispinor Γ completion —
-    and reaches the superseded scrambled-Sobol draw only through the named
-    ``rule="sobol_debug"`` (``Q0_RULE_EXACT`` / ``Q0_RULE_SOBOL_DEBUG``).
-    The bulk (``sys_dim = 3``) keeps its incumbent Sobol + Baldereschi
-    sphere rule: the polygon construction is two-dimensional.
+    The slab and bulk evaluate it on the exact Wigner--Seitz polygon or
+    polyhedron cubature issued below: ONE q→0 cell-average owner shared with
+    the matching packed bispinor Γ completion.  Either dimension reaches
+    the superseded scrambled-Sobol draw only through the explicit DEBUG
+    ``rule="sobol_debug"`` spelling.
 ``minibz_voronoi_batches`` / ``minibz_average`` / ``minibz_inscribed_sphere_r2``
     The BGW ``Common/minibzaverage.f90`` port.  Used by the 3D and 2D
     ``q0_average`` above, and directly by ``bse.vq_interp.minibz_head_vlr``
@@ -61,11 +59,11 @@ WHO CALLS WHAT
     ``(C,Tx,Ty,Tz)`` basis.  It is the sample provider for a caller that must
     complete a coupled q0 solve before averaging; it contains no screened
     response physics and applies no cell-volume factor.
-``slab_minibz_photon_cubature(kernel, geometry, kgrid)``
+``minibz_photon_cubature(kernel, geometry, kgrid)``
     The production screened-head provider: one authenticated receipt binding
-    the true mini-lattice Wigner--Seitz polygon, fixed 16/24/32 Duffy--Gauss
-    ladder, cell volume, reciprocal lattice/k-grid identity, normalized
-    weights, and physical/padded solve counts.
+    the true mini-lattice Wigner--Seitz polygon/polyhedron, its fixed
+    Duffy--Gauss ladder, cell volume, reciprocal lattice/k-grid identity,
+    normalized weights, and physical/padded solve counts.
 ``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
     The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
     ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
@@ -110,7 +108,8 @@ from vcoul.box_fft import (
     _round_up_fft_size,
     compute_vcoul_box,
 )
-from vcoul.bulk_3d import Bulk3D
+from vcoul.bulk_3d import (BULK_Q0_RULE_EXACT, Bulk3D,
+                           BulkQ0Certificate)
 from vcoul.geometry import CoulombGeometry
 from vcoul.quadrature import (
     GAUSS_LEGENDRE_INTERVAL_PROVENANCE,
@@ -160,7 +159,8 @@ __all__ = [
     "HeadSlotTable", "head_slot_table",
     "Bulk3D", "Slab2D", "Box0D",
     # the slab q->0 cell-average rule selection (no silent alternative)
-    "Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG", "SlabQ0Certificate",
+    "Q0_RULE_EXACT", "BULK_Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG",
+    "SlabQ0Certificate", "BulkQ0Certificate",
     # standalone host quadrature owner
     "GAUSS_LEGENDRE_INTERVAL_PROVENANCE", "gauss_legendre_interval",
     # mini-BZ sampling / averaging

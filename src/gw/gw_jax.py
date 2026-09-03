@@ -1017,7 +1017,8 @@ def main(argv=None):
 			final_head = finalize_iteration_head_samples(
 				oneshot_head_response, wfn=wfn, meta=meta, config=config,
 				mesh=mesh_xy, requests=oneshot_head_requests,
-				W_by_role=W_by_role)
+				W_by_role=W_by_role,
+				q0_certificate_fn=q0_certificates.append)
 		head_resolver.install_samples(final_head.samples)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
@@ -1694,12 +1695,24 @@ def main(argv=None):
 		report.progress(_odd_line)
 	if q0_certificates:
 		_q0_cert = max(q0_certificates, key=lambda item: item.final_error_ratio)
+		_q0_cell_count = getattr(
+			_q0_cert, "polygon_edges",
+			getattr(_q0_cert, "polyhedron_faces", "unknown"))
+		_q0_cell_name = (
+			"polygon_edges" if hasattr(_q0_cert, "polygon_edges")
+			else "polyhedron_faces")
+		_q0_mean_w = (
+			_q0_cert.mean_w.real
+			if _q0_cert.mean_w is not None else float("nan"))
 		report.progress(
-			"Slab WS cert   : exact q=0 charge-head cubature; "
+			f"Gamma WS cert : dim={_q0_cert.dimension}; "
+			f"method={_q0_cert.method}; exact q=0 charge-head cubature; "
 			f"orders={_q0_cert.orders}; nodes={_q0_cert.physical_counts}; "
-			f"polygon_edges={_q0_cert.polygon_edges}; evaluations="
+			f"{_q0_cell_name}={_q0_cell_count}; evaluations="
 			f"{len(q0_certificates)}; max_final_error_ratio="
-			f"{_q0_cert.final_error_ratio:.3e} (<=1 required)")
+			f"{_q0_cert.final_error_ratio:.3e} (<=1 required); "
+			f"<v>={_q0_cert.mean_v.real:.9g} a.u.; "
+			f"<W>={_q0_mean_w:.9g} a.u.")
 	report.sigma_coverage(
 		config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
 		sigma_result=sigma_result)

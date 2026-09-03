@@ -164,7 +164,7 @@ In a hand-built config, setting the field replaces the `q = Γ, G = 0` slot
 of the nine TT `V` tiles by `−T_{ij}/Ω_{\rm cell}`, where `T` is sampled by the
 Sobol `vcoul.minibz_transverse_head_avg` debug estimator. It is not the
 Wigner–Seitz polygon provider that owns the deck-reachable scalar and packed
-slab heads.
+slab/bulk heads.
 Exact identities used as gates:
 
 $$
@@ -181,8 +181,9 @@ MoS2 4×4 bi4 deck (`BISPINOR_DHFB_DESIGN.md` §11): the missing head is
 comparable in Frobenius norm to the whole stored `q = Γ` TT slab and is
 about 5 % of `Σ^B`, but only ~0.2 meV on quasiparticle energies at that
 grid, decaying as `1/√N_k` in 2D. Box truncation (`sys_dim = 0`) never zeros
-the slot and is refused. Bulk (`sys_dim = 3`) uses the Baldereschi–Tosatti
-analytic sphere for the `1/q²` part, as `⟨v⟩` does.
+the slot and is refused. The packed bulk route uses the exact polyhedron
+receipt; only the unreachable incumbent overlay still uses its historical
+Sobol/sphere helper pending deletion with that route.
 
 This term is frequency independent because `Σ^B` is. If invoked from a
 hand-built configuration, it is the only transverse Γ-cell correction outside
@@ -283,16 +284,15 @@ W_h(\omega)=\left\langle\frac{v(\mathbf q)}{1-v(\mathbf q)\,q_aS^{\rm eff}_{ab}(
 \qquad(\texttt{vcoul.<kernel>.q0\_average}).
 $$
 
-**The cell average has one owner per dimension, and on a slab it is the
-same rule the packed completion of §4 uses.** `Slab2D.q0_average` evaluates
-both brackets on the exact mini-lattice Wigner–Seitz polygon cubature
-(Γ-to-edge Duffy triangulation, fixed 16/24/32 Gauss–Legendre ladder)
-issued by `vcoul.slab_minibz_photon_cubature` — the same authenticated
-receipt, the same nodes and the same weights `complete_static_photon_q0`
-consumes. The superseded scrambled-Sobol draw survives only as the named
-`rule="sobol_debug"`. `Bulk3D` keeps its Sobol + Baldereschi–Tosatti sphere
-rule: the polygon construction is two-dimensional. See §3.6 and
-`docs/services/vcoul.md`.
+**The cell average has one owner per dimension, and it is the same rule the
+matching packed completion of §4 uses.** `Slab2D.q0_average` evaluates both
+brackets on the exact mini-lattice Wigner–Seitz polygon cubature
+(16/24/32); `Bulk3D.q0_average` uses the exact Wigner–Seitz polyhedron
+tetrahedron/Duffy cubature (10/16/22). Each consumes the same authenticated
+receipt, nodes, weights, and raw kernel as `complete_static_photon_q0`.
+The superseded scrambled-Sobol draws and the bulk analytic-sphere split
+survive only as the named service DEBUG rule `rule="sobol_debug"`. See
+§3.6 and `docs/services/vcoul.md`.
 
 The body `W_{μν}(q=0)` is solved with the `G = 0` channel removed (the
 `K = 0` slot of `v` is zero), so the scalar head is re-attached to it as a
@@ -372,7 +372,7 @@ Facts at `34228021`, with the derivation and branch assignment owned by
   bare current addition is TR-even and static: it never touches `B_odd`, `D`,
   the ordered residue branch, or that verdict.
 
-### 3.6 CLOSED (quadrature): the 5.4 meV was the Sobol estimator
+### 3.6 CLOSED in slabs; bulk migration is separately gated
 
 There were two evaluations of the **same** Γ-cell charge integral and they
 disagreed. Two mechanisms differed at once — the quadrature and the
@@ -380,7 +380,7 @@ insertion — and the quadrature half is now settled and fixed.
 
 | | incumbent (before 2026-09-02) | today, both routes |
 |---|---|---|
-| quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon rule, `vcoul.slab_minibz_photon_cubature` |
+| quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon/polyhedron rule, dispatched by `vcoul.minibz_photon_cubature` |
 | insertion | band-diagonal scalar shift (§3.2) | scalar route: band-diagonal (§3.2); packed route: rank-4 update through the real Σ kernels (§4.2) |
 | convergence certificate | none printed | scalar: polygon edges/orders/nodes/`⟨v⟩`/24→32 error ratio, refuses above budget. packed: one `Photon head` record with `<D>[0,0]`, `M_00[0,0]`, the four family norms, occupied-state insertion statistics, the WS orders/nodes/error ratio, and the Ward/Hermiticity/Dyson bounds |
 
@@ -679,8 +679,9 @@ former.
 At `34228021` the two implementation defects below are fixed. The absolute
 insertion/wing normalisation that remained open after that change is closed
 numerically in §3.6; the scalar and packed routes share one slab quadrature,
-and the packed bulk completion has its exact polyhedron rule. The scalar bulk
-owner remains separate and is not changed here.
+and the scalar and packed bulk heads share the exact polyhedron rule. The
+remaining distinction is scalar band-diagonal versus packed low-rank
+insertion, not the Gamma-cell integrator.
 
 * **Interband Γ wing sign.** Both wing kernels built the
   mixed head/body interband weight as `+F\,\overline{P}\,b/(z²−Δ²)`, while the

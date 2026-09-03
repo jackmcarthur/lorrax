@@ -240,6 +240,68 @@ def test_bulk_photon_receipt_is_true_ws_and_obeys_trace_identity(
             D_mean[1, 1], D_mean[3, 3], rtol=1.0e-4, atol=0.0)
 
 
+@pytest.mark.parametrize("static_model", ("S_cart", "kappa"))
+def test_bulk_scalar_head_consumes_the_photon_receipt(static_model):
+    """Scalar <v>/<W> and the packed completion share one 3-D rule."""
+    import vcoul
+
+    bvec = np.diag((1.0, 1.2, 0.7))
+    geometry = vcoul.CoulombGeometry(
+        bvec=bvec,
+        cell_volume=float((2.0 * np.pi) ** 3 / abs(np.linalg.det(bvec))))
+    kgrid = (3, 4, 2)
+    receipt = vcoul.bulk_minibz_photon_cubature(
+        vcoul.get_kernel(3), geometry, kgrid)
+    chunk = receipt.chunks[-1]
+    n = int(chunk.physical_count)
+    weight = np.asarray(chunk.sample_weight[:n])
+    q = np.asarray(chunk.q_cart[:n])
+    v = np.asarray(chunk.D_raw[:n, 0, 0])
+    measure = float(np.sum(weight))
+    certificates = []
+    kwargs = {}
+    if static_model == "S_cart":
+        S = np.diag((-0.01, -0.008, -0.006))
+        qSq = np.einsum("qi,ij,qj->q", q, S, q, optimize=True)
+        expected_w = np.sum(weight * v / (1.0 - v * qSq)) / measure
+        kwargs["S_cart"] = S
+    else:
+        kappa2 = 0.04
+        q2 = np.einsum("qi,qi->q", q, q, optimize=True)
+        expected_w = np.sum(weight * 8.0 * np.pi / (q2 + kappa2)) / measure
+        kwargs["static_kappa2"] = kappa2
+    got_v, got_w = vcoul.get_kernel(3).q0_average(
+        geometry, kgrid, certificate_fn=certificates.append, **kwargs)
+    np.testing.assert_allclose(complex(got_v), np.sum(weight * v) / measure,
+                               rtol=2.0e-15)
+    np.testing.assert_allclose(complex(got_w), expected_w, rtol=2.0e-15)
+    assert len(certificates) == 1
+    assert isinstance(certificates[0], vcoul.BulkQ0Certificate)
+    assert certificates[0].orders == receipt.orders
+    assert certificates[0].mean_v == complex(got_v)
+    assert certificates[0].mean_w == complex(got_w)
+
+
+def test_bulk_scalar_head_debug_rule_is_named_and_production_refuses_sphere():
+    import vcoul
+
+    geometry = vcoul.CoulombGeometry(
+        bvec=np.eye(3), cell_volume=float((2.0 * np.pi) ** 3))
+    kernel = vcoul.get_kernel(3)
+    with pytest.raises(ValueError, match="bulk_q0_rule_unknown"):
+        kernel.q0_average(
+            geometry, (3, 3, 3), S_cart=np.zeros((3, 3)), rule="sobol")
+    with pytest.raises(ValueError, match="bulk_q0_debug_rule_required"):
+        kernel.q0_average(
+            geometry, (3, 3, 3), S_cart=np.zeros((3, 3)),
+            analytic_sphere=True)
+    with pytest.warns(RuntimeWarning, match="infinite variance"):
+        old_v, old_w = kernel.q0_average(
+            geometry, (3, 3, 3), S_cart=np.zeros((3, 3)),
+            rule=vcoul.Q0_RULE_SOBOL_DEBUG, nsamples=256, qmc_reps=2)
+    assert np.isfinite(complex(old_v)) and np.isfinite(complex(old_w))
+
+
 def test_photon_cubature_dimension_dispatch_refuses_mismatched_kernels():
     import vcoul
 

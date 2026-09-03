@@ -3025,6 +3025,7 @@ def finalize_iteration_head_samples(
     mesh: Mesh,
     requests=None,
     W_by_role=None,
+    q0_certificate_fn=None,
 ) -> IterationHeadSamples:
     """Apply the optional body Schur fold and mini-BZ-average the head.
 
@@ -3135,6 +3136,7 @@ def finalize_iteration_head_samples(
         response_kind=("full_local_fields" if use_fold
                        else "direct_irreducible"),
         source_prefix=("head_schur" if use_fold else "head_direct"),
+        q0_certificate_fn=q0_certificate_fn,
     )
     return IterationHeadSamples(
         omegas=response.omegas,
@@ -3155,6 +3157,7 @@ def head_samples_from_s(
     static_kappa2_bohr2: float | None = None,
     response_kind="direct_irreducible",
     source_prefix: str = "qsgw_parallel_transport",
+    q0_certificate_fn=None,
 ) -> tuple[object, ...]:
     """Convert replicated 3x3 S tensors to mini-BZ averaged head samples."""
     from gw.head_correction import (
@@ -3201,6 +3204,7 @@ def head_samples_from_s(
             analytic_sphere=bool(getattr(
                 config.head, "analytic_q0_sphere",
                 config.head.head_minibz_average)),
+            certificate_fn=q0_certificate_fn,
         )
         out.append(
             HeadSample(

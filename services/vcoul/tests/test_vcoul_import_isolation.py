@@ -128,12 +128,12 @@ def test_the_whole_public_surface_answers_with_no_lorrax():
             "import os; os.environ.setdefault('JAX_PLATFORMS', 'cpu')\n"
             "import numpy as np\n"
             "import vcoul as V\n"
-            # 47 names, measured at this commit.  The generic receipt,
+            # 49 names, measured at this commit.  The generic receipt,
             # dimension dispatcher, and two explicit issuers are all on the
             # service door; the superseded slab-only receipt/validator names
             # are gone.  Bump this measured count in the same commit as any
             # door change; a stale count is not an isolation break.
-            "assert len(V.__all__) == 47, V.__all__\n"
+            "assert len(V.__all__) == 49, V.__all__\n"
             "for _n in V.__all__:\n"
             "    assert hasattr(V, _n), _n\n"
             "class W:\n"
