@@ -306,6 +306,14 @@ def test_live_hartree_is_carried_to_both_final_output_seams():
     assert "dump_sigma_omega_h5_final transverse" in text
 
 
+def test_bispinor_live_hartree_rebuild_has_a_per_map_record():
+    """The production record, not a quiet loop printer, owns this receipt."""
+    text = (ROOT / "src" / "gw" / "sc_iteration.py").read_text(
+        encoding="utf-8")
+    assert ('_record_sc(\n            inputs,\n'
+            '            f"    density-SC: rebuilt exact scalar"') in text
+
+
 def test_sc_density_applies_rotation_inside_the_scan():
     """SC must not materialise a full resident QP-wavefunction array."""
     module = ast.parse((ROOT / "src" / "gw" / "sc_iteration.py").read_text(

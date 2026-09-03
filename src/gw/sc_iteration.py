@@ -2812,7 +2812,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             _sanity.check_finite(
                 "H_T[SC] transverse", exact_hartree_dft.transverse_dft,
                 print_fn=inputs.print_fn)
-        inputs.print_fn(
+        _record_sc(
+            inputs,
             f"    density-SC: rebuilt exact scalar"
             f"{' + transverse' if exact_hartree_dft.transverse_dft is not None else ''} "
             f"Hartree from iteration {state.iteration} orbitals "
