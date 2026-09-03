@@ -83,10 +83,12 @@ from .minimax_screening import MinimaxNodes
 _chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
 
-# The static metal fallback streams one small ordered band-pair tile at a
-# time.  This is deliberately a compile-time constant: changing it is a
-# memory/performance choice, not physics or an input-file option.
-_STATIC_FRACTIONAL_PAIR_TILE = 8
+# The static metal fallback streams one ordered band-pair tile at a time.
+# Width 8 left production Bi executing 529 tiny scan steps per q row.  Width
+# 32 reduces that to 36 steps for its 184-band physical window; the documented
+# transient is 5.8 GiB/rank on the P36 geometry, well below an 80 GiB A100.
+# This remains a compile-time performance choice, not a physics/input dial.
+_STATIC_FRACTIONAL_PAIR_TILE = 32
 
 
 def _complete_static_vertex_orientations(forward_R, reverse_R=None):
