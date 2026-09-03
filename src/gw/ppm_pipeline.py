@@ -491,6 +491,7 @@ def compute_ppm_sigma_pipeline(
     sym,
     iteration_head=None,
     occupation_state=None,
+    w_time_factor_cache=None,
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -642,6 +643,9 @@ def compute_ppm_sigma_pipeline(
             os.makedirs(fit_dir, exist_ok=True)
         barrier("ppm_mpa_fit_directory_ready")
         fit_store_path = os.path.join(fit_dir, "mpa_fit_oneshot.h5")
+        ppm_w_cache = (
+            None if w_time_factor_cache is None else
+            w_time_factor_cache.setdefault("ppm_total", {}))
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
@@ -655,6 +659,7 @@ def compute_ppm_sigma_pipeline(
                 quadrature_cache_dir=quadrature_cache_dir,
                 occupation_state=occupation_state,
                 plan=plan,
+                w_time_factor_cache=ppm_w_cache,
                 print_fn=print_fn,
             )
         sigma_omega_even = None
@@ -664,6 +669,9 @@ def compute_ppm_sigma_pipeline(
             # contribution by subtraction, preserving main's observable.
             even_store_path = os.path.join(
                 fit_dir, "mpa_fit_oneshot_even.h5")
+            even_w_cache = (
+                None if w_time_factor_cache is None else
+                w_time_factor_cache.setdefault("ppm_even", {}))
             with timing.section("sigma.exec.odd_reference"):
                 sigma_omega_even = compute_sigma_c_ppm_omega_grid(
                     wfns, replace(ppm, B_odd_q=None), meta, mesh_xy,
@@ -677,6 +685,7 @@ def compute_ppm_sigma_pipeline(
                     quadrature_cache_dir=quadrature_cache_dir,
                     occupation_state=occupation_state,
                     plan=plan,
+                    w_time_factor_cache=even_w_cache,
                     print_fn=lambda *args, **kwargs: None,
                 )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries

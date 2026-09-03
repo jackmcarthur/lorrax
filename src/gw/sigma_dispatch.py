@@ -680,6 +680,7 @@ def compute_sigma_xc(
     material_class: str,
     qsgw_offdiagonal_efermi_ev: float | None = None,
     frozen_screening_model: bool = False,
+    w_time_factor_cache=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -1331,6 +1332,7 @@ def compute_sigma_xc(
             # this run's screening_diagrams either did or did not produce,
             # and the two are indistinguishable in the bytes.
             expected_screening_diagrams=config.screening.diagrams,
+            w_time_factor_cache=w_time_factor_cache,
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
@@ -1433,6 +1435,7 @@ def compute_sigma_xc(
         band_slices=band_slices, wfn=wfn, sym=sym,
         iteration_head=iteration_head,
         occupation_state=occupation_state,
+        w_time_factor_cache=w_time_factor_cache,
         print_fn=print_fn,
     )
 

@@ -1712,9 +1712,10 @@ _DEFAULTS = {
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
     # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
     # still honored as deprecated overrides.
-    # Two-level QSGW uses this as BOTH the outer W-refit cap and each
-    # frozen-screening inner solve's accelerator cap.  sc_max_iter=1 remains
-    # the historical one-map diagnostic, not a nested solve.
+    # Two-level QSGW uses this for the outer W-refit cap, each frozen-W
+    # G->Sigma solve, and the innermost fixed-Sigma-table accelerator cap.
+    # sc_max_iter=1 remains the historical one-map diagnostic, not a nested
+    # solve.
     "sc_max_iter": 20,
     "sc_tol_ev": 1.0e-4,
     "sc_accelerator": "rcrop",   # rcrop | linear
@@ -4532,9 +4533,10 @@ class SCConfig:
     envs are still honored as deprecated overrides at config construction
     (``from_input_file`` prints a note when one is active).
 
-    - ``max_iter`` / ``tol_ev``: ``max_iter`` bounds both outer W refits and
-      each frozen-screening inner solve; ``tol_ev`` is the L-infinity
-      protected-energy convergence cutoff at both levels (eV).
+    - ``max_iter`` / ``tol_ev``: ``max_iter`` bounds outer W refits, each
+      frozen-screening G→Sigma solve, and each innermost fixed-Sigma-table
+      solve; ``tol_ev`` is the L-infinity protected-energy convergence cutoff
+      at every level (eV).
     - ``accelerator``: ``"rcrop"`` (Anderson-style restart-CROP, default —
       required for QSGW's typical 2-cycle Jacobian) or ``"linear"``
       (plain α-mixing, diagnostic).  rCROP makes TWO ``gw_iteration_map``

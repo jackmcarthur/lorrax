@@ -883,6 +883,59 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
         0, pole_indices.shape[0], _add, jnp.zeros_like(B_poles[0]))
 
 
+_shared_w_tau_kernel_cache: dict[int, Callable] = {}
+
+
+def get_shared_w_tau_kernel(*, mesh_xy: Mesh) -> Callable[..., jax.Array]:
+    """Return the sole compiled builder for a reusable ``W(tau)`` tile.
+
+    The ordinary Sigma path keeps this build fused into
+    :func:`get_shared_sigma_tau_kernel`.  Two-level QSGW asks for the same
+    operation separately so the outer screening transaction can retain its
+    immutable W-side time factors while later inner maps rebuild only G.
+    Splitting at this seam changes no frequency algebra and leaves the fused
+    spatial ``G*W`` convolution owned by :func:`_get_sigma_kij_kernel`.
+    """
+    key = id(mesh_xy)
+    fn = _shared_w_tau_kernel_cache.get(key)
+    if fn is None:
+        q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+
+        @jax.jit
+        def _build(B_poles, Omega_poles, pole_indices, bounds,
+                   phase_real, E_ref_B, t_node):
+            W_t = build_shared_w_tau(
+                B_poles, Omega_poles, pole_indices, bounds,
+                phase_real, E_ref_B, t_node)
+            return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
+
+        fn = _build
+        _shared_w_tau_kernel_cache[key] = fn
+    return fn
+
+
+def get_shared_sigma_spatial_kernel(
+    *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
+    brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
+    layout: str = "legacy", face_shape=None, pack_brackets: bool = True,
+) -> Callable[..., jax.Array]:
+    """Return the established fused spatial ``G(tau) W(tau)`` kernel.
+
+    This is the prepared-W entry to the same kernel used by
+    :func:`get_shared_sigma_tau_kernel`; it exists only so a frozen-screening
+    owner can cache ``W(tau)`` without creating a second convolution path.
+    """
+    kgrid = tuple(int(x) for x in kgrid)
+    if brackets is not None:
+        brackets = tuple((int(lo), None if hi is None else int(hi))
+                         for lo, hi in brackets)
+    ensure_jax_compile_cache()
+    return _get_sigma_kij_kernel(
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
+        brackets=brackets, layout=layout, face_shape=face_shape,
+        pack_brackets=pack_brackets)
+
+
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,

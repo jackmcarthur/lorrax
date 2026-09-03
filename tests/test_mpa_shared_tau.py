@@ -4,7 +4,11 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from gw.ppm_accumulators import DeviceOmegaAccumulator
-from gw.ppm_tau_kernel import build_shared_w_tau
+from gw.ppm_tau_kernel import (
+    build_shared_w_tau,
+    get_shared_sigma_spatial_kernel,
+    get_shared_w_tau_kernel,
+)
 
 
 def _mesh():
@@ -56,6 +60,21 @@ def test_selector_boundary_is_strict_below_and_inclusive_above():
         np.asarray([False, False]), 0.0, 0.3))
     want = np.exp(-1j * Omega[0] * 0.3)
     np.testing.assert_allclose(got, want, rtol=2e-15, atol=2e-15)
+
+
+def test_frozen_w_builder_is_the_owned_w_tau_algebra():
+    """The cacheable seam produces the exact established W(tau) tile."""
+    mesh = _mesh()
+    B = np.asarray([[[[1.0 + 0.25j]]]], dtype=np.complex128)
+    Omega = np.asarray([[[[0.8 - 0.1j]]]], dtype=np.complex128)
+    poles = np.asarray([0], dtype=np.int32)
+    bounds = np.asarray([[0.0, np.inf, -np.inf, -np.inf,
+                          np.inf, np.inf]])
+    real_phase = np.asarray([False])
+    args = (B, Omega, poles, bounds, real_phase, 0.04, 0.3 - 0.05j)
+    cached_seam = get_shared_w_tau_kernel(mesh_xy=mesh)(*args)
+    direct = build_shared_w_tau(*args)
+    np.testing.assert_array_equal(np.asarray(cached_seam), np.asarray(direct))
 
 
 def test_device_frequency_fold_and_one_sided_completion():
@@ -186,3 +205,27 @@ def test_shared_tau_factory_forwards_the_band_partition(monkeypatch):
     assert seen["merged_x"] is True
     assert seen["pack_brackets"] is False
     tau._sigma_shared_tau_kernel_cache.clear()
+
+
+def test_prepared_w_factory_reuses_the_same_spatial_kernel(monkeypatch):
+    """Prepared W enters the existing convolution owner, not a twin."""
+    import gw.ppm_tau_kernel as tau
+
+    seen = {}
+    sentinel = object()
+
+    def fake_spatial(**kwargs):
+        seen.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(tau, "_get_sigma_kij_kernel", fake_spatial)
+    got = get_shared_sigma_spatial_kernel(
+        mesh_xy=_mesh(), kgrid=(1, 2, 3), brackets=((0, 2),),
+        pack_brackets=False)
+    assert got is sentinel
+    assert seen["kgrid"] == (1, 2, 3)
+    assert seen["merged_x"] is True
+    assert seen["brackets"] == ((0, 2),)
+    assert seen["layout"] == "legacy"
+    assert seen["face_shape"] is None
+    assert seen["pack_brackets"] is False
