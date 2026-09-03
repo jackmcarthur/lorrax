@@ -40,6 +40,7 @@ current density `ψ†α^iψ`).
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`, in static COHSEX and packed GN/HL-PPM | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; Hall **refused** (§4) | `bispinor_gw = bare_transverse` inside the packed envelope | experimental, slab, one shot; body byte-identical to the incumbent route when compared without its head |
 | the packed operator on a **dynamic** Σ | **CC dynamic, current blocks static**: `W_00(ω)` follows the PPM model while the other fifteen packed blocks are evaluated at `ω = 0` | CC: the dynamic model's own head (§3.3) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT and CT/TC: the packed Γ-cell completion of §4.2 | either `bispinor_gw` value with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the packed envelope; `mpa` stays on the incumbent route | experimental, slab, one shot; the current blocks' `ω`-dependence is neglected and bounded as in §2.2 |
+| dynamic Hall/Faraday Γ head | `sigma_H(z)` is an even function of `z`; sampled at `0` and `i*omega_p` for GN | the producer and authenticated frequency-sample transaction are specified in §4.5; the packed-Σ insertion is not implemented | measured-broken-TR, insulating packed GN | **producer in progress; consumer refuses by name** because the Hall term belongs to the ordinary residue `B`, not the ordered half-difference `D` |
 | retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -609,10 +610,102 @@ response, and the code's ladder screening (`w_bse`) is charge-only.
 The time-reversal-odd photon physics that is *not* quantized, the
 finite-frequency Hall/Kerr response `σ_{xy}(ω)` and the antisymmetric part of
 the TT response, lives at `ω ≠ 0` and at `O(q²)`. Neither is present in the
-static packed head, and no dynamic photon propagator exists to hold the
-former.
+static packed head.  The bounded Gamma-cell Hall producer specified next is
+the first of those objects; it does not make the finite-q current blocks
+dynamic.
 
-### 4.5 Audited seams and remaining limitation
+### 4.5 Dynamic Hall/Faraday Gamma head
+
+This subsection owns the finite-frequency extension of the Hall term in
+§4.2.  It uses the same energy-ordered Adler--Wiser convention as the
+charge head and wings.  Let `Delta_ij = epsilon_i - epsilon_j > 0`,
+`f_diff = f_j - f_i`, and
+
+$$
+D_a(ij)=-\frac{v_a(ij)}{\Delta_{ij}},\qquad
+\Gamma_i=\frac{\alpha_{FS}}2 v_i .
+$$
+
+The one-charge-leg rule supplies the minus in the energy-ordered mixed
+response,
+
+$$
+\chi^{(a)}_{0i}(z)=
+-\frac{4}{\Omega N_k n_{\rm spin}n_{\rm spinor}}
+\sum_{\mathbf k,\,\Delta_{ij}>0}
+\frac{(f_j-f_i)\,\overline{v_a(ij)}\,\Gamma_i(ij)}
+     {z^2-\Delta_{ij}^2}.
+$$
+
+Its coordinate-antisymmetric axial part defines the one Hall pseudovector,
+
+$$
+\sigma_H^b(z)=\frac{i}{2}\epsilon_{bai}\chi^{(a)}_{0i}(z),\qquad
+\chi_{0i}(\mathbf q\to0,z)
+   =-i\epsilon_{bai}\sigma_H^b(z)q_a,
+$$
+
+and `TC(z)` is the causal partner of `CT(z)`.  At `z=0`, pairing the two
+band orientations reduces this expression to the occupied-bra Berry sum in
+§4.4, including its sign:
+
+$$
+\sigma_H^b(0)=-\frac{\alpha_{FS}C_s}{2\Omega}\,
+\operatorname{Im}c_B^b .
+$$
+
+Three parities are consequences of the formula, not routing assumptions.
+
+* `sigma_H(-z) = sigma_H(z)`: the Hall coefficient is frequency-even.  On
+  the imaginary axis every denominator is real and the epsilon-contracted
+  velocity bilinear is purely imaginary, so `sigma_H(i*xi)` is real.
+* Reversing the magnetisation complex-conjugates the axial bilinear and
+  sends `sigma_H(z) -> -sigma_H(z)`.
+* When `SymMaps.trs_allowed` is true, the authenticated `k`/`-k` partners
+  cancel at every `z`.  The producer therefore returns exact zeros without
+  executing the Hall contraction.  This exact short circuit, plus a
+  `0.000 micro-eV` packed-route regression, is the required zero test.
+
+The head is analytic per transition pole.  It adds no frequency quadrature,
+no response kernel, and no pairwise Sigma stage: the same sharded band-pair
+reduction that owns `sigma_H(0)` evaluates all requested frequencies in one
+bounded sweep.
+
+#### Plasmon-pole consequence and current refusal
+
+For any head family represented by
+
+$$
+W_h^c(z)=\frac{R_+}{z-\Omega_h}-\frac{R_-}{z+\Omega_h}
+=\frac{2\Omega_h B+2zD}{z^2-\Omega_h^2},\qquad
+B=\frac{R_++R_-}{2},\quad D=\frac{R_+-R_-}{2},
+$$
+
+an even Hall sample has `D_H = 0` exactly.  Equivalently, the completed
+CT/TC Gamma sample is Hermitian at `z=i*omega_p`; applying the ordered-fit
+split `(W-W^dagger)/2` to that family returns zero.  Magnetisation oddness
+resides in the sign of the ordinary residue `B_H`, not in the
+frequency-odd residue `D`.  Both conduction and valence branches would still
+pass through `ppm_sigma._residue_for_space`, but they receive the same Hall
+residue.
+
+This distinguishes two diagnostics that must not be conflated:
+
+* the existing `sigC_odd` is `Sigma[B,D] - Sigma[B,D=0]` and measures a
+  frequency-odd ordered residue;
+* a Hall/Faraday diagnostic would be `Sigma[B_H] - Sigma[B_H=0]` (or a
+  magnetisation-reversed half-difference) and measures a
+  magnetisation-odd, frequency-even residue.
+
+Consequently the proposed `sigCT_odd` defined as "production minus its
+`D=0` twin" is identically zero and cannot certify a Faraday contribution.
+Until the output contract names the Hall-on/off observable and the packed
+head can form the probe-frequency low-rank factors without retaining another
+full packed body, a measured-broken-TR dynamic packed deck refuses as
+`GATE dynamic_hall_head_unimplemented_sigma_consumer`.  Static `z=0`
+completion is unchanged and remains the special case of the same producer.
+
+### 4.6 Audited seams and remaining limitation
 
 At `34228021` the two implementation defects below are fixed. The remaining
 head limitation is the insertion difference in §3.6; the scalar and packed

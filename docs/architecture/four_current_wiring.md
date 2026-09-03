@@ -482,6 +482,31 @@ charge Sigma and its coupled completion owns the charge head. The dynamic
 packed route deliberately keeps the scalar dynamic charge head and adds only
 the current-index blocks from the packed completion.
 
+### 3d. Dynamic Hall/Faraday Gamma-head boundary
+
+`qsgw_head.raw_hall_pseudovector_sharded` is the sole Hall Kubo reduction.
+It accepts an explicit complex-frequency vector, evaluates all samples in
+one band-tiled `P(None,None,'x','y')` contraction, and returns only the
+replicated `(n_frequency,3)` pseudovectors.  Its `z=0` row preserves the
+occupied-Berry result used by the static completion.  The sealed Hall
+transaction and `file_io.static_gauge_head` bind the frequency vector and
+all pseudovectors to the same WFN, band interval, full-BZ count and canonical
+operator fingerprint.  `SymMaps.trs_allowed=true` takes an exact-zero
+short circuit before the contraction.
+
+The production boundary is intentionally fail-closed.  The existing packed
+completion can consume one real imaginary-axis Hall sample through its
+`response.sigma_H` input, but obtaining both the static and probe-frequency
+rank-four factor families currently requires a second full packed body to be
+live.  That violates this layer's memory envelope.  Moreover the Hall Kubo
+coefficient is frequency-even, so its ordered half-difference `D` is exactly
+zero; it cannot feed the existing `sigC_odd = Sigma[B,D]-Sigma[B,D=0]`
+diagnostic.  A measured-broken-TR dynamic packed route therefore refuses as
+`GATE dynamic_hall_head_unimplemented_sigma_consumer`, naming the sampled
+`max|sigma_H(i*omega_p)|` when an authenticated artifact supplies it.  TRS
+decks retain the incumbent route byte-for-byte and static packed COHSEX keeps
+the existing `z=0` completion.
+
 ## Stage 4 — self-energy
 
 The fork is `sigma_dispatch.py:845`, and it has **three** packed arms plus
