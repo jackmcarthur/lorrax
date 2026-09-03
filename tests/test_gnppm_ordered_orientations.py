@@ -478,6 +478,103 @@ def test_faraday_ct_family_has_exact_zero_ordered_residue_and_sigct_odd():
     np.testing.assert_array_equal(B_h, B)
 
 
+def test_faraday_sigma_consumer_is_hall_on_off_and_magnetisation_odd(
+        monkeypatch):
+    """The rank-four analytic head reaches Sigma; its zero twin does not."""
+    from gw.head_correction import FaradayHeadPPMFactorCarrier
+    from gw.photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors)
+    from gw.photon_sigma import compute_ppm_faraday_head_sigma_omega
+
+    # This cell exercises the q0 closed form, not the host FFI implementation
+    # of the final small band projection.  Production GPU gates exercise the
+    # mandatory FFI route; the announced XLA fallback keeps this CPU oracle
+    # about the pole/branch algebra.
+    monkeypatch.setenv("LORRAX_BANDS_GEMM_FFI", "0")
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(404)
+    nk, nb, ns, nmu = 1, 4, 4, 4
+    slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
+
+    def bundle():
+        psi = (rng.normal(size=(nk, nb, ns, nmu))
+               + 1j * rng.normal(size=(nk, nb, ns, nmu)))
+        return Wavefunctions(
+            psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
+            psi_xr=_put(psi, mesh, PSI_XR_SPEC),
+            psi_yr=_put(psi, mesh, PSI_YR_SPEC),
+            psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+            enk=_put(np.array([[-0.8, -0.3, 0.5, 1.1]]),
+                     mesh, P(None, None)),
+            occ=_put(np.array([[1.0, 1.0, 0.0, 0.0]]),
+                     mesh, P(None, None)),
+            slices=slices)
+
+    charge = bundle()
+    transverse = bundle()
+    layout = PhotonBasisLayout.from_centroid_extents(nmu, nmu, mesh)
+
+    def one_channel_rows(channel, values, axis_name):
+        spec = P(None, axis_name)
+        vectors = []
+        for index in range(4):
+            row = (np.asarray(values, dtype=np.complex128)
+                   if index == channel else np.zeros(nmu, np.complex128))
+            vectors.append(_put(row[None], mesh, spec))
+        packed = pack_photon_channel_vectors(
+            tuple(vectors), layout, mesh, axis_name=axis_name)[0]
+        row = jnp.sum(packed, axis=0)
+        return jnp.zeros_like(packed).at[0].set(row)
+
+    left_charge = one_channel_rows(
+        0, [0.3 + 0.1j, -0.2 + 0.4j, 0.1 - 0.3j, 0.2], "x")
+    right_current = one_channel_rows(
+        1, [-0.1 + 0.2j, 0.5 - 0.3j, 0.2 + 0.1j, -0.4], "y")
+    left_current = one_channel_rows(
+        1, [0.2 - 0.1j, 0.1 + 0.3j, -0.5j, 0.4], "x")
+    right_charge = one_channel_rows(
+        0, [-0.3j, 0.2 + 0.1j, -0.4 + 0.2j, 0.5], "y")
+    B_pairs = ((left_charge, right_current),
+               (left_current, right_charge))
+    omega_h = 1.3
+    static_pairs = tuple(
+        (-2.0 * left / omega_h, right) for left, right in B_pairs)
+    probe_ratio = omega_h ** 2 / (OMEGA_P ** 2 + omega_h ** 2)
+    probe_pairs = tuple(
+        (probe_ratio * left, right) for left, right in static_pairs)
+
+    def carrier(sign):
+        return FaradayHeadPPMFactorCarrier(
+            omega_h_ry=omega_h,
+            B_pairs=tuple((sign * left, right)
+                          for left, right in B_pairs),
+            static_pairs=tuple((sign * left, right)
+                               for left, right in static_pairs),
+            probe_pairs=tuple((sign * left, right)
+                              for left, right in probe_pairs),
+            sigma_H_static=sign * np.array([0.0, 0.0, 1.0e-4]),
+            sigma_H_probe=sign * np.array([0.0, 0.0, 3.0e-5]),
+            probe_frequency_ry=1j * OMEGA_P,
+            probe_fit_relative_error=0.0)
+
+    kwargs = dict(
+        wfns_charge=charge, wfns_transverse=transverse,
+        photon_layout=layout,
+        meta=SimpleNamespace(nk_tot=nk, kgrid=(1, 1, 1)),
+        mesh_xy=mesh, omega_grid_ry=np.array([-0.2, 0.3]),
+        efermi_ry=0.0)
+    plus = np.asarray(compute_ppm_faraday_head_sigma_omega(
+        faraday_ppm=carrier(+1.0), **kwargs))
+    minus = np.asarray(compute_ppm_faraday_head_sigma_omega(
+        faraday_ppm=carrier(-1.0), **kwargs))
+    zero = np.asarray(compute_ppm_faraday_head_sigma_omega(
+        faraday_ppm=carrier(0.0), **kwargs))
+
+    assert np.max(np.abs(plus)) > 1.0e-6
+    np.testing.assert_allclose(minus, -plus, rtol=0.0, atol=1.0e-13)
+    np.testing.assert_array_equal(zero, np.zeros_like(zero))
+
+
 def test_debug_odd_residue_off_reproduces_even_only_residues_and_refuses_trs(
         monkeypatch):
     """The debug A/B arm keeps ordered B but makes D=0, and is magnet-only."""

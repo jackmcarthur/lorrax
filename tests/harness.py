@@ -663,8 +663,9 @@ def parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarr
     remains the historical seven-column array.  Callers auditing a bispinor
     file can request ``("sigSX", "sigCOH", "sigTOT", "sigCC", "sigTT",
     "sigCT")``; a broken-TR PPM caller can additionally request
-    ``sigC_odd``.  Parsing is label-based, so additive columns do not move an
-    old field and old files still parse with the default labels.
+    ``sigC_odd`` and the packed Faraday route can request ``sigCT_hall``.
+    Parsing is label-based, so additive columns do not move an old field and
+    old files still parse with the default labels.
 
     THE DIRECT-FIELD COLUMN HAS TWO SPELLINGS and this parser accepts both.
     A scalar deck writes ``VH=``; a ``bispinor = true`` deck writes ``Hdir=``,

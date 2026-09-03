@@ -168,6 +168,7 @@ def _require_packed_operator(name, packed, mesh_xy):
 def _make_photon_static_block_kernel(
     mesh_xy: Mesh, kgrid, nk_tot: int, wfns_left, wfns_right, *,
     with_q0_diagnostic: bool,
+    ppm_head_only: bool = False,
 ):
     """One block contraction, specialized only by endpoint carrier shapes.
 
@@ -185,7 +186,7 @@ def _make_photon_static_block_kernel(
     key = (id(mesh_xy), tuple(int(v) for v in kgrid), int(nk_tot),
            ffi_dial_key(), wfns_left.layout,
            endpoint.get("face_shape"), endpoint.get("right_face_shape"),
-           bool(with_q0_diagnostic))
+           bool(with_q0_diagnostic), bool(ppm_head_only))
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
 
@@ -193,7 +194,14 @@ def _make_photon_static_block_kernel(
     from .cohsex_sigma import _make_static_convolution, _occ_diag_full
     from .greens_function_kernel import build_G
 
-    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
+    if ppm_head_only and not with_q0_diagnostic:
+        raise ValueError("ppm_head_only requires the q0 contraction kernel")
+    # The analytic Faraday pole has structural q=0 support.  Do not even
+    # instantiate the full-q FFT service for that call: the q0 closed form
+    # below is its exact branch and is the only one the returned PPM kernel
+    # traces.
+    convolve = (None if ppm_head_only else
+                _make_static_convolution(mesh_xy, kgrid, nk_tot))
     convolve_q0 = (
         _make_static_convolution(
             mesh_xy, kgrid, nk_tot, q0_only=True)
@@ -310,8 +318,136 @@ def _make_photon_static_block_kernel(
             return result, head_result
         return result
 
-    _photon_sigma_kernel_cache[key] = contract_block
-    return contract_block
+    if with_q0_diagnostic:
+        @jax.jit
+        def contract_ppm_head(
+            wfns_left, wfns_right, wfns_left_g, wfns_right_g,
+            residue_AB, phases_wkn,
+        ):
+            """Analytic one-pole q=0 insertion with one G live per omega."""
+            s_left = wfns_left.slices
+            s_right = wfns_right.slices
+
+            def one_frequency(phase_kn):
+                if wfns_left.layout == "legacy":
+                    G = build_G(
+                        wfns_left_g.xn(s_left.sigma_sum),
+                        wfns_right_g.yr(s_right.sigma_sum),
+                        phases=phase_kn[:, s_left.sigma_sum])
+                    O = convolve_q0(G, residue_AB, 1.0)
+                    return project(
+                        wfns_left.xr(s_left.sigma), O,
+                        wfns_right.yn(s_right.sigma))
+                G = build_G(
+                    wfns_left_g.psi_mun, wfns_right_g.psi_nmu,
+                    phases=phase_kn, layout="face", gemm=g_plan)
+                O = convolve_q0(G, residue_AB, 1.0)
+                return project(
+                    wfns_left.psi_nmu, O, wfns_right.psi_mun)
+
+            # A scan, not a Python-unrolled omega loop: only one centroid-
+            # square G/operator tile is live while the small band-space
+            # Sigma cube is accumulated.
+            return jax.lax.map(one_frequency, phases_wkn)
+    else:
+        contract_ppm_head = None
+
+    kernels = (contract_block, contract_ppm_head)
+    _photon_sigma_kernel_cache[key] = kernels
+    return kernels
+
+
+def compute_ppm_faraday_head_sigma_omega(
+    *,
+    wfns_charge,
+    wfns_transverse,
+    faraday_ppm,
+    photon_layout,
+    meta,
+    mesh_xy: Mesh,
+    omega_grid_ry,
+    efermi_ry: float,
+    eta_ry: float = 1.0e-6,
+):
+    r"""Contract an even one-pole CT/TC Gamma head on the Sigma grid.
+
+    The interaction remains two rank-four factor families until one CT or TC
+    Lorentz block is streamed into the incumbent q=0 convolution.  Pole
+    denominators weight the intermediate bands inside a ``lax.map``; there is
+    no pairwise stage, frequency quadrature, or probe-frequency packed body.
+    """
+    from .head_correction import FaradayHeadPPMFactorCarrier
+    from .photon_layout import photon_q0_low_rank_block
+    from .ppm_sigma import _residue_for_space
+    from .wavefunction_bundle import with_lorentz_vertices
+
+    if not isinstance(faraday_ppm, FaradayHeadPPMFactorCarrier):
+        raise TypeError(
+            "dynamic Faraday Sigma requires FaradayHeadPPMFactorCarrier")
+    if wfns_charge.layout != wfns_transverse.layout:
+        raise ValueError(
+            "dynamic Faraday Sigma endpoints must use one wavefunction layout")
+    if wfns_charge.slices != wfns_transverse.slices:
+        raise ValueError(
+            "dynamic Faraday Sigma endpoints must use one band plan")
+
+    # Hall is frequency-even, not an ordered frequency-odd residue.  The
+    # shared branch selector therefore receives B_odd=None and returns the
+    # identical ordinary B factors for R+ and R-.
+    cond_pairs = _residue_for_space("cond", faraday_ppm.B_pairs, None)
+    val_pairs = _residue_for_space("val", faraday_ppm.B_pairs, None)
+    if cond_pairs is not faraday_ppm.B_pairs or val_pairs is not cond_pairs:
+        raise RuntimeError(
+            "even Faraday residue did not preserve branch object identity")
+
+    omega = jnp.asarray(omega_grid_ry, dtype=jnp.float64).reshape(-1)
+    energies = jnp.asarray(wfns_charge.enk, dtype=jnp.float64)
+    occupations = jnp.asarray(wfns_charge.occ, dtype=jnp.float64)
+    if energies.shape != occupations.shape:
+        raise ValueError(
+            "dynamic Faraday energies and occupations must share shape")
+    nb_full = int(wfns_charge.slices.nb_full)
+    if tuple(energies.shape) != (int(meta.nk_tot), nb_full):
+        raise ValueError(
+            "dynamic Faraday band carrier shape mismatch: "
+            f"got {energies.shape}, expected {(int(meta.nk_tot), nb_full)}")
+    live = (jnp.arange(nb_full)
+            < int(wfns_charge.slices.nb_sigma_sum))[None, :]
+    occ = jnp.where(live, occupations, 0.0)
+    empty = jnp.where(live, 1.0 - occupations, 0.0)
+    delta = (omega[:, None, None]
+             - (energies[None, :, :] - float(efermi_ry)))
+    pole = float(faraday_ppm.omega_h_ry)
+    eta = float(eta_ry)
+    # The q0 convolution owns a leading minus.  Negating the analytic branch
+    # weights here recovers the same +R/(omega-epsilon +/- Omega) convention
+    # as compute_ppm_head_sigma_diag.
+    phases = -(
+        occ[None, :, :] / (delta + pole - 1j * eta)
+        + empty[None, :, :] / (delta - pole + 1j * eta))
+
+    sigma = None
+    for A, B in ((0, 1), (0, 2), (0, 3),
+                 (1, 0), (2, 0), (3, 0)):
+        left = _bundle_for_channel(wfns_charge, wfns_transverse, A)
+        right = _bundle_for_channel(wfns_charge, wfns_transverse, B)
+        left_g = with_lorentz_vertices(left, A, 0)
+        right_g = with_lorentz_vertices(right, 0, B)
+        _, contract_ppm_head = _make_photon_static_block_kernel(
+            mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
+            with_q0_diagnostic=True, ppm_head_only=True)
+        residue_AB = photon_q0_low_rank_block(
+            cond_pairs, photon_layout, A, B, mesh_xy)
+        contribution = contract_ppm_head(
+            left, right, left_g, right_g, residue_AB, phases)
+        sigma = contribution if sigma is None else sigma + contribution
+        sigma.block_until_ready()
+
+    if wfns_charge.layout == "face":
+        from .ppm_sigma import strip_sigma_window
+        nb_sigma = int(wfns_charge.slices.nb_sigma)
+        sigma = strip_sigma_window(sigma, nb_sigma, mesh_xy=mesh_xy)
+    return sigma
 
 
 def compute_static_photon_sigma(
@@ -418,7 +554,7 @@ def compute_static_photon_sigma(
             right = _bundle_for_channel(wfns_charge, wfns_transverse, B)
             right_g = with_lorentz_vertices(right, 0, B)
             n_right = padded_centroid_extent(right)
-            contract_block = _make_photon_static_block_kernel(
+            contract_block, _ = _make_photon_static_block_kernel(
                 mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
                 with_q0_diagnostic=q0_factors is not None)
             V_AB = photon_block_view(V_packed, photon_layout, A, B, mesh_xy)

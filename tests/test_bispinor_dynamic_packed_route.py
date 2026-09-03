@@ -175,7 +175,7 @@ def test_unnamed_solver_is_derived_for_the_dynamic_packed_route(tmp_path):
                and "w_dyson_solver was not named" in line for line in lines)
 
 
-def test_dynamic_hall_gate_admits_trs_zero_and_announces_broken_tr_omission(
+def test_dynamic_hall_gate_admits_trs_zero_and_prepares_authenticated_magnet(
         tmp_path):
     """The dynamic route is never silent about the Faraday Gamma head."""
     from gw.w_isdf import _gate_dynamic_hall_head
@@ -209,10 +209,12 @@ def test_dynamic_hall_gate_admits_trs_zero_and_announces_broken_tr_omission(
         hall_transaction=_Hall(),
         print_fn=lambda text, **kwargs: records.append(text))
     assert record == (
-        "ABSENT (unowned rank-four probe-frequency CT/TC Sigma insertion; "
+        "PREPARED (authenticated z=0 and z=i*omega_p Hall samples; "
         "max|sigma_H(i*omega_p)| = 3.00000000000000008e-06 bohr^-1; "
         "static sigma_H = [4e-08, -5e-08, 6e-08] bohr^-1)")
-    assert records == ["WARNING Faraday head : " + record]
+    # PREPARED is internal state, not a second run-record line. The driver
+    # emits the sole magnetic record only after measuring sigCT_hall.
+    assert records == []
 
     records.clear()
     record = _gate_dynamic_hall_head(
@@ -254,6 +256,7 @@ def test_the_dispatch_asks_for_the_current_blocks_only():
               / "src" / "gw" / "gw_jax.py").read_text()
     assert '"Faraday head   : "' in driver
     assert "photon_response.faraday_head_record" in driver
+    assert "Faraday head   : APPLIED" in driver
 
 
 # ---------------------------------------------------------------------------

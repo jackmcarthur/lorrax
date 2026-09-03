@@ -184,6 +184,28 @@ def test_lorentz_column_closure_refuses_a_bad_decomposition(tmp_path):
             kpoints_crys=KPTS)
 
 
+def test_faraday_column_is_the_optional_hall_on_off_observable(tmp_path):
+    """``sigCT_hall`` is additive; its absent twin preserves the schema."""
+    values = np.arange(NK * NB).reshape(NK, NB) * 0.125
+    hall = values * (-2.0e-3)
+    scalar = tmp_path / "scalar.dat"
+    magnetic = tmp_path / "magnetic.dat"
+    write_sigma_to_file(
+        _diag_array(values), filename=str(scalar), kpoints_crys=KPTS,
+        hartree_kij_eV=_diag_array(np.zeros_like(values)))
+    write_sigma_to_file(
+        _diag_array(values), filename=str(magnetic), kpoints_crys=KPTS,
+        sigma_ct_hall_kn_eV=hall,
+        hartree_kij_eV=_diag_array(np.zeros_like(values)))
+
+    assert "sigCT_hall=" not in scalar.read_text()
+    text = magnetic.read_text()
+    assert "sigma_H-on minus sigma_H=0 twin" in text
+    parsed = parse_eqp_rows(magnetic, labels=("sigCT_hall",))
+    np.testing.assert_allclose(
+        parsed[:, 2], hall.reshape(-1), rtol=0.0, atol=5.0e-7)
+
+
 def test_z_column_records_raw_value_and_state_local_fallback(tmp_path):
     out = tmp_path / "z_status.dat"
     z = np.full((NK, NB), 0.8)

@@ -31,7 +31,7 @@ jax.config.update("jax_enable_x64", True)
 
 _WFN_SHA = "1" * 64
 _HALL_OPERATOR = "sha256:" + "c" * 64
-_HALL_PRODUCER = "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1"
+_HALL_PRODUCER = "lorrax.dynamic_gauge_hall/full_bz_uniform_gauge_v2"
 
 
 def _mesh():
@@ -70,10 +70,13 @@ class _Hall:
     pass
 
 
-def _hall(monkeypatch, mesh, sigma, *, band_stop=2):
+def _hall(monkeypatch, mesh, sigma, *, probe_sigma=None, band_stop=2):
     monkeypatch.setattr(qsgw_head, "StaticGaugeHallTransaction", _Hall)
     hall = _Hall()
     hall.sigma_H = _placed(sigma, mesh, P())
+    hall.sigma_H_at = lambda frequency: _placed(
+        sigma if complex(frequency) == 0.0j else (
+            probe_sigma if probe_sigma is not None else sigma), mesh, P())
     hall.wfn_fingerprint = _WFN_SHA
     hall.band_start, hall.band_stop = 0, band_stop
     hall.nk_tot = 6
@@ -141,6 +144,22 @@ def test_producer_with_hall_artifact_has_only_declared_support(monkeypatch):
     np.testing.assert_array_equal(pi1[:, 1:, 0], np.conj(pi1[:, 0, 1:]))
     assert pi1[0, 0, 2] == 2.0j
     assert pi1[1, 0, 1] == -2.0j
+
+
+def test_producer_selects_the_exact_dynamic_hall_sample(monkeypatch):
+    mesh = _mesh()
+    _patch_direct(monkeypatch, mesh)
+    hall = _hall(
+        monkeypatch, mesh, [0.0, 0.0, -2.0],
+        probe_sigma=[0.25, -0.5, -0.75])
+    response = build_static_photon_head_response(
+        object(), hall_transaction=hall, frequency_ry=0.7j, **_kwargs(mesh))
+
+    _check_charge_support(response)
+    assert response.frequency_ry == 0.7j
+    np.testing.assert_array_equal(
+        np.asarray(response.sigma_H), [0.25, -0.5, -0.75])
+    assert "z=0.7j Ry" in response.hall_source
 
 
 def test_producer_without_hall_artifact_uses_sigma_h_zero(monkeypatch):

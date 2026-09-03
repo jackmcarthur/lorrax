@@ -132,6 +132,75 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     assert result.omega_coverage is coverage
 
 
+def test_finalizer_adds_faraday_once_and_books_it_to_ct(monkeypatch):
+    """The Hall-only cube reaches total Sigma, ``sigCT_hall``, and CT once."""
+    import gw.dynamic_sigma as dynamic
+    import gw.qsgw_utils as qsgw
+    import gw.sigma_dispatch as dispatch
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    body = jnp.zeros((2, 1, 2, 2), dtype=jnp.complex128)
+    hall = jnp.full_like(body, 2.0)
+    sig_x = jnp.ones((1, 2, 2), dtype=jnp.complex128)
+    static_lorentz = jnp.stack((
+        jnp.ones_like(sig_x), 2.0 * jnp.ones_like(sig_x),
+        4.0 * jnp.ones_like(sig_x)))
+    coverage = SimpleNamespace(name="covered")
+    eval_maxima = []
+    qsgw_x_maxima = []
+
+    monkeypatch.setattr(
+        dynamic, "add_head_sigma_diag", lambda sigma, _head: sigma)
+
+    def evaluate(sigma, **_kwargs):
+        maximum = float(np.max(np.abs(np.asarray(sigma))))
+        eval_maxima.append(maximum)
+        return (np.full((1, 2), maximum), np.zeros((1, 2)), 0.0,
+                "midgap", coverage)
+
+    def build(_sigma, sigma_x, *_args, **_kwargs):
+        x_max = float(np.max(np.abs(np.asarray(sigma_x))))
+        qsgw_x_maxima.append(x_max)
+        value = 10.0 if x_max else 3.0
+        return (jnp.full_like(sig_x, value),
+                {"n_clipped": 0, "frac_clipped": 0.0})
+
+    monkeypatch.setattr(dynamic, "eval_sigma_c_at_dft_energies", evaluate)
+    monkeypatch.setattr(qsgw, "build_qsgw_sigma_xc", build)
+    monkeypatch.setattr(
+        dispatch, "device_put_process_local", lambda value, _sharding: value)
+
+    faraday = SimpleNamespace(
+        omega_h_ry=1.25,
+        sigma_H_static=np.array([0.0, 0.0, 4.0e-8]),
+        sigma_H_probe=np.array([0.0, 0.0, 1.5e-8]))
+    config = SimpleNamespace(
+        omega_grid_ev=np.asarray([-1.0, 1.0]),
+        omega_grid_ry=np.asarray([-0.1, 0.1]), sc=None)
+    result = dispatch.finalize_dynamic_sigma(
+        body, None, sig_x=sig_x, sig_h=2.0 * sig_x,
+        e_qp_ev=np.zeros((1, 2)), config=config, meta=object(),
+        mesh_xy=mesh, sym=object(), wfn=SimpleNamespace(efermi=0.0),
+        band_slices=object(), input_dir="/tmp", write_sigma_omega_h5=False,
+        sigma_lorentz_static_skij_ry=static_lorentz,
+        sigma_ct_hall_body_omega=hall, faraday_ppm=faraday,
+        efermi_ry=0.0, efermi_provenance="midgap",
+        print_fn=lambda *_: None)
+
+    # Total and Hall-only interpolation see the same value because body=0;
+    # there is no second addition in either path.
+    assert eval_maxima == [2.0, 2.0]
+    assert qsgw_x_maxima == [1.0, 0.0]
+    np.testing.assert_array_equal(result.sigma_ct_hall_at_dft_diag_ev, 2.0)
+    np.testing.assert_array_equal(np.asarray(result.sigma_c_omega_kij_ry), 2.0)
+    np.testing.assert_array_equal(
+        np.asarray(result.sigma_lorentz_skij_ry[:, 0]),
+        np.stack((np.ones((2, 2)), 5.0 * np.ones((2, 2)),
+                  4.0 * np.ones((2, 2)))))
+    assert result.faraday_head_omega_h_ry == 1.25
+    assert result.faraday_sigma_h_probe_bohr_inv == (0.0, 0.0, 1.5e-8)
+
+
 def test_the_sc_driver_does_not_overwrite_the_finalize_omega_reference():
     """The reference that reaches the eqp writer is the finalize's own.
 

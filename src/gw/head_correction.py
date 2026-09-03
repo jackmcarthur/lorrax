@@ -23,9 +23,11 @@ What the module owns
 * **Static COHSEX head terms** -- :class:`StaticHeadTerms` and
   :func:`compute_static_head_terms`: the exact band-diagonal ``Sigma^X``,
   ``Sigma^SX``, ``Sigma^(SX-X)``, ``Sigma^COH`` shifts.
-* **Dynamic heads** -- :func:`fit_head_ppm` (GN / HL single pole from two
-  samples) and :func:`compute_complex_pole_head_sigma_diag` (MPA poles on the
-  stamped complex grid).
+* **Dynamic heads** -- :func:`fit_head_ppm` (GN / HL scalar pole from two
+  samples), :func:`fit_dynamic_slab_photon_cttc_q0` (the GN Hall-on/off CT/TC
+  completion retained as rank-four factors), and
+  :func:`compute_complex_pole_head_sigma_diag` (MPA poles on the stamped
+  complex grid).
 * **Rank-1 re-attachment** -- :func:`apply_q0_head_rank1` and
   :func:`resolve_head_S_cart`: the ``(W_h/Omega) conj(g0) x g0`` update that
   downstream W consumers (BSE, densifiers) apply to a headless ``W(q=0)``.
@@ -1138,6 +1140,35 @@ class StaticPhotonQ0FactorCarrier:
 
 
 @dataclass(frozen=True)
+class FaradayHeadPPMFactorCarrier:
+    """Even one-pole CT/TC Gamma head, kept only as rank-four factors.
+
+    ``static_pairs`` and ``probe_pairs`` are the screened Hall-on minus
+    ``sigma_H=0`` CT and TC samples.  ``B_pairs`` is their fitted ordinary
+    pole residue ``B=(R_+ + R_-)/2``.  The Hall response is even in frequency,
+    so there is deliberately no odd-residue field: both Sigma branches select
+    these same factors through :func:`gw.ppm_sigma._residue_for_space`.
+    """
+
+    omega_h_ry: float
+    B_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+    static_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+    probe_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+    sigma_H_static: np.ndarray
+    sigma_H_probe: np.ndarray
+    probe_frequency_ry: complex
+    probe_fit_relative_error: float
+
+    def __post_init__(self) -> None:
+        if (len(self.B_pairs), len(self.static_pairs), len(self.probe_pairs)) != (
+                2, 2, 2):
+            raise ValueError(
+                "Faraday head needs exactly two factor families (CT and TC)")
+        if not np.isfinite(self.omega_h_ry) or self.omega_h_ry <= 0.0:
+            raise ValueError("Faraday head pole frequency must be positive")
+
+
+@dataclass(frozen=True)
 class StaticSlabPhotonHeadCompletion:
     """Evidence and bounded runtime carrier for one slab q=0 completion."""
 
@@ -1160,6 +1191,7 @@ class StaticSlabPhotonHeadCompletion:
     sigma_H: np.ndarray
     hall_source: str
     q0_factors: StaticPhotonQ0FactorCarrier
+    faraday_ppm: FaradayHeadPPMFactorCarrier | None = None
 
 
 _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET = 1.0e-9
@@ -1577,6 +1609,377 @@ def complete_static_slab_photon_q0(
             screened_pairs=tuple(screened_pairs)),
     )
     return V_packed, W_packed, evidence
+
+
+def _dynamic_photon_head_small_system(
+    response,
+    W_static_body_gamma: jax.Array,
+    *,
+    W_static_charge_gamma: jax.Array,
+    W_target_charge_gamma: jax.Array | None = None,
+    cell_volume: float,
+    mesh_xy: Mesh,
+):
+    """Fold one frequency sample through the resident frozen-current body.
+
+    The packed current body stays at ``z=0`` while its charge block follows
+    the scalar PPM sample. The static sample therefore contracts the resident
+    packed Gamma tile directly. For the probe, only ``delta W_00`` is folded
+    into the charge-supported wings and added to the O(N) wing halves. This is
+    algebraically the packed body with its charge block replaced, but that
+    second centroid-square tile is never constructed.
+    """
+    from .static_gauge_response import require_static_photon_head_response
+
+    response = require_static_photon_head_response(response, mesh_xy)
+    n_packed = int(response.layout.packed_extent)
+    n_charge = int(response.layout.padded_extent(0))
+    if tuple(W_static_body_gamma.shape) != (n_packed, n_packed):
+        raise ValueError(
+            "dynamic Faraday completion needs the resident packed Gamma "
+            f"body {(n_packed, n_packed)}; got "
+            f"{tuple(W_static_body_gamma.shape)}")
+    expected_charge = (n_charge, n_charge)
+    for name, block in (
+            ("static", W_static_charge_gamma),
+            ("target", W_target_charge_gamma)):
+        if block is not None and tuple(block.shape) != expected_charge:
+            raise ValueError(
+                f"dynamic Faraday {name} charge Gamma block must have shape "
+                f"{expected_charge}; got {tuple(block.shape)}")
+    wanted_body = NamedSharding(mesh_xy, P("x", "y"))
+    for name, array in (
+            ("packed body", W_static_body_gamma),
+            ("static charge block", W_static_charge_gamma),
+            ("target charge block", W_target_charge_gamma)):
+        if array is None:
+            continue
+        sharding = getattr(array, "sharding", None)
+        if (not isinstance(sharding, NamedSharding)
+                or not sharding.is_equivalent_to(wanted_body, 2)):
+            raise ValueError(
+                f"dynamic Faraday {name} must keep P('x','y') sharding; "
+                f"got {sharding!r}")
+
+    S_effective = response.S_direct
+    for a in range(2):
+        for b in range(2):
+            folded = fold_small_head_wings_sharded(
+                response.S_direct[a, b], response.Y_x[a],
+                W_static_body_gamma, response.Z_y[b], float(cell_volume),
+                mesh_xy=mesh_xy)
+            S_effective = S_effective.at[a, b].set(folded)
+    YW_y, WZ_x = small_head_wing_halves_sharded(
+        response.Y_x, W_static_body_gamma, response.Z_y, mesh_xy=mesh_xy)
+
+    if W_target_charge_gamma is not None:
+        delta_charge = W_target_charge_gamma - W_static_charge_gamma
+        with mesh_xy:
+            Y_small = jax.lax.with_sharding_constraint(
+                jnp.zeros((2, 4, n_charge), dtype=jnp.complex128)
+                .at[:, 0, :].set(response.charge_Y_x),
+                NamedSharding(mesh_xy, P(None, None, "x")))
+            Z_small = jax.lax.with_sharding_constraint(
+                jnp.zeros((2, n_charge, 4), dtype=jnp.complex128)
+                .at[:, :, 0].set(response.charge_Z_y),
+                NamedSharding(mesh_xy, P(None, "y", None)))
+        for a in range(2):
+            for b in range(2):
+                correction = fold_small_head_wings_sharded(
+                    jnp.zeros_like(response.S_direct[a, b]), Y_small[a],
+                    delta_charge, Z_small[b], float(cell_volume),
+                    mesh_xy=mesh_xy)
+                S_effective = S_effective.at[a, b].add(correction)
+        delta_YW, delta_WZ = small_head_wing_halves_sharded(
+            Y_small, delta_charge, Z_small, mesh_xy=mesh_xy)
+        delta_YW_packed = jnp.stack(tuple(
+            _pack_charge_factor_rows(
+                delta_YW[a], response.layout, mesh_xy, axis_name="y")
+            for a in range(2)))
+        delta_WZ_packed = jnp.swapaxes(jnp.stack(tuple(
+            _pack_charge_factor_rows(
+                jnp.swapaxes(delta_WZ[b], 0, 1), response.layout,
+                mesh_xy, axis_name="x")
+            for b in range(2))), 1, 2)
+        YW_y = YW_y + delta_YW_packed
+        WZ_x = WZ_x + delta_WZ_packed
+
+    S_effective = canonicalize_static_gauge_q2_tensor(S_effective)
+    jax.block_until_ready((S_effective, YW_y, WZ_x))
+    return S_effective, YW_y, WZ_x
+
+
+def _dynamic_photon_head_moments(
+    sigma_H, S_effective, cubature_receipt,
+):
+    """Run the incumbent coupled 4x4 completion kernel for one frequency."""
+    per_order = []
+    per_order_D = []
+    residuals = []
+    min_sigmas = []
+    max_conditions = []
+    conditioned_backward_errors = []
+    for chunk in cubature_receipt.chunks:
+        q_host = np.asarray(chunk.q_cart, dtype=np.float64)
+        weight = np.asarray(chunk.sample_weight, dtype=np.float64)
+        n_valid = int(chunk.physical_count)
+        (moments, bare_sum, returned_count, backward, chunk_sigma_min,
+         chunk_condition_max,
+         chunk_conditioned_backward) = static_slab_photon_head_moment_chunk(
+            q_host, chunk.D_raw, sigma_H, S_effective, n_valid, weight)
+        (moment_host, D_host, count_host, residual_host, sigma_host,
+         condition_host, conditioned_backward_host) = jax.device_get((
+             moments, bare_sum, returned_count, backward, chunk_sigma_min,
+             chunk_condition_max, chunk_conditioned_backward))
+        if int(np.asarray(count_host)) != n_valid:
+            raise RuntimeError(
+                "dynamic photon head moment kernel changed physical_count")
+        measure = float(np.sum(weight[:n_valid]))
+        if not np.isfinite(measure) or measure <= 0.0:
+            raise ValueError(
+                "provider-issued dynamic photon cubature has nonpositive "
+                "measure")
+        per_order.append(
+            np.asarray(moment_host, dtype=np.complex128) / measure)
+        per_order_D.append(
+            np.asarray(D_host, dtype=np.complex128) / measure)
+        residuals.append(float(np.asarray(residual_host)))
+        min_sigmas.append(float(np.asarray(sigma_host)))
+        max_conditions.append(float(np.asarray(condition_host)))
+        conditioned_backward_errors.append(
+            float(np.asarray(conditioned_backward_host)))
+
+    qstar = np.sqrt(float(cubature_receipt.polygon_area))
+
+    def _scaled(moment):
+        out = np.empty_like(moment)
+        degrees = (0, 1, 1)
+        for u in range(3):
+            for v in range(3):
+                out[u, v] = moment[u, v] / (
+                    qstar ** (degrees[u] + degrees[v]))
+        return out
+
+    ratios = []
+    for index in range(1, len(per_order)):
+        previous = [per_order_D[index - 1]]
+        current = [per_order_D[index]]
+        previous_scaled = _scaled(per_order[index - 1])
+        current_scaled = _scaled(per_order[index])
+        for u in range(3):
+            for v in range(3):
+                previous.append(previous_scaled[u, v])
+                current.append(current_scaled[u, v])
+        ratios.append(_static_photon_mixed_error_ratio(previous, current))
+    (max_residual, min_sigma, max_condition,
+     max_conditioned_backward) = _reduce_static_photon_order_diagnostics(
+         residuals, min_sigmas, max_conditions,
+         conditioned_backward_errors)
+    _require_static_photon_numerical_certificate(
+        per_order_D[-1], per_order[-1],
+        max_backward=max_residual, min_sigma=min_sigma,
+        max_condition=max_condition,
+        max_conditioned_backward=max_conditioned_backward,
+        mixed_error_ratios=tuple(ratios))
+    return per_order[-1]
+
+
+def _pack_charge_factor_rows(rows, layout, mesh_xy, *, axis_name: str):
+    """Embed four charge-family rows without inventing a packing order."""
+    from common.collectives import device_put_process_local
+    from .photon_layout import pack_photon_channel_vectors
+
+    rows = jnp.asarray(rows, dtype=jnp.complex128)
+    n_charge = int(layout.padded_extent(0))
+    if tuple(rows.shape) != (4, n_charge):
+        raise ValueError(
+            f"charge factor rows must be (4,{n_charge}); got {rows.shape}")
+    spec = P(None, axis_name)
+    zeros = tuple(
+        device_put_process_local(
+            np.zeros((4, layout.padded_extent(channel)),
+                     dtype=np.complex128),
+            NamedSharding(mesh_xy, spec))
+        for channel in range(1, 4))
+    packed_by_channel = pack_photon_channel_vectors(
+        (rows, *zeros), layout, mesh_xy, axis_name=axis_name)
+    return jax.lax.with_sharding_constraint(
+        jnp.sum(packed_by_channel, axis=1),
+        NamedSharding(mesh_xy, P(None, axis_name)))
+
+
+def _faraday_cttc_factor_pairs(
+    delta_moments, *, g0_X, g0_Y, YW_y, WZ_x, layout, mesh_xy,
+    cell_volume: float,
+):
+    """Collapse nine moment updates to one rank-four CT and one TC pair."""
+    factor_shape = (4, int(layout.packed_extent))
+    if (tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape
+            or tuple(YW_y.shape) != (2,) + factor_shape
+            or tuple(WZ_x.shape) != (2, factor_shape[1], factor_shape[0])):
+        raise ValueError(
+            "dynamic Faraday factors do not match the packed layout: "
+            f"g0={g0_X.shape}/{g0_Y.shape}, YW={YW_y.shape}, "
+            f"WZ={WZ_x.shape}, expected packed extent={factor_shape[1]}")
+    sh_x = NamedSharding(mesh_xy, P(None, "x"))
+    sh_y = NamedSharding(mesh_xy, P(None, "y"))
+    left_bare = jax.lax.with_sharding_constraint(
+        jnp.conj(g0_X).astype(jnp.complex128), sh_x)
+    left_basis = (
+        left_bare.at[1:, :].set(0.0),
+        jax.lax.with_sharding_constraint(
+            jnp.swapaxes(WZ_x[0], 0, 1), sh_x),
+        jax.lax.with_sharding_constraint(
+            jnp.swapaxes(WZ_x[1], 0, 1), sh_x),
+    )
+    right_basis = (
+        jax.lax.with_sharding_constraint(
+            g0_Y.at[1:, :].set(0.0).astype(jnp.complex128), sh_y),
+        jax.lax.with_sharding_constraint(YW_y[0], sh_y),
+        jax.lax.with_sharding_constraint(YW_y[1], sh_y),
+    )
+    moment = jnp.asarray(delta_moments, dtype=jnp.complex128)
+    with mesh_xy:
+        left_ct = jax.lax.with_sharding_constraint(
+            sum(jnp.einsum("BA,Bj->Aj", moment[u, 0], left_basis[u],
+                           optimize=True)
+                for u in range(3)), sh_x)
+        right_ct = jax.lax.with_sharding_constraint(
+            g0_Y.at[0, :].set(0.0).astype(jnp.complex128)
+            / jnp.asarray(float(cell_volume), dtype=jnp.float64), sh_y)
+
+        left_tc = jax.lax.with_sharding_constraint(
+            left_bare.at[0, :].set(0.0), sh_x)
+        right_tc = jax.lax.with_sharding_constraint(
+            sum(jnp.einsum("AB,Bj->Aj", moment[0, v], right_basis[v],
+                           optimize=True)
+                for v in range(3))
+            / jnp.asarray(float(cell_volume), dtype=jnp.float64), sh_y)
+    jax.block_until_ready((left_ct, right_ct, left_tc, right_tc))
+    return ((left_ct, right_ct), (left_tc, right_tc))
+
+
+def _factor_pair_inner(first, second):
+    """Frobenius inner product of two low-rank operators, no dense body."""
+    left_a, right_a = first
+    left_b, right_b = second
+    left_gram = jnp.einsum(
+        "ai,bi->ab", jnp.conj(left_a), left_b, optimize=True)
+    right_gram = jnp.einsum(
+        "aj,bj->ab", jnp.conj(right_a), right_b, optimize=True)
+    return jnp.sum(left_gram * right_gram)
+
+
+def fit_dynamic_slab_photon_cttc_q0(
+    static_response,
+    probe_response,
+    *,
+    W_static_body_gamma: jax.Array,
+    W_static_charge_gamma: jax.Array,
+    W_probe_charge_gamma: jax.Array,
+    static_off_moments=None,
+    g0_X: jax.Array,
+    g0_Y: jax.Array,
+    cubature_receipt,
+    mesh_xy: Mesh,
+) -> FaradayHeadPPMFactorCarrier:
+    r"""Fit the Hall-on/off CT/TC completion to one even analytic pole.
+
+    Each frequency executes the incumbent coupled 4x4 mini-BZ solve twice,
+    with the authenticated ``sigma_H(z)`` and with literal ``sigma_H=0``.
+    Their
+    difference is collapsed to one rank-four factor pair for CT and one for
+    TC.  A shared scalar pole is fitted in the operators' Frobenius metric,
+    evaluated from 4x4 Gram matrices; no centroid-square probe body exists.
+
+    The model is ``W_H(z)=2*Omega_H*B_H/(z^2-Omega_H^2)``.  Hall is even in
+    ``z``, hence ``B_odd=None`` and ``B_H=-Omega_H*W_H(0)/2``.
+    """
+    from vcoul import validate_slab_minibz_photon_receipt
+
+    receipt = validate_slab_minibz_photon_receipt(cubature_receipt)
+    static_S, static_YW, static_WZ = _dynamic_photon_head_small_system(
+        static_response, W_static_body_gamma,
+        W_static_charge_gamma=W_static_charge_gamma,
+        cell_volume=float(receipt.cell_volume), mesh_xy=mesh_xy)
+    probe_S, probe_YW, probe_WZ = _dynamic_photon_head_small_system(
+        probe_response, W_static_body_gamma,
+        W_static_charge_gamma=W_static_charge_gamma,
+        W_target_charge_gamma=W_probe_charge_gamma,
+        cell_volume=float(receipt.cell_volume), mesh_xy=mesh_xy)
+    zero_sigma = np.zeros(3, dtype=np.float64)
+    static_on = _dynamic_photon_head_moments(
+        static_response.sigma_H, static_S, receipt)
+    static_off = (
+        _dynamic_photon_head_moments(zero_sigma, static_S, receipt)
+        if static_off_moments is None else
+        np.asarray(static_off_moments, dtype=np.complex128))
+    if static_off.shape != static_on.shape:
+        raise ValueError(
+            "dynamic Faraday static Hall-off moments must have shape "
+            f"{static_on.shape}; got {static_off.shape}")
+    probe_on = _dynamic_photon_head_moments(
+        probe_response.sigma_H, probe_S, receipt)
+    probe_off = _dynamic_photon_head_moments(
+        zero_sigma, probe_S, receipt)
+
+    static_delta = static_on - static_off
+    probe_delta = probe_on - probe_off
+    static_pairs = _faraday_cttc_factor_pairs(
+        static_delta, g0_X=g0_X, g0_Y=g0_Y,
+        YW_y=static_YW, WZ_x=static_WZ, layout=static_response.layout,
+        mesh_xy=mesh_xy, cell_volume=float(receipt.cell_volume))
+    probe_pairs = _faraday_cttc_factor_pairs(
+        probe_delta, g0_X=g0_X, g0_Y=g0_Y,
+        YW_y=probe_YW, WZ_x=probe_WZ, layout=probe_response.layout,
+        mesh_xy=mesh_xy, cell_volume=float(receipt.cell_volume))
+
+    static_norm = sum(_factor_pair_inner(pair, pair)
+                      for pair in static_pairs)
+    probe_norm = sum(_factor_pair_inner(pair, pair)
+                     for pair in probe_pairs)
+    cross = sum(_factor_pair_inner(static, probe)
+                for static, probe in zip(static_pairs, probe_pairs))
+    static_norm_h, probe_norm_h, cross_h = (
+        complex(value) for value in jax.device_get(
+            (static_norm, probe_norm, cross)))
+    scale = max(abs(static_norm_h), abs(probe_norm_h), 1.0e-300)
+    if (static_norm_h.real <= 1.0e-300
+            or abs(static_norm_h.imag) > 1.0e-12 * scale):
+        raise ValueError(
+            "GATE dynamic_hall_head_static_anchor: the Hall-on/off CT/TC "
+            "static factor family has no positive finite Frobenius norm")
+    if abs(cross_h.imag) > 1.0e-10 * scale:
+        raise ValueError(
+            "GATE dynamic_hall_head_complex_fit: the imaginary-axis Hall "
+            f"factor overlap is not real; Im<0,p>={cross_h.imag:.3e}")
+    ratio = cross_h.real / static_norm_h.real
+    if not 0.0 < ratio < 1.0:
+        raise ValueError(
+            "GATE dynamic_hall_head_one_pole: an even positive-frequency "
+            "one-pole fit requires 0 < <W0,Wp>/<W0,W0> < 1; "
+            f"got {ratio:.17e}")
+    probe_frequency = complex(probe_response.frequency_ry)
+    probe_magnitude = abs(probe_frequency)
+    omega_h = probe_magnitude * np.sqrt(ratio / (1.0 - ratio))
+    residual_sq = max(
+        probe_norm_h.real - 2.0 * ratio * cross_h.real
+        + ratio * ratio * static_norm_h.real,
+        0.0)
+    probe_fit_error = np.sqrt(residual_sq / max(probe_norm_h.real, 1.0e-300))
+    B_pairs = tuple(
+        (-0.5 * float(omega_h) * left, right)
+        for left, right in static_pairs)
+    return FaradayHeadPPMFactorCarrier(
+        omega_h_ry=float(omega_h), B_pairs=B_pairs,
+        static_pairs=static_pairs, probe_pairs=probe_pairs,
+        sigma_H_static=np.asarray(
+            jax.device_get(static_response.sigma_H), dtype=np.float64),
+        sigma_H_probe=np.asarray(
+            jax.device_get(probe_response.sigma_H), dtype=np.float64),
+        probe_frequency_ry=probe_frequency,
+        probe_fit_relative_error=float(probe_fit_error),
+    )
 
 
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,

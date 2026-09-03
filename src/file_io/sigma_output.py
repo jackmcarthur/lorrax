@@ -247,6 +247,7 @@ def write_sigma_to_file(
 	hartree_label: str = "VH",
 	sigma_lorentz_skn_eV=None,
 	sigma_c_odd_kn_eV=None,
+	sigma_ct_hall_kn_eV=None,
 	z_factor_kn=None,
 	z_pathological_kn=None,
 ):
@@ -277,6 +278,9 @@ def write_sigma_to_file(
 			written.  None leaves the historical scalar file byte-identical.
 		sigma_c_odd_kn_eV: Optional measured broken-TR contribution to Sigma_c,
 			shape (nk, band), written as ``sigC_odd``.  None omits the column.
+		sigma_ct_hall_kn_eV: Optional dynamic CT/TC Gamma-head contribution,
+			defined as the physical ``sigma_H`` run minus its in-run
+			``sigma_H=0`` twin, shape (nk, band), written as ``sigCT_hall``.
 		z_factor_kn: Optional raw quasiparticle residue, shape ``(nk, band)``.
 			When present, every row records ``Z`` without clipping it.
 		z_pathological_kn: Boolean twin of ``z_factor_kn``.  True means the
@@ -405,6 +409,7 @@ def write_sigma_to_file(
 				f"does not equal {total_label}: {_closure:.3e} eV > "
 				f"{_limit:.3e} eV")
 	odd_diag = _diag(sigma_c_odd_kn_eV)
+	hall_diag = _diag(sigma_ct_hall_kn_eV)
 	z_diag = None if z_factor_kn is None else np.asarray(
 		z_factor_kn, dtype=np.float64)
 	z_bad = None if z_pathological_kn is None else np.asarray(
@@ -429,6 +434,7 @@ def write_sigma_to_file(
 	lorentz_cplx = ([ _is_complex(lorentz_diag[s]) for s in range(3)]
 	                 if lorentz_diag is not None else None)
 	odd_cplx = _is_complex(odd_diag)
+	hall_cplx = _is_complex(hall_diag)
 
 	#: Width of the omitted "+x.xxxxxxi" field, so a real column occupies
 	#: exactly as many characters as a complex one would.
@@ -461,6 +467,9 @@ def write_sigma_to_file(
 		if odd_diag is not None:
 			f.write("# sigC_odd = ordered broken-TR residue contribution "
 			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
+		if hall_diag is not None:
+			f.write("# sigCT_hall = dynamic CT/TC Gamma head, "
+			        "sigma_H-on minus sigma_H=0 twin\n")
 		if z_diag is not None:
 			f.write("# Z_status=PATHOLOGICAL_EQP1_FALLBACK means raw Z is "
 			        "non-finite or outside 0 < Z <= 1; that state's eqp1 "
@@ -564,6 +573,11 @@ def write_sigma_to_file(
 					value = odd_diag[k, n]
 					line += f"  sigC_odd={float(np.real(value)):>12.6f}"
 					line += _im(float(np.imag(value)), odd_cplx)
+
+				if hall_diag is not None:
+					value = hall_diag[k, n]
+					line += f"  sigCT_hall={float(np.real(value)):>12.6f}"
+					line += _im(float(np.imag(value)), hall_cplx)
 
 				if hv_diag is not None:
 					hv_re = float(np.real(hv_diag[k, n]))

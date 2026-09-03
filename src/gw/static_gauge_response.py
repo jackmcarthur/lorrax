@@ -1,4 +1,4 @@
-"""Inputs of the packed static photon Gamma-cell completion.
+"""Inputs of the packed photon Gamma-cell completion.
 
 ``bispinor_gw = full_static_cohsex`` completes the ``q = Gamma, G = 0`` slot
 of the packed sixteen-block V and W (``gw.head_correction.
@@ -9,7 +9,8 @@ complete_static_slab_photon_q0``) from one bounded response
 that this module assembles.  Its content, by declaration:
 
 * present: the charge CC ``q^2`` head ``S^{00}`` from the incumbent scalar
-  producer (:func:`gw.qsgw_head.build_dft_head_response` at ``omega = 0``),
+  producer (:func:`gw.qsgw_head.build_dft_head_response` at the requested
+  imaginary frequency),
   the charge one-leg wings ``Y^{0}``/``Z^{0}`` that fold it through the
   packed body, and the Hall CT/TC ``q^1`` term generated structurally from
   ``sigma_H`` (:func:`gw.head_correction.static_hall_linear_response`);
@@ -19,15 +20,16 @@ that this module assembles.  Its content, by declaration:
   negative-energy (complement-space) closure.  They are never stored as
   accidental zeros of a larger schema; ``S_direct`` has charge support only.
 
-The Hall term is optional.  Static ``sigma_H`` is the exact ``z=0`` row of
-the immutable frequency-sample artifact written by
+The Hall term is optional.  ``sigma_H`` is the exact requested row of the
+immutable frequency-sample artifact written by
 ``get_dipole_mtxels --static-gauge-hall-only`` when the deck's
 ``static_gauge_hall_file`` exists and authenticates against the run's WFN,
 band manifold and k-count; when the file is absent ``sigma_H = 0`` and
 ``hall_source`` says so.  For a Chern-trivial insulator the static Hall
 coefficient is exactly zero in the converged limit (it is the occupied
-Berry-curvature sum, i.e. a Chern number), so the absent-artifact default is
-the exact answer for the systems this mode admits.
+Berry-curvature sum, i.e. a Chern number). Dynamic broken-TR GN requests both
+``z=0`` and ``z=i*omega_p`` through this one producer; an absent artifact is
+then announced rather than treated as a measured finite-frequency zero.
 
 This module owns no WFN load, symmetry unfold, current, FFT, body-response
 or packing implementation.  It composes the existing routines and retains
@@ -79,10 +81,13 @@ class StaticPhotonHeadResponse:
     hall_source: str
     Y_x: jax.Array                    # (2,4,Npacked), P(None,None,'x')
     Z_y: jax.Array                    # (2,Npacked,4), P(None,'y',None)
+    charge_Y_x: jax.Array             # (2,Ncharge), P(None,'x')
+    charge_Z_y: jax.Array             # (2,Ncharge), P(None,'y')
     ward_residual: float
     hermiticity_residual: float
     wing_reciprocity_residual: float
     _producer_token: object
+    frequency_ry: complex = 0.0 + 0.0j
 
     def __post_init__(self) -> None:
         if self._producer_token is not _PRODUCER_TOKEN:
@@ -119,6 +124,12 @@ def require_static_photon_head_response(
          P(None, None, "x")),
         (response.Z_y, "Z_y", (2, n_packed, 4), np.complex128,
          P(None, "y", None)),
+        (response.charge_Y_x, "charge_Y_x",
+         (2, response.layout.padded_extent(0)), np.complex128,
+         P(None, "x")),
+        (response.charge_Z_y, "charge_Z_y",
+         (2, response.layout.padded_extent(0)), np.complex128,
+         P(None, "y")),
     )
     for array, name, shape, dtype, spec in arrays:
         if tuple(array.shape) != shape:
@@ -153,6 +164,12 @@ def require_static_photon_head_response(
     if response.wing_reciprocity_residual > 1.0e-10:
         raise ValueError(
             "static photon head response violates wing reciprocity")
+    frequency = complex(response.frequency_ry)
+    if (not np.isfinite(frequency.real) or not np.isfinite(frequency.imag)
+            or frequency.real != 0.0):
+        raise ValueError(
+            "photon head completion samples must lie on the imaginary axis; "
+            f"got frequency_ry={frequency!r}")
     return response
 
 
@@ -178,8 +195,9 @@ def build_static_photon_head_response(
     layout: PhotonBasisLayout,
     hall_transaction=None,
     wfn_fingerprint_binding=None,
+    frequency_ry: complex = 0.0 + 0.0j,
 ) -> StaticPhotonHeadResponse:
-    r"""Compose the charge CC head, its wings and the optional Hall term.
+    r"""Compose one imaginary-frequency charge/Hall head sample.
 
     The scalar response is evaluated once by
     :func:`gw.qsgw_head.build_dft_head_response` at ``omega = 0``.  Its two
@@ -190,8 +208,9 @@ def build_static_photon_head_response(
     ``hall_transaction`` is either ``None`` (``sigma_H = 0``) or the full-BZ
     result of :func:`gw.qsgw_head.static_gauge_hall_transaction`, which must
     name the same WFN identity and band manifold as the charge response.  This
-    static owner deliberately selects only its transaction's exact ``z=0``
-    row; dynamic consumers must request a frequency by exact value.
+    owner.  ``frequency_ry`` is exact and must be purely imaginary.  The
+    incumbent default is ``z=0``; the Faraday completion requests its stored
+    ``z=i*omega_p`` row through the same object and the same response kernel.
     """
     from common.parallel_transport import (
         fingerprint_from_binding, wfn_fingerprint)
@@ -206,6 +225,12 @@ def build_static_photon_head_response(
         raise TypeError(
             "static photon head response requires PhotonBasisLayout")
     layout.assert_mesh(mesh)
+    frequency = complex(frequency_ry)
+    if (not np.isfinite(frequency.real) or not np.isfinite(frequency.imag)
+            or frequency.real != 0.0):
+        raise ValueError(
+            "photon head response frequency must lie on the imaginary axis; "
+            f"got {frequency!r}")
 
     wfn_fp = _canonical_wfn_sha256(
         wfn_fingerprint(wfn)
@@ -229,16 +254,21 @@ def build_static_photon_head_response(
         if _canonical_wfn_sha256(hall_transaction.wfn_fingerprint) != wfn_fp:
             raise ValueError(
                 "charge and Hall responses use different WFN identities")
-        sigma_host = np.asarray(
-            jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
-        if sigma_host.shape != (3,) or not np.all(np.isfinite(sigma_host)):
-            raise ValueError("Hall transaction has an invalid sigma_H")
+        sigma_sample = np.asarray(jax.device_get(
+            hall_transaction.sigma_H_at(frequency)), dtype=np.complex128)
+        if (sigma_sample.shape != (3,)
+                or not np.all(np.isfinite(sigma_sample))
+                or np.any(np.imag(sigma_sample) != 0.0)):
+            raise ValueError(
+                "Hall transaction has an invalid real imaginary-axis sample")
+        sigma_host = np.asarray(np.real(sigma_sample), dtype=np.float64)
         hall_source = (
             f"{hall_transaction.producer_id} "
-            f"(operator {hall_transaction.hamiltonian_config_operator_fingerprint})")
+            f"(operator {hall_transaction.hamiltonian_config_operator_fingerprint}; "
+            f"z={frequency!r} Ry)")
 
     direct = build_dft_head_response(
-        wfns, (0.0 + 0.0j,), input_dir=input_dir, mesh=mesh,
+        wfns, (frequency,), input_dir=input_dir, mesh=mesh,
         wfn=wfn, meta=meta, config=config,
         wfn_fingerprint_binding=wfn_fingerprint_binding)
     if direct.Y_x is None or direct.Z_y is None:
@@ -289,9 +319,11 @@ def build_static_photon_head_response(
         layout=layout,
         S_direct=S_direct, sigma_H=sigma_H, hall_source=hall_source,
         Y_x=Y_x, Z_y=Z_y,
+        charge_Y_x=charge_y, charge_Z_y=charge_z,
         ward_residual=float(ward), hermiticity_residual=float(hermiticity),
         wing_reciprocity_residual=wing_reciprocity,
         _producer_token=_PRODUCER_TOKEN,
+        frequency_ry=frequency,
     )
     return require_static_photon_head_response(response, mesh)
 

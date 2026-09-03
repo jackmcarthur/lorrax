@@ -407,7 +407,8 @@ def test_static_photon_head_response_is_sealed_to_its_producer():
     with pytest.raises(TypeError, match="issued only by"):
         StaticPhotonHeadResponse(
             layout=None, S_direct=None, sigma_H=None, hall_source="",
-            Y_x=None, Z_y=None, ward_residual=0.0,
+            Y_x=None, Z_y=None, charge_Y_x=None, charge_Z_y=None,
+            ward_residual=0.0,
             hermiticity_residual=0.0, wing_reciprocity_residual=0.0,
             _producer_token=object())
 

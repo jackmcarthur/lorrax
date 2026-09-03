@@ -138,6 +138,9 @@ class SigmaResult:
     sigma_c_omega_kij_ry: jax.Array | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     sigma_c_odd_at_dft_diag_ev: np.ndarray | None = None
+    #: Dynamic CT/TC Gamma-head contribution, defined by the physical run
+    #: minus its in-run ``sigma_H=0`` twin and evaluated at the DFT states.
+    sigma_ct_hall_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
     e_eval_ev: np.ndarray | None = None
     omega_grid_ev: np.ndarray | None = None
@@ -166,6 +169,9 @@ class SigmaResult:
     band_extrapolation_scheme: str | None = None
     ppm_probe_hermiticity_residual: float | None = None
     ppm_odd_even_residue_ratio: float | None = None
+    faraday_head_omega_h_ry: float | None = None
+    faraday_sigma_h_static_bohr_inv: tuple[float, float, float] | None = None
+    faraday_sigma_h_probe_bohr_inv: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
         if self.hartree_omitted:
@@ -244,6 +250,7 @@ SIGMA_BASIS_FIELDS = (
     # and rebuilds the diagonal from it.  The odd diagonal (measured-broken-TR
     # GN decks only) is evaluated once at the DFT states and never rotated.
     "sigma_c_odd_at_dft_diag_ev",
+    "sigma_ct_hall_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",
 )
@@ -276,6 +283,9 @@ BASIS_FREE_FIELDS = (
     "hartree_omitted",
     "ppm_probe_hermiticity_residual",
     "ppm_odd_even_residue_ratio",
+    "faraday_head_omega_h_ry",
+    "faraday_sigma_h_static_bohr_inv",
+    "faraday_sigma_h_probe_bohr_inv",
 )
 
 
@@ -380,6 +390,8 @@ def finalize_dynamic_sigma(
     photon_head_sigma_basis=None,
     sigma_lorentz_static_skij_ry=None,
     sigma_c_odd_body_omega=None,
+    sigma_ct_hall_body_omega=None,
+    faraday_ppm=None,
     ppm_probe_hermiticity_residual=None,
     ppm_odd_even_residue_ratio=None,
 ) -> SigmaResult:
@@ -417,6 +429,17 @@ def finalize_dynamic_sigma(
         v_h_scalar = sig_h
 
     with timing.section("gw_jax.dynamic_sigma_finalize"):
+        if sigma_ct_hall_body_omega is not None:
+            if tuple(sigma_ct_hall_body_omega.shape) != tuple(
+                    sigma_c_body_omega.shape):
+                raise ValueError(
+                    "dynamic Faraday Sigma cube must match the ordinary "
+                    f"body cube; got {sigma_ct_hall_body_omega.shape} and "
+                    f"{sigma_c_body_omega.shape}")
+            sigma_c_body_omega = jax.jit(
+                lambda body, hall: body + hall,
+                out_shardings=sigma_c_body_omega.sharding)(
+                    sigma_c_body_omega, sigma_ct_hall_body_omega)
         sigma_c_omega = add_head_sigma_diag(
             sigma_c_body_omega, head_sigma_diag_w_kn_ry)
 
@@ -452,6 +475,30 @@ def finalize_dynamic_sigma(
                 raise ValueError(
                     "GATE ppm_odd_sigma_reference: ordered-residue and total "
                     "Sigma_c were evaluated on different energy references")
+
+        sigma_ct_hall_at_dft_ev = None
+        if sigma_ct_hall_body_omega is not None:
+            (sigma_ct_hall_at_dft_ev,
+             hall_omega_dft_rel_ev,
+             hall_efermi_dft_ev,
+             hall_reference_provenance,
+             _) = eval_sigma_c_at_dft_energies(
+                sigma_ct_hall_body_omega,
+                config=config,
+                band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
+                mesh_xy=mesh_xy, print_fn=lambda *args, **kwargs: None,
+                efermi_ry=efermi_ry,
+                efermi_provenance=efermi_provenance,
+            )
+            if (not np.array_equal(
+                    hall_omega_dft_rel_ev, omega_dft_rel_ev)
+                    or hall_efermi_dft_ev != efermi_dft_ev
+                    or hall_reference_provenance
+                    != omega_reference_provenance):
+                raise ValueError(
+                    "GATE dynamic_hall_sigma_reference: the Hall-on/off "
+                    "Gamma head and total Sigma_c were evaluated on "
+                    "different energy references")
 
         # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
         # reference the interpolation above used — one omega reference per
@@ -540,6 +587,14 @@ def finalize_dynamic_sigma(
             # from output columns.
             current = jnp.asarray(
                 sigma_lorentz_static_skij_ry, dtype=sigma_xc_qsgw.dtype)
+            if sigma_ct_hall_body_omega is not None:
+                zero_x = jnp.zeros_like(sig_x_rep)
+                sigma_ct_hall_qsgw, _ = build_qsgw_sigma_xc(
+                    sigma_ct_hall_body_omega, zero_x,
+                    omega_grid_ev, e_qp_rel_ev, mesh_xy,
+                    **qsgw_edge_kwargs,
+                )
+                current = current.at[1].add(sigma_ct_hall_qsgw)
             sigma_lorentz = current.at[0].set(
                 sigma_xc_qsgw - current[1] - current[2])
 
@@ -553,6 +608,12 @@ def finalize_dynamic_sigma(
         # never mixed into the carry.
         sigma_xc_qsgw_unextrap = None
         if sigma_c_body_omega_unextrap is not None:
+            if sigma_ct_hall_body_omega is not None:
+                sigma_c_body_omega_unextrap = jax.jit(
+                    lambda body, hall: body + hall,
+                    out_shardings=sigma_c_body_omega_unextrap.sharding)(
+                        sigma_c_body_omega_unextrap,
+                        sigma_ct_hall_body_omega)
             sigma_c_omega_unextrap = add_head_sigma_diag(
                 sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry)
             sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
@@ -594,6 +655,7 @@ def finalize_dynamic_sigma(
         sigma_c_omega_kij_ry=sigma_c_omega,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         sigma_c_odd_at_dft_diag_ev=sigma_c_odd_at_dft_ev,
+        sigma_ct_hall_at_dft_diag_ev=sigma_ct_hall_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
         # The energies THIS call's Σ spectrum was evaluated at, kept so the
         # eqp1 writer can centre its linearization where the QP pole
@@ -616,6 +678,15 @@ def finalize_dynamic_sigma(
             str(_band_scheme) if _band_scheme is not None else None),
         ppm_probe_hermiticity_residual=ppm_probe_hermiticity_residual,
         ppm_odd_even_residue_ratio=ppm_odd_even_residue_ratio,
+        faraday_head_omega_h_ry=(
+            None if faraday_ppm is None
+            else float(faraday_ppm.omega_h_ry)),
+        faraday_sigma_h_static_bohr_inv=(
+            None if faraday_ppm is None else tuple(float(v) for v in
+                np.asarray(faraday_ppm.sigma_H_static).reshape(3))),
+        faraday_sigma_h_probe_bohr_inv=(
+            None if faraday_ppm is None else tuple(float(v) for v in
+                np.asarray(faraday_ppm.sigma_H_probe).reshape(3))),
         # The dynamic PACKED route's per-sector Gamma-cell diagnostics.
         # None for every scalar dynamic run, so the freq-debug writer's
         # columns are unchanged there; on the packed route its CC sector is
@@ -919,6 +990,7 @@ def compute_sigma_xc(
     photon_head_sigma_diag = None
     photon_head_sigma_basis = None
     sigma_lorentz = None
+    faraday_ppm = None
     sig_x_b = None
     if packed_photon_replaces_charge_sigma(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
@@ -1070,6 +1142,8 @@ def compute_sigma_xc(
                 photon_head_diagnostics.components_tskn_ry)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
         sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
+        faraday_ppm = getattr(
+            photon_response.head_completion, "faraday_ppm", None)
     elif uses_static_photon_response(config):
         # EXHAUSTIVENESS over the packed route's compute modes.  The two
         # predicates above cover gw_config.PACKED_PHOTON_COMPUTE_MODES; a
@@ -1397,6 +1471,27 @@ def compute_sigma_xc(
         print_fn=print_fn,
     )
 
+    sigma_ct_hall_body_omega = None
+    faraday_efermi_ry = None
+    faraday_efermi_provenance = None
+    if faraday_ppm is not None:
+        from .efermi import resolve_sigma_efermi_ry
+        from .photon_sigma import compute_ppm_faraday_head_sigma_omega
+        faraday_efermi_ry, faraday_efermi_provenance = (
+            resolve_sigma_efermi_ry(
+                config.sigma.fermi_reference,
+                occupation_state=occupation_state, wfn=wfn))
+        sigma_ct_hall_body_omega = compute_ppm_faraday_head_sigma_omega(
+            wfns_charge=wfns,
+            wfns_transverse=wfns_transverse,
+            faraday_ppm=faraday_ppm,
+            photon_layout=photon_response.layout,
+            meta=meta,
+            mesh_xy=mesh_xy,
+            omega_grid_ry=config.omega_grid_ry,
+            efermi_ry=faraday_efermi_ry,
+        )
+
     return finalize_dynamic_sigma(
         ppm_outputs.sigma_c_body_omega,
         ppm_outputs.head_sigma_diag_w_kn_ry,
@@ -1415,9 +1510,13 @@ def compute_sigma_xc(
         sigma_c_body_omega_unextrap=(
             ppm_outputs.sigma_c_body_omega_unextrap),
         sigma_c_odd_body_omega=ppm_outputs.sigma_c_odd_body_omega,
+        sigma_ct_hall_body_omega=sigma_ct_hall_body_omega,
+        faraday_ppm=faraday_ppm,
         ppm_probe_hermiticity_residual=(
             ppm_outputs.probe_hermiticity_residual),
         ppm_odd_even_residue_ratio=ppm_outputs.odd_even_residue_ratio,
+        efermi_ry=faraday_efermi_ry,
+        efermi_provenance=faraday_efermi_provenance,
         print_fn=print_fn,
     )
 
