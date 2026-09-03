@@ -124,6 +124,66 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
     assert calls["occupation"][0] == str(fit.resolve())
 
 
+def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
+        tmp_path, monkeypatch):
+    """Producer padding may widen a fit grid; it may never under-cover live."""
+    fit = tmp_path / "mpa_fit_oneshot.h5"
+    fit.touch()
+
+    class _Tables:
+        def logical(self, _n_mu):
+            return self
+        def canonical(self):
+            return self
+        def digest(self):
+            return "table"
+
+    monkeypatch.setattr(
+        model, "_q_wedge", lambda *_args: (
+            np.arange(1), _Tables(), SimpleNamespace(centroid_hash="centroids")))
+    monkeypatch.setattr(
+        model.mpa_store, "validate_fit_store", lambda *_args, **_kwargs: {
+            "n_p": 2, "n_q": 1, "n_mu": 3, "ordered_residues": False})
+    monkeypatch.setattr(model.mpa_store, "assert_occupation_stamps",
+                        lambda *_args, **_kwargs: None)
+    stored_plan, live_plan = object(), object()
+    monkeypatch.setattr(model, "make_mpa_plan_from_fit",
+                        lambda *_args, **_kwargs: stored_plan)
+    monkeypatch.setattr(
+        model.sample_plan, "plan_z",
+        lambda plan: (np.asarray([0.0 + 0.2j, 6.0 + 0.2j])
+                      if plan is stored_plan else
+                      np.asarray([0.0 + 0.2j, 5.0 + 0.2j])))
+    config = SimpleNamespace(
+        mpa=SimpleNamespace(n_poles=2),
+        screening=SimpleNamespace(diagrams="w_rpa"))
+    messages = []
+
+    got = model.validate_reused_mpa_fit(
+        fit, config=config, live_plan=live_plan,
+        sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
+        meta=SimpleNamespace(n_rmu=3), mesh_xy=None,
+        occupation_state=object(), material_class="metal",
+        print_fn=messages.append)
+
+    assert got == str(fit.resolve())
+    assert any("conservatively covers" in message for message in messages)
+
+    monkeypatch.setattr(
+        model.sample_plan, "plan_z",
+        lambda plan: (np.asarray([0.0 + 0.2j, 4.0 + 0.2j])
+                      if plan is stored_plan else
+                      np.asarray([0.0 + 0.2j, 5.0 + 0.2j])))
+    import pytest
+    with pytest.raises(ValueError, match="under-covers"):
+        model.validate_reused_mpa_fit(
+            fit, config=config, live_plan=live_plan,
+            sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
+            meta=SimpleNamespace(n_rmu=3), mesh_xy=None,
+            occupation_state=object(), material_class="metal",
+            print_fn=lambda *_args: None)
+
+
 def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):
     V = jnp.asarray(np.stack([np.eye(2), 2 * np.eye(2)]),
                     dtype=jnp.complex128)

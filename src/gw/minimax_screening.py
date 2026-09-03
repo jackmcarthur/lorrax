@@ -1349,12 +1349,16 @@ def build_static_quadrature(wfns, minimax_config, *,
     # f_nk - f_mk.  What that cut used to do on a METAL is now handled by the
     # occupation-width floor on x_min below; see there.
     enk_v = wfns.enk[:, s.val]
-    # ``cond_all``, not ``cond``: this quadrature is built once and reused by
+    # ``cond_all_logical``, not ``cond``: this quadrature is built once and reused by
     # BOTH χ0 and Σ, so its interval must cover the union of the two band
     # sums.  ``cond`` is the χ0 leg only and would under-cover a deck whose
     # ``number_bands_sigma`` is the larger of the two.  Identical to ``cond``
-    # on every unsplit deck (see BandSlices.cond_all).
-    enk_c = wfns.enk[:, s.cond_all]
+    # on every unsplit deck (see BandSlices.cond_all_logical).
+    # ``cond_all`` is the padded loaded carrier.  Its tail contains zero psi
+    # but finite sentinel/reader energies, so using it here makes x_max (and
+    # therefore every MPA sample frequency) depend on process count.  Spectral
+    # extrema are physics and end at the logical union carried alongside it.
+    enk_c = wfns.enk[:, s.cond_all_logical]
     e_ref = resolve_minimax_energy_reference(
         enk_v, enk_c, reference=minimax_config.energy_reference)
 

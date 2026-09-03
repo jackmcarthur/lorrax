@@ -11,10 +11,41 @@ dynamic Sigma_c run; the analytic identities are invisible at gate level
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import jax.numpy as jnp
 import numpy as np
 
 import minimax as mm
 from gw import minimax_screening as ms
+from gw.wavefunction_bundle import BandSlices
+
+
+def test_static_window_ignores_process_padded_band_energies(monkeypatch):
+    """P16/P36 carrier tails cannot change the physical minimax interval."""
+    slices = BandSlices.from_band_edges(
+        0, 0, 2, 4, 6, b4_chi=6, b4_sigma=6, b4_logical=4)
+    # The last two values stand in for real WFN energies carried in zero-psi
+    # padding slots.  They would inflate x_max from 5 to 203 if cond_all were
+    # used instead of cond_all_logical.
+    wfns = SimpleNamespace(
+        slices=slices,
+        enk=jnp.asarray([[-3.0, -1.0, 1.0, 2.0, 100.0, 200.0]]))
+    seen = {}
+
+    def solve(x_min, x_max, **_kwargs):
+        seen["interval"] = (x_min, x_max)
+        return SimpleNamespace(x_min=x_min, x_max=x_max)
+
+    monkeypatch.setattr(ms, "solve_laplace_minimax_interval", solve)
+    config = SimpleNamespace(
+        energy_reference="midgap", target_error=1.0e-6,
+        max_nodes=64, use_shipped_tables=True)
+
+    quad, _ = ms.build_static_quadrature(wfns, config)
+
+    assert seen["interval"] == (2.0, 5.0)
+    assert quad.x_max == 5.0
 
 
 def _typed(catalog):

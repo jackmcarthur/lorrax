@@ -135,13 +135,29 @@ def validate_reused_mpa_fit(
         config, path, mesh_xy=mesh_xy, material_class=material_class)
     stored_z = np.asarray(sample_plan.plan_z(stored_plan), np.complex128)
     live_z = np.asarray(sample_plan.plan_z(live_plan), np.complex128)
-    if stored_z.shape != live_z.shape or not np.array_equal(stored_z, live_z):
-        delta = (float(np.max(np.abs(stored_z - live_z)))
-                 if stored_z.shape == live_z.shape else float("inf"))
+    if stored_z.shape != live_z.shape:
         raise ValueError(
-            "MPA certified-fit reuse frequency mismatch against the live "
-            f"band/quadrature span: stored_shape={stored_z.shape}, "
-            f"live_shape={live_z.shape}, max_abs_delta={delta:.17g}")
+            "MPA certified-fit reuse frequency-count mismatch: "
+            f"stored_shape={stored_z.shape}, live_shape={live_z.shape}")
+    if not np.array_equal(stored_z, live_z):
+        # Sampling locations are numerical fit choices, not an evaluation-time
+        # observable.  A completed fit made on a wider transition interval is
+        # a conservative provider for the same logical calculation; requiring
+        # exact equality made reuse depend on the producer's process padding.
+        # The reverse is unsafe: a stored plan whose ceiling is below the live
+        # logical spectrum did not sample the whole requested interval.
+        stored_ceiling = float(np.max(stored_z.real))
+        live_ceiling = float(np.max(live_z.real))
+        if stored_ceiling < live_ceiling:
+            raise ValueError(
+                "MPA certified-fit reuse frequency span under-covers the live "
+                "logical band/quadrature span: "
+                f"stored_ceiling={stored_ceiling:.17g}, "
+                f"live_ceiling={live_ceiling:.17g}")
+        print_fn(
+            "  MPA screening reuse: stored frequency ceiling conservatively "
+            f"covers live logical span ({stored_ceiling:.9g} >= "
+            f"{live_ceiling:.9g} Ry).")
     if material_class == "metal":
         mpa_store.assert_occupation_stamps(
             path, occupation_state, where="mpa_fit_reuse_file")
