@@ -1758,6 +1758,10 @@ def write_results(
         e_eval_rel_ev=e_eval_rel_ev_irr,
         dE_ev=eqp_dE_ev,
         nspin=1,
+        # SC is an eqp0-type fixed-point map.  Its central-difference Z is
+        # output-only in the BGW-style eqp1 column; it must never select a
+        # fallback value or feed an iteration.
+        guard_pathological_z=not results.self_consistent,
         print_fn=print_fn,
     )
 
@@ -1784,8 +1788,12 @@ def write_results(
         sigma_c_odd_kn_eV=(
             None if results.sigma_c_odd_diag_at_dft_ry is None
             else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
-        z_factor_kn=assembly.z_factor,
-        z_pathological_kn=assembly.z_pathological,
+        # The legacy sigma text diagnostic defines Z together with a guarded
+        # fallback-status twin.  SC has no such status: its raw central-
+        # difference Z is represented only by the resulting eqp1 file.
+        z_factor_kn=(None if results.self_consistent else assembly.z_factor),
+        z_pathological_kn=(
+            None if results.self_consistent else assembly.z_pathological),
     )
 
     # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing
