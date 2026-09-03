@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 import pytest
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from gw.gw_config import (
     HeadCorrection,
@@ -26,13 +26,18 @@ from gw.head_correction import (
     _reduce_static_photon_order_diagnostics,
     _require_static_photon_numerical_certificate,
     _static_photon_mixed_error_ratio,
+    charge_head_insertion_norm_stats,
     complete_static_slab_photon_q0,
     static_gauge_tensor_residuals,
     static_hall_linear_response,
     static_slab_photon_head_moment_chunk,
 )
 from gw.static_gauge_response import StaticPhotonHeadResponse
-from gw.w_isdf import compute_static_photon_response
+from gw.w_isdf import (
+    StaticPhotonResponse,
+    compute_static_photon_response,
+    format_photon_head_run_record,
+)
 
 
 def _mesh():
@@ -437,7 +442,7 @@ def test_packed_runtime_refuses_no_local_fields_before_opening_a_body():
             config=config)
 
 
-def _packed_deck(*, sys_dim=2, extra=""):
+def _packed_deck(*, sys_dim=2, mode="full_static_cohsex", extra=""):
     return (
         "[cohsex]\n"
         "nval = 2\n"
@@ -446,7 +451,7 @@ def _packed_deck(*, sys_dim=2, extra=""):
         "memory_per_device_gb = 4.0\n"
         f"sys_dim = {sys_dim}\n"
         "bispinor = true\n"
-        "bispinor_gw = full_static_cohsex\n"
+        f"bispinor_gw = {mode}\n"
         "compute_mode = cohsex\n"
         "low_mem_bands = true\n"
         "w_dyson_solver = distributed\n"
@@ -472,6 +477,70 @@ def test_packed_deck_off_head_is_an_announced_debug_skip(tmp_path):
     config = _parse(tmp_path, _packed_deck(extra="head_correction = off\n"))
     assert uses_static_photon_response(config)
     assert not uses_coupled_photon_head(config)
+
+
+@pytest.mark.parametrize("mode", ["bare_transverse", "full_static_cohsex"])
+def test_every_packed_bispinor_mode_records_headless_as_debug(tmp_path, mode):
+    """The config-selected run-record path, not component chatter, owns it."""
+    config = _parse(
+        tmp_path, _packed_deck(
+            mode=mode, extra="head_correction = off\n"))
+    assert uses_static_photon_response(config)
+    response = StaticPhotonResponse(
+        layout=None, V_packed=None, W_packed=None,
+        current_contact="none", approximation=f"DEBUG_headless_{mode}",
+        head_completion=None)
+    record = format_photon_head_run_record(response)
+    assert record.startswith("DEBUG:")
+    assert "head_correction=off" in record
+    assert "NOT a production calculation" in record
+    source = inspect.getsource(compute_static_photon_response)
+    assert "WARNING -- DEBUG" in source
+
+
+def test_charge_head_insertion_norm_stats_is_a_sharded_scalar_reduction():
+    mesh = _mesh()
+    nk, ns, nmu, nb, nocc = 2, 2, 4, 4, 2
+    psi = np.full(
+        (nk, ns, nmu, nb), 1.0 / np.sqrt(float(ns)),
+        dtype=np.complex128)
+    g0 = np.full(nmu, 1.0 / nmu, dtype=np.complex128)
+    with mesh:
+        psi_mun = jax.device_put(
+            psi, NamedSharding(mesh, P(None, None, "x", "y")))
+        g0_X = jax.device_put(g0, NamedSharding(mesh, P("x")))
+    wfns = SimpleNamespace(
+        layout="face", psi_mun=psi_mun,
+        slices=SimpleNamespace(occ=slice(0, nocc)))
+    mean, std, minimum, maximum, imag = charge_head_insertion_norm_stats(
+        wfns, g0_X, mesh_xy=mesh)
+    np.testing.assert_allclose(
+        (mean, std, minimum, maximum, imag), (1.0, 0.0, 1.0, 1.0, 0.0),
+        rtol=0.0, atol=1.0e-14)
+
+
+def test_completed_photon_head_record_exposes_moments_ws_and_norm_stats():
+    moments = np.arange(3 * 3 * 4 * 4, dtype=np.float64).reshape(3, 3, 4, 4)
+    completion = SimpleNamespace(
+        screened_moments=moments.astype(np.complex128),
+        bare_D_mean=np.eye(4, dtype=np.complex128) * 2.0,
+        cubature_receipt=SimpleNamespace(orders=(16, 24, 32)),
+        observed_physical_counts=(1536, 3456, 6144),
+        mixed_convergence_error_ratios=(0.2, 0.1),
+        max_backward_residual=3.0e-16,
+        hall_source="none", sigma_H=np.zeros(3), ward_residual=1.0e-15,
+        hermiticity_residual=2.0e-15,
+        max_dyson_forward_error_bound=4.0e-15)
+    response = StaticPhotonResponse(
+        layout=None, V_packed=None, W_packed=None,
+        current_contact="none", approximation="completed",
+        head_completion=completion,
+        charge_head_insertion_norm_stats=(0.99, 0.02, 0.95, 1.03, 1.0e-16))
+    record = format_photon_head_run_record(response)
+    for token in ("<D>[0,0]=", "M_00[0,0]=",
+                  "moment_norms(00,0a,a0,ab)=", "N_occ(mean,std,min,max)=",
+                  "WS(orders=(16, 24, 32),nodes=(1536, 3456, 6144)"):
+        assert token in record
 
 
 def test_packed_deck_refuses_no_local_fields(tmp_path):

@@ -1915,6 +1915,58 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
+    #: ``(mean, std, min, max, max_abs_imag)`` of
+    #: ``sum_mu g0_mu sum_s |psi_kns(r_mu)|^2`` over occupied states.
+    #: Present exactly when the Gamma-cell completion ran.
+    charge_head_insertion_norm_stats: tuple[float, ...] | None = None
+
+
+def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
+    """Format the one packed-photon Gamma-head production-record line."""
+    completion = response.head_completion
+    if completion is None:
+        return (
+            "DEBUG: Gamma-cell head disabled by head_correction=off "
+            "(headless packed body; NOT a production calculation)")
+    stats = response.charge_head_insertion_norm_stats
+    if stats is None or len(stats) != 5:
+        raise ValueError(
+            "GATE photon_head_insertion_norm_unmeasured: a completed packed "
+            "Gamma head has no occupied-state N_n statistics")
+    mean, std, minimum, maximum, imag_max = (float(v) for v in stats)
+    moments = np.asarray(completion.screened_moments, dtype=np.complex128)
+    D00 = complex(np.asarray(completion.bare_D_mean)[0, 0])
+    M0000 = complex(moments[0, 0, 0, 0])
+    family_norms = (
+        float(np.linalg.norm(moments[0, 0])),
+        float(np.linalg.norm(moments[0, 1:])),
+        float(np.linalg.norm(moments[1:, 0])),
+        float(np.linalg.norm(moments[1:, 1:])),
+    )
+
+    def _complex(value):
+        return f"{value.real:.9e}{value.imag:+.9e}j"
+
+    receipt = completion.cubature_receipt
+    return (
+        "Gamma-cell completion applied (bare <D> into V, charge S00/wing "
+        "head into W); "
+        f"hall_source={completion.hall_source}; "
+        f"sigma_H={np.asarray(completion.sigma_H).tolist()} bohr^-1; "
+        f"<D>[0,0]={_complex(D00)}; M_00[0,0]={_complex(M0000)}; "
+        "moment_norms(00,0a,a0,ab)="
+        f"({family_norms[0]:.9e},{family_norms[1]:.9e},"
+        f"{family_norms[2]:.9e},{family_norms[3]:.9e}); "
+        f"N_occ(mean,std,min,max)=({mean:.9e},{std:.9e},{minimum:.9e},"
+        f"{maximum:.9e}); N_occ_max_abs_imag={imag_max:.3e}; "
+        f"ward={completion.ward_residual:.3e}; "
+        f"hermiticity={completion.hermiticity_residual:.3e}; "
+        f"dyson_forward_bound={completion.max_dyson_forward_error_bound:.3e}; "
+        f"WS(orders={receipt.orders},nodes={completion.observed_physical_counts},"
+        "final_error_ratio="
+        f"{completion.mixed_convergence_error_ratios[-1]:.3e},"
+        "max_dyson_backward_residual="
+        f"{completion.max_backward_residual:.3e})")
 
 
 def _load_static_photon_hall(
@@ -2251,10 +2303,14 @@ def compute_static_photon_response(
             "gate before coupled head/body folding")
 
     head_completion = None
+    charge_head_insertion_stats = None
     if coupled_head:
         from vcoul import (
             CoulombGeometry, get_kernel, slab_minibz_photon_cubature)
-        from .head_correction import complete_static_slab_photon_q0
+        from .head_correction import (
+            charge_head_insertion_norm_stats,
+            complete_static_slab_photon_q0,
+        )
         from .static_gauge_response import (
             build_static_photon_head_response)
 
@@ -2275,6 +2331,8 @@ def compute_static_photon_response(
                 "literal-Gamma vectors")
         g0_X = pack_photon_channel_vectors(
             tuple(photon_g0_vectors), layout, mesh_xy, axis_name="x")[0]
+        charge_head_insertion_stats = charge_head_insertion_norm_stats(
+            wfns_charge, photon_g0_vectors[0], mesh_xy=mesh_xy)
         y_sharding = NamedSharding(mesh_xy, P(None, "y"))
         g0_Y = pack_photon_channel_vectors(
             tuple(device_put_process_local(vector, y_sharding)
@@ -2308,6 +2366,7 @@ def compute_static_photon_response(
             current_contact=current_contact,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
+            charge_head_insertion_norm_stats=charge_head_insertion_stats,
             approximation=(
                 "gamma_completed_no_pair_static_photon_v1"
                 if coupled_head
@@ -2318,6 +2377,7 @@ def compute_static_photon_response(
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
+        charge_head_insertion_norm_stats=charge_head_insertion_stats,
         approximation=(
             "gamma_completed_bare_transverse_photon_v1"
             if coupled_head
