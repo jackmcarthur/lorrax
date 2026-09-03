@@ -519,10 +519,10 @@ def test_gnppm_matches_reference(gnppm_session):
 
 @pytest.mark.regression
 def test_bispinor_gnppm_matches_reference(bispinor_session):
-    """Bispinor GN-PPM frozen gate (Σ^B folded into sigX).
+    """Bispinor GN-PPM packed-route frozen gate (current blocks in sigX).
 
-    Frontera-frozen; runs on Perlmutter too at ``_XMACHINE_ATOL_EV``
-    (owner ruling 2026-08-07 — read that constant before touching it).
+    Perlmutter-frozen; cross-machine runs use ``_XMACHINE_ATOL_EV`` (owner
+    ruling 2026-08-07 — read that constant before touching it).
     """
     _assert_matches_reference(
         bispinor_session.run_dir / bispinor_session.output_name,
