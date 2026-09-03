@@ -213,7 +213,7 @@ band-pair cost; it is not the implemented path.
 | [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
 | [`src/centroid/sampling_metric.py`](../src/centroid/sampling_metric.py) | Shared charge/current feature-Gram diagonal from streamed subspace projectors. |
 | [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes feature-fit, source-WFN, and intended-channel provenance. |
-| [`src/gw/photon_sigma.py`](../src/gw/photon_sigma.py) | One block-streamed $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$ and the screened four-current channels. |
+| `src/gw/photon_sigma.py` | One block-streamed $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$ and the screened four-current channels. |
 | [`src/gw/v_q_bispinor.py`](../src/gw/v_q_bispinor.py) + [`src/gw/compute_vcoul.py`](../src/gw/compute_vcoul.py) | Channel-aware $V_q$ orchestration and the Coulomb/transverse projector kernel. |
 | [`src/gw/cohsex_sigma.py`](../src/gw/cohsex_sigma.py), [`ppm_sigma.py`](../src/gw/ppm_sigma.py) | Parameterise spinor axis size; $\tilde\gamma^0$ vertices made explicit (identity, but expose contraction shape for phase-2). |
 | [`src/gw/gw_init.py`](../src/gw/gw_init.py), [`gw_config.py`](../src/gw/gw_config.py) | Resolve independent reuse, select coupled versus sequential transverse fitting, and bind the `bispinor_gw` policy. |
