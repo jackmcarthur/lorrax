@@ -908,7 +908,8 @@ def main(argv=None):
 		"--static-gauge-hall-only",
 		action="store_true",
 		help="Run only the canonical full-BZ uniform-current sweep and print "
-		     "its raw Hall pseudovector. This does not write dipole.h5 or "
+		     "its raw Hall pseudovector at z=0 and z=i*ppm_omega_p. This "
+		     "does not write dipole.h5 or "
 		     "fabricate any other static-gauge response term.",
 	)
 	parser.add_argument(
@@ -1266,6 +1267,13 @@ def main(argv=None):
 	nb = int(nband_eff)
 	if args.static_gauge_hall_only:
 		from gw.qsgw_head import static_gauge_hall_transaction
+		omega_p = float(params.get("ppm_omega_p", 2.0))
+		if not np.isfinite(omega_p) or omega_p <= 0.0:
+			parser.error(
+				"--static-gauge-hall-only requires finite ppm_omega_p > 0 "
+				"for its dynamic Hall sample")
+		hall_frequencies = np.asarray(
+			[0.0 + 0.0j, 1j * omega_p], dtype=np.complex128)
 
 		psi_G = wfn.load(
 			bands=(0, nb), k="full_bz", sharding=band_sphere_spec(),
@@ -1283,9 +1291,12 @@ def main(argv=None):
 				kvecs=np.asarray(gtab.kvecs))
 		with timing.section("static_gauge_hall_reduce"):
 			hall = static_gauge_hall_transaction(
-				uniform_gauge, wfn=wfn, sym=sym, band_start=0,
+				uniform_gauge, hall_frequencies,
+				wfn=wfn, sym=sym, band_start=0,
 				band_stop=nb, mesh=RUNTIME.mesh)
 			sigma_H = np.asarray(jax.block_until_ready(hall.sigma_H))
+			sigma_H_frequency = np.asarray(
+				jax.block_until_ready(hall.sigma_H_frequency))
 		if args.static_gauge_hall_out is not None:
 			from file_io.static_gauge_head import (
 				write_static_gauge_hall_artifact)
@@ -1303,6 +1314,14 @@ def main(argv=None):
 				f"sigma_H_raw_bohr^-1="
 				f"[{sigma_H[0]:.17e},{sigma_H[1]:.17e},"
 				f"{sigma_H[2]:.17e}]")
+			for z, sigma_z in zip(hall_frequencies, sigma_H_frequency):
+				print(
+					"DYNAMIC_GAUGE_HALL_SAMPLE "
+					f"z_ry={z.real:.17e}{z.imag:+.17e}j "
+					"sigma_H_raw_bohr^-1="
+					f"[{sigma_z[0].real:.17e}{sigma_z[0].imag:+.17e}j,"
+					f"{sigma_z[1].real:.17e}{sigma_z[1].imag:+.17e}j,"
+					f"{sigma_z[2].real:.17e}{sigma_z[2].imag:+.17e}j]")
 		timing.report(title="--- Timing (seconds) ---",
 		              wall=time.perf_counter() - _t_main)
 		return 0

@@ -19,8 +19,9 @@ that this module assembles.  Its content, by declaration:
   negative-energy (complement-space) closure.  They are never stored as
   accidental zeros of a larger schema; ``S_direct`` has charge support only.
 
-The Hall term is optional.  ``sigma_H`` comes from the immutable artifact
-written by ``get_dipole_mtxels --static-gauge-hall-only`` when the deck's
+The Hall term is optional.  Static ``sigma_H`` is the exact ``z=0`` row of
+the immutable frequency-sample artifact written by
+``get_dipole_mtxels --static-gauge-hall-only`` when the deck's
 ``static_gauge_hall_file`` exists and authenticates against the run's WFN,
 band manifold and k-count; when the file is absent ``sigma_H = 0`` and
 ``hall_source`` says so.  For a Chern-trivial insulator the static Hall
@@ -188,7 +189,9 @@ def build_static_photon_head_response(
 
     ``hall_transaction`` is either ``None`` (``sigma_H = 0``) or the full-BZ
     result of :func:`gw.qsgw_head.static_gauge_hall_transaction`, which must
-    name the same WFN identity and band manifold as the charge response.
+    name the same WFN identity and band manifold as the charge response.  This
+    static owner deliberately selects only its transaction's exact ``z=0``
+    row; dynamic consumers must request a frequency by exact value.
     """
     from common.parallel_transport import (
         fingerprint_from_binding, wfn_fingerprint)

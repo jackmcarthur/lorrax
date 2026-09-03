@@ -16,6 +16,7 @@ import pytest
 from jax.sharding import Mesh
 
 import common.parallel_transport as parallel_transport_module
+import gw.qsgw_head as qsgw_head_module
 from common.chi_from_dipole import compute_S_omega
 from common.bispinor_init import HALFALPHA
 from common.mtxel_sweep import UniformGaugeCurrentMatrixElements
@@ -413,10 +414,10 @@ def test_raw_hall_matches_orbital_cB_owner_and_documented_sign():
     nspin, nspinor_wfn = 1, 2
 
     got = np.asarray(raw_hall_pseudovector_sharded(
-        gamma_raw, energies, occupations,
+        gamma_raw, energies, occupations, [0.0 + 0.0j],
         mesh=_mesh(), nb_logical=nb, cell_volume=volume, nk_tot=nk,
         nspin=nspin, nspinor_wfn=nspinor_wfn,
-        degeneracy_tolerance_ry=1.0e-10))
+        degeneracy_tolerance_ry=1.0e-10))[0]
     cB = np.zeros(3, dtype=np.complex128)
     for k in range(nk):
         _pa, pb = orbital_pieces_at_k(
@@ -481,12 +482,12 @@ def test_raw_hall_fractional_occupations_and_degeneracy_refusal():
     velocity = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
     gamma_raw = HALFALPHA * np.transpose(velocity, (1, 0, 2, 3))
     got = np.asarray(raw_hall_pseudovector_sharded(
-        gamma_raw, energies, occupations,
+        gamma_raw, energies, occupations, [0.0 + 0.0j],
         mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk,
-        nspin=1, nspinor_wfn=2))
+        nspin=1, nspinor_wfn=2))[0]
     with pytest.raises(ValueError, match="one Gamma_raw row per full-BZ"):
         raw_hall_pseudovector_sharded(
-            gamma_raw, energies, occupations,
+            gamma_raw, energies, occupations, [0.0 + 0.0j],
             mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk + 1,
             nspin=1, nspinor_wfn=2)
 
@@ -510,12 +511,13 @@ def test_raw_hall_fractional_occupations_and_degeneracy_refusal():
     bad_energies[0, 2] = bad_energies[0, 1]
     with pytest.raises(ValueError, match="differently occupied states"):
         raw_hall_pseudovector_sharded(
-            gamma_raw, bad_energies, occupations,
+            gamma_raw, bad_energies, occupations, [0.0 + 0.0j],
             mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk,
             nspin=1, nspinor_wfn=2)
 
 
-def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint():
+def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint(
+        monkeypatch):
     """One full-BZ uniform transaction owns Hall values and provenance."""
     rng = np.random.default_rng(82601)
     nk, logical, storage = 2, 3, 4
@@ -542,13 +544,14 @@ def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint()
     sym = SimpleNamespace(
         nk_tot=nk,
         nk_red=1,
+        trs_allowed=False,
         irr_idx_k=np.asarray([0, 0], dtype=np.int32),
         sym_idx_k=np.asarray([0, 1], dtype=np.int32),
         sym_mats_k=np.stack((np.eye(3), -np.eye(3))),
     )
 
     got = static_gauge_hall_transaction(
-        uniform,
+        uniform, [0.0 + 0.0j, 0.0 + 0.7j],
         wfn=wfn,
         sym=sym,
         band_start=0,
@@ -559,6 +562,7 @@ def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint()
         uniform.gamma_raw,
         np.repeat(energies_file[0], nk, axis=0),
         np.repeat(occupations_file[0], nk, axis=0),
+        [0.0 + 0.0j, 0.0 + 0.7j],
         mesh=_mesh(),
         nb_logical=logical,
         cell_volume=31.0,
@@ -567,12 +571,28 @@ def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint()
         nspinor_wfn=2,
     )
     assert isinstance(got, StaticGaugeHallTransaction)
-    np.testing.assert_allclose(got.sigma_H, expected, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        got.sigma_H_frequency, expected, rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(got.sigma_H, expected[0].real)
     assert got.hamiltonian_config_operator_fingerprint == fingerprint
     assert (got.band_start, got.band_stop, got.nk_tot) == (0, logical, nk)
-    assert got.producer_id == "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1"
+    assert got.producer_id == "lorrax.dynamic_gauge_hall/full_bz_uniform_gauge_v2"
     with pytest.raises(TypeError, match="issued only"):
         replace(got, _producer_token=object())
+
+    # A measured TRS verdict is an exact-zero short circuit: the reduction
+    # itself must not execute, and every requested frequency is literal zero.
+    def _forbidden_hall_reduction(*args, **kwargs):
+        raise AssertionError("Hall reduction executed on a TRS transaction")
+
+    monkeypatch.setattr(
+        qsgw_head_module, "raw_hall_pseudovector_sharded",
+        _forbidden_hall_reduction)
+    sym.trs_allowed = True
+    trs = static_gauge_hall_transaction(
+        uniform, [0.0 + 0.0j, 0.0 + 0.7j],
+        wfn=wfn, sym=sym, band_start=0, band_stop=logical, mesh=_mesh())
+    np.testing.assert_array_equal(trs.sigma_H_frequency, 0.0 + 0.0j)
 
 
 def test_uniform_gauge_fingerprint_is_contact_capability_only():

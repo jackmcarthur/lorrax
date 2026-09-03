@@ -254,26 +254,30 @@ _HEAD_VERTEX_WIDTHS = (3, 8)
 
 
 _STATIC_GAUGE_HALL_PRODUCER_ID = (
-    "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1")
+    "lorrax.dynamic_gauge_hall/full_bz_uniform_gauge_v2")
 _STATIC_GAUGE_HALL_TOKEN = object()
 
 
 @dataclass(frozen=True)
 class StaticGaugeHallTransaction:
-    """Sealed Hall result from one complete uniform-gauge transaction.
+    """Sealed Hall samples from one complete uniform-gauge transaction.
 
-    ``sigma_H`` is the three-component real Hall pseudovector consumed by
-    the static response producer.  The fingerprint is copied from the same
-    uniform-gauge sweep that supplied ``Gamma_raw``.  A current-only sweep
-    authenticates the Hall operator without claiming contact or transfer-jet
-    closure; those terms remain an explicit capability decision downstream.
+    ``sigma_H_frequency`` contains one three-component Hall pseudovector per
+    explicit complex frequency in ``frequencies_ry``.  Frequency zero is
+    required in slot zero; :attr:`sigma_H` is its real, bit-preserving static
+    view consumed by the incumbent completion.  The fingerprint is copied
+    from the same uniform-gauge sweep that supplied ``Gamma_raw``.  A
+    current-only sweep authenticates the Hall operator without claiming
+    contact or transfer-jet closure; those terms remain an explicit
+    capability decision downstream.
 
     The large ``Gamma_raw`` band matrix remains sharded over both processor
     axes and is not retained here.  The only replicated product is the
-    three-component Hall vector.
+    frequency-by-three Hall table.
     """
 
-    sigma_H: jax.Array
+    frequencies_ry: jax.Array
+    sigma_H_frequency: jax.Array
     hamiltonian_config_operator_fingerprint: str
     wfn_fingerprint: str
     band_start: int
@@ -305,10 +309,59 @@ class StaticGaugeHallTransaction:
         if self.producer_id != _STATIC_GAUGE_HALL_PRODUCER_ID:
             raise ValueError(
                 "StaticGaugeHallTransaction has an unknown producer")
-        if (tuple(self.sigma_H.shape) != (3,)
-                or np.dtype(self.sigma_H.dtype) != np.dtype(np.float64)):
+        if (self.frequencies_ry.ndim != 1
+                or int(self.frequencies_ry.shape[0]) <= 0
+                or np.dtype(self.frequencies_ry.dtype)
+                != np.dtype(np.complex128)):
             raise ValueError(
-                "StaticGaugeHallTransaction sigma_H must be float64[3]")
+                "StaticGaugeHallTransaction frequencies_ry must be a "
+                "nonempty complex128 vector")
+        if (tuple(self.sigma_H_frequency.shape)
+                != (int(self.frequencies_ry.shape[0]), 3)
+                or np.dtype(self.sigma_H_frequency.dtype)
+                != np.dtype(np.complex128)):
+            raise ValueError(
+                "StaticGaugeHallTransaction sigma_H_frequency must be "
+                "complex128[n_frequency,3]")
+        frequencies = np.asarray(jax.device_get(self.frequencies_ry))
+        sigma = np.asarray(jax.device_get(self.sigma_H_frequency))
+        if (not np.all(np.isfinite(frequencies))
+                or not np.all(np.isfinite(sigma))):
+            raise ValueError(
+                "StaticGaugeHallTransaction samples must be finite")
+        if complex(frequencies[0]) != 0.0 + 0.0j:
+            raise ValueError(
+                "StaticGaugeHallTransaction frequency slot zero must be z=0")
+        if len(np.unique(frequencies)) != int(frequencies.size):
+            raise ValueError(
+                "StaticGaugeHallTransaction frequencies must be unique")
+        if np.any(np.imag(sigma[0]) != 0.0):
+            raise ValueError(
+                "StaticGaugeHallTransaction sigma_H(0) must be explicitly "
+                "real")
+
+    @property
+    def sigma_H(self) -> jax.Array:
+        """Return the incumbent real ``z=0`` pseudovector."""
+        return jnp.real(self.sigma_H_frequency[0])
+
+    def sigma_H_at(self, frequency_ry: complex) -> jax.Array:
+        """Return one exactly named frequency sample; never nearest-match."""
+        requested = complex(frequency_ry)
+        frequencies = np.asarray(jax.device_get(self.frequencies_ry))
+        matches = np.flatnonzero(frequencies == requested)
+        if matches.size != 1:
+            raise ValueError(
+                "GATE static_gauge_hall_frequency_missing: the Hall artifact "
+                "does not contain the exactly requested frequency.\n"
+                f"  got:  requested z={requested!r}; stored="
+                f"{frequencies.tolist()}\n"
+                "  want: one exact stored frequency sample\n"
+                "  why:  interpolating or nearest-matching a Hall response "
+                "would introduce an unauthenticated frequency model\n"
+                "  doc:  docs/theory/four-current-head-corrections.md, "
+                "Dynamic Hall/Faraday Gamma head")
+        return self.sigma_H_frequency[int(matches[0])]
 
 
 def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
@@ -2517,11 +2570,13 @@ def head_s_tensor_sharded(
 
 
 def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
-    """Distributed occupied-state Berry-overlap contraction.
+    """Distributed static-Berry and energy-ordered Hall contractions.
 
-    This is the band-tiled form of ``orbital_magnetization.cB``.  It returns
-    the axial cross product before physical prefactors; no band matrix is
-    gathered and only the three-component reduction is replicated.
+    The zero-frequency arm is the bit-preserving band-tiled form of
+    ``orbital_magnetization.cB``.  The frequency arm evaluates the same axial
+    bilinear once per explicit ``z`` with energy-ordered pairs.  No band
+    matrix is gathered; only ``(n_frequency,3)`` and one safety flag are
+    replicated.
     """
     key = ("static_gauge_raw_hall", id(mesh), int(nb_logical))
     hit = _KERNEL_CACHE.get(key)
@@ -2529,7 +2584,9 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(gamma_local, e_bra, e_ket, f_bra, f_ket, deps_tol):
+    def _local(
+        gamma_local, e_bra, e_ket, f_bra, f_ket, frequencies, deps_tol,
+    ):
         nx, ny = gamma_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
@@ -2557,6 +2614,41 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         ))
         cB_raw = jnp.einsum("akij,kij->a", cross, weight, optimize=True)
 
+        # D_a=-v_a/Delta and the one-charge-leg Adler--Wiser rule give the
+        # axial finite-frequency bilinear below.  The caller applies the
+        # physical prefactor after the collective.
+        ordered = logical & (dE > deps_tol)
+        f_diff = f_ket[:, None, :] - f_bra[:, :, None]
+        ordered_cross = jnp.stack((
+            jnp.conj(gy) * gz - jnp.conj(gz) * gy,
+            jnp.conj(gz) * gx - jnp.conj(gx) * gz,
+            jnp.conj(gx) * gy - jnp.conj(gy) * gx,
+        ))
+
+        def _one(frequency):
+            denom = jnp.square(dE) - jnp.square(frequency)
+            safe_denom = jnp.where(ordered, denom, 1.0 + 0.0j)
+            dynamic_weight = jnp.where(
+                ordered, f_diff / safe_denom, 0.0 + 0.0j)
+            local = jnp.einsum(
+                "akij,kij->a", ordered_cross, dynamic_weight, optimize=True)
+            return jax.lax.psum(local, (ax_x, ax_y))
+
+        n_frequency = int(frequencies.shape[0])
+        block = min(_HEAD_WING_FREQUENCY_BLOCK, n_frequency)
+        n_padded = ((n_frequency + block - 1) // block) * block
+        frequency_blocks = jnp.pad(
+            frequencies, (0, n_padded - n_frequency),
+            constant_values=jnp.asarray(1.0j, dtype=frequencies.dtype),
+        ).reshape(-1, block)
+
+        def _block(_carry, frequency_block):
+            return _carry, jax.vmap(_one)(frequency_block)
+
+        _, dynamic_blocks = jax.lax.scan(
+            _block, None, frequency_blocks, unroll=1)
+        dynamic_raw = dynamic_blocks.reshape(n_padded, 3)[:n_frequency]
+
         # A degeneracy joining differently occupied states invalidates the
         # ordinary insulating SOS expression; report one small flag rather
         # than silently clipping it into a Hall number.
@@ -2566,6 +2658,7 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
             & (jnp.abs(f_bra[:, :, None] - f_ket[:, None, :]) > 1.0e-12))
         return (
             jax.lax.psum(cB_raw, (ax_x, ax_y)),
+            dynamic_raw,
             jax.lax.psum(unsafe.astype(jnp.int32), (ax_x, ax_y)),
         )
 
@@ -2578,9 +2671,10 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
             P(None, "y"),
             P(None, "x"),
             P(None, "y"),
+            P(None),
             P(),
         ),
-        out_specs=(P(None), P()),
+        out_specs=(P(None), P(None, None), P()),
         check_vma=False,
     )
     kernel = jax.jit(sm)
@@ -2592,6 +2686,7 @@ def raw_hall_pseudovector_sharded(
     gamma_raw,
     energies_kn_ry,
     occupations_kn,
+    frequencies_ry,
     *,
     mesh: Mesh,
     nb_logical: int,
@@ -2601,7 +2696,7 @@ def raw_hall_pseudovector_sharded(
     nspinor_wfn: int,
     degeneracy_tolerance_ry: float = 1.0e-10,
 ):
-    r"""Derive the schema's real raw Hall pseudovector from ``Gamma_raw``.
+    r"""Derive ``sigma_H(z)`` from the canonical raw current vertex.
 
     The accepted raw Breit vertex and physical Pauli velocity are
 
@@ -2627,12 +2722,36 @@ def raw_hall_pseudovector_sharded(
     test_raw_hall_matches_orbital_cB_owner_and_documented_sign`` and
     ``tests/test_photon_head_sign_oracle.py::
     test_part_a_definitions_share_one_convention``).
+
+    At nonzero ``z`` the same kernel evaluates
+
+    ``sigma_H^b(z) = i*C/(Omega*Nk*HALFALPHA) sum_{Delta>0}``
+    ``(f_ket-f_bra) epsilon[b,a,i] conj(Gamma_a) Gamma_i``
+    ``/(Delta^2-z^2)``.
+
+    This follows directly from ``D_a=-v_a/Delta`` and the one-charge-leg
+    rule.  It is even in ``z`` and real on the imaginary axis.  An explicit
+    zero-frequency row is selected from the incumbent occupied-Berry
+    arithmetic so its float64 values remain bit-identical.
+
+    Parameters
+    ----------
+    frequencies_ry
+        One-dimensional complex frequency vector in Ry.  The returned array
+        has shape ``(n_frequency,3)`` and replicated sharding.
     """
     from common.bispinor_init import HALFALPHA
 
     gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    frequencies_host = np.atleast_1d(
+        np.asarray(frequencies_ry, dtype=np.complex128))
+    if (frequencies_host.ndim != 1 or frequencies_host.size == 0
+            or not np.all(np.isfinite(frequencies_host))):
+        raise ValueError(
+            "frequencies_ry must be a nonempty finite complex vector")
+    frequencies = jnp.asarray(frequencies_host, dtype=jnp.complex128)
     if gamma.ndim != 4 or gamma.shape[1] != 3:
         raise ValueError(
             "gamma_raw must be (nk,3,nb,nb) from "
@@ -2678,13 +2797,14 @@ def raw_hall_pseudovector_sharded(
     vertex = jnp.transpose(gamma, (1, 0, 2, 3))
     vertex, e, f, _ = _pad_head_band_manifold(
         vertex, e, f, jnp.zeros_like(e), mesh=mesh)
-    cB_raw, unsafe = _raw_hall_kernel(
+    cB_raw, dynamic_raw, unsafe = _raw_hall_kernel(
         mesh, nb_logical=int(nb_logical))(
             vertex,
             e,
             e,
             f,
             f,
+            frequencies,
             jnp.asarray(float(degeneracy_tolerance_ry), dtype=jnp.float64),
         )
     if int(np.asarray(unsafe)):
@@ -2693,14 +2813,26 @@ def raw_hall_pseudovector_sharded(
             "states are degenerate within degeneracy_tolerance_ry; the "
             "insulating occupied-state Berry SOS formula is undefined")
     capacity = 2.0 / (float(nspin) * float(nspinor_wfn))
-    prefactor = -capacity / (
+    static_prefactor = -capacity / (
         float(cell_volume) * float(nk_tot) * float(HALFALPHA))
-    return jnp.asarray(
-        prefactor * jnp.imag(cB_raw), dtype=jnp.float64)
+    static = jnp.asarray(
+        static_prefactor * jnp.imag(cB_raw), dtype=jnp.float64)
+    dynamic_prefactor = 1j * capacity / (
+        float(cell_volume) * float(nk_tot) * float(HALFALPHA))
+    dynamic = jnp.asarray(
+        dynamic_prefactor * dynamic_raw, dtype=jnp.complex128)
+    # The two formulae are mathematically equal at zero.  Selecting the old
+    # arithmetic there preserves authenticated static values bit-for-bit.
+    return jnp.where(
+        (frequencies == 0.0 + 0.0j)[:, None],
+        static[None, :].astype(jnp.complex128),
+        dynamic,
+    )
 
 
 def static_gauge_hall_transaction(
     uniform_gauge,
+    frequencies_ry,
     *,
     wfn,
     sym,
@@ -2709,7 +2841,7 @@ def static_gauge_hall_transaction(
     mesh: Mesh,
     degeneracy_tolerance_ry: float = 1.0e-10,
 ) -> StaticGaugeHallTransaction:
-    r"""Produce the artifact-ready Hall term from one canonical transaction.
+    r"""Produce artifact-ready Hall samples from one canonical transaction.
 
     ``uniform_gauge`` must be the result of
     :func:`common.mtxel_sweep.sweep_uniform_current_matrix_elements`.  Hall
@@ -2731,6 +2863,10 @@ def static_gauge_hall_transaction(
     physical full-BZ k before the sole ``1/Nk`` normalization is applied.  No
     driver-local star reconstruction, wavefunction reopen, band-matrix gather,
     FFT, current operator, or second Hall contraction is introduced here.
+    All requested frequencies share that one contraction.  Slot zero must be
+    exactly ``z=0`` so the transaction always retains the incumbent static
+    Hall value.  If the symmetry service measured ``trs_allowed=True``, the
+    Hall table is issued as exact zeros without executing the Hall reduction.
     """
     from common.mtxel_sweep import (
         UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)
@@ -2760,6 +2896,27 @@ def static_gauge_hall_transaction(
         raise ValueError(
             "static gauge Hall transaction currently requires nspin=1: "
             "Gamma_raw has no explicit spin-channel axis")
+    frequencies_host = np.atleast_1d(
+        np.asarray(frequencies_ry, dtype=np.complex128))
+    if (frequencies_host.ndim != 1 or frequencies_host.size == 0
+            or not np.all(np.isfinite(frequencies_host))):
+        raise ValueError(
+            "static gauge Hall frequencies_ry must be a nonempty finite "
+            "complex vector")
+    if complex(frequencies_host[0]) != 0.0 + 0.0j:
+        raise ValueError(
+            "static gauge Hall frequency slot zero must be exactly z=0")
+    if len(np.unique(frequencies_host)) != int(frequencies_host.size):
+        raise ValueError("static gauge Hall frequencies must be unique")
+    if not hasattr(sym, "trs_allowed"):
+        raise ValueError(
+            "GATE static_gauge_hall_needs_measured_trs: Hall production "
+            "requires SymMaps.trs_allowed; the supplied symmetry object has "
+            "no measured verdict")
+    if not isinstance(sym.trs_allowed, (bool, np.bool_)):
+        raise ValueError(
+            "GATE static_gauge_hall_needs_measured_trs: "
+            "SymMaps.trs_allowed is not a boolean measured verdict")
 
     gamma = uniform_gauge.gamma_raw
     nk_tot = int(sym.nk_tot)
@@ -2822,22 +2979,33 @@ def static_gauge_hall_transaction(
             "static gauge Hall band interval omits occupied WFN states; "
             "increase band_stop")
 
-    energies_full = unfold_file_wedge_to_full_bz(sym, energies_file)
-    occupations_full = unfold_file_wedge_to_full_bz(sym, occupations_file)
-    sigma_H = raw_hall_pseudovector_sharded(
-        gamma,
-        energies_full,
-        occupations_full,
-        mesh=mesh,
-        nb_logical=logical,
-        cell_volume=float(wfn.cell_volume),
-        nk_tot=nk_tot,
-        nspin=int(wfn.nspin),
-        nspinor_wfn=int(wfn.nspinor),
-        degeneracy_tolerance_ry=float(degeneracy_tolerance_ry),
-    )
+    if bool(sym.trs_allowed):
+        frequencies = device_put_process_local(
+            frequencies_host, NamedSharding(mesh, P(None)))
+        sigma_H_frequency = device_put_process_local(
+            np.zeros((frequencies_host.size, 3), dtype=np.complex128),
+            NamedSharding(mesh, P(None, None)))
+    else:
+        energies_full = unfold_file_wedge_to_full_bz(sym, energies_file)
+        occupations_full = unfold_file_wedge_to_full_bz(sym, occupations_file)
+        sigma_H_frequency = raw_hall_pseudovector_sharded(
+            gamma,
+            energies_full,
+            occupations_full,
+            frequencies_host,
+            mesh=mesh,
+            nb_logical=logical,
+            cell_volume=float(wfn.cell_volume),
+            nk_tot=nk_tot,
+            nspin=int(wfn.nspin),
+            nspinor_wfn=int(wfn.nspinor),
+            degeneracy_tolerance_ry=float(degeneracy_tolerance_ry),
+        )
+        frequencies = device_put_process_local(
+            frequencies_host, NamedSharding(mesh, P(None)))
     return StaticGaugeHallTransaction(
-        sigma_H=sigma_H,
+        frequencies_ry=frequencies,
+        sigma_H_frequency=sigma_H_frequency,
         hamiltonian_config_operator_fingerprint=fingerprint,
         wfn_fingerprint=wfn_fingerprint(wfn),
         band_start=start,
@@ -2849,16 +3017,21 @@ def static_gauge_hall_transaction(
 
 
 def _static_gauge_hall_transaction_from_artifact(
-    *, sigma_H, hamiltonian_config_operator_fingerprint: str,
+    *, frequencies_ry, sigma_H_frequency,
+    hamiltonian_config_operator_fingerprint: str,
     wfn_fingerprint: str, band_start: int, band_stop: int, nk_tot: int,
     mesh: Mesh,
 ) -> StaticGaugeHallTransaction:
-    """Place a loader-validated Hall vector on the run mesh."""
+    """Place a loader-validated Hall frequency table on the run mesh."""
+    frequencies = device_put_process_local(
+        np.asarray(frequencies_ry, dtype=np.complex128),
+        NamedSharding(mesh, P(None)))
     sigma = device_put_process_local(
-        np.asarray(sigma_H, dtype=np.float64),
-        NamedSharding(mesh, P()))
+        np.asarray(sigma_H_frequency, dtype=np.complex128),
+        NamedSharding(mesh, P(None, None)))
     return StaticGaugeHallTransaction(
-        sigma_H=sigma,
+        frequencies_ry=frequencies,
+        sigma_H_frequency=sigma,
         hamiltonian_config_operator_fingerprint=(
             hamiltonian_config_operator_fingerprint),
         wfn_fingerprint=wfn_fingerprint,

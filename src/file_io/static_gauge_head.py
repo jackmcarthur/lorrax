@@ -1,13 +1,14 @@
-"""Immutable SlabIO format of the static Hall artifact (``static_gauge_hall.h5``).
+"""Immutable SlabIO format of Hall frequency samples (``static_gauge_hall.h5``).
 
-This is the sole format owner for the three-component Hall pseudovector
-``sigma_H`` produced by :func:`gw.qsgw_head.static_gauge_hall_transaction`
+This is the sole format owner for the frequency-indexed Hall pseudovector
+``sigma_H(z)`` produced by :func:`gw.qsgw_head.static_gauge_hall_transaction`
 (``get_dipole_mtxels --static-gauge-hall-only``) and consumed, optionally, by
 the packed static photon Gamma-cell completion
 (:func:`gw.w_isdf.compute_static_photon_response` under
-``bispinor_gw = full_static_cohsex``).  The artifact is small (three floats
-plus identity attributes) and replicated; SlabIO is still the only transport
-so that every rank reads the same completed inode collectively.
+``bispinor_gw = full_static_cohsex``).  The artifact is small (one complex
+frequency and three complex components per sample, plus identity attributes)
+and replicated; SlabIO is still the only transport so that every rank reads
+the same completed inode collectively.
 
 The loader authenticates the artifact against the consuming run: the WFN
 identity (:func:`common.parallel_transport.wfn_fingerprint`), the band
@@ -32,7 +33,7 @@ from common.parallel_transport import (
 from file_io.slab_io import SlabIO
 
 
-STATIC_GAUGE_HALL_SCHEMA_VERSION = 1
+STATIC_GAUGE_HALL_SCHEMA_VERSION = 2
 
 
 def _require_prefixed_sha256(value: str, *, field_name: str) -> str:
@@ -152,7 +153,7 @@ def write_static_gauge_hall_artifact(
     *,
     mesh_xy: Mesh,
 ) -> None:
-    """Collectively persist the sealed three-number Hall transaction.
+    """Collectively persist the sealed Hall frequency transaction.
 
     The final path is create-once.  SlabIO writes ``<path>.partial`` and
     stamps ``complete=1`` only after its writes drain; a hard-link publish
@@ -170,11 +171,20 @@ def write_static_gauge_hall_artifact(
     wfn_sha256 = hall_transaction.wfn_fingerprint
     operator_sha256 = (
         hall_transaction.hamiltonian_config_operator_fingerprint)
-    sigma_array = hall_transaction.sigma_H
-    sigma_H = np.asarray(jax.device_get(sigma_array), dtype=np.float64)
-    if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
+    frequencies = np.asarray(
+        jax.device_get(hall_transaction.frequencies_ry), dtype=np.complex128)
+    sigma_H = np.asarray(
+        jax.device_get(hall_transaction.sigma_H_frequency),
+        dtype=np.complex128)
+    if (frequencies.ndim != 1 or frequencies.size == 0
+            or not np.all(np.isfinite(frequencies))):
         raise ValueError(
-            "StaticGaugeHall sigma_H must be three finite real numbers")
+            "StaticGaugeHall frequencies_ry must be a nonempty finite vector")
+    if (sigma_H.shape != (frequencies.size, 3)
+            or not np.all(np.isfinite(sigma_H))):
+        raise ValueError(
+            "StaticGaugeHall sigma_H_frequency must contain three finite "
+            "values per frequency")
     final_path, partial_path = _immutable_partial_paths(
         path, artifact_name="StaticGaugeHall")
     with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
@@ -189,7 +199,8 @@ def write_static_gauge_hall_artifact(
             _text_i32(operator_sha256, encoding="ascii"))
         io.write_attr("band_stop", np.int32(stop))
         io.write_attr("nk_tot", np.int32(nk_tot))
-        io.write_attr("sigma_H_cart", sigma_H)
+        io.write_attr("frequency_ry", frequencies)
+        io.write_attr("sigma_H_cart_frequency", sigma_H)
 
     _publish_completed_partial(
         partial_path, final_path, artifact_name="StaticGaugeHall",
@@ -261,8 +272,11 @@ def load_static_gauge_hall_artifact(
             encoding="ascii")
         stop = int(np.asarray(_read_required_small(io, "band_stop")))
         nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
+        frequencies = np.asarray(
+            _read_required_small(io, "frequency_ry"), dtype=np.complex128)
         sigma_H = np.asarray(
-            _read_required_small(io, "sigma_H_cart"), dtype=np.float64)
+            _read_required_small(io, "sigma_H_cart_frequency"),
+            dtype=np.complex128)
 
     if complete != 1:
         raise ValueError(
@@ -280,15 +294,22 @@ def load_static_gauge_hall_artifact(
     if nk_tot != expected_nk:
         raise ValueError(
             f"StaticGaugeHall nk_tot={nk_tot}, expected {expected_nk}")
-    if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
+    if (frequencies.ndim != 1 or frequencies.size == 0
+            or not np.all(np.isfinite(frequencies))):
         raise ValueError(
-            "StaticGaugeHall sigma_H_cart must contain three finite values")
+            "StaticGaugeHall frequency_ry must be a nonempty finite vector")
+    if (sigma_H.shape != (frequencies.size, 3)
+            or not np.all(np.isfinite(sigma_H))):
+        raise ValueError(
+            "StaticGaugeHall sigma_H_cart_frequency must contain three "
+            "finite values per frequency")
     operator_fingerprint = _require_prefixed_sha256(
         operator_fingerprint,
         field_name="Hall Hamiltonian/config/operator fingerprint")
 
     return _static_gauge_hall_transaction_from_artifact(
-        sigma_H=sigma_H,
+        frequencies_ry=frequencies,
+        sigma_H_frequency=sigma_H,
         hamiltonian_config_operator_fingerprint=operator_fingerprint,
         wfn_fingerprint=artifact_wfn,
         band_start=expected_start,

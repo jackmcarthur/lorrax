@@ -201,10 +201,14 @@ def part_a_residuals(mesh):
     # --- Hall CT: one charge leg (v), one current leg (Gamma) ---------------
     from common.bispinor_init import HALFALPHA
     gamma_raw = HALFALPHA * np.transpose(m.velocity, (1, 0, 2, 3))
-    sigma_H = np.asarray(raw_hall_pseudovector_sharded(
-        gamma_raw, m.energies, m.occupations, mesh=mesh, nb_logical=m.nb,
+    hall_frequencies = np.asarray(
+        [0.0 + 0.0j, 0.0 + 0.7j, 0.0 - 0.7j, 0.0 + 1.3j])
+    sigma_samples = np.asarray(raw_hall_pseudovector_sharded(
+        gamma_raw, m.energies, m.occupations, hall_frequencies,
+        mesh=mesh, nb_logical=m.nb,
         cell_volume=m.cell_volume, nk_tot=m.nk, nspin=m.nspin,
         nspinor_wfn=m.nspinor))
+    sigma_H = sigma_samples[0].real
     gamma_dir = np.transpose(gamma_raw, (1, 0, 2, 3))     # (3,nk,nb,nb)
     chi_0i = adler_wiser_chi(
         D_jet[:2], gamma_dir, m.energies, m.occupations,
@@ -216,6 +220,51 @@ def part_a_residuals(mesh):
     out["hall_TC_is_CT_dagger"] = (
         _rel(np.asarray(static_hall_linear_response(sigma_H))[:, 1:, 0],
              np.conj(CT_code)), None)
+
+    basis = np.eye(3)
+    epsilon = np.asarray([
+        [[np.dot(basis[b], np.cross(basis[a], basis[i]))
+          for i in range(3)] for a in range(3)] for b in range(3)])
+    sigma_reference = []
+    for z in hall_frequencies:
+        chi_dynamic = adler_wiser_chi(
+            D_jet, gamma_dir, m.energies, m.occupations,
+            cell_volume=m.cell_volume, nk_tot=m.nk, nspin=m.nspin,
+            nspinor=m.nspinor, z=z)
+        sigma_reference.append(
+            0.5j * np.einsum("bai,ai->b", epsilon, chi_dynamic))
+    sigma_reference = np.asarray(sigma_reference)
+    out["hall_dynamic_kubo"] = (
+        _rel(sigma_samples, sigma_reference), sigma_reference)
+    out["hall_dynamic_kubo_flipped"] = (
+        _rel(sigma_samples, -sigma_reference), None)
+    out["hall_dynamic_even"] = (
+        _rel(sigma_samples[1], sigma_samples[2]), None)
+    out["hall_dynamic_imag_axis_reality"] = (
+        float(np.max(np.abs(sigma_samples.imag))), None)
+
+    sigma_reversed = np.asarray(raw_hall_pseudovector_sharded(
+        np.conj(gamma_raw), m.energies, m.occupations, hall_frequencies,
+        mesh=mesh, nb_logical=m.nb, cell_volume=m.cell_volume,
+        nk_tot=m.nk, nspin=m.nspin, nspinor_wfn=m.nspinor))
+    out["hall_dynamic_magnetisation_odd"] = (
+        _rel(sigma_reversed, -sigma_samples), None)
+    gamma_trs = np.concatenate((gamma_raw, -np.conj(gamma_raw)), axis=0)
+    energies_trs = np.concatenate((m.energies, m.energies), axis=0)
+    occupations_trs = np.concatenate(
+        (m.occupations, m.occupations), axis=0)
+    sigma_trs = np.asarray(raw_hall_pseudovector_sharded(
+        gamma_trs, energies_trs, occupations_trs, hall_frequencies,
+        mesh=mesh, nb_logical=m.nb, cell_volume=m.cell_volume,
+        nk_tot=2 * m.nk, nspin=m.nspin, nspinor_wfn=m.nspinor))
+    out["hall_dynamic_trs_twin"] = (
+        float(np.max(np.abs(sigma_trs))), None)
+    out["hall_static_frozen_bits"] = (
+        0.0 if sigma_samples[0].real.tobytes().hex()
+        == "358bf00049d5823ff158d907361e8f3fec79838d1a3296bf"
+        else 1.0,
+        None,
+    )
     return out
 
 
@@ -565,12 +614,17 @@ _TOL = 2.0e-10
 def test_part_a_definitions_share_one_convention():
     out = part_a_residuals(_mesh(1))
     for key in ("S00", "wing_Y", "wing_Z", "hall_CT_imag",
-                "hall_TC_is_CT_dagger", "wing_reciprocity"):
+                "hall_TC_is_CT_dagger", "wing_reciprocity",
+                "hall_dynamic_kubo", "hall_dynamic_even",
+                "hall_dynamic_imag_axis_reality",
+                "hall_dynamic_magnetisation_odd",
+                "hall_dynamic_trs_twin",
+                "hall_static_frozen_bits"):
         assert out[key][0] < 1.0e-12, (key, out[key][0])
     # Negative controls: each sign is observable, so none of these agreements
     # is a tautology of the reference's own spelling.
     for key in ("S00_flipped", "wing_Y_flipped", "wing_Z_flipped",
-                "hall_CT_imag_flipped"):
+                "hall_CT_imag_flipped", "hall_dynamic_kubo_flipped"):
         assert out[key][0] > 1.0e-3, (key, out[key][0])
 
 
