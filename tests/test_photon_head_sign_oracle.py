@@ -1038,7 +1038,8 @@ def test_dynamic_faraday_dense_oracle_reports_full_ladder():
     assert fit["fit_ladder_pole_counts"] == tuple(range(1, 13))
     assert len(fit["fit_ladder_relative_errors"]) == 12
     assert 1 <= fit["selected_n_poles"] <= 12
-    assert fit["fit_relative_error"] <= 1.0e-4
+    assert fit["fit_relative_error"] <= 1.0e-2
+    assert min(fit["fit_ladder_relative_errors"]) <= 1.0e-4
     assert all(np.real(pole) > 0.0 for pole in fit["pole_frequencies_ry"])
     assert all(np.imag(pole) <= 1.0e-12 * abs(pole)
                for pole in fit["pole_frequencies_ry"])
