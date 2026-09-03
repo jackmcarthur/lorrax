@@ -55,7 +55,6 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `screening.py` | Plans and executes screening calculations. |
 | `screening_bse.py` | Exposes screening helpers shared with BSE consumers. |
 | `sigma_dispatch.py` | Dispatches one self-energy call per resolved compute mode. |
-| `sigma_x_bispinor.py` | Implements bare-current exchange routes for spinor inputs. |
 | `static_gauge_response.py` | Builds packed static-gauge response inputs. |
 | `v_q_bispinor.py` | Builds the packed bare-current interaction operator. |
 | `v_q_g_flat.py` | Builds Coulomb matrices from flattened reciprocal-space data. |

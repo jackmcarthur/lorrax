@@ -1041,11 +1041,11 @@ def compute_sigma_xc(
         # Bare-family x_only is exactly scalar charge X plus the packed
         # consumer's current X blocks.  W_packed equals V_packed on this
         # route, so no screened channel or correlation is admitted and the
-        # incumbent separate Sigma-B fold must stay off.
+        # no second Sigma-B fold exists.
         if photon_response is None:
             raise RuntimeError(
                 "packed x_only reached Sigma without the packed photon "
-                "response; refusing the incumbent Sigma-B fallback")
+            "response; refusing a charge-only fallback")
         from .cohsex_sigma import _resolve_Gij
         photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
         sig_x = compute_sigma_x(
@@ -1124,9 +1124,8 @@ def compute_sigma_xc(
         #
         # In the BARE family (chi_TT = chi_CT = 0) the second bracket is
         # SX(D_TT) = X(D_TT) = Sigma^B with COH(D_TT - D_TT) = 0 and CT/TC
-        # identically zero -- i.e. exactly what gw.sigma_x_bispinor returned
-        # and what compute_sigma_x folded into sig_x on the incumbent route,
-        # plus the TT/CT Gamma cell the packed completion carries.
+        # identically zero.  The packed completion also carries the TT/CT
+        # Gamma cell.
         # reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md section 1.
         if photon_response is None:
             raise RuntimeError(
@@ -1143,11 +1142,9 @@ def compute_sigma_xc(
                 "claim the SX/COH columns.")
         from .cohsex_sigma import _resolve_Gij
         photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
-        # CHARGE CHANNEL: the ordinary scalar bare-exchange owner, with the
-        # incumbent Sigma^B arms EXPLICITLY OFF.  The transverse exchange is
-        # the packed consumer's TT block below; letting compute_sigma_x add
-        # it as well is precisely the double count this route exists to
-        # remove.  ``static_head_terms`` is the scalar band-diagonal q->0
+        # CHARGE CHANNEL: the ordinary scalar bare-exchange owner.  The
+        # transverse exchange is owned only by the packed consumer's TT
+        # block below.  ``static_head_terms`` is the scalar band-diagonal q->0
         # bare-X head, i.e. the CC head, and it stays the scalar owner's --
         # the packed completion supplies only the TT/CT Gamma cell here.
         sig_x = compute_sigma_x(
@@ -1181,9 +1178,8 @@ def compute_sigma_xc(
         # Sigma contribution, so adding the current sector to sig_x and
         # adding it to Sigma_c(w) produce the SAME Sigma_xc
         # (qsgw_utils.build_qsgw_sigma_xc forms sig_x + Sigma_c(E)).  It
-        # goes into sig_x, the seam the incumbent route used for Sigma^B, so
-        # the bare family's sigX column is unchanged from that route and the
-        # A/B against it is like for like.  In the SCREENED family the same
+        # goes into sig_x, which is the w-independent bookkeeping seam.  In
+        # the SCREENED family the same
         # column then also carries the current blocks' static CORRELATION,
         # which is O(alpha_FS^2) and is printed here rather than left
         # invisible.

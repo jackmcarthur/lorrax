@@ -106,7 +106,7 @@ synthetic data (`test_symmetry_unfold`), loader/IO contracts
 kernel identities vs independent references (`test_wfn_transforms`,
 `test_zq_from_psi_sm_bit_identity` — z_q streaming + PsiGStore slicer,
 `test_compute_all_V_q_g_flat` — incl. per-q Coulomb sphere,
-`test_compute_V_q_bispinor_g_flat`, `test_sigma_x_bispinor`), head-fit
+`test_compute_V_q_bispinor_g_flat`, `test_bispinor_route_exhaustive`), head-fit
 sign regressions (`test_head_correction`), PPM window freeze
 (`test_sigma_ppm_gates` G2), planner floors (`test_band_chunk_size_floor`),
 QSGW band partition (`test_band_partition`), restart pad roundtrip

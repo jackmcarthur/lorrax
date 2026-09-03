@@ -1,7 +1,7 @@
 """Every supported bispinor deck class has the packed photon owner.
 
 This is the executable capability ruling for retiring the former
-``sigma_x_bispinor`` route.  The parse-time grid and the later
+retired direct-tile route.  The parse-time grid and the later
 screened-restart door are tested separately from the measured-TRS Hall door:
 TRS is a property of the loaded WFN, not a deck key.
 """
@@ -166,7 +166,13 @@ def test_the_sigma_dispatch_has_no_nonpacked_bispinor_fallback():
 
     assert "bispinor_v_q_path" not in dispatch_signature.parameters
     assert "bispinor_v_q_path" not in dispatch_source
-    assert "return_transverse" not in dispatch_source
+    assert tuple(dispatch_signature.parameters) == (
+        "mode", "wfns", "V_q", "W_by_role", "e_qp_ev",
+        "static_head_terms", "head_resolver", "quad", "config", "meta",
+        "mesh_xy", "sym", "wfn", "band_slices", "input_dir", "Gij",
+        "wfns_transverse", "photon_response", "write_sigma_omega_h5",
+        "hartree_basis_rotation", "omit_v_h", "iteration_head",
+        "occupation_state", "material_class", "print_fn")
     for signature in (cohsex_signature, exchange_signature):
         assert "wfns_transverse" not in signature.parameters
         assert "bispinor_v_q_path" not in signature.parameters

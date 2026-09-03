@@ -750,12 +750,12 @@ def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Heads are always on: the incumbent route must say what it did, and
+# Heads are always on: the packed route must say what it did, and
 # `restart` must not swap the head mechanism behind the deck's back
 # (owner ruling 2026-09-01 / TASTE.md row 20; lane J section 3)
 # ---------------------------------------------------------------------------
 
-_INCUMBENT_DECK = (
+_BISPINOR_DECK = (
     "[cohsex]\n"
     "nval = 2\n"
     "ncond = 2\n"
@@ -771,23 +771,23 @@ _INCUMBENT_DECK = (
 def test_bulk_head_off_takes_the_packed_debug_route(
         tmp_path):
     config = _parse(tmp_path,
-                    _INCUMBENT_DECK + "head_correction = off\n")
+                    _BISPINOR_DECK + "head_correction = off\n")
     assert uses_static_photon_response(config)
     assert not uses_coupled_photon_head(config)
 
 
 def test_bulk_head_full_takes_the_packed_completion(tmp_path):
-    config = _parse(tmp_path, _INCUMBENT_DECK)
+    config = _parse(tmp_path, _BISPINOR_DECK)
     assert uses_static_photon_response(config)
     assert uses_coupled_photon_head(config)
 
 
-def test_the_driver_prints_the_incumbent_head_record(tmp_path):
-    """The one owner is gw_config; gw_jax must not grow a second copy."""
+def test_the_driver_prints_the_packed_head_record(tmp_path):
+    """The driver formats the response-owned packed-head record."""
     import inspect
     from gw import gw_jax
     src = inspect.getsource(gw_jax.main)
-    assert "incumbent_bispinor_head_record(config)" in src
+    assert "format_photon_head_run_record(photon_response)" in src
     assert "Photon head    : " in src
 
 
@@ -802,7 +802,7 @@ def test_the_driver_replays_config_provenance_into_the_production_report():
 
 def test_restart_keeps_the_packed_head_route_on_a_slab_cohsex_deck(tmp_path):
     """restart changes the input source, never the selected head mechanism."""
-    deck = (_INCUMBENT_DECK
+    deck = (_BISPINOR_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
             .replace("restart = false", "restart = true"))
     config = _parse(tmp_path, deck)
@@ -813,7 +813,7 @@ def test_restart_keeps_the_packed_head_route_on_a_slab_cohsex_deck(tmp_path):
 def test_an_unnamed_restart_uses_the_fresh_physics_default(tmp_path):
     """The global default is fresh physics and its provenance is visible."""
     lines = []
-    deck = (_INCUMBENT_DECK
+    deck = (_BISPINOR_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
             .replace("restart = false\n", ""))
     path = tmp_path / "unnamed_restart.in"
@@ -828,7 +828,7 @@ def test_an_unnamed_restart_uses_the_fresh_physics_default(tmp_path):
 
 
 def test_a_scalar_deck_gets_the_same_fresh_restart_default(tmp_path):
-    deck = (_INCUMBENT_DECK
+    deck = (_BISPINOR_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
             .replace("bispinor = true\n", "")
             .replace("bispinor_gw = bare_transverse\n", "")
@@ -846,7 +846,7 @@ def test_a_scalar_deck_gets_the_same_fresh_restart_default(tmp_path):
 def test_a_bulk_bispinor_restart_keeps_the_packed_head_route(tmp_path):
     """Restart changes the input source, not the dimension-general route."""
     config = _parse(tmp_path,
-                    _INCUMBENT_DECK.replace("restart = false",
+                    _BISPINOR_DECK.replace("restart = false",
                                             "restart = true"))
     assert config.restart is True
     assert uses_static_photon_response(config)

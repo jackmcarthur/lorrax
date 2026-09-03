@@ -1,8 +1,7 @@
-"""Real 4-rank CUDA gate: bispinor Σ^B transverse-vertex insertion —
+"""Real 4-rank CUDA gate: packed bispinor current-vertex insertion —
 ``gw.wavefunction_bundle.with_lorentz_vertices`` — against an independent
-4x4-γ̃-matmul NumPy reference, AND legacy-vs-face parity through the exact
-kernel chain ``gw.sigma_x_bispinor.compute_sigma_x_bispinor`` uses
-(``gw.cohsex_sigma._make_cohsex_kernels``'s layout-dispatched ``sigma_sx``).
+4x4-γ̃-matmul NumPy reference, plus the packed photon contraction against
+an independent legacy-layout charge-kernel oracle.
 
 Guide: reports/gwjax_low_mem_bands_audit_2026-08-22/report.md, census row
 "Bispinor transverse exchange" — this file is the "transverse-exchange
@@ -31,13 +30,10 @@ Checks:
      not the perm/phase gather this function itself uses — a genuinely
      different mechanism for the same claim (the module's own docstring:
      "Replaces a 4x4 matmul ... with a gather + multiply").
-  2. The full ``sigma_sx`` chain (``build_G`` -> FFT convolve -> band
-     projection) as ``compute_sigma_x_bispinor`` actually calls it via
-     ``_make_cohsex_kernels``, legacy vs face, on the SAME vertex-
-     inserted ψ and the SAME (Hermitian, physical) V tile — this is
-     ``compute_sigma_x_bispinor``'s own per-tile mechanism, minus the
-     HDF5 reader / 9-tile Python loop (pure orchestration, not new
-     physics).  The same fixture also checks that the packed-photon block
+  2. The packed photon block's full ``build_G`` -> FFT convolve -> band
+     projection chain against the legacy-layout charge kernel as an
+     independent oracle on the SAME ψ and Hermitian V tile.  The fixture
+     checks that the packed-photon block
      kernel's dynamic X/SX selector reproduces V and 2V algebra through
      one compiled executable, and that its full-photon caller can request
      Hartree without running the historical bare-X path.  ``mu_L == 0``
@@ -189,11 +185,10 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
 
 
 # ---------------------------------------------------------------------------
-# 2. Full sigma_sx chain (build_G -> convolve -> project), legacy vs face,
-#    exactly compute_sigma_x_bispinor's own per-tile mechanism.
+# 2. Packed photon chain against an independent legacy-layout oracle.
 # ---------------------------------------------------------------------------
 
-def check_sigma_sx_chain_face_matches_legacy(
+def check_packed_photon_chain_matches_legacy_oracle(
         mesh, dtype="complex128", *, mu_L, nu_L, ns=4, mu=8, nb_full=8,
         nb_sigma=5, nk=2):
     from gw.cohsex_sigma import _make_cohsex_kernels
@@ -240,43 +235,12 @@ def check_sigma_sx_chain_face_matches_legacy(
     Gij_legacy = _put(Gij_np, mesh, (None, None, None))
     Gij_face = _put(Gij_np, mesh, (None, None, None))
     V_q_legacy = _put(V_q_np, mesh, (None, None, None))
-    V_q_face = _put(V_q_np, mesh, (None, None, None))
 
     sigma_sx_legacy, _ = _make_cohsex_kernels(mesh, kgrid, nk,
                                               layout="legacy")
-    sigma_sx_face, _ = _make_cohsex_kernels(
-        mesh, kgrid, nk, layout="face",
-        face_shape=(nk, nb_full, mu, ns))
 
     wfns_legacy_v = with_lorentz_vertices(wfns_legacy, mu_L, nu_L)
-    wfns_face_v = with_lorentz_vertices(wfns_face, mu_L, nu_L)
-
-    # Legacy: with_lorentz_vertices only ever touches psi_xn/psi_yr (the
-    # G-build's two fields), leaving psi_xr/psi_yn (the projection's own
-    # two fields) untouched — so the single-argument call already keeps
-    # the outer projection bra/ket un-rotated, exactly what the physics
-    # requires (module docstring of gw.sigma_x_bispinor).
     got_legacy = _gather(sigma_sx_legacy(wfns_legacy_v, Gij_legacy, V_q_legacy))
-    # Face: the two-array carrier serves BOTH roles, so the vertex-
-    # inserted bundle must be threaded through ONLY as wfns_g (the
-    # G-build operand); wfns_face itself (untouched) supplies the
-    # projection's bra/ket.  See _make_cohsex_kernels_face's own
-    # sigma_sx docstring for the derivation and the O(1) discrepancy
-    # this parameter exists to fix (found by an earlier version of THIS
-    # gate, before wfns_g existed).
-    got_face_full = _gather(sigma_sx_face(wfns_face, Gij_face, V_q_face,
-                                          wfns_g=wfns_face_v))
-    # Mirrors compute_sigma_x_bispinor's OWN gather-then-window step for
-    # layout='face' (its return contract: (nk, nb_sigma, nb_sigma) in
-    # EITHER layout).
-    got_face = got_face_full[:, :nb_sigma, :nb_sigma]
-
-    assert got_legacy.shape == got_face.shape, (
-        f"shape mismatch: legacy={got_legacy.shape} face={got_face.shape}")
-    r = _rel(got_face, got_legacy)
-    assert r < RTOL, (
-        f"sigma_sx chain face-vs-legacy rel err {r:.3e} "
-        f"(mu_L={mu_L}, nu_L={nu_L})")
 
     # The coupled photon path must evaluate X[V_packed] and SX[W_packed]
     # through the same Green/convolution/projector graph and one compiled
@@ -296,8 +260,10 @@ def check_sigma_sx_chain_face_matches_legacy(
         wfns_face, wfns_face, left_g, right_g, Gij_face,
         W_q_packed, V_q_packed, np.asarray(_TERM_SX, dtype=np.int32))
     photon_sx.block_until_ready()
-    r_photon_x = _rel(_gather(photon_x), got_face_full)
-    r_photon_sx = _rel(_gather(photon_sx), 2.0 * got_face_full)
+    photon_x_window = _gather(photon_x)[:, :nb_sigma, :nb_sigma]
+    photon_sx_window = _gather(photon_sx)[:, :nb_sigma, :nb_sigma]
+    r_photon_x = _rel(photon_x_window, got_legacy)
+    r_photon_sx = _rel(photon_sx_window, 2.0 * got_legacy)
     assert r_photon_x < RTOL, (
         f"photon X[V] rel err {r_photon_x:.3e} "
         f"(mu_L={mu_L}, nu_L={nu_L})")
@@ -310,9 +276,8 @@ def check_sigma_sx_chain_face_matches_legacy(
         f"cache_size={cache_size}")
 
     return {
-        "face_vs_legacy": r,
-        "photon_x_vs_v": r_photon_x,
-        "photon_sx_vs_2v": r_photon_sx,
+        "photon_x_vs_legacy_v": r_photon_x,
+        "photon_sx_vs_legacy_2v": r_photon_sx,
         "photon_kernel_cache_size": cache_size,
         "skipped_x_max_abs": max_skipped_x,
     }
@@ -452,9 +417,9 @@ _CLI_CELLS = (
       (lambda mesh, dt, mu_L=mu_L, nu_L=nu_L:
        check_vertex_build_g(mesh, dt, mu_L=mu_L, nu_L=nu_L)))
      for (mu_L, nu_L) in _LORENTZ_PAIRS]
-    + [(f"sigma_sx_chain_{mu_L}{nu_L}",
+    + [(f"packed_photon_chain_{mu_L}{nu_L}",
         (lambda mesh, dt, mu_L=mu_L, nu_L=nu_L:
-         check_sigma_sx_chain_face_matches_legacy(
+         check_packed_photon_chain_matches_legacy_oracle(
              mesh, dt, mu_L=mu_L, nu_L=nu_L)))
        for (mu_L, nu_L) in _LORENTZ_PAIRS]
     + [("four_current_ordered_pair_all16",

@@ -2207,7 +2207,7 @@ def compute_static_photon_response(
     execute a hidden charge fold.  The provider selects the exact slab polygon
     or bulk polyhedron receipt from ``config.sys_dim``; the completion algebra
     remains one dimension-general owner.  A nonzero Hall artifact is refused
-    on the static bare route.  Dynamic packed GN keeps the incumbent current
+    on the static bare route.  Dynamic packed GN keeps the resident current
     body (``V_CURRENT`` on the bare route, screened current on the full route)
     as its Hall-off resident body, calls the same dimension-general moment
     owner at ``0`` and ``i*omega_p``, and retains only analytic CT/TC
@@ -2221,10 +2221,8 @@ def compute_static_photon_response(
     MEMORY.  ``V_packed`` is ``(nq, N_packed, N_packed)`` complex128 at
     ``P(None,'x','y')`` with ``N_packed = n_C + 3 n_T``, i.e.
     ``16 nq N_packed^2 / P`` bytes per rank.  Charge-present layouts retain
-    an equal-sized W; absent-charge dynamic layouts do not.  The bare route's
-    incumbent predecessor held one TT tile at a time instead, so this IS a
-    new resident carrier for that route (it is the same object the screened
-    mode already holds).  The figure is printed at this site below; the
+    an equal-sized W; absent-charge dynamic layouts do not.  The figure is
+    printed at this site below; the
     per-block streaming inside ``gw.photon_sigma`` is unchanged.
 
     ``print_fn`` is the driver's rank-zero printer.  In production mode the
@@ -2295,7 +2293,7 @@ def compute_static_photon_response(
         if not dynamic_current_only and W_charge is None:
             raise ValueError(
                 "the packed bare-transverse route requires its charge-block "
-                "operator: incumbent scalar W(omega=0) for a screened mode, "
+                "operator: scalar W(omega=0) for a screened mode, "
                 "or V for x_only; refusing to invent it here")
     elif photon_mode is not BispinorGWMode.FULL_STATIC_COHSEX:
         raise ValueError(
@@ -2418,7 +2416,7 @@ def compute_static_photon_response(
         # chi_TT = chi_CT = 0 makes the packed Dyson equation block diagonal:
         #     W_packed = diag((1 - D_00 chi_00)^-1 D_00, D_TT),  W_CT = 0.
         # Neither the twelve current blocks of chi nor the (n_C + 3 n_T)^2
-        # solve is built.  The CC block was solved by the incumbent scalar
+        # solve is built.  The CC block was solved by the scalar charge
         # owner at n_C; the rest of W is V, block for block, through the sole
         # packer -- one local write per block, no gather.
         # The screened branch checks this inside
@@ -2437,7 +2435,7 @@ def compute_static_photon_response(
         expected_cc = layout.block_shape(int(meta.nk_tot), 0, 0)
         if tuple(W_cc.shape) != expected_cc:
             raise ValueError(
-                "the packed bare-transverse route needs the incumbent scalar "
+                "the packed bare-transverse route needs the scalar charge "
                 f"W on the CC block: expected {expected_cc} from the photon "
                 f"layout, got {tuple(W_cc.shape)}.  The charge centroid "
                 "padding of the scalar and packed paths must agree.")

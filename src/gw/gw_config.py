@@ -3382,8 +3382,8 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         # closed.  Both halves the previous session's comment named as
         # missing are now ported and gated:
         #
-        # * Sigma^B/vertex insertion (sigma_x_bispinor.py's G-build side)
-        #   — gw.wavefunction_bundle.with_lorentz_vertices, a
+        # * current-vertex insertion —
+        #   gw.wavefunction_bundle.with_lorentz_vertices, a
         #   representation-aware bundle operation folding γ̃ into whichever
         #   pair of fields plays the G-build's direct/conjugated role
         #   (psi_xn/psi_yr legacy, psi_mun/psi_nmu face) — landed
@@ -5823,8 +5823,8 @@ class LorraxConfig:
         # ONE derivation site for every packed route.  Applicability and the
         # derived-key names come from ``packed_static_envelope``; this code
         # knows only how to set a named field.  Explicit conflicts survive
-        # and are refused (screened mode) or select the incumbent route
-        # (bare mode), never overwritten.
+        # and are refused by the single packed-route validator, never
+        # overwritten.
         _packed_candidate = (
             bool(resolved.bispinor)
             and (resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX

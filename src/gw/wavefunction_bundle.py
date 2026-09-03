@@ -649,12 +649,9 @@ def attach_parent_green_carrier(
 
 
 # ---------------------------------------------------------------------------
-# Bispinor Σ^B: γ̃ vertex insertion — representation-aware, bundle-owned
-# (census row "Bispinor transverse exchange",
-# reports/gwjax_low_mem_bands_audit_2026-08-22/report.md).  Both
-# consumers below used to live in gw.sigma_x_bispinor, hard-coded to the
-# legacy field names; moved here so a caller gets the right field for
-# WHICHEVER layout its bundle carries, without re-deriving the mapping.
+# Bispinor current vertices — representation-aware and bundle-owned.
+# The packed photon response and self-energy both consume this operation,
+# so the field/axis mapping lives with the carrier rather than either stage.
 # ---------------------------------------------------------------------------
 
 #: ``layout -> (direct_field, direct_spin_axis, conj_field, conj_spin_axis)``
@@ -674,33 +671,28 @@ _G_VERTEX_FIELDS: dict[str, tuple[str, int, str, int]] = {
 def with_lorentz_vertices(
     wfns: "Wavefunctions", mu_L: int, nu_L: int,
 ) -> "Wavefunctions":
-    """γ̃^{mu_L} folded into the G-build's LEFT (direct-μ) vertex operand,
-    γ̃^{nu_L} into its RIGHT (conjugated-internally) operand — the
-    bispinor Σ^B transverse-exchange trick (``gw.sigma_x_bispinor``'s
-    module docstring has the physics derivation; γ̃^0 = I_4 is the charge
-    channel, ``mu_L = nu_L = 0`` reproduces today's scalar Σ_X path
-    byte-identically — see below).
+    """Fold γ̃ vertices into the Green-build operands of a current block.
+
+    γ̃^{mu_L} acts on the LEFT (direct-μ) operand and γ̃^{nu_L} on the
+    RIGHT operand (conjugated internally).  γ̃^0 = I_4 is the charge
+    channel, so ``mu_L = nu_L = 0`` reproduces the scalar path exactly.
 
     REPRESENTATION-AWARE: which FIELD carries the G-build's direct/
     conjugated role is a LAYOUT fact, read from :data:`_G_VERTEX_FIELDS`
     rather than hard-coded per caller.  ``layout='legacy'`` folds into
     ``psi_xn``/``psi_yr`` (:func:`greens_function_kernel._legacy_build_G`'s
     two operands); ``layout='face'`` folds into ``psi_mun``/``psi_nmu``
-    (:func:`greens_function_kernel._face_build_G`'s — the SAME argument
-    slots, direct-then-conjugated, under the two-face carrier's own field
-    names).  This is what lets ``gw.sigma_x_bispinor.compute_sigma_x_bispinor``
-    call this ONE function regardless of which layout its
-    ``wfns_transverse`` bundle carries, rather than special-casing face
-    the way the pre-2026-08-23 version hard-coded legacy.
+    (:func:`greens_function_kernel._face_build_G`'s corresponding argument
+    slots).  The packed photon kernels therefore use one operation for
+    every carrier layout.
 
     Only the two G-vertex operands move.  The PROJECTION operand pair
     (``psi_xr``/``psi_yn`` under legacy, ``psi_nmu``/``psi_mun`` again
     under face — see :func:`project`'s own argument-slot docstring)
     passes through UNCHANGED: the γ̃ vertex sits on the G-build side of
-    the kernel chain, not the projection side (physics: ``gw.
-    sigma_x_bispinor``'s module docstring).  A caller that projects
-    through this SAME bundle (as ``sigma_sx`` does) therefore inserts the
-    vertex exactly once, at the G-build seam, never at both seams.
+    the kernel chain, not the projection side.  Packed photon kernels pass
+    the vertex-bearing Green operands separately from the unmodified
+    projection operands, inserting each vertex exactly once.
 
     ``mu_L == 0`` / ``nu_L == 0`` SKIP that field's ``gamma_apply`` call
     entirely rather than applying an identity permutation — so
@@ -749,9 +741,8 @@ def padded_centroid_extent(wfns: "Wavefunctions") -> int:
     ``psi_yr``'s trailing axis under ``'legacy'``, ``psi_mun``'s μ axis
     (index 2) under ``'face'`` — the SAME logical quantity
     (``load_centroids_band_chunked``'s mesh-padded ``n_rmu``), carried by a
-    different field per layout.  The ONE owner of that read: the packed
-    photon response, the sixteen-block photon Σ and the bare Σ^B all pad
-    their on-disk V tiles up to this extent and must agree on it.
+    different field per layout.  The packed photon response and its
+    sixteen-block self-energy both pad on-disk V tiles to this extent.
     """
     if wfns.layout == "legacy":
         return int(wfns.psi_yr.shape[-1])
@@ -777,9 +768,9 @@ def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
     energy/occupation tables follow the established convention and are not
     part of this ψ inventory.
 
-    Named consumer: the bispinor Σ^B transverse-centroid bundle DOUBLES
-    whichever psi inventory a run already carries — a second, independent
-    :class:`Wavefunctions` on a different (usually smaller) centroid set.
+    Named consumer: the packed bispinor current path carries a second,
+    independent transverse :class:`Wavefunctions` bundle on a different
+    (usually smaller) centroid set.
     This module's own docstring states the closed form
     (``2·S/Px + 2·S/Py`` legacy, ``2·S/(Px·Py)`` face) but
     ``gw.gflat_memory_model`` never prices it — that planner's own scope
@@ -788,8 +779,8 @@ def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
     :func:`build_wavefunction_bundle`/:func:`build_wavefunctions_face`
     produces.  Measuring the REAL bundle here, after construction, is
     simpler and strictly more trustworthy than adding a second, parallel
-    model of the same number; see ``gw.sigma_x_bispinor``'s disclosure
-    print for the call site.
+    model of the same number; the driver prints this measurement after
+    constructing the bundle.
     """
     out: dict = {}
     for f in psi_field_names(wfns.layout):

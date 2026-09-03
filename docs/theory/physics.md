@@ -252,8 +252,8 @@ I/O; no rank should materialize an \(N_\mu^2\) matrix merely to write or fit it.
 ## 9. Present validity boundary
 
 The mature static, PPM, and insulating MPA modes support their documented
-driver contracts. MPA remains on the incumbent four-current Sigma route and
-its contour completion does not preserve the magnetic odd residue. Metallic
+driver contracts. Bispinor MPA uses the packed current owner, and its ordered
+contour completion preserves the magnetic odd residue. Metallic
 sample geometries exist, but
 fractional occupations, intraband response, and denominator cells that
 straddle zero still require explicit physics. A code path that lacks those

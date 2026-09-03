@@ -787,8 +787,9 @@ The move was scoped anyway and **not taken**. Two reasons, in order:
    derived in memory at the shared V projection seam and are not a second
    persisted dataset. Then unfold **and then** mix inside
    `BispinorVqReader.get_tile`, where the full-BZ q extent is hard-coded into
-   the requested slab shape at `:529`/`:538`, threading `sym` through
-   `compute_sigma_x_bispinor` → `cohsex_sigma.py:371`/`:450` → `gw_jax`.
+   the requested slab shape. The packed response builder already receives
+   `sym` from `gw_jax`; any future compressed-storage reader must reuse that
+   seam rather than introduce a second contraction path.
 
 2. **The gate that would guard it is blind on the only deck that can run it.**
    Moving storage promotes `mix_channels_by_proper_rotation` from a write-time

@@ -577,8 +577,8 @@ class BispinorVqReader:
         ``gw.v_q_g_flat._compute_V_q_g_flat_one_tile`` (its ``_pad``
         helper, which also pads to ``p_x*p_y``) and matches the
         ψ-side μ extent built by ``load_centroids_band_chunked`` — so a
-        single pad here makes Σ^B's V tile broadcast against ψ with no
-        further padding step in sigma_x_bispinor.
+        a single pad here makes each packed current tile broadcast against ψ
+        without further padding.
 
         Padding to ``gx*gy`` (rather than per-axis ``gx``/``gy``) is also
         what makes sharded reads with spec P(None,'x','y') divide
@@ -597,8 +597,8 @@ class BispinorVqReader:
         n_R_padded) c128.  When n_L/n_R aren't divisible by the mesh axis
         size, the trailing μ rows are zero-padded — mirrors the write-side
         μ padding in ``gw.v_q_g_flat._compute_V_q_g_flat_one_tile`` and
-        lets Σ^B run at any process count without a runtime divisibility
-        error."""
+        lets the packed current contraction run at any process count without
+        a runtime divisibility error."""
         if not (0 <= mu_L <= 3 and 0 <= nu_L <= 3):
             raise ValueError(f"Lorentz indices must be in {{0..3}}; got "
                              f"({mu_L}, {nu_L}).")

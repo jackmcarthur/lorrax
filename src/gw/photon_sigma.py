@@ -376,7 +376,7 @@ def compute_ppm_faraday_head_sigma_omega(
     r"""Contract an even one-pole CT/TC Gamma head on the Sigma grid.
 
     The interaction remains two rank-four factor families until one CT or TC
-    Lorentz block is streamed into the incumbent q=0 convolution.  Pole
+    Lorentz block is streamed into the shared q=0 convolution.  Pole
     denominators weight the intermediate bands inside a ``lax.map``; there is
     no pairwise stage, frequency quadrature, or probe-frequency packed body.
     """
