@@ -79,6 +79,73 @@ def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy, material_class):
     return plan
 
 
+def validate_reused_mpa_fit(
+    fit_path, *, config, live_plan, sym, centroid_indices, meta, mesh_xy,
+    occupation_state, material_class, print_fn=print,
+):
+    """Certify an explicit read-only one-shot MPA fit against this run.
+
+    This is the production reuse seam.  It validates the finalized store,
+    diagram provenance, current q wedge and centroid identity, exact sampling
+    grid, pole count, ordered-residue convention, and metallic occupations.
+    No sample or fit inode is opened writable on this path.
+    """
+    path = os.path.abspath(os.fspath(fit_path))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"mpa_fit_reuse_file does not name a file: {path}")
+
+    q_idx, tables, closure_verdict = _q_wedge(
+        sym, centroid_indices, meta)
+    ledger = mpa_store.validate_fit_store(
+        path,
+        expected_identity={
+            "w_table_hash": tables.canonical().digest(),
+            "w_centroid_hash": closure_verdict.centroid_hash,
+        },
+        expected_screening_diagrams=config.screening.diagrams,
+    )
+    expected_ordered = bool(
+        material_class == "insulator" and not bool(sym.trs_allowed))
+    extents = {
+        "n_p": (int(ledger["n_p"]), int(config.mpa.n_poles)),
+        "n_q": (int(ledger["n_q"]), int(q_idx.size)),
+        "n_mu": (int(ledger["n_mu"]), int(meta.n_rmu)),
+        "ordered_residues": (
+            bool(ledger["ordered_residues"]), expected_ordered),
+    }
+    mismatched = {
+        key: values for key, values in extents.items()
+        if values[0] != values[1]
+    }
+    if mismatched:
+        detail = ", ".join(
+            f"{key}: store={got!r}, run={want!r}"
+            for key, (got, want) in mismatched.items())
+        raise ValueError(
+            "MPA certified-fit reuse extent mismatch: " + detail)
+
+    stored_plan = make_mpa_plan_from_fit(
+        config, path, mesh_xy=mesh_xy, material_class=material_class)
+    stored_z = np.asarray(sample_plan.plan_z(stored_plan), np.complex128)
+    live_z = np.asarray(sample_plan.plan_z(live_plan), np.complex128)
+    if stored_z.shape != live_z.shape or not np.array_equal(stored_z, live_z):
+        delta = (float(np.max(np.abs(stored_z - live_z)))
+                 if stored_z.shape == live_z.shape else float("inf"))
+        raise ValueError(
+            "MPA certified-fit reuse frequency mismatch against the live "
+            f"band/quadrature span: stored_shape={stored_z.shape}, "
+            f"live_shape={live_z.shape}, max_abs_delta={delta:.17g}")
+    if material_class == "metal":
+        mpa_store.assert_occupation_stamps(
+            path, occupation_state, where="mpa_fit_reuse_file")
+    print_fn(
+        "  MPA screening reuse: certified finalized fit opened read-only: "
+        f"{path} (n_q={ledger['n_q']}, n_mu={ledger['n_mu']}, "
+        f"n_p={ledger['n_p']})")
+    return path
+
+
 def iteration_artifact_paths(run_dir, label):
     """Return the two disk artifacts owned by one MPA screening map."""
     root = os.path.abspath(os.fspath(run_dir))
@@ -896,6 +963,7 @@ __all__ = [
     "build_mpa_fit",
     "make_mpa_plan",
     "make_mpa_plan_from_fit",
+    "validate_reused_mpa_fit",
     "retain_iteration_artifacts",
     "iteration_artifact_paths",
 ]

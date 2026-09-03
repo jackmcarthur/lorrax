@@ -59,6 +59,66 @@ def test_q_wedge_returns_the_resolution_verdict(monkeypatch):
     assert got is verdict
 
 
+def test_explicit_fit_reuse_asserts_every_cross_run_identity(
+        tmp_path, monkeypatch):
+    fit = tmp_path / "mpa_fit_oneshot.h5"
+    fit.touch()
+    calls = {}
+
+    class _Tables:
+        def canonical(self):
+            return self
+
+        def digest(self):
+            return "table-current"
+
+    monkeypatch.setattr(
+        model, "_q_wedge",
+        lambda *_args: (
+            np.arange(3, dtype=np.int32), _Tables(),
+            SimpleNamespace(centroid_hash="centroids-current")))
+
+    def validate(path, **kwargs):
+        calls["validate"] = (path, kwargs)
+        return {
+            "n_p": 8, "n_q": 3, "n_mu": 5,
+            "ordered_residues": False,
+        }
+
+    monkeypatch.setattr(model.mpa_store, "validate_fit_store", validate)
+    monkeypatch.setattr(
+        model.mpa_store, "assert_occupation_stamps",
+        lambda path, state, **kwargs: calls.setdefault(
+            "occupation", (path, state, kwargs)))
+    live_plan, stored_plan = object(), object()
+    monkeypatch.setattr(
+        model, "make_mpa_plan_from_fit",
+        lambda *_args, **_kwargs: stored_plan)
+    z = np.asarray([2.0e-5j, 1.0 + 0.2j])
+    monkeypatch.setattr(model.sample_plan, "plan_z", lambda _plan: z)
+    occ = object()
+    config = SimpleNamespace(
+        mpa=SimpleNamespace(n_poles=8),
+        screening=SimpleNamespace(diagrams="w_rpa"))
+    meta = SimpleNamespace(n_rmu=5)
+    sym = SimpleNamespace(trs_allowed=True)
+
+    got = model.validate_reused_mpa_fit(
+        fit, config=config, live_plan=live_plan, sym=sym,
+        centroid_indices=None, meta=meta, mesh_xy=None,
+        occupation_state=occ, material_class="metal",
+        print_fn=lambda *_args: None)
+
+    assert got == str(fit.resolve())
+    _, kwargs = calls["validate"]
+    assert kwargs["expected_identity"] == {
+        "w_table_hash": "table-current",
+        "w_centroid_hash": "centroids-current",
+    }
+    assert kwargs["expected_screening_diagrams"] == "w_rpa"
+    assert calls["occupation"][0] == str(fit.resolve())
+
+
 def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):
     V = jnp.asarray(np.stack([np.eye(2), 2 * np.eye(2)]),
                     dtype=jnp.complex128)
