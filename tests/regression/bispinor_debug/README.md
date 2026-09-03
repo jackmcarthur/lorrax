@@ -102,14 +102,13 @@ certify a state nobody has explained.
 `tests/known_failures/2026-09-02-bispinor-gnppm-fixture-runs-again-reference-not-refrozen.md`
 carries the numbers and the one-line re-freeze command for the owner.
 
-**Which route this deck takes, after phase 3.** It stays on the INCUMBENT
-charge-screened + `Σ^B` route. The packed four-current operator now serves
-`compute_mode` in {`cohsex`, `gn_ppm`, `hl_ppm`}, but its Dyson solve has no
-local plan and `distrib_la` refuses `distributed` on a 1×1 mesh, so a 1-GPU
-gate cannot reach it: `packed_bare_transverse_route` requires
-`w_dyson_solver = distributed` and the run record says so. The packed dynamic
-route's own gates are the P=4 MoS2 legs of
-`runs/MoS2/11_bisp_n_dynamic_packed_20260901/`.
+**Which route this deck takes.** With `head_correction = full` and the scalar
+head overrides removed, it takes the packed dynamic route even on a 1×1
+mesh. The bare family has no packed Dyson solve; its scalar charge W uses the
+existing local plan, which is the unnamed default and is printed with
+`[config provenance]`. The frozen reference is deliberately not updated by
+this route-enablement change; the known-failure record above remains the
+owner until the fixture-drift lane resolves and re-freezes it.
 
 ## Files
 
