@@ -8,9 +8,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from common.units import RYD_TO_EV
 from gw.mpa.sigma import _batch_rows
 from gw.ppm_windows import _SigmaBranch
-from gw.sigma_box_plan import plan_sigma_windows
+from gw.sigma_box_plan import (
+    _box_for_window,
+    _sc_padded_box_spec,
+    make_sigma_box_spec,
+    plan_sigma_windows,
+)
 from minimax import UniformRule
 
 
@@ -23,6 +29,17 @@ def _branch(tag="positive conduction", *, space="cond", negative=False):
         space=space, neg_omega_half=negative,
         omega_abs=omega_abs,
         omega_idx=np.arange(omega_abs.size, dtype=np.int64),
+    )
+
+
+def _branch_at(energies, tag="positive conduction"):
+    branch = _branch(tag)
+    return _SigmaBranch(
+        tag=branch.tag,
+        E_A=jnp.asarray([energies], dtype=jnp.float64),
+        base_mask_A=jnp.asarray([[True, True]]),
+        space=branch.space, neg_omega_half=branch.neg_omega_half,
+        omega_abs=branch.omega_abs, omega_idx=branch.omega_idx,
     )
 
 
@@ -155,6 +172,100 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
                                       right.window.nodes.alpha)
     assert first_geometry["window_tau_pairs"] == second_geometry[
         "window_tau_pairs"]
+
+
+def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
+    calls = []
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    session = {}
+    args = dict(
+        eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
+        fixed_rule_session=session,
+        print_fn=lambda *_args, **_kwargs: None)
+    first, first_geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    assert len(calls) == 3
+    calls.clear()
+    second, second_geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.11, 3.01))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    assert calls == []
+    assert second_geometry["sc_fixed_quadrature"]
+    assert not second_geometry["sc_fixed_initialized"]
+    assert second_geometry["sc_fixed_rebuilds"] == []
+    assert all(row["cache_status"] == "sc-fixed-hit"
+               for row in second_geometry["branches"][0]["windows"])
+    first_digests = [
+        row["node_digest"]
+        for row in first_geometry["branches"][0]["windows"]]
+    second_digests = [
+        row["node_digest"]
+        for row in second_geometry["branches"][0]["windows"]]
+    assert first_digests == second_digests
+    for left, right in zip(first, second):
+        np.testing.assert_array_equal(left.window.nodes.t, right.window.nodes.t)
+        np.testing.assert_array_equal(
+            left.window.nodes.alpha, right.window.nodes.alpha)
+    assert first_geometry["sc_fixed_initial_window_tau_pairs"] == 6
+
+
+def test_sc_fixed_session_rebuilds_only_escaped_windows_and_prints_edges(
+        monkeypatch):
+    calls, lines = [], []
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    session = {}
+    args = dict(
+        eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
+        fixed_rule_session=session, print_fn=lines.append)
+    plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    calls.clear()
+    _plan_rows, geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.5))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    assert 0 < len(calls) < 3
+    assert len(calls) == len(geometry["sc_fixed_rebuilds"])
+    assert all("state_tail" in row["name"] or "pole_tail" in row["name"]
+               for row in geometry["sc_fixed_rebuilds"])
+    escape = "\n".join(lines)
+    assert "SC fixed quadrature ESCAPE" in escape
+    assert "current=" in escape and "fixed=" in escape
+    assert "rebuilding this window only" in escape
+
+
+def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
+    eta = 0.1
+    spec = make_sigma_box_spec(
+        name="crossing", frequencies=(-2.0, 2.0), states=(-0.2, 0.2),
+        pole_stats=((1.0, 2.0, 0.5, 1.0),), pole_sign=1.0,
+        eta_ry=eta)
+    assert spec["kind"] == "crossing"
+    padded = _sc_padded_box_spec(spec, eta)
+    expanded_poles = ((0.9, 2.2, 0.45, 1.1),)
+    pole_box, _, _ = _box_for_window(
+        spec["frequencies"], spec["states"], expanded_poles,
+        spec["pole_sign"], eta)
+    expected = (
+        min(spec["box"][0], pole_box[0]) - 2.0 / RYD_TO_EV,
+        max(spec["box"][1], pole_box[1]) + 2.0 / RYD_TO_EV,
+        min(spec["box"][2], pole_box[2]),
+        max(spec["box"][3], pole_box[3]),
+    )
+    np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
+    assert padded["sc_state_pad_ev"] == 2.0
+    assert padded["sc_pole_pad_fraction"] == 0.10
 
 
 def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):

@@ -61,7 +61,8 @@ class BandClasses:
         padding above this edge is not represented in the Hamiltonian.
     occupied_stop
         Global, half-open occupied-band edge.  It is retained as part of the
-        immutable band-class receipt.
+        immutable band-class receipt and identifies the two highest
+        protected conduction bands used for the rigid outer scissor.
     """
 
     band_start: int
@@ -77,10 +78,11 @@ class BandClasses:
             raise ValueError(
                 "BandClasses requires b0 <= occupied_stop <= b3 <= "
                 f"b4_user; got {edges}.")
-        if self.n_protected < 1 and self.n_outer:
+        if self.n_protected_conduction < 2 and self.n_outer:
             raise ValueError(
-                "BandClasses needs at least one protected band to define "
-                "the outer-block boundary correction.")
+                "BandClasses needs at least two protected conduction bands "
+                "to define the outer-block scissor; got "
+                f"{self.n_protected_conduction}.")
 
     @classmethod
     def from_run(cls, band_slices, meta) -> "BandClasses":
@@ -107,6 +109,15 @@ class BandClasses:
     @property
     def occupied_stop_local(self) -> int:
         return int(self.occupied_stop - self.band_start)
+
+    @property
+    def n_protected_conduction(self) -> int:
+        return int(self.protected_stop - self.occupied_stop)
+
+    @property
+    def scissor_bands_local(self) -> slice:
+        """The two highest protected conduction indices, half open."""
+        return slice(self.n_protected - 2, self.n_protected)
 
 
 def _validate_uniform_grid(omega_ev: np.ndarray) -> np.ndarray:
@@ -366,7 +377,7 @@ def effective_sigma(
     This computes the operator added to ``kin_ion``.  The protected block is
     the QSGW half-average, P x U is evaluated once at E_F, and U x U is
     chosen so ``kin_ion + effective_sigma`` has zero off-diagonal entries
-    and diagonal ``E_DFT + Delta_k``.  The closing Hermitisation is part of the
+    and diagonal ``E_DFT + Delta``.  The closing Hermitisation is part of the
     defining equation, not a numerical repair.
 
     Equation
@@ -416,17 +427,18 @@ def effective_sigma(
         _symmetrize_exact_qp_blocks(
             sigma_pp, energy[:, :n_p], exact_degeneracy_tol_ev))
 
-    # Delta_k is the QP-minus-DFT correction of the highest protected band
-    # at that k.  ``dft_h_qp`` is the immutable DFT Hamiltonian expressed in
-    # the same current QP basis, so this remains a correction even after the
-    # orbitals rotate.  Taking the boundary value itself makes P/U
-    # continuous at every k by construction.
+    # Delta is one number per iteration and spin: the mean over k of the
+    # QP-minus-DFT correction of the two highest protected conduction bands.
+    # ``dft_h_qp`` is the immutable DFT Hamiltonian expressed in the same
+    # current QP basis, so this remains a correction after orbitals rotate.
+    # The resulting P/U boundary mismatch is evidence, not a condition used
+    # to bend the map.
     h_pp = (jnp.asarray(table.kin_ion_qp_kij_ry)[:, :n_p, :n_p]
             + sigma_pp)
     dft_pp = jnp.asarray(table.dft_h_qp_kij_ry)[:, :n_p, :n_p]
     correction_diag = jnp.real(jnp.diagonal(
         h_pp - dft_pp, axis1=-2, axis2=-1))
-    delta_ry = correction_diag[:, -1]
+    delta_ry = jnp.mean(correction_diag[:, classes.scissor_bands_local])
 
     dtype = jnp.result_type(sigma_pp, table.kin_ion_qp_kij_ry)
     sigma_eff = jnp.zeros((nk, n_total, n_total), dtype=dtype)
@@ -443,7 +455,7 @@ def effective_sigma(
         kin_uu = jnp.asarray(table.kin_ion_qp_kij_ry)[:, n_p:, n_p:]
         sigma_uu = -kin_uu
         target_diag = (jnp.asarray(table.e_dft_kn_ry)[:, n_p:]
-                       + delta_ry[:, None])
+                       + delta_ry)
         sigma_uu = sigma_uu.at[
             :, jnp.arange(classes.n_outer), jnp.arange(classes.n_outer)
         ].add(target_diag)

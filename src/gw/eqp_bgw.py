@@ -499,6 +499,7 @@ def compute_eqp_diag(
 	# Both or neither; None ⇒ the historical at-DFT linearization.
 	sigma_c_at_eval_diag_ev: np.ndarray | None = None,  # (nk, nb)
 	e_eval_ev: np.ndarray | None = None,                # (nk, nb)
+	guard_pathological_z: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
 	"""Return zeroth-order and Z-linearized BGW QP energies.
 
@@ -532,9 +533,10 @@ def compute_eqp_diag(
 	For dynamic modes (GN-PPM, HL-PPM, MPA) the caller obtains
 	``sigma_c_at_dft_diag_ev``, ``sigma_c_at_eval_diag_ev`` and
 	``z_factor`` from :func:`compute_z_factor_from_omega_grid`.
-	A raw non-finite Z or value outside ``0 < Z <= 1`` is diagnostic evidence
-	of a pole/grid/linearization pathology, not permission for an unbounded
-	Newton step: ``eqp1`` falls back state-by-state to the finite ``eqp0``.
+	One-shot callers retain the historical state-local pathological-Z fallback.
+	Self-consistent output passes ``guard_pathological_z=False``: by owner
+	ruling, its raw central-difference Z affects only the reported ``eqp1``
+	column and never changes, gates, or replaces an SC-map value.
 	"""
 	if (sigma_c_at_eval_diag_ev is None) != (e_eval_ev is None):
 		raise ValueError(
@@ -568,7 +570,7 @@ def compute_eqp_diag(
 			+ sigma_x_diag_ev + sigma_c_at_eval_diag_ev - e_eval_ev
 		).real
 		eqp1 = e_eval_ev + z_factor * delta_at_eval
-	if z_factor is not None:
+	if z_factor is not None and guard_pathological_z:
 		eqp1 = np.where(pathological_z_factor_mask(z_factor), eqp0, eqp1)
 	return eqp0, eqp1
 
@@ -648,6 +650,7 @@ def assemble_eqp(
 	hartree_scalar_diag_ev: np.ndarray | None = None,
 	hartree_transverse_diag_ev: np.ndarray | None = None,
 	mean_field_gate: bool = True,
+	guard_pathological_z: bool = True,
 	print_fn=print,
 ) -> EqpAssembly:
 	"""Assemble BGW QP energies from H₀ and Σ.  **One implementation.**
@@ -667,8 +670,10 @@ def assemble_eqp(
 	   (:func:`compute_z_factor_from_omega_grid`, and
 	   :func:`compute_eqp_diag` for why);
 	4. the Newton update (:func:`compute_eqp_diag`);
-	5. state-local fallback ``eqp1 = eqp0`` wherever raw Z is non-finite or
-	   outside the quasiparticle interval ``0 < Z <= 1``.
+	5. on the historical one-shot path, state-local fallback ``eqp1 = eqp0``
+	   wherever raw Z is non-finite or outside ``0 < Z <= 1``.  The SC writer
+	   disables that fallback: Z is output-only and the fixed-point map is
+	   always the unlinearized eqp0-type evaluation.
 
 	**The evaluation point, and the one-omega-reference rule.**
 	``e_eval_ev`` / ``e_eval_rel_ev`` are the same energies in absolute
@@ -783,7 +788,8 @@ def assemble_eqp(
 			e_eval_ev = None
 
 	z_pathological = (
-		None if z_factor is None else pathological_z_factor_mask(z_factor))
+		None if z_factor is None or not guard_pathological_z
+		else pathological_z_factor_mask(z_factor))
 	if z_pathological is not None:
 		n_bad = int(np.count_nonzero(z_pathological))
 		finite = np.asarray(z_factor)[np.isfinite(z_factor)]
@@ -815,6 +821,7 @@ def assemble_eqp(
 		z_factor=z_factor,
 		sigma_c_at_eval_diag_ev=sigma_c_at_eval,
 		e_eval_ev=e_eval_ev,
+		guard_pathological_z=guard_pathological_z,
 	)
 	return EqpAssembly(
 		kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),

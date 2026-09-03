@@ -26,6 +26,7 @@ import numpy as np
 
 from common.collectives import (all_gather_processes, gather_to_host,
                                 process_count, process_rank)
+from common.units import RYD_TO_EV
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaWindow
@@ -40,6 +41,8 @@ from minimax import (
 _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
+_SC_STATE_PAD_EV = 2.0
+_SC_POLE_PAD_FRACTION = 0.10
 
 
 def resolve_sigma_box_cache_dir(setting, input_dir):
@@ -333,7 +336,9 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
     return green, screened
 
 
-def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
+def _fit_rule(
+    spec, eps, reduction_seconds, cache_dir, eta, *, cache_build_widen=True,
+):
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
@@ -345,7 +350,8 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         cache_status = f"hit:{cache_name}"
     else:
         build_box = (_cache_build_box(requested_box, eta)
-                     if cache_dir is not None else requested_box)
+                     if cache_dir is not None and cache_build_widen
+                     else requested_box)
         rule = build_uniform_rule(
             build_box, eps, time_budget=reduction_seconds)
         cache_status = "miss" if cache_dir is not None else "off"
@@ -390,6 +396,10 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         # cancellation cap but misses Sigma's eps-scaled noise cap must not
         # poison every subsequent attempt for this box.
         _rule_cache_store(cache_dir, rule, noise_amplification)
+    node_digest = hashlib.sha256(
+        np.ascontiguousarray(times).view(np.uint8).tobytes()
+        + np.ascontiguousarray(weights).view(np.uint8).tobytes()
+    ).hexdigest()[:16]
     return {
         "times": times, "weights": weights,
         "node_count": int(times.size), "rule_box": tuple(rule.box),
@@ -399,6 +409,7 @@ def _fit_rule(spec, eps, reduction_seconds, cache_dir, eta):
         "cache_status": cache_status, "factor_growth": growth,
         "noise_bound": noise_bound, "noise_budget": noise_budget,
         "roundoff_amplification": noise_amplification,
+        "node_digest": node_digest,
         "one_line": rule.one_line(),
     }
 
@@ -446,6 +457,7 @@ def _parallel_fits(specs, worker):
 
 def fit_sigma_box_specs(
     specs, eta_ry, *, eps, reduction_seconds, cache_dir,
+    cache_build_widen=True,
 ):
     """Fit independent route-neutral box specifications across processes.
 
@@ -466,7 +478,194 @@ def fit_sigma_box_specs(
         raise ValueError("sigma_quadrature_reduction_seconds must be > 0")
     return _parallel_fits(
         rows, lambda index: _fit_rule(
-            rows[index], tolerance, budget, cache_dir, eta))
+            rows[index], tolerance, budget, cache_dir, eta,
+            cache_build_widen=bool(cache_build_widen)))
+
+
+def _box_contains(outer, inner):
+    """Return whether one certified denominator box contains another."""
+    return (outer[0] <= inner[0] and outer[1] >= inner[1]
+            and outer[2] <= inner[2] and outer[3] >= inner[3])
+
+
+def _box_escape_reasons(outer, inner):
+    """Describe every edge by which ``inner`` escapes ``outer``."""
+    labels = ("real_lo", "real_hi", "imag_lo", "imag_hi")
+    escaped = (
+        inner[0] < outer[0], inner[1] > outer[1],
+        inner[2] < outer[2], inner[3] > outer[3],
+    )
+    return [
+        f"{label}: current={inner[index]:.12g} Ry, "
+        f"fixed={outer[index]:.12g} Ry"
+        for index, (label, is_outside) in enumerate(zip(labels, escaped))
+        if is_outside
+    ]
+
+
+def _sc_padded_box_spec(spec, eta):
+    """Return the iteration-1 SC certificate box required by policy.
+
+    The ordinary planner has already protected the near-zero edge that sets
+    the sign topology.  QP-state drift can move both edges of a crossing box,
+    but only the far edge of a sign-definite box; padding only those edges is
+    why the latter is nearly free.  Pole-store drift is covered independently
+    by widening the full real and imaginary pole extents by ten percent.
+    """
+    a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
+    frac = _SC_POLE_PAD_FRACTION
+    padded_poles = ((
+        a_lo - frac * abs(a_lo),
+        a_hi + frac * abs(a_hi),
+        max(0.0, gamma_lo - frac * abs(gamma_lo)),
+        gamma_hi + frac * abs(gamma_hi),
+    ),)
+    pole_box, _, _ = _box_for_window(
+        spec["frequencies"], spec["states"], padded_poles,
+        spec["pole_sign"], eta)
+    box = [
+        min(spec["box"][0], pole_box[0]),
+        max(spec["box"][1], pole_box[1]),
+        min(spec["box"][2], pole_box[2]),
+        max(spec["box"][3], pole_box[3]),
+    ]
+    state_pad_ry = _SC_STATE_PAD_EV / RYD_TO_EV
+    if spec["kind"] in ("crossing", "sign_definite_negative"):
+        box[0] -= state_pad_ry
+    if spec["kind"] in ("crossing", "sign_definite_positive"):
+        box[1] += state_pad_ry
+    padded = dict(spec)
+    padded["box"] = tuple(float(value) for value in box)
+    padded["kind"] = (
+        "sign_definite_positive" if box[0] > 0.0 else
+        "sign_definite_negative" if box[1] < 0.0 else "crossing")
+    padded["sc_unpadded_box"] = tuple(spec["box"])
+    padded["sc_state_pad_ev"] = _SC_STATE_PAD_EV
+    padded["sc_pole_pad_fraction"] = _SC_POLE_PAD_FRACTION
+    if not _box_contains(padded["box"], spec["box"]):
+        raise RuntimeError(
+            f"SC fixed-rule padding failed to contain {spec['name']!r}")
+    return padded
+
+
+def _fixed_fit_for_spec(entry, spec, *, cache_status):
+    """Reuse one immutable rule and recheck current factor growth."""
+    fit = dict(entry["fit"])
+    growth = _factor_growth(
+        fit["times"], spec["pole_sign"], spec["states"],
+        spec["pole_stats"], spec["E_ref_A"], spec["E_ref_B"])
+    if max(growth) > _FACTOR_GROWTH_CAP:
+        raise RuntimeError(
+            f"Sigma box window {spec['name']!r} refused while reusing its "
+            f"fixed SC rule: factored log growth {max(growth):.6g} exceeds "
+            f"{_FACTOR_GROWTH_CAP:g}")
+    fit["factor_growth"] = growth
+    fit["cache_status"] = cache_status
+    fit["seconds"] = 0.0
+    return fit
+
+
+def _fit_fixed_sc_rules(
+    specs, eta, *, eps, reduction_seconds, cache_dir, session, print_fn,
+):
+    """Fit once per SC session, then reuse identical nodes by containment."""
+    rows = list(specs)
+    call_index = int(session.get("call_count", 0))
+    session["call_count"] = call_index + 1
+    if "rules" not in session:
+        session["eta_ry"] = float(eta)
+        session["eps"] = float(eps)
+        padded = [_sc_padded_box_spec(spec, eta) for spec in rows]
+        fits, fit_rows = fit_sigma_box_specs(
+            padded, eta, eps=eps, reduction_seconds=reduction_seconds,
+            cache_dir=cache_dir, cache_build_widen=False)
+        rules = {}
+        for spec, padded_spec, fit in zip(rows, padded, fits):
+            frozen = dict(fit)
+            frozen["cache_status"] = f"sc-fixed-init:{fit['cache_status']}"
+            rules[spec["name"]] = {
+                "fit": frozen,
+                "padded_box": tuple(padded_spec["box"]),
+                "initial_box": tuple(spec["box"]),
+                "rebuild_count": 0,
+            }
+        session["rules"] = rules
+        session["initial_window_tau_pairs"] = int(sum(
+            fit["node_count"] for fit in fits))
+        session["rebuild_count"] = 0
+        return [dict(rules[spec["name"]]["fit"]) for spec in rows], fit_rows, {
+            "call_index": call_index, "initialized": True,
+            "rebuilds": [],
+        }
+
+    if (float(session["eta_ry"]) != float(eta)
+            or float(session["eps"]) != float(eps)):
+        raise ValueError(
+            "SC fixed quadrature session changed currency: "
+            f"eta {session['eta_ry']!r}->{eta!r}, "
+            f"eps {session['eps']!r}->{eps!r}")
+
+    rules = session["rules"]
+    rebuild_specs, rebuild_names, rebuild_reasons = [], [], []
+    for spec in rows:
+        entry = rules.get(spec["name"])
+        if entry is None:
+            reasons = ["window was absent from the iteration-1 plan"]
+        else:
+            reasons = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+        if not reasons:
+            continue
+        padded = _sc_padded_box_spec(spec, eta)
+        if entry is not None:
+            padded["box"] = tuple(
+                min(entry["fit"]["rule_box"][index], padded["box"][index])
+                if index in (0, 2) else
+                max(entry["fit"]["rule_box"][index], padded["box"][index])
+                for index in range(4))
+        rebuild_specs.append(padded)
+        rebuild_names.append(spec["name"])
+        rebuild_reasons.append(reasons)
+        if process_rank() == 0:
+            print_fn(
+                f"  SC fixed quadrature ESCAPE: {spec['name']}; "
+                + "; ".join(reasons)
+                + "; rebuilding this window only")
+
+    rebuilt_by_name = {}
+    if rebuild_specs:
+        rebuilt, rebuilt_rows = fit_sigma_box_specs(
+            rebuild_specs, eta, eps=eps,
+            reduction_seconds=reduction_seconds, cache_dir=cache_dir,
+            cache_build_widen=False)
+        for name, padded, fit in zip(rebuild_names, rebuild_specs, rebuilt):
+            old_count = int(rules.get(name, {}).get("rebuild_count", 0))
+            frozen = dict(fit)
+            frozen["cache_status"] = "sc-fixed-rebuild:" + fit["cache_status"]
+            rules[name] = {
+                "fit": frozen, "padded_box": tuple(padded["box"]),
+                "initial_box": tuple(
+                    rules.get(name, {}).get("initial_box", padded["box"])),
+                "rebuild_count": old_count + 1,
+            }
+            rebuilt_by_name[name] = frozen
+        session["rebuild_count"] = int(session["rebuild_count"]) + len(rebuilt)
+    else:
+        rebuilt_rows = []
+
+    fits = []
+    for spec in rows:
+        if spec["name"] in rebuilt_by_name:
+            fits.append(dict(rebuilt_by_name[spec["name"]]))
+        else:
+            fits.append(_fixed_fit_for_spec(
+                rules[spec["name"]], spec, cache_status="sc-fixed-hit"))
+    fit_rows = list(rebuilt_rows)
+    return fits, fit_rows, {
+        "call_index": call_index, "initialized": False,
+        "rebuilds": [
+            {"name": name, "reasons": reasons}
+            for name, reasons in zip(rebuild_names, rebuild_reasons)],
+    }
 
 
 def sigma_box_executor_nodes(
@@ -517,6 +716,7 @@ def plan_sigma_windows(
     cache_dir,
     print_fn=print,
     edge_factor=1.5,
+    fixed_rule_session=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -544,6 +744,12 @@ def plan_sigma_windows(
         assigned round-robin across processes.
     cache_dir
         Directory for immutable box-rule certificates, or ``None``.
+    fixed_rule_session
+        Mutable run-local receipt used only by a multi-map SC calculation.
+        The first call certifies boxes with the owner-set 2 eV state-edge
+        and 10 percent pole-extent padding.  Later calls reuse those exact
+        nodes by containment; only an explicitly reported escape may fit a
+        replacement rule.  ``None`` preserves ordinary one-shot planning.
 
     Returns
     -------
@@ -639,9 +845,16 @@ def plan_sigma_windows(
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
 
-    fits, fit_rows = fit_sigma_box_specs(
-        specs, eta, eps=tolerance, reduction_seconds=budget,
-        cache_dir=cache_dir)
+    fixed_receipt = None
+    if fixed_rule_session is None:
+        fits, fit_rows = fit_sigma_box_specs(
+            specs, eta, eps=tolerance, reduction_seconds=budget,
+            cache_dir=cache_dir)
+    else:
+        fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
+            specs, eta, eps=tolerance, reduction_seconds=budget,
+            cache_dir=cache_dir, session=fixed_rule_session,
+            print_fn=print_fn)
     # The (window, tau) pair count is reported, never refused on: the owner
     # eliminated the pair ceiling (2026-09-02).  A count above what a deck
     # can afford is a planning question answered by eps and the window
@@ -683,6 +896,7 @@ def plan_sigma_windows(
             "raw_real_support_ry": list(spec["raw_real_support"]),
             "box_ry": list(spec["box"]), "rule_box_ry": list(fit["rule_box"]),
             "node_count": fit["node_count"],
+            "node_digest": fit["node_digest"],
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
             "sup_error": fit["sup_error"], "eps": tolerance,
@@ -694,6 +908,10 @@ def plan_sigma_windows(
             "factor_growth": list(fit["factor_growth"]),
             "cache_status": fit["cache_status"],
             "fit_seconds": fit["seconds"],
+            "sc_fixed_rule": fixed_rule_session is not None,
+            "sc_fixed_padded_box_ry": (
+                None if fixed_rule_session is None else list(
+                    fixed_rule_session["rules"][spec["name"]]["padded_box"])),
         })
         if _resolve_uniform_rule_trace() and process_rank() == 0:
             print_fn(
@@ -718,6 +936,21 @@ def plan_sigma_windows(
             (row["wall_seconds"] for row in fit_rows), default=0.0),
         "branches": branch_reports,
     })
+    if fixed_rule_session is not None:
+        geometry.update({
+            "sc_fixed_quadrature": True,
+            "sc_fixed_call_index": int(fixed_receipt["call_index"]),
+            "sc_fixed_initialized": bool(fixed_receipt["initialized"]),
+            "sc_fixed_rebuilds": fixed_receipt["rebuilds"],
+            "sc_fixed_total_rebuild_count": int(
+                fixed_rule_session["rebuild_count"]),
+            "sc_fixed_initial_window_tau_pairs": int(
+                fixed_rule_session["initial_window_tau_pairs"]),
+            "sc_state_edge_padding_ev": _SC_STATE_PAD_EV,
+            "sc_pole_extent_padding_fraction": _SC_POLE_PAD_FRACTION,
+        })
+    else:
+        geometry["sc_fixed_quadrature"] = False
     return output, geometry
 
 

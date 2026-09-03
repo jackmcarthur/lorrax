@@ -586,6 +586,7 @@ def compute_sigma_c_mpa_omega_grid(
     band_brackets=None,
     band_counts=None,
     include_fermi_pu=False,
+    fixed_quadrature_session=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -670,7 +671,8 @@ def compute_sigma_c_mpa_omega_grid(
                 eps=quadrature_eps,
                 reduction_seconds=quadrature_reduction_seconds,
                 cache_dir=quadrature_cache_dir,
-                print_fn=print_fn, edge_factor=edge_factor)
+                print_fn=print_fn, edge_factor=edge_factor,
+                fixed_rule_session=fixed_quadrature_session)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
@@ -685,10 +687,25 @@ def compute_sigma_c_mpa_omega_grid(
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "
                 f"cache={geometry['cache_dir'] or 'off'}")
+            if geometry["sc_fixed_quadrature"]:
+                print_fn(
+                    "  SC fixed quadrature: "
+                    f"call={geometry['sc_fixed_call_index']}, "
+                    f"initialized={geometry['sc_fixed_initialized']}, "
+                    f"rebuilds_this_call={len(geometry['sc_fixed_rebuilds'])}, "
+                    f"rebuilds_total="
+                    f"{geometry['sc_fixed_total_rebuild_count']}, "
+                    f"initial_pairs="
+                    f"{geometry['sc_fixed_initial_window_tau_pairs']}, "
+                    f"state_pad={geometry['sc_state_edge_padding_ev']:.1f} eV, "
+                    f"pole_pad="
+                    f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}%")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:
                     print_fn(
                         f"    {window['name']}: n_tau={window['node_count']}, "
+                        f"nodes={window['node_digest']}, "
+                        f"reuse={window['cache_status']}, "
                         f"box={tuple(window['box_ry'])} Ry, "
                         f"sup={window['sup_error']:.6g}/"
                         f"{window['eps']:.6g} ({window['criterion']}), "

@@ -355,6 +355,29 @@ def test_pole_crossing_pathological_z_falls_back_to_eqp0():
 	assert all(line.startswith("WARNING: ") for line in messages)
 
 
+def test_sc_eqp1_reports_raw_z_without_a_guard_or_fallback():
+	"""Owner ruling: derivative evidence may format SC output, not select it."""
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
+	pole, eta, strength = 0.20, 0.05, 0.30
+	x = omega - pole
+	curve = (strength * x / (x * x + eta * eta))[:, None, None]
+	messages = []
+	got = assemble_eqp(
+		kpoints_irr_frac=np.zeros((1, 3)), band_offset=12,
+		e_dft_ev=np.zeros((1, 1)), kin_ion_diag_ev=np.ones((1, 1)),
+		hartree_diag_ev=np.zeros((1, 1)),
+		sigma_x_diag_ev=np.zeros((1, 1)),
+		sigma_c_omega_diag_ev=curve.astype(np.complex128),
+		omega_rel_ev=omega, e_dft_rel_ev=np.zeros((1, 1)),
+		dE_ev=0.5, mean_field_gate=False,
+		guard_pathological_z=False, print_fn=messages.append,
+	)
+	assert float(got.z_factor[0, 0]) < 0.0
+	assert got.z_pathological is None
+	assert not np.array_equal(got.eqp1_ev, got.eqp0_ev)
+	assert messages == []
+
+
 def test_smooth_negative_slope_keeps_the_linearized_eqp1():
 	"""Negative control: a physical 0 < Z <= 1 is reported and retained."""
 	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)

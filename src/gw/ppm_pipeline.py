@@ -492,6 +492,7 @@ def compute_ppm_sigma_pipeline(
     sym,
     iteration_head=None,
     occupation_state=None,
+    fixed_quadrature_session=None,
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -659,6 +660,9 @@ def compute_ppm_sigma_pipeline(
                 include_fermi_pu=(
                     getattr(config.qp_solver, "value", config.qp_solver)
                     == "self_consistent"),
+                fixed_quadrature_session=(
+                    None if fixed_quadrature_session is None else
+                    fixed_quadrature_session.setdefault("primary", {})),
                 print_fn=print_fn,
             )
         sigma_omega_even = None
@@ -681,6 +685,10 @@ def compute_ppm_sigma_pipeline(
                     quadrature_cache_dir=quadrature_cache_dir,
                     occupation_state=occupation_state,
                     plan=plan,
+                    fixed_quadrature_session=(
+                        None if fixed_quadrature_session is None else
+                        fixed_quadrature_session.setdefault(
+                            "odd_even_reference", {})),
                     print_fn=lambda *args, **kwargs: None,
                 )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries

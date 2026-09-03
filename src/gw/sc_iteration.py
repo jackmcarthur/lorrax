@@ -333,6 +333,11 @@ class SCInputs:
     #: populated at map 0 only after the exact JAX-built entry occupation
     #: state exists; later maps read the path as immutable grid provenance.
     screening_seed_cache: dict | None = None
+    #: Run-local dynamic-Sigma quadrature receipts.  None for one-shot and
+    #: one-map SC runs; a multi-map SC run fills these on map 1 and reuses
+    #: the exact node arrays thereafter, unless a padded box escape is
+    #: reported and rebuilt window-by-window.
+    fixed_quadrature_session: dict | None = None
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
     # record.  Component chatter remains on ``print_fn`` and can still be
@@ -2424,8 +2429,7 @@ def _fixed_index_hamiltonian(
         "    fixed-index SC update: "
         f"policy={diagnostics['policy']}, P={classes.n_protected}, "
         f"U={classes.n_outer}, outside(k,n)={diagnostics['n_outside']}, "
-        f"Delta_k=[{float(jnp.min(diagnostics['delta_ev'])):+.9f},"
-        f"{float(jnp.max(diagnostics['delta_ev'])):+.9f}] eV, "
+        f"Delta={float(diagnostics['delta_ev']):+.9f} eV, "
         f"P/U mismatch="
         f"{float(diagnostics['boundary_mismatch_ev']):.9f} eV, "
         f"exact_QP_blocks={diagnostics['n_degenerate_blocks']} "
@@ -3073,6 +3077,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         omit_v_h=exact_hartree_dft is not None,
         iteration_head=iteration_head,
         material_class=inputs.material_class,
+        fixed_quadrature_session=inputs.fixed_quadrature_session,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
@@ -3714,37 +3719,6 @@ def _sc_z_factors(inputs: SCInputs, state_out: SCState) -> np.ndarray:
     return np.asarray(z_factor, dtype=np.float64)
 
 
-def _write_sc_z_snapshot(
-    path: str,
-    kpoints: np.ndarray,
-    e_eval_ev: np.ndarray,
-    z_factor: np.ndarray,
-    *,
-    band_offset: int,
-    call_index: int,
-    role: str,
-) -> None:
-    """Write one compact per-map Z table on the canonical file wedge."""
-    if e_eval_ev.shape != z_factor.shape:
-        raise ValueError(
-            "SC Z snapshot shape mismatch: evaluation energies "
-            f"{e_eval_ev.shape}, Z {z_factor.shape}")
-    with open(path, "w", encoding="utf-8") as stream:
-        stream.write(
-            "# LORRAX SC Z factors; columns: ispin iband "
-            "E_eval_eV Z\n")
-        stream.write(f"# SC map={call_index:04d} role={role}\n")
-        for ik, kpt in enumerate(np.asarray(kpoints, dtype=np.float64)):
-            stream.write(
-                f"{kpt[0]:15.9f} {kpt[1]:15.9f} {kpt[2]:15.9f} "
-                f"{z_factor.shape[1]:7d}\n")
-            for ib in range(z_factor.shape[1]):
-                stream.write(
-                    f"{1:8d} {band_offset + ib + 1:8d} "
-                    f"{e_eval_ev[ik, ib]:16.9f} "
-                    f"{z_factor[ik, ib]:16.9f}\n")
-
-
 def _dump_sc_rotation(
     inputs: SCInputs,
     state_out: SCState,
@@ -3811,8 +3785,10 @@ def _write_sc_eqp_snapshot(
     scissor are the same input law used to build this map's chi/W/Sigma;
     recording both ranges makes the closure across ``b3`` auditable.
     rCROP trial outputs are useful diagnostics but are not accepted iterates.
-    This is not a second implementation of BGW's final ``eqp0`` / ``eqp1``
-    equations; those remain solely in :mod:`gw.eqp_bgw`.
+    The sibling ``eqp1_iterNNNN.dat`` is the BGW-shaped, output-only
+    linearization ``E_eval + Z * (eqp0_map - E_eval)`` using the central
+    difference on this map's retained Sigma grid.  The SC map never reads Z,
+    never gates on it, and never replaces a value because of it.
 
     WHICH NUMBER IS THE RESIDUAL, AND WHICH IS NOT.  ``verdict`` is
     :func:`protected_band_convergence` on THIS call's output against THIS
@@ -3884,11 +3860,6 @@ def _write_sc_eqp_snapshot(
                "output, and its RMS stamp is the convergence criterion.")
 
     z_factor_full = _sc_z_factors(inputs, state_out)
-    sanity.refuse_nonfinite(
-        f"SC Z factor (call {int(call_index)}, role {role})", z_factor_full,
-        print_fn=inputs.print_fn,
-        detail="this is the renormalization table written beside the map "
-               "spectrum; non-finite Z is a dynamic-Sigma pathology")
 
     rotation_path = _dump_sc_rotation(
         inputs, state_out, call_index=call_index)
@@ -3916,6 +3887,14 @@ def _write_sc_eqp_snapshot(
         np.asarray(state_out.outputs.sigma_result.e_eval_ev,
                    dtype=np.float64))
     z_factor = _to_file_wedge(z_factor_full)
+    if e_eval.shape != e_output.shape or z_factor.shape != e_output.shape:
+        raise ValueError(
+            "SC eqp1 snapshot shape mismatch after file-wedge reduction: "
+            f"E_eval={e_eval.shape}, eqp0_map={e_output.shape}, "
+            f"Z={z_factor.shape}")
+    # Output only.  In particular there is deliberately no pathological-Z
+    # mask, fallback, membership test, convergence test, or map update here.
+    eqp1_output = e_eval + z_factor * (e_output - e_eval)
 
     active_scissored = np.flatnonzero(
         ~np.asarray(inputs.partition.in_range_mask, dtype=bool))
@@ -3967,33 +3946,36 @@ def _write_sc_eqp_snapshot(
         path, kpoints, e_dft, e_output,
         band_offset=band_offset, nspin=1, comments=comments,
     )
-    z_path = os.path.join(
-        inputs.input_dir, f"z_factor_iter{int(call_index):04d}.dat")
-    _write_sc_z_snapshot(
-        z_path, kpoints, e_eval, z_factor,
-        band_offset=band_offset, call_index=int(call_index), role=role)
+    eqp1_path = os.path.join(
+        inputs.input_dir, f"eqp1_iter{int(call_index):04d}.dat")
+    write_bgw_eqp(
+        eqp1_path, kpoints, e_dft, eqp1_output,
+        band_offset=band_offset, nspin=1,
+        comments=comments + (
+            "BGW-style eqp1 diagnostic: E_eval + Z_central_difference * "
+            "(eqp0_map - E_eval); Z is output-only and is never read by "
+            "the SC iteration",
+        ),
+    )
 
     n_occ = int(inputs.meta.nelec) - band_offset
     gap_ev = float(np.min(e_output[:, n_occ])
                    - np.max(e_output[:, n_occ - 1]))
-    z_min = float(np.min(z_factor))
-    z_max = float(np.max(z_factor))
-    z_bad = int(np.count_nonzero((z_factor <= 0.0) | (z_factor > 1.0)))
     partition = _state_partition(state_out, inputs)
     protected = np.asarray(partition.protected_mask, dtype=bool)
     in_range = np.asarray(partition.in_range_mask, dtype=bool)
     # Keep the established map-artifact line schema intact: the canonical
-    # convergence parser keys the following verdict to this exact line.  Z is
-    # a sibling artifact, not a suffix that makes the map line unparsable.
+    # convergence parser keys the following verdict to this exact line.
+    # eqp1 is a sibling artifact, not a suffix that makes the map line
+    # unparsable.
     _record_sc(inputs, f"  SC map energies: {path}")
-    _record_sc(inputs, f"  SC map Z factors: {z_path}")
+    _record_sc(inputs, f"  SC map eqp1: {eqp1_path}")
     if rotation_path is not None:
         _record_sc(inputs, f"  SC map rotation: {rotation_path}")
     _record_sc(
         inputs,
         f"    SC iteration: call={int(call_index):04d} role={role} "
         f"gap={gap_ev:.9f} eV max|dE|={float(verdict.max_abs_ev):.9e} eV "
-        f"Z=[{z_min:.9f},{z_max:.9f}] bad_Z={z_bad}/{z_factor.size} "
         f"active={band_offset + 1}-{band_offset + e_output.shape[1]} "
         f"protected={_band_ranges(protected, band_offset=band_offset)} "
         f"in_range={_band_ranges(in_range, band_offset=band_offset)}")
@@ -4005,7 +3987,7 @@ def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
     from .qsgw_utils import remove_managed
 
     removed = remove_managed(
-        input_dir, r"(?:eqp0|z_factor)_iter[0-9]{4}\.dat\Z",
+        input_dir, r"(?:eqp0|eqp1|z_factor)_iter[0-9]{4}\.dat\Z",
         barrier_tag="sc.eqp_snapshots.clear", print_fn=print_fn)
     if removed:
         print_fn(f"  SC map energies: cleared {len(removed)} stale snapshots")
@@ -5222,6 +5204,8 @@ def run_sc_driver(
         parallel_transport=parallel_transport,
         fixed_dft_head_response=fixed_dft_head_response,
         screening_seed_cache={},
+        fixed_quadrature_session=(
+            {} if int(config.sc.max_iter) > 1 else None),
         print_fn=print_fn,
         record_fn=record_fn,
     )
@@ -5262,7 +5246,7 @@ def run_sc_driver(
             "GATE sc_fixed_point_not_converged: the SC iteration budget was "
             "exhausted without satisfying the protected-band fixed-point "
             f"criterion. {verdict.summary()} Per-map eqp0_iterNNNN.dat and "
-            "z_factor_iterNNNN.dat diagnostics were retained; no terminal "
+            "eqp1_iterNNNN.dat diagnostics were retained; no terminal "
             "QP result is reported as converged.")
     else:
         _record_sc(

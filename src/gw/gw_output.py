@@ -1758,6 +1758,10 @@ def write_results(
         e_eval_rel_ev=e_eval_rel_ev_irr,
         dE_ev=eqp_dE_ev,
         nspin=1,
+        # Owner ruling 2026-09-03: SC is an eqp0-type fixed-point map.
+        # Its central-difference Z exists only to report raw BGW-style eqp1;
+        # it must never select a fallback value or feed an iteration.
+        guard_pathological_z=not results.self_consistent,
         print_fn=print_fn,
     )
 

@@ -141,24 +141,23 @@ def test_outer_law_and_hamiltonian_are_hermitian():
         hamiltonian[:, :4, 4:], 2.5 + 2.25j)
     np.testing.assert_allclose(hamiltonian[:, 4:, 4:], np.diag(
         np.asarray(table.e_dft_kn_ry)[0, 4:]
-        + np.asarray(diagnostics["delta_ry"])[0])[None])
+        + diagnostics["delta_ry"])[None])
 
 
-def test_band_classes_ignore_padding_and_need_a_boundary_band():
+def test_band_classes_ignore_padding_and_require_scissor_samples():
     classes = _classes()
     assert classes.n_protected == 4
     assert classes.n_outer == 2
     assert classes.n_total == 6
-    one_boundary_band = BandClasses(
-        band_start=0, occupied_stop=0, protected_stop=1, outer_stop=6)
-    assert one_boundary_band.n_protected == 1
-    with pytest.raises(ValueError, match="at least one protected band"):
+    assert classes.n_protected_conduction == 2
+    assert classes.scissor_bands_local == slice(2, 4)
+    with pytest.raises(ValueError, match="at least two protected conduction"):
         BandClasses(
-            band_start=0, occupied_stop=0, protected_stop=0, outer_stop=6)
+            band_start=0, occupied_stop=3, protected_stop=4, outer_stop=6)
 
 
-def test_outer_scissor_is_highest_protected_correction_at_each_k():
-    """The P/U boundary correction is local in k, not a global mean."""
+def test_outer_scissor_is_constant_mean_of_two_top_conduction_bands():
+    """Delta is one scalar; a k-local boundary value is the red twin."""
     one = _table()
     sigma_x = np.repeat(np.asarray(one.sigma_x_pp_kij_ry), 2, axis=0)
     sigma_x[1, -1, -1] = 2.0
@@ -187,14 +186,19 @@ def test_outer_scissor_is_highest_protected_correction_at_each_k():
         exact_degeneracy_tol_ev=1.0e-4)
     hamiltonian = np.asarray(QpHamiltonian(
         table.kin_ion_qp_kij_ry).build(sigma))
-    delta = np.asarray(diagnostics["delta_ry"])
+    delta = float(diagnostics["delta_ry"])
 
-    np.testing.assert_allclose(delta[1] - delta[0], 2.0)
+    correction = np.real(np.diagonal(
+        hamiltonian[:, :4, :4]
+        - np.asarray(table.dft_h_qp_kij_ry)[:, :4, :4],
+        axis1=-2, axis2=-1))
+    expected = float(np.mean(correction[:, 2:4]))
+    np.testing.assert_allclose(delta, expected)
     for k in range(2):
         np.testing.assert_allclose(
             np.diag(hamiltonian[k, 4:, 4:]),
-            np.asarray(table.e_dft_kn_ry)[k, 4:] + delta[k])
-    assert float(diagnostics["boundary_mismatch_ev"]) == 0.0
+            np.asarray(table.e_dft_kn_ry)[k, 4:] + delta)
+    assert float(diagnostics["boundary_mismatch_ev"]) > 0.0
 
 
 def test_exact_qp_block_is_invariant_to_random_unitary_gauge():
