@@ -168,21 +168,6 @@ def test_scalar_decks_are_untouched_by_the_new_grammar(tmp_path):
     assert not packed_photon_replaces_charge_sigma(cfg)
 
 
-def test_the_hand_tt_overlay_is_refused_on_the_dynamic_packed_route(tmp_path):
-    """The completion carries the TT head here too, so the overlay double counts."""
-    with pytest.raises(ValueError) as exc:
-        _config(
-            tmp_path,
-            _PACKED_BARE + _PPM_KEYS + "compute_mode = gn_ppm\n"
-            "bispinor_tt_head_correction = true\n",
-            name="gnppm_overlay.in")
-    message = str(exc.value)
-    # Since lane L the key is not a deck key at all: the parse-time tombstone
-    # fires before the route's own double-count gate could, on any value.
-    assert "bispinor_tt_head_correction" in message
-    assert "REMOVED" in message
-
-
 def test_bare_route_accepts_local_solver_for_one_gpu(tmp_path):
     """Bare current builds no packed Dyson system; local serves scalar CC."""
     from gw.gw_config import (packed_bare_transverse_route,

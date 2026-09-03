@@ -3024,10 +3024,9 @@ def read_lorrax_input(filename: str) -> dict:
                 "the same <D_TT> = -<v P^T> the overlay wrote.\n"
                 "  why:  heads are always on with bispinors (owner ruling "
                 "2026-09-01, docs/architecture/decisions.md; TASTE.md row "
-                "20), so a deck dial that turns one off is not a dial.  The "
-                "overlay code (gw.v_q_bispinor._tt_head_tensor) survives "
-                "only for the incumbent non-packed route, which is being "
-                "retired; nothing reads a deck value for it.\n"
+                "20), so a deck dial that turns one off is not a dial.  "
+                "There is no separate overlay implementation or runtime "
+                "field; the packed completion is the sole owner.\n"
                 "  doc:  docs/input_reference.md, bispinor_gw / "
                 "head_correction."
             )
@@ -3695,26 +3694,15 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     blocks of ``chi`` set to zero: the packed Dyson equation is then block
     diagonal, ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0``, and the
     sixteen-block Sigma consumer returns the screened charge COHSEX in CC,
-    the bare Breit exchange ``Sigma^B`` in TT (``SX(D_TT) = X(D_TT)``,
-    ``COH(D_TT - D_TT) = 0``) and zero in CT/TC -- the incumbent
-    ``gw.sigma_x_bispinor`` result, block for block.  The Gamma completion
-    is the same :func:`gw.head_correction.complete_static_photon_q0`
-    with the charge-only ``R(q)``, which returns ``diag(W^00_h, D_TT)`` and
-    so inserts BOTH the charge head and the bare ``<D_TT>`` that the
-    ``bispinor_tt_head_correction`` overlay writes into the V tiles today.
+    the bare transverse exchange in TT (``SX(D_TT) = X(D_TT)``,
+    ``COH(D_TT - D_TT) = 0``) and zero in CT/TC.  The Gamma completion is
+    :func:`gw.head_correction.complete_static_photon_q0` with charge-only
+    ``R(q)``; it inserts both the charge head and bare ``<D_TT>``.
 
-    The route is taken exactly inside the envelope that completion is
-    derived for, and NOWHERE else: outside it the incumbent
-    charge-screened + ``Sigma^B`` route is the only certified one, and it
-    is unchanged.  Returns ``(taken, reason)`` so the driver can print the
-    first unmet condition instead of switching physics in silence; the
-    predicate and its narration have one owner.
-
-    Not in the predicate on purpose: ``bispinor_tt_head_correction``.  Its
-    value must not move the route -- a deck that asks for the hand TT
-    overlay inside this envelope is REFUSED by
-    :func:`refuse_unsupported_bispinor_gw` (the completion already carries
-    that head, so honouring both would double count it).
+    Every accepted bare-transverse deck is inside this envelope.  Returns
+    ``(taken, reason)`` so validation and the run record share one owner for
+    the capability decision; an unmet row is a named refusal, never a route
+    switch.
     """
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
@@ -3919,39 +3907,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "charge and signed Dirac current must be rebuilt on every map; "
             "freezing the DFT direct field mixes two orbital states\n"
             "  doc:  docs/input_reference.md, density_self_consistent.")
-    # EITHER packed static mode inserts the bare <D_TT> q=Gamma head through
-    # the Gamma-cell completion that carries the charge head, so the hand
-    # overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
-    # (gw.v_q_bispinor._tt_head_tensor) would be counted twice.  ONE gate for
-    # both, no longer a row of the envelope table: the deck key is gone, so
-    # this is the hand-built-config guard, and a route must never be moved by
-    # a head dial.  (The gate id keeps its bare-route name so the docs, the
-    # tests and this message stay one string; lane N deletes it with the
-    # overlay.)
-    if (uses_static_photon_response(config)
-            and bool(config.head.bispinor_tt_head_correction)):
-        raise ValueError(
-                "GATE packed_bare_transverse_tt_head_double_count: "
-                f"bispinor_gw = {mode.value} is refused with "
-                "bispinor_tt_head_correction = true inside the packed "
-                "static-photon envelope.\n"
-                "  got:  bispinor_tt_head_correction = true, "
-                f"bispinor = true, compute_mode = "
-                f"{config.compute_mode.value}, sys_dim = {config.sys_dim}, "
-                f"head_correction = {config.head.correction.value}, "
-                f"qp_solver = {config.qp_solver.value}\n"
-                "  want: bispinor_tt_head_correction = false\n"
-                "  why:  this deck routes through the packed static photon "
-                "operator, whose Gamma-cell completion already inserts the "
-                "bare <D_TT> = -<v P^T> head into the TT blocks of V (and, "
-                "unscreened, of W).  The overlay writes the same quantity "
-                "into the q=Gamma, G=0 slot of the TT V tiles, so keeping "
-                "both would double count it.\n"
-                "  fix:  leave head.bispinor_tt_head_correction at its "
-                "default (False) -- it is not a deck key any more; the TT "
-                "head is on by default with the charge head\n"
-                "  doc:  docs/input_reference.md, "
-                "bispinor_tt_head_correction.")
     if bool(config.bispinor):
         if (mode is BispinorGWMode.FULL_STATIC_COHSEX
                 and config.compute_mode is ComputeMode.MPA):
@@ -4058,65 +4013,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "  doc:  docs/input_reference.md, bispinor_gw.")
 
 
-def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
-    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope.
-
-    NOT REACHABLE FROM A DECK since 2026-09-01: the key is tombstoned in
-    ``read_lorrax_input`` and :class:`HeadConfig` is built with ``False``,
-    so every parsed config returns on the first line.  This function is
-    the guard for a HAND-BUILT config (tests, tools, an embedded caller)
-    that sets the field itself, which is why the driver-entry call in
-    ``gw.gw_init.prepare_isdf_and_wavefunctions`` remains and the
-    parser-altitude call was dropped.  Lane N deletes both with the
-    incumbent non-packed route.
-
-    Two named conditions, GATE ``bispinor_tt_head_unsupported``:
-
-    1. ``bispinor = false`` — the flag corrects a bare TT V-tile that a
-       non-bispinor run never builds.
-    2. ``sys_dim not in (2, 3)`` — box truncation's q=Γ, G=0 slot is
-       already finite (``vcoul.box_0d.Box0D._v_bare_per_q`` never zeros
-       it), so there is no missing slot to substitute; the bispinor
-       g-flat path also does not reach sys_dim=0 today
-       (``gw.v_q_g_flat`` refuses sys_dim not in (2, 3) at its own
-       entry), so this is a defensive, not merely a redundant, refusal.
-
-    """
-    if not bool(config.head.bispinor_tt_head_correction):
-        return
-    if not bool(config.bispinor):
-        raise ValueError(
-            "GATE bispinor_tt_head_unsupported: "
-            "bispinor_tt_head_correction = true is refused with "
-            "bispinor = false.\n"
-            "  got:  bispinor_tt_head_correction = true, bispinor = false\n"
-            "  want: bispinor = true\n"
-            "  fix:  set bispinor = true, or leave the field at its "
-            "default (False) -- it has not been a deck key since "
-            "2026-09-01\n"
-            "  why:  the correction replaces the q=Γ, G=0 slot of the "
-            "bare bispinor TT (transverse-transverse) V-tiles, which a "
-            "non-bispinor run never builds\n"
-            "  doc:  docs/input_reference.md '## Screening', "
-            "bispinor_tt_head_correction.")
-    sys_dim = int(config.sys_dim)
-    if sys_dim not in (2, 3):
-        raise ValueError(
-            "GATE bispinor_tt_head_unsupported: "
-            f"bispinor_tt_head_correction = true is refused with "
-            f"sys_dim = {sys_dim}.\n"
-            f"  got:  bispinor_tt_head_correction = true, sys_dim = {sys_dim}\n"
-            "  want: sys_dim in {2, 3} (slab / bulk)\n"
-            "  fix:  set sys_dim to 2 or 3, or leave the field at its "
-            "default (False) -- it has not been a deck key since "
-            "2026-09-01\n"
-            "  why:  box truncation (sys_dim=0) never zeros its q=Γ, G=0 "
-            "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
-            "there is no missing slot for this correction to fill\n"
-            "  doc:  docs/input_reference.md '## Screening', "
-            "bispinor_tt_head_correction.")
-
-
 def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
     """Refuse an explicit dense ``Gij`` operand under ``low_mem_bands = true``.
 
@@ -4201,7 +4097,6 @@ class HeadConfig:
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
-    bispinor_tt_head_correction: bool  # bare TT q=Γ,G=0 mini-BZ head (default off)
     w_av_first_neighbors: bool
     w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
@@ -5428,13 +5323,6 @@ class LorraxConfig:
             mc_average_placement_vcoul=(
                 str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
-            # NOT a deck key any more (tombstoned above).  The field stays
-            # so the incumbent non-packed TT overlay owner
-            # (gw.v_q_bispinor._make_per_q_v_builder_for_tile) keeps ONE
-            # place to read, and so a hand-built config that sets it True
-            # still meets refuse_unsupported_bispinor_tt_head_correction.
-            # Lane N deletes the field with the incumbent route.
-            bispinor_tt_head_correction=False,
             w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
             w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),

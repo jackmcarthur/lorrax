@@ -19,8 +19,7 @@ from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (Q0_RULE_SOBOL_DEBUG, _announce_q0_rule,
                           _sample_q0_minibz_qpoints,
                           bulk_minibz_photon_cubature, minibz_average,
-                          minibz_inscribed_sphere_r2,
-                          minibz_transverse_head_avg)
+                          minibz_inscribed_sphere_r2)
 
 __all__ = ["Bulk3D", "BulkQ0Certificate", "BULK_Q0_RULE_EXACT"]
 
@@ -327,37 +326,3 @@ class Bulk3D:
         wq = vq / (1.0 + vq * qsq * gamma)
         wcoul0 = jnp.mean(wq)
         return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
-
-    def q0_average_transverse_tensor(
-        self, geometry: CoulombGeometry, kgrid, *,
-        nsamples: int = 2**18,
-        method: str = "sobol",
-        qmc_reps: int = 10,
-        analytic_sphere: bool = False,
-    ) -> np.ndarray:
-        """``T_ab = ⟨v(q) t_ab(q̂)⟩_mBZ`` at q=Γ — the bare transverse-
-        projector head (bispinor TT), bare units.  See
-        :meth:`Slab2D.q0_average_transverse_tensor` for the physics.
-
-        This incumbent-only route remains a pure-Sobol mean of a
-        ``1/q²``-singular integrand and inherits
-        the SAME infinite-variance estimator problem the scalar 3D head has
-        (``KNOWN_LORRAX_ISSUES.md``, the ``minibz.py`` row: measured tail
-        index ``alpha≈1.5 < 2``, so ``sigma/sqrt(N)`` is not a valid error
-        bar).  ``analytic_sphere=True`` adds the historical isotropic
-        Baldereschi-Tosatti sphere term, but neither spelling is the scalar
-        production owner now.  This method remains only while
-        ``gw.v_q_bispinor._tt_head_tensor`` consumes it; the DELETE lane owns
-        retiring both.  The 2D slab sibling is unaffected (marginal
-        ``alpha=2``); this caveat is 3D-only.
-        """
-        nkx, nky, nkz = (int(s) for s in kgrid)
-        bvec = np.asarray(geometry.bvec, dtype=np.float64)
-        batches = _sample_q0_minibz_qpoints(
-            geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=False)
-        q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=False)
-        return minibz_transverse_head_avg(
-            np.zeros(3), [np.asarray(b) for b in batches], kind="bulk_3d",
-            celvol=float(geometry.cell_volume), n_kpts=int(nkx * nky * nkz),
-            q0sph2=q0sph2, analytic_sphere=analytic_sphere, adaptive=True)

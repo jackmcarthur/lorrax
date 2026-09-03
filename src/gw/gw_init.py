@@ -43,7 +43,6 @@ from .gw_config import (
 	env_bool,
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
-	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_bispinor_gw,
 	refuse_screened_photon_restart_storage,
 	resolve_xla_gpu_memory_env,
@@ -2862,8 +2861,6 @@ def compute_V_q(
 						centroid_C_idx=_cent_C_idx_for_orchestrator,
 						centroid_T_idx=_cent_T_idx_for_orchestrator,
 						use_ibz=_use_ibz_bispinor,
-						tt_head_correction=bool(
-							cfg.head.bispinor_tt_head_correction),
 						# No explicit-carrier stamp: both shipped
 						# bispinor_gw values ride the one raw
 						# kinetic-balance carrier.
@@ -3169,9 +3166,6 @@ def prepare_isdf_and_wavefunctions(
 	                                take_pre_unfold)
 
 	refuse_unsupported_bispinor_gw(cfg)
-	# Same shape, same two-call-site reason: parser-altitude coverage is
-	# duplicated here for a hand-built cfg.  No-op at the default (false).
-	refuse_unsupported_bispinor_tt_head_correction(cfg)
 	if (bool(cfg.restart) and bool(cfg.bispinor)
 			and packed_photon_screens_current(cfg)):
 		if not getattr(cfg.paths, 'centroids_file_current', None):

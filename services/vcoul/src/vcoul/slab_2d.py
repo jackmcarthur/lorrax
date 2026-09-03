@@ -30,7 +30,7 @@ from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
                           Q0_RULE_SOBOL_DEBUG, _announce_q0_rule,
                           minibz_inscribed_sphere_r2,
-                          minibz_transverse_head_avg, minibz_voronoi_batches,
+                          minibz_voronoi_batches,
                           slab_minibz_photon_cubature)
 
 __all__ = ["Slab2D", "SlabQ0Certificate", "Q0_RULE_EXACT",
@@ -458,46 +458,3 @@ class Slab2D:
         wq = vc_q / (1.0 + vc_q * (kxy * kxy) * gamma)
         wcoul0 = 8.0 * jnp.pi * jnp.mean(wq)
         return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
-
-    def q0_average_transverse_tensor(
-        self, geometry: CoulombGeometry, kgrid, *,
-        nsamples: int = 2**18,
-        method: str = "sobol",
-        qmc_reps: int = 10,
-        analytic_sphere: bool = False,
-    ) -> np.ndarray:
-        """``T_ab = ⟨v_slab(q) t_ab(q̂)⟩_mBZ`` at q=Γ — the bare Coulomb-
-        gauge transverse-projector head (bispinor TT), bare units (no
-        ``1/celvol``).  Scrambled-Sobol Voronoi draw (``nmax`` 1↔3 on the
-        ``analytic_sphere`` flag, ``is_2d=True``) — see
-        :func:`~vcoul.minibz.minibz_transverse_head_avg` for the estimator
-        and the physics it replaces (the missing q=Γ, G=0 slot of the bare
-        TT tiles, ``docs/BISPINOR_DHFB_DESIGN.md`` §11).
-
-        NOT THE SAME RULE AS :meth:`q0_average` SINCE 2026-09-01.  The
-        scalar charge head moved to the exact Wigner--Seitz polygon
-        cubature (``Q0_RULE_EXACT``); this TT head is still the Sobol
-        draw, so it still carries the ~0.1–0.2 % cusp sampling error the
-        scalar head shed.  It has one production caller, the incumbent
-        ``bare_transverse`` route's ``gw.v_q_bispinor._tt_head_tensor``;
-        the packed route takes its TT head from the same receipt
-        ``q0_average`` now uses and is unaffected.  Registered in
-        ``KNOWN_LORRAX_ISSUES.md``; the fix is the same three lines
-        (``receipt.chunks[-1].D_raw[:, 1:, 1:] / COULOMB_GAUGE_TT_SIGN``)
-        and it moves the incumbent route's numbers, so it wants its own
-        gate.
-        """
-        nkx, nky, nkz = (int(s) for s in kgrid)
-        bvec = np.asarray(geometry.bvec, dtype=np.float64)
-        zc = self.truncation_half_height(geometry)
-        batches = _sample_q0_minibz_qpoints(
-            geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=True)
-        q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=True)
-        return minibz_transverse_head_avg(
-            np.zeros(3), [np.asarray(b) for b in batches], kind="slab",
-            celvol=float(geometry.cell_volume), n_kpts=int(nkx * nky * nkz),
-            q0sph2=q0sph2, zc=zc,
-            # The slab flag widens the draw's Voronoi fold only; the
-            # Baldereschi analytic sphere is the 3D 1/q^2 treatment.
-            analytic_sphere=False, adaptive=True)
