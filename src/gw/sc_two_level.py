@@ -223,6 +223,13 @@ def run_two_level_self_consistency(
                 fixed_quadrature_session=outer_rule_session,
             )
             inner_seed = _carry_only(first_map, sc_iteration)
+            # The screening transaction above is the only producer output
+            # the inner solve consumes.  Release the producer's Sigma cube,
+            # Hartree record, and writer-only diagnostics before allocating
+            # the next Sigma cube and the frozen W(tau) cache.  Retaining the
+            # otherwise-dead SCOutputs here exceeded an A100-40GB device on
+            # the strict 80-band/504-centroid Si control.
+            first_map = None
             inner_final, inner_history = sc_iteration.run_self_consistency(
                 inner_seed, frozen_inputs,
                 max_iter=int(max_iter), tol_ev=tol_ev,

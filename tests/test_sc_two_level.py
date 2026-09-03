@@ -1,5 +1,6 @@
 """Two-level QSGW orchestration without running a physics kernel."""
 
+import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -40,6 +41,13 @@ def _state(value, iteration, *, outputs=None, converged=False):
     )
 
 
+class _Outputs:
+    """Weak-referenceable stand-in for the output-sized map transaction."""
+
+    def __init__(self, screening):
+        self.screening = screening
+
+
 def test_one_map_diagnostic_delegates_without_two_level_wrapping(monkeypatch):
     initial = _state(0.0, 0)
     inputs = _Inputs()
@@ -66,6 +74,7 @@ def test_outer_refits_freeze_each_model_and_reset_inner_history(monkeypatch):
     initial = _state(0.0, 0)
     calls = []
     live_count = [0]
+    producer_output_refs = []
 
     monkeypatch.setattr(
         sc_iteration, "_kshard_eigh_kernels",
@@ -81,11 +90,16 @@ def test_outer_refits_freeze_each_model_and_reset_inner_history(monkeypatch):
             screening = sc_iteration.SCMapScreeningArtifacts(
                 static_w=None, iteration_head=None,
                 static_head_terms=None, sigma_model=model)
-            outputs = SimpleNamespace(screening=screening)
+            outputs = _Outputs(screening)
+            producer_output_refs.append(weakref.ref(outputs))
             return _state(
                 float(np.asarray(state.H_qp_dft)[0, 0, 0]) + 10.0,
                 state.iteration + 1, outputs=outputs), []
 
+        # The inner call may retain the screening object itself, but the
+        # producer's output-sized Sigma/writer transaction must already be
+        # dead before this next map allocation.
+        assert producer_output_refs[-1]() is None
         # First inner fixed point is 1.0.  With alpha=0.25 the next outer
         # producer must therefore see 0.25, not the unmixed candidate.  The
         # second inner answer is within the 1 meV outer cutoff of that input.
