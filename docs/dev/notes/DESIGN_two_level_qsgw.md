@@ -11,15 +11,17 @@ The fixed-index study measured the self-consistent map directly (report
 consecutive iterations the Si Γ bottom pair moved 0.027 meV while its raw on-shell
 Σ_c moved 46.8 meV under GN-PPM (amplification 1765) and 0.498 meV against 176.6 meV
 under MPA (355). Every iteration recomputes χ0 → W → the pole store from rotated
-wavefunctions, and the pole fit is not continuous in its inputs: GN-PPM modes cross
-the Ω² < 0 threshold and switch to the static-limit branch (`ppm_invalid_mode`),
+wavefunctions, and the pole representation/refit is not continuous in its inputs:
 the MPA Loewner pole set jumps. A map with a local Lipschitz constant of a thousand
 has no attractive fixed point; rCROP kills components pointing away from a fixed
 point, which is why it converged the earlier loops that did not refit a
 threshold-sensitive pole model every iteration, and why nothing converges now.
-Lane SCDIAG (`runs/DEV/108_sc_map_sensitivity_2026-09-03`) is measuring the
-amplification stage by stage; this design is written to its expected outcome and is
-adjusted to its actual one before the fix lane starts.
+Lane SCDIAG (`runs/DEV/108_sc_map_sensitivity_2026-09-03`, claim 661) subsequently
+located the first resolved non-scaling stage at the pole representation/refit, not
+χ₀ or the Dyson W solve. GN valid-mask bits did flip, but their switched modes carried
+only 4e-13--2e-12 of the residue mass, so the static-limit threshold is not the
+cause and no threshold blend belongs in this design. Literal frozen-W controls
+converged monotonically for Si GN and MPA where the live-screening twins did not.
 
 ## 2. Structure
 
@@ -51,16 +53,7 @@ if E_m leaves the grid, printed as a receipt.
 main (it is what kept the earlier loops out of the steep regions); the frozen rules
 (lane SCFIX) and the BGW-style eqp1 output land independently.
 
-## 3. The threshold-mode question (decided by SCDIAG)
-
-If the census shows GN-PPM modes crossing Ω² = 0 between OUTER iterations carry
-enough residue mass to move Σ by tens of meV, the outer loop will still see jumps.
-Then the continuous treatment of near-threshold modes becomes part of this design:
-a smooth blend between the pole and the static-limit branches across a small window
-in Ω² (or a smooth lower clamp on Ω²), which is a physics-numerics choice the owner
-rules on with the measured mass in hand. Nothing here relaxes a gate.
-
-## 4. Acceptance
+## 3. Acceptance
 
 Si 4×4×4 (GN-PPM and MPA) and MoS2 3×3 GN-PPM at ±10 and ±15 eV, P4: inner loops
 converge monotonically after two maps; the outer loop converges in ≤ 5 refits; the

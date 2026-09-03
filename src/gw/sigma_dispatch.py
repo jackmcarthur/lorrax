@@ -46,6 +46,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
+from .qsgw_utils import QSGWUpdatePolicy
 from .gw_config import (
     BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
     band_extrapolation_is_consumable,
@@ -382,7 +383,7 @@ def finalize_dynamic_sigma(
     sigma_c_odd_body_omega=None,
     ppm_probe_hermiticity_residual=None,
     ppm_odd_even_residue_ratio=None,
-    qsgw_offdiagonal_efermi_ev: float | None = None,
+    qsgw_update_policy: QSGWUpdatePolicy = QSGWUpdatePolicy.HALF_SUM,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
 
@@ -410,6 +411,13 @@ def finalize_dynamic_sigma(
         write_sigma_omega,
     )
     from .qsgw_utils import build_qsgw_sigma_xc
+
+    try:
+        qsgw_update_policy = QSGWUpdatePolicy(qsgw_update_policy)
+    except ValueError as error:
+        raise ValueError(
+            f"unknown QSGW update policy {qsgw_update_policy!r}; expected "
+            f"one of {tuple(item.value for item in QSGWUpdatePolicy)}") from error
 
     if v_h_scalar is None:
         if h_transverse is not None:
@@ -520,10 +528,8 @@ def finalize_dynamic_sigma(
         qsgw_edge_kwargs = (
             {"one_sided_core_mask": one_sided_core_mask}
             if (one_sided_core_mask is not None
-                and qsgw_offdiagonal_efermi_ev is None) else {})
-        if qsgw_offdiagonal_efermi_ev is not None:
-            qsgw_edge_kwargs["offdiagonal_efermi_ev"] = float(
-                qsgw_offdiagonal_efermi_ev)
+                and qsgw_update_policy is QSGWUpdatePolicy.HALF_SUM) else {})
+        qsgw_edge_kwargs["update_policy"] = qsgw_update_policy
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
@@ -531,7 +537,8 @@ def finalize_dynamic_sigma(
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
-        if qsgw_offdiagonal_efermi_ev is not None:
+        if (qsgw_update_policy
+                is QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI):
             print_fn(
                 "  QSGW SC update: diagonal Sigma_mm at clip(E_m), "
                 "off-diagonal Sigma_mn at E_F "
@@ -541,7 +548,7 @@ def finalize_dynamic_sigma(
                 "E_F clipped="
                 f"{bool(qsgw_diag['efermi_was_clipped'])}")
         if (one_sided_core_mask is not None
-                and qsgw_offdiagonal_efermi_ev is None):
+                and qsgw_update_policy is QSGWUpdatePolicy.HALF_SUM):
             print_fn(
                 "  QSGW window edge: one-sided Sigma(E_core) on "
                 f"{int(qsgw_diag['n_one_sided_edges'])} ordered "
@@ -679,7 +686,7 @@ def compute_sigma_xc(
     occupation_state=None,
     material_class: str,
     fixed_quadrature_session=None,
-    qsgw_offdiagonal_efermi_ev: float | None = None,
+    qsgw_update_policy: QSGWUpdatePolicy = QSGWUpdatePolicy.HALF_SUM,
     frozen_screening_model: bool = False,
     w_time_factor_cache=None,
     print_fn: Callable = print,
@@ -720,6 +727,10 @@ def compute_sigma_xc(
     e_qp_ev
         Per-(k, n) QP energies (eV) used by the QSGW build to evaluate
         Σ_c(E_m, E_n).  Required for dynamic modes; ignored for static.
+    qsgw_update_policy
+        Typed energy-argument policy at the shared QSGW interpolation owner.
+        The default historical half-sum is byte-preserving; multi-map SC
+        explicitly requests diagonal-on-shell/off-diagonal-at-E_F.
     static_head_terms, head_resolver
         q→0 head plumbing; ``static_head_terms`` is None when ``do_G0`` is
         false in the config.
@@ -1399,7 +1410,7 @@ def compute_sigma_xc(
             # into sigma_mnk.h5 as a metal's chemical potential.
             efermi_ry=sigma_efermi_ry,
             efermi_provenance=sigma_efermi_provenance,
-            qsgw_offdiagonal_efermi_ev=qsgw_offdiagonal_efermi_ev)
+            qsgw_update_policy=qsgw_update_policy)
 
     # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
     # What follows is the two-point plasmon-pole pipeline, and until this
@@ -1467,7 +1478,7 @@ def compute_sigma_xc(
         ppm_probe_hermiticity_residual=(
             ppm_outputs.probe_hermiticity_residual),
         ppm_odd_even_residue_ratio=ppm_outputs.odd_even_residue_ratio,
-        qsgw_offdiagonal_efermi_ev=qsgw_offdiagonal_efermi_ev,
+        qsgw_update_policy=qsgw_update_policy,
         print_fn=print_fn,
     )
 

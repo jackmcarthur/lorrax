@@ -85,6 +85,7 @@ from .band_partition import (
 from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
                      as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
 from .gw_config import ComputeMode, HeadCorrection
+from .qsgw_utils import QSGWUpdatePolicy
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
@@ -1716,7 +1717,9 @@ def run_fixed_sigma_evsc(
         sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
             sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
             replicated_output=False,
-            offdiagonal_efermi_ev=(0.0 if sc_mode else None))
+            update_policy=(
+                QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI
+                if sc_mode else QSGWUpdatePolicy.HALF_SUM))
         if int(diagnostics["n_clipped"]) != int(n_out):
             raise RuntimeError(
                 "run_fixed_sigma_evsc: omega_coverage/build_qsgw_sigma_xc "
@@ -3266,8 +3269,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # Map 1 stays on the historical half-sum exactly, preserving the
         # one-shot identity gate.  Every later dynamic SC map uses the
         # owner-selected diagonal-at-E_m / off-diagonal-at-E_F law.
-        qsgw_offdiagonal_efermi_ev=(
-            None if int(state.iteration) == 0 else 0.0),
+        qsgw_update_policy=(
+            QSGWUpdatePolicy.HALF_SUM
+            if int(state.iteration) == 0 else
+            QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI),
         frozen_screening_model=frozen_screening is not None,
         w_time_factor_cache=w_time_factor_cache,
         print_fn=inputs.print_fn,

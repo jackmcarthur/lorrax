@@ -354,7 +354,7 @@ def test_sc_fixed_table_reuses_eqp2_engine_with_fermi_offdiagonals(
     owned_build = qsgw_utils.build_qsgw_sigma_xc
 
     def recording_build(*args, **kwargs):
-        seen.append(kwargs.get("offdiagonal_efermi_ev"))
+        seen.append(kwargs.get("update_policy"))
         return owned_build(*args, **kwargs)
 
     monkeypatch.setattr(qsgw_utils, "build_qsgw_sigma_xc", recording_build)
@@ -380,4 +380,6 @@ def test_sc_fixed_table_reuses_eqp2_engine_with_fermi_offdiagonals(
 
     assert got.converged
     assert got.H_qp_dft_ry.shape == kin.shape
-    assert seen and all(value == 0.0 for value in seen)
+    expected_policy = (
+        qsgw_utils.QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI)
+    assert seen and all(value is expected_policy for value in seen)

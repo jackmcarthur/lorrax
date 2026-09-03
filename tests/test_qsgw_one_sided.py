@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from gw.qsgw_utils import build_qsgw_sigma_xc
+from gw.qsgw_utils import QSGWUpdatePolicy, build_qsgw_sigma_xc
 
 
 def test_one_sided_cross_edge_uses_core_energy():
@@ -58,12 +58,38 @@ def test_sc_update_uses_fermi_offdiagonal_and_on_shell_diagonal():
         jnp.zeros((1, 2, 2), dtype=jnp.complex128),
         np.asarray([-1.0, 0.0, 1.0]),
         np.asarray([[-1.0, 1.0]]), mesh,
-        offdiagonal_efermi_ev=0.0)
+        update_policy=(
+            QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI))
 
     np.testing.assert_allclose(
         np.asarray(result)[0], np.asarray([[11.0, 5.0], [5.0, 23.0]]))
     assert diagnostics["offdiagonal_efermi_ev"] == 0.0
+    assert diagnostics["update_policy"] == (
+        QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI.value)
     assert diagnostics["efermi_was_clipped"] == 0.0
+
+
+def test_typed_half_sum_is_exactly_the_default_path():
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    rng = np.random.default_rng(91)
+    sigma = (rng.normal(size=(3, 1, 2, 2))
+             + 1j * rng.normal(size=(3, 1, 2, 2)))
+    sigma_x = (rng.normal(size=(1, 2, 2))
+               + 1j * rng.normal(size=(1, 2, 2)))
+    args = (jnp.asarray(sigma), jnp.asarray(sigma_x),
+            np.asarray([-1.0, 0.0, 1.0]), np.asarray([[-0.7, 0.6]]), mesh)
+
+    default, default_diagnostics = build_qsgw_sigma_xc(*args)
+    explicit, explicit_diagnostics = build_qsgw_sigma_xc(
+        *args, update_policy=QSGWUpdatePolicy.HALF_SUM)
+
+    assert np.array_equal(np.asarray(default), np.asarray(explicit))
+    assert default_diagnostics.keys() == explicit_diagnostics.keys()
+    for key in default_diagnostics:
+        left, right = default_diagnostics[key], explicit_diagnostics[key]
+        assert left == right or (
+            isinstance(left, float) and isinstance(right, float)
+            and np.isnan(left) and np.isnan(right))
 
 
 def test_sc_fermi_law_refuses_the_legacy_one_sided_edge_law():
@@ -74,4 +100,15 @@ def test_sc_fermi_law_refuses_the_legacy_one_sided_edge_law():
             jnp.zeros((1, 2, 2), dtype=jnp.complex128),
             np.asarray([0.0, 1.0]), np.asarray([[0.0, 1.0]]), mesh,
             one_sided_core_mask=np.asarray([True, False]),
-            offdiagonal_efermi_ev=0.0)
+            update_policy=(
+                QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI))
+
+
+def test_qsgw_update_policy_refuses_unknown_value():
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    with np.testing.assert_raises_regex(ValueError, "unknown QSGW update"):
+        build_qsgw_sigma_xc(
+            jnp.zeros((2, 1, 1, 1), dtype=jnp.complex128),
+            jnp.zeros((1, 1, 1), dtype=jnp.complex128),
+            np.asarray([0.0, 1.0]), np.asarray([[0.0]]), mesh,
+            update_policy="typo")

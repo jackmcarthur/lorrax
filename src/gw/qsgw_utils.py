@@ -19,6 +19,7 @@ seam:
 
 from __future__ import annotations
 
+import enum
 import os
 
 import numpy as np
@@ -28,6 +29,14 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
+
+
+class QSGWUpdatePolicy(str, enum.Enum):
+    """Energy arguments used to make dynamic Sigma a static QSGW operator."""
+
+    HALF_SUM = "half_sum"
+    DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI = (
+        "diagonal_on_shell_offdiagonal_fermi")
 
 
 # ---------------------------------------------------------------------------
@@ -736,8 +745,8 @@ def build_qsgw_sigma_xc(
     *,
     replicated_output: bool = True,
     one_sided_core_mask: np.ndarray | None = None,
-    offdiagonal_efermi_ev: float | None = None,
-) -> tuple[jax.Array, dict[str, float]]:
+    update_policy: QSGWUpdatePolicy = QSGWUpdatePolicy.HALF_SUM,
+) -> tuple[jax.Array, dict[str, float | str]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
     By default, implements the standard QSGW ansatz
@@ -748,13 +757,11 @@ def build_qsgw_sigma_xc(
     interpolation noise).  Σ_xc = Σ_c + Σ_x; Σ_x is ω-independent so it
     is added once after the Σ_c(ω) interpolation.
 
-    When ``offdiagonal_efermi_ev`` is supplied, the self-consistent path's
-    two-level update law is used instead: diagonal ``(m=m)`` elements are
-    evaluated on shell at ``E_m`` and every off-diagonal at the supplied
-    Fermi reference.  The caller passes zero when both the omega grid and
-    energies are Fermi-relative.  The argument has no default behaviour for
-    self-consistency: omitting it deliberately retains the historical
-    half-sum, which is required for one-shot and SC map-1 bit identity.
+    ``DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI`` is the self-consistent path's
+    two-level update law: diagonal ``(m=m)`` elements are evaluated on shell
+    at ``E_m`` and every off-diagonal at ``E_F = 0`` on this Fermi-relative
+    grid.  The typed default deliberately retains the historical half-sum,
+    which is required for one-shot and SC map-1 bit identity.
 
     ``one_sided_core_mask`` is the explicit window-edge diagnostic rule.  A
     coupling with exactly one core endpoint is evaluated at that endpoint's
@@ -807,6 +814,12 @@ def build_qsgw_sigma_xc(
     if E.shape != (nk, nb):
         raise ValueError(
             f"e_qp_kn_ev must have shape ({nk}, {nb}); got {E.shape}.")
+    try:
+        policy = QSGWUpdatePolicy(update_policy)
+    except ValueError as error:
+        raise ValueError(
+            f"unknown QSGW update policy {update_policy!r}; expected one of "
+            f"{tuple(item.value for item in QSGWUpdatePolicy)}") from error
     one_sided = one_sided_core_mask is not None
     if one_sided:
         core_mask = np.asarray(one_sided_core_mask, dtype=bool).reshape(-1)
@@ -820,10 +833,12 @@ def build_qsgw_sigma_xc(
                 "subspaces.")
     else:
         core_mask = np.zeros(nb, dtype=bool)
-    fermi_offdiagonal = offdiagonal_efermi_ev is not None
+    fermi_offdiagonal = (
+        policy is QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI)
     if fermi_offdiagonal and one_sided:
         raise ValueError(
-            "offdiagonal_efermi_ev and one_sided_core_mask request two "
+            "the Fermi-off-diagonal update policy and one_sided_core_mask "
+            "request two "
             "different off-diagonal evaluation energies; the SC update "
             "law requires Sigma_mn(E_F) for every m != n")
 
@@ -843,8 +858,7 @@ def build_qsgw_sigma_xc(
 
     # Scalar interpolation receipt for the SC-only off-diagonal law.  Dummy
     # values keep one stable kernel signature on the historical path.
-    efermi_eval = float(omega_lo if offdiagonal_efermi_ev is None
-                        else offdiagonal_efermi_ev)
+    efermi_eval = float(0.0 if fermi_offdiagonal else omega_lo)
     efermi_clamped = float(np.clip(efermi_eval, omega_lo, omega_hi))
     if_hi = int(np.clip(
         np.searchsorted(omega, efermi_clamped, side="left"),
@@ -896,6 +910,7 @@ def build_qsgw_sigma_xc(
             float(efermi_clamped) if fermi_offdiagonal else float("nan")),
         "efermi_was_clipped": float(
             fermi_offdiagonal and efermi_clamped != efermi_eval),
+        "update_policy": policy.value,
     }
     return sigma_xc_qsgw, diagnostics
 
@@ -1202,6 +1217,7 @@ def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
 
 
 __all__ = [
+    "QSGWUpdatePolicy",
     "build_qsgw_sigma_xc",
     "extract_sigma_diag_replicated",
     "static_sigma_diag_to_host",
