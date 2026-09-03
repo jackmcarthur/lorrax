@@ -47,26 +47,21 @@ from .minimax_screening import (
 
 
 # ---------------------------------------------------------------------------
-#  Crossing-quadrature conditioning (the load-bearing fix for the conduction
-#  Σ_c instability — reports/gw_ppm_sigma_regularization_2026-07-20).
+#  Crossing-quadrature conditioning (reports/gw_ppm_sigma_regularization_2026-07-20).
 #
-#  The HGL "core" crossing window fits its regularization target with a minimax
-#  sin-sum over the dimensionless bandwidth  A_core = 2·T/ξ = 2·ω_max/ξ + 2·edge
-#  (T = ω_max + edge·ξ).  The sin-fit is well-conditioned only for MODEST A: the
-#  exact solver's weights Σ|α_hat| jump from ~2–3 at A≲24 to ~3e4 (A=83, ξ=0.25)
-#  and ~2e5 (A=43, ξ=0.5) — an ill-conditioning that is *not even monotone in ξ*.
-#  Those O(1e4–1e5) weights are near-cancelling, so they amplify ANY perturbation
-#  of the per-τ operand σ(τ) by Σ|α|; σ(τ) carries the (large, ~1e4 in the ISDF
-#  centroid basis, and mesh-sensitive) screened W, so on a multi-device mesh the
-#  amplified perturbations do NOT cancel → Σ_c blows up to O(1e5) eV (device/mesh
-#  dependent, gap-inverting) with O(1e3) eV imaginary parts even on one device.
-#
-#  Fix: floor ξ so A_core ≤ _CROSSING_A_MAX (well-conditioned regime).  ξ is a
-#  *broadening*; the QP self-energy is evaluated off-pole (at E_DFT, away from the
-#  plasmon poles), so a coarser near-pole broadening does not move the QP energies.
-#  The floor scales with ω_max, so it only engages when the Σ_c ω-grid is wide
-#  enough to force an ill-conditioned crossing; a narrow grid keeps the user's ξ.
-_CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3 below)
+#  The HGL crossing rule is well-conditioned only for modest dimensionless
+#  bandwidth A (Σ|α_hat| ~ 2–3 at A <= 24, versus O(1e4–1e5) on the old wide
+#  core).  The bounded-cell planner below is the conditioning mechanism: it
+#  partitions omega/E/Omega until every HGL cell obeys this ceiling.  It must
+#  not instead enlarge the physical regularization width xi with the requested
+#  omega extent; that old policy made the two Fermi-limit targets disagree.
+_CROSSING_A_MAX = 24.0
+
+#: Fixed HGL crossing-shell padding in units of the requested regularization
+#: width.  Outside ``|denominator| <= factor*xi`` a cell is sign-definite and
+#: uses the ordinary reciprocal target.  Four widths put that target in the
+#: asymptotic HGL/reciprocal agreement regime without changing xi itself.
+HGL_CROSSING_PADDING_FACTOR = 4.0
 
 #: A reducible sign-definite inverse-Laplace pane may span at most eight binary
 #: octaves in its denominator, ``x_max/x_min <= 2**8``.  A zero-width Ω pane
@@ -74,29 +69,6 @@ _CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3
 #: over-wide request to minimax.  This ceiling neither blesses a table nor
 #: changes a pole, and is independent of the caller's node budget.
 _SIGN_DEFINITE_PANE_MAX_RANGE = 2.0 ** 8
-
-
-def crossing_regularization_floor(omega_max_ry: float, edge_factor: float) -> float:
-    """Minimum ξ (Ry) so the HGL core bandwidth A_core ≤ _CROSSING_A_MAX.
-
-    A_core = 2·ω_max/ξ + 2·edge ≤ A_max  ⇔  ξ ≥ 2·ω_max/(A_max − 2·edge).
-    Returns 0.0 when no floor is meaningful (degenerate edge/ω_max).
-    """
-    denom = _CROSSING_A_MAX - 2.0 * float(edge_factor)
-    if denom <= 1.0 or float(omega_max_ry) <= 0.0:
-        return 0.0
-    return 2.0 * float(omega_max_ry) / denom
-
-
-#: Ansätze whose Σ_c crossing quadrature is the HGL sin-fit that
-#: :func:`crossing_regularization_floor` was derived for, and therefore the
-#: ones ``sigma_regularization_floor_ev = auto`` raises ξ for.  MPA's
-#: crossing family is a positive real-time rule with its own node ceiling
-#: and error budget (``gw.mpa.sigma_windows``), so the HGL bandwidth
-#: derivation says nothing about it and ``auto`` leaves its ξ alone.  An
-#: EXPLICIT floor applies to every ansatz — that is the knob a cross-ansatz
-#: comparison uses to equalise ξ.
-_HGL_CROSSING_ANSATZE = frozenset({"gn_ppm", "hl_ppm"})
 
 
 def hgl_partition_required(
@@ -122,24 +94,18 @@ def hgl_partition_required(
 
 
 class SigmaRegularization(NamedTuple):
-    """The EFFECTIVE Σ broadening ξ, and where it came from.
+    """The effective Σ broadening ξ, and where it came from.
 
     THE ONE PLACE the Σ regularization is resolved, for every ansatz.
-    Before 2026-08-22 GN-PPM silently raised the deck's
-    ``sigma_regularization_ev`` to a window-dependent conditioning floor
-    while MPA passed the same key straight through, so the two ran at
-    different broadenings on the same deck with nothing in either output
-    tying the number back to the key the operator set.  Measured on the
-    sodium 48b deck (grid ±5 eV, edge 1.5): GN-PPM 0.4762 eV against MPA
-    0.2500 eV, **1.90×**; on a ±15 eV window the same formula gives 1.4286
-    eV, **5.7×**.  Any MPA-vs-GN-PPM comparison made without equalising ξ
-    is confounded, and the July MoS2 ξ ladder measured 2.381 eV worth +1016
-    meV on the K gap — the floor is not comfortably far from where it goes
-    bad.
+    GN/HL-PPM and MPA all use the requested ``sigma_regularization_ev`` by
+    default.  HGL conditioning is provided by bounded crossing cells, not by
+    changing ξ as a function of the requested omega extent.  An explicit
+    ``sigma_regularization_floor_ev`` remains an operator-requested override
+    and is stamped in the output.
 
     Fields are Ry except where named ``_ev``.  ``floor_policy`` is
-    ``'auto'`` (the ansatz's own conditioning floor) or ``'explicit'`` (a
-    deck-supplied ``sigma_regularization_floor_ev``).
+    ``'auto'`` (no additional floor) or ``'explicit'`` (a deck-supplied
+    ``sigma_regularization_floor_ev``).
     """
 
     requested_ry: float
@@ -184,8 +150,6 @@ class SigmaRegularization(NamedTuple):
 def resolve_sigma_regularization(
     *,
     requested_ry: float,
-    omega_grid_ry,
-    edge_factor: float,
     ansatz: str,
     floor_ev=None,
 ) -> SigmaRegularization:
@@ -196,24 +160,15 @@ def resolve_sigma_regularization(
     requested_ry
         ``sigma_regularization_ev`` converted to Ry — what the deck asked
         for.
-    omega_grid_ry
-        The Σ ω grid.  Only ``max|ω|`` is read; that is what sets the HGL
-        core bandwidth ``A_core = 2·ω_max/ξ + 2·edge``.
-    edge_factor
-        ``sigma_window_edge_factor``.
     ansatz
         ``compute_mode``'s value string (``'gn_ppm'``, ``'hl_ppm'``,
-        ``'mpa'``, …).  Decides what ``auto`` means; see
-        :data:`_HGL_CROSSING_ANSATZE`.
+        ``'mpa'``, …), retained in the provenance stamp.
     floor_ev
-        ``sigma_regularization_floor_ev``.  ``None`` / ``'auto'`` selects
-        the ansatz's own conditioning floor.  A float (eV) is an EXPLICIT
-        floor applied to every ansatz — the knob that equalises ξ across a
-        cross-ansatz comparison.  ``0`` is a legal explicit value and means
-        "do not raise", which on an HGL ansatz re-opens the ill-conditioned
-        regime the floor exists for; it is spellable on purpose so an
-        operator can measure that, and it is stamped so nobody can do it by
-        accident.
+        ``sigma_regularization_floor_ev``.  ``None`` / ``'auto'`` means no
+        additional floor.  A float (eV) is an EXPLICIT operator-requested
+        floor applied to every ansatz.  ``0`` is a legal explicit value and
+        means "do not raise"; it is stamped so it cannot be confused with
+        the default policy.
 
     Returns
     -------
@@ -225,8 +180,6 @@ def resolve_sigma_regularization(
     from common.units import RYD_TO_EV
 
     requested = float(requested_ry)
-    omega = np.asarray(omega_grid_ry, dtype=np.float64)
-    omega_max_ry = float(np.max(np.abs(omega))) if omega.size else 0.0
     name = str(getattr(ansatz, "value", ansatz)).strip().lower()
 
     explicit = not (floor_ev is None
@@ -238,9 +191,6 @@ def resolve_sigma_regularization(
                 f"sigma_regularization_floor_ev must be >= 0 or 'auto'; "
                 f"got {floor_ev!r}.")
         policy = "explicit"
-    elif name in _HGL_CROSSING_ANSATZE:
-        floor_ry = crossing_regularization_floor(omega_max_ry, edge_factor)
-        policy = "auto"
     else:
         floor_ry = 0.0
         policy = "auto"
@@ -267,8 +217,6 @@ def sigma_regularization_for_config(config) -> SigmaRegularization:
     sigma_cfg = config.sigma
     return resolve_sigma_regularization(
         requested_ry=float(sigma_cfg.regularization_ev) / RYD_TO_EV,
-        omega_grid_ry=np.asarray(config.omega_grid_ry, dtype=np.float64),
-        edge_factor=float(sigma_cfg.window_edge_factor),
         ansatz=config.compute_mode,
         floor_ev=getattr(sigma_cfg, "regularization_floor_ev", None),
     )

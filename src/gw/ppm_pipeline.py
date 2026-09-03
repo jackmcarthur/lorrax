@@ -49,7 +49,11 @@ from .ppm_sigma import (
     fit_ppm,
 )
 from .ppm_tau_kernel import precompile_sigma
-from .ppm_windows import hgl_partition_required, sigma_regularization_for_config
+from .ppm_windows import (
+    HGL_CROSSING_PADDING_FACTOR,
+    hgl_partition_required,
+    sigma_regularization_for_config,
+)
 
 
 @dataclass(frozen=True)
@@ -641,7 +645,7 @@ def compute_ppm_sigma_pipeline(
                 energy_windows=hgl_partition_required(
                     config.omega_grid_ry,
                     sigma_xi.resolved_ry,
-                    config.sigma.window_edge_factor),
+                    HGL_CROSSING_PADDING_FACTOR),
             )
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(

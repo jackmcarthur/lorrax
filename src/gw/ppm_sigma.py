@@ -70,8 +70,7 @@ from .ppm_windows import (
     _build_windows_for_branch,
     window_mask_B_bounds,
     _to_host_np,
-    _CROSSING_A_MAX,
-    crossing_regularization_floor,
+    HGL_CROSSING_PADDING_FACTOR,
     hgl_partition_required,
     resolve_sigma_regularization,
 )
@@ -1509,7 +1508,10 @@ def compute_sigma_c_ppm_omega_grid(
     # Ansatz-neutral grid/window knobs come from DynamicSigmaConfig; the PPM
     # object contributes only its invalid-pole policy.
     regularization_width_ry = float(sigma_cfg.regularization_ev) / RYD_TO_EV
-    edge_factor = float(sigma_cfg.window_edge_factor)
+    # The legacy HGL target owns a fixed four-xi crossing shell.  The shared
+    # ``sigma_window_edge_factor`` key belongs to the MPA box/sector planner;
+    # using it here used to couple two different target families.
+    edge_factor = HGL_CROSSING_PADDING_FACTOR
     # The ansatz NAME comes from ``compute_mode`` -- the CANONICAL axis --
     # so the shared xi resolver and the sharded-window precondition decide
     # the same way here and at the sigma_mnk.h5 writer, which reads
@@ -1520,31 +1522,22 @@ def compute_sigma_c_ppm_omega_grid(
     regularization_floor_ev = getattr(
         sigma_cfg, "regularization_floor_ev", None)
 
-    # Crossing-quadrature conditioning floor: raise ξ if the Σ_c ω-grid is wide
-    # enough that the HGL core window would be ill-conditioned (Σ|α| ~ 1e5,
-    # amplifying the mesh-sensitive per-τ operand → device-dependent Σ_c blow-up
-    # + O(1e3) eV Im).
-    #
     # RESOLVED BY THE SHARED RESOLVER, not here.  ``ppm_windows.
     # resolve_sigma_regularization`` is the one place any ansatz decides its
-    # effective ξ, and it is a pure function of (requested ξ, ω grid, edge
-    # factor, ansatz, floor policy) — so the Σ_c(ω) HDF5 writer re-derives the
-    # SAME number from the same config and stamps it, instead of the resolved
-    # value living only in this local and a print.  Before 2026-08-22 MPA
-    # passed ``regularization_ev`` straight through while this raised it
-    # silently: 1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV window.
+    # effective ξ, and it is a pure function of (requested ξ, ansatz, floor
+    # policy) — so the Σ_c(ω) HDF5 writer re-derives the SAME number from the
+    # same config and stamps it, instead of the resolved value living only in
+    # this local and a print.
     _xi = resolve_sigma_regularization(
         requested_ry=regularization_width_ry,
-        omega_grid_ry=np.asarray(omega_values_ry, dtype=np.float64),
-        edge_factor=edge_factor,
         ansatz=ansatz_name,
         floor_ev=regularization_floor_ev,
     )
     print_fn(_xi.describe())
     if _xi.raised:
         print_fn(
-            f"    (A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ "
-            f"would make the HGL crossing quadrature ill-conditioned)")
+            "    (an explicit sigma_regularization_floor_ev raised the "
+            "requested ξ)")
     regularization_width_ry = _xi.resolved_ry
     partition_hgl = hgl_partition_required(
         omega_values_ry, regularization_width_ry, edge_factor)

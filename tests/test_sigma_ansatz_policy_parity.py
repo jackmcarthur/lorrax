@@ -10,13 +10,11 @@ into a ``P(None,None,'x','y')`` array and stripped the same cube with no
 divisibility check anywhere in the module.  One contract at one seam now:
 ``ppm_sigma.assert_sharded_sigma_window_divides_mesh``.
 
-**(b) The effective Sigma broadening xi.**  GN-PPM silently raised the
-deck's ``sigma_regularization_ev`` to a window-dependent conditioning
-floor; MPA passed it straight through.  1.90x apart on a +/-5 eV grid,
-5.7x on +/-15 eV, and the resolved value appeared in no artifact -- so a
-cross-ansatz comparison could not assert that two runs shared xi.  One
-resolver (``ppm_windows.resolve_sigma_regularization``), one deck key
-(``sigma_regularization_floor_ev``), one stamp.
+**(b) The effective Sigma broadening xi.**  GN/HL-PPM and MPA use the
+requested ``sigma_regularization_ev`` by default.  The bounded HGL cell
+planner, not an omega-extent-dependent xi floor, owns conditioning.  One
+resolver (``ppm_windows.resolve_sigma_regularization``), one explicit floor
+key (``sigma_regularization_floor_ev``), one stamp.
 
 **(c) fermi_reference.**  MPA read ``wfn.efermi`` and never looked at the
 key.  ``wfn.efermi`` IS the midgap, so the default agreed by coincidence
@@ -101,48 +99,28 @@ def test_the_precondition_refuses_an_indivisible_window(mesh22):
 # (b) one effective-xi resolver
 # ---------------------------------------------------------------------------
 
-def _omega_grid_ry(half_width_ev):
-    half = half_width_ev / RYD_TO_EV
-    return np.linspace(-half, half, 41)
+def test_auto_keeps_requested_xi_for_every_ansatz():
+    """Omega extent is absent from the resolver and cannot change xi."""
+    import inspect
 
+    from gw.ppm_windows import resolve_sigma_regularization
 
-def test_auto_raises_the_hgl_ansatze_and_leaves_mpa_alone():
-    """The measured 1.90x / 5.7x, reproduced from the shipped formula."""
-    from gw.ppm_windows import (crossing_regularization_floor,
-                                resolve_sigma_regularization)
-
-    for half_ev, expect_ev in ((5.0, 0.4762), (15.0, 1.4286)):
-        grid = _omega_grid_ry(half_ev)
-        ppm = resolve_sigma_regularization(
-            requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-            edge_factor=1.5, ansatz="gn_ppm")
-        mpa = resolve_sigma_regularization(
-            requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-            edge_factor=1.5, ansatz="mpa")
-        assert ppm.raised and not mpa.raised
-        assert ppm.resolved_ev == pytest.approx(expect_ev, abs=1e-3)
-        assert mpa.resolved_ev == pytest.approx(0.25, rel=1e-12)
-        # The DRIFT this row exists for, quoted from the resolver itself.
-        assert ppm.resolved_ry / mpa.resolved_ry == pytest.approx(
-            expect_ev / 0.25, rel=1e-3)
-        # ...and it is the same closed form the driver used before.
-        assert ppm.floor_ry == pytest.approx(
-            crossing_regularization_floor(
-                float(np.max(np.abs(grid))), 1.5), rel=1e-12)
-    # hl_ppm takes the same floor as gn_ppm: it is the same quadrature.
-    hl = resolve_sigma_regularization(
-        requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=_omega_grid_ry(5.0),
-        edge_factor=1.5, ansatz="hl_ppm")
-    assert hl.raised
+    assert "omega_grid_ry" not in inspect.signature(
+        resolve_sigma_regularization).parameters
+    resolved = [resolve_sigma_regularization(
+        requested_ry=0.25 / RYD_TO_EV, ansatz=ansatz)
+        for ansatz in ("gn_ppm", "hl_ppm", "mpa")]
+    assert all(not value.raised for value in resolved)
+    assert all(value.resolved_ev == pytest.approx(0.25, rel=1e-12)
+               for value in resolved)
+    assert all(value.floor_ry == 0.0 for value in resolved)
 
 
 def test_an_explicit_floor_equalises_xi_across_ansatze():
     """The knob the register asked for: one number, both ansaetze."""
     from gw.ppm_windows import resolve_sigma_regularization
 
-    grid = _omega_grid_ry(15.0)
-    kw = dict(requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-              edge_factor=1.5, floor_ev=0.8)
+    kw = dict(requested_ry=0.25 / RYD_TO_EV, floor_ev=0.8)
     a = resolve_sigma_regularization(ansatz="gn_ppm", **kw)
     b = resolve_sigma_regularization(ansatz="mpa", **kw)
     assert a.resolved_ry == b.resolved_ry
@@ -158,8 +136,7 @@ def test_a_requested_xi_above_the_floor_is_never_lowered():
     from gw.ppm_windows import resolve_sigma_regularization
 
     r = resolve_sigma_regularization(
-        requested_ry=3.0 / RYD_TO_EV, omega_grid_ry=_omega_grid_ry(5.0),
-        edge_factor=1.5, ansatz="gn_ppm")
+        requested_ry=3.0 / RYD_TO_EV, ansatz="gn_ppm")
     assert r.resolved_ev == pytest.approx(3.0, rel=1e-12) and not r.raised
 
 
@@ -167,13 +144,12 @@ def test_the_log_line_is_the_same_sentence_for_both_ansatze():
     """A comparison can only assert equal xi if both runs print it alike."""
     from gw.ppm_windows import resolve_sigma_regularization
 
-    grid = _omega_grid_ry(5.0)
     lines = [resolve_sigma_regularization(
-        requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-        edge_factor=1.5, ansatz=a).describe() for a in ("gn_ppm", "mpa")]
+        requested_ry=0.25 / RYD_TO_EV,
+        ansatz=a).describe() for a in ("gn_ppm", "mpa")]
     for line in lines:
         assert "Σ broadening ξ:" in line and "requested" in line
-    assert "RAISED" in lines[0] and "RAISED" not in lines[1]
+    assert all("RAISED" not in line for line in lines)
 
 
 def test_a_bad_floor_refuses_rather_than_resolving_to_auto():
@@ -181,8 +157,8 @@ def test_a_bad_floor_refuses_rather_than_resolving_to_auto():
 
     with pytest.raises(ValueError):
         resolve_sigma_regularization(
-            requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=_omega_grid_ry(5.0),
-            edge_factor=1.5, ansatz="gn_ppm", floor_ev=-1.0)
+            requested_ry=0.25 / RYD_TO_EV,
+            ansatz="gn_ppm", floor_ev=-1.0)
 
 
 # ---------------------------------------------------------------------------

@@ -2178,19 +2178,11 @@ _DEFAULTS = {
     # range spelling (docs/dev/crossing-rule-cost-law.md).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
-    # Effective-xi FLOOR, in eV.  "auto" (default) = the ansatz's own
-    # conditioning floor: for the HGL plasmon-pole crossing quadrature that
-    # is `ppm_windows.crossing_regularization_floor` = 2*omega_max/(24 -
-    # 2*edge), which is why a GN-PPM run on a +/-5 eV grid at edge 1.5
-    # silently ran at 0.4762 eV where the deck said 0.25; for MPA it is 0,
-    # because MPA's crossing family is a positive real-time rule with its
-    # own node ceiling and the HGL bandwidth derivation says nothing about
-    # it.  A FLOAT is an explicit floor applied to EVERY ansatz -- the knob
-    # that equalises xi across a cross-ansatz comparison, which is otherwise
-    # confounded (1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV
-    # window).  0 is legal and means "do not raise"; on an HGL ansatz that
-    # re-opens the ill-conditioned regime the floor exists for, so it is
-    # spellable on purpose and stamped so it cannot happen by accident.
+    # Effective-xi FLOOR, in eV.  "auto" (default) adds no floor: every
+    # ansatz uses the requested sigma_regularization_ev.  HGL conditions a
+    # wide omega grid by partitioning it into bounded crossing cells with a
+    # fixed four-xi shell, not by changing xi.  A FLOAT is an explicit floor
+    # applied to EVERY ansatz.  0 is legal and means "do not raise".
     # Resolved ONCE by `ppm_windows.resolve_sigma_regularization` and
     # stamped into sigma_mnk.h5 beside the requested value.
     "sigma_regularization_floor_ev": "auto",
