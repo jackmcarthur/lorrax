@@ -259,10 +259,17 @@ def part_a_residuals(mesh):
         nk_tot=2 * m.nk, nspin=m.nspin, nspinor_wfn=m.nspinor))
     out["hall_dynamic_trs_twin"] = (
         float(np.max(np.abs(sigma_trs))), None)
+    # Reduction last bits are backend-specific.  These are the pre-extension
+    # z=0 bytes captured on the certified CPU and CUDA paths; selecting the
+    # old occupied-Berry row above must preserve the appropriate literal.
+    frozen_static = {
+        "cpu": "358bf00049d5823ff158d907361e8f3fec79838d1a3296bf",
+        "gpu": "358bf00049d5823ff158d907361e8f3ff379838d1a3296bf",
+    }
+    platform = jax.devices()[0].platform
     out["hall_static_frozen_bits"] = (
         0.0 if sigma_samples[0].real.tobytes().hex()
-        == "358bf00049d5823ff158d907361e8f3fec79838d1a3296bf"
-        else 1.0,
+        == frozen_static.get(platform) else 1.0,
         None,
     )
     return out
