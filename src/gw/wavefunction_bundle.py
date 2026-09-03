@@ -114,25 +114,32 @@ class BandSlices:
     b4_chi: int = 0        # 0 == "not split": resolves to b4
     b4_sigma: int = 0
     sigma_sum: slice = slice(0, 0)   # [0, b4_sigma-b0)  the Sigma band sum
-    #: [b2-b0, b4-b0) — conduction bands over the LOADED window, i.e. the
-    #: UNION of what χ0 and Σ reach.  Exactly ``cond`` on an unsplit deck.
-    #: Its one consumer is the minimax τ-axis (``build_static_quadrature``),
-    #: which certifies a 1/x rule on ``[x_min, x_max]`` and is then reused by
-    #: BOTH stages: an interval built from the χ conduction top alone would
-    #: not cover Σ's transitions on a deck whose Σ count is the larger one,
-    #: and the resulting quadrature error is invisible at the seam that
-    #: caused it.
+    #: [b2-b0, b4-b0) — conduction bands over the PADDED loaded carrier.
+    #: This is a shape/layout slice, not a physical spectral window.
+    #:
+    #: The physical union is :attr:`cond_all_logical`, which ends at
+    #: ``b4_logical``.  Keeping both names on this carrier prevents a consumer
+    #: from recovering a logical count from a padded shape.
     cond_all: slice = slice(0, 0)
+    #: Logical union top used by spectral consumers.  On a split deck this is
+    #: max(chi, sigma); on every deck it excludes the process-mesh pad in b4.
+    b4_logical: int = 0
 
     @classmethod
     def from_band_edges(cls, b0: int, b1: int, b2: int, b3: int, b4: int,
                         *, b4_chi: int | None = None,
-                        b4_sigma: int | None = None) -> BandSlices:
+                        b4_sigma: int | None = None,
+                        b4_logical: int | None = None) -> BandSlices:
         if not (b0 <= b1 <= b2 <= b3 <= b4):
             raise ValueError(f"Invalid band edges: {(b0, b1, b2, b3, b4)}")
         nb_full = b4 - b0
         b4_chi = b4 if b4_chi in (None, 0) else int(b4_chi)
         b4_sigma = b4 if b4_sigma in (None, 0) else int(b4_sigma)
+        b4_logical = b4 if b4_logical in (None, 0) else int(b4_logical)
+        if not (b2 <= b4_logical <= b4):
+            raise ValueError(
+                f"Invalid b4_logical={b4_logical}: the physical loaded-band "
+                f"top must satisfy b2={b2} <= b4_logical <= padded b4={b4}.")
         for name, edge in (("b4_chi", b4_chi), ("b4_sigma", b4_sigma)):
             if not (b2 <= edge <= b4):
                 raise ValueError(
@@ -157,6 +164,7 @@ class BandSlices:
             b4_sigma=b4_sigma,
             sigma_sum=slice(0, b4_sigma - b0),
             cond_all=slice(b2 - b0, nb_full),
+            b4_logical=b4_logical,
         )
 
     @property
@@ -178,6 +186,21 @@ class BandSlices:
     def nb_sigma_sum(self) -> int:
         """Bands in the Σ band sum (the count the extrapolation brackets)."""
         return self.b4_sigma - self.b0
+
+    @property
+    def cond_all_logical(self) -> slice:
+        """Conduction bands in the logical union of the chi and Sigma sums.
+
+        This is the minimax tau-axis window: an interval built from ``cond``
+        can under-cover Sigma when Sigma is larger, while one built from
+        padded ``cond_all`` changes with process geometry.
+        """
+        return slice(self.b2 - self.b0, self.b4_logical - self.b0)
+
+    @property
+    def nb_full_logical(self) -> int:
+        """Logical loaded-band count, excluding process-mesh padding."""
+        return self.b4_logical - self.b0
 
     @property
     def is_split(self) -> bool:

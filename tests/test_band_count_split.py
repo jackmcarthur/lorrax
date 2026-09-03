@@ -338,6 +338,20 @@ def test_cond_all_is_the_union_not_the_chi_leg():
     assert s.cond_all == slice(8, 248)
 
 
+def test_logical_conduction_union_excludes_process_padding():
+    """A spectral consumer never promotes carrier padding into real bands."""
+    p16 = _slices(
+        b2=46, b3=72, b4=192, b4_chi=192, b4_sigma=192,
+        b4_logical=184)
+    p36 = _slices(
+        b2=46, b3=72, b4=216, b4_chi=216, b4_sigma=216,
+        b4_logical=184)
+
+    assert p16.cond_all != p36.cond_all
+    assert p16.cond_all_logical == p36.cond_all_logical == slice(46, 184)
+    assert p16.nb_full_logical == p36.nb_full_logical == 184
+
+
 def test_the_larger_count_must_own_the_padded_edge():
     """``b4`` is the padded top of the LARGER consumer.  A BandSlices whose
     two tops are both below ``b4`` would mean bands were loaded that no

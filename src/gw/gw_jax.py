@@ -489,7 +489,8 @@ def main(argv=None):
 	# remains the independently parsed ``config.bispinor`` policy.
 	meta.bispinor = charge_bispinor
 	band_slices = BandSlices.from_band_edges(
-		*meta.band_edges, b4_chi=meta.b_id_4_chi, b4_sigma=meta.b_id_4_sigma)
+		*meta.band_edges, b4_chi=meta.b_id_4_chi,
+		b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
 	# THE ``max`` IS NEVER SILENT.  Which of the two counts sized the ISDF ζ
 	# fit is exactly the thing a reader of this log needs and cannot infer:
 	# ``nband`` in the deck echo is already the max, so without this line a
