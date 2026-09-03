@@ -2052,6 +2052,21 @@ def _gate_dynamic_hall_head(
             print_fn("Faraday head : " + record, flush=True)
         return record
 
+    if config.compute_mode.ppm_model == "hl":
+        raise NotImplementedError(
+            "GATE dynamic_hall_head_hl_imaginary_probe: measured-broken-TR "
+            "HL-PPM is refused before the packed photon body is opened.\n"
+            "  got:  SymMaps.trs_allowed = false, compute_mode = hl_ppm\n"
+            "  want: compute_mode = gn_ppm for the authenticated "
+            "z=i*omega_p Hall probe\n"
+            "  why:  HL supplies a real-axis scalar probe while the Hall "
+            "artifact is sampled on the imaginary axis; combining them "
+            "would fit two different analytic continuations\n"
+            "  fix:  use gn_ppm, or add an authenticated real-axis Hall "
+            "sample before enabling magnetic HL\n"
+            "  doc:  docs/theory/four-current-head-corrections.md, dynamic "
+            "Hall/Faraday head.")
+
     omega_p = float(config.ppm.omega_p)
     probe = 1j * omega_p
     if hall_transaction is None:
@@ -2539,12 +2554,8 @@ def compute_static_photon_response(
         faraday_ppm = None
         if dynamic_hall:
             if config.compute_mode.ppm_model != "gn":
-                gate = (
-                    "dynamic_hall_head_hl_imaginary_probe"
-                    if config.compute_mode.ppm_model == "hl" else
-                    "dynamic_hall_head_non_gn_unimplemented")
                 raise NotImplementedError(
-                    f"GATE {gate}: the Hall "
+                    "GATE dynamic_hall_head_non_gn_unimplemented: the Hall "
                     "completion is authenticated at z=i*omega_p but this "
                     "mode does not supply the matching GN imaginary-axis "
                     "charge role (HL supplies a real-axis probe; non-PPM "

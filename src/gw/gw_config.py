@@ -4031,6 +4031,24 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "  doc:  docs/input_reference.md, qp_solver.")
         if (config.qp_solver is QPSolver.SELF_CONSISTENT
                 and mode is BispinorGWMode.BARE_TRANSVERSE
+                and config.compute_mode is ComputeMode.X_ONLY):
+            raise ValueError(
+                "GATE packed_bare_x_only_self_consistency_unimplemented: "
+                "packed x_only has no self-consistent map owner.\n"
+                "  got:  bispinor_gw = bare_transverse, "
+                "compute_mode = x_only, qp_solver = self_consistent\n"
+                "  want: qp_solver = one_shot_dft, or a dynamic compute_mode "
+                "in {gn_ppm, hl_ppm, mpa}\n"
+                "  why:  IMPLEMENTATION LIMIT.  The existing packed-current "
+                "SC map is entered only by a dynamic Sigma mode.  Letting "
+                "x_only fall through would select the retiring non-packed "
+                "transverse-exchange owner instead of re-projecting the "
+                "immutable packed current operator on each map\n"
+                "  fix:  use qp_solver = one_shot_dft, or extend the sole "
+                "packed-current SC map to x_only and certify that route\n"
+                "  doc:  docs/input_reference.md, qp_solver / bispinor_gw.")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and mode is BispinorGWMode.BARE_TRANSVERSE
                 and config.compute_mode is ComputeMode.COHSEX):
             raise ValueError(
                 "GATE packed_bare_cohsex_self_consistency_unimplemented: "
