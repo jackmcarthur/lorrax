@@ -642,12 +642,13 @@ def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
 # ``_extract_diag_kernel``: a closure inside ``build_qsgw_sigma_xc``
 # retraced+recompiled the full (nω, nk, nb, nb) gather every SC
 # iteration.
-_QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool, bool], object] = {}
+_QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool, bool, bool], object] = {}
 
 
 def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool,
-                        one_sided: bool):
-    key = (id(mesh_xy), bool(replicated_output), bool(one_sided))
+                        one_sided: bool, fermi_offdiagonal: bool):
+    key = (id(mesh_xy), bool(replicated_output), bool(one_sided),
+           bool(fermi_offdiagonal))
     fn = _QSGW_BUILD_KERNEL_CACHE.get(key)
     if fn is None:
         out_3d = NamedSharding(
@@ -656,7 +657,8 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool,
             else P(None, "x", "y"))
 
         @jax.jit
-        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi, core_mask):
+        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi, core_mask,
+                    if_lo, if_hi, wf_lo, wf_hi):
             # ilo/ihi/wlo/whi: (nk, nb) replicated; sig_w: (nω, nk, nb_m_X, nb_n_Y).
             # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
             # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
@@ -687,7 +689,19 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool,
             # partner use B=Σ_mn(E_n).  Same-side pairs retain the standard
             # QSGW half-sum.  Hermitisation below then makes the two cross-edge
             # entries exact adjoints without referring to the buffer energy.
-            sigma_c = 0.5 * (A + B)
+            if fermi_offdiagonal:
+                # QSGW0 two-level update: the diagonal follows its own
+                # moving on-shell energy, while every off-diagonal samples
+                # the one fixed Fermi reference.  The subsequent explicit
+                # Hermitisation is still the sole owner of numerical
+                # anti-Hermitian interpolation noise.
+                sigma_c_fermi = (
+                    wf_lo * sig_w[if_lo] + wf_hi * sig_w[if_hi])
+                diag_a = jnp.diagonal(A, axis1=-2, axis2=-1)
+                idx = jnp.arange(sig_w.shape[-1])
+                sigma_c = sigma_c_fermi.at[:, idx, idx].set(diag_a)
+            else:
+                sigma_c = 0.5 * (A + B)
             if one_sided:
                 m_core = core_mask[:, None]
                 n_core = core_mask[None, :]
@@ -722,16 +736,25 @@ def build_qsgw_sigma_xc(
     *,
     replicated_output: bool = True,
     one_sided_core_mask: np.ndarray | None = None,
+    offdiagonal_efermi_ev: float | None = None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
-    Implements the standard QSGW ansatz
+    By default, implements the standard QSGW ansatz
 
         Σ_xc^QSGW_ij(k) = ½[ Σ_xc_ij(k, E_i(k)) + Σ_xc_ij(k, E_j(k)) ]ʰ
 
     where ``[·]ʰ`` denotes the Hermitian part (real-symmetrisation against
     interpolation noise).  Σ_xc = Σ_c + Σ_x; Σ_x is ω-independent so it
     is added once after the Σ_c(ω) interpolation.
+
+    When ``offdiagonal_efermi_ev`` is supplied, the self-consistent path's
+    two-level update law is used instead: diagonal ``(m=m)`` elements are
+    evaluated on shell at ``E_m`` and every off-diagonal at the supplied
+    Fermi reference.  The caller passes zero when both the omega grid and
+    energies are Fermi-relative.  The argument has no default behaviour for
+    self-consistency: omitting it deliberately retains the historical
+    half-sum, which is required for one-shot and SC map-1 bit identity.
 
     ``one_sided_core_mask`` is the explicit window-edge diagnostic rule.  A
     coupling with exactly one core endpoint is evaluated at that endpoint's
@@ -797,6 +820,12 @@ def build_qsgw_sigma_xc(
                 "subspaces.")
     else:
         core_mask = np.zeros(nb, dtype=bool)
+    fermi_offdiagonal = offdiagonal_efermi_ev is not None
+    if fermi_offdiagonal and one_sided:
+        raise ValueError(
+            "offdiagonal_efermi_ev and one_sided_core_mask request two "
+            "different off-diagonal evaluation energies; the SC update "
+            "law requires Sigma_mn(E_F) for every m != n")
 
     # Linear-interp index/weight arrays, host-side then pushed replicated.
     omega_lo = float(omega[0])
@@ -811,6 +840,20 @@ def build_qsgw_sigma_xc(
     denom = np.where(ω_hi > ω_lo, ω_hi - ω_lo, 1.0)
     w_hi = (E_clamped - ω_lo) / denom
     w_lo = 1.0 - w_hi
+
+    # Scalar interpolation receipt for the SC-only off-diagonal law.  Dummy
+    # values keep one stable kernel signature on the historical path.
+    efermi_eval = float(omega_lo if offdiagonal_efermi_ev is None
+                        else offdiagonal_efermi_ev)
+    efermi_clamped = float(np.clip(efermi_eval, omega_lo, omega_hi))
+    if_hi = int(np.clip(
+        np.searchsorted(omega, efermi_clamped, side="left"),
+        1, n_omega - 1))
+    if_lo = if_hi - 1
+    f_denom = float(omega[if_hi] - omega[if_lo])
+    wf_hi = ((efermi_clamped - float(omega[if_lo])) / f_denom
+             if f_denom > 0.0 else 0.0)
+    wf_lo = 1.0 - wf_hi
 
     rep_2d = NamedSharding(mesh_xy, P(None, None))
     # Numpy → replicated, placed PROCESS-LOCALLY: a bare ``jax.device_put``
@@ -833,9 +876,12 @@ def build_qsgw_sigma_xc(
 
     sigma_xc_qsgw = _qsgw_build_kernel(
         mesh_xy, replicated_output=bool(replicated_output),
-        one_sided=one_sided)(
+        one_sided=one_sided,
+        fermi_offdiagonal=fermi_offdiagonal)(
         sigma_c_omega_ry, sigma_x_kij_ry,
         idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, core_j,
+        np.int32(if_lo), np.int32(if_hi),
+        np.complex128(wf_lo), np.complex128(wf_hi),
     )
     sigma_xc_qsgw.block_until_ready()
 
@@ -846,6 +892,10 @@ def build_qsgw_sigma_xc(
         "omega_max_ev": omega_hi,
         "n_one_sided_edges": float(
             2 * int(core_mask.sum()) * int((~core_mask).sum()) * nk),
+        "offdiagonal_efermi_ev": (
+            float(efermi_clamped) if fermi_offdiagonal else float("nan")),
+        "efermi_was_clipped": float(
+            fermi_offdiagonal and efermi_clamped != efermi_eval),
     }
     return sigma_xc_qsgw, diagnostics
 

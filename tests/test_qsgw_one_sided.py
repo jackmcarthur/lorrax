@@ -42,3 +42,36 @@ def test_one_sided_mask_requires_core_and_buffer():
             sigma, sigma_x, np.asarray([0.0, 1.0]),
             np.asarray([[0.0, 1.0]]), mesh,
             one_sided_core_mask=np.asarray([True, True]))
+
+
+def test_sc_update_uses_fermi_offdiagonal_and_on_shell_diagonal():
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    sigma = np.zeros((3, 1, 2, 2), dtype=np.complex128)
+    # Off-diagonal values distinguish E_0=-1, E_F=0, and E_1=+1.
+    sigma[:, 0, 0, 1] = sigma[:, 0, 1, 0] = (1.0, 5.0, 9.0)
+    # Diagonals must still follow their own on-shell energies.
+    sigma[:, 0, 0, 0] = (11.0, 12.0, 13.0)
+    sigma[:, 0, 1, 1] = (21.0, 22.0, 23.0)
+
+    result, diagnostics = build_qsgw_sigma_xc(
+        jnp.asarray(sigma),
+        jnp.zeros((1, 2, 2), dtype=jnp.complex128),
+        np.asarray([-1.0, 0.0, 1.0]),
+        np.asarray([[-1.0, 1.0]]), mesh,
+        offdiagonal_efermi_ev=0.0)
+
+    np.testing.assert_allclose(
+        np.asarray(result)[0], np.asarray([[11.0, 5.0], [5.0, 23.0]]))
+    assert diagnostics["offdiagonal_efermi_ev"] == 0.0
+    assert diagnostics["efermi_was_clipped"] == 0.0
+
+
+def test_sc_fermi_law_refuses_the_legacy_one_sided_edge_law():
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    with np.testing.assert_raises_regex(ValueError, "two different"):
+        build_qsgw_sigma_xc(
+            jnp.zeros((2, 1, 2, 2), dtype=jnp.complex128),
+            jnp.zeros((1, 2, 2), dtype=jnp.complex128),
+            np.asarray([0.0, 1.0]), np.asarray([[0.0, 1.0]]), mesh,
+            one_sided_core_mask=np.asarray([True, False]),
+            offdiagonal_efermi_ev=0.0)
