@@ -103,74 +103,70 @@ the gate is red for a **different, now-measured** reason.
 
 **2026-09-02 (integ reconciliation).** The deck now names `w_dyson_solver = local` explicitly: an unnamed solver on a slab bare_transverse deck is derived to `distributed` at parse time (heads always on), which `distrib_la` refuses on this fixture's 1x1 mesh. With `local` the fixture stays on the incumbent route the reference was cut from and keeps failing at the pre-existing drift documented above.
 
-## 2026-09-02 historical attribution follow-up
+## 2026-09-03 matched-historical-FFI attribution closure
 
-The requested numerical bisect could not cross the historical native-library
-boundary without violating the measurement contract.  The mandatory runtime
-contains the `8576f9f9` `src/ffi` tree (`8d34f444...`).  The last commit before
-the kin-ion provenance refusal, `0b43d0a6`, has `f380b216...`; the frozen
-reference ancestry is older again.  The first compatible first-parent commit
-is `60cf0273`.  Both the `sigC` (`max |delta| > 0.05 eV`) and direct-field
-bisects therefore terminate with the interval
-`1e64d83a..60cf0273^` skipped, rather than naming a first bad commit.  The
-reference header identifies `dd727216` as the generating tree and `1e64d83a`
-as the freeze commit.  Bisect records and every probe are under
-`runs/DEV/320_bisp_fixture_drift_20260902/`.
+The earlier ABI limitation is now removed.  Six historical `src/ffi` trees
+were built on Perlmutter compute nodes in bounded directories under
+`/pscratch/sd/j/jackm/wt_codex_fixture_hist/ffi_<hash>/`; every probe canary
+prints the exact loaded `.so`.  The 2026-08-09 freeze tree reproduces the
+reference exactly: zero changed cells out of 1620.
 
-The executable half of the history is decisive:
+The drift is fully assigned.  Each numeric cell below is mean / population
+standard deviation / maximum absolute move in eV over 270 rows:
 
-| comparison (B - A) | `sigX` | `sigC` | `sigXC` | direct field |
+| cause (exact parent -> commit or artifact B - A) | `sigX` | `sigC` | `sigXC` | direct field |
 |---|---:|---:|---:|---:|
-| frozen reference -> `60cf0273` | +0.003954 / 0.002263 / 0.007798 | +0.510978 / 0.210189 / 0.803370 | +0.514932 / 0.210204 / 0.804859 | +0.277667 / 0.447171 / 1.434381 |
-| `60cf0273` -> `837ed531` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
-| `837ed531` -> `8576f9f9` | 0 / 0 / 0 | -0.001282 / 0.001591 / 0.004073 | -0.001281 / 0.001591 / 0.004073 | 0 / 0 / 0 |
+| `e83ff7d5 -> 07451900`, apply WFN reciprocal scale once | -0.000290 / 0.000183 / 0.000591 | -0.000045 / 0.000108 / 0.000402 | -0.000335 / 0.000251 / 0.000981 | +0.003042 / 0.001112 / 0.004631 |
+| `9a3409ca -> 4534dc79`, normalize response by source-WFN states | 0 / 0 / 0 | +0.512756 / 0.210173 / 0.803032 | +0.512756 / 0.210173 / 0.803032 | 0 / 0 / 0 |
+| `56627937 -> 8f46b0de`, Coulomb-gauge TT metric sign | +0.004243 / 0.002445 / 0.008389 | 0 / 0 / 0 | +0.004243 / 0.002445 / 0.008389 | 0 / 0 / 0 |
+| `d235f100 -> 27f1e5c9`, orbit-safe 0.2% GN pole-tail policy | 0 / 0 / 0 | -0.001734 / 0.002545 / 0.013729 | -0.001734 / 0.002545 / 0.013729 | 0 / 0 / 0 |
+| `0b43d0a6`, regenerated minus archived `kin_ion.h5` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | +0.274625 / 0.446359 / 1.429902 |
 
-Each cell is mean / population standard deviation / maximum absolute move in
-eV over 270 rows.  The post-`837ed531` move first appears between the last
-unchanged box-plan-only commit `2fcf81ab` and the first runnable certified
-shared-MPA route `0140d997`; intermediate `a751d10b` fails with an unexpected
-`B_odd_p` keyword, while `5a0326a7` and `5908434f` refuse because the measured
-runtime-noise bound `6.28194e-07` exceeds `5e-07`.  `0140d997` and `8576f9f9`
-are identical.  The extra move is therefore the separately requested box-rule
-physics change, not part of the old-reference drift; it moves the largest
-printed `eqp1` row by 4.049637 meV and the reported effective-H gap from
-3.41116 to 3.41286 eV.
+The remaining endpoint residual after summing these rows is at most 2e-6 eV,
+below the gate's 1e-5 eV tolerance.  The two anticipated candidates are
+negative controls on this TRS fixture: `07071457` moves all printed columns by
+exactly zero, and `b0212b6b` (`-2F` -> the two ordered orientations) moves
+`sigX`, `sigC`, and the direct field by zero, with only three `sigXC` values
+rounding by 1e-6 eV.  Its own P4 ordered-pair gate is accurate to
+`4.936e-16`.  The VNL velocity-sign change remains excluded by the reference
+header's exact re-verification, and head/wing changes cannot contribute to the
+explicit head-off, zero-head deck.
 
-The direct-field decomposition also corrects the earlier hypothesis.  The
-component-aware receipt at `837ed531` authenticates `Hdir = V_H + H_T`, but
-this nonmagnetic fixture has `max |H_T| = 2.110e-35 eV`.  Thus the 1.434381 eV
-maximum is entirely the scalar `V_H` representation/artifact move, not the
-addition of transverse Hartree.  Holding the exact pre-live artifact fixed
-across `89db5652 -> 62f1fa22` measures zero in every printed column, so the
-stored-exact -> live-exact G-space code switch itself is also zero here.  The
-archived July artifact contains only `kin_ion`; the regenerated pre-live
-artifact also contains exact `v_hartree` and `v_hartree_transverse`, so
-`hartree_source=auto` changes from ISDF to stored-exact on the old code.  Its
-share at `0b43d0a6` remains unmeasured because that exact tree is on the
-incompatible FFI side of the boundary.
+The large `sigC` step is therefore neither q-grid reconstruction nor the
+`-2F` removal.  It is the legitimate `4534dc79` correction at
+`src/gw/w_isdf.py:1311-1330` in that tree: a four-component kinetic-balance
+representation does not double the number of physical source-WFN states, so
+the Dyson response prefactor must use `nspinor_wfnfile`, not `nspinor=4`.
+Its commit records an alpha-to-zero P4 gate whose four-state red twin is
+exactly one half (JID 57527799, step
+`lx-Xg4-081151-102145-8903`).  `07451900`, `8f46b0de`, and `27f1e5c9` are
+likewise intentional physics corrections: respectively the missing `blat`
+conversion at the WFN boundary, the spatial Lorentz-metric minus in
+`D_TT=-vP_T`, and the user-ruled, explicitly lossy but Wc(0)-preserving 0.2%
+GN tail policy.  No unregistered physics defect is needed to explain the
+fixture.
 
-The same controlled artifact swap at the compatible live-only source
-`62f1fa22` moves no printed Sigma/direct-field value, although off-diagonal
-kinetic/ionic changes move the largest `eqp1` row by 0.272168 meV.  It is a
-surrogate control, not the prohibited historical A/B.
+The direct-field result also replaces the earlier hypothesis.  At the exact
+pre-provenance tree, changing only `kin_ion.h5` gives the 1.429902 eV maximum
+and zero Sigma movement.  `f80a5f70` is the immediate child and correctly
+refuses the archived file: “kin_ion.h5 carries no bispinor provenance stamp”.
+The remaining 4.631 meV maximum is exactly `07451900`'s WFN reciprocal-scale
+correction.  `H_T` is only `2.110e-35 eV`, and the fixed-artifact
+`89db5652 -> 62f1fa22` live-G-space Hartree switch is zero.  Thus the old
+`VH`/new `Hdir` label change is not the numerical cause; the value remains
+scalar `V_H` to displayed precision.
 
-Candidate rulings are correspondingly bounded.  The VNL velocity-sign fix
-`6b3ffc1f` postdates the generating SHA but is already present at the
-reference header's exact `5b135f8e` re-verification (0/1620 cells changed),
-so it is excluded.  Heads cannot contribute because the deck sets
-`head_correction=off` and all three head scalars to zero.  The ordered GN
-probe and `Re Omega^2` changes postdate `837ed531`, and this run reports
-`Global TRS: enabled`.  The `-2F` replacement landed in this ancestry as
-`b0212b6b` (patch-equivalent to `8cd30c79`).  Its old and new expressions are
-algebraically equal when the ordered orientation is related by TRS, but its
-exact fixture contribution remains inside the unprobed interval.  The
-unresolved `sigC` move is confined to that ABI-blocked scalar-charge
-q-grid/screening interval, which includes the legitimate TRS-coherent q-grid
-reconstruction `07071457`.  The low-memory face-layout zeta changes are not
-active because this deck leaves `low_mem_bands` at its false default; the
-face-wing fixes are separately excluded by the head-off/zero-head inputs.
-No per-commit number is assigned to a remaining candidate in the interval:
-doing so would be a guess.
+On the merge topology, `520ad4f5 = 60cf0273^1` retains the full direct-field
+artifact/scale move but is exactly frozen in all Sigma columns.
+`88711198 = 60cf0273^2` is byte-identical to `60cf0273`; the merge brings the
+four localized physics fixes onto the first parent and adds no merge-only
+numerical change.  The separate `837ed531 -> 8576f9f9` box-rule result is
+unchanged: `sigC` -0.001282 / 0.001591 / 0.004073 eV, with a maximum printed
+`eqp1` move of 4.049637 meV.
+
+Full build, bisect, refusal, canary, and artifact receipts are in
+`runs/DEV/320_bisp_fixture_drift_20260902_histffi/`.  The older
+`runs/DEV/320_bisp_fixture_drift_20260902/` remains immutable.
 
 This follow-up still does **not** authorize a re-freeze.  A literal incumbent
 tip copy would be:
