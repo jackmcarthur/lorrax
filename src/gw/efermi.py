@@ -85,7 +85,7 @@ __all__ = [
     "OccupationState", "assert_fixed_n", "assert_wfn_occupation_consistency",
     "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
     "mp1_negative_derivative", "mp1_occupations",
-    "occupation_clamp_tol", "occupation_weight_floor",
+    "occupation_clamp_tol", "occupation_digest", "occupation_weight_floor",
     "occupied_band_count", "resolve_sigma_efermi_ry",
     "solve_mp1_occupations", "step_occupations",
 ]
@@ -687,6 +687,42 @@ def step_occupations(E_kn, e_fermi) -> jax.Array:
             < jnp.asarray(e_fermi, dtype=jnp.float64)).astype(jnp.float64)
 
 
+def occupation_digest(f_kn, *, band_extent: int | None = None) -> str:
+    """Hash an occupation table without making zero padding physical.
+
+    With no explicit extent, common trailing columns that are exactly zero on
+    every k point are removed before hashing.  ``band_extent`` exists only for
+    authenticating legacy stores whose digest included a producer mesh's zero
+    pad: nonzero columns may never be truncated, and a larger extent appends
+    exact zeros.  The numerical carrier itself is never changed.
+    """
+    f = np.asarray(f_kn, dtype=np.float64)
+    if f.ndim != 2 or min(f.shape) < 1:
+        raise ValueError(
+            f"occupation_digest: f_kn must be nonempty (nk,nb); got {f.shape}")
+    if not np.all(np.isfinite(f)):
+        raise ValueError("occupation_digest: f_kn must be finite")
+    if band_extent is None:
+        occupied_columns = np.flatnonzero(np.any(f != 0.0, axis=0))
+        stop = int(occupied_columns[-1]) + 1 if occupied_columns.size else 1
+    else:
+        stop = int(band_extent)
+        if stop < 1:
+            raise ValueError(
+                f"occupation_digest: band_extent must be positive; got {stop}")
+        if stop < int(f.shape[1]) and np.any(f[:, stop:] != 0.0):
+            raise ValueError(
+                "occupation_digest: requested legacy extent would truncate "
+                "nonzero occupations")
+    if stop <= int(f.shape[1]):
+        canonical = f[:, :stop]
+    else:
+        canonical = np.pad(f, ((0, 0), (0, stop - int(f.shape[1]))),
+                           mode="constant", constant_values=0.0)
+    return hashlib.sha256(
+        np.ascontiguousarray(canonical).tobytes()).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class OccupationState:
     """The one per-iteration occupation record every metal consumer reads.
@@ -697,8 +733,9 @@ class OccupationState:
     signatures — that is the shadow-accounting failure class.  It owns the
     fixed-N invariant: both constructors assert the realised electron count
     against the target (``assert_fixed_n``), and ``__post_init__`` binds
-    ``occ_hash`` to the bytes of ``f_kn`` so a stamp can never describe a
-    table it was not computed from.
+    ``occ_hash`` to the physical bytes of ``f_kn`` so a stamp can never
+    describe a table it was not computed from. Common trailing exact-zero band
+    columns are process padding and are excluded from that digest.
 
     ``f_kn`` is NEVER clipped — MP1's overshoot beyond [0, 1] is part of the
     configured quadrature (see :func:`mp1_occupations`).  The far tail IS
@@ -736,8 +773,7 @@ class OccupationState:
                 f"OccupationState: family 'mp1' requires width > 0; got {width!r}")
         if not np.isfinite(self.mu_ry):
             raise ValueError(f"OccupationState: mu_ry must be finite; got {self.mu_ry!r}")
-        digest = hashlib.sha256(
-            np.ascontiguousarray(f).tobytes()).hexdigest()[:16]
+        digest = occupation_digest(f)
         if self.occ_hash and self.occ_hash != digest:
             raise ValueError(
                 "OccupationState: supplied occ_hash does not match f_kn "

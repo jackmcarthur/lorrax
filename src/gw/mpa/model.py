@@ -159,8 +159,30 @@ def validate_reused_mpa_fit(
             f"covers live logical span ({stored_ceiling:.9g} >= "
             f"{live_ceiling:.9g} Ry).")
     if material_class == "metal":
-        mpa_store.assert_occupation_stamps(
-            path, occupation_state, where="mpa_fit_reuse_file")
+        # Stores written before occupation digests were logicalized included
+        # the producer square mesh's zero-band pad. Reproduce only those exact
+        # legacy encodings from the live table; no nonzero occupation can be
+        # changed or truncated by ``occupation_digest``.
+        from gw.efermi import occupation_digest
+        logical_nband = int(meta.b_id_4_user)
+        legacy_extents = {
+            ((logical_nband + side * side - 1) // (side * side))
+            * (side * side)
+            for side in range(1, 17)
+        }
+        compatible_hashes = {
+            occupation_digest(
+                occupation_state.f_kn, band_extent=extent)
+            for extent in legacy_extents
+        }
+        occupation_match = mpa_store.assert_occupation_stamps(
+            path, occupation_state, where="mpa_fit_reuse_file",
+            compatible_occ_hashes=compatible_hashes)
+        if occupation_match == "legacy_zero_pad":
+            print_fn(
+                "  MPA screening reuse: occupation provenance matched an "
+                "exact legacy square-mesh zero-pad encoding; physical "
+                f"occ_hash={occupation_state.occ_hash}.")
     print_fn(
         "  MPA screening reuse: certified finalized fit opened read-only: "
         f"{path} (n_q={ledger['n_q']}, n_mu={ledger['n_mu']}, "

@@ -309,7 +309,9 @@ def read_occupation_stamps(src, *, mode="r"):
         }
 
 
-def assert_occupation_stamps(src, occupation_state, *, where="fit store"):
+def assert_occupation_stamps(
+        src, occupation_state, *, where="fit store",
+        compatible_occ_hashes=()):
     """REUSE-site gate: the store's occupations are the run's occupations.
 
     Refuses an unstamped store outright — a metallic reuse of a store
@@ -327,7 +329,10 @@ def assert_occupation_stamps(src, occupation_state, *, where="fit store"):
     ``mu_ry``, ``smearing_family``, ``smearing_width_ry`` and
     ``n_electrons`` (which is stamped under the key ``occ_nelec`` — the
     attribute and the stamp are deliberately spelled differently and that
-    is the only place it is written down).
+    is the only place it is written down). ``compatible_occ_hashes`` is a
+    caller-computed set of exact legacy encodings; it exists only to migrate
+    stores whose old digest included zero band padding. Other stamp fields
+    remain exact, and this layer never guesses a padding geometry.
 
     Rank-local and serial.  ``src`` is a path (this call's ``_h5`` owns the
     handle) or an open h5py group (the caller owns it); the read is
@@ -342,8 +347,13 @@ def assert_occupation_stamps(src, occupation_state, *, where="fit store"):
             "(mpa_occ_hash ...); regenerate the fit store with the "
             "current build.")
     want = _occ_stamp_values(occupation_state)
-    hard = ("occ_hash", "smearing_family", "smearing_width_ry", "occ_nelec")
+    compatible = {str(value) for value in compatible_occ_hashes}
+    occ_exact = stamps["occ_hash"] == want["occ_hash"]
+    occ_compatible = stamps["occ_hash"] in compatible
+    hard = ("smearing_family", "smearing_width_ry", "occ_nelec")
     bad = [k for k in hard if stamps[k] != want[k]]
+    if not (occ_exact or occ_compatible):
+        bad.insert(0, "occ_hash")
     if bad:
         detail = ", ".join(
             f"{k}: store {stamps[k]!r} != run {want[k]!r}" for k in bad)
@@ -352,6 +362,7 @@ def assert_occupation_stamps(src, occupation_state, *, where="fit store"):
             f"occupation state ({detail}; store mu_ry={stamps['mu_ry']!r}, "
             f"run mu_ry={want['mu_ry']!r}). The fit was made from "
             "different occupations — regenerate it.")
+    return "exact" if occ_exact else "legacy_zero_pad"
 
 
 #: Bytes per complex128 element.  Named because it appears in the budget
