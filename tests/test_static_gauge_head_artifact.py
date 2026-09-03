@@ -93,6 +93,30 @@ def _load(path, mesh, wfn=None, **changes):
     return load_static_gauge_hall_artifact(path, **kwargs)
 
 
+def _static_bare_config(tmp_path, hall_path):
+    """Return the real resolved config whose Hall admission is under test."""
+    from gw.gw_config import LorraxConfig
+
+    deck = tmp_path / "static_bare.in"
+    deck.write_text(
+        "[cohsex]\n"
+        "nval = 2\n"
+        "ncond = 2\n"
+        "nband = 10\n"
+        "memory_per_device_gb = 4.0\n"
+        "bispinor = true\n"
+        "bispinor_gw = bare_transverse\n"
+        "sys_dim = 2\n"
+        "qp_solver = one_shot_dft\n"
+        "head_correction = full\n"
+        "compute_mode = cohsex\n"
+        f"static_gauge_hall_file = {hall_path}\n",
+        encoding="utf-8",
+    )
+    return LorraxConfig.from_input_file(
+        str(deck), print_fn=lambda *args, **kwargs: None)
+
+
 def test_hall_artifact_roundtrip_is_sealed_and_immutable(tmp_path):
     mesh = _mesh()
     wfn = _wfn()
@@ -221,8 +245,7 @@ def test_bare_route_accepts_authenticated_exact_zero_hall(tmp_path):
     path = tmp_path / "zero_hall.h5"
     write_static_gauge_hall_artifact(
         path, _transaction(mesh, wfn, sigma_H=np.zeros(3)), mesh_xy=mesh)
-    config = SimpleNamespace(
-        paths=SimpleNamespace(static_gauge_hall_file=str(path)))
+    config = _static_bare_config(tmp_path, path)
     meta = SimpleNamespace(b_id_0=0, b_id_4_chi_user=4, nk_tot=6)
 
     hall = _load_static_photon_hall(
@@ -244,8 +267,7 @@ def test_bare_route_still_refuses_authenticated_nonzero_hall(tmp_path):
     path = tmp_path / "nonzero_hall.h5"
     write_static_gauge_hall_artifact(
         path, _transaction(mesh, wfn), mesh_xy=mesh)
-    config = SimpleNamespace(
-        paths=SimpleNamespace(static_gauge_hall_file=str(path)))
+    config = _static_bare_config(tmp_path, path)
     meta = SimpleNamespace(b_id_0=0, b_id_4_chi_user=4, nk_tot=6)
 
     with pytest.raises(
