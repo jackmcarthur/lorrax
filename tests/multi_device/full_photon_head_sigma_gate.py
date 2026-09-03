@@ -149,7 +149,7 @@ def _response(mesh, layout, sigma_h, *, wfn, wfn_binding, meta):
             hall = None
         return build_static_photon_head_response(
             None, input_dir="unused", mesh=mesh, wfn=wfn, meta=meta,
-            config=SimpleNamespace(), layout=layout,
+            config=SimpleNamespace(sys_dim=2), layout=layout,
             hall_transaction=hall, wfn_fingerprint_binding=wfn_binding)
     finally:
         qsgw_head.build_dft_head_response = saved
@@ -340,7 +340,10 @@ def _run_gate(mesh, wfn, output_dir):
     import vcoul
     from common.parallel_transport import bind_wfn_fingerprint
 
-    from gw.head_correction import complete_static_slab_photon_q0
+    from gw.head_correction import (
+        STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
+        complete_static_photon_q0,
+    )
     from gw.photon_layout import (
         PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
         photon_q0_low_rank_block)
@@ -446,8 +449,9 @@ def _run_gate(mesh, wfn, output_dir):
         response = _response(
             mesh, layout, sigma_h, wfn=wfn, wfn_binding=wfn_binding,
             meta=meta)
-        V, W, completion = complete_static_slab_photon_q0(
-            V, W, response, g0_x, g0_y, receipt, mesh_xy=mesh)
+        V, W, completion = complete_static_photon_q0(
+            V, W, response, g0_x, g0_y, receipt, mesh_xy=mesh,
+            charge_block_state=STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
         if not np.array_equal(
                 np.asarray(completion.sigma_H),
                 np.asarray(sigma_h, dtype=np.float64)):

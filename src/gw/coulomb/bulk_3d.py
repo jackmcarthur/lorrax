@@ -39,16 +39,21 @@ class Bulk3D(vcoul.Bulk3D):
         S_cart=None,
         epshead=None,
         static_kappa2=None,
+        rule: str = vcoul.BULK_Q0_RULE_EXACT,
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
+        certificate_fn=None,
     ):
+        """Translate ``(wfn, meta)`` into the service's exact bulk owner."""
         return super().q0_average(
             CoulombGeometry.from_wfn(wfn),
             (meta.nkx, meta.nky, meta.nkz),
             S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
+            rule=rule,
             nsamples=nsamples,
             method=method, qmc_reps=qmc_reps,
             analytic_sphere=analytic_sphere,
+            certificate_fn=certificate_fn,
         )

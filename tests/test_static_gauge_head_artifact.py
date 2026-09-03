@@ -177,7 +177,8 @@ def test_bare_route_accepts_authenticated_exact_zero_hall(tmp_path):
         print_fn=lambda *args, **kwargs: None)
     np.testing.assert_array_equal(np.asarray(jax.device_get(hall.sigma_H)), 0.0)
     np.testing.assert_array_equal(
-        np.asarray(jax.device_get(static_hall_linear_response(hall.sigma_H))),
+        np.asarray(jax.device_get(static_hall_linear_response(
+            hall.sigma_H, dimension=2))),
         0.0)
 
 

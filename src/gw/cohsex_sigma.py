@@ -403,40 +403,10 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve):
         mesh_xy, layout="face", face_shape=face_shape)
 
     @jax.jit
-    def sigma_sx(wfns, Gij, W_q, *, wfns_g=None):
-        """``wfns_g``, when given, supplies the G-BUILD's two operands
-        (``psi_mun``/``psi_nmu``) INSTEAD of ``wfns``; the projection
-        step always reads ``wfns``'s own copies.  Defaults to ``wfns``
-        (every non-bispinor caller — identical to the pre-2026-08-23
-        body, since ``g = wfns_g or wfns`` then reproduces the exact
-        prior computation byte-for-byte).
-
-        THE REASON THIS PARAMETER EXISTS AT ALL, and not on the legacy
-        sibling: the two-face carrier stores exactly ONE (psi_mun,
-        psi_nmu) pair, reused for BOTH the G-build's internal band sum
-        and the outer band-basis projection — unlike the legacy
-        four-copy carrier, whose G-vertex fields (psi_xn/psi_yr) and
-        projection fields (psi_xr/psi_yn) are already four INDEPENDENT
-        arrays.  The bispinor Σ^B transverse-vertex trick
-        (``gw.sigma_x_bispinor``) needs γ̃ folded into the G-build's
-        INTERNAL band sum only — never into the OUTER projection bra/
-        ket (module docstring of ``gw.sigma_x_bispinor``: "the γ̃ vertex
-        sits on the build_G side of the kernel chain, not the
-        projection side").  On legacy that separation is already free
-        (``gw.wavefunction_bundle.with_lorentz_vertices`` only ever
-        touches psi_xn/psi_yr); on face, WITHOUT this parameter, the
-        SAME two arrays would have to serve both roles at once, and a
-        γ̃-inserted psi_mun/psi_nmu would corrupt the projection's outer
-        bra/ket along with the G-build — MEASURED: real 4-rank CUDA,
-        transverse (mu_L, nu_L) != (0,0) tiles disagreed with the
-        legacy reference by O(1) relative before this parameter existed
-        (tests/multi_device/bispinor_transverse_vertex_face_gate.py's
-        own bring-up).
-        """
+    def sigma_sx(wfns, Gij, W_q):
         s = wfns.slices
-        g = wfns_g if wfns_g is not None else wfns
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
-        G_occ = build_G(g.psi_mun, g.psi_nmu, phases=phases,
+        G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
                         layout="face", gemm=g_plan)
         return _project(wfns.psi_nmu, wfns.psi_mun,
                         _convolve(G_occ, W_q, 1.0),
@@ -532,8 +502,6 @@ def compute_cohsex_sigma(
     do_screened: bool = True,
     static_head_terms=None,
     compute_bare_x: bool = True,
-    wfns_transverse=None,
-    bispinor_v_q_path=None,
     occupation_state=None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
@@ -564,10 +532,7 @@ def compute_cohsex_sigma(
     Returns
     -------
     dict with keys:
-        sig_sx   (nk, nb_sigma, nb_sigma)  physical occupied/SX component:
-                                              screened charge exchange + head,
-                                              plus bare transverse Σ^B when
-                                              the bispinor operands are present
+        sig_sx   (nk, nb_sigma, nb_sigma)  screened charge exchange + head
         sig_coh  (nk, nb_sigma, nb_sigma)  Coulomb hole + head (if screened)
         sig_x    (nk, nb_sigma, nb_sigma)  bare exchange + head, or None
 
@@ -620,7 +585,6 @@ def compute_cohsex_sigma(
         sig_coh.block_until_ready()
 
     sig_x = None
-    sig_x_b = None
     if compute_bare_x:
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
@@ -639,40 +603,10 @@ def compute_cohsex_sigma(
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
-        # Bispinor bare exchange: add Σ^B (transverse-only sum over
-        # (i, j) ∈ {1, 2, 3}²) to the bare-X diagnostic AND to the
-        # physical occupied/SX component.  The COHSEX dispatcher builds
-        # Sigma_xc = sig_sx + sig_coh, so this is the single seam that carries
-        # Σ^B into Eqp, the live Hamiltonian and sigma_diag without changing
-        # X_ONLY (which uses compute_sigma_x) or the packed full-photon
-        # route (which replaces all three photon components).  No-op when
-        # ``wfns_transverse`` or ``bispinor_v_q_path`` is missing.  See
-        # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
-        if wfns_transverse is not None and bispinor_v_q_path is not None:
-            # face-layout defensive backstop REMOVED 2026-08-23
-            # (feat/transverse-zeta-face-2026-08-23): compute_sigma_x_
-            # bispinor is representation-aware since feat/bispinor-
-            # face-2026-08-23 (with_lorentz_vertices, face_kernel_kwargs
-            # dispatch) and the low_mem_bands_bispinor_unported envelope
-            # row that made this branch unreachable for face is now
-            # lifted — this call is the real, gated path, not dead code.
-            from .sigma_x_bispinor import compute_sigma_x_bispinor
-            with mesh_xy:
-                sig_x_b = compute_sigma_x_bispinor(
-                    wfns_transverse=wfns_transverse,
-                    Gij=Gij,
-                    bispinor_v_q_path=bispinor_v_q_path,
-                    meta=meta, mesh_xy=mesh_xy,
-                )
-            sig_x_b.block_until_ready()
-            sig_x = sig_x + sig_x_b
-            sig_sx = sig_sx + sig_x_b
-
     return {
         "sig_sx":  sig_sx,
         "sig_coh": sig_coh,
         "sig_x":   sig_x,
-        "sig_x_b": sig_x_b,
     }
 
 
@@ -684,10 +618,7 @@ def compute_sigma_x(
     *,
     Gij: jax.Array | None = None,
     static_head_terms=None,
-    wfns_transverse=None,
-    bispinor_v_q_path=None,
     occupation_state=None,
-    return_transverse: bool = False,
 ):
     """Bare-exchange-only path for modes without static screening.
 
@@ -700,10 +631,6 @@ def compute_sigma_x(
     ``sigma_coh_k(W_q, V_q)`` and so saves two flat-q convolutions per
     call (≈ the ``W_q`` cost on each, roughly half the cohsex_sigma
     wall on dense band manifolds).
-
-    Bispinor: identical to ``compute_cohsex_sigma``'s ``compute_bare_x``
-    branch — Σ^B is added to ``sig_x`` when both ``wfns_transverse``
-    and ``bispinor_v_q_path`` are supplied.
 
     ``occupation_state`` carries the same contract as in
     :func:`compute_cohsex_sigma`: ``None`` is insulating and bit-exact,
@@ -730,21 +657,4 @@ def compute_sigma_x(
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
-    sig_x_b = None
-    if wfns_transverse is not None and bispinor_v_q_path is not None:
-        # face-layout defensive backstop REMOVED 2026-08-23 — see
-        # compute_cohsex_sigma's identical removal, same session/reason.
-        from .sigma_x_bispinor import compute_sigma_x_bispinor
-        with mesh_xy:
-            sig_x_b = compute_sigma_x_bispinor(
-                wfns_transverse=wfns_transverse,
-                Gij=Gij,
-                bispinor_v_q_path=bispinor_v_q_path,
-                meta=meta, mesh_xy=mesh_xy,
-            )
-        sig_x_b.block_until_ready()
-        sig_x = sig_x + sig_x_b
-
-    if return_transverse:
-        return sig_x, sig_x_b
     return sig_x

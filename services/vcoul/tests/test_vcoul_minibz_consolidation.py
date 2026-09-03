@@ -149,12 +149,13 @@ def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
     assert receipt.cell_volume == HEX_CELVOL
     np.testing.assert_array_equal(
         np.asarray(receipt.reciprocal_lattice_rows), HEX_BVEC)
-    assert vcoul.validate_slab_minibz_photon_receipt(receipt) is receipt
-    polygon = np.asarray(receipt.polygon_vertices)
+    assert receipt.dimension == 2
+    assert vcoul.validate_minibz_photon_receipt(receipt) is receipt
+    polygon = np.asarray(receipt.polytope_vertices)
     assert polygon.shape == (6, 2)
     mini = np.asarray(receipt.mini_lattice_rows)
     np.testing.assert_allclose(
-        receipt.polygon_area, abs(np.linalg.det(mini)), rtol=2e-12)
+        receipt.minibz_measure, abs(np.linalg.det(mini)), rtol=2e-12)
     assert receipt.physical_counts == tuple(
         6 * order * order for order in receipt.orders)
     assert receipt.padded_counts == (6 * 32 * 32,) * 3
@@ -180,7 +181,7 @@ def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
         vcoul.CoulombGeometry(bvec=HEX_BVEC, cell_volume=HEX_CELVOL),
         ANISOTROPIC_SLAB_KGRID)
     np.testing.assert_allclose(
-        anisotropic.polygon_area,
+        anisotropic.minibz_measure,
         abs(np.linalg.det(np.asarray(anisotropic.mini_lattice_rows))),
         rtol=2e-12)
 
@@ -190,6 +191,128 @@ def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
             vcoul.CoulombGeometry(
                 bvec=HEX_BVEC, cell_volume=HEX_CELVOL),
             SLAB_KGRID, method="polygon_gl"))
+
+
+@pytest.mark.parametrize(
+    ("bvec", "kgrid", "expect_isotropic"),
+    ((np.eye(3), (4, 4, 4), True), (HEX_BVEC, HEX_KGRID, False)),
+)
+def test_bulk_photon_receipt_is_true_ws_and_obeys_trace_identity(
+        bvec, kgrid, expect_isotropic):
+    import vcoul
+
+    receipt = vcoul.minibz_photon_cubature(
+        vcoul.get_kernel(3),
+        vcoul.CoulombGeometry(bvec=bvec, cell_volume=HEX_CELVOL),
+        kgrid)
+    assert receipt.dimension == 3
+    assert receipt.method == "true_ws_polyhedron_duffy_gauss_legendre_v1"
+    assert receipt.orders == (10, 16, 22)
+    assert receipt.slab_zc is None
+    assert vcoul.validate_minibz_photon_receipt(receipt) is receipt
+    mini = np.asarray(receipt.mini_lattice_rows)
+    np.testing.assert_allclose(
+        receipt.minibz_measure, abs(np.linalg.det(mini)), rtol=5e-12)
+    assert all(len(face) >= 3 for face in receipt.polytope_faces)
+
+    chunk = receipt.chunks[-1]
+    physical = int(chunk.physical_count)
+    weight = chunk.sample_weight[:physical]
+    D = chunk.D_raw[:physical]
+    assert np.all(np.linalg.norm(chunk.q_cart[:physical], axis=1) > 0.0)
+    np.testing.assert_allclose(np.sum(weight), 1.0, rtol=8e-15)
+    np.testing.assert_allclose(
+        np.sum(weight[:, None] * chunk.q_cart[:physical], axis=0), 0.0,
+        rtol=0.0, atol=5e-15)
+    # Accumulate the pointwise identity so independent large reductions do
+    # not inject cancellation noise into this algebra oracle.
+    trace_identity = np.sum(weight * (
+        np.trace(D[:, 1:, 1:], axis1=1, axis2=2) + 2.0 * D[:, 0, 0]))
+    assert abs(trace_identity) / abs(np.sum(weight * D[:, 0, 0])) <= 1.0e-14
+
+    D_mean = np.einsum("s,sij->ij", weight, D)
+    if expect_isotropic:
+        np.testing.assert_allclose(
+            D_mean[1:, 1:], -(2.0 / 3.0) * D_mean[0, 0] * np.eye(3),
+            rtol=1.0e-12, atol=1.0e-12)
+    else:
+        assert not np.isclose(
+            D_mean[1, 1], D_mean[3, 3], rtol=1.0e-4, atol=0.0)
+
+
+@pytest.mark.parametrize("static_model", ("S_cart", "kappa"))
+def test_bulk_scalar_head_consumes_the_photon_receipt(static_model):
+    """Scalar <v>/<W> and the packed completion share one 3-D rule."""
+    import vcoul
+
+    bvec = np.diag((1.0, 1.2, 0.7))
+    geometry = vcoul.CoulombGeometry(
+        bvec=bvec,
+        cell_volume=float((2.0 * np.pi) ** 3 / abs(np.linalg.det(bvec))))
+    kgrid = (3, 4, 2)
+    receipt = vcoul.bulk_minibz_photon_cubature(
+        vcoul.get_kernel(3), geometry, kgrid)
+    chunk = receipt.chunks[-1]
+    n = int(chunk.physical_count)
+    weight = np.asarray(chunk.sample_weight[:n])
+    q = np.asarray(chunk.q_cart[:n])
+    v = np.asarray(chunk.D_raw[:n, 0, 0])
+    measure = float(np.sum(weight))
+    certificates = []
+    kwargs = {}
+    if static_model == "S_cart":
+        S = np.diag((-0.01, -0.008, -0.006))
+        qSq = np.einsum("qi,ij,qj->q", q, S, q, optimize=True)
+        expected_w = np.sum(weight * v / (1.0 - v * qSq)) / measure
+        kwargs["S_cart"] = S
+    else:
+        kappa2 = 0.04
+        q2 = np.einsum("qi,qi->q", q, q, optimize=True)
+        expected_w = np.sum(weight * 8.0 * np.pi / (q2 + kappa2)) / measure
+        kwargs["static_kappa2"] = kappa2
+    got_v, got_w = vcoul.get_kernel(3).q0_average(
+        geometry, kgrid, certificate_fn=certificates.append, **kwargs)
+    np.testing.assert_allclose(complex(got_v), np.sum(weight * v) / measure,
+                               rtol=2.0e-15)
+    np.testing.assert_allclose(complex(got_w), expected_w, rtol=2.0e-15)
+    assert len(certificates) == 1
+    assert isinstance(certificates[0], vcoul.BulkQ0Certificate)
+    assert certificates[0].orders == receipt.orders
+    assert certificates[0].mean_v == complex(got_v)
+    assert certificates[0].mean_w == complex(got_w)
+
+
+def test_bulk_scalar_head_debug_rule_is_named_and_production_refuses_sphere():
+    import vcoul
+
+    geometry = vcoul.CoulombGeometry(
+        bvec=np.eye(3), cell_volume=float((2.0 * np.pi) ** 3))
+    kernel = vcoul.get_kernel(3)
+    with pytest.raises(ValueError, match="bulk_q0_rule_unknown"):
+        kernel.q0_average(
+            geometry, (3, 3, 3), S_cart=np.zeros((3, 3)), rule="sobol")
+    with pytest.raises(ValueError, match="bulk_q0_debug_rule_required"):
+        kernel.q0_average(
+            geometry, (3, 3, 3), S_cart=np.zeros((3, 3)),
+            analytic_sphere=True)
+    with pytest.warns(RuntimeWarning, match="infinite variance"):
+        old_v, old_w = kernel.q0_average(
+            geometry, (3, 3, 3), S_cart=np.zeros((3, 3)),
+            rule=vcoul.Q0_RULE_SOBOL_DEBUG, nsamples=256, qmc_reps=2)
+    assert np.isfinite(complex(old_v)) and np.isfinite(complex(old_w))
+
+
+def test_photon_cubature_dimension_dispatch_refuses_mismatched_kernels():
+    import vcoul
+
+    geometry = vcoul.CoulombGeometry(
+        bvec=HEX_BVEC, cell_volume=HEX_CELVOL)
+    with pytest.raises(TypeError, match="Bulk3D"):
+        vcoul.bulk_minibz_photon_cubature(
+            vcoul.get_kernel(2), geometry, HEX_KGRID)
+    with pytest.raises(TypeError, match="Slab2D"):
+        vcoul.slab_minibz_photon_cubature(
+            vcoul.get_kernel(3), geometry, SLAB_KGRID)
 
 
 def test_polygon_photon_receipt_uses_one_area_reduction_on_cri3_geometry():
@@ -206,9 +329,9 @@ def test_polygon_photon_receipt_uses_one_area_reduction_on_cri3_geometry():
         vcoul.CoulombGeometry(
             bvec=bvec, cell_volume=6331.9219276452886),
         (6, 6, 1))
-    assert vcoul.validate_slab_minibz_photon_receipt(receipt) is receipt
+    assert vcoul.validate_minibz_photon_receipt(receipt) is receipt
 
-    polygon = np.asarray(receipt.polygon_vertices)
+    polygon = np.asarray(receipt.polytope_vertices)
     crosses = [
         float(left[0] * right[1] - left[1] * right[0])
         for left, right in zip(polygon, np.roll(polygon, -1, axis=0))
@@ -216,7 +339,7 @@ def test_polygon_photon_receipt_uses_one_area_reduction_on_cri3_geometry():
     issued_order = 0.5 * float(sum(crosses))
     old_validator_order = 0.5 * float(np.sum(np.asarray(crosses)))
     assert issued_order != old_validator_order
-    assert receipt.polygon_area == issued_order
+    assert receipt.minibz_measure == issued_order
 
 
 def _slab_photon_receipt():
@@ -236,7 +359,7 @@ def test_polygon_photon_receipt_validation_is_exact_type_and_rechecks_token():
     with pytest.raises(TypeError, match="issued only"):
         replace(receipt, orders=(8, 16, 24))
 
-    class ForgedReceipt(vcoul.SlabMinibzPhotonReceipt):
+    class ForgedReceipt(vcoul.MinibzPhotonReceipt):
         def require_integrity(self):  # A virtual check would accept this.
             return self
 
@@ -244,11 +367,11 @@ def test_polygon_photon_receipt_validation_is_exact_type_and_rechecks_token():
     for name, value in vars(receipt).items():
         object.__setattr__(forged, name, value)
     with pytest.raises(TypeError, match="exact provider receipt type"):
-        vcoul.validate_slab_minibz_photon_receipt(forged)
+        vcoul.validate_minibz_photon_receipt(forged)
 
     object.__setattr__(receipt, "_provider_token", object())
     with pytest.raises(TypeError, match="not issued"):
-        vcoul.validate_slab_minibz_photon_receipt(receipt)
+        vcoul.validate_minibz_photon_receipt(receipt)
 
 
 @pytest.mark.parametrize("payload_name", ("q_cart", "D_raw", "sample_weight"))
@@ -264,7 +387,7 @@ def test_polygon_photon_receipt_detects_mutation_despite_reversible_write_flag(
     payload.setflags(write=True)
     payload.flat[0] = np.nextafter(payload.flat[0], np.inf)
     with pytest.raises(ValueError, match="payload or metadata changed"):
-        vcoul.validate_slab_minibz_photon_receipt(receipt)
+        vcoul.validate_minibz_photon_receipt(receipt)
 
 
 @pytest.mark.parametrize(
@@ -277,7 +400,7 @@ def test_polygon_photon_receipt_detects_bound_geometry_mutation(field, value):
     receipt = _slab_photon_receipt()
     object.__setattr__(receipt, field, value)
     with pytest.raises(ValueError):
-        vcoul.validate_slab_minibz_photon_receipt(receipt)
+        vcoul.validate_minibz_photon_receipt(receipt)
 
 
 def test_slab_polygon_refuses_nonplanar_or_three_dimensional_cells():

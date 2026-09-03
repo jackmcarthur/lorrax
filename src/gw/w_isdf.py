@@ -1423,7 +1423,8 @@ def _w_solve_pref_scalar(meta) -> float:
         * float(nspinor_wfnfile))
 
 
-def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
+def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
+                        dyson_solver=None,
                         distrib_la_batched_route: str = "batch_reshard"):
     """Return ``(solve_fn, pref)`` for the requested W plan.
 
@@ -1444,6 +1445,11 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
 
     W comes out ``P(None,'x','y')`` on BOTH — that is the module's
     output contract, not a per-plan detail.
+
+    ``n_rmu_logical`` overrides the scalar ``meta.n_rmu`` prefix when the
+    carrier is a different declared basis.  The packed photon caller uses
+    this for its full C+T1+T2+T3 extent on the only legal local geometry,
+    1x1; ordinary scalar callers retain the ``meta.n_rmu`` default.
     """
     from .gw_config import normalize_w_dyson_solver
     dyson = normalize_w_dyson_solver(dyson_solver)
@@ -1454,7 +1460,12 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
     # silently restored the padded-extent LU for any meta-like object
     # missing the field (opt-out-by-omission, PADDING_AUDIT item 3).
     # Synthetic-meta callers must carry n_rmu (= the logical extent).
-    n_log = int(meta.n_rmu)
+    n_log = (int(meta.n_rmu) if n_rmu_logical is None
+             else int(n_rmu_logical))
+    if not 1 <= n_log <= int(n_rmu):
+        raise ValueError(
+            "solve_w logical extent must be positive and no larger than "
+            f"the carrier: got logical={n_log}, carrier={int(n_rmu)}")
 
     if dyson == "distributed":
         solve_fn = _get_w_solve_fn_distributed(
@@ -1465,7 +1476,8 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 
-def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+def solve_w(V_q, chi0_q, meta, mesh_xy, *, n_rmu_logical=None,
+            dyson_solver=None,
             distrib_la_batched_route: str = "batch_reshard"):
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
@@ -1490,9 +1502,14 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
 
     ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
     caller must drop its reference after this call.
+
+    ``n_rmu_logical`` defaults to ``meta.n_rmu`` for the scalar carrier.
+    A caller whose matrix has another declared logical basis, such as the
+    packed four-current direct sum, must pass that extent explicitly.
     """
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        meta, mesh_xy, n_rmu=chi0_q.shape[1],
+        n_rmu_logical=n_rmu_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route)
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
@@ -1905,7 +1922,10 @@ class StaticPhotonResponse:
 
     layout: object
     V_packed: jax.Array
-    W_packed: jax.Array
+    W_packed: jax.Array | None
+    #: ``present_static`` or ``absent_dynamic_scalar_owner``.  The latter is
+    #: a first-class layout state, not a zero-filled CC block.
+    charge_block_state: str
     current_contact: str
     #: The approximation stamp: ``gamma_completed_*`` when the Gamma-cell
     #: completion ran, ``DEBUG_headless_*`` under ``head_correction = off``
@@ -1915,7 +1935,85 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
+    #: Separate dynamic Hall/Faraday run-record state.  ``PREPARED`` is
+    #: internal until Sigma emits the sole final ``APPLIED`` line.
     faraday_head_record: str | None = None
+    #: ``(mean, std, min, max, max_abs_imag)`` of
+    #: ``sum_mu g0_mu sum_s |psi_kns(r_mu)|^2`` over occupied states.
+    #: Present exactly when the Gamma-cell completion ran.
+    charge_head_insertion_norm_stats: tuple[float, ...] | None = None
+
+
+def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
+    """Format the one packed-photon Gamma-head production-record line."""
+    completion = response.head_completion
+    if completion is None:
+        return (
+            "DEBUG: Gamma-cell head disabled by head_correction=off "
+            "(headless packed body; NOT a production calculation)")
+    from .photon_sigma import STATIC_PHOTON_CHARGE_BLOCK_ABSENT
+    receipt = completion.cubature_receipt
+    D_mean = np.asarray(completion.bare_D_mean)
+    D00 = complex(D_mean[0, 0])
+    transverse_trace = complex(np.trace(D_mean[1:, 1:]))
+    cubature_record = (
+        f"dimension={receipt.dimension}; method={receipt.method}; "
+        f"orders={receipt.orders}; "
+        f"nodes={completion.observed_physical_counts}; "
+        "weight_defect_max="
+        f"{max(receipt.weight_sum_defects):.3e}; "
+        f"<v>={D00.real:.12e}; "
+        f"tr<D_TT>={transverse_trace.real:.12e}")
+    if response.charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_ABSENT:
+        # SCMPA: dynamic bare route -- the packed CC block is absent by
+        # name, the charge S/wing fold and the coupled Dyson solve are
+        # skipped (no consumer); only the bare <D> is inserted.
+        return (
+            "bare <D> inserted into V and logical W_CURRENT = V_CURRENT; "
+            "packed CC block ABSENT; charge S/wing fold and coupled Dyson "
+            "SKIPPED (no consumer); "
+            f"<D>[0,0]={D00.real:.9e}{D00.imag:+.9e}j; "
+            f"{cubature_record}; WS("
+            "final_error_ratio="
+            f"{completion.mixed_convergence_error_ratios[-1]:.3e},"
+            "no packed Dyson solve)")
+    stats = response.charge_head_insertion_norm_stats
+    if stats is None or len(stats) != 5:
+        raise ValueError(
+            "GATE photon_head_insertion_norm_unmeasured: a completed packed "
+            "Gamma head has no occupied-state N_n statistics")
+    mean, std, minimum, maximum, imag_max = (float(v) for v in stats)
+    moments = np.asarray(completion.screened_moments, dtype=np.complex128)
+    M0000 = complex(moments[0, 0, 0, 0])
+    family_norms = (
+        float(np.linalg.norm(moments[0, 0])),
+        float(np.linalg.norm(moments[0, 1:])),
+        float(np.linalg.norm(moments[1:, 0])),
+        float(np.linalg.norm(moments[1:, 1:])),
+    )
+
+    def _complex(value):
+        return f"{value.real:.9e}{value.imag:+.9e}j"
+
+    return (
+        "Gamma-cell completion applied (bare <D> into V, charge S00/wing "
+        "head into W); "
+        f"{cubature_record}; "
+        f"hall_source={completion.hall_source}; "
+        f"sigma_H={np.asarray(completion.sigma_H).tolist()} bohr^-1; "
+        f"<D>[0,0]={_complex(D00)}; M_00[0,0]={_complex(M0000)}; "
+        "moment_norms(00,0a,a0,ab)="
+        f"({family_norms[0]:.9e},{family_norms[1]:.9e},"
+        f"{family_norms[2]:.9e},{family_norms[3]:.9e}); "
+        f"N_occ(mean,std,min,max)=({mean:.9e},{std:.9e},{minimum:.9e},"
+        f"{maximum:.9e}); N_occ_max_abs_imag={imag_max:.3e}; "
+        f"ward={completion.ward_residual:.3e}; "
+        f"hermiticity={completion.hermiticity_residual:.3e}; "
+        f"dyson_forward_bound={completion.max_dyson_forward_error_bound:.3e}; "
+        "WS(final_error_ratio="
+        f"{completion.mixed_convergence_error_ratios[-1]:.3e},"
+        "max_dyson_backward_residual="
+        f"{completion.max_backward_residual:.3e})")
 
 
 def _gate_dynamic_hall_head(
@@ -1953,6 +2051,21 @@ def _gate_dynamic_hall_head(
         if jax.process_index() == 0:
             print_fn("Faraday head : " + record, flush=True)
         return record
+
+    if config.compute_mode.ppm_model == "hl":
+        raise NotImplementedError(
+            "GATE dynamic_hall_head_hl_imaginary_probe: measured-broken-TR "
+            "HL-PPM is refused before the packed photon body is opened.\n"
+            "  got:  SymMaps.trs_allowed = false, compute_mode = hl_ppm\n"
+            "  want: compute_mode = gn_ppm for the authenticated "
+            "z=i*omega_p Hall probe\n"
+            "  why:  HL supplies a real-axis scalar probe while the Hall "
+            "artifact is sampled on the imaginary axis; combining them "
+            "would fit two different analytic continuations\n"
+            "  fix:  use gn_ppm, or add an authenticated real-axis Hall "
+            "sample before enabling magnetic HL\n"
+            "  doc:  docs/theory/four-current-head-corrections.md, dynamic "
+            "Hall/Faraday head.")
 
     omega_p = float(config.ppm.omega_p)
     probe = 1j * omega_p
@@ -2053,6 +2166,7 @@ def compute_static_photon_response(
     meta, mesh_xy, *,
     screen_current: bool,
     W_charge=None,
+    W_charge_head=None,
     W_charge_probe=None,
     wfn=None,
     config=None,
@@ -2074,50 +2188,41 @@ def compute_static_photon_response(
     defaulted here) selects which:
 
     ``screen_current = True`` -- ``bispinor_gw = full_static_cohsex``: the
-    sixteen no-pair blocks of ``chi``, one distributed Dyson solve at
-    omega=0.
+    sixteen no-pair blocks of ``chi``, one existing local or distributed
+    Dyson plan at omega=0.
 
     ``screen_current = False`` -- the ``bare_transverse`` family: the twelve
-    current blocks of ``chi`` are ZERO by declaration, so the packed Dyson
-    equation is block diagonal and neither the current blocks nor the packed
-    solve are built at all.  The CC block is screened by the incumbent
-    scalar owner (``gw.screening.compute_screening_model`` -> :func:`solve_w`
-    at ``n_C``) and arrives as ``W_charge``; this function assembles
-    ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0`` through the sole
-    packer.  The sixteen-block Sigma consumer then returns the screened
-    charge COHSEX in CC, the bare Breit exchange ``Sigma^B`` in TT
-    (``SX(D_TT) = X(D_TT)``, ``COH(D_TT - D_TT) = 0``) and zero in CT/TC --
-    the incumbent ``gw.sigma_x_bispinor`` result, block for block.
+    current blocks of ``chi`` are ZERO by declaration, so neither they nor a
+    packed solve are built.  Static COHSEX supplies ``W_charge`` and assembles
+    ``W_packed = diag(W_00,D_TT)``.  A dynamic GN/HL/MPA run instead names
+    ``charge_block_state = absent_dynamic_scalar_owner``: its scalar Sigma
+    path owns ``W_00(omega)``, this function materializes no packed W carrier,
+    and the current-only consumer enforces ``W_CURRENT = V_CURRENT``.
 
-    Both modes then run ONE Gamma-cell completion
-    (:func:`gw.head_correction.complete_static_slab_photon_q0`) from the
-    bounded response of
-    :func:`gw.static_gauge_response.build_static_photon_head_response` --
-    bare ``<D>`` into V, the charge ``S^{00}``/wing head into W, the Hall
-    CT/TC term from ``config.paths.static_gauge_hall_file`` when that
-    artifact exists (``sigma_H = 0`` otherwise, announced).  With the
-    charge-only ``R(q)`` the coupled 4x4 solve returns
-    ``diag(W^{00}_h(q), D_TT(q))``, so the same completion inserts the
-    charge head AND the bare ``<D_TT> = -<v P^T>`` that the
-    ``bispinor_tt_head_correction`` overlay writes into the TT V tiles on
-    the incumbent route (that key is refused here, GATE
-    ``packed_bare_transverse_tt_head_double_count``). On the static bare route
-    a nonzero Hall artifact is refused because that model has no screened
-    CT/TC channel. Dynamic packed GN keeps the same Hall-off body, runs the
-    completion at ``0`` and ``i*omega_p``, and retains only its analytic CT/TC
-    Hall-on/off factors for Sigma. The completion runs under
-    ``head_correction = full`` (the
+    All layouts call ONE Gamma-cell completion.  Charge-present layouts use
+    the bounded ``StaticPhotonHeadResponse`` and coupled 4x4 solve, inserting
+    bare ``<D>`` into V and charge S/wings (plus optional Hall CT/TC) into W.
+    The absent-charge dynamic layout passes no response and averages only the
+    provider's bare D: it inserts ``<D>`` into V/logical current W and cannot
+    execute a hidden charge fold.  The provider selects the exact slab polygon
+    or bulk polyhedron receipt from ``config.sys_dim``; the completion algebra
+    remains one dimension-general owner.  A nonzero Hall artifact is refused
+    on the static bare route.  Dynamic packed GN keeps the resident current
+    body (``V_CURRENT`` on the bare route, screened current on the full route)
+    as its Hall-off resident body, calls the same dimension-general moment
+    owner at ``0`` and ``i*omega_p``, and retains only analytic CT/TC
+    Hall-on/off factors for Sigma; the packed CC block remains absent from
+    that consumer.
+    The completion runs under ``head_correction = full`` (the
     default); ``off`` skips it behind a DEBUG banner and is not a production
     setting (owner ruling 2026-09-01).  The current q^2/contact/complement
     terms are omitted by model in either case.
 
-    MEMORY.  Both modes keep the packed body resident: ``V_packed`` and
-    ``W_packed`` are each ``(nq, N_packed, N_packed)`` complex128 at
+    MEMORY.  ``V_packed`` is ``(nq, N_packed, N_packed)`` complex128 at
     ``P(None,'x','y')`` with ``N_packed = n_C + 3 n_T``, i.e.
-    ``16 nq N_packed^2 / P`` bytes per rank each.  The bare route's
-    incumbent predecessor held one TT tile at a time instead, so this IS a
-    new resident carrier for that route (it is the same object the screened
-    mode already holds).  The figure is printed at this site below; the
+    ``16 nq N_packed^2 / P`` bytes per rank.  Charge-present layouts retain
+    an equal-sized W; absent-charge dynamic layouts do not.  The figure is
+    printed at this site below; the
     per-block streaming inside ``gw.photon_sigma`` is unchanged.
 
     ``print_fn`` is the driver's rank-zero printer.  In production mode the
@@ -2129,16 +2234,16 @@ def compute_static_photon_response(
     from .gw_config import (
         BispinorGWMode, HeadCorrection,
         coerce_bispinor_gw_mode, packed_bare_transverse_route,
-        packed_photon_screens_current)
+        packed_photon_screens_current, uses_dynamic_packed_photon_route)
+    from .head_correction import (
+        STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+        STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
+    )
     from .photon_layout import (
         PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
         pack_photon_operator)
     from .v_q_bispinor import ZERO_TILES, BispinorVqReader
 
-    if str(dyson_solver).strip().lower() != "distributed":
-        raise ValueError(
-            "packed static photon response requires "
-            "dyson_solver='distributed'")
     if config is None:
         raise ValueError(
             "packed static photon response requires the run config: the "
@@ -2160,6 +2265,11 @@ def compute_static_photon_response(
             "selector is resolved once by "
             "gw_config.packed_photon_screens_current and must not be "
             "restated at the call site")
+    dynamic_current_only = (
+        not screen_current and uses_dynamic_packed_photon_route(config))
+    charge_block_state = (
+        STATIC_PHOTON_CHARGE_BLOCK_ABSENT
+        if dynamic_current_only else STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
     if not screen_current:
         if photon_mode is not BispinorGWMode.BARE_TRANSVERSE:
             raise ValueError(
@@ -2171,11 +2281,20 @@ def compute_static_photon_response(
                 "packed static photon response reached with "
                 f"bispinor_gw={photon_mode.value!r} outside its envelope: "
                 f"{route_reason}")
-        if W_charge is None:
+        if dynamic_current_only and W_charge is not None:
             raise ValueError(
-                "the packed bare-transverse route requires the incumbent "
-                "scalar W(omega=0) on the charge block; refusing to build a "
-                "second charge screening owner here")
+                "the dynamic packed bare route declares its CC block absent; "
+                "an external static W_charge would have no consumer")
+        if not dynamic_current_only and W_charge_head is not None:
+            raise ValueError(
+                "the static packed route takes its charge block through "
+                "W_charge; W_charge_head is reserved for the dynamic "
+                "Faraday producer and would have no owner here")
+        if not dynamic_current_only and W_charge is None:
+            raise ValueError(
+                "the packed bare-transverse route requires its charge-block "
+                "operator: scalar W(omega=0) for a screened mode, "
+                "or V for x_only; refusing to invent it here")
     elif photon_mode is not BispinorGWMode.FULL_STATIC_COHSEX:
         raise ValueError(
             "packed static photon response received bispinor_gw="
@@ -2184,6 +2303,20 @@ def compute_static_photon_response(
         raise ValueError(
             "full_static_cohsex screens the charge block inside the packed "
             "Dyson solve; an external W_charge would be ignored")
+    if (screen_current and str(dyson_solver) == "local"
+            and int(jax.process_count()) != 1):
+        raise ValueError(
+            "GATE bispinor_screened_packed_local_requires_1x1: the local "
+            "packed Dyson plan is restricted to a one-process mesh.\n"
+            f"  got:  w_dyson_solver = local, mesh={mesh_xy.devices.shape}, "
+            f"process_count={int(jax.process_count())}\n"
+            "  want: w_dyson_solver = local on a 1x1 mesh, or distributed "
+            "on a square multi-process mesh\n"
+            "  why:  local solve_w assigns complete packed mu-by-mu q tiles "
+            "to individual ranks; only the distributed plan preserves the "
+            "all-rank memory invariant when P > 1\n"
+            "  fix:  set w_dyson_solver = distributed for this run geometry\n"
+            "  doc:  docs/input_reference.md, w_dyson_solver / bispinor_gw.")
     hall = None
     if coupled_head:
         if (wfn is None or photon_g0_vectors is None
@@ -2253,7 +2386,10 @@ def compute_static_photon_response(
             f"  [photon response] packed body N_packed={n_packed} "
             f"(n_C={layout.padded_extent(0)} + 3*n_T="
             f"{layout.padded_extent(1)}), nq={int(meta.nk_tot)}: "
-            f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W",
+            f"{body_bytes / 1e9:.4f} GB/rank resident for V"
+            + (" and W" if charge_block_state
+               == STATIC_PHOTON_CHARGE_BLOCK_PRESENT else
+               "; no W carrier (CC absent, W_CURRENT = V_CURRENT)"),
             flush=True)
     if screen_current:
         chi_packed = compute_experimental_no_pair_photon_chi0(
@@ -2263,18 +2399,24 @@ def compute_static_photon_response(
 
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
-            dyson_solver="distributed",
+            # ``meta.n_rmu`` is the CHARGE extent.  The local packed plan
+            # must factor the complete C+T1+T2+T3 direct sum; inheriting the
+            # scalar default here zero-filled every current row/column on a
+            # 1x1 mesh.  Local packed execution is restricted above to 1x1,
+            # where padded and logical per-channel extents are identical.
+            n_rmu_logical=sum(layout.logical_extents),
+            dyson_solver=dyson_solver,
             distrib_la_batched_route=distrib_la_batched_route)
         # The bare Hartree/exchange stage that follows does not depend on W
         # and could otherwise begin allocating its Green/operator workspaces
         # while the asynchronous distributed LU still owns A, RHS and donated
         # chi.  Finish the response here, inside its timing/lifetime boundary.
         W_packed.block_until_ready()
-    else:
+    elif charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT:
         # chi_TT = chi_CT = 0 makes the packed Dyson equation block diagonal:
         #     W_packed = diag((1 - D_00 chi_00)^-1 D_00, D_TT),  W_CT = 0.
         # Neither the twelve current blocks of chi nor the (n_C + 3 n_T)^2
-        # solve is built.  The CC block was solved by the incumbent scalar
+        # solve is built.  The CC block was solved by the scalar charge
         # owner at n_C; the rest of W is V, block for block, through the sole
         # packer -- one local write per block, no gather.
         # The screened branch checks this inside
@@ -2293,7 +2435,7 @@ def compute_static_photon_response(
         expected_cc = layout.block_shape(int(meta.nk_tot), 0, 0)
         if tuple(W_cc.shape) != expected_cc:
             raise ValueError(
-                "the packed bare-transverse route needs the incumbent scalar "
+                "the packed bare-transverse route needs the scalar charge "
                 f"W on the CC block: expected {expected_cc} from the photon "
                 f"layout, got {tuple(W_cc.shape)}.  The charge centroid "
                 "padding of the scalar and packed paths must agree.")
@@ -2314,47 +2456,70 @@ def compute_static_photon_response(
             _bare_W_block, int(meta.nk_tot), layout, mesh_xy)
         W_packed.block_until_ready()
         del W_cc
+    else:
+        # Dynamic bare family: the charge half is owned end to end by the
+        # scalar GN/HL/MPA Sigma path, and photon_sigma selects only the
+        # current blocks.  No packed W (and therefore no zero-filled CC tile)
+        # is materialised.  The named relation W_CURRENT = V_CURRENT is
+        # enforced at that sole consumer.
+        from .wavefunction_bundle import padded_centroid_extent
+        n_c = padded_centroid_extent(wfns_charge)
+        n_t = padded_centroid_extent(wfns_transverse)
+        if (n_c != layout.padded_extent(0) or n_t != layout.padded_extent(1)):
+            raise ValueError(
+                "photon layout padded extents do not match wavefunction "
+                f"bundles: layout C/T=({layout.padded_extent(0)},"
+                f"{layout.padded_extent(1)}), wfns C/T=({n_c},{n_t})")
+        W_packed = None
     # This packed path bypasses screening._gate_w, so apply its two valid
     # static stage invariants here through the shared sanity owner.  Full-q
     # scalar reciprocity is deliberately not borrowed: Lorentz current
     # channels transform as vectors and require their own derived relation.
     from common import sanity
-    sanity.refuse_nonfinite("static packed photon W", W_packed)
-    if not sanity.check_hermitian(
-            "static packed photon W[q=0]", W_packed[0], rtol=1.0e-6,
-            always=True):
-        raise ValueError(
-            "static packed photon W[q=0] failed the canonical Hermiticity "
-            "gate before coupled head/body folding")
+    if W_packed is not None:
+        sanity.refuse_nonfinite("static packed photon W", W_packed)
+        if not sanity.check_hermitian(
+                "static packed photon W[q=0]", W_packed[0], rtol=1.0e-6,
+                always=True):
+            raise ValueError(
+                "static packed photon W[q=0] failed the canonical "
+                "Hermiticity gate before coupled head/body folding")
 
     head_completion = None
+    charge_head_insertion_stats = None
     if coupled_head:
-        from vcoul import (
-            CoulombGeometry, get_kernel, slab_minibz_photon_cubature)
-        from .head_correction import complete_static_slab_photon_q0
+        from vcoul import CoulombGeometry, get_kernel, minibz_photon_cubature
+        from .head_correction import (
+            charge_head_insertion_norm_stats,
+            complete_static_photon_q0,
+        )
         from .static_gauge_response import (
             build_static_photon_head_response)
 
-        response = build_static_photon_head_response(
-            wfns_charge,
-            input_dir=config.input_dir,
-            mesh=mesh_xy,
-            wfn=wfn,
-            meta=meta,
-            config=config,
-            layout=layout,
-            hall_transaction=hall,
-            wfn_fingerprint_binding=wfn_fingerprint_binding,
-        )
-        completion_response = response
-        from .gw_config import uses_dynamic_packed_photon_route
         dynamic_hall = (
             uses_dynamic_packed_photon_route(config)
-            and not bool(trs_allowed) and hall is not None)
-        if dynamic_hall:
-            # The frozen-current packed body is the literal sigma_H=0 twin.
-            # Its Hall-on CT/TC Gamma cell belongs to the analytic pole below,
-            # not simultaneously to this static COHSEX carrier.
+            and not bool(trs_allowed)
+            and hall is not None)
+        response = None
+        if (charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT
+                or dynamic_hall):
+            response = build_static_photon_head_response(
+                wfns_charge,
+                input_dir=config.input_dir,
+                mesh=mesh_xy,
+                wfn=wfn,
+                meta=meta,
+                config=config,
+                layout=layout,
+                hall_transaction=hall,
+                wfn_fingerprint_binding=wfn_fingerprint_binding,
+            )
+        completion_response = response
+        if (dynamic_hall
+                and charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT):
+            # The resident screened-current body is the Hall-off twin.  Its
+            # dynamic Hall CT/TC completion belongs only to the analytic pole
+            # below, not simultaneously to this static carrier.
             from dataclasses import replace
             completion_response = replace(
                 response, sigma_H=jnp.zeros_like(response.sigma_H),
@@ -2365,33 +2530,42 @@ def compute_static_photon_response(
                 "literal-Gamma vectors")
         g0_X = pack_photon_channel_vectors(
             tuple(photon_g0_vectors), layout, mesh_xy, axis_name="x")[0]
+        charge_head_insertion_stats = charge_head_insertion_norm_stats(
+            wfns_charge, photon_g0_vectors[0][0], mesh_xy=mesh_xy)
         y_sharding = NamedSharding(mesh_xy, P(None, "y"))
         g0_Y = pack_photon_channel_vectors(
             tuple(device_put_process_local(vector, y_sharding)
                   for vector in photon_g0_vectors),
             layout, mesh_xy, axis_name="y")[0]
         geometry = CoulombGeometry.from_wfn(wfn)
-        cubature = slab_minibz_photon_cubature(
-            get_kernel(2), geometry, tuple(int(v) for v in meta.kgrid))
+        dimension = int(config.sys_dim)
+        cubature = minibz_photon_cubature(
+            get_kernel(dimension), geometry,
+            tuple(int(v) for v in meta.kgrid))
 
-        # Fit before the base completion donates W_packed. The probe changes
-        # only its scalar charge block; head_correction folds that delta into
-        # the resident static packed tile's O(N) wing halves, so screened and
-        # bare current bodies share this path without a second packed body.
+        # The dynamic packed Sigma consumer remains current-only: its packed
+        # CC block is absent and W_CURRENT = V_CURRENT.  A magnetic GN head
+        # nevertheless needs the scalar owner's static/probe charge bodies
+        # to form the coupled small-system Hall-on/off differences.  Fold
+        # those bodies through O(N) charge-wing adapters against resident V;
+        # never construct a packed W or expose a CC block to photon_sigma.
         faraday_ppm = None
         if dynamic_hall:
             if config.compute_mode.ppm_model != "gn":
                 raise NotImplementedError(
-                    "GATE dynamic_hall_head_hl_imaginary_probe: the Hall "
-                    "completion is authenticated at z=i*omega_p but the HL "
-                    "charge body supplies a real-axis probe.  A separate "
-                    "imaginary-axis scalar W role is required before these "
-                    "samples can share one coupled solve.")
-            if W_charge_probe is None:
+                    "GATE dynamic_hall_head_non_gn_unimplemented: the Hall "
+                    "completion is authenticated at z=i*omega_p but this "
+                    "mode does not supply the matching GN imaginary-axis "
+                    "charge role (HL supplies a real-axis probe; non-PPM "
+                    "modes expose no GN two-sample role).  A "
+                    "separate imaginary-axis scalar W role is required "
+                    "before these samples can share one coupled solve.")
+            if W_charge_probe is None or (
+                    not screen_current and W_charge_head is None):
                 raise RuntimeError(
                     "dynamic Faraday completion requires scalar W_00 at "
-                    "z=i*omega_p")
-            from .head_correction import fit_dynamic_slab_photon_cttc_q0
+                    "z=0 and z=i*omega_p")
+            from .head_correction import fit_dynamic_photon_cttc_q0
             probe = 1j * float(config.ppm.omega_p)
             probe_response = build_static_photon_head_response(
                 wfns_charge,
@@ -2405,12 +2579,16 @@ def compute_static_photon_response(
                 wfn_fingerprint_binding=wfn_fingerprint_binding,
                 frequency_ry=probe,
             )
-            W_static_charge_gamma = photon_block_view(
-                W_packed, layout, 0, 0, mesh_xy)[0]
-            faraday_ppm = fit_dynamic_slab_photon_cttc_q0(
+            resident_body = W_packed if screen_current else V_packed
+            resident_charge_gamma = photon_block_view(
+                resident_body, layout, 0, 0, mesh_xy)[0]
+            static_charge_gamma = (
+                resident_charge_gamma if screen_current else W_charge_head[0])
+            faraday_ppm = fit_dynamic_photon_cttc_q0(
                 response, probe_response,
-                W_static_body_gamma=W_packed[0],
-                W_static_charge_gamma=W_static_charge_gamma,
+                W_resident_body_gamma=resident_body[0],
+                W_resident_charge_gamma=resident_charge_gamma,
+                W_static_charge_gamma=static_charge_gamma,
                 W_probe_charge_gamma=W_charge_probe[0],
                 g0_X=g0_X, g0_Y=g0_Y,
                 cubature_receipt=cubature,
@@ -2419,27 +2597,60 @@ def compute_static_photon_response(
             )
 
         V_packed, W_packed, head_completion = (
-            complete_static_slab_photon_q0(
-                V_packed, W_packed, completion_response,
+            complete_static_photon_q0(
+                V_packed, W_packed,
+                (completion_response if charge_block_state
+                 == STATIC_PHOTON_CHARGE_BLOCK_PRESENT else None),
                 g0_X, g0_Y, cubature,
-                mesh_xy=mesh_xy))
-        jax.block_until_ready((V_packed, W_packed))
+                mesh_xy=mesh_xy,
+                charge_block_state=charge_block_state,
+                layout=(layout if charge_block_state
+                        == STATIC_PHOTON_CHARGE_BLOCK_ABSENT else None)))
+        jax.block_until_ready(
+            V_packed if W_packed is None else (V_packed, W_packed))
         sanity.refuse_nonfinite(
             "Gamma-completed static photon V", V_packed)
-        sanity.refuse_nonfinite(
-            "Gamma-completed static photon W", W_packed)
+        if W_packed is not None:
+            sanity.refuse_nonfinite(
+                "Gamma-completed static photon W", W_packed)
         if jax.process_index() == 0:
-            print_fn(
-                "  [photon head] Gamma-cell completion applied: bare <D> "
-                "into V, charge S00/wing head into W; hall_source="
-                f"{completion_response.hall_source}; "
-                f"ward={head_completion.ward_residual:.3e}, "
-                f"hermiticity={head_completion.hermiticity_residual:.3e}, "
-                "dyson_forward_bound="
-                f"{head_completion.max_dyson_forward_error_bound:.3e}",
-                flush=True)
+            if charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_ABSENT:
+                print_fn(
+                    "  [photon head] Gamma-cell completion applied: bare "
+                    "<D> into V and logical W_CURRENT = V_CURRENT; packed "
+                    "CC block ABSENT; charge S/wing fold SKIPPED (no "
+                    "consumer); "
+                    f"dimension={dimension}, method={cubature.method}, "
+                    f"orders={cubature.orders}, "
+                    f"physical={cubature.physical_counts}, "
+                    "weight_defect_max="
+                    f"{max(cubature.weight_sum_defects):.3e}, "
+                    f"<v>={head_completion.bare_D_mean[0, 0].real:.12e}, "
+                    "tr<D_TT>="
+                    f"{np.trace(head_completion.bare_D_mean[1:, 1:]).real:.12e}",
+                    flush=True)
+            else:
+                print_fn(
+                    "  [photon head] Gamma-cell completion applied: "
+                    f"dimension={dimension}, method={cubature.method}, "
+                    f"orders={cubature.orders}, "
+                    f"physical={cubature.physical_counts}, "
+                    "weight_defect_max="
+                    f"{max(cubature.weight_sum_defects):.3e}, "
+                    f"<v>={head_completion.bare_D_mean[0, 0].real:.12e}, "
+                    "tr<D_TT>="
+                    f"{np.trace(head_completion.bare_D_mean[1:, 1:]).real:.12e}; "
+                    "bare "
+                    "<D> into V, charge S00/wing head into W; hall_source="
+                    f"{response.hall_source}; "
+                    f"ward={head_completion.ward_residual:.3e}, "
+                    f"hermiticity={head_completion.hermiticity_residual:.3e}, "
+                    "dyson_forward_bound="
+                    f"{head_completion.max_dyson_forward_error_bound:.3e}",
+                    flush=True)
 
         if faraday_ppm is not None:
+            from dataclasses import replace
             head_completion = replace(
                 head_completion, faraday_ppm=faraday_ppm)
             faraday_head_record = (
@@ -2462,10 +2673,12 @@ def compute_static_photon_response(
     if screen_current:
         return StaticPhotonResponse(
             layout=layout, V_packed=V_packed, W_packed=W_packed,
+            charge_block_state=charge_block_state,
             current_contact=current_contact,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
             faraday_head_record=faraday_head_record,
+            charge_head_insertion_norm_stats=charge_head_insertion_stats,
             approximation=(
                 "gamma_completed_no_pair_static_photon_v1"
                 if coupled_head
@@ -2473,10 +2686,12 @@ def compute_static_photon_response(
         )
     return StaticPhotonResponse(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
+        charge_block_state=charge_block_state,
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
         faraday_head_record=faraday_head_record,
+        charge_head_insertion_norm_stats=charge_head_insertion_stats,
         approximation=(
             "gamma_completed_bare_transverse_photon_v1"
             if coupled_head
@@ -3702,7 +3917,8 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     ).compile()
 
 
-def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, n_rmu_logical=None,
+                       dyson_solver=None,
                        distrib_la_batched_route: str = "batch_reshard"):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
@@ -3711,7 +3927,8 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
     """
     ensure_jax_compile_cache()
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        meta, mesh_xy, n_rmu=chi0_q.shape[1],
+        n_rmu_logical=n_rmu_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route)
     # The DISTRIBUTED plan is a plain function around chunked jits + one
     # FFI call, not a single jit, so there is nothing to lower here —

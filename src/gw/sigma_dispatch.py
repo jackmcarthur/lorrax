@@ -730,7 +730,6 @@ def compute_sigma_xc(
     input_dir: str,
     Gij: jax.Array | None = None,
     wfns_transverse=None,
-    bispinor_v_q_path: str | None = None,
     photon_response=None,
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
@@ -796,15 +795,13 @@ def compute_sigma_xc(
         term take the same ``diag(f)`` weights Σ_c does.  ``None`` is
         the insulating default and every static channel is then
         bit-for-bit the integer ``occ > 0.5`` projector.
-    wfns_transverse, bispinor_v_q_path
-        Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
-        tile file).  Both-or-neither; the static kernels fold Σ^B into
-        ``sig_x`` and, for COHSEX, the physical ``sig_sx`` component that
-        forms ``sigma_xc``.  ``None`` for scalar runs.
+    wfns_transverse
+        Transverse-centroid wavefunction bundle consumed by the packed
+        four-current Sigma owner.  ``None`` for scalar runs.
     photon_response
-        Packed static four-current response.  Used only by
-        ``bispinor_gw=full_static_cohsex``; the default bare-transverse path
-        neither inspects nor constructs it.
+        Packed four-current response.  Every accepted bispinor deck supplies
+        one; the selected family and compute mode decide whether it carries
+        all sixteen blocks or only the current-index blocks.
     print_fn
         Rank-0-only print.
 
@@ -1001,7 +998,6 @@ def compute_sigma_xc(
     photon_head_sigma_basis = None
     sigma_lorentz = None
     faraday_ppm = None
-    sig_x_b = None
     if packed_photon_replaces_charge_sigma(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
@@ -1038,6 +1034,7 @@ def compute_sigma_xc(
             photon_layout=photon_response.layout,
             meta=meta,
             mesh_xy=mesh_xy,
+            charge_block_state=photon_response.charge_block_state,
             head_completion=photon_response.head_completion,
             diagnostic_basis_rotation=hartree_basis_rotation,
             diagnostic_input_basis=(
@@ -1049,57 +1046,22 @@ def compute_sigma_xc(
                 photon_head_diagnostics.components_tskn_ry)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
         sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
-    elif uses_dynamic_packed_photon_route(config):
-        # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
-        # W_packed(w) = diag(W_00(w), W_TT, W_CT): the CHARGE block carries
-        # the run's plasmon-pole model, the twelve CURRENT blocks are frozen
-        # at w = 0.  Because the sixteen-block sum is a plain sum once
-        # W_packed is built, Sigma splits exactly in two and each half keeps
-        # its existing owner:
-        #
-        #   Sigma_xc(w) = [ Sigma_x^CC + Sigma_c^CC(w) ]        <- scalar owner
-        #               + [ sum_{AB != CC} SX(W_AB) + COH(W_AB - V_AB) ]
-        #                                                       <- packed owner
-        #
-        # There is no third implementation here: the first bracket is the
-        # ordinary compute_sigma_x + ppm_pipeline chain below, the second is
-        # the SAME gw.photon_sigma consumer the static packed mode uses,
-        # called with blocks = "current".
-        #
-        # In the BARE family (chi_TT = chi_CT = 0) the second bracket is
-        # SX(D_TT) = X(D_TT) = Sigma^B with COH(D_TT - D_TT) = 0 and CT/TC
-        # identically zero -- i.e. exactly what gw.sigma_x_bispinor returned
-        # and what compute_sigma_x folded into sig_x on the incumbent route,
-        # plus the TT/CT Gamma cell the packed completion carries.
-        # reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md section 1.
+    elif (uses_static_photon_response(config)
+          and mode is ComputeMode.X_ONLY):
+        # Bare-family x_only is exactly scalar charge X plus the packed
+        # consumer's current X blocks.  W_packed equals V_packed on this
+        # route, so no screened channel or correlation is admitted and the
+        # no second Sigma-B fold exists.
         if photon_response is None:
             raise RuntimeError(
-                "dynamic packed-photon route reached Sigma without the "
-                "packed static photon response.  Refusing instead of "
-                "falling back to charge-only screened Sigma with no "
-                "transverse channel at all.")
-        if builds_static_screened:
-            raise ValueError(
-                f"dynamic packed-photon route reached Sigma with a mode "
-                f"that builds static screened channels "
-                f"({getattr(mode, 'value', mode)}); the packed current "
-                "blocks and a static screened charge Sigma would both "
-                "claim the SX/COH columns.")
+                "packed x_only reached Sigma without the packed photon "
+            "response; refusing a charge-only fallback")
         from .cohsex_sigma import _resolve_Gij
         photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
-        # CHARGE CHANNEL: the ordinary scalar bare-exchange owner, with the
-        # incumbent Sigma^B arms EXPLICITLY OFF.  The transverse exchange is
-        # the packed consumer's TT block below; letting compute_sigma_x add
-        # it as well is precisely the double count this route exists to
-        # remove.  ``static_head_terms`` is the scalar band-diagonal q->0
-        # bare-X head, i.e. the CC head, and it stays the scalar owner's --
-        # the packed completion supplies only the TT/CT Gamma cell here.
         sig_x = compute_sigma_x(
             wfns, V_q, meta, mesh_xy,
             Gij=photon_Gij,
             static_head_terms=static_head_terms,
-            wfns_transverse=None,
-            bispinor_v_q_path=None,
             occupation_state=None,
         )
         from .photon_sigma import (
@@ -1122,13 +1084,112 @@ def compute_sigma_xc(
                 "qp" if hartree_basis_rotation is not None else "dft"),
             print_fn=print_fn,
         )
+        # The declaration W=V makes SX=X and COH(W-V)=0.  Consume X by
+        # name so a future screened response cannot silently enter x_only.
+        sig_x = sig_x + cur_x
+        sig_x.block_until_ready()
+        sig_sx = sig_coh = jnp.zeros_like(sig_x)
+        _sx_x_residual = float(jnp.max(jnp.abs(cur_sx - cur_x)))
+        if _sx_x_residual > 1.0e-13:
+            raise ValueError(
+                "GATE bispinor_packed_x_only_not_bare: packed x_only "
+                "requires SX(V)=X(V), but its current blocks differ.\n"
+                f"  got:  max|Sigma_SX-Sigma_X|={_sx_x_residual:.3e} Ry\n"
+                "  want: exact bare-current identity within 1e-13 Ry\n"
+                "  why:  a screened current operand must never enter x_only\n"
+                "  fix:  use bispinor_gw = bare_transverse and rebuild the "
+                "packed response\n"
+                "  doc:  docs/input_reference.md, bispinor_gw / x_only.")
+        _coh_residual = float(jnp.max(jnp.abs(cur_coh)))
+        if _coh_residual > 1.0e-13:
+            raise ValueError(
+                "GATE bispinor_packed_x_only_has_correlation: packed x_only "
+                "requires COH(W-V)=0, but current correlation survived.\n"
+                f"  got:  max|Sigma_COH|={_coh_residual:.3e} Ry\n"
+                "  want: exact zero within 1e-13 Ry\n"
+                "  why:  x_only cannot consume any W-V contribution\n"
+                "  fix:  use bispinor_gw = bare_transverse and rebuild the "
+                "packed response\n"
+                "  doc:  docs/input_reference.md, bispinor_gw / x_only.")
+        if photon_head_diagnostics is not None:
+            photon_head_sigma_diag = (
+                photon_head_diagnostics.components_tskn_ry)
+            photon_head_sigma_basis = photon_head_diagnostics.output_basis
+        sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
+    elif uses_dynamic_packed_photon_route(config):
+        # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
+        # The scalar GN/HL/MPA owner carries W_00(w).  The packed operator's
+        # CC block and W carrier are absent; its twelve CURRENT blocks are
+        # frozen at w = 0 with W_CURRENT = V_CURRENT.  Sigma therefore splits
+        # exactly in two and each half keeps its existing owner:
+        #
+        #   Sigma_xc(w) = [ Sigma_x^CC + Sigma_c^CC(w) ]        <- scalar owner
+        #               + [ sum_{AB != CC} SX(W_AB) + COH(W_AB - V_AB) ]
+        #                                                       <- packed owner
+        #
+        # There is no third implementation here: the first bracket is the
+        # ordinary compute_sigma_x + ppm_pipeline chain below, the second is
+        # the SAME gw.photon_sigma consumer the static packed mode uses,
+        # called with blocks = "current".
+        #
+        # In the BARE family (chi_TT = chi_CT = 0) the second bracket is
+        # SX(D_TT) = X(D_TT) = Sigma^B with COH(D_TT - D_TT) = 0 and CT/TC
+        # identically zero.  The packed completion also carries the TT/CT
+        # Gamma cell.
+        # reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md section 1.
+        if photon_response is None:
+            raise RuntimeError(
+                "dynamic packed-photon route reached Sigma without the "
+                "packed static photon response.  Refusing instead of "
+                "falling back to charge-only screened Sigma with no "
+                "transverse channel at all.")
+        if builds_static_screened:
+            raise ValueError(
+                f"dynamic packed-photon route reached Sigma with a mode "
+                f"that builds static screened channels "
+                f"({getattr(mode, 'value', mode)}); the packed current "
+                "blocks and a static screened charge Sigma would both "
+                "claim the SX/COH columns.")
+        from .cohsex_sigma import _resolve_Gij
+        photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
+        # CHARGE CHANNEL: the ordinary scalar bare-exchange owner.  The
+        # transverse exchange is owned only by the packed consumer's TT
+        # block below.  ``static_head_terms`` is the scalar band-diagonal q->0
+        # bare-X head, i.e. the CC head, and it stays the scalar owner's --
+        # the packed completion supplies only the TT/CT Gamma cell here.
+        sig_x = compute_sigma_x(
+            wfns, V_q, meta, mesh_xy,
+            Gij=photon_Gij,
+            static_head_terms=static_head_terms,
+            occupation_state=None,
+        )
+        from .photon_sigma import (
+            PHOTON_BLOCKS_CURRENT, compute_static_photon_sigma)
+        (cur_x, cur_sx, cur_coh,
+         photon_head_diagnostics,
+         photon_sigma_diagnostics) = compute_static_photon_sigma(
+            wfns_charge=wfns,
+            wfns_transverse=wfns_transverse,
+            Gij=photon_Gij,
+            V_packed=photon_response.V_packed,
+            W_packed=photon_response.W_packed,
+            photon_layout=photon_response.layout,
+            meta=meta,
+            mesh_xy=mesh_xy,
+            blocks=PHOTON_BLOCKS_CURRENT,
+            charge_block_state=photon_response.charge_block_state,
+            head_completion=photon_response.head_completion,
+            diagnostic_basis_rotation=hartree_basis_rotation,
+            diagnostic_input_basis=(
+                "qp" if hartree_basis_rotation is not None else "dft"),
+            print_fn=print_fn,
+        )
         # BOOKING.  A genuinely w-independent W_AB gives a w-independent
         # Sigma contribution, so adding the current sector to sig_x and
         # adding it to Sigma_c(w) produce the SAME Sigma_xc
         # (qsgw_utils.build_qsgw_sigma_xc forms sig_x + Sigma_c(E)).  It
-        # goes into sig_x, the seam the incumbent route used for Sigma^B, so
-        # the bare family's sigX column is unchanged from that route and the
-        # A/B against it is like for like.  In the SCREENED family the same
+        # goes into sig_x, which is the w-independent bookkeeping seam.  In
+        # the SCREENED family the same
         # column then also carries the current blocks' static CORRELATION,
         # which is O(alpha_FS^2) and is printed here rather than left
         # invisible.
@@ -1157,7 +1218,7 @@ def compute_sigma_xc(
     elif uses_static_photon_response(config):
         # EXHAUSTIVENESS over the packed route's compute modes.  The two
         # predicates above cover gw_config.PACKED_PHOTON_COMPUTE_MODES; a
-        # packed deck on any other mode (mpa today) reaches here only
+        # packed deck on any other mode reaches here only
         # through a hand-built config that skipped
         # refuse_unsupported_bispinor_gw, and is refused by name rather
         # than served the charge-only scalar path with its transverse
@@ -1165,12 +1226,10 @@ def compute_sigma_xc(
         raise NotImplementedError(
             f"packed four-current mode with compute_mode = "
             f"{getattr(mode, 'value', mode)} has no Sigma branch.  The "
-            "packed operator serves compute_mode = cohsex (static, all "
-            "sixteen blocks) and the two-point plasmon-pole pair (dynamic "
-            "charge block, static current blocks).  mpa has no independent "
-            "static-role W for the bare family's CC block "
-            "(gw.screening.screening_requests_for returns none for it), so "
-            "it is refused rather than approximated; see "
+            "packed operator serves compute_mode = x_only (scalar charge X "
+            "plus packed current X), cohsex (static, all sixteen blocks) and "
+            "all named dynamic modes (scalar dynamic charge owner, absent "
+            "packed CC block, static current blocks); see "
             "gw_config.PACKED_PHOTON_COMPUTE_MODES.")
     elif builds_static_screened:
         cohsex = compute_cohsex_sigma(
@@ -1179,42 +1238,18 @@ def compute_sigma_xc(
             do_screened=True,
             static_head_terms=static_head_terms,
             compute_bare_x=True,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
         )
         sig_x = cohsex["sig_x"]
         sig_sx = cohsex["sig_sx"]
         sig_coh = cohsex["sig_coh"]
-        sig_x_b = cohsex["sig_x_b"]
-        if sig_x_b is not None:
-            sigma_xc_incumbent = sig_sx + sig_coh
-            sigma_lorentz = jnp.stack((
-                sigma_xc_incumbent - sig_x_b,
-                jnp.zeros_like(sig_x_b),
-                sig_x_b,
-            ))
     else:
-        _bispinor_sigma = (
-            wfns_transverse is not None and bispinor_v_q_path is not None)
-        sigma_x_result = compute_sigma_x(
+        sig_x = compute_sigma_x(
             wfns, V_q, meta, mesh_xy,
             Gij=Gij,
             static_head_terms=static_head_terms,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
-            return_transverse=_bispinor_sigma,
         )
-        if _bispinor_sigma:
-            sig_x, sig_x_b = sigma_x_result
-            sigma_lorentz = jnp.stack((
-                sig_x - sig_x_b,
-                jnp.zeros_like(sig_x_b),
-                sig_x_b,
-            ))
-        else:
-            sig_x = sigma_x_result
         sig_sx = sig_coh = jnp.zeros_like(sig_x)
 
     # Density-SC rebuilds this same exact G-space operator from the evolving
@@ -1382,7 +1417,6 @@ def compute_sigma_xc(
             quadrature_eps=float(config.sigma.quadrature_eps),
             quadrature_reduction_seconds=float(
                 config.sigma.quadrature_reduction_seconds),
-            pair_ceiling=int(config.mpa.sigma_max_nodes),
             quadrature_cache_dir=quadrature_cache_dir,
             omega_grid_step_ry=(
                 float(config.sigma.omega_step_ev) / RYD_TO_EV),
@@ -1419,6 +1453,8 @@ def compute_sigma_xc(
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
         return finalize_dynamic_sigma(
             body.sigma_c_kij, head_diag,
+            photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
+            photon_head_sigma_basis=photon_head_sigma_basis,
             sig_x=sig_x, sig_h=sig_h,
             v_h_scalar=v_h_scalar, h_transverse=h_transverse,
             hartree_omitted=bool(omit_v_h),

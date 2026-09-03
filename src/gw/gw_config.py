@@ -919,6 +919,20 @@ def refuse_unsupported_screening_diagrams(config) -> None:
     table = _RESOLVENT_REFUSAL_TABLES.get(diagrams)
     if table is None:
         return
+    if bool(config.bispinor):
+        raise ValueError(
+            "GATE bispinor_screening_diagrams_require_packed_operand: "
+            f"screening_diagrams = {diagrams.value} is refused with "
+            "bispinor = true.\n"
+            f"  got:  bispinor = true, screening_diagrams = {diagrams.value}\n"
+            "  want: screening_diagrams = w_rpa for a bispinor deck\n"
+            "  fix:  use w_rpa, or set bispinor = false only when scalar "
+            "charge physics is intended\n"
+            "  why:  the ladder/resolvent dispatch accepts a scalar V/W "
+            "operand and has no packed four-current operator; falling "
+            "through would run a different diagram set on charge alone\n"
+            "  doc:  docs/input_reference.md '## Screening', "
+            "screening_diagrams / bispinor_gw.")
     for rule_id, predicate, got, want, fix, doc in table:
         if not predicate(config):
             continue
@@ -2166,7 +2180,6 @@ _DEFAULTS = {
     "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_reduction_seconds": 120.0,
     "sigma_quadrature_cache_dir": "auto",
-    "mpa_sigma_max_nodes": 96,
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
     # the applied floor is 1 − threshold: 0.995 ⇒ |weight| > 0.005.  It is
@@ -2184,22 +2197,6 @@ _DEFAULTS = {
     # range spelling (docs/dev/crossing-rule-cost-law.md).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
-    # Effective-xi FLOOR, in eV.  "auto" (default) = the ansatz's own
-    # conditioning floor: for the HGL plasmon-pole crossing quadrature that
-    # is `ppm_windows.crossing_regularization_floor` = 2*omega_max/(24 -
-    # 2*edge), which is why a GN-PPM run on a +/-5 eV grid at edge 1.5
-    # silently ran at 0.4762 eV where the deck said 0.25; for MPA it is 0,
-    # because MPA's crossing family is a positive real-time rule with its
-    # own node ceiling and the HGL bandwidth derivation says nothing about
-    # it.  A FLOAT is an explicit floor applied to EVERY ansatz -- the knob
-    # that equalises xi across a cross-ansatz comparison, which is otherwise
-    # confounded (1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV
-    # window).  0 is legal and means "do not raise"; on an HGL ansatz that
-    # re-opens the ill-conditioned regime the floor exists for, so it is
-    # spellable on purpose and stamped so it cannot happen by accident.
-    # Resolved ONCE by `ppm_windows.resolve_sigma_regularization` and
-    # stamped into sigma_mnk.h5 beside the requested value.
-    "sigma_regularization_floor_ev": "auto",
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -3027,10 +3024,9 @@ def read_lorrax_input(filename: str) -> dict:
                 "the same <D_TT> = -<v P^T> the overlay wrote.\n"
                 "  why:  heads are always on with bispinors (owner ruling "
                 "2026-09-01, docs/architecture/decisions.md; TASTE.md row "
-                "20), so a deck dial that turns one off is not a dial.  The "
-                "overlay code (gw.v_q_bispinor._tt_head_tensor) survives "
-                "only for the incumbent non-packed route, which is being "
-                "retired; nothing reads a deck value for it.\n"
+                "20), so a deck dial that turns one off is not a dial.  "
+                "There is no separate overlay implementation or runtime "
+                "field; the packed completion is the sole owner.\n"
                 "  doc:  docs/input_reference.md, bispinor_gw / "
                 "head_correction."
             )
@@ -3049,8 +3045,7 @@ def read_lorrax_input(filename: str) -> dict:
                     "Sigma route. Remove the key and use "
                     "sigma_quadrature_eps, "
                     "sigma_quadrature_reduction_seconds, "
-                    "sigma_quadrature_cache_dir, and the existing "
-                    "mpa_sigma_max_nodes pair ceiling."
+                    "sigma_quadrature_cache_dir."
                 )
         # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
         # accumulation is the only mode, so the key steered nothing.  The
@@ -3387,8 +3382,8 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         # closed.  Both halves the previous session's comment named as
         # missing are now ported and gated:
         #
-        # * Sigma^B/vertex insertion (sigma_x_bispinor.py's G-build side)
-        #   — gw.wavefunction_bundle.with_lorentz_vertices, a
+        # * current-vertex insertion —
+        #   gw.wavefunction_bundle.with_lorentz_vertices, a
         #   representation-aware bundle operation folding γ̃ into whichever
         #   pair of fields plays the G-build's direct/conjugated role
         #   (psi_xn/psi_yr legacy, psi_mun/psi_nmu face) — landed
@@ -3572,20 +3567,18 @@ _SCALAR_HEAD_OVERRIDES: tuple[tuple[str, object], ...] = (
 
 #: The compute modes the packed four-current operator serves.  ``cohsex`` is
 #: the phase-1 static mode (the packed operator owns the WHOLE Sigma); the
-#: two-point plasmon-pole pair is the phase-3 dynamic packed route, where the
-#: CHARGE block is dynamic (the ordinary scalar Sigma_c on the same ISDF
-#: W_00) and the twelve current blocks are frozen at omega = 0.
-#:
-#: ``mpa`` is deliberately absent.  ``gw.screening.screening_requests_for``
-#: returns NO independent static role for it (its shared double-parallel
-#: frequency walk is not a set of role requests), so the bare-transverse
-#: family's CC block of ``W_packed`` would have no owner, and no gate in the
-#: phase-3 lane covers the fit-store plumbing.  It refuses by name rather
-#: than being served the plasmon-pole branch's assembly.
+#: dynamic modes are the phase-3 route, where the CHARGE block remains with
+#: the ordinary scalar Sigma_c owner and the twelve current blocks are frozen
+#: at omega = 0.  In the bare family the packed operator therefore declares
+#: its CC block ABSENT instead of inventing a static role beside the dynamic
+#: owner.  This is what lets MPA join the route without touching its ordered
+#: fit/residue machinery.
 PACKED_PHOTON_COMPUTE_MODES: tuple[ComputeMode, ...] = (
+    ComputeMode.X_ONLY,
     ComputeMode.COHSEX,
     ComputeMode.GN_PPM,
     ComputeMode.HL_PPM,
+    ComputeMode.MPA,
 )
 
 def scalar_head_overrides_named(config) -> tuple[str, ...]:
@@ -3626,14 +3619,11 @@ def packed_static_envelope(config, *, screened: bool):
     row: it is inferred once from the loaded WFN occupations and
     :func:`validate_material_inputs` refuses every fractional-occupation
     non-MPA run, including this COHSEX-only screened route, and is not a
-    row.  The distributed-plan row (``w_dyson_solver = distributed``) is
-    shared because the packed response facade has that one plan even when
-    the bare route can skip the block-diagonal current solve.  ``sys_dim`` is
-    also deliberately NOT here -- the bare route treats it as a routing
-    condition while the screened mode refuses it only under
-    ``head_correction = full`` (``GATE
-    static_bispinor_photon_head_slab_only``), and one row cannot honestly
-    say both.
+    row.  The Dyson-plan row belongs only to the screened family.  The bare
+    family performs no packed solve; its scalar charge solve uses the ordinary
+    two-plan facade, and x_only needs no W.  ``sys_dim`` is shared: the
+    provider issues an exact polygon or polyhedron receipt, while the coupled
+    completion algebra remains one owner.
     """
     yield (config.compute_mode in PACKED_PHOTON_COMPUTE_MODES,
            f"compute_mode = {config.compute_mode.value}",
@@ -3641,14 +3631,27 @@ def packed_static_envelope(config, *, screened: bool):
            + ", ".join(m.value for m in PACKED_PHOTON_COMPUTE_MODES) + "}",
            _ENV_IMPL,
            "the photon response is built once at omega = 0: cohsex is the "
-           "static packed mode; the two-point plasmon-pole pair is the DYNAMIC "
-           "packed route (W_00(omega) on the charge block, the twelve current "
-           "blocks frozen at omega = 0); mpa has no independent static-role W, "
-           "so its CC block would have no owner and it refuses by name", None)
-    yield (config.qp_solver is QPSolver.ONE_SHOT_DFT,
+           "static packed mode; x_only uses scalar charge X plus the packed "
+           "current X blocks; gn_ppm, hl_ppm and mpa are the DYNAMIC packed "
+           "route (the scalar owner carries W_00(omega), the packed CC block "
+           "is absent, and the twelve current blocks are frozen at omega = 0)",
+           None)
+    yield (int(config.sys_dim) in (2, 3),
+           f"sys_dim = {config.sys_dim}", "sys_dim in {2, 3}",
+           _ENV_IMPL,
+           "the packed photon Gamma-cell provider has exact slab and bulk "
+           "Wigner-Seitz rules; a 0-D box has no finite Gamma cell", None)
+    _bare_dynamic_sc = (
+        not screened
+        and config.qp_solver is QPSolver.SELF_CONSISTENT
+        and config.compute_mode.is_dynamic)
+    yield (config.qp_solver is QPSolver.ONE_SHOT_DFT or _bare_dynamic_sc,
            f"qp_solver = {config.qp_solver.value}",
-           "qp_solver = one_shot_dft", _ENV_IMPL,
-           "no self-consistent map exists for the packed 4x4 operator", None)
+           "qp_solver = one_shot_dft, or qp_solver = self_consistent for a "
+           "bare-transverse dynamic mode", _ENV_IMPL,
+           "the orbital-independent bare current operator is reusable across "
+           "a QP map; coupled/static charge completion and screened-current "
+           "responses still require per-map owners", None)
     yield (config.screening.diagrams is ScreeningDiagrams.W_RPA,
            f"screening_diagrams = {config.screening.diagrams.value}",
            "screening_diagrams = w_rpa", _ENV_IMPL,
@@ -3661,24 +3664,14 @@ def packed_static_envelope(config, *, screened: bool):
            "heads are always on with bispinors and 'off' is the announced "
            "DEBUG skip (owner ruling 2026-09-01, "
            "docs/architecture/decisions.md; TASTE.md row 20)", None)
-    yield (not bool(config.restart), "restart = true", "restart = false",
-           _ENV_IMPL,
-           "there is no photon restart storage: the packed V/W and the "
-           "Gamma-cell completion are not in the restart schema, so a "
-           "restarted deck would silently fall back to a different q->0 "
-           "head mechanism.  On a slab COHSEX deck this row is normally "
-           "unreachable: GATE "
-           "bispinor_slab_cohsex_restart_changes_the_head_mechanism refuses "
-           "at parse time, naming both mechanisms", None)
-    yield (str(config.backend.w_dyson_solver) == "distributed",
-           f"w_dyson_solver = {config.backend.w_dyson_solver}",
-           "w_dyson_solver = distributed", _ENV_IMPL,
-           "the packed response facade has only the distributed plan.  "
-           "DERIVED: an unnamed w_dyson_solver is set to distributed for "
-           "every packed route at parse time, so this row can only fire on "
-           "an explicit conflicting value", "w_dyson_solver")
     if not screened:
         return
+    yield (str(config.backend.w_dyson_solver) in ("local", "distributed"),
+           f"w_dyson_solver = {config.backend.w_dyson_solver}",
+           "w_dyson_solver in {local, distributed}", _ENV_IMPL,
+           "the packed response calls the existing two-plan solve_w facade; "
+           "local is valid on a 1x1 mesh and distributed keeps the all-rank "
+           "memory ceiling on a square multi-rank mesh", None)
     yield (bool(config.memory.low_mem_bands), "low_mem_bands = false",
            "low_mem_bands = true", _ENV_IMPL,
            "the sixteen-block no-pair chi0 kernel is written against the "
@@ -3701,26 +3694,15 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     blocks of ``chi`` set to zero: the packed Dyson equation is then block
     diagonal, ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0``, and the
     sixteen-block Sigma consumer returns the screened charge COHSEX in CC,
-    the bare Breit exchange ``Sigma^B`` in TT (``SX(D_TT) = X(D_TT)``,
-    ``COH(D_TT - D_TT) = 0``) and zero in CT/TC -- the incumbent
-    ``gw.sigma_x_bispinor`` result, block for block.  The Gamma completion
-    is the same :func:`gw.head_correction.complete_static_slab_photon_q0`
-    with the charge-only ``R(q)``, which returns ``diag(W^00_h, D_TT)`` and
-    so inserts BOTH the charge head and the bare ``<D_TT>`` that the
-    ``bispinor_tt_head_correction`` overlay writes into the V tiles today.
+    the bare transverse exchange in TT (``SX(D_TT) = X(D_TT)``,
+    ``COH(D_TT - D_TT) = 0``) and zero in CT/TC.  The Gamma completion is
+    :func:`gw.head_correction.complete_static_photon_q0` with charge-only
+    ``R(q)``; it inserts both the charge head and bare ``<D_TT>``.
 
-    The route is taken exactly inside the envelope that completion is
-    derived for, and NOWHERE else: outside it the incumbent
-    charge-screened + ``Sigma^B`` route is the only certified one, and it
-    is unchanged.  Returns ``(taken, reason)`` so the driver can print the
-    first unmet condition instead of switching physics in silence; the
-    predicate and its narration have one owner.
-
-    Not in the predicate on purpose: ``bispinor_tt_head_correction``.  Its
-    value must not move the route -- a deck that asks for the hand TT
-    overlay inside this envelope is REFUSED by
-    :func:`refuse_unsupported_bispinor_gw` (the completion already carries
-    that head, so honouring both would double count it).
+    Every accepted bare-transverse deck is inside this envelope.  Returns
+    ``(taken, reason)`` so validation and the run record share one owner for
+    the capability decision; an unmet row is a named refusal, never a route
+    switch.
     """
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
@@ -3731,21 +3713,25 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
     # resolving property that can itself refuse) touched by this predicate.
     if not bool(config.bispinor):
         return False, "bispinor = false (no transverse channels to pack)"
-    if int(config.sys_dim) != 2:
-        # Not in the shared table: the screened mode refuses a bulk deck
-        # only under head_correction = full, and one row cannot say both.
-        return False, (f"sys_dim = {config.sys_dim} "
-                       "(the packed bare route wants sys_dim = 2)")
     for accepted, got, want, _klass, _why, _derived in packed_static_envelope(
             config, screened=False):
         if not accepted:
             return False, f"{got} (the packed bare route wants {want})"
     if config.compute_mode is ComputeMode.COHSEX:
-        return True, "bispinor slab one-shot static COHSEX"
+        return True, (
+            f"bispinor sys_dim={config.sys_dim} one-shot static COHSEX")
+    if config.compute_mode is ComputeMode.X_ONLY:
+        return True, (
+            f"bispinor sys_dim={config.sys_dim} one-shot x_only -- scalar "
+            "charge X plus packed "
+            "current X blocks, with no W solve")
+    solver = config.qp_solver.value.replace("_", "-")
     return True, (
-        f"bispinor slab one-shot {config.compute_mode.value} -- the DYNAMIC "
-        "packed route: W_00(omega) on the charge block, the twelve current "
-        "blocks frozen at omega = 0")
+        f"bispinor sys_dim={config.sys_dim} {solver} "
+        f"{config.compute_mode.value} -- the DYNAMIC "
+        "packed route: the scalar owner carries W_00(omega), the packed CC "
+        "block is absent, and the twelve current blocks are frozen at "
+        "omega = 0")
 
 
 def packed_photon_screens_current(config) -> bool:
@@ -3800,15 +3786,15 @@ def packed_photon_replaces_charge_sigma(config) -> bool:
 def uses_dynamic_packed_photon_route(config) -> bool:
     """The packed four-current operator on a frequency-dependent Sigma.
 
-    ``W_packed(omega) = diag(W_00(omega), W_TT, W_CT)``: the charge block
-    carries the run's plasmon-pole model, the current blocks are the
-    ``omega = 0`` packed response.  See
+    The scalar dynamic owner carries ``W_00(omega)``; the packed operator's
+    CC block is explicitly absent and its current blocks are the ``omega =
+    0`` response.  See
     ``reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md`` for the block
     algebra and the measured bound on what freezing the current blocks
     costs.
     """
     return (uses_static_photon_response(config)
-            and config.compute_mode.ppm_model is not None)
+            and config.compute_mode.is_dynamic)
 
 
 def uses_coupled_photon_head(config) -> bool:
@@ -3827,45 +3813,41 @@ def uses_coupled_photon_head(config) -> bool:
             and config.head.correction is HeadCorrection.FULL)
 
 
-def incumbent_bispinor_head_record(config) -> tuple[str, str]:
-    """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route.
+def refuse_screened_photon_restart_storage(
+    config, *, nq: int, n_charge_padded: int, n_current_padded: int,
+) -> None:
+    """Refuse the one packed restart class whose solved body is not stored.
 
-    Heads are always on (owner ruling 2026-09-01,
-    ``docs/architecture/decisions.md``; TASTE.md row 20).  The packed route
-    has said so since lane B: a boxed ``WARNING -- DEBUG`` banner and a
-    ``Photon head`` line naming the completion.  The incumbent route said
-    only "no special Gamma-cell contribution", in component chatter that
-    production mode sinks -- so a headless bispinor bulk / dynamic /
-    ``x_only`` run reached ``eqp1.dat`` with no DEBUG token anywhere in the
-    run record (lane J section 3.c).
-
-    Returned rather than printed so the policy has ONE owner and a test can
-    read it without a driver.  ``banner`` is ``""`` when there is nothing
-    loud to say.  The caller is :mod:`gw.gw_jax`, and only for decks with
-    ``uses_static_photon_response(config)`` false.
+    The bare family is rebuilt from authenticated V tiles, scalar W0 (when
+    its mode uses W), and the four small Gamma vectors.  A screened packed
+    response instead depends on its full coupled solution.  Until that
+    solution has one canonical tagged-array representation, quote the exact
+    two-body storage requirement for this run and stop before loading large
+    restart arrays.
     """
-    if config.head.correction is HeadCorrection.OFF:
-        return (
-            "\n  ==========================================================\n"
-            "  WARNING -- DEBUG: Gamma-cell head disabled by\n"
-            "  head_correction=off on the INCUMBENT bispinor route.\n"
-            "  No scalar <v>/W_h band-diagonal head and no transverse\n"
-            "  q=Gamma head.  This is a brute-force k-grid convergence /\n"
-            "  debugging setting, NOT a production calculation\n"
-            "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
-            "  ==========================================================\n",
-            "DEBUG: no Gamma-cell head at all (head_correction=off on the "
-            "incumbent route); NOT a production calculation")
-    # head_correction = full here (no_local_fields is refused on every
-    # bispinor deck).  The CHARGE head is the scalar band-diagonal one and
-    # there is NO transverse q=Gamma head on this route now that the overlay
-    # has no deck key -- say so rather than let a bulk number look complete.
-    return (
-        "",
-        "scalar band-diagonal charge head only (gw.head_correction "
-        "StaticHeadTerms); NO transverse q=Gamma head on the incumbent "
-        "route -- the packed Gamma-cell completion is the only producer of "
-        "<D_TT> and this deck is outside its envelope")
+    mode = coerce_bispinor_gw_mode(getattr(
+        config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if (not bool(config.bispinor)
+            or mode is not BispinorGWMode.FULL_STATIC_COHSEX
+            or not bool(config.restart)):
+        return
+    packed = int(n_charge_padded) + 3 * int(n_current_padded)
+    storage_bytes = 2 * int(nq) * packed * packed * 16
+    raise ValueError(
+        "GATE bispinor_screened_packed_restart_storage_unimplemented: "
+        "screened packed restart is not yet represented in the canonical "
+        "restart schema.\n"
+        f"  got:  bispinor_gw = {mode.value}, restart = true, nq={int(nq)}, "
+        f"N_packed={packed}\n"
+        "  want: restart = false, or one authenticated V_packed/W_packed "
+        "schema with a completion receipt\n"
+        "  why:  rebuilding the sixteen-block screened response would repeat "
+        "chi0 and the coupled Dyson solve; persisting both complex128 bodies "
+        f"would require {storage_bytes} bytes "
+        f"({storage_bytes / 2**30:.6f} GiB) for this run\n"
+        "  fix:  set restart = false; use bare_transverse when bare current "
+        "physics is intended\n"
+        "  doc:  docs/input_reference.md, bispinor_gw / restart.")
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:
@@ -3895,42 +3877,22 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "never choose a route (lane J section 2/3.d).  Bispinor heads "
             "are on by default and 'off' is the announced DEBUG skip.\n"
             "  doc:  docs/input_reference.md, head_correction.")
-    # A DECK KEY THAT IS NOT A HEAD DIAL MUST NOT CHANGE THE HEAD.  On a
-    # bispinor slab COHSEX deck, flipping ``restart`` alone used to move the
-    # calculation from the packed Gamma-cell completion to the incumbent
-    # scalar band-diagonal head -- silently, with no run-record difference
-    # beyond the routing reason, and worth 5.7 meV on an occupied state's
-    # SX+COH (lane J section 4.2: the two quadratures measured on the SAME
-    # head function, exact Wigner-Seitz vs the production Sobol draw), plus
-    # the whole transverse q=Gamma head.  Photon restart storage is not
-    # built, so the honest answer is to refuse, not to route.
     if (bool(config.bispinor)
-            and config.compute_mode is ComputeMode.COHSEX
-            and int(config.sys_dim) == 2
-            and bool(config.restart)):
+            and mode is BispinorGWMode.FULL_STATIC_COHSEX
+            and config.compute_mode is ComputeMode.X_ONLY):
         raise ValueError(
-            "GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism: "
-            "restart = true is refused on a bispinor slab static-COHSEX "
-            "deck.\n"
-            f"  got:  bispinor = true, compute_mode = cohsex, sys_dim = "
-            f"{config.sys_dim}, restart = true\n"
-            "  want: restart = false, or leave restart unnamed (an unnamed "
-            "restart is set to false for this deck class at parse time, "
-            "with a [config provenance] line)\n"
-            "  why:  IMPLEMENTATION LIMIT.  There is no photon restart "
-            "storage: neither the packed 4x4 V/W nor the Gamma-cell "
-            "completion is in the restart schema.  A restarted deck would "
-            "therefore silently swap ONE q->0 head mechanism for ANOTHER -- "
-            "from the packed completion (exact slab Wigner-Seitz cubature "
-            "of the coupled 4x4 Dyson equation: charge CC q^2 head, charge "
-            "wings, the bare <D_TT> transverse head, optional Hall CT/TC) "
-            "to the incumbent one (a Sobol mini-BZ <v>/W_h inserted band "
-            "diagonally by gw.head_correction's StaticHeadTerms, and NO "
-            "transverse head at all).  Measured difference on MoS2 3x3: "
-            "+5.72 meV on an occupied state's SX+COH from the quadrature "
-            "alone (reports/bisp_j_architecture_review_2026-09-01 section "
-            "4.2), before the missing transverse head.\n"
-            "  doc:  docs/input_reference.md, bispinor_gw / restart.")
+            "GATE bispinor_screened_x_only_has_no_screened_operand: "
+            "x_only is refused for the screened-current family.\n"
+            "  got:  bispinor = true, bispinor_gw = "
+            "full_static_cohsex, compute_mode = x_only\n"
+            "  want: bispinor_gw = bare_transverse for packed x_only\n"
+            "  why:  x_only has no W or chi0, so full_static_cohsex cannot "
+            "supply the screened four-current operand its name requests; "
+            "falling through would either run an unnecessary packed Dyson "
+            "solve or silently reinterpret screened current as bare current\n"
+            "  fix:  use bispinor_gw = bare_transverse, or select cohsex "
+            "when a screened-current static self-energy is intended\n"
+            "  doc:  docs/input_reference.md, bispinor_gw / x_only.")
     if (bool(config.bispinor)
             and config.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(config.density_self_consistent)):
@@ -3945,39 +3907,77 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "charge and signed Dirac current must be rebuilt on every map; "
             "freezing the DFT direct field mixes two orbital states\n"
             "  doc:  docs/input_reference.md, density_self_consistent.")
-    # EITHER packed static mode inserts the bare <D_TT> q=Gamma head through
-    # the Gamma-cell completion that carries the charge head, so the hand
-    # overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
-    # (gw.v_q_bispinor._tt_head_tensor) would be counted twice.  ONE gate for
-    # both, no longer a row of the envelope table: the deck key is gone, so
-    # this is the hand-built-config guard, and a route must never be moved by
-    # a head dial.  (The gate id keeps its bare-route name so the docs, the
-    # tests and this message stay one string; lane N deletes it with the
-    # overlay.)
-    if (uses_static_photon_response(config)
-            and bool(config.head.bispinor_tt_head_correction)):
-        raise ValueError(
-                "GATE packed_bare_transverse_tt_head_double_count: "
-                f"bispinor_gw = {mode.value} is refused with "
-                "bispinor_tt_head_correction = true inside the packed "
-                "static-photon envelope.\n"
-                "  got:  bispinor_tt_head_correction = true, "
-                f"bispinor = true, compute_mode = "
-                f"{config.compute_mode.value}, sys_dim = {config.sys_dim}, "
-                f"head_correction = {config.head.correction.value}, "
-                f"qp_solver = {config.qp_solver.value}\n"
-                "  want: bispinor_tt_head_correction = false\n"
-                "  why:  this deck routes through the packed static photon "
-                "operator, whose Gamma-cell completion already inserts the "
-                "bare <D_TT> = -<v P^T> head into the TT blocks of V (and, "
-                "unscreened, of W).  The overlay writes the same quantity "
-                "into the q=Gamma, G=0 slot of the TT V tiles, so keeping "
-                "both would double count it.\n"
-                "  fix:  leave head.bispinor_tt_head_correction at its "
-                "default (False) -- it is not a deck key any more; the TT "
-                "head is on by default with the charge head\n"
-                "  doc:  docs/input_reference.md, "
-                "bispinor_tt_head_correction.")
+    if bool(config.bispinor):
+        if (mode is BispinorGWMode.FULL_STATIC_COHSEX
+                and config.compute_mode is ComputeMode.MPA):
+            raise ValueError(
+                "GATE packed_screened_mpa_static_role_unimplemented: "
+                "screened-current MPA has no owned static charge role.\n"
+                "  got:  bispinor_gw = full_static_cohsex, "
+                "compute_mode = mpa\n"
+                "  want: bispinor_gw = bare_transverse, or compute_mode in "
+                "{cohsex, gn_ppm, hl_ppm}\n"
+                "  why:  the screened packed solve needs W_00(0) in the "
+                "same static operator as its current blocks.  MPA stores "
+                "the exact z=0 sample inside its fit transaction but does "
+                "not expose a static-role W; adding another static-W builder "
+                "would create a second owner\n"
+                "  fix:  expose the MPA fit transaction's exact static W "
+                "through the existing screening seam before enabling this "
+                "cell\n"
+                "  doc:  docs/input_reference.md, bispinor_gw.")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and mode is BispinorGWMode.FULL_STATIC_COHSEX):
+            raise ValueError(
+                "GATE packed_screened_self_consistency_unimplemented: "
+                "the screened packed response has no per-map owner.\n"
+                "  got:  bispinor_gw = full_static_cohsex, "
+                "qp_solver = self_consistent\n"
+                "  want: qp_solver = one_shot_dft, or "
+                "bispinor_gw = bare_transverse with a dynamic compute_mode\n"
+                "  why:  every QP map would have to rebuild all sixteen "
+                "chi blocks, the packed Dyson solve and its coupled charge "
+                "head.  The scalar SC hook owns only scalar W today; reusing "
+                "the pre-map packed response would freeze orbital-dependent "
+                "screening\n"
+                "  fix:  install compute_static_photon_response at the SC "
+                "map's screening seam before enabling this cell\n"
+                "  doc:  docs/input_reference.md, qp_solver.")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and mode is BispinorGWMode.BARE_TRANSVERSE
+                and config.compute_mode is ComputeMode.X_ONLY):
+            raise ValueError(
+                "GATE packed_bare_x_only_self_consistency_unimplemented: "
+                "packed x_only has no self-consistent map owner.\n"
+                "  got:  bispinor_gw = bare_transverse, "
+                "compute_mode = x_only, qp_solver = self_consistent\n"
+                "  want: qp_solver = one_shot_dft, or a dynamic compute_mode "
+                "in {gn_ppm, hl_ppm, mpa}\n"
+                "  why:  IMPLEMENTATION LIMIT.  The existing packed-current "
+                "SC map is entered only by a dynamic Sigma mode.  Letting "
+                "x_only fall through would select the retiring non-packed "
+                "transverse-exchange owner instead of re-projecting the "
+                "immutable packed current operator on each map\n"
+                "  fix:  use qp_solver = one_shot_dft, or extend the sole "
+                "packed-current SC map to x_only and certify that route\n"
+                "  doc:  docs/input_reference.md, qp_solver / bispinor_gw.")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and mode is BispinorGWMode.BARE_TRANSVERSE
+                and config.compute_mode is ComputeMode.COHSEX):
+            raise ValueError(
+                "GATE packed_bare_cohsex_self_consistency_unimplemented: "
+                "static packed COHSEX has no per-map charge completion.\n"
+                "  got:  bispinor_gw = bare_transverse, "
+                "compute_mode = cohsex, qp_solver = self_consistent\n"
+                "  want: qp_solver = one_shot_dft, or a dynamic compute_mode "
+                "in {gn_ppm, hl_ppm, mpa}\n"
+                "  why:  COHSEX consumes the packed CC block, so each QP "
+                "map must rebuild W_00(0), charge S/wings and the coupled "
+                "Gamma completion from the current orbitals.  The dynamic "
+                "bare route consumes no packed CC block and needs none\n"
+                "  fix:  install the sole photon completion beside the "
+                "scalar SC map's static-W update before enabling this cell\n"
+                "  doc:  docs/input_reference.md, qp_solver.")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if not bool(config.bispinor):
@@ -3995,21 +3995,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     # ``full`` runs it, ``off`` is the announced DEBUG skip, and there is no
     # third value because ``no_local_fields`` names a scalar diagnostic that
     # the coupled 4x4 solve does not produce.
-    if config.head.correction is HeadCorrection.FULL and int(config.sys_dim) != 2:
-        raise ValueError(
-            "GATE static_bispinor_photon_head_slab_only: the packed static "
-            "photon Gamma-cell completion is derived for a slab.\n"
-            f"  got:  bispinor_gw = {mode.value}, head_correction = full, "
-            f"sys_dim = {config.sys_dim}\n"
-            "  want: sys_dim = 2\n"
-            "  why:  the completion solves the coupled 4x4 Lorentz Dyson "
-            "equation at every point of an exact in-plane Wigner-Seitz "
-            "cubature (vcoul.slab_minibz_photon_cubature) before averaging; "
-            "a bulk analytic-sphere completion cannot be added after that "
-            "nonlinear solve and has no derived integrator yet.\n"
-            "  fix:  set sys_dim = 2, or head_correction = off for a "
-            "DEBUG headless body (not a production calculation)\n"
-            "  doc:  docs/input_reference.md, bispinor_gw.")
     for accepted, got, want, klass, why, _derived in packed_static_envelope(
             config, screened=True):
         if accepted:
@@ -4026,65 +4011,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "charge wings and the optional Hall CT/TC term; the current "
             "q^2/contact/complement terms are omitted by model.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
-
-
-def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
-    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope.
-
-    NOT REACHABLE FROM A DECK since 2026-09-01: the key is tombstoned in
-    ``read_lorrax_input`` and :class:`HeadConfig` is built with ``False``,
-    so every parsed config returns on the first line.  This function is
-    the guard for a HAND-BUILT config (tests, tools, an embedded caller)
-    that sets the field itself, which is why the driver-entry call in
-    ``gw.gw_init.prepare_isdf_and_wavefunctions`` remains and the
-    parser-altitude call was dropped.  Lane N deletes both with the
-    incumbent non-packed route.
-
-    Two named conditions, GATE ``bispinor_tt_head_unsupported``:
-
-    1. ``bispinor = false`` — the flag corrects a bare TT V-tile that a
-       non-bispinor run never builds.
-    2. ``sys_dim not in (2, 3)`` — box truncation's q=Γ, G=0 slot is
-       already finite (``vcoul.box_0d.Box0D._v_bare_per_q`` never zeros
-       it), so there is no missing slot to substitute; the bispinor
-       g-flat path also does not reach sys_dim=0 today
-       (``gw.v_q_g_flat`` refuses sys_dim not in (2, 3) at its own
-       entry), so this is a defensive, not merely a redundant, refusal.
-
-    """
-    if not bool(config.head.bispinor_tt_head_correction):
-        return
-    if not bool(config.bispinor):
-        raise ValueError(
-            "GATE bispinor_tt_head_unsupported: "
-            "bispinor_tt_head_correction = true is refused with "
-            "bispinor = false.\n"
-            "  got:  bispinor_tt_head_correction = true, bispinor = false\n"
-            "  want: bispinor = true\n"
-            "  fix:  set bispinor = true, or leave the field at its "
-            "default (False) -- it has not been a deck key since "
-            "2026-09-01\n"
-            "  why:  the correction replaces the q=Γ, G=0 slot of the "
-            "bare bispinor TT (transverse-transverse) V-tiles, which a "
-            "non-bispinor run never builds\n"
-            "  doc:  docs/input_reference.md '## Screening', "
-            "bispinor_tt_head_correction.")
-    sys_dim = int(config.sys_dim)
-    if sys_dim not in (2, 3):
-        raise ValueError(
-            "GATE bispinor_tt_head_unsupported: "
-            f"bispinor_tt_head_correction = true is refused with "
-            f"sys_dim = {sys_dim}.\n"
-            f"  got:  bispinor_tt_head_correction = true, sys_dim = {sys_dim}\n"
-            "  want: sys_dim in {2, 3} (slab / bulk)\n"
-            "  fix:  set sys_dim to 2 or 3, or leave the field at its "
-            "default (False) -- it has not been a deck key since "
-            "2026-09-01\n"
-            "  why:  box truncation (sys_dim=0) never zeros its q=Γ, G=0 "
-            "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
-            "there is no missing slot for this correction to fill\n"
-            "  doc:  docs/input_reference.md '## Screening', "
-            "bispinor_tt_head_correction.")
 
 
 def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
@@ -4171,7 +4097,6 @@ class HeadConfig:
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
-    bispinor_tt_head_correction: bool  # bare TT q=Γ,G=0 mini-BZ head (default off)
     w_av_first_neighbors: bool
     w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
@@ -4295,12 +4220,6 @@ class DynamicSigmaConfig:
     quadrature_eps: float = 1.0e-4
     quadrature_reduction_seconds: float = 120.0
     quadrature_cache_dir: str = "auto"
-    #: ``sigma_regularization_floor_ev``: "auto" or a float in eV.  See
-    #: :func:`gw.ppm_windows.resolve_sigma_regularization`, which is the
-    #: ONLY place this is interpreted -- the drivers and the sigma_mnk.h5
-    #: writer all call it, so the stamped xi and the xi the kernel ran at
-    #: cannot disagree.
-    regularization_floor_ev: str | float = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
     #: patches at ``omega_step_ev``, replacing the contiguous grid.  The
@@ -4357,22 +4276,6 @@ class DynamicSigmaConfig:
         if not str(self.quadrature_cache_dir).strip():
             raise ValueError(
                 "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")
-        # 'auto' or a non-negative float in eV.  A TYPO must refuse here,
-        # not resolve to 'auto' -- a floor key that silently defaults is the
-        # confound the key was added to remove.
-        _floor = self.regularization_floor_ev
-        if not (isinstance(_floor, str)
-                and _floor.strip().lower() == "auto"):
-            try:
-                _floor_f = float(_floor)
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"sigma_regularization_floor_ev must be 'auto' or a "
-                    f"number of eV; got {_floor!r}.") from None
-            if not (_floor_f >= 0.0):
-                raise ValueError(
-                    f"sigma_regularization_floor_ev must be >= 0; got "
-                    f"{_floor_f!r}.")
         # REFUSE an unrecognised estimator, naming both, rather than falling
         # back to the default.  A misspelling that silently ran the default
         # would be an A/B measuring nothing -- the same rule
@@ -4488,7 +4391,6 @@ class MPAConfig:
     #: ``sampling._METAL_ORIGIN_SHIFT`` default (2e-5 Ry = 1e-5 Ha).
     metal_origin_shift_ry: float | None
     pole_batch_size: int
-    sigma_max_nodes: int
     #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
     #: counting toward a metallic Green's-function branch.  The Σ planner's
     #: cut is on the branch WEIGHT (``f`` on val, ``1 − f`` on cond), so the
@@ -4530,8 +4432,6 @@ class MPAConfig:
                     "this key is Ry like every deck key, so it is TWICE the "
                     "Hartree value the multipole papers quote (published "
                     "default 1e-5 Ha = 2e-5 Ry).")
-        if self.sigma_max_nodes < 2:
-            raise ValueError("mpa_sigma_max_nodes must be at least two")
 
     def sample_plan(self, omega_m_ry, *, material_class):
         """Return the configured double-parallel frequency plan in Ry.
@@ -5325,9 +5225,18 @@ class LorraxConfig:
                 "mpa_sigma_sector_target_error is retired: MPA Sigma now "
                 "uses one uniform denominator-box rule per product window "
                 "and has no measured-sector error apportionment. Remove the "
-                "key and use sigma_quadrature_eps (default 1e-4); "
-                "mpa_sigma_max_nodes remains the total (window,tau) pair "
-                "ceiling.")
+                "key and use sigma_quadrature_eps (default 1e-4).")
+        if "mpa_sigma_max_nodes" in _named_keys:
+            raise ValueError(
+                "mpa_sigma_max_nodes is retired (2026-09-02): the pair "
+                "ceiling is eliminated and the box plan never refuses on "
+                "count. Remove the key; sigma_quadrature_eps is the only "
+                "accuracy dial.")
+        if "sigma_regularization_floor_ev" in _named_keys:
+            raise ValueError(
+                "sigma_regularization_floor_ev is retired (2026-09-02): "
+                "sigma_regularization_ev is the broadening every ansatz "
+                "runs at and nothing raises it. Remove the key.")
         if _bgw_q0_mode == "exact":
             # An explicit spelling of the shipping default must serialize to
             # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
@@ -5414,13 +5323,6 @@ class LorraxConfig:
             mc_average_placement_vcoul=(
                 str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
-            # NOT a deck key any more (tombstoned above).  The field stays
-            # so the incumbent non-packed TT overlay owner
-            # (gw.v_q_bispinor._make_per_q_v_builder_for_tile) keeps ONE
-            # place to read, and so a hand-built config that sets it True
-            # still meets refuse_unsupported_bispinor_tt_head_correction.
-            # Lane N deletes the field with the incumbent route.
-            bispinor_tt_head_correction=False,
             w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
             w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
@@ -5461,7 +5363,6 @@ class LorraxConfig:
                 float(_g("mpa_metal_origin_shift_ry"))
                 if _g("mpa_metal_origin_shift_ry") is not None else None),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
-            sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
         )
@@ -5477,7 +5378,6 @@ class LorraxConfig:
                 _g("sigma_quadrature_reduction_seconds")),
             quadrature_cache_dir=str(
                 _g("sigma_quadrature_cache_dir")).strip(),
-            regularization_floor_ev=_g("sigma_regularization_floor_ev"),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
             omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
@@ -5912,10 +5812,9 @@ class LorraxConfig:
                 "never selected from mere presence; set restart = true "
                 "explicitly to enter the authenticated restart loader "
                 "(docs/input_reference.md, restart)")
-        # DERIVED, NOT DECLARED (lane J section 3).  ``low_mem_bands`` and
-        # ``w_dyson_solver`` are not physics dials of a packed photon mode --
-        # they are the layouts/plans its envelope is written against -- so
-        # the deck should not have to write them.
+        # DERIVED, NOT DECLARED (lane J section 3).  ``low_mem_bands`` is the
+        # layout the screened packed response is written against, so the deck
+        # should not have to name it.
         # Promote only when EVERY OTHER envelope row already passes: a deck
         # that is outside the envelope for some other reason must still see
         # that reason, not a low_mem_bands refusal it never asked for.  An
@@ -5924,24 +5823,20 @@ class LorraxConfig:
         # ONE derivation site for every packed route.  Applicability and the
         # derived-key names come from ``packed_static_envelope``; this code
         # knows only how to set a named field.  Explicit conflicts survive
-        # and are refused (screened mode) or select the incumbent route
-        # (bare mode), never overwritten.
+        # and are refused by the single packed-route validator, never
+        # overwritten.
         _packed_candidate = (
             bool(resolved.bispinor)
             and (resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX
                  or (resolved.bispinor_gw
-                     is BispinorGWMode.BARE_TRANSVERSE
-                     and int(resolved.sys_dim) == 2)))
+                     is BispinorGWMode.BARE_TRANSVERSE)))
         if _packed_candidate:
             _screened = (
                 resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX)
             _unmet = [row for row in packed_static_envelope(
                 resolved, screened=_screened) if not row[0]]
             if _unmet and all(row[5] for row in _unmet):
-                _promotions = {
-                    "low_mem_bands": ("memory", True),
-                    "w_dyson_solver": ("backend", "distributed"),
-                }
+                _promotions = {"low_mem_bands": ("memory", True)}
                 for row in _unmet:
                     key = row[5]
                     if key in _named_keys:
@@ -5956,6 +5851,28 @@ class LorraxConfig:
                         f"{key} = {value} (the packed response is written "
                         "against this derived layout/plan; "
                         "docs/input_reference.md, bispinor_gw)")
+            if ("w_dyson_solver" not in _named_keys
+                    and all(row[0] for row in packed_static_envelope(
+                        resolved, screened=_screened))):
+                if _screened:
+                    _solver_why = (
+                        "the existing local packed solve is legal on a 1x1 "
+                        "mesh; name distributed for the all-rank memory plan")
+                elif resolved.compute_mode is ComputeMode.X_ONLY:
+                    _solver_why = (
+                        "x_only builds neither scalar nor packed W; the key "
+                        "does not move the packed route")
+                else:
+                    _solver_why = (
+                        "the bare packed operator skips its packed solve; "
+                        "the scalar charge W uses the ordinary local plan")
+                print_fn(
+                    "  [config provenance] packed_static_envelope "
+                    f"(bispinor_gw = {resolved.bispinor_gw.value}): "
+                    "w_dyson_solver was not named; resolved "
+                    f"w_dyson_solver = {resolved.backend.w_dyson_solver} "
+                    f"because {_solver_why} "
+                    "(docs/input_reference.md, bispinor_gw)")
         # CROSS-KEY, and therefore after the record exists: the w_bse
         # refusals read resolved axes (compute_mode / qp_solver fold in the
         # legacy flags), and the honest way to ask which mode a deck chose

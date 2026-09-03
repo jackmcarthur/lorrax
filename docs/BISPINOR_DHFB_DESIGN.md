@@ -1,12 +1,13 @@
 # Bispinor GW — Phase-1 Design (DHF + Bare-Breit)
 
-> **SUPERSEDED IN PART; CURRENT IMPLEMENTATION NOTES UPDATED 2026-08-29.**
+> **SUPERSEDED IN PART; CURRENT IMPLEMENTATION NOTES UPDATED 2026-09-03.**
 > This remains the phase-1 physics record. The current source map and ζ
 > schedule supersede the original implementation plan:
 >
-> - Σ^B assembly lives in `src/gw/sigma_x_bispinor.py` (the planned
->   `src/gw/breit_sigma.py` was never created); V_q^{μν} tiles in
->   `src/gw/v_q_bispinor.py`.
+> - The single packed four-current owner contracts Σ^B in
+>   `src/gw/photon_sigma.py`; bare V_q^{μν} tiles live in
+>   `src/gw/v_q_bispinor.py`. The earlier direct-tile contractor was retired
+>   after every supported deck class moved to this owner.
 > - Transverse ζ uses the Hermitian-indefinite CCT path. The default ridge
 >   family is pivoted LU; `transverse_zeta_solve=rank_truncate` is the explicit
 >   indefinite pseudo-inverse alternative. Fresh μ=1,2,3 fits may share their
@@ -30,7 +31,7 @@
 
 **Status:** historical physics design with current implementation addenda
 
-**Last update:** 2026-08-29
+**Last update:** 2026-09-03
 
 ## 1. Scope
 
@@ -212,7 +213,7 @@ band-pair cost; it is not the implemented path.
 | [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
 | [`src/centroid/sampling_metric.py`](../src/centroid/sampling_metric.py) | Shared charge/current feature-Gram diagonal from streamed subspace projectors. |
 | [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes feature-fit, source-WFN, and intended-channel provenance. |
-| [`src/gw/sigma_x_bispinor.py`](../src/gw/sigma_x_bispinor.py) | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$. |
+| `src/gw/photon_sigma.py` | One block-streamed $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$ and the screened four-current channels. |
 | [`src/gw/v_q_bispinor.py`](../src/gw/v_q_bispinor.py) + [`src/gw/compute_vcoul.py`](../src/gw/compute_vcoul.py) | Channel-aware $V_q$ orchestration and the Coulomb/transverse projector kernel. |
 | [`src/gw/cohsex_sigma.py`](../src/gw/cohsex_sigma.py), [`ppm_sigma.py`](../src/gw/ppm_sigma.py) | Parameterise spinor axis size; $\tilde\gamma^0$ vertices made explicit (identity, but expose contraction shape for phase-2). |
 | [`src/gw/gw_init.py`](../src/gw/gw_init.py), [`gw_config.py`](../src/gw/gw_config.py) | Resolve independent reuse, select coupled versus sequential transverse fitting, and bind the `bispinor_gw` policy. |
@@ -226,7 +227,7 @@ band-pair cost; it is not the implemented path.
 | M2 | Four-density ISDF infra: pair-density helpers, channel-aware centroid mode | done |
 | M3 | $\chi^0_{00}$, $W_{00}$ on bispinor $G^0$ | implemented |
 | M4 | $\Sigma^C$ with explicit $\tilde\gamma^0$ vertices | implemented |
-| M5 | $\Sigma^B$ from bare $D^{ij}$ | implemented in `sigma_x_bispinor.py` |
+| M5 | $\Sigma^B$ from bare $D^{ij}$ | implemented by the packed block consumer in `photon_sigma.py` |
 | M6 | External DHFB-Breit reference comparison | open validation work |
 
 ## 7. Validation strategy
@@ -262,8 +263,9 @@ correction the code applies, live in
 Deck: MoS2 4×4, 402 charge + 143 transverse centroids, P=4, `sys_dim=2`,
 job 7885325 (Frontera; artifacts were machine-local and are not shipped).
 These are historical measurements of the former TT-slot overlay, not a
-current route claim: at `34228021` no deck key reaches that overlay, while
-the packed slab routes obtain `⟨D_TT⟩` from the coupled Γ completion. See the
+current route claim: that overlay and its separate estimator have been
+deleted, while the packed slab and bulk route obtains `⟨D_TT⟩` from the
+coupled Γ completion. See the
 single [implementation-status statement](theory/four-current-head-corrections.md#four-current-phase-status).
 
 | quantity | value |

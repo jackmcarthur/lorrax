@@ -13,10 +13,10 @@ divisibility check anywhere in the module.  One contract at one seam now:
 **(b) The effective Sigma broadening xi.**  GN-PPM silently raised the
 deck's ``sigma_regularization_ev`` to a window-dependent conditioning
 floor; MPA passed it straight through.  1.90x apart on a +/-5 eV grid,
-5.7x on +/-15 eV, and the resolved value appeared in no artifact -- so a
-cross-ansatz comparison could not assert that two runs shared xi.  One
-resolver (``ppm_windows.resolve_sigma_regularization``), one deck key
-(``sigma_regularization_floor_ev``), one stamp.
+5.7x on +/-15 eV, and the resolved value appeared in no artifact.  Since
+2026-09-02 (owner ruling) the floor is gone: one resolver
+(``ppm_windows.resolve_sigma_regularization``) returns the deck's value
+for every ansatz, and one stamp records it.
 
 **(c) fermi_reference.**  MPA read ``wfn.efermi`` and never looked at the
 key.  ``wfn.efermi`` IS the midgap, so the default agreed by coincidence
@@ -106,61 +106,20 @@ def _omega_grid_ry(half_width_ev):
     return np.linspace(-half, half, 41)
 
 
-def test_auto_raises_the_hgl_ansatze_and_leaves_mpa_alone():
-    """The measured 1.90x / 5.7x, reproduced from the shipped formula."""
-    from gw.ppm_windows import (crossing_regularization_floor,
-                                resolve_sigma_regularization)
-
-    for half_ev, expect_ev in ((5.0, 0.4762), (15.0, 1.4286)):
-        grid = _omega_grid_ry(half_ev)
-        ppm = resolve_sigma_regularization(
-            requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-            edge_factor=1.5, ansatz="gn_ppm")
-        mpa = resolve_sigma_regularization(
-            requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-            edge_factor=1.5, ansatz="mpa")
-        assert ppm.raised and not mpa.raised
-        assert ppm.resolved_ev == pytest.approx(expect_ev, abs=1e-3)
-        assert mpa.resolved_ev == pytest.approx(0.25, rel=1e-12)
-        # The DRIFT this row exists for, quoted from the resolver itself.
-        assert ppm.resolved_ry / mpa.resolved_ry == pytest.approx(
-            expect_ev / 0.25, rel=1e-3)
-        # ...and it is the same closed form the driver used before.
-        assert ppm.floor_ry == pytest.approx(
-            crossing_regularization_floor(
-                float(np.max(np.abs(grid))), 1.5), rel=1e-12)
-    # hl_ppm takes the same floor as gn_ppm: it is the same quadrature.
-    hl = resolve_sigma_regularization(
-        requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=_omega_grid_ry(5.0),
-        edge_factor=1.5, ansatz="hl_ppm")
-    assert hl.raised
-
-
-def test_an_explicit_floor_equalises_xi_across_ansatze():
-    """The knob the register asked for: one number, both ansaetze."""
+def test_xi_is_literal_for_every_ansatz():
+    """Owner ruling 2026-09-02: the deck's eta IS the broadening.  The HGL
+    conditioning floor (1.90x on +-5 eV, 5.7x on +-15 eV) went with the HGL
+    executor it belonged to; nothing raises xi for any ansatz."""
     from gw.ppm_windows import resolve_sigma_regularization
 
-    grid = _omega_grid_ry(15.0)
-    kw = dict(requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-              edge_factor=1.5, floor_ev=0.8)
-    a = resolve_sigma_regularization(ansatz="gn_ppm", **kw)
-    b = resolve_sigma_regularization(ansatz="mpa", **kw)
-    assert a.resolved_ry == b.resolved_ry
-    assert a.resolved_ev == pytest.approx(0.8, rel=1e-12)
-    assert a.floor_policy == b.floor_policy == "explicit"
-    # An explicit 0 means "do not raise" -- spellable on purpose, and it
-    # says so in the stamp rather than being indistinguishable from auto.
-    z = resolve_sigma_regularization(ansatz="gn_ppm", **{**kw, "floor_ev": 0})
-    assert not z.raised and z.floor_policy == "explicit"
-
-
-def test_a_requested_xi_above_the_floor_is_never_lowered():
-    from gw.ppm_windows import resolve_sigma_regularization
-
-    r = resolve_sigma_regularization(
-        requested_ry=3.0 / RYD_TO_EV, omega_grid_ry=_omega_grid_ry(5.0),
-        edge_factor=1.5, ansatz="gn_ppm")
-    assert r.resolved_ev == pytest.approx(3.0, rel=1e-12) and not r.raised
+    for ansatz in ("gn_ppm", "hl_ppm", "mpa"):
+        r = resolve_sigma_regularization(
+            requested_ry=0.25 / RYD_TO_EV, ansatz=ansatz)
+        assert not r.raised and r.floor_ry == 0.0
+        assert r.floor_policy == "literal"
+        assert r.resolved_ev == pytest.approx(0.25, rel=1e-12)
+    with pytest.raises(ValueError):
+        resolve_sigma_regularization(requested_ry=0.0, ansatz="mpa")
 
 
 def test_the_log_line_is_the_same_sentence_for_both_ansatze():
@@ -168,21 +127,12 @@ def test_the_log_line_is_the_same_sentence_for_both_ansatze():
     from gw.ppm_windows import resolve_sigma_regularization
 
     grid = _omega_grid_ry(5.0)
+    del grid
     lines = [resolve_sigma_regularization(
-        requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=grid,
-        edge_factor=1.5, ansatz=a).describe() for a in ("gn_ppm", "mpa")]
+        requested_ry=0.25 / RYD_TO_EV, ansatz=a).describe() for a in ("gn_ppm", "mpa")]
     for line in lines:
         assert "Σ broadening ξ:" in line and "requested" in line
-    assert "RAISED" in lines[0] and "RAISED" not in lines[1]
-
-
-def test_a_bad_floor_refuses_rather_than_resolving_to_auto():
-    from gw.ppm_windows import resolve_sigma_regularization
-
-    with pytest.raises(ValueError):
-        resolve_sigma_regularization(
-            requested_ry=0.25 / RYD_TO_EV, omega_grid_ry=_omega_grid_ry(5.0),
-            edge_factor=1.5, ansatz="gn_ppm", floor_ev=-1.0)
+    assert lines[0].replace("gn_ppm", "mpa") == lines[1]
 
 
 # ---------------------------------------------------------------------------

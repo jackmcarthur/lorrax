@@ -43,9 +43,10 @@ from .gw_config import (
 	env_bool,
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
-	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_bispinor_gw,
+	refuse_screened_photon_restart_storage,
 	resolve_xla_gpu_memory_env,
+	packed_photon_screens_current,
 	uses_coupled_photon_head,
 )
 
@@ -2633,10 +2634,16 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	return hc
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
+def compute_V_q(
+	zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print,
+	bgw_v_grid_fn=None, sym=None, centroid_indices=None,
+	charge_basis_receipt=None, transverse_basis_receipt=None,
+	coulomb_policy_stamp=None,
+):
 	"""Compute bare Coulomb V_qmunu and its in-memory G=0 view.
 
-	Returns (V_qmunu, G0, head_channel, photon_g0_vectors), where V_qmunu
+	Returns (V_qmunu, G0, head_channel, photon_g0_vectors,
+	bispinor_vq_restart_binding), where V_qmunu
 	has shape (nq, μ, μ)
 	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
 	``gw.head_channel.HeadChannel`` when the deck sets
@@ -2651,6 +2658,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	"""
 	from .compute_vcoul import compute_all_V_q
 	photon_g0_vectors = None
+	bispinor_vq_restart_binding = None
 
 	if jax.process_index() == 0:
 		os.sync()
@@ -2819,7 +2827,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
 			                ) as zt3:
 				with mesh_xy:
-					_, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
+					from file_io.bispinor_vq_restart import (
+						BispinorVqRestartBinding)
+					from .v_q_bispinor import V_QMUNU_FORMAT
+					bispinor_vq_restart_binding = (
+						BispinorVqRestartBinding.from_sources(
+							v_qmunu_format=V_QMUNU_FORMAT,
+							zeta_fit_provenance=(
+								zc.fit_provenance, zt1.fit_provenance,
+								zt2.fit_provenance, zt3.fit_provenance),
+							charge_basis_receipt=charge_basis_receipt,
+							transverse_basis_receipt=(
+								transverse_basis_receipt),
+							coulomb_policy=coulomb_policy_stamp))
+					_, photon_g0_vectors = (
+						compute_V_q_bispinor_g_flat_to_h5(
 						zeta_C_loader=zc,
 						zeta_T_loaders=(zt1, zt2, zt3),
 						output_h5_path=bispinor_h5_path,
@@ -2828,6 +2850,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						cell_volume=meta.cell_volume,
 						sys_dim=meta.sys_dim,
 						n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+						restart_binding=bispinor_vq_restart_binding,
 						bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
 						bdot=(np.asarray(wfn.bdot, dtype=np.float64)
 						       if meta.sys_dim == 0 else None),
@@ -2838,21 +2861,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						centroid_C_idx=_cent_C_idx_for_orchestrator,
 						centroid_T_idx=_cent_T_idx_for_orchestrator,
 						use_ibz=_use_ibz_bispinor,
-						tt_head_correction=bool(
-							cfg.head.bispinor_tt_head_correction),
 						# No explicit-carrier stamp: both shipped
 						# bispinor_gw values ride the one raw
 						# kinetic-balance carrier.
 						bispinor_gw_mode=None,
 						charge_representation=None,
 						spatial_current_representation=None,
-					)
+					))
 
 		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
-		# view returned by the same projection that built V; it is deliberately
-		# absent from v_q_bispinor.h5 because zeta_q_G is the sole persisted
-		# source of truth.  The four small views stay resident only for a packed
-		# coupled head; headless modes release the transverse three immediately.
+		# view returned by the same projection that built V.  The numerical
+		# V-tile file does not duplicate those views; when restart output is
+		# enabled the canonical restart writer persists the four small μ-class
+		# views under the same cross-file source binding.  They stay resident
+		# only for a packed coupled head; headless modes release the transverse
+		# three immediately.
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
 		# via BispinorVqReader once those paths land.
 		with BispinorVqReader(bispinor_h5_path, mesh_xy,
@@ -3034,7 +3057,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-	return V_qmunu, G0, head_channel, photon_g0_vectors
+	return (V_qmunu, G0, head_channel, photon_g0_vectors,
+	        bispinor_vq_restart_binding)
 
 
 def build_wavefunction_bundle(
@@ -3142,9 +3166,20 @@ def prepare_isdf_and_wavefunctions(
 	                                take_pre_unfold)
 
 	refuse_unsupported_bispinor_gw(cfg)
-	# Same shape, same two-call-site reason: parser-altitude coverage is
-	# duplicated here for a hand-built cfg.  No-op at the default (false).
-	refuse_unsupported_bispinor_tt_head_correction(cfg)
+	if (bool(cfg.restart) and bool(cfg.bispinor)
+			and packed_photon_screens_current(cfg)):
+		if not getattr(cfg.paths, 'centroids_file_current', None):
+			raise ValueError(
+				"bispinor screened restart requires centroids_file_current")
+		from file_io.centroids import load_centroids as _load_centroids_for_gate
+		from runtime.padding import padded_mu_extent
+		_, _, _n_current_for_gate = _load_centroids_for_gate(
+			cfg.paths.centroids_file_current, meta.fft_grid)
+		refuse_screened_photon_restart_storage(
+			cfg, nq=int(meta.nk_tot),
+			n_charge_padded=int(meta.n_rmu_padded),
+			n_current_padded=padded_mu_extent(
+				int(_n_current_for_gate), int(jax.device_count())))
 	from file_io.wfn_basis import WavefunctionBasisReceipt
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
@@ -3494,11 +3529,19 @@ def prepare_isdf_and_wavefunctions(
 			# (the one driver debug stream).  Round-1 addition.
 			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
-			V_qmunu, G0, head_channel, photon_g0_vectors = compute_V_q(
+			from file_io import (
+				coulomb_policy_from_config, format_coulomb_policy)
+			_coulomb_policy = coulomb_policy_from_config(cfg, meta)
+			(V_qmunu, G0, head_channel, photon_g0_vectors,
+			 bispinor_vq_restart_binding) = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
-				sym=sym, centroid_indices=centroid_indices)
+				sym=sym, centroid_indices=centroid_indices,
+				charge_basis_receipt=charge_basis_receipt,
+				transverse_basis_receipt=transverse_basis_receipt,
+				coulomb_policy_stamp=(
+					format_coulomb_policy(_coulomb_policy)))
 			# P5 — post-V_q.  V_q's transient peak just happened inside
 			# compute_V_q; this probe captures what survives (V_qmunu,
 			# G0) plus anything held over from ζ-fit.  Combined with P4
@@ -3546,7 +3589,6 @@ def prepare_isdf_and_wavefunctions(
 				cfg, sym=sym, centroid_indices=centroid_indices,
 				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
-				from file_io import coulomb_policy_from_config
 				from file_io.qp_wfn import (
 					qp_state_source_provenance_from_binding)
 				write_restart_state_to_h5(
@@ -3557,7 +3599,13 @@ def prepare_isdf_and_wavefunctions(
 					# restart and compute_V_q never re-runs, so without this
 					# an averaging-policy change is inherited in silence with
 					# every other guard passing.
-					coulomb_policy=coulomb_policy_from_config(cfg, meta),
+					coulomb_policy=_coulomb_policy,
+					bispinor_vq_restart_binding=(
+						bispinor_vq_restart_binding),
+					photon_g0_vectors=photon_g0_vectors,
+					n_rmu_transverse_logical=(
+						int(transverse_wfn_data['meta'].n_rmu)
+						if transverse_wfn_data is not None else None),
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
@@ -3710,6 +3758,16 @@ def prepare_isdf_and_wavefunctions(
 		# branch.  The entry resolver above is a centralized compatibility
 		# hook whose current deck-key refusal table is empty.
 		from file_io import load_restart_state_from_h5
+		_bispinor_restart_binding = None
+		_bispinor_pre_schema_recovered = False
+		_bispinor_zeta_paths = (
+			os.path.join(tmp_dir, "zeta_q.h5"),
+			os.path.join(tmp_dir, "zeta_q_mu1.h5"),
+			os.path.join(tmp_dir, "zeta_q_mu2.h5"),
+			os.path.join(tmp_dir, "zeta_q_mu3.h5"),
+		)
+		_cent_T_idx_now = None
+		_n_rmu_curr_now = None
 		from file_io.qp_wfn import (
 			authenticate_restart_qp_state_source_for_wfn)
 		_restart_source_record, basis_wfn_fingerprint_binding = (
@@ -3723,6 +3781,75 @@ def prepare_isdf_and_wavefunctions(
 		# receipt: there is no fact tying the stored psi/E bytes to this WFN.
 		_restart_wfn_provenance_complete = (
 			_restart_source_record is not None)
+		if _restart_wfn_provenance_complete:
+			charge_basis_receipt = WavefunctionBasisReceipt.from_bound_source(
+				wfn=wfn,
+				wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+				role='charge',
+				bispinor=bool(int(meta.nspinor) == 4),
+				bispinor_lift=(representation.charge_lift or "raw"),
+				band_interval=_basis_band_interval,
+				fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
+				n_rmu_logical=int(meta.n_rmu),
+				n_rmu_padded=int(meta.n_rmu_padded))
+		if cfg.bispinor:
+			if not _restart_wfn_provenance_complete:
+				raise ValueError(
+					"GATE bispinor_pre_schema_restart_provenance_missing: "
+					"bispinor restart recovery requires the canonical "
+					"qp_state_source_provenance record before distributed "
+					"payload I/O.")
+			if not getattr(cfg.paths, 'centroids_file_current', None):
+				raise ValueError(
+					"bispinor restart requires centroids_file_current in the "
+					"input file (same requirement as the fresh path).")
+			from file_io.centroids import load_centroids as _load_cent_restart
+			from runtime.padding import padded_mu_extent
+			_, _cent_T_idx_now, _n_rmu_curr_now = _load_cent_restart(
+				cfg.paths.centroids_file_current, meta.fft_grid)
+			transverse_basis_receipt = (
+				WavefunctionBasisReceipt.from_bound_source(
+					wfn=wfn,
+					wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+					role='transverse', bispinor=True,
+					bispinor_lift=(representation.current_lift or "raw"),
+					band_interval=_basis_band_interval,
+					fft_grid=meta.fft_grid,
+					centroid_fft_idx=_cent_T_idx_now,
+					n_rmu_logical=int(_n_rmu_curr_now),
+					n_rmu_padded=padded_mu_extent(
+						int(_n_rmu_curr_now), int(jax.device_count()))))
+			from file_io import (
+				coulomb_policy_from_config, format_coulomb_policy,
+				read_photon_g0_vectors_from_h5)
+			from file_io.bispinor_vq_restart import (
+				authenticate_or_recover_bispinor_vq_restart_binding)
+			from .v_q_bispinor import V_QMUNU_FORMAT
+			_bispinor_restart_binding, _bispinor_pre_schema_recovered = (
+				authenticate_or_recover_bispinor_vq_restart_binding(
+					restart_path=tensors_filename,
+					v_q_path=os.path.join(tmp_dir, "v_q_bispinor.h5"),
+					zeta_paths=_bispinor_zeta_paths,
+					charge_basis_receipt=charge_basis_receipt,
+					transverse_basis_receipt=transverse_basis_receipt,
+					coulomb_policy=format_coulomb_policy(
+						coulomb_policy_from_config(cfg, meta)),
+					expected_kgrid=meta.kgrid,
+					expected_v_qmunu_format=V_QMUNU_FORMAT))
+			if uses_coupled_photon_head(cfg):
+				photon_g0_vectors = read_photon_g0_vectors_from_h5(
+					tensors_filename, mesh_xy,
+					n_rmu_charge_logical=int(meta.n_rmu),
+					n_rmu_transverse_logical=int(_n_rmu_curr_now),
+					pre_schema_zeta_paths=(
+						_bispinor_zeta_paths
+						if _bispinor_pre_schema_recovered else None))
+			if _bispinor_pre_schema_recovered:
+				print0(
+					"  [config provenance] bispinor packed restart vectors/"
+					"binding = recovered from pre-schema tensors; four "
+					"literal-Gamma views came from authenticated zeta G=0 "
+					"slices (no zeta refit or full-sphere read).")
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
@@ -3779,6 +3906,7 @@ def prepare_isdf_and_wavefunctions(
 				       f"({type(exc).__name__}: {exc}).")
 			_have_c = _stamped.get('centroids_charge_md5')
 			if _have_c is None:
+				charge_basis_receipt = None
 				print0(
 					f"  *** LORRAX SANITY: {tensors_filename} carries no "
 					f"'centroids_charge_md5' attr — it predates the "
@@ -3808,19 +3936,6 @@ def prepare_isdf_and_wavefunctions(
 					f"WavefunctionBasisReceipt because its stored psi/E source "
 					f"cannot be authenticated; finite-transfer current "
 					f"construction will refuse. ***")
-			else:
-				charge_basis_receipt = (
-					WavefunctionBasisReceipt.from_bound_source(
-					wfn=wfn,
-					wfn_fingerprint_binding=(
-						basis_wfn_fingerprint_binding),
-					role='charge',
-					bispinor=bool(int(meta.nspinor) == 4),
-					band_interval=_basis_band_interval,
-					fft_grid=meta.fft_grid,
-					centroid_fft_idx=centroid_indices,
-					n_rmu_logical=int(meta.n_rmu),
-					n_rmu_padded=int(meta.n_rmu_padded)))
 			if cfg.memory.low_mem_bands:
 				# Both faces were already read at their OWN specs
 				# (P(None,'x',None,'y') / P(None,None,'x','y')) directly
@@ -3895,9 +4010,10 @@ def prepare_isdf_and_wavefunctions(
 						"bispinor restart requires centroids_file_current "
 						"in the input file (same requirement as the "
 						"non-restart bispinor path).")
-				from file_io.centroids import load_centroids as _load_cent
-				_, _cent_T_idx_now, _n_rmu_curr_now = _load_cent(
-					cfg.paths.centroids_file_current, meta.fft_grid)
+				if _cent_T_idx_now is None or _n_rmu_curr_now is None:
+					from file_io.centroids import load_centroids as _load_cent
+					_, _cent_T_idx_now, _n_rmu_curr_now = _load_cent(
+						cfg.paths.centroids_file_current, meta.fft_grid)
 				if int(_n_rmu_curr_now) != int(rs.n_rmu_transverse_disk):
 					raise ValueError(
 						f"bispinor restart: {tensors_filename} stores the "
@@ -3911,7 +4027,6 @@ def prepare_isdf_and_wavefunctions(
 				# Content check — same count does NOT mean same points
 				# (audit fix/zq 2026-07-28; ``_stamped`` read above).
 				_have_t = _stamped.get('centroids_transverse_md5')
-				transverse_basis_receipt = None
 				_n_rmu_T_padded = (
 					int(rs.psi_nmu_transverse.shape[-1])
 					if cfg.memory.low_mem_bands else
@@ -3922,6 +4037,7 @@ def prepare_isdf_and_wavefunctions(
 				meta_restart_transverse.sys_dim = meta.sys_dim
 				meta_restart_transverse.bispinor = True
 				if _have_t is None:
+					transverse_basis_receipt = None
 					print0(
 						f"  *** LORRAX SANITY: {tensors_filename} carries "
 						f"no 'centroids_transverse_md5' attr — it "
@@ -3953,18 +4069,6 @@ def prepare_isdf_and_wavefunctions(
 						f"qp_state_source_provenance record.  The transverse "
 						f"bundle carries NO WavefunctionBasisReceipt; "
 						f"finite-transfer current construction will refuse. ***")
-				else:
-					transverse_basis_receipt = (
-						WavefunctionBasisReceipt.from_bound_source(
-							wfn=wfn,
-							wfn_fingerprint_binding=(
-								basis_wfn_fingerprint_binding),
-							role='transverse', bispinor=True,
-							band_interval=_basis_band_interval,
-							fft_grid=meta.fft_grid,
-							centroid_fft_idx=_cent_T_idx_now,
-							n_rmu_logical=int(_n_rmu_curr_now),
-							n_rmu_padded=_n_rmu_T_padded))
 				if cfg.memory.low_mem_bands:
 					from .wavefunction_bundle import (
 						wavefunctions_face_from_restart)
@@ -3992,6 +4096,11 @@ def prepare_isdf_and_wavefunctions(
 				       f"{'face' if cfg.memory.low_mem_bands else 'legacy'}, "
 				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
+				if (uses_coupled_photon_head(cfg)
+						and not _bispinor_pre_schema_recovered):
+					print0(
+						"  [bispinor restart] loaded four authenticated "
+						"literal-Gamma vectors; no zeta refit or zeta-sphere read.")
 
 
 	from .wavefunction_bundle import AuthenticatedWavefunctions

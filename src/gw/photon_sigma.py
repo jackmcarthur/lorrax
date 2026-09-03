@@ -20,7 +20,7 @@ the existing owners:
   exchange/correlation operator back to band space.
 
 When the response carries a Gamma-cell completion
-(:class:`gw.head_correction.StaticSlabPhotonHeadCompletion`, always under
+(:class:`gw.head_correction.StaticPhotonHeadCompletion`, always under
 ``head_correction = full``), the same loop re-contracts the completion's
 bounded rank-4 factors alone (``q0_only`` convolution,
 :func:`gw.photon_layout.photon_q0_low_rank_block`) and reports the exact
@@ -30,15 +30,14 @@ by ``GATE photon_head_sigma_sector_closure`` (the three sectors must sum to
 the direct sixteen-block head total).  These diagnostics are what
 ``gw.gw_output.write_freq_debug`` prints as the ``*_CC/_CTTC/_TT`` columns.
 
-This is ALSO the Sigma owner of the dynamic packed route (phase 3,
-``compute_mode`` in the plasmon-pole pair with ``bispinor = true``).  There
-the charge block's frequency dependence is carried by the ordinary scalar
-Sigma_c machinery (:mod:`gw.ppm_pipeline` on the same ISDF ``W_00``) and the
-current blocks are frozen at ``omega = 0``, so this function is called with
-``blocks = "current"`` and contracts the twelve non-CC blocks only.  The
-``(0,0)`` block is then skipped in the loop below and nowhere else: there is
-one consumer, one head-sector closure gate and one set of kernels for both
-routes.  See ``docs/theory/four-current-head-corrections.md`` and
+This is ALSO the Sigma owner of the dynamic packed route (GN/HL/MPA with
+``bispinor = true``).  The scalar mode-specific machinery owns charge at
+every frequency.  The packed response therefore names its CC block absent
+and has no W carrier; with ``blocks = "current"`` this consumer contracts the
+twelve non-CC blocks using the declared identity ``W_CURRENT = V_CURRENT``.
+The ``(0,0)`` block is skipped here and nowhere else: there is one consumer,
+one head-sector closure gate and one set of kernels for both routes.  See
+``docs/theory/four-current-head-corrections.md`` and
 ``gw.sigma_dispatch.compute_sigma_xc``.
 
 The accumulator stays 2-D sharded until the ordinary static-Sigma result
@@ -56,6 +55,11 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from .head_correction import (
+    STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+    STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
+    STATIC_PHOTON_CHARGE_BLOCK_STATES,
+)
 
 
 _CHANNELS = range(4)
@@ -372,7 +376,7 @@ def compute_ppm_faraday_head_sigma_omega(
     r"""Contract an ordered one-pole CT/TC Gamma head on the Sigma grid.
 
     The interaction remains two rank-four factor families until one CT or TC
-    Lorentz block is streamed into the incumbent q=0 convolution.  Pole
+    Lorentz block is streamed into the shared q=0 convolution.  Pole
     denominators weight the intermediate bands inside a ``lax.map``; there is
     no pairwise stage, frequency quadrature, or probe-frequency packed body.
     """
@@ -471,6 +475,7 @@ def compute_static_photon_sigma(
     meta,
     mesh_xy: Mesh,
     blocks: str = PHOTON_BLOCKS_ALL,
+    charge_block_state: str = STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
     head_completion=None,
     diagnostic_basis_rotation=None,
     diagnostic_input_basis=None,
@@ -493,10 +498,9 @@ def compute_static_photon_sigma(
 
     * ``"all"`` (the default, ``compute_mode = cohsex``) -- all sixteen.
     * ``"current"`` (the dynamic packed route) -- the twelve blocks with at
-      least one current index.  The ``(0,0)`` block is skipped because the
-      dynamic route's charge channel is owned end to end by the scalar
-      ``Sigma_x + Sigma_c(omega)`` machinery on the same ``W_00``; summing it
-      here as well would double count it, statically.
+      least one current index.  Its packed CC block and W carrier are absent;
+      the scalar ``Sigma_x + Sigma_c(omega)`` machinery owns charge and the
+      current blocks obey ``W_CURRENT = V_CURRENT``.
 
     The head-sector closure gate is unaffected by the selection: the skipped
     blocks are absent from the direct total and from the per-sector sums
@@ -507,6 +511,22 @@ def compute_static_photon_sigma(
         raise ValueError(
             f"photon Sigma block selection must be one of "
             f"{_PHOTON_BLOCK_SELECTIONS}; got {blocks!r}")
+    if charge_block_state not in STATIC_PHOTON_CHARGE_BLOCK_STATES:
+        raise ValueError(
+            "photon Sigma charge-block state must be one of "
+            f"{STATIC_PHOTON_CHARGE_BLOCK_STATES}; got "
+            f"{charge_block_state!r}")
+    charge_absent = (
+        charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_ABSENT)
+    if charge_absent and blocks != PHOTON_BLOCKS_CURRENT:
+        raise ValueError(
+            "an absent packed charge block is valid only with "
+            "blocks='current'; the all-block COHSEX consumer needs CC")
+    if charge_absent != (W_packed is None):
+        raise ValueError(
+            "photon Sigma W carrier disagrees with charge-block state: "
+            f"charge_block_state={charge_block_state!r}, "
+            f"W_packed={'absent' if W_packed is None else 'present'}")
     if wfns_charge.layout != wfns_transverse.layout:
         raise ValueError(
             "photon Sigma requires charge and transverse wavefunction "
@@ -517,8 +537,9 @@ def compute_static_photon_sigma(
             "photon Sigma requires the charge and transverse bundles to use "
             "the same band windows; their BandSlices records differ.")
 
-    for name, packed in (("V_packed", V_packed), ("W_packed", W_packed)):
-        _require_packed_operator(name, packed, mesh_xy)
+    _require_packed_operator("V_packed", V_packed, mesh_xy)
+    if W_packed is not None:
+        _require_packed_operator("W_packed", W_packed, mesh_xy)
 
     from .photon_layout import photon_block_view, photon_q0_low_rank_block
 
@@ -529,6 +550,12 @@ def compute_static_photon_sigma(
         raise ValueError(
             "packed photon head completion lacks its bounded q0 factor "
             "carrier; refusing a decomposition inferred from the packed body")
+    if (q0_factors is not None
+            and q0_factors.charge_block_state != charge_block_state):
+        raise ValueError(
+            "photon Sigma head factors disagree with the response's "
+            f"charge-block state: {q0_factors.charge_block_state!r} != "
+            f"{charge_block_state!r}")
     if q0_factors is not None:
         if diagnostic_input_basis not in ("dft", "qp"):
             raise ValueError(
@@ -568,7 +595,9 @@ def compute_static_photon_sigma(
                 mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
                 with_q0_diagnostic=q0_factors is not None)
             V_AB = photon_block_view(V_packed, photon_layout, A, B, mesh_xy)
-            W_AB = photon_block_view(W_packed, photon_layout, A, B, mesh_xy)
+            W_AB = (
+                V_AB if charge_absent else
+                photon_block_view(W_packed, photon_layout, A, B, mesh_xy))
             expected = (int(meta.nk_tot), n_left, n_right)
             if tuple(V_AB.shape) != expected or tuple(W_AB.shape) != expected:
                 raise ValueError(

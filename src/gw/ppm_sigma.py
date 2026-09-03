@@ -1059,11 +1059,7 @@ def compute_sigma_c_ppm_omega_grid(
         float(sigma_cfg.regularization_ev) / RYD_TO_EV)
     ansatz_name = str(getattr(ansatz, "value", ansatz)).strip().lower()
     resolved_xi = resolve_sigma_regularization(
-        requested_ry=regularization_width_ry,
-        omega_grid_ry=omega_req,
-        edge_factor=float(sigma_cfg.window_edge_factor),
-        ansatz=ansatz_name,
-        floor_ev=sigma_cfg.regularization_floor_ev)
+        requested_ry=regularization_width_ry, ansatz=ansatz_name)
     print_fn(resolved_xi.describe())
     regularization_width_ry = resolved_xi.resolved_ry
 
@@ -1142,7 +1138,6 @@ def compute_sigma_c_ppm_omega_grid(
         quadrature_eps=float(sigma_cfg.quadrature_eps),
         quadrature_reduction_seconds=float(
             sigma_cfg.quadrature_reduction_seconds),
-        pair_ceiling=int(mpa_cfg.sigma_max_nodes),
         quadrature_cache_dir=quadrature_cache_dir,
         omega_grid_step_ry=float(sigma_cfg.omega_step_ev) / RYD_TO_EV,
         pole_batch_size=int(mpa_cfg.pole_batch_size),

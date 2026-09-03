@@ -53,7 +53,7 @@ def _plan(monkeypatch, branch=None, **kwargs):
              else branch.omega_abs)
     return plan_sigma_windows(
         _summaries(), [branch], omega, 0.1,
-        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+        eps=1.0e-4, reduction_seconds=120.0,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None,
         **kwargs)
 
@@ -137,7 +137,7 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
 
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+        eps=1.0e-4, reduction_seconds=120.0,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
     first, first_geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
@@ -170,7 +170,7 @@ def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
         "gw.sigma_box_plan.build_uniform_rule", large_relative_kappa)
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+        eps=1.0e-4, reduction_seconds=120.0,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
     assert len(plan) == 3
     assert geometry["branches"][0]["windows"][0]["kappa_max"] == 1.0e6
@@ -196,17 +196,18 @@ def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
     with pytest.raises(RuntimeError, match="runtime-noise"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=20,
+            eps=1.0e-4, reduction_seconds=120.0,
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 
 
-def test_total_pair_ceiling_refuses(monkeypatch):
+def test_no_pair_ceiling(monkeypatch):
+    # Owner ruling 2026-09-02: the plan reports its pair count, never refuses on it.
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    with pytest.raises(RuntimeError, match="pair ceiling=5"):
-        plan_sigma_windows(
-            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0, pair_ceiling=5,
-            cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+    plan, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        eps=1.0e-4, reduction_seconds=120.0,
+        cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+    assert "pair_ceiling" not in geometry and geometry["window_tau_pairs"] > 5
 
 
 def _range_row(poles):

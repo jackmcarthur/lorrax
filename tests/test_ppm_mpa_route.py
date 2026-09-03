@@ -45,13 +45,12 @@ def test_ppm_fit_is_persisted_then_consumed_by_the_mpa_route(monkeypatch):
     ppm_cfg = SimpleNamespace(invalid_mode="zero")
     sigma_cfg = SimpleNamespace(
         regularization_ev=0.25,
-        regularization_floor_ev=0.0,
         window_edge_factor=1.5,
         fermi_reference="midgap",
         quadrature_eps=3.0e-5,
         quadrature_reduction_seconds=42.0,
         omega_step_ev=0.5)
-    mpa_cfg = SimpleNamespace(sigma_max_nodes=91, pole_batch_size=4)
+    mpa_cfg = SimpleNamespace(pole_batch_size=4)
     plan = trivial_plan(2, 1, 2)
     omega_grid = np.asarray([-0.1, 0.2])
     captured = {}
@@ -105,7 +104,6 @@ def test_ppm_fit_is_persisted_then_consumed_by_the_mpa_route(monkeypatch):
     assert mpa_kw["quadrature_eps"] == 3.0e-5
     assert mpa_kw["quadrature_reduction_seconds"] == 42.0
     assert mpa_kw["quadrature_cache_dir"] == "/tmp/rule-cache"
-    assert mpa_kw["pair_ceiling"] == 91
     assert mpa_kw["pole_batch_size"] == 4
     assert mpa_kw["band_brackets"] == plan.bounds
     assert mpa_kw["band_counts"] == plan.counts

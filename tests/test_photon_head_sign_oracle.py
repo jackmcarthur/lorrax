@@ -50,6 +50,13 @@ SCOPE, stated up front (TASTE.md: state what a check could NOT have seen).
   the SAME provider-issued cubature.  It consumes the response record, so
   it is blind to a joint wing flip and to a sign error inside the shared
   ``vcoul`` D; negative controls N2/N3 measure that sensitivity explicitly.
+* Part C tests the ABSOLUTE CENTROID MEASURE in an exact ISDF model:
+  centroids are every real-space point and ``zeta_mu(r)=delta_mu,r``.  The
+  physical body operator is ``Omega*W_code``, while the directly evaluated
+  Adler--Wiser wings are ``chi_hb=Y/Omega`` and ``chi_bh=Z/Omega``.  It
+  forms the wing attachment and all four reattachment families through
+  those two independent representations.  Omitting the final physical-to-
+  stored ``1/Omega`` is an explicit factor-``Omega`` negative control.
 * Meshes are 1x1 (and 2x2 when four devices are visible).  Sharding,
   collectives and the padded-channel mask are NOT the subject here; a 2x2
   arm exercises the mask only incidentally.
@@ -75,13 +82,15 @@ import common.parallel_transport as parallel_transport  # noqa: E402
 import gw.qsgw_head as qsgw_head  # noqa: E402
 from gw.head_correction import (  # noqa: E402
     _adjoint_factor_family,
+    STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+    STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
     _dynamic_photon_head_moments,
     _dynamic_photon_head_small_system,
     _faraday_cttc_factor_pairs,
     _fit_ordered_faraday_factor_samples,
     canonicalize_static_gauge_q2_tensor,
-    complete_static_slab_photon_q0,
-    fit_dynamic_slab_photon_cttc_q0,
+    complete_static_photon_q0,
+    fit_dynamic_photon_cttc_q0,
     fold_small_head_wings_sharded,
     small_head_wing_halves_sharded,
     static_hall_linear_response,
@@ -225,11 +234,13 @@ def part_a_residuals(mesh):
         D_jet[:2], gamma_dir, m.energies, m.occupations,
         cell_volume=m.cell_volume, nk_tot=m.nk, nspin=m.nspin,
         nspinor=m.nspinor)                                 # (2,3), a x i
-    CT_code = np.asarray(static_hall_linear_response(sigma_H))[:, 0, 1:]
+    CT_code = np.asarray(static_hall_linear_response(
+        sigma_H, dimension=2))[:, 0, 1:]
     out["hall_CT_imag"] = (_rel(CT_code.imag, chi_0i.imag), chi_0i.imag)
     out["hall_CT_imag_flipped"] = (_rel(CT_code.imag, -chi_0i.imag), None)
     out["hall_TC_is_CT_dagger"] = (
-        _rel(np.asarray(static_hall_linear_response(sigma_H))[:, 1:, 0],
+        _rel(np.asarray(static_hall_linear_response(
+            sigma_H, dimension=2))[:, 1:, 0],
              np.conj(CT_code)), None)
 
     basis = np.eye(3)
@@ -320,7 +331,25 @@ def _receipt():
         vcoul.get_kernel(2), _geometry(), _KGRID)
 
 
-def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
+def _bulk_receipt(*, hexagonal):
+    """Production bulk receipt for cubic or elongated hexagonal mini-cell."""
+    import vcoul
+    if hexagonal:
+        bvec = np.asarray((
+            (1.0, 0.0, 0.0),
+            (0.5, np.sqrt(3.0) / 2.0, 0.0),
+            (0.0, 0.0, 1.0 / 3.0),
+        ))
+    else:
+        bvec = np.eye(3)
+    cell_volume = float((2.0 * np.pi) ** 3 / abs(np.linalg.det(bvec)))
+    geometry = vcoul.CoulombGeometry(
+        bvec=bvec, cell_volume=cell_volume)
+    return vcoul.minibz_photon_cubature(
+        vcoul.get_kernel(3), geometry, (3, 3, 3))
+
+
+def _fixture(mesh, *, sigma_H, dimension=2, wings=True, seed=20260901):
     """Sealed response + packed body + Gamma vectors, everything nonzero."""
     rng = np.random.default_rng(seed)
     layout = PhotonBasisLayout.from_centroid_extents(4, 3, mesh)
@@ -332,16 +361,18 @@ def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
     # the Hall strength is 8*pi*zc*sigma_H.  Both are kept O(0.1) so the
     # provider's fixed 16/24/32 polygon ladder converges inside its own
     # GATE static_photon_polygon_not_converged budget.
-    charge_S = np.array([[-1.2e-2, 3.0e-3], [3.0e-3, -8.0e-3]])
+    charge_S = np.diag(
+        np.asarray((-1.2e-2, -8.0e-3, -5.0e-3)[:dimension]))
+    if dimension >= 2:
+        charge_S[0, 1] = charge_S[1, 0] = 3.0e-3
     S_host = np.zeros((1, 3, 3), dtype=np.complex128)
-    S_host[0, :2, :2] = charge_S
-    S_host[0, 2, 2] = -5.0e-3                    # out-of-plane, never read
+    S_host[0, :dimension, :dimension] = charge_S
 
     Y_host = np.zeros((1, 3, charge_extent), dtype=np.complex128)
     if wings:
-        wing = (rng.normal(size=(2, charge_extent))
-                + 1j * rng.normal(size=(2, charge_extent))) * 1.0
-        Y_host[0, :2, :] = wing
+        wing = (rng.normal(size=(dimension, charge_extent))
+                + 1j * rng.normal(size=(dimension, charge_extent))) * 1.0
+        Y_host[0, :dimension, :] = wing
     Z_host = np.conj(np.transpose(Y_host, (0, 2, 1))).copy()
 
     direct = SimpleNamespace(
@@ -375,7 +406,7 @@ def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
             input_dir="/bounded/not-read", mesh=mesh,
             wfn=SimpleNamespace(nspin=1),
             meta=SimpleNamespace(b_id_0=0, b_id_4_chi_user=4),
-            config=SimpleNamespace(),
+            config=SimpleNamespace(sys_dim=dimension),
             layout=layout, hall_transaction=hall)
     finally:
         qsgw_head.build_dft_head_response = saved_direct
@@ -497,12 +528,12 @@ def _levi_civita():
     return eps
 
 
-def hall_response_reference(sigma_H, *, ct_sign=-1.0):
+def hall_response_reference(sigma_H, *, dimension=2, ct_sign=-1.0):
     """``chi_0i^{(a)} = ct_sign * i * eps[b,a,i] sigma_b``; TC = CT^dagger."""
     eps = _levi_civita()
     sigma = np.asarray(sigma_H, dtype=np.float64)
-    H = np.zeros((2, 4, 4), dtype=np.complex128)
-    for a in range(2):
+    H = np.zeros((dimension, 4, 4), dtype=np.complex128)
+    for a in range(dimension):
         for i in range(3):
             value = ct_sign * 1j * float(
                 sum(eps[b, a, i] * sigma[b] for b in range(3)))
@@ -517,8 +548,9 @@ def schur_folded_response(response, W_gamma, cell_volume, *, wing_sign=1.0):
     Y = _gather(response.Y_x)
     Z = _gather(response.Z_y)
     out = np.array(S, dtype=np.complex128)
-    for a in range(2):
-        for b in range(2):
+    dimension = int(response.dimension)
+    for a in range(dimension):
+        for b in range(dimension):
             out[a, b] = S[a, b] + wing_sign * (
                 Y[a] @ W_gamma @ Z[b]) / cell_volume
     return 0.5 * (out + np.swapaxes(out, 0, 1))
@@ -535,13 +567,15 @@ def head_propagator_bruteforce(q, D, R, *, tt_sign=-1.0):
     """
     q = np.asarray(q, dtype=np.float64)
     qn = q / np.linalg.norm(q)
-    zhat = np.array([0.0, 0.0, 1.0])
-    t1 = np.cross(zhat, qn)
+    axes = np.eye(3)
+    reference = axes[int(np.argmin(np.abs(axes @ qn)))]
+    t1 = np.cross(reference, qn)
     t1 = t1 / np.linalg.norm(t1)
+    t2 = np.cross(qn, t1)
     Pi = np.zeros((4, 3), dtype=np.complex128)
     Pi[0, 0] = 1.0
     Pi[1:, 1] = t1
-    Pi[1:, 2] = zhat
+    Pi[1:, 2] = t2
     v = float(np.real(D[0, 0]))
     D_red = np.diag(np.array([v, tt_sign * v, tt_sign * v],
                              dtype=np.complex128))
@@ -552,20 +586,26 @@ def head_propagator_bruteforce(q, D, R, *, tt_sign=-1.0):
 
 def reference_moments(receipt, S_eff, sigma_H, *, ct_sign=-1.0, tt_sign=-1.0):
     """``<b_u W_h b_v>`` and ``<D>`` on the receipt's final rule."""
-    H = hall_response_reference(sigma_H, ct_sign=ct_sign)
+    dimension = int(receipt.dimension)
+    H = hall_response_reference(
+        sigma_H, dimension=dimension, ct_sign=ct_sign)
     chunk = receipt.chunks[-1]
     n = int(chunk.physical_count)
     q = np.asarray(chunk.q_cart[:n], dtype=np.float64)
     D = np.asarray(chunk.D_raw[:n], dtype=np.complex128)
     w = np.asarray(chunk.sample_weight[:n], dtype=np.float64)
     measure = float(np.sum(w))
-    moments = np.zeros((3, 3, 4, 4), dtype=np.complex128)
+    basis_size = 1 + dimension
+    moments = np.zeros(
+        (basis_size, basis_size, 4, 4), dtype=np.complex128)
     D_mean = np.zeros((4, 4), dtype=np.complex128)
     for s in range(n):
-        R = (np.einsum("a,aij->ij", q[s, :2], H)
-             + np.einsum("a,b,abij->ij", q[s, :2], q[s, :2], S_eff))
+        R = (np.einsum("a,aij->ij", q[s, :dimension], H)
+             + np.einsum(
+                 "a,b,abij->ij", q[s, :dimension], q[s, :dimension],
+                 S_eff))
         W_h = head_propagator_bruteforce(q[s], D[s], R, tt_sign=tt_sign)
-        basis = np.array([1.0, q[s, 0], q[s, 1]])
+        basis = np.concatenate(([1.0], q[s, :dimension]))
         moments += w[s] * np.einsum("u,ij,v->uvij", basis, W_h, basis)
         D_mean += w[s] * D[s]
     return moments / measure, D_mean / measure
@@ -578,14 +618,17 @@ def reference_insertion(fixture, moments, D_mean, cell_volume):
     Z = _gather(fixture.response.Z_y)
     g0x = _gather(fixture.g0_X)
     g0y = _gather(fixture.g0_Y)
-    left = [np.conj(g0x), (W0 @ Z[0]).T, (W0 @ Z[1]).T]
-    right = [g0y, Y[0] @ W0, Y[1] @ W0]
+    dimension = int(fixture.response.dimension)
+    left = [np.conj(g0x)] + [
+        (W0 @ Z[direction]).T for direction in range(dimension)]
+    right = [g0y] + [
+        Y[direction] @ W0 for direction in range(dimension)]
     V_ref = fixture.V_host[0] + np.einsum(
         "Ai,AB,Bj->ij", np.conj(g0x), D_mean, g0y,
         optimize=True) / cell_volume
     W_ref = np.array(W0, dtype=np.complex128)
-    for u in range(3):
-        for v in range(3):
+    for u in range(1 + dimension):
+        for v in range(1 + dimension):
             W_ref = W_ref + np.einsum(
                 "Ai,AB,Bj->ij", left[u], moments[u, v], right[v],
                 optimize=True) / cell_volume
@@ -605,22 +648,29 @@ def run_case(mesh, sigma_H, *, wings=True, seed=20260901,
     """Run the production completion and the reference; return residuals."""
     receipt = _receipt() if receipt is None else receipt
     cell_volume = float(receipt.cell_volume)
-    fixture = _fixture(mesh, sigma_H=sigma_H, wings=wings, seed=seed)
+    dimension = int(receipt.dimension)
+    fixture = _fixture(
+        mesh, sigma_H=sigma_H, dimension=dimension, wings=wings, seed=seed)
     V_in, W_in = _packed_pair(fixture, mesh)
-    V_out, W_out, evidence = complete_static_slab_photon_q0(
+    V_out, W_out, evidence = complete_static_photon_q0(
         V_in, W_in, fixture.response, fixture.g0_X, fixture.g0_Y,
-        receipt, mesh_xy=mesh)
+        receipt, mesh_xy=mesh,
+        charge_block_state=STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
 
     S_eff = schur_folded_response(
         fixture.response, fixture.W_host[0], cell_volume, wing_sign=wing_sign)
     moments, D_mean = reference_moments(
         receipt, S_eff, np.asarray(sigma_H, dtype=np.float64),
         ct_sign=ct_sign, tt_sign=tt_sign)
-    V_ref, W_ref = reference_insertion(
-        fixture, moments, D_mean, cell_volume)
-
     got_moments = np.asarray(evidence.screened_moments)
     got_D = np.asarray(evidence.bare_D_mean)
+    # The inverse oracle owns the screened moments.  The bare V insertion
+    # uses the completion's already-certified <D>: re-reducing up to 383328
+    # rows in NumPy gives a different tree from XLA and can add ~1e-13 of
+    # platform-only summation drift to an otherwise exact reattachment check.
+    # ``bare_D`` below remains the independent provider-to-kernel comparison.
+    V_ref, W_ref = reference_insertion(
+        fixture, moments, got_D, cell_volume)
     residual = {
         "bare_D": _rel(got_D, D_mean),
         "bare_D_flipped": _rel(got_D, -D_mean),
@@ -642,8 +692,8 @@ def run_case(mesh, sigma_H, *, wings=True, seed=20260901,
             - moments[:, :, rows, cols]))) / scale
         residual[f"weight_{name}"] = float(np.max(np.abs(
             moments[:, :, rows, cols]))) / scale
-    for u in range(3):
-        for v in range(3):
+    for u in range(1 + dimension):
+        for v in range(1 + dimension):
             residual[f"moment_{u}{v}"] = float(np.max(np.abs(
                 got_moments[u, v] - moments[u, v]))) / scale
     W_done = _gather(W_out)[0]
@@ -718,9 +768,10 @@ def test_completed_gamma_body_is_hermitian():
     # ... and the completion actually moved the body, so the invariant is
     # not being read off an untouched Hermitian input.
     _, W_in = _packed_pair(fixture, _mesh(1))
-    _, W_out, _ = complete_static_slab_photon_q0(
+    _, W_out, _ = complete_static_photon_q0(
         *_packed_pair(fixture, _mesh(1)), fixture.response,
-        fixture.g0_X, fixture.g0_Y, _receipt(), mesh_xy=_mesh(1))
+        fixture.g0_X, fixture.g0_Y, _receipt(), mesh_xy=_mesh(1),
+        charge_block_state=STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
     delta = _gather(W_out)[0] - fixture.W_host[0]
     assert float(np.max(np.abs(delta))) > 1.0e-6
 
@@ -743,6 +794,76 @@ def test_zero_hall_decouples_into_charge_head_plus_bare_transverse():
     D_got = np.asarray(evidence.bare_D_mean)
     assert abs(np.trace(D_got[1:, 1:]) + 2.0 * D_got[0, 0]) <= (
         1.0e-13 * abs(D_got[0, 0]))
+
+
+def test_absent_charge_completion_inserts_only_bare_D():
+    """Dynamic bare routes must not evaluate a hidden charge-head fold."""
+    mesh = _mesh(1)
+    receipt = _receipt()
+    fixture = _fixture(mesh, sigma_H=np.zeros(3))
+    V_in, _ = _packed_pair(fixture, mesh)
+    V_out, W_out, evidence = complete_static_photon_q0(
+        V_in, None, None, fixture.g0_X, fixture.g0_Y, receipt,
+        mesh_xy=mesh,
+        charge_block_state=STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+        layout=fixture.response.layout)
+    _, D_mean = reference_moments(
+        receipt, np.zeros((2, 2, 4, 4), dtype=np.complex128), np.zeros(3))
+    g0x = _gather(fixture.g0_X)
+    g0y = _gather(fixture.g0_Y)
+    V_ref = fixture.V_host[0] + np.einsum(
+        "Ai,AB,Bj->ij", np.conj(g0x), D_mean, g0y,
+        optimize=True) / float(receipt.cell_volume)
+    assert W_out is None
+    assert evidence.screened_moments is None
+    assert evidence.max_backward_residual is None
+    assert evidence.charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_ABSENT
+    assert len(evidence.q0_factors.screened_pairs) == 1
+    assert _rel(np.asarray(evidence.bare_D_mean), D_mean) < _TOL
+    assert _rel(_gather(V_out)[0], V_ref) < _TOL
+
+
+@pytest.mark.parametrize("hexagonal", (False, True))
+def test_bulk_completion_matches_subspace_inverse_and_geometry_oracles(
+        hexagonal):
+    """The one completion owner consumes cubic and elongated-hex bulk rules.
+
+    Hall physics is deliberately not inferred here: ``sigma_H=0`` is the
+    bulk default.  That limit must decouple CT/TC exactly, zero wings must
+    leave ``S_eff=S``, and the independent ``D^-1-R`` inverse on the
+    non-null Coulomb-gauge subspace must reproduce both packed insertions.
+    """
+    receipt = _bulk_receipt(hexagonal=hexagonal)
+    residual, evidence, fixture, _, _, S_eff = run_case(
+        _mesh(1), np.zeros(3), wings=False, receipt=receipt)
+    for key in ("V_packed", "W_packed"):
+        assert residual[key] <= 1.0e-13, (key, residual[key])
+    assert residual["moments_all"] <= 3.0e-13
+    np.testing.assert_array_equal(
+        np.asarray(evidence.screened_moments)[:, :, 0, 1:], 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(evidence.screened_moments)[:, :, 1:, 0], 0.0)
+    np.testing.assert_array_equal(S_eff, _gather(fixture.response.S_direct))
+    assert len(evidence.q0_factors.screened_pairs) == 16
+
+    chunk = receipt.chunks[-1]
+    physical = int(chunk.physical_count)
+    weight = np.asarray(chunk.sample_weight[:physical])
+    D = np.asarray(chunk.D_raw[:physical])
+    trace_identity = np.sum(weight * (
+        np.trace(D[:, 1:, 1:], axis1=1, axis2=2) + 2.0 * D[:, 0, 0]))
+    assert abs(trace_identity) / abs(np.sum(weight * D[:, 0, 0])) <= 1.0e-14
+    D_mean = np.einsum("s,sij->ij", weight, D)
+    if hexagonal:
+        np.testing.assert_allclose(
+            D_mean[1, 1], D_mean[2, 2], rtol=1.0e-12, atol=1.0e-12)
+        assert not np.isclose(
+            D_mean[1, 1], D_mean[3, 3], rtol=1.0e-3, atol=0.0)
+    else:
+        np.testing.assert_allclose(
+            D_mean[1:, 1:],
+            -(2.0 / 3.0) * D_mean[0, 0] * np.eye(3),
+            rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_zero_wings_reduce_the_folded_response_to_S():
@@ -784,9 +905,10 @@ def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
         fixture.response,
         sigma_H=fixture.response.sigma_H * probe_ratio,
         frequency_ry=probe_frequency)
-    fitted = fit_dynamic_slab_photon_cttc_q0(
+    fitted = fit_dynamic_photon_cttc_q0(
         fixture.response, response_probe,
-        W_static_body_gamma=W_packed[0],
+        W_resident_body_gamma=W_packed[0],
+        W_resident_charge_gamma=W_charge_gamma,
         W_static_charge_gamma=W_charge_gamma,
         W_probe_charge_gamma=W_charge_gamma,
         g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
@@ -893,7 +1015,8 @@ def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
 
     static_S, static_YW, static_WZ = _dynamic_photon_head_small_system(
         fixture.response, W_packed[0],
-        W_static_charge_gamma=W_charge_gamma,
+        W_resident_charge_gamma=W_charge_gamma,
+        W_target_charge_gamma=W_charge_gamma,
         cell_volume=float(receipt.cell_volume), mesh_xy=mesh)
     off_moments = _dynamic_photon_head_moments(
         np.zeros(3, dtype=np.float64), static_S, receipt)
@@ -947,7 +1070,7 @@ def test_dynamic_faraday_probe_charge_delta_matches_explicit_packed_toy():
     target_charge = 0.73 * W_static_charge
     got_S, got_YW, got_WZ = _dynamic_photon_head_small_system(
         fixture.response, W_static,
-        W_static_charge_gamma=W_static_charge,
+        W_resident_charge_gamma=W_static_charge,
         W_target_charge_gamma=target_charge,
         cell_volume=float(receipt.cell_volume), mesh_xy=mesh)
 
@@ -976,13 +1099,42 @@ def test_dynamic_faraday_probe_charge_delta_matches_explicit_packed_toy():
     np.testing.assert_allclose(got_WZ, want_WZ, rtol=0.0, atol=2.0e-14)
 
 
+def test_bulk_faraday_factor_family_consumes_the_third_direction():
+    """The dimension-general adapter must not truncate the bulk z moments."""
+    mesh = _mesh(1)
+    fixture = _fixture(
+        mesh, sigma_H=np.array([1.0e-4, -2.0e-4, 3.0e-4]),
+        dimension=3, wings=True)
+    W_packed = _block_diagonal_body(fixture, mesh)
+    YW_y, WZ_x = small_head_wing_halves_sharded(
+        fixture.response.Y_x, W_packed[0], fixture.response.Z_y,
+        mesh_xy=mesh)
+    delta = np.zeros((4, 4, 4, 4), dtype=np.complex128)
+    delta[3, 0, 0, 1] = 0.4j
+    delta[0, 3, 1, 0] = -0.2j
+    pairs = _faraday_cttc_factor_pairs(
+        delta, g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
+        YW_y=YW_y, WZ_x=WZ_x, layout=fixture.layout,
+        mesh_xy=mesh, cell_volume=5.0)
+    dense = _cttc_dense_vector(pairs, fixture.layout, mesh)
+    assert np.max(np.abs(dense)) > 1.0e-8
+
+    zero_pairs = _faraday_cttc_factor_pairs(
+        np.zeros_like(delta), g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
+        YW_y=YW_y, WZ_x=WZ_x, layout=fixture.layout,
+        mesh_xy=mesh, cell_volume=5.0)
+    np.testing.assert_array_equal(
+        _cttc_dense_vector(zero_pairs, fixture.layout, mesh),
+        np.zeros_like(dense))
+
+
 def _reference_bare_tt_moments(receipt):
     chunk = receipt.chunks[-1]
     n = int(chunk.physical_count)
     q = np.asarray(chunk.q_cart[:n], dtype=np.float64)
     D = np.asarray(chunk.D_raw[:n], dtype=np.complex128)
     w = np.asarray(chunk.sample_weight[:n], dtype=np.float64)
-    basis = np.column_stack((np.ones(n), q[:, :2]))
+    basis = np.column_stack((np.ones(n), q[:, :receipt.dimension]))
     return np.einsum("s,su,sij,sv->uvij", w, basis, D[:, 1:, 1:], basis,
                      optimize=True) / float(np.sum(w))
 
@@ -1058,6 +1210,144 @@ def test_schur_fold_and_rank4_reattachment_are_one_block_inverse_identity():
     assert np.max(np.abs(unfolded - W[:nh, :nh])) > 1.0e-3
 
 
+# --------------------------------------------------------------------------
+# Part C -- exact centroid measure and absolute wing normalisation.
+# --------------------------------------------------------------------------
+
+def part_c_exact_measure_residuals(seed=585):
+    r"""Close the absolute wing relation in an exact discrete ISDF basis.
+
+    With every grid point selected as a centroid,
+    ``zeta_mu(r)=delta_mu,r`` and the forward Fourier convention gives
+    ``g0_mu=1/N_r``.  Real-space wavefunctions use the matching FFT
+    normalisation ``sum_r |psi_n(r)|^2=N_r``, hence the literal-Gamma
+    insertion is exactly one.  A physical real-space body kernel is
+    ``Omega`` times its stored LORRAX matrix, while Part A's independently
+    evaluated Adler--Wiser wings obey ``Y=Omega*chi_hb`` and
+    ``Z=Omega*chi_bh``.  Therefore
+
+    ``(Omega W_code)(Z/Omega) = W_code Z``
+
+    on the left (and analogously on the right), and converting the physical
+    completed body back to storage supplies exactly one final ``1/Omega``.
+    """
+    rng = np.random.default_rng(seed)
+    n_r, n_band, n_occ = 7, 4, 2
+    cell_volume = 17.25
+    energies = np.asarray([[-1.4, -0.5, 0.7, 1.9]], dtype=np.float64)
+    occupations = np.zeros_like(energies)
+    occupations[:, :n_occ] = 1.0
+
+    psi = (rng.normal(size=(1, 1, n_r, n_band))
+           + 1j * rng.normal(size=(1, 1, n_r, n_band)))
+    psi *= np.sqrt(
+        n_r / np.sum(np.abs(psi) ** 2, axis=(1, 2), keepdims=True))
+    g0 = np.full(n_r, 1.0 / n_r, dtype=np.complex128)
+    insertion = np.einsum(
+        "m,ksmn,ksmn->kn", g0, np.conj(psi), psi, optimize=True)
+
+    raw_v = (rng.normal(size=(2, 1, n_band, n_band))
+             + 1j * rng.normal(size=(2, 1, n_band, n_band)))
+    velocity = 0.5 * (raw_v + np.conj(np.swapaxes(raw_v, -1, -2)))
+    D_jet = density_jet(velocity, energies)
+    body_vertex = _centroid_vertex(psi)
+    chi_hb = adler_wiser_chi(
+        D_jet, body_vertex, energies, occupations,
+        cell_volume=cell_volume, nk_tot=1, nspin=1, nspinor=1)
+    chi_bh = adler_wiser_chi(
+        body_vertex, D_jet, energies, occupations,
+        cell_volume=cell_volume, nk_tot=1, nspin=1, nspinor=1)
+    Y = cell_volume * chi_hb
+    Z = cell_volume * chi_bh
+
+    raw_W = (rng.normal(size=(n_r, n_r))
+             + 1j * rng.normal(size=(n_r, n_r)))
+    W_code = 0.04 * (raw_W + np.conj(raw_W.T))
+    W_physical = cell_volume * W_code
+    left_direct = W_physical @ chi_bh
+    right_direct = chi_hb @ W_physical
+    left_rank4 = W_code @ Z
+    right_rank4 = Y @ W_code
+
+    # Scalar charge-head moments for u,v in (0,x,y).  The values are
+    # deliberately nonsymmetric so every family is independently nonzero.
+    moments = np.asarray(
+        [[1.3, -0.17, 0.09],
+         [0.21, 0.031, -0.014],
+         [-0.08, 0.019, 0.027]], dtype=np.complex128)
+    direct_families = {
+        "00": moments[0, 0] * np.outer(np.conj(g0), g0) / cell_volume,
+        "0a": sum(
+            moments[0, a + 1] * np.outer(np.conj(g0), right_direct[a])
+            for a in range(2)) / cell_volume,
+        "a0": sum(
+            moments[a + 1, 0] * np.outer(left_direct[:, a], g0)
+            for a in range(2)) / cell_volume,
+        "ab": sum(
+            moments[a + 1, b + 1]
+            * np.outer(left_direct[:, a], right_direct[b])
+            for a in range(2) for b in range(2)) / cell_volume,
+    }
+    rank4_families = {
+        "00": moments[0, 0] * np.outer(np.conj(g0), g0) / cell_volume,
+        "0a": sum(
+            moments[0, a + 1] * np.outer(np.conj(g0), right_rank4[a])
+            for a in range(2)) / cell_volume,
+        "a0": sum(
+            moments[a + 1, 0] * np.outer(left_rank4[:, a], g0)
+            for a in range(2)) / cell_volume,
+        "ab": sum(
+            moments[a + 1, b + 1]
+            * np.outer(left_rank4[:, a], right_rank4[b])
+            for a in range(2) for b in range(2)) / cell_volume,
+    }
+
+    residuals = {
+        "insertion": float(np.max(np.abs(insertion - 1.0))),
+        "left_attachment": _rel(left_rank4, left_direct),
+        "right_attachment": _rel(right_rank4, right_direct),
+        # This is claim 585's relation written literally; g0 is nonzero at
+        # every point in the exact delta basis.
+        "quoted_relation": _rel(
+            left_direct / np.conj(g0)[:, None],
+            left_rank4 / np.conj(g0)[:, None]),
+    }
+    for family in ("00", "0a", "a0", "ab"):
+        residuals[f"family_{family}"] = _rel(
+            rank4_families[family], direct_families[family])
+
+    direct_ab_physical = direct_families["ab"] * cell_volume
+    direct_ab_extra_divide = direct_families["ab"] / cell_volume
+    residuals["omega_omitted"] = _rel(
+        rank4_families["ab"], direct_ab_physical)
+    residuals["omega_doubled"] = _rel(
+        rank4_families["ab"], direct_ab_extra_divide)
+    residuals["omega_omitted_norm_ratio"] = float(
+        np.linalg.norm(direct_ab_physical)
+        / np.linalg.norm(rank4_families["ab"]))
+    residuals["omega_doubled_norm_ratio"] = float(
+        np.linalg.norm(direct_ab_extra_divide)
+        / np.linalg.norm(rank4_families["ab"]))
+    residuals["cell_volume"] = cell_volume
+    return residuals
+
+
+def test_part_c_exact_measure_closes_absolute_wing_normalisation():
+    result = part_c_exact_measure_residuals()
+    for key in ("insertion", "left_attachment", "right_attachment",
+                "quoted_relation", "family_00", "family_0a", "family_a0",
+                "family_ab"):
+        assert result[key] < 1.0e-12, (key, result[key])
+    np.testing.assert_allclose(
+        result["omega_omitted_norm_ratio"], result["cell_volume"],
+        rtol=1.0e-14, atol=0.0)
+    np.testing.assert_allclose(
+        result["omega_doubled_norm_ratio"], 1.0 / result["cell_volume"],
+        rtol=1.0e-14, atol=0.0)
+    assert result["omega_omitted"] > 0.9
+    assert result["omega_doubled"] > 0.9
+
+
 def test_receipt_samples_never_reach_the_singular_origin():
     receipt = _receipt()
     for chunk in receipt.chunks:
@@ -1088,7 +1378,7 @@ def main():  # pragma: no cover - reporting entry point
     print(f"\n[oracle] cubature: orders={receipt.orders} "
           f"physical={receipt.physical_counts} "
           f"cell_volume={receipt.cell_volume:.6f} "
-          f"polygon_area={receipt.polygon_area:.6e}")
+          f"minibz_measure={receipt.minibz_measure:.6e}")
     print("\n== PART B: merged completion, all blocks nonzero ==")
     worst = 0.0
     for label, sigma in (("sigma_H = +z", _SIGMA_PLUS),
@@ -1159,6 +1449,24 @@ def main():  # pragma: no cover - reporting entry point
               f"  TT {residual['moments_TT']:.3e}"
               f"  W {residual['W_packed']:.3e}")
 
+    print("\n== PART C: exact centroid measure / absolute normalisation ==")
+    exact = part_c_exact_measure_residuals()
+    for key in ("insertion", "left_attachment", "right_attachment",
+                "quoted_relation", "family_00", "family_0a", "family_a0",
+                "family_ab"):
+        print(f"  {key:28s} rel = {exact[key]:.3e}")
+    print(f"  omitted 1/Omega control ratio = "
+          f"{exact['omega_omitted_norm_ratio']:.12f} "
+          f"(Omega={exact['cell_volume']:.12f})")
+    print(f"  doubled 1/Omega control ratio = "
+          f"{exact['omega_doubled_norm_ratio']:.12f} "
+          f"(1/Omega={1.0 / exact['cell_volume']:.12f})")
+
+    worst = max(worst, max(
+        exact[key] for key in (
+            "insertion", "left_attachment", "right_attachment",
+            "quoted_relation", "family_00", "family_0a", "family_a0",
+            "family_ab")))
     print(f"\n[oracle] WORST residual over every positive case = {worst:.3e}")
     return 0 if worst < _TOL else 1
 

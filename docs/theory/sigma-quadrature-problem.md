@@ -26,7 +26,7 @@ Each term then factors into independent external-frequency, electronic-state,
 and screened-pole factors. One `(window,tau)` pair therefore costs one spatial
 Green-function/screened-interaction transform, rather than an explicit
 state-by-pole contraction. The total number of `(window,tau)` pairs is the
-resource currency and is refused when it exceeds `mpa_sigma_max_nodes`.
+resource currency; the plan reports it and never refuses on it.
 
 ## 2. Product windows
 
@@ -160,6 +160,5 @@ sigma_quadrature_cache_dir = auto
 ```
 
 The reduction budget trades planning wall for node count after an accepted
-interpolatory rule exists; it does not weaken `eps`. Retarded broadening stays
-under `sigma_regularization_ev` / `sigma_regularization_floor_ev`, and the total
-pair ceiling stays `mpa_sigma_max_nodes`.
+interpolatory rule exists; it does not weaken `eps`. Retarded broadening is
+`sigma_regularization_ev`, literal for every ansatz; there is no pair ceiling.

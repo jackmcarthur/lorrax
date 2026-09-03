@@ -514,7 +514,6 @@ def plan_sigma_windows(
     *,
     eps,
     reduction_seconds,
-    pair_ceiling,
     cache_dir,
     print_fn=print,
     edge_factor=1.5,
@@ -543,8 +542,6 @@ def plan_sigma_windows(
     reduction_seconds
         Per-window Gauss-reduction wall budget.  Independent windows are
         assigned round-robin across processes.
-    pair_ceiling
-        Hard ceiling on the sum of ``(window, tau)`` pairs.
     cache_dir
         Directory for immutable box-rule certificates, or ``None``.
 
@@ -580,7 +577,7 @@ def plan_sigma_windows(
     """
     started = time.perf_counter()
     eta, tolerance = float(eta_ry), float(eps)
-    budget, ceiling = float(reduction_seconds), int(pair_ceiling)
+    budget = float(reduction_seconds)
     edge = float(edge_factor)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("sigma_quadrature requires eta_ry > 0")
@@ -588,8 +585,6 @@ def plan_sigma_windows(
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     if not np.isfinite(budget) or budget <= 0.0:
         raise ValueError("sigma_quadrature_reduction_seconds must be > 0")
-    if ceiling < 1:
-        raise ValueError("mpa_sigma_max_nodes pair ceiling must be positive")
     if not np.isfinite(edge) or edge < 0.0:
         raise ValueError("sigma_window_edge_factor must be nonnegative")
     branch_rows = list(branches)
@@ -647,11 +642,11 @@ def plan_sigma_windows(
     fits, fit_rows = fit_sigma_box_specs(
         specs, eta, eps=tolerance, reduction_seconds=budget,
         cache_dir=cache_dir)
+    # The (window, tau) pair count is reported, never refused on: the owner
+    # eliminated the pair ceiling (2026-09-02).  A count above what a deck
+    # can afford is a planning question answered by eps and the window
+    # geometry, not a runtime refusal (TASTE 70).
     pairs = sum(row["node_count"] for row in fits)
-    if pairs > ceiling:
-        raise RuntimeError(
-            f"Sigma box plan refused: {pairs} (window,tau) pairs exceed "
-            f"mpa_sigma_max_nodes pair ceiling={ceiling}")
 
     output = []
     for spec, fit in zip(specs, fits):
@@ -715,7 +710,7 @@ def plan_sigma_windows(
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,
         "reduction_seconds": budget, "cache_dir": cache_dir,
-        "pair_ceiling": ceiling, "n_windows": len(output),
+        "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
         "plan_seconds": time.perf_counter() - started,
         "planning_process_count": int(process_count()),

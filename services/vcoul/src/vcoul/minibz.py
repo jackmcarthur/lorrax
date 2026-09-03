@@ -80,6 +80,7 @@ from __future__ import annotations
 from dataclasses import InitVar, dataclass, field
 import functools
 import hashlib
+import itertools
 from typing import NamedTuple
 import warnings
 
@@ -101,10 +102,11 @@ __all__ = [
     "minibz_inscribed_sphere_r2",
     "minibz_average",
     "minibz_moment_tensor",
-    "minibz_transverse_head_avg",
-    "SlabMinibzPhotonReceipt",
+    "MinibzPhotonReceipt",
+    "minibz_photon_cubature",
     "slab_minibz_photon_cubature",
-    "validate_slab_minibz_photon_receipt",
+    "bulk_minibz_photon_cubature",
+    "validate_minibz_photon_receipt",
     "iter_minibz_photon_samples",
     "build_miniBZ_dq_cart",
     "build_v_head_miniBZ_fn_3d",
@@ -122,11 +124,32 @@ COULOMB_GAUGE_TT_SIGN = -1.0
 _SLAB_MINIBZ_PHOTON_METHOD = (
     "true_ws_polygon_duffy_gauss_legendre_v1")
 _SLAB_MINIBZ_PHOTON_ORDERS = (16, 24, 32)
-_SLAB_MINIBZ_RECEIPT_TOKEN = object()
+_BULK_MINIBZ_PHOTON_METHOD = (
+    "true_ws_polyhedron_duffy_gauss_legendre_v1")
+_BULK_MINIBZ_PHOTON_ORDERS = (10, 16, 22)
+_MINIBZ_PHOTON_RECEIPT_TOKEN = object()
 
 
-class _SlabMinibzPhotonChunk(NamedTuple):
-    """One weighted, fixed-shape rule issued with a slab receipt."""
+#: DEBUG/DIAGNOSTIC ONLY: the historical scrambled-Sobol Voronoi q=0
+#: estimator.  Both slab and bulk production rules require their exact
+#: provider-issued Wigner--Seitz receipt; this spelling is their sole named
+#: escape hatch for reproducing superseded numbers.
+Q0_RULE_SOBOL_DEBUG = "sobol_debug"
+_Q0_RULE_ANNOUNCED: set[str] = set()
+
+
+def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
+    """Name the q=0 rule that answered, once per process."""
+    if line in _Q0_RULE_ANNOUNCED:
+        return
+    _Q0_RULE_ANNOUNCED.add(line)
+    print(line, flush=True)
+    if warn:
+        warnings.warn(line, RuntimeWarning, stacklevel=3)
+
+
+class _MinibzPhotonChunk(NamedTuple):
+    """One weighted, fixed-shape rule issued with a photon receipt."""
 
     order: int
     q_cart: np.ndarray
@@ -136,8 +159,8 @@ class _SlabMinibzPhotonChunk(NamedTuple):
 
 
 @dataclass(frozen=True)
-class SlabMinibzPhotonReceipt:
-    """Provider-issued exact slab mini-BZ cubature and its geometry facts.
+class MinibzPhotonReceipt:
+    """Provider-issued exact mini-BZ cubature and its geometry facts.
 
     This is the one deliberately typed service result: the screened Dyson
     consumer must be able to distinguish an exact Wigner--Seitz/Duffy ladder
@@ -146,6 +169,7 @@ class SlabMinibzPhotonReceipt:
     all geometry and rule diagnostics travel with the immutable receipt.
     """
 
+    dimension: int
     method: str
     orders: tuple[int, int, int]
     reciprocal_lattice_rows: tuple[
@@ -154,16 +178,17 @@ class SlabMinibzPhotonReceipt:
         tuple[float, float, float],
     ]
     kgrid: tuple[int, int, int]
-    mini_lattice_rows: tuple[tuple[float, float], tuple[float, float]]
-    polygon_vertices: tuple[tuple[float, float], ...]
-    polygon_area: float
-    slab_zc: float
+    mini_lattice_rows: tuple[tuple[float, ...], ...]
+    polytope_vertices: tuple[tuple[float, ...], ...]
+    polytope_faces: tuple[tuple[int, ...], ...]
+    minibz_measure: float
+    slab_zc: float | None
     cell_volume: float
     physical_counts: tuple[int, int, int]
     padded_counts: tuple[int, int, int]
     weight_sum_defects: tuple[float, float, float]
     weighted_q_centroids: tuple[tuple[float, float, float], ...]
-    chunks: tuple[_SlabMinibzPhotonChunk, ...] = field(
+    chunks: tuple[_MinibzPhotonChunk, ...] = field(
         repr=False, compare=False)
     _issue_token: InitVar[object] = None
     # ``init=False`` is load-bearing: dataclasses.replace() does not copy the
@@ -177,10 +202,10 @@ class SlabMinibzPhotonReceipt:
         init=False, default="", repr=False, compare=False)
 
     def __post_init__(self, _issue_token) -> None:
-        if _issue_token is not _SLAB_MINIBZ_RECEIPT_TOKEN:
+        if _issue_token is not _MINIBZ_PHOTON_RECEIPT_TOKEN:
             raise TypeError(
-                "SlabMinibzPhotonReceipt is issued only by "
-                "slab_minibz_photon_cubature")
+                "MinibzPhotonReceipt is issued only by "
+                "minibz_photon_cubature")
         object.__setattr__(self, "_provider_token", _issue_token)
 
 
@@ -732,6 +757,212 @@ def _slab_minibz_wigner_seitz_polygon(bvec, kgrid):
     return polygon, np.asarray((g1, g2), dtype=np.float64), polygon_area
 
 
+def _dedupe_polyhedron_polygon(points, point_tol):
+    """Remove adjacent duplicate vertices from one clipped 3-D face."""
+    if len(points) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    polygon = np.asarray(points, dtype=np.float64)
+    keep = np.ones(polygon.shape[0], dtype=bool)
+    for index in range(polygon.shape[0]):
+        if np.linalg.norm(polygon[index] - polygon[index - 1]) <= point_tol:
+            keep[index] = False
+    return polygon[keep]
+
+
+def _clip_polyhedron_half_space(
+    faces, normal, offset, *, inside_tol, point_tol,
+):
+    """Clip a convex polyhedron against ``x.normal <= offset``.
+
+    Faces are ordered convex polygons.  The clipping plane's intersection
+    points form the one new cap face; its order is fixed by the outward
+    normal, so subsequent triangulation is deterministic.
+    """
+    clipped_faces = []
+    cap_points = []
+    for face in faces:
+        out = []
+        previous = face[-1]
+        previous_value = float(previous @ normal) - float(offset)
+        previous_inside = previous_value <= inside_tol
+        for current in face:
+            current_value = float(current @ normal) - float(offset)
+            current_inside = current_value <= inside_tol
+            if current_inside != previous_inside:
+                denominator = previous_value - current_value
+                if denominator == 0.0:
+                    raise RuntimeError(
+                        "degenerate bulk mini-BZ half-space crossing")
+                crossing = previous + (
+                    previous_value / denominator) * (current - previous)
+                out.append(crossing)
+                cap_points.append(crossing)
+            if current_inside:
+                out.append(current)
+            previous = current
+            previous_value = current_value
+            previous_inside = current_inside
+        polygon = _dedupe_polyhedron_polygon(out, point_tol)
+        if polygon.shape[0] >= 3:
+            clipped_faces.append(polygon)
+
+    unique_cap = []
+    for point in cap_points:
+        if not any(np.linalg.norm(point - old) <= point_tol
+                   for old in unique_cap):
+            unique_cap.append(point)
+    if len(unique_cap) >= 3:
+        cap = np.asarray(unique_cap, dtype=np.float64)
+        center = np.mean(cap, axis=0)
+        normal_unit = normal / np.linalg.norm(normal)
+        relative = cap - center
+        first = int(np.argmax(np.linalg.norm(relative, axis=1)))
+        axis_1 = relative[first] / np.linalg.norm(relative[first])
+        axis_2 = np.cross(normal_unit, axis_1)
+        angles = np.arctan2(relative @ axis_2, relative @ axis_1)
+        cap = cap[np.argsort(angles)]
+        cap = _dedupe_polyhedron_polygon(cap, point_tol)
+        if cap.shape[0] >= 3:
+            clipped_faces.append(cap)
+    return clipped_faces
+
+
+def _polyhedron_indexed_faces(faces, point_tol):
+    """Return one canonical vertex table and face-index description."""
+    vertices = []
+    indexed = []
+    for face in faces:
+        indices = []
+        for point in face:
+            matches = [
+                index for index, old in enumerate(vertices)
+                if np.linalg.norm(point - old) <= point_tol]
+            if matches:
+                index = matches[0]
+            else:
+                index = len(vertices)
+                vertices.append(np.asarray(point, dtype=np.float64))
+            if not indices or indices[-1] != index:
+                indices.append(index)
+        if len(indices) >= 3 and indices[0] == indices[-1]:
+            indices.pop()
+        if len(indices) >= 3:
+            indexed.append(tuple(indices))
+    return np.asarray(vertices, dtype=np.float64), tuple(indexed)
+
+
+def _bulk_minibz_wigner_seitz_polyhedron(bvec, kgrid):
+    r"""Return the true 3-D mini-lattice Wigner--Seitz polyhedron.
+
+    The neighbour shell is finite by construction.  A centered fundamental
+    parallelepiped gives the covering-radius bound
+    ``R <= 1/2 sum_i |g_i|``.  Therefore every lattice vector longer than
+    ``2R`` has a redundant Voronoi half-space on the entire WS cell.  If
+    ``sigma_min`` is the smallest singular value of the mini-lattice matrix,
+    ``|n| <= 2R/sigma_min`` contains every nonredundant integer vector.  The
+    resulting fixed shell is clipped once; there is no convergence search.
+    """
+    bvec = np.asarray(bvec, dtype=np.float64)
+    kg = tuple(int(value) for value in kgrid)
+    if bvec.shape != (3, 3) or not np.all(np.isfinite(bvec)):
+        raise ValueError("bulk polyhedron cubature requires finite (3,3) bvec")
+    if len(kg) != 3 or any(value <= 0 for value in kg):
+        raise ValueError(
+            f"kgrid must contain three positive integers; got {kgrid}")
+    mini = bvec / np.asarray(kg, dtype=np.float64)[:, None]
+    singular_values = np.linalg.svd(mini, compute_uv=False)
+    scale = float(np.max(singular_values))
+    sigma_min = float(np.min(singular_values))
+    singular_tol = 256.0 * np.finfo(np.float64).eps * max(scale, 1.0)
+    if sigma_min <= singular_tol:
+        raise ValueError("bulk mini-BZ lattice is singular")
+
+    covering_bound = 0.5 * float(np.sum(np.linalg.norm(mini, axis=1)))
+    shell = int(np.ceil(2.0 * covering_bound / sigma_min)) + 1
+    if shell > 24:
+        raise ValueError(
+            "GATE bulk_minibz_neighbour_shell: exact WS construction would "
+            "exceed its bounded neighbour-shell budget.\n"
+            f"  got: shell half-width = {shell}, sigma_min = "
+            f"{sigma_min:.6e}, covering bound = {covering_bound:.6e}\n"
+            "  want: shell half-width <= 24\n"
+            "  why: an extremely ill-conditioned reciprocal lattice makes "
+            "the certified finite clipping problem impractically large\n"
+            "  fix: supply a reduced primitive reciprocal basis; the "
+            "physical lattice and its WS cell are unchanged")
+    cutoff = 2.0 * covering_bound
+    cutoff_tol = 4096.0 * np.finfo(np.float64).eps * max(cutoff, 1.0)
+    neighbours = []
+    for coefficients in itertools.product(range(-shell, shell + 1), repeat=3):
+        if coefficients == (0, 0, 0):
+            continue
+        vector = np.asarray(coefficients, dtype=np.float64) @ mini
+        norm = float(np.linalg.norm(vector))
+        if norm <= cutoff + cutoff_tol:
+            neighbours.append((norm, coefficients, vector))
+    neighbours.sort(key=lambda item: (item[0], item[1]))
+
+    cube_radius = 2.0 * covering_bound + max(scale, 1.0) * 1.0e-12
+    lo, hi = -cube_radius, cube_radius
+    faces = [
+        np.asarray(points, dtype=np.float64)
+        for points in (
+            ((lo, lo, lo), (lo, lo, hi), (lo, hi, hi), (lo, hi, lo)),
+            ((hi, lo, lo), (hi, hi, lo), (hi, hi, hi), (hi, lo, hi)),
+            ((lo, lo, lo), (hi, lo, lo), (hi, lo, hi), (lo, lo, hi)),
+            ((lo, hi, lo), (lo, hi, hi), (hi, hi, hi), (hi, hi, lo)),
+            ((lo, lo, lo), (lo, hi, lo), (hi, hi, lo), (hi, lo, lo)),
+            ((lo, lo, hi), (hi, lo, hi), (hi, hi, hi), (lo, hi, hi)),
+        )
+    ]
+    point_tol = 32768.0 * np.finfo(np.float64).eps * max(scale, 1.0)
+    inside_tol = point_tol * max(scale, 1.0)
+    for _, _, normal in neighbours:
+        faces = _clip_polyhedron_half_space(
+            faces, normal, 0.5 * float(normal @ normal),
+            inside_tol=inside_tol, point_tol=point_tol)
+        if len(faces) < 4:
+            raise RuntimeError(
+                "bulk mini-BZ half-space intersection became empty")
+
+    vertices, indexed_faces = _polyhedron_indexed_faces(faces, point_tol)
+    if vertices.shape[0] < 4 or len(indexed_faces) < 4:
+        raise RuntimeError("bulk mini-BZ polyhedron is not three-dimensional")
+    if np.any(np.max(np.abs(vertices), axis=1) >= cube_radius - point_tol):
+        raise RuntimeError(
+            "bulk mini-BZ clipping retained an artificial bounding-cube face")
+    for _, _, normal in neighbours:
+        excess = vertices @ normal - 0.5 * float(normal @ normal)
+        if float(np.max(excess)) > 4.0 * inside_tol:
+            raise RuntimeError(
+                "bulk mini-BZ vertex violates a certified lattice half-space")
+
+    central_error = max(
+        min(float(np.linalg.norm(point + partner)) for partner in vertices)
+        for point in vertices)
+    if central_error > 8.0 * point_tol:
+        raise RuntimeError(
+            "bulk mini-BZ polyhedron failed central symmetry: "
+            f"max vertex-pair defect={central_error:.3e}")
+
+    volume = 0.0
+    for face in indexed_faces:
+        left = vertices[face[0]]
+        for offset in range(1, len(face) - 1):
+            middle = vertices[face[offset]]
+            right = vertices[face[offset + 1]]
+            volume += abs(float(np.linalg.det(
+                np.stack((left, middle, right), axis=0)))) / 6.0
+    lattice_volume = abs(float(np.linalg.det(mini)))
+    relative_error = abs(volume - lattice_volume) / lattice_volume
+    if relative_error > 5.0e-12:
+        raise RuntimeError(
+            "bulk mini-BZ polyhedron failed its Voronoi cell-volume identity: "
+            f"polyhedron={volume:.17e}, lattice={lattice_volume:.17e}, "
+            f"relative_error={relative_error:.3e}")
+    return vertices, indexed_faces, mini, volume
+
+
 def _slab_minibz_polygon_rule(polygon, polygon_area, order):
     r"""One normalized Gamma-to-edge Duffy--Gauss rule.
 
@@ -772,6 +1003,60 @@ def _slab_minibz_polygon_rule(polygon, polygon_area, order):
     return q_cart, average_weights, weight_sum_defect, weighted_centroid
 
 
+def _bulk_minibz_polyhedron_rule(
+    vertices, faces, minibz_measure, order,
+):
+    r"""One normalized Gamma-to-face tetrahedral Duffy--Gauss rule.
+
+    Every convex face is triangulated as a fan.  On the tetrahedron joining
+    ``Gamma`` to triangle ``(v0,v1,v2)``, the product-cube map is
+
+    ``p(u,t)=(1-u)v0+u((1-t)v1+t v2)``, ``q(r,u,t)=r p(u,t)``.
+
+    Its Jacobian is ``r^2 u |det(v0,v1,v2)|``.  The radial ``r^2`` factor
+    cancels the bulk ``8*pi/|q|^2`` singularity algebraically before the
+    weighted sum, and interior Gauss nodes never evaluate Gamma.
+    """
+    n = int(order)
+    nodes, weights = gauss_legendre_interval(n, 0.0, 1.0)
+    r, u, t = np.meshgrid(nodes, nodes, nodes, indexing="ij")
+    wr, wu, wt = np.meshgrid(weights, weights, weights, indexing="ij")
+    q_parts = []
+    w_parts = []
+    for face in faces:
+        face_vertices = vertices[np.asarray(face, dtype=np.int64)]
+        v0 = np.mean(face_vertices, axis=0)
+        for offset in range(len(face)):
+            v1 = face_vertices[offset]
+            v2 = face_vertices[(offset + 1) % len(face)]
+            determinant = abs(float(np.linalg.det(
+                np.stack((v0, v1, v2), axis=0))))
+            if determinant <= 0.0:
+                raise RuntimeError(
+                    "bulk mini-BZ face triangulation has zero volume")
+            angular = (
+                (1.0 - u)[..., None] * v0
+                + u[..., None] * (
+                    (1.0 - t)[..., None] * v1 + t[..., None] * v2))
+            q_parts.append((r[..., None] * angular).reshape(-1, 3))
+            w_parts.append(
+                (wr * wu * wt * r * r * u * determinant).reshape(-1))
+    q_cart = np.concatenate(q_parts, axis=0)
+    average_weights = np.concatenate(w_parts, axis=0) / float(minibz_measure)
+    weight_sum_defect = abs(float(np.sum(average_weights)) - 1.0)
+    weighted_centroid = np.sum(
+        average_weights[:, None] * q_cart, axis=0)
+    if weight_sum_defect > 8.0e-15:
+        raise RuntimeError("polyhedron cubature weights do not sum to one")
+    q_scale = max(float(np.max(np.linalg.norm(q_cart, axis=1))),
+                  np.finfo(np.float64).tiny)
+    if float(np.linalg.norm(weighted_centroid)) > 5.0e-13 * q_scale:
+        raise RuntimeError(
+            "polyhedron cubature failed its weighted-centroid identity: "
+            f"|sum(w*q)|={np.linalg.norm(weighted_centroid):.3e}")
+    return q_cart, average_weights, weight_sum_defect, weighted_centroid
+
+
 def _photon_D_raw(q_cart, *, kind, zc):
     """Bare Coulomb-gauge block on logical, nonzero q rows only."""
     q_valid = np.asarray(q_cart, dtype=np.float64)
@@ -785,8 +1070,13 @@ def _photon_D_raw(q_cart, *, kind, zc):
     return D_raw, q2
 
 
-def _slab_minibz_receipt_digest(receipt) -> str:
-    """Digest every receipt field and payload; ndarray flags are not trust."""
+def _minibz_photon_receipt_digest(receipt) -> str:
+    """Digest every receipt field and payload; ndarray flags are not trust.
+
+    The dimension-two byte stream deliberately retains the pre-generalization
+    labels and field order.  This makes the slab digest a regression oracle:
+    changing only the Python field names cannot move an issued slab rule.
+    """
     digest = hashlib.sha256()
 
     def _add_array(name, value):
@@ -801,9 +1091,17 @@ def _slab_minibz_receipt_digest(receipt) -> str:
     _add_array("reciprocal_lattice_rows", receipt.reciprocal_lattice_rows)
     _add_array("kgrid", receipt.kgrid)
     _add_array("mini_lattice_rows", receipt.mini_lattice_rows)
-    _add_array("polygon_vertices", receipt.polygon_vertices)
-    _add_array("polygon_area", receipt.polygon_area)
-    _add_array("slab_zc", receipt.slab_zc)
+    if int(receipt.dimension) == 2:
+        _add_array("polygon_vertices", receipt.polytope_vertices)
+        _add_array("polygon_area", receipt.minibz_measure)
+        _add_array("slab_zc", receipt.slab_zc)
+    else:
+        _add_array("dimension", receipt.dimension)
+        _add_array("polytope_vertices", receipt.polytope_vertices)
+        for index, face in enumerate(receipt.polytope_faces):
+            _add_array(f"polytope_face_{index}", face)
+        _add_array("minibz_measure", receipt.minibz_measure)
+        _add_array("slab_zc_is_none", receipt.slab_zc is None)
     _add_array("cell_volume", receipt.cell_volume)
     _add_array("physical_counts", receipt.physical_counts)
     _add_array("padded_counts", receipt.padded_counts)
@@ -820,7 +1118,7 @@ def _slab_minibz_receipt_digest(receipt) -> str:
 
 def slab_minibz_photon_cubature(
     kernel, geometry, kgrid,
-) -> SlabMinibzPhotonReceipt:
+) -> MinibzPhotonReceipt:
     """Issue the fixed exact-WS slab photon cubature receipt.
 
     There is no method token, order dial, or caller-supplied geometry fact on
@@ -868,7 +1166,7 @@ def slab_minibz_photon_cubature(
             array.setflags(write=False)
 
         centroid_tuple = tuple(float(v) for v in centroid)
-        chunks.append(_SlabMinibzPhotonChunk(
+        chunks.append(_MinibzPhotonChunk(
             order=int(order), q_cart=q_chunk, D_raw=D_chunk,
             physical_count=physical_count, sample_weight=sample_weight))
         physical_counts.append(physical_count)
@@ -878,14 +1176,18 @@ def slab_minibz_photon_cubature(
     def _rows(values):
         return tuple(tuple(float(x) for x in row) for row in values)
 
-    receipt = SlabMinibzPhotonReceipt(
+    receipt = MinibzPhotonReceipt(
+        dimension=2,
         method=_SLAB_MINIBZ_PHOTON_METHOD,
         orders=_SLAB_MINIBZ_PHOTON_ORDERS,
         reciprocal_lattice_rows=_rows(bvec),
         kgrid=kg,
         mini_lattice_rows=_rows(mini_lattice),
-        polygon_vertices=_rows(polygon),
-        polygon_area=polygon_area,
+        polytope_vertices=_rows(polygon),
+        polytope_faces=tuple(
+            (index, (index + 1) % int(polygon.shape[0]))
+            for index in range(int(polygon.shape[0]))),
+        minibz_measure=polygon_area,
         slab_zc=zc,
         cell_volume=cell_volume,
         physical_counts=tuple(physical_counts),
@@ -893,33 +1195,139 @@ def slab_minibz_photon_cubature(
         weight_sum_defects=tuple(weight_defects),
         weighted_q_centroids=tuple(weighted_centroids),
         chunks=tuple(chunks),
-        _issue_token=_SLAB_MINIBZ_RECEIPT_TOKEN,
+        _issue_token=_MINIBZ_PHOTON_RECEIPT_TOKEN,
     )
     object.__setattr__(
-        receipt, "_provider_digest", _slab_minibz_receipt_digest(receipt))
-    return validate_slab_minibz_photon_receipt(receipt)
+        receipt, "_provider_digest", _minibz_photon_receipt_digest(receipt))
+    return validate_minibz_photon_receipt(receipt)
 
 
-def validate_slab_minibz_photon_receipt(
+def bulk_minibz_photon_cubature(
+    kernel, geometry, kgrid,
+) -> MinibzPhotonReceipt:
+    """Issue the fixed exact-WS bulk photon cubature receipt.
+
+    The provider constructs the true three-dimensional mini-lattice Voronoi
+    polyhedron from a rigorously bounded neighbour shell, triangulates its
+    faces to Gamma, and evaluates the fixed 10/16/22 tetrahedral Duffy--Gauss
+    ladder.  Weights are normalized cell-average weights.  Raw ``D`` carries
+    no cell-volume factor.
+    """
+    from vcoul.bulk_3d import Bulk3D
+    if type(kernel) is not Bulk3D:
+        raise TypeError(
+            "bulk_minibz_photon_cubature needs the exact Bulk3D kernel "
+            "returned by get_kernel(3)")
+
+    bvec = np.asarray(geometry.bvec, dtype=np.float64)
+    kg = tuple(int(value) for value in kgrid)
+    cell_volume = float(geometry.cell_volume)
+    if not np.isfinite(cell_volume) or cell_volume <= 0.0:
+        raise ValueError(
+            "bulk photon cubature requires a finite positive cell_volume; "
+            f"got {cell_volume}")
+    vertices, faces, mini_lattice, minibz_measure = (
+        _bulk_minibz_wigner_seitz_polyhedron(bvec, kg))
+    triangle_count = sum(len(face) for face in faces)
+    padded_count = triangle_count * max(_BULK_MINIBZ_PHOTON_ORDERS) ** 3
+
+    chunks = []
+    physical_counts = []
+    weight_defects = []
+    weighted_centroids = []
+    for order in _BULK_MINIBZ_PHOTON_ORDERS:
+        q_valid, weight_valid, defect, centroid = (
+            _bulk_minibz_polyhedron_rule(
+                vertices, faces, minibz_measure, order))
+        physical_count = int(q_valid.shape[0])
+        D_valid, _ = _photon_D_raw(q_valid, kind="bulk_3d", zc=None)
+
+        q_chunk = np.zeros((padded_count, 3), dtype=np.float64)
+        D_chunk = np.zeros((padded_count, 4, 4), dtype=np.float64)
+        sample_weight = np.zeros(padded_count, dtype=np.float64)
+        q_chunk[:physical_count] = q_valid
+        D_chunk[:physical_count] = D_valid
+        sample_weight[:physical_count] = weight_valid
+        for array in (q_chunk, D_chunk, sample_weight):
+            array.setflags(write=False)
+        chunks.append(_MinibzPhotonChunk(
+            order=int(order), q_cart=q_chunk, D_raw=D_chunk,
+            physical_count=physical_count, sample_weight=sample_weight))
+        physical_counts.append(physical_count)
+        weight_defects.append(float(defect))
+        weighted_centroids.append(tuple(float(value) for value in centroid))
+
+    def _rows(values):
+        return tuple(tuple(float(value) for value in row) for row in values)
+
+    receipt = MinibzPhotonReceipt(
+        dimension=3,
+        method=_BULK_MINIBZ_PHOTON_METHOD,
+        orders=_BULK_MINIBZ_PHOTON_ORDERS,
+        reciprocal_lattice_rows=_rows(bvec),
+        kgrid=kg,
+        mini_lattice_rows=_rows(mini_lattice),
+        polytope_vertices=_rows(vertices),
+        polytope_faces=tuple(tuple(int(value) for value in face)
+                             for face in faces),
+        minibz_measure=minibz_measure,
+        slab_zc=None,
+        cell_volume=cell_volume,
+        physical_counts=tuple(physical_counts),
+        padded_counts=(padded_count,) * len(_BULK_MINIBZ_PHOTON_ORDERS),
+        weight_sum_defects=tuple(weight_defects),
+        weighted_q_centroids=tuple(weighted_centroids),
+        chunks=tuple(chunks),
+        _issue_token=_MINIBZ_PHOTON_RECEIPT_TOKEN,
+    )
+    object.__setattr__(
+        receipt, "_provider_digest", _minibz_photon_receipt_digest(receipt))
+    return validate_minibz_photon_receipt(receipt)
+
+
+def minibz_photon_cubature(kernel, geometry, kgrid) -> MinibzPhotonReceipt:
+    """Issue the exact photon Gamma-cell rule selected by kernel dimension."""
+    try:
+        dimension = int(kernel.sys_dim)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError(
+            "minibz_photon_cubature needs a vcoul kernel returned by "
+            "get_kernel(sys_dim)") from exc
+    if dimension == 2:
+        return slab_minibz_photon_cubature(kernel, geometry, kgrid)
+    if dimension == 3:
+        return bulk_minibz_photon_cubature(kernel, geometry, kgrid)
+    raise NotImplementedError(
+        "minibz_photon_cubature supports sys_dim=2 (slab) or 3 (bulk); "
+        f"got {dimension}")
+
+
+def validate_minibz_photon_receipt(
     receipt,
-) -> SlabMinibzPhotonReceipt:
+) -> MinibzPhotonReceipt:
     """Non-virtual validation of an exact provider-issued receipt."""
-    if type(receipt) is not SlabMinibzPhotonReceipt:
+    if type(receipt) is not MinibzPhotonReceipt:
         raise TypeError(
-            "production slab photon cubature requires the exact provider "
-            "receipt type SlabMinibzPhotonReceipt; subclasses, proxies, and "
+            "production photon cubature requires the exact provider "
+            "receipt type MinibzPhotonReceipt; subclasses, proxies, and "
             f"caller-labelled payloads are refused (got {type(receipt).__name__})")
-    if receipt._provider_token is not _SLAB_MINIBZ_RECEIPT_TOKEN:
+    if receipt._provider_token is not _MINIBZ_PHOTON_RECEIPT_TOKEN:
         raise TypeError(
-            "SlabMinibzPhotonReceipt was not issued by "
-            "slab_minibz_photon_cubature")
-    _require_slab_minibz_photon_receipt(receipt)
+            "MinibzPhotonReceipt was not issued by minibz_photon_cubature")
+    if receipt.dimension == 2:
+        _require_slab_minibz_photon_receipt(receipt)
+    elif receipt.dimension == 3:
+        _require_bulk_minibz_photon_receipt(receipt)
+    else:
+        raise ValueError(
+            "exact photon receipt dimension must be 2 or 3; got "
+            f"{receipt.dimension!r}")
     return receipt
 
 
 def _require_slab_minibz_photon_receipt(receipt) -> None:
     """Validate every small fact bound into one provider-issued receipt."""
-    if receipt.method != _SLAB_MINIBZ_PHOTON_METHOD:
+    if receipt.dimension != 2 or receipt.method != _SLAB_MINIBZ_PHOTON_METHOD:
         raise ValueError(
             "exact slab photon receipt carries the wrong cubature method")
     if receipt.orders != _SLAB_MINIBZ_PHOTON_ORDERS:
@@ -927,7 +1335,7 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
             "exact slab photon receipt must carry the fixed 16/24/32 ladder")
     bvec = np.asarray(receipt.reciprocal_lattice_rows, dtype=np.float64)
     mini = np.asarray(receipt.mini_lattice_rows, dtype=np.float64)
-    polygon = np.asarray(receipt.polygon_vertices, dtype=np.float64)
+    polygon = np.asarray(receipt.polytope_vertices, dtype=np.float64)
     kg = receipt.kgrid
     if (type(kg) is not tuple or len(kg) != 3
             or any(type(value) is not int or value <= 0 for value in kg)
@@ -939,6 +1347,10 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
             or not np.all(np.isfinite(bvec))
             or not np.all(np.isfinite(mini))
             or not np.all(np.isfinite(polygon))
+            or receipt.polytope_faces != tuple(
+                (index, (index + 1) % int(polygon.shape[0]))
+                for index in range(int(polygon.shape[0])))
+            or receipt.slab_zc is None
             or not np.isfinite(receipt.slab_zc)
             or receipt.slab_zc <= 0.0
             or not np.isfinite(receipt.cell_volume)
@@ -963,9 +1375,9 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
     polygon_area = 0.5 * _polygon_signed_twice_area(polygon)
     lattice_area = abs(_det2(mini[0], mini[1]))
     if (np.any(crosses <= 0.0)
-            or not np.isfinite(receipt.polygon_area)
-            or receipt.polygon_area != polygon_area
-            or receipt.polygon_area != expected_area
+            or not np.isfinite(receipt.minibz_measure)
+            or receipt.minibz_measure != polygon_area
+            or receipt.minibz_measure != expected_area
             or abs(polygon_area - lattice_area) / lattice_area > 2.0e-12):
         raise ValueError(
             "exact slab photon receipt failed its CCW/area identity")
@@ -979,7 +1391,7 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
         raise ValueError(
             "exact slab photon receipt does not contain three complete rules")
     for chunk in receipt.chunks:
-        if (type(chunk) is not _SlabMinibzPhotonChunk
+        if (type(chunk) is not _MinibzPhotonChunk
                 or type(chunk.q_cart) is not np.ndarray
                 or type(chunk.D_raw) is not np.ndarray
                 or type(chunk.sample_weight) is not np.ndarray):
@@ -989,7 +1401,7 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
     if (type(receipt._provider_digest) is not str
             or len(receipt._provider_digest) != 64
             or receipt._provider_digest
-            != _slab_minibz_receipt_digest(receipt)):
+            != _minibz_photon_receipt_digest(receipt)):
         raise ValueError(
             "exact slab photon receipt payload or metadata changed after "
             "provider issuance")
@@ -1009,7 +1421,7 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
         weight = np.asarray(chunk.sample_weight)
         expected_q, expected_weight, defect, centroid = (
             _slab_minibz_polygon_rule(
-                expected_polygon, receipt.polygon_area,
+                expected_polygon, receipt.minibz_measure,
                 _SLAB_MINIBZ_PHOTON_ORDERS[index]))
         expected_D, _ = _photon_D_raw(
             expected_q, kind="slab", zc=receipt.slab_zc)
@@ -1033,6 +1445,112 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
                 or defect > 4.0e-15):
             raise ValueError(
                 "exact slab photon receipt chunk diagnostics do not match "
+                f"the bound order {receipt.orders[index]}")
+
+
+def _require_bulk_minibz_photon_receipt(receipt) -> None:
+    """Validate every small fact bound into one provider-issued bulk rule."""
+    if receipt.method != _BULK_MINIBZ_PHOTON_METHOD:
+        raise ValueError(
+            "exact bulk photon receipt carries the wrong cubature method")
+    if receipt.orders != _BULK_MINIBZ_PHOTON_ORDERS:
+        raise ValueError(
+            "exact bulk photon receipt must carry the fixed 10/16/22 ladder")
+    bvec = np.asarray(receipt.reciprocal_lattice_rows, dtype=np.float64)
+    mini = np.asarray(receipt.mini_lattice_rows, dtype=np.float64)
+    vertices = np.asarray(receipt.polytope_vertices, dtype=np.float64)
+    kg = receipt.kgrid
+    if (type(kg) is not tuple or len(kg) != 3
+            or any(type(value) is not int or value <= 0 for value in kg)
+            or bvec.shape != (3, 3) or mini.shape != (3, 3)
+            or vertices.ndim != 2 or vertices.shape[1] != 3
+            or vertices.shape[0] < 4
+            or not np.all(np.isfinite(bvec))
+            or not np.all(np.isfinite(mini))
+            or not np.all(np.isfinite(vertices))
+            or receipt.slab_zc is not None
+            or not np.isfinite(receipt.minibz_measure)
+            or receipt.minibz_measure <= 0.0
+            or not np.isfinite(receipt.cell_volume)
+            or receipt.cell_volume <= 0.0):
+        raise ValueError(
+            "exact bulk photon receipt carries invalid lattice/polyhedron rows")
+    expected_vertices, expected_faces, expected_mini, expected_measure = (
+        _bulk_minibz_wigner_seitz_polyhedron(bvec, kg))
+    if (not np.array_equal(mini, expected_mini)
+            or not np.array_equal(vertices, expected_vertices)
+            or receipt.polytope_faces != expected_faces
+            or receipt.minibz_measure != expected_measure):
+        raise ValueError(
+            "exact bulk photon receipt geometry differs from the service "
+            "Wigner-Seitz construction")
+
+    n_orders = len(_BULK_MINIBZ_PHOTON_ORDERS)
+    fields = (
+        receipt.physical_counts, receipt.padded_counts,
+        receipt.weight_sum_defects, receipt.weighted_q_centroids,
+        receipt.chunks)
+    if any(len(values) != n_orders for values in fields):
+        raise ValueError(
+            "exact bulk photon receipt does not contain three complete rules")
+    for chunk in receipt.chunks:
+        if (type(chunk) is not _MinibzPhotonChunk
+                or type(chunk.q_cart) is not np.ndarray
+                or type(chunk.D_raw) is not np.ndarray
+                or type(chunk.sample_weight) is not np.ndarray):
+            raise TypeError(
+                "exact bulk photon receipt chunks require the provider's "
+                "exact chunk and ndarray payload types")
+    if (type(receipt._provider_digest) is not str
+            or len(receipt._provider_digest) != 64
+            or receipt._provider_digest
+            != _minibz_photon_receipt_digest(receipt)):
+        raise ValueError(
+            "exact bulk photon receipt payload or metadata changed after "
+            "provider issuance")
+    triangle_count = sum(len(face) for face in expected_faces)
+    expected_physical = tuple(
+        triangle_count * order ** 3
+        for order in _BULK_MINIBZ_PHOTON_ORDERS)
+    expected_padded = (
+        triangle_count * max(_BULK_MINIBZ_PHOTON_ORDERS) ** 3,
+    ) * n_orders
+    if (receipt.physical_counts != expected_physical
+            or receipt.padded_counts != expected_padded):
+        raise ValueError(
+            "exact bulk photon receipt physical/padded solve counts drifted")
+    for index, chunk in enumerate(receipt.chunks):
+        physical = expected_physical[index]
+        padded = expected_padded[index]
+        q = np.asarray(chunk.q_cart)
+        D = np.asarray(chunk.D_raw)
+        weight = np.asarray(chunk.sample_weight)
+        expected_q, expected_weight, defect, centroid = (
+            _bulk_minibz_polyhedron_rule(
+                expected_vertices, expected_faces, expected_measure,
+                _BULK_MINIBZ_PHOTON_ORDERS[index]))
+        expected_D, _ = _photon_D_raw(
+            expected_q, kind="bulk_3d", zc=None)
+        if (chunk.order != receipt.orders[index]
+                or chunk.physical_count != physical
+                or q.shape != (padded, 3)
+                or D.shape != (padded, 4, 4)
+                or weight.shape != (padded,)
+                or q.dtype != np.dtype(np.float64)
+                or D.dtype != np.dtype(np.float64)
+                or weight.dtype != np.dtype(np.float64)
+                or not np.array_equal(q[:physical], expected_q)
+                or not np.array_equal(D[:physical], expected_D)
+                or not np.array_equal(weight[:physical], expected_weight)
+                or np.any(q[physical:] != 0.0)
+                or np.any(D[physical:] != 0.0)
+                or np.any(weight[physical:] != 0.0)
+                or receipt.weight_sum_defects[index] != defect
+                or receipt.weighted_q_centroids[index]
+                != tuple(float(value) for value in centroid)
+                or defect > 8.0e-15):
+            raise ValueError(
+                "exact bulk photon receipt chunk diagnostics do not match "
                 f"the bound order {receipt.orders[index]}")
 
 
@@ -1341,94 +1859,6 @@ def minibz_moment_tensor(
             Kq = K[:n_q]
             M = (Kq * v[:n_q, None]).T @ Kq / float(n_q)
         per_batch.append(M)
-    return np.mean(np.stack(per_batch, axis=0), axis=0)
-
-
-def minibz_transverse_head_avg(
-    shift_cart, dq_batches, *,
-    kind: str,
-    celvol: float,
-    n_kpts: int,
-    q0sph2: float,
-    alpha: float | None = None,
-    zc: float | None = None,
-    analytic_sphere: bool = False,
-    adaptive: bool = True,
-    n_coarse: int = 250_000,
-    eps_K2: float = 1e-30,
-) -> np.ndarray:
-    """Mini-BZ Voronoi CELL AVERAGE of ``v(q) t_ab(q̂)`` — the bare
-    Coulomb-gauge transverse-projector head, ``t_ab(q̂) = δ_ab − q̂_a q̂_b``.
-
-    This is the current-current (bispinor TT) analogue of
-    :func:`minibz_average`'s scalar charge head ``⟨v(q)⟩``: the CHARGE
-    structure factor obeys ``M_mn(q→0) → δ_mn`` so its q=0 exchange slot
-    needs only the bare cell average ``⟨v⟩``, but the CURRENT structure
-    factor ``⟨m|α^i|n⟩`` is finite and generically non-diagonal, and the
-    q=0 slot of the bare transverse propagator carries the DIRECTION-
-    DEPENDENT projector ``t_ab(q̂)`` rather than the identity.  A single
-    grid point cannot represent that — ``t_ab`` has no limit as ``q→0`` —
-    so the correct discrete-BZ-sum replacement for the zeroed q=0 slot is
-    this cell average, exactly as ``⟨v⟩`` replaces the zeroed CC slot.
-
-    For an isotropic 3D cell the closed form is
-    ``⟨t_ab⟩_angle = (2/3) δ_ab`` (the projector's trace is 2 in every
-    direction); for the in-plane mini-BZ of a slab it is
-    ``diag(1/2, 1/2, 1)`` — the measured LORRAX reference value
-    (``docs/BISPINOR_DHFB_DESIGN.md`` §11, bi4 deck: 0.4993, 0.5007,
-    1.0000).  Neither closed form is assumed here; both fall out of the
-    same Monte-Carlo estimator ``minibz_average`` already uses, weighted
-    by ``t_ab`` instead of ``1``.
-
-    ``K2_safe`` guards the SAME single degenerate sample any batch can
-    contain — ``shift_cart = 0`` and ``δq = 0`` exactly never occurs on a
-    continuous Sobol/uniform draw, so this only matters for a
-    pathological/test batch; production draws never hit it.
-
-    ESTIMATOR — same two BGW branches as :func:`minibz_average`, sample
-    for sample:
-
-    * ``|shift|² < TOL`` and ``analytic_sphere`` (3D only) — MC of
-      ``v·t_ab`` OUTSIDE the inscribed sphere (÷ full sample count) plus
-      the closed-form isotropic sphere term.  The angular average of
-      ``t_ab`` over a full sphere is ``(2/3)δ_ab`` for ANY radius, so the
-      sphere's analytic contribution is the scalar Baldereschi-Tosatti
-      term (:func:`minibz_average`) times ``(2/3)δ_ab`` — the same
-      factorisation :func:`minibz_moment_tensor` uses for its own
-      isotropic sphere twin.
-    * else — pure adaptive MC on the first ``n_q`` draws (2D slab heads,
-      whose ``|Q|`` cusp is integrable, always take this branch).
-
-    Returns a real ``(3, 3)`` array, meaned over the replicate batches
-    (the same free error bar as :func:`minibz_average`).  Bare units —
-    NO ``1/celvol`` — matching :func:`minibz_average`'s convention; the
-    caller applies its own volume factor at injection.
-    """
-    shift = np.asarray(shift_cart, dtype=np.float64)
-    len_shift2 = float(np.dot(shift, shift))
-    head_branch = (len_shift2 < 1e-12) and analytic_sphere
-    per_batch = []
-    for dq in dq_batches:
-        dq = np.asarray(dq, dtype=np.float64)
-        n_tot = dq.shape[0]
-        v, len2 = _minibz_kernel_bare(shift, dq, kind=kind,
-                                      alpha=alpha, zc=zc)
-        K = shift[None, :] + dq                       # (N, 3) full momentum
-        t = transverse_projector(K, len2, eps_K2=eps_K2)
-        if head_branch:
-            outside = len2 > q0sph2
-            w = np.where(outside, v, 0.0)
-            T = np.einsum('n,nab->ab', w, t) / float(n_tot)
-            analytic = _analytic_sphere_bare_head(q0sph2, celvol, n_kpts)
-            T = T + np.eye(3) * (2.0 / 3.0) * analytic
-        else:
-            if adaptive and len_shift2 > 1e-12:
-                n_q = int(round(n_coarse * 4.0 * q0sph2 / len_shift2))
-                n_q = max(1, min(n_q, n_tot))
-            else:
-                n_q = n_tot
-            T = np.einsum('n,nab->ab', v[:n_q], t[:n_q]) / float(n_q)
-        per_batch.append(T)
     return np.mean(np.stack(per_batch, axis=0), axis=0)
 
 

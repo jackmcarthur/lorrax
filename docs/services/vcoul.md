@@ -11,8 +11,8 @@ quoted in the extraction and consolidation commit messages.
 Everything LORRAX knows about `v(q+G)` lives here: the three truncation
 schemes (3D bulk `8π/|q+G|²`, the Ismail-Beigi 2D slab, the Wigner-Seitz
 0-D box), the per-q evaluation driver that serves them through one code
-path, and the mini-BZ machinery — Voronoi-cell sampling, the BGW-ported
-cell average with its Baldereschi-Tosatti analytic-sphere branch, and the
+path, and the mini-BZ machinery — exact Wigner–Seitz cell rules, quarantined
+Voronoi/Sobol debug sampling, the BGW-ported analytic-sphere branch, and the
 3D body head that the G-flat V_q path injects at the `argmin |q+G|`
 slots. The BGW `vcoul` text-table reader rides along as `vcoul.bgw_parity`
 because it is this family's external comparison surface, even though that
@@ -26,7 +26,7 @@ loaders and `Meta` stay on the LORRAX side of the door; the service speaks
 ## API
 
 The door is the top-level package; LORRAX imports `vcoul` public names and
-never a submodule. The surface is 44 names; the ones that carry the
+never a submodule. The surface is 49 names; the ones that carry the
 architecture are these.
 
 `gauss_legendre_interval(order, left, right)` is the standalone host owner
@@ -77,19 +77,18 @@ map is the single place the row convention (`U @ bvec`, never
 `U @ bvec.T`) is decidable; the 2026-05..08 head bias lived precisely in a
 private copy of it. `minibz_voronoi_batches`, `minibz_average` and
 `minibz_inscribed_sphere_r2` are the BGW `minibzaverage.f90` port;
-`minibz_moment_tensor` (`⟨v q_a q_b⟩`) and `minibz_transverse_head_avg`
-(`⟨v (δ_ab − q̂_a q̂_b)⟩`, the bare TT head) are the same draw and the same
-two estimator branches with a tensor weight; `slab_minibz_photon_cubature`
-is the exact Wigner–Seitz polygon rule — **the one q→0 cell-average owner
-for the slab**, with two callers: the packed photon head
-(`head_correction.complete_static_slab_photon_q0`) and, since 2026-09-01,
-the scalar charge head `Slab2D.q0_average` (see below).
-The kernel-facing spelling of the TT estimator is
-`Bulk3D`/`Slab2D`.`q0_average_transverse_tensor`, which is what
-`gw/v_q_bispinor.py` calls to value the bare TT Γ-head slot; it is still
-on the Sobol draw and is **not** covered by that owner (registered).
-Physics owner
-for all of them: `docs/theory/four-current-head-corrections.md`; how they
+`minibz_moment_tensor` owns the retained `⟨v q_a q_b⟩` moment.
+`minibz_photon_cubature`
+dispatches on the kernel type to the exact Wigner–Seitz rule: the
+two-dimensional polygon issuer `slab_minibz_photon_cubature` or the
+three-dimensional polyhedron issuer `bulk_minibz_photon_cubature`. Both issue
+one authenticated `MinibzPhotonReceipt`, and the packed photon head consumes
+either through `head_correction.complete_static_photon_q0`. Each rule also
+owns its dimension's scalar charge head (see below). The exact receipt is the
+sole transverse Γ-head provider; the former Sobol tensor estimator and
+per-kernel wrappers were deleted with the alternate insertion.
+Physics owner for these quantities is
+`docs/theory/four-current-head-corrections.md`; how they
 are wired into the four-current pipeline:
 [`architecture/four_current_wiring.md`](../architecture/four_current_wiring.md);
 `wrap_points_to_voronoi` is the jitted Voronoi fold everything shares.
@@ -119,19 +118,21 @@ is finite and *is* the head. `Box0D` refuses `v(q+G)` at `q ≠ 0` rather
 than serving the q=0 answer, because a box deck is Γ-only and a finite-q
 request means the k-grid is wrong, not the kernel.
 
-### One q→0 cell-average rule per dimension, named (2026-09-01)
+### One q→0 cell-average rule per dimension, named
 
-`Slab2D.q0_average` takes a `rule` selection with no silent alternative:
+`Slab2D.q0_average` and `Bulk3D.q0_average` take dimension-specific exact
+rule names with no silent alternative:
 
 | `rule` | what it is | default |
 |---|---|---|
 | `Q0_RULE_EXACT` = `"wigner_seitz_polygon"` | the exact mini-lattice Wigner–Seitz polygon, Γ-to-edge Duffy triangulation, fixed 16/24/32 Gauss–Legendre ladder — `slab_minibz_photon_cubature`'s own receipt | **yes** |
+| `BULK_Q0_RULE_EXACT` = `"wigner_seitz_polyhedron"` | the exact mini-lattice Wigner–Seitz polyhedron, Γ-to-face-tetrahedron Duffy map, fixed 10/16/22 ladder — `bulk_minibz_photon_cubature`'s own receipt | **yes, in bulk** |
 | `Q0_RULE_SOBOL_DEBUG` = `"sobol_debug"` | the superseded scrambled-Sobol Voronoi draw, kept verbatim so its numbers stay reproducible | no; DEBUG only, announces itself |
 
 The scalar charge head and the packed bispinor Γ completion therefore
 reduce the **same** nodes, weights and kernel values: measured on the
 MoS2 3×3 deck geometry, `⟨v⟩` from `Slab2D.q0_average` and `⟨v⟩` from
-`complete_static_slab_photon_q0`'s own `static_slab_photon_head_moment_chunk`
+`complete_static_photon_q0`'s own `static_photon_head_moment_chunk`
 reduction agree to `2.274e-13`, and the screened companion
 `⟨v/(1 − v qᵀSq)⟩` to `0.000e+00`
 (`runs/MoS2/08_bisp_k_head_quadrature_20260901/head_owner_check.json`).
@@ -142,37 +143,54 @@ deterministic-per-seed sampling error on the `|q|` cusp — which was
 claim 0586) and about half the scalar route's disagreement with
 BerkeleyGW (claim 582).
 
+For `sys_dim=3`, `bulk_minibz_photon_cubature` constructs the true Voronoi
+cell of the mini-lattice rows `b_i/N_i`. A centered fundamental
+parallelepiped bounds the WS covering radius by
+`R = 1/2 sum_i |b_i/N_i|`; lattice half-spaces longer than `2R` are therefore
+redundant. The smallest singular value converts that length bound to one
+finite integer-neighbour shell, which is clipped once—there is no open-ended
+search. Each face is triangulated about its center and joined to Gamma. The
+tetrahedral Duffy map has Jacobian `r^2 u |det(v0,v1,v2)|`, so its radial
+`r^2` cancels the bulk `8 pi/q^2` kernel exactly before summation. The fixed
+10/16/22 Gauss–Legendre ladder uses interior nodes only, normalized weights,
+and authenticates the polytope, cell volume, weight-sum/centroid identities,
+physical counts, padded counts, and payload digest in the same receipt family
+as the slab rule.
+
 Consequences a caller sees:
 
 * `nsamples`, `method` and `qmc_reps` are the `sobol_debug` rule's dials
   and select nothing under the production rule, which is exact and has no
   order knob. The deck-facing wrappers (`gw.vcoul.compute_q0_averages`,
   `gw.head_densify.gamma_cell_head_scalar`) still thread their historical
-  values through; on a slab they are inert, and both docstrings say so.
+  values through; under either exact rule they are inert, and both
+  docstrings say so.
 * `analytic_sphere` — the deck key `head_minibz_average` — is **refused**
-  on the slab rather than ignored (`GATE
-  slab_q0_analytic_sphere_unavailable`): it only ever widened the Sobol
-  draw's Voronoi fold, and the exact rule integrates the Wigner–Seitz
-  cell itself. There is no Baldereschi–Tosatti sphere in 2D; the slab
-  head is a `|q|` cusp, not a `1/q²` pole.
-* The production rule prints its ladder certificate once per process —
-  polygon edges, orders, node counts, `⟨v⟩`, and the 24→32 mixed
+  by either production rule rather than ignored (`GATE
+  slab_q0_analytic_sphere_unavailable` / `bulk_q0_debug_rule_required`).
+  The exact rule integrates the whole Wigner–Seitz cell; applying an
+  analytic bare sphere after the nonlinear solve is not the same integral.
+* Each production rule prints its ladder certificate once per process —
+  polygon edges or polyhedron faces, orders, node counts, `⟨v⟩`, `⟨W⟩`,
+  and the final-pair mixed
   absolute+relative error ratio — and REFUSES above 1
   (`GATE slab_q0_polygon_not_converged`, budget `atol 1e-12`,
   `rtol 1e-8`, the same one the packed completion applies to its own
   ladder). The scalar head had no convergence bound before.
-  It also emits the typed `SlabQ0Certificate` through an optional
-  `certificate_fn`. LORRAX's `HeadResolver` sends that receipt to the
-  top-level production reporter, so `gwjax.out` contains `Slab WS cert`
-  with the actual order ladder, physical node counts, polygon edge count,
+  It also emits a typed `SlabQ0Certificate` or `BulkQ0Certificate` through
+  an optional `certificate_fn`. LORRAX's `HeadResolver` sends that receipt
+  to the top-level production reporter, so `gwjax.out` contains `Gamma WS
+  cert` with the dimension, exact method, actual order ladder, physical
+  node counts, polygon-edge or polyhedron-face count,
   evaluation count and worst final error ratio; the run record no longer
   depends on component stdout escaping the production sink.
 
-**`Bulk3D` is unchanged and takes no `rule`.** The polygon construction is
-two-dimensional; there is no 3D owner for it, so the bulk head keeps the
-scrambled-Sobol draw plus the Baldereschi–Tosatti analytic sphere, with
-every dial live. The paragraph below is therefore a statement about the
-3D head and about `sobol_debug`.
+The bulk scalar rule evaluates `⟨v⟩`, anisotropic
+`⟨v/(1-v q^T S q)⟩`, and the static Thomas–Fermi
+`⟨8π/(q²+κ²)⟩` branch on the same polyhedron ladder. Its former `1/q²`
+Sobol estimator has tail index about 1.5 and therefore infinite variance;
+it survives solely under `rule="sobol_debug"`, along with the old optional
+Baldereschi–Tosatti sphere split for historical reproduction.
 
 Explicit requests refuse; only `auto` demotes, and it announces once.
 `method="sobol"` without scipy is a `RuntimeError` naming the fix;

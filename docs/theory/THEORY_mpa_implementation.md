@@ -814,7 +814,6 @@ mpa_pole_batch_size = 4
 sigma_quadrature_eps = 1e-4
 sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
-mpa_sigma_max_nodes = 96
 sigma_regularization_ev = 0.25
 sigma_window_edge_factor = 1.5
 sigma_omega_layout = sharded

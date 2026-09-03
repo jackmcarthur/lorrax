@@ -36,6 +36,10 @@ from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 # comparisons keep the same control while retiring the measured-sector deck
 # dial from the production path.
 _PANE_CONTROL_TARGET_ERROR = 6.5e-4
+# The pane CONTROL's own rank cap.  There is no deck pair ceiling any more
+# (owner ruling 2026-09-02); the control keeps a generous fixed cap only
+# because its legacy planner needs one to size its tables.
+_PANE_CONTROL_MAX_RANK = 4096
 
 
 _DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
@@ -508,7 +512,6 @@ def compute_sigma_c_mpa_omega_grid(
     edge_factor=1.5,
     quadrature_eps,
     quadrature_reduction_seconds,
-    pair_ceiling,
     quadrature_cache_dir,
     omega_grid_step_ry,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
@@ -591,9 +594,9 @@ def compute_sigma_c_mpa_omega_grid(
                 regularization_width_ry=regularization_width_ry,
                 edge_factor=edge_factor,
                 target_error=_PANE_CONTROL_TARGET_ERROR,
-                max_rank=int(pair_ceiling),
+                max_rank=_PANE_CONTROL_MAX_RANK,
                 crossing_max_nodes=max(
-                    CROSSING_NODE_FLOOR, int(pair_ceiling)),
+                    CROSSING_NODE_FLOOR, _PANE_CONTROL_MAX_RANK),
                 omega_grid_step_ry=omega_grid_step_ry,
                 occupation_window_threshold=occupation_window_threshold)
         else:
@@ -602,7 +605,6 @@ def compute_sigma_c_mpa_omega_grid(
                 regularization_width_ry,
                 eps=quadrature_eps,
                 reduction_seconds=quadrature_reduction_seconds,
-                pair_ceiling=pair_ceiling,
                 cache_dir=quadrature_cache_dir,
                 print_fn=print_fn, edge_factor=edge_factor)
         if plan_mode == "panes":

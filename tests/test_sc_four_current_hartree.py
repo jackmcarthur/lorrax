@@ -233,6 +233,45 @@ def test_live_hartree_addition_is_fused_and_donates_the_dead_base():
     assert "donate_argnums=(0,)" in decorator
 
 
+def test_live_hartree_addition_trims_mesh_padding_at_logical_consumer():
+    """A logical SC carry consumes the leading block of a padded sweep."""
+    from gw.sc_iteration import _add_exact_four_current_hartree
+
+    base = jnp.arange(2 * 3 * 3, dtype=jnp.float64).reshape(2, 3, 3)
+    expected = np.asarray(base) + 1.75
+    scalar = jnp.full((2, 4, 4), 2.0, dtype=jnp.float64)
+    transverse = jnp.full((2, 4, 4), -0.25, dtype=jnp.float64)
+    got = np.asarray(_add_exact_four_current_hartree(
+        base, scalar, transverse))
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_live_hartree_addition_rejects_an_undersized_carrier():
+    """Mesh padding may enlarge a sweep carrier; it may never lose bands."""
+    from gw.sc_iteration import _add_exact_four_current_hartree
+
+    base = jnp.zeros((2, 4, 4), dtype=jnp.float64)
+    scalar = jnp.zeros((2, 3, 3), dtype=jnp.float64)
+    transverse = jnp.zeros((2, 4, 4), dtype=jnp.float64)
+    with pytest.raises(ValueError, match="no wider than"):
+        _add_exact_four_current_hartree(base, scalar, transverse)
+
+
+def test_final_rotation_and_hartree_trim_the_same_mesh_padding():
+    """The final U and direct fields meet on the Sigma carrier's width."""
+    from gw.sc_iteration import (_logical_band_rotation,
+                                 _logical_exact_hartree_term)
+
+    sigma = jnp.zeros((2, 6, 6), dtype=jnp.complex128)
+    padded = jnp.zeros((2, 8, 8), dtype=jnp.complex128)
+    assert _logical_band_rotation(
+        padded, sigma, label="test rotation").shape == sigma.shape
+    assert _logical_exact_hartree_term(
+        padded, sigma, label="test Hartree").shape == sigma.shape
+    with pytest.raises(ValueError, match="no wider than"):
+        _logical_band_rotation(sigma, padded, label="test undersized")
+
+
 def test_hartree_omission_receipt_restores_full_output_matrices():
     """The compact internal sentinel cannot masquerade as a final field."""
     from gw.sigma_dispatch import SigmaResult
@@ -261,9 +300,18 @@ def test_live_hartree_is_carried_to_both_final_output_seams():
         encoding="utf-8")
     assert "exact_hartree_dft=exact_hartree_dft" in text
     assert "exact_hartree_dft=state_final.outputs.exact_hartree_dft" in text
-    assert "v_h_scalar = exact_hartree_dft.scalar_dft" in text
-    assert "h_transverse = exact_hartree_dft.transverse_dft" in text
-    assert "sig_h = exact_hartree_dft.total" in text
+    assert "run_sc_driver final scalar Hartree" in text
+    assert "run_sc_driver final transverse Hartree" in text
+    assert "dump_sigma_omega_h5_final scalar Hartree" in text
+    assert "dump_sigma_omega_h5_final transverse" in text
+
+
+def test_bispinor_live_hartree_rebuild_has_a_per_map_record():
+    """The production record, not a quiet loop printer, owns this receipt."""
+    text = (ROOT / "src" / "gw" / "sc_iteration.py").read_text(
+        encoding="utf-8")
+    assert ('_record_sc(\n            inputs,\n'
+            '            f"    density-SC: rebuilt exact scalar"') in text
 
 
 def test_sc_density_applies_rotation_inside_the_scan():

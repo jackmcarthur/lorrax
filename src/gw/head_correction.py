@@ -24,7 +24,7 @@ What the module owns
   :func:`compute_static_head_terms`: the exact band-diagonal ``Sigma^X``,
   ``Sigma^SX``, ``Sigma^(SX-X)``, ``Sigma^COH`` shifts.
 * **Dynamic heads** -- :func:`fit_head_ppm` (GN / HL scalar pole from two
-  samples), :func:`fit_dynamic_slab_photon_cttc_q0` (the GN Hall-on/off CT/TC
+  samples), :func:`fit_dynamic_photon_cttc_q0` (the GN Hall-on/off CT/TC
   completion retained as rank-four factors), and
   :func:`compute_complex_pole_head_sigma_diag` (MPA poles on the stamped
   complex grid).
@@ -37,20 +37,19 @@ What the module owns
   :func:`static_hall_linear_response` (the unique Hall-only CT/TC tensor from
   ``sigma_H``), :func:`canonicalize_static_gauge_q2_tensor` and
   :func:`static_gauge_tensor_residuals` (the in-plane Ward / Hermiticity
-  certificates of a ``(2,2,4,4)`` response), the fixed-size coupled 4x4
-  Dyson/cubature kernel :func:`static_slab_photon_head_moment_chunk`, and
-  :func:`complete_static_slab_photon_q0`, which folds the bounded
+  certificates of a ``(dimension,dimension,4,4)`` response), the fixed-size
+  coupled 4x4 Dyson/cubature kernel :func:`static_photon_head_moment_chunk`,
+  and :func:`complete_static_photon_q0`, which folds the bounded
   :class:`gw.static_gauge_response.StaticPhotonHeadResponse` through the
   headless packed body, solves ``W_h(q) = [1 - D(q) R(q)]^{-1} D(q)`` on the
-  exact slab Wigner-Seitz cubature, and inserts the bare and nine screened
-  rank-4 moments into packed V and W (:func:`gw.photon_layout.
+  exact Wigner-Seitz cubature, and inserts the bare and dimensioned screened
+  Lorentz-rank moments into packed V and W (:func:`gw.photon_layout.
   add_photon_q0_low_rank`).  Its evidence record
-  :class:`StaticSlabPhotonHeadCompletion` carries the numerical
+  :class:`StaticPhotonHeadCompletion` carries the numerical
   certificates and the bounded factor carrier
   :class:`StaticPhotonQ0FactorCarrier` that ``gw.photon_sigma`` uses to
-  attribute Sigma per Lorentz sector.  Slab only: a bulk analytic-sphere
-  completion cannot be added after the nonlinear coupled solve and has no
-  derived integrator.
+  attribute Sigma per Lorentz sector.  Slab and bulk differ only in the
+  authenticated provider receipt; the nonlinear completion algebra is one.
 
 What it does not own
 --------------------
@@ -64,6 +63,7 @@ Hall artifact format (``file_io.static_gauge_head``).
 from __future__ import annotations
 
 import functools
+import itertools
 from dataclasses import dataclass
 import enum
 import os
@@ -161,12 +161,13 @@ _STATIC_GAUGE_WARD_RESIDUAL_MAX = 1.0e-8
 _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX = 1.0e-10
 
 
-def static_hall_linear_response(sigma_H) -> jax.Array:
+def static_hall_linear_response(sigma_H, *, dimension: int) -> jax.Array:
     r"""Return the unique static Hall-only linear CT/TC tensor.
 
     ``Pi_H[0,i](q) = -i epsilon[b,a,i] sigma_H[b] q[a]`` for the persisted
     occupied-bra Berry ``sigma_H``; ``TC = CT^dagger``.
-    The result has shape ``(2,4,4)`` with coordinate index ``a=(x,y)``.
+    The result has shape ``(dimension,4,4)`` with coordinate index
+    ``a=(x,y)`` or ``a=(x,y,z)``.
     Charge is Lorentz row/column zero and currents are columns/rows 1:4.
     Every CC and TT entry is exactly zero; TC is the Hermitian conjugate of
     CT.  A real, separately sourced ``sigma_H`` is required so this function
@@ -184,7 +185,11 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
             "static sigma_H must be explicitly real; refusing to discard an "
             "imaginary component")
     sigma = np.asarray(np.real(sigma_raw), dtype=np.float64)
-    axes = np.eye(3, dtype=np.float64)[:2]
+    dim = int(dimension)
+    if dim not in (2, 3):
+        raise ValueError(
+            f"static Hall response dimension must be 2 or 3; got {dimension}")
+    axes = np.eye(3, dtype=np.float64)[:dim]
     # epsilon[b,a,i] sigma[b] = (sigma x e_a)[i].  The minus is fixed by the
     # live band orientation P=-Delta*D: the direct Adler--Wiser response
     # energy-orders the bra and conjugates the row, so its linear CT
@@ -194,7 +199,7 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
     # tests/test_qsgw_parallel_transport_head.py::
     # test_raw_hall_matches_orbital_cB_owner_and_documented_sign).
     ct = -1j * np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
-    linear = np.zeros((2, 4, 4), dtype=np.complex128)
+    linear = np.zeros((dim, 4, 4), dtype=np.complex128)
     linear[:, 0, 1:] = ct
     linear[:, 1:, 0] = np.conj(ct)
     return jnp.asarray(linear)
@@ -210,13 +215,17 @@ def canonicalize_static_gauge_q2_tensor(S_direct) -> jax.Array:
     independent validation gate fail-closed for arbitrary consumer input.
     """
     S = jnp.asarray(S_direct)
-    if tuple(S.shape) != (2, 2, 4, 4):
-        raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
+    if (S.ndim != 4 or tuple(S.shape[2:]) != (4, 4)
+            or int(S.shape[0]) not in (2, 3)
+            or int(S.shape[1]) != int(S.shape[0])):
+        raise ValueError(
+            "S_direct must be (dimension,dimension,4,4) with dimension "
+            f"2 or 3; got {S.shape}")
     return 0.5 * (S + jnp.swapaxes(S, 0, 1))
 
 
 def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
-    r"""Return algebraic in-plane Ward and Hermiticity residuals of ``S``.
+    r"""Return algebraic periodic-direction Ward/Hermiticity residuals.
 
     The Ward residual is the largest coefficient of the two cubic identities
     ``q_i q_a q_b S[a,b,i,J]=0`` and
@@ -226,8 +235,11 @@ def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
     refused rather than retained as an arbitrary representative.
     """
     S = np.asarray(jax.device_get(S_direct), dtype=np.complex128)
-    if S.shape != (2, 2, 4, 4):
-        raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
+    if (S.ndim != 4 or S.shape[2:] != (4, 4)
+            or S.shape[0] not in (2, 3) or S.shape[1] != S.shape[0]):
+        raise ValueError(
+            "S_direct must be (dimension,dimension,4,4) with dimension "
+            f"2 or 3; got {S.shape}")
     if not np.all(np.isfinite(S)):
         raise ValueError("S_direct contains non-finite values")
     scale = float(np.max(np.abs(S)))
@@ -238,20 +250,22 @@ def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
     lorentz_error = float(np.max(np.abs(
         S - np.conj(np.swapaxes(S, 2, 3)))))
 
-    # Coefficients of (qx^3, qx^2*qy, qx*qy^2, qy^3), retaining the open
-    # opposite Lorentz leg.  Current x/y are Lorentz indices 1/2.
-    left = np.stack((
-        S[0, 0, 1, :],
-        S[0, 1, 1, :] + S[1, 0, 1, :] + S[0, 0, 2, :],
-        S[1, 1, 1, :] + S[0, 1, 2, :] + S[1, 0, 2, :],
-        S[1, 1, 2, :],
-    ), axis=0)
-    right = np.stack((
-        S[0, 0, :, 1],
-        S[0, 1, :, 1] + S[1, 0, :, 1] + S[0, 0, :, 2],
-        S[1, 1, :, 1] + S[0, 1, :, 2] + S[1, 0, :, 2],
-        S[1, 1, :, 2],
-    ), axis=0)
+    # Each unordered degree-three Cartesian monomial receives all distinct
+    # assignments of its indices to (current, first q, second q).  This is
+    # the dimension-general coefficient of q_i q_a q_b S[a,b,i,J].
+    dim = int(S.shape[0])
+    left_rows = []
+    right_rows = []
+    for monomial in itertools.combinations_with_replacement(range(dim), 3):
+        permutations = sorted(set(itertools.permutations(monomial)))
+        left_rows.append(sum(
+            (S[a, b, i + 1, :] for i, a, b in permutations),
+            start=np.zeros(4, dtype=np.complex128)))
+        right_rows.append(sum(
+            (S[a, b, :, i + 1] for i, a, b in permutations),
+            start=np.zeros(4, dtype=np.complex128)))
+    left = np.stack(left_rows, axis=0)
+    right = np.stack(right_rows, axis=0)
     ward_error = float(max(np.max(np.abs(left)), np.max(np.abs(right))))
     return ward_error / scale, max(coordinate_error, lorentz_error) / scale
 
@@ -939,7 +953,7 @@ def small_head_wing_halves_sharded(
 ) -> tuple[jax.Array, jax.Array]:
     r"""Contract each small photon wing through one resident body ``W``.
 
-    For the two in-plane directions and four Lorentz fields this returns
+    For the receipt's periodic directions and four Lorentz fields this returns
 
     ``YW[a,A,J] = sum_I Y[a,A,I] W[I,J]`` and
     ``WZ[b,I,B] = sum_J W[I,J] Z[b,J,B]``.
@@ -951,10 +965,17 @@ def small_head_wing_halves_sharded(
     """
     if Y_x.ndim != 3 or W_body_xy.ndim != 2 or Z_y.ndim != 3:
         raise ValueError(
-            "small photon-head halves require Y=(2,4,N), W=(N,N), "
-            f"Z=(2,N,4); got {Y_x.shape}, {W_body_xy.shape}, {Z_y.shape}")
+            "small photon-head halves require Y=(dimension,4,N), W=(N,N), "
+            "Z=(dimension,N,4); got "
+            f"{Y_x.shape}, {W_body_xy.shape}, {Z_y.shape}")
     n_body = int(W_body_xy.shape[0])
-    expected = ((2, 4, n_body), (n_body, n_body), (2, n_body, 4))
+    dimension = int(Y_x.shape[0])
+    if dimension not in (2, 3):
+        raise ValueError(
+            f"small photon-head direction extent must be 2 or 3; got "
+            f"{dimension}")
+    expected = ((dimension, 4, n_body), (n_body, n_body),
+                (dimension, n_body, 4))
     if (tuple(Y_x.shape), tuple(W_body_xy.shape), tuple(Z_y.shape)) != expected:
         raise ValueError(
             "small photon-head half-contraction extents do not compose: "
@@ -978,7 +999,7 @@ def small_head_wing_halves_sharded(
 
 
 @jax.jit
-def _static_slab_photon_head_moment_chunk(
+def _static_photon_head_moment_chunk(
     q_cart: jax.Array,
     D_raw: jax.Array,
     H_hall: jax.Array,
@@ -988,17 +1009,18 @@ def _static_slab_photon_head_moment_chunk(
 ):
     r"""Accumulate one fixed-size chunk of the coupled small-head solve.
 
-    ``R(q) = q_a H_hall[a] + q_a q_b S_quadratic[a,b]`` uses the two
-    periodic in-plane Cartesian coordinates of a slab.  ``H_hall`` is private
+    ``R(q) = q_a H_hall[a] + q_a q_b S_quadratic[a,b]`` uses the receipt's
+    two or three periodic Cartesian coordinates.  ``H_hall`` is private
     to this numerical kernel: the public entry derives it from ``sigma_H`` so
     an arbitrary linear CT/TC matrix cannot enter production.  For every valid
     mini-BZ sample this evaluates the *coupled* four-field Dyson equation
 
     ``W_h(q) = [I - D(q) R(q)]^-1 D(q)``
 
-    before averaging.  The returned ``(1,qx,qy)`` moments are sufficient to
-    rebuild the head, both single wings, and the double-wing body update as
-    repeated rank-four outer products; no sample-by-centroid array exists.
+    before averaging.  The returned ``(1,q_1,...,q_dimension)`` moments are
+    sufficient to rebuild the head, both single wings, and the double-wing
+    body update as repeated Lorentz-rank outer products; no
+    sample-by-centroid array exists.
 
     This is the sole sample-sized graph.  The vcoul provider zero-pads its
     final chunk to the same fixed size and passes ``valid_count``, preventing
@@ -1009,10 +1031,12 @@ def _static_slab_photon_head_moment_chunk(
     D = jnp.asarray(D_raw, dtype=jnp.complex128)
     H = jnp.asarray(H_hall, dtype=jnp.complex128)
     S = jnp.asarray(S_quadratic, dtype=jnp.complex128)
-    qxy = q[:, :2]
+    dimension = S.shape[0]
+    q_periodic = q[:, :dimension]
     R = (
-        jnp.einsum("sa,aij->sij", qxy, H, optimize=True)
-        + jnp.einsum("sa,sb,abij->sij", qxy, qxy, S, optimize=True)
+        jnp.einsum("sa,aij->sij", q_periodic, H, optimize=True)
+        + jnp.einsum(
+            "sa,sb,abij->sij", q_periodic, q_periodic, S, optimize=True)
     )
     identity = jnp.eye(4, dtype=jnp.complex128)[None, :, :]
     lhs = identity - jnp.einsum("sik,skj->sij", D, R, optimize=True)
@@ -1022,7 +1046,7 @@ def _static_slab_photon_head_moment_chunk(
     weight = jnp.where(
         valid, jnp.asarray(sample_weight, dtype=jnp.float64), 0.0)
     basis = jnp.concatenate(
-        (jnp.ones((q.shape[0], 1), dtype=jnp.float64), qxy), axis=1)
+        (jnp.ones((q.shape[0], 1), dtype=jnp.float64), q_periodic), axis=1)
     moments = jnp.einsum(
         "s,su,sij,sv->uvij", weight, basis, W_head, basis,
         optimize=True)
@@ -1059,7 +1083,7 @@ def _static_slab_photon_head_moment_chunk(
             max_condition, max_conditioned_backward)
 
 
-def static_slab_photon_head_moment_chunk(
+def static_photon_head_moment_chunk(
     q_cart,
     D_raw,
     sigma_H,
@@ -1067,18 +1091,18 @@ def static_slab_photon_head_moment_chunk(
     valid_count,
     sample_weight,
 ):
-    """Validated entry to the fixed-size static slab photon-head graph.
+    """Validated entry to the fixed-size static photon-head graph.
 
-    Parameters follow :func:`_static_slab_photon_head_moment_chunk`:
+    Parameters follow :func:`_static_photon_head_moment_chunk`:
     ``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
     units (no cell-volume factor), ``sigma_H`` is the separately sourced real
-    Hall pseudovector, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
-    normalizes each provider-issued weighted rule and applies the one and only
+    Hall pseudovector, and ``S_quadratic`` is ``(d,d,4,4)`` for ``d=2`` or
+    ``d=3``.  The caller normalizes each provider-issued weighted rule and
+    applies the one and only
     ``1/Vcell`` while rebuilding the packed q=Gamma row.
 
-    The function is intentionally slab/static-only.  A bulk analytic-sphere
-    correction cannot be added after this nonlinear coupled solve, and must
-    have its own derived integrator before that policy is admitted.
+    The exact mini-BZ provider owns the dimension; no analytic-sphere term is
+    attached after this nonlinear coupled solve.
     """
     q_shape = tuple(np.shape(q_cart))
     d_shape = tuple(np.shape(D_raw))
@@ -1089,10 +1113,13 @@ def static_slab_photon_head_moment_chunk(
     expected_D = (q_shape[0], 4, 4)
     if d_shape != expected_D:
         raise ValueError(f"D_raw must be {expected_D}, got {d_shape}")
-    if sigma_shape != (3,) or S_shape != (2, 2, 4, 4):
+    if (sigma_shape != (3,) or len(S_shape) != 4
+            or S_shape[0] not in (2, 3) or S_shape[1] != S_shape[0]
+            or S_shape[2:] != (4, 4)):
         raise ValueError(
-            "static slab response requires sigma_H=(3,) and "
-            f"S_quadratic=(2,2,4,4); got {sigma_shape}/{S_shape}")
+            "static response requires sigma_H=(3,) and "
+            "S_quadratic=(dimension,dimension,4,4), dimension in (2,3); "
+            f"got {sigma_shape}/{S_shape}")
     n_valid = int(valid_count)
     if not 0 <= n_valid <= q_shape[0]:
         raise ValueError(
@@ -1106,12 +1133,13 @@ def static_slab_photon_head_moment_chunk(
         raise ValueError(
             "sample_weight must be finite and nonnegative on valid rows, "
             "with exact zeros on padded rows")
-    H_hall = static_hall_linear_response(sigma_H)
+    H_hall = static_hall_linear_response(
+        sigma_H, dimension=int(S_shape[0]))
     S_sharding = getattr(S_quadratic, "sharding", None)
     if isinstance(S_sharding, NamedSharding):
         H_hall = device_put_process_local(
             H_hall, NamedSharding(S_sharding.mesh, P()))
-    result = _static_slab_photon_head_moment_chunk(
+    result = _static_photon_head_moment_chunk(
         q_cart, D_raw, H_hall, S_quadratic,
         jnp.asarray(n_valid, dtype=jnp.int32), jnp.asarray(weight))
     return result
@@ -1121,22 +1149,51 @@ def static_slab_photon_head_moment_chunk(
 class StaticPhotonQ0FactorCarrier:
     """Bounded factors for the exact q=0 updates inserted into V and W.
 
-    The bare pair and nine screened pairs are the completed factors, after
-    the coupled 4x4 Dyson/cubature transaction.  They are retained only so
-    the incumbent Sigma contraction can attribute the FINAL Lorentz blocks
-    linearly; they are not a second response model or a packed-body copy.
+    Charge-present completion carries one bare pair plus the dimensioned
+    screened pairs completed by the coupled 4x4 Dyson/cubature transaction.
+    Absent-charge dynamic completion carries the bare pair once for V and once
+    as the named logical ``W_CURRENT = V_CURRENT`` factor.  They are retained
+    only so the Sigma contraction can attribute final Lorentz blocks linearly;
+    they are not a second response model or a packed-body copy.
     """
 
     bare_pair: tuple[jax.Array, jax.Array]
     screened_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+    dimension: int
+    charge_block_state: str
 
     def __post_init__(self) -> None:
         if len(self.bare_pair) != 2:
             raise ValueError("static photon bare q=0 carrier needs one pair")
-        if len(self.screened_pairs) != 9:
+        dimension = int(self.dimension)
+        if dimension not in (2, 3):
             raise ValueError(
-                "static photon screened q=0 carrier needs the complete "
-                f"3x3 moment grid (9 pairs); got {len(self.screened_pairs)}")
+                f"static photon factor dimension must be 2 or 3; got "
+                f"{dimension}")
+        if self.charge_block_state not in STATIC_PHOTON_CHARGE_BLOCK_STATES:
+            raise ValueError(
+                "static photon q=0 carrier has invalid charge-block state "
+                f"{self.charge_block_state!r}")
+        expected = (
+            (1 + dimension) ** 2
+            if self.charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT
+            else 1)
+        if len(self.screened_pairs) != expected:
+            raise ValueError(
+                "static photon q=0 carrier has the wrong screened-factor "
+                f"count for charge_block_state={self.charge_block_state!r}: "
+                f"expected {expected}, got {len(self.screened_pairs)}")
+
+
+#: Named packed-operator layout states.  The absent state is not a zero CC
+#: tile: no W carrier exists in that route.  The scalar dynamic Sigma owner
+#: carries W_00(omega), while photon_sigma aliases W_CURRENT to V_CURRENT.
+STATIC_PHOTON_CHARGE_BLOCK_PRESENT = "present_static"
+STATIC_PHOTON_CHARGE_BLOCK_ABSENT = "absent_dynamic_scalar_owner"
+STATIC_PHOTON_CHARGE_BLOCK_STATES = (
+    STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
+    STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+)
 
 
 @dataclass(frozen=True)
@@ -1184,34 +1241,130 @@ class FaradayHeadPPMFactorCarrier:
 
 
 @dataclass(frozen=True)
-class StaticSlabPhotonHeadCompletion:
-    """Evidence and bounded runtime carrier for one slab q=0 completion."""
+class StaticPhotonHeadCompletion:
+    """Evidence and bounded runtime carrier for one q=0 completion."""
 
     bare_D_mean: np.ndarray
-    screened_moments: np.ndarray
+    screened_moments: np.ndarray | None
     cubature_receipt: object
     observed_physical_counts: tuple[int, int, int]
-    observed_padded_solve_counts: tuple[int, int, int]
-    max_backward_residual: float
-    min_dyson_singular_value: float
-    max_dyson_condition_number: float
-    max_dyson_forward_error_bound: float
+    observed_padded_solve_counts: tuple[int, int, int] | None
+    max_backward_residual: float | None
+    min_dyson_singular_value: float | None
+    max_dyson_condition_number: float | None
+    max_dyson_forward_error_bound: float | None
     mixed_scale_qstar: float
     mixed_convergence_error_ratios: tuple[float, float]
-    ward_residual: float
-    hermiticity_residual: float
+    ward_residual: float | None
+    hermiticity_residual: float | None
     #: The Hall pseudovector that entered ``R(q)`` (bohr^-1) and where it
     #: came from (the authenticated artifact producer, or the announced
     #: ``sigma_H = 0`` default when no ``static_gauge_hall_file`` exists).
     sigma_H: np.ndarray
     hall_source: str
+    charge_block_state: str
     q0_factors: StaticPhotonQ0FactorCarrier
     faraday_ppm: FaradayHeadPPMFactorCarrier | None = None
 
 
+_CHARGE_HEAD_NORM_KERNEL_CACHE: dict[tuple, object] = {}
+
+
+def _charge_head_insertion_norm_kernel(mesh_xy: Mesh, wfns, n_occ: int):
+    """Return the cached scalar reduction for ``sum_mu g0_mu |psi|^2``."""
+    layout = str(getattr(wfns, "layout", "legacy"))
+    if layout == "face":
+        psi = wfns.psi_mun
+        spec = P(None, None, "x", "y")
+    elif layout == "legacy":
+        psi = wfns.psi_xn
+        spec = P(None, None, "x", None)
+    else:
+        raise ValueError(
+            "charge head insertion normalisation requires wavefunction "
+            f"layout 'legacy' or 'face'; got {layout!r}")
+    if psi is None or int(n_occ) <= 0 or int(n_occ) > int(psi.shape[-1]):
+        raise ValueError(
+            "charge head insertion normalisation needs a nonempty occupied "
+            f"window inside the wavefunction carrier; n_occ={n_occ}, "
+            f"psi_shape={getattr(psi, 'shape', None)}")
+    key = (layout, id(mesh_xy), tuple(int(v) for v in psi.shape), int(n_occ))
+    hit = _CHARGE_HEAD_NORM_KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = tuple(mesh_xy.axis_names)
+
+    if layout == "face":
+        def _local(g0_local, psi_local):
+            values = jax.lax.psum(
+                jnp.einsum(
+                    "m,ksmn,ksmn->kn", g0_local, jnp.conj(psi_local),
+                    psi_local, optimize=True),
+                ax_x)
+            n_local = int(psi_local.shape[-1])
+            global_n = (
+                jax.lax.axis_index(ax_y) * n_local
+                + jnp.arange(n_local, dtype=jnp.int32))
+            mask = global_n < int(n_occ)
+            real = jnp.real(values)
+            count = jax.lax.psum(
+                jnp.asarray(values.shape[0], dtype=jnp.float64)
+                * jnp.sum(mask.astype(jnp.float64)), ax_y)
+            total = jax.lax.psum(jnp.sum(jnp.where(mask[None], real, 0.0)), ax_y)
+            total2 = jax.lax.psum(
+                jnp.sum(jnp.where(mask[None], real * real, 0.0)), ax_y)
+            minimum = jax.lax.pmin(
+                jnp.min(jnp.where(mask[None], real, jnp.inf)), ax_y)
+            maximum = jax.lax.pmax(
+                jnp.max(jnp.where(mask[None], real, -jnp.inf)), ax_y)
+            imag_max = jax.lax.pmax(
+                jnp.max(jnp.where(
+                    mask[None], jnp.abs(jnp.imag(values)), 0.0)), ax_y)
+            mean = total / count
+            std = jnp.sqrt(jnp.maximum(total2 / count - mean * mean, 0.0))
+            return jnp.stack((mean, std, minimum, maximum, imag_max))
+    else:
+        def _local(g0_local, psi_local):
+            values = jax.lax.psum(
+                jnp.einsum(
+                    "m,ksmn,ksmn->kn", g0_local, jnp.conj(psi_local),
+                    psi_local, optimize=True),
+                ax_x)[:, :int(n_occ)]
+            real = jnp.real(values)
+            return jnp.stack((
+                jnp.mean(real), jnp.std(real), jnp.min(real), jnp.max(real),
+                jnp.max(jnp.abs(jnp.imag(values)))))
+
+    kernel = jax.jit(shard_map(
+        _local, mesh=mesh_xy,
+        in_specs=(P("x"), spec), out_specs=P(), check_vma=False))
+    _CHARGE_HEAD_NORM_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def charge_head_insertion_norm_stats(wfns, g0_X, *, mesh_xy: Mesh):
+    r"""Measure the occupied-state literal-Gamma insertion ``N_n``.
+
+    ``N_kn = sum_mu zeta_Gamma(mu,G=0) sum_s |psi_kns(r_mu)|^2``.
+    Only the small five-number reduction is replicated; neither wavefunction
+    face is gathered.  The result is ``(mean, std, min, max, max_abs_imag)``
+    over every occupied ``(k,n)`` state.
+    """
+    n_occ = int(wfns.slices.occ.stop)
+    values = _charge_head_insertion_norm_kernel(
+        mesh_xy, wfns, n_occ)(g0_X, (
+            wfns.psi_mun if wfns.layout == "face" else wfns.psi_xn))
+    host = np.asarray(jax.device_get(values), dtype=np.float64)
+    if host.shape != (5,) or not np.all(np.isfinite(host)):
+        raise ValueError(
+            "GATE photon_head_insertion_norm_nonfinite: occupied-state "
+            f"Gamma insertion statistics are invalid; got {host!r}")
+    return tuple(float(v) for v in host)
+
+
 _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET = 1.0e-9
-_STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL = 1.0e-8
-_STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL = 1.0e-12
+_STATIC_PHOTON_CELL_CONVERGENCE_RTOL = 1.0e-8
+_STATIC_PHOTON_CELL_CONVERGENCE_ATOL = 1.0e-12
 
 
 def _finite_static_photon_values(values, *, gate: str, label: str):
@@ -1233,7 +1386,7 @@ def _static_photon_mixed_error_ratio(previous_blocks, current_blocks) -> float:
     """Return one finite mixed-error maximum without Python NaN swallowing."""
     if len(previous_blocks) != len(current_blocks) or not previous_blocks:
         raise ValueError(
-            "GATE static_photon_polygon_nonfinite: cubature block lists "
+            "GATE static_photon_cell_nonfinite: cubature block lists "
             "cannot be compared.\n"
             f"  got:  previous_blocks = {len(previous_blocks)}, "
             f"current_blocks = {len(current_blocks)}\n"
@@ -1247,16 +1400,16 @@ def _static_photon_mixed_error_ratio(previous_blocks, current_blocks) -> float:
         norms = _finite_static_photon_values(
             (delta, float(np.linalg.norm(previous)),
              float(np.linalg.norm(current))),
-            gate="static_photon_polygon_nonfinite",
+            gate="static_photon_cell_nonfinite",
             label=f"cubature block {block_index} norms")
         scale = float(np.max(norms[1:]))
         limit = (
-            _STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL
-            + _STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL * scale)
+            _STATIC_PHOTON_CELL_CONVERGENCE_ATOL
+            + _STATIC_PHOTON_CELL_CONVERGENCE_RTOL * scale)
         ratio = delta / limit
         ratios.append(ratio)
     ratio_array = _finite_static_photon_values(
-        ratios, gate="static_photon_polygon_nonfinite",
+        ratios, gate="static_photon_cell_nonfinite",
         label="cubature mixed-error ratios")
     return float(np.max(ratio_array))
 
@@ -1366,81 +1519,233 @@ def _require_static_photon_numerical_certificate(
             f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}\n"
             "  why:  inserting a head whose rigorous error exceeds the "
             "budget would publish uncertified q=0 matrix elements")
+    _require_static_photon_polygon_certificate(mixed_error_ratios)
+    return max_forward_error_bound
+
+
+def _require_static_photon_polygon_certificate(mixed_error_ratios) -> None:
+    """Require convergence of the provider's fixed 16/24/32 ladder."""
     convergence = np.asarray(mixed_error_ratios, dtype=np.float64)
     if (convergence.shape != (2,) or not np.all(np.isfinite(convergence))):
         raise ValueError(
-            "GATE static_photon_polygon_nonfinite: the fixed cubature "
+            "GATE static_photon_cell_nonfinite: the fixed cubature "
             "ladder produced invalid convergence diagnostics.\n"
             f"  got:  convergence shape = {convergence.shape}, values = "
             f"{convergence.tolist()}\n"
-            "  want: two finite error ratios for 16/24/32 orders\n"
+            "  want: two finite error ratios for the provider's three orders\n"
             "  why:  without both adjacent-order ratios the fixed ladder "
             "cannot certify convergence")
     if convergence[-1] > 1.0:
         raise ValueError(
-            "GATE static_photon_polygon_not_converged: the final polygon "
+            "GATE static_photon_cell_not_converged: the final Wigner-Seitz "
             "Duffy--Gauss order pair did not converge every dimensionless "
             "bare/screened moment under the mixed absolute+relative budget: "
             f"error_ratio={convergence[-1]:.3e} > 1.  The provider ladder "
             "is fixed; refusing insertion rather than accepting a caller "
             "dial.")
-    return max_forward_error_bound
 
 
-def complete_static_slab_photon_q0(
+def _insert_bare_static_photon_q0(
+    V_packed,
+    layout,
+    g0_X,
+    g0_Y,
+    D_mean,
+    cell_volume,
+    *,
+    mesh_xy,
+):
+    """Insert the one bare ``<D>`` factor and return its bounded pair."""
+    from .photon_layout import add_photon_q0_low_rank
+
+    dtype = V_packed.dtype
+    sh_x = NamedSharding(mesh_xy, P(None, "x"))
+    sh_y = NamedSharding(mesh_xy, P(None, "y"))
+    volume = jnp.asarray(float(cell_volume), dtype=jnp.float64)
+    with mesh_xy:
+        left_bare = jax.lax.with_sharding_constraint(
+            jnp.conj(g0_X).astype(dtype), sh_x)
+        right_bare = jax.lax.with_sharding_constraint(
+            jnp.einsum(
+                "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
+                optimize=True) / volume,
+            sh_y)
+    V_packed = add_photon_q0_low_rank(
+        V_packed, layout, mesh_xy,
+        left_rows_X=left_bare, right_rows_Y=right_bare)
+    return V_packed, (left_bare, right_bare)
+
+
+def complete_static_photon_q0(
     V_packed: jax.Array,
-    W_packed: jax.Array,
+    W_packed: jax.Array | None,
     response,
     g0_X: jax.Array,
     g0_Y: jax.Array,
     cubature_receipt,
     *,
     mesh_xy: Mesh,
-) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
+    charge_block_state: str,
+    layout=None,
+) -> tuple[jax.Array, jax.Array | None, StaticPhotonHeadCompletion]:
     r"""Complete bare and screened packed photon operators in the Γ cell.
 
-    ``response`` is the sealed bounded
+    With ``charge_block_state = present_static``, ``response`` is the sealed
+    bounded
     :class:`gw.static_gauge_response.StaticPhotonHeadResponse` (charge
     ``S^{00}``, charge wings, ``sigma_H``); the kernel below constructs the
     Hall tensor from ``sigma_H`` itself, so no arbitrary linear CT/TC matrix
     can enter.  ``cubature_receipt`` is the sole vcoul provider's
     authenticated exact Wigner--Seitz/Duffy ladder and the sole cell-volume
     source for the completion.  Each sample first solves the coupled
-    four-field head Dyson equation; only its ``(1,qx,qy)`` moments survive.
-    The packed body is then updated by one bare and nine screened rank-four
+    four-field head Dyson equation; only its
+    ``(1,q_1,...,q_dimension)`` moments survive.  The packed body is then
+    updated by one bare and ``(1 + dimension)^2`` screened Lorentz-factor
     outer products.  No sample-by-centroid tensor or second photon packing
-    convention exists.
+    convention exists.  With ``absent_dynamic_scalar_owner``, the dynamic
+    scalar Sigma path owns ``W_00(omega)`` and the packed operator has no CC
+    block or W carrier.  This same function then averages and inserts only
+    the bare ``<D>`` factor; its current-sector W is the named identity
+    ``W_CURRENT = V_CURRENT`` consumed by :mod:`gw.photon_sigma`.  No charge
+    S/wing fold or coupled Dyson solve is evaluated in that state.
     """
-    from .photon_layout import (
-        MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
+    from .photon_layout import N_LORENTZ, add_photon_q0_low_rank
     from .static_gauge_response import require_static_photon_head_response
 
-    response = require_static_photon_head_response(response, mesh_xy)
-    layout = response.layout
+    if charge_block_state not in STATIC_PHOTON_CHARGE_BLOCK_STATES:
+        raise ValueError(
+            "static photon completion requires charge_block_state in "
+            f"{STATIC_PHOTON_CHARGE_BLOCK_STATES}; got "
+            f"{charge_block_state!r}")
+    charge_present = (
+        charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
+    if charge_present:
+        if layout is not None:
+            raise ValueError(
+                "present static charge completion takes its layout from the "
+                "sealed response; an external layout would have two owners")
+        response = require_static_photon_head_response(response, mesh_xy)
+        layout = response.layout
+        if W_packed is None:
+            raise ValueError(
+                "present static charge completion requires a packed W body")
+    else:
+        if response is not None or W_packed is not None or layout is None:
+            raise ValueError(
+                "absent dynamic charge completion requires response=None, "
+                "W_packed=None and an explicit photon layout")
+        layout.assert_mesh(mesh_xy)
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
     if (tuple(V_packed.shape) != packed_shape
-            or tuple(W_packed.shape) != packed_shape):
+            or (W_packed is not None and tuple(W_packed.shape) != packed_shape)):
         raise ValueError(
-            "coupled photon head requires equal packed V/W bodies; got "
-            f"V={V_packed.shape}, W={W_packed.shape}, expected={packed_shape}")
-    factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
+            "static photon head received incompatible packed bodies; got "
+            f"V={V_packed.shape}, "
+            f"W={None if W_packed is None else W_packed.shape}, "
+            f"expected={packed_shape}")
+    factor_shape = (N_LORENTZ, layout.packed_extent)
     if tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape:
         raise ValueError(
             f"packed Γ vectors must both be {factor_shape}; got "
             f"{g0_X.shape}/{g0_Y.shape}")
-    from vcoul import validate_slab_minibz_photon_receipt
-    cubature_receipt = validate_slab_minibz_photon_receipt(
-        cubature_receipt)
+    from vcoul import validate_minibz_photon_receipt
+    cubature_receipt = validate_minibz_photon_receipt(cubature_receipt)
+    dimension = int(cubature_receipt.dimension)
+    if charge_present and int(response.dimension) != dimension:
+        raise ValueError(
+            "photon response/cubature dimensions differ: "
+            f"response={response.dimension}, receipt={dimension}")
+    basis_size = layout.q0_basis_size(dimension)
     cell_volume = float(cubature_receipt.cell_volume)
+    qstar = float(cubature_receipt.minibz_measure) ** (1.0 / dimension)
 
-    # The headless Gamma body remains resident and 2-D sharded.  Four calls
-    # reuse the sole bounded Schur-fold graph; broadcasting W over the two
-    # coordinate axes would create four body views in one executable.
+    if not charge_present:
+        # The provider already evaluated the bare Coulomb-gauge propagator
+        # D(q) on every fixed-ladder point.  Average that exact carrier only;
+        # there is deliberately no response object from which a charge fold
+        # could be performed in this layout state.
+        per_order_D = []
+        observed_physical = []
+        for chunk in cubature_receipt.chunks:
+            D_raw = np.asarray(chunk.D_raw, dtype=np.complex128)
+            weight = np.asarray(chunk.sample_weight, dtype=np.float64)
+            n_valid = int(chunk.physical_count)
+            if (D_raw.ndim != 3 or D_raw.shape[1:] != (4, 4)
+                    or D_raw.shape[0] != weight.shape[0]
+                    or not 0 < n_valid <= D_raw.shape[0]):
+                raise ValueError(
+                    "GATE static_photon_bare_cubature_shape: provider bare "
+                    "D rows do not match the authenticated cubature carrier.\n"
+                    f"  got: D={D_raw.shape}, weight={weight.shape}, "
+                    f"physical_count={n_valid}\n"
+                    "  want: padded (n,4,4) D, (n,) weights and 0<count<=n\n"
+                    "  why: the bare Gamma average cannot infer or truncate "
+                    "provider rows")
+            measure = float(np.sum(weight[:n_valid]))
+            if (not np.isfinite(measure) or measure <= 0.0
+                    or np.any(weight[n_valid:] != 0.0)):
+                raise ValueError(
+                    "provider-issued photon cubature has invalid bare-D "
+                    "weights or padded-row support")
+            per_order_D.append(
+                np.einsum(
+                    "q,qAB->AB", weight[:n_valid], D_raw[:n_valid],
+                    optimize=True) / measure)
+            observed_physical.append(n_valid)
+        if tuple(observed_physical) != cubature_receipt.physical_counts:
+            raise RuntimeError(
+                "executed bare photon counts differ from the vcoul receipt: "
+                f"physical={tuple(observed_physical)}/"
+                f"{cubature_receipt.physical_counts}")
+        mixed_error_ratios = tuple(
+            _static_photon_mixed_error_ratio(
+                [per_order_D[index - 1]], [per_order_D[index]])
+            for index in range(1, len(per_order_D)))
+        D_mean = per_order_D[-1]
+        if not np.all(np.isfinite(D_mean)):
+            raise ValueError(
+                "GATE static_photon_polygon_nonfinite: the bare <D> "
+                "cubature average contains nonfinite values")
+        _require_static_photon_polygon_certificate(mixed_error_ratios)
+        V_packed, bare_pair = _insert_bare_static_photon_q0(
+            V_packed, layout, g0_X, g0_Y, D_mean, cell_volume,
+            mesh_xy=mesh_xy)
+        V_packed.block_until_ready()
+        evidence = StaticPhotonHeadCompletion(
+            bare_D_mean=D_mean,
+            screened_moments=None,
+            cubature_receipt=cubature_receipt,
+            observed_physical_counts=tuple(observed_physical),
+            observed_padded_solve_counts=None,
+            max_backward_residual=None,
+            min_dyson_singular_value=None,
+            max_dyson_condition_number=None,
+            max_dyson_forward_error_bound=None,
+            mixed_scale_qstar=qstar,
+            mixed_convergence_error_ratios=mixed_error_ratios,
+            ward_residual=None,
+            hermiticity_residual=None,
+            sigma_H=np.zeros(3, dtype=np.float64),
+            hall_source=(
+                "not consumed: bare_transverse declares W_CT=0"),
+            charge_block_state=charge_block_state,
+            q0_factors=StaticPhotonQ0FactorCarrier(
+                bare_pair=bare_pair,
+                # Logical W_CURRENT is exactly V_CURRENT in the bare family.
+                screened_pairs=(bare_pair,),
+                dimension=dimension,
+                charge_block_state=charge_block_state),
+        )
+        return V_packed, None, evidence
+
+    # The headless Gamma body remains resident and 2-D sharded.  These bounded
+    # calls reuse the sole Schur-fold graph; broadcasting W over coordinate
+    # axes would create multiple body views in one executable.
     W_gamma = W_packed[0]
     S_effective = response.S_direct
-    for a in range(2):
-        for b in range(2):
+    for a in range(dimension):
+        for b in range(dimension):
             folded = fold_small_head_wings_sharded(
                 response.S_direct[a, b],
                 response.Y_x[a], W_gamma, response.Z_y[b],
@@ -1488,7 +1793,7 @@ def complete_static_slab_photon_q0(
         n_valid = int(chunk.physical_count)
         (moments, bare_sum, returned_count, backward, chunk_sigma_min,
          chunk_condition_max,
-         chunk_conditioned_backward) = static_slab_photon_head_moment_chunk(
+         chunk_conditioned_backward) = static_photon_head_moment_chunk(
             q_host, chunk.D_raw, response.sigma_H, S_effective,
             n_valid, weight)
         (moment_host, D_host, count_host, residual_host, sigma_host,
@@ -1525,13 +1830,11 @@ def complete_static_slab_photon_q0(
             f"{tuple(observed_padded)}/{cubature_receipt.padded_counts}")
     D_mean = per_order_D[-1]
     moments_mean = per_order_moments[-1]
-    qstar = np.sqrt(float(cubature_receipt.polygon_area))
-
     def _dimensionless_moments(moment):
         scaled = np.empty_like(moment)
-        degrees = (0, 1, 1)
-        for u in range(3):
-            for v in range(3):
+        degrees = (0,) + (1,) * dimension
+        for u in range(basis_size):
+            for v in range(basis_size):
                 scaled[u, v] = moment[u, v] / (
                     qstar ** (degrees[u] + degrees[v]))
         return scaled
@@ -1542,8 +1845,8 @@ def complete_static_slab_photon_q0(
         previous_scaled = _dimensionless_moments(
             per_order_moments[index - 1])
         current_scaled = _dimensionless_moments(per_order_moments[index])
-        for u in range(3):
-            for v in range(3):
+        for u in range(basis_size):
+            for v in range(basis_size):
                 previous_blocks.append(previous_scaled[u, v])
                 current_blocks.append(current_scaled[u, v])
         return _static_photon_mixed_error_ratio(
@@ -1568,27 +1871,19 @@ def complete_static_slab_photon_q0(
     sh_x = NamedSharding(mesh_xy, P(None, "x"))
     sh_y = NamedSharding(mesh_xy, P(None, "y"))
     volume = jnp.asarray(float(cell_volume), dtype=jnp.float64)
-    with mesh_xy:
-        left_bare = jax.lax.with_sharding_constraint(
-            jnp.conj(g0_X).astype(dtype), sh_x)
-        right_bare = jax.lax.with_sharding_constraint(
-            jnp.einsum(
-                "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
-                optimize=True) / volume,
-            sh_y)
-    V_packed = add_photon_q0_low_rank(
-        V_packed, layout, mesh_xy,
-        left_rows_X=left_bare, right_rows_Y=right_bare)
+    V_packed, (left_bare, right_bare) = _insert_bare_static_photon_q0(
+        V_packed, layout, g0_X, g0_Y, D_mean, cell_volume,
+        mesh_xy=mesh_xy)
 
-    left_basis = (
-        left_bare,
-        jax.lax.with_sharding_constraint(jnp.swapaxes(WZ_x[0], 0, 1), sh_x),
-        jax.lax.with_sharding_constraint(jnp.swapaxes(WZ_x[1], 0, 1), sh_x),
-    )
-    right_basis = (g0_Y, YW_y[0], YW_y[1])
+    left_basis = (left_bare,) + tuple(
+        jax.lax.with_sharding_constraint(
+            jnp.swapaxes(WZ_x[direction], 0, 1), sh_x)
+        for direction in range(dimension))
+    right_basis = (g0_Y,) + tuple(
+        YW_y[direction] for direction in range(dimension))
     screened_pairs = []
-    for u in range(3):
-        for v in range(3):
+    for u in range(basis_size):
+        for v in range(basis_size):
             with mesh_xy:
                 right_rows = jax.lax.with_sharding_constraint(
                     jnp.einsum(
@@ -1601,7 +1896,7 @@ def complete_static_slab_photon_q0(
                 left_rows_X=left_basis[u], right_rows_Y=right_rows)
             screened_pairs.append((left_basis[u], right_rows))
 
-    evidence = StaticSlabPhotonHeadCompletion(
+    evidence = StaticPhotonHeadCompletion(
         bare_D_mean=D_mean,
         screened_moments=moments_mean,
         cubature_receipt=cubature_receipt,
@@ -1619,56 +1914,60 @@ def complete_static_slab_photon_q0(
         sigma_H=np.asarray(
             jax.device_get(response.sigma_H), dtype=np.float64),
         hall_source=str(response.hall_source),
+        charge_block_state=charge_block_state,
         q0_factors=StaticPhotonQ0FactorCarrier(
             bare_pair=(left_bare, right_bare),
-            screened_pairs=tuple(screened_pairs)),
+            screened_pairs=tuple(screened_pairs),
+            dimension=dimension,
+            charge_block_state=charge_block_state),
     )
     return V_packed, W_packed, evidence
 
 
 def _dynamic_photon_head_small_system(
     response,
-    W_static_body_gamma: jax.Array,
+    W_resident_body_gamma: jax.Array,
     *,
-    W_static_charge_gamma: jax.Array,
-    W_target_charge_gamma: jax.Array | None = None,
+    W_resident_charge_gamma: jax.Array,
+    W_target_charge_gamma: jax.Array,
     cell_volume: float,
     mesh_xy: Mesh,
 ):
     """Fold one frequency sample through the resident frozen-current body.
 
     The packed current body stays at ``z=0`` while its charge block follows
-    the scalar PPM sample. The static sample therefore contracts the resident
-    packed Gamma tile directly. For the probe, only ``delta W_00`` is folded
-    into the charge-supported wings and added to the O(N) wing halves. This is
-    algebraically the packed body with its charge block replaced, but that
-    second centroid-square tile is never constructed.
+    the scalar PPM sample.  On the dynamic current-only route the resident
+    body is ``V`` and its packed CC block has no Sigma consumer; the two
+    explicitly named charge blocks let this producer fold only
+    ``W_target_00 - W_resident_00`` through the charge-supported wings.  This
+    is algebraically the packed body with its charge block replaced, but that
+    second centroid-square tile is never constructed or exposed to the
+    current-only Sigma consumer.
     """
     from .static_gauge_response import require_static_photon_head_response
 
     response = require_static_photon_head_response(response, mesh_xy)
+    dimension = int(response.dimension)
     n_packed = int(response.layout.packed_extent)
     n_charge = int(response.layout.padded_extent(0))
-    if tuple(W_static_body_gamma.shape) != (n_packed, n_packed):
+    if tuple(W_resident_body_gamma.shape) != (n_packed, n_packed):
         raise ValueError(
             "dynamic Faraday completion needs the resident packed Gamma "
             f"body {(n_packed, n_packed)}; got "
-            f"{tuple(W_static_body_gamma.shape)}")
+            f"{tuple(W_resident_body_gamma.shape)}")
     expected_charge = (n_charge, n_charge)
     for name, block in (
-            ("static", W_static_charge_gamma),
+            ("resident", W_resident_charge_gamma),
             ("target", W_target_charge_gamma)):
-        if block is not None and tuple(block.shape) != expected_charge:
+        if tuple(block.shape) != expected_charge:
             raise ValueError(
                 f"dynamic Faraday {name} charge Gamma block must have shape "
                 f"{expected_charge}; got {tuple(block.shape)}")
     wanted_body = NamedSharding(mesh_xy, P("x", "y"))
     for name, array in (
-            ("packed body", W_static_body_gamma),
-            ("static charge block", W_static_charge_gamma),
+            ("packed body", W_resident_body_gamma),
+            ("resident charge block", W_resident_charge_gamma),
             ("target charge block", W_target_charge_gamma)):
-        if array is None:
-            continue
         sharding = getattr(array, "sharding", None)
         if (not isinstance(sharding, NamedSharding)
                 or not sharding.is_equivalent_to(wanted_body, 2)):
@@ -1677,47 +1976,46 @@ def _dynamic_photon_head_small_system(
                 f"got {sharding!r}")
 
     S_effective = response.S_direct
-    for a in range(2):
-        for b in range(2):
+    for a in range(dimension):
+        for b in range(dimension):
             folded = fold_small_head_wings_sharded(
                 response.S_direct[a, b], response.Y_x[a],
-                W_static_body_gamma, response.Z_y[b], float(cell_volume),
+                W_resident_body_gamma, response.Z_y[b], float(cell_volume),
                 mesh_xy=mesh_xy)
             S_effective = S_effective.at[a, b].set(folded)
     YW_y, WZ_x = small_head_wing_halves_sharded(
-        response.Y_x, W_static_body_gamma, response.Z_y, mesh_xy=mesh_xy)
+        response.Y_x, W_resident_body_gamma, response.Z_y, mesh_xy=mesh_xy)
 
-    if W_target_charge_gamma is not None:
-        delta_charge = W_target_charge_gamma - W_static_charge_gamma
-        with mesh_xy:
-            Y_small = jax.lax.with_sharding_constraint(
-                jnp.zeros((2, 4, n_charge), dtype=jnp.complex128)
-                .at[:, 0, :].set(response.charge_Y_x),
-                NamedSharding(mesh_xy, P(None, None, "x")))
-            Z_small = jax.lax.with_sharding_constraint(
-                jnp.zeros((2, n_charge, 4), dtype=jnp.complex128)
-                .at[:, :, 0].set(response.charge_Z_y),
-                NamedSharding(mesh_xy, P(None, "y", None)))
-        for a in range(2):
-            for b in range(2):
-                correction = fold_small_head_wings_sharded(
-                    jnp.zeros_like(response.S_direct[a, b]), Y_small[a],
-                    delta_charge, Z_small[b], float(cell_volume),
-                    mesh_xy=mesh_xy)
-                S_effective = S_effective.at[a, b].add(correction)
-        delta_YW, delta_WZ = small_head_wing_halves_sharded(
-            Y_small, delta_charge, Z_small, mesh_xy=mesh_xy)
-        delta_YW_packed = jnp.stack(tuple(
-            _pack_charge_factor_rows(
-                delta_YW[a], response.layout, mesh_xy, axis_name="y")
-            for a in range(2)))
-        delta_WZ_packed = jnp.swapaxes(jnp.stack(tuple(
-            _pack_charge_factor_rows(
-                jnp.swapaxes(delta_WZ[b], 0, 1), response.layout,
-                mesh_xy, axis_name="x")
-            for b in range(2))), 1, 2)
-        YW_y = YW_y + delta_YW_packed
-        WZ_x = WZ_x + delta_WZ_packed
+    delta_charge = W_target_charge_gamma - W_resident_charge_gamma
+    with mesh_xy:
+        Y_small = jax.lax.with_sharding_constraint(
+            jnp.zeros((dimension, 4, n_charge), dtype=jnp.complex128)
+            .at[:, 0, :].set(response.charge_Y_x),
+            NamedSharding(mesh_xy, P(None, None, "x")))
+        Z_small = jax.lax.with_sharding_constraint(
+            jnp.zeros((dimension, n_charge, 4), dtype=jnp.complex128)
+            .at[:, :, 0].set(response.charge_Z_y),
+            NamedSharding(mesh_xy, P(None, "y", None)))
+    for a in range(dimension):
+        for b in range(dimension):
+            correction = fold_small_head_wings_sharded(
+                jnp.zeros_like(response.S_direct[a, b]), Y_small[a],
+                delta_charge, Z_small[b], float(cell_volume),
+                mesh_xy=mesh_xy)
+            S_effective = S_effective.at[a, b].add(correction)
+    delta_YW, delta_WZ = small_head_wing_halves_sharded(
+        Y_small, delta_charge, Z_small, mesh_xy=mesh_xy)
+    delta_YW_packed = jnp.stack(tuple(
+        _pack_charge_factor_rows(
+            delta_YW[a], response.layout, mesh_xy, axis_name="y")
+        for a in range(dimension)))
+    delta_WZ_packed = jnp.swapaxes(jnp.stack(tuple(
+        _pack_charge_factor_rows(
+            jnp.swapaxes(delta_WZ[b], 0, 1), response.layout,
+            mesh_xy, axis_name="x")
+        for b in range(dimension))), 1, 2)
+    YW_y = YW_y + delta_YW_packed
+    WZ_x = WZ_x + delta_WZ_packed
 
     S_effective = canonicalize_static_gauge_q2_tensor(S_effective)
     jax.block_until_ready((S_effective, YW_y, WZ_x))
@@ -1740,7 +2038,7 @@ def _dynamic_photon_head_moments(
         n_valid = int(chunk.physical_count)
         (moments, bare_sum, returned_count, backward, chunk_sigma_min,
          chunk_condition_max,
-         chunk_conditioned_backward) = static_slab_photon_head_moment_chunk(
+         chunk_conditioned_backward) = static_photon_head_moment_chunk(
             q_host, chunk.D_raw, sigma_H, S_effective, n_valid, weight)
         (moment_host, D_host, count_host, residual_host, sigma_host,
          condition_host, conditioned_backward_host) = jax.device_get((
@@ -1764,13 +2062,19 @@ def _dynamic_photon_head_moments(
         conditioned_backward_errors.append(
             float(np.asarray(conditioned_backward_host)))
 
-    qstar = np.sqrt(float(cubature_receipt.polygon_area))
+    dimension = int(cubature_receipt.dimension)
+    if dimension not in (2, 3):
+        raise ValueError(
+            f"dynamic Faraday cubature dimension must be 2 or 3; got "
+            f"{dimension}")
+    qstar = float(cubature_receipt.minibz_measure) ** (1.0 / dimension)
+    basis_size = 1 + dimension
 
     def _scaled(moment):
         out = np.empty_like(moment)
-        degrees = (0, 1, 1)
-        for u in range(3):
-            for v in range(3):
+        degrees = (0,) + (1,) * dimension
+        for u in range(basis_size):
+            for v in range(basis_size):
                 out[u, v] = moment[u, v] / (
                     qstar ** (degrees[u] + degrees[v]))
         return out
@@ -1781,8 +2085,8 @@ def _dynamic_photon_head_moments(
         current = [per_order_D[index]]
         previous_scaled = _scaled(per_order[index - 1])
         current_scaled = _scaled(per_order[index])
-        for u in range(3):
-            for v in range(3):
+        for u in range(basis_size):
+            for v in range(basis_size):
                 previous.append(previous_scaled[u, v])
                 current.append(current_scaled[u, v])
         ratios.append(_static_photon_mixed_error_ratio(previous, current))
@@ -1827,11 +2131,20 @@ def _faraday_cttc_factor_pairs(
     delta_moments, *, g0_X, g0_Y, YW_y, WZ_x, layout, mesh_xy,
     cell_volume: float,
 ):
-    """Collapse nine moment updates to one rank-four CT and one TC pair."""
+    """Collapse all dimensioned moments to one rank-four CT/TC pair each."""
     factor_shape = (4, int(layout.packed_extent))
+    dimension = int(YW_y.shape[0])
+    basis_size = 1 + dimension
+    if dimension not in (2, 3):
+        raise ValueError(
+            f"dynamic Faraday factor dimension must be 2 or 3; got "
+            f"{dimension}")
     if (tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape
-            or tuple(YW_y.shape) != (2,) + factor_shape
-            or tuple(WZ_x.shape) != (2, factor_shape[1], factor_shape[0])):
+            or tuple(YW_y.shape) != (dimension,) + factor_shape
+            or tuple(WZ_x.shape)
+            != (dimension, factor_shape[1], factor_shape[0])
+            or tuple(np.shape(delta_moments))
+            != (basis_size, basis_size, 4, 4)):
         raise ValueError(
             "dynamic Faraday factors do not match the packed layout: "
             f"g0={g0_X.shape}/{g0_Y.shape}, YW={YW_y.shape}, "
@@ -1842,23 +2155,20 @@ def _faraday_cttc_factor_pairs(
         jnp.conj(g0_X).astype(jnp.complex128), sh_x)
     left_basis = (
         left_bare.at[1:, :].set(0.0),
-        jax.lax.with_sharding_constraint(
-            jnp.swapaxes(WZ_x[0], 0, 1), sh_x),
-        jax.lax.with_sharding_constraint(
-            jnp.swapaxes(WZ_x[1], 0, 1), sh_x),
-    )
+    ) + tuple(jax.lax.with_sharding_constraint(
+        jnp.swapaxes(WZ_x[a], 0, 1), sh_x)
+        for a in range(dimension))
     right_basis = (
         jax.lax.with_sharding_constraint(
             g0_Y.at[1:, :].set(0.0).astype(jnp.complex128), sh_y),
-        jax.lax.with_sharding_constraint(YW_y[0], sh_y),
-        jax.lax.with_sharding_constraint(YW_y[1], sh_y),
-    )
+    ) + tuple(jax.lax.with_sharding_constraint(YW_y[a], sh_y)
+              for a in range(dimension))
     moment = jnp.asarray(delta_moments, dtype=jnp.complex128)
     with mesh_xy:
         left_ct = jax.lax.with_sharding_constraint(
             sum(jnp.einsum("BA,Bj->Aj", moment[u, 0], left_basis[u],
                            optimize=True)
-                for u in range(3)), sh_x)
+                for u in range(basis_size)), sh_x)
         right_ct = jax.lax.with_sharding_constraint(
             g0_Y.at[0, :].set(0.0).astype(jnp.complex128)
             / jnp.asarray(float(cell_volume), dtype=jnp.float64), sh_y)
@@ -1868,7 +2178,7 @@ def _faraday_cttc_factor_pairs(
         right_tc = jax.lax.with_sharding_constraint(
             sum(jnp.einsum("AB,Bj->Aj", moment[0, v], right_basis[v],
                            optimize=True)
-                for v in range(3))
+                for v in range(basis_size))
             / jnp.asarray(float(cell_volume), dtype=jnp.float64), sh_y)
     jax.block_until_ready((left_ct, right_ct, left_tc, right_tc))
     return ((left_ct, right_ct), (left_tc, right_tc))
@@ -2069,11 +2379,12 @@ def _fit_ordered_faraday_factor_samples(
         float(odd_even_ratio), pair_cross_h)
 
 
-def fit_dynamic_slab_photon_cttc_q0(
+def fit_dynamic_photon_cttc_q0(
     static_response,
     probe_response,
     *,
-    W_static_body_gamma: jax.Array,
+    W_resident_body_gamma: jax.Array,
+    W_resident_charge_gamma: jax.Array,
     W_static_charge_gamma: jax.Array,
     W_probe_charge_gamma: jax.Array,
     static_off_moments=None,
@@ -2097,16 +2408,24 @@ def fit_dynamic_slab_photon_cttc_q0(
     ordered response can nevertheless have ``D_H`` because its imaginary-axis
     screening environment is non-Hermitian without time reversal.
     """
-    from vcoul import validate_slab_minibz_photon_receipt
+    from vcoul import validate_minibz_photon_receipt
 
-    receipt = validate_slab_minibz_photon_receipt(cubature_receipt)
+    receipt = validate_minibz_photon_receipt(cubature_receipt)
+    dimension = int(receipt.dimension)
+    if (int(static_response.dimension), int(probe_response.dimension)) != (
+            dimension, dimension):
+        raise ValueError(
+            "dynamic Faraday response/cubature dimensions differ: "
+            f"static={static_response.dimension}, "
+            f"probe={probe_response.dimension}, receipt={dimension}")
     static_S, static_YW, static_WZ = _dynamic_photon_head_small_system(
-        static_response, W_static_body_gamma,
-        W_static_charge_gamma=W_static_charge_gamma,
+        static_response, W_resident_body_gamma,
+        W_resident_charge_gamma=W_resident_charge_gamma,
+        W_target_charge_gamma=W_static_charge_gamma,
         cell_volume=float(receipt.cell_volume), mesh_xy=mesh_xy)
     probe_S, probe_YW, probe_WZ = _dynamic_photon_head_small_system(
-        probe_response, W_static_body_gamma,
-        W_static_charge_gamma=W_static_charge_gamma,
+        probe_response, W_resident_body_gamma,
+        W_resident_charge_gamma=W_resident_charge_gamma,
         W_target_charge_gamma=W_probe_charge_gamma,
         cell_volume=float(receipt.cell_volume), mesh_xy=mesh_xy)
     zero_sigma = np.zeros(3, dtype=np.float64)

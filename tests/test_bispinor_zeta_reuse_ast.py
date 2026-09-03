@@ -17,24 +17,23 @@ cheap to pin is the SHAPE of the code that job certified:
    that catches a good header sitting over a ζ of the wrong μ extent.
 
 3. The bispinor reuse path returns a REBUILT ``transverse_wfn_data``,
-   never ``None``.  ``None`` there flows into the Σ kernels, whose Σ^B
-   fold-in is a silent no-op on ``None``: rc=0 with Σ^B dropped.  That
-   is the exact failure commit 3d89885 fixed on the restart round-trip
-   and it must not come back through the reuse door.
+   never ``None``.  Without it the packed current operator cannot be built.
+   That is the exact missing-channel failure commit 3d89885 fixed on the
+   restart round-trip, and it must not come back through the reuse door.
 
 4. ``_transverse_wfn_data`` has exactly two call sites — the fit path
    and the reuse path.  Bit-identity of the two legs rests on both
    sampling ψ through the same code; a third, open-coded sampling site
    is how that guarantee would rot.
 
-5. Only missing channels reach the incumbent fit/stamp path; accepted files
+5. Only missing channels reach the one fit/stamp path; accepted files
    are never opened by the writer during resume.
 
 6. The transverse ζ files get a provenance stamp.  Without it every
    bispinor rerun refits: rule 4 of ``_zeta_reuse_ok`` is "no
    provenance ⇒ refit", and the μ_L loop used to write none.
 
-7. Every freshly fit channel crosses the one incumbent deferred-finding
+7. Every freshly fit channel crosses the one deferred-finding
    host seam before its provenance stamp.  Accepted channels cross neither:
    pending rank/closure state must never leak from a transverse fit into a
    later stage or authenticate an artifact before refusal.
@@ -151,7 +150,7 @@ def test_only_missing_channels_reach_fit_writers():
     _, fit_zeta = _fit_zeta_tree()
     fits = _calls(fit_zeta, "fit_zeta_to_h5")
     assert len(fits) == 2, (
-        "expected the incumbent charge and transverse fit call sites only; "
+        "expected the sole charge and transverse fit call sites; "
         "found %d" % len(fits))
     charge_guards = [n for n in ast.walk(fit_zeta)
                      if isinstance(n, ast.If)
@@ -184,7 +183,7 @@ def test_bispinor_reuse_path_returns_rebuilt_transverse_data():
     assert rebuilt, (
         "no return in fit_zeta re-samples ψ at the transverse centroids. "
         "The bispinor reuse path must rebuild transverse_wfn_data; "
-        "returning None there silently drops Σ^B (rc=0, wrong physics).")
+        "returning None leaves the packed current operator incomplete.")
     # And the None-returning tuple that remains must be the
     # non-bispinor one — i.e. it is guarded by `not cfg.bispinor`.
     nones = [r for r in tuples
@@ -193,7 +192,7 @@ def test_bispinor_reuse_path_returns_rebuilt_transverse_data():
     for r in nones:
         assert _guarded_by_not_bispinor(fit_zeta, r), (
             "a `return ..., None` in fit_zeta is not guarded by "
-            "`not cfg.bispinor`; on a bispinor run that drops Σ^B")
+            "`not cfg.bispinor`; a bispinor run needs the packed current data")
 
 
 def _guarded_by_not_bispinor(fit_zeta, target):
@@ -236,7 +235,7 @@ def test_transverse_zeta_files_are_stamped():
 def test_every_fresh_channel_gates_rank_findings_before_stamp():
     _, gate = _function_tree("_gate_fresh_zeta_rank_findings")
     assert len(_calls(gate, "raise_if_pending")) == 2, (
-        "the shared zeta host seam must invoke exactly the incumbent "
+        "the shared zeta host seam must invoke exactly the established "
         "spectral-closure and rank-policy dispositions")
 
     _, fit_zeta = _fit_zeta_tree()
