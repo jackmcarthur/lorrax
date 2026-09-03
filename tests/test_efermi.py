@@ -245,6 +245,25 @@ def test_occupation_state_hash_binds_to_the_table():
             occ_hash="0" * 16)
 
 
+def test_occupation_state_hash_ignores_only_trailing_exact_zero_columns():
+    base = np.asarray([[1.0, 0.4], [1.0, 0.6]])
+    padded = np.pad(base, ((0, 0), (0, 7)))
+    a = OccupationState(
+        f_kn=base, mu_ry=0.1, smearing_family="mp1",
+        smearing_width_ry=0.02, n_electrons=2.0)
+    b = OccupationState(
+        f_kn=padded, mu_ry=0.1, smearing_family="mp1",
+        smearing_width_ry=0.02, n_electrons=2.0)
+    assert a.occ_hash == b.occ_hash
+
+    changed = padded.copy()
+    changed[0, -1] = np.nextafter(0.0, 1.0)
+    c = OccupationState(
+        f_kn=changed, mu_ry=0.1, smearing_family="mp1",
+        smearing_width_ry=0.02, n_electrons=2.0)
+    assert c.occ_hash != a.occ_hash
+
+
 def test_occupation_state_step_is_insulating_only():
     # Gapped: works, family "fixed", zero width, capacity-weighted target.
     E = np.array([[0.0, 1.0, 2.0, 3.0]] * 4)

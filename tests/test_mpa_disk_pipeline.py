@@ -100,11 +100,11 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
         lambda *_args, **_kwargs: stored_plan)
     z = np.asarray([2.0e-5j, 1.0 + 0.2j])
     monkeypatch.setattr(model.sample_plan, "plan_z", lambda _plan: z)
-    occ = object()
+    occ = SimpleNamespace(f_kn=np.ones((1, 5)), occ_hash="current")
     config = SimpleNamespace(
         mpa=SimpleNamespace(n_poles=8),
         screening=SimpleNamespace(diagrams="w_rpa"))
-    meta = SimpleNamespace(n_rmu=5)
+    meta = SimpleNamespace(n_rmu=5, b_id_4_user=5)
     sym = SimpleNamespace(trs_allowed=True)
 
     got = model.validate_reused_mpa_fit(
@@ -122,6 +122,9 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
     assert calls["logical_n_mu"] == 5
     assert kwargs["expected_screening_diagrams"] == "w_rpa"
     assert calls["occupation"][0] == str(fit.resolve())
+    from gw.efermi import occupation_digest
+    assert occupation_digest(occ.f_kn, band_extent=8) in (
+        calls["occupation"][2]["compatible_occ_hashes"])
 
 
 def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
@@ -158,12 +161,14 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
         mpa=SimpleNamespace(n_poles=2),
         screening=SimpleNamespace(diagrams="w_rpa"))
     messages = []
+    occ = SimpleNamespace(f_kn=np.ones((1, 3)), occ_hash="current")
+    meta = SimpleNamespace(n_rmu=3, b_id_4_user=3)
 
     got = model.validate_reused_mpa_fit(
         fit, config=config, live_plan=live_plan,
         sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
-        meta=SimpleNamespace(n_rmu=3), mesh_xy=None,
-        occupation_state=object(), material_class="metal",
+        meta=meta, mesh_xy=None,
+        occupation_state=occ, material_class="metal",
         print_fn=messages.append)
 
     assert got == str(fit.resolve())
@@ -179,8 +184,8 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
         model.validate_reused_mpa_fit(
             fit, config=config, live_plan=live_plan,
             sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
-            meta=SimpleNamespace(n_rmu=3), mesh_xy=None,
-            occupation_state=object(), material_class="metal",
+            meta=meta, mesh_xy=None,
+            occupation_state=occ, material_class="metal",
             print_fn=lambda *_args: None)
 
 

@@ -262,6 +262,19 @@ def test_a_mismatched_state_is_refused_with_the_field_named(tmp_path):
         MS.assert_occupation_stamps(dest, _occ_state(occ_hash="deadbeef"))
 
 
+def test_a_legacy_zero_pad_hash_is_accepted_only_when_reproduced(tmp_path):
+    from file_io import mpa_store as MS
+
+    legacy = _occ_state(occ_hash="legacy-p36")
+    dest = _tiny_fit_store(tmp_path, legacy)
+    live = _occ_state(occ_hash="logical")
+    assert MS.assert_occupation_stamps(
+        dest, live, compatible_occ_hashes={"legacy-p36"}) == "legacy_zero_pad"
+    with pytest.raises(ValueError, match="occ_hash"):
+        MS.assert_occupation_stamps(
+            dest, live, compatible_occ_hashes={"some-other-hash"})
+
+
 def test_an_unstamped_store_is_refused_at_a_metallic_reuse(tmp_path):
     from file_io import mpa_store as MS
 
