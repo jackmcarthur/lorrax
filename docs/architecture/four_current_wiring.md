@@ -61,7 +61,7 @@ yields `(accepted, got, want, klass, why, derived_key)`:
 | 3 | `screening_diagrams = w_rpa` | both | IMPLEMENTATION LIMIT |
 | 4 | `head_correction ∈ {full, off}` | both | PHYSICS/POLICY (row 20) |
 | 5 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived** |
-| 6 | `w_dyson_solver ∈ {local, distributed}` | screened | the existing two-plan `solve_w` facade; local serves a 1×1 mesh, distributed is the all-rank memory plan |
+| 6 | `w_dyson_solver ∈ {local, distributed}` | screened | the existing two-plan `solve_w` facade; local serves a 1×1 mesh and factors the explicitly supplied full packed extent, distributed is the all-rank memory plan |
 | 7 | no scalar q→0 head override named (`scalar_head_overrides_named`, `:3621`) | screened | IMPLEMENTATION LIMIT — ONE conjunct for the eight `use_bgw_vcoul` / `wcoul0_*` / `*head*` / `mc_average_placement*` keys, naming only the ones the deck set |
 
 Row 5 is **derived, not declared**: `LorraxConfig.from_input_file` sets
@@ -95,8 +95,10 @@ The bare route does not inspect `w_dyson_solver` for routing: there is no
 packed solve. Its scalar CC solve uses the ordinary plan, and `x_only` builds
 no W. The screened route passes the packed operator to the same `solve_w`
 facade as scalar screening, so local is valid on a 1×1 mesh and distributed
-retains the all-rank plan. The packed completion is the only deck-reachable
-producer of a transverse q→0 head.
+retains the all-rank plan. The packed caller passes
+`sum(layout.logical_extents)`: inheriting scalar `meta.n_rmu` here would solve
+only the charge prefix and zero-fill all current rows and columns. The packed
+completion is the only deck-reachable producer of a transverse q→0 head.
 
 The three predicates, all in `src/gw/gw_config.py`:
 

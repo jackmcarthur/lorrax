@@ -1423,7 +1423,8 @@ def _w_solve_pref_scalar(meta) -> float:
         * float(nspinor_wfnfile))
 
 
-def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
+def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
+                        dyson_solver=None,
                         distrib_la_batched_route: str = "batch_reshard"):
     """Return ``(solve_fn, pref)`` for the requested W plan.
 
@@ -1444,6 +1445,11 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
 
     W comes out ``P(None,'x','y')`` on BOTH — that is the module's
     output contract, not a per-plan detail.
+
+    ``n_rmu_logical`` overrides the scalar ``meta.n_rmu`` prefix when the
+    carrier is a different declared basis.  The packed photon caller uses
+    this for its full C+T1+T2+T3 extent on the only legal local geometry,
+    1x1; ordinary scalar callers retain the ``meta.n_rmu`` default.
     """
     from .gw_config import normalize_w_dyson_solver
     dyson = normalize_w_dyson_solver(dyson_solver)
@@ -1454,7 +1460,12 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
     # silently restored the padded-extent LU for any meta-like object
     # missing the field (opt-out-by-omission, PADDING_AUDIT item 3).
     # Synthetic-meta callers must carry n_rmu (= the logical extent).
-    n_log = int(meta.n_rmu)
+    n_log = (int(meta.n_rmu) if n_rmu_logical is None
+             else int(n_rmu_logical))
+    if not 1 <= n_log <= int(n_rmu):
+        raise ValueError(
+            "solve_w logical extent must be positive and no larger than "
+            f"the carrier: got logical={n_log}, carrier={int(n_rmu)}")
 
     if dyson == "distributed":
         solve_fn = _get_w_solve_fn_distributed(
@@ -1465,7 +1476,8 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 
-def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+def solve_w(V_q, chi0_q, meta, mesh_xy, *, n_rmu_logical=None,
+            dyson_solver=None,
             distrib_la_batched_route: str = "batch_reshard"):
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
@@ -1490,9 +1502,14 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
 
     ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
     caller must drop its reference after this call.
+
+    ``n_rmu_logical`` defaults to ``meta.n_rmu`` for the scalar carrier.
+    A caller whose matrix has another declared logical basis, such as the
+    packed four-current direct sum, must pass that extent explicitly.
     """
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        meta, mesh_xy, n_rmu=chi0_q.shape[1],
+        n_rmu_logical=n_rmu_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route)
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
@@ -2248,6 +2265,12 @@ def compute_static_photon_response(
 
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
+            # ``meta.n_rmu`` is the CHARGE extent.  The local packed plan
+            # must factor the complete C+T1+T2+T3 direct sum; inheriting the
+            # scalar default here zero-filled every current row/column on a
+            # 1x1 mesh.  Local packed execution is restricted above to 1x1,
+            # where padded and logical per-channel extents are identical.
+            n_rmu_logical=sum(layout.logical_extents),
             dyson_solver=dyson_solver,
             distrib_la_batched_route=distrib_la_batched_route)
         # The bare Hartree/exchange stage that follows does not depend on W
@@ -3613,7 +3636,8 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     ).compile()
 
 
-def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, n_rmu_logical=None,
+                       dyson_solver=None,
                        distrib_la_batched_route: str = "batch_reshard"):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
@@ -3622,7 +3646,8 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
     """
     ensure_jax_compile_cache()
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        meta, mesh_xy, n_rmu=chi0_q.shape[1],
+        n_rmu_logical=n_rmu_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route)
     # The DISTRIBUTED plan is a plain function around chunked jits + one
     # FFI call, not a single jit, so there is nothing to lower here —

@@ -722,7 +722,7 @@ and refusal at `34228021` — is
 | head sources, `HeadResolver`, static terms, PPM/complex-pole head `Σ`, Schur fold, rank-1 injection, packed Γ completion | `src/gw/head_correction.py` |
 | `S(ω)`, Γ wings, velocity, Hall pseudovector, per-iteration head samples | `src/gw/qsgw_head.py` |
 | packed layout and rank-4 updates | `src/gw/photon_layout.py` |
-| packed body response and Dyson, for **both** packed modes and **both** compute-mode families | `src/gw/w_isdf.py` (`compute_static_photon_response`, keyword `screen_current`) |
+| packed body response and Dyson, for **both** packed modes and **both** compute-mode families; the screened 1×1 caller supplies the full `C+T1+T2+T3` logical extent rather than scalar `meta.n_rmu` | `src/gw/w_isdf.py` (`compute_static_photon_response`, keyword `screen_current`; `solve_w`, keyword `n_rmu_logical`) |
 | sixteen-block `Σ`, and its twelve-block current-only selection | `src/gw/photon_sigma.py` |
 | the dynamic route's block split (charge half ↔ current half), and bare `x_only`'s exact `SX=X`, `COH=0` contraction | `src/gw/sigma_dispatch.py`, `compute_sigma_xc` |
 | packed restart source binding shared by the canonical restart and V-tile artifacts | `src/file_io/bispinor_vq_restart.py` |
