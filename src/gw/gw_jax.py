@@ -702,12 +702,14 @@ def main(argv=None):
 	if (do_screened
 			and config.head.correction is HeadCorrection.FULL
 			and config.screening.diagrams is ScreeningDiagrams.W_RPA
-			# The DYNAMIC packed route keeps the scalar charge owner (its CC
-			# channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
-			# the direct DFT response its q->0 head samples are finalized
-			# from.  Only the STATIC packed mode, whose packed Gamma-cell
-			# completion replaces that machinery outright, skips it.
-			and not packed_photon_replaces_charge_sigma(config)
+			# The dynamic packed route keeps the scalar charge owner.  The
+			# static BARE packed route also needs this bounded charge response:
+			# restart_q_storage persists W_00 together with the head receipt
+			# finalized against it.  The screened-current static route alone
+			# skips the scalar response because its packed Gamma completion owns
+			# the whole screened operator and that restart class is refused.
+			and (not packed_photon_replaces_charge_sigma(config)
+			     or packed_bare_transverse_route(config)[0])
 			# Every self-consistent mode builds its exact frequency plan and
 			# response inside the map.  A pre-map response would exist only to
 			# seed a restart artifact and could be mistaken for final physics.
