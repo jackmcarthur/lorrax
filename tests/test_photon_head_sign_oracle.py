@@ -74,6 +74,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 import common.parallel_transport as parallel_transport  # noqa: E402
 import gw.qsgw_head as qsgw_head  # noqa: E402
 from gw.head_correction import (  # noqa: E402
+    _adjoint_factor_family,
     _dynamic_photon_head_moments,
     _dynamic_photon_head_small_system,
     _faraday_cttc_factor_pairs,
@@ -855,7 +856,9 @@ def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
     assert abs(sum(ordered_overlaps).imag) > 1.0e-3 * abs(
         sum(ordered_overlaps).real)
     assert ordered_D_over_B > 1.0e-3
-    assert ordered_error < 1.0e-12
+    # Gram-norm subtraction resolves an exactly collinear residual only to
+    # O(sqrt(eps)); the material adequacy gate is two orders looser at 1e-4.
+    assert ordered_error < 64.0 * np.sqrt(np.finfo(np.float64).eps)
     ordered_B_dense = _cttc_dense_vector(
         ordered_B, fixture.layout, mesh)
     ordered_D_dense = _cttc_dense_vector(
@@ -869,6 +872,24 @@ def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
     np.testing.assert_allclose(
         ordered_model, ordered_probe_dense, rtol=2e-12,
         atol=2e-12 * np.max(np.abs(ordered_probe_dense)))
+
+    # Negative control: two independently scaled Hermitian sectors change
+    # the probe operator's direction.  The complex-overlap gate is green and
+    # D is exactly zero, but a shared even pole cannot represent the sample;
+    # two frequencies do not identify the required second even pole.
+    static_ct = fitted.static_pairs[0]
+    deformed_ct = (
+        0.4 * static_ct[0] + 0.1 * jnp.roll(static_ct[0], 1, axis=0),
+        static_ct[1],
+    )
+    unrepresented_even_probe = (
+        deformed_ct,) + _adjoint_factor_family((deformed_ct,), mesh)
+    with pytest.raises(
+            NotImplementedError,
+            match="dynamic_hall_head_unimplemented_second_even_pole"):
+        _fit_ordered_faraday_factor_samples(
+            fitted.static_pairs, unrepresented_even_probe, probe_frequency,
+            mesh_xy=mesh, print_fn=lambda _message: None)
 
     static_S, static_YW, static_WZ = _dynamic_photon_head_small_system(
         fixture.response, W_packed[0],

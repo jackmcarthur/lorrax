@@ -2043,6 +2043,27 @@ def _fit_ordered_faraday_factor_samples(
             f"||A0||/||W0||={static_anti_ratio:.3e}; "
             f"||D_H||/||B_H||={odd_even_ratio:.3e}; "
             f"even-fit residual={even_fit_error:.3e}")
+    # The synthetic dense-contour oracle closes below 1e-4.  Above that
+    # scale the single even pole has changed not merely the magnitude but
+    # the operator direction of the completed probe.  Two samples cannot
+    # determine a second even pole, so consuming the projected approximation
+    # would hide a model failure behind a successful complex-overlap gate.
+    if even_fit_error > 1.0e-4:
+        raise NotImplementedError(
+            "GATE dynamic_hall_head_unimplemented_second_even_pole:\n"
+            f"  got:  ordered one-pole even-fit residual = "
+            f"{even_fit_error:.17e} (> 1.0e-4) from the z=0 and "
+            "z=i*omega_p samples\n"
+            "  want: an even CT/TC head model that reproduces the "
+            "Hermitian probe to the dense-contour oracle tolerance\n"
+            "  why:  the two available samples fix one even pole; a second "
+            "even pole is not identifiable without at least one additional "
+            "authenticated Hall, charge-head/wing, and W_00 sample\n"
+            "  fix:  extend the immutable Hall transaction and GN head "
+            "sample plan by one nonzero imaginary frequency, then fit and "
+            "gate the minimal two-even-pole model\n"
+            "  doc:  docs/theory/four-current-head-corrections.md, "
+            "Dynamic Hall/Faraday Gamma head.")
     return (
         float(omega_h), B_pairs, D_pairs, float(even_fit_error),
         float(odd_even_ratio), pair_cross_h)

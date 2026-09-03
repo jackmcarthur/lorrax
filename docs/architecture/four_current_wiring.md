@@ -508,6 +508,14 @@ factor gauge `L -> cL, R -> R/c` leaves those overlaps invariant, so the
 ordered split is a physical selection rather than a phase convention. No
 second packed body or centroid-square probe carrier exists.
 
+The same owner measures the Hermitian probe reconstruction error before
+publishing the carrier.  The dense-contour oracle sets its ceiling at
+`1e-4`; larger residuals stop at
+`GATE dynamic_hall_head_unimplemented_second_even_pole`.  The two schema-v2
+frequencies determine only one even pole, so this refusal requests a third
+authenticated Hall, charge-head/wing and `W_00` sample rather than silently
+projecting a material response onto the wrong operator direction.
+
 `photon_sigma.compute_ppm_faraday_head_sigma_omega` passes those factors
 through `ppm_sigma._residue_for_space` as `B_H+D_H` / `B_H-D_H`, streams one
 q=0 CT/TC block at a time through the existing normalized convolution, and
@@ -643,7 +651,7 @@ columns byte-for-byte.
 | `Sigma blocks   : …` | `gw_jax.py:1461-1468` | Max and mean `|diag|` in eV over the Sigma window for CC, CT+TC and TT. These reduce the same per-state fields written to `sigma_diag.dat`. |
 | `Head Sigma     : …` | `gw_jax.py:1470-1475` | Max and mean `|diag|` of the Gamma-cell contribution, split CC, CT+TC and TT. Dynamic CC combines the scalar bare-X and dynamic-correlation head owners; current sectors come from the packed completion. |
 | `GN odd Sigma   : …` | `gw_jax.py:1478-1498` | Measured-broken-TR only: max/mean `|sigC_odd|`, its max/mean shares of `|Sigma_xc|`, the `W(iomega_p)` Hermiticity residual, and `max|D|/max|B|`. Its absence on a TRS deck is part of the schema. |
-| `Faraday head   : APPLIED (…)` | `gw_jax.main` | Packed broken-TR GN only: authenticated `sigma_H(0)` and `sigma_H(i*omega_p)`, fitted `Omega_H`, `||D_H||/||B_H||`, the even-probe fit residual, and max/mean per-state `|sigCT_hall|`. The alternatives are explicit `EXACT ZERO`, DEBUG `ABSENT`, or missing-artifact `ABSENT` records. |
+| `Faraday head   : APPLIED (…)` | `gw_jax.main` | Representable packed broken-TR GN only: authenticated `sigma_H(0)` and `sigma_H(i*omega_p)`, fitted `Omega_H`, `||D_H||/||B_H||`, the even-probe fit residual, and max/mean per-state `|sigCT_hall|`. The alternatives are explicit `EXACT ZERO`, DEBUG `ABSENT`, missing-artifact `ABSENT`, or the named second-even-pole refusal above. |
 | `Slab WS cert   : …` / `Photon WS cert : …` | `gw_jax.py:803-809,1500-1506` | Exact Wigner-Seitz cubature order ladder, physical node counts and final mixed-tolerance error ratio. The photon line also reports the coupled solve's maximum Dyson backward residual. |
 | `Global TRS     : …` | `common/scientific_output.py:352-386` | The measured global verdict and provenance used by the screening/ordered-residue route. Route selection reads this verdict; it is not inferred again from a deck flag. |
 | `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:314` | the carrier banner. Under `full_static_cohsex` the parenthetical names the **head state**, not "experimental", and reads `DEBUG: Gamma-cell head disabled by head_correction=off` when the completion is off |

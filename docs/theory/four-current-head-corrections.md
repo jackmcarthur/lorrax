@@ -40,7 +40,7 @@ current density `ψ†α^iψ`).
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`, in static COHSEX and packed GN/HL-PPM | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; a static nonzero Hall artifact remains refused, while packed GN owns its dynamic Hall pole (§4.5) | `bispinor_gw = bare_transverse` inside the packed envelope | experimental, slab, one shot; body byte-identical to the incumbent route when compared without its head |
 | the packed operator on a **dynamic** Σ | **CC dynamic, current blocks static**: `W_00(ω)` follows the PPM model while the other fifteen packed body blocks are evaluated at `ω = 0`; magnetic GN adds the analytic CT/TC Γ pole | CC: the dynamic model's own head (§3.3) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT: the packed Γ-cell completion; CT/TC: Hall-off static body plus the Hall-on/off pole (§4.5) | either `bispinor_gw` value with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the packed envelope; magnetic Faraday insertion is GN; `mpa` stays on the incumbent route | experimental, slab, one shot; the current body blocks' `ω`-dependence is neglected and bounded as in §2.2 |
-| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled at `0` and `i*omega_p` | one sharded Kubo producer, authenticated schema-v2 transaction, two coupled completion samples retained as CT/TC rank-four factors, and one ordered analytic pole (§4.5) | measured-broken-TR, insulating packed GN | **applied**; the completed probe is split into Hermitian/anti-Hermitian parts and Sigma receives `R_+=B_H+D_H` / `R_-=B_H-D_H`; `sigCT_hall` is the Hall-on/off observable |
+| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled at `0` and `i*omega_p` | one sharded Kubo producer, authenticated schema-v2 transaction, two coupled completion samples retained as CT/TC rank-four factors, and one ordered analytic pole (§4.5) | measured-broken-TR, insulating packed GN | **conditionally applied** when the one-even-pole residual is at most `1e-4`; otherwise `GATE dynamic_hall_head_unimplemented_second_even_pole` refuses because schema v2 has no third sample from which to identify the required second even pole |
 | retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -738,10 +738,13 @@ pole denominators. Heads are analytic per pole: there is no quadrature work,
 no new response kernel, and no per-band-pair stage.
 
 The residual of the one-pole fit to `H_p` is printed separately from
-`||D_H||/||B_H||`.  A second even pole cannot be identified from the two
-schema-v2 samples: it requires at least one additional authenticated Hall
-and charge-response frequency.  It must never be inferred by phase-rotating
-one factor side, because that changes the physical operator.
+`||D_H||/||B_H||`.  The dense-contour oracle fixes `1e-4` as the largest
+admitted relative residual.  A larger value refuses as
+`GATE dynamic_hall_head_unimplemented_second_even_pole`, before Sigma.  A
+second even pole cannot be identified from the two schema-v2 samples: it
+requires at least one additional authenticated Hall, charge-head/wing and
+`W_00` frequency.  It must never be inferred by phase-rotating one factor
+side, because that changes the physical operator.
 
 This distinguishes two diagnostics that must not be conflated:
 
@@ -752,8 +755,8 @@ This distinguishes two diagnostics that must not be conflated:
   magnetisation-odd completed CT/TC response, including both `B_H` and
   `D_H`.
 
-There is therefore no `sigCT_odd` column. On a measured-broken-TR packed GN
-run the record says `Faraday head : APPLIED`, names both Hall samples and
+There is therefore no `sigCT_odd` column. On a representable
+measured-broken-TR packed GN run the record says `Faraday head : APPLIED`, names both Hall samples and
 `Omega_H`, `||D_H||/||B_H||`, the even-probe residual, and the maximum and
 mean per-state `|sigCT_hall|`.
 `SymMaps.trs_allowed=true` takes no new producer, completion, or Sigma path
