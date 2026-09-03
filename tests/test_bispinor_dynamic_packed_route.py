@@ -271,7 +271,7 @@ def test_x_only_dispatch_uses_packed_current_blocks_not_sigma_b_fallback():
     branch = source[source.index(marker):source.index(
         "elif uses_dynamic_packed_photon_route")]
     assert "blocks=PHOTON_BLOCKS_CURRENT" in branch
-    assert "bispinor_v_q_path=None" in branch
+    assert "bispinor_v_q_path" not in branch
 
 
 @pytest.mark.parametrize("diagrams", ["w_bse", "w_rpa_resolvent"])
@@ -457,9 +457,12 @@ def test_the_dispatch_asks_for_the_current_blocks_only():
 
     from gw import sigma_dispatch
     source = inspect.getsource(sigma_dispatch.compute_sigma_xc)
-    assert "blocks=PHOTON_BLOCKS_CURRENT" in source
-    # and the scalar bare-X call in that branch must not fold Sigma^B twice
-    assert "bispinor_v_q_path=None," in source
+    branch = source[source.index("elif uses_dynamic_packed_photon_route"):
+                    source.index("elif uses_static_photon_response")]
+    assert "blocks=PHOTON_BLOCKS_CURRENT" in branch
+    # The scalar bare-X owner has no transverse operand; the packed consumer
+    # is the only owner of the current-sector exchange.
+    assert "bispinor_v_q_path" not in branch
     assert "charge_block_state=photon_response.charge_block_state" in source
 
 

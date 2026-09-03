@@ -1056,8 +1056,6 @@ def compute_sigma_xc(
             wfns, V_q, meta, mesh_xy,
             Gij=photon_Gij,
             static_head_terms=static_head_terms,
-            wfns_transverse=None,
-            bispinor_v_q_path=None,
             occupation_state=None,
         )
         from .photon_sigma import (
@@ -1160,8 +1158,6 @@ def compute_sigma_xc(
             wfns, V_q, meta, mesh_xy,
             Gij=photon_Gij,
             static_head_terms=static_head_terms,
-            wfns_transverse=None,
-            bispinor_v_q_path=None,
             occupation_state=None,
         )
         from .photon_sigma import (
@@ -1240,42 +1236,18 @@ def compute_sigma_xc(
             do_screened=True,
             static_head_terms=static_head_terms,
             compute_bare_x=True,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
         )
         sig_x = cohsex["sig_x"]
         sig_sx = cohsex["sig_sx"]
         sig_coh = cohsex["sig_coh"]
-        sig_x_b = cohsex["sig_x_b"]
-        if sig_x_b is not None:
-            sigma_xc_incumbent = sig_sx + sig_coh
-            sigma_lorentz = jnp.stack((
-                sigma_xc_incumbent - sig_x_b,
-                jnp.zeros_like(sig_x_b),
-                sig_x_b,
-            ))
     else:
-        _bispinor_sigma = (
-            wfns_transverse is not None and bispinor_v_q_path is not None)
-        sigma_x_result = compute_sigma_x(
+        sig_x = compute_sigma_x(
             wfns, V_q, meta, mesh_xy,
             Gij=Gij,
             static_head_terms=static_head_terms,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
-            return_transverse=_bispinor_sigma,
         )
-        if _bispinor_sigma:
-            sig_x, sig_x_b = sigma_x_result
-            sigma_lorentz = jnp.stack((
-                sig_x - sig_x_b,
-                jnp.zeros_like(sig_x_b),
-                sig_x_b,
-            ))
-        else:
-            sig_x = sigma_x_result
         sig_sx = sig_coh = jnp.zeros_like(sig_x)
 
     # Density-SC rebuilds this same exact G-space operator from the evolving

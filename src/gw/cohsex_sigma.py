@@ -532,8 +532,6 @@ def compute_cohsex_sigma(
     do_screened: bool = True,
     static_head_terms=None,
     compute_bare_x: bool = True,
-    wfns_transverse=None,
-    bispinor_v_q_path=None,
     occupation_state=None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
@@ -620,7 +618,6 @@ def compute_cohsex_sigma(
         sig_coh.block_until_ready()
 
     sig_x = None
-    sig_x_b = None
     if compute_bare_x:
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
@@ -639,40 +636,10 @@ def compute_cohsex_sigma(
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
-        # Bispinor bare exchange: add Σ^B (transverse-only sum over
-        # (i, j) ∈ {1, 2, 3}²) to the bare-X diagnostic AND to the
-        # physical occupied/SX component.  The COHSEX dispatcher builds
-        # Sigma_xc = sig_sx + sig_coh, so this is the single seam that carries
-        # Σ^B into Eqp, the live Hamiltonian and sigma_diag without changing
-        # X_ONLY (which uses compute_sigma_x) or the packed full-photon
-        # route (which replaces all three photon components).  No-op when
-        # ``wfns_transverse`` or ``bispinor_v_q_path`` is missing.  See
-        # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
-        if wfns_transverse is not None and bispinor_v_q_path is not None:
-            # face-layout defensive backstop REMOVED 2026-08-23
-            # (feat/transverse-zeta-face-2026-08-23): compute_sigma_x_
-            # bispinor is representation-aware since feat/bispinor-
-            # face-2026-08-23 (with_lorentz_vertices, face_kernel_kwargs
-            # dispatch) and the low_mem_bands_bispinor_unported envelope
-            # row that made this branch unreachable for face is now
-            # lifted — this call is the real, gated path, not dead code.
-            from .sigma_x_bispinor import compute_sigma_x_bispinor
-            with mesh_xy:
-                sig_x_b = compute_sigma_x_bispinor(
-                    wfns_transverse=wfns_transverse,
-                    Gij=Gij,
-                    bispinor_v_q_path=bispinor_v_q_path,
-                    meta=meta, mesh_xy=mesh_xy,
-                )
-            sig_x_b.block_until_ready()
-            sig_x = sig_x + sig_x_b
-            sig_sx = sig_sx + sig_x_b
-
     return {
         "sig_sx":  sig_sx,
         "sig_coh": sig_coh,
         "sig_x":   sig_x,
-        "sig_x_b": sig_x_b,
     }
 
 
@@ -684,10 +651,7 @@ def compute_sigma_x(
     *,
     Gij: jax.Array | None = None,
     static_head_terms=None,
-    wfns_transverse=None,
-    bispinor_v_q_path=None,
     occupation_state=None,
-    return_transverse: bool = False,
 ):
     """Bare-exchange-only path for modes without static screening.
 
@@ -700,10 +664,6 @@ def compute_sigma_x(
     ``sigma_coh_k(W_q, V_q)`` and so saves two flat-q convolutions per
     call (≈ the ``W_q`` cost on each, roughly half the cohsex_sigma
     wall on dense band manifolds).
-
-    Bispinor: identical to ``compute_cohsex_sigma``'s ``compute_bare_x``
-    branch — Σ^B is added to ``sig_x`` when both ``wfns_transverse``
-    and ``bispinor_v_q_path`` are supplied.
 
     ``occupation_state`` carries the same contract as in
     :func:`compute_cohsex_sigma`: ``None`` is insulating and bit-exact,
@@ -730,21 +690,4 @@ def compute_sigma_x(
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
-    sig_x_b = None
-    if wfns_transverse is not None and bispinor_v_q_path is not None:
-        # face-layout defensive backstop REMOVED 2026-08-23 — see
-        # compute_cohsex_sigma's identical removal, same session/reason.
-        from .sigma_x_bispinor import compute_sigma_x_bispinor
-        with mesh_xy:
-            sig_x_b = compute_sigma_x_bispinor(
-                wfns_transverse=wfns_transverse,
-                Gij=Gij,
-                bispinor_v_q_path=bispinor_v_q_path,
-                meta=meta, mesh_xy=mesh_xy,
-            )
-        sig_x_b.block_until_ready()
-        sig_x = sig_x + sig_x_b
-
-    if return_transverse:
-        return sig_x, sig_x_b
     return sig_x
