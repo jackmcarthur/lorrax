@@ -19,6 +19,16 @@ n ∈ U (see §2). Built once per iteration in the current QP basis exactly as t
 grid and knows nothing about policies; a request outside the grid is a programming
 error there, not a clamp.
 
+For a genuinely iterative dynamic run, map 1 also owns the quadrature for the
+whole SC session.  Each physical product-window box keeps its ordinary near-zero
+edge and receives 2 eV of padding on the state-driven real far edge (both real
+edges for a crossing box); the fitted pole extents receive 10% padding at both
+real and imaginary extrema.  Those rules are certified and cached once.  Every
+later map reuses the exact node and weight arrays when its current box is
+contained.  A box escape is printed edge by edge and permits only that window to
+be rebuilt.  A one-map run retains the ordinary one-shot plan so the iteration-1
+equivalence gate remains exact.
+
 **`BandClasses`** — decided once at setup, by band INDEX, from the deck: P = the Σ
 window `[b0, b3)`; U = the sum-band tail `[b3, b4_user)` (Σ elements among U are never
 computed); mesh padding is ignored. Membership never changes during the loop: no
@@ -40,11 +50,13 @@ the owner picks one from the measurement and the other is deleted:
 function, Hermitian by construction:
 - P×P: ½[Σ_mn(ω_m) + Σ_mn(ω_n)] with (ω_m, ω_n) from the policy, Hermitized;
 - P×U and U×P: Σ_mn(E_F) — the U states rotate with the protected block;
-- U×U: zero off-diagonal; diagonal E^DFT_n + Δ_k;
-- Δ_k (the scissor): at each k, the correction of the highest protected band,
-  [Σ̃_nn − V_xc,nn] at n = b3 - 1.  The U block is therefore continuous with P at
-  its boundary by construction.  There is no affine or per-outer-band fit; its
-  sensitivity is measured (§4), not tuned.
+- U×U: zero off-diagonal; diagonal E^DFT_n + Δ;
+- Δ (the scissor): one number per iteration and spin, the mean over k of the
+  corrections of the two highest protected conduction bands.  This is the
+  pass-1 definition restored by owner ruling on 2026-09-03; the pass-2 local
+  Δ_k is retracted because it moved the MoS2 ladder from 4/6 converged arms to
+  0/6.  There is no affine or per-outer-band fit.  The resulting P/U boundary
+  mismatch remains a reported diagnostic, never a condition that alters Δ.
 
 **`QpHamiltonian`** — H_k = h0_k + Σ̃_k − V_xc,k in the DFT basis (the rotate-back seam as
 today), `eigh` → (E, U) ascending; the Fermi level as today (midgap for insulators,
@@ -53,7 +65,11 @@ meaningful; no state tracking, no damping of near-degenerate pairs (TASTE 59).
 
 **Loop** — iterate the map to `max|ΔE| < sc_tol_ev` over P. The `eqp2` fixed-table loop
 is the same `effective_sigma` on a fixed `SigmaTable`; it stops having its own partition
-path.
+path.  The map is eqp0-type throughout: it reads Σ at the selected energies and
+never uses dΣ/dω or Z.  After a completed map, central-difference Z may be used
+only to write the diagnostic `eqp1_iterNNNN.dat`; after convergence the same raw,
+unguarded BGW-style linearization writes `eqp1.dat` beside `eqp0.dat`.  No Z
+value gates membership, convergence, fallback, or any other SC decision.
 
 ## 2. The P×U block
 
@@ -77,9 +93,10 @@ produced by a single-ω evaluation at E_F (it is static in ω), which is cheap.
   the study arms, the shipped behaviour reverts to the literature method, `clamp`
   (mode A at the energies, edge-clamped), without a further ruling; both are reported.
 - Rules P×U at E_F and U×U scissor are the standard static outer block. Because P/U
-  is by index there is no reclassification.  The local Δ_k removes the diagonal
-  correction mismatch at the P/U boundary; sensitivity to where that boundary is
-  placed remains measured by the nb_P ladder (§4).
+  is by index there is no reclassification.  Constant Δ leaves a measurable
+  diagonal correction mismatch at the P/U boundary; both that mismatch and the
+  sensitivity to where the boundary is placed remain measured by the nb_P ladder
+  (§4), rather than being removed by a k-local change to the map.
 - Metals: classes by index, Fermi level from occupations, and the E_F-evaluated P×U
   block is the natural choice; nothing metal-specific is added.
 
