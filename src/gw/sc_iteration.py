@@ -417,61 +417,22 @@ class SCMapScreeningArtifacts:
 class SCExactHartree:
     """Caller-owned direct field rebuilt from one SC map's orbitals.
 
-    Every matrix is on the full BZ in the original DFT basis.  The stored
-    carriers retain the matrix-element sweep's two-axis mesh padding; the
-    logical accessors trim both band axes only at a consumer.  Keeping the
-    scalar and transverse pieces separate preserves ``sigma_mnk.h5``'s
-    decomposition; :attr:`total` is the only combination that enters the
-    Hamiltonian.
+    Every matrix is on the full BZ in the original DFT basis and retains the
+    matrix-element sweep's two-axis mesh padding.  Keeping the scalar and
+    transverse pieces separate preserves ``sigma_mnk.h5``'s decomposition;
+    :attr:`total` is the only combination that enters final padded outputs.
+    The logical SC Hamiltonian trims at its dedicated fused-add consumer.
     """
 
     scalar_dft: jax.Array
     transverse_dft: jax.Array | None
     efermi_ry: float
-    nb_logical: int
-
-    def __post_init__(self):
-        nb = int(self.nb_logical)
-        components = (("scalar", self.scalar_dft),
-                      ("transverse", self.transverse_dft))
-        for label, component in components:
-            if component is None:
-                continue
-            if (component.ndim != 3
-                    or component.shape[-2] != component.shape[-1]
-                    or component.shape[-1] < nb):
-                raise ValueError(
-                    f"SCExactHartree {label} carrier must be "
-                    f"(nk, nb_padded, nb_padded) with nb_padded >= "
-                    f"nb_logical={nb}; got {component.shape}")
-        if (self.transverse_dft is not None
-                and self.transverse_dft.shape != self.scalar_dft.shape):
-            raise ValueError(
-                "SCExactHartree scalar and transverse carriers must have "
-                f"the same shape; got {self.scalar_dft.shape} and "
-                f"{self.transverse_dft.shape}")
-
-    @property
-    def scalar_logical_dft(self):
-        """Scalar field over the active, unpadded SC band window."""
-        nb = int(self.nb_logical)
-        return self.scalar_dft[..., :nb, :nb]
-
-    @property
-    def transverse_logical_dft(self):
-        """Transverse field over the active, unpadded SC band window."""
-        if self.transverse_dft is None:
-            return None
-        nb = int(self.nb_logical)
-        return self.transverse_dft[..., :nb, :nb]
 
     @property
     def total(self):
-        scalar = self.scalar_logical_dft
-        transverse = self.transverse_logical_dft
-        if transverse is None:
-            return scalar
-        return scalar + transverse
+        if self.transverse_dft is None:
+            return self.scalar_dft
+        return self.scalar_dft + self.transverse_dft
 
 
 def _logical_exact_hartree_term(term, base, *, label: str):
@@ -2116,8 +2077,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     return SCExactHartree(
         scalar_dft=H_scalar,
         transverse_dft=H_transverse,
-        efermi_ry=float(e_f),
-        nb_logical=nb)
+        efermi_ry=float(e_f))
 
 
 def _residency_census(named, print_fn) -> None:
@@ -5426,8 +5386,8 @@ def run_sc_driver(
     else:
         # Already contracted with the unrotated DFT orbitals.  Rotating this
         # through the Sigma-basis U would be a second, erroneous basis change.
-        v_h_scalar = exact_hartree_dft.scalar_logical_dft
-        h_transverse = exact_hartree_dft.transverse_logical_dft
+        v_h_scalar = exact_hartree_dft.scalar_dft
+        h_transverse = exact_hartree_dft.transverse_dft
         sig_h = exact_hartree_dft.total
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
@@ -5646,11 +5606,10 @@ def dump_sigma_omega_h5_final(
         # mixing bases or repeating the rotation on every SC iteration.
         U = _place(sigma_basis_U, mesh_xy, _band_rotation_spec())
         scalar_qp = _rotate_fixed_matrix(
-            exact_hartree_dft.scalar_logical_dft, U,
-            mesh=mesh_xy, to_qp=True)
+            exact_hartree_dft.scalar_dft, U, mesh=mesh_xy, to_qp=True)
         transverse_qp = (
             _rotate_fixed_matrix(
-                exact_hartree_dft.transverse_logical_dft, U,
+                exact_hartree_dft.transverse_dft, U,
                 mesh=mesh_xy, to_qp=True)
             if exact_hartree_dft.transverse_dft is not None else None)
         total_qp = (scalar_qp if transverse_qp is None

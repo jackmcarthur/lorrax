@@ -285,8 +285,8 @@ def test_live_hartree_is_carried_to_both_final_output_seams():
         encoding="utf-8")
     assert "exact_hartree_dft=exact_hartree_dft" in text
     assert "exact_hartree_dft=state_final.outputs.exact_hartree_dft" in text
-    assert "v_h_scalar = exact_hartree_dft.scalar_logical_dft" in text
-    assert "h_transverse = exact_hartree_dft.transverse_logical_dft" in text
+    assert "v_h_scalar = exact_hartree_dft.scalar_dft" in text
+    assert "h_transverse = exact_hartree_dft.transverse_dft" in text
     assert "sig_h = exact_hartree_dft.total" in text
 
 
