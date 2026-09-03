@@ -103,8 +103,8 @@ retain two owners.
 Declaring the twelve current `χ` blocks zero costs **0.012 µeV** (1.2e-8 eV)
 against the screened packed mode on the same deck — the current vertices each
 carry `α_FS/2`, so `χ_TT` enters at `α_FS²`. The former head-on comparison
-mixed two quadratures and two insertion rules. The routes now share one
-quadrature; §3.6 isolates the remaining insertion difference.
+mixed two quadratures and two insertion rules. The packed head and body now
+share one quadrature; §3.6 isolates the remaining insertion difference.
 
 In Coulomb gauge the bare electron–electron interaction, after eliminating
 the photon field, is block diagonal in `(C, T)`:
