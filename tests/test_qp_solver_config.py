@@ -176,6 +176,8 @@ def test_default_bispinor_self_consistency_uses_live_four_current(tmp_path):
     path.write_text(
         BASE_INPUT
         + "bispinor = true\n"
+        + "sys_dim = 2\n"
+        + "compute_mode = mpa\n"
         + "qp_solver = self_consistent\n")
     cfg = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
@@ -203,6 +205,8 @@ def test_bispinor_accepts_live_four_current_self_consistency(tmp_path):
         tmp_path,
         "bispinor = true\n"
         "bispinor_gw = bare_transverse\n"
+        "sys_dim = 2\n"
+        "compute_mode = mpa\n"
         "qp_solver = self_consistent\n"
         "density_self_consistent = true\n")
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
@@ -221,6 +225,8 @@ def test_legacy_bispinor_self_consistency_gets_same_live_default(tmp_path):
             tmp_path,
             "bispinor = true\n"
             "bispinor_gw = bare_transverse\n"
+            "sys_dim = 2\n"
+            "compute_mode = mpa\n"
             "self_consistent = true\n")
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
     assert cfg.density_self_consistent

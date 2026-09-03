@@ -956,6 +956,7 @@ def compute_sigma_xc(
             photon_layout=photon_response.layout,
             meta=meta,
             mesh_xy=mesh_xy,
+            charge_block_state=photon_response.charge_block_state,
             head_completion=photon_response.head_completion,
             diagnostic_basis_rotation=hartree_basis_rotation,
             diagnostic_input_basis=(
@@ -969,11 +970,10 @@ def compute_sigma_xc(
         sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
     elif uses_dynamic_packed_photon_route(config):
         # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
-        # W_packed(w) = diag(W_00(w), W_TT, W_CT): the CHARGE block carries
-        # the run's plasmon-pole model, the twelve CURRENT blocks are frozen
-        # at w = 0.  Because the sixteen-block sum is a plain sum once
-        # W_packed is built, Sigma splits exactly in two and each half keeps
-        # its existing owner:
+        # The scalar GN/HL/MPA owner carries W_00(w).  The packed operator's
+        # CC block and W carrier are absent; its twelve CURRENT blocks are
+        # frozen at w = 0 with W_CURRENT = V_CURRENT.  Sigma therefore splits
+        # exactly in two and each half keeps its existing owner:
         #
         #   Sigma_xc(w) = [ Sigma_x^CC + Sigma_c^CC(w) ]        <- scalar owner
         #               + [ sum_{AB != CC} SX(W_AB) + COH(W_AB - V_AB) ]
@@ -1034,6 +1034,7 @@ def compute_sigma_xc(
             meta=meta,
             mesh_xy=mesh_xy,
             blocks=PHOTON_BLOCKS_CURRENT,
+            charge_block_state=photon_response.charge_block_state,
             head_completion=photon_response.head_completion,
             diagnostic_basis_rotation=hartree_basis_rotation,
             diagnostic_input_basis=(
@@ -1073,7 +1074,7 @@ def compute_sigma_xc(
     elif uses_static_photon_response(config):
         # EXHAUSTIVENESS over the packed route's compute modes.  The two
         # predicates above cover gw_config.PACKED_PHOTON_COMPUTE_MODES; a
-        # packed deck on any other mode (mpa today) reaches here only
+        # packed deck on any other mode reaches here only
         # through a hand-built config that skipped
         # refuse_unsupported_bispinor_gw, and is refused by name rather
         # than served the charge-only scalar path with its transverse
@@ -1082,11 +1083,9 @@ def compute_sigma_xc(
             f"packed four-current mode with compute_mode = "
             f"{getattr(mode, 'value', mode)} has no Sigma branch.  The "
             "packed operator serves compute_mode = cohsex (static, all "
-            "sixteen blocks) and the two-point plasmon-pole pair (dynamic "
-            "charge block, static current blocks).  mpa has no independent "
-            "static-role W for the bare family's CC block "
-            "(gw.screening.screening_requests_for returns none for it), so "
-            "it is refused rather than approximated; see "
+            "sixteen blocks) and all named dynamic modes (scalar dynamic "
+            "charge owner, absent packed CC block, static current blocks); "
+            "see "
             "gw_config.PACKED_PHOTON_COMPUTE_MODES.")
     elif builds_static_screened:
         cohsex = compute_cohsex_sigma(

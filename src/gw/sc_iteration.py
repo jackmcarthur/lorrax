@@ -298,6 +298,11 @@ class SCInputs:
     # re-solves the old endpoint of its Fermi displacement.
     efermi_dft_ry: float
     material_class: str
+    #: Immutable bare-current operator.  On the supported dynamic packed
+    #: route its CC block is absent and it is independent of the QP map;
+    #: each map still rotates both wavefunction bundles and re-contracts it.
+    wfns_transverse_dft: Wavefunctions | None = None
+    photon_response: object | None = None
     #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
     #: runs entirely on the full BZ, which is what every result before
     #: 2026-08-04 did and what the one-shot equivalence gate pins.  When
@@ -2727,6 +2732,18 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         mesh_xy=inputs.mesh_xy,
         active_slice=inputs.band_slices.sigma,
     )
+    wfns_transverse_qp = None
+    if inputs.wfns_transverse_dft is not None:
+        # The packed current vertices are orbital dependent even though the
+        # bare current operator is not.  Reapply this map's SAME U/E update
+        # to the immutable transverse DFT bundle before every contraction.
+        wfns_transverse_qp = rotate_wavefunctions(
+            inputs.wfns_transverse_dft, U_full,
+            enk_active_new=E_full, enk_base=enk_base,
+            efermi=float(efermi_ry),
+            mesh_xy=inputs.mesh_xy,
+            active_slice=inputs.band_slices.sigma,
+        )
 
     # (``entry_occ_state`` was solved above, before the tail scissor that
     # feeds ``enk_base`` — see the block after ``E_full``.)
@@ -3021,6 +3038,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         omit_v_h=exact_hartree_dft is not None,
         iteration_head=iteration_head,
         material_class=inputs.material_class,
+        wfns_transverse=wfns_transverse_qp,
+        photon_response=inputs.photon_response,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
@@ -3029,6 +3048,25 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             "SigmaResult Hartree-omission receipt disagrees with the "
             "density-SC direct-field owner")
     _check_sigma_stage(sigma_result, print_fn=inputs.print_fn)
+    if inputs.photon_response is not None:
+        if sigma_result.sigma_lorentz_skij_ry is None:
+            raise RuntimeError(
+                "dynamic packed SC map returned no Lorentz-sector "
+                "diagnostics")
+        sig_tt = float(jax.device_get(jnp.max(jnp.abs(jnp.diagonal(
+            sigma_result.sigma_lorentz_skij_ry[2],
+            axis1=-2, axis2=-1))))) * RYD_TO_EV
+        head_tt = 0.0
+        if sigma_result.photon_head_sigma_diag_tskn_ry is not None:
+            head_tt = float(jax.device_get(jnp.max(jnp.abs(
+                sigma_result.photon_head_sigma_diag_tskn_ry[1:, 2].sum(
+                    axis=0))))) * RYD_TO_EV
+        _record_sc(
+            inputs,
+            f"  SC packed current map {state.iteration:04d}: "
+            f"max|sigTT|={sig_tt:.12e} eV; "
+            f"max|head_TT|={head_tt:.12e} eV; "
+            "operator=fixed bare current, orbitals=this map")
 
     # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
     # (as if every band were protected); the partition step below masks
@@ -4900,6 +4938,8 @@ def run_sc_driver(
     tensors_filename: str,
     enk_dft,
     material_class: str,
+    wfns_transverse=None,
+    photon_response=None,
     print_fn: Callable = print,
     record_fn: Callable | None = None,
 ) -> SCDriverResult:
@@ -4946,6 +4986,19 @@ def run_sc_driver(
         cannot be separated at the caller boundary.
     """
     import dataclasses
+
+    from .gw_config import uses_dynamic_packed_photon_route
+    packed_dynamic = uses_dynamic_packed_photon_route(config)
+    if packed_dynamic and (wfns_transverse is None or photon_response is None):
+        raise ValueError(
+            "GATE packed_dynamic_sc_requires_current_operator: a dynamic "
+            "packed SC map needs both the transverse DFT bundle and the "
+            "immutable bare-current photon response")
+    if not packed_dynamic and (wfns_transverse is not None
+                               or photon_response is not None):
+        raise ValueError(
+            "SC driver received packed-current inputs for a deck outside "
+            "the dynamic packed route")
 
     # THE b0 == 0 ASSUMPTION, MADE EXPLICIT.  Every occupancy in this
     # module indexes the ACTIVE window with a GLOBAL band count:
@@ -5095,6 +5148,8 @@ def run_sc_driver(
         # insulator, the existing initial fixed-N _mu_ry on a metal.
         efermi_dft_ry=efermi_dft_scissor_ry,
         material_class=material_class,
+        wfns_transverse_dft=wfns_transverse,
+        photon_response=photon_response,
         kstar=kstar,
         parallel_transport=parallel_transport,
         fixed_dft_head_response=fixed_dft_head_response,

@@ -39,6 +39,13 @@ head_correction = full
 _PACKED_BARE_LOCAL_SOLVER = _PACKED_BARE.replace(
     "w_dyson_solver = distributed\n", "w_dyson_solver = local\n")
 
+_PACKED_SCREENED = _PACKED_BARE.replace(
+    "bispinor_gw = bare_transverse\n",
+    "bispinor_gw = full_static_cohsex\n")
+
+_PACKED_BARE_SC = _PACKED_BARE.replace(
+    "qp_solver = one_shot_dft\n", "qp_solver = self_consistent\n")
+
 _PPM_KEYS = """\
 use_ppm_sigma = true
 ppm_omega_p = 2.0
@@ -89,20 +96,62 @@ def test_cohsex_bispinor_still_replaces_the_charge_sigma(tmp_path):
     assert not uses_dynamic_packed_photon_route(cfg)
 
 
-def test_mpa_bispinor_does_not_take_the_packed_route(tmp_path):
-    """MPA has no independent static-role W; it must not be served silently."""
+def test_mpa_bare_bispinor_takes_absent_charge_packed_route(tmp_path):
+    """MPA needs no static W because the current consumer skips packed CC."""
     from gw.gw_config import (PACKED_PHOTON_COMPUTE_MODES, ComputeMode,
                               packed_bare_transverse_route,
                               uses_dynamic_packed_photon_route,
                               uses_static_photon_response)
-    assert ComputeMode.MPA not in PACKED_PHOTON_COMPUTE_MODES
+    assert ComputeMode.MPA in PACKED_PHOTON_COMPUTE_MODES
     cfg = _config(
         tmp_path, _PACKED_BARE + "compute_mode = mpa\n", name="mpa_packed.in")
     taken, reason = packed_bare_transverse_route(cfg)
-    assert not taken
-    assert "compute_mode = mpa" in reason
-    assert not uses_static_photon_response(cfg)
-    assert not uses_dynamic_packed_photon_route(cfg)
+    assert taken, reason
+    assert "DYNAMIC" in reason
+    assert uses_static_photon_response(cfg)
+    assert uses_dynamic_packed_photon_route(cfg)
+
+
+@pytest.mark.parametrize("mode", ["gn_ppm", "hl_ppm", "mpa"])
+def test_self_consistent_bare_dynamic_modes_take_packed_route(tmp_path, mode):
+    from gw.gw_config import (packed_bare_transverse_route,
+                              uses_dynamic_packed_photon_route)
+
+    extra = _PACKED_BARE_SC + f"compute_mode = {mode}\n"
+    if mode != "mpa":
+        extra += _PPM_KEYS
+    cfg = _config(tmp_path, extra, name=f"sc_{mode}.in")
+    taken, reason = packed_bare_transverse_route(cfg)
+    assert taken, reason
+    assert "self-consistent" in reason
+    assert uses_dynamic_packed_photon_route(cfg)
+
+
+def test_screened_mpa_refuses_missing_static_role_by_name(tmp_path):
+    with pytest.raises(ValueError) as exc:
+        _config(
+            tmp_path, _PACKED_SCREENED + "compute_mode = mpa\n",
+            name="screened_mpa.in")
+    assert "GATE packed_screened_mpa_static_role_unimplemented" in str(exc.value)
+
+
+def test_screened_self_consistency_refuses_per_map_cost_by_name(tmp_path):
+    with pytest.raises(ValueError) as exc:
+        _config(
+            tmp_path,
+            _PACKED_SCREENED.replace(
+                "qp_solver = one_shot_dft\n", "qp_solver = self_consistent\n")
+            + _PPM_KEYS + "compute_mode = gn_ppm\n",
+            name="screened_sc.in")
+    assert "GATE packed_screened_self_consistency_unimplemented" in str(exc.value)
+
+
+def test_bare_cohsex_self_consistency_refuses_charge_rebuild_by_name(tmp_path):
+    with pytest.raises(ValueError) as exc:
+        _config(
+            tmp_path, _PACKED_BARE_SC + "compute_mode = cohsex\n",
+            name="bare_cohsex_sc.in")
+    assert "GATE packed_bare_cohsex_self_consistency_unimplemented" in str(exc.value)
 
 
 def test_scalar_decks_are_untouched_by_the_new_grammar(tmp_path):
@@ -201,6 +250,33 @@ def test_the_dispatch_asks_for_the_current_blocks_only():
     assert "blocks=PHOTON_BLOCKS_CURRENT" in source
     # and the scalar bare-X call in that branch must not fold Sigma^B twice
     assert "bispinor_v_q_path=None," in source
+    assert "charge_block_state=photon_response.charge_block_state" in source
+
+
+def test_absent_charge_state_has_no_packed_w_and_aliases_current_to_v():
+    """The layout is named absence, never a zero CC tile posing as W."""
+    import inspect
+
+    from gw import photon_sigma, w_isdf
+    from gw.head_correction import STATIC_PHOTON_CHARGE_BLOCK_ABSENT
+
+    assert STATIC_PHOTON_CHARGE_BLOCK_ABSENT == "absent_dynamic_scalar_owner"
+    build_source = inspect.getsource(w_isdf.compute_static_photon_response)
+    consume_source = inspect.getsource(photon_sigma.compute_static_photon_sigma)
+    assert "W_packed = None" in build_source
+    assert "V_AB if charge_absent" in consume_source
+    assert "charge_absent and blocks != PHOTON_BLOCKS_CURRENT" in consume_source
+
+
+def test_sc_map_rotates_and_recontracts_current_bundle():
+    import inspect
+
+    from gw import sc_iteration
+    source = inspect.getsource(sc_iteration.gw_iteration_map)
+    assert "wfns_transverse_qp = rotate_wavefunctions" in source
+    assert "wfns_transverse=wfns_transverse_qp" in source
+    assert "photon_response=inputs.photon_response" in source
+    assert "SC packed current map" in source
 
 
 # ---------------------------------------------------------------------------

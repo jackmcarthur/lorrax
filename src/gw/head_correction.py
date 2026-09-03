@@ -1119,22 +1119,44 @@ def static_slab_photon_head_moment_chunk(
 class StaticPhotonQ0FactorCarrier:
     """Bounded factors for the exact q=0 updates inserted into V and W.
 
-    The bare pair and nine screened pairs are the completed factors, after
-    the coupled 4x4 Dyson/cubature transaction.  They are retained only so
-    the incumbent Sigma contraction can attribute the FINAL Lorentz blocks
-    linearly; they are not a second response model or a packed-body copy.
+    Charge-present completion carries one bare pair plus the nine coupled
+    screened moment pairs.  Absent-charge dynamic completion carries the bare
+    pair once for V and once as the named logical ``W_CURRENT = V_CURRENT``
+    factor.  They are retained only so the Sigma contraction can attribute
+    final Lorentz blocks linearly; they are not a second response model or a
+    packed-body copy.
     """
 
     bare_pair: tuple[jax.Array, jax.Array]
     screened_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+    charge_block_state: str
 
     def __post_init__(self) -> None:
         if len(self.bare_pair) != 2:
             raise ValueError("static photon bare q=0 carrier needs one pair")
-        if len(self.screened_pairs) != 9:
+        if self.charge_block_state not in STATIC_PHOTON_CHARGE_BLOCK_STATES:
             raise ValueError(
-                "static photon screened q=0 carrier needs the complete "
-                f"3x3 moment grid (9 pairs); got {len(self.screened_pairs)}")
+                "static photon q=0 carrier has invalid charge-block state "
+                f"{self.charge_block_state!r}")
+        expected = (
+            9 if self.charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT
+            else 1)
+        if len(self.screened_pairs) != expected:
+            raise ValueError(
+                "static photon q=0 carrier has the wrong screened-factor "
+                f"count for charge_block_state={self.charge_block_state!r}: "
+                f"expected {expected}, got {len(self.screened_pairs)}")
+
+
+#: Named packed-operator layout states.  The absent state is not a zero CC
+#: tile: no W carrier exists in that route.  The scalar dynamic Sigma owner
+#: carries W_00(omega), while photon_sigma aliases W_CURRENT to V_CURRENT.
+STATIC_PHOTON_CHARGE_BLOCK_PRESENT = "present_static"
+STATIC_PHOTON_CHARGE_BLOCK_ABSENT = "absent_dynamic_scalar_owner"
+STATIC_PHOTON_CHARGE_BLOCK_STATES = (
+    STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
+    STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
+)
 
 
 @dataclass(frozen=True)
@@ -1142,23 +1164,24 @@ class StaticSlabPhotonHeadCompletion:
     """Evidence and bounded runtime carrier for one slab q=0 completion."""
 
     bare_D_mean: np.ndarray
-    screened_moments: np.ndarray
+    screened_moments: np.ndarray | None
     cubature_receipt: object
     observed_physical_counts: tuple[int, int, int]
-    observed_padded_solve_counts: tuple[int, int, int]
-    max_backward_residual: float
-    min_dyson_singular_value: float
-    max_dyson_condition_number: float
-    max_dyson_forward_error_bound: float
+    observed_padded_solve_counts: tuple[int, int, int] | None
+    max_backward_residual: float | None
+    min_dyson_singular_value: float | None
+    max_dyson_condition_number: float | None
+    max_dyson_forward_error_bound: float | None
     mixed_scale_qstar: float
     mixed_convergence_error_ratios: tuple[float, float]
-    ward_residual: float
-    hermiticity_residual: float
+    ward_residual: float | None
+    hermiticity_residual: float | None
     #: The Hall pseudovector that entered ``R(q)`` (bohr^-1) and where it
     #: came from (the authenticated artifact producer, or the announced
     #: ``sigma_H = 0`` default when no ``static_gauge_hall_file`` exists).
     sigma_H: np.ndarray
     hall_source: str
+    charge_block_state: str
     q0_factors: StaticPhotonQ0FactorCarrier
 
 
@@ -1319,6 +1342,12 @@ def _require_static_photon_numerical_certificate(
             f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}\n"
             "  why:  inserting a head whose rigorous error exceeds the "
             "budget would publish uncertified q=0 matrix elements")
+    _require_static_photon_polygon_certificate(mixed_error_ratios)
+    return max_forward_error_bound
+
+
+def _require_static_photon_polygon_certificate(mixed_error_ratios) -> None:
+    """Require convergence of the provider's fixed 16/24/32 ladder."""
     convergence = np.asarray(mixed_error_ratios, dtype=np.float64)
     if (convergence.shape != (2,) or not np.all(np.isfinite(convergence))):
         raise ValueError(
@@ -1337,22 +1366,55 @@ def _require_static_photon_numerical_certificate(
             f"error_ratio={convergence[-1]:.3e} > 1.  The provider ladder "
             "is fixed; refusing insertion rather than accepting a caller "
             "dial.")
-    return max_forward_error_bound
+
+
+def _insert_bare_static_photon_q0(
+    V_packed,
+    layout,
+    g0_X,
+    g0_Y,
+    D_mean,
+    cell_volume,
+    *,
+    mesh_xy,
+):
+    """Insert the one bare ``<D>`` factor and return its bounded pair."""
+    from .photon_layout import add_photon_q0_low_rank
+
+    dtype = V_packed.dtype
+    sh_x = NamedSharding(mesh_xy, P(None, "x"))
+    sh_y = NamedSharding(mesh_xy, P(None, "y"))
+    volume = jnp.asarray(float(cell_volume), dtype=jnp.float64)
+    with mesh_xy:
+        left_bare = jax.lax.with_sharding_constraint(
+            jnp.conj(g0_X).astype(dtype), sh_x)
+        right_bare = jax.lax.with_sharding_constraint(
+            jnp.einsum(
+                "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
+                optimize=True) / volume,
+            sh_y)
+    V_packed = add_photon_q0_low_rank(
+        V_packed, layout, mesh_xy,
+        left_rows_X=left_bare, right_rows_Y=right_bare)
+    return V_packed, (left_bare, right_bare)
 
 
 def complete_static_slab_photon_q0(
     V_packed: jax.Array,
-    W_packed: jax.Array,
+    W_packed: jax.Array | None,
     response,
     g0_X: jax.Array,
     g0_Y: jax.Array,
     cubature_receipt,
     *,
     mesh_xy: Mesh,
-) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
+    charge_block_state: str,
+    layout=None,
+) -> tuple[jax.Array, jax.Array | None, StaticSlabPhotonHeadCompletion]:
     r"""Complete bare and screened packed photon operators in the Γ cell.
 
-    ``response`` is the sealed bounded
+    With ``charge_block_state = present_static``, ``response`` is the sealed
+    bounded
     :class:`gw.static_gauge_response.StaticPhotonHeadResponse` (charge
     ``S^{00}``, charge wings, ``sigma_H``); the kernel below constructs the
     Hall tensor from ``sigma_H`` itself, so no arbitrary linear CT/TC matrix
@@ -1362,21 +1424,48 @@ def complete_static_slab_photon_q0(
     four-field head Dyson equation; only its ``(1,qx,qy)`` moments survive.
     The packed body is then updated by one bare and nine screened rank-four
     outer products.  No sample-by-centroid tensor or second photon packing
-    convention exists.
+    convention exists.  With ``absent_dynamic_scalar_owner``, the dynamic
+    scalar Sigma path owns ``W_00(omega)`` and the packed operator has no CC
+    block or W carrier.  This same function then averages and inserts only
+    the bare ``<D>`` factor; its current-sector W is the named identity
+    ``W_CURRENT = V_CURRENT`` consumed by :mod:`gw.photon_sigma`.  No charge
+    S/wing fold or coupled Dyson solve is evaluated in that state.
     """
-    from .photon_layout import (
-        MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
+    from .photon_layout import MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank
     from .static_gauge_response import require_static_photon_head_response
 
-    response = require_static_photon_head_response(response, mesh_xy)
-    layout = response.layout
+    if charge_block_state not in STATIC_PHOTON_CHARGE_BLOCK_STATES:
+        raise ValueError(
+            "static photon completion requires charge_block_state in "
+            f"{STATIC_PHOTON_CHARGE_BLOCK_STATES}; got "
+            f"{charge_block_state!r}")
+    charge_present = (
+        charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT)
+    if charge_present:
+        if layout is not None:
+            raise ValueError(
+                "present static charge completion takes its layout from the "
+                "sealed response; an external layout would have two owners")
+        response = require_static_photon_head_response(response, mesh_xy)
+        layout = response.layout
+        if W_packed is None:
+            raise ValueError(
+                "present static charge completion requires a packed W body")
+    else:
+        if response is not None or W_packed is not None or layout is None:
+            raise ValueError(
+                "absent dynamic charge completion requires response=None, "
+                "W_packed=None and an explicit photon layout")
+        layout.assert_mesh(mesh_xy)
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
     if (tuple(V_packed.shape) != packed_shape
-            or tuple(W_packed.shape) != packed_shape):
+            or (W_packed is not None and tuple(W_packed.shape) != packed_shape)):
         raise ValueError(
-            "coupled photon head requires equal packed V/W bodies; got "
-            f"V={V_packed.shape}, W={W_packed.shape}, expected={packed_shape}")
+            "static photon head received incompatible packed bodies; got "
+            f"V={V_packed.shape}, "
+            f"W={None if W_packed is None else W_packed.shape}, "
+            f"expected={packed_shape}")
     factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
     if tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape:
         raise ValueError(
@@ -1386,6 +1475,84 @@ def complete_static_slab_photon_q0(
     cubature_receipt = validate_slab_minibz_photon_receipt(
         cubature_receipt)
     cell_volume = float(cubature_receipt.cell_volume)
+
+    if not charge_present:
+        # The provider already evaluated the bare Coulomb-gauge propagator
+        # D(q) on every fixed-ladder point.  Average that exact carrier only;
+        # there is deliberately no response object from which a charge fold
+        # could be performed in this layout state.
+        per_order_D = []
+        observed_physical = []
+        for chunk in cubature_receipt.chunks:
+            D_raw = np.asarray(chunk.D_raw, dtype=np.complex128)
+            weight = np.asarray(chunk.sample_weight, dtype=np.float64)
+            n_valid = int(chunk.physical_count)
+            if (D_raw.ndim != 3 or D_raw.shape[1:] != (4, 4)
+                    or D_raw.shape[0] != weight.shape[0]
+                    or not 0 < n_valid <= D_raw.shape[0]):
+                raise ValueError(
+                    "GATE static_photon_bare_cubature_shape: provider bare "
+                    "D rows do not match the authenticated cubature carrier.\n"
+                    f"  got: D={D_raw.shape}, weight={weight.shape}, "
+                    f"physical_count={n_valid}\n"
+                    "  want: padded (n,4,4) D, (n,) weights and 0<count<=n\n"
+                    "  why: the bare Gamma average cannot infer or truncate "
+                    "provider rows")
+            measure = float(np.sum(weight[:n_valid]))
+            if (not np.isfinite(measure) or measure <= 0.0
+                    or np.any(weight[n_valid:] != 0.0)):
+                raise ValueError(
+                    "provider-issued photon cubature has invalid bare-D "
+                    "weights or padded-row support")
+            per_order_D.append(
+                np.einsum(
+                    "q,qAB->AB", weight[:n_valid], D_raw[:n_valid],
+                    optimize=True) / measure)
+            observed_physical.append(n_valid)
+        if tuple(observed_physical) != cubature_receipt.physical_counts:
+            raise RuntimeError(
+                "executed bare photon counts differ from the vcoul receipt: "
+                f"physical={tuple(observed_physical)}/"
+                f"{cubature_receipt.physical_counts}")
+        mixed_error_ratios = tuple(
+            _static_photon_mixed_error_ratio(
+                [per_order_D[index - 1]], [per_order_D[index]])
+            for index in range(1, len(per_order_D)))
+        D_mean = per_order_D[-1]
+        if not np.all(np.isfinite(D_mean)):
+            raise ValueError(
+                "GATE static_photon_polygon_nonfinite: the bare <D> "
+                "cubature average contains nonfinite values")
+        _require_static_photon_polygon_certificate(mixed_error_ratios)
+        V_packed, bare_pair = _insert_bare_static_photon_q0(
+            V_packed, layout, g0_X, g0_Y, D_mean, cell_volume,
+            mesh_xy=mesh_xy)
+        V_packed.block_until_ready()
+        evidence = StaticSlabPhotonHeadCompletion(
+            bare_D_mean=D_mean,
+            screened_moments=None,
+            cubature_receipt=cubature_receipt,
+            observed_physical_counts=tuple(observed_physical),
+            observed_padded_solve_counts=None,
+            max_backward_residual=None,
+            min_dyson_singular_value=None,
+            max_dyson_condition_number=None,
+            max_dyson_forward_error_bound=None,
+            mixed_scale_qstar=np.sqrt(float(cubature_receipt.polygon_area)),
+            mixed_convergence_error_ratios=mixed_error_ratios,
+            ward_residual=None,
+            hermiticity_residual=None,
+            sigma_H=np.zeros(3, dtype=np.float64),
+            hall_source=(
+                "not consumed: bare_transverse declares W_CT=0"),
+            charge_block_state=charge_block_state,
+            q0_factors=StaticPhotonQ0FactorCarrier(
+                bare_pair=bare_pair,
+                # Logical W_CURRENT is exactly V_CURRENT in the bare family.
+                screened_pairs=(bare_pair,),
+                charge_block_state=charge_block_state),
+        )
+        return V_packed, None, evidence
 
     # The headless Gamma body remains resident and 2-D sharded.  Four calls
     # reuse the sole bounded Schur-fold graph; broadcasting W over the two
@@ -1521,17 +1688,9 @@ def complete_static_slab_photon_q0(
     sh_x = NamedSharding(mesh_xy, P(None, "x"))
     sh_y = NamedSharding(mesh_xy, P(None, "y"))
     volume = jnp.asarray(float(cell_volume), dtype=jnp.float64)
-    with mesh_xy:
-        left_bare = jax.lax.with_sharding_constraint(
-            jnp.conj(g0_X).astype(dtype), sh_x)
-        right_bare = jax.lax.with_sharding_constraint(
-            jnp.einsum(
-                "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
-                optimize=True) / volume,
-            sh_y)
-    V_packed = add_photon_q0_low_rank(
-        V_packed, layout, mesh_xy,
-        left_rows_X=left_bare, right_rows_Y=right_bare)
+    V_packed, (left_bare, right_bare) = _insert_bare_static_photon_q0(
+        V_packed, layout, g0_X, g0_Y, D_mean, cell_volume,
+        mesh_xy=mesh_xy)
 
     left_basis = (
         left_bare,
@@ -1572,9 +1731,11 @@ def complete_static_slab_photon_q0(
         sigma_H=np.asarray(
             jax.device_get(response.sigma_H), dtype=np.float64),
         hall_source=str(response.hall_source),
+        charge_block_state=charge_block_state,
         q0_factors=StaticPhotonQ0FactorCarrier(
             bare_pair=(left_bare, right_bare),
-            screened_pairs=tuple(screened_pairs)),
+            screened_pairs=tuple(screened_pairs),
+            charge_block_state=charge_block_state),
     )
     return V_packed, W_packed, evidence
 
