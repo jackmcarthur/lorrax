@@ -382,6 +382,7 @@ def finalize_dynamic_sigma(
     sigma_c_odd_body_omega=None,
     ppm_probe_hermiticity_residual=None,
     ppm_odd_even_residue_ratio=None,
+    qsgw_offdiagonal_efermi_ev: float | None = None,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
 
@@ -516,8 +517,13 @@ def finalize_dynamic_sigma(
             one_sided_core_mask = (
                 (band_ids >= int(meta.nelec) - int(config.nval))
                 & (band_ids < int(meta.nelec) + int(config.ncond)))
-        qsgw_edge_kwargs = ({"one_sided_core_mask": one_sided_core_mask}
-                             if one_sided_core_mask is not None else {})
+        qsgw_edge_kwargs = (
+            {"one_sided_core_mask": one_sided_core_mask}
+            if (one_sided_core_mask is not None
+                and qsgw_offdiagonal_efermi_ev is None) else {})
+        if qsgw_offdiagonal_efermi_ev is not None:
+            qsgw_edge_kwargs["offdiagonal_efermi_ev"] = float(
+                qsgw_offdiagonal_efermi_ev)
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
@@ -525,11 +531,26 @@ def finalize_dynamic_sigma(
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
-        if one_sided_core_mask is not None:
+        if qsgw_offdiagonal_efermi_ev is not None:
+            print_fn(
+                "  QSGW SC update: diagonal Sigma_mm at clip(E_m), "
+                "off-diagonal Sigma_mn at E_F "
+                f"({float(qsgw_diag['offdiagonal_efermi_ev']):+.6f} eV "
+                "on the relative omega grid); "
+                f"diagonal clips={int(qsgw_diag['n_clipped'])}, "
+                "E_F clipped="
+                f"{bool(qsgw_diag['efermi_was_clipped'])}")
+        if (one_sided_core_mask is not None
+                and qsgw_offdiagonal_efermi_ev is None):
             print_fn(
                 "  QSGW window edge: one-sided Sigma(E_core) on "
                 f"{int(qsgw_diag['n_one_sided_edges'])} ordered "
                 "(k,m,n) couplings")
+        elif one_sided_core_mask is not None:
+            print_fn(
+                "  QSGW window edge: sc_buffer_mode=one_sided retains "
+                "core-buffer couplings; the SC update evaluates them at "
+                "E_F with every other off-diagonal")
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
@@ -658,6 +679,8 @@ def compute_sigma_xc(
     occupation_state=None,
     material_class: str,
     fixed_quadrature_session=None,
+    qsgw_offdiagonal_efermi_ev: float | None = None,
+    frozen_screening_model: bool = False,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -1318,8 +1341,24 @@ def compute_sigma_xc(
         # One occupation state per iteration: head fit vs body (skips when
         # occupation_state is None; refuses an unstamped head under metal).
         from .mpa.sigma import assert_head_body_occupation_match
-        assert_head_body_occupation_match(
-            head.get("occupation_stamps") or {}, occupation_state)
+        head_stamps = head.get("occupation_stamps") or {}
+        if frozen_screening_model and occupation_state is not None:
+            # The outer occupation belongs to W and its pole residues; the
+            # current occupation belongs to G.  Equality is deliberately not
+            # expected in a frozen-W inner map, but an unstamped metallic
+            # store would still make the outer side unverifiable.
+            if (head_stamps.get("occ_hash") is None
+                    or head_stamps.get("mu_ry") is None):
+                raise ValueError(
+                    "frozen metallic MPA screening requires an "
+                    "occupation-stamped outer head fit")
+            print_fn(
+                "  MPA frozen screening: outer head occ_hash="
+                f"{head_stamps['occ_hash']}, current G occ_hash="
+                f"{occupation_state.occ_hash}; the mismatch is the "
+                "two-level W[G_outer] / G_inner construction")
+        else:
+            assert_head_body_occupation_match(head_stamps, occupation_state)
         if iteration_head is None:
             sigma_bands = wfns.slices.sigma
             head_enk = np.asarray(wfns.enk[:, sigma_bands])
@@ -1357,7 +1396,8 @@ def compute_sigma_xc(
             # reference "fixed-N mu", so a midgap MPA run would be written
             # into sigma_mnk.h5 as a metal's chemical potential.
             efermi_ry=sigma_efermi_ry,
-            efermi_provenance=sigma_efermi_provenance)
+            efermi_provenance=sigma_efermi_provenance,
+            qsgw_offdiagonal_efermi_ev=qsgw_offdiagonal_efermi_ev)
 
     # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
     # What follows is the two-point plasmon-pole pipeline, and until this
@@ -1424,6 +1464,7 @@ def compute_sigma_xc(
         ppm_probe_hermiticity_residual=(
             ppm_outputs.probe_hermiticity_residual),
         ppm_odd_even_residue_ratio=ppm_outputs.odd_even_residue_ratio,
+        qsgw_offdiagonal_efermi_ev=qsgw_offdiagonal_efermi_ev,
         print_fn=print_fn,
     )
 

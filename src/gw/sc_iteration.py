@@ -1,7 +1,8 @@
 """Self-consistent QSGW iteration map.
 
-A single ``state → state`` step :func:`gw_iteration_map` and a small
-Python-loop driver :func:`run_self_consistency` that wraps it.  The
+A single ``state → state`` step :func:`gw_iteration_map`, an inner
+Python-loop driver :func:`run_self_consistency`, and the two-level outer
+orchestrator in :mod:`gw.sc_two_level`.  The
 state is :class:`SCState` carrying ``H_qp_dft_mnk`` in the **original
 DFT basis** (so the iteration carry has a fixed coordinate system; rcrop
 Anderson mixing composes meaningfully).  Every iteration:
@@ -11,8 +12,9 @@ Anderson mixing composes meaningfully).  Every iteration:
 2. Rotate the **original** DFT wfn bundle to the new QP basis via
    :func:`wavefunction_bundle.rotate_wavefunctions` (no cumulative
    U-product, no drift).
-3. Recompute χ₀ → W → Σ_xc with the rotated wfns
-   (:func:`sigma_dispatch.compute_sigma_xc`, mode-orthogonal).
+3. At an outer boundary recompute χ₀ → W and the pole model; within an inner
+   solve reuse that screening transaction and rebuild only G → Σ_xc with the
+   rotated wfns (:func:`sigma_dispatch.compute_sigma_xc`, mode-orthogonal).
 4. Rotate ``(V_H + Σ_xc)`` back to the DFT basis and form
    ``H_qp_dft = kin_ion_dft + (V_H + Σ_xc)_dft``.
 
@@ -321,6 +323,11 @@ class SCInputs:
     #: reuses the exact node arrays thereafter.  A padded-box escape refuses
     #: instead of changing the quadrature inside the fixed-point map.
     fixed_quadrature_session: dict | None = None
+    #: Frozen χ0/W/pole-model transaction for a two-level inner solve.
+    #: ``None`` builds screening from this map's orbitals; otherwise the map
+    #: rebuilds G and Sigma from the retained model without entering the
+    #: screening producer.  Set only by :mod:`gw.sc_two_level`.
+    frozen_screening: SCMapScreeningArtifacts | None = None
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
     # record.  Component chatter remains on ``print_fn`` and can still be
@@ -394,23 +401,56 @@ def _carry_sc_buffer_diagonal(H_new, H_input, buffer_mask):
 class SCMapScreeningArtifacts:
     """Screening artifacts owned by one completed QSGW map evaluation.
 
-    These three values belong to the same map evaluation, and the static
+    These values belong to the same map evaluation, and the static
     terms are the exact ones passed to that map's Sigma build.  Under FULL,
     the head and terms are folded through this map's exact static/probe W
     role table.  Under NLF they deliberately remain independent of the W
     body.  Keeping the artifacts together prevents a restart writer from
     pairing a final head with a seed/previous W.  Only the static W is
     retained; probe-frequency W is not restart-owned and must not survive
-    the map.
+    the map on the historical single-level path.  The two-level path retains
+    the complete role mapping only for the lifetime of its current inner
+    solve, then releases it before the next outer producer allocates W.
 
-    ``static_w`` stays in its producer's two-dimensional mesh sharding.  The
-    driver persists it once, immediately after the solver accepts this map,
-    then drops it before the post-SC artifact builds.
+    ``sigma_model`` is the complete role mapping consumed by
+    :func:`gw.sigma_dispatch.compute_sigma_xc`: resident static/probe W for
+    PPM or the disk-backed pole-store path for MPA.  Keeping that one mapping
+    is what makes a frozen-screening inner loop reuse the exact model rather
+    than reconstructing a second representation.  ``static_w`` aliases its
+    static role for restart persistence and stays in the producer's
+    two-dimensional mesh sharding.  The driver drops both after persistence
+    and before the post-SC artifact builds.
     """
 
     static_w: object | None
     iteration_head: object | None
     static_head_terms: object | None
+    sigma_model: object | None = None
+
+
+def _retarget_frozen_iteration_head(
+    head,
+    *,
+    energies_ry,
+    occupations,
+    efermi_ry: float,
+):
+    """Attach the current Green-function state to frozen head samples.
+
+    The samples (and therefore their fitted screening poles) belong to the
+    outer step and remain immutable.  Their band-energy/occupation fields are
+    Green-function inputs used only when evaluating the head self-energy, so
+    an inner map replaces those fields with its current QP state.  This is the
+    head analogue of rebuilding the body Sigma from a frozen W store.
+    """
+    if head is None:
+        return None
+    return replace(
+        head,
+        sigma_energies_ry=np.asarray(energies_ry, dtype=np.float64),
+        sigma_occupations=np.asarray(occupations, dtype=np.float64),
+        efermi_ry=float(efermi_ry),
+    )
 
 
 @dataclass(frozen=True)
@@ -2333,15 +2373,24 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     the latter supplies only edge hysteresis and never freezes the Fermi
     anchor or current-spectrum classification.
 
-    Screening is mode-orthogonal: each iteration asks
+    Screening is mode-orthogonal: an outer call asks
     :func:`gw.screening.compute_screening_model` for the configured Σ
     scheme's screening representation and hands the resulting
     ``{role → W_q}`` dict to
-    :func:`gw.sigma_dispatch.compute_sigma_xc`.  No ``compute_chi0``
-    call lives here directly — adding a new Σ scheme that wants extra
-    W frequencies is purely a screening + compute_sigma_xc change.
+    :func:`gw.sigma_dispatch.compute_sigma_xc`; an inner call receives that
+    same mapping through ``inputs.frozen_screening`` and skips the producer.
+    No ``compute_chi0`` call lives here directly — adding a new Σ scheme that
+    wants extra W frequencies is purely a screening + compute_sigma_xc
+    change.
     """
     n_occ = int(inputs.meta.nelec)
+    frozen_screening = inputs.frozen_screening
+    if (frozen_screening is not None
+            and frozen_screening.sigma_model is None):
+        raise ValueError(
+            "GATE sc_frozen_screening_model_missing: a two-level inner "
+            "map requested frozen screening but SCMapScreeningArtifacts "
+            "contains no Sigma screening model")
     E_qp_ry = U_qp = None
     if state.iteration == 0:
         # The canonical initial carry (``make_initial_state_from_dft``)
@@ -2599,7 +2648,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
     screening_reuse = None
     certified_fit = None
-    if mpa_mode and inputs.quad is None:
+    if mpa_mode and inputs.quad is None and frozen_screening is None:
         if inputs.config.head.correction is HeadCorrection.FULL:
             raise ValueError(
                 "MPA certified-fit reuse with no screening quadrature cannot "
@@ -2791,9 +2840,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
-    requests, mpa_plan, head_omegas = _sc_head_frequency_plan(
-        inputs.config, inputs.quad, certified_fit=certified_fit,
-        mesh_xy=inputs.mesh_xy, material_class=inputs.material_class)
+    if frozen_screening is None:
+        requests, mpa_plan, head_omegas = _sc_head_frequency_plan(
+            inputs.config, inputs.quad, certified_fit=certified_fit,
+            mesh_xy=inputs.mesh_xy, material_class=inputs.material_class)
+    else:
+        requests, mpa_plan, head_omegas = (), None, ()
 
     # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
     # accelerators that evaluate one carry repeatedly: at iteration zero
@@ -2810,7 +2862,31 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
         from .qsgw_head import finalize_iteration_head_samples
-    if pt is not None:
+    if frozen_screening is not None:
+        head_efermi_ry = (
+            float(entry_occ_state.mu_ry)
+            if entry_occ_state is not None else float(efermi_ry))
+        iteration_head = _retarget_frozen_iteration_head(
+            frozen_screening.iteration_head,
+            energies_ry=E_full,
+            occupations=wfns_qp.occ[:, inputs.band_slices.sigma],
+            efermi_ry=head_efermi_ry,
+        )
+        iteration_static_head_terms = frozen_screening.static_head_terms
+        if iteration_head is not None and bool(inputs.config.do_G0):
+            from .head_correction import compute_static_head_terms_from_sample
+            iteration_static_head_terms = compute_static_head_terms_from_sample(
+                iteration_head.at(0.0 + 0.0j),
+                occ=np.asarray(
+                    iteration_head.sigma_occupations,
+                    dtype=np.float64),
+                cell_volume=float(inputs.meta.cell_volume),
+                nk_tot=int(inputs.meta.nk_tot),
+            )
+        inputs.print_fn(
+            "    SC inner: reused frozen screening/pole model; rebuilt G "
+            "and Sigma on the current QP spectrum")
+    elif pt is not None:
         from .qsgw_head import (
             assemble_delta_head_manifold,
             build_iteration_head_response,
@@ -2932,7 +3008,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
     # The pre-plan reuse call already returned this map's complete fit mapping.
     # A live producer runs here, after the current head response exists.
-    if screening_reuse is not None:
+    if frozen_screening is not None:
+        W_by_role = frozen_screening.sigma_model
+    elif screening_reuse is not None:
         W_by_role = screening_reuse
     elif mpa_mode and inputs.quad is None:
         # The external fit is valid only for the occupation state stamped in
@@ -3028,6 +3106,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         material_class=inputs.material_class,
         write_sigma_omega_h5=False,
         fixed_quadrature_session=inputs.fixed_quadrature_session,
+        # Map 1 stays on the historical half-sum exactly, preserving the
+        # one-shot identity gate.  Every later dynamic SC map uses the
+        # owner-selected diagonal-at-E_m / off-diagonal-at-E_F law.
+        qsgw_offdiagonal_efermi_ev=(
+            None if int(state.iteration) == 0 else 0.0),
+        frozen_screening_model=frozen_screening is not None,
         print_fn=inputs.print_fn,
     )
     if bool(sigma_result.hartree_omitted) != (exact_hartree_dft is not None):
@@ -3244,7 +3328,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # the Sigma gates and assembled H.  Only at this point is the preceding
     # map's pair safe to unlink.  The newest pair survives convergence for
     # restart/debugging; ordinary screening modes never enter this branch.
-    if inputs.config.compute_mode is ComputeMode.MPA:
+    if (inputs.config.compute_mode is ComputeMode.MPA
+            and frozen_screening is None):
         from .mpa.model import retain_iteration_artifacts
         retain_iteration_artifacts(
             os.path.join(inputs.input_dir, "tmp", "mpa"),
@@ -3283,6 +3368,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 static_w=W_by_role.get("static"),
                 iteration_head=iteration_head,
                 static_head_terms=iteration_static_head_terms,
+                sigma_model=W_by_role,
             ),
             exact_hartree_dft=exact_hartree_dft,
         ),
@@ -3926,8 +4012,10 @@ def run_self_consistency(
     accelerator: str = "rcrop",
     history_depth: int = 5,
     mixing: float = 1.0,
+    reset_diagnostics: bool = True,
+    snapshot_offset: int = 0,
 ) -> tuple[SCState, list[float]]:
-    """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
+    """Run one fixed-screening-capable inner solve of ``gw_iteration_map``.
 
     The iteration carry holds only ``H_qp_dft``; convergence is judged
     on the **eigenvalues** of consecutive H matrices (recomputed each
@@ -3960,14 +4048,22 @@ def run_self_consistency(
     rms_history
         RMS ΔE_n (eV) at each iteration ≥ 1; empty list when
         ``max_iter == 1`` (one-shot G0W0).
+
+    ``max_iter`` bounds this inner solve.  The public two-level driver uses
+    ``SCConfig.max_iter`` independently as both the number of outer W refits
+    and each inner solve's cap; ``reset_diagnostics`` and ``snapshot_offset``
+    let those solves share one non-overwriting per-map artifact sequence.
+    Direct callers retain the historical defaults.
     """
     print_fn = inputs.print_fn
-    _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
+    if reset_diagnostics:
+        _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
     # deprecated override, applied at config construction).
     _dump_dir = inputs.config.sc.dump_dir
-    _clear_sc_rotation_snapshots(_dump_dir, print_fn=print_fn)
+    if reset_diagnostics:
+        _clear_sc_rotation_snapshots(_dump_dir, print_fn=print_fn)
 
     # One-shot fast path: no acceleration needed.
     if max_iter == 1:
@@ -3987,7 +4083,7 @@ def run_self_consistency(
         state_new = replace(state_new, convergence_verdict=verdict)
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
-            call_index=0, role="one_shot", rms_ev=rms,
+            call_index=int(snapshot_offset), role="one_shot", rms_ev=rms,
             rms2_ev=float("nan"),
             # There is no previous map call; the "previous output" the RMS
             # is against is the DFT seed spectrum, and saying so is what
@@ -4006,6 +4102,7 @@ def run_self_consistency(
             eigvalsh_kshard=eigvalsh_kshard,
             print_fn=print_fn,
             dump_dir=_dump_dir,
+            snapshot_offset=int(snapshot_offset),
         )
     if accelerator == "linear":
         return _run_linear_mixing(
@@ -4014,6 +4111,7 @@ def run_self_consistency(
             eigvalsh_kshard=eigvalsh_kshard,
             print_fn=print_fn,
             dump_dir=_dump_dir,
+            snapshot_offset=int(snapshot_offset),
         )
     raise ValueError(
         f"run_self_consistency: unknown accelerator={accelerator!r} "
@@ -4023,7 +4121,7 @@ def run_self_consistency(
 def _run_linear_mixing(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, mixing: float,
-    eigvalsh_kshard, print_fn, dump_dir,
+    eigvalsh_kshard, print_fn, dump_dir, snapshot_offset: int = 0,
 ) -> tuple[SCState, list[float]]:
     """Plain α-mixing fixed point.  Diagnostic / accelerator-control path.
 
@@ -4128,7 +4226,7 @@ def _run_linear_mixing(
             if len(_out_history) >= 3 else float("nan"))
         _write_sc_eqp_snapshot(
             inputs, state_map, E_candidate_ev,
-            call_index=it, role="linear",
+            call_index=int(snapshot_offset) + it, role="linear",
             rms_ev=cand_rms, rms2_ev=cand_rms2,
             prev_output_role=("dft_seed" if it == 0 else "linear"),
             verdict=verdict,
@@ -4161,7 +4259,7 @@ def _run_linear_mixing(
 def _run_rcrop(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, history_depth: int,
-    eigvalsh_kshard, print_fn, dump_dir,
+    eigvalsh_kshard, print_fn, dump_dir, snapshot_offset: int = 0,
 ) -> tuple[SCState, list[float]]:
     """rCROP (Anderson-style) accelerated fixed point.
 
@@ -4319,7 +4417,8 @@ def _run_rcrop(
     _last_verdict: list[ConvergenceVerdict | None] = [None]
     _occ_state: list = [state_init.occupation_state]
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
-    _iter_idx = [0]
+    _iter_idx = [int(state_init.iteration)]
+    _call_idx = [0]
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
 
@@ -4389,7 +4488,7 @@ def _run_rcrop(
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
-        call_index = _iter_idx[0]
+        call_index = _call_idx[0]
 
         def _role_of(idx):
             return ("initial" if idx == 0 else
@@ -4398,7 +4497,8 @@ def _run_rcrop(
         role = _role_of(call_index)
         _write_sc_eqp_snapshot(
             inputs, state_out, E_new,
-            call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
+            call_index=int(snapshot_offset) + call_index,
+            role=role, rms_ev=rms, rms2_ev=rms2,
             # NAMING THE PREVIOUS CALL'S ROLE IS THE FIX.  ``rms`` is
             # measured against ``_e_history[-1]``, i.e. the immediately
             # preceding MAP CALL, which under rCROP alternates trial and
@@ -4412,6 +4512,7 @@ def _run_rcrop(
         )
         _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
         _iter_idx[0] += 1
+        _call_idx[0] += 1
         # Non-trial calls only: there the INPUT is the accepted iterate
         # (rcrop_nojit's ``f_new = residual_fn(x_new)``), so this is the
         # residual AT the iterate the loop would return.  A trial call's
@@ -4484,7 +4585,7 @@ def _run_rcrop(
         # skip it silently.
         print_fn(
             f"  SC rCROP stopped by the convergence criterion after "
-            f"{_iter_idx[0]} map calls: {stop.verdict.summary()}")
+            f"{_call_idx[0]} map calls: {stop.verdict.summary()}")
         print_fn(
             "  SC rCROP pad inertness: NOT CHECKED (early stop -- the "
             "check reads the solver's final x, not reached on this path)")
@@ -5104,7 +5205,8 @@ def run_sc_driver(
         f"buffer_mode={sc.buffer_mode}"
         + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
            else f", α={sc.mixing:.2f}"))
-    state_final, rms_history = run_self_consistency(
+    from .sc_two_level import run_two_level_self_consistency
+    state_final, rms_history = run_two_level_self_consistency(
         state_init, inputs,
         max_iter=sc.max_iter, tol_ev=sc.tol_ev,
         accelerator=sc.accelerator,
@@ -5202,7 +5304,8 @@ def run_sc_driver(
         take_pre_unfold("W0_qmunu")
     # W0 is the only large object in the final-map payload.  Drop it before
     # WFN/sigma artifact construction; the tiny head/term provenance remains.
-    screening = dataclasses.replace(screening, static_w=None)
+    screening = dataclasses.replace(
+        screening, static_w=None, sigma_model=None)
     state_final = dataclasses.replace(
         state_final,
         outputs=dataclasses.replace(
