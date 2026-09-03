@@ -257,6 +257,21 @@ def test_live_hartree_addition_rejects_an_undersized_carrier():
         _add_exact_four_current_hartree(base, scalar, transverse)
 
 
+def test_final_rotation_and_hartree_trim_the_same_mesh_padding():
+    """The final U and direct fields meet on the Sigma carrier's width."""
+    from gw.sc_iteration import (_logical_band_rotation,
+                                 _logical_exact_hartree_term)
+
+    sigma = jnp.zeros((2, 6, 6), dtype=jnp.complex128)
+    padded = jnp.zeros((2, 8, 8), dtype=jnp.complex128)
+    assert _logical_band_rotation(
+        padded, sigma, label="test rotation").shape == sigma.shape
+    assert _logical_exact_hartree_term(
+        padded, sigma, label="test Hartree").shape == sigma.shape
+    with pytest.raises(ValueError, match="no wider than"):
+        _logical_band_rotation(sigma, padded, label="test undersized")
+
+
 def test_hartree_omission_receipt_restores_full_output_matrices():
     """The compact internal sentinel cannot masquerade as a final field."""
     from gw.sigma_dispatch import SigmaResult
@@ -285,9 +300,10 @@ def test_live_hartree_is_carried_to_both_final_output_seams():
         encoding="utf-8")
     assert "exact_hartree_dft=exact_hartree_dft" in text
     assert "exact_hartree_dft=state_final.outputs.exact_hartree_dft" in text
-    assert "v_h_scalar = exact_hartree_dft.scalar_dft" in text
-    assert "h_transverse = exact_hartree_dft.transverse_dft" in text
-    assert "sig_h = exact_hartree_dft.total" in text
+    assert "run_sc_driver final scalar Hartree" in text
+    assert "run_sc_driver final transverse Hartree" in text
+    assert "dump_sigma_omega_h5_final scalar Hartree" in text
+    assert "dump_sigma_omega_h5_final transverse" in text
 
 
 def test_sc_density_applies_rotation_inside_the_scan():

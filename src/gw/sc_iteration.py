@@ -420,8 +420,8 @@ class SCExactHartree:
     Every matrix is on the full BZ in the original DFT basis and retains the
     matrix-element sweep's two-axis mesh padding.  Keeping the scalar and
     transverse pieces separate preserves ``sigma_mnk.h5``'s decomposition;
-    :attr:`total` is the only combination that enters final padded outputs.
-    The logical SC Hamiltonian trims at its dedicated fused-add consumer.
+    each logical consumer trims both band axes against the matrix it augments.
+    :attr:`total` exists for callers whose other carrier is padded identically.
     """
 
     scalar_dft: jax.Array
@@ -451,6 +451,25 @@ def _logical_exact_hartree_term(term, base, *, label: str):
             f"{label}: SC matrix must be square and no wider than its padded "
             f"exact-Hartree carrier; got {base.shape} and {term.shape}")
     return term[..., :nb_m, :nb_n]
+
+
+def _logical_band_rotation(rotation, base, *, label: str):
+    """Trim an identity-padded SC rotation to one logical Sigma matrix."""
+    if rotation.ndim != 3 or base.ndim < 3:
+        raise ValueError(
+            f"{label}: rotation must be (nk, nb, nb) and the reference must "
+            f"end in two band axes; got {rotation.shape} and {base.shape}")
+    if rotation.shape[0] != base.shape[0]:
+        raise ValueError(
+            f"{label}: rotation and reference must share the k axis; got "
+            f"{rotation.shape} and {base.shape}")
+    nb_m, nb_n = int(base.shape[-2]), int(base.shape[-1])
+    if (nb_m != nb_n or rotation.shape[-2] != rotation.shape[-1]
+            or rotation.shape[-1] < nb_n):
+        raise ValueError(
+            f"{label}: reference must be square and no wider than its padded "
+            f"rotation; got {base.shape} and {rotation.shape}")
+    return rotation[..., :nb_m, :nb_n]
 
 
 @_functools.partial(jax.jit, donate_argnums=(0,))
@@ -5349,6 +5368,9 @@ def run_sc_driver(
     # routes each kind correctly; only the spec changed.
     U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
                _band_rotation_spec())
+    U = _logical_band_rotation(
+        U, sigma_result.sigma_x_kij_ry,
+        label="run_sc_driver final Sigma rotation")
     sigma_c_omega_dft = (
         _rotate_sigma_omega_cube(
             sigma_result.sigma_c_omega_kij_ry, U,
@@ -5386,9 +5408,17 @@ def run_sc_driver(
     else:
         # Already contracted with the unrotated DFT orbitals.  Rotating this
         # through the Sigma-basis U would be a second, erroneous basis change.
-        v_h_scalar = exact_hartree_dft.scalar_dft
-        h_transverse = exact_hartree_dft.transverse_dft
-        sig_h = exact_hartree_dft.total
+        v_h_scalar = _logical_exact_hartree_term(
+            exact_hartree_dft.scalar_dft, sigma_result.sigma_x_kij_ry,
+            label="run_sc_driver final scalar Hartree")
+        h_transverse = (
+            _logical_exact_hartree_term(
+                exact_hartree_dft.transverse_dft,
+                sigma_result.sigma_x_kij_ry,
+                label="run_sc_driver final transverse Hartree")
+            if exact_hartree_dft.transverse_dft is not None else None)
+        sig_h = (v_h_scalar if h_transverse is None
+                 else v_h_scalar + h_transverse)
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
         sigma_result.sigma_xc_kij_ry, U, mesh=mesh_xy)
@@ -5605,11 +5635,21 @@ def dump_sigma_omega_h5_final(
         # components INTO that QP basis once for this file rather than
         # mixing bases or repeating the rotation on every SC iteration.
         U = _place(sigma_basis_U, mesh_xy, _band_rotation_spec())
+        reference = sigma_result.sigma_x_kij_ry
+        U = _logical_band_rotation(
+            U, reference, label="dump_sigma_omega_h5_final rotation")
+        scalar_dft = _logical_exact_hartree_term(
+            exact_hartree_dft.scalar_dft, reference,
+            label="dump_sigma_omega_h5_final scalar Hartree")
         scalar_qp = _rotate_fixed_matrix(
-            exact_hartree_dft.scalar_dft, U, mesh=mesh_xy, to_qp=True)
+            scalar_dft, U, mesh=mesh_xy, to_qp=True)
         transverse_qp = (
             _rotate_fixed_matrix(
-                exact_hartree_dft.transverse_dft, U,
+                _logical_exact_hartree_term(
+                    exact_hartree_dft.transverse_dft, reference,
+                    label=("dump_sigma_omega_h5_final transverse "
+                           "Hartree")),
+                U,
                 mesh=mesh_xy, to_qp=True)
             if exact_hartree_dft.transverse_dft is not None else None)
         total_qp = (scalar_qp if transverse_qp is None
