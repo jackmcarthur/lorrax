@@ -3433,6 +3433,80 @@ def validate_fit_store(src, *, expected_identity=None,
     return ledger
 
 
+def refuse_completed_artifact_replacement(
+    sample_path,
+    fit_path,
+    *,
+    sample_names,
+    overwrite_completed=False,
+):
+    """Protect usable MPA artifacts before either destructive open occurs.
+
+    A sample artifact is protected only when every named frequency-resolved
+    component passes :func:`read_w_header` and has every ``data_ready`` bit
+    set.  A fit artifact is protected only when :func:`validate_fit_store`
+    accepts its finalized ledger and stored certification.  Incomplete or
+    uncertified files keep their historical replacement behavior; this guard
+    is not the separate partial-resume implementation.
+
+    The caller supplies ``sample_names`` because the physics route owns which
+    components form one sample artifact (ordinary RPA uses chi/Wc; an ordered
+    response also carries their reflected/negative partners).  This format
+    owner supplies the single interpretation of readiness and certification.
+
+    Returns the exact protected artifact paths when the deliberately
+    destructive opt-in is true, otherwise refuses before a writer opens either
+    path.  Reading is rank-local and serial; a collective caller invokes this
+    uniformly before its first collective open.
+    """
+    names = tuple(str(name) for name in sample_names)
+    if not names or any(not name for name in names):
+        raise ValueError(
+            "refuse_completed_artifact_replacement requires one or more "
+            "nonempty sample dataset names")
+
+    protected = []
+    sample = os.path.abspath(os.fspath(sample_path))
+    fit = os.path.abspath(os.fspath(fit_path))
+    if os.path.exists(sample):
+        try:
+            headers = tuple(read_w_header(sample, name) for name in names)
+        except (KeyError, ValueError):
+            headers = ()
+        if headers and all(
+                bool(np.asarray(header["data_ready"], dtype=bool).all())
+                for header in headers):
+            protected.append(("completed sample store", sample))
+
+    if os.path.exists(fit):
+        try:
+            validate_fit_store(fit)
+        except (KeyError, ValueError):
+            pass
+        else:
+            protected.append(("finalized certified fit store", fit))
+
+    if protected and not bool(overwrite_completed):
+        listed = "\n".join(
+            f"    - {kind}: {path}" for kind, path in protected)
+        raise ValueError(
+            "GATE mpa_completed_artifacts_write_once:\n"
+            "  got   : mpa_overwrite_completed_artifacts = false, with "
+            "protected artifact(s):\n"
+            f"{listed}\n"
+            "  want  : completed MPA sample stores and finalized/certified "
+            "fit stores are write-once.\n"
+            "  why   : this rerun would open the managed artifact names with "
+            "mode='w' and destroy usable screening or pole data before the "
+            "downstream stage runs. restart = true only skips the ISDF fit; "
+            "it does not authorize MPA artifact replacement.\n"
+            "  fix   : consume or preserve the named artifacts, make a new "
+            "run/variant, or deliberately set "
+            "mpa_overwrite_completed_artifacts = true to replace them. That "
+            "opt-in is destructive and does not resume a partial store.")
+    return tuple(path for _, path in protected)
+
+
 def _require_certification(certification, dest):
     """A certification :func:`validate_fit_store` will accept, or refuse.
 

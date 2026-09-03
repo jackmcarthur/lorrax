@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -73,6 +75,77 @@ def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
 def test_thiele_solver_is_deck_selectable(tmp_path):
     config = _config(tmp_path, "mpa_pole_solver = thiele\n")
     assert config.mpa.pole_solver == "thiele"
+
+
+def test_completed_artifact_overwrite_is_an_explicit_false_by_default(tmp_path):
+    default = _config(tmp_path / "default")
+    enabled = _config(
+        tmp_path / "enabled",
+        "mpa_overwrite_completed_artifacts = true\n")
+    assert default.mpa.overwrite_completed_artifacts is False
+    assert enabled.mpa.overwrite_completed_artifacts is True
+
+
+@pytest.mark.parametrize(
+    "trs_allowed,expected_names",
+    [
+        (True, ("chi_qmunu_z", "Wc_qmunu_z")),
+        (False, (
+            "chi_qmunu_z", "Wc_qmunu_z",
+            "chi_qmunu_minus_conj_z", "Wc_qmunu_minus_z")),
+    ],
+)
+def test_build_checks_both_managed_artifacts_before_allocation(
+        tmp_path, monkeypatch, trs_allowed, expected_names):
+    """The format guard runs before the first inode-owning writer."""
+    import common.collectives as collectives
+
+    config = _config(tmp_path / "deck")
+    sample_path = str(tmp_path / "mpa_samples_oneshot.h5")
+    fit_path = str(tmp_path / "mpa_fit_oneshot.h5")
+    calls = []
+
+    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
+    monkeypatch.setattr(collectives, "barrier", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model, "make_mpa_plan", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        sample_plan, "plan_z",
+        lambda _plan: np.asarray([0.0 + 0.1j, 1.0 + 0.1j]))
+    monkeypatch.setattr(sample_plan, "refuse_unsupported", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        model, "_q_wedge",
+        lambda *args, **kwargs: (np.asarray([0]), object(), object()))
+    monkeypatch.setattr(
+        model, "iteration_artifact_paths",
+        lambda *args, **kwargs: (sample_path, fit_path))
+
+    class Protected(RuntimeError):
+        pass
+
+    def guard(samples, fit, *, sample_names, overwrite_completed):
+        calls.append((samples, fit, tuple(sample_names), overwrite_completed))
+        raise Protected("stop before allocation")
+
+    monkeypatch.setattr(
+        model.mpa_store, "refuse_completed_artifact_replacement", guard)
+    monkeypatch.setattr(
+        model.mpa_store, "allocate_w_omega_collective",
+        lambda *args, **kwargs: pytest.fail("sample inode touched before guard"))
+
+    with pytest.raises(Protected, match="stop before allocation"):
+        model.build_mpa_fit(
+            tmp_path, "oneshot", wfns=None, V_q=None,
+            quad=SimpleNamespace(x_max=1.0),
+            sym=SimpleNamespace(trs_allowed=trs_allowed),
+            centroid_indices=None, head_resolver=None, config=config,
+            meta=None, mesh_xy=None, material_class="insulator")
+
+    assert calls == [(
+        sample_path,
+        fit_path,
+        expected_names,
+        False,
+    )]
 
 
 @pytest.mark.parametrize(

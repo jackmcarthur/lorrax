@@ -201,6 +201,74 @@ def test_every_frequency_slab_round_trips_bit_identically(tmpdir_path):
         assert bool(hdr["data_ready"][i])
 
 
+def test_completed_sample_store_refuses_destructive_replacement(tmpdir_path):
+    _write_w(tmpdir_path, name="chi")
+    _write_w(tmpdir_path, name="Wc", seed=23)
+    with pytest.raises(ValueError) as error:
+        MS.refuse_completed_artifact_replacement(
+            tmpdir_path,
+            os.path.join(os.path.dirname(tmpdir_path), "missing_fit.h5"),
+            sample_names=("chi", "Wc"),
+        )
+    message = str(error.value)
+    assert "GATE mpa_completed_artifacts_write_once" in message
+    assert f"completed sample store: {os.path.abspath(tmpdir_path)}" in message
+    assert "mpa_overwrite_completed_artifacts = true" in message
+
+
+def test_partial_sample_store_is_not_misreported_as_resumable(tmpdir_path):
+    _write_w(tmpdir_path, name="chi", ready=True)
+    _write_w(tmpdir_path, name="Wc", ready=False, seed=23)
+    assert MS.refuse_completed_artifact_replacement(
+        tmpdir_path,
+        os.path.join(os.path.dirname(tmpdir_path), "missing_fit.h5"),
+        sample_names=("chi", "Wc"),
+    ) == ()
+
+
+def _write_certified_fit(path):
+    MS.allocate_fit_store(
+        path, n_q=1, n_mu=2, n_p=1, energy_unit="Ry", mode="w")
+    poles = np.full((1, 2, 2), 1.0 - 0.1j, dtype=np.complex128)
+    residues = np.ones((1, 2, 2), dtype=np.complex128)
+    diagnostics = {
+        "condition": np.full((2, 2), 2.0),
+        "backward_error": np.full((2, 2), 1.0e-12),
+    }
+    MS.write_fit_block(
+        path, 0, np.arange(2), poles, residues, diagnostics)
+    MS.finalize_fit_store(path, certification={
+        "condition_max_allowed": 10.0,
+        "backward_error_max_allowed": 1.0e-8,
+    })
+
+
+def test_certified_fit_store_refuses_destructive_replacement(tmpdir_path):
+    fit_path = os.path.join(os.path.dirname(tmpdir_path), "certified_fit.h5")
+    _write_certified_fit(fit_path)
+    with pytest.raises(ValueError) as error:
+        MS.refuse_completed_artifact_replacement(
+            os.path.join(os.path.dirname(tmpdir_path), "missing_samples.h5"),
+            fit_path,
+            sample_names=("chi", "Wc"),
+        )
+    message = str(error.value)
+    assert f"finalized certified fit store: {os.path.abspath(fit_path)}" in message
+
+
+def test_explicit_overwrite_opt_in_returns_both_protected_names(tmpdir_path):
+    _write_w(tmpdir_path, name="chi")
+    _write_w(tmpdir_path, name="Wc", seed=23)
+    fit_path = os.path.join(os.path.dirname(tmpdir_path), "certified_fit.h5")
+    _write_certified_fit(fit_path)
+    assert MS.refuse_completed_artifact_replacement(
+        tmpdir_path,
+        fit_path,
+        sample_names=("chi", "Wc"),
+        overwrite_completed=True,
+    ) == (os.path.abspath(tmpdir_path), os.path.abspath(fit_path))
+
+
 def test_collective_writer_keeps_large_bytes_behind_slabio(
         tmpdir_path, monkeypatch):
     """The production helper uses SlabIO; h5py only stamps metadata."""
