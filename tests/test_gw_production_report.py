@@ -132,6 +132,12 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     report.legacy_print("Started sigma[correlation] at 12:00:00.")
     report.legacy_print(
         "[ 12:00:01 | █████░░░░░ |  50% ] tau node 5 / 10 · ETA 1 s")
+    report.legacy_print(
+        "  SC fixed quadrature: iteration=2, initialized=False, "
+        "rebuilds_this_iteration=0, rebuilds_total=0, pair_cost=61")
+    report.legacy_print(
+        "    SC fixed window: c:bulk: n_tau=8, nodes=0123456789abcdef, "
+        "cache=hit:sc-fixed, padded_box=(-13.6, 27.2, 1.36, 2.72) eV")
     report.legacy_print("WARNING: protected state leaves the omega grid")
     report.qp_gap(band_slices=bands, e_dft_ry=energies,
                   e_qp_ry=energies + 0.1 / RYD_TO_EV)
@@ -215,6 +221,9 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "harmless backend implementation chatter" not in text
     assert "Started sigma[correlation]" in text
     assert "tau node 5 / 10" in text
+    assert "SC fixed quadrature: iteration=2" in text
+    assert "SC fixed window: c:bulk" in text
+    assert "nodes=0123456789abcdef" in text
     assert "protected state leaves the omega grid" in text
     zeta_line = next(line for line in text.splitlines()
                      if line.startswith("  zeta"))

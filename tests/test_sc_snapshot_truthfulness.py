@@ -138,6 +138,26 @@ def test_the_snapshot_stamps_the_convergence_criterion():
     assert "THIS is the convergence criterion" in body
 
 
+def test_snapshot_writes_eqp1_but_never_uses_z_to_drive_the_map():
+    body = _block("_write_sc_eqp_snapshot")
+    assert "eqp1_iter" in body
+    assert "e_eval + z_factor * (e_output - e_eval)" in body
+    assert "Z is output-only" in body
+    assert "pathological_z_factor_mask" not in body
+    assert "z_factor_iter" not in body
+
+    clear = _block("_clear_sc_eqp_snapshots")
+    assert "eqp1" in clear and "z_factor" in clear
+
+    gw_output = open(os.path.join(_SRC, "gw", "gw_output.py"),
+                     encoding="utf-8").read()
+    assert "guard_pathological_z=not results.self_consistent" in gw_output
+    assert "None if results.self_consistent else assembly.z_factor" in gw_output
+
+    driver = _block("run_sc_driver")
+    assert "{} if int(config.sc.max_iter) > 1 else None" in driver
+
+
 def test_the_legacy_stamp_names_the_previous_calls_role():
     """``map_output_RMS_dE_prev_output`` is kept -- it is a real number and
     something parses it -- but it is measured against whatever call came

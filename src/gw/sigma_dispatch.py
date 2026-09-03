@@ -657,6 +657,7 @@ def compute_sigma_xc(
     iteration_head=None,
     occupation_state=None,
     material_class: str,
+    fixed_quadrature_session=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -1308,6 +1309,9 @@ def compute_sigma_xc(
             # this run's screening_diagrams either did or did not produce,
             # and the two are indistinguishable in the bytes.
             expected_screening_diagrams=config.screening.diagrams,
+            fixed_quadrature_session=(
+                None if fixed_quadrature_session is None else
+                fixed_quadrature_session.setdefault("mpa", {})),
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
@@ -1393,6 +1397,9 @@ def compute_sigma_xc(
         band_slices=band_slices, wfn=wfn, sym=sym,
         iteration_head=iteration_head,
         occupation_state=occupation_state,
+        fixed_quadrature_session=(
+            None if fixed_quadrature_session is None else
+            fixed_quadrature_session.setdefault("ppm", {})),
         print_fn=print_fn,
     )
 
