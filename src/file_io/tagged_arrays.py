@@ -15,6 +15,14 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import barrier
 
 
+PHOTON_G0_DATASETS = (
+    "photon_g0_charge",
+    "photon_g0_current_x",
+    "photon_g0_current_y",
+    "photon_g0_current_z",
+)
+
+
 def _mu_logical_shape(shape, mu_axes, n_rmu_logical):
     """On-disk (logical) shape for a μ-padded in-memory array: clip the
     ``mu_axes`` extents of ``shape`` to ``n_rmu_logical``.
@@ -342,6 +350,8 @@ def write_restart_state_to_h5(
     qirr=None,
     coulomb_policy=None,
     qp_state_source_record: dict | None = None,
+    bispinor_vq_restart_binding=None,
+    photon_g0_vectors=None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -403,6 +413,12 @@ def write_restart_state_to_h5(
     ``psi_full_y`` / ``enk_full`` state this restart stores.  Its format and
     serialization belong only to :mod:`file_io.qp_wfn`; this writer transports
     the opaque bytes through the incumbent SlabIO metadata path on ``mode=w``.
+
+    ``bispinor_vq_restart_binding`` is the source-composition record owned by
+    :mod:`file_io.bispinor_vq_restart`.  ``photon_g0_vectors`` are the four
+    symmetry-resolved literal-Gamma views produced at the same V projection
+    seam.  Persisting these μ-class views avoids rereading the complete four
+    zeta G-spheres on restart; the shared binding authenticates their source.
     """
     from .slab_io import SlabIO
 
@@ -439,6 +455,21 @@ def write_restart_state_to_h5(
                     QP_STATE_SOURCE_DATASET,
                     encode_qp_state_source_provenance(
                         qp_state_source_record))
+            if bispinor_vq_restart_binding is not None:
+                from .bispinor_vq_restart import (
+                    BISPINOR_VQ_RESTART_BINDING_DATASET,
+                    BispinorVqRestartBinding,
+                )
+                if not isinstance(
+                        bispinor_vq_restart_binding,
+                        BispinorVqRestartBinding):
+                    raise TypeError(
+                        "write_restart_state_to_h5 requires a "
+                        "BispinorVqRestartBinding, got "
+                        f"{type(bispinor_vq_restart_binding).__name__}")
+                io.write_attr(
+                    BISPINOR_VQ_RESTART_BINDING_DATASET,
+                    bispinor_vq_restart_binding.encode())
         # kgrid attr lets BSE recover the (nkx,nky,nkz) split from
         # flat-q V_qmunu / W0_qmunu without re-opening the WFN.  Stored
         # as a length-3 int64 dataset (the SlabIO ``write_attr`` path
@@ -539,6 +570,32 @@ def write_restart_state_to_h5(
             # read_restart_state_from_h5.
             io.write_attr("n_rmu_transverse_logical", np.int64(n_T))
 
+        photon_g0_touched = photon_g0_vectors is not None
+        if photon_g0_touched:
+            if bispinor_vq_restart_binding is None:
+                raise ValueError(
+                    "photon_g0_vectors require the bispinor V/restart "
+                    "source-composition binding")
+            if n_rmu_transverse_logical is None:
+                raise ValueError(
+                    "photon_g0_vectors require n_rmu_transverse_logical")
+            vectors = tuple(photon_g0_vectors)
+            if len(vectors) != 4:
+                raise ValueError(
+                    "photon_g0_vectors must contain charge plus three "
+                    f"current vectors; got {len(vectors)}")
+            nq = int(vectors[0].shape[0])
+            for channel, (name, vector) in enumerate(
+                    zip(PHOTON_G0_DATASETS, vectors)):
+                if int(vector.ndim) != 2 or int(vector.shape[0]) != nq:
+                    raise ValueError(
+                        "photon literal-Gamma vectors must all have shape "
+                        f"(nq, mu); channel {channel} has {vector.shape}")
+                _write(
+                    name, vector, mu_axes=(-1,),
+                    n_logical=(n_rmu_logical if channel == 0 else
+                               n_rmu_transverse_logical))
+
         # W0_qmunu: either write the real data or pre-allocate an
         # all-zeros placeholder.
         w0_touched = W0_qmunu is not None or init_W0
@@ -602,12 +659,15 @@ def write_restart_state_to_h5(
     # the data went in; readers treat ABSENT as True so every restart file
     # written before this attr existed keeps loading byte-for-byte.
     v_touched = V_qmunu is not None
-    if (w0_touched or v_touched) and jax.process_index() == 0:
+    if (w0_touched or v_touched or photon_g0_touched
+            ) and jax.process_index() == 0:
         with h5py.File(filename, "a") as f:
             if w0_touched:
                 f["W0_qmunu"].attrs["W0_ready"] = w0_ready
             if v_touched:
                 f["V_qmunu"].attrs["V_ready"] = True
+            if photon_g0_touched:
+                f.attrs["photon_g0_ready"] = True
             # THE q_irr STAMP GOES IN THE SAME RANK-0 BLOCK, for the reason
             # that block's own comment gives: stamping from anywhere else
             # would reintroduce the SlabIO interleave it exists to avoid.
@@ -626,6 +686,121 @@ def write_restart_state_to_h5(
                             w0_placeholder=(w0_touched and not w0_ready),
                             w0_data=(w0_touched and w0_ready))
     barrier("restart_W0_ready_flag")
+
+
+def read_photon_g0_vectors_from_h5(
+    filename, mesh_xy, *, n_rmu_charge_logical: int,
+    n_rmu_transverse_logical: int,
+):
+    """Read the four ready literal-Gamma channel views from restart.
+
+    These are μ-class, not μ²-class: every process makes the same small host
+    read and places only its local shard.  The caller authenticates the shared
+    V/restart binding first; this reader owns readiness, shape, logical
+    clipping, and processor-dependent padding.
+    """
+    from common.collectives import device_put_process_local
+    from runtime.padding import padded_mu_extent
+
+    try:
+        with h5py.File(filename, "r") as f:
+            ready = bool(f.attrs.get("photon_g0_ready", False))
+            missing = [name for name in PHOTON_G0_DATASETS if name not in f]
+            if not ready or missing:
+                raise ValueError(
+                    "GATE bispinor_packed_restart_gamma_missing: packed "
+                    "Gamma vectors are absent or incomplete.\n"
+                    f"  got:  photon_g0_ready={ready}, missing={missing} in "
+                    f"{filename}\n"
+                    "  want: four ready literal-Gamma vectors written with "
+                    "the authenticated restart state\n"
+                    "  why:  the packed head cannot be rebuilt without its "
+                    "charge/current zeta factors\n"
+                    "  fix:  set restart = false and write restart tensors\n"
+                    "  doc:  docs/input_reference.md, restart.")
+            host = [np.asarray(f[name][...]) for name in PHOTON_G0_DATASETS]
+    except OSError as exc:
+        raise ValueError(
+            "GATE bispinor_packed_restart_gamma_missing: packed Gamma "
+            f"vectors cannot be read from {filename}.\n"
+            "  got:  missing or unreadable restart artifact\n"
+            "  want: an authenticated readable restart artifact\n"
+            "  why:  the packed Gamma-cell completion requires four factors\n"
+            "  fix:  restore the file or set restart = false\n"
+            "  doc:  docs/input_reference.md, restart.") from exc
+
+    nq = int(host[0].shape[0]) if host and host[0].ndim == 2 else -1
+    logical = (
+        int(n_rmu_charge_logical),
+        int(n_rmu_transverse_logical),
+        int(n_rmu_transverse_logical),
+        int(n_rmu_transverse_logical),
+    )
+    padded = tuple(
+        padded_mu_extent(value, int(jax.device_count())) for value in logical)
+    vectors = []
+    for channel, (array, n_logical, n_padded) in enumerate(
+            zip(host, logical, padded)):
+        if array.ndim != 2 or tuple(array.shape) != (nq, n_logical):
+            raise ValueError(
+                "GATE bispinor_packed_restart_gamma_shape: packed Gamma "
+                "vector shape does not match this deck.\n"
+                f"  got:  channel {channel} shape={array.shape}\n"
+                f"  want: ({nq}, {n_logical})\n"
+                "  why:  a different centroid basis cannot complete this "
+                "packed operator\n"
+                "  fix:  restore the matching centroid files or set "
+                "restart = false\n"
+                "  doc:  docs/input_reference.md, restart.")
+        if n_padded > n_logical:
+            array = np.pad(array, ((0, 0), (0, n_padded - n_logical)))
+        vectors.append(device_put_process_local(
+            np.ascontiguousarray(array),
+            NamedSharding(mesh_xy, P(None, "x"))))
+    return tuple(vectors)
+
+
+def read_ready_w0_qmunu_from_h5(
+    filename, mesh_xy, *, n_rmu_logical: int,
+    expected_screening_diagrams: str = "w_rpa",
+):
+    """Authenticate readiness/diagram identity, then read canonical W(0)."""
+    try:
+        with h5py.File(filename, "r") as f:
+            present = "W0_qmunu" in f
+            ready = bool(
+                f["W0_qmunu"].attrs.get("W0_ready", False)) if present else False
+            diagrams = (
+                str(f["W0_qmunu"].attrs.get("screening_diagrams", ""))
+                if present else "")
+    except OSError as exc:
+        raise ValueError(
+            "GATE bispinor_packed_restart_w0_missing: scalar W(0) restart "
+            f"input cannot be read from {filename}.\n"
+            "  got:  missing or unreadable restart artifact\n"
+            "  want: ready W0_qmunu with screening_diagrams = w_rpa\n"
+            "  why:  the packed bare response rebuilds its CC block from W0\n"
+            "  fix:  restore the artifact or set restart = false\n"
+            "  doc:  docs/input_reference.md, restart.") from exc
+    if (not present or not ready
+            or diagrams != str(expected_screening_diagrams)):
+        raise ValueError(
+            "GATE bispinor_packed_restart_w0_missing: scalar W(0) restart "
+            "input is absent, incomplete, or has the wrong diagram set.\n"
+            f"  got:  present={present}, W0_ready={ready}, "
+            f"screening_diagrams={diagrams!r}\n"
+            "  want: ready W0_qmunu with screening_diagrams = "
+            f"{expected_screening_diagrams}\n"
+            "  why:  the packed bare response rebuilds its CC block from "
+            "the persisted scalar W(0), never from a placeholder\n"
+            "  fix:  run fresh with write_restart_tensors = true\n"
+            "  doc:  docs/input_reference.md, restart.")
+    result = read_munu_tensor_from_h5(
+        filename, "W0_qmunu", mesh_xy,
+        n_rmu_logical=int(n_rmu_logical))
+    if result is None:
+        raise AssertionError("ready W0_qmunu disappeared after preflight")
+    return result
 
 
 def _stamp_qirr(f, qirr, n_rmu_logical, *, v_touched, w0_placeholder,

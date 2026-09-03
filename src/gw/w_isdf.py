@@ -2002,8 +2002,8 @@ def compute_static_photon_response(
     defaulted here) selects which:
 
     ``screen_current = True`` -- ``bispinor_gw = full_static_cohsex``: the
-    sixteen no-pair blocks of ``chi``, one distributed Dyson solve at
-    omega=0.
+    sixteen no-pair blocks of ``chi``, one existing local or distributed
+    Dyson plan at omega=0.
 
     ``screen_current = False`` -- the ``bare_transverse`` family: the twelve
     current blocks of ``chi`` are ZERO by declaration, so the packed Dyson
@@ -2062,10 +2062,6 @@ def compute_static_photon_response(
         pack_photon_operator)
     from .v_q_bispinor import ZERO_TILES, BispinorVqReader
 
-    if str(dyson_solver).strip().lower() != "distributed":
-        raise ValueError(
-            "packed static photon response requires "
-            "dyson_solver='distributed'")
     if config is None:
         raise ValueError(
             "packed static photon response requires the run config: the "
@@ -2100,9 +2096,9 @@ def compute_static_photon_response(
                 f"{route_reason}")
         if W_charge is None:
             raise ValueError(
-                "the packed bare-transverse route requires the incumbent "
-                "scalar W(omega=0) on the charge block; refusing to build a "
-                "second charge screening owner here")
+                "the packed bare-transverse route requires its charge-block "
+                "operator: incumbent scalar W(omega=0) for a screened mode, "
+                "or V for x_only; refusing to invent it here")
     elif photon_mode is not BispinorGWMode.FULL_STATIC_COHSEX:
         raise ValueError(
             "packed static photon response received bispinor_gw="
@@ -2111,6 +2107,20 @@ def compute_static_photon_response(
         raise ValueError(
             "full_static_cohsex screens the charge block inside the packed "
             "Dyson solve; an external W_charge would be ignored")
+    if (screen_current and str(dyson_solver) == "local"
+            and int(jax.process_count()) != 1):
+        raise ValueError(
+            "GATE bispinor_screened_packed_local_requires_1x1: the local "
+            "packed Dyson plan is restricted to a one-process mesh.\n"
+            f"  got:  w_dyson_solver = local, mesh={mesh_xy.devices.shape}, "
+            f"process_count={int(jax.process_count())}\n"
+            "  want: w_dyson_solver = local on a 1x1 mesh, or distributed "
+            "on a square multi-process mesh\n"
+            "  why:  local solve_w assigns complete packed mu-by-mu q tiles "
+            "to individual ranks; only the distributed plan preserves the "
+            "all-rank memory invariant when P > 1\n"
+            "  fix:  set w_dyson_solver = distributed for this run geometry\n"
+            "  doc:  docs/input_reference.md, w_dyson_solver / bispinor_gw.")
     hall = None
     if coupled_head:
         if (wfn is None or photon_g0_vectors is None
@@ -2186,7 +2196,7 @@ def compute_static_photon_response(
 
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
-            dyson_solver="distributed",
+            dyson_solver=dyson_solver,
             distrib_la_batched_route=distrib_la_batched_route)
         # The bare Hartree/exchange stage that follows does not depend on W
         # and could otherwise begin allocating its Green/operator workspaces

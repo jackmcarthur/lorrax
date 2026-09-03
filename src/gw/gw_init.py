@@ -45,7 +45,9 @@ from .gw_config import (
 	classify_xla_pool,
 	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_bispinor_gw,
+	refuse_screened_photon_restart_storage,
 	resolve_xla_gpu_memory_env,
+	packed_photon_screens_current,
 	uses_coupled_photon_head,
 )
 
@@ -2633,10 +2635,16 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	return hc
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
+def compute_V_q(
+	zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print,
+	bgw_v_grid_fn=None, sym=None, centroid_indices=None,
+	charge_basis_receipt=None, transverse_basis_receipt=None,
+	coulomb_policy_stamp=None,
+):
 	"""Compute bare Coulomb V_qmunu and its in-memory G=0 view.
 
-	Returns (V_qmunu, G0, head_channel, photon_g0_vectors), where V_qmunu
+	Returns (V_qmunu, G0, head_channel, photon_g0_vectors,
+	bispinor_vq_restart_binding), where V_qmunu
 	has shape (nq, μ, μ)
 	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
 	``gw.head_channel.HeadChannel`` when the deck sets
@@ -2651,6 +2659,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	"""
 	from .compute_vcoul import compute_all_V_q
 	photon_g0_vectors = None
+	bispinor_vq_restart_binding = None
 
 	if jax.process_index() == 0:
 		os.sync()
@@ -2819,7 +2828,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
 			                ) as zt3:
 				with mesh_xy:
-					_, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
+					from file_io.bispinor_vq_restart import (
+						BispinorVqRestartBinding)
+					from .v_q_bispinor import V_QMUNU_FORMAT
+					bispinor_vq_restart_binding = (
+						BispinorVqRestartBinding.from_sources(
+							v_qmunu_format=V_QMUNU_FORMAT,
+							zeta_fit_provenance=(
+								zc.fit_provenance, zt1.fit_provenance,
+								zt2.fit_provenance, zt3.fit_provenance),
+							charge_basis_receipt=charge_basis_receipt,
+							transverse_basis_receipt=(
+								transverse_basis_receipt),
+							coulomb_policy=coulomb_policy_stamp))
+					_, photon_g0_vectors = (
+						compute_V_q_bispinor_g_flat_to_h5(
 						zeta_C_loader=zc,
 						zeta_T_loaders=(zt1, zt2, zt3),
 						output_h5_path=bispinor_h5_path,
@@ -2828,6 +2851,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						cell_volume=meta.cell_volume,
 						sys_dim=meta.sys_dim,
 						n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+						restart_binding=bispinor_vq_restart_binding,
 						bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
 						bdot=(np.asarray(wfn.bdot, dtype=np.float64)
 						       if meta.sys_dim == 0 else None),
@@ -2846,13 +2870,15 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						bispinor_gw_mode=None,
 						charge_representation=None,
 						spatial_current_representation=None,
-					)
+					))
 
 		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
-		# view returned by the same projection that built V; it is deliberately
-		# absent from v_q_bispinor.h5 because zeta_q_G is the sole persisted
-		# source of truth.  The four small views stay resident only for a packed
-		# coupled head; headless modes release the transverse three immediately.
+		# view returned by the same projection that built V.  The numerical
+		# V-tile file does not duplicate those views; when restart output is
+		# enabled the canonical restart writer persists the four small μ-class
+		# views under the same cross-file source binding.  They stay resident
+		# only for a packed coupled head; headless modes release the transverse
+		# three immediately.
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
 		# via BispinorVqReader once those paths land.
 		with BispinorVqReader(bispinor_h5_path, mesh_xy,
@@ -3034,7 +3060,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-	return V_qmunu, G0, head_channel, photon_g0_vectors
+	return (V_qmunu, G0, head_channel, photon_g0_vectors,
+	        bispinor_vq_restart_binding)
 
 
 def build_wavefunction_bundle(
@@ -3145,6 +3172,20 @@ def prepare_isdf_and_wavefunctions(
 	# Same shape, same two-call-site reason: parser-altitude coverage is
 	# duplicated here for a hand-built cfg.  No-op at the default (false).
 	refuse_unsupported_bispinor_tt_head_correction(cfg)
+	if (bool(cfg.restart) and bool(cfg.bispinor)
+			and packed_photon_screens_current(cfg)):
+		if not getattr(cfg.paths, 'centroids_file_current', None):
+			raise ValueError(
+				"bispinor screened restart requires centroids_file_current")
+		from file_io.centroids import load_centroids as _load_centroids_for_gate
+		from runtime.padding import padded_mu_extent
+		_, _, _n_current_for_gate = _load_centroids_for_gate(
+			cfg.paths.centroids_file_current, meta.fft_grid)
+		refuse_screened_photon_restart_storage(
+			cfg, nq=int(meta.nk_tot),
+			n_charge_padded=int(meta.n_rmu_padded),
+			n_current_padded=padded_mu_extent(
+				int(_n_current_for_gate), int(jax.device_count())))
 	from file_io.wfn_basis import WavefunctionBasisReceipt
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
@@ -3494,11 +3535,19 @@ def prepare_isdf_and_wavefunctions(
 			# (the one driver debug stream).  Round-1 addition.
 			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
-			V_qmunu, G0, head_channel, photon_g0_vectors = compute_V_q(
+			from file_io import (
+				coulomb_policy_from_config, format_coulomb_policy)
+			_coulomb_policy = coulomb_policy_from_config(cfg, meta)
+			(V_qmunu, G0, head_channel, photon_g0_vectors,
+			 bispinor_vq_restart_binding) = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
-				sym=sym, centroid_indices=centroid_indices)
+				sym=sym, centroid_indices=centroid_indices,
+				charge_basis_receipt=charge_basis_receipt,
+				transverse_basis_receipt=transverse_basis_receipt,
+				coulomb_policy_stamp=(
+					format_coulomb_policy(_coulomb_policy)))
 			# P5 — post-V_q.  V_q's transient peak just happened inside
 			# compute_V_q; this probe captures what survives (V_qmunu,
 			# G0) plus anything held over from ζ-fit.  Combined with P4
@@ -3546,7 +3595,6 @@ def prepare_isdf_and_wavefunctions(
 				cfg, sym=sym, centroid_indices=centroid_indices,
 				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
-				from file_io import coulomb_policy_from_config
 				from file_io.qp_wfn import (
 					qp_state_source_provenance_from_binding)
 				write_restart_state_to_h5(
@@ -3557,7 +3605,13 @@ def prepare_isdf_and_wavefunctions(
 					# restart and compute_V_q never re-runs, so without this
 					# an averaging-policy change is inherited in silence with
 					# every other guard passing.
-					coulomb_policy=coulomb_policy_from_config(cfg, meta),
+					coulomb_policy=_coulomb_policy,
+					bispinor_vq_restart_binding=(
+						bispinor_vq_restart_binding),
+					photon_g0_vectors=photon_g0_vectors,
+					n_rmu_transverse_logical=(
+						int(transverse_wfn_data['meta'].n_rmu)
+						if transverse_wfn_data is not None else None),
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
@@ -3710,6 +3764,15 @@ def prepare_isdf_and_wavefunctions(
 		# branch.  The entry resolver above is a centralized compatibility
 		# hook whose current deck-key refusal table is empty.
 		from file_io import load_restart_state_from_h5
+		_bispinor_restart_binding = None
+		if cfg.bispinor:
+			from file_io.bispinor_vq_restart import (
+				assert_bispinor_vq_restart_binding)
+			_bispinor_restart_binding = (
+				assert_bispinor_vq_restart_binding(
+					restart_path=tensors_filename,
+					v_q_path=os.path.join(tmp_dir, "v_q_bispinor.h5"),
+					where="gw_jax bispinor restart"))
 		from file_io.qp_wfn import (
 			authenticate_restart_qp_state_source_for_wfn)
 		_restart_source_record, basis_wfn_fingerprint_binding = (
@@ -3992,6 +4055,33 @@ def prepare_isdf_and_wavefunctions(
 				       f"{'face' if cfg.memory.low_mem_bands else 'legacy'}, "
 				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
+				# The two files already agreed above.  Now bind that joint
+				# statement to THIS run's WFN/centroid transforms and Coulomb
+				# policy before any packed operator can consume it.
+				from file_io import (
+					coulomb_policy_from_config, format_coulomb_policy,
+					read_photon_g0_vectors_from_h5)
+				from file_io.bispinor_vq_restart import (
+					BispinorVqRestartBinding)
+				from .v_q_bispinor import V_QMUNU_FORMAT
+				_running_binding = BispinorVqRestartBinding.from_sources(
+					v_qmunu_format=V_QMUNU_FORMAT,
+					zeta_fit_provenance=(
+						_bispinor_restart_binding.zeta_fit_provenance),
+					charge_basis_receipt=charge_basis_receipt,
+					transverse_basis_receipt=transverse_basis_receipt,
+					coulomb_policy=format_coulomb_policy(
+						coulomb_policy_from_config(cfg, meta)))
+				_bispinor_restart_binding.assert_same_composition(
+					_running_binding, where="gw_jax running bispinor sources")
+				if uses_coupled_photon_head(cfg):
+					photon_g0_vectors = read_photon_g0_vectors_from_h5(
+						tensors_filename, mesh_xy,
+						n_rmu_charge_logical=int(meta.n_rmu),
+						n_rmu_transverse_logical=int(_n_rmu_curr_now))
+					print0(
+						"  [bispinor restart] loaded four authenticated "
+						"literal-Gamma vectors; no zeta refit or zeta-sphere read.")
 
 
 	from .wavefunction_bundle import AuthenticatedWavefunctions

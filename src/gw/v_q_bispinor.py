@@ -271,6 +271,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     sys_dim: int,
     n_rmu_C: int,
     n_rmu_T: int,
+    restart_binding=None,
     bare_coulomb_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None,
     g_chunk: int | None = None,
@@ -304,11 +305,13 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
     Each centroid family follows its resolved full-BZ/IBZ path.  The returned
     four-channel tuple is the derived literal-G=0 view produced at the same
-    projection seam as V.  It is not persisted beside V: canonical
-    ``zeta_q_G`` remains the sole source of truth.  On an IBZ source, the
-    symmetry service reconstructs the exact parent G coefficient and applies
-    the scalar or polar-vector action; the writer owns no q map, centroid
-    action or Cartesian rotation.
+    projection seam as V.  On an IBZ source, the symmetry service reconstructs
+    the exact parent G coefficient and applies the scalar or polar-vector
+    action; the writer owns no q map, centroid action or Cartesian rotation.
+    The canonical restart writer may persist this small derived view so a
+    restart need not reread the complete zeta spheres.  When supplied, the
+    small ``restart_binding`` authenticates that view and the V tiles against
+    their common sources.
 
     The reader :class:`BispinorVqReader` opens this on-disk format.
     """
@@ -322,6 +325,12 @@ def compute_V_q_bispinor_g_flat_to_h5(
         raise ValueError(
             f"zeta_T_loaders must be length 3 (μ_L=1,2,3); "
             f"got {len(zeta_T_loaders)}.")
+    if restart_binding is not None:
+        from file_io.bispinor_vq_restart import BispinorVqRestartBinding
+        if not isinstance(restart_binding, BispinorVqRestartBinding):
+            raise TypeError(
+                "restart_binding must be a BispinorVqRestartBinding; got "
+                f"{type(restart_binding).__name__}")
     nq_total = int(np.prod(kgrid))
 
     # File creation + metadata (rank-0 + collective sync via SlabIO).
@@ -557,6 +566,13 @@ def compute_V_q_bispinor_g_flat_to_h5(
         with h5py.File(output_h5_path, "a") as f:
             f.create_dataset("v_qmunu_format",
                              data=np.bytes_(V_QMUNU_FORMAT))
+            if restart_binding is not None:
+                from file_io.bispinor_vq_restart import (
+                    BISPINOR_VQ_RESTART_BINDING_DATASET,
+                )
+                f.create_dataset(
+                    BISPINOR_VQ_RESTART_BINDING_DATASET,
+                    data=restart_binding.encode())
             f.attrs["unique_tiles"] = json.dumps(
                 [list(t) for t in UNIQUE_TILES])
             f.attrs["zero_tiles"] = json.dumps(

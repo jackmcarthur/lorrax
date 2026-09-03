@@ -321,17 +321,37 @@ class WavefunctionBasisReceipt:
             raise TypeError(
                 f"{where}: expected WavefunctionBasisReceipt, got "
                 f"{type(other).__name__}")
-        # The padded extent is the sole runtime-layout field.  Deriving the
-        # comparison set from the dataclass schema prevents a newly added
-        # physical field from being accidentally omitted here.
-        differing = [
-            item.name for item in fields(self)
-            if item.name != "n_rmu_padded"
-            and getattr(self, item.name) != getattr(other, item.name)]
+        mine = self.physical_source_record()
+        theirs = other.physical_source_record()
+        differing = [name for name in mine if mine[name] != theirs[name]]
         if differing:
             raise ValueError(
                 f"{where}: wavefunction-at-centroids receipts differ in "
                 f"physical source fields {differing}")
+
+    def physical_source_record(self) -> dict:
+        """Return JSON-native physical identity, excluding carrier padding.
+
+        This is the one field selection used both by
+        :meth:`assert_same_source` and by persisted artifact-composition
+        receipts.  ``n_rmu_padded`` is runtime layout and may change with the
+        processor count; every returned field identifies physical source
+        bytes or the transform that sampled them.
+        """
+        return {
+            "role": self.role,
+            "wfn_fingerprint_scheme": self.wfn_fingerprint_scheme,
+            "wfn_fingerprint": self.wfn_fingerprint,
+            "band_interval": list(self.band_interval),
+            "fft_grid": list(self.fft_grid),
+            "centroid_fingerprint_scheme": (
+                self.centroid_fingerprint_scheme),
+            "centroid_table_md5": self.centroid_table_md5,
+            "n_rmu_logical": self.n_rmu_logical,
+            "source_identity": self.source_identity,
+            "nspinor_sampled": self.nspinor_sampled,
+            "bispinor_lift_provenance": self.bispinor_lift_provenance,
+        }
 
     def assert_same_carrier(
         self, other: "WavefunctionBasisReceipt", *, where: str,

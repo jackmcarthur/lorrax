@@ -854,6 +854,7 @@ def compute_screening_model(
     occupation_state=None,
     material_class,
     static_only=False,
+    omit_static=False,
     tensors_filename=None,
     print_fn=print,
 ):
@@ -864,6 +865,9 @@ def compute_screening_model(
     frequency walk cannot be represented as independent screening requests.
     ``static_only`` is an explicit request for just the ordinary static role;
     MPA has no independent static-role representation and returns nothing.
+    ``omit_static`` is the complementary internal restart request: the caller
+    already authenticated W(0) and asks this stage to build only the remaining
+    dynamic roles.  The two flags are mutually exclusive.
 
     THE ``screening_diagrams`` FORK LIVES HERE AND NOWHERE ELSE.  The role
     plan (:func:`screening_requests_for`) and the Σ dispatch are identical
@@ -887,6 +891,10 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    if static_only and omit_static:
+        raise ValueError(
+            "compute_screening_model cannot request only and omit the static "
+            "role at the same time")
     trs_allowed = _trs_verdict(sym)
     if diagrams is ScreeningDiagrams.W_BSE and not trs_allowed:
         raise RuntimeError(
@@ -963,6 +971,9 @@ def compute_screening_model(
     if static_only:
         requests = [request for request in requests
                     if request.role == "static"]
+    elif omit_static:
+        requests = [request for request in requests
+                    if request.role != "static"]
     return compute_screening(
         wfns, V_q, requests, quad=quad, e_ref=e_ref, sym=sym,
         centroid_indices=centroid_indices, config=config, meta=meta,
