@@ -112,8 +112,9 @@ the kin-ion provenance refusal, `0b43d0a6`, has `f380b216...`; the frozen
 reference ancestry is older again.  The first compatible first-parent commit
 is `60cf0273`.  Both the `sigC` (`max |delta| > 0.05 eV`) and direct-field
 bisects therefore terminate with the interval
-`dd727216..60cf0273^` skipped, rather than naming a first bad commit.  Raw
-bisect logs and every probe are under
+`1e64d83a..60cf0273^` skipped, rather than naming a first bad commit.  The
+reference header identifies `dd727216` as the generating tree and `1e64d83a`
+as the freeze commit.  Bisect records and every probe are under
 `runs/DEV/320_bisp_fixture_drift_20260902/`.
 
 The executable half of the history is decisive:
@@ -154,9 +155,11 @@ kinetic/ionic changes move the largest `eqp1` row by 0.272168 meV.  It is a
 surrogate control, not the prohibited historical A/B.
 
 Candidate rulings are correspondingly bounded.  The VNL velocity-sign fix
-`6b3ffc1f` predates the reference.  Heads cannot contribute because the deck
-sets `head_correction=off` and all three head scalars to zero.  The ordered
-GN probe and `Re Omega^2` changes postdate `837ed531`, and this run reports
+`6b3ffc1f` postdates the generating SHA but is already present at the
+reference header's exact `5b135f8e` re-verification (0/1620 cells changed),
+so it is excluded.  Heads cannot contribute because the deck sets
+`head_correction=off` and all three head scalars to zero.  The ordered GN
+probe and `Re Omega^2` changes postdate `837ed531`, and this run reports
 `Global TRS: enabled`.  The `-2F` replacement landed in this ancestry as
 `b0212b6b` (patch-equivalent to `8cd30c79`).  Its old and new expressions are
 algebraically equal when the ordered orientation is related by TRS, but its
