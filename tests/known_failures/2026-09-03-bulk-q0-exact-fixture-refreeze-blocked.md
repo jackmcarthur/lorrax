@@ -1,7 +1,7 @@
 # Exact bulk q=0 migration measured, fixture refreeze blocked upstream
 
-**Date:** 2026-09-03  
-**Source:** `lane/bisp-bulk-gamma-completion-2026-09-02`  
+**Date:** 2026-09-03
+**Source:** `lane/bisp-bulk-gamma-completion-2026-09-02`
 **Disposition:** no frozen reference, tolerance, or fixture input changed.
 
 Step 4 of the bulk Gamma-completion lane replaces the production scalar bulk
