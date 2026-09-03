@@ -130,6 +130,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `__init__.py` | Exposes the supported file-I/O surface. |
 | `_slab_io_ffi.py` | Implements the native SlabIO transport binding. |
 | `_slab_io_serial.py` | Implements serial SlabIO transport. |
+| `bispinor_vq_restart.py` | Owns the authenticated source-composition binding shared by packed bispinor V tiles and canonical restart tensors. |
 | `centroids.py` | Reads and writes centroid files. |
 | `epsreader.py` | Reads dielectric-matrix files. |
 | `h5_journal.py` | Records bounded HDF5 operation journals. |

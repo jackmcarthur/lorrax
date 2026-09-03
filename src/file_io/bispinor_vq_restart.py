@@ -1,0 +1,229 @@
+"""Authenticate the packed-photon body/restart artifact composition.
+
+The record here defines no new physical identity.  It composes the existing
+wavefunction-basis receipts, exact zeta fit-provenance strings, canonical
+Coulomb policy, and V-format word.  Fresh GW stamps the same small record at
+the V-tile and canonical-restart gateways; restart compares them before
+opening either distributed payload.
+"""
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+import h5py
+import numpy as np
+
+from .wfn_basis import WavefunctionBasisReceipt
+
+BISPINOR_VQ_RESTART_BINDING_DATASET = "bispinor_vq_restart_binding"
+BISPINOR_VQ_RESTART_BINDING_SCHEMA = "bispinor_vq_restart_binding_v1"
+
+
+@dataclass(frozen=True)
+class BispinorVqRestartBinding:
+    """Small host-only composition record shared by V and restart files."""
+
+    v_qmunu_format: str
+    zeta_fit_provenance: tuple[str, str, str, str]
+    charge_basis_source: dict
+    transverse_basis_source: dict
+    coulomb_policy: str
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        v_qmunu_format: str,
+        zeta_fit_provenance: Sequence[str],
+        charge_basis_receipt: WavefunctionBasisReceipt,
+        transverse_basis_receipt: WavefunctionBasisReceipt,
+        coulomb_policy: str,
+    ) -> BispinorVqRestartBinding:
+        """Compose incumbent identities without rereading source payloads."""
+        if not isinstance(charge_basis_receipt, WavefunctionBasisReceipt):
+            raise TypeError(
+                "bispinor V/restart binding requires a charge "
+                "WavefunctionBasisReceipt")
+        if not isinstance(transverse_basis_receipt, WavefunctionBasisReceipt):
+            raise TypeError(
+                "bispinor V/restart binding requires a transverse "
+                "WavefunctionBasisReceipt")
+        charge = charge_basis_receipt.physical_source_record()
+        transverse = transverse_basis_receipt.physical_source_record()
+        if charge["role"] != "charge" or transverse["role"] != "transverse":
+            raise ValueError(
+                "bispinor V/restart binding requires ordered charge and "
+                "transverse basis receipts")
+        return cls._from_parts(
+            v_qmunu_format=v_qmunu_format,
+            zeta_fit_provenance=zeta_fit_provenance,
+            charge_basis_source=charge,
+            transverse_basis_source=transverse,
+            coulomb_policy=coulomb_policy,
+        )
+
+    @classmethod
+    def _from_parts(
+        cls,
+        *,
+        v_qmunu_format,
+        zeta_fit_provenance,
+        charge_basis_source,
+        transverse_basis_source,
+        coulomb_policy,
+    ) -> BispinorVqRestartBinding:
+        fmt = str(v_qmunu_format)
+        provenance = tuple(str(value) for value in zeta_fit_provenance)
+        if not fmt:
+            raise ValueError("bispinor V/restart binding has an empty V format")
+        if len(provenance) != 4 or any(not value for value in provenance):
+            raise ValueError(
+                "bispinor V/restart binding requires four non-empty exact "
+                "zeta fit-provenance strings in C,T1,T2,T3 order")
+        if not isinstance(charge_basis_source, Mapping):
+            raise TypeError("bispinor V/restart charge source is not a record")
+        if not isinstance(transverse_basis_source, Mapping):
+            raise TypeError(
+                "bispinor V/restart transverse source is not a record")
+        charge = dict(charge_basis_source)
+        transverse = dict(transverse_basis_source)
+        if charge.get("role") != "charge" or transverse.get("role") != "transverse":
+            raise ValueError(
+                "bispinor V/restart basis records have the wrong channel roles")
+        policy = str(coulomb_policy)
+        if not policy:
+            raise ValueError(
+                "bispinor V/restart binding has an empty Coulomb-policy stamp")
+        return cls(
+            v_qmunu_format=fmt,
+            zeta_fit_provenance=provenance,
+            charge_basis_source=charge,
+            transverse_basis_source=transverse,
+            coulomb_policy=policy,
+        )
+
+    def to_record(self) -> dict:
+        return {
+            "schema": BISPINOR_VQ_RESTART_BINDING_SCHEMA,
+            "v_qmunu_format": self.v_qmunu_format,
+            "zeta_fit_provenance": list(self.zeta_fit_provenance),
+            "charge_basis_source": dict(self.charge_basis_source),
+            "transverse_basis_source": dict(self.transverse_basis_source),
+            "coulomb_policy": self.coulomb_policy,
+        }
+
+    @classmethod
+    def from_record(cls, record) -> BispinorVqRestartBinding:
+        if not isinstance(record, Mapping):
+            raise TypeError("bispinor V/restart binding payload is not a record")
+        required = {
+            "schema", "v_qmunu_format", "zeta_fit_provenance",
+            "charge_basis_source", "transverse_basis_source", "coulomb_policy",
+        }
+        if record.get("schema") != BISPINOR_VQ_RESTART_BINDING_SCHEMA:
+            raise ValueError(
+                "bispinor V/restart binding has unsupported schema "
+                f"{record.get('schema')!r}; expected "
+                f"{BISPINOR_VQ_RESTART_BINDING_SCHEMA!r}")
+        if set(record) != required:
+            raise ValueError(
+                "bispinor V/restart binding fields differ from its schema: "
+                f"got {sorted(record)}, expected {sorted(required)}")
+        return cls._from_parts(
+            v_qmunu_format=record["v_qmunu_format"],
+            zeta_fit_provenance=record["zeta_fit_provenance"],
+            charge_basis_source=record["charge_basis_source"],
+            transverse_basis_source=record["transverse_basis_source"],
+            coulomb_policy=record["coulomb_policy"],
+        )
+
+    def encode(self) -> np.ndarray:
+        """Return canonical scalar bytes for either metadata gateway."""
+        text = json.dumps(self.to_record(), sort_keys=True, separators=(",", ":"))
+        return np.asarray(text.encode("utf-8"), dtype="S")
+
+    def assert_same_composition(
+        self, other: BispinorVqRestartBinding, *, where: str,
+    ) -> None:
+        if not isinstance(other, BispinorVqRestartBinding):
+            raise TypeError(
+                f"{where}: expected BispinorVqRestartBinding, got "
+                f"{type(other).__name__}")
+        mine = self.to_record()
+        theirs = other.to_record()
+        differing = [name for name in mine if mine[name] != theirs[name]]
+        if differing:
+            raise ValueError(
+                "GATE bispinor_packed_restart_binding_mismatch: packed "
+                "restart artifacts name different physical sources.\n"
+                f"  got:  differing binding fields {differing} at {where}\n"
+                "  want: isdf_tensors and v_q_bispinor.h5 written together\n"
+                "  why:  same-shaped charge/current tensors from different "
+                "WFN, zeta, centroid, or Coulomb sources are silently wrong\n"
+                "  fix:  set restart = false and regenerate both artifacts\n"
+                "  doc:  docs/input_reference.md, restart.")
+
+
+def read_bispinor_vq_restart_binding(
+    path: str | Path,
+) -> BispinorVqRestartBinding | None:
+    """Read one small host record; ``None`` means missing/legacy artifact."""
+    path = Path(path)
+    try:
+        with h5py.File(path, "r") as h5:
+            if BISPINOR_VQ_RESTART_BINDING_DATASET not in h5:
+                return None
+            raw = h5[BISPINOR_VQ_RESTART_BINDING_DATASET][()]
+    except OSError:
+        return None
+    try:
+        payload = raw if isinstance(raw, bytes) else np.asarray(raw).tobytes()
+        record = json.loads(payload.decode("utf-8", "strict").rstrip("\x00"))
+        return BispinorVqRestartBinding.from_record(record)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError(
+            "GATE bispinor_packed_restart_binding_invalid: packed restart "
+            "binding metadata is not canonical.\n"
+            f"  got:  invalid {BISPINOR_VQ_RESTART_BINDING_DATASET} in {path}\n"
+            "  want: a canonical binding written by the current restart writer\n"
+            "  why:  corrupt provenance cannot authenticate distributed arrays\n"
+            "  fix:  set restart = false and regenerate the artifacts\n"
+            "  doc:  docs/input_reference.md, restart.") from exc
+
+
+def assert_bispinor_vq_restart_binding(
+    *, restart_path: str | Path, v_q_path: str | Path,
+    where: str = "bispinor restart",
+) -> BispinorVqRestartBinding:
+    """Refuse a stale/legacy cross-file join before distributed payload I/O."""
+    restart = read_bispinor_vq_restart_binding(restart_path)
+    photon = read_bispinor_vq_restart_binding(v_q_path)
+    missing = []
+    if restart is None:
+        missing.append(str(restart_path))
+    if photon is None:
+        missing.append(str(v_q_path))
+    if missing:
+        raise ValueError(
+            "GATE bispinor_packed_restart_binding_missing: packed restart "
+            "artifact provenance is missing.\n"
+            f"  got:  no {BISPINOR_VQ_RESTART_BINDING_DATASET} in {missing}\n"
+            "  want: authenticated isdf_tensors and v_q_bispinor.h5 from one run\n"
+            "  why:  a legacy, absent, or partial tile file cannot be joined "
+            "safely to the restart carrier\n"
+            "  fix:  restore both matching files or set restart = false\n"
+            "  doc:  docs/input_reference.md, restart.")
+    restart.assert_same_composition(photon, where=where)
+    return restart
+
+
+__all__ = [
+    "BISPINOR_VQ_RESTART_BINDING_DATASET",
+    "BISPINOR_VQ_RESTART_BINDING_SCHEMA",
+    "BispinorVqRestartBinding",
+    "assert_bispinor_vq_restart_binding",
+    "read_bispinor_vq_restart_binding",
+]

@@ -601,8 +601,10 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 2      # 6 shared (incl. w_dyson_solver) + 2 screened-only
-    assert "w_dyson_solver = distributed" in shared
+    # Screened adds the existing two-plan Dyson row, face-layout row, and
+    # scalar-head override row.  Bare has no packed solve.
+    assert len(both) == len(shared) + 3
+    assert all("w_dyson_solver" not in row for row in shared)
 
 
 def test_material_class_is_owned_by_wfn_validation_not_the_envelope(tmp_path):
@@ -644,9 +646,7 @@ def test_the_eight_scalar_head_overrides_are_one_conjunct(tmp_path):
 
 
 def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
-    """``low_mem_bands`` / ``w_dyson_solver`` are the only layout and the
-    only Dyson plan the packed screened mode has, so the deck must not
-    have to write them."""
+    """The face layout derives; unnamed Dyson uses the legal local plan."""
     lines = []
     deck = (_packed_deck()
             .replace("low_mem_bands = true\n", "")
@@ -656,10 +656,11 @@ def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
     config = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     assert config.memory.low_mem_bands is True
-    assert str(config.backend.w_dyson_solver) == "distributed"
+    assert str(config.backend.w_dyson_solver) == "local"
     assert uses_static_photon_response(config)
     assert any("low_mem_bands was not named" in ln for ln in lines), lines
     assert any("w_dyson_solver was not named" in ln for ln in lines), lines
+    assert any("legal on a 1x1 mesh" in ln for ln in lines), lines
 
 
 def test_an_explicit_conflicting_value_is_still_refused_not_overridden(
@@ -757,23 +758,14 @@ def test_the_driver_replays_config_provenance_into_the_production_report():
     assert "report.emit(line.strip())" in src
 
 
-def test_restart_may_not_swap_the_head_mechanism_on_a_slab_cohsex_deck(
-        tmp_path):
-    """restart = true used to move a slab bispinor COHSEX deck from the
-    packed Gamma-cell completion to the incumbent scalar head, silently,
-    for 5.7 meV plus the whole transverse head."""
+def test_restart_keeps_the_packed_head_route_on_a_slab_cohsex_deck(tmp_path):
+    """restart changes the input source, never the selected head mechanism."""
     deck = (_INCUMBENT_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
             .replace("restart = false", "restart = true"))
-    with pytest.raises(ValueError) as exc:
-        _parse(tmp_path, deck)
-    message = str(exc.value)
-    assert ("bispinor_slab_cohsex_restart_changes_the_head_mechanism"
-            in message)
-    # it must NAME BOTH mechanisms, not just say "unsupported"
-    assert "Wigner-Seitz" in message and "StaticHeadTerms" in message
-    assert "5.72 meV" in message
-    assert "IMPLEMENTATION LIMIT" in message
+    config = _parse(tmp_path, deck)
+    assert config.restart is True
+    assert uses_static_photon_response(config)
 
 
 def test_an_unnamed_restart_uses_the_fresh_physics_default(tmp_path):

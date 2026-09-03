@@ -92,8 +92,11 @@ def test_restart_qp_state_matrix(
         if error is None:
             assert call() is None
         else:
-            with pytest.raises(ValueError, match=error):
+            with pytest.raises(ValueError, match=error) as exc:
                 call()
+            if not legacy and not same_content:
+                assert "GATE restart_qp_state_wfn_fingerprint_mismatch" in str(
+                    exc.value)
 
 
 def test_record_roundtrip_and_malformed_refusal(tmp_path):

@@ -702,12 +702,14 @@ def main(argv=None):
 	if (do_screened
 			and config.head.correction is HeadCorrection.FULL
 			and config.screening.diagrams is ScreeningDiagrams.W_RPA
-			# The DYNAMIC packed route keeps the scalar charge owner (its CC
-			# channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
-			# the direct DFT response its q->0 head samples are finalized
-			# from.  Only the STATIC packed mode, whose packed Gamma-cell
-			# completion replaces that machinery outright, skips it.
-			and not packed_photon_replaces_charge_sigma(config)
+			# The dynamic packed route keeps the scalar charge owner.  The
+			# static BARE packed route also needs this bounded charge response:
+			# restart_q_storage persists W_00 together with the head receipt
+			# finalized against it.  The screened-current static route alone
+			# skips the scalar response because its packed Gamma completion owns
+			# the whole screened operator and that restart class is refused.
+			and (not packed_photon_replaces_charge_sigma(config)
+			     or packed_bare_transverse_route(config)[0])
 			# Every self-consistent mode builds its exact frequency plan and
 			# response inside the map.  A pre-map response would exist only to
 			# seed a restart artifact and could be mistaken for final physics.
@@ -743,6 +745,7 @@ def main(argv=None):
 	# Do not perform a redundant DFT screening solve here: besides its cost,
 	# that seed body used to survive long enough to be paired with a final head.
 	photon_response = None
+	_packed_restart_w0 = None
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		W_by_role = {}
 	else:
@@ -767,7 +770,31 @@ def main(argv=None):
 				# assembled from -- and it must KEEP them past this block.
 				_dynamic_packed = uses_dynamic_packed_photon_route(config)
 				_W_charge = None
-				if not _screens_current or _dynamic_packed:
+				_x_only_packed = mode is ComputeMode.X_ONLY
+				_loaded_restart_w0 = None
+				if (bool(config.restart) and not _screens_current
+						and not _x_only_packed):
+					from file_io import read_ready_w0_qmunu_from_h5
+					_t0_restart_w0 = time.monotonic()
+					with timing.section("gw_jax.packed_restart_w0_load"):
+						_loaded_restart_w0 = read_ready_w0_qmunu_from_h5(
+							tensors_filename, mesh_xy,
+							n_rmu_logical=int(meta.n_rmu),
+							expected_screening_diagrams="w_rpa")
+					print0(
+						"  [bispinor restart] loaded authenticated scalar W(0) "
+						f"in {time.monotonic() - _t0_restart_w0:.3f} s; "
+						"no static chi0/Dyson rebuild for that role.")
+				if _x_only_packed:
+					# No screening exists in x_only.  The shared packed builder
+					# receives W=V so its current consumer has SX(V)=X(V) and
+					# COH(V-V)=0; Sigma consumes only those current X blocks.
+					W_by_role = {}
+					_W_charge = V_q
+				elif _loaded_restart_w0 is not None and not _dynamic_packed:
+					_W_charge = _loaded_restart_w0
+					W_by_role = {"static": _loaded_restart_w0}
+				elif not _screens_current or _dynamic_packed:
 					W_by_role = compute_screening_model(
 						mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
 						centroid_indices=centroid_indices, config=config,
@@ -781,14 +808,35 @@ def main(argv=None):
 						material_class=material_class,
 						tensors_filename=tensors_filename,
 						static_only=not _dynamic_packed,
+						omit_static=(_loaded_restart_w0 is not None),
 						print_fn=print0)
 					if not _screens_current:
+						if _loaded_restart_w0 is not None:
+							W_by_role = dict(W_by_role)
+							W_by_role["static"] = _loaded_restart_w0
 						_W_charge = W_by_role.get("static")
 						if _W_charge is None:
 							raise RuntimeError(
 								"the packed bare-transverse route needs the incumbent "
 								"static W(omega=0) on the charge block; the screening "
 								"model returned no 'static' role.")
+						# The packed completion owns the four-current Gamma cell,
+						# while restart_q_storage owns the scalar W0 body plus its
+						# scalar charge-head receipt.  Finalize that bounded charge
+						# receipt against the SAME W role before the packed builder
+						# consumes the body.  Without this installation the canonical
+						# W0 writer would ask an intentionally unfinalized resolver for
+						# its static sample after the packed route returned.
+						if oneshot_head_response is not None:
+							from .qsgw_head import finalize_iteration_head_samples
+							_charge_head = finalize_iteration_head_samples(
+								oneshot_head_response,
+								wfn=wfn, meta=meta, config=config, mesh=mesh_xy,
+								requests=oneshot_head_requests,
+								W_by_role=W_by_role)
+							head_resolver.install_samples(_charge_head.samples)
+						if not bool(config.restart):
+							_packed_restart_w0 = _W_charge
 				from .w_isdf import compute_static_photon_response
 				photon_response = compute_static_photon_response(
 					wfns, wfns_transverse, quad, bispinor_v_q_path,
@@ -816,8 +864,10 @@ def main(argv=None):
 					"  static photon route: "
 					+ ("full_static_cohsex (sixteen chi blocks, one packed "
 					   "Dyson solve)" if _screens_current else
-					   "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
-					   "scalar Dyson on CC, W_packed = diag(W_00, D_TT))")
+					   ("bare_transverse packed x_only (no W solve; "
+					    "W_packed = V_packed)" if _x_only_packed else
+					    "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
+					    "scalar W on CC, W_packed = diag(W_00, D_TT))"))
 					+ ("" if not _dynamic_packed else
 					   "; DYNAMIC packed route: the CC block carries "
 					   f"compute_mode = {mode.value} at every omega and the "
@@ -848,6 +898,12 @@ def main(argv=None):
 						"q->0 head is the packed Gamma-cell completion's. "
 						"Sigma^B is the TT block of the packed operator, not "
 						"a separate term.")
+				elif _x_only_packed:
+					report.progress(
+						"Photon Sigma   : packed x_only route -- scalar charge X "
+						"plus the packed consumer's current X blocks; W=V, "
+						"Sigma_SX=Sigma_X and Sigma_COH=0 in the current sector. "
+						"No incumbent separate Sigma^B term is added.")
 				else:
 					report.progress(
 						"Photon Sigma   : static packed route -- all sixteen "
@@ -915,13 +971,20 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	if (not packed_photon_replaces_charge_sigma(config)
+	if ((not packed_photon_replaces_charge_sigma(config)
+			or _packed_restart_w0 is not None)
 			and driver_persists_w0(mode, config)
+			# A served packed restart is read-only: its authenticated W0 is
+			# already the input just consumed.  Rewriting it would make restart
+			# change more than the load path and would mutate the source bundle.
+			and not (bool(config.restart)
+			         and uses_static_photon_response(config))
 			and qp_solver is not QPSolver.SELF_CONSISTENT):
 		with timing.section("gw_jax.persist_w0"):
 			from .gw_output import persist_w0_and_head
 			persist_w0_and_head(
-				W_by_role.get("static", V_q),
+				(_packed_restart_w0 if _packed_restart_w0 is not None else
+				 W_by_role.get("static", V_q)),
 				tensors_filename=tensors_filename, head_resolver=head_resolver,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, centroid_indices=centroid_indices,

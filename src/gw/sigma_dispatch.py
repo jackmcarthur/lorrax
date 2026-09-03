@@ -967,6 +967,78 @@ def compute_sigma_xc(
                 photon_head_diagnostics.components_tskn_ry)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
         sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
+    elif (uses_static_photon_response(config)
+          and mode is ComputeMode.X_ONLY):
+        # Bare-family x_only is exactly scalar charge X plus the packed
+        # consumer's current X blocks.  W_packed equals V_packed on this
+        # route, so no screened channel or correlation is admitted and the
+        # incumbent separate Sigma-B fold must stay off.
+        if photon_response is None:
+            raise RuntimeError(
+                "packed x_only reached Sigma without the packed photon "
+                "response; refusing the incumbent Sigma-B fallback")
+        from .cohsex_sigma import _resolve_Gij
+        photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
+        sig_x = compute_sigma_x(
+            wfns, V_q, meta, mesh_xy,
+            Gij=photon_Gij,
+            static_head_terms=static_head_terms,
+            wfns_transverse=None,
+            bispinor_v_q_path=None,
+            occupation_state=None,
+        )
+        from .photon_sigma import (
+            PHOTON_BLOCKS_CURRENT, compute_static_photon_sigma)
+        (cur_x, cur_sx, cur_coh,
+         photon_head_diagnostics,
+         photon_sigma_diagnostics) = compute_static_photon_sigma(
+            wfns_charge=wfns,
+            wfns_transverse=wfns_transverse,
+            Gij=photon_Gij,
+            V_packed=photon_response.V_packed,
+            W_packed=photon_response.W_packed,
+            photon_layout=photon_response.layout,
+            meta=meta,
+            mesh_xy=mesh_xy,
+            blocks=PHOTON_BLOCKS_CURRENT,
+            head_completion=photon_response.head_completion,
+            diagnostic_basis_rotation=hartree_basis_rotation,
+            diagnostic_input_basis=(
+                "qp" if hartree_basis_rotation is not None else "dft"),
+            print_fn=print_fn,
+        )
+        # The declaration W=V makes SX=X and COH(W-V)=0.  Consume X by
+        # name so a future screened response cannot silently enter x_only.
+        sig_x = sig_x + cur_x
+        sig_x.block_until_ready()
+        sig_sx = sig_coh = jnp.zeros_like(sig_x)
+        _sx_x_residual = float(jnp.max(jnp.abs(cur_sx - cur_x)))
+        if _sx_x_residual > 1.0e-13:
+            raise ValueError(
+                "GATE bispinor_packed_x_only_not_bare: packed x_only "
+                "requires SX(V)=X(V), but its current blocks differ.\n"
+                f"  got:  max|Sigma_SX-Sigma_X|={_sx_x_residual:.3e} Ry\n"
+                "  want: exact bare-current identity within 1e-13 Ry\n"
+                "  why:  a screened current operand must never enter x_only\n"
+                "  fix:  use bispinor_gw = bare_transverse and rebuild the "
+                "packed response\n"
+                "  doc:  docs/input_reference.md, bispinor_gw / x_only.")
+        _coh_residual = float(jnp.max(jnp.abs(cur_coh)))
+        if _coh_residual > 1.0e-13:
+            raise ValueError(
+                "GATE bispinor_packed_x_only_has_correlation: packed x_only "
+                "requires COH(W-V)=0, but current correlation survived.\n"
+                f"  got:  max|Sigma_COH|={_coh_residual:.3e} Ry\n"
+                "  want: exact zero within 1e-13 Ry\n"
+                "  why:  x_only cannot consume any W-V contribution\n"
+                "  fix:  use bispinor_gw = bare_transverse and rebuild the "
+                "packed response\n"
+                "  doc:  docs/input_reference.md, bispinor_gw / x_only.")
+        if photon_head_diagnostics is not None:
+            photon_head_sigma_diag = (
+                photon_head_diagnostics.components_tskn_ry)
+            photon_head_sigma_basis = photon_head_diagnostics.output_basis
+        sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
     elif uses_dynamic_packed_photon_route(config):
         # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
         # W_packed(w) = diag(W_00(w), W_TT, W_CT): the CHARGE block carries
@@ -1081,8 +1153,9 @@ def compute_sigma_xc(
         raise NotImplementedError(
             f"packed four-current mode with compute_mode = "
             f"{getattr(mode, 'value', mode)} has no Sigma branch.  The "
-            "packed operator serves compute_mode = cohsex (static, all "
-            "sixteen blocks) and the two-point plasmon-pole pair (dynamic "
+            "packed operator serves compute_mode = x_only (scalar charge X "
+            "plus packed current X), cohsex (static, all sixteen blocks), "
+            "and the two-point plasmon-pole pair (dynamic "
             "charge block, static current blocks).  mpa has no independent "
             "static-role W for the bare family's CC block "
             "(gw.screening.screening_requests_for returns none for it), so "

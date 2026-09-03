@@ -961,10 +961,17 @@ def _refuse_conflicting_qp_state_sources(
         stamp = provenance["qp_wfn_stamp"]
         if provenance["wfn_fingerprint"] != selected["wfn_fingerprint"]:
             raise ValueError(
-                f"{where}: restart {state_artifact_path} and selected WFN "
-                f"{wfn_path} have different canonical content fingerprints. "
-                "They do not carry the same psi/E representation; regenerate "
-                "the restart from the selected WFN.")
+                "GATE restart_qp_state_wfn_fingerprint_mismatch: restart "
+                "and selected WFN have different canonical content "
+                "fingerprints.\n"
+                f"  got:  {where}: restart {state_artifact_path}, selected "
+                f"WFN {wfn_path}\n"
+                "  want: the WFN that supplied the restart psi/E state\n"
+                "  why:  different fingerprints cannot carry the same "
+                "wavefunction/energy representation\n"
+                "  fix:  regenerate the restart from the selected WFN, or "
+                "restore its original WFN\n"
+                "  doc:  docs/input_reference.md, restart.")
         if stamp != selected["qp_wfn_stamp"]:
             raise ValueError(
                 f"{where}: restart {state_artifact_path} has a torn QP-state "
