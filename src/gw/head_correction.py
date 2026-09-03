@@ -2527,6 +2527,34 @@ def _faraday_hermitian_coordinate_basis(
         orthogonal_sq, projection_error)
 
 
+def _faraday_fit_rung_is_adequate(block_residuals, *, causal):
+    """Apply the owner-approved physical-sector fit contracts."""
+    cc_residual, ct_residual, tc_residual, tt_residual = (
+        float(value) for value in block_residuals)
+    return bool(
+        causal
+        and cc_residual <= 1.0e-4
+        and ct_residual <= 1.0e-2
+        and tc_residual <= 1.0e-2
+        and tt_residual == 0.0)
+
+
+def _faraday_fit_failure_gate(block_ladder, *, max_fit_poles):
+    """Name an inadequate ladder without conflating Hall and zero sectors."""
+    hall_ladder = tuple(
+        max(float(row[1]), float(row[2])) for row in block_ladder)
+    high_order_plateau = (
+        max_fit_poles >= 12
+        and min(hall_ladder[-3:]) > 1.0e-2
+        and min(hall_ladder[-2:]) >= 0.8 * hall_ladder[-3])
+    return (
+        "dynamic_hall_head_unimplemented_second_even_pole"
+        if max_fit_poles == 1 else
+        "dynamic_hall_head_nonpole_plateau"
+        if high_order_plateau else
+        "dynamic_hall_head_multipole_inadequate")
+
+
 def _fit_ordered_faraday_factor_samples(
     sample_pairs,
     sample_frequencies,
@@ -2535,7 +2563,6 @@ def _fit_ordered_faraday_factor_samples(
     layout=None,
     sampling_alpha: int = 1,
     sampling_schedule: str = "nested",
-    adequacy_tolerance: float = 1.0e-4,
     print_fn=print,
 ):
     r"""Fit the minimal 1..12-pole ordered MPA model on factor coordinates.
@@ -2545,9 +2572,10 @@ def _fit_ordered_faraday_factor_samples(
     is then an ordinary element for :func:`gw.mpa.pade_fit.fit_mpa_poles`,
     including its ordered ``B``/``D`` split and causal guards.  Rung ``n`` is
     fitted on the nested ``2*n``-sample support and scored against every
-    supplied sample.  The full ladder through 12 is reported, and its first
-    largest physical-block dense-contour residual no larger than
-    ``adequacy_tolerance`` is used.
+    supplied sample.  The full ladder through 12 is reported.  Its first
+    causal rung whose CT and TC residuals are each at most one percent is
+    used; CC retains the scalar owner's ``1e-4`` certificate and TT must stay
+    exactly zero for this Hall-only insertion.
     """
     from .mpa.pade_fit import eval_mpa_model, fit_mpa_poles_batched
     from .mpa.sample_plan import faraday_imaginary_plan, plan_z
@@ -2726,32 +2754,26 @@ def _fit_ordered_faraday_factor_samples(
                 f"block max-sample residuals={list(block_max_samples)}; "
                 f"valid={int(np.sum(valid_host))}/{valid_host.size}; "
                 f"causal={bool(causal)}")
-        if (selected is None and residual <= float(adequacy_tolerance)
-                and causal):
+        if (selected is None
+                and _faraday_fit_rung_is_adequate(
+                    block_residuals, causal=causal)):
             selected = (
                 n_poles, omega_host, B_host, D_host, valid_host)
 
     if selected is None:
-        high_order_plateau = (
-            max_fit_poles >= 12
-            and min(ladder[-3:]) > 1.0e-3
-            and min(ladder[-2:]) >= 0.8 * ladder[-3])
-        gate = (
-            "dynamic_hall_head_unimplemented_second_even_pole"
-            if max_fit_poles == 1 else
-            "dynamic_hall_head_nonpole_plateau"
-            if high_order_plateau else
-            "dynamic_hall_head_multipole_inadequate")
+        gate = _faraday_fit_failure_gate(
+            ladder_blocks, max_fit_poles=max_fit_poles)
         message = (
             f"GATE {gate}:\n"
             f"  got:  ordered Faraday n_p=1..{max_fit_poles} maximum "
             f"CC/CT/TC/TT dense-contour residuals = {ladder}; per-block "
             f"(CC,CT,TC,TT) = "
             f"{ladder_blocks}; max-sample = {ladder_max_sample}; all above "
-            f"{adequacy_tolerance:.1e} or "
+            "their sector gates or "
             "with a noncausal guarded pole\n"
-            "  want: the minimal causal even-in-z MPA model whose dense "
-            "imaginary-contour residual is <= 1e-4\n"
+            "  want: the minimal causal even-in-z MPA model with CT and TC "
+            "dense-contour residuals <= 1e-2, CC <= 1e-4, and TT exactly "
+            "zero\n"
             "  why:  an under-resolved Gamma-head pole would silently "
             "replace the authenticated CT/TC response by another operator\n"
             "  fix:  request the owner-ruled non-pole imaginary-axis-to-time "

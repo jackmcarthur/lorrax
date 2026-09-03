@@ -118,7 +118,9 @@ blocks without allocating a second packed W body. Schema v3 authenticates
 and anti-Hermitian operator halves through factor-Gram contractions. Their
 bounded coordinates go through the existing ordered MPA fitter for every rung
 `n_p=1…12`; all rungs are scored against all 32 samples, and the first causal
-fit below `1e-4` is selected. Its residues are selected as `B_H+D_H` /
+fit whose CT and TC relative residuals are each at most `1e-2` is selected.
+The CC contract remains `1e-4` at its scalar `W_00` owner and TT is exactly
+zero in this Hall insertion. The selected residues are `B_H+D_H` /
 `B_H-D_H` by the shared `ppm_sigma._residue_for_space` owner. The fit and
 sample provenance are written to `faraday_head_fit.json` before Sigma. A
 schema-v2 artifact remains readable for static work but refuses broken-TR
@@ -189,7 +191,8 @@ Runtime facts add these important boundaries:
 - `dynamic_hall_head_unimplemented_second_even_pole`: a readable schema-v2
   Hall artifact lacks the authenticated dense samples required by production.
 - `dynamic_hall_head_nonpole_plateau`: all causal 1…12-pole rungs miss the
-  dense-sample tolerance and the high-order residual has plateaued.
+  sector-specific dense-sample tolerances (CT/TC `1e-2`, CC `1e-4`, TT exact
+  zero) and the high-order Hall residual has plateaued.
 - `dynamic_hall_head_multipole_inadequate`: the 1…12-pole ladder remains
   above tolerance without satisfying the plateau certificate.
 - `packed_dynamic_sc_requires_current_operator`: a served bare dynamic SC

@@ -41,7 +41,7 @@ current density `ψ†α^iψ`).
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + charge wings + optional Hall CT/TC `q¹` (§4), completed on the exact dimensioned WS cell; `off` is DEBUG | `bispinor_gw = full_static_cohsex`, `sys_dim` 2 or 3 | experimental, insulating, one shot |
 | *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`; static COHSEX uses packed `W = diag(W_00,D_TT)`, while dynamic GN/HL/MPA uses `W_CURRENT = V_CURRENT` with packed CC absent | static COHSEX uses the coupled dimensioned completion; dynamic mode inserts bare `⟨D⟩` only into V/logical current W and skips the base charge S/wings; measured-broken-TR GN separately fits the dynamic Hall pole (§4.5) | `bispinor_gw = bare_transverse`, `sys_dim` 2 or 3 | experimental; dynamic mode supports one-shot and self-consistent QP maps |
 | the packed operator on a **dynamic** Σ | **CC dynamic scalar owner, current blocks static**: GN/HL/MPA own `W_00(ω)` outside the bare packed carrier; twelve current blocks are evaluated at `ω = 0`; magnetic GN adds the analytic CT/TC Γ pole | CC: the dynamic model's own head for `Σ_c` plus scalar bare-X head; current: the packed bare Γ completion, plus the Hall-on/off CT/TC pole when prepared | `compute_mode` in {`gn_ppm`, `hl_ppm`} for either packed family, plus `mpa` for `bare_transverse`; `sys_dim` 2 or 3; magnetic Faraday insertion is GN and magnetic HL refuses by name | experimental; current-frequency dependence neglected as bounded in §2.2; bare SC re-contracts per-map orbitals |
-| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled on the 32-point nested imaginary-axis MPA oracle from `0` through `i*omega_p` | one sharded Kubo producer, authenticated schema-v3 transaction, coupled completion samples retained as CT/TC rank-four factors, and the minimal adequate ordered 1…12-pole MPA fit (§4.5) | measured-broken-TR, insulating packed GN | **conditionally applied** when the first causal rung has a maximum 32-sample residual at most `1e-4`; an inadequate ladder refuses before Sigma, and a plateau names the required non-pole treatment |
+| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled on the 32-point nested imaginary-axis MPA oracle from `0` through `i*omega_p` | one sharded Kubo producer, authenticated schema-v3 transaction, coupled completion samples retained as CT/TC rank-four factors, and the minimal adequate ordered 1…12-pole MPA fit (§4.5) | measured-broken-TR, insulating packed GN | **conditionally applied** at the first causal rung whose CT and TC 32-sample relative residuals are each at most `1e-2`; CC retains its scalar-owner `1e-4` certificate and TT stays exactly zero; an inadequate ladder refuses before Sigma |
 | retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -758,7 +758,12 @@ CC, CT, TC, and TT tensor sectors,
 cannot turn a bounded absolute miss into a divergent relative error. The
 maximum per-sample value remains a diagnostic, not the acceptance criterion.
 Production reports the complete `n_p=1…12` ladder and selects the first causal
-rung whose largest nonzero-sector dense-contour residual is at most `1e-4`.
+rung whose CT and TC dense-contour relative residuals are each at most `1e-2`.
+This owner-relaxed Hall tolerance does not weaken either non-Hall contract: CC
+remains certified to `1e-4` through the scalar `W_00` body owner, and the TT
+sector of this Hall-only insertion must remain exactly zero. Thus CrI3's
+measured ladder selects `n_p=10` (`CT = 2.687737e-3`,
+`TC = 2.688598e-3`), the smallest qualifying rung.
 
 Each selected coordinate/pole pair is converted back into bounded CT/TC
 factor families. Both Sigma branches pass through
@@ -773,8 +778,9 @@ the Hall plan and producer provenance; lists `sigma_H`, `S`, both wings, and
 `W_00` norms at every sample; and records the factor-Gram rank and projection
 residual, the per-CC/CT/TC/TT dense residuals plus maximum-sample diagnostic for
 the full 1…12 ladder, the selected pole terms, and
-`||D_H||/||B_H||`. If no rung passes, Sigma does not run. A high-order
-plateau refuses as `GATE dynamic_hall_head_nonpole_plateau`; a still-improving
+`||D_H||/||B_H||`. If no rung passes the sector-specific contracts, Sigma does
+not run. A high-order CT/TC plateau above one percent refuses as
+`GATE dynamic_hall_head_nonpole_plateau`; a still-improving
 but inadequate ladder refuses as `GATE dynamic_hall_head_multipole_inadequate`.
 The legacy schema-v2 boundary retains
 `GATE dynamic_hall_head_unimplemented_second_even_pole`. Phase-rotating one

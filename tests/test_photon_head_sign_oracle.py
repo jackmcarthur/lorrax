@@ -87,6 +87,8 @@ from gw.head_correction import (  # noqa: E402
     _dynamic_photon_head_moments,
     _dynamic_photon_head_small_system,
     _faraday_cttc_factor_pairs,
+    _faraday_fit_failure_gate,
+    _faraday_fit_rung_is_adequate,
     _fit_ordered_faraday_factor_samples,
     canonicalize_static_gauge_q2_tensor,
     complete_static_photon_q0,
@@ -1040,6 +1042,45 @@ def test_dynamic_faraday_dense_oracle_reports_full_ladder():
     assert all(np.real(pole) > 0.0 for pole in fit["pole_frequencies_ry"])
     assert all(np.imag(pole) <= 1.0e-12 * abs(pole)
                for pole in fit["pole_frequencies_ry"])
+
+
+def test_dynamic_faraday_subpercent_plateau_selects_first_passing_rung():
+    """The owner-ruled CrI3 plateau selects n_p=10, not a later rung."""
+    block_ladder = (
+        (0.0, 1.3383026712, 1.3382675081, 0.0),
+        (0.0, 0.6201334659, 0.6201405295, 0.0),
+        (0.0, 0.7811488659, 0.7811615623, 0.0),
+        (0.0, 0.7577074573, 0.7578210536, 0.0),
+        (0.0, 0.3579270284, 0.3576865813, 0.0),
+        (0.0, 0.4468710391, 0.4466418995, 0.0),
+        (0.0, 0.2472826355, 0.2472047728, 0.0),
+        (0.0, 0.07769215175, 0.07763914460, 0.0),
+        (0.0, 0.03568590320, 0.03562804939, 0.0),
+        (0.0, 0.002687737419, 0.002688598230, 0.0),
+        (0.0, 0.004538807787, 0.004534533947, 0.0),
+        (0.0, 0.002891182687, 0.002896610038, 0.0),
+    )
+    passing = [
+        index for index, residuals in enumerate(block_ladder, start=1)
+        if _faraday_fit_rung_is_adequate(residuals, causal=True)
+    ]
+    assert passing[0] == 10
+
+
+def test_dynamic_faraday_plateau_above_one_percent_refuses():
+    """A causal 12-rung plateau above the Hall gate keeps its named refusal."""
+    block_ladder = (
+        *((0.0, 0.2, 0.2, 0.0),) * 9,
+        (0.0, 0.0120, 0.0121, 0.0),
+        (0.0, 0.0140, 0.0139, 0.0),
+        (0.0, 0.0128, 0.0130, 0.0),
+    )
+    assert not any(
+        _faraday_fit_rung_is_adequate(row, causal=True)
+        for row in block_ladder)
+    assert _faraday_fit_failure_gate(
+        block_ladder, max_fit_poles=12
+    ) == "dynamic_hall_head_nonpole_plateau"
 
 
 def test_dynamic_faraday_probe_charge_delta_matches_explicit_packed_toy():
