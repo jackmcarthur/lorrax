@@ -44,8 +44,8 @@ class SharedSigmaWindow(NamedTuple):
 
 _INF = np.inf
 
-#: Node ceiling for the positive causal crossing rule: keeps the validated
-#: 500-node safety margin even when mpa_sigma_max_nodes is set lower.
+#: Node ceiling for the pane control's positive causal crossing rule (the
+#: validated 500-node safety margin; there is no deck pair ceiling).
 CROSSING_NODE_FLOOR = 500
 
 #: ``occupation_window_threshold`` lives in ``gw.efermi`` — ONE default, ONE

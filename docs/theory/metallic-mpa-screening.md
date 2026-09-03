@@ -651,8 +651,8 @@ its minimum and maximum requested frequencies.  Dynamic-range cost is
 therefore visible in the reported box and total `(window,tau)` pairs rather
 than hidden behind a second clustering policy.  Sign-definite tails remain
 logarithmic because their rule uses relative error; crossing boxes retain the
-linear-in-bandwidth lower bound.  `mpa_sigma_max_nodes` is the explicit total
-pair refusal.  Full construction and cache conventions are in
+linear-in-bandwidth lower bound.  The plan reports the total pair count and never
+refuses on it.  Full construction and cache conventions are in
 `docs/theory/sigma-quadrature-problem.md`.
 
 ## 6. The QSGW occupation cycle

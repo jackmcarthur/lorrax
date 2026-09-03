@@ -2166,7 +2166,6 @@ _DEFAULTS = {
     "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_reduction_seconds": 120.0,
     "sigma_quadrature_cache_dir": "auto",
-    "mpa_sigma_max_nodes": 96,
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
     # the applied floor is 1 − threshold: 0.995 ⇒ |weight| > 0.005.  It is
@@ -2184,22 +2183,6 @@ _DEFAULTS = {
     # range spelling (docs/dev/crossing-rule-cost-law.md).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
-    # Effective-xi FLOOR, in eV.  "auto" (default) = the ansatz's own
-    # conditioning floor: for the HGL plasmon-pole crossing quadrature that
-    # is `ppm_windows.crossing_regularization_floor` = 2*omega_max/(24 -
-    # 2*edge), which is why a GN-PPM run on a +/-5 eV grid at edge 1.5
-    # silently ran at 0.4762 eV where the deck said 0.25; for MPA it is 0,
-    # because MPA's crossing family is a positive real-time rule with its
-    # own node ceiling and the HGL bandwidth derivation says nothing about
-    # it.  A FLOAT is an explicit floor applied to EVERY ansatz -- the knob
-    # that equalises xi across a cross-ansatz comparison, which is otherwise
-    # confounded (1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV
-    # window).  0 is legal and means "do not raise"; on an HGL ansatz that
-    # re-opens the ill-conditioned regime the floor exists for, so it is
-    # spellable on purpose and stamped so it cannot happen by accident.
-    # Resolved ONCE by `ppm_windows.resolve_sigma_regularization` and
-    # stamped into sigma_mnk.h5 beside the requested value.
-    "sigma_regularization_floor_ev": "auto",
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -3049,8 +3032,7 @@ def read_lorrax_input(filename: str) -> dict:
                     "Sigma route. Remove the key and use "
                     "sigma_quadrature_eps, "
                     "sigma_quadrature_reduction_seconds, "
-                    "sigma_quadrature_cache_dir, and the existing "
-                    "mpa_sigma_max_nodes pair ceiling."
+                    "sigma_quadrature_cache_dir."
                 )
         # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
         # accumulation is the only mode, so the key steered nothing.  The
@@ -4295,12 +4277,6 @@ class DynamicSigmaConfig:
     quadrature_eps: float = 1.0e-4
     quadrature_reduction_seconds: float = 120.0
     quadrature_cache_dir: str = "auto"
-    #: ``sigma_regularization_floor_ev``: "auto" or a float in eV.  See
-    #: :func:`gw.ppm_windows.resolve_sigma_regularization`, which is the
-    #: ONLY place this is interpreted -- the drivers and the sigma_mnk.h5
-    #: writer all call it, so the stamped xi and the xi the kernel ran at
-    #: cannot disagree.
-    regularization_floor_ev: str | float = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
     #: patches at ``omega_step_ev``, replacing the contiguous grid.  The
@@ -4357,22 +4333,6 @@ class DynamicSigmaConfig:
         if not str(self.quadrature_cache_dir).strip():
             raise ValueError(
                 "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")
-        # 'auto' or a non-negative float in eV.  A TYPO must refuse here,
-        # not resolve to 'auto' -- a floor key that silently defaults is the
-        # confound the key was added to remove.
-        _floor = self.regularization_floor_ev
-        if not (isinstance(_floor, str)
-                and _floor.strip().lower() == "auto"):
-            try:
-                _floor_f = float(_floor)
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"sigma_regularization_floor_ev must be 'auto' or a "
-                    f"number of eV; got {_floor!r}.") from None
-            if not (_floor_f >= 0.0):
-                raise ValueError(
-                    f"sigma_regularization_floor_ev must be >= 0; got "
-                    f"{_floor_f!r}.")
         # REFUSE an unrecognised estimator, naming both, rather than falling
         # back to the default.  A misspelling that silently ran the default
         # would be an A/B measuring nothing -- the same rule
@@ -4488,7 +4448,6 @@ class MPAConfig:
     #: ``sampling._METAL_ORIGIN_SHIFT`` default (2e-5 Ry = 1e-5 Ha).
     metal_origin_shift_ry: float | None
     pole_batch_size: int
-    sigma_max_nodes: int
     #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
     #: counting toward a metallic Green's-function branch.  The Σ planner's
     #: cut is on the branch WEIGHT (``f`` on val, ``1 − f`` on cond), so the
@@ -4530,8 +4489,6 @@ class MPAConfig:
                     "this key is Ry like every deck key, so it is TWICE the "
                     "Hartree value the multipole papers quote (published "
                     "default 1e-5 Ha = 2e-5 Ry).")
-        if self.sigma_max_nodes < 2:
-            raise ValueError("mpa_sigma_max_nodes must be at least two")
 
     def sample_plan(self, omega_m_ry, *, material_class):
         """Return the configured double-parallel frequency plan in Ry.
@@ -5325,9 +5282,18 @@ class LorraxConfig:
                 "mpa_sigma_sector_target_error is retired: MPA Sigma now "
                 "uses one uniform denominator-box rule per product window "
                 "and has no measured-sector error apportionment. Remove the "
-                "key and use sigma_quadrature_eps (default 1e-4); "
-                "mpa_sigma_max_nodes remains the total (window,tau) pair "
-                "ceiling.")
+                "key and use sigma_quadrature_eps (default 1e-4).")
+        if "mpa_sigma_max_nodes" in _named_keys:
+            raise ValueError(
+                "mpa_sigma_max_nodes is retired (2026-09-02): the pair "
+                "ceiling is eliminated and the box plan never refuses on "
+                "count. Remove the key; sigma_quadrature_eps is the only "
+                "accuracy dial.")
+        if "sigma_regularization_floor_ev" in _named_keys:
+            raise ValueError(
+                "sigma_regularization_floor_ev is retired (2026-09-02): "
+                "sigma_regularization_ev is the broadening every ansatz "
+                "runs at and nothing raises it. Remove the key.")
         if _bgw_q0_mode == "exact":
             # An explicit spelling of the shipping default must serialize to
             # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
@@ -5461,7 +5427,6 @@ class LorraxConfig:
                 float(_g("mpa_metal_origin_shift_ry"))
                 if _g("mpa_metal_origin_shift_ry") is not None else None),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
-            sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
         )
@@ -5477,7 +5442,6 @@ class LorraxConfig:
                 _g("sigma_quadrature_reduction_seconds")),
             quadrature_cache_dir=str(
                 _g("sigma_quadrature_cache_dir")).strip(),
-            regularization_floor_ev=_g("sigma_regularization_floor_ev"),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
             omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),

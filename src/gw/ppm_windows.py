@@ -22,48 +22,6 @@ from .efermi import (
 from .minimax_screening import MinimaxNodes
 
 
-# The historical HGL pane control becomes poorly conditioned above this
-# dimensionless bandwidth.  The resolver retains that published broadening
-# policy; window construction itself now belongs solely to the MPA route.
-_CROSSING_A_MAX = 24.0
-
-
-def crossing_regularization_floor(
-    omega_max_ry: float,
-    edge_factor: float,
-) -> float:
-    """Return the historical HGL conditioning floor for ``xi`` in Ry."""
-    denom = _CROSSING_A_MAX - 2.0 * float(edge_factor)
-    if denom <= 1.0 or float(omega_max_ry) <= 0.0:
-        return 0.0
-    return 2.0 * float(omega_max_ry) / denom
-
-
-_HGL_CROSSING_ANSATZE = frozenset({"gn_ppm", "hl_ppm"})
-
-
-def hgl_partition_required(
-    omega_grid_ry,
-    regularization_width_ry: float,
-    edge_factor: float,
-) -> bool:
-    """Return whether a grid exceeds the historical HGL capacity."""
-    omega = np.asarray(omega_grid_ry, dtype=np.float64)
-    omega_max = float(np.max(np.abs(omega))) if omega.size else 0.0
-    xi = float(regularization_width_ry)
-    edge = float(edge_factor)
-    if not np.isfinite(xi) or xi <= 0.0:
-        raise ValueError("regularization_width_ry must be finite and positive")
-    if not np.isfinite(edge) or edge < 0.0:
-        raise ValueError("edge_factor must be finite and non-negative")
-    if not np.isfinite(omega_max):
-        raise ValueError("omega_grid_ry contains a non-finite value")
-    A_core = 2.0 * (omega_max + edge * xi) / xi
-    capacity = _CROSSING_A_MAX * (
-        1.0 + 8.0 * np.finfo(np.float64).eps)
-    return A_core > capacity
-
-
 class SigmaRegularization(NamedTuple):
     """Effective dynamic-Sigma broadening and its provenance.
 
@@ -93,73 +51,41 @@ class SigmaRegularization(NamedTuple):
     def describe(self) -> str:
         """Return the canonical one-line broadening receipt."""
         from common.units import RYD_TO_EV
-        head = (f"  Σ broadening ξ: {self.resolved_ev:.4f} eV "
+        del RYD_TO_EV
+        return (f"  Σ broadening ξ: {self.resolved_ev:.4f} eV "
                 f"(requested {self.requested_ev:.4f} eV, ansatz "
-                f"{self.ansatz}, floor {self.floor_ry * RYD_TO_EV:.4f} eV "
-                f"[{self.floor_policy}])")
-        if self.raised:
-            head += " — RAISED to the floor"
-        return head
+                f"{self.ansatz}, {self.floor_policy})")
 
 
-def resolve_sigma_regularization(
-    *,
-    requested_ry: float,
-    omega_grid_ry,
-    edge_factor: float,
-    ansatz: str,
-    floor_ev=None,
-) -> SigmaRegularization:
-    """Resolve the effective broadening once for every dynamic ansatz.
+def resolve_sigma_regularization(*, requested_ry: float, ansatz: str) -> SigmaRegularization:
+    """Resolve the Sigma broadening once for every dynamic ansatz.
 
-    An explicit non-negative ``floor_ev`` applies to every ansatz.  ``auto``
-    retains the historical HGL conditioning floor for GN/HL-PPM and is zero
-    for MPA.  The causal executor receives only the resolved value.
+    The deck's ``sigma_regularization_ev`` IS the broadening the kernel runs
+    at, for every ansatz: the executor inserts it exactly once as
+    ``exp(-eta t)`` on every time node.  Retired 2026-09-02 (owner ruling):
+    the ``auto`` conditioning floor that raised GN/HL-PPM's xi to
+    ``2 omega_max/(24 - 2 edge)`` -- 1.43 eV on a +-15 eV grid, 8.6 eV on
+    CrI3's -- belonged to the deleted HGL sine-table executor (its tables
+    stopped at A = 24) and made the broadening a function of the omega grid.
+    The receipt type and the h5 stamp are kept so a run's xi stays
+    auditable.
     """
-    from common.units import RYD_TO_EV
-
     requested = float(requested_ry)
-    omega = np.asarray(omega_grid_ry, dtype=np.float64)
-    omega_max_ry = float(np.max(np.abs(omega))) if omega.size else 0.0
-    name = str(getattr(ansatz, "value", ansatz)).strip().lower()
-
-    explicit = not (
-        floor_ev is None or str(floor_ev).strip().lower() == "auto")
-    if explicit:
-        floor_ry = float(floor_ev) / RYD_TO_EV
-        if floor_ry < 0.0:
-            raise ValueError(
-                "sigma_regularization_floor_ev must be >= 0 or 'auto'; "
-                f"got {floor_ev!r}.")
-        policy = "explicit"
-    elif name in _HGL_CROSSING_ANSATZE:
-        floor_ry = crossing_regularization_floor(omega_max_ry, edge_factor)
-        policy = "auto"
-    else:
-        floor_ry = 0.0
-        policy = "auto"
-
+    if not np.isfinite(requested) or requested <= 0.0:
+        raise ValueError("sigma_regularization_ev must be finite and positive")
     return SigmaRegularization(
-        requested_ry=requested,
-        resolved_ry=max(requested, floor_ry),
-        floor_ry=floor_ry,
-        floor_policy=policy,
-        ansatz=name,
-    )
+        requested_ry=requested, resolved_ry=requested, floor_ry=0.0,
+        floor_policy="literal",
+        ansatz=str(getattr(ansatz, "value", ansatz)).strip().lower())
 
 
 def sigma_regularization_for_config(config) -> SigmaRegularization:
     """Resolve broadening from a ``LorraxConfig`` without importing it."""
     from common.units import RYD_TO_EV
 
-    sigma_cfg = config.sigma
     return resolve_sigma_regularization(
-        requested_ry=float(sigma_cfg.regularization_ev) / RYD_TO_EV,
-        omega_grid_ry=np.asarray(config.omega_grid_ry, dtype=np.float64),
-        edge_factor=float(sigma_cfg.window_edge_factor),
-        ansatz=config.compute_mode,
-        floor_ev=getattr(sigma_cfg, "regularization_floor_ev", None),
-    )
+        requested_ry=float(config.sigma.regularization_ev) / RYD_TO_EV,
+        ansatz=config.compute_mode)
 
 
 @dataclass(frozen=True)
