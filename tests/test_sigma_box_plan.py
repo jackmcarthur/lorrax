@@ -259,7 +259,7 @@ def test_sc_fixed_session_refuses_escape_without_refitting(monkeypatch):
     assert calls == []
 
 
-def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
+def test_sc_fixed_session_keeps_membership_across_a_partition_edge(
         monkeypatch):
     calls = []
 
@@ -274,15 +274,15 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     _, first_geometry = plan_sigma_windows(
-        _summaries(), [_branch_at((0.1, 3.0))],
+        _summaries(), [_branch_at((0.1, 0.66))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    _, subset_geometry = plan_sigma_windows(
-        _summaries(), [_branch_at((0.1, 0.2))],
+    moved, moved_geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 0.64))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     assert calls == []
-    _, restored_geometry = plan_sigma_windows(
-        _summaries(), [_branch_at((0.1, 3.0))],
+    restored_rows, restored_geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 0.66))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     assert calls == []
     assert [row["name"] for row in first_geometry["branches"][0]["windows"]] == [
@@ -290,8 +290,9 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         "positive conduction:state_tail",
         "positive conduction:pole_tail",
     ]
-    assert [row["name"] for row in subset_geometry["branches"][0]["windows"]] == [
+    assert [row["name"] for row in moved_geometry["branches"][0]["windows"]] == [
         "positive conduction:resonant",
+        "positive conduction:state_tail",
         "positive conduction:pole_tail",
     ]
     assert set(session["rules"]) == {
@@ -300,12 +301,39 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         "positive conduction:pole_tail",
     }
     first = first_geometry["branches"][0]["windows"]
-    restored = restored_geometry["branches"][0]["windows"]
-    assert [row["node_digest"] for row in restored] == [
+    restored_reports = restored_geometry["branches"][0]["windows"]
+    assert [row["node_digest"] for row in restored_reports] == [
         row["node_digest"] for row in first]
+    for current, final in zip(moved, restored_rows):
+        np.testing.assert_array_equal(
+            current.window.mask_A, final.window.mask_A)
 
 
-def test_sc_fixed_session_refuses_a_window_absent_from_iteration_one(
+def test_sc_fixed_session_freezes_state_and_pole_partition_geometry(
+        monkeypatch):
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    session = {}
+    args = dict(
+        eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
+        fixed_rule_session=session,
+        print_fn=lambda *_args, **_kwargs: None)
+    first, _ = plan_sigma_windows(
+        _summaries(), [_branch_at((-0.2, 0.1))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    moved, _ = plan_sigma_windows(
+        _summaries(), [_branch_at((-0.3, 0.1))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+
+    assert [row.window.name for row in moved] == [
+        row.window.name for row in first]
+    for initial, current in zip(first, moved):
+        np.testing.assert_array_equal(
+            current.window.mask_A, initial.window.mask_A)
+        np.testing.assert_array_equal(current.bounds, initial.bounds)
+
+
+def test_sc_fixed_session_refuses_branch_topology_drift(
         monkeypatch):
     calls = []
 
@@ -323,9 +351,9 @@ def test_sc_fixed_session_refuses_a_window_absent_from_iteration_one(
         _summaries(), [_branch_at((0.1, 0.2))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    with pytest.raises(RuntimeError, match="absent from iteration 1"):
+    with pytest.raises(RuntimeError, match="topology changed"):
         plan_sigma_windows(
-            _summaries(), [_branch_at((0.1, 3.0))],
+            _summaries(), [_branch_at((0.1, 0.2), tag="new conduction")],
             np.asarray([0.2, 0.5]), 0.1, **args)
     assert calls == []
 

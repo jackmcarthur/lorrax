@@ -661,10 +661,10 @@ def _fit_fixed_sc_rules(
             "SC fixed quadrature found window(s) absent from iteration 1: "
             f"new={unknown!r}, fixed={tuple(rules)!r}; refusing rather than "
             "fitting new nodes inside the SC loop")
-    # A product window may temporarily have no live state/pole tuples.  Keep
-    # its iteration-1 receipt in ``rules`` and simply omit its zero
-    # contribution from this map; if it reappears, the same containment and
-    # node-identity checks below apply.  Only a genuinely new name refuses.
+    # State membership is frozen before this owner is called, so a product
+    # window cannot disappear merely because one state crosses a partition
+    # edge.  This second guard keeps the rule table independently complete if
+    # a caller ever supplies inconsistent transaction state.
     fits = []
     for spec in rows:
         entry = rules[spec["name"]]
@@ -756,9 +756,10 @@ def plan_sigma_windows(
         Directory for immutable box-rule certificates, or ``None``.
     fixed_rule_session
         Mutable run-local receipt used only by a multi-map SC calculation.
-        Iteration 1 certifies boxes padded by the fixed SC policy; every
-        later map reuses the exact same nodes by containment.  ``None``
-        preserves the ordinary one-shot planner byte-for-byte.
+        Iteration 1 freezes state-to-window membership and certifies boxes
+        padded by the fixed SC policy; every later map reuses the same
+        windows and exact same nodes by containment.  ``None`` preserves the
+        ordinary one-shot planner byte-for-byte.
 
     Returns
     -------
@@ -808,6 +809,28 @@ def plan_sigma_windows(
         raise ValueError("Sigma box planning needs at least one pole summary")
     omega_grid = np.asarray(omega_ry, dtype=np.float64)
     state_rows, geometry = _product_geometry(branch_rows, eta, edge)
+    if fixed_rule_session is not None:
+        product_geometry = fixed_rule_session.get("product_geometry")
+        if product_geometry is None:
+            fixed_rule_session["product_geometry"] = {
+                key: geometry[key] for key in (
+                    "omega_max_ry", "state_edge_ry", "pole_edge_ry",
+                    "negative_state_excursion_ry", "edge_factor")
+            }
+        else:
+            geometry.update(product_geometry)
+    fixed_membership = (
+        None if fixed_rule_session is None else
+        fixed_rule_session.get("state_membership"))
+    record_fixed_membership = (
+        fixed_rule_session is not None and fixed_membership is None
+        and "rules" not in fixed_rule_session)
+    if (fixed_rule_session is not None and fixed_membership is None
+            and not record_fixed_membership):
+        raise RuntimeError(
+            "SC fixed quadrature session has rules but no frozen window "
+            "membership; refusing an incomplete transaction")
+    membership_seed = {}
 
     specs, branch_reports = [], []
     for branch, (state_shape, raw_energy, flat_indices) in zip(
@@ -828,19 +851,38 @@ def plan_sigma_windows(
         for (name, state_lo, state_hi, selector,
              pole_lo, pole_hi) in _state_products(
                  branch, geometry["state_edge_ry"], geometry["pole_edge_ry"]):
-            local = np.nonzero(
-                (raw_energy > state_lo) & (raw_energy <= state_hi))[0]
+            window_name = f"{branch.tag}:{name}"
+            if fixed_membership is None:
+                local = np.nonzero(
+                    (raw_energy > state_lo) & (raw_energy <= state_hi))[0]
+                state_indices = flat_indices[local]
+                if record_fixed_membership:
+                    membership_seed[window_name] = tuple(
+                        int(value) for value in state_indices)
+            else:
+                if window_name not in fixed_membership:
+                    raise RuntimeError(
+                        "SC fixed quadrature branch/window topology changed: "
+                        f"{window_name!r} was absent from the frozen "
+                        "membership table")
+                state_indices = np.asarray(
+                    fixed_membership[window_name], dtype=np.int32)
+                if (state_indices.size
+                        and not np.all(np.isin(state_indices, flat_indices))):
+                    raise RuntimeError(
+                        "SC fixed quadrature live-state support changed for "
+                        f"{window_name!r}; refusing to alter a frozen window")
             pole_indices, pole_stats = _pole_rows(summaries, selector)
-            if not local.size or not pole_indices.size:
+            if not state_indices.size or not pole_indices.size:
                 continue
-            states = raw_energy[local]
+            states = state_shape.reshape(-1)[state_indices]
             spec = make_sigma_box_spec(
-                name=f"{branch.tag}:{name}", frequencies=frequencies,
+                name=window_name, frequencies=frequencies,
                 states=states, pole_stats=pole_stats,
                 pole_sign=pole_sign, eta_ry=eta)
             spec.update({
                 "branch": branch,
-                "state_indices": flat_indices[local],
+                "state_indices": state_indices,
                 "state_shape": state_shape.shape,
                 "state_interval": (float(state_lo), float(state_hi)),
                 "pole_indices": pole_indices,
@@ -853,6 +895,9 @@ def plan_sigma_windows(
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
+
+    if record_fixed_membership:
+        fixed_rule_session["state_membership"] = membership_seed
 
     fixed_receipt = None
     if fixed_rule_session is None:
