@@ -2,11 +2,14 @@
 
 This is a compute-node certificate, not an ordinary unit test.  It compares
 the production exact Wigner--Seitz polygon/polyhedron rules with independent
-scrambled-Sobol estimates of the same cell integrals.  Each reported draw is
-the mean of ten ``2**18``-point Sobol replicates, matching the historical
-production estimator.  The 3-D estimator analytically removes the inscribed
-sphere before sampling, including the screened singular term, so every
-sampled remainder has finite variance.
+finite-variance scrambled-Sobol references of the same cell integrals.  Each
+reported draw is the mean of ten ``2**18``-point Sobol replicates, matching
+the historical production estimator's sample count and seed construction.
+In 2-D the full inscribed disk is integrated separately: the bare radial
+integral is analytic, the screened radial Jacobian cancels the ``1/|q|``
+cusp before a certified product rule, and Sobol samples only the polygon
+outside the disk.  In 3-D the exact singular sphere is likewise removed
+before sampling.  Every sampled remainder therefore has finite variance.
 
 The physical static-response tensors are frozen from the two P=4 head
 captures that motivated this gate:
@@ -56,6 +59,7 @@ _NSAMPLES = 2**18
 _QMC_REPS = 10
 _RTOL = 1.0e-8
 _ATOL = 1.0e-12
+_SLAB_DISK_ORDERS = (32, 48, 64)
 
 # P=4 MoS2 3x3 scalar-slab restart, retained literally for provenance.
 _MOS2_SLAB_S_MEASURED = np.asarray([
@@ -227,6 +231,129 @@ def _bulk_sphere_terms(geometry, kgrid, S):
     return q0sph2, terms, certificate
 
 
+def _slab_disk_terms(receipt, S):
+    r"""Full inscribed-disk terms for the finite-variance slab reference.
+
+    For in-plane ``q = r n`` the Ismail--Beigi kernel is
+
+    ``v(r) = 8*pi*(1 - exp(-zc*r))/r**2``.
+
+    Its disk measure contributes one radial power, so the bare integral is
+
+    ``16*pi**2 * [gamma + log(zc*R) + E1(zc*R)]``.
+
+    For ``W = v/(1-v*qSq)`` the same Jacobian makes the radial integrand
+    finite at Gamma.  A fixed radial Gauss--Legendre / periodic angular rule
+    therefore integrates the *whole* disk, not an asymptotic replacement.
+    The TT disk is analytic because ``tr(P_T)=2`` pointwise and the angular
+    mean of ``P_T`` for an in-plane circle is ``diag(1/2,1/2,1)``.
+    Returned terms are already normalized by the mini-BZ polygon area.
+    """
+    if int(receipt.dimension) != 2 or receipt.slab_zc is None:
+        raise ValueError("slab disk reference requires a dimension-2 receipt")
+    polygon = np.asarray(receipt.polytope_vertices, dtype=np.float64)
+    edge_distances = []
+    for face in receipt.polytope_faces:
+        if len(face) != 2:
+            raise ValueError("slab receipt face must contain one polygon edge")
+        left, right = polygon[np.asarray(face, dtype=np.int64)]
+        edge = right - left
+        edge_distances.append(
+            abs(left[0] * right[1] - left[1] * right[0])
+            / float(np.linalg.norm(edge)))
+    radius = float(min(edge_distances))
+    helper_radius = float(np.sqrt(vcoul.minibz_inscribed_sphere_r2(
+        receipt.reciprocal_lattice_rows, receipt.kgrid, is_2d=True)))
+    if not np.isclose(radius, helper_radius, rtol=2.0e-13, atol=2.0e-15):
+        raise AssertionError(
+            "receipt polygon and mini-lattice disagree on the inscribed "
+            f"disk radius: polygon={radius:.17g}, helper={helper_radius:.17g}")
+
+    area = float(receipt.minibz_measure)
+    zc = float(receipt.slab_zc)
+    scaled_radius = zc * radius
+    if not (area > 0.0 and radius > 0.0 and scaled_radius > 0.0):
+        raise AssertionError(
+            "slab analytic-disk reference requires positive area, radius, "
+            f"and zc; got area={area}, radius={radius}, zc={zc}")
+    from scipy.special import exp1
+    ein = float(np.euler_gamma + np.log(scaled_radius)
+                + exp1(scaled_radius))
+    bare = float(16.0 * np.pi**2 * ein / area)
+
+    S2 = np.asarray(S, dtype=np.float64)[:2, :2]
+    screened_ladder = []
+    bare_radial_ladder = []
+    for order in _SLAB_DISK_ORDERS:
+        node, weight = np.polynomial.legendre.leggauss(order)
+        radial = 0.5 * radius * (node + 1.0)
+        radial_weight = 0.5 * radius * weight
+        phi = (2.0 * np.pi
+               * (np.arange(2 * order, dtype=np.float64) + 0.5)
+               / (2 * order))
+        direction = np.stack((np.cos(phi), np.sin(phi)), axis=1)
+        nSn = np.einsum(
+            "pi,ij,pj->p", direction, S2, direction, optimize=True)
+        truncation = -np.expm1(-zc * radial[:, None])
+        # This is r*v(r).  It tends to 8*pi*zc, so the quadrature never
+        # evaluates a singular quantity even as its nodes approach Gamma.
+        radial_times_v = 8.0 * np.pi * truncation / radial[:, None]
+        denominator = (
+            1.0 - 8.0 * np.pi * truncation * nSn[None, :])
+        screened = float(
+            (2.0 * np.pi / area)
+            * np.sum(radial_weight[:, None]
+                     * radial_times_v / denominator)
+            / (2 * order))
+        bare_radial = float(
+            (2.0 * np.pi / area)
+            * np.sum(radial_weight * radial_times_v[:, 0]))
+        screened_ladder.append((int(order), screened))
+        bare_radial_ladder.append((int(order), bare_radial))
+
+    screened_ratios = _ladder_ratios(
+        [value for _, value in screened_ladder])
+    if screened_ratios[-1] > 1.0:
+        raise AssertionError(
+            "screened analytic-disk rule did not converge: "
+            f"ladder={screened_ladder!r}, ratios={screened_ratios!r}")
+    bare_errors = [abs(value - bare) for _, value in bare_radial_ladder]
+    if bare_errors[-1] > 5.0e-11:
+        raise AssertionError(
+            "closed-form and radial-rule bare disk integrals disagree: "
+            f"analytic={bare:.17g}, ladder={bare_radial_ladder!r}")
+
+    terms = {
+        "bare_v": bare,
+        "screened_w": screened_ladder[-1][1],
+        "tt_trace": -2.0 * bare,
+    }
+    certificate = {
+        "method": (
+            "analytic_ismail_beigi_disk_plus_smooth_screened_product_rule"),
+        "radius": radius,
+        "radius_from_minibz_helper": helper_radius,
+        "minibz_area": area,
+        "zc": zc,
+        "scaled_radius_zc_R": scaled_radius,
+        "bare_closed_form": bare,
+        "bare_radial_ladder": [
+            {"order": order, "value": value,
+             "abs_error_vs_closed_form": error}
+            for (order, value), error in zip(
+                bare_radial_ladder, bare_errors)],
+        "screened_ladder": [
+            {"order": order, "value": value}
+            for order, value in screened_ladder],
+        "screened_ladder_ratios": screened_ratios,
+        "tt_trace": terms["tt_trace"],
+        "tt_tensor_diagonal": [
+            -0.5 * bare, -0.5 * bare, -bare],
+        "sobol_region": "Wigner-Seitz polygon minus closed inscribed disk",
+    }
+    return radius * radius, terms, certificate
+
+
 def _ladder_ratios(values):
     ratios = []
     for previous, current in zip(values, values[1:]):
@@ -284,18 +411,12 @@ def _exact_rule(case):
 
 
 def _sobol_draw(case, *, trial, nsamples, qmc_reps,
-                bulk_sphere=None):
+                analytic_region):
     dimension = int(case["dimension"])
-    analytic_terms = {name: 0.0 for name in (
-        "bare_v", "screened_w", "tt_trace", "tt_xx", "tt_yy", "tt_zz")}
-    q0sph2 = None
-    if dimension == 3:
-        if bulk_sphere is None:
-            bulk_sphere = _bulk_sphere_terms(
-                case["geometry"], case["kgrid"], case["S"])
-        q0sph2, analytic_terms, _ = bulk_sphere
+    region_r2, analytic_terms, _ = analytic_region
 
     replicate_values = []
+    plain_replicate_values = []
     for rep in range(qmc_reps):
         seed = trial * qmc_reps + rep
         # One replicate per call keeps the production sampler's temporary
@@ -313,21 +434,29 @@ def _sobol_draw(case, *, trial, nsamples, qmc_reps,
         values, q2 = _values_from_q(
             q, dimension=dimension, geometry=case["geometry"],
             kgrid=case["kgrid"], S=case["S"])
-        if dimension == 3:
-            outside = q2 > q0sph2
-            reduced = {
-                name: float(np.sum(np.where(outside, value, 0.0))
-                            / q.shape[0] + analytic_terms[name])
-                for name, value in values.items()
-            }
-        else:
-            reduced = {
-                name: float(np.mean(value)) for name, value in values.items()}
+        outside = q2 > region_r2
+        reduced = {
+            name: float(np.sum(np.where(outside, value, 0.0))
+                        / q.shape[0] + analytic_terms[name])
+            for name, value in values.items()
+        }
         replicate_values.append(reduced)
-    return {
+        if dimension == 2:
+            plain_replicate_values.append({
+                name: float(np.mean(value))
+                for name, value in values.items()})
+    corrected = {
         name: float(np.mean([values[name] for values in replicate_values]))
         for name in replicate_values[0]
     }
+    plain = None
+    if plain_replicate_values:
+        plain = {
+            name: float(np.mean(
+                [values[name] for values in plain_replicate_values]))
+            for name in plain_replicate_values[0]
+        }
+    return corrected, plain
 
 
 def _summary(rule, draws):
@@ -337,10 +466,14 @@ def _summary(rule, draws):
     std = float(np.std(samples, ddof=1))
     se = std / np.sqrt(n)
     z = abs(float(rule) - mean) / se if se > 0.0 else np.inf
-    above = int(np.count_nonzero(samples > rule))
+    signed_above = int(np.count_nonzero(samples > rule))
     below = int(np.count_nonzero(samples < rule))
+    magnitude_above = int(np.count_nonzero(
+        np.abs(samples) > abs(float(rule))))
+    magnitude_below = int(np.count_nonzero(
+        np.abs(samples) < abs(float(rule))))
     mean_pass = bool(abs(float(rule) - mean) <= 2.0 * se)
-    sign_pass = bool(above / n <= 0.60)
+    sign_pass = bool(magnitude_above / n <= 0.60)
     return {
         "N": n,
         "rule": float(rule),
@@ -350,11 +483,15 @@ def _summary(rule, draws):
         "min": float(np.min(samples)),
         "max": float(np.max(samples)),
         "empirical_cdf_below_rule": below / n,
-        "count_draws_above_rule": above,
-        "fraction_draws_above_rule": above / n,
+        "count_draws_above_rule_signed": signed_above,
+        "fraction_draws_above_rule_signed": signed_above / n,
+        "magnitude_cdf_below_rule_magnitude": magnitude_below / n,
+        "count_draws_with_greater_magnitude_than_rule": magnitude_above,
+        "fraction_draws_with_greater_magnitude_than_rule": (
+            magnitude_above / n),
         "abs_rule_minus_mean_over_SE": float(z),
         "mean_within_2SE": mean_pass,
-        "underestimate_sign_test": sign_pass,
+        "underestimate_magnitude_sign_test": sign_pass,
         "verdict": "PASS" if mean_pass and sign_pass else "FAIL",
         "sorted_draws": [float(value) for value in np.sort(samples)],
     }
@@ -362,10 +499,12 @@ def _summary(rule, draws):
 
 def _format_report(payload):
     lines = [
-        "Exact Gamma-cell rule vs independent Sobol distributions",
+        "Exact Gamma-cell rule vs finite-variance Sobol-reference distributions",
         (f"N={payload['config']['N']}, "
          f"nsamples={payload['config']['nsamples']}, "
          f"qmc_reps={payload['config']['qmc_reps']}"),
+        ("Underestimation convention: compare absolute magnitudes; "
+         "more_mass means |draw| > |rule|, including negative TT rows."),
         "",
     ]
     for case in payload["cases"]:
@@ -377,8 +516,9 @@ def _format_report(payload):
             (f"weight_sum_defects={cert['weight_sum_defects']} "
              f"weighted_q_centroids={cert['weighted_q_centroids']}"),
         ))
-        if "analytic_sphere" in case:
-            lines.append(f"analytic_sphere={case['analytic_sphere']}")
+        lines.append(
+            f"reference_method={case['reference_method']} "
+            f"analytic_region={case['analytic_region']}")
         for name, stats in case["quantities"].items():
             ladder = case["exact"][name]
             lines.append(
@@ -386,11 +526,24 @@ def _format_report(payload):
                 f"mean={stats['mean']:.17g} std={stats['std']:.9g} "
                 f"SE={stats['SE']:.9g} min={stats['min']:.17g} "
                 f"max={stats['max']:.17g} "
-                f"CDF(R)={stats['empirical_cdf_below_rule']:.6f} "
-                f"above={stats['count_draws_above_rule']}/{stats['N']} "
+                f"CDF_signed(R)={stats['empirical_cdf_below_rule']:.6f} "
+                f"CDF_mass(R)="
+                f"{stats['magnitude_cdf_below_rule_magnitude']:.6f} "
+                f"more_mass="
+                f"{stats['count_draws_with_greater_magnitude_than_rule']}"
+                f"/{stats['N']} "
                 f"|R-mean|/SE={stats['abs_rule_minus_mean_over_SE']:.6f} "
                 f"ladder={ladder['ladder_values']} "
                 f"ratios={ladder['ladder_ratios']} {stats['verdict']}")
+        if "plain_sobol_quantities" in case:
+            lines.append("plain_sobol_diagnostic (same draws, no cusp split):")
+            for name, stats in case["plain_sobol_quantities"].items():
+                lines.append(
+                    f"  {name}: mean={stats['mean']:.17g} "
+                    f"std={stats['std']:.9g} SE={stats['SE']:.9g} "
+                    f"min={stats['min']:.17g} max={stats['max']:.17g} "
+                    f"|R-mean|/SE="
+                    f"{stats['abs_rule_minus_mean_over_SE']:.6f}")
         lines.append("")
     lines.append(f"overall={payload['verdict']}")
     return "\n".join(lines) + "\n"
@@ -411,7 +564,9 @@ def run_acceptance(*, n_trials=_N_TRIALS, nsamples=_NSAMPLES,
                 for trial in range(n_trials)],
             "criteria": {
                 "mean": "abs(rule - mean(draws)) <= 2 * std(draws)/sqrt(N)",
-                "underestimate": "count(draws > rule)/N <= 0.60",
+                "underestimate": (
+                    "count(abs(draws) > abs(rule))/N <= 0.60; magnitude "
+                    "makes less cusp mass the same direction for negative TT"),
             },
         },
         "physical_S_sources": {
@@ -425,20 +580,33 @@ def run_acceptance(*, n_trials=_N_TRIALS, nsamples=_NSAMPLES,
     for case in _cases():
         started = time.monotonic()
         receipt, exact, scalar_certificate = _exact_rule(case)
-        bulk_sphere = (
-            _bulk_sphere_terms(
+        if int(case["dimension"]) == 2:
+            analytic_region = _slab_disk_terms(receipt, case["S"])
+            reference_method = (
+                "analytic full inscribed disk plus Sobol polygon-minus-disk "
+                "remainder (DEBUG reference)")
+        else:
+            analytic_region = _bulk_sphere_terms(
                 case["geometry"], case["kgrid"], case["S"])
-            if int(case["dimension"]) == 3 else None)
+            reference_method = (
+                "analytic full inscribed sphere plus Sobol "
+                "polyhedron-minus-sphere remainder (DEBUG reference)")
         draws = {name: [] for name in exact}
+        plain_draws = (
+            {name: [] for name in exact}
+            if int(case["dimension"]) == 2 else None)
         for trial in range(n_trials):
             print(
                 f"Q0_ACCEPTANCE geometry={case['name']} "
                 f"trial={trial + 1}/{n_trials}", flush=True)
-            draw = _sobol_draw(
+            draw, plain_draw = _sobol_draw(
                 case, trial=trial, nsamples=nsamples, qmc_reps=qmc_reps,
-                bulk_sphere=bulk_sphere)
+                analytic_region=analytic_region)
             for name, value in draw.items():
                 draws[name].append(value)
+            if plain_draw is not None:
+                for name, value in plain_draw.items():
+                    plain_draws[name].append(value)
         quantities = {
             name: _summary(exact[name]["value"], draws[name])
             for name in exact
@@ -452,6 +620,8 @@ def run_acceptance(*, n_trials=_N_TRIALS, nsamples=_NSAMPLES,
             "cell_volume": float(case["geometry"].cell_volume),
             "kgrid": list(case["kgrid"]),
             "S": np.asarray(case["S"]).tolist(),
+            "reference_method": reference_method,
+            "analytic_region": analytic_region[2],
             "rule_certificate": {
                 "method": receipt.method,
                 "orders": list(receipt.orders),
@@ -465,16 +635,18 @@ def run_acceptance(*, n_trials=_N_TRIALS, nsamples=_NSAMPLES,
             "exact": exact,
             "quantities": quantities,
         }
-        if int(case["dimension"]) == 3:
-            _, _, sphere_certificate = bulk_sphere
-            record["analytic_sphere"] = sphere_certificate
+        if plain_draws is not None:
+            record["plain_sobol_quantities"] = {
+                name: _summary(exact[name]["value"], plain_draws[name])
+                for name in exact
+            }
         record["elapsed_seconds"] = float(time.monotonic() - started)
         payload["cases"].append(record)
     payload["verdict"] = "PASS" if all_pass else "FAIL"
     return payload
 
 
-def test_exact_rules_are_unbiased_against_production_sobol_distributions():
+def test_exact_rules_are_unbiased_against_finite_variance_sobol_references():
     payload = run_acceptance()
     output = Path.cwd()
     json_path = output / "q0_rule_sobol_acceptance.json"
