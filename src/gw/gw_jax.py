@@ -787,6 +787,7 @@ def main(argv=None):
 					wf_binding_charge=isdf.wf_binding_charge,
 					wf_binding_transverse=isdf.wf_binding_transverse,
 					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+					trs_allowed=sym.trs_allowed,
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
@@ -802,6 +803,11 @@ def main(argv=None):
 			report.progress(
 				"Photon head    : "
 				+ format_photon_head_run_record(photon_response))
+			if not str(photon_response.faraday_head_record).startswith(
+					"PREPARED"):
+				report.progress(
+					"Faraday head   : "
+					f"{photon_response.faraday_head_record}")
 	else:
 		with timing.section("gw_jax.screening", announce=True,
 		                    label="screening (chi0 -> W)"):
@@ -904,11 +910,17 @@ def main(argv=None):
 					meta, mesh_xy,
 					screen_current=_screens_current,
 					W_charge=_W_charge,
+					W_charge_head=(
+						W_by_role.get("static")
+						if _dynamic_packed and not _screens_current else None),
+					W_charge_probe=(
+						W_by_role.get("probe") if _dynamic_packed else None),
 					wfn=wfn, config=config,
 					photon_g0_vectors=isdf.photon_g0_vectors,
 					wf_binding_charge=isdf.wf_binding_charge,
 					wf_binding_transverse=isdf.wf_binding_transverse,
 					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+					trs_allowed=sym.trs_allowed,
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
@@ -965,6 +977,16 @@ def main(argv=None):
 						"unconsumed charge S/wing fold. "
 						"Sigma^B is the TT block of the packed operator, not "
 						"a separate term.")
+					# An authenticated magnetic run is only complete after Sigma
+					# has measured its Hall-on/off per-state contribution.  Its
+					# final APPLIED record is emitted at that seam below; exact
+					# zero, DEBUG, and genuinely absent-artifact outcomes are final
+					# already and belong in the record here.
+					if not str(photon_response.faraday_head_record).startswith(
+							"PREPARED"):
+						report.progress(
+							"Faraday head   : "
+							f"{photon_response.faraday_head_record}")
 				elif _x_only_packed:
 					report.progress(
 						"Photon Sigma   : packed x_only route -- scalar charge X "
@@ -1286,6 +1308,7 @@ def main(argv=None):
 	photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
 	sigma_lorentz_skij_ry = sigma_result.sigma_lorentz_skij_ry
 	sigma_c_odd_at_dft_ev = sigma_result.sigma_c_odd_at_dft_diag_ev
+	sigma_ct_hall_at_dft_ev = sigma_result.sigma_ct_hall_at_dft_diag_ev
 	if photon_head_sigma_diag_tskn_ry is None:
 		photon_head_sigma_diag_tskn_ry = np.zeros(
 			(3, 3) + tuple(np.asarray(enk_dft).shape), dtype=np.complex128)
@@ -1445,6 +1468,11 @@ def main(argv=None):
 					np.asarray(sigma_c_odd_at_dft_ev),
 					energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 					tol_ry=float(config.degen_avg_tol_ry))
+			if sigma_ct_hall_at_dft_ev is not None:
+				sigma_ct_hall_at_dft_ev = average_within_degenerate_sets(
+					np.asarray(sigma_ct_hall_at_dft_ev),
+					energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+					tol_ry=float(config.degen_avg_tol_ry))
 		omega_rel_ev = omega_grid_ev
 	else:
 		sigma_c_omega_diag_ev = None
@@ -1570,6 +1598,9 @@ def main(argv=None):
 		sigma_c_odd_diag_at_dft_ry=(
 			None if sigma_c_odd_at_dft_ev is None
 			else np.asarray(sigma_c_odd_at_dft_ev) / RYD_TO_EV),
+		sigma_ct_hall_diag_at_dft_ry=(
+			None if sigma_ct_hall_at_dft_ev is None
+			else np.asarray(sigma_ct_hall_at_dft_ev) / RYD_TO_EV),
 	)
 	if meta.rank == 0:
 		# Canonical Σ-decomposition table.  Explicit debug requests it for all
@@ -1693,6 +1724,22 @@ def main(argv=None):
 				f"; max|D|/max|B|="
 				f"{sigma_result.ppm_odd_even_residue_ratio:.3e}")
 		report.progress(_odd_line)
+	if sigma_ct_hall_at_dft_ev is not None:
+		_hall_abs = np.abs(np.asarray(sigma_ct_hall_at_dft_ev))
+		if (sigma_result.faraday_head_omega_h_ry is None
+				or sigma_result.faraday_sigma_h_static_bohr_inv is None
+				or sigma_result.faraday_sigma_h_probe_bohr_inv is None):
+			raise RuntimeError(
+				"applied dynamic Faraday Sigma lacks its fitted-pole record")
+		report.progress(
+			"Faraday head   : APPLIED (even one-pole CT/TC Gamma head; "
+			f"sigma_H(0) = "
+			f"{list(sigma_result.faraday_sigma_h_static_bohr_inv)} bohr^-1; "
+			f"sigma_H(i omega_p) = "
+			f"{list(sigma_result.faraday_sigma_h_probe_bohr_inv)} bohr^-1; "
+			f"Omega_H = {sigma_result.faraday_head_omega_h_ry:.17e} Ry; "
+			f"sigCT_hall max/mean = {np.max(_hall_abs):.6e}/"
+			f"{np.mean(_hall_abs):.6e} eV)")
 	if q0_certificates:
 		_q0_cert = max(q0_certificates, key=lambda item: item.final_error_ratio)
 		_q0_cell_count = getattr(

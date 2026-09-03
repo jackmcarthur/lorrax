@@ -1935,6 +1935,9 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
+    #: Separate dynamic Hall/Faraday run-record state.  ``PREPARED`` is
+    #: internal until Sigma emits the sole final ``APPLIED`` line.
+    faraday_head_record: str | None = None
     #: ``(mean, std, min, max, max_abs_imag)`` of
     #: ``sum_mu g0_mu sum_s |psi_kns(r_mu)|^2`` over occupied states.
     #: Present exactly when the Gamma-cell completion ran.
@@ -2013,6 +2016,68 @@ def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
         f"{completion.max_backward_residual:.3e})")
 
 
+def _gate_dynamic_hall_head(
+    config, *, trs_allowed, coupled_head: bool, hall_transaction,
+    print_fn=print,
+) -> str | None:
+    """Record the exact zero, DEBUG/absent case, or authenticated samples.
+
+    This gate runs before the packed body is opened. It is deliberately
+    separate from the Hall loader: authentication remains the loader's job,
+    while this function owns the dynamic route's measured-TRS requirement and
+    zero/absence record. An authenticated magnet is only internal
+    ``PREPARED`` state here; the driver emits its sole record, ``APPLIED``,
+    after Sigma has measured ``sigCT_hall``.
+    """
+    from .gw_config import uses_dynamic_packed_photon_route
+
+    if not uses_dynamic_packed_photon_route(config):
+        return None
+    if not isinstance(trs_allowed, (bool, np.bool_)):
+        raise ValueError(
+            "GATE dynamic_hall_head_needs_measured_trs: the dynamic packed "
+            "Hall boundary requires a boolean SymMaps.trs_allowed verdict")
+    if not coupled_head:
+        record = (
+            "ABSENT (head_correction=off DEBUG skip; no Gamma-cell head is "
+            "applied)")
+        if jax.process_index() == 0:
+            print_fn("WARNING Faraday head : " + record, flush=True)
+        return record
+    if bool(trs_allowed):
+        record = (
+            "EXACT ZERO (SymMaps.trs_allowed=true; no Hall producer or "
+            "consumer path taken)")
+        if jax.process_index() == 0:
+            print_fn("Faraday head : " + record, flush=True)
+        return record
+
+    omega_p = float(config.ppm.omega_p)
+    probe = 1j * omega_p
+    if hall_transaction is None:
+        magnitude = "unmeasured (static_gauge_hall_file unnamed)"
+        static_text = "unmeasured (static_gauge_hall_file unnamed)"
+        record = (
+            "ABSENT (unowned rank-four probe-frequency CT/TC Sigma insertion; "
+            f"max|sigma_H(i*omega_p)| = {magnitude}; "
+            f"static sigma_H = {static_text})")
+        if jax.process_index() == 0:
+            print_fn("WARNING Faraday head : " + record, flush=True)
+        return record
+
+    sample = np.asarray(
+        jax.device_get(hall_transaction.sigma_H_at(probe)),
+        dtype=np.complex128)
+    static = np.asarray(
+        jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
+    magnitude_value = float(np.max(np.abs(sample)))
+    record = (
+        "PREPARED (authenticated z=0 and z=i*omega_p Hall samples; "
+        f"max|sigma_H(i*omega_p)| = {magnitude_value:.17e} bohr^-1; "
+        f"static sigma_H = {static.tolist()} bohr^-1)")
+    return record
+
+
 def _load_static_photon_hall(
     config, meta, mesh_xy, wfn, wfn_fingerprint_binding, *,
     screen_current: bool, print_fn=print,
@@ -2021,10 +2086,12 @@ def _load_static_photon_hall(
 
     An unnamed ``static_gauge_hall_file`` is the declared ``sigma_H = 0``
     default.  A named path always reaches the one artifact loader, including
-    the absent-path refusal.  The bare-transverse model admits an authenticated
-    artifact only when its value is exactly zero: then the Hall response is
-    identically absent and the packed operator is the same charge/TT block
-    diagonal model as the unnamed case.  Any nonzero component still refuses.
+    the absent-path refusal. The static bare-transverse model admits an
+    authenticated artifact only when its value is exactly zero: then the Hall
+    response is identically absent and the packed operator is the same
+    charge/TT block-diagonal model as the unnamed case. Dynamic packed GN
+    instead keeps its static current body as the Hall-off twin and carries a
+    nonzero artifact in analytic CT/TC factors.
     """
     hall_path = str(config.paths.static_gauge_hall_file).strip()
     if not hall_path:
@@ -2049,7 +2116,9 @@ def _load_static_photon_hall(
         wfn_fingerprint_binding=wfn_fingerprint_binding,
     )
     sigma_h = np.asarray(jax.device_get(hall.sigma_H), dtype=np.float64)
-    if not bool(screen_current) and np.any(sigma_h != 0.0):
+    from .gw_config import uses_dynamic_packed_photon_route
+    if (not bool(screen_current) and np.any(sigma_h != 0.0)
+            and not uses_dynamic_packed_photon_route(config)):
         raise ValueError(
             "GATE packed_bare_transverse_hall_unavailable: a nonzero Hall "
             "artifact has no channel in the bare-transverse model.\n"
@@ -2058,13 +2127,16 @@ def _load_static_photon_hall(
             "  want: an authenticated artifact with sigma_H = [0, 0, 0], "
             "an unnamed static_gauge_hall_file, or "
             "bispinor_gw = full_static_cohsex\n"
-            "  why:  bare_transverse declares chi_TT = chi_CT = 0, hence "
+            "  why:  static bare_transverse declares chi_TT = chi_CT = 0, hence "
             "W_CT = 0 at every finite q; a nonzero Gamma-only CT/TC block "
             "would not be a limit of that model\n"
             "  doc:  docs/input_reference.md, static_gauge_hall_file.")
     if jax.process_index() == 0:
+        dynamic = uses_dynamic_packed_photon_route(config)
         suffix = (
-            " (exact zero is compatible with bare_transverse)"
+            " (dynamic bare_transverse: packed body is the sigma_H=0 twin)"
+            if not bool(screen_current) and dynamic else
+            " (exact zero is compatible with static bare_transverse)"
             if not bool(screen_current) else "")
         print_fn(
             "  [photon head] Hall term: sigma_H = "
@@ -2079,12 +2151,15 @@ def compute_static_photon_response(
     meta, mesh_xy, *,
     screen_current: bool,
     W_charge=None,
+    W_charge_head=None,
+    W_charge_probe=None,
     wfn=None,
     config=None,
     photon_g0_vectors=None,
     wf_binding_charge=None,
     wf_binding_transverse=None,
     wfn_fingerprint_binding=None,
+    trs_allowed=None,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
     dyson_solver: str = "distributed",
@@ -2117,8 +2192,13 @@ def compute_static_photon_response(
     execute a hidden charge fold.  The provider selects the exact slab polygon
     or bulk polyhedron receipt from ``config.sys_dim``; the completion algebra
     remains one dimension-general owner.  A nonzero Hall artifact is refused
-    on the bare route.  The completion runs under ``head_correction = full``
-    (the
+    on the static bare route.  Dynamic packed GN keeps the incumbent current
+    body (``V_CURRENT`` on the bare route, screened current on the full route)
+    as its Hall-off resident body, calls the same dimension-general moment
+    owner at ``0`` and ``i*omega_p``, and retains only analytic CT/TC
+    Hall-on/off factors for Sigma; the packed CC block remains absent from
+    that consumer.
+    The completion runs under ``head_correction = full`` (the
     default); ``off`` skips it behind a DEBUG banner and is not a production
     setting (owner ruling 2026-09-01).  The current q^2/contact/complement
     terms are omitted by model in either case.
@@ -2192,6 +2272,11 @@ def compute_static_photon_response(
             raise ValueError(
                 "the dynamic packed bare route declares its CC block absent; "
                 "an external static W_charge would have no consumer")
+        if not dynamic_current_only and W_charge_head is not None:
+            raise ValueError(
+                "the static packed route takes its charge block through "
+                "W_charge; W_charge_head is reserved for the dynamic "
+                "Faraday producer and would have no owner here")
         if not dynamic_current_only and W_charge is None:
             raise ValueError(
                 "the packed bare-transverse route requires its charge-block "
@@ -2252,6 +2337,10 @@ def compute_static_photon_response(
             "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
             "  ==========================================================\n",
             flush=True)
+
+    faraday_head_record = _gate_dynamic_hall_head(
+        config, trs_allowed=trs_allowed, coupled_head=coupled_head,
+        hall_transaction=hall, print_fn=print_fn)
 
     with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
         if int(reader.n_q_total) != int(meta.nk_tot):
@@ -2394,8 +2483,13 @@ def compute_static_photon_response(
         from .static_gauge_response import (
             build_static_photon_head_response)
 
+        dynamic_hall = (
+            uses_dynamic_packed_photon_route(config)
+            and not bool(trs_allowed)
+            and hall is not None)
         response = None
-        if charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT:
+        if (charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT
+                or dynamic_hall):
             response = build_static_photon_head_response(
                 wfns_charge,
                 input_dir=config.input_dir,
@@ -2407,6 +2501,16 @@ def compute_static_photon_response(
                 hall_transaction=hall,
                 wfn_fingerprint_binding=wfn_fingerprint_binding,
             )
+        completion_response = response
+        if (dynamic_hall
+                and charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT):
+            # The resident screened-current body is the Hall-off twin.  Its
+            # dynamic Hall CT/TC completion belongs only to the analytic pole
+            # below, not simultaneously to this static carrier.
+            from dataclasses import replace
+            completion_response = replace(
+                response, sigma_H=jnp.zeros_like(response.sigma_H),
+                hall_source="sigma_H=0 Hall-off twin for dynamic Faraday")
         if len(photon_g0_vectors) != 4:
             raise ValueError(
                 "the packed static photon completion requires four "
@@ -2425,9 +2529,69 @@ def compute_static_photon_response(
         cubature = minibz_photon_cubature(
             get_kernel(dimension), geometry,
             tuple(int(v) for v in meta.kgrid))
+
+        # The dynamic packed Sigma consumer remains current-only: its packed
+        # CC block is absent and W_CURRENT = V_CURRENT.  A magnetic GN head
+        # nevertheless needs the scalar owner's static/probe charge bodies
+        # to form the coupled small-system Hall-on/off differences.  Fold
+        # those bodies through O(N) charge-wing adapters against resident V;
+        # never construct a packed W or expose a CC block to photon_sigma.
+        faraday_ppm = None
+        if dynamic_hall:
+            if config.compute_mode.ppm_model != "gn":
+                gate = (
+                    "dynamic_hall_head_hl_imaginary_probe"
+                    if config.compute_mode.ppm_model == "hl" else
+                    "dynamic_hall_head_non_gn_unimplemented")
+                raise NotImplementedError(
+                    f"GATE {gate}: the Hall "
+                    "completion is authenticated at z=i*omega_p but this "
+                    "mode does not supply the matching GN imaginary-axis "
+                    "charge role (HL supplies a real-axis probe; non-PPM "
+                    "modes expose no GN two-sample role).  A "
+                    "separate imaginary-axis scalar W role is required "
+                    "before these samples can share one coupled solve.")
+            if W_charge_probe is None or (
+                    not screen_current and W_charge_head is None):
+                raise RuntimeError(
+                    "dynamic Faraday completion requires scalar W_00 at "
+                    "z=0 and z=i*omega_p")
+            from .head_correction import fit_dynamic_photon_cttc_q0
+            probe = 1j * float(config.ppm.omega_p)
+            probe_response = build_static_photon_head_response(
+                wfns_charge,
+                input_dir=config.input_dir,
+                mesh=mesh_xy,
+                wfn=wfn,
+                meta=meta,
+                config=config,
+                layout=layout,
+                hall_transaction=hall,
+                wfn_fingerprint_binding=wfn_fingerprint_binding,
+                frequency_ry=probe,
+            )
+            resident_body = W_packed if screen_current else V_packed
+            resident_charge_gamma = photon_block_view(
+                resident_body, layout, 0, 0, mesh_xy)[0]
+            static_charge_gamma = (
+                resident_charge_gamma if screen_current else W_charge_head[0])
+            faraday_ppm = fit_dynamic_photon_cttc_q0(
+                response, probe_response,
+                W_resident_body_gamma=resident_body[0],
+                W_resident_charge_gamma=resident_charge_gamma,
+                W_static_charge_gamma=static_charge_gamma,
+                W_probe_charge_gamma=W_charge_probe[0],
+                g0_X=g0_X, g0_Y=g0_Y,
+                cubature_receipt=cubature,
+                mesh_xy=mesh_xy,
+            )
+
         V_packed, W_packed, head_completion = (
             complete_static_photon_q0(
-                V_packed, W_packed, response, g0_X, g0_Y, cubature,
+                V_packed, W_packed,
+                (completion_response if charge_block_state
+                 == STATIC_PHOTON_CHARGE_BLOCK_PRESENT else None),
+                g0_X, g0_Y, cubature,
                 mesh_xy=mesh_xy,
                 charge_block_state=charge_block_state,
                 layout=(layout if charge_block_state
@@ -2475,6 +2639,22 @@ def compute_static_photon_response(
                     f"{head_completion.max_dyson_forward_error_bound:.3e}",
                     flush=True)
 
+        if faraday_ppm is not None:
+            from dataclasses import replace
+            head_completion = replace(
+                head_completion, faraday_ppm=faraday_ppm)
+            faraday_head_record = (
+                "PREPARED (even one-pole CT/TC Gamma-head factors; "
+                f"Omega_H={faraday_ppm.omega_h_ry:.17e} Ry; "
+                "Sigma insertion pending the shared PPM head branch)")
+            if jax.process_index() == 0:
+                print_fn(
+                    "  [photon head] Faraday factors: Hall-on minus "
+                    "sigma_H=0; Omega_H="
+                    f"{faraday_ppm.omega_h_ry:.8e} Ry; probe-fit residual="
+                    f"{faraday_ppm.probe_fit_relative_error:.3e}",
+                    flush=True)
+
     if screen_current:
         return StaticPhotonResponse(
             layout=layout, V_packed=V_packed, W_packed=W_packed,
@@ -2482,6 +2662,7 @@ def compute_static_photon_response(
             current_contact=current_contact,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
+            faraday_head_record=faraday_head_record,
             charge_head_insertion_norm_stats=charge_head_insertion_stats,
             approximation=(
                 "gamma_completed_no_pair_static_photon_v1"
@@ -2494,6 +2675,7 @@ def compute_static_photon_response(
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
+        faraday_head_record=faraday_head_record,
         charge_head_insertion_norm_stats=charge_head_insertion_stats,
         approximation=(
             "gamma_completed_bare_transverse_photon_v1"

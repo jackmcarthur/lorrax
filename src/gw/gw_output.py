@@ -154,6 +154,8 @@ class GWResults:
     #: Ordered-residue contribution to dynamic correlation, Ry.  Present only
     #: when the measured Global TRS verdict is broken.
     sigma_c_odd_diag_at_dft_ry: np.ndarray | None = None
+    #: Dynamic CT/TC Gamma-head Hall-on minus sigma_H=0 twin, Ry.
+    sigma_ct_hall_diag_at_dft_ry: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.sig_h_scalar is None:
@@ -1784,6 +1786,9 @@ def write_results(
         sigma_c_odd_kn_eV=(
             None if results.sigma_c_odd_diag_at_dft_ry is None
             else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
+        sigma_ct_hall_kn_eV=(
+            None if results.sigma_ct_hall_diag_at_dft_ry is None
+            else r2e * _wedge(results.sigma_ct_hall_diag_at_dft_ry)),
         z_factor_kn=assembly.z_factor,
         z_pathological_kn=assembly.z_pathological,
     )

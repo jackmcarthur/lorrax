@@ -28,6 +28,7 @@ from gw.qsgw_head import (
 _OPERATOR_FINGERPRINT = "sha256:" + "a" * 64
 _SIGMA_H = (1.9528890297769742e-11, 4.1597624292025984e-11,
             -4.223240852693869e-08)
+_HALL_FREQUENCIES = np.asarray([0.0 + 0.0j, 0.0 + 2.0j])
 
 
 def _mesh():
@@ -52,8 +53,11 @@ def _wfn(*, energy_shift=0.0):
 
 
 def _transaction(mesh, wfn, *, sigma_H=_SIGMA_H):
+    static = np.asarray(sigma_H, dtype=np.float64)
     return _static_gauge_hall_transaction_from_artifact(
-        sigma_H=np.asarray(sigma_H, dtype=np.float64),
+        frequencies_ry=_HALL_FREQUENCIES,
+        sigma_H_frequency=np.stack((static, 0.75 * static)).astype(
+            np.complex128),
         hamiltonian_config_operator_fingerprint=_OPERATOR_FINGERPRINT,
         wfn_fingerprint=wfn_fingerprint(wfn),
         band_start=0, band_stop=4, nk_tot=6, mesh=mesh)
@@ -83,12 +87,22 @@ def test_hall_artifact_roundtrip_is_sealed_and_immutable(tmp_path):
     np.testing.assert_array_equal(
         np.asarray(jax.device_get(loaded.sigma_H)),
         np.asarray(_SIGMA_H, dtype=np.float64))
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(loaded.frequencies_ry)),
+        _HALL_FREQUENCIES)
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(loaded.sigma_H_at(2.0j))),
+        0.75 * np.asarray(_SIGMA_H))
     assert loaded.sigma_H.sharding.is_equivalent_to(
         NamedSharding(mesh, P()), 1)
+    assert loaded.sigma_H_frequency.sharding.is_equivalent_to(
+        NamedSharding(mesh, P(None, None)), 2)
     assert (loaded.band_start, loaded.band_stop, loaded.nk_tot) == (0, 4, 6)
     assert loaded.wfn_fingerprint == wfn_fingerprint(wfn)
     assert (loaded.hamiltonian_config_operator_fingerprint
             == _OPERATOR_FINGERPRINT)
+    with pytest.raises(ValueError, match="static_gauge_hall_frequency_missing"):
+        loaded.sigma_H_at(1.0j)
 
     with pytest.raises(FileExistsError, match="immutable StaticGaugeHall"):
         write_static_gauge_hall_artifact(path, transaction, mesh_xy=mesh)

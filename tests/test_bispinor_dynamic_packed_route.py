@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pathlib
 
+import numpy as np
 import pytest
 
 
@@ -383,6 +384,55 @@ def test_screened_local_solver_refuses_on_a_multi_process_mesh(
             dyson_solver="local")
 
 
+def test_dynamic_hall_gate_admits_trs_zero_and_prepares_authenticated_magnet(
+        tmp_path):
+    """The dynamic route is never silent about the Faraday Gamma head."""
+    from gw.w_isdf import _gate_dynamic_hall_head
+
+    cfg = _config(
+        tmp_path, _PACKED_BARE + _PPM_KEYS + "compute_mode = gn_ppm\n",
+        name="gnppm_faraday_gate.in")
+
+    class _Hall:
+        sigma_H = np.asarray((4.0e-8, -5.0e-8, 6.0e-8),
+                             dtype=np.float64)
+
+        def sigma_H_at(self, frequency):
+            assert frequency == 2.0j
+            return np.asarray((1.0e-6, -2.0e-6, 3.0e-6),
+                              dtype=np.complex128)
+
+    records = []
+    record = _gate_dynamic_hall_head(
+        cfg, trs_allowed=True, coupled_head=True,
+        hall_transaction=object(),
+        print_fn=lambda text, **kwargs: records.append(text))
+    assert record.startswith("EXACT ZERO")
+    assert records == [
+        "Faraday head : EXACT ZERO (SymMaps.trs_allowed=true; "
+        "no Hall producer or consumer path taken)"]
+
+    records.clear()
+    record = _gate_dynamic_hall_head(
+        cfg, trs_allowed=False, coupled_head=True,
+        hall_transaction=_Hall(),
+        print_fn=lambda text, **kwargs: records.append(text))
+    assert record == (
+        "PREPARED (authenticated z=0 and z=i*omega_p Hall samples; "
+        "max|sigma_H(i*omega_p)| = 3.00000000000000008e-06 bohr^-1; "
+        "static sigma_H = [4e-08, -5e-08, 6e-08] bohr^-1)")
+    # PREPARED is internal state, not a second run-record line. The driver
+    # emits the sole magnetic record only after measuring sigCT_hall.
+    assert records == []
+
+    records.clear()
+    record = _gate_dynamic_hall_head(
+        cfg, trs_allowed=False, coupled_head=True, hall_transaction=None,
+        print_fn=lambda text, **kwargs: records.append(text))
+    assert "unmeasured (static_gauge_hall_file unnamed)" in record
+    assert records == ["WARNING Faraday head : " + record]
+
+
 # ---------------------------------------------------------------------------
 # One consumer, two block selections
 # ---------------------------------------------------------------------------
@@ -459,6 +509,12 @@ def test_dynamic_run_record_names_the_absent_charge_layout():
     assert "packed dynamic current-only photon operator" in text
     assert "CC block absent; W_CURRENT = V_CURRENT" in text
     assert "_bare_taken and uses_dynamic_packed_photon_route(config)" in text
+
+    driver = (pathlib.Path(__file__).resolve().parents[1]
+              / "src" / "gw" / "gw_jax.py").read_text()
+    assert '"Faraday head   : "' in driver
+    assert "photon_response.faraday_head_record" in driver
+    assert "Faraday head   : APPLIED" in driver
 
 
 # ---------------------------------------------------------------------------

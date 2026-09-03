@@ -19,7 +19,7 @@ current density `ψ†α^iψ`).
 
 ## 1. Status in one table {#four-current-phase-status}
 
-> **Integration status (2026-09-02).** Phase 1 is complete
+> **Integration status (2026-09-03).** Phase 1 is complete
 > inside the slab and bulk one-shot static-COHSEX envelope. Phase 2 is implemented;
 > the magnetic GN-PPM response and two-residue fit are W-level gated on CrI3,
 > but there is no Sigma-level CrI3 number. Phase 3 is minimally implemented:
@@ -39,8 +39,9 @@ current density `ψ†α^iψ`).
 | charge correlation `Σ_SX+Σ_COH` / `Σ_c(ω)` (CC) | static, GN-PPM (two samples), HL-PPM, MPA | scalar `W_h(ω)` from `S_eff(ω)` (§3) | `head_correction = full` | production |
 | bare transverse exchange `Σ^B` (TT) | none: instantaneous (bare Breit) | **inside the packed envelope**: `⟨D_TT⟩` from the Γ-cell completion, always on. **Outside it**: none — the `−⟨v P^T⟩_mBZ` tensor slot overlay (§2.1) survives as library code with no deck route | inside: `bispinor_gw = bare_transverse` + the §2 envelope. Outside: no deck key since 2026-09-01 | completion implemented and always on; the overlay is unreachable from a deck and **refused** on either packed route |
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + charge wings + optional Hall CT/TC `q¹` (§4), completed on the exact dimensioned WS cell; `off` is DEBUG | `bispinor_gw = full_static_cohsex`, `sys_dim` 2 or 3 | experimental, insulating, one shot |
-| *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`; static COHSEX uses packed `W = diag(W_00,D_TT)`, while dynamic GN/HL/MPA uses `W_CURRENT = V_CURRENT` with packed CC absent | static COHSEX uses the coupled dimensioned completion; dynamic mode inserts bare `⟨D⟩` only into V/logical current W and skips charge S/wings; Hall **refused** (§4) | `bispinor_gw = bare_transverse`, `sys_dim` 2 or 3 | experimental; dynamic mode supports one-shot and self-consistent QP maps |
-| the packed operator on a **dynamic** Σ | **CC dynamic scalar owner, current blocks static**: GN/HL/MPA own `W_00(ω)` outside the bare packed carrier; twelve current blocks are evaluated at `ω = 0` | CC: the dynamic model's own head for `Σ_c` plus scalar bare-X head; current: the packed Γ completion, bare-only for the absent-CC route | `compute_mode` in {`gn_ppm`, `hl_ppm`} for either packed family, plus `mpa` for `bare_transverse`; `sys_dim` 2 or 3; screened MPA refuses its missing static role | experimental; current-frequency dependence neglected as bounded in §2.2; bare SC re-contracts per-map orbitals |
+| *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`; static COHSEX uses packed `W = diag(W_00,D_TT)`, while dynamic GN/HL/MPA uses `W_CURRENT = V_CURRENT` with packed CC absent | static COHSEX uses the coupled dimensioned completion; dynamic mode inserts bare `⟨D⟩` only into V/logical current W and skips the base charge S/wings; measured-broken-TR GN separately fits the dynamic Hall pole (§4.5) | `bispinor_gw = bare_transverse`, `sys_dim` 2 or 3 | experimental; dynamic mode supports one-shot and self-consistent QP maps |
+| the packed operator on a **dynamic** Σ | **CC dynamic scalar owner, current blocks static**: GN/HL/MPA own `W_00(ω)` outside the bare packed carrier; twelve current blocks are evaluated at `ω = 0`; magnetic GN adds the analytic CT/TC Γ pole | CC: the dynamic model's own head for `Σ_c` plus scalar bare-X head; current: the packed bare Γ completion, plus the Hall-on/off CT/TC pole when prepared | `compute_mode` in {`gn_ppm`, `hl_ppm`} for either packed family, plus `mpa` for `bare_transverse`; `sys_dim` 2 or 3; magnetic Faraday insertion is GN and magnetic HL refuses by name | experimental; current-frequency dependence neglected as bounded in §2.2; bare SC re-contracts per-map orbitals |
+| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled at `0` and `i*omega_p` | one sharded Kubo producer, authenticated schema-v2 transaction, two coupled completion samples retained as CT/TC rank-four factors, and one analytic even pole (§4.5) | measured-broken-TR, insulating packed GN | **applied**; both Sigma branches receive ordinary `B_H` with `D_H = 0`, and `sigCT_hall` is the Hall-on/off observable |
 | retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -60,13 +61,17 @@ Two facts follow from the table and are easy to miss:
   dynamic route leaves the **charge** block out of the packed layout:
   GN/HL/MPA carry `W_00(ω)` in their existing scalar owner, while the sole
   packed consumer reads only the current sector with `W_CURRENT = V_CURRENT`.
-  `Σ^B` is its TT block rather than a separately added exchange term.
-* The only time-reversal-odd term in the screened photon head is the
-  static Hall (Chern–Simons) response. For a gapped system that
-  coefficient is topologically quantized (§4.4), so for a Chern-trivial
-  insulator it is exactly zero, so the packed mode's head reduces to the
-  charge-only head of §3 — its Hall term is zero both by default (an absent
-  `static_gauge_hall_file` sets `σ_H = 0`, announced) and by physics.
+  `Σ^B` is its TT block rather than a separately added exchange term.  A
+  dynamic Hall pole adds only CT/TC current-sector blocks; it does not make
+  packed CC a consumer.
+* At zero frequency the only time-reversal-odd term in the screened photon
+  head is the static Hall (Chern–Simons) response. For a gapped system that
+  coefficient is topologically quantized (§4.4), hence exactly zero for a
+  Chern-trivial insulator. At finite frequency it is not quantized:
+  `sigma_H(i*omega_p)` supplies the Faraday/Kerr CT/TC Gamma pole of §4.5.
+  An absent `static_gauge_hall_file` is still an announced absence, never a
+  silent inference that a measured-broken-TR material has zero dynamic Hall
+  response.
 
 ## 2. The bare propagator and its Γ-cell average
 
@@ -524,12 +529,14 @@ only admitted `q`-linear CT/TC structure is generated from it. It is also
 **optional**: an absent `static_gauge_hall_file` means `σ_H = 0`, announced
 with its reason, which by §4.4 is the exact answer for the systems this mode
 admits; a present but mismatched artifact still refuses in the loader, so a
-stale file cannot degrade the run silently. On the **unscreened** packed
-route of §2 an authenticated exact-zero artifact is equivalent to the
+stale file cannot degrade the run silently. On the **static unscreened**
+packed route of §2 an authenticated exact-zero artifact is equivalent to the
 unnamed default and is accepted. `GATE packed_bare_transverse_hall_unavailable`
-refuses any nonzero component: with the current channels unscreened,
-`W_CT = 0` at every finite `q`, so a Γ-only CT/TC block would not be the
-`q → 0` limit of anything the model computes. The sign is the live band
+refuses any nonzero component there: with the current channels unscreened,
+`W_CT = 0` at every finite `q`, so a standalone static Γ-only CT/TC block
+would not be the `q → 0` limit of anything the model computes. Dynamic packed
+GN instead uses that same block-diagonal operator as its Hall-off twin and
+adds the analytic Hall-on/off pole of §4.5. The sign is the live band
 orientation's: the persisted `σ_H` is the occupied-bra Berry sum while the
 live Adler–Wiser response is energy-ordered (`P = −ΔD`), which is the minus
 above; the oracle is
@@ -671,17 +678,138 @@ response, and the code's ladder screening (`w_bse`) is charge-only.
 The time-reversal-odd photon physics that is *not* quantized, the
 finite-frequency Hall/Kerr response `σ_{xy}(ω)` and the antisymmetric part of
 the TT response, lives at `ω ≠ 0` and at `O(q²)`. Neither is present in the
-static packed head, and no dynamic photon propagator exists to hold the
-former.
+static packed head.  The bounded Gamma-cell Hall producer specified next is
+the first of those objects; it does not make the finite-q current blocks
+dynamic.
 
-### 4.5 Audited seams and remaining limitation
+### 4.5 Dynamic Hall/Faraday Gamma head
 
-At `34228021` the two implementation defects below are fixed. The absolute
-insertion/wing normalisation that remained open after that change is closed
-numerically in §3.6; the scalar and packed routes share one slab quadrature,
-and the scalar and packed bulk heads share the exact polyhedron rule. The
-remaining distinction is scalar band-diagonal versus packed low-rank
-insertion, not the Gamma-cell integrator.
+This subsection owns the finite-frequency extension of the Hall term in
+§4.2.  It uses the same energy-ordered Adler--Wiser convention as the
+charge head and wings.  Let `Delta_ij = epsilon_i - epsilon_j > 0`,
+`f_diff = f_j - f_i`, and
+
+$$
+D_a(ij)=-\frac{v_a(ij)}{\Delta_{ij}},\qquad
+\Gamma_i=\frac{\alpha_{FS}}2 v_i .
+$$
+
+The one-charge-leg rule supplies the minus in the energy-ordered mixed
+response,
+
+$$
+\chi^{(a)}_{0i}(z)=
+-\frac{4}{\Omega N_k n_{\rm spin}n_{\rm spinor}}
+\sum_{\mathbf k,\,\Delta_{ij}>0}
+\frac{(f_j-f_i)\,\overline{v_a(ij)}\,\Gamma_i(ij)}
+     {z^2-\Delta_{ij}^2}.
+$$
+
+Its coordinate-antisymmetric axial part defines the one Hall pseudovector,
+
+$$
+\sigma_H^b(z)=\frac{i}{2}\epsilon_{bai}\chi^{(a)}_{0i}(z),\qquad
+\chi_{0i}(\mathbf q\to0,z)
+   =-i\epsilon_{bai}\sigma_H^b(z)q_a,
+$$
+
+and `TC(z)` is the causal partner of `CT(z)`.  At `z=0`, pairing the two
+band orientations reduces this expression to the occupied-bra Berry sum in
+§4.4, including its sign:
+
+$$
+\sigma_H^b(0)=-\frac{\alpha_{FS}C_s}{2\Omega}\,
+\operatorname{Im}c_B^b .
+$$
+
+Three parities are consequences of the formula, not routing assumptions.
+
+* `sigma_H(-z) = sigma_H(z)`: the Hall coefficient is frequency-even.  On
+  the imaginary axis every denominator is real and the epsilon-contracted
+  velocity bilinear is purely imaginary, so `sigma_H(i*xi)` is real.
+* Reversing the magnetisation complex-conjugates the axial bilinear and
+  sends `sigma_H(z) -> -sigma_H(z)`.
+* When `SymMaps.trs_allowed` is true, the authenticated `k`/`-k` partners
+  cancel at every `z`.  The producer therefore returns exact zeros without
+  executing the Hall contraction.  This exact short circuit, plus a
+  `0.000 micro-eV` packed-route regression, is the required zero test.
+
+The head is analytic per transition pole.  It adds no frequency quadrature,
+no response kernel, and no pairwise Sigma stage: the same sharded band-pair
+reduction that owns `sigma_H(0)` evaluates all requested frequencies in one
+bounded sweep.
+
+#### Even one-pole completion and Sigma insertion
+
+For any head family represented by
+
+$$
+W_h^c(z)=\frac{R_+}{z-\Omega_h}-\frac{R_-}{z+\Omega_h}
+=\frac{2\Omega_h B+2zD}{z^2-\Omega_h^2},\qquad
+B=\frac{R_++R_-}{2},\quad D=\frac{R_+-R_-}{2},
+$$
+
+an even Hall sample has `D_H = 0` exactly. Magnetisation oddness resides in
+the sign of the ordinary residue `B_H`, not in a frequency-odd residue.
+Both conduction and valence branches pass through
+`ppm_sigma._residue_for_space(..., B_odd=None)` and therefore receive the
+same Hall residue.
+
+The dynamic packed GN route keeps its ordinary packed current body as the
+literal `sigma_H=0` twin. On the absent-CC bare route that resident is
+`V_CURRENT`; O(N) charge-wing adapters fold the scalar owner's `W_00(0)` and
+`W_00(i*omega_p)` into the small system without constructing packed W or
+giving the CC block a Sigma consumer. It then executes the same
+dimension-general coupled 4x4 Gamma-cell moment owner for Hall-on and Hall-off
+at both frequencies. Only two rank-four factor pairs leave those solves: one
+CT pair and one TC pair, each stored as `left_rows_X` and `right_rows_Y`. No
+probe-frequency packed body is constructed.
+
+Writing the combined CT/TC Hall-on/off factors as `F_0` and `F_p`, the
+two-sample even fit uses the factor-Gram Frobenius overlap
+
+$$
+r={\mathrm{Re}\langle F_0,F_p\rangle_F\over
+        \langle F_0,F_0\rangle_F},\qquad
+\Omega_H=\omega_p\sqrt{r\over1-r},\qquad
+B_H=-{\Omega_H\over2}F_0 .
+$$
+
+Thus
+`F_H(z)=2*Omega_H*B_H/(z^2-Omega_H^2)`. The fit works on 4x4 Gram matrices,
+so the largest retained object is still one rank-four factor family. The
+Sigma consumer streams one final CT or TC Lorentz block at a time through
+the incumbent q=0 convolution and analytic pole denominators. Heads are
+analytic per pole: there is no quadrature work, no new response kernel, and
+no per-band-pair stage.
+
+This distinguishes two diagnostics that must not be conflated:
+
+* the existing `sigC_odd` is `Sigma[B,D] - Sigma[B,D=0]` and measures a
+  frequency-odd ordered residue;
+* the Hall/Faraday diagnostic `sigCT_hall` is
+  `Sigma[sigma_H] - Sigma[sigma_H=0]` and measures a
+  magnetisation-odd, frequency-even residue.
+
+There is therefore no `sigCT_odd` column. On a measured-broken-TR packed GN
+run the record says `Faraday head : APPLIED`, names both Hall samples and
+`Omega_H`, and reports the maximum and mean per-state `|sigCT_hall|`.
+`SymMaps.trs_allowed=true` takes no new producer, completion, or Sigma path
+and records `EXACT ZERO`; `head_correction=off` records the DEBUG skip. A
+measured-broken-TR run without an authenticated artifact records `ABSENT`
+with an unmeasured magnitude. The static packed COHSEX `z=0` completion is
+unchanged; a nonzero Hall artifact remains outside the static
+`bare_transverse` model.
+
+### 4.6 Audited seams and remaining limitation
+
+The two implementation defects below are fixed. The absolute insertion/wing
+normalisation that remained open after that change is closed numerically in
+§3.6. The scalar and packed routes share one slab quadrature, and the scalar
+and packed bulk heads share the exact polyhedron rule; §4.5 adds only the
+dimensioned frequency samples, adapters, and factor consumer. The remaining
+static distinction is scalar band-diagonal versus packed low-rank insertion,
+not the Gamma-cell integrator.
 
 * **Interband Γ wing sign.** Both wing kernels built the
   mixed head/body interband weight as `+F\,\overline{P}\,b/(z²−Δ²)`, while the

@@ -64,6 +64,7 @@ SCOPE, stated up front (TASTE.md: state what a check could NOT have seen).
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -82,11 +83,19 @@ import gw.qsgw_head as qsgw_head  # noqa: E402
 from gw.head_correction import (  # noqa: E402
     STATIC_PHOTON_CHARGE_BLOCK_ABSENT,
     STATIC_PHOTON_CHARGE_BLOCK_PRESENT,
+    _dynamic_photon_head_moments,
+    _dynamic_photon_head_small_system,
+    _faraday_cttc_factor_pairs,
+    canonicalize_static_gauge_q2_tensor,
     complete_static_photon_q0,
+    fit_dynamic_photon_cttc_q0,
+    fold_small_head_wings_sharded,
+    small_head_wing_halves_sharded,
     static_hall_linear_response,
 )
 from gw.photon_layout import (  # noqa: E402
-    PhotonBasisLayout, pack_photon_channel_vectors)
+    PhotonBasisLayout, pack_photon_channel_vectors, pack_photon_operator,
+    photon_block_view, photon_q0_low_rank_block)
 from gw.qsgw_head import (  # noqa: E402
     head_s_tensor_sharded,
     head_wings_sharded,
@@ -210,10 +219,14 @@ def part_a_residuals(mesh):
     # --- Hall CT: one charge leg (v), one current leg (Gamma) ---------------
     from common.bispinor_init import HALFALPHA
     gamma_raw = HALFALPHA * np.transpose(m.velocity, (1, 0, 2, 3))
-    sigma_H = np.asarray(raw_hall_pseudovector_sharded(
-        gamma_raw, m.energies, m.occupations, mesh=mesh, nb_logical=m.nb,
+    hall_frequencies = np.asarray(
+        [0.0 + 0.0j, 0.0 + 0.7j, 0.0 - 0.7j, 0.0 + 1.3j])
+    sigma_samples = np.asarray(raw_hall_pseudovector_sharded(
+        gamma_raw, m.energies, m.occupations, hall_frequencies,
+        mesh=mesh, nb_logical=m.nb,
         cell_volume=m.cell_volume, nk_tot=m.nk, nspin=m.nspin,
         nspinor_wfn=m.nspinor))
+    sigma_H = sigma_samples[0].real
     gamma_dir = np.transpose(gamma_raw, (1, 0, 2, 3))     # (3,nk,nb,nb)
     chi_0i = adler_wiser_chi(
         D_jet[:2], gamma_dir, m.energies, m.occupations,
@@ -227,6 +240,58 @@ def part_a_residuals(mesh):
         _rel(np.asarray(static_hall_linear_response(
             sigma_H, dimension=2))[:, 1:, 0],
              np.conj(CT_code)), None)
+
+    basis = np.eye(3)
+    epsilon = np.asarray([
+        [[np.dot(basis[b], np.cross(basis[a], basis[i]))
+          for i in range(3)] for a in range(3)] for b in range(3)])
+    sigma_reference = []
+    for z in hall_frequencies:
+        chi_dynamic = adler_wiser_chi(
+            D_jet, gamma_dir, m.energies, m.occupations,
+            cell_volume=m.cell_volume, nk_tot=m.nk, nspin=m.nspin,
+            nspinor=m.nspinor, z=z)
+        sigma_reference.append(
+            0.5j * np.einsum("bai,ai->b", epsilon, chi_dynamic))
+    sigma_reference = np.asarray(sigma_reference)
+    out["hall_dynamic_kubo"] = (
+        _rel(sigma_samples, sigma_reference), sigma_reference)
+    out["hall_dynamic_kubo_flipped"] = (
+        _rel(sigma_samples, -sigma_reference), None)
+    out["hall_dynamic_even"] = (
+        _rel(sigma_samples[1], sigma_samples[2]), None)
+    out["hall_dynamic_imag_axis_reality"] = (
+        float(np.max(np.abs(sigma_samples.imag))), None)
+
+    sigma_reversed = np.asarray(raw_hall_pseudovector_sharded(
+        np.conj(gamma_raw), m.energies, m.occupations, hall_frequencies,
+        mesh=mesh, nb_logical=m.nb, cell_volume=m.cell_volume,
+        nk_tot=m.nk, nspin=m.nspin, nspinor_wfn=m.nspinor))
+    out["hall_dynamic_magnetisation_odd"] = (
+        _rel(sigma_reversed, -sigma_samples), None)
+    gamma_trs = np.concatenate((gamma_raw, -np.conj(gamma_raw)), axis=0)
+    energies_trs = np.concatenate((m.energies, m.energies), axis=0)
+    occupations_trs = np.concatenate(
+        (m.occupations, m.occupations), axis=0)
+    sigma_trs = np.asarray(raw_hall_pseudovector_sharded(
+        gamma_trs, energies_trs, occupations_trs, hall_frequencies,
+        mesh=mesh, nb_logical=m.nb, cell_volume=m.cell_volume,
+        nk_tot=2 * m.nk, nspin=m.nspin, nspinor_wfn=m.nspinor))
+    out["hall_dynamic_trs_twin"] = (
+        float(np.max(np.abs(sigma_trs))), None)
+    # Reduction last bits are backend-specific.  These are the pre-extension
+    # z=0 bytes captured on the certified CPU and CUDA paths; selecting the
+    # old occupied-Berry row above must preserve the appropriate literal.
+    frozen_static = {
+        "cpu": "358bf00049d5823ff158d907361e8f3fec79838d1a3296bf",
+        "gpu": "358bf00049d5823ff158d907361e8f3ff379838d1a3296bf",
+    }
+    platform = jax.devices()[0].platform
+    out["hall_static_frozen_bits"] = (
+        0.0 if sigma_samples[0].real.tobytes().hex()
+        == frozen_static.get(platform) else 1.0,
+        None,
+    )
     return out
 
 
@@ -328,6 +393,7 @@ def _fixture(mesh, *, sigma_H, dimension=2, wings=True, seed=20260901):
             hall = _Hall()
             hall.sigma_H = _put(np.asarray(sigma_H, dtype=np.float64),
                                 mesh, P())
+            hall.sigma_H_at = lambda _frequency: hall.sigma_H
             hall.wfn_fingerprint = _WFN_SHA
             hall.band_start, hall.band_stop = 0, 4
             hall.producer_id = "oracle-fixture"
@@ -416,6 +482,38 @@ def _packed_pair(fixture, mesh):
     sharding = NamedSharding(mesh, P(None, "x", "y"))
     return (jax.device_put(fixture.V_host, sharding),
             jax.device_put(fixture.W_host, sharding))
+
+
+def _block_diagonal_body(fixture, mesh):
+    """Bare-transverse body: scalar W00 plus diagonal bare current blocks."""
+    layout = fixture.layout
+    rng = np.random.default_rng(72)
+    blocks = {}
+    for channel in range(4):
+        width = layout.padded_extent(channel)
+        if channel == 0:
+            raw = (rng.normal(size=(width, width))
+                   + 1j * rng.normal(size=(width, width)))
+            block = 0.03 * (raw + np.conj(raw.T)) + 0.7 * np.eye(width)
+        else:
+            block = (0.15 + 0.01 * channel) * np.eye(
+                width, dtype=np.complex128)
+        blocks[channel, channel] = _put(
+            np.asarray(block, dtype=np.complex128)[None], mesh,
+            P(None, "x", "y"))
+    return pack_photon_operator(
+        lambda A, B: blocks.get((A, B)), 1, layout, mesh)
+
+
+def _cttc_dense_vector(pairs, layout, mesh):
+    """Dense CT/TC block vector for a test-sized factor carrier."""
+    blocks = []
+    for A, B in ((0, 1), (0, 2), (0, 3),
+                 (1, 0), (2, 0), (3, 0)):
+        block = np.asarray(photon_q0_low_rank_block(
+            pairs, layout, A, B, mesh))[0]
+        blocks.append(block.reshape(-1))
+    return np.concatenate(blocks)
 
 
 # ---- the independent NumPy reference ------------------------------------
@@ -615,12 +713,17 @@ _TOL = 2.0e-10
 def test_part_a_definitions_share_one_convention():
     out = part_a_residuals(_mesh(1))
     for key in ("S00", "wing_Y", "wing_Z", "hall_CT_imag",
-                "hall_TC_is_CT_dagger", "wing_reciprocity"):
+                "hall_TC_is_CT_dagger", "wing_reciprocity",
+                "hall_dynamic_kubo", "hall_dynamic_even",
+                "hall_dynamic_imag_axis_reality",
+                "hall_dynamic_magnetisation_odd",
+                "hall_dynamic_trs_twin",
+                "hall_static_frozen_bits"):
         assert out[key][0] < 1.0e-12, (key, out[key][0])
     # Negative controls: each sign is observable, so none of these agreements
     # is a tautology of the reference's own spelling.
     for key in ("S00_flipped", "wing_Y_flipped", "wing_Z_flipped",
-                "hall_CT_imag_flipped"):
+                "hall_CT_imag_flipped", "hall_dynamic_kubo_flipped"):
         assert out[key][0] > 1.0e-3, (key, out[key][0])
 
 
@@ -772,6 +875,173 @@ def test_zero_wings_reduce_the_folded_response_to_S():
         _mesh(1), _SIGMA_FULL, wings=False, receipt=receipt)
     assert residual["moments_all"] < _TOL
     assert residual["W_packed"] < _TOL
+
+
+def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
+    """The even Hall pole is the Hall-on/off CT/TC completion itself.
+
+    This is the synthetic-magnet end-to-end cell: every contour point runs
+    the incumbent coupled 4x4 completion kernel, then its CT/TC rank-four
+    factors are materialized only at this tiny oracle boundary.  Production
+    keeps the factors.  The ``sigma_H=0`` twin is exact zero, reversing the
+    magnet reverses the inserted family, and the two-sample even pole closes
+    the dense contour within the toy's deliberately finite Hall nonlinearity.
+    """
+    mesh = _mesh(2)
+    receipt = _receipt()
+    sigma_static = np.array([0.0, 0.0, 1.0e-4])
+    fixture = _fixture(mesh, sigma_H=sigma_static, wings=True)
+    W_packed = _block_diagonal_body(fixture, mesh)
+    W_charge_gamma = photon_block_view(
+        W_packed, fixture.layout, 0, 0, mesh)[0]
+
+    probe_frequency = 2.0j
+    omega_reference = 1.0
+    probe_ratio = omega_reference ** 2 / (
+        abs(probe_frequency) ** 2 + omega_reference ** 2)
+    response_probe = replace(
+        fixture.response,
+        sigma_H=fixture.response.sigma_H * probe_ratio,
+        frequency_ry=probe_frequency)
+    fitted = fit_dynamic_photon_cttc_q0(
+        fixture.response, response_probe,
+        W_resident_body_gamma=W_packed[0],
+        W_resident_charge_gamma=W_charge_gamma,
+        W_static_charge_gamma=W_charge_gamma,
+        W_probe_charge_gamma=W_charge_gamma,
+        g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
+        cubature_receipt=receipt, mesh_xy=mesh)
+
+    # Frequency-even means one ordinary residue family and literally no D.
+    assert not hasattr(fitted, "B_odd_pairs")
+    assert fitted.probe_fit_relative_error < 1.0e-4
+    B_dense = _cttc_dense_vector(
+        fitted.B_pairs, fixture.layout, mesh)
+    static_dense = _cttc_dense_vector(
+        fitted.static_pairs, fixture.layout, mesh)
+    probe_dense = _cttc_dense_vector(
+        fitted.probe_pairs, fixture.layout, mesh)
+    np.testing.assert_allclose(
+        -2.0 * B_dense / fitted.omega_h_ry, static_dense,
+        rtol=0.0, atol=2.0e-13 * np.max(np.abs(static_dense)))
+    fitted_probe = (
+        2.0 * fitted.omega_h_ry * B_dense
+        / (probe_frequency ** 2 - fitted.omega_h_ry ** 2))
+    assert _rel(fitted_probe, probe_dense) < 1.0e-4
+
+    static_S, static_YW, static_WZ = _dynamic_photon_head_small_system(
+        fixture.response, W_packed[0],
+        W_resident_charge_gamma=W_charge_gamma,
+        W_target_charge_gamma=W_charge_gamma,
+        cell_volume=float(receipt.cell_volume), mesh_xy=mesh)
+    off_moments = _dynamic_photon_head_moments(
+        np.zeros(3, dtype=np.float64), static_S, receipt)
+
+    def direct_pairs(scale, frequency):
+        response = replace(
+            fixture.response,
+            sigma_H=fixture.response.sigma_H * scale,
+            frequency_ry=frequency)
+        moments = _dynamic_photon_head_moments(
+            response.sigma_H, static_S, receipt)
+        return _faraday_cttc_factor_pairs(
+            moments - off_moments,
+            g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
+            YW_y=static_YW, WZ_x=static_WZ,
+            layout=fixture.layout, mesh_xy=mesh,
+            cell_volume=float(receipt.cell_volume))
+
+    contour_error = 0.0
+    for y in (0.0, 0.5, 1.0, 2.0, 4.0):
+        z = 1j * y
+        ratio = omega_reference ** 2 / (y * y + omega_reference ** 2)
+        direct = _cttc_dense_vector(
+            direct_pairs(ratio, z), fixture.layout, mesh)
+        model = (2.0 * fitted.omega_h_ry * B_dense
+                 / (z * z - fitted.omega_h_ry ** 2))
+        contour_error = max(contour_error, _rel(model, direct))
+    assert contour_error < 1.0e-3
+
+    zero = _cttc_dense_vector(
+        direct_pairs(0.0, 0.7j), fixture.layout, mesh)
+    np.testing.assert_array_equal(zero, np.zeros_like(zero))
+    plus = _cttc_dense_vector(
+        direct_pairs(0.4, 0.7j), fixture.layout, mesh)
+    minus = _cttc_dense_vector(
+        direct_pairs(-0.4, 0.7j), fixture.layout, mesh)
+    np.testing.assert_allclose(
+        minus, -plus, rtol=0.0, atol=2.0e-13 * np.max(np.abs(plus)))
+
+
+def test_dynamic_faraday_probe_charge_delta_matches_explicit_packed_toy():
+    """O(N) probe folding equals replacing CC in a tiny packed body."""
+    mesh = _mesh(2)
+    receipt = _receipt()
+    fixture = _fixture(
+        mesh, sigma_H=np.array([0.0, 0.0, 2.0e-4]), wings=True)
+    _, W_packed = _packed_pair(fixture, mesh)
+    W_static = W_packed[0]
+    W_static_charge = photon_block_view(
+        W_packed, fixture.layout, 0, 0, mesh)[0]
+    target_charge = 0.73 * W_static_charge
+    got_S, got_YW, got_WZ = _dynamic_photon_head_small_system(
+        fixture.response, W_static,
+        W_resident_charge_gamma=W_static_charge,
+        W_target_charge_gamma=target_charge,
+        cell_volume=float(receipt.cell_volume), mesh_xy=mesh)
+
+    # Materializing the hybrid body is allowed only at this tiny oracle
+    # boundary. Production proves the same identity with the O(N) delta fold.
+    explicit_packed = pack_photon_operator(
+        lambda A, B: (
+            target_charge[None]
+            if (A, B) == (0, 0) else
+            photon_block_view(W_packed, fixture.layout, A, B, mesh)),
+        1, fixture.layout, mesh)
+    explicit = explicit_packed[0]
+    want_S = fixture.response.S_direct
+    for a in range(2):
+        for b in range(2):
+            folded = fold_small_head_wings_sharded(
+                fixture.response.S_direct[a, b], fixture.response.Y_x[a],
+                explicit, fixture.response.Z_y[b], float(receipt.cell_volume),
+                mesh_xy=mesh)
+            want_S = want_S.at[a, b].set(folded)
+    want_S = canonicalize_static_gauge_q2_tensor(want_S)
+    want_YW, want_WZ = small_head_wing_halves_sharded(
+        fixture.response.Y_x, explicit, fixture.response.Z_y, mesh_xy=mesh)
+    np.testing.assert_allclose(got_S, want_S, rtol=0.0, atol=2.0e-14)
+    np.testing.assert_allclose(got_YW, want_YW, rtol=0.0, atol=2.0e-14)
+    np.testing.assert_allclose(got_WZ, want_WZ, rtol=0.0, atol=2.0e-14)
+
+
+def test_bulk_faraday_factor_family_consumes_the_third_direction():
+    """The dimension-general adapter must not truncate the bulk z moments."""
+    mesh = _mesh(1)
+    fixture = _fixture(
+        mesh, sigma_H=np.array([1.0e-4, -2.0e-4, 3.0e-4]),
+        dimension=3, wings=True)
+    W_packed = _block_diagonal_body(fixture, mesh)
+    YW_y, WZ_x = small_head_wing_halves_sharded(
+        fixture.response.Y_x, W_packed[0], fixture.response.Z_y,
+        mesh_xy=mesh)
+    delta = np.zeros((4, 4, 4, 4), dtype=np.complex128)
+    delta[3, 0, 0, 1] = 0.4j
+    delta[0, 3, 1, 0] = -0.2j
+    pairs = _faraday_cttc_factor_pairs(
+        delta, g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
+        YW_y=YW_y, WZ_x=WZ_x, layout=fixture.layout,
+        mesh_xy=mesh, cell_volume=5.0)
+    dense = _cttc_dense_vector(pairs, fixture.layout, mesh)
+    assert np.max(np.abs(dense)) > 1.0e-8
+
+    zero_pairs = _faraday_cttc_factor_pairs(
+        np.zeros_like(delta), g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
+        YW_y=YW_y, WZ_x=WZ_x, layout=fixture.layout,
+        mesh_xy=mesh, cell_volume=5.0)
+    np.testing.assert_array_equal(
+        _cttc_dense_vector(zero_pairs, fixture.layout, mesh),
+        np.zeros_like(dense))
 
 
 def _reference_bare_tt_moments(receipt):

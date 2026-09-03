@@ -40,7 +40,7 @@ Orthogonally to *which* packed operator is built, `compute_mode` decides
 | compute mode | packed Σ blocks | charge Σ | predicate |
 |---|---|---|---|
 | `cohsex` | all sixteen (`blocks = "all"`) | none beside it: the CC block of the packed operator **is** the charge Σ | `packed_photon_replaces_charge_sigma` |
-| `gn_ppm`, `hl_ppm`, `mpa` | the twelve with a current index (`blocks = "current"`), evaluated once at `ω = 0`; the sole consumer enforces `W_CURRENT = V_CURRENT` | the ordinary scalar `Σ_x + Σ_c(ω)` owner, with its head and GN/HL role-W or MPA fit transaction unchanged | `uses_dynamic_packed_photon_route` |
+| `gn_ppm`, `hl_ppm`, `mpa` | the twelve with a current index (`blocks = "current"`), evaluated once at `ω = 0`; the sole consumer enforces `W_CURRENT = V_CURRENT`; broken-TR GN additionally streams the analytic Hall-on/off CT/TC Gamma pole | the ordinary scalar `Σ_x + Σ_c(ω)` owner, with its head and GN/HL role-W or MPA fit transaction unchanged | `uses_dynamic_packed_photon_route` |
 | `x_only` (bare family only) | the twelve current-index X blocks; `SX(D_TT)=X(D_TT)`, `COH=0` | ordinary scalar charge X, with the incumbent `Σ^B` arms explicitly disabled | `uses_static_photon_response` plus `compute_mode = x_only` |
 
 The absent-CC layout is what admits `mpa`: it needs no independent static role
@@ -228,7 +228,7 @@ object each key ends up on and who reads it.
 | `centroids_file_current` | `""` (`:1514`, parse `:5435-5443`) | `config.paths.centroids_file_current` (`:3274`) | both |
 | `head_correction` | `full` (`:2011`, coerced `:548`, read `:5451`, built into `HeadConfig` `:5474`) | `config.head.correction` (`:5064`) | both |
 | ~~`bispinor_tt_head_correction`~~ | **REMOVED as a deck key 2026-09-01**; the field is wired to `False` (`gw_config.py:5495`) for the incumbent V-tile builder | `config.head.bispinor_tt_head_correction` | **B only**, and now only from a hand-built config |
-| `static_gauge_hall_file` | `""` — EMPTY (`:1503`) | `config.paths.static_gauge_hall_file` | P; optional. An UNNAMED file means `σ_H = 0`, announced. Every named path is authenticated by the loader; an absent one refuses there. The bare route accepts only an exact-zero artifact and refuses a nonzero Hall vector |
+| `static_gauge_hall_file` | `""` — EMPTY (`:1503`) | `config.paths.static_gauge_hall_file` | P; optional. An UNNAMED file means `σ_H = 0`, announced. Every named path is authenticated by the loader; an absent one refuses there. Static packed bare accepts only an exact-zero artifact; dynamic packed GN owns a nonzero artifact through its Hall-on/off CT/TC pole |
 | `transverse_zeta_solve` | `ridge` (`:1908`, validate `:5723-5740`) | `config.backend.transverse_zeta_solve` (`:4773`) | both |
 | `transverse_zeta_rcond` | `1e-10` (`:1916`, validate `:5741-5745`) | `config.backend.transverse_zeta_rcond` (`:4774`) | both |
 | `distrib_la_batched_route` | `batch_reshard` (explicit `auto` remains available; `use_low_mem_eigh=true` derives it when the key is absent) | `config.backend.distrib_la_batched_route` | both |
@@ -497,6 +497,49 @@ charge Sigma and its coupled completion owns the charge head. The dynamic
 packed route deliberately keeps the scalar dynamic charge head and adds only
 the current-index blocks from the packed completion.
 
+### 3d. Dynamic Hall/Faraday Gamma-head path
+
+`qsgw_head.raw_hall_pseudovector_sharded` is the sole Hall Kubo reduction.
+It accepts an explicit complex-frequency vector, evaluates all samples in
+one band-tiled `P(None,None,'x','y')` contraction, and returns only the
+replicated `(n_frequency,3)` pseudovectors.  Its `z=0` row preserves the
+occupied-Berry result used by the static completion.  The sealed Hall
+transaction and `file_io.static_gauge_head` bind the frequency vector and
+all pseudovectors to the same WFN, band interval, full-BZ count and canonical
+operator fingerprint.  `SymMaps.trs_allowed=true` takes an exact-zero
+short circuit before the contraction.
+
+`static_gauge_response.build_static_photon_head_response` selects an exact
+transaction frequency and exposes the dimensioned native charge-wing rows
+beside their packed form. `w_isdf.compute_static_photon_response` leaves the
+dynamic packed CC block absent and keeps `V_CURRENT` as the resident Hall-off
+body. It folds the scalar owner's static and probe charge bodies into that
+body through O(N) charge-wing adapters, builds the `z=0` and
+`z=i*omega_p` responses, and calls
+`head_correction.fit_dynamic_photon_cttc_q0`. That owner runs the same
+dimension-general 4x4 completion moment kernel for Hall-on and Hall-off at
+each frequency, but retains only one rank-four factor pair for CT and one for
+TC. The common even pole is fitted from factor-Gram inner products; no packed
+W, second packed body, CC Sigma read, or centroid-square probe carrier exists.
+
+`photon_sigma.compute_ppm_faraday_head_sigma_omega` passes those factors
+through `ppm_sigma._residue_for_space` with `B_odd=None`, streams one q=0
+CT/TC block at a time through the existing normalized convolution, and uses
+analytic pole denominators. `sigma_dispatch.finalize_dynamic_sigma` adds that
+cube once and evaluates its Hall-on/off diagonal as `sigCT_hall`; it also
+books the same matrix into the CT+TC Lorentz sector. This is distinct from
+`sigC_odd = Sigma[B,D]-Sigma[B,D=0]`: Hall is even in frequency (`D=0`) but
+odd in magnetisation (`B_H -> -B_H`).
+
+`SymMaps.trs_allowed=true` takes the exact-zero branch before all of this and
+records `Faraday head : EXACT ZERO`; `head_correction=off` records its DEBUG
+skip. A measured-broken-TR dynamic deck without an authenticated artifact
+records `ABSENT` and the unmeasured sample instead of silently continuing.
+The insertion currently serves the packed GN imaginary-axis pair; a magnetic
+HL run refuses by name because its existing scalar probe is on the real axis,
+not at the authenticated `i*omega_p` Hall sample. Static packed COHSEX keeps
+the existing `z=0` completion.
+
 ## Stage 4 — self-energy
 
 The fork is `sigma_dispatch.py:845`, and it has **three** packed arms plus
@@ -506,7 +549,7 @@ an exhaustiveness refusal:
 |---|---|---|
 | `packed_photon_replaces_charge_sigma` (`compute_mode = cohsex`) | `:845-889` | the sixteen-block contraction owns `Σ_X`, `Σ_SX`, `Σ_COH` outright. Its three refusals fire before any allocation: outside `compute_mode = cohsex`, with no packed response ("Refusing instead of falling back to charge-only screened COHSEX"), and with scalar `static_head_terms` present (double count) |
 | bare-family `compute_mode = x_only` | before the dynamic arm | scalar charge X is computed with the incumbent transverse arms disabled; the packed current blocks contribute X with `SX=X` and `COH=0`. Residual checks refuse if that algebra is violated |
-| `uses_dynamic_packed_photon_route` (GN/HL/MPA) | `:890-990` | the scalar `compute_sigma_x` runs with the incumbent `Σ^B` arms **explicitly off** (`wfns_transverse=None`, `bispinor_v_q_path=None`) and keeps `static_head_terms` (the CC bare-X head); the packed consumer is called with `blocks = "current"` and `charge_block_state = absent_dynamic_scalar_owner`. It aliases `W_CURRENT` to `V_CURRENT`, so `SX = X`, `COH = 0`, and books that static contribution into `sig_x`. Control then reaches the mode's unchanged GN/HL or MPA charge-Sigma branch |
+| `uses_dynamic_packed_photon_route` (GN/HL/MPA) | `sigma_dispatch.compute_sigma_xc` | the scalar `compute_sigma_x` runs with the incumbent `Σ^B` arms **explicitly off** (`wfns_transverse=None`, `bispinor_v_q_path=None`) and keeps `static_head_terms` (the CC bare-X head); the packed consumer is called with `blocks = "current"` and `charge_block_state = absent_dynamic_scalar_owner`. It aliases `W_CURRENT` to `V_CURRENT`, so `SX = X`, `COH = 0`, and books that static contribution into `sig_x`. On measured-broken-TR GN, the completion's CT/TC Hall factors additionally enter `compute_ppm_faraday_head_sigma_omega` and are added to the dynamic correlation cube exactly once. Control otherwise reaches the unchanged GN/HL or MPA charge-Sigma branch |
 | `uses_static_photon_response` with neither of the above | `:991-1008` | exhaustiveness refusal naming `PACKED_PHOTON_COMPUTE_MODES`; no parsed supported deck reaches it |
 
 `finalize_dynamic_sigma` carries the packed per-sector Γ diagnostics through
@@ -520,6 +563,8 @@ there is the dynamic model's, not the packed completion's.
 | per-block operands | `photon_layout.photon_block_view` (`:279`), fetched at `photon_sigma.py:401-402` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')` — a `dynamic_slice`, never a gather | P |
 | Green function `G` | `greens_function_kernel.build_G`, face layout | `(nk, ns, μ_L, ns, μ_R)` | `P(None,None,'x',None,'y')` (`wavefunction_bundle.py:236`) | both |
 | head-attribution diagnostics | `photon_sigma.py:410-414` (accumulated at `:450-471`) via `photon_layout.photon_q0_low_rank_block` (`:676`) | one `(1, p_A, p_B)` block | `P(None,'x','y')` | P |
+| dynamic Faraday carrier | `head_correction.FaradayHeadPPMFactorCarrier`, fitted by `fit_dynamic_photon_cttc_q0` | two CT/TC families of `(4,N_packed)` left/right rows plus their static/probe samples; no `(nq,N_packed,N_packed)` W body | left `P(None,'x')`, right `P(None,'y')` | packed GN, measured broken TR |
+| dynamic Faraday Sigma | `photon_sigma.compute_ppm_faraday_head_sigma_omega` | `(n_omega,nk,nb_sigma,nb_sigma)` after streaming six CT/TC current-sector blocks | same dynamic-Sigma layout as its consumer | packed GN, measured broken TR |
 | `Σ^B`, bare transverse — **incumbent route only** | `sigma_x_bispinor.compute_sigma_x_bispinor` (`:77`), nine `(i,j)` tiles at `:189-190`. Bulk is no longer an exclusion: eligible `sys_dim=3` decks reach `Σ^B` through the packed operator and its polyhedron completion. Restart, local/one-GPU, bare `x_only`, and slab or bulk GN/HL/MPA including the supported bare dynamic SC class likewise reach the packed current consumer; `no_local_fields`, ladder/resolvent diagrams, screened restart, screened `x_only`, screened MPA, screened SC and bare COHSEX SC refuse by name rather than falling back | `(nk, nb_sigma, nb_sigma)` | replicated after a gather-then-window (`:221-235`) | B |
 | transverse Hartree | `sigma_dispatch._compute_live_hartree` (`:302-335`) → `kin_ion_io.compute_hartree_matrix` (`:759`) | `charge`, `transverse`, each `(nk_full, nb, nb)` Ry | `P(None,'x','y')` with `return_sharded=True` | **both** |
 
@@ -580,6 +625,7 @@ packed contractions at `:887-890` or `:988-990`):
 | `photon_head_sigma_basis` | `:125` | `"dft"` when populated; also in `BASIS_FREE_FIELDS` (`:257`) |
 | `sigma_lorentz_skij_ry` | `sigma_dispatch.py` | `(3, nk, nb, nb)` — physical `Sigma_xc` sectors `(CC, CT+TC, TT)`. Packed routes accumulate the computed blocks in `photon_sigma.py`; incumbent routes retain the computed `Sigma^B` as TT and define CC as the exact total-minus-current residual. It rotates with the total under static self-consistency. |
 | `sigma_c_odd_at_dft_diag_ev` | `sigma_dispatch.py` | `(nk, nb)` only on a measured-broken-TR GN deck: `Sigma_c[B,D] - Sigma_c[B,D=0]` evaluated at each DFT state. `None` on measured-TRS decks. |
+| `sigma_ct_hall_at_dft_diag_ev` | `sigma_dispatch.py` | `(nk, nb)` only when the dynamic Faraday carrier is applied: `Sigma[sigma_H] - Sigma[sigma_H=0]`, evaluated at each DFT state. `None` on measured-TRS decks. |
 
 A former `photon_head_sigma_operator_fingerprint` field is absent at
 `34228021`; it belonged to the removed full-static-gauge seam.
@@ -596,9 +642,10 @@ changing `sigTOT`/`sigXC`; their sum is gated against that old total before
 write. The independently computed current sectors are rounded to the legacy
 six-decimal precision and displayed CC is their residual from the unchanged
 displayed total, so the identity also closes within 1e-9 eV in public text. A
-measured-broken-TR GN deck additionally adds `sigC_odd`; a
-measured-TRS deck omits it. Scalar files take the `None` branch and retain
-their historical columns byte-for-byte.
+measured-broken-TR GN deck additionally adds `sigC_odd`; the packed Faraday
+path adds the separate `sigCT_hall` Hall-on/off column. A measured-TRS deck
+omits both. Scalar files take the `None` branches and retain their historical
+columns byte-for-byte.
 
 **Reading `gwjax.out`.** These lines tell you which route ran:
 
@@ -611,6 +658,7 @@ their historical columns byte-for-byte.
 | `Head Sigma     : …` | `gw_jax.py:1470-1475` | Max and mean `|diag|` of the Gamma-cell contribution, split CC, CT+TC and TT. Dynamic CC combines the scalar bare-X and dynamic-correlation head owners; current sectors come from the packed completion. |
 | `GN odd Sigma   : …` | `gw_jax.py:1478-1498` | Measured-broken-TR only: max/mean `|sigC_odd|`, its max/mean shares of `|Sigma_xc|`, the `W(iomega_p)` Hermiticity residual, and `max|D|/max|B|`. Its absence on a TRS deck is part of the schema. |
 | `Gamma WS cert  : …` / `Photon WS cert : …` | `gw_jax.py:803-809,1500-1506` | Dimension, exact polygon/polyhedron method, order ladder, physical node counts and final mixed-tolerance error ratio. The photon line also reports the coupled solve's maximum Dyson backward residual. |
+| `Faraday head   : APPLIED (…)` | `gw_jax.main` | Packed broken-TR GN only: authenticated `sigma_H(0)` and `sigma_H(i*omega_p)`, fitted `Omega_H`, and max/mean per-state `|sigCT_hall|`. The alternatives are explicit `EXACT ZERO`, DEBUG `ABSENT`, or missing-artifact `ABSENT` records. |
 | `Global TRS     : …` | `common/scientific_output.py:352-386` | The measured global verdict and provenance used by the screening/ordered-residue route. Route selection reads this verdict; it is not inferred again from a deck flag. |
 | `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:314` | the carrier banner. Under `full_static_cohsex` the parenthetical names the **head state**, not "experimental", and reads `DEBUG: Gamma-cell head disabled by head_correction=off` when the completion is off |
 | `Σ^B tile (μ_L=i, ν_L=j): tr Σ = …` ×9 | `sigma_x_bispinor.py:217` | the **incumbent** bare route ran. Their absence beside a `Photon route: packed …` line is the packed bare route |
@@ -632,7 +680,8 @@ and again at driver entry (`gw_init.py:3101`).
 |---|---|---|
 | `packed_bare_transverse_tt_head_double_count` | `gw_config.py:3943` | `head.bispinor_tt_head_correction = true` on a deck that takes EITHER packed route. The deck key is gone (2026-09-01), so this is the hand-built-config guard. The Γ completion already inserts `⟨D_TT⟩`; honouring the overlay too would double count it |
 | `static_gauge_hall_file_missing` | `file_io/static_gauge_head.py` | the deck NAMES a Hall artifact that does not exist. This loader is the one absence owner; unnamed still means `σ_H = 0`, announced |
-| `packed_bare_transverse_hall_unavailable` | `w_isdf._load_static_photon_hall` | an authenticated Hall artifact has any nonzero component on the packed **bare** route. Exact zero is accepted; otherwise the current-unscreened model's finite-q `W_CT = 0` cannot have a Γ-only CT/TC limit |
+| `packed_bare_transverse_hall_unavailable` | `w_isdf._load_static_photon_hall` | an authenticated Hall artifact has any nonzero component on the **static** packed bare route. Exact zero is accepted. Dynamic packed GN instead owns the nonzero artifact through its Hall-on/off pole; the static current-unscreened model's finite-q `W_CT = 0` cannot have a standalone Γ-only CT/TC limit |
+| `dynamic_hall_head_hl_imaginary_probe` | `w_isdf.compute_static_photon_response` | a measured-broken-TR packed HL deck supplies the incumbent real-axis charge probe, while its Hall artifact is authenticated at `i*omega_p`. It refuses rather than pair samples from different frequencies |
 | (no id) `screen_current` inconsistency | `w_isdf.py:2195-2226` | the `screen_current` argument disagrees with `packed_photon_screens_current(config)` for the resolved `bispinor_gw`, or `W_charge` is missing on the bare branch |
 | `bispinor_gw_charge_hall_cubature_retired`, `bispinor_gw_pauli_reference_retired`, `bispinor_gw_isometric_kinetic_balance_retired` | `gw_config.py:324` (`_RETIRED_BISPINOR_GW_MODES`, read by `coerce_bispinor_gw_mode` `:353`) | the deck names a retired mode value. **Refusals, not aliases**: the coercer runs from a dozen resolution sites, so an alias would print from each, and a mode value is the one deck word that decides which physics runs. Each names its replacement |
 | `bispinor_head_correction_no_local_fields_unavailable` | `:3943` | `head_correction = no_local_fields` with any bispinor deck; the coupled solve does not produce that scalar diagnostic, and on the bare family the value would choose a route by changing head policy |
