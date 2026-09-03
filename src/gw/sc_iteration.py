@@ -15,7 +15,10 @@ Anderson mixing composes meaningfully).  Every iteration:
 3. At an outer boundary recompute χ₀ → W and the pole model; within an inner
    solve reuse that screening transaction and rebuild only G → Σ_xc with the
    rotated wfns (:func:`sigma_dispatch.compute_sigma_xc`, mode-orthogonal).
-4. Rotate ``(V_H + Σ_xc)`` back to the DFT basis and form
+4. Between expensive Sigma rebuilds, converge rotations and energies against
+   the fixed Sigma_c(omega) table with :func:`run_fixed_sigma_evsc`; the outer
+   screening transaction also caches its immutable W-side time factors.
+5. Rotate ``(V_H + Σ_xc)`` back to the DFT basis and form
    ``H_qp_dft = kin_ion_dft + (V_H + Σ_xc)_dft``.
 
 The iteration map is a pure function: ``state → state``.  The body has
@@ -64,6 +67,7 @@ from __future__ import annotations
 import functools as _functools
 import math as _math
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -136,8 +140,10 @@ class FixedSigmaEVSCResult:
 
     energies_ry: np.ndarray
     U_dft_to_qp: jax.Array
+    H_qp_dft_ry: jax.Array
     iterations: int
     residual_ev: float
+    converged: bool = True
 
 
 def protected_band_convergence(
@@ -328,6 +334,13 @@ class SCInputs:
     #: rebuilds G and Sigma from the retained model without entering the
     #: screening producer.  Set only by :mod:`gw.sc_two_level`.
     frozen_screening: SCMapScreeningArtifacts | None = None
+    #: Activate the nested fixed-Sigma-table cycle and W(tau) cache.  False
+    #: on the max_iter=1 identity path, even though that path also uses this
+    #: input bundle.
+    two_level_enabled: bool = False
+    #: Run-local measured cost ledger.  Host orchestration only, never a jit
+    #: operand; shared across the dataclass replacements made by the loops.
+    two_level_cost: dict | None = None
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
     # record.  Component chatter remains on ``print_fn`` and can still be
@@ -426,6 +439,8 @@ class SCMapScreeningArtifacts:
     iteration_head: object | None
     static_head_terms: object | None
     sigma_model: object | None = None
+    #: Device-resident W-side time factors, scoped to this outer W model.
+    w_time_factor_cache: dict | None = None
 
 
 def _retarget_frozen_iteration_head(
@@ -512,6 +527,7 @@ class SCOutputs:
     tail_scissor_fit: ScissorFit | None
     screening: SCMapScreeningArtifacts
     exact_hartree_dft: SCExactHartree | None = None
+    fixed_sigma_cycle_converged: bool = True
 
 
 @dataclass(frozen=True)
@@ -1395,22 +1411,28 @@ def run_fixed_sigma_evsc(
     band_slices: BandSlices,
     wfn,
     mesh_xy: Mesh,
+    sc_context: dict | None = None,
     print_fn: Callable = print,
 ) -> FixedSigmaEVSCResult:
     """Iterate a fixed full-matrix Sigma(omega) table to eigenvalue SC.
 
-    This is the opt-in ``eqp2.dat`` treatment.  Screening, W, and every
-    self-energy diagram are computed exactly once by the ordinary one-shot
-    path.  Its fixed-point variable is the Hermitian QP Hamiltonian in the
-    ORIGINAL DFT basis.  For an input ``H_p^DFT`` it diagonalizes
+    This is the single fixed-table engine used by both the opt-in
+    ``eqp2.dat`` treatment and the innermost two-level QSGW cycle.
+    Screening, W, and every self-energy diagram are fixed for the duration
+    of the call.  Its fixed-point variable is the Hermitian QP Hamiltonian
+    in the ORIGINAL DFT basis.  For an input ``H_p^DFT`` it diagonalizes
 
     ``H_p^DFT U_p = U_p E_p``
 
     rotates the stored cube as
-    ``Sigma_c,p(omega) = U_p^dagger Sigma_c,DFT(omega) U_p``, forms
+    ``Sigma_c,p(omega) = U_p^dagger Sigma_c,DFT(omega) U_p``.  The EQP2
+    consumer forms the historical half-sum
 
     ``Sigma_eff,p[m,n] = 1/2 [Sigma_p,mn(E_p,m)
-                              + Sigma_p,mn(E_p,n)]^h``,
+                              + Sigma_p,mn(E_p,n)]^h``;
+
+    the nested SC consumer instead evaluates its diagonal at ``E_p,m`` and
+    every off-diagonal at ``E_F``, using the same shared interpolation owner,
 
     and returns ``F(H_p)^DFT = H0_DFT + U_p Sigma_eff,p U_p^dagger``.
     Keeping the fixed-point carry in one coordinate system is what makes the
@@ -1451,6 +1473,40 @@ def run_fixed_sigma_evsc(
             "Sigma(omega) result, but these fields are absent: "
             + ", ".join(missing))
 
+    sc_mode = sc_context is not None
+    if sc_mode:
+        required_context = (
+            "inputs", "H_seed_dft_ry", "sigma_basis_U", "partition",
+            "band_classes", "exact_hartree_dft")
+        absent = [name for name in required_context
+                  if name not in sc_context]
+        if absent:
+            raise ValueError(
+                "SC fixed-table context is missing: " + ", ".join(absent))
+        sc_inputs = sc_context["inputs"]
+        ks = _kstar(sc_inputs)
+        basis_U = sc_context["sigma_basis_U"]
+
+        # The Sigma producer returns its table in the QP basis of the G that
+        # built it.  The fixed-table engine's carry is always in the original
+        # DFT basis, so rotate each immutable operator back exactly once.
+        sigma_c_dft = _rotate_sigma_omega_cube(
+            sigma_c_dft, basis_U, mesh=mesh_xy, to_qp=False)
+        sigma_x_dft = _rotate_fixed_matrix(
+            sigma_x_dft, basis_U, mesh=mesh_xy, to_qp=False)
+        if not bool(sigma_result.hartree_omitted):
+            v_h_dft = _rotate_fixed_matrix(
+                v_h_dft, basis_U, mesh=mesh_xy, to_qp=False)
+
+        if not ks.is_identity:
+            # KStarMap selects a leading k axis.  The cube's k axis is one,
+            # so expose it as leading only for this index selection.
+            sigma_c_dft = jnp.swapaxes(
+                ks.select(jnp.swapaxes(sigma_c_dft, 0, 1)), 0, 1)
+            sigma_x_dft = ks.select(sigma_x_dft)
+            if not bool(sigma_result.hartree_omitted):
+                v_h_dft = ks.select(v_h_dft)
+
     e_dft_ry = np.asarray(e_dft_kn_ry, dtype=np.float64)
     if e_dft_ry.ndim != 2:
         raise ValueError(
@@ -1485,7 +1541,16 @@ def run_fixed_sigma_evsc(
     ident = np.broadcast_to(
         np.eye(nb, dtype=np.complex128)[None, :, :], (nk, nb, nb)).copy()
     U_seed = _place(ident, mesh_xy, rotation_spec)
-    h0_dft = jnp.asarray(kin_ion_dft_ry) + jnp.asarray(v_h_dft)
+    if sc_mode and bool(sigma_result.hartree_omitted):
+        exact_hartree_dft = sc_context["exact_hartree_dft"]
+        if exact_hartree_dft is None:
+            raise ValueError(
+                "SC fixed-table cycle received hartree_omitted=true "
+                "without its caller-owned exact Hartree operator")
+        h0_dft = (jnp.asarray(kin_ion_dft_ry)
+                  + jnp.asarray(exact_hartree_dft.total))
+    else:
+        h0_dft = jnp.asarray(kin_ion_dft_ry) + jnp.asarray(v_h_dft)
     h0_dft = _place(h0_dft, mesh_xy, rotation_spec)
     sigma_c_dft = _place(
         sigma_c_dft, mesh_xy, P(None, None, "x", "y"))
@@ -1493,29 +1558,38 @@ def run_fixed_sigma_evsc(
     omega_ev = np.asarray(omega_ev, dtype=np.float64)
     omega_ry = np.asarray(omega_ry, dtype=np.float64)
     efermi_ev = float(efermi_ev)
-    e_dft_full_ry = np.asarray(wfn.energies[0], dtype=np.float64)
-    partition = build_omega_band_partition(
-        e_dft_ry, e_dft_full_ry,
-        band_offset=b0,
-        omega_min_abs_ev=float(omega_ev[0]) + efermi_ev,
-        omega_max_abs_ev=float(omega_ev[-1]) + efermi_ev,
-        label="EQP2", print_fn=print_fn)
+    if sc_mode:
+        partition = sc_context["partition"]
+    else:
+        e_dft_full_ry = np.asarray(wfn.energies[0], dtype=np.float64)
+        partition = build_omega_band_partition(
+            e_dft_ry, e_dft_full_ry,
+            band_offset=b0,
+            omega_min_abs_ev=float(omega_ev[0]) + efermi_ev,
+            omega_max_abs_ev=float(omega_ev[-1]) + efermi_ev,
+            label="EQP2", print_fn=print_fn)
     protected = np.asarray(
         partition.protected_mask, dtype=bool).reshape(-1)
     in_range = np.asarray(
         partition.in_range_mask, dtype=bool).reshape(-1)
     required_kn = np.broadcast_to(
         (protected | in_range)[None, :], e_dft_ry.shape)
-    valence_mask_kn = np.broadcast_to(
-        (np.arange(nb) + b0 < int(meta.nelec))[None, :],
-        e_dft_ry.shape)
+    valence_mask_kn = (
+        np.asarray(sc_inputs.valence_mask_active_kn, dtype=bool)
+        if sc_mode else np.broadcast_to(
+            (np.arange(nb) + b0 < int(meta.nelec))[None, :],
+            e_dft_ry.shape))
+    if sc_mode and not ks.is_identity:
+        valence_mask_kn = np.asarray(ks.select(valence_mask_kn), dtype=bool)
 
     # EQP2 changes eigenvalues only, but metals still need the same fixed-N
     # chemical potential and three-way valence/crossing/conduction split as
     # the main SC map.  On an insulator this closure is never called and the
     # established fixed-band-cut midgap path remains exact.
-    use_mp1 = bool(getattr(config, "occ_smearing_family", None))
-    if use_mp1:
+    use_mp1 = bool(
+        sc_context.get("occupation_state") is not None
+        if sc_mode else getattr(config, "occ_smearing_family", None))
+    if use_mp1 and not sc_mode:
         from psp.get_DFT_mtxels import spin_degeneracy_factor
         from .efermi import solve_mp1_occupations
 
@@ -1531,18 +1605,22 @@ def run_fixed_sigma_evsc(
                 clamp_tol=float(config.occupation_clamp_tol))
 
         efermi_dft_scissor_ry, _ = _occupation_state(e_dft_ry)
-    else:
+    elif not sc_mode:
         efermi_dft_scissor_ry = float(
             _midgap_efermi(jnp.asarray(e_dft_ry), n_occ))
+    else:
+        efermi_dft_scissor_ry = float(sc_inputs.efermi_dft_ry)
 
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import KStarMap
-    kstar = KStarMap.identity(nk)
-    tol_ev = float(config.eqp2.tol_ev)
-    max_iter = int(config.eqp2.max_iter)
-    accelerator = str(config.eqp2.accelerator)
-    history_depth = int(config.eqp2.history_depth)
+    kstar = ks if sc_mode else KStarMap.identity(nk)
+    controls = config.sc if sc_mode else config.eqp2
+    tol_ev = float(controls.tol_ev)
+    max_iter = int(controls.max_iter)
+    accelerator = str(controls.accelerator)
+    history_depth = int(controls.history_depth)
+    cycle_label = "SC fixed table" if sc_mode else "EQP2"
     eigh_kind = _resolve_sc_eigh(nb, mesh_xy, config, print_fn=print_fn)
 
     # The seed's eigensystem is exactly the DFT input basis.  Using this
@@ -1550,9 +1628,13 @@ def run_fixed_sigma_evsc(
     # makes the first map evaluation exactly the requested one-shot
     # Sigma_mn(E_m^DFT)+Sigma_mn(E_n^DFT) construction, including inside a
     # degenerate DFT manifold where a generic eigh may choose another gauge.
-    H_seed_host = np.zeros((nk, nb, nb), dtype=np.complex128)
-    H_seed_host[:, np.arange(nb), np.arange(nb)] = e_dft_ry
-    H_seed = _place(H_seed_host, mesh_xy, rotation_spec)
+    if sc_mode:
+        H_seed = _place(
+            sc_context["H_seed_dft_ry"], mesh_xy, rotation_spec)
+    else:
+        H_seed_host = np.zeros((nk, nb, nb), dtype=np.complex128)
+        H_seed_host[:, np.arange(nb), np.arange(nb)] = e_dft_ry
+        H_seed = _place(H_seed_host, mesh_xy, rotation_spec)
 
     def _eigh(H):
         H = _place(H, mesh_xy, rotation_spec)
@@ -1560,6 +1642,10 @@ def run_fixed_sigma_evsc(
             H, kind=eigh_kind, mesh_xy=mesh_xy, config=config)
 
     def _candidate_efermi(H):
+        if sc_mode:
+            return _partitioned_candidate_efermi(
+                H, inputs=sc_inputs, kstar=kstar, n_occ=n_occ,
+                use_mp1=use_mp1)
         e_candidate, _ = _eigh(H)
         if use_mp1:
             mu_ry, _ = _occupation_state(e_candidate)
@@ -1567,26 +1653,29 @@ def run_fixed_sigma_evsc(
         return float(_midgap_efermi(e_candidate, n_occ))
 
     map_calls = [0]
+    last_fixed_map = [None]
 
     def _fixed_map(H_dft):
         call_index = map_calls[0]
         H_dft = _place(H_dft, mesh_xy, rotation_spec)
         H_dft = 0.5 * (
             H_dft + jnp.conj(jnp.swapaxes(H_dft, -1, -2)))
-        if call_index == 0:
+        if call_index == 0 and not sc_mode:
             e_in_ry = e_dft_ry
             U_dft_to_qp = U_seed
         else:
             e_in_j, U_dft_to_qp = _eigh(H_dft)
             e_in_ry = np.asarray(e_in_j, dtype=np.float64)
 
-        if use_mp1:
+        if use_mp1 and not sc_mode:
             from .scissor import classify_scissor_bands
             _, f_in = _occupation_state(e_in_ry)
             band_classes = classify_scissor_bands(f_in)
             if call_index == 0:
                 print_fn(
                     f"    EQP2 scissor classes: {band_classes.summary()}")
+        elif sc_mode:
+            band_classes = sc_context["band_classes"]
         else:
             band_classes = None
 
@@ -1626,7 +1715,8 @@ def run_fixed_sigma_evsc(
 
         sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
             sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
-            replicated_output=False)
+            replicated_output=False,
+            offdiagonal_efermi_ev=(0.0 if sc_mode else None))
         if int(diagnostics["n_clipped"]) != int(n_out):
             raise RuntimeError(
                 "run_fixed_sigma_evsc: omega_coverage/build_qsgw_sigma_xc "
@@ -1643,13 +1733,41 @@ def run_fixed_sigma_evsc(
         H_full = h0_dft + sigma_xc_dft
         H_full = 0.5 * (
             H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
+        if sc_mode:
+            # Match the main SC map's accidental-degeneracy and named-buffer
+            # policy.  The shared scissor helper below remains the sole owner
+            # of the three-way band replacement.
+            if not bool(getattr(config, "no_degen_averaging", False)):
+                from .degen_average import average_matrix_diagonal
+                delta_h = average_matrix_diagonal(
+                    H_full - jnp.asarray(kin_ion_dft_ry),
+                    energies_kn_ry=e_dft_ry,
+                    tol_ry=(float(config.sc.exact_degeneracy_tol_ev)
+                            / RYD_TO_EV),
+                    mesh_xy=mesh_xy)
+                H_full = jnp.asarray(kin_ion_dft_ry) + delta_h
+            buffer_mask = np.asarray(
+                sc_context.get("buffer_mask", np.zeros(nb, dtype=bool)),
+                dtype=bool)
+            if (buffer_mask.any()
+                    and config.sc.buffer_mode == "carry"):
+                H_full = _carry_sc_buffer_diagonal(
+                    H_full, H_dft, jnp.asarray(buffer_mask, dtype=bool))
         H_out, _ = _apply_scissor_partition_policy(
             H_full, e_dft_ry, valence_mask_kn, partition, kstar,
             efermi_dft_ry=efermi_dft_scissor_ry,
             n_occ=n_occ,
             candidate_efermi_fn=_candidate_efermi,
             band_classes=band_classes,
-            label="EQP2", print_fn=print_fn)
+            scissor_fit=(sc_context.get("scissor_fit")
+                         if sc_mode else None),
+            use_valence_fit=(
+                config.sc.tail_fit == "buffer_edges" if sc_mode else False),
+            label=("SC fixed table" if sc_mode else "EQP2"),
+            print_fn=print_fn)
+        if sc_mode and not kstar.is_identity:
+            _check_kstar_spread(
+                kstar, kstar.broadcast(H_out), print_fn=print_fn)
         H_out = _place(H_out, mesh_xy, rotation_spec)
         sanity.refuse_nonfinite(
             f"eqp2 H map call {call_index + 1}", H_out,
@@ -1665,10 +1783,11 @@ def run_fixed_sigma_evsc(
             protected, in_range, tol_ev)
         residual_ev = float(verdict.max_abs_ev)
         map_calls[0] += 1
+        last_fixed_map[0] = (H_out, e_out_ry, U_out, residual_ev)
         return H_out, e_out_ry, U_out, residual_ev
 
     print_fn(
-        f"[ EQP2 | fixed Sigma(omega), screening unchanged | "
+        f"[ {cycle_label} | fixed Sigma(omega), screening unchanged | "
         f"criterion max|dE| over non-scissored states "
         f"<= {tol_ev * 1e3:.3f} meV | "
         f"accelerator {accelerator} | max_iter {max_iter} ]")
@@ -1677,7 +1796,7 @@ def run_fixed_sigma_evsc(
         """Evaluate once after the putative final rotation/scissor."""
         H_check, e_check, U_check, residual_check = _fixed_map(H)
         print_fn(
-            f"[ EQP2 | final post-rotation verification ({source}) | "
+            f"[ {cycle_label} | final post-rotation verification ({source}) | "
             f"max|dE| {residual_check * 1e3:.6f} meV | "
             f"{'VERIFIED' if residual_check <= tol_ev else 'resume'} ]")
         return H_check, e_check, U_check, residual_check
@@ -1687,7 +1806,7 @@ def run_fixed_sigma_evsc(
         for iteration in range(1, max_iter + 1):
             H, e_out_ry, U_out, residual_ev = _fixed_map(H)
             print_fn(
-                f"[ EQP2 | Picard {iteration:02d}/{max_iter:02d} | "
+                f"[ {cycle_label} | Picard {iteration:02d}/{max_iter:02d} | "
                 f"max|dE| {residual_ev * 1e3:.6f} meV | "
                 f"{'CONVERGED' if residual_ev <= tol_ev else 'continue'} ]")
             if residual_ev <= tol_ev:
@@ -1696,12 +1815,14 @@ def run_fixed_sigma_evsc(
                 if residual_ev <= tol_ev:
                     return FixedSigmaEVSCResult(
                         energies_ry=e_out_ry, U_dft_to_qp=U_out,
+                        H_qp_dft_ry=H,
                         iterations=map_calls[0], residual_ev=residual_ev)
     else:
         from mixing.acceleration import rcrop_nojit
 
         class _EQP2Converged(Exception):
-            def __init__(self, energies, rotations, residual):
+            def __init__(self, H, energies, rotations, residual):
+                self.H = H
                 self.energies = energies
                 self.rotations = rotations
                 self.residual = residual
@@ -1718,18 +1839,18 @@ def run_fixed_sigma_evsc(
             role = ("initial" if call_index == 0 else
                     "trial" if call_index % 2 else "accepted")
             print_fn(
-                f"[ EQP2 | rCROP residual {call_index + 1:02d} | {role} | "
+                f"[ {cycle_label} | rCROP residual {call_index + 1:02d} | {role} | "
                 f"max|dE| {residual * 1e3:.6f} meV | "
                 f"{'CONVERGED' if residual <= tol_ev else 'continue'} ]")
             if role != "trial":
                 last_accepted_residual[0] = residual
                 if residual <= tol_ev:
-                    _, e_check, U_check, residual_check = _verify_final_map(
+                    H_check, e_check, U_check, residual_check = _verify_final_map(
                         H_out, source=f"rCROP {role} {call_index + 1:02d}")
                     last_accepted_residual[0] = residual_check
                     if residual_check <= tol_ev:
                         raise _EQP2Converged(
-                            e_check, U_check, residual_check)
+                            H_check, e_check, U_check, residual_check)
             return _place(H_out - H_in, mesh_xy, rotation_spec)
 
         try:
@@ -1741,10 +1862,24 @@ def run_fixed_sigma_evsc(
             return FixedSigmaEVSCResult(
                 energies_ry=np.asarray(stop.energies, dtype=np.float64),
                 U_dft_to_qp=stop.rotations,
+                H_qp_dft_ry=stop.H,
                 iterations=map_calls[0],
                 residual_ev=float(stop.residual),
             )
         residual_ev = last_accepted_residual[0]
+
+    if sc_mode and last_fixed_map[0] is not None:
+        H_last, e_last, U_last, residual_ev = last_fixed_map[0]
+        print_fn(
+            f"[ {cycle_label} | STALLED after {map_calls[0]} map "
+            f"evaluations at max|dE|={residual_ev * 1e3:.6f} meV; "
+            "returning the last evaluated table map so frozen-W Sigma can "
+            "be rebuilt ]")
+        return FixedSigmaEVSCResult(
+            energies_ry=np.asarray(e_last, dtype=np.float64),
+            U_dft_to_qp=U_last, H_qp_dft_ry=H_last,
+            iterations=map_calls[0], residual_ev=float(residual_ev),
+            converged=False)
 
     raise RuntimeError(
         "eqp2 fixed-Sigma eigenvalue self-consistency did not converge: "
@@ -2362,6 +2497,23 @@ def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
     """Current partition, with compatibility for synthetic bare states."""
     return state.partition if state.partition is not None else inputs.partition
+
+
+def _include_fixed_table_verdict(
+    state: SCState,
+    verdict: ConvergenceVerdict,
+    inputs: SCInputs,
+) -> ConvergenceVerdict:
+    """Prevent an outer/inner stop while the innermost table cycle stalled."""
+    if not bool(getattr(inputs, "two_level_enabled", False)) or state.outputs is None:
+        return verdict
+    if bool(getattr(state.outputs, "fixed_sigma_cycle_converged", True)):
+        return verdict
+    if verdict.converged:
+        inputs.print_fn(
+            "  SC convergence held: the Sigma-rebuild residual is below "
+            "cutoff but its innermost fixed-Sigma table cycle stalled")
+    return replace(verdict, converged=False)
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
@@ -3079,6 +3231,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # returns (see ``dump_sigma_omega_h5_final``).
     # Same metal-only threading as the screening step above: Σ_x/SX
     # diag(f), Σ_c branch weights, and the metal E_F reference.
+    w_time_factor_cache = (
+        frozen_screening.w_time_factor_cache
+        if frozen_screening is not None else
+        {} if inputs.two_level_enabled else None)
+    sigma_wall_start = time.perf_counter()
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -3112,8 +3269,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         qsgw_offdiagonal_efermi_ev=(
             None if int(state.iteration) == 0 else 0.0),
         frozen_screening_model=frozen_screening is not None,
+        w_time_factor_cache=w_time_factor_cache,
         print_fn=inputs.print_fn,
     )
+    sigma_wall = time.perf_counter() - sigma_wall_start
+    if inputs.two_level_cost is not None:
+        walls = inputs.two_level_cost.setdefault("sigma_walls_s", [])
+        walls.append(float(sigma_wall))
+        inputs.print_fn(
+            f"[ SC cost | Sigma(omega) evaluation {len(walls)} | "
+            f"wall={sigma_wall:.6f} s | "
+            f"screening={'frozen' if frozen_screening is not None else 'refit'} ]")
     if bool(sigma_result.hartree_omitted) != (exact_hartree_dft is not None):
         raise RuntimeError(
             "SigmaResult Hartree-omission receipt disagrees with the "
@@ -3286,6 +3452,43 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         scissor_fit=tail_fit,
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
+    fixed_sigma_cycle_converged = True
+    if inputs.two_level_enabled:
+        fixed_exact_hartree = None
+        if exact_hartree_terms is not None:
+            scalar, transverse = exact_hartree_terms
+            fixed_exact_hartree = SCExactHartree(
+                scalar_dft=scalar, transverse_dft=transverse,
+                efermi_ry=float(exact_hartree_dft.efermi_ry))
+        fixed_cycle = run_fixed_sigma_evsc(
+            sigma_result, inputs.kin_ion_dft,
+            np.asarray(e_dft_act, dtype=np.float64),
+            config=inputs.config, meta=inputs.meta,
+            band_slices=inputs.band_slices, wfn=inputs.wfn,
+            mesh_xy=inputs.mesh_xy,
+            sc_context={
+                "inputs": inputs,
+                # The expensive Sigma evaluation above already produced the
+                # first fixed-table map.  Start at that candidate and spend
+                # only the additional cheap rotate/interpolate/eigh maps.
+                "H_seed_dft_ry": H_qp_dft_new,
+                "sigma_basis_U": U_full,
+                "partition": partition,
+                "band_classes": scissor_classes,
+                "scissor_fit": tail_fit,
+                "buffer_mask": buffer_mask,
+                "occupation_state": entry_occ_state,
+                "exact_hartree_dft": fixed_exact_hartree,
+            },
+            print_fn=inputs.print_fn,
+        )
+        H_qp_dft_new = fixed_cycle.H_qp_dft_ry
+        fixed_sigma_cycle_converged = bool(fixed_cycle.converged)
+        inputs.print_fn(
+            "[ SC fixed table receipt | "
+            f"maps={fixed_cycle.iterations}, "
+            f"max|dE|={fixed_cycle.residual_ev * 1e3:.6f} meV, "
+            f"converged={fixed_cycle.converged} ]")
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
     # rewrote.  The partition is precisely the operation that could break the
@@ -3369,8 +3572,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 iteration_head=iteration_head,
                 static_head_terms=iteration_static_head_terms,
                 sigma_model=W_by_role,
+                w_time_factor_cache=w_time_factor_cache,
             ),
             exact_hartree_dft=exact_hartree_dft,
+            fixed_sigma_cycle_converged=fixed_sigma_cycle_converged,
         ),
     )
 
@@ -4080,6 +4285,7 @@ def run_self_consistency(
             np.asarray(_state_partition(state_new, inputs).in_range_mask,
                        dtype=bool).reshape(-1),
             tol_ev)
+        verdict = _include_fixed_table_verdict(state_new, verdict, inputs)
         state_new = replace(state_new, convergence_verdict=verdict)
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
@@ -4211,6 +4417,7 @@ def _run_linear_mixing(
             np.asarray(_state_partition(state_map, inputs).in_range_mask,
                        dtype=bool),
             tol_ev)
+        verdict = _include_fixed_table_verdict(state_map, verdict, inputs)
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
         # a stamp computed from ``E_new_ev`` (post-mix) described a
@@ -4476,6 +4683,8 @@ def _run_rcrop(
             np.asarray(_state_partition(state_out, inputs).in_range_mask,
                        dtype=bool),
             tol_ev)
+        _verdict = _include_fixed_table_verdict(
+            state_out, _verdict, inputs)
         _last_verdict[0] = _verdict
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
@@ -5189,6 +5398,10 @@ def run_sc_driver(
         screening_seed_cache={},
         fixed_quadrature_session=(
             {} if int(config.sc.max_iter) > 1 else None),
+        two_level_enabled=int(config.sc.max_iter) > 1,
+        two_level_cost=(
+            {"sigma_walls_s": [], "w_refits": 0}
+            if int(config.sc.max_iter) > 1 else None),
         print_fn=print_fn,
         record_fn=record_fn,
     )
@@ -5305,7 +5518,8 @@ def run_sc_driver(
     # W0 is the only large object in the final-map payload.  Drop it before
     # WFN/sigma artifact construction; the tiny head/term provenance remains.
     screening = dataclasses.replace(
-        screening, static_w=None, sigma_model=None)
+        screening, static_w=None, sigma_model=None,
+        w_time_factor_cache=None)
     state_final = dataclasses.replace(
         state_final,
         outputs=dataclasses.replace(

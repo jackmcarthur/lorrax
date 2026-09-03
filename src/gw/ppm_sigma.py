@@ -1002,6 +1002,7 @@ def compute_sigma_c_ppm_omega_grid(
     occupation_state=None,
     plan: 'BandBracketPlan | None' = None,
     fixed_quadrature_session=None,
+    w_time_factor_cache=None,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
@@ -1147,6 +1148,7 @@ def compute_sigma_c_ppm_omega_grid(
         band_brackets=plan.bounds,
         band_counts=plan.counts,
         fixed_quadrature_session=fixed_quadrature_session,
+        w_time_factor_cache=w_time_factor_cache,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:

@@ -16,6 +16,7 @@ from gw.sc_iteration import (
     _sigma_c_at_dft_diag_from_dft_cube,
     run_fixed_sigma_evsc,
 )
+from gw.band_partition import BandPartition
 from gw.sigma_dispatch import SigmaResult
 from gw.wavefunction_bundle import BandSlices
 
@@ -25,7 +26,12 @@ def _config(*, tol_ev=1.0e-9, max_iter=30, accelerator="linear"):
         eqp2=SimpleNamespace(
             tol_ev=tol_ev, max_iter=max_iter, accelerator=accelerator,
             history_depth=5),
-        sc=SimpleNamespace(eigh="native"),
+        sc=SimpleNamespace(
+            eigh="native", tol_ev=tol_ev, max_iter=max_iter,
+            accelerator=accelerator, history_depth=5,
+            exact_degeneracy_tol_ev=1.0e-4,
+            buffer_mode="one_sided", tail_fit="frontier"),
+        no_degen_averaging=True,
         memory=SimpleNamespace(per_device_gb=4.0),
     )
 
@@ -325,3 +331,53 @@ def test_fixed_sigma_evsc_refuses_uncovered_energy_before_clamping():
             result, kin, e_dft_ry, config=_config(),
             **_band_context(e_dft_ry),
             mesh_xy=single_device_mesh(), print_fn=lambda *a: None)
+
+
+def test_sc_fixed_table_reuses_eqp2_engine_with_fermi_offdiagonals(
+        monkeypatch):
+    """The nested SC cycle enters the one fixed-table implementation."""
+    import gw.qsgw_utils as qsgw_utils
+
+    omega_ev = np.linspace(-2.0, 2.0, 9)
+    e_dft_ry = np.asarray([[-0.6, 0.7]]) / RYD_TO_EV
+    kin = jnp.asarray(np.diag(e_dft_ry[0])[None].astype(complex))
+    sigma_w = jnp.zeros((omega_ev.size, 1, 2, 2), dtype=jnp.complex128)
+    zero = jnp.zeros((1, 2, 2), dtype=jnp.complex128)
+    result = SigmaResult(
+        v_h_kij_ry=zero, sigma_x_kij_ry=zero,
+        sigma_xc_kij_ry=zero, sigma_c_omega_kij_ry=sigma_w,
+        omega_grid_ev=omega_ev, omega_grid_ry=omega_ev / RYD_TO_EV,
+        efermi_dft_ev=0.0)
+    cfg = _config(tol_ev=1.0e-10, max_iter=4)
+    mesh = single_device_mesh()
+    seen = []
+    owned_build = qsgw_utils.build_qsgw_sigma_xc
+
+    def recording_build(*args, **kwargs):
+        seen.append(kwargs.get("offdiagonal_efermi_ev"))
+        return owned_build(*args, **kwargs)
+
+    monkeypatch.setattr(qsgw_utils, "build_qsgw_sigma_xc", recording_build)
+    sc_inputs = SimpleNamespace(
+        kstar=None, kin_ion_dft=kin, mesh_xy=mesh, config=cfg,
+        valence_mask_active_kn=np.asarray([[True, False]]),
+        efermi_dft_ry=0.0)
+    context = {
+        "inputs": sc_inputs,
+        "H_seed_dft_ry": kin,
+        "sigma_basis_U": jnp.asarray(np.eye(2)[None], dtype=jnp.complex128),
+        "partition": BandPartition.all_protected(2),
+        "band_classes": None,
+        "scissor_fit": None,
+        "buffer_mask": np.zeros(2, dtype=bool),
+        "occupation_state": None,
+        "exact_hartree_dft": None,
+    }
+    got = run_fixed_sigma_evsc(
+        result, kin, e_dft_ry, config=cfg,
+        **_band_context(e_dft_ry), mesh_xy=mesh,
+        sc_context=context, print_fn=lambda *a: None)
+
+    assert got.converged
+    assert got.H_qp_dft_ry.shape == kin.shape
+    assert seen and all(value == 0.0 for value in seen)

@@ -3,7 +3,10 @@
 The outer map rebuilds chi0, W, and the pole model once.  Its inner solve
 then calls :func:`gw.sc_iteration.gw_iteration_map` with that screening
 transaction frozen, so only the current Green function/orbitals and Sigma are
-rebuilt.  No screening or self-energy equation is duplicated here.
+rebuilt.  Each expensive Sigma rebuild is followed by the existing
+fixed-Sigma-table evSC engine, which converges rotations and energies before
+another convolution is allowed.  No screening or self-energy equation is
+duplicated here.
 
 ``sc_max_iter`` deliberately bounds both the number of outer refits and each
 inner accelerator solve.  Reusing the existing cap avoids a second convergence
@@ -39,13 +42,31 @@ def _verdict(state_out, state_in, inputs, eigvalsh_kshard, tol_ev,
              sc_iteration):
     """Protected-state residual of one outer or first-inner map."""
     partition = sc_iteration._state_partition(state_out, inputs)
-    return sc_iteration.protected_band_convergence(
+    verdict = sc_iteration.protected_band_convergence(
         _eigenvalues_ev(state_out.H_qp_dft, eigvalsh_kshard),
         _eigenvalues_ev(state_in.H_qp_dft, eigvalsh_kshard),
         np.asarray(partition.protected_mask, dtype=bool),
         np.asarray(partition.in_range_mask, dtype=bool),
         float(tol_ev),
     )
+    return sc_iteration._include_fixed_table_verdict(
+        state_out, verdict, inputs)
+
+
+def _cost_receipt(inputs):
+    """Print the measured expensive-evaluation count and walls once."""
+    ledger = getattr(inputs, "two_level_cost", None)
+    if ledger is None:
+        return
+    walls = [float(value) for value in ledger.get("sigma_walls_s", ())]
+    total = float(sum(walls))
+    inputs.print_fn(
+        "[ SC two-level cost | "
+        f"W_refits={int(ledger.get('w_refits', 0))}, "
+        f"Sigma(omega)_evaluations={len(walls)}, "
+        f"Sigma_wall_total={total:.6f} s, "
+        f"Sigma_wall_mean={(total / len(walls) if walls else 0.0):.6f} s, "
+        f"Sigma_wall_each={walls} ]")
 
 
 def run_two_level_self_consistency(
@@ -75,7 +96,8 @@ def run_two_level_self_consistency(
         L-infinity protected-state cutoff for both inner and outer changes.
     accelerator, history_depth : str, int
         Existing inner-solve rCROP/linear controls.  A fresh invocation is
-        made after every W refit, which resets rCROP history by construction.
+        made after every W refit, which resets rCROP history by construction;
+        the same controls bound each innermost fixed-table cycle.
     mixing : float
         Existing ``sc_mixing`` coefficient.  It remains the Picard damping
         for a linear inner solve and also linearly mixes the outer Hamiltonian
@@ -140,6 +162,9 @@ def run_two_level_self_consistency(
             reset_diagnostics=(outer_index == 0),
             snapshot_offset=snapshot_offset,
         )
+        ledger = getattr(inputs, "two_level_cost", None)
+        if ledger is not None:
+            ledger["w_refits"] = int(ledger.get("w_refits", 0)) + 1
         snapshot_offset += 1
         if first_map.outputs is None:
             raise RuntimeError(
@@ -199,6 +224,7 @@ def run_two_level_self_consistency(
                 f"[ SC outer {outer_number} | INNER NOT CONVERGED after "
                 f"{inner_calls} map calls; outer W will not be refitted | "
                 f"{inner_verdict.summary()} ]")
+            _cost_receipt(inputs)
             return inner_final, residual_history
 
         # Outer residual is the unmixed fixed point at the newly fitted W
@@ -216,6 +242,7 @@ def run_two_level_self_consistency(
             inputs.print_fn(
                 f"[ SC two-level CONVERGED after {outer_number} W refits "
                 f"and {snapshot_offset} total map calls ]")
+            _cost_receipt(inputs)
             return last_inner, residual_history
 
         if outer_number < int(max_iter):
@@ -250,6 +277,7 @@ def run_two_level_self_consistency(
     inputs.print_fn(
         f"[ SC two-level NOT CONVERGED after {max_iter} W refits | "
         f"{last_outer_verdict.summary()} ]")
+    _cost_receipt(inputs)
     return last_inner, residual_history
 
 

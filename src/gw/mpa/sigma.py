@@ -18,7 +18,11 @@ from gw.ppm_sigma import (SigmaOmegaResult,
                           _residue_for_space,
                           assert_sharded_sigma_window_divides_mesh,
                           pad_sigma_window, strip_sigma_window)
-from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+from gw.ppm_tau_kernel import (
+    get_shared_sigma_spatial_kernel,
+    get_shared_sigma_tau_kernel,
+    get_shared_w_tau_kernel,
+)
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_box_plan import plan_sigma_windows
 from gw.sigma_plan import resolve_sigma_plan
@@ -138,6 +142,7 @@ def _integrate_sigma_batches(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
+    w_time_factor_cache=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -249,6 +254,26 @@ def _integrate_sigma_batches(
         brackets=brackets,
         pack_brackets=pack_brackets,
         **face_kwargs)
+    w_builder = spatial_kernel = None
+    cache_bank = None
+    cache_cursor = 0
+    cache_hits = cache_misses = 0
+    if w_time_factor_cache is not None:
+        # Separate banks are required for an ordered-residue fit: the
+        # production B+/-D execution and its D=0 observability twin have
+        # different W(tau), although each is immutable across frozen-W SC
+        # maps.  The cache object itself is scoped to one outer screening
+        # transaction, so its slot order is a sufficient artifact identity;
+        # every slot also carries an exact scalar/selector signature and a
+        # later map refuses if that order or geometry drifts.
+        banks = w_time_factor_cache.setdefault("banks", {})
+        bank_name = "odd_off" if odd_residue_off else "production"
+        cache_bank = banks.setdefault(
+            bank_name, {"signatures": [], "factors": [], "complete": False})
+        w_builder = get_shared_w_tau_kernel(mesh_xy=mesh_xy)
+        spatial_kernel = get_shared_sigma_spatial_kernel(
+            mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
+            pack_brackets=pack_brackets, **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
@@ -294,13 +319,29 @@ def _integrate_sigma_batches(
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
                     jnp.asarray(first_t, dtype=jnp.complex128))
-                if hasattr(tau_kernel, "lower"):
+                if w_time_factor_cache is None and hasattr(tau_kernel, "lower"):
                     tau_kernel.lower(*prewarm_args).compile()
-                else:
+                elif w_time_factor_cache is None:
                     # The stage-split diagnostic is a Python dispatcher over
                     # separately-jitted stages.  Execute one real-shape call
                     # to prewarm the same kernels the timed sweep will use.
                     jax.block_until_ready(tau_kernel(*prewarm_args))
+                else:
+                    w_args = (
+                        B_branch, Omega, pole_indices, bounds, phase_real,
+                        jnp.asarray(win.E_ref_B),
+                        jnp.asarray(first_t, dtype=jnp.complex128))
+                    W_first = w_builder(*w_args)
+                    spatial_args = (
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
+                        row.E_A, selector, jnp.asarray(win.E_ref_A),
+                        jnp.asarray(first_t, dtype=jnp.complex128), W_first)
+                    if hasattr(spatial_kernel, "lower"):
+                        spatial_kernel.lower(*spatial_args).compile()
+                    else:
+                        jax.block_until_ready(spatial_kernel(*spatial_args))
+                    del W_first
                 accumulator.precompile_tau_add(
                     sigma_shape=sigma_shape,
                     sigma_sharding=sigma_sharding)
@@ -317,14 +358,52 @@ def _integrate_sigma_batches(
                 omega_values=row.omega_abs)
             for t in np.asarray(
                     jax.device_get(win.nodes.t), np.complex128):
-                sigma_tau = tau_kernel(
-                    psi_coh_xn, psi_coh_yr,
-                    psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B_branch, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A),
-                    jnp.asarray(win.E_ref_B),
-                    jnp.asarray(t, dtype=jnp.complex128))
+                if w_time_factor_cache is None:
+                    sigma_tau = tau_kernel(
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
+                        row.E_A, selector, B_branch, Omega,
+                        pole_indices, bounds, phase_real,
+                        jnp.asarray(win.E_ref_A),
+                        jnp.asarray(win.E_ref_B),
+                        jnp.asarray(t, dtype=jnp.complex128))
+                else:
+                    signature = (
+                        int(lo), int(width), str(row.space),
+                        complex(np.asarray(win.E_ref_B)), complex(t),
+                        np.asarray(pole_indices).tobytes(),
+                        np.asarray(bounds).tobytes(),
+                        np.asarray(phase_real).tobytes(),
+                    )
+                    if bool(cache_bank["complete"]):
+                        if cache_cursor >= len(cache_bank["signatures"]):
+                            raise RuntimeError(
+                                "GATE sc_w_time_cache_shape: frozen W(tau) "
+                                "execution requested more factors than its "
+                                "outer producer cached")
+                        if signature != cache_bank["signatures"][cache_cursor]:
+                            raise RuntimeError(
+                                "GATE sc_w_time_cache_identity: a frozen-W "
+                                "inner map changed a W-side tau node, pole "
+                                "selector, or reference; no replanning is "
+                                "allowed inside the two-level loop")
+                        W_t = cache_bank["factors"][cache_cursor]
+                        cache_hits += 1
+                    else:
+                        W_t = w_builder(
+                            B_branch, Omega, pole_indices, bounds, phase_real,
+                            jnp.asarray(win.E_ref_B),
+                            jnp.asarray(t, dtype=jnp.complex128))
+                        W_t.block_until_ready()
+                        cache_bank["signatures"].append(signature)
+                        cache_bank["factors"].append(W_t)
+                        cache_misses += 1
+                    cache_cursor += 1
+                    sigma_tau = spatial_kernel(
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
+                        row.E_A, selector, jnp.asarray(win.E_ref_A),
+                        jnp.asarray(t, dtype=jnp.complex128), W_t)
                 accumulator.add_tau(sigma_tau)
                 n_tau += 1
             accumulator.end_window()
@@ -354,6 +433,25 @@ def _integrate_sigma_batches(
         f"({n_poles} poles, batches of {batch_size}); "
         f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
+    if cache_bank is not None:
+        if bool(cache_bank["complete"]):
+            if cache_cursor != len(cache_bank["signatures"]):
+                raise RuntimeError(
+                    "GATE sc_w_time_cache_shape: frozen W(tau) execution "
+                    f"consumed {cache_cursor} of "
+                    f"{len(cache_bank['signatures'])} cached factors")
+        else:
+            cache_bank["complete"] = True
+        global_bytes = sum(int(value.nbytes)
+                           for value in cache_bank["factors"])
+        print_fn(
+            "  SC frozen W(tau) cache: "
+            f"bank={('odd_off' if odd_residue_off else 'production')}, "
+            f"hits={cache_hits}, misses={cache_misses}, "
+            f"factors={len(cache_bank['factors'])}, "
+            f"global={global_bytes / 2**20:.2f} MiB, "
+            f"about {global_bytes / max(int(mesh_xy.size), 1) / 2**20:.2f} "
+            "MiB/device")
     ratio = None
     if max_b or max_d:
         ratio = max_d / max_b if max_b else np.inf
@@ -404,6 +502,7 @@ def integrate_sigma_store(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
+    w_time_factor_cache=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -438,6 +537,7 @@ def integrate_sigma_store(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
+            w_time_factor_cache=w_time_factor_cache,
             print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
@@ -523,6 +623,7 @@ def compute_sigma_c_mpa_omega_grid(
     band_brackets=None,
     band_counts=None,
     fixed_quadrature_session=None,
+    w_time_factor_cache=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -665,6 +766,7 @@ def compute_sigma_c_mpa_omega_grid(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
+            w_time_factor_cache=w_time_factor_cache,
             print_fn=print_fn)
         if not ordered_residues:
             return total
@@ -677,6 +779,7 @@ def compute_sigma_c_mpa_omega_grid(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=True,
+            w_time_factor_cache=w_time_factor_cache,
             print_fn=lambda *args, **kwargs: None)
         return _attach_ordered_odd_sigma(total, even)
 

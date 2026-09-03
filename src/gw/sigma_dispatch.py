@@ -681,6 +681,7 @@ def compute_sigma_xc(
     fixed_quadrature_session=None,
     qsgw_offdiagonal_efermi_ev: float | None = None,
     frozen_screening_model: bool = False,
+    w_time_factor_cache=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -1335,6 +1336,7 @@ def compute_sigma_xc(
             fixed_quadrature_session=(
                 None if fixed_quadrature_session is None else
                 fixed_quadrature_session.setdefault("mpa", {})),
+            w_time_factor_cache=w_time_factor_cache,
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
@@ -1440,6 +1442,7 @@ def compute_sigma_xc(
         fixed_quadrature_session=(
             None if fixed_quadrature_session is None else
             fixed_quadrature_session.setdefault("ppm", {})),
+        w_time_factor_cache=w_time_factor_cache,
         print_fn=print_fn,
     )
 
