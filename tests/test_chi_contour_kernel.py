@@ -486,14 +486,20 @@ def test_static_fractional_finite_q_matches_divided_difference():
             kminq_rows=kminq)
 
     shifted_z = 2.0e-5j
+    progress = []
     shifted = w_isdf.compute_chi0_direct_fractional(
         wfns, np.asarray([shifted_z]),
         SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
-        occupation_state=state, kminq_rows=kminq)
+        occupation_state=state, kminq_rows=kminq,
+        progress_fn=lambda done, total, elapsed: progress.append(
+            (done, total, elapsed)))
     np.testing.assert_allclose(
         np.asarray(jax.device_get(shifted)),
         _dense_dynamic_finite_q(psi, enk, occ, kminq, shifted_z),
         rtol=3e-13, atol=3e-13)
+    assert [(done, total) for done, total, _ in progress] == [
+        (i, nk) for i in range(1, nk + 1)]
+    assert all(elapsed >= 0.0 for _, _, elapsed in progress)
 
 
 def test_origin_row_static_value_bounds_the_shifted_sample():
@@ -586,8 +592,10 @@ def test_metal_plan_dispatch_census(monkeypatch):
                 def at(self, *a):  # pragma: no cover - override path unused
                     raise AssertionError("no override in census")
                 block_until_ready = staticmethod(lambda: None)
-            return np.zeros((3, 2, 2), np.complex128) if wedge else \
-                np.zeros((3, 2, 2), np.complex128)
+            value = np.zeros((3, 2, 2), np.complex128)
+            if name == "ordered_contour" and kwargs.get("return_reflected"):
+                return value, value
+            return value
         return _f
 
     monkeypatch.setattr(w_isdf, "compute_chi0", _fake("insulating_static"))
@@ -618,8 +626,11 @@ def test_metal_plan_dispatch_census(monkeypatch):
     routes = sample_plan.plan_routes(plan)
 
     model._evaluate_samples(
-        SimpleNamespace(enk=np.array([[0.0]]), occ=None), routes, quad,
-        config, meta=None, mesh_xy=None,
+        SimpleNamespace(
+            enk=np.array([[0.0]]), occ=None,
+            slices=SimpleNamespace(b0=0)), routes, quad,
+        config, meta=SimpleNamespace(b_id_4_chi_user=3), mesh_xy=None,
+        material_class="metal",
         sym=SimpleNamespace(trs_allowed=False), energy_reference=0.0,
         occupation_state=state,
         write_full=lambda p, chi: written.append(("full", p["role"])),
@@ -651,7 +662,8 @@ def test_metal_plan_dispatch_census(monkeypatch):
     model._evaluate_samples(
         SimpleNamespace(enk=np.array([[0.0]]), occ=None),
         sample_plan.plan_routes(plan_i), quad, config_i, meta=None,
-        mesh_xy=None, sym=SimpleNamespace(trs_allowed=True),
+        mesh_xy=None, material_class="insulator",
+        sym=SimpleNamespace(trs_allowed=True),
         energy_reference=0.0, occupation_state=None,
         write_full=lambda p, chi: written.append(("full", p["role"])),
         write_wedge=lambda p, chi: written.append(("wedge", p["role"])),
@@ -667,14 +679,17 @@ def test_metal_plan_dispatch_census(monkeypatch):
     calls.clear()
     written.clear()
     announced = []
+    reflected = []
     model._evaluate_samples(
         SimpleNamespace(enk=np.array([[0.0]]), occ=None),
         sample_plan.plan_routes(plan_i), quad, config_i,
         meta=SimpleNamespace(nkx=3, nky=1, nkz=1), mesh_xy=None,
+        material_class="insulator",
         sym=SimpleNamespace(trs_allowed=False), energy_reference=0.0,
         occupation_state=None,
         write_full=lambda p, chi: written.append(("full", p["role"])),
         write_wedge=lambda p, chi: written.append(("wedge", p["role"])),
+        write_reflected=lambda p, chi: reflected.append(p["role"]),
         static_gamma_override=None, gamma_row=None, kminq_rows=None,
         print_fn=lambda line: announced.append(line))
     assert calls.count("insulating_static") == 1
@@ -688,6 +703,7 @@ def test_metal_plan_dispatch_census(monkeypatch):
         model._evaluate_samples(
             SimpleNamespace(enk=None, occ=None), routes, quad, config,
             meta=None, mesh_xy=None, sym=SimpleNamespace(trs_allowed=False),
+            material_class="metal",
             energy_reference=0.0,
             occupation_state=None,
             write_full=lambda p, chi: None, write_wedge=lambda p, chi: None,

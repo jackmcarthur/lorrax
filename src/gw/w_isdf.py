@@ -52,6 +52,7 @@ resident single-axis copy.  See the design doc for the full derivation and
 why ``distrib_la.gemm_plan``/``GemmPlan.local_call`` do not apply here.
 """
 import os
+import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -2918,8 +2919,11 @@ def _fractional_pair_scan(
     """
     nk, nspinor, nmu_x, nb = psi_x_a.shape
     nmu_y = psi_y_a.shape[2]
-    nb_pad = ((int(nb) + tile - 1) // tile) * tile
-    pad = nb_pad - int(nb)
+    # A rank-padded carrier can be wider than the physical chi window.
+    # The logical mask makes those bands numerically zero, but a scan sized
+    # from the carrier would still pay their quadratic tile cost.
+    nb_pad = ((int(nb_logical) + tile - 1) // tile) * tile
+    pad = max(0, nb_pad - int(nb))
     pad4 = ((0, 0), (0, 0), (0, 0), (0, pad))
     pad2 = ((0, 0), (0, pad))
     pa_x_full = jnp.pad(psi_x_a, pad4)
@@ -3178,8 +3182,13 @@ def _fractional_pair_scan_face(
         gathered = jax.lax.psum(gathered, 'x')
         return jnp.transpose(gathered, (0, 2, 3, 1))
 
-    nb_pad = ((int(nb_full) + tile - 1) // tile) * tile
-    pad = nb_pad - int(nb_full)
+    # ``nb_full`` is a storage extent and can include rank-padding above the
+    # physical chi window.  Do not execute empty O(nb**2) tile pairs merely
+    # because the carrier is wider than ``nb_logical``.  Keep enough backing
+    # storage for a final partial tile, but size the scans from the logical
+    # sum extent.
+    nb_pad = ((int(nb_logical) + tile - 1) // tile) * tile
+    pad = max(0, nb_pad - int(nb_full))
     pad2 = ((0, 0), (0, pad))
     ea_full = jnp.pad(energy_a, pad2)
     eb_full = jnp.pad(energy_b, pad2)
@@ -3462,6 +3471,7 @@ def compute_chi0_direct_fractional(
     occupation_state,
     kminq_rows,
     nb_logical=None,
+    progress_fn=None,
 ):
     """Exact finite-occupation chi0 at selected complex frequencies.
 
@@ -3471,6 +3481,9 @@ def compute_chi0_direct_fractional(
     MP1 divided-difference limit; every nonzero entry is evaluated at its
     literal complex coordinate.  With one frequency the returned shape is
     ``(n_q,n_mu,n_mu)``; otherwise it is ``(n_z,n_q,n_mu,n_mu)``.
+    ``progress_fn``, when supplied, is called as
+    ``progress_fn(rows_done, rows_total, elapsed_seconds)`` after each q-row
+    result is device-ready.  It changes synchronization only, never values.
     """
     from gw.efermi import mp1_negative_derivative
 
@@ -3521,10 +3534,16 @@ def compute_chi0_direct_fractional(
         kernel = _get_chi_fractional_q_kernel(
             mesh_xy, nb_logical=nb_log,
             pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size)
-        rows = [
-            kernel(psi_x, psi_y, jnp.asarray(row), e, f, surface, jnp.asarray(z))
-            for row in kmq
-        ]
+        rows = []
+        for q_row, row in enumerate(kmq):
+            started = time.monotonic()
+            value = kernel(
+                psi_x, psi_y, jnp.asarray(row), e, f, surface,
+                jnp.asarray(z))
+            if progress_fn is not None:
+                value.block_until_ready()
+                progress_fn(q_row + 1, len(kmq), time.monotonic() - started)
+            rows.append(value)
         values = jnp.stack(rows, axis=1)
         return values[0] if z.size == 1 else values
     # face: wfns.enk is already (nk, nb_full) -- e/f/surface above are
@@ -3546,11 +3565,16 @@ def compute_chi0_direct_fractional(
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
         pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size)
-    rows = [
-        kernel(wfns.psi_mun, wfns.psi_nmu, jnp.asarray(row), e_full, f_full,
-               surface_full, jnp.asarray(z))
-        for row in kmq
-    ]
+    rows = []
+    for q_row, row in enumerate(kmq):
+        started = time.monotonic()
+        value = kernel(
+            wfns.psi_mun, wfns.psi_nmu, jnp.asarray(row), e_full, f_full,
+            surface_full, jnp.asarray(z))
+        if progress_fn is not None:
+            value.block_until_ready()
+            progress_fn(q_row + 1, len(kmq), time.monotonic() - started)
+        rows.append(value)
     values = jnp.stack(rows, axis=1)
     return values[0] if z.size == 1 else values
 
