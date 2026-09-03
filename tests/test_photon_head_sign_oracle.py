@@ -552,11 +552,15 @@ def run_case(mesh, sigma_H, *, wings=True, seed=20260901,
     moments, D_mean = reference_moments(
         receipt, S_eff, np.asarray(sigma_H, dtype=np.float64),
         ct_sign=ct_sign, tt_sign=tt_sign)
-    V_ref, W_ref = reference_insertion(
-        fixture, moments, D_mean, cell_volume)
-
     got_moments = np.asarray(evidence.screened_moments)
     got_D = np.asarray(evidence.bare_D_mean)
+    # The inverse oracle owns the screened moments.  The bare V insertion
+    # uses the completion's already-certified <D>: re-reducing up to 383328
+    # rows in NumPy gives a different tree from XLA and can add ~1e-13 of
+    # platform-only summation drift to an otherwise exact reattachment check.
+    # ``bare_D`` below remains the independent provider-to-kernel comparison.
+    V_ref, W_ref = reference_insertion(
+        fixture, moments, got_D, cell_volume)
     residual = {
         "bare_D": _rel(got_D, D_mean),
         "bare_D_flipped": _rel(got_D, -D_mean),

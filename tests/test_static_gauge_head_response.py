@@ -47,7 +47,8 @@ def _mesh():
 def test_q0_factor_update_rank_is_derived_not_truncated():
     from jax.sharding import NamedSharding, PartitionSpec as P
     from gw.photon_layout import (
-        PhotonBasisLayout, add_photon_q0_low_rank)
+        PhotonBasisLayout, add_photon_q0_low_rank,
+        pack_photon_channel_vectors)
 
     mesh = _mesh()
     layout = PhotonBasisLayout.from_centroid_extents(2, 2, mesh)
@@ -59,6 +60,16 @@ def test_q0_factor_update_rank_is_derived_not_truncated():
         rank * layout.packed_extent, dtype=np.float64).reshape(
             rank, layout.packed_extent).astype(np.complex128)
     right = (left + 0.5j).astype(np.complex128)
+    channel_ones = []
+    for channel in range(4):
+        values = np.zeros(
+            (1, layout.padded_extent(channel)), dtype=np.complex128)
+        values[0, :layout.logical_extent(channel)] = 1.0
+        channel_ones.append(jax.device_put(values, left_sharding))
+    logical_mask = np.sum(np.abs(np.asarray(pack_photon_channel_vectors(
+        tuple(channel_ones), layout, mesh, axis_name="x")[0])), axis=0)
+    left *= logical_mask[None, :]
+    right *= logical_mask[None, :]
     packed = jax.device_put(
         np.zeros((1, layout.packed_extent, layout.packed_extent),
                  dtype=np.complex128), packed_sharding)
