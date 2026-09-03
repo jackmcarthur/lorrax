@@ -327,11 +327,17 @@ def test_slab_q0_rule_is_a_named_selection_that_refuses_its_alternatives():
     with pytest.raises(
             ValueError, match="slab_q0_analytic_sphere_unavailable"):
         kernel.q0_average(geometry, kgrid, S_cart=zero, analytic_sphere=True)
-    # The bulk head keeps its incumbent Sobol + Baldereschi rule and takes
-    # no ``rule`` selection: the polygon construction is two-dimensional.
-    with pytest.raises(TypeError):
+    # Bulk has its own dimension-honest exact selection; passing the slab
+    # polygon name cannot silently select it.
+    with pytest.raises(ValueError, match="bulk_q0_rule_unknown"):
         vcoul.get_kernel(3).q0_average(
             geometry, kgrid, S_cart=zero, rule=vcoul.Q0_RULE_EXACT)
+    bulk_geometry = vcoul.CoulombGeometry(
+        bvec=np.eye(3), cell_volume=float((2.0 * np.pi) ** 3))
+    bare, screened = vcoul.get_kernel(3).q0_average(
+        bulk_geometry, (3, 3, 3), S_cart=zero,
+        rule=vcoul.BULK_Q0_RULE_EXACT)
+    assert np.isfinite(complex(bare)) and np.isfinite(complex(screened))
 
 
 def test_static_head_numerical_certificate_gates_transformed_forward_bound():
@@ -777,3 +783,38 @@ def test_retired_charge_hall_cubature_spelling_names_the_new_mode(tmp_path):
             match="(?s)bispinor_gw_charge_hall_cubature_retired.*"
                   "full_static_cohsex"):
         _parse(tmp_path, deck)
+
+
+def test_final_scalar_head_forwards_the_gamma_certificate(monkeypatch):
+    """The post-Schur head evaluation must reach the run-record callback."""
+    from gw import vcoul as gw_vcoul
+    from gw.qsgw_head import head_samples_from_s
+
+    marker = object()
+    seen = []
+    callback = seen.append
+
+    def fake_q0(*_args, certificate_fn=None, **_kwargs):
+        assert certificate_fn is callback
+        certificate_fn(marker)
+        return 11.0, 7.0
+
+    monkeypatch.setattr(gw_vcoul, "compute_q0_averages", fake_q0)
+    config = SimpleNamespace(head=SimpleNamespace(
+        vhead=None,
+        whead_0freq=None,
+        whead_imfreq=None,
+        analytic_q0_sphere=False,
+        head_minibz_average=True,
+    ))
+    samples = head_samples_from_s(
+        np.zeros((1, 3, 3), dtype=np.complex128),
+        (0.0j,),
+        wfn=object(),
+        meta=object(),
+        config=config,
+        q0_certificate_fn=callback,
+    )
+    assert seen == [marker]
+    assert samples[0].vc0 == 11.0 + 0.0j
+    assert samples[0].wcoul0 == 7.0 + 0.0j

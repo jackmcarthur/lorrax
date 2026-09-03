@@ -119,17 +119,13 @@ class CoulombKernel(Protocol):
         ``epshead`` slot, unused) — V(q=G=0) is finite from the cell-box
         FFT.
 
-        THE QUADRATURE IS NOT SHARED ACROSS DIMENSIONS.  ``Slab2D``
-        (``sys_dim = 2``) takes an extra ``rule`` selection and defaults to
-        the EXACT Wigner--Seitz polygon cubature — the same provider
-        receipt the packed bispinor Γ completion consumes — so its
+        ``Slab2D`` and ``Bulk3D`` each default to the exact Wigner--Seitz
+        receipt that their packed bispinor Gamma completion consumes
+        (polygon in 2D, polyhedron in 3D).  Their
         ``nsamples``/``method``/``qmc_reps``/``analytic_sphere`` arguments
-        belong to its named ``sobol_debug`` rule only.  ``Bulk3D``
-        (``sys_dim = 3``) keeps the scrambled-Sobol Voronoi draw plus the
-        Baldereschi--Tosatti analytic sphere: the exact polygon rule is a
-        two-dimensional construction and there is no 3D owner for it, so
-        the bulk head's incumbent rule and every one of these dials stand
-        unchanged.  See ``docs/services/vcoul.md``.
+        belong only to the explicitly named ``sobol_debug`` reproduction
+        rule; the deck-facing wrapper never selects it.  See
+        ``docs/services/vcoul.md``.
         """
         ...
 

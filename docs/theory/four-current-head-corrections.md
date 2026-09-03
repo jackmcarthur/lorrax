@@ -24,7 +24,7 @@ current density `ψ†α^iψ`).
 > the magnetic GN-PPM response and two-residue fit are W-level gated on CrI3,
 > but there is no Sigma-level CrI3 number. Phase 3 is minimally implemented:
 > GN/HL-PPM keep the charge block dynamic and freeze the current blocks at
-> ω = 0. For `bare_transverse`, six deck classes remain assigned to the
+> ω = 0. For `bare_transverse`, five deck classes remain assigned to the
 > incumbent Sigma owner:
 > restart, self-consistent, MPA, the `x_only`/`no_local_fields`/resolvent
 > family, and explicit-local or one-GPU operation. (`no_local_fields` itself
@@ -85,7 +85,7 @@ envelope.
 
 | | inside the envelope | outside it |
 |---|---|---|
-| envelope | `bispinor`, `compute_mode ∈ {cohsex, gn_ppm, hl_ppm}`, `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim = 2`, `head_correction ∈ {full, off}`, `restart = false` (`cohsex`: unnamed → derived false; dynamic: the deck must select false) | the six classes in §1: bulk; restart; self-consistent; MPA; `x_only`/`no_local_fields`/resolvent; explicit-local or one-GPU operation |
+| envelope | `bispinor`, `compute_mode ∈ {cohsex, gn_ppm, hl_ppm}`, `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa`, `sys_dim ∈ {2,3}`, `head_correction ∈ {full, off}`, `restart = false` (`cohsex`: unnamed → derived false; dynamic: the deck must select false) | the five classes in §1: restart; self-consistent; MPA; `x_only`/`no_local_fields`/resolvent; explicit-local or one-GPU operation |
 | who contracts `Σ^B` | `gw.photon_sigma`, the TT part of the sixteen-block `Σ_X` | `gw.sigma_x_bispinor`, the nine bare TT tiles |
 | the TT Γ-cell head | `⟨D_TT⟩` out of the Γ-cell completion, always on | **none** — the §2.1 overlay lost its deck key on 2026-09-01, and the run record says so |
 | status | experimental; body byte-identical to the incumbent (below) | **the only certified route**, and unchanged |
@@ -154,7 +154,7 @@ count.
 > `gw.v_q_bispinor._tt_head_tensor`, wired to `False`, for a hand-built
 > incumbent non-packed configuration; it is reachable only from a
 > hand-built config. **Consequence: a bispinor deck outside the packed
-> envelope — for example bulk, restart, self-consistent, MPA,
+> envelope — for example restart, self-consistent, MPA,
 > `x_only`/resolvent, or explicit-local — carries NO transverse
 > q→0 head at all**, and its run record now says so on the `Photon head`
 > line. The section is kept because the identities below are the gates the
@@ -164,7 +164,7 @@ In a hand-built config, setting the field replaces the `q = Γ, G = 0` slot
 of the nine TT `V` tiles by `−T_{ij}/Ω_{\rm cell}`, where `T` is sampled by the
 Sobol `vcoul.minibz_transverse_head_avg` debug estimator. It is not the
 Wigner–Seitz polygon provider that owns the deck-reachable scalar and packed
-slab heads.
+slab/bulk heads.
 Exact identities used as gates:
 
 $$
@@ -181,8 +181,9 @@ MoS2 4×4 bi4 deck (`BISPINOR_DHFB_DESIGN.md` §11): the missing head is
 comparable in Frobenius norm to the whole stored `q = Γ` TT slab and is
 about 5 % of `Σ^B`, but only ~0.2 meV on quasiparticle energies at that
 grid, decaying as `1/√N_k` in 2D. Box truncation (`sys_dim = 0`) never zeros
-the slot and is refused. Bulk (`sys_dim = 3`) uses the Baldereschi–Tosatti
-analytic sphere for the `1/q²` part, as `⟨v⟩` does.
+the slot and is refused. The packed bulk route uses the exact polyhedron
+receipt; only the unreachable incumbent overlay still uses its historical
+Sobol/sphere helper pending deletion with that route.
 
 This term is frequency independent because `Σ^B` is. If invoked from a
 hand-built configuration, it is the only transverse Γ-cell correction outside
@@ -283,16 +284,15 @@ W_h(\omega)=\left\langle\frac{v(\mathbf q)}{1-v(\mathbf q)\,q_aS^{\rm eff}_{ab}(
 \qquad(\texttt{vcoul.<kernel>.q0\_average}).
 $$
 
-**The cell average has one owner per dimension, and on a slab it is the
-same rule the packed completion of §4 uses.** `Slab2D.q0_average` evaluates
-both brackets on the exact mini-lattice Wigner–Seitz polygon cubature
-(Γ-to-edge Duffy triangulation, fixed 16/24/32 Gauss–Legendre ladder)
-issued by `vcoul.slab_minibz_photon_cubature` — the same authenticated
-receipt, the same nodes and the same weights `complete_static_photon_q0`
-consumes. The superseded scrambled-Sobol draw survives only as the named
-`rule="sobol_debug"`. `Bulk3D` keeps its Sobol + Baldereschi–Tosatti sphere
-rule: the polygon construction is two-dimensional. See §3.6 and
-`docs/services/vcoul.md`.
+**The cell average has one owner per dimension, and it is the same rule the
+matching packed completion of §4 uses.** `Slab2D.q0_average` evaluates both
+brackets on the exact mini-lattice Wigner–Seitz polygon cubature
+(16/24/32); `Bulk3D.q0_average` uses the exact Wigner–Seitz polyhedron
+tetrahedron/Duffy cubature (10/16/22). Each consumes the same authenticated
+receipt, nodes, weights, and raw kernel as `complete_static_photon_q0`.
+The superseded scrambled-Sobol draws and the bulk analytic-sphere split
+survive only as the named service DEBUG rule `rule="sobol_debug"`. See
+§3.6 and `docs/services/vcoul.md`.
 
 The body `W_{μν}(q=0)` is solved with the `G = 0` channel removed (the
 `K = 0` slot of `v` is zero), so the scalar head is re-attached to it as a
@@ -370,7 +370,7 @@ Facts at `34228021`, with the derivation and branch assignment owned by
   applies both resolvent rows to one orientation and completes with the
   time-reversal-symmetric conjugate, so it also deletes the odd channel.
 
-### 3.6 CLOSED (quadrature): the 5.4 meV was the Sobol estimator
+### 3.6 CLOSED in slabs; bulk migration is separately gated
 
 There were two evaluations of the **same** Γ-cell charge integral and they
 disagreed. Two mechanisms differed at once — the quadrature and the
@@ -378,7 +378,7 @@ insertion — and the quadrature half is now settled and fixed.
 
 | | incumbent (before 2026-09-02) | today, both routes |
 |---|---|---|
-| quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon rule, `vcoul.slab_minibz_photon_cubature` |
+| quadrature | Sobol Voronoi average of `v/(1 − v\,q·S·q)` | exact Wigner–Seitz Duffy–Gauss polygon/polyhedron rule, dispatched by `vcoul.minibz_photon_cubature` |
 | insertion | band-diagonal scalar shift (§3.2) | scalar route: band-diagonal (§3.2); packed route: rank-4 update through the real Σ kernels (§4.2) |
 | convergence certificate | none printed | scalar: polygon edges/orders/nodes/`⟨v⟩`/24→32 error ratio, refuses above budget. packed: `ward`, `hermiticity`, `dyson_forward_bound`, `cubature_orders` |
 
@@ -643,8 +643,9 @@ former.
 
 At `34228021` the two implementation defects below are fixed. The remaining
 head limitation is the insertion difference in §3.6; the scalar and packed
-slab routes share one quadrature, and the packed bulk completion now has its
-exact polyhedron rule. The scalar bulk owner is treated separately in §3.6.
+routes share one quadrature in both slab and bulk. The remaining distinction
+is scalar band-diagonal versus packed low-rank insertion, not the Gamma-cell
+integrator.
 
 * **Interband Γ wing sign.** Both wing kernels built the
   mixed head/body interband weight as `+F\,\overline{P}\,b/(z²−Δ²)`, while the
@@ -709,7 +710,7 @@ and refusal at `34228021` — is
 | bare `D^{IJ}` tiles, TT head slot | `src/gw/v_q_bispinor.py` (`_make_per_q_v_builder_for_tile`, `_tt_head_tensor`) |
 | mini-BZ estimators: `⟨v⟩`, `⟨v q q⟩`, `⟨v P^T⟩`, photon cubature | `services/vcoul/src/vcoul/minibz.py` |
 | `Σ^B` — the TT part of the packed `Σ`, static AND dynamic routes alike | `src/gw/photon_sigma.py`, the one sixteen-block consumer (`blocks = "all"` for `compute_mode = cohsex`, `blocks = "current"` for the dynamic route, whose charge block is the scalar `Σ_x + Σ_c(ω)`) |
-| `Σ^B`, incumbent route only — the six classes from §1: bulk; restart; self-consistent; MPA; `x_only`/`no_local_fields`/resolvent; explicit-local or one-GPU operation | `src/gw/sigma_x_bispinor.py` |
+| `Σ^B`, incumbent route only — the five classes from §1: restart; self-consistent; MPA; `x_only`/`no_local_fields`/resolvent; explicit-local or one-GPU operation | `src/gw/sigma_x_bispinor.py` |
 | which of the two routes a deck takes, and the reason printed in the run record | `gw_config.packed_bare_transverse_route` |
 | which compute modes the packed operator serves | `gw_config.PACKED_PHOTON_COMPUTE_MODES` (`cohsex` + the plasmon-pole pair; `mpa` refuses by name) |
 | whether the packed operator owns the CHARGE Σ too, or only the current blocks | `gw_config.packed_photon_replaces_charge_sigma` (static) / `gw_config.uses_dynamic_packed_photon_route` (dynamic) |

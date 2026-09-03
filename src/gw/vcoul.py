@@ -42,30 +42,19 @@ def compute_q0_averages(
 
 	Thin compatibility wrapper around the dimension-aware ``CoulombKernel``
 	in :mod:`gw.coulomb`, which adapts :mod:`vcoul`'s.  ``analytic_sphere``
-	(``head_minibz_average``) adds the Baldereschi-Tosatti analytic sphere
-	term (3D) / widens the Voronoi fold (both dims) to the q→0 head; default
-	False keeps the historical pure-Sobol average bit-identical.
+	(``head_minibz_average``) now names a retired Sobol/Baldereschi debug
+	policy and is refused by both exact production rules.  The historical
+	estimator remains directly reachable only as the service's explicit
+	``sobol_debug`` rule; this deck-facing wrapper never selects it.
 
-	THE SLAB IGNORES THE SAMPLER DIALS BY DESIGN (2026-09-01).  On a
-	``sys_dim = 2`` deck ``q0_average`` runs the exact Wigner--Seitz
-	polygon cubature — the single q→0 cell-average owner, shared with the
-	packed bispinor Γ completion — which takes no sample count, no
-	sequence and no replicate count; ``nsamples``/``method``/``qmc_reps``
-	below configure that kernel's named ``sobol_debug`` rule, which this
-	wrapper never selects.  ``analytic_sphere`` is REFUSED there rather
-	than ignored, because it is a deck key (``head_minibz_average``).
-	Everything in the paragraphs below is therefore about the 3D bulk and
-	its Baldereschi--Tosatti sphere, whose rule is unchanged.
+	The slab and bulk kernels run the exact Wigner--Seitz polygon/polyhedron
+	cubatures shared with their packed bispinor Gamma completions.  Neither
+	takes a sample count, sequence, or replicate count in production;
+	``nsamples``/``method``/``qmc_reps`` configure ``sobol_debug`` only.
 
-	``method`` DEFAULTS TO ``"auto"`` since the extraction (it was
-	``"sobol"``).  With scipy present — which is every production machine,
-	and the ``sobol`` extra declares it — ``auto`` resolves to exactly the
-	same scrambled-Sobol draw, so every number here is unchanged.  What
-	changes is the machine WITHOUT scipy: it used to fall back to a uniform
-	draw with ``nsamples`` silently raised to 2.5e6, and now it does the
-	same thing while SAYING so once (``vcoul.minibz``'s announce-or-refuse
-	gate).  A caller that wants the old silence back should not have it; a
-	caller that wants a refusal instead passes ``method="sobol"``.
+	``method`` defaults to ``"auto"`` for compatibility, but affects only
+	the quarantined debug estimator.  The exact production rules have no
+	random sequence, seed, replicate count, or sample-count control.
 
 	For a 3D metal at exactly zero frequency, ``static_kappa2`` selects the
 	Thomas-Fermi order of limits, ``<8*pi/(q^2+kappa_TF^2)>``.  It is mutually
@@ -74,7 +63,7 @@ def compute_q0_averages(
 	from .coulomb import get_kernel
 	kernel = get_kernel(getattr(meta, 'sys_dim', None))
 	kwargs = {}
-	if int(getattr(meta, 'sys_dim', 3)) == 2:
+	if int(getattr(meta, 'sys_dim', 3)) in (2, 3):
 		kwargs["certificate_fn"] = certificate_fn
 	return kernel.q0_average(
 		wfn, meta,

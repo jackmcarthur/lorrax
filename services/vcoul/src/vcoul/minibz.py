@@ -131,6 +131,24 @@ _BULK_MINIBZ_PHOTON_ORDERS = (10, 16, 22)
 _MINIBZ_PHOTON_RECEIPT_TOKEN = object()
 
 
+#: DEBUG/DIAGNOSTIC ONLY: the historical scrambled-Sobol Voronoi q=0
+#: estimator.  Both slab and bulk production rules require their exact
+#: provider-issued Wigner--Seitz receipt; this spelling is their sole named
+#: escape hatch for reproducing superseded numbers.
+Q0_RULE_SOBOL_DEBUG = "sobol_debug"
+_Q0_RULE_ANNOUNCED: set[str] = set()
+
+
+def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
+    """Name the q=0 rule that answered, once per process."""
+    if line in _Q0_RULE_ANNOUNCED:
+        return
+    _Q0_RULE_ANNOUNCED.add(line)
+    print(line, flush=True)
+    if warn:
+        warnings.warn(line, RuntimeWarning, stacklevel=3)
+
+
 class _MinibzPhotonChunk(NamedTuple):
     """One weighted, fixed-shape rule issued with a photon receipt."""
 

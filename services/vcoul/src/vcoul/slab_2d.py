@@ -20,7 +20,6 @@ as noise (+5.72 meV per occupied state on MoS2 3×3, lane J claim 0586).
 from __future__ import annotations
 
 from dataclasses import dataclass
-import warnings
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +28,7 @@ import numpy as np
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
+                          Q0_RULE_SOBOL_DEBUG, _announce_q0_rule,
                           minibz_inscribed_sphere_r2,
                           minibz_transverse_head_avg, minibz_voronoi_batches,
                           slab_minibz_photon_cubature)
@@ -40,9 +40,6 @@ __all__ = ["Slab2D", "SlabQ0Certificate", "Q0_RULE_EXACT",
 #: Wigner--Seitz polygon, Γ-to-edge Duffy triangulation, fixed 16/24/32
 #: Gauss--Legendre ladder.  ONE owner, shared with the packed completion.
 Q0_RULE_EXACT = "wigner_seitz_polygon"
-#: DEBUG/DIAGNOSTIC ONLY: the historical scrambled-Sobol Voronoi draw.
-#: Reachable only by naming it; never a production rule.
-Q0_RULE_SOBOL_DEBUG = "sobol_debug"
 _Q0_RULES = (Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG)
 
 # Same mixed absolute+relative budget the packed completion applies to its
@@ -53,37 +50,18 @@ _Q0_RULES = (Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG)
 _Q0_LADDER_RTOL = 1.0e-8
 _Q0_LADDER_ATOL = 1.0e-12
 
-_Q0_RULE_ANNOUNCED: set[str] = set()
-
-
 @dataclass(frozen=True)
 class SlabQ0Certificate:
     """Public certificate for one exact slab q=0 cell average."""
 
+    dimension: int
+    method: str
     orders: tuple[int, ...]
     physical_counts: tuple[int, ...]
     polygon_edges: int
     final_error_ratio: float
-
-
-def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
-    """Name the q→0 rule that answered, once per process.
-
-    ``print`` reaches a direct caller (a test, a tool, a service consumer).
-    A LORRAX production driver routes incidental component stdout to
-    ``os.devnull`` on purpose (``runtime.production_stream.ProductionStdout``)
-    and keeps only its own reporter, so the production certificate does not
-    reach ``gwjax.out`` today; that seam is registered.  ``warn=True`` also
-    raises a ``RuntimeWarning``, which that boundary DOES route into the
-    driver's warning block — reserved for selecting the DEBUG rule, which
-    must never run unnoticed inside a production driver.
-    """
-    if line in _Q0_RULE_ANNOUNCED:
-        return
-    _Q0_RULE_ANNOUNCED.add(line)
-    print(line, flush=True)
-    if warn:
-        warnings.warn(line, RuntimeWarning, stacklevel=3)
+    mean_v: complex
+    mean_w: complex | None
 
 
 class Slab2D:
@@ -376,10 +354,15 @@ class Slab2D:
             f"{ratios[-1]:.3e} (<= 1 required).  Same receipt the packed "
             "Gamma completion consumes.")
         return SlabQ0Certificate(
+            dimension=2,
+            method=Q0_RULE_EXACT,
             orders=tuple(int(v) for v in receipt.orders),
             physical_counts=tuple(int(v) for v in receipt.physical_counts),
             polygon_edges=len(receipt.polytope_vertices),
             final_error_ratio=float(ratios[-1]),
+            mean_v=complex(ladder[-1][1]),
+            mean_w=(None if ladder[-1][2] is None
+                    else complex(ladder[-1][2])),
         )
 
     @staticmethod
