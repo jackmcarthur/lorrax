@@ -818,6 +818,21 @@ def main(argv=None):
 								"the packed bare-transverse route needs the incumbent "
 								"static W(omega=0) on the charge block; the screening "
 								"model returned no 'static' role.")
+						# The packed completion owns the four-current Gamma cell,
+						# while restart_q_storage owns the scalar W0 body plus its
+						# scalar charge-head receipt.  Finalize that bounded charge
+						# receipt against the SAME W role before the packed builder
+						# consumes the body.  Without this installation the canonical
+						# W0 writer would ask an intentionally unfinalized resolver for
+						# its static sample after the packed route returned.
+						if oneshot_head_response is not None:
+							from .qsgw_head import finalize_iteration_head_samples
+							_charge_head = finalize_iteration_head_samples(
+								oneshot_head_response,
+								wfn=wfn, meta=meta, config=config, mesh=mesh_xy,
+								requests=oneshot_head_requests,
+								W_by_role=W_by_role)
+							head_resolver.install_samples(_charge_head.samples)
 						if not bool(config.restart):
 							_packed_restart_w0 = _W_charge
 				from .w_isdf import compute_static_photon_response
