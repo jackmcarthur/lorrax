@@ -1948,6 +1948,7 @@ def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
         return (
             "DEBUG: Gamma-cell head disabled by head_correction=off "
             "(headless packed body; NOT a production calculation)")
+    from .photon_sigma import STATIC_PHOTON_CHARGE_BLOCK_ABSENT
     if response.charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_ABSENT:
         # SCMPA: dynamic bare route -- the packed CC block is absent by
         # name, the charge S/wing fold and the coupled Dyson solve are
