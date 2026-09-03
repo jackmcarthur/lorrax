@@ -213,6 +213,29 @@ def test_precompile_solve_w_refuses_the_same_noncanonical_carrier(
             operand, operand, meta, mesh, dyson_solver="distributed")
 
 
+def test_distributed_solve_cache_is_keyed_by_logical_extent(monkeypatch):
+    """One padded extent must not reuse another caller's zero-mask closure."""
+    from types import SimpleNamespace
+
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    import distrib_la
+    import gw.w_isdf as w_isdf
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    monkeypatch.setattr(
+        distrib_la, "plan",
+        lambda *_args, **_kwargs: SimpleNamespace(describe=lambda: "capture"))
+    w_isdf._w_solve_cache.clear()
+    scalar = w_isdf._get_w_solve_fn_distributed(
+        mesh, nq=1, n_rmu=8, n_rmu_logical=6)
+    packed = w_isdf._get_w_solve_fn_distributed(
+        mesh, nq=1, n_rmu=8, n_rmu_logical=8)
+    assert scalar is not packed
+
+
 def test_mpa_reader_and_distributed_dyson_a_build_on_true_6x6_mesh():
     """Logical 42 must reach ``_a_local`` as one zero-padded 72 carrier."""
     repo = Path(__file__).resolve().parents[1]
