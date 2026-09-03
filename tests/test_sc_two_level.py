@@ -114,13 +114,15 @@ def test_outer_refits_freeze_each_model_and_reset_inner_history(monkeypatch):
     assert [call[2]["reset_diagnostics"] for call in calls] == [
         True, False, False, False]
     assert [call[2]["snapshot_offset"] for call in calls] == [0, 1, 3, 4]
-    assert calls[0][3] is calls[1][3]
-    assert calls[2][3] is calls[3][3]
-    assert calls[0][3] is not calls[2][3]
-    assert calls[0][3] == {
+    assert calls[0][3] is None and calls[2][3] is None
+    assert calls[1][3] is not calls[3][3]
+    assert calls[1][3] == calls[3][3] == {
         "state_edge_padding_ev": 0.25,
         "pole_extent_padding_fraction": 0.0,
     }
+    assert calls[1][1].w_time_factor_cache == {}
+    assert calls[3][1].w_time_factor_cache == {}
+    assert calls[1][1].w_time_factor_cache is not calls[3][1].w_time_factor_cache
 
 
 def test_two_level_refuses_a_pre_frozen_initial_input():

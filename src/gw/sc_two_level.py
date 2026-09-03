@@ -155,10 +155,12 @@ def run_two_level_self_consistency(
         # One ordinary map is both the outer screening refit and the first
         # evaluation F_W(H) of the new inner problem.  Reusing its result
         # avoids paying a duplicate Sigma build merely to obtain W.
-        # One quadrature transaction per outer model.  The frozen pole census
-        # cannot drift inside this solve, so it needs only a small state-edge
-        # allowance and no pole padding.  The next outer refit gets a fresh
-        # session and is therefore free to replan for its new pole set.
+        # One quadrature transaction per frozen inner solve.  It starts on
+        # the first post-producer Hamiltonian, after the ordinary multi-eV
+        # DFT->QP jump; only the subsequent meV-scale state motion is covered
+        # by the narrow padding.  The live producer still evaluates Sigma
+        # once to obtain that Hamiltonian, but its transient rules and W(tau)
+        # factors are not part of the frozen transaction.
         outer_rule_session = {
             "state_edge_padding_ev": 0.25,
             "pole_extent_padding_fraction": 0.0,
@@ -166,7 +168,7 @@ def run_two_level_self_consistency(
         live_inputs = replace(
             inputs,
             frozen_screening=None,
-            fixed_quadrature_session=outer_rule_session,
+            fixed_quadrature_session=None,
         )
         first_map, _ = sc_iteration.run_self_consistency(
             outer_input, live_inputs,
@@ -214,6 +216,7 @@ def run_two_level_self_consistency(
             )
             inner_calls = 1
         else:
+            screening = replace(screening, w_time_factor_cache={})
             frozen_inputs = replace(
                 inputs,
                 frozen_screening=screening,

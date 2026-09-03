@@ -325,10 +325,11 @@ class SCInputs:
     #: populated at map 0 only after the exact JAX-built entry occupation
     #: state exists; later maps read the path as immutable grid provenance.
     screening_seed_cache: dict | None = None
-    #: Run-local dynamic-Sigma quadrature receipts.  None for one-shot and
-    #: one-map SC diagnostics; a multi-map SC run fills these on map 1 and
-    #: reuses the exact node arrays thereafter.  A padded-box escape refuses
-    #: instead of changing the quadrature inside the fixed-point map.
+    #: Run-local dynamic-Sigma quadrature receipts.  None for one-shot, the
+    #: outer screening-producer map, and one-map SC diagnostics; a two-level
+    #: run fills these on its first frozen-G map and reuses the exact node
+    #: arrays thereafter.  A padded-box escape refuses instead of changing
+    #: the quadrature inside the fixed-point map.
     fixed_quadrature_session: dict | None = None
     #: Run-local anchor positions and reconstruction ceilings for the outer
     #: screening refit policy.  None on the exact one-map path.
@@ -3241,7 +3242,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     w_time_factor_cache = (
         frozen_screening.w_time_factor_cache
         if frozen_screening is not None else
-        {} if inputs.two_level_enabled else None)
+        {} if (inputs.two_level_enabled
+               and inputs.fixed_quadrature_session is not None) else None)
     sigma_wall_start = time.perf_counter()
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
