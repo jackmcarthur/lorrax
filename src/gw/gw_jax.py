@@ -379,16 +379,24 @@ def main(argv=None):
 			# into the RUN RECORD: which of two physically equivalent-inside-
 			# the-envelope routes ran is exactly the fact a later reader needs
 			# (they differ in the q->0 head mechanism).
-			report.progress(
-				"Photon route   : "
-				+ ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
-				   "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
-				   "completion carries both the charge head and the bare "
-				   f"<D_TT>) -- {_bare_reason}"
-				   if _bare_taken else
-				   "incumbent charge-screened W + Sigma^B "
-				   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
-				   f"head -- {_bare_reason}"))
+			if _bare_taken and uses_dynamic_packed_photon_route(config):
+				_route = (
+					"packed dynamic current-only photon operator "
+					"(CC block absent; W_CURRENT = V_CURRENT; Gamma-cell "
+					"completion carries bare <D_TT> only) -- "
+					f"{_bare_reason}")
+			elif _bare_taken:
+				_route = (
+					"packed static photon operator (chi_TT = chi_CT = 0; "
+					"scalar Dyson on CC, W_packed = diag(W_00, D_TT); the "
+					"Gamma-cell completion carries both the charge head and "
+					f"the bare <D_TT>) -- {_bare_reason}")
+			else:
+				_route = (
+					"incumbent charge-screened W + Sigma^B "
+					"(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
+					f"head -- {_bare_reason}")
+			report.progress(f"Photon route   : {_route}")
 		# HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
 		# docs/architecture/decisions.md; TASTE.md row 20).  The packed route
 		# already prints a boxed WARNING banner and a `Photon head` record

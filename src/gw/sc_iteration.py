@@ -417,7 +417,9 @@ class SCMapScreeningArtifacts:
 class SCExactHartree:
     """Caller-owned direct field rebuilt from one SC map's orbitals.
 
-    Every matrix is on the full BZ in the original DFT basis.  Keeping the
+    Every matrix is on the full BZ in the original DFT basis.  The stored
+    carriers retain the matrix-element sweep's two-axis mesh padding; the
+    logical accessors trim both band axes only at a consumer.  Keeping the
     scalar and transverse pieces separate preserves ``sigma_mnk.h5``'s
     decomposition; :attr:`total` is the only combination that enters the
     Hamiltonian.
@@ -426,23 +428,85 @@ class SCExactHartree:
     scalar_dft: jax.Array
     transverse_dft: jax.Array | None
     efermi_ry: float
+    nb_logical: int
+
+    def __post_init__(self):
+        nb = int(self.nb_logical)
+        components = (("scalar", self.scalar_dft),
+                      ("transverse", self.transverse_dft))
+        for label, component in components:
+            if component is None:
+                continue
+            if (component.ndim != 3
+                    or component.shape[-2] != component.shape[-1]
+                    or component.shape[-1] < nb):
+                raise ValueError(
+                    f"SCExactHartree {label} carrier must be "
+                    f"(nk, nb_padded, nb_padded) with nb_padded >= "
+                    f"nb_logical={nb}; got {component.shape}")
+        if (self.transverse_dft is not None
+                and self.transverse_dft.shape != self.scalar_dft.shape):
+            raise ValueError(
+                "SCExactHartree scalar and transverse carriers must have "
+                f"the same shape; got {self.scalar_dft.shape} and "
+                f"{self.transverse_dft.shape}")
+
+    @property
+    def scalar_logical_dft(self):
+        """Scalar field over the active, unpadded SC band window."""
+        nb = int(self.nb_logical)
+        return self.scalar_dft[..., :nb, :nb]
+
+    @property
+    def transverse_logical_dft(self):
+        """Transverse field over the active, unpadded SC band window."""
+        if self.transverse_dft is None:
+            return None
+        nb = int(self.nb_logical)
+        return self.transverse_dft[..., :nb, :nb]
 
     @property
     def total(self):
-        if self.transverse_dft is None:
-            return self.scalar_dft
-        return self.scalar_dft + self.transverse_dft
+        scalar = self.scalar_logical_dft
+        transverse = self.transverse_logical_dft
+        if transverse is None:
+            return scalar
+        return scalar + transverse
+
+
+def _logical_exact_hartree_term(term, base, *, label: str):
+    """Trim a padded sweep carrier to the logical matrix it augments."""
+    if term.ndim != base.ndim or term.shape[:-2] != base.shape[:-2]:
+        raise ValueError(
+            f"{label}: exact-Hartree carrier and SC matrix must have the "
+            f"same rank and leading axes; got {term.shape} and {base.shape}")
+    if term.shape[-2] != term.shape[-1]:
+        raise ValueError(
+            f"{label}: exact-Hartree carrier must be square on its band "
+            f"axes; got {term.shape}")
+    nb_m, nb_n = int(base.shape[-2]), int(base.shape[-1])
+    if nb_m != nb_n or term.shape[-1] < nb_n:
+        raise ValueError(
+            f"{label}: SC matrix must be square and no wider than its padded "
+            f"exact-Hartree carrier; got {base.shape} and {term.shape}")
+    return term[..., :nb_m, :nb_n]
 
 
 @_functools.partial(jax.jit, donate_argnums=(0,))
 def _add_exact_scalar_hartree(base, scalar):
     """Add a caller-owned scalar direct field into a dead matrix buffer."""
+    scalar = _logical_exact_hartree_term(
+        scalar, base, label="_add_exact_scalar_hartree")
     return base + scalar
 
 
 @_functools.partial(jax.jit, donate_argnums=(0,))
 def _add_exact_four_current_hartree(base, scalar, transverse):
     """Fuse V_H + H_T into ``base`` without materialising their sum."""
+    scalar = _logical_exact_hartree_term(
+        scalar, base, label="_add_exact_four_current_hartree scalar")
+    transverse = _logical_exact_hartree_term(
+        transverse, base, label="_add_exact_four_current_hartree transverse")
     return base + scalar + transverse
 
 
@@ -2052,7 +2116,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     return SCExactHartree(
         scalar_dft=H_scalar,
         transverse_dft=H_transverse,
-        efermi_ry=float(e_f))
+        efermi_ry=float(e_f),
+        nb_logical=nb)
 
 
 def _residency_census(named, print_fn) -> None:
@@ -5361,8 +5426,8 @@ def run_sc_driver(
     else:
         # Already contracted with the unrotated DFT orbitals.  Rotating this
         # through the Sigma-basis U would be a second, erroneous basis change.
-        v_h_scalar = exact_hartree_dft.scalar_dft
-        h_transverse = exact_hartree_dft.transverse_dft
+        v_h_scalar = exact_hartree_dft.scalar_logical_dft
+        h_transverse = exact_hartree_dft.transverse_logical_dft
         sig_h = exact_hartree_dft.total
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
@@ -5581,10 +5646,11 @@ def dump_sigma_omega_h5_final(
         # mixing bases or repeating the rotation on every SC iteration.
         U = _place(sigma_basis_U, mesh_xy, _band_rotation_spec())
         scalar_qp = _rotate_fixed_matrix(
-            exact_hartree_dft.scalar_dft, U, mesh=mesh_xy, to_qp=True)
+            exact_hartree_dft.scalar_logical_dft, U,
+            mesh=mesh_xy, to_qp=True)
         transverse_qp = (
             _rotate_fixed_matrix(
-                exact_hartree_dft.transverse_dft, U,
+                exact_hartree_dft.transverse_logical_dft, U,
                 mesh=mesh_xy, to_qp=True)
             if exact_hartree_dft.transverse_dft is not None else None)
         total_qp = (scalar_qp if transverse_qp is None

@@ -279,6 +279,15 @@ def test_sc_map_rotates_and_recontracts_current_bundle():
     assert "SC packed current map" in source
 
 
+def test_dynamic_run_record_names_the_absent_charge_layout():
+    """Production logs must not describe a nonexistent static CC Dyson."""
+    text = (pathlib.Path(__file__).resolve().parents[1]
+            / "src" / "gw" / "gw_jax.py").read_text(encoding="utf-8")
+    assert "packed dynamic current-only photon operator" in text
+    assert "CC block absent; W_CURRENT = V_CURRENT" in text
+    assert "_bare_taken and uses_dynamic_packed_photon_route(config)" in text
+
+
 # ---------------------------------------------------------------------------
 # In-band import canary (KNOWN_SANDBOX_ERRORS.md: `lx` can bind another tree)
 # ---------------------------------------------------------------------------
