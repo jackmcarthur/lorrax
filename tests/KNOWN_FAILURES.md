@@ -1074,15 +1074,15 @@ for EQP/output assembly.  The three guards and their documentation
 restrictions were removed in the same change.
 
 Focused evidence is green: 171 passed, 1 skipped across the rotation,
-basis-contract, config, metallic-SC, zero-head, delivered-window, and
+basis-contract, config, metallic-SC, zero-head, former campaign-window, and
 layering tests; a four-logical-device test checks the explicit `U C U†`
 value and retained sharding.  CUDA P=4 JID 57754440, step 71, checked the
 same row-scanned kernel on four ranks/four devices:
 max absolute tile error `9.1551e-16`, output
 `P(None,None,'x','y')`.  The requested Na end-to-end measurement remains
 blocked before Sigma by two independent deck/planner preconditions: the
-strict 24/48-band boundaries are not multiplet-clean, and the delivered
-product-window planner refuses the exact `-10..+10 eV` arm at P=4 with
+strict 24/48-band boundaries are not multiplet-clean, and the since-deleted
+campaign planner refused the exact `-10..+10 eV` arm at P=4 with
 achieved residual `0.00510025` and amplification p99 `7183.46` (JID
 57754440 step 91).  Neither refusal may be bypassed to manufacture a passing
 gate.  The two newly reachable head-off metallic seams are fixed and tested,

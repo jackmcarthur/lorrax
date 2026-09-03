@@ -189,18 +189,18 @@ Ranked.  These escape input-file validation, the run log, and provenance.
 3. `LORRAX_WFN_BACKEND` (`""` → config/auto; forces `eager` \| `phdf5`,
    `services/wfn_loader/src/wfn_loader/loader.py`) → the `slab_io`/backend config
    section, so the read path is recorded alongside the write path.
-4. **`LORRAX_SIGMA_PLAN` → a Sigma planning key.** Default `panes` preserves
-   the incumbent GN-PPM and MPA pane/window planners exactly; `delivered`
-   selects the shared measure-apportioned hybrid planner for both routes
-   (`gw.sigma_plan.resolve_sigma_plan`). Grammar is the exact, case-insensitive
-   enum `panes` \| `delivered` after stripping; blank means `panes`, and every
-   other value REFUSES naming both choices. This changes the quadrature and is
-   therefore policy, not machine capability; the env form is the initial
-   opt-in and must be promoted before it becomes a default candidate. See
-   [the delivered-plan contract](delivered_plan.md).
+4. **`LORRAX_SIGMA_PLAN` is now a control selector, not production policy.**
+   Default/blank is `box`, the sole production dynamic-Sigma quadrature shared
+   by MPA and GN/HL-PPM; `panes` selects the frozen comparison route only
+   (`gw.sigma_plan.resolve_sigma_plan`). `delivered` and every other spelling
+   refuse naming the two legal choices. Box construction, acceptance, cache
+   policy, lower-half-plane conjugation, and executor conversion live once in
+   `gw.sigma_box_plan`. Numerical policy is owned by the three deck keys
+   `sigma_quadrature_eps`,
+   `sigma_quadrature_reduction_seconds`, and
+   `sigma_quadrature_cache_dir`; no accuracy/cache environment override remains.
 5. *(removed 2026-08-31)* `LORRAX_DELIVERED_TAU_GRID` no longer exists:
    lookup-served rules carry their own nodes and there is one grid mode.
-
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
 cache (§2 — a machine fact; its mandatory-`""` status during regression
 timing belongs in the job script, not the physics input).
@@ -326,6 +326,7 @@ incident instruments, not production results.
 | var | default | effect |
 |---|---|---|
 | `LORRAX_DEBUG_GN_ODD_RESIDUE_OFF` | `0` (off) | **DEBUG-ONLY physics A/B switch; never production.** On a measured-broken-TR GN-PPM or MPA fit, `1`/`true`/`yes`/`on` discards the anti-Hermitian frequency-odd residue, setting `D=0` so `_residue_for_space` gives `R+=R-=B`; the even fit, screening, and every other input stay unchanged. GN applies the switch at `fit_gn_ppm_from_wc_pair`; MPA applies it when the stamped ordered-residue fit is consumed. The run record prints `WARNING -- DEBUG` plus a method-specific odd-Sigma line. It REFUSES on a TRS/single-residue fit because there is no TR-odd residue to discard. Canonical `runtime.env_flags.env_bool` grammar. |
+| `LORRAX_UNIFORM_RULE_TRACE` | unset | Print each MPA box plan's raw real support and final padded denominator box. Diagnostic only: it changes no support, rule, cache key, or executor value. Accuracy, reduction time, and cache location are deck keys. |
 | `LORRAX_SIGMA_TAU_TIMING` | `0` | Per-stage blocking timing rows for the staged τ kernel (`gw/ppm_tau_kernel.py:66`; the sub-rows are documented at `gw/ppm_sigma.py:377`).  Numerics identical (same primitives, same order, separate XLA modules); walltime NOT comparable to the fused path.  Scale-neutral: O(1) host work per τ stage. |
 | `LORRAX_PPM_ALLOW_CROSSING_BANDS` | unset (→ off) | Debugging override of `GATE ppm_sigma_gapped_occupations` (`gw/ppm_sigma.py::assert_gapped_occupations_for_ppm`), which REFUSES a GN/HL plasmon-pole Sigma whose occupation table has a Fermi-crossing band -- one occupied at some k and empty at others.  The GN/HL driver splits bands by a hard `occ > 0.5` step at a Fermi level it derives itself as `0.5*(vbm+cbm)`; with a crossing band `vbm > cbm`, so that reference is not in any gap, and `E_cond`/`H_val` are clipped at zero so a wrong-side band cannot be represented.  Nothing about that changes an array shape or the exit code.  The deck key `mpa_material_class = metal` is already refused outside `compute_mode = mpa` at parse time, but `insulator` is the DEFAULT, so this measures the SPECTRUM rather than trusting the declaration.  `1`/`true`/`on` downgrades the refusal to a loud line and continues.  `AGENT_PREAMBLE`: never set it to make a gate pass. |
 | `LORRAX_PPM_HERM_DIAG` | `0` | Deck-level ε_H measurement of the PPM amplitude's inherited hermiticity residual — `check_hermitian` over B_q and Ω_q, all q, rtol 1.0 (`gw/ppm_sigma.py:275`).  Diagnostic, not a gate (the channel merge needs no hermiticity). |

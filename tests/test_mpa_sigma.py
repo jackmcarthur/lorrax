@@ -1,11 +1,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import jax.numpy as jnp
 import pytest
 
 from gw.mpa.sigma import (_attach_ordered_odd_sigma, _batch_rows, _branches,
                           _resolve_mpa_odd_residue_debug)
-from gw.ppm_sigma import SigmaOmegaResult
+from gw.ppm_sigma import (SigmaOmegaResult, _SigmaPhysicsState,
+                          _ppm_as_one_pole_store_fields)
 
 
 def _row(poles):
@@ -23,11 +25,57 @@ def test_batch_rows_relocalize_pole_selection_per_batch():
     assert _batch_rows(low_only, range(4, 8)) is None
 
 
+def test_ppm_one_pole_fields_use_the_mpa_residue_normalization():
+    """PPM Wc(0) = -2B/Omega enters the MPA model without rescaling."""
+    Omega = jnp.asarray([[[0.7, 0.8], [0.9, 1.0]]])
+    B = jnp.asarray([[[1.0 + 0.2j, -0.4], [0.3j, 0.6 - 0.1j]]])
+    live = jnp.asarray([[[True, False], [True, False]]])
+    state = _SigmaPhysicsState(
+        efermi=jnp.asarray(0.0),
+        E_cond=jnp.zeros((1, 1)), H_val=jnp.zeros((1, 1)),
+        cond_mask=jnp.ones((1, 1), bool), val_mask=jnp.ones((1, 1), bool),
+        B_corr=B, Omega_abs=Omega, B_mask=live,
+        invalid_mask=~live, n_total_modes=jnp.asarray(4),
+        n_invalid=jnp.asarray(2))
+    Omega_p, B_p, D_p = _ppm_as_one_pole_store_fields(state)
+    Omega_p, B_p = map(np.asarray, (Omega_p, B_p))
+
+    assert Omega_p.shape == B_p.shape == (1, 1, 2, 2)
+    assert D_p is None
+    np.testing.assert_array_equal(B_p[0][~np.asarray(live)], 0.0)
+    np.testing.assert_array_equal(Omega_p[0][~np.asarray(live)], 0.0)
+    mask = np.asarray(live)
+    ppm_wc0 = -2.0 * np.asarray(B)[mask] / np.asarray(Omega)[mask]
+    mpa_wc0 = -2.0 * B_p[0][mask] / Omega_p[0][mask]
+    np.testing.assert_array_equal(mpa_wc0, ppm_wc0)
+
+
+def test_ppm_one_pole_fields_preserve_ordered_residue_and_mask():
+    Omega = jnp.asarray([[[0.7, 0.8], [0.9, 1.0]]])
+    B = jnp.asarray([[[1.0, -0.4], [0.3j, 0.6]]])
+    D = jnp.asarray([[[0.2j, 4.0], [-0.1j, 5.0]]])
+    live = jnp.asarray([[[True, False], [True, False]]])
+    state = _SigmaPhysicsState(
+        efermi=jnp.asarray(0.0),
+        E_cond=jnp.zeros((1, 1)), H_val=jnp.zeros((1, 1)),
+        cond_mask=jnp.ones((1, 1), bool), val_mask=jnp.ones((1, 1), bool),
+        B_corr=B, Omega_abs=Omega, B_mask=live,
+        invalid_mask=~live, n_total_modes=jnp.asarray(4),
+        n_invalid=jnp.asarray(2))
+    _Omega_p, B_p, D_p = _ppm_as_one_pole_store_fields(state, D)
+    np.testing.assert_array_equal(np.asarray(D_p)[0][~np.asarray(live)], 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(B_p + D_p)[0][np.asarray(live)],
+        np.asarray(B + D)[np.asarray(live)])
+    np.testing.assert_array_equal(
+        np.asarray(B_p - D_p)[0][np.asarray(live)],
+        np.asarray(B - D)[np.asarray(live)])
+
+
 def test_mpa_debug_odd_residue_switch_warns_and_refuses_trs(monkeypatch):
     messages = []
     monkeypatch.setenv("LORRAX_DEBUG_GN_ODD_RESIDUE_OFF", "1")
-    assert _resolve_mpa_odd_residue_debug(
-        True, print_fn=messages.append)
+    assert _resolve_mpa_odd_residue_debug(True, print_fn=messages.append)
     assert any("WARNING -- DEBUG" in line and "MPA" in line and "D=0" in line
                for line in messages)
     with pytest.raises(ValueError, match="debug_gn_odd_residue_off_scope"):

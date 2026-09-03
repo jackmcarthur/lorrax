@@ -382,7 +382,12 @@ class _RecordingSink:
 
 
 def _crossing_window():
-    return SimpleNamespace(omega_sign=OMEGA_SIGN, prefactor=PREF, project_code=1)
+    return SimpleNamespace(
+        omega_sign=OMEGA_SIGN,
+        prefactor=PREF,
+        project_code=1,
+        omega_indices=None,
+    )
 
 
 def _run_accumulator(S_R_g, S_I_g, mesh, *, n_tau=3):

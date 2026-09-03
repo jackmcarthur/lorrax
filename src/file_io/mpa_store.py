@@ -2208,6 +2208,171 @@ def allocate_fit_store_collective(
     return fit_completion_ledger(dest)
 
 
+def write_complete_pole_store_collective(
+    dest,
+    Omega_p,
+    B_p,
+    *,
+    B_odd_p=None,
+    mesh_xy,
+    n_mu_logical,
+    energy_unit,
+    provenance,
+    certification,
+    occupation_state=None,
+):
+    """Write an already-fitted pole field as a finalized MPA store.
+
+    This is the collective format seam for pole models whose fit is performed
+    in memory rather than by the streamed Padé driver.  ``Omega_p``, ``B_p``
+    and optional ordered-orientation odd residue ``B_odd_p`` have shape
+    ``(n_p, n_q, n_mu_padded, n_mu_padded)`` and remain on
+    ``P(None, None, 'x', 'y')`` throughout the write.  Only the logical
+    ``n_mu_logical`` square reaches disk; the device-count-dependent pad is
+    discarded by :class:`file_io.slab_io.SlabIO`.
+
+    A live pole is an element with nonzero ``B_p`` in the ordinary model, or
+    nonzero ``B_p + B_odd_p`` or ``B_p - B_odd_p`` in the ordered model.
+    Live poles must satisfy
+    the MPA causal convention ``Re(Omega_p) > 0`` and
+    ``Im(Omega_p) <= 0``.  A zero-residue element is an absent pole and may
+    carry zero frequency.  Both arrays must be finite, including absent
+    entries, because a non-finite dormant value can become live after an
+    upstream policy change without changing the file shape.
+
+    ``certification`` and ``provenance`` are required.  An algebraic model has
+    no Padé solve condition or backward error, so this writer records observed
+    values of zero in the completion journal; the provenance must name the
+    algebraic fit protocol, and the caller supplies the positive thresholds
+    that :func:`validate_fit_store` requires.  The stored ``fit_condition``
+    payload remains its allocation-time zero fill.
+
+    Parameters
+    ----------
+    dest
+        Output HDF5 path, replaced collectively.
+    Omega_p, B_p, B_odd_p
+        Pole frequencies and residues in ``energy_unit`` with shape
+        ``(n_p, n_q, n_mu_padded, n_mu_padded)`` and sharding
+        ``P(None, None, 'x', 'y')``.  ``B_odd_p`` is the optional
+        ``D=(R_+-R_-)/2`` field; its presence stamps the store as ordered.
+    mesh_xy
+        Existing named ``('x', 'y')`` device mesh.
+    n_mu_logical
+        Logical ISDF-pair extent written on both trailing axes.
+    energy_unit
+        ``'Ry'`` or ``'Ha'``; both poles and residues carry one energy unit.
+    provenance
+        Artifact provenance stamped as ``prov_*`` attributes.
+    certification
+        Positive condition/backward-error acceptance thresholds.
+
+    Returns
+    -------
+    dict
+        The finalized completion ledger, identically on every rank.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    if not provenance:
+        raise ValueError(
+            "write_complete_pole_store_collective requires provenance "
+            "naming the in-memory fit protocol")
+    _require_certification(certification, dest)
+    arrays = (Omega_p, B_p) if B_odd_p is None else (
+        Omega_p, B_p, B_odd_p)
+    for arr in arrays:
+        _require_layout(
+            arr, mesh_xy, P(None, None, "x", "y"),
+            "write_complete_pole_store_collective requires Omega_p and "
+            "B_p on P(None,None,'x','y')")
+    expected = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    Omega = jax.lax.with_sharding_constraint(
+        jnp.asarray(Omega_p, dtype=jnp.complex128), expected)
+    residue = jax.lax.with_sharding_constraint(
+        jnp.asarray(B_p, dtype=jnp.complex128), expected)
+    odd_residue = (None if B_odd_p is None else
+                   jax.lax.with_sharding_constraint(
+                       jnp.asarray(B_odd_p, dtype=jnp.complex128), expected))
+    if Omega.ndim != 4 or tuple(Omega.shape) != tuple(residue.shape):
+        raise ValueError(
+            "write_complete_pole_store_collective requires equal rank-4 "
+            "Omega_p/B_p arrays shaped (n_p,n_q,n_mu_pad,n_mu_pad); got "
+            f"{tuple(Omega.shape)} and {tuple(residue.shape)}")
+    if odd_residue is not None and tuple(odd_residue.shape) != tuple(Omega.shape):
+        raise ValueError(
+            "write_complete_pole_store_collective requires B_odd_p to "
+            f"match Omega_p/B_p; got {tuple(odd_residue.shape)} and "
+            f"{tuple(Omega.shape)}")
+    n_p, n_q, n_mu_x, n_mu_y = map(int, Omega.shape)
+    n_mu = int(n_mu_logical)
+    if min(n_p, n_q, n_mu) < 1 or n_mu_x < n_mu or n_mu_y < n_mu:
+        raise ValueError(
+            "write_complete_pole_store_collective got incompatible logical "
+            f"extents: poles={tuple(Omega.shape)}, n_mu_logical={n_mu}")
+    finite = (jnp.isfinite(jnp.real(Omega))
+              & jnp.isfinite(jnp.imag(Omega))
+              & jnp.isfinite(jnp.real(residue))
+              & jnp.isfinite(jnp.imag(residue)))
+    if odd_residue is None:
+        live = jnp.abs(residue) > 0.0
+    else:
+        finite = (finite
+                  & jnp.isfinite(jnp.real(odd_residue))
+                  & jnp.isfinite(jnp.imag(odd_residue)))
+        live = ((jnp.abs(residue + odd_residue) > 0.0)
+                | (jnp.abs(residue - odd_residue) > 0.0))
+    bad_causal = live & ((jnp.real(Omega) <= 0.0)
+                         | (jnp.imag(Omega) > 0.0))
+    n_nonfinite, n_bad_causal = map(
+        int, jax.device_get((jnp.sum(~finite, dtype=jnp.int64),
+                             jnp.sum(bad_causal, dtype=jnp.int64))))
+    if n_nonfinite:
+        raise ValueError(
+            "write_complete_pole_store_collective refuses "
+            f"{n_nonfinite} non-finite pole/residue elements")
+    if n_bad_causal:
+        raise ValueError(
+            "write_complete_pole_store_collective refuses "
+            f"{n_bad_causal} live poles with Re Omega <= 0 or Im Omega > 0")
+
+    allocate_fit_store_collective(
+        dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n_p,
+        energy_unit=energy_unit, provenance=provenance,
+        occupation_state=occupation_state,
+        ordered_residues=odd_residue is not None, mode="w")
+    global_shape = (n_p, n_q, n_mu, n_mu)
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        io.create_dataset("Omega_p", shape=global_shape, dtype=np.complex128)
+        io.create_dataset("B_p", shape=global_shape, dtype=np.complex128)
+        if odd_residue is not None:
+            io.create_dataset(
+                "B_odd_p", shape=global_shape, dtype=np.complex128)
+        io.write_slab("Omega_p", Omega, offset=(0, 0, 0, 0),
+                      global_shape=global_shape)
+        io.write_slab("B_p", residue, offset=(0, 0, 0, 0),
+                      global_shape=global_shape)
+        if odd_residue is not None:
+            io.write_slab("B_odd_p", odd_residue, offset=(0, 0, 0, 0),
+                          global_shape=global_shape)
+    barrier("mpa_complete_poles_written")
+
+    if process_rank() == 0:
+        columns = np.arange(n_mu, dtype=np.int64)
+        records = tuple(
+            (iq, columns, 0, n_mu, 0.0, 0.0) for iq in range(n_q))
+        with _h5(dest, "a") as grp:
+            _commit_fit_blocks(_open_fit(grp), records)
+        finalize_fit_store(dest, certification=certification)
+    barrier("mpa_complete_poles_finalized")
+    return fit_completion_ledger(dest)
+
+
 def _utc_now():
     return datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0).isoformat()
@@ -3656,9 +3821,9 @@ class PoleReader:
     """ONE collective handle serving every pole batch of one iteration.
 
     WHY THIS EXISTS (audit A1 fix 2).  The Σ stage walks the pole axis in
-    batches so no complete pole tensor ever exists on host or device, and
-    it walks it TWICE per iteration — once for the census that plans the
-    windows, once for the spatial executor.  Called through
+    batches so no complete pole tensor ever exists on host or device.  The
+    pane control walks it twice (census, executor); the box route walks it
+    three times (pole CDF, selected-region census, executor).  Called through
     :func:`read_poles`, each batch opened and closed its own h5py handle
     (ledger), its own collective ``SlabIO``, and a THIRD h5py handle for
     the unfold tables — and the third one landed *between* the two, so the

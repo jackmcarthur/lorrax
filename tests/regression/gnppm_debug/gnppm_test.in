@@ -52,6 +52,10 @@ sigma_omega_min_ev = -10.0
 sigma_omega_max_ev = 10.0
 sigma_omega_step_ev = 0.5
 sigma_regularization_ev = 0.25
+# The shared denominator-box plan uses 108 (window,tau) pairs on this
+# fixture.  Keep the resource certificate explicit rather than changing the
+# shipping default for unrelated decks.
+mpa_sigma_max_nodes = 128
 memory_per_device_gb = 28
 sigma_freq_debug_output = true
 fermi_reference = midgap

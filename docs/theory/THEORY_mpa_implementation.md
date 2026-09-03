@@ -439,6 +439,13 @@ the split that keeps the rectangles sign definite are owned by
 
 ## 8. The core, electronic stripe, and plasmon slab
 
+> **Pane-control history.** Sections 8--10 document the frozen pane planner
+> retained for `LORRAX_SIGMA_PLAN=panes` comparison runs. They are not the
+> production quadrature path. Production constructs the same three Cartesian
+> products directly, boxes their raw denominator corners, and calls the
+> uniform-rule service once per nonempty product; see
+> [The MPA Sigma denominator-box quadrature](sigma-quadrature-problem.md).
+
 Let
 
 $$
@@ -599,15 +606,14 @@ This is linear in energy bandwidth, not quadratic. Reducing $\eta$ lengthens
 the time interval and can raise the cost nearly in inverse proportion when
 the fitted poles themselves are narrow.
 
-The sector and crossing tolerances bound the same dimensionless residual
-$|1-dQ(d)|$, so they are numerically comparable. They are separate controls
-because a uniform scalar budget is not an optimal observable-error allocation.
-On the measured Si case, loosening only the crossing budget from
+The pane-control sector and crossing tolerances bound the same dimensionless
+residual $|1-dQ(d)|$. They are frozen comparison constants, not deck controls.
+Historically, loosening only the crossing budget from
 $6.5\times10^{-4}$ to $2\times10^{-3}$ reduced the physical census from 478
 to 446 without a measurable change relative to the 478-node plan at the
 $5\times10^{-5}$ meV reporting scale.
 
-### 10.1 The Landau floor, and the omega-clustered decomposition
+### 10.1 Historical pane-control omega clustering
 
 The linear law above is not a defect of the order search.  Measured on the
 sodium semicore scan, the production rule costs $N_\times = 87F + 10$ at
@@ -628,9 +634,9 @@ $x=\omega-e-a$ and cannot ride the separable $\tau$ kernel at all.
 What IS wrong is the certified region.  For any single evaluation
 frequency, only the thin shell $|\omega-e-a|\lesssim$ (margins) crosses;
 the rest of the $[\omega_{\min},\omega_{\max}]\times$(transitions) product
-set is sign-definite and belongs to the logarithmic family.  The planner
-therefore clusters each branch's $|\omega|$ values at gaps larger than
-`mpa_sigma_omega_cluster_gap_ry` and, when there is more than one cluster,
+set is sign-definite and belongs to the logarithmic family.  The pane control
+therefore clusters each branch's $|\omega|$ values at gaps larger than 1.5
+requested grid steps and, when there is more than one cluster,
 splits the core per cluster at the crossing-edge margin $m$:
 
 * bands $e < w_{\rm lo} - a_{\rm hi} - m$: the denominator
@@ -797,7 +803,6 @@ minimax_target_error = 1e-6
 minimax_max_nodes = 64
 
 mpa_n_poles = 8
-mpa_material_class = insulator
 mpa_sampling_alpha = 1
 mpa_sampling_schedule = nested
 mpa_pole_solver = loewner
@@ -805,12 +810,12 @@ mpa_varpi_near_ry = 0.2
 mpa_varpi_far_ry = 2.0
 mpa_pole_batch_size = 4
 
-mpa_sigma_sector_target_error = 6.5e-4
-mpa_sigma_crossing_target_error = 2e-3
+sigma_quadrature_eps = 1e-4
+sigma_quadrature_reduction_seconds = 120
+sigma_quadrature_cache_dir = auto
 mpa_sigma_max_nodes = 96
 sigma_regularization_ev = 0.25
 sigma_window_edge_factor = 1.5
-sigma_omega_layout = sharded
 ```
 
 The measured output grid was $[-7,7]$ eV in $0.5$ eV steps. On four A100
@@ -822,12 +827,13 @@ difference over 84 registered states was 0.07265 meV, the RMS difference was
 body-quadrature convergence statement for that system and fixed head, not a
 universal accuracy bound or a comparison with BerkeleyGW.
 
-The two error budgets play different roles. Keep chi at roughly $10^{-6}$
+The two accuracy stages play different roles. Keep chi at roughly $10^{-6}$
 before tuning the pole count: sample noise is amplified by the rational fit.
-The measured Sigma sector budget should also be treated conservatively because
-its current support ladder is not nested. The positive crossing rule degraded
-smoothly enough to use $2\times10^{-3}$ on the measured system. A new material
-still needs a tight-plan comparison at the QP level.
+Sigma uses one $10^{-4}$ sup target per directly constructed denominator box,
+with the service selecting relative error for sign-definite tails and
+peak-relative error for crossing boxes. The 120-second reduction budget changes
+node count, not accuracy, and independent windows reduce in parallel. A new
+material still needs a tighter-plan comparison at the QP level.
 
 ## 14. What changes the cost or the answer
 
