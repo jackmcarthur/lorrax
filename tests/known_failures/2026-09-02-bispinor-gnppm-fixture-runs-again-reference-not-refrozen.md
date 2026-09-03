@@ -102,3 +102,83 @@ done, and the re-freeze is deliberately not. The row is AMENDED, not closed:
 the gate is red for a **different, now-measured** reason.
 
 **2026-09-02 (integ reconciliation).** The deck now names `w_dyson_solver = local` explicitly: an unnamed solver on a slab bare_transverse deck is derived to `distributed` at parse time (heads always on), which `distrib_la` refuses on this fixture's 1x1 mesh. With `local` the fixture stays on the incumbent route the reference was cut from and keeps failing at the pre-existing drift documented above.
+
+## 2026-09-03 matched-historical-FFI attribution closure
+
+The earlier ABI limitation is now removed.  Six historical `src/ffi` trees
+were built on Perlmutter compute nodes in bounded directories under
+`/pscratch/sd/j/jackm/wt_codex_fixture_hist/ffi_<hash>/`; every probe canary
+prints the exact loaded `.so`.  The 2026-08-09 freeze tree reproduces the
+reference exactly: zero changed cells out of 1620.
+
+The drift is fully assigned.  Each numeric cell below is mean / population
+standard deviation / maximum absolute move in eV over 270 rows:
+
+| cause (exact parent -> commit or artifact B - A) | `sigX` | `sigC` | `sigXC` | direct field |
+|---|---:|---:|---:|---:|
+| `e83ff7d5 -> 07451900`, apply WFN reciprocal scale once | -0.000290 / 0.000183 / 0.000591 | -0.000045 / 0.000108 / 0.000402 | -0.000335 / 0.000251 / 0.000981 | +0.003042 / 0.001112 / 0.004631 |
+| `9a3409ca -> 4534dc79`, normalize response by source-WFN states | 0 / 0 / 0 | +0.512756 / 0.210173 / 0.803032 | +0.512756 / 0.210173 / 0.803032 | 0 / 0 / 0 |
+| `56627937 -> 8f46b0de`, Coulomb-gauge TT metric sign | +0.004243 / 0.002445 / 0.008389 | 0 / 0 / 0 | +0.004243 / 0.002445 / 0.008389 | 0 / 0 / 0 |
+| `d235f100 -> 27f1e5c9`, orbit-safe 0.2% GN pole-tail policy | 0 / 0 / 0 | -0.001734 / 0.002545 / 0.013729 | -0.001734 / 0.002545 / 0.013729 | 0 / 0 / 0 |
+| `0b43d0a6`, regenerated minus archived `kin_ion.h5` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | +0.274625 / 0.446359 / 1.429902 |
+
+The remaining endpoint residual after summing these rows is at most 2e-6 eV,
+below the gate's 1e-5 eV tolerance.  The two anticipated candidates are
+negative controls on this TRS fixture: `07071457` moves all printed columns by
+exactly zero, and `b0212b6b` (`-2F` -> the two ordered orientations) moves
+`sigX`, `sigC`, and the direct field by zero, with only three `sigXC` values
+rounding by 1e-6 eV.  Its own P4 ordered-pair gate is accurate to
+`4.936e-16`.  The VNL velocity-sign change remains excluded by the reference
+header's exact re-verification, and head/wing changes cannot contribute to the
+explicit head-off, zero-head deck.
+
+The large `sigC` step is therefore neither q-grid reconstruction nor the
+`-2F` removal.  It is the legitimate `4534dc79` correction at
+`src/gw/w_isdf.py:1311-1330` in that tree: a four-component kinetic-balance
+representation does not double the number of physical source-WFN states, so
+the Dyson response prefactor must use `nspinor_wfnfile`, not `nspinor=4`.
+Its commit records an alpha-to-zero P4 gate whose four-state red twin is
+exactly one half (JID 57527799, step
+`lx-Xg4-081151-102145-8903`).  `07451900`, `8f46b0de`, and `27f1e5c9` are
+likewise intentional physics corrections: respectively the missing `blat`
+conversion at the WFN boundary, the spatial Lorentz-metric minus in
+`D_TT=-vP_T`, and the user-ruled, explicitly lossy but Wc(0)-preserving 0.2%
+GN tail policy.  No unregistered physics defect is needed to explain the
+fixture.
+
+The direct-field result also replaces the earlier hypothesis.  At the exact
+pre-provenance tree, changing only `kin_ion.h5` gives the 1.429902 eV maximum
+and zero Sigma movement.  `f80a5f70` is the immediate child and correctly
+refuses the archived file: “kin_ion.h5 carries no bispinor provenance stamp”.
+The remaining 4.631 meV maximum is exactly `07451900`'s WFN reciprocal-scale
+correction.  `H_T` is only `2.110e-35 eV`, and the fixed-artifact
+`89db5652 -> 62f1fa22` live-G-space Hartree switch is zero.  Thus the old
+`VH`/new `Hdir` label change is not the numerical cause; the value remains
+scalar `V_H` to displayed precision.
+
+On the merge topology, `520ad4f5 = 60cf0273^1` retains the full direct-field
+artifact/scale move but is exactly frozen in all Sigma columns.
+`88711198 = 60cf0273^2` is byte-identical to `60cf0273`; the merge brings the
+four localized physics fixes onto the first parent and adds no merge-only
+numerical change.  The separate `837ed531 -> 8576f9f9` box-rule result is
+unchanged: `sigC` -0.001282 / 0.001591 / 0.004073 eV, with a maximum printed
+`eqp1` move of 4.049637 meV.
+
+Full build, bisect, refusal, canary, and artifact receipts are in
+`runs/DEV/320_bisp_fixture_drift_20260902_histffi/`.  The older
+`runs/DEV/320_bisp_fixture_drift_20260902/` remains immutable.
+
+This follow-up still does **not** authorize a re-freeze.  A literal incumbent
+tip copy would be:
+
+```
+cp runs/DEV/320_bisp_fixture_drift_20260902/probes/8576f9f9edc40ef5e0174e8665ca854d5375a713/sigma_diag_bispinor_test.dat \
+   tests/regression/bispinor_debug/sigma_diag_bispinor_ref.dat
+```
+
+It would bless, relative to the present reference, `sigX` +0.003954 / 0.002263
+/ 0.007798 eV, `sigC` +0.509697 / 0.209653 / 0.801972 eV, `sigXC` +0.513650 /
+0.209679 / 0.803461 eV, and direct field +0.277667 / 0.447171 / 1.434381 eV
+(mean / standard deviation / maximum absolute).  Do not run that copy.  The
+replacement reference should be generated once by the DELETE lane on its
+heads-on, one-GPU packed route and copied from that named run instead.
