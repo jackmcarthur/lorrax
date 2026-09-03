@@ -330,9 +330,11 @@ def test_screened_local_solver_factors_the_full_packed_direct_sum():
     from gw.w_isdf import compute_static_photon_response, solve_w
 
     source = inspect.getsource(compute_static_photon_response)
-    screened = source[source.index("if screen_current:"):
-                      source.index("else:\n        # chi_TT")]
-    assert "n_rmu_logical=sum(layout.logical_extents)" in screened
+    # The builder's branch comments are allowed to evolve as dimension and
+    # charge-layout semantics are unified.  Grade the one live call instead
+    # of slicing it between prose sentinels from the former slab-only body.
+    assert source.count(
+        "n_rmu_logical=sum(layout.logical_extents)") == 1
 
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
