@@ -34,8 +34,8 @@ restart = false
 head_correction = full
 """
 
-#: The explicit non-distributed negative control.  An unnamed solver is
-#: derived to ``distributed`` from ``packed_static_envelope``.
+#: The explicit local plan.  The bare family performs no packed solve, so
+#: this value controls only its scalar charge W and is legal on a 1x1 mesh.
 _PACKED_BARE_LOCAL_SOLVER = _PACKED_BARE.replace(
     "w_dyson_solver = distributed\n", "w_dyson_solver = local\n")
 
@@ -133,16 +133,8 @@ def test_the_hand_tt_overlay_is_refused_on_the_dynamic_packed_route(tmp_path):
     assert "REMOVED" in message
 
 
-def test_the_route_is_not_taken_when_its_dyson_solver_would_refuse(tmp_path):
-    """A route predicate must not claim a deck its screening owner refuses.
-
-    ``w_isdf.compute_static_photon_response``'s first statement refuses
-    anything but ``dyson_solver = 'distributed'`` (the packed solve has no
-    local plan, and ``distrib_la`` additionally needs a true 2-D mesh).  The
-    An unnamed solver is derived to ``distributed`` from the envelope table.
-    This explicit ``local`` arm proves a user request is preserved and keeps
-    the deck on the incumbent route rather than being silently overwritten.
-    """
+def test_bare_route_accepts_local_solver_for_one_gpu(tmp_path):
+    """Bare current builds no packed Dyson system; local serves scalar CC."""
     from gw.gw_config import (packed_bare_transverse_route,
                               uses_dynamic_packed_photon_route,
                               uses_static_photon_response)
@@ -150,13 +142,13 @@ def test_the_route_is_not_taken_when_its_dyson_solver_would_refuse(tmp_path):
         tmp_path, _PACKED_BARE_LOCAL_SOLVER + _PPM_KEYS + "compute_mode = gn_ppm\n",
         name="gnppm_auto_solver.in")
     taken, reason = packed_bare_transverse_route(cfg)
-    assert not taken
-    assert "w_dyson_solver" in reason, reason
-    assert not uses_static_photon_response(cfg)
-    assert not uses_dynamic_packed_photon_route(cfg)
+    assert taken, reason
+    assert cfg.backend.w_dyson_solver == "local"
+    assert uses_static_photon_response(cfg)
+    assert uses_dynamic_packed_photon_route(cfg)
 
 
-def test_unnamed_solver_is_derived_for_the_dynamic_packed_route(tmp_path):
+def test_unnamed_solver_resolves_local_for_the_dynamic_packed_route(tmp_path):
     from gw.gw_config import LorraxConfig, uses_dynamic_packed_photon_route
 
     path = tmp_path / "gnppm_derived_solver.in"
@@ -168,10 +160,140 @@ def test_unnamed_solver_is_derived_for_the_dynamic_packed_route(tmp_path):
     lines = []
     cfg = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
-    assert cfg.backend.w_dyson_solver == "distributed"
+    assert cfg.backend.w_dyson_solver == "local"
     assert uses_dynamic_packed_photon_route(cfg)
     assert any("packed_static_envelope" in line
                and "w_dyson_solver was not named" in line for line in lines)
+    assert any("bare packed operator skips its packed solve" in line
+               for line in lines)
+
+
+def test_x_only_bare_family_takes_packed_route(tmp_path):
+    from gw.gw_config import (ComputeMode, PACKED_PHOTON_COMPUTE_MODES,
+                              packed_bare_transverse_route,
+                              uses_static_photon_response)
+
+    cfg = _config(
+        tmp_path, _PACKED_BARE_LOCAL_SOLVER + "compute_mode = x_only\n",
+        name="x_only_packed.in")
+    taken, reason = packed_bare_transverse_route(cfg)
+    assert ComputeMode.X_ONLY in PACKED_PHOTON_COMPUTE_MODES
+    assert taken, reason
+    assert "scalar charge X plus packed current X" in reason
+    assert uses_static_photon_response(cfg)
+
+
+def test_x_only_screened_family_refuses_by_exact_gate(tmp_path):
+    deck = (_PACKED_BARE_LOCAL_SOLVER
+            .replace("bispinor_gw = bare_transverse",
+                     "bispinor_gw = full_static_cohsex")
+            + "compute_mode = x_only\n")
+    with pytest.raises(
+            ValueError,
+            match="GATE bispinor_screened_x_only_has_no_screened_operand"):
+        _config(tmp_path, deck, name="x_only_screened.in")
+
+
+@pytest.mark.parametrize(
+    "mode,extra",
+    [("cohsex", ""), ("gn_ppm", _PPM_KEYS), ("x_only", "")],
+)
+def test_restart_does_not_move_served_bare_classes_off_packed_route(
+        tmp_path, mode, extra):
+    from gw.gw_config import packed_bare_transverse_route
+
+    deck = _PACKED_BARE_LOCAL_SOLVER.replace(
+        "restart = false", "restart = true")
+    cfg = _config(
+        tmp_path, deck + extra + f"compute_mode = {mode}\n",
+        name=f"restart_{mode}.in")
+    taken, reason = packed_bare_transverse_route(cfg)
+    assert taken, reason
+
+
+def test_x_only_dispatch_uses_packed_current_blocks_not_sigma_b_fallback():
+    import inspect
+
+    from gw import sigma_dispatch
+    source = inspect.getsource(sigma_dispatch.compute_sigma_xc)
+    marker = "and mode is ComputeMode.X_ONLY"
+    assert marker in source
+    branch = source[source.index(marker):source.index(
+        "elif uses_dynamic_packed_photon_route")]
+    assert "blocks=PHOTON_BLOCKS_CURRENT" in branch
+    assert "bispinor_v_q_path=None" in branch
+
+
+@pytest.mark.parametrize("diagrams", ["w_bse", "w_rpa_resolvent"])
+def test_bispinor_ladder_classes_refuse_at_dispatch_door(
+        tmp_path, diagrams):
+    with pytest.raises(ValueError) as exc:
+        _config(
+            tmp_path,
+            _PACKED_BARE_LOCAL_SOLVER
+            + "compute_mode = cohsex\n"
+            + f"screening_diagrams = {diagrams}\n",
+            name=f"{diagrams}.in")
+    assert "GATE bispinor_screening_diagrams_require_packed_operand" in str(
+        exc.value)
+
+
+def test_screened_restart_refusal_prints_exact_storage_size(tmp_path):
+    from gw.gw_config import refuse_screened_photon_restart_storage
+
+    screened = _PACKED_BARE_LOCAL_SOLVER.replace(
+        "bispinor_gw = bare_transverse",
+        "bispinor_gw = full_static_cohsex").replace(
+            "restart = false", "restart = true")
+    cfg = _config(
+        tmp_path, screened + "compute_mode = cohsex\n",
+        name="screened_restart.in")
+    with pytest.raises(ValueError) as exc:
+        refuse_screened_photon_restart_storage(
+            cfg, nq=9, n_charge_padded=16, n_current_padded=20)
+    message = str(exc.value)
+    assert "GATE bispinor_screened_packed_restart_storage_unimplemented" in message
+    assert str(2 * 9 * (16 + 3 * 20) ** 2 * 16) in message
+
+
+def test_screened_local_solver_is_a_served_packed_plan(tmp_path):
+    from gw.gw_config import uses_static_photon_response
+
+    screened = _PACKED_BARE_LOCAL_SOLVER.replace(
+        "bispinor_gw = bare_transverse",
+        "bispinor_gw = full_static_cohsex")
+    cfg = _config(
+        tmp_path, screened + "compute_mode = cohsex\n",
+        name="screened_local.in")
+    assert cfg.backend.w_dyson_solver == "local"
+    assert uses_static_photon_response(cfg)
+
+
+def test_screened_local_solver_refuses_on_a_multi_process_mesh(
+        tmp_path, monkeypatch):
+    from gw.w_isdf import compute_static_photon_response
+
+    screened = (_PACKED_BARE_LOCAL_SOLVER
+                .replace("bispinor_gw = bare_transverse",
+                         "bispinor_gw = full_static_cohsex")
+                .replace("head_correction = full", "head_correction = off"))
+    cfg = _config(
+        tmp_path, screened + "compute_mode = cohsex\n",
+        name="screened_local_p4.in")
+    monkeypatch.setattr("gw.w_isdf.jax.process_count", lambda: 4)
+
+    class Mesh:
+        class Devices:
+            shape = (2, 2)
+        devices = Devices()
+
+    with pytest.raises(
+            ValueError,
+            match="GATE bispinor_screened_packed_local_requires_1x1"):
+        compute_static_photon_response(
+            None, None, None, None, None, Mesh(),
+            screen_current=True, W_charge=None, config=cfg,
+            dyson_solver="local")
 
 
 # ---------------------------------------------------------------------------
