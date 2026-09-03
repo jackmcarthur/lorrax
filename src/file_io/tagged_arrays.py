@@ -691,13 +691,19 @@ def write_restart_state_to_h5(
 def read_photon_g0_vectors_from_h5(
     filename, mesh_xy, *, n_rmu_charge_logical: int,
     n_rmu_transverse_logical: int,
+    pre_schema_zeta_paths=None,
 ):
     """Read the four ready literal-Gamma channel views from restart.
 
     These are μ-class, not μ²-class: every process makes the same small host
     read and places only its local shard.  The caller authenticates the shared
     V/restart binding first; this reader owns readiness, shape, logical
-    clipping, and processor-dependent padding.
+    clipping, and processor-dependent padding.  A fully authenticated
+    pre-schema caller may supply the historical charge/current zeta paths;
+    only then does an artifact with all four datasets absent recover the
+    exact ``zeta_q_G[:, :, G=0]`` views that the fresh V builder packs.  The
+    local zeta-loader plan reads that one G column and never gathers a full
+    zeta sphere.
     """
     from common.collectives import device_put_process_local
     from runtime.padding import padded_mu_extent
@@ -707,18 +713,24 @@ def read_photon_g0_vectors_from_h5(
             ready = bool(f.attrs.get("photon_g0_ready", False))
             missing = [name for name in PHOTON_G0_DATASETS if name not in f]
             if not ready or missing:
-                raise ValueError(
-                    "GATE bispinor_packed_restart_gamma_missing: packed "
-                    "Gamma vectors are absent or incomplete.\n"
-                    f"  got:  photon_g0_ready={ready}, missing={missing} in "
-                    f"{filename}\n"
-                    "  want: four ready literal-Gamma vectors written with "
-                    "the authenticated restart state\n"
-                    "  why:  the packed head cannot be rebuilt without its "
-                    "charge/current zeta factors\n"
-                    "  fix:  set restart = false and write restart tensors\n"
-                    "  doc:  docs/input_reference.md, restart.")
-            host = [np.asarray(f[name][...]) for name in PHOTON_G0_DATASETS]
+                if (pre_schema_zeta_paths is not None
+                        and not ready and missing == list(PHOTON_G0_DATASETS)):
+                    host = None
+                else:
+                    raise ValueError(
+                        "GATE bispinor_packed_restart_gamma_missing: packed "
+                        "Gamma vectors are absent or incomplete.\n"
+                        f"  got:  photon_g0_ready={ready}, missing={missing} in "
+                        f"{filename}\n"
+                        "  want: four ready literal-Gamma vectors written with "
+                        "the authenticated restart state\n"
+                        "  why:  the packed head cannot be rebuilt without its "
+                        "charge/current zeta factors\n"
+                        "  fix:  set restart = false and write restart tensors\n"
+                        "  doc:  docs/input_reference.md, restart.")
+            else:
+                host = [
+                    np.asarray(f[name][...]) for name in PHOTON_G0_DATASETS]
     except OSError as exc:
         raise ValueError(
             "GATE bispinor_packed_restart_gamma_missing: packed Gamma "
@@ -728,6 +740,41 @@ def read_photon_g0_vectors_from_h5(
             "  why:  the packed Gamma-cell completion requires four factors\n"
             "  fix:  restore the file or set restart = false\n"
             "  doc:  docs/input_reference.md, restart.") from exc
+
+    if host is None:
+        zeta_paths = tuple(pre_schema_zeta_paths)
+        if len(zeta_paths) != 4:
+            raise ValueError(
+                "GATE bispinor_packed_restart_gamma_missing: pre-schema "
+                "Gamma recovery requires charge plus three current zeta "
+                f"files; got {len(zeta_paths)}.")
+        from zeta_loader import ZetaLoader
+        logical_extents = (
+            int(n_rmu_charge_logical),
+            int(n_rmu_transverse_logical),
+            int(n_rmu_transverse_logical),
+            int(n_rmu_transverse_logical),
+        )
+        host = []
+        try:
+            for path, n_logical in zip(zeta_paths, logical_extents):
+                with ZetaLoader(path) as zeta:
+                    # Exactly the fresh builder's literal-G=0 view: every q,
+                    # logical mu rows, and the canonical sphere slot G=0.
+                    host.append(np.asarray(zeta.read_zeta_G_local(
+                        (slice(None), slice(0, n_logical), 0))))
+        except (OSError, KeyError, ValueError) as exc:
+            raise ValueError(
+                "GATE bispinor_packed_restart_gamma_missing: pre-schema "
+                "literal-Gamma vectors could not be recovered from the four "
+                "authenticated zeta files.\n"
+                "  want: complete G-flat charge/current zeta files with the "
+                "canonical G=0 sphere slot\n"
+                "  why:  the packed Gamma-cell completion requires four "
+                "one-leg factors\n"
+                "  fix:  restore the historical zeta files or regenerate "
+                "the restart\n"
+                "  doc:  docs/input_reference.md, restart.") from exc
 
     nq = int(host[0].shape[0]) if host and host[0].ndim == 2 else -1
     logical = (

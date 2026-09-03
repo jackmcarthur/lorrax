@@ -79,7 +79,12 @@ centroid-square object is materialized on fewer than all processors.
 
 Bare restart authenticates the tensor store and `v_q_bispinor.h5` with one
 source-composition binding, the four literal-Γ vectors and any required scalar
-`W(0)`. Screened packed restart refuses before opening large arrays because
+`W(0)`. Paired pre-schema files recover that binding in memory only after the
+restart WFN fingerprint, both centroid tables, Coulomb policy, four exact zeta
+provenance records, and V-tile format/grid/extents agree. Their literal-Γ
+vectors are the four small `zeta_q_G[:, :, 0]` hyperslabs read through
+`ZetaLoader`; no full zeta sphere is gathered and the historical artifacts are
+not modified. Screened packed restart refuses before opening large arrays because
 canonical packed V+W storage is not yet implemented.
 
 ### Screening and Γ completion
@@ -172,6 +177,9 @@ Runtime facts add these important boundaries:
   map must receive both the immutable packed response and transverse bundle.
 - `bispinor_packed_restart_binding_*`, `bispinor_packed_restart_gamma_*`, and
   `bispinor_packed_restart_w0_missing`: restart authentication failed.
+- `bispinor_pre_schema_restart_provenance_{missing,mismatch}`: read-only
+  recovery lacks a required historical stamp or one disagrees with the live
+  authenticated sources.
 - `static_gauge_hall_*`: the Hall artifact is absent, partial, or mismatched.
 - `photon_head_sigma_sector_closure`: the block-sector accounting failed.
 

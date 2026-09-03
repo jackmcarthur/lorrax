@@ -3759,14 +3759,15 @@ def prepare_isdf_and_wavefunctions(
 		# hook whose current deck-key refusal table is empty.
 		from file_io import load_restart_state_from_h5
 		_bispinor_restart_binding = None
-		if cfg.bispinor:
-			from file_io.bispinor_vq_restart import (
-				assert_bispinor_vq_restart_binding)
-			_bispinor_restart_binding = (
-				assert_bispinor_vq_restart_binding(
-					restart_path=tensors_filename,
-					v_q_path=os.path.join(tmp_dir, "v_q_bispinor.h5"),
-					where="gw_jax bispinor restart"))
+		_bispinor_pre_schema_recovered = False
+		_bispinor_zeta_paths = (
+			os.path.join(tmp_dir, "zeta_q.h5"),
+			os.path.join(tmp_dir, "zeta_q_mu1.h5"),
+			os.path.join(tmp_dir, "zeta_q_mu2.h5"),
+			os.path.join(tmp_dir, "zeta_q_mu3.h5"),
+		)
+		_cent_T_idx_now = None
+		_n_rmu_curr_now = None
 		from file_io.qp_wfn import (
 			authenticate_restart_qp_state_source_for_wfn)
 		_restart_source_record, basis_wfn_fingerprint_binding = (
@@ -3780,6 +3781,75 @@ def prepare_isdf_and_wavefunctions(
 		# receipt: there is no fact tying the stored psi/E bytes to this WFN.
 		_restart_wfn_provenance_complete = (
 			_restart_source_record is not None)
+		if _restart_wfn_provenance_complete:
+			charge_basis_receipt = WavefunctionBasisReceipt.from_bound_source(
+				wfn=wfn,
+				wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+				role='charge',
+				bispinor=bool(int(meta.nspinor) == 4),
+				bispinor_lift=(representation.charge_lift or "raw"),
+				band_interval=_basis_band_interval,
+				fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
+				n_rmu_logical=int(meta.n_rmu),
+				n_rmu_padded=int(meta.n_rmu_padded))
+		if cfg.bispinor:
+			if not _restart_wfn_provenance_complete:
+				raise ValueError(
+					"GATE bispinor_pre_schema_restart_provenance_missing: "
+					"bispinor restart recovery requires the canonical "
+					"qp_state_source_provenance record before distributed "
+					"payload I/O.")
+			if not getattr(cfg.paths, 'centroids_file_current', None):
+				raise ValueError(
+					"bispinor restart requires centroids_file_current in the "
+					"input file (same requirement as the fresh path).")
+			from file_io.centroids import load_centroids as _load_cent_restart
+			from runtime.padding import padded_mu_extent
+			_, _cent_T_idx_now, _n_rmu_curr_now = _load_cent_restart(
+				cfg.paths.centroids_file_current, meta.fft_grid)
+			transverse_basis_receipt = (
+				WavefunctionBasisReceipt.from_bound_source(
+					wfn=wfn,
+					wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+					role='transverse', bispinor=True,
+					bispinor_lift=(representation.current_lift or "raw"),
+					band_interval=_basis_band_interval,
+					fft_grid=meta.fft_grid,
+					centroid_fft_idx=_cent_T_idx_now,
+					n_rmu_logical=int(_n_rmu_curr_now),
+					n_rmu_padded=padded_mu_extent(
+						int(_n_rmu_curr_now), int(jax.device_count()))))
+			from file_io import (
+				coulomb_policy_from_config, format_coulomb_policy,
+				read_photon_g0_vectors_from_h5)
+			from file_io.bispinor_vq_restart import (
+				authenticate_or_recover_bispinor_vq_restart_binding)
+			from .v_q_bispinor import V_QMUNU_FORMAT
+			_bispinor_restart_binding, _bispinor_pre_schema_recovered = (
+				authenticate_or_recover_bispinor_vq_restart_binding(
+					restart_path=tensors_filename,
+					v_q_path=os.path.join(tmp_dir, "v_q_bispinor.h5"),
+					zeta_paths=_bispinor_zeta_paths,
+					charge_basis_receipt=charge_basis_receipt,
+					transverse_basis_receipt=transverse_basis_receipt,
+					coulomb_policy=format_coulomb_policy(
+						coulomb_policy_from_config(cfg, meta)),
+					expected_kgrid=meta.kgrid,
+					expected_v_qmunu_format=V_QMUNU_FORMAT))
+			if uses_coupled_photon_head(cfg):
+				photon_g0_vectors = read_photon_g0_vectors_from_h5(
+					tensors_filename, mesh_xy,
+					n_rmu_charge_logical=int(meta.n_rmu),
+					n_rmu_transverse_logical=int(_n_rmu_curr_now),
+					pre_schema_zeta_paths=(
+						_bispinor_zeta_paths
+						if _bispinor_pre_schema_recovered else None))
+			if _bispinor_pre_schema_recovered:
+				print0(
+					"  [config provenance] bispinor packed restart vectors/"
+					"binding = recovered from pre-schema tensors; four "
+					"literal-Gamma views came from authenticated zeta G=0 "
+					"slices (no zeta refit or full-sphere read).")
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
@@ -3836,6 +3906,7 @@ def prepare_isdf_and_wavefunctions(
 				       f"({type(exc).__name__}: {exc}).")
 			_have_c = _stamped.get('centroids_charge_md5')
 			if _have_c is None:
+				charge_basis_receipt = None
 				print0(
 					f"  *** LORRAX SANITY: {tensors_filename} carries no "
 					f"'centroids_charge_md5' attr — it predates the "
@@ -3865,19 +3936,6 @@ def prepare_isdf_and_wavefunctions(
 					f"WavefunctionBasisReceipt because its stored psi/E source "
 					f"cannot be authenticated; finite-transfer current "
 					f"construction will refuse. ***")
-			else:
-				charge_basis_receipt = (
-					WavefunctionBasisReceipt.from_bound_source(
-					wfn=wfn,
-					wfn_fingerprint_binding=(
-						basis_wfn_fingerprint_binding),
-					role='charge',
-					bispinor=bool(int(meta.nspinor) == 4),
-					band_interval=_basis_band_interval,
-					fft_grid=meta.fft_grid,
-					centroid_fft_idx=centroid_indices,
-					n_rmu_logical=int(meta.n_rmu),
-					n_rmu_padded=int(meta.n_rmu_padded)))
 			if cfg.memory.low_mem_bands:
 				# Both faces were already read at their OWN specs
 				# (P(None,'x',None,'y') / P(None,None,'x','y')) directly
@@ -3952,9 +4010,10 @@ def prepare_isdf_and_wavefunctions(
 						"bispinor restart requires centroids_file_current "
 						"in the input file (same requirement as the "
 						"non-restart bispinor path).")
-				from file_io.centroids import load_centroids as _load_cent
-				_, _cent_T_idx_now, _n_rmu_curr_now = _load_cent(
-					cfg.paths.centroids_file_current, meta.fft_grid)
+				if _cent_T_idx_now is None or _n_rmu_curr_now is None:
+					from file_io.centroids import load_centroids as _load_cent
+					_, _cent_T_idx_now, _n_rmu_curr_now = _load_cent(
+						cfg.paths.centroids_file_current, meta.fft_grid)
 				if int(_n_rmu_curr_now) != int(rs.n_rmu_transverse_disk):
 					raise ValueError(
 						f"bispinor restart: {tensors_filename} stores the "
@@ -3968,7 +4027,6 @@ def prepare_isdf_and_wavefunctions(
 				# Content check — same count does NOT mean same points
 				# (audit fix/zq 2026-07-28; ``_stamped`` read above).
 				_have_t = _stamped.get('centroids_transverse_md5')
-				transverse_basis_receipt = None
 				_n_rmu_T_padded = (
 					int(rs.psi_nmu_transverse.shape[-1])
 					if cfg.memory.low_mem_bands else
@@ -3979,6 +4037,7 @@ def prepare_isdf_and_wavefunctions(
 				meta_restart_transverse.sys_dim = meta.sys_dim
 				meta_restart_transverse.bispinor = True
 				if _have_t is None:
+					transverse_basis_receipt = None
 					print0(
 						f"  *** LORRAX SANITY: {tensors_filename} carries "
 						f"no 'centroids_transverse_md5' attr — it "
@@ -4010,18 +4069,6 @@ def prepare_isdf_and_wavefunctions(
 						f"qp_state_source_provenance record.  The transverse "
 						f"bundle carries NO WavefunctionBasisReceipt; "
 						f"finite-transfer current construction will refuse. ***")
-				else:
-					transverse_basis_receipt = (
-						WavefunctionBasisReceipt.from_bound_source(
-							wfn=wfn,
-							wfn_fingerprint_binding=(
-								basis_wfn_fingerprint_binding),
-							role='transverse', bispinor=True,
-							band_interval=_basis_band_interval,
-							fft_grid=meta.fft_grid,
-							centroid_fft_idx=_cent_T_idx_now,
-							n_rmu_logical=int(_n_rmu_curr_now),
-							n_rmu_padded=_n_rmu_T_padded))
 				if cfg.memory.low_mem_bands:
 					from .wavefunction_bundle import (
 						wavefunctions_face_from_restart)
@@ -4049,30 +4096,8 @@ def prepare_isdf_and_wavefunctions(
 				       f"{'face' if cfg.memory.low_mem_bands else 'legacy'}, "
 				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
-				# The two files already agreed above.  Now bind that joint
-				# statement to THIS run's WFN/centroid transforms and Coulomb
-				# policy before any packed operator can consume it.
-				from file_io import (
-					coulomb_policy_from_config, format_coulomb_policy,
-					read_photon_g0_vectors_from_h5)
-				from file_io.bispinor_vq_restart import (
-					BispinorVqRestartBinding)
-				from .v_q_bispinor import V_QMUNU_FORMAT
-				_running_binding = BispinorVqRestartBinding.from_sources(
-					v_qmunu_format=V_QMUNU_FORMAT,
-					zeta_fit_provenance=(
-						_bispinor_restart_binding.zeta_fit_provenance),
-					charge_basis_receipt=charge_basis_receipt,
-					transverse_basis_receipt=transverse_basis_receipt,
-					coulomb_policy=format_coulomb_policy(
-						coulomb_policy_from_config(cfg, meta)))
-				_bispinor_restart_binding.assert_same_composition(
-					_running_binding, where="gw_jax running bispinor sources")
-				if uses_coupled_photon_head(cfg):
-					photon_g0_vectors = read_photon_g0_vectors_from_h5(
-						tensors_filename, mesh_xy,
-						n_rmu_charge_logical=int(meta.n_rmu),
-						n_rmu_transverse_logical=int(_n_rmu_curr_now))
+				if (uses_coupled_photon_head(cfg)
+						and not _bispinor_pre_schema_recovered):
 					print0(
 						"  [bispinor restart] loaded four authenticated "
 						"literal-Gamma vectors; no zeta refit or zeta-sphere read.")

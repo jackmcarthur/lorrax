@@ -16,7 +16,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .wfn_basis import WavefunctionBasisReceipt
+from .wfn_basis import WavefunctionBasisReceipt, centroid_table_md5
 
 BISPINOR_VQ_RESTART_BINDING_DATASET = "bispinor_vq_restart_binding"
 BISPINOR_VQ_RESTART_BINDING_SCHEMA = "bispinor_vq_restart_binding_v1"
@@ -220,10 +220,232 @@ def assert_bispinor_vq_restart_binding(
     return restart
 
 
+def authenticate_or_recover_bispinor_vq_restart_binding(
+    *,
+    restart_path: str | Path,
+    v_q_path: str | Path,
+    zeta_paths: Sequence[str | Path],
+    charge_basis_receipt: WavefunctionBasisReceipt,
+    transverse_basis_receipt: WavefunctionBasisReceipt,
+    coulomb_policy: str,
+    expected_kgrid: Sequence[int],
+    expected_v_qmunu_format: str,
+) -> tuple[BispinorVqRestartBinding, bool]:
+    """Authenticate a current binding or recover a complete pre-schema one.
+
+    Recovery is deliberately narrower than the ordinary reader.  It is
+    available only when *both* artifacts predate the binding schema, and only
+    when the restart carrier, V-tile metadata, and four complete zeta headers
+    reproduce every physical source used by :meth:`from_sources`.  No file is
+    modified.  The returned boolean says that the binding was reconstructed
+    in memory from those authenticated pre-schema records.
+
+    Parameters
+    ----------
+    restart_path, v_q_path
+        The paired ISDF restart carrier and packed-photon tile file.
+    zeta_paths
+        Charge followed by the three Cartesian-current zeta files.
+    charge_basis_receipt, transverse_basis_receipt
+        Canonical receipts constructed from the selected WFN and centroid
+        tables after the restart WFN fingerprint has been authenticated.
+    coulomb_policy
+        Canonical formatted policy of the running deck.
+    expected_kgrid
+        Full q-grid dimensions used by the tile and zeta files.
+    expected_v_qmunu_format
+        Current packed V-tile format word.
+
+    Returns
+    -------
+    binding : BispinorVqRestartBinding
+        Authenticated persisted binding or its in-memory pre-schema recovery.
+    recovered : bool
+        ``True`` only for the complete pre-schema recovery path.
+    """
+    restart_path = Path(restart_path)
+    v_q_path = Path(v_q_path)
+    restart = read_bispinor_vq_restart_binding(restart_path)
+    photon = read_bispinor_vq_restart_binding(v_q_path)
+
+    # A partially upgraded pair is not a legacy pair.  Reuse the canonical
+    # missing-binding refusal rather than treating one record as disposable.
+    if (restart is None) != (photon is None):
+        assert_bispinor_vq_restart_binding(
+            restart_path=restart_path, v_q_path=v_q_path,
+            where="bispinor pre-schema recovery")
+
+    if restart is not None:
+        restart.assert_same_composition(
+            photon, where="bispinor restart artifacts")
+        running = BispinorVqRestartBinding.from_sources(
+            v_qmunu_format=expected_v_qmunu_format,
+            zeta_fit_provenance=restart.zeta_fit_provenance,
+            charge_basis_receipt=charge_basis_receipt,
+            transverse_basis_receipt=transverse_basis_receipt,
+            coulomb_policy=coulomb_policy,
+        )
+        restart.assert_same_composition(
+            running, where="gw_jax running bispinor sources")
+        return restart, False
+
+    zeta_paths = tuple(zeta_paths)
+    if len(zeta_paths) != 4:
+        raise ValueError(
+            "GATE bispinor_pre_schema_restart_provenance_missing: legacy "
+            "packed restart recovery is incomplete.\n"
+            f"  got:  {len(zeta_paths)} zeta paths\n"
+            "  want: charge plus three current zeta files\n"
+            "  why:  all four exact fit-provenance records are required to "
+            "reconstruct the packed source composition\n"
+            "  fix:  restore the four zeta files or regenerate the restart\n"
+            "  doc:  docs/input_reference.md, restart.")
+
+    from file_io.qp_wfn import read_qp_state_source_provenance
+    from file_io.tagged_arrays import (
+        format_coulomb_policy,
+        read_coulomb_policy_from_h5,
+    )
+    from zeta_loader import ZetaLoader
+
+    def _missing(fact: str, path: Path) -> ValueError:
+        return ValueError(
+            "GATE bispinor_pre_schema_restart_provenance_missing: legacy "
+            "packed restart recovery is incomplete.\n"
+            f"  got:  missing {fact} in {path}\n"
+            "  want: the authenticated WFN, centroid, zeta, Coulomb, and "
+            "tile stamps written by the historical run\n"
+            "  why:  an inferred binding without every source stamp could "
+            "join same-shaped tensors from different calculations\n"
+            "  fix:  restore the original artifacts or regenerate the restart\n"
+            "  doc:  docs/input_reference.md, restart.")
+
+    def _mismatch(fact: str, got, want, path: Path) -> ValueError:
+        return ValueError(
+            "GATE bispinor_pre_schema_restart_provenance_mismatch: legacy "
+            "packed restart sources disagree.\n"
+            f"  got:  {fact}={got!r} in {path}\n"
+            f"  want: {want!r}\n"
+            "  why:  pre-schema recovery is valid only for the exact WFN, "
+            "centroid, zeta, Coulomb, and tile composition\n"
+            "  fix:  restore one matched artifact family or regenerate it\n"
+            "  doc:  docs/input_reference.md, restart.")
+
+    charge = charge_basis_receipt.physical_source_record()
+    transverse = transverse_basis_receipt.physical_source_record()
+    source_record = read_qp_state_source_provenance(restart_path)
+    if source_record is None:
+        raise _missing("qp_state_source_provenance", restart_path)
+    for name in ("wfn_fingerprint_scheme", "wfn_fingerprint"):
+        want = charge[name]
+        got = source_record.get(name)
+        if got != want or transverse[name] != want:
+            raise _mismatch(name, got, want, restart_path)
+
+    try:
+        with h5py.File(restart_path, "r") as h5:
+            for attr, source in (
+                ("centroids_charge_md5", charge),
+                ("centroids_transverse_md5", transverse),
+            ):
+                if attr not in h5.attrs:
+                    raise _missing(attr, restart_path)
+                got = str(h5.attrs[attr])
+                want = source["centroid_table_md5"]
+                if got != want:
+                    raise _mismatch(attr, got, want, restart_path)
+    except OSError as exc:
+        raise _missing("readable restart carrier", restart_path) from exc
+
+    stamped_policy = read_coulomb_policy_from_h5(restart_path)
+    if stamped_policy is None:
+        raise _missing("coulomb_policy", restart_path)
+    got_policy = format_coulomb_policy(stamped_policy)
+    if got_policy != str(coulomb_policy):
+        raise _mismatch(
+            "coulomb_policy", got_policy, str(coulomb_policy), restart_path)
+
+    kgrid = tuple(int(value) for value in expected_kgrid)
+    n_q = int(np.prod(kgrid))
+    try:
+        with h5py.File(v_q_path, "r") as h5:
+            required = ("v_qmunu_format", "kgrid", "n_rmu_C", "n_rmu_T",
+                        "n_q_total")
+            for name in required:
+                if name not in h5:
+                    raise _missing(name, v_q_path)
+
+            raw_format = h5["v_qmunu_format"][()]
+            tile_format = (
+                raw_format.decode("utf-8", "strict")
+                if isinstance(raw_format, bytes) else str(raw_format))
+            tile_facts = {
+                "v_qmunu_format": tile_format,
+                "kgrid": tuple(int(value) for value in h5["kgrid"][...]),
+                "n_rmu_C": int(h5["n_rmu_C"][()]),
+                "n_rmu_T": int(h5["n_rmu_T"][()]),
+                "n_q_total": int(h5["n_q_total"][()]),
+            }
+    except OSError as exc:
+        raise _missing("readable V-tile metadata", v_q_path) from exc
+    wanted_tile_facts = {
+        "v_qmunu_format": str(expected_v_qmunu_format),
+        "kgrid": kgrid,
+        "n_rmu_C": int(charge["n_rmu_logical"]),
+        "n_rmu_T": int(transverse["n_rmu_logical"]),
+        "n_q_total": n_q,
+    }
+    for name, want in wanted_tile_facts.items():
+        got = tile_facts[name]
+        if got != want:
+            raise _mismatch(name, got, want, v_q_path)
+
+    provenance = []
+    expected_sources = (charge, transverse, transverse, transverse)
+    for channel, (path, source) in enumerate(zip(zeta_paths, expected_sources)):
+        path = Path(path)
+        try:
+            with ZetaLoader(path) as zeta:
+                if zeta.fit_provenance is None:
+                    raise _missing("isdf_header/fit_provenance", path)
+                if int(zeta.vertex_mu_L) != channel:
+                    raise _mismatch(
+                        "vertex_mu_L", int(zeta.vertex_mu_L), channel, path)
+                if tuple(int(value) for value in zeta.kgrid) != kgrid:
+                    raise _mismatch("kgrid", tuple(zeta.kgrid), kgrid, path)
+                if zeta.q_layout != "full_bz" or int(zeta.n_q_on_disk) != n_q:
+                    raise _mismatch(
+                        "q_layout/n_q_on_disk",
+                        (zeta.q_layout, int(zeta.n_q_on_disk)),
+                        ("full_bz", n_q), path)
+                got_md5 = centroid_table_md5(zeta.r_mu_fft_idx)
+                want_md5 = source["centroid_table_md5"]
+                if got_md5 != want_md5:
+                    raise _mismatch(
+                        "zeta centroid table", got_md5, want_md5, path)
+                if int(zeta.n_rmu) != int(source["n_rmu_logical"]):
+                    raise _mismatch(
+                        "zeta n_rmu", int(zeta.n_rmu),
+                        int(source["n_rmu_logical"]), path)
+                provenance.append(str(zeta.fit_provenance))
+        except OSError as exc:
+            raise _missing("readable complete zeta file", path) from exc
+
+    recovered = BispinorVqRestartBinding.from_sources(
+        v_qmunu_format=expected_v_qmunu_format,
+        zeta_fit_provenance=provenance,
+        charge_basis_receipt=charge_basis_receipt,
+        transverse_basis_receipt=transverse_basis_receipt,
+        coulomb_policy=coulomb_policy,
+    )
+    return recovered, True
+
+
 __all__ = [
     "BISPINOR_VQ_RESTART_BINDING_DATASET",
     "BISPINOR_VQ_RESTART_BINDING_SCHEMA",
     "BispinorVqRestartBinding",
+    "authenticate_or_recover_bispinor_vq_restart_binding",
     "assert_bispinor_vq_restart_binding",
     "read_bispinor_vq_restart_binding",
 ]
