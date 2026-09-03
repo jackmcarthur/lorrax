@@ -1446,7 +1446,8 @@ def _w_solve_pref_scalar(meta) -> float:
         * float(nspinor_wfnfile))
 
 
-def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
+def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
+                        dyson_solver=None,
                         distrib_la_batched_route: str = "batch_reshard"):
     """Return ``(solve_fn, pref)`` for the requested W plan.
 
@@ -1473,11 +1474,14 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
     nq = int(meta.nk_tot)
     pref_scalar = _w_solve_pref_scalar(meta)
 
-    # ``meta.n_rmu`` is a HARD read: a soft getattr fallback here
-    # silently restored the padded-extent LU for any meta-like object
-    # missing the field (opt-out-by-omission, PADDING_AUDIT item 3).
-    # Synthetic-meta callers must carry n_rmu (= the logical extent).
-    n_log = int(meta.n_rmu)
+    # Scalar charge solves take their logical prefix from ``meta``.  The
+    # packed photon solve is a direct sum of independently padded channel
+    # blocks and therefore has no single charge-logical prefix; its caller
+    # passes the complete packed carrier extent explicitly.  Never infer the
+    # latter from ``n_rmu`` merely because it is the array width -- that was
+    # the historical opt-out-by-omission path for scalar padding.
+    n_log = (int(meta.n_rmu) if n_rmu_logical is None
+             else int(n_rmu_logical))
 
     if dyson == "distributed":
         solve_fn = _get_w_solve_fn_distributed(
@@ -1488,14 +1492,54 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 
+def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
+                                n_rmu_logical=None):
+    """Authenticate the public Dyson carrier without owning its q set.
+
+    The q axis may be full-BZ or an irreducible wedge; its mapping belongs to
+    the screening/MPA caller.  The two centroid axes, however, must be one
+    square canonical product-padded carrier shared by V and chi.
+    """
+    v_shape = tuple(int(n) for n in V_q.shape)
+    chi_shape = tuple(int(n) for n in chi0_q.shape)
+    if v_shape != chi_shape:
+        raise ValueError(
+            "solve_w requires V_q and chi0_q to have the same padded "
+            f"(q,mu,nu) extent; got V_q.shape={v_shape} and "
+            f"chi0_q.shape={chi_shape}.  Producers and restart readers "
+            "must reconstruct both mu axes with "
+            "runtime.padding.padded_mu_extent before the Dyson solve.")
+    if len(v_shape) != 3 or v_shape[0] < 1 or v_shape[1] != v_shape[2]:
+        raise ValueError(
+            "solve_w requires equal rank-3 square (q,mu,nu) operands; "
+            f"got V_q.shape=chi0_q.shape={v_shape}.")
+    n_logical = (int(meta.n_rmu) if n_rmu_logical is None
+                 else int(n_rmu_logical))
+    n_padded = int(padded_mu_extent(n_logical, mesh_xy))
+    if v_shape[1:] != (n_padded, n_padded):
+        raise ValueError(
+            "solve_w requires the canonical product-padded centroid "
+            f"carrier (*,{n_padded},{n_padded}) from logical "
+            f"n_rmu={n_logical}; got equal V_q/chi0_q shapes {v_shape}.  "
+            "The q extent may be a full BZ or an irreducible wedge, but "
+            "per-mesh-axis centroid divisibility is not the in-memory "
+            "carrier contract; use runtime.padding.padded_mu_extent.")
+    return n_logical
+
+
 def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+            n_rmu_logical=None,
             distrib_la_batched_route: str = "batch_reshard"):
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
-    Both inputs must use the one canonical in-memory carrier extent
-    ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  The distributed plan masks
-    their pad rows/columns to exact zero before its first contraction.
+    Scalar inputs must use the one canonical in-memory carrier extent
+    ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  Their q axis may be full-BZ
+    or an irreducible wedge; q-set ownership stays with the caller.  A packed
+    direct-sum caller supplies ``n_rmu_logical`` explicitly because its
+    channel padding is internal rather than one trailing scalar prefix.  The
+    distributed plan masks scalar trailing pad rows/columns to exact zero
+    before its first contraction.
 
     **Output contract:** ``W`` is ``P(None, 'x', 'y')`` — 2-D sharded
     W_q(μ_X, ν_Y) — on both plans, and stays that way into its
@@ -1517,27 +1561,11 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
     ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
     caller must drop its reference after this call.
     """
-    v_shape = tuple(int(n) for n in V_q.shape)
-    chi_shape = tuple(int(n) for n in chi0_q.shape)
-    if v_shape != chi_shape:
-        raise ValueError(
-            "solve_w requires V_q and chi0_q to have the same padded "
-            f"(q,mu,nu) extent; got V_q.shape={v_shape} and "
-            f"chi0_q.shape={chi_shape}.  Producers and restart readers "
-            "must reconstruct both mu axes with "
-            "runtime.padding.padded_mu_extent before the Dyson solve.")
-    n_logical = int(meta.n_rmu)
-    n_padded = int(padded_mu_extent(n_logical, mesh_xy))
-    expected_shape = (int(meta.nk_tot), n_padded, n_padded)
-    if v_shape != expected_shape:
-        raise ValueError(
-            "solve_w requires the canonical product-padded centroid "
-            f"carrier {expected_shape} from logical n_rmu={n_logical}; "
-            f"got equal V_q/chi0_q shapes {v_shape}.  Per-mesh-axis "
-            "divisibility is not the in-memory carrier contract; use "
-            "runtime.padding.padded_mu_extent.")
+    n_logical = _require_w_operand_geometry(
+        V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        meta, mesh_xy, n_rmu=chi0_q.shape[1],
+        n_rmu_logical=n_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route)
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
@@ -2232,6 +2260,9 @@ def compute_static_photon_response(
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
             dyson_solver="distributed",
+            # Direct sum of already-padded C/T channel blocks: unlike the
+            # scalar carrier, this space has no one logical prefix to mask.
+            n_rmu_logical=int(layout.packed_extent),
             distrib_la_batched_route=distrib_la_batched_route)
         # The bare Hartree/exchange stage that follows does not depend on W
         # and could otherwise begin allocating its Green/operator workspaces
@@ -3589,6 +3620,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
 
 
 def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+                       n_rmu_logical=None,
                        distrib_la_batched_route: str = "batch_reshard"):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
@@ -3596,8 +3628,11 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
     :func:`solve_w` so both paths agree on which jit to compile.
     """
     ensure_jax_compile_cache()
+    n_logical = _require_w_operand_geometry(
+        V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        meta, mesh_xy, n_rmu=chi0_q.shape[1],
+        n_rmu_logical=n_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route)
     # The DISTRIBUTED plan is a plain function around chunked jits + one
     # FFI call, not a single jit, so there is nothing to lower here —

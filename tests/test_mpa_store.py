@@ -500,6 +500,34 @@ def test_collective_reader_reconstructs_the_product_padded_mu_carrier(
     })]
 
 
+def test_collective_writer_refuses_partial_slab_before_readiness(
+        monkeypatch):
+    """SlabIO clipping must not turn an undersized payload into ready data."""
+    from types import SimpleNamespace
+
+    import common.collectives as collectives
+    import file_io.slab_io as slab_io
+
+    opened = []
+
+    class MustNotOpen:
+        def __init__(self, *_args, **_kwargs):
+            opened.append(True)
+
+    monkeypatch.setattr(slab_io, "SlabIO", MustNotOpen)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+    mesh = SimpleNamespace(axis_names=("x", "y"),
+                           shape={"x": 6, "y": 6})
+    partial = SimpleNamespace(shape=(64, 2070, 2070))
+    with pytest.raises(ValueError, match=(
+            r"complete canonical product-padded slab "
+            r"\(65, 2088, 2088\).*got \(64, 2070, 2070\)")):
+        MS.write_w_slab_collective(
+            "samples.h5", "chi0_qmunu_z", 0, partial, mesh_xy=mesh,
+            global_shape=(16, 65, 2070, 2070))
+    assert opened == []
+
+
 def test_a_single_q_of_a_slab_is_the_same_bytes(tmpdir_path):
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     for iq in range(_N_Q_IBZ):

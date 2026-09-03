@@ -1124,12 +1124,29 @@ def write_w_slab_collective(
 
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
+    from runtime.padding import padded_mu_extent
 
     shape = tuple(int(n) for n in global_shape)
-    if len(shape) != 4:
+    if len(shape) != 4 or shape[2] != shape[3]:
         raise ValueError(
-            "write_w_slab_collective: global_shape must be "
+            "write_w_slab_collective: global_shape must be square "
             "(n_omega,n_q,n_mu,n_mu)")
+    i = int(i_omega)
+    if not 0 <= i < shape[0]:
+        raise IndexError(
+            f"write_w_slab_collective: frequency index {i} is outside "
+            f"[0,{shape[0]})")
+    n_mu_padded = int(padded_mu_extent(shape[2], mesh_xy))
+    expected = (shape[1], n_mu_padded, n_mu_padded)
+    got = tuple(int(n) for n in W_q_munu.shape)
+    if got != expected:
+        raise ValueError(
+            "write_w_slab_collective requires one complete canonical "
+            f"product-padded slab {expected} for logical destination "
+            f"{shape[1:]}; got {got}.  SlabIO intentionally clips a larger "
+            "carrier to the logical file extent, so this seam must refuse "
+            "an undersized, wrong-q, or merely per-axis-padded producer "
+            "before it could mark a partial slab ready.")
     _require_layout(
         W_q_munu, mesh_xy, P(None, "x", "y"),
         "write_w_slab_collective requires W on P(None,'x','y'); "
@@ -1138,14 +1155,14 @@ def write_w_slab_collective(
     W4 = W_q_munu[None, ...]
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         io.write_slab(
-            name, W4, offset=(int(i_omega), 0, 0, 0),
+            name, W4, offset=(i, 0, 0, 0),
             global_shape=shape)
     del W4
 
     if process_rank() == 0:
         with _h5(dest, "a") as grp:
             ds, mgrp = _open_w(grp, name)
-            _mark_w_slab_ready(ds, mgrp, i_omega, ready)
+            _mark_w_slab_ready(ds, mgrp, i, ready)
     barrier("mpa_w_slab_ready")
 
 
