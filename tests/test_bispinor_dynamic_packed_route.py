@@ -269,6 +269,42 @@ def test_screened_local_solver_is_a_served_packed_plan(tmp_path):
     assert uses_static_photon_response(cfg)
 
 
+def test_screened_local_solver_factors_the_full_packed_direct_sum():
+    """The scalar ``meta.n_rmu`` must not truncate C+T1+T2+T3."""
+    import inspect
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from gw.w_isdf import compute_static_photon_response, solve_w
+
+    source = inspect.getsource(compute_static_photon_response)
+    screened = source[source.index("if screen_current:"):
+                      source.index("else:\n        # chi_TT")]
+    assert "n_rmu_logical=sum(layout.logical_extents)" in screened
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+
+    class ScalarMeta:
+        nk_tot = 1
+        nspin = 1
+        nspinor_wfnfile = 1
+        n_rmu = 1
+
+    V = np.diag([0.10, 0.20, 0.30, 0.40]).astype(np.complex128)[None]
+    chi = np.diag([-0.25, -0.20, -0.15, -0.10]).astype(np.complex128)[None]
+    got = np.asarray(solve_w(
+        jnp.asarray(V), jnp.asarray(chi), ScalarMeta(), mesh,
+        n_rmu_logical=4, dyson_solver="local"))
+    pref = 2.0
+    want = np.linalg.solve(
+        np.eye(4, dtype=np.complex128) - pref * V[0] @ chi[0], V[0])
+    np.testing.assert_allclose(got[0], want, rtol=2.0e-13, atol=2.0e-13)
+    assert np.all(np.diag(got[0])[1:] != 0.0)
+
+
 def test_screened_local_solver_refuses_on_a_multi_process_mesh(
         tmp_path, monkeypatch):
     from gw.w_isdf import compute_static_photon_response
