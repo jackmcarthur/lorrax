@@ -72,8 +72,9 @@ produced by a single-ω evaluation at E_F (it is static in ω), which is cheap.
   window-edge oscillation of claims 620/624 under the old tail laws had this shape. The
   `clamp` policy is continuous in E, so the fixed point exists and the accelerators
   converge; for a state one eV beyond the edge the edge value is also closer to Σ(E)
-  than Σ(E_F) is. Expected outcome of the study: `clamp` wins on both consistency and
-  iteration count; the owner rules on the measurement.
+  than Σ(E_F) is. Decision rule (owner, 2026-09-03): `fermi` is primary; if it does not converge on
+  the study arms, the shipped behaviour reverts to the literature method, `clamp`
+  (mode A at the energies, edge-clamped), without a further ruling; both are reported.
 - Rules P×U at E_F and U×U scissor are the standard static outer block. Because P/U
   is by index there is no reclassification; the only artifact is a mismatch between the
   protected block's correction at its top and Δ, visible at the P/U boundary and
