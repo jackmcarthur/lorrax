@@ -99,8 +99,7 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
 	ComputeMode, HeadCorrection, LorraxConfig, QPSolver,
-	ScreeningDiagrams, incumbent_bispinor_head_record,
-	packed_bare_transverse_route,
+	ScreeningDiagrams, packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
@@ -362,12 +361,6 @@ def main(argv=None):
 		print0(
 			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
 			f"{_bispinor_note}")
-		# Which route a bare-transverse deck takes is deck-visible, never
-		# silent: the packed path and the incumbent charge-screened + Sigma^B
-		# path are the SAME physics inside the envelope below (lane C gate,
-		# reports/bisp_c_bare_as_packed_2026-09-01), but they differ in the
-		# q->0 head mechanism, so the reader must be told which one ran and,
-		# when it is the incumbent one, the first condition that decided it.
 		_bare_taken, _bare_reason = packed_bare_transverse_route(config)
 		if config.bispinor_gw.value == "full_static_cohsex":
 			report.progress(
@@ -376,42 +369,24 @@ def main(argv=None):
 				"(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
 				"Gamma-cell completion carries charge, mixed, and transverse heads)")
 		else:
-			# In production mode print0 sinks component chatter, so this goes
-			# into the RUN RECORD: which of two physically equivalent-inside-
-			# the-envelope routes ran is exactly the fact a later reader needs
-			# (they differ in the q->0 head mechanism).
-			if _bare_taken and uses_dynamic_packed_photon_route(config):
+			if not _bare_taken:
+				raise RuntimeError(
+					"validated bispinor deck did not select the packed photon "
+					f"owner: {_bare_reason}")
+			if uses_dynamic_packed_photon_route(config):
 				_route = (
 					"packed dynamic current-only photon operator "
 					"(CC block absent; W_CURRENT = V_CURRENT; Gamma-cell "
 					"completion carries bare <D_TT> only) -- "
 					f"{_bare_reason}")
-			elif _bare_taken:
+			else:
 				_route = (
 					f"sys_dim={config.sys_dim} packed static photon operator "
 					"(chi_TT = chi_CT = 0; "
 					"scalar Dyson on CC, W_packed = diag(W_00, D_TT); the "
 					"Gamma-cell completion carries both the charge head and "
 					f"the bare <D_TT>) -- {_bare_reason}")
-			else:
-				_route = (
-					"incumbent charge-screened W + Sigma^B "
-					"(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
-					f"head -- {_bare_reason}")
 			report.progress(f"Photon route   : {_route}")
-		# HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
-		# docs/architecture/decisions.md; TASTE.md row 20).  The packed route
-		# already prints a boxed WARNING banner and a `Photon head` record
-		# line when head_correction=off (gw.w_isdf, lane B).  The INCUMBENT
-		# route printed only "no special Gamma-cell contribution" in the
-		# component chatter that production mode sinks, so a headless
-		# bispinor bulk / dynamic / x_only run reached eqp1.dat with no
-		# DEBUG token anywhere in the run record (lane J section 3.c).
-		if not uses_static_photon_response(config):
-			_banner, _head_record = incumbent_bispinor_head_record(config)
-			if _banner:
-				print0(_banner)
-			report.progress(f"Photon head    : {_head_record}")
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -637,19 +612,16 @@ def main(argv=None):
 			f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
 			f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
 			f"occ_hash={oneshot_occupation_state.occ_hash}")
-	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
-	# samples ψ at the transverse-centroid Wfns bundle (None when
-	# bispinor=False or centroids_file_current is unset).
+	# The packed four-current owner reads V^{i,j} tiles from
+	# v_q_bispinor.h5 and samples psi at the transverse-centroid bundle.
 	wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
-	# LOUD guard (quality pattern #7): the Σ kernels' Σ^B fold-in is a
-	# structural no-op when ``wfns_transverse``/``bispinor_v_q_path`` is
-	# None — a bispinor run reaching Σ without them would exit rc=0 with
-	# Σ^B silently dropped.  Both producer paths (fit + restart) raise
-	# with specifics before this point; this is the last-line invariant.
+	# LOUD guard (quality pattern #7): every bispinor route requires this
+	# operand.  Both producer paths raise with specifics before this point;
+	# this is the last-line invariant before the packed response is built.
 	if config.bispinor and wfns_transverse is None:
 		raise RuntimeError(
 			"bispinor = true but no transverse-centroid Wfns bundle was "
-			"produced (Σ^B would be silently dropped).  Check "
+			"produced (the packed current sector cannot be built).  Check "
 			"centroids_file_current and, on restart, that the restart "
 			"file carries psi_full_y_transverse.")
 	report.batched_linalg(
@@ -820,7 +792,7 @@ def main(argv=None):
 				# ONE selector, resolved in gw_config: full_static_cohsex screens
 				# all sixteen blocks inside the packed Dyson solve; the
 				# bare-transverse family declares chi_TT = chi_CT = 0 and screens
-				# only CC, whose owner is the incumbent scalar screening model.
+				# only CC, whose owner is the scalar screening model.
 				_screens_current = packed_photon_screens_current(config)
 				# PHASE 3.  On the dynamic packed route the CHARGE block is
 				# frequency dependent and is owned end to end by the scalar
@@ -880,11 +852,11 @@ def main(argv=None):
 					if not _screens_current and not _dynamic_packed:
 						# SCMPA: on the dynamic packed route the packed CC block is
 						# ABSENT (W_charge stays None); only the static bare route
-						# needs the incumbent W(omega=0) as its charge block.
+						# needs the scalar W(omega=0) as its charge block.
 						_W_charge = W_by_role.get("static")
 						if _W_charge is None:
 							raise RuntimeError(
-								"the packed bare-transverse route needs the incumbent "
+								"the packed bare-transverse route needs the scalar "
 								"static W(omega=0) on the charge block; the screening "
 								"model returned no 'static' role.")
 						# The packed completion owns the four-current Gamma cell,
@@ -960,23 +932,19 @@ def main(argv=None):
 				# component chatter (owner ruling 2026-09-01: a headless
 				# packed run is a DEBUG setting and must say so).
 				if _dynamic_packed:
-					# THE RUN RECORD MUST SAY WHICH SIGMA RAN.  A bispinor
-					# plasmon-pole deck used to take the incumbent
-					# charge-screened + Sigma^B route with no TT Gamma head;
-					# it now takes the packed operator, and the current blocks
-					# are an omega = 0 approximation inside a dynamic run.
-					# Both facts are physics, so neither is left to a log.
+					# The response state's canonical spelling distinguishes the
+					# bare absent-CC layout from the screened coupled layout.
 					report.progress(
 						"Photon Sigma   : dynamic packed route -- "
-						"packed CC block ABSENT (not zero-filled); "
+						"packed response charge_block_state="
+						f"{photon_response.charge_block_state}; "
 						f"compute_mode = {mode.value} scalar Sigma owns W_00(omega), "
 						"W_CURRENT = V_CURRENT, and "
 						"the twelve current blocks STATIC (omega = 0). The "
 						"charge q->0 head is the dynamic model's; the packed "
 						"Gamma completion inserts bare <D> only and skips the "
-						"unconsumed charge S/wing fold. "
-						"Sigma^B is the TT block of the packed operator, not "
-						"a separate term.")
+						"unconsumed charge S/wing fold. The TT exchange is a block "
+						"of the packed operator, never a separate term.")
 					# An authenticated magnetic run is only complete after Sigma
 					# has measured its Hall-on/off per-state contribution.  Its
 					# final APPLIED record is emitted at that seam below; exact
@@ -991,8 +959,7 @@ def main(argv=None):
 					report.progress(
 						"Photon Sigma   : packed x_only route -- scalar charge X "
 						"plus the packed consumer's current X blocks; W=V, "
-						"Sigma_SX=Sigma_X and Sigma_COH=0 in the current sector. "
-						"No incumbent separate Sigma^B term is added.")
+						"Sigma_SX=Sigma_X and Sigma_COH=0 in the current sector.")
 				else:
 					report.progress(
 						"Photon Sigma   : static packed route -- all sixteen "

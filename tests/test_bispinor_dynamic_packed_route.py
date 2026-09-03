@@ -505,13 +505,15 @@ def test_sc_map_rotates_and_recontracts_current_bundle():
     assert "SC packed current map" in source
 
 
-def test_dynamic_run_record_names_the_absent_charge_layout():
-    """Production logs must not describe a nonexistent static CC Dyson."""
+def test_dynamic_run_record_reads_the_canonical_charge_layout():
+    """Production logs distinguish bare absent CC from screened coupled CC."""
     text = (pathlib.Path(__file__).resolve().parents[1]
             / "src" / "gw" / "gw_jax.py").read_text(encoding="utf-8")
     assert "packed dynamic current-only photon operator" in text
     assert "CC block absent; W_CURRENT = V_CURRENT" in text
-    assert "_bare_taken and uses_dynamic_packed_photon_route(config)" in text
+    assert "if uses_dynamic_packed_photon_route(config)" in text
+    assert "photon_response.charge_block_state" in text
+    assert "packed CC block ABSENT (not zero-filled)" not in text
 
     driver = (pathlib.Path(__file__).resolve().parents[1]
               / "src" / "gw" / "gw_jax.py").read_text()

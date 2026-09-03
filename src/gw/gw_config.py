@@ -3862,47 +3862,6 @@ def refuse_screened_photon_restart_storage(
         "  doc:  docs/input_reference.md, bispinor_gw / restart.")
 
 
-def incumbent_bispinor_head_record(config) -> tuple[str, str]:
-    """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route.
-
-    Heads are always on (owner ruling 2026-09-01,
-    ``docs/architecture/decisions.md``; TASTE.md row 20).  The packed route
-    has said so since lane B: a boxed ``WARNING -- DEBUG`` banner and a
-    ``Photon head`` line naming the completion.  The incumbent route said
-    only "no special Gamma-cell contribution", in component chatter that
-    production mode sinks -- so a headless bispinor bulk / dynamic /
-    ``x_only`` run reached ``eqp1.dat`` with no DEBUG token anywhere in the
-    run record (lane J section 3.c).
-
-    Returned rather than printed so the policy has ONE owner and a test can
-    read it without a driver.  ``banner`` is ``""`` when there is nothing
-    loud to say.  The caller is :mod:`gw.gw_jax`, and only for decks with
-    ``uses_static_photon_response(config)`` false.
-    """
-    if config.head.correction is HeadCorrection.OFF:
-        return (
-            "\n  ==========================================================\n"
-            "  WARNING -- DEBUG: Gamma-cell head disabled by\n"
-            "  head_correction=off on the INCUMBENT bispinor route.\n"
-            "  No scalar <v>/W_h band-diagonal head and no transverse\n"
-            "  q=Gamma head.  This is a brute-force k-grid convergence /\n"
-            "  debugging setting, NOT a production calculation\n"
-            "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
-            "  ==========================================================\n",
-            "DEBUG: no Gamma-cell head at all (head_correction=off on the "
-            "incumbent route); NOT a production calculation")
-    # head_correction = full here (no_local_fields is refused on every
-    # bispinor deck).  The CHARGE head is the scalar band-diagonal one and
-    # there is NO transverse q=Gamma head on this route now that the overlay
-    # has no deck key -- say so rather than let a bulk number look complete.
-    return (
-        "",
-        "scalar band-diagonal charge head only (gw.head_correction "
-        "StaticHeadTerms); NO transverse q=Gamma head on the incumbent "
-        "route -- the packed Gamma-cell completion is the only producer of "
-        "<D_TT> and this deck is outside its envelope")
-
-
 def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW.
 
