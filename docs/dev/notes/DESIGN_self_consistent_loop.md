@@ -27,8 +27,13 @@ reclassification, no hysteresis margin, no per-k in-range mask, no buffer bands.
 **`EvaluationPolicy`** — the map from the current QP energies to the frequencies at
 which Σ is read for a P×P pair. Two named values, both implemented for the study;
 the owner picks one from the measurement and the other is deleted:
-- `fermi` (the owner's rule): both E_m and E_n inside [ω_min, ω_max] → (E_m, E_n);
-  otherwise (E_F, E_F).
+- `fermi` (the owner's rule): a band m is INSIDE at this iteration iff E_mk lies in
+  [ω_min, ω_max] for EVERY k (a per-band, per-iteration boolean from the current QP
+  energies, never a per-(m, k) test); for a pair with both bands inside → (E_mk, E_nk)
+  at each k; otherwise (E_F, E_F) at every k. Deciding membership per band keeps the
+  switch coherent across k, so a band flips as a whole between iterations instead of
+  element by element (owner, 2026-09-03: "not foolproof but will probably significantly
+  help with convergence").
 - `clamp`: (clip(E_m), clip(E_n)) always, clip to [ω_min, ω_max].
 
 **`effective_sigma(table, classes, policy, E, E_F) -> Σ̃_k`** — THE update law, one
@@ -61,8 +66,8 @@ produced by a single-ω evaluation at E_F (it is static in ω), which is cheap.
 ## 3. Robustness (the owner asked)
 
 - Rule P×P-inside is standard QSGW (mode A). Robust.
-- Rule P×P-outside → Σ(E_F) is a hard switch when a QP energy crosses ω_max or ω_min
-  between iterations: Σ̃_mn jumps by Σ_mn(E_edge) − Σ_mn(E_F), which for a diagonal
+- Rule P×P-outside → Σ(E_F) is a hard switch when a band's QP energy at any k crosses
+  ω_max or ω_min between iterations (the whole band flips, by the per-band rule): Σ̃_mn jumps by Σ_mn(E_edge) − Σ_mn(E_F), which for a diagonal
   element is O(100 meV) and can make a state that straddles the edge cycle — the
   window-edge oscillation of claims 620/624 under the old tail laws had this shape. The
   `clamp` policy is continuous in E, so the fixed point exists and the accelerators
