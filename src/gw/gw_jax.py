@@ -371,7 +371,8 @@ def main(argv=None):
 		_bare_taken, _bare_reason = packed_bare_transverse_route(config)
 		if config.bispinor_gw.value == "full_static_cohsex":
 			report.progress(
-				"Photon route   : packed screened static photon operator "
+				f"Photon route   : sys_dim={config.sys_dim} packed screened "
+				"static photon operator "
 				"(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
 				"Gamma-cell completion carries charge, mixed, and transverse heads)")
 		else:
@@ -387,7 +388,8 @@ def main(argv=None):
 					f"{_bare_reason}")
 			elif _bare_taken:
 				_route = (
-					"packed static photon operator (chi_TT = chi_CT = 0; "
+					f"sys_dim={config.sys_dim} packed static photon operator "
+					"(chi_TT = chi_CT = 0; "
 					"scalar Dyson on CC, W_packed = diag(W_00, D_TT); the "
 					"Gamma-cell completion carries both the charge head and "
 					f"the bare <D_TT>) -- {_bare_reason}")
@@ -796,10 +798,10 @@ def main(argv=None):
 				"ABSENT; scalar W_00(omega), charge head and four-current "
 				"Hartree rebuilt per map; current vertices re-contracted from "
 				"that map's rotated orbitals.")
+			from .w_isdf import format_photon_head_run_record
 			report.progress(
-				"Photon head    : bare <D> inserted into V and logical "
-				"W_CURRENT = V_CURRENT; charge S/wing fold and coupled Dyson "
-				"SKIPPED (no packed-CC consumer).")
+				"Photon head    : "
+				+ format_photon_head_run_record(photon_response))
 	else:
 		with timing.section("gw_jax.screening", announce=True,
 		                    label="screening (chi0 -> W)"):

@@ -2,7 +2,7 @@
 
 ``bispinor_gw = full_static_cohsex`` completes the ``q = Gamma, G = 0`` slot
 of the packed sixteen-block V and W (``gw.head_correction.
-complete_static_slab_photon_q0``) from one bounded response
+complete_static_photon_q0``) from one bounded response
 
     ``R(q) = q_a H_a(sigma_H) + q_a q_b S_ab``
 
@@ -73,11 +73,12 @@ class StaticPhotonHeadResponse:
     """
 
     layout: PhotonBasisLayout
-    S_direct: jax.Array               # (2,2,4,4), replicated charge CC
+    dimension: int
+    S_direct: jax.Array               # (d,d,4,4), replicated charge CC
     sigma_H: jax.Array                # (3,), replicated real bohr^-1
     hall_source: str
-    Y_x: jax.Array                    # (2,4,Npacked), P(None,None,'x')
-    Z_y: jax.Array                    # (2,Npacked,4), P(None,'y',None)
+    Y_x: jax.Array                    # (d,4,Npacked), P(None,None,'x')
+    Z_y: jax.Array                    # (d,Npacked,4), P(None,'y',None)
     ward_residual: float
     hermiticity_residual: float
     wing_reciprocity_residual: float
@@ -111,12 +112,17 @@ def require_static_photon_head_response(
     response.layout.assert_mesh(mesh_xy)
 
     n_packed = int(response.layout.packed_extent)
+    dimension = int(response.dimension)
+    if dimension not in (2, 3):
+        raise ValueError(
+            f"static photon head dimension must be 2 or 3; got {dimension}")
     arrays = (
-        (response.S_direct, "S_direct", (2, 2, 4, 4), np.complex128, P()),
+        (response.S_direct, "S_direct",
+         (dimension, dimension, 4, 4), np.complex128, P()),
         (response.sigma_H, "sigma_H", (3,), np.float64, P()),
-        (response.Y_x, "Y_x", (2, 4, n_packed), np.complex128,
+        (response.Y_x, "Y_x", (dimension, 4, n_packed), np.complex128,
          P(None, None, "x")),
-        (response.Z_y, "Z_y", (2, n_packed, 4), np.complex128,
+        (response.Z_y, "Z_y", (dimension, n_packed, 4), np.complex128,
          P(None, "y", None)),
     )
     for array, name, shape, dtype, spec in arrays:
@@ -181,10 +187,10 @@ def build_static_photon_head_response(
     r"""Compose the charge CC head, its wings and the optional Hall term.
 
     The scalar response is evaluated once by
-    :func:`gw.qsgw_head.build_dft_head_response` at ``omega = 0``.  Its two
-    in-plane velocity rows become the qx/qy derivatives of the charge head
-    and charge-only wings.  Three exact-zero transverse vectors are passed to
-    the canonical packer; no current wing is inferred.
+    :func:`gw.qsgw_head.build_dft_head_response` at ``omega = 0``.  Its
+    periodic-direction velocity rows become the derivatives of the charge
+    head and charge-only wings.  Three exact-zero transverse vectors are
+    passed to the canonical packer; no current wing is inferred.
 
     ``hall_transaction`` is either ``None`` (``sigma_H = 0``) or the full-BZ
     result of :func:`gw.qsgw_head.static_gauge_hall_transaction`, which must
@@ -203,6 +209,16 @@ def build_static_photon_head_response(
         raise TypeError(
             "static photon head response requires PhotonBasisLayout")
     layout.assert_mesh(mesh)
+    try:
+        dimension = int(config.sys_dim)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "static photon head response requires explicit config.sys_dim") \
+            from exc
+    if dimension not in (2, 3):
+        raise ValueError(
+            "static photon head response supports config.sys_dim in (2,3); "
+            f"got {dimension}")
 
     wfn_fp = _canonical_wfn_sha256(
         wfn_fingerprint(wfn)
@@ -248,13 +264,14 @@ def build_static_photon_head_response(
             f"Y={direct.Y_x.shape}, Z={direct.Z_y.shape}, "
             f"charge padded extent={charge_extent}")
 
-    charge_y = direct.Y_x[0, :2, :]
-    charge_z = jnp.transpose(direct.Z_y[0, :, :2], (1, 0))
+    charge_y = direct.Y_x[0, :dimension, :]
+    charge_z = jnp.transpose(
+        direct.Z_y[0, :, :dimension], (1, 0))
     zeros_x = tuple(
-        _channel_zeros(2, layout.padded_extent(A), mesh, "x")
+        _channel_zeros(dimension, layout.padded_extent(A), mesh, "x")
         for A in range(1, 4))
     zeros_y = tuple(
-        _channel_zeros(2, layout.padded_extent(A), mesh, "y")
+        _channel_zeros(dimension, layout.padded_extent(A), mesh, "y")
         for A in range(1, 4))
     Y_x = pack_photon_channel_vectors(
         (charge_y, *zeros_x), layout, mesh, axis_name="x")
@@ -262,9 +279,11 @@ def build_static_photon_head_response(
         (charge_z, *zeros_y), layout, mesh, axis_name="y")
     Z_y = jnp.transpose(Z_packed_y, (0, 2, 1))
 
-    S_host = np.zeros((2, 2, 4, 4), dtype=np.complex128)
+    S_host = np.zeros(
+        (dimension, dimension, 4, 4), dtype=np.complex128)
     charge_S = np.asarray(
-        jax.device_get(direct.S_direct[0, :2, :2]), dtype=np.complex128)
+        jax.device_get(direct.S_direct[0, :dimension, :dimension]),
+        dtype=np.complex128)
     S_host[:, :, 0, 0] = charge_S
     S_direct = canonicalize_static_gauge_q2_tensor(
         _replicated(S_host, mesh, dtype=np.complex128))
@@ -283,7 +302,7 @@ def build_static_photon_head_response(
     ward, hermiticity = static_gauge_tensor_residuals(S_direct)
 
     response = StaticPhotonHeadResponse(
-        layout=layout,
+        layout=layout, dimension=dimension,
         S_direct=S_direct, sigma_H=sigma_H, hall_source=hall_source,
         Y_x=Y_x, Z_y=Z_y,
         ward_residual=float(ward), hermiticity_residual=float(hermiticity),

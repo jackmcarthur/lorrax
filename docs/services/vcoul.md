@@ -79,11 +79,13 @@ private copy of it. `minibz_voronoi_batches`, `minibz_average` and
 `minibz_inscribed_sphere_r2` are the BGW `minibzaverage.f90` port;
 `minibz_moment_tensor` (`⟨v q_a q_b⟩`) and `minibz_transverse_head_avg`
 (`⟨v (δ_ab − q̂_a q̂_b)⟩`, the bare TT head) are the same draw and the same
-two estimator branches with a tensor weight; `slab_minibz_photon_cubature`
-is the exact Wigner–Seitz polygon rule — **the one q→0 cell-average owner
-for the slab**, with two callers: the packed photon head
-(`head_correction.complete_static_slab_photon_q0`) and, since 2026-09-01,
-the scalar charge head `Slab2D.q0_average` (see below).
+two estimator branches with a tensor weight. `minibz_photon_cubature`
+dispatches on the kernel type to the exact Wigner–Seitz rule: the
+two-dimensional polygon issuer `slab_minibz_photon_cubature` or the
+three-dimensional polyhedron issuer `bulk_minibz_photon_cubature`. Both issue
+one authenticated `MinibzPhotonReceipt`, and the packed photon head consumes
+either through `head_correction.complete_static_photon_q0`. The slab rule also
+owns the scalar charge head `Slab2D.q0_average` (see below).
 The kernel-facing spelling of the TT estimator is
 `Bulk3D`/`Slab2D`.`q0_average_transverse_tensor`, which is what
 `gw/v_q_bispinor.py` calls to value the bare TT Γ-head slot; it is still
@@ -119,7 +121,7 @@ is finite and *is* the head. `Box0D` refuses `v(q+G)` at `q ≠ 0` rather
 than serving the q=0 answer, because a box deck is Γ-only and a finite-q
 request means the k-grid is wrong, not the kernel.
 
-### One q→0 cell-average rule per dimension, named (2026-09-01)
+### One q→0 cell-average rule per dimension, named
 
 `Slab2D.q0_average` takes a `rule` selection with no silent alternative:
 
@@ -131,7 +133,7 @@ request means the k-grid is wrong, not the kernel.
 The scalar charge head and the packed bispinor Γ completion therefore
 reduce the **same** nodes, weights and kernel values: measured on the
 MoS2 3×3 deck geometry, `⟨v⟩` from `Slab2D.q0_average` and `⟨v⟩` from
-`complete_static_slab_photon_q0`'s own `static_slab_photon_head_moment_chunk`
+`complete_static_photon_q0`'s own `static_photon_head_moment_chunk`
 reduction agree to `2.274e-13`, and the screened companion
 `⟨v/(1 − v qᵀSq)⟩` to `0.000e+00`
 (`runs/MoS2/08_bisp_k_head_quadrature_20260901/head_owner_check.json`).
@@ -141,6 +143,20 @@ deterministic-per-seed sampling error on the `|q|` cusp — which was
 (`reports/bisp_j_architecture_review_2026-09-01/report.md` §4,
 claim 0586) and about half the scalar route's disagreement with
 BerkeleyGW (claim 582).
+
+For `sys_dim=3`, `bulk_minibz_photon_cubature` constructs the true Voronoi
+cell of the mini-lattice rows `b_i/N_i`. A centered fundamental
+parallelepiped bounds the WS covering radius by
+`R = 1/2 sum_i |b_i/N_i|`; lattice half-spaces longer than `2R` are therefore
+redundant. The smallest singular value converts that length bound to one
+finite integer-neighbour shell, which is clipped once—there is no open-ended
+search. Each face is triangulated about its center and joined to Gamma. The
+tetrahedral Duffy map has Jacobian `r^2 u |det(v0,v1,v2)|`, so its radial
+`r^2` cancels the bulk `8 pi/q^2` kernel exactly before summation. The fixed
+10/16/22 Gauss–Legendre ladder uses interior nodes only, normalized weights,
+and authenticates the polytope, cell volume, weight-sum/centroid identities,
+physical counts, padded counts, and payload digest in the same receipt family
+as the slab rule.
 
 Consequences a caller sees:
 

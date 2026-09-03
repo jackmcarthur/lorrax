@@ -10,7 +10,7 @@ THE q→0 CELL AVERAGE HAS ONE OWNER (2026-09-01).  ``⟨v⟩`` and
 Duffy--Gauss ladder issued by
 :func:`~vcoul.minibz.slab_minibz_photon_cubature` — the same provider
 receipt, the same nodes and the same weights the packed bispinor Γ
-completion (``gw.head_correction.complete_static_slab_photon_q0``)
+completion (``gw.head_correction.complete_static_photon_q0``)
 consumes, so the scalar route and the packed completion evaluate the same
 integral with the same rule.  The historical scrambled-Sobol draw is the
 named DEBUG rule ``sobol_debug``: it carries a ~0.1–0.2 % sampling error
@@ -370,7 +370,7 @@ class Slab2D:
                 "accepting a caller dial.")
         _announce_q0_rule(
             f"[vcoul] q0_average rule = {Q0_RULE_EXACT} (production): exact "
-            f"Wigner-Seitz polygon, {len(receipt.polygon_vertices)} edges, "
+            f"Wigner-Seitz polygon, {len(receipt.polytope_vertices)} edges, "
             f"orders {receipt.orders}, nodes {receipt.physical_counts}; "
             f"<v>={ladder[-1][1].real:.9g} a.u.; ladder error_ratio="
             f"{ratios[-1]:.3e} (<= 1 required).  Same receipt the packed "
@@ -378,7 +378,7 @@ class Slab2D:
         return SlabQ0Certificate(
             orders=tuple(int(v) for v in receipt.orders),
             physical_counts=tuple(int(v) for v in receipt.physical_counts),
-            polygon_edges=len(receipt.polygon_vertices),
+            polygon_edges=len(receipt.polytope_vertices),
             final_error_ratio=float(ratios[-1]),
         )
 

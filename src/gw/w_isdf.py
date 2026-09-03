@@ -1949,19 +1949,28 @@ def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
             "DEBUG: Gamma-cell head disabled by head_correction=off "
             "(headless packed body; NOT a production calculation)")
     from .photon_sigma import STATIC_PHOTON_CHARGE_BLOCK_ABSENT
+    receipt = completion.cubature_receipt
+    D_mean = np.asarray(completion.bare_D_mean)
+    D00 = complex(D_mean[0, 0])
+    transverse_trace = complex(np.trace(D_mean[1:, 1:]))
+    cubature_record = (
+        f"dimension={receipt.dimension}; method={receipt.method}; "
+        f"orders={receipt.orders}; "
+        f"nodes={completion.observed_physical_counts}; "
+        "weight_defect_max="
+        f"{max(receipt.weight_sum_defects):.3e}; "
+        f"<v>={D00.real:.12e}; "
+        f"tr<D_TT>={transverse_trace.real:.12e}")
     if response.charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_ABSENT:
         # SCMPA: dynamic bare route -- the packed CC block is absent by
         # name, the charge S/wing fold and the coupled Dyson solve are
         # skipped (no consumer); only the bare <D> is inserted.
-        receipt = completion.cubature_receipt
-        D00 = complex(np.asarray(completion.bare_D_mean)[0, 0])
         return (
             "bare <D> inserted into V and logical W_CURRENT = V_CURRENT; "
             "packed CC block ABSENT; charge S/wing fold and coupled Dyson "
             "SKIPPED (no consumer); "
             f"<D>[0,0]={D00.real:.9e}{D00.imag:+.9e}j; "
-            f"WS(orders={receipt.orders},"
-            f"nodes={completion.observed_physical_counts},"
+            f"{cubature_record}; WS("
             "final_error_ratio="
             f"{completion.mixed_convergence_error_ratios[-1]:.3e},"
             "no packed Dyson solve)")
@@ -1972,7 +1981,6 @@ def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
             "Gamma head has no occupied-state N_n statistics")
     mean, std, minimum, maximum, imag_max = (float(v) for v in stats)
     moments = np.asarray(completion.screened_moments, dtype=np.complex128)
-    D00 = complex(np.asarray(completion.bare_D_mean)[0, 0])
     M0000 = complex(moments[0, 0, 0, 0])
     family_norms = (
         float(np.linalg.norm(moments[0, 0])),
@@ -1984,10 +1992,10 @@ def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
     def _complex(value):
         return f"{value.real:.9e}{value.imag:+.9e}j"
 
-    receipt = completion.cubature_receipt
     return (
         "Gamma-cell completion applied (bare <D> into V, charge S00/wing "
         "head into W); "
+        f"{cubature_record}; "
         f"hall_source={completion.hall_source}; "
         f"sigma_H={np.asarray(completion.sigma_H).tolist()} bohr^-1; "
         f"<D>[0,0]={_complex(D00)}; M_00[0,0]={_complex(M0000)}; "
@@ -1999,8 +2007,7 @@ def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
         f"ward={completion.ward_residual:.3e}; "
         f"hermiticity={completion.hermiticity_residual:.3e}; "
         f"dyson_forward_bound={completion.max_dyson_forward_error_bound:.3e}; "
-        f"WS(orders={receipt.orders},nodes={completion.observed_physical_counts},"
-        "final_error_ratio="
+        "WS(final_error_ratio="
         f"{completion.mixed_convergence_error_ratios[-1]:.3e},"
         "max_dyson_backward_residual="
         f"{completion.max_backward_residual:.3e})")
@@ -2107,8 +2114,11 @@ def compute_static_photon_response(
     bare ``<D>`` into V and charge S/wings (plus optional Hall CT/TC) into W.
     The absent-charge dynamic layout passes no response and averages only the
     provider's bare D: it inserts ``<D>`` into V/logical current W and cannot
-    execute a hidden charge fold.  A nonzero Hall artifact is refused on the
-    bare route.  The completion runs under ``head_correction = full`` (the
+    execute a hidden charge fold.  The provider selects the exact slab polygon
+    or bulk polyhedron receipt from ``config.sys_dim``; the completion algebra
+    remains one dimension-general owner.  A nonzero Hall artifact is refused
+    on the bare route.  The completion runs under ``head_correction = full``
+    (the
     default); ``off`` skips it behind a DEBUG banner and is not a production
     setting (owner ruling 2026-09-01).  The current q^2/contact/complement
     terms are omitted by model in either case.
@@ -2376,19 +2386,16 @@ def compute_static_photon_response(
     head_completion = None
     charge_head_insertion_stats = None
     if coupled_head:
-        from vcoul import (
-            CoulombGeometry, get_kernel, slab_minibz_photon_cubature)
+        from vcoul import CoulombGeometry, get_kernel, minibz_photon_cubature
         from .head_correction import (
             charge_head_insertion_norm_stats,
-            complete_static_slab_photon_q0,
+            complete_static_photon_q0,
         )
         from .static_gauge_response import (
             build_static_photon_head_response)
 
         response = None
         if charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT:
-            from .static_gauge_response import (
-                build_static_photon_head_response)
             response = build_static_photon_head_response(
                 wfns_charge,
                 input_dir=config.input_dir,
@@ -2414,10 +2421,12 @@ def compute_static_photon_response(
                   for vector in photon_g0_vectors),
             layout, mesh_xy, axis_name="y")[0]
         geometry = CoulombGeometry.from_wfn(wfn)
-        cubature = slab_minibz_photon_cubature(
-            get_kernel(2), geometry, tuple(int(v) for v in meta.kgrid))
+        dimension = int(config.sys_dim)
+        cubature = minibz_photon_cubature(
+            get_kernel(dimension), geometry,
+            tuple(int(v) for v in meta.kgrid))
         V_packed, W_packed, head_completion = (
-            complete_static_slab_photon_q0(
+            complete_static_photon_q0(
                 V_packed, W_packed, response, g0_X, g0_Y, cubature,
                 mesh_xy=mesh_xy,
                 charge_block_state=charge_block_state,
@@ -2436,10 +2445,28 @@ def compute_static_photon_response(
                     "  [photon head] Gamma-cell completion applied: bare "
                     "<D> into V and logical W_CURRENT = V_CURRENT; packed "
                     "CC block ABSENT; charge S/wing fold SKIPPED (no "
-                    "consumer)", flush=True)
+                    "consumer); "
+                    f"dimension={dimension}, method={cubature.method}, "
+                    f"orders={cubature.orders}, "
+                    f"physical={cubature.physical_counts}, "
+                    "weight_defect_max="
+                    f"{max(cubature.weight_sum_defects):.3e}, "
+                    f"<v>={head_completion.bare_D_mean[0, 0].real:.12e}, "
+                    "tr<D_TT>="
+                    f"{np.trace(head_completion.bare_D_mean[1:, 1:]).real:.12e}",
+                    flush=True)
             else:
                 print_fn(
-                    "  [photon head] Gamma-cell completion applied: bare "
+                    "  [photon head] Gamma-cell completion applied: "
+                    f"dimension={dimension}, method={cubature.method}, "
+                    f"orders={cubature.orders}, "
+                    f"physical={cubature.physical_counts}, "
+                    "weight_defect_max="
+                    f"{max(cubature.weight_sum_defects):.3e}, "
+                    f"<v>={head_completion.bare_D_mean[0, 0].real:.12e}, "
+                    "tr<D_TT>="
+                    f"{np.trace(head_completion.bare_D_mean[1:, 1:]).real:.12e}; "
+                    "bare "
                     "<D> into V, charge S00/wing head into W; hall_source="
                     f"{response.hall_source}; "
                     f"ward={head_completion.ward_residual:.3e}, "

@@ -118,8 +118,9 @@ from vcoul.quadrature import (
 )
 from vcoul.minibz import (
     COULOMB_GAUGE_TT_SIGN,
-    SlabMinibzPhotonReceipt,
+    MinibzPhotonReceipt,
     apply_transverse_projector,
+    bulk_minibz_photon_cubature,
     transverse_projector,
     build_miniBZ_dq_cart,
     build_v_head_miniBZ_fn_3d,
@@ -128,10 +129,11 @@ from vcoul.minibz import (
     minibz_frac_to_cart,
     minibz_inscribed_sphere_r2,
     minibz_moment_tensor,
+    minibz_photon_cubature,
     minibz_voronoi_batches,
     iter_minibz_photon_samples,
     slab_minibz_photon_cubature,
-    validate_slab_minibz_photon_receipt,
+    validate_minibz_photon_receipt,
     sample_minibz_qpoints,
     wrap_points_to_voronoi,
 )
@@ -163,15 +165,17 @@ __all__ = [
     "GAUSS_LEGENDRE_INTERVAL_PROVENANCE", "gauss_legendre_interval",
     # mini-BZ sampling / averaging
     "COULOMB_GAUGE_TT_SIGN",
-    "SlabMinibzPhotonReceipt",
+    "MinibzPhotonReceipt",
     "apply_transverse_projector",
     "transverse_projector",
     "wrap_points_to_voronoi", "minibz_voronoi_batches",
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
     "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",
     "iter_minibz_photon_samples",
+    "minibz_photon_cubature",
     "slab_minibz_photon_cubature",
-    "validate_slab_minibz_photon_receipt",
+    "bulk_minibz_photon_cubature",
+    "validate_minibz_photon_receipt",
     "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",
     "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate

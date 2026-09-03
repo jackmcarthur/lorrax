@@ -225,7 +225,7 @@ def test_tt_head_tensor_matches_measured_slab_reference_ratio():
 # 5-8: the PACKED route's transverse head.  Same physical quantity, different
 # owner: on the packed bare-transverse route the TT q=Gamma head is not this
 # overlay at all -- it is the ``<D_TT>`` half of the bare ``<D>`` that
-# ``gw.head_correction.complete_static_slab_photon_q0`` inserts, from vcoul's
+# ``gw.head_correction.complete_static_photon_q0`` inserts, from vcoul's
 # EXACT Wigner-Seitz Duffy--Gauss polygon rule rather than the Sobol Voronoi
 # draw above.  These pin that owner against the same analytic identities, so
 # a regression in either owner is visible without comparing them to each
@@ -256,9 +256,9 @@ def _zero_S():
 
 def _moment_solve(chunk, weight, S):
     """Run the production coupled-head kernel on one cubature chunk."""
-    from gw.head_correction import static_slab_photon_head_moment_chunk
+    from gw.head_correction import static_photon_head_moment_chunk
 
-    moments, D_sum, *_ = static_slab_photon_head_moment_chunk(
+    moments, D_sum, *_ = static_photon_head_moment_chunk(
         chunk.q_cart, chunk.D_raw, np.zeros(3, dtype=np.float64),
         np.asarray(S, dtype=np.complex128),
         int(chunk.physical_count), weight)
@@ -516,13 +516,8 @@ def test_packed_bare_route_accepts_the_default_and_takes_the_packed_path(
     assert cfg.head.bispinor_tt_head_correction is False
 
 
-def test_outside_the_packed_envelope_the_overlay_is_still_accepted(tmp_path):
-    """The incumbent route keeps the overlay: it is its ONLY TT head.
-
-    A bulk (sys_dim = 3) bispinor COHSEX deck is outside the slab
-    completion's envelope, so it must still parse with the overlay on --
-    otherwise this change would delete a capability rather than move it.
-    """
+def test_bulk_packed_route_refuses_the_hand_tt_overlay(tmp_path):
+    """Bulk now has the same completed TT head, so the overlay double-counts."""
     from gw.gw_config import (packed_bare_transverse_route,
                               refuse_unsupported_bispinor_gw,
                               uses_static_photon_response)
@@ -530,11 +525,12 @@ def test_outside_the_packed_envelope_the_overlay_is_still_accepted(tmp_path):
         tmp_path,
         _PACKED_BARE_DECK.replace("sys_dim = 2", "sys_dim = 3"),
         name="bulk_bare_overlay.in"))
-    refuse_unsupported_bispinor_gw(cfg)     # no double-count refusal here
+    with pytest.raises(
+            ValueError, match="packed_bare_transverse_tt_head_double_count"):
+        refuse_unsupported_bispinor_gw(cfg)
     taken, reason = packed_bare_transverse_route(cfg)
-    assert not taken
-    assert "sys_dim = 3" in reason
-    assert not uses_static_photon_response(cfg)
+    assert taken, reason
+    assert uses_static_photon_response(cfg)
     assert cfg.head.bispinor_tt_head_correction is True
 
 
