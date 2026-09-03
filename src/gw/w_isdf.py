@@ -1259,11 +1259,11 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
             f"_get_w_solve_fn_distributed: n_rmu_logical={n_log} exceeds "
             f"extent {n_ext}")
 
-    # The distributed closure factors the padded operator and is independent
-    # of the logical prefix.  Keep n_log only for the public range check;
-    # including it here would compile duplicate solve programs for identical
-    # padded shapes.
-    cache_key = ("distributed", id(mesh_xy), nq, n_ext,
+    # The local masking closure captures the logical prefix.  Two callers can
+    # legitimately share one padded extent while owning different logical
+    # prefixes (notably scalar charge versus an explicit packed carrier), so
+    # omitting n_log would reuse a closure with the wrong exact-zero mask.
+    cache_key = ("distributed", id(mesh_xy), nq, n_ext, n_log,
                  str(distrib_la_batched_route))
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
