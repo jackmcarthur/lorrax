@@ -1141,31 +1141,46 @@ class StaticPhotonQ0FactorCarrier:
 
 @dataclass(frozen=True)
 class FaradayHeadPPMFactorCarrier:
-    """Even one-pole CT/TC Gamma head, kept only as rank-four factors.
+    """Ordered one-pole CT/TC Gamma head, kept only as rank-four factors.
 
     ``static_pairs`` and ``probe_pairs`` are the screened Hall-on minus
     ``sigma_H=0`` CT and TC samples.  ``B_pairs`` is their fitted ordinary
-    pole residue ``B=(R_+ + R_-)/2``.  The Hall response is even in frequency,
-    so there is deliberately no odd-residue field: both Sigma branches select
-    these same factors through :func:`gw.ppm_sigma._residue_for_space`.
+    pole residue ``B=(R_+ + R_-)/2``.  ``D_pairs`` is the ordered residue
+    ``D=(R_+ - R_-)/2`` read from the anti-Hermitian part of the completed
+    probe sample.  The bare Hall coefficient is even in frequency, but its
+    CT/TC completion is embedded in the same non-Hermitian imaginary-axis
+    screening environment as the GN body; the two parities must not be
+    conflated.  Sigma selects ``B+D`` / ``B-D`` through the one shared
+    :func:`gw.ppm_sigma._residue_for_space` convention.
     """
 
     omega_h_ry: float
     B_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+    D_pairs: tuple[tuple[jax.Array, jax.Array], ...]
     static_pairs: tuple[tuple[jax.Array, jax.Array], ...]
     probe_pairs: tuple[tuple[jax.Array, jax.Array], ...]
     sigma_H_static: np.ndarray
     sigma_H_probe: np.ndarray
     probe_frequency_ry: complex
     probe_fit_relative_error: float
+    odd_even_residue_ratio: float
+    raw_pair_overlaps: tuple[complex, complex]
 
     def __post_init__(self) -> None:
-        if (len(self.B_pairs), len(self.static_pairs), len(self.probe_pairs)) != (
-                2, 2, 2):
+        if (len(self.B_pairs), len(self.D_pairs), len(self.static_pairs),
+                len(self.probe_pairs)) != (2, 4, 2, 2):
             raise ValueError(
-                "Faraday head needs exactly two factor families (CT and TC)")
+                "Faraday head needs two B/static/probe factor families "
+                "(CT and TC) and four ordered-D factors")
         if not np.isfinite(self.omega_h_ry) or self.omega_h_ry <= 0.0:
             raise ValueError("Faraday head pole frequency must be positive")
+        if (not np.isfinite(self.probe_fit_relative_error)
+                or not np.isfinite(self.odd_even_residue_ratio)
+                or self.probe_fit_relative_error < 0.0
+                or self.odd_even_residue_ratio < 0.0):
+            raise ValueError("Faraday head fit diagnostics must be finite")
+        if len(self.raw_pair_overlaps) != 2:
+            raise ValueError("Faraday head needs one raw overlap per CT/TC pair")
 
 
 @dataclass(frozen=True)
@@ -1870,6 +1885,169 @@ def _factor_pair_inner(first, second):
     return jnp.sum(left_gram * right_gram)
 
 
+def _factor_family_inner(first, second):
+    """Frobenius inner product of two sums of rank-four operators."""
+    return sum(
+        _factor_pair_inner(pair_a, pair_b)
+        for pair_a in tuple(first) for pair_b in tuple(second))
+
+
+def _scale_factor_family(pairs, scale):
+    """Scale a low-rank operator without changing either factor layout."""
+    value = jnp.asarray(scale, dtype=jnp.complex128)
+    return tuple((value * left, right) for left, right in tuple(pairs))
+
+
+def _adjoint_factor_family(pairs, mesh_xy: Mesh):
+    r"""Return factors for ``(sum L.T R)^dagger`` without a dense body.
+
+    The packed update uses a plain transpose, not a conjugate transpose, so
+    one pair's adjoint is ``(conj(R), conj(L))``.  Exchanging the two mesh
+    axes is a bounded rank-four reshard, never a packed-body gather.
+    """
+    sh_x = NamedSharding(mesh_xy, P(None, "x"))
+    sh_y = NamedSharding(mesh_xy, P(None, "y"))
+    result = []
+    with mesh_xy:
+        for left, right in tuple(pairs):
+            adjoint_left = jax.lax.with_sharding_constraint(
+                jnp.conj(right), sh_x)
+            adjoint_right = jax.lax.with_sharding_constraint(
+                jnp.conj(left), sh_y)
+            result.append((adjoint_left, adjoint_right))
+    jax.block_until_ready(tuple(result))
+    return tuple(result)
+
+
+def _fit_ordered_faraday_factor_samples(
+    static_pairs,
+    probe_pairs,
+    probe_frequency: complex,
+    *,
+    mesh_xy: Mesh,
+    print_fn=print,
+):
+    r"""Fit ``B`` and ordered ``D`` from two CT/TC factor samples.
+
+    A factor gauge is ``L -> c L, R -> R/c`` because the represented update
+    is ``L.T R``.  :func:`_factor_family_inner` is exactly invariant under
+    that transformation, so an imaginary raw overlap cannot be repaired by
+    a legitimate factor phase convention.  The named physical selection is
+    instead the GN ordered split of the completed probe operator,
+    ``H=(Wp+Wp^dagger)/2`` and ``A=(Wp-Wp^dagger)/2``.  ``H`` fixes the
+    static-anchored even pole; ``A`` fixes ``D`` exactly as in the body fit.
+
+    Returns
+    -------
+    tuple
+        ``(Omega, B_pairs, D_pairs, even_fit_error, |D|/|B|,
+        raw_pair_overlaps)``.  Each residue remains a bounded sequence of
+        rank-four factors.
+    """
+    static_pairs = tuple(static_pairs)
+    probe_pairs = tuple(probe_pairs)
+    if len(static_pairs) != 2 or len(probe_pairs) != 2:
+        raise ValueError("ordered Faraday fit requires CT and TC factor pairs")
+    probe = complex(probe_frequency)
+    if (not np.isfinite(probe.real) or not np.isfinite(probe.imag)
+            or probe.real != 0.0 or probe.imag == 0.0):
+        raise ValueError(
+            "GATE dynamic_hall_head_ordered_probe_axis: the ordered Hall "
+            f"probe must be nonzero and purely imaginary; got {probe!r}")
+
+    static_adjoint = _adjoint_factor_family(static_pairs, mesh_xy)
+    probe_adjoint = _adjoint_factor_family(probe_pairs, mesh_xy)
+    static_anti = (
+        _scale_factor_family(static_pairs, 0.5)
+        + _scale_factor_family(static_adjoint, -0.5))
+    probe_herm = (
+        _scale_factor_family(probe_pairs, 0.5)
+        + _scale_factor_family(probe_adjoint, 0.5))
+    probe_anti = (
+        _scale_factor_family(probe_pairs, 0.5)
+        + _scale_factor_family(probe_adjoint, -0.5))
+
+    pair_cross = tuple(
+        _factor_pair_inner(anchor, sample)
+        for anchor, sample in zip(static_pairs, probe_pairs))
+    static_norm = _factor_family_inner(static_pairs, static_pairs)
+    probe_norm = _factor_family_inner(probe_pairs, probe_pairs)
+    static_anti_norm = _factor_family_inner(static_anti, static_anti)
+    probe_herm_norm = _factor_family_inner(probe_herm, probe_herm)
+    probe_anti_norm = _factor_family_inner(probe_anti, probe_anti)
+    raw_cross = _factor_family_inner(static_pairs, probe_pairs)
+    herm_cross = _factor_family_inner(static_pairs, probe_herm)
+    values = jax.device_get((
+        *pair_cross, static_norm, probe_norm, static_anti_norm,
+        probe_herm_norm, probe_anti_norm, raw_cross, herm_cross))
+    (ct_cross_h, tc_cross_h, static_norm_h, probe_norm_h,
+     static_anti_norm_h, probe_herm_norm_h, probe_anti_norm_h,
+     raw_cross_h, herm_cross_h) = (complex(value) for value in values)
+    pair_cross_h = (ct_cross_h, tc_cross_h)
+    scale = max(abs(static_norm_h), abs(probe_norm_h), 1.0e-300)
+    if (static_norm_h.real <= 1.0e-300
+            or abs(static_norm_h.imag) > 1.0e-12 * scale):
+        raise ValueError(
+            "GATE dynamic_hall_head_static_anchor: the Hall-on/off CT/TC "
+            "static factor family has no positive finite Frobenius norm")
+    static_anti_ratio = np.sqrt(
+        max(static_anti_norm_h.real, 0.0) / static_norm_h.real)
+    # This norm is obtained by subtracting two independently contracted
+    # O(||W0||^2) Gram sums before taking a square root, so its floating-point
+    # resolution is O(sqrt(eps)), not O(eps).  The complex-overlap gate below
+    # remains at 1e-10; this separate certificate only rejects a resolvable
+    # static anti-Hermitian operator.
+    static_anti_tolerance = 64.0 * np.sqrt(np.finfo(np.float64).eps)
+    if static_anti_ratio > static_anti_tolerance:
+        raise ValueError(
+            "GATE dynamic_hall_head_static_anchor: the z=0 Hall factor "
+            "family is not Hermitian; ||A0||/||W0||="
+            f"{static_anti_ratio:.3e}")
+    if abs(herm_cross_h.imag) > 1.0e-10 * scale:
+        raise ValueError(
+            "GATE dynamic_hall_head_complex_fit: the ordered Hermitian "
+            "probe overlap is not real; Im<W0,Hp>="
+            f"{herm_cross_h.imag:.3e}")
+
+    ratio = herm_cross_h.real / static_norm_h.real
+    if not 0.0 < ratio < 1.0:
+        raise ValueError(
+            "GATE dynamic_hall_head_one_pole: an even positive-frequency "
+            "one-pole fit requires 0 < <W0,Hp>/<W0,W0> < 1; "
+            f"got {ratio:.17e}")
+    probe_magnitude = abs(probe.imag)
+    omega_h = probe_magnitude * np.sqrt(ratio / (1.0 - ratio))
+    even_residual_sq = max(
+        probe_herm_norm_h.real - 2.0 * ratio * herm_cross_h.real
+        + ratio * ratio * static_norm_h.real,
+        0.0)
+    even_fit_error = np.sqrt(
+        even_residual_sq / max(probe_herm_norm_h.real, 1.0e-300))
+    B_pairs = _scale_factor_family(static_pairs, -0.5 * omega_h)
+    odd_scale = 1j * (
+        probe_magnitude * probe_magnitude + omega_h * omega_h
+    ) / (2.0 * probe_magnitude)
+    D_pairs = _scale_factor_family(probe_anti, odd_scale)
+    B_norm = 0.5 * omega_h * np.sqrt(static_norm_h.real)
+    D_norm = abs(odd_scale) * np.sqrt(max(probe_anti_norm_h.real, 0.0))
+    odd_even_ratio = D_norm / max(B_norm, 1.0e-300)
+
+    if jax.process_index() == 0:
+        print_fn(
+            "  [photon head] Faraday ordered factors: "
+            f"CT <W0,Wp>={ct_cross_h.real:.17e}{ct_cross_h.imag:+.17e}j; "
+            f"TC <W0,Wp>={tc_cross_h.real:.17e}{tc_cross_h.imag:+.17e}j; "
+            "combined raw <W0,Wp>="
+            f"{raw_cross_h.real:.17e}{raw_cross_h.imag:+.17e}j; "
+            f"ordered Im<W0,Hp>={herm_cross_h.imag:.3e}; "
+            f"||A0||/||W0||={static_anti_ratio:.3e}; "
+            f"||D_H||/||B_H||={odd_even_ratio:.3e}; "
+            f"even-fit residual={even_fit_error:.3e}")
+    return (
+        float(omega_h), B_pairs, D_pairs, float(even_fit_error),
+        float(odd_even_ratio), pair_cross_h)
+
+
 def fit_dynamic_slab_photon_cttc_q0(
     static_response,
     probe_response,
@@ -1882,8 +2060,9 @@ def fit_dynamic_slab_photon_cttc_q0(
     g0_Y: jax.Array,
     cubature_receipt,
     mesh_xy: Mesh,
+    print_fn=print,
 ) -> FaradayHeadPPMFactorCarrier:
-    r"""Fit the Hall-on/off CT/TC completion to one even analytic pole.
+    r"""Fit the Hall-on/off CT/TC completion to one ordered analytic pole.
 
     Each frequency executes the incumbent coupled 4x4 mini-BZ solve twice,
     with the authenticated ``sigma_H(z)`` and with literal ``sigma_H=0``.
@@ -1892,8 +2071,10 @@ def fit_dynamic_slab_photon_cttc_q0(
     TC.  A shared scalar pole is fitted in the operators' Frobenius metric,
     evaluated from 4x4 Gram matrices; no centroid-square probe body exists.
 
-    The model is ``W_H(z)=2*Omega_H*B_H/(z^2-Omega_H^2)``.  Hall is even in
-    ``z``, hence ``B_odd=None`` and ``B_H=-Omega_H*W_H(0)/2``.
+    The model is ``W_H(z)=(2*Omega_H*B_H+2*z*D_H)/
+    (z^2-Omega_H^2)``.  The Hall coefficient is even in ``z``; the completed
+    ordered response can nevertheless have ``D_H`` because its imaginary-axis
+    screening environment is non-Hermitian without time reversal.
     """
     from vcoul import validate_slab_minibz_photon_receipt
 
@@ -1934,44 +2115,13 @@ def fit_dynamic_slab_photon_cttc_q0(
         YW_y=probe_YW, WZ_x=probe_WZ, layout=probe_response.layout,
         mesh_xy=mesh_xy, cell_volume=float(receipt.cell_volume))
 
-    static_norm = sum(_factor_pair_inner(pair, pair)
-                      for pair in static_pairs)
-    probe_norm = sum(_factor_pair_inner(pair, pair)
-                     for pair in probe_pairs)
-    cross = sum(_factor_pair_inner(static, probe)
-                for static, probe in zip(static_pairs, probe_pairs))
-    static_norm_h, probe_norm_h, cross_h = (
-        complex(value) for value in jax.device_get(
-            (static_norm, probe_norm, cross)))
-    scale = max(abs(static_norm_h), abs(probe_norm_h), 1.0e-300)
-    if (static_norm_h.real <= 1.0e-300
-            or abs(static_norm_h.imag) > 1.0e-12 * scale):
-        raise ValueError(
-            "GATE dynamic_hall_head_static_anchor: the Hall-on/off CT/TC "
-            "static factor family has no positive finite Frobenius norm")
-    if abs(cross_h.imag) > 1.0e-10 * scale:
-        raise ValueError(
-            "GATE dynamic_hall_head_complex_fit: the imaginary-axis Hall "
-            f"factor overlap is not real; Im<0,p>={cross_h.imag:.3e}")
-    ratio = cross_h.real / static_norm_h.real
-    if not 0.0 < ratio < 1.0:
-        raise ValueError(
-            "GATE dynamic_hall_head_one_pole: an even positive-frequency "
-            "one-pole fit requires 0 < <W0,Wp>/<W0,W0> < 1; "
-            f"got {ratio:.17e}")
     probe_frequency = complex(probe_response.frequency_ry)
-    probe_magnitude = abs(probe_frequency)
-    omega_h = probe_magnitude * np.sqrt(ratio / (1.0 - ratio))
-    residual_sq = max(
-        probe_norm_h.real - 2.0 * ratio * cross_h.real
-        + ratio * ratio * static_norm_h.real,
-        0.0)
-    probe_fit_error = np.sqrt(residual_sq / max(probe_norm_h.real, 1.0e-300))
-    B_pairs = tuple(
-        (-0.5 * float(omega_h) * left, right)
-        for left, right in static_pairs)
+    (omega_h, B_pairs, D_pairs, probe_fit_error, odd_even_ratio,
+     pair_overlaps) = _fit_ordered_faraday_factor_samples(
+         static_pairs, probe_pairs, probe_frequency,
+         mesh_xy=mesh_xy, print_fn=print_fn)
     return FaradayHeadPPMFactorCarrier(
-        omega_h_ry=float(omega_h), B_pairs=B_pairs,
+        omega_h_ry=float(omega_h), B_pairs=B_pairs, D_pairs=D_pairs,
         static_pairs=static_pairs, probe_pairs=probe_pairs,
         sigma_H_static=np.asarray(
             jax.device_get(static_response.sigma_H), dtype=np.float64),
@@ -1979,6 +2129,8 @@ def fit_dynamic_slab_photon_cttc_q0(
             jax.device_get(probe_response.sigma_H), dtype=np.float64),
         probe_frequency_ry=probe_frequency,
         probe_fit_relative_error=float(probe_fit_error),
+        odd_even_residue_ratio=float(odd_even_ratio),
+        raw_pair_overlaps=tuple(pair_overlaps),
     )
 
 

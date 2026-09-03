@@ -449,13 +449,13 @@ def test_ordered_fit_is_the_incumbent_fit_on_a_hermitian_probe():
     np.testing.assert_allclose(B_o, B_i, rtol=0, atol=1.0e-13 * np.max(np.abs(B_i)))
 
 
-def test_faraday_ct_family_has_exact_zero_ordered_residue_and_sigct_odd():
-    """Negative control for the refused production-minus-D=0 diagnostic.
+def test_hermitian_faraday_ct_family_has_zero_ordered_residue():
+    """A Hermitian CT/TC probe is the exact ``D_H=0`` negative control.
 
-    A Hall CT/TC head is magnetisation-odd but frequency-even.  Its
-    imaginary-axis sample is therefore Hermitian, so the ordered GN split
-    has ``D=0`` and a ``sigCT_odd`` defined by subtracting a D=0 twin is
-    identically blind to the Hall term.
+    This does not assume that a real magnet's *completed* probe is Hermitian:
+    the charge/body environment can supply its ordered anti-Hermitian part.
+    It proves that when that part is absent the shared GN split returns
+    ``D=0`` exactly.
     """
     omega = np.full((1, 4, 4), 1.7, dtype=np.float64)
     residue = np.zeros((1, 4, 4), dtype=np.complex128)
@@ -536,6 +536,9 @@ def test_faraday_sigma_consumer_is_hall_on_off_and_magnetisation_odd(
         0, [-0.3j, 0.2 + 0.1j, -0.4 + 0.2j, 0.5], "y")
     B_pairs = ((left_charge, right_current),
                (left_current, right_charge))
+    D_pairs = tuple(
+        [(0.2 * left, right) for left, right in B_pairs]
+        + [(jnp.zeros_like(left), right) for left, right in B_pairs])
     omega_h = 1.3
     static_pairs = tuple(
         (-2.0 * left / omega_h, right) for left, right in B_pairs)
@@ -548,6 +551,8 @@ def test_faraday_sigma_consumer_is_hall_on_off_and_magnetisation_odd(
             omega_h_ry=omega_h,
             B_pairs=tuple((sign * left, right)
                           for left, right in B_pairs),
+            D_pairs=tuple((sign * left, right)
+                          for left, right in D_pairs),
             static_pairs=tuple((sign * left, right)
                                for left, right in static_pairs),
             probe_pairs=tuple((sign * left, right)
@@ -555,7 +560,9 @@ def test_faraday_sigma_consumer_is_hall_on_off_and_magnetisation_odd(
             sigma_H_static=sign * np.array([0.0, 0.0, 1.0e-4]),
             sigma_H_probe=sign * np.array([0.0, 0.0, 3.0e-5]),
             probe_frequency_ry=1j * OMEGA_P,
-            probe_fit_relative_error=0.0)
+            probe_fit_relative_error=0.0,
+            odd_even_residue_ratio=0.2,
+            raw_pair_overlaps=(0.0j, 0.0j))
 
     kwargs = dict(
         wfns_charge=charge, wfns_transverse=transverse,

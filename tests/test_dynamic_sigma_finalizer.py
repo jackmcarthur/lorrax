@@ -172,6 +172,8 @@ def test_finalizer_adds_faraday_once_and_books_it_to_ct(monkeypatch):
 
     faraday = SimpleNamespace(
         omega_h_ry=1.25,
+        probe_fit_relative_error=3.0e-5,
+        odd_even_residue_ratio=0.2,
         sigma_H_static=np.array([0.0, 0.0, 4.0e-8]),
         sigma_H_probe=np.array([0.0, 0.0, 1.5e-8]))
     config = SimpleNamespace(
@@ -198,6 +200,8 @@ def test_finalizer_adds_faraday_once_and_books_it_to_ct(monkeypatch):
         np.stack((np.ones((2, 2)), 5.0 * np.ones((2, 2)),
                   4.0 * np.ones((2, 2)))))
     assert result.faraday_head_omega_h_ry == 1.25
+    assert result.faraday_probe_even_fit_relative_error == 3.0e-5
+    assert result.faraday_odd_even_residue_ratio == 0.2
     assert result.faraday_sigma_h_probe_bohr_inv == (0.0, 0.0, 1.5e-8)
 
 

@@ -2415,6 +2415,7 @@ def compute_static_photon_response(
                 g0_X=g0_X, g0_Y=g0_Y,
                 cubature_receipt=cubature,
                 mesh_xy=mesh_xy,
+                print_fn=print_fn,
             )
 
         V_packed, W_packed, head_completion = (
@@ -2442,14 +2443,19 @@ def compute_static_photon_response(
             head_completion = replace(
                 head_completion, faraday_ppm=faraday_ppm)
             faraday_head_record = (
-                "PREPARED (even one-pole CT/TC Gamma-head factors; "
+                "PREPARED (ordered one-pole CT/TC Gamma-head factors; "
                 f"Omega_H={faraday_ppm.omega_h_ry:.17e} Ry; "
+                "||D_H||/||B_H||="
+                f"{faraday_ppm.odd_even_residue_ratio:.3e}; "
                 "Sigma insertion pending the shared PPM head branch)")
             if jax.process_index() == 0:
                 print_fn(
                     "  [photon head] Faraday factors: Hall-on minus "
                     "sigma_H=0; Omega_H="
-                    f"{faraday_ppm.omega_h_ry:.8e} Ry; probe-fit residual="
+                    f"{faraday_ppm.omega_h_ry:.8e} Ry; "
+                    "ordered ||D_H||/||B_H||="
+                    f"{faraday_ppm.odd_even_residue_ratio:.3e}; "
+                    "even-probe-fit residual="
                     f"{faraday_ppm.probe_fit_relative_error:.3e}",
                     flush=True)
 

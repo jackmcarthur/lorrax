@@ -40,7 +40,7 @@ current density `ψ†α^iψ`).
 | screened TT/CT/TC (packed 4×4) | **static only** (`compute_mode = cohsex`) | charge CC `q²` + the charge wings + **optional** Hall CT/TC `q¹` (§4), **always on**; `head_correction = off` is a DEBUG skip behind a loud banner | `bispinor_gw = full_static_cohsex` | experimental, insulating slab, one shot |
 | *unscreened* TT via the same packed operator | current block evaluated once at `ω = 0`, in static COHSEX and packed GN/HL-PPM | the same Γ-cell completion, charge-only `R(q)`, returning `diag(W^{00}_h, ⟨D_TT⟩)`; a static nonzero Hall artifact remains refused, while packed GN owns its dynamic Hall pole (§4.5) | `bispinor_gw = bare_transverse` inside the packed envelope | experimental, slab, one shot; body byte-identical to the incumbent route when compared without its head |
 | the packed operator on a **dynamic** Σ | **CC dynamic, current blocks static**: `W_00(ω)` follows the PPM model while the other fifteen packed body blocks are evaluated at `ω = 0`; magnetic GN adds the analytic CT/TC Γ pole | CC: the dynamic model's own head (§3.3) for `Σ_c` plus the scalar band-diagonal `⟨v⟩` head for `Σ_X`; TT: the packed Γ-cell completion; CT/TC: Hall-off static body plus the Hall-on/off pole (§4.5) | either `bispinor_gw` value with `compute_mode` in {`gn_ppm`, `hl_ppm`} inside the packed envelope; magnetic Faraday insertion is GN; `mpa` stays on the incumbent route | experimental, slab, one shot; the current body blocks' `ω`-dependence is neglected and bounded as in §2.2 |
-| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled at `0` and `i*omega_p` | one sharded Kubo producer, authenticated schema-v2 transaction, two coupled completion samples retained as CT/TC rank-four factors, and one analytic even pole (§4.5) | measured-broken-TR, insulating packed GN | **applied**; both Sigma branches receive ordinary `B_H` with `D_H = 0`, and `sigCT_hall` is the Hall-on/off observable |
+| dynamic Hall/Faraday Γ head | `sigma_H(z)` is even in `z` and odd in magnetisation; sampled at `0` and `i*omega_p` | one sharded Kubo producer, authenticated schema-v2 transaction, two coupled completion samples retained as CT/TC rank-four factors, and one ordered analytic pole (§4.5) | measured-broken-TR, insulating packed GN | **applied**; the completed probe is split into Hermitian/anti-Hermitian parts and Sigma receives `R_+=B_H+D_H` / `R_-=B_H-D_H`; `sigCT_hall` is the Hall-on/off observable |
 | retarded / dynamic photon `D^{IJ}(ω)` — the current blocks' own frequency dependence | — | — | none | **does not exist**; bounded from above in §2.2 |
 
 Binding rule ([decisions, 2026-09-01](../architecture/decisions.md)): COHSEX
@@ -675,7 +675,7 @@ no response kernel, and no pairwise Sigma stage: the same sharded band-pair
 reduction that owns `sigma_H(0)` evaluates all requested frequencies in one
 bounded sweep.
 
-#### Even one-pole completion and Sigma insertion
+#### Ordered one-pole completion and Sigma insertion
 
 For any head family represented by
 
@@ -685,11 +685,14 @@ W_h^c(z)=\frac{R_+}{z-\Omega_h}-\frac{R_-}{z+\Omega_h}
 B=\frac{R_++R_-}{2},\quad D=\frac{R_+-R_-}{2},
 $$
 
-an even Hall sample has `D_H = 0` exactly. Magnetisation oddness resides in
-the sign of the ordinary residue `B_H`, not in a frequency-odd residue.
-Both conduction and valence branches pass through
-`ppm_sigma._residue_for_space(..., B_odd=None)` and therefore receive the
-same Hall residue.
+The evenness of the *bare coefficient* `sigma_H(z)` does not make the
+completed `W_H(i*omega_p)` Hermitian in a magnet.  The charge/body screening
+environment has the same ordered-orientation identity as the GN body,
+`W(i*omega_p)^dagger = W(-i*omega_p)`, and can therefore supply an
+anti-Hermitian part at the positive imaginary-axis sample.  Calling that
+part a phase gauge would be wrong: the packed factor update is `L.T R`, so
+its legitimate gauge is `L -> c L`, `R -> R/c`; both the represented
+operator and every factor-Gram Frobenius overlap are exactly invariant.
 
 The dynamic packed GN route freezes its ordinary packed current body as the
 literal `sigma_H=0` twin. It then executes the existing coupled 4x4
@@ -699,23 +702,46 @@ Only two rank-four factor pairs leave those solves: one CT pair and one TC
 pair, each stored as `left_rows_X` and `right_rows_Y`. No probe-frequency
 packed body is constructed.
 
-Writing the combined CT/TC Hall-on/off factors as `F_0` and `F_p`, the
-two-sample even fit uses the factor-Gram Frobenius overlap
+Writing the combined CT/TC Hall-on/off operators as `F_0` and `F_p`, the
+named GN ordered selection is
 
 $$
-r={\mathrm{Re}\langle F_0,F_p\rangle_F\over
+H_p={F_p+F_p^\dagger\over2},\qquad
+A_p={F_p-F_p^\dagger\over2}.
+$$
+
+The static anchor is Hermitian.  Its overlap with `H_p` fixes the ordinary
+pole,
+
+$$
+r={\mathrm{Re}\langle F_0,H_p\rangle_F\over
         \langle F_0,F_0\rangle_F},\qquad
 \Omega_H=\omega_p\sqrt{r\over1-r},\qquad
-B_H=-{\Omega_H\over2}F_0 .
+B_H=-{\Omega_H\over2}F_0,
+$$
+
+while the anti-Hermitian sample fixes the ordered residue without another
+frequency point,
+
+$$
+D_H=iA_p{\omega_p^2+\Omega_H^2\over2\omega_p}.
 $$
 
 Thus
-`F_H(z)=2*Omega_H*B_H/(z^2-Omega_H^2)`. The fit works on 4x4 Gram matrices,
-so the largest retained object is still one rank-four factor family. The
-Sigma consumer streams one final CT or TC Lorentz block at a time through
-the incumbent q=0 convolution and analytic pole denominators. Heads are
-analytic per pole: there is no quadrature work, no new response kernel, and
-no per-band-pair stage.
+`F_H(z)=(2*Omega_H*B_H+2*z*D_H)/(z^2-Omega_H^2)`.  The fit works on 4x4
+factor Gram matrices.  `D_H` is a four-factor sum (the probe plus its
+adjoint), still O(N) storage; no dense body is formed.  Both branches pass
+through `ppm_sigma._residue_for_space`, selecting `B_H+D_H` for conduction
+and `B_H-D_H` for valence.  The Sigma consumer streams one final CT or TC
+Lorentz block at a time through the incumbent q=0 convolution and analytic
+pole denominators. Heads are analytic per pole: there is no quadrature work,
+no new response kernel, and no per-band-pair stage.
+
+The residual of the one-pole fit to `H_p` is printed separately from
+`||D_H||/||B_H||`.  A second even pole cannot be identified from the two
+schema-v2 samples: it requires at least one additional authenticated Hall
+and charge-response frequency.  It must never be inferred by phase-rotating
+one factor side, because that changes the physical operator.
 
 This distinguishes two diagnostics that must not be conflated:
 
@@ -723,11 +749,13 @@ This distinguishes two diagnostics that must not be conflated:
   frequency-odd ordered residue;
 * the Hall/Faraday diagnostic `sigCT_hall` is
   `Sigma[sigma_H] - Sigma[sigma_H=0]` and measures a
-  magnetisation-odd, frequency-even residue.
+  magnetisation-odd completed CT/TC response, including both `B_H` and
+  `D_H`.
 
 There is therefore no `sigCT_odd` column. On a measured-broken-TR packed GN
 run the record says `Faraday head : APPLIED`, names both Hall samples and
-`Omega_H`, and reports the maximum and mean per-state `|sigCT_hall|`.
+`Omega_H`, `||D_H||/||B_H||`, the even-probe residual, and the maximum and
+mean per-state `|sigCT_hall|`.
 `SymMaps.trs_allowed=true` takes no new producer, completion, or Sigma path
 and records `EXACT ZERO`; `head_correction=off` records the DEBUG skip. A
 measured-broken-TR run without an authenticated artifact records `ABSENT`

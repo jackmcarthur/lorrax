@@ -77,6 +77,7 @@ from gw.head_correction import (  # noqa: E402
     _dynamic_photon_head_moments,
     _dynamic_photon_head_small_system,
     _faraday_cttc_factor_pairs,
+    _fit_ordered_faraday_factor_samples,
     canonicalize_static_gauge_q2_tensor,
     complete_static_slab_photon_q0,
     fit_dynamic_slab_photon_cttc_q0,
@@ -757,7 +758,7 @@ def test_zero_wings_reduce_the_folded_response_to_S():
 
 
 def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
-    """The even Hall pole is the Hall-on/off CT/TC completion itself.
+    """The ordered Hall pole is the Hall-on/off CT/TC completion itself.
 
     This is the synthetic-magnet end-to-end cell: every contour point runs
     the incumbent coupled 4x4 completion kernel, then its CT/TC rank-four
@@ -790,11 +791,15 @@ def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
         g0_X=fixture.g0_X, g0_Y=fixture.g0_Y,
         cubature_receipt=receipt, mesh_xy=mesh)
 
-    # Frequency-even means one ordinary residue family and literally no D.
-    assert not hasattr(fitted, "B_odd_pairs")
+    # This toy's completed probe is Hermitian, so its ordered D cancels even
+    # though production retains the four-factor representation.
+    assert len(fitted.D_pairs) == 4
+    assert fitted.odd_even_residue_ratio < 1.0e-12
     assert fitted.probe_fit_relative_error < 1.0e-4
     B_dense = _cttc_dense_vector(
         fitted.B_pairs, fixture.layout, mesh)
+    D_dense = _cttc_dense_vector(
+        fitted.D_pairs, fixture.layout, mesh)
     static_dense = _cttc_dense_vector(
         fitted.static_pairs, fixture.layout, mesh)
     probe_dense = _cttc_dense_vector(
@@ -803,9 +808,67 @@ def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
         -2.0 * B_dense / fitted.omega_h_ry, static_dense,
         rtol=0.0, atol=2.0e-13 * np.max(np.abs(static_dense)))
     fitted_probe = (
-        2.0 * fitted.omega_h_ry * B_dense
+        (2.0 * fitted.omega_h_ry * B_dense
+         + 2.0 * probe_frequency * D_dense)
         / (probe_frequency ** 2 - fitted.omega_h_ry ** 2))
     assert _rel(fitted_probe, probe_dense) < 1.0e-4
+
+    # A legitimate factor gauge changes L and R by inverse phases.  It leaves
+    # both the packed operator and its complex overlap invariant; therefore it
+    # cannot be used to rotate away a physical anti-Hermitian probe component.
+    rng = np.random.default_rng(903)
+    phases = np.exp(1j * rng.uniform(-np.pi, np.pi, len(fitted.probe_pairs)))
+    gauged_probe = tuple(
+        (phase * left, right / phase)
+        for phase, (left, right) in zip(phases, fitted.probe_pairs))
+    (gauge_omega, gauge_B, gauge_D, gauge_error, gauge_ratio,
+     gauge_overlaps) = _fit_ordered_faraday_factor_samples(
+         fitted.static_pairs, gauged_probe, probe_frequency,
+         mesh_xy=mesh, print_fn=lambda _message: None)
+    np.testing.assert_allclose(gauge_omega, fitted.omega_h_ry, rtol=2e-14)
+    np.testing.assert_allclose(gauge_error, fitted.probe_fit_relative_error,
+                               rtol=0.0, atol=5e-11)
+    assert gauge_ratio < 64.0 * np.sqrt(np.finfo(np.float64).eps)
+    np.testing.assert_allclose(gauge_overlaps, fitted.raw_pair_overlaps,
+                               rtol=2e-14, atol=2e-14)
+    np.testing.assert_allclose(
+        _cttc_dense_vector(gauge_B, fixture.layout, mesh), B_dense,
+        rtol=2e-14, atol=2e-14 * np.max(np.abs(B_dense)))
+    np.testing.assert_allclose(
+        _cttc_dense_vector(gauge_D, fixture.layout, mesh), D_dense,
+        rtol=0.0, atol=2e-13 * np.max(np.abs(B_dense)))
+
+    # A physical one-sided phase is different from the inverse factor gauge:
+    # it makes the completed probe non-Hermitian.  The ordered split retains
+    # it as D_H and closes the complex sample without weakening the real-
+    # overlap gate on the Hermitian half.
+    ordered_ratio = 0.35
+    ordered_anti = 0.07
+    ordered_probe = tuple(
+        ((ordered_ratio + 1j * ordered_anti) * left, right)
+        for left, right in fitted.static_pairs)
+    (ordered_omega, ordered_B, ordered_D, ordered_error,
+     ordered_D_over_B, ordered_overlaps) = (
+        _fit_ordered_faraday_factor_samples(
+            fitted.static_pairs, ordered_probe, probe_frequency,
+            mesh_xy=mesh, print_fn=lambda _message: None))
+    assert abs(sum(ordered_overlaps).imag) > 1.0e-3 * abs(
+        sum(ordered_overlaps).real)
+    assert ordered_D_over_B > 1.0e-3
+    assert ordered_error < 1.0e-12
+    ordered_B_dense = _cttc_dense_vector(
+        ordered_B, fixture.layout, mesh)
+    ordered_D_dense = _cttc_dense_vector(
+        ordered_D, fixture.layout, mesh)
+    ordered_probe_dense = _cttc_dense_vector(
+        ordered_probe, fixture.layout, mesh)
+    ordered_model = (
+        (2.0 * ordered_omega * ordered_B_dense
+         + 2.0 * probe_frequency * ordered_D_dense)
+        / (probe_frequency ** 2 - ordered_omega ** 2))
+    np.testing.assert_allclose(
+        ordered_model, ordered_probe_dense, rtol=2e-12,
+        atol=2e-12 * np.max(np.abs(ordered_probe_dense)))
 
     static_S, static_YW, static_WZ = _dynamic_photon_head_small_system(
         fixture.response, W_packed[0],
@@ -834,7 +897,7 @@ def test_dynamic_faraday_rank_four_fit_closes_dense_contour_and_twins():
         ratio = omega_reference ** 2 / (y * y + omega_reference ** 2)
         direct = _cttc_dense_vector(
             direct_pairs(ratio, z), fixture.layout, mesh)
-        model = (2.0 * fitted.omega_h_ry * B_dense
+        model = ((2.0 * fitted.omega_h_ry * B_dense + 2.0 * z * D_dense)
                  / (z * z - fitted.omega_h_ry ** 2))
         contour_error = max(contour_error, _rel(model, direct))
     assert contour_error < 1.0e-3

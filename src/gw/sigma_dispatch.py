@@ -170,6 +170,8 @@ class SigmaResult:
     ppm_probe_hermiticity_residual: float | None = None
     ppm_odd_even_residue_ratio: float | None = None
     faraday_head_omega_h_ry: float | None = None
+    faraday_probe_even_fit_relative_error: float | None = None
+    faraday_odd_even_residue_ratio: float | None = None
     faraday_sigma_h_static_bohr_inv: tuple[float, float, float] | None = None
     faraday_sigma_h_probe_bohr_inv: tuple[float, float, float] | None = None
 
@@ -284,6 +286,8 @@ BASIS_FREE_FIELDS = (
     "ppm_probe_hermiticity_residual",
     "ppm_odd_even_residue_ratio",
     "faraday_head_omega_h_ry",
+    "faraday_probe_even_fit_relative_error",
+    "faraday_odd_even_residue_ratio",
     "faraday_sigma_h_static_bohr_inv",
     "faraday_sigma_h_probe_bohr_inv",
 )
@@ -681,6 +685,12 @@ def finalize_dynamic_sigma(
         faraday_head_omega_h_ry=(
             None if faraday_ppm is None
             else float(faraday_ppm.omega_h_ry)),
+        faraday_probe_even_fit_relative_error=(
+            None if faraday_ppm is None
+            else float(faraday_ppm.probe_fit_relative_error)),
+        faraday_odd_even_residue_ratio=(
+            None if faraday_ppm is None
+            else float(faraday_ppm.odd_even_residue_ratio)),
         faraday_sigma_h_static_bohr_inv=(
             None if faraday_ppm is None else tuple(float(v) for v in
                 np.asarray(faraday_ppm.sigma_H_static).reshape(3))),

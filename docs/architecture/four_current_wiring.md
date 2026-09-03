@@ -426,7 +426,7 @@ old `isinstance` fork over two response types is gone: the single path is
 |---|---|---|---|
 | cubature receipt | `vcoul.slab_minibz_photon_cubature` (`services/vcoul/src/vcoul/minibz.py:821`) — exact Wigner–Seitz polygon, fixed 16/24/32 Duffy–Gauss ladder (`:124`) | host chunks: `q_cart (n,3)`, `D_raw (n,4,4)`, `sample_weight (n,)` f64 | host, write-locked |
 | `StaticPhotonHeadResponse` (`:64`, sealed — only its producer can build one) | `static_gauge_response.build_static_photon_head_response` (`:169-293`, called at `w_isdf.py:2215`); `require_static_photon_head_response` (`:103-155`) | `S_direct (2,2,4,4)`, `sigma_H (3,)` real, `hall_source` str, `Y_x (2,4,N_packed)`, `Z_y (2,N_packed,4)` | `P()`, `P()`, —, `P(None,None,'x')`, `P(None,'y',None)` |
-| Hall artifact — **optional** | `file_io/static_gauge_head.load_static_gauge_hall_artifact` (`:180-189`), called at `w_isdf.py:2066-2074` behind the existence check at `:2019`; sole writer `write_static_gauge_hall_artifact` (`:130-135`) via `psp/get_dipole_mtxels.py` | `static_gauge_hall.h5`, schema 1 (`STATIC_GAUGE_HALL_SCHEMA_VERSION`, `:35`), `sigma_H_cart (3,)` f64 | replicated |
+| Hall artifact — **optional** | `file_io.static_gauge_head.load_static_gauge_hall_artifact`, called by `w_isdf._load_static_photon_hall`; sole writer `write_static_gauge_hall_artifact` via `psp/get_dipole_mtxels.py` | `static_gauge_hall.h5`, schema 2 (`STATIC_GAUGE_HALL_SCHEMA_VERSION`), `frequency_ry (n_frequency,)` and `sigma_H_cart_frequency (n_frequency,3)` c128 | replicated |
 
 If no `static_gauge_hall_file` is present the builder sets `sigma_H = 0` and
 `hall_source = HALL_SOURCE_NONE` (`static_gauge_response.py:51,214`; the shape/sharding contract is re-asserted at `:114-121`) and says
@@ -502,17 +502,21 @@ packed current body as the literal `sigma_H=0` twin, builds the `z=0` and
 `head_correction.fit_dynamic_slab_photon_cttc_q0`. That owner runs the
 incumbent coupled 4x4 completion for Hall-on and Hall-off at each frequency,
 but retains only one rank-four factor pair for CT and one for TC. The common
-even pole is fitted from factor-Gram inner products; no second packed body or
-centroid-square probe carrier exists.
+pole is fitted from the factor-Gram projection of the Hermitian probe half;
+the anti-Hermitian half becomes the ordered residue `D_H`. A legitimate
+factor gauge `L -> cL, R -> R/c` leaves those overlaps invariant, so the
+ordered split is a physical selection rather than a phase convention. No
+second packed body or centroid-square probe carrier exists.
 
 `photon_sigma.compute_ppm_faraday_head_sigma_omega` passes those factors
-through `ppm_sigma._residue_for_space` with `B_odd=None`, streams one q=0
-CT/TC block at a time through the existing normalized convolution, and uses
-analytic pole denominators. `sigma_dispatch.finalize_dynamic_sigma` adds that
-cube once and evaluates its Hall-on/off diagonal as `sigCT_hall`; it also
-books the same matrix into the CT+TC Lorentz sector. This is distinct from
-`sigC_odd = Sigma[B,D]-Sigma[B,D=0]`: Hall is even in frequency (`D=0`) but
-odd in magnetisation (`B_H -> -B_H`).
+through `ppm_sigma._residue_for_space` as `B_H+D_H` / `B_H-D_H`, streams one
+q=0 CT/TC block at a time through the existing normalized convolution, and
+uses analytic pole denominators. `sigma_dispatch.finalize_dynamic_sigma`
+adds that cube once and evaluates its Hall-on/off diagonal as `sigCT_hall`;
+it also books the same matrix into the CT+TC Lorentz sector. The bare
+`sigma_H(z)` remains even in frequency, while the completed ordered response
+inherits the broken-TR screening environment's anti-Hermitian probe part.
+This is distinct from the body-only `sigC_odd` diagnostic.
 
 `SymMaps.trs_allowed=true` takes the exact-zero branch before all of this and
 records `Faraday head : EXACT ZERO`; `head_correction=off` records its DEBUG
@@ -639,7 +643,7 @@ columns byte-for-byte.
 | `Sigma blocks   : …` | `gw_jax.py:1461-1468` | Max and mean `|diag|` in eV over the Sigma window for CC, CT+TC and TT. These reduce the same per-state fields written to `sigma_diag.dat`. |
 | `Head Sigma     : …` | `gw_jax.py:1470-1475` | Max and mean `|diag|` of the Gamma-cell contribution, split CC, CT+TC and TT. Dynamic CC combines the scalar bare-X and dynamic-correlation head owners; current sectors come from the packed completion. |
 | `GN odd Sigma   : …` | `gw_jax.py:1478-1498` | Measured-broken-TR only: max/mean `|sigC_odd|`, its max/mean shares of `|Sigma_xc|`, the `W(iomega_p)` Hermiticity residual, and `max|D|/max|B|`. Its absence on a TRS deck is part of the schema. |
-| `Faraday head   : APPLIED (…)` | `gw_jax.main` | Packed broken-TR GN only: authenticated `sigma_H(0)` and `sigma_H(i*omega_p)`, fitted `Omega_H`, and max/mean per-state `|sigCT_hall|`. The alternatives are explicit `EXACT ZERO`, DEBUG `ABSENT`, or missing-artifact `ABSENT` records. |
+| `Faraday head   : APPLIED (…)` | `gw_jax.main` | Packed broken-TR GN only: authenticated `sigma_H(0)` and `sigma_H(i*omega_p)`, fitted `Omega_H`, `||D_H||/||B_H||`, the even-probe fit residual, and max/mean per-state `|sigCT_hall|`. The alternatives are explicit `EXACT ZERO`, DEBUG `ABSENT`, or missing-artifact `ABSENT` records. |
 | `Slab WS cert   : …` / `Photon WS cert : …` | `gw_jax.py:803-809,1500-1506` | Exact Wigner-Seitz cubature order ladder, physical node counts and final mixed-tolerance error ratio. The photon line also reports the coupled solve's maximum Dyson backward residual. |
 | `Global TRS     : …` | `common/scientific_output.py:352-386` | The measured global verdict and provenance used by the screening/ordered-residue route. Route selection reads this verdict; it is not inferred again from a deck flag. |
 | `Bispinor GW policy: bispinor_gw=…` | `gw_jax.py:314` | the carrier banner. Under `full_static_cohsex` the parenthetical names the **head state**, not "experimental", and reads `DEBUG: Gamma-cell head disabled by head_correction=off` when the completion is off |
