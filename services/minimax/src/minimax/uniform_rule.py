@@ -69,7 +69,7 @@ from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.linalg import qr as _pivoted_qr
 
 __all__ = [
-    "UniformRule", "build_uniform_rule", "box_samples",
+    "UniformRule", "build_uniform_rule", "box_samples", "band_samples",
     "rule_roundoff_amplification", "rule_sup_error",
 ]
 
@@ -128,6 +128,33 @@ def box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=5.0, n_im=6, near=30.0):
         h = min(v, 4.0 * im_lo) / per_unit
         out.append(_re_line(re_lo, re_hi, h, near * im_lo) + 1j * v)
     return np.concatenate(out)
+
+
+def band_samples(re_lo, re_hi, im_lo, im_hi, x_min, S, per_half_wave=3.0, n_im=6):
+    """Sample cloud for a BAND rule: the box minus the free square
+    ``|Re d| < x_min, Im d < x_min``, with the real line spaced for the
+    horizon (``per_half_wave`` points per half wave of the fastest member
+    ``exp(i S x)``) and ``n_im`` log-spaced Im levels.  Uniform spacing is
+    right here: the rule oscillates at up to ``S`` everywhere on the real
+    line, and the box's own near-zero region is exactly what the band
+    removes."""
+    h = np.pi / (per_half_wave * S)
+    x = np.arange(re_lo, re_hi + 0.5 * h, h)
+    x = np.unique(np.concatenate([x, [re_lo, re_hi, -x_min, x_min]]))
+    x = x[(x >= re_lo) & (x <= re_hi)]
+    im = np.geomspace(im_lo, max(im_hi, im_lo * 1.0001), n_im)
+    d = np.concatenate([x + 1j * v for v in im])
+    return d[(np.abs(d.real) >= x_min) | (d.imag >= x_min)]
+
+
+# Horizon of a band rule in units of 1/x_min: the smallest ``S x_min`` at
+# which a one-sided sum reaches 1e-4 (peak-relative) outside the free square
+# on a physical-width crossing box.  Measured by dense least squares on the
+# Na +-15 eV conduction box: 1.0e-3 at 14, 2.1e-4 at 18, 4e-5 at 22.  The
+# owner's odd sine rule needs about 10 because it has no imaginary part to
+# suppress; a causal sum's Im part is the Hilbert partner of its Re part, so
+# confining the spectral weight to the square with 1e-4 tails costs ~22.
+_BAND_HORIZON = 22.0
 
 
 def _log_density_weights(d):
@@ -1014,16 +1041,19 @@ class UniformRule:
     sup_error: float
     kappa_max: float
     seconds: float
+    band: float = 0.0          # half-width x_min of the free square (0: none)
 
     @property
     def node_count(self) -> int:
         return int(self.times.size)
 
     def one_line(self) -> str:
+        kind = ("relative" if self.relative else
+                f"peak-relative, free square |Re d| < {self.band:.4g}" if self.band > 0.0
+                else "peak-relative")
         return (f"uniform box rule: {self.node_count} nodes, ray {self.theta_deg:.0f} deg, "
                 f"rank {self.rank}, sup {self.sup_error:.2e} (eps {self.eps:g}, "
-                f"{'relative' if self.relative else 'peak-relative'}), "
-                f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
+                f"{kind}), kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
 
 
 def _select_backend(backend, n_start, cloud_size):
@@ -1050,9 +1080,29 @@ def _select_backend(backend, n_start, cloud_size):
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
                        reduce=True, time_budget=None, relative=None,
-                       backend=None):
+                       backend=None, band=None, peak_scale=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
+
+    ``band = x_min`` builds a BAND rule on a crossing box: ``1/d`` is
+    certified (peak-relative to ``1/peak_scale``, which the caller must give:
+    the deck's broadening) only outside the free square ``|Re d| < x_min,
+    Im d < x_min``, and the square's interior is whatever least squares
+    makes it -- the learned regularization of the resonance.  The box is
+    then the PHYSICAL one (``im_lo`` the narrowest pole width, no ``eta``
+    added) and the executor must not apply ``exp(-eta t)`` to this rule.
+    The horizon is ``_BAND_HORIZON / x_min`` instead of ``ln(10/eps)/im_lo``,
+    which is where the nodes go: on the Na +-15 eV conduction box (217 nodes
+    as a Lorentzian rule) a band of ``4 eta`` gives 153, ``6 eta`` 101,
+    ``8 eta`` 90.  Tempting, and why not: (1) keep the ``eta``-Lorentzian
+    target and only drop the square from the check -- the Lorentzian's time
+    tail ``exp(-eta t)`` beyond a short horizon is unrepresentable by any
+    sum inside it (a flat deficit ``exp(-eta S)``), measured 199 nodes for
+    217; (2) the relative currency -- its noise gate is ``|d|/eta`` stricter
+    at the far edge and a band rule that passes here fails there; (3) the
+    interpolatory weights as the Tikhonov reference -- the start is not a
+    quadrature of the truncated integral, so ``w_ref`` comes from a lightly
+    penalised least squares on the start nodes.
 
     ``eps`` is a sup bound on the box in the rule's currency: on a
     sign-definite box (``re_lo > 0`` or ``re_hi < 0``) the RELATIVE error
@@ -1097,26 +1147,43 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             and 0.0 < im_lo <= im_hi):
         raise ValueError(f"invalid support box {box!r}")
     t0 = time.perf_counter()
-    if relative is None:
-        relative = re_lo > 0.0 or re_hi < 0.0
-    # rho_of: the acceptance currency (sup); fit_of: the same currency with
-    # the cloud's log-density folded in, for the basis and the least squares
-    rho_of = (lambda x: np.abs(x)) if relative else (lambda x: np.full(x.size, im_lo))
-    fit_of = ((lambda x: np.abs(x) * _log_density_weights(x)) if relative
-              else rho_of)
-    d = box_samples(re_lo, re_hi, im_lo, im_hi)
-    _r0, theta, S, _rate = _choose_angle(d, eps, fit_of(d))
-    n_im = _im_levels(theta)
-    if n_im != 6:
-        d = box_samples(re_lo, re_hi, im_lo, im_hi, n_im=n_im)
-    # Acceptance is judged on a cloud finer than the fit cloud in both
-    # directions, so a rule that is exact between fit samples only is
-    # rejected (property test: 17 of 80 random rotated-ray boxes failed a
-    # finer check before this).  Tempting, and why not: use the fit cloud,
-    # or a coarser check (it is the largest matrix in the reduction loop):
-    # the failures were all rotated-ray boxes whose rule was exact at the
-    # sampled Im levels and off between them.
-    d_check = box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=8.0, n_im=2 * n_im)
+    band = 0.0 if band is None else float(band)
+    if band > 0.0:
+        if relative:
+            raise ValueError("a band rule is peak-relative; relative=True is not allowed")
+        if not (re_lo < 0.0 < re_hi) or band >= max(-re_lo, re_hi):
+            raise ValueError(
+                f"band {band!r} needs a crossing box wider than its square: {box!r}")
+        if peak_scale is None or not np.isfinite(peak_scale) or peak_scale <= 0.0:
+            raise ValueError("a band rule needs peak_scale > 0 (the deck broadening)")
+        relative = False
+        rho_of = lambda x: np.full(x.size, float(peak_scale))
+        fit_of = rho_of
+        theta, S = 0.0, _BAND_HORIZON / band                 # real time, band horizon
+        d = band_samples(re_lo, re_hi, im_lo, im_hi, band, S)
+        d_check = band_samples(re_lo, re_hi, im_lo, im_hi, band, S,
+                               per_half_wave=5.0, n_im=12)
+    else:
+        if relative is None:
+            relative = re_lo > 0.0 or re_hi < 0.0
+        # rho_of: the acceptance currency (sup); fit_of: the same currency with
+        # the cloud's log-density folded in, for the basis and the least squares
+        rho_of = (lambda x: np.abs(x)) if relative else (lambda x: np.full(x.size, im_lo))
+        fit_of = ((lambda x: np.abs(x) * _log_density_weights(x)) if relative
+                  else rho_of)
+        d = box_samples(re_lo, re_hi, im_lo, im_hi)
+        _r0, theta, S, _rate = _choose_angle(d, eps, fit_of(d))
+        n_im = _im_levels(theta)
+        if n_im != 6:
+            d = box_samples(re_lo, re_hi, im_lo, im_hi, n_im=n_im)
+        # Acceptance is judged on a cloud finer than the fit cloud in both
+        # directions, so a rule that is exact between fit samples only is
+        # rejected (property test: 17 of 80 random rotated-ray boxes failed a
+        # finer check before this).  Tempting, and why not: use the fit cloud,
+        # or a coarser check (it is the largest matrix in the reduction loop):
+        # the failures were all rotated-ray boxes whose rule was exact at the
+        # sampled Im levels and off between them.
+        d_check = box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=8.0, n_im=2 * n_im)
     rho, rho_check = fit_of(d), rho_of(d_check)
     fam = _RayFamily(d, theta, S, eps / trunc, rho)
     s, w = fam.interpolatory()
@@ -1140,13 +1207,18 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             if extra > 1.0:
                 fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
                 s, w = fam.interpolatory()
+            w_ref = w
+            if band > 0.0:
+                probe = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
+                probe.mu *= 1.0e-3
+                w_ref = probe.ls(s.astype(complex))[0]
             # the cloud solver works in the executor's convention t = phase*s
             # with weights -i*phase*w: the sup test uses exactly that map
             if _select_backend(backend, w.size, d.size) == "jax":
-                fit = _JaxCloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w,
+                fit = _JaxCloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w_ref,
                                    rho=rho, check_cloud=(d_check, rho_check, eps, kappa_cap))
             else:
-                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
+                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w_ref, rho=rho)
             red = fit.reduce(s, ok, deadline)       # start acceptance ignores the deadline
             if red is not None:
                 break
@@ -1162,7 +1234,7 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         times=times, weights=weights, box=(re_lo, re_hi, im_lo, im_hi),
         eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),
         rank=int(fam.r), sup_error=sup, kappa_max=kappa,
-        seconds=time.perf_counter() - t0)
+        seconds=time.perf_counter() - t0, band=band)
 
 
 def _score_cloud(fit, s, w, d, rho):

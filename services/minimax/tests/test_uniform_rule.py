@@ -119,3 +119,41 @@ def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
     sup, kappa = rule_sup_error(rule.times, rule.weights, d)
     assert sup <= 1.5e-4 and kappa <= 1.0e4
     assert abs(rule.node_count - ref.node_count) <= 3, (rule.node_count, ref.node_count)
+
+
+# ----------------------------------------------------------------- band rules
+def test_band_rule_is_cheaper_than_the_lorentzian_rule_on_the_same_window():
+    # Physical-width crossing box (narrowest pole 1e-3 eta, broadest 20 eta),
+    # free square of 4 eta certified peak-relative to 1/eta; against the
+    # Lorentzian rule on the eta-shifted box.  Measured on the Na +-15 eV
+    # conduction box: 153 vs 217 at 4 eta; here the box is 90 eta wide.
+    from minimax.uniform_rule import band_samples
+    eps = 1.0e-4
+    phys = (-60.0 * ETA, 30.0 * ETA, 1.0e-3 * ETA, 20.0 * ETA)
+    band = build_uniform_rule(phys, eps, band=4.0 * ETA, peak_scale=ETA, time_budget=90.0)
+    assert band.band == 4.0 * ETA and not band.relative and abs(band.theta_deg) < 1.0
+    # certificate outside the square on a finer cloud, in the band's currency
+    d = band_samples(*phys, 4.0 * ETA, band.times.real.max(), per_half_wave=7.0, n_im=16)
+    sup, kappa = rule_sup_error(band.times, band.weights, d, np.full(d.size, ETA))
+    assert sup <= 3.0 * eps and kappa <= 1.0e4
+    assert np.all(np.isfinite(band.times)) and np.all(band.times != 0.0)
+    # the square is free: the rule is finite there and not required to match
+    inside = np.array([0.0 + 1.0e-3j * ETA, 1.0 * ETA + 1.0e-3j * ETA])
+    q = np.exp(1j * inside[:, None] * band.times[None, :]) @ band.weights
+    assert np.all(np.isfinite(q))
+    lorentz = build_uniform_rule((-60.0 * ETA, 30.0 * ETA, ETA, 21.0 * ETA), eps,
+                                 time_budget=90.0)
+    assert band.node_count <= 0.85 * lorentz.node_count, (band.node_count, lorentz.node_count)
+    assert "free square" in band.one_line()
+
+
+def test_band_rule_refuses_misuse():
+    with pytest.raises(ValueError):                      # sign-definite box
+        build_uniform_rule((2.0 * ETA, 40.0 * ETA, 1e-3 * ETA, ETA), 1e-4, band=4 * ETA, peak_scale=ETA)
+    with pytest.raises(ValueError):                      # square wider than the box
+        build_uniform_rule((-3.0 * ETA, 3.0 * ETA, 1e-3 * ETA, ETA), 1e-4, band=4 * ETA, peak_scale=ETA)
+    with pytest.raises(ValueError):                      # no currency scale
+        build_uniform_rule((-30.0 * ETA, 30.0 * ETA, 1e-3 * ETA, ETA), 1e-4, band=4 * ETA)
+    with pytest.raises(ValueError):                      # relative currency
+        build_uniform_rule((-30.0 * ETA, 30.0 * ETA, 1e-3 * ETA, ETA), 1e-4, band=4 * ETA,
+                           peak_scale=ETA, relative=True)
