@@ -96,6 +96,19 @@ def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):
         np.testing.assert_array_equal(event[2], 3.0 * np.asarray(chi[i]))
 
 
+def test_dyson_refuses_mixed_centroid_carrier_extents_before_dispatch():
+    """The P36 2088-V/2070-chi failure is rejected at the public seam."""
+    import pytest
+    from gw.w_isdf import solve_w
+
+    V = SimpleNamespace(shape=(65, 2088, 2088))
+    chi = SimpleNamespace(shape=(65, 2070, 2070))
+    with pytest.raises(ValueError, match=(
+            r"same padded .*V_q\.shape=\(65, 2088, 2088\).*"
+            r"chi0_q\.shape=\(65, 2070, 2070\)")):
+        solve_w(V, chi, meta=None, mesh_xy=None, dyson_solver="distributed")
+
+
 def test_fit_walk_consumes_wc_not_chi(monkeypatch):
     seen = {}
 

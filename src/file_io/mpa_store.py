@@ -1171,7 +1171,8 @@ def read_w_slab_collective(
 
     RETURNS ``(slab, header)``.  ``slab`` is
     ``(n_q_on_disk, n_mu_padded, n_mu_padded)`` complex128 — the μ extent
-    is ``mesh_divisible_shape``'s round-up, NOT ``header['n_mu']``.  The
+    is the canonical ``runtime.padding.padded_mu_extent`` round-up, NOT
+    ``header['n_mu']`` and not the weaker per-axis SlabIO round-up.  The
     4-D read is issued at ``P(None, None, 'x', 'y')`` and the returned 3-D
     array therefore carries ``P(None, 'x', 'y')``; that is inferred from the
     leading index, not asserted on the way out.  ``header`` is
@@ -1180,7 +1181,8 @@ def read_w_slab_collective(
     registry allows and counts).
     """
     from jax.sharding import PartitionSpec as P
-    from file_io.slab_io import SlabIO, mesh_divisible_shape
+    from file_io.slab_io import SlabIO
+    from runtime.padding import padded_mu_extent
 
     header = read_w_header(src, name)
     i = int(i_omega)
@@ -1195,7 +1197,13 @@ def read_w_slab_collective(
 
     logical = (1, header["n_q_on_disk"], header["n_mu"], header["n_mu"])
     spec = P(None, None, "x", "y")
-    shape = mesh_divisible_shape(logical, mesh_xy, spec)
+    # Both μ axes belong to one canonical in-memory carrier.  Padding each
+    # axis only by its own mesh side is legal for this SlabIO read but is not
+    # sufficient for downstream product-face/all-to-all consumers.  In
+    # particular, P=36 and n_mu=2070 would otherwise reload χ at 2070 while
+    # V is correctly carried at padded_mu_extent(2070, 36) == 2088.
+    n_mu_padded = int(padded_mu_extent(header["n_mu"], mesh_xy))
+    shape = (1, header["n_q_on_disk"], n_mu_padded, n_mu_padded)
     with SlabIO(src, mode="r", mesh=mesh_xy) as io:
         slab = io.read_slab(
             name, shape=shape, offset=(i, 0, 0, 0),

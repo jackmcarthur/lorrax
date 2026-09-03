@@ -1,8 +1,10 @@
 """P=4 gate for MPA's disk-bounded sample -> fit -> pole stream.
 
 Run only through the Perlmutter multi-process launcher.  Five poles and
-``N_mu=P+1`` force both a nondivisible SlabIO row shard and the production
-four-pole plus one-pole tail reads in one short leg.
+``N_mu=P+2`` on the required P=4 mesh make N_mu divisible by each mesh side
+but not by the device product.  This is the hostile geometry that separates
+SlabIO's per-axis minimum from the canonical in-memory μ carrier while also
+exercising the production four-pole plus one-pole tail reads.
 """
 from __future__ import annotations
 
@@ -25,9 +27,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P  # noqa: E402
 
 from common.collectives import barrier, process_count, process_rank, resolve_mesh  # noqa: E402
 from file_io import mpa_store  # noqa: E402
-from file_io.slab_io import mesh_divisible_shape  # noqa: E402
 from gw.mpa import fit_driver, sampling  # noqa: E402
 from gw.ppm_tau_kernel import build_shared_w_tau  # noqa: E402
+from runtime.padding import padded_mu_extent  # noqa: E402
 from symmetry_maps import (centroid_source_map_and_wrap,  # noqa: E402
                            verify_centroid_orbit_closure)
 from symmetry_maps import qirr_store as QS  # noqa: E402
@@ -93,7 +95,7 @@ def main():
     if world != 4:
         _fail(f"requires exactly four processes, got {world}")
     mesh = resolve_mesh()
-    n_mu = world + 1
+    n_mu = world + 2
     tables, verdict = _tables(n_mu)
     Omega_ref, B_ref = _planted(n_mu)
     z = sampling.double_parallel_grid(
@@ -119,7 +121,8 @@ def main():
                   "n_p": N_POLES, "alpha": 1, "omega_max": 4.0},
         n_rmu_logical=n_mu, energy_unit="Ha", mode="w")
     spec = P(None, "x", "y")
-    padded = mesh_divisible_shape((1, n_mu, n_mu), mesh, spec)
+    n_mu_padded = padded_mu_extent(n_mu, mesh)
+    padded = (1, n_mu_padded, n_mu_padded)
     sharding = NamedSharding(mesh, spec)
     global_shape = (z.size, 1, n_mu, n_mu)
     for iz in range(z.size):
@@ -129,6 +132,22 @@ def main():
         mpa_store.write_w_slab_collective(
             sample_path, W_NAME, iz, slab, mesh_xy=mesh,
             global_shape=global_shape)
+
+    # This exact full-slab reload feeds the production Dyson solve.  At P=4,
+    # n_mu=6 is already divisible by each 2-D mesh side, so the historical
+    # per-axis reader returned 6 while every canonical μ carrier was padded
+    # to 8.  Assert the product-padded carrier and its exact-zero pad before
+    # the fit's independently tiled column reader can hide the mismatch.
+    reloaded, _ = mpa_store.read_w_slab_collective(
+        sample_path, W_NAME, 0, mesh_xy=mesh)
+    if tuple(reloaded.shape) != padded:
+        _fail(f"full-slab reload shape {tuple(reloaded.shape)} != "
+              f"canonical carrier {padded}")
+    expected_reload = np.zeros(padded, np.complex128)
+    expected_reload[0, :n_mu, :n_mu] = W[0][None]
+    _check_local("product-padded full-slab reload", reloaded,
+                 expected_reload)
+    del reloaded
 
     ledger, report = fit_driver.run_fit_driver(
         sample_path, W_NAME, fit_path, z, N_POLES, mesh_xy=mesh)
