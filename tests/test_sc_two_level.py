@@ -24,7 +24,8 @@ class _Inputs:
     partition: object = None
     fixed_quadrature_session: object = None
     config: object = field(default_factory=lambda: SimpleNamespace(
-        sc=SimpleNamespace(outer_refit_policy="fixed_poles")))
+        sc=SimpleNamespace(outer_refit_policy="fixed_poles"),
+        memory=SimpleNamespace(per_device_gb=8.0)))
     print_fn: object = lambda *_args: None
 
 
@@ -131,11 +132,14 @@ def test_outer_refits_freeze_each_model_and_reset_inner_history(monkeypatch):
     assert calls[0][3] is None and calls[2][3] is None
     assert calls[1][3] is not calls[3][3]
     assert calls[1][3] == calls[3][3] == {
-        "state_edge_padding_ev": 0.25,
+        "state_edge_padding_ev": 2.0,
         "pole_extent_padding_fraction": 0.0,
     }
-    assert calls[1][1].w_time_factor_cache == {}
-    assert calls[3][1].w_time_factor_cache == {}
+    for call in (calls[1], calls[3]):
+        owner = call[1].w_time_factor_cache["_owner"]
+        assert owner["device_fraction"] == 0.10
+        assert owner["capacity_per_device_bytes"] == 800_000_000
+        assert owner["resident_per_device_bytes"] == 0
     assert calls[1][1].w_time_factor_cache is not calls[3][1].w_time_factor_cache
 
 

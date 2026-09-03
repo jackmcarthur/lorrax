@@ -22,6 +22,42 @@ import numpy as np
 from common.units import RYD_TO_EV
 
 
+_FROZEN_W_CACHE_DEVICE_FRACTION = 0.10
+
+
+def _new_frozen_w_time_factor_cache(inputs):
+    """Return one exact W(tau) cache bounded by device-memory policy.
+
+    The configured per-device memory budget is resolved once at driver
+    startup.  A fixed fraction of that stable quantity, rather than ambient
+    free memory, makes admission identical on every inner map and rank.
+    Factors that do not fit remain known identities and are rebuilt from the
+    frozen pole store when consumed.
+    """
+    per_device_gb = float(inputs.config.memory.per_device_gb)
+    if not np.isfinite(per_device_gb) or per_device_gb <= 0.0:
+        raise ValueError(
+            "two-level W(tau) caching requires a positive resolved "
+            f"per-device memory budget; got {per_device_gb!r} GB")
+    capacity = int(
+        per_device_gb * 1.0e9 * _FROZEN_W_CACHE_DEVICE_FRACTION)
+    return {
+        "_owner": {
+            "device_fraction": _FROZEN_W_CACHE_DEVICE_FRACTION,
+            "capacity_per_device_bytes": capacity,
+            "resident_per_device_bytes": 0,
+            "current_builds": 0,
+            "current_hits": 0,
+            "current_evictions": 0,
+            "current_recomputes": 0,
+            "total_builds": 0,
+            "total_hits": 0,
+            "total_evictions": 0,
+            "total_recomputes": 0,
+        }
+    }
+
+
 def _carry_only(state, sc_iteration):
     """Drop output-sized artifacts before the next map allocation."""
     return sc_iteration.SCState(
@@ -59,6 +95,8 @@ def _cost_receipt(inputs):
     if ledger is None:
         return
     walls = [float(value) for value in ledger.get("sigma_walls_s", ())]
+    cache_maps = list(ledger.get("w_factor_cache_per_inner_map", ()))
+    recomputes = [int(row.get("recomputes", 0)) for row in cache_maps]
     total = float(sum(walls))
     inputs.print_fn(
         "[ SC two-level cost | "
@@ -66,7 +104,8 @@ def _cost_receipt(inputs):
         f"Sigma(omega)_evaluations={len(walls)}, "
         f"Sigma_wall_total={total:.6f} s, "
         f"Sigma_wall_mean={(total / len(walls) if walls else 0.0):.6f} s, "
-        f"Sigma_wall_each={walls} ]")
+        f"Sigma_wall_each={walls}, "
+        f"W_factor_recomputes_each_inner_map={recomputes} ]")
 
 
 def run_two_level_self_consistency(
@@ -158,11 +197,11 @@ def run_two_level_self_consistency(
         # One quadrature transaction per frozen inner solve.  It starts on
         # the first post-producer Hamiltonian, after the ordinary multi-eV
         # DFT->QP jump; only the subsequent meV-scale state motion is covered
-        # by the narrow padding.  The live producer still evaluates Sigma
+        # by the state padding.  The live producer still evaluates Sigma
         # once to obtain that Hamiltonian, but its transient rules and W(tau)
         # factors are not part of the frozen transaction.
         outer_rule_session = {
-            "state_edge_padding_ev": 0.25,
+            "state_edge_padding_ev": 2.0,
             "pole_extent_padding_fraction": 0.0,
         }
         live_inputs = replace(
@@ -216,7 +255,18 @@ def run_two_level_self_consistency(
             )
             inner_calls = 1
         else:
-            screening = replace(screening, w_time_factor_cache={})
+            w_time_factor_cache = _new_frozen_w_time_factor_cache(inputs)
+            owner = w_time_factor_cache["_owner"]
+            inputs.print_fn(
+                "[ SC frozen W(tau) cache policy | exact factors, "
+                f"cap={100.0 * owner['device_fraction']:.1f}% of "
+                f"{float(inputs.config.memory.per_device_gb):.3f} "
+                "GB/device = "
+                f"{owner['capacity_per_device_bytes'] / 2**30:.3f} "
+                "GiB/device; recompute nonresident identities from the "
+                "frozen store ]")
+            screening = replace(
+                screening, w_time_factor_cache=w_time_factor_cache)
             frozen_inputs = replace(
                 inputs,
                 frozen_screening=screening,

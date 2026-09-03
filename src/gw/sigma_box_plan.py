@@ -540,8 +540,10 @@ def _sc_padded_box_spec(
     """Return the iteration-1 SC certificate box required by policy.
 
     The ordinary multi-map policy supplies the conservative module defaults.
-    A two-level QSGW outer step passes 0.25 eV and zero pole padding because
-    its inner solve freezes the pole census and replans at the next refit.
+    A two-level QSGW outer step passes 2 eV and zero pole padding: its inner
+    solve freezes the pole census, while the owner-selected state allowance
+    covers the moving Green-function energies without replanning.  The next
+    outer refit starts a fresh transaction.
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
     frac = float(pole_pad_fraction)

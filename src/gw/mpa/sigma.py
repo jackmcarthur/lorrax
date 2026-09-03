@@ -138,7 +138,7 @@ def _w_time_factor_index(cache_bank):
 
 
 def _frozen_w_time_factor(cache_bank, signature):
-    """Fetch one exact outer W-side factor, allowing subset/reordered use."""
+    """Fetch one exact resident W-side factor, or ``None`` if nonresident."""
     index = _w_time_factor_index(cache_bank).get(signature)
     if index is None:
         raise RuntimeError(
@@ -146,6 +146,63 @@ def _frozen_w_time_factor(cache_bank, signature):
             "a W-side tau node, pole selector, or reference; no replanning "
             "is allowed inside the two-level loop")
     return cache_bank["factors"][index]
+
+
+def _cache_owner(w_time_factor_cache):
+    """Return the shared bounded-cache ledger, including from a child."""
+    if not isinstance(w_time_factor_cache, dict):
+        return None
+    owner = w_time_factor_cache.get("_owner")
+    if owner is None:
+        return None
+    capacity = int(owner.get("capacity_per_device_bytes", 0))
+    if capacity <= 0:
+        raise ValueError(
+            "frozen W(tau) cache capacity must be positive; got "
+            f"{capacity} bytes/device")
+    return owner
+
+
+def _factor_per_device_nbytes(W_t, mesh_xy):
+    """Price one sharded W(tau) tile without gathering it to a host."""
+    shards = tuple(getattr(W_t, "addressable_shards", ()))
+    if shards:
+        return max(int(shard.data.nbytes) for shard in shards)
+    global_bytes = int(W_t.nbytes)
+    n_devices = max(int(mesh_xy.size), 1)
+    return (global_bytes + n_devices - 1) // n_devices
+
+
+def _note_cache_event(owner, name, count=1):
+    """Accumulate one cache event in both map-local and outer totals."""
+    if owner is None:
+        return
+    amount = int(count)
+    owner[f"current_{name}"] = int(
+        owner.get(f"current_{name}", 0)) + amount
+    owner[f"total_{name}"] = int(owner.get(f"total_{name}", 0)) + amount
+
+
+def _admit_w_time_factor(cache_bank, signature, W_t, owner, mesh_xy):
+    """Record one immutable identity and retain its tile only if it fits."""
+    factor_index = _w_time_factor_index(cache_bank)
+    if signature in factor_index:
+        raise RuntimeError("duplicate frozen W(tau) cache identity")
+    index = len(cache_bank["factors"])
+    factor_bytes = _factor_per_device_nbytes(W_t, mesh_xy)
+    retain = True
+    if owner is not None:
+        used = int(owner.get("resident_per_device_bytes", 0))
+        cap = int(owner["capacity_per_device_bytes"])
+        retain = used + factor_bytes <= cap
+        if retain:
+            owner["resident_per_device_bytes"] = used + factor_bytes
+        else:
+            _note_cache_event(owner, "evictions")
+    cache_bank["signatures"].append(signature)
+    cache_bank["factors"].append(W_t if retain else None)
+    factor_index[signature] = index
+    return retain
 
 
 def _integrate_sigma_batches(
@@ -275,7 +332,8 @@ def _integrate_sigma_batches(
         **face_kwargs)
     w_builder = spatial_kernel = None
     cache_bank = None
-    cache_hits = cache_misses = 0
+    cache_hits = cache_misses = cache_evictions = cache_recomputes = 0
+    owner = _cache_owner(w_time_factor_cache)
     if w_time_factor_cache is not None:
         # Separate banks are required for an ordered-residue fit: the
         # production B+/-D execution and its D=0 observability twin have
@@ -400,7 +458,17 @@ def _integrate_sigma_batches(
                     )
                     if bool(cache_bank["complete"]):
                         W_t = _frozen_w_time_factor(cache_bank, signature)
-                        cache_hits += 1
+                        if W_t is None:
+                            W_t = w_builder(
+                                B_branch, Omega, pole_indices, bounds,
+                                phase_real, jnp.asarray(win.E_ref_B),
+                                jnp.asarray(t, dtype=jnp.complex128))
+                            W_t.block_until_ready()
+                            cache_recomputes += 1
+                            _note_cache_event(owner, "recomputes")
+                        else:
+                            cache_hits += 1
+                            _note_cache_event(owner, "hits")
                     else:
                         index = factor_index.get(signature)
                         if index is None:
@@ -409,14 +477,25 @@ def _integrate_sigma_batches(
                                 phase_real, jnp.asarray(win.E_ref_B),
                                 jnp.asarray(t, dtype=jnp.complex128))
                             W_t.block_until_ready()
-                            index = len(cache_bank["factors"])
-                            cache_bank["signatures"].append(signature)
-                            cache_bank["factors"].append(W_t)
-                            factor_index[signature] = index
+                            retained = _admit_w_time_factor(
+                                cache_bank, signature, W_t, owner, mesh_xy)
+                            if not retained:
+                                cache_evictions += 1
                             cache_misses += 1
+                            _note_cache_event(owner, "builds")
                         else:
                             W_t = cache_bank["factors"][index]
-                            cache_hits += 1
+                            if W_t is None:
+                                W_t = w_builder(
+                                    B_branch, Omega, pole_indices, bounds,
+                                    phase_real, jnp.asarray(win.E_ref_B),
+                                    jnp.asarray(t, dtype=jnp.complex128))
+                                W_t.block_until_ready()
+                                cache_recomputes += 1
+                                _note_cache_event(owner, "recomputes")
+                            else:
+                                cache_hits += 1
+                                _note_cache_event(owner, "hits")
                     sigma_tau = spatial_kernel(
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
@@ -454,13 +533,16 @@ def _integrate_sigma_batches(
     if cache_bank is not None:
         if not bool(cache_bank["complete"]):
             cache_bank["complete"] = True
-        global_bytes = sum(int(value.nbytes)
-                           for value in cache_bank["factors"])
+        resident = [value for value in cache_bank["factors"]
+                    if value is not None]
+        global_bytes = sum(int(value.nbytes) for value in resident)
         print_fn(
             "  SC frozen W(tau) cache: "
             f"bank={('odd_off' if odd_residue_off else 'production')}, "
             f"hits={cache_hits}, misses={cache_misses}, "
-            f"factors={len(cache_bank['factors'])}, "
+            f"evictions={cache_evictions}, recomputes={cache_recomputes}, "
+            f"identities={len(cache_bank['factors'])}, "
+            f"resident_factors={len(resident)}, "
             f"global={global_bytes / 2**20:.2f} MiB, "
             f"about {global_bytes / max(int(mesh_xy.size), 1) / 2**20:.2f} "
             "MiB/device")

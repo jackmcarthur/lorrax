@@ -346,6 +346,11 @@ class SCInputs:
     #: Run-local measured cost ledger.  Host orchestration only, never a jit
     #: operand; shared across the dataclass replacements made by the loops.
     two_level_cost: dict | None = None
+    #: Typed dynamic-Sigma evaluation law for maps after the bit-identical
+    #: first map.  Production uses diagonal-on-shell/off-diagonal-at-E_F;
+    #: the historical half-sum exists only for the discriminating debug arm.
+    two_level_update_policy: QSGWUpdatePolicy = (
+        QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI)
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
     # record.  Component chatter remains on ``print_fn`` and can still be
@@ -444,7 +449,9 @@ class SCMapScreeningArtifacts:
     iteration_head: object | None
     static_head_terms: object | None
     sigma_model: object | None = None
-    #: Device-resident W-side time factors, scoped to this outer W model.
+    #: Exact, bounded device-resident W-side time factors, scoped to this
+    #: outer W model.  Nonresident identities are recomputed from the same
+    #: frozen model and the shared owner ledger records that cost.
     w_time_factor_cache: dict | None = None
 
 
@@ -1436,8 +1443,10 @@ def run_fixed_sigma_evsc(
     ``Sigma_eff,p[m,n] = 1/2 [Sigma_p,mn(E_p,m)
                               + Sigma_p,mn(E_p,n)]^h``;
 
-    the nested SC consumer instead evaluates its diagonal at ``E_p,m`` and
-    every off-diagonal at ``E_F``, using the same shared interpolation owner,
+    the nested SC consumer uses its caller's typed update policy, production
+    being diagonal at ``E_p,m`` and every off-diagonal at ``E_F``.  The
+    diagnostic legacy arm selects the same half-sum as the shipped
+    single-level loop through this identical interpolation owner,
 
     and returns ``F(H_p)^DFT = H0_DFT + U_p Sigma_eff,p U_p^dagger``.
     Keeping the fixed-point carry in one coordinate system is what makes the
@@ -1718,12 +1727,15 @@ def run_fixed_sigma_evsc(
             sigma_c_qp = _rotate_sigma_omega_cube(
                 sigma_c_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
 
+        sc_update_policy = (
+            QSGWUpdatePolicy(sc_context.get(
+                "update_policy",
+                QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI))
+            if sc_mode else QSGWUpdatePolicy.HALF_SUM)
         sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
             sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
             replicated_output=False,
-            update_policy=(
-                QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI
-                if sc_mode else QSGWUpdatePolicy.HALF_SUM))
+            update_policy=sc_update_policy)
         if int(diagnostics["n_clipped"]) != int(n_out):
             raise RuntimeError(
                 "run_fixed_sigma_evsc: omega_coverage/build_qsgw_sigma_xc "
@@ -3244,6 +3256,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if frozen_screening is not None else
         {} if (inputs.two_level_enabled
                and inputs.fixed_quadrature_session is not None) else None)
+    w_cache_owner = (
+        w_time_factor_cache.get("_owner")
+        if isinstance(w_time_factor_cache, dict) else None)
+    if w_cache_owner is not None:
+        for name in ("builds", "hits", "evictions", "recomputes"):
+            w_cache_owner[f"current_{name}"] = 0
     sigma_wall_start = time.perf_counter()
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
@@ -3279,12 +3297,37 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         qsgw_update_policy=(
             QSGWUpdatePolicy.HALF_SUM
             if int(state.iteration) == 0 else
-            QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI),
+            inputs.two_level_update_policy),
         frozen_screening_model=frozen_screening is not None,
         w_time_factor_cache=w_time_factor_cache,
         print_fn=inputs.print_fn,
     )
     sigma_wall = time.perf_counter() - sigma_wall_start
+    if w_cache_owner is not None:
+        cache_receipt = {
+            name: int(w_cache_owner.get(f"current_{name}", 0))
+            for name in ("builds", "hits", "evictions", "recomputes")
+        }
+        cache_receipt.update({
+            "iteration": int(state.iteration) + 1,
+            "resident_per_device_bytes": int(
+                w_cache_owner.get("resident_per_device_bytes", 0)),
+            "capacity_per_device_bytes": int(
+                w_cache_owner["capacity_per_device_bytes"]),
+        })
+        if inputs.two_level_cost is not None:
+            inputs.two_level_cost.setdefault(
+                "w_factor_cache_per_inner_map", []).append(cache_receipt)
+        inputs.print_fn(
+            "[ SC frozen W(tau) map cost | "
+            f"iteration={cache_receipt['iteration']}, "
+            f"builds={cache_receipt['builds']}, "
+            f"hits={cache_receipt['hits']}, "
+            f"evictions={cache_receipt['evictions']}, "
+            f"recomputes={cache_receipt['recomputes']}, "
+            f"resident={cache_receipt['resident_per_device_bytes'] / 2**20:.2f}/"
+            f"{cache_receipt['capacity_per_device_bytes'] / 2**20:.2f} "
+            "MiB/device ]")
     if inputs.two_level_cost is not None:
         walls = inputs.two_level_cost.setdefault("sigma_walls_s", [])
         walls.append(float(sigma_wall))
@@ -3491,6 +3534,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 "buffer_mask": buffer_mask,
                 "occupation_state": entry_occ_state,
                 "exact_hartree_dft": fixed_exact_hartree,
+                "update_policy": inputs.two_level_update_policy,
             },
             print_fn=inputs.print_fn,
         )
@@ -5387,6 +5431,19 @@ def run_sc_driver(
             f"{len(fixed_head_omegas)} frequency sample(s); each map folds "
             "them once through its resident W.")
 
+    from runtime.env_flags import env_bool
+    legacy_update_debug = env_bool(
+        "LORRAX_DEBUG_SC_LEGACY_UPDATE", False, print_fn=print_fn)
+    two_level_update_policy = (
+        QSGWUpdatePolicy.HALF_SUM if legacy_update_debug else
+        QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI)
+    if legacy_update_debug:
+        print_fn(
+            "WARNING -- DEBUG: LORRAX_DEBUG_SC_LEGACY_UPDATE=1; "
+            "two-level inner maps use the shipped single-level half-sum "
+            "Sigma_mn(E_m/E_n) update law. This discriminating arm is "
+            "diagnostic only, never production.")
+
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
         head_channel=head_channel,
@@ -5417,6 +5474,7 @@ def run_sc_driver(
         two_level_cost=(
             {"sigma_walls_s": [], "w_refits": 0}
             if int(config.sc.max_iter) > 1 else None),
+        two_level_update_policy=two_level_update_policy,
         print_fn=print_fn,
         record_fn=record_fn,
     )

@@ -383,3 +383,54 @@ def test_sc_fixed_table_reuses_eqp2_engine_with_fermi_offdiagonals(
     expected_policy = (
         qsgw_utils.QSGWUpdatePolicy.DIAGONAL_ON_SHELL_OFFDIAGONAL_FERMI)
     assert seen and all(value is expected_policy for value in seen)
+
+
+def test_sc_fixed_table_accepts_the_legacy_discriminating_policy(monkeypatch):
+    """The diagnostic arm reaches the same typed half-sum interpolation."""
+    import gw.qsgw_utils as qsgw_utils
+
+    omega_ev = np.linspace(-2.0, 2.0, 9)
+    e_dft_ry = np.asarray([[-0.6, 0.7]]) / RYD_TO_EV
+    kin = jnp.asarray(np.diag(e_dft_ry[0])[None].astype(complex))
+    zero = jnp.zeros((1, 2, 2), dtype=jnp.complex128)
+    result = SigmaResult(
+        v_h_kij_ry=zero, sigma_x_kij_ry=zero,
+        sigma_xc_kij_ry=zero,
+        sigma_c_omega_kij_ry=jnp.zeros(
+            (omega_ev.size, 1, 2, 2), dtype=jnp.complex128),
+        omega_grid_ev=omega_ev, omega_grid_ry=omega_ev / RYD_TO_EV,
+        efermi_dft_ev=0.0)
+    cfg = _config(tol_ev=1.0e-10, max_iter=4)
+    mesh = single_device_mesh()
+    seen = []
+    owned_build = qsgw_utils.build_qsgw_sigma_xc
+
+    def recording_build(*args, **kwargs):
+        seen.append(kwargs.get("update_policy"))
+        return owned_build(*args, **kwargs)
+
+    monkeypatch.setattr(qsgw_utils, "build_qsgw_sigma_xc", recording_build)
+    sc_inputs = SimpleNamespace(
+        kstar=None, kin_ion_dft=kin, mesh_xy=mesh, config=cfg,
+        valence_mask_active_kn=np.asarray([[True, False]]),
+        efermi_dft_ry=0.0)
+    context = {
+        "inputs": sc_inputs,
+        "H_seed_dft_ry": kin,
+        "sigma_basis_U": jnp.asarray(np.eye(2)[None], dtype=jnp.complex128),
+        "partition": BandPartition.all_protected(2),
+        "band_classes": None,
+        "scissor_fit": None,
+        "buffer_mask": np.zeros(2, dtype=bool),
+        "occupation_state": None,
+        "exact_hartree_dft": None,
+        "update_policy": qsgw_utils.QSGWUpdatePolicy.HALF_SUM,
+    }
+    got = run_fixed_sigma_evsc(
+        result, kin, e_dft_ry, config=cfg,
+        **_band_context(e_dft_ry), mesh_xy=mesh,
+        sc_context=context, print_fn=lambda *a: None)
+
+    assert got.converged
+    assert seen and all(
+        value is qsgw_utils.QSGWUpdatePolicy.HALF_SUM for value in seen)

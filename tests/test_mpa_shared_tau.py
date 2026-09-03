@@ -9,7 +9,7 @@ from gw.ppm_tau_kernel import (
     get_shared_sigma_spatial_kernel,
     get_shared_w_tau_kernel,
 )
-from gw.mpa.sigma import _frozen_w_time_factor
+from gw.mpa.sigma import _admit_w_time_factor, _frozen_w_time_factor
 
 
 def _mesh():
@@ -90,6 +90,27 @@ def test_frozen_w_cache_allows_reordered_subset_but_refuses_new_identity():
     assert _frozen_w_time_factor(bank, ("a",)) is first
     with pytest.raises(RuntimeError, match="sc_w_time_cache_identity"):
         _frozen_w_time_factor(bank, ("new",))
+
+
+def test_frozen_w_cache_keeps_identity_when_device_budget_evicts_factor():
+    mesh = _mesh()
+    first = jax.device_put(np.ones((1, 2, 2), dtype=np.complex128))
+    second = jax.device_put(np.ones((1, 2, 2), dtype=np.complex128))
+    bank = {
+        "signatures": [], "factors": [], "factor_index": {},
+        "complete": False,
+    }
+    owner = {
+        "capacity_per_device_bytes": int(first.nbytes),
+        "resident_per_device_bytes": 0,
+    }
+
+    assert _admit_w_time_factor(bank, ("first",), first, owner, mesh)
+    assert not _admit_w_time_factor(bank, ("second",), second, owner, mesh)
+    assert _frozen_w_time_factor(bank, ("first",)) is first
+    assert _frozen_w_time_factor(bank, ("second",)) is None
+    assert owner["resident_per_device_bytes"] == first.nbytes
+    assert owner["total_evictions"] == 1
 
 
 def test_device_frequency_fold_and_one_sided_completion():

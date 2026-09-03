@@ -56,11 +56,19 @@ and establishes a new certified anchor. Thus the continuous path is tested for
 adequacy rather than freezing a model blindly.
 
 Each outer model also owns one SCFIX quadrature transaction. Its frozen-pole inner
-solve pads movable state edges by 0.25 eV and pole extents by 0%, then reuses those
+solve pads movable state edges by 2.0 eV and pole extents by 0%, then reuses those
 exact rules for the whole inner solve. The transaction is discarded at the next
-outer W/pole refit, which replans and repads for the new model. This is narrower than
-SCFIX's 2 eV/10% conservative cross-refit defaults and avoids paying that 230-pair
-MoS2 geometry when only meV-scale state motion remains.
+outer W/pole refit, which replans and repads for the new model. The 2.0 eV state
+allowance is the owner's pass-3 ruling: it restores the original instruction to
+extend non-crossing state coverage by about 2 eV, while zero pole padding remains
+valid because the pole census is frozen.
+
+The frozen W-side time-factor cache is exact and device-resident but bounded to 10%
+of the resolved per-device memory budget. It retains a deterministic prefix of the
+first inner map's factors; identities beyond the cap remain certified and their
+factors are recomputed from the frozen pole store on every later map. No W tile is
+gathered to host, narrowed in precision, or refitted. Every inner map reports its
+factor build, hit, eviction, and recomputation counts.
 
 **Update law.** Owner's proposal (2026-09-03): every off-diagonal Σ̃_mn (m ≠ n) at E_F,
 the diagonal Σ̃_mm at E_m (on-shell, eqp0-type, no Z anywhere in the iteration). The

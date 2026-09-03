@@ -714,6 +714,8 @@ def compute_ppm_sigma_pipeline(
         ppm_w_cache = (
             None if w_time_factor_cache is None else
             w_time_factor_cache.setdefault("ppm_total", {}))
+        if ppm_w_cache is not None and "_owner" in w_time_factor_cache:
+            ppm_w_cache.setdefault("_owner", w_time_factor_cache["_owner"])
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
@@ -742,6 +744,8 @@ def compute_ppm_sigma_pipeline(
             even_w_cache = (
                 None if w_time_factor_cache is None else
                 w_time_factor_cache.setdefault("ppm_even", {}))
+            if even_w_cache is not None and "_owner" in w_time_factor_cache:
+                even_w_cache.setdefault("_owner", w_time_factor_cache["_owner"])
             with timing.section("sigma.exec.odd_reference"):
                 sigma_omega_even = compute_sigma_c_ppm_omega_grid(
                     wfns, replace(ppm, B_odd_q=None), meta, mesh_xy,
