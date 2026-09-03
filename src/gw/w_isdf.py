@@ -1921,6 +1921,56 @@ class StaticPhotonResponse:
     charge_head_insertion_norm_stats: tuple[float, ...] | None = None
 
 
+def _dump_packed_photon_q0_diagnostic(
+    W_packed, layout, mesh_xy, config, stage, *, head_completion=None,
+):
+    """Write one canonical q=0 photon matrix for the bounded W-plan audit.
+
+    This temporary measurement hook shares the already registered
+    ``LORRAX_W_RESIDUAL_CHECK`` opt-in with the Dyson-residual diagnostic.
+    Blocks are unpacked through :func:`photon_block_view` before gathering so
+    the 1x1 contiguous and 2x2 mesh-interleaved carriers land in the same
+    canonical C,T1,T2,T3 order on disk.
+    """
+    enabled = os.environ.get("LORRAX_W_RESIDUAL_CHECK", "0").strip().lower()
+    if enabled in ("", "0", "false", "no", "off"):
+        return
+    from common.collectives import gather_to_host
+    from .photon_layout import photon_block_view
+
+    q0 = W_packed[:1]
+    blocks = []
+    for A in range(4):
+        row = []
+        for B in range(4):
+            block = gather_to_host(
+                photon_block_view(q0, layout, A, B, mesh_xy))[0]
+            row.append(block[
+                :layout.logical_extent(A), :layout.logical_extent(B)])
+        blocks.append(row)
+    if jax.process_index() != 0:
+        return
+    canonical = np.concatenate(
+        [np.concatenate(row, axis=1) for row in blocks], axis=0)
+    path = os.path.join(
+        config.input_dir, f"W_packed_q0_{str(stage)}_canonical.npy")
+    np.save(path, canonical)
+    print(
+        f"  [W solve diagnostic] wrote canonical W_packed[q=0] "
+        f"stage={stage} shape={canonical.shape} to {path}", flush=True)
+    if head_completion is not None:
+        receipt_path = os.path.join(
+            config.input_dir, "W_packed_q0_completion_moments.npz")
+        np.savez(
+            receipt_path,
+            D_mean=np.asarray(head_completion.bare_D_mean),
+            M_uv=np.asarray(head_completion.screened_moments),
+        )
+        print(
+            "  [W solve diagnostic] wrote completion D_mean/M_uv to "
+            f"{receipt_path}", flush=True)
+
+
 def format_photon_head_run_record(response: StaticPhotonResponse) -> str:
     """Format the one packed-photon Gamma-head production-record line."""
     completion = response.head_completion
@@ -2311,6 +2361,8 @@ def compute_static_photon_response(
         raise ValueError(
             "static packed photon W[q=0] failed the canonical Hermiticity "
             "gate before coupled head/body folding")
+    _dump_packed_photon_q0_diagnostic(
+        W_packed, layout, mesh_xy, config, "body")
 
     head_completion = None
     charge_head_insertion_stats = None
@@ -2369,6 +2421,9 @@ def compute_static_photon_response(
                 "dyson_forward_bound="
                 f"{head_completion.max_dyson_forward_error_bound:.3e}",
                 flush=True)
+        _dump_packed_photon_q0_diagnostic(
+            W_packed, layout, mesh_xy, config, "completed",
+            head_completion=head_completion)
 
     if screen_current:
         return StaticPhotonResponse(
