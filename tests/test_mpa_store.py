@@ -441,6 +441,65 @@ def test_collective_reader_keeps_one_frequency_slab_sharded(
     assert calls == ["open", "close"]
 
 
+def test_collective_reader_reconstructs_the_product_padded_mu_carrier(
+        monkeypatch):
+    """P36 Bi geometry: 2070 divides six, but the carrier extent is 2088.
+
+    The old reader used ``mesh_divisible_shape`` independently on μ_X and
+    ν_Y, requested 2070, and fed that χ into a Dyson solve whose V carrier
+    was 2088.  No payload allocation is needed to gate the read request.
+    """
+    from types import SimpleNamespace
+    from jax.sharding import PartitionSpec as P
+    import file_io.slab_io as slab_io
+
+    header = {
+        "n_omega": 1,
+        "n_q_on_disk": 65,
+        "n_mu": 2070,
+        "data_ready": np.asarray([True]),
+    }
+    monkeypatch.setattr(MS, "read_w_header", lambda *_args, **_kw: header)
+    calls = []
+    sentinel = object()
+
+    class ReturnedSlab:
+        def __getitem__(self, index):
+            assert index == 0
+            return sentinel
+
+    class RecordingSlabIO:
+        def __init__(self, path, *, mode, mesh):
+            assert path == "samples.h5"
+            assert mode == "r"
+            self.mesh = mesh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def read_slab(self, name, **kwargs):
+            calls.append((name, kwargs))
+            return ReturnedSlab()
+
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
+    mesh = SimpleNamespace(axis_names=("x", "y"), shape={"x": 6, "y": 6})
+
+    got, got_header = MS.read_w_slab_collective(
+        "samples.h5", "chi0_qmunu_z", 0, mesh_xy=mesh)
+
+    assert got is sentinel
+    assert got_header is header
+    assert calls == [("chi0_qmunu_z", {
+        "shape": (1, 65, 2088, 2088),
+        "offset": (0, 0, 0, 0),
+        "valid_shape": (1, 65, 2070, 2070),
+        "partition_spec": P(None, None, "x", "y"),
+    })]
+
+
 def test_a_single_q_of_a_slab_is_the_same_bytes(tmpdir_path):
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     for iq in range(_N_Q_IBZ):

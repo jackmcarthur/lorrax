@@ -69,7 +69,7 @@ from common import Meta, jax_profile
 from common.bispinor_init import NO_PAIR_DIRAC_CURRENT_MODEL
 from common.collectives import device_put_process_local
 from common.jax_compile_cache import ensure_jax_compile_cache
-from runtime.padding import round_up, solve_at_logical
+from runtime.padding import padded_mu_extent, round_up, solve_at_logical
 from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                      band_in_occupation_window, occupation_weight_floor)
 from .minimax_screening import MinimaxNodes
@@ -1304,6 +1304,16 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         print(f"  [W solve] w_dyson_solver=distributed -> {p.describe()}",
               flush=True)
 
+    def _logical_tile(A_loc):
+        """Zero the nonphysical rows/columns of one distributed μ tile."""
+        i0 = jax.lax.axis_index('x') * (n_ext // px)
+        j0 = jax.lax.axis_index('y') * (n_ext // py)
+        logical = jnp.logical_and(
+            i0 + jnp.arange(n_ext // px)[:, None] < n_log,
+            j0 + jnp.arange(n_ext // py)[None, :] < n_log)
+        return jnp.where(logical[None, :, :], A_loc,
+                         jnp.zeros((), dtype=A_loc.dtype))
+
     # The two collectives ``_a_local`` emits, per q (2-D block GEMM):
     #   all_gather('y')  V   (μ/Px, μ/Py) -> (μ/Px, μ)  = μ²/Px · 16 B
     #   all_gather('x')  χ   (μ/Px, μ/Py) -> (μ, μ/Py)  = μ²/Py · 16 B
@@ -1317,6 +1327,12 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         # A[q,i,j] = δ_ij − Σ_k V[q,i,k]·χs[q,k,j] on my (i on 'x',
         # j on 'y') tile.  Classic 2-D block GEMM pairing — same shape
         # of communication as ``isdf.core._distributed_pinv_apply``.
+        # Mask BOTH inputs here, before either gather: the public seam
+        # authenticates their common product-padded extent, while this local
+        # operation makes the exact-zero pad contract structural even if an
+        # upstream padded buffer was poisoned.  No full μ² tile is formed.
+        V_loc = _logical_tile(V_loc)
+        chi_loc = _logical_tile(chi_loc)
         V_row = jax.lax.all_gather(V_loc, 'y', axis=2, tiled=True)
         chi_col = jax.lax.all_gather(chi_loc, 'x', axis=1, tiled=True)
         prod = jnp.einsum('qik,qkj->qij', V_row, chi_col)
@@ -1341,7 +1357,14 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # the FFI backsolve DONATES both operands (docs/dev/linalg_ffi.md
     # "Sharp edges") and V is still needed by Σ_SX/Σ_COH/Σ_X and the
     # PPM fit's Wc = W − V.
-    _copy = jax.jit(jnp.copy, out_shardings=nat)
+    @partial(shard_map, mesh=mesh_xy, in_specs=P(None, 'x', 'y'),
+             out_specs=P(None, 'x', 'y'), check_vma=False)
+    def _zero_pad_rhs_local(V_loc):
+        return _logical_tile(V_loc)
+
+    # This remains a fresh RHS buffer (V is not donated), but unlike a plain
+    # copy it also makes the identity-embedded system's zero pad exact.
+    _copy_zero_pad = jax.jit(_zero_pad_rhs_local, out_shardings=nat)
 
     def _solve_w_dist(V_flat: jax.Array, chi_flat: jax.Array,
                       pref: jax.Array) -> jax.Array:
@@ -1359,7 +1382,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         for q0 in range(0, nq_local, qb):
             q1 = min(q0 + qb, nq_local)
             A = _a_chunk(V_flat[q0:q1], chi_scaled[q0:q1], A, q0)
-        B = _copy(V_flat)
+        B = _copy_zero_pad(V_flat)
         # ONE plan call for the whole stack: one descriptor, one
         # workspace; A and B are donated into the FFI.
         W = p.batched(A, B)
@@ -1470,6 +1493,9 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
+    Both inputs must use the one canonical in-memory carrier extent
+    ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  The distributed plan masks
+    their pad rows/columns to exact zero before its first contraction.
 
     **Output contract:** ``W`` is ``P(None, 'x', 'y')`` — 2-D sharded
     W_q(μ_X, ν_Y) — on both plans, and stays that way into its
@@ -1491,6 +1517,25 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
     ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
     caller must drop its reference after this call.
     """
+    v_shape = tuple(int(n) for n in V_q.shape)
+    chi_shape = tuple(int(n) for n in chi0_q.shape)
+    if v_shape != chi_shape:
+        raise ValueError(
+            "solve_w requires V_q and chi0_q to have the same padded "
+            f"(q,mu,nu) extent; got V_q.shape={v_shape} and "
+            f"chi0_q.shape={chi_shape}.  Producers and restart readers "
+            "must reconstruct both mu axes with "
+            "runtime.padding.padded_mu_extent before the Dyson solve.")
+    n_logical = int(meta.n_rmu)
+    n_padded = int(padded_mu_extent(n_logical, mesh_xy))
+    expected_shape = (int(meta.nk_tot), n_padded, n_padded)
+    if v_shape != expected_shape:
+        raise ValueError(
+            "solve_w requires the canonical product-padded centroid "
+            f"carrier {expected_shape} from logical n_rmu={n_logical}; "
+            f"got equal V_q/chi0_q shapes {v_shape}.  Per-mesh-axis "
+            "divisibility is not the in-memory carrier contract; use "
+            "runtime.padding.padded_mu_extent.")
     solve_fn, pref = _resolve_w_solve_fn(
         meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route)
