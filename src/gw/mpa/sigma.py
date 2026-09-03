@@ -400,7 +400,12 @@ def _integrate_sigma_batches(
         print_fn(
             "  MPA Sigma fixed-index outer face: retained "
             f"Sigma_c(E_F) P×U = ({n_protected},{n_total_logical - n_protected}) "
-            "from the shared sweep")
+            "from the shared sweep; "
+            + (f"legacy columns widened P×P -> P×(P+U), "
+               f"projector-face ratio={n_total_logical / n_protected:.6f}"
+               if wfns.layout == "legacy" else
+               "face layout already accumulated the full band face, "
+               "incremental projector work=0"))
     sigma = strip_sigma_window(
         sigma_wide, nb_real, mesh_xy=mesh_xy)
     transform_saving = int(logical_tau_pairs - n_tau)

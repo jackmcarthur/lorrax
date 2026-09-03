@@ -1518,17 +1518,17 @@ def _rotate_wavefunctions_legacy(
     ``greens_function_kernel._legacy_build_G``'s own precedent.
     """
     sigma_slice = wfns_dft.slices.sigma
+    full_slice = wfns_dft.slices.full
     if active_slice is None:
         active_slice = sigma_slice
     a_lo = int(active_slice.start or 0)
     a_hi = int(active_slice.stop)
-    s_lo = int(sigma_slice.start or 0)
-    s_hi = int(sigma_slice.stop)
-    if a_lo < s_lo or a_hi > s_hi:
+    f_lo = int(full_slice.start or 0)
+    f_hi = int(full_slice.stop)
+    if a_lo < f_lo or a_hi > f_hi:
         raise ValueError(
             f"rotate_wavefunctions: active_slice [{a_lo}, {a_hi}) leaks "
-            f"outside the σ-window [{s_lo}, {s_hi}); we have no QP basis "
-            f"information for bands beyond the protected window.")
+            f"outside the loaded band window [{f_lo}, {f_hi}).")
     nb_active = a_hi - a_lo
     if U_dft_to_qp_active.shape[-2:] != (nb_active, nb_active):
         raise ValueError(
@@ -1607,17 +1607,17 @@ def _rotate_wavefunctions_face(
     See :func:`rotate_wavefunctions` for the shared docstring.
     """
     sigma_slice = wfns_dft.slices.sigma
+    full_slice = wfns_dft.slices.full
     if active_slice is None:
         active_slice = sigma_slice
     a_lo = int(active_slice.start or 0)
     a_hi = int(active_slice.stop)
-    s_lo = int(sigma_slice.start or 0)
-    s_hi = int(sigma_slice.stop)
-    if a_lo < s_lo or a_hi > s_hi:
+    f_lo = int(full_slice.start or 0)
+    f_hi = int(full_slice.stop)
+    if a_lo < f_lo or a_hi > f_hi:
         raise ValueError(
             f"rotate_wavefunctions: active_slice [{a_lo}, {a_hi}) leaks "
-            f"outside the σ-window [{s_lo}, {s_hi}); we have no QP basis "
-            f"information for bands beyond the protected window.")
+            f"outside the loaded band window [{f_lo}, {f_hi}).")
     nb_active = a_hi - a_lo
     if U_dft_to_qp_active.shape[-2:] != (nb_active, nb_active):
         raise ValueError(
@@ -1727,23 +1727,18 @@ def rotate_wavefunctions(
     ``u_spec=qsgw_density.band_rotation_spec()``, which it already
     supports, or by using ``distributed_eigh_bands``, which emits it.
 
-    Active / inactive partition
-    ---------------------------
-    The ``active_slice`` (default: ``wfns_dft.slices.sigma`` — the QP
-    evaluation window) selects a contiguous band block ``[start, stop)``
-    where the QP Hamiltonian has full off-diagonal Σ and we apply the
-    band-mixing unitary.  Bands **outside** that window always keep their
-    DFT wavefunctions.  Their energies come from ``enk_base`` when one is
-    supplied, otherwise from the DFT bundle unchanged.  This lets the SC
-    driver apply an energy-only scissor to conduction-sum bands without
-    inventing a QP wavefunction rotation for bands the QP matrix never
-    touched.
+    Rotation window
+    ---------------
+    The ``active_slice`` defaults to ``wfns_dft.slices.sigma`` for the
+    one-shot path.  A fixed-index self-consistent Hamiltonian instead passes
+    P+U: its P×U block rotates the outer states even though no U×U Sigma
+    elements are evaluated.  Either slice must remain inside the loaded
+    wavefunction window; bands outside it keep their DFT wavefunctions and
+    take energies from ``enk_base`` when supplied.
 
     Validation
     ----------
-    Errors if ``active_slice`` extends past ``wfns_dft.slices.sigma`` —
-    that would imply we're rotating bands the calculation can't have
-    produced QP-basis information for.
+    Errors if ``active_slice`` extends past ``wfns_dft.slices.full``.
 
     Parameters
     ----------

@@ -2426,7 +2426,7 @@ def _fixed_index_hamiltonian(
         f"{float(diagnostics['boundary_mismatch_ev']):.9f} eV")
     if not ks.is_identity:
         _check_kstar_spread(
-            ks, H_dft_full, print_fn=inputs.print_fn)
+            ks, ks.broadcast(H_dft), print_fn=inputs.print_fn)
     return H_dft
 
 
