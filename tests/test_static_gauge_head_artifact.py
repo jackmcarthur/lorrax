@@ -23,6 +23,7 @@ from gw.qsgw_head import (
     StaticGaugeHallTransaction,
     _static_gauge_hall_transaction_from_artifact,
 )
+from gw.mpa.sample_plan import faraday_imaginary_plan, plan_z
 
 
 _OPERATOR_FINGERPRINT = "sha256:" + "a" * 64
@@ -61,6 +62,26 @@ def _transaction(mesh, wfn, *, sigma_H=_SIGMA_H):
         hamiltonian_config_operator_fingerprint=_OPERATOR_FINGERPRINT,
         wfn_fingerprint=wfn_fingerprint(wfn),
         band_start=0, band_stop=4, nk_tot=6, mesh=mesh)
+
+
+def _transaction_v3(mesh, wfn):
+    plan = faraday_imaginary_plan(3, 2.0)
+    frequencies = plan_z(plan)
+    sigma = np.arange(frequencies.size * 3, dtype=np.float64).reshape(-1, 3)
+    transaction = _static_gauge_hall_transaction_from_artifact(
+        frequencies_ry=frequencies,
+        sigma_H_frequency=sigma.astype(np.complex128),
+        hamiltonian_config_operator_fingerprint=_OPERATOR_FINGERPRINT,
+        wfn_fingerprint=wfn_fingerprint(wfn),
+        band_start=0, band_stop=4, nk_tot=6, mesh=mesh,
+        artifact_schema_version=3,
+        sample_plan_label=plan["label"],
+        sample_plan_n_poles=plan["n_poles"],
+        sample_plan_alpha=plan["sampling_alpha"],
+        sample_plan_schedule=plan["sampling_schedule"],
+        sample_plan_omega_max_ry=plan["omega_max_ry"],
+    )
+    return transaction, plan
 
 
 def _load(path, mesh, wfn=None, **changes):
@@ -110,6 +131,38 @@ def test_hall_artifact_roundtrip_is_sealed_and_immutable(tmp_path):
         write_static_gauge_hall_artifact(
             tmp_path / "other.h5", SimpleNamespace(sigma_H=np.zeros(3)),
             mesh_xy=mesh)
+
+
+def test_hall_artifact_v3_roundtrip_stamps_nested_mpa_plan(tmp_path):
+    mesh = _mesh()
+    wfn = _wfn()
+    transaction, plan = _transaction_v3(mesh, wfn)
+    path = tmp_path / "static_gauge_hall_v3.h5"
+
+    write_static_gauge_hall_artifact(path, transaction, mesh_xy=mesh)
+    loaded = _load(path, mesh, wfn)
+    assert loaded.artifact_schema_version == STATIC_GAUGE_HALL_SCHEMA_VERSION
+    assert loaded.sample_plan_label == plan["label"]
+    assert loaded.sample_plan_n_poles == 3
+    assert loaded.sample_plan_alpha == 1
+    assert loaded.sample_plan_schedule == "nested"
+    assert loaded.sample_plan_omega_max_ry == 2.0
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(loaded.frequencies_ry)),
+        np.asarray([0.0j, 0.25j, 0.5j, 1.0j, 1.5j, 2.0j]))
+
+
+def test_hall_artifact_v3_refuses_tampered_sample_plan_stamp(tmp_path):
+    mesh = _mesh()
+    wfn = _wfn()
+    transaction, _ = _transaction_v3(mesh, wfn)
+    path = tmp_path / "static_gauge_hall_v3.h5"
+    write_static_gauge_hall_artifact(path, transaction, mesh_xy=mesh)
+    with SlabIO(path, mode="a", mesh=mesh) as io:
+        io.write_attr("sample_plan_alpha", np.int32(2))
+    with pytest.raises(
+            ValueError, match="static_gauge_hall_sample_plan_provenance"):
+        _load(path, mesh, wfn)
 
 
 @pytest.mark.parametrize(

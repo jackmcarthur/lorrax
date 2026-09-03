@@ -18,6 +18,8 @@ file refuses; it never degrades to ``sigma_H = 0``.  The absent-file default
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -33,7 +35,37 @@ from common.parallel_transport import (
 from file_io.slab_io import SlabIO
 
 
-STATIC_GAUGE_HALL_SCHEMA_VERSION = 2
+STATIC_GAUGE_HALL_SCHEMA_VERSION = 3
+STATIC_GAUGE_HALL_READABLE_SCHEMA_VERSIONS = (2, 3)
+
+
+def _sample_plan_sha256(
+    frequencies_ry,
+    *,
+    label: str,
+    n_poles: int,
+    alpha: int,
+    schedule: str,
+    omega_max_ry: float,
+) -> str:
+    """Hash the exact frequency bytes and their MPA-plan provenance."""
+    frequencies = np.ascontiguousarray(
+        np.asarray(frequencies_ry, dtype=np.complex128))
+    payload = json.dumps(
+        {
+            "label": str(label),
+            "n_poles": int(n_poles),
+            "sampling_alpha": int(alpha),
+            "sampling_schedule": str(schedule),
+            "omega_max_ry": float(omega_max_ry),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(payload)
+    digest.update(frequencies.view(np.uint8))
+    return "sha256:" + digest.hexdigest()
 
 
 def _require_prefixed_sha256(value: str, *, field_name: str) -> str:
@@ -176,6 +208,7 @@ def write_static_gauge_hall_artifact(
     sigma_H = np.asarray(
         jax.device_get(hall_transaction.sigma_H_frequency),
         dtype=np.complex128)
+    schema_version = int(hall_transaction.artifact_schema_version)
     if (frequencies.ndim != 1 or frequencies.size == 0
             or not np.all(np.isfinite(frequencies))):
         raise ValueError(
@@ -188,8 +221,7 @@ def write_static_gauge_hall_artifact(
     final_path, partial_path = _immutable_partial_paths(
         path, artifact_name="StaticGaugeHall")
     with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
-        io.write_attr(
-            "schema_version", np.int32(STATIC_GAUGE_HALL_SCHEMA_VERSION))
+        io.write_attr("schema_version", np.int32(schema_version))
         io.write_attr("complete", np.int32(1))
         io.write_attr(
             "wfn_fingerprint_i32",
@@ -201,6 +233,33 @@ def write_static_gauge_hall_artifact(
         io.write_attr("nk_tot", np.int32(nk_tot))
         io.write_attr("frequency_ry", frequencies)
         io.write_attr("sigma_H_cart_frequency", sigma_H)
+        if schema_version == 3:
+            plan_hash = _sample_plan_sha256(
+                frequencies,
+                label=hall_transaction.sample_plan_label,
+                n_poles=hall_transaction.sample_plan_n_poles,
+                alpha=hall_transaction.sample_plan_alpha,
+                schedule=hall_transaction.sample_plan_schedule,
+                omega_max_ry=hall_transaction.sample_plan_omega_max_ry,
+            )
+            io.write_attr(
+                "sample_plan_label_i32",
+                _text_i32(hall_transaction.sample_plan_label))
+            io.write_attr(
+                "sample_plan_n_poles",
+                np.int32(hall_transaction.sample_plan_n_poles))
+            io.write_attr(
+                "sample_plan_alpha",
+                np.int32(hall_transaction.sample_plan_alpha))
+            io.write_attr(
+                "sample_plan_schedule_i32",
+                _text_i32(hall_transaction.sample_plan_schedule))
+            io.write_attr(
+                "sample_plan_omega_max_ry",
+                np.float64(hall_transaction.sample_plan_omega_max_ry))
+            io.write_attr(
+                "sample_plan_sha256_i32",
+                _text_i32(plan_hash, encoding="ascii"))
 
     _publish_completed_partial(
         partial_path, final_path, artifact_name="StaticGaugeHall",
@@ -277,14 +336,37 @@ def load_static_gauge_hall_artifact(
         sigma_H = np.asarray(
             _read_required_small(io, "sigma_H_cart_frequency"),
             dtype=np.complex128)
+        if schema == 3:
+            sample_plan_label = _decode_i32_text(
+                _read_required_small(io, "sample_plan_label_i32"),
+                field_name="sample_plan_label_i32", encoding="utf-8")
+            sample_plan_n_poles = int(np.asarray(
+                _read_required_small(io, "sample_plan_n_poles")))
+            sample_plan_alpha = int(np.asarray(
+                _read_required_small(io, "sample_plan_alpha")))
+            sample_plan_schedule = _decode_i32_text(
+                _read_required_small(io, "sample_plan_schedule_i32"),
+                field_name="sample_plan_schedule_i32", encoding="utf-8")
+            sample_plan_omega_max_ry = float(np.asarray(
+                _read_required_small(io, "sample_plan_omega_max_ry")))
+            sample_plan_hash = _decode_i32_text(
+                _read_required_small(io, "sample_plan_sha256_i32"),
+                field_name="sample_plan_sha256_i32", encoding="ascii")
+        else:
+            sample_plan_label = None
+            sample_plan_n_poles = None
+            sample_plan_alpha = None
+            sample_plan_schedule = None
+            sample_plan_omega_max_ry = None
+            sample_plan_hash = None
 
     if complete != 1:
         raise ValueError(
             f"StaticGaugeHall artifact is incomplete (complete={complete})")
-    if schema != STATIC_GAUGE_HALL_SCHEMA_VERSION:
+    if schema not in STATIC_GAUGE_HALL_READABLE_SCHEMA_VERSIONS:
         raise ValueError(
-            f"schema_version={schema}, expected "
-            f"{STATIC_GAUGE_HALL_SCHEMA_VERSION}")
+            f"schema_version={schema}, expected one of "
+            f"{STATIC_GAUGE_HALL_READABLE_SCHEMA_VERSIONS}")
     artifact_wfn = _require_wfn_sha256(artifact_wfn)
     if artifact_wfn != expected_wfn:
         raise ValueError("StaticGaugeHall WFN identity differs")
@@ -303,6 +385,21 @@ def load_static_gauge_hall_artifact(
         raise ValueError(
             "StaticGaugeHall sigma_H_cart_frequency must contain three "
             "finite values per frequency")
+    if schema == 3:
+        expected_plan_hash = _sample_plan_sha256(
+            frequencies,
+            label=sample_plan_label,
+            n_poles=sample_plan_n_poles,
+            alpha=sample_plan_alpha,
+            schedule=sample_plan_schedule,
+            omega_max_ry=sample_plan_omega_max_ry,
+        )
+        sample_plan_hash = _require_prefixed_sha256(
+            sample_plan_hash, field_name="Hall MPA sample-plan fingerprint")
+        if sample_plan_hash != expected_plan_hash:
+            raise ValueError(
+                "GATE static_gauge_hall_sample_plan_provenance: schema-v3 "
+                "sample frequencies differ from their MPA-plan stamp")
     operator_fingerprint = _require_prefixed_sha256(
         operator_fingerprint,
         field_name="Hall Hamiltonian/config/operator fingerprint")
@@ -316,11 +413,18 @@ def load_static_gauge_hall_artifact(
         band_stop=stop,
         nk_tot=nk_tot,
         mesh=mesh_xy,
+        artifact_schema_version=schema,
+        sample_plan_label=sample_plan_label,
+        sample_plan_n_poles=sample_plan_n_poles,
+        sample_plan_alpha=sample_plan_alpha,
+        sample_plan_schedule=sample_plan_schedule,
+        sample_plan_omega_max_ry=sample_plan_omega_max_ry,
     )
 
 
 __all__ = [
     "STATIC_GAUGE_HALL_SCHEMA_VERSION",
+    "STATIC_GAUGE_HALL_READABLE_SCHEMA_VERSIONS",
     "load_static_gauge_hall_artifact",
     "write_static_gauge_hall_artifact",
 ]

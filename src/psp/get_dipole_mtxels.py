@@ -1267,13 +1267,23 @@ def main(argv=None):
 	nb = int(nband_eff)
 	if args.static_gauge_hall_only:
 		from gw.qsgw_head import static_gauge_hall_transaction
+		from gw.mpa.sample_plan import (
+			faraday_imaginary_plan, plan_z)
 		omega_p = float(params.get("ppm_omega_p", 2.0))
 		if not np.isfinite(omega_p) or omega_p <= 0.0:
 			parser.error(
 				"--static-gauge-hall-only requires finite ppm_omega_p > 0 "
 				"for its dynamic Hall sample")
-		hall_frequencies = np.asarray(
-			[0.0 + 0.0j, 1j * omega_p], dtype=np.complex128)
+		# The three-pole Hall ceiling needs six samples.  Their positions are
+		# the nested 1/2/3-pole supports from the existing MPA partition owner,
+		# placed on the imaginary axis required by the charge-head completion.
+		# No new deck key is introduced: alpha/schedule are the MPA deck values
+		# and the incumbent GN probe is the exact upper endpoint.
+		hall_sample_plan = faraday_imaginary_plan(
+			3, omega_p,
+			alpha=int(params.get("mpa_sampling_alpha", 1)),
+			schedule=str(params.get("mpa_sampling_schedule", "nested")))
+		hall_frequencies = plan_z(hall_sample_plan)
 
 		psi_G = wfn.load(
 			bands=(0, nb), k="full_bz", sharding=band_sphere_spec(),
@@ -1293,7 +1303,8 @@ def main(argv=None):
 			hall = static_gauge_hall_transaction(
 				uniform_gauge, hall_frequencies,
 				wfn=wfn, sym=sym, band_start=0,
-				band_stop=nb, mesh=RUNTIME.mesh)
+				band_stop=nb, mesh=RUNTIME.mesh,
+				sample_plan=hall_sample_plan)
 			sigma_H = np.asarray(jax.block_until_ready(hall.sigma_H))
 			sigma_H_frequency = np.asarray(
 				jax.block_until_ready(hall.sigma_H_frequency))
@@ -1311,6 +1322,8 @@ def main(argv=None):
 				f"{hall.hamiltonian_config_operator_fingerprint} "
 				f"bands=[{hall.band_start},{hall.band_stop}) "
 				f"nk_tot={hall.nk_tot} "
+				f"schema={hall.artifact_schema_version} "
+				f"sample_plan={hall.sample_plan_label} "
 				f"sigma_H_raw_bohr^-1="
 				f"[{sigma_H[0]:.17e},{sigma_H[1]:.17e},"
 				f"{sigma_H[2]:.17e}]")

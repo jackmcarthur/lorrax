@@ -370,3 +370,45 @@ def mpa_plan(
     if str(schedule).lower() != "nested":
         label += f"-schedule={str(schedule).lower()}"
     return sampling_plan(pts, label=label)
+
+
+def faraday_imaginary_plan(
+    n_p,
+    omega_max_ry,
+    *,
+    alpha=1,
+    schedule="nested",
+):
+    """Return the nested imaginary-axis support for the Faraday MPA fit.
+
+    The Hall head is even in ``z`` and its charge-head completion accepts
+    imaginary-axis samples only.  Reuse the MPA partition owner rather than
+    introducing a second abscissa rule: an ``n_p``-pole Hall fit receives
+    ``2*n_p`` points from :func:`sampling.partition_omegas`, placed at
+    ``z=i*omega``.  Consequently the one-, two-, and three-pole supports are
+    nested sets.  For the standard 2 Ry endpoint their union is
+    ``{0, .25i, .5i, 1i, 1.5i, 2i}`` Ry.
+
+    This is sampling geometry only.  It does not change the double-parallel
+    body MPA plan or any screening/Sigma quadrature.
+    """
+    n = int(n_p)
+    if n < 1:
+        raise ValueError("Faraday MPA n_p must be positive")
+    omega = sampling.partition_omegas(
+        2 * n, omega_max_ry, alpha=alpha, schedule=schedule)
+    points = tuple(
+        sample_point(1j * value, f"faraday_imag_{index:02d}", index=index)
+        for index, value in enumerate(omega))
+    plan = sampling_plan(
+        points,
+        label=(f"faraday-imaginary-mpa-n_p={n}-alpha={int(alpha)}"
+               f"-schedule={str(schedule).strip().lower()}"),
+    )
+    return {
+        **plan,
+        "n_poles": n,
+        "sampling_alpha": int(alpha),
+        "sampling_schedule": str(schedule).strip().lower(),
+        "omega_max_ry": float(omega_max_ry),
+    }

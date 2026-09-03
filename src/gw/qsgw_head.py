@@ -285,6 +285,12 @@ class StaticGaugeHallTransaction:
     nk_tot: int
     producer_id: str
     _producer_token: object
+    artifact_schema_version: int = 2
+    sample_plan_label: str | None = None
+    sample_plan_n_poles: int | None = None
+    sample_plan_alpha: int | None = None
+    sample_plan_schedule: str | None = None
+    sample_plan_omega_max_ry: float | None = None
 
     def __post_init__(self) -> None:
         if self._producer_token is not _STATIC_GAUGE_HALL_TOKEN:
@@ -309,6 +315,35 @@ class StaticGaugeHallTransaction:
         if self.producer_id != _STATIC_GAUGE_HALL_PRODUCER_ID:
             raise ValueError(
                 "StaticGaugeHallTransaction has an unknown producer")
+        schema = int(self.artifact_schema_version)
+        if schema not in (2, 3):
+            raise ValueError(
+                "StaticGaugeHallTransaction supports artifact schema 2 or 3")
+        plan_fields = (
+            self.sample_plan_label,
+            self.sample_plan_n_poles,
+            self.sample_plan_alpha,
+            self.sample_plan_schedule,
+            self.sample_plan_omega_max_ry,
+        )
+        if schema == 2 and any(value is not None for value in plan_fields):
+            raise ValueError(
+                "schema-v2 StaticGaugeHallTransaction cannot claim MPA "
+                "sample-plan provenance")
+        if schema == 3:
+            if any(value is None for value in plan_fields):
+                raise ValueError(
+                    "schema-v3 StaticGaugeHallTransaction requires complete "
+                    "MPA sample-plan provenance")
+            if (not str(self.sample_plan_label).strip()
+                    or int(self.sample_plan_n_poles) < 1
+                    or int(self.sample_plan_alpha) not in (1, 2)
+                    or str(self.sample_plan_schedule) not in ("nested", "leon")
+                    or not np.isfinite(float(self.sample_plan_omega_max_ry))
+                    or float(self.sample_plan_omega_max_ry) <= 0.0):
+                raise ValueError(
+                    "schema-v3 StaticGaugeHallTransaction has invalid MPA "
+                    "sample-plan provenance")
         if (self.frequencies_ry.ndim != 1
                 or int(self.frequencies_ry.shape[0]) <= 0
                 or np.dtype(self.frequencies_ry.dtype)
@@ -2840,6 +2875,7 @@ def static_gauge_hall_transaction(
     band_stop: int,
     mesh: Mesh,
     degeneracy_tolerance_ry: float = 1.0e-10,
+    sample_plan=None,
 ) -> StaticGaugeHallTransaction:
     r"""Produce artifact-ready Hall samples from one canonical transaction.
 
@@ -2908,6 +2944,32 @@ def static_gauge_hall_transaction(
             "static gauge Hall frequency slot zero must be exactly z=0")
     if len(np.unique(frequencies_host)) != int(frequencies_host.size):
         raise ValueError("static gauge Hall frequencies must be unique")
+    schema_version = 2
+    plan_label = None
+    plan_n_poles = None
+    plan_alpha = None
+    plan_schedule = None
+    plan_omega_max = None
+    if sample_plan is not None:
+        from gw.mpa.sample_plan import plan_z
+
+        if not isinstance(sample_plan, dict):
+            raise TypeError("static gauge Hall sample_plan must be an MPA plan")
+        planned = plan_z(sample_plan)
+        if not np.array_equal(planned, frequencies_host):
+            raise ValueError(
+                "static gauge Hall frequencies differ from the stamped MPA "
+                "sample plan")
+        try:
+            plan_label = str(sample_plan["label"])
+            plan_n_poles = int(sample_plan["n_poles"])
+            plan_alpha = int(sample_plan["sampling_alpha"])
+            plan_schedule = str(sample_plan["sampling_schedule"])
+            plan_omega_max = float(sample_plan["omega_max_ry"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "static gauge Hall MPA sample plan lacks provenance") from exc
+        schema_version = 3
     if not hasattr(sym, "trs_allowed"):
         raise ValueError(
             "GATE static_gauge_hall_needs_measured_trs: Hall production "
@@ -3013,6 +3075,12 @@ def static_gauge_hall_transaction(
         nk_tot=nk_tot,
         producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
         _producer_token=_STATIC_GAUGE_HALL_TOKEN,
+        artifact_schema_version=schema_version,
+        sample_plan_label=plan_label,
+        sample_plan_n_poles=plan_n_poles,
+        sample_plan_alpha=plan_alpha,
+        sample_plan_schedule=plan_schedule,
+        sample_plan_omega_max_ry=plan_omega_max,
     )
 
 
@@ -3021,6 +3089,12 @@ def _static_gauge_hall_transaction_from_artifact(
     hamiltonian_config_operator_fingerprint: str,
     wfn_fingerprint: str, band_start: int, band_stop: int, nk_tot: int,
     mesh: Mesh,
+    artifact_schema_version: int = 2,
+    sample_plan_label: str | None = None,
+    sample_plan_n_poles: int | None = None,
+    sample_plan_alpha: int | None = None,
+    sample_plan_schedule: str | None = None,
+    sample_plan_omega_max_ry: float | None = None,
 ) -> StaticGaugeHallTransaction:
     """Place a loader-validated Hall frequency table on the run mesh."""
     frequencies = device_put_process_local(
@@ -3040,6 +3114,12 @@ def _static_gauge_hall_transaction_from_artifact(
         nk_tot=int(nk_tot),
         producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
         _producer_token=_STATIC_GAUGE_HALL_TOKEN,
+        artifact_schema_version=int(artifact_schema_version),
+        sample_plan_label=sample_plan_label,
+        sample_plan_n_poles=sample_plan_n_poles,
+        sample_plan_alpha=sample_plan_alpha,
+        sample_plan_schedule=sample_plan_schedule,
+        sample_plan_omega_max_ry=sample_plan_omega_max_ry,
     )
 
 
