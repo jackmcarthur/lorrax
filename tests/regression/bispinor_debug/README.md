@@ -106,9 +106,9 @@ Lane FIXTURE attributed the old-reference movement commit by commit, closing
 to 2e-6 eV. Lane DELETE then generated a representation-stamped `dipole.h5`,
 ran matched packed head-off/head-full controls on one GPU, and copied the
 heads-on `sigma_diag` directly into the reference. The full gap is 4.33762 eV;
-heads off gives 3.41193 eV. The gate's first rerun is required to be
-byte-identical. Numerical provenance and the controlled per-column movement
-are in
+heads off gives 3.41193 eV. The gate's first rerun is required to have
+byte-identical data after the canonical volatile-header normalization.
+Numerical provenance and the controlled per-column movement are in
 `tests/known_failures/2026-09-02-bispinor-fixture-refrozen-on-the-packed-route.md`.
 
 ## Files

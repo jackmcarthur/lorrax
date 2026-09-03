@@ -70,8 +70,11 @@ The full-matrix gap moves from 3.41193 eV (DEBUG head-off) to 4.33762 eV
 
 ## Gate contract
 
-The first tip rerun must take the byte-identity fast path. Cross-machine
-fallback remains label-based through `tests.harness.parse_eqp_rows` and uses
-`atol = 1e-5 eV`; the current `Hdir=` direct-field spelling is parsed rather
-than relying on bytes to hide an unreadable file. Any later nonzero movement
-must again be attributed before another freeze.
+The first tip rerun must take the normalized byte-identity fast path: every
+data byte is compared after `tests.harness.normalize_dat` removes only the
+run timestamp and roundoff-valued star-spread diagnostic headers.
+Cross-machine fallback remains label-based through
+`tests.harness.parse_eqp_rows` and uses `atol = 1e-5 eV`; the current `Hdir=`
+direct-field spelling is parsed rather than relying on bytes to hide an
+unreadable file. Any later nonzero movement must again be attributed before
+another freeze.

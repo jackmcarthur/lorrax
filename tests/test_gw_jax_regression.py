@@ -41,8 +41,8 @@ reference.  What each pin uniquely covers:
   a silently deactivated cascade because IBZ ≡ full-BZ). Its session run
   doubles as the prepared state for every Tier-2 from-restart invariance gate.
 * ``bispinor`` — MoS2 3×3 nspinor=2 bispinor GN-PPM: dynamic Σ_c on the
-  screened charge W plus bare Breit Σ^B folded into sigX; 4 ζ channels,
-  7 V_q tiles, transverse γ̃ machinery no scalar gate touches.
+  screened charge W plus the packed bare-current blocks in sigX; 4 ζ
+  channels, 7 V_q tiles, transverse γ̃ machinery no scalar gate touches.
 
 atol notes: the 1e-6 gates are pure freezes of deterministic runs (the
 tolerance only absorbs GPU-nondeterministic last-ULP drift).  The Si
@@ -64,6 +64,7 @@ from harness import (          # noqa: E402
     REG,
     compare_to_bgw,
     copy_fixture,
+    normalize_dat,
     parse_eqp_rows,
     run_gw_jax,
     skip_unless_gpu,
@@ -137,9 +138,11 @@ def _assert_matches_reference(output_file, reference_file, labels, atol,
     # either — "it passed" would then be ambiguous between "bit-for-bit"
     # and "used 99% of the budget", which are completely different facts
     # about the same green cell.
-    if output_file.read_text() == reference_file.read_text():
-        _report_headroom(case_id, "BYTE-IDENTICAL to the reference "
-                                  f"(atol {atol:.0e} not exercised)")
+    if normalize_dat(output_file.read_text()) == normalize_dat(
+            reference_file.read_text()):
+        _report_headroom(
+            case_id, "BYTE-IDENTICAL data to the reference after excluding "
+            f"volatile headers (atol {atol:.0e} not exercised)")
         return
     ref_rows = parse_eqp_rows(reference_file, labels)
     out_rows = parse_eqp_rows(output_file, labels)
@@ -528,45 +531,11 @@ def test_bispinor_gnppm_matches_reference(bispinor_session):
         bispinor_session.run_dir / bispinor_session.output_name,
         REG / "bispinor_debug" / "sigma_diag_bispinor_ref.dat",
         ("sigX", "sigC", "sigXC"), _XMACHINE_ATOL_EV, "bispinor")
-    # Fixture properties (see its README): charge tiles full-BZ-direct,
-    # transverse tiles through the IBZ cascade.
-    #
-    # THE STRING MOVED, THE PROPERTY DID NOT.  This used to look for
-    # "charge-centroid orbit closure failed", which was the wording of the
-    # per-call-site fallback notice that `53908088` ("q-grid closure: one
-    # resolution point, and the fallback stops being silent") replaced with
-    # a single announcement composed by the service.  The property being
-    # asserted is unchanged and still true — the bispinor deck's 256-centroid
-    # CHARGE set is not orbit-closed (1 of 2 ops violating, worst residual
-    # 1.436e-01, carried in
-    # `test_symmetry_maps_qgrid_resolution.py::test_a_non_closed_set_...`),
-    # so its tiles fall back to the full BZ and say so, while the closed
-    # 209-centroid transverse set goes through the IBZ cascade silently.
-    #
-    # Asserted on the parts that carry meaning rather than on one long
-    # literal: that a fallback was announced, and that the set it fell back
-    # on was the CHARGE one.
-    #
-    # THE CALL SITE IS DELIBERATELY NOT ASSERTED, and that is a finding
-    # rather than a shortcut.  ``announce_once`` dedupes on the centroid SET
-    # (``res.announce_key``), so the ``where`` in the announcement names
-    # whichever site reached the charge set FIRST — the bispinor g-flat
-    # tile, the V_q/W reduction, or the W Dyson solve, depending on the
-    # deck's path through the run.  An assertion on ``bispinor g-flat,
-    # charge centroids`` was tried here and failed for exactly that reason
-    # while the fallback itself was announced correctly.  Pinning the
-    # winner of a dedup race is pinning an implementation detail.
-    #
-    # The WORST RESIDUAL is the honest discriminant instead: 1.436e-01
-    # belongs to the 256-centroid charge set and to nothing else in this
-    # deck (the 209-centroid transverse set is closed at 1.1e-16 and
-    # announces nothing at all), so finding it in the announcement proves
-    # both halves of the fixture property — charge fell back, transverse did
-    # not.  It is the same number
-    # `test_symmetry_maps_qgrid_resolution.py::test_a_non_closed_set_...`
-    # carries for `bispinor_debug-256`, so the two cells move together.
+    # The production report owns the charge-set verdict. Its exact measured
+    # residual identifies this fixture's 256-site set; the 209-site current
+    # set's closed verdict remains pinned independently by the symmetry-map
+    # resolver tests rather than by a vanished per-call announcement.
     out = bispinor_session.stdout
-    assert "q-grid symmetry: FALLBACK" in out
-    assert "not orbit-closed" in out
-    assert "1.436e-01" in out, "the charge set's residual should name it"
-    assert "V_qmunu_TT_11" in out
+    assert "Centroid orbit: NOT CLOSED" in out
+    assert "1/2 spatial operations fail" in out
+    assert "worst residual 1.43614e-01" in out
