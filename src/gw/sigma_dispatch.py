@@ -1298,7 +1298,6 @@ def compute_sigma_xc(
             quadrature_eps=float(config.sigma.quadrature_eps),
             quadrature_reduction_seconds=float(
                 config.sigma.quadrature_reduction_seconds),
-            pair_ceiling=int(config.mpa.sigma_max_nodes),
             quadrature_cache_dir=quadrature_cache_dir,
             omega_grid_step_ry=(
                 float(config.sigma.omega_step_ev) / RYD_TO_EV),
