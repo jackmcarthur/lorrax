@@ -9,6 +9,7 @@ from gw.ppm_tau_kernel import (
     get_shared_sigma_spatial_kernel,
     get_shared_w_tau_kernel,
 )
+from gw.mpa.sigma import _frozen_w_time_factor
 
 
 def _mesh():
@@ -75,6 +76,20 @@ def test_frozen_w_builder_is_the_owned_w_tau_algebra():
     cached_seam = get_shared_w_tau_kernel(mesh_xy=mesh)(*args)
     direct = build_shared_w_tau(*args)
     np.testing.assert_array_equal(np.asarray(cached_seam), np.asarray(direct))
+
+
+def test_frozen_w_cache_allows_reordered_subset_but_refuses_new_identity():
+    first, second, third = object(), object(), object()
+    bank = {
+        "signatures": [("a",), ("b",), ("c",)],
+        "factors": [first, second, third],
+        "complete": True,
+    }
+
+    assert _frozen_w_time_factor(bank, ("c",)) is third
+    assert _frozen_w_time_factor(bank, ("a",)) is first
+    with pytest.raises(RuntimeError, match="sc_w_time_cache_identity"):
+        _frozen_w_time_factor(bank, ("new",))
 
 
 def test_device_frequency_fold_and_one_sided_completion():

@@ -14,6 +14,7 @@ from gw.ppm_windows import _SigmaBranch
 from gw.sigma_box_plan import (
     _box_for_window,
     _sc_padded_box_spec,
+    fixed_rule_child_session,
     make_sigma_box_spec,
     plan_sigma_windows,
 )
@@ -41,6 +42,23 @@ def _branch_at(energies, tag="positive conduction"):
         space=branch.space, neg_omega_half=branch.neg_omega_half,
         omega_abs=branch.omega_abs, omega_idx=branch.omega_idx,
     )
+
+
+def test_nested_fixed_rule_sessions_inherit_two_level_padding_policy():
+    outer = {
+        "state_edge_padding_ev": 0.25,
+        "pole_extent_padding_fraction": 0.0,
+    }
+    ppm = fixed_rule_child_session(outer, "ppm")
+    primary = fixed_rule_child_session(ppm, "primary")
+    mpa = fixed_rule_child_session(outer, "mpa")
+
+    for session in (ppm, primary, mpa):
+        assert session["state_edge_padding_ev"] == 0.25
+        assert session["pole_extent_padding_fraction"] == 0.0
+    assert outer["ppm"] is ppm
+    assert ppm["primary"] is primary
+    assert outer["mpa"] is mpa
 
 
 def _summaries():

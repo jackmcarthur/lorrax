@@ -44,6 +44,28 @@ _RUNTIME_NOISE_SAFETY = 0.05
 _SC_STATE_PAD_EV = 2.0
 _SC_POLE_PAD_FRACTION = 0.10
 
+_FIXED_RULE_POLICY_KEYS = (
+    "state_edge_padding_ev",
+    "pole_extent_padding_fraction",
+)
+
+
+def fixed_rule_child_session(session, name):
+    """Return a nested rule session carrying the parent's SC policy.
+
+    The mode dispatch and the PPM pipeline each own a namespace below the
+    outer two-level session.  The namespace isolates their mutable rule
+    receipts, while these two scalar padding choices remain properties of the
+    whole outer transaction and therefore follow every nested route.
+    """
+    if session is None:
+        return None
+    child = session.setdefault(str(name), {})
+    for key in _FIXED_RULE_POLICY_KEYS:
+        if key in session:
+            child.setdefault(key, session[key])
+    return child
+
 
 def resolve_sigma_box_cache_dir(setting, input_dir):
     """Resolve the deck's uniform-rule cache spelling beside its input.
@@ -944,6 +966,7 @@ def plan_sigma_windows(
 
 
 __all__ = [
+    "fixed_rule_child_session",
     "fit_sigma_box_specs",
     "make_sigma_box_spec",
     "plan_sigma_windows",

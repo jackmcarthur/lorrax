@@ -50,6 +50,7 @@ from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
     fit_ppm,
 )
+from .sigma_box_plan import fixed_rule_child_session
 
 
 @dataclass(frozen=True)
@@ -726,9 +727,8 @@ def compute_ppm_sigma_pipeline(
                 quadrature_cache_dir=quadrature_cache_dir,
                 occupation_state=occupation_state,
                 plan=plan,
-                fixed_quadrature_session=(
-                    None if fixed_quadrature_session is None else
-                    fixed_quadrature_session.setdefault("primary", {})),
+                fixed_quadrature_session=fixed_rule_child_session(
+                    fixed_quadrature_session, "primary"),
                 w_time_factor_cache=ppm_w_cache,
                 print_fn=print_fn,
             )
@@ -755,10 +755,8 @@ def compute_ppm_sigma_pipeline(
                     quadrature_cache_dir=quadrature_cache_dir,
                     occupation_state=occupation_state,
                     plan=plan,
-                    fixed_quadrature_session=(
-                        None if fixed_quadrature_session is None else
-                        fixed_quadrature_session.setdefault(
-                            "odd_even_reference", {})),
+                    fixed_quadrature_session=fixed_rule_child_session(
+                        fixed_quadrature_session, "odd_even_reference"),
                     w_time_factor_cache=even_w_cache,
                     print_fn=lambda *args, **kwargs: None,
                 )

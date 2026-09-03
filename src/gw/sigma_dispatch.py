@@ -47,6 +47,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from .qsgw_utils import QSGWUpdatePolicy
+from .sigma_box_plan import fixed_rule_child_session
 from .gw_config import (
     BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
     band_extrapolation_is_consumable,
@@ -1345,9 +1346,8 @@ def compute_sigma_xc(
             # this run's screening_diagrams either did or did not produce,
             # and the two are indistinguishable in the bytes.
             expected_screening_diagrams=config.screening.diagrams,
-            fixed_quadrature_session=(
-                None if fixed_quadrature_session is None else
-                fixed_quadrature_session.setdefault("mpa", {})),
+            fixed_quadrature_session=fixed_rule_child_session(
+                fixed_quadrature_session, "mpa"),
             w_time_factor_cache=w_time_factor_cache,
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
@@ -1457,9 +1457,8 @@ def compute_sigma_xc(
         band_slices=band_slices, wfn=wfn, sym=sym,
         iteration_head=iteration_head,
         occupation_state=occupation_state,
-        fixed_quadrature_session=(
-            None if fixed_quadrature_session is None else
-            fixed_quadrature_session.setdefault("ppm", {})),
+        fixed_quadrature_session=fixed_rule_child_session(
+            fixed_quadrature_session, "ppm"),
         outer_refit_session=ppm_refit_session,
         frozen_screening_model=frozen_screening_model,
         w_time_factor_cache=w_time_factor_cache,

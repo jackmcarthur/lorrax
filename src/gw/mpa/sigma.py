@@ -129,6 +129,25 @@ def _batch_rows(row, batch):
     )
 
 
+def _w_time_factor_index(cache_bank):
+    """Return the order-independent index for one outer W-factor bank."""
+    return cache_bank.setdefault(
+        "factor_index",
+        {signature: index for index, signature in enumerate(
+            cache_bank["signatures"])})
+
+
+def _frozen_w_time_factor(cache_bank, signature):
+    """Fetch one exact outer W-side factor, allowing subset/reordered use."""
+    index = _w_time_factor_index(cache_bank).get(signature)
+    if index is None:
+        raise RuntimeError(
+            "GATE sc_w_time_cache_identity: a frozen-W inner map changed "
+            "a W-side tau node, pole selector, or reference; no replanning "
+            "is allowed inside the two-level loop")
+    return cache_bank["factors"][index]
+
+
 def _integrate_sigma_batches(
     wfns,
     batches,
@@ -256,20 +275,24 @@ def _integrate_sigma_batches(
         **face_kwargs)
     w_builder = spatial_kernel = None
     cache_bank = None
-    cache_cursor = 0
     cache_hits = cache_misses = 0
     if w_time_factor_cache is not None:
         # Separate banks are required for an ordered-residue fit: the
         # production B+/-D execution and its D=0 observability twin have
         # different W(tau), although each is immutable across frozen-W SC
         # maps.  The cache object itself is scoped to one outer screening
-        # transaction, so its slot order is a sufficient artifact identity;
-        # every slot also carries an exact scalar/selector signature and a
-        # later map refuses if that order or geometry drifts.
+        # transaction.  Every factor carries its exact W-side scalar/selector
+        # signature.  Frozen maps may consume a subset in a different order
+        # when a state product window becomes empty, but may not request a
+        # signature that the outer producer did not build.
         banks = w_time_factor_cache.setdefault("banks", {})
         bank_name = "odd_off" if odd_residue_off else "production"
         cache_bank = banks.setdefault(
-            bank_name, {"signatures": [], "factors": [], "complete": False})
+            bank_name, {
+                "signatures": [], "factors": [], "factor_index": {},
+                "complete": False,
+            })
+        factor_index = _w_time_factor_index(cache_bank)
         w_builder = get_shared_w_tau_kernel(mesh_xy=mesh_xy)
         spatial_kernel = get_shared_sigma_spatial_kernel(
             mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
@@ -376,29 +399,24 @@ def _integrate_sigma_batches(
                         np.asarray(phase_real).tobytes(),
                     )
                     if bool(cache_bank["complete"]):
-                        if cache_cursor >= len(cache_bank["signatures"]):
-                            raise RuntimeError(
-                                "GATE sc_w_time_cache_shape: frozen W(tau) "
-                                "execution requested more factors than its "
-                                "outer producer cached")
-                        if signature != cache_bank["signatures"][cache_cursor]:
-                            raise RuntimeError(
-                                "GATE sc_w_time_cache_identity: a frozen-W "
-                                "inner map changed a W-side tau node, pole "
-                                "selector, or reference; no replanning is "
-                                "allowed inside the two-level loop")
-                        W_t = cache_bank["factors"][cache_cursor]
+                        W_t = _frozen_w_time_factor(cache_bank, signature)
                         cache_hits += 1
                     else:
-                        W_t = w_builder(
-                            B_branch, Omega, pole_indices, bounds, phase_real,
-                            jnp.asarray(win.E_ref_B),
-                            jnp.asarray(t, dtype=jnp.complex128))
-                        W_t.block_until_ready()
-                        cache_bank["signatures"].append(signature)
-                        cache_bank["factors"].append(W_t)
-                        cache_misses += 1
-                    cache_cursor += 1
+                        index = factor_index.get(signature)
+                        if index is None:
+                            W_t = w_builder(
+                                B_branch, Omega, pole_indices, bounds,
+                                phase_real, jnp.asarray(win.E_ref_B),
+                                jnp.asarray(t, dtype=jnp.complex128))
+                            W_t.block_until_ready()
+                            index = len(cache_bank["factors"])
+                            cache_bank["signatures"].append(signature)
+                            cache_bank["factors"].append(W_t)
+                            factor_index[signature] = index
+                            cache_misses += 1
+                        else:
+                            W_t = cache_bank["factors"][index]
+                            cache_hits += 1
                     sigma_tau = spatial_kernel(
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
@@ -434,13 +452,7 @@ def _integrate_sigma_batches(
         f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
     if cache_bank is not None:
-        if bool(cache_bank["complete"]):
-            if cache_cursor != len(cache_bank["signatures"]):
-                raise RuntimeError(
-                    "GATE sc_w_time_cache_shape: frozen W(tau) execution "
-                    f"consumed {cache_cursor} of "
-                    f"{len(cache_bank['signatures'])} cached factors")
-        else:
+        if not bool(cache_bank["complete"]):
             cache_bank["complete"] = True
         global_bytes = sum(int(value.nbytes)
                            for value in cache_bank["factors"])
