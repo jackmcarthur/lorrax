@@ -162,8 +162,55 @@ def test_solve_w_refuses_equal_but_noncanonical_centroid_extents():
                            shape={"x": 6, "y": 6})
     with pytest.raises(ValueError, match=(
             r"canonical product-padded centroid carrier "
-            r"\(65, 2088, 2088\).*got equal .*\(65, 2070, 2070\)")):
+            r"\(\*,2088,2088\).*got equal .*\(65, 2070, 2070\)")):
         solve_w(operand, operand, meta, mesh, dyson_solver="distributed")
+
+
+def test_solve_w_geometry_accepts_irreducible_q_extent():
+    """The Dyson seam owns mu padding, not full-BZ versus wedge q mapping."""
+    from types import SimpleNamespace
+
+    from gw.w_isdf import _require_w_operand_geometry
+
+    operand = SimpleNamespace(shape=(65, 2088, 2088))
+    meta = SimpleNamespace(nk_tot=512, n_rmu=2070)
+    mesh = SimpleNamespace(axis_names=("x", "y"),
+                           shape={"x": 6, "y": 6})
+    assert _require_w_operand_geometry(operand, operand, meta, mesh) == 2070
+
+
+def test_solve_w_geometry_accepts_explicit_packed_carrier():
+    """A direct-sum photon carrier is not the scalar charge prefix."""
+    from types import SimpleNamespace
+
+    from gw.w_isdf import _require_w_operand_geometry
+
+    operand = SimpleNamespace(shape=(4, 32, 32))
+    meta = SimpleNamespace(nk_tot=4, n_rmu=6)
+    mesh = SimpleNamespace(axis_names=("x", "y"),
+                           shape={"x": 2, "y": 2})
+    assert _require_w_operand_geometry(
+        operand, operand, meta, mesh, n_rmu_logical=32) == 32
+
+
+def test_precompile_solve_w_refuses_the_same_noncanonical_carrier(
+        monkeypatch):
+    """AOT setup must not compile a geometry the runtime seam rejects."""
+    from types import SimpleNamespace
+
+    import gw.w_isdf as w_isdf
+    import pytest
+
+    monkeypatch.setattr(w_isdf, "ensure_jax_compile_cache", lambda: None)
+    operand = SimpleNamespace(shape=(65, 2070, 2070))
+    meta = SimpleNamespace(nk_tot=512, n_rmu=2070)
+    mesh = SimpleNamespace(axis_names=("x", "y"),
+                           shape={"x": 6, "y": 6})
+    with pytest.raises(ValueError, match=(
+            r"canonical product-padded centroid carrier "
+            r"\(\*,2088,2088\).*got equal .*\(65, 2070, 2070\)")):
+        w_isdf.precompile_solve_w(
+            operand, operand, meta, mesh, dyson_solver="distributed")
 
 
 def test_mpa_reader_and_distributed_dyson_a_build_on_true_6x6_mesh():
