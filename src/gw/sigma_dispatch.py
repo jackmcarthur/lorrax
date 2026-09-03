@@ -1334,6 +1334,8 @@ def compute_sigma_xc(
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
         return finalize_dynamic_sigma(
             body.sigma_c_kij, head_diag,
+            photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
+            photon_head_sigma_basis=photon_head_sigma_basis,
             sig_x=sig_x, sig_h=sig_h,
             v_h_scalar=v_h_scalar, h_transverse=h_transverse,
             hartree_omitted=bool(omit_v_h),

@@ -253,6 +253,19 @@ def test_the_dispatch_asks_for_the_current_blocks_only():
     assert "charge_block_state=photon_response.charge_block_state" in source
 
 
+def test_mpa_finalizer_keeps_the_packed_head_diagnostics():
+    """MPA and PPM publish the same current-sector Gamma receipt."""
+    import inspect
+
+    from gw import sigma_dispatch
+    source = inspect.getsource(sigma_dispatch.compute_sigma_xc)
+    mpa_branch = source.split(
+        "if mode is ComputeMode.MPA:", 1)[1].split(
+            "# ── THE EXHAUSTIVENESS SEAM", 1)[0]
+    assert "photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag" in mpa_branch
+    assert "photon_head_sigma_basis=photon_head_sigma_basis" in mpa_branch
+
+
 def test_absent_charge_state_has_no_packed_w_and_aliases_current_to_v():
     """The layout is named absence, never a zero CC tile posing as W."""
     import inspect
