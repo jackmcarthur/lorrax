@@ -1142,7 +1142,6 @@ def main(argv=None):
 				sym=sym, wfn=wfn, band_slices=band_slices,
 				input_dir=input_dir,
 				wfns_transverse=wfns_transverse,
-				bispinor_v_q_path=bispinor_v_q_path,
 				photon_response=photon_response,
 				occupation_state=oneshot_occupation_state,
 				material_class=material_class,

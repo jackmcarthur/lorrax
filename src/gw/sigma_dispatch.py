@@ -720,7 +720,6 @@ def compute_sigma_xc(
     input_dir: str,
     Gij: jax.Array | None = None,
     wfns_transverse=None,
-    bispinor_v_q_path: str | None = None,
     photon_response=None,
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
@@ -786,15 +785,13 @@ def compute_sigma_xc(
         term take the same ``diag(f)`` weights Σ_c does.  ``None`` is
         the insulating default and every static channel is then
         bit-for-bit the integer ``occ > 0.5`` projector.
-    wfns_transverse, bispinor_v_q_path
-        Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
-        tile file).  Both-or-neither; the static kernels fold Σ^B into
-        ``sig_x`` and, for COHSEX, the physical ``sig_sx`` component that
-        forms ``sigma_xc``.  ``None`` for scalar runs.
+    wfns_transverse
+        Transverse-centroid wavefunction bundle consumed by the packed
+        four-current Sigma owner.  ``None`` for scalar runs.
     photon_response
-        Packed static four-current response.  Used only by
-        ``bispinor_gw=full_static_cohsex``; the default bare-transverse path
-        neither inspects nor constructs it.
+        Packed four-current response.  Every accepted bispinor deck supplies
+        one; the selected family and compute mode decide whether it carries
+        all sixteen blocks or only the current-index blocks.
     print_fn
         Rank-0-only print.
 
@@ -991,7 +988,6 @@ def compute_sigma_xc(
     photon_head_sigma_basis = None
     sigma_lorentz = None
     faraday_ppm = None
-    sig_x_b = None
     if packed_photon_replaces_charge_sigma(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
