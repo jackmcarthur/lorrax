@@ -1247,6 +1247,7 @@ def _warn_on_unphysical_h0(
     if implied_vxc_ev.size == 0:
         return implied_vxc_ev
     lo, hi = float(implied_vxc_ev.min()), float(implied_vxc_ev.max())
+    h0_source = "kin_ion + V_H[exact, live G-space]"
     n_bad = int(
         np.count_nonzero(
             (implied_vxc_ev < _VXC_IMPLIED_MIN_EV)
@@ -1254,8 +1255,7 @@ def _warn_on_unphysical_h0(
         )
     )
     print_fn(
-        "  H0 check: implied Vxc = E_DFT - "
-        "(kin_ion + V_H[exact, live G-space]) in "
+        f"  H0 check: implied Vxc = E_DFT - ({h0_source}) in "
         f"[{lo:.3f}, {hi:.3f}] eV over {implied_vxc_ev.size} (k,n)"
     )
     if n_bad == 0:
@@ -1276,7 +1276,7 @@ def _warn_on_unphysical_h0(
     # dropped it from the CLI and never given it to the live driver.
     from common import sanity
     sanity.warn(
-        f"H0 = {_src} is UNPHYSICAL — "
+        f"H0 = {h0_source} is UNPHYSICAL — "
         f"{n_bad} of {implied_vxc_ev.size} (k,n) have an implied Vxc outside "
         f"[{_VXC_IMPLIED_MIN_EV:.0f}, {_VXC_IMPLIED_MAX_EV:.0f}] eV "
         f"(worst: k={int(k_bad)} n={int(n_band_bad)}, "
