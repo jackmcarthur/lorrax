@@ -2415,6 +2415,25 @@ def _fixed_index_hamiltonian(
     H_qp = QpHamiltonian(kin_qp).build(sigma_effective)
     H_dft_full = _rotate_fixed_matrix(
         H_qp, U_full, mesh=inputs.mesh_xy, to_qp=False)
+    # Exact DFT multiplets have no preferred eigenvector gauge.  Preserve
+    # the established <=0.1 meV gauge convention on the correction's
+    # diagonal so a different legal basis in an exactly degenerate space
+    # cannot look like fixed-point motion.  This is not damping of a
+    # resolved near-degenerate pair: the configuration validator caps the
+    # tolerance at 1e-4 eV, and the immutable DFT spectrum alone defines
+    # membership.  The fixed-index update law above remains the sole owner
+    # of every P/U and frequency decision.
+    if not bool(getattr(inputs.config, "no_degen_averaging", False)):
+        from .degen_average import average_matrix_diagonal
+        delta_h_dft = average_matrix_diagonal(
+            H_dft_full - jnp.asarray(inputs.kin_ion_full_dft),
+            energies_kn_ry=np.asarray(
+                inputs.e_dft_full_kn_ry, dtype=np.float64),
+            tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
+                    / RYD_TO_EV),
+            mesh_xy=inputs.mesh_xy,
+        )
+        H_dft_full = jnp.asarray(inputs.kin_ion_full_dft) + delta_h_dft
     ks = _kstar(inputs)
     H_dft = H_dft_full if ks.is_identity else ks.select(H_dft_full)
     inputs.print_fn(
