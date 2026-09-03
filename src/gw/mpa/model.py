@@ -827,6 +827,21 @@ def build_mpa_fit(
             "w_rpa or implement the reflected ladder source at the one "
             "wc_source seam.")
     sample_path, fit_path = iteration_artifact_paths(root, label)
+    sample_names = [_CHI, _WC]
+    if ordered:
+        sample_names.extend((_CHI_REFLECTED, _WC_NEGATIVE))
+    protected = mpa_store.refuse_completed_artifact_replacement(
+        sample_path,
+        fit_path,
+        sample_names=sample_names,
+        overwrite_completed=config.mpa.overwrite_completed_artifacts,
+    )
+    if protected:
+        print_fn(
+            "WARNING -- DESTRUCTIVE MPA ARTIFACT REPLACEMENT: "
+            "mpa_overwrite_completed_artifacts = true permits replacing "
+            + ", ".join(protected)
+            + ". This is regeneration, not partial-store resume.")
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
     # PROVENANCE (QUALITY_PATTERNS #10).  RPA poles and ladder poles have

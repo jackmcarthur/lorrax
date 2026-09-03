@@ -2158,6 +2158,10 @@ _DEFAULTS = {
     # Optional finalized MPA body/head fit consumed read-only by a one-shot
     # run.  Empty means build screening in this run.
     "mpa_fit_reuse_file": "",
+    # Destructive recovery escape hatch.  A normal MPA rerun refuses before
+    # replacing a fully-ready sample store or a finalized/certified pole fit.
+    # This key authorizes replacement; it does NOT enable partial-store resume.
+    "mpa_overwrite_completed_artifacts": False,
     # Retired parser tombstone.  It remains recognized so old decks receive
     # the precise refusal in LorraxConfig.from_input_file instead of an
     # unknown-key warning; the box rule has no sector apportionment.
@@ -4451,6 +4455,9 @@ class MPAConfig:
     #: ``sampling._METAL_ORIGIN_SHIFT`` default (2e-5 Ry = 1e-5 Ha).
     metal_origin_shift_ry: float | None
     pole_batch_size: int
+    #: Deliberately destructive opt-in for replacing an already complete MPA
+    #: sample store or finalized/certified pole fit.  False is write-once.
+    overwrite_completed_artifacts: bool = False
     #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
     #: counting toward a metallic Green's-function branch.  The Σ planner's
     #: cut is on the branch WEIGHT (``f`` on val, ``1 − f`` on cond), so the
@@ -5443,6 +5450,8 @@ class LorraxConfig:
                 float(_g("mpa_metal_origin_shift_ry"))
                 if _g("mpa_metal_origin_shift_ry") is not None else None),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
+            overwrite_completed_artifacts=bool(
+                _g("mpa_overwrite_completed_artifacts")),
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
             fit_reuse_file=(str(_g("mpa_fit_reuse_file")) or None),
