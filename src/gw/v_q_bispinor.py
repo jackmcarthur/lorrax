@@ -45,6 +45,7 @@ Public surface
 from __future__ import annotations
 
 from contextlib import ExitStack
+import json
 from pathlib import Path
 from typing import Iterable
 
@@ -78,6 +79,10 @@ HERMITIAN_PAIRS: dict[tuple[int, int], tuple[int, int]] = {
 }
 
 V_QMUNU_FORMAT = "bispinor_lorentz_v2"
+V_QMUNU_INVENTORY_SCHEMA = 1
+V_QMUNU_INVENTORY_DATASET = "v_qmunu_unique_tile_inventory"
+V_QMUNU_DATA_READY_DATASET = "v_qmunu_data_ready"
+V_QMUNU_TILE_DTYPE = np.dtype(np.complex128)
 
 
 def tile_dataset_name(mu_L: int, nu_L: int) -> str:
@@ -90,6 +95,128 @@ def tile_dataset_name(mu_L: int, nu_L: int) -> str:
     if (mu_L, nu_L) == (0, 0):
         return "V_qmunu_CC"
     return f"V_qmunu_TT_{mu_L}{nu_L}"
+
+
+def _expected_unique_tile_inventory(
+    *, n_q_total: int, n_rmu_C: int, n_rmu_T: int,
+) -> dict:
+    """Return the one canonical receipt for a complete bispinor-V file."""
+    tiles = []
+    for mu_L, nu_L in UNIQUE_TILES:
+        n_L = n_rmu_C if mu_L == 0 else n_rmu_T
+        n_R = n_rmu_C if nu_L == 0 else n_rmu_T
+        tiles.append({
+            "lorentz": [mu_L, nu_L],
+            "name": tile_dataset_name(mu_L, nu_L),
+            "logical_shape": [n_q_total, n_L, n_R],
+            "dtype": V_QMUNU_TILE_DTYPE.name,
+        })
+    return {"schema": V_QMUNU_INVENTORY_SCHEMA, "tiles": tiles}
+
+
+def _inventory_json(*, n_q_total: int, n_rmu_C: int,
+                    n_rmu_T: int) -> str:
+    return json.dumps(
+        _expected_unique_tile_inventory(
+            n_q_total=n_q_total, n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T),
+        sort_keys=True, separators=(",", ":"),
+    )
+
+
+def _validate_unique_tile_datasets(
+    h5_file, *, filename: Path, n_q_total: int,
+    n_rmu_C: int, n_rmu_T: int,
+) -> None:
+    """Validate every physical tile without opening a collective reader."""
+    expected = _expected_unique_tile_inventory(
+        n_q_total=n_q_total, n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
+    expected_names = {tile["name"] for tile in expected["tiles"]}
+    actual_names = {
+        name for name in h5_file.keys() if name.startswith("V_qmunu_")
+    }
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        unexpected = sorted(actual_names - expected_names)
+        raise ValueError(
+            f"{filename}: incomplete bispinor-V unique-tile set; "
+            f"missing={missing}, unexpected={unexpected}.")
+    for tile in expected["tiles"]:
+        dataset = h5_file[tile["name"]]
+        expected_shape = tuple(tile["logical_shape"])
+        if tuple(dataset.shape) != expected_shape:
+            raise ValueError(
+                f"{filename}: tile {tile['name']} has storage shape "
+                f"{tuple(dataset.shape)}, expected exact logical shape "
+                f"{expected_shape}.")
+        if np.dtype(dataset.dtype) != V_QMUNU_TILE_DTYPE:
+            raise ValueError(
+                f"{filename}: tile {tile['name']} has dtype "
+                f"{np.dtype(dataset.dtype).name}, expected "
+                f"{V_QMUNU_TILE_DTYPE.name}.")
+
+
+def _publish_unique_tile_inventory(
+    h5_file, *, filename: Path, n_q_total: int,
+    n_rmu_C: int, n_rmu_T: int,
+    bispinor_gw_mode: str | None = None,
+    charge_representation: str | None = None,
+    spatial_current_representation: str | None = None,
+) -> None:
+    """Certify a staged tile file, publishing readiness as the last write."""
+    h5_file.create_dataset(
+        V_QMUNU_DATA_READY_DATASET, data=np.bool_(False))
+    _validate_unique_tile_datasets(
+        h5_file, filename=filename, n_q_total=n_q_total,
+        n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
+    h5_file.create_dataset(
+        "v_qmunu_format", data=np.bytes_(V_QMUNU_FORMAT))
+    h5_file.create_dataset(
+        V_QMUNU_INVENTORY_DATASET,
+        data=np.bytes_(_inventory_json(
+            n_q_total=n_q_total, n_rmu_C=n_rmu_C,
+            n_rmu_T=n_rmu_T)))
+    h5_file.attrs["unique_tiles"] = json.dumps(
+        [list(t) for t in UNIQUE_TILES])
+    h5_file.attrs["zero_tiles"] = json.dumps(
+        [list(t) for t in sorted(ZERO_TILES)])
+    h5_file.attrs["hermitian_pairs"] = json.dumps(
+        [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
+    if bispinor_gw_mode is not None:
+        h5_file.attrs["bispinor_gw_mode"] = str(bispinor_gw_mode)
+    if charge_representation is not None:
+        h5_file.attrs["charge_representation"] = str(
+            charge_representation)
+    if spatial_current_representation is not None:
+        h5_file.attrs["spatial_current_representation"] = str(
+            spatial_current_representation)
+    h5_file.flush()
+    h5_file[V_QMUNU_DATA_READY_DATASET][()] = np.bool_(True)
+    h5_file.flush()
+
+
+def _tile_logical_shape(
+    mu_L: int, nu_L: int, *, n_q_total: int,
+    n_rmu_C: int, n_rmu_T: int,
+) -> tuple[int, int, int]:
+    n_L = n_rmu_C if mu_L == 0 else n_rmu_T
+    n_R = n_rmu_C if nu_L == 0 else n_rmu_T
+    return (n_q_total, n_L, n_R)
+
+
+def _require_tile_carrier(
+    array, *, name: str, logical_shape: tuple[int, int, int],
+) -> None:
+    carrier_shape = tuple(int(x) for x in array.shape)
+    if (carrier_shape[0] != logical_shape[0]
+            or any(got < need for got, need in
+                   zip(carrier_shape[1:], logical_shape[1:]))):
+        raise ValueError(
+            f"{name}: carrier shape {carrier_shape} cannot supply logical "
+            f"tile shape {logical_shape}.")
+    if np.dtype(array.dtype) != V_QMUNU_TILE_DTYPE:
+        raise ValueError(
+            f"{name}: carrier dtype {np.dtype(array.dtype).name}, expected "
+            f"{V_QMUNU_TILE_DTYPE.name}; refusing a silent precision cast.")
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +441,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
     """
     from file_io.slab_io import SlabIO
     import h5py
-    import json
     from .v_q_g_flat import _compute_V_q_g_flat_one_tile
 
     output_h5_path = Path(output_h5_path)
@@ -491,11 +617,15 @@ def compute_V_q_bispinor_g_flat_to_h5(
             #     6 TT tiles would inflate peak memory; we preserve the
             #     pre-IBZ "free between tiles" behaviour exactly.
             name = tile_dataset_name(mu_L, nu_L)
-            v_logical_shape = (int(V_acc.shape[0]), n_rmu_L, n_rmu_R)
+            v_logical_shape = _tile_logical_shape(
+                mu_L, nu_L, n_q_total=nq_total,
+                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
+            _require_tile_carrier(
+                V_acc, name=name, logical_shape=v_logical_shape)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
 ) as tile_io:
                 tile_io.create_dataset(
-                    name, shape=v_logical_shape, dtype=V_acc.dtype)
+                    name, shape=v_logical_shape, dtype=V_QMUNU_TILE_DTYPE)
                 tile_io.write_slab(name, V_acc)
             del V_acc, g0_acc
         else:
@@ -536,11 +666,15 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 continue
             V_mix = tt_mixed[(mu_L, nu_L)]
             name = tile_dataset_name(mu_L, nu_L)
-            v_logical_shape = (int(V_mix.shape[0]), n_rmu_T, n_rmu_T)
+            v_logical_shape = _tile_logical_shape(
+                mu_L, nu_L, n_q_total=nq_total,
+                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
+            _require_tile_carrier(
+                V_mix, name=name, logical_shape=v_logical_shape)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
 ) as tile_io:
                 tile_io.create_dataset(
-                    name, shape=v_logical_shape, dtype=V_mix.dtype)
+                    name, shape=v_logical_shape, dtype=V_QMUNU_TILE_DTYPE)
                 tile_io.write_slab(name, V_mix)
                 if mu_L == nu_L:
                     if tt_g0 is None:
@@ -551,26 +685,18 @@ def compute_V_q_bispinor_g_flat_to_h5(
         del tt_full_in, tt_mixed
     del tt_buffer, tt_g0
 
-    # Format string + tile-layout JSON — rank-0 post-close write so
-    # the BispinorVqReader can h5-open without rank coordination.
+    # Format, canonical inventory and readiness receipt — rank-0 post-close
+    # write so BispinorVqReader can reject a torn file without rank
+    # coordination.  data_ready=True is deliberately the final mutation.
     if jax.process_index() == 0:
         with h5py.File(output_h5_path, "a") as f:
-            f.create_dataset("v_qmunu_format",
-                             data=np.bytes_(V_QMUNU_FORMAT))
-            f.attrs["unique_tiles"] = json.dumps(
-                [list(t) for t in UNIQUE_TILES])
-            f.attrs["zero_tiles"] = json.dumps(
-                [list(t) for t in sorted(ZERO_TILES)])
-            f.attrs["hermitian_pairs"] = json.dumps(
-                [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
-            if bispinor_gw_mode is not None:
-                f.attrs["bispinor_gw_mode"] = str(bispinor_gw_mode)
-            if charge_representation is not None:
-                f.attrs["charge_representation"] = str(
-                    charge_representation)
-            if spatial_current_representation is not None:
-                f.attrs["spatial_current_representation"] = str(
-                    spatial_current_representation)
+            _publish_unique_tile_inventory(
+                f, filename=output_h5_path, n_q_total=nq_total,
+                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+                bispinor_gw_mode=bispinor_gw_mode,
+                charge_representation=charge_representation,
+                spatial_current_representation=(
+                    spatial_current_representation))
     barrier("v_q_bispinor_g_flat_tile_layout_meta")
     if any(vector is None for vector in g0_by_channel):
         missing = [i for i, vector in enumerate(g0_by_channel)
@@ -616,7 +742,15 @@ class BispinorVqReader:
         # close, so a constructor-time refusal must happen first.
         with h5py.File(self._filename, "r") as f:
             def _read_scalar(name):
+                if name not in f:
+                    raise ValueError(
+                        f"{self._filename}: required bispinor-V metadata "
+                        f"dataset '{name}' is absent.")
                 d = f[name]
+                if d.shape != () and name != "kgrid":
+                    raise ValueError(
+                        f"{self._filename}: metadata dataset '{name}' "
+                        f"must be scalar, got shape {d.shape}.")
                 v = d[()] if d.shape == () else d[:]
                 return v
             fmt = _read_scalar("v_qmunu_format")
@@ -632,6 +766,39 @@ class BispinorVqReader:
             self.n_rmu_C = int(_read_scalar("n_rmu_C"))
             self.n_rmu_T = int(_read_scalar("n_rmu_T"))
             self.n_q_total = int(_read_scalar("n_q_total"))
+            if self.n_q_total != int(np.prod(self.kgrid)):
+                raise ValueError(
+                    f"{self._filename}: n_q_total={self.n_q_total} does "
+                    f"not match kgrid product {int(np.prod(self.kgrid))}.")
+            ready_dataset = f.get(V_QMUNU_DATA_READY_DATASET)
+            if (ready_dataset is None or ready_dataset.shape != ()
+                    or np.dtype(ready_dataset.dtype) != np.dtype(np.bool_)
+                    or not bool(ready_dataset[()])):
+                raise ValueError(
+                    f"{self._filename}: bispinor-V data_ready receipt is "
+                    "absent, malformed, or false; the tile file is not "
+                    "certified complete.")
+            raw_inventory = _read_scalar(V_QMUNU_INVENTORY_DATASET)
+            if isinstance(raw_inventory, bytes):
+                raw_inventory = raw_inventory.decode("utf-8")
+            try:
+                inventory = json.loads(str(raw_inventory))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{self._filename}: malformed bispinor-V unique-tile "
+                    "inventory.") from exc
+            expected_inventory = _expected_unique_tile_inventory(
+                n_q_total=self.n_q_total, n_rmu_C=self.n_rmu_C,
+                n_rmu_T=self.n_rmu_T)
+            if inventory != expected_inventory:
+                raise ValueError(
+                    f"{self._filename}: published bispinor-V unique-tile "
+                    "inventory does not match the canonical inventory "
+                    "derived from the file's logical geometry.")
+            _validate_unique_tile_datasets(
+                f, filename=self._filename,
+                n_q_total=self.n_q_total, n_rmu_C=self.n_rmu_C,
+                n_rmu_T=self.n_rmu_T)
 
         self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
 )
@@ -704,7 +871,8 @@ class BispinorVqReader:
             V_companion = self._io.read_slab(
                 tile_dataset_name(*companion),
                 shape=(self.n_q_total, n_L_p, n_R_p),
-                mesh=self._mesh, partition_spec=P(None, 'y', 'x'))
+                mesh=self._mesh, partition_spec=P(None, 'y', 'x'),
+                dtype=jnp.complex128)
             # Hermitian: V[j,i](q,μ,ν) = V[i,j](q,ν,μ)*
             return jnp.conj(jnp.swapaxes(V_companion, -1, -2))
         # Direct read (member of UNIQUE_TILES)
@@ -713,7 +881,8 @@ class BispinorVqReader:
         return self._io.read_slab(
             tile_dataset_name(mu_L, nu_L),
             shape=(self.n_q_total, n_L_p, n_R_p),
-            mesh=self._mesh, partition_spec=spec)
+            mesh=self._mesh, partition_spec=spec,
+            dtype=jnp.complex128)
 
     @property
     def filename(self) -> Path:
