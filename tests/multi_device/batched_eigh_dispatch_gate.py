@@ -54,8 +54,6 @@ from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 
 from common.collectives import (process_count, process_rank,  # noqa: E402
                                 resolve_mesh)
-from ffi import _services                                     # noqa: E402
-_services.ensure_on_path()
 import distrib_la as linalg                                   # noqa: E402
 from distrib_la import dispatch_batched_eigh                  # noqa: E402
 

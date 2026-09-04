@@ -17,8 +17,6 @@ re-implement.
 # Bootstrap first, door second — the same order rule the audit arm proved
 # load-bearing at gw/v_q_g_flat.py and scripts/checks (D1/D2): nothing
 # guarantees another test module has put services/*/src on sys.path yet.
-from ffi import _services
-_services.ensure_on_path()
 import vcoul  # noqa: E402
 
 

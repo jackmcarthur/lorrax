@@ -1,16 +1,12 @@
 """Every service door is reachable in a BARE launch, not just under pytest.
 
-THE DEFECT THIS EXISTS TO CATCH is "green suite, red cluster".  Nothing in
-the launch chain puts ``services/*/src`` on ``sys.path``: ``lx`` rewrites
-the container ``PYTHONPATH`` to exactly ``<checkout>/src``
-(``~/bin/lx``, ``retarget_pythonpath``), the Shifter image pip-installs
-nothing, and ``tests/harness.run_gw_jax`` — the launcher every end-to-end
-regression gate goes through — sets ``PYTHONPATH`` to ``<repo>/src`` and
-nothing else.  Under pytest the path is there anyway, because each
-``services/*/tests/conftest.py`` inserts it at collection.  So a
-module-scope ``from distrib_la import ...`` — or ``from wfn_loader import
-...`` — with no bootstrap would pass the entire lorrax suite and
-``ImportError`` on the first real run.
+THE DEFECT THIS EXISTS TO CATCH is "green suite, red cluster".  A source
+launch initially selects only ``<checkout>/src``; the metadata-derived
+runtime closure must then select and authenticate every ``services/*/src``
+door before a first-party import.  Under pytest service conftests can make
+those doors reachable independently, so a module-scope ``from distrib_la
+import ...`` — or ``from wfn_loader import ...`` — with no application seal
+could pass the suite and ``ImportError`` on the first real run.
 
 PARAMETERIZED BY ``(consumer, service)`` since 2026-08-07.  It was
 distrib_la-only, and the wfn_loader extraction added a second service
@@ -62,9 +58,9 @@ _REPO = Path(__file__).resolve().parents[1]
 _SRC = str(_REPO / "src")
 
 #: ``(consumer module, service it must reach)`` — consumers that import a
-#: service door at MODULE scope.  The lazy sites (seven of them, all
-#: ``ensure_on_path()`` inside the function) cannot fail at import time and
-#: are covered by the end-to-end run instead.
+#: service door at MODULE scope.  Function-local door imports cannot fail at
+#: module import time and are covered by their owning runtime/compatibility
+#: path plus the end-to-end run instead.
 #:
 #: GENERALIZED 2026-08-07 from a bare tuple of distrib_la consumers.  It
 #: had to be: ``file_io.wfn_loader`` became a module-scope bootstrap
@@ -290,6 +286,115 @@ def _bootstrap_lineno(tree: ast.Module):
                 and ast.unparse(node.func).rsplit(".", 1)[-1] in _BOOTSTRAPS):
             return node.lineno
     return None
+
+
+def _conftest_seal_errors(text: str) -> list[str]:
+    """Validate the root conftest's one early stdlib-only closure seal."""
+    tree = ast.parse(text)
+    seals = []
+    risky_imports = []
+    risky_roots = {
+        "bandstructure", "bse", "centroid", "common", "distrib_la", "ffi",
+        "file_io", "gw", "harness", "jax", "minimax", "psp",
+        "symmetry_maps", "vcoul", "wfn_loader", "zeta_loader",
+    }
+    for node in _module_scope_statements(tree):
+        if isinstance(node, ast.Call) \
+                and ast.unparse(node.func).rsplit(".", 1)[-1] == "_seal_sources":
+            seals.append(node.lineno)
+        if isinstance(node, ast.Import):
+            modules = [item.name for item in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        else:
+            continue
+        for module in modules:
+            root = module.split(".", 1)[0]
+            if root in risky_roots or (
+                    root == "runtime" and module != "runtime.source_closure"):
+                risky_imports.append(node.lineno)
+    errors = []
+    if len(seals) != 1:
+        errors.append(f"expected one _seal_sources() call, found {seals}")
+    if seals and risky_imports and seals[0] >= min(risky_imports):
+        errors.append(
+            f"seal at {seals[0]} is not before risky import at "
+            f"{min(risky_imports)}")
+    return errors
+
+
+def test_root_conftest_seals_once_before_jax_or_first_party_imports():
+    text = (_REPO / "tests" / "conftest.py").read_text()
+    assert not _conftest_seal_errors(text)
+
+
+def test_root_conftest_seal_detector_rejects_missing_late_and_duplicate():
+    missing = "import jax\n"
+    late = (
+        "import jax\n"
+        "from runtime.source_closure import ensure_source_closure as "
+        "_seal_sources\n"
+        "_seal_sources()\n")
+    duplicate = (
+        "from runtime.source_closure import ensure_source_closure as "
+        "_seal_sources\n"
+        "_seal_sources()\n"
+        "_seal_sources()\n"
+        "import jax\n")
+    assert "expected one" in " ".join(_conftest_seal_errors(missing))
+    assert "not before" in " ".join(_conftest_seal_errors(late))
+    assert "expected one" in " ".join(_conftest_seal_errors(duplicate))
+
+
+def test_sternheimer_bootstraps_once_before_common_or_jax_imports():
+    """Its first common import may import JAX, so the seal must precede it."""
+    text = (_REPO / "src" / "psp" / "run_sternheimer.py").read_text()
+    tree = ast.parse(text)
+    bootstraps = []
+    risky_imports = []
+    for node in _module_scope_statements(tree):
+        if isinstance(node, ast.Call) \
+                and ast.unparse(node.func).rsplit(".", 1)[-1] == "bootstrap":
+            bootstraps.append(node.lineno)
+        if isinstance(node, ast.Import):
+            modules = [item.name for item in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        else:
+            continue
+        if any(module == "jax" or module.startswith(("jax.", "common."))
+               for module in modules):
+            risky_imports.append(node.lineno)
+    assert len(bootstraps) == 1, bootstraps
+    assert risky_imports and bootstraps[0] < min(risky_imports), (
+        bootstraps, risky_imports)
+
+
+@pytest.mark.parametrize(("relative", "door"), [
+    ("src/gw/sigma_box_plan.py", "minimax"),
+    ("src/gw/mpa/sample_plan.py", "minimax"),
+    ("src/gw/mpa/sigma_windows.py", "minimax"),
+    ("src/ffi/common/ffi_loader.py", "lxkit"),
+    ("src/ffi/cpp/stage/seal_bundle.py", "lxkit"),
+    ("services/wfn_loader/bench/bench_wfn_loader.py", "wfn_loader"),
+])
+def test_direct_source_consumers_seal_before_their_service(relative, door):
+    """Direct-library/script doors cannot rely on a core-driver startup."""
+    tree = ast.parse((_REPO / relative).read_text())
+    seal = _bootstrap_lineno(tree)
+    imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [item.name for item in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        else:
+            continue
+        if any(module == door or module.startswith(f"{door}.")
+               for module in modules):
+            imports.append(node.lineno)
+    assert seal is not None and imports and seal < min(imports), (
+        relative, seal, imports)
 
 
 def _scan_tree(src: str, door: str = "wfn_loader"):

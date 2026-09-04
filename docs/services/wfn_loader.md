@@ -41,15 +41,15 @@ gone: the phase-wide cleanup commit deleted it along with the other four
 wave-1 shims, and nothing aliases it back, so `from file_io.wfn_loader
 import WfnLoader` now raises `ModuleNotFoundError` rather than resolving
 anywhere. Two spellings are supported and there is no third. The first is
-`import wfn_loader` and then top-level names, which works in any process
-where `ffi._services.ensure_on_path()` has already put the service roots
-on `sys.path`; importing `file_io` performs that bootstrap on the way in,
-and so does every other module that reaches a service door (`grep -rn
-'ensure_on_path()' src/`), but a bare `import wfn_loader` in a process
-that has done neither still fails, and that is the one sharp edge worth
-remembering. The second is `from file_io import
-WfnLoader` — or `WFNReader`, the back-compat alias bound to the same
-class — which is the spelling most in-tree consumers already use.
+`import wfn_loader` and then top-level names, after the metadata-derived
+application seal has selected one coherent installed or source closure.
+Core drivers obtain the seal from runtime startup. A direct-library caller
+may use `ffi._services.ensure_on_path()`, which delegates to that same seal
+and owns no independent path scan. Merely putting `<checkout>/src` on
+`PYTHONPATH` does not select the service set. The second spelling is
+`from file_io import WfnLoader` — or `WFNReader`, the back-compat alias
+bound to the same class — which is the spelling most in-tree consumers
+already use.
 
 That second spelling is not a new shim wearing a different hat, and
 `src/file_io/__init__.py` says so in its own words: "THE RE-EXPORTS
@@ -191,13 +191,13 @@ services/wfn_loader/tests`; monorepo `pytest -m wfn_loader`; deselect via
 * The graduated parity harness (`tests/bench/…parity_test.py`) shares the
   same `check_*` bodies — one implementation, defaults hostile, atol 0.0.
 * Every check ships with the case where it returns FALSE.
-* **A door consumer that forgets the `sys.path` bootstrap is a
+* **A door consumer that forgets the application seal is a
   green-suite / red-cluster failure**, so the coverage is structural
   rather than sampled: `tests/test_service_path_bootstrap.py` walks the
   AST of `src/`, enumerates every module-scope importer of the door
-  (**12** at this head), and asserts each has `ensure_on_path()` on a line
+  and asserts each has a canonical runtime or compatibility seal on a line
   STRICTLY ABOVE the import. Non-empty, ordered, and complete — a
-  thirteenth consumer is a red cell until it is listed. Its red twin runs
+  new consumer is a red cell until it is listed. Its red twin runs
   the same detector over a tree built to be wrong (missing bootstrap, late
   bootstrap, a function-scope lazy import, a level-1 relative import).
   The four subprocess cells that launch a real bare interpreter remain a

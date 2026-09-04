@@ -25,11 +25,6 @@ jax.config.update("jax_enable_x64", True)
 from common.coulomb_sphere import compute_per_q_bare_coulomb_components
 from file_io.isdf_header import IsdfHeader, write_isdf_header
 from file_io.mf_header import copy_mf_header
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from zeta_loader import ZetaLoader  # noqa: E402
 ZetaReader = ZetaLoader  # merged 2026-07-09; slab API lives on ZetaLoader
 from gw.v_q_bispinor import (

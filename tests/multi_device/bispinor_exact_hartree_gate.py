@@ -27,9 +27,6 @@ from common.four_current_model import (                        # noqa: E402
     resolve_four_current_representation,
 )
 from common.collectives import resolve_mesh                    # noqa: E402
-from ffi import _services                                      # noqa: E402
-
-_services.ensure_on_path()
 import symmetry_maps                                           # noqa: E402
 from wfn_loader import WfnLoader                               # noqa: E402
 from gw.gw_config import read_lorrax_input                      # noqa: E402

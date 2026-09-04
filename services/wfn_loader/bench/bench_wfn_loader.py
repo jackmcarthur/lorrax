@@ -68,13 +68,13 @@ import numpy as np
 _BENCH = os.path.dirname(os.path.abspath(__file__))
 _SERVICES = os.path.dirname(os.path.dirname(_BENCH))
 _REPO = os.path.dirname(_SERVICES)
-for _p in (os.path.join(_REPO, "src"),):
-    if os.path.isdir(_p) and _p not in sys.path:
-        sys.path.insert(0, _p)
-for _svc in ("lxkit", "wfn_loader"):
-    _src = os.path.join(_SERVICES, _svc, "src")
-    if os.path.isdir(_src) and _src not in sys.path:
-        sys.path.insert(0, _src)
+_APPLICATION_SOURCE = os.path.join(_REPO, "src")
+if _APPLICATION_SOURCE not in sys.path:
+    sys.path.insert(0, _APPLICATION_SOURCE)
+
+from runtime.source_closure import ensure_source_closure  # noqa: E402
+
+ensure_source_closure()
 
 if __name__ == "__main__":
     os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -240,8 +240,6 @@ def _read_rows(WfnLoader, path, mesh, common, b_lo, b_hi, *, paths,
 def run(path, deck, mesh, *, windows, paths, backends, warmup, reps):
     import jax
     from jax.sharding import PartitionSpec as P
-    from ffi import _services
-    _services.ensure_on_path()
     from wfn_loader import WfnLoader
 
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])

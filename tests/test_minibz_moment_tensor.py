@@ -24,8 +24,6 @@ carry the ``census`` pytest marker as soon as it exists — it does not exist on
 import numpy as np
 import pytest
 
-from ffi import _services  # bootstrap BEFORE the door (audit rule D1/D2)
-_services.ensure_on_path()
 import vcoul as cb  # noqa: E402  — raw-array service names, no translation
 
 # tests/regression/si_cohsex_debug/WFN.h5 — FCC Si, blat*bvec, 1/bohr

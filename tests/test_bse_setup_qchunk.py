@@ -450,8 +450,6 @@ def test_eigh_backend_vocabulary_is_the_resolvers_own():
     low-memory eigh was unrequestable through an input file on a host mesh.
     """
     pytest.importorskip("jax")
-    from ffi import _services
-    _services.ensure_on_path()
     from distrib_la import BACKEND_CHOICES
     from gw.gw_config import eigh_backend_choices
     assert set(eigh_backend_choices()) == set(BACKEND_CHOICES["eigh"])
@@ -479,8 +477,6 @@ def test_the_vocabulary_came_from_the_resolver_and_not_the_fallback():
     whole point of the pair.
     """
     pytest.importorskip("jax")
-    from ffi import _services
-    _services.ensure_on_path()
     import distrib_la                                        # noqa: F401
     from gw import gw_config
     gw_config.eigh_backend_choices()
@@ -499,8 +495,6 @@ def test_the_vocabulary_source_check_can_fail(monkeypatch):
     """
     pytest.importorskip("jax")
     import sys
-    from ffi import _services
-    _services.ensure_on_path()
     from distrib_la import BACKEND_CHOICES
     from gw import gw_config
 
@@ -522,8 +516,6 @@ def test_a_door_that_renamed_the_op_raises_instead_of_falling_back(monkeypatch):
     fails with the fallback tuple in hand instead of the KeyError.
     """
     pytest.importorskip("jax")
-    from ffi import _services
-    _services.ensure_on_path()
     import distrib_la
     from gw import gw_config
 

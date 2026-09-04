@@ -9,11 +9,6 @@ import numpy as np
 import pytest
 
 from wfn_loader import WfnLoader
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from symmetry_maps import (                                     # noqa: E402
     check_density_symmetries,
     trs_check_mode,

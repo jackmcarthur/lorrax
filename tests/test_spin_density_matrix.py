@@ -15,10 +15,6 @@ sys.path.insert(0, os.path.join(
 
 import jax.numpy as jnp  # noqa: E402
 
-from ffi import _services  # noqa: E402
-
-_services.ensure_on_path()
-
 from psp.get_DFT_mtxels import (  # noqa: E402
     density_components_from_psi_r,
     spin_density_matrix_to_pauli_fields,

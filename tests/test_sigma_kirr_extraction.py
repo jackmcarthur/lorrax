@@ -376,8 +376,6 @@ def test_the_gauge_blind_arms_vanish_on_an_exact_star_relation():
     meaningful rather than an artefact of the metric.
     """
     pytest.importorskip("jax")
-    from ffi import _services
-    _services.ensure_on_path()
     import symmetry_maps
 
     rows, compact = compact_star_tables(_IRR)

@@ -90,9 +90,6 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,      # noqa: E402
                                 sweep_matrix_elements, vnl_operator)
 from common.wfn_layout import band_sphere_spec                   # noqa: E402
 from common.wfn_transforms import load_kpoint_fftbox_local     # noqa: E402
-from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
-                                 # with the owner's workspace fix)
-_services.ensure_on_path()
 # THE SERVICE, not ``from common import symmetry_maps``.  That shim was
 # deleted with the rest of the phase-wide forwarding shims and this line
 # went stale with it, which made the whole gate an ImportError at line

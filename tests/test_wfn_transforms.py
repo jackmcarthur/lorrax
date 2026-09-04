@@ -25,11 +25,6 @@ from common.wfn_transforms import (
     to_rchunk_inner, to_rmu_inner,
     gflat_to_rmu, load_centroids_band_chunked)
 from common.meta import Meta
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 
 # The synthetic-WFN builder moved WITH the loader (charter wave 1): it

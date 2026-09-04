@@ -55,17 +55,16 @@ attribute works, and :attr:`slab_io` / :meth:`load` /
 mesh is UNCHANGED in every respect (eager SlabIO open, same collective,
 same refusal when the FFI is absent).
 
-THE HOST-TREE IMPORTS ARE LAZY, AND THAT IS THE WAVE-1B SEAM.  This
+THE HOST-TREE IMPORTS ARE LAZY, AND THE APPLICATION CLOSURE OWNS THEM.  This
 module's only module-scope third-party imports are h5py, numpy and jax:
 ``import zeta_loader`` is clean on a machine with no LORRAX checkout at
 all.  The four things it does need from the host tree —
 ``file_io.mf_header``, ``file_io.isdf_header``, ``file_io.slab_io`` and
 ``common.gvec_fft_box`` — are imported at CALL time by the four helpers
 below, each of which refuses by naming the missing module and the
-surface that still works without it.  Those four are not a permanent
-dependency: ``slab_io`` and the header binders are scheduled for
-extraction as services of their own (wave 1b), at which point the lazy
-imports become declared package dependencies and these helpers go.
+surface that still works without it.  A full ``ZetaLoader`` therefore
+requires the metadata-verified LORRAX application closure; the standalone
+package continues to provide its format probe without that closure.
 """
 from __future__ import annotations
 
@@ -99,10 +98,12 @@ def _host_tree_refusal(module: str, names: str, needed_for: str) -> str:
         f"zeta_loader needs {names} from {module!r}, and that module is not "
         f"importable here.  {module!r} is a LORRAX HOST-TREE module, not a "
         f"dependency of this package: the data path ({needed_for}) reads its "
-        f"metadata and its bytes through the host tree until slab_io and the "
-        f"header binders are extracted as services of their own (wave 1b), "
-        f"and this import is that seam.  Put <lorrax>/src on sys.path — "
-        f"ffi._services.ensure_on_path() is what the monorepo does — or use "
+        f"metadata and bytes through the LORRAX application.  Select one "
+        f"coherent installed or source application and call "
+        f"runtime.source_closure.ensure_source_closure() before using this "
+        f"surface.  ffi._services.ensure_on_path() is the compatibility "
+        f"delegate for existing direct-library callers and applies the same "
+        f"closure check; do not append individual service roots.  Or use "
         f"the standalone surface (probe_zeta_file), which is "
         f"pure h5py+numpy and needs none of this.")
 

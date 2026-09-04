@@ -13,6 +13,13 @@ from pathlib import Path as _Path
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
+# Pytest imports test modules during collection, before any production driver
+# can initialize the runtime.  Seal the same metadata-derived package closure
+# once here, while only stdlib modules are loaded; individual test modules do
+# not own service-path setup.
+from runtime.source_closure import ensure_source_closure as _seal_sources
+_seal_sources(print_fn=lambda _line: None)
+
 # Some test modules import JAX during collection, before any driver can enter
 # ``runtime.set_default_env``.  Route that early-import corner through the
 # same owner as production.  CPU sessions deliberately receive no GPU flag;

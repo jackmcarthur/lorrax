@@ -39,9 +39,13 @@ import tempfile
 from pathlib import Path
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[4]
-_LXKIT_SOURCE = _SOURCE_ROOT / "services" / "lxkit" / "src"
-if str(_LXKIT_SOURCE) not in sys.path:
-    sys.path.insert(0, str(_LXKIT_SOURCE))
+_APPLICATION_SOURCE = _SOURCE_ROOT / "src"
+if str(_APPLICATION_SOURCE) not in sys.path:
+    sys.path.insert(0, str(_APPLICATION_SOURCE))
+
+from runtime.source_closure import ensure_source_closure  # noqa: E402
+
+ensure_source_closure()
 
 from lxkit import native_provider as _native  # noqa: E402
 

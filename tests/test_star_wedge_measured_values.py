@@ -34,10 +34,6 @@ import os
 import numpy as np
 import pytest
 
-from ffi import _services
-
-_services.ensure_on_path()
-
 from symmetry_maps import SymMaps                               # noqa: E402
 from symmetry_maps.maps import _star_row_order                  # noqa: E402
 

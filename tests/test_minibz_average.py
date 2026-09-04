@@ -12,8 +12,6 @@ bit-identity, exciton flag on/off) lives at
 reports/minibz_head_averaging_2026-07-20/validate_minibz.py (needs the 6x6 fixture).
 """
 import numpy as np
-from ffi import _services  # bootstrap BEFORE the door (audit rule D1/D2)
-_services.ensure_on_path()
 import vcoul as cb  # noqa: E402  — raw-array service names, no translation
 
 # synthetic cubic reciprocal cell: bvec rows = 2pi * e_i  =>  real cell vol = 1

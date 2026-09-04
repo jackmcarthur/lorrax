@@ -42,10 +42,6 @@ import pathlib
 import numpy as np
 import pytest
 
-from ffi import _services
-
-_services.ensure_on_path()
-
 from symmetry_maps import (                                    # noqa: E402
     build_qgrid_trs_policy,
     little_group_covariance_residual,

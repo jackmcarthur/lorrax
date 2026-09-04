@@ -880,8 +880,6 @@ def test_linalg_facts_answers_for_real_on_a_healthy_tree():
     constructs it.
     """
     pytest.importorskip("jax")
-    from ffi import _services
-    _services.ensure_on_path()
     import distrib_la                                        # noqa: F401
     import jax
     from jax.sharding import Mesh

@@ -33,8 +33,6 @@ def test_typed_cartesian_actions_match_cri3_fixture():
     if wfn_path is None:
         pytest.skip(f"No retained CrI3 WFN; tried {_WFN_CANDIDATES}.")
 
-    from ffi import _services
-    _services.ensure_on_path()
     from symmetry_maps import SymMaps
     from wfn_loader import WfnLoader
 

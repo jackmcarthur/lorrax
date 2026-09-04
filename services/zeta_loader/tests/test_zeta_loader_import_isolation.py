@@ -14,12 +14,11 @@ measures BOTH halves of it:
   the fit runs at all), so this is the half that has to work with nothing
   else present.
 * The DATA path is NOT standalone, and it REFUSES BY NAME rather than
-  dying in an ImportError traceback three frames deep.  That is the
-  wave-1b seam made observable: ``file_io.mf_header``,
+  dying in an ImportError traceback three frames deep. The application seam
+  is observable: ``file_io.mf_header``,
   ``file_io.isdf_header``, ``file_io.slab_io`` and ``common.gvec_fft_box``
-  are call-time imports with named refusals, and when slab_io and the
-  header binders extract as services they become package dependencies and
-  the helpers go.
+  are call-time imports with named refusals that route callers to the
+  canonical application closure rather than teaching a second path scan.
 
 ``zeta_loader`` DOES import jax (every data read takes a
 ``jax.sharding.Mesh`` and returns a sharded ``jax.Array``) and h5py (the ζ
@@ -226,8 +225,9 @@ def test_the_data_path_refuses_by_naming_the_missing_host_tree_module():
         "    assert 'file_io.mf_header' in m, m\n"
         "    assert 'bind_mf_attrs' in m, m\n"
         "    assert 'HOST-TREE module' in m, m\n"
-        "    assert 'wave 1b' in m, m\n"
-        "    assert 'ffi._services.ensure_on_path()' in m, m\n"
+        "    assert 'runtime.source_closure.ensure_source_closure()' in m, m\n"
+        "    assert 'compatibility delegate' in m, m\n"
+        "    assert 'do not append individual service roots' in m, m\n"
         "    assert 'probe_zeta_file' in m, m\n"
         "else:\n"
         "    raise AssertionError(\n"
@@ -246,8 +246,8 @@ def test_the_four_lazy_helpers_share_one_refusal_sentence():
     ``loader._host_tree_refusal`` exists so the four call-time importers
     cannot drift apart: each names its own module, its own symbols and its
     own "needed for", and everything else — the HOST-TREE explanation, the
-    wave-1b seam, the ``ensure_on_path()`` fix, the pointer at the surface
-    that still works — is one string.  Asserting that here means the
+    canonical closure, its compatibility delegate, and the pointer at the
+    surface that still works — is one string.  Asserting that here means the
     subprocess only has to prove the sentence FIRES, not that all four
     spellings of it are complete.
     """
@@ -263,8 +263,9 @@ def test_the_four_lazy_helpers_share_one_refusal_sentence():
         msg = _host_tree_refusal(mod, names, "some surface")
         assert mod in msg and names in msg
         assert "HOST-TREE module" in msg
-        assert "wave 1b" in msg
-        assert "ffi._services.ensure_on_path()" in msg
+        assert "runtime.source_closure.ensure_source_closure()" in msg
+        assert "compatibility delegate" in msg
+        assert "do not append individual service roots" in msg
         assert "probe_zeta_file" in msg
         assert "pure h5py+numpy" in msg
 

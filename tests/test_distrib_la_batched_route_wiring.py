@@ -45,8 +45,6 @@ def test_deck_route_defaults_normalizes_and_refuses_unknown(tmp_path):
 
 
 def test_deck_vocabulary_is_the_service_vocabulary():
-    from ffi import _services
-    _services.ensure_on_path()
     from distrib_la import BATCHED_ROUTE_CHOICES
     from distrib_la import BATCHED_ROUTE_DEFAULT
     from gw.gw_config import (DISTRIB_LA_BATCHED_ROUTE_DEFAULT,

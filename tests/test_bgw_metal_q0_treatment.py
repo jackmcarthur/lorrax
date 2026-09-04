@@ -19,9 +19,6 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi import _services
-
-_services.ensure_on_path()
 from vcoul import minibz_average  # noqa: E402
 
 from gw.gw_config import LorraxConfig  # noqa: E402

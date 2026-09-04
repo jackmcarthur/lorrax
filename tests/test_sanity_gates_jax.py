@@ -574,8 +574,6 @@ def test_rotated_density_load_reduces_to_the_plain_load_at_U_identity():
                     f"tree, so the QSGW density seam has no operands -- "
                     f"covered by the monorepo run, where the fixture is "
                     f"committed")
-    from ffi import _services
-    _services.ensure_on_path()
     from wfn_loader import WfnLoader
     from common import Meta
     import symmetry_maps
@@ -619,8 +617,6 @@ def test_process_local_load_matches_the_legacy_wrapper():
                     f"tree, so the QSGW density seam has no operands -- "
                     f"covered by the monorepo run, where the fixture is "
                     f"committed")
-    from ffi import _services
-    _services.ensure_on_path()
     from wfn_loader import WfnLoader
     from common import Meta
     import symmetry_maps

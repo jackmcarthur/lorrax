@@ -2329,8 +2329,6 @@ def _linalg_facts(mesh) -> dict:
     and the config echo reports the choice.
     """
     try:
-        from ffi import _services
-        _services.ensure_on_path()
         from distrib_la import list_backends as _list_backends
     except Exception as exc:                                  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}"}

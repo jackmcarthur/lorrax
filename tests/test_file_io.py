@@ -291,11 +291,6 @@ from jax.sharding import Mesh
 
 from file_io.mf_header import copy_mf_header
 from file_io.isdf_header import IsdfHeader, write_isdf_header
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from zeta_loader import ZetaLoader as ZetaReader  # noqa: E402
 
 # Reuse the synthetic-WFN helper from the header tests.

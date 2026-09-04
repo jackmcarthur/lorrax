@@ -59,8 +59,9 @@ from __future__ import annotations
 # backend this CLI now falls back to CPU instead of dying at the first
 # jax call.
 from runtime import bootstrap
-from common.fft_helpers import local_fftn3, local_ifftn3
 bootstrap()
+
+from common.fft_helpers import local_fftn3, local_ifftn3
 
 import argparse
 import functools
@@ -75,11 +76,6 @@ import numpy as np
 
 from common import Meta
 from common.wfn_transforms import load_kpoint_fftbox
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from wfn_loader import WfnLoader                                    # noqa: E402
 from psp.dft_operators import setup_H_k_from_kvec
 from psp.h_dft import make_apply_H
@@ -92,13 +88,6 @@ from solvers.sternheimer_precond import (
     tpa_preconditioner_diag,
 )
 from solvers.sternheimer_solve import SternheimerOp, sternheimer_solve
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
-
-
 # ═══════════════════════════════════════════════════════════════════════
 #  Jitted real-space kernels (single-GPU; no sharding)
 # ═══════════════════════════════════════════════════════════════════════

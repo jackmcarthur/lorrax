@@ -26,7 +26,8 @@ concurrently-moving wave-1 services to zero.
 ## API
 
 ```python
-from ffi import _services; _services.ensure_on_path()   # transitional
+from runtime.source_closure import ensure_source_closure
+ensure_source_closure()                                 # one coherent app
 import zeta_loader                                       # jax-free import
 
 zeta_loader.ZetaLoader(path, *, mesh=None, mode='r')     # first access imports jax
@@ -38,6 +39,11 @@ zeta_loader.ZetaLoader(path, *, mesh=None, mode='r')     # first access imports 
     # + the bound mf_header/isdf_header attribute surface (see Contract)
 zeta_loader.probe_zeta_file(path) -> ZetaFileProbe   # NEVER raises
 ```
+
+Core drivers get this seal from runtime startup. Direct-library callers that
+cannot adopt startup yet may use `ffi._services.ensure_on_path()`, a small
+compatibility delegate to the same metadata-derived seal; it does not scan or
+append service directories independently.
 
 `mesh=None` is HEADER-ONLY mode: every header attribute and the local
 plan work with no phdf5 FFI anywhere; the collective reads refuse naming
@@ -101,8 +107,8 @@ since 2026-08-27 `SlabIO` serves the one exception (an EMULATED mesh,
 one process. Declared package deps are lxkit, jax, numpy, h5py;
 `file_io.slab_io`, `file_io.mf_header`, `file_io.isdf_header` and
 `common.gvec_fft_box` are reached through call-time imports that refuse
-by name — the wave-1b seam (they become package deps when
-slab_io/file_formats extract).
+by name when the service is used outside a sealed LORRAX application. The
+standalone probe remains usable without the host application.
 
 ## Tests
 

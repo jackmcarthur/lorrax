@@ -71,8 +71,6 @@ def _bare_vc0() -> complex:
     ``is_2d=True``, ``kind='slab'``) -- independent of
     ``vcoul.Slab2D.q0_average``'s own screened-head branches (S_cart /
     epshead), which this module has no reason to exercise."""
-    from ffi import _services
-    _services.ensure_on_path()
     from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
                                sample_minibz_qpoints)
     from vcoul.geometry import CoulombGeometry
@@ -236,8 +234,6 @@ def test_tt_head_tensor_matches_measured_slab_reference_ratio():
 
 def _photon_cubature_chunk():
     """The finest chunk of the provider-issued slab photon cubature."""
-    from ffi import _services
-    _services.ensure_on_path()
     from vcoul import (CoulombGeometry, get_kernel,
                        slab_minibz_photon_cubature)
 

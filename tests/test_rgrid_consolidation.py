@@ -31,8 +31,6 @@ sys.path.insert(0, str(_SRC))
 
 def _sym():
     try:
-        from ffi import _services
-        _services.ensure_on_path()
         from symmetry_maps import orbit_syms
     except Exception as exc:                                    # noqa: BLE001
         pytest.skip(f"symmetry service unavailable ({type(exc).__name__})")

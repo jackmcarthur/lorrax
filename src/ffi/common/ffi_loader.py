@@ -77,6 +77,10 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 
+from ffi import _services
+
+_services.ensure_on_path()
+
 import jax
 import jax.ffi
 from lxkit import native_provider as _native

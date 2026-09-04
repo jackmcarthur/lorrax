@@ -86,6 +86,10 @@ exactly the reason the papers introduce it.  A tolerance here would
 silently reclassify it.
 """
 
+from ffi import _services
+
+_services.ensure_on_path()
+
 import numpy as np
 
 from minimax import CHARACTERS as _SERVICE_CHARACTERS

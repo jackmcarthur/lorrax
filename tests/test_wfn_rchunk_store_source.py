@@ -13,10 +13,6 @@ from jax.sharding import Mesh, PartitionSpec as P
 
 from common.psi_G_store import _mesh_device_coords, build_psi_G_store
 from common.wfn_transforms import iter_psi_rchunk_bandwise
-from ffi import _services
-
-
-_services.ensure_on_path()
 from wfn_loader import WfnLoader  # noqa: E402
 
 

@@ -50,9 +50,6 @@ from common.mtxel_sweep import (SweepGeometry, Operator,        # noqa: E402
                                 dipole_operator, kinetic_operator,
                                 sweep_matrix_elements, vnl_operator)
 from common.wfn_layout import band_sphere_spec                   # noqa: E402
-from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
-                                 # with the owner's workspace fix)
-_services.ensure_on_path()
 from wfn_loader import WfnLoader                               # noqa: E402
 from gw.gw_config import read_lorrax_input                     # noqa: E402
 from psp.dft_operators import padded_gvectors                  # noqa: E402

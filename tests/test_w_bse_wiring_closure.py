@@ -149,8 +149,6 @@ def _rebuild_run_state(run_dir, tensors_path):
     tensors), and a state handed over by the code under test would be the
     circular reference QUALITY_PATTERNS #1 warns about.
     """
-    from ffi import _services
-    _services.ensure_on_path()
     import symmetry_maps
     from wfn_loader import WfnLoader
 

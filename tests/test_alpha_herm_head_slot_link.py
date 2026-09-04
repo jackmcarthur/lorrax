@@ -64,8 +64,6 @@ if _SRC not in sys.path:
 # Bootstrap first, door second -- the same order rule the shim-identity
 # cells use: nothing guarantees another test module has put
 # services/*/src on sys.path yet.
-from ffi import _services                           # noqa: E402
-_services.ensure_on_path()
 import vcoul as V                                    # noqa: E402
 from solvers import lanczos                          # noqa: E402
 

@@ -56,8 +56,6 @@ import common.timing as timing                                 # noqa: E402
 from common import Meta                                        # noqa: E402
 from common.collectives import barrier                         # noqa: E402
 from file_io import load_centroids                              # noqa: E402
-from ffi import _services                                       # noqa: E402
-_services.ensure_on_path()
 from wfn_loader import WfnLoader                                # noqa: E402
 import symmetry_maps                                            # noqa: E402
 from gw.gw_config import LorraxConfig                            # noqa: E402

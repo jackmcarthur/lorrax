@@ -765,8 +765,6 @@ def _symmetry_tables(input_file: str):
     ``symmetry_maps.unfold_isdf_operator``.  Single source: no BSE-side copy of
     the wedge arithmetic — :func:`_symmetry_reduced_q_list` is a projection of
     this, not a second construction."""
-    from ffi import _services
-    _services.ensure_on_path()
     from wfn_loader import WfnLoader
     from .bse_io import _parse_wfn_path
     return WfnLoader(_parse_wfn_path(input_file)).symmetry()

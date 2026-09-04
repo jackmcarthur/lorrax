@@ -326,8 +326,6 @@ def _bundle(mesh, psi, enk, occ, slices):
 
 
 def run_gate(mesh, wfn_path, output_dir):
-    from ffi import _services
-    _services.ensure_on_path()
     from wfn_loader import WfnLoader
 
     # The producer authenticates the Hall term against the loaded WFN's

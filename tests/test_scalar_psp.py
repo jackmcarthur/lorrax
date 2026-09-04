@@ -413,8 +413,6 @@ _FR_SI_UPF = Path("/home/jackm/SOURCES/agent_tasks/qe-gw-pipeline/"
 
 
 def _wfn_loader(path):
-    from ffi import _services
-    _services.ensure_on_path()
     from wfn_loader import WfnLoader
 
     return WfnLoader(str(path))

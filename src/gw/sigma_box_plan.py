@@ -21,6 +21,10 @@ import os
 import pickle
 import time
 
+from ffi import _services
+
+_services.ensure_on_path()
+
 import jax.numpy as jnp
 import numpy as np
 

@@ -973,8 +973,6 @@ def _qirr_tables(seed=5):
 
 def _qirr_unfold(A_ibz, mesh, sym_perm, L_table):
     """The tree's own unfold, on this section's tables."""
-    from ffi import _services
-    _services.ensure_on_path()
     from symmetry_maps import unfold_isdf_operator
     return unfold_isdf_operator(
         A_ibz, irr_idx=jnp.asarray(QIRR_IRR_IDX),
