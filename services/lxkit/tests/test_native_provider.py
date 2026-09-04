@@ -184,7 +184,8 @@ def test_h5py_preload_is_best_effort_when_absent(monkeypatch):
 
     def absent(name, *args, **kwargs):
         if name == "h5py":
-            raise ModuleNotFoundError("hostile no-h5py environment")
+            raise ModuleNotFoundError(
+                "hostile no-h5py environment", name="h5py")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", absent)
@@ -206,12 +207,34 @@ def test_h5py_preload_runs_when_present(monkeypatch):
     assert imported == ["h5py"]
 
 
+@pytest.mark.parametrize("failure", [
+    ImportError("undefined symbol: H5Pset_fapl_mpio"),
+    ModuleNotFoundError("missing h5py dependency", name="h5py._errors"),
+])
+def test_h5py_preload_refuses_an_installed_but_broken_provider(
+        monkeypatch, failure):
+    class ConsumerUnusable(OSError):
+        pass
+
+    real_import = builtins.__import__
+
+    def broken(name, *args, **kwargs):
+        if name == "h5py":
+            raise failure
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken)
+    with pytest.raises(ConsumerUnusable, match="installed h5py is unusable"):
+        native._prefer_process_hdf5(unusable_cls=ConsumerUnusable)
+
+
 def test_h5py_preload_precedes_first_dlopen(tmp_path, monkeypatch):
     selected = tmp_path / "legacy.so"
     selected.write_bytes(b"not an ELF; the fake dlopen owns this test")
     events = []
 
-    def preload():
+    def preload(*, unusable_cls):
+        assert unusable_cls is LibraryUnusable
         events.append("h5py")
         return False
 

@@ -557,7 +557,9 @@ def _announce_loaded(path: Path, origin: Path,
             file=sys.stderr, flush=True)
 
 
-def _prefer_process_hdf5() -> bool:
+def _prefer_process_hdf5(
+    *, unusable_cls: Type[OSError] = LibraryUnusable,
+) -> bool:
     """Give an installed h5py's HDF5 symbols global precedence, if present.
 
     Both native legs are opened ``RTLD_GLOBAL`` and may link site parallel
@@ -568,8 +570,24 @@ def _prefer_process_hdf5() -> bool:
     """
     try:
         import h5py  # noqa: F401
-    except Exception:  # h5py is optional for standalone native consumers
-        return False
+    except ModuleNotFoundError as exc:
+        # Standalone native consumers may genuinely omit h5py.  A missing
+        # dependency *inside* an installed h5py is different: continuing to
+        # RTLD_GLOBAL here would hide the broken Python/HDF5 environment and
+        # can make the later failure depend on whichever HDF5 SONAME wins.
+        if exc.name == "h5py":
+            return False
+        raise unusable_cls(
+            "installed h5py is unusable before the native RTLD_GLOBAL load: "
+            f"its dependency {exc.name!r} is missing.  Refusing at the shared "
+            "HDF5 load-order boundary rather than allowing an incompatible "
+            "site/parallel HDF5 provider to mask the import failure.") from exc
+    except Exception as exc:
+        raise unusable_cls(
+            "installed h5py is unusable before the native RTLD_GLOBAL load: "
+            f"{type(exc).__name__}: {exc}.  This commonly indicates a Python/"
+            "HDF5 ABI or symbol-closure conflict; repair that environment "
+            "before loading a LORRAX native provider.") from exc
     return True
 
 
@@ -585,7 +603,7 @@ def open_and_attest(
     mismatch_cls: Type[OSError] = NativeAbiMismatch,
 ) -> tuple[ctypes.CDLL, Path]:
     """Dlopen one preflighted file and attest its live origin and ABI."""
-    _prefer_process_hdf5()
+    _prefer_process_hdf5(unusable_cls=unusable_cls)
     selected = path.resolve()
     manifest = _discover_manifest(selected)
     att = (_read_bundle(manifest, expected_abi=expected_abi,
