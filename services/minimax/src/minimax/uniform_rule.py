@@ -1082,10 +1082,10 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     always available after about a second, so the budget trades planning
     wall for node count and nothing else.  Never refuses a finite box.
     ``backend`` (``numpy`` | ``jax`` | ``auto``, default the environment's
-    ``LORRAX_UNIFORM_RULE_BACKEND`` or ``auto``) chooses where the reduction's
-    inner solves run; see ``_JaxCloudFit``.  Both backends run the same
-    algorithm with the same acceptance; the jax one differs in floating-point
-    detail only.
+    ``LORRAX_UNIFORM_RULE_BACKEND`` or ``numpy`` when unset) chooses where
+    the reduction's inner solves run; see ``_JaxCloudFit``.  Both backends
+    run the same algorithm with the same acceptance; the jax one differs in
+    floating-point detail only.
 
     Tempting, and why not: judge acceptance on the fit cloud ``d`` itself
     (17 of 80 random boxes passed there and failed on a finer cloud), or skip
