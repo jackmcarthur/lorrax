@@ -46,6 +46,8 @@ interpretable. A production self-consistent run must satisfy:
   (`zeta_nband = number_bands`), not a 16–20-band window; if the strict rank
   ceiling refuses, the owner decides `zeta_rcond`, the run does not drop to a
   smaller basis;
+- `use_band_extrapolation = true` (the default), named explicitly;
+- on metals the MPA route only (GN-PPM refuses fractional occupations by design, owner ruling 2026-09-03); the two-level (frozen-W inner) loop is discontinued and stays a diagnostic branch;
 - band-structure interpolation (htransform) fitting the whole WFN band set and
   returning at least **16 corrected conduction bands**, guard bands ≥ 8, with a
   QE `bands` calculation along the same path as the accuracy certificate; four
@@ -74,7 +76,7 @@ sigma_omega_max_ev = 15.0    # deck; default +5
 sigma_omega_step_ev = 0.25   # default
 sigma_regularization_ev = 0.25   # default; literal η — see pitfall 4
 sigma_quadrature_eps = 1e-4      # default — see pitfall 5
-use_band_extrapolation = false   # deck; default TRUE — see pitfall 6
+use_band_extrapolation = false   # diagnostic study; production = true — see pitfall 6
 restart = true                   # deck — see pitfall 7
 zeta_rcond = 1e-10               # deck; production default 1e-8
 ```
@@ -137,10 +139,12 @@ tightening ε does not make Σ more accurate once round-off dominates. The
 builder/consumer κ-cap mismatch that produced spurious refusals at ε = 1e-5
 on sign-definite rules is fixed in `sigma_box_plan.py` (2026-09-03).
 
-**6. `use_band_extrapolation` defaults to TRUE; every self-consistency
-result above was measured with it FALSE.** The extrapolated Σ_c is what the
-loop sees when it is on. Name the key explicitly in an SC deck. Until an SC
-run with extrapolation on is on record, treat it as untested in the loop.
+**6. `use_band_extrapolation` is TRUE by default and is the production setting**
+(owner, 2026-09-03: "use band extrapolation in future runs"). Every
+self-consistency result in the 2026-09-03 diagnostic study was measured with
+it FALSE; the production reruns carry it TRUE with one FALSE control. Name the
+key explicitly in an SC deck either way, and if an extrapolation-on loop fails
+where its control converges, report it rather than tune around it.
 
 **7. `restart = true` reuses the ISDF/W tensors of a finished run and is the
 right way to start a loop from a converged one-shot; it is not safe against a
