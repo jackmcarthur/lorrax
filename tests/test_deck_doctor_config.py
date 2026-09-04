@@ -1,6 +1,8 @@
 """CPU-safe typed configuration seams used by ``lx doctor --deck``."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -39,3 +41,10 @@ def test_material_class_uses_the_driver_tolerance(occupations, expected):
 def test_material_class_refuses_missing_or_nonfinite_occupations(occupations):
     with pytest.raises(ValueError, match="finite and nonempty"):
         infer_material_class(occupations)
+
+
+def test_gw_driver_uses_shared_material_classifier():
+    driver = Path(__file__).resolve().parents[1] / "src/gw/gw_jax.py"
+    source = driver.read_text()
+    assert "material_class = infer_material_class(wfn.occs)" in source
+    assert "_infer_material_class" not in source
