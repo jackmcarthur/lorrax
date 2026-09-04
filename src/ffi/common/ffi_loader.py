@@ -924,23 +924,6 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
         if lib is not None:                    # re-entrancy, not reachable today
             return lib
     path = _locate_so(platform)
-    # Load h5py's HDF5 FIRST.  Both FFI libraries link the site's Intel
-    # parallel HDF5 (``libhdf5.so.310`` = 1.14.6 on Frontera) and we dlopen
-    # them RTLD_GLOBAL, which publishes every ``H5*`` symbol into the global
-    # namespace.  h5py ships its OWN, ABI-incompatible HDF5
-    # (``h5py.libs/libhdf5-*.so.320`` = 2.0.0); if the FFI lands first, the
-    # later ``import h5py`` binds its extension modules to the Intel symbols
-    # and dies at import with the useless
-    # ``ValueError: Not a datatype (not a datatype)``  (measured, wk_AG job
-    # 7876369).  Production happens to import h5py long before any FFI probe,
-    # so this never fired in a driver — but every diagnostic script that
-    # probes the FFI first hits it, and nothing said why.  Importing h5py
-    # here makes the safe order unconditional; it is already a hard
-    # dependency, so this costs nothing after the first call.
-    try:
-        import h5py  # noqa: F401
-    except Exception:
-        pass
     lib, actual_origin = _native.open_and_attest(
         path, platform=platform, expected_abi=LORRAX_FFI_ABI_VERSION,
         abi_symbols=_ABI_SYMBOLS,

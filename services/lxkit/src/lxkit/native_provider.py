@@ -489,6 +489,17 @@ def _attest_private_mapping(att: BundleAttestation,
                 f"private provider origin mismatch for {expected.name}: sealed "
                 f"bundle requires {expected}, live mappings are "
                 f"{sorted(str(p) for p in actual) or '<none>'}")
+    expected_private = set(att.private_libraries)
+    unlisted = sorted(
+        str(path) for path in mapped
+        if is_private_redistributable(path) and path not in expected_private)
+    if unlisted:
+        raise unusable_cls(
+            "sealed native bundle has an engine-private provider mapped "
+            "outside its manifest: " + ", ".join(unlisted) + ".  A stale "
+            "SLATE/BLAS++/cuSolverMp/cuBLASMp/CAL/NVSHMEM provider can win by "
+            "SONAME even when the requested FFI file itself is exact; restart "
+            "with only the bundle's declared private closure.")
     for path in mapped:
         try:
             path.relative_to(att.bundle_root)
@@ -546,6 +557,22 @@ def _announce_loaded(path: Path, origin: Path,
             file=sys.stderr, flush=True)
 
 
+def _prefer_process_hdf5() -> bool:
+    """Give an installed h5py's HDF5 symbols global precedence, if present.
+
+    Both native legs are opened ``RTLD_GLOBAL`` and may link site parallel
+    HDF5.  Importing h5py afterward can bind its extension against those
+    ABI-incompatible symbols.  This lazy best-effort import is deliberately
+    owned at the one common pre-dlopen boundary; lxkit still imports with no
+    h5py (or JAX) dependency.
+    """
+    try:
+        import h5py  # noqa: F401
+    except Exception:  # h5py is optional for standalone native consumers
+        return False
+    return True
+
+
 def open_and_attest(
     path: Path,
     *,
@@ -558,6 +585,7 @@ def open_and_attest(
     mismatch_cls: Type[OSError] = NativeAbiMismatch,
 ) -> tuple[ctypes.CDLL, Path]:
     """Dlopen one preflighted file and attest its live origin and ABI."""
+    _prefer_process_hdf5()
     selected = path.resolve()
     manifest = _discover_manifest(selected)
     att = (_read_bundle(manifest, expected_abi=expected_abi,

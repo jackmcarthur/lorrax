@@ -613,18 +613,6 @@ def get_lib(platform: str) -> ctypes.CDLL:
         if lib is not None:                    # re-entrancy, not reachable today
             return lib
     path = _locate_so(platform)
-    # Load h5py's HDF5 FIRST.  Both LORRAX libraries link the site's
-    # parallel HDF5 and are dlopened RTLD_GLOBAL, which publishes every
-    # ``H5*`` symbol globally; h5py ships its OWN, ABI-incompatible HDF5,
-    # and a later ``import h5py`` binds to the site symbols and dies with
-    # ``ValueError: Not a datatype`` (measured, wk_AG job 7876369).
-    # Production imports h5py long before any FFI probe, so this never
-    # fired in a driver -- but every diagnostic that probes the FFI first
-    # hits it, and nothing said why.
-    try:
-        import h5py                                            # noqa: F401
-    except Exception:                                          # noqa: BLE001
-        pass
     lib, actual_origin = _native.open_and_attest(
         path, platform=platform, expected_abi=LORRAX_FFI_ABI_VERSION,
         abi_symbols=_ABI_SYMBOLS,

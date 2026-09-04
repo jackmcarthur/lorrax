@@ -102,6 +102,36 @@ Vendor subdirectory names are kept deliberately: every filename stays unique
 reference maps mechanically `src/ffi/<v>/cpp/X` → `src/ffi/cpp/<v>/X`. Docs
 and commit messages written before 2026-07-31 use the old spelling.
 
+### 2a. The deployable unit is one sealed pair
+
+The two independently built legs become one production provider only through
+`src/ffi/cpp/stage/seal_bundle.py`.  It publishes a new, non-overwriting
+directory containing both canonical shared objects and one
+`lorrax_ffi_bundle.json`.  That manifest binds the pair, the handler ABI, exact
+file sizes and SHA-256 values, each ELF SONAME/`DT_NEEDED` record, and the
+dependency-first private redistributable closure.  Both libraries put literal
+`$ORIGIN` first in their existing RPATHs; the common loader also preloads every
+manifested private provider by exact path, so an ordinary run script owns no
+library search path.
+
+The private closure is deliberately narrow: cuSolverMp/cuBLASMp/CAL,
+SLATE/BLAS++/LAPACK++, and NVSHMEM may be sealed.  MPI, site HDF5, the system
+and compiler runtimes, CUDA runtime/driver libraries, and NCCL remain owned by
+the selected machine runtime and are never copied or manifest-owned.  At load,
+`lxkit.native_provider` rehashes both legs and the private closure, checks the
+live ABI-symbol origin with `dladdr`, and refuses any mapped engine-private
+provider not named by the manifest.  The core loader and standalone
+`distrib_la` loader call this same policy; neither carries a private copy.
+
+`source.revision` records which clean source build produced the sealed pair.
+It is provenance, not a demand that the active Python checkout have the same
+Git SHA: a stable FFI ABI intentionally permits a certified installed wheel or
+backported provider to serve another source commit.  Compatibility is the
+exported `LORRAX_FFI_ABI_VERSION`, live feature/target probes, and the build
+acceptance contract.  A changed ABI is always refused.  An unsealed build-tree
+artifact remains a developer migration path and prints `LEGACY-UNSEALED` with
+its actual hash; it is not production attestation.
+
 ---
 
 ## 3. What each machine provides

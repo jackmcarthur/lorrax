@@ -69,6 +69,42 @@ GPU run both are dlopened `RTLD_GLOBAL`, so they share SONAMEs (`libslate.so.2`,
 bare-metal has to be the HDF5 the container mounts. A host library can be
 perfectly correct on its own and unloadable beside its partner.
 
+## Seal the deployable pair
+
+The accepted outputs are still two build artifacts; production deployment is
+one immutable pair.  After both build receipts say `git_dirty=no` at the same
+full revision, seal them together:
+
+```bash
+python src/ffi/cpp/stage/seal_bundle.py \
+  --cuda path/to/liblorrax_ffi.so \
+  --host path/to/liblorrax_ffi_host.so \
+  --private-lib path/to/libblaspp.so.2 \
+  --private-lib path/to/libslate.so.2 \
+  --output path/to/new-content-named-bundle
+```
+
+Repeat `--private-lib` in dependency-first order for every private engine
+provider named by either leg's `DT_NEEDED` closure.  The sealer requires each
+ELF's adjacent `PROVENANCE`, validates source and artifact hashes, verifies the
+canonical leg SONAMEs, refuses an incomplete recognized private closure, and
+atomically publishes both legs plus `lorrax_ffi_bundle.json`.  The output must
+not already exist.  Never list MPI, site HDF5, CUDA runtime/driver libraries,
+NCCL, or system/compiler libraries; those belong to the machine runtime.
+
+No manifest environment variable is needed.  Both loaders discover the one
+adjacent bundle manifest, require both legs to agree with it, rehash every
+listed file, preload the exact private closure, and attest the live origin/ABI
+before registering a target.  Literal `$ORIGIN` is already first in both
+legs' RPATHs.  Unsealed build directories remain loadable only as an announced
+`LEGACY-UNSEALED` developer migration path.
+
+The manifest's source revision is reproducibility provenance, not the FFI
+compatibility key.  Requiring Git-SHA equality would wrongly reject installed
+wheels and certified backports whose stable handler ABI is identical.  Bump
+and enforce `LORRAX_FFI_ABI_VERSION` for boundary changes; use source revision
+to reconstruct the build.
+
 ## The verify contract
 
 Every build path in this repository ends at `scripts/verify_ffi_build.sh`. The

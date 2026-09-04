@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import builtins
 import hashlib
 import json
 import shutil
@@ -165,6 +166,66 @@ def test_runtime_owned_library_cannot_enter_private_closure(tmp_path):
     _write_manifest(root, private=(mpi,))
     with pytest.raises(LibraryUnusable, match="runtime-owned"):
         _locate(root)
+
+
+def test_unlisted_engine_private_mapping_refuses(tmp_path, monkeypatch):
+    root = _bundle(tmp_path)
+    att = native._read_bundle(
+        root / native.BUNDLE_MANIFEST, expected_abi=ABI,
+        unusable_cls=LibraryUnusable)
+    foreign = (tmp_path / "foreign" / "libslate.so.2").resolve()
+    monkeypatch.setattr(native, "_mapped_paths", lambda: {foreign})
+    with pytest.raises(LibraryUnusable, match="outside its manifest"):
+        native._attest_private_mapping(att, LibraryUnusable)
+
+
+def test_h5py_preload_is_best_effort_when_absent(monkeypatch):
+    real_import = builtins.__import__
+
+    def absent(name, *args, **kwargs):
+        if name == "h5py":
+            raise ModuleNotFoundError("hostile no-h5py environment")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", absent)
+    assert native._prefer_process_hdf5() is False
+
+
+def test_h5py_preload_runs_when_present(monkeypatch):
+    real_import = builtins.__import__
+    imported = []
+
+    def present(name, *args, **kwargs):
+        if name == "h5py":
+            imported.append(name)
+            return object()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", present)
+    assert native._prefer_process_hdf5() is True
+    assert imported == ["h5py"]
+
+
+def test_h5py_preload_precedes_first_dlopen(tmp_path, monkeypatch):
+    selected = tmp_path / "legacy.so"
+    selected.write_bytes(b"not an ELF; the fake dlopen owns this test")
+    events = []
+
+    def preload():
+        events.append("h5py")
+        return False
+
+    def refuse_dlopen(*args, **kwargs):
+        events.append("dlopen")
+        raise OSError("constructed stop")
+
+    monkeypatch.setattr(native, "_prefer_process_hdf5", preload)
+    monkeypatch.setattr(native.ctypes, "CDLL", refuse_dlopen)
+    with pytest.raises(LibraryUnusable, match="could not be loaded"):
+        native.open_and_attest(
+            selected, platform="cpu", expected_abi=ABI,
+            abi_symbols=ABI_SYMBOLS, build_hint="build host")
+    assert events == ["h5py", "dlopen"]
 
 
 def test_symlink_escape_cannot_satisfy_a_bound_file(tmp_path):
