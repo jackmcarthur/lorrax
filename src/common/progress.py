@@ -142,15 +142,22 @@ class LoopProgress:
         blocked on before the line is timed, so a loop that only DISPATCHES
         asynchronous work (the Sigma tau sweep) reports execution progress
         rather than how far ahead the Python loop has run.  Blocking on a
-        local array is not a collective, so a rank-0-only wait is safe
-        (INVARIANTS row 21).  Non-milestone steps never block.
+        JAX value can still be globally sharded, so every process performs
+        the wait (INVARIANTS row 21).  Non-milestone steps never block.
         """
         if self._start is None:
             self.start()
         self._current += 1
-        if self.enabled and self._current <= self.num_steps and self._mask[self._current]:
-            if wait is not None:
-                jax.block_until_ready(wait)
+        milestone = (
+            self._current <= self.num_steps and self._mask[self._current])
+        # ``enabled`` defaults to process_index() == 0.  A wait on a JAX
+        # value must nevertheless be reached by every process: a caller can
+        # pass a globally sharded value even though today's Sigma caller uses
+        # a local shard.  Only formatting and printing are rank-conditional
+        # (INVARIANTS row 21).
+        if milestone and wait is not None:
+            jax.block_until_ready(wait)
+        if self.enabled and milestone:
             elapsed = time.time() - self._start
             self.print_fn(_format_progress(
                 self._current, self.num_steps, elapsed,

@@ -74,8 +74,10 @@ def make_pw_init(T_diag: jax.Array, n_channels: int, verbose: bool = True):
         X0 = jnp.einsum('ij,isG->jsG', C_low, V_pw, optimize=True)
         HX0 = jnp.einsum('ij,isG->jsG', C_low, HV_pw, optimize=True)
 
+        # ``eigvals`` is a JAX value.  Materialize it rank-symmetrically;
+        # only the formatting/printing may depend on ``verbose``.
+        eigs = np.asarray(eigvals[:n_eig])
         if verbose:
-            eigs = np.asarray(eigvals[:n_eig])
             print(f"  Initial guess: {n_basis} PWs → {n_eig} vectors, "
                   f"eig [{eigs[0]:.6f}, {eigs[-1]:.6f}] Ry")
         return X0, HX0

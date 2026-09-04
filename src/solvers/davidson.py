@@ -630,8 +630,8 @@ def davidson(
         LAST_RUN['t'].append(_time.perf_counter() - _t0)
         if verbose and (it <= 5 or it % 5 == 0 or n_conv == n_eig):
             print(f"  iter {it:3d}: m={V.shape[0]:3d}  mv={n_matvec:5d}  "
-                  f"eig[0]={float(Lambda[0]):12.6f}  "
-                  f"eig[{n_eig-1}]={float(Lambda[n_eig-1]):12.6f}  "
+                  f"eig[0]={float(Lambda_np[0]):12.6f}  "
+                  f"eig[{n_eig-1}]={float(Lambda_np[n_eig-1]):12.6f}  "
                   f"res=[{res_np.min():.1e},{res_np.max():.1e}]  "
                   f"conv={n_conv}/{n_eig}")
 

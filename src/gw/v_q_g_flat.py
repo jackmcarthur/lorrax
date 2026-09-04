@@ -583,8 +583,11 @@ def _compute_V_q_g_flat_one_tile(
         _t1 = _t.perf_counter()
         V_acc, g0_acc = kernel(
             V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_dev, q_idx_dev[q])
+        # The wait consumes a sharded accumulator, so it cannot sit under
+        # the rank-0 timing gate.  All processes rendezvous; only rank 0
+        # formats the diagnostic (INVARIANTS row 21).
+        jax.block_until_ready(V_acc)
         if _time_each_q:
-            jax.block_until_ready(V_acc)
             print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
                   f"kernel={_t.perf_counter() - _t1:.2f}s", flush=True)
 
