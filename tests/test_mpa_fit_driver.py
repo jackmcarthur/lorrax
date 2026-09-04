@@ -34,6 +34,7 @@ full-size valid-pole-count map solely for that assertion.
 from __future__ import annotations
 
 import io
+import inspect
 
 import numpy as np
 import pytest
@@ -193,6 +194,18 @@ def test_collective_fit_allocation_refuses_inode_preserving_mode(
         MS.allocate_fit_store_collective(
             str(tmp_path / "bad_append.h5"), mesh_xy=mesh_xy,
             n_q=1, n_mu=3, n_p=2, mode="a")
+
+
+def test_driver_closes_resume_and_allocation_ledgers_before_fit_writer():
+    source = inspect.getsource(fit_driver.run_fit_driver)
+    validate = source.index("validate_fit_store_for_resume")
+    before_allocate = source.index(
+        'barrier("mpa_fit_resume_readers_closed")')
+    allocate = source.index("allocate_fit_store_collective", before_allocate)
+    after_allocate = source.index(
+        'barrier("mpa_fit_ledger_readers_closed")')
+    writer = source.index("mpa_store.FitWriter", after_allocate)
+    assert validate < before_allocate < allocate < after_allocate < writer
 
 
 def test_run_driver_holds_one_fit_payload_handle(
@@ -358,7 +371,13 @@ def _write_w_file(path, n_p=_N_P):
         n_mu=n_mu, tables=tables, omega=z,
         sampling=dict(_SAMPLING, n_p=n_p), omega_line=line,
         closure_verdict=verdict,
-        provenance={"deck": "synthetic-glide-mpa-driver"})
+        provenance={
+            "deck": "synthetic-glide-mpa-driver",
+            "wfn_fingerprint_scheme": "wfn-test-v1",
+            "wfn_fingerprint": "wfn-test-a",
+            "charge_zeta_identity_scheme": "zeta-test-v1",
+            "charge_zeta_identity": "zeta-test-a",
+        })
     for i in range(2 * n_p):
         MS.write_w_slab(str(path), _W_NAME, i, W[i], ready=True)
     return {"z": z, "Omega": Omega, "B": B, "W": W, "n_mu": n_mu,
@@ -387,6 +406,25 @@ def fitted(planted, mesh_xy):
         report_stream=stream)
     return {"path": fit_path, "ledger": ledger, "report": report,
             "text": stream.getvalue()}
+
+
+def test_sample_identities_propagate_through_fit_and_reuse(fitted):
+    expected = {
+        "wfn_fingerprint_scheme": "wfn-test-v1",
+        "wfn_fingerprint": "wfn-test-a",
+        "charge_zeta_identity_scheme": "zeta-test-v1",
+        "charge_zeta_identity": "zeta-test-a",
+    }
+    assert {
+        key: fitted["ledger"]["provenance"][key] for key in expected
+    } == expected
+    reused = MS.validate_fit_store(
+        str(fitted["path"]), expected_identity=expected)
+    assert reused["complete"]
+    with pytest.raises(ValueError, match="charge_zeta_identity"):
+        MS.validate_fit_store(
+            str(fitted["path"]), expected_identity={
+                **expected, "charge_zeta_identity": "wrong-zeta"})
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +461,42 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     # complex128 round-trips exactly, so the disk leg must cost nothing.
     assert d_omega < 1.0e-7
     assert d_b < 1.0e-6
+
+
+def test_fit_restart_checkpoints_only_closed_32_block_epochs(
+        planted, tmp_path, mesh_xy, monkeypatch):
+    fit_path = tmp_path / "mpa_fit_epoch_resume.h5"
+    one_column_tile = (
+        planted["z"].size * planted["n_mu"] * np.dtype(np.complex128).itemsize)
+    original = fit_driver.fit_one_block
+    calls = {"count": 0}
+
+    def fail_in_second_epoch(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 35:
+            raise RuntimeError("synthetic epoch crash")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fit_driver, "fit_one_block", fail_in_second_epoch)
+    with pytest.raises(RuntimeError, match="synthetic epoch crash"):
+        fit_driver.run_fit_driver(
+            str(planted["w_path"]), _W_NAME, str(fit_path),
+            planted["z"], planted["n_p"], mesh_xy=mesh_xy,
+            tile_bytes=one_column_tile, finalize=False)
+    first = MS.fit_completion_ledger(str(fit_path))
+    assert first["n_done"] == 32
+    assert first["journal"].shape == (32, 3)
+
+    monkeypatch.setattr(fit_driver, "fit_one_block", original)
+    final, report = fit_driver.run_fit_driver(
+        str(planted["w_path"]), _W_NAME, str(fit_path),
+        planted["z"], planted["n_p"], mesh_xy=mesh_xy,
+        tile_bytes=one_column_tile)
+    assert final["complete"]
+    assert report["blocks_skipped"] == 32
+    assert report["checkpoint_blocks"] == 32
+    assert report["checkpoint_epochs_planned"] == 2
+    assert report["checkpoint_epochs_committed"] == 2
 
 
 def test_ordered_end_to_end_stores_and_recovers_the_odd_residue(

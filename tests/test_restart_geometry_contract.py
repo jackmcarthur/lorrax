@@ -144,6 +144,41 @@ def test_poisoned_mu_pad_is_clipped_and_both_shapes_are_receipted(
         assert tuple(ds.attrs[tagged_arrays.RESTART_CARRIER_SHAPE_ATTR]) == (8,)
 
 
+def test_charge_zeta_receipt_fresh_stamp_and_read(tmp_path, host_transport):
+    path = str(tmp_path / "zeta_receipt.h5")
+    receipt = {"scheme": "charge-zeta-v1", "digest": "abc123"}
+    tagged_arrays.write_restart_state_to_h5(
+        path, n_rmu_logical=2,
+        V_qmunu=np.eye(2, dtype=np.complex128)[None],
+        psi_full_y=np.ones((1, 1, 1, 2), dtype=np.complex128),
+        charge_zeta_identity=receipt, mesh=object(), mode="w")
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+                axis_names=("x", "y"))
+    state = tagged_arrays.load_restart_state_from_h5(path, mesh)
+    assert state.charge_zeta_identity == receipt
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [np.asarray([b"scheme"], dtype="S"),
+     np.asarray([b"scheme", b""], dtype="S"),
+     np.asarray([1, 2], dtype=np.int64)])
+def test_malformed_charge_zeta_receipt_refuses_before_tensor_read(
+        tmp_path, monkeypatch, stored):
+    path = tmp_path / "bad_zeta_receipt.h5"
+    with h5py.File(path, "w") as f:
+        f["V_qmunu"] = np.eye(2, dtype=np.complex128)[None]
+        f["psi_full_y"] = np.ones((1, 1, 1, 2), dtype=np.complex128)
+        f[tagged_arrays.CHARGE_ZETA_IDENTITY_DATASET] = stored
+    opens = []
+    monkeypatch.setattr(
+        slab_io, "SlabIO",
+        lambda *_a, **_k: opens.append(True))
+    with pytest.raises(ValueError, match="charge-zeta receipt"):
+        tagged_arrays.read_restart_state_from_h5(str(path), object())
+    assert opens == []
+
+
 def _write_then_repad(tmp_path, host_transport, source_carrier, target_carrier):
     path = str(tmp_path / f"p{source_carrier}_to_p{target_carrier}.h5")
     logical = 184

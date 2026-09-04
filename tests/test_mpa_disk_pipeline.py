@@ -117,6 +117,7 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
         fit, config=config, live_plan=live_plan, sym=sym,
         centroid_indices=None, meta=meta, mesh_xy=None,
         wfn=object(),
+        charge_zeta_identity={"scheme": "zeta-v1", "digest": "zeta-a"},
         occupation_state=occ, material_class="metal",
         print_fn=lambda *_args: None)
 
@@ -127,6 +128,8 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
         "w_centroid_hash": "centroids-current",
         "wfn_fingerprint_scheme": "mean-field-content-v1",
         "wfn_fingerprint": "wfn-current",
+        "charge_zeta_identity_scheme": "zeta-v1",
+        "charge_zeta_identity": "zeta-a",
     }
     assert calls["logical_n_mu"] == 5
     assert kwargs["expected_screening_diagrams"] == "w_rpa"
@@ -183,6 +186,7 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
         fit, config=config, live_plan=live_plan,
         sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
         meta=meta, mesh_xy=None, wfn=object(),
+        charge_zeta_identity={"scheme": "zeta-v1", "digest": "zeta-a"},
         occupation_state=occ, material_class="metal",
         print_fn=messages.append)
 
@@ -200,6 +204,7 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
             fit, config=config, live_plan=live_plan,
             sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
             meta=meta, mesh_xy=None, wfn=object(),
+            charge_zeta_identity={"scheme": "zeta-v1", "digest": "zeta-a"},
             occupation_state=occ, material_class="metal",
             print_fn=lambda *_args: None)
 
@@ -239,6 +244,81 @@ def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):
     ]
     for i, event in enumerate(events[1::2]):
         np.testing.assert_array_equal(event[2], 3.0 * np.asarray(chi[i]))
+
+
+def test_dyson_resume_skips_independently_ready_wc_slabs(monkeypatch):
+    V = jnp.asarray(np.stack([np.eye(2), 2 * np.eye(2)]),
+                    dtype=jnp.complex128)
+    chi = [jnp.full((2, 2, 2), k + 1, dtype=jnp.complex128)
+           for k in range(3)]
+    events = []
+
+    def read(_path, name, i, *, mesh_xy):
+        assert name == model._CHI
+        events.append(("read", i))
+        return chi[i], {}
+
+    def write(_path, name, i, value, *, mesh_xy, global_shape):
+        assert name == model._WC
+        events.append(("write", i))
+
+    monkeypatch.setattr(model.mpa_store, "read_w_slab_collective", read)
+    monkeypatch.setattr(model.mpa_store, "write_w_slab_collective", write)
+    import gw.w_isdf as w_isdf
+    monkeypatch.setattr(
+        w_isdf, "solve_w",
+        lambda Vq, cq, *_args, **_kw: Vq + 3.0 * cq)
+
+    model._solve_wc(
+        "samples.h5", V, 3, np.array([0, 1]),
+        SimpleNamespace(n_rmu=2), _mesh(),
+        wc_ready=np.asarray([False, True, False]))
+
+    assert events == [
+        ("read", 0), ("write", 0),
+        ("read", 2), ("write", 2),
+    ]
+
+
+def test_ladder_wc_source_preserves_head_but_skips_ready_wc_writes(
+        monkeypatch):
+    from gw import screening_bse
+
+    z = np.asarray([0.1j, 0.8 + 0.1j], np.complex128)
+    slabs = jnp.asarray(np.stack([
+        np.eye(2, dtype=np.complex128),
+        2.0 * np.eye(2, dtype=np.complex128),
+    ]))[:, None, :, :]
+    wedge = SimpleNamespace(wc=slabs)
+    head = object()
+    writes = []
+    monkeypatch.setattr(
+        screening_bse, "prepare_ladder_restart", lambda *a, **k: None)
+    monkeypatch.setattr(
+        screening_bse, "_ladder_wedge", lambda *a, **k: wedge)
+    monkeypatch.setattr(
+        screening_bse, "_assert_wedge_matches_run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        screening_bse, "_finalize_ladder_head", lambda *a, **k: head)
+    monkeypatch.setattr(
+        screening_bse, "_assert_mu_width", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(
+        "file_io.mpa_store.write_w_slab_collective",
+        lambda _path, _name, index, *_a, **_k: writes.append(index))
+    source = screening_bse.make_ladder_wc_source(
+        None, None, quad=None, e_ref=0.0, sym=None,
+        centroid_indices=None,
+        config=SimpleNamespace(input_file=""),
+        meta=None, mesh_xy=None, tensors_filename="restart.h5",
+        head_resolver=SimpleNamespace(wfn=None))
+
+    got = source(
+        "samples.h5", jnp.zeros((1, 2, 2), jnp.complex128), z,
+        np.asarray([0]), SimpleNamespace(n_rmu=2), None,
+        wc_ready=np.asarray([True, False]))
+
+    assert got is head
+    assert writes == [1]
 
 
 def test_dyson_refuses_mixed_centroid_carrier_extents_before_dispatch():

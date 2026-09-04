@@ -37,6 +37,27 @@ def _canonical_wfn_identity(wfn, wfn_fingerprint_binding=None):
     }
 
 
+def _canonical_charge_zeta_identity(receipt):
+    """Validate gw_init's opaque charge-zeta receipt for MPA transport."""
+    if receipt is None:
+        raise ValueError(
+            "MPA requires the authenticated charge-zeta identity stored with "
+            "the ISDF restart. This restart predates that receipt; rerun with "
+            "restart = false to regenerate the restart and MPA artifacts.")
+    if not isinstance(receipt, dict) or set(receipt) != {"scheme", "digest"}:
+        raise ValueError(
+            "MPA charge-zeta identity must contain exactly scheme and digest")
+    scheme, digest = receipt["scheme"], receipt["digest"]
+    if any(not isinstance(value, str) or not value
+           for value in (scheme, digest)):
+        raise ValueError(
+            "MPA charge-zeta identity fields must be nonempty strings")
+    return {
+        "charge_zeta_identity_scheme": scheme,
+        "charge_zeta_identity": digest,
+    }
+
+
 def make_mpa_plan(config, quad, *, material_class):
     """Build and validate the one frequency plan shared by body and head."""
     n_p = int(config.mpa.n_poles)
@@ -101,6 +122,7 @@ def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy, material_class):
 def validate_reused_mpa_fit(
     fit_path, *, config, live_plan, sym, centroid_indices, meta, mesh_xy, wfn,
     wfn_fingerprint_binding=None,
+    charge_zeta_identity=None,
     occupation_state, material_class, print_fn=print,
 ):
     """Certify an explicit read-only one-shot MPA fit against this run.
@@ -126,12 +148,14 @@ def validate_reused_mpa_fit(
     # from its P36 carrier extent 2088), and also makes reuse mesh-dependent.
     logical_tables = tables.logical(int(meta.n_rmu)).canonical()
     wfn_identity = _canonical_wfn_identity(wfn, wfn_fingerprint_binding)
+    zeta_identity = _canonical_charge_zeta_identity(charge_zeta_identity)
     ledger = mpa_store.validate_fit_store(
         path,
         expected_identity={
             "w_table_hash": logical_tables.digest(),
             "w_centroid_hash": closure_verdict.centroid_hash,
             **wfn_identity,
+            **zeta_identity,
         },
         expected_screening_diagrams=config.screening.diagrams,
     )
@@ -337,6 +361,8 @@ def _solve_wc(
     distrib_la_batched_route: str = "batch_reshard",
     reflected_chi_name=None,
     negative_wc_name=None,
+    wc_ready=None,
+    negative_wc_ready=None,
 ):
     """THE DEFAULT ``wc_source``: Wc(z) = W(z) - V from the sampled chi.
 
@@ -374,6 +400,17 @@ def _solve_wc(
     else:
         z_values = np.asarray(z, dtype=np.complex128).reshape(-1)
         n_z = int(z_values.size)
+    wc_ready = np.zeros(n_z, dtype=bool) if wc_ready is None else np.asarray(
+        wc_ready, dtype=bool)
+    if wc_ready.shape != (n_z,):
+        raise ValueError("_solve_wc wc_ready must have one bit per frequency")
+    if negative_wc_name is not None:
+        negative_wc_ready = (
+            np.zeros(n_z, dtype=bool) if negative_wc_ready is None else
+            np.asarray(negative_wc_ready, dtype=bool))
+        if negative_wc_ready.shape != (n_z,):
+            raise ValueError(
+                "_solve_wc negative_wc_ready must have one bit per frequency")
     bgw_q0 = None
     bgw_vhead = None
     bgw_epsinv = []
@@ -412,8 +449,11 @@ def _solve_wc(
     head_samples = []
     shape = (n_z, q_idx.size, meta.n_rmu, meta.n_rmu)
     for index in range(n_z):
-        chi, _ = mpa_store.read_w_slab_collective(
-            sample_path, _CHI, index, mesh_xy=mesh_xy)
+        need_live_w = bool(bgw_q0 is not None or head_response is not None)
+        chi = None
+        if not wc_ready[index] or bgw_q0 is not None:
+            chi, _ = mpa_store.read_w_slab_collective(
+                sample_path, _CHI, index, mesh_xy=mesh_xy)
         chi_q0 = None
         if bgw_q0 is not None:
             # ``solve_w`` donates the full chi buffer.  Retain only one
@@ -421,10 +461,19 @@ def _solve_wc(
             # process materialises an N_mu^2 object.
             q0row = int(bgw_q0.wedge_row)
             chi_q0 = chi[q0row:q0row + 1].copy()
-        W = solve_w(
-            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
-            distrib_la_batched_route=distrib_la_batched_route)
-        W.block_until_ready()
+        if wc_ready[index]:
+            if need_live_w:
+                Wc, _ = mpa_store.read_w_slab_collective(
+                    sample_path, _WC, index, mesh_xy=mesh_xy)
+                W = Wc + V
+                W.block_until_ready()
+            else:
+                Wc = W = None
+        else:
+            W = solve_w(
+                V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+                distrib_la_batched_route=distrib_la_batched_route)
+            W.block_until_ready()
         if bgw_q0 is not None:
             from gw.head_correction import (
                 bgw_q0shift_head_sample,
@@ -462,14 +511,16 @@ def _solve_wc(
                 config=config,
                 mesh=mesh_xy,
             ))
-        Wc = W - V
-        Wc.block_until_ready()
-        mpa_store.write_w_slab_collective(
-            sample_path, _WC, index, Wc, mesh_xy=mesh_xy,
-            global_shape=shape)
+        if not wc_ready[index]:
+            Wc = W - V
+            Wc.block_until_ready()
+            mpa_store.write_w_slab_collective(
+                sample_path, _WC, index, Wc, mesh_xy=mesh_xy,
+                global_shape=shape)
         del chi, W, Wc
 
-        if reflected_chi_name is not None:
+        if (reflected_chi_name is not None
+                and not negative_wc_ready[index]):
             import jax
 
             chi_reflected, _ = mpa_store.read_w_slab_collective(
@@ -524,12 +575,13 @@ def _solve_wc(
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
               provenance=None, occupation_state=None, solve="loewner",
-              w_negative_name=None):
+              w_negative_name=None, overwrite_incompatible=False):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
         w_negative_name=w_negative_name,
         tile_bytes=tile_bytes, provenance=provenance,
-        occupation_state=occupation_state, solve=solve)
+        occupation_state=occupation_state, solve=solve,
+        overwrite_incompatible=overwrite_incompatible, finalize=False)
 
 
 def _metal_kminq_rows(sym, q_idx):
@@ -779,6 +831,7 @@ def _evaluate_samples(
 def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     wfn_fingerprint_binding=None,
+    charge_zeta_identity=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
     occupation_state=None, material_class, head_channel=None, wc_source=None,
@@ -852,21 +905,14 @@ def build_mpa_fit(
             "w_rpa or implement the reflected ladder source at the one "
             "wc_source seam.")
     sample_path, fit_path = iteration_artifact_paths(root, label)
-    sample_names = [_CHI, _WC]
-    if ordered:
-        sample_names.extend((_CHI_REFLECTED, _WC_NEGATIVE))
-    protected = mpa_store.refuse_completed_artifact_replacement(
-        sample_path,
+    protected_fit = mpa_store.refuse_finalized_fit_replacement(
         fit_path,
-        sample_names=sample_names,
         overwrite_completed=config.mpa.overwrite_completed_artifacts,
     )
-    if protected:
+    if protected_fit is not None:
         print_fn(
-            "WARNING -- DESTRUCTIVE MPA ARTIFACT REPLACEMENT: "
-            "mpa_overwrite_completed_artifacts = true permits replacing "
-            + ", ".join(protected)
-            + ". This is regeneration, not partial-store resume.")
+            "  MPA destructive regeneration was explicitly requested for "
+            f"the finalized fit store {protected_fit}.")
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
     # PROVENANCE (QUALITY_PATTERNS #10).  RPA poles and ladder poles have
@@ -879,6 +925,7 @@ def build_mpa_fit(
     provenance = {
         "screening_diagrams": diagrams,
         **_canonical_wfn_identity(wfn, wfn_fingerprint_binding),
+        **_canonical_charge_zeta_identity(charge_zeta_identity),
     }
     # The origin shift is stamped ONLY when the deck declared it: it enters
     # mpa_store's `extra` channel as the additive attr
@@ -895,30 +942,50 @@ def build_mpa_fit(
         sampling_record["metal_origin_shift_ry"] = float(
             config.mpa.metal_origin_shift_ry)
     common = dict(
-        mesh_xy=mesh_xy, n_omega=z_all.size, n_q_on_disk=q_idx.size,
+        n_omega=z_all.size, n_q_on_disk=q_idx.size,
         n_mu=meta.n_rmu, n_rmu_logical=meta.n_rmu, tables=tables,
         closure_verdict=closure_verdict,
         omega=z_all, omega_line=line, energy_unit="Ry",
         sampling=sampling_record, provenance=provenance)
-    mpa_store.allocate_w_omega_collective(
-        sample_path, _CHI, mode="w", **common)
-    mpa_store.allocate_w_omega_collective(
-        sample_path, _WC, mode="a", **common)
+    components = [dict(common, name=_CHI), dict(common, name=_WC)]
     if ordered:
         reflected_common = dict(common)
         reflected_common.update(
             omega=-np.conj(z_all),
             omega_line=line)
-        mpa_store.allocate_w_omega_collective(
-            sample_path, _CHI_REFLECTED, mode="a", **reflected_common)
+        components.append(dict(reflected_common, name=_CHI_REFLECTED))
         negative_common = dict(common)
         negative_common.update(
             omega=-z_all,
             omega_line=line)
-        mpa_store.allocate_w_omega_collective(
-            sample_path, _WC_NEGATIVE, mode="a", **negative_common)
+        components.append(dict(negative_common, name=_WC_NEGATIVE))
+
+    sample_headers = mpa_store.prepare_w_sample_store_collective(
+        sample_path, components, mesh_xy=mesh_xy,
+        overwrite_incompatible=config.mpa.overwrite_completed_artifacts)
+    ready = {
+        name: np.asarray(header["data_ready"], dtype=bool)
+        for name, header in sample_headers.items()
+    }
+    resumed_slabs = sum(int(bits.sum()) for bits in ready.values())
+    if resumed_slabs:
+        print_fn(
+            f"  MPA sample resume: preserving {resumed_slabs} ready "
+            "component-frequency slabs; chi and Wc readiness are independent.")
 
     routes = sample_plan.plan_routes(plan)
+    def _chi_needed(point):
+        index = int(point["index"])
+        return (not ready[_CHI][index]
+                or (ordered and not ready[_CHI_REFLECTED][index]))
+    routes = {
+        "existing": tuple(
+            point for point in routes["existing"] if _chi_needed(point)),
+        "lines": tuple(
+            (varpi_i, tuple(point for point in points if _chi_needed(point)))
+            for varpi_i, points in routes["lines"]
+            if any(_chi_needed(point) for point in points)),
+    }
     metal = material_class == "metal"
     kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
     static_gamma_override = (
@@ -928,20 +995,24 @@ def build_mpa_fit(
     gamma_row = int(gamma_matches[0]) if gamma_matches.size == 1 else None
 
     def _write_full(point, chi):
-        _write_sample(
-            sample_path, point["index"], chi, q_idx, meta, mesh_xy,
-            z_all.size)
+        if not ready[_CHI][int(point["index"])]:
+            _write_sample(
+                sample_path, point["index"], chi, q_idx, meta, mesh_xy,
+                z_all.size)
 
     def _write_wedge(point, chi_wedge):
+        if ready[_CHI][int(point["index"])]:
+            return
         chi_wedge.block_until_ready()
         mpa_store.write_w_slab_collective(
             sample_path, _CHI, point["index"], chi_wedge, mesh_xy=mesh_xy,
             global_shape=(z_all.size, q_idx.size, meta.n_rmu, meta.n_rmu))
 
     def _write_reflected(point, chi):
-        _write_sample(
-            sample_path, point["index"], chi, q_idx, meta, mesh_xy,
-            z_all.size, name=_CHI_REFLECTED)
+        if not ready[_CHI_REFLECTED][int(point["index"])]:
+            _write_sample(
+                sample_path, point["index"], chi, q_idx, meta, mesh_xy,
+                z_all.size, name=_CHI_REFLECTED)
 
     _evaluate_samples(
         wfns, routes, quad, config, meta, mesh_xy,
@@ -970,6 +1041,8 @@ def build_mpa_fit(
                 config.backend, "distrib_la_batched_route", "batch_reshard"),
             reflected_chi_name=_CHI_REFLECTED if ordered else None,
             negative_wc_name=_WC_NEGATIVE if ordered else None,
+            wc_ready=ready[_WC],
+            negative_wc_ready=(ready[_WC_NEGATIVE] if ordered else None),
         )
     else:
         if iteration_head_response is not None:
@@ -979,12 +1052,14 @@ def build_mpa_fit(
                 "use screening_diagrams = w_rpa for self-consistency.")
         iteration_head = wc_source(
             sample_path, V, z_all, q_idx, meta, mesh_xy,
-            config.backend.w_dyson_solver)
+            config.backend.w_dyson_solver,
+            wc_ready=ready[_WC])
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
         provenance=provenance, occupation_state=occupation_state,
         solve=config.mpa.pole_solver,
-        w_negative_name=_WC_NEGATIVE if ordered else None)
+        w_negative_name=_WC_NEGATIVE if ordered else None,
+        overwrite_incompatible=config.mpa.overwrite_completed_artifacts)
     # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
     # writer opens the same file through serial h5py.  A context-manager
     # return is rank-local: without this process barrier rank 0 can enter
@@ -1033,6 +1108,16 @@ def build_mpa_fit(
         solve=config.mpa.pole_solver,
         occupation_state=occupation_state,
     )
+    # COMPLETE is the last mutation of the two-part transaction.  A crash
+    # after body checkpointing or during head publication leaves the store
+    # explicitly incomplete; the next run validates/skips the body and
+    # republishes the tiny head before reaching this stamp.
+    from common.collectives import process_rank
+    if process_rank() == 0:
+        mpa_store.finalize_fit_store(
+            fit_path, certification=report["certification"],
+            require_head=True)
+    barrier("mpa_body_and_head_finalized")
     print_fn(fit_driver.format_cost_report(report))
     return fit_path, iteration_head
 

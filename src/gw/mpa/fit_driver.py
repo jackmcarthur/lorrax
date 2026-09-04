@@ -13,13 +13,15 @@ that was planted.  That claim spans both, so it is tested here.
 
 THE LOOP, WHICH IS THE WHOLE MODULE
 -----------------------------------
-``plan_column_walk`` -> open one fit payload writer -> for each ``(q, column
-block)``: collective SlabIO read -> row-local ``fit_mpa_poles_batched`` ->
-queue and drain six collective SlabIO payload writes -> close the payload
-writer -> publish one rank-zero completion-ledger transaction.  No pole
-tensor accumulates across blocks: the persistent object is the file handle and six cached
-dataset handles.  The per-block drain is the required ownership transfer
-before the next W-file read; it is not a file reopen or ledger transaction.
+``plan_column_walk`` -> authenticate the partial ledger -> divide unfinished
+``(q, column block)`` entries into fixed 32-block checkpoint epochs.  Within
+each epoch one payload writer performs collective SlabIO read -> row-local
+``fit_mpa_poles_batched`` -> queue and drain collective pole writes for every
+block.  Only after that handle closes does rank zero publish the epoch's
+completion journal.  No pole tensor accumulates across blocks: the persistent
+object within an epoch is the file handle and its cached dataset handles.  The
+per-block drain is the required ownership transfer before the next W-file
+read; the epoch close is the bounded durability transaction.
 
 THE ORDER OF OPERATIONS INSIDE ONE BLOCK IS LOAD-BEARING.  The read comes
 first and the write comes last, so a block refused before its write leaves
@@ -42,6 +44,7 @@ protocol grid they were evaluated on is stamped beside them.
 from __future__ import annotations
 
 import functools
+import os
 import time
 
 import numpy as np
@@ -62,6 +65,10 @@ __all__ = [
 # lack of GPU batching is accepted and printed as part of this diagnostic
 # route's cost rather than changing the algorithm being compared.
 _FIT_EIG = "jax_qr"
+# One checkpoint transaction after this many scheduled q/column blocks.  This
+# is an internal durability policy, not a deck/env tuning knob: at the Bi
+# schedule of 1,105 blocks it produces 35 bounded epochs.
+_FIT_CHECKPOINT_BLOCKS = 32
 
 
 def _fit_eig(solve):
@@ -397,55 +404,61 @@ def fit_one_block(
     }
 
 
-def _bind_sample_wfn_identity(header, negative_header, provenance):
-    """Bind fit provenance to the canonical identity stamped on its samples."""
-    keys = mpa_store.WFN_IDENTITY_PROVENANCE_KEYS
+def _bind_sample_artifact_identities(header, negative_header, provenance):
+    """Bind fit provenance to WFN and charge-zeta sample identities."""
+    identity_groups = (
+        ("WFN", mpa_store.WFN_IDENTITY_PROVENANCE_KEYS),
+        ("charge-zeta", mpa_store.CHARGE_ZETA_IDENTITY_PROVENANCE_KEYS),
+    )
 
     def text(value):
         if isinstance(value, (bytes, np.bytes_)):
             return bytes(value).decode("utf-8")
         return str(value)
 
-    def identity(row, label):
+    def identity(row, label, identity_label, keys):
         values = dict(row.get("provenance", {}))
         present = [key for key in keys if key in values]
         if not present:
             return None
         if len(present) != len(keys):
             raise ValueError(
-                f"run_fit_driver: {label} sample WFN identity is partial; "
+                f"run_fit_driver: {label} sample {identity_label} identity "
+                "is partial; "
                 f"present={present}, required={list(keys)}")
         return {key: text(values[key]) for key in keys}
 
-    positive = identity(header, "positive")
-    negative = (None if negative_header is None else
-                identity(negative_header, "negative"))
-    if negative_header is not None and negative != positive:
-        raise ValueError(
-            "run_fit_driver: ordered positive/negative sample stores carry "
-            f"different WFN identities: positive={positive}, "
-            f"negative={negative}")
-
     bound = dict(provenance or {})
-    caller_identity = {key: text(bound[key]) for key in keys if key in bound}
-    if positive is None:
-        if caller_identity:
+    for identity_label, keys in identity_groups:
+        positive = identity(header, "positive", identity_label, keys)
+        negative = (
+            None if negative_header is None else
+            identity(negative_header, "negative", identity_label, keys))
+        if negative_header is not None and negative != positive:
             raise ValueError(
-                "run_fit_driver: caller provenance cannot inject a WFN "
-                "identity absent from the sample store")
-        # Explicit legacy policy: old samples remain fit-able for offline or
-        # same-run compatibility, but their fit remains unstamped and explicit
-        # reuse (which supplies both expected fields) refuses it.
-        return bound
-    mismatched = [
-        key for key, value in caller_identity.items()
-        if value != positive[key]
-    ]
-    if mismatched:
-        raise ValueError(
-            "run_fit_driver: caller WFN provenance disagrees with the sample "
-            f"store in {mismatched}")
-    bound.update(positive)
+                "run_fit_driver: ordered positive/negative sample stores "
+                f"carry different {identity_label} identities: "
+                f"positive={positive}, negative={negative}")
+        caller_identity = {
+            key: text(bound[key]) for key in keys if key in bound}
+        if positive is None:
+            if caller_identity:
+                raise ValueError(
+                    "run_fit_driver: caller provenance cannot inject a "
+                    f"{identity_label} identity absent from the sample store")
+            # Legacy direct/offline sample fitting remains possible, but the
+            # resulting fit is unauthenticated and explicit reuse supplies the
+            # missing expected pair and refuses it.
+            continue
+        mismatched = [
+            key for key, value in caller_identity.items()
+            if value != positive[key]
+        ]
+        if mismatched:
+            raise ValueError(
+                f"run_fit_driver: caller {identity_label} provenance "
+                f"disagrees with the sample store in {mismatched}")
+        bound.update(positive)
     return bound
 
 
@@ -464,8 +477,10 @@ def run_fit_driver(
     provenance=None,
     occupation_state=None,
     report_stream=None,
+    overwrite_incompatible=False,
+    finalize=True,
 ):
-    """The whole fit stage: allocate, walk, stage, finalize, report.
+    """The whole fit stage: resume/allocate, checkpoint, optionally finalize.
 
     Reads the W(omega) header for its extents and its stamps, allocates
     the staged B/Omega store against them, walks
@@ -538,7 +553,7 @@ def run_fit_driver(
 
     plan = tiling.plan_column_walk(
         n_mu, n_omega * (2 if ordered else 1), tile_bytes)
-    fit_provenance = _bind_sample_wfn_identity(
+    fit_provenance = _bind_sample_artifact_identities(
         header, negative_header, provenance)
     fit_provenance.update({
         "solve_mode": solve,
@@ -546,16 +561,53 @@ def run_fit_driver(
         "eig_mode": _fit_eig(solve),
         "fit_fused": True,
     })
-    mpa_store.allocate_fit_store_collective(
-        fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
-        energy_unit=header["omega_units"],
-        grid_hash=header["grid_hash"],
-        table_hash=header["table_hash"],
-        centroid_hash=header["centroid_hash"],
-        unfold_tables=mpa_store.read_w_tables(w_src, w_name),
-        provenance=fit_provenance,
-        occupation_state=occupation_state,
-        ordered_residues=ordered)
+    schedule = tuple(tiling.fit_schedule(
+        n_q, n_mu, n_omega * (2 if ordered else 1), tile_bytes))
+    ledger = None
+    must_allocate = not os.path.exists(os.fspath(fit_dest))
+    if not must_allocate:
+        try:
+            ledger = mpa_store.validate_fit_store_for_resume(
+                fit_dest, n_q=n_q, n_mu=n_mu, n_p=n,
+                energy_unit=header["omega_units"],
+                grid_hash=header["grid_hash"],
+                table_hash=header["table_hash"],
+                centroid_hash=header["centroid_hash"],
+                provenance=fit_provenance, ordered_residues=ordered,
+                schedule=schedule, occupation_state=occupation_state)
+            if ledger["complete"]:
+                raise ValueError(
+                    "completed MPA fit stores are write-once; consume the "
+                    "fit through mpa_fit_reuse_file or choose a new variant")
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            if not bool(overwrite_incompatible):
+                raise ValueError(
+                    "GATE mpa_partial_fit_compatible: existing fit store is "
+                    "not a compatible resumable transaction and will not be "
+                    "truncated. Set mpa_overwrite_completed_artifacts = true "
+                    "only for destructive regeneration. Cause: "
+                    f"{type(exc).__name__}: {exc}") from exc
+            must_allocate = True
+    from common.collectives import barrier, process_rank
+    # ``validate_fit_store_for_resume`` is an all-rank serial-h5py read.
+    # Do not let a fast rank enter either collective allocation or an
+    # append-mode FitWriter while a slower peer still owns that reader.
+    barrier("mpa_fit_resume_readers_closed")
+    if must_allocate:
+        ledger = mpa_store.allocate_fit_store_collective(
+            fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
+            energy_unit=header["omega_units"],
+            grid_hash=header["grid_hash"],
+            table_hash=header["table_hash"],
+            centroid_hash=header["centroid_hash"],
+            unfold_tables=mpa_store.read_w_tables(w_src, w_name),
+            provenance=fit_provenance,
+            occupation_state=occupation_state,
+            ordered_residues=ordered)
+    # Fresh allocation returns a final all-rank serial ledger read; resume
+    # validation does too.  No FitWriter may open append-mode until every
+    # rank has closed whichever reader produced ``ledger``.
+    barrier("mpa_fit_ledger_readers_closed")
 
     report = {
         "n_q": int(n_q),
@@ -566,11 +618,16 @@ def run_fit_driver(
         "solve": solve,
         "eig": _fit_eig(solve),
         "rcond": rcond,
+        "certification": dict(certification),
         "n_cols_budget": int(plan["n_cols"]),
         "n_blocks_per_q": int(plan["n_blocks"]),
         "tile_bytes": int(plan["tile_bytes"]),
         "cost_sentence": plan["cost"],
         "blocks_walked": 0,
+        "blocks_skipped": 0,
+        "checkpoint_blocks": _FIT_CHECKPOINT_BLOCKS,
+        "checkpoint_epochs_planned": 0,
+        "checkpoint_epochs_committed": 0,
         "columns_read": 0,
         "elements_fitted": 0,
         "bytes_read": 0,
@@ -581,49 +638,63 @@ def run_fit_driver(
                     "finalize": 0.0, "total": 0.0},
     }
 
-    ledger = None
-    t_write_lifecycle = time.perf_counter()
-    fit_writer = mpa_store.FitWriter(fit_dest, mesh_xy=mesh_xy)
-    report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
-    try:
-        for q, lo, hi in tiling.fit_schedule(
-                n_q, n_mu, n_omega * (2 if ordered else 1), tile_bytes):
-            stats = fit_one_block(
-                w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
-                mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
-                w_negative_name=w_negative_name,
-                negative_header=negative_header,
-                tile_bytes=tile_bytes, rcond=rcond,
-                solve=solve, header=header, fit_writer=fit_writer)
-            ledger = stats["ledger"]
-            report["blocks_walked"] += 1
-            report["columns_read"] += stats["n_cols"]
-            report["elements_fitted"] += stats["n_elements"]
-            report["bytes_read"] += stats["bytes_read"]
-            report["peak_block_bytes"] = max(report["peak_block_bytes"],
-                                             stats["bytes_read"])
-            report["fit_dispatches"] += stats["fit_dispatches"]
-            report["pade_solves"] += stats["pade_solves"]
-            report["seconds"]["read"] += stats["seconds_read"]
-            report["seconds"]["fit"] += stats["seconds_fit"]
-            report["seconds"]["write"] += stats["seconds_write"]
-    except BaseException:
-        fit_writer.close(commit=False)
-        raise
-    t_write_lifecycle = time.perf_counter()
-    ledger = fit_writer.close()
-    report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
+    pending = []
+    for q, lo, hi in schedule:
+        block_done = np.asarray(ledger["blocks_done"])[int(q), int(lo):int(hi)]
+        if bool(block_done.all()):
+            report["blocks_skipped"] += 1
+        elif bool(block_done.any()):
+            raise ValueError(
+                f"run_fit_driver: schedule block {(q, lo, hi)} is partly "
+                "committed after ledger validation")
+        else:
+            pending.append((q, lo, hi))
+    epochs = tuple(
+        tuple(pending[start:start + _FIT_CHECKPOINT_BLOCKS])
+        for start in range(0, len(pending), _FIT_CHECKPOINT_BLOCKS))
+    report["checkpoint_epochs_planned"] = len(epochs)
+    for epoch in epochs:
+        t_write_lifecycle = time.perf_counter()
+        fit_writer = mpa_store.FitWriter(fit_dest, mesh_xy=mesh_xy)
+        report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
+        try:
+            for q, lo, hi in epoch:
+                stats = fit_one_block(
+                    w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
+                    mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
+                    w_negative_name=w_negative_name,
+                    negative_header=negative_header,
+                    tile_bytes=tile_bytes, rcond=rcond,
+                    solve=solve, header=header, fit_writer=fit_writer)
+                ledger = stats["ledger"]
+                report["blocks_walked"] += 1
+                report["columns_read"] += stats["n_cols"]
+                report["elements_fitted"] += stats["n_elements"]
+                report["bytes_read"] += stats["bytes_read"]
+                report["peak_block_bytes"] = max(
+                    report["peak_block_bytes"], stats["bytes_read"])
+                report["fit_dispatches"] += stats["fit_dispatches"]
+                report["pade_solves"] += stats["pade_solves"]
+                report["seconds"]["read"] += stats["seconds_read"]
+                report["seconds"]["fit"] += stats["seconds_fit"]
+                report["seconds"]["write"] += stats["seconds_write"]
+        except BaseException:
+            fit_writer.close(commit=False)
+            raise
+        t_write_lifecycle = time.perf_counter()
+        ledger = fit_writer.close()
+        report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
+        report["checkpoint_epochs_committed"] += 1
 
     t_fin = time.perf_counter()
-    from common.collectives import barrier, process_rank
     if not bool(np.asarray(ledger["blocks_done"]).all()):
         raise ValueError(
             "run_fit_driver: refusing collective finalize because the fit "
             "ledger still has unfinished columns")
-    if process_rank() == 0:
+    if finalize and process_rank() == 0:
         mpa_store.finalize_fit_store(
             fit_dest, certification=certification)
-    barrier("mpa_fit_finalized")
+    barrier("mpa_fit_finalized" if finalize else "mpa_fit_body_complete")
     ledger = mpa_store.fit_completion_ledger(fit_dest)
     report["seconds"]["finalize"] = time.perf_counter() - t_fin
 
@@ -669,8 +740,12 @@ def format_cost_report(report):
         f"  walk            {r['blocks_walked']} blocks "
         f"({r['n_blocks_per_q']} per q x {r['n_q']} q), "
         f"{r['n_cols_budget']} columns per block",
-        f"  columns read    {r['columns_read']} "
-        f"(= {r['n_q']} q x {r['n_mu']} columns)",
+        f"  resume          {r['blocks_skipped']} blocks skipped; "
+        f"checkpoint epoch={r['checkpoint_blocks']} blocks, "
+        f"{r['checkpoint_epochs_committed']}/"
+        f"{r['checkpoint_epochs_planned']} new epochs committed",
+        f"  columns read    {r['columns_read']} newly fitted "
+        f"(full store = {r['n_q']} q x {r['n_mu']} columns)",
         f"  elements fitted {r['elements_fitted']}",
         f"  logical outputs {r['logical_outputs']} "
         + ("(= 3*n_p per element: n_p Omega + n_p B + n_p D)"

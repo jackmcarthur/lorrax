@@ -13,6 +13,7 @@ import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier
+import common.timing as timing
 
 
 RESTART_LOGICAL_SHAPE_ATTR = "restart_logical_shape"
@@ -20,6 +21,45 @@ RESTART_CARRIER_SHAPE_ATTR = "restart_carrier_shape"
 BAND_WINDOW_SCHEMA_DATASET = "band_window_schema"
 BAND_WINDOW_SCHEMA_VERSION = 2
 BAND_WINDOW_CARRIER_DATASET = "band_window_carrier"
+CHARGE_ZETA_IDENTITY_DATASET = "charge_zeta_identity"
+
+
+def _encode_charge_zeta_identity(receipt):
+    """Validate and encode the opaque two-string charge-zeta receipt."""
+    if receipt is None:
+        return None
+    if not isinstance(receipt, dict) or set(receipt) != {"scheme", "digest"}:
+        raise ValueError(
+            "charge_zeta_identity must contain exactly the two strings "
+            "'scheme' and 'digest'")
+    values = tuple(receipt[key] for key in ("scheme", "digest"))
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError(
+            "charge_zeta_identity scheme and digest must be nonempty strings")
+    return np.asarray(values, dtype="S")
+
+
+def _decode_charge_zeta_identity(value, *, where):
+    """Decode a stored receipt without assigning semantics to its strings."""
+    raw = np.asarray(value)
+    if raw.shape != (2,) or raw.dtype.kind not in ("S", "U", "O"):
+        raise ValueError(
+            f"{where}: charge-zeta receipt "
+            f"{CHARGE_ZETA_IDENTITY_DATASET!r} must be a two-string "
+            f"dataset; got shape={raw.shape}, dtype={raw.dtype}")
+    out = []
+    for item in raw.tolist():
+        if isinstance(item, (bytes, np.bytes_)):
+            try:
+                item = bytes(item).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"{where}: charge-zeta receipt is not UTF-8") from exc
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                f"{where}: charge-zeta receipt fields must be nonempty strings")
+        out.append(item)
+    return {"scheme": out[0], "digest": out[1]}
 
 
 def _logical_storage_shape(shape, logical_axes, logical_extent, *, where):
@@ -456,6 +496,7 @@ def write_restart_state_to_h5(
     qirr=None,
     coulomb_policy=None,
     qp_state_source_record: dict | None = None,
+    charge_zeta_identity: dict | None = None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -519,6 +560,13 @@ def write_restart_state_to_h5(
     the opaque bytes through the incumbent SlabIO metadata path on ``mode=w``.
     """
     from .slab_io import SlabIO
+
+    encoded_charge_zeta_identity = _encode_charge_zeta_identity(
+        charge_zeta_identity)
+    if encoded_charge_zeta_identity is not None and mode != "w":
+        raise ValueError(
+            "charge_zeta_identity is immutable restart provenance and may "
+            "only be stamped by the mode='w' transaction")
 
     # ---- THE ONE RESOLUTION, APPLIED ONCE, BEFORE ANY WRITE -----------
     # Both the tensor and the placeholder are decided here, together, from
@@ -631,6 +679,10 @@ def write_restart_state_to_h5(
                     QP_STATE_SOURCE_DATASET,
                     encode_qp_state_source_provenance(
                         qp_state_source_record))
+            if encoded_charge_zeta_identity is not None:
+                io.write_attr(
+                    CHARGE_ZETA_IDENTITY_DATASET,
+                    encoded_charge_zeta_identity)
         # kgrid attr lets BSE recover the (nkx,nky,nkz) split from
         # flat-q V_qmunu / W0_qmunu without re-opening the WFN.  Stored
         # as a length-3 int64 dataset (the SlabIO ``write_attr`` path
@@ -1447,6 +1499,11 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
         G0_mu_nu = (np.asarray(f["G0_mu_nu"][:]) if "G0_mu_nu" in f else None)
         stored_T = (int(np.asarray(f["n_rmu_transverse_logical"])[()])
                     if "n_rmu_transverse_logical" in f else None)
+        charge_zeta_identity = (
+            _decode_charge_zeta_identity(
+                f[CHARGE_ZETA_IDENTITY_DATASET][()],
+                where=f"Restart file {filename}")
+            if CHARGE_ZETA_IDENTITY_DATASET in f else None)
 
     n_rmu_disk = int(shapes["V_qmunu"][-1])
     n_rmu_pad = padded_mu_extent(n_rmu_disk, divisor)
@@ -1479,14 +1536,25 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
         if name not in shapes:
             return None
         off, shape, spec = _munu_slab_request(shapes[name], n_rmu_pad)
-        arr = io.read_slab(name, shape=shape, dtype=dtypes[name],
-                           offset=off, mesh=mesh_xy, partition_spec=spec)
-        arr = _collapse_leading(arr, shapes[name], mesh_xy)
+        with timing.section(
+                f"gw_jax.restart.read.{name}", announce=True,
+                label=f"restart SlabIO read {name}"):
+            arr = io.read_slab(name, shape=shape, dtype=dtypes[name],
+                               offset=off, mesh=mesh_xy,
+                               partition_spec=spec)
+            jax.block_until_ready(arr)
+        with timing.section(
+                f"gw_jax.restart.wedge_transform.{name}", announce=True,
+                label=f"restart wedge transform {name}"):
+            arr = _collapse_leading(arr, shapes[name], mesh_xy)
         # THE UNFOLD, AFTER THE READ AND BEFORE THE CALLER SEES IT.  The
         # request above derives its q extent from the dataset shape, so a
         # wedge simply arrives as (n_q_ibz, mu_pad, nu_pad) on the same spec
         # the unfold takes and returns.  A no-op on every non-wedge file.
-        return _unfold_wedge(arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
+            arr = _unfold_wedge(
+                arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
+            jax.block_until_ready(arr)
+        return arr
 
     def _read_psi(io, name, n_mu_logical, *, spec, mu_axis=-1,
                   spinor_axis=2, band_axis=1):
@@ -1517,9 +1585,14 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                     f"{int(n_band_carrier)} slots. The band identity preflight "
                     "should have refused this mismatch before tensor I/O.")
             shape[b_axis] = int(n_band_carrier)
-        return io.read_slab(
-            name, shape=tuple(shape), dtype=dtypes[name],
-            mesh=mesh_xy, partition_spec=spec)
+        with timing.section(
+                f"gw_jax.restart.read.{name}", announce=True,
+                label=f"restart SlabIO read {name}"):
+            arr = io.read_slab(
+                name, shape=tuple(shape), dtype=dtypes[name],
+                mesh=mesh_xy, partition_spec=spec)
+            jax.block_until_ready(arr)
+        return arr
 
     n_rmu_T_disk = (int(shapes["psi_full_y_transverse"][-1])
                     if "psi_full_y_transverse" in shapes else None)
@@ -1613,7 +1686,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
     del nspinor  # gated above; the extent itself rides on the arrays
     return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
             psi_full_y_transverse, n_rmu_T_disk, psi_nmu, psi_mun,
-            psi_nmu_T, psi_mun_T)
+            psi_nmu_T, psi_mun_T, charge_zeta_identity)
 
 
 def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
@@ -1709,7 +1782,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     # the read (SlabIO returns the tile), so none of it survives here.
     (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
      psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
-     psi_nmu_T, psi_mun_T) = read_restart_state_from_h5(
+     psi_nmu_T, psi_mun_T, charge_zeta_identity) = read_restart_state_from_h5(
         filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
         n_band_carrier=(
             int(band_slices.b4) - int(band_slices.b0)
@@ -1728,6 +1801,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
             psi_rmu_Y_transverse=None, psi_rmuT_X_transverse=None,
             psi_nmu_transverse=psi_nmu_T, psi_mun_transverse=psi_mun_T,
             n_rmu_transverse_disk=n_rmu_T_disk,
+            charge_zeta_identity=charge_zeta_identity,
         )
 
     x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
@@ -1735,16 +1809,24 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     # psi_rmuT_X: conj + transpose(nb↔μ) then y→x reshard on μ.  This is
     # the ONLY reshard on the legacy restart path, and it is deliberate:
     # the two ψ copies are what the pair-density contraction needs.
-    psi_rmuT_X = jax.lax.with_sharding_constraint(
-        jnp.conj(psi_rmu_Y).transpose(0, 3, 1, 2), x1_psi_X)
+    with timing.section(
+            "gw_jax.restart.final_reshard.charge", announce=True,
+            label="restart final charge-wavefunction reshard"):
+        psi_rmuT_X = jax.lax.with_sharding_constraint(
+            jnp.conj(psi_rmu_Y).transpose(0, 3, 1, 2), x1_psi_X)
+        jax.block_until_ready(psi_rmuT_X)
 
     # Bispinor transverse ψ: same two-copy derivation as the charge ψ, at
     # the TRANSVERSE μ extent (its own centroid count, its own pad, both
     # already applied by the reader).
     psi_rmuT_X_T = None
     if psi_rmu_Y_T is not None:
-        psi_rmuT_X_T = jax.lax.with_sharding_constraint(
-            jnp.conj(psi_rmu_Y_T).transpose(0, 3, 1, 2), x1_psi_X)
+        with timing.section(
+                "gw_jax.restart.final_reshard.transverse", announce=True,
+                label="restart final transverse-wavefunction reshard"):
+            psi_rmuT_X_T = jax.lax.with_sharding_constraint(
+                jnp.conj(psi_rmu_Y_T).transpose(0, 3, 1, 2), x1_psi_X)
+            jax.block_until_ready(psi_rmuT_X_T)
 
     return SimpleNamespace(
         V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
@@ -1755,4 +1837,5 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         psi_rmuT_X_transverse=psi_rmuT_X_T,
         psi_nmu_transverse=None, psi_mun_transverse=None,
         n_rmu_transverse_disk=n_rmu_T_disk,
+        charge_zeta_identity=charge_zeta_identity,
     )

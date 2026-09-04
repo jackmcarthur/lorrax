@@ -226,6 +226,91 @@ def test_partial_sample_store_is_not_misreported_as_resumable(tmpdir_path):
     ) == ()
 
 
+def _sample_resume_components(path, *, provenance=None):
+    tables, verdict, n_mu = _geometry()
+    omega = np.asarray([0.0 + 0.1j, 0.5 + 0.1j], np.complex128)
+    line = np.zeros(2, np.int32)
+    sampling_record = dict(_SAMPLING, n_p=1)
+    common = dict(
+        n_omega=2, n_q_on_disk=_N_Q_IBZ, n_mu=n_mu,
+        n_rmu_logical=n_mu, tables=tables, omega=omega,
+        omega_line=line, sampling=sampling_record,
+        closure_verdict=verdict, provenance=provenance or {"deck": "resume"},
+        energy_unit="Ha")
+    return [dict(common, name="chi"), dict(common, name="Wc")]
+
+
+def _serial_allocate_component(path, name, spec, *, mode="a"):
+    serial = dict(spec)
+    serial.pop("n_rmu_logical", None)
+    MS.allocate_w_omega(path, name, mode=mode, **serial)
+
+
+def test_partial_sample_resume_preserves_independent_chi_wc_ledgers(
+        tmpdir_path, monkeypatch):
+    components = _sample_resume_components(tmpdir_path)
+    for index, component in enumerate(components):
+        spec = dict(component)
+        name = spec.pop("name")
+        _serial_allocate_component(
+            tmpdir_path, name, spec, mode="w" if index == 0 else "a")
+    n_mu = components[0]["n_mu"]
+    slab = np.ones((_N_Q_IBZ, n_mu, n_mu), np.complex128)
+    MS.write_w_slab(tmpdir_path, "chi", 0, slab)
+    MS.write_w_slab(tmpdir_path, "chi", 1, slab * 2)
+    MS.write_w_slab(tmpdir_path, "Wc", 0, slab * 3)
+    monkeypatch.setattr(
+        MS, "allocate_w_omega_collective",
+        lambda *_a, **_k: pytest.fail("compatible surviving dataset replaced"))
+
+    headers = MS.prepare_w_sample_store_collective(
+        tmpdir_path, components, mesh_xy=object())
+
+    np.testing.assert_array_equal(headers["chi"]["data_ready"], [True, True])
+    np.testing.assert_array_equal(headers["Wc"]["data_ready"], [True, False])
+
+
+def test_partial_sample_appends_only_missing_component_after_validation(
+        tmpdir_path, monkeypatch):
+    components = _sample_resume_components(tmpdir_path)
+    first = dict(components[0])
+    name = first.pop("name")
+    _serial_allocate_component(tmpdir_path, name, first, mode="w")
+    n_mu = first["n_mu"]
+    MS.write_w_slab(
+        tmpdir_path, "chi", 0,
+        np.ones((_N_Q_IBZ, n_mu, n_mu), np.complex128))
+    allocations = []
+
+    def allocate(path, name, *, mesh_xy, mode, **spec):
+        del mesh_xy
+        allocations.append((name, mode))
+        _serial_allocate_component(path, name, spec, mode=mode)
+
+    monkeypatch.setattr(MS, "allocate_w_omega_collective", allocate)
+    headers = MS.prepare_w_sample_store_collective(
+        tmpdir_path, components, mesh_xy=object())
+    assert allocations == [("Wc", "a")]
+    np.testing.assert_array_equal(headers["chi"]["data_ready"], [True, False])
+    np.testing.assert_array_equal(headers["Wc"]["data_ready"], [False, False])
+
+
+def test_partial_sample_incompatible_provenance_refuses_without_mutation(
+        tmpdir_path, monkeypatch):
+    components = _sample_resume_components(tmpdir_path)
+    first = dict(components[0])
+    name = first.pop("name")
+    _serial_allocate_component(tmpdir_path, name, first, mode="w")
+    incompatible = _sample_resume_components(
+        tmpdir_path, provenance={"deck": "changed"})
+    monkeypatch.setattr(
+        MS, "allocate_w_omega_collective",
+        lambda *_a, **_k: pytest.fail("incompatible file was mutated"))
+    with pytest.raises(ValueError, match="mpa_partial_sample_compatible"):
+        MS.prepare_w_sample_store_collective(
+            tmpdir_path, incompatible, mesh_xy=object())
+
+
 def _write_certified_fit(path):
     MS.allocate_fit_store(
         path, n_q=1, n_mu=2, n_p=1, energy_unit="Ry", mode="w")
@@ -241,6 +326,121 @@ def _write_certified_fit(path):
         "condition_max_allowed": 10.0,
         "backward_error_max_allowed": 1.0e-8,
     })
+
+
+def _partial_fit_for_resume(path):
+    provenance = {
+        "screening_diagrams": "w_rpa",
+        "wfn_fingerprint_scheme": "wfn-v1",
+        "wfn_fingerprint": "wfn-a",
+        "charge_zeta_identity_scheme": "zeta-v1",
+        "charge_zeta_identity": "zeta-a",
+        "solve_mode": "loewner", "solve_rcond": 1.0e-13,
+        "eig_mode": "jax_qr", "fit_fused": True,
+    }
+    MS.allocate_fit_store(
+        path, n_q=1, n_mu=4, n_p=1, energy_unit="Ry", mode="w",
+        grid_hash="grid", table_hash="table", centroid_hash="centroids",
+        provenance=provenance)
+    poles = np.full((1, 4, 2), 1.0 - 0.1j, np.complex128)
+    residues = np.ones_like(poles)
+    diagnostics = {
+        "condition": np.full((4, 2), 2.0),
+        "backward_error": np.full((4, 2), 1.0e-12),
+    }
+    MS.write_fit_block(path, 0, [0, 1], poles, residues, diagnostics)
+    return provenance, ((0, 0, 2), (0, 2, 4))
+
+
+def _validate_partial_fit(path, provenance, schedule):
+    return MS.validate_fit_store_for_resume(
+        path, n_q=1, n_mu=4, n_p=1, energy_unit="Ry",
+        grid_hash="grid", table_hash="table", centroid_hash="centroids",
+        provenance=provenance, ordered_residues=False, schedule=schedule)
+
+
+def test_partial_fit_resume_authenticates_exact_journal_union(tmpdir_path):
+    provenance, schedule = _partial_fit_for_resume(tmpdir_path)
+    ledger = _validate_partial_fit(tmpdir_path, provenance, schedule)
+    np.testing.assert_array_equal(
+        ledger["blocks_done"], [[True, True, False, False]])
+    np.testing.assert_array_equal(ledger["journal"], [[0, 0, 2]])
+
+
+@pytest.mark.parametrize("poison", ["duplicate", "outside", "bitmap", "diag"])
+def test_partial_fit_resume_refuses_poisoned_journal_state(
+        tmpdir_path, poison):
+    provenance, schedule = _partial_fit_for_resume(tmpdir_path)
+    with h5py.File(tmpdir_path, "a") as h5:
+        ledger = h5[MS.MPA_FIT_SUFFIX]
+        if poison in ("duplicate", "outside"):
+            row = np.asarray([[0, 0, 2] if poison == "duplicate"
+                              else [0, 1, 3]], np.int64)
+            for name, value in (
+                    ("block_journal", row),
+                    ("block_condition_max", np.asarray([2.0])),
+                    ("block_backward_error_max", np.asarray([1.0e-12]))):
+                ds = ledger[name]
+                old = int(ds.shape[0])
+                ds.resize(old + 1, axis=0)
+                ds[old:] = value
+        elif poison == "bitmap":
+            ledger["blocks_done"][0, 3] = True
+        else:
+            ledger["block_condition_max"][0] = np.nan
+    match = {
+        "duplicate": "repeats scheduled range",
+        "outside": "outside the current column schedule",
+        "bitmap": "does not exactly equal the union",
+        "diag": "contain non-finite",
+    }[poison]
+    with pytest.raises(ValueError, match=match):
+        _validate_partial_fit(tmpdir_path, provenance, schedule)
+
+
+@pytest.mark.parametrize("poison", ["short", "dtype"])
+def test_partial_fit_resume_refuses_wrong_pole_payload_metadata(
+        tmpdir_path, poison):
+    provenance, schedule = _partial_fit_for_resume(tmpdir_path)
+    with h5py.File(tmpdir_path, "a") as h5:
+        del h5["Omega_p"]
+        if poison == "short":
+            h5.create_dataset(
+                "Omega_p", shape=(1, 1, 4, 3), dtype=np.complex128)
+        else:
+            h5.create_dataset(
+                "Omega_p", shape=(1, 1, 4, 4), dtype=np.complex64)
+    match = "expected exact logical shape" if poison == "short" else "complex128"
+    with pytest.raises(ValueError, match=match):
+        _validate_partial_fit(tmpdir_path, provenance, schedule)
+
+
+def test_final_complete_is_last_after_ready_head(tmpdir_path):
+    provenance, schedule = _partial_fit_for_resume(tmpdir_path)
+    poles = np.full((1, 4, 2), 1.2 - 0.1j, np.complex128)
+    residues = np.ones_like(poles)
+    diagnostics = {
+        "condition": np.full((4, 2), 2.0),
+        "backward_error": np.full((4, 2), 1.0e-12),
+    }
+    MS.write_fit_block(
+        tmpdir_path, 0, [2, 3], poles, residues, diagnostics)
+    _validate_partial_fit(tmpdir_path, provenance, schedule)
+    with pytest.raises(ValueError, match="no scalar head"):
+        MS.finalize_fit_store(
+            tmpdir_path, certification=_CERT, require_head=True)
+    with h5py.File(tmpdir_path, "a") as h5:
+        head = h5.create_group(MS.MPA_HEAD_SUFFIX)
+        head.attrs["ready"] = False
+        head.attrs["mpa_grid_hash"] = "grid"
+    with pytest.raises(ValueError, match="head is not ready"):
+        MS.finalize_fit_store(
+            tmpdir_path, certification=_CERT, require_head=True)
+    with h5py.File(tmpdir_path, "a") as h5:
+        h5[MS.MPA_HEAD_SUFFIX].attrs["ready"] = True
+    ledger = MS.finalize_fit_store(
+        tmpdir_path, certification=_CERT, require_head=True)
+    assert ledger["complete"]
 
 
 def test_certified_fit_store_refuses_destructive_replacement(tmpdir_path):
@@ -472,15 +672,27 @@ def test_the_collective_w_writers_answer_the_same_on_every_rank(
     W = jax.device_put(_w_omega(1, _N_Q_IBZ, n_mu)[0],
                        NamedSharding(mesh, P(None, "x", "y")))
     for rank in (0, 1):
-        monkeypatch.setattr(collectives, "process_rank", lambda r=rank: r)
+        # A single-process host shim cannot emulate rank 0's metadata write
+        # concurrently with rank 1.  Seed each independent file through the
+        # rank-0 half, then exercise the requested rank's uniform return.
+        path = tmpdir_path + f".rank{rank}"
+        monkeypatch.setattr(collectives, "process_rank", lambda: 0)
         assert MS.allocate_w_omega_collective(
-            tmpdir_path, "W", mesh_xy=mesh, n_omega=1, mode="w",
+            path, "W", mesh_xy=mesh, n_omega=1, mode="w",
             n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
             omega=np.asarray([0.2 + 0.1j]),
             sampling=dict(_SAMPLING, n_p=1),
-            closure_verdict=verdict) is None, f"rank {rank}"
+            closure_verdict=verdict) is None
+        monkeypatch.setattr(collectives, "process_rank", lambda r=rank: r)
+        if rank:
+            assert MS.allocate_w_omega_collective(
+                path, "W", mesh_xy=mesh, n_omega=1, mode="a",
+                n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
+                omega=np.asarray([0.2 + 0.1j]),
+                sampling=dict(_SAMPLING, n_p=1),
+                closure_verdict=verdict) is None, f"rank {rank}"
         assert MS.write_w_slab_collective(
-            tmpdir_path, "W", 0, W, mesh_xy=mesh,
+            path, "W", 0, W, mesh_xy=mesh,
             global_shape=shape) is None, f"rank {rank}"
 
 
@@ -1324,6 +1536,94 @@ def test_collective_head_writer_closes_all_ledger_readers_before_rank0_write():
     handoff = source.index('barrier("mpa_head_ledger_readers_closed")')
     writer = source.index("if process_rank() == 0:")
     assert ledger < handoff < writer
+
+
+def test_resume_paths_transfer_serial_readers_before_collective_writers():
+    sample = inspect.getsource(MS.prepare_w_sample_store_collective)
+    validate = sample.index("_validate_w_component_for_resume")
+    pre_allocate = sample.index('barrier("mpa_sample_resume_readers_closed")')
+    allocate = sample.index("allocate_w_omega_collective", pre_allocate)
+    final_headers = sample.index("headers =", allocate)
+    pre_return = sample.index(
+        'barrier("mpa_sample_headers_readers_closed")')
+    assert validate < pre_allocate < allocate < final_headers < pre_return
+
+    slab = inspect.getsource(MS.write_w_slab_collective)
+    header = slab.index("header = read_w_header")
+    handoff = slab.index('barrier("mpa_w_slab_header_readers_closed")')
+    writer = slab.index("with SlabIO", handoff)
+    assert header < handoff < writer
+
+    fit_writer = inspect.getsource(MS.FitWriter.__init__)
+    ledger = fit_writer.index("self.ledger = fit_completion_ledger")
+    handoff = fit_writer.index(
+        'barrier("mpa_fit_writer_ledger_readers_closed")')
+    writer = fit_writer.index("SlabIO(", handoff)
+    assert ledger < handoff < writer
+
+
+def test_ready_head_before_root_complete_is_idempotently_resumed(
+        tmpdir_path, monkeypatch):
+    """A crash after head readiness must not rewrite committed head bytes."""
+    import common.collectives as collectives
+    import file_io.slab_io as slab_io
+
+    _staged_fit(
+        tmpdir_path, n_q=1, n_mu=2, n_p=1, n_cols=2,
+        energy_unit="Ry")
+    opens = []
+
+    class HeadHostSlabIO:
+        def __init__(self, path, *, mode, mesh):
+            opens.append((mode, mesh))
+            self.file = h5py.File(path, mode)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self.file.close()
+
+        def write_attr(self, name, value):
+            self.file.create_dataset(name, data=np.asarray(value))
+
+    monkeypatch.setattr(slab_io, "SlabIO", HeadHostSlabIO)
+    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+    z = np.asarray([0.1j, 0.8 + 0.1j], np.complex128)
+    wc = np.asarray([-2.0, -0.5 + 0.2j], np.complex128)
+    poles = np.asarray([0.7 - 0.1j], np.complex128)
+    residues = np.asarray([0.3 + 0.05j], np.complex128)
+    kwargs = dict(
+        mesh_xy=None,
+        energy_unit="Ry",
+        fit_condition=3.0,
+        fit_backward_error=1.0e-12,
+        fit_max_abs_residual=2.0e-9,
+        grid_hash="sha256:deadbeef",
+        fit_provenance={"solve_mode": "loewner", "n_valid": 1},
+        model="dft_direct_loewner",
+    )
+
+    MS.write_head_fit_collective(
+        tmpdir_path, z, wc, poles, residues, **kwargs)
+    assert len(opens) == 1
+    with h5py.File(tmpdir_path, "r") as h5:
+        assert bool(h5[MS.MPA_HEAD_SUFFIX].attrs["ready"])
+        assert not bool(h5.attrs["mpa_fit_complete"])
+
+    # This is the exact crash boundary: head is committed, root COMPLETE is
+    # absent.  Restart authenticates and skips it, so SlabIO is not reopened.
+    MS.write_head_fit_collective(
+        tmpdir_path, z, wc, poles, residues, **kwargs)
+    assert len(opens) == 1
+    with pytest.raises(ValueError, match="mpa_ready_head_identity"):
+        MS.write_head_fit_collective(
+            tmpdir_path, z, wc + 1.0, poles, residues, **kwargs)
+
+    ledger = MS.finalize_fit_store(
+        tmpdir_path, certification=_CERT, require_head=True)
+    assert ledger["complete"]
 
 
 def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(

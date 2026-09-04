@@ -1086,7 +1086,8 @@ def make_ladder_wc_source(
     """The ``wc_source`` seam MPA's ``build_mpa_fit`` calls instead of its Dyson.
 
     Returns a callable with ``mpa.model._solve_wc``'s signature
-    ``(sample_path, V, z, q_idx, meta, mesh_xy, dyson_solver=None)``.  Same
+    ``(sample_path, V, z, q_idx, meta, mesh_xy, dyson_solver=None, *,
+    wc_ready=None)``.  Same
     per-z, per-wedge-q ``Wc(z)`` slabs written into the same SlabIO sample
     store; the fit, the store lifecycle and the pole consumer are
     untouched.  What changes is only where the slab came from.
@@ -1105,8 +1106,14 @@ def make_ladder_wc_source(
     state = {"prepared": False}
 
     def _wc_from_ladder(sample_path, V, z, q_idx, meta_, mesh_,
-                        dyson_solver=None):
+                        dyson_solver=None, *, wc_ready=None):
         z_all = np.asarray(z, dtype=np.complex128)
+        wc_ready = (
+            np.zeros(z_all.size, dtype=bool) if wc_ready is None else
+            np.asarray(wc_ready, dtype=bool))
+        if wc_ready.shape != (z_all.size,):
+            raise ValueError(
+                "ladder MPA wc_ready must have one bit per frequency")
         if not state["prepared"]:
             prepare_ladder_restart(
                 wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
@@ -1127,6 +1134,8 @@ def make_ladder_wc_source(
         shape = (z_all.size, q_idx.size, meta_.n_rmu, meta_.n_rmu)
         mu_target = int(V.shape[-1])
         for index in range(z_all.size):
+            if wc_ready[index]:
+                continue
             Wc = _assert_mu_width(
                 wedge.wc[index], mu_target,
                 where=f"MPA Wc slab z[{index}]")

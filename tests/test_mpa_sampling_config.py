@@ -112,18 +112,10 @@ def test_completed_artifact_overwrite_is_an_explicit_false_by_default(tmp_path):
     assert enabled.mpa.overwrite_completed_artifacts is True
 
 
-@pytest.mark.parametrize(
-    "trs_allowed,expected_names",
-    [
-        (True, ("chi_qmunu_z", "Wc_qmunu_z")),
-        (False, (
-            "chi_qmunu_z", "Wc_qmunu_z",
-            "chi_qmunu_minus_conj_z", "Wc_qmunu_minus_z")),
-    ],
-)
-def test_build_checks_both_managed_artifacts_before_allocation(
-        tmp_path, monkeypatch, trs_allowed, expected_names):
-    """The format guard runs before the first inode-owning writer."""
+@pytest.mark.parametrize("trs_allowed", [True, False])
+def test_build_refuses_finalized_fit_before_sample_allocation(
+        tmp_path, monkeypatch, trs_allowed):
+    """The write-once fit guard runs before the resumable sample writer."""
     import common.collectives as collectives
 
     config = _config(tmp_path / "deck")
@@ -148,14 +140,14 @@ def test_build_checks_both_managed_artifacts_before_allocation(
     class Protected(RuntimeError):
         pass
 
-    def guard(samples, fit, *, sample_names, overwrite_completed):
-        calls.append((samples, fit, tuple(sample_names), overwrite_completed))
+    def guard(fit, *, overwrite_completed):
+        calls.append((fit, overwrite_completed))
         raise Protected("stop before allocation")
 
     monkeypatch.setattr(
-        model.mpa_store, "refuse_completed_artifact_replacement", guard)
+        model.mpa_store, "refuse_finalized_fit_replacement", guard)
     monkeypatch.setattr(
-        model.mpa_store, "allocate_w_omega_collective",
+        model.mpa_store, "prepare_w_sample_store_collective",
         lambda *args, **kwargs: pytest.fail("sample inode touched before guard"))
 
     with pytest.raises(Protected, match="stop before allocation"):
@@ -166,12 +158,7 @@ def test_build_checks_both_managed_artifacts_before_allocation(
             centroid_indices=None, head_resolver=None, config=config,
             meta=None, mesh_xy=None, material_class="insulator")
 
-    assert calls == [(
-        sample_path,
-        fit_path,
-        expected_names,
-        False,
-    )]
+    assert calls == [(fit_path, False)]
 
 
 @pytest.mark.parametrize(

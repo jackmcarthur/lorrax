@@ -1,5 +1,7 @@
 """Hostile provenance and finalized-payload gates for MPA artifacts."""
 
+import json
+
 from types import SimpleNamespace
 
 import h5py
@@ -60,12 +62,12 @@ def test_sample_writer_stamps_the_canonical_wfn_owner(
     class ReachedSampleAllocation(RuntimeError):
         pass
 
-    def allocate(*args, **kwargs):
-        captured.update(kwargs)
+    def prepare(_path, components, **kwargs):
+        captured.update(components[0])
         raise ReachedSampleAllocation
 
     monkeypatch.setattr(
-        model.mpa_store, "allocate_w_omega_collective", allocate)
+        model.mpa_store, "prepare_w_sample_store_collective", prepare)
     config = SimpleNamespace(
         mpa=SimpleNamespace(
             n_poles=1, sampling_alpha=1, sampling_schedule="nested",
@@ -79,12 +81,15 @@ def test_sample_writer_stamps_the_canonical_wfn_owner(
             sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
             head_resolver=None, config=config,
             meta=SimpleNamespace(n_rmu=2), mesh_xy=None, plan=object(),
-            material_class="insulator")
+            material_class="insulator",
+            charge_zeta_identity={"scheme": "zeta-v1", "digest": "zeta-a"})
 
     assert captured["provenance"] == {
         "screening_diagrams": "w_rpa",
         "wfn_fingerprint_scheme": _SCHEME,
         "wfn_fingerprint": "current-wfn",
+        "charge_zeta_identity_scheme": "zeta-v1",
+        "charge_zeta_identity": "zeta-a",
     }
 
 
@@ -92,20 +97,22 @@ def test_fit_identity_is_copied_from_samples_not_injected_by_caller():
     identity = {
         "wfn_fingerprint_scheme": _SCHEME,
         "wfn_fingerprint": "sample-wfn",
+        "charge_zeta_identity_scheme": "zeta-v1",
+        "charge_zeta_identity": "zeta-a",
     }
     header = {"provenance": identity}
-    got = fit_driver._bind_sample_wfn_identity(
+    got = fit_driver._bind_sample_artifact_identities(
         header, None, {"screening_diagrams": "w_rpa"})
     assert {key: got[key] for key in identity} == identity
 
     with pytest.raises(ValueError, match="cannot inject"):
-        fit_driver._bind_sample_wfn_identity(
+        fit_driver._bind_sample_artifact_identities(
             {"provenance": {}}, None, identity)
     with pytest.raises(ValueError, match="partial"):
-        fit_driver._bind_sample_wfn_identity(
+        fit_driver._bind_sample_artifact_identities(
             {"provenance": {"wfn_fingerprint": "orphan"}}, None, {})
     with pytest.raises(ValueError, match="different WFN identities"):
-        fit_driver._bind_sample_wfn_identity(
+        fit_driver._bind_sample_artifact_identities(
             header,
             {"provenance": dict(identity, wfn_fingerprint="other")}, {})
 
@@ -125,6 +132,36 @@ def test_canonical_wfn_identity_uses_binding_and_refuses_wrong_object():
     assert identity["wfn_fingerprint_scheme"] == _SCHEME
     with pytest.raises(ValueError, match="different loaded WFN object"):
         model._canonical_wfn_identity(other, binding)
+
+
+def test_charge_zeta_identity_ignores_only_wfn_locator_fields(monkeypatch):
+    from gw import gw_init
+
+    source = object()
+    monkeypatch.setattr(
+        "common.parallel_transport.wfn_fingerprint",
+        lambda candidate: "same-wfn" if candidate is source else "other")
+    base = {
+        "schema": gw_init._ZETA_PROVENANCE_SCHEMA,
+        "wfn_file": "/stage/a/WFN.h5", "wfn_bytes": 111,
+        "n_rmu": 2070, "zeta_cutoff_ry": 8.0,
+    }
+    moved = dict(base, wfn_file="/stage/b/copied-WFN.h5", wfn_bytes=999)
+    changed = dict(base, zeta_cutoff_ry=8.5)
+    first = gw_init.charge_zeta_identity(json.dumps(base), wfn=source)
+    second = gw_init.charge_zeta_identity(
+        json.dumps(moved), wfn=source)
+    third = gw_init.charge_zeta_identity(
+        json.dumps(changed), wfn=source)
+    assert first == second
+    assert first["digest"] != third["digest"]
+
+
+def test_mpa_refuses_legacy_restart_without_charge_zeta_receipt():
+    with pytest.raises(ValueError, match="restart = false"):
+        model._canonical_charge_zeta_identity(None)
+    with pytest.raises(ValueError, match="exactly scheme and digest"):
+        model._canonical_charge_zeta_identity({"scheme": "only"})
 
 
 def test_explicit_identity_refuses_missing_and_wrong_wfn(tmp_path):
@@ -208,9 +245,12 @@ def test_screening_hands_current_wfn_to_explicit_reuse(monkeypatch):
         config=config, meta=None, mesh_xy=None, run_dir="unused",
         label="oneshot", wfn=source_wfn, mpa_plan=object(),
         wfn_fingerprint_binding="bound-current-wfn",
+        charge_zeta_identity={"scheme": "zeta-v1", "digest": "zeta-a"},
         occupation_state=None, material_class="insulator",
         print_fn=lambda *args, **kwargs: None)
 
     assert result == {"mpa_fit": "certified-fit.h5", "mpa_fit_reused": True}
     assert captured["wfn"] is source_wfn
     assert captured["wfn_fingerprint_binding"] == "bound-current-wfn"
+    assert captured["charge_zeta_identity"] == {
+        "scheme": "zeta-v1", "digest": "zeta-a"}

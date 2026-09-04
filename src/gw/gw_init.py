@@ -7,6 +7,8 @@ Chunk sizing (band_chunk / r_chunk / q_chunk / gflat_chunk_size) is owned
 entirely by :func:`gw.gflat_memory_model.plan_gflat_chunks` — the single
 production planner (persistent floor + max over five stage transients).
 """
+import hashlib
+import json
 import os
 import threading
 from dataclasses import dataclass, replace
@@ -171,6 +173,55 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 #: Bump when the provenance schema changes meaning (forces a refit of
 #: every ζ stamped by an older LORRAX, rather than a false match).
 _ZETA_PROVENANCE_SCHEMA = 2
+
+# A restart/MPA receipt is deliberately not the raw zeta provenance JSON.
+# That JSON owns two launch-local locator fields; the canonical WFN content
+# fingerprint supersedes both when the fit crosses an artifact boundary.
+CHARGE_ZETA_IDENTITY_SCHEME = (
+	"charge-zeta-v1:canonical-provenance+bound-wfn")
+_ZETA_PROVENANCE_LOCATOR_FIELDS = frozenset(("wfn_file", "wfn_bytes"))
+
+
+def charge_zeta_identity(provenance_json, *, wfn,
+		wfn_fingerprint_binding=None):
+	"""Return the path-independent identity of one charge-zeta fit.
+
+	The zeta provenance owner decides which fields are mere locators.  MPA and
+	restart I/O receive only this opaque two-string receipt and therefore never
+	maintain a second table of zeta semantics.  Every non-locator field remains
+	in the digest, while the source WFN is represented by the incumbent
+	``common.parallel_transport`` content identity.
+	"""
+	try:
+		semantic = json.loads(str(provenance_json))
+	except (TypeError, ValueError) as exc:
+		raise ValueError(
+			"charge_zeta_identity requires canonical zeta provenance JSON") from exc
+	if not isinstance(semantic, dict):
+		raise ValueError("charge_zeta_identity provenance must decode to an object")
+	if int(semantic.get("schema", -1)) != _ZETA_PROVENANCE_SCHEMA:
+		raise ValueError(
+			"charge_zeta_identity requires current zeta provenance schema "
+			f"{_ZETA_PROVENANCE_SCHEMA}; got {semantic.get('schema')!r}")
+	for key in _ZETA_PROVENANCE_LOCATOR_FIELDS:
+		semantic.pop(key, None)
+	from common.parallel_transport import (
+		WFN_FINGERPRINT_SCHEME, fingerprint_from_binding, wfn_fingerprint)
+	wfn_digest = (
+		wfn_fingerprint(wfn) if wfn_fingerprint_binding is None else
+		fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+	semantic["wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
+	semantic["wfn_fingerprint"] = wfn_digest
+	canonical = json.dumps(
+		semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+	digest = hashlib.sha256()
+	digest.update(CHARGE_ZETA_IDENTITY_SCHEME.encode("ascii"))
+	digest.update(b"\0")
+	digest.update(canonical.encode("utf-8"))
+	return {
+		"scheme": CHARGE_ZETA_IDENTITY_SCHEME,
+		"digest": digest.hexdigest(),
+	}
 
 
 def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
@@ -3156,6 +3207,7 @@ def prepare_isdf_and_wavefunctions(
 	charge_basis_receipt = None
 	transverse_basis_receipt = None
 	basis_wfn_fingerprint_binding = None
+	charge_zeta_identity_receipt = None
 	photon_g0_vectors = None
 	green_parent_carrier = None
 
@@ -3184,6 +3236,9 @@ def prepare_isdf_and_wavefunctions(
 			zeta_contract = _resolve_zeta_fit_contract(
 				wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
 				tmp_dir, print_fn=print0)
+			charge_zeta_identity_receipt = charge_zeta_identity(
+				zeta_contract.provenance, wfn=wfn,
+				wfn_fingerprint_binding=basis_wfn_fingerprint_binding)
 			charge_zeta_reused = bool(zeta_contract.reuse_charge)
 
 			# Plan chunks ONCE for a channel that will actually FIT.  The
@@ -3566,6 +3621,7 @@ def prepare_isdf_and_wavefunctions(
 						wfn,
 						wfn_fingerprint_binding=(
 							basis_wfn_fingerprint_binding))),
+					charge_zeta_identity=charge_zeta_identity_receipt,
 					# Stamp the band window + n_rmu so a later restart
 					# under a CHANGED window fails loudly instead of
 					# silently misindexing Sigma (job 7874375).
@@ -3723,11 +3779,14 @@ def prepare_isdf_and_wavefunctions(
 		# receipt: there is no fact tying the stored psi/E bytes to this WFN.
 		_restart_wfn_provenance_complete = (
 			_restart_source_record is not None)
-		with timing.section("gw_jax.restart_load"):
+		with timing.section(
+				"gw_jax.restart_load", announce=True,
+				label="restart load (metadata, SlabIO tensors, wedge, reshard)"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
 				n_rmu_logical=int(meta.n_rmu),
 				low_mem_bands=bool(cfg.memory.low_mem_bands))
+			charge_zeta_identity_receipt = rs.charge_zeta_identity
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
 			# COULOMB-KERNEL POLICY DISCLOSURE.  Loud on a mismatch, one
@@ -4019,6 +4078,7 @@ def prepare_isdf_and_wavefunctions(
 		# orchestration seam so later artifact gates cannot reopen/resample the
 		# same WFN.  Legacy restart bundles legitimately carry ``None``.
 		wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+		charge_zeta_identity=charge_zeta_identity_receipt,
 		# Host-only provenance stays in these orchestration bindings rather
 		# than entering Wavefunctions' JAX pytree.  QP rotation returns only a
 		# numerical carrier, so it cannot accidentally inherit a DFT binding.

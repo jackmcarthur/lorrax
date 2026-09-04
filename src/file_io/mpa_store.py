@@ -281,6 +281,14 @@ _OCC_STAMP_ORDER = (
 WFN_IDENTITY_PROVENANCE_KEYS = (
     "wfn_fingerprint_scheme", "wfn_fingerprint")
 
+# Opaque receipt owned by ``gw_init``.  This format transports it from the
+# charge-zeta/restart transaction through samples and fits; it does not know
+# which zeta provenance fields contribute to the digest.
+CHARGE_ZETA_IDENTITY_PROVENANCE_KEYS = (
+    "charge_zeta_identity_scheme", "charge_zeta_identity")
+MPA_IDENTITY_PROVENANCE_KEYS = (
+    *WFN_IDENTITY_PROVENANCE_KEYS, *CHARGE_ZETA_IDENTITY_PROVENANCE_KEYS)
+
 
 def _occ_stamp_values(occupation_state):
     """The five stamp values from a duck-typed occupation state."""
@@ -881,6 +889,152 @@ def allocate_w_omega_collective(
     barrier("mpa_w_omega_allocated")
 
 
+def _values_equal(left, right):
+    """Exact metadata equality across h5py/numpy scalar spellings."""
+    a, b = np.asarray(left), np.asarray(right)
+    if a.shape != b.shape:
+        return False
+    if a.dtype.kind in ("S", "U", "O") or b.dtype.kind in ("S", "U", "O"):
+        def text(value):
+            if isinstance(value, (bytes, np.bytes_)):
+                return bytes(value).decode("utf-8")
+            return str(value)
+        return [text(v) for v in a.reshape(-1).tolist()] == [
+            text(v) for v in b.reshape(-1).tolist()]
+    return bool(np.array_equal(a, b))
+
+
+def _validate_w_component_for_resume(src, name, spec):
+    """Validate one surviving sample component against its full contract."""
+    header = read_w_header(src, name)
+    shape, dtype = _w_storage_geometry(
+        spec["n_omega"], spec["n_q_on_disk"], spec["n_mu"],
+        spec.get("dtype"), spec["closure_verdict"],
+        where=f"resume W component {name!r}")
+    omega, line = _normalise_grid(
+        spec["omega"], spec.get("omega_line"), shape[0])
+    sampling, sampling_extra = _canonical_sampling(spec["sampling"])
+    logical_tables = spec["tables"].canonical()
+    if spec.get("n_rmu_logical") is not None:
+        logical_tables = logical_tables.logical(
+            int(spec["n_rmu_logical"])).canonical()
+    expected = {
+        "n_omega": shape[0],
+        "n_q_on_disk": shape[1],
+        "n_mu": shape[2],
+        "n_rmu_logical": int(
+            spec.get("n_rmu_logical") or shape[2]),
+        "n_q_full": int(logical_tables.n_q_full),
+        "omega_units": str(spec.get("energy_unit", "Ha")),
+        "grid_hash": omega_grid_digest(omega, line, sampling),
+        "table_hash": logical_tables.digest(),
+        "centroid_hash": str(spec["closure_verdict"].centroid_hash),
+        "dtype": np.dtype(dtype),
+    }
+    mismatch = []
+    for key, want in expected.items():
+        got = header.get(key)
+        if key == "dtype":
+            equal = np.dtype(got) == want
+        else:
+            equal = _values_equal(got, want)
+        if not equal:
+            mismatch.append(f"{key}: stored={got!r}, expected={want!r}")
+    for key, want in (("omega", omega), ("omega_line", line),
+                      ("sampling", sampling),
+                      ("sampling_extra", sampling_extra)):
+        got = header.get(key)
+        if isinstance(want, dict):
+            equal = (set(got or {}) == set(want) and all(
+                _values_equal((got or {})[field], want[field])
+                for field in want))
+        else:
+            equal = _values_equal(got, want)
+        if not equal:
+            mismatch.append(f"{key} differs")
+    automatic = {
+        "qirr_generator_commit", "qirr_written_utc", "qirr_writer",
+        "mpa_writer",
+    }
+    stored_provenance = {
+        key: value for key, value in header["provenance"].items()
+        if key not in automatic}
+    expected_provenance = dict(spec.get("provenance") or {})
+    if (set(stored_provenance) != set(expected_provenance)
+            or any(not _values_equal(stored_provenance[key], value)
+                   for key, value in expected_provenance.items()
+                   if key in stored_provenance)):
+        mismatch.append(
+            "provenance differs: stored keys="
+            f"{sorted(stored_provenance)}, expected keys="
+            f"{sorted(expected_provenance)}")
+    if mismatch:
+        raise ValueError(
+            f"MPA partial sample component {name!r} is incompatible:\n  "
+            + "\n  ".join(mismatch))
+    return header
+
+
+def prepare_w_sample_store_collective(
+        dest, components, *, mesh_xy, overwrite_incompatible=False):
+    """Open a compatible partial sample store or allocate missing components.
+
+    Every surviving component is authenticated before any writer opens the
+    inode.  Missing components are then appended through the canonical
+    collective allocator; no existing readiness ledger or payload is reset.
+    An incompatible partial store is a refusal unless the caller explicitly
+    selected the incumbent destructive-overwrite option.
+    """
+    specs = tuple(dict(component) for component in components)
+    names = tuple(str(spec.pop("name")) for spec in specs)
+    if not names or len(set(names)) != len(names):
+        raise ValueError(
+            "prepare_w_sample_store_collective requires unique component names")
+    path = os.path.abspath(os.fspath(dest))
+    present = set()
+    incompatible = None
+    if os.path.exists(path):
+        try:
+            with _h5(path, "r") as grp:
+                present = {name for name in names if name in grp}
+            for name, spec in zip(names, specs):
+                if name in present:
+                    _validate_w_component_for_resume(path, name, spec)
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            incompatible = exc
+    replace = incompatible is not None
+    if replace and not bool(overwrite_incompatible):
+        raise ValueError(
+            "GATE mpa_partial_sample_compatible: existing partial sample "
+            f"store {path} is incompatible and will not be repaired or "
+            "truncated. Set mpa_overwrite_completed_artifacts = true only "
+            "if destructive regeneration is intended. Cause: "
+            f"{type(incompatible).__name__}: {incompatible}") from incompatible
+
+    missing = list(names if replace or not os.path.exists(path) else
+                   (name for name in names if name not in present))
+    # Every rank performed serial-h5py validation above.  Transfer inode
+    # ownership only after the slowest reader has closed; otherwise a fast
+    # rank can enter SlabIO's collective writer while a peer still owns a
+    # read handle to the same file.
+    from common.collectives import barrier
+    barrier("mpa_sample_resume_readers_closed")
+    for index, name in enumerate(missing):
+        spec = specs[names.index(name)]
+        mode = "w" if index == 0 and (replace or not os.path.exists(path)) else "a"
+        allocate_w_omega_collective(
+            path, name, mesh_xy=mesh_xy, mode=mode, **spec)
+    headers = {
+        name: read_w_header(path, name)
+        for name in names
+    }
+    # The caller's next operation is normally a collective sample write.
+    # Close these final all-rank serial header readers before returning that
+    # decision to it, including the no-missing-components resume path.
+    barrier("mpa_sample_headers_readers_closed")
+    return headers
+
+
 def stamp_w_omega(
     dest,
     name,
@@ -1169,6 +1323,18 @@ def write_w_slab_collective(
         "write_w_slab_collective requires W on P(None,'x','y'); "
         "the producer must return the native SlabIO layout rather "
         "than resharding a bulk tensor at the writer seam")
+    header = read_w_header(dest, name)
+    if (header["n_omega"], header["n_q_on_disk"], header["n_mu"],
+            header["n_mu"]) != shape:
+        raise ValueError(
+            f"write_w_slab_collective destination {name!r} has logical "
+            f"shape {(header['n_omega'], header['n_q_on_disk'], header['n_mu'], header['n_mu'])}, "
+            f"but caller supplied {shape}")
+    if bool(header["data_ready"][i]):
+        raise ValueError(
+            f"write_w_slab_collective refuses to replace ready {name!r} "
+            f"frequency slab {i}; completed sample slabs are write-once")
+    barrier("mpa_w_slab_header_readers_closed")
     W4 = W_q_munu[None, ...]
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         io.write_slab(
@@ -1176,6 +1342,7 @@ def write_w_slab_collective(
             global_shape=shape)
     del W4
 
+    barrier("mpa_w_slab_payload_closed")
     if process_rank() == 0:
         with _h5(dest, "a") as grp:
             ds, mgrp = _open_w(grp, name)
@@ -1396,6 +1563,9 @@ def read_w_header(src, name, *, mode="r"):
 
         prov = {k[len("prov_"):]: v for k, v in ds.attrs.items()
                 if str(k).startswith("prov_")}
+        sampling_extra = {
+            str(k)[len("mpa_prov_"):]: v for k, v in ds.attrs.items()
+            if str(k).startswith("mpa_prov_")}
         for key in ("qirr_generator_commit", "qirr_written_utc",
                     "qirr_writer", "mpa_writer"):
             if key in ds.attrs:
@@ -1415,11 +1585,13 @@ def read_w_header(src, name, *, mode="r"):
             "n_q_on_disk": n_q_on_disk,
             "n_q_full": can.n_q_full,
             "n_mu": n_mu,
+            "dtype": np.dtype(ds.dtype),
             "n_rmu_logical": int(ds.attrs["qirr_n_rmu_logical"]),
             "centroid_hash": qs.qirr_attr_str(ds, "qirr_centroid_hash"),
             "table_hash": can.digest(),
             "closure_verdict": qs.qirr_attr_str(ds, "qirr_closure_verdict"),
             "provenance": prov,
+            "sampling_extra": sampling_extra,
         }
 
 
@@ -2628,6 +2800,114 @@ def read_head_fit(src, *, to_unit=None, mode="r"):
     }
 
 
+def _matching_ready_collective_head(
+    src,
+    *,
+    sample_z,
+    sample_Wc,
+    Omega_p,
+    B_p,
+    energy_unit,
+    diagnostics,
+    grid_hash,
+    fit_provenance,
+    model,
+    occupation_state,
+):
+    """Whether an incomplete fit already owns this exact committed head.
+
+    A ready head is immutable transaction state: exact equality permits an
+    interrupted body+head transaction to continue to the root COMPLETE
+    stamp, while any mismatch refuses.  A present ``ready=False`` group is
+    disposable staging state; the caller has already authenticated the root
+    fit ledger and all body ranges before reaching this check.
+    """
+    expected_payload = {
+        "sample_z": sample_z,
+        "sample_Wc": sample_Wc,
+        "Omega_p": Omega_p,
+        "B_p": B_p,
+    }
+    expected_attrs = {
+        "format_version": np.int64(2),
+        "model": str(model),
+        "frequency_unit": str(energy_unit),
+        "Wc_unit": "a.u.",
+        "residue_unit": f"{energy_unit}*a.u.",
+        "mpa_grid_hash": str(grid_hash),
+        **dict(diagnostics),
+    }
+    expected_provenance = {
+        "fit_" + str(key): value
+        for key, value in dict(fit_provenance).items()
+    }
+    expected_occ = (
+        {} if occupation_state is None else {
+            "mpa_" + key: value
+            for key, value in _occ_stamp_values(occupation_state).items()
+        })
+    with _h5(src, "r") as grp:
+        _open_fit(grp)
+        if MPA_HEAD_SUFFIX not in grp:
+            return False
+        head = grp[MPA_HEAD_SUFFIX]
+        if not bool(head.attrs.get("ready", False)):
+            return False
+        faults = []
+        if set(map(str, head.keys())) != set(expected_payload):
+            faults.append(
+                f"payload datasets={sorted(map(str, head.keys()))}, "
+                f"expected={sorted(expected_payload)}")
+        for name, expected in expected_payload.items():
+            if name not in head:
+                continue
+            dataset = head[name]
+            if np.dtype(dataset.dtype) != np.dtype(np.complex128):
+                faults.append(
+                    f"{name} dtype={dataset.dtype}, expected=complex128")
+                continue
+            if tuple(dataset.shape) != tuple(expected.shape):
+                faults.append(
+                    f"{name} shape={tuple(dataset.shape)}, "
+                    f"expected={tuple(expected.shape)}")
+                continue
+            if not np.array_equal(np.asarray(dataset[()]), expected):
+                faults.append(f"{name} values differ")
+        for name, expected in expected_attrs.items():
+            if name not in head.attrs or not _values_equal(
+                    head.attrs.get(name), expected):
+                faults.append(
+                    f"{name}={head.attrs.get(name)!r}, expected={expected!r}")
+        diagnostic_names = set(diagnostics)
+        actual_provenance = {
+            str(key): head.attrs[key]
+            for key in head.attrs
+            if str(key).startswith("fit_")
+            and str(key) not in diagnostic_names
+        }
+        if (set(actual_provenance) != set(expected_provenance)
+                or any(not _values_equal(actual_provenance[key], value)
+                       for key, value in expected_provenance.items()
+                       if key in actual_provenance)):
+            faults.append("fit provenance differs")
+        actual_occ = {
+            "mpa_" + key: head.attrs["mpa_" + key]
+            for key in _OCC_STAMP_ORDER if "mpa_" + key in head.attrs
+        }
+        if (set(actual_occ) != set(expected_occ)
+                or any(not _values_equal(actual_occ[key], value)
+                       for key, value in expected_occ.items()
+                       if key in actual_occ)):
+            faults.append("occupation provenance differs")
+    if faults:
+        raise ValueError(
+            "GATE mpa_ready_head_identity: an incomplete fit store already "
+            "contains a ready scalar head that differs from this restart; "
+            "refusing to replace committed head state:\n  "
+            + "\n  ".join(faults))
+    return True
+
+
 def write_head_fit_collective(
     dest,
     sample_z,
@@ -2647,7 +2927,7 @@ def write_head_fit_collective(
 ):
     """Collectively publish one tiny scalar head fit through SlabIO.
 
-    COLLECTIVE over ``mesh_xy`` (four barriers).  ``dest`` must be a PATH.
+    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH.
 
     SHAPES AND UNITS.  All four arrays are flattened to 1-D complex128.
     ``sample_z``/``sample_Wc`` share an extent — 2·n_p in production — and
@@ -2662,16 +2942,21 @@ def write_head_fit_collective(
     close — so every rank must supply identical values, and a rank-dependent
     array here is silently discarded on all ranks but one.
 
-    ORDERING PRECONDITION: the BODY fit must already be finalized and its
-    ``w_grid_hash`` must equal ``grid_hash``; both are refused here.  A head
-    cannot be attached to an incomplete store.
+    ORDERING PRECONDITION: every BODY range must be checkpointed while the
+    store itself remains incomplete, and its ``w_grid_hash`` must equal
+    ``grid_hash``.  The final COMPLETE stamp is published only after this
+    head's readiness transaction closes.  A matching already-ready head is
+    authenticated and preserved so a crash immediately before COMPLETE is
+    idempotently resumable; a differing ready head is immutable and refuses.
 
     FORMAT VERSION 2, AND IT IS NOT THE SERIAL PAIR'S.
     :func:`write_head_fit` stamps 1 and :func:`read_head_fit` refuses
     anything else; this writer stamps 2 and
     :func:`read_head_fit_collective` refuses anything else.  The two pairs
-    CANNOT read each other's heads.  Four HDF5 opens per call: all-rank
-    h5py ``'r'``, rank-0 h5py ``'a'``, FFI ``'a'``, rank-0 h5py ``'a'``.
+    CANNOT read each other's heads.  A fresh publish uses all-rank h5py
+    validation, rank-0 h5py metadata allocation, FFI payload publication,
+    then rank-0 h5py readiness.  The already-ready path stops after the
+    read-only identity check.
     """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -2704,20 +2989,37 @@ def write_head_fit_collective(
     if any(not np.isfinite(v) or v < 0.0 for v in diagnostics.values()):
         raise ValueError("collective scalar-head diagnostics are invalid")
     ledger = fit_completion_ledger(dest)
-    if not ledger["complete"]:
-        raise ValueError("scalar head may only be attached to a finalized body fit")
+    if ledger["complete"]:
+        raise ValueError(
+            "scalar head cannot replace data in a finalized fit store")
+    if not bool(np.asarray(ledger["blocks_done"], dtype=bool).all()):
+        raise ValueError(
+            "scalar head may only be attached after every body range is "
+            "checkpointed")
     if str(ledger["w_grid_hash"]) != str(grid_hash):
         raise ValueError(
             "scalar-head grid hash does not match the fitted body grid")
 
-    # ``fit_completion_ledger`` is an all-rank serial-h5py read.  Rank 0
-    # must not open the same inode for write until every peer has closed
-    # that reader: otherwise a fast rank 0 sets HDF5's superblock write-open
-    # flag while a slower peer is still entering its read, which that peer
-    # refuses as "file is already open for write".  The following barrier
-    # is therefore a reader->single-writer ownership transfer, not optional
+    head_ready = _matching_ready_collective_head(
+        dest,
+        sample_z=z,
+        sample_Wc=wc,
+        Omega_p=poles,
+        B_p=residues,
+        energy_unit=energy_unit,
+        diagnostics=diagnostics,
+        grid_hash=grid_hash,
+        fit_provenance=fit_provenance,
+        model=model,
+        occupation_state=occupation_state,
+    )
+    # The ledger and ready-head checks are all-rank serial-h5py reads.  Rank
+    # 0 must not open the inode for write until every peer has closed both.
+    # This is a reader->single-writer ownership transfer, not optional
     # synchronization around the later parallel payload write.
     barrier("mpa_head_ledger_readers_closed")
+    if head_ready:
+        return
     if process_rank() == 0:
         with _h5(dest, "a") as grp:
             _open_fit(grp)
@@ -2990,7 +3292,7 @@ def write_fit_block(
 
 
 class FitWriter:
-    """One collective payload handle for a complete pole-fit walk.
+    """One collective payload handle for a bounded pole-fit epoch.
 
     The fit output is larger than its one-tile working set, so blocks still
     stream to disk as soon as they are fitted.  What persists is the FILE
@@ -3042,6 +3344,11 @@ class FitWriter:
                 f"{self.diagnostic_keys!r} does not match production "
                 f"schema {PERSISTED_DIAGNOSTICS!r}")
         self._pending = []
+        from common.collectives import barrier
+        # ``fit_completion_ledger`` is an all-rank serial read.  Each epoch
+        # must transfer ownership after that fresh check, not rely on a
+        # driver barrier that preceded this constructor.
+        barrier("mpa_fit_writer_ledger_readers_closed")
         from file_io.slab_io import SlabIO
         self._io = SlabIO(self.dest, mode=mode, mesh=mesh_xy)
         pole_shape = (self.ledger["n_p"], self.ledger["n_q"],
@@ -3084,10 +3391,12 @@ class FitWriter:
             raise
 
         from common.collectives import barrier, process_rank
+        barrier("mpa_fit_payload_session_closed")
         pending = tuple(self._pending)
         self._pending = []
         if not commit:
             self.ledger = fit_completion_ledger(self.dest)
+            barrier("mpa_fit_aborted_ledger_readers_closed")
             return self.ledger
         if pending and process_rank() == 0:
             with _h5(self.dest, "a") as grp:
@@ -3394,8 +3703,8 @@ def fit_completion_ledger(src, *, mode="r"):
         return out
 
 
-def _validate_final_pole_payload(src, ledger, *, mode="r"):
-    """Validate finalized pole dataset metadata without reading pole bytes."""
+def _validate_pole_payload_metadata(src, ledger, *, mode="r"):
+    """Validate pole/diagnostic dataset metadata without reading payloads."""
     expected_shape = (
         int(ledger["n_p"]), int(ledger["n_q"]),
         int(ledger["n_mu"]), int(ledger["n_mu"]),
@@ -3408,18 +3717,142 @@ def _validate_final_pole_payload(src, ledger, *, mode="r"):
         for name in names:
             if name not in grp:
                 raise ValueError(
-                    f"MPA finalized fit is missing pole payload {name!r}")
+                    f"MPA fit is missing pole payload {name!r}")
             dataset = grp[name]
             if tuple(dataset.shape) != expected_shape:
                 raise ValueError(
-                    f"MPA finalized fit payload {name!r} has shape "
+                    f"MPA fit payload {name!r} has shape "
                     f"{tuple(dataset.shape)}, expected exact logical shape "
                     f"{expected_shape} from its completion ledger")
             if np.dtype(dataset.dtype) != expected_dtype:
                 raise ValueError(
-                    f"MPA finalized fit payload {name!r} has dtype "
+                    f"MPA fit payload {name!r} has dtype "
                     f"{np.dtype(dataset.dtype).name}, expected "
                     f"{expected_dtype.name}")
+        diagnostic_shape = (int(ledger["n_q"]), int(ledger["n_mu"]),
+                            int(ledger["n_mu"]))
+        for key in PERSISTED_DIAGNOSTICS:
+            name = "fit_" + key
+            if name not in grp:
+                raise ValueError(f"MPA fit is missing diagnostic payload {name!r}")
+            dataset = grp[name]
+            if tuple(dataset.shape) != diagnostic_shape:
+                raise ValueError(
+                    f"MPA fit payload {name!r} has shape "
+                    f"{tuple(dataset.shape)}, expected {diagnostic_shape}")
+            if np.dtype(dataset.dtype) != np.dtype(np.float64):
+                raise ValueError(
+                    f"MPA fit payload {name!r} has dtype {dataset.dtype}, "
+                    "expected float64")
+
+
+def validate_fit_store_for_resume(
+        src, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
+        centroid_hash, provenance, ordered_residues, schedule,
+        occupation_state=None, mode="r"):
+    """Authenticate a partial fit and prove its ledger against the schedule.
+
+    Only whole scheduled ranges can be checkpointed.  The journal, both
+    diagnostics vectors and ``blocks_done`` are redundant by design here:
+    all three must describe exactly the same non-overlapping union before a
+    restart may skip any work.
+    """
+    ledger = fit_completion_ledger(src, mode=mode)
+    expected = {
+        "format_version": MPA_FIT_FORMAT_VERSION,
+        "n_q": int(n_q), "n_mu": int(n_mu), "n_p": int(n_p),
+        "energy_unit": str(energy_unit),
+        "w_grid_hash": str(grid_hash), "w_table_hash": str(table_hash),
+        "w_centroid_hash": str(centroid_hash),
+        "ordered_residues": bool(ordered_residues),
+        "diagnostic_keys": ",".join(PERSISTED_DIAGNOSTICS),
+    }
+    faults = [
+        f"{key}: stored={ledger.get(key)!r}, expected={want!r}"
+        for key, want in expected.items()
+        if not _values_equal(ledger.get(key), want)
+    ]
+    stored_provenance = dict(ledger.get("provenance") or {})
+    expected_provenance = dict(provenance or {})
+    if (set(stored_provenance) != set(expected_provenance)
+            or any(not _values_equal(stored_provenance[key], value)
+                   for key, value in expected_provenance.items()
+                   if key in stored_provenance)):
+        faults.append(
+            "provenance differs: stored keys="
+            f"{sorted(stored_provenance)}, expected keys="
+            f"{sorted(expected_provenance)}")
+    stored_occ = read_occupation_stamps(src, mode=mode)
+    expected_occ = (
+        None if occupation_state is None else _occ_stamp_values(occupation_state))
+    if ((stored_occ is None) != (expected_occ is None)
+            or (stored_occ is not None and any(
+                not _values_equal(stored_occ[key], expected_occ[key])
+                for key in expected_occ))):
+        faults.append("occupation provenance differs")
+    if faults:
+        raise ValueError(
+            "MPA partial fit store is incompatible:\n  " + "\n  ".join(faults))
+
+    _validate_pole_payload_metadata(src, ledger, mode=mode)
+    done = np.asarray(ledger["blocks_done"], dtype=bool)
+    if done.shape != (int(n_q), int(n_mu)):
+        raise ValueError(
+            f"MPA partial fit blocks_done has shape {done.shape}, expected "
+            f"{(int(n_q), int(n_mu))}")
+    journal = np.asarray(ledger["journal"], dtype=np.int64)
+    if journal.ndim != 2 or journal.shape[1:] != (3,):
+        raise ValueError(
+            f"MPA partial fit journal must have shape (n,3); got {journal.shape}")
+    n_records = int(journal.shape[0])
+    for key in CERTIFICATION_METRICS:
+        values = np.asarray(ledger["block_" + key + "_max"], np.float64)
+        if values.shape != (n_records,):
+            raise ValueError(
+                f"MPA partial fit {key} diagnostics length {values.shape} "
+                f"does not equal journal length {n_records}")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"MPA partial fit {key} diagnostics contain non-finite values")
+
+    schedule = tuple(schedule)
+    allowed = {(int(q), int(lo), int(hi)) for q, lo, hi in schedule}
+    if len(allowed) != len(schedule):
+        raise ValueError("MPA fit schedule itself contains duplicate ranges")
+    schedule_union = np.zeros_like(done)
+    for q, lo, hi in allowed:
+        if not (0 <= q < int(n_q) and 0 <= lo < hi <= int(n_mu)):
+            raise ValueError(
+                f"MPA fit schedule carries invalid range {(q, lo, hi)}")
+        if bool(schedule_union[q, lo:hi].any()):
+            raise ValueError(
+                f"MPA fit schedule carries overlapping range {(q, lo, hi)}")
+        schedule_union[q, lo:hi] = True
+    if not bool(schedule_union.all()):
+        raise ValueError("MPA fit schedule does not cover every q/column pair")
+    union = np.zeros_like(done)
+    seen = set()
+    for row in journal:
+        record = tuple(int(value) for value in row)
+        if record not in allowed:
+            raise ValueError(
+                f"MPA partial fit journal range {record} is outside the "
+                "current column schedule")
+        if record in seen:
+            raise ValueError(
+                f"MPA partial fit journal repeats scheduled range {record}")
+        seen.add(record)
+        q, lo, hi = record
+        if bool(union[q, lo:hi].any()):
+            raise ValueError(
+                f"MPA partial fit journal range {record} overlaps an earlier "
+                "committed range")
+        union[q, lo:hi] = True
+    if not np.array_equal(done, union):
+        raise ValueError(
+            "MPA partial fit blocks_done does not exactly equal the union of "
+            "its validated journal ranges")
+    return ledger
 
 
 def validate_fit_store(src, *, expected_identity=None,
@@ -3478,9 +3911,9 @@ def validate_fit_store(src, *, expected_identity=None,
         raise ValueError("MPA Sigma requires a finalized pole fit store")
     if ledger["energy_unit"] not in FIT_ENERGY_UNITS:
         raise ValueError("MPA fit store does not declare a supported unit")
-    _validate_final_pole_payload(src, ledger, mode=mode)
+    _validate_pole_payload_metadata(src, ledger, mode=mode)
     for key, want in (expected_identity or {}).items():
-        if key in WFN_IDENTITY_PROVENANCE_KEYS:
+        if key in MPA_IDENTITY_PROVENANCE_KEYS:
             got = ledger["provenance"].get(key)
         elif key in ("w_grid_hash", "w_table_hash", "w_centroid_hash"):
             got = ledger[key]
@@ -3586,6 +4019,25 @@ def refuse_completed_artifact_replacement(
     return tuple(path for _, path in protected)
 
 
+def refuse_finalized_fit_replacement(fit_path, *, overwrite_completed=False):
+    """Early write-once gate for a build that will resume sample artifacts."""
+    path = os.path.abspath(os.fspath(fit_path))
+    if not os.path.exists(path):
+        return None
+    try:
+        validate_fit_store(path)
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if not bool(overwrite_completed):
+        raise ValueError(
+            "GATE mpa_completed_fit_write_once: finalized certified MPA fit "
+            f"store {path} is write-once. Consume it through "
+            "mpa_fit_reuse_file, choose a new run variant, or deliberately "
+            "set mpa_overwrite_completed_artifacts = true for destructive "
+            "regeneration.")
+    return path
+
+
 def _require_certification(certification, dest):
     """A certification :func:`validate_fit_store` will accept, or refuse.
 
@@ -3635,7 +4087,8 @@ def _require_certification(certification, dest):
         "leave the store uncertified.")
 
 
-def finalize_fit_store(dest, *, certification=None, mode="a"):
+def finalize_fit_store(dest, *, certification=None, require_head=False,
+                       mode="a"):
     """Stamp the store COMPLETE — once, and only when it is.
 
     Refuses a store with an unfitted (q, column) and NAMES the gaps,
@@ -3703,6 +4156,21 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
                 (" ..." if len(gaps) > 6 else "") +
                 "  Stamping it complete would tell the Σ stage that "
                 "zeros are poles.")
+        if require_head:
+            if MPA_HEAD_SUFFIX not in grp:
+                raise ValueError(
+                    "finalize_fit_store: production MPA store has a complete "
+                    "body but no scalar head; leaving it resumable")
+            head = grp[MPA_HEAD_SUFFIX]
+            if not bool(head.attrs.get("ready", False)):
+                raise ValueError(
+                    "finalize_fit_store: scalar head is not ready; leaving "
+                    "the body/head transaction incomplete and resumable")
+            head_grid_hash = qs.qirr_attr_str(head, "mpa_grid_hash")
+            body_grid_hash = qs.qirr_attr_str(grp, "mpa_fit_w_grid_hash")
+            if head_grid_hash != body_grid_hash:
+                raise ValueError(
+                    "finalize_fit_store: scalar head/body grid hashes differ")
         grp.attrs["mpa_fit_complete"] = True
         grp.attrs["mpa_fit_finalized_utc"] = _utc_now()
         for key in CERTIFICATION_METRICS:
