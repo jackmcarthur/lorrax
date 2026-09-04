@@ -7,7 +7,10 @@ import sys
 
 from lxkit.deck_doctor import (
     _backend_lines,
+    _check_input_rows,
     _device_lines,
+    DeckDoctorError,
+    InputPath,
     required_input_paths,
 )
 
@@ -48,6 +51,15 @@ def test_one_shot_head_off_requires_only_three_core_inputs(tmp_path):
     rows = required_input_paths(config, tmp_path / "cohsex.in", n_rmu=12)
     assert [row.role for row in rows] == [
         "DFT wavefunctions", "ISDF centroids", "mean-field Hamiltonian"]
+
+
+def test_missing_input_refuses_by_role_and_resolved_path(tmp_path):
+    import pytest
+    missing = tmp_path / "absent" / "centroids.txt"
+    with pytest.raises(DeckDoctorError, match="LX-DECK-INPUT-MISSING") as exc:
+        _check_input_rows((InputPath("ISDF centroids", missing),))
+    assert "ISDF centroids" in str(exc.value)
+    assert str(missing) in str(exc.value)
 
 
 def test_selected_optional_inputs_and_restart_are_all_checked(tmp_path):

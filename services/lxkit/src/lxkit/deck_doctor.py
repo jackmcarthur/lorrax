@@ -143,6 +143,33 @@ def _print_refusal(exc: DeckDoctorError) -> None:
     print(f"  fix  : {exc.fix}", file=sys.stderr)
 
 
+def _check_input_rows(
+    rows: Sequence[InputPath],
+    *,
+    already_reported: set[Path] | None = None,
+) -> set[Path]:
+    """Report resolved inputs and refuse before a consumer opens a missing one."""
+    reported = set() if already_reported is None else set(already_reported)
+    missing = []
+    for row in rows:
+        if row.path in reported:
+            continue
+        exists = row.path.is_file()
+        print(f"INPUT_FILE {'OK' if exists else 'MISSING'} "
+              f"role={row.role!r} path={row.path}")
+        reported.add(row.path)
+        if not exists:
+            missing.append(row)
+    if missing:
+        _fail(
+            "LX-DECK-INPUT-MISSING",
+            ", ".join(f"{row.role}={row.path}" for row in missing),
+            "every file selected by the resolved deck",
+            "create or relink the named input artifacts beside the deck",
+        )
+    return reported
+
+
 def _source_root_and_runtime(source_root: Path, *, gpu: bool):
     """Import and bootstrap exactly the runtime selected by the launcher."""
     expected = (source_root / "src" / "runtime" / "__init__.py").resolve()
@@ -282,6 +309,16 @@ def inspect_deck(args) -> None:
     )
     print(f"DECK_PARSE_OK strict deck={deck}")
 
+    # These three files are consumed to derive later report fields.  Refuse
+    # them by resolved role/path before h5py or the centroid reader can turn a
+    # missing input into an unclassified FileNotFoundError.
+    reported_inputs = _check_input_rows((
+        InputPath("DFT wavefunctions", Path(config.paths.wfn_file).resolve()),
+        InputPath("ISDF centroids", Path(config.paths.centroids_file).resolve()),
+        InputPath("mean-field Hamiltonian",
+                  Path(config.paths.kin_ion_file).resolve()),
+    ))
+
     from file_io.centroids import load_centroids
     from file_io.mf_header import read_mf_header
 
@@ -292,20 +329,7 @@ def inspect_deck(args) -> None:
     print(f"MATERIAL_CLASS {material} source=WFN occupations")
 
     rows = required_input_paths(config, deck, n_rmu=n_rmu)
-    missing = []
-    for row in rows:
-        exists = row.path.is_file()
-        print(f"INPUT_FILE {'OK' if exists else 'MISSING'} "
-              f"role={row.role!r} path={row.path}")
-        if not exists:
-            missing.append(row)
-    if missing:
-        _fail(
-            "LX-DECK-INPUT-MISSING",
-            ", ".join(f"{row.role}={row.path}" for row in missing),
-            "every file selected by the resolved deck",
-            "create or relink the named input artifacts beside the deck",
-        )
+    _check_input_rows(rows, already_reported=reported_inputs)
 
     print(f"CONFIG_MODE compute_mode={config.compute_mode.value} "
           f"qp_solver={config.qp_solver.value} bispinor={config.bispinor}")
