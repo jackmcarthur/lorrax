@@ -102,6 +102,12 @@ IMPORT_TIME_ENV_PREFIXES = (
     "PYTEST_",        # pytest's own bookkeeping
 )
 
+IMPORT_TIME_ENV_NAMES = frozenset({
+    # HDF5 reads this before h5py's first H5open; tests that exercise
+    # import-time runtime bootstrap cannot fixture it.
+    "HDF5_USE_FILE_LOCKING",
+})
+
 #: Exact names allowed for a DIFFERENT reason than the prefixes above: not
 #: "read at import", but "guards something that cannot be undone".
 IRREVERSIBLE_ENV_SENTINELS = frozenset({
@@ -128,6 +134,7 @@ def env_collection_offenders(before: dict, after: dict) -> list:
     out = []
     for name in sorted(set(before) | set(after)):
         if (name.startswith(IMPORT_TIME_ENV_PREFIXES)
+                or name in IMPORT_TIME_ENV_NAMES
                 or name in IRREVERSIBLE_ENV_SENTINELS):
             continue
         was, now = before.get(name), after.get(name)

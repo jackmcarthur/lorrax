@@ -136,7 +136,7 @@ def test_import_time_knobs_are_allowed():
     """jax/XLA knobs are latched at import, so module scope is their only
     home and the check must not police them."""
     for name in ("JAX_ENABLE_X64", "JAX_PLATFORMS", "XLA_FLAGS",
-                 "CUDA_VISIBLE_DEVICES"):
+                 "CUDA_VISIBLE_DEVICES", "HDF5_USE_FILE_LOCKING"):
         assert harness.env_collection_offenders({}, {name: "1"}) == [], (
             f"{name} is import-time-latched; flagging it would force a "
             "fixture that cannot possibly be early enough")
