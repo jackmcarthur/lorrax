@@ -55,7 +55,9 @@ from common.fft_helpers import (
     FLAT_K_FFT_VALUE_RTOL,
     make_flat_k_fftn,
     make_flat_k_ifftn,
+    make_local_flat_k_fftn,
 )
+from common.shard_map import shard_map
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
@@ -588,6 +590,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # 'backward' = 1/N normalisation in IFFT — matches Σ_R e^{-2πik·R} fH_R = fH_k.
     local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
     local_fftn = make_flat_k_fftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
+    local_fftn_slab = make_local_flat_k_fftn(
+        mesh_xy, kgrid_co, norm='backward')
 
     # ``f_eps.T`` at the call site was its own eager ``transpose`` module;
     # transposing inside costs nothing and removes one compile (exact — a
@@ -679,40 +683,42 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         """Transform a dead k-space carrier in its reusable buffer."""
         return local_ifftn(operator_k)
 
-    @partial(jax.jit,
-             in_shardings=(flat_xy, flat_xy),
-             out_shardings=(rep_, rep_))
-    def _fft_roundtrip_abs_scale(operator_R, operator_k):
-        """Reduce one row slab of the canonical FFT receipt to scalars."""
-        fft_roundtrip_abs = jnp.max(
-            jnp.abs(local_fftn(operator_R) - operator_k))
-        fft_scale = jnp.max(jnp.abs(operator_k))
-        return fft_roundtrip_abs, fft_scale
+    def _fft_roundtrip_local(operator_R_local, operator_k_local):
+        """Certify every local matrix tile in bounded row slabs."""
+        local_rank = int(operator_R_local.shape[-2])
+        rows = max(1, (local_rank + 15) // 16)
+        slabs = (local_rank + rows - 1) // rows
+
+        def _slab_receipt(i, maxima):
+            start = jnp.minimum(i * rows, local_rank - rows)
+            operator_R_slab = lax.dynamic_slice_in_dim(
+                operator_R_local, start, rows, axis=1)
+            operator_k_slab = lax.dynamic_slice_in_dim(
+                operator_k_local, start, rows, axis=1)
+            reconstructed = local_fftn_slab(operator_R_slab)
+            slab_abs = jnp.max(jnp.abs(reconstructed - operator_k_slab))
+            slab_scale = jnp.max(jnp.abs(operator_k_slab))
+            return (jnp.maximum(maxima[0], slab_abs),
+                    jnp.maximum(maxima[1], slab_scale))
+
+        fft_roundtrip_abs, fft_scale = lax.fori_loop(
+            0, slabs, _slab_receipt,
+            (jnp.asarray(0.0), jnp.asarray(0.0)))
+        axes = tuple(mesh_xy.axis_names)
+        return (lax.pmax(fft_roundtrip_abs, axis_name=axes),
+                lax.pmax(fft_scale, axis_name=axes))
+
+    _fft_roundtrip_abs_scale = jax.jit(shard_map(
+        _fft_roundtrip_local, mesh=mesh_xy,
+        in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
+        out_specs=(P(), P()), check_vma=False))
 
     def _fft_roundtrip_relative(operator_R, operator_k):
-        """Certify every matrix tile with bounded row-slab workspaces.
-
-        The FFT acts only on the leading flat-k axis, so partitioning a matrix
-        axis is algebraically exact.  Sixteen sequential, x-divisible row
-        slabs retain the incumbent value-level all-tile receipt while bounding
-        its alias-protection/output workspace.  This is essential once one
-        dense-grid operator occupies 11--14 GiB per device.
-        """
-        rank = int(operator_R.shape[-2])
-        rows = _pad_to(mesh_xy, 'x', max(1, (rank + 15) // 16))
-        fft_roundtrip_abs = 0.0
-        fft_scale = 0.0
-        for start in range(0, rank, rows):
-            stop = min(rank, start + rows)
-            operator_R_slab = jax.device_put(
-                operator_R[:, start:stop, :], flat_xy)
-            operator_k_slab = jax.device_put(
-                operator_k[:, start:stop, :], flat_xy)
-            slab_abs, slab_scale = _fft_roundtrip_abs_scale(
-                operator_R_slab, operator_k_slab)
-            slab_abs, slab_scale = jax.device_get((slab_abs, slab_scale))
-            fft_roundtrip_abs = max(fft_roundtrip_abs, float(slab_abs))
-            fft_scale = max(fft_scale, float(slab_scale))
+        """Certify all tiles without a global slice or matrix reshard."""
+        fft_roundtrip_abs, fft_scale = jax.device_get(
+            _fft_roundtrip_abs_scale(operator_R, operator_k))
+        fft_roundtrip_abs = float(fft_roundtrip_abs)
+        fft_scale = float(fft_scale)
         return (fft_roundtrip_abs / fft_scale
                 if fft_scale > 0.0 else fft_roundtrip_abs)
 
