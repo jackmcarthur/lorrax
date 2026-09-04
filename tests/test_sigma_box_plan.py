@@ -489,6 +489,29 @@ def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
         for row in geometry["branches"][0]["windows"])
 
 
+def test_each_cache_write_failure_is_announced_without_rejecting_rule(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.os.replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("read-only cache")))
+    lines = []
+    plan, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        eps=1.0e-4, reduction_seconds=120.0,
+        cache_dir=str(tmp_path), print_fn=lines.append)
+
+    assert len(plan) == 3
+    warnings = [line for line in lines
+                if line.startswith("WARNING sigma quadrature cache")]
+    assert len(warnings) == 3
+    assert all(str(tmp_path) in line for line in warnings)
+    assert all("OSError: read-only cache" in line for line in warnings)
+    assert all(row["cache_status"] == "miss"
+               for row in geometry["branches"][0]["windows"])
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_no_pair_ceiling(monkeypatch):
     # Owner ruling 2026-09-02: the plan reports its pair count, never refuses on it.
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)

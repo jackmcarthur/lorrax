@@ -281,18 +281,19 @@ def _rule_cache_lookup(
 
 
 def _rule_cache_store(directory, rule, noise_amplification):
-    """Atomically store one immutable box certificate."""
+    """Atomically store one immutable box certificate, or return a warning."""
     if directory is None:
-        return
+        return None
+    digest = hashlib.sha256(json.dumps(
+        ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
+         bool(rule.relative)]
+    ).encode()).hexdigest()[:16]
+    path = os.path.abspath(os.path.join(directory, f"rule_{digest}.npz"))
+    temporary = None
     try:
         os.makedirs(directory, exist_ok=True)
-        digest = hashlib.sha256(json.dumps(
-            ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
-             bool(rule.relative)]
-        ).encode()).hexdigest()[:16]
-        path = os.path.join(directory, f"rule_{digest}.npz")
         if os.path.exists(path):
-            return
+            return None
         temporary = f"{path}.{os.getpid()}.tmp"
         with open(temporary, "wb") as handle:
             np.savez(
@@ -305,9 +306,20 @@ def _rule_cache_store(directory, rule, noise_amplification):
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
                 seconds=float(rule.seconds))
         os.replace(temporary, path)
-    except OSError:
-        # A cache is an acceleration, never a second correctness path.
-        pass
+    except OSError as exc:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        # A cache is an acceleration, never a second correctness path, so the
+        # accepted rule remains usable. Silence is still wrong: it turns every
+        # restart into a cold 100+s plan with no explanation.
+        return (
+            "WARNING sigma quadrature cache write failed; this accepted rule "
+            "will be rebuilt on a later run: "
+            f"path={path} error={type(exc).__name__}: {exc}")
+    return None
 
 
 def _cache_build_box(box, eta):
@@ -420,12 +432,14 @@ def _fit_rule(
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: factored log "
             f"growth {max(growth):.6g} exceeds {_FACTOR_GROWTH_CAP:g}")
+    cache_write_warning = None
     if cached is None:
         # Only executor-acceptable rules enter the shared cache.  In
         # particular, a service-level rule that meets its broad default
         # cancellation cap but misses Sigma's eps-scaled noise cap must not
         # poison every subsequent attempt for this box.
-        _rule_cache_store(cache_dir, rule, noise_amplification)
+        cache_write_warning = _rule_cache_store(
+            cache_dir, rule, noise_amplification)
     node_digest = hashlib.sha256(
         np.ascontiguousarray(times).view(np.uint8).tobytes()
         + np.ascontiguousarray(weights).view(np.uint8).tobytes()
@@ -440,6 +454,7 @@ def _fit_rule(
         "noise_bound": noise_bound, "noise_budget": noise_budget,
         "roundoff_amplification": noise_amplification,
         "node_digest": node_digest,
+        "cache_write_warning": cache_write_warning,
         "one_line": rule.one_line(),
     }
 
@@ -591,6 +606,9 @@ def _fixed_fit_for_spec(entry, spec):
     fit["factor_growth"] = growth
     fit["cache_status"] = "hit:sc-fixed"
     fit["seconds"] = 0.0
+    # A failed write was announced on the iteration that attempted it. Reusing
+    # the in-memory fixed rule must not repeat the old warning every SC map.
+    fit["cache_write_warning"] = None
     return fit
 
 
@@ -888,6 +906,11 @@ def plan_sigma_windows(
         fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
             specs, eta, eps=tolerance, reduction_seconds=budget,
             cache_dir=cache_dir, session=fixed_rule_session)
+    if process_rank() == 0:
+        for fit in fits:
+            warning = fit.get("cache_write_warning")
+            if warning:
+                print_fn(warning)
     # The (window, tau) pair count is reported, never refused on: the owner
     # eliminated the pair ceiling (2026-09-02).  A count above what a deck
     # can afford is a planning question answered by eps and the window
