@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 
 from lxkit.deck_doctor import (
     _backend_lines,
@@ -100,5 +101,76 @@ def test_epshead_replaces_dipole_requirement(tmp_path):
 def test_zero_gpu_report_does_not_import_jax():
     lines = _device_lines(gpu=False)
     assert "use --gpu to measure" in lines[0]
-    assert _backend_lines(None, n_rmu=12, gpu=False) == [
+    assert _backend_lines(
+        None, n_rmu=12, gpu=False, science_mesh=(2, 2)) == [
         "BACKEND_PROBE skipped (zero-GPU doctor; add --gpu)"]
+
+
+def test_backend_probe_defers_only_true2d_collective(monkeypatch):
+    config = SimpleNamespace(backend=SimpleNamespace(
+        distributed_cholesky="auto",
+        distributed_lu="cusolvermp",
+        eigh_backend="cusolvermp",
+    ))
+
+    class FakeMesh:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    calls = []
+
+    def resolve(op, requested, _mesh, *, n):
+        calls.append((op, requested, n))
+        if op == "solve_lu":
+            raise ValueError(
+                "solve_lu backend 'cusolvermp' needs a true-2D mesh "
+                "(px >= 2 and py >= 2)")
+        return "native" if requested == "auto" else requested
+
+    monkeypatch.setitem(
+        sys.modules, "jax", SimpleNamespace(local_devices=lambda: [object()]))
+    monkeypatch.setitem(sys.modules, "jax.sharding", SimpleNamespace(Mesh=FakeMesh))
+    monkeypatch.setitem(
+        sys.modules, "distrib_la", SimpleNamespace(resolve_backend=resolve))
+
+    lines = _backend_lines(
+        config, n_rmu=836, gpu=True, science_mesh=(2, 2))
+    assert any("op=cholesky" in line and "resolved=native" in line
+               for line in lines)
+    assert any("op=solve_lu" in line
+               and "resolved=deferred-to-science-launch" in line
+               and "live_provider=usable" in line for line in lines)
+    assert any("op=eigh" in line and "resolved=cusolvermp" in line
+               for line in lines)
+    assert calls == [
+        ("cholesky", "auto", 836),
+        ("solve_lu", "cusolvermp", 836),
+        ("eigh", "cusolvermp", 836),
+    ]
+
+
+def test_backend_probe_does_not_hide_bad_science_geometry(monkeypatch):
+    config = SimpleNamespace(backend=SimpleNamespace(
+        distributed_cholesky="cusolvermp",
+        distributed_lu="auto",
+        eigh_backend="auto",
+    ))
+
+    class FakeMesh:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    def resolve(op, requested, _mesh, *, n):
+        del op, requested, n
+        raise ValueError("backend 'cusolvermp' needs a true-2D mesh")
+
+    monkeypatch.setitem(
+        sys.modules, "jax", SimpleNamespace(local_devices=lambda: [object()]))
+    monkeypatch.setitem(sys.modules, "jax.sharding", SimpleNamespace(Mesh=FakeMesh))
+    monkeypatch.setitem(
+        sys.modules, "distrib_la", SimpleNamespace(resolve_backend=resolve))
+
+    import pytest
+    with pytest.raises(ValueError, match="needs a true-2D mesh"):
+        _backend_lines(
+            config, n_rmu=64, gpu=True, science_mesh=(1, 1))

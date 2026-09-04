@@ -196,15 +196,29 @@ def _device_lines(*, gpu: bool) -> list[str]:
             f"kind={','.join(kinds)} memory_limit={','.join(memory)}"]
 
 
-def _backend_lines(config, *, n_rmu: int, gpu: bool) -> list[str]:
-    """Resolve the deck's dense-LA requests on a live one-GPU probe mesh."""
+def _backend_lines(
+    config,
+    *,
+    n_rmu: int,
+    gpu: bool,
+    science_mesh: tuple[int, int],
+) -> list[str]:
+    """Resolve live providers without pretending one GPU is a science mesh.
+
+    Provider guards run before the true-2D geometry guard in
+    :func:`distrib_la.resolve_backend`.  An explicit cuSOLVERMp request that
+    reaches that geometry guard has therefore proved its live handler bundle;
+    when the requested science mesh really is two-dimensional, report that
+    final collective resolution as deferred to the science launch.  Every
+    other refusal remains fatal.
+    """
     if not gpu:
         return ["BACKEND_PROBE skipped (zero-GPU doctor; add --gpu)"]
 
     import jax
     import numpy as np
     from jax.sharding import Mesh
-    from distrib_la import list_backends, resolve_backend
+    from distrib_la import resolve_backend
 
     devices = jax.local_devices()
     mesh = Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y"))
@@ -215,14 +229,22 @@ def _backend_lines(config, *, n_rmu: int, gpu: bool) -> list[str]:
     )
     lines = []
     for op, requested in requests:
-        resolved = resolve_backend(op, requested, mesh, n=int(n_rmu))
-        available = ",".join(
-            name for name, detail in list_backends(op, mesh).items()
-            if detail.startswith("available"))
+        try:
+            resolved = resolve_backend(op, requested, mesh, n=int(n_rmu))
+            status = f"resolved={resolved}"
+        except ValueError as exc:
+            why = str(exc)
+            px, py = science_mesh
+            if "needs a true-2D mesh" in why and px >= 2 and py >= 2:
+                status = (
+                    "resolved=deferred-to-science-launch "
+                    "live_provider=usable reason=one-GPU-probe-is-1x1")
+            else:
+                raise
         lines.append(
             f"BACKEND_RESOLVED op={op} requested={requested} "
-            f"resolved={resolved} probe_mesh=1x1 n={int(n_rmu)} "
-            f"available={available}")
+            f"{status} probe_mesh=1x1 science_mesh="
+            f"{science_mesh[0]}x{science_mesh[1]} n={int(n_rmu)}")
     return lines
 
 
@@ -325,7 +347,8 @@ def inspect_deck(args) -> None:
 
     for line in _device_lines(gpu=args.gpu):
         print(line)
-    for line in _backend_lines(config, n_rmu=n_rmu, gpu=args.gpu):
+    for line in _backend_lines(
+            config, n_rmu=n_rmu, gpu=args.gpu, science_mesh=(px, py)):
         print(line)
     print("DECK_DOCTOR_OK")
 
