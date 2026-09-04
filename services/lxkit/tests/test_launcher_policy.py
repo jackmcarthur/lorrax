@@ -17,6 +17,7 @@ from lxkit.launcher_policy import (
     export_allocation_pin,
     newest_first,
     resolve_allocation_pin,
+    rewrite_pythonpath,
     runtime_origin,
     select_source_root,
     square_mesh,
@@ -114,6 +115,20 @@ def test_source_selection_prefers_cwd_checkout_and_keeps_old_pin():
         root, reason = select_source_root(run_dir, site_tree, old_tree)
         assert root == old_tree.resolve()
         assert reason == "LORRAX_CHECKOUT compatibility"
+
+
+def test_pythonpath_rewrite_covers_bare_env_and_shifter_forms():
+    source = Path("/tmp/feature")
+    base = Path("/tmp/base")
+    bare = rewrite_pythonpath(
+        "env PATH=/bin PYTHONPATH=/tmp/base/src:/third python3", source, base)
+    assert "PYTHONPATH=/tmp/feature/src:/third" in bare
+    assert "/tmp/base/src" not in bare
+
+    shifter = rewrite_pythonpath(
+        "shifter --image=x --env=PYTHONPATH=/tmp/base/src:/third", source, base)
+    assert "--env=PYTHONPATH=/tmp/feature/src:/third" in shifter
+    assert "/tmp/base/src" not in shifter
 
 
 if __name__ == "__main__":

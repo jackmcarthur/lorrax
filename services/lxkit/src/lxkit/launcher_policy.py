@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import shlex
 from typing import Mapping, MutableMapping, Sequence, TypeVar
 
 
@@ -220,9 +221,47 @@ def runtime_origin(source_root: str | os.PathLike[str]) -> Path:
     return (Path(source_root).resolve() / "src" / "runtime" / "__init__.py")
 
 
+def rewrite_pythonpath(
+    command: str,
+    source_root: str | os.PathLike[str],
+    module_root: str | os.PathLike[str],
+) -> str:
+    """Put the selected checkout first in Shifter and bare-``env`` forms."""
+    source = str(Path(source_root).resolve() / "src")
+    module = (Path(module_root).resolve() / "src").resolve()
+    out = []
+    found = False
+    prefixes = ("--env=PYTHONPATH=", "PYTHONPATH=")
+    for token in shlex.split(command):
+        prefix = next((item for item in prefixes if token.startswith(item)), None)
+        if prefix is not None:
+            entries = token[len(prefix):].split(":")
+            retained = []
+            for entry in entries:
+                try:
+                    resolved = Path(entry).resolve()
+                except OSError:
+                    retained.append(entry)
+                    continue
+                if resolved not in (module, Path(source).resolve()):
+                    retained.append(entry)
+            token = prefix + ":".join([source] + retained)
+            found = True
+        out.append(token)
+    if not found:
+        raise LauncherPolicyError(
+            "LX-NOPYTHONPATH",
+            "the selected site descriptor has no PYTHONPATH environment token",
+            "a capability descriptor with PYTHONPATH for the LORRAX runtime",
+            "reinstall the durable site module and run `lx doctor --refresh`",
+        )
+    return shlex.join(out)
+
+
 __all__ = [
     "AllocationPin", "LaunchGeometry", "LauncherPolicyError",
     "apply_cache_policy", "export_allocation_pin", "newest_first",
-    "resolve_allocation_pin", "runtime_origin", "select_source_root",
+    "resolve_allocation_pin", "rewrite_pythonpath", "runtime_origin",
+    "select_source_root",
     "square_mesh", "validate_geometry",
 ]
