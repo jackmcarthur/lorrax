@@ -732,10 +732,12 @@ add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
 set_target_properties(lorrax_ffi PROPERTIES
     OUTPUT_NAME "lorrax_ffi"
     PREFIX "lib"
-    # RPATH points at the NVHPC directory so the runtime linker finds
-    # libcusolverMp.so and libcal.so without LD_LIBRARY_PATH.
+    # $ORIGIN is first so an immutable staged bundle can carry only its
+    # private redistributable providers beside this file.  MPI, site HDF5,
+    # CUDA and NCCL remain runtime-owned and are NEVER copied there; the
+    # existing site/build paths below continue to serve legacy build trees.
     BUILD_WITH_INSTALL_RPATH ON
-    INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib;/lorrax_slate/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
+    INSTALL_RPATH "$ORIGIN;${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib;/lorrax_slate/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
 )
 
 # ----------------------------------------------------------------------------
@@ -1622,7 +1624,9 @@ set_target_properties(lorrax_ffi_host PROPERTIES
     OUTPUT_NAME "lorrax_ffi_host"
     PREFIX "lib"
     BUILD_WITH_INSTALL_RPATH ON
-    INSTALL_RPATH "${_host_rpaths}"
+    # Same relocatable private-provider door as the CUDA leg.  Keep every
+    # existing site path after it for unsealed developer builds.
+    INSTALL_RPATH "$ORIGIN;${_host_rpaths}"
 )
 
 # The XLA FFI headers are THIRD-PARTY (vendored with jaxlib) and are not

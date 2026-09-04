@@ -1,12 +1,13 @@
 """``lxkit`` — the shared foundation every LORRAX service stands on.
 
-Four things that standalone services need and must not own private copies of:
+Five things that standalone services need and must not own private copies of:
 the env-dial :class:`~lxkit.gate.Gate` (grammar, rank discipline,
 announce-or-refuse), the ABSENT-vs-BROKEN probe vocabulary
 (:mod:`lxkit.probe`), the jax-version-boundary shims
 (:mod:`lxkit.jax_compat`), and process-local array placement
-(:mod:`lxkit.placement`).  :mod:`lxkit.testing` ships the pytest harness as a
-``pytest11`` plugin.
+(:mod:`lxkit.placement`), and native-provider selection/attestation policy
+(:mod:`lxkit.native_provider`).  :mod:`lxkit.testing` ships the pytest harness
+as a ``pytest11`` plugin.
 
 PINNED PROPERTY — STDLIB-ONLY AT IMPORT
 ---------------------------------------
@@ -51,6 +52,7 @@ from lxkit.jax_compat import (
     select_mode,
     vma_mode,
 )
+from lxkit import native_provider
 from lxkit.placement import device_put_process_local
 from lxkit.probe import (
     AVAILABLE,
@@ -73,4 +75,6 @@ __all__ = [
     # JAX utilities
     "device_put_process_local", "mark_varying", "vma_mode", "select_mode",
     "VMA_TRACKING_SINCE", "VmaSupportError",
+    # native-provider policy (the tables remain with each caller)
+    "native_provider",
 ]

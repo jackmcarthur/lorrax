@@ -508,11 +508,15 @@ def _record_ffi_loader_open_order(monkeypatch, *, disable_rule=False,
         opened.append(str(path))
         return _FakeLib()
 
+    def _fake_open(path, **kwargs):
+        return _fake_cdll(path, mode=ctypes.RTLD_GLOBAL), pathlib.Path(path)
+
     monkeypatch.setattr(F, "_LIBS", {})
     monkeypatch.setattr(F, "_LIB_PATHS", {})
     monkeypatch.setattr(F, "_CUDA_FIRST_TRIED", False)
     monkeypatch.setattr(F, "_locate_so", _fake_locate)
     monkeypatch.setattr(ctypes, "CDLL", _fake_cdll)
+    monkeypatch.setattr(F._native, "open_and_attest", _fake_open)
     monkeypatch.setattr(F, "_set_argtypes", lambda lib, platform: None)
     monkeypatch.setattr(F, "_register_ffi_targets", lambda lib, plat: None)
     monkeypatch.setattr(F, "_process_can_use_cuda", lambda: bool(cuda_capable))

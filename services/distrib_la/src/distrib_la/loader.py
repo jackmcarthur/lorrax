@@ -43,12 +43,12 @@ no trace.
 from __future__ import annotations
 
 import ctypes
-import glob
 import os
 import sys
 from pathlib import Path
 from typing import Dict, Optional
 
+from lxkit import native_provider as _native
 from lxkit.probe import (AVAILABLE, LibraryNotBuilt, LibraryUnusable,
                          ProbeResult, missing_symbol, not_loadable,
                          unknown_target)
@@ -74,9 +74,6 @@ LORRAX_FFI_ABI_VERSION = 3
 #: for the second, which is the exact failure being detected.
 _ABI_SYMBOLS = {"cpu": "lorrax_ffi_host_abi_version",
                 "CUDA": "lorrax_ffi_cuda_abi_version"}
-
-_ABI_UNSTAMPED_ANNOUNCED: set = set()
-
 
 class AbiMismatch(LibraryUnusable):
     """The library loaded fine and speaks a DIFFERENT handler ABI.
@@ -106,47 +103,12 @@ def _check_abi(lib: ctypes.CDLL, platform: str, path: str) -> None:
     backend as unavailable and any refusal printed to a human quotes the text
     below verbatim.
     """
-    sym = _ABI_SYMBOLS[platform]
-    fn = getattr(lib, sym, None)
-    if fn is None:
-        if os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1":
-            raise AbiMismatch(
-                f"{path} carries no handler-ABI stamp ({sym} is not exported) "
-                f"and LORRAX_FFI_ABI_STRICT=1 refuses an unstamped library.  "
-                f"Built before 2026-08-08; whether its signatures match this "
-                f"package's (abi={LORRAX_FFI_ABI_VERSION}) cannot be read from "
-                f"the artifact.  Rebuild: {_PLATFORMS[platform]['build_hint']}")
-        if platform not in _ABI_UNSTAMPED_ANNOUNCED:
-            _ABI_UNSTAMPED_ANNOUNCED.add(platform)
-            print(
-                f"[distrib_la] NOTE: {path} carries no handler-ABI stamp, so "
-                f"it cannot be checked against this package "
-                f"(abi={LORRAX_FFI_ABI_VERSION}).  Pre-2026-08-08 build.  If a "
-                f"call later fails with 'Wrong number of arguments', this is "
-                f"why; rebuild with {_PLATFORMS[platform]['build_hint']}.  "
-                f"LORRAX_FFI_ABI_STRICT=1 makes this a refusal.",
-                file=sys.stderr)
-        return
-    fn.restype = ctypes.c_int
-    fn.argtypes = []
-    found = int(fn())
-    if found != LORRAX_FFI_ABI_VERSION:
-        raise AbiMismatch(
-            f"HANDLER ABI MISMATCH.\n"
-            f"  library  {path}\n"
-            f"           speaks abi={found}\n"
-            f"  this tree speaks abi={LORRAX_FFI_ABI_VERSION}\n"
-            f"These cannot be paired.  Mixing them is not a degraded run: it "
-            f"is an FFI arity or layout mismatch that surfaces as "
-            f"'INVALID_ARGUMENT: Wrong number of arguments' at the first call "
-            f"crossing a changed signature, and everything off that path stays "
-            f"green until then.\n"
-            f"  fix  rebuild this leg from this tree:\n"
-            f"         {_PLATFORMS[platform]['build_hint']}\n"
-            f"       or pin the .so this tree was built for "
-            f"({_PLATFORMS[platform]['env']}=<path>).\n"
-            f"  why  src/ffi/cpp/common/lorrax_ffi_abi.h records what changed "
-            f"at each version.")
+    _native.check_abi(
+        lib, platform, path, expected_abi=LORRAX_FFI_ABI_VERSION,
+        abi_symbols=_ABI_SYMBOLS,
+        build_hint=str(_PLATFORMS[platform]["build_hint"]),
+        strict_unstamped=os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1",
+        mismatch_cls=AbiMismatch)
 
 
 _LIBS: Dict[str, ctypes.CDLL] = {}
@@ -276,32 +238,11 @@ def _candidate_paths(platform: str) -> list[Path]:
 
 
 def _locate_so(platform: str) -> Path:
-    spec = _PLATFORMS[platform]
-
-    # AN EXPLICIT PIN THAT IS MISSING IS A REFUSAL, NEVER A FALL-THROUGH.
-    # Same shape as lxkit.gate's "an explicit request that cannot be
-    # honored refuses rather than silently downgrading".
-    pinned = os.environ.get(spec["env"])
-    if pinned:
-        pin = Path(pinned)
-        if pin.is_file():
-            return pin
-        raise LibraryUnusable(
-            f"{spec['env']} is set to {pinned!r}, which is not a file.  "
-            f"Refusing to fall back to another {spec['so_name']}: an "
-            f"explicit pin that cannot be honored is a refusal, not a hint.  "
-            f"Fix the path, or unset {spec['env']} to search the default "
-            f"locations.")
-
-    for c in _candidate_paths(platform):
-        if c.is_file():
-            return c
-    hints = "\n  ".join(str(p) for p in _candidate_paths(platform)) or "(none)"
-    raise LibraryNotBuilt(
-        f"Could not locate {spec['so_name']} (platform={platform}).  "
-        f"Build with:\n    {spec['build_hint']}\n"
-        f"or pin it with {spec['env']}.\n"
-        "Paths searched:\n  " + hints)
+    return _native.locate_library(
+        platform, specs=_PLATFORMS,
+        candidates={name: _candidate_paths(name) for name in _PLATFORMS},
+        expected_abi=LORRAX_FFI_ABI_VERSION,
+        not_built_cls=LibraryNotBuilt, unusable_cls=LibraryUnusable)
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +521,8 @@ def _nvidia_device_visible() -> bool:
     session -- the hardware half of the question is the one a pure test
     cannot arrange for real.
     """
-    return (bool(glob.glob("/dev/nvidia[0-9]*"))
-            or os.path.exists("/dev/nvidiactl"))
+    return (any(Path("/dev").glob("nvidia[0-9]*"))
+            or Path("/dev/nvidiactl").exists())
 
 
 def _process_can_use_cuda() -> bool:
@@ -613,13 +554,7 @@ def _process_can_use_cuda() -> bool:
     here" is a different question and the best-effort ``try`` in
     :func:`_open_cuda_before_host` is what answers it.
     """
-    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
-    if first and first not in ("cuda", "gpu"):
-        return False
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cvd is not None and cvd.strip() == "":
-        return False
-    return _nvidia_device_visible()
+    return _native.process_can_use_cuda(device_visible=_nvidia_device_visible)
 
 
 def _open_cuda_before_host() -> None:
@@ -690,24 +625,18 @@ def get_lib(platform: str) -> ctypes.CDLL:
         import h5py                                            # noqa: F401
     except Exception:                                          # noqa: BLE001
         pass
-    try:
-        lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
-    except OSError as exc:
-        # The file is THERE; its dependency closure is not resolvable.
-        raise LibraryUnusable(
-            f"{path} exists but could not be loaded: {exc}.  This is a BROKEN "
-            f"BUILD OR ENVIRONMENT, not an absent library: check "
-            f"LD_LIBRARY_PATH and, in a container, that every RPATH "
-            f"directory is actually bind-mounted "
-            f"(ldd {path} | grep 'not found').") from exc
-    # FIRST, before any declaration reads a symbol out of it.  See _check_abi.
-    _check_abi(lib, platform, str(path))
+    lib, actual_origin = _native.open_and_attest(
+        path, platform=platform, expected_abi=LORRAX_FFI_ABI_VERSION,
+        abi_symbols=_ABI_SYMBOLS,
+        build_hint=str(_PLATFORMS[platform]["build_hint"]),
+        strict_unstamped=os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1",
+        unusable_cls=LibraryUnusable, mismatch_cls=AbiMismatch)
     _bind_c_abi(lib, platform)
     _declare_cusolvermp(lib)
     _declare_slate(lib)
     _register_ffi_targets(lib, platform)
     _LIBS[platform] = lib
-    _LIB_PATHS[platform] = str(path)
+    _LIB_PATHS[platform] = str(actual_origin)
     return lib
 
 

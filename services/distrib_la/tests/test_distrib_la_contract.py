@@ -1689,11 +1689,15 @@ def _drive_open_order(monkeypatch, *, disable_rule=False, present=("CUDA", "cpu"
         opened.append(str(path))
         return _FakeLib()
 
+    def _fake_open(path, **kwargs):
+        return _fake_cdll(path), pathlib.Path(path)
+
     monkeypatch.setattr(L, "_LIBS", {})
     monkeypatch.setattr(L, "_LIB_PATHS", {})
     monkeypatch.setattr(L, "_CUDA_FIRST_TRIED", False)
     monkeypatch.setattr(L, "_locate_so", _fake_locate)
     monkeypatch.setattr(L.ctypes, "CDLL", _fake_cdll)
+    monkeypatch.setattr(L._native, "open_and_attest", _fake_open)
     monkeypatch.setattr(L, "_declare_cusolvermp", lambda lib: None)
     monkeypatch.setattr(L, "_declare_slate", lambda lib: None)
     monkeypatch.setattr(L, "_register_ffi_targets", lambda lib, platform: None)

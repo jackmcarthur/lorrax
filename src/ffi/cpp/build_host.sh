@@ -190,5 +190,13 @@ bash "${LORRAX_ROOT}/scripts/verify_ffi_build.sh" --leg host "${SO_FILE}" || {
     exit 1
 }
 
+# A deployable bundle refuses an ELF with no exact source/hash receipt.  The
+# pair sealer later requires this stamp from BOTH legs; it cannot reconstruct
+# which source produced an already-built file.
+"${SCRIPT_DIR}/stage/stamp_provenance.sh" "${SO_FILE}" \
+    "leg=host" \
+    "slate=${SLATE_DIR}" \
+    "build_dir=${BUILD_DIR}"
+
 echo
 echo "[build_host] done.  .so at: ${SO_FILE}"
