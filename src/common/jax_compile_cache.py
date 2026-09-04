@@ -30,7 +30,7 @@ Knobs (all optional):
                                           per-module cross-rank compile-key
                                           refusal (default on at P > 1).
   ``LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S`` — bounded per-module agreement
-                                          timeout, default 60 seconds.
+                                          timeout, default 300 seconds.
   ``LORRAX_JAX_CACHE_STRICT=0``         — on an agreed entry that then fails
                                           to load, warn instead of aborting
                                           (UNSAFE on GPU: can hang).
@@ -293,7 +293,11 @@ _KV_NS = "lorrax/compile_cache/v1"
 # compile and refuses a rank-divergent module before XLA can enter collective
 # GPU autotuning and wait forever.
 _COMPILE_KV_NS = "lorrax/compile_agreement/v2"
-_COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 60.0
+# Production Si MPA legitimately reaches the post-planning host-materialize
+# compile slot 122 s apart across P4 ranks (JID 57909046.129).  Five minutes
+# keeps that measured skew inside the contract while remaining a finite
+# fail-fast bound; tests and bisect probes use their own short deadline.
+_COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 300.0
 
 # Parallel page-cache prefetch of the agreed entries (see _prefetch_agreed).
 # ON: at 606 centroids / P=16 the SERIAL reads of 169 entries cost 29 s on one
