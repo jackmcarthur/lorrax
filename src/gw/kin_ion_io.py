@@ -64,11 +64,6 @@ from common.progress import LoopProgress
 from common.scientific_output import (
     band_range, pseudopotential_file_rows,
 )
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 import symmetry_maps                                           # noqa: E402
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (

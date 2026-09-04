@@ -149,11 +149,6 @@ import time
 import jax
 import numpy as np
 
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import timing
 from common.collectives import process_rank

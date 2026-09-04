@@ -22,8 +22,8 @@ THE wfn_loader AND symmetry_maps BRANCHES BOTH GENERALIZED THIS FILE, in
 parallel and without seeing each other, and the 2026-08-08 landing merge
 kept BOTH generalizations because they measure different things.  From
 wfn_loader: the bootstrap-ORDER census (``_scan_tree``, door-parameterized
-already), which asserts every module-scope door import has an
-``ensure_on_path()`` call strictly above it.  From symmetry_maps: the
+already), which asserts every module-scope door import has a source-sealing
+call strictly above it.  From symmetry_maps: the
 BUCKETED census, which asserts the set of module-scope consumers equals
 the union of four lists, so a new consumer has to be classified —
 bare-launch-covered, FFI-blocked, shim, or script — before the suite goes
@@ -31,10 +31,10 @@ green.  Dropping either would have silently retired a real gate; the
 merge added the symmetry_maps door to the first and left the second
 scoped to its own door, which is what its own comment asks for.
 
-``ffi._services.ensure_on_path()`` is the bootstrap, and it is transitional
-plumbing with an owner decision behind it (see its docstring: pip install -e
-services/*, a modulefile PYTHONPATH entry, or a uv workspace — all touch
-shared resources).  These cells are what keeps it honest until then.
+``runtime.source_closure`` is the one metadata-derived package seal.
+Core drivers reach it through ``initialize_communicator_stack()``; direct
+library imports retain ``ffi._services.ensure_on_path()`` as a compatibility
+door that delegates to that same seal and owns no path policy of its own.
 
 Each cell launches a SUBPROCESS with ``PYTHONPATH=<repo>/src`` and nothing
 else, which is the cluster's environment exactly, and imports a consumer
@@ -123,9 +123,11 @@ _MODULE_SCOPE_CONSUMERS = (
     ("file_io", "wfn_loader"),
     ("psp.operator_checks", "wfn_loader"),
     ("centroid.charge_density", "symmetry_maps"),
+    ("centroid.kmeans_isdf", "symmetry_maps"),
     ("centroid.pivoted_cholesky", "symmetry_maps"),
-    ("psp.get_DFT_mtxels", "symmetry_maps"),
-    ("psp.run_sternheimer", "symmetry_maps"),
+    ("gw.centroid_k_unfold", "symmetry_maps"),
+    ("psp.get_DFT_mtxels", "wfn_loader"),
+    ("psp.run_sternheimer", "wfn_loader"),
 )
 
 #: Every service the pairs above reach.  The red arm runs once per service:
@@ -170,8 +172,14 @@ _ALL_MODULE_SCOPE_DOOR_CONSUMERS = frozenset({
     "psp.run_sternheimer",
 })
 
-#: The bootstrap call every one of them must make FIRST.
-_BOOTSTRAP = "ensure_on_path"
+#: Calls that seal the source closure.  Core drivers use the full runtime
+#: startup; direct library consumers use the compatibility door.
+_BOOTSTRAPS = frozenset({
+    "bootstrap",
+    "ensure_on_path",
+    "ensure_source_closure",
+    "initialize_communicator_stack",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -198,12 +206,9 @@ _BOOTSTRAP = "ensure_on_path"
 #: each went through :func:`_bare_run` and died on the missing library, never
 #: on the bootstrap.  The Si COHSEX fixture run covers them on the cluster.
 _FFI_BLOCKED_CONSUMERS = (
-    "bandstructure.htransform",
     "centroid.kmeans_cli",
-    "gw.gw_jax",
     "gw.kin_ion_io",
     "psp.get_dipole_mtxels",
-    "psp.orbital_magnetization",
 )
 
 #: The three transitional shims — ``src/`` modules whose whole body is a
@@ -219,6 +224,13 @@ _FFI_BLOCKED_CONSUMERS = (
 #: whereas a deleted list is no claim at all.  ``_RETIRED_SHIM_PATHS``
 #: below carries the ratchet that keeps it empty.
 _SHIM_CONSUMERS = ()
+
+#: An annotation-only import guarded by ``typing.TYPE_CHECKING``.  The AST
+#: census keeps conditional module statements visible, so account for this
+#: edge explicitly without pretending it executes or needs a bare-run cell.
+_STATIC_ONLY_CONSUMERS = (
+    "file_io.centroids",
+)
 
 #: Not importable modules, so ``_bare_run`` cannot parametrize over them —
 #: they are entry points, covered the same way the FFI-blocked consumers are.
@@ -267,15 +279,15 @@ def _door_imports(tree: ast.Module, door: str):
 
 
 def _bootstrap_lineno(tree: ast.Module):
-    """Line of the first module-scope ``ensure_on_path()`` CALL, or None.
+    """Line of the first module-scope source-sealing call, or ``None``.
 
-    The CALL, not the import of it: ``from ffi import _services`` puts the
-    name in scope and does nothing to ``sys.path``.  Several consumers
-    import ``_services`` many lines above the call that matters.
+    The CALL, not its import: putting a function in scope does not seal the
+    package set.  The final attribute name is sufficient here because the
+    supported calls have unique, explicit names and this is a source census.
     """
     for node in _module_scope_statements(tree):
         if (isinstance(node, ast.Call)
-                and ast.unparse(node.func).endswith(_BOOTSTRAP)):
+                and ast.unparse(node.func).rsplit(".", 1)[-1] in _BOOTSTRAPS):
             return node.lineno
     return None
 
@@ -311,10 +323,10 @@ def _scan_tree(src: str, door: str = "wfn_loader"):
             for lineno, spelling in hits:
                 if boot is None:
                     bad.append((dotted, lineno, spelling,
-                                f"no module-scope {_BOOTSTRAP}() anywhere"))
+                                "no module-scope source-sealing call anywhere"))
                 elif boot > lineno:
                     bad.append((dotted, lineno, spelling,
-                                f"{_BOOTSTRAP}() is at line {boot}, AFTER "
+                                f"source-sealing call is at line {boot}, AFTER "
                                 f"the import at {lineno}"))
     return census, bad
 
@@ -395,9 +407,10 @@ def test_the_module_scope_symmetry_maps_census_is_complete():
     documented = (
         {_module_path(m) for m, door in _MODULE_SCOPE_CONSUMERS
          if door == "symmetry_maps"}
-        | {_module_path(m) for m in _FFI_BLOCKED_CONSUMERS}
-        | {_module_path(m) for m in _SHIM_CONSUMERS}
-        | set(_SCRIPT_CONSUMERS))
+         | {_module_path(m) for m in _FFI_BLOCKED_CONSUMERS}
+         | {_module_path(m) for m in _SHIM_CONSUMERS}
+         | {_module_path(m) for m in _STATIC_ONLY_CONSUMERS}
+         | set(_SCRIPT_CONSUMERS))
     found = (_scan_module_scope(_REPO / "src", _REPO, "symmetry_maps")
              | _scan_module_scope(_REPO / "scripts", _REPO, "symmetry_maps"))
     unlisted = sorted(found - documented)
@@ -714,23 +727,8 @@ def test_the_retired_path_scan_can_fail(tmp_path):
         f"'innocent' would make the ratchet fail the migration it enforces.")
 
 
-def test_the_bootstrap_is_idempotent_and_appends():
-    """``ensure_on_path`` must not shadow an environment that already knows.
-
-    It APPENDS: an editable install or a PYTHONPATH entry keeps winning, so
-    a machine that has been taught about ``services/`` does not silently
-    switch to the in-tree copy the day a consumer imports the door.
-
-    The expected count is ENUMERATED FROM DISK here, by a different call
-    than the one under test (``pathlib.iterdir`` in this process vs
-    ``os.listdir`` in the subprocess's ``_services.service_roots``), and
-    the two services that must always be there are named.  It was the
-    literal ``2`` until 2026-08-07, which is a number every service
-    extraction has to come back and bump — four wave-1 branches editing one
-    line, i.e. a guaranteed conflict for a fact the filesystem already
-    states.  A bare ``len(added) > 0`` would be the tautology to avoid;
-    this is neither.
-    """
+def test_the_compatibility_door_uses_the_idempotent_authoritative_seal():
+    """The bridge selects this checkout once and owns no append policy."""
     expected = sorted(p.name for p in (_REPO / "services").iterdir()
                       if (p / "src").is_dir())
     assert {"lxkit", "distrib_la"} <= set(expected), expected
@@ -745,7 +743,8 @@ def test_the_bootstrap_is_idempotent_and_appends():
         "added = [p for p in once if p not in before]\n"
         "assert once == twice, 'not idempotent'\n"
         "assert added, 'added nothing'\n"
-        "assert once[:len(before)] == before, 'it PREPENDED; must append'\n"
+        "assert all('/services/' in p and p.endswith('/src') "
+        "for p in once[:len(added)]), 'selected roots were not prepended'\n"
         "print('ADDED', len(added))\n")
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     # One per ``services/*/src`` that EXISTS — the count is the census, not
@@ -787,10 +786,9 @@ def test_every_module_scope_door_consumer_has_the_bootstrap_before_it():
     NON-EMPTY: a detector that finds nothing agrees with a detector that
     is broken, and the second is the likelier reading after a rename.
 
-    ORDERED: every door import has a module-scope ``ensure_on_path()``
-    call on a line STRICTLY ABOVE it.  Order is the whole claim — the
-    bootstrap appends to ``sys.path``, so a call below the import runs
-    after the ``ImportError`` it was meant to prevent.
+    ORDERED: every door import has a module-scope source-sealing call on a
+    line STRICTLY ABOVE it.  Order is the whole claim: a call below the
+    import runs after the ``ImportError`` it was meant to prevent.
 
     COMPLETE: the census equals ``_ALL_MODULE_SCOPE_DOOR_CONSUMERS``.  A
     thirteenth consumer fails HERE until it is listed, which is the point:
@@ -806,7 +804,7 @@ def test_every_module_scope_door_consumer_has_the_bootstrap_before_it():
         "after it stopped measuring anything.")
 
     assert not unbootstrapped, (
-        "module-scope door importers with no ensure_on_path() above "
+        "module-scope door importers with no source-sealing call above "
         "them.  PYTHONPATH on the cluster is <repo>/src and nothing "
         "else, so these ImportError on the first real run while the "
         "whole pytest suite stays green (the service conftest puts "
@@ -839,20 +837,20 @@ def test_every_module_scope_door_consumer_has_the_bootstrap_before_it():
         f"has gone vacuous.")
 
 
-def test_service_directory_census_runs_once_per_process(monkeypatch):
-    """Repeated transitional door calls do no repeated filesystem census."""
+def test_compatibility_door_delegates_and_owns_no_service_census(monkeypatch):
+    """The compatibility door has no independent roster or path mutation."""
     monkeypatch.syspath_prepend(_SRC)
     from ffi import _services
 
     calls = []
-    monkeypatch.setattr(_services, "_READY", False)
     monkeypatch.setattr(
-        _services, "service_roots",
-        lambda: calls.append("census") or [],
+        _services, "_ensure_source_closure",
+        lambda **kwargs: calls.append(kwargs),
     )
     _services.ensure_on_path()
-    _services.ensure_on_path()
-    assert calls == ["census"]
+    assert calls == [{"print_fn": _services._rank0_print}]
+    assert not hasattr(_services, "service_roots")
+    assert not hasattr(_services, "_READY")
 
 
 def test_the_census_detector_catches_a_missing_and_a_late_bootstrap(tmp_path):

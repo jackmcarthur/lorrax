@@ -22,11 +22,6 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial
 
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta
 from common import timing

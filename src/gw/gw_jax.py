@@ -88,11 +88,6 @@ import jax.numpy as jnp
 from file_io import (
     load_kin_ion_submatrix, load_centroid_basis,
 )
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
