@@ -4760,6 +4760,15 @@ def _validate_occupation_smearing(screening, family, width_ry):
                 f"{RYD_TO_EV} eV/Ry, or remove one of them.")
 
 
+def infer_material_class(occupations) -> str:
+    """Classify a mean field from its WFN occupation array."""
+    occ = np.asarray(occupations, dtype=np.float64)
+    if occ.size == 0 or not np.all(np.isfinite(occ)):
+        raise ValueError("WFN occupations must be finite and nonempty")
+    distance = np.abs(occ - np.rint(occ))
+    return "metal" if float(np.max(distance)) > 1.0e-6 else "insulator"
+
+
 def validate_material_inputs(config, material_class):
     """Validate deck inputs after occupations determine the material class."""
     if material_class not in ("insulator", "metal"):
@@ -5226,12 +5235,24 @@ class LorraxConfig:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_input_file(cls, filename: str, *, print_fn=print) -> LorraxConfig:
+    def from_input_file(
+        cls,
+        filename: str,
+        *,
+        print_fn=print,
+        runtime_platform: str | None = None,
+        resolve_hardware: bool = True,
+    ) -> LorraxConfig:
         """Parse input file and resolve runtime settings (memory, env vars).
 
         Replaces ``read_cohsex_input`` + ``resolve_runtime_config`` +
         path resolution in one call.  Returns a ``LorraxConfig`` with
         sub-dataclasses fully populated.
+        unknown-key policy. ``runtime_platform`` is an injected ``cpu`` or
+        ``gpu`` answer for a preflight that has no target device. With
+        ``resolve_hardware=False``, an auto memory budget stays at its zero
+        sentinel and no device-memory probe is made; explicit deck budgets
+        remain resolved. Production callers use all defaults.
         """
         from file_io import resolve_input_paths
 
@@ -5242,7 +5263,7 @@ class LorraxConfig:
 
         # --- Memory auto-detection ---
         memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
-        if memory_per_device_gb <= 0:
+        if memory_per_device_gb <= 0 and resolve_hardware:
             from common.gpu_utils import get_device_memory_gb
             memory_per_device_gb = get_device_memory_gb()
             print_fn(
@@ -5559,11 +5580,19 @@ class LorraxConfig:
             raise ValueError(
                 f"transverse_zeta_rcond={_transverse_zeta_rcond!r} must be "
                 f"a relative cutoff in (0, 1).")
-        try:
-            import jax as _jax
-            _is_cpu_backend = _jax.default_backend() == "cpu"
-        except Exception:
-            _is_cpu_backend = False
+        if runtime_platform is not None:
+            platform = str(runtime_platform).strip().lower()
+            if platform not in ("cpu", "gpu", "cuda"):
+                raise ValueError(
+                    "runtime_platform must be cpu or gpu/cuda, got "
+                    f"{runtime_platform!r}")
+            _is_cpu_backend = platform == "cpu"
+        else:
+            try:
+                import jax as _jax
+                _is_cpu_backend = _jax.default_backend() == "cpu"
+            except Exception:
+                _is_cpu_backend = False
         _dist_lu = _linalg.distributed_lu
         _dist_chol = _linalg.distributed_cholesky
         if _dist_lu == "distributed":

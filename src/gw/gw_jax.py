@@ -99,7 +99,8 @@ from .gw_config import (
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
-	resolve_mpa_sampling_alpha, validate_material_inputs)
+	infer_material_class, resolve_mpa_sampling_alpha,
+	validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -199,15 +200,6 @@ def _compute_static_head(
 		head, occ=occ_mask, cell_volume=meta.cell_volume, nk_tot=meta.nk_tot)
 	print0(format_static_head_diagnostics(terms))
 	return terms
-
-
-def _infer_material_class(wfn) -> str:
-	"""Classify the loaded mean field from its supplied occupations."""
-	occ = np.asarray(wfn.occs, dtype=np.float64)
-	if occ.size == 0 or not np.all(np.isfinite(occ)):
-		raise ValueError("WFN occupations must be finite and nonempty")
-	distance = np.abs(occ - np.rint(occ))
-	return "metal" if float(np.max(distance)) > 1.0e-6 else "insulator"
 
 
 def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,

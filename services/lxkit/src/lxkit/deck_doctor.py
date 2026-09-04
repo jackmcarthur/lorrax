@@ -255,11 +255,10 @@ def inspect_deck(args) -> None:
     # zero-GPU preflight can answer honestly.
     config = LorraxConfig.from_input_file(
         str(deck),
-        strict_keys=True,
         runtime_platform=None if args.gpu else "gpu",
         resolve_hardware=args.gpu,
     )
-    print(f"DECK_PARSE_OK strict_keys=true deck={deck}")
+    print(f"DECK_PARSE_OK strict deck={deck}")
 
     from file_io.centroids import load_centroids
     from file_io.mf_header import read_mf_header

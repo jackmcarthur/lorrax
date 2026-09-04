@@ -23,7 +23,8 @@ def resolve_input_paths(params: dict, input_dir: str) -> dict:
 		return resolve_input_path(input_dir, path)
 
 	path_keys = [
-		"wfn_file", "centroids_file", "kin_ion_file",
+		"wfn_file", "centroids_file", "centroids_file_current",
+		"kin_ion_file", "bgw_vcoul_file", "bgw_vcoul_sym_wfn",
 		"parallel_transport_file", "static_gauge_hall_file",
 		"mpa_fit_reuse_file",
 		"sigma_diag_file", "eqp0_file", "eqp1_file", "report_file",
