@@ -433,7 +433,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
                     else "charge"),
         k_weights=full_k_quadrature_weights(wfn, sym),
         verbose=(debug_print_enabled() and process_rank() == 0),
-        select_time_budget_s=args.prune_time_budget_seconds,
+        select_time_budget_s=getattr(
+            args, "prune_time_budget_seconds",
+            _DEFAULT_PRUNE_TIME_BUDGET_SECONDS),
         progress_print_fn=rank0_print,
     )
     if args.prune_window == "v_x_vc":

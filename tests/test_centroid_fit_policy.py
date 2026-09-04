@@ -144,9 +144,11 @@ def _load_prune_stage_without_driver_startup():
         "__package__": "centroid",
         "np": np,
         "print0": lambda *args, **kwargs: None,
+        "rank0_print": lambda *args, **kwargs: None,
         "debug_print_enabled": lambda: False,
         "process_rank": lambda: 0,
         "timing": SimpleNamespace(section=lambda _name: nullcontext()),
+        "_DEFAULT_PRUNE_TIME_BUDGET_SECONDS": 900.0,
     }
     exec(compile(ast.Module(body=definitions, type_ignores=[]),
                  str(ROOT / "src/centroid/kmeans_cli.py"), "exec"), namespace)
@@ -191,6 +193,7 @@ def test_current_prune_routes_exact_transverse_metric_through_group_blocks(
     call = calls[0]
     assert call["group_block"] is True
     assert call["n_keep"] == call["n_point_budget"] == 4
+    assert call["select_time_budget_s"] == 900.0
     assert call["bispinor"] is True
     assert call["gamma_mode"] == "transverse"
     assert "band_norms" not in call
@@ -232,5 +235,6 @@ def test_scalar_prune_keeps_the_same_ungrouped_charge_route(monkeypatch):
     call = calls[0]
     assert call["group_block"] is False
     assert call["n_point_budget"] is None
+    assert call["select_time_budget_s"] == 900.0
     assert call["bispinor"] is False
     assert call["gamma_mode"] == "charge"
