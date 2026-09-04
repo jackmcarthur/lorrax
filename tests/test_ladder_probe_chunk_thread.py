@@ -65,7 +65,9 @@ def _drive_facade(monkeypatch, *, deck_chunk, p_y):
         screening=SimpleNamespace(ladder_probe_chunk=deck_chunk),
         head=SimpleNamespace(correction=None),
         input_file="deck.in")
-    mesh = SimpleNamespace(devices=np.zeros((1, p_y)))
+    mesh = SimpleNamespace(
+        devices=np.zeros((1, p_y)), axis_names=("x", "y"),
+        shape={"x": 1, "y": p_y})
     lines = []
     sb._ladder_wedge("restart.h5", [0.0 + 0.0j], mesh,
                      input_file="deck.in", config=config,

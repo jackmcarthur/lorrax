@@ -79,7 +79,6 @@ from common.pivoted_cholesky import (
     make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
 )
-from runtime.padding import round_up
 from runtime.production_stream import failure_output_streams
 
 from . import distribution as dist
@@ -424,8 +423,13 @@ def gram_col_block_device_bytes(
     """
     x_i = max(1, int(x_shards))
     y_i = max(1, int(y_shards))
-    rows_local = (min(int(n_rows), int(block_width)) + x_i - 1) // x_i
-    cols_local = (int(block_width) + y_i - 1) // y_i
+    from runtime.padding import padded_axis
+    rows_local = padded_axis(
+        min(int(n_rows), int(block_width)), x_i,
+        name="Gram row-shard carrier").carrier // x_i
+    cols_local = padded_axis(
+        int(block_width), y_i,
+        name="Gram column-shard carrier").carrier // y_i
     return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
 
 
@@ -487,7 +491,10 @@ def _auto_gram_width_from_compiled_peaks(
     itself is always queried and certified.
     """
     d = max(1, int(divisor))
-    floor = ((max(1, _GRAM_MIN_COL_BLOCK) + d - 1) // d) * d
+    from runtime.padding import padded_axis
+    floor = padded_axis(
+        max(1, _GRAM_MIN_COL_BLOCK), d,
+        name="pivoted-Cholesky Gram floor").carrier
     ceiling = (int(max_width) // d) * d
     width = min(max(floor, (int(seed_width) // d) * d), ceiling)
     checked: dict[int, dict[str, int]] = {}
@@ -523,7 +530,10 @@ def _auto_gram_width_from_compiled_peaks(
     # nearly 4x the useful square work.  Keep the SAME number of scan iterations
     # and shrink to the minimum aligned width that still covers the extent.
     ntiles, _, _ = gram_tile_schedule(ceiling, width)
-    compact = round_up(-(-ceiling // ntiles), d)
+    from runtime.padding import padded_axis
+    compact = padded_axis(
+        -(-ceiling // ntiles), d,
+        name="pivoted-Cholesky compact tile").carrier
     compact = min(width, max(floor, compact))
     if compact != width:
         compact_facts = check(compact)
@@ -1110,12 +1120,9 @@ def prune_candidates_by_pivoted_cholesky(
     # n_pad rows/cols are zero-padding, NOT candidates.
     M_pad = int(G.shape[0])
     n_pad = M_pad - M
-    if M_pad % n_dev != 0:
-        raise ValueError(
-            f"Gram came back with M_pad={M_pad}, which the mesh product "
-            f"{n_dev} does not divide (logical M={M}). The sharded select "
-            f"needs an even row split; expected round_up(M, {n_dev})="
-            f"{-(-M // n_dev) * n_dev}.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        M, M_pad, n_dev, name="pivoted-Cholesky candidate carrier")
 
     # This diagnostic consumes a globally sharded value, so every process
     # must execute it even though only rank 0 prints.  Putting the JAX work
@@ -1642,7 +1649,11 @@ def build_gram_q0_via_loadwfns(
         float(meta.memory_per_device_gb) * 1e9
         * _GRAM_SEED_BUDGET_FRACTION
     )
-    tile_divisor = math.lcm(n_x, n_y)
+    from runtime.padding import padded_axis
+    tile_divisor = padded_axis(
+        1, mesh_xy, name="Gram square-tile divisor",
+        specs=((PartitionSpec('x', None), 0),
+               (PartitionSpec(None, 'y'), 1))).divisor
     block_source = "auto"
     if env_cb:
         block_source = "LORRAX_GRAM_COL_BLOCK override"
@@ -1660,7 +1671,10 @@ def build_gram_q0_via_loadwfns(
         # A manual width keeps its historical floor and is rounded UP so the
         # now-square tile divides BOTH mesh axes.  It is an explicit override,
         # so it may exceed auto's target and the diagnostic below says so.
-        col_block = round_up(col_block, tile_divisor)
+        from runtime.padding import padded_axis
+        col_block = padded_axis(
+            col_block, tile_divisor,
+            name="pivoted-Cholesky column block").carrier
     else:
         if gram_col_block_bytes(nk_, ns_, M_cols) <= seed_budget_bytes:
             col_block = M_cols
@@ -1728,11 +1742,13 @@ def build_gram_q0_via_loadwfns(
         resident_bytes = worst_process_resident_bytes(resident_local_bytes)
 
         target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
+        from runtime.padding import padded_axis
+        gram_rows_local = padded_axis(
+            M_cols, n_x, name="Gram resident row carrier").carrier // n_x
+        gram_cols_local = padded_axis(
+            M_cols, n_y, name="Gram resident column carrier").carrier // n_y
         gram_local_bytes = (
-            ((M_cols + n_x - 1) // n_x)
-            * ((M_cols + n_y - 1) // n_y)
-            * _GRAM_COMPLEX_BYTES
-        )
+            gram_rows_local * gram_cols_local * _GRAM_COMPLEX_BYTES)
 
         def _compiled_live_set(tile_width):
             tile_width = int(tile_width)

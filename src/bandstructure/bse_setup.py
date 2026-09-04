@@ -46,7 +46,8 @@ from distrib_la import plan as linalg_plan, mesh_key as _mesh_key   # noqa: E402
 # ``exciton_bands`` unrunnable at EVERY P>1 on any deck whose centroid count is
 # not a multiple of the mesh axis (785 = 5·157 on the MoS2 4×4 deck: job
 # 7882476 cells exb16s/exb64s).  See common/sharding_fit.py.
-from common.sharding_fit import fit_sharding as _fit, padded_extent as _pad_to
+from common.sharding_fit import fit_sharding as _fit
+from runtime.padding import padded_axis
 # The (i,j)-face → q-batch move below is a layout change XLA cannot lower in
 # one step; ``common.staged_reshard`` is the two-all_to_all staging that makes
 # it legal.  See the block at ``fH_q(qbatch)``.
@@ -519,8 +520,11 @@ def compute_wfns_fi(
     # loop already appended and the same ``[:nq]`` slice already discarded —
     # ``lam``/``psi``/``coeffs`` are per-q independent, so padding the batch
     # cannot touch a value, only how many are computed and where.
-    bs = _pad_to(mesh_xy, ('x', 'y'), batch_size)
-    _ndev = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])
+    bs = padded_axis(
+        batch_size, mesh_xy, name="BSE q batch",
+        spec=P(("x", "y"), None, None), axis=0).carrier
+    from runtime.padding import mesh_divisor
+    _ndev = mesh_divisor(mesh_xy)
     _batch_note = (f"q-chunk={bs} [{_bs_origin}]" if bs == batch_size else
                    f"q-chunk={bs} ({_bs_origin}, padded to a multiple of "
                    f"ndev={_ndev} so the q axis splits)")
@@ -565,7 +569,7 @@ def compute_wfns_fi(
         q_all = _uniform_kgrid_frac(kgrid_fi)
     else:
         q_all = jnp.asarray((q_list + 0.5) % 1.0 - 0.5)
-    n_pad = (-nq) % bs
+    n_pad = padded_axis(nq, bs, name="BSE setup q batch").pad
     q_pad = (jnp.concatenate([q_all, jnp.zeros((n_pad, 3), dtype=q_all.dtype)])
              if n_pad else q_all)
 
@@ -631,11 +635,7 @@ def compute_wfns_fi(
     # actually reach here, and ``bs`` is padded to ndev a few lines above.
     _route = resolve_reshard_route(reshard_route, log_fn=log)
     _stage_q = (_face_to_batch_reshard(
-                    mesh_xy, axes=('x', 'y'), route=_route, log_fn=log,
-                    divisibility_hint=(
-                        "bse_setup pads the q-batch with "
-                        "sharding_fit.padded_extent; ``rank`` is pinned by "
-                        "streaming_galerkin_solve to lcm(px, py)."))
+                    mesh_xy, axes=('x', 'y'), route=_route, log_fn=log)
                 if native and _face_to_batch_supported(
                     mesh_xy, (bs, rank, rank), axes=('x', 'y'),
                     route=_route) else None)

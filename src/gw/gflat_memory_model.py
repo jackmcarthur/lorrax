@@ -98,7 +98,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.gpu_utils import bfc_fragmentation_target_utilization
-from runtime.padding import bounded_partition_tile, round_up
+from runtime.padding import bounded_partition_tile, padded_axis, round_down
 
 # The planner's ONE printing path: every fallback below announces its demotion
 # through this, once per process, tagged with the rank it happened on.  (Safe
@@ -144,15 +144,20 @@ def _coupled_mu123_zq_incremental_bytes(
     extra_gflat = 0.0 if host_spill_gflat else extra_gflat_host
     extra_factors = 2.0 * _c128(
         nq, mu, mu, shard=int(p_x) * int(p_y))
-    face_nb_transport = round_up(face_nb, int(p_x) * int(p_y))
+    from runtime.padding import padded_axis
+    face_nb_transport = padded_axis(
+        face_nb, int(p_x) * int(p_y),
+        name="gflat face band carrier").carrier
     extra_psi_r = (2.0 * _c128(
         nk, face_nb_transport, ns, n_rtot,
         shard=int(p_x) * int(p_y)) if cache_psi_r else 0.0)
     stacked_solve = 0.0
     if stack_three_solves:
         p_xy = int(p_x) * int(p_y)
-        b_one = round_up(nq, p_xy)
-        b_three = round_up(3 * nq, p_xy)
+        b_one = padded_axis(
+            nq, p_xy, name="single-channel q carrier").carrier
+        b_three = padded_axis(
+            3 * nq, p_xy, name="three-channel q carrier").carrier
         delta_b = b_three - b_one
         # Two nonconcurrent liveness phases bind.  First, face→batch local
         # RHS input/output plus the larger A arena; second, one enlarged local
@@ -308,7 +313,8 @@ def batch_reshard_square_solve_capacity(
         raise ValueError(
             "memory_per_device_gb must be positive, got "
             f"{memory_per_device_gb}")
-    batch_local = (batch + processes - 1) // processes
+    batch_local = padded_axis(
+        batch, processes, name="batch memory carrier").carrier // processes
     limit_bytes = (
         _ARENA_PLACEMENT_FRAC * memory_per_device_gb * 1.0e9)
     bytes_per_mu2 = 3 * _C128 * batch_local * 2
@@ -351,7 +357,9 @@ def centroid_fft_tile_geometry(
         raise ValueError(
             "centroid FFT geometry requires positive nk, band_chunk, and "
             f"p_band; got nk={nk}, band_chunk={band_chunk}, p_band={p_band}")
-    band_tile = round_up(band_chunk, p_band)
+    from runtime.padding import padded_axis
+    band_tile = padded_axis(
+        band_chunk, p_band, name="centroid FFT band tile").carrier
     local_bands = band_tile // p_band
     k_tile = min(nk, max(1, band_tile // local_bands))
     return k_tile, k_tile * local_bands
@@ -729,7 +737,8 @@ def plan_gflat_chunks(
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
-    p_xy = p_x * p_y
+    from runtime.padding import mesh_divisor
+    p_xy = mesh_divisor(mesh_xy)
 
     nk = int(meta.nk_tot)
     ns = int(meta.nspinor)
@@ -745,10 +754,10 @@ def plan_gflat_chunks(
         raise ValueError(
             f"fit_nb_total and face_nb_total must be positive, got "
             f"fit={fit_nb}, face={face_nb}")
-    if low_mem_bands and face_nb % p_y:
-        raise ValueError(
-            f"face_nb_total={face_nb} must divide the face band mesh axis "
-            f"Py={p_y}")
+    if low_mem_bands:
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            face_nb, face_nb, p_y, name="face band memory-model carrier")
     fft_grid = tuple(getattr(meta, 'fft_grid', None)
                      or (int(round(n_rtot ** (1 / 3))),) * 3)
     if n_q_ibz is None:
@@ -779,7 +788,8 @@ def plan_gflat_chunks(
     # cannot fit the target.  Ordinary modes retain the established hoist.
     _persistent_base = _persistent_bytes(p_x=p_x, p_y=p_y, **sys)
     _min_cache_slots = max(
-        p_xy, ((fit_nb + p_xy - 1) // p_xy) * p_xy)
+        p_xy, padded_axis(
+            fit_nb, p_xy, name="minimum cached fit bands").carrier)
     _min_cache_bytes = _c128(
         nk, _min_cache_slots, ns, n_rtot, shard=p_xy)
     cache_psi_r = True
@@ -789,12 +799,14 @@ def plan_gflat_chunks(
             int(band_chunk_override)
             if band_chunk_override and band_chunk_override > 0 else fit_nb)
         _cache_probe_bc = max(
-            p_xy, ((_cache_probe_bc + p_xy - 1) // p_xy) * p_xy)
+            p_xy, padded_axis(
+                _cache_probe_bc, p_xy,
+                name="cache-probe fit-band chunk").carrier)
         _cache_probe_bc = min(_cache_probe_bc, _min_cache_slots)
         _cache_probe_r = min(
             n_rtot, max(min(mu, n_rtot), math.ceil(n_rtot / max_chunks)))
         _cache_probe_r = max(
-            p_y, _cache_probe_r - _cache_probe_r % max(p_y, 1))
+            p_y, round_down(_cache_probe_r, p_y))
         _cache_probe_face = _stage_C_face_terms(
             nk=nk, ns=ns, mu=mu, face_nb=face_nb,
             slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
@@ -820,13 +832,16 @@ def plan_gflat_chunks(
     # ---- Phase 1: the rank floor (un-chunkable ÷P / ÷√P family) ---------
     def _floor_at(pp: int) -> float:
         px, py = _factor_mesh(pp)
-        face_nb_pp = ((face_nb + pp - 1) // pp) * pp
+        face_nb_pp = padded_axis(
+            face_nb, pp, name="face bands at candidate rank").carrier
         if band_chunk_override and band_chunk_override > 0:
             floor_bc = int(band_chunk_override)
         else:
             floor_bc = fit_nb
-        floor_bc = max(pp, ((floor_bc + pp - 1) // pp) * pp)
-        fit_padded = max(pp, ((fit_nb + pp - 1) // pp) * pp)
+        floor_bc = max(pp, padded_axis(
+            floor_bc, pp, name="fit-band chunk at candidate rank").carrier)
+        fit_padded = max(pp, padded_axis(
+            fit_nb, pp, name="fit bands at candidate rank").carrier)
         floor_bc = min(floor_bc, fit_padded)
         cache_slots = math.ceil(fit_nb / floor_bc) * floor_bc
         psi_r_cache = _c128(nk, cache_slots, ns, n_rtot, shard=pp)
@@ -871,12 +886,15 @@ def plan_gflat_chunks(
     # ---- band_chunk (Stage A FFT box) ----------------------------------
     def _bump_bc(bc: int) -> int:
         bc = int(bc)
-        if p_xy > 1 and bc % p_xy != 0:
-            bc = ((bc + p_xy - 1) // p_xy) * p_xy
+        from runtime.padding import padded_axis
+        if p_xy > 1:
+            bc = padded_axis(
+                bc, p_xy, name="gflat band-chunk carrier").carrier
         # The physical transport chunk may extend past the logical ζ edge by
         # at most P-1 zero-masked bands.  Do not clamp a rounded value back to
         # a non-divisible logical edge (e.g. 50 -> 52 -> 50 at P=4).
-        fit_nb_padded = ((fit_nb + p_xy - 1) // p_xy) * p_xy
+        fit_nb_padded = padded_axis(
+            fit_nb, p_xy, name="gflat fit-band carrier").carrier
         return min(max(bc, p_xy), max(fit_nb_padded, p_xy))
 
     _fft_box_cache: dict[tuple[int, int], float] = {}
@@ -905,8 +923,7 @@ def plan_gflat_chunks(
         r_for_band_guard = max(r_lo, math.ceil(n_rtot / max_chunks))
     if r_alignment > 1:
         r_for_band_guard = max(
-            r_alignment,
-            r_for_band_guard - r_for_band_guard % r_alignment)
+            r_alignment, round_down(r_for_band_guard, r_alignment))
 
     def _band_candidate_fits(bc: int) -> bool:
         n_bc = math.ceil(fit_nb / bc)
@@ -1034,8 +1051,7 @@ def plan_gflat_chunks(
                        else min(n_rtot, max(
                            r_lo, math.ceil(n_rtot / max_chunks))))
         route_width = max(
-            r_alignment,
-            route_width - route_width % max(r_alignment, 1))
+            r_alignment, round_down(route_width, r_alignment))
         route_tile = bounded_partition_tile(
             route_width, cache_cap, r_alignment)
         route_tiles = (route_width // route_tile) if route_tile else 0
@@ -1108,7 +1124,7 @@ def plan_gflat_chunks(
         r_chunk = min(r_chunk, n_rtot)
     if r_alignment > 1:
         r_chunk = max(
-            r_alignment, r_chunk - r_chunk % r_alignment)
+            r_alignment, round_down(r_chunk, r_alignment))
     n_r_chunks = max(1, math.ceil(n_rtot / r_chunk))
     if cache_face_y_blocks:
         face_y_cache_r_tile = bounded_partition_tile(
@@ -1151,7 +1167,8 @@ def plan_gflat_chunks(
     # Face pair accumulation needs only Py alignment; every solve still sees
     # an all-P carrier.  Price that pad here without imposing it on the face
     # kernel or duplicating the runtime channel resolver.
-    _solve_r_chunk = ((r_chunk + p_xy - 1) // p_xy) * p_xy
+    _solve_r_chunk = padded_axis(
+        r_chunk, p_xy, name="zeta-solve real-space chunk").carrier
     _rhs_stacks = 2 * _c128(nq, mu, _solve_r_chunk, shard=p_xy)
     # The full-BZ Z_q the solve is handed as a live input.  Defined HERE
     # rather than beside ``C_t`` because ``q_chunk``'s own headroom has to

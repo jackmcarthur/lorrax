@@ -231,6 +231,39 @@ def test_padded_axis_spec_derives_product_divisor_inside_owner():
         spec=(None, ("x", "y"), None), axis=1)
     assert (tag.logical, tag.carrier, tag.divisor) == (18, 32, 16)
 
+    shared = padded_axis(
+        86, MeshShape(), name="Sigma square band carrier",
+        specs=(
+            ((None, None, "x", None), 2),
+            ((None, None, None, "y"), 3),
+        ))
+    assert (shared.logical, shared.carrier, shared.divisor) == (86, 88, 4)
+
+
+def test_authenticate_padded_axis_recomputes_the_canonical_receipt():
+    from runtime.padding import authenticate_padded_axis
+
+    class MeshShape:
+        shape = {"x": 4, "y": 4}
+        axis_names = ("x", "y")
+
+    specs = (((None, "x"), 1), ((None, None, "y"), 2))
+    tag = authenticate_padded_axis(
+        86, 88, MeshShape(), name="Sigma band window", specs=specs)
+    assert (tag.logical, tag.carrier, tag.divisor) == (86, 88, 4)
+    with pytest.raises(ValueError, match="carrier extent is 86, expected 88"):
+        authenticate_padded_axis(
+            86, 86, MeshShape(), name="Sigma band window", specs=specs)
+
+
+def test_pad_square_can_identity_embed_a_rotation():
+    from runtime.padding import pad_square, padded_axis
+
+    tag = padded_axis(3, 2, name="rotation bands")
+    U = jnp.eye(3, dtype=jnp.complex128)[None]
+    got = np.asarray(pad_square(U, tag, pad_diagonal=1.0))
+    assert np.array_equal(got, np.eye(4, dtype=np.complex128)[None])
+
 
 def test_padded_axis_refusal_names_logical_and_carrier_extents():
     from runtime.padding import PaddedAxis, pad_to_axis
@@ -494,28 +527,33 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
         )
 
     assert has_centroid_assignment(
-        "band_tile", "round_up(requested_band_tile, p_band)")
+        "band_tile",
+        "padded_axis(requested_band_tile, p_band, "
+        "name='centroid stream band tile').carrier")
     assert has_centroid_assignment(
-        "nb_accum", "round_up(nb_total, band_tile)")
+        "nb_accum",
+        "padded_axis(nb_total, band_tile, "
+        "name='centroid stream band accumulator').carrier")
     assert has_centroid_assignment(
         "nb_per_band_shard",
         "band_tile // p_band if stream_tiles "
-        "else round_up(nb_total, p_band) // p_band",
+        "else padded_axis(nb_total, p_band, "
+        "name='centroid bulk band carrier').carrier // p_band",
     )
     assert has_centroid_assignment(
         "nb_padded_global",
         "band_tile if stream_tiles else nb_per_band_shard * p_band",
     )
     assert "(nb_total + n_devices - 1) // n_devices" not in centroid_body
-    assert "divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)" in parallel
-    assert "p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in galerkin_body
+    assert "spec=band_sphere_spec(), axis=1).carrier" in parallel
+    assert "spec=band_sphere_spec(), axis=1).divisor" in galerkin_body
     assert "p_band = max(1, int(mesh_xy.size))" not in galerkin_body
-    assert "n_pad = round_up(nq, batch_size) - nq" in ht
+    assert "nq, batch_size, name=\"htransform path-q carrier\").pad" in ht
     assert "n_pad = (-nq) % batch_size" not in ht
     assert "band_divisor = spec_divisor(mesh, in_spec, axis=1)" in move_body
     assert "r_divisor = spec_divisor(mesh, out_spec, axis=3)" in move_body
     assert "ndev = p_x * p_y" not in move_body
-    assert "m_pad = round_up(m_loc, p_y)" in staged
+    assert "m_loc, p_y, name=\"face-to-batch local row carrier\").carrier" in staged
     assert "m_pad = -(-m_loc // p_y) * p_y" not in staged
     assert "p = shard_factor(mesh, picked)" in subset_body
     assert "p *= int(mesh.shape[a])" not in subset_body

@@ -800,8 +800,7 @@ class BispinorVqReader:
                 n_q_total=self.n_q_total, n_rmu_C=self.n_rmu_C,
                 n_rmu_T=self.n_rmu_T)
 
-        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
-)
+        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy)
         self._io.__enter__()
 
     def __enter__(self):
@@ -841,10 +840,9 @@ class BispinorVqReader:
         Routed through ``runtime.padding.padded_mu_extent`` so the
         test-only LORRAX_EXTRA_MU_PAD knob stays consistent with the
         ψ-side / write-side extents."""
-        from runtime.padding import padded_mu_extent
-        proc = int(self._mesh.shape['x']) * int(self._mesh.shape['y'])
-        return (padded_mu_extent(int(n_L), proc),
-                padded_mu_extent(int(n_R), proc))
+        from runtime.padding import padded_mu_axis
+        return (padded_mu_axis(int(n_L), self._mesh).carrier,
+                padded_mu_axis(int(n_R), self._mesh).carrier)
 
     def get_tile(self, mu_L: int, nu_L: int) -> jax.Array:
         """Return V^{μ_L, ν_L}_q as a sharded JAX array (n_q, n_L_padded,

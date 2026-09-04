@@ -217,11 +217,6 @@ def _make_project_ri_reduce_scatter(
         layout=layout,
         face_shape=face_shape,
         face_band_extent=face_band_extent,
-        divisibility_hint=(
-            "Both existing sigma call sites pad via pad_sigma_window; "
-            "meta.py rounds b_id_4 to world_size but NOT the sigma band "
-            "window (b3-b0), so a new unpadded caller is a real hazard, "
-            "not a tautology."),
     )
 
 

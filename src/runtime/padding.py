@@ -51,6 +51,27 @@ def round_up(n: int, divisor: int) -> int:
     return ((int(n) + d - 1) // d) * d
 
 
+def round_down(n: int, divisor: int) -> int:
+    """Round ``n`` down to a nonnegative multiple of ``divisor``."""
+    value = max(int(n), 0)
+    d = max(int(divisor), 1)
+    return (value // d) * d
+
+
+def combined_divisor(*divisors: int) -> int:
+    """Least common multiple for simultaneous shard-divisor constraints."""
+    values = tuple(max(int(value), 1) for value in divisors)
+    return math.lcm(*values) if values else 1
+
+
+def product_divisor(*axis_sizes: int) -> int:
+    """Product divisor for one array axis flattened over several mesh axes."""
+    product = 1
+    for value in axis_sizes:
+        product *= max(int(value), 1)
+    return product
+
+
 @dataclass(frozen=True)
 class PaddedAxis:
     """Portable receipt for one logical axis in a mesh-legal carrier.
@@ -562,11 +583,13 @@ def mesh_divisor(mesh_or_int) -> int:
     if isinstance(mesh_or_int, int):
         return int(mesh_or_int)
     try:
+        shape = mesh_or_int.shape
+        axes = getattr(mesh_or_int, "axis_names", tuple(shape))
         prod = 1
-        for axis in mesh_or_int.axis_names:
-            prod *= int(mesh_or_int.shape[axis])
+        for axis in axes:
+            prod *= int(shape[axis])
         return prod
-    except AttributeError as exc:
+    except (AttributeError, TypeError) as exc:
         raise TypeError(
             f"mesh_divisor: expected an int or a Mesh; "
             f"got {type(mesh_or_int)!r}") from exc
@@ -609,6 +632,9 @@ def spec_divisor(mesh, spec, axis: int) -> int:
 
 __all__ = [
     "round_up",
+    "round_down",
+    "combined_divisor",
+    "product_divisor",
     "PaddedAxis",
     "padded_axis",
     "authenticate_padded_axis",

@@ -18,7 +18,7 @@ from common.collectives import (
 )
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 from runtime import debug_print_enabled
-from runtime.padding import bounded_partition_tile, round_up
+from runtime.padding import bounded_partition_tile
 
 # Canonical boolean env grammar for this layer (same recognised token set
 # as file_io._slab_io_ffi._env_flag and the one isdf.core imports, plus an
@@ -1278,16 +1278,15 @@ def fit_zeta_to_h5(
     # bands — the resulting einsum still runs at the uniform
     # ``bc_size``, so it hits the same JIT cache.
     _bfs, _bfe = band_range_full
-    _p_xy = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])
-    if band_chunk_size % _p_xy != 0:
-        raise ValueError(
-            f"band_chunk_size={band_chunk_size} is not divisible by the "
-            f"mesh size {_p_xy}")
+    from runtime.padding import padded_axis
+    band_chunk_size = padded_axis(
+        band_chunk_size, mesh_xy, name="zeta-fit band chunk").carrier
     # The physics window remains exactly [_bfs, _bfe): masks below use the
     # logical endpoints.  Only the ψ(G) transport range is padded so every
     # per-chunk band shard is P-divisible.  The loader and the pair masks
     # zero/ignore these at-most-P-1 tail bands.
-    _bfe_transport = _bfs + ((_bfe - _bfs + _p_xy - 1) // _p_xy) * _p_xy
+    _bfe_transport = _bfs + padded_axis(
+        _bfe - _bfs, mesh_xy, name="zeta-fit band transport").carrier
     band_chunk_ranges = [
         (_bfs + i * band_chunk_size,
          min(_bfs + (i + 1) * band_chunk_size, _bfe_transport))
@@ -1422,7 +1421,8 @@ def fit_zeta_to_h5(
     # n_q or n_mu_local).
     _gflat_chunk_size = int(gflat_chunk_size) if gflat_chunk_size else None
     if jax.process_index() == 0:
-        _p_prod = int(jax.device_count())
+        from runtime.padding import mesh_divisor
+        _p_prod = mesh_divisor(mesh_xy)
         _n_mu_local = int(meta.n_rmu_padded) // _p_prod
         _N = n_q_disk * _n_mu_local
         _cs = _gflat_chunk_size or _N
@@ -1502,8 +1502,9 @@ def fit_zeta_to_h5(
             # canonical r-slice zero-fills cells beyond the physical grid,
             # the solve carries those inert RHS columns, and the slice below
             # restores the exact logical slab before G-flat accumulation.
-            _p_y = int(mesh_xy.shape['y'])
-            actual_n_rchunk = round_up(logical_n_rchunk, _p_y)
+            actual_n_rchunk = padded_axis(
+                logical_n_rchunk, mesh_xy, name="zeta-fit real-space chunk",
+                spec=P(None, None, "y"), axis=2).carrier
 
             _dbg_rchunk = debug_print_enabled()
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0

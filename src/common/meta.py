@@ -3,7 +3,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from runtime.padding import round_up as _round_up
+from runtime.padding import padded_axis
 
 
 @dataclass
@@ -170,7 +170,8 @@ class Meta:
                 f"gw_config.resolve_band_counts; do not re-derive it here.")
         b_id_4_user = int(nband)
         world_size = int(jax.device_count())
-        b_id_4 = _round_up(b_id_4_user, world_size)
+        b_id_4 = padded_axis(
+            b_id_4_user, world_size, name="full loaded-band carrier").carrier
         # The LARGER count takes the padded edge (so the default path is
         # byte-for-byte what it was); the smaller takes its literal value.
         b_id_4_chi = b_id_4 if nband_chi >= nband_sigma else nband_chi

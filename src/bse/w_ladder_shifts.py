@@ -381,13 +381,11 @@ def seed_probe_block(G_zeta, data, gen, sh) -> jax.Array:
     constraints), lifted to its own function so a z-list caller pays it ONCE.
     Returns ``sh.X_full`` = ``(2, n_probe, c, v, k)``.
     """
-    px, py = sh.X.mesh.devices.shape
     n_probe = int(G_zeta.shape[0])
-    if n_probe % py != 0:
-        raise ValueError(
-            f"probe block n_probe={n_probe} must be a multiple of py={py} "
-            "(reduce-scatter tiles nu over y); pad the probe block with zero "
-            "rows.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        n_probe, n_probe, sh.X.mesh, name="BSE shifted probe carrier",
+        spec=P("y", None), axis=0)
     n_rmu = int(data["V_q0"].shape[0])
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
     G = np.asarray(G_zeta, dtype=np.float64)

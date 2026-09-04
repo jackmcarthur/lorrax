@@ -311,8 +311,8 @@ def test_a_non_divisible_band_chunk_is_refused():
     with pytest.raises(ValueError) as exc:
         assert_band_chunks_divisible(ranges, 4)
     text = str(exc.value)
-    assert "[48, 50)" in text and "drops 2" in text
-    assert "band_chunk_size" in text
+    assert "[48, 50)" in text
+    assert "carrier extent is 2, expected 4" in text
 
 
 def test_a_divisible_split_is_accepted():

@@ -27,7 +27,7 @@ from common import Meta
 from common import timing
 from common.band_degeneracy import DEGENERACY_TOL_RY
 from common.units import RYD_TO_EV
-from runtime.padding import round_up, spec_divisor
+from runtime.padding import spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
     fit_galerkin_basis,
@@ -61,7 +61,7 @@ from common.collectives import (
     restore_from_host,
     spill_to_host,
 )
-from common.sharding_fit import padded_extent as _pad_to
+from runtime.padding import padded_axis
 from runtime.production_stream import ProductionStdout
 from .production_report import HTransformProductionReport
 
@@ -1720,13 +1720,15 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # retaining ndev-way q parallelism.  A distributed-within-matrix path
         # belongs to ``distrib_la.plan``, not a second eig implementation here.
         #
-        # ``padded_extent`` is the canonical placement owner also used by
+        # ``padded_axis`` is the canonical placement owner also used by
         # bse_setup.  Starting from one means this policy cannot drift from
         # the divisor that judges the actual NamedSharding.  Extra q are zero
         # rows and ``_post_kpath[:nq]`` discards them, so only scheduling and
         # the static executable shape change, never a retained value.
         _t0 = _perf()                                      # instrument:
-        batch_size = _pad_to(mesh_xy, ('x', 'y'), 1)
+        batch_size = padded_axis(
+            1, mesh_xy, name="htransform q batch",
+            spec=P(("x", "y"), None), axis=0).carrier
         ndev = spec_divisor(mesh_xy, P(('x', 'y'), None), axis=0)
         matrices_per_device = batch_size // ndev
         matrix_bytes = rank * rank * np.dtype(np.complex128).itemsize
@@ -1736,7 +1738,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             f"({rank}, {rank}) complex128 operand={matrix_bytes / 2**30:.3f} "
             f"GiB/device (backend eigensolver workspace excluded)")
         nq = int(kpath_frac.shape[0])
-        n_pad = round_up(nq, batch_size) - nq
+        n_pad = padded_axis(
+            nq, batch_size, name="htransform path-q carrier").pad
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
         nq_padded = wrapped_k.shape[0]
         jax.block_until_ready(wrapped_k)                   # instrument:

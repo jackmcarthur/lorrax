@@ -70,7 +70,11 @@ from common import Meta, jax_profile
 from common.bispinor_init import NO_PAIR_DIRAC_CURRENT_MODEL
 from common.collectives import device_put_process_local
 from common.jax_compile_cache import ensure_jax_compile_cache
-from runtime.padding import padded_mu_extent, round_up, solve_at_logical
+from runtime.padding import (
+    authenticate_padded_axis,
+    padded_mu_axis,
+    solve_at_logical,
+)
 from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                      band_in_occupation_window, occupation_weight_floor)
 from .minimax_screening import MinimaxNodes
@@ -1138,8 +1142,10 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
         chi_scaled = pref * chi_flat
 
         # Pad to device count then reshard to q-parallel
-        total_devices = mesh_xy.devices.size
-        nq_padded = round_up(nq_local, total_devices)
+        from runtime.padding import padded_axis
+        nq_padded = padded_axis(
+            nq_local, mesh_xy, name="local W q carrier",
+            spec=q_spec, axis=0).carrier
         pad = nq_padded - nq_local
         V_padded = jnp.pad(V_flat, ((0, pad), (0, 0), (0, 0))) if pad > 0 else V_flat
         chi_padded = jnp.pad(chi_scaled, ((0, pad), (0, 0), (0, 0))) if pad > 0 else chi_scaled
@@ -1509,24 +1515,20 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
         raise ValueError(
             "solve_w requires V_q and chi0_q to have the same padded "
             f"(q,mu,nu) extent; got V_q.shape={v_shape} and "
-            f"chi0_q.shape={chi_shape}.  Producers and restart readers "
-            "must reconstruct both mu axes with "
-            "runtime.padding.padded_mu_extent before the Dyson solve.")
+            f"chi0_q.shape={chi_shape}.")
     if len(v_shape) != 3 or v_shape[0] < 1 or v_shape[1] != v_shape[2]:
         raise ValueError(
             "solve_w requires equal rank-3 square (q,mu,nu) operands; "
             f"got V_q.shape=chi0_q.shape={v_shape}.")
     n_logical = (int(meta.n_rmu) if n_rmu_logical is None
                  else int(n_rmu_logical))
-    n_padded = int(padded_mu_extent(n_logical, mesh_xy))
-    if v_shape[1:] != (n_padded, n_padded):
-        raise ValueError(
-            "solve_w requires the canonical product-padded centroid "
-            f"carrier (*,{n_padded},{n_padded}) from logical "
-            f"n_rmu={n_logical}; got equal V_q/chi0_q shapes {v_shape}.  "
-            "The q extent may be a full BZ or an irreducible wedge, but "
-            "per-mesh-axis centroid divisibility is not the in-memory "
-            "carrier contract; use runtime.padding.padded_mu_extent.")
+    mu_axis = padded_mu_axis(n_logical, mesh_xy)
+    authenticate_padded_axis(
+        mu_axis.logical, v_shape[1], mu_axis.divisor,
+        name="Dyson row-centroid carrier")
+    authenticate_padded_axis(
+        mu_axis.logical, v_shape[2], mu_axis.divisor,
+        name="Dyson column-centroid carrier")
     return n_logical
 
 
@@ -1944,12 +1946,12 @@ def compute_experimental_no_pair_photon_chi0(
             f"got {wfns_charge.layout!r}/{wfns_transverse.layout!r}")
     n_c = int(wfns_charge.psi_mun.shape[2])
     n_t = int(wfns_transverse.psi_mun.shape[2])
-    if (n_c != layout.padded_extent(0) or
-            n_t != layout.padded_extent(1)):
+    if (n_c != layout.carrier_extent(0) or
+            n_t != layout.carrier_extent(1)):
         raise ValueError(
             "photon layout padded extents do not match wavefunction "
-            f"bundles: layout C/T=({layout.padded_extent(0)},"
-            f"{layout.padded_extent(1)}), wfns C/T=({n_c},{n_t})")
+            f"bundles: layout C/T=({layout.carrier_extent(0)},"
+            f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
     nq = int(meta.nk_tot)
     families = (wfns_charge, wfns_transverse,
                 wfns_transverse, wfns_transverse)
@@ -2250,8 +2252,8 @@ def compute_static_photon_response(
             flush=True)
         print_fn(
             f"  [photon response] packed body N_packed={n_packed} "
-            f"(n_C={layout.padded_extent(0)} + 3*n_T="
-            f"{layout.padded_extent(1)}), nq={int(meta.nk_tot)}: "
+            f"(n_C={layout.carrier_extent(0)} + 3*n_T="
+            f"{layout.carrier_extent(1)}), nq={int(meta.nk_tot)}: "
             f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W",
             flush=True)
     if screen_current:
@@ -2286,11 +2288,11 @@ def compute_static_photon_response(
         from .wavefunction_bundle import padded_centroid_extent
         n_c = padded_centroid_extent(wfns_charge)
         n_t = padded_centroid_extent(wfns_transverse)
-        if (n_c != layout.padded_extent(0) or n_t != layout.padded_extent(1)):
+        if (n_c != layout.carrier_extent(0) or n_t != layout.carrier_extent(1)):
             raise ValueError(
                 "photon layout padded extents do not match wavefunction "
-                f"bundles: layout C/T=({layout.padded_extent(0)},"
-                f"{layout.padded_extent(1)}), wfns C/T=({n_c},{n_t})")
+                f"bundles: layout C/T=({layout.carrier_extent(0)},"
+                f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
         W_cc = jnp.asarray(W_charge)
         expected_cc = layout.block_shape(int(meta.nk_tot), 0, 0)
         if tuple(W_cc.shape) != expected_cc:
@@ -2924,7 +2926,10 @@ def _fractional_pair_scan(
     # A rank-padded carrier can be wider than the physical chi window.
     # The logical mask makes those bands numerically zero, but a scan sized
     # from the carrier would still pay their quadratic tile cost.
-    nb_pad = ((int(nb_logical) + tile - 1) // tile) * tile
+    from runtime.padding import padded_axis
+    nb_pad = padded_axis(
+        int(nb_logical), tile,
+        name="fractional-response band tile carrier").carrier
     pad = max(0, nb_pad - int(nb))
     pad4 = ((0, 0), (0, 0), (0, 0), (0, pad))
     pad2 = ((0, 0), (0, pad))
@@ -3189,7 +3194,10 @@ def _fractional_pair_scan_face(
     # because the carrier is wider than ``nb_logical``.  Keep enough backing
     # storage for a final partial tile, but size the scans from the logical
     # sum extent.
-    nb_pad = ((int(nb_logical) + tile - 1) // tile) * tile
+    from runtime.padding import padded_axis
+    nb_pad = padded_axis(
+        int(nb_logical), tile,
+        name="face fractional-response band carrier").carrier
     pad = max(0, nb_pad - int(nb_full))
     pad2 = ((0, 0), (0, pad))
     ea_full = jnp.pad(energy_a, pad2)

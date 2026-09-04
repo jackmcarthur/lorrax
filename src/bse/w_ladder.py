@@ -753,11 +753,13 @@ def compute_wc_qwedge(
             f"frequencies; got shape {z_list_ry.shape}.")
     # Argument checks BEFORE the restart read: a caller that got probe_chunk
     # wrong should learn it in milliseconds, not after a multi-GB sharded load.
-    if probe_chunk is not None and (int(probe_chunk) <= 0
-                                    or int(probe_chunk) % py != 0):
-        raise ValueError(
-            f"probe_chunk={probe_chunk} must be a positive multiple of py={py} "
-            "(the reduce-scatter snapshot tiles the probe axis over y).")
+    if probe_chunk is not None:
+        if int(probe_chunk) <= 0:
+            raise ValueError(f"probe_chunk must be positive; got {probe_chunk}")
+        from runtime.padding import padded_axis
+        probe_chunk = padded_axis(
+            int(probe_chunk), mesh_xy, name="BSE ladder probe chunk",
+            spec=P("y"), axis=0).carrier
 
     # FULL chi0 band window on both legs — the pair basis must span exactly the
     # window the GW chi0 consumed, or the ladder resolvent is solving a smaller

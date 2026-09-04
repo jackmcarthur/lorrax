@@ -677,12 +677,12 @@ def test_the_staged_chain_holds_one_shard_at_the_deck_geometry(tmp_path):
 def test_indivisible_extent_is_refused_with_the_fix_named(shape):
     mesh = _mesh()
     assert not face_to_batch_reshard_supported(mesh, shape)
-    reshard = face_to_batch_reshard(mesh, divisibility_hint="HINT-TOKEN")
+    reshard = face_to_batch_reshard(mesh)
     a = jnp.zeros(shape, dtype=jnp.complex128)
     with pytest.raises(ValueError) as exc:
         jax.jit(reshard).lower(a)
     msg = str(exc.value)
-    assert "padded_extent" in msg and "HINT-TOKEN" in msg, msg
+    assert "carrier extent" in msg and "expected" in msg, msg
 
 
 def test_supported_accepts_the_divisible_case():

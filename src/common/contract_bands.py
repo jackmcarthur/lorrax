@@ -285,17 +285,6 @@ def bands_gemm_ffi_enabled() -> bool:
 # The primitive
 # ---------------------------------------------------------------------------
 
-_DIVISIBILITY_MSG = (
-    "contract_bands_block_reshard needs the band window divisible by the "
-    "mesh: m={m} must be a multiple of p_{ax_x}={px} and n={n} of "
-    "p_{ax_y}={py} (the two psum_scatters tile m over '{ax_x}' and n over "
-    "'{ax_y}').  Pad m and n INDEPENDENTLY (m -> p_{ax_x}, n -> p_{ax_y}) "
-    "at the caller and strip the zero pad downstream — do NOT round to a "
-    "multiple of the p_{ax_x}*p_{ax_y} product (up to 3.16x tile waste; "
-    "audit fix/zq 2026-07-28).  Sigma callers: gw.ppm_sigma.pad_sigma_window "
-    "is the existing helper.{hint}")
-
-
 #: ``(nk, nb_full, n_rmu, nspinor)`` — the four static ints
 #: :func:`contract_bands_block_reshard`'s face path needs to build its two
 #: ``distrib_la.gemm_plan``s EAGERLY (their shapes are fixed at
@@ -432,7 +421,6 @@ def contract_bands_block_reshard(
     channels: str = "none",
     extra: str = "none",
     axes: tuple[str, str] = ("x", "y"),
-    divisibility_hint: str = "",
     layout: str = "legacy",
     face_shape=None,
     right_face_shape=None,
@@ -472,8 +460,6 @@ def contract_bands_block_reshard(
     axes
         Mesh axis names ``(ax_x, ax_y)``; ax_x shards μ/m, ax_y shards
         ν/n.  Default matches every production mesh.
-    divisibility_hint
-        Extra caller-specific text appended to the divisibility refusal.
     layout
         ``"legacy"`` (default): the shard_map + psum_scatter body below,
         BYTE-IDENTICAL to the code this module shipped before
@@ -591,9 +577,6 @@ def contract_bands_block_reshard(
         #   extra='leading' where the GEMM plan matters.
         if _BANDS_GEMM_GATE.resolve(mesh_xy) is None or extra == "minor":
             use_ffi = False
-
-    p_x = mesh_xy.shape[ax_x]
-    p_y = mesh_xy.shape[ax_y]
 
     # -- rank-local GEMM helpers ---------------------------------------
     # The LARGE right contraction, optionally through the FFI handler.

@@ -280,11 +280,10 @@ def build_ladder_freq_chain(data: dict, matvec, gen, sh, G_probe,
     """
     p = int(G_probe.shape[0])
     m = int(chain_len)
-    px, py = sh.X.mesh.devices.shape
-    if p % py != 0:
-        raise ValueError(
-            f"probe block n_probe={p} must be a multiple of py={py} "
-            "(reduce-scatter tiles nu over y); pad with zero rows.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        p, p, sh.X.mesh, name="BSE frequency probe carrier",
+        spec=P("y", None), axis=0)
     n_rmu = int(data["V_q0"].shape[0])
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
 
@@ -366,8 +365,10 @@ def eval_ladder_freq_chain(chain: dict, data: dict, snapshot, sh, z,
         chain["S_stack"][:m_use],
         NamedSharding(sh.X.mesh, P(None, None, "x", "y", None)))
     s = jax.lax.with_sharding_constraint(_combine_chain(V_use, C), sh.X)
-    px, py = sh.X.mesh.devices.shape
-    n_pad = int(np.ceil(p / py) * py)
+    from runtime.padding import padded_axis
+    n_pad = padded_axis(
+        p, sh.X.mesh, name="BSE frequency result probe carrier",
+        spec=P("y", None, None, None), axis=0).carrier
     if n_pad != p:                                   # pragma: no cover
         pad = jnp.zeros((n_pad - p,) + s.shape[1:], dtype=s.dtype)
         s = jax.lax.with_sharding_constraint(

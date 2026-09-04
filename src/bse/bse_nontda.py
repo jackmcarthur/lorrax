@@ -138,8 +138,13 @@ def dense_col_chunk(args, mesh_xy, N, *, log=None):
     """
     psi_c_X, W_R = args[0], args[6]
     px, py = mesh_xy.devices.shape
-    mu_local = -(-int(W_R.shape[0]) // px)
-    nu_local = -(-int(W_R.shape[1]) // py)
+    from runtime.padding import padded_axis
+    mu_local = padded_axis(
+        int(W_R.shape[0]), int(px),
+        name="non-TDA row-centroid carrier").carrier // int(px)
+    nu_local = padded_axis(
+        int(W_R.shape[1]), int(py),
+        name="non-TDA column-centroid carrier").carrier // int(py)
     nspinor = int(psi_c_X.shape[2])
     nk = int(np.prod(np.asarray(W_R.shape[2:5])))
     per_col = mu_local * nu_local * nspinor * nspinor * nk * 16

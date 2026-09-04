@@ -21,6 +21,8 @@ from typing import ClassVar
 
 import numpy as np
 
+from runtime.padding import padded_axis
+
 
 _GROUPED_SHARD_LAYOUT_SCHEMA = "lorrax.grouped-shard-layout.v1"
 
@@ -363,7 +365,8 @@ def build_grouped_shard_layout(
         raise ValueError(
             "build_grouped_shard_layout: shard_size_multiple must be >= 1; "
             f"got {multiple}.")
-    shard_size = ((int(loads.max()) + multiple - 1) // multiple) * multiple
+    shard_size = padded_axis(
+        int(loads.max()), multiple, name="grouped shard rows").carrier
     n_padded = nshard * shard_size
     packed_to_canonical = np.full((n_padded,), -1, dtype=np.int64)
     packed_group_id = np.full((n_padded,), n_groups, dtype=np.int32)
