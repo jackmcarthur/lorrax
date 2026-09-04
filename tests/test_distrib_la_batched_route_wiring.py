@@ -22,26 +22,17 @@ def test_deck_route_defaults_normalizes_and_refuses_unknown(tmp_path):
         read_lorrax_input(str(bare))) == "batch_reshard"
 
     low_mem = tmp_path / "low_mem.in"
-    low_mem.write_text("[cohsex]\nuse_low_mem_eigh = true\n")
+    low_mem.write_text("[cohsex]\nlinalg = distributed\n")
     assert resolve_distrib_la_batched_route(
         read_lorrax_input(str(low_mem))) == "auto"
 
     opted = tmp_path / "opted.in"
-    opted.write_text(
-        "[cohsex]\n"
-        "distrib_la_batched_route =  BATCH_RESHARD  \n")
-    assert resolve_distrib_la_batched_route(
-        read_lorrax_input(str(opted))) == "batch_reshard"
+    opted.write_text("[cohsex]\ndistrib_la_batched_route = batch_reshard\n")
+    with pytest.raises(ValueError, match="retired"):
+        read_lorrax_input(str(opted))
 
     with pytest.raises(ValueError, match="distrib_la_batched_route"):
-        resolve_distrib_la_batched_route(
-            {"distrib_la_batched_route": "replicate"})
-
-    with pytest.raises(ValueError, match="contradicts use_low_mem_eigh"):
-        resolve_distrib_la_batched_route({
-            "distrib_la_batched_route": "batch_reshard",
-            "use_low_mem_eigh": True,
-        })
+        resolve_distrib_la_batched_route({}, override="replicate")
 
 
 def test_deck_vocabulary_is_the_service_vocabulary():

@@ -1517,26 +1517,18 @@ def main(argv=None):
         f"mesh_xy.shape={dict(mesh_xy.shape)} (px={args.px}, py={args.py})")
 
     # ── Q path from the ONE K_POINTS crystal_b machinery ─────────────────
-    from gw.gw_config import read_lorrax_input
+    from gw.gw_config import linalg_resolution, read_lorrax_input
     from bandstructure import htransform as ht
     from bandstructure.bse_setup import compute_wfns_fi
 
     params = read_lorrax_input(args.input)
-    # Input file is the source of truth; the CLI flag is an override — and
-    # BOTH go through the one resolver, which is where ``use_low_mem_eigh``
-    # folds in.  This driver used to inline the precedence and never call
-    # ``resolve_eigh_backend`` at all, so a deck saying
-    # ``use_low_mem_eigh = true`` got the native q-batched path anyway.
-    # (Both distributed-eigh sites below — compute_wfns_fi and
-    # build_vq_evaluator — read this resolved value.)
+    # CLI backend flags remain debug overrides of the implementation selected
+    # by the parser-cached public layout profile.
     args.eigh_backend = resolve_eigh_backend(
         params, override=args.eigh_backend)
     args.distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=args.distrib_la_batched_route)
-    # The INTENT travels to compute_wfns_fi as well: its refusal contract
-    # (refuse at resolve time, never fall back to the whole-matrix native
-    # path) is armed by this flag, not by the resolved library name.
-    _use_low_mem_eigh = bool(params.get("use_low_mem_eigh", False))
+    _use_low_mem_eigh = linalg_resolution(params).layout == "distributed"
     if not params.get("kpoints_crystal_b"):
         raise ValueError(f"{args.input} has no K_POINTS crystal_b block — "
                          "the exciton Q path comes from it (same format as "

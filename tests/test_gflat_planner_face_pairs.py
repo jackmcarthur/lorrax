@@ -54,7 +54,7 @@ def _run50_plan():
         shape={'x': 4, 'y': 4}, devices=np.empty(16, dtype=object))
     _, plan = _plan_gflat_chunks_for_channel(
         meta=_meta(), cfg=cfg, band_slices=bands, mesh_xy=mesh,
-        is_bispinor=True, print_fn=lambda *_: None)
+        is_bispinor=True, n_q_selected=36, print_fn=lambda *_: None)
     return plan
 
 

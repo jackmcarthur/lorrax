@@ -739,7 +739,6 @@ def fit_zeta_to_h5(
                 psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
                 gamma_mu, gamma_mu,
                 kgrid=kgrid, mesh_xy=mesh_xy)
-        C_q.block_until_ready()
         # C_q: (nqx, nqy, nqz, n_rmu_padded, n_rmu_padded) with zero
         # pad rows/cols.
 
@@ -747,6 +746,7 @@ def fit_zeta_to_h5(
         # in-memory shape); factor_c_q slices to logical
         # internally via ``n_rmu_logical=``.
         C_q_flat = C_q.reshape(nq, n_rmu_padded, n_rmu_padded)
+        del C_q
         flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
         if _q_neg_idx is not None:
@@ -768,6 +768,13 @@ def fit_zeta_to_h5(
             from symmetry_maps import slice_q_full_to_ibz
             C_q_flat = slice_q_full_to_ibz(
                 C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
+
+        # Commit only the selected q carrier at the outer host boundary.
+        # The charge -q completion above still needs all K rows internally,
+        # but waiting on C_full before this slice pinned d*(K-Q)*M^2/P bytes
+        # through the synchronization point for no consumer.  The slice is a
+        # pure row selection, so the selected values are unchanged.
+        C_q_flat.block_until_ready()
 
     # Fresh-fit low-mem psi contract (low_mem_bands census row "Fresh
     # centroid load/liveness"; report gwjax_low_mem_bands_audit_2026-08-22).
@@ -1003,7 +1010,7 @@ def fit_zeta_to_h5(
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
     # This is critical for fitting within memory budget
-    del C_q, C_q_flat
+    del C_q_flat
     with timing.section("zeta_fit.gc_pre_chunk_loop"):
         _collect_fit_setup_garbage()
 

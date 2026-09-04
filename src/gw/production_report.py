@@ -23,12 +23,10 @@ from common.scientific_output import (
     centroid_orbit_line,
     file_table_lines,
     numerical_environment_lines,
-    policy,
     symmetry_sampling_lines,
 )
 from common.units import RYD_TO_EV
-from .gw_config import (DISTRIB_LA_BATCHED_ROUTE_DEFAULT,
-                        qp_solver_semantics)
+from .gw_config import qp_solver_semantics
 
 
 _WARNING_WORDS = (
@@ -44,43 +42,52 @@ QP_ROTATIONS_FILE_ROLE = "full-matrix effective-H rotations"
 QP_WFN_FILE_ROLE = "matched full-matrix QP wavefunctions"
 
 
-def batched_la_record_lines(
-        *, config, n_charge: int, n_current: int, nq: int,
-        processes: int) -> tuple[str, ...]:
-    """Build the run-record provenance and optional capacity warning."""
-    route = str(config.backend.distrib_la_batched_route).strip().lower()
-    lines: list[str] = []
-    if (route == DISTRIB_LA_BATCHED_ROUTE_DEFAULT
-            and "distrib_la_batched_route" not in config.raw_input_keys):
-        lines.append(
-            "[config provenance] distrib_la_batched_route = batch_reshard "
-            "(shipping default; the input deck did not name the key)")
-    if route != "batch_reshard":
-        return tuple(lines)
 
-    n_charge = int(n_charge)
-    n_current = int(n_current)
-    n_total = n_charge + n_current
-    from .gflat_memory_model import batch_reshard_square_solve_capacity
-    capacity = batch_reshard_square_solve_capacity(
-        batch=int(nq), processes=int(processes),
-        memory_per_device_gb=float(config.memory.per_device_gb),
-        centroids=n_total)
-    if n_total > int(capacity["threshold"]):
+def _human_bytes(n_bytes: float) -> str:
+    """GiB above one GiB, MiB below, three significant figures either way."""
+    gib = float(n_bytes) / 2**30
+    if gib >= 1.0:
+        return f"{gib:.3g} GiB"
+    return f"{float(n_bytes) / 2**20:.3g} MiB"
+
+def layout_dial_record_lines(
+        *, config, n_mu: int, n_q_irr: int, processes: int) -> tuple[str, ...]:
+    """Build the startup record for the two user-facing memory/layout dials."""
+    n_mu = int(n_mu)
+    q_per_task = (int(n_q_irr) + int(processes) - 1) // int(processes)
+    matrix_gib = (
+        q_per_task * n_mu * n_mu * np.dtype(np.complex128).itemsize
+        / 1024 ** 3)
+    layout = str(config.backend.linalg).strip().lower()
+    lines = [
+        f"[config provenance] linalg = {layout} "
+        f"({config.backend.linalg_provenance})",
+    ]
+    if layout == "local":
         lines.append(
-            "WARNING [distrib_la batch_reshard capacity]: "
-            f"charge+current centroids={n_total} "
-            f"({n_charge}+{n_current}) exceeds threshold="
-            f"{int(capacity['threshold'])} for nq={int(nq)}, "
-            f"P={int(processes)}, memory_per_device_gb="
-            f"{float(config.memory.per_device_gb):.2f}; the measured "
-            "three-arena complex128 square-solve floor is "
-            f"{float(capacity['floor_bytes']) / 1.0e9:.2f} GB/rank, above "
-            "the 50% placement limit "
-            f"{float(capacity['limit_bytes']) / 1.0e9:.2f} "
-            "GB/rank. Very large centroid counts may require "
-            "distrib_la_batched_route = auto (the direct distributed/provider "
-            "path).")
+            "linalg = local: fastest, but each task holds ceil(N_q_irr/P) "
+            "complete N_mu x N_mu dense matrices "
+            f"(here ceil({int(n_q_irr)}/{int(processes)}) x {n_mu}^2 x "
+            f"16 B = {_human_bytes(matrix_gib * 2**30)} per task, complex128) plus their "
+            "factor workspace; on large systems where that is a large "
+            "fraction of memory per task, set linalg = distributed")
+    else:
+        lines.append(
+            "linalg = distributed: dense N_mu x N_mu matrices are 2D "
+            f"distributed across the process mesh (N_mu = {n_mu})")
+
+    low_mem = bool(config.memory.low_mem_bands)
+    provenance = getattr(
+        config.memory, "low_mem_bands_provenance",
+        "deck" if "low_mem_bands" in config.raw_input_keys else "default")
+    lines.append(
+        f"[config provenance] low_mem_bands = {str(low_mem).lower()} "
+        f"({provenance})")
+    if low_mem:
+        lines.append(
+            "low_mem_bands = true: saves memory "
+            f"(band chunks of {int(config.memory.band_chunk_size)}) but takes "
+            "longer; set false on systems that fit")
     return tuple(lines)
 
 
@@ -157,12 +164,12 @@ class GWProductionReport:
         """Write one deliberately selected rank-zero progress line."""
         self.emit(line)
 
-    def batched_linalg(self, *, config, n_charge: int, n_current: int,
-                       nq: int, processes: int) -> None:
-        """Record the universal batched-LA default and its capacity advice."""
-        for line in batched_la_record_lines(
-                config=config, n_charge=n_charge, n_current=n_current,
-                nq=nq, processes=processes):
+    def layout_dials(
+            self, *, config, n_mu: int, n_q_irr: int, processes: int) -> None:
+        """Record resolved layout/memory dials before allocating dense data."""
+        for line in layout_dial_record_lines(
+                config=config, n_mu=n_mu, n_q_irr=n_q_irr,
+                processes=processes):
             self.progress(line)
 
     def begin(self, *, input_file: str, config) -> None:
@@ -249,18 +256,7 @@ class GWProductionReport:
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
-        self.emit(f"ISDF solve     : {config.backend.charge_zeta_solve} | "
-                  "back-solve policy=" + policy(
-                      config.backend.distributed_zeta_solve,
-                      ("auto", "replicated", "per_q", "distributed")))
-        self.emit(f"W Dyson solve  : {config.backend.w_dyson_solver} | "
-                  "LU policy=" + policy(
-                      config.backend.distributed_lu,
-                      ("auto", "off", "cusolvermp", "scalapack")))
-        self.emit("QP eigensolve  : " + policy(
-            config.backend.eigh_backend,
-            ("auto", "off", "distributed", "cusolvermp", "slate",
-             "scalapack")))
+        self.emit(f"Dense linalg   : {config.backend.linalg} layout")
 
         # Report only controls with a caller in this calculation.  In
         # particular, the k-leading candidate has no production Sigma caller,

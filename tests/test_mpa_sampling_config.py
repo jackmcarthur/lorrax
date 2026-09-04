@@ -9,7 +9,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gw.gw_config import LorraxConfig, _DEFAULTS, validate_material_inputs
+from gw.gw_config import (
+    LorraxConfig,
+    _DEFAULTS,
+    resolve_mpa_sampling_alpha,
+    validate_material_inputs,
+)
 from gw.mpa import model, sample_plan, sampling
 
 
@@ -546,6 +551,8 @@ def test_the_sampler_refuses_an_origin_shift_under_an_insulator():
 
 def test_an_unset_key_is_the_published_constant_bit_for_bit(tmp_path):
     config = _config(tmp_path, "mpa_n_poles = 4\n" + _METAL_KEYS)
+    config = resolve_mpa_sampling_alpha(
+        config, "metal", print_fn=lambda *_: None)
     assert config.mpa.metal_origin_shift_ry is None
 
     from gw.mpa import sampling
@@ -554,7 +561,7 @@ def test_an_unset_key_is_the_published_constant_bit_for_bit(tmp_path):
         config.mpa.sample_plan(8.0, material_class="metal"))
     reference = sampling.double_parallel_grid(
         4, 8.0, material_class="metal", varpi_near=0.2, varpi_far=2.0,
-        energy_unit="Ry")
+        alpha=2, energy_unit="Ry")
     np.testing.assert_array_equal(z, reference)
     assert z[0] == 1j * _SHIFT_DEFAULT_RY
 
@@ -565,6 +572,10 @@ def test_typing_the_default_in_by_hand_changes_no_bit(tmp_path):
         tmp_path / "b",
         "mpa_n_poles = 4\n" + _METAL_KEYS
         + f"mpa_metal_origin_shift_ry = {_SHIFT_DEFAULT_RY}\n")
+    base = resolve_mpa_sampling_alpha(
+        base, "metal", print_fn=lambda *_: None)
+    typed = resolve_mpa_sampling_alpha(
+        typed, "metal", print_fn=lambda *_: None)
     np.testing.assert_array_equal(
         sample_plan.plan_z(base.mpa.sample_plan(
             8.0, material_class="metal")),
@@ -576,6 +587,8 @@ def test_an_insulating_grid_is_untouched_by_the_new_parameter(tmp_path):
     """The other half of default-identity: the key cannot reach an
     insulating plan at all, so z = 0 stays exactly 0."""
     config = _config(tmp_path, "mpa_n_poles = 4\n")
+    config = resolve_mpa_sampling_alpha(
+        config, "insulator", print_fn=lambda *_: None)
     z = sample_plan.plan_z(
         config.mpa.sample_plan(8.0, material_class="insulator"))
     assert z[0] == 0.0 + 0.0j
@@ -591,6 +604,8 @@ def test_each_ladder_rung_lands_where_the_owner_quoted_it(
         tmp_path,
         "mpa_n_poles = 4\n" + _METAL_KEYS
         + f"mpa_metal_origin_shift_ry = {shift_ry}\n")
+    config = resolve_mpa_sampling_alpha(
+        config, "metal", print_fn=lambda *_: None)
     assert config.mpa.metal_origin_shift_ry == shift_ry
     z = sample_plan.plan_z(
         config.mpa.sample_plan(8.0, material_class="metal"))
@@ -598,6 +613,8 @@ def test_each_ladder_rung_lands_where_the_owner_quoted_it(
     assert z[0].imag == pytest.approx(2.0 * shift_ha, rel=1e-15)
     # Nothing else on either line moved.
     reference = _config(tmp_path / "ref", "mpa_n_poles = 4\n" + _METAL_KEYS)
+    reference = resolve_mpa_sampling_alpha(
+        reference, "metal", print_fn=lambda *_: None)
     np.testing.assert_array_equal(
         z[1:], sample_plan.plan_z(reference.mpa.sample_plan(
             8.0, material_class="metal"))[1:])

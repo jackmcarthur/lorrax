@@ -275,29 +275,21 @@ def test_explicit_cache_off_also_disables_xla_subcaches(monkeypatch, n_proc):
         ("jax_persistent_cache_enable_xla_caches", "")]
 
 
-def test_cache_default_prefers_workflow_over_global_fallback(monkeypatch,
-                                                             tmp_path):
-    """A named workflow takes precedence over the legacy global fallback."""
+def test_cache_default_is_cold_despite_ambient_cache_roots(monkeypatch,
+                                                           tmp_path):
+    """Absent expert control cannot silently inherit a persistent cache."""
     monkeypatch.delenv("ISDF_JAX_CACHE_DIR", raising=False)
-    monkeypatch.delenv("LORRAX_RUN_DIR", raising=False)
-    scratch = tmp_path / "scratch"
-    monkeypatch.setenv("SCRATCH", str(scratch))
-    # The module no longer exports this second owner; if a user supplies it,
-    # LORRAX still resolves only its own documented policy.
+    monkeypatch.setenv("LORRAX_RUN_DIR", str(tmp_path / "this-workflow"))
+    monkeypatch.setenv("SCRATCH", str(tmp_path / "scratch"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv(
         "JAX_COMPILATION_CACHE_DIR", str(tmp_path / "native-jax-cache"))
 
-    assert jcc._resolve_cache_base_dir() == (
-        str(scratch / "lorrax_jax_cache"), "$SCRATCH fallback")
-
-    run_dir = tmp_path / "this-workflow"
-    monkeypatch.setenv("LORRAX_RUN_DIR", str(run_dir))
-    assert jcc._resolve_cache_base_dir() == (
-        str(run_dir / ".lorrax_jax_cache"), "LORRAX_RUN_DIR")
+    assert jcc._resolve_cache_base_dir() == ("", "default cold")
 
 
 def test_explicit_cache_control_wins_over_run_dir(monkeypatch, tmp_path):
-    """The legacy expert knob retains both path override and empty opt-out."""
+    """The expert knob retains both warm-path request and empty opt-out."""
     monkeypatch.setenv("LORRAX_RUN_DIR", str(tmp_path / "workflow"))
     explicit = tmp_path / "restart-campaign"
     monkeypatch.setenv("ISDF_JAX_CACHE_DIR", f"  {explicit}  ")

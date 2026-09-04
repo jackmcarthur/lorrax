@@ -1594,7 +1594,7 @@ def _resolve_zeta_fit_contract(
 
 
 def _plan_gflat_chunks_for_channel(
-		*, meta, cfg, band_slices, mesh_xy, is_bispinor,
+		*, meta, cfg, band_slices, mesh_xy, is_bispinor, n_q_selected,
 		face_current_vertex=False, print_fn=print):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
@@ -1635,8 +1635,11 @@ def _plan_gflat_chunks_for_channel(
 		log=lambda _message: None)
 	_zeta_fit_nb = (max(_zeta_left[1], _zeta_right[1])
 	                - min(_zeta_left[0], _zeta_right[0]))
-	# Q-axis on disk: conservative full-BZ (the transverse path writes
-	# IBZ-only, which is smaller).
+	n_q_selected = int(n_q_selected)
+	if not 1 <= n_q_selected <= int(meta.nk_tot):
+		raise ValueError(
+			"selected zeta q rows must be in [1, full-zone K], got "
+			f"Q={n_q_selected}, K={int(meta.nk_tot)}")
 	_ngkmax = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
 	gflat_plan = plan_gflat_chunks(
 		meta=meta, mesh_xy=mesh_xy,
@@ -1644,7 +1647,8 @@ def _plan_gflat_chunks_for_channel(
 		face_nb_total=int(band_slices.b4 - band_slices.b0),
 		fit_nb_total=_zeta_fit_nb,
 		ngkmax=_ngkmax,
-		n_q_disk=int(meta.nk_tot),
+		n_q_disk=n_q_selected,
+		n_q_ibz=n_q_selected,
 		budget_gb=float(mem.per_device_gb),
 		target_utilization=(mem.chunk_target_utilization
 		                    if mem.chunk_target_utilization > 0 else None),
@@ -2118,9 +2122,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# definitively declined and ahead of the μ_L fit loop; all three
 		# Lorentz components share this one transverse-sized plan.
 		if not all(_reuse_T):
+			_n_q_selected_T = (
+				int(np.asarray(sym.q_irr_full_idx).shape[0])
+				if _write_ibz_only_transverse else int(_meta_T.nk_tot))
 			_chunks_T, _gflat_plan_T = _plan_gflat_chunks_for_channel(
 				meta=_meta_T, cfg=cfg, band_slices=band_slices,
 				mesh_xy=mesh_xy, is_bispinor=True,
+				n_q_selected=_n_q_selected_T,
 				face_current_vertex=True, print_fn=print_fn)
 	_coupled_mu123_enabled = False
 	_transverse_batched_route = str(
@@ -3250,10 +3258,15 @@ def prepare_isdf_and_wavefunctions(
 			chunks = None
 			gflat_plan = None
 			if not charge_zeta_reused:
+				_n_q_selected_charge = (
+					int(np.asarray(sym.q_irr_full_idx).shape[0])
+					if zeta_contract.write_ibz_only_charge
+					else int(meta.nk_tot))
 				chunks, gflat_plan = _plan_gflat_chunks_for_channel(
 					meta=meta, cfg=cfg, band_slices=band_slices,
 					mesh_xy=mesh_xy,
 					is_bispinor=bool(int(meta.nspinor) == 4),
+					n_q_selected=_n_q_selected_charge,
 					print_fn=print0)
 
 			# Parent-k Green acceleration is internal and shape-derived: only

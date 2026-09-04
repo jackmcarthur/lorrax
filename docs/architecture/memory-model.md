@@ -50,7 +50,7 @@ Typical ranges (from production datasets):
 | **Centroid load (Peak A)** | fit-loop persistent floor + compiled centroid-load FFT box | `M_A = persistent + _fft_box_bytes(n_k, B_b, n_s, fft_grid, mesh)` |
 | **Centroid copies** | two X-sharded + two Y-sharded copies | `M_cent = 2·16·n_k·n_s·μ·n_b·(1/p_x+1/p_y)` |
 | **Stage-A FFT fallback** | used only when the compiled query is unavailable; announced as an under-predicting fallback | `4·16·n_k·B_b·n_s·n_r/P` (no cuFFT-plan term) |
-| **C_q build + factor (Peak B)** | `P_l`, `P_r`, `C_q`, factor or pseudo-inverse | `M_B = persistent + 16·n_q·μ²/P + 2·16·n_k·n_s²·μ²/P` |
+| **C_q build + factor (Peak B)** | `P_l`, `P_r`, full-zone `C_q`, selected-Q factor or pseudo-inverse | `M_B = persistent + 16·K·μ²/P + 2·16·n_k·n_s²·μ²/P` |
 | **fit + ζ solve (Peak C)** | larger of the pair-density/r-chunk live set and route-specific solve live set | see [§R-Chunk](#r-chunk-b_r) and [§Solve stage](#solve-stage) |
 | **accumulate_rchunk_to_gflat (Peak D)** | `gflat_acc`, `zeta_chunk`, two FFT-box-sized slots | `M_D = persistent + 16·n_q^disk·μ·B_r/P + 2·16·cs·n_r` |
 | **Vq contraction (Peak E)** | `V_acc`, one or two full IBZ ζ̃ slabs, and their X/Y resharded faces | see [§Vq G-Chunk](#vq-g-chunk) |
@@ -202,7 +202,7 @@ The solve holds both the sharded `Z_col` stack and its donated output
 accumulator:
 
 ```
-M_rhs_stacks = 2 · 16 · n_q · μ · B_r / P
+M_rhs_stacks = 2 · 16 · Q · μ · B_r / P
 ```
 
 The ordinary charge gather term depends on `distributed_zeta_solve`:
@@ -221,7 +221,7 @@ For explicit `replicated`, the planner chooses
 ```
 q_chunk = clamp(
     floor((target − persistent − M_rhs_stacks) / (16 · μ²)),
-    1, n_q)
+    1, Q)
 ```
 
 `auto` is conservatively priced by the same replicated formula.  The live
@@ -386,20 +386,20 @@ closure under the spatial sym ops succeeds.  Effects on memory:
 
 Four points worth keeping straight:
 
-- **The planner is conservatively full-BZ today.**
-  `prepare_isdf_and_wavefunctions` passes `n_q_disk=n_k_tot` and does not pass
-  `n_q_ibz`; therefore the printed D/E/F estimates do not claim the runtime
-  cascade savings in this table.  Wiring the resolved cascade extent into the
-  planner is a future efficiency change, not present behavior.
+- **The receipt names both q extents.**  Pair-density, ordered-pair completion,
+  and C/Z construction retain full-zone `K`.  The selected post-slice extent
+  `Q` prices the persistent factor, G-flat accumulator, two solve RHS stacks,
+  accumulation, V contraction, and restart write.  The startup receipt prints
+  `selected Q / full-zone K` so this distinction is inspectable.
 
 - **Vq still becomes full-BZ in memory.**  `V_q` is unfolded inside
   `compute_V_q_..._to_h5` (`gw/v_q_g_flat.py`) eagerly to its full
   `(n_q_full, n_rmu, n_rmu)` shape sharded `P(None, 'x', 'y')`, then
   written to `isdf_tensors.h5` and passed to Σ on the full BZ — so the
   in-memory V_q footprint is identical with and without the cascade.
-- **The pair-density part of Peak C is unchanged.**  The live IBZ solve can
-  shrink its q-leading RHS/factor stacks, but the production planner prices
-  those at full-BZ extent today.
+- **The pair-density part of Peak C is unchanged.**  It constructs full-zone
+  C/Z and the live Z input at the solve seam is still priced at `K`; only the
+  post-slice factor and the two solve RHS/output stacks use `Q`.
 - **`unfold_v_q` transient is small.**  At peak it's
   `2 · 16 · n_q_full · n_rmu² / P` (the umklapp phase plus a permuted
   `V_at_irr` copy), which on Si 4×4×4 is ~1 MB and on CrI3 6×6 is
@@ -543,14 +543,14 @@ peak_D = persistent_total
 `gflat_acc` is already part of `persistent_total`.  It is the G-flat ζ
 accumulator (μ-flat sharded across the mesh).  The runtime object can use
 `n_q_irr` under the cascade, but the production planner call currently prices
-`n_q_disk = n_q_full` conservatively.
+`n_q_disk = Q`, the selected post-slice extent disclosed by the receipt.
 
 ### Peaks E and F — post-fit Vq and tensor write
 
 These peaks use `E_base`, not the fit-loop persistent floor.  Peak E is the
 full-slab inventory in [§Vq G-Chunk](#vq-g-chunk).  Peak F adds the larger
-of the sharded V/W0 tensor and G-flat ζ tensor.  The planner currently uses
-full-BZ q extents for both.  SlabIO writes per-rank hyperslabs; the deleted
+of the selected-Q sharded V/W0 tensor and G-flat ζ tensor.  SlabIO writes
+per-rank hyperslabs; the deleted
 all-gather writer is not an alternative modeled here.
 
 ### Sample planner output

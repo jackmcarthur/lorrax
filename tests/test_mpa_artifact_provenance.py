@@ -182,6 +182,23 @@ def test_mpa_refuses_legacy_restart_without_charge_zeta_receipt():
         model._canonical_charge_zeta_identity({"scheme": "only"})
 
 
+def test_oneshot_driver_hands_charge_zeta_identity_to_every_screening_call():
+    driver = Path(__file__).parents[1] / "src/gw/gw_jax.py"
+    tree = ast.parse(driver.read_text(encoding="utf-8"), filename=str(driver))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "compute_screening_model"
+    ]
+    assert calls
+    for call in calls:
+        values = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert "charge_zeta_identity" in values
+        assert ast.unparse(values["charge_zeta_identity"]) == (
+            "isdf.charge_zeta_identity")
+
+
 def test_explicit_identity_refuses_missing_and_wrong_wfn(tmp_path):
     missing = tmp_path / "missing_identity.h5"
     _finalized_fit(missing)

@@ -404,15 +404,7 @@ def test_eqp2_is_additional_to_one_shot_only(tmp_path, solver):
 
 
 # ---------------------------------------------------------------------------
-# Distributed-linalg axes: distributed_cholesky / distributed_lu
-# (portable backend names; the legacy cusolvermp_charge/cusolvermp_lu
-# aliases were REMOVED 2026-07-31 — unknown deck keys are ignored)
-#
-# The parse outcome is JAX-backend-dependent (explicit cusolvermp REFUSES
-# on a CPU backend — doctrine 3, audit fix/zq 2026-07-28; 'auto' LU
-# demotes there with an announcement), so each cell PINS the backend via
-# monkeypatch instead of inheriting whatever the test box runs, and the
-# parse time no longer runs any transport capability probe (2026-08-06).
+# One linear-algebra layout dial; platform library lowering is internal.
 # ---------------------------------------------------------------------------
 
 def _pin_backend(monkeypatch, backend_name: str):
@@ -426,83 +418,63 @@ def _pin_backend(monkeypatch, backend_name: str):
 def test_distributed_linalg_defaults(tmp_path, monkeypatch):
     _pin_backend(monkeypatch, "gpu")
     cfg = _config(tmp_path)
+    assert cfg.backend.linalg == "local"
     assert cfg.backend.distributed_cholesky == "auto"
     assert cfg.backend.distributed_lu == "auto"
 
 
-def test_distributed_cholesky_slate_accepted(tmp_path):
-    cfg = _config(tmp_path, "distributed_cholesky = slate\n")
-    assert cfg.backend.distributed_cholesky == "slate"
-
-
-def test_distributed_lu_slate_rejected(tmp_path):
-    # No SLATE getrf wrapper exists yet — the value must fail loudly.
-    with pytest.raises(ValueError, match="distributed_lu"):
-        _config(tmp_path, "distributed_lu = slate\n")
-
-
-def test_removed_legacy_aliases_are_inert(tmp_path, monkeypatch):
-    # cusolvermp_charge / cusolvermp_lu were REMOVED (2026-07-31): they
-    # are unknown keys now and must neither DeprecationWarning nor steer
-    # the portable keys (the pre-removal alias honored 'on' → cusolvermp
-    # here).  They DO appear in the aggregated unknown-key stdout report
-    # like any other unknown key — that is the point of the removal.
+def test_distributed_linalg_lowers_to_gpu_libraries(tmp_path, monkeypatch):
     _pin_backend(monkeypatch, "gpu")
-    cfg = _config(tmp_path, "cusolvermp_charge = on\ncusolvermp_lu = off\n")
+    cfg = _config(tmp_path, "linalg = distributed\n")
+    assert cfg.backend.linalg == "distributed"
+    assert cfg.backend.distributed_lu == "cusolvermp"
+    # Distributed rank truncation owns the charge factor; selecting a
+    # Cholesky provider simultaneously would be contradictory.
     assert cfg.backend.distributed_cholesky == "auto"
-    assert cfg.backend.distributed_lu == "auto"
+    assert cfg.backend.distributed_zeta_solve == "distributed"
+    assert cfg.backend.distrib_la_batched_route == "auto"
+    assert cfg.backend.eigh_backend == "distributed"
 
 
-def test_distributed_cholesky_invalid_value_raises(tmp_path):
-    with pytest.raises(ValueError, match="distributed_cholesky"):
-        _config(tmp_path, "distributed_cholesky = scalapack\n")
-
-
-@pytest.mark.parametrize("key", ["distributed_cholesky", "distributed_lu"])
-def test_explicit_cusolvermp_on_cpu_refuses(tmp_path, monkeypatch, key):
-    # Doctrine 3: an explicit CUDA-only backend on a CPU JAX backend
-    # REFUSES at parse time — it is not rewritten to 'off' (which silently
-    # ran a different solver than the input file names).  Substring
-    # contract, not exact text.
-    _pin_backend(monkeypatch, "cpu")
-    with pytest.raises(ValueError, match="CUDA-only"):
-        _config(tmp_path, f"{key} = cusolvermp\n")
+def test_removed_legacy_aliases_refuse_as_unknown(tmp_path):
+    with pytest.raises(ValueError, match="cusolvermp_charge"):
+        _config(tmp_path, "cusolvermp_charge = on\ncusolvermp_lu = off\n")
 
 
 # ---------------------------------------------------------------------------
 # Unknown-key check (read_lorrax_input): a deck key that is neither in
-# _DEFAULTS nor covered by a legacy branch is reported in ONE aggregated
-# rank-0 stdout warning and ignored; ``strict_keys = true`` upgrades the
-# report to a ValueError naming every unknown key.  These cases call
+# _DEFAULTS nor covered by a legacy branch is refused in ONE aggregated
+# ValueError naming every unknown key.  These cases call
 # ``read_lorrax_input`` directly — the parsing path needs no jax.
 # ---------------------------------------------------------------------------
 
-def test_unknown_key_warns_on_stdout_and_still_parses(tmp_path, capsys):
+def test_unknown_keys_always_refuse_in_one_aggregate(tmp_path):
     from gw.gw_config import read_lorrax_input
     p = tmp_path / "deck_unknown.in"
     p.write_text(BASE_INPUT + "x_only = true\nuse_chunked_isdf = false\n")
-    params = read_lorrax_input(str(p))
-    out = capsys.readouterr().out
-    # One aggregated report naming each key with its line number.
-    assert "unrecognized deck key" in out
-    assert "x_only (line 6)" in out
-    assert "use_chunked_isdf (line 7)" in out
-    assert "ignored" in out
-    # ...and the deck still parses: known keys land, unknown ones don't.
-    assert params["nval"] == 2
-    assert "x_only" not in params
+    with pytest.raises(ValueError, match="unrecognized deck key") as exc:
+        read_lorrax_input(str(p))
+    message = str(exc.value)
+    assert "x_only (line 6)" in message
+    assert "use_chunked_isdf (line 7)" in message
 
 
-def test_strict_keys_true_raises_naming_every_unknown_key(tmp_path):
+def test_strict_keys_is_retired_even_without_other_unknown_keys(tmp_path):
     from gw.gw_config import read_lorrax_input
     p = tmp_path / "deck_strict.in"
-    p.write_text(BASE_INPUT + "strict_keys = true\n"
-                 "x_only = true\nbogus_knob = 3\n")
-    with pytest.raises(ValueError, match="strict_keys") as exc:
+    p.write_text(BASE_INPUT + "strict_keys = true\n")
+    with pytest.raises(ValueError, match="strict_keys.*retired"):
         read_lorrax_input(str(p))
-    # ALL unknown keys named at once, not just the first.
-    assert "x_only" in str(exc.value)
-    assert "bogus_knob" in str(exc.value)
+
+
+def test_unknown_key_always_refuses(tmp_path):
+    # Strict parsing is the only behaviour since the ``strict_keys`` key was
+    # retired (owner ruling 2026-09-04); no caller can ask for less.
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_doctor_unknown.in"
+    p.write_text(BASE_INPUT + "tyop = 1\n")
+    with pytest.raises(ValueError, match=r"(?s)unrecognized deck.*tyop"):
+        read_lorrax_input(str(p))
 
 
 def test_mixed_case_key_is_recognised_not_reported_unknown(tmp_path, capsys):
@@ -526,15 +498,6 @@ def test_mixed_case_key_is_recognised_not_reported_unknown(tmp_path, capsys):
             f"{spelling}: value not honoured -- test premise is wrong")
         assert "not a recognized deck key" not in out, (
             f"{spelling}: honoured key reported as unrecognised:\n{out}")
-
-
-def test_mixed_case_key_survives_strict_keys(tmp_path):
-    """The same key must not be REFUSED by the strict gate."""
-    from gw.gw_config import read_lorrax_input
-    p = tmp_path / "deck_strict_case.in"
-    p.write_text(BASE_INPUT + "strict_keys = true\ndo_G0 = false\n")
-    params = read_lorrax_input(str(p))     # must not raise
-    assert params["do_G0"] is False
 
 
 def test_screening_method_ctsp_refuses_and_names_minimax(tmp_path):
@@ -566,11 +529,7 @@ def test_every_tracked_fixture_deck_has_no_dead_keys(tmp_path):
     ``profile_qloop``, ``profile_trace_dir``).  Every one parsed clean and
     steered nothing.
 
-    ``strict_keys`` is forced ON here regardless of the shipped default,
-    so this stays a real gate if that default never flips.  The knob is
-    injected right after the ``[cohsex]`` header: appending at EOF can
-    land past the section end when a K_POINTS block follows, which would
-    silently test nothing.
+    Parsing is unconditionally strict, so each fixture is read directly.
     """
     import re
     from gw.gw_config import read_lorrax_input
@@ -583,23 +542,17 @@ def test_every_tracked_fixture_deck_has_no_dead_keys(tmp_path):
 
     offenders = {}
     for deck in decks:
-        out, injected = [], False
+        out = []
         for ln in deck.read_text().splitlines(keepends=True):
             if re.match(r"\s*strict_keys\s*[=:]", ln, re.I):
                 continue
             out.append(ln)
-            if not injected and ln.strip().lower().startswith("[cohsex]"):
-                out.append("strict_keys = true\n")
-                injected = True
         probe = tmp_path / deck.name
         probe.write_text("".join(out))
         try:
             read_lorrax_input(str(probe))
         except ValueError as exc:
-            if "strict_keys" in str(exc):
-                offenders[deck.relative_to(repo)] = str(exc).splitlines()[1:]
-            else:
-                raise
+            offenders[deck.relative_to(repo)] = str(exc).splitlines()[1:]
     assert not offenders, (
         "tracked fixture decks carry keys that nothing reads:\n"
         + "\n".join(f"  {k}: {v}" for k, v in offenders.items()))
@@ -624,19 +577,16 @@ def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):
         read_lorrax_input(str(q))
 
 
-def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
-    # 'auto' MAY demote, announced: distributed_cholesky=auto passes
-    # through (it carries the replicated rank-truncation route on CPU);
-    # distributed_lu=auto demotes to 'off' and says so.
+def test_distributed_layout_lowers_to_scalapack_on_cpu(tmp_path, monkeypatch):
     _pin_backend(monkeypatch, "cpu")
     lines: list[str] = []
     path = tmp_path / "cohsex_auto_cpu.in"
-    path.write_text(BASE_INPUT)
+    path.write_text(BASE_INPUT + "linalg = distributed\n")
     cfg = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     assert cfg.backend.distributed_cholesky == "auto"
-    assert cfg.backend.distributed_lu == "off"
-    assert any("distributed_lu=auto" in l and "off" in l for l in lines)
+    assert cfg.backend.distributed_lu == "scalapack"
+    assert not any("distributed_lu=auto" in line for line in lines)
 
 
 def test_the_dynamic_self_consistent_regression_deck_is_supported():

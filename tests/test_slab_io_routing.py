@@ -95,10 +95,10 @@ def test_unknown_key_check_still_sees_real_typos(tmp_path):
     neighbouring misspelling must still be reported by the typo check.
     """
     with pytest.raises(ValueError, match="slab_iox"):
-        _config(tmp_path, "strict_keys = true\nslab_iox = phdf5_ffi\n")
-    # ...and the retired spelling keeps its targeted refusal under strictness.
+        _config(tmp_path, "slab_iox = phdf5_ffi\n")
+    # ...and the retired spelling keeps its targeted refusal.
     with pytest.raises(ValueError, match="must be removed"):
-        _config(tmp_path, "strict_keys = true\nslab_io = phdf5_ffi\n")
+        _config(tmp_path, "slab_io = phdf5_ffi\n")
 
 
 def test_gw_config_no_longer_defines_the_tier_vocabulary(tmp_path):
@@ -439,16 +439,13 @@ def test_w_dyson_solver_unknown_raises():
         normalize_w_dyson_solver("bogus")
 
 
-def test_deck_level_lu_warns_and_parses(tmp_path):
-    # Normalisation happens at PARSE time (fails/warns here, not
-    # 20 minutes into a run).
-    with pytest.warns(DeprecationWarning, match="lu"):
-        cfg = _config(tmp_path, "w_dyson_solver = lu\n")
-    assert cfg.backend.w_dyson_solver == "local"
+def test_deck_level_lu_refuses_with_layout_migration(tmp_path):
+    with pytest.raises(ValueError, match="linalg = local"):
+        _config(tmp_path, "w_dyson_solver = lu\n")
 
 
 def test_deck_level_lstsq_raises_at_parse(tmp_path):
-    with pytest.raises(ValueError, match="lstsq"):
+    with pytest.raises(ValueError, match="w_dyson_solver.*retired"):
         _config(tmp_path, "w_dyson_solver = lstsq\n")
 
 

@@ -181,6 +181,82 @@ def _worker_ridge_effect() -> int:
     return 0
 
 
+def _worker_batch_reshard_hoist() -> int:
+    """Child: a provider request on batch_reshard factors exactly once."""
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from isdf import factor_c_q, solve_zeta
+    import isdf.core as core
+
+    devs = jax.devices()
+    if len(devs) < _NDEV:
+        print(json.dumps({"skip": f"only {len(devs)} devices"}))
+        return 0
+
+    rng = np.random.default_rng(710)
+    nq, n, nr = 5, 32, 12
+    C = np.empty((nq, n, n), dtype=np.complex128)
+    for q in range(nq):
+        A = (rng.standard_normal((n, n))
+             + 1j * rng.standard_normal((n, n)))
+        H = 0.5 * (A + A.conj().T)
+        H += np.diag(np.linspace(-4.0, 4.0, n))
+        C[q] = H
+    Z1 = (rng.standard_normal((nq, n, nr))
+          + 1j * rng.standard_normal((nq, n, nr)))
+    Z2 = (rng.standard_normal((nq, n, nr))
+          + 1j * rng.standard_normal((nq, n, nr)))
+
+    mesh = Mesh(np.asarray(devs[:4]).reshape(2, 2), ('x', 'y'))
+    xy = NamedSharding(mesh, P(None, 'x', 'y'))
+    C_dev = jax.device_put(jnp.asarray(C), xy)
+    C_raw = core._identity_pad_block_diagonal(
+        C_dev, n_rmu_logical=n, mesh_xy=mesh)
+
+    calls = 0
+    factor_impl = core._factor_c_q_transverse_lu
+
+    def _counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return factor_impl(*args, **kwargs)
+
+    core._factor_c_q_transverse_lu = _counted
+    try:
+        LU, piv = factor_c_q(
+            C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n,
+            solver_kind='cusolvermp_lu',
+            distrib_la_batched_route='batch_reshard')
+    finally:
+        core._factor_c_q_transverse_lu = factor_impl
+
+    got = []
+    ref = []
+    for Z in (Z1, Z2):
+        ref.append(np.asarray(jax.device_get(solve_zeta(
+            C_raw, jax.device_put(jnp.asarray(Z), xy), mesh, 2,
+            vertex_mu_L=1, solver_kind='lu',
+            n_rmu_logical=n))))
+        # solve_zeta donates the Z carrier on this path.  Give the hoisted
+        # arm its own identical device array instead of reusing a deleted
+        # test fixture.
+        got.append(np.asarray(jax.device_get(solve_zeta(
+            LU, jax.device_put(jnp.asarray(Z), xy), mesh, 2,
+            vertex_mu_L=1, solver_kind='cusolvermp_lu',
+            n_rmu_logical=n, lu_piv=piv,
+            distrib_la_batched_route='batch_reshard'))))
+    print(json.dumps({
+        "factor_calls": calls,
+        "exact": bool(all(np.array_equal(a, b) for a, b in zip(got, ref))),
+        "max_abs": float(max(np.max(np.abs(a - b))
+                             for a, b in zip(got, ref))),
+    }))
+    return 0
+
+
 def _run_worker(tag: str, timeout: int = 900):
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
@@ -228,11 +304,24 @@ def test_hoisted_factor_carries_the_ridge():
         f"solution norm 1e{out['log10_norm']:.1f} looks unridged")
 
 
+def test_batch_reshard_provider_lu_is_hoisted_once_and_bit_identical():
+    """Two r chunks reuse one local-JAX factor under a provider request."""
+    out = _run_worker("worker_batch_reshard")
+    if "skip" in out:
+        pytest.skip(f"batch-reshard hoist gate: {out['skip']}")
+    assert out["factor_calls"] == 1, out
+    assert out["exact"], (
+        "batch_reshard's hoisted provider request drifted from the fused "
+        f"local-JAX route (max abs delta {out['max_abs']:.3e})")
+
+
 if __name__ == "__main__":
     tag = sys.argv[1] if len(sys.argv) > 1 else ""
     if tag == "worker_hoist":
         sys.exit(_worker_hoist())
     if tag == "worker_ridge":
         sys.exit(_worker_ridge_effect())
+    if tag == "worker_batch_reshard":
+        sys.exit(_worker_batch_reshard_hoist())
     print(f"unknown worker tag {tag!r}", file=sys.stderr)
     sys.exit(2)

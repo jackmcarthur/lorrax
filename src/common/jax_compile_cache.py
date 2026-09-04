@@ -87,16 +87,12 @@ Knobs (all optional):
                                           does not lower it: cheap compiles are
                                           cheaper than a Lustre entry.
 
-Default policy (``ISDF_JAX_CACHE_DIR`` unset) prefers the workflow: when
-``LORRAX_RUN_DIR`` is set, entries live in
-``$LORRAX_RUN_DIR/.lorrax_jax_cache/np{N_proc}/``.  Launchers without an
-explicit run directory retain the legacy ``$SCRATCH/lorrax_jax_cache`` (or
-``$XDG_CACHE_HOME``/``~/.cache``) fallback until the required P=4 default-flip
-A/B is available.  The workflow path avoids a cross-material cache that grows
-by tens of thousands of small files for the usual one-shot calculation while
-allowing kmeans/dipole/kin-ion/GW processes in one named workflow to reuse
-compatible entries.  An explicit ``ISDF_JAX_CACHE_DIR`` still overrides or
-opts out.  JAX's in-process executable cache is active in every case.
+Default policy (``ISDF_JAX_CACHE_DIR`` unset) is cache-cold across Python
+processes.  This is the ordinary one-shot path and creates no persistent-cache
+files.  A deliberate restart or cold-to-warm campaign enables reuse by naming
+one bounded, rank-visible directory explicitly.  An empty or whitespace-only
+value is the retained explicit opt-out.  JAX's in-process executable cache is
+active in every case.
 
 Within an enabled base, ``np{N_proc}`` is ONE directory shared by every rank
 of that world size (the old ``rank{i}/`` partitioning is gone; see below).
@@ -1883,28 +1879,19 @@ def compile_cache_stats() -> dict:
 
 
 def _resolve_cache_base_dir() -> tuple[str, str]:
-    """Resolve the one persistent-cache owner without inventing global state.
+    """Resolve the one persistent-cache owner without implicit reuse.
 
-    ``ISDF_JAX_CACHE_DIR`` is the explicit expert control, including its empty
-    opt-out.  Otherwise ``LORRAX_RUN_DIR`` scopes reuse to one workflow.  With
-    neither set, retain the legacy scratch/home fallback until the separately
-    required P=4 default-flip experiment can be run.
+    Cross-process reuse is an explicit request: a nonempty
+    ``ISDF_JAX_CACHE_DIR``.  Unset and empty both stay cache-cold, so an
+    ordinary one-shot run cannot inherit tens of thousands of global entries
+    merely because ``LORRAX_RUN_DIR``, ``SCRATCH`` or ``XDG_CACHE_HOME`` is
+    present.  The empty spelling remains distinguishable in the receipt as an
+    explicit opt-out.
     """
     explicit = os.environ.get("ISDF_JAX_CACHE_DIR")
     if explicit is not None:
         return explicit.strip(), "explicit"
-
-    run_dir = os.environ.get("LORRAX_RUN_DIR", "").strip()
-    if run_dir:
-        return os.path.join(run_dir, ".lorrax_jax_cache"), "LORRAX_RUN_DIR"
-
-    scratch = os.environ.get("SCRATCH", "").strip()
-    if scratch:
-        return os.path.join(scratch, "lorrax_jax_cache"), "$SCRATCH fallback"
-
-    base_cache = os.environ.get(
-        "XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-    return os.path.join(base_cache, "isdf_jax_compilation"), "home fallback"
+    return "", "default cold"
 
 
 # ---------------------------------------------------------------------------
@@ -1990,13 +1977,14 @@ def ensure_jax_compile_cache() -> None:
         # per-fusion cache active but gives it no real base directory.  Rank 0
         # then fails alone while its peers continue towards a collective.
         _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
-    if not cache_dir:  # only the explicit empty/whitespace opt-out reaches here
+    if not cache_dir:
         if proc_idx == 0:
-            _say(f"persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" "
-                 f"opt-out). JAX's in-process "
+            reason = ("ISDF_JAX_CACHE_DIR=\"\" opt-out"
+                      if cache_source == "explicit"
+                      else "ISDF_JAX_CACHE_DIR unset: cache-cold default")
+            _say(f"persistent compile cache OFF ({reason}). JAX's in-process "
                  f"executable cache remains active. For reuse among "
-                 f"sequential drivers in one workflow, set LORRAX_RUN_DIR; "
-                 f"for a deliberate restart campaign, set "
+                 f"sequential drivers or a deliberate restart campaign, set "
                  f"ISDF_JAX_CACHE_DIR to a rank-visible directory.")
         return
 
