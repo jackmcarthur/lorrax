@@ -9,9 +9,9 @@ that division collapses to 0 for every bc and downstream
 
     dimension size of operand at 'all_gather_dim' cannot be zero
 
-The planner is the single source of truth for chunk sizes; the user-set
-``band_chunk_size`` (e.g. via cohsex.in) is a hint that the planner must
-adjust for correctness on the active mesh.  These tests pin the
+The planner is the single source of truth for chunk sizes; its internal
+``band_chunk_override`` hint must be adjusted for correctness on the active
+mesh.  These tests pin the
 mesh-floor + round-up-to-multiple-of-``p_xy`` contract.
 
 Tickled by CrI3 6x6 30Ry bispinor full-BZ 16-GPU (commit ``2de70eb``+
@@ -55,37 +55,27 @@ def _cpu_mesh(p_x: int, p_y: int) -> Mesh:
     return Mesh(devs, axis_names=('x', 'y'))
 
 
-def test_deck_default_is_bc16_for_parallel_throughput():
-    from gw.gw_config import _DEFAULTS
-    assert _DEFAULTS["band_chunk_size"] == 16
-
-
-def test_deck_default_is_mesh_rounded_and_window_capped():
-    """The config default takes the positive-override path through _bump_bc."""
-    from gw.gw_config import _DEFAULTS
-
+def test_internal_hint_is_mesh_rounded_and_window_capped():
     mesh = _cpu_mesh(2, 2)
     plan = plan_gflat_chunks(
         meta=_fake_meta(), mesh_xy=mesh,
         nb_total=120, fit_nb_total=14,
         ngkmax=5000, n_q_disk=36,
         budget_gb=28.0,
-        band_chunk_override=_DEFAULTS["band_chunk_size"],
+        band_chunk_override=16,
         r_chunk_override=4096,
     )
     # _bump_bc(16), capped at ceil(14/P)*P = 16.
     assert plan.band_chunk == 16
 
 
-def test_deck_default_caps_below_sixteen_on_p1():
-    from gw.gw_config import _DEFAULTS
-
+def test_internal_hint_caps_below_sixteen_on_p1():
     plan = plan_gflat_chunks(
         meta=_fake_meta(), mesh_xy=_cpu_mesh(1, 1),
         nb_total=12, fit_nb_total=12,
         ngkmax=5000, n_q_disk=36,
         budget_gb=28.0,
-        band_chunk_override=_DEFAULTS["band_chunk_size"],
+        band_chunk_override=16,
         r_chunk_override=4096,
     )
     assert plan.band_chunk == 12
