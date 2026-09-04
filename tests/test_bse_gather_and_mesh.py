@@ -565,7 +565,10 @@ def _run_wide_child(n_devices: int = 4):
 
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
-    env["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={n_devices}"
+    force_host = f"--xla_force_host_platform_device_count={n_devices}"
+    flags = env.get("XLA_FLAGS", "")
+    if "xla_force_host_platform_device_count" not in flags:
+        env["XLA_FLAGS"] = f"{flags} {force_host}".strip()
     # The child must import what this process imports; under ``lx test`` the
     # source root arrives on sys.path, not necessarily in PYTHONPATH.
     env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)

@@ -41,7 +41,10 @@ def test_reshard_mu_to_r_uses_all_to_all_and_profiles(tmp_path: Path) -> None:
     """Check A_q[mu_XY, r] -> A_q[mu, r_XY] resharding on 4 forced CPU devices."""
     trace_dir = tmp_path / "reshard_trace"
     env = os.environ.copy()
-    env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    force_host = "--xla_force_host_platform_device_count=4"
+    flags = env.get("XLA_FLAGS", "")
+    if "xla_force_host_platform_device_count" not in flags:
+        env["XLA_FLAGS"] = f"{flags} {force_host}".strip()
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_PLATFORM_NAME"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"

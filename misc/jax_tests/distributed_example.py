@@ -1,6 +1,9 @@
 import os
 
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+_force_host = "--xla_force_host_platform_device_count=4"
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+if "xla_force_host_platform_device_count" not in _xla_flags:
+    os.environ["XLA_FLAGS"] = f"{_xla_flags} {_force_host}".strip()
 
 from jax import config
 
