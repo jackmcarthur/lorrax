@@ -55,9 +55,7 @@ from common.fft_helpers import (
     FLAT_K_FFT_VALUE_RTOL,
     make_flat_k_fftn,
     make_flat_k_ifftn,
-    make_local_flat_k_fftn,
 )
-from common.shard_map import shard_map
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
@@ -590,8 +588,6 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # 'backward' = 1/N normalisation in IFFT — matches Σ_R e^{-2πik·R} fH_R = fH_k.
     local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
     local_fftn = make_flat_k_fftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
-    local_fftn_slab = make_local_flat_k_fftn(
-        mesh_xy, kgrid_co, norm='backward')
 
     # ``f_eps.T`` at the call site was its own eager ``transpose`` module;
     # transposing inside costs nothing and removes one compile (exact — a
@@ -670,57 +666,36 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
 
     @partial(jax.jit,
              in_shardings=flat_xy,
-             out_shardings=flat_xy)
-    def _ifft_operator(operator_k):
-        """Transform one matrix-sharded operator without another live-out."""
-        return local_ifftn(operator_k)
-
-    @partial(jax.jit,
-             in_shardings=flat_xy,
              out_shardings=flat_xy,
              donate_argnums=(0,))
     def _ifft_operator_donated(operator_k):
         """Transform a dead k-space carrier in its reusable buffer."""
         return local_ifftn(operator_k)
 
-    def _fft_roundtrip_local(operator_R_local, operator_k_local):
-        """Certify every local matrix tile in bounded row slabs."""
-        local_rank = int(operator_R_local.shape[-2])
-        rows = max(1, (local_rank + 15) // 16)
-        slabs = (local_rank + rows - 1) // rows
+    @partial(jax.jit,
+             in_shardings=flat_xy,
+             out_shardings=flat_xy,
+             donate_argnums=(0,))
+    def _fftn_operator_donated(operator_R):
+        """Forward-transform a dead R-space carrier in its reusable buffer."""
+        return local_fftn(operator_R)
 
-        def _slab_receipt(i, maxima):
-            start = jnp.minimum(i * rows, local_rank - rows)
-            operator_R_slab = lax.dynamic_slice_in_dim(
-                operator_R_local, start, rows, axis=1)
-            operator_k_slab = lax.dynamic_slice_in_dim(
-                operator_k_local, start, rows, axis=1)
-            reconstructed = local_fftn_slab(operator_R_slab)
-            slab_abs = jnp.max(jnp.abs(reconstructed - operator_k_slab))
-            slab_scale = jnp.max(jnp.abs(operator_k_slab))
-            return (jnp.maximum(maxima[0], slab_abs),
-                    jnp.maximum(maxima[1], slab_scale))
-
-        fft_roundtrip_abs, fft_scale = lax.fori_loop(
-            0, slabs, _slab_receipt,
-            (jnp.asarray(0.0), jnp.asarray(0.0)))
-        axes = tuple(mesh_xy.axis_names)
-        return (lax.pmax(fft_roundtrip_abs, axis_name=axes),
-                lax.pmax(fft_scale, axis_name=axes))
-
-    _fft_roundtrip_abs_scale = jax.jit(shard_map(
-        _fft_roundtrip_local, mesh=mesh_xy,
-        in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
-        out_specs=(P(), P()), check_vma=False))
+    @partial(jax.jit,
+             in_shardings=(flat_xy, flat_xy),
+             out_shardings=rep_)
+    def _fft_reconstruction_relative(reconstructed_k, operator_k):
+        """Reduce an already reconstructed all-tile FFT receipt to a scalar."""
+        fft_roundtrip_abs = jnp.max(jnp.abs(reconstructed_k - operator_k))
+        fft_scale = jnp.max(jnp.abs(operator_k))
+        return jnp.where(
+            fft_scale > 0.0, fft_roundtrip_abs / fft_scale,
+            fft_roundtrip_abs)
 
     def _fft_roundtrip_relative(operator_R, operator_k):
-        """Certify all tiles without a global slice or matrix reshard."""
-        fft_roundtrip_abs, fft_scale = jax.device_get(
-            _fft_roundtrip_abs_scale(operator_R, operator_k))
-        fft_roundtrip_abs = float(fft_roundtrip_abs)
-        fft_scale = float(fft_scale)
-        return (fft_roundtrip_abs / fft_scale
-                if fft_scale > 0.0 else fft_roundtrip_abs)
+        """Destructively certify all tiles with at most two live operators."""
+        reconstructed_k = _fftn_operator_donated(operator_R)
+        return float(_fft_reconstruction_relative(
+            reconstructed_k, operator_k))
 
     @partial(jax.jit,
              in_shardings=(coeff_x, coeff_y),
@@ -755,9 +730,10 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # operator through that donated route, then deterministically rebuild its
     # k-space Gram image for the value-level receipt.  Repeating a contraction
     # is cheaper than retaining a third 11--14-GiB operator: at most the R and
-    # rebuilt k images coexist.  Finally reconstruct active_R once more after
-    # both receipts.  Each receipt covers every tile in bounded local row
-    # slabs; only two scalar maxima are replicated or transferred to the host.
+    # rebuilt k images coexist.  The receipt destructively forward-transforms
+    # its R carrier and compares every reconstructed tile; both retained R
+    # operators are then rebuilt once.  Only the scalar residual is replicated
+    # or transferred to the host.
     if active_band_range is not None:
         active_k = _build_active_k(ctilde_x, ctilde_y)
         active_R = _ifft_operator_donated(active_k)
@@ -778,6 +754,13 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
      _energy_recovery_again, _inverse_residual_again) = _build_fH_k(
          ctilde_x, ctilde_y, f_eps)
     fft_rel = _fft_roundtrip_relative(fH_R, fH_k)
+    del (fH_k, fH_R, _f_recovery_again,
+         _energy_recovery_again, _inverse_residual_again)
+    (fH_k, _f_recovery_again,
+     _energy_recovery_again, _inverse_residual_again) = _build_fH_k(
+         ctilde_x, ctilde_y, f_eps)
+    fH_R = _ifft_operator_donated(fH_k)
+    jax.block_until_ready(fH_R)
     del (fH_k, _f_recovery_again,
          _energy_recovery_again, _inverse_residual_again)
     if active_band_range is not None:

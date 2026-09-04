@@ -416,10 +416,6 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
     make_gw_conv_ffi as _make_gw_conv_ffi,
     make_flat_k_fft_ffi as _make_flat_k_fft_ffi,
 )
-from ffi.fft import (  # noqa: E402
-    make_local_flat_k_fft_ffi as _make_local_flat_k_fft_ffi,
-    require_fft_ffi as _require_fft_ffi,
-)
 
 
 # ============================================================================
@@ -603,21 +599,3 @@ def make_flat_k_fftn(
     """Flat-k FFT ``(nk, *trail) -> (nk, *trail)``.  See :func:`make_flat_k_fft`."""
     return make_flat_k_fft(mesh, kgrid, spec, kind='fftn',
                            norm=norm, out_spec=out_spec)
-
-
-def make_local_flat_k_fftn(
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    *,
-    norm: str | None = 'ortho',
-) -> Callable:
-    """Device-local flat-k FFT for a caller already inside ``shard_map``.
-
-    This is the same required FFI kernel as :func:`make_flat_k_fftn`, without
-    its outer ``shard_map`` wrapper.  It exists for bounded local trailing-axis
-    slabs; callers must keep the complete k axis local.
-    """
-    if not fft_ffi_enabled():
-        raise RuntimeError(GATE.off_refuse_msg)
-    _require_fft_ffi(mesh)
-    return _make_local_flat_k_fft_ffi(kgrid, kind='fftn', norm=norm)

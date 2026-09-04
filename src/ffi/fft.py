@@ -364,46 +364,6 @@ def validate_flat_spec(spec: P, what: str) -> P:
     return P(None, *axes[3:])
 
 
-def make_local_flat_k_fft_ffi(
-    kgrid: tuple[int, int, int],
-    *,
-    kind: str,
-    norm: str | None,
-) -> Callable:
-    """Return the flat-k FFI call for use inside an existing ``shard_map``.
-
-    This is the local kernel owned by :func:`make_flat_k_fft_ffi`, exposed so
-    an already manually sharded caller can bound a trailing-axis workspace
-    without nesting another ``shard_map``.  Platform/target validation remains
-    the outer factory's responsibility.
-    """
-    if kind not in ('ifftn', 'fftn'):
-        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    nkx, nky, nkz = (int(v) for v in kgrid)
-    nk = nkx * nky * nkz
-    scale = ffi_fft_scale(kind, norm, nk)
-    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
-                 forward=np.int64(0 if kind == 'ifftn' else 1),
-                 scale=np.float64(scale))
-
-    def _local(x_local):
-        if x_local.dtype != jnp.complex128:
-            raise TypeError(
-                "FFI flat-k backend supports complex128 only, got "
-                f"{x_local.dtype}.")
-        if int(x_local.shape[0]) != nk:
-            raise ValueError(
-                f"flat-k local input leading extent {x_local.shape[0]} != "
-                f"nkx*nky*nkz = {nk}.")
-        out_t = jax.ShapeDtypeStruct(x_local.shape, x_local.dtype)
-        return jax.ffi.ffi_call(
-            FLAT_K_TARGET, out_t,
-            input_output_aliases={0: 0},
-        )(x_local, **attrs)
-
-    return _local
-
-
 def make_flat_k_fft_ffi(
     mesh: Mesh,
     kgrid: tuple[int, int, int],
@@ -439,7 +399,17 @@ def make_flat_k_fft_ffi(
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     flat_spec = validate_flat_spec(spec, "the input")
-    _local = make_local_flat_k_fft_ffi(kgrid, kind=kind, norm=norm)
+    scale = ffi_fft_scale(kind, norm, nk)
+    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
+                 forward=np.int64(0 if kind == 'ifftn' else 1),
+                 scale=np.float64(scale))
+
+    def _local(x_local):
+        out_t = jax.ShapeDtypeStruct(x_local.shape, x_local.dtype)
+        return jax.ffi.ffi_call(
+            FLAT_K_TARGET, out_t,
+            input_output_aliases={0: 0},  # in-place when the operand is dead
+        )(x_local, **attrs)
 
     from common.shard_map import shard_map     # see the import-cycle note
     _sm = shard_map(_local, mesh=mesh,
