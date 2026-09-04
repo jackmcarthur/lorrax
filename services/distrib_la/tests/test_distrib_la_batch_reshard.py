@@ -102,7 +102,7 @@ def test_cholesky_route_uses_safe_ragged_padding_and_ignores_block_size():
     assert _rel(np.asarray(L) @ np.conj(np.swapaxes(np.asarray(L), -1, -2)), A) < 1e-12
 
 
-def test_solve_lu_route_uses_identity_A_and_zero_rhs_for_ragged_padding():
+def test_solve_lu_route_skips_ragged_padding_and_restores_layout():
     from jax.sharding import PartitionSpec as P
 
     mesh = _mesh()
@@ -118,6 +118,49 @@ def test_solve_lu_route_uses_identity_A_and_zero_rhs_for_ragged_padding():
     assert X.shape == B.shape and X.sharding.spec == P(None, "x", "y")
     assert _rel(X, want) < 1e-12
     assert _rel(A @ np.asarray(X), B) < 1e-12
+
+
+@pytest.mark.parametrize("op", ["eigh", "cholesky", "solve_lu"])
+def test_ragged_route_never_calls_dense_kernel_for_synthetic_rows(
+    op, monkeypatch,
+):
+    """Q=5 on P=4 executes five dense rows, not Qp=8."""
+    import jax
+    import jax.numpy as jnp
+    import distrib_la._batch_reshard as br
+
+    mesh = _mesh()
+    rng = np.random.default_rng(8350)
+    A = (_herm(rng, 5, 8) if op == "eigh" else _hpd(rng, 5, 8))
+    B = (rng.standard_normal((5, 8, 6))
+         + 1j * rng.standard_normal((5, 8, 6))).astype("complex128")
+    calls = []
+
+    original = getattr(jnp.linalg, "solve" if op == "solve_lu" else op)
+
+    def _counted(*args, **kwargs):
+        # This callback is staged inside the scalar lax.cond's real branch;
+        # it therefore counts runtime dense executions rather than traces.
+        jax.debug.callback(lambda _unused: calls.append(1), jnp.int32(0))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        jnp.linalg, "solve" if op == "solve_lu" else op, _counted)
+    br._JIT_CACHE.clear()
+    p = D.plan(
+        op, mesh, backend="off", n=8,
+        batched_route=D.ROUTE_BATCH_RESHARD)
+    operands = [_put(A, mesh)]
+    if op == "solve_lu":
+        operands.append(_put(B, mesh))
+    result = p.batched(*operands)
+    leaves = jax.tree.leaves(result)
+    for leaf in leaves:
+        leaf.block_until_ready()
+
+    assert len(calls) == 5, (
+        f"{op} executed {len(calls)} dense rows for Q=5; Qp=8 means "
+        "synthetic slots reached the expensive branch")
 
 
 def test_dispatch_public_route_does_not_take_the_native_early_return(monkeypatch):

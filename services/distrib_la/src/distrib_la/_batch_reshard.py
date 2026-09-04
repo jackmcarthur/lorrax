@@ -17,10 +17,10 @@ Consequently GSPMD never sees a direct face→batch or batch→face reshard it
 could lower as replicate-then-partition, and no full matrix crosses the host.
 
 The leading batch need not divide the mesh.  It is padded locally before
-the first exchange and dropped after the inverse exchange.  Padding is
-operation-safe: local Cholesky and LU solves replace padded A matrices by
-identity (and padded RHS matrices by zero); eigh may safely diagonalize its
-zero-Hermitian padding.  Matrix dimensions still have to tile the incoming
+the first exchange and dropped after the inverse exchange.  Synthetic local
+rows never enter a dense kernel: a scalar ``lax.cond`` around each local slot
+runs the operation only when its global q index is real.  Matrix dimensions
+still have to tile the incoming
 ``P(None,'x','y')`` face exactly.  Padding those dimensions would change the
 linear-algebra problem, so a consumer that needs it must pad before calling
 the plan and slice the result afterward; this route pads only the leading
@@ -137,16 +137,74 @@ def _pad_leading(a, amount: int):
     return jnp.pad(a, ((0, amount), (0, 0), (0, 0)))
 
 
-def _replace_padded_a_with_identity(
-    A, *, nbatch: int, px: int, py: int,
+def _dense_real_rows(
+    op: str, A, B=None, *, nbatch: int, py: int,
 ):
-    """Make this rank's padded local A matrices nonsingular/HPD."""
-    local_nb = int(A.shape[0])
-    block = ((jax.lax.axis_index("x") * py + jax.lax.axis_index("y"))
-             * local_nb)
-    padded = block + jnp.arange(local_nb) >= nbatch
-    eye = jnp.eye(int(A.shape[1]), dtype=A.dtype)
-    return jnp.where(padded[:, None, None], eye[None, :, :], A)
+    """Apply one dense operation only to real local batch rows.
+
+    After face-to-batch movement each device owns ``ceil(Q/P)`` whole
+    matrices.  The last local slots may be synthetic padding.  A vmapped
+    conditional is not sufficient here because a batched predicate may run
+    both branches; the scalar ``fori_loop`` + ``lax.cond`` is the same
+    schedule used by ``isdf.core._factor_c_q_replicated_qparallel`` and makes
+    the expensive branch unreachable for a synthetic global q index.
+    """
+    local_nb, n, _ = (int(v) for v in A.shape)
+    device = (jax.lax.axis_index("x") * py + jax.lax.axis_index("y"))
+    first_q = device * local_nb
+
+    if op == "eigh":
+        w0 = jnp.zeros((local_nb, n), dtype=jnp.real(A).dtype)
+        z0 = jnp.zeros_like(A)
+
+        def _one(i, acc):
+            W, Z = acc
+            A1 = jax.lax.dynamic_slice_in_dim(A, i, 1, axis=0)
+
+            def _work(a):
+                result = jnp.linalg.eigh(a)
+                # EighResult is a named tuple while the neutral branch is a
+                # plain tuple; lax.cond requires identical pytree node types.
+                return result[0], result[1]
+
+            def _skip(a):
+                return (jnp.zeros((1, n), dtype=jnp.real(a).dtype),
+                        jnp.zeros_like(a))
+
+            W1, Z1 = jax.lax.cond(first_q + i < nbatch, _work, _skip, A1)
+            return (jax.lax.dynamic_update_slice(W, W1, (i, 0)),
+                    jax.lax.dynamic_update_slice(Z, Z1, (i, 0, 0)))
+
+        return jax.lax.fori_loop(0, local_nb, _one, (w0, z0))
+
+    out0 = (jnp.zeros_like(A) if op == "cholesky"
+            else jnp.zeros_like(B))
+
+    def _one(i, out):
+        A1 = jax.lax.dynamic_slice_in_dim(A, i, 1, axis=0)
+        if op == "cholesky":
+            operand = A1
+
+            def _work(a):
+                return jnp.linalg.cholesky(a)
+
+            def _skip(a):
+                return jnp.zeros_like(a)
+        else:
+            B1 = jax.lax.dynamic_slice_in_dim(B, i, 1, axis=0)
+            operand = (A1, B1)
+
+            def _work(ab):
+                return jnp.linalg.solve(ab[0], ab[1])
+
+            def _skip(ab):
+                return jnp.zeros_like(ab[1])
+
+        out1 = jax.lax.cond(
+            first_q + i < nbatch, _work, _skip, operand)
+        return jax.lax.dynamic_update_slice(out, out1, (i, 0, 0))
+
+    return jax.lax.fori_loop(0, local_nb, _one, out0)
 
 
 def _replicate_batch_vector(v, *, px: int, py: int):
@@ -188,24 +246,23 @@ def batch_reshard_call(
                 for a in local_faces)
             A = local[0]
 
-            # Eigh can diagonalize zero-Hermitian padding safely.  Cholesky
-            # and LU cannot, so give their synthetic rows a neutral A=I.
-            if batch_pad and op in ("cholesky", "solve_lu"):
-                A = _replace_padded_a_with_identity(
-                    A, nbatch=nbatch, px=px, py=py)
-
             if op == "eigh":
-                W, Z = jnp.linalg.eigh(A)
+                if batch_pad:
+                    W, Z = _dense_real_rows(
+                        op, A, nbatch=nbatch, py=py)
+                else:
+                    W, Z = jnp.linalg.eigh(A)
                 W = _replicate_batch_vector(W, px=px, py=py)[:nbatch]
                 Z = _batch_to_face(Z, px=px, py=py)[:nbatch]
                 return W, Z
             if op == "cholesky":
-                L = jnp.linalg.cholesky(A)
+                L = (_dense_real_rows(op, A, nbatch=nbatch, py=py)
+                     if batch_pad else jnp.linalg.cholesky(A))
                 return _batch_to_face(L, px=px, py=py)[:nbatch]
 
-            # The padded RHS is already zero.  With padded A=I its solution
-            # is zero, and both are dropped after the inverse exchange.
-            X = jnp.linalg.solve(A, local[1])
+            X = (_dense_real_rows(
+                    op, A, local[1], nbatch=nbatch, py=py)
+                 if batch_pad else jnp.linalg.solve(A, local[1]))
             return _batch_to_face(X, px=px, py=py)[:nbatch]
 
         mapped = shard_map(
