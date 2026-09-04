@@ -51,7 +51,15 @@ interpretable. A production self-consistent run must satisfy:
 - band-structure interpolation (htransform) fitting the whole WFN band set and
   returning at least **16 corrected conduction bands**, guard bands ≥ 8, with a
   QE `bands` calculation along the same path as the accuracy certificate; four
-  returned conduction bands destroy the interpolant.
+  returned conduction bands destroy the interpolant. The **htransform coarse
+  k-grid is a production convergence parameter independent of the GW screening
+  grid**: densify it until the energy-ordered, per-path-VBM-aligned QE
+  certificate is at most **20 meV over every displayed state**. Whole-WFN
+  fitting, a larger Galerkin rank, guard bands, and a different f-transform
+  scale do not replace this grid test. On Si, 4x4x4 and 6x6x6 miss by 120.424
+  and 33.905 meV, while 8x8x8 passes at 10.869 meV; do not publish a curve from
+  the coarser diagnostic grids merely because the GW correction itself was
+  computed there.
 
 ## The diagnostic deck the study converged on
 
