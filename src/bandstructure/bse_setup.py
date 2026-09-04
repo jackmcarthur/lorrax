@@ -325,8 +325,9 @@ def compute_wfns_fi(
     arbitrary_q_bse.md §1/§2a: e.g. the shifted grid {k + Q}).
 
     Args:
-        ctilde:    (nk_co, nb, rank) Galerkin coeffs in the rank-α basis,
-                   replicated. From ``streaming_galerkin_solve``.
+        ctilde:    (nk_co, nb, rank) Galerkin coeffs in the rank-α basis.
+                   ``build_fH_R`` consumes paired rank-sharded views, so this
+                   may arrive rank-sharded or replicated.
         B_at_mu:   (rank, ns, n_μ) α-basis evaluated at coarse centroids.
         enk_sigma: (nb, nk_co) DFT band energies in Ry.
         kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.

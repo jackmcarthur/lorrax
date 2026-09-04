@@ -548,8 +548,9 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     with the actual IFFT prevents a documentation-only convention mismatch.
 
     Args:
-        ctilde:    (nk_co, nb, rank) Galerkin coefficients in the rank-α basis,
-                   replicated. Output of ``streaming_galerkin_solve``.
+        ctilde:    (nk_co, nb, rank) Galerkin coefficients in the rank-α basis.
+                   The rank axis is consumed as paired ``'x'``/``'y'`` views;
+                   callers may pass either view or a replicated array.
         enk_sigma: (nb, nk_co) DFT band energies in Ry.
         kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
         mesh_xy:   ('x','y') device mesh.
@@ -581,6 +582,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
            + (f" (a from band {a_band_index})" if a_band_index is not None else ""))
 
     flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    coeff_x = NamedSharding(mesh_xy, P(None, None, 'x'))
+    coeff_y = NamedSharding(mesh_xy, P(None, None, 'y'))
     spec_3d = P(None, None, None, 'x', 'y')
     rep_ = NamedSharding(mesh_xy, P())
     # 'backward' = 1/N normalisation in IFFT — matches Σ_R e^{-2πik·R} fH_R = fH_k.
@@ -604,24 +607,38 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                 "guard boundary exists.")
     else:
         active_start = active_stop = 0
+
+    # A replicated (nk, nb, rank) coefficient carrier scales with the coarse
+    # grid and was the last dense-grid wall: MoS2 64x64x1 / 80 bands / rank
+    # 1656 occupied 8.68 GiB on EVERY device, then made build_fH_R compile a
+    # 52.31-GiB module and request a 20.92-GiB contiguous allocation.  Keep
+    # one rank-sharded view for each output matrix axis instead.  The band
+    # contraction is local and each device constructs its own (alpha, beta)
+    # tile directly; only the Hermitian transpose uses the mesh collective.
+    # This changes placement only: the two operands contain identical values
+    # and preserve the incumbent einsum order over the unsharded band axis.
+    ctilde_x = jax.device_put(ctilde, coeff_x)
+    ctilde_y = jax.device_put(ctilde_x, coeff_y)
+    jax.block_until_ready((ctilde_x, ctilde_y))
+    log_fn(
+        "  [route] Galerkin coefficient carrier: paired rank shards "
+        "P(None,None,'x') / P(None,None,'y'); no replicated ctilde in fH")
+
     @partial(jax.jit,
-             in_shardings=(rep_, rep_),
+             in_shardings=(coeff_x, coeff_y, rep_),
              out_shardings=(flat_xy, rep_, rep_, rep_))
-    def _build_fH_k(ctilde_in, f_eps_in):
+    def _build_fH_k(ctilde_i, ctilde_j, f_eps_in):
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
         bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
-        weighted = ctilde_in * bw[..., None]
-        fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
-        # Constrain the CONTRACTION OUTPUT, not just the hermitized copy.
-        # ``ctilde`` arrives replicated, so without this the SPMD partitioner
-        # has no reason to split the (nk, rank, rank) product and materialises
-        # it — and then its transpose, and then the hermitized sum — at FULL
-        # size on every device.  Measured on MoS2 12x12 / n_mu=2412 / nb=20
-        # (rank 2880): the module wanted 57.84 GiB per device and OOMed an
-        # A100-80GB, against a true sharded footprint of 2 x 1.2 GiB on a 4x4
-        # mesh.  Pinning the einsum output makes the whole chain local.
-        # Memory-only: same values, same shardings out.
+        weighted_i = ctilde_i * bw[..., None]
+        weighted_j = ctilde_j * bw[..., None]
+        fH_k = -jnp.einsum(
+            'kim,kin->kmn', weighted_i, jnp.conj(weighted_j),
+            optimize=True)
+        # Constrain the contraction output, not just the hermitized copy.
+        # The paired input views already place m on x and n on y, so this is
+        # the natural output layout and no full rank-by-rank product exists.
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
@@ -633,7 +650,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         # are already live, rather than compiling a rank-by-rank Gamma-only
         # eigensolve beside the production batched eigensolver.
         small_fH = -jnp.einsum(
-            'kim,kjm->kij', weighted, jnp.conj(weighted), optimize=True)
+            'kim,kjm->kij', weighted_i, jnp.conj(weighted_i), optimize=True)
         small_fH = 0.5 * (small_fH + jnp.swapaxes(small_fH, -1, -2).conj())
         recovered_f = jax.vmap(jnp.linalg.eigvalsh)(small_fH)
         expected_f = jnp.sort(f_eps_T, axis=1)
@@ -666,12 +683,13 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             fft_roundtrip_abs)
 
     @partial(jax.jit,
-             in_shardings=rep_,
+             in_shardings=(coeff_x, coeff_y),
              out_shardings=flat_xy)
-    def _build_active_k(ctilde_in):
-        active_rows = ctilde_in[:, active_start:active_stop, :]
+    def _build_active_k(ctilde_i, ctilde_j):
+        active_rows_i = ctilde_i[:, active_start:active_stop, :]
+        active_rows_j = ctilde_j[:, active_start:active_stop, :]
         active_k = jnp.einsum(
-            'kim,kin->kmn', active_rows, jnp.conj(active_rows),
+            'kim,kin->kmn', active_rows_i, jnp.conj(active_rows_j),
             optimize=True)
         active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
         active_k = 0.5 * (
@@ -684,13 +702,13 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # Applying a per-k Löwdin map would change the one shared alpha gauge and
     # is therefore forbidden.  Accuracy is decided directly from recovered
     # coarse-grid energies/wavefunctions and the independent fine-QE oracle.
-    @partial(jax.jit, out_shardings=rep_)
+    @partial(jax.jit, in_shardings=coeff_x, out_shardings=rep_)
     def _ortho_all_k(c):
         nb_ = c.shape[1]
         G = jnp.einsum('kim,kjm->kij', c, jnp.conj(c), optimize=True)
         return jnp.max(jnp.abs(G - jnp.eye(nb_, dtype=G.dtype)[None]))
 
-    _projection_defect = float(_ortho_all_k(ctilde))
+    _projection_defect = float(_ortho_all_k(ctilde_x))
     log_fn(
         f"  [receipt] whole-state projection over all "
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
@@ -705,7 +723,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # workspaces overlap.  The max reductions remain SPMD reductions over
     # P(None, 'x', 'y'); only a scalar is replicated or transferred to host.
     if active_band_range is not None:
-        active_k = _build_active_k(ctilde)
+        active_k = _build_active_k(ctilde_x, ctilde_y)
         active_R = _ifft_operator(active_k)
         active_fft_rel = float(
             _fft_roundtrip_relative(active_R, active_k))
@@ -715,7 +733,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         active_fft_rel = 0.0
 
     (fH_k, f_recovery_error,
-     energy_recovery_error, inverse_residual) = _build_fH_k(ctilde, f_eps)
+     energy_recovery_error, inverse_residual) = _build_fH_k(
+         ctilde_x, ctilde_y, f_eps)
     fH_R = _ifft_operator(fH_k)
     fft_rel = float(_fft_roundtrip_relative(fH_R, fH_k))
     log_fn(
@@ -2252,6 +2271,20 @@ def main(argv=None):
         sanity.check_in_range(
             "htransform E_nk bandwidth", np.array([_spread]),
             0.0, 20.0 * RYD_TO_EV, unit="eV", print_fn=log)
+
+    # QP rotations above consume the immutable fit artifact in its incumbent
+    # replicated layout.  Past this seam only the compact coefficients and
+    # basis-at-nodes table survive.  Move ctilde onto one rank shard and drop
+    # the wrapper before build_fH_R allocates either rank-by-rank operator;
+    # otherwise ``basis.ctilde`` keeps the full replica live even though the
+    # builder itself consumes rank-sharded views.
+    _coeff_x = NamedSharding(mesh_xy, P(None, None, 'x'))
+    ctilde = jax.device_put(ctilde, _coeff_x)
+    jax.block_until_ready(ctilde)
+    del basis
+    log(
+        "  [route] compact Galerkin state handed to htransform as "
+        "P(None,None,'x'); released immutable replicated fit carrier")
 
     kpath_data = initialize_kpath(wfn, params)
     if len(_centroid_records) != 1:

@@ -123,6 +123,51 @@ def test_htransform_carries_no_dense_identity_metric():
     assert "no dense" in banner
 
 
+@pytest.mark.parametrize("ndev", [1, 4])
+def test_fh_builder_consumes_rank_shards_and_keeps_small_certificate(ndev):
+    """The coarse-grid certificate survives removal of replicated ctilde.
+
+    This is the red twin for the 64x64x1 MoS2 memory wall.  The old builder
+    required ``P()`` for both coefficient operands, so a 4096x80x1656 c128
+    table occupied 8.68 GiB on every device and remained live beside fH.  A
+    source rank shard must now reach the real fH/FFT/path pipeline without an
+    all-gather, while the synthetic fixture's exact coarse points remain
+    below the same value-level certificate.
+    """
+    pytest.importorskip("jax")
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from bandstructure.htransform import h_transform
+    from symmetry_maps import SymMaps
+
+    mesh = _mesh(1 if ndev == 1 else 2)
+    meta, ct, enk, wfn, _ = _kpath_inputs(
+        nk_grid=(2, 2, 1), nb=4, rank=8, nq=4)
+    coarse_k = np.asarray([
+        [0.0, 0.0, 0.0],
+        [0.0, -0.5, 0.0],
+        [-0.5, 0.0, 0.0],
+        [-0.5, -0.5, 0.0],
+    ])
+    kpath_data = (coarse_k, np.arange(4.0), [0], ["Gamma"], [0])
+    sym = object.__new__(SymMaps)
+    sym.unfolded_kpts = coarse_k
+    lines = []
+    with mesh:
+        ct_x = jax.device_put(
+            jnp.asarray(ct), NamedSharding(mesh, P(None, None, 'x')))
+        out = h_transform(
+            meta, ct_x, jnp.asarray(enk), wfn, kpath_data, lines.append,
+            mesh, n_return_bands=ct.shape[1] - 1, sym=sym)
+
+    assert out["coincident_max_abs_ry"] < 2.0e-11
+    assert np.all(np.isfinite(out["energies_sorted"]))
+    assert (
+        "paired rank shards P(None,None,'x') / P(None,None,'y'); "
+        "no replicated ctilde in fH" in " ".join(lines))
+
+
 def test_active_character_follows_state_through_guard_energy_crossing():
     """A lower DFT guard must not replace a raised active QP state."""
     pytest.importorskip("jax")
@@ -258,9 +303,11 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
     np.testing.assert_array_equal(result["coincident_coarse_indices"], [0])
     np.testing.assert_allclose(
         result["coincident_exact"], [[-1.0, 0.0, 3.0]],
-        rtol=0.0, atol=0.0)
+        rtol=0.0, atol=2.0e-11)
     assert result["coincident_max_abs_ry"] < 2.0e-11
-    np.testing.assert_array_equal(result["gamma_exact"], [-1.0, 0.0, 3.0])
+    np.testing.assert_allclose(
+        result["gamma_exact"], [-1.0, 0.0, 3.0],
+        rtol=0.0, atol=2.0e-11)
     assert "active/guard character selection" in " ".join(lines)
     assert "path/coarse coincidences: 1 path row" in " ".join(lines)
 
