@@ -11,6 +11,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common.progress import LoopProgress
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
@@ -256,6 +257,19 @@ def _integrate_sigma_batches(
     batch_size = int(pole_batch_size)
     sweep_started = False
     max_b = max_d = 0.0
+    # The same bar as the zeta fit and the W roles (common.progress); the
+    # step count is exact because window/batch membership is a pure function
+    # of the pole ranges the sweep will visit.  Owner request 2026-09-03.
+    total_tau = 0
+    for _lo in range(0, int(n_poles), batch_size):
+        _batch = tuple(range(_lo, min(_lo + batch_size, int(n_poles))))
+        for _row in plan:
+            if _batch_rows(_row, _batch) is not None:
+                total_tau += len(np.asarray(_row.window.nodes.t))
+    progress = LoopProgress(
+        max(1, total_tau), print_fn, title="Sigma tau sweep",
+        item_name="tau node", max_updates=20)
+    progress.start()
     for lo, Omega, B, B_odd in batches:
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
@@ -327,11 +341,13 @@ def _integrate_sigma_batches(
                     jnp.asarray(t, dtype=jnp.complex128))
                 accumulator.add_tau(sigma_tau)
                 n_tau += 1
+                progress.step(wait=sigma_tau)
             accumulator.end_window()
             n_sweeps += 1
             logical_tau_pairs += win.n_tau
         del B, B_odd, Omega
         gc.collect()
+    progress.finish()
 
     sigma = strip_sigma_window(
         accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
@@ -628,7 +644,10 @@ def compute_sigma_c_mpa_omega_grid(
                     "  SC fixed quadrature: "
                     f"iteration={geometry['sc_fixed_iteration']}, "
                     f"initialized={geometry['sc_fixed_initialized']}, "
-                    "rebuilds_this_iteration=0, rebuilds_total=0, "
+                    f"rebuilds_this_iteration="
+                    f"{geometry['sc_fixed_rebuilds_this_iteration']}, "
+                    f"rebuilds_total="
+                    f"{geometry['sc_fixed_total_rebuild_count']}, "
                     f"pair_cost={geometry['window_tau_pairs']}, "
                     f"initial_pair_cost="
                     f"{geometry['sc_fixed_initial_window_tau_pairs']}, "

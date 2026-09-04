@@ -135,12 +135,22 @@ class LoopProgress:
                 self.print_fn(f"Started {self.title} at {_fmt_time(self._start)}.")
         return self
 
-    def step(self):
-        """Call after each iteration completes."""
+    def step(self, wait=None):
+        """Call after each iteration completes.
+
+        ``wait`` is an optional JAX value; at a milestone step it is
+        blocked on before the line is timed, so a loop that only DISPATCHES
+        asynchronous work (the Sigma tau sweep) reports execution progress
+        rather than how far ahead the Python loop has run.  Blocking on a
+        local array is not a collective, so a rank-0-only wait is safe
+        (INVARIANTS row 21).  Non-milestone steps never block.
+        """
         if self._start is None:
             self.start()
         self._current += 1
         if self.enabled and self._current <= self.num_steps and self._mask[self._current]:
+            if wait is not None:
+                jax.block_until_ready(wait)
             elapsed = time.time() - self._start
             self.print_fn(_format_progress(
                 self._current, self.num_steps, elapsed,
