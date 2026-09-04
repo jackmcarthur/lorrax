@@ -11,6 +11,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
@@ -617,14 +618,19 @@ def compute_sigma_c_mpa_omega_grid(
                 omega_grid_step_ry=omega_grid_step_ry,
                 occupation_window_threshold=occupation_window_threshold)
         else:
-            plan, geometry = plan_sigma_windows(
-                summaries, branches, omega_grid_ry,
-                regularization_width_ry,
-                eps=quadrature_eps,
-                reduction_seconds=quadrature_reduction_seconds,
-                cache_dir=quadrature_cache_dir,
-                print_fn=print_fn, edge_factor=edge_factor,
-                fixed_rule_session=fixed_quadrature_session)
+            # Rule fitting is its own timing row: on the Si b80/c504 deck the
+            # cold fits took ~180 s of a 194 s "Sigma" stage while the tau
+            # sweep took 6 s (2026-09-03, runs/DEV/122), and the table
+            # could not tell them apart.
+            with timing.section("sigma.rule_plan"):
+                plan, geometry = plan_sigma_windows(
+                    summaries, branches, omega_grid_ry,
+                    regularization_width_ry,
+                    eps=quadrature_eps,
+                    reduction_seconds=quadrature_reduction_seconds,
+                    cache_dir=quadrature_cache_dir,
+                    print_fn=print_fn, edge_factor=edge_factor,
+                    fixed_rule_session=fixed_quadrature_session)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
@@ -680,11 +686,12 @@ def compute_sigma_c_mpa_omega_grid(
                         f"kappa_max={window['kappa_max']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")
-        total = integrate_sigma_store(
-            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, brackets=band_brackets,
-            band_counts=band_counts, odd_residue_off=odd_residue_off,
-            print_fn=print_fn)
+        with timing.section("sigma.tau_sweep"):
+            total = integrate_sigma_store(
+                wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+                pole_batch_size=pole_batch_size, brackets=band_brackets,
+                band_counts=band_counts, odd_residue_off=odd_residue_off,
+                print_fn=print_fn)
         if not ordered_residues:
             return total
         # Exact observability twin, shared in algebra with the GN arm in

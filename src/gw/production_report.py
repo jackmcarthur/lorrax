@@ -560,6 +560,15 @@ class GWProductionReport:
         w_screen = outer_prefixed("W.", within="gw_jax.screening")
         screening_support = max(screening_total - chi0 - w_screen, 0.0)
 
+        # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
+        # fitting, cached by box and tolerance) and ``sigma.tau_sweep`` (the
+        # tau contraction) under gw_jax.sigma or, in a self-consistent run,
+        # under gw_jax.sc_driver; nothing else of Sigma is separately named.
+        sigma_total = top_level("gw_jax.sigma", "gw_jax.sc_driver")
+        sigma_plan = outer_prefixed("sigma.rule_plan")
+        sigma_sweep = outer_prefixed("sigma.tau_sweep")
+        sigma_other = max(sigma_total - sigma_plan - sigma_sweep, 0.0)
+
         stages = [
             ("runtime bring-up", total(lambda r: r["name"].startswith(
                 "gw_jax.runtime_stack."))),
@@ -575,7 +584,9 @@ class GWProductionReport:
             ("screening support", screening_support),
             ("W persist + q0 head", top_level(
                 "gw_jax.persist_w0", "gw_jax.static_head")),
-            ("Sigma", top_level("gw_jax.sigma", "gw_jax.sc_driver")),
+            ("Sigma rule plan", sigma_plan),
+            ("Sigma tau sweep", sigma_sweep),
+            ("Sigma other", sigma_other),
             ("mean-field load", top_level("gw_jax.kin_ion_load")),
             ("QP solve + diagonalize", top_level(
                 "gw_jax.solve_qp", "gw_jax.qp_eigh")),
