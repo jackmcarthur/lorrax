@@ -42,6 +42,14 @@ QP_ROTATIONS_FILE_ROLE = "full-matrix effective-H rotations"
 QP_WFN_FILE_ROLE = "matched full-matrix QP wavefunctions"
 
 
+
+def _human_bytes(n_bytes: float) -> str:
+    """GiB above one GiB, MiB below, three significant figures either way."""
+    gib = float(n_bytes) / 2**30
+    if gib >= 1.0:
+        return f"{gib:.3g} GiB"
+    return f"{float(n_bytes) / 2**20:.3g} MiB"
+
 def layout_dial_record_lines(
         *, config, n_mu: int, n_q_irr: int, processes: int) -> tuple[str, ...]:
     """Build the startup record for the two user-facing memory/layout dials."""
@@ -60,7 +68,7 @@ def layout_dial_record_lines(
             "linalg = local: fastest, but each task holds ceil(N_q_irr/P) "
             "complete N_mu x N_mu dense matrices "
             f"(here ceil({int(n_q_irr)}/{int(processes)}) x {n_mu}^2 x "
-            f"16 B = {matrix_gib:.1f} GiB per task, complex128) plus their "
+            f"16 B = {_human_bytes(matrix_gib * 2**30)} per task, complex128) plus their "
             "factor workspace; on large systems where that is a large "
             "fraction of memory per task, set linalg = distributed")
     else:
