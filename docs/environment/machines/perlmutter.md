@@ -1,6 +1,6 @@
 # Perlmutter (NERSC)
 
-*The bare-host CUDA-13/JAX-0.9 reference platform. Authoritative for module mechanics
+*The CUDA-13/JAX-0.9 reference platform. Authoritative for module mechanics
 and porting knobs: [`config/README.md`](../../../config/README.md). This
 page holds the runtime environment: the Lmod module, the FFI staging
 contract, multi-host topology — and an honest statement of what has and
@@ -8,10 +8,9 @@ has not been exercised recently.*
 
 ## 0. Test status — honest
 
-* The GPU FFI stack (cuSOLVERMp eigh, phdf5 slab I/O, SLATE) and the
-  `lxalloc`/`lxrun` module workflow were production-certified on
-  Perlmutter (1–4 nodes × 4 A100). `lx` (§1) drives the same
-  `select_gpu.sh` + Shifter + `in_container.sh` composition.
+* The GPU FFI stack (cuSOLVERMp eigh, phdf5 slab I/O, SLATE) is exercised on
+  Perlmutter at 1–4 nodes × 4 A100. `lx` drives the tracked
+  `select_gpu.sh` + environment + `in_container.sh` composition.
 * CPU multi-process `impl=mpi` is now validated on Milan with Cray MPICH
   9.0.1.498 and JAX/JAXLIB 0.9.1.  A P=4 collective probe passed on one and
   two nodes, including all three 2-D mesh cliques and exact
@@ -62,10 +61,9 @@ lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in
 evidence. `lx shell` is one task/one GPU. Report GPU count, rank count, and
 runtime mesh.
 
-> ### `lx` runs the checkout its *base module* names, not the one you are standing in
+> ### Source selection is explicit and attested
 >
-> **Re-measured 2026-08-10 — `lx` now prefers the checkout you are standing
-> in, and this warning used to say the opposite.** The resolution order is
+> `lx` resolves source in this order:
 > `LORRAX_CHECKOUT`, then the checkout `cwd` sits inside, then the base
 > module's tree, where "a checkout" means a directory holding both
 > `src/gw/__init__.py` and `tests/`. `lx` announces which one it picked on
@@ -77,26 +75,14 @@ runtime mesh.
 > [lx] source tree: /global/u2/j/jackm/software/lorrax_P/src    [module default (cwd is not in a checkout)]
 > ```
 >
-> The trap the old warning was reaching for is still real, but it is narrower
-> and it bites in the opposite place: **a data directory is not a checkout.**
-> Real calculations run in a scratch directory holding `WFN.h5` and a deck, so
-> `lx run` there silently resolves to the base module's tree — which on this
-> machine is `lorrax_P`, measured 2026-08-10 sitting **624 commits behind
-> `main`** and old enough to predate the `jax_support` window check and to have
-> no `gw/downfold_cli.py` at all. Running a current pipeline from a data
-> directory therefore runs old code without saying so beyond that one line.
+> A data directory is not a checkout, so production run directories must set
+> `LORRAX_CHECKOUT`. `LX_BASE_MODULE` chooses the machine environment; it does
+> not choose the source. Startup refuses a requested checkout that disagrees
+> with the imported core or first-party services.
 >
-> `LORRAX_CHECKOUT=/path/to/tree` is the fix, and it is the only one that works
-> from a data directory. `LX_BASE_MODULE=lorrax_A` selects the deployed
-> JAX/JAXLIB-0.9.1 CUDA-13 environment independently of the checkout, and
-> `LORRAX_DEFAULT_BASE` sets the default. Retired `J070`/pre-0.9 base modules
-> are refusal test fixtures, not runnable alternatives. Two other things stay
-> visible: `lx doctor` prints `base module` and
-> `LORRAX_ROOT` before you run anything, and every run's
-> [startup block](../overview.md#startup-block) prints the path of the `.so` it
-> loaded. `lx test` is the exception that has always used `cwd`: it runs pytest
-> in the current directory, and only falls back to `$LORRAX_ROOT/tests` when
-> `cwd` has no `tests/`.
+> `lx doctor` prints the base environment, and every run records its actual
+> Python source and native-library origins. `lx test` uses the current checkout
+> when `cwd` contains `tests/`.
 >
 > Current source requires the 0.9 series for both JAX and JAXLIB.  Select the
 > deployed bare-host CUDA-13 lane and pin the source checkout independently:
@@ -110,66 +96,19 @@ runtime mesh.
 > repeats the version check internally, so an old module or copied launcher
 > refuses even if the preflight was omitted.
 
-### Do not start from `module load lorrax`
+### The module is a descriptor, not a launcher
 
-The older `module load lorrax` + `lxalloc`/`lxrun`/`lxpre`/`lxshell`/`lxkill`
-workflow still exists, and the module is still what *produces* the Shifter
-string `lx` consumes. But it is not the entry point to hand a newcomer, for
-two measured reasons:
-
-**It resolves the wrong checkout.** The base module derives `LORRAX_ROOT` by
-matching its own path against `<root>/config/modulefiles/lorrax/`; an
-*installed* (copied, not symlinked) modulefile always fails that match and
-falls back to a hardcoded value. Measured on this machine 2026-08-06,
-`module show lorrax` sets `LORRAX_ROOT=$HOME/software/lorrax_C` — an older
-worktree — no matter which tree you are standing in.
-
-**The installed module exports the allocator setting
-[§2.1](../overview.md#21-the-three-allocators) condemns.** Measured
-2026-08-06, `module show lorrax` sets:
-
-| it sets | consequence |
-|---|---|
-| `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` | with the allocator left unset (BFC) this pre-grabs 95 % of the card, **starving NCCL** — the failure surfaces as `cusolverMpSyevd: status=7` (§2.1) |
-| `TF_GPU_ALLOCATOR=cuda_malloc_async` | **inert.** A TensorFlow variable; it selects nothing for JAX, and the startup block says so outright |
-
-Note the repo *template* `config/modulefiles/lorrax/0.1.0.lua` has since been
-changed to set `XLA_PYTHON_CLIENT_PREALLOCATE=false` +
-`XLA_PYTHON_CLIENT_ALLOCATOR=platform` instead, and carries no
-`MEM_FRACTION`. **The installed module on this machine predates that
-change.** Which one you get therefore depends on when `install.sh` was last
-run — which is the whole argument for not routing newcomers through it.
-`lx` reads the module for the Shifter string only and sets its own allocator
-pair (`preallocate=false`, `allocator=platform`); what any given run actually
-resolved is in its [startup block](../overview.md#startup-block).
-
-`lxrun` expands to `srun --mpi=cray_shasta … select_gpu.sh shifter …
-in_container.sh "$@"`: each rank sees exactly one GPU as device 0 via
-`CUDA_VISIBLE_DEVICES=$SLURM_LOCALID` (**not** `--gpus-per-task=1`, which
-breaks JAX's topology sync). Batch template:
-`config/perlmutter/run_gw.slurm`; multi-node adds
-`LORRAX_NNODES=2 LORRAX_NGPU=8`.
-
-`lx`, the installed CUDA-13 module, and the Perlmutter env scripts do not own
-GPU autotuning policy and do not rewrite `XLA_FLAGS`. Every production driver
-enters `runtime.set_default_env` before importing JAX; that one owner merges
-`--xla_gpu_autotune_level=0` only when the caller supplied no autotune level,
-then the normal startup line prints the resolved value and provenance. Thus
-the launch recipe is unchanged and an experiment such as
-`XLA_FLAGS=--xla_gpu_autotune_level=2 lx run …` remains an explicit override.
-At P>1 the same runtime installs the default-on per-module compile agreement
-after JAX coordination is initialized and before mesh warmup, so launchers
-must continue to give every rank one shared coordination world; no new shell
-export is required.
-
-Per-invocation cost: ~7 s single-rank, 10–15 s multi-rank (srun step 2–5 s,
-Shifter bring-up ~5 s, `jax.distributed` handshake 3–5 s). `lx shell` and a
-persistent compile-cache directory are the fast-iteration knobs.
+`lx` loads the named module in a throwaway shell only to obtain
+`LORRAX_ROOT` and the assembled native/container capability string. The
+tracked module defines no run or allocation functions and sets no JAX,
+allocator, HDF5, compile-cache, or profiling policy. Those defaults are set
+and reported by `runtime` before JAX/HDF5 import; documented experiments may
+override them explicitly.
 
 ### One-time install
 
 ```bash
-vi config/perlmutter/site_config.sh          # account, QoS, paths
+vi config/perlmutter/site_config.sh          # image and dependency paths
 bash config/perlmutter/install.sh            # or LORRAX_MODULE_NAME=<name> bash …
 ```
 
@@ -185,8 +124,8 @@ container:
 | `slate` | SLATE + libsci | distributed Cholesky, trsm, heev |
 
 Staged once per cluster (idempotent, each ends with a `readelf -d` check;
-staging is mandatory because Shifter forbids `--volume` sources under
-`/opt/*` or `$HOME`):
+staging is mandatory because Shifter cannot mount the vendor `/opt/*` trees
+directly):
 
 ```bash
 src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh   # cuSolverMp + CAL
@@ -226,12 +165,10 @@ Expected in-job topology: `jax.local_devices()` = `[cuda:0]` per rank,
 
 ## 4. Generic-cluster porting
 
-Everything cluster-specific funnels through `site_config.sh`
-(`LORRAX_SLURM_*`, `LORRAX_GPUS_PER_NODE`, `LORRAX_MPI_TYPE_DEFAULT`,
-the three `LORRAX_FFI_*_DIR` stage roots, …) — the full table is in
-[`config/README.md`](../../../config/README.md). For non-Shifter runtimes
-swap the `shifter` invocation in `lxrun`/`lxshell`/`lxpre`;
-`select_gpu.sh`, `in_container.sh` and the SLURM defaults are portable.
+The image and native stage roots funnel through `site_config.sh`; the full
+ownership map is in [`config/README.md`](../../../config/README.md). A
+non-Shifter site needs its own environment descriptor. Do not copy the
+retired shell launch functions as a portability layer.
 
 ## 5. CPU multi-process runs (Milan)
 

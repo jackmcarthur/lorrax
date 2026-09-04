@@ -18,12 +18,8 @@ set -euo pipefail
 #   e.g. /global/common/software/m2651/modulefiles
 #   Then have users add:  module use /global/common/software/m2651/modulefiles
 #
-# For multiple LORRAX checkouts (parallel A/B/C agent sessions):
-#   Run install.sh once per checkout, passing a variant name:
-#     LORRAX_MODULE_NAME=lorrax_A bash /path/to/lorrax_A/config/perlmutter/install.sh
-#     LORRAX_MODULE_NAME=lorrax_B bash /path/to/lorrax_B/config/perlmutter/install.sh
-#   family("lorrax") in the modulefile makes them mutually exclusive, so
-#   `module load lorrax_B` auto-swaps out lorrax_A in the same shell.
+# Install one named base environment. Runtime source selection is independent:
+# set LORRAX_CHECKOUT when `lx run` starts from a data directory.
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,7 +72,6 @@ case "$IMAGE" in
         exit 1
         ;;
 esac
-DEPS="${LORRAX_DEPS:-}"
 MODULE_NAME="${LORRAX_MODULE_NAME:-lorrax}"
 
 # --- Install modulefile ---
@@ -94,14 +89,8 @@ echo "  Target:  $DST_MODULE"
 sed \
     -e "s|@LORRAX_ROOT@|$LORRAX_INSTALL_ROOT|g" \
     -e "s|@LORRAX_SITE@|$LORRAX_SITE_PACKAGES|g" \
-    -e "s|@LORRAX_DEPS@|$DEPS|g" \
     -e "s|@LORRAX_IMAGE@|$IMAGE|g" \
-    -e "s|@LORRAX_SLURM_ACCOUNT@|${LORRAX_SLURM_ACCOUNT}|g" \
-    -e "s|@LORRAX_SLURM_QOS@|${LORRAX_SLURM_QOS}|g" \
-    -e "s|@LORRAX_SLURM_CONSTRAINT@|${LORRAX_SLURM_CONSTRAINT}|g" \
-    -e "s|@LORRAX_GPUS_PER_NODE@|${LORRAX_GPUS_PER_NODE}|g" \
     -e "s|@LORRAX_SHIFTER_MODULES@|${LORRAX_SHIFTER_MODULES}|g" \
-    -e "s|@LORRAX_MPI_TYPE_DEFAULT@|${LORRAX_MPI_TYPE_DEFAULT}|g" \
     -e "s|@LORRAX_NVHPC_SUBPATH@|${LORRAX_NVHPC_SUBPATH}|g" \
     -e "s|@LORRAX_MPICH_CONTAINER_DIR@|${LORRAX_MPICH_CONTAINER_DIR}|g" \
     -e "s|@LORRAX_DARSHAN_LIB_DIR@|${LORRAX_DARSHAN_LIB_DIR}|g" \
@@ -114,13 +103,9 @@ sed \
 
 echo "  Patched: LORRAX_ROOT       = $LORRAX_INSTALL_ROOT"
 echo "  Patched: LORRAX_SITE       = $LORRAX_SITE_PACKAGES"
-echo "  Patched: LORRAX_DEPS       = ${DEPS:-(none)}"
 echo "  Patched: LORRAX_IMAGE      = $IMAGE"
-echo "  Patched: SLURM account/qos = ${LORRAX_SLURM_ACCOUNT} / ${LORRAX_SLURM_QOS}"
-echo "  Patched: GPUs per node     = ${LORRAX_GPUS_PER_NODE}"
 echo "  Patched: shifter modules   = ${LORRAX_SHIFTER_MODULES}"
-echo "  Patched: default --mpi=    = ${LORRAX_MPI_TYPE_DEFAULT}"
-echo "  Module name: $MODULE_NAME  (load with: module load $MODULE_NAME)"
+echo "  Base module: $MODULE_NAME"
 
 # --- Add module use to bashrc ---
 BASHRC="$HOME/.bashrc"
@@ -137,10 +122,7 @@ fi
 
 # --- Verify ---
 echo ""
-echo "Installation complete. To use:"
+echo "Installation complete. Verify and run with:"
 echo "  source ~/.bashrc       # or start a new shell"
-echo "  module load $MODULE_NAME"
-echo "  module help $MODULE_NAME"
-echo ""
-echo "Quick test (requires a SLURM GPU allocation):"
-echo "  lxrun python3 -u -c \"import jax; print(jax.devices())\""
+echo "  LX_BASE_MODULE=$MODULE_NAME lx doctor --refresh"
+echo "  LX_BASE_MODULE=$MODULE_NAME LORRAX_CHECKOUT=$LORRAX_INSTALL_ROOT lx run python3 -u -c \"import jax; print(jax.devices())\""

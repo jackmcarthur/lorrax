@@ -1,155 +1,63 @@
 -- -*- lua -*-
--- LORRAX 0.1.0 — Low-scaling Real-space Real-Axis eXcited state package
--- Lmod modulefile for Shifter-based GPU execution.
---
--- Install:  bash config/<cluster>/install.sh
--- Usage:    module load lorrax
---           lxrun python3 -u -m gw.gw_jax -i cohsex.in
---
--- Template placeholders `@FOO@` are patched at install time from
--- config/<cluster>/site_config.sh.  See config/README.md.
+-- LORRAX 0.1.0 Perlmutter environment descriptor.
+-- Installed from config/perlmutter/site_config.sh by install.sh.
 
 help([[
-LORRAX 0.1.0 — JAX-based GW with ISDF compression, Shifter container.
+LORRAX environment descriptor for the `lx` launcher.
 
-Commands
-  lxalloc [N] [T]   Interactive GPU allocation (N nodes, default 1, T hrs).
-  lxrun <cmd>       Run <cmd> on LORRAX_NGPU ranks (default 4) inside the
-                    Shifter container.  Cray MPICH + 1 GPU per rank.
-  lxshell           Single-rank pty shell inside the container; iterate
-                    without paying ~5 s shifter bring-up per python call.
-  lxpre <in> N      Preprocessing (centroids, dipoles, kin_ion).
-
-Typical flow
-  lxalloc
-  lxrun python3 -u -m gw.gw_jax -i cohsex.in
-  LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i cohsex.in
-  lxshell       # then `python3 -m common.slate_batched_test` etc.
-
-Stack
-  --mpi=cray_shasta, --module=gpu,mpich, one GPU per rank via
-  select_gpu.sh (CUDA_VISIBLE_DEVICES=$SLURM_LOCALID), LD_PRELOAD the
-  CUDA-12 libmpi_gtl_cuda, MPICH_GPU_SUPPORT_ENABLED=1.  SLATE,
-  cuSOLVERMp, and Cray-HDF5 phdf5 all share this stack.
-
-Overrides (set before `module load`)
-  LORRAX_FFI_NVHPC_DIR      default @LORRAX_FFI_NVHPC_DIR_DEFAULT@
-  LORRAX_FFI_PHDF5_DIR      default @LORRAX_FFI_PHDF5_DIR_DEFAULT@
-  LORRAX_FFI_SLATE_DIR      default @LORRAX_FFI_SLATE_DIR_DEFAULT@
-  LORRAX_FFI_FFTW_DIR       default @LORRAX_FFI_FFTW_DIR_DEFAULT@
-  LORRAX_SLATE_INSTALL_DIR  default @LORRAX_SLATE_INSTALL_DIR_DEFAULT@
-  LORRAX_MPI_TYPE           default @LORRAX_MPI_TYPE_DEFAULT@ (|none|pmi2|pmix)
-  LORRAX_NGPU               default 4 for lxrun, 1 for lxshell
-
-Do NOT use bare `python` / `python3` — the module configures a Shifter
-container, not the host Python.  For non-Shifter local dev, use `uv run`.
+Use `lx run`, `lx test`, and `lx doctor`; this module deliberately defines no
+allocation or run shell functions.  It owns only the container image, native
+bind mounts, MPI capabilities, and supplemental third-party Python path.
+LORRAX runtime owns JAX, allocator, HDF5, compile-cache, and profiling policy.
 ]])
 
-whatis("Name:        LORRAX")
-whatis("Version:     0.1.0")
-whatis("Description: JAX-based GW with ISDF compression (Shifter container)")
-
--- Multiple LORRAX checkouts coexist under distinct module names
--- (lorrax_A / _B / _C).  family() makes Lmod auto-swap — loading
--- lorrax_B unloads lorrax_A in the same shell, so LORRAX_ROOT and the
--- shell functions never point at a mixed state.
+whatis("Name: LORRAX")
+whatis("Version: 0.1.0")
+whatis("Description: LORRAX Perlmutter container and native-library capabilities")
 family("lorrax")
 
--- =========================================================================
---  Site constants (patched at install time; see site_config.sh)
--- =========================================================================
 local image                 = "@LORRAX_IMAGE@"
 local lorrax_site           = "@LORRAX_SITE@"
-local lorrax_deps           = "@LORRAX_DEPS@"
-
--- SLURM defaults for lxalloc.
-local slurm_account         = "@LORRAX_SLURM_ACCOUNT@"
-local slurm_qos             = "@LORRAX_SLURM_QOS@"
-local slurm_constraint      = "@LORRAX_SLURM_CONSTRAINT@"
-local gpus_per_node         = tonumber("@LORRAX_GPUS_PER_NODE@")
-
--- Shifter + MPI stack.
-local shifter_modules       = "@LORRAX_SHIFTER_MODULES@"      -- "gpu,mpich"
-local default_mpi_type      = "@LORRAX_MPI_TYPE_DEFAULT@"     -- "cray_shasta"
+local shifter_modules       = "@LORRAX_SHIFTER_MODULES@"
 local nvhpc_subpath         = "@LORRAX_NVHPC_SUBPATH@"
-local mpich_container_dir   = "@LORRAX_MPICH_CONTAINER_DIR@"  -- "/opt/udiImage/modules/mpich"
-local darshan_lib_dir       = "@LORRAX_DARSHAN_LIB_DIR@"      -- may be ""
-
--- Stage-dir defaults (NERSC $SCRATCH-based; overridable per-user).
+local mpich_container_dir   = "@LORRAX_MPICH_CONTAINER_DIR@"
+local darshan_lib_dir       = "@LORRAX_DARSHAN_LIB_DIR@"
 local default_nvhpc_host    = "@LORRAX_FFI_NVHPC_DIR_DEFAULT@"
 local default_phdf5_host    = "@LORRAX_FFI_PHDF5_DIR_DEFAULT@"
 local default_slate_host    = "@LORRAX_FFI_SLATE_DIR_DEFAULT@"
 local default_fftw_host     = "@LORRAX_FFI_FFTW_DIR_DEFAULT@"
 local default_slate_install = "@LORRAX_SLATE_INSTALL_DIR_DEFAULT@"
 
--- =========================================================================
---  LORRAX source location (derived from this modulefile's own path)
--- =========================================================================
--- Works when the modulefile is symlinked into $MODULEFILE_DIR/ (common for
--- A/B/C multi-checkout setups).  If the file was copied instead, install.sh
--- patches @LORRAX_ROOT@ as the fallback.
-
-local this_file   = myFileName()
+local this_file = myFileName()
 local lorrax_root = this_file:match("(.+)/config/modulefiles/lorrax/.*$")
 if lorrax_root == nil then
     lorrax_root = os.getenv("LORRAX_ROOT") or "@LORRAX_ROOT@"
 end
-local lorrax_src  = pathJoin(lorrax_root, "src")
-
--- =========================================================================
---  Per-user paths (runtime-overridable via env vars)
--- =========================================================================
+local lorrax_src = pathJoin(lorrax_root, "src")
 
 local function env_or(var, fallback)
-    local v = os.getenv(var)
-    if v and v ~= "" then return v end
+    local value = os.getenv(var)
+    if value and value ~= "" then return value end
     return fallback
 end
 
-local nvhpc_host         = env_or("LORRAX_FFI_NVHPC_DIR",     default_nvhpc_host)
-local phdf5_host         = env_or("LORRAX_FFI_PHDF5_DIR",     default_phdf5_host)
-local slate_host         = env_or("LORRAX_FFI_SLATE_DIR",     default_slate_host)
-local fftw_host          = env_or("LORRAX_FFI_FFTW_DIR",      default_fftw_host)
-local slate_install_host = env_or("LORRAX_SLATE_INSTALL_DIR", default_slate_install)
+local nvhpc_host = env_or("LORRAX_FFI_NVHPC_DIR", default_nvhpc_host)
+local phdf5_host = env_or("LORRAX_FFI_PHDF5_DIR", default_phdf5_host)
+local slate_host = env_or("LORRAX_FFI_SLATE_DIR", default_slate_host)
+local fftw_host = env_or("LORRAX_FFI_FFTW_DIR", default_fftw_host)
+local slate_install_host = env_or(
+    "LORRAX_SLATE_INSTALL_DIR", default_slate_install)
 
--- =========================================================================
---  Performance env (inside and outside container)
--- =========================================================================
-
--- Lustre: HDF5 file-locking must be off.
-setenv("HDF5_USE_FILE_LOCKING", "FALSE")
-
--- XLA memory: grow on demand from the CUDA async mempool instead of a
--- fixed-size BFC pool.  NCCL / cuSOLVERMp / SLATE then share VRAM with
--- XLA cleanly.  At MEM_FRACTION=0.95 with BFC, NCCL starves and surfaces
--- as `NCCL error 1 unhandled cuda error` inside cusolverMpSyevd.
-setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-setenv("XLA_PYTHON_CLIENT_ALLOCATOR",   "cuda_async")
-setenv("TF_GPU_ALLOCATOR",              "cuda_malloc_async")
-
--- =========================================================================
---  PYTHONPATH + container LD_LIBRARY_PATH
--- =========================================================================
-
--- PYTHONPATH: lorrax src + supplemental site-packages + optional deps.
-local pypath = lorrax_src .. ":" .. lorrax_site
-if lorrax_deps ~= "" then
-    pypath = pypath .. ":" .. lorrax_deps
+-- The selected checkout and the supplemental third-party packages are the
+-- only Python entries supplied by the site layer. First-party services are
+-- selected and attested by LORRAX startup.
+local pypath = lorrax_src
+if lorrax_site ~= "" then
+    pypath = pypath .. ":" .. lorrax_site
 end
 
--- Container LD_LIBRARY_PATH — order matters:
---   1. SLATE install (slate/blaspp/lapackpp built against cray libs)
---   2. /lorrax_slate : Cray libsci + libmpi_gtl_cuda + xpmem + lustreapi
---   3. /lorrax_phdf5 : Cray HDF5 (libmpi_gnu_*.so.12)
---   4. /lorrax_nvhpc : libcusolverMp + libcal
---   5. Shifter's mpich bind-mount (libmpi.so.12 + PMI + libfabric deps)
---   6. (optional) Darshan I/O profiling
---   4b. /lorrax_fftw : the double-precision SERIAL cray-fftw engine, and
---                     nothing else.  It is LAST of the lorrax stages on
---                     purpose: it holds one library, no other entry here
---                     ships a libfftw3.*, so its position cannot select a
---                     version the way the NVHPC entries do -- and last means
---                     it can never shadow a vendor library either.
+-- Keep the vendor runtime as one ordered capability description. Never add
+-- a second MPI implementation or another copy of a versioned vendor SONAME.
 local ldlib_parts = {
     slate_install_host .. "/lib64",
     "/lorrax_slate/lib",
@@ -164,29 +72,10 @@ if darshan_lib_dir ~= "" then
 end
 local container_ldlib = table.concat(ldlib_parts, ":")
 
--- =========================================================================
---  Shifter invocation
--- =========================================================================
--- We pass --image/--module/--volume per-shifter-call (NERSC's image cache
--- makes the --image lookup near-free; salloc-time pre-stage doesn't
--- measurably reduce the ~5 s shifter bring-up).  The real fast-iter win
--- is `lxshell` (one shifter bring-up, many python invocations).
-
 local shifter_env_parts = {
     "--env=PYTHONPATH=" .. pypath,
-    "--env=HDF5_USE_FILE_LOCKING=FALSE",
-    "--env=XLA_PYTHON_CLIENT_PREALLOCATE=false",
-    "--env=XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async",
-    "--env=TF_GPU_ALLOCATOR=cuda_malloc_async",
     "--env=LD_LIBRARY_PATH=" .. container_ldlib,
-    -- Shifter's mpich module ships libmpi_gtl_cuda.so.0 built against
-    -- CUDA 11 (needs libcudart.so.11 we don't have).  LD_PRELOAD the
-    -- staged CUDA-12 copy so the loader binds it first.
     "--env=LD_PRELOAD=/lorrax_slate/lib/libmpi_gtl_cuda.so.0",
-    -- Cray MPICH GPU-Direct RDMA.  Shifter's --module=mpich explicitly
-    -- unsets this per /etc/shifter/udiRoot.conf; in_container.sh
-    -- re-asserts it inside, but passing via --env also covers one-off
-    -- invocations that don't use in_container.sh (e.g. lxshell).
     "--env=MPICH_GPU_SUPPORT_ENABLED=1",
     "--env=LORRAX_MPI_INCLUDE_DIR=/lorrax_phdf5/include",
     "--env=LORRAX_MPICH_LIB_DIR=" .. mpich_container_dir,
@@ -198,164 +87,17 @@ local shifter_args = table.concat({
     "--volume=" .. nvhpc_host .. ":/lorrax_nvhpc",
     "--volume=" .. phdf5_host .. ":/lorrax_phdf5",
     "--volume=" .. slate_host .. ":/lorrax_slate",
-    -- The image ships NO FFTW3 (measured in-container 2026-08-06: no
-    -- libfftw3* anywhere it can see, every dlopen candidate "cannot open
-    -- shared object file", and /opt/cray/pe absent entirely -- so the host
-    -- .so's RPATH, which is what makes the BARE-HOST leg work, resolves
-    -- nothing here).  The flat-k FFT handler keeps FFTW3 out of DT_NEEDED
-    -- by design (GATE 5), which means it needs a file to dlopen at run
-    -- time, which means a mount.  Shifter will not --volume a /opt/ system
-    -- path, so /opt/cray/pe/fftw cannot be mounted directly; stage it with
-    -- src/ffi/cpp/stage/fftw_stage_cray.sh.
-    --
-    -- NOT a repair: this image DOES carry libcufftw.so.11, which exports
-    -- all three entry points the handler binds.  Letting that answer makes
-    -- the FFT cells green while the HOST handler runs on the GPU.
-    -- src/ffi/cpp/gate_one_fftw.sh (GATE 8) is what distinguishes them.
     "--volume=" .. fftw_host .. ":/lorrax_fftw",
     table.concat(shifter_env_parts, " "),
 }, " ")
 
--- =========================================================================
---  Exports
--- =========================================================================
-
-setenv("LORRAX_ROOT",              lorrax_root)
-setenv("LORRAX_SRC",               lorrax_src)
-setenv("LORRAX_SITE",              lorrax_site)
-setenv("LORRAX_IMAGE",             image)
-setenv("LORRAX_SHIFTER",           "shifter " .. shifter_args)
-setenv("LORRAX_FFI_NVHPC_HOST",    nvhpc_host)
-setenv("LORRAX_FFI_PHDF5_HOST",    phdf5_host)
-setenv("LORRAX_FFI_SLATE_HOST",    slate_host)
-setenv("LORRAX_FFI_FFTW_HOST",     fftw_host)
+setenv("LORRAX_ROOT", lorrax_root)
+setenv("LORRAX_SRC", lorrax_src)
+setenv("LORRAX_SITE", lorrax_site)
+setenv("LORRAX_IMAGE", image)
+setenv("LORRAX_SHIFTER", "shifter " .. shifter_args)
+setenv("LORRAX_FFI_NVHPC_HOST", nvhpc_host)
+setenv("LORRAX_FFI_PHDF5_HOST", phdf5_host)
+setenv("LORRAX_FFI_SLATE_HOST", slate_host)
+setenv("LORRAX_FFI_FFTW_HOST", fftw_host)
 setenv("LORRAX_SLATE_INSTALL_DIR", slate_install_host)
-
--- =========================================================================
---  Shell functions
--- =========================================================================
-
--- Paths to the helper wrappers (injected into every shell function body).
-local select_gpu_sh   = pathJoin(lorrax_src, "ffi/cpp/select_gpu.sh")
-local in_container_sh = pathJoin(lorrax_src, "ffi/cpp/in_container.sh")
-
--- -------------------------------------------------------------------------
--- lxalloc: interactive GPU allocation.
---   lxalloc          → 1 node, {gpus_per_node} GPUs, 2 hours
---   lxalloc 4        → 4 nodes
---   lxalloc 1 4:00   → 1 node, 4 hours
---
--- `salloc ... bash -c "sleep 100000"` holds the allocation open on the
--- compute node while salloc exports SLURM_JOBID into the caller's shell
--- so lxrun / lxshell / lxpre can pick it up.
-
-set_shell_function("lxalloc", [[
-    local nodes="${1:-1}"
-    local time="${2:-02:00:00}"
-    local gpus=$((nodes * ]] .. gpus_per_node .. [[))
-    echo "Requesting ${nodes} node(s), ${gpus} GPU(s), ${time}..."
-    salloc --nodes=${nodes} --qos=]] .. slurm_qos .. [[ --time=${time} \
-           --constraint=]] .. slurm_constraint .. [[ --gpus=${gpus} \
-           --account=]] .. slurm_account .. [[ \
-           bash -c "sleep 100000"
-]], "")
-
--- -------------------------------------------------------------------------
--- lxrun: run <cmd> on `LORRAX_NGPU` ranks (default 4) inside the container.
---   lxrun python3 -u -m gw.gw_jax -i cohsex.in
---   LORRAX_NGPU=1 lxrun python3 -u -m common.slate_batched_test ...
---
--- Structure of the generated srun line:
---   srun --jobid=$JID --mpi=cray_shasta --gres=gpu:N -N 1 -n N \
---        select_gpu.sh          # CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
---        shifter ...            # image + mounts + env + LD_PRELOAD
---        in_container.sh        # re-assert MPICH_GPU_SUPPORT_ENABLED=1
---        <user cmd>
-
-set_shell_function("lxrun", [[
-    # Lustre pre-stripe for large parallel-HDF5 writes under $PWD/tmp.
-    # Without this, files inherit pscratch's default 1x1MB layout, which
-    # is a PER-FILE single-OST ceiling of ~0.65 GiB/s: measured 0.616
-    # GiB/s at 4 ranks and 0.695 GiB/s at 16 ranks, i.e. quadrupling the
-    # ranks bought 13%.  (The previous "~30 MB/s/rank" phrasing here was
-    # the same ceiling divided by the 16-rank count; stated per rank it
-    # looks like something more parallelism can fix, which it is not.)
-    # 16 x 1M is the measured optimum at BOTH 1 and 4 nodes -- see
-    # docs/architecture/slab_io.md.  `lfs` isn't in the container so it
-    # must run host-side.  Override with LORRAX_NO_PRESTRIPE=1 or
-    # LORRAX_LUSTRE_STRIPE_{COUNT,SIZE}.
-    if [ -z "${LORRAX_NO_PRESTRIPE:-}" ] && command -v lfs >/dev/null 2>&1; then
-        mkdir -p "$PWD/tmp" 2>/dev/null
-        lfs setstripe -c "${LORRAX_LUSTRE_STRIPE_COUNT:-16}" \
-                      -S "${LORRAX_LUSTRE_STRIPE_SIZE:-1M}" \
-                      "$PWD/tmp" >/dev/null 2>&1 || true
-    fi
-    local ngpu="${LORRAX_NGPU:-]] .. gpus_per_node .. [[}"
-    local mpitype="${LORRAX_MPI_TYPE:-]] .. default_mpi_type .. [[}"
-    local mpiflag=""
-    if [ "${mpitype}" != "none" ]; then
-        mpiflag="--mpi=${mpitype}"
-    fi
-    local jobflag=""
-    if [ -n "${SLURM_JOBID:-}" ] && [ -z "${SLURM_STEP_ID:-}" ]; then
-        jobflag="--jobid=$SLURM_JOBID"
-    fi
-    srun $jobflag $mpiflag --gres=gpu:${ngpu} -N 1 -n ${ngpu} \
-        ]] .. select_gpu_sh .. [[ \
-        shifter ]] .. shifter_args .. [[ \
-        ]] .. in_container_sh .. [[ \
-        "$@"
-]], "")
-
--- -------------------------------------------------------------------------
--- lxshell: interactive pty shell inside the container on a compute node.
--- Single rank, single GPU by default — the point is to avoid paying the
--- ~5 s shifter bring-up per python invocation during iteration.  For
--- multi-rank MPI you still want lxrun (upstream Shifter docs: MPI
--- integration requires srun on the outside).
---
---   lxshell                   # 1 GPU visible
---   LORRAX_NGPU=4 lxshell     # all GPUs visible to a single rank
-
-set_shell_function("lxshell", [[
-    local ngpu="${LORRAX_NGPU:-1}"
-    local jobflag=""
-    if [ -n "${SLURM_JOBID:-}" ] && [ -z "${SLURM_STEP_ID:-}" ]; then
-        jobflag="--jobid=$SLURM_JOBID"
-    fi
-    srun $jobflag --pty --gres=gpu:${ngpu} -N 1 -n 1 \
-        ]] .. select_gpu_sh .. [[ \
-        shifter ]] .. shifter_args .. [[ \
-        bash -l
-]], "")
-
--- -------------------------------------------------------------------------
--- lxpre: run the 3 LORRAX preprocessing steps (single-GPU each).
---   lxpre cohsex.in 640
-
-set_shell_function("lxpre", [[
-    local input="${1:?Usage: lxpre <cohsex.in> <n_centroids>}"
-    local ncentroids="${2:?Usage: lxpre <cohsex.in> <n_centroids>}"
-    local abs_input="$(cd "$(dirname "$input")" && pwd)/$(basename "$input")"
-    local jobflag=""
-    if [ -n "${SLURM_JOBID:-}" ] && [ -z "${SLURM_STEP_ID:-}" ]; then
-        jobflag="--jobid=$SLURM_JOBID"
-    fi
-    local step="srun $jobflag --gres=gpu:1 -N 1 -n 1 ]] .. select_gpu_sh .. [[ \
-                shifter ]] .. shifter_args .. [[ ]] .. in_container_sh .. [["
-
-    echo "=== [1/3] ISDF centroids (n=$ncentroids) ==="
-    $step python3 -u -m centroid.kmeans_cli "$ncentroids" --seed 42 \
-        || { echo "FAILED: centroid generation"; return 1; }
-
-    echo "=== [2/3] Dipole matrix elements ==="
-    $step python3 -u -m psp.get_dipole_mtxels -i "$abs_input" \
-        || { echo "FAILED: dipole matrix elements"; return 1; }
-
-    echo "=== [3/3] Kinetic + ionic Hamiltonian ==="
-    $step python3 -u -m gw.kin_ion_io -i "$abs_input" \
-        || { echo "FAILED: kin_ion"; return 1; }
-
-    echo "=== Preprocessing complete ==="
-    ls -lh centroids_frac_*.txt dipole.h5 kin_ion.h5 2>/dev/null
-]], "")

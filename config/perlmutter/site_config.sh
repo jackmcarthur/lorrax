@@ -24,10 +24,6 @@ LORRAX_INSTALL_ROOT=""
 #       packaging pillow pyparsing python-dateutil six
 LORRAX_SITE_PACKAGES="$HOME/software/lorrax_site"
 
-# Extra PYTHONPATH entries for the Shifter container (colon-separated).  Use
-# for deps outside LORRAX src/ and site-packages.  Leave empty if not needed.
-LORRAX_DEPS=""
-
 # Shifter container image.  No default is intentional: the former default was
 # the retired CUDA-12/JAX-0.7 image, while current LORRAX requires JAX/JAXLIB
 # 0.9 and Perlmutter production uses the bare-host ``lorrax_A`` CUDA-13 lane.
@@ -46,31 +42,11 @@ LORRAX_MODULEFILE_DIR="$HOME/modulefiles"
 : "${LORRAX_MODULE_NAME:=lorrax}"
 
 # ----------------------------------------------------------------------------
-# SLURM defaults (used by lxalloc)
-# ----------------------------------------------------------------------------
-
-# Charge account.  Perlmutter: AY-yearly allocation ID (e.g. m2651).
-LORRAX_SLURM_ACCOUNT="m2651"
-
-# QOS.  NERSC interactive GPU QOS.
-LORRAX_SLURM_QOS="interactive"
-
-# Node constraint.  Perlmutter: "gpu" selects A100 nodes.
-LORRAX_SLURM_CONSTRAINT="gpu"
-
-# GPUs per node.  Perlmutter GPU nodes have 4 A100s.
-LORRAX_GPUS_PER_NODE="4"
-
-# ----------------------------------------------------------------------------
 # Shifter + bind-mount layout (Cray MPICH stack)
 # ----------------------------------------------------------------------------
 
 # Shifter module list (gpu + Cray MPICH bind-mounts).
 LORRAX_SHIFTER_MODULES="gpu,mpich"
-
-# srun --mpi= PMI flavour.  Cray MPICH speaks cray_shasta; pmi2 / pmix will
-# silently give singleton MPI_COMM_WORLD with shifter-mpich.
-LORRAX_MPI_TYPE_DEFAULT="cray_shasta"
 
 # cuSolverMp lib subdir under /lorrax_nvhpc/.  Must contain
 # math_libs/<cuda>/lib64/libcusolverMp.so + the matching
