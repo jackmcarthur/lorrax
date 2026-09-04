@@ -365,7 +365,9 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
                       p_x, p_y, low_mem_bands: bool = False) -> dict:
     """The un-chunkable floor resident across the whole r-chunk loop.
 
-    ``L_q`` and ``gflat_acc`` are ÷P (μ²/μ-family).
+    ``L_q`` and ``gflat_acc`` are ÷P (μ²/μ-family), both at the
+    selected post-slice q extent ``nq_disk``.  ``nq`` remains the full-zone
+    extent used by the C/Z construction stages.
 
     ``psi_copies`` prices the RESOLVED ``Wavefunctions`` layout
     (``gw.wavefunction_bundle``, report
@@ -406,7 +408,7 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     else:
         psi_copies = 2 * psi_one / p_x + 2 * psi_one / p_y
     return {
-        "L_q":         _c128(nq, mu, mu, shard=P_),
+        "L_q":         _c128(nq_disk, mu, mu, shard=P_),
         "gflat_acc":   _c128(nq_disk, mu, ngkmax, shard=P_),
         "psi_copies":  psi_copies,
         "loader_tables": 4.0 * nk * n_rtot + _C128 * nk * ngkmax,
@@ -555,6 +557,10 @@ class GFlatChunkPlan:
     r_chunk: int
     n_r_chunks: int
     q_chunk: int
+    #: Full-zone q rows K used while constructing C and Z.
+    n_q_full: int
+    #: Selected q rows Q retained for factor/solve/accumulation/V.
+    n_q_selected: int
     zeta_solve_memory_route: str
     gflat_chunk_size: int
     hwm_bytes: float
@@ -650,6 +656,8 @@ class GFlatChunkPlan:
             f"    zeta FFT      = full-nk transform, "
             f"{self.zeta_transform_fft_bytes / 1e9:.3f} GB/dev",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
+            f"    q rows        = selected Q {self.n_q_selected} / "
+            f"full-zone K {self.n_q_full}",
             f"    q_chunk       = {self.q_chunk}",
             f"    ζ solve memory = {self.zeta_solve_memory_route}",
             f"    gflat_cs      = {self.gflat_chunk_size}",
@@ -736,6 +744,9 @@ def plan_gflat_chunks(
     mu = int(getattr(meta, "n_rmu_padded", None) or meta.n_rmu)
     nq = nk
     nq_disk = int(n_q_disk)
+    if not 1 <= nq_disk <= nq:
+        raise ValueError(
+            f"n_q_disk must be in [1, n_k_tot], got Q={nq_disk}, K={nq}")
     n_rtot = int(meta.n_rtot)
     ngkmax = int(ngkmax)
     nb = int(nb_total)
@@ -752,8 +763,13 @@ def plan_gflat_chunks(
     fft_grid = tuple(getattr(meta, 'fft_grid', None)
                      or (int(round(n_rtot ** (1 / 3))),) * 3)
     if n_q_ibz is None:
-        n_q_ibz = nq
+        n_q_ibz = nq_disk
     n_q_ibz = int(n_q_ibz)
+    if n_q_ibz != nq_disk:
+        raise ValueError(
+            "the zeta planner has one selected q extent for disk, factor, "
+            f"solve, accumulation, and V; got disk Q={nq_disk}, "
+            f"V Q={n_q_ibz}")
 
     if target_utilization is None:
         target_utilization = bfc_fragmentation_target_utilization(ns)
@@ -1152,7 +1168,7 @@ def plan_gflat_chunks(
     # an all-P carrier.  Price that pad here without imposing it on the face
     # kernel or duplicating the runtime channel resolver.
     _solve_r_chunk = ((r_chunk + p_xy - 1) // p_xy) * p_xy
-    _rhs_stacks = 2 * _c128(nq, mu, _solve_r_chunk, shard=p_xy)
+    _rhs_stacks = 2 * _c128(nq_disk, mu, _solve_r_chunk, shard=p_xy)
     # The full-BZ Z_q the solve is handed as a live input.  Defined HERE
     # rather than beside ``C_t`` because ``q_chunk``'s own headroom has to
     # subtract it: see ``_factor_headroom``.
@@ -1189,7 +1205,7 @@ def plan_gflat_chunks(
         _factor_headroom = max(
             target - persistent_total - _rhs_stacks - _zq_live, 0.0)
         q_chunk = max(
-            1, min(nq, int(_factor_headroom / _factor_per_q)))
+            1, min(nq_disk, int(_factor_headroom / _factor_per_q)))
         solve_t = _rhs_stacks + q_chunk * _factor_per_q
         _solve_memory_route = (
             "replicated (auto-conservative)"
@@ -1350,6 +1366,8 @@ def plan_gflat_chunks(
         r_chunk=int(r_chunk),
         n_r_chunks=int(n_r_chunks),
         q_chunk=int(q_chunk),
+        n_q_full=int(nq),
+        n_q_selected=int(nq_disk),
         zeta_solve_memory_route=_solve_memory_route,
         gflat_chunk_size=int(gflat_cs),
         hwm_bytes=float(hwm),
