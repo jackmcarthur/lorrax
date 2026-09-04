@@ -118,12 +118,13 @@ def fit_schedule(n_q, n_mu, n_omega, tile_bytes=None):
 
     Q-MAJOR AND NOT COLUMN-MAJOR.  Both orders visit the same steps,
     but the q axis is the one the read is indexed on — a column block
-    is ``ds[:, q, :, lo:hi]`` — so finishing a q before moving on keeps
-    each HDF5 chunk in cache for the whole of its column walk instead
-    of touching every q's chunks once per block.  It is also the order
-    the staged store's completion ledger is easiest to read in: a
-    crashed run leaves a prefix of whole q's plus one partial q, which
-    ``_ranges`` prints as one line.
+    is ``ds[:, q, :, lo:hi]`` — so finishing a q before moving on gives
+    the filesystem and page cache the strongest available locality.
+    This is NOT an HDF5 chunk-cache claim: the production sample dataset
+    is contiguous, and each column tile remains a strided hyperslab that
+    performs one H5Dread.  Q-major is also the order the staged store's
+    completion ledger is easiest to read in: a crashed run leaves a prefix
+    of whole q's plus one partial q, which ``_ranges`` prints as one line.
     """
     blocks = column_blocks(n_mu, choose_column_budget(n_mu, n_omega,
                                                       tile_bytes))

@@ -207,10 +207,20 @@ def test_driver_closes_resume_and_allocation_ledgers_before_fit_writer():
     writer = source.index("mpa_store.FitWriter", after_allocate)
     assert validate < before_allocate < allocate < after_allocate < writer
 
+    final_ledger = source.index(
+        "ledger = mpa_store.fit_completion_ledger(fit_dest)", writer)
+    receipt_handoff = source.index(
+        'barrier("mpa_fit_body_ledger_readers_closed")', final_ledger)
+    receipt_write = source.index(
+        "mpa_store.write_fit_io_receipt", receipt_handoff)
+    receipt_done = source.index(
+        'barrier("mpa_fit_io_receipt_committed")', receipt_write)
+    assert final_ledger < receipt_handoff < receipt_write < receipt_done
+
 
 def test_run_driver_holds_one_fit_payload_handle(
         planted, tmp_path, mesh_xy, monkeypatch):
-    """The production walk opens the fit payload once, not once per block."""
+    """One small run uses one source and fit handle, not one per block."""
     import file_io.slab_io as slab_io
 
     fit_path = tmp_path / "one_payload_session.h5"
@@ -234,16 +244,164 @@ def test_run_driver_holds_one_fit_payload_handle(
     monkeypatch.setattr(slab_io, "SlabIO", CountingSlabIO)
     ledger, report = fit_driver.run_fit_driver(
         str(planted["w_path"]), _W_NAME, str(fit_path), planted["z"],
-        planted["n_p"], mesh_xy=mesh_xy)
+        planted["n_p"], mesh_xy=mesh_xy, finalize=False)
 
     fit_opens = [mode for path, mode in opens if path == str(fit_path)]
     assert fit_opens == ["w", "a"]
+    source_opens = [mode for path, mode in opens
+                    if path == str(planted["w_path"])]
+    assert source_opens == ["r"]
     assert report["blocks_walked"] > 1
+    assert report["sample_source_opens"] == 1
+    assert report["sample_source_closes"] == 1
+    assert report["sample_h5d_reads"] == report["blocks_walked"]
     assert syncs.count(str(fit_path)) == report["blocks_walked"]
     assert ledger["journal"].shape[0] == report["blocks_walked"]
     fit_writes = [name for path, name in writes if path == str(fit_path)]
     assert len(fit_writes) == 3 * report["blocks_walked"]
     assert set(fit_writes) == {"Omega_p", "B_p", "fit_condition"}
+    receipt = MS.read_fit_io_receipt(str(fit_path))
+    assert receipt["scope"] == "successful_body_attempt"
+    for key in MS._FIT_IO_RECEIPT_COUNTS:
+        assert receipt["counts"][key] == report[key]
+    assert receipt["seconds"] == report["seconds"]
+
+
+@pytest.mark.parametrize(
+    "ordered, blocks_per_q, expected_blocks, expected_epochs, expected_reads",
+    [
+        (False, 17, 1_105, 35, 1_105),
+        (True, 33, 2_145, 68, 4_290),
+    ],
+)
+def test_bi_schedule_reuses_one_sample_handle_per_checkpoint_epoch(
+        monkeypatch, ordered, blocks_per_q, expected_blocks,
+        expected_epochs, expected_reads):
+    """Fake the Bi walk: opens follow epochs while H5Dreads follow blocks.
+
+    Scalar uses 16-frequency, 129-column blocks: 65*17 = 1,105 reads
+    and ceil(1,105/32) = 35 source lifetimes.  Ordered positive/negative
+    blocks coexist, so its 32-frequency memory price narrows the block to
+    64 columns: 65*33 = 2,145 blocks, two reads each, 68 lifetimes.
+    """
+    from common import collectives
+
+    n_q, n_mu, n_omega, n_p = 65, 2_070, 16, 8
+    z = (1j * (1.0 + np.arange(n_omega))).astype(np.complex128)
+    positive = {
+        "n_q_on_disk": n_q, "n_mu": n_mu, "n_omega": n_omega,
+        "omega": z, "omega_units": "Ha", "grid_hash": "grid",
+        "table_hash": "table", "centroid_hash": "centroids",
+        "provenance": {},
+    }
+    negative = {**positive, "omega": -z}
+    ledger = {
+        "complete": False,
+        "blocks_done": np.zeros((n_q, n_mu), dtype=bool),
+        "condition_max": 2.0,
+        "backward_error_max": 1.0e-12,
+    }
+    events = []
+    readers = []
+    writers = []
+
+    class FakeReader:
+        def __init__(self, headers):
+            self.headers = headers
+            self.h5d_reads = 0
+            self.closed = False
+            readers.append(self)
+            events.append("source_open")
+
+        def read(self, name, *_args, **_kwargs):
+            assert not self.closed and name in self.headers
+            self.h5d_reads += 1
+            events.append("h5dread")
+
+        def close(self):
+            assert not self.closed
+            self.closed = True
+            events.append("source_close")
+
+    class FakeWriter:
+        def __init__(self, *_args, **_kwargs):
+            self.ledger = ledger
+            self.closed = False
+            writers.append(self)
+            events.append("writer_open")
+
+        def close(self, *, commit=True):
+            assert not self.closed
+            self.closed = True
+            events.append("writer_commit" if commit else "writer_abort")
+            return self.ledger
+
+    def open_reader(_src, *, mesh_xy, headers):
+        assert mesh_xy is not None
+        return FakeReader(headers)
+
+    def fake_fit_one_block(
+            _src, name, _dest, q, cols, _z, _n, *, w_reader,
+            w_negative_name=None, **_kwargs):
+        w_reader.read(name, q, cols)
+        if w_negative_name is not None:
+            w_reader.read(w_negative_name, q, cols)
+        cols = np.asarray(cols)
+        ledger["blocks_done"][int(q), cols] = True
+        count = int(cols.size)
+        return {
+            "ledger": ledger, "n_cols": count,
+            "n_elements": n_mu * count,
+            "bytes_read": ((2 if ordered else 1) * n_omega * n_mu
+                           * count * MS.COMPLEX128_BYTES),
+            "fit_dispatches": 1, "pade_solves": n_mu * count,
+            "seconds_read": 0.0, "seconds_fit": 0.0,
+            "seconds_write": 0.0,
+        }
+
+    monkeypatch.setattr(
+        MS, "read_w_header",
+        lambda _src, name: negative if name == _W_NEGATIVE_NAME else positive)
+    monkeypatch.setattr(MS, "read_w_tables", lambda *_args: object())
+    monkeypatch.setattr(
+        MS, "allocate_fit_store_collective", lambda *_args, **_kwargs: ledger)
+    monkeypatch.setattr(MS, "fit_completion_ledger", lambda *_args: ledger)
+    monkeypatch.setattr(MS, "write_fit_io_receipt",
+                        lambda _dest, _report: None)
+    monkeypatch.setattr(MS, "open_w_column_reader", open_reader)
+    monkeypatch.setattr(MS, "FitWriter", FakeWriter)
+    monkeypatch.setattr(fit_driver, "fit_one_block", fake_fit_one_block)
+    monkeypatch.setattr(fit_driver.os.path, "exists", lambda _path: False)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
+
+    _, report = fit_driver.run_fit_driver(
+        "Bi-W.h5", _W_NAME, "Bi-fit.h5", z, n_p,
+        w_negative_name=_W_NEGATIVE_NAME if ordered else None,
+        mesh_xy=object(), finalize=False)
+
+    assert report["n_blocks_per_q"] == blocks_per_q
+    assert report["blocks_walked"] == expected_blocks
+    assert report["checkpoint_epochs_planned"] == expected_epochs
+    assert report["checkpoint_epochs_committed"] == expected_epochs
+    assert report["sample_source_opens"] == expected_epochs
+    assert report["sample_source_closes"] == expected_epochs
+    assert report["sample_h5d_reads"] == expected_reads
+    assert len(readers) == len(writers) == expected_epochs
+    assert all(reader.closed for reader in readers)
+    assert all(writer.closed for writer in writers)
+    # Every source closes before that epoch's fit payload publishes its ledger.
+    closes = [i for i, event in enumerate(events) if event == "source_close"]
+    commits = [i for i, event in enumerate(events) if event == "writer_commit"]
+    source_opens = [i for i, event in enumerate(events)
+                    if event == "source_open"]
+    writer_opens = [i for i, event in enumerate(events)
+                    if event == "writer_open"]
+    assert len(closes) == len(commits) == expected_epochs
+    assert len(source_opens) == len(writer_opens) == expected_epochs
+    assert all(writer < source
+               for writer, source in zip(writer_opens, source_opens))
+    assert all(close < commit for close, commit in zip(closes, commits))
 
 
 def test_failed_fit_session_publishes_no_completion_ledger(
@@ -469,7 +627,28 @@ def test_fit_restart_checkpoints_only_closed_32_block_epochs(
     one_column_tile = (
         planted["z"].size * planted["n_mu"] * np.dtype(np.complex128).itemsize)
     original = fit_driver.fit_one_block
+    original_open = MS.open_w_column_reader
+    original_writer = MS.FitWriter
     calls = {"count": 0}
+    readers = []
+    events = []
+
+    def track_reader(*args, **kwargs):
+        reader = original_open(*args, **kwargs)
+        close = reader.close
+
+        def tracked_close():
+            events.append("source_close")
+            return close()
+
+        reader.close = tracked_close
+        readers.append(reader)
+        return reader
+
+    class TrackingWriter(original_writer):
+        def close(self, *, commit=True):
+            events.append("writer_commit" if commit else "writer_abort")
+            return super().close(commit=commit)
 
     def fail_in_second_epoch(*args, **kwargs):
         calls["count"] += 1
@@ -478,11 +657,16 @@ def test_fit_restart_checkpoints_only_closed_32_block_epochs(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(fit_driver, "fit_one_block", fail_in_second_epoch)
+    monkeypatch.setattr(MS, "open_w_column_reader", track_reader)
+    monkeypatch.setattr(MS, "FitWriter", TrackingWriter)
     with pytest.raises(RuntimeError, match="synthetic epoch crash"):
         fit_driver.run_fit_driver(
             str(planted["w_path"]), _W_NAME, str(fit_path),
             planted["z"], planted["n_p"], mesh_xy=mesh_xy,
             tile_bytes=one_column_tile, finalize=False)
+    assert len(readers) == 2
+    assert all(reader._io is None for reader in readers)
+    assert events[-2:] == ["source_close", "writer_abort"]
     first = MS.fit_completion_ledger(str(fit_path))
     assert first["n_done"] == 32
     assert first["journal"].shape == (32, 3)
@@ -918,9 +1102,13 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
     # One vmapped dispatch per block, one Pade solve per element.
     assert r["fit_dispatches"] == r["blocks_walked"]
     assert r["pade_solves"] == r["elements_fitted"]
+    assert r["sample_source_opens"] == r["checkpoint_epochs_committed"]
+    assert r["sample_source_closes"] == r["sample_source_opens"]
+    assert r["sample_h5d_reads"] == r["blocks_walked"]
 
     sec = r["seconds"]
-    parts = sec["read"] + sec["fit"] + sec["write"] + sec["finalize"]
+    parts = sum(sec[key] for key in (
+        "source_open", "read", "source_close", "fit", "write", "finalize"))
     assert all(v >= 0.0 for v in sec.values())
     assert sec["total"] > 0.0
     assert parts <= sec["total"] + 1.0e-6
@@ -931,7 +1119,8 @@ def test_cost_report_text_states_what_the_plan_demands(fitted, capsys):
     text = fitted["text"]
     for token in ("logical outputs", "dispatches",
                   "pole solves", "bytes read", "peak block", "seconds",
-                  "columns read", "elements fitted"):
+                  "columns read", "elements fitted", "source opens",
+                  "H5Dreads"):
         assert token in text, f"cost report omits {token!r}"
     assert str(fitted["report"]["logical_outputs"]) in text
     assert str(fitted["report"]["blocks_walked"]) in text

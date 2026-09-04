@@ -65,10 +65,10 @@ __all__ = [
 # lack of GPU batching is accepted and printed as part of this diagnostic
 # route's cost rather than changing the algorithm being compared.
 _FIT_EIG = "jax_qr"
-# One checkpoint transaction after this many scheduled q/column blocks.  This
-# is an internal durability policy, not a deck/env tuning knob: at the Bi
-# schedule of 1,105 blocks it produces 35 bounded epochs.
-_FIT_CHECKPOINT_BLOCKS = 32
+# One checkpoint transaction after this many scheduled q/column blocks.  The
+# receipt schema owns the value because it authenticates opens against epochs;
+# this alias keeps the loop readable without creating a second policy value.
+_FIT_CHECKPOINT_BLOCKS = mpa_store.FIT_IO_CHECKPOINT_BLOCKS
 
 
 def _fit_eig(solve):
@@ -259,6 +259,7 @@ def fit_one_block(
     solve="loewner",
     header=None,
     fit_writer=None,
+    w_reader=None,
 ):
     """Read one ``(q, column block)``, fit it, stage it.  Returns stats.
 
@@ -287,8 +288,12 @@ def fit_one_block(
         frequency and the scheduled column buffer remain replicated.
     fit_writer
         Optional live :class:`file_io.mpa_store.FitWriter`.  The production
-        driver supplies one for the whole schedule.  ``None`` uses the
+        driver supplies one for the checkpoint epoch.  ``None`` uses the
         one-block committed spelling for surgical resume callers.
+    w_reader
+        Optional live :class:`file_io.mpa_store.WColumnReader`.  Production
+        supplies the same reader for every block in the checkpoint epoch;
+        ``None`` keeps the one-shot source lifetime for surgical callers.
 
     Returns
     -------
@@ -315,15 +320,25 @@ def fit_one_block(
         n_cols_buffer = mpa_store.choose_column_budget(
             n_mu, int(hdr["n_omega"]), tile_bytes)
     t_read = time.perf_counter()
-    block = mpa_store.read_w_columns_collective(
-        w_src, w_name, q, cols, mesh_xy=mesh_xy,
-        n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes, header=hdr)
+    if w_reader is None:
+        block = mpa_store.read_w_columns_collective(
+            w_src, w_name, q, cols, mesh_xy=mesh_xy,
+            n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes, header=hdr)
+    else:
+        block = w_reader.read(
+            w_name, q, cols, n_cols_buffer=n_cols_buffer,
+            tile_bytes=tile_bytes)
     negative_block = block
     if w_negative_name is not None:
-        negative_block = mpa_store.read_w_columns_collective(
-            w_src, w_negative_name, q, cols, mesh_xy=mesh_xy,
-            n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes,
-            header=negative_header)
+        if w_reader is None:
+            negative_block = mpa_store.read_w_columns_collective(
+                w_src, w_negative_name, q, cols, mesh_xy=mesh_xy,
+                n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes,
+                header=negative_header)
+        else:
+            negative_block = w_reader.read(
+                w_negative_name, q, cols,
+                n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes)
     t_read = time.perf_counter() - t_read
 
     n_omega, _, n_mu_padded, _ = map(int, block.shape)
@@ -496,6 +511,14 @@ def run_fit_driver(
     report is PRINTED ONCE, at finalize, to ``report_stream`` when one
     is given; a memory decision that only appears in a traceback is a
     decision nobody reads.
+
+    RECEIPT SCOPE.  The production ``finalize=False`` body path persists the
+    successful attempt's I/O receipt before returning to the separate scalar
+    head/root-COMPLETE transaction.  A standalone ``finalize=True`` call
+    returns and optionally prints the same report but deliberately does not
+    append it after COMPLETE: its own finalize duration is unknowable before
+    that last write, and mutating a finalized artifact to record it would
+    violate the store's write-once contract.
     """
     n = int(n_p)
     rcond = float(rcond)
@@ -628,13 +651,17 @@ def run_fit_driver(
         "checkpoint_blocks": _FIT_CHECKPOINT_BLOCKS,
         "checkpoint_epochs_planned": 0,
         "checkpoint_epochs_committed": 0,
+        "sample_source_opens": 0,
+        "sample_source_closes": 0,
+        "sample_h5d_reads": 0,
         "columns_read": 0,
         "elements_fitted": 0,
         "bytes_read": 0,
         "peak_block_bytes": 0,
         "fit_dispatches": 0,
         "pade_solves": 0,
-        "seconds": {"read": 0.0, "fit": 0.0, "write": 0.0,
+        "seconds": {"source_open": 0.0, "read": 0.0,
+                    "source_close": 0.0, "fit": 0.0, "write": 0.0,
                     "finalize": 0.0, "total": 0.0},
     }
 
@@ -654,10 +681,42 @@ def run_fit_driver(
         for start in range(0, len(pending), _FIT_CHECKPOINT_BLOCKS))
     report["checkpoint_epochs_planned"] = len(epochs)
     for epoch in epochs:
-        t_write_lifecycle = time.perf_counter()
-        fit_writer = mpa_store.FitWriter(fit_dest, mesh_xy=mesh_xy)
-        report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
+        headers = {w_name: header}
+        if ordered:
+            headers[w_negative_name] = negative_header
+        fit_writer = None
+        w_reader = None
+        source_accounted = False
+        source_closed = False
+
+        def close_source_reader():
+            nonlocal source_accounted, source_closed
+            if w_reader is None or source_closed:
+                return
+            if not source_accounted:
+                report["sample_h5d_reads"] += w_reader.h5d_reads
+                source_accounted = True
+            t_source_lifecycle = time.perf_counter()
+            w_reader.close()
+            report["seconds"]["source_close"] += (
+                time.perf_counter() - t_source_lifecycle)
+            report["sample_source_closes"] += 1
+            source_closed = True
+
         try:
+            # FitWriter authenticates its ledger through serial h5py before
+            # opening the output payload.  Finish that transfer before a
+            # collective source handle exists, then close in reverse order.
+            t_write_lifecycle = time.perf_counter()
+            fit_writer = mpa_store.FitWriter(fit_dest, mesh_xy=mesh_xy)
+            report["seconds"]["write"] += (
+                time.perf_counter() - t_write_lifecycle)
+            t_source_lifecycle = time.perf_counter()
+            w_reader = mpa_store.open_w_column_reader(
+                w_src, mesh_xy=mesh_xy, headers=headers)
+            report["seconds"]["source_open"] += (
+                time.perf_counter() - t_source_lifecycle)
+            report["sample_source_opens"] += 1
             for q, lo, hi in epoch:
                 stats = fit_one_block(
                     w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
@@ -665,7 +724,8 @@ def run_fit_driver(
                     w_negative_name=w_negative_name,
                     negative_header=negative_header,
                     tile_bytes=tile_bytes, rcond=rcond,
-                    solve=solve, header=header, fit_writer=fit_writer)
+                    solve=solve, header=header, fit_writer=fit_writer,
+                    w_reader=w_reader)
                 ledger = stats["ledger"]
                 report["blocks_walked"] += 1
                 report["columns_read"] += stats["n_cols"]
@@ -678,9 +738,19 @@ def run_fit_driver(
                 report["seconds"]["read"] += stats["seconds_read"]
                 report["seconds"]["fit"] += stats["seconds_fit"]
                 report["seconds"]["write"] += stats["seconds_write"]
+            close_source_reader()
         except BaseException:
-            fit_writer.close(commit=False)
+            # Both constructors and every block phase land here.  Source
+            # closes first; only then may the output payload close/abort and
+            # perform its serial-ledger ownership transfer.
+            try:
+                close_source_reader()
+            finally:
+                if fit_writer is not None:
+                    fit_writer.close(commit=False)
             raise
+        # The source reader is closed on every rank before FitWriter closes
+        # its payload and rank zero publishes this epoch's completion ledger.
         t_write_lifecycle = time.perf_counter()
         ledger = fit_writer.close()
         report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
@@ -696,6 +766,11 @@ def run_fit_driver(
             fit_dest, certification=certification)
     barrier("mpa_fit_finalized" if finalize else "mpa_fit_body_complete")
     ledger = mpa_store.fit_completion_ledger(fit_dest)
+    if not finalize:
+        # Every rank just performed a serial-h5py ledger read.  Transfer
+        # ownership after the slowest reader has CLOSED, before rank zero
+        # opens the same inode to commit the receipt.
+        barrier("mpa_fit_body_ledger_readers_closed")
     report["seconds"]["finalize"] = time.perf_counter() - t_fin
 
     report["logical_outputs"] = (
@@ -705,6 +780,16 @@ def run_fit_driver(
     report["condition_max"] = ledger["condition_max"]
     report["backward_error_max"] = ledger["backward_error_max"]
     report["seconds"]["total"] = time.perf_counter() - t_total
+
+    # Production leaves root COMPLETE for the later scalar-head transaction.
+    # Persist this successful body attempt now, while metadata is still
+    # legally writable.  A ready incumbent is authenticated and preserved,
+    # so a head-crash restart with no pending blocks cannot replace the real
+    # work receipt with its zero-new-work pass.
+    if not finalize:
+        if process_rank() == 0:
+            mpa_store.write_fit_io_receipt(fit_dest, report)
+        barrier("mpa_fit_io_receipt_committed")
 
     if report_stream is not None and process_rank() == 0:
         report_stream.write(format_cost_report(report))
@@ -744,6 +829,9 @@ def format_cost_report(report):
         f"checkpoint epoch={r['checkpoint_blocks']} blocks, "
         f"{r['checkpoint_epochs_committed']}/"
         f"{r['checkpoint_epochs_planned']} new epochs committed",
+        f"  sample I/O      {r['sample_source_opens']} source opens, "
+        f"{r['sample_source_closes']} closes, "
+        f"{r['sample_h5d_reads']} H5Dreads",
         f"  columns read    {r['columns_read']} newly fitted "
         f"(full store = {r['n_q']} q x {r['n_mu']} columns)",
         f"  elements fitted {r['elements_fitted']}",
@@ -764,7 +852,8 @@ def format_cost_report(report):
         f"  budget rule     {r['cost_sentence']}",
         f"  worst condition {r['condition_max']:.3e}, worst backward "
         f"error {r['backward_error_max']:.3e}",
-        f"  seconds         read {sec['read']:.3f}  fit "
+        f"  seconds         source open {sec['source_open']:.3f}  read "
+        f"{sec['read']:.3f}  source close {sec['source_close']:.3f}  fit "
         f"{sec['fit']:.3f}  write {sec['write']:.3f}  finalize "
         f"{sec['finalize']:.3f}  total {sec['total']:.3f}",
         "-" * 60,

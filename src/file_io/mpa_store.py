@@ -77,9 +77,10 @@ eight.  Readers re-pad against their OWN count via ``n_mu_padded=``.
 THE COLUMN READER IS THE MEMORY ARGUMENT.  Per-element plasmon-pole
 fits want a few ν columns ACROSS ALL FREQUENCIES, never a full
 (N_μ, N_μ) frequency slab and never all of ω for a full row-block.
-:func:`read_w_columns` is that read (again the host seam; production goes
-through :func:`read_w_columns_collective`) and :func:`choose_column_budget`
-is its arithmetic; the budget is sized so the returned block costs about
+:func:`read_w_columns` is that read (again the host seam; production holds
+one :class:`WColumnReader` across a bounded fit epoch) and
+:func:`choose_column_budget` is its arithmetic; the budget is sized so the
+returned block costs about
 what ONE (N_μ, N_μ) tile costs, which is the unit the owner's
 constraint is stated in.  The block is 1-D SHARDED ON THE ROW AXIS
 ONLY — never 2-D — because the fit is elementwise in (μ, ν) and a
@@ -187,6 +188,15 @@ MPA_FIT_SUFFIX = "__mpafit"
 
 #: Tiny scalar q->0 fit beside, but independent of, the body pole tensors.
 MPA_HEAD_SUFFIX = "__mpahead"
+
+#: Compact, write-once receipt for the successful body-fit attempt.  It is
+#: committed before the later scalar-head/root-COMPLETE transaction.
+MPA_FIT_IO_RECEIPT_SUFFIX = "__mpafit_io"
+
+#: The fit driver's bounded durability epoch.  Kept beside the receipt schema
+#: because the receipt authenticates its open/close census against this value;
+#: the driver aliases this constant rather than maintaining a second copy.
+FIT_IO_CHECKPOINT_BLOCKS = 32
 
 # The fit keeps the W wedge's q map beside its poles.  The tables belong to
 # ``symmetry_maps``; this is only the dataset name under which that service
@@ -2176,45 +2186,130 @@ def read_w_columns_collective(
     tile_bytes=None,
     header=None,
 ):
-    """Collectively read one all-frequency column tile, sharded on rows.
+    """One-shot collective read of an all-frequency column tile.
 
     The returned array is ``(n_omega, 1, n_mu_padded, n_cols_buffer)``
     with ``P(None, None, ('x', 'y'), None)``.  The singleton is the stored
     q axis; retaining it makes the SlabIO offset and the fit-store write
     geometry identical.  A short final column block is zero-filled to the
     fixed buffer width and ``valid_shape`` prevents those zeros from reading
-    bytes belonging to the next block.
+    bytes belonging to the next block.  This is the surgical single-read
+    door; a scheduled fit must use :class:`WColumnReader` so its epoch does
+    not reopen the same source once per column block.
     """
-    from jax.sharding import PartitionSpec as P
-
-    from file_io.slab_io import SlabIO, mesh_divisible_shape
-
     hdr = read_w_header(src, name) if header is None else header
-    n_mu = int(hdr["n_mu"])
-    n_omega = int(hdr["n_omega"])
-    iq, cols, budget = _validate_column_request(
-        hdr, q, mu_cols, tile_bytes,
-        f"read_w_columns_collective({name!r})")
-    lo, hi, sel = _column_span(cols)
-    if sel is not None:
-        raise ValueError(
-            "read_w_columns_collective requires one contiguous column "
-            "range; the production fit schedule emits contiguous blocks")
-    width = int(n_cols_buffer)
-    if width < int(cols.size) or width > budget:
-        raise ValueError(
-            f"read_w_columns_collective: n_cols_buffer={width}, actual "
-            f"width={int(cols.size)}, budget={budget}; require "
-            "actual <= buffer <= budget")
+    with WColumnReader(
+            src, mesh_xy=mesh_xy, headers={name: hdr}) as reader:
+        return reader.read(
+            name, q, mu_cols, n_cols_buffer=n_cols_buffer,
+            tile_bytes=tile_bytes)
 
-    spec = P(None, None, ("x", "y"), None)
-    shape = mesh_divisible_shape(
-        (n_omega, 1, n_mu, width), mesh_xy, spec)
-    with SlabIO(src, mode="r", mesh=mesh_xy) as io:
-        return io.read_slab(
-            name, shape=shape, offset=(0, iq, 0, lo),
+
+class WColumnReader:
+    """ONE collective source handle for one bounded fit epoch.
+
+    A fit block still performs one H5Dread per sample component and retains
+    exactly one budgeted all-frequency column tile per component.  What this
+    object removes is file/dataset discovery churn: the source is opened once
+    for the epoch, not once for every ``(q, column)`` block.  At the scalar Bi
+    geometry that changes 1,105 source opens to 35 without changing the 1,105
+    H5Dreads, their selections, the fit algebra, or device memory.
+
+    ``headers`` is explicit because production authenticates both positive
+    and optional negative components before collective I/O begins.  Keeping
+    those already-closed serial reads outside this lifetime also prevents an
+    h5py metadata open from appearing while the collective handle is live.
+    Multiple names share this ONE handle, so ordered fitting reads W(z) and
+    W(-z) without independently reopening their common source.
+
+    COLLECTIVE over ``mesh_xy``.  Every rank must construct, read in the same
+    order, and close.  Use the context-manager spelling; :meth:`read` refuses
+    after close rather than silently reviving a handle whose lifetime would
+    no longer be visible in the driver.
+    """
+
+    def __init__(self, src, *, mesh_xy, headers):
+        if mesh_xy is None:
+            raise ValueError(
+                "WColumnReader requires mesh_xy: its source handle is "
+                "collective")
+        rows = {str(name): dict(header)
+                for name, header in dict(headers).items()}
+        if not rows:
+            raise ValueError(
+                "WColumnReader requires at least one authenticated header")
+        self.src = os.fspath(src)
+        self.mesh_xy = mesh_xy
+        self.headers = rows
+        self.h5d_reads = 0
+        from file_io.slab_io import SlabIO
+        self._io = SlabIO(self.src, mode="r", mesh=mesh_xy)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        io, self._io = getattr(self, "_io", None), None
+        if io is not None:
+            io.close()
+
+    def read(
+        self,
+        name,
+        q,
+        mu_cols,
+        *,
+        n_cols_buffer,
+        tile_bytes=None,
+    ):
+        """Read one contiguous column tile through the live handle."""
+        from jax.sharding import PartitionSpec as P
+
+        from file_io.slab_io import mesh_divisible_shape
+
+        if self._io is None:
+            raise ValueError(
+                "WColumnReader.read after close(): open a new epoch reader")
+        key = str(name)
+        if key not in self.headers:
+            raise KeyError(
+                f"WColumnReader has no authenticated header for {key!r}; "
+                f"available={sorted(self.headers)}")
+        header = self.headers[key]
+        n_mu = int(header["n_mu"])
+        n_omega = int(header["n_omega"])
+        iq, cols, budget = _validate_column_request(
+            header, q, mu_cols, tile_bytes,
+            f"WColumnReader.read({key!r})")
+        lo, _, sel = _column_span(cols)
+        if sel is not None:
+            raise ValueError(
+                "WColumnReader.read requires one contiguous column range; "
+                "the production fit schedule emits contiguous blocks")
+        width = int(n_cols_buffer)
+        if width < int(cols.size) or width > budget:
+            raise ValueError(
+                f"WColumnReader.read: n_cols_buffer={width}, actual "
+                f"width={int(cols.size)}, budget={budget}; require "
+                "actual <= buffer <= budget")
+
+        spec = P(None, None, ("x", "y"), None)
+        shape = mesh_divisible_shape(
+            (n_omega, 1, n_mu, width), self.mesh_xy, spec)
+        block = self._io.read_slab(
+            key, shape=shape, offset=(0, iq, 0, lo),
             valid_shape=(n_omega, 1, n_mu, int(cols.size)),
             partition_spec=spec)
+        self.h5d_reads += 1
+        return block
+
+
+def open_w_column_reader(src, *, mesh_xy, headers):
+    """Open the persistent source reader for one fit checkpoint epoch."""
+    return WColumnReader(src, mesh_xy=mesh_xy, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -2228,7 +2323,7 @@ def _initialise_fit_metadata(
 ):
     """Rank-zero-only small metadata half of fit-store allocation."""
     qs = _qs()
-    reset = [MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX]
+    reset = [MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX, MPA_FIT_IO_RECEIPT_SUFFIX]
     if not preserve_payload:
         reset = ["Omega_p", "B_p", "B_odd_p"] + [
             k for k in grp if str(k).startswith("fit_")] + reset
@@ -3302,13 +3397,14 @@ class FitWriter:
     payload close publishes nothing.
 
     Each block is drained before :meth:`write_block` returns.  The next fit
-    block is read from the W-sample file through a different HDF5 handle;
-    allowing that read to overlap this handle's asynchronous H5Dwrite is
-    illegal even though the two inodes differ (parallel HDF5's VOL state is
-    process-global).  Pre-opening every output dataset before the first
-    write and using one drain per three-write block gives the service a strict
-    ``read W -> fit -> write+drain poles`` transaction order without
-    restoring any per-block file open or ledger transaction.
+    block is read from the W-sample file through the epoch's different,
+    persistent HDF5 handle; allowing that read to overlap this handle's
+    asynchronous H5Dwrite is illegal even though the two inodes differ
+    (parallel HDF5's VOL state is process-global).  Pre-opening every output
+    dataset before the first write and using one drain per three-write block
+    gives the service a strict ``read W -> fit -> write+drain poles``
+    transaction order without restoring any per-block file open or ledger
+    transaction.
 
     COLLECTIVE over ``mesh_xy``.  Construct, call :meth:`write_block` in the
     same order on every rank, then close collectively.  The context-manager
@@ -4085,6 +4181,192 @@ def _require_certification(certification, dest):
         "pair 1/rcond and sqrt(eps) (gw/mpa/fit_driver.py); a stage with "
         "no material tolerance of its own should reuse them rather than "
         "leave the store uncertified.")
+
+
+_FIT_IO_RECEIPT_COUNTS = (
+    "blocks_walked",
+    "blocks_skipped",
+    "checkpoint_blocks",
+    "checkpoint_epochs_planned",
+    "checkpoint_epochs_committed",
+    "sample_source_opens",
+    "sample_source_closes",
+    "sample_h5d_reads",
+)
+_FIT_IO_RECEIPT_SECONDS = (
+    "source_open", "read", "source_close", "fit", "write", "finalize",
+    "total",
+)
+
+
+def _normalise_fit_io_receipt(report):
+    """The exact compact schema persisted for one successful body attempt."""
+    row = dict(report)
+    try:
+        count_values = {key: np.asarray(row[key])
+                        for key in _FIT_IO_RECEIPT_COUNTS}
+        second_values = {key: np.asarray(row["seconds"][key])
+                         for key in _FIT_IO_RECEIPT_SECONDS}
+        ordered_value = np.asarray(row["ordered_residues"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "fit I/O receipt is missing its exact count/timing schema") from exc
+    if any(value.shape != () or value.dtype.kind not in "iu"
+           for value in count_values.values()):
+        raise ValueError("fit I/O receipt counts must be scalar integers")
+    if any(value.shape != () or value.dtype.kind not in "iuf"
+           for value in second_values.values()):
+        raise ValueError("fit I/O receipt seconds must be scalar numbers")
+    if ordered_value.shape != () or ordered_value.dtype.kind != "b":
+        raise ValueError("fit I/O receipt ordered_residues must be bool")
+    counts = {key: int(value) for key, value in count_values.items()}
+    seconds = {key: float(value) for key, value in second_values.items()}
+    ordered = bool(ordered_value)
+    if any(value < 0 for value in counts.values()):
+        raise ValueError("fit I/O receipt counts must be nonnegative")
+    if any(not np.isfinite(value) or value < 0.0
+           for value in seconds.values()):
+        raise ValueError(
+            "fit I/O receipt seconds must be finite and nonnegative")
+    if counts["sample_source_opens"] != counts["sample_source_closes"]:
+        raise ValueError("fit I/O receipt source opens/closes disagree")
+    if counts["checkpoint_blocks"] != FIT_IO_CHECKPOINT_BLOCKS:
+        raise ValueError(
+            "fit I/O receipt checkpoint_blocks disagrees with the format "
+            f"policy {FIT_IO_CHECKPOINT_BLOCKS}")
+    expected_epochs = (
+        counts["blocks_walked"] + FIT_IO_CHECKPOINT_BLOCKS - 1
+    ) // FIT_IO_CHECKPOINT_BLOCKS
+    if (counts["checkpoint_epochs_planned"] != expected_epochs
+            or counts["checkpoint_epochs_committed"] != expected_epochs
+            or counts["sample_source_opens"] != expected_epochs):
+        raise ValueError(
+            "fit I/O receipt epoch/open census disagrees with "
+            f"ceil(blocks_walked/{FIT_IO_CHECKPOINT_BLOCKS})="
+            f"{expected_epochs}")
+    expected_reads = counts["blocks_walked"] * (2 if ordered else 1)
+    if counts["sample_h5d_reads"] != expected_reads:
+        raise ValueError(
+            "fit I/O receipt H5Dreads disagree with fitted blocks/components: "
+            f"got {counts['sample_h5d_reads']}, expected {expected_reads}")
+    return {"ordered_residues": ordered,
+            "counts": counts, "seconds": seconds}
+
+
+def _validate_fit_io_receipt_against_ledger(grp, normal):
+    """Bind a plausible receipt to the actual completed body transaction."""
+    led = _open_fit(grp)
+    counts = normal["counts"]
+    n_journal = int(led["block_journal"].shape[0])
+    described = counts["blocks_walked"] + counts["blocks_skipped"]
+    if described != n_journal:
+        raise ValueError(
+            "fit I/O receipt block census disagrees with the fit ledger: "
+            f"walked+skipped={described}, journal={n_journal}")
+    stored_ordered = bool(
+        grp.attrs.get("mpa_fit_ordered_residues", False))
+    if normal["ordered_residues"] != stored_ordered:
+        raise ValueError(
+            "fit I/O receipt ordered_residues disagrees with the fit ledger")
+
+
+def _read_fit_io_receipt_group(grp):
+    """Read and authenticate the exact ready receipt group."""
+    if MPA_FIT_IO_RECEIPT_SUFFIX not in grp:
+        return None
+    row = grp[MPA_FIT_IO_RECEIPT_SUFFIX]
+    expected = {
+        "format_version", "scope", "ordered_residues", "written_utc",
+        "ready",
+        *("count_" + key for key in _FIT_IO_RECEIPT_COUNTS),
+        *("seconds_" + key for key in _FIT_IO_RECEIPT_SECONDS),
+    }
+    actual = set(map(str, row.attrs.keys()))
+    if actual != expected:
+        raise ValueError(
+            "fit I/O receipt does not have the exact schema: "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
+    if int(row.attrs["format_version"]) != 1:
+        raise ValueError("unsupported fit I/O receipt format_version")
+    scope = row.attrs["scope"]
+    if isinstance(scope, (bytes, np.bytes_)):
+        scope = bytes(scope).decode("utf-8")
+    if str(scope) != "successful_body_attempt":
+        raise ValueError("fit I/O receipt has an unknown scope")
+    if not bool(row.attrs["ready"]):
+        raise ValueError("fit I/O receipt is present but not ready")
+    report = {
+        key: row.attrs["count_" + key]
+        for key in _FIT_IO_RECEIPT_COUNTS
+    }
+    report["ordered_residues"] = bool(row.attrs["ordered_residues"])
+    report["seconds"] = {
+        key: row.attrs["seconds_" + key]
+        for key in _FIT_IO_RECEIPT_SECONDS
+    }
+    normal = _normalise_fit_io_receipt(report)
+    _validate_fit_io_receipt_against_ledger(grp, normal)
+    return {
+        "format_version": 1,
+        "scope": "successful_body_attempt",
+        "written_utc": row.attrs["written_utc"],
+        **normal,
+    }
+
+
+def read_fit_io_receipt(src, *, mode="r"):
+    """Return the ready body-attempt I/O receipt, or ``None`` if absent."""
+    with _h5(src, mode) as grp:
+        return _read_fit_io_receipt_group(grp)
+
+
+def _flush_fit_io_receipt(grp):
+    """Make one receipt publication phase durable in its current file."""
+    grp.file.flush()
+
+
+def write_fit_io_receipt(dest, report, *, mode="a"):
+    """Commit the successful body attempt's compact I/O receipt once.
+
+    RANK-0 ONLY.  The body ledger must be complete and root COMPLETE must
+    still be false: production writes this after ``run_fit_driver(...,
+    finalize=False)`` and before the separate scalar-head/finalize
+    transaction.  A ready receipt is immutable and is authenticated/preserved
+    on a no-pending restart.  An unready group is abandoned staging state and
+    may be replaced.  ``ready`` is the last write.
+    """
+    normal = _normalise_fit_io_receipt(report)
+    with _h5(dest, mode) as grp:
+        led = _open_fit(grp)
+        if bool(grp.attrs.get("mpa_fit_complete", False)):
+            raise ValueError(
+                "fit I/O receipt must be committed before root COMPLETE")
+        if not bool(np.asarray(led["blocks_done"][()], dtype=bool).all()):
+            raise ValueError(
+                "fit I/O receipt requires every body range checkpointed")
+        _validate_fit_io_receipt_against_ledger(grp, normal)
+        if MPA_FIT_IO_RECEIPT_SUFFIX in grp:
+            incumbent = grp[MPA_FIT_IO_RECEIPT_SUFFIX]
+            if bool(incumbent.attrs.get("ready", False)):
+                return _read_fit_io_receipt_group(grp)
+            del grp[MPA_FIT_IO_RECEIPT_SUFFIX]
+        row = grp.create_group(MPA_FIT_IO_RECEIPT_SUFFIX)
+        # False is the first field and is made durable with the payload below.
+        # A crash anywhere before the second flush therefore leaves staging
+        # state that the next attempt may replace, never a torn ready schema.
+        row.attrs["ready"] = False
+        row.attrs["format_version"] = np.int64(1)
+        row.attrs["scope"] = "successful_body_attempt"
+        row.attrs["ordered_residues"] = normal["ordered_residues"]
+        for key, value in normal["counts"].items():
+            row.attrs["count_" + key] = np.int64(value)
+        for key, value in normal["seconds"].items():
+            row.attrs["seconds_" + key] = np.float64(value)
+        row.attrs["written_utc"] = _utc_now()
+        _flush_fit_io_receipt(grp)
+        row.attrs["ready"] = True
+        _flush_fit_io_receipt(grp)
+        return _read_fit_io_receipt_group(grp)
 
 
 def finalize_fit_store(dest, *, certification=None, require_head=False,

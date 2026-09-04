@@ -721,6 +721,129 @@ def test_collective_reader_keeps_one_frequency_slab_sharded(
     assert calls == ["open", "close"]
 
 
+def test_w_column_reader_holds_one_handle_and_preserves_ragged_bytes(
+        tmpdir_path, monkeypatch):
+    """One epoch handle serves full and short-final column selections."""
+    W, _, _, n_mu, _, _ = _write_w(tmpdir_path)
+    header = MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+    calls = []
+
+    class RecordingSlabIO(HostSlabIO):
+        def __init__(self, path, *, mode, mesh):
+            calls.append(("open", str(path), mode))
+            super().__init__(path, mode=mode, mesh=mesh)
+
+        def read_slab(self, name, **kwargs):
+            calls.append(("read", name, kwargs["offset"],
+                          kwargs["valid_shape"]))
+            return super().read_slab(name, **kwargs)
+
+        def close(self):
+            if getattr(self, "file", None) is not None:
+                calls.append(("close",))
+            super().close()
+
+    import file_io.slab_io as slab_io
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
+    mesh = _mesh()
+    ragged_tile = 3 * 6 * n_mu * MS.COMPLEX128_BYTES
+    budget = MS.choose_column_budget(n_mu, 6, ragged_tile)
+    assert budget > 1 and n_mu % budget
+    with MS.open_w_column_reader(
+            tmpdir_path, mesh_xy=mesh,
+            headers={"W_qmunu_omega": header}) as reader:
+        first = reader.read(
+            "W_qmunu_omega", 1, np.arange(budget),
+            n_cols_buffer=budget, tile_bytes=ragged_tile)
+        lo = n_mu - (n_mu % budget)
+        last = reader.read(
+            "W_qmunu_omega", 1, np.arange(lo, n_mu),
+            n_cols_buffer=budget, tile_bytes=ragged_tile)
+        assert reader.h5d_reads == 2
+
+    np.testing.assert_array_equal(
+        np.asarray(first)[:, 0, :n_mu, :budget],
+        W[:, 1, :, :budget])
+    tail = n_mu - lo
+    np.testing.assert_array_equal(
+        np.asarray(last)[:, 0, :n_mu, :tail], W[:, 1, :, lo:n_mu])
+    assert not np.asarray(last)[:, 0, :n_mu, tail:].any()
+    assert [row[0] for row in calls] == ["open", "read", "read", "close"]
+    with pytest.raises(ValueError, match="after close"):
+        reader.read(
+            "W_qmunu_omega", 0, [0], n_cols_buffer=budget)
+
+
+def test_ordered_w_components_share_one_reader_handle(
+        tmpdir_path, monkeypatch):
+    positive, _, _, n_mu, _, _ = _write_w(tmpdir_path, name="W_plus")
+    negative, _, _, _, _, _ = _write_w(
+        tmpdir_path, name="W_minus", seed=29)
+    headers = {
+        name: MS.read_w_header(tmpdir_path, name)
+        for name in ("W_plus", "W_minus")
+    }
+    calls = []
+
+    class RecordingSlabIO(HostSlabIO):
+        def __init__(self, path, *, mode, mesh):
+            calls.append("open")
+            super().__init__(path, mode=mode, mesh=mesh)
+
+        def read_slab(self, name, **kwargs):
+            calls.append("read:" + name)
+            return super().read_slab(name, **kwargs)
+
+        def close(self):
+            if getattr(self, "file", None) is not None:
+                calls.append("close")
+            super().close()
+
+    import file_io.slab_io as slab_io
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
+    width = MS.choose_column_budget(n_mu, 12)
+    cols = np.arange(width)
+    with MS.open_w_column_reader(
+            tmpdir_path, mesh_xy=_mesh(), headers=headers) as reader:
+        got_positive = reader.read(
+            "W_plus", 2, cols, n_cols_buffer=width,
+            tile_bytes=MS.one_tile_bytes(n_mu))
+        got_negative = reader.read(
+            "W_minus", 2, cols, n_cols_buffer=width,
+            tile_bytes=MS.one_tile_bytes(n_mu))
+        assert reader.h5d_reads == 2
+
+    np.testing.assert_array_equal(
+        np.asarray(got_positive)[:, 0, :n_mu, :width],
+        positive[:, 2, :, :width])
+    np.testing.assert_array_equal(
+        np.asarray(got_negative)[:, 0, :n_mu, :width],
+        negative[:, 2, :, :width])
+    assert calls == ["open", "read:W_plus", "read:W_minus", "close"]
+
+
+def test_w_column_reader_closes_collectively_on_exception(
+        tmpdir_path, monkeypatch):
+    _write_w(tmpdir_path)
+    header = MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+    closes = []
+
+    class RecordingSlabIO(HostSlabIO):
+        def close(self):
+            if getattr(self, "file", None) is not None:
+                closes.append(True)
+            super().close()
+
+    import file_io.slab_io as slab_io
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
+    with pytest.raises(RuntimeError, match="synthetic fit failure"):
+        with MS.open_w_column_reader(
+                tmpdir_path, mesh_xy=_mesh(),
+                headers={"W_qmunu_omega": header}):
+            raise RuntimeError("synthetic fit failure")
+    assert closes == [True]
+
+
 def test_collective_reader_reconstructs_the_product_padded_mu_carrier(
         monkeypatch):
     """P36 Bi geometry: 2070 divides six, but the carrier extent is 2088.
@@ -1401,6 +1524,183 @@ def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None,
         MS.write_fit_block(path, q, cols, Om, Bp, diag)
         truth[(q, lo, hi)] = (Om, Bp, diag)
     return truth, steps
+
+
+def _fit_io_report(*, blocks_walked, blocks_skipped=0, ordered=False):
+    epochs = (int(blocks_walked) + 31) // 32
+    return {
+        "blocks_walked": int(blocks_walked),
+        "blocks_skipped": int(blocks_skipped),
+        "checkpoint_blocks": MS.FIT_IO_CHECKPOINT_BLOCKS,
+        "checkpoint_epochs_planned": epochs,
+        "checkpoint_epochs_committed": epochs,
+        "sample_source_opens": epochs,
+        "sample_source_closes": epochs,
+        "sample_h5d_reads": int(blocks_walked) * (2 if ordered else 1),
+        "ordered_residues": bool(ordered),
+        "seconds": {
+            "source_open": 0.1, "read": 0.2, "source_close": 0.3,
+            "fit": 0.4, "write": 0.5, "finalize": 0.6, "total": 2.1,
+        },
+    }
+
+
+def test_fit_io_receipt_replaces_unready_staging_and_commits_ready_last(
+        tmpdir_path, monkeypatch):
+    _, steps = _staged_fit(tmpdir_path, n_q=1, n_mu=6, n_p=2, n_cols=2)
+    with h5py.File(tmpdir_path, "a") as h5:
+        interrupted = h5.create_group(MS.MPA_FIT_IO_RECEIPT_SUFFIX)
+        interrupted.attrs["ready"] = False
+        interrupted.attrs["poison"] = "partial write"
+
+    report = _fit_io_report(blocks_walked=len(steps))
+    original_flush = MS._flush_fit_io_receipt
+    flushed_states = []
+
+    def recording_flush(grp):
+        flushed_states.append(bool(
+            grp[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs["ready"]))
+        original_flush(grp)
+
+    monkeypatch.setattr(MS, "_flush_fit_io_receipt", recording_flush)
+    receipt = MS.write_fit_io_receipt(tmpdir_path, report)
+    assert receipt["scope"] == "successful_body_attempt"
+    assert receipt["counts"]["blocks_walked"] == len(steps)
+    assert receipt["counts"]["sample_h5d_reads"] == len(steps)
+    assert receipt["seconds"] == report["seconds"]
+    with h5py.File(tmpdir_path, "r") as h5:
+        attrs = set(h5[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs)
+    expected = {
+        "format_version", "scope", "ordered_residues", "written_utc",
+        "ready",
+        *("count_" + key for key in MS._FIT_IO_RECEIPT_COUNTS),
+        *("seconds_" + key for key in MS._FIT_IO_RECEIPT_SECONDS),
+    }
+    assert attrs == expected and "poison" not in attrs
+    assert flushed_states == [False, True]
+
+
+def test_fit_io_receipt_crash_after_payload_flush_is_replaceable(
+        tmpdir_path, monkeypatch):
+    _, steps = _staged_fit(tmpdir_path, n_q=1, n_mu=6, n_p=2, n_cols=2)
+    report = _fit_io_report(blocks_walked=len(steps))
+    original_flush = MS._flush_fit_io_receipt
+    calls = []
+
+    def crash_after_first_flush(grp):
+        original_flush(grp)
+        calls.append(bool(
+            grp[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs["ready"]))
+        if len(calls) == 1:
+            raise RuntimeError("crash after receipt payload flush")
+
+    monkeypatch.setattr(
+        MS, "_flush_fit_io_receipt", crash_after_first_flush)
+    with pytest.raises(RuntimeError, match="payload flush"):
+        MS.write_fit_io_receipt(tmpdir_path, report)
+    with h5py.File(tmpdir_path, "r") as h5:
+        assert not bool(
+            h5[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs["ready"])
+
+    monkeypatch.setattr(MS, "_flush_fit_io_receipt", original_flush)
+    receipt = MS.write_fit_io_receipt(tmpdir_path, report)
+    assert receipt["counts"]["blocks_walked"] == len(steps)
+    with h5py.File(tmpdir_path, "r") as h5:
+        assert bool(h5[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs["ready"])
+
+
+def test_fit_io_receipt_handles_both_body_completion_interruption_windows(
+        tmpdir_path):
+    """No receipt records zero new work; ready receipt remains immutable."""
+    _, steps = _staged_fit(tmpdir_path, n_q=1, n_mu=6, n_p=2, n_cols=2)
+
+    # Crash after the last epoch ledger but before receipt: the retry has no
+    # pending work, and says exactly that instead of inventing read/open cost.
+    zero_work = _fit_io_report(
+        blocks_walked=0, blocks_skipped=len(steps))
+    first = MS.write_fit_io_receipt(tmpdir_path, zero_work)
+    assert first["counts"]["blocks_walked"] == 0
+    assert first["counts"]["blocks_skipped"] == len(steps)
+    assert first["counts"]["sample_source_opens"] == 0
+    assert first["counts"]["sample_h5d_reads"] == 0
+
+    # Crash after ready receipt but before head/root COMPLETE: a later body
+    # pass authenticates and preserves the incumbent instead of replacing it.
+    replacement = _fit_io_report(blocks_walked=len(steps))
+    preserved = MS.write_fit_io_receipt(tmpdir_path, replacement)
+    assert preserved == first
+    assert MS.read_fit_io_receipt(tmpdir_path) == first
+
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
+    with pytest.raises(ValueError, match="before root COMPLETE"):
+        MS.write_fit_io_receipt(tmpdir_path, replacement)
+
+
+def test_fit_io_receipt_refuses_wrong_census_and_poisoned_ready_schema(
+        tmpdir_path):
+    _, steps = _staged_fit(tmpdir_path, n_q=1, n_mu=6, n_p=2, n_cols=2)
+    bad = _fit_io_report(blocks_walked=len(steps))
+    bad["sample_h5d_reads"] += 1
+    with pytest.raises(ValueError, match="H5Dreads disagree"):
+        MS.write_fit_io_receipt(tmpdir_path, bad)
+
+    MS.write_fit_io_receipt(
+        tmpdir_path, _fit_io_report(blocks_walked=len(steps)))
+    with h5py.File(tmpdir_path, "a") as h5:
+        h5[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs["unexpected"] = 1
+    with pytest.raises(ValueError, match="exact schema"):
+        MS.read_fit_io_receipt(tmpdir_path)
+
+
+def _poison_fit_io_report(report, poison):
+    row = {**report, "seconds": dict(report["seconds"])}
+    if poison == "total":
+        row["blocks_skipped"] += 1
+    elif poison == "ordered":
+        row["ordered_residues"] = True
+        row["sample_h5d_reads"] = 2 * row["blocks_walked"]
+    elif poison == "epoch":
+        row["checkpoint_epochs_planned"] += 1
+        row["checkpoint_epochs_committed"] += 1
+        row["sample_source_opens"] += 1
+        row["sample_source_closes"] += 1
+    else:                                                   # pragma: no cover
+        raise AssertionError(poison)
+    return row
+
+
+@pytest.mark.parametrize(
+    "poison, match",
+    [("total", "block census"), ("ordered", "ordered_residues"),
+     ("epoch", "epoch/open census")],
+)
+def test_fit_io_receipt_new_write_refuses_plausible_ledger_mismatch(
+        tmpdir_path, poison, match):
+    _, steps = _staged_fit(tmpdir_path, n_q=1, n_mu=6, n_p=2, n_cols=2)
+    report = _poison_fit_io_report(
+        _fit_io_report(blocks_walked=len(steps)), poison)
+    with pytest.raises(ValueError, match=match):
+        MS.write_fit_io_receipt(tmpdir_path, report)
+
+
+@pytest.mark.parametrize(
+    "poison, match",
+    [("total", "block census"), ("ordered", "ordered_residues"),
+     ("epoch", "epoch/open census")],
+)
+def test_fit_io_receipt_ready_incumbent_refuses_plausible_poison(
+        tmpdir_path, poison, match):
+    _, steps = _staged_fit(tmpdir_path, n_q=1, n_mu=6, n_p=2, n_cols=2)
+    report = _fit_io_report(blocks_walked=len(steps))
+    MS.write_fit_io_receipt(tmpdir_path, report)
+    poisoned = _poison_fit_io_report(report, poison)
+    with h5py.File(tmpdir_path, "a") as h5:
+        receipt = h5[MS.MPA_FIT_IO_RECEIPT_SUFFIX]
+        for key in MS._FIT_IO_RECEIPT_COUNTS:
+            receipt.attrs["count_" + key] = poisoned[key]
+        receipt.attrs["ordered_residues"] = poisoned["ordered_residues"]
+    with pytest.raises(ValueError, match=match):
+        MS.read_fit_io_receipt(tmpdir_path)
 
 
 def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
