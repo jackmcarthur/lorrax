@@ -111,7 +111,7 @@ def test_iteration_map_resolves_the_eigh_separately_from_the_efermi_rule():
     body = src[src.index("def gw_iteration_map("):
                src.index("def _scissor_E_qp_for_outofrange(")]
     eigh_at = body.index("eigh_kind = _resolve_sc_eigh(")
-    call_at = body.index("E_qp_ry, U_qp = distributed_eigh_bands(")
+    call_at = body.index("E_qp_ry, U_qp = _sc_eigh_bands(")
     dsc_at = body.index('"density_self_consistent"', eigh_at)
     assert eigh_at < call_at < dsc_at, (
         "the eigh dispatch must be resolved before, and independently of, "

@@ -35,6 +35,9 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     sym = SimpleNamespace(
         Rinv_grid=np.eye(3, dtype=int)[None], translations=np.zeros((1, 3)),
         trs_allowed=True, nk_tot=8, nk_red=1,
+        active_symmetry_rows=np.array([0], dtype=np.int32),
+        qe_symmetry_binding=None,
+        qe_symmetry_diagnostic="synthetic test fixture has no QE schema",
     )
     params = {"eigh_backend": "auto", "htransform_rank_multiplier": 0.0}
     report.environment(

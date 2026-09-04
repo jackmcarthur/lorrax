@@ -36,6 +36,7 @@ def test_preprocessing_report_is_human_readable_and_shared(tmp_path):
         Rinv_grid=np.eye(3, dtype=int)[None],
         translations=np.array([[np.pi, 0.0, 0.0]]),
         trs_allowed=True, nk_tot=2, nk_red=2,
+        active_symmetry_rows=np.array([0]), qe_symmetry_binding=None,
     )
     report.environment(wfn=wfn, lines=("Output writer  : bounded owner gather",))
     report.pathways(("Velocity       : p + i[r, V_NL]",))

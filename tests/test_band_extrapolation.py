@@ -1199,12 +1199,12 @@ def test_mask_with_a_leading_nspin_axis_gives_the_same_bracketed_sum(brackets):
     # DEFAULT path observable.  Both arms must fail at base and pass here.
     # kgrid must multiply out to nk -- the gw_conv FFI checks it.
     op = _operands(mesh, nk=16, nb=nb)
-    two_d = _run_tau(mesh, op, brackets, merged_x=True, kgrid=(4, 2, 2))
+    two_d = _run_tau(mesh, op, brackets, kgrid=(4, 2, 2))
 
     op3 = dict(op)
     op3['mask_A'] = jnp.reshape(op['mask_A'], (1,) + op['mask_A'].shape)
     assert op3['mask_A'].ndim == 3
-    three_d = _run_tau(mesh, op3, brackets, merged_x=True, kgrid=(4, 2, 2))
+    three_d = _run_tau(mesh, op3, brackets, kgrid=(4, 2, 2))
 
     assert two_d.shape == three_d.shape, (
         f"a leading nspin axis on the mask changed the output SHAPE: "

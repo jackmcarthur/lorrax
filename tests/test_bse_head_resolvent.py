@@ -516,6 +516,10 @@ def _dims_from_payload(data) -> Dims:
                 int(data["V_q0"].shape[0]))
 
 
+@pytest.mark.skipif(
+    jax.device_count() < 4,
+    reason=("needs >=4 JAX devices for the real gnppm ladder payload; its "
+            "restart construction exhausts the one-A100 unit-test process"))
 def test_conditioning_on_the_real_gnppm_ladder_payload(gnppm_session, mesh):
     """The same walk on a REAL restart payload — the production operator.
 

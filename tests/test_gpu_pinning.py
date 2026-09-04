@@ -204,7 +204,8 @@ def test_the_controller_does_not_narrow_what_the_workers_inherit(tmp_path):
     # file into the checkout to get that would mutate the source tree from
     # inside a test.  ``harness`` comes along because the conftest imports
     # it by path.
-    for name in ("conftest.py", "harness.py"):
+    for name in ("conftest.py", "fast_gate.py", "harness.py",
+                 "known_failure_ledger.py", "KNOWN_FAILURES.md"):
         (tmp_path / name).write_text(
             (harness.REPO_ROOT / "tests" / name).read_text())
     # EACH WORKER REPORTS THROUGH A FILE, not through stdout.  Under xdist a

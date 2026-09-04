@@ -255,13 +255,6 @@ def test_fit_scissor_refuses_a_zero_weight():
                     k_weights=w)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="fit_scissor still accepts the energy arrays positionally: "
-           "src/gw/sc_iteration.py passes them that way and that file is "
-           "held by another workstream.  Move the '*' to the front of "
-           "fit_scissor's parameter list and fix that call site together, "
-           "then delete this marker.")
 def test_fit_scissor_energy_arrays_cannot_be_passed_positionally():
     """A swap of the two energy arrays must be a TypeError, not a fit.
 

@@ -58,6 +58,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import jax
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from harness import (          # noqa: E402
@@ -70,6 +71,12 @@ from harness import (          # noqa: E402
 )
 
 SI_DIR = REG / "si_cohsex_debug"
+
+_NEEDS_P4_E2E_MEMORY = pytest.mark.skipif(
+    jax.device_count() < 4,
+    reason=("needs >=4 JAX devices: the full regression fixture exhausts "
+            "one A100 during a 9.84-10.68 GiB allocation"),
+)
 
 #: Cross-machine tolerance for the FRONTERA-FROZEN Tier-1 pins, in eV.
 #:
@@ -193,6 +200,7 @@ def test_gw_jax_matches_reference(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.regression
+@_NEEDS_P4_E2E_MEMORY
 def test_si_production_matches_frozen_reference(si_session):
     """Si production deck vs its own frozen output — 'did the code change?'.
 
@@ -250,6 +258,7 @@ _BGW_STAR_SPREAD_MAX_MEV = 5.0
 
 
 @pytest.mark.regression
+@_NEEDS_P4_E2E_MEMORY
 def test_si_production_matches_berkeleygw(si_session):
     """Si production deck vs literal BerkeleyGW columns — THE external anchor.
 
@@ -317,6 +326,7 @@ _SI_FAST_REF = SI_DIR / "eqp_si_fast_ref.dat"
 
 
 @pytest.mark.regression
+@_NEEDS_P4_E2E_MEMORY
 @pytest.mark.skipif(
     not _SI_FAST_REF.exists(),
     reason=(
@@ -377,6 +387,7 @@ _HBN_SKIP_REASON = (
 
 
 @pytest.mark.regression
+@_NEEDS_P4_E2E_MEMORY
 @pytest.mark.skipif(not _HBN_WFN.exists(), reason=_HBN_SKIP_REASON)
 def test_hbn_matches_frozen_reference(hbn_session):
     """hBN non-cubic deck vs its own frozen output.  NOT a BerkeleyGW anchor.
@@ -420,6 +431,7 @@ _HBN_MCAVG_MIN_MAE_MEV = 5.0
 
 
 @pytest.mark.regression
+@_NEEDS_P4_E2E_MEMORY
 @pytest.mark.skipif(not _HBN_WFN.exists(), reason=_HBN_SKIP_REASON)
 def test_hbn_mc_average_vcoul_body_moves_sigma(hbn_session,
                                                hbn_mcavg_false_session):
@@ -518,6 +530,7 @@ def test_gnppm_matches_reference(gnppm_session):
 
 
 @pytest.mark.regression
+@_NEEDS_P4_E2E_MEMORY
 def test_bispinor_gnppm_matches_reference(bispinor_session):
     """Bispinor GN-PPM frozen gate (Σ^B folded into sigX).
 

@@ -1,100 +1,17 @@
-"""The crossing-rule cost law is sub-linear in dynamic range.
+"""The patched dynamic-Sigma frequency grid and its uncovered-hole guard.
 
-The incumbent monolithic core paid n = 87·f_max + 10 nodes (measured,
-``runs/Na/02_soc48b_qsgw_mpa/14_semicore_cond_window/rule_cost_scan.out``)
-because one positive damped rule had to resolve the eta-scale crossing
-feature uniformly over the whole ``[ω_lo, ω_hi] × transitions`` product
-set — a Landau-density floor for real-time exponential rules, not a node
-selection defect (``docs/dev/crossing-rule-cost-law.md``).
-
-The clustered decomposition keeps the eta-resolved rule only on the
-crossing shell of each ω cluster, whose bandwidth is set by the cluster
-span and the pole bracket, so the total is set by how many places the
-physics evaluates Σ, never by how far apart they are.  These tests pin
-that law at the PRODUCTION eta and tolerance, on a synthetic Fe-class
-geometry: a valence window plus a semicore cluster 7.7 Ry deep (a 209 eV
-evaluation span), then the same geometry twice as deep.
-
-All offline scalar planning — no GPU, no spatial kernel.
+This module formerly also tested the retired clustered pane planner's
+crossing-cost law.  Production MPA now uses ``gw.sigma_box_plan`` and the
+pane builder no longer has a separate crossing-error control, so those three
+tests were stale assertions about behavior that no shipping route provides.
+The frequency-patch contract remains live and is kept here.
 """
 
-import jax.numpy as jnp
 import numpy as np
 
-from gw.mpa import sigma_windows as SW
-from gw.ppm_windows import _SigmaBranch
-
 RYD = 13.605693122994
-ETA_RY = 0.25 / RYD                  # production sigma_regularization_ev
-CROSSING_TOL = 2.0e-3                # frozen pane-control crossing target
-SECTOR_TOL = 6.5e-4                  # frozen pane-control sector target
-
-
-def _fe_class_plan(depth_ry):
-    """A valence window plus one semicore ω cluster ``depth_ry`` deep."""
-    energies = np.asarray([0.05, 0.25, 0.45, depth_ry - 0.25])
-    omega = np.concatenate([
-        np.linspace(0.0, 0.5, 6),
-        np.asarray([depth_ry - 0.05, depth_ry + 0.05]),
-    ])
-    E_A = jnp.asarray(energies[None, :])
-    branch = _SigmaBranch(
-        "pos_cond", E_A, jnp.ones_like(E_A, dtype=bool), "cond", False,
-        omega, np.arange(omega.size))
-    Omega = jnp.asarray([[[[0.30 - 0.05j]]]])
-    B = jnp.asarray([[[[0.7 + 0.2j]]]])
-    summaries = SW.summarize_sigma_poles(
-        Omega, B, [branch],
-        regularization_width_ry=ETA_RY, edge_factor=1.5)
-    return SW.build_shared_sigma_windows(
-        summaries, [branch],
-        regularization_width_ry=ETA_RY, edge_factor=1.5,
-        target_error=SECTOR_TOL, crossing_target_error=CROSSING_TOL,
-        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
-
-
-def test_fe_class_span_certifies_under_300_nodes_per_rule():
-    """The Fe-class discriminator: every rule in a 209 eV-span plan is
-    certified at the production tolerance with n < 300 nodes — where the
-    monolithic core REFUSED at 500 and needed ~87·f_max ≈ 1300+."""
-    plan, report = _fe_class_plan(7.7)
-    assert plan, "Fe-class plan built no windows"
-    for row in plan:
-        assert row.window.n_tau < 300, (
-            f"{row.window.name}: {row.window.n_tau} nodes")
-        assert row.window.max_error is not None
-        target = (CROSSING_TOL if row.window.name in ("core", "sd_core")
-                  else SECTOR_TOL)
-        assert row.window.max_error <= target
-
-
-def test_fe_class_total_beats_the_linear_law_and_meets_the_budget():
-    """Total tau dispatches land in the 150–250 budget class, against
-    ~700 for the linear law at this span (87·f_max with f_max ≈ ω_max)."""
-    plan, _report = _fe_class_plan(7.7)
-    total = sum(row.window.n_tau for row in plan)
-    linear_law = 87.0 * 7.7 + 10.0
-    assert total < 0.5 * linear_law, (total, linear_law)
-    assert total < 300, total
-
-
-def test_doubling_the_dynamic_range_does_not_grow_the_damped_rules():
-    """Sub-linearity, stated as the scan would state it: moving the
-    semicore cluster twice as deep leaves the eta-resolved (damped) node
-    total EXACTLY unchanged and the full plan within 10%."""
-    shallow_plan, _ = _fe_class_plan(7.7)
-    deep_plan, _ = _fe_class_plan(15.4)
-
-    def damped_total(plan):
-        return sum(row.window.n_tau for row in plan
-                   if row.window.name in ("core", "sd_core"))
-
-    def total(plan):
-        return sum(row.window.n_tau for row in plan)
-
-    assert damped_total(deep_plan) == damped_total(shallow_plan)
-    assert total(deep_plan) <= 1.10 * total(shallow_plan), (
-        total(shallow_plan), total(deep_plan))
+ETA_RY = 0.25 / RYD
+CROSSING_TOL = 2.0e-3
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +23,7 @@ def _sigma_cfg(patches):
     return DynamicSigmaConfig(
         omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.25,
         regularization_ev=0.25, window_edge_factor=1.5,
-        omega_layout="replicated", fermi_reference="vbm",
+        fermi_reference="vbm",
         sigma_at_dft_extrapolate=False, sigma_at_dft_energies=False,
         omega_patches_ev=patches)
 

@@ -588,10 +588,10 @@ def test_uniform_gauge_fingerprint_is_contact_capability_only():
         atom_crys=np.zeros((0, 3), dtype=np.float64),
     )
     ordinary = build_vnl_setup(
-        wfn, pseudos={}, n_q=2, q_max=1.0, soc=False,
+        wfn, pseudos={}, n_q=2, q_max=1.0,
         compute_contact=False, print_fn=lambda *_: None)
     contact = build_vnl_setup(
-        wfn, pseudos={}, n_q=2, q_max=1.0, soc=False,
+        wfn, pseudos={}, n_q=2, q_max=1.0,
         compute_contact=True, print_fn=lambda *_: None)
     assert (
         ordinary.uniform_gauge_fingerprint,

@@ -314,20 +314,20 @@ def test_gather_host_keeps_the_tiled_allgather_arm_for_remote_shards(
 
 
 # ---------------------------------------------------------------------------
-# the OTHER four wrappers: same service, and the tiled=False trio is gone
+# the one other surviving wrapper: same service; the direct-import sites need
+# no wrapper-delegation test
 # ---------------------------------------------------------------------------
 _WRAPPERS = [
     ("bse.exciton_bands", "_gather_host"),
     ("bse.vq_interp", "_to_host"),
-    ("bse.bse_davidson_helpers", "_gather_to_host"),
-    ("bse.davidson_absorption", "_gather_to_host"),
-    ("solvers.davidson", "_to_host"),
 ]
 
 
 @pytest.mark.parametrize("modname,fname", _WRAPPERS)
 def test_every_hand_rolled_gather_wrapper_delegates(monkeypatch, modname, fname):
-    """Five wrappers hand-rolled this; three of them used
+    """The surviving wrappers delegate to the one collective owner.
+
+    Five wrappers once hand-rolled this; three of them used
     ``process_allgather(tiled=False)`` and branched on ``process_count()``
     instead of ``is_fully_addressable``.
 
@@ -337,7 +337,9 @@ def test_every_hand_rolled_gather_wrapper_delegates(monkeypatch, modname, fname)
     ``eigvecs``).  Three of the five also cited
     ``common.collectives.gather_to_host`` as the pattern they mirrored, but
     that one uses ``tiled=True``, so the citation was wrong too.  One
-    implementation, one branch, one explanation.
+    implementation, one branch, one explanation.  The three deleted wrappers
+    now import ``gather_to_host`` directly and therefore have no adapter left
+    for this parametrized test to exercise.
     """
     import importlib
 

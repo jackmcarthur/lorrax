@@ -423,7 +423,7 @@ def main(argv=None):
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
-	material_class = _infer_material_class(wfn)
+	material_class = infer_material_class(wfn.occs)
 	config = resolve_mpa_sampling_alpha(
 		config, material_class, print_fn=report.progress)
 	validate_material_inputs(config, material_class)
