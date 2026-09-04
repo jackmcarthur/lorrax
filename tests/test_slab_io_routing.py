@@ -258,6 +258,109 @@ def test_cpp_no_longer_carries_a_second_stripe_default():
     assert "stripe_policy_unit(ctx->world_size)" in src
 
 
+def test_large_one_stripe_read_warns_once_without_debug(
+        monkeypatch, capsys):
+    import file_io._slab_io_ffi as slab
+
+    slab._READ_LAYOUT_ANNOUNCED.clear()
+    monkeypatch.setattr(slab, "_rank0", lambda: True)
+    monkeypatch.setattr(slab, "debug_print_enabled", lambda: False)
+    monkeypatch.setattr(slab.os.path, "getsize", lambda _path: 48_000_000_000)
+    monkeypatch.setattr(slab.os.path, "realpath", lambda path: path)
+    monkeypatch.setattr(slab, "file_stripe_layout", lambda _path: (1, 1 << 20))
+    monkeypatch.setattr(slab.jax, "process_count", lambda: 36)
+
+    slab._announce_read_layout("/bounded/restart.h5")
+    slab._announce_read_layout("/bounded/restart.h5")
+    lines = capsys.readouterr().out.splitlines()
+
+    assert len(lines) == 1
+    assert "bytes=48000000000" in lines[0]
+    assert "stripe_count=1" in lines[0]
+    assert "cb_nodes=1/36" in lines[0]
+    assert "WARNING: one-stripe inode" in lines[0]
+
+
+def test_small_read_layout_stays_quiet_without_debug(monkeypatch, capsys):
+    import file_io._slab_io_ffi as slab
+
+    slab._READ_LAYOUT_ANNOUNCED.clear()
+    monkeypatch.setattr(slab, "_rank0", lambda: True)
+    monkeypatch.setattr(slab, "debug_print_enabled", lambda: False)
+    monkeypatch.setattr(slab.os.path, "getsize", lambda _path: 1024)
+    monkeypatch.setattr(
+        slab, "file_stripe_layout",
+        lambda _path: pytest.fail("small non-debug read should not run lfs"))
+
+    slab._announce_read_layout("/bounded/small.h5")
+    assert capsys.readouterr().out == ""
+
+
+def test_large_read_layout_is_rank_zero_only(monkeypatch, capsys):
+    import file_io._slab_io_ffi as slab
+
+    slab._READ_LAYOUT_ANNOUNCED.clear()
+    monkeypatch.setattr(slab, "_rank0", lambda: False)
+    monkeypatch.setattr(
+        slab.os.path, "getsize",
+        lambda _path: pytest.fail("non-root must not stat the shared inode"))
+    monkeypatch.setattr(
+        slab, "file_stripe_layout",
+        lambda _path: pytest.fail("non-root must not invoke lfs"))
+
+    slab._announce_read_layout("/bounded/large.h5")
+    assert capsys.readouterr().out == ""
+
+
+def test_large_read_reports_unknown_layout(monkeypatch, capsys):
+    import file_io._slab_io_ffi as slab
+
+    slab._READ_LAYOUT_ANNOUNCED.clear()
+    monkeypatch.setattr(slab, "_rank0", lambda: True)
+    monkeypatch.setattr(slab, "debug_print_enabled", lambda: False)
+    monkeypatch.setattr(slab.os.path, "getsize", lambda _path: 2 << 30)
+    monkeypatch.setattr(slab.os.path, "realpath", lambda path: path)
+    monkeypatch.setattr(slab, "file_stripe_layout", lambda _path: None)
+
+    slab._announce_read_layout("/bounded/large.h5")
+    line = capsys.readouterr().out
+    assert "bytes=2147483648" in line
+    assert "stripe layout=UNKNOWN" in line
+    assert "cannot be predicted" in line
+
+
+def test_large_read_progress_heartbeats_until_completion(
+        monkeypatch, capsys):
+    import time
+    import file_io._slab_io_ffi as slab
+
+    monkeypatch.setattr(slab, "_rank0", lambda: True)
+    monkeypatch.setattr(slab.os.path, "getsize", lambda _path: 2 << 30)
+    monkeypatch.setattr(slab, "_READ_HEARTBEAT_SECONDS", 0.01)
+
+    with slab._large_read_progress(
+            "/bounded/restart.h5", "V_qmunu",
+            global_bytes=4096, local_bytes=1024):
+        time.sleep(0.025)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("  [SlabIO.read] START restart.h5:V_qmunu")
+    assert any("PROGRESS restart.h5:V_qmunu" in line for line in lines)
+    assert lines[-1].startswith(
+        "  [SlabIO.read] COMPLETE restart.h5:V_qmunu")
+
+
+def test_large_read_progress_is_quiet_for_small_files(monkeypatch, capsys):
+    import file_io._slab_io_ffi as slab
+
+    monkeypatch.setattr(slab, "_rank0", lambda: True)
+    monkeypatch.setattr(slab.os.path, "getsize", lambda _path: 1024)
+    with slab._large_read_progress(
+            "/bounded/small.h5", "x", global_bytes=8, local_bytes=8):
+        pass
+    assert capsys.readouterr().out == ""
+
+
 def test_cpp_stripe_policy_transcribes_the_python_one():
     """Compile the two extracted C++ policy functions and diff them
     against `_stripe_policy` over 0..4100 ranks.

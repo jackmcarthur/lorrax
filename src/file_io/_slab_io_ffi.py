@@ -31,6 +31,9 @@ from __future__ import annotations
 
 import functools
 import os
+import threading
+import time
+from contextlib import contextmanager
 from typing import Sequence
 
 import jax
@@ -133,6 +136,13 @@ _STRIPE_COUNT_MAX = 128
 
 _STRIPE_UNIT_MIN = 1 << 20
 _STRIPE_UNIT_MAX = 4 << 20
+
+# A multi-GiB read is operationally expensive enough that its physical inode
+# layout belongs in the ordinary run record, not behind debug mode.  Bulk Bi's
+# 48.1-GB one-stripe restart took 380 s at P=36 while the log was silent.
+_LARGE_READ_LAYOUT_BYTES = 1 << 30
+_READ_HEARTBEAT_SECONDS = 60.0
+_READ_LAYOUT_ANNOUNCED: set[str] = set()
 
 
 #: The boolean env grammar, ONE copy.  Mirrors the C++ writer's
@@ -385,7 +395,10 @@ def file_stripe_layout(path: str) -> tuple[int, int] | None:
         import subprocess
         out = subprocess.run(
             ["lfs", "getstripe", "-c", "-S", str(path)],
-            capture_output=True, text=True, timeout=10, check=False)
+            # This is an observability probe before the collective open, not
+            # part of the read.  A sick metadata service must not leave every
+            # peer waiting ten seconds for rank 0 to diagnose it.
+            capture_output=True, text=True, timeout=2, check=False)
         if out.returncode != 0:
             return None
         nums = [int(tok) for tok in out.stdout.split() if tok.isdigit()]
@@ -393,6 +406,95 @@ def file_stripe_layout(path: str) -> tuple[int, int] | None:
         return (nums[0], nums[1]) if len(nums) >= 2 else None
     except Exception:
         return None
+
+
+def _announce_read_layout(path: str) -> None:
+    """Report a large input's actual Lustre layout once per process/path."""
+    if not _rank0():
+        return
+    canonical = os.path.realpath(os.path.abspath(path))
+    if canonical in _READ_LAYOUT_ANNOUNCED:
+        return
+    try:
+        nbytes = int(os.path.getsize(path))
+    except OSError:
+        nbytes = -1
+    if not debug_print_enabled() and nbytes < _LARGE_READ_LAYOUT_BYTES:
+        return
+    _READ_LAYOUT_ANNOUNCED.add(canonical)
+    layout = file_stripe_layout(path)
+    if layout is None:
+        print(
+            f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode=r "
+            f"bytes={nbytes if nbytes >= 0 else 'UNKNOWN'} "
+            "file stripe layout=UNKNOWN (lfs unavailable or not Lustre); "
+            "collective read aggregation cannot be predicted",
+            flush=True)
+        return
+    count, unit = layout
+    ranks = int(jax.process_count())
+    cb_nodes = min(int(count), ranks)
+    warning = ""
+    if count == 1 and ranks > 1:
+        warning = (
+            " WARNING: one-stripe inode forces cb_nodes=1 and a single "
+            "read aggregator at every rank count; create the destination "
+            "directory with the intended layout before producing the file "
+            "or make a separately authenticated migrated copy")
+    print(
+        f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode=r "
+        f"bytes={nbytes if nbytes >= 0 else 'UNKNOWN'} "
+        f"file stripe_count={count} stripe_size={unit} B "
+        f"cb_nodes={cb_nodes}/{ranks} (the file's inode, not write policy)."
+        f"{warning}",
+        flush=True)
+
+
+@contextmanager
+def _large_read_progress(path: str, name: str, *, global_bytes: int,
+                         local_bytes: int):
+    """Make a synchronous H5Dread distinguishable from a frozen process."""
+    if not _rank0():
+        yield
+        return
+    try:
+        file_bytes = int(os.path.getsize(path))
+    except OSError:
+        file_bytes = -1
+    if file_bytes < _LARGE_READ_LAYOUT_BYTES:
+        yield
+        return
+
+    started = time.monotonic()
+    stopped = threading.Event()
+    label = f"{os.path.basename(path)}:{name}"
+    print(
+        f"  [SlabIO.read] START {label} global_bytes={int(global_bytes)} "
+        f"local_bytes={int(local_bytes)}",
+        flush=True)
+
+    def heartbeat() -> None:
+        while not stopped.wait(_READ_HEARTBEAT_SECONDS):
+            print(
+                f"  [SlabIO.read] PROGRESS {label} "
+                f"elapsed={time.monotonic() - started:.1f} s; "
+                "collective H5Dread has not returned",
+                flush=True)
+
+    thread = threading.Thread(
+        target=heartbeat, name="lorrax-slabio-read-progress", daemon=True)
+    thread.start()
+    outcome = "FAILED"
+    try:
+        yield
+        outcome = "COMPLETE"
+    finally:
+        stopped.set()
+        thread.join(timeout=1.0)
+        print(
+            f"  [SlabIO.read] {outcome} {label} "
+            f"elapsed={time.monotonic() - started:.1f} s",
+            flush=True)
 
 
 def _replace_inode_for_write(path: str) -> None:
@@ -1726,27 +1828,11 @@ class _FfiBackend(_DatasetGeometry):
                   f"stripe_unit={_su} B (policy; "
                   f"LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)",
                   flush=True)
-        elif mode == "r" and _rank0() and debug_print_enabled():
-            # The read side names its own dominant term, and it is a
-            # DIFFERENT number: a Lustre layout is fixed at inode create, so
-            # on a file LORRAX did not write (every WFN.h5 — pw2bgw creates
-            # it) the policy above is inert and the file's own layout governs
-            # the read.  stripe_count=1 pins cb_nodes=1, i.e. ONE aggregator
-            # at any rank count.  This announcement was hand-rolled in
-            # WfnLoader._ensure_phdf5_ctx, which was the read side's way of
-            # reaching around SlabIO; it belongs where the read handle is
-            # opened.  See file_stripe_layout for the measurement.
-            _lay = file_stripe_layout(path)
-            if _lay is not None:
-                _c, _s = _lay
-                _warn = ("  <-- ONE STRIPE: cb_nodes=1, single-aggregator "
-                         "read at any rank count; `lfs setstripe -c 16 -S 4M`"
-                         " on the deck dir before the file is created, or "
-                         "`lfs migrate` this file" if _c == 1 else "")
-                print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} "
-                      f"mode={mode} file stripe_count={_c} stripe_size={_s} B "
-                      f"(the file's own inode, not the policy){_warn}",
-                      flush=True)
+        elif mode == "r":
+            # Large reads always disclose the actual inode layout.  Small
+            # reads retain the historical debug-only line.  The helper
+            # de-duplicates repeated dataset opens of the same file.
+            _announce_read_layout(path)
         # ONE HDF5 LIBRARY INSTANCE PER OPEN FILE (audit A1; claims/0110).
         # Declared BEFORE the collective open, so a path h5py already
         # holds open in a way that can write is refused by name here
@@ -2354,8 +2440,14 @@ class _FfiBackend(_DatasetGeometry):
         handle_arr = _replicated_i64_vector((ctx_handle, ds_id), mesh)
         offset_arr = _replicated_i64_vector(off, mesh)
         valid_shape_arr = _replicated_i64_vector(vshape, mesh)
-        result = sm(handle_arr, offset_arr, valid_shape_arr)
-        result.block_until_ready()
+        _dtype = jnp.dtype(dtype)
+        _global_bytes = int(np.prod(read_shape, dtype=np.int64)) * _dtype.itemsize
+        _local_bytes = int(np.prod(local_shape, dtype=np.int64)) * _dtype.itemsize
+        with _large_read_progress(
+                self.path, name, global_bytes=_global_bytes,
+                local_bytes=_local_bytes):
+            result = sm(handle_arr, offset_arr, valid_shape_arr)
+            result.block_until_ready()
         return result
 
     # ------------------------------------------------------------------
