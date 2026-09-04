@@ -576,7 +576,10 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_R:    (nk_co, rank, rank), sharded P(None, 'x', 'y') (lattice-R index).
         params:  (a_f, n_f, shift) — for ``newton_inv`` on the eigvals of fH_q.
         f_eps:   (nb, nk_co) f-transformed eigenvalues, replicated.
-        active_R: (nk_co, rank, rank), sharded P(None, 'x', 'y'), or None.
+        active_R_spill: process-local host spill of the active-character
+                   operator, or None.  The caller restores it only after
+                   consuming and deleting ``fH_R`` so the two dense
+                   operators never coexist in device memory.
     """
     if log_fn is None:
         log_fn = lambda *a, **kw: None
@@ -825,33 +828,24 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         active_R = _build_active_R(ctilde_x, ctilde_y)
         active_fft_rel = _relative_from_abs_scale(
             _active_fft_abs_scale(active_R, ctilde_x, ctilde_y))
-        del active_R
+        # The path selector needs both operators mathematically, but not at
+        # the same time: first solve fH(q) and retain only its fitted-state
+        # eigenspaces, then score those states with P_A(q).  Spill P_A here,
+        # before fH_R exists, so a dense operator is never restored beside
+        # another one.  Each process moves only its own matrix-face shards.
+        log_fn(
+            "  [route] dual dense operators: process-local active_R host "
+            "spill; fH eigenspaces and active character evaluated in "
+            "separate path passes")
+        active_R_spill = spill_to_host(active_R)
     else:
-        active_R = None
+        active_R_spill = None
         active_fft_rel = 0.0
 
     fH_R = _build_fH_R(ctilde_x, ctilde_y, f_eps)
     fft_rel = _relative_from_abs_scale(
         _fH_fft_abs_scale(fH_R, ctilde_x, ctilde_y, f_eps))
-    if active_band_range is not None:
-        # Both retained operators fit together, but constructing active_R
-        # while fH_R and the paired coefficient shards remain device-resident
-        # does not: the MoS2-72 local shard is 13.18 GiB.  Spill only this
-        # process's fH_R shards, explicitly delete their device buffers, build
-        # active_R, release the coefficient views, and restore the exact bits.
-        # ``spill_to_host``/``restore_from_host`` are the repository's
-        # zero-collective bounded-live-set seam; no host gather occurs.
-        log_fn(
-            "  [route] dual dense operators: process-local fH_R host spill "
-            "while active_R is built; zero collectives, bit-exact restore")
-        fH_R_spill = spill_to_host(fH_R)
-        active_R = _build_active_R(ctilde_x, ctilde_y)
-        jax.block_until_ready(active_R)
     del ctilde_x, ctilde_y
-    if active_band_range is not None:
-        fH_R = restore_from_host(fH_R_spill)
-        jax.block_until_ready(fH_R)
-        del fH_R_spill
     log_fn(
         f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
         f"round-trip scale-relative max|FFT(IFFT(fH))-fH|="
@@ -902,7 +896,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             "r_vectors": int(_outer_shell.size),
             "locality_wall_seconds": float(_quality_clock() - _quality_t0),
         })
-    return (fH_R, (a_f, n_f, shift), f_eps, active_R)
+    return (fH_R, (a_f, n_f, shift), f_eps, active_R_spill)
 
 
 NEWTON_RESIDUAL_MAX = 1.0e-12
@@ -1589,13 +1583,14 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
 
     _t0 = _perf()                                          # instrument:
     coeffs = ctilde.reshape(nk, states, rank)
-    fH_R, (a_f, n_f, shift), f_eps, active_R = build_fH_R(
+    fH_R, (a_f, n_f, shift), f_eps, active_R_spill = build_fH_R(
         coeffs, enk_sigma, kgrid, mesh_xy,
         a_band_index=a_band_index,
         active_band_range=active_band_range, log_fn=log_fn,
         quality_record_fn=quality_record_fn)
-    jax.block_until_ready((fH_R, f_eps, active_R))         # instrument:
+    jax.block_until_ready((fH_R, f_eps))                   # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
+    use_active = active_R_spill is not None
 
     # The top of the fit window is identically invisible to fH at the k where
     # it sets ``shift``.  Returning that band gives an arbitrary null-space
@@ -1651,7 +1646,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
         return mat + jnp.swapaxes(mat, 1, 2).conj()
 
-    if active_R is None:
+    if not use_active:
         @partial(jax.jit, out_shardings=batch_eig_shard)
         def _kpath_batch(batch_k, fH_R):
             # batch_k: (bs, 3) replicated; fH_R is face-sharded.  The R-only
@@ -1660,16 +1655,27 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             mat = _fourier_matrix(batch_k, fH_R)
             return jax.vmap(jnp.linalg.eigvalsh)(mat)
     else:
+        batch_vec_shard = NamedSharding(
+            mesh_xy, P(('x', 'y'), None, None))
+
+        @partial(
+            jax.jit,
+            out_shardings=(batch_eig_shard, batch_vec_shard))
+        def _fH_kpath_batch(batch_k, fH_R):
+            """Retain only fitted-state eigenspaces before releasing fH_R."""
+            mat = _fourier_matrix(batch_k, fH_R)
+            values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
+            return values[:, :states], vectors[:, :, :states]
+
         @partial(
             jax.jit,
             out_shardings=(batch_eig_shard, batch_eig_shard,
                            batch_scalar_shard, batch_scalar_shard,
                            batch_eig_shard, batch_eig_shard,
                            batch_scalar_shard))
-        def _kpath_batch(batch_k, fH_R, active_R):
-            mat = _fourier_matrix(batch_k, fH_R)
+        def _active_kpath_batch(batch_k, values, vectors, active_R):
+            """Score retained fH eigenspaces after restoring only P_A(R)."""
             active_mat = _fourier_matrix(batch_k, active_R)
-            values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
             (selected_values, selected_scores, score_gap, score_tol,
              cluster_values, cluster_mask,
              min_nonreturned_value) = select_active_eigenpairs(
@@ -1743,6 +1749,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         _t0 = _perf()                                      # instrument:
         lambda_q_list = []
         active_selection_list = []
+        physical_eigenpairs = []
         from common.progress import LoopProgress
         _n_batches = int(nq_padded // batch_size)
         _path_progress = LoopProgress(
@@ -1751,18 +1758,39 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             item_name="k batch", max_updates=min(_n_batches, 12),
             enabled=progress_fn is not None).start()
         for i in range(0, nq_padded, batch_size):
-            if active_R is None:
+            if not use_active:
                 batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R)
                 lambda_q_list.append(batch_eigs)
                 jax.block_until_ready(batch_eigs)
             else:
-                batch_result = _kpath_batch(
-                    wrapped_k[i:i+batch_size], fH_R, active_R)
+                batch_eigenpairs = _fH_kpath_batch(
+                    wrapped_k[i:i+batch_size], fH_R)
+                physical_eigenpairs.append(batch_eigenpairs)
+                jax.block_until_ready(batch_eigenpairs)
+            _path_progress.step()
+        _path_progress.finish()
+        if use_active:
+            # ``Array.delete`` is deliberate: a Python ``del`` would leave
+            # release timing to refcounts and could overlap the 13.18-GiB
+            # fH_R and P_A(R) shards at MoS2-72.  The retained fitted-state
+            # eigenpairs are O(nq*rank*states), not O(nk*rank^2).
+            fH_R.delete()
+            del fH_R
+            active_R = restore_from_host(active_R_spill)
+            jax.block_until_ready(active_R)
+            del active_R_spill
+            log_fn(
+                "  [route] released fH_R before active_R restore; scoring "
+                "retained fitted-state eigenspaces in a second path pass")
+            for i, (values, vectors) in zip(
+                    range(0, nq_padded, batch_size), physical_eigenpairs):
+                batch_result = _active_kpath_batch(
+                    wrapped_k[i:i+batch_size], values, vectors, active_R)
                 lambda_q_list.append(batch_result[0])
                 active_selection_list.append(batch_result[1:])
                 jax.block_until_ready(batch_result)
-            _path_progress.step()
-        _path_progress.finish()
+            active_R.delete()
+            del active_R
         timing.record("ht.kpath_loop", _perf() - _t0,      # instrument:
                       count=len(lambda_q_list))            # instrument:
 
@@ -1794,7 +1822,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # Values are untouched: ``out_shardings`` moves data, it does not
         # compute.
         # Gate: ``tests/test_htransform_kpath_gates.py``.
-        if active_R is None:
+        if not use_active:
             @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
                      out_shardings=(rep, rep))
             def _post_kpath(batches, nq, nb_keep):
@@ -1866,7 +1894,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                         diagnostics)
 
         _t0 = _perf()                                      # instrument:
-        if active_R is None:
+        if not use_active:
             energies_sorted_jax, inverse_residual = _post_kpath(
                 tuple(lambda_q_list), int(nq), int(nb_keep))
         else:
@@ -1984,7 +2012,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             # before returning its lowest interior; without that boundary it
             # energy-orders the whole fitted Hamiltonian.
             n_reference_candidates = (
-                states if active_R is None else n_qp_corrected)
+                states if not use_active else n_qp_corrected)
             candidate = enk_host[
                 :n_reference_candidates, coincident_coarse_indices].T
             coincident_exact = np.sort(candidate, axis=1)[:, :nb_keep]

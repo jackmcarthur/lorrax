@@ -308,8 +308,11 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
     np.testing.assert_allclose(
         result["gamma_exact"], [-1.0, 0.0, 3.0],
         rtol=0.0, atol=2.0e-11)
-    assert "active/guard character selection" in " ".join(lines)
-    assert "path/coarse coincidences: 1 path row" in " ".join(lines)
+    banner = " ".join(lines)
+    assert "process-local active_R host spill" in banner
+    assert "released fH_R before active_R restore" in banner
+    assert "active/guard character selection" in banner
+    assert "path/coarse coincidences: 1 path row" in banner
 
 
 @pytest.mark.parametrize(("first_dft_guard", "must_refuse"), (
