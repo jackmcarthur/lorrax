@@ -31,11 +31,32 @@ Z-factor enters the iteration; `eqp1` is written as the BerkeleyGW-style
 linearized output only. After convergence `eqp1` and `eqp0` agree to about
 1 meV, which is a cheap check that the fixed point is real.
 
-## A deck that converged
+## Production requirements (owner rulings, 2026-09-03 evening)
+
+The deck below is the *diagnostic* deck the convergence study used. It is
+not a production setting, and band structures drawn from it are not
+interpretable. A production self-consistent run must satisfy:
+
+- at least **20 conduction bands in the Σ window** (`ncond >= 20`); the loop's
+  partition decides which of them are protected;
+- **centroids ≥ 10 × `number_bands`** (80 bands → at least 800), the nearest
+  orbit-closed count at or above that; 192 or 504 centroids are diagnostic
+  only;
+- the ζ/ISDF fit built on the Gram matrix of **all bands that enter Σ**
+  (`zeta_nband = number_bands`), not a 16–20-band window; if the strict rank
+  ceiling refuses, the owner decides `zeta_rcond`, the run does not drop to a
+  smaller basis;
+- band-structure interpolation (htransform) fitting the whole WFN band set and
+  returning at least **16 corrected conduction bands**, guard bands ≥ 8, with a
+  QE `bands` calculation along the same path as the accuracy certificate; four
+  returned conduction bands destroy the interpolant.
+
+## The diagnostic deck the study converged on
 
 These are the live keys of the Si run behind the band structures in
-`reports/si_bands_dft_g0w0_qsgw_2026-09-03` (sandbox). Keys marked *deck* are
-not defaults and must be chosen per material.
+`reports/si_bands_dft_g0w0_qsgw_2026-09-03` (sandbox, superseded by the
+production reruns of 2026-09-03 evening). Keys marked *deck* are not defaults
+and must be chosen per material.
 
 ```ini
 qp_solver = self_consistent
@@ -58,7 +79,7 @@ restart = true                   # deck — see pitfall 7
 zeta_rcond = 1e-10               # deck; production default 1e-8
 ```
 
-with 504 ISDF centroids for 80 bands (about 6 centroids per band).
+with 504 ISDF centroids for 80 bands (about 6 per band; a production run needs 10 per band, see above).
 
 ## Pitfalls, in the order they bite
 
