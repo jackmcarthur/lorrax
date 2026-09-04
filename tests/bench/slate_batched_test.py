@@ -9,9 +9,8 @@ the X axis and each matrix is distributed across the Y axis.  Factor via
 
 Usage::
 
-    LORRAX_NGPU=4 LORRAX_SELECT_GPU=1 LORRAX_MPI_TYPE=cray_shasta \\
-        XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \\
-        bash src/ffi/common/cpp/run_shifter.sh \\
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
         python3 -u tests/bench/slate_batched_test.py \\
         --nbatch 8 -n 128 --mesh 2x2 --dtype c128
 """

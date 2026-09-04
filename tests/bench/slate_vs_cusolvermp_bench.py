@@ -1,14 +1,16 @@
 """SLATE heev vs cuSOLVERMp syevd timing — 4 GPUs / 2x2 grid, complex128.
 
-Runs ONE backend per invocation (each needs different process affinity):
+Runs one backend per invocation, always with one process per GPU:
 
-    # cuSOLVERMp (default, all GPUs visible per process)
-    LORRAX_NGPU=4 bash src/ffi/common/cpp/run_shifter.sh \\
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+
+    # cuSOLVERMp
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
         python3 -u tests/bench/slate_vs_cusolvermp_bench.py \\
         --backend cusolvermp -n 2048 --repeats 5
 
-    # SLATE (needs 1-GPU-per-process via LORRAX_SELECT_GPU=1)
-    LORRAX_NGPU=4 LORRAX_SELECT_GPU=1 bash src/ffi/common/cpp/run_shifter.sh \\
+    # SLATE
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
         python3 -u tests/bench/slate_vs_cusolvermp_bench.py \\
         --backend slate -n 2048 --repeats 5
 
@@ -42,9 +44,8 @@ def _init_distributed(backend: str) -> None:
     world = int(os.environ.get("SLURM_NTASKS", "1"))
     if world > 1:
         if backend == "slate":
-            # Each process has CUDA_VISIBLE_DEVICES=$SLURM_LOCALID via
-            # run_shifter.sh select_gpu.sh — tell JAX it owns exactly 1
-            # local GPU (at index 0).
+            # The launcher gives each rank one visible GPU. Tell JAX it owns
+            # exactly that local device (index 0).
             jax.distributed.initialize(local_device_ids=[0])
         else:
             jax.distributed.initialize()

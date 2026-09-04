@@ -11,7 +11,9 @@ Mirrors the matvec/precond/init setup of ``tests/bench/test_davidson_bse.py``
 
 Usage:
 
-    LORRAX_NGPU=4 lxrun python3 -u -m bse.davidson_absorption \\
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u -m bse.davidson_absorption \\
         -i cohsex.in --n-val 4 --n-cond 4 --n-occ 8 \\
         --eqp <bgw>/eqp.dat --dipole dipole_p_only.h5 \\
         --V-cell 270.107 --n-eig 20 --max-iter 80 \\

@@ -29,13 +29,16 @@ On Perlmutter, launch from a data directory with both choices explicit:
 ```bash
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CHECKOUT=/absolute/path/to/checkout
-lx run "$LORRAX_CHECKOUT/tools/require_jax09.py"
+lx run -- env PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 "$LORRAX_CHECKOUT/tools/require_jax09.py"
 ```
 
-A source overlay must prepend the checkout's `src` and every required
-`services/*/src` directory inside the compute payload.  JAX 0.9 does not by
-itself certify a native FFI artifact: the CUDA major, registered handler set,
-dependency closure, and source provenance remain separate launch facts.
+Put the checkout's top-level `src` on the compute payload path, not only in the
+outer shell. Current source derives every first-party service root from package
+metadata and refuses a mixed closure before JAX; do not duplicate a manual
+`services/*/src` list. JAX 0.9 does not by itself certify a native FFI artifact:
+the CUDA major, registered handler set, dependency closure, and source
+provenance remain separate launch facts.
 
 Historical result documents may name JAX 0.5 or 0.7 because those versions
 were actually used for those measurements.  They are evidence records, not

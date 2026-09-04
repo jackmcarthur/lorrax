@@ -39,9 +39,15 @@ that is either input-file- or clarg-driven.
 
 Usage
 -----
-    lxrun python3 -u -m psp.run_sternheimer -i sternheimer.in
-    lxrun python3 -u -m psp.run_sternheimer \\
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u -m psp.run_sternheimer -i sternheimer.in
+    lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u -m psp.run_sternheimer \\
         --wfn WFN.h5 --pseudo_dir . --n-cond-bands 20 --iq-list 0 1
+
+This driver is currently single-GPU; this diagnostic geometry is not P=4
+landing evidence for other drivers.
 """
 from __future__ import annotations
 

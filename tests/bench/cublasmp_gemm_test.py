@@ -1,8 +1,9 @@
 """Correctness test for cuBLASMp-backed batched_distributed_gemm.
 
 Usage::
-    lxalloc
-    LORRAX_MPI_TYPE=pmix lxrun python3 -u tests/bench/cublasmp_gemm_test.py
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u tests/bench/cublasmp_gemm_test.py
 """
 from __future__ import annotations
 

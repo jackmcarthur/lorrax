@@ -115,8 +115,12 @@ In `/pscratch/sd/j/jackm/lorrax_sandbox/runs/Si/04_si_4x4x4_bse/C_lorrax_bse_bgw
 ## Recommended usage
 
 ```bash
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/lorrax
+SOURCE_PATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # Run BSE solve, get eigenvectors.h5
-LORRAX_NGPU=4 lxrun python3 -u -m bse.bse_jax \
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m bse.bse_jax \
     -i cohsex_bse.in --eqp <bgw_eqp.dat> --n-occ <Nocc> \
     --bse --lanczos --tda \
     --n-val <Nv> --n-cond <Nc> --n-reorth -1 \
@@ -124,16 +128,21 @@ LORRAX_NGPU=4 lxrun python3 -u -m bse.bse_jax \
     --px 2 --py 2 --write-eigs <Neig>
 
 # Absorption — Haydock (best fidelity vs BGW; no eigvecs needed)
-LORRAX_NGPU=4 lxrun python3 -u -m bse.absorption_haydock \
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m bse.absorption_haydock \
     -i cohsex_bse.in --n-val <Nv> --n-cond <Nc> --n-occ <Nocc> \
     --eqp <bgw_eqp.dat> --dipole dipole.h5 \
     --V-cell <V_bohr3> --n-iter 200 --eta-eV 0.15 --no-eps1
 
 # Absorption — eigenvector route (per-state oscillator strengths to BGW eigenvalues.dat format)
-LORRAX_NGPU=1 lxrun python3 -u -m bse.absorption_eigvecs \
+lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m bse.absorption_eigvecs \
     --eigenvectors eigenvectors.h5 --dipole dipole.h5 \
     --n-occ <Nocc> --V-cell <V_bohr3> --eta-eV 0.15 --no-eps1
 ```
+
+The payload-side source path is load-bearing on Perlmutter; use the runtime
+source-closure receipt rather than the `lx` checkout banner as import evidence.
 
 ## Known caveats / next steps if needed
 

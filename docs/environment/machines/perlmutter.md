@@ -33,7 +33,10 @@ has not been exercised recently.*
 calling it twice never double-allocates.
 
 ```bash
-lx run python3 -u -m gw.gw_jax -i cohsex.in   # one step on a compute node
+export LORRAX_CHECKOUT=$PWD
+SOURCE_PATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
+lx run -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m gw.gw_jax -i cohsex.in       # one step on a compute node
 lx test                                       # the default gate, on a compute node, in cwd
 lx test --census                              # the full census (see docs/contributing.md)
 lx status                                     # who is running where
@@ -54,16 +57,17 @@ actually inherit.
 Use one task/rank per GPU. Keep `lx`'s default rank count or set it explicitly:
 
 ```bash
-lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
 `-N 1 -G 4 -n 1` violates the process/collective contract and is not P=4
 evidence. `lx shell` is one task/one GPU. Report GPU count, rank count, and
 runtime mesh.
 
-> ### Source selection is explicit and attested
+> ### Source intent and import selection are separate
 >
-> `lx` resolves source in this order:
+> `lx` resolves and announces the intended source in this order:
 > `LORRAX_CHECKOUT`, then the checkout `cwd` sits inside, then the base
 > module's tree, where "a checkout" means a directory holding both
 > `src/gw/__init__.py` and `tests/`. `lx` announces which one it picked on
@@ -77,12 +81,16 @@ runtime mesh.
 >
 > A data directory is not a checkout, so production run directories must set
 > `LORRAX_CHECKOUT`. `LX_BASE_MODULE` chooses the machine environment; it does
-> not choose the source. Startup refuses a requested checkout that disagrees
-> with the imported core or first-party services.
+> not choose the source. The deployed container can replace an outer-shell
+> `PYTHONPATH`, so the banner alone is not an import seal: pass
+> `PYTHONPATH="$LORRAX_CHECKOUT/src..."` on the payload side of `lx run`, as in
+> the examples above. Current runtime then derives every first-party service
+> root from package metadata and refuses a mixed checkout before JAX.
 >
 > `lx doctor` prints the base environment, and every run records its actual
-> Python source and native-library origins. `lx test` uses the current checkout
-> when `cwd` contains `tests/`.
+> Python source and native-library origins. Until an `lx test` canary proves its
+> announced and imported checkouts agree, feature-checkout tests use `lx run`
+> with the same payload-side source path.
 >
 > Current source requires the 0.9 series for both JAX and JAXLIB.  Select the
 > deployed bare-host CUDA-13 lane and pin the source checkout independently:
@@ -90,6 +98,8 @@ runtime mesh.
 > ```bash
 > export LX_BASE_MODULE=lorrax_A
 > export LORRAX_CHECKOUT=/path/to/your/checkout
+> lx run -- env PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}" \
+>   python3 "$LORRAX_CHECKOUT/tools/require_jax09.py"
 > ```
 >
 > `tools/require_jax09.py` must run before the first driver import.  The driver
@@ -208,10 +218,11 @@ lx run --cpu -N 2 -n 4 -- bash -c '
 '
 ```
 
-Both pins are required. `LORRAX_CHECKOUT` prevents `lx` from falling back to
-the base module's source when invoked from a data directory, while
-`CPU_JAX_VENV` selects the tested CPU JAX environment inside the rank shell.
-The tracked preflight checks JAX and jaxlib before either is imported.
+All three selections are required: `LORRAX_CHECKOUT` declares the intended
+source, the explicit `PYTHONPATH` selects it for Python, and `CPU_JAX_VENV`
+selects the tested CPU JAX environment inside the rank shell. The tracked
+preflight checks JAX and jaxlib before either is imported; current runtime
+then attests the full first-party source closure.
 
 The source inside the `lx` rank shell is the load-bearing one.  It sets the
 four-part Cray contract before JAX import:

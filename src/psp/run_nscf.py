@@ -15,8 +15,11 @@ Three modes of operation:
      Requires the WFN.h5 to have bands exceeding the number of valence electrons.
 
 Usage:
-    lxrun python3 -u -m psp.run_nscf -i nscf.in
-    lxrun python3 -u -m psp.run_nscf --save QE.save --nbnd 100 --nk 4 4 4
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u -m psp.run_nscf -i nscf.in
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u -m psp.run_nscf --save QE.save --nbnd 100 --nk 4 4 4
 """
 from __future__ import annotations
 

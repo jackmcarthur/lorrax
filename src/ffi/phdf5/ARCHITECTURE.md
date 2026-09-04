@@ -329,12 +329,17 @@ matter are collective transfers + the stripe hints (scorecard AI:
 | `phdf5_loop_test` | overlap / pipelining sanity | `common.phdf5_loop_test` |
 | `pytest -q` (top-level) | 14 LORRAX-wide correctness tests; passes throughout | — |
 
-Run locally with `lxalloc` + `lxrun` (module's defaults cover the
-full stack env):
+Run the maintained benchmark from a writable run directory through `lx`; the
+site descriptor and runtime own the stack environment:
 
 ```bash
-lxalloc
-lxrun python3 -u -m common.phdf5_multi_offset_test
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/lorrax
+SOURCE_PATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p "$PWD/slabio_smoke"
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u "$LORRAX_CHECKOUT/tests/bench/slabio_scaling_bench.py" \
+  --dir "$PWD/slabio_smoke" --phase both --tag smoke \
+  --rows 128 --cols 128 --configs '[{"name":"default"}]' --verify
 ```
 
 ------------------------------------------------------------------------

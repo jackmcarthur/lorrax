@@ -24,8 +24,8 @@
 #   module load cray-hdf5-parallel cray-mpich
 #   src/ffi/cpp/stage/phdf5_stage_cray.sh
 #
-# Then use with `LORRAX_PHDF5_MPI_STACK=mpich` in run_shifter.sh
-# (the module's `lxrun` uses this stack by default).
+# Then select the staged capability in the site descriptor. Perlmutter `lx`
+# consumes that descriptor; routine run wrappers do not repeat the stack flag.
 
 set -euo pipefail
 

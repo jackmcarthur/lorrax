@@ -4,7 +4,7 @@ This is a benchmark/profiling driver, not a correctness unit test.  It lives
 next to the cuSOLVERMp FFI because the goal is to produce Nsight traces that
 transfer directly to the in-situ GWJAX calls:
 
-* one process per GPU under ``lxrun``;
+* one process per GPU under ``lx run``;
 * a 2x2 JAX mesh over 4 GPUs;
 * batched matrices sharded ``P(None, 'x', 'y')``;
 * default MoS2 3x3-ish shape: ``nq=9, n=640, dtype=complex128``;
@@ -13,9 +13,9 @@ transfer directly to the in-situ GWJAX calls:
 Typical Perlmutter usage from this repository:
 
 ```
-export SLURM_JOBID=<one-node allocation>
-cd /global/homes/j/jackm/scratchperl/lorrax_sandbox/sources/lorrax_D
-LORRAX_NGPU=4 lxrun python3 -u tests/bench/profile_batched.py \\
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+  python3 -u tests/bench/profile_batched.py \\
     --mode potrf --nq 9 -n 640 --iters 8 --warmup 2
 ```
 
@@ -23,7 +23,8 @@ For Nsight Systems, use ``--cuda-profiler-api`` and wrap the command:
 
 ```
 export OUT=/path/to/nsys
-LORRAX_NGPU=4 lxrun bash -lc 'nsys profile --trace=cuda,nvtx,osrt \\
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+  bash -lc 'nsys profile --trace=cuda,nvtx,osrt \\
     --capture-range=cudaProfilerApi --capture-range-end=stop \\
     --force-overwrite=true -o "$OUT/potrf_rank${SLURM_PROCID}" \\
     python3 -u tests/bench/profile_batched.py \\

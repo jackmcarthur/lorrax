@@ -1083,15 +1083,14 @@ replicated global pivot.
 * **Re-deriving a mesh identity by hand.** Use `mesh_key(mesh)`. `id(mesh)`
   as a cache key is only safe when the cached value retains the mesh, and
   the case where it does not is exactly where somebody re-spells it.
-* **Confusing an installed package with LORRAX's source-checkout
-  bootstrap.** A normal consumer installs `lxkit` and `distrib_la` and then
-  imports the latter directly; it must not import `ffi._services` or edit
-  `sys.path`. Only an uninstalled LORRAX checkout needs the transitional
-  `ffi._services.ensure_on_path()` call, because `lx` sets container
-  `PYTHONPATH` to `<checkout>/src` and does not install `services/*/src`.
-  `tests/test_service_path_bootstrap.py` covers that LORRAX integration
-  seam, while the package's own import-isolation suite proves the installed
-  service has no upward dependency.
+* **Confusing an installed package with LORRAX's source closure.** A normal
+  consumer installs `lxkit` and `distrib_la` and imports the latter directly;
+  it must not import a LORRAX path helper or edit `sys.path`. An uninstalled
+  LORRAX checkout puts only `<checkout>/src` on the compute payload path; the
+  runtime derives service roots from package metadata and refuses any service
+  outside that checkout before JAX. `tests/test_service_path_bootstrap.py`
+  covers that integration seam, while the package's own import-isolation suite
+  proves the installed service has no upward dependency.
 * **Assuming the two platform `.so`s are independent.** They share
   `libslate.so.2` / `libblaspp.so.2` by SONAME. Opening the host library
   first gives every CUDA SLATE handler a `blas::get_device_count()` of 0

@@ -41,12 +41,17 @@ reference dir with `eqp.dat`, `vcoul`, `absorption_eh.dat`,
 `eigenvalues.dat`. See `runs/Si/04_si_4x4x4_bse/` for examples.
 
 ```bash
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/lorrax
+SOURCE_PATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # 1) bare-p dipole (matches BGW use_momentum)
-LORRAX_NGPU=1 lxrun python3 -u -m psp.get_dipole_mtxels \
+lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m psp.get_dipole_mtxels \
     -i cohsex.in --skip-vnl --out dipole_p_only.h5
 
 # 2a) Haydock route — apples-to-apples vs BGW Haydock; fast peak convergence
-LORRAX_NGPU=4 lxrun python3 -u -m bse.absorption_haydock \
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m bse.absorption_haydock \
     -i cohsex.in --n-val 4 --n-cond 4 --n-occ 8 \
     --eqp <bgw_run>/eqp.dat --dipole dipole_p_only.h5 \
     --V-cell <V_bohr3> --n-iter 100 --eta-eV 0.15 --no-eps1 \
@@ -55,16 +60,22 @@ LORRAX_NGPU=4 lxrun python3 -u -m bse.absorption_haydock \
 # 2b) Eigenvector route — only if you need per-state oscillators.
 #     Peak height converges SLOWLY with n_eig (n=100 ≈ 18% of full peak).
 #     For fair vs-BGW comparison: use eigvals_to_eps2.py with matched n_max.
-LORRAX_NGPU=4 lxrun python3 -u -m bse.bse_jax \
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m bse.bse_jax \
     -i cohsex.in --eqp <bgw_run>/eqp.dat \
     --bse --lanczos --tda \
     --n-val 4 --n-cond 4 --n-occ 8 --n-reorth -1 \
     --max-lanczos-iter 2400 --n-eig 100 --px 2 --py 2 --write-eigs 100
-LORRAX_NGPU=1 lxrun python3 -u -m bse.absorption_eigvecs \
+lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u -m bse.absorption_eigvecs \
     --eigenvectors eigenvectors.h5 --dipole dipole_p_only.h5 \
     --n-occ 8 --V-cell <V_bohr3> --eta-eV 0.15 --no-eps1 \
     --out-prefix absorption_eigvec
 ```
+
+The source path is on the payload side because the Perlmutter container
+replaces an outer `PYTHONPATH`; the runtime closure receipt must name the
+requested checkout and all first-party services.
 
 ## Comparing spectra at custom η / matched n_eig
 

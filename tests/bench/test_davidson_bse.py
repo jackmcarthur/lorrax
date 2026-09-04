@@ -11,8 +11,10 @@ This is a smoke + numerical sanity test, NOT a unit test (no
 asserts). It prints residual norms per iteration so the
 profiling-stack tooling can pick up the wall-time picture.
 
-Usage (from the cohsex_bse.in run dir, under lxrun):
-    LORRAX_NGPU=4 lxrun python3 -u tests/bench/test_davidson_bse.py \\
+Usage (from the ``cohsex_bse.in`` run directory):
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/lorrax
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u "$LORRAX_CHECKOUT/tests/bench/test_davidson_bse.py" \\
         -i cohsex_bse.in --eqp <bgw_eqp.dat> --n-occ 4 \\
         --n-val 8 --n-cond 8 --n-eig 20 --max-iter 60 \\
         --bgw-h5 /pscratch/.../00_bgw_bse_8x8/eigenvectors.h5

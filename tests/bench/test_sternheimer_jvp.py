@@ -25,7 +25,12 @@ Covers:
 
 Run:
     cd <dir with WFN.h5 + UPFs>
-    lxrun python3 -u tests/bench/test_sternheimer_jvp.py
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/lorrax
+    lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u "$LORRAX_CHECKOUT/tests/bench/test_sternheimer_jvp.py"
+
+This probes the currently single-GPU Sternheimer driver; it is not P=4
+landing evidence for other drivers.
 """
 from __future__ import annotations
 

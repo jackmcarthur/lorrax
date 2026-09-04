@@ -32,12 +32,16 @@ Never run a driver on a login node and never submit an iteration with
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CHECKOUT=/path/to/lorrax
 lx doctor
-lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in
+lx run -N 1 -G 4 -n 4 -- \
+  env PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
 Use one rank per GPU. Run preprocessing as separate `lx run` steps; do not use
-the retired `lxpre` wrapper. `lx help` is the authority for allocations,
-concurrent batches, status, and tests.
+the retired `lxpre` wrapper. The source path belongs after `lx run`, because the
+container replaces an outer `PYTHONPATH`; the runtime closure receipt must name
+the checkout and its first-party services. `lx help` is the authority for
+allocations, concurrent batches, status, and tests.
 
 ## Native FFI stack
 

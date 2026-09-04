@@ -5,7 +5,9 @@ Polynomial Method.  Follows the same potential-setup pipeline as run_nscf,
 then replaces Davidson with Chebyshev moment accumulation from solvers/.
 
 Usage:
-    lxrun python3 -u -m psp.kpm_dos --save qe/nscf/silicon.save --nk 4 4 4
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u -m psp.kpm_dos --save qe/nscf/silicon.save --nk 4 4 4
 
 The structure mirrors bse_kpm.py as closely as possible — the only
 differences are the Hamiltonian construction (DFT vs BSE) and k-point

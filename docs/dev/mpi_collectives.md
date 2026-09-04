@@ -287,10 +287,12 @@ lx run --cpu -N 2 -n 4 -- bash -c '
 '
 ```
 
-`LORRAX_CHECKOUT` is the source pin consumed by `lx` when the caller is in a
-data directory; setting only `PYTHONPATH` does not replace it. The explicit
+`LORRAX_CHECKOUT` declares the requested source to `lx`; it does not replace
+the explicit Python-path selection. For this non-container CPU launch the
+exported checkout `src` remains on the rank-shell path, while the explicit
 rank-shell `PATH` is the interpreter pin. The tracked metadata-only checker
-then refuses a JAX/JAXLIB series other than 0.9 without importing JAX.
+then refuses a JAX/JAXLIB series other than 0.9 without importing JAX, and the
+runtime attests the complete first-party source closure before JAX starts.
 
 The prelude validates the adapter's pinned source, MPI ABI and SHA256 manifest;
 rejects stale Frontera overlays and conflicting MPI/PMI preloads; forces CPU,

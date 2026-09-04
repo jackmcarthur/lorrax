@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Tier-2 cross-P invariance gate driver (Perlmutter / lorrax module + lxrun).
+# Tier-2 cross-P invariance gate driver (Perlmutter / lx).
 #
 # LORRAX runs one process per device, so the P=4 leg must be launched as 4
 # tasks — a single python process cannot host it.  This driver prepares the
-# run dirs, launches each leg with lxrun (LORRAX_NGPU picks the per-node GPU
-# / task count), and runs the compare step.  Needs: a GPU allocation
-# (lxalloc/lxattach), `module load lorrax_X lorrax_agent`.
+# run dirs, launches each leg with one task per GPU, and runs the comparison.
+# `lx` allocates or attaches; set both Slurm job-id spellings only when
+# attaching to a verified custom allocation.
 #
 #   cd <repo> && bash tests/multi_device/run_tier2.sh [gnppm|bispinor ...]
 #
@@ -22,22 +22,18 @@ CASES=("${@:-gnppm bispinor}")
 declare -A FIXTURE=( [gnppm]="gnppm_debug"     [bispinor]="bispinor_debug" )
 declare -A INPUT=(   [gnppm]="gnppm_test.in"   [bispinor]="bispinor_test.in" )
 
-if ! type lxrun >/dev/null 2>&1; then
-    # lxrun is a shell function (not exported to child shells) — try to
-    # self-load the modules on Perlmutter; honor LORRAX_MODULE for the
-    # checkout letter (default: lorrax_D).
-    if [ -r /etc/profile.d/zzz-lmod.sh ]; then
-        # shellcheck disable=SC1091
-        source /etc/profile.d/zzz-lmod.sh
-        module use /global/homes/j/jackm/modulefiles 2>/dev/null || true
-        module use /pscratch/sd/j/jackm/lorrax_sandbox/modulefiles 2>/dev/null || true
-        module load "${LORRAX_MODULE:-lorrax_D}" lorrax_agent 2>/dev/null || true
-    fi
-fi
-if ! type lxrun >/dev/null 2>&1; then
-    echo "run_tier2.sh: lxrun not found — module load lorrax_X lorrax_agent first" >&2
+if ! command -v lx >/dev/null 2>&1; then
+    echo "run_tier2.sh: lx not found; use the supported Perlmutter launcher" >&2
     exit 2
 fi
+if [ -n "${LORRAX_CHECKOUT:-}" ] && \
+   [ "$(readlink -f "$LORRAX_CHECKOUT")" != "$REPO" ]; then
+    echo "run_tier2.sh: LORRAX_CHECKOUT does not name this source tree" >&2
+    exit 2
+fi
+export LX_BASE_MODULE="${LX_BASE_MODULE:-lorrax_A}"
+export LORRAX_CHECKOUT="$REPO"
+SOURCE_PATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
 
 rc=0
 for case in "${CASES[@]}"; do
@@ -47,12 +43,16 @@ for case in "${CASES[@]}"; do
         rm -rf "$dir"; mkdir -p "$WORK"
         cp -r "$fix" "$dir"; rm -rf "$dir/tmp"
         echo "== $case $leg =="
+        if [ "$leg" = p1 ]; then ngpu=1; else ngpu=4; fi
         ( cd "$dir" && \
-          LORRAX_NGPU=$([ "$leg" = p1 ] && echo 1 || echo 4) \
-          lxrun python3 -u -m gw.gw_jax -i "${INPUT[$case]}" > run.log 2>&1 ) \
+          lx run -N 1 -G "$ngpu" -n "$ngpu" -- \
+          env LORRAX_RUN_DIR="$dir" PYTHONPATH="$SOURCE_PATH" \
+          python3 -u -m gw.gw_jax -i "${INPUT[$case]}" > run.log 2>&1 ) \
           || { echo "$case $leg FAILED — see $dir/run.log"; rc=1; continue 2; }
     done
-    LORRAX_NGPU=1 lxrun python3 "$REPO/tests/multi_device/eqp_invariance_cross_p.py" \
+    lx run -N 1 -G 0 -n 1 -- \
+      env JAX_PLATFORMS=cpu PYTHONPATH="$SOURCE_PATH" \
+      python3 "$REPO/tests/multi_device/eqp_invariance_cross_p.py" \
         compare "$case" "$WORK/${case}_p1" "$WORK/${case}_p4" || rc=1
 done
 exit $rc

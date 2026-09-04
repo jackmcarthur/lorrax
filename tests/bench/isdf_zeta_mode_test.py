@@ -10,8 +10,10 @@ Checks:
 
 Usage (4 GPUs)::
 
-    lxalloc
-    lxrun python3 -u tests/bench/isdf_zeta_mode_test.py --nq 8 -n 128 --mrhs 256 --mesh 2x2
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u tests/bench/isdf_zeta_mode_test.py \\
+        --nq 8 -n 128 --mrhs 256 --mesh 2x2
 """
 from __future__ import annotations
 

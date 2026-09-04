@@ -6,8 +6,8 @@ numpy.linalg.eigh on the same matrix.
 
 Usage::
 
-    SLURM_JOBID=... LORRAX_NGPU=4 \\
-        bash src/ffi/common/cpp/run_shifter.sh \\
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
         python3 -u tests/bench/slate_eigh_test.py -n 256 --dtype c128
 """
 from __future__ import annotations
@@ -40,8 +40,7 @@ def _init():
         print(f"slate_init_mpi skipped: {_e}", flush=True)
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
         try:
-            # With CUDA_VISIBLE_DEVICES=$SLURM_LOCALID (set by run_shifter.sh
-            # for SLATE), each process sees exactly 1 GPU.  Tell JAX so
+            # The launcher gives each process exactly one visible GPU. Tell JAX so
             # explicitly; otherwise its distributed init waits on absent
             # local-topology keys from the other ranks.
             jax.distributed.initialize(local_device_ids=[0])

@@ -3,10 +3,8 @@
 LORRAX is one JAX process per GPU, so the only mode is multi-process
 cusolverMp on a 2x2 grid:
 
-  LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \\
-      CUSOLVERMP_FORCE_NCCL=1 \\
-      XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \\
-      XLA_PYTHON_CLIENT_PREALLOCATE=false \\
+  export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+  lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
       python3 -u tests/bench/eigh_benchmark.py -n 2048 --repeats 5
 
 Prints per-call wall time (ms) with one warm-up excluded so JIT compile and

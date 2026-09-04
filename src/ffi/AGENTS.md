@@ -44,14 +44,13 @@ any future distributed solver (ELPA, `H5Dwrite_async`, etc.).
 ## Cold start (fresh clone on Perlmutter)
 
 ```bash
-cd sources/lorrax
+export LX_BASE_MODULE=lorrax_A
+export LORRAX_CHECKOUT=$PWD
 
 src/ffi/cpp/stage/cusolvermp_stage_nvhpc.sh       # ~100 MB → /pscratch, one-time
 src/ffi/cpp/stage/phdf5_stage_openmpi.sh          #  ~40 MB → /pscratch, one-time
 
-lxalloc                                          # 1 node × 4 GPUs
-export SLURM_JOBID=<from lxalloc output>
-src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
+lx run -N 1 -G 0 -n 1 -- bash src/ffi/cpp/build.sh
 ```
 
 Staging copies are mandatory because Shifter's `udiRoot.conf` on Perlmutter
@@ -85,9 +84,9 @@ ffi/                       (full design: docs/architecture/ffi_layout.md)
 │   │                    services/distrib_la/ now — their C++ is still
 │   │                    cpp/slate/ and cpp/scalapack/, which is the point:
 │   │                    the SO is one build, the python is per service.
-├── _services.py         puts services/*/src on sys.path.  TRANSITIONAL —
-│                        see its docstring; it goes with the owner's
-│                        install/PYTHONPATH decision.
+├── _services.py         compatibility path helper for older direct imports;
+│                        current runtime source closure owns checkout-wide
+│                        first-party service selection.
 └── cpp/                 THE one C++ tree (both platform legs)
     ├── CMakeLists.txt   ONE entry point; -DLORRAX_FFI_PLATFORM=cuda|host
     │                    selects the leg, refuses when unset
@@ -106,7 +105,8 @@ ffi/                       (full design: docs/architecture/ffi_layout.md)
 ## Build
 
 ```bash
-src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+lx run -N 1 -G 0 -n 1 -- bash src/ffi/cpp/build.sh
 ```
 
 Output: `src/ffi/cpp/build/liblorrax_ffi.so`.  CMake prints the
@@ -117,32 +117,30 @@ build against the opt-in Cray MPICH stack, prefix with
 ## Smoke tests
 
 ```bash
-# cusolvermp — 4 ranks × 4 GPUs
-LORRAX_NGPU=4 src/ffi/cpp/run_shifter.sh env \
-    CUSOLVERMP_FORCE_NCCL=1 XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async \
-    python3 -u -m common.cusolvermp_eigh_test --grid 2 2
+export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+SOURCE_PATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-# phdf5 round-trip (write + parallel read, exact equality)
-LORRAX_NGPU=4 src/ffi/cpp/run_shifter.sh env \
-    XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async HDF5_USE_FILE_LOCKING=FALSE \
-    python3 -u -m common.phdf5_write_test
+# cuSOLVERMp — 4 ranks × 4 GPUs
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u tests/bench/cusolvermp_eigh_test.py --grid 2 2
 
-# phdf5 bench @ 16 GPUs / 4 nodes (write or read; pick one)
-LORRAX_NNODES=4 LORRAX_NGPU=4 LORRAX_NTASKS=16 \
-    src/ffi/cpp/run_shifter.sh env \
-    XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async HDF5_USE_FILE_LOCKING=FALSE \
-    python3 -u -m common.phdf5_vs_gather_bench -n 16384 --iters 3
+# phdf5 small exact round trip in a writable run directory
+export SMOKE_DIR=/path/to/writable/run/slabio_smoke
+mkdir -p "$SMOKE_DIR"
+lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+  python3 -u tests/bench/slabio_scaling_bench.py \
+  --dir "$SMOKE_DIR" --phase both --tag smoke --rows 128 --cols 128 \
+  --configs '[{"name":"default"}]' --verify
 ```
 
-## Required env vars
+## Runtime ownership
 
-| Var | Target | Why |
-|---|---|---|
-| `LORRAX_NGPU` / `LORRAX_NNODES` / `LORRAX_NTASKS` | all | `run_shifter.sh` forwards to `srun --gres=gpu -N -n`. |
-| `CUSOLVERMP_FORCE_NCCL=1` | cusolvermp | Routes libcal collectives via NCCL instead of UCC+IB. |
-| `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` | cusolvermp, phdf5 | CUDA async mempool so JAX and `cudaMalloc` (libcal, pinned staging) share VRAM. |
-| `HDF5_USE_FILE_LOCKING=FALSE` | phdf5 | Lustre doesn't support advisory locks; HDF5 defaults to acquiring them. |
-| `LORRAX_PHDF5_MPI_STACK={openmpi,mpich}` | phdf5 | Pick MPI backend (default `openmpi`; see PORTING.md). |
+Do not copy GPU-count, allocator, HDF5-locking, or CAL-routing exports into a
+science or smoke wrapper. `lx` owns geometry and placement; the selected site
+descriptor supplies native capabilities; `runtime` resolves and reports the
+JAX/allocator/I/O policy before import. `LORRAX_PHDF5_MPI_STACK` remains a
+build/porting choice for `run_shifter.sh`, not a routine `lx run` setting. The
+canonical environment-variable register is `docs/dev/env_vars.md`.
 
 ## How it works
 

@@ -1,13 +1,17 @@
 """4-GPU distributed Hermitian eigensolve test — cuSOLVERMp via JAX FFI.
 
-Usage (Perlmutter, inside an interactive 4-GPU allocation with
-``module load lorrax``)::
+Usage (Perlmutter)::
 
-    lxrun python3 -u tests/bench/cusolvermp_eigh_test.py
+    export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+    lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u tests/bench/cusolvermp_eigh_test.py
 
 or, for a 1-GPU smoke::
 
-    LORRAX_NGPU=1 lxrun python3 -u tests/bench/cusolvermp_eigh_test.py --grid 1 1
+    lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
+        python3 -u tests/bench/cusolvermp_eigh_test.py --grid 1 1
+
+The one-GPU arm is diagnostic only; it is not landing evidence.
 
 What it does
 ------------
@@ -48,8 +52,8 @@ def _maybe_init_jax_distributed():
                          os.environ.get("JAX_NUM_PROCESSES",
                          os.environ.get("SLURM_NTASKS", "1"))))
     if proc_count > 1:
-        # Under LORRAX_SELECT_GPU=1 each rank has only 1 GPU visible
-        # (CUDA_VISIBLE_DEVICES=$SLURM_LOCALID).  JAX's default init
+        # Under the one-task-per-GPU launcher each rank has only one GPU
+        # visible. JAX's default init
         # assumes all processes see all GPUs and times out waiting for
         # the missing local topologies.  Tell it explicitly.
         cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")

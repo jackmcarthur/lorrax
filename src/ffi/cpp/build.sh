@@ -2,13 +2,12 @@
 # Build liblorrax_ffi.so inside the Shifter container.
 #
 # Typical usage (from lorrax root):
-#   lxalloc                                       # 1-node, 4-GPU alloc
-#   src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh
+#   export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+#   lx run -N 1 -G 0 -n 1 -- bash src/ffi/cpp/build.sh
 #
-# The sibling `run_shifter.sh` launches Shifter with the HPC SDK
-# bind-mounted at /lorrax_nvhpc so the build can see cuSOLVERMp headers
-# and libraries.  Alternatively, run this script by hand inside a
-# shifter shell that already has /lorrax_nvhpc mounted.
+# `lx` enters the selected site image with the HPC SDK bind-mounted at
+# /lorrax_nvhpc so the build can see cuSOLVERMp headers and libraries.
+# `run_shifter.sh` remains the internal/manual composition tool for porting.
 #
 # Output: src/ffi/cpp/build/liblorrax_ffi*.so
 

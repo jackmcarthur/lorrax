@@ -52,8 +52,15 @@ On Perlmutter, run it on a compute node instead — never on a login node:
 ```bash
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CHECKOUT=$LORRAX_SOURCE
-(cd "$LORRAX_QUICKSTART" && lx run --wait 900 -N 1 -G 1 -n 1 -- python3 -u -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in)
+(cd "$LORRAX_QUICKSTART" && lx run --wait 900 -N 1 -G 1 -n 1 -- \
+  env PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -u -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in)
 ```
+
+The `PYTHONPATH` assignment is deliberately on the payload side of `lx run`:
+the container replaces an outer-shell value. `LORRAX_CHECKOUT` supplies the
+requested-source identity, while the runtime closure receipt proves the core and
+all first-party services actually came from that checkout.
 
 The fixture ships its own wavefunction
 (`WFNsmall.h5`), centroids (`centroids_frac_60.txt`), `dipole.h5`, and `kin_ion.h5`, so it

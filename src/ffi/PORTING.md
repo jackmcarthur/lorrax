@@ -418,20 +418,18 @@ runtime libs SLATE links against.
 
 ## Runtime
 
-The LORRAX Lmod module wires the full `srun + select_gpu + shifter
-+ in_container` invocation. On a ported cluster, install the module
-via `config/<cluster>/install.sh` (see [`config/README.md`](../../config/README.md)),
-then `lxrun <cmd>` — no per-call env juggling.
+The installed module is a capability descriptor, not a launcher or a second
+copy of runtime policy. On Perlmutter, `lx` composes task placement,
+`select_gpu.sh`, Shifter, and `in_container.sh`; pass the checkout's top-level
+`src` on the payload side and use the runtime source-closure receipt as the
+import proof. A ported cluster provides an equivalent site descriptor and
+machine page through `config/<cluster>/`; do not copy a raw `srun` wrapper or
+the retired module functions.
 
-What the module sets:
-
-```
-XLA_PYTHON_CLIENT_PREALLOCATE=false     # share VRAM with NCCL/cuSOLVERMp
-XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async  # cudaMallocAsync — see note below
-HDF5_USE_FILE_LOCKING=FALSE             # Lustre compatibility
-MPICH_GPU_SUPPORT_ENABLED=1             # GPU-Direct RDMA
-LD_PRELOAD=/lorrax_slate/lib/libmpi_gtl_cuda.so.0   # CUDA-12 shim; see §Slate-specific below
-```
+Allocator, HDF5-locking, GPU-direct, preload, and JAX settings are resolved by
+the site descriptor plus `runtime` and reported at startup. The canonical
+ownership and override list is [`docs/dev/env_vars.md`](../../docs/dev/env_vars.md);
+a run script should not duplicate those defaults.
 
 > **`platform` is not cudaMallocAsync**, and `TF_GPU_ALLOCATOR` does
 > nothing.  This block used to read
@@ -447,7 +445,7 @@ LD_PRELOAD=/lorrax_slate/lib/libmpi_gtl_cuda.so.0   # CUDA-12 shim; see §Slate-
 > [`docs/environment/overview.md`](../../docs/environment/overview.md) §2.1.
 
 `CUDA_VISIBLE_DEVICES=$SLURM_LOCALID` is set per-rank by
-`select_gpu.sh` (invoked from `lxrun`). JAX callers must pass
+`select_gpu.sh` (invoked by `lx` on Perlmutter). JAX callers must pass
 `local_device_ids=[0]` to `jax.distributed.initialize()` when
 `process_count > 1` — the sandbox tests auto-detect via the length
 of `CUDA_VISIBLE_DEVICES`.
@@ -475,12 +473,15 @@ of `CUDA_VISIBLE_DEVICES`.
    via `src/ffi/cpp/run_shifter.sh`).
 6. **Verify**:
    ```bash
-   lxalloc
-   lxrun python3 -u -m common.cusolvermp_eigh_test
-   lxrun python3 -u -m common.slate_cholesky_trsm_test -n 256 --dtype c128
-   lxrun python3 -u -m common.phdf5_multi_offset_test
+   export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
+   SOURCE_PATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
+   lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+     python3 -u tests/bench/cusolvermp_eigh_test.py --grid 2 2
+   lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
+     python3 -u tests/bench/slate_cholesky_trsm_test.py -n 256 --dtype c128
    ```
-   Expected: all PASS at machine precision (~1e-13 for C128 eigh).
+   Expected: both PASS at machine precision (~1e-13 for C128). Follow the
+   phdf5 round-trip in `src/ffi/AGENTS.md` for the I/O leg.
 
 For non-Shifter runtimes (Singularity/Apptainer): swap the
 `shifter ...` invocation inside the module's shell functions for
@@ -496,7 +497,7 @@ of other paths, which is why every "stage" script copies to
 **not** ship NVHPC SDK, Cray MPICH, Cray HDF5, or SLATE — all four
 come in via bind-mount. (Nor FFTW3; it does ship NCCL.)
 
-`lxrun` uses `--mpi=cray_shasta` (not `pmi2` or `pmix`) — both of
+`lx` uses `--mpi=cray_shasta` (not `pmi2` or `pmix`) — both of
 those silently give singleton `MPI_COMM_WORLD` with
 `shifter --module=mpich`.
 
@@ -504,7 +505,7 @@ those silently give singleton `MPI_COMM_WORLD` with
 MPICH. Shifter's `--module=mpich` bind-mounts a copy built against
 CUDA 11, needing `libcudart.so.11.0` not in our container.
 `stage_cray.sh` for slate also copies the CUDA-12 version, and
-`lxrun` `LD_PRELOAD`s it so the loader binds that one first.
+the site composition preloads it so the loader binds that one first.
 
 ## phdf5 stack choice
 
