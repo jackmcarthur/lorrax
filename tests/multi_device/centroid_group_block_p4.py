@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -139,6 +140,85 @@ def main() -> None:
     if int(floor_ref[2]) != 4 or int(floor_got[2]) != 4:
         _fail("exact-floor distributed rank drifted")
 
+    # Production-scale liveness regression for the Si geometry.  The old
+    # incident stopped before this selector because rank 0 alone evaluated a
+    # distributed Gram diagnostic.  Exercise that asymmetric print policy,
+    # then require a 1028-candidate / 25-group selection to finish under one
+    # finite lower+compile+execute budget and to report every admitted group.
+    from centroid.pivoted_cholesky import (
+        _make_group_progress_reporter,
+        _report_logical_gram_diagonal,
+        _run_bounded_select,
+    )
+
+    production_sizes = np.asarray(
+        [48] * 19 + [24] * 4 + [12, 8], dtype=np.int32)
+    production_M = int(production_sizes.sum())
+    production_budget = 800
+    if production_M != 1028 or production_sizes.size != 25:
+        _fail("production-scale fixture geometry drifted")
+    production_gid = np.repeat(
+        np.arange(production_sizes.size, dtype=np.int32), production_sizes)
+    production_gram = np.diag(
+        np.arange(production_M, 0, -1, dtype=np.float64)).astype(
+            np.complex128)
+    production_G = device_put_process_local(production_gram, row)
+    _report_logical_gram_diagonal(
+        production_G, production_M,
+        verbose=(jax.process_index() == 0), print_fn=print)
+
+    messages = []
+
+    def rank0_log(message):
+        if jax.process_index() == 0:
+            messages.append(message)
+            print(message, flush=True)
+
+    report_group, start_progress = _make_group_progress_reporter(
+        rank0_log, n_candidates=production_M,
+        n_groups=int(production_sizes.size),
+        point_budget=production_budget)
+    production_step = make_sharded_group_block_pivoted_cholesky_select(
+        mesh, production_M, production_budget,
+        int(production_sizes.size), mesh_axis=("x", "y"),
+        tol_rel=1e-13, progress_fn=report_group)
+    production_gid_dev = device_put_process_local(production_gid, row1)
+    started = time.perf_counter()
+    production_got = _run_bounded_select(
+        production_step, (production_G, production_gid_dev, None),
+        time_budget_s=30.0, n_candidates=production_M,
+        n_groups=int(production_sizes.size),
+        point_budget=production_budget, print_fn=rank0_log,
+        start_progress=start_progress)
+    production_wall = time.perf_counter() - started
+    production_piv = np.asarray(production_got[0])
+    production_used = production_piv[production_piv >= 0]
+    if production_used.size != production_budget:
+        _fail(
+            f"production-scale delivered={production_used.size}, "
+            f"expected {production_budget}")
+    if int(production_got[2]) != production_budget:
+        _fail(
+            f"production-scale rank={int(production_got[2])}, "
+            f"expected {production_budget}")
+    selected_counts = np.bincount(
+        production_gid[production_used], minlength=production_sizes.size)
+    production_picked = np.flatnonzero(selected_counts)
+    if not np.array_equal(
+            selected_counts[production_picked],
+            production_sizes[production_picked]):
+        _fail("production-scale selector emitted a partial group")
+    if production_wall >= 30.0:
+        _fail(f"production-scale wall={production_wall:.3f}s exceeds 30s")
+    if jax.process_index() == 0:
+        progress = [
+            message for message in messages
+            if message.startswith("[centroid-select-progress]")]
+        if len(progress) != production_picked.size:
+            _fail(
+                f"production-scale progress receipts={len(progress)}, "
+                f"selected groups={production_picked.size}")
+
     if jax.process_index() == 0:
         print(
             f"[centroid-group-block-p4] delivered={used.size}/{budget} "
@@ -147,6 +227,13 @@ def main() -> None:
             flush=True)
         print(
             "[centroid-group-block-p4] exact-floor reopen red twin PASS",
+            flush=True)
+        print(
+            "[centroid-group-block-production-p4] "
+            f"candidates={production_M} groups={production_sizes.size} "
+            f"delivered={production_used.size}/{production_budget} "
+            f"rank={int(production_got[2])} wall_s={production_wall:.3f} "
+            "budget_s=30 PASS",
             flush=True)
         print("[centroid-group-block-p4] PASS", flush=True)
 
