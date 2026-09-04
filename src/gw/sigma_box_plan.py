@@ -236,18 +236,25 @@ def make_sigma_box_spec(
 def _rule_cache_lookup(
     directory, box, eps, relative, *, noise_amplification_cap,
 ):
-    """Return the smallest cached rule certified on a containing box."""
+    """Return the smallest compatible rule plus any unreadable-path warnings."""
     if directory is None:
-        return None
+        return None, ()
+    warnings = []
     try:
         names = [name for name in os.listdir(directory)
                  if name.endswith(".npz")]
-    except OSError:
-        return None
+    except OSError as exc:
+        path = os.path.abspath(directory)
+        warnings.append(
+            "WARNING sigma quadrature cache lookup failed; rules will be "
+            "rebuilt in memory: "
+            f"path={path} error={type(exc).__name__}: {exc}")
+        return None, tuple(warnings)
     best = None
     for name in names:
+        path = os.path.abspath(os.path.join(directory, name))
         try:
-            with np.load(os.path.join(directory, name)) as data:
+            with np.load(path) as data:
                 if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
                         or bool(data["relative"]) != relative):
                     continue
@@ -275,25 +282,33 @@ def _rule_cache_lookup(
                     kappa_max=float(data["kappa_max"]), seconds=0.0)
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
-        except (OSError, KeyError, ValueError):
-            continue
-    return best
+        except (EOFError, OSError, KeyError, ValueError) as exc:
+            warnings.append(
+                "WARNING sigma quadrature cache entry is unreadable and "
+                "will not be used: "
+                f"path={path} error={type(exc).__name__}: {exc}")
+    return best, tuple(warnings)
 
 
 def _rule_cache_store(directory, rule, noise_amplification):
     """Atomically store one immutable box certificate, or return a warning."""
     if directory is None:
         return None
-    digest = hashlib.sha256(json.dumps(
+    identity = hashlib.sha256(json.dumps(
         ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
          bool(rule.relative)]
-    ).encode()).hexdigest()[:16]
+    ).encode())
+    identity.update(np.ascontiguousarray(rule.times).view(np.uint8).tobytes())
+    identity.update(np.ascontiguousarray(rule.weights).view(np.uint8).tobytes())
+    identity.update(np.asarray(
+        [float(rule.sup_error), float(rule.kappa_max),
+         float(noise_amplification), float(rule.theta_deg), float(rule.rank)],
+        dtype=np.float64).tobytes())
+    digest = identity.hexdigest()[:16]
     path = os.path.abspath(os.path.join(directory, f"rule_{digest}.npz"))
     temporary = None
     try:
         os.makedirs(directory, exist_ok=True)
-        if os.path.exists(path):
-            return None
         temporary = f"{path}.{os.getpid()}.tmp"
         with open(temporary, "wb") as handle:
             np.savez(
@@ -369,7 +384,7 @@ def _fit_rule(
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
-    cached = _rule_cache_lookup(
+    cached, cache_lookup_warnings = _rule_cache_lookup(
         cache_dir, requested_box, eps, relative,
         noise_amplification_cap=noise_amplification_cap)
     if cached is not None:
@@ -455,6 +470,7 @@ def _fit_rule(
         "roundoff_amplification": noise_amplification,
         "node_digest": node_digest,
         "cache_write_warning": cache_write_warning,
+        "cache_lookup_warnings": cache_lookup_warnings,
         "one_line": rule.one_line(),
     }
 
@@ -609,6 +625,7 @@ def _fixed_fit_for_spec(entry, spec):
     # A failed write was announced on the iteration that attempted it. Reusing
     # the in-memory fixed rule must not repeat the old warning every SC map.
     fit["cache_write_warning"] = None
+    fit["cache_lookup_warnings"] = ()
     return fit
 
 
@@ -907,10 +924,16 @@ def plan_sigma_windows(
             specs, eta, eps=tolerance, reduction_seconds=budget,
             cache_dir=cache_dir, session=fixed_rule_session)
     if process_rank() == 0:
+        announced = set()
         for fit in fits:
-            warning = fit.get("cache_write_warning")
-            if warning:
-                print_fn(warning)
+            warnings = tuple(fit.get("cache_lookup_warnings", ()))
+            write_warning = fit.get("cache_write_warning")
+            if write_warning:
+                warnings += (write_warning,)
+            for warning in warnings:
+                if warning not in announced:
+                    print_fn(warning)
+                    announced.add(warning)
     # The (window, tau) pair count is reported, never refused on: the owner
     # eliminated the pair ceiling (2026-09-02).  A count above what a deck
     # can afford is a planning question answered by eps and the window

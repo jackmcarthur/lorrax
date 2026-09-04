@@ -488,6 +488,48 @@ def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
         row["cache_status"] == "miss"
         for row in geometry["branches"][0]["windows"])
 
+    calls.clear()
+    _plan, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
+    assert calls == []
+    assert all(
+        row["cache_status"].startswith("hit:")
+        for row in geometry["branches"][0]["windows"])
+
+
+def test_corrupt_cache_entry_is_announced_and_repaired(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    args = dict(
+        eps=1.0e-4, reduction_seconds=120.0,
+        cache_dir=str(tmp_path))
+    plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        print_fn=lambda *_args: None, **args)
+    damaged = sorted(tmp_path.glob("*.npz"))[0]
+    damaged.write_bytes(b"not an npz certificate")
+
+    lines = []
+    plan, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        print_fn=lines.append, **args)
+    warnings = [line for line in lines
+                if "cache entry is unreadable" in line]
+    assert len(plan) == 3
+    assert len(warnings) == 1
+    assert str(damaged.resolve()) in warnings[0]
+    assert "error=" in warnings[0]
+    assert sum(row["cache_status"] == "miss"
+               for row in geometry["branches"][0]["windows"]) == 1
+
+    lines.clear()
+    _plan, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        print_fn=lines.append, **args)
+    assert not [line for line in lines if "cache entry is unreadable" in line]
+    assert all(row["cache_status"].startswith("hit:")
+               for row in geometry["branches"][0]["windows"])
+
 
 def test_each_cache_write_failure_is_announced_without_rejecting_rule(
         monkeypatch, tmp_path):
