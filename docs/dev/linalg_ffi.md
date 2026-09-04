@@ -281,18 +281,15 @@ is not (bug L-2) and is refused.
 
 ## The config surface
 
-Input-file keys are the source of truth; CLI flags override them.
+The deck has one dense-linear-algebra control: `linalg = local | distributed`.
+`local` selects whole-matrix `batch_reshard` plus the auto replicated/per-q ζ
+tier. `distributed` selects the provider/native2d batch route, distributed ζ
+and W, and distributed eigensolves; CUDA provider-owned Cholesky/LU use
+cuSolverMp. The former stage/backend deck keys are retired and refuse by name.
+CLI/provider environment overrides are debugging controls, not deck inputs.
 
-| key (cohsex.in `[cohsex]`) | values | consumer |
-|---|---|---|
-| `distributed_cholesky` | `auto \| off \| cusolvermp \| slate` | GW ζ-fit charge channel (`isdf/core`) |
-| `distributed_lu` | `auto \| off \| cusolvermp \| scalapack` | GW ζ-fit transverse channels (`isdf/core`) |
-| `eigh_backend` | `auto \| off \| cusolvermp \| slate` | BSE/htransform eigh sites (`bse_setup`, `vq_interp`) via `htransform` / `exciton_bands` |
-| `distributed_zeta_solve` | `auto \| replicated \| per_q \| distributed` | GW ζ-fit back-solve tier (`isdf/core`) |
-
-`ffi.linalg.resolve_backend('eigh', …)` additionally accepts `distributed`
-(and `scalapack`) beyond the `eigh_backend` key's vocabulary; the ζ-fit tier
-is the caller that uses them.
+The sections below retain the internal route names because they describe the
+service implementation selected by that one public dial.
 
 ### `distributed_zeta_solve` — the ζ back-solve tier
 

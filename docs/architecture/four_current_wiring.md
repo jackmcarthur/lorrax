@@ -62,15 +62,16 @@ yields `(accepted, got, want, klass, why, derived_key)`:
 | 3 | `screening_diagrams = w_rpa` | both | IMPLEMENTATION LIMIT |
 | 4 | `head_correction ∈ {full, off}` | both | PHYSICS/POLICY (row 20) |
 | 5 | `restart = false` | both | IMPLEMENTATION LIMIT — normally unreachable on a slab deck, which `GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism` (`:3895`) refuses at parse time |
-| 6 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived** |
-| 7 | `w_dyson_solver = distributed` | screened | IMPLEMENTATION LIMIT, **derived** |
+| 6 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived when unnamed** |
+| 7 | `linalg = distributed` | screened | IMPLEMENTATION LIMIT, **declared** |
 | 8 | no scalar q→0 head override named (`scalar_head_overrides_named`, `:3621`) | screened | IMPLEMENTATION LIMIT — ONE conjunct for the eight `use_bgw_vcoul` / `wcoul0_*` / `*head*` / `mc_average_placement*` keys, naming only the ones the deck set |
 
-Rows 6 and 7 are **derived, not declared**: `LorraxConfig.from_input_file`
-sets an unnamed one for `full_static_cohsex` with a `[config provenance]`
-line, promoting only when every other row already passes, so a deck outside
-the envelope for another reason still sees *that* reason. An explicitly named
-conflicting value is refused (rule 13). Material class is also outside the
+Row 6 may be **derived when unnamed**: `LorraxConfig.from_input_file` sets it
+for `full_static_cohsex` with a `[config provenance]` line, promoting only
+when every other row already passes, so a deck outside the envelope for
+another reason still sees *that* reason. Row 7 is declared: the global
+`linalg` default remains `local`, and a packed route must explicitly request
+`distributed`. Material class is also outside the
 table: the driver infers it from the loaded WFN occupations, and
 `validate_material_inputs` refuses every fractional-occupation non-MPA run
 before screening. `sys_dim = 2` is deliberately **not** in the table: the bare route treats it as a routing condition
@@ -92,14 +93,12 @@ keyed on `uses_static_photon_response`), reachable only from a hand-built
 config: the Γ-cell completion already inserts `⟨D_TT⟩` and honouring an
 overlay too would double count it.
 
-The bare route additionally requires `w_dyson_solver = distributed` as a
-ROUTING condition, not a table row. After ordinary parsing, an eligible
-unnamed slab deck is promoted to `distributed` (`gw_config.py:6028-6066`),
-so both bispinor modes reach the packed route by default on a multi-rank mesh.
-Explicit `local` retains the incumbent route. Because `distrib_la` refuses a
-distributed solve on a 1×1 mesh, one-GPU operation needs explicit `local` and
-therefore stays incumbent. The packed completion is the only deck-reachable
-producer of a transverse q→0 head.
+The bare route additionally requires `linalg = distributed` as a routing
+condition. The default `local` retains the incumbent route; an explicit
+`distributed` selects the packed route on a supported multi-rank mesh.
+Because `distrib_la` refuses a distributed solve on a 1×1 mesh, one-GPU
+operation stays on the local incumbent route. The packed completion is the
+only deck-reachable producer of a transverse q→0 head.
 
 The three predicates, all in `src/gw/gw_config.py`:
 
@@ -228,12 +227,11 @@ object each key ends up on and who reads it.
 | `head_correction` | `full` (`:2011`, coerced `:548`, read `:5451`, built into `HeadConfig` `:5474`) | `config.head.correction` (`:5064`) | both |
 | ~~`bispinor_tt_head_correction`~~ | **REMOVED as a deck key 2026-09-01**; the field is wired to `False` (`gw_config.py:5495`) for the incumbent V-tile builder | `config.head.bispinor_tt_head_correction` | **B only**, and now only from a hand-built config |
 | `static_gauge_hall_file` | `""` — EMPTY (`:1503`) | `config.paths.static_gauge_hall_file` | P; optional. An UNNAMED file means `σ_H = 0`, announced. Every named path is authenticated by the loader; an absent one refuses there. The bare route accepts only an exact-zero artifact and refuses a nonzero Hall vector |
-| `transverse_zeta_solve` | `ridge` (`:1908`, validate `:5723-5740`) | `config.backend.transverse_zeta_solve` (`:4773`) | both |
+| `linalg` | `local` | the parser-cached backend profile (including `config.backend.transverse_zeta_solve`) | both |
 | `transverse_zeta_rcond` | `1e-10` (`:1916`, validate `:5741-5745`) | `config.backend.transverse_zeta_rcond` (`:4774`) | both |
-| `distrib_la_batched_route` | `batch_reshard` (explicit `auto` remains available; `use_low_mem_eigh=true` derives it when the key is absent) | `config.backend.distrib_la_batched_route` | both |
 
-There is no `transverse_zeta_*` key beyond those two, and no `LORRAX_*`
-variable reads any key in this table.
+The retired stage/backend keys refuse by name; implementation-specific
+overrides, where available, are debug-only CLI or `LORRAX_*` controls.
 
 **The one resolver.** `common/four_current_model.resolve_four_current_representation(bispinor, model)`
 returns a frozen `FourCurrentRepresentation` with seven fields: `charge_bispinor`,
@@ -629,7 +627,7 @@ and again at driver entry (`gw_init.py:3101`).
 | `bispinor_tt_head_unsupported` | `:4086-4137` | a hand-built TT head lacks bispinor or has unsupported dimensionality |
 | (no id) SC × dynamic | `gw_jax.py:274-285` | self-consistent solver with a dynamic mode |
 | (no id) missing current centroids | `gw_jax.py:579-584`, `gw_init.py:1425-1428` | `bispinor = true` without `centroids_file_current` |
-| (no id) packed route needs a distributed Dyson solve | `gw_config.packed_static_envelope` (shared derived-key row) | Every packed route derives an unnamed `w_dyson_solver` to `distributed` with a provenance line. An explicit `local` remains a route conjunct for `bare_transverse` (incumbent fallback, named in the run record) and a refusal for `full_static_cohsex`. `distrib_la` still refuses `distributed` on a 1×1 mesh; the derivation never downgrades silently. |
+| (no id) packed route needs distributed dense linear algebra | `gw_config.packed_static_envelope` | Every packed route requires `linalg = distributed`. The default `local` remains the incumbent fallback for `bare_transverse` and is a refusal for `full_static_cohsex`; `distrib_la` still refuses the distributed route on a 1×1 mesh. |
 | (no id) photon Σ envelope | `sigma_dispatch.py:845` ff. | the static arm: outside `cohsex`; without a packed response; with scalar `static_head_terms`. The dynamic arm (`:890`) refuses a mode that builds static screened channels, and `:991` refuses a packed deck on a mode with no branch (`mpa`) |
 | (no id) packed response needs a config / distributed Dyson | `w_isdf.py:1945-1953` | the packed path is called without the run config, or with a non-distributed Dyson solver |
 | `GATE static_gauge_head_fold_{ward,hermiticity}` | `head_correction.py:1365,1370` | Γ-fold residuals over `1e-8` / `1e-10` (`:158-159`) |
