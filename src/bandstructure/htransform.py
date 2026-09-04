@@ -751,17 +751,18 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
         f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
-    # The FFI FFT aliases its input buffer when that input is dead.  A receipt
-    # applied to a retained operator therefore needs alias protection.  Build
-    # and certify the active operator, release both of its large carriers,
-    # then build and certify fH.  Finally reconstruct active_R through the
-    # already-certified identical route.  The extra active contraction is
-    # cheaper than retaining a third 11--14-GiB operator beside a receipt.
-    # Each value-level receipt covers every tile in bounded row slabs; only
-    # two scalar maxima are replicated or transferred to the host.
+    # The FFI FFT aliases a dead input buffer.  Build each retained R-space
+    # operator through that donated route, then deterministically rebuild its
+    # k-space Gram image for the value-level receipt.  Repeating a contraction
+    # is cheaper than retaining a third 11--14-GiB operator: at most the R and
+    # rebuilt k images coexist.  Finally reconstruct active_R once more after
+    # both receipts.  Each receipt covers every tile in bounded local row
+    # slabs; only two scalar maxima are replicated or transferred to the host.
     if active_band_range is not None:
         active_k = _build_active_k(ctilde_x, ctilde_y)
-        active_R = _ifft_operator(active_k)
+        active_R = _ifft_operator_donated(active_k)
+        del active_k
+        active_k = _build_active_k(ctilde_x, ctilde_y)
         active_fft_rel = _fft_roundtrip_relative(active_R, active_k)
         del active_k, active_R
     else:
@@ -771,9 +772,14 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     (fH_k, f_recovery_error,
      energy_recovery_error, inverse_residual) = _build_fH_k(
          ctilde_x, ctilde_y, f_eps)
-    fH_R = _ifft_operator(fH_k)
-    fft_rel = _fft_roundtrip_relative(fH_R, fH_k)
+    fH_R = _ifft_operator_donated(fH_k)
     del fH_k
+    (fH_k, _f_recovery_again,
+     _energy_recovery_again, _inverse_residual_again) = _build_fH_k(
+         ctilde_x, ctilde_y, f_eps)
+    fft_rel = _fft_roundtrip_relative(fH_R, fH_k)
+    del (fH_k, _f_recovery_again,
+         _energy_recovery_again, _inverse_residual_again)
     if active_band_range is not None:
         active_k = _build_active_k(ctilde_x, ctilde_y)
         active_R = _ifft_operator_donated(active_k)
