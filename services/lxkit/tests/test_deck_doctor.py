@@ -4,7 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from lxkit.deck_doctor import _device_lines, required_input_paths
+from lxkit.deck_doctor import (
+    _backend_lines,
+    _device_lines,
+    required_input_paths,
+)
 
 
 def _config(tmp_path: Path, **overrides):
@@ -96,4 +100,5 @@ def test_epshead_replaces_dipole_requirement(tmp_path):
 def test_zero_gpu_report_does_not_import_jax():
     lines = _device_lines(gpu=False)
     assert "use --gpu to measure" in lines[0]
-    assert "skipped" in lines[1]
+    assert _backend_lines(None, n_rmu=12, gpu=False) == [
+        "BACKEND_PROBE skipped (zero-GPU doctor; add --gpu)"]

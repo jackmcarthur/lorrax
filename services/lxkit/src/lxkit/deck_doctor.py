@@ -176,7 +176,6 @@ def _device_lines(*, gpu: bool) -> list[str]:
         return [
             "DEVICE_EXPECTED platform=Perlmutter NVIDIA A100; HBM class is "
             "allocation-specific (40/80 GB); use --gpu to measure it",
-            "BACKEND_PROBE skipped (zero-GPU doctor; add --gpu)",
         ]
     import jax
 
@@ -193,12 +192,38 @@ def _device_lines(*, gpu: bool) -> list[str]:
         stats = device.memory_stats() if hasattr(device, "memory_stats") else None
         limit = (stats or {}).get("bytes_limit", 0)
         memory.append(f"{float(limit) / 1e9:.2f} GB" if limit else "unknown")
-    return [
-        f"DEVICE_ACTUAL backend={jax.default_backend()} kind={','.join(kinds)} "
-        f"memory_limit={','.join(memory)}",
-        "BACKEND_PROBE live GPU backend initialized; detailed providers are "
-        "reported by runtime.bootstrap/source capability gates",
-    ]
+    return [f"DEVICE_ACTUAL backend={jax.default_backend()} "
+            f"kind={','.join(kinds)} memory_limit={','.join(memory)}"]
+
+
+def _backend_lines(config, *, n_rmu: int, gpu: bool) -> list[str]:
+    """Resolve the deck's dense-LA requests on a live one-GPU probe mesh."""
+    if not gpu:
+        return ["BACKEND_PROBE skipped (zero-GPU doctor; add --gpu)"]
+
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    from distrib_la import list_backends, resolve_backend
+
+    devices = jax.local_devices()
+    mesh = Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y"))
+    requests = (
+        ("cholesky", config.backend.distributed_cholesky),
+        ("solve_lu", config.backend.distributed_lu),
+        ("eigh", config.backend.eigh_backend),
+    )
+    lines = []
+    for op, requested in requests:
+        resolved = resolve_backend(op, requested, mesh, n=int(n_rmu))
+        available = ",".join(
+            name for name, detail in list_backends(op, mesh).items()
+            if detail.startswith("available"))
+        lines.append(
+            f"BACKEND_RESOLVED op={op} requested={requested} "
+            f"resolved={resolved} probe_mesh=1x1 n={int(n_rmu)} "
+            f"available={available}")
+    return lines
 
 
 def inspect_deck(args) -> None:
@@ -300,6 +325,8 @@ def inspect_deck(args) -> None:
         )
 
     for line in _device_lines(gpu=args.gpu):
+        print(line)
+    for line in _backend_lines(config, n_rmu=n_rmu, gpu=args.gpu):
         print(line)
     print("DECK_DOCTOR_OK")
 
