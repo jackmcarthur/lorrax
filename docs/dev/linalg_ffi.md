@@ -284,8 +284,9 @@ is not (bug L-2) and is refused.
 The deck has one dense-linear-algebra control: `linalg = local | distributed`.
 `local` selects whole-matrix `batch_reshard` plus the auto replicated/per-q ζ
 tier. `distributed` selects the provider/native2d batch route, distributed ζ
-and W, and distributed eigensolves; CUDA provider-owned Cholesky/LU use
-cuSolverMp. The former stage/backend deck keys are retired and refuse by name.
+and W, and distributed eigensolves; CUDA transverse LU uses cuSolverMp. The
+charge Cholesky policy stays `auto` because distributed rank truncation owns
+that factor. The former stage/backend deck keys are retired and refuse by name.
 CLI/provider environment overrides are debugging controls, not deck inputs.
 
 The sections below retain the internal route names because they describe the

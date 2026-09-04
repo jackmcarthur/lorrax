@@ -1257,7 +1257,10 @@ def resolve_linalg(params) -> LinalgResolution:
         layout=layout,
         provenance=provenance,
         w_dyson_solver="distributed",
-        distributed_cholesky="distributed",
+        # Charge keeps the distributed rank-truncation factor owner.  A
+        # simultaneous explicit Cholesky provider would contradict that
+        # tier; leave the inactive Cholesky arm at its incumbent policy.
+        distributed_cholesky="auto",
         distributed_lu="distributed",
         batched_route="auto",
         eigh_backend="distributed",
@@ -5567,11 +5570,6 @@ class LorraxConfig:
             _dist_lu = "scalapack" if _is_cpu_backend else "cusolvermp"
         elif _dist_lu == "auto" and _is_cpu_backend:
             _dist_lu = "off"
-        if _dist_chol == "distributed":
-            # The distributed charge profile uses rank truncation; this
-            # Cholesky selection is the matching fallback should that fixed
-            # conditioner ever request its Cholesky arm internally.
-            _dist_chol = "auto" if _is_cpu_backend else "cusolvermp"
         backend = BackendConfig(
             linalg=_linalg.layout,
             linalg_provenance=_linalg.provenance,

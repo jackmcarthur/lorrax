@@ -224,7 +224,8 @@ profile. `local` selects the current small-system route:
 the provider route (`distrib_la_batched_route=auto`), distributed zeta and W,
 the distributed eigensolver layout (including self-consistency), and
 cuSolverMp/cuBLASMp on CUDA or ScaLAPACK on CPU for provider-owned solves. On
-CUDA its Cholesky and LU backends are cuSolverMp.
+CUDA the transverse LU backend is cuSolverMp; the inactive charge-Cholesky
+arm remains `auto` because distributed rank truncation owns that factor.
 The htransform and exciton-band `--eigh-backend` and
 `--distrib-la-batched-route` flags remain debug-only implementation overrides;
 they are not deck keys.

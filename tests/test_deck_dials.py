@@ -33,6 +33,7 @@ def test_linalg_dial_resolves_one_complete_profile(
     assert resolved.provenance == "deck"
     assert resolved.w_dyson_solver == w_solver
     assert resolved.distributed_zeta_solve == zeta
+    assert resolved.distributed_cholesky == "auto"
     assert resolved.distributed_lu == lu
     assert resolved.batched_route == (
         "batch_reshard" if layout == "local" else "auto")
