@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 import pytest
 
@@ -279,6 +280,37 @@ def test_per_module_compile_agreement_refuses_a_missing_rank_by_deadline():
         assert "jit_test_module" in message
         assert "rank 3: <not-arrived>" in message
         assert "did not arrive" in message or "published no verdict" in message
+
+
+def test_early_peers_wait_for_a_late_but_valid_rank_zero_verdict():
+    """A peer can arrive before p0; its bounded wait must cover p0's window."""
+    n_proc = 4
+    timeout_s = 0.2
+    kv = FakeKV(n_proc)
+    out = {}
+
+    def work(rank):
+        try:
+            jcc._agree_before_module_compile(
+                "jit_late_rank_zero", "c" * 64, 0, client=kv,
+                n_proc=n_proc, proc_idx=rank, timeout_s=timeout_s)
+            out[rank] = None
+        except BaseException as exc:                         # noqa: BLE001
+            out[rank] = exc
+
+    peers = [threading.Thread(target=work, args=(rank,))
+             for rank in (1, 2, 3)]
+    for thread in peers:
+        thread.start()
+    # Longer than the former timeout + 0.1 s handoff, but shorter than the
+    # new two-interval bound.  Once p0 arrives, every peer record is present.
+    time.sleep(0.35)
+    leader = threading.Thread(target=work, args=(0,))
+    leader.start()
+    for thread in [*peers, leader]:
+        thread.join(timeout=2.0)
+    assert set(out) == set(range(n_proc))
+    assert all(value is None for value in out.values())
 
 
 # ---------------------------------------------------------------------------

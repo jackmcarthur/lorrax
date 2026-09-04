@@ -1491,13 +1491,18 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
             f"{prefix}/verdict",
             json.dumps(verdict, sort_keys=True).encode("utf-8"))
     else:
-        # Rank 0 may consume the entire stated deadline before publishing its
-        # timeout verdict.  A small, still-bounded handoff allowance lets the
-        # peers receive that shared all-rank diagnostic instead of racing it.
+        # A peer may reach this slot nearly one full deadline before rank 0;
+        # rank 0 may then legitimately consume its own full deadline waiting
+        # for the last rank.  Therefore an early peer needs two intervals plus
+        # a small handoff allowance.  Anything shorter can time out a peer
+        # milliseconds before rank 0 publishes a passing verdict, leaving the
+        # remaining ranks to enter a collective without it (measured on the Si
+        # MPA P4 path, JID 57909046.123).
         handoff_s = min(2.0, max(0.1, timeout_s * 0.1))
+        peer_wait_s = 2.0 * timeout_s + handoff_s
         try:
             payload = client.blocking_key_value_get_bytes(
-                f"{prefix}/verdict", int((timeout_s + handoff_s) * 1000))
+                f"{prefix}/verdict", int(peer_wait_s * 1000))
             verdict = json.loads(payload.decode("utf-8"))
         except Exception as exc:                            # noqa: BLE001
             records = _snapshot_compile_records(
@@ -1508,7 +1513,7 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
                 "occurrence": occurrence,
                 "reason": (
                     f"rank 0 published no verdict within "
-                    f"{timeout_s + handoff_s:g} seconds "
+                    f"{peer_wait_s:g} seconds "
                     f"({type(exc).__name__})"),
                 "records": records,
             }
