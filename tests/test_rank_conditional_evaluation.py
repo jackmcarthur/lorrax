@@ -23,12 +23,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-# Exact bad blocks from
-# ``d294ac52^:src/centroid/pivoted_cholesky.py`` and
-# ``3111aa71^:src/centroid/pivoted_cholesky.py``.  Both lived in
-# ``prune_candidates_by_pivoted_cholesky``; the surrounding thousand-line
-# selector is irrelevant to the lexical invariant, so the fixtures retain the
-# function name, parameters, and bad statements verbatim.
+# Exact old blocks from the two fixes whose corrected descendants are present
+# at ``d294ac52^`` and ``3111aa71^``.  The bad statements are copied verbatim
+# from the immediate pre-fix snapshots ``7a9c290a^`` and ``75ba9d82^``;
+# respectively, those are ancestors of the two requested audit points.  Both
+# lived in ``prune_candidates_by_pivoted_cholesky``; the surrounding
+# thousand-line selector is irrelevant to the lexical invariant, so the
+# fixtures retain the function name, parameters, and bad statements verbatim.
 _GRAM_DIAGNOSTIC_BEFORE_7A9C290A = """
 def prune_candidates_by_pivoted_cholesky(G, M, verbose):
     if verbose:
