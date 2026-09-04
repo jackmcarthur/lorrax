@@ -155,6 +155,15 @@ def validate_geometry(
         raise LauncherPolicyError(
             "LX-BADGEOMETRY", f"-n {ranks}", "at least one rank",
             "set -n to a positive rank count, or omit it for nodes*GPUs")
+    total_gpus = nodes * gpus_per_node
+    if gpus_per_node > 0 and ranks > total_gpus:
+        raise LauncherPolicyError(
+            "LX-BADGEOMETRY",
+            f"-N {nodes} -G {gpus_per_node} provides {total_gpus} GPUs "
+            f"but -n {ranks} asks for more GPU ranks",
+            "at most one rank per requested GPU",
+            f"use -n {total_gpus}, or request enough nodes/GPUs; -G is per node",
+        )
     return LaunchGeometry(nodes, gpus_per_node, ranks, site_gpus_per_node)
 
 

@@ -71,6 +71,12 @@ def test_gpu_count_is_per_node_and_p16_geometry_is_valid():
     with raises(LauncherPolicyError, match="-G is per node"):
         validate_geometry(4, 16, 16)
 
+    with raises(LauncherPolicyError, match="more GPU ranks"):
+        validate_geometry(1, 4, 9)
+
+    assert validate_geometry(1, 4, 1).ranks == 1
+    assert validate_geometry(1, 0, 9).ranks == 9
+
 
 def test_non_square_mesh_refuses_by_name():
     with raises(LauncherPolicyError, match="LX-NONSQUARE-MESH"):
