@@ -429,6 +429,11 @@ class SCInputs:
     #: padded certificate, or a new window name, gets its rule rebuilt and
     #: the rebuild is counted in the planner receipt (2026-09-03).
     fixed_quadrature_session: dict | None = None
+    #: Opaque artifact-provenance receipts resolved once by gw_init.  MPA
+    #: screening validates both on every map; the SC loop must not reopen or
+    #: independently fingerprint the source WFN/zeta artifacts.
+    wfn_fingerprint_binding: object | None = None
+    charge_zeta_identity: dict | None = None
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
     # record.  Component chatter remains on ``print_fn`` and can still be
@@ -2891,6 +2896,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             head_resolver=inputs.head_resolver,
             head_channel=getattr(inputs, 'head_channel', None),
             wfn=inputs.wfn,
+            wfn_fingerprint_binding=inputs.wfn_fingerprint_binding,
+            charge_zeta_identity=inputs.charge_zeta_identity,
             mpa_plan=mpa_plan,
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
@@ -5025,6 +5032,8 @@ def run_sc_driver(
     kin_ion: jax.Array,
     *,
     head_channel=None,
+    wfn_fingerprint_binding=None,
+    charge_zeta_identity=None,
     quad,
     e_ref: float,
     static_head_terms,
@@ -5242,6 +5251,8 @@ def run_sc_driver(
         screening_seed_cache={},
         fixed_quadrature_session=(
             {} if int(config.sc.max_iter) > 1 else None),
+        wfn_fingerprint_binding=wfn_fingerprint_binding,
+        charge_zeta_identity=charge_zeta_identity,
         print_fn=print_fn,
         record_fn=record_fn,
     )

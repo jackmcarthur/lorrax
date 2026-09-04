@@ -152,3 +152,28 @@ def test_gw_iteration_map_calls_the_stage_gate(monkeypatch):
     assert "_check_sigma_stage(sigma_result" in body
     assert body.index("sigma_result = compute_sigma_xc(") < body.index(
         "_check_sigma_stage(sigma_result")
+
+
+def test_sc_mpa_maps_receive_the_authenticated_zeta_receipt():
+    """The one-shot MPA provenance gate applies equally to every SC map."""
+    src = pathlib.Path(sc_iteration.__file__).read_text()
+    map_body = src[src.index("def gw_iteration_map("):
+                   src.index("def _scissor_E_qp_for_outofrange(")]
+    for spelling in (
+        "wfn_fingerprint_binding=inputs.wfn_fingerprint_binding",
+        "charge_zeta_identity=inputs.charge_zeta_identity",
+    ):
+        assert spelling in map_body
+
+    driver_body = src[src.index("def run_sc_driver("):
+                      src.index("def final_qp_eigenstates(")]
+    for spelling in (
+        "wfn_fingerprint_binding=wfn_fingerprint_binding",
+        "charge_zeta_identity=charge_zeta_identity",
+    ):
+        assert spelling in driver_body
+
+    gw_jax = pathlib.Path(sc_iteration.__file__).with_name("gw_jax.py")
+    driver = gw_jax.read_text()
+    assert "wfn_fingerprint_binding=isdf.wfn_fingerprint_binding" in driver
+    assert "charge_zeta_identity=isdf.charge_zeta_identity" in driver
