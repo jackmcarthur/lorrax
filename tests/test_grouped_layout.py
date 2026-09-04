@@ -288,6 +288,28 @@ def test_panel_selector_matches_rank_one_reference_in_canonical_order():
         rtol=2e-11, atol=2e-11)
 
 
+def test_rank_one_group_selector_reports_each_completed_group():
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
+    from common.pivoted_cholesky import (
+        make_sharded_group_block_pivoted_cholesky_select,
+    )
+
+    labels = _labels_from_sizes([2, 3, 2])
+    gram = jnp.diag(jnp.arange(7.0, 0.0, -1.0))
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    receipts = []
+    selector = make_sharded_group_block_pivoted_cholesky_select(
+        mesh, 7, 6, 3, mesh_axis=("x", "y"),
+        progress_fn=lambda *values: receipts.append(values))
+    result = selector.lower(gram, jnp.asarray(labels), None).compile()(
+        gram, jnp.asarray(labels), None)
+    jax.block_until_ready(result)
+
+    assert receipts == [(1, 0, 2, 2), (2, 1, 3, 5)]
+
+
 def test_panel_selector_preserves_rank_floor_and_post_floor_delivery():
     jax = pytest.importorskip("jax")
     import jax.numpy as jnp

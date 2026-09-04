@@ -46,6 +46,8 @@ from __future__ import annotations
 import gc
 import math
 import os
+import threading
+import time
 from functools import lru_cache, partial
 
 import numpy as np
@@ -71,13 +73,14 @@ _services.ensure_on_path()
 if TYPE_CHECKING:                                                   # pragma: no cover
     from wfn_loader import WfnLoader
 from common import timing
-from common.collectives import device_put_process_local
+from common.collectives import device_put_process_local, process_rank
 from common.gpu_utils import worst_process_resident_bytes
 from common.pivoted_cholesky import (
     make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
 )
 from runtime.padding import round_up
+from runtime.production_stream import failure_output_streams
 
 from . import distribution as dist
 
@@ -89,6 +92,141 @@ _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
 _GRAM_FINAL_FOLD_SLOTS = 3
 _CANDIDATE_GAMMA_MODES = ("charge", "transverse")
+
+
+def _make_group_progress_reporter(
+    print_fn,
+    *,
+    n_candidates: int,
+    n_groups: int,
+    point_budget: int,
+):
+    """Return the one host callback and its execution-clock initializer."""
+    state = {"start": None, "last": None}
+
+    def start() -> None:
+        now = time.perf_counter()
+        state["start"] = now
+        state["last"] = now
+
+    def report(group_number, group_id, group_size, committed) -> None:
+        now = time.perf_counter()
+        start_wall = state["start"] if state["start"] is not None else now
+        last_wall = state["last"] if state["last"] is not None else start_wall
+        state["last"] = now
+        print_fn(
+            "[centroid-select-progress] "
+            f"group={int(group_number)}/{int(n_groups)} "
+            f"id={int(group_id)} size={int(group_size)} "
+            f"committed={int(committed)}/{int(point_budget)} "
+            f"candidates={int(n_candidates)} "
+            f"group_wall_s={now - last_wall:.3f} "
+            f"elapsed_s={now - start_wall:.3f}"
+        )
+
+    return report, start
+
+
+def _run_bounded_select(
+    select_step,
+    operands,
+    *,
+    time_budget_s: float,
+    n_candidates: int,
+    n_groups: int,
+    point_budget: int,
+    print_fn,
+    start_progress,
+):
+    """Lower, compile, and execute one selector under one finite deadline.
+
+    A Python exception cannot reliably interrupt a thread blocked in a PJRT
+    device invocation.  On expiry every rank therefore writes the same named
+    refusal and exits immediately, matching the distributed fail-fast rule:
+    attempting backend teardown after one rank leaves a collective is itself
+    an unbounded wait.
+    """
+    budget = float(time_budget_s)
+    if not math.isfinite(budget) or budget <= 0.0:
+        raise ValueError(
+            "--prune-time-budget-seconds must be finite and > 0; "
+            f"got {time_budget_s!r}")
+    operands = tuple(operands)
+    started = time.perf_counter()
+    lock = threading.Lock()
+    state = {"phase": "lowering", "phase_start": started, "done": False}
+    rank0 = process_rank() == 0
+
+    def set_phase(phase: str) -> float:
+        now = time.perf_counter()
+        with lock:
+            state["phase"] = phase
+            state["phase_start"] = now
+        print_fn(
+            f"[centroid-select] phase={phase} state=start "
+            f"elapsed_s={now - started:.3f}")
+        return now
+
+    def expire() -> None:
+        now = time.perf_counter()
+        with lock:
+            if state["done"]:
+                return
+            phase = str(state["phase"])
+            phase_start = float(state["phase_start"])
+        message = (
+            "pivoted-Cholesky REFUSES [GATE centroid_select_time_budget]: "
+            f"--prune-time-budget-seconds got: {budget:g}; want: selector "
+            "lowering, compilation, and execution to complete within the "
+            "declared wall-time budget; why: continuing would leave all P "
+            "ranks in an unbounded lowering/device/collective wait. "
+            f"phase={phase} phase_wall_s={now - phase_start:.3f} "
+            f"elapsed_s={now - started:.3f} candidates={n_candidates} "
+            f"groups={n_groups} point_budget={point_budget}.\n")
+        if rank0:
+            for stream in failure_output_streams():
+                try:
+                    stream.write(message)
+                    stream.flush()
+                except Exception:
+                    pass
+        os._exit(124)
+
+    print_fn(
+        "[centroid-select] state=start "
+        f"candidates={n_candidates} groups={n_groups} "
+        f"point_budget={point_budget} time_budget_s={budget:g}")
+    timer = threading.Timer(budget, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        phase_start = set_phase("lowering")
+        lowered = select_step.lower(*operands)
+        now = time.perf_counter()
+        print_fn(
+            f"[centroid-select] phase=lowering state=done "
+            f"wall_s={now - phase_start:.3f} elapsed_s={now - started:.3f}")
+
+        phase_start = set_phase("compilation")
+        compiled = lowered.compile()
+        now = time.perf_counter()
+        print_fn(
+            f"[centroid-select] phase=compilation state=done "
+            f"wall_s={now - phase_start:.3f} elapsed_s={now - started:.3f}")
+
+        phase_start = set_phase("execution")
+        start_progress()
+        result = compiled(*operands)
+        jax.block_until_ready(result)
+        now = time.perf_counter()
+        print_fn(
+            f"[centroid-select] phase=execution state=done "
+            f"wall_s={now - phase_start:.3f} elapsed_s={now - started:.3f}")
+        return result
+    finally:
+        with lock:
+            state["done"] = True
+        timer.cancel()
 
 
 @lru_cache(maxsize=None)
@@ -780,6 +918,8 @@ def prune_candidates_by_pivoted_cholesky(
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
     group_block: bool = False,
+    select_time_budget_s: float = 900.0,
+    progress_print_fn=print,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -816,6 +956,11 @@ def prune_candidates_by_pivoted_cholesky(
     It admits an orbit only if the complete orbit fits, so the kernel itself
     returns the largest greedy whole-orbit set no larger than the point budget;
     there is no partial last block for the host to repair.
+
+    ``select_time_budget_s`` is a finite wall budget spanning selector
+    lowering, compilation, and execution. ``progress_print_fn`` receives one
+    receipt per completely deflated group.  The Gram build has its own stage
+    timing and is outside this selector-specific deadline.
 
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
@@ -982,13 +1127,29 @@ def prune_candidates_by_pivoted_cholesky(
             )
         group_id_jax = device_put_process_local(
             dense_pad, NamedSharding(mesh, PartitionSpec(select_axis)))
+        group_sizes_host = np.bincount(dense_id, minlength=n_groups)
+        if progress_print_fn is not None:
+            progress_print_fn(
+                "[centroid-select] group-census "
+                f"candidates={M} groups={n_groups} point_budget={budget} "
+                f"size_min={int(group_sizes_host.min())} "
+                f"size_median={float(np.median(group_sizes_host)):.1f} "
+                f"size_max={int(group_sizes_host.max())}")
+        progress_fn, start_progress = _make_group_progress_reporter(
+            progress_print_fn or (lambda _message: None),
+            n_candidates=M, n_groups=n_groups, point_budget=budget)
         with timing.section("prune.select"):
             select_step = _make_sharded_block_select(
                 mesh, M_pad, budget, n_groups,
-                mesh_axis=select_axis, tol_rel=tol_rel)
+                mesh_axis=select_axis, tol_rel=tol_rel,
+                progress_fn=progress_fn)
             (piv, L, rank, d_final, d_taken, trR_over_trG,
-             psd_info) = select_step(G, group_id_jax, active_init)
-            piv.block_until_ready()
+             psd_info) = _run_bounded_select(
+                 select_step, (G, group_id_jax, active_init),
+                 time_budget_s=select_time_budget_s,
+                 n_candidates=M, n_groups=n_groups, point_budget=budget,
+                 print_fn=progress_print_fn or (lambda _message: None),
+                 start_progress=start_progress)
         del L
 
         piv_np = np.asarray(piv)

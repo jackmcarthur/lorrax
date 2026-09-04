@@ -29,6 +29,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import io_callback
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from common.shard_map import shard_map
@@ -42,6 +43,45 @@ __all__ = [
     "make_sharded_group_block_pivoted_cholesky_select",
     "make_sharded_group_panel_pivoted_cholesky_select",
 ]
+
+
+def _group_progress_effect(
+    progress_fn,
+    finished,
+    group_number,
+    group_id,
+    group_size,
+    committed,
+    ready_value,
+):
+    """Emit one ordered host receipt after a complete group update.
+
+    The callback receives only five scalars.  ``ready_value`` is derived from
+    the updated residual and makes the receipt causally follow the numerical
+    work it reports; it is deliberately not exposed as a second diagnostic.
+    Every rank traces the same callback effect.  The caller-supplied reporter
+    owns rank filtering so multi-process executables retain one shape and one
+    collective sequence.
+    """
+    if progress_fn is None:
+        return jnp.int32(0)
+
+    result_shape = jax.ShapeDtypeStruct((), jnp.int32)
+    payload = jnp.asarray(
+        [group_number, group_id, group_size, committed, ready_value],
+        dtype=jnp.int32)
+
+    def _host_report(values):
+        progress_fn(*(int(value) for value in values[:4]))
+        return values[0]
+
+    return lax.cond(
+        finished,
+        lambda values: io_callback(
+            _host_report, result_shape, values, ordered=True),
+        lambda values: jnp.int32(0),
+        payload,
+    )
 
 
 def _mesh_axis_size(
@@ -619,6 +659,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
     tol_rel: float | None = None,
+    progress_fn=None,
 ):
     """Row-sharded counterpart of
     :func:`group_block_pivoted_cholesky_select`.
@@ -800,6 +841,19 @@ def make_sharded_group_block_pivoted_cholesky_select(
                 available = available & ~kill
                 current_left = current_left - jnp.where(avail, 1, 0)
                 d = jnp.where(kill, 0.0, jnp.where(take, d_new, d))
+                finished = avail & (current_left == 0)
+                progress_token = _group_progress_effect(
+                    progress_fn,
+                    finished,
+                    jnp.sum(chosen[:n_groups]).astype(jnp.int32),
+                    current,
+                    group_sizes[jnp.clip(current, 0, n_groups)],
+                    committed,
+                    jnp.isfinite(jnp.sum(d)).astype(jnp.int32),
+                )
+                # Carry a zero-valued dependency so the next loop iteration
+                # cannot run ahead of the ordered host receipt.
+                committed = committed + jnp.int32(0) * progress_token
                 return (d, L, piv, unadmitted, chosen, available, current,
                         current_left, committed, d_taken, trR,
                         d_min_raw, d_min_at, d_min_j)
@@ -845,6 +899,7 @@ def make_sharded_group_panel_pivoted_cholesky_select(
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
     tol_rel: float | None = None,
+    progress_fn=None,
 ):
     """Panelized whole-group selection on an orbit-local row layout.
 
@@ -1120,6 +1175,16 @@ def make_sharded_group_panel_pivoted_cholesky_select(
                 chosen = chosen.at[candidate].set(
                     chosen[candidate] | has_candidate)
                 committed = committed + block_size
+                progress_token = _group_progress_effect(
+                    progress_fn,
+                    has_candidate,
+                    iteration + jnp.int32(1),
+                    candidate,
+                    block_size,
+                    committed,
+                    jnp.isfinite(jnp.sum(d)).astype(jnp.int32),
+                )
+                committed = committed + jnp.int32(0) * progress_token
                 return (
                     iteration + 1, has_candidate, committed, d, L, piv,
                     available, chosen, d_taken, trR, d_min_raw,
