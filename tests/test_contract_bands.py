@@ -293,7 +293,8 @@ def test_refusals():
         proj(psi_l, o, psi_r)
         raise AssertionError("divisibility refusal did not fire")
     except ValueError as exc:
-        assert "pad_sigma_window" in str(exc) or "INDEPENDENTLY" in str(exc)
+        assert "carrier extent is 7, expected 8" in str(exc)
+        assert "logical extent 7 and divisor 2" in str(exc)
 
     # (b) inverted axes: large payload would ride the strided axis.
     try:

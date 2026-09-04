@@ -508,27 +508,19 @@ def main(argv=None):
 		       f"(padded from {meta.b_id_4_user} to the world size).")
 	check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
 
-	# ---- dynamic-Sigma layout: resolve-time capacity/geometry gate ----
-	# The config-level axis checks (self_consistent) already ran
-	# in ``config.qp_solver``; the two conditions below need the mesh and the
-	# σ window, known only here.  Refusing NOW costs seconds; refusing at the
-	# Σ stage would waste the whole ζ fit (pattern #6: the resolve-time check
-	# must test what will execute).  The Σ driver re-checks divisibility at
-	# its own seam as the last-line guard.
-	# THE SAME precondition the Σ drivers enforce, asked EARLY.  It is one
-	# function (``ppm_sigma.assert_sharded_sigma_window_divides_mesh``); this
-	# used to be a third hand-written copy of the modulus test, alongside the
-	# PPM branch's and — absent entirely — the MPA executor's.
+	# ---- dynamic-Sigma logical/carrier receipt ----
+	# Resolve the same square carrier the producer will use, early enough to
+	# print the allocation shape before ζ fitting.  This is informational:
+	# indivisible windows are ordinary exact-zero pads, not a geometry refusal.
 	#
-	# ``compute_mode = mpa`` reaches it whatever the deck says about the
-	# layout, because the MPA executor emits the sharded cube unconditionally
-	# (the dispatch refuses ``replicated`` by name for that reason).
+	# ``compute_mode = mpa`` reaches it whatever the deck says about layout,
+	# because the MPA executor emits the sharded cube unconditionally.
 	_p_x = int(mesh_xy.devices.shape[0])
 	_p_y = int(mesh_xy.devices.shape[1])
 	_nbs = int(meta.nb_sigma)
 	if mode.is_dynamic:
-		from .ppm_sigma import assert_sharded_sigma_window_divides_mesh
-		assert_sharded_sigma_window_divides_mesh(
+		from .ppm_sigma import sigma_band_axis
+		_sigma_axis = sigma_band_axis(
 			_nbs, mesh_xy,
 			ansatz=f"compute_mode = {getattr(mode, 'value', mode)}")
 		# The second refusal that used to live here -- sharded layout with
@@ -539,7 +531,8 @@ def main(argv=None):
 		# so it was also the weakest.  Nothing can select that writer now.
 		print0(
 			f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
-			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh end-to-end "
+			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh at "
+			f"logical/carrier={_sigma_axis.logical}/{_sigma_axis.carrier} "
 			f"(consumers read tiles; no full-cube replication).")
 
 	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the

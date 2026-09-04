@@ -46,6 +46,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
+from runtime.padding import PaddedAxis
 from .gw_config import (
     BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
     band_extrapolation_is_consumable,
@@ -136,6 +137,7 @@ class SigmaResult:
     #: keeps the default path's object graph unchanged.
     sigma_xc_kij_ry_unextrap: jax.Array | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
+    sigma_band_axis: PaddedAxis | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     sigma_c_odd_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
@@ -267,6 +269,7 @@ BASIS_FREE_FIELDS = (
     "omega_grid_ev",
     "omega_grid_ry",
     "sigma_omega_h5_path",
+    "sigma_band_axis",
     "photon_head_sigma_basis",
     "efermi_dft_ev",
     "omega_reference_provenance",
@@ -357,6 +360,7 @@ def finalize_dynamic_sigma(
     sigma_c_body_omega: jax.Array,
     head_sigma_diag_w_kn_ry: np.ndarray | None,
     *,
+    sigma_band_axis: PaddedAxis | None,
     sig_x: jax.Array,
     sig_h: jax.Array,
     v_h_scalar: jax.Array | None = None,
@@ -418,7 +422,8 @@ def finalize_dynamic_sigma(
 
     with timing.section("gw_jax.dynamic_sigma_finalize"):
         sigma_c_omega = add_head_sigma_diag(
-            sigma_c_body_omega, head_sigma_diag_w_kn_ry)
+            sigma_c_body_omega, head_sigma_diag_w_kn_ry,
+            band_axis=sigma_band_axis)
 
         (sigma_c_at_dft_ev,
          omega_dft_rel_ev,
@@ -429,6 +434,7 @@ def finalize_dynamic_sigma(
             config=config,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy, print_fn=print_fn,
+            band_axis=sigma_band_axis,
             efermi_ry=efermi_ry,
             efermi_provenance=efermi_provenance,
         )
@@ -443,6 +449,7 @@ def finalize_dynamic_sigma(
                 config=config,
                 band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
                 mesh_xy=mesh_xy, print_fn=lambda *args, **kwargs: None,
+                band_axis=sigma_band_axis,
                 efermi_ry=efermi_ry,
                 efermi_provenance=efermi_provenance,
             )
@@ -491,6 +498,7 @@ def finalize_dynamic_sigma(
                     else "self_consistent_qp"),
                 omega_coverage=omega_coverage,
                 sym=sym, band_extrapolation=band_extrapolation,
+                band_axis=sigma_band_axis,
                 print_fn=print_fn,
             )
         else:
@@ -521,6 +529,7 @@ def finalize_dynamic_sigma(
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
+            band_axis=sigma_band_axis,
             **qsgw_edge_kwargs,
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
@@ -554,10 +563,12 @@ def finalize_dynamic_sigma(
         sigma_xc_qsgw_unextrap = None
         if sigma_c_body_omega_unextrap is not None:
             sigma_c_omega_unextrap = add_head_sigma_diag(
-                sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry)
+                sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
+                band_axis=sigma_band_axis)
             sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
                 sigma_c_omega_unextrap, sig_x_rep,
                 omega_grid_ev, e_qp_rel_ev, mesh_xy,
+                band_axis=sigma_band_axis,
                 **qsgw_edge_kwargs,
             )
 
@@ -592,6 +603,7 @@ def finalize_dynamic_sigma(
         sigma_lorentz_skij_ry=sigma_lorentz,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
         sigma_c_omega_kij_ry=sigma_c_omega,
+        sigma_band_axis=sigma_band_axis,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         sigma_c_odd_at_dft_diag_ev=sigma_c_odd_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
@@ -1350,6 +1362,7 @@ def compute_sigma_xc(
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
         return finalize_dynamic_sigma(
             body.sigma_c_kij, head_diag,
+            sigma_band_axis=body.band_axis,
             sig_x=sig_x, sig_h=sig_h,
             v_h_scalar=v_h_scalar, h_transverse=h_transverse,
             hartree_omitted=bool(omit_v_h),
@@ -1418,6 +1431,7 @@ def compute_sigma_xc(
     return finalize_dynamic_sigma(
         ppm_outputs.sigma_c_body_omega,
         ppm_outputs.head_sigma_diag_w_kn_ry,
+        sigma_band_axis=ppm_outputs.band_axis,
         photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
         photon_head_sigma_basis=photon_head_sigma_basis,
         sigma_lorentz_static_skij_ry=sigma_lorentz,

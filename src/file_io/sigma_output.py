@@ -1280,6 +1280,7 @@ def write_sigma_omega_h5(
 	eval_energies_provenance=None,
 	omega_coverage=None,
 	band_extrapolation=None,
+	band_axis=None,
 	print_fn=None,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
@@ -1372,6 +1373,16 @@ def write_sigma_omega_h5(
 	n_omega, nk, nb, nb2 = shape_ref
 	if nb != nb2:
 		raise ValueError("dynamic sigma tensors must be square in band indices.")
+	logical_nb = nb
+	if band_axis is not None:
+		logical_nb = int(band_axis.logical)
+		expected_carrier = int(band_axis.carrier)
+		if nb != expected_carrier:
+			raise ValueError(
+				"write_sigma_omega_h5: Sigma band carrier is "
+				f"{nb}, expected {expected_carrier} for logical extent "
+				f"{logical_nb} and divisor {int(band_axis.divisor)}")
+	storage_shape = (n_omega, nk, logical_nb, logical_nb)
 	component_flags = (
 		hartree_scalar_kij_ev is not None,
 		hartree_transverse_kij_ev is not None,
@@ -1434,7 +1445,7 @@ def write_sigma_omega_h5(
 		payload, star, omega_ev=omega_ev, nk_full=nk, print_fn=print_fn)
 	if star is not None:
 		nk = int(np.shape(payload["sigma_total_kij_ev"])[1])
-		shape_ref = (n_omega, nk, nb, nb2)
+		storage_shape = (n_omega, nk, logical_nb, logical_nb)
 
 	eval_rel_extracted = payload.pop(SIGMA_EVAL_DATASET, None)
 	total = payload["sigma_total_kij_ev"]
@@ -1448,8 +1459,15 @@ def write_sigma_omega_h5(
 			hartree_kij_ev, hartree_scalar_kij_ev,
 			hartree_transverse_kij_ev, where="file-wedge raw Sigma payload")
 
+	def _band_receipt_attrs(attrs):
+		if band_axis is not None:
+			attrs["band_logical_extent"] = logical_nb
+			attrs["band_carrier_extent"] = int(band_axis.carrier)
+			attrs["band_carrier_divisor"] = int(band_axis.divisor)
+		return attrs
+
 	def _direct_attrs(name, semantics):
-		attrs = dict(_attrs(name) or {})
+		attrs = _band_receipt_attrs(dict(_attrs(name) or {}))
 		attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
 		attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
 		attrs["direct_field_semantics"] = semantics
@@ -1460,10 +1478,14 @@ def write_sigma_omega_h5(
 
 	def _operator_attrs(name):
 		"""k-storage stamps plus the one meaning shared by every raw cube."""
-		at = dict(_attrs(name) or {})
+		at = _band_receipt_attrs(dict(_attrs(name) or {}))
 		at[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
 		at[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
 		return at
+
+	def _operator_storage_shape(values):
+		shape = tuple(int(n) for n in values.shape)
+		return shape[:-2] + (logical_nb, logical_nb)
 
 	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
 		# Creation-time promise, before the later live assemble_eqp append.
@@ -1505,23 +1527,23 @@ def write_sigma_omega_h5(
 			io.write_attr(SYM_IDX_DATASET,
 				np.asarray(sym_idx_k, dtype=np.int32))
 		io.create_dataset("sigma_total_kij_ev",
-			shape=shape_ref, dtype=np.complex128,
+			shape=storage_shape, dtype=np.complex128,
 			attrs=_operator_attrs("sigma_total_kij_ev"))
 		io.write_slab("sigma_total_kij_ev", total)
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
-				shape=shape_ref, dtype=np.complex128,
+				shape=storage_shape, dtype=np.complex128,
 				attrs=_operator_attrs("sigma_c_kij_ev"))
 			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev)
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
-				shape=tuple(sigma_sx_kij_ev.shape),
+				shape=_operator_storage_shape(sigma_sx_kij_ev),
 				dtype=np.complex128,
 				attrs=_operator_attrs("sigma_sx_kij_ev"))
 			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev)
 		if hartree_kij_ev is not None:
 			io.create_dataset("hartree_kij_ev",
-				shape=tuple(hartree_kij_ev.shape),
+				shape=_operator_storage_shape(hartree_kij_ev),
 				dtype=np.complex128,
 				attrs=(
 					_operator_attrs("hartree_kij_ev")
@@ -1530,14 +1552,14 @@ def write_sigma_omega_h5(
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
 		if hartree_scalar_kij_ev is not None:
 			io.create_dataset("hartree_scalar_kij_ev",
-				shape=tuple(hartree_scalar_kij_ev.shape),
+				shape=_operator_storage_shape(hartree_scalar_kij_ev),
 				dtype=np.complex128,
 				attrs=_direct_attrs(
 					"hartree_scalar_kij_ev", "V_H_scalar"))
 			io.write_slab("hartree_scalar_kij_ev", hartree_scalar_kij_ev)
 		if hartree_transverse_kij_ev is not None:
 			io.create_dataset("hartree_transverse_kij_ev",
-				shape=tuple(hartree_transverse_kij_ev.shape),
+				shape=_operator_storage_shape(hartree_transverse_kij_ev),
 				dtype=np.complex128,
 				attrs=_direct_attrs(
 					"hartree_transverse_kij_ev", "H_transverse"))

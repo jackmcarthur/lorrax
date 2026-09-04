@@ -1,65 +1,10 @@
-"""Real multi-rank CUDA gate for the MPA split-Sigma-window fix
-(``gw.mpa.sigma._integrate_sigma_batches``, 2026-08-23).
+"""Real P4 gate for the runtime-owned Sigma band carrier.
 
-Companion to ``tests/test_sigma_window_pad.py`` (the shape-only, single-
-device unit tests for ``pad_sigma_window``/``strip_sigma_window``) and to
-``tests/test_pack_band_window.py`` (the analogous INPUT-side repack this
-fix's mechanism is reused from). Neither of those exercises a genuinely
-mesh-sharded ``P(...,'x','y')`` array through ``strip_sigma_window`` --
-every array they build lives on ONE device (``jnp.asarray`` with no
-explicit sharding), so the new device-array arm added here
-(:func:`gw.ppm_sigma._strip_sharded_sigma_window_kernel`) has no real
-coverage until this file runs on real multi-process CUDA.
-
-Named gap this closes: ``gw.mpa.sigma._integrate_sigma_batches``
-``layout='face'`` used to refuse outright whenever ``nb_sigma !=
-nb_full`` (a split Sigma window -- the common case: a deck usually loads
-more bands for chi0/screening than it evaluates Sigma over).  The fix
-keeps the accumulator at ``nb_full`` (the input side is untouched --
-``contract_bands``'s face GEMM plans are fixed at that width, see
-``mpa/sigma.py``'s own updated comment for why narrowing the INPUT was
-the wrong lever) and instead repacks the OUTPUT ``Sigma_c(omega,k,m,n)``
-down to ``nb_sigma`` post-hoc, reusing
-``wavefunction_bundle.pack_band_window``'s OWN mechanism
-(``jax.lax.slice_in_dim`` + ``jax.lax.with_sharding_constraint``) rather
-than a numpy-style slice (illegal on a live mesh-sharded axis whenever
-the target extent does not itself divide the mesh).
-
-    lx run -N 1 -G 4 -n 4 bash <wrapper.sh> \\
-        tests/test_mpa_sigma_split_window_strip.py --mesh 2x2
-
-Under plain pytest (one process) every case SKIPS rather than failing --
-it names exactly why (process_count), matching every sibling face-layout
-gate in this directory (TASTE.md, "a check that cannot fail is not
-evidence").
-
-Cases
------
-* ``strip_divisible_window`` -- a genuine 2x2-mesh-sharded
-  ``(n_omega, nk, nb_full, nb_full)`` complex128 array, stripped to a
-  SMALLER ``nb_real`` that itself divides the mesh (the achievable case
-  ``_integrate_sigma_batches`` now serves): the mesh-aware kernel's
-  result must equal a HOST reference (gather the full array, then plain
-  numpy-slice it -- ``strip_sigma_window``'s own host/numpy arm, exercised
-  on the SAME data as an independent oracle) bit-exactly (pure
-  data movement -- a slice + a resharding collective, no arithmetic).
-  Checked at TWO nb_real values on the same input, including nb_real ==
-  the mesh size itself (a degenerate 1-per-rank window).
-* ``strip_full_window_is_identity`` -- ``nb_real == nb_full`` returns the
-  VERY SAME array object (the no-op fast path both layouts already relied
-  on) -- checked by identity, not just value equality; confirms this fix
-  did not disturb the unsplit case any existing gate already covers.
-* ``strip_indivisible_window_refuses`` -- ``nb_real`` that does NOT
-  divide the mesh: ``assert_sharded_sigma_window_divides_mesh`` (the SAME
-  shared owner the legacy branch already calls) refuses BEFORE any
-  attempt to build the illegal sharding -- the "genuinely impossible
-  sub-case" the fix keeps refusing, by name, rather than reworking
-  around it.
-* ``strip_missing_mesh_refuses`` -- a live mesh-sharded array reaching
-  ``strip_sigma_window`` with ``mesh_xy=None`` refuses loudly (the
-  defensive backstop for a future caller that forgets it) rather than
-  mis-indexing -- process-count-gated for the same reason as the others
-  (building the P('x','y') array at all needs real ranks).
+The dynamic producer publishes only a square ``P(..., 'x', 'y')`` carrier.
+An indivisible logical window therefore stays live as a divisible carrier
+whose tail rows and columns are exact zero.  Only a replicated/host output
+consumer strips that carrier.  These cells cover both the old divisible
+strip seam and the formerly-refused 5 -> 6 carrier on a real 2x2 mesh.
 """
 from __future__ import annotations
 
@@ -87,8 +32,8 @@ import jax.numpy as jnp
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from gw.ppm_sigma import (assert_sharded_sigma_window_divides_mesh,
-                          strip_sigma_window)
+from gw.ppm_sigma import sigma_band_axis, strip_sigma_window
+from runtime.padding import PaddedAxis, pad_square, strip_axis
 
 PX = PY = 2
 
@@ -115,10 +60,11 @@ def check_strip_divisible_window(mesh, *, nb_full, nb_real, seed):
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
     sigma, full = _sharded_sigma(mesh, n_omega=3, nk=2, nb_full=nb_full,
                                  seed=seed)
-    assert_sharded_sigma_window_divides_mesh(
-        nb_real, mesh, ansatz="compute_mode = mpa")
+    tag = PaddedAxis(
+        name="test Sigma band window", logical=nb_real,
+        carrier=nb_full, divisor=PX)
     got = jax.block_until_ready(
-        strip_sigma_window(sigma, nb_real, mesh_xy=mesh))
+        strip_sigma_window(sigma, tag, mesh_xy=mesh))
     got_h = _to_host(got)
     want_h = full[..., :nb_real, :nb_real]
     assert got_h.shape == want_h.shape, (got_h.shape, want_h.shape)
@@ -132,42 +78,35 @@ def check_strip_divisible_window(mesh, *, nb_full, nb_real, seed):
 def check_strip_full_window_is_identity(mesh, *, nb_full):
     sigma, _ = _sharded_sigma(mesh, n_omega=2, nk=1, nb_full=nb_full,
                               seed=99)
-    out = strip_sigma_window(sigma, nb_full, mesh_xy=mesh)
+    tag = PaddedAxis(
+        name="test Sigma band window", logical=nb_full,
+        carrier=nb_full, divisor=PX)
+    out = strip_sigma_window(sigma, tag, mesh_xy=mesh)
     assert out is sigma, "nb_real == nb_full must be a true no-op"
 
 
-def check_strip_indivisible_window_refuses(mesh, *, nb_full, nb_real):
-    sigma, _ = _sharded_sigma(mesh, n_omega=2, nk=1, nb_full=nb_full,
-                              seed=7)
-    try:
-        assert_sharded_sigma_window_divides_mesh(
-            nb_real, mesh, ansatz="compute_mode = mpa")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError(
-            f"expected assert_sharded_sigma_window_divides_mesh to refuse "
-            f"nb_real={nb_real} on a {PX}x{PY} mesh")
-    # strip_sigma_window itself does not re-derive divisibility (the
-    # caller's assert is the single owner) -- what it must do on an
-    # indivisible target via the mesh-aware arm is either raise or produce
-    # something that is NOT silently wrong; the production caller never
-    # reaches this call because it asserts first (mirrored above), so this
-    # only confirms the guard fires before mpa/sigma.py would ever try.
-    del sigma
-
-
-def check_strip_missing_mesh_refuses(mesh, *, nb_full, nb_real):
-    sigma, _ = _sharded_sigma(mesh, n_omega=2, nk=1, nb_full=nb_full,
-                              seed=11)
-    try:
-        strip_sigma_window(sigma, nb_real)
-    except ValueError as exc:
-        assert "mesh_xy" in str(exc), exc
-    else:
-        raise AssertionError(
-            "expected strip_sigma_window to refuse a mesh-sharded array "
-            "with mesh_xy=None rather than mis-index it")
+def check_indivisible_window_uses_zero_carrier(mesh, *, nb_real):
+    """The old refusal case is a live divisible carrier with inert tails."""
+    tag = sigma_band_axis(nb_real, mesh, ansatz="compute_mode = mpa")
+    assert tag.logical == nb_real
+    assert tag.carrier == 6
+    rng = np.random.default_rng(7)
+    logical = (rng.standard_normal((2, 1, nb_real, nb_real))
+               + 1j * rng.standard_normal((2, 1, nb_real, nb_real)))
+    carrier = np.asarray(pad_square(jnp.asarray(logical), tag))
+    np.testing.assert_array_equal(
+        carrier[..., :nb_real, :nb_real], logical)
+    np.testing.assert_array_equal(carrier[..., nb_real:, :], 0)
+    np.testing.assert_array_equal(carrier[..., :, nb_real:], 0)
+    sigma = jax.device_put(
+        jnp.asarray(carrier),
+        NamedSharding(mesh, P(None, None, "x", "y")))
+    # The sharded cube remains at carrier width.  The public diagonal gather
+    # is the replicated consumer boundary, then the owner strips by receipt.
+    from gw.qsgw_utils import extract_sigma_diag_replicated
+    got = np.asarray(extract_sigma_diag_replicated(sigma, mesh))
+    got = np.asarray(strip_axis(got, tag, axis=-1))
+    np.testing.assert_array_equal(got, np.diagonal(logical, axis1=-2, axis2=-1))
 
 
 _DIVISIBLE_CASES = (
@@ -196,22 +135,13 @@ def test_strip_full_window_is_identity():
     check_strip_full_window_is_identity(mesh, nb_full=6)
 
 
-def test_strip_indivisible_window_refuses():
+def test_indivisible_window_uses_zero_carrier():
     if jax.process_count() < PX * PY:
         pytest.skip(
             f"needs {PX * PY} REAL processes; "
             f"got process_count={jax.process_count()}")
     mesh = Mesh(np.asarray(jax.devices()).reshape(PX, PY), ("x", "y"))
-    check_strip_indivisible_window_refuses(mesh, nb_full=8, nb_real=5)
-
-
-def test_strip_missing_mesh_refuses():
-    if jax.process_count() < PX * PY:
-        pytest.skip(
-            f"needs {PX * PY} REAL processes; "
-            f"got process_count={jax.process_count()}")
-    mesh = Mesh(np.asarray(jax.devices()).reshape(PX, PY), ("x", "y"))
-    check_strip_missing_mesh_refuses(mesh, nb_full=8, nb_real=4)
+    check_indivisible_window_uses_zero_carrier(mesh, nb_real=5)
 
 
 def _cli_main():
@@ -240,11 +170,9 @@ def _cli_main():
     for name, fn, kwargs in (
         ("strip_full_window_is_identity",
          check_strip_full_window_is_identity, dict(nb_full=6)),
-        ("strip_indivisible_window_refuses",
-         check_strip_indivisible_window_refuses,
-         dict(nb_full=8, nb_real=5)),
-        ("strip_missing_mesh_refuses",
-         check_strip_missing_mesh_refuses, dict(nb_full=8, nb_real=4)),
+        ("indivisible_window_uses_zero_carrier",
+         check_indivisible_window_uses_zero_carrier,
+         dict(nb_real=5)),
     ):
         total += 1
         try:

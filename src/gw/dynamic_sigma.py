@@ -57,6 +57,8 @@ class OmegaCoverage:
 def add_head_sigma_diag(
     sigma_c_body_omega: jax.Array,
     head_sigma_diag_w_kn_ry: np.ndarray | None,
+    *,
+    band_axis=None,
 ) -> jax.Array:
     """Add a band-diagonal dynamic q->0 head to a Sigma_c body cube.
 
@@ -72,10 +74,22 @@ def add_head_sigma_diag(
         return sigma_c_body_omega
 
     head = np.asarray(head_sigma_diag_w_kn_ry)
-    if head.shape != sigma_c_body_omega.shape[:3]:
+    expected_head = tuple(sigma_c_body_omega.shape[:2]) + (
+        int(band_axis.logical) if band_axis is not None
+        else int(sigma_c_body_omega.shape[2]),)
+    if head.shape != expected_head:
         raise ValueError(
             "dynamic Sigma head shape must match the body diagonal: "
             f"head={head.shape}, body={sigma_c_body_omega.shape}")
+    if band_axis is not None:
+        from runtime.padding import authenticate_axis, pad_to_axis
+        authenticate_axis(
+            sigma_c_body_omega, band_axis, axis=-2,
+            where="dynamic Sigma body producer")
+        authenticate_axis(
+            sigma_c_body_omega, band_axis, axis=-1,
+            where="dynamic Sigma body producer")
+        head = pad_to_axis(jnp.asarray(head), band_axis, axis=-1)
 
     from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
     if is_band_sharded_sigma_omega(sigma_c_body_omega):
@@ -94,6 +108,7 @@ def eval_sigma_c_at_dft_energies(
     config,
     band_slices, wfn, sym, meta, mesh_xy,
     print_fn,
+    band_axis=None,
     efermi_ry=None,
     efermi_provenance=None,
 ):
@@ -147,9 +162,12 @@ def eval_sigma_c_at_dft_energies(
     from .qsgw_utils import (extract_sigma_diag_replicated,
                              interp_along_omega, omega_coverage,
                              resolve_out_of_range_policy)
-    sig_c_diag = (
-        np.asarray(extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
-        * RYD_TO_EV)
+    sig_c_diag = np.asarray(
+        extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
+    if band_axis is not None:
+        from runtime.padding import strip_axis
+        sig_c_diag = np.asarray(strip_axis(sig_c_diag, band_axis, axis=-1))
+    sig_c_diag = sig_c_diag * RYD_TO_EV
     grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
     # THE OUTPUT PATH, so the policy is named and the count is REPORTED.
     # Until 2026-08-22 this call clamped every uncovered state to the grid
@@ -204,6 +222,7 @@ def write_sigma_omega(
     omega_coverage=None,
     sym=None,
     band_extrapolation=None,
+    band_axis=None,
     print_fn=None,
 ) -> str:
     """Write canonical ``sigma_mnk.h5`` for any dynamic Sigma ansatz.
@@ -246,6 +265,13 @@ def write_sigma_omega(
         if h_transverse is not None:
             raise ValueError("write_sigma_omega: H_T requires scalar V_H")
         v_h_scalar = sig_h
+    if band_axis is not None:
+        from runtime.padding import pad_square
+        sig_x = pad_square(sig_x, band_axis)
+        sig_h = pad_square(sig_h, band_axis)
+        v_h_scalar = pad_square(v_h_scalar, band_axis)
+        if h_transverse is not None:
+            h_transverse = pad_square(h_transverse, band_axis)
     hartree_ev = RYD_TO_EV * sig_h
     if h_transverse is not None:
         # Component-aware files derive their aggregate in output units from
@@ -303,6 +329,7 @@ def write_sigma_omega(
             eval_energies_provenance=eval_energies_provenance,
             omega_coverage=omega_coverage,
             band_extrapolation=band_extrapolation,
+            band_axis=band_axis,
             print_fn=print_fn,
         )
         return out_path
@@ -326,6 +353,7 @@ def write_sigma_omega(
         eval_energies_provenance=eval_energies_provenance,
         omega_coverage=omega_coverage,
         band_extrapolation=band_extrapolation,
+        band_axis=band_axis,
         print_fn=print_fn,
     )
     return out_path

@@ -213,9 +213,9 @@ def check_packed_kernel_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
         jnp.asarray(psi_full[:, :nb_sigma, :, :]), xr_spec)
     psi_proj_yn_L0 = jax.device_put(
         jnp.asarray(psi_full_T[:, :, :, :nb_sigma]), yn_spec)
-    psi_proj_xr_L, psi_proj_yn_L, nb_real = pad_sigma_window(
+    psi_proj_xr_L, psi_proj_yn_L, band_axis = pad_sigma_window(
         psi_proj_xr_L0, psi_proj_yn_L0, mesh)
-    assert nb_real == nb_sigma
+    assert band_axis.logical == nb_sigma
     tau_kernel_legacy = get_shared_sigma_tau_kernel(
         mesh_xy=mesh, kgrid=kgrid, brackets=brackets)
     out_legacy = jax.block_until_ready(tau_kernel_legacy(

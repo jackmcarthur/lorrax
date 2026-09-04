@@ -37,6 +37,7 @@ round-up; do not unify the two.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import NamedTuple
 
 
@@ -121,6 +122,7 @@ def padded_axis(
     name: str,
     spec=None,
     axis: int | None = None,
+    specs: tuple[tuple[object, int], ...] | None = None,
     extra: int = 0,
 ) -> PaddedAxis:
     """Create the canonical logical-to-mesh-carrier receipt for an axis.
@@ -140,7 +142,14 @@ def padded_axis(
         raise ValueError(f"{name}: logical extent must be >= 0; got {n}")
     if extra_n < 0:
         raise ValueError(f"{name}: extra pad must be >= 0; got {extra_n}")
-    if spec is None:
+    if spec is not None and specs is not None:
+        raise TypeError(f"{name}: give spec or specs, not both")
+    if specs is not None:
+        divisors = tuple(
+            spec_divisor(divisor_or_mesh, one_spec, int(one_axis))
+            for one_spec, one_axis in specs)
+        divisor = math.lcm(*divisors) if divisors else 1
+    elif spec is None:
         divisor = mesh_divisor(divisor_or_mesh)
     else:
         if axis is None:
@@ -151,6 +160,35 @@ def padded_axis(
         carrier = round_up(carrier + extra_n, divisor)
     return PaddedAxis(
         name=str(name), logical=n, carrier=carrier, divisor=divisor)
+
+
+def authenticate_padded_axis(
+    logical: int,
+    carrier: int,
+    divisor_or_mesh,
+    *,
+    name: str,
+    spec=None,
+    axis: int | None = None,
+    specs: tuple[tuple[object, int], ...] | None = None,
+) -> PaddedAxis:
+    """Authenticate the canonical carrier for one logical mesh axis.
+
+    Readers and consumers use this counterpart to :func:`padded_axis` when
+    both extents already exist.  The expected carrier and every divisor are
+    derived here; callers never inspect a modulus or silently accept an
+    over-padded shape from another convention.
+    """
+    expected = padded_axis(
+        logical, divisor_or_mesh, name=name, spec=spec, axis=axis,
+        specs=specs)
+    observed = int(carrier)
+    if observed != expected.carrier:
+        raise ValueError(
+            f"{expected.name}: carrier extent is {observed}, expected "
+            f"{expected.carrier} for logical extent {expected.logical} and "
+            f"divisor {expected.divisor}")
+    return expected
 
 
 def axis_mask(tag: PaddedAxis, *, dtype=bool):
@@ -171,8 +209,10 @@ def pad_to_axis(A, tag: PaddedAxis, *, axis: int = -1, fill: float = 0.0):
     """Normalize ``A`` to ``tag.carrier`` along ``axis``.
 
     Inputs may be logical-width or a wider reusable carrier.  Only the leading
-    logical interval is meaningful, so a wider input is first sliced to that
-    interval and then padded to the canonical carrier.
+    logical interval is meaningful.  A wider input is normalized directly to
+    the canonical carrier, then the tagged tail is overwritten with ``fill``.
+    This ordering never publishes a non-mesh-divisible logical-width
+    intermediate when the source and destination are both legal carriers.
     """
     import jax.numpy as jnp
 
@@ -182,15 +222,58 @@ def pad_to_axis(A, tag: PaddedAxis, *, axis: int = -1, fill: float = 0.0):
         raise ValueError(
             f"{tag.name}: logical extent {tag.logical} exceeds source carrier "
             f"extent {source} on axis {ax}")
-    if source == tag.carrier:
+    if source > tag.carrier:
+        A = jax_slice_axis(A, tag.carrier, axis=ax)
+    elif source < tag.carrier:
+        widths = [(0, 0)] * A.ndim
+        widths[ax] = (0, tag.carrier - source)
+        A = jnp.pad(A, widths, mode="constant", constant_values=fill)
+    if not tag.pad:
         return A
-    if source != tag.logical:
-        A = jax_slice_axis(A, tag.logical, axis=ax)
-    if tag.carrier == tag.logical:
-        return A
-    widths = [(0, 0)] * A.ndim
-    widths[ax] = (0, tag.pad)
-    return jnp.pad(A, widths, mode="constant", constant_values=fill)
+    shape = [1] * A.ndim
+    shape[ax] = tag.carrier
+    mask = axis_mask(tag).reshape(shape)
+    return jnp.where(mask, A, jnp.asarray(fill, dtype=A.dtype))
+
+
+def pad_square(
+    A,
+    tag: PaddedAxis,
+    *,
+    axes: tuple[int, int] = (-2, -1),
+    fill: float = 0.0,
+    pad_diagonal: float | None = None,
+):
+    """Normalize two matrix axes to one square carrier.
+
+    ``pad_diagonal`` optionally sets the diagonal of the pad-only block after
+    zero/sentinel padding.  It is used for identity-embedded rotations and for
+    eigensolver sentinels; off-diagonal coupling to the logical block remains
+    exactly zero.
+    """
+    import jax.numpy as jnp
+
+    left, right = (int(a) % int(A.ndim) for a in axes)
+    if int(A.shape[left]) < tag.logical or int(A.shape[right]) < tag.logical:
+        raise ValueError(
+            f"{tag.name}: logical square extent {tag.logical} exceeds source "
+            f"carrier shape {tuple(int(n) for n in A.shape)} on axes "
+            f"{(left, right)}")
+    out = pad_to_axis(A, tag, axis=left, fill=fill)
+    out = pad_to_axis(out, tag, axis=right, fill=fill)
+    if pad_diagonal is not None and tag.pad:
+        i = jnp.arange(tag.carrier)
+        diag = jnp.where(i < tag.logical, jnp.diagonal(
+            out, axis1=left, axis2=right), jnp.asarray(
+                pad_diagonal, dtype=out.dtype))
+        # Matrix axes are trailing at every current consumer.  Refuse a future
+        # non-trailing spelling rather than inventing a second scatter rule.
+        if (left, right) != (out.ndim - 2, out.ndim - 1):
+            raise ValueError(
+                f"{tag.name}: pad_diagonal requires trailing matrix axes; "
+                f"got {(left, right)} for rank {out.ndim}")
+        out = out.at[..., i, i].set(diag)
+    return out
 
 
 def strip_axis(A, tag: PaddedAxis, *, axis: int = -1):
@@ -279,8 +362,8 @@ def extra_mu_pad() -> int:
     return val
 
 
-def padded_mu_extent(n_rmu: int, divisor) -> int:
-    """Single source of truth for the padded μ extent (``Meta.n_rmu_padded``).
+def padded_mu_axis(n_rmu: int, divisor) -> PaddedAxis:
+    """Return the charge/current-centroid logical-to-carrier receipt.
 
     ``round_up(n_rmu, divisor)`` — plus, when the test-only
     ``LORRAX_EXTRA_MU_PAD`` env knob is set (see :func:`extra_mu_pad`),
@@ -298,7 +381,12 @@ def padded_mu_extent(n_rmu: int, divisor) -> int:
         a Mesh whose axis-size product is used.
     """
     return padded_axis(
-        int(n_rmu), divisor, name="centroid mu", extra=extra_mu_pad()).carrier
+        int(n_rmu), divisor, name="centroid mu", extra=extra_mu_pad())
+
+
+def padded_mu_extent(n_rmu: int, divisor) -> int:
+    """Compatibility scalar for callers not yet carrying the μ receipt."""
+    return padded_mu_axis(n_rmu, divisor).carrier
 
 
 def solve_at_logical(solve_fn, n_logical, mats, rhs=None, *, pad_axes=(-2,)):
@@ -523,11 +611,14 @@ __all__ = [
     "round_up",
     "PaddedAxis",
     "padded_axis",
+    "authenticate_padded_axis",
     "axis_mask",
     "pad_to_axis",
+    "pad_square",
     "strip_axis",
     "authenticate_axis",
     "extra_mu_pad",
+    "padded_mu_axis",
     "padded_mu_extent",
     "solve_at_logical",
     "PadAxisResult",

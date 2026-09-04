@@ -100,7 +100,7 @@ def _fft_ffi_fused_enabled() -> bool:
 
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = False,
-    layout: str = "legacy", face_shape=None,
+    layout: str = "legacy", face_shape=None, face_band_extent=None,
 ) -> Callable[..., jax.Array]:
     """Build the shard_map'd ψ* σ ψ projector that reduce-scatters the output.
 
@@ -216,6 +216,7 @@ def _make_project_ri_reduce_scatter(
         channels=("none" if merged_x else "split_reim"),
         layout=layout,
         face_shape=face_shape,
+        face_band_extent=face_band_extent,
         divisibility_hint=(
             "Both existing sigma call sites pad via pad_sigma_window; "
             "meta.py rounds b_id_4 to world_size but NOT the sigma band "
@@ -255,6 +256,7 @@ def get_sigma_spatial_kernel(
     merged_x: bool = False,
     layout: str = "legacy",
     face_shape=None,
+    face_band_extent=None,
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
@@ -297,7 +299,7 @@ def get_sigma_spatial_kernel(
         make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           bool(merged_x), layout, face_shape)
+           bool(merged_x), layout, face_shape, face_band_extent)
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -320,7 +322,8 @@ def get_sigma_spatial_kernel(
         _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
     project = _make_project_ri_reduce_scatter(
-        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape)
+        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
+        face_band_extent=face_band_extent)
 
     @jax.jit
     def prep_w(W_q):
@@ -424,7 +427,8 @@ def _stack_channels(outs, mesh_xy: Mesh):
 def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = False,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
-    layout: str = "legacy", face_shape=None, pack_brackets: bool = True,
+    layout: str = "legacy", face_shape=None, face_band_extent=None,
+    pack_brackets: bool = True,
     energy_windows: bool = False,
 ) -> Callable[..., jax.Array]:
     """GN/MPA adapter that builds G and calls the shared spatial kernel.
@@ -515,13 +519,14 @@ def _get_sigma_kij_kernel(
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-           bool(pack_brackets), bool(energy_windows))
+           face_band_extent, bool(pack_brackets), bool(energy_windows))
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
-        layout=layout, face_shape=face_shape)
+        layout=layout, face_shape=face_shape,
+        face_band_extent=face_band_extent)
 
     g_plan = None
     g_plans = None
@@ -535,7 +540,7 @@ def _get_sigma_kij_kernel(
         use_packed = bool(pack_brackets) and brackets is not None \
             and len(brackets) > 1
         if use_packed:
-            from runtime.padding import round_up
+            from runtime.padding import padded_axis
             px = int(mesh_xy.shape["x"])
             py = int(mesh_xy.shape["y"])
             if px != py:
@@ -548,7 +553,10 @@ def _get_sigma_kij_kernel(
             for lo, hi in brackets:
                 hi_ = nb_full_f if hi is None else hi
                 width = hi_ - lo
-                w_pad = round_up(width, px)
+                w_pad = padded_axis(
+                    width, mesh_xy, name="PPM bracket band carrier",
+                    specs=((P(None, None, None, "x"), 3),
+                           (P(None, "y", None, None), 1))).carrier
                 if lo == 0 and hi_ == nb_full_f:
                     g_plans.append(g_plan)   # identical shape -- reuse
                 else:
@@ -886,7 +894,8 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
-    layout: str = "legacy", face_shape=None, pack_brackets: bool = True,
+    layout: str = "legacy", face_shape=None, face_band_extent=None,
+    pack_brackets: bool = True,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -910,7 +919,8 @@ def get_shared_sigma_tau_kernel(
     from ffi import ffi_dial_key
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           brackets, layout, face_shape, bool(pack_brackets))
+           brackets, layout, face_shape, face_band_extent,
+           bool(pack_brackets))
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
@@ -920,6 +930,7 @@ def get_shared_sigma_tau_kernel(
     sigma_kij = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         brackets=brackets, layout=layout, face_shape=face_shape,
+        face_band_extent=face_band_extent,
         pack_brackets=pack_brackets)
 
     @jax.jit
