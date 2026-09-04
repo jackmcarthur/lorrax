@@ -11,13 +11,11 @@ def test_hardware_free_config_keeps_auto_memory_and_gpu_request(tmp_path):
     deck = tmp_path / "cohsex.in"
     deck.write_text(
         "[cohsex]\n"
-        "strict_keys = true\n"
         "memory_per_device_gb = 0\n"
-        "distributed_lu = cusolvermp\n"
+        "linalg = distributed\n"
     )
     config = LorraxConfig.from_input_file(
         str(deck),
-        strict_keys=True,
         runtime_platform="gpu",
         resolve_hardware=False,
         print_fn=lambda *_: None,

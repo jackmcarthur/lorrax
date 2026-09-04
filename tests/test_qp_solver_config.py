@@ -467,12 +467,14 @@ def test_strict_keys_is_retired_even_without_other_unknown_keys(tmp_path):
         read_lorrax_input(str(p))
 
 
-def test_caller_can_force_strict_unknown_key_refusal(tmp_path):
+def test_unknown_key_always_refuses(tmp_path):
+    # Strict parsing is the only behaviour since the ``strict_keys`` key was
+    # retired (owner ruling 2026-09-04); no caller can ask for less.
     from gw.gw_config import read_lorrax_input
     p = tmp_path / "deck_doctor_unknown.in"
-    p.write_text(BASE_INPUT + "strict_keys = false\ntyop = 1\n")
-    with pytest.raises(ValueError, match=r"(?s)strict_keys = true.*tyop"):
-        read_lorrax_input(str(p), strict_keys=True)
+    p.write_text(BASE_INPUT + "tyop = 1\n")
+    with pytest.raises(ValueError, match=r"(?s)unrecognized deck.*tyop"):
+        read_lorrax_input(str(p))
 
 
 def test_mixed_case_key_is_recognised_not_reported_unknown(tmp_path, capsys):
