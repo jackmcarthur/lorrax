@@ -1193,6 +1193,12 @@ def prune_candidates_by_pivoted_cholesky(
             tol_rel=tol_rel)
         d_final_np = np.asarray(
             _mh.process_allgather(d_final, tiled=True))[:M]
+        # Materializing these sharded diagnostics may itself lower a JAX
+        # gather.  Every process must do that work even though only rank 0 is
+        # verbose; otherwise rank 0 compiles a collective after its peers have
+        # already left the selector (cross-rank compile-agreement refusal).
+        d_taken_np = np.asarray(d_taken)
+        trR_over_trG_np = np.asarray(trR_over_trG)
         if n_pad:
             G = G[:M, :M]
         if verbose:
@@ -1202,13 +1208,13 @@ def prune_candidates_by_pivoted_cholesky(
                 f"{n_delivered}/{budget} points, rank={rank_i}; every "
                 f"delivered point updated the residual")
             print(f"[pivoted_cholesky] picked-pivot residuals: "
-                  f"first={float(d_taken[0]):.3e}, "
-                  f"last-delivered={float(d_taken[last]):.3e}")
+                  f"first={float(d_taken_np[0]):.3e}, "
+                  f"last-delivered={float(d_taken_np[last]):.3e}")
             print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
-                  f"first={float(trR_over_trG[1]):.3e}, "
-                  f"last-delivered={float(trR_over_trG[n_delivered]):.3e}")
-        return (keep_idx, rank_i, G, d_final_np, np.asarray(d_taken),
-                np.asarray(trR_over_trG), psd_host)
+                  f"first={float(trR_over_trG_np[1]):.3e}, "
+                  f"last-delivered={float(trR_over_trG_np[n_delivered]):.3e}")
+        return (keep_idx, rank_i, G, d_final_np, d_taken_np,
+                trR_over_trG_np, psd_host)
 
     # Compatibility selector: orbit-aware mode chooses one representative and
     # then emits its whole orbit. Production centroid pruning returns above
@@ -1252,15 +1258,20 @@ def prune_candidates_by_pivoted_cholesky(
         piv.block_until_ready()
     del L
 
+    # These values can be globally sharded.  Materialize them on every rank
+    # before the rank-0-only report for the same reason as the group-block
+    # diagnostics above.
+    d_taken_np = np.asarray(d_taken)
+    trR_over_trG_np = np.asarray(trR_over_trG)
     if verbose:
         print(f"[pivoted_cholesky] picked-pivot residuals: "
-              f"first={float(d_taken[0]):.3e}, "
-              f"mid={float(d_taken[n_keep // 2]):.3e}, "
-              f"last={float(d_taken[-1]):.3e}")
+              f"first={float(d_taken_np[0]):.3e}, "
+              f"mid={float(d_taken_np[n_keep // 2]):.3e}, "
+              f"last={float(d_taken_np[-1]):.3e}")
         print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
-              f"first={float(trR_over_trG[1]):.3e}, "
-              f"mid={float(trR_over_trG[n_keep // 2 + 1]):.3e}, "
-              f"last={float(trR_over_trG[n_keep]):.3e}")
+              f"first={float(trR_over_trG_np[1]):.3e}, "
+              f"mid={float(trR_over_trG_np[n_keep // 2 + 1]):.3e}, "
+              f"last={float(trR_over_trG_np[n_keep]):.3e}")
 
     piv_np = np.asarray(piv)
     diag_host = np.real(np.asarray(jnp.diag(G)))
@@ -1334,8 +1345,8 @@ def prune_candidates_by_pivoted_cholesky(
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
-    return (keep_idx, rank_i, G, d_final_np, np.asarray(d_taken),
-            np.asarray(trR_over_trG), psd_host)
+    return (keep_idx, rank_i, G, d_final_np, d_taken_np,
+            trR_over_trG_np, psd_host)
 
 
 # ═══════════════════════════════════════════════════════════════════════
