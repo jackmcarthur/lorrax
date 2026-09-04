@@ -257,22 +257,44 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             V0 = V_or_W[0][None, None, :, None, :]
             return prefactor * G_k * V0 * (-1.0 / float(nk_tot))
     else:
-        from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+        from common.fft_helpers import (
+            make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
+        from ffi.mklfft import fused_fft_ffi_enabled
 
-        _G_ifftn = make_flat_k_ifftn(
-            mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-        _G_fftn = make_flat_k_fftn(
-            mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-        _V_ifftn = make_flat_k_ifftn(
-            mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
         _inv_sqrt_nk = -1.0 / jnp.sqrt(float(nk_tot))
+        if fused_fft_ffi_enabled():
+            # Use the same certified k-leading convolution owner as dynamic
+            # Sigma.  Keeping IFFT(G), IFFT(V), their product and FFT(GV)
+            # inside one handler is load-bearing for the face carrier: at
+            # Bi's P36 c2070 shape, exposing those R-space tensors to one
+            # compiled XLA heap made a 45.11-GiB executable on 40-GB GPUs.
+            # The prefactor remains outside because SX/COH/photon callers
+            # share this factory with different scalar coefficients.
+            _gw_conv = make_flat_k_gw_conv(
+                mesh_xy, kgrid, G_FFT7D_SPEC, V_FFT5D_SPEC,
+                norm='ortho', mult=_inv_sqrt_nk)
 
-        @jax.jit
-        def _convolve(G_k, V_or_W, prefactor):
-            """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
-            G_R = _G_ifftn(G_k)
-            V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
-            return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
+            @jax.jit
+            def _convolve(G_k, V_or_W, prefactor):
+                """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
+                return prefactor * _gw_conv(G_k, V_or_W)
+        else:
+            # Explicit LORRAX_FFT_FFI_FUSED=0 control.  The three transforms
+            # remain on the required flat-k FFT service; only their fused
+            # lifetime is disabled.
+            _G_ifftn = make_flat_k_ifftn(
+                mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+            _G_fftn = make_flat_k_fftn(
+                mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+            _V_ifftn = make_flat_k_ifftn(
+                mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+
+            @jax.jit
+            def _convolve(G_k, V_or_W, prefactor):
+                """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
+                G_R = _G_ifftn(G_k)
+                V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
+                return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
 
     _static_convolution_cache[cache_key] = _convolve
     return _convolve

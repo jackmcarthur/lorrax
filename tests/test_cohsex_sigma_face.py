@@ -28,7 +28,9 @@ jax.config.update("jax_enable_x64", True)
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
-from gw.cohsex_sigma import _face_kwargs, _make_cohsex_kernels  # noqa: E402
+from gw.cohsex_sigma import (  # noqa: E402
+    G_FFT7D_SPEC, V_FFT5D_SPEC, _face_kwargs, _make_cohsex_kernels,
+    _make_static_convolution)
 from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices, build_wavefunctions, build_wavefunctions_face)
 
@@ -95,3 +97,39 @@ def test_face_kwargs_reads_shape_off_the_face_bundle():
     kw = _face_kwargs(wfns)
     assert kw["layout"] == "face"
     assert kw["face_shape"] == (nk, nb, nmu, ns)
+
+
+def test_static_convolution_uses_certified_fused_owner(monkeypatch):
+    """The face carrier must not materialize three full R-space G buffers."""
+    mesh = _mesh_xy()
+    called = {}
+
+    def fake_factory(mesh_arg, kgrid, g_spec, v_spec, *, norm, mult):
+        called.update(mesh=mesh_arg, kgrid=kgrid, g_spec=g_spec,
+                      v_spec=v_spec, norm=norm, mult=float(mult))
+
+        def fake_fused(G_k, V_q):
+            return mult * (G_k + V_q[:, None, :, None, :])
+
+        return fake_fused
+
+    monkeypatch.setattr("ffi.mklfft.fused_fft_ffi_enabled", lambda: True)
+    monkeypatch.setattr(
+        "common.fft_helpers.make_flat_k_gw_conv", fake_factory)
+    conv = _make_static_convolution(mesh, (1, 1, 2), 2)
+
+    G = _put(np.ones((2, 1, 2, 1, 2), np.complex128),
+             mesh, P(None, None, "x", None, "y"))
+    V = _put(2.0 * np.ones((2, 2, 2), np.complex128),
+             mesh, P(None, "x", "y"))
+    got = np.asarray(conv(G, V, 2.5))
+
+    assert called["mesh"] is mesh
+    assert called["kgrid"] == (1, 1, 2)
+    assert called["g_spec"] == G_FFT7D_SPEC
+    assert called["v_spec"] == V_FFT5D_SPEC
+    assert called["norm"] == "ortho"
+    assert called["mult"] == pytest.approx(-1.0 / np.sqrt(2.0))
+    np.testing.assert_allclose(
+        got, 2.5 * (-1.0 / np.sqrt(2.0)) * 3.0,
+        rtol=0.0, atol=0.0)
