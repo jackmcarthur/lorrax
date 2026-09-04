@@ -283,7 +283,11 @@ $$
 with frequency leading. SlabIO owns collective creation, filesystem striping,
 padding, and writes. A small readiness entry is committed only after the
 collective close, so an allocated but incomplete slab cannot be consumed as a
-plausible zero.
+plausible zero. On restart, every surviving component is first authenticated
+against the exact frequency grid, q table, logical centroid geometry, dtype,
+sampling record and WFN/charge-zeta identity. Compatible ready chi and Wc
+slabs are then skipped independently; an incompatible partial store refuses
+rather than being truncated implicitly.
 
 The Dyson stage reads one complete chi slab, solves
 
@@ -301,13 +305,23 @@ The fit reads all $N_z=2N_p$ frequencies only for a bounded block of matrix
 columns. Rows and columns remain sharded over the process mesh. The default
 tile budget is chosen so that no process materializes an $N_\mu^2$ object.
 Each block is fitted, queued collectively to the q-wedge pole store, drained,
-and released before the next block.  The drain is required before the next
-W-file HDF5 read; it does not close the pole-store handle.  One SlabIO payload
-handle and its pre-opened dataset handles remain live for the complete
-q-major walk.  After that handle closes, one rank-zero metadata transaction
-publishes the complete block journal and completion bitmap.  A failed payload
-session therefore certifies none of its possibly partial bytes.  This same
-bounded path is valid when chi and W are written on every QSGW iteration.
+and released before the next block. The drain is required before the next
+W-file HDF5 read. One read-only W handle and one pole-writer handle remain
+live for a bounded 32-block durability epoch; the W reader closes first, then
+the pole writer closes and one rank-zero metadata transaction publishes that
+epoch's exact nonoverlapping journal ranges and completion bitmap. A failed
+epoch therefore certifies none of its possibly partial bytes, while a later
+restart authenticates and skips every previously committed whole range. This
+same bounded path is valid when chi and W are written on every QSGW
+iteration.
+
+The pole store becomes reusable only after both parts of its transaction are
+ready. Body ranges remain explicitly incomplete while the scalar head is
+published. A restart may reuse an exactly matching already-ready head, but
+cannot replace it. The root COMPLETE stamp is the last mutation, after body
+journal coverage, pole diagnostics, head identity and head readiness all
+pass. Thus a crash between a large body fit and the small head publication is
+recoverable without treating a headless store as complete.
 
 ## 6. The Loewner multipole model
 
