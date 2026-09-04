@@ -894,6 +894,7 @@ def main(argv=None):
 					centroid_indices=centroid_indices, config=config, meta=meta,
 					mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
 					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+					charge_zeta_identity=isdf.charge_zeta_identity,
 					label="oneshot", head_resolver=head_resolver,
 					head_channel=getattr(isdf, 'head_channel', None),
 					mpa_plan=oneshot_mpa_plan,
