@@ -350,15 +350,19 @@ class GWProductionReport:
         self.emit(f"QP valence     : {band_range(b.b1, b.b2)}")
         self.emit(f"QP conduction  : {band_range(b.b2, b.b3)}")
         self.emit(f"QP matrix      : {band_range(b.b0, b.b3)}")
-        logical_chi = min(int(b.b4_chi), int(b.b4_logical))
-        logical_sigma = min(int(b.b4_sigma), int(b.b4_logical))
+        # ``b4_logical`` is the physical loaded top (tagged_arrays.py); a
+        # band-slices object without it (older producers, test stubs) means
+        # no mesh padding, so the padded top is the logical top.
+        b4_logical = int(getattr(b, "b4_logical", b.b4))
+        logical_chi = min(int(b.b4_chi), b4_logical)
+        logical_sigma = min(int(b.b4_sigma), b4_logical)
         self.emit(f"chi0/W sum     : {band_range(b.b0, logical_chi)}")
         self.emit(f"Sigma sum      : {band_range(b.b0, logical_sigma)}")
-        self.emit(f"Loaded ISDF psi: {band_range(b.b0, b.b4_logical)}")
-        if int(b.b4) != int(b.b4_logical):
+        self.emit(f"Loaded ISDF psi: {band_range(b.b0, b4_logical)}")
+        if int(b.b4) != b4_logical:
             self.emit(
                 f"Band carrier    : {band_range(b.b0, b.b4)} "
-                f"({int(b.b4) - int(b.b4_logical)} zero-pad rows)")
+                f"({int(b.b4) - b4_logical} zero-pad rows)")
         self.emit(f"zeta fit       : left {band_range(*zeta_ranges[0])}; "
                   f"right {band_range(*zeta_ranges[1])}")
 
