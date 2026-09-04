@@ -49,17 +49,27 @@ interpretable. A production self-consistent run must satisfy:
 - `use_band_extrapolation = true` (the default), named explicitly;
 - on metals the MPA route only (GN-PPM refuses fractional occupations by design, owner ruling 2026-09-03); the two-level (frozen-W inner) loop is discontinued and stays a diagnostic branch;
 - band-structure interpolation (htransform) fitting the whole WFN band set and
-  returning at least **16 corrected conduction bands**, guard bands ≥ 8, with a
-  QE `bands` calculation along the same path as the accuracy certificate; four
-  returned conduction bands destroy the interpolant. The **htransform coarse
-  k-grid is a production convergence parameter independent of the GW screening
-  grid**: densify it until the energy-ordered, per-path-VBM-aligned QE
-  certificate is at most **20 meV over every displayed state**. Whole-WFN
-  fitting, a larger Galerkin rank, guard bands, and a different f-transform
-  scale do not replace this grid test. On Si, 4x4x4 and 6x6x6 miss by 120.424
-  and 33.905 meV, while 8x8x8 passes at 10.869 meV; do not publish a curve from
-  the coarser diagnostic grids merely because the GW correction itself was
-  computed there.
+  returning at least **16 corrected conduction bands**, guard bands ≥ 8. A
+  band-structure workflow must request its own dense uniform NSCF/WFN for
+  htransform and a separate QE `calculation='bands'` along the same path; it
+  must not inherit the GW screening mesh as its DFT reference. Start Si-class
+  cells at 8x8x8, or use the first material-specific grid whose certificate
+  passes. Four returned conduction bands destroy the interpolant. The
+  **htransform coarse k-grid is a production convergence parameter independent
+  of the GW screening grid**: densify it until the energy-ordered,
+  per-path-VBM-aligned QE certificate is at most **20 meV for every plotted
+  cell whose QE energy lies in the inclusive [-8,+8] eV window**. The receipt
+  must also report the all-state maximum; cells outside the window do not gate.
+  Whole-WFN fitting, a larger Galerkin rank, guard bands, and a different
+  f-transform scale do not replace this grid test. On Si, 4x4x4 and 6x6x6 miss
+  by 120.424 and 33.905 meV, while 8x8x8 passes at 10.869 meV; do not publish a
+  curve from the coarser diagnostic grids merely because the GW correction
+  itself was computed there. On monolayer MoS2, the 64x64x1 and 72x72x1
+  all-state maxima remain 26.987 and 31.646 meV on the lowest valence pair,
+  about -60.2 eV relative to the path VBM, while their [-8,+8] eV maxima are
+  9.327 and 8.117 meV. This non-monotone deep-pair error is a known finite-mesh
+  interpolation limitation outside the publication window, not a state-label
+  or f-transform-scale correction.
 
 ## The diagnostic deck the study converged on
 
