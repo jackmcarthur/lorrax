@@ -23,6 +23,7 @@ where the third member changes what they must additionally prove.
 from __future__ import annotations
 
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,15 +44,6 @@ ncond = 2
 nband = 10
 memory_per_device_gb = 4.0
 """
-
-_METAL_KEYS = """\
-mpa_material_class = metal
-occ_smearing_family = mp1
-occ_smearing_width_ry = 0.02
-fermi_reference = mp1_fixed_n
-sigma_omega_layout = sharded
-"""
-
 
 def _config(tmp_path, extra="", name="w_rpa_resolvent.in"):
     path = tmp_path / name
@@ -119,33 +111,6 @@ def test_each_unsupported_combination_refuses_at_parse_time(
     assert rule_id in message
     for part in ("got:", "want:", "fix:", "why:", "doc:"):
         assert part in message, f"{rule_id} refusal is missing '{part}'"
-
-
-def test_the_parse_time_insulators_only_row_would_be_dead_code(tmp_path):
-    """WHY THERE IS NO ``w_rpa_resolvent_insulators_only`` PARSE-TIME ROW.
-
-    ``mpa_material_class = metal`` is refused outside ``compute_mode =
-    mpa`` by an EARLIER, unrelated gate
-    (``metal_material_class_requires_mpa``) regardless of
-    ``screening_diagrams``.  So a deck-key predicate mirroring
-    ``w_bse_insulators_only`` could only ever fire on a
-    ``compute_mode = mpa`` deck — and ``w_rpa_resolvent_mpa_
-    unimplemented`` already refuses EVERY such deck, unconditionally,
-    earlier in the same table.  A parallel row would be the exact
-    "narrowed row whose predicate is a strict subset of an earlier row's"
-    shape ``gw_config._LOW_MEM_BANDS_REFUSALS`` deletes on sight rather
-    than ships unreachable.  This test is the measurement backing that
-    argument, not merely the argument: the SAME deck this file's ``w_bse``
-    sibling uses to reach ``w_bse_insulators_only`` reaches a DIFFERENT,
-    earlier rule id here.
-    """
-    with pytest.raises(ValueError) as exc:
-        _config(tmp_path,
-                "screening_diagrams = w_rpa_resolvent\ncompute_mode = mpa\n"
-                + _METAL_KEYS)
-    message = str(exc.value)
-    assert "w_rpa_resolvent_mpa_unimplemented" in message
-    assert "insulators_only" not in message
 
 
 @pytest.mark.parametrize("extra", [
@@ -255,7 +220,8 @@ class _Reached(Exception):
 
 def _stub_kwargs(config, tmp_path):
     return dict(
-        quad=None, e_ref=0.0, sym=None, centroid_indices=None,
+        quad=None, e_ref=0.0, sym=SimpleNamespace(trs_allowed=True),
+        centroid_indices=None,
         config=config, meta=None, mesh_xy=None,
         run_dir=str(tmp_path / "mpa"), label="unit",
         material_class="insulator",

@@ -197,6 +197,13 @@ _L3_MODULES = frozenset({
 #: (``_SERVICE_DOORS``) like every service, and no level entry.
 _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 
+#: Physics-facing service entry points which deliberately sit above their
+#: package's substrate default.  ``deck_doctor`` parses the GW deck and reads
+#: its WFN/centroid headers in order to preflight a concrete calculation; its
+#: address under ``lxkit`` does not turn those application-level imports into
+#: substrate dependencies.
+_L1_MODULES = frozenset({"lxkit.deck_doctor"})
+
 #: L2 by module.  Whole packages are in ``_L2_PACKAGES``.
 _L2_MODULES = frozenset({
     "common.rank_criterion",   # the pseudo-inverse truncation criterion
@@ -252,6 +259,8 @@ def layer_of(mod: str) -> str:
     """``"L1"``/``"L2"``/``"L3"``, or ``"X"`` for an exempt bench driver."""
     if _is_standalone_driver(mod):
         return "X"
+    if mod in _L1_MODULES:
+        return "L1"
     if mod in _L3_MODULES or mod.split(".")[0] in _L3_PACKAGES:
         return "L3"
     if mod in _L2_MODULES or mod.split(".")[0] in _L2_PACKAGES:
@@ -1256,6 +1265,11 @@ _MESH_OWNERS = {
     # single-process under ``verify_ffi_build``, so the one-object-per-process
     # jit-cache contract those helpers protect is not in play.
     "ffi.cpp.gate_one_odr",
+    # The deck doctor is another live-provider probe, not a science mesh.  It
+    # intentionally builds a one-device mesh so ``distrib_la`` can validate
+    # the requested handlers before the real P=4 launch; the production mesh
+    # helpers would resolve the launch's default science topology instead.
+    "lxkit.deck_doctor",
 }
 
 

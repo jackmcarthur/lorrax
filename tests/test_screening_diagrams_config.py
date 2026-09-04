@@ -251,8 +251,7 @@ def test_w_rpa_decks_are_untouched_by_every_rule(tmp_path):
     for extra in ("compute_mode = x_only\n",
                   "compute_mode = hl_ppm\n",
                   "compute_mode = cohsex\nqp_solver = self_consistent\n",
-                  "compute_mode = cohsex\nmc_average_placement = bgw\n",
-                  "compute_mode = mpa\n" + _METAL_KEYS):
+                  "compute_mode = cohsex\nmc_average_placement = bgw\n"):
         config = _config(tmp_path, extra, name="rpa_arm.in")
         assert config.screening.diagrams is ScreeningDiagrams.W_RPA
         refuse_unsupported_screening_diagrams(config)   # must not raise
@@ -333,13 +332,10 @@ def test_the_runtime_gate_passes_an_insulating_occupation_array():
 def test_the_runtime_gate_refuses_a_fractional_occupation_in_the_active_window():
     """THE CASE NO DECK KEY CAN DECLARE: a metallic WFN on a silent deck.
 
-    ``mpa_material_class`` is the only key in the parser that says "metal",
-    and nothing at all in a deck describes the WFN's occupations — so a
-    smeared mean field reaches the stage looking exactly like an insulating
-    one until something reads ``occ``.  The refusal carries the SAME rule
-    id as its parse-time twin (one grep for an operator) and the same five
-    parts, and it names the offending (spin, k, band) so the reader can go
-    look at it.
+    Material class is inferred from the WFN occupations, not declared by a
+    deck key.  A smeared mean field therefore cannot be rejected until the
+    stage reads ``occ``.  The refusal names the offending (spin, k, band) so
+    the reader can inspect it.
     """
     from gw.screening_bse import refuse_fractional_occupations
 
@@ -468,7 +464,7 @@ class _Reached(Exception):
 
 def _stub_kwargs(config, tmp_path):
     return dict(
-        quad=None, e_ref=0.0, sym=SimpleNamespace(trs_allowed=True),
+        quad=object(), e_ref=0.0, sym=SimpleNamespace(trs_allowed=True),
         centroid_indices=None,
         config=config, meta=None, mesh_xy=None,
         run_dir=str(tmp_path / "mpa"), label="unit",

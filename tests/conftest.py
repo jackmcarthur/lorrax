@@ -43,6 +43,7 @@ if "jax" not in _sys.modules:
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 import fast_gate  # noqa: E402
 import harness  # noqa: E402
+import known_failure_ledger  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # ONE GPU PER PROCESS THAT RUNS TESTS.  Not a preference — three separate
@@ -735,6 +736,28 @@ def _apply_default_gate(config, items):
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     _stamp_census(items)
+    ledger_path = _Path(__file__).resolve().parent / "KNOWN_FAILURES.md"
+    try:
+        known_xfails = known_failure_ledger.read_known_xfails(ledger_path)
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+    by_nodeid = {item.nodeid: item for item in items}
+    if known_failure_ledger.is_complete_tests_selection(
+            getattr(config.option, "file_or_dir", ()), ledger_path.parent):
+        missing = known_failure_ledger.missing_nodeids(
+            known_xfails, by_nodeid)
+        if missing:
+            raise pytest.UsageError(
+                "tests/KNOWN_FAILURES.md names tests that no longer exist:\n    "
+                + "\n    ".join(missing)
+                + "\nRemove or update the stale ledger rows before trusting "
+                  "this suite verdict.")
+    for nodeid, row in known_xfails.items():
+        item = by_nodeid.get(nodeid)
+        if item is not None:
+            item.add_marker(pytest.mark.xfail(
+                reason=f"{row['reason']} [owner: {row['owner']}]",
+                strict=True))
     _group_mesh_items(config, items)
     _apply_default_gate(config, items)
 

@@ -1779,6 +1779,9 @@ def _run_worker(ndev, timeout=900):
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
+    # This is intentionally an emulated CPU-mesh oracle.  Do not inherit a
+    # parent run's CUDA-only production accelerator arm into that oracle.
+    env["LORRAX_CONV_KPAIR_FFI"] = "off"
     env["XLA_FLAGS"] = (
         env.get("XLA_FLAGS", "")
         + f" --xla_force_host_platform_device_count={ndev}").strip()

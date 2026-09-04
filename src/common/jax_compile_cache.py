@@ -266,6 +266,7 @@ they were cut from.  ``jax.version.__version_info__`` is the honest tuple.
 from __future__ import annotations
 
 import atexit
+import functools
 import hashlib
 import re
 import json
@@ -1223,6 +1224,12 @@ def _install_lookup_patch(*, enforce_agreement: bool) -> None:
     # naming three arguments it never interprets would be a claim about their
     # meaning that this file has no reason to make.  It forwards them
     # untouched, which is exact for any arity.
+    # ``wraps`` is load-bearing even though the forwarding body does not need
+    # it: runtime.jax_support checks this private surface with
+    # ``inspect.signature``.  Without ``__wrapped__``, that later check sees
+    # this implementation's two syntactic parameters and refuses our own
+    # transparent observer as an incompatible JAX installation.
+    @functools.wraps(_orig_get)
     def _observed_get(cache_key, *passthrough):
         _STATE.probes += 1
         _STATE.probe_keys.add(cache_key)
@@ -1250,6 +1257,7 @@ def _install_lookup_patch(*, enforce_agreement: bool) -> None:
         _STATE.hits += 1
         return executable, compile_time
 
+    @functools.wraps(_orig_in_cache)
     def _observed_in_cache(backend, cache_key):
         _STATE.probe_keys.add(cache_key)
         if enforce_agreement and cache_key not in _STATE.agreed:
