@@ -53,6 +53,7 @@ _OMEGA_GRID = np.asarray([0.0, 0.25, 0.5])
 _ETA = 0.05
 _EDGE = 1.5
 _TOL = dict(target_error=1.0e-6, max_rank=96,
+            omega_grid_step_ry=0.25,
             crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
 
 
