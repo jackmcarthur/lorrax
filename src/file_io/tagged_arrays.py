@@ -174,6 +174,19 @@ def _band_window_receipts(band_slices):
     return logical, carrier, split
 
 
+def _loaded_band_axis(logical: int, mesh_or_divisor):
+    """Canonical receipt shared by every persistent restart band dataset."""
+    shape = getattr(mesh_or_divisor, "shape", {})
+    if "x" in shape and "y" in shape:
+        from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
+        return padded_axis(
+            int(logical), mesh_or_divisor, name="restart loaded-band carrier",
+            specs=((PSI_NMU_SPEC, 1), (PSI_MUN_SPEC, 3)))
+    return padded_axis(
+        int(logical), mesh_divisor(mesh_or_divisor),
+        name="restart loaded-band carrier")
+
+
 def _validate_shape_receipt(name, ds) -> None:
     """Refuse an authenticated dataset whose stored shape changed."""
     if RESTART_LOGICAL_SHAPE_ATTR not in ds.attrs:
@@ -639,13 +652,17 @@ def write_restart_state_to_h5(
         mesh if mesh is not None else int(jax.device_count()))
     band_receipts = None
     n_band_logical = None
+    loaded_band_tag = None
     if band_slices is not None:
         band_receipts = _band_window_receipts(band_slices)
         n_band_logical = int(band_receipts[0][4] - band_receipts[0][0])
+        loaded_band_tag = _loaded_band_axis(
+            n_band_logical,
+            mesh if mesh is not None else carrier_divisor)
         authenticate_padded_axis(
             n_band_logical,
             int(band_receipts[1][4] - band_receipts[1][0]),
-            carrier_divisor, name="restart loaded-band carrier")
+            loaded_band_tag.divisor, name=loaded_band_tag.name)
     elif mode != "w" and any(
             arr is not None for arr in (
                 psi_full_y, psi_full_y_mun, psi_full_y_transverse,
@@ -666,6 +683,9 @@ def write_restart_state_to_h5(
                         f"Restart file {filename}: schema-{schema} band_window "
                         f"has {len(stored_logical)} entries, expected 5.")
                 n_band_logical = stored_logical[4] - stored_logical[0]
+                loaded_band_tag = _loaded_band_axis(
+                    n_band_logical,
+                    mesh if mesh is not None else carrier_divisor)
 
     if ((psi_full_y_transverse is not None
          or psi_full_y_transverse_mun is not None)
@@ -694,9 +714,10 @@ def write_restart_state_to_h5(
                 where=f"write_restart_state_to_h5 dataset {name!r}")
             axis_receipts.append((axis, mu_tag))
         if band_axes and n_band_logical is not None:
-            band_tag = padded_axis(
-                n_band_logical, carrier_divisor,
-                name=f"restart dataset {name!r} band carrier")
+            band_tag = loaded_band_tag
+            if band_tag is None:
+                raise RuntimeError(
+                    f"restart dataset {name!r}: missing loaded-band receipt")
             shape = _logical_storage_shape(
                 shape, band_axes, n_band_logical,
                 where=f"write_restart_state_to_h5 dataset {name!r} band axis")
@@ -1447,7 +1468,7 @@ def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
 
 
 def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
-                               n_band_carrier=None):
+                               band_receipt=None, n_band_carrier=None):
     """Read canonical restart state as PER-RANK TILES (restart format v2).
 
     Returns arrays that are ALREADY sharded on ``mesh_xy`` and ALREADY at
@@ -1658,12 +1679,11 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
         mu_index = int(mu_axis) % len(shape)
         shape[mu_index] = mu_tag.carrier
         b_axis = int(band_axis) % len(shape)
-        band_tag = padded_axis(
-            int(ds[b_axis]), divisor,
-            name=f"restart dataset {name!r} band carrier")
+        band_tag = (band_receipt if band_receipt is not None else
+                    _loaded_band_axis(int(ds[b_axis]), mesh_xy))
         if n_band_carrier is not None:
             band_tag = authenticate_padded_axis(
-                band_tag.logical, int(n_band_carrier), divisor,
+                band_tag.logical, int(n_band_carrier), band_tag.divisor,
                 name=band_tag.name)
         shape[b_axis] = band_tag.carrier
         with timing.section(
@@ -1748,11 +1768,11 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
             NamedSharding(mesh_xy, P("y")))
     if enk_full is not None:
         n_disk_band = int(enk_full.shape[-1])
-        band_tag = padded_axis(
-            n_disk_band, divisor, name="restart eigenvalue band carrier")
+        band_tag = (band_receipt if band_receipt is not None else
+                    _loaded_band_axis(n_disk_band, mesh_xy))
         if n_band_carrier is not None:
             band_tag = authenticate_padded_axis(
-                n_disk_band, int(n_band_carrier), divisor,
+                band_tag.logical, int(n_band_carrier), band_tag.divisor,
                 name=band_tag.name)
         if band_tag.pad:
             if enk_full.size == 0:
@@ -1869,13 +1889,22 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     # the reader had to be guarded off above one process.  The pad is now
     # the read (SlabIO zero-fills past the dataset) and the sharding is
     # the read (SlabIO returns the tile), so none of it survives here.
+    band_axis = None
+    if band_slices is not None:
+        n_band_logical = (
+            int(getattr(band_slices, "b4_logical", 0) or band_slices.b4)
+            - int(band_slices.b0))
+        band_axis = _loaded_band_axis(n_band_logical, mesh_xy)
+        authenticate_padded_axis(
+            band_axis.logical,
+            int(band_slices.b4) - int(band_slices.b0),
+            band_axis.divisor, name=band_axis.name)
+
     (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
      psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
      psi_nmu_T, psi_mun_T, charge_zeta_identity) = read_restart_state_from_h5(
         filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
-        n_band_carrier=(
-            int(band_slices.b4) - int(band_slices.b0)
-            if band_slices is not None else None))
+        band_receipt=band_axis)
 
     if low_mem_bands:
         # No derivation, no reshard: both faces already arrived at their
