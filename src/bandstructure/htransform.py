@@ -628,7 +628,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     @partial(jax.jit,
              in_shardings=(coeff_x, coeff_y, rep_),
              out_shardings=flat_xy)
-    def _build_fH_k(ctilde_i, ctilde_j, f_eps_in):
+    def _build_fH_R(ctilde_i, ctilde_j, f_eps_in):
+        """Contract fH(k) and consume its internal buffer in the IFFT."""
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
         bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
@@ -644,7 +645,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         # consumer seam, as it was before this placement repair.
         # The paired input views already place m on x and n on y, so this is
         # the natural output layout and no full rank-by-rank product exists.
-        return jax.lax.with_sharding_constraint(fH_k, flat_xy)
+        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
+        return local_ifftn(fH_k)
 
     @partial(jax.jit,
              in_shardings=(coeff_x, rep_, rep_),
@@ -674,14 +676,6 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                     - jnp.sort(enk_in.T, axis=1)))
         return (f_recovery_error, energy_recovery_error,
                 jnp.max(inverse_residual))
-
-    @partial(jax.jit,
-             in_shardings=flat_xy,
-             out_shardings=flat_xy,
-             donate_argnums=(0,))
-    def _ifft_operator_donated(operator_k):
-        """Transform a dead k-space carrier in its reusable buffer."""
-        return local_ifftn(operator_k)
 
     def _active_fft_receipt_local(operator_R_local, ctilde_i, ctilde_j):
         """Compare every local active-operator tile in bounded row slabs."""
@@ -768,14 +762,15 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     @partial(jax.jit,
              in_shardings=(coeff_x, coeff_y),
              out_shardings=flat_xy)
-    def _build_active_k(ctilde_i, ctilde_j):
+    def _build_active_R(ctilde_i, ctilde_j):
+        """Contract P_A(k) and consume its internal buffer in the IFFT."""
         active_rows_i = ctilde_i[:, active_start:active_stop, :]
         active_rows_j = ctilde_j[:, active_start:active_stop, :]
         active_k = jnp.einsum(
             'kim,kin->kmn', active_rows_i, jnp.conj(active_rows_j),
             optimize=True)
         active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
-        return active_k
+        return local_ifftn(active_k)
 
     # Projection receipt, not a rank gate.  The published whole-state QRCP
     # basis is deliberately approximate, so C C^H need not be the identity.
@@ -814,16 +809,15 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         inverse_residual = max(inverse_residual,
                                float(chunk_receipts[2]))
 
-    # The inverse FFI aliases each dead k-space carrier.  For the value-level
+    # Each contraction and inverse FFI share one JIT so the custom-call alias
+    # consumes the internal dead k-space carrier.  For the value-level
     # receipt, forward-transform bounded local matrix-row slabs and compare
     # them directly with the Galerkin formula.  This covers every tile without
     # constructing a second 11--14-GiB k-space operator beside the retained
     # R image.  Only the two scalar maxima are replicated or transferred to
     # the host.
     if active_band_range is not None:
-        active_k = _build_active_k(ctilde_x, ctilde_y)
-        active_R = _ifft_operator_donated(active_k)
-        del active_k
+        active_R = _build_active_R(ctilde_x, ctilde_y)
         active_fft_rel = _relative_from_abs_scale(
             _active_fft_abs_scale(active_R, ctilde_x, ctilde_y))
         del active_R
@@ -831,17 +825,13 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         active_R = None
         active_fft_rel = 0.0
 
-    fH_k = _build_fH_k(ctilde_x, ctilde_y, f_eps)
-    fH_R = _ifft_operator_donated(fH_k)
-    del fH_k
+    fH_R = _build_fH_R(ctilde_x, ctilde_y, f_eps)
     fft_rel = _relative_from_abs_scale(
         _fH_fft_abs_scale(fH_R, ctilde_x, ctilde_y, f_eps))
     jax.block_until_ready(fH_R)
     if active_band_range is not None:
-        active_k = _build_active_k(ctilde_x, ctilde_y)
-        active_R = _ifft_operator_donated(active_k)
+        active_R = _build_active_R(ctilde_x, ctilde_y)
         jax.block_until_ready(active_R)
-        del active_k
     del ctilde_x, ctilde_y
     log_fn(
         f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
