@@ -343,14 +343,12 @@ def test_use_low_mem_eigh_refuses_rather_than_running_native(monkeypatch):
 
 
 def test_use_low_mem_eigh_keeps_an_explicitly_named_library():
-    """The flag is a rename onto ``distributed``; it must not overwrite a
-    library the deck named.  Checked at the resolve seam so the cell needs
-    no FFI build."""
+    """A debug CLI backend overrides the distributed layout's library."""
     from gw.gw_config import resolve_eigh_backend
     assert resolve_eigh_backend(
-        {"eigh_backend": "scalapack", "use_low_mem_eigh": True}) == "scalapack"
+        {"linalg": "distributed"}, override="scalapack") == "scalapack"
     assert resolve_eigh_backend(
-        {"eigh_backend": "cusolvermp", "use_low_mem_eigh": True}) == "cusolvermp"
+        {"linalg": "distributed"}, override="cusolvermp") == "cusolvermp"
 
 
 # ---------------------------------------------------------------------------
@@ -367,22 +365,15 @@ def test_use_low_mem_eigh_keeps_an_explicitly_named_library():
 # only evidence that distinguishes a live knob from a stored one.
 
 def test_the_cli_override_still_folds_in_the_low_memory_intent():
-    """CLI names the LIBRARY, the deck key names the INTENT, one resolver.
-
-    RED ARM: an implementation that let ``override`` bypass the
-    combination (an early ``return override``) passes the first two
-    asserts and fails the third — ``off`` under the low-memory flag is a
-    contradiction whichever spelling asked for it.
-    """
+    """CLI names a debug library; the deck names the public layout."""
     from gw.gw_config import resolve_eigh_backend
-    deck = {"eigh_backend": "auto", "use_low_mem_eigh": False}
+    deck = {"linalg": "local"}
     assert resolve_eigh_backend(deck, override=None) == "auto"
     assert resolve_eigh_backend(deck, override="slate") == "slate"
-    low = {"eigh_backend": "auto", "use_low_mem_eigh": True}
+    low = {"linalg": "distributed"}
     assert resolve_eigh_backend(low, override=None) == "distributed"
     assert resolve_eigh_backend(low, override="scalapack") == "scalapack"
-    with pytest.raises(ValueError, match="contradiction"):
-        resolve_eigh_backend(low, override="off")
+    assert resolve_eigh_backend(low, override="off") == "off"
 
 
 #: The two drivers that read a raw params dict instead of a LorraxConfig.
@@ -412,16 +403,14 @@ def test_the_raw_params_drivers_resolve_the_eigh_axis(driver):
     src = _driver_source(driver)
     assert "resolve_eigh_backend(" in src, (
         f"{driver} does not call gw_config.resolve_eigh_backend, so its "
-        f"``use_low_mem_eigh`` deck key is parsed and never read")
+        f"the resolved linalg profile is never read")
     forbidden = 'else str(params.get("eigh_backend", "auto"))'
     assert forbidden not in src, (
         f"{driver} still inlines the CLI-over-deck precedence "
         f"({forbidden!r}), which is the spelling that skipped the "
         f"low-memory intent entirely")
-    assert "use_low_mem_eigh" in src, (
-        f"{driver} must thread the low-memory INTENT to compute_wfns_fi; "
-        f"the resolved library name alone leaves bse_setup's no-fallback "
-        f"refusal disarmed")
+    assert "linalg_resolution(" in src, (
+        f"{driver} must get low-memory intent from the cached linalg profile")
 
 
 @pytest.mark.parametrize("driver", _RAW_PARAMS_DRIVERS)
@@ -528,12 +517,11 @@ def test_a_door_that_renamed_the_op_raises_instead_of_falling_back(monkeypatch):
 def test_resolve_eigh_backend_passthrough_and_promotion():
     from gw.gw_config import resolve_eigh_backend
     assert resolve_eigh_backend({}) == "auto"
-    assert resolve_eigh_backend({"eigh_backend": "off"}) == "off"
-    assert resolve_eigh_backend({"eigh_backend": "OFF  "}) == "off"
-    assert resolve_eigh_backend(
-        {"eigh_backend": "auto", "use_low_mem_eigh": True}) == "distributed"
+    assert resolve_eigh_backend({"linalg": "distributed"}) == "distributed"
+    assert resolve_eigh_backend({}, override="off") == "off"
+    assert resolve_eigh_backend({}, override="OFF  ") == "off"
     with pytest.raises(ValueError, match="invalid"):
-        resolve_eigh_backend({"eigh_backend": "replicated"})
+        resolve_eigh_backend({}, override="replicated")
 
 
 def test_input_keys_parse(tmp_path):
@@ -543,16 +531,15 @@ def test_input_keys_parse(tmp_path):
         "[cohsex]\n"
         "nval = 4\n"
         "wfn_fi_q_chunk = 12\n"
-        "use_low_mem_eigh = true\n"
-        "eigh_backend = distributed\n")
+        "linalg = distributed\n")
     params = read_lorrax_input(str(p))
     assert params["wfn_fi_q_chunk"] == 12 and isinstance(
         params["wfn_fi_q_chunk"], int)
-    assert params["use_low_mem_eigh"] is True
-    assert params["eigh_backend"] == "distributed"
+    from gw.gw_config import linalg_resolution
+    assert linalg_resolution(params).eigh_backend == "distributed"
     # defaults, when the deck says nothing
     q = tmp_path / "bare.in"
     q.write_text("[cohsex]\nnval = 4\n")
     bare = read_lorrax_input(str(q))
     assert bare["wfn_fi_q_chunk"] == 0        # 0 == "use N_q_co"
-    assert bare["use_low_mem_eigh"] is False
+    assert linalg_resolution(bare).eigh_backend == "auto"

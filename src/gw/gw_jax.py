@@ -99,7 +99,7 @@ from .gw_config import (
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
-	validate_material_inputs)
+	resolve_mpa_sampling_alpha, validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -321,12 +321,6 @@ def main(argv=None):
 	                 else production_stdout.emit)
 	print0 = report.legacy_print
 	report.begin(input_file=args.input, config=config)
-	report.architecture()
-	report.method(config=config)
-	if _config_provenance:
-		report.heading("Configuration provenance")
-		for line in _config_provenance:
-			report.emit(line.strip())
 	# A mode may be DECLARED on the axis before its Σ stage exists (today:
 	# ``mpa``).  Refusing here — before the WFN read, before ISDF, before
 	# any allocation is spent — is the difference between an operator
@@ -438,6 +432,8 @@ def main(argv=None):
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
 	material_class = _infer_material_class(wfn)
+	config = resolve_mpa_sampling_alpha(
+		config, material_class, print_fn=report.progress)
 	validate_material_inputs(config, material_class)
 	print0(f"  Material class: {material_class} (inferred from WFN occupations)")
 	sym = wfn.symmetry()
@@ -455,6 +451,18 @@ def main(argv=None):
 		n_rmu=n_rmu, fft_grid=wfn.fft_grid,
 		cell_volume=wfn.cell_volume, print_fn=print0,
 	)
+	report.layout_dials(
+		config=config, n_mu=n_rmu, n_q_irr=int(sym.nk_red),
+		processes=RUNTIME.process_count)
+	# The two user-facing execution dials belong in the first startup lines.
+	# Their numeric memory receipt needs the loaded WFN symmetry and centroid
+	# basis, so defer the longer architecture/method sections until now.
+	if _config_provenance:
+		report.heading("Configuration provenance")
+		for line in _config_provenance:
+			report.emit(line.strip())
+	report.architecture()
+	report.method(config=config)
 
 	charge_bispinor = uses_four_spinor_finite_q_charge(
 		config.bispinor, config.bispinor_gw)
@@ -638,13 +646,6 @@ def main(argv=None):
 			"produced (Σ^B would be silently dropped).  Check "
 			"centroids_file_current and, on restart, that the restart "
 			"file carries psi_full_y_transverse.")
-	report.batched_linalg(
-		config=config,
-		n_charge=isdf.n_rmu_charge_logical,
-		n_current=isdf.n_rmu_transverse_logical,
-		nq=meta.nk_tot,
-		processes=RUNTIME.process_count,
-	)
 	bispinor_v_q_path = (
 		os.path.join(tmp_dir, 'v_q_bispinor.h5')
 		if wfns_transverse is not None else None

@@ -53,11 +53,9 @@ memory_per_device_gb = 4.0
 """
 
 _METAL_KEYS = """\
-mpa_material_class = metal
 occ_smearing_family = mp1
 occ_smearing_width_ry = 0.02
 fermi_reference = mp1_fixed_n
-sigma_omega_layout = sharded
 """
 
 
@@ -120,13 +118,13 @@ def test_the_value_normalises_like_every_other_string_key(tmp_path):
 
 
 def test_the_key_is_registered_so_it_is_not_an_unknown_key(tmp_path):
-    """``strict_keys = true`` must ACCEPT it — the registry test.
+    """Always-strict parsing must accept the registered key.
 
     A key absent from ``_DEFAULTS`` is warned about and ignored, which for
     a physics-selecting key is the worst of the three possible outcomes.
     """
     config = _config(
-        tmp_path, "strict_keys = true\nscreening_diagrams = w_rpa\n")
+        tmp_path, "screening_diagrams = w_rpa\n")
     assert config.screening.diagrams is ScreeningDiagrams.W_RPA
 
 
@@ -190,8 +188,6 @@ def test_the_default_is_spelled_the_same_in_both_places():
      "compute_mode = cohsex\nqp_solver = self_consistent\n"),
     ("w_bse_head_placement_unimplemented",
      "compute_mode = cohsex\nmc_average_placement = bgw\n"),
-    ("w_bse_insulators_only",
-     "compute_mode = mpa\n" + _METAL_KEYS),
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -273,26 +269,16 @@ def test_a_metal_deck_still_parses_and_runs_under_w_rpa(tmp_path):
     """
     config = _config(tmp_path, "compute_mode = mpa\n" + _METAL_KEYS)
     assert config.screening.diagrams is ScreeningDiagrams.W_RPA
-    assert config.mpa.material_class == "metal"
+    from gw.gw_config import validate_material_inputs
+    validate_material_inputs(config, "metal")
     refuse_unsupported_screening_diagrams(config)       # must not raise
 
 
-def test_the_insulator_refusal_names_the_live_metal_alternative(tmp_path):
-    """The refusal points a metal deck to the live RPA implementation.
-
-    The metal merge makes MPA+RPA production-capable; it does not change the
-    ladder's insulator-only derivation.  The diagnostic must state both facts
-    so the new metal capability and the older ladder refusal cannot be read
-    as contradictory global claims.
-    """
-    with pytest.raises(ValueError) as exc:
-        _config(tmp_path,
-                "screening_diagrams = w_bse\ncompute_mode = mpa\n"
-                + _METAL_KEYS)
-    message = str(exc.value)
-    assert "screening_diagrams = w_rpa" in message
-    assert "metallic MPA screening/Sigma pipeline is live" in message
-    assert "insulator" in message
+def test_material_class_is_deferred_to_wfn_occupations(tmp_path):
+    config = _config(
+        tmp_path, "screening_diagrams = w_bse\ncompute_mode = mpa\n"
+        + _METAL_KEYS)
+    assert config.screening.diagrams is ScreeningDiagrams.W_BSE
 
 
 def test_every_rule_has_all_five_parts_and_a_unique_id():
@@ -579,9 +565,11 @@ def test_mpa_gets_the_ladder_through_the_wc_source_seam_only(
         seen.clear()
         config = _config(tmp_path, extra + "compute_mode = mpa\n",
                          name="mpa_arm.in")
+        kwargs = _stub_kwargs(config, tmp_path)
+        kwargs["quad"] = object()
         screening.compute_screening_model(
             ComputeMode.MPA, None, None,
-            head_resolver=object(), **_stub_kwargs(config, tmp_path))
+            head_resolver=object(), **kwargs)
         assert seen["wc_source"] == expect
 
 

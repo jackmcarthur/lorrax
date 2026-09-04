@@ -25,6 +25,8 @@ def _config():
         degen_avg_tol_ry=1.0e-6,
         restart=False,
         backend=SimpleNamespace(
+            linalg="local",
+            linalg_provenance="default",
             charge_zeta_solve="rank_truncate",
             distributed_zeta_solve="per_q",
             w_dyson_solver="distributed",
@@ -32,7 +34,8 @@ def _config():
             eigh_backend="native",
             distrib_la_batched_route="batch_reshard",
         ),
-        memory=SimpleNamespace(per_device_gb=40.0),
+        memory=SimpleNamespace(
+            per_device_gb=40.0, low_mem_bands=False, band_chunk_size=16),
         raw_input_keys=frozenset(),
         screening=SimpleNamespace(
             diagrams=SimpleNamespace(value="w_rpa"), method="minimax"),
@@ -376,57 +379,58 @@ def test_nonzero_rank_never_creates_report(tmp_path):
     assert not path.exists()
 
 
-def test_batched_la_default_provenance_without_mos2_capacity_warning(tmp_path):
-    """MoS2-12-sized centroids are below the derived 40-GB/P4 threshold."""
+def test_local_linalg_warning_has_dense_matrix_numbers(tmp_path):
     path = tmp_path / "gwjax.out"
     report = GWProductionReport(
         str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
-    report.batched_linalg(
-        config=_config(), n_charge=640, n_current=668, nq=9, processes=4)
+    report.layout_dials(config=_config(), n_mu=640, n_q_irr=9, processes=4)
     report.finish()
 
     text = path.read_text(encoding="utf-8")
-    assert text.count("[config provenance]") == 1
-    assert "distrib_la_batched_route = batch_reshard" in text
-    assert "WARNING [distrib_la batch_reshard capacity]" not in text
+    assert "[config provenance] linalg = local (default)" in text
+    assert (
+        "linalg = local: fastest, but each task holds ceil(N_q_irr/P) "
+        "complete N_mu x N_mu dense matrices (here ceil(9/4) x 640^2 x "
+        "16 B = 0.0 GiB per task, complex128) plus their factor workspace; "
+        "on large systems where that is a large fraction of memory per "
+        "task, set linalg = distributed" in text)
+    assert "[config provenance] low_mem_bands = false (default)" in text
 
 
-def test_batched_la_large_centroid_warning_is_one_line_with_numbers(tmp_path):
-    path = tmp_path / "gwjax.out"
-    report = GWProductionReport(
-        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
-    report.batched_linalg(
-        config=_config(), n_charge=7000, n_current=2000,
-        nq=9, processes=4)
-    report.finish()
-
-    lines = path.read_text(encoding="utf-8").splitlines()
-    warnings = [line for line in lines
-                if line.startswith("WARNING [distrib_la batch_reshard capacity]")]
-    assert len(warnings) == 1
-    warning = warnings[0]
-    assert "charge+current centroids=9000 (7000+2000)" in warning
-    assert "threshold=8333" in warning
-    assert "three-arena complex128 square-solve floor is 23.33 GB/rank" in warning
-    assert "50% placement limit 20.00 GB/rank" in warning
-    assert "distrib_la_batched_route = auto" in warning
-
-
-def test_explicit_auto_has_no_default_provenance_or_capacity_warning(tmp_path):
+def test_low_mem_bands_warning_has_automatic_chunk_number(tmp_path):
     path = tmp_path / "gwjax.out"
     config = _config()
-    config.backend.distrib_la_batched_route = "auto"
-    config.raw_input_keys = frozenset({"distrib_la_batched_route"})
+    config.memory.low_mem_bands = True
+    config.memory.band_chunk_size = 24
+    config.raw_input_keys = frozenset({"low_mem_bands"})
     report = GWProductionReport(
         str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
-    report.batched_linalg(
-        config=config, n_charge=9000, n_current=9000,
-        nq=9, processes=4)
+    report.layout_dials(
+        config=config, n_mu=7000, n_q_irr=9, processes=4)
     report.finish()
 
     text = path.read_text(encoding="utf-8")
-    assert "[config provenance]" not in text
-    assert "WARNING [distrib_la batch_reshard capacity]" not in text
+    assert "[config provenance] low_mem_bands = true (deck)" in text
+    assert (
+        "low_mem_bands = true: saves memory (band chunks of 24) but takes "
+        "longer; set false on systems that fit" in text)
+
+
+def test_distributed_linalg_reports_2d_layout(tmp_path):
+    path = tmp_path / "gwjax.out"
+    config = _config()
+    config.backend.linalg = "distributed"
+    config.backend.linalg_provenance = "deck"
+    report = GWProductionReport(
+        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
+    report.layout_dials(
+        config=config, n_mu=9000, n_q_irr=9, processes=4)
+    report.finish()
+
+    text = path.read_text(encoding="utf-8")
+    assert "[config provenance] linalg = distributed (deck)" in text
+    assert "2D distributed across the process mesh (N_mu = 9000)" in text
+    assert "linalg = local: fastest" not in text
 
 
 def test_mpa_trs_route_is_part_of_the_scientific_run_record(tmp_path):

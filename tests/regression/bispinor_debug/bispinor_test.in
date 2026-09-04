@@ -53,14 +53,13 @@ centroids_file_current = centroids_frac_209_current.txt
 memory_per_device_gb = 30.0
 
 restart = false
-# EXPLICIT local plan: this is a ONE-GPU deck.  An unnamed w_dyson_solver on a
-# slab bare_transverse deck is derived to 'distributed' at parse time (heads
-# always on, integ 2026-09-02), and distrib_la refuses that plan on a 1x1
-# mesh; naming 'local' keeps this fixture on the incumbent route (Sigma^B via
+# EXPLICIT local plan: this is a ONE-GPU deck.  The distributed packed route
+# needs a multi-process mesh; naming 'local' keeps this fixture on the
+# incumbent route (Sigma^B via
 # gw.sigma_x_bispinor, scalar band-diagonal head, NO transverse q=Gamma head),
 # which is the route its frozen reference was cut from.  Lane N's dynamic
 # packed route needs >= 2x2 GPUs until the packed Dyson solve has a local plan.
-w_dyson_solver = local
+linalg = local
 
 do_screened = true
 compute_mode = gn_ppm

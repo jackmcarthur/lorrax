@@ -36,12 +36,12 @@ from isdf.galerkin import (
     validate_rank_multiplier,
     write_galerkin_basis,
 )
-# ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
-# this driver reads a raw params dict rather than a LorraxConfig, which is
-# exactly the case that function exists for.
+# This driver reads a raw params dict rather than ``LorraxConfig``; use the
+# parser-cached linalg profile rather than interpreting its public dial here.
 from gw.gw_config import (
     distrib_la_batched_route_choices,
     eigh_backend_choices,
+    linalg_resolution,
     read_cohsex_input,
     resolve_distrib_la_batched_route,
     resolve_eigh_backend,
@@ -2301,18 +2301,12 @@ def main(argv=None):
     report.architecture()
 
     params = read_cohsex_input(args.input)
-    # Input file is the source of truth; the CLI flag is an override — and
-    # BOTH go through the one resolver, which is where ``use_low_mem_eigh``
-    # folds in.  This driver used to inline the precedence and never call
-    # it, so the deck key moved nothing here.
+    # Input file is the source of truth; CLI backend flags remain debug
+    # overrides of the implementation selected by the resolved layout.
     eigh_backend = resolve_eigh_backend(params, override=args.eigh_backend)
     distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=args.distrib_la_batched_route)
-    # The INTENT travels too.  ``compute_wfns_fi`` refuses at resolve time
-    # under this flag rather than falling back to the whole-matrix native
-    # path (bse_setup's no-fallback contract); passing only the resolved
-    # library name would leave that refusal disarmed on this driver.
-    use_low_mem_eigh = bool(params.get("use_low_mem_eigh", False))
+    use_low_mem_eigh = linalg_resolution(params).layout == "distributed"
     n_return_bands = int(params["nval"]) + int(params["ncond"])
     
     # Override WFN file if provided via CLI

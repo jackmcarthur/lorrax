@@ -1194,6 +1194,88 @@ def eigh_backend_choices() -> tuple:
 
 DISTRIB_LA_BATCHED_ROUTE_DEFAULT = "batch_reshard"
 
+# The owner-selected automatic band chunk remains the implementation policy
+# after the numeric deck key is retired.  ``low_mem_bands`` selects the carrier;
+# the chunk planner still mesh-rounds and caps this request at the fit window.
+AUTOMATIC_BAND_CHUNK_SIZE = 16
+
+
+@dataclass(frozen=True)
+class LinalgResolution:
+    """Internal execution profile selected by the one ``linalg`` deck dial.
+
+    The public vocabulary deliberately stops at layout.  These fields retain
+    the established implementation choices so existing stage code need not
+    become a second interpreter of ``local`` versus ``distributed``.
+    """
+
+    layout: str
+    provenance: str
+    w_dyson_solver: str
+    distributed_cholesky: str
+    distributed_lu: str
+    batched_route: str
+    eigh_backend: str
+    sc_eigh: str
+    charge_zeta_solve: str
+    distributed_zeta_solve: str
+    transverse_zeta_solve: str
+
+
+_LINALG_RESOLUTION = "_linalg_resolution"
+
+
+def resolve_linalg(params) -> LinalgResolution:
+    """Interpret ``linalg = local | distributed`` exactly once.
+
+    ``distributed_lu='distributed'`` is an internal portable sentinel.  The
+    typed-config factory lowers it to cuSolverMp on CUDA and ScaLAPACK on CPU;
+    that is capability routing, not another interpretation of the deck dial.
+    """
+    raw = params.get("linalg", "local") if hasattr(params, "get") else "local"
+    layout = str("local" if raw is None else raw).strip().lower()
+    if layout not in ("local", "distributed"):
+        raise ValueError(
+            f"linalg={layout!r} invalid; expected local or distributed.")
+    named = params.get(_DECK_NAMED_KEYS, ()) if hasattr(params, "get") else ()
+    provenance = "deck" if "linalg" in named else "default"
+    if layout == "local":
+        return LinalgResolution(
+            layout=layout,
+            provenance=provenance,
+            w_dyson_solver="local",
+            distributed_cholesky="auto",
+            distributed_lu="auto",
+            batched_route=DISTRIB_LA_BATCHED_ROUTE_DEFAULT,
+            eigh_backend="auto",
+            sc_eigh="auto",
+            charge_zeta_solve="rank_truncate",
+            distributed_zeta_solve="auto",
+            transverse_zeta_solve="ridge",
+        )
+    return LinalgResolution(
+        layout=layout,
+        provenance=provenance,
+        w_dyson_solver="distributed",
+        distributed_cholesky="distributed",
+        distributed_lu="distributed",
+        batched_route="auto",
+        eigh_backend="distributed",
+        sc_eigh="distributed",
+        charge_zeta_solve="rank_truncate",
+        distributed_zeta_solve="distributed",
+        transverse_zeta_solve="ridge",
+    )
+
+
+def linalg_resolution(params) -> LinalgResolution:
+    """Return the parser-cached layout profile (resolve hand-built dicts)."""
+    resolution = (params.get(_LINALG_RESOLUTION)
+                  if hasattr(params, "get") else None)
+    if isinstance(resolution, LinalgResolution):
+        return resolution
+    return resolve_linalg(params)
+
 
 def distrib_la_batched_route_choices() -> tuple[str, ...]:
     """User-facing batch-route vocabulary from the ``distrib_la`` door.
@@ -1218,18 +1300,10 @@ def distrib_la_batched_route_choices() -> tuple[str, ...]:
 
 def resolve_distrib_la_batched_route(
         params, *, override: str | None = None) -> str:
-    """Resolve the universal distrib_la batch schedule from deck/CLI input.
-
-    ``use_low_mem_eigh`` says that one complete eigensolver tile cannot fit
-    on a device; ``batch_reshard`` requires exactly that residency.  Refuse
-    the contradictory pair here, before either the GW or standalone BSE
-    drivers allocate a matrix.
-    """
+    """Return the batch schedule from the resolved layout or a CLI override."""
+    resolution = linalg_resolution(params)
     raw = (override if override is not None else
-           (params.get("distrib_la_batched_route",
-                       DISTRIB_LA_BATCHED_ROUTE_DEFAULT)
-            if hasattr(params, "get")
-            else DISTRIB_LA_BATCHED_ROUTE_DEFAULT))
+           resolution.batched_route)
     route = str(DISTRIB_LA_BATCHED_ROUTE_DEFAULT
                 if raw is None else raw).strip().lower()
     choices = distrib_la_batched_route_choices()
@@ -1237,88 +1311,21 @@ def resolve_distrib_la_batched_route(
         raise ValueError(
             f"distrib_la_batched_route={route!r} invalid; expected "
             f"{' / '.join(choices)}.")
-    if (route == "batch_reshard" and hasattr(params, "get")
-            and bool(params.get("use_low_mem_eigh", False))):
-        named = params.get(_DECK_NAMED_KEYS, None)
-        route_was_named = (
-            override is not None
-            or ("distrib_la_batched_route" in named
-                if named is not None
-                else "distrib_la_batched_route" in params))
-        if not route_was_named:
-            # ``use_low_mem_eigh`` says whole-tile residency is unsafe. This
-            # is the one uncertified envelope for the shipping staged route;
-            # preserve the face-sharded provider/scan path unless the deck
-            # explicitly contradicts itself.
-            return "auto"
-        raise ValueError(
-            "distrib_la_batched_route='batch_reshard' contradicts "
-            "use_low_mem_eigh=true: batch_reshard places one complete "
-            "matrix (and its result/workspace) on each participating "
-            "device, while use_low_mem_eigh asserts that whole-tile "
-            "residency is not safe.  Keep distrib_la_batched_route=auto "
-            "for the robust face-sharded eigensolver route, or disable "
-            "use_low_mem_eigh only when a full tile fits.")
     return route
 
 
 def resolve_eigh_backend(params, *, override: str | None = None) -> str:
-    """``(eigh_backend, use_low_mem_eigh)`` → ONE backend string.
-
-    THE single place the two spellings of one axis are combined, so a
-    driver that reads the raw params dict (``bandstructure.htransform``,
-    ``bse.exciton_bands``) gets the same answer as ``LorraxConfig``.
-
-    ``override`` is a CLI ``--eigh-backend`` value, or ``None`` for "the
-    deck decides".  It replaces the deck's ``eigh_backend`` and then goes
-    through the same combination, which is the only spelling of the
-    precedence that cannot drift: the flag names the LIBRARY, the deck key
-    ``use_low_mem_eigh`` names the INTENT, and one axis has one resolver.
-    The two CLI drivers used to do `args.X if args.X is not None else
-    params.get(...)` inline and never called this function at all, so
-    ``use_low_mem_eigh`` was parsed, stored, and read by nobody on either
-    of them.
-
-    * ``use_low_mem_eigh`` unset/false → ``eigh_backend`` verbatim.
-    * true + ``auto`` → ``"distributed"`` (the platform's distributed
-      library; ScaLAPACK on a host mesh, cuSOLVERMp on CUDA).
-    * true + an explicit library name → that name (it already IS the
-      distributed path).
-    * true + ``off`` → ``ValueError``.  ``off`` pins the q-batched native
-      eigh, which needs a WHOLE ``(rank, rank)`` matrix per device — the
-      one thing the flag says is unaffordable.  Refusing at parse time is
-      the doctrine: an explicit request that cannot be honoured never
-      silently becomes its opposite.
-
-    Vocabulary is checked here too, so an unknown spelling fails at parse
-    time rather than at the first eigh.
-    """
+    """Return the eigensolver backend from the resolved layout or CLI debug."""
     if override is not None:
         raw = override
     else:
-        raw = (params.get("eigh_backend", "auto")
-               if hasattr(params, "get") else "auto")
+        raw = linalg_resolution(params).eigh_backend
     backend = str("auto" if raw is None else raw).strip().lower()
     choices = eigh_backend_choices()
     if backend not in choices:
         raise ValueError(
             f"eigh_backend={backend!r} invalid; expected "
             f"{' / '.join(choices)}.")
-    low_mem = bool(params.get("use_low_mem_eigh", False)
-                   if hasattr(params, "get") else False)
-    if not low_mem:
-        return backend
-    if backend in ("auto", "native"):
-        return "distributed"
-    if backend == "off":
-        raise ValueError(
-            "use_low_mem_eigh = true with eigh_backend = off is a "
-            "contradiction: 'off' pins the q-batched NATIVE eigh, which is "
-            "the path that needs one whole (rank, rank) matrix per device — "
-            "exactly what the low-memory flag says will not fit.  Either "
-            "drop use_low_mem_eigh, or set eigh_backend = auto (resolves to "
-            "'distributed') or name a library "
-            "(distributed|cusolvermp|slate|scalapack).")
     return backend
 
 
@@ -1731,9 +1738,6 @@ _DEFAULTS = {
     # interpreted only by qp_solver=self_consistent.
     "sc_buffer_nbands": 0,
     "sc_buffer_mode": "diagonal",  # diagonal | one_sided | carry
-    "sc_eigh": "auto",           # auto | native | distributed (per-iteration
-                                 # eigh of the (nk, nb, nb) carry; a LAYOUT
-                                 # choice, independent of the physics knobs)
     # Optional fourth text output beside the ordinary one-shot eqp0/eqp1
     # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
     # already-computed full Sigma_c(omega) table: W, screening, and Sigma
@@ -1764,58 +1768,10 @@ _DEFAULTS = {
     # 0 (default) = auto (``_pick_g_chunk(ngkmax)`` → largest divisor
     # of ngkmax ≤ 4096).
     "vq_g_chunk_size": 0,
-    # ζ-fit solver path overrides (3-state).  Default ``auto`` picks
-    # cuSolverMp on true 2D meshes (p_x ≥ 2 AND p_y ≥ 2) and the
-    # JAX/CUDA fallback otherwise.  Force a path with ``on`` / ``off``.
-    # Distributed dense-linalg backends (block-cyclic).  Portable axes —
-    # the values name LIBRARIES, not vendors' key names:
-    #   distributed_cholesky = auto | off | cusolvermp | slate
-    #       charge-channel ζ-fit Cholesky.  auto → cusolvermp on true-2D
-    #       GPU meshes, in-tree sharded_cholesky otherwise.  slate is the
-    #       portability path (Frontier/Aurora); explicit request fails
-    #       loudly if the FFI/library is absent (optional dependency).
-    #   distributed_lu = auto | off | cusolvermp | scalapack
-    #       transverse-channel LU.  scalapack = the host/CPU-backend
-    #       backend (Cray LibSci pXgetrf+pXgetrs via liblorrax_ffi_host);
-    #       explicit, never auto-picked.  (SLATE getrf not yet written.)
-    "distributed_cholesky": "auto",
-    "distributed_lu":       "auto",
-    # Universal schedule for every array-returning ``distrib_la.Plan.batched``
-    # call. ``batch_reshard`` is the certified small-matrix/high-HBM default:
-    # P(None,'x','y') -> P(('x','y'),None,None), local JAX linalg on
-    # each device's whole matrices, then the inverse reshard.  Backend
-    # resolution and the Plan I/O contract stay unchanged; this explicit
-    # route runs the local JAX kernel in place of that backend for the call.
-    # Explicit ``auto`` restores the face-sharded provider/scan route.
-    "distrib_la_batched_route": DISTRIB_LA_BATCHED_ROUTE_DEFAULT,
-    #   eigh_backend = auto | off | distributed | cusolvermp | slate
-    #                | scalapack
-    #       Hermitian eigensolver for the BSE/htransform distributed-eigh
-    #       sites (bse_setup fH_q, vq_interp coarse C_q tiles).  auto|off =
-    #       the q-BATCHED native jnp.linalg.eigh (the measured default at
-    #       every production tile size); the rest spread ONE tile over the
-    #       whole mesh via the distributed-linalg FFI — the wide-band-window
-    #       regime where a single matrix no longer fits on one device (square
-    #       mesh + one process per device required; all guards fire at
-    #       resolve time — see services/distrib_la +
-    #       docs/services/distrib_la.md).
-    #       ``distributed`` = the PLATFORM's distributed library (ScaLAPACK
-    #       pzheevd on a host mesh, cuSOLVERMp on CUDA) and is the spelling
-    #       that ports; the vocabulary is distrib_la's own, checked
-    #       against it at parse time so the two can never drift.  The
-    #       --eigh-backend CLI flag of htransform / exciton_bands OVERRIDES
-    #       this key.
-    "eigh_backend":         "auto",
-    #   use_low_mem_eigh = true | false   (default false)
-    #       The SAME axis named by INTENT instead of by library: "one whole
-    #       (rank, rank) matrix does not fit on a rank, keep it spread over
-    #       the mu x nu face".  true + eigh_backend=auto  =>  'distributed'.
-    #       true + an explicit library name keeps that name.  true +
-    #       eigh_backend=off is a CONTRADICTION and is refused at parse time,
-    #       as is a true that cannot be honoured on this mesh — never a
-    #       silent fall back to the whole-matrix path the flag exists to
-    #       avoid.  See bandstructure.bse_setup.compute_wfns_fi.
-    "use_low_mem_eigh":     False,
+    # The only deck selector for dense-LA placement.  ``resolve_linalg``
+    # expands it once into the established whole-matrix or provider profile;
+    # stage/backend spellings are internal implementation details.
+    "linalg": "local",           # local | distributed
     # Charge ζ-fit OPT-IN Tikhonov ridge ε (added ON TOP of the fixed
     # 1e-14·|tr| non-singularity floor, as a fraction of the mean CCT
     # diagonal tr(C)/n): C_q ← C_q + [1e-14·|tr| + ε·|tr|/n]·I before the
@@ -1830,17 +1786,17 @@ _DEFAULTS = {
     # this ill-posed fit) — hence opt-in, a physics call.  Env override
     # LORRAX_ZETA_RIDGE.  See reports/gw_zeta_mesh_invariance_2026-07-20.
     "zeta_ridge":           0.0,
-    # Charge ζ-solve conditioner (μ_L=0 channel only).  "rank_truncate"
-    # (DEFAULT) = rank-revealing eigh pseudo-inverse: drop eigenvalues
+    # Internal charge ζ conditioner (μ_L=0 channel only).  Both public
+    # layouts retain rank_truncate: a rank-revealing eigh pseudo-inverse that
+    # drops eigenvalues
     # < zeta_rcond·λ_max before inverting, so the near-null directions of
     # the over-complete charge CCT (n_μ > pair-density rank, κ~1e13) are
     # removed at the source instead of amplified by plain Cholesky into
     # O(1) V_q errors that GN-PPM magnifies to tens of eV (the conduction
     # Σc blow-up / device-count / nband instability).  "cholesky" = the
-    # historical replicated/cuSolverMp Cholesky path (bit-identical to the
-    # pre-feature behavior; the selectable alternative).
-    "charge_zeta_solve":    "rank_truncate",   # rank_truncate | cholesky
-    # ζ BACK-SOLVE TIER — how much of the (nq, μ, μ) charge factor is ever
+    # historical replicated/cuSolverMp Cholesky path (kept as an internal
+    # implementation arm).
+    # Internal ζ BACK-SOLVE TIER — how much of the (nq, μ, μ) charge factor is ever
     # replicated.  The first three tiers below are numerically free (same
     # per-q arithmetic, only the gathered extent differs); `distributed`
     # replaces the factorization as well and is the only one that scales.
@@ -1880,7 +1836,6 @@ _DEFAULTS = {
     # collective's payload.  The 4 GiB gather cap was satisfied when job
     # 7876062 died at P=144 inside a single 1.15 GB Gloo AllGather; see
     # isdf/core.py's "COLLECTIVE PAYLOAD CHUNKING" note and scorecard AF.
-    "distributed_zeta_solve": "auto",  # auto | replicated | per_q | distributed
     # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-8 —
     # the LOW end of the over-complete recovery plateau.  An over-complete
     # basis needs it: at MoS2 4×4/1204c, 1e-10 only partially recovers (MAE
@@ -1895,8 +1850,8 @@ _DEFAULTS = {
     # ZETA_RCOND_DEFAULT (defined above _DEFAULTS) — one copy, no mirrors.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
     "zeta_rcond":           ZETA_RCOND_DEFAULT,
-    # Transverse ζ-solve family (bispinor μ_L=1,2,3 channels only; inert
-    # otherwise).  "ridge" (DEFAULT) = the historical hoisted pivoted-LU
+    # Internal transverse ζ-solve family (bispinor μ_L=1,2,3 channels only;
+    # inert otherwise).  Both public layouts retain ridge: the historical hoisted pivoted-LU
     # with the 1e-12·|tr|/n diagonal ridge — byte-identical to the
     # pre-feature behavior.  "rank_truncate" = per-q eigh pseudo-inverse
     # of the Hermitian INDEFINITE transverse CCT with an |λ| cut (drop
@@ -1912,7 +1867,6 @@ _DEFAULTS = {
     # distributed_lu=scalapack does not apply).  distributed_lu is an LU
     # backend key and conflicts with this family: explicit
     # scalapack/cusolvermp + rank_truncate refuses at parse time.
-    "transverse_zeta_solve": "ridge",   # ridge | rank_truncate
     # Transverse rank-truncation cutoff τ (relative to |λ|_max, per q).
     # Only read by transverse_zeta_solve=rank_truncate.  Default from the
     # 2026-08 MoS2 4×4 bispinor calibration ladder (eqp drift vs the
@@ -1930,13 +1884,8 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    # Owner-selected no-key policy.  Its pre-AOT P=4 premise (Si 80 Ry:
-    # bc16 33 ms versus full-window 46 ms) reversed after the SM80 AOT merge
-    # (31 versus 21 ms), so 16 is not asserted to be the faster universal
-    # choice.  Explicit 0 opts into the full-window-first planner ladder; any
-    # positive value remains an override.  The planner mesh-rounds and caps
-    # all three forms at the logical zeta window.
-    "band_chunk_size": 16,
+    # The automatic band chunk request is ``AUTOMATIC_BAND_CHUNK_SIZE``;
+    # the planner mesh-rounds and caps it at the logical zeta window.
     "r_chunk_size": 0,
     # Two-face 2-D-sharded ψ carrier (gw.wavefunction_bundle
     # layout="face") in place of the legacy four single-axis copies:
@@ -1961,7 +1910,6 @@ _DEFAULTS = {
     #                on an unsupported mesh/build — never silently
     #                downgrades to local.
     # (lu → local with a DeprecationWarning; lstsq was removed.)
-    "w_dyson_solver": "auto",
     "mc_average_vcoul_body": True,
     # One explicit BerkeleyGW-emulation contract for the metallic q=0 cell.
     # ``exact`` is the shipped LORRAX limit.  ``bgw_q0shift`` bundles the
@@ -2137,7 +2085,7 @@ _DEFAULTS = {
     "ppm_probe_chi_reuse": "off",
     # Multipole W sampling / bounded Sigma consumption.
     "mpa_n_poles": 8,
-    "mpa_sampling_alpha": 1,
+    "mpa_sampling_alpha": None,
     # The incumbent nested extension and the literal Leon/Yambo qPPS
     # continuation agree through eight poles and differ from nine onward.
     "mpa_sampling_schedule": "nested",
@@ -2345,12 +2293,6 @@ _DEFAULTS = {
     # construction.  See bandstructure.bse_setup.compute_wfns_fi.
     "wfn_fi_q_chunk": 0,
 
-    # Deck hygiene.  False (DEFAULT): a key that is not in _DEFAULTS and
-    # not covered by a legacy/deprecation branch is reported in one
-    # aggregated rank-0 warning and ignored.  True: the same condition
-    # raises ValueError naming every unknown key — for CI decks and fresh
-    # runs where a typo must not silently drop a knob.
-    "strict_keys": False,
 }
 
 # Deck keys REMOVED from _DEFAULTS but still handled by an explicit
@@ -2380,6 +2322,21 @@ _LEGACY_DECK_KEYS = frozenset({
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
     # keeps its dedicated parse refusal; other values warn-and-ignore.
     "sigma_omega_accumulation",
+    # 2026-09-04: one layout dial replaces the stage/backend spellings.
+    "distributed_zeta_solve",
+    "distributed_cholesky",
+    "distributed_lu",
+    "w_dyson_solver",
+    "distrib_la_batched_route",
+    "charge_zeta_solve",
+    "transverse_zeta_solve",
+    "eigh_backend",
+    "sc_eigh",
+    "use_low_mem_eigh",
+    # Boolean low-memory intent now owns automatic band chunking.
+    "band_chunk_size",
+    # Unknown keys always refuse; this opt-in spelling no longer exists.
+    "strict_keys",
 })
 
 # Keys whose string values should be lowercased and stripped
@@ -2388,7 +2345,6 @@ _NORMALIZE_STR = {
     "bispinor_gw",
     "qp_solver",
     "sc_accelerator",
-    "sc_eigh",
     "sc_head_update",
     "wcoul0_source", "head_correction", "screening_method",
     "screening_diagrams",
@@ -2397,7 +2353,7 @@ _NORMALIZE_STR = {
     "band_extrapolation_estimator",
     "band_extrapolation_bracket_scheme",
     "occ_smearing_family",
-    "w_dyson_solver",
+    "linalg",
     "ppm_invalid_mode",
     "ppm_model",
     "ppm_probe_chi_reuse",
@@ -2407,10 +2363,6 @@ _NORMALIZE_STR = {
     # the same reason: its wrong value would otherwise surface as a refusal
     # in the post-SC artifact dump, after the whole self-consistency.
     "qp_rotations_k_storage",
-    # distributed-linalg backend axes (consumed both via LorraxConfig and
-    # directly from the params dict by htransform / exciton_bands).
-    "eigh_backend",
-    "distrib_la_batched_route",
 }
 
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
@@ -2434,6 +2386,7 @@ _NULLABLE_BOOL = frozenset({
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({
     "zeta_nband",
+    "mpa_sampling_alpha",
     # The band-count family's three "the deck did not say" slots.  They are
     # nullable for the same reason ``zeta_nband`` is — ``None`` has to be
     # distinguishable from any integer a deck could write — and integer for
@@ -2946,9 +2899,8 @@ def read_lorrax_input(filename: str) -> dict:
         # "retired" (the key was real once, and here is what replaced it)
         # distinct from "unrecognized" (nothing ever read this).  The
         # DeprecationWarnings stay — they are what a library consumer
-        # filters on.  This report never REFUSES: ``strict_keys`` governs
-        # unknown keys, and whether a retired key should be fatal is the
-        # deck owner's call, not the parser's.
+        # filters on.  Explicit refusal branches below own keys whose
+        # replacement must be named rather than hidden in a generic error.
         retired = []                         # (key, what the run does with it)
 
         # ``chunk_size`` (legacy band-chunk knob) was a no-op: its only
@@ -2959,13 +2911,13 @@ def read_lorrax_input(filename: str) -> dict:
             warnings.warn(
                 "Input key 'chunk_size' is no longer supported and will be "
                 "ignored (it was a no-op; chunk sizing is planner-owned — "
-                "see 'gflat_chunk_size' / 'band_chunk_size').",
+                "see 'gflat_chunk_size' / 'low_mem_bands').",
                 DeprecationWarning, stacklevel=2,
             )
             retired.append((
                 "chunk_size",
                 "IGNORED — it was a no-op; chunk sizing is planner-owned "
-                "(see 'gflat_chunk_size' / 'band_chunk_size')"))
+                "(see 'gflat_chunk_size' / 'low_mem_bands')"))
         for legacy_key in ("output_file", "eqp_output_file"):
             if section.get(legacy_key, fallback=None) is not None:
                 import warnings
@@ -3041,6 +2993,30 @@ def read_lorrax_input(filename: str) -> dict:
                     "sigma_quadrature_reduction_seconds, "
                     "sigma_quadrature_cache_dir."
                 )
+        for legacy_key in (
+            "distributed_zeta_solve",
+            "distributed_cholesky",
+            "distributed_lu",
+            "w_dyson_solver",
+            "distrib_la_batched_route",
+            "charge_zeta_solve",
+            "transverse_zeta_solve",
+            "eigh_backend",
+            "sc_eigh",
+            "use_low_mem_eigh",
+        ):
+            if section.get(legacy_key, fallback=None) is not None:
+                raise ValueError(
+                    f"Input key '{legacy_key}' is retired; use "
+                    "'linalg = local | distributed'.")
+        if section.get("band_chunk_size", fallback=None) is not None:
+            raise ValueError(
+                "Input key 'band_chunk_size' is retired; use "
+                "'low_mem_bands = true | false' (chunk size is automatic).")
+        if section.get("strict_keys", fallback=None) is not None:
+            raise ValueError(
+                "Input key 'strict_keys' is retired; remove it (unknown "
+                "deck keys are always refused).")
         # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
         # accumulation is the only mode, so the key steered nothing.  The
         # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
@@ -3095,18 +3071,13 @@ def read_lorrax_input(filename: str) -> dict:
         # check below, never steering anything): ``isdf_memory_mode``
         # (two-plan W cleanup — the W Dyson solve is selected by
         # w_dyson_solver=local|distributed) and the legacy aliases
-        # ``cusolvermp_charge``/``cusolvermp_lu`` (use distributed_cholesky
-        # / distributed_lu).
+        # ``cusolvermp_charge``/``cusolvermp_lu`` (use the ``linalg`` dial).
 
         # --- Unknown-key check -----------------------------------------
         # Every key in the deck that is neither in ``_DEFAULTS`` nor
-        # handled by one of the explicit legacy branches above is reported
-        # in ONE aggregated rank-0 warning (key, line number, "ignored").
-        # Silently dropping unknown keys turned every typo and every stale
-        # doc into silent wrong physics.  Warn, don't refuse — archived
-        # decks carry dead keys — unless the deck opts in via
-        # ``strict_keys = true``, which upgrades the warning to a
-        # ValueError naming all unknown keys at once.
+        # handled by one of the explicit legacy branches above is refused
+        # in ONE aggregated error (key and line number).  Deck parsing is
+        # always strict; there is no mode in which a typo is ignored.
         # Retired keys are exempt (they got their own report above).
         # configparser lower-cases option names (``optionxform = str.lower``),
         # so iterating ``section`` yields ``do_g0`` for a deck that writes
@@ -3123,19 +3094,11 @@ def read_lorrax_input(filename: str) -> dict:
         if unknown:
             located = [f"{key} ({_deck_key_line(lines, start, end, key)})"
                        for key in unknown]
-            if section.getboolean(
-                    "strict_keys",
-                    fallback=bool(_DEFAULTS["strict_keys"])):
-                raise ValueError(
-                    f"strict_keys = true: {len(unknown)} unknown deck "
-                    f"key(s) in {filename}:\n"
-                    + "\n".join(f"    {loc}: not a recognized deck key"
-                                for loc in located))
-            _print_deck_report(
+            raise ValueError(
                 f"read_lorrax_input: {len(unknown)} unrecognized deck "
                 f"key(s) in {filename}:\n"
                 + "\n".join(
-                    f"    {loc}: ignored — not a recognized deck key"
+                    f"    {loc}: not a recognized deck key"
                     for loc in located))
 
         # Build params from _DEFAULTS, overriding with parsed values
@@ -3181,6 +3144,10 @@ def read_lorrax_input(filename: str) -> dict:
     else:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()
+
+    # Deck dial interpretation point (INVARIANTS row 19).  Every downstream
+    # consumer reads this immutable record; no stage reinterprets ``linalg``.
+    params[_LINALG_RESOLUTION] = resolve_linalg(params)
 
     # --- Band counts: resolve ONCE, here ------------------------------
     # ``number_bands`` / ``number_bands_chi`` / ``number_bands_sigma`` /
@@ -3615,7 +3582,7 @@ def packed_static_envelope(config, *, screened: bool):
     row: it is inferred once from the loaded WFN occupations and
     :func:`validate_material_inputs` refuses every fractional-occupation
     non-MPA run, including this COHSEX-only screened route, and is not a
-    row.  The distributed-plan row (``w_dyson_solver = distributed``) is
+    row.  The distributed-plan row (``linalg = distributed``) is
     shared because the packed response facade has that one plan even when
     the bare route can skip the block-diagonal current solve.  ``sys_dim`` is
     also deliberately NOT here -- the bare route treats it as a routing
@@ -3659,13 +3626,10 @@ def packed_static_envelope(config, *, screened: bool):
            "unreachable: GATE "
            "bispinor_slab_cohsex_restart_changes_the_head_mechanism refuses "
            "at parse time, naming both mechanisms", None)
-    yield (str(config.backend.w_dyson_solver) == "distributed",
-           f"w_dyson_solver = {config.backend.w_dyson_solver}",
-           "w_dyson_solver = distributed", _ENV_IMPL,
-           "the packed response facade has only the distributed plan.  "
-           "DERIVED: an unnamed w_dyson_solver is set to distributed for "
-           "every packed route at parse time, so this row can only fire on "
-           "an explicit conflicting value", "w_dyson_solver")
+    yield (str(config.backend.linalg) == "distributed",
+           f"linalg = {config.backend.linalg}",
+           "linalg = distributed", _ENV_IMPL,
+           "the packed response facade has only the distributed plan", None)
     if not screened:
         return
     yield (bool(config.memory.low_mem_bands), "low_mem_bands = false",
@@ -4446,7 +4410,8 @@ class MPAConfig:
     """Multipole sample geometry and bounded pole-consumption policy."""
 
     n_poles: int
-    sampling_alpha: int
+    sampling_alpha: int | None
+    sampling_alpha_provenance: str
     sampling_schedule: str
     pole_solver: str
     varpi_near_ry: float
@@ -4476,7 +4441,7 @@ class MPAConfig:
     def __post_init__(self):
         if not 1 <= self.n_poles <= 16:
             raise ValueError("mpa_n_poles must be in [1, 16]")
-        if self.sampling_alpha not in (1, 2):
+        if self.sampling_alpha is not None and self.sampling_alpha not in (1, 2):
             raise ValueError("mpa_sampling_alpha must be 1 or 2")
         if self.sampling_schedule not in ("nested", "leon"):
             raise ValueError(
@@ -4510,6 +4475,11 @@ class MPAConfig:
         metallic plan does not claim that the occupation-weighted χ/Σ
         evaluators needed to consume it have landed.
         """
+        if self.sampling_alpha is None:
+            raise RuntimeError(
+                "mpa_sampling_alpha is unresolved; infer the material class "
+                "from WFN occupations before constructing an MPA sample plan")
+
         from .mpa.sample_plan import mpa_plan
 
         return mpa_plan(
@@ -4677,19 +4647,19 @@ class MemoryConfig:
     gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
     low_mem_bands: bool           # gw.wavefunction_bundle layout="face"
+    low_mem_bands_provenance: str  # deck | default | derived for packed mode
 
 
 @dataclass(frozen=True)
 class BackendConfig:
     """FFI/linalg backend selection resolved once at startup."""
+    linalg: str              # one public layout dial: local | distributed
+    linalg_provenance: str   # deck | default
     w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     distrib_la_batched_route: str  # "auto" | "batch_reshard"
-    eigh_backend: str          # resolved: auto|off|distributed|cusolvermp|
-                               #           slate|scalapack (use_low_mem_eigh
-                               #           already folded in)
-    use_low_mem_eigh: bool     # what the deck ASKED for, kept for the banner
+    eigh_backend: str          # resolved internal distrib_la backend
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
     distributed_zeta_solve: str  # "auto"|"replicated"|"per_q"|"distributed"
@@ -4700,29 +4670,7 @@ class BackendConfig:
 
     def summary(self) -> str:
         """One-line "what's active" for the run banner."""
-        return (
-            "backend: "
-            + (f"w_dyson_solver={self.w_dyson_solver}, "
-               if self.w_dyson_solver != "local" else "")
-            + f"distributed_cholesky={self.distributed_cholesky}, "
-            f"distributed_lu={self.distributed_lu}, "
-            + (f"distrib_la_batched_route={self.distrib_la_batched_route}, "
-               if self.distrib_la_batched_route != "auto" else "")
-            + (f"eigh_backend={self.eigh_backend}"
-               + (" (use_low_mem_eigh)" if self.use_low_mem_eigh else "")
-               + ", " if self.eigh_backend != "auto" else "")
-            + f"charge_zeta_solve={self.charge_zeta_solve}"
-            + (f"(rcond={self.zeta_rcond:g})"
-               if self.charge_zeta_solve == 'rank_truncate' else '')
-            + (f", zeta_ridge={self.zeta_ridge:g}"
-               if self.zeta_ridge else '')
-            + (f", distributed_zeta_solve={self.distributed_zeta_solve}"
-               if self.distributed_zeta_solve != 'auto' else '')
-            + (f", transverse_zeta_solve={self.transverse_zeta_solve}"
-               f"(rcond={self.transverse_zeta_rcond:g})"
-               if self.transverse_zeta_solve != 'ridge' else '')
-            + f", gamma_contract={self.gamma_contract_mode}"
-        )
+        return f"backend: linalg={self.linalg} ({self.linalg_provenance})"
 
 
 @dataclass(frozen=True)
@@ -4844,6 +4792,36 @@ def validate_material_inputs(config, material_class):
             raise ValueError(
                 "mpa_metal_origin_shift_ry is metal-only, but WFN "
                 "occupations identify an insulator; remove the key.")
+
+
+def resolve_mpa_sampling_alpha(config, material_class, *, print_fn=print):
+    """Resolve and report the MPA sampling exponent from WFN material class.
+
+    This runs only after occupations are loaded: fractional occupations select
+    2, while integer-occupation nonmetals select 1.  A deck value wins.
+    """
+    if material_class not in ("insulator", "metal"):
+        raise ValueError(f"unknown inferred material class {material_class!r}")
+    named = "mpa_sampling_alpha" in config.raw_input_keys
+    if named:
+        alpha = config.mpa.sampling_alpha
+        if alpha not in (1, 2):
+            raise ValueError("mpa_sampling_alpha must be 1 or 2")
+        provenance = "deck"
+    else:
+        alpha = 2 if material_class == "metal" else 1
+        provenance = (
+            "default for metal" if material_class == "metal"
+            else "default for nonmetal")
+    print_fn(
+        f"  [config provenance] mpa_sampling_alpha = {alpha} "
+        f"({provenance})")
+    return _dc_replace(
+        config,
+        mpa=_dc_replace(
+            config.mpa,
+            sampling_alpha=alpha,
+            sampling_alpha_provenance=provenance))
 
 
 @dataclass(frozen=True)
@@ -5255,6 +5233,7 @@ class LorraxConfig:
         from file_io import resolve_input_paths
 
         params = read_lorrax_input(filename)
+        _linalg = params[_LINALG_RESOLUTION]
         input_dir = os.path.dirname(os.path.abspath(filename))
         resolve_input_paths(params, input_dir)
 
@@ -5440,7 +5419,12 @@ class LorraxConfig:
         )
         mpa = MPAConfig(
             n_poles=int(_g("mpa_n_poles")),
-            sampling_alpha=int(_g("mpa_sampling_alpha")),
+            sampling_alpha=(
+                int(_g("mpa_sampling_alpha"))
+                if _g("mpa_sampling_alpha") is not None else None),
+            sampling_alpha_provenance=(
+                "deck" if "mpa_sampling_alpha" in _named_keys
+                else "unresolved"),
             sampling_schedule=str(
                 _g("mpa_sampling_schedule")).strip().lower(),
             pole_solver=str(_g("mpa_pole_solver")).strip().lower(),
@@ -5543,7 +5527,7 @@ class LorraxConfig:
             buffer_mode=str(_g("sc_buffer_mode")).strip().lower(),
             # No env override: the LORRAX_SC_* envs are deprecated and a
             # new knob must not add one.
-            eigh=str(_g("sc_eigh")).strip().lower(),
+            eigh=_linalg.sc_eigh,
             head_update=str(_g("sc_head_update")).strip().lower(),
         )
         eqp2 = EQP2Config(
@@ -5556,88 +5540,17 @@ class LorraxConfig:
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
-            band_chunk_size=int(_g("band_chunk_size")),
+            band_chunk_size=AUTOMATIC_BAND_CHUNK_SIZE,
             r_chunk_override=int(_g("r_chunk_size")),
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
             low_mem_bands=bool(_g("low_mem_bands")),
+            low_mem_bands_provenance=(
+                "deck" if "low_mem_bands" in _named_keys else "default"),
         )
-        # SlabIO routing + auto-route GPU FFIs off on the CPU backend.
-        # cuSOLVERMp / cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both
-        # its read and its write core compile CUDA-free into
-        # liblorrax_ffi_host.so (``LORRAX_FFI_NO_CUDA``; see
-        # ``ffi/cpp/phdf5/platform_seam.h``), so on CPU it is preferred
-        # whenever the deployed lib exports the handler.
-        #
-        #   * the sharded-slab transport is NOT selected here any
-        #     more.  There is one, it is capability-checked at the file
-        #     open by ``file_io.slab_io.assert_available``, and a stack
-        #     that cannot serve it refuses there naming the probe that
-        #     declined.  Removing the deck key removed the router, the
-        #     three tiers and seven refusals with it (2026-08-06).
-        #   * on CPU, explicit ``cusolvermp`` is
-        #     REFUSED at parse time (CUDA-only backend; doctrine 3);
-        #     ``distributed_lu = auto`` demotes to ``"off"`` (in-tree
-        #     per-q ``jnp.linalg.solve``) with an announcement.
-        #
-        # User-facing: same ``cohsex.in`` works on both backends.
-        # Distributed-linalg axes.
-        _dist_chol = str(_g("distributed_cholesky")).strip().lower()
-        _dist_lu = str(_g("distributed_lu")).strip().lower()
-        _distrib_la_batched_route = resolve_distrib_la_batched_route(params)
-        if _dist_chol not in ("auto", "off", "cusolvermp", "slate"):
-            raise ValueError(
-                f"distributed_cholesky={_dist_chol!r} invalid; expected "
-                f"auto / off / cusolvermp / slate.")
-        if _dist_lu not in ("auto", "off", "cusolvermp", "scalapack"):
-            raise ValueError(
-                f"distributed_lu={_dist_lu!r} invalid; expected auto / off "
-                f"/ cusolvermp / scalapack (a SLATE getrf wrapper does not "
-                f"exist yet; scalapack is the host/CPU-backend option).")
-        # eigh_backend + use_low_mem_eigh are ONE axis; ``resolve_eigh_backend``
-        # is the single place they combine (the raw-params drivers call the
-        # same function).  It also owns the vocabulary check, read from
-        # distrib_la so parser and dispatcher cannot drift.
-        _use_low_mem_eigh = bool(_g("use_low_mem_eigh"))
-        _eigh_backend = resolve_eigh_backend({
-            "eigh_backend": _g("eigh_backend"),
-            "use_low_mem_eigh": _use_low_mem_eigh,
-        })
-        # No CPU rewriting for eigh_backend: an explicit FFI request keeps
-        # the fails-loudly semantics — distrib_la.resolve_backend rejects
-        # cusolvermp on a CPU mesh (and a slate-less build) at resolve time.
-        _charge_zeta_solve = str(_g("charge_zeta_solve")).strip().lower()
-        if _charge_zeta_solve not in ("rank_truncate", "cholesky"):
-            raise ValueError(
-                f"charge_zeta_solve={_charge_zeta_solve!r} invalid; expected "
-                f"rank_truncate / cholesky.")
-        # Normalised to one of the TWO plans at PARSE time (fails loudly
-        # here on removed spellings, not 20 minutes into the run).
-        _w_dyson_solver = normalize_w_dyson_solver(_g("w_dyson_solver"))
-        _dist_zeta_solve = str(_g("distributed_zeta_solve")).strip().lower()
-        if _dist_zeta_solve not in (
-                "auto", "replicated", "per_q", "distributed"):
-            raise ValueError(
-                f"distributed_zeta_solve={_dist_zeta_solve!r} invalid; "
-                f"expected auto / replicated / per_q / distributed.")
-        _transverse_zeta_solve = str(
-            _g("transverse_zeta_solve")).strip().lower()
-        if _transverse_zeta_solve not in ("ridge", "rank_truncate"):
-            raise ValueError(
-                f"transverse_zeta_solve={_transverse_zeta_solve!r} invalid; "
-                f"expected ridge / rank_truncate.")
-        if (_transverse_zeta_solve == "rank_truncate"
-                and _dist_lu in ("scalapack", "cusolvermp", "on")):
-            # Same refusal isdf/core._resolve_solver_kind_transverse makes
-            # at resolve time, surfaced at PARSE time so a doomed bispinor
-            # deck refuses in seconds, not after the charge fit.
-            raise ValueError(
-                f"transverse_zeta_solve=rank_truncate selects the eigh "
-                f"pseudo-inverse family (distributed plan via "
-                f"distributed_zeta_solve=distributed), but "
-                f"distributed_lu={_dist_lu!r} explicitly requests an LU "
-                f"backend that family does not run.  Leave distributed_lu "
-                f"at auto/off, or keep transverse_zeta_solve=ridge.")
+        # Lower the one layout profile to platform libraries.  This is a
+        # capability choice inside the already-resolved profile: GPU uses
+        # cuSolverMp/cuBLASMp; CPU uses ScaLAPACK.
         _transverse_zeta_rcond = float(_g("transverse_zeta_rcond"))
         if not (0.0 < _transverse_zeta_rcond < 1.0):
             raise ValueError(
@@ -5648,78 +5561,30 @@ class LorraxConfig:
             _is_cpu_backend = _jax.default_backend() == "cpu"
         except Exception:
             _is_cpu_backend = False
-        if _is_cpu_backend:
-            # Doctrine 3 (audit fix/zq 2026-07-28): an EXPLICIT
-            # ``cusolvermp`` on a CPU JAX backend REFUSES at parse time —
-            # matching the scalapack-on-GPU refusal below and
-            # eigh_backend's fails-loudly contract — instead of being
-            # rewritten to 'off' (which silently ran a different solver
-            # than the input file names).  Only 'auto' may demote, with an
-            # announcement.
-            #
-            # slate / scalapack pass through: host-platform FFIs
-            # (liblorrax_ffi_host.so) with explicit-request-fails-loudly
-            # semantics at their own resolve/call sites.
-            #
-            # ``distributed_cholesky = auto`` ALSO passes through.  It
-            # used to be forced to 'off' here, but 'off' is an *override*
-            # that short-circuits the whole route policy in isdf/core.py
-            # straight to ``sharded_cholesky`` -- and the replicated route
-            # it thereby skips is the ONLY one that carries the charge
-            # ζ-solve rank-truncation cure
-            # (charge_zeta_solve='rank_truncate').  That route is
-            # replicated dense JAX with no FFI, so it is perfectly valid
-            # on CPU; only the ABOVE-cap cuSOLVERMp branch is CUDA-only,
-            # and isdf/core.py declines that on a CPU mesh.  Forcing 'off'
-            # here silently produced a non-rank-conditioned ζ on CPU
-            # (garbage V_q -> inverted QP gap) with no warning.
-            if _dist_chol == "cusolvermp":
-                raise ValueError(
-                    "distributed_cholesky = cusolvermp is CUDA-only but "
-                    "the JAX backend is CPU; use distributed_cholesky = "
-                    "auto|off|slate on CPU runs (auto keeps the replicated "
-                    "rank-truncation route; slate is the host FFI).")
-            if _dist_lu == "cusolvermp":
-                raise ValueError(
-                    "distributed_lu = cusolvermp is CUDA-only but the JAX "
-                    "backend is CPU; use distributed_lu = "
-                    "auto|off|scalapack on CPU runs (scalapack is the "
-                    "ScaLAPACK host FFI).")
-            if _dist_lu == "auto":
-                # 'auto' demote, announced: auto never picks an FFI LU on
-                # a CPU backend (cuSOLVERMp is CUDA-only and auto never
-                # selects ScaLAPACK), so 'off' (in-tree per-q
-                # jnp.linalg.solve) is the same route auto would resolve
-                # to — made explicit here, and said out loud.
-                print_fn(
-                    "  [config] distributed_lu=auto on CPU backend: auto "
-                    "never picks an FFI LU here (cuSOLVERMp is CUDA-only; "
-                    "ScaLAPACK is explicit-only).  Demoting to 'off' "
-                    "(in-tree per-q jnp.linalg.solve).  The ScaLAPACK "
-                    "host FFI is available via explicit "
-                    "distributed_lu = scalapack."
-                )
-                _dist_lu = "off"
-        elif _dist_lu == "scalapack":
-            # Host-only backend on a non-CPU JAX backend: reject at parse
-            # time — the alternative is a ValueError hours later at the
-            # first transverse solve, after the C_q build.
-            raise ValueError(
-                "distributed_lu=scalapack is host-only (Cray LibSci) but "
-                "the JAX backend is not CPU; use distributed_lu = "
-                "auto|off|cusolvermp on GPU runs.")
+        _dist_lu = _linalg.distributed_lu
+        _dist_chol = _linalg.distributed_cholesky
+        if _dist_lu == "distributed":
+            _dist_lu = "scalapack" if _is_cpu_backend else "cusolvermp"
+        elif _dist_lu == "auto" and _is_cpu_backend:
+            _dist_lu = "off"
+        if _dist_chol == "distributed":
+            # The distributed charge profile uses rank truncation; this
+            # Cholesky selection is the matching fallback should that fixed
+            # conditioner ever request its Cholesky arm internally.
+            _dist_chol = "auto" if _is_cpu_backend else "cusolvermp"
         backend = BackendConfig(
-            w_dyson_solver=_w_dyson_solver,
+            linalg=_linalg.layout,
+            linalg_provenance=_linalg.provenance,
+            w_dyson_solver=_linalg.w_dyson_solver,
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
-            distrib_la_batched_route=_distrib_la_batched_route,
-            eigh_backend=_eigh_backend,
-            use_low_mem_eigh=_use_low_mem_eigh,
+            distrib_la_batched_route=_linalg.batched_route,
+            eigh_backend=_linalg.eigh_backend,
             zeta_ridge=float(_g("zeta_ridge")),
-            charge_zeta_solve=_charge_zeta_solve,
-            distributed_zeta_solve=_dist_zeta_solve,
+            charge_zeta_solve=_linalg.charge_zeta_solve,
+            distributed_zeta_solve=_linalg.distributed_zeta_solve,
             zeta_rcond=float(_g("zeta_rcond")),
-            transverse_zeta_solve=_transverse_zeta_solve,
+            transverse_zeta_solve=_linalg.transverse_zeta_solve,
             transverse_zeta_rcond=_transverse_zeta_rcond,
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
@@ -5902,10 +5767,10 @@ class LorraxConfig:
                 "never selected from mere presence; set restart = true "
                 "explicitly to enter the authenticated restart loader "
                 "(docs/input_reference.md, restart)")
-        # DERIVED, NOT DECLARED (lane J section 3).  ``low_mem_bands`` and
-        # ``w_dyson_solver`` are not physics dials of a packed photon mode --
-        # they are the layouts/plans its envelope is written against -- so
-        # the deck should not have to write them.
+        # ``low_mem_bands`` is derived for the packed screened mode because
+        # its sixteen-block kernel has only the face carrier.  ``linalg`` is
+        # never derived here: its global default is local, and packed modes
+        # must explicitly select the distributed layout they require.
         # Promote only when EVERY OTHER envelope row already passes: a deck
         # that is outside the envelope for some other reason must still see
         # that reason, not a low_mem_bands refusal it never asked for.  An
@@ -5928,10 +5793,7 @@ class LorraxConfig:
             _unmet = [row for row in packed_static_envelope(
                 resolved, screened=_screened) if not row[0]]
             if _unmet and all(row[5] for row in _unmet):
-                _promotions = {
-                    "low_mem_bands": ("memory", True),
-                    "w_dyson_solver": ("backend", "distributed"),
-                }
+                _promotions = {"low_mem_bands": ("memory", True)}
                 for row in _unmet:
                     key = row[5]
                     if key in _named_keys:
@@ -5939,6 +5801,13 @@ class LorraxConfig:
                     group, value = _promotions[key]
                     resolved = _dc_replace(resolved, **{group: _dc_replace(
                         getattr(resolved, group), **{key: value})})
+                    if key == "low_mem_bands":
+                        resolved = _dc_replace(
+                            resolved,
+                            memory=_dc_replace(
+                                resolved.memory,
+                                low_mem_bands_provenance=(
+                                    "derived for packed static envelope")))
                     print_fn(
                         "  [config provenance] packed_static_envelope "
                         f"(bispinor_gw = {resolved.bispinor_gw.value}): "

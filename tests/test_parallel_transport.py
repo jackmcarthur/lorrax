@@ -42,7 +42,7 @@ from gw.gw_config import read_lorrax_input
 def test_w_av_neighbor_flags_are_input_controls(tmp_path):
     deck = tmp_path / "cohsex.in"
     deck.write_text(
-        "[cohsex]\nstrict_keys = true\n"
+        "[cohsex]\n"
         "W_av_first_neighbors = true\nW_av_second_neighbors = false\n")
     params = read_lorrax_input(str(deck))
     assert params["w_av_first_neighbors"] is True

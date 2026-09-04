@@ -449,7 +449,7 @@ def _packed_deck(*, sys_dim=2, extra=""):
         "bispinor_gw = full_static_cohsex\n"
         "compute_mode = cohsex\n"
         "low_mem_bands = true\n"
-        "w_dyson_solver = distributed\n"
+        "linalg = distributed\n"
         "restart = false\n"
         + extra
     )
@@ -527,8 +527,8 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 2      # 6 shared (incl. w_dyson_solver) + 2 screened-only
-    assert "w_dyson_solver = distributed" in shared
+    assert len(both) == len(shared) + 2      # 6 shared (incl. linalg) + 2 screened-only
+    assert "linalg = distributed" in shared
 
 
 def test_material_class_is_owned_by_wfn_validation_not_the_envelope(tmp_path):
@@ -570,22 +570,18 @@ def test_the_eight_scalar_head_overrides_are_one_conjunct(tmp_path):
 
 
 def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
-    """``low_mem_bands`` / ``w_dyson_solver`` are the only layout and the
-    only Dyson plan the packed screened mode has, so the deck must not
-    have to write them."""
+    """The packed kernel derives its band carrier, not the public LA dial."""
     lines = []
-    deck = (_packed_deck()
-            .replace("low_mem_bands = true\n", "")
-            .replace("w_dyson_solver = distributed\n", ""))
+    deck = _packed_deck().replace("low_mem_bands = true\n", "")
     path = tmp_path / "derived.in"
     path.write_text(deck)
     config = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     assert config.memory.low_mem_bands is True
-    assert str(config.backend.w_dyson_solver) == "distributed"
+    assert str(config.backend.linalg) == "distributed"
     assert uses_static_photon_response(config)
     assert any("low_mem_bands was not named" in ln for ln in lines), lines
-    assert any("w_dyson_solver was not named" in ln for ln in lines), lines
+    assert not any("linalg was not named" in ln for ln in lines), lines
 
 
 def test_an_explicit_conflicting_value_is_still_refused_not_overridden(
@@ -632,6 +628,7 @@ _INCUMBENT_DECK = (
     "bispinor = true\n"
     "bispinor_gw = bare_transverse\n"
     "compute_mode = cohsex\n"
+    "linalg = distributed\n"
     "restart = false\n")
 
 
@@ -667,9 +664,9 @@ def test_incumbent_head_full_says_it_has_no_transverse_gamma_head(tmp_path):
 
 def test_the_driver_prints_the_incumbent_head_record(tmp_path):
     """The one owner is gw_config; gw_jax must not grow a second copy."""
-    import inspect
-    from gw import gw_jax
-    src = inspect.getsource(gw_jax.main)
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1]
+           / "src/gw/gw_jax.py").read_text()
     assert "incumbent_bispinor_head_record(config)" in src
     assert "Photon head    : " in src
 

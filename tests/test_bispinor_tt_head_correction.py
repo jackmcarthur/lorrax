@@ -480,7 +480,7 @@ sys_dim = 2
 compute_mode = cohsex
 qp_solver = one_shot_dft
 low_mem_bands = true
-w_dyson_solver = distributed
+linalg = distributed
 restart = false
 head_correction = full
 """

@@ -475,13 +475,10 @@ def test_a_deck_that_omits_the_key_reads_as_not_declared(tmp_path):
 
 
 def test_strict_keys_accepts_a_deck_that_names_the_sign(tmp_path):
-    """``strict_keys = true`` REFUSES unknown keys by name, so a deck
-    that declares the sign under it is the sharpest witness that the key
-    is registered rather than merely tolerated."""
+    """Always-strict parsing accepts the registered sign key."""
     from gw.gw_config import read_lorrax_input
 
-    params = read_lorrax_input(_deck(
-        tmp_path, "vnl_velocity_sign = +1\nstrict_keys = true\n"))
+    params = read_lorrax_input(_deck(tmp_path, "vnl_velocity_sign = +1\n"))
     assert params["vnl_velocity_sign"] == "+1"
 
 

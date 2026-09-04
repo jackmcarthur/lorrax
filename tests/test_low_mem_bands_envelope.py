@@ -114,18 +114,13 @@ nband = 10
 memory_per_device_gb = 4.0
 """
 
-#: The companion keys ``mpa_material_class = metal`` requires at parse time
-#: (``_validate_metal_compute_mode`` / ``_validate_occupation_smearing``) —
-#: identical block to ``test_screening_diagrams_config.py``'s ``_METAL_KEYS``,
-#: so a metal deck under test here satisfies the SAME prerequisite gate a
-#: production metal deck would.
+#: Metal runtime prerequisites; material class itself comes from WFN
+#: occupations and the Sigma cube layout is no longer a deck dial.
 _METAL_KEYS = """\
-mpa_material_class = metal
 compute_mode = mpa
 occ_smearing_family = mp1
 occ_smearing_width_ry = 0.02
 fermi_reference = mp1_fixed_n
-sigma_omega_layout = sharded
 """
 
 
@@ -165,7 +160,8 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
         # low_mem_bands=true (the mpa_z status-line NameError that made
         # the SC driver unreachable is fixed on the same branch).
         cfg = _config(pathlib.Path(d), "low_mem_bands = true\n" + _METAL_KEYS)
-        assert str(cfg.mpa.material_class).strip().lower() == "metal"
+        from gw.gw_config import validate_material_inputs
+        validate_material_inputs(cfg, "metal")
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +244,9 @@ def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
 
 
 def test_the_key_is_registered_so_it_is_not_an_unknown_key(tmp_path):
-    """``strict_keys = true`` must ACCEPT it — the registry test."""
+    """Always-strict parsing must accept the registered boolean dial."""
     config = _config(
-        tmp_path, "strict_keys = true\nlow_mem_bands = true\n"
+        tmp_path, "low_mem_bands = true\n"
                   "head_correction = off\n")
     assert config.memory.low_mem_bands is True
 

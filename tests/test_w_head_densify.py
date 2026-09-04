@@ -726,13 +726,12 @@ def test_w_head_densify_takes_only_the_two_modes():
 
 
 def test_w_head_densify_deck_key_reaches_shipping_resolver(tmp_path, capsys):
-    """A strict deck must select the same mode the BSE loader consumes."""
+    """The deck must select the same mode the BSE loader consumes."""
     from bse.bse_densify import (_read_lorrax_input_quietly,
                                  resolve_w_head_densify)
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text(
-        "[cohsex]\nstrict_keys = true\nw_head_densify = legacy\n")
+    deck.write_text("[cohsex]\nw_head_densify = legacy\n")
     params = _read_lorrax_input_quietly(str(deck))
 
     assert params["w_head_densify"] == "legacy"
@@ -748,8 +747,7 @@ def test_invalid_w_head_densify_deck_value_is_named(tmp_path):
                                  resolve_w_head_densify)
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text(
-        "[cohsex]\nstrict_keys = true\nw_head_densify = interpolate\n")
+    deck.write_text("[cohsex]\nw_head_densify = interpolate\n")
     params = _read_lorrax_input_quietly(str(deck))
 
     with pytest.raises(ValueError, match="interpolate"):

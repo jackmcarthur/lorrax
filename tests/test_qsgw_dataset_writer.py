@@ -551,7 +551,7 @@ def test_the_key_parses_the_decks_boolean_grammar(tmp_path, spelling, want):
 
 def test_the_key_is_not_an_unknown_deck_key_and_reaches_the_config(
         tmp_path, monkeypatch):
-    """``strict_keys = true`` accepts it, and the dataclass carries it.
+    """Always-strict parsing accepts it, and the dataclass carries it.
 
     The parse has three layers and a key wired into two of them reads as
     its default forever with nothing to show for it.  The writers consult
@@ -562,7 +562,7 @@ def test_the_key_is_not_an_unknown_deck_key_and_reaches_the_config(
 
     deck = tmp_path / "cohsex.in"
     deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
-                    "strict_keys = true\nwrite_qsgw_datasets = true\n")
+                    "write_qsgw_datasets = true\n")
     cfg = LorraxConfig.from_input_file(str(deck),
                                        print_fn=lambda *a, **k: None)
     assert cfg.write_qsgw_datasets is True
