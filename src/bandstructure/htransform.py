@@ -604,12 +604,10 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                 "guard boundary exists.")
     else:
         active_start = active_stop = 0
-    active_out = flat_xy if active_band_range is not None else rep_
-
     @partial(jax.jit,
-             out_shardings=(flat_xy, flat_xy, active_out,
-                            rep_, rep_, rep_, rep_, rep_))
-    def _build(ctilde_in, f_eps_in):
+             in_shardings=(rep_, rep_),
+             out_shardings=(flat_xy, rep_, rep_, rep_))
+    def _build_fH_k(ctilde_in, f_eps_in):
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
         bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
@@ -627,26 +625,6 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
-        fH_R = local_ifftn(fH_k)
-
-        if active_band_range is None:
-            active_R = jnp.empty((0,), dtype=ctilde_in.dtype)
-            active_fft_roundtrip_rel = jnp.asarray(0.0, dtype=f_eps_in.dtype)
-        else:
-            active_rows = ctilde_in[:, active_start:active_stop, :]
-            active_k = jnp.einsum(
-                'kim,kin->kmn', active_rows, jnp.conj(active_rows),
-                optimize=True)
-            active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
-            active_k = 0.5 * (
-                active_k + jnp.swapaxes(active_k, -1, -2).conj())
-            active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
-            active_R = local_ifftn(active_k)
-            active_fft_abs = jnp.max(jnp.abs(local_fftn(active_R) - active_k))
-            active_scale = jnp.max(jnp.abs(active_k))
-            active_fft_roundtrip_rel = jnp.where(
-                active_scale > 0.0, active_fft_abs / active_scale,
-                active_fft_abs)
 
         # The rank-by-rank fH eigensolve is not needed to certify its coarse
         # spectrum.  If A = sqrt(-f(eps)) C, the nonzero eigenvalues of
@@ -665,18 +643,41 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         energy_recovery_error = jnp.max(
             jnp.abs(jnp.sort(recovered_e, axis=1)
                     - jnp.sort(enk_sigma.T, axis=1)))
+        return (fH_k, f_recovery_error,
+                energy_recovery_error, jnp.max(inverse_residual))
 
-        # Use the paired canonical flat-k service for the complete inverse
-        # transform.  A one-point explicit Fourier sum can certify Gamma while
-        # still missing an ordering, normalization or non-Gamma defect.
-        fft_roundtrip_abs = jnp.max(jnp.abs(local_fftn(fH_R) - fH_k))
-        fft_scale = jnp.max(jnp.abs(fH_k))
-        fft_roundtrip_rel = jnp.where(
+    @partial(jax.jit,
+             in_shardings=flat_xy,
+             out_shardings=flat_xy)
+    def _ifft_operator(operator_k):
+        """Transform one matrix-sharded operator without another live-out."""
+        return local_ifftn(operator_k)
+
+    @partial(jax.jit,
+             in_shardings=(flat_xy, flat_xy),
+             out_shardings=rep_)
+    def _fft_roundtrip_relative(operator_R, operator_k):
+        """Reduce the canonical FFT receipt without gathering matrix tiles."""
+        fft_roundtrip_abs = jnp.max(
+            jnp.abs(local_fftn(operator_R) - operator_k))
+        fft_scale = jnp.max(jnp.abs(operator_k))
+        return jnp.where(
             fft_scale > 0.0, fft_roundtrip_abs / fft_scale,
             fft_roundtrip_abs)
-        return (fH_k, fH_R, active_R, fft_roundtrip_rel,
-                active_fft_roundtrip_rel, f_recovery_error,
-                energy_recovery_error, jnp.max(inverse_residual))
+
+    @partial(jax.jit,
+             in_shardings=rep_,
+             out_shardings=flat_xy)
+    def _build_active_k(ctilde_in):
+        active_rows = ctilde_in[:, active_start:active_stop, :]
+        active_k = jnp.einsum(
+            'kim,kin->kmn', active_rows, jnp.conj(active_rows),
+            optimize=True)
+        active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
+        active_k = 0.5 * (
+            active_k + jnp.swapaxes(active_k, -1, -2).conj())
+        active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
+        return active_k
 
     # Projection receipt, not a rank gate.  The published whole-state QRCP
     # basis is deliberately approximate, so C C^H need not be the identity.
@@ -695,15 +696,33 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
         f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
-    (fH_k, fH_R, active_R, fft_roundtrip_rel,
-     active_fft_roundtrip_rel, f_recovery_error,
-     energy_recovery_error, inverse_residual) = _build(ctilde, f_eps)
+    # The FFI FFT aliases its input buffer when that input is dead.  A receipt
+    # applied to a returned operator therefore needs one alias-protection copy
+    # of the local matrix shard.  Build and certify the active operator first,
+    # then release its k-space carrier before constructing fH.  Each receipt
+    # stays in its scalar-only executable and is forced before the next
+    # rank-by-rank operator: at no point can their construction or receipt
+    # workspaces overlap.  The max reductions remain SPMD reductions over
+    # P(None, 'x', 'y'); only a scalar is replicated or transferred to host.
+    if active_band_range is not None:
+        active_k = _build_active_k(ctilde)
+        active_R = _ifft_operator(active_k)
+        active_fft_rel = float(
+            _fft_roundtrip_relative(active_R, active_k))
+        del active_k
+    else:
+        active_R = None
+        active_fft_rel = 0.0
+
+    (fH_k, f_recovery_error,
+     energy_recovery_error, inverse_residual) = _build_fH_k(ctilde, f_eps)
+    fH_R = _ifft_operator(fH_k)
+    fft_rel = float(_fft_roundtrip_relative(fH_R, fH_k))
     log_fn(
         f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
         f"round-trip scale-relative max|FFT(IFFT(fH))-fH|="
-        f"{float(fft_roundtrip_rel):.3e} "
+        f"{fft_rel:.3e} "
         f"(limit {FLAT_K_FFT_VALUE_RTOL:.1e})")
-    fft_rel = float(fft_roundtrip_rel)
     if not np.isfinite(fft_rel) or fft_rel > FLAT_K_FFT_VALUE_RTOL:
         raise ValueError(
             "build_fH_R: canonical flat-k FFT round-trip violated the "
@@ -712,7 +731,6 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             "The forward/inverse pair must preserve every coarse-k fH tile; "
             "do not publish or interpolate this Hamiltonian.")
     if active_band_range is not None:
-        active_fft_rel = float(active_fft_roundtrip_rel)
         log_fn(
             "  [receipt] active-character P_A from compact rows "
             f"[{active_start},{active_stop}) "
@@ -750,8 +768,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             "r_vectors": int(_outer_shell.size),
             "locality_wall_seconds": float(_quality_clock() - _quality_t0),
         })
-    return (fH_k, fH_R, (a_f, n_f, shift), f_eps,
-            active_R if active_band_range is not None else None)
+    return (fH_k, fH_R, (a_f, n_f, shift), f_eps, active_R)
 
 
 NEWTON_RESIDUAL_MAX = 1.0e-12
