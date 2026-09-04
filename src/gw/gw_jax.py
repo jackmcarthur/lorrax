@@ -470,7 +470,8 @@ def main(argv=None):
 	                        int(config.ncond) + _sc_buffer, config.nband,
 	                        n_rmu, charge_bispinor,
 	                        nband_chi=config.bands.chi,
-	                        nband_sigma=config.bands.sigma)
+	                        nband_sigma=config.bands.sigma,
+	                        mesh_xy=mesh_xy)
 	if _sc_buffer:
 		print0(
 			f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
