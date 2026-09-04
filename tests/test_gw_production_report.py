@@ -391,7 +391,7 @@ def test_local_linalg_warning_has_dense_matrix_numbers(tmp_path):
     assert (
         "linalg = local: fastest, but each task holds ceil(N_q_irr/P) "
         "complete N_mu x N_mu dense matrices (here ceil(9/4) x 640^2 x "
-        "16 B = 0.0 GiB per task, complex128) plus their factor workspace; "
+        "16 B = 18.8 MiB per task, complex128) plus their factor workspace; "
         "on large systems where that is a large fraction of memory per "
         "task, set linalg = distributed" in text)
     assert "[config provenance] low_mem_bands = false (default)" in text
