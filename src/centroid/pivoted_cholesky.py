@@ -94,6 +94,25 @@ _GRAM_FINAL_FOLD_SLOTS = 3
 _CANDIDATE_GAMMA_MODES = ("charge", "transverse")
 
 
+@partial(jax.jit, static_argnums=(1,))
+def _logical_gram_diagonal_extrema(G, n_logical: int):
+    """Return extrema of the logical diagonal of a distributed Gram matrix."""
+    diagonal = jnp.real(jnp.diag(G))[:n_logical]
+    return jnp.min(diagonal), jnp.max(diagonal)
+
+
+def _report_logical_gram_diagonal(G, n_logical: int, *, verbose: bool,
+                                  print_fn=print):
+    """Collectively measure a distributed Gram diagonal and print on rank 0."""
+    diag_min, diag_max = _logical_gram_diagonal_extrema(G, n_logical)
+    jax.block_until_ready((diag_min, diag_max))
+    if verbose:
+        print_fn(
+            f"[pivoted_cholesky] G built, shape=({n_logical}, {n_logical}), "
+            f"diag range [{float(diag_min):.3e}, {float(diag_max):.3e}]")
+    return diag_min, diag_max
+
+
 def _make_group_progress_reporter(
     print_fn,
     *,
@@ -1098,12 +1117,13 @@ def prune_candidates_by_pivoted_cholesky(
             f"needs an even row split; expected round_up(M, {n_dev})="
             f"{-(-M // n_dev) * n_dev}.")
 
+    # This diagnostic consumes a globally sharded value, so every process
+    # must execute it even though only rank 0 prints.  Putting the JAX work
+    # under ``if verbose`` deadlocked debug-enabled P>1 runs: rank 0 entered
+    # the diagonal collective while its peers advanced to the selector.
+    _report_logical_gram_diagonal(G, M, verbose=verbose)
     if verbose:
-        # Report the LOGICAL diagonal (pads are zero and would drag the min to
-        # 0.0, changing a diagnostic the gates compare across P).
-        diag = jnp.real(jnp.diag(G))[:M]
-        print(f"[pivoted_cholesky] G built, shape=({M}, {M}), "
-              f"diag range [{float(diag.min()):.3e}, {float(diag.max()):.3e}]")
+        # The extrema above cover only logical rows; report padding separately.
         if n_pad:
             print(f"[pivoted_cholesky] zero-pad for the sharded select: "
                   f"M {M} -> {M_pad} (+{n_pad} inactive rows) so M_pad % "

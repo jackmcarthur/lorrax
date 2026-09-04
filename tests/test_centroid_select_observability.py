@@ -6,6 +6,25 @@ import subprocess
 import sys
 
 
+def test_distributed_gram_diagnostic_excludes_padding_and_always_executes():
+    import jax.numpy as jnp
+    from centroid import pivoted_cholesky as pc
+
+    gram = jnp.diag(jnp.asarray([7.0, 3.0, 5.0, 0.0]))
+    quiet = pc._report_logical_gram_diagonal(
+        gram, 3, verbose=False,
+        print_fn=lambda _text: (_ for _ in ()).throw(AssertionError()))
+    lines = []
+    loud = pc._report_logical_gram_diagonal(
+        gram, 3, verbose=True, print_fn=lines.append)
+
+    assert tuple(map(float, quiet)) == (3.0, 7.0)
+    assert tuple(map(float, loud)) == (3.0, 7.0)
+    assert lines == [
+        "[pivoted_cholesky] G built, shape=(3, 3), "
+        "diag range [3.000e+00, 7.000e+00]"]
+
+
 def test_select_phase_receipts_name_lower_compile_and_execute(monkeypatch):
     from centroid import pivoted_cholesky as pc
 
