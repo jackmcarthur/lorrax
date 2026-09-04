@@ -10,6 +10,32 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-09-04 — One owner for every mesh-padded axis; producers pad and consumers strip
+
+`runtime.padding` owns every mesh-divisibility divisor, carrier extent, pad,
+mask, authentication, and strip operation. A producer carries a `PaddedAxis`
+receipt beside its plain array; `file_io.tagged_arrays` serializes the same
+logical/carrier/divisor receipt at a restart seam. A consumer never infers the
+logical extent from the carrier shape and never computes `% p_x`, `% p_y`, a
+mesh LCM, or a mesh round-up locally. See the authoritative contract and axis
+inventory in [Mesh-padded axes](padding.md).
+
+The Σ band-window refusal is retired. Dynamic Σ is accumulated on the one
+square carrier derived from both projection specs, then QP/QSGW/SC and output
+consumers strip by receipt. Thus 86 physical bands on a 4×4 mesh use an
+88-band carrier with two exact-zero rows and columns. ζ band tails, centroid
+families, q batches, and band/r chunks follow the same producer/consumer rule.
+
+The only remaining divisibility refusals concern unsupported process topology
+or a solve for which padding is not inert. A static source census names those
+exceptions and rejects every new local arithmetic/refusal site.
+
+This supersedes the incomplete 2026-08-22 helper ruling and the 2026-08-06
+decision declining a common band-padding owner. Licenses deleting:
+`assert_sharded_sigma_window_divides_mesh`, downstream post-hoc Σ pad/strip
+pairs, local `mesh_padded`/`padded_extent` helpers, mesh-modulo error hints,
+and duplicate divisor parameters whose only purpose was to restate the spec.
+
 ## 2026-09-01 — COHSEX with bispinors always carries the q→0 head; `head_correction = off` is debug-only
 
 **Ruling (owner, 2026-09-01).** A static COHSEX calculation with
@@ -37,6 +63,9 @@ seam are absent. Physics owner:
 wiring: [Four-current wiring](four_current_wiring.md).
 
 ## 2026-08-22 — One mesh-divisibility pad helper, and it returns a NAMED result
+
+**Superseded by the 2026-09-04 all-axis receipt ruling above.** The historical
+failure mode and parity evidence below remain the reason the result is named.
 
 `runtime.padding.pad_axis(A, divisor, *, axis, fill=0.0)` is the single
 implementation of the mesh-divisibility pad. It returns
@@ -205,6 +234,10 @@ long-range model fits. `DEG_B26P` remains the in-plane *degree ladder*
 and must not be read as a channel set again.
 
 ## 2026-08-06 — There is deliberately no `LORRAX_EXTRA_BAND_PAD`
+
+**Superseded 2026-09-04.** The band and Σ paths now share the same owner. The
+historical reasons for declining a test knob remain useful, but no longer
+describe the source tree.
 
 Asked and **declined**, 2026-08-06 (ledger 0169), even though the band
 axis is now the most-padded axis in the tree.
