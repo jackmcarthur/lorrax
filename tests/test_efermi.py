@@ -264,6 +264,24 @@ def test_occupation_state_hash_ignores_only_trailing_exact_zero_columns():
     assert c.occ_hash != a.occ_hash
 
 
+def test_legacy_occupation_hashes_reproduce_only_square_mesh_zero_padding():
+    from gw.efermi import (
+        legacy_square_mesh_occupation_digests, occupation_digest)
+
+    live = np.pad(np.asarray([[1.0, 0.4], [1.0, 0.6]]), ((0, 0), (0, 7)))
+    compatible = legacy_square_mesh_occupation_digests(
+        live, logical_nband=2, max_mesh_side=4)
+    # side=2 -> P=4 -> band carrier 4; side=3 -> P=9 -> carrier 9.
+    assert occupation_digest(live, band_extent=4) in compatible
+    assert occupation_digest(live, band_extent=9) in compatible
+
+    nonzero_tail = live.copy()
+    nonzero_tail[0, 2] = np.nextafter(0.0, 1.0)
+    with pytest.raises(ValueError, match="nonzero outside logical_nband"):
+        legacy_square_mesh_occupation_digests(
+            nonzero_tail, logical_nband=2, max_mesh_side=4)
+
+
 def test_occupation_state_step_is_insulating_only():
     # Gapped: works, family "fixed", zero width, capacity-weighted target.
     E = np.array([[0.0, 1.0, 2.0, 3.0]] * 4)

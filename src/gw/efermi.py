@@ -84,6 +84,7 @@ __all__ = [
     "MP1_LOBE_EXTREMUM",
     "OccupationState", "assert_fixed_n", "assert_wfn_occupation_consistency",
     "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
+    "legacy_square_mesh_occupation_digests",
     "mp1_negative_derivative", "mp1_occupations",
     "occupation_clamp_tol", "occupation_digest", "occupation_weight_floor",
     "occupied_band_count", "resolve_sigma_efermi_ry",
@@ -721,6 +722,47 @@ def occupation_digest(f_kn, *, band_extent: int | None = None) -> str:
                            mode="constant", constant_values=0.0)
     return hashlib.sha256(
         np.ascontiguousarray(canonical).tobytes()).hexdigest()[:16]
+
+
+def legacy_square_mesh_occupation_digests(
+        f_kn, logical_nband: int, *, max_mesh_side: int = 16,
+) -> frozenset[str]:
+    """Reproduce old occupation hashes for exact-zero square-mesh padding.
+
+    Before :func:`occupation_digest` became mesh invariant, a producer hashed
+    its complete band carrier.  That carrier was rounded up to a multiple of
+    ``P = side**2``.  This migration helper enumerates those old encodings
+    from the *live* table, so compatibility never means trusting a supplied
+    hash or dropping a nonzero occupation.  ``max_mesh_side`` bounds the
+    legacy geometries this release promises to authenticate; it is not a
+    numerical tolerance.
+    """
+    f = np.asarray(f_kn, dtype=np.float64)
+    logical = int(logical_nband)
+    side_max = int(max_mesh_side)
+    if f.ndim != 2 or min(f.shape) < 1:
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: f_kn must be nonempty "
+            f"(nk,nb); got {f.shape}")
+    if not (1 <= logical <= int(f.shape[1])):
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: logical_nband must lie "
+            f"inside the live carrier; got logical={logical}, shape={f.shape}")
+    if side_max < 1:
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: max_mesh_side must be "
+            f"positive; got {side_max}")
+    if np.any(f[:, logical:] != 0.0):
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: live occupations are "
+            "nonzero outside logical_nband; refusing to call that tail "
+            "process padding")
+    extents = {
+        ((logical + side * side - 1) // (side * side)) * (side * side)
+        for side in range(1, side_max + 1)
+    }
+    return frozenset(
+        occupation_digest(f, band_extent=extent) for extent in extents)
 
 
 @dataclass(frozen=True)

@@ -707,14 +707,17 @@ def compute_sigma_c_mpa_omega_grid(
         return _attach_ordered_odd_sigma(total, even)
 
 
-def assert_head_body_occupation_match(head_attrs, occupation_state):
+def assert_head_body_occupation_match(
+        head_attrs, occupation_state, *, compatible_occ_hashes=()):
     """Refuse when the head fit and the body Sigma disagree about occupations.
 
     ``head_attrs`` is the stamp dict a head-fit reader returns.  One
     occupation state per iteration is the rule (ARCHITECTURE W2.d/W3); the
-    head's stamped ``occ_hash``/``mu_ry`` must equal the body's.  A metal
-    run with an UNSTAMPED head fit refuses too — an unverifiable stamp is
-    not a pass.  Insulating runs (state None) skip the check.
+    head's stamped ``occ_hash``/``mu_ry`` must equal the body's.  A legacy
+    hash may match only when the caller reproduced it from the live table by
+    exact-zero padding and supplies it in ``compatible_occ_hashes``.  A metal
+    run with an UNSTAMPED head fit refuses too — an unverifiable stamp is not
+    a pass.  Insulating runs (state None) skip the check.
     """
     if occupation_state is None:
         return
@@ -726,7 +729,10 @@ def assert_head_body_occupation_match(head_attrs, occupation_state):
             "(occ_hash + mu_ry attrs); this store has "
             f"occ_hash={stamped_hash!r}, mu_ry={stamped_mu!r}.  Refit the "
             "head with the current iteration's occupation state.")
-    if (str(stamped_hash) != str(occupation_state.occ_hash)
+    hash_exact = str(stamped_hash) == str(occupation_state.occ_hash)
+    hash_compatible = str(stamped_hash) in {
+        str(value) for value in compatible_occ_hashes}
+    if (not (hash_exact or hash_compatible)
             or abs(float(stamped_mu) - float(occupation_state.mu_ry))
             > 1.0e-12):
         raise ValueError(
@@ -735,6 +741,7 @@ def assert_head_body_occupation_match(head_attrs, occupation_state):
             f"vs body (occ_hash={occupation_state.occ_hash}, "
             f"mu={float(occupation_state.mu_ry):.12g}).  One state per "
             "iteration; rebuild the stale artifact.")
+    return "exact" if hash_exact else "legacy_zero_pad"
 
 
 __all__ = [

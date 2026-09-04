@@ -32,6 +32,7 @@ integ/metal-mpa-qsgw-2026-08-15 @ merge base):
 import numpy as np
 import jax
 import jax.numpy as jnp
+import pytest
 
 from gw.mpa import sigma_windows as SW
 from gw.ppm_tau_kernel import build_shared_w_tau
@@ -416,6 +417,28 @@ def test_head_body_occupation_match_refuses_mismatch_and_unstamped():
             pass
         else:
             raise AssertionError(f"no refusal for head attrs {attrs}")
+
+
+def test_head_body_occupation_match_accepts_only_a_reproduced_legacy_hash():
+    state = _state(np.asarray([[1.0, 0.5, 0.0]]), mu=0.1)
+    attrs = {"occ_hash": "legacy-zero-pad", "mu_ry": 0.1}
+    assert assert_head_body_occupation_match(
+        attrs, state, compatible_occ_hashes={"legacy-zero-pad"}
+    ) == "legacy_zero_pad"
+    with pytest.raises(ValueError, match="different occupation states"):
+        assert_head_body_occupation_match(
+            attrs, state, compatible_occ_hashes={"not-this-hash"})
+
+
+def test_mpa_head_occupation_preflight_precedes_the_body_sweep():
+    import inspect
+
+    from gw.sigma_dispatch import compute_sigma_xc
+
+    source = inspect.getsource(compute_sigma_xc)
+    mpa = source.split("if mode is ComputeMode.MPA:", 1)[1]
+    assert mpa.index("head = mpa_store.read_head_fit_collective") < mpa.index(
+        "body = compute_sigma_c_mpa_omega_grid")
 
 
 # ---------------------------------------------------------------------------
