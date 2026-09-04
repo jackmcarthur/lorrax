@@ -91,6 +91,12 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
 
     monkeypatch.setattr(model.mpa_store, "validate_fit_store", validate)
     monkeypatch.setattr(
+        model, "_canonical_wfn_identity",
+        lambda source, binding=None: {
+            "wfn_fingerprint_scheme": "mean-field-content-v1",
+            "wfn_fingerprint": "wfn-current",
+        })
+    monkeypatch.setattr(
         model.mpa_store, "assert_occupation_stamps",
         lambda path, state, **kwargs: calls.setdefault(
             "occupation", (path, state, kwargs)))
@@ -110,6 +116,7 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
     got = model.validate_reused_mpa_fit(
         fit, config=config, live_plan=live_plan, sym=sym,
         centroid_indices=None, meta=meta, mesh_xy=None,
+        wfn=object(),
         occupation_state=occ, material_class="metal",
         print_fn=lambda *_args: None)
 
@@ -118,6 +125,8 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
     assert kwargs["expected_identity"] == {
         "w_table_hash": "table-current",
         "w_centroid_hash": "centroids-current",
+        "wfn_fingerprint_scheme": "mean-field-content-v1",
+        "wfn_fingerprint": "wfn-current",
     }
     assert calls["logical_n_mu"] == 5
     assert kwargs["expected_screening_diagrams"] == "w_rpa"
@@ -147,6 +156,12 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
     monkeypatch.setattr(
         model.mpa_store, "validate_fit_store", lambda *_args, **_kwargs: {
             "n_p": 2, "n_q": 1, "n_mu": 3, "ordered_residues": False})
+    monkeypatch.setattr(
+        model, "_canonical_wfn_identity",
+        lambda source, binding=None: {
+            "wfn_fingerprint_scheme": "mean-field-content-v1",
+            "wfn_fingerprint": "wfn-current",
+        })
     monkeypatch.setattr(model.mpa_store, "assert_occupation_stamps",
                         lambda *_args, **_kwargs: None)
     stored_plan, live_plan = object(), object()
@@ -167,7 +182,7 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
     got = model.validate_reused_mpa_fit(
         fit, config=config, live_plan=live_plan,
         sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
-        meta=meta, mesh_xy=None,
+        meta=meta, mesh_xy=None, wfn=object(),
         occupation_state=occ, material_class="metal",
         print_fn=messages.append)
 
@@ -184,7 +199,7 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
         model.validate_reused_mpa_fit(
             fit, config=config, live_plan=live_plan,
             sym=SimpleNamespace(trs_allowed=True), centroid_indices=None,
-            meta=meta, mesh_xy=None,
+            meta=meta, mesh_xy=None, wfn=object(),
             occupation_state=occ, material_class="metal",
             print_fn=lambda *_args: None)
 

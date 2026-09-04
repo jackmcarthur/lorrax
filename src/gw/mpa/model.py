@@ -18,6 +18,25 @@ _WC = "Wc_qmunu_z"
 _WC_NEGATIVE = "Wc_qmunu_minus_z"
 
 
+def _canonical_wfn_identity(wfn, wfn_fingerprint_binding=None):
+    """The existing mean-field identity, named for MPA provenance."""
+    if wfn is None:
+        raise ValueError(
+            "MPA sample/reuse provenance requires the loaded source WFN; "
+            "there is no safe identity to infer from Meta or array shapes")
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, fingerprint_from_binding, wfn_fingerprint)
+    fingerprint = (
+        wfn_fingerprint(wfn)
+        if wfn_fingerprint_binding is None else
+        fingerprint_from_binding(wfn_fingerprint_binding, wfn)
+    )
+    return {
+        "wfn_fingerprint_scheme": WFN_FINGERPRINT_SCHEME,
+        "wfn_fingerprint": fingerprint,
+    }
+
+
 def make_mpa_plan(config, quad, *, material_class):
     """Build and validate the one frequency plan shared by body and head."""
     n_p = int(config.mpa.n_poles)
@@ -80,15 +99,18 @@ def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy, material_class):
 
 
 def validate_reused_mpa_fit(
-    fit_path, *, config, live_plan, sym, centroid_indices, meta, mesh_xy,
+    fit_path, *, config, live_plan, sym, centroid_indices, meta, mesh_xy, wfn,
+    wfn_fingerprint_binding=None,
     occupation_state, material_class, print_fn=print,
 ):
     """Certify an explicit read-only one-shot MPA fit against this run.
 
     This is the production reuse seam.  It validates the finalized store,
-    diagram provenance, current q wedge and centroid identity, exact sampling
-    grid, pole count, ordered-residue convention, and metallic occupations.
-    No sample or fit inode is opened writable on this path.
+    diagram provenance, canonical source-WFN identity, current q wedge and
+    centroid identity, exact sampling grid, pole count, ordered-residue
+    convention, and metallic occupations.  No sample or fit inode is opened
+    writable on this path.  A legacy fit without the canonical WFN pair is
+    refused: absence cannot authenticate explicit cross-run reuse.
     """
     path = os.path.abspath(os.fspath(fit_path))
     if not os.path.isfile(path):
@@ -103,11 +125,13 @@ def validate_reused_mpa_fit(
     # on the producer's own mesh (2070 logical centroids hash differently
     # from its P36 carrier extent 2088), and also makes reuse mesh-dependent.
     logical_tables = tables.logical(int(meta.n_rmu)).canonical()
+    wfn_identity = _canonical_wfn_identity(wfn, wfn_fingerprint_binding)
     ledger = mpa_store.validate_fit_store(
         path,
         expected_identity={
             "w_table_hash": logical_tables.digest(),
             "w_centroid_hash": closure_verdict.centroid_hash,
+            **wfn_identity,
         },
         expected_screening_diagrams=config.screening.diagrams,
     )
@@ -754,6 +778,7 @@ def _evaluate_samples(
 
 def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
+    wfn_fingerprint_binding=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
     occupation_state=None, material_class, head_channel=None, wc_source=None,
@@ -851,7 +876,10 @@ def build_mpa_fit(
     diagrams = str(getattr(
         getattr(config.screening, "diagrams", "w_rpa"), "value",
         getattr(config.screening, "diagrams", "w_rpa")))
-    provenance = {"screening_diagrams": diagrams}
+    provenance = {
+        "screening_diagrams": diagrams,
+        **_canonical_wfn_identity(wfn, wfn_fingerprint_binding),
+    }
     # The origin shift is stamped ONLY when the deck declared it: it enters
     # mpa_store's `extra` channel as the additive attr
     # ``mpa_prov_metal_origin_shift_ry``, outside _SAMPLING_ORDER and so

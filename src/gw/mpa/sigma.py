@@ -79,6 +79,24 @@ def _geometry_residue(B, B_odd):
     return jnp.where(jnp.abs(plus) > 0.0, plus, minus)
 
 
+def _refuse_nonfinite_pole_slab(lo, Omega, B, B_odd=None):
+    """Finite-reduce one streamed pole slab before it reaches any planner."""
+    arrays = [("Omega_p", Omega), ("B_p", B)]
+    if B_odd is not None:
+        arrays.append(("B_odd_p", B_odd))
+    finite = jnp.stack([jnp.all(jnp.isfinite(value))
+                        for _, value in arrays])
+    flags = np.asarray(jax.device_get(finite), dtype=bool)
+    if np.all(flags):
+        return
+    bad = [name for (name, _), ok in zip(arrays, flags) if not ok]
+    width = int(Omega.shape[0])
+    raise ValueError(
+        "MPA streamed pole slab contains non-finite payload before window "
+        f"planning/execution: pole_range=[{int(lo)},{int(lo) + width}), "
+        f"datasets={bad}")
+
+
 def _bounded_pole_batch_size(value):
     size = int(value)
     if not 1 <= size <= 8:
@@ -597,6 +615,7 @@ def compute_sigma_c_mpa_omega_grid(
             Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=True, return_sharded=True,
                 to_unit="Ry", include_odd=True)
+            _refuse_nonfinite_pole_slab(lo, Omega, B, B_odd)
             if B_odd is not None and odd_residue_off:
                 B_odd = jnp.zeros_like(B_odd)
             summaries.extend(summarize_sigma_poles(

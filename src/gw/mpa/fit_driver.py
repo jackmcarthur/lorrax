@@ -397,6 +397,58 @@ def fit_one_block(
     }
 
 
+def _bind_sample_wfn_identity(header, negative_header, provenance):
+    """Bind fit provenance to the canonical identity stamped on its samples."""
+    keys = mpa_store.WFN_IDENTITY_PROVENANCE_KEYS
+
+    def text(value):
+        if isinstance(value, (bytes, np.bytes_)):
+            return bytes(value).decode("utf-8")
+        return str(value)
+
+    def identity(row, label):
+        values = dict(row.get("provenance", {}))
+        present = [key for key in keys if key in values]
+        if not present:
+            return None
+        if len(present) != len(keys):
+            raise ValueError(
+                f"run_fit_driver: {label} sample WFN identity is partial; "
+                f"present={present}, required={list(keys)}")
+        return {key: text(values[key]) for key in keys}
+
+    positive = identity(header, "positive")
+    negative = (None if negative_header is None else
+                identity(negative_header, "negative"))
+    if negative_header is not None and negative != positive:
+        raise ValueError(
+            "run_fit_driver: ordered positive/negative sample stores carry "
+            f"different WFN identities: positive={positive}, "
+            f"negative={negative}")
+
+    bound = dict(provenance or {})
+    caller_identity = {key: text(bound[key]) for key in keys if key in bound}
+    if positive is None:
+        if caller_identity:
+            raise ValueError(
+                "run_fit_driver: caller provenance cannot inject a WFN "
+                "identity absent from the sample store")
+        # Explicit legacy policy: old samples remain fit-able for offline or
+        # same-run compatibility, but their fit remains unstamped and explicit
+        # reuse (which supplies both expected fields) refuses it.
+        return bound
+    mismatched = [
+        key for key, value in caller_identity.items()
+        if value != positive[key]
+    ]
+    if mismatched:
+        raise ValueError(
+            "run_fit_driver: caller WFN provenance disagrees with the sample "
+            f"store in {mismatched}")
+    bound.update(positive)
+    return bound
+
+
 def run_fit_driver(
     w_src,
     w_name,
@@ -420,7 +472,9 @@ def run_fit_driver(
     ``tiling.fit_schedule`` q-major, and finalizes.  The W file's
     ``grid_hash``, ``table_hash`` and ``centroid_hash`` are carried into
     the fit store so the Sigma stage can assert that these poles came
-    from that screening on that centroid set.
+    from that screening on that centroid set.  The sample's canonical WFN
+    fingerprint and scheme are copied as one identity pair; caller provenance
+    may agree with that pair but cannot manufacture or override it.
 
     Returns ``(ledger, report)`` — the store's completion ledger and the
     cost report, whose contents :func:`format_cost_report` prints.  The
@@ -484,7 +538,8 @@ def run_fit_driver(
 
     plan = tiling.plan_column_walk(
         n_mu, n_omega * (2 if ordered else 1), tile_bytes)
-    fit_provenance = dict(provenance or {})
+    fit_provenance = _bind_sample_wfn_identity(
+        header, negative_header, provenance)
     fit_provenance.update({
         "solve_mode": solve,
         "solve_rcond": rcond,

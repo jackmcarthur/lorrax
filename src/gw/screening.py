@@ -854,6 +854,7 @@ def compute_screening_model(
     run_dir,
     label,
     wfn=None,
+    wfn_fingerprint_binding=None,
     head_resolver=None,
     head_channel=None,
     mpa_plan=None,
@@ -920,7 +921,9 @@ def compute_screening_model(
             fit_path = validate_reused_mpa_fit(
                 reuse_path, config=config, live_plan=mpa_plan, sym=sym,
                 centroid_indices=centroid_indices, meta=meta,
-                mesh_xy=mesh_xy, occupation_state=occupation_state,
+                mesh_xy=mesh_xy, wfn=wfn,
+                wfn_fingerprint_binding=wfn_fingerprint_binding,
+                occupation_state=occupation_state,
                 material_class=material_class, print_fn=print_fn)
             return {"mpa_fit": fit_path, "mpa_fit_reused": True}
         if quad is None:
@@ -948,6 +951,7 @@ def compute_screening_model(
                 print_fn=print_fn)
         fit_path, iteration_head = build_mpa_fit(
             run_dir, label, wfns=wfns, wfn=wfn, V_q=V_q, quad=quad, sym=sym,
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
             centroid_indices=centroid_indices, head_resolver=head_resolver,
             config=config, meta=meta, mesh_xy=mesh_xy,
             energy_reference=e_ref, plan=mpa_plan,

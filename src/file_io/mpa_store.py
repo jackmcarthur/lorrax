@@ -275,6 +275,12 @@ _OCC_STAMP_ORDER = (
     "occ_hash", "mu_ry", "smearing_family", "smearing_width_ry",
     "occ_nelec")
 
+# Canonical mean-field identity carried from the W sample into its pole fit.
+# The digest and scheme are owned by ``common.parallel_transport``; this
+# format only gives those existing facts stable provenance keys.
+WFN_IDENTITY_PROVENANCE_KEYS = (
+    "wfn_fingerprint_scheme", "wfn_fingerprint")
+
 
 def _occ_stamp_values(occupation_state):
     """The five stamp values from a duck-typed occupation state."""
@@ -3388,14 +3394,43 @@ def fit_completion_ledger(src, *, mode="r"):
         return out
 
 
+def _validate_final_pole_payload(src, ledger, *, mode="r"):
+    """Validate finalized pole dataset metadata without reading pole bytes."""
+    expected_shape = (
+        int(ledger["n_p"]), int(ledger["n_q"]),
+        int(ledger["n_mu"]), int(ledger["n_mu"]),
+    )
+    expected_dtype = np.dtype(np.complex128)
+    names = ["Omega_p", "B_p"]
+    if ledger["ordered_residues"]:
+        names.append("B_odd_p")
+    with _h5(src, mode) as grp:
+        for name in names:
+            if name not in grp:
+                raise ValueError(
+                    f"MPA finalized fit is missing pole payload {name!r}")
+            dataset = grp[name]
+            if tuple(dataset.shape) != expected_shape:
+                raise ValueError(
+                    f"MPA finalized fit payload {name!r} has shape "
+                    f"{tuple(dataset.shape)}, expected exact logical shape "
+                    f"{expected_shape} from its completion ledger")
+            if np.dtype(dataset.dtype) != expected_dtype:
+                raise ValueError(
+                    f"MPA finalized fit payload {name!r} has dtype "
+                    f"{np.dtype(dataset.dtype).name}, expected "
+                    f"{expected_dtype.name}")
+
+
 def validate_fit_store(src, *, expected_identity=None,
                        expected_screening_diagrams=None, mode="r"):
     """Validate the finalized fit contract before Sigma reads pole bytes.
 
     ``expected_identity`` may name ``w_grid_hash``, ``w_table_hash`` and
-    ``w_centroid_hash`` from the screening object currently in use.  The
-    fit's own declared ``*_max_allowed`` certification thresholds are always
-    enforced against its observed maxima.
+    ``w_centroid_hash`` from the screening object currently in use, plus the
+    canonical ``wfn_fingerprint_scheme`` / ``wfn_fingerprint`` copied from
+    the W sample.  The fit's own declared ``*_max_allowed`` certification
+    thresholds are always enforced against its observed maxima.
 
     ``expected_screening_diagrams`` is the run's ``screening_diagrams``
     value.  RPA poles and ladder-corrected poles are the same shape, pass
@@ -3406,12 +3441,16 @@ def validate_fit_store(src, *, expected_identity=None,
     "written by the RPA path" are different facts, and silently reading the
     first as the second is how a ladder fit gets consumed as an RPA one.
 
-    IT VALIDATES THE LEDGER, NOT THE BYTES.  Every check is on ledger
-    attributes: COMPLETE, the energy unit, the optional identity hashes,
-    the PRESENCE of the ``mpa_cert_*`` thresholds, and observed-vs-allowed
-    maxima.  ``Omega_p`` and ``B_p`` are never opened — not their shape,
-    not their dtype, not their finiteness.  Read the summary line as "the
-    contract Σ relies on", not "the poles were checked".
+    Pole bytes are not materialized here.  The finalized datasets themselves
+    are nevertheless opened for metadata and must exactly match the ledger's
+    logical ``(n_p,n_q,n_mu,n_mu)`` shape and ``complex128`` dtype before a
+    collective reader can be opened.  Finiteness is a streamed property: the
+    Sigma census reduces each resident pole slab before planning or execution.
+
+    LEGACY POLICY: a caller that supplies no WFN fields may still validate an
+    old fit for offline inspection or same-run compatibility.  Explicit reuse
+    supplies both canonical fields and therefore refuses every legacy fit that
+    predates them; absence is not interpreted as a match.
 
     Returns the :func:`fit_completion_ledger` dict, which callers use for
     ``n_p``.  Rank-local and serial; ``src`` is a path or an open group.
@@ -3439,10 +3478,14 @@ def validate_fit_store(src, *, expected_identity=None,
         raise ValueError("MPA Sigma requires a finalized pole fit store")
     if ledger["energy_unit"] not in FIT_ENERGY_UNITS:
         raise ValueError("MPA fit store does not declare a supported unit")
+    _validate_final_pole_payload(src, ledger, mode=mode)
     for key, want in (expected_identity or {}).items():
-        if key not in ("w_grid_hash", "w_table_hash", "w_centroid_hash"):
+        if key in WFN_IDENTITY_PROVENANCE_KEYS:
+            got = ledger["provenance"].get(key)
+        elif key in ("w_grid_hash", "w_table_hash", "w_centroid_hash"):
+            got = ledger[key]
+        else:
             raise KeyError(f"unknown MPA fit identity field {key!r}")
-        got = ledger[key]
         if got is None or str(got) != str(want):
             raise ValueError(
                 f"MPA fit identity mismatch for {key}: got {got!r}, "
