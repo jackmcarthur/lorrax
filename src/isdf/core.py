@@ -6808,7 +6808,8 @@ def _make_fit_one_rchunk_kernel(
             gamma_mu = gamma_static
             # Streaming pair density + γ̃·γ̃ + FFT — single shard_map.  The
             # expensive full-grid ψ IFFT is hoisted outside the r-chunk loop.
-            # Output Z_q at FULL-BZ q-shape.
+            # Build Z_q at FULL-BZ q-shape; charge completion below needs the
+            # complete -q domain before the selected rows can be returned.
             Z_q = z_q_from_psi_sm(
                 psi_l_X_scaled, psi_r_X_scaled, psi_G_store, psi_r_cache,
                 band_chunk_ranges=band_chunk_ranges,
@@ -6829,20 +6830,20 @@ def _make_fit_one_rchunk_kernel(
         # IBZ-only solve (Phase B): L_q + cct_trace + lu_piv come in
         # PRE-SLICED at IBZ rows (via ``symmetry_maps.slice_q_full_to_ibz``
         # upstream in ``fit_zeta_to_h5``; the factor stage runs after the
-        # slice, so its piv q-axis is already IBZ).  Z_q is built at full
-        # BZ by ``z_q_phase``, so it gets the IBZ slice here.  When
-        # ``q_irr_full_idx`` is None (write_ibz_only=False), all
-        # arrays are full-BZ and the solve runs as before.
-        if q_irr_idx_j is not None:
-            Z_q_for_solve = Z_q[q_irr_idx_j]
-        else:
-            Z_q_for_solve = Z_q
+        # slice, so its piv q-axis is already IBZ).  Production selects Z
+        # immediately outside ``z_q_phase`` and before its outer host
+        # synchronization.  The composed AOT helper below hands this routine
+        # the full carrier directly, so select it here based on its static
+        # shape.  Keeping the selection outside the physics-producing JIT
+        # preserves that JIT's numerical lowering and bit identity.
+        if q_irr_idx_j is not None and int(Z_q.shape[0]) == int(meta.nk_tot):
+            Z_q = Z_q[q_irr_idx_j]
         # ``n_rmu_logical=meta.n_rmu``: the per-q dense solves run at
         # the LOGICAL μ extent (ζ pad rows zero-filled after) so ζ is
         # independent of the pad extent / device count.  See
         # solve_zeta's n_rmu_logical docstring.
         return solve_zeta(
-            L_q, Z_q_for_solve, mesh_xy, q_chunk_size,
+            L_q, Z_q, mesh_xy, q_chunk_size,
             solver_kind=solver_kind,
             cct_trace_per_q=cct_trace_per_q,
             n_rmu_logical=int(meta.n_rmu),
@@ -7062,9 +7063,22 @@ def fit_one_rchunk(
                 norms_l, norms_r, r_start_dyn,
                 gamma_perm, gamma_phase, psi_r_cache,
                 psi_mun, weight_l, weight_r)
+            # Keep the full-domain charge completion inside z_q_phase, but
+            # select in this separate scheduling operation before the outer
+            # wait.  Putting the take inside the compiled physics producer
+            # changes its lowering and can perturb otherwise identical rows.
+            if q_irr_full_idx is not None:
+                Z_q = Z_q[jnp.asarray(
+                    np.asarray(q_irr_full_idx, dtype=np.int32))]
             Z_q.block_until_ready()
         else:
             Z_q = _prebuilt_Z_q
+            # The coupled producer is shared across transverse channels and
+            # therefore still returns its full-zone carrier.  Match the
+            # ordinary z_q_phase lifetime before the same outer wait.
+            if q_irr_full_idx is not None:
+                Z_q = Z_q[jnp.asarray(
+                    np.asarray(q_irr_full_idx, dtype=np.int32))]
             Z_q.block_until_ready()
     _t_z = (time.perf_counter() - _t_z0) if _dbg else 0.0
     _r1 = host_rss_gb() if _dbg else 0.0
