@@ -270,6 +270,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import re
 import json
 import os
 import sys
@@ -1349,7 +1350,7 @@ def _compile_module_identity(module) -> tuple[str, str, float]:
         except Exception:                                  # noqa: BLE001
             pass
     try:
-        mlir = operation.get_asm(binary=True, enable_debug_info=False)
+        mlir = operation.get_asm(binary=False, enable_debug_info=False)
     except Exception as exc:                               # noqa: BLE001
         raise CompileAgreementError(
             "GATE cross_rank_compile_agreement: REFUSED before compiling "
@@ -1357,8 +1358,29 @@ def _compile_module_identity(module) -> tuple[str, str, float]:
             f"computed ({type(exc).__name__}: {exc}).") from exc
     if isinstance(mlir, str):
         mlir = mlir.encode("utf-8")
-    digest = hashlib.sha256(bytes(mlir)).hexdigest()
+    digest = hashlib.sha256(canonical_compile_text(bytes(mlir))).hexdigest()
     return name, digest, time.monotonic() - t0
+
+
+#: Process-local integer attributes that a rank-symmetric program may carry
+#: verbatim in its MLIR: the cuBLASMp/cuSolverMp context pointer is emitted as
+#: ``ctx_handle = 93965789305168 : i64`` on the distributed GEMM custom call,
+#: and it differs on every rank by construction.  Measured 2026-09-04 (claim
+#: 704): the Na metal chi0 route lowered the identical GEMM plan on four ranks
+#: with four different handles, and the exact-bytes agreement refused it.
+#: Replacing only the handle made all four SHA-256 digests identical.
+_HANDLE_ATTR_RE = re.compile(rb"\b([A-Za-z_]*handle)\s*=\s*-?\d+")
+
+
+def canonical_compile_text(mlir: bytes) -> bytes:
+    """Return ``mlir`` with process-local handle literals replaced.
+
+    Only attributes whose name ends in ``handle`` are touched, and only
+    their integer literal; shapes, layouts, constants and every other
+    attribute stay byte-exact, so a genuinely rank-divergent program still
+    disagrees.  Pure so the test can pin it without a device.
+    """
+    return _HANDLE_ATTR_RE.sub(rb"\1=<process-local>", mlir)
 
 
 def _compile_event_prefix(occurrence: int) -> str:

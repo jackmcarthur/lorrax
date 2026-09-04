@@ -425,3 +425,15 @@ def test_the_summary_line_names_a_disagreeing_binding(monkeypatch, tmp_path,
     _fake_cc(monkeypatch, str(tmp_path / "ours"))
     jcc._report_impl()
     assert "BOUND-ELSEWHERE" not in capsys.readouterr().out
+
+
+def test_canonical_compile_text_hides_only_process_local_handles():
+    from common.jax_compile_cache import canonical_compile_text
+    a = (b'stablehlo.custom_call @cublasmp_gemm(%0) {backend_config = '
+         b'{ctx_handle = 93965789305168 : i64, m = 896 : i64}} : tensor<896x896xcomplex<f64>>')
+    b = a.replace(b"93965789305168", b"94848402087200")
+    c = a.replace(b"m = 896", b"m = 897")
+    assert canonical_compile_text(a) == canonical_compile_text(b)
+    assert canonical_compile_text(a) != canonical_compile_text(c)
+    assert b"<process-local>" in canonical_compile_text(a)
+    assert b"m = 896" in canonical_compile_text(a)
