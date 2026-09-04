@@ -318,8 +318,9 @@ class SCInputs:
     screening_seed_cache: dict | None = None
     #: Run-local dynamic-Sigma quadrature receipts.  None for one-shot and
     #: one-map SC diagnostics; a multi-map SC run fills these on map 1 and
-    #: reuses the exact node arrays thereafter.  A padded-box escape refuses
-    #: instead of changing the quadrature inside the fixed-point map.
+    #: reuses the exact node arrays thereafter.  A window that escapes its
+    #: padded certificate, or a new window name, gets its rule rebuilt and
+    #: the rebuild is counted in the planner receipt (2026-09-03).
     fixed_quadrature_session: dict | None = None
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production

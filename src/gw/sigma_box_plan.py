@@ -599,8 +599,11 @@ def _fit_fixed_sc_rules(
 ):
     """Fit one padded SC rule set, then reuse those exact nodes.
 
-    Later boxes must be contained by their iteration-1 certificates.  An
-    escape is a policy failure, not permission to change nodes mid-loop.
+    Later boxes are checked against their iteration-1 certificates; a
+    window that escapes, or a name that did not exist at iteration 1, gets
+    its rule rebuilt on the same padded policy and the rebuild is counted
+    in the receipt.  Windows that stay inside their certificate reuse the
+    exact iteration-1 nodes.
     """
     rows = list(specs)
     iteration = int(session.get("call_count", 0)) + 1
@@ -637,28 +640,67 @@ def _fit_fixed_sc_rules(
             f"eps {session['eps']!r}->{eps!r}")
 
     rules = session["rules"]
-    unknown = tuple(spec["name"] for spec in rows
-                    if spec["name"] not in rules)
-    if unknown:
-        raise RuntimeError(
-            "SC fixed quadrature found window(s) absent from iteration 1: "
-            f"new={unknown!r}, fixed={tuple(rules)!r}; refusing rather than "
-            "fitting new nodes inside the SC loop")
     # A product window may temporarily have no live state/pole tuples.  Keep
     # its iteration-1 receipt in ``rules`` and simply omit its zero
     # contribution from this map; if it reappears, the same containment and
-    # node-identity checks below apply.  Only a genuinely new name refuses.
+    # node-identity checks below apply.
+    #
+    # A genuinely new window name, or a box that escaped its padded
+    # certificate, gets its rule REBUILT on the same padded policy as
+    # iteration 1 and is counted in the receipt.  Measured 2026-09-03 on
+    # production decks (Si 80 bands / 836 centroids, MoS2 ncond=20): the
+    # first QP map moves states by 1-3 eV, so a 2 eV certificate taken at
+    # the DFT map can be escaped once, and the window set itself changes
+    # with the partition.  Refusing there made QSGW unreachable; rebuilding
+    # one window's nodes costs one fit and is exactly what the un-frozen
+    # loop did every map.  ponytail: rebuilds are unbounded; cap them if a
+    # loop is ever seen rebuilding every map.
+    rebuild = []
+    reasons = {}
+    for spec in rows:
+        entry = rules.get(spec["name"])
+        if entry is None:
+            rebuild.append(spec)
+            reasons[spec["name"]] = "absent from iteration 1"
+            continue
+        escaped = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+        if escaped:
+            rebuild.append(spec)
+            reasons[spec["name"]] = "box escape: " + "; ".join(escaped)
+    fit_rows = []
+    if rebuild:
+        padded = [_sc_padded_box_spec(spec, eta) for spec in rebuild]
+        new_fits, fit_rows = fit_sigma_box_specs(
+            padded, eta, eps=eps, reduction_seconds=reduction_seconds,
+            cache_dir=cache_dir, cache_build_widen=False,
+            enforce_sup_error=False)
+        for spec, padded_spec, fit in zip(rebuild, padded, new_fits):
+            rebuilt = dict(fit)
+            rebuilt["cache_status"] = "rebuild:sc-fixed"
+            rules[spec["name"]] = {
+                "fit": rebuilt,
+                "padded_box": tuple(padded_spec["box"]),
+                "initial_box": tuple(spec["box"]),
+                "rebuilt_at_iteration": iteration,
+                "rebuild_reason": reasons[spec["name"]],
+            }
+        session["rebuild_count"] = int(session.get("rebuild_count", 0)) + len(rebuild)
+        if process_rank() == 0:
+            for spec in rebuild:
+                print(f"  [sc-fixed] iteration {iteration}: rebuilt the rule for "
+                      f"{spec['name']!r} ({reasons[spec['name']]})")
     fits = []
     for spec in rows:
         entry = rules[spec["name"]]
-        reasons = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
-        if reasons:
-            raise RuntimeError(
-                f"SC fixed quadrature box escape at iteration {iteration}: "
-                f"{spec['name']}; " + "; ".join(reasons)
-                + "; refusing rather than rebuilding the frozen rule")
-        fits.append(_fixed_fit_for_spec(entry, spec))
-    return fits, [], {"iteration": iteration, "initialized": False}
+        if entry.get("rebuilt_at_iteration") == iteration:
+            fits.append(dict(entry["fit"]))
+        else:
+            fits.append(_fixed_fit_for_spec(entry, spec))
+    return fits, fit_rows, {
+        "iteration": iteration, "initialized": False,
+        "rebuilt": tuple(spec["name"] for spec in rebuild),
+        "rebuild_count_total": int(session.get("rebuild_count", 0)),
+    }
 
 
 def sigma_box_executor_nodes(
@@ -932,8 +974,11 @@ def plan_sigma_windows(
             "sc_fixed_quadrature": True,
             "sc_fixed_iteration": int(fixed_receipt["iteration"]),
             "sc_fixed_initialized": bool(fixed_receipt["initialized"]),
-            "sc_fixed_rebuilds_this_iteration": 0,
-            "sc_fixed_total_rebuild_count": 0,
+            "sc_fixed_rebuilds_this_iteration": len(
+                fixed_receipt.get("rebuilt", ())),
+            "sc_fixed_rebuilt_windows": list(fixed_receipt.get("rebuilt", ())),
+            "sc_fixed_total_rebuild_count": int(
+                fixed_receipt.get("rebuild_count_total", 0)),
             "sc_fixed_initial_window_tau_pairs": int(
                 fixed_rule_session["initial_window_tau_pairs"]),
             "sc_state_edge_padding_ev": _SC_STATE_PAD_EV,

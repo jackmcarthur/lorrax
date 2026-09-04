@@ -217,7 +217,7 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     assert first_geometry["sc_fixed_initial_window_tau_pairs"] == 6
 
 
-def test_sc_fixed_session_refuses_escape_without_refitting(monkeypatch):
+def test_sc_fixed_session_rebuilds_an_escaped_window_and_counts_it(monkeypatch):
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -234,11 +234,28 @@ def test_sc_fixed_session_refuses_escape_without_refitting(monkeypatch):
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    with pytest.raises(RuntimeError, match="refusing rather than rebuilding"):
-        plan_sigma_windows(
-            _summaries(), [_branch_at((0.1, 8.0))],
-            np.asarray([0.2, 0.5]), 0.1, **args)
+    _second, geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 8.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    # Only the escaped window(s) are refitted; the rest reuse their nodes.
+    rebuilt = geometry["sc_fixed_rebuilds_this_iteration"]
+    assert 1 <= rebuilt <= 3
+    assert len(calls) == rebuilt
+    assert geometry["sc_fixed_total_rebuild_count"] == rebuilt
+    assert len(geometry["sc_fixed_rebuilt_windows"]) == rebuilt
+    statuses = [row["cache_status"]
+                for row in geometry["branches"][0]["windows"]]
+    assert statuses.count("rebuild:sc-fixed") == rebuilt
+    assert all(status in ("rebuild:sc-fixed", "hit:sc-fixed")
+               for status in statuses)
+    # The rebuilt certificate holds on the next map without another fit.
+    calls.clear()
+    _third, geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 8.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
     assert calls == []
+    assert geometry["sc_fixed_rebuilds_this_iteration"] == 0
+    assert geometry["sc_fixed_total_rebuild_count"] == rebuilt
 
 
 def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
@@ -287,7 +304,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         row["node_digest"] for row in first]
 
 
-def test_sc_fixed_session_refuses_a_window_absent_from_iteration_one(
+def test_sc_fixed_session_rebuilds_a_window_absent_from_iteration_one(
         monkeypatch):
     calls = []
 
@@ -301,15 +318,20 @@ def test_sc_fixed_session_refuses_a_window_absent_from_iteration_one(
         eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    plan_sigma_windows(
+    _first, first_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 0.2))],
         np.asarray([0.2, 0.5]), 0.1, **args)
+    n_first = len(first_geometry["branches"][0]["windows"])
     calls.clear()
-    with pytest.raises(RuntimeError, match="absent from iteration 1"):
-        plan_sigma_windows(
-            _summaries(), [_branch_at((0.1, 3.0))],
-            np.asarray([0.2, 0.5]), 0.1, **args)
-    assert calls == []
+    _second, geometry = plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    n_second = len(geometry["branches"][0]["windows"])
+    assert n_second > n_first
+    rebuilt = geometry["sc_fixed_rebuilds_this_iteration"]
+    assert rebuilt >= n_second - n_first
+    assert len(calls) == rebuilt
+    assert geometry["sc_fixed_total_rebuild_count"] == rebuilt
 
 
 def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
