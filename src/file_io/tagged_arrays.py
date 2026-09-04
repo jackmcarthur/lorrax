@@ -15,19 +15,133 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import barrier
 
 
-def _mu_logical_shape(shape, mu_axes, n_rmu_logical):
-    """On-disk (logical) shape for a μ-padded in-memory array: clip the
-    ``mu_axes`` extents of ``shape`` to ``n_rmu_logical``.
+RESTART_LOGICAL_SHAPE_ATTR = "restart_logical_shape"
+RESTART_CARRIER_SHAPE_ATTR = "restart_carrier_shape"
+BAND_WINDOW_SCHEMA_DATASET = "band_window_schema"
+BAND_WINDOW_SCHEMA_VERSION = 2
+BAND_WINDOW_CARRIER_DATASET = "band_window_carrier"
+
+
+def _logical_storage_shape(shape, logical_axes, logical_extent, *, where):
+    """Return a logical disk shape, refusing a short source carrier.
+
+    ``logical_axes`` are the axes whose on-disk extent is exactly
+    ``logical_extent``.  A carrier may be larger because a process mesh padded
+    it; it may never be smaller.  The old ``min(source, logical)`` spelling
+    silently blessed a short carrier and let SlabIO zero-fill data that the
+    producer never supplied.
+    """
+    source = tuple(int(s) for s in shape)
+    extent = int(logical_extent)
+    if extent < 0:
+        raise ValueError(
+            f"{where}: logical extent must be nonnegative; got {extent}.")
+    out = list(source)
+    normalized = []
+    for raw_axis in logical_axes:
+        axis = int(raw_axis)
+        if axis < 0:
+            axis += len(source)
+        if not 0 <= axis < len(source):
+            raise ValueError(
+                f"{where}: logical axis {raw_axis} is outside source shape "
+                f"{source}.")
+        if axis in normalized:
+            raise ValueError(
+                f"{where}: logical axis {raw_axis} was declared twice for "
+                f"source shape {source}.")
+        normalized.append(axis)
+        if source[axis] < extent:
+            raise ValueError(
+                f"{where}: source carrier shape {source} is SHORT on axis "
+                f"{axis}: extent {source[axis]} < declared logical extent "
+                f"{extent}. Refusing before opening or mutating the restart "
+                "file; missing physical rows must never be stored as padding.")
+        out[axis] = extent
+    return tuple(out)
+
+
+def _mu_logical_shape(shape, mu_axes, n_rmu_logical, *, where="restart tensor"):
+    """On-disk (logical) shape for a μ-padded in-memory array.
 
     Disk contract (SHARDING_RULES §2): files store the LOGICAL μ extent
     so a restart written at any device count re-reads on any other; the
     in-memory pad (``Meta.n_rmu_padded``, zero rows by construction) is
     re-applied on read via ``runtime.padding.padded_mu_extent``.
+
+    Refuses when any declared μ axis is shorter than the logical extent.
+    This check belongs before SlabIO opens: a short source is a producer defect,
+    not permission for the reader to invent zero rows.
     """
-    out = [int(s) for s in shape]
-    for ax in mu_axes:
-        out[ax] = min(out[ax], int(n_rmu_logical))
-    return tuple(out)
+    return _logical_storage_shape(
+        shape, mu_axes, n_rmu_logical, where=where)
+
+
+def _shape_receipt_attrs(carrier_shape, logical_shape):
+    """Dataset attrs that keep producer carrier and disk shape distinct."""
+    return {
+        RESTART_CARRIER_SHAPE_ATTR: np.asarray(
+            tuple(int(v) for v in carrier_shape), dtype=np.int64),
+        RESTART_LOGICAL_SHAPE_ATTR: np.asarray(
+            tuple(int(v) for v in logical_shape), dtype=np.int64),
+    }
+
+
+def _band_window_receipts(band_slices):
+    """Return logical identity plus the producer's padded band carrier.
+
+    The first four edges are already physical indices. ``b4`` is a storage
+    edge and may be mesh padded; ``b4_logical`` is the physical loaded top.
+    The chi/sigma tops use the same convention as ``Meta``: clipping either
+    against the logical loaded top removes only the zero-band carrier tail.
+    """
+    carrier = tuple(int(getattr(band_slices, f"b{i}")) for i in range(5))
+    logical_top = int(getattr(band_slices, "b4_logical", 0) or carrier[4])
+    if not carrier[0] <= carrier[1] <= carrier[2] <= carrier[3] <= logical_top:
+        raise ValueError(
+            "write_restart_state_to_h5: invalid logical band window "
+            f"{carrier[:4] + (logical_top,)} derived from carrier {carrier}.")
+    if logical_top > carrier[4]:
+        raise ValueError(
+            "write_restart_state_to_h5: logical loaded-band top "
+            f"{logical_top} exceeds carrier top {carrier[4]}.")
+    logical = carrier[:4] + (logical_top,)
+    split = (
+        min(int(getattr(band_slices, "b4_chi", carrier[4])), logical_top),
+        min(int(getattr(band_slices, "b4_sigma", carrier[4])), logical_top),
+    )
+    if min(split) < carrier[2] or max(split) != logical_top:
+        raise ValueError(
+            "write_restart_state_to_h5: logical chi/Sigma tops "
+            f"{split} are inconsistent with band window {logical}.")
+    return logical, carrier, split
+
+
+def _validate_shape_receipt(name, ds) -> None:
+    """Refuse an authenticated dataset whose stored shape changed."""
+    if RESTART_LOGICAL_SHAPE_ATTR not in ds.attrs:
+        return
+    stamped = tuple(int(v) for v in np.asarray(
+        ds.attrs[RESTART_LOGICAL_SHAPE_ATTR]).reshape(-1))
+    actual = tuple(int(v) for v in ds.shape)
+    if stamped != actual:
+        raise ValueError(
+            f"Restart dataset {name!r}: stamped logical storage shape "
+            f"{stamped} does not match actual dataset shape {actual}. The file "
+            "is torn or hand-edited; regenerate it with restart=false.")
+    if RESTART_CARRIER_SHAPE_ATTR not in ds.attrs:
+        raise ValueError(
+            f"Restart dataset {name!r} has a logical storage receipt but no "
+            f"{RESTART_CARRIER_SHAPE_ATTR!r}. The authenticated receipt is "
+            "partial; regenerate the file with restart=false.")
+    carrier = tuple(int(v) for v in np.asarray(
+        ds.attrs[RESTART_CARRIER_SHAPE_ATTR]).reshape(-1))
+    if len(carrier) != len(actual) or any(
+            c < s for c, s in zip(carrier, actual)):
+        raise ValueError(
+            f"Restart dataset {name!r}: producer carrier receipt "
+            f"{carrier} cannot cover logical storage shape {actual}. The "
+            "file is internally inconsistent.")
 
 
 def _restart_write_log_on() -> bool:
@@ -426,6 +540,84 @@ def write_restart_state_to_h5(
                 "nobody froze for this purpose.")
         V_on_disk = qirr.capture.X_ibz
 
+    # Resolve EVERY logical storage shape before SlabIO opens.  SlabIO's
+    # ``mode='w'`` replaces the inode during construction; discovering a short
+    # producer inside ``_write`` would therefore already have destroyed the
+    # previous file.  The plan also keeps the producer carrier shape beside the
+    # logical disk shape instead of making readers reverse-engineer one from
+    # the other.
+    band_receipts = None
+    n_band_logical = None
+    if band_slices is not None:
+        band_receipts = _band_window_receipts(band_slices)
+        n_band_logical = int(band_receipts[0][4] - band_receipts[0][0])
+    elif mode != "w" and any(
+            arr is not None for arr in (
+                psi_full_y, psi_full_y_mun, psi_full_y_transverse,
+                psi_full_y_transverse_mun, enk_full)):
+        # Append calls intentionally do not repeat band_slices.  A schema-2
+        # file's band_window is logical, so it is sufficient to clip the later
+        # psi faces to the same portable disk extent.  A legacy file has no
+        # way to distinguish physical rows from its mesh pad and stays on its
+        # historical full-carrier storage path.
+        with h5py.File(filename, "r") as f:
+            schema = (int(np.asarray(f[BAND_WINDOW_SCHEMA_DATASET])[()])
+                      if BAND_WINDOW_SCHEMA_DATASET in f else None)
+            if schema == BAND_WINDOW_SCHEMA_VERSION and "band_window" in f:
+                stored_logical = tuple(
+                    int(v) for v in np.asarray(f["band_window"]).reshape(-1))
+                if len(stored_logical) != 5:
+                    raise ValueError(
+                        f"Restart file {filename}: schema-{schema} band_window "
+                        f"has {len(stored_logical)} entries, expected 5.")
+                n_band_logical = stored_logical[4] - stored_logical[0]
+
+    if ((psi_full_y_transverse is not None
+         or psi_full_y_transverse_mun is not None)
+            and n_rmu_transverse_logical is None):
+        raise ValueError(
+            "write_restart_state_to_h5: transverse psi requires "
+            "n_rmu_transverse_logical (the transverse centroid count).")
+    n_T = (int(n_rmu_transverse_logical)
+           if n_rmu_transverse_logical is not None else None)
+
+    write_plan = {}
+
+    def _plan(name, arr, *, mu_axes=(), n_logical=None, band_axes=()):
+        if arr is None:
+            return
+        n_log = n_rmu_logical if n_logical is None else n_logical
+        shape = _mu_logical_shape(
+            arr.shape, mu_axes, n_log,
+            where=f"write_restart_state_to_h5 dataset {name!r}")
+        if band_axes and n_band_logical is not None:
+            shape = _logical_storage_shape(
+                shape, band_axes, n_band_logical,
+                where=f"write_restart_state_to_h5 dataset {name!r} band axis")
+        write_plan[name] = (
+            shape, _shape_receipt_attrs(arr.shape, shape))
+
+    _plan("V_qmunu", V_on_disk, mu_axes=(-2, -1))
+    _plan("S_qmunu", S_qmunu, mu_axes=(-2, -1))
+    _plan("V0_noG0_munu", V0_noG0_munu, mu_axes=(-2, -1))
+    _plan("G0_mu_nu", G0_mu_nu, mu_axes=(-1,))
+    _plan("psi_full_y", psi_full_y, mu_axes=(-1,), band_axes=(1,))
+    _plan("psi_full_y_mun", psi_full_y_mun, mu_axes=(-2,), band_axes=(-1,))
+    _plan("enk_full", enk_full, band_axes=(-1,))
+    _plan("psi_full_y_transverse", psi_full_y_transverse,
+          mu_axes=(-1,), n_logical=n_T, band_axes=(1,))
+    _plan("psi_full_y_transverse_mun", psi_full_y_transverse_mun,
+          mu_axes=(-2,), n_logical=n_T, band_axes=(-1,))
+    _plan("W0_qmunu", W0_qmunu, mu_axes=(-2, -1))
+
+    if init_W0 and W0_qmunu is None:
+        if V_qmunu is None:
+            raise ValueError("init_W0=True requires V_qmunu to size the placeholder")
+        # V_on_disk, not the possibly full-BZ V_qmunu, is the resolved q
+        # storage.  Its preflight above covers the placeholder too.
+        v_shape, v_attrs = write_plan["V_qmunu"]
+        write_plan["W0_qmunu"] = (v_shape, dict(v_attrs))
+
     with SlabIO(filename, mode=mode, mesh=mesh,
 ) as io:
         if mode == "w":
@@ -453,19 +645,29 @@ def write_restart_state_to_h5(
         # 7874375: window 70 tensors reused at window 80 gave a QP gap of
         # -135 eV while every stage reported success).  Stamp the window here
         # so :func:`assert_restart_window_matches` can refuse that on load.
-        if band_slices is not None and mode == "w":
+        if band_receipts is not None and mode == "w":
+            logical_window, carrier_window, logical_split = band_receipts
+            # Schema 2 changes ``band_window`` from a P-dependent carrier
+            # receipt to the physical identity.  The producer carrier remains
+            # available under its own explicit name; readers never compare it
+            # as physics.  Presence of the schema dataset makes legacy files
+            # unambiguous.
+            if enk_full is not None:
+                actual_top = logical_window[0] + int(enk_full.shape[-1])
+                carrier_window = carrier_window[:4] + (actual_top,)
+            io.write_attr(BAND_WINDOW_SCHEMA_DATASET,
+                          np.int64(BAND_WINDOW_SCHEMA_VERSION))
             io.write_attr("band_window", np.asarray(
-                [int(band_slices.b0), int(band_slices.b1),
-                 int(band_slices.b2), int(band_slices.b3),
-                 int(band_slices.b4)], dtype=np.int64))
+                logical_window, dtype=np.int64))
+            io.write_attr(BAND_WINDOW_CARRIER_DATASET, np.asarray(
+                carrier_window, dtype=np.int64))
             # THE χ / Σ SPLIT, IN A SEPARATE ATTR ON PURPOSE (2026-08-16).
             # Widening ``band_window`` from 5 entries to 7 would have made
             # every restart file already on disk compare unequal and strand
             # it.  A new attr instead: absent == "written by an unsplit run",
             # which resolves to (b4, b4) and matches an unsplit run exactly.
             io.write_attr("band_window_split", np.asarray(
-                [int(band_slices.b4_chi), int(band_slices.b4_sigma)],
-                dtype=np.int64))
+                logical_split, dtype=np.int64))
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
         # COULOMB-KERNEL PROVENANCE.  Unconditional on the ``w`` pass: a
@@ -487,7 +689,7 @@ def write_restart_state_to_h5(
         # SlabIO.close drain line.  The one-switch/rank-0 policy lives at
         # :func:`_restart_write_log_on` / :func:`_log_restart_write`.
 
-        def _write(name, arr, mu_axes=(), n_logical=None):
+        def _write(name, arr):
             """create+write one dataset, μ axes clipped to ``n_logical``
             (default: the charge ``n_rmu_logical``), with the AF.4c
             debug telemetry line.  Single write path for every dataset in
@@ -496,45 +698,36 @@ def write_restart_state_to_h5(
             inline copy of this helper)."""
             if arr is None:
                 return
-            n_log = n_rmu_logical if n_logical is None else n_logical
-            shape = _mu_logical_shape(arr.shape, mu_axes, n_log)
+            shape, attrs = write_plan[name]
             _t0 = time.time()
             # The LOGICAL shape is stated once, to create_dataset; the
             # write clips ``arr``'s μ pad rows against it on its own
             # (decisions.md 2026-08-04).
-            io.create_dataset(name, shape=shape, dtype=arr.dtype)
+            io.create_dataset(name, shape=shape, dtype=arr.dtype, attrs=attrs)
             io.write_slab(name, arr)
             _log_restart_write(name, shape, arr.dtype, time.time() - _t0)
 
-        _write("V_qmunu",      V_on_disk,    mu_axes=(-2, -1))
-        _write("S_qmunu",      S_qmunu,      mu_axes=(-2, -1))
-        _write("V0_noG0_munu", V0_noG0_munu, mu_axes=(-2, -1))
-        _write("G0_mu_nu",     G0_mu_nu,     mu_axes=(-1,))
-        _write("psi_full_y",   psi_full_y,   mu_axes=(-1,))
+        _write("V_qmunu", V_on_disk)
+        _write("S_qmunu", S_qmunu)
+        _write("V0_noG0_munu", V0_noG0_munu)
+        _write("G0_mu_nu", G0_mu_nu)
+        _write("psi_full_y", psi_full_y)
         # (nk, s, μ, n): μ is axis -2, not -1 — the mun face's axis order
         # differs from every other dataset this writer knows about.
-        _write("psi_full_y_mun", psi_full_y_mun, mu_axes=(-2,))
-        _write("enk_full",     enk_full)
+        _write("psi_full_y_mun", psi_full_y_mun)
+        _write("enk_full", enk_full)
 
         # Bispinor per-channel ψ: μ axis clipped to the TRANSVERSE
         # logical extent (its own centroid count, not n_rmu_logical).
         if psi_full_y_transverse is not None:
-            if n_rmu_transverse_logical is None:
-                raise ValueError(
-                    "write_restart_state_to_h5: psi_full_y_transverse "
-                    "requires n_rmu_transverse_logical (the transverse "
-                    "centroid count) to clip its μ axis on disk.")
-            n_T = int(n_rmu_transverse_logical)
-            _write("psi_full_y_transverse", psi_full_y_transverse,
-                   mu_axes=(-1,), n_logical=n_T)
+            _write("psi_full_y_transverse", psi_full_y_transverse)
             # Face layout (low_mem_bands): the ADDITIVE second face of
             # the transverse carrier, mirroring psi_full_y_mun exactly
             # ((nk, s, μ_T, n) — μ at axis -2).  Written only when the
             # caller holds a face-layout transverse bundle; a legacy
             # caller passes None and the file stays byte-identical to
             # the pre-face schema.
-            _write("psi_full_y_transverse_mun", psi_full_y_transverse_mun,
-                   mu_axes=(-2,), n_logical=n_T)
+            _write("psi_full_y_transverse_mun", psi_full_y_transverse_mun)
             # Stamped for the load-time extent cross-check in
             # read_restart_state_from_h5.
             io.write_attr("n_rmu_transverse_logical", np.int64(n_T))
@@ -544,11 +737,9 @@ def write_restart_state_to_h5(
         w0_touched = W0_qmunu is not None or init_W0
         w0_ready = False
         if W0_qmunu is not None:
-            _write("W0_qmunu", W0_qmunu, mu_axes=(-2, -1))
+            _write("W0_qmunu", W0_qmunu)
             w0_ready = True
         elif init_W0:
-            if V_qmunu is None:
-                raise ValueError("init_W0=True requires V_qmunu to size the placeholder")
             # THE PLACEHOLDER'S SHAPE IS V'S SHAPE.  W0 is allocated here
             # from ``V_qmunu.shape``, so V's storage decision silently
             # becomes W0's — including its q extent.  That coupling is
@@ -568,11 +759,11 @@ def write_restart_state_to_h5(
             # placeholder from the in-memory full-BZ tensor is precisely
             # the inheritance the rule above forbids.  ONE resolution
             # decided both, which is what dbe3b4ec asked for.
-            v_shape = _mu_logical_shape(V_on_disk.shape, (-2, -1),
-                                        n_rmu_logical)
+            v_shape, v_attrs = write_plan["W0_qmunu"]
             v_dtype = V_on_disk.dtype
             _t0 = time.time()
-            io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype)
+            io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype,
+                              attrs=v_attrs)
             if _restart_write_log_on():
                 # Allocation ONLY -- no data is written here, so this
                 # deliberately does NOT use the _log_restart_write
@@ -712,11 +903,17 @@ def write_w0_qmunu_to_h5(
                 f"{int(n_rmu_logical)}; refusing before W0 mutation.")
         W0_qmunu = qirr.capture.X_ibz
 
-    shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
+    # Preflight before SlabIO opens the existing file: a short producer must
+    # not recreate/mutate W0 and only then report its bad geometry.
+    shape = _mu_logical_shape(
+        W0_qmunu.shape, (-2, -1), n_rmu_logical,
+        where="write_w0_qmunu_to_h5 dataset 'W0_qmunu'")
+    shape_attrs = _shape_receipt_attrs(W0_qmunu.shape, shape)
     with SlabIO(filename, mode="a", mesh=mesh,
 ) as io:
         _t0 = time.time()
-        io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
+        io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype,
+                          attrs=shape_attrs)
         io.write_slab("W0_qmunu", W0_qmunu)
         # Same instrument as ``write_restart_state_to_h5`` (AF.4c).  This
         # is the SECOND (nq, mu, mu) tensor the run writes -- another
@@ -834,8 +1031,39 @@ def assert_restart_window_matches(filename, band_slices=None,
         stored_w = np.asarray(f["band_window"]).tolist() if "band_window" in f else None
         stored_split = (np.asarray(f["band_window_split"]).tolist()
                         if "band_window_split" in f else None)
+        stored_schema = (
+            int(np.asarray(f[BAND_WINDOW_SCHEMA_DATASET])[()])
+            if BAND_WINDOW_SCHEMA_DATASET in f else None)
+        stored_carrier = (
+            np.asarray(f[BAND_WINDOW_CARRIER_DATASET]).tolist()
+            if BAND_WINDOW_CARRIER_DATASET in f else None)
         stored_mu = (int(np.asarray(f["n_rmu_logical"])[()])
                      if "n_rmu_logical" in f else None)
+
+    if stored_schema is not None:
+        if stored_schema != BAND_WINDOW_SCHEMA_VERSION:
+            raise ValueError(
+                f"Restart file {filename} has unsupported band-window schema "
+                f"{stored_schema}; this reader supports "
+                f"{BAND_WINDOW_SCHEMA_VERSION}.")
+        if stored_w is None or stored_carrier is None or stored_split is None:
+            raise ValueError(
+                f"Restart file {filename} declares band-window schema "
+                f"{stored_schema} but is missing band_window, "
+                f"band_window_split, or {BAND_WINDOW_CARRIER_DATASET}. The "
+                "geometry receipt is torn.")
+        if len(stored_w) != 5 or len(stored_carrier) != 5:
+            raise ValueError(
+                f"Restart file {filename} has malformed band-window receipts: "
+                f"logical={stored_w}, carrier={stored_carrier}; expected two "
+                "five-edge windows.")
+        logical = tuple(int(v) for v in stored_w)
+        carrier = tuple(int(v) for v in stored_carrier)
+        if logical[:4] != carrier[:4] or carrier[4] < logical[4]:
+            raise ValueError(
+                f"Restart file {filename} has inconsistent logical/carrier "
+                f"band receipts: logical={logical}, carrier={carrier}. The "
+                "carrier may add only a zero-pad tail above the logical b4.")
 
     # THE χ COUNT MUST MATCH; THE Σ COUNT NEED NOT, and the asymmetry is the
     # point.  Every tensor in this file is a function of the SCREENING side or
@@ -851,7 +1079,18 @@ def assert_restart_window_matches(filename, band_slices=None,
     # blanket "no restart under a split".  Changing χ is refused, for exactly
     # the reason the 5-tuple check above exists.
     if band_slices is not None:
-        want_split = (int(band_slices.b4_chi), int(band_slices.b4_sigma))
+        want_b4_logical = int(
+            getattr(band_slices, "b4_logical", 0) or band_slices.b4)
+        want_split = (
+            min(int(band_slices.b4_chi), want_b4_logical),
+            min(int(band_slices.b4_sigma), want_b4_logical),
+        )
+        # Legacy split stamps carried the padded larger edge.  Keep their
+        # historical comparison exact: without schema 2 the file cannot prove
+        # whether rows between logical and carrier b4 were zeros or physical.
+        if stored_schema is None:
+            want_split = (int(band_slices.b4_chi),
+                          int(band_slices.b4_sigma))
         if stored_split is None and stored_w is not None:
             stored_split = [int(stored_w[4]), int(stored_w[4])]
         if stored_split is not None and int(stored_split[0]) != want_split[0]:
@@ -868,8 +1107,12 @@ def assert_restart_window_matches(filename, band_slices=None,
                 f"tensor in this file depends on it.")
 
     if stored_w is not None and band_slices is not None:
+        want_b4 = int(band_slices.b4)
+        if stored_schema == BAND_WINDOW_SCHEMA_VERSION:
+            want_b4 = int(
+                getattr(band_slices, "b4_logical", 0) or band_slices.b4)
         want = [int(band_slices.b0), int(band_slices.b1), int(band_slices.b2),
-                int(band_slices.b3), int(band_slices.b4)]
+                int(band_slices.b3), want_b4]
         stored_stable = [int(stored_w[index]) for index in (0, 1, 2, 4)]
         want_stable = [want[index] for index in (0, 1, 2, 4)]
         if stored_stable != want_stable:
@@ -1074,7 +1317,8 @@ def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
         n_sym_spatial=int(t.n_sym_spatial))
 
 
-def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
+def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
+                               n_band_carrier=None):
     """Read canonical restart state as PER-RANK TILES (restart format v2).
 
     Returns arrays that are ALREADY sharded on ``mesh_xy`` and ALREADY at
@@ -1181,6 +1425,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
                             "psi_full_y_transverse_mun")
                   if k in f}
         dtypes = {k: f[k].dtype for k in shapes}
+        for name in shapes:
+            _validate_shape_receipt(name, f[name])
         if (low_mem_bands and "psi_full_y_transverse" in shapes
                 and "psi_full_y_transverse_mun" not in shapes):
             raise ValueError(
@@ -1243,7 +1489,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
         return _unfold_wedge(arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
 
     def _read_psi(io, name, n_mu_logical, *, spec, mu_axis=-1,
-                  spinor_axis=2):
+                  spinor_axis=2, band_axis=1):
         """One direct hyperslab of a ψ dataset, μ padded, at ``spec``.
 
         ``mu_axis``/``spinor_axis`` default to the legacy/nmu axis order
@@ -1260,6 +1506,17 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
         pad = padded_mu_extent(int(n_mu_logical), divisor)
         shape = list(int(s) for s in ds)
         shape[mu_axis] = int(pad)
+        if n_band_carrier is not None:
+            b_axis = int(band_axis)
+            if b_axis < 0:
+                b_axis += len(shape)
+            if shape[b_axis] > int(n_band_carrier):
+                raise ValueError(
+                    f"Restart dataset {name!r} stores {shape[b_axis]} logical "
+                    f"bands but this run's carrier has only "
+                    f"{int(n_band_carrier)} slots. The band identity preflight "
+                    "should have refused this mismatch before tensor I/O.")
+            shape[b_axis] = int(n_band_carrier)
         return io.read_slab(
             name, shape=tuple(shape), dtype=dtypes[name],
             mesh=mesh_xy, partition_spec=spec)
@@ -1276,7 +1533,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
             psi_nmu = _read_psi(io, "psi_full_y", n_rmu_disk,
                                 spec=psi_nmu_spec)
             psi_mun = _read_psi(io, "psi_full_y_mun", n_rmu_disk,
-                                spec=psi_mun_spec, mu_axis=-2, spinor_axis=1)
+                                spec=psi_mun_spec, mu_axis=-2, spinor_axis=1,
+                                band_axis=-1)
             # Transverse (bispinor) faces: same two-hyperslab pattern at
             # the transverse μ extent.  A file holding the nmu-order
             # dataset WITHOUT the additive mun face was written by a
@@ -1291,7 +1549,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
                     spec=psi_nmu_spec)
                 psi_mun_T = _read_psi(
                     io, "psi_full_y_transverse_mun", n_rmu_T_disk,
-                    spec=psi_mun_spec, mu_axis=-2, spinor_axis=1)
+                    spec=psi_mun_spec, mu_axis=-2, spinor_axis=1,
+                    band_axis=-1)
             else:
                 psi_nmu_T = None
                 psi_mun_T = None
@@ -1329,6 +1588,24 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
             np.ascontiguousarray(G0_mu_nu),
             NamedSharding(mesh_xy, P("y")))
     if enk_full is not None:
+        if n_band_carrier is not None:
+            n_disk_band = int(enk_full.shape[-1])
+            n_target_band = int(n_band_carrier)
+            if n_disk_band > n_target_band:
+                raise ValueError(
+                    f"Restart enk_full stores {n_disk_band} logical bands but "
+                    f"this run's carrier has only {n_target_band} slots. The "
+                    "band identity preflight should have refused this mismatch.")
+            if n_disk_band < n_target_band:
+                if enk_full.size == 0:
+                    raise ValueError(
+                        "Restart enk_full is empty and cannot define the finite "
+                        "energy sentinel needed for band-carrier padding.")
+                sentinel = float(np.max(enk_full)) + 1.0
+                pad = np.full(
+                    (enk_full.shape[0], n_target_band - n_disk_band),
+                    sentinel, dtype=enk_full.dtype)
+                enk_full = np.concatenate((enk_full, pad), axis=-1)
         enk_full = device_put_process_local(
             np.ascontiguousarray(enk_full),
             NamedSharding(mesh_xy, P(None, None)))
@@ -1433,7 +1710,10 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
      psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
      psi_nmu_T, psi_mun_T) = read_restart_state_from_h5(
-        filename, mesh_xy, low_mem_bands=bool(low_mem_bands))
+        filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
+        n_band_carrier=(
+            int(band_slices.b4) - int(band_slices.b0)
+            if band_slices is not None else None))
 
     if low_mem_bands:
         # No derivation, no reshard: both faces already arrived at their
