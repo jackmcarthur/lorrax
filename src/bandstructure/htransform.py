@@ -60,7 +60,12 @@ from common.shard_map import shard_map
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
-from common.collectives import device_put_process_local, gather_to_host
+from common.collectives import (
+    device_put_process_local,
+    gather_to_host,
+    restore_from_host,
+    spill_to_host,
+)
 from common.sharding_fit import padded_extent as _pad_to
 from runtime.production_stream import ProductionStdout
 from .production_report import HTransformProductionReport
@@ -828,11 +833,25 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     fH_R = _build_fH_R(ctilde_x, ctilde_y, f_eps)
     fft_rel = _relative_from_abs_scale(
         _fH_fft_abs_scale(fH_R, ctilde_x, ctilde_y, f_eps))
-    jax.block_until_ready(fH_R)
     if active_band_range is not None:
+        # Both retained operators fit together, but constructing active_R
+        # while fH_R and the paired coefficient shards remain device-resident
+        # does not: the MoS2-72 local shard is 13.18 GiB.  Spill only this
+        # process's fH_R shards, explicitly delete their device buffers, build
+        # active_R, release the coefficient views, and restore the exact bits.
+        # ``spill_to_host``/``restore_from_host`` are the repository's
+        # zero-collective bounded-live-set seam; no host gather occurs.
+        log_fn(
+            "  [route] dual dense operators: process-local fH_R host spill "
+            "while active_R is built; zero collectives, bit-exact restore")
+        fH_R_spill = spill_to_host(fH_R)
         active_R = _build_active_R(ctilde_x, ctilde_y)
         jax.block_until_ready(active_R)
     del ctilde_x, ctilde_y
+    if active_band_range is not None:
+        fH_R = restore_from_host(fH_R_spill)
+        jax.block_until_ready(fH_R)
+        del fH_R_spill
     log_fn(
         f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
         f"round-trip scale-relative max|FFT(IFFT(fH))-fH|="
