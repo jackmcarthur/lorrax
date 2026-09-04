@@ -160,8 +160,13 @@ damping.
 
 **9. Budget.** A healthy loop converges in 13–15 maps. If the residual has
 not fallen below 1 meV by map 20 it will not converge at 60; stop and fix the
-deck (pitfalls 1, 3, 6). Each map costs one full Σ evaluation, 80–90 % of the
-wall time (Si b80/c504 on 4 GPUs: 3 min GN, 4 min MPA per map).
+deck (pitfalls 1, 3, 6). Each map costs one full Σ evaluation. Read its cost
+from the three Σ rows of the stage table: on Si b80/c504 at P4 a cold run is
+"Sigma rule plan" 180 s (box-rule fitting, cached by box and tolerance, paid
+once per rule set and reused by the frozen rules across maps), "Sigma tau
+sweep" 6 s (the actual contraction, 700 τ nodes), "Sigma other" 9 s
+(2026-09-03, `runs/DEV/123`). A QSGW map that shows minutes of rule planning
+after map 1 is rebuilding rules; check `sc_fixed_rebuilds_this_iteration`.
 
 **10. Convergence is judged on the non-scissored bands only**
 (`protected_band_convergence`). Scissored bands are α·E_DFT + β with the
