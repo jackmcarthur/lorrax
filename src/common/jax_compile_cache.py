@@ -292,7 +292,7 @@ _KV_NS = "lorrax/compile_cache/v1"
 # startup cache snapshot above, this one executes before EVERY backend
 # compile and refuses a rank-divergent module before XLA can enter collective
 # GPU autotuning and wait forever.
-_COMPILE_KV_NS = "lorrax/compile_agreement/v1"
+_COMPILE_KV_NS = "lorrax/compile_agreement/v2"
 _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 60.0
 
 # Parallel page-cache prefetch of the agreed entries (see _prefetch_agreed).
@@ -330,7 +330,7 @@ class _CacheState:
         self.compile_fingerprint_secs = 0.0
         self.compile_agreement_secs = 0.0
         self._compile_client = None
-        self._compile_occurrences: dict[str, int] = {}
+        self._compile_sequence = 0
         # JAX calls the file-cache writer on process 0 only.  Keep these
         # explicitly process-local: summing them across ranks would turn one
         # physical write into a fictitious P writes.  The atomic, unlimited
@@ -346,13 +346,6 @@ class _CacheState:
         # which is the state that precedes the collective-compile deadlock.
         # A set of keys is the only observable that separates those.
         self.probe_keys: set[str] = set()
-
-    def next_compile_occurrence(self, module_name: str) -> int:
-        """Return this rank's zero-based occurrence for ``module_name``."""
-        with self._compile_event_lock:
-            occurrence = self._compile_occurrences.get(module_name, 0)
-            self._compile_occurrences[module_name] = occurrence + 1
-            return occurrence
 
     def reset_write_metrics(self) -> None:
         """Reset this process's successful-write receipt deterministically."""
@@ -1364,9 +1357,16 @@ def _compile_module_identity(module) -> tuple[str, str, float]:
     return name, digest, time.monotonic() - t0
 
 
-def _compile_event_prefix(module_name: str, occurrence: int) -> str:
-    name_hash = hashlib.sha256(module_name.encode("utf-8")).hexdigest()[:24]
-    return f"{_COMPILE_KV_NS}/{name_hash}/{int(occurrence)}"
+def _compile_event_prefix(occurrence: int) -> str:
+    """Name one all-rank compile slot by global order, not module name.
+
+    Keying by each module name's local occurrence permits two concurrently
+    lowered modules to be approved in opposite orders on different ranks.
+    Their later collective executions can then deadlock even though each
+    individual fingerprint agreed.  A single global slot turns that ordering
+    difference into the same bounded, rank-by-rank refusal as a shape change.
+    """
+    return f"{_COMPILE_KV_NS}/{int(occurrence)}"
 
 
 def _decode_compile_record(payload: bytes, rank: int) -> dict:
@@ -1438,7 +1438,7 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
     proc_idx = int(s.proc_idx if proc_idx is None else proc_idx)
     timeout_s = float(
         s.compile_agreement_timeout_s if timeout_s is None else timeout_s)
-    prefix = _compile_event_prefix(module_name, occurrence)
+    prefix = _compile_event_prefix(occurrence)
     record = {
         "rank": proc_idx,
         "module": module_name,
@@ -1623,8 +1623,22 @@ def _install_compile_counter() -> None:
             module_name, key, fingerprint_secs = _compile_module_identity(
                 module)
             _STATE.compile_fingerprint_secs += fingerprint_secs
-            occurrence = _STATE.next_compile_occurrence(module_name)
-            _agree_before_module_compile(module_name, key, occurrence)
+            # JAX may ask host threads to lower independent modules at once.
+            # Keep each process's exchange *and backend entry* in one order;
+            # otherwise a later local thread can overtake a module whose
+            # all-rank agreement just passed.  The slot is global across
+            # module names, so another rank choosing a different first module
+            # refuses with both names instead of approving both out of order.
+            with _STATE._compile_event_lock:
+                occurrence = _STATE._compile_sequence
+                _STATE._compile_sequence += 1
+                _agree_before_module_compile(module_name, key, occurrence)
+                t0 = time.monotonic()
+                try:
+                    return _orig(*args, **kwargs)
+                finally:
+                    _STATE.compiles += 1
+                    _STATE.compile_secs += time.monotonic() - t0
         t0 = time.monotonic()
         try:
             return _orig(*args, **kwargs)

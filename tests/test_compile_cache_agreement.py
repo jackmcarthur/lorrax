@@ -209,7 +209,8 @@ def test_bitmask_helpers_roundtrip():
     assert [i for i in range(19) if jcc._bit(m, i)] == [0, 7, 8, 18]
 
 
-def _run_compile_agreement(keys, n_proc, *, launched=None, timeout_s=1.0):
+def _run_compile_agreement(keys, n_proc, *, modules=None, launched=None,
+                           timeout_s=1.0):
     """Run the per-module protocol over ``FakeKV`` with selected ranks."""
     kv = FakeKV(n_proc)
     launched = list(range(n_proc)) if launched is None else list(launched)
@@ -218,7 +219,8 @@ def _run_compile_agreement(keys, n_proc, *, launched=None, timeout_s=1.0):
     def work(rank):
         try:
             jcc._agree_before_module_compile(
-                "jit_test_module", keys[rank], 0, client=kv,
+                (modules or {}).get(rank, "jit_test_module"), keys[rank], 0,
+                client=kv,
                 n_proc=n_proc, proc_idx=rank, timeout_s=timeout_s)
             out[rank] = None
         except BaseException as exc:                         # noqa: BLE001
@@ -253,6 +255,18 @@ def test_per_module_compile_agreement_refuses_and_lists_every_rank_key():
         assert "stalled module 'jit_test_module'" in message
         for rank, key in keys.items():
             assert f"rank {rank}: key={key}" in message
+
+
+def test_compile_agreement_refuses_different_modules_in_one_global_slot():
+    keys = {rank: "a" * 64 for rank in range(4)}
+    modules = {0: "jit_first", 1: "jit_second",
+               2: "jit_first", 3: "jit_second"}
+    out, _ = _run_compile_agreement(keys, 4, modules=modules)
+    for exc in out.values():
+        assert isinstance(exc, jcc.CompileAgreementError)
+        message = str(exc)
+        assert "jit_first" in message
+        assert "jit_second" in message
 
 
 def test_per_module_compile_agreement_refuses_a_missing_rank_by_deadline():
