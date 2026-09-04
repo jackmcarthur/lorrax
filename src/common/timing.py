@@ -31,14 +31,19 @@ from typing import Any, Callable
 # AC.2's 30-minute silent pzheevd, AF.4c's 2 h 55 m silent restart
 # write, the 2.5 h silent c2406 screening stage) pass
 # ``announce=True`` (optionally with a human ``label``) to
-# ``timing.section``.  Same formatting path, same rank-0 gate, no
-# depth cap — ONE cadence mechanism, not two.
+# ``timing.section``.  A collector-owned daemon emits elapsed-wall heartbeats
+# every 60 seconds until the section and its registered async watchers finish.
+# It proves that the Python scope is alive, not that a GPU counter advanced.
+# Same formatting path, same rank-0 gate, no depth cap — ONE cadence mechanism,
+# not two.  Driver-owned announced sections begin after runtime/bootstrap; raw
+# process forks after runtime startup are unsupported throughout LORRAX.
 # ---------------------------------------------------------------------------
 # The knob is read at USE time, not import time: common.timing is
 # imported by essentially every LORRAX CLI.  Use-time reads also let tests
 # and driver wrappers set the shared runtime switch after import.
 _TRACE_RANK0: bool | None = None
 _TRACE_DEPTH = 3
+_ANNOUNCED_HEARTBEAT_SECONDS = 60.0
 
 
 def _trace_flag() -> bool:
@@ -105,6 +110,16 @@ def _trace(msg: str) -> None:
     print(f"[stage {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _safe_trace(msg: str) -> None:
+	"""Best-effort cadence output that can never replace numerical errors."""
+	try:
+		_trace(msg)
+	except Exception:
+		# Closed stdout/captures and diagnostic formatting bugs are not a
+		# reason to abort a calculation or mask a body/watcher exception.
+		pass
+
+
 class TimingNode:
 	__slots__ = ("name", "count", "inclusive", "exclusive", "children")
 
@@ -156,30 +171,25 @@ class TimingSection:
 		        or (self.announce and _rank0()))
 
 	def __enter__(self) -> "TimingSection":
-		self.stack.append(self)
-		if self._cadence_on():
-			_trace("  " * (len(self.stack) - 1) + f"-> {self._display_name()}")
-		self.start = time.perf_counter()
-		self.child_elapsed = 0.0
-		self._watchers = []
-		return self
+		return self.collector._enter(self)
 
 	def __exit__(self, exc_type, exc, tb) -> None:
-		if exc_type is None and self._watchers:
-			for watcher in self._watchers:
-				watcher()
-		end = time.perf_counter()
-		inclusive = end - self.start
-		exclusive = inclusive - self.child_elapsed
-		with self.collector._lock:
-			self.node.record(inclusive, max(0.0, exclusive))
-		if self._cadence_on():
-			_trace("  " * (len(self.stack) - 1)
-			       + f"<- {self._display_name()}  {inclusive:.1f} s"
-			       + ("  [EXC]" if exc_type is not None else ""))
-		self.stack.pop()
-		if self.stack:
-			self.stack[-1].child_elapsed += inclusive
+		# Keep cadence alive while a watcher synchronizes asynchronous JAX work.
+		# Cleanup belongs in ``finally``: a failed ``block_until_ready`` is the
+		# most important time not to leave a false heartbeat behind.
+		watcher_failed = False
+		try:
+			if exc_type is None and self._watchers:
+				for watcher in self._watchers:
+					watcher()
+		except BaseException:
+			watcher_failed = True
+			raise
+		finally:
+			end = time.perf_counter()
+			self.collector._leave(
+				self, end=end,
+				failed=exc_type is not None or watcher_failed)
 		# Do not suppress exceptions
 		return False
 
@@ -210,14 +220,127 @@ class TimingCollector:
 	def __init__(self) -> None:
 		self._root = TimingNode("root")
 		self._lock = threading.RLock()
+		self._heartbeat_condition = threading.Condition(self._lock)
+		self._heartbeat_sections: dict[TimingSection, float] = {}
+		self._heartbeat_thread: threading.Thread | None = None
+		self._active_sections: set[TimingSection] = set()
 		self._local = threading.local()
 
+	def _heartbeat_loop(self) -> None:
+		"""Emit one cadence line per active thread, with atomic ownership.
+
+		The collector lock covers section-stack mutation, deepest-owner choice,
+		and the print itself.  Thus an exit cannot overtake a heartbeat already
+		chosen, and a parent cannot print from a snapshot taken before a nested
+		announced child entered.  The daemon performs no JAX or collective call.
+		"""
+		while True:
+			with self._heartbeat_condition:
+				if not self._heartbeat_sections:
+					self._heartbeat_thread = None
+					return
+				now = time.perf_counter()
+				delay = min(self._heartbeat_sections.values()) - now
+				if delay > 0.0:
+					self._heartbeat_condition.wait(timeout=delay)
+					continue
+
+				due = {section for section, deadline
+				       in self._heartbeat_sections.items() if deadline <= now}
+				for section in due:
+					self._heartbeat_sections[section] = (
+						now + _ANNOUNCED_HEARTBEAT_SECONDS)
+				speakers: list[tuple[int, TimingSection]] = []
+				for section in due:
+					try:
+						index = section.stack.index(section)
+					except ValueError:
+						continue
+					if any(item in self._heartbeat_sections
+					       for item in section.stack[index + 1:]):
+						continue
+					speakers.append((index, section))
+				for index, section in sorted(
+						speakers, key=lambda item: (id(item[1].stack), item[0])):
+					_safe_trace(
+						"  " * index
+						+ f".. {section._display_name()} still running; "
+						+ f"elapsed={now - section.start:.1f} s")
+
+	def _ensure_heartbeat_thread_locked(self) -> None:
+		thread = self._heartbeat_thread
+		if thread is not None and thread.is_alive():
+			return
+		thread = threading.Thread(
+			target=self._heartbeat_loop, name="lorrax-stage-heartbeat",
+			daemon=True)
+		self._heartbeat_thread = thread
+		try:
+			thread.start()
+		except Exception:
+			self._heartbeat_thread = None
+			raise
+
+	def _enter(self, section: TimingSection) -> TimingSection:
+		with self._heartbeat_condition:
+			section.stack.append(section)
+			self._active_sections.add(section)
+			try:
+				if section._cadence_on():
+					_safe_trace("  " * (len(section.stack) - 1)
+					            + f"-> {section._display_name()}")
+				section.start = time.perf_counter()
+				section.child_elapsed = 0.0
+				section._watchers = []
+				if section.announce and _rank0():
+					self._heartbeat_sections[section] = (
+						section.start + _ANNOUNCED_HEARTBEAT_SECONDS)
+					self._ensure_heartbeat_thread_locked()
+					self._heartbeat_condition.notify_all()
+			except BaseException:
+				self._heartbeat_sections.pop(section, None)
+				self._active_sections.discard(section)
+				section.stack.pop()
+				self._heartbeat_condition.notify_all()
+				raise
+		return section
+
+	def _leave(self, section: TimingSection, *, end: float,
+	           failed: bool) -> None:
+		inclusive = end - section.start
+		exclusive = inclusive - section.child_elapsed
+		with self._heartbeat_condition:
+			if not section.stack or section.stack[-1] is not section:
+				raise RuntimeError(
+					"timing sections must exit in last-entered, first-exited order")
+			cadence = section._cadence_on()
+			depth = len(section.stack) - 1
+			self._heartbeat_sections.pop(section, None)
+			self._active_sections.discard(section)
+			section.node.record(inclusive, max(0.0, exclusive))
+			section.stack.pop()
+			if section.stack:
+				section.stack[-1].child_elapsed += inclusive
+			self._heartbeat_condition.notify_all()
+			# State is already clean if the ordinary foreground print sink fails.
+			# Holding the same lock as the scheduler preserves exit ordering.
+			if cadence:
+				_safe_trace("  " * depth
+				            + f"<- {section._display_name()}  {inclusive:.1f} s"
+				            + ("  [EXC]" if failed else ""))
+
 	def reset(self) -> None:
-		with self._lock:
-			self._root = TimingNode("root")
 		stack = getattr(self._local, "stack", None)
-		if stack is not None:
-			stack.clear()
+		with self._lock:
+			if self._active_sections:
+				raise RuntimeError(
+					"cannot reset timing while a section is active")
+			if stack:
+				raise RuntimeError(
+					"cannot reset timing while a section is active")
+			self._root = TimingNode("root")
+			if stack is not None:
+				stack.clear()
 
 	def _stack(self) -> list[TimingSection]:
 		stack = getattr(self._local, "stack", None)
@@ -229,8 +352,9 @@ class TimingCollector:
 	def section(self, name: str, *, announce: bool = False,
 	            label: str | None = None) -> TimingSection:
 		stack = self._stack()
-		parent = stack[-1].node if stack else self._root
-		node = parent.child(name)
+		with self._lock:
+			parent = stack[-1].node if stack else self._root
+			node = parent.child(name)
 		return TimingSection(self, node, stack, announce=announce, label=label)
 
 	def timed(self, name: str | None = None, *, watch: bool = False) -> Callable:
