@@ -163,18 +163,9 @@ def validate_reused_mpa_fit(
         # the producer square mesh's zero-band pad. Reproduce only those exact
         # legacy encodings from the live table; no nonzero occupation can be
         # changed or truncated by ``occupation_digest``.
-        from gw.efermi import occupation_digest
-        logical_nband = int(meta.b_id_4_user)
-        legacy_extents = {
-            ((logical_nband + side * side - 1) // (side * side))
-            * (side * side)
-            for side in range(1, 17)
-        }
-        compatible_hashes = {
-            occupation_digest(
-                occupation_state.f_kn, band_extent=extent)
-            for extent in legacy_extents
-        }
+        from gw.efermi import legacy_square_mesh_occupation_digests
+        compatible_hashes = legacy_square_mesh_occupation_digests(
+            occupation_state.f_kn, int(meta.b_id_4_user))
         occupation_match = mpa_store.assert_occupation_stamps(
             path, occupation_state, where="mpa_fit_reuse_file",
             compatible_occ_hashes=compatible_hashes)

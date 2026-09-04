@@ -1289,6 +1289,25 @@ def compute_sigma_xc(
         from .sigma_box_plan import resolve_sigma_box_cache_dir
         quadrature_cache_dir = resolve_sigma_box_cache_dir(
             config.sigma.quadrature_cache_dir, input_dir)
+        # Read and authenticate the cheap scalar head before the expensive
+        # body sweep.  A certified legacy store can differ only by an exact-
+        # zero square-mesh band pad; the helper reproduces that digest from
+        # the live table rather than trusting artifact metadata.
+        head = mpa_store.read_head_fit_collective(
+            fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+        compatible_occ_hashes = ()
+        if occupation_state is not None:
+            from .efermi import legacy_square_mesh_occupation_digests
+            compatible_occ_hashes = legacy_square_mesh_occupation_digests(
+                occupation_state.f_kn, int(meta.b_id_4_user))
+        from .mpa.sigma import assert_head_body_occupation_match
+        head_occ_match = assert_head_body_occupation_match(
+            head.get("occupation_stamps") or {}, occupation_state,
+            compatible_occ_hashes=compatible_occ_hashes)
+        if head_occ_match == "legacy_zero_pad":
+            print_fn(
+                "  MPA scalar head: occupation provenance matched an exact "
+                "legacy square-mesh zero-pad encoding.")
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
@@ -1313,13 +1332,6 @@ def compute_sigma_xc(
                 None if fixed_quadrature_session is None else
                 fixed_quadrature_session.setdefault("mpa", {})),
             print_fn=print_fn)
-        head = mpa_store.read_head_fit_collective(
-            fit_path, mesh_xy=mesh_xy, to_unit="Ry")
-        # One occupation state per iteration: head fit vs body (skips when
-        # occupation_state is None; refuses an unstamped head under metal).
-        from .mpa.sigma import assert_head_body_occupation_match
-        assert_head_body_occupation_match(
-            head.get("occupation_stamps") or {}, occupation_state)
         if iteration_head is None:
             sigma_bands = wfns.slices.sigma
             head_enk = np.asarray(wfns.enk[:, sigma_bands])
