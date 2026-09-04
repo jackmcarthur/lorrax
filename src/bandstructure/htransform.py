@@ -627,7 +627,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
 
     @partial(jax.jit,
              in_shardings=(coeff_x, coeff_y, rep_),
-             out_shardings=(flat_xy, rep_, rep_, rep_))
+             out_shardings=flat_xy)
     def _build_fH_k(ctilde_i, ctilde_j, f_eps_in):
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
@@ -644,14 +644,23 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         # consumer seam, as it was before this placement repair.
         # The paired input views already place m on x and n on y, so this is
         # the natural output layout and no full rank-by-rank product exists.
-        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
+        return jax.lax.with_sharding_constraint(fH_k, flat_xy)
 
+    @partial(jax.jit,
+             in_shardings=(coeff_x, rep_, rep_),
+             out_shardings=(rep_, rep_, rep_))
+    def _fH_state_receipt(ctilde_i, f_eps_in, enk_in):
+        """Recover one bounded k chunk in the nb-by-nb state space."""
+        f_eps_T = f_eps_in.T
+        f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
+        bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
+        weighted_i = ctilde_i * bw[..., None]
         # The rank-by-rank fH eigensolve is not needed to certify its coarse
         # spectrum.  If A = sqrt(-f(eps)) C, the nonzero eigenvalues of
         # -A^H A are exactly those of the much smaller -A A^H.  This checks
-        # every coarse k in the nb-by-nb state space while the weighted rows
-        # are already live, rather than compiling a rank-by-rank Gamma-only
-        # eigensolve beside the production batched eigensolver.
+        # every coarse k in the nb-by-nb state space.  The caller streams k
+        # chunks so the syevBatched workspace never overlaps a dense-grid
+        # rank-by-rank operator.
         small_fH = -jnp.einsum(
             'kim,kjm->kij', weighted_i, jnp.conj(weighted_i), optimize=True)
         small_fH = 0.5 * (small_fH + jnp.swapaxes(small_fH, -1, -2).conj())
@@ -662,9 +671,9 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             a_f, n_f, shift, recovered_f.real)
         energy_recovery_error = jnp.max(
             jnp.abs(jnp.sort(recovered_e, axis=1)
-                    - jnp.sort(enk_sigma.T, axis=1)))
-        return (fH_k, f_recovery_error,
-                energy_recovery_error, jnp.max(inverse_residual))
+                    - jnp.sort(enk_in.T, axis=1)))
+        return (f_recovery_error, energy_recovery_error,
+                jnp.max(inverse_residual))
 
     @partial(jax.jit,
              in_shardings=flat_xy,
@@ -785,6 +794,26 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
         f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
+    # Certify the complete coarse spectrum before any dense-grid operator is
+    # live.  The incumbent one-shot 5184-way syevBatched needed an 11.29-GiB
+    # workspace beside a 13.18-GiB fH output on MoS2-72.  Chunking only the
+    # independent k batch is algebraically exact and bounds that workspace.
+    state_k_chunk = 256
+    f_recovery_error = 0.0
+    energy_recovery_error = 0.0
+    inverse_residual = 0.0
+    for k_start in range(0, int(ctilde.shape[0]), state_k_chunk):
+        k_stop = min(int(ctilde.shape[0]), k_start + state_k_chunk)
+        chunk_receipts = jax.device_get(_fH_state_receipt(
+            ctilde_x[k_start:k_stop], f_eps[:, k_start:k_stop],
+            enk_sigma[:, k_start:k_stop]))
+        f_recovery_error = max(f_recovery_error,
+                               float(chunk_receipts[0]))
+        energy_recovery_error = max(energy_recovery_error,
+                                    float(chunk_receipts[1]))
+        inverse_residual = max(inverse_residual,
+                               float(chunk_receipts[2]))
+
     # The inverse FFI aliases each dead k-space carrier.  For the value-level
     # receipt, forward-transform bounded local matrix-row slabs and compare
     # them directly with the Galerkin formula.  This covers every tile without
@@ -802,9 +831,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         active_R = None
         active_fft_rel = 0.0
 
-    (fH_k, f_recovery_error,
-     energy_recovery_error, inverse_residual) = _build_fH_k(
-         ctilde_x, ctilde_y, f_eps)
+    fH_k = _build_fH_k(ctilde_x, ctilde_y, f_eps)
     fH_R = _ifft_operator_donated(fH_k)
     del fH_k
     fft_rel = _relative_from_abs_scale(
