@@ -124,6 +124,113 @@ class ConvergenceVerdict:
 
 
 @dataclass(frozen=True)
+class SCMapGain:
+    """Adjacent-map response of on-shell correlation Sigma to input E.
+
+    The gain is the ratio of the two L-infinity changes over the current
+    map's non-scissored set.  ``worst_k``/``worst_band`` locate the state
+    attaining the numerator.  This is an output-only diagnostic: no SC
+    decision, damping, or refusal reads it (TASTE 59).
+    """
+
+    gain: float
+    max_dsigma_mev: float
+    max_de_mev: float
+    worst_k: int
+    worst_band: int
+    worst_de_mev: float
+
+    def summary(self) -> str:
+        """Return the stable one-line SC log spelling."""
+        return (
+            "SC map gain: max |dSigma_on-shell| / max |dE_in| = "
+            f"{self.gain:.6g} (worst k={self.worst_k} "
+            f"band={self.worst_band}: dSigma={self.max_dsigma_mev:.6f} meV "
+            f"/ dE={self.worst_de_mev:.6f} meV)")
+
+    def stamp(self) -> str:
+        """Return the machine-readable eqp-iteration comment."""
+        return (
+            f"sc_map_gain={self.gain:.12e}; "
+            f"max_abs_dSigma_on_shell_mev={self.max_dsigma_mev:.12e}; "
+            f"max_abs_dE_in_mev={self.max_de_mev:.12e}; "
+            f"worst_k={self.worst_k}; worst_band_1based={self.worst_band}; "
+            f"worst_state_abs_dE_in_mev={self.worst_de_mev:.12e}")
+
+
+def measure_sc_map_gain(
+    e_input_ev: np.ndarray,
+    sigma_on_shell_ev: np.ndarray,
+    previous_e_input_ev: np.ndarray,
+    previous_sigma_on_shell_ev: np.ndarray,
+    non_scissored_mask: np.ndarray,
+    *,
+    band_offset: int = 0,
+) -> SCMapGain:
+    """Measure the adjacent SC-map gain on host arrays.
+
+    Parameters
+    ----------
+    e_input_ev, previous_e_input_ev
+        ``(nk, nb)`` map-input eigenvalues in eV.
+    sigma_on_shell_ev, previous_sigma_on_shell_ev
+        ``(nk, nb)`` complex correlation self-energy evaluated by the two
+        consecutive maps, in eV.  The SC driver passes its retained
+        ``SigmaResult.sigma_c_at_dft_diag_ev`` tables, matching the
+        2026-09-03 SCDIAG/METALSC definition.
+    non_scissored_mask
+        ``(nb,)`` bool, the current map's ``protected | in_range`` set.
+    band_offset
+        Zero-based offset of the active Sigma window in the WFN band table.
+
+    Returns
+    -------
+    SCMapGain
+        Output-only gain and its numerator-owning state.  A zero input
+        motion yields ``nan`` rather than manufacturing contraction.
+    """
+    e_now = np.asarray(e_input_ev, dtype=np.float64)
+    e_prev = np.asarray(previous_e_input_ev, dtype=np.float64)
+    sigma_now = np.asarray(sigma_on_shell_ev, dtype=np.complex128)
+    sigma_prev = np.asarray(
+        previous_sigma_on_shell_ev, dtype=np.complex128)
+    if not (e_now.shape == e_prev.shape == sigma_now.shape
+            == sigma_prev.shape):
+        raise ValueError(
+            "measure_sc_map_gain: consecutive E/Sigma tables must have the "
+            f"same (k, band) shape; got E={e_now.shape}/{e_prev.shape}, "
+            f"Sigma={sigma_now.shape}/{sigma_prev.shape}.")
+    mask = np.asarray(non_scissored_mask, dtype=bool).reshape(-1)
+    if mask.shape != (e_now.shape[1],):
+        raise ValueError(
+            "measure_sc_map_gain: non_scissored_mask has shape "
+            f"{mask.shape}, expected ({e_now.shape[1]},).")
+    if not mask.any():
+        raise ValueError(
+            "measure_sc_map_gain: the non-scissored set is empty; the map "
+            "gain is undefined.")
+
+    de = np.abs(e_now[:, mask] - e_prev[:, mask])
+    dsigma = np.abs(sigma_now[:, mask] - sigma_prev[:, mask])
+    max_de_ev = float(np.max(de))
+    flat = int(np.argmax(dsigma))
+    worst_k, worst_column = divmod(flat, dsigma.shape[1])
+    active_columns = np.flatnonzero(mask)
+    worst_band = int(band_offset + active_columns[worst_column] + 1)
+    max_dsigma_ev = float(dsigma[worst_k, worst_column])
+    gain = (max_dsigma_ev / max_de_ev
+            if max_de_ev > 0.0 else float("nan"))
+    return SCMapGain(
+        gain=gain,
+        max_dsigma_mev=max_dsigma_ev * 1.0e3,
+        max_de_mev=max_de_ev * 1.0e3,
+        worst_k=worst_k,
+        worst_band=worst_band,
+        worst_de_mev=float(de[worst_k, worst_column]) * 1.0e3,
+    )
+
+
+@dataclass(frozen=True)
 class FixedSigmaEVSCResult:
     """Converged fixed-Sigma eigenvalue-self-consistent QP ladder.
 
@@ -3671,6 +3778,37 @@ def _band_ranges(mask, *, band_offset: int) -> str:
         str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
 
 
+def _sc_map_gain_for_call(
+    inputs: SCInputs,
+    state_out: SCState,
+    e_input_ev: np.ndarray,
+    previous: tuple[np.ndarray, np.ndarray] | None,
+) -> tuple[SCMapGain | None, tuple[np.ndarray, np.ndarray] | None]:
+    """Measure one adjacent-map gain and retain its small host inputs."""
+    sigma_result = getattr(state_out.outputs, "sigma_result", None)
+    sigma_on_shell = getattr(
+        sigma_result, "sigma_c_at_dft_diag_ev", None)
+    # Static self-consistent modes have no dynamic Sigma-c table.  Preserve
+    # their historical path; this diagnostic is defined for the dynamic
+    # QSGW maps studied in pitfall 13.
+    if sigma_on_shell is None:
+        return None, None
+    current = (
+        np.asarray(e_input_ev, dtype=np.float64).copy(),
+        np.asarray(sigma_on_shell, dtype=np.complex128).copy(),
+    )
+    if previous is None:
+        return None, current
+    partition = _state_partition(state_out, inputs)
+    non_scissored = (
+        np.asarray(partition.protected_mask, dtype=bool).reshape(-1)
+        | np.asarray(partition.in_range_mask, dtype=bool).reshape(-1))
+    diagnostic = measure_sc_map_gain(
+        current[0], current[1], previous[0], previous[1], non_scissored,
+        band_offset=int(inputs.band_slices.sigma.start))
+    return diagnostic, current
+
+
 def _write_sc_eqp_snapshot(
     inputs: SCInputs,
     state_out: SCState,
@@ -3682,6 +3820,7 @@ def _write_sc_eqp_snapshot(
     rms2_ev: float,
     prev_output_role: str,
     verdict: ConvergenceVerdict,
+    map_gain: SCMapGain | None,
 ) -> str | None:
     """Write one small BGW-shaped record of a completed SC map call.
 
@@ -3811,7 +3950,7 @@ def _write_sc_eqp_snapshot(
 
     active_fit = state_out.outputs.scissor_fit
     tail_fit = state_out.outputs.tail_scissor_fit
-    comments = (
+    comments = [
         f"SC map={int(call_index):04d} role={role}; columns are "
         "E_DFT reference and eigvalsh(F(H_in)) map output; rCROP trial "
         "outputs are not accepted iterates",
@@ -3843,7 +3982,10 @@ def _write_sc_eqp_snapshot(
             f"{tail_fit.beta_c_ev:+.10e} eV; "
             f"n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
             f"rmse={tail_fit.rmse_c_ev:.10e} eV")),
-    )
+    ]
+    if map_gain is not None:
+        comments.insert(2, map_gain.stamp())
+    comments = tuple(comments)
     path = os.path.join(
         inputs.input_dir, f"eqp0_iter{int(call_index):04d}.dat")
     write_bgw_eqp(
@@ -3876,6 +4018,8 @@ def _write_sc_eqp_snapshot(
     _record_sc(inputs, f"  SC map eqp1: {eqp1_path}")
     if rotation_path is not None:
         _record_sc(inputs, f"  SC map rotation: {rotation_path}")
+    if map_gain is not None:
+        _record_sc(inputs, map_gain.summary())
     _record_sc(
         inputs,
         f"    SC iteration: call={int(call_index):04d} role={role} "
@@ -3995,6 +4139,7 @@ def run_self_consistency(
             # stops it being read as a convergence residual.
             prev_output_role="dft_seed",
             verdict=verdict,
+            map_gain=None,
         )
         _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         return state_new, []
@@ -4043,6 +4188,7 @@ def _run_linear_mixing(
     #: under ``mixing != 1`` those are two different sequences and the file
     #: was stamped from the wrong one.
     _out_history: list[np.ndarray] = [E_prev_ev.copy()]
+    gain_previous: tuple[np.ndarray, np.ndarray] | None = None
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
@@ -4127,12 +4273,15 @@ def _run_linear_mixing(
         cand_rms2 = (
             float(np.sqrt(np.mean((E_candidate_ev - _out_history[-3]) ** 2)))
             if len(_out_history) >= 3 else float("nan"))
+        map_gain, gain_previous = _sc_map_gain_for_call(
+            inputs, state_map, E_prev_ev, gain_previous)
         _write_sc_eqp_snapshot(
             inputs, state_map, E_candidate_ev,
             call_index=it, role="linear",
             rms_ev=cand_rms, rms2_ev=cand_rms2,
             prev_output_role=("dft_seed" if it == 0 else "linear"),
             verdict=verdict,
+            map_gain=map_gain,
         )
         _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         last_evaluated = replace(
@@ -4323,6 +4472,7 @@ def _run_rcrop(
     _iter_idx = [0]
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
+    _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -4397,6 +4547,8 @@ def _run_rcrop(
                     "trial" if idx % 2 else "accepted_input_map")
 
         role = _role_of(call_index)
+        map_gain, _gain_previous[0] = _sc_map_gain_for_call(
+            inputs, state_out, E_in, _gain_previous[0])
         _write_sc_eqp_snapshot(
             inputs, state_out, E_new,
             call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
@@ -4410,6 +4562,7 @@ def _run_rcrop(
             prev_output_role=("dft_seed" if call_index == 0
                               else _role_of(call_index - 1)),
             verdict=_verdict,
+            map_gain=map_gain,
         )
         _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
         _iter_idx[0] += 1
@@ -5773,6 +5926,7 @@ def dump_qp_wfn_artifacts(
 
 
 __all__ = [
+    "SCMapGain",
     "FixedSigmaEVSCResult",
     "SCInputs",
     "SCOutputs",
@@ -5780,6 +5934,7 @@ __all__ = [
     "gw_iteration_map",
     "load_head_velocity_source",
     "make_initial_state_from_dft",
+    "measure_sc_map_gain",
     "run_self_consistency",
     "run_sc_driver",
     "run_fixed_sigma_evsc",
