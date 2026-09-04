@@ -4552,7 +4552,8 @@ def _factor_c_q_replicated_qparallel(
 # no factor stage to schedule.  The functions below hoist the factor so
 # the transverse channels have the SAME two plans as the charge family:
 #
-# * LOCAL plan ('lu') — per-q pivoted LU on the whole ridged LOGICAL
+# * LOCAL plan ('lu', including the ``batch_reshard`` execution selected by
+#   a provider LU kind) — per-q pivoted LU on the whole ridged LOGICAL
 #   tile, computed ONCE per channel (q-parallel over devices at P>1 under
 #   the charge fold's policy), stored as (LU, perm) with the LU factors
 #   identity-re-embedded at the padded extent so every downstream gather
@@ -5643,33 +5644,40 @@ def factor_c_q(
                 distrib_la_batched_route=distrib_la_batched_route), None
         if t_kind in ('scalapack_lu', 'cusolvermp_lu'):
             # A block-cyclic token cannot enter distrib_la's face-to-batch
-            # schedule.  Keep raw CCT so solve_zeta can use that plan-shaped
-            # route, adding the accepted materialized trace ridge once.  This
-            # refactors each chunk, trading small n_mu_T^3 work for avoiding
-            # the latency-heavy world-grid getrs sequence.
+            # schedule.  Factor ONCE with the existing local-JAX kernel and
+            # keep its (LU, pivots) across r chunks.  The former route kept
+            # raw C here and called the fused factor+solve plan in every
+            # r chunk: 3*(J-1)*Q*(8/3)*mu_T^3 avoidable real FLOPs across the
+            # three transverse channels, including factors of phantom q
+            # rows.  The local kernel is the arithmetic that route already
+            # used after face-to-batch movement, so this changes lifetime,
+            # not numerics.
             if distrib_la_batched_route == 'batch_reshard':
                 if jax.process_index() == 0:
-                    print("  [zeta transverse ridge] batch_reshard keeps "
-                          "the raw CCT; factor+solve runs per r-chunk after "
-                          "face-to-batch movement", flush=True)
-                return C_q, None
-            # The factor is an opaque FactorToken with no public buffer, so
-            # the |diag U| instrument cannot reach it.  Say that rather than
-            # skipping silently: an unmeasured path and a clean one must not
-            # look alike in a log.
-            if jax.process_index() == 0:
-                print(f"  [zeta transverse ridge ({t_kind})] conditioning "
-                      "NOT MEASURED: the block-cyclic provider LU factor is "
-                      "inside a FactorToken with no public buffer, so the "
-                      "|diag U| kappa bound is unreachable here.  That is an "
-                      "absence, not a pass — use transverse_zeta_solve = "
-                      "rank_truncate for a route whose conditioning is "
-                      "bounded by construction.", flush=True)
-            return _factor_c_q_transverse_distributed_lu(
-                C_q, mesh_xy, n_rmu_logical,
-                backend=('scalapack' if t_kind == 'scalapack_lu'
-                         else 'cusolvermp'),
-                trace_per_q=transverse_trace_per_q), None
+                    print("  [zeta transverse ridge] batch_reshard hoists "
+                          f"the local-JAX LU: {nq} factorization(s) once per "
+                          "channel; 0 factorizations/r-chunk; "
+                          f"{nq} lu_solve application(s)/r-chunk", flush=True)
+                t_kind = 'lu'
+            else:
+                # The factor is an opaque FactorToken with no public buffer,
+                # so the |diag U| instrument cannot reach it.  Say that rather
+                # than skipping silently: an unmeasured path and a clean one
+                # must not look alike in a log.
+                if jax.process_index() == 0:
+                    print(f"  [zeta transverse ridge ({t_kind})] conditioning "
+                          "NOT MEASURED: the block-cyclic provider LU factor "
+                          "is inside a FactorToken with no public buffer, so "
+                          "the |diag U| kappa bound is unreachable here.  "
+                          "That is an absence, not a pass — use "
+                          "transverse_zeta_solve = rank_truncate for a route "
+                          "whose conditioning is bounded by construction.",
+                          flush=True)
+                return _factor_c_q_transverse_distributed_lu(
+                    C_q, mesh_xy, n_rmu_logical,
+                    backend=('scalapack' if t_kind == 'scalapack_lu'
+                             else 'cusolvermp'),
+                    trace_per_q=transverse_trace_per_q), None
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
@@ -5934,15 +5942,14 @@ def solve_zeta(
     invalid and the factor is a pivoted LU with a small diagonal ridge
     ``ε·|tr(C_log)|/n_log`` (ε = :data:`_TRANSVERSE_LU_RIDGE`).  Since
     the 2026-08 hoist ``factor_c_q`` computes that LU ONCE per channel on
-    the ordinary local plan: ``L_q`` carries the packed factors and
+    the local plan (including provider selection with ``batch_reshard``):
+    ``L_q`` carries the packed factors and
     ``lu_piv`` the permutation, and this routine only APPLIES them per
     r-chunk (``lax.linalg.lu_solve`` — bit-identical to the fused
     ``jnp.linalg.solve``).  On the ScaLAPACK and cuSOLVERMp plans ``L_q``
     is instead a :class:`distrib_la.FactorToken`, which carries the
     block-cyclic factors and rank-private pivots; this module never opens
-    that token.  The explicit local ``batch_reshard`` route is different:
-    ``factor_c_q`` keeps the raw CCT and its trace, and this routine performs
-    the local factor+solve after face-to-batch movement in each r-chunk.
+    that token.
     Bunch-Kaufman LDL^T would be the natural Hermitian-
     indefinite factorization but JAX doesn't expose it; pivoted LU is
     numerically equivalent for our purposes.
@@ -6029,6 +6036,18 @@ def solve_zeta(
     mu_pad = n_rmu - n_log
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
+
+    # ``factor_c_q`` deliberately answers a provider LU request with the
+    # local-JAX (LU, pivots) pair when batch_reshard is selected: the provider
+    # token has a block-cyclic lifetime and cannot cross that route, whereas
+    # the JAX factor can be retained across r chunks.  Normalize the already
+    # resolved provider name at this seam so the remainder takes the ordinary
+    # hoisted lu_solve path.  A non-None pivot vector is the unambiguous tag;
+    # provider tokens keep their pivots opaque and were handled above.
+    if (lu_piv is not None
+            and solver_kind in ('cusolvermp_lu', 'scalapack_lu')
+            and distrib_la_batched_route == 'batch_reshard'):
+        solver_kind = 'lu'
 
     if isinstance(L_q, FactorToken):
         # THE LIBRARY-HANDLE ROUTES, now one branch.  ``factor_c_q``
