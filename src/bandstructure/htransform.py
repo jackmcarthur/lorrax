@@ -567,7 +567,6 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                    scalars to the host.
 
     Returns:
-        fH_k:    (nk_co, rank, rank), sharded P(None, 'x', 'y').
         fH_R:    (nk_co, rank, rank), sharded P(None, 'x', 'y') (lattice-R index).
         params:  (a_f, n_f, shift) — for ``newton_inv`` on the eigvals of fH_q.
         f_eps:   (nb, nk_co) f-transformed eigenvalues, replicated.
@@ -636,11 +635,13 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_k = -jnp.einsum(
             'kim,kin->kmn', weighted_i, jnp.conj(weighted_j),
             optimize=True)
-        # Constrain the contraction output, not just the hermitized copy.
+        # Constrain the contraction output.  The Gram product is Hermitian by
+        # construction; explicitly adding its distributed transpose used to
+        # materialize another full dense-grid operator without changing the
+        # mathematical result.  Fine-q reconstruction is Hermitized at its
+        # consumer seam, as it was before this placement repair.
         # The paired input views already place m on x and n on y, so this is
         # the natural output layout and no full rank-by-rank product exists.
-        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
-        fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
 
         # The rank-by-rank fH eigensolve is not needed to certify its coarse
@@ -671,16 +672,49 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         return local_ifftn(operator_k)
 
     @partial(jax.jit,
+             in_shardings=flat_xy,
+             out_shardings=flat_xy,
+             donate_argnums=(0,))
+    def _ifft_operator_donated(operator_k):
+        """Transform a dead k-space carrier in its reusable buffer."""
+        return local_ifftn(operator_k)
+
+    @partial(jax.jit,
              in_shardings=(flat_xy, flat_xy),
-             out_shardings=rep_)
-    def _fft_roundtrip_relative(operator_R, operator_k):
-        """Reduce the canonical FFT receipt without gathering matrix tiles."""
+             out_shardings=(rep_, rep_))
+    def _fft_roundtrip_abs_scale(operator_R, operator_k):
+        """Reduce one row slab of the canonical FFT receipt to scalars."""
         fft_roundtrip_abs = jnp.max(
             jnp.abs(local_fftn(operator_R) - operator_k))
         fft_scale = jnp.max(jnp.abs(operator_k))
-        return jnp.where(
-            fft_scale > 0.0, fft_roundtrip_abs / fft_scale,
-            fft_roundtrip_abs)
+        return fft_roundtrip_abs, fft_scale
+
+    def _fft_roundtrip_relative(operator_R, operator_k):
+        """Certify every matrix tile with bounded row-slab workspaces.
+
+        The FFT acts only on the leading flat-k axis, so partitioning a matrix
+        axis is algebraically exact.  Sixteen sequential, x-divisible row
+        slabs retain the incumbent value-level all-tile receipt while bounding
+        its alias-protection/output workspace.  This is essential once one
+        dense-grid operator occupies 11--14 GiB per device.
+        """
+        rank = int(operator_R.shape[-2])
+        rows = _pad_to(mesh_xy, 'x', max(1, (rank + 15) // 16))
+        fft_roundtrip_abs = 0.0
+        fft_scale = 0.0
+        for start in range(0, rank, rows):
+            stop = min(rank, start + rows)
+            operator_R_slab = jax.device_put(
+                operator_R[:, start:stop, :], flat_xy)
+            operator_k_slab = jax.device_put(
+                operator_k[:, start:stop, :], flat_xy)
+            slab_abs, slab_scale = _fft_roundtrip_abs_scale(
+                operator_R_slab, operator_k_slab)
+            slab_abs, slab_scale = jax.device_get((slab_abs, slab_scale))
+            fft_roundtrip_abs = max(fft_roundtrip_abs, float(slab_abs))
+            fft_scale = max(fft_scale, float(slab_scale))
+        return (fft_roundtrip_abs / fft_scale
+                if fft_scale > 0.0 else fft_roundtrip_abs)
 
     @partial(jax.jit,
              in_shardings=(coeff_x, coeff_y),
@@ -691,9 +725,6 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         active_k = jnp.einsum(
             'kim,kin->kmn', active_rows_i, jnp.conj(active_rows_j),
             optimize=True)
-        active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
-        active_k = 0.5 * (
-            active_k + jnp.swapaxes(active_k, -1, -2).conj())
         active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
         return active_k
 
@@ -715,19 +746,18 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
     # The FFI FFT aliases its input buffer when that input is dead.  A receipt
-    # applied to a returned operator therefore needs one alias-protection copy
-    # of the local matrix shard.  Build and certify the active operator first,
-    # then release its k-space carrier before constructing fH.  Each receipt
-    # stays in its scalar-only executable and is forced before the next
-    # rank-by-rank operator: at no point can their construction or receipt
-    # workspaces overlap.  The max reductions remain SPMD reductions over
-    # P(None, 'x', 'y'); only a scalar is replicated or transferred to host.
+    # applied to a retained operator therefore needs alias protection.  Build
+    # and certify the active operator, release both of its large carriers,
+    # then build and certify fH.  Finally reconstruct active_R through the
+    # already-certified identical route.  The extra active contraction is
+    # cheaper than retaining a third 11--14-GiB operator beside a receipt.
+    # Each value-level receipt covers every tile in bounded row slabs; only
+    # two scalar maxima are replicated or transferred to the host.
     if active_band_range is not None:
         active_k = _build_active_k(ctilde_x, ctilde_y)
         active_R = _ifft_operator(active_k)
-        active_fft_rel = float(
-            _fft_roundtrip_relative(active_R, active_k))
-        del active_k
+        active_fft_rel = _fft_roundtrip_relative(active_R, active_k)
+        del active_k, active_R
     else:
         active_R = None
         active_fft_rel = 0.0
@@ -736,7 +766,14 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
      energy_recovery_error, inverse_residual) = _build_fH_k(
          ctilde_x, ctilde_y, f_eps)
     fH_R = _ifft_operator(fH_k)
-    fft_rel = float(_fft_roundtrip_relative(fH_R, fH_k))
+    fft_rel = _fft_roundtrip_relative(fH_R, fH_k)
+    del fH_k
+    if active_band_range is not None:
+        active_k = _build_active_k(ctilde_x, ctilde_y)
+        active_R = _ifft_operator_donated(active_k)
+        jax.block_until_ready(active_R)
+        del active_k
+    del ctilde_x, ctilde_y
     log_fn(
         f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
         f"round-trip scale-relative max|FFT(IFFT(fH))-fH|="
@@ -787,7 +824,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             "r_vectors": int(_outer_shell.size),
             "locality_wall_seconds": float(_quality_clock() - _quality_t0),
         })
-    return (fH_k, fH_R, (a_f, n_f, shift), f_eps, active_R)
+    return (fH_R, (a_f, n_f, shift), f_eps, active_R)
 
 
 NEWTON_RESIDUAL_MAX = 1.0e-12
@@ -1474,12 +1511,12 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
 
     _t0 = _perf()                                          # instrument:
     coeffs = ctilde.reshape(nk, states, rank)
-    fH_k, fH_R, (a_f, n_f, shift), f_eps, active_R = build_fH_R(
+    fH_R, (a_f, n_f, shift), f_eps, active_R = build_fH_R(
         coeffs, enk_sigma, kgrid, mesh_xy,
         a_band_index=a_band_index,
         active_band_range=active_band_range, log_fn=log_fn,
         quality_record_fn=quality_record_fn)
-    jax.block_until_ready((fH_k, fH_R, f_eps, active_R))   # instrument:
+    jax.block_until_ready((fH_R, f_eps, active_R))         # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
 
     # The top of the fit window is identically invisible to fH at the k where
@@ -1492,11 +1529,6 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     _f_shoulder_gate(
         f_eps, 0, nb_keep, shift, log_fn, rank=rank,
         where="htransform")
-    # The path solve consumes ``fH_R`` alone.  Release the coarse-grid image
-    # before its q-batched matrices are allocated (576 MiB at the reference
-    # 64 x 768 x 768 complex128 shape).
-    del fH_k
-
     _t0 = _perf()                                          # instrument:
     # The selected-state Cholesky basis is orthonormal by construction.  There
     # is no separately mutable metric: carrying a dense identity S was a

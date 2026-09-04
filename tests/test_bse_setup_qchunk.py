@@ -330,8 +330,8 @@ def test_use_low_mem_eigh_refuses_rather_than_running_native(monkeypatch):
         nk = int(np.prod(kgrid_co))
         rank = int(ctilde.shape[-1])
         nb = int(enk_sigma.shape[0])
-        return (None, jnp.zeros((nk, rank, rank), dtype=ctilde.dtype),
-                (1.0, 2.0, 1.0), -np.ones((nb, nk), dtype=np.float64))
+        return (jnp.zeros((nk, rank, rank), dtype=ctilde.dtype),
+                (1.0, 2.0, 1.0), -np.ones((nb, nk), dtype=np.float64), None)
 
     monkeypatch.setattr(setup, "build_fH_R", _fH_without_fft)
     with pytest.raises(RuntimeError) as exc:
