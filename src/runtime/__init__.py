@@ -163,6 +163,7 @@ __all__ = [
     "format_production_startup_report",
     "bootstrap",
     "set_default_env",
+    "set_default_xla_gpu_autotune",
     "announce_cpu_collectives",
     "skip_gpu_plugin_discovery",
     "init_jax_distributed",
@@ -428,6 +429,97 @@ def install_failfast_excepthook() -> None:
 _X64_ENV = "JAX_ENABLE_X64"
 X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
 
+#: XLA's GPU autotuner level is a compile-time environment choice.  Keep its
+#: name and default beside the other environment defaults rather than in a
+#: driver or site script: every driver must make the same decision before its
+#: first JAX backend exists, while a deployment-provided value must win.
+_XLA_FLAGS_ENV = "XLA_FLAGS"
+_XLA_GPU_AUTOTUNE_FLAG = "--xla_gpu_autotune_level"
+_XLA_GPU_AUTOTUNE_DEFAULT = "0"
+
+#: Receipt captured at the ONE interpretation site below.  Startup reporting
+#: consumes this record; it must not re-parse ``XLA_FLAGS`` and risk printing
+#: a value different from the one startup actually resolved.
+_XLA_GPU_AUTOTUNE = {
+    "value": None,
+    "provenance": "runtime.set_default_env has not run",
+    "applicable": None,
+    "xla_flags": None,
+}
+
+
+def _xla_flag_value(raw: str, flag: str) -> str | None:
+    """Return the last caller-supplied value of one whitespace XLA flag.
+
+    XLA accepts both ``--name=value`` and ``--name value``.  The environment
+    has no shell quoting stage by the time jaxlib reads it, so splitting on
+    whitespace mirrors the consumer and, importantly, preserves the original
+    string when the flag is already present.  A valueless ``--name`` returns
+    ``"<missing>"``: it is still a caller request and must not be silently
+    repaired into LORRAX's default before XLA can report the malformed flag.
+    """
+    tokens = (raw or "").split()
+    values = []
+    for i, token in enumerate(tokens):
+        if token.startswith(flag + "="):
+            values.append(token.split("=", 1)[1])
+        elif token == flag:
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                values.append(tokens[i + 1])
+            else:
+                values.append("<missing>")
+    return values[-1] if values else None
+
+
+def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
+    """Merge LORRAX's measured GPU autotune level into ``XLA_FLAGS``.
+
+    The cold P=4 compile matrix measured ``level=0`` 12.9% faster for kmeans
+    and 16.3% faster for the Si MPA Sigma one-shot, with execution inside
+    run-to-run noise (sandbox claims 683--684).  This is a GPU-only XLA flag:
+    a forced CPU startup leaves ``XLA_FLAGS`` byte-for-byte unchanged so the
+    host/FFTW chain never depends on a GPU parser accepting it.
+
+    Caller policy always wins.  If either accepted spelling is already
+    present, this function neither rewrites nor appends anything and records
+    the last value as caller provenance.  Otherwise it appends exactly one
+    ``--xla_gpu_autotune_level=0`` token, preserving every unrelated flag.
+    The returned dict is a copy of the receipt the startup report consumes.
+    """
+    if platform not in ("gpu", "cpu"):
+        raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
+
+    raw = os.environ.get(_XLA_FLAGS_ENV, "")
+    supplied = _xla_flag_value(raw, _XLA_GPU_AUTOTUNE_FLAG)
+    if platform == "cpu":
+        _XLA_GPU_AUTOTUNE.update({
+            "value": supplied,
+            "provenance": (
+                "caller-supplied XLA_FLAGS; GPU-only and inactive on this "
+                "forced CPU startup" if supplied is not None else
+                "not applied: forced CPU startup"),
+            "applicable": False,
+            "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
+        })
+        return dict(_XLA_GPU_AUTOTUNE)
+
+    if supplied is None:
+        addition = f"{_XLA_GPU_AUTOTUNE_FLAG}={_XLA_GPU_AUTOTUNE_DEFAULT}"
+        merged = f"{raw} {addition}".strip() if raw else addition
+        os.environ[_XLA_FLAGS_ENV] = merged
+        value = _XLA_GPU_AUTOTUNE_DEFAULT
+        provenance = "LORRAX default (runtime.set_default_env)"
+    else:
+        value = supplied
+        provenance = "caller-supplied XLA_FLAGS"
+    _XLA_GPU_AUTOTUNE.update({
+        "value": value,
+        "provenance": provenance,
+        "applicable": True,
+        "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
+    })
+    return dict(_XLA_GPU_AUTOTUNE)
+
 
 def _x64_requested():
     """:data:`_X64_ENV` read through **jax's own** grammar; ``None`` if unset.
@@ -641,6 +733,10 @@ def set_default_env(*, platform: str = "gpu") -> None:
     _check_allocator_env()
     tune_glibc_malloc()
     skip_gpu_plugin_discovery()
+    resolved_platforms = os.environ.get("JAX_PLATFORMS", "")
+    xla_platform = (
+        "cpu" if platform == "cpu" or resolved_platforms == "cpu" else "gpu")
+    set_default_xla_gpu_autotune(platform=xla_platform)
 
 
 #: The four values jaxlib accepts for ``XLA_PYTHON_CLIENT_ALLOCATOR``.
@@ -1550,6 +1646,10 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        progress setting is only a request; this is the check that it worked.
        It must precede clique construction because XLA can issue collectives
        from executor threads.
+    5d. ``install_compile_agreement`` -- installs the cross-rank module-key
+       refusal after the live coordination client and supported JAX surface
+       exist, but before the mesh warmup performs the first compile.  A
+       rank-divergent warmup is therefore covered rather than grandfathered.
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -1628,6 +1728,9 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     _enforce_supported_jax(say)
     # -- 5c -----------------------------------------------------------------
     _enforce_cpu_mpi_thread_multiple(say)
+    # -- 5d -----------------------------------------------------------------
+    from common.jax_compile_cache import install_compile_agreement
+    install_compile_agreement()
     _t_boot = time.perf_counter()
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh
@@ -2300,6 +2403,7 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     # silently unmeasurable.
     f["matmul_precision"] = read_matmul_precision()
     f["matmul_precision_env"] = os.environ.get(_MATMUL_PRECISION_ENV)
+    f["xla_gpu_autotune"] = dict(_XLA_GPU_AUTOTUNE)
     f["jax_version"] = getattr(jax, "__version__", "unknown")
     f["jaxlib_version"] = getattr(jaxlib, "__version__", "unknown")
 
@@ -2455,6 +2559,15 @@ def format_startup_report(f: dict) -> list:
             f"pinned, on the BSE ladder matvec.  runtime.bootstrap() pins "
             f"it; a process that reaches this line unpinned did not go "
             f"through bootstrap.")
+    _at = f.get("xla_gpu_autotune") or {}
+    if _at.get("applicable"):
+        add(f"  XLA GPU autotuning resolved to level {_at.get('value')!r} "
+            f"from {_at.get('provenance')}; the complete resolved XLA_FLAGS "
+            f"value is {_at.get('xla_flags')!r}.")
+    else:
+        add(f"  The XLA GPU autotune level is not active: "
+            f"{_at.get('provenance', 'runtime.set_default_env has not run')}; "
+            f"the complete XLA_FLAGS value is {_at.get('xla_flags')!r}.")
     gx, gy = (list(f.get("mesh_shape", (1, 1))) + [1, 1])[:2]
     add(f"  The run's device mesh is {gx}x{gy} over axes "
         f"{tuple(f.get('mesh_axes', ()))}, and its communicator cliques were "
@@ -2713,6 +2826,13 @@ def format_startup_report(f: dict) -> list:
     add("  The cache key includes every array shape, so a system size this "
         "machine has not run before misses every entry no matter how warm "
         "the cache looks.")
+    if cc.get("compile_agreement_enabled"):
+        add(f"  Cross-rank module-compile agreement is ON with a bounded "
+            f"{cc.get('compile_agreement_timeout_s'):g}-second deadline; "
+            f"each backend compile is fingerprinted before XLA execution.")
+    else:
+        add(f"  Cross-rank module-compile agreement is "
+            f"{cc.get('compile_agreement_reason', 'unavailable')}.")
 
     # -- guards ------------------------------------------------------------
     if f.get("failfast"):
@@ -2773,6 +2893,18 @@ def format_production_startup_report(f: dict) -> list:
     x64 = "FP64/complex128" if f.get("x64") else "FP32/complex64"
     collective = "NCCL" if backend in ("GPU", "CUDA", "ROCM") and p > 1 \
         else str((f.get("collectives") or {}).get("impl") or "local").upper()
+    autotune = f.get("xla_gpu_autotune") or {}
+    if autotune.get("applicable"):
+        autotune_text = (
+            f"XLA GPU autotune={autotune.get('value')} "
+            f"({autotune.get('provenance')})")
+    else:
+        autotune_text = "XLA GPU autotune inactive"
+    compile_cache = f.get("compile_cache") or {}
+    compile_agreement_text = (
+        "compile agreement on" if
+        compile_cache.get("compile_agreement_enabled") else
+        f"compile agreement {compile_cache.get('compile_agreement_reason', 'unavailable')}")
     elapsed = (f.get("elapsed") or {}).get("total")
 
     lines = [
@@ -2783,7 +2915,8 @@ def format_production_startup_report(f: dict) -> list:
          f"{'s' if nlocal != 1 else ''}/rank | {affinity_text}"),
         (f"Environment    | JAX/JAXLIB {f.get('jax_version', 'unknown')}/"
          f"{f.get('jaxlib_version', 'unknown')} | "
-         f"{collective} collectives | {x64}"),
+         f"{collective} collectives | {x64} | {autotune_text} | "
+         f"{compile_agreement_text}"),
     ]
     if elapsed is not None:
         lines.append(f"Runtime startup | {float(elapsed):.1f} s")

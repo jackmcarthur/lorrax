@@ -26,7 +26,7 @@ _ENV_KEYS = ("JAX_PROCESS_COUNT", "JAX_NUM_PROCESSES", "SLURM_NTASKS",
              # XLA_PYTHON_CLIENT_ALLOCATOR exported, which would otherwise
              # make the "stays unset" assertion fail for the wrong reason.
              "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR",
-             "TF_GPU_ALLOCATOR")
+             "TF_GPU_ALLOCATOR", "XLA_FLAGS")
 
 
 @pytest.fixture
@@ -118,6 +118,46 @@ def test_set_default_env_respects_override(clean_env):
     assert os.environ["JAX_PLATFORMS"] == "cpu"
 
 
+def test_gpu_autotune_default_merges_without_overwriting_other_flags(clean_env):
+    clean_env.setenv("XLA_FLAGS", "--xla_gpu_enable_command_buffer=FUSION")
+    receipt = runtime.set_default_xla_gpu_autotune(platform="gpu")
+    assert os.environ["XLA_FLAGS"] == (
+        "--xla_gpu_enable_command_buffer=FUSION "
+        "--xla_gpu_autotune_level=0")
+    assert receipt["value"] == "0"
+    assert receipt["provenance"] == "LORRAX default (runtime.set_default_env)"
+
+
+@pytest.mark.parametrize("flags, value", [
+    ("--xla_gpu_autotune_level=2 --unrelated=1", "2"),
+    ("--xla_gpu_autotune_level 4 --unrelated=1", "4"),
+    ("--xla_gpu_autotune_level=1 --xla_gpu_autotune_level=3", "3"),
+])
+def test_gpu_autotune_caller_value_wins_byte_for_byte(
+        clean_env, flags, value):
+    clean_env.setenv("XLA_FLAGS", flags)
+    receipt = runtime.set_default_xla_gpu_autotune(platform="gpu")
+    assert os.environ["XLA_FLAGS"] == flags
+    assert receipt["value"] == value
+    assert receipt["provenance"] == "caller-supplied XLA_FLAGS"
+
+
+def test_gpu_autotune_default_is_idempotent(clean_env):
+    runtime.set_default_xla_gpu_autotune(platform="gpu")
+    runtime.set_default_xla_gpu_autotune(platform="gpu")
+    assert os.environ["XLA_FLAGS"].split().count(
+        "--xla_gpu_autotune_level=0") == 1
+
+
+def test_forced_cpu_does_not_add_a_gpu_xla_flag(clean_env):
+    clean_env.setenv("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+    before = os.environ["XLA_FLAGS"]
+    receipt = runtime.set_default_xla_gpu_autotune(platform="cpu")
+    assert os.environ["XLA_FLAGS"] == before
+    assert receipt["applicable"] is False
+    assert receipt["value"] is None
+
+
 def test_set_default_env_disables_gpu_preallocation(clean_env):
     """The canonical GPU allocator answer, pinned so it cannot drift back.
 
@@ -163,6 +203,7 @@ def test_set_default_env_cpu_does_not_touch_gpu_allocator(clean_env):
     set_default_env(platform="cpu")
     assert os.environ["JAX_PLATFORMS"] == "cpu"
     assert "XLA_PYTHON_CLIENT_PREALLOCATE" not in os.environ
+    assert "XLA_FLAGS" not in os.environ
 
 
 def test_set_default_env_refuses_an_allocator_typo(clean_env):

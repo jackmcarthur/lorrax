@@ -215,6 +215,13 @@ def _run_probe(kind: str, tmp_path, mode):
     env["JAX_COMPILATION_CACHE_MAX_SIZE"] = "-1"
     env["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
     env["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "0"
+    if kind == "rankstatic":
+        # This older red twin measures the persistent cache's ARM 3 after
+        # the divergent programs have compiled.  The default-on compile
+        # refusal now catches that defect earlier, so disable it only in
+        # this explicitly unsafe positive control; the dedicated P4 guard
+        # tests exercise and require the new refusal itself.
+        env["LORRAX_JAX_COMPILE_AGREEMENT"] = "0"
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + (
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     argv = [sys.executable,

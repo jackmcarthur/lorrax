@@ -55,8 +55,10 @@ sys.path.insert(0, os.path.join(
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("XLA_FLAGS",
-                      "--xla_force_host_platform_device_count=4")
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+if "xla_force_host_platform_device_count" not in _xla_flags:
+    os.environ["XLA_FLAGS"] = (
+        f"{_xla_flags} --xla_force_host_platform_device_count=4".strip())
 # LORRAX_BANDS_GEMM_FFI is deliberately NOT set here — see the
 # `_xla_plan_dial` fixture below.  The three knobs above are read by
 # jax/XLA at IMPORT time and cannot be moved into a fixture; the GEMM dial

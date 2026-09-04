@@ -41,8 +41,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 # Four emulated host devices so the sharded-reduction test exercises a real
 # multi-device global array (the production case) instead of skipping.
-os.environ.setdefault("XLA_FLAGS",
-                      "--xla_force_host_platform_device_count=4")
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+if "xla_force_host_platform_device_count" not in _xla_flags:
+    os.environ["XLA_FLAGS"] = (
+        f"{_xla_flags} --xla_force_host_platform_device_count=4".strip())
 
 import h5py                                          # noqa: E402
 import pytest                                         # noqa: E402

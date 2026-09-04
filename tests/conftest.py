@@ -13,6 +13,16 @@ from pathlib import Path as _Path
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
+# Some test modules import JAX during collection, before any driver can enter
+# ``runtime.set_default_env``.  Route that early-import corner through the
+# same owner as production.  CPU sessions deliberately receive no GPU flag;
+# GPU sessions merge the measured default without replacing caller flags.
+if "jax" not in _sys.modules:
+    from runtime import (_gpu_is_present,
+                         set_default_xla_gpu_autotune)       # noqa: E402
+    set_default_xla_gpu_autotune(
+        platform="gpu" if _gpu_is_present() else "cpu")
+
 # The HDF5 operation journal is off by default in production and in the
 # suite.  ``tests/test_h5_journal.py`` enables it explicitly in a private
 # directory; no global override is needed here and an operator's explicit

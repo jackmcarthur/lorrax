@@ -209,6 +209,64 @@ def test_bitmask_helpers_roundtrip():
     assert [i for i in range(19) if jcc._bit(m, i)] == [0, 7, 8, 18]
 
 
+def _run_compile_agreement(keys, n_proc, *, launched=None, timeout_s=1.0):
+    """Run the per-module protocol over ``FakeKV`` with selected ranks."""
+    kv = FakeKV(n_proc)
+    launched = list(range(n_proc)) if launched is None else list(launched)
+    out = {}
+
+    def work(rank):
+        try:
+            jcc._agree_before_module_compile(
+                "jit_test_module", keys[rank], 0, client=kv,
+                n_proc=n_proc, proc_idx=rank, timeout_s=timeout_s)
+            out[rank] = None
+        except BaseException as exc:                         # noqa: BLE001
+            out[rank] = exc
+
+    threads = [threading.Thread(target=work, args=(rank,))
+               for rank in launched]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=max(5.0, 4.0 * timeout_s))
+    assert set(out) == set(launched), "compile agreement did not stay bounded"
+    return out, kv
+
+
+def test_per_module_compile_agreement_accepts_identical_keys():
+    out, kv = _run_compile_agreement({rank: "a" * 64 for rank in range(4)}, 4)
+    assert all(value is None for value in out.values())
+    # One rank record each plus one verdict; p0 reads three records and each
+    # peer reads one verdict.  This pins the O(P), central-verdict protocol.
+    assert kv.n_set == 5
+    assert kv.n_get == 6
+
+
+def test_per_module_compile_agreement_refuses_and_lists_every_rank_key():
+    keys = {rank: f"{rank:064x}" for rank in range(4)}
+    out, _ = _run_compile_agreement(keys, 4)
+    for exc in out.values():
+        assert isinstance(exc, jcc.CompileAgreementError)
+        message = str(exc)
+        assert "GATE cross_rank_compile_agreement: REFUSED" in message
+        assert "stalled module 'jit_test_module'" in message
+        for rank, key in keys.items():
+            assert f"rank {rank}: key={key}" in message
+
+
+def test_per_module_compile_agreement_refuses_a_missing_rank_by_deadline():
+    keys = {rank: "b" * 64 for rank in range(4)}
+    out, _ = _run_compile_agreement(
+        keys, 4, launched=(0, 1, 2), timeout_s=0.05)
+    for exc in out.values():
+        assert isinstance(exc, jcc.CompileAgreementError)
+        message = str(exc)
+        assert "jit_test_module" in message
+        assert "rank 3: <not-arrived>" in message
+        assert "did not arrive" in message or "published no verdict" in message
+
+
 # ---------------------------------------------------------------------------
 # THE CACHE OBJECT MUST FOLLOW THE DIRECTORY WE CHOOSE
 # ---------------------------------------------------------------------------

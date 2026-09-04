@@ -150,6 +150,18 @@ breaks JAX's topology sync). Batch template:
 `config/perlmutter/run_gw.slurm`; multi-node adds
 `LORRAX_NNODES=2 LORRAX_NGPU=8`.
 
+`lx`, the installed CUDA-13 module, and the Perlmutter env scripts do not own
+GPU autotuning policy and do not rewrite `XLA_FLAGS`. Every production driver
+enters `runtime.set_default_env` before importing JAX; that one owner merges
+`--xla_gpu_autotune_level=0` only when the caller supplied no autotune level,
+then the normal startup line prints the resolved value and provenance. Thus
+the launch recipe is unchanged and an experiment such as
+`XLA_FLAGS=--xla_gpu_autotune_level=2 lx run …` remains an explicit override.
+At P>1 the same runtime installs the default-on per-module compile agreement
+after JAX coordination is initialized and before mesh warmup, so launchers
+must continue to give every rank one shared coordination world; no new shell
+export is required.
+
 Per-invocation cost: ~7 s single-rank, 10–15 s multi-rank (srun step 2–5 s,
 Shifter bring-up ~5 s, `jax.distributed` handshake 3–5 s). `lx shell` and a
 persistent compile-cache directory are the fast-iteration knobs.

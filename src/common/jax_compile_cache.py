@@ -26,6 +26,11 @@ Knobs (all optional):
   ``LORRAX_JAX_CACHE_MULTIPROCESS=0``   — restore the scorecard-AG refusal
                                           (no cache at all when P > 1).
   ``LORRAX_JAX_CACHE_AGREE_TIMEOUT_S``  — agreement timeout, default 300.
+  ``LORRAX_JAX_COMPILE_AGREEMENT=0``    — UNSAFE bisect-only opt-out from the
+                                          per-module cross-rank compile-key
+                                          refusal (default on at P > 1).
+  ``LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S`` — bounded per-module agreement
+                                          timeout, default 60 seconds.
   ``LORRAX_JAX_CACHE_STRICT=0``         — on an agreed entry that then fails
                                           to load, warn instead of aborting
                                           (UNSAFE on GPU: can hang).
@@ -264,6 +269,7 @@ they were cut from.  ``jax.version.__version_info__`` is the honest tuple.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import sys
@@ -282,6 +288,13 @@ _CACHE_SUFFIX = "-cache"
 # `jax.distributed` session (one srun step), so a fixed namespace is safe.
 _KV_NS = "lorrax/compile_cache/v1"
 
+# Per-module compile fingerprints use a separate protocol.  Unlike the
+# startup cache snapshot above, this one executes before EVERY backend
+# compile and refuses a rank-divergent module before XLA can enter collective
+# GPU autotuning and wait forever.
+_COMPILE_KV_NS = "lorrax/compile_agreement/v1"
+_COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 60.0
+
 # Parallel page-cache prefetch of the agreed entries (see _prefetch_agreed).
 # ON: at 606 centroids / P=16 the SERIAL reads of 169 entries cost 29 s on one
 # rank and 8.8 s on another, against the ~4.5 s of XLA compile they replace —
@@ -295,6 +308,7 @@ class _CacheState:
 
     def __init__(self) -> None:
         self._write_lock = threading.Lock()
+        self._compile_event_lock = threading.Lock()
         self.enabled = False
         self.dir = ""
         self.n_proc = 1
@@ -308,6 +322,15 @@ class _CacheState:
         self.compile_secs = 0.0
         self.read_secs = 0.0   # time spent loading executables from disk
         self.prefetch_secs = 0.0
+        self.compile_agreement_configured = False
+        self.compile_agreement_enabled = False
+        self.compile_agreement_reason = "not installed"
+        self.compile_agreement_timeout_s = 0.0
+        self.compile_agreement_checks = 0
+        self.compile_fingerprint_secs = 0.0
+        self.compile_agreement_secs = 0.0
+        self._compile_client = None
+        self._compile_occurrences: dict[str, int] = {}
         # JAX calls the file-cache writer on process 0 only.  Keep these
         # explicitly process-local: summing them across ranks would turn one
         # physical write into a fictitious P writes.  The atomic, unlimited
@@ -323,6 +346,13 @@ class _CacheState:
         # which is the state that precedes the collective-compile deadlock.
         # A set of keys is the only observable that separates those.
         self.probe_keys: set[str] = set()
+
+    def next_compile_occurrence(self, module_name: str) -> int:
+        """Return this rank's zero-based occurrence for ``module_name``."""
+        with self._compile_event_lock:
+            occurrence = self._compile_occurrences.get(module_name, 0)
+            self._compile_occurrences[module_name] = occurrence + 1
+            return occurrence
 
     def reset_write_metrics(self) -> None:
         """Reset this process's successful-write receipt deterministically."""
@@ -370,6 +400,26 @@ class _KeyEnvMismatch(RuntimeError):
 
 class UnsafeCachePolicy(RuntimeError):
     """A requested disk-cache lifecycle would violate the cache contract."""
+
+
+class CompileAgreementError(RuntimeError):
+    """The ranks did not present the same module to the compile boundary."""
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    """Read a positive finite duration, refusing an unbounded spelling."""
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None or not raw.strip() else float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a positive number of seconds, got {raw!r}") \
+            from exc
+    if not (value > 0.0 and value < float("inf")):
+        raise ValueError(
+            f"{name} must be a finite positive number of seconds, "
+            f"got {raw!r}")
+    return value
 
 
 def _truthy(name: str, default: str = "0") -> bool:
@@ -1282,6 +1332,267 @@ def _install_atomic_put_patch() -> None:
 _COMPILE_ENTRY_POINT = "backend_compile_and_load"
 
 
+def _compile_module_identity(module) -> tuple[str, str, float]:
+    """Return ``(module_name, stable_mlir_sha256, fingerprint_seconds)``.
+
+    This hashes the binary MLIR handed to the backend, before XLA compilation
+    starts.  Debug locations are excluded so source-path metadata cannot make
+    otherwise identical rank programs disagree.  The digest is the cold-path
+    equivalent of a persistent-cache key: it remains available when the disk
+    cache is disabled, and it needs neither a backend compile nor a device
+    assignment to compute.
+    """
+    t0 = time.monotonic()
+    operation = getattr(module, "operation", None)
+    name = "<unnamed-module>"
+    if operation is not None:
+        try:
+            attr = operation.attributes["sym_name"]
+            name = str(getattr(attr, "value", attr)).strip('"')
+        except Exception:                                  # noqa: BLE001
+            pass
+    try:
+        mlir = operation.get_asm(binary=True, enable_debug_info=False)
+    except Exception as exc:                               # noqa: BLE001
+        raise CompileAgreementError(
+            "GATE cross_rank_compile_agreement: REFUSED before compiling "
+            f"module {name!r}: its stable MLIR fingerprint could not be "
+            f"computed ({type(exc).__name__}: {exc}).") from exc
+    if isinstance(mlir, str):
+        mlir = mlir.encode("utf-8")
+    digest = hashlib.sha256(bytes(mlir)).hexdigest()
+    return name, digest, time.monotonic() - t0
+
+
+def _compile_event_prefix(module_name: str, occurrence: int) -> str:
+    name_hash = hashlib.sha256(module_name.encode("utf-8")).hexdigest()[:24]
+    return f"{_COMPILE_KV_NS}/{name_hash}/{int(occurrence)}"
+
+
+def _decode_compile_record(payload: bytes, rank: int) -> dict:
+    try:
+        record = json.loads(payload.decode("utf-8"))
+    except Exception as exc:                               # noqa: BLE001
+        raise CompileAgreementError(
+            f"rank {rank} published a malformed compile-agreement record "
+            f"({type(exc).__name__}: {exc})") from exc
+    if not isinstance(record, dict) or "key" not in record:
+        raise CompileAgreementError(
+            f"rank {rank} published an incomplete compile-agreement record: "
+            f"{record!r}")
+    return record
+
+
+def _snapshot_compile_records(client, prefix: str, n_proc: int,
+                              local_rank: int, local_record: dict) -> list:
+    """Best-effort all-rank snapshot for a bounded-time refusal message."""
+    records: list[dict | None] = [None] * n_proc
+    records[local_rank] = local_record
+    for rank in range(n_proc):
+        if records[rank] is not None:
+            continue
+        try:
+            payload = client.blocking_key_value_get_bytes(
+                f"{prefix}/rank/{rank}", 1)
+            records[rank] = _decode_compile_record(payload, rank)
+        except Exception:                                  # noqa: BLE001
+            pass
+    return records
+
+
+def _format_compile_refusal(verdict: dict) -> str:
+    module_name = verdict.get("module", "<unknown-module>")
+    occurrence = verdict.get("occurrence", "?")
+    reason = verdict.get("reason", "compile-key disagreement")
+    records = verdict.get("records") or []
+    rank_lines = []
+    for rank, record in enumerate(records):
+        if record is None:
+            rank_lines.append(f"rank {rank}: <not-arrived>")
+        else:
+            rank_lines.append(
+                f"rank {rank}: key={record.get('key', '<missing>')} "
+                f"module={record.get('module', '<missing>')!r}")
+    return (
+        "GATE cross_rank_compile_agreement: REFUSED before XLA execution.\n"
+        f"  got: {reason}; stalled module {module_name!r}, occurrence "
+        f"{occurrence}.\n"
+        f"  rank keys: {'; '.join(rank_lines)}.\n"
+        "  want: every rank to present the same stable MLIR/HLO key before "
+        "any rank enters backend compilation.\n"
+        "  why: a rank-divergent GPU compile can enter collective autotuning "
+        "on only part of the world and hang silently.\n"
+        "  fix: remove rank-conditional shapes/jits or make the emitted "
+        "module identical; LORRAX_JAX_COMPILE_AGREEMENT=0 is an UNSAFE "
+        "bisect-only opt-out.")
+
+
+def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
+                                 *, client=None, n_proc: int | None = None,
+                                 proc_idx: int | None = None,
+                                 timeout_s: float | None = None) -> None:
+    """Exchange one compile fingerprint and refuse divergence or absence."""
+    s = _STATE
+    client = s._compile_client if client is None else client
+    n_proc = int(s.n_proc if n_proc is None else n_proc)
+    proc_idx = int(s.proc_idx if proc_idx is None else proc_idx)
+    timeout_s = float(
+        s.compile_agreement_timeout_s if timeout_s is None else timeout_s)
+    prefix = _compile_event_prefix(module_name, occurrence)
+    record = {
+        "rank": proc_idx,
+        "module": module_name,
+        "occurrence": occurrence,
+        "key": key,
+    }
+    client.key_value_set_bytes(
+        f"{prefix}/rank/{proc_idx}",
+        json.dumps(record, sort_keys=True).encode("utf-8"))
+
+    t0 = time.monotonic()
+    if proc_idx == 0:
+        deadline = t0 + timeout_s
+        records: list[dict | None] = [None] * n_proc
+        records[0] = record
+        reason = ""
+        for rank in range(1, n_proc):
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            if time.monotonic() >= deadline:
+                reason = f"deadline expired after {timeout_s:g} seconds"
+                break
+            try:
+                payload = client.blocking_key_value_get_bytes(
+                    f"{prefix}/rank/{rank}", remaining_ms)
+                records[rank] = _decode_compile_record(payload, rank)
+            except Exception as exc:                        # noqa: BLE001
+                reason = (
+                    f"rank {rank} did not arrive within {timeout_s:g} "
+                    f"seconds ({type(exc).__name__})")
+                break
+        if any(item is None for item in records):
+            records = _snapshot_compile_records(
+                client, prefix, n_proc, proc_idx, record)
+            if not reason:
+                reason = f"deadline expired after {timeout_s:g} seconds"
+        keys = {item["key"] for item in records if item is not None}
+        modules = {item.get("module") for item in records if item is not None}
+        passed = len(records) == n_proc and None not in records \
+            and len(keys) == 1 and modules == {module_name}
+        if not passed and not reason:
+            reason = "ranks published different stable MLIR/HLO keys"
+        verdict = {
+            "passed": passed,
+            "module": module_name,
+            "occurrence": occurrence,
+            "reason": reason,
+            "records": records,
+        }
+        client.key_value_set_bytes(
+            f"{prefix}/verdict",
+            json.dumps(verdict, sort_keys=True).encode("utf-8"))
+    else:
+        # Rank 0 may consume the entire stated deadline before publishing its
+        # timeout verdict.  A small, still-bounded handoff allowance lets the
+        # peers receive that shared all-rank diagnostic instead of racing it.
+        handoff_s = min(2.0, max(0.1, timeout_s * 0.1))
+        try:
+            payload = client.blocking_key_value_get_bytes(
+                f"{prefix}/verdict", int((timeout_s + handoff_s) * 1000))
+            verdict = json.loads(payload.decode("utf-8"))
+        except Exception as exc:                            # noqa: BLE001
+            records = _snapshot_compile_records(
+                client, prefix, n_proc, proc_idx, record)
+            verdict = {
+                "passed": False,
+                "module": module_name,
+                "occurrence": occurrence,
+                "reason": (
+                    f"rank 0 published no verdict within "
+                    f"{timeout_s + handoff_s:g} seconds "
+                    f"({type(exc).__name__})"),
+                "records": records,
+            }
+
+    s.compile_agreement_checks += 1
+    s.compile_agreement_secs += time.monotonic() - t0
+    if not verdict.get("passed"):
+        raise CompileAgreementError(_format_compile_refusal(verdict))
+
+
+def _configure_compile_agreement() -> None:
+    """Resolve the default-on agreement once, after JAX coordination setup."""
+    s = _STATE
+    if s.compile_agreement_configured:
+        return
+    s.compile_agreement_configured = True
+    try:
+        import jax
+        s.n_proc = int(jax.process_count())
+        s.proc_idx = int(jax.process_index())
+    except Exception:                                      # noqa: BLE001
+        s.n_proc = 1
+        s.proc_idx = 0
+
+    if s.n_proc <= 1:
+        s.compile_agreement_reason = "no-op: process_count=1"
+        if s.proc_idx == 0:
+            _say("cross-rank compile agreement no-op: process_count=1.")
+        return
+
+    # Install the known rank-local shard-offset canonicalization before the
+    # mesh warmup can compile ``jit__multi_slice``.  ``ensure_jax_compile_cache``
+    # repeats this idempotently later for direct cache callers, but doing it
+    # only there would put the new refusal in front of the existing repair.
+    if _truthy("LORRAX_JAX_CACHE_SHARD_SLICE", "1"):
+        _install_shard_slice_patch()
+
+    from runtime.env_flags import env_bool
+    requested = env_bool(
+        "LORRAX_JAX_COMPILE_AGREEMENT", True, print_fn=_say)
+    if not requested:
+        s.compile_agreement_reason = (
+            "disabled by LORRAX_JAX_COMPILE_AGREEMENT=0")
+        if s.proc_idx == 0:
+            _say("*** cross-rank compile agreement DISABLED by "
+                 "LORRAX_JAX_COMPILE_AGREEMENT=0. This is an UNSAFE "
+                 "bisect-only mode: a rank-divergent compile may hang. ***")
+        return
+
+    from jax._src import distributed as _dist
+    client = _dist.global_state.client
+    if client is None:
+        s.compile_agreement_reason = (
+            "no-op: jax.distributed coordination client is not initialized")
+        if s.proc_idx == 0:
+            _say("cross-rank compile agreement no-op: jax.distributed "
+                 "coordination client is not initialized.")
+        return
+
+    timeout_s = _positive_float_env(
+        "LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S",
+        _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S)
+    s._compile_client = client
+    s.compile_agreement_timeout_s = timeout_s
+    s.compile_agreement_enabled = True
+    s.compile_agreement_reason = "enabled"
+    if s.proc_idx == 0:
+        _debug_say(
+            "cross-rank compile agreement enabled before backend compile "
+            f"with a {timeout_s:g}-second deadline.")
+
+
+def install_compile_agreement() -> None:
+    """Install the compile counter and default-on all-rank module refusal.
+
+    The runtime calls this after ``jax.distributed.initialize`` and before
+    mesh warmup.  Direct library/test paths are safe: P=1 or an absent
+    coordination client makes agreement an announced no-op, while the
+    compile counter remains useful.
+    """
+    _configure_compile_agreement()
+    _install_compile_counter()
+
+
 def _install_compile_counter() -> None:
     """Count real XLA compiles so the storm is measurable, warm vs cold.
 
@@ -1307,6 +1618,13 @@ def _install_compile_counter() -> None:
     _orig = getattr(_compiler, name)
 
     def _counting(*args, **kwargs):
+        if _STATE.compile_agreement_enabled:
+            module = args[1] if len(args) > 1 else kwargs.get("module")
+            module_name, key, fingerprint_secs = _compile_module_identity(
+                module)
+            _STATE.compile_fingerprint_secs += fingerprint_secs
+            occurrence = _STATE.next_compile_occurrence(module_name)
+            _agree_before_module_compile(module_name, key, occurrence)
         t0 = time.monotonic()
         try:
             return _orig(*args, **kwargs)
@@ -1364,6 +1682,11 @@ def _dump_keys() -> None:
         "dir": s.dir,
         "bound_dir": bound_cache_dir(),
         "xla_compiles": s.compiles,
+        "compile_agreement_enabled": s.compile_agreement_enabled,
+        "compile_agreement_reason": s.compile_agreement_reason,
+        "compile_agreement_checks": s.compile_agreement_checks,
+        "compile_fingerprint_secs": s.compile_fingerprint_secs,
+        "compile_agreement_secs": s.compile_agreement_secs,
         "probes": s.probes,
         "hits": s.hits,
         "vetoed": s.blocked,
@@ -1472,6 +1795,10 @@ def _report_impl() -> None:
             "(cache off or capped-LRU path; JAX p0-only)  ")
     msg = (f"rank {s.proc_idx}/{s.n_proc} summary: "
            f"xla_compiles={s.compiles} ({s.compile_secs:.2f}s)  "
+           f"compile_agreement={s.compile_agreement_checks} "
+           f"({s.compile_fingerprint_secs:.3f}s fingerprint + "
+           f"{s.compile_agreement_secs:.3f}s exchange; "
+           f"{s.compile_agreement_reason})  "
            f"cache_probes={s.probes} hits={s.hits} "
            f"({s.read_secs:.2f}s) vetoed={s.blocked}  "
            f"{write_receipt}"
@@ -1492,6 +1819,13 @@ def compile_cache_stats() -> dict:
         "proc_idx": s.proc_idx, "n_seen": s.n_seen, "n_agreed": s.n_agreed,
         "probes": s.probes, "hits": s.hits, "vetoed": s.blocked,
         "compiles": s.compiles, "compile_secs": s.compile_secs,
+        "compile_agreement_configured": s.compile_agreement_configured,
+        "compile_agreement_enabled": s.compile_agreement_enabled,
+        "compile_agreement_reason": s.compile_agreement_reason,
+        "compile_agreement_timeout_s": s.compile_agreement_timeout_s,
+        "compile_agreement_checks": s.compile_agreement_checks,
+        "compile_fingerprint_secs": s.compile_fingerprint_secs,
+        "compile_agreement_secs": s.compile_agreement_secs,
         "read_secs": s.read_secs, "prefetch_secs": s.prefetch_secs,
         **writes,
         "is_cache_writer": s.proc_idx == 0,
@@ -1592,7 +1926,7 @@ def ensure_jax_compile_cache() -> None:
     # counter that is not installed must SAY it is not installed — the number
     # it stops producing is the one the docstring above promises.
     try:
-        _install_compile_counter()
+        install_compile_agreement()
         atexit.register(_report)
     except Exception as exc:  # noqa: BLE001
         if proc_idx == 0:

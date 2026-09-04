@@ -62,8 +62,10 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 # Four emulated host devices: the projector's shard_map/psum_scatter path
 # is identical to production; multi-process collectives are covered by the
 # restart-gated P=64 A/B (wk_REL/lgemm_ab.sbatch).
-os.environ.setdefault("XLA_FLAGS",
-                      "--xla_force_host_platform_device_count=4")
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+if "xla_force_host_platform_device_count" not in _xla_flags:
+    os.environ["XLA_FLAGS"] = (
+        f"{_xla_flags} --xla_force_host_platform_device_count=4".strip())
 
 import pytest                                        # noqa: E402
 import jax                                           # noqa: E402

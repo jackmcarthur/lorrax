@@ -26,7 +26,10 @@ distributed init, no MPI.
 import os
 import sys
 
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+if "xla_force_host_platform_device_count" not in _xla_flags:
+    os.environ["XLA_FLAGS"] = (
+        f"{_xla_flags} --xla_force_host_platform_device_count=4".strip())
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 

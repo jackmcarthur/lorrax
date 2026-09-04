@@ -125,6 +125,39 @@ def test_every_core_driver_uses_the_shared_finalize_boundary(relative):
     assert len(calls) == 1, relative
 
 
+@pytest.mark.parametrize("relative", [
+    "centroid/kmeans_cli.py",
+    "psp/get_dipole_mtxels.py",
+    "gw/kin_ion_io.py",
+    "gw/gw_jax.py",
+    "bse/bse_jax.py",
+    "bandstructure/htransform.py",
+    "bse/exciton_bands.py",
+])
+def test_every_core_driver_bootstraps_before_its_first_jax_import(relative):
+    """The env owner must run before JAX/XLA latches ``XLA_FLAGS``."""
+    path = os.path.join(_SRC, relative)
+    tree = ast.parse(open(path, encoding="utf-8").read(), path)
+    startup_lines = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "id", None)
+             or getattr(node.func, "attr", None))
+        == "initialize_communicator_stack"]
+    jax_lines = [
+        node.lineno for node in tree.body
+        if ((isinstance(node, ast.Import)
+             and any(alias.name == "jax" or alias.name.startswith("jax.")
+                     for alias in node.names))
+            or (isinstance(node, ast.ImportFrom)
+                and node.module
+                and (node.module == "jax" or node.module.startswith("jax."))))]
+    assert startup_lines and jax_lines, relative
+    assert min(startup_lines) < min(jax_lines), (
+        f"{relative} imports JAX at line {min(jax_lines)} before runtime "
+        f"startup at line {min(startup_lines)}")
+
+
 @pytest.mark.parametrize("outcome, expected", [
     (None, 0),
     (7, 7),
@@ -262,6 +295,10 @@ def _facts(**over):
         "x64": True,
         "matmul_precision": "highest",
         "matmul_precision_env": None,
+        "xla_gpu_autotune": {
+            "value": None, "applicable": False,
+            "provenance": "not applied: forced CPU startup",
+            "xla_flags": None},
         "jax_version": "0.9.1",
         "jaxlib_version": "0.9.1",
         "mesh_shape": (4, 4),
@@ -333,8 +370,12 @@ def _facts(**over):
                     "MKL_NUM_THREADS": "28", "OPENBLAS_NUM_THREADS": "28",
                     "LORRAX_MKLBLAS_THREADS": None,
                     "LORRAX_SCALAPACK_MKL_THREADS": None},
-        "compile_cache": {"enabled": True, "n_proc": 16,
-                          "dir": "/scratch2/lorrax_jax_cache/np16"},
+        "compile_cache": {
+            "enabled": True, "n_proc": 16,
+            "dir": "/scratch2/lorrax_jax_cache/np16",
+            "compile_agreement_enabled": True,
+            "compile_agreement_reason": "enabled",
+            "compile_agreement_timeout_s": 60.0},
         "compile_cache_error": None,
         "malloc_tune": {"applied": True, "mmap_mb": 1, "trim_mb": 128,
                         "reason": None},
@@ -372,6 +413,8 @@ def test_production_startup_is_compact_and_has_no_library_inventory():
     assert "16 CPU devices" in text
     assert "mesh 4x4" in text
     assert "JAX/JAXLIB 0.9.1/0.9.1" in text
+    assert "XLA GPU autotune inactive" in text
+    assert "compile agreement on" in text
     assert "28 CPU cores/rank" in text
     assert "FFI" not in text
     assert "HDF5" not in text
@@ -932,6 +975,20 @@ def test_compile_cache_on_names_the_directory():
     assert "agreement layer" in out
 
 
+def test_compile_agreement_default_and_deadline_are_reported():
+    out = _text(_facts())
+    assert "Cross-rank module-compile agreement is ON" in out
+    assert "60-second deadline" in out
+
+
+def test_compile_agreement_noop_reason_is_not_hidden():
+    cc = dict(_facts()["compile_cache"],
+              compile_agreement_enabled=False,
+              compile_agreement_reason="no-op: process_count=1")
+    out = _text(_facts(process_count=1, n_devices=1, compile_cache=cc))
+    assert "no-op: process_count=1" in out
+
+
 def test_compile_cache_at_P1_does_not_say_it_is_shared_by_1_rank():
     out = _text(_facts(process_count=1, n_devices=1,
                        compile_cache={"enabled": True, "n_proc": 1,
@@ -1018,7 +1075,8 @@ def _entry_point_call_sequence():
 
 def test_the_entry_point_calls_the_phases_in_the_one_correct_order():
     seq = _entry_point_call_sequence()
-    wanted = ["install_failfast_excepthook", "bootstrap", "prepare_mesh",
+    wanted = ["install_failfast_excepthook", "bootstrap",
+              "install_compile_agreement", "prepare_mesh",
               "ensure_jax_compile_cache", "_install_pjrt_log_filter",
               "collect_startup_facts", "enforce_x64",
               "format_startup_report"]
@@ -1134,6 +1192,21 @@ def test_the_report_states_the_resolved_matmul_precision():
     text = _text(_facts())
     assert "matmul precision" in text
     assert "'highest'" in text
+
+
+def test_the_report_states_resolved_gpu_autotune_value_and_provenance():
+    autotune = {
+        "value": "0", "applicable": True,
+        "provenance": "LORRAX default (runtime.set_default_env)",
+        "xla_flags": "--xla_gpu_autotune_level=0"}
+    text = _text(_facts(backend="gpu", xla_gpu_autotune=autotune))
+    assert "XLA GPU autotuning resolved to level '0'" in text
+    assert "LORRAX default (runtime.set_default_env)" in text
+    caller = dict(autotune, value="2",
+                  provenance="caller-supplied XLA_FLAGS",
+                  xla_flags="--xla_gpu_autotune_level=2")
+    text = _text(_facts(backend="gpu", xla_gpu_autotune=caller))
+    assert "level '2' from caller-supplied XLA_FLAGS" in text
 
 
 def test_an_unpinned_matmul_precision_is_a_warning_not_silence():
