@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ffi import _services
+
+_services.ensure_on_path()
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,10 +27,6 @@ from common.grouped_layout import (
     SquareGroupedShardLayout,
     build_square_grouped_shard_layout,
 )
-from ffi import _services
-
-_services.ensure_on_path()
-
 from symmetry_maps import (
     centroid_source_map_and_wrap,
     permutation_orbit_labels,
