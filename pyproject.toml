@@ -5,6 +5,18 @@ description = "LORRAX: Low-scaling Real-space Real-Axis eXcited state package"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # FIRST-PARTY SERVICES.  These stay independently installable, but a
+    # LORRAX installation is one coherent distribution set: production wheels
+    # install these requirements, while uv resolves them from the workspace
+    # sources declared below.  runtime.source_closure reads the same package
+    # metadata for bare-source launches; no launcher owns a copied service list.
+    "distrib_la==0.1.0",
+    "lxkit==0.1.0",
+    "minimax==0.1.0",
+    "symmetry_maps==0.1.0",
+    "vcoul==0.1.0",
+    "wfn_loader==0.1.0",
+    "zeta_loader==0.1.0",
     "h5py>=3.14.0",
     # NO CUDA VARIANT PINNED HERE — it is a SITE fact, not a package fact.
     # Pick one at install time:  pip install -e '.[cuda13]'  (Perlmutter)
@@ -74,6 +86,19 @@ lorrax-downfold = "gw.downfold_cli:main"
 # cannot be wired as a console script without a source refactor. Re-add this
 # entry once `bse.bse_jax` (or a successor) gains a module-level `main()`.
 
+# The installed-form source-closure manifest.  Names are distributions and
+# values are their public import doors.  The bare-source form cross-checks this
+# table against the workspace members, their own project names, root runtime
+# requirements, and uv workspace sources before putting any path on sys.path.
+[project.entry-points."lorrax.services"]
+distrib_la = "distrib_la"
+lxkit = "lxkit"
+minimax = "minimax"
+symmetry_maps = "symmetry_maps"
+vcoul = "vcoul"
+wfn_loader = "wfn_loader"
+zeta_loader = "zeta_loader"
+
 [tool.uv]
 package = true
 
@@ -85,10 +110,17 @@ package = true
 # it is the place a NEW package-data claim would have to go.
 [tool.setuptools.package-data]
 
+[tool.uv.sources]
+distrib_la = { workspace = true }
+lxkit = { workspace = true }
+minimax = { workspace = true }
+symmetry_maps = { workspace = true }
+vcoul = { workspace = true }
+wfn_loader = { workspace = true }
+zeta_loader = { workspace = true }
+
 [tool.uv.workspace]
-members = [
-    
-]
+members = ["services/*"]
 
 [tool.pytest.ini_options]
 # `services` carries the standalone service suites (charter: own fast

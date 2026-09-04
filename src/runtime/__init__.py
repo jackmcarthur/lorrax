@@ -77,6 +77,7 @@ import subprocess
 # ``ModuleNotFoundError: No module named 'runtime.jax_support'`` from the
 # other tree.
 from .jax_support import enforce as _enforce_jax_support
+from .source_closure import ensure_source_closure as _ensure_source_closure
 from .pjrt_log_filter import (begin_clean_shutdown_log_filter as
                               _begin_clean_shutdown_log_filter,
                               install_pjrt_log_filter as
@@ -222,7 +223,7 @@ def _record_demotion(msg: str) -> None:
 
 
 def bootstrap(*, platform: str = "gpu") -> None:
-    """Canonical CLI bootstrap: env defaults + distributed init + CPU fallback.
+    """Seal package origins, set env, initialize distributed, and fall back.
 
     One call replaces the three-call header every LORRAX CLI used to
     carry.  MUST run before the caller's own ``import jax``:
@@ -236,6 +237,11 @@ def bootstrap(*, platform: str = "gpu") -> None:
     Idempotent (each piece guards itself); no-op-ish in single-process
     runs.  ``platform`` forwards to :func:`set_default_env`.
     """
+    # Source/package sealing is stdlib-only and MUST precede every existing
+    # bootstrap step: it puts this checkout's declared service doors ahead of
+    # stale installed copies and refuses a LORRAX_CHECKOUT/runtime mismatch
+    # before set_default_env's first possible JAX import.
+    _ensure_source_closure(print_fn=rank0_print)
     set_default_env(platform=platform)
     announce_cpu_collectives()
     skip_gpu_plugin_discovery()
@@ -1607,6 +1613,10 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        so installing it after the collectives would leave the riskiest part
        of startup unprotected.  Idempotent, so ``bootstrap()``'s own call
        below is a no-op.
+    0a. :func:`source_closure.ensure_source_closure` -- derive every
+       first-party service from package metadata, put this checkout's service
+       sources before ambient installs, and refuse a checkout/runtime
+       disagreement.  Standard-library-only, so it precedes JAX and physics.
     1. :func:`set_default_env` -- JAX_ENABLE_X64, JAX_PLATFORMS,
        XLA_PYTHON_CLIENT_PREALLOCATE=false, the allocator-spelling refusal,
        the glibc malloc tuning, and the first arming of the CPU-only plugin
@@ -1629,7 +1639,7 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        Demotes to CPU only when no GPU is physically present; a cuda-init
        failure ON a GPU node is re-raised, never masked.
 
-       (2)-(5) are ``bootstrap()``, unchanged and still separately tested;
+       (0a)-(5) are ``bootstrap()`` and are separately tested;
        this function calls it rather than re-listing its steps, so there is
        exactly one implementation of the order.
     5b. :func:`runtime.jax_support.enforce` -- the running JAX is the one this
