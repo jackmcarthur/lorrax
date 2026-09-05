@@ -369,10 +369,12 @@ def apply_band_partition(
     # Zero the off-diagonal portion outside protected×protected.
     offdiag_part = H_full * (1.0 - eye) * offdiag_keep[None, :, :]
 
-    # Diagonal: in-range bands keep H_full's diag; out-of-range get scissor.
+    # The protected class owns its full diagonal even after multiplet
+    # promotion across the grid edge. Only the third class is scissored;
+    # this is the same protected | in_range set used by convergence.
     diag_full = jnp.diagonal(H_full, axis1=1, axis2=2)            # (nk, nb)
     diag_kept = jnp.where(
-        in_range_mask[None, :], diag_full,
+        (protected_mask | in_range_mask)[None, :], diag_full,
         scissor_E_qp_kn.astype(H_full.dtype),
     )                                                              # (nk, nb)
 

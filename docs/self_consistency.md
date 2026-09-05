@@ -298,3 +298,17 @@ control), `si_centroid_ladder_sc_2026-09-03` (resolution ladder),
 structures), `sc_fixed_rules_eqp1_2026-09-03` (claim 662, frozen rules),
 `sigma_eta_literal_no_ceiling_2026-09-03` (claims 637/639),
 `qsgw_two_level_2026-09-03` (the frozen-W inner loop, branch only).
+
+**18. QP identities, not sorted eigenvalue ordinals, define SC motion.**
+The first map output supplies a fixed QP reference. Later input and output
+eigenvectors are assigned to those reference multiplets by maximum projector
+overlap, using all active candidate columns so crossings with scissored
+levels cannot relabel the target. Exact multiplets use the configured SC
+exact-degeneracy tolerance and their mean energy. `SC identity` prints this
+input-to-output L-infinity criterion beside the sorted-index value. The
+`SC_identity` eqp comments give map-0 labels, sorted input/output columns,
+block means and adjacent-output motion on the file's k-block index (the
+first integer in a body row is spin). They describe eqp0 even in the eqp1
+file. The Hamiltonian carry and accelerator are unchanged. The diagonal
+retention mask is `protected | in_range`, including protected multiplet
+members; only non-protected out-of-range diagonals are scissored.

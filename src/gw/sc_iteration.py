@@ -256,21 +256,12 @@ def protected_band_convergence(
 ) -> ConvergenceVerdict:
     """Has every NON-SCISSORED band moved by less than ``cutoff_ev``?
 
-    ``e_*_ev`` are ``(nk, nb_active)`` eV.  The test set is
-    ``protected_mask | in_range_mask``, both from the ITERATION-LOCAL
-    :class:`~gw.band_partition.BandPartition` -- never a band-index
-    window written down somewhere else.  A frozen window keeps testing
-    the bands that WERE in range; the set that matters is the one this
-    iteration actually treated as physical.
-
-    WHY THE UNION AND NOT ``protected_mask`` ALONE.  The partition is
-    THREE-way and only the third category is scissored:
-    ``apply_band_partition`` substitutes alpha*E_DFT + beta exactly where
-    ``in_range_mask`` is False.  A band in range but NOT protected keeps
-    its own Sigma-derived diagonal and merely loses off-diagonal mixing --
-    a genuine degree of freedom.  Today ``run_sc_driver`` builds both
-    masks from the same ``in_range``, so the two spellings agree; that is
-    a property of that ONE line, not of this predicate.
+    ``e_*_ev`` are ``(nk, nb_active)`` eV, already aligned to map-0
+    QP identities and averaged within exact multiplets by the SC caller.
+    The test set is the frozen ``protected_mask | in_range_mask``: full
+    protected diagonals plus the unprotected in-range diagonals. This is
+    exactly the diagonal-retention mask in ``apply_band_partition``.
+    Callers without rotations (fixed-Sigma EVSC) supply their own labels.
 
     WHY SCISSORED BANDS ARE EXCLUDED.  Their energies are alpha*E_DFT +
     beta with the coefficients refitted each iteration FROM the in-range
@@ -588,6 +579,7 @@ class SCOutputs:
     tail_scissor_fit: ScissorFit | None
     screening: SCMapScreeningArtifacts
     exact_hartree_dft: SCExactHartree | None = None
+    identity: dict | None = None  # map-0 overlap readout; never fed to F(H)
 
 
 @dataclass(frozen=True)
@@ -3996,6 +3988,66 @@ def _band_ranges(mask, *, band_offset: int) -> str:
         str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
 
 
+def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
+                          history, *, cutoff_ev):
+    """Read a map in frozen QP identities; retain only small host diagnostics.
+
+    The reference is the first map OUTPUT, not its DFT input rotation.
+    Output eigenvectors are computed with the existing k-sharded kernel;
+    the map's retained ``sigma_basis_U`` supplies its input eigenvectors.
+    Neither eigenvectors nor assignments replace the Hamiltonian carry.
+    """
+    from common.collectives import gather_to_host
+    from .sc_state_identity import assign_qp_identity
+
+    partition = _state_partition(state_out, inputs)
+    protected = np.asarray(partition.protected_mask, dtype=bool)
+    in_range = np.asarray(partition.in_range_mask, dtype=bool)
+    mask = protected | in_range
+    eigh, _ = _kshard_eigh_kernels(inputs.mesh_xy, _band_rotation_spec())
+    _, output_u = eigh(state_out.H_qp_dft)
+    u_out = np.asarray(gather_to_host(output_u))
+    u_in = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))
+    nb = e_output_ev.shape[1]
+    u_in = u_in[:, :nb, :nb]
+    u_out = u_out[:, :nb, :nb]
+    if not history:
+        history.update(u=u_out.copy(), e=np.asarray(e_output_ev).copy(),
+                       mask=mask.copy(), previous=None)
+    if not np.array_equal(mask, history['mask']):
+        raise ValueError('SC identity: trusted mask changed after map 0')
+    args = (history['u'], history['e'])
+    kw = dict(degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
+    out_index, out_e, blocks, weight = assign_qp_identity(
+        *args, u_out, e_output_ev, mask, **kw)
+    in_index, in_e, _, _ = assign_qp_identity(
+        *args, u_in, e_input_ev, mask, **kw)
+    # Preserve the legacy all-band RMS as a sorted diagnostic. Only trusted
+    # columns enter the criterion and receive the overlap/block-mean readout.
+    aligned_in, aligned_out = np.array(e_input_ev), np.array(e_output_ev)
+    aligned_in[:, mask], aligned_out[:, mask] = in_e[:, mask], out_e[:, mask]
+    verdict = protected_band_convergence(
+        aligned_out, aligned_in, protected, in_range, cutoff_ev)
+    sorted_verdict = protected_band_convergence(
+        e_output_ev, e_input_ev, protected, in_range, cutoff_ev)
+    previous = history['previous']
+    motion = (np.full(out_e.shape, np.nan) if previous is None else out_e - previous)
+    history['previous'] = out_e.copy()
+    reassigned = np.sum(out_index[:, mask] != np.flatnonzero(mask), axis=1)
+    worst_k = int(np.argmax(reassigned))
+    info = dict(input_indices=in_index, output_indices=out_index,
+                blocks=blocks, input_ev=in_e, output_ev=out_e,
+                residual_ev=out_e-in_e, motion_ev=motion, weight=weight,
+                sorted_max_ev=sorted_verdict.max_abs_ev)
+    state_out = replace(state_out, outputs=replace(state_out.outputs, identity=info))
+    _record_sc(inputs,
+        f'SC identity: max |dE| by overlap = {verdict.max_abs_ev:.9e} eV '
+        f'(sorted-index value {sorted_verdict.max_abs_ev:.9e} eV; '
+        f'{int(reassigned[worst_k])} reassignments at k={worst_k}; '
+        f'total={int(reassigned.sum())})')
+    return verdict, state_out
+
+
 def _sc_map_gain_for_call(
     inputs: SCInputs,
     state_out: SCState,
@@ -4018,6 +4070,17 @@ def _sc_map_gain_for_call(
             "SC map gain: retained E and Sigma tables must already share "
             f"the loop k-set and band window, got E={e_now.shape}, "
             f"Sigma={sigma_now.shape}")
+    identity = getattr(state_out.outputs, 'identity', None)
+    if identity is not None:
+        e_now = e_now.copy()
+        sigma_aligned = sigma_now.copy()
+        for k, block_row in enumerate(identity['blocks']):
+            for block in np.unique(block_row[block_row >= 0]):
+                labels = np.flatnonzero(block_row == block)
+                columns = identity['input_indices'][k, labels]
+                e_now[k, labels] = identity['input_ev'][k, labels]
+                sigma_aligned[k, labels] = sigma_now[k, columns].mean()
+        sigma_now = sigma_aligned
     current = (e_now.copy(), sigma_now.copy())
     if previous is None:
         return None, current
@@ -4163,8 +4226,10 @@ def _write_sc_eqp_snapshot(
     # mask, fallback, membership test, convergence test, or map update here.
     eqp1_output = e_eval + z_factor * (e_output - e_eval)
 
+    snapshot_partition = _state_partition(state_out, inputs)
     active_scissored = np.flatnonzero(
-        ~np.asarray(inputs.partition.in_range_mask, dtype=bool))
+        ~(np.asarray(snapshot_partition.protected_mask, dtype=bool)
+          | np.asarray(snapshot_partition.in_range_mask, dtype=bool)))
     band_offset = int(inputs.band_slices.sigma.start)
     active_labels = ",".join(
         str(band_offset + int(i) + 1) for i in active_scissored)
@@ -4209,6 +4274,30 @@ def _write_sc_eqp_snapshot(
     ]
     if map_gain is not None:
         comments.insert(2, map_gain.stamp())
+    identity = getattr(state_out.outputs, 'identity', None)
+    if identity is not None:
+        tables = {key: _loop_to_file_wedge(identity[key]) for key in
+                  ('input_indices', 'output_indices', 'blocks', 'input_ev',
+                   'output_ev', 'residual_ev', 'motion_ev', 'weight')}
+        comments.append('SC_identity refers to eqp0 map output; map-0 QP '
+                        'multiplet means; k_file_0based indexes the k block, '
+                        'body columns remain ispin, iband, E_DFT, E_QP')
+        for k, row in enumerate(tables['blocks'].astype(int)):
+            for block in np.unique(row[row >= 0]):
+                labels = np.flatnonzero(row == block)
+                first = labels[0]
+                def band_list(a):
+                    return ','.join(str(int(v) + band_offset + 1) for v in a)
+                comments.append(
+                    f'SC_identity k_file_0based={k} '
+                    f'map0_bands_1based={band_list(labels)} '
+                    f'input_sorted_bands_1based={band_list(tables["input_indices"][k, labels])} '
+                    f'output_sorted_bands_1based={band_list(tables["output_indices"][k, labels])} '
+                    f'E_input_mean_ev={tables["input_ev"][k, first]:.12e} '
+                    f'E_output_mean_ev={tables["output_ev"][k, first]:.12e} '
+                    f'residual_ev={tables["residual_ev"][k, first]:.12e} '
+                    f'motion_ev={tables["motion_ev"][k, first]:.12e} '
+                    f'projector_weight={tables["weight"][k, first]:.12e}')
     comments = tuple(comments)
     path = os.path.join(
         inputs.input_dir, f"eqp0_iter{int(call_index):04d}.dat")
@@ -4346,13 +4435,8 @@ def run_self_consistency(
         e_new_ev = (
             np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
         rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
-        verdict = protected_band_convergence(
-            e_new_ev, e_initial_ev,
-            np.asarray(_state_partition(state_new, inputs).protected_mask,
-                       dtype=bool).reshape(-1),
-            np.asarray(_state_partition(state_new, inputs).in_range_mask,
-                       dtype=bool).reshape(-1),
-            tol_ev)
+        verdict, state_new = _sc_identity_for_call(
+            inputs, state_new, e_initial_ev, e_new_ev, {}, cutoff_ev=tol_ev)
         state_new = replace(state_new, convergence_verdict=verdict)
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
@@ -4413,6 +4497,7 @@ def _run_linear_mixing(
     #: was stamped from the wrong one.
     _out_history: list[np.ndarray] = [E_prev_ev.copy()]
     gain_previous: tuple[np.ndarray, np.ndarray] | None = None
+    identity_history = {}
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
@@ -4483,13 +4568,9 @@ def _run_linear_mixing(
         # break on ``rms < tol_ev`` -- an RMS over ALL active bands
         # including the scissored ones, both the looser test and a
         # different set.
-        verdict = protected_band_convergence(
-            E_candidate_ev, E_prev_ev,
-            np.asarray(_state_partition(state_map, inputs).protected_mask,
-                       dtype=bool),
-            np.asarray(_state_partition(state_map, inputs).in_range_mask,
-                       dtype=bool),
-            tol_ev)
+        verdict, state_map = _sc_identity_for_call(
+            inputs, state_map, E_prev_ev, E_candidate_ev, identity_history,
+            cutoff_ev=tol_ev)
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
         # a stamp computed from ``E_new_ev`` (post-mix) described a
@@ -4703,6 +4784,7 @@ def _run_rcrop(
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
+    _identity_history = {}
     _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
@@ -4755,13 +4837,9 @@ def _run_rcrop(
         # difference can be driven small by damping while F still has no
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
-        _verdict = protected_band_convergence(
-            E_new, E_in,
-            np.asarray(_state_partition(state_out, inputs).protected_mask,
-                       dtype=bool),
-            np.asarray(_state_partition(state_out, inputs).in_range_mask,
-                       dtype=bool),
-            tol_ev)
+        _verdict, state_out = _sc_identity_for_call(
+            inputs, state_out, E_in, E_new, _identity_history, cutoff_ev=tol_ev)
+        _last_outputs[0] = state_out.outputs
         _last_verdict[0] = _verdict
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
