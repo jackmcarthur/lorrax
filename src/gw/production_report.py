@@ -178,7 +178,10 @@ class GWProductionReport:
         self.emit("LORRAX GW CALCULATION")
         self.emit("=" * 78)
         self.emit(f"Input          : {abs_path(input_file)}")
-        self.emit(f"Method         : {config.compute_mode.value} / "
+        route = getattr(getattr(config, "sigma", None), "freq_route", None)
+        method = ("internal_ff_cd" if getattr(route, "value", None)
+                  == "internal_ff_cd" else config.compute_mode.value)
+        self.emit(f"Method         : {method} / "
                   f"{config.qp_solver.value}")
 
     def architecture(self) -> None:
@@ -191,6 +194,8 @@ class GWProductionReport:
         """Dense statement of the physical approximations that actually run."""
         mode = config.compute_mode.value
         solver = config.qp_solver.value
+        route = getattr(getattr(config, "sigma", None), "freq_route", None)
+        is_internal_ff_cd = getattr(route, "value", None) == "internal_ff_cd"
         mode_text = {
             "x_only": "bare exchange",
             "cohsex": "static screened exchange + Coulomb hole",
@@ -198,6 +203,10 @@ class GWProductionReport:
             "hl_ppm": "Hybertsen-Louie plasmon-pole GW",
             "mpa": "multipole-approximation GW",
         }.get(mode, mode)
+        if is_internal_ff_cd:
+            mode_text = (
+                "fit-free contour-deformation GW oracle; direct real-axis "
+                "residues plus imaginary-axis contour")
         solver_text = qp_solver_semantics(solver).description
         screening = getattr(config, "screening", None)
         diagrams = getattr(getattr(screening, "diagrams", None), "value", "-")
@@ -233,8 +242,13 @@ class GWProductionReport:
             self.emit(
                 "EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma "
                 "eigenvalue self-consistency)")
-        self.emit(f"Screening      : {diagram_text}; "
-                  f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
+        if is_internal_ff_cd:
+            self.emit(
+                f"Screening      : {diagram_text}; direct ordered-pair chi0 "
+                "and distributed W at the CD contour nodes")
+        else:
+            self.emit(f"Screening      : {diagram_text}; "
+                      f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
         self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
         self.emit(f"Coulomb system : {geometry}; Hartree=live G-space")
         self.emit("Spin channels  : " + (
