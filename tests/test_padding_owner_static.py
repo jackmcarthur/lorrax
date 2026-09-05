@@ -56,7 +56,60 @@ MODULO_EXCEPTIONS = {
         "reason": "cyclic y-axis ppermute destination",
         "follow_up": "retire with the legacy head-wing kernel",
     },
+    ("services/lxkit/src/lxkit/deck_doctor.py", "inspect_deck",
+     "sigma_window % px"): {
+        "reason": "concurrently owned launcher diagnostic, not runtime physics",
+        "follow_up": "LXDOCTOR owner must retire the logical-window refusal",
+    },
+    ("services/lxkit/src/lxkit/deck_doctor.py", "inspect_deck",
+     "sigma_window % py"): {
+        "reason": "concurrently owned launcher diagnostic, not runtime physics",
+        "follow_up": "LXDOCTOR owner must retire the logical-window refusal",
+    },
 }
+
+
+def _registered(entries, *, reason, follow_up):
+    """Attach a reviewable reason and disposition to every exact census item."""
+    return {
+        entry: {"reason": reason, "follow_up": follow_up}
+        for entry in entries
+    }
+
+
+MODULO_EXCEPTIONS.update(_registered({
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "validate_batch_reshard_operands", "n % px"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "validate_batch_reshard_operands", "n % py"),
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "validate_batch_reshard_operands", "nrhs % py"),
+    ("services/distrib_la/src/distrib_la/matmul.py", "matmul",
+     "int(x.shape[-1]) % py"),
+    ("services/distrib_la/src/distrib_la/matmul.py", "matmul",
+     "int(x.shape[-2]) % px"),
+    ("services/distrib_la/src/distrib_la/matmul.py", "matmul", "m_out % px"),
+    ("services/distrib_la/src/distrib_la/matmul.py", "matmul", "n_out % py"),
+    ("services/distrib_la/src/distrib_la/polar.py", "_mesh_contract", "n % px"),
+    ("services/distrib_la/src/distrib_la/polar.py", "_mesh_contract", "n % py"),
+    ("services/distrib_la/src/distrib_la/resolve.py", "resolve_backend",
+     "int(n) % px"),
+    ("services/distrib_la/src/distrib_la/resolve.py", "resolve_backend",
+     "int(n) % py"),
+}, reason="backend authenticates an already-produced distributed carrier",
+   follow_up="caller must obtain the carrier from runtime.padding"))
+
+MODULO_EXCEPTIONS.update(_registered({
+    ("services/symmetry_maps/src/symmetry_maps/maps.py",
+     "reorder_isdf_operator_basis", "shape[1] % (px * py)"),
+    ("services/symmetry_maps/src/symmetry_maps/maps.py",
+     "reorder_isdf_operator_basis", "shape[2] % (px * py)"),
+    ("services/symmetry_maps/src/symmetry_maps/maps.py",
+     "unfold_spin_centroid_operator", "n_left * ns % px"),
+    ("services/symmetry_maps/src/symmetry_maps/maps.py",
+     "unfold_spin_centroid_operator", "perm_ms % (n_left * ns // px)"),
+}, reason="symmetry transport authenticates an already-padded package",
+   follow_up="accept the runtime receipt when the service API next changes"))
 
 DIVISIBILITY_REFUSAL_EXCEPTIONS = {
     ("src/bse/bse_ring_comm.py", "create_mesh_xy"): {
@@ -75,6 +128,46 @@ DIVISIBILITY_REFUSAL_EXCEPTIONS = {
         "follow_up": "retire when the runtime admits rectangular meshes",
     },
 }
+
+DIVISIBILITY_REFUSAL_EXCEPTIONS.update(_registered({
+    ("services/distrib_la/src/distrib_la/_batch_reshard.py",
+     "validate_batch_reshard_operands"),
+    ("services/distrib_la/src/distrib_la/_cusolvermp.py",
+     "batched_distributed_cholesky"),
+    ("services/distrib_la/src/distrib_la/_cusolvermp.py",
+     "batched_distributed_getrf"),
+    ("services/distrib_la/src/distrib_la/_cusolvermp.py",
+     "batched_distributed_getrs"),
+    ("services/distrib_la/src/distrib_la/_cusolvermp.py",
+     "batched_distributed_potrs"),
+    ("services/distrib_la/src/distrib_la/_cusolvermp.py",
+     "batched_distributed_solve_lu"),
+    ("services/distrib_la/src/distrib_la/_cusolvermp.py", "distributed_eigh"),
+    ("services/distrib_la/src/distrib_la/_native2d.py", "block_size_for"),
+    ("services/distrib_la/src/distrib_la/_scalapack.py",
+     "_validate_lu_geometry"),
+    ("services/distrib_la/src/distrib_la/_scalapack.py",
+     "batched_distributed_eigh"),
+    ("services/distrib_la/src/distrib_la/_scalapack.py",
+     "batched_distributed_getrs"),
+    ("services/distrib_la/src/distrib_la/_scalapack.py",
+     "batched_distributed_solve_lu"),
+    ("services/distrib_la/src/distrib_la/_slate.py",
+     "batched_distributed_cholesky"),
+    ("services/distrib_la/src/distrib_la/_slate.py", "batched_distributed_trsm"),
+    ("services/distrib_la/src/distrib_la/_slate.py", "distributed_cholesky"),
+    ("services/distrib_la/src/distrib_la/_slate.py", "distributed_eigh"),
+    ("services/distrib_la/src/distrib_la/_slate.py", "distributed_trsm"),
+    ("services/distrib_la/src/distrib_la/polar.py", "_mesh_contract"),
+    ("services/distrib_la/src/distrib_la/resolve.py", "resolve_backend"),
+}, reason="backend cannot consume a ragged carrier",
+   follow_up="retain as provider authentication; runtime.padding owns production"))
+
+DIVISIBILITY_REFUSAL_EXCEPTIONS.update(_registered({
+    ("services/symmetry_maps/src/symmetry_maps/maps.py",
+     "_get_unfold_isdf_operator_jit"),
+}, reason="collective authenticates the already-padded symmetry carrier",
+   follow_up="accept the runtime receipt when the service API next changes"))
 
 
 class _PaddingCensus(ast.NodeVisitor):
@@ -133,7 +226,9 @@ def test_runtime_padding_is_the_only_mesh_extent_arithmetic_owner():
     modulo = set()
     refusals = set()
     forbidden = []
-    for absolute in sorted((ROOT / "src").rglob("*.py")):
+    sources = list((ROOT / "src").rglob("*.py"))
+    sources.extend((ROOT / "services").glob("*/src/**/*.py"))
+    for absolute in sorted(sources):
         relative = absolute.relative_to(ROOT)
         if relative == OWNER:
             continue

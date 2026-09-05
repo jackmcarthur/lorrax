@@ -1742,8 +1742,9 @@ class WfnLoader:
         k_idxs, unfold = self._resolve_k(k)
         named_sharding, p_band = self._default_sharding(
             sharding, n_k=len(k_idxs))
-        from runtime.padding import round_up
-        nb_padded = round_up(nb_logical, p_band)
+        from runtime.padding import padded_axis
+        nb_padded = padded_axis(
+            nb_logical, p_band, name="WfnLoader.band").carrier
 
         # Backends produce 2-spinor ψ in the canonical layout
         # ``(n_k, nb_padded, nspinor, ngkmax)`` c128.  The optional
