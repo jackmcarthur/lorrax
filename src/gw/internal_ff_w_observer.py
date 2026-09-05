@@ -547,7 +547,61 @@ class InternalFFWObserver:
             _atomic_sidecar(self.spec.sidecar_path, self._state)
 
 
-def open_w_observer(spec, *, mesh_xy, v_wedge) -> InternalFFWObserver:
+class CompletedInternalFFWObserver:
+    """Read-only receipt for a durably completed write-once observer.
+
+    This object deliberately owns no SlabIO handle, probes, or action kernel.
+    It exists only so a CD restart whose matching checkpoints are also
+    complete can advance to the post-body head/finalizer without reopening a
+    completed W payload for append.  Any attempt to consume another W
+    frequency remains a hard refusal.
+    """
+
+    def __init__(self, spec, *, state):
+        self.spec = spec
+        self._state = state
+        self._closed = False
+
+    @property
+    def artifact_receipt(self) -> dict:
+        return {
+            "payload_path": self.spec.payload_path,
+            "sidecar_path": self.spec.sidecar_path,
+            "identity_digest": self.spec.identity_digest,
+        }
+
+    def require_checkpoint_prefix(self, arm: str, completed: int) -> None:
+        plan = self.spec.arm(arm)
+        completed = int(completed)
+        expected = int(plan["n"])
+        ready = int(self._state["ready_prefix_by_arm"][arm])
+        if ready != expected:
+            raise ValueError(
+                f"completed W observer has nonterminal {arm} readiness "
+                f"{ready}/{expected}; start a new run variant")
+        if completed != expected:
+            raise ValueError(
+                f"completed W observer is read-only but the matching CD "
+                f"checkpoint covers {completed}/{expected} frequencies for "
+                f"{arm}; missing Sigma body work cannot be resumed without "
+                "a writable matching observer. Start a new run variant.")
+
+    def observe(self, global_frequency_index: int, wc_wedge) -> None:
+        raise RuntimeError(
+            "completed W observer is read-only; no W frequency may be added")
+
+    def commit_prefix(self, arm: str, n: int) -> None:
+        raise RuntimeError(
+            "completed W observer is read-only; readiness may not be changed")
+
+    def close(self, *, body_complete: bool) -> None:
+        if not body_complete:
+            raise RuntimeError(
+                "completed W observer cannot be downgraded from body_complete")
+        self._closed = True
+
+
+def open_w_observer(spec, *, mesh_xy, v_wedge):
     """Allocate or authenticate, then open the one persistent SlabIO owner."""
     from common.collectives import barrier
     from file_io.slab_io import SlabIO
@@ -571,8 +625,8 @@ def open_w_observer(spec, *, mesh_xy, v_wedge) -> InternalFFWObserver:
             "W observer found only one transaction artifact; start a new run "
             f"variant instead of repairing {payload} / {sidecar}")
 
-    probes = _make_probes(spec, mesh_xy, nmu_storage)
     if not payload_exists:
+        probes = _make_probes(spec, mesh_xy, nmu_storage)
         state = _new_sidecar(
             spec, status="allocating", nmu_storage=nmu_storage)
         _atomic_sidecar(spec.sidecar_path, state)
@@ -592,15 +646,28 @@ def open_w_observer(spec, *, mesh_xy, v_wedge) -> InternalFFWObserver:
             raise ValueError(
                 "W observer artifacts have an incompatible identity; start a "
                 "new run variant")
+        _validate_resume_state(state, spec, nmu_storage)
         if state.get("status") == "body_complete":
-            raise ValueError(
-                "W observer artifact is complete and write-once; consume it "
-                "offline or start a new run variant")
+            incomplete = {
+                arm["name"]: (
+                    int(state["ready_prefix_by_arm"][arm["name"]]),
+                    int(arm["n"]),
+                )
+                for arm in spec.arms
+                if int(state["ready_prefix_by_arm"][arm["name"]])
+                != int(arm["n"])
+            }
+            if incomplete:
+                raise ValueError(
+                    "W observer sidecar claims body_complete with incomplete "
+                    f"arms {incomplete}; start a new run variant")
+            barrier("internal_ff_w_observer_completed_read_only")
+            return CompletedInternalFFWObserver(spec, state=state)
         if state.get("status") != "active":
             raise ValueError(
                 f"W observer sidecar status {state.get('status')!r} is not "
                 "resumable; start a new run variant")
-        _validate_resume_state(state, spec, nmu_storage)
+        probes = _make_probes(spec, mesh_xy, nmu_storage)
 
     barrier("internal_ff_w_observer_before_append")
     io = SlabIO(spec.payload_path, mode="a", mesh=mesh_xy)
@@ -617,6 +684,7 @@ def open_w_observer(spec, *, mesh_xy, v_wedge) -> InternalFFWObserver:
 
 __all__ = [
     "PROPOSAL_RANK", "HELDOUT_RANK", "PROBE_RANK", "OBSERVER_SCHEMA",
-    "WObserverSpec", "InternalFFWObserver", "select_q_rows",
-    "plan_w_observer", "make_wc_action_kernel", "open_w_observer",
+    "WObserverSpec", "InternalFFWObserver", "CompletedInternalFFWObserver",
+    "select_q_rows", "plan_w_observer", "make_wc_action_kernel",
+    "open_w_observer",
 ]

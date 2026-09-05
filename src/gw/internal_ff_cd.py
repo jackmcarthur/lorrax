@@ -570,7 +570,7 @@ def _save_checkpoint(path: Path, identity, completed, accumulators,
 
 def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
                           mesh, sym, wfn, V_q, band_slices,
-                          nb_chi_logical, print_fn):
+                          nb_chi_logical, velocity_path, print_fn):
     """The referee's pole-free static metallic head and eta=0 half residue."""
     from common.collectives import device_put_process_local
     from common.kq_mapping import kminq_idx_for_iq
@@ -587,7 +587,7 @@ def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
     surface = star_symmetrize_weights(surface, np.asarray(sym.irr_idx_k))
     surface_kn = jnp.asarray(surface * nk, dtype=jnp.float64)
     velocity = load_dft_velocity_head(
-        config.paths.parallel_transport_file, mesh=mesh, wfn=wfn, meta=meta)
+        velocity_path, mesh=mesh, wfn=wfn, meta=meta)
     nb_logical = int(nb_chi_logical)
     nb_storage = int(band_slices.nb_full)
     if int(wfns.enk.shape[1]) != nb_storage:
@@ -685,8 +685,10 @@ def compute_internal_ff_cd(
     or a mean.
     """
     from psp.get_DFT_mtxels import spin_degeneracy_factor
+    from file_io.paths import resolve_input_path
     from symmetry_maps import unfold_isdf_operator
     from .efermi import OccupationState, mp1_negative_derivative
+    from .qsgw_head import preflight_dft_velocity_head
     from .v_q_g_flat import _resolve_ibz_q_list
     from .w_isdf import solve_w
 
@@ -707,6 +709,14 @@ def compute_internal_ff_cd(
             raise ValueError(
                 f"internal_ff_cd {name}={value} is outside padded carrier "
                 f"extent {nb_storage}")
+    velocity_path = resolve_input_path(
+        input_dir, config.paths.parallel_transport_file)
+    preflight_dft_velocity_head(
+        velocity_path, mesh=mesh_xy, wfn=wfn, meta=meta)
+    if rank == 0:
+        print_fn(
+            "  internal_ff_cd preflight: authenticated exact-DFT velocity "
+            f"stage at {velocity_path}")
     if occupation_state is None:
         occupation_state = OccupationState.solve_mp1(
             wfns.enk, np.full(nk, 1.0 / nk), float(wfn.num_electrons),
@@ -1115,7 +1125,7 @@ def compute_internal_ff_cd(
         wfns, target_k, target_b, state=state, config=config, meta=meta,
         mesh=mesh_xy, sym=sym, wfn=wfn, V_q=V_q,
         band_slices=band_slices, nb_chi_logical=nb_chi_logical,
-        print_fn=print_fn)
+        velocity_path=velocity_path, print_fn=print_fn)
     totals = real_results[-1] + imag_accum + head_ev
     controls, control_max_mev, contracts = _control_certificate(
         real_fine=real_results[-1], real_coarse=final_coarse_real,

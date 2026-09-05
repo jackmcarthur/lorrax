@@ -197,6 +197,7 @@ __all__ = [
     "finalize_iteration_head_samples",
     "load_dft_velocity_head",
     "load_parallel_transport_head",
+    "preflight_dft_velocity_head",
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
     "rotate_velocity_to_qp",
@@ -662,6 +663,7 @@ def load_dft_velocity_head(
     mesh: Mesh,
     wfn,
     meta,
+    _authenticate_only: bool = False,
 ) -> DftVelocityHeadData:
     """Load the completed exact-DFT velocity stage, and only that stage.
 
@@ -734,16 +736,41 @@ def load_dft_velocity_head(
                 f"{path}: refusing DFT velocity stage:\n  - "
                 + "\n  - ".join(refusals)
             )
-        velocity = io.read_slab(
-            VELOCITY_DFT_DATASET,
-            shape=(3, int(meta.nk_tot), nb_storage, nb_storage),
-            partition_spec=P(None, None, "x", "y"),
-        )
+        velocity = None
+        if not _authenticate_only:
+            velocity = io.read_slab(
+                VELOCITY_DFT_DATASET,
+                shape=(3, int(meta.nk_tot), nb_storage, nb_storage),
+                partition_spec=P(None, None, "x", "y"),
+            )
     return DftVelocityHeadData(
         velocity_dft_cart=velocity,
         nb_logical=nb,
         reciprocal_lattice_cart=reciprocal,
     )
+
+
+def preflight_dft_velocity_head(
+    path: str,
+    *,
+    mesh: Mesh,
+    wfn,
+    meta,
+) -> None:
+    """Authenticate velocity-stage metadata without reading its large data."""
+    try:
+        load_dft_velocity_head(
+            path, mesh=mesh, wfn=wfn, meta=meta,
+            _authenticate_only=True)
+    except Exception as exc:
+        raise ValueError(
+            "GATE internal_ff_cd_needs_dft_velocity: the internal full-"
+            "frequency CD route requires a current exact-DFT velocity stage "
+            f"at {path!r} before any W frequency is evaluated. Regenerate it "
+            "from this deck/WFN with `python -m psp.get_dipole_mtxels -i "
+            "<deck> --parallel-transport-out <path> "
+            "--parallel-transport-velocity-only`; original refusal: "
+            f"{exc}") from exc
 
 
 def _mesh_xy(mesh: Mesh) -> tuple[str, str]:
