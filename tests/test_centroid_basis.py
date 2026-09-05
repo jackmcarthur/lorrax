@@ -214,3 +214,25 @@ def test_file_carrier_can_be_smaller_equal_or_larger_than_runtime(monkeypatch, e
     flat = jax.device_put(canonical, NamedSharding(mesh, P(None, ('x', 'y'), None)))
     np.testing.assert_array_equal(np.asarray(basis.unpack_axis(
         basis.pack_axis(flat, 1), 1)), canonical)
+
+
+def test_single_device_mesh_converts_without_collectives():
+    # P = 1: every axis is replicated (spec P()), the permutation is local.
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ('x', 'y'))
+    # canonical order interleaves the orbits, so even one shard permutes
+    cents = np.asarray([[1, 0, 0], [2, 0, 0], [3, 1, 0], [2, 2, 0],
+                        [0, 1, 0], [0, 2, 0], [1, 3, 0]], dtype=np.int32)
+    basis = PackedCentroidBasis.build(cents, _sym_swap_xy(), (4, 4, 1), mesh)
+    assert not basis.is_identity
+    canonical = np.zeros((3, basis.n_canonical), dtype=np.complex128)
+    canonical[:, :basis.n_logical] = np.arange(3 * basis.n_logical).reshape(
+        3, -1) + 1.0
+    dev = jax.device_put(jnp.asarray(canonical), NamedSharding(mesh, P()))
+    packed = jax.block_until_ready(basis.pack_axis(dev, 1))
+    np.testing.assert_array_equal(
+        np.asarray(packed), basis.pack_host(canonical[:, :basis.n_logical], axis=1))
+    back = basis.unpack_axis(packed, 1)
+    np.testing.assert_array_equal(np.asarray(back), canonical)
+    op = jnp.einsum('im,in->mn', dev, dev.conj())
+    np.testing.assert_array_equal(
+        np.asarray(basis.unpack_operator(basis.pack_operator(op))), np.asarray(op))

@@ -43,10 +43,21 @@ def _permute_sharded_axis(arr, axis, source_map, mesh, spec, *, pad_to=None,
     arr = jnp.asarray(arr)
     ndim = int(arr.ndim)
     axis = int(axis) % ndim
+    source = np.asarray(source_map, dtype=np.int32)
+
+    def _pad(x, ax, target):
+        widths = [(0, 0)] * ndim
+        widths[ax] = (0, int(target) - int(x.shape[ax]))
+        return jnp.pad(x, widths)
+
     names = spec[axis] if axis < len(spec) else None
     if names is None:
-        raise ValueError(
-            f"centroid basis: axis {axis} of spec {spec} is not sharded.")
+        # Replicated axis (single-device meshes, replicated operands): the
+        # permutation is rank-local and needs no collective.
+        x = _pad(arr, axis, pad_to) if pad_to is not None else arr
+        x = jnp.take(x, jnp.asarray(source), axis=axis)
+        return x if crop_to is None else jax.lax.slice_in_dim(
+            x, 0, int(crop_to), axis=axis)
     names = (names,) if isinstance(names, str) else tuple(names)
     n_shards = int(np.prod([int(mesh.shape[n]) for n in names]))
     axis_name = names[0] if len(names) == 1 else names
@@ -55,12 +66,6 @@ def _permute_sharded_axis(arr, axis, source_map, mesh, spec, *, pad_to=None,
     if ndim < 2:
         raise ValueError("centroid basis: sharded conversion needs a second axis")
     split = max((i for i in range(ndim) if i != axis), key=lambda i: local[i])
-    source = np.asarray(source_map, dtype=np.int32)
-
-    def _pad(x, ax, target):
-        widths = [(0, 0)] * ndim
-        widths[ax] = (0, int(target) - int(x.shape[ax]))
-        return jnp.pad(x, widths)
 
     def body(x):
         if pad_to is not None:
