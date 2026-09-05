@@ -51,8 +51,8 @@ class BandPartition:
         True for bands that get full off-diagonal Σ corrections in
         ``H_qp_dft`` and participate in the basis rotation.
     in_range_mask : (nk, nb_active) or (nb_active,) bool
-        True for bands whose ``E_DFT`` lies inside ``[ω_min, ω_max]`` at
-        every k.  Used to decide between Σ_diag (in-range) and scissor
+        True for identities whose current assigned energy lies inside
+        ``[ω_min, ω_max]`` at every k.  Used to decide between Σ_diag (in-range) and scissor
         (out-of-range) for the *non-protected* bands' diagonal.
     """
 
@@ -231,8 +231,8 @@ def build_omega_band_partition(
             sorted_i = np.zeros(e_ev.shape[1], dtype=bool)
             sorted_p[indices[k]] = protected[k]
             sorted_i[indices[k]] = in_range[k]
-            if not (np.array_equal(sorted_p, protected[k]) and
-                    np.array_equal(sorted_i, in_range[k])):
+            if k == 0 or not (np.array_equal(sorted_p, protected[k]) and
+                             np.array_equal(sorted_i, in_range[k])):
                 absolute = lambda mask: (np.flatnonzero(mask) + band_offset + 1).tolist()
                 print_fn(f"  {label} partition k={k}: protected identities="
                          f"{absolute(protected[k])}, sorted columns={absolute(sorted_p)}; "

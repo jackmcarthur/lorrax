@@ -4999,6 +4999,9 @@ class LorraxConfig:
     # config built by hand, and the consumer refuses on empty rather than
     # guessing a deck beside the restart.
     input_file: str = ""
+    #: Internal sampled SC support, retained by the quadrature session.
+    #: This is not a deck knob; requested Sigma bounds stay unchanged.
+    sc_omega_grid_ev: tuple[float, ...] | None = None
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""
@@ -5222,6 +5225,9 @@ class LorraxConfig:
         by the patch validation.  ``sigma_omega_min/max_ev`` are ignored
         then — the patches ARE the grid.
         """
+        if (self.qp_solver is QPSolver.SELF_CONSISTENT
+                and getattr(self, "sc_omega_grid_ev", None) is not None):
+            return np.asarray(self.sc_omega_grid_ev, dtype=np.float64)
         p = self.sigma
         patches = p.parsed_omega_patches_ev()
         if not patches:

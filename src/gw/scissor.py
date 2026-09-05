@@ -358,6 +358,61 @@ def sc_padded_window_ev(lower_ev, upper_ev):
             upper / (1.0 - _SC_PAD_FRACTION * np.sign(upper)))
 
 
+def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev):
+    """Cover retained raw SC energies by extending only outer samples.
+
+    Parameters
+    ----------
+    omega_grid_ev : (n_omega,) real
+        Existing sampled frequencies relative to mu, in eV, ascending.
+    energy_kn_ev : (nk, nb_active) real
+        Raw current energies relative to mu in eV, in DFT identity order.
+    required_kn : (nk, nb_active) or (nb_active,) bool
+        Protected or in-range identities retained in the Hamiltonian.
+    step_ev : float
+        Sampling step in eV, also used for the added outer samples.
+
+    Returns
+    -------
+    ndarray
+        Monotone sampled support containing every old sample unchanged.
+        Only uncovered required states trigger growth, to E +/- pad(E).
+        Interior gaps retain the existing patched-grid coverage refusal.
+    """
+    from common.units import RYD_TO_EV
+    from .qsgw_utils import assert_omega_grid_covers
+
+    grid = np.asarray(omega_grid_ev, dtype=np.float64)
+    energy = np.asarray(energy_kn_ev, dtype=np.float64)
+    required = np.asarray(required_kn, dtype=bool)
+    step = float(step_ev)
+    if (grid.ndim != 1 or grid.size < 2 or not np.isfinite(grid).all()
+            or np.any(np.diff(grid) <= 0.0)
+            or not np.isfinite(step) or step <= 0.0):
+        raise ValueError("SC omega support requires an ascending finite grid and positive step")
+    if energy.ndim != 2 or required.shape not in ((energy.shape[1],), energy.shape):
+        raise ValueError("SC omega support: energies and required identity masks disagree")
+    required = np.broadcast_to(required, energy.shape)
+    if not np.isfinite(energy[required]).all():
+        raise ValueError("SC omega support: retained energies must be finite")
+    assert_omega_grid_covers(
+        energy / RYD_TO_EV, required, grid / RYD_TO_EV,
+        context="SC retained identity support")
+    below = required & (energy < grid[0])
+    above = required & (energy > grid[-1])
+    if not (below.any() or above.any()):
+        return grid
+    lower = (float(np.min(energy[below] - sc_state_pad_ev(energy[below])))
+             if below.any() else float(grid[0]))
+    upper = (float(np.max(energy[above] + sc_state_pad_ev(energy[above])))
+             if above.any() else float(grid[-1]))
+    n_lower = int(np.ceil((grid[0] - lower) / step))
+    n_upper = int(np.ceil((upper - grid[-1]) / step))
+    return np.concatenate((
+        grid[0] - step * np.arange(n_lower, 0, -1), grid,
+        grid[-1] + step * np.arange(1, n_upper + 1)))
+
+
 def classify_bands_in_grid(
     E_kn_ev: np.ndarray,
     omega_min_ev: float,

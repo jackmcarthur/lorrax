@@ -2829,7 +2829,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         mu_ev=_mu_ev, current_indices_kn=indices_loop,
         degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
         label=f"SC map {int(state.iteration)} (identity, mu-anchored)",
-        print_fn=inputs.print_fn)
+        print_fn=lambda line: _record_sc(inputs, line))
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),
@@ -3262,6 +3262,38 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # returns (see ``dump_sigma_omega_h5_final``).
     # Same metal-only threading as the screening step above: Σ_x/SX
     # diag(f), Σ_c branch weights, and the metal E_F reference.
+    sigma_config = inputs.config
+    if inputs.config.compute_mode.is_dynamic:
+        from .scissor import extend_sc_omega_grid_ev, sc_state_pad_ev
+
+        session = inputs.fixed_quadrature_session
+        sampled_grid = np.asarray(
+            session.get("omega_grid_ev", inputs.config.omega_grid_ev)
+            if session is not None else inputs.config.omega_grid_ev,
+            dtype=np.float64)
+        support_partition = _partition_on_loop(partition, inputs)
+        required_kn = np.broadcast_to(np.asarray(
+            support_partition.protected_mask | support_partition.in_range_mask,
+            dtype=bool), energies_loop.shape)
+        energy_relative_ev = energies_loop - _mu_ev
+        expanded_grid = extend_sc_omega_grid_ev(
+            sampled_grid, energy_relative_ev, required_kn,
+            float(inputs.config.sigma.omega_step_ev))
+        escaped_kn = required_kn & (
+            (energy_relative_ev < sampled_grid[0])
+            | (energy_relative_ev > sampled_grid[-1]))
+        for k, n in zip(*np.nonzero(escaped_kn)):
+            energy = float(energy_relative_ev[k, n])
+            _record_sc(
+                inputs, f"SC sampled-support growth: "
+                f"band={int(inputs.band_slices.b0) + int(n) + 1}, k={int(k)}, "
+                f"E-mu={energy:+.6f} eV, pad={float(sc_state_pad_ev(energy)):.6f} eV; "
+                f"sampled [{sampled_grid[0]:+.6f}, {sampled_grid[-1]:+.6f}] -> "
+                f"[{expanded_grid[0]:+.6f}, {expanded_grid[-1]:+.6f}] eV")
+        if session is not None:
+            session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
+        sigma_config = replace(
+            inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -3272,7 +3304,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         static_head_terms=iteration_static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad,
-        config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
+        config=sigma_config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
         sym=inputs.sym, wfn=inputs.wfn,
         band_slices=inputs.band_slices,
         input_dir=inputs.input_dir,
@@ -4271,6 +4303,8 @@ def _write_sc_eqp_snapshot(
         "these are map-call diagnostics over ALL active bands, not "
         "accepted-iterate residuals — a trial neighbour understates them",
         f"active_scissored_bands_1based={active_labels}",
+        "active_scissored_bands_1based denotes DFT identities scissored at all k; "
+        "eqp body band indices denote sorted eigenvalues",
         ("active_scissor=none (all active bands lie on the Sigma grid)"
          if active_fit is None else
          "shared_map_input_active_scissor: " + active_fit.summary()),
@@ -4282,6 +4316,12 @@ def _write_sc_eqp_snapshot(
             f"n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
             f"rmse={tail_fit.rmse_c_ev:.10e} eV")),
     ]
+    if active_fit is not None:
+        comments.append(
+            f"active_scissor_coefficients alpha_v={active_fit.alpha_v:.12e} "
+            f"beta_v_ev={active_fit.beta_v_ev:.12e} "
+            f"alpha_c={active_fit.alpha_c:.12e} "
+            f"beta_c_ev={active_fit.beta_c_ev:.12e}")
     if map_gain is not None:
         comments.insert(2, map_gain.stamp())
     identity = getattr(state_out.outputs, 'identity', None)
@@ -4294,7 +4334,22 @@ def _write_sc_eqp_snapshot(
                         'columns that carry them; QP multiplet means; '
                         'k_file_0based indexes the k block, body columns '
                         'remain ispin, iband, E_DFT, E_QP')
+        protected_file = _loop_to_file_wedge(np.broadcast_to(
+            np.asarray(snapshot_partition.protected_mask, bool),
+            np.shape(state_out.H_qp_dft)[:2])).astype(bool)
+        in_range_file = _loop_to_file_wedge(np.broadcast_to(
+            np.asarray(snapshot_partition.in_range_mask, bool),
+            np.shape(state_out.H_qp_dft)[:2])).astype(bool)
         for k, row in enumerate(tables['blocks'].astype(int)):
+            def mask_bands(mask):
+                return ','.join(str(int(n) + band_offset + 1)
+                                for n in np.flatnonzero(mask)) or 'none'
+            comments.append(
+                f'SC_partition k_file_0based={k} '
+                f'protected_DFT_bands_1based={mask_bands(protected_file[k])} '
+                f'in_range_DFT_bands_1based={mask_bands(in_range_file[k])} '
+                f'scissored_DFT_bands_1based='
+                f'{mask_bands(~(protected_file[k] | in_range_file[k]))}')
             for block in np.unique(row[row >= 0]):
                 labels = np.flatnonzero(row == block)
                 first = labels[0]
@@ -6064,6 +6119,11 @@ def dump_sigma_omega_h5_final(
             hartree_omitted=False)
     from .dynamic_sigma import write_sigma_omega
     from .qsgw_utils import write_qsgw_sigma_cube
+
+    # The final cube may contain support added for a promoted multiplet.
+    # Its own frequency axis, not the initial requested support, owns I/O.
+    config = replace(config, sc_omega_grid_ev=tuple(
+        float(x) for x in sigma_result.omega_grid_ev))
 
     # Sigma already crossed the map's one k-set seam with every retained
     # table.  The terminal writer stamps those star-wedge rows directly; it

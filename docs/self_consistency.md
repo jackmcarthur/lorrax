@@ -233,7 +233,8 @@ electron-volts per map (Na eta=0.5, 86 bands on a [-15,+18] eV grid: bands
 35-70 meV). When those entries entered the least squares, the accelerator's
 trials wandered (entry mu 2.09 eV at map 2, in-range residual 3.7 eV). The
 Gram and the residual norms are now taken over the non-scissored block only,
-the outer product of the initial ``protected | in_range`` mask; the update
+the per-k outer product of the current ``protected | in_range`` identity mask;
+the update
 still mixes the full carry and the scissored rows keep following the map. A
 full window (a semiconductor with every band in range) has weights of exactly
 1.0 and is bit identical to the unweighted solve. The log line is
@@ -258,22 +259,26 @@ a support that really crosses later is a box escape and rebuilds), and the
 disk cache never returns a certificate above eps. Do not loosen eps to admit
 a rule.
 
-**16. The self-consistent state set is fixed at map 0, with a margin from the
-grid edge.** Re-classifying bands against the (mu-anchored) Sigma window on
-every map made the iteration map discontinuous on Na (86 bands, top +18 eV):
-bands 9-10 reach 17.2 eV at some k and 11-13 straddle the edge, so ~1 eV QP
-shifts moved them in and out of the in-range set map to map and the loop
-floored. From map 1 the trusted set is the one chosen at map 0; the grid still
-re-anchors on each map's mu. At map 0 a band inside the grid whose all-k range
-ends within `SC_EDGE_MARGIN_EV` (2 eV, the SC state pad) of an edge is
-scissored, not self-consistent: at +24 eV band 14 sat 1.7 eV under the top and
-keeping its Gamma multiplet whole had promoted bands 15-23 (up to 16 eV above
-the grid, Sigma clamped) into the protected block, which threw the k=1 triplet
-6.4 eV in one map. A frozen in-range state that leaves the grid refuses with
-the band, the k row, the energy and the deck value that clears it. The log
-lines are `SC partition: N band(s) inside the grid but within 2.0 eV of an
-edge are scissored` and `SC partition: frozen from map 0 (...)`. A window
-whose bands never change class is bit identical.
+**16. One energy-dependent pad supports classification and quadrature.**
+A DFT-labelled band enters the protected set when its current all-k energy
+range lies entirely inside the requested, mu-anchored window. Previously
+protected members remain protected while their range lies within that window
+padded by `pad(E) = 0.5 eV + 0.10 |E - mu|`. The pad is 0.5 eV at mu,
+1.5 eV at 10 eV and 2.5 eV at 20 eV. This replaces the inward 2 eV edge
+margin and frozen sorted-index set: near-mu motion is small, while Na's
+spectrum stretches by about ten percent and the upper states moved 1.2–2.2 eV.
+Classification runs on every map, including rCROP trials. An escape prints
+the band identity, k, energy and pad; the state is reclassified and the
+quadrature planner retains its existing rebuild-on-box-escape behavior.
+The quadrature state support uses the same pad; pole padding and certified
+acceptance are unchanged. The sampled omega grid includes the hysteresis
+region while the requested bounds remain the entry criterion. A retained
+state's energy therefore stays sampled beyond the requested window.
+If local multiplet promotion retains an energy beyond that support, only the
+outer sampled endpoints grow, to the escaped energy plus its same pad; old
+samples remain unchanged and the quadrature session retains the expanded
+support on later maps. Interior holes still require an explicit patch.
+Quadrature nodes remain frozen while their certified boxes cover the map.
 
 **17. The active-window scissor law is frozen at map 0.** States inside the
 Sigma window but outside the omega grid follow an affine law fitted to the
@@ -288,10 +293,24 @@ justifies. The reviewers' remaining candidates for a metal residual after
 these closures, the per-map MPA pole refit and the sorted-index state
 identity, are registered in the sandbox issues ledger.
 
+**18. Partition identities are per k, and Hamiltonian masks use the carry's
+basis.** Overlap assignment against reference DFT multiplets finds the sorted
+QP columns carrying each identity on every map. Classification uses those raw
+assigned energies. Whole reference multiplets are protected locally at each
+k; promotion at one k does not transitively promote the same label at every
+other k. The Hamiltonian and rCROP carry are in the DFT basis, so their masks
+are `(k, DFT identity)`, with sorted-column correspondence printed explicitly.
+Applying sorted-column masks directly to that carry would protect the wrong
+states at a crossing. The same masks select the non-scissored convergence
+criterion, rCROP Gram block and identity comments. The eqp body retains sorted
+eigenvalues and the identity comments retain DFT-band labels. Each map reports
+bands protected at all k and k rows where the sorted protected columns differ
+from the reference labels.
+
 **19. On metals the self-consistent set should stop where the quasiparticle
 stops being well defined; convergence time is set by the largest Z in the
-set.** Na eta=0.5 (86 bands, 8x8x8, 896 centroids), three trusted sets run
-to convergence side by side: band 5 alone (window top +11 eV), bands 5-10
+set.** Na eta=0.5 (86 bands, 8x8x8, 896 centroids), three historical trusted sets were run
+with the former 2 eV inward margin: band 5 alone (window top +11 eV), bands 5-10
 (+21 eV) and bands 5-13 (+24 eV). Per accepted map, the unmixed output
 motion of every band with map-0 quasiparticle weight Z in (0.55, 0.8)
 (bands 5-8, Z from the eqp1 diagnostic `(eqp1 - E_DFT)/(eqp0 - E_DFT)`)
@@ -304,12 +323,16 @@ sets (bandwidth 6.831 / 6.827 / 6.837 eV against 6.581 DFT-seeded), while
 its absolute position moves 41 meV when bands 11-13 join the set (bands
 5 alone and 5-10 agree to 2.5 meV). Bands 5-10 converge to about 1 meV per
 map by accepted map 22 and reach a 2 meV rCROP residual at map 28; 5-13 is
-still at 5-9 meV per map on bands 12-13 at map 26. Production on Na:
-`sigma_omega_max_ev = 21` (trusted 5-10), report the Fermi window, and do
-not stop on the rCROP L-infinity residual while Z >= 1 states walk. A
+still at 5-9 meV per map on bands 12-13 at map 26. Those measurements used `sigma_omega_max_ev = 21` to select 5-10.
+Under the all-k entry rule in pitfall 16 the same +21 eV request initially
+admits 5-13, because the inward margin has been removed; a window value no
+longer implies the old membership. Report the actual identity masks and
+the Fermi-window observables, and do not infer observable convergence from
+the rCROP L-infinity residual alone while Z >= 1 states walk. A
 partition by quasiparticle well-definedness (Z below about 0.9 at every k
 at map 0) instead of by energy window is registered; in Na the multiplet
-chain links bands 5-10, so it needs per-k masks. The single measurement that
+chain linked bands 5-10 under global promotion; local per-k closure now
+avoids that transitive union. The single measurement that
 decides the next structural change is a small-kick response at a retained
 input: chi0, the body W and the final trusted-block H scale linearly
 (ratio 10.1-10.6 for a 10x kick) while the fitted scalar head does not

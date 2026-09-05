@@ -129,3 +129,50 @@ def test_identity_priority_preserves_established_readout_assignment():
         priority_mask=trusted, degeneracy_tol_ev=1e-4)
     np.testing.assert_array_equal(extended[:, trusted], old[:, trusted])
     np.testing.assert_array_equal(np.sort(extended, axis=1), [np.arange(5)])
+
+
+def test_promoted_multiplet_grows_sampled_support_and_reuses_it():
+    from gw.scissor import extend_sc_omega_grid_ev
+
+    reference = np.array([[0., 4., 4.], [0., 4., 8.]])
+    energy = np.array([[0., 4., 7.], [0., 4., 8.]])
+    part = _partition(energy, reference)
+    required = np.asarray(part.protected_mask | part.in_range_mask)
+    assert required[0, 2] and not required[1, 2]
+    original = np.arange(-3., 6.25 + .125, .25)
+    grown = extend_sc_omega_grid_ev(original, energy, required, .25)
+    assert grown[-1] == pytest.approx(8.25)
+    assert grown[0] == original[0]
+    np.testing.assert_array_equal(grown[:original.size], original)
+    # Without growth the retained 7 eV member would interpolate to 6.25.
+    assert np.interp(7., original, original) != pytest.approx(7.)
+    assert np.interp(7., grown, grown) == pytest.approx(7.)
+    repeated = extend_sc_omega_grid_ev(grown, energy, required, .25)
+    np.testing.assert_array_equal(repeated, grown)
+
+
+def test_sc_support_growth_low_edge_and_unrequired_outlier():
+    from gw.scissor import extend_sc_omega_grid_ev
+
+    original = np.arange(-3., 6.25 + .125, .25)
+    energy = np.array([[-4., 0., 50.]])
+    grown = extend_sc_omega_grid_ev(original, energy, [[True, True, False]], .25)
+    assert grown[0] == pytest.approx(-5.)
+    assert grown[-1] == original[-1]
+    np.testing.assert_array_equal(grown[-original.size:], original)
+
+
+def test_sc_support_unchanged_for_covered_energies():
+    from gw.scissor import extend_sc_omega_grid_ev
+
+    original = np.arange(-3., 6.25 + .125, .25)
+    grown = extend_sc_omega_grid_ev(original, [[-3., 6.25]], [[True, True]], .25)
+    np.testing.assert_array_equal(grown, original)
+
+
+def test_sc_support_retains_patched_grid_hole_refusal():
+    from gw.scissor import extend_sc_omega_grid_ev
+
+    patched = np.r_[np.arange(-3., -.9, .25), np.arange(2., 6.3, .25)]
+    with pytest.raises(ValueError, match="omega_grid_hole"):
+        extend_sc_omega_grid_ev(patched, [[0.]], [[True]], .25)
