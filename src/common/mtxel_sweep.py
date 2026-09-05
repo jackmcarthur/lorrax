@@ -810,6 +810,14 @@ def require_vnl_velocity_sign(value) -> float:
     return sign
 
 
+def resolve_vnl_velocity_sign(cli_value, deck_value) -> float:
+    """Resolve CLI-over-deck precedence for the two characterized arms."""
+    raw = cli_value if cli_value is not None else deck_value
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return VNL_VELOCITY_SIGN_FLIPPED
+    return require_vnl_velocity_sign(raw)
+
+
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                     vnl_setup=None,
                     vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED) -> Operator:

@@ -70,7 +70,8 @@ and in its negation, which is the one that gets said in review:
 `file_io/`, and the physics-aware modules in `common/`
 (`zeta_projection`, `wfn_transforms`, `gvec_fft_box`,
 `psi_G_store`, `kq_mapping`, `coulomb_sphere`, `meta`, `units`,
-`gamma_matrices`, `bispinor_init`, `chi_from_dipole`).  `symmetry_maps`
+`gamma_matrices`, `bispinor_init`, `chi_from_dipole`) and the inert
+`psp/dipole_store.py` file contract.  `symmetry_maps`
 and `density_symmetry_check` left `common/` for `services/symmetry_maps/`
 on 2026-08-07 and are reached through the service door; the forwarding
 shims left at their old paths were deleted the same day, so those

@@ -808,7 +808,7 @@ def test_head_correction_checks_dipole_provenance_and_coverage():
 
 def test_dipole_provenance_checker_still_exists_with_that_signature():
     """The caller passes ``wfn``/``nval``/``ncond``/``nband`` by keyword."""
-    tree = _tree(_read("psp/get_dipole_mtxels.py"), "get_dipole_mtxels")
+    tree = _tree(_read("psp/dipole_store.py"), "dipole_store")
     fn = None
     for n in ast.walk(tree):
         if isinstance(n, ast.FunctionDef) and n.name == "check_dipole_provenance":

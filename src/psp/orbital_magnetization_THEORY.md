@@ -178,6 +178,21 @@ computed sign is reported, not assumed. The expected magnitude for CrI₃ is
 * **Spin moment.** `|m_spin| ≈ 6 μ_B` cross-checks the wavefunction/occupations
   and pins the reporting axis.
 
+## 8. Interpolated-Hamiltonian route
+
+`bandstructure.htransform --orbital-magnetization-grid` evaluates the same
+formula without finite-differencing bands. It differentiates the existing
+Fourier series for `f(H)` and recovers off-diagonal `dH/dk` with
+
+```
+<m|dH|n> = (E_m-E_n)/(f(E_m)-f(E_n)) <m|d f(H)|n>.
+```
+
+Thus a DFT-only run contains the full mean-field velocity and no synthetic
+self-energy term. A QP-Hamiltonian run differentiates that complete operator,
+so its covariant `[r,Sigma]` term is present automatically. Both routes share
+the modern-theory contraction and the typed axial/time-odd symmetry projector.
+
 ## Sources
 
 1. T. Thonhauser, D. Ceresoli, D. Vanderbilt, R. Resta, *Orbital Magnetization

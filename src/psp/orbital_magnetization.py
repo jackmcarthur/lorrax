@@ -44,6 +44,12 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")  # MUST precede jax import (f64)
 if "--cpu" in sys.argv:  # force CPU backend (avoid GPU contention); must precede jax import
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ.setdefault("OMP_NUM_THREADS", "32")  # courteous cap on shared nodes
+if os.environ.get("JAX_PLATFORMS", "").strip().lower() == "cpu":
+    # This observable has an intentionally zero-FFI streaming route.  Reuse
+    # the runtime's pre-JAX CPU plugin guard without initializing its GPU/FFT
+    # communicator stack.
+    from runtime import skip_gpu_plugin_discovery
+    skip_gpu_plugin_discovery()
 
 import numpy as np
 import jax  # noqa: F401  (sets up x64; devices queried lazily)
@@ -212,7 +218,8 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
 def run_dipole_orbmag(wfn, sym, dipole_path, nbnd, nocc, deps_tol, m_axis):
     """Contract an authenticated full-BZ ``dipole.h5`` without redoing it."""
     import h5py
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from common.mtxel_sweep import VNL_VELOCITY_SIGN_FLIPPED
+    from psp.dipole_store import check_dipole_provenance
 
     path = Path(dipole_path).resolve()
     with h5py.File(path, "r") as h5:
@@ -233,10 +240,10 @@ def run_dipole_orbmag(wfn, sym, dipole_path, nbnd, nocc, deps_tol, m_axis):
         nval=int(stamp["prov_nval"]),
         ncond=int(stamp["prov_ncond"]),
         nband=int(stamp["prov_nband"]),
-        bispinor=bool(stamp["prov_bispinor"]),
-        skip_vnl=bool(stamp["prov_skip_vnl"]),
-        vnl_mode=str(stamp["prov_vnl_mode"]),
-        vnl_velocity_sign=float(stamp["prov_vnl_velocity_sign"]),
+        bispinor=False,
+        skip_vnl=False,
+        vnl_mode="analytic",
+        vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED,
     )
     if not ok:
         raise SystemExit(

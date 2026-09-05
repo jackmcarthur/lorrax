@@ -3409,10 +3409,10 @@ def build_dft_head_response(
     # Fail before the host read and every sharded head allocation.  Shape does
     # not identify a velocity artifact: in particular, a two-spinor dipole and
     # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
-    # The producer owns both the stamp grammar and sign resolution; consume
-    # those owners directly rather than mirroring either convention here.
-    from psp.get_dipole_mtxels import (
-        check_dipole_provenance, resolve_vnl_velocity_sign)
+    # Consume the inert store contract and the operator convention directly;
+    # importing a producer CLI just to inspect a file would start its runtime.
+    from psp.dipole_store import check_dipole_provenance
+    from common.mtxel_sweep import resolve_vnl_velocity_sign
     expected_vnl_sign = resolve_vnl_velocity_sign(
         None, config.vnl_velocity_sign)
     from common.four_current_model import resolve_four_current_representation

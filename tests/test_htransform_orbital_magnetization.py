@@ -119,9 +119,14 @@ def test_dipole_reuse_streams_full_bz_and_applies_typed_projection(
             "prov_vnl_velocity_sign": 1.0,
         })
 
+    checked = {}
+
+    def _authenticate(*_args, **kwargs):
+        checked.update(kwargs)
+        return True
+
     monkeypatch.setattr(
-        "psp.get_dipole_mtxels.check_dipole_provenance",
-        lambda *_a, **_k: True)
+        "psp.dipole_store.check_dipole_provenance", _authenticate)
 
     class _Wfn:
         pass
@@ -150,3 +155,7 @@ def test_dipole_reuse_streams_full_bz_and_applies_typed_projection(
     ref_b = np.mean([x[1].sum(axis=(1, 2)) for x in ref], axis=0)
     np.testing.assert_allclose(cA, [0.0, 0.0, ref_a[2]])
     np.testing.assert_allclose(cB, [0.0, 0.0, ref_b[2]])
+    assert checked["bispinor"] is False
+    assert checked["skip_vnl"] is False
+    assert checked["vnl_mode"] == "analytic"
+    assert checked["vnl_velocity_sign"] == 1.0

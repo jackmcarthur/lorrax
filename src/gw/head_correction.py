@@ -577,7 +577,7 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
         return
     nval, ncond, nband = _dipole_window_from_params(params, wfn)
     try:
-        from psp.get_dipole_mtxels import check_dipole_provenance
+        from psp.dipole_store import check_dipole_provenance
     except Exception as exc:            # psp stack unavailable (h5py-less env)
         if explicit_comparison:
             raise ValueError(
