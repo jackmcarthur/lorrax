@@ -405,7 +405,9 @@ GN-PPM "pad modes born dead" selector is the active-slot mask
 (`meta.mu_active_mask`) rather than an index prefix.  The Dyson matrix
 `1 - Vχ` already carries 1 on its pads.  A bispinor deck, a trivial group
 or a non-closed centroid set uses the identity layout (canonical order,
-every conversion a no-op).
+every conversion a no-op). Bispinor transverse metadata clears the charge
+basis and uses the existing canonical loader path for its own current
+centroid table, on both fresh and restart paths.
 
 Files keep the CANONICAL centroid-file order at logical extent, so ζ h5,
 restart tensors and the MPA sample/pole store stay processor-grid agnostic.

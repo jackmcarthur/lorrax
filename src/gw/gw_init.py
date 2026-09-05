@@ -1489,8 +1489,10 @@ def _resolve_zeta_fit_contract(
 		# device array only after the canonical all-channel reuse verdict says
 		# that a fit or downstream Sigma sampling is actually required.
 		centroids_transverse = np.asarray(cent_T_np, dtype=np.int32)
+		# The current channel has its own canonical table; it must not inherit
+		# the charge basis, which the loader would substitute for that table.
 		meta_transverse = replace(
-			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4,
+			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4, mu_basis=None,
 			n_rmu_padded=int(padded_mu_extent(int(n_rmu_T),
 			                                  int(jax.device_count()))))
 		meta_transverse.sys_dim = meta.sys_dim
@@ -4182,7 +4184,7 @@ def prepare_isdf_and_wavefunctions(
 					if cfg.memory.low_mem_bands else
 					int(rs.psi_rmu_Y_transverse.shape[-1]))
 				meta_restart_transverse = replace(
-					meta, n_rmu=int(_n_rmu_curr_now),
+					meta, n_rmu=int(_n_rmu_curr_now), mu_basis=None,
 					n_rmu_padded=_n_rmu_T_padded, nspinor=4, npol=4)
 				meta_restart_transverse.sys_dim = meta.sys_dim
 				meta_restart_transverse.bispinor = True
