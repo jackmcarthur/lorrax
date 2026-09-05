@@ -5891,28 +5891,32 @@ def dump_qp_wfn_artifacts(
              f"{' (star wedge)' if state_on_ibz else ' (full BZ)'}")
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
-    if jax.process_index() == 0:
-        enk_full_base_ry = None
-        tail_fit = (state.outputs.tail_scissor_fit
-                    if state.outputs is not None else None)
-        if tail_fit is not None:
-            if logical_band_stop is None:
-                raise ValueError(
-                    "dump_qp_wfn_artifacts: logical_band_stop is required "
-                    "when the final SC map used a tail scissor.")
-            base_ev = np.asarray(
-                wfn.energies[0], dtype=np.float64) * RYD_TO_EV
-            enk_full_base_ry = apply_conduction_scissor_to_tail(
-                base_ev, tail_fit,
-                tail_start=int(band_slices.b3),
-                logical_stop=int(logical_band_stop),
-            ) / RYD_TO_EV
+    enk_full_base_ry = None
+    tail_fit = (state.outputs.tail_scissor_fit
+                if state.outputs is not None else None)
+    if tail_fit is not None:
+        if logical_band_stop is None:
+            raise ValueError(
+                "dump_qp_wfn_artifacts: logical_band_stop is required "
+                "when the final SC map used a tail scissor.")
+        base_ev = np.asarray(
+            wfn.energies[0], dtype=np.float64) * RYD_TO_EV
+        enk_full_base_ry = apply_conduction_scissor_to_tail(
+            base_ev, tail_fit,
+            tail_start=int(band_slices.b3),
+            logical_stop=int(logical_band_stop),
+        ) / RYD_TO_EV
+    def _write_qp_wfn():
         write_qp_wfn_h5(
             qp_wfn_path, wfn=wfn,
             U_kmn=U_wfn, enk_active_qp_ry=enk_wfn_ry,
             band_start=band_slices.b0, band_stop=band_slices.b3,
             enk_full_base_ry=enk_full_base_ry,
         )
+    from common.collectives import rank0_transaction
+    rank0_transaction(qp_wfn_path, stage="qp_wfn_h5_write", write=_write_qp_wfn)
+
+    def _write_qp_rotations():
         # The tables come from the SERVICE's own accessor, never re-spelled
         # here: ``n_sym_spatial`` is derived from ``sym_mats_k`` rather than
         # from the WFN header, and that derivation is the one the unfold
@@ -5934,7 +5938,8 @@ def dump_qp_wfn_artifacts(
             source_wfn=wfn,
             print_fn=print_fn,
         )
-    barrier("qp_wfn_h5_write")
+    rank0_transaction(qp_rot_path, stage="qp_rotations_h5_write",
+                      write=_write_qp_rotations)
     print_fn(f"  QP WFN:       {qp_wfn_path}")
     print_fn(f"  QP rotations: {qp_rot_path}")
     _ref_kind = ("fixed-N mu" if (state.occupation_state is not None

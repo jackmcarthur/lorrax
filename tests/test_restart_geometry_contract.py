@@ -81,7 +81,6 @@ class _HostSlabIO:
 def host_transport(monkeypatch):
     _HostSlabIO.opens = []
     monkeypatch.setattr(slab_io, "SlabIO", _HostSlabIO)
-    monkeypatch.setattr(tagged_arrays, "barrier", lambda *_a, **_k: None)
     monkeypatch.setattr(tagged_arrays.jax, "process_index", lambda: 0)
     monkeypatch.setattr(tagged_arrays.jax, "device_count", lambda: 1)
     monkeypatch.setattr(

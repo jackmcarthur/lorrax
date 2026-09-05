@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import barrier
+from common.collectives import rank0_transaction
+from .commit_state import set_commit_state
 import common.timing as timing
 
 
@@ -845,30 +846,23 @@ def write_restart_state_to_h5(
     # the data went in; readers treat ABSENT as True so every restart file
     # written before this attr existed keeps loading byte-for-byte.
     v_touched = V_qmunu is not None
-    if (w0_touched or v_touched) and jax.process_index() == 0:
+    def _publish_readiness():
+        if not (w0_touched or v_touched):
+            return
         with h5py.File(filename, "a") as f:
-            if w0_touched:
-                f["W0_qmunu"].attrs["W0_ready"] = w0_ready
-            if v_touched:
-                f["V_qmunu"].attrs["V_ready"] = True
-            # THE q_irr STAMP GOES IN THE SAME RANK-0 BLOCK, for the reason
-            # that block's own comment gives: stamping from anywhere else
-            # would reintroduce the SlabIO interleave it exists to avoid.
-            # It is metadata only — the tensors are already on disk, written
-            # by the collective writer above; this adds the table group and
-            # the attrs that say what q-set they are on.
-            #
-            # BOTH TENSORS ARE STAMPED FROM ONE RESOLUTION, and the W0
-            # PLACEHOLDER is stamped ``data_ready=False`` so a q_irr file
-            # inherits the persisted-flag gate rather than the hazard: the
-            # same all-zero-screening incident, eight times smaller and just
-            # as plausible.
+            set_commit_state(f, False)
             if qirr is not None and qirr.store_wedge:
                 _stamp_qirr(f, qirr, n_rmu_logical,
                             v_touched=v_touched,
                             w0_placeholder=(w0_touched and not w0_ready),
                             w0_data=(w0_touched and w0_ready))
-    barrier("restart_W0_ready_flag")
+            if w0_touched:
+                f["W0_qmunu"].attrs["W0_ready"] = w0_ready
+            if v_touched:
+                f["V_qmunu"].attrs["V_ready"] = True
+            set_commit_state(f, True)
+    rank0_transaction(filename, stage="restart.readiness", write=_publish_readiness)
+
 
 
 def _stamp_qirr(f, qirr, n_rmu_logical, *, v_touched, w0_placeholder,
@@ -979,13 +973,16 @@ def write_w0_qmunu_to_h5(
     # stamp rides in the same rank-0 block, for the same reason as in
     # ``write_restart_state_to_h5``: SlabIO has released the file and no
     # other writer may open it between these two statements.
-    if jax.process_index() == 0:
+    def _publish_w0():
         with h5py.File(filename, "a") as f:
-            f["W0_qmunu"].attrs["W0_ready"] = True
+            set_commit_state(f, False)
             if qirr is not None and qirr.store_wedge:
                 _stamp_qirr(f, qirr, n_rmu_logical, v_touched=False,
                             w0_placeholder=False, w0_data=True)
-    barrier("restart_W0_ready_flag")
+            f["W0_qmunu"].attrs["W0_ready"] = True
+            set_commit_state(f, True)
+    rank0_transaction(filename, stage="restart.W0_readiness", write=_publish_w0)
+
 
 
 def write_head_scalars_to_h5(
@@ -1032,35 +1029,45 @@ def write_head_scalars_to_h5(
 
     Rank-0-only write (these are tiny; no MPI-IO needed).
     """
-    if jax.process_index() != 0:
-        barrier("restart_head_scalars")
-        return
-    with h5py.File(filename, "a") as f:
-        if vhead is not None:
-            if "vhead" in f:
-                del f["vhead"]
-            f.create_dataset("vhead", data=np.complex128(vhead))
-        if whead is not None:
-            if "whead" in f:
-                del f["whead"]
-            arr = np.asarray(whead, dtype=np.complex128).reshape(-1)
-            ds = f.create_dataset("whead", data=arr)
-            if omega_grid is not None:
-                ds.attrs["omega_grid"] = np.asarray(omega_grid, dtype=np.float64).reshape(-1)
-            if head_correction is not None:
-                ds.attrs["head_correction"] = str(head_correction)
-            if response_kind is not None:
-                ds.attrs["response_kind"] = str(response_kind)
-            if head_source is not None:
-                ds.attrs["head_source"] = str(head_source)
-        if S_cart is not None:
-            if "S_cart_head" in f:
-                del f["S_cart_head"]
-            S = np.asarray(S_cart, dtype=np.complex128).reshape(3, 3)
-            sd = f.create_dataset("S_cart_head", data=S)
-            sd.attrs["convention"] = "cartesian_q2_coefficient"
-            sd.attrs["omega_ry"] = 0.0
-    barrier("restart_head_scalars")
+    # JAX metadata conversion is replicated, before the serial writer.
+    if vhead is not None:
+        vhead = np.complex128(vhead)
+    if whead is not None:
+        whead = np.asarray(whead, dtype=np.complex128).reshape(-1)
+    if omega_grid is not None:
+        omega_grid = np.asarray(omega_grid, dtype=np.float64).reshape(-1)
+    if S_cart is not None:
+        S_cart = np.asarray(S_cart, dtype=np.complex128).reshape(3, 3)
+
+    def _write_heads():
+        with h5py.File(filename, "a") as f:
+            set_commit_state(f, False)
+            if vhead is not None:
+                if "vhead" in f:
+                    del f["vhead"]
+                f.create_dataset("vhead", data=np.complex128(vhead))
+            if whead is not None:
+                if "whead" in f:
+                    del f["whead"]
+                arr = np.asarray(whead, dtype=np.complex128).reshape(-1)
+                ds = f.create_dataset("whead", data=arr)
+                if omega_grid is not None:
+                    ds.attrs["omega_grid"] = np.asarray(omega_grid, dtype=np.float64).reshape(-1)
+                if head_correction is not None:
+                    ds.attrs["head_correction"] = str(head_correction)
+                if response_kind is not None:
+                    ds.attrs["response_kind"] = str(response_kind)
+                if head_source is not None:
+                    ds.attrs["head_source"] = str(head_source)
+            if S_cart is not None:
+                if "S_cart_head" in f:
+                    del f["S_cart_head"]
+                S = np.asarray(S_cart, dtype=np.complex128).reshape(3, 3)
+                sd = f.create_dataset("S_cart_head", data=S)
+                sd.attrs["convention"] = "cartesian_q2_coefficient"
+                sd.attrs["omega_ry"] = 0.0
+            set_commit_state(f, True)
+    rank0_transaction(filename, stage="restart.head_scalars", write=_write_heads)
 
 
 def assert_restart_window_matches(filename, band_slices=None,
