@@ -3803,11 +3803,14 @@ def _sc_map_gain_for_call(
     e_now = np.asarray(e_input_ev, dtype=np.float64)
     sigma_now = np.asarray(sigma_on_shell, dtype=np.complex128)
     if e_now.shape[0] != sigma_now.shape[0]:
-        # H/E/U live on the IBZ while Sigma is built on the full BZ (the
-        # KStarMap k-set invariant).  Measure both on Sigma's k-set so the
-        # worst state names one row of the Sigma table.  Si b80/c504 P4:
-        # E=(8,16) against Sigma=(64,16) refused every QSGW map 2.
-        e_now = np.asarray(_kstar(inputs).broadcast(e_now), dtype=np.float64)
+        # ``sigma_c_at_dft_diag_ev`` is the full-BZ diagnostic table formed
+        # before the SC finalize; the update itself consumes Sigma selected
+        # to the IBZ (``ks.select(delta_h_qp)`` in gw_iteration_map).  Use
+        # that same IBZ copy here, so E and Sigma share the loop's k-set and
+        # the worst state names an IBZ row like every other SC line.  Si
+        # b80/c504 P4: E=(8,16) against Sigma=(64,16) refused every map 2.
+        sigma_now = np.asarray(
+            _kstar(inputs).select(sigma_now), dtype=np.complex128)
     current = (e_now.copy(), sigma_now.copy())
     if previous is None:
         return None, current
