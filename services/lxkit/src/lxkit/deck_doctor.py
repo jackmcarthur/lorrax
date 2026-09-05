@@ -103,7 +103,14 @@ def required_input_paths(config, deck: Path, *, n_rmu: int) -> tuple[InputPath, 
     solver = str(getattr(solver, "value", solver)).lower()
     head_update = str(getattr(getattr(config, "sc", None),
                               "head_update", "off")).lower()
-    if solver == "self_consistent" and head_update != "off":
+    freq_route = getattr(getattr(config, "sigma", None), "freq_route", "")
+    freq_route = str(getattr(freq_route, "value", freq_route)).lower()
+    if freq_route == "internal_ff_cd":
+        rows.append(InputPath(
+            "exact-DFT velocity stage for internal full-frequency CD",
+            _resolve_beside(deck, config.paths.parallel_transport_file),
+        ))
+    elif solver == "self_consistent" and head_update != "off":
         rows.append(InputPath(
             "parallel transport",
             _resolve_beside(deck, config.paths.parallel_transport_file),
