@@ -5,7 +5,8 @@ self-consistency work (``docs/dev/ibz_self_consistency_scaffold.md`` §8):
 
 1. ``fit_scissor`` has NO unweighted spelling.  Omitting ``k_weights`` is
    a ``TypeError`` at the call site, not a silently different fit.
-2. Uniform weights reproduce the pre-weighting arithmetic BIT FOR BIT.
+2. Without crossings, uniform weights reproduce the pre-weighting arithmetic
+   BIT FOR BIT.
    The unweighted formulas are transcribed here as ``_legacy_ols`` (from
    ``scissor.py`` before this change) and compared with ``==``, not
    ``allclose`` — the full-BZ default is the production path and must not
@@ -276,11 +277,14 @@ def test_fit_scissor_energy_arrays_cannot_be_passed_positionally():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("seed", range(24))
-def test_uniform_weights_are_bit_identical_to_the_unweighted_fit(seed):
+def test_uniform_weights_are_bit_identical_without_crossings(seed):
     rng = np.random.default_rng(1000 + seed)
     nk = int(rng.integers(1, 33))
     nb = int(rng.integers(8, 129))
     e_dft, e_qp, vm, fm = _random_deck(rng, nk, nb)
+    # The historical oracle pairs sorted positions. Restrict this weight
+    # arithmetic comparison to a spectrum with no identity crossings.
+    e_qp = np.sort(e_qp, axis=1)
     got = fit_scissor(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_qp,
                       valence_mask_kn=vm, fit_mask_kn=fm,
                       k_weights=full_bz_k_weights(nk))
@@ -297,6 +301,9 @@ def test_the_bit_identity_check_can_fail():
     e_dft, e_qp, vm, fm = _random_deck(rng, 8, 32)
     w = full_bz_k_weights(8)
     w[3] = 2.0
+    # The historical oracle pairs sorted positions. Restrict this weight
+    # arithmetic comparison to a spectrum with no identity crossings.
+    e_qp = np.sort(e_qp, axis=1)
     got = fit_scissor(E_dft_kn_ev=e_dft, E_qp_kn_ev=e_qp,
                       valence_mask_kn=vm, fit_mask_kn=fm,
                       k_weights=w)

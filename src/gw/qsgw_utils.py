@@ -1064,10 +1064,9 @@ def solve_qp(
             np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
             E_sc_rel_ry.shape).astype(bool)
         # Fit in eV so the printed slopes/intercepts are human-readable.
-        # Sort-and-pair semantics (per-k argsort on each of E_DFT and
-        # E_QP independently) live inside ``fit_scissor`` and are
-        # robust to QSGW reorderings; one-shot G0W0 has no
-        # reordering and the sort is a no-op.
+        # The diagonal fixed-point solution remains paired to each DFT
+        # state. ``fit_scissor`` applies one joint DFT sort to both energy
+        # tables and masks, preserving these identities through crossings.
         fit = fit_scissor(
             E_dft_kn_ev=E_dft_rel_ry * RYD_TO_EV,
             E_qp_kn_ev=E_sc_rel_ry * RYD_TO_EV,

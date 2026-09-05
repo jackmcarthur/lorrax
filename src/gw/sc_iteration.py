@@ -2908,6 +2908,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         scissor_classes = classify_scissor_bands(entry_occ_state.f_kn)
         if str(entry_occ_state.smearing_family) == "fixed":
             _assert_index_mask_matches_classes(inputs, scissor_classes)
+        scissor_classes = replace(scissor_classes, current_indices_kn=indices_loop)
         inputs.print_fn(
             f"    SC scissor classes: {scissor_classes.summary()}")
 
@@ -2931,9 +2932,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             e_dft_fit = ks.select(e_dft_fit)
             valence_fit = ks.select(valence_fit)
         e_dft_fit_ev = np.asarray(e_dft_fit, dtype=np.float64) * RYD_TO_EV
-        fit_mask_kn = np.broadcast_to(
-            np.asarray(_partition_on_loop(partition, inputs).in_range_mask, dtype=bool),
-            e_dft_fit_ev.shape)
+        fit_partition = _partition_on_loop(partition, inputs)
+        fit_mask_kn = np.broadcast_to(np.asarray(
+            fit_partition.protected_mask | fit_partition.in_range_mask,
+            dtype=bool), e_dft_fit_ev.shape)
         if inputs.config.sc.tail_fit == "buffer_edges":
             fit_mask_kn = fit_mask_kn & np.broadcast_to(
                 buffer_mask[None, :], e_dft_fit_ev.shape)
@@ -3579,7 +3581,7 @@ def _scissor_E_qp_for_outofrange(
     H_qp_dft_full: jax.Array,
     e_dft_kn_ry: jax.Array,
     valence_mask_kn: jax.Array,
-    in_range_mask: jax.Array,
+    retained_mask: jax.Array,
     kstar,
     *,
     band_classes=None,
@@ -3593,7 +3595,7 @@ def _scissor_E_qp_for_outofrange(
 
     Mechanism: use ``scissor_fit`` when supplied; otherwise take the
     diagonal of ``H_qp_dft_full`` (the candidate QP energies if the
-    iteration kept all off-diagonals), restrict to in-range bands as the
+    iteration kept all off-diagonals), restrict to non-scissored identities as the
     scissor's reference set, and fit α/β per val/cond.  The shared-fit
     form lets the active and sum-band sides of ``b3`` use the exact same
     law from the map input.  The conduction candidate remains
@@ -3603,7 +3605,7 @@ def _scissor_E_qp_for_outofrange(
     primitive will use these candidates only at out-of-range entries.
 
     Short-circuits to ``E_DFT`` (no correction) when every band is
-    in-range — the all-protected default — so the per-iteration cost
+    retained — the all-protected default — so the per-iteration cost
     is one ``np.diagonal`` call.
 
     ``kstar`` IS REQUIRED AND IS THE MAP THAT PRODUCED THESE ROWS.  The
@@ -3636,23 +3638,23 @@ def _scissor_E_qp_for_outofrange(
     from .scissor import k_star_weights, qsgw_out_of_range_energies
 
     e_dft_np = np.asarray(e_dft_kn_ry, dtype=np.float64)
-    in_range = np.asarray(in_range_mask, dtype=bool)
+    retained = np.asarray(retained_mask, dtype=bool)
     # Fast path: nothing to extrapolate.
-    if bool(in_range.all()):
+    if bool(retained.all()):
         return e_dft_kn_ry, None
 
-    in_range_kn = np.broadcast_to(
-        in_range, e_dft_np.shape).astype(bool)
+    retained_kn = np.broadcast_to(
+        retained, e_dft_np.shape).astype(bool)
     # THE THREE-WAY CLASSIFICATION.  ``band_classes`` is None on an
     # insulating deck and the historical two-way index mask is used
     # verbatim — the step mask IS this rule when no band crosses E_F, so
     # that path is byte-identical, not merely equivalent.
     valence_kn = np.asarray(valence_mask_kn, dtype=bool)
     crossing_kn = None
-    fit_mask_kn = in_range_kn
+    fit_mask_kn = retained_kn
     if band_classes is not None:
         valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
-        fit_mask_kn = in_range_kn & ~crossing_kn
+        fit_mask_kn = retained_kn & ~crossing_kn
     fit = scissor_fit
     if fit is None:
         H_diag_np = np.real(np.asarray(jnp.diagonal(
@@ -3717,7 +3719,7 @@ def _apply_scissor_partition_policy(
     """
     scissor_provisional_ry, scissor_fit = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, e_dft_kn_ry, valence_mask_kn,
-        partition.in_range_mask, kstar,
+        partition.protected_mask | partition.in_range_mask, kstar,
         band_classes=band_classes,
         scissor_fit=scissor_fit,
         fermi_displacement_ry=0.0,
@@ -3728,23 +3730,23 @@ def _apply_scissor_partition_policy(
     candidate_efermi_ry = None
 
     if scissor_fit is not None:
-        in_range_np = np.all(np.broadcast_to(
-            np.asarray(partition.in_range_mask, dtype=bool),
-            np.shape(e_dft_kn_ry)), axis=0)
+        retained_kn = np.broadcast_to(np.asarray(
+            partition.protected_mask | partition.in_range_mask, dtype=bool),
+            np.shape(e_dft_kn_ry))
         if band_classes is not None and band_classes.n_crossing:
-            frontier = np.arange(
-                int(band_classes.valence_stop),
-                int(band_classes.conduction_start))
+            _, frontier_kn = band_classes.masks(retained_kn.shape)
         else:
             frontier = np.asarray(
-                [max(0, n_occ - 1), min(n_occ, in_range_np.size - 1)],
+                [max(0, n_occ - 1), min(n_occ, retained_kn.shape[1] - 1)],
                 dtype=np.int64)
-        bad_frontier = frontier[~in_range_np[frontier]]
+            frontier_kn = np.zeros(retained_kn.shape, dtype=bool)
+            frontier_kn[:, frontier] = True
+        bad_frontier = np.argwhere(frontier_kn & ~retained_kn)
         if bad_frontier.size:
             raise ValueError(
                 f"{label} low-valence Fermi anchor requires the complete "
-                "Fermi-crossing/frontier manifold inside the Sigma window; "
-                f"out-of-range active band(s) {bad_frontier.tolist()} would "
+                "Fermi-crossing/frontier manifold to remain non-scissored; "
+                f"scissored (k, active band) pairs {bad_frontier.tolist()} would "
                 "make E_F(F(H)) depend on the scissor being anchored. Widen "
                 "sigma_omega_min/max_ev (and preserve whole multiplets).")
 

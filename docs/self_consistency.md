@@ -301,7 +301,10 @@ k; promotion at one k does not transitively promote the same label at every
 other k. The Hamiltonian and rCROP carry are in the DFT basis, so their masks
 are `(k, DFT identity)`, with sorted-column correspondence printed explicitly.
 Applying sorted-column masks directly to that carry would protect the wrong
-states at a crossing. The same masks select the non-scissored convergence
+states at a crossing. Scissor fits preserve paired DFT/QP identity columns,
+including protected states retained outside the requested edge; they never
+sort QP samples independently. Metal Fermi-class masks follow the same
+per-k input-column assignment. The same masks select the non-scissored convergence
 criterion, rCROP Gram block and identity comments. The eqp body retains sorted
 eigenvalues and the identity comments retain DFT-band labels. Each map reports
 bands protected at all k and k rows where the sorted protected columns differ

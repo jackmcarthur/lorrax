@@ -473,20 +473,18 @@ FRACTIONAL_TOL = 1.0e-8
 class ScissorBandClasses:
     """Which bands are valence, which cross E_F, and which are conduction.
 
-    Held as two BOUNDARY INDICES rather than a per-band label array, because
-    the owner's rule is stated in terms of boundaries and because the two
-    consumers need the classes at different band widths — the fit sees the
-    active window ``nb_active``, the occupation table may be the padded
-    parallel-transport manifold ``nb_storage``, and the sum-band tail fit
-    sees the full ladder.  Index arithmetic is width-agnostic; a label array
-    would have to be padded, and padding a label array is how the wrong
-    band gets the wrong class.
+    The two boundaries describe sorted input columns. Live SC optionally
+    supplies a per-k DFT identity to sorted-column permutation so the same
+    classes apply to its identity-labelled fit and Hamiltonian arrays.
+    Without that permutation the masks broadcast the sorted boundaries.
 
     Attributes
     ----------
     valence_stop : int
         Bands ``[0, valence_stop)`` are the valence fit class — everything
         strictly below the lowest Fermi-crossing band.
+    current_indices_kn : (nk, nb_active) integer, optional
+        DFT identity to current sorted input column on the live SC k set.
     conduction_start : int
         Bands ``[conduction_start, nb)`` are the conduction fit class —
         everything strictly above the highest Fermi-crossing band.
@@ -501,6 +499,7 @@ class ScissorBandClasses:
 
     valence_stop: int
     conduction_start: int
+    current_indices_kn: np.ndarray | None = None
 
     def __post_init__(self):
         if not (0 <= int(self.valence_stop) <= int(self.conduction_start)):
@@ -524,11 +523,18 @@ class ScissorBandClasses:
         conduction, so two masks describe three classes.
         """
         nk, nb = int(shape[0]), int(shape[1])
-        idx = np.arange(nb)
+        if self.current_indices_kn is None:
+            idx = np.broadcast_to(np.arange(nb), (nk, nb))
+        else:
+            idx = np.asarray(self.current_indices_kn)
+            if (idx.shape != (nk, nb) or not np.issubdtype(idx.dtype, np.integer)
+                    or not np.all(np.sort(idx, axis=1) == np.arange(nb))):
+                raise ValueError(
+                    "ScissorBandClasses: current_indices_kn must be a per-k "
+                    "permutation on the same active k/band shape")
         val = idx < int(self.valence_stop)
         cross = (~val) & (idx < int(self.conduction_start))
-        return (np.broadcast_to(val[None, :], (nk, nb)),
-                np.broadcast_to(cross[None, :], (nk, nb)))
+        return val, cross
 
     def summary(self) -> str:
         """One line, 1-BASED band labels — the convention the logs use."""
@@ -540,7 +546,7 @@ class ScissorBandClasses:
         return (f"val = bands {v}, Fermi-crossing = bands {x} "
                 f"(n={self.n_crossing}), "
                 f"cond = bands {self.conduction_start + 1}+ "
-                f"[crossing excluded from both fits]")
+                f"[boundaries refer to sorted columns; crossing excluded from both fits]")
 
 
 def classify_scissor_bands(
@@ -714,23 +720,11 @@ def fit_scissor(
 ) -> ScissorFit:
     """Fit valence / conduction scissor lines to (E_DFT, ΔE) samples.
 
-    **Sort-and-pair** semantics: at each k, both ``E_DFT_kn_ev`` and
-    ``E_qp_kn_ev`` are sorted ascending **independently**, then paired
-    by sorted index.  The fit pair is
-
-        ``( E_DFT_sorted[k, p],
-            E_qp_sorted[k, p] − E_DFT_sorted[k, p] )``
-
-    i.e. the p-th lowest QP eigenvalue at k vs. the p-th lowest DFT
-    eigenvalue at k.  This is robust to QP reorderings (where the QSGW
-    diagonalisation places eigenvalues in an order that does not match
-    the DFT band labels) — band identity is dropped in favour of
-    energy-sorted matching, which is the right pairing for a scissor
-    fit (a smooth function of E).
-
-    The ``valence_mask_kn`` / ``fit_mask_kn`` are also reordered by
-    the **DFT** sort permutation (since "occupied" and "in-window" are
-    properties tied to the DFT band each E_DFT_sorted[k, p] came from).
+    Each column pairs the DFT and QP energies of the SAME state identity.
+    At each k the DFT sort permutation is applied jointly to both energies
+    and both masks. A QP crossing therefore cannot substitute an excluded
+    state's energy for a retained fit sample. The fitted correction is
+    ``Delta E[k,n] = E_QP[k,n] - E_DFT[k,n]`` for that identity.
 
     Parameters
     ----------
@@ -799,9 +793,8 @@ def fit_scissor(
 
     rows = np.arange(nk)[:, None]
     order_dft = np.argsort(E_dft, axis=1)
-    order_qp = np.argsort(E_qp, axis=1)
     E_dft_sorted = E_dft[rows, order_dft]
-    E_qp_sorted = E_qp[rows, order_qp]
+    E_qp_sorted = E_qp[rows, order_dft]
 
     # Masks live in DFT-band-identity space; reorder by DFT permutation.
     vm_sorted = vm[rows, order_dft]

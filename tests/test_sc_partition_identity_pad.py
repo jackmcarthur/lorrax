@@ -176,3 +176,70 @@ def test_sc_support_retains_patched_grid_hole_refusal():
     patched = np.r_[np.arange(-3., -.9, .25), np.arange(2., 6.3, .25)]
     with pytest.raises(ValueError, match="omega_grid_hole"):
         extend_sc_omega_grid_ev(patched, [[0.]], [[True]], .25)
+
+
+def test_scissor_fit_keeps_a_crossed_protected_sample_paired():
+    from gw.scissor import fit_scissor
+
+    dft = np.array([[0., 4., 7., 7.]])
+    qp = np.array([[.5, 4.5, 3., 3.]])
+    keep = np.array([[True, True, False, False]])
+    valence = np.zeros_like(keep)
+    fit = fit_scissor(dft, qp, valence, keep, k_weights=np.ones(1))
+    assert fit.alpha_c == pytest.approx(1.)
+    assert fit.beta_c_ev == pytest.approx(.5)
+    # Red twin: independently sorting QP energies substitutes the tail
+    # doublet's 3 eV value for the protected singlet's 4.5 eV sample.
+    wrong = fit_scissor(dft, np.sort(qp, axis=1), valence, keep,
+                        k_weights=np.ones(1))
+    assert wrong.alpha_c == pytest.approx(.625)
+    assert wrong.alpha_c != fit.alpha_c
+    permutation = [2, 0, 3, 1]
+    shuffled = fit_scissor(dft[:, permutation], qp[:, permutation],
+                          valence[:, permutation], keep[:, permutation],
+                          k_weights=np.ones(1))
+    assert shuffled.alpha_c == fit.alpha_c
+    assert shuffled.beta_c_ev == fit.beta_c_ev
+
+
+def test_hysteresis_retained_state_remains_a_scissor_fit_sample():
+    from types import SimpleNamespace
+    from gw.sc_iteration import _apply_scissor_partition_policy
+
+    reference = np.array([[-1., 4., 8.]])
+    initial = _partition(reference, reference)
+    energy = np.array([[-1., 6., 10.]])
+    retained = _partition(energy, reference, previous=initial)
+    assert retained.protected_mask[0, 1]
+    assert not retained.in_range_mask[0, 1]
+    kstar = SimpleNamespace(irr_idx=np.array([0]), select=lambda a: a)
+    h = jnp.asarray(np.diag(energy[0] / RYD_TO_EV)[None])
+    result, fit = _apply_scissor_partition_policy(
+        h, reference / RYD_TO_EV, np.array([[True, False, False]]),
+        retained, kstar, efermi_dft_ry=0., n_occ=1,
+        candidate_efermi_fn=lambda _: 0., print_fn=lambda _: None)
+    assert fit.n_fit_c == 1
+    assert fit.alpha_c == pytest.approx(1.)
+    assert fit.beta_c_ev == pytest.approx(2.)
+    # The retained 6 eV diagonal stays measured; its +2 eV fit corrects
+    # the excluded DFT 8 eV state to 10 eV instead of leaving it at DFT.
+    np.testing.assert_allclose(np.diagonal(result, axis1=1, axis2=2) * RYD_TO_EV,
+                               [[-1., 6., 10.]])
+
+
+def test_fermi_classes_follow_per_k_state_identities():
+    from gw.scissor import ScissorBandClasses
+
+    classes = ScissorBandClasses(
+        valence_stop=1, conduction_start=2,
+        current_indices_kn=np.array([[0, 1, 2], [2, 0, 1]]))
+    valence, crossing = classes.masks((2, 3))
+    np.testing.assert_array_equal(valence, [[True, False, False], [False, True, False]])
+    np.testing.assert_array_equal(crossing, [[False, True, False], [False, False, True]])
+    np.testing.assert_array_equal(~(valence | crossing),
+                                  [[False, False, True], [True, False, False]])
+    # The sorted-only class mask puts k=1's crossing label on the wrong state.
+    _, wrong_crossing = ScissorBandClasses(1, 2).masks((2, 3))
+    assert not np.array_equal(crossing[1], wrong_crossing[1])
+    with pytest.raises(ValueError, match="same active k/band shape"):
+        classes.masks((1, 3))
