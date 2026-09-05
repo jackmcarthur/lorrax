@@ -71,6 +71,57 @@ def parent_k_contraction_profitable(
     return avoided >= _MIN_AVOIDED_BAND_WORK
 
 
+def _shardwise_prefix_map(base_map, canonical: int, n_shards: int) -> np.ndarray:
+    """Re-lay a destination-to-source map so each shard's canonical rows are
+    that shard's OWN prefix.
+
+    ``base_map`` puts the ``canonical`` kept rows at the global prefix and
+    the pad rows at the global suffix.  Cropping THAT layout to ``canonical``
+    is not shard-aligned (Si: 836 of 840 rows, 420 per X shard), and XLA
+    lowers the global slice as an all-gather of the whole axis on every rank
+    (KNOWN_LORRAX_ISSUES 2026-09-05, HLO module 0250).  Here shard ``s``
+    receives canonical rows ``[s*c, (s+1)*c)`` followed by its share of the
+    pad rows, so the crop becomes a rank-local slice
+    (:func:`_local_prefix_crop`) and the axis is never replicated.
+    """
+    base = np.asarray(base_map, dtype=np.int32)
+    extent = int(base.shape[0])
+    canonical = int(canonical)
+    n_shards = int(n_shards)
+    if extent % n_shards or canonical % n_shards:
+        raise ValueError(
+            "shard-wise canonical crop needs both the packed and the "
+            f"canonical extent divisible by the shard count; got packed "
+            f"{extent}, canonical {canonical}, shards {n_shards}.")
+    sh, c = extent // n_shards, canonical // n_shards
+    pads = base[canonical:]
+    out = np.empty((extent,), dtype=np.int32)
+    for sidx in range(n_shards):
+        out[sidx * sh: sidx * sh + c] = base[sidx * c: (sidx + 1) * c]
+        out[sidx * sh + c: (sidx + 1) * sh] = pads[
+            sidx * (sh - c): (sidx + 1) * (sh - c)]
+    return out
+
+
+def _local_prefix_crop(operator, mesh_xy: Mesh, *, left=None, right=None):
+    """Keep each rank's own prefix on the sharded endpoint(s) of a
+    ``P(None,'x','y')`` operator.  A slice inside ``shard_map`` is
+    rank-local; the same slice on the global array to a non-shard-aligned
+    extent makes XLA all-gather the axis first."""
+    from common.shard_map import shard_map
+    spec = P(None, 'x', 'y')
+
+    def body(x):
+        if left is not None:
+            x = x[:, :int(left), :]
+        if right is not None:
+            x = x[:, :, :int(right)]
+        return x
+
+    return shard_map(body, mesh=mesh_xy, in_specs=spec, out_specs=spec,
+                     check_vma=False)(operator)
+
+
 def _readonly(value, dtype) -> np.ndarray:
     out = np.array(value, dtype=dtype, copy=True)
     out.setflags(write=False)
@@ -169,14 +220,16 @@ class CentroidKUnfoldPlan:
             raise ValueError(
                 "CentroidKUnfoldPlan.restore_left_basis requires a rank-three "
                 f"(q, mu, r) operator; got {packed.shape}.")
+        n_x = int(self.mesh_xy.shape['x'])
+        target = int(self.canonical_centroid_extent)
         reordered = reorder_isdf_operator_basis(
             packed,
-            left_source_map=self._canonical_source_map(),
+            left_source_map=_shardwise_prefix_map(
+                self._canonical_source_map(), target, n_x),
             right_source_map=None,
             mesh_xy=self.mesh_xy)
-        canonical = reordered[:, :int(self.canonical_centroid_extent), :]
-        return jax.lax.with_sharding_constraint(
-            canonical, NamedSharding(self.mesh_xy, P(None, 'x', 'y')))
+        # Each X shard now holds its canonical rows as a prefix: crop locally.
+        return _local_prefix_crop(reordered, self.mesh_xy, left=target // n_x)
 
     @property
     def n_full(self) -> int:
@@ -240,6 +293,20 @@ class CentroidKUnfoldPlan:
             jnp.asarray(0, dtype=out.dtype))
         return jax.lax.with_sharding_constraint(
             out, NamedSharding(self.mesh_xy, spec))
+
+    def pack_square_operator(self, operator):
+        """Pack BOTH centroid axes (the last two) of a ``(..., mu, mu)``
+        operator into the orbit-packed order, pad rows zero, sharded
+        ``P(..., 'x', 'y')``.  One-time per operand: the dynamic Σ chain on
+        the parent route runs entirely in packed order (G is unfolded to
+        packed full k and never restored per τ node), so the screened
+        interaction's residues follow it once."""
+        arr = jnp.asarray(operator)
+        lead = (None,) * (int(arr.ndim) - 2)
+        out = self.pack_centroid_axis(
+            arr, axis=arr.ndim - 2, spec=P(*lead, 'x', None))
+        return self.pack_centroid_axis(
+            out, axis=arr.ndim - 1, spec=P(*lead, 'x', 'y'))
 
     def pack_face_pair(self, psi_nmu, psi_mun):
         """Pack raw-parent face operands without changing their roles."""
@@ -410,14 +477,17 @@ class CentroidKUnfoldPlan:
             raise ValueError(
                 "CentroidKUnfoldPlan.restore_operator_basis canonical "
                 f"extent must lie in (0,{extent}]; got {target}.")
+        n_x = int(self.mesh_xy.shape['x'])
+        n_y = int(self.mesh_xy.shape['y'])
         reordered = reorder_isdf_operator_basis(
             packed,
-            left_source_map=source,
-            right_source_map=source,
+            left_source_map=_shardwise_prefix_map(source, target, n_x),
+            right_source_map=_shardwise_prefix_map(source, target, n_y),
             mesh_xy=self.mesh_xy)
-        canonical = reordered[:, :target, :target]
-        return jax.lax.with_sharding_constraint(
-            canonical, NamedSharding(self.mesh_xy, P(None, 'x', 'y')))
+        # Both endpoints hold their canonical rows as per-shard prefixes: the
+        # crop is rank-local, no axis is ever gathered.
+        return _local_prefix_crop(
+            reordered, self.mesh_xy, left=target // n_x, right=target // n_y)
 
 
 def build_centroid_k_unfold_plan(

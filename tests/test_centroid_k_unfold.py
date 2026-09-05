@@ -368,6 +368,64 @@ def test_orbit_padding_is_cropped_without_replicating_operator_axes():
     assert hlo.count("all-to-all(") == 4
 
 
+def test_nonaligned_canonical_crop_is_rank_local():
+    """Packed 12 -> canonical 8 on a 2x2 mesh: the crop crosses a shard
+    boundary (6 packed rows per X shard, 4 canonical), which the old global
+    slice lowered as an all-gather of the whole centroid axis."""
+    mesh = _mesh_2x2()
+    layout = build_square_grouped_shard_layout(
+        np.asarray([0, 0, 0, 0, 0, 1, 1, 1], dtype=np.int32), (2, 2))
+    packed_extent = int(layout.axis.n_padded)
+    assert packed_extent > 8 and packed_extent % 2 == 0
+    identity_perm = layout.axis.pack_permutations_host(
+        np.arange(8, dtype=np.int32)[None, :])
+    plan = CentroidKUnfoldPlan(
+        mesh_xy=mesh,
+        layout=layout,
+        irr_idx=np.asarray([0], dtype=np.int32),
+        sym_idx=np.asarray([0], dtype=np.int32),
+        sym_perm=identity_perm,
+        L_table=np.zeros((1, packed_extent, 3), dtype=np.int64),
+        k_parent_frac=np.zeros((1, 3), dtype=np.float64),
+        spin_action_full=np.ones((1, 1, 1), dtype=np.complex128),
+        n_sym_spatial=1,
+        nspinor=1,
+        canonical_centroid_extent=8,
+    )
+    assert plan.supports_canonical_bridge
+    canonical = np.arange(64, dtype=np.float64).reshape(8, 8)
+    packed = np.zeros((1, 1, packed_extent, 1, packed_extent),
+                      dtype=np.complex128)
+    dst = layout.axis.canonical_to_packed
+    packed[0, 0, dst[:, None], 0, dst[None, :]] = canonical
+    operand = jax.device_put(
+        jnp.asarray(packed),
+        NamedSharding(mesh, P(None, None, 'x', None, 'y')))
+    result = plan.finish_green(operand)
+    np.testing.assert_allclose(
+        np.asarray(result)[0, 0, :, 0, :], canonical, rtol=0, atol=0)
+    assert result.shape == (1, 1, 8, 1, 8)
+    hlo = jax.jit(plan.finish_green).lower(operand).compiler_ir(
+        dialect="hlo").as_hlo_text().lower()
+    assert "all-gather(" not in hlo
+    # the zeta-fit RHS: left axis canonical, right axis (r) untouched
+    rhs = np.zeros((2, packed_extent, 4), dtype=np.complex128)
+    rows = np.arange(16, dtype=np.float64).reshape(8, 2)
+    for q in range(2):
+        rhs[q, dst, :] = np.repeat(rows[:, q:q + 1], 4, axis=1) + q
+    rhs_dev = jax.device_put(
+        jnp.asarray(rhs), NamedSharding(mesh, P(None, 'x', 'y')))
+    left = plan.restore_left_basis(rhs_dev)
+    assert left.shape == (2, 8, 4)
+    for q in range(2):
+        np.testing.assert_allclose(
+            np.asarray(left)[q], np.repeat(rows[:, q:q + 1], 4, axis=1) + q,
+            rtol=0, atol=0)
+    hlo_left = jax.jit(plan.restore_left_basis).lower(rhs_dev).compiler_ir(
+        dialect="hlo").as_hlo_text().lower()
+    assert "all-gather(" not in hlo_left
+
+
 def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
     """A cold nested trace may be reused by a different outer executable."""
     import symmetry_maps.maps as maps_impl
