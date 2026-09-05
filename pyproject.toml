@@ -146,11 +146,12 @@ norecursedirs = ["archive", "bench"]
 # THE DEFAULT TIER IS NOT SPELLED HERE EITHER, for that same reason. A bare
 # `pytest` is the two-minute core in tests/core plus its exact established
 # roster. `pytest --full` (`--census` / `-m census` for compatibility) is the
-# run tests/KNOWN_FAILURES.md accounts for. The narrowing lives in the
-# collection hook in tests/conftest.py; tests/core/manifest.py owns the roster.
+# compact nightly run tests/KNOWN_FAILURES.md accounts for. The narrowing and
+# one-case legacy parameter gut live in tests/conftest.py;
+# tests/core/manifest.py owns the protected fast roster.
 addopts = "-m 'not extra'"
 markers = [
-    "census: the periodic FULL accounting — applied automatically by tests/conftest.py to every cell that is not `extra`, so `-m census` collects exactly what a bare `pytest` collected before the 2026-08-09 default-gate split",
+    "census: the compact periodic full accounting — applied automatically by tests/conftest.py to every cell that is not `extra`; collection keeps one legacy parameter case plus protected core and registered-defect nodes",
     "regression: end-to-end physics regression tests with reference files",
     "gpu: tests that require a CUDA-capable JAX backend",
     "core_extended: tiny-system or synthetic coverage intentionally outside the two-minute default core budget",

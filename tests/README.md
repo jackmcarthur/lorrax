@@ -9,13 +9,16 @@ and runtime contract cells in `tests/core/manifest.py`.
 ```bash
 lx test                    # developer pre-push: default core, P=4 node
 lx test --core-extended    # additional tiny-system and provider coverage
-lx test --full             # nightly: the complete non-extra suite
+lx test --full             # nightly: compact legacy/defect tier
 ```
 
 `--census` and `-m census` remain aliases for `--full` for old automation.
-The full tier is the owner of `tests/KNOWN_FAILURES.md` accounting. A named
-path, `-m`, `-k`, or a service-selection option is an explicit selection and
-therefore stands the default narrowing down.
+The full tier is the owner of `tests/KNOWN_FAILURES.md` accounting. It keeps
+one representative of each legacy parametrized assertion; exact core nodes,
+the tiny-fixture families, and every executable registered-defect node are
+protected from that compaction. A named path, `-m`, `-k`, or a
+service-selection option is an explicit selection and therefore stands the
+default narrowing down.
 
 The core roster is deliberately small and exact. A stale node ID is a usage
 error, not a silently smaller green run. The default contains:
@@ -32,7 +35,9 @@ error, not a silently smaller green run. The default contains:
 
 The old real-deck regressions and the per-defect assertion zoo remain in the
 full tier. Redundant parameter sizes and retired-route duplicates are not a
-reason to grow core; one hostile size and one actionable refusal are enough.
+reason to grow core: the roster names one hostile size and one actionable
+refusal by their exact parameter IDs. A base node spelling is reserved for a
+test whose complete parameter family is intentionally part of core.
 
 ## Cached fixtures
 
