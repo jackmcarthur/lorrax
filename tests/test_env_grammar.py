@@ -501,11 +501,9 @@ def test_defect3_vocabulary_has_not_drifted():
         ``file_io/_slab_io_ffi.py::_TRUE/_FALSE`` are now RE-EXPORTS of
         it, so the drift they used to be able to have is gone by
         construction rather than by this assertion;
-      * ``ffi/gate.py::MODE_SPELLINGS``  (two-valued since 2026-08-06 —
-        the ``auto`` token was deleted with the auto tier it named).  The
-        gate keeps its own resolver because it is three-VALUED in intent
-        (a gate may DEMOTE and say so); only its on/off token sets are
-        the same vocabulary, and those still have to be checked.
+      * ``ffi/gate.py::MODE_SPELLINGS``.  Optional accelerators may now name
+        the exact ``auto`` spelling when they also provide a capability
+        probe; only its on/off token sets share the boolean vocabulary.
 
     ``isdf/core.py::_ENV_TRUE`` — a copy this test used to pin — was
     RETIRED by P1.3: the module imports ``gw_config.env_bool`` instead.
@@ -524,10 +522,10 @@ def test_defect3_vocabulary_has_not_drifted():
     assert _runtime._FALSY_TOKENS is env_flags.ENV_FALSE
     # ``auto`` must stay out of the two-valued sets.
     assert "auto" not in set(gw_config._ENV_TRUE) | set(gw_config._ENV_FALSE)
-    # ...and out of the gate vocabulary: a token with no resolver branch in
-    # enabled()/resolve()/enforce() would accept ``=auto`` and run as ``on``
-    # in silence (deleted 2026-08-06; decisions.md 2026-08-01 killed the tier).
-    assert "auto" not in gate.MODE_SPELLINGS and "auto" not in gate.MODE_HELP
+    # Optional gates have a real auto branch, spelled only one way; it must
+    # not silently acquire the boolean spellings.
+    assert gate.MODE_SPELLINGS["auto"] == ("auto",)
+    assert "auto" in gate.MODE_HELP
 
 
 def test_the_substrate_parsers_import_the_grammar_rather_than_copying_it():

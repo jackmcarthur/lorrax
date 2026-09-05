@@ -2835,8 +2835,11 @@ def format_startup_report(f: dict) -> list:
         "machine has not run before misses every entry no matter how warm "
         "the cache looks.")
     if cc.get("compile_agreement_enabled"):
-        add(f"  Cross-rank module-compile agreement is ON with a bounded "
-            f"{cc.get('compile_agreement_timeout_s'):g}-second deadline; "
+        deadline_s = float(cc.get("compile_agreement_timeout_s") or 0.0)
+        deadline = (f"a bounded {deadline_s:g}-second deadline"
+                    if deadline_s > 0 else
+                    "no deadline (rank 0 names a missing rank every 60 s)")
+        add(f"  Cross-rank module-compile agreement is ON with {deadline}; "
             f"each backend compile is fingerprinted before XLA execution.")
     else:
         add(f"  Cross-rank module-compile agreement is "

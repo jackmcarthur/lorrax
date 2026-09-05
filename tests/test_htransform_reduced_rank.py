@@ -126,7 +126,8 @@ def test_standalone_htransform_refuses_an_occupied_band_cut(monkeypatch):
 
     monkeypatch.setattr(
         htransform, "setup_wfn_and_sym",
-        lambda *args, **kwargs: (SimpleNamespace(nelec=12), object()))
+        lambda *args, **kwargs: (
+            SimpleNamespace(nelec=12, fft_grid=(1, 1, 1)), object()))
 
     def _centroids_were_reached(*args, **kwargs):
         raise RuntimeError("centroid stage reached")

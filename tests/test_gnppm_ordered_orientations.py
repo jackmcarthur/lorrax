@@ -56,9 +56,10 @@ OMEGA_P = 2.0
 # ---------------------------------------------------------------------------
 
 def test_this_file_is_testing_the_tree_it_was_launched_from():
-    want = os.environ.get("LORRAX_CHECKOUT")
-    assert want, ("LORRAX_CHECKOUT is unset, so this file cannot say which "
-                  "tree it tested; set it before trusting any verdict here")
+    # The test file's own checkout is the authority.  Requiring an auxiliary
+    # launcher variable made the coordinator's explicitly source-pinned
+    # command fail even though every imported module resolved correctly.
+    want = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     root = os.path.realpath(want) + os.sep
     for mod in (w_isdf, ms):
         assert os.path.realpath(mod.__file__).startswith(root), (

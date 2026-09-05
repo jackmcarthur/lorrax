@@ -86,7 +86,7 @@ def test_watcher_exception_cleans_registration_and_stack(monkeypatch):
 
     assert not collector._heartbeat_sections
     assert collector._stack() == []
-    assert messages[-1].endswith("[EXC]")
+    assert messages[-1].__contains__("[EXC]")
 
 
 def test_handled_outer_exception_does_not_mark_success_failed(monkeypatch):
@@ -100,7 +100,7 @@ def test_handled_outer_exception_does_not_mark_success_failed(monkeypatch):
             pass
 
     assert messages[-1].startswith("<- success  ")
-    assert not messages[-1].endswith("[EXC]")
+    assert not messages[-1].__contains__("[EXC]")
 
 
 def test_trace_failure_does_not_mask_watcher_failure(monkeypatch):
@@ -159,7 +159,7 @@ def test_body_exception_cleans_registration_and_stack(monkeypatch):
 
     assert not collector._heartbeat_sections
     assert collector._stack() == []
-    assert messages[-1].endswith("[EXC]")
+    assert messages[-1].__contains__("[EXC]")
 
 
 def test_blocked_heartbeat_cannot_overtake_exit_or_inflate_record(monkeypatch):
@@ -263,3 +263,15 @@ def test_nonannounced_section_has_no_mandatory_heartbeat(monkeypatch):
 
     assert messages == []
     assert collector._heartbeat_thread is None
+
+
+def test_stage_exit_line_names_the_exception(capsys):
+    """The raising rank's log must carry the exception text at the stage
+    line: a later collective teardown can hang before any traceback prints
+    (Si b80/c504 P4, JID 57927048.48)."""
+    import pytest
+    from common import timing as tm
+    assert tm._exc_text(None) == ""
+    assert tm._exc_text(RuntimeError("rank 3 did not arrive\nmore")) == \
+        "RuntimeError: rank 3 did not arrive"
+    assert tm._exc_text(KeyError()) == "KeyError"

@@ -527,6 +527,11 @@ def _run_worker(case_name: str, ndev: int = 4, timeout: int = 300):
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
+    # This parity path intentionally runs on emulated CPU devices and uses
+    # only native JAX collectives.  The Perlmutter runtime exports the
+    # CUDA-only pair-convolution accelerator as ``on``; inheriting that dial
+    # makes the CPU child refuse before it reaches the layout comparison.
+    env["LORRAX_CONV_KPAIR_FFI"] = "off"
     env["XLA_FLAGS"] = (
         env.get("XLA_FLAGS", "")
         + f" --xla_force_host_platform_device_count={ndev}").strip()

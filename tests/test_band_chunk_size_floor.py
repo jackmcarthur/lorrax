@@ -9,10 +9,11 @@ that division collapses to 0 for every bc and downstream
 
     dimension size of operand at 'all_gather_dim' cannot be zero
 
-The planner is the single source of truth for chunk sizes; its internal
-``band_chunk_override`` hint must be adjusted for correctness on the active
-mesh.  These tests pin the
-mesh-floor + round-up-to-multiple-of-``p_xy`` contract.
+The planner is the single source of truth for chunk sizes.  The former deck
+key ``band_chunk_size`` was retired by DECKDIAL; the three parser/default
+tests were deleted with it.  The remaining tests exercise the planner's
+internal ``band_chunk_override`` seam and pin the mesh floor plus
+round-up-to-multiple-of-``p_xy`` contract.
 
 Tickled by CrI3 6x6 30Ry bispinor full-BZ 16-GPU (commit ``2de70eb``+
 ``4b927dc`` cascade) where user set ``band_chunk_size=2``.
@@ -82,7 +83,7 @@ def test_internal_hint_caps_below_sixteen_on_p1():
 
 
 # ---------------------------------------------------------------------------
-# Core regression: the CrI3 case (band_chunk_size=2, world_size=16)
+# Core regression: the CrI3 planner case (override=2, world_size=16)
 # ---------------------------------------------------------------------------
 
 

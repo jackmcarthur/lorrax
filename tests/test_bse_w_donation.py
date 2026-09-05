@@ -144,7 +144,7 @@ def test_coarse_w_path_is_not_donated():
     """
     from bse import exciton_bands as EB
     src = inspect.getsource(EB)
-    i = src.index("decimate_W_q_to_subgrid(data[\"W_q\"]")
+    i = src.index("W_q_coarse = decimate_W_q_to_subgrid(")
     window = src[max(0, i - 600):i]
     assert "_ifftn_donated" not in window.split("if cg == (nkx, nky, nkz):")[-1], (
         "the coarse-W branch appears to donate W_q, but it still needs it to "

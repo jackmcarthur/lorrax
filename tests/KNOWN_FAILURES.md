@@ -1,5 +1,81 @@
 # Known test failures — full-suite census
 
+## Executable exact-name xfail ledger (current main)
+
+This small section is machine-read by `tests/conftest.py`.  Every row is one
+exact pytest node id with a reason and an accountable owner.  Entries are
+strict xfails: an unexpected pass makes the suite red, and a complete
+`pytest tests` collection refuses if any named test no longer exists.  The
+historical census and dated amendments below remain the evidence record; they
+do not implicitly suppress tests.
+
+<!-- executable-xfails:start -->
+```jsonl
+{"nodeid":"tests/test_bse_bgw_regression.py::test_bse_matches_frozen_and_bgw","reason":"frozen/BGW BSE integration gate remains red after infrastructure repairs","owner":"BSE"}
+{"nodeid":"tests/test_bse_dense_reference.py::test_nontda_matvec_matches_dense_shao","reason":"non-TDA fixture is not positive definite or its SHAO spectrum is non-real","owner":"BSE"}
+{"nodeid":"tests/test_bse_dense_reference.py::test_nontda_solver_reproduces_dense","reason":"non-TDA fixture is not positive definite or its SHAO spectrum is non-real","owner":"BSE"}
+{"nodeid":"tests/test_bse_nontda_restart_preflight.py::test_nontda_runs_end_to_end_on_the_fresh_fixture","reason":"non-TDA fixture pencil is not positive definite","owner":"BSE"}
+{"nodeid":"tests/test_bse_oscillator_strengths.py::test_a_conjugated_dipole_is_caught[cohsex_debug]","reason":"fixture oscillator-strength convention disagrees with its reference/control","owner":"BSE"}
+{"nodeid":"tests/test_bse_oscillator_strengths.py::test_a_conjugated_dipole_is_caught[gnppm_debug]","reason":"fixture oscillator-strength convention disagrees with its reference/control","owner":"BSE"}
+{"nodeid":"tests/test_bse_oscillator_strengths.py::test_fixture_oscillator_strengths_match_reference[cohsex_debug]","reason":"fixture oscillator-strength convention disagrees with its reference/control","owner":"BSE"}
+{"nodeid":"tests/test_bse_oscillator_strengths.py::test_fixture_oscillator_strengths_match_reference[gnppm_debug]","reason":"fixture oscillator-strength convention disagrees with its reference/control","owner":"BSE"}
+{"nodeid":"tests/test_bse_setup_qchunk.py::test_q_count_not_a_multiple_of_the_chunk","reason":"q-chunk remainder case exceeds the pinned invariance tolerance","owner":"BSE"}
+{"nodeid":"tests/test_bse_sp_lanczos.py::test_driver_matrixfree_route_matches_the_dense_route","reason":"non-TDA fixture is unstable in the Lanczos/dense comparison","owner":"BSE"}
+{"nodeid":"tests/test_bse_sp_lanczos.py::test_sdy_solver_on_the_deck_fixture_matches_dense","reason":"non-TDA fixture is unstable in the Lanczos/dense comparison","owner":"BSE"}
+{"nodeid":"tests/test_bse_w_ladder_dense.py::test_w_ladder_matches_dense_oracle_on_a_mesh[1-1]","reason":"ladder implementation disagrees with the independent dense oracle by about 1","owner":"BSE"}
+{"nodeid":"tests/test_bse_w_ladder_dense.py::test_w_ladder_trs_gauge_mechanism_on_a_synthetic_payload[1]","reason":"ladder implementation disagrees with the independent dense oracle by about 1","owner":"BSE"}
+{"nodeid":"tests/test_bse_w_omega_chain_scan.py::test_bse_w_exact_is_p_gt_1_safe","reason":"BSE W chain tracing or P>1 host-gather contract is violated","owner":"BSE"}
+{"nodeid":"tests/test_bse_w_omega_chain_scan.py::test_chain_step_traces_once_for_the_whole_chain","reason":"BSE W chain tracing or P>1 host-gather contract is violated","owner":"BSE"}
+{"nodeid":"tests/test_cache_key_lint.py::test_the_tree_is_clean_apart_from_the_red_list","reason":"three noncanonical JAX cache-key sites lack allow-list rows","owner":"runtime"}
+{"nodeid":"tests/test_collectives_distribution.py::test_every_name_collectives_promises_is_defined","reason":"common.collectives exports undefined device_put_process_local","owner":"common/collectives"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A100_eps1e-08_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A100_eps1e-12_positive_composite]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A120_eps1e-08_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A120_eps1e-12_positive_composite]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A160_eps1e-10_positive_composite]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A20_eps1e-12_positive_composite]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A40_eps1e-12_positive_composite]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_shipped_entry_recertifies_from_its_own_bytes[A60_eps1e-08_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_catalog_covers_the_span_and_tier_ladder","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_far_line_rides_the_same_node_set[A100_eps1e-06_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_far_line_rides_the_same_node_set[A100_eps1e-08_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_far_line_rides_the_same_node_set[A120_eps1e-08_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_far_line_rides_the_same_node_set[A40_eps1e-10_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_far_line_rides_the_same_node_set[A60_eps1e-08_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_far_line_rides_the_same_node_set[A80_eps1e-06_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_far_line_rides_the_same_node_set[A80_eps1e-08_btv_minimax]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_ported_composite_is_the_shipped_evaluator_rule[v10_A200_e1e-12]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_ported_composite_is_the_shipped_evaluator_rule[v1_A100_e1e-10]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_ported_composite_is_the_shipped_evaluator_rule[v1_A20_e1e-06]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_damped_line_tables.py::test_the_ported_composite_is_the_shipped_evaluator_rule[v1_A60_e1e-08]","reason":"shipped damped-line catalog does not reproduce its recorded certification values","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_dft_gauge_vertices.py::test_icl_kminusq_jet_reuses_uniform_current_and_contact_exactly","reason":"finite-q jet does not exactly reuse the uniform current/contact payload","owner":"GW/head"}
+{"nodeid":"tests/test_driver_debug_print_contract.py::test_driver_debug_does_not_force_jax_cache_miss_explanations","reason":"environment registry is missing the JAX cache-miss default row","owner":"runtime/docs"}
+{"nodeid":"tests/test_exciton_bands_refit_window.py::test_the_refusal_names_the_window_and_the_basis_not_the_tolerance","reason":"the refusal text no longer names the required orthonormality condition","owner":"BSE/exciton-bands"}
+{"nodeid":"tests/test_ff_compute_mode.py::test_no_module_dispatches_on_the_mode_through_a_bare_else","reason":"compute-mode exhaustiveness/source-documentation contract is violated","owner":"GW/config"}
+{"nodeid":"tests/test_ff_compute_mode.py::test_the_reference_docs_carry_the_mode_and_say_it_refuses[input_reference.md]","reason":"compute-mode exhaustiveness/source-documentation contract is violated","owner":"GW/config"}
+{"nodeid":"tests/test_gw_jax_regression.py::test_bispinor_gnppm_matches_reference","reason":"the 2026-08-09 bispinor frozen reference is stale by 1.434381 eV and must not be refrozen without a physics ruling","owner":"GW/physics"}
+{"nodeid":"tests/test_gw_jax_regression.py::test_gnppm_matches_reference","reason":"frozen GW reference differs from the current computed result","owner":"GW/physics"}
+{"nodeid":"tests/test_invariance_gates.py::test_fixed_point_frozen_qp_rotations","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
+{"nodeid":"tests/test_invariance_gates.py::test_ibz_equals_full_bz","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
+{"nodeid":"tests/test_invariance_gates.py::test_restart_equals_fresh","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
+{"nodeid":"tests/test_minimax_beta_selector.py::test_a_refused_request_is_byte_identical_to_the_runtime_solve","reason":"runtime minimax refusal and offline solve are not byte-identical","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_minimax_beta_selector.py::test_the_escape_hatch_still_reaches_the_runtime_solve","reason":"the explicit runtime-solve escape hatch returns 7 nodes where the gate requires 10","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_minimax_imag_tables.py::test_the_catalog_carries_both_tiers_and_says_who_asks_for_each","reason":"imaginary-axis catalog coverage or certification differs from its pinned contract","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_minimax_imag_tables.py::test_the_catalog_covers_the_census_request_table","reason":"imaginary-axis catalog coverage or certification differs from its pinned contract","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_minimax_imag_tables.py::test_the_fit_stage_floor_is_no_longer_a_quadrature","reason":"imaginary-axis catalog coverage or certification differs from its pinned contract","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_minimax_imag_tables.py::test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door","reason":"imaginary-axis catalog coverage or certification differs from its pinned contract","owner":"minimax/quadrature"}
+{"nodeid":"tests/test_parallel_transport.py::test_finite_link_gate_passes_a_band_crossing_and_refuses_wrong_orientation","reason":"finite-link head response is about 2.35e-2 above the 5e-3 gate","owner":"GW/head"}
+{"nodeid":"tests/test_parallel_transport.py::test_finite_link_gate_passes_a_non_crossing_window","reason":"finite-link head response is about 2.35e-2 above the 5e-3 gate","owner":"GW/head"}
+{"nodeid":"tests/test_qgrid_symmetry_resolution.py::test_no_module_bypasses_the_resolution_point","reason":"centroid_k_unfold bypasses the canonical q-grid symmetry resolver","owner":"symmetry"}
+{"nodeid":"tests/test_scissor_weights.py::test_fit_scissor_energy_arrays_cannot_be_passed_positionally","reason":"fit_scissor still accepts swappable energy arrays positionally; changing the held production call site is outside this test-infrastructure lane","owner":"QSGW"}
+{"nodeid":"tests/test_spectral_closure.py::test_every_wired_site_imports_the_shared_guard","reason":"htransform no longer calls the shared spectral-closure guard","owner":"bandstructure"}
+{"nodeid":"tests/test_spectral_closure.py::test_the_default_mode_and_tolerance_have_exactly_one_literal","reason":"htransform no longer calls the shared spectral-closure guard","owner":"bandstructure"}
+{"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[bispinor_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
+{"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[cohsex_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
+{"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[gnppm_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
+```
+<!-- executable-xfails:end -->
+
 > **WHICH RUN THIS FILE ACCOUNTS FOR (unchanged, restated 2026-08-09).**
 > Every row below is about the **CENSUS** — `pytest --census`, equivalently
 > `pytest -m census`. Since 2026-08-09 a bare `pytest` is the fast default

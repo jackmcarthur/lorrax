@@ -31,6 +31,8 @@ image.
 """
 from __future__ import annotations
 
+import importlib
+import inspect
 import types
 
 import jax  # noqa: F401  -- populates the jax._src submodule attributes
@@ -219,6 +221,30 @@ def test_p1_observer_preserves_a_cache_read_exception(monkeypatch):
             "broken", "opts", "backend", "devices")
     assert jcc._STATE.probes == 1
     assert jcc._STATE.hits == 0
+
+
+def test_lookup_observer_preserves_the_live_private_arity(monkeypatch):
+    """Installing our observer must not make the startup gate reject it.
+
+    The observer deliberately forwards every argument without interpreting
+    it.  Signature preservation is nevertheless part of that transparency:
+    the runtime capability gate may run later in the same process and must
+    still see JAX's four-parameter 0.9.1 contract, not the wrapper's
+    ``(cache_key, *passthrough)`` implementation detail.
+    """
+    mod, _seen = _fake_compilation_cache(4, verification=True)
+    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
+
+    jcc._install_observation_patch()
+
+    assert len(inspect.signature(mod.get_executable_and_time).parameters) == 4
+    from runtime import jax_support
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        importlib, "import_module",
+        lambda name: (mod if name == "jax._src.compilation_cache"
+                      else real_import(name)))
+    assert jax_support.check_private_arity() == []
 
 
 def test_p1_cache_setup_arms_the_observer_before_return(monkeypatch, tmp_path):

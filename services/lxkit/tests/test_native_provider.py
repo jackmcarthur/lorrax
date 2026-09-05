@@ -6,8 +6,10 @@ import ctypes
 import builtins
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,6 +34,32 @@ ABI_SYMBOLS = {
     "CUDA": "lorrax_ffi_cuda_abi_version",
     "cpu": "lorrax_ffi_host_abi_version",
 }
+
+_ISOLATED_CASE_ENV = "LORRAX_LXKIT_NATIVE_PROVIDER_ISOLATED_CASE"
+
+
+def _run_in_clean_process(node_name: str) -> None:
+    """Run a live-loader assertion before this process's CUDA mappings.
+
+    These two tests inspect the process-wide dynamic-loader map.  Once a
+    preceding test imports JAX/CUDA, NVIDIA's engine-private providers are
+    already mapped and cannot be unloaded by a fixture.  An exec'd pytest
+    process is therefore part of the test's real precondition, not a skip.
+    """
+    env = dict(os.environ)
+    env[_ISOLATED_CASE_ENV] = node_name
+    for key in ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT",
+                "PYTEST_XDIST_TESTRUNUID", "PYTEST_CURRENT_TEST",
+                "PYTEST_ADDOPTS"):
+        env.pop(key, None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         f"{Path(__file__).resolve()}::{node_name}"],
+        cwd=Path(__file__).resolve().parents[3], env=env,
+        capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, (
+        f"isolated native-provider case {node_name} failed\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
 
 def _hash(path: Path) -> str:
@@ -283,6 +311,11 @@ def _compile_pair(tmp_path: Path) -> Path:
 
 
 def test_live_abi_symbol_origin_is_the_manifest_file(tmp_path):
+    if os.environ.get(_ISOLATED_CASE_ENV) != (
+            "test_live_abi_symbol_origin_is_the_manifest_file"):
+        _run_in_clean_process(
+            "test_live_abi_symbol_origin_is_the_manifest_file")
+        return
     root = _compile_pair(tmp_path)
     selected = _locate(root, "cpu")
     lib, actual = native.open_and_attest(
@@ -305,6 +338,11 @@ def test_live_wrong_origin_refuses(tmp_path, monkeypatch):
 
 def test_private_closure_localizes_without_ld_library_path(tmp_path,
                                                            monkeypatch):
+    if os.environ.get(_ISOLATED_CASE_ENV) != (
+            "test_private_closure_localizes_without_ld_library_path"):
+        _run_in_clean_process(
+            "test_private_closure_localizes_without_ld_library_path")
+        return
     cc = shutil.which("cc") or shutil.which("gcc")
     if cc is None:
         pytest.skip("C compiler required for the private-closure twin")

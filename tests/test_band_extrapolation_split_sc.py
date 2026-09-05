@@ -292,9 +292,14 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
     """
     path = os.path.join(_SRC, "gw", "ppm_pipeline.py")
     calls = _calls(path, "_extrapolated_point")
-    assert len(calls) == 1, f"expected one driving call, got {len(calls)}"
-    args = [ast.unparse(a) for a in calls[0].args]
-    assert args[1] == "extrap_weights", args
+    # The first call drives the even/full Sigma.  A second call now applies
+    # the SAME weights to the even residue so the reported TR-odd component
+    # is an extrapolated difference rather than a mixed-count subtraction.
+    assert len(calls) == 2, (
+        f"expected driving and even-residue calls, got {len(calls)}")
+    for call in calls:
+        args = [ast.unparse(a) for a in call.args]
+        assert args[1] == "extrap_weights", args
     src_pipe = open(path, encoding="utf-8").read()
     assert ("extrap_payload, extrap_weights = _report_band_extrapolation("
             in src_pipe), (
@@ -306,7 +311,7 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
     # ...and band_counts is the PLAN's counts, not a band count re-read from
     # the config or the meta.
     src = open(os.path.join(_SRC, "gw", "ppm_sigma.py"), encoding="utf-8").read()
-    assert "band_counts=tuple(int(c) for c in plan.counts)" in src, (
+    assert "band_counts=plan.counts" in src, (
         "the Sigma cube's band_counts must come from the bracket plan; if it "
         "is re-derived from a config key the split can disagree with it")
 
@@ -582,7 +587,7 @@ def test_the_dynamic_branch_does_not_recite_the_static_measurement():
     src = open(os.path.join(_SRC, "gw", "sigma_dispatch.py"),
                encoding="utf-8").read()
     guard = src[src.index("AUTO-DISABLED, LOUDLY"):]
-    guard = guard[:guard.index("Static channels")]
+    guard = guard[:guard.index("NOTHING IS REBOUND HERE")]
     probe = 'getattr(mode, "is_dynamic", False)'
     assert probe in guard, "the note must branch on whether the stage is dynamic"
     # Slice relative to the branch itself: there is an EARLIER if/else in this

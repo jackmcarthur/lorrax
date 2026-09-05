@@ -29,8 +29,9 @@ Knobs (all optional):
   ``LORRAX_JAX_COMPILE_AGREEMENT=0``    — UNSAFE bisect-only opt-out from the
                                           per-module cross-rank compile-key
                                           refusal (default on at P > 1).
-  ``LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S`` — bounded per-module agreement
-                                          timeout, default 300 seconds.
+  ``LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S`` — per-module agreement deadline in
+                                          seconds; default 0 = no deadline
+                                          (a heartbeat names the missing rank).
   ``LORRAX_JAX_CACHE_STRICT=0``         — on an agreed entry that then fails
                                           to load, warn instead of aborting
                                           (UNSAFE on GPU: can hang).
@@ -265,6 +266,7 @@ they were cut from.  ``jax.version.__version_info__`` is the honest tuple.
 from __future__ import annotations
 
 import atexit
+import functools
 import hashlib
 import re
 import json
@@ -294,7 +296,68 @@ _COMPILE_KV_NS = "lorrax/compile_agreement/v2"
 # compile slot 122 s apart across P4 ranks (JID 57909046.129).  Five minutes
 # keeps that measured skew inside the contract while remaining a finite
 # fail-fast bound; tests and bisect probes use their own short deadline.
-_COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 300.0
+# Default 0: wait without bound.  A late rank is skew, not disagreement.  The
+# Sigma rule planner fits its windows round-robin across ranks, and on Si
+# b80/c504 one rank's share ran past the former 300-second deadline (JID
+# 57927048.48): rank 0 refused, tore down, and hung in a collective H5Fclose
+# while its peers were still fitting.  A deadline turned skew into a hang.
+_COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 0.0
+_AGREEMENT_HEARTBEAT_S = 60.0
+
+
+def _deadline_text(timeout_s: float) -> str:
+    return (f"a {timeout_s:g}-second deadline" if timeout_s > 0
+            else "no deadline (rank 0 names a missing rank every 60 s)")
+
+
+def _agreement_deadline_env(name: str, default: float) -> float:
+    """Read a finite deadline in seconds; 0 (the default) waits without bound."""
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None or not raw.strip() else float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a number of seconds (0 = no deadline), "
+            f"got {raw!r}") from exc
+    if not (value >= 0.0 and value < float("inf")):
+        raise ValueError(
+            f"{name} must be a finite non-negative number of seconds, "
+            f"got {raw!r}")
+    return value
+
+
+def _is_wait_timeout(exc: BaseException) -> bool:
+    text = str(exc).upper()
+    return (isinstance(exc, TimeoutError) or "DEADLINE" in text
+            or "TIMED OUT" in text or "TIMEOUT" in text)
+
+
+def _wait_for_key(client, key: str, timeout_s: float, *, what: str) -> bytes:
+    """Block on one coordination key; ``timeout_s <= 0`` waits without bound.
+
+    The wait is chunked so that every ``_AGREEMENT_HEARTBEAT_S`` a line names
+    what this rank is still waiting for.  Only the client's own wait timeout
+    is retried; any other failure propagates.
+    """
+    t0 = time.monotonic()
+    while True:
+        waited = time.monotonic() - t0
+        chunk_s = _AGREEMENT_HEARTBEAT_S
+        if timeout_s > 0:
+            chunk_s = min(chunk_s, timeout_s - waited)
+            if chunk_s <= 0:
+                raise TimeoutError(
+                    f"{what}: not within {timeout_s:g} seconds")
+        try:
+            return client.blocking_key_value_get_bytes(
+                key, max(1, int(chunk_s * 1000)))
+        except Exception as exc:                            # noqa: BLE001
+            waited = time.monotonic() - t0
+            if not _is_wait_timeout(exc) or (
+                    timeout_s > 0 and waited >= timeout_s):
+                raise
+            _say(f"compile agreement: still waiting for {what} "
+                 f"({waited:.0f} s elapsed)")
 
 # Parallel page-cache prefetch of the agreed entries (see _prefetch_agreed).
 # ON: at 606 centroids / P=16 the SERIAL reads of 169 entries cost 29 s on one
@@ -1161,6 +1224,12 @@ def _install_lookup_patch(*, enforce_agreement: bool) -> None:
     # naming three arguments it never interprets would be a claim about their
     # meaning that this file has no reason to make.  It forwards them
     # untouched, which is exact for any arity.
+    # ``wraps`` is load-bearing even though the forwarding body does not need
+    # it: runtime.jax_support checks this private surface with
+    # ``inspect.signature``.  Without ``__wrapped__``, that later check sees
+    # this implementation's two syntactic parameters and refuses our own
+    # transparent observer as an incompatible JAX installation.
+    @functools.wraps(_orig_get)
     def _observed_get(cache_key, *passthrough):
         _STATE.probes += 1
         _STATE.probe_keys.add(cache_key)
@@ -1188,6 +1257,7 @@ def _install_lookup_patch(*, enforce_agreement: bool) -> None:
         _STATE.hits += 1
         return executable, compile_time
 
+    @functools.wraps(_orig_in_cache)
     def _observed_in_cache(backend, cache_key):
         _STATE.probe_keys.add(cache_key)
         if enforce_agreement and cache_key not in _STATE.agreed:
@@ -1473,18 +1543,19 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
 
     t0 = time.monotonic()
     if proc_idx == 0:
-        deadline = t0 + timeout_s
         records: list[dict | None] = [None] * n_proc
         records[0] = record
         reason = ""
         for rank in range(1, n_proc):
-            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
-            if time.monotonic() >= deadline:
+            remaining_s = (timeout_s - (time.monotonic() - t0)
+                           if timeout_s > 0 else 0.0)
+            if timeout_s > 0 and remaining_s <= 0:
                 reason = f"deadline expired after {timeout_s:g} seconds"
                 break
             try:
-                payload = client.blocking_key_value_get_bytes(
-                    f"{prefix}/rank/{rank}", remaining_ms)
+                payload = _wait_for_key(
+                    client, f"{prefix}/rank/{rank}", remaining_s,
+                    what=f"rank {rank} to reach the {module_name} compile")
                 records[rank] = _decode_compile_record(payload, rank)
             except Exception as exc:                        # noqa: BLE001
                 reason = (
@@ -1521,10 +1592,11 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
         # remaining ranks to enter a collective without it (measured on the Si
         # MPA P4 path, JID 57909046.123).
         handoff_s = min(2.0, max(0.1, timeout_s * 0.1))
-        peer_wait_s = 2.0 * timeout_s + handoff_s
+        peer_wait_s = 2.0 * timeout_s + handoff_s if timeout_s > 0 else 0.0
         try:
-            payload = client.blocking_key_value_get_bytes(
-                f"{prefix}/verdict", int(peer_wait_s * 1000))
+            payload = _wait_for_key(
+                client, f"{prefix}/verdict", peer_wait_s,
+                what=f"rank 0's verdict on the {module_name} compile")
             verdict = json.loads(payload.decode("utf-8"))
         except Exception as exc:                            # noqa: BLE001
             records = _snapshot_compile_records(
@@ -1595,7 +1667,7 @@ def _configure_compile_agreement() -> None:
                  "coordination client is not initialized.")
         return
 
-    timeout_s = _positive_float_env(
+    timeout_s = _agreement_deadline_env(
         "LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S",
         _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S)
     s._compile_client = client
@@ -1605,7 +1677,7 @@ def _configure_compile_agreement() -> None:
     if s.proc_idx == 0:
         _debug_say(
             "cross-rank compile agreement enabled before backend compile "
-            f"with a {timeout_s:g}-second deadline.")
+            f"with {_deadline_text(timeout_s)}.")
 
 
 def install_compile_agreement() -> None:

@@ -464,10 +464,13 @@ def test_the_qsgw_writers_cohsex_omission_now_goes_through_the_table():
     body = ast.unparse(fn)
     assert "mode_builds_channels(config.compute_mode" in body
     assert "explain_missing_channels(config.compute_mode" in body
-    # And the decision it replaced is gone from that arm, not merely
-    # supplemented: two authorities on one question is the state this
-    # change exists to leave.
-    assert "results.use_ppm" not in body
+    # And the channel-presence decision it replaced is gone from that arm,
+    # not merely supplemented.  ``results.use_ppm`` remains legitimate
+    # below this gate for choosing static storage/labels.
+    channel_gate = body[
+        body.index("if not mode_builds_channels"):
+        body.index("elif static_band_sharded")]
+    assert "results.use_ppm" not in channel_gate
 
 
 def test_the_advice_the_writers_print_never_names_a_mode_that_refuses():

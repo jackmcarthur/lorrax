@@ -81,6 +81,12 @@ _QUADRATURE_FLOOR = 2.5e-9
 #: sit at 1e-4 and above) cannot hide under it.
 _REL_TOL = 4.0 * _QUADRATURE_FLOOR
 
+_NEEDS_P4_CLOSURE_MEMORY = pytest.mark.skipif(
+    jax.device_count() < 4,
+    reason=("needs >=4 JAX devices: the W-BSE closure fixture exhausts one "
+            "A100 during a 10.68 GiB allocation"),
+)
+
 
 def _require_ladder_facade():
     try:
@@ -270,6 +276,7 @@ def _read_full_bz(path, name, n_rmu):
 
 
 @pytest.mark.gpu
+@_NEEDS_P4_CLOSURE_MEMORY
 def test_include_w_false_reproduces_the_production_rpa_w0(wbse_closure_run,
                                                           monkeypatch):
     """THE CENTREPIECE.  Full tile, q=0 AND a finite q_irr, to the floor.
@@ -443,6 +450,7 @@ def test_include_w_false_reproduces_the_production_rpa_w0(wbse_closure_run,
 
 
 @pytest.mark.gpu
+@_NEEDS_P4_CLOSURE_MEMORY
 def test_the_ladder_w_passes_the_production_w_gate_at_finite_q(
         wbse_closure_run, monkeypatch):
     """THE LADDER W's OWN gate, at q=0 AND at every irreducible finite q.
@@ -595,6 +603,7 @@ def test_the_ladder_w_passes_the_production_w_gate_at_finite_q(
 
 
 @pytest.mark.gpu
+@_NEEDS_P4_CLOSURE_MEMORY
 def test_the_ladder_operator_obeys_q_conjugate_reciprocity_without_the_unfold(
         wbse_closure_run, monkeypatch):
     """``W(-q) = conj(W(q))`` SOLVED at both q, with no symmetry step at all.
@@ -692,6 +701,7 @@ def _first_finite_irreducible_q(sym):
 
 
 @pytest.mark.gpu
+@_NEEDS_P4_CLOSURE_MEMORY
 def test_the_wired_path_refuses_a_restart_it_cannot_hand_over(
         wbse_closure_run, tmp_path):
     """Persist-before-load, stated as a refusal rather than a hope.
