@@ -9,9 +9,12 @@ import pytest
 from gw import sc_iteration
 
 
-def _partition(nb, lo, hi):
+def _partition(nb, lo, hi, protected_hi=None):
     m = np.zeros(nb, dtype=bool); m[lo:hi] = True
-    return SimpleNamespace(protected_mask=m, in_range_mask=m)
+    pm = m.copy()
+    if protected_hi is not None:
+        pm[lo:protected_hi] = True
+    return SimpleNamespace(protected_mask=pm, in_range_mask=m)
 
 
 def test_inside_states_return_the_smallest_margin(capsys):
@@ -45,3 +48,14 @@ def test_scissored_bands_do_not_count():
         omega_max_abs_ev=18.0, tolerance_ev=0.136, omega_step_ev=0.25,
         iteration=1, print_fn=lambda _s: None)
     assert margin == pytest.approx(12.0)
+
+
+def test_promoted_protected_bands_outside_the_grid_are_not_escapes():
+    """Whole-multiplet promotion may protect bands that were never in range;
+    they keep the historical clamp and must not trip the frozen check."""
+    e = np.array([[-3.0, 1.0, 30.0]])
+    margin = sc_iteration._refuse_frozen_partition_escape(
+        _partition(3, 0, 2, protected_hi=3), e, band_offset=0,
+        omega_min_abs_ev=-15.0, omega_max_abs_ev=24.0, tolerance_ev=0.136,
+        omega_step_ev=0.25, iteration=1, print_fn=lambda _s: None)
+    assert margin == pytest.approx(23.0)
