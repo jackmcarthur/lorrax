@@ -361,7 +361,16 @@ def inspect_deck(args) -> None:
     print(f"SIGMA_WINDOW bands={sigma_window} nelec={nelec} "
           f"ncond={config.ncond} sc_buffer={sc_buffer} "
           f"divides_mesh={str(divides).lower()}")
-    if config.compute_mode.is_dynamic and not divides:
+    # The divisibility rule belongs to the mesh-sharded off-shell Sigma
+    # frequency cube.  Tier-0 CD has no such cube: it streams a replicated
+    # target table, pads its fixed-size target tiles internally, and returns
+    # only the physical diagonal.  Applying the cube rule to CD can make a
+    # symmetry-closed physical window impossible (scalar Na: safe edge 10,
+    # while every P16-divisible edge above the occupied manifold is open).
+    cd_streams_physical_diagonal = (
+        config.sigma.freq_route.value == "internal_ff_cd")
+    if (config.compute_mode.is_dynamic and not cd_streams_physical_diagonal
+            and not divides):
         _fail(
             "LX-DECK-SIGMA-MESH",
             f"dynamic Sigma window {sigma_window} does not divide {px}x{py}",
