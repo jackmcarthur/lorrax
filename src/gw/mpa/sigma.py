@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import gc
+import os
+import sys
+import time
 from dataclasses import replace
 
 import jax
@@ -43,6 +46,89 @@ _PANE_CONTROL_MAX_RANK = 4096
 
 
 _DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
+_DEBUG_MAX_TAU_DISPATCHES_ENV = "LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES"
+
+
+def _resolve_debug_max_tau_dispatches(*, print_fn=print):
+    """Return the debug-only bounded-sweep length, or ``None``.
+
+    A bounded sweep is a performance instrument, not a quadrature rule: the
+    executor exits cleanly after the requested number of real-shape tau
+    dispatches and never returns a partial Sigma cube to an output consumer.
+    """
+    raw = os.environ.get(_DEBUG_MAX_TAU_DISPATCHES_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        count = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_DEBUG_MAX_TAU_DISPATCHES_ENV} must be a positive integer; "
+            f"got {raw!r}") from exc
+    if count <= 0:
+        raise ValueError(
+            f"{_DEBUG_MAX_TAU_DISPATCHES_ENV} must be a positive integer; "
+            f"got {raw!r}")
+    print_fn(
+        "WARNING -- DEBUG: "
+        f"{_DEBUG_MAX_TAU_DISPATCHES_ENV}={count}; the MPA Sigma executor "
+        "will stop after that many tau dispatches and WILL NOT produce "
+        "scientific Sigma/QP output.")
+    return count
+
+
+_TAU_PROFILE_PHASES = (
+    "sigma.tau.w_phase",
+    "sigma.tau.w_prep",
+    "sigma.tau.G_build",
+    "sigma.tau.G_ifft",
+    "sigma.tau.GW_mult_fft",
+    "sigma.tau.GW_conv_ffi",
+    "sigma.tau.project_rs",
+    "sigma.tau.kernel",
+    "sigma.tau.accumulator",
+    "sigma.tau.progress",
+)
+
+
+def _tau_profile_snapshot():
+    """Aggregate the tau profiler's timing nodes by local section name."""
+    totals = {}
+    for record in timing.records():
+        name = record["name"]
+        if name not in _TAU_PROFILE_PHASES:
+            continue
+        count, seconds = totals.get(name, (0, 0.0))
+        totals[name] = (
+            count + int(record["count"]),
+            seconds + float(record["inclusive"]),
+        )
+    return totals
+
+
+def _debug_probe_print(line):
+    """Emit one live rank-zero line outside the production report sink."""
+    if jax.process_index() == 0:
+        # gw_jax deliberately sends incidental stdout to /dev/null.  This
+        # opt-in diagnostic must survive that production stream boundary.
+        print(line, file=sys.stderr, flush=True)
+
+
+def _print_tau_profile(before, *, n_tau, print_fn=_debug_probe_print):
+    """Print post-prewarm timing deltas for the staged tau diagnostic."""
+    after = _tau_profile_snapshot()
+    print_fn("--- Sigma tau phase profile (post-prewarm, blocking) ---")
+    print_fn(f"{'Phase':<31} {'Count':>7} {'Total[s]':>11} {'s/dispatch':>13}")
+    for name in _TAU_PROFILE_PHASES:
+        count0, seconds0 = before.get(name, (0, 0.0))
+        count1, seconds1 = after.get(name, (0, 0.0))
+        count = count1 - count0
+        seconds = seconds1 - seconds0
+        if count <= 0:
+            continue
+        print_fn(
+            f"{name:<31} {count:>7d} {seconds:>11.6f} "
+            f"{seconds / max(1, n_tau):>13.6f}")
 
 
 def _resolve_mpa_odd_residue_debug(ordered_residues, *, print_fn=print):
@@ -162,6 +248,9 @@ def _integrate_sigma_batches(
     omega = np.asarray(omega_grid_ry, np.float64)
     if omega.ndim != 1 or not omega.size:
         raise ValueError("omega_grid_ry must be a nonempty vector")
+    debug_max_tau = _resolve_debug_max_tau_dispatches(print_fn=print_fn)
+    tau_profile = env_bool(
+        "LORRAX_SIGMA_TAU_TIMING", False, print_fn=print_fn)
 
     s = wfns.slices
     sigma_axis = sigma_band_axis(
@@ -259,10 +348,16 @@ def _integrate_sigma_batches(
         for _row in plan:
             if _batch_rows(_row, _batch) is not None:
                 total_tau += len(np.asarray(_row.window.nodes.t))
+    progress_total = (
+        total_tau if debug_max_tau is None
+        else min(total_tau, debug_max_tau))
     progress = LoopProgress(
-        max(1, total_tau), print_fn, title="Sigma tau sweep",
+        max(1, progress_total), print_fn, title="Sigma tau sweep",
         item_name="tau node", max_updates=20)
     progress.start()
+    profile_before = None
+    sweep_wall_start = None
+    stop_probe = False
     for lo, Omega, B, B_odd in batches:
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
@@ -314,33 +409,84 @@ def _integrate_sigma_batches(
                 print_fn(
                     "  MPA Sigma sweep begin: shared pane tau kernel "
                     "prewarmed")
+                profile_before = _tau_profile_snapshot()
+                sweep_wall_start = time.perf_counter()
                 sweep_started = True
+            t_nodes = np.asarray(
+                jax.device_get(win.nodes.t), np.complex128)
+            alpha_nodes = np.asarray(
+                jax.device_get(win.nodes.alpha), np.complex128)
+            if debug_max_tau is not None:
+                remaining = debug_max_tau - n_tau
+                if remaining <= 0:
+                    stop_probe = True
+                    break
+                t_nodes = t_nodes[:remaining]
+                alpha_nodes = alpha_nodes[:remaining]
             accumulator.begin_window(
-                win.nodes.t, win.nodes.alpha,
+                t_nodes, alpha_nodes,
                 omega_sign=win.omega_sign, prefactor=win.prefactor,
                 e_ref_sum=win.E_ref_A + win.E_ref_B,
                 antihermitian=(win.project_code == 1),
                 omega_indices=row.omega_idx,
                 omega_values=row.omega_abs)
-            for t in np.asarray(
-                    jax.device_get(win.nodes.t), np.complex128):
-                sigma_tau = tau_kernel(
-                    psi_coh_xn, psi_coh_yr,
-                    psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B_branch, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A),
-                    jnp.asarray(win.E_ref_B),
-                    jnp.asarray(t, dtype=jnp.complex128))
-                accumulator.add_tau(sigma_tau)
+            for t in t_nodes:
+                if tau_profile:
+                    with timing.section("sigma.tau.kernel") as sec:
+                        sigma_tau = tau_kernel(
+                            psi_coh_xn, psi_coh_yr,
+                            psi_proj_xr, psi_proj_yn,
+                            row.E_A, selector, B_branch, Omega,
+                            pole_indices, bounds, phase_real,
+                            jnp.asarray(win.E_ref_A),
+                            jnp.asarray(win.E_ref_B),
+                            jnp.asarray(t, dtype=jnp.complex128))
+                        sec.watch(sigma_tau)
+                    with timing.section("sigma.tau.accumulator") as sec:
+                        accumulated = accumulator.add_tau(sigma_tau)
+                        sec.watch(accumulated)
+                    with timing.section("sigma.tau.progress"):
+                        progress.step()
+                else:
+                    sigma_tau = tau_kernel(
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
+                        row.E_A, selector, B_branch, Omega,
+                        pole_indices, bounds, phase_real,
+                        jnp.asarray(win.E_ref_A),
+                        jnp.asarray(win.E_ref_B),
+                        jnp.asarray(t, dtype=jnp.complex128))
+                    accumulator.add_tau(sigma_tau)
+                    progress.step(wait=sigma_tau)
                 n_tau += 1
-                progress.step(wait=sigma_tau)
             accumulator.end_window()
             n_sweeps += 1
-            logical_tau_pairs += win.n_tau
+            logical_tau_pairs += len(t_nodes)
+            if debug_max_tau is not None and n_tau >= debug_max_tau:
+                stop_probe = True
+                break
         del B, B_odd, Omega
         gc.collect()
+        if stop_probe:
+            break
     progress.finish()
+
+    if debug_max_tau is not None:
+        # Close every outstanding asynchronous accumulator/end-window update
+        # before stopping the measurement clock.  The partial cube dies here;
+        # it is never wrapped in SigmaOmegaResult or handed to an output path.
+        jax.block_until_ready(accumulator.finalize())
+        elapsed = time.perf_counter() - sweep_wall_start
+        _debug_probe_print(
+            f"  DEBUG bounded Sigma tau sweep: {n_tau} dispatches in "
+            f"{elapsed:.6f} s ({elapsed / max(1, n_tau):.6f} s/dispatch)")
+        if tau_profile:
+            _print_tau_profile(
+                profile_before, n_tau=n_tau)
+        _debug_probe_print(
+            "  DEBUG bounded Sigma tau sweep complete; exiting before "
+            "Sigma/QP output (intentional rc=0).")
+        raise SystemExit(0)
 
     sigma = accumulator.finalize()
     if bracketed:
