@@ -706,15 +706,23 @@ def sigma_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
     return result
 
 
-def parent_sigma_operands(wfns: "Wavefunctions"):
+def parent_sigma_operands(wfns: "Wavefunctions", *, projection="canonical"):
     """The Σ kernel operands of the parent route, in the kernels' slot order.
 
     ``(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, enk, occ)``: the
     PACKED parent faces for the G contraction (first operand direct, second
-    conjugated inside ``build_G``), the CANONICAL parent faces for the band
-    projection (first operand conjugated inside the projector), and the
-    parent-row energy/occupation tables.  Same six roles the full-k face
-    call sites fill from ``wfns`` itself.
+    conjugated inside ``build_G``), the parent faces for the band projection
+    (first operand conjugated inside the projector), and the parent-row
+    energy/occupation tables.  Same six roles the full-k face call sites
+    fill from ``wfns`` itself.
+
+    ``projection="canonical"`` hands the canonical-order parent faces: for
+    a Σ operator in canonical centroid order (the static kernels, whose G is
+    restored by ``finish_green``).  ``projection="packed"`` hands the packed
+    faces: for the dynamic τ chain, which keeps G, W and Σ in PACKED order
+    and never restores per τ node.  The band matrix
+    ψ†Σψ is the same in either basis because the permutation is applied to
+    both factors and the pad slots are zero in ψ.
     """
     carrier = wfns.green_parent
     if carrier is None or carrier.psi_nmu_canonical is None:
@@ -722,6 +730,14 @@ def parent_sigma_operands(wfns: "Wavefunctions"):
             "parent_sigma_operands: the bundle carries no projection-capable "
             "parent carrier (build_packed_parent_green_carrier with the "
             "canonical faces).")
+    if projection == "packed":
+        return (carrier.psi_mun, carrier.psi_nmu,
+                carrier.psi_nmu, carrier.psi_mun,
+                carrier.enk, carrier.occ)
+    if projection != "canonical":
+        raise ValueError(
+            "parent_sigma_operands: projection must be 'canonical' or "
+            f"'packed'; got {projection!r}.")
     return (carrier.psi_mun, carrier.psi_nmu,
             carrier.psi_nmu_canonical, carrier.psi_mun_canonical,
             carrier.enk, carrier.occ)

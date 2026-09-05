@@ -400,6 +400,25 @@ G_Θk(r,r') = G_k(r',r) at the same complex frequency, so Σ_Θk,mn = Σ_k,nm
 (the conj rule would flip Im Σ on the diagonal).  Gate:
 `tests/test_sigma_parent_projection.py`.
 
+The dynamic τ chain runs entirely in PACKED centroid order: G is unfolded
+to packed full k (`k_unfold_output="packed"`, no `finish_green` restore per
+τ node — that restore was four all-to-all exchanges per node on Si), the
+screened interaction's residues are packed once per pole batch
+(`plan.pack_square_operator`), the FFT convolution is order-agnostic, and
+the projection uses the packed parent faces
+(`parent_sigma_operands(projection="packed")`).  ψ†Σψ is the same in either
+basis because the permutation acts on both factors and the pad slots of ψ
+are zero.  The static kernels (invalid-pole limit, COHSEX) keep the
+canonical order through `finish_green`.
+
+Where a canonical crop is still needed (`restore_left_basis` for the ζ-fit
+RHS, `restore_operator_basis` in `finish_green`), the reorder lays each
+shard's canonical rows as that shard's OWN prefix
+(`_shardwise_prefix_map`) and the crop is a rank-local slice inside a
+`shard_map` (`_local_prefix_crop`).  The former global slice to a
+non-shard-aligned extent made XLA all-gather the whole centroid axis on
+every rank (Si: c128[8, 840, 1384] from a [8, 420, 1384] tile).
+
 When every wavefunction consumer of a run is parent-capable, `gw_init`
 never forms the full-k faces at all: the loader samples the raw parents
 (`load_centroids_band_chunked(k_domain="ibz")`), the face bundle carries

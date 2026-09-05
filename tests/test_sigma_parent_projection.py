@@ -200,6 +200,18 @@ def _worker() -> int:
     scale = float(np.max(np.abs(ref)))
     proj_rel = float(np.max(np.abs(got - ref))) / scale
 
+    # The dynamic chain's PACKED order: the operator unfolded to packed full
+    # k (no restore), projected with the packed parent faces.  Same band
+    # matrix.
+    with mesh:
+        sigma_packed = jax.block_until_ready(plan.unfold_operator(O_parent))
+    project_packed = _make_project_ri_reduce_scatter(
+        mesh, merged_x=True, layout="face", face_shape=(nk, nb, n_mu, ns),
+        parent_route=route, packed_projection=True)
+    got_packed = np.asarray(jax.block_until_ready(jax.jit(project_packed)(
+        psi_nmu_pk, sigma_packed, psi_mun_pk)))
+    proj_packed_rel = float(np.max(np.abs(got_packed - ref))) / scale
+
     # The discriminator: the conj rule on the time-reversed row (k3).
     inner = contract_bands_block_reshard(
         mesh, layout="face", face_shape=(n_parent, nb, n_mu, ns))
@@ -330,6 +342,7 @@ def _worker() -> int:
     print(json.dumps({
         "sc_rotation_parents_vs_full_rel": rot_rel,
         "g_rel": g_rel, "proj_rel": proj_rel,
+        "proj_packed_rel": proj_packed_rel,
         "conj_rule_rel_on_tr_rows": conj_rel_trs,
         "conj_rule_rel_on_unitary_rows": conj_rel_uni,
         "parents_only_bundle_names_full_k_shapes": parents_only_ok,
@@ -369,6 +382,7 @@ def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
         pytest.skip(f"parent Σ route parity: {out['skip']}")
     assert out["g_rel"] < _TOL, f"G on parents vs full k: {out}"
     assert out["proj_rel"] < _TOL, f"Σ projection on parents vs full k: {out}"
+    assert out["proj_packed_rel"] < _TOL, f"packed-order Σ projection: {out}"
     # The conj rule is right on unitary rows and wrong on the antiunitary
     # one: the transpose is the discriminating choice, not a convention.
     assert out["conj_rule_rel_on_unitary_rows"] < _TOL, out
