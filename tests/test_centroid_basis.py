@@ -139,3 +139,34 @@ def test_identity_basis_is_a_no_op():
     open_set = PackedCentroidBasis.build(
         cents[:1], _sym_swap_xy(), (4, 4, 1), mesh)
     assert open_set.is_identity
+
+
+@pytest.mark.parametrize("spec,axis", [
+    (P(None, 'x', 'y'), 1),
+    (P(None, 'x', 'y'), 2),
+    (P(None, ('x', 'y'), None), 1),
+])
+def test_extent_change_round_trips_when_packed_exceeds_canonical(spec, axis):
+    """Orbits [3, 3, 2] on a 2x2 mesh: canonical 8, packed 12 (one shard
+    holds 5 rows padded to 6).  The rank-local prefix pad/crop at the seam
+    is live here, unlike the equal-extent case."""
+    from common.grouped_layout import build_square_grouped_shard_layout
+    mesh = _mesh_2x2()
+    layout = build_square_grouped_shard_layout(
+        np.asarray([0, 0, 0, 1, 1, 1, 2, 2], dtype=np.int32), (2, 2))
+    assert layout.axis.n_padded == 12
+    cents = np.stack([np.arange(8), np.zeros(8), np.zeros(8)], axis=1).astype(np.int32)
+    basis = PackedCentroidBasis(
+        mesh_xy=mesh, layout=layout, canonical_indices=cents, n_canonical=8)
+    assert basis.n_packed == 12 and basis.n_canonical == 8 and not basis.is_identity
+    rng = np.random.default_rng(3)
+    shape = [3, 8, 8]
+    shape[axis] = 8
+    canonical = rng.normal(size=shape) + 1j * rng.normal(size=shape)
+    dev = jax.device_put(jnp.asarray(canonical), NamedSharding(mesh, spec))
+    packed = jax.block_until_ready(basis.pack_axis(dev, axis))
+    assert packed.shape[axis] == 12
+    np.testing.assert_array_equal(
+        np.asarray(packed), basis.pack_host(canonical, axis=axis))
+    back = jax.block_until_ready(basis.unpack_axis(packed, axis))
+    np.testing.assert_array_equal(np.asarray(back), canonical)
