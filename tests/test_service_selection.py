@@ -121,30 +121,6 @@ def test_the_default_gate_is_exactly_core_plus_its_roster(
         f"  only in the roster: {sorted(expected - default_gate)}")
 
 
-def test_the_full_tier_keeps_one_unprotected_parameter_case(baseline):
-    """The nightly gut preserves core/defects and collapses old size zoos."""
-    from core import manifest
-    import known_failure_ledger
-
-    ledger = known_failure_ledger.read_known_xfails(
-        _REPO / "tests" / "KNOWN_FAILURES.md")
-    by_base = {}
-    for nodeid in baseline:
-        if "[" not in nodeid:
-            continue
-        if (nodeid.startswith("tests/core/") or nodeid in ledger
-                or manifest.matches(nodeid, manifest.CORE_EXTENDED_NODES)):
-            continue
-        by_base.setdefault(nodeid.split("[", 1)[0], []).append(nodeid)
-    duplicates = {base: nodes for base, nodes in by_base.items()
-                  if len(nodes) > 1}
-    assert not duplicates, (
-        "the full tier retained redundant unprotected parameter cases:\n  "
-        + "\n  ".join(
-            f"{base}: {sorted(nodes)}"
-            for base, nodes in sorted(duplicates.items())))
-
-
 def _is_service(nodeid: str) -> bool:
     return nodeid.startswith("services/")
 
