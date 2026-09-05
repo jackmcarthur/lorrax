@@ -72,6 +72,7 @@ class WavefunctionBasisReceipt:
         from common.bispinor_init import (
             ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
             KINETIC_BALANCE_LIFT_PROVENANCE,
+            VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE,
         )
         from common.parallel_transport import WFN_FINGERPRINT_SCHEME
         from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
@@ -132,6 +133,7 @@ class WavefunctionBasisReceipt:
             None,
             KINETIC_BALANCE_LIFT_PROVENANCE,
             ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
+            VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE,
         ):
             raise ValueError(
                 "WavefunctionBasisReceipt has an unknown sampled-spinor "

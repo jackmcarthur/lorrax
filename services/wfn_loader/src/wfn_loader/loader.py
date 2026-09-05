@@ -248,6 +248,12 @@ class WfnLoader:
         self._qe_symmetry_checked = False
         self.qe_symmetry_binding = None
         self.qe_symmetry_diagnostic = "symmetry has not been initialized"
+        # ``bispinor_lift='velocity'`` needs the pseudopotential velocity
+        # ``sum_a sigma^a (dV_NL/dk_a psi_L)``; the loader does not own
+        # projectors, so the driver attaches the callable
+        # ``psp.vnl_ops.nonlocal_velocity_lift(setup)`` here.  ``None`` +
+        # a velocity request refuses by name (never a silent sigma.p).
+        self.nonlocal_velocity_lift = None
 
         if backend == "auto":
             backend = self._auto_pick_backend()
@@ -980,15 +986,31 @@ class WfnLoader:
                     static["tr_mask_per_full"][full_k],
                 )
         if bispinor:
+            lift_mode = str(bispinor_lift).strip().lower()
+            lift_args = (
+                child,
+                g_parent,
+                static["reciprocal_per_full"][full_k],
+                static["umklapp_per_full"][full_k],
+                static["kvec_per_full"][full_k],
+                static["bvec_cart_bohr"],
+            )
+            if lift_mode == "velocity":
+                # The child's G list is the parent's rotated row; build it
+                # once here (same carrier arithmetic the kernel uses) so the
+                # attached projector velocity sees the child's own k+G.
+                from symmetry_maps import unfold_reciprocal_carriers
+                g_child = unfold_reciprocal_carriers(
+                    static["reciprocal_per_full"][full_k], g_parent,
+                    static["umklapp_per_full"][full_k])
+                sigma_vnl = self._sigma_vnl_velocity(
+                    child, g_child[None, :, :],
+                    static["kvec_per_full"][full_k][None, :],
+                    np.asarray([int(self.ngk[parent])], dtype=np.int32),
+                    representation=lift_mode)
+                lift_args = lift_args + (sigma_vnl,)
             child = _parent_bispinor_lift_kernel(
-                self._mesh, str(bispinor_lift).strip().lower())(
-                    child,
-                    g_parent,
-                    static["reciprocal_per_full"][full_k],
-                    static["umklapp_per_full"][full_k],
-                    static["kvec_per_full"][full_k],
-                    static["bvec_cart_bohr"],
-                )
+                self._mesh, lift_mode)(*lift_args)
         return child
 
     # ------------------------------------------------------------------
@@ -2001,13 +2023,46 @@ class WfnLoader:
         # lift converts to the Cartesian momentum its API requires.
         bvec_cart_bohr = (
             float(self.blat) * np.asarray(self.bvec, dtype=np.float64))
+        sigma_vnl = self._sigma_vnl_velocity(
+            psi_2, gvecs, kvecs_np, np.asarray(self.ngk_valid(k=k)),
+            representation=representation)
         return _bispinor_lift_kernel(
             psi_2,
             jnp.asarray(gvecs, dtype=jnp.float64),
             jnp.asarray(kvecs_np),
             jnp.asarray(bvec_cart_bohr),
             sharding=sharding, representation=representation,
+            sigma_vnl_velocity_ry=sigma_vnl,
         )
+
+    def _sigma_vnl_velocity(self, psi_2, gvecs_int, kvecs_frac, ngk_valid,
+                            *, representation: str):
+        """``sum_a sigma^a (dV_NL/dk_a psi_L)`` for the velocity lift, else None.
+
+        The attached ``nonlocal_velocity_lift`` (see ``__init__``) owns the
+        projector physics; this method only routes the loader's own G table,
+        k representatives and ``ngk_valid`` mask to it, so the velocity term
+        is evaluated in exactly the gauge the σ·p term is.
+        """
+        if str(representation).strip().lower() != "velocity":
+            return None
+        fn = self.nonlocal_velocity_lift
+        if fn is None:
+            raise ValueError(
+                "GATE bispinor_velocity_lift_needs_projectors: "
+                "bispinor_lift='velocity' was requested but this loader has "
+                "no nonlocal velocity attached.\n"
+                "  want: loader.nonlocal_velocity_lift = "
+                "psp.vnl_ops.nonlocal_velocity_lift(setup) before the load "
+                "(gw_jax and psp.get_dipole_mtxels do this from the deck's "
+                "pseudopotentials)\n"
+                "  why:  the small component sigma.v psi_L needs dV_NL/dk, "
+                "which lives in the run's projectors, not in WFN.h5.")
+        return fn(
+            psi_2,
+            jnp.asarray(np.asarray(gvecs_int), dtype=jnp.int32),
+            jnp.asarray(np.asarray(kvecs_frac, dtype=np.float64)),
+            jnp.asarray(np.asarray(ngk_valid, dtype=np.int32)))
 
     # ------------------------------------------------------------------
     # Eager unfold core
@@ -2096,6 +2151,20 @@ def _get_bispinor_lift_jit(
     """
     from common.bispinor_init import lift_to_4spinor
 
+    if representation == "velocity":
+        # Separate signature, separate cache row: the velocity kernel takes
+        # the sigma.(dV_NL/dk psi) operand the others must never see.
+        @jax.jit
+        def _kernel_v(psi_2, gvecs, kvecs, bvec_cart_bohr, sigma_vnl):
+            out = lift_to_4spinor(
+                psi_2, gvecs, kvecs, bvec_cart_bohr,
+                representation=representation,
+                sigma_vnl_velocity_ry=sigma_vnl)
+            if sharding is not None:
+                out = jax.lax.with_sharding_constraint(out, sharding)
+            return out
+        return _kernel_v
+
     @jax.jit
     def _kernel(psi_2, gvecs, kvecs, bvec_cart_bohr):
         out = lift_to_4spinor(
@@ -2115,6 +2184,7 @@ def _bispinor_lift_kernel(
     *,
     sharding: NamedSharding | None,
     representation: str = "raw",
+    sigma_vnl_velocity_ry: jax.Array | None = None,
 ) -> jax.Array:
     """Append small components → 4-spinor ψ.
 
@@ -2122,9 +2192,23 @@ def _bispinor_lift_kernel(
     gvecs: (n_k, ngkmax, 3)  float64 (already cast)
     kvecs: (n_k, 3)          float64
     bvec_cart_bohr : (3, 3)  float64, reciprocal rows in bohr⁻¹
+    sigma_vnl_velocity_ry : (n_k, nb, 2, ngkmax) c128, only for
+        ``representation='velocity'`` (see ``lift_to_4spinor``).
     """
-    return _get_bispinor_lift_jit(sharding, str(representation).strip().lower())(
-        psi_2, gvecs, kvecs, bvec_cart_bohr)
+    mode = str(representation).strip().lower()
+    kernel = _get_bispinor_lift_jit(sharding, mode)
+    if mode == "velocity":
+        if sigma_vnl_velocity_ry is None:
+            raise ValueError(
+                "_bispinor_lift_kernel(representation='velocity') needs "
+                "sigma_vnl_velocity_ry")
+        return kernel(psi_2, gvecs, kvecs, bvec_cart_bohr,
+                      sigma_vnl_velocity_ry)
+    if sigma_vnl_velocity_ry is not None:
+        raise ValueError(
+            "_bispinor_lift_kernel: sigma_vnl_velocity_ry is only for "
+            f"representation='velocity', got {representation!r}")
+    return kernel(psi_2, gvecs, kvecs, bvec_cart_bohr)
 
 
 # ---------------------------------------------------------------------------
@@ -2362,7 +2446,7 @@ def _parent_bispinor_lift_kernel(mesh: Mesh, representation: str):
 
     def _per_rank(
             psi_2, g_parent, reciprocal_child, umklapp_child, kvec_child,
-            bvec_cart_bohr):
+            bvec_cart_bohr, *sigma_vnl):
         g_child = unfold_reciprocal_carriers(
             reciprocal_child, g_parent, umklapp_child)
         return lift_to_4spinor(
@@ -2371,14 +2455,20 @@ def _parent_bispinor_lift_kernel(mesh: Mesh, representation: str):
             kvec_child[None, :],
             bvec_cart_bohr,
             representation=representation,
+            sigma_vnl_velocity_ry=(sigma_vnl[0] if sigma_vnl else None),
         )
 
     band_spec = P(None, ("x", "y"), None, None)
+    in_specs = (band_spec, P(None, None), P(None, None), P(None),
+                P(None), P(None, None))
+    if representation == "velocity":
+        # One extra band-sharded operand: sigma.(dV_NL/dk psi) for this
+        # child, built by ``WfnLoader.unfold_parent_to_full_k``.
+        in_specs = in_specs + (band_spec,)
     return jax.jit(shard_map(
         _per_rank,
         mesh=mesh,
-        in_specs=(band_spec, P(None, None), P(None, None), P(None),
-                  P(None), P(None, None)),
+        in_specs=in_specs,
         out_specs=band_spec,
         check_vma=False,
     ))

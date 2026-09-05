@@ -2320,6 +2320,90 @@ def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
     return t1 + t2
 
 
+def nonlocal_velocity_lift(setup: VNLSetup):
+    """The loader's velocity-balance hook for one projector ``setup``.
+
+    Returns ``f(psi_2, gvecs_int, kvecs_frac, ngk_valid)`` mapping a
+    k-batched two-component ψ ``(n_k, nb, 2, ngkmax)`` to
+
+    ``sum_a sigma^a (dV_NL/dk_a psi_L)``   ``(n_k, nb, 2, ngkmax)``
+
+    in Rydberg velocity units — the SAME ``dV_NL/dk`` ket
+    :func:`apply_vnl_velocity_to_ket` returns and
+    ``common.mtxel_sweep.dipole_operator`` adds to ``2(k+G)`` (plus arm),
+    contracted with σ by ``common.bispinor_init.sigma_dot_cartesian_kets``.
+    ``common.bispinor_init.lift_to_4spinor(representation='velocity')``
+    scales it by ``alpha/4`` and adds it to the ``sigma.p`` small component;
+    ``WfnLoader.nonlocal_velocity_lift`` is where a driver attaches it.
+
+    Pad columns: the loader's G table carries the FFT-box sentinel beyond
+    ``ngk_valid`` and ψ is zero there.  The projectors are evaluated at Γ
+    on those columns (so ``|k+G|`` stays inside the radial table) and the
+    result is zeroed on them, because ``(dZ) E Z† psi`` is NOT zero on a
+    column where only ψ vanishes.
+
+    Memory: one ``lax.map`` over k, so the ``(3, nb, 2, ngkmax)`` transient
+    and the ``(4, total_R, ngkmax)`` projector rows exist for one k at a
+    time; the returned array is the size of ψ_L.  Band sharding of ``psi_2``
+    propagates through (Z/dZ are replicated per rank, small).
+    """
+    from common.bispinor_init import sigma_dot_cartesian_kets
+    if int(setup.nspinor) != 2:
+        raise ValueError(
+            "nonlocal_velocity_lift requires a two-component (Pauli) "
+            f"VNLSetup; got nspinor={int(setup.nspinor)}")
+
+    def _one_k(psi_k, gvec_k, kvec_k, ngk_k):
+        ngkmax = int(gvec_k.shape[0])
+        gmask = jnp.arange(ngkmax, dtype=jnp.int32) < ngk_k
+        gvec_safe = jnp.where(gmask[:, None], gvec_k, 0)
+        kdata = build_vnl_kdata_traced(
+            kvec_k, gvec_safe, setup, compute_dZ=True)
+        v_ket = apply_vnl_velocity_to_ket(
+            psi_k, kdata.Z, kdata.dZ, kdata.E_super)      # (3, nb, 2, ngkmax)
+        return sigma_dot_cartesian_kets(v_ket) * gmask.astype(v_ket.dtype)
+
+    @jax.jit
+    def _batch(psi_2, gvecs_int, kvecs_frac, ngk_valid):
+        psi_L = jnp.asarray(psi_2)[:, :, :2, :]
+        return jax.lax.map(
+            lambda args: _one_k(*args),
+            (psi_L,
+             jnp.asarray(gvecs_int, dtype=jnp.int32),
+             jnp.asarray(kvecs_frac, dtype=jnp.float64),
+             jnp.asarray(ngk_valid, dtype=jnp.int32)))
+
+    return _batch
+
+
+def nonlocal_velocity_lift_from_pseudo_dir(
+    wfn, sym, meta, pseudo_dir, *, sys_dim: int, caller: str,
+    print_fn=print,
+):
+    """Load ``*.upf`` from ``pseudo_dir``, build the projector setup, and
+    return :func:`nonlocal_velocity_lift` for it.  The one preflight the
+    kin_ion/dipole producers run (``psp.operator_checks``) runs here too, so
+    a deck asking for velocity balance without projectors refuses by name
+    instead of lifting with ``V_NL = 0``."""
+    from psp.pseudos import load_pseudopotentials
+    from psp.operator_checks import validate_operator_inputs
+    pseudos = load_pseudopotentials(str(pseudo_dir))
+    if not pseudos:
+        raise ValueError(
+            "GATE bispinor_current_balance_needs_pseudopotentials: "
+            "bispinor_current_balance = velocity lifts the spatial-current "
+            "carrier with sigma.v, v = p + dV_NL/dk, and dV_NL/dk needs the "
+            "run's projectors.\n"
+            f"  got:  no *.upf in {str(pseudo_dir)!r}\n"
+            "  want: the deck's pseudopotentials beside the input file, or "
+            "pseudo_dir = <directory>\n"
+            "  doc:  docs/input_reference.md, bispinor_current_balance.")
+    validate_operator_inputs(pseudos, wfn, int(sys_dim), caller=caller)
+    setup = build_vnl_setup(
+        wfn, sym, meta, pseudos, nspinor=int(wfn.nspinor), print_fn=print_fn)
+    return nonlocal_velocity_lift(setup)
+
+
 @jax.jit
 def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     """⟨m | ∂V_NL/∂K_cart^α | n⟩ matrix elements at one k.  Returns (3, nb, nb).

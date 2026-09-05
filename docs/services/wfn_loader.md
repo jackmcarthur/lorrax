@@ -65,6 +65,7 @@ for the real one, which is exactly what the deleted shim was.
 |---|---|
 | `WfnLoader(path, *, mesh=None, backend='auto', qe_schema=None)` | Open the WFN and check a 2c DFT reference before symmetry unfolding. `qe_schema=None` performs bounded WFN-anchored discovery at first `symmetry()`; an explicit schema must authenticate or the call refuses. |
 | `load(*, bands, k='full_bz', sharding=None, bispinor=False)` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. |
+| `nonlocal_velocity_lift` (attribute, default `None`) | The driver-attached `psp.vnl_ops.nonlocal_velocity_lift(setup)` callable that `bispinor_lift="velocity"` needs (σ·(∂V_NL/∂k ψ_L) for the spatial-current carrier). The loader owns no projectors; a velocity request with no hook refuses by name (`GATE bispinor_velocity_lift_needs_projectors`). `gw_jax` and `psp.get_dipole_mtxels` attach it from the deck's pseudopotentials. |
 | `load_process_local(*, bands, k, bispinor=False)` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. |
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
 | `full_k_parent_groups(full_k=None)` | Stable O(nk) grouping of requested full-BZ rows by raw IBZ parent. |

@@ -847,7 +847,8 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	"""
 	from common.wfn_transforms import load_centroids_band_chunked
 	representation = resolve_four_current_representation(
-		cfg.bispinor, cfg.bispinor_gw)
+		cfg.bispinor, cfg.bispinor_gw,
+		current_lift=cfg.bispinor_current_lift)
 	with timing.section("gw_jax.load_centroid_wfns_current"):
 		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
 			wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
@@ -1507,13 +1508,19 @@ def _resolve_zeta_fit_contract(
 			for mu_L in (1, 2, 3))
 
 	representation = resolve_four_current_representation(
-		cfg.bispinor, cfg.bispinor_gw)
-	# One carrier for both shipped bispinor_gw values (the raw kinetic
-	# balance lift), so the zeta provenance names no alternate lift.  The
-	# two comparison carriers that did were retired from the deck grammar
-	# on 2026-09-01 (gw_config._RETIRED_BISPINOR_GW_MODES).
+		cfg.bispinor, cfg.bispinor_gw,
+		current_lift=cfg.bispinor_current_lift)
+	# The charge carrier is the raw kinetic-balance lift for both shipped
+	# bispinor_gw values, so the charge zeta provenance names no lift (the
+	# two comparison carriers that did were retired 2026-09-01,
+	# gw_config._RETIRED_BISPINOR_GW_MODES).  The TRANSVERSE stamp names
+	# the current lift whenever it is not the shipped sigma.p one: a
+	# zeta_q_mu{1,2,3}.h5 fitted on sigma.p carriers must refit, not be
+	# reused, under bispinor_current_balance = velocity, and vice versa.
 	_normalized_charge_lift = None
-	_normalized_current_lift = None
+	_normalized_current_lift = (
+		representation.current_lift
+		if representation.current_lift not in (None, "raw") else None)
 	provenance = _zeta_fit_provenance(
 		wfn=wfn, meta=meta, cfg=cfg,
 		band_range_left=band_range_left,
@@ -2036,7 +2043,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
 	representation = resolve_four_current_representation(
-		cfg.bispinor, cfg.bispinor_gw)
+		cfg.bispinor, cfg.bispinor_gw,
+		current_lift=cfg.bispinor_current_lift)
 	# Honour cohsex.in ``gamma_contract_mode`` for the γ̃·γ̃ kernel
 	# inside the monolithic pair pipeline.  Mode is module-level (the
 	# γ̃ contract sits inside shard_map bodies so threading a kwarg
@@ -3207,7 +3215,8 @@ def prepare_isdf_and_wavefunctions(
 	refuse_unsupported_bispinor_tt_head_correction(cfg)
 	from file_io.wfn_basis import WavefunctionBasisReceipt
 	representation = resolve_four_current_representation(
-		cfg.bispinor, cfg.bispinor_gw)
+		cfg.bispinor, cfg.bispinor_gw,
+		current_lift=cfg.bispinor_current_lift)
 	# The receipt's band interval is PHYSICAL, not the mesh-padded carrier
 	# edge.  ``b_id_4_user`` is the exact loaded WFN boundary; ``b4`` may be
 	# rounded past WFN.nbands and names allocation only.

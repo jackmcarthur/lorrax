@@ -2019,9 +2019,12 @@ def _dft_psi_sphere(inputs):
     # entry.
     from common.four_current_model import resolve_four_current_representation
     representation = resolve_four_current_representation(
-        bool(inputs.config.bispinor), inputs.config.bispinor_gw)
+        bool(inputs.config.bispinor), inputs.config.bispinor_gw,
+        current_lift=inputs.config.bispinor_current_lift)
     carrier_bispinor = bool(representation.current_bispinor)
-    carrier_lift = representation.current_lift or "raw"
+    # One psi feeds rho AND the Dirac current in the SC rebuild (see
+    # sigma_dispatch's Hartree note): the charge carrier is the one kept.
+    carrier_lift = representation.charge_lift or "raw"
     # The device placement is mesh-specific.  Keeping the mesh in the key
     # prevents a later calculation in the same process from reusing a buffer
     # whose devices belong to an earlier runtime.
@@ -2167,7 +2170,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
     representation = resolve_four_current_representation(
-        bool(inputs.config.bispinor), inputs.config.bispinor_gw)
+        bool(inputs.config.bispinor), inputs.config.bispinor_gw,
+        current_lift=inputs.config.bispinor_current_lift)
     include_current = bool(representation.current_bispinor)
     charge_ns = (int(psi_G.shape[2]) if representation.charge_bispinor
                  else int(inputs.wfn.nspinor))

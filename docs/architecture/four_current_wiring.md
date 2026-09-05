@@ -244,16 +244,33 @@ on the config** — its consumers call it locally (`gw_config.py:378`,
 `psp/get_dipole_mtxels.py:1093`), so grep for
 `resolve_four_current_representation`, not for a config attribute.
 
-**TWO branches at `34228021`**: non-bispinor (everything False) and
-bispinor (both `raw`, `scalar_head_bispinor=True`) — the two shipped
-`bispinor_gw` values ride the same carrier, so `model` is accepted and
-ignored. The two carrier-comparison branches went with their deck spellings.
+**THREE branches (2026-09-04)**: non-bispinor (everything False),
+bispinor/kinetic (both lifts `raw`, `scalar_head_bispinor=True`) and
+bispinor/velocity (`current_lift="velocity"`,
+`spatial_current_representation="velocity_kinetic_balance_alpha_spatial_current_v1"`,
+charge side unchanged).  The two shipped `bispinor_gw` values ride the same
+carrier, so `model` is accepted and ignored; the one carrier dial is the
+deck's `bispinor_current_balance`, passed as `current_lift=` by every call
+site that owns a current-channel object (`gw_init` ×4, `sigma_dispatch`,
+`sc_iteration` ×2, `head_correction`, `file_io/kin_ion`,
+`psp/get_dipole_mtxels`).  The velocity lift needs `dV_NL/dk`: `gw_jax`
+builds the projector setup from `pseudo_dir` and attaches
+`psp.vnl_ops.nonlocal_velocity_lift(setup)` to `WfnLoader.nonlocal_velocity_lift`;
+the loader routes its own G table, k representatives and `ngk_valid` mask to
+it and hands the σ·(dV_NL/dk ψ_L) ket to `lift_to_4spinor(representation=
+"velocity")`, which adds `(α/4)` of it (Ry→Hartree ½) to the σ·p small
+component.  Two places still share ONE carrier between ρ and the Dirac
+current — the exact Hartree (`sigma_dispatch` → `kin_ion_io.compute_hartree_matrix`)
+and the SC density rebuild (`sc_iteration`) — and keep the charge lift for
+both, announced with a printed notice. The two carrier-comparison branches went with their deck spellings.
 It stays a resolver rather than collapsing into `bool(bispinor)` because the
 `charge_representation` / `spatial_current_representation` provenance stamps
 the `dipole.h5` / `kin_ion.h5` / ζ authenticators compare against need ONE
-producer. The surviving lift selector is `RAW_KINETIC_BALANCE_LIFT = "raw"`;
-`ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"`
-(`src/common/bispinor_init.py`) remains library code for the jet tests.
+producer. The lift selectors are `RAW_KINETIC_BALANCE_LIFT = "raw"` and
+`VELOCITY_KINETIC_BALANCE_LIFT = "velocity"` (deck-reachable, the latter for
+the spatial-current carrier only); `ISOMETRIC_KINETIC_BALANCE_LIFT =
+"isometric"` (`src/common/bispinor_init.py`) remains library code for the
+jet tests.
 
 **`static_bispinor_photon_envelope` is a gate id, not a function.** It is
 the raise at `gw_config.py:3997`, over the eight rows of
