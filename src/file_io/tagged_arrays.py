@@ -1080,6 +1080,8 @@ def assert_restart_window_matches(filename, band_slices=None,
     strand existing restart files.
     """
     with h5py.File(filename, "r") as f:
+        from .commit_state import assert_committed
+        assert_committed(f, path=filename)
         stored_w = np.asarray(f["band_window"]).tolist() if "band_window" in f else None
         stored_split = (np.asarray(f["band_window_split"]).tolist()
                         if "band_window_split" in f else None)

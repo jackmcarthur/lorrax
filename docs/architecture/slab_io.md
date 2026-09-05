@@ -114,6 +114,21 @@ rank that skips one call deadlocks the rest with no traceback
 
 ---
 
+## Global publication
+
+`close()` first drains and closes MPI-IO on every rank, then exchanges bounded
+4096-byte error receipts through `common.collectives.agree_io_error`. Any failure
+refuses metadata publication on every rank with the same path, stage and failing
+rank. Only global data success permits metadata materialization and rank-0
+publication, whose verdict is broadcast by `rank0_transaction`.
+
+`file_io.commit_state` owns the `lorrax_io_committed` dataset. New files start
+with HDF5's zero fill; appends invalidate the receipt before any data mutation.
+The serial metadata writer sets it to one last. SlabIO reads and restart readers
+refuse a present incomplete receipt; legacy files keep their format checks.
+This is an error-reporting and restart protocol, not recovery from a process
+that dies inside an MPI collective; the process-group supervisor owns that case.
+
 ## One HDF5 library per file {#one-owner}
 
 *Measured 2026-08-15, JID 57038615, metallic MPA-QSGW on 4 A100. On branch
