@@ -38,17 +38,39 @@ ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE = (
     "Psi=[I;X](I+X^dagger*X)^(-1/2)*psi_L;X=(alpha_fs/2)*sigma.p"
 )
 # Velocity balance (owner request 2026-09-04): the SPATIAL-CURRENT carrier
-# only.  ``v = p + dV_NL/dk`` is the pseudo-Hamiltonian's velocity, so the
-# alpha^i vertex built from this lift is the first-order current of the
-# Hamiltonian the states came from (Ward identity at O(q)).  The charge
+# only, ONE CARRIER PER CARTESIAN CHANNEL.  For channel a,
+#
+#   psi_S^(a) = (alpha/4) [ sigma.(2(k+G) + dV_SR/dk) psi_L
+#                           + sigma^a (dV_SO/dk_a) psi_L ]          (Ry velocities)
+#
+# so that psi_L^dagger sigma^a psi_S^(a) + h.c. = (alpha/2) <2(k+G)_a + dV_NL/dk_a>
+# EXACTLY: the spin-scalar part rides the sigma sandwich (sigma^a sigma^b V_b
+# + V_b sigma^b sigma^a = 2 V_a because [sigma, V_SR] = 0) and the spin-orbit
+# part sits behind sigma^a alone (sigma^a sigma^a = 1), which is what keeps
+# the i eps_abc [sigma^c, dV_SO/dk_b] artifact of a single sigma.v carrier
+# out.  The alpha^a vertex of channel a is then the pseudo-Hamiltonian's
+# velocity at first order in q, plus the Gordon spin current.  The charge
 # carrier keeps ``sigma.p``: its small-component density is the O(alpha^2)
 # Dirac density, and a V_NL-dressed |psi_S|^2 has no place in it.
-VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE = (
-    "psi_S=(alpha_fs/2)*sigma.v*psi_L;v=p+dV_NL/dk"
-)
 RAW_KINETIC_BALANCE_LIFT = "raw"
 ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"
+#: The family selector (deck value ``bispinor_current_balance = velocity``;
+#: the resolver's ``current_lift``).  It names the per-channel scheme, not
+#: one carrier; the loader and the lift take the channel selectors below.
 VELOCITY_KINETIC_BALANCE_LIFT = "velocity"
+VELOCITY_KINETIC_BALANCE_LIFTS = ("velocity_1", "velocity_2", "velocity_3")
+VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE = (
+    "psi_S^(a)=(alpha_fs/4)*[sigma.(2(k+G)+dV_SR/dk)+sigma^a*dV_SO/dk_a]*psi_L"
+    ";one_carrier_per_channel"
+)
+
+
+def velocity_lift_channel(representation: str) -> int | None:
+    """``"velocity_a"`` -> ``a`` in {1,2,3}; anything else -> ``None``."""
+    mode = str(representation).strip().lower()
+    if mode in VELOCITY_KINETIC_BALANCE_LIFTS:
+        return int(mode[-1])
+    return None
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
 )
@@ -61,13 +83,17 @@ def kinetic_balance_lift_provenance(representation: str) -> str:
         return KINETIC_BALANCE_LIFT_PROVENANCE
     if mode == ISOMETRIC_KINETIC_BALANCE_LIFT:
         return ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE
-    if mode == VELOCITY_KINETIC_BALANCE_LIFT:
+    if mode == VELOCITY_KINETIC_BALANCE_LIFT or velocity_lift_channel(mode):
+        # One provenance for the family: the three channel carriers are
+        # the same scheme, and every artifact that names a lift names the
+        # scheme (its channel is fixed by the Lorentz label it serves).
         return VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE
     raise ValueError(
         f"unknown kinetic-balance representation {representation!r}; "
         f"expected {RAW_KINETIC_BALANCE_LIFT!r}, "
-        f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r} or "
-        f"{VELOCITY_KINETIC_BALANCE_LIFT!r}")
+        f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}, "
+        f"{VELOCITY_KINETIC_BALANCE_LIFT!r} or one of "
+        f"{VELOCITY_KINETIC_BALANCE_LIFTS}")
 
 
 def _isometric_kinetic_balance_factor(K_cart_bohr_inv):
@@ -279,18 +305,19 @@ def lift_to_4spinor(
     to both upper and lower blocks.  Since ``(σ·K)†(σ·K)=|K|² I``, this is
     exactly ``[I;X](I+X†X)^(-1/2)`` without a redundant 2×2 matrix inverse.
 
-    ``representation='velocity'`` replaces ``p`` by the pseudo-Hamiltonian
-    velocity ``v = p + i[V_NL, r] = p + dV_NL/dk`` (Hartree units), i.e.
+    ``representation='velocity_a'`` (a = 1, 2, 3) builds the channel-``a``
+    carrier of the per-channel velocity balance (module header):
 
-    ``ψ_S = (α/2) σ·p ψ_L + (α/4) Σ_a σ^a (dV_NL^{Ry}/dk_a ψ_L)``
+    ``ψ_S^(a) = (α/2) σ·p ψ_L + (α/4) · sigma_vnl_velocity_ry``
 
-    — the second term is ``sigma_vnl_velocity_ry`` (``(n_k, nb, 2, ngkmax)``,
-    Rydberg velocity units, the same ``dV_NL/dk`` the dipole sweep adds to
-    ``2(k+G)``, already contracted with σ by
-    :func:`sigma_dot_cartesian_kets`; ``psp.vnl_ops.nonlocal_velocity_lift``
-    produces it) and the ½ is the Ry→Hartree velocity conversion.  It is
-    REQUIRED for this representation and REFUSED for the others: a supplied
-    ket that was silently ignored is the failure class this tree pays for.
+    where ``sigma_vnl_velocity_ry`` is ``Σ_b σ^b (dV_SR/dk_b ψ_L) + σ^a
+    (dV_SO/dk_a ψ_L)`` in Rydberg velocity units (``(n_k, nb, 2, ngkmax)``,
+    from ``psp.vnl_ops.nonlocal_velocity_lift(setup)(..., channel=a)``) and
+    the ¼ is (α/2) times the Ry→Hartree velocity conversion ½.  It is
+    REQUIRED for these representations and REFUSED for the others: a
+    supplied ket that was silently ignored is the failure class this tree
+    pays for.  The family name ``"velocity"`` is not a carrier and is
+    refused here; callers resolve it to a channel first.
     Pure ``jnp`` (no jit / sharding here — the caller wraps it; see
     ``WfnLoader._get_bispinor_lift_jit``).
 
@@ -323,12 +350,17 @@ def lift_to_4spinor(
         psi_2, p_cart)
     mode = str(representation).strip().lower()
     if mode == VELOCITY_KINETIC_BALANCE_LIFT:
+        raise ValueError(
+            "lift_to_4spinor: 'velocity' names the per-channel scheme, not a "
+            f"carrier; pass one of {VELOCITY_KINETIC_BALANCE_LIFTS} (the "
+            "Lorentz label the carrier serves).")
+    if velocity_lift_channel(mode):
         if sigma_vnl_velocity_ry is None:
             raise ValueError(
-                "lift_to_4spinor(representation='velocity') requires "
-                "sigma_vnl_velocity_ry = sum_a sigma^a (dV_NL/dk_a psi_L); "
-                "attach psp.vnl_ops.nonlocal_velocity_lift(setup) to the "
-                "loader (WfnLoader.nonlocal_velocity_lift).")
+                f"lift_to_4spinor(representation={mode!r}) requires "
+                "sigma_vnl_velocity_ry (the channel's projector velocity "
+                "ket); attach psp.vnl_ops.nonlocal_velocity_lift(setup) to "
+                "the loader (WfnLoader.nonlocal_velocity_lift).")
         sigma_v = jnp.asarray(sigma_vnl_velocity_ry)
         if tuple(sigma_v.shape) != tuple(psi_S.shape):
             raise ValueError(
@@ -340,15 +372,15 @@ def lift_to_4spinor(
     elif sigma_vnl_velocity_ry is not None:
         raise ValueError(
             "lift_to_4spinor: sigma_vnl_velocity_ry is only meaningful for "
-            f"representation='velocity', got {representation!r}")
+            f"the velocity_a representations, got {representation!r}")
     lifted = jnp.concatenate([psi_2, psi_S], axis=2)
-    if mode in (RAW_KINETIC_BALANCE_LIFT, VELOCITY_KINETIC_BALANCE_LIFT):
+    if mode == RAW_KINETIC_BALANCE_LIFT or velocity_lift_channel(mode):
         return lifted
     if mode != ISOMETRIC_KINETIC_BALANCE_LIFT:
         raise ValueError(
             f"unknown kinetic-balance representation {representation!r}; "
             f"expected {RAW_KINETIC_BALANCE_LIFT!r}, "
-            f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r} or "
-            f"{VELOCITY_KINETIC_BALANCE_LIFT!r}")
+            f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r} or one of "
+            f"{VELOCITY_KINETIC_BALANCE_LIFTS}")
     r = _isometric_kinetic_balance_factor(p_cart)
     return lifted * r[:, None, None, :]

@@ -982,7 +982,8 @@ class WfnLoader:
                 static["kvec_per_full"][full_k],
                 static["bvec_cart_bohr"],
             )
-            if lift_mode == "velocity":
+            from common.bispinor_init import velocity_lift_channel
+            if velocity_lift_channel(lift_mode):
                 # The child's G list is the parent's rotated row; build it
                 # once here (same carrier arithmetic the kernel uses) so the
                 # attached projector velocity sees the child's own k+G.
@@ -2030,25 +2031,56 @@ class WfnLoader:
         k representatives and ``ngk_valid`` mask to it, so the velocity term
         is evaluated in exactly the gauge the σ·p term is.
         """
-        if str(representation).strip().lower() != "velocity":
+        from common.bispinor_init import velocity_lift_channel
+        channel = velocity_lift_channel(representation)
+        if channel is None:
             return None
         fn = self.nonlocal_velocity_lift
         if fn is None:
             raise ValueError(
                 "GATE bispinor_velocity_lift_needs_projectors: "
-                "bispinor_lift='velocity' was requested but this loader has "
-                "no nonlocal velocity attached.\n"
+                f"bispinor_lift={str(representation)!r} was requested but "
+                "this loader has no nonlocal velocity attached.\n"
                 "  want: loader.nonlocal_velocity_lift = "
                 "psp.vnl_ops.nonlocal_velocity_lift(setup) before the load "
                 "(gw_jax and psp.get_dipole_mtxels do this from the deck's "
                 "pseudopotentials)\n"
-                "  why:  the small component sigma.v psi_L needs dV_NL/dk, "
-                "which lives in the run's projectors, not in WFN.h5.")
+                "  why:  the small component needs dV_NL/dk, which lives in "
+                "the run's projectors, not in WFN.h5.")
         return fn(
             psi_2,
             jnp.asarray(np.asarray(gvecs_int), dtype=jnp.int32),
             jnp.asarray(np.asarray(kvecs_frac, dtype=np.float64)),
-            jnp.asarray(np.asarray(ngk_valid, dtype=np.int32)))
+            jnp.asarray(np.asarray(ngk_valid, dtype=np.int32)),
+            channel=channel)
+
+    def lift(self, psi_2: jax.Array, *, k: KSpec = "full_bz",
+             bispinor_lift: str = "raw",
+             sharding: NamedSharding | None = None) -> jax.Array:
+        """Lift an already-loaded two-component ψ window to a four-spinor.
+
+        ``psi_2`` must be the ``(n_k, nb, 2, ngkmax)`` array a
+        ``load(..., k=k, bispinor=False)`` (or ``load_process_local``)
+        returned for the SAME ``k`` request, so the loader's own G table
+        and k representatives pair with it.  This is how a consumer that
+        needs several carriers of one window (the three velocity-balance
+        channels, plus the sigma.p charge carrier) lifts once per carrier
+        instead of re-reading WFN.h5 once per carrier.  ``sharding`` is
+        the output sharding for a global array; ``None`` for a
+        process-local one.
+        """
+        if int(self.nspinor) != 2:
+            raise ValueError(
+                "WfnLoader.lift requires a 2-spinor WFN; file has "
+                f"nspinor={int(self.nspinor)}.")
+        psi_2 = jnp.asarray(psi_2)
+        if psi_2.ndim != 4 or int(psi_2.shape[2]) != 2:
+            raise ValueError(
+                "WfnLoader.lift expects psi_2 of shape (n_k, nb, 2, ngkmax); "
+                f"got {tuple(psi_2.shape)}")
+        return self._apply_bispinor_lift(
+            psi_2, k=k, sharding=sharding,
+            representation=str(bispinor_lift).strip().lower())
 
     # ------------------------------------------------------------------
     # Eager unfold core
@@ -2137,9 +2169,10 @@ def _get_bispinor_lift_jit(
     """
     from common.bispinor_init import lift_to_4spinor
 
-    if representation == "velocity":
-        # Separate signature, separate cache row: the velocity kernel takes
-        # the sigma.(dV_NL/dk psi) operand the others must never see.
+    from common.bispinor_init import velocity_lift_channel
+    if velocity_lift_channel(representation):
+        # Separate signature, separate cache row: the velocity kernels take
+        # the projector-velocity operand the others must never see.
         @jax.jit
         def _kernel_v(psi_2, gvecs, kvecs, bvec_cart_bohr, sigma_vnl):
             out = lift_to_4spinor(
@@ -2181,19 +2214,20 @@ def _bispinor_lift_kernel(
     sigma_vnl_velocity_ry : (n_k, nb, 2, ngkmax) c128, only for
         ``representation='velocity'`` (see ``lift_to_4spinor``).
     """
+    from common.bispinor_init import velocity_lift_channel
     mode = str(representation).strip().lower()
     kernel = _get_bispinor_lift_jit(sharding, mode)
-    if mode == "velocity":
+    if velocity_lift_channel(mode):
         if sigma_vnl_velocity_ry is None:
             raise ValueError(
-                "_bispinor_lift_kernel(representation='velocity') needs "
+                f"_bispinor_lift_kernel(representation={mode!r}) needs "
                 "sigma_vnl_velocity_ry")
         return kernel(psi_2, gvecs, kvecs, bvec_cart_bohr,
                       sigma_vnl_velocity_ry)
     if sigma_vnl_velocity_ry is not None:
         raise ValueError(
-            "_bispinor_lift_kernel: sigma_vnl_velocity_ry is only for "
-            f"representation='velocity', got {representation!r}")
+            "_bispinor_lift_kernel: sigma_vnl_velocity_ry is only for the "
+            f"velocity_a representations, got {representation!r}")
     return kernel(psi_2, gvecs, kvecs, bvec_cart_bohr)
 
 
@@ -2447,9 +2481,10 @@ def _parent_bispinor_lift_kernel(mesh: Mesh, representation: str):
     band_spec = P(None, ("x", "y"), None, None)
     in_specs = (band_spec, P(None, None), P(None, None), P(None),
                 P(None), P(None, None))
-    if representation == "velocity":
-        # One extra band-sharded operand: sigma.(dV_NL/dk psi) for this
-        # child, built by ``WfnLoader.unfold_parent_to_full_k``.
+    from common.bispinor_init import velocity_lift_channel
+    if velocity_lift_channel(representation):
+        # One extra band-sharded operand: the channel's projector-velocity
+        # ket for this child, built by ``WfnLoader.unfold_parent_to_full_k``.
         in_specs = in_specs + (band_spec,)
     return jax.jit(shard_map(
         _per_rank,

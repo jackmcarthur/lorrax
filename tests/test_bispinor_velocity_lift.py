@@ -10,13 +10,16 @@ in q.  Three altitudes are gated here:
 * the lift algebra on synthetic data (``common.bispinor_init``);
 * the loader hook on a real WFN with its own projectors
   (``tests/regression/cohsex_debug``: MoS2, nspinor=2, FR ONCV UPFs) —
-  including the q=0 current identity
+  including the q=0 current identity, per channel a,
 
-      (2/alpha) <m,k| alpha^i |n,k>
-          = <m| v_i |n>  +  (i/2) eps_ijk <m| [sigma^k, v_j^NL] |n>     (Ry)
+      (2/alpha) <m,k| alpha^a |n,k>_{carrier a} = <m| 2(k+G)_a + dV_NL/dk_a |n>   (Ry)
 
-  which for the raw sigma.p lift collapses to the bare momentum
-  ``<m| 2(k+G)_i |n>`` — the whole point of the change is the middle term.
+  EXACTLY, with j-RESOLVED (spin-orbit) projectors: the spin-scalar part of
+  the velocity rides the sigma sandwich and the spin-orbit part sits behind
+  sigma^a alone, so no commutator term survives.  The raw sigma.p lift gives
+  the bare momentum ``<m| 2(k+G)_a |n>``.  A single sigma.v carrier would
+  give the velocity plus ``(i/2) eps_abc <[sigma^c, dV_SO/dk_b]>``; that
+  arm is gone from the tree and this file is what says so.
 """
 from __future__ import annotations
 
@@ -34,10 +37,12 @@ from common.bispinor_init import (
     KINETIC_BALANCE_LIFT_PROVENANCE,
     RAW_KINETIC_BALANCE_LIFT,
     VELOCITY_KINETIC_BALANCE_LIFT,
+    VELOCITY_KINETIC_BALANCE_LIFTS,
     VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE,
     kinetic_balance_lift_provenance,
     lift_to_4spinor,
     sigma_dot_cartesian_kets,
+    velocity_lift_channel,
 )
 from common.four_current_model import (
     RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
@@ -70,6 +75,13 @@ def test_velocity_moves_only_the_current_carrier():
         True, "bare_transverse", current_lift="velocity")
     assert raw.current_lift == RAW_KINETIC_BALANCE_LIFT
     assert vel.current_lift == VELOCITY_KINETIC_BALANCE_LIFT
+    assert raw.one_current_carrier and not vel.one_current_carrier
+    for a in (1, 2, 3):
+        assert raw.current_lift_for(a) == RAW_KINETIC_BALANCE_LIFT
+        assert vel.current_lift_for(a) == VELOCITY_KINETIC_BALANCE_LIFTS[a - 1]
+        assert velocity_lift_channel(vel.current_lift_for(a)) == a
+    with pytest.raises(ValueError, match="mu_L must be 1, 2 or 3"):
+        vel.current_lift_for(0)
     assert (raw.spatial_current_representation
             == RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
     assert (vel.spatial_current_representation
@@ -95,6 +107,11 @@ def test_velocity_without_bispinor_refuses_by_name():
 def test_provenance_names_the_velocity_lift():
     assert (kinetic_balance_lift_provenance("velocity")
             == VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE)
+    for sel in VELOCITY_KINETIC_BALANCE_LIFTS:
+        assert (kinetic_balance_lift_provenance(sel)
+                == VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE)
+    assert velocity_lift_channel("raw") is None
+    assert velocity_lift_channel("velocity") is None
     assert (kinetic_balance_lift_provenance("raw")
             == KINETIC_BALANCE_LIFT_PROVENANCE)
     assert (VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE
@@ -169,7 +186,7 @@ def test_velocity_lift_is_raw_lift_plus_alpha_over_four_sigma_vnl():
         jnp.asarray(bvec)))
     vel = np.asarray(lift_to_4spinor(
         jnp.asarray(psi), jnp.asarray(gvecs), jnp.asarray(kvecs),
-        jnp.asarray(bvec), representation="velocity",
+        jnp.asarray(bvec), representation="velocity_1",
         sigma_vnl_velocity_ry=jnp.asarray(sigma_v)))
     # large components untouched, small ones shifted by (alpha/4) sigma.v_NL
     np.testing.assert_array_equal(vel[:, :, :2], raw[:, :, :2])
@@ -184,12 +201,15 @@ def test_velocity_lift_refuses_a_missing_or_stray_operand():
     args = (jnp.asarray(psi), jnp.asarray(gvecs), jnp.asarray(kvecs),
             jnp.asarray(bvec))
     with pytest.raises(ValueError, match="requires sigma_vnl_velocity_ry"):
-        lift_to_4spinor(*args, representation="velocity")
+        lift_to_4spinor(*args, representation="velocity_2")
     sigma_v = jnp.asarray(np.einsum("aij,kabjg->kbig", _PAULI, kets))
+    with pytest.raises(ValueError, match="names the per-channel scheme"):
+        lift_to_4spinor(*args, representation="velocity",
+                        sigma_vnl_velocity_ry=sigma_v)
     with pytest.raises(ValueError, match="only meaningful"):
         lift_to_4spinor(*args, sigma_vnl_velocity_ry=sigma_v)
     with pytest.raises(ValueError, match="shape"):
-        lift_to_4spinor(*args, representation="velocity",
+        lift_to_4spinor(*args, representation="velocity_3",
                         sigma_vnl_velocity_ry=sigma_v[:, :2])
 
 
@@ -236,35 +256,47 @@ def test_velocity_lift_needs_the_hook_and_then_matches_the_projector_velocity():
         with pytest.raises(ValueError,
                            match="bispinor_velocity_lift_needs_projectors"):
             loader.load(bands=(0, nb), k="full_bz", bispinor=True,
-                        bispinor_lift="velocity")
+                        bispinor_lift="velocity_1")
         loader.nonlocal_velocity_lift = vnl_ops.nonlocal_velocity_lift(setup)
         raw = np.asarray(loader.load(bands=(0, nb), k="full_bz",
                                      bispinor=True))
-        vel = np.asarray(loader.load(bands=(0, nb), k="full_bz",
-                                     bispinor=True, bispinor_lift="velocity"))
         # Same-hook kinetic request is byte-identical to the shipped lift.
         raw_again = np.asarray(loader.load(bands=(0, nb), k="full_bz",
                                            bispinor=True, bispinor_lift="raw"))
         np.testing.assert_array_equal(raw_again, raw)
-        np.testing.assert_array_equal(vel[:, :, :2], raw[:, :, :2])
+        # The public lift of the same window reproduces load(bispinor=True).
+        psi_2 = loader.load(bands=(0, nb), k="full_bz")
+        np.testing.assert_array_equal(
+            np.asarray(loader.lift(psi_2, k="full_bz")), raw)
+        E_SR, E_SO = vnl_ops.spin_orbit_split_E(setup)
+        assert bool(setup.soc), "fixture should resolve j-RESOLVED"
+        assert float(jnp.max(jnp.abs(E_SO))) > 0.0
         n_k = raw.shape[0]
-        for ik in range(n_k):
-            n, g, kvec = _valid_sphere(loader, ik, "full_bz")
-            psi_L = raw[ik, :, :2, :n]
-            kdata = vnl_ops.build_vnl_kdata_from_kvec(
-                kvec, g, setup, compute_dZ=True)
-            v_ket = np.asarray(vnl_ops.apply_vnl_velocity_to_ket(
-                jnp.asarray(psi_L), kdata.Z, kdata.dZ, kdata.E_super))
-            want = 0.5 * HALFALPHA * np.einsum(
-                "aij,abjg->big", _PAULI, v_ket)
-            got = vel[ik, :, 2:, :n] - raw[ik, :, 2:, :n]
-            scale = max(float(np.max(np.abs(want))), 1e-300)
-            np.testing.assert_allclose(got, want, rtol=0.0,
-                                       atol=1e-12 * scale)
-            assert scale > 0.0, "V_NL velocity vanished on a real deck"
-            # pad columns are exactly zero on both lifts
-            assert not np.any(vel[ik, :, :, n:])
-            assert not np.any(raw[ik, :, :, n:])
+        for a in (1, 2, 3):
+            vel = np.asarray(loader.load(
+                bands=(0, nb), k="full_bz", bispinor=True,
+                bispinor_lift=f"velocity_{a}"))
+            np.testing.assert_array_equal(
+                np.asarray(loader.lift(psi_2, k="full_bz",
+                                       bispinor_lift=f"velocity_{a}")), vel)
+            np.testing.assert_array_equal(vel[:, :, :2], raw[:, :, :2])
+            for ik in range(n_k):
+                n, g, kvec = _valid_sphere(loader, ik, "full_bz")
+                psi_L = raw[ik, :, :2, :n]
+                kdata = vnl_ops.build_vnl_kdata_from_kvec(
+                    kvec, g, setup, compute_dZ=True)
+                v_sr = np.asarray(vnl_ops.apply_vnl_velocity_to_ket(
+                    jnp.asarray(psi_L), kdata.Z, kdata.dZ, E_SR))
+                v_so = np.asarray(vnl_ops.apply_vnl_velocity_to_ket(
+                    jnp.asarray(psi_L), kdata.Z, kdata.dZ, E_SO))
+                ket = (np.einsum("bij,bnjg->nig", _PAULI, v_sr)
+                       + np.einsum("ij,njg->nig", _PAULI[a - 1], v_so[a - 1]))
+                want = 0.5 * HALFALPHA * ket
+                got = vel[ik, :, 2:, :n] - raw[ik, :, 2:, :n]
+                scale = max(float(np.max(np.abs(want))), 1e-300)
+                np.testing.assert_allclose(got, want, rtol=0.0,
+                                           atol=1e-12 * scale)
+                assert not np.any(vel[ik, :, :, n:])
     finally:
         loader.close()
 
@@ -279,23 +311,24 @@ def _current_matrix(psi4, ngk):
 def test_q0_current_identity_kinetic_gives_momentum_velocity_gives_dH_dk():
     """The load-bearing physics cell.
 
-    raw lift:       (2/alpha)<alpha^i> = <2(k+G)_i>                        (Ry)
-    velocity lift:  (2/alpha)<alpha^i> = <2(k+G)_i + dV_NL/dk_i>
-                                         + (i/2) eps_ijk <[sigma^k, dV_NL/dk_j]>
-    The commutator survives only through the j-resolved (spin-orbit) part
-    of V_NL and is transverse-free; both arms are checked against
-    independent NumPy contractions of the same projector kets.
+    raw lift:         (2/alpha)<alpha^a> = <2(k+G)_a>                          (Ry)
+    velocity_a lift:  (2/alpha)<alpha^a> = <2(k+G)_a + dV_NL/dk_a>  EXACTLY,
+                      with j-RESOLVED projectors (dV_NL includes the
+                      spin-orbit part), no commutator remainder.
+    Both arms against independent contractions of the same projector kets.
     """
     _fixture_or_skip()
     from psp import vnl_ops
     from psp.dft_operators import momentum_matrix_k
     loader, sym, setup = _open_loader_with_setup()
     try:
+        assert bool(setup.soc)
         nb = min(6, int(loader.nbands))
         loader.nonlocal_velocity_lift = vnl_ops.nonlocal_velocity_lift(setup)
         raw = np.asarray(loader.load(bands=(0, nb), k="ibz", bispinor=True))
-        vel = np.asarray(loader.load(bands=(0, nb), k="ibz", bispinor=True,
-                                     bispinor_lift="velocity"))
+        vel = [np.asarray(loader.load(bands=(0, nb), k="ibz", bispinor=True,
+                                      bispinor_lift=f"velocity_{a}"))
+               for a in (1, 2, 3)]
         B = jnp.asarray(float(loader.blat) * np.asarray(loader.bvec, float))
         checked = 0
         for ik in range(raw.shape[0]):
@@ -306,31 +339,17 @@ def test_q0_current_identity_kinetic_gives_momentum_velocity_gives_dH_dk():
             kdata = vnl_ops.build_vnl_kdata_from_kvec(
                 kvec, g, setup, compute_dZ=True)
             vnl_mn = np.asarray(vnl_ops.vnl_velocity_matrix(
-                psi_L, kdata.Z, kdata.dZ, kdata.E_super))
-            v_ket = np.asarray(vnl_ops.apply_vnl_velocity_to_ket(
-                psi_L, kdata.Z, kdata.dZ, kdata.E_super))      # (3,nb,2,n)
-            psi_np = np.asarray(psi_L)
-            # C[j,k,m,n] = <m| sigma^k v_j - v_j sigma^k |n>
-            #   <m|sigma^k v_j|n> = psi_m^dag sigma^k (v_j psi_n)
-            #   <m|v_j sigma^k|n> = (v_j psi_m)^dag sigma^k psi_n   (v Hermitian)
-            sig_v = np.einsum("kst,jntg->jknsg", _PAULI, v_ket)
-            sig_psi = np.einsum("kst,ntg->knsg", _PAULI, psi_np)
-            C = (np.einsum("msg,jknsg->jkmn", np.conj(psi_np), sig_v)
-                 - np.einsum("jmsg,knsg->jkmn", np.conj(v_ket), sig_psi))
-            eps = np.zeros((3, 3, 3))
-            eps[0, 1, 2] = eps[1, 2, 0] = eps[2, 0, 1] = 1.0
-            eps[0, 2, 1] = eps[2, 1, 0] = eps[1, 0, 2] = -1.0
-            comm = 0.5j * np.einsum("ijk,jkmn->imn", eps, C)
-
-            lhs_raw = _current_matrix(raw[ik], n)
-            lhs_vel = _current_matrix(vel[ik], n)
+                psi_L, kdata.Z, kdata.dZ, kdata.E_super))  # full V_NL incl. SO
             scale = float(np.max(np.abs(p_mn)))
+            lhs_raw = _current_matrix(raw[ik], n)
             np.testing.assert_allclose(lhs_raw, p_mn, rtol=0.0,
                                        atol=1e-11 * scale)
-            np.testing.assert_allclose(lhs_vel, p_mn + vnl_mn + comm,
-                                       rtol=0.0, atol=1e-11 * scale)
-            # and the difference between the arms IS the nonlocal velocity
-            # (plus its spin-orbit commutator) — not a rounding-level shift
+            for a in (1, 2, 3):
+                lhs_a = _current_matrix(vel[a - 1][ik], n)[a - 1]
+                np.testing.assert_allclose(
+                    lhs_a, p_mn[a - 1] + vnl_mn[a - 1],
+                    rtol=0.0, atol=1e-11 * scale)
+            # and the nonlocal part is not a rounding-level shift
             assert float(np.max(np.abs(vnl_mn))) > 1e-6 * scale
             checked += 1
         assert checked > 0

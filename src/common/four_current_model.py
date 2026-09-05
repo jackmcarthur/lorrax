@@ -48,7 +48,7 @@ SOURCE_WFN_CHARGE_REPRESENTATION = "source_wfn_normalized_charge_v1"
 RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION = (
     "raw_kinetic_balance_alpha_spatial_current_v1")
 VELOCITY_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION = (
-    "velocity_kinetic_balance_alpha_spatial_current_v1")
+    "velocity_kinetic_balance_per_channel_alpha_spatial_current_v1")
 
 
 @dataclass(frozen=True)
@@ -64,10 +64,38 @@ class FourCurrentRepresentation:
     charge_bispinor: bool
     charge_lift: str | None
     current_bispinor: bool
+    #: The spatial-current lift FAMILY: ``"raw"`` (one sigma.p carrier for
+    #: all three channels) or ``"velocity"`` (one carrier per channel).
     current_lift: str | None
     scalar_head_bispinor: bool
     charge_representation: str
     spatial_current_representation: str | None
+
+    def current_lift_for(self, mu_L: int) -> str | None:
+        """The loader selector for Lorentz label ``mu_L`` in {1, 2, 3}.
+
+        ``raw`` for the shipped carrier; ``velocity_<mu_L>`` under the
+        per-channel velocity balance (``common.bispinor_init``).  This is
+        the ONE place the family name becomes a carrier name, so every
+        consumer that loads a current carrier asks for its own channel.
+        """
+        from common.bispinor_init import (
+            VELOCITY_KINETIC_BALANCE_LIFT, VELOCITY_KINETIC_BALANCE_LIFTS)
+        mu_L = int(mu_L)
+        if mu_L not in (1, 2, 3):
+            raise ValueError(
+                f"current_lift_for: mu_L must be 1, 2 or 3; got {mu_L}")
+        if self.current_lift is None:
+            return None
+        if self.current_lift == VELOCITY_KINETIC_BALANCE_LIFT:
+            return VELOCITY_KINETIC_BALANCE_LIFTS[mu_L - 1]
+        return self.current_lift
+
+    @property
+    def one_current_carrier(self) -> bool:
+        """True when all three channels ride the SAME four-spinor."""
+        from common.bispinor_init import VELOCITY_KINETIC_BALANCE_LIFT
+        return self.current_lift != VELOCITY_KINETIC_BALANCE_LIFT
 
 
 def resolve_four_current_representation(
@@ -84,10 +112,11 @@ def resolve_four_current_representation(
     different carrier, this is the one function that has to learn about it.
 
     ``current_lift`` is the deck's ``bispinor_current_balance`` resolved to a
-    lift selector (``gw_config.LorraxConfig.bispinor_current_lift``):
+    lift family (``gw_config.LorraxConfig.bispinor_current_lift``):
     ``None``/``"raw"`` is the shipped ``sigma.p`` carrier for the spatial
-    current, ``"velocity"`` the ``sigma.v`` carrier
-    (``common.bispinor_init.VELOCITY_KINETIC_BALANCE_LIFT``).  It moves ONLY
+    current, ``"velocity"`` the exact per-channel velocity balance
+    (``common.bispinor_init.VELOCITY_KINETIC_BALANCE_LIFT``; one carrier
+    per Cartesian channel, ``current_lift_for(mu_L)``).  It moves ONLY
     ``current_lift`` and ``spatial_current_representation``: the charge
     carrier and the scalar head/dipole producer stay on kinetic balance by
     design (owner 2026-09-04), so every charge-side stamp is unchanged and

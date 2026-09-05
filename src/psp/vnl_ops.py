@@ -33,6 +33,10 @@ from common.gauss_legendre import (
 )
 
 
+# Canonical Pauli matrices (the same tables ``common.gamma_matrices`` owns),
+# for the channel-specific spin-orbit term of the velocity lift.
+from common.gamma_matrices import paulis as _PAULI_JNP
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -84,6 +88,14 @@ class VNLSetup:
     # production stdout filter keeps only WARNING-class legacy prints, so
     # this line is how an informational verdict reaches the report.
     soc_provenance: str = ""
+    # The j-AVERAGED (scalar-relativistic) E blocks, kept beside the selected
+    # ``E_super`` so a consumer can split V_NL = V_SR + V_SO exactly:
+    # ``E_SR = E_super_scalar``, ``E_SO = E_super - E_super_scalar`` (zero
+    # when ``soc`` is False, since then ``E_super`` IS the averaged arm).
+    # ``None`` only when a fully-relativistic pseudopotential cannot be
+    # j-averaged at all (``build_E_blocks_full(soc=False)`` refused), in
+    # which case no SR/SO split exists and consumers that need one refuse.
+    E_super_scalar: jax.Array | None = None
     # ── Pre-flattened per-row metadata for vectorized Z assembly ──
     # Each row r of Z(total_R, nG) is: c_il * G[beta_idx[r], q] * S[l[r], m[r], G] * phase[tau[r], G]
     row_beta_idx: jax.Array | None = None  # (total_R,) int — which G_table row
@@ -710,6 +722,15 @@ def build_vnl_setup(
             print_fn(f"[build_vnl_setup] V_NL: {forced_line}")
     else:
         blocks_by_arm[bool(soc_resolved)] = _species_blocks(bool(soc_resolved))
+        if bool(soc_resolved):
+            # The averaged arm is also wanted beside a declared j-resolved
+            # operator: it is the scalar-relativistic half of the exact
+            # V_SR + V_SO split (``VNLSetup.E_super_scalar``).  A pseudo
+            # that cannot be averaged simply leaves that field None.
+            try:
+                blocks_by_arm[False] = _species_blocks(False)
+            except ValueError:
+                pass
 
     # Channels carry the arm-0 blocks; the measured path swaps them for
     # the selected arm below.
@@ -867,6 +888,9 @@ def build_vnl_setup(
         Gppp_table=Gppp_table,
         uniform_gauge_fingerprint=uniform_gauge_fingerprint,
     )
+
+    if False in blocks_by_arm:
+        setup.E_super_scalar = _assemble_E_super(blocks_by_arm[False])
 
     # ── say HOW the mode was decided (one line, report-block ready) ──
     j_present = [el for el in live if pseudo_has_j_channels(pseudos[el])]
@@ -2317,21 +2341,51 @@ def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
     return t1 + t2
 
 
+def spin_orbit_split_E(setup: VNLSetup):
+    """``(E_SR, E_SO)`` for ``setup``: the exact V_NL = V_SR + V_SO split.
+
+    ``E_SR`` is the j-averaged (scalar-relativistic, spin-scalar) block
+    matrix and ``E_SO = E_super - E_SR`` the spin-orbit remainder.  When
+    the setup runs the averaged operator (``soc`` False) the remainder is
+    exactly zero.  Refuses when the pseudopotential could not be averaged,
+    because then no split exists.
+    """
+    if not bool(setup.soc):
+        return setup.E_super, jnp.zeros_like(setup.E_super)
+    if setup.E_super_scalar is None:
+        raise ValueError(
+            "GATE vnl_spin_orbit_split_unavailable: this VNLSetup runs a "
+            "j-resolved V_NL whose pseudopotential could not be j-averaged, "
+            "so V_NL = V_SR + V_SO has no scalar-relativistic half to split "
+            "off.  The exact per-channel velocity lift needs that split.")
+    return setup.E_super_scalar, setup.E_super - setup.E_super_scalar
+
+
 def nonlocal_velocity_lift(setup: VNLSetup):
     """The loader's velocity-balance hook for one projector ``setup``.
 
-    Returns ``f(psi_2, gvecs_int, kvecs_frac, ngk_valid)`` mapping a
-    k-batched two-component ψ ``(n_k, nb, 2, ngkmax)`` to
+    Returns ``f(psi_2, gvecs_int, kvecs_frac, ngk_valid, channel)`` mapping
+    a k-batched two-component ψ ``(n_k, nb, 2, ngkmax)`` to the
+    Rydberg-velocity ket the channel-``a`` small component needs,
 
-    ``sum_a sigma^a (dV_NL/dk_a psi_L)``   ``(n_k, nb, 2, ngkmax)``
+        sum_b sigma^b (dV_SR/dk_b psi_L)  +  sigma^a (dV_SO/dk_a psi_L)
 
-    in Rydberg velocity units — the SAME ``dV_NL/dk`` ket
-    :func:`apply_vnl_velocity_to_ket` returns and
-    ``common.mtxel_sweep.dipole_operator`` adds to ``2(k+G)`` (plus arm),
-    contracted with σ by ``common.bispinor_init.sigma_dot_cartesian_kets``.
-    ``common.bispinor_init.lift_to_4spinor(representation='velocity')``
-    scales it by ``alpha/4`` and adds it to the ``sigma.p`` small component;
+    with shape ``(n_k, nb, 2, ngkmax)``.  ``common.bispinor_init.
+    lift_to_4spinor(representation="velocity_a")`` scales it by
+    ``alpha/4`` and adds it to the ``sigma.p`` small component;
     ``WfnLoader.nonlocal_velocity_lift`` is where a driver attaches it.
+
+    WHY THE SPLIT.  The four-spinor current of channel ``a`` is
+    ``psi_L^dagger sigma^a psi_S + h.c.``.  A spin-SCALAR velocity may sit
+    inside the sigma sandwich: ``sigma^a sigma^b V_b + V_b sigma^b sigma^a
+    = 2 V_a`` because ``[sigma, V_SR] = 0``.  The spin-orbit part does not
+    commute and the sandwich would add ``i eps_abc [sigma^c, dV_SO/dk_b]``,
+    which is not part of dH/dk (measured 20% of |dV_NL/dk| on MoS2, more on
+    Bi).  Placing it behind ``sigma^a`` instead uses ``sigma^a sigma^a = 1``
+    and returns exactly ``psi_L^dagger dV_SO/dk_a psi_L + h.c.``.  So the
+    channel-``a`` carrier reproduces ``<m| 2(k+G)_a + dV_NL/dk_a |n>``, the
+    Hamiltonian's velocity, with no spurious term — at the price of one
+    carrier per Cartesian channel.
 
     Pad columns: the loader's G table carries the FFT-box sentinel beyond
     ``ngk_valid`` and ψ is zero there.  The projectors are evaluated at Γ
@@ -2341,30 +2395,43 @@ def nonlocal_velocity_lift(setup: VNLSetup):
 
     Memory: one ``lax.map`` over k, so the ``(3, nb, 2, ngkmax)`` transient
     and the ``(4, total_R, ngkmax)`` projector rows exist for one k at a
-    time; the returned array is the size of ψ_L.  Band sharding of ``psi_2``
-    propagates through (Z/dZ are replicated per rank, small).
+    time; the returned array is the size of ψ_L.
     """
     from common.bispinor_init import sigma_dot_cartesian_kets
     if int(setup.nspinor) != 2:
         raise ValueError(
             "nonlocal_velocity_lift requires a two-component (Pauli) "
             f"VNLSetup; got nspinor={int(setup.nspinor)}")
+    E_SR, E_SO = spin_orbit_split_E(setup)
+    has_so = bool(setup.soc)
 
-    def _one_k(psi_k, gvec_k, kvec_k, ngk_k):
+    def _one_k(psi_k, gvec_k, kvec_k, ngk_k, channel):
         ngkmax = int(gvec_k.shape[0])
         gmask = jnp.arange(ngkmax, dtype=jnp.int32) < ngk_k
         gvec_safe = jnp.where(gmask[:, None], gvec_k, 0)
         kdata = build_vnl_kdata_traced(
             kvec_k, gvec_safe, setup, compute_dZ=True)
-        v_ket = apply_vnl_velocity_to_ket(
-            psi_k, kdata.Z, kdata.dZ, kdata.E_super)      # (3, nb, 2, ngkmax)
-        return sigma_dot_cartesian_kets(v_ket) * gmask.astype(v_ket.dtype)
+        v_sr = apply_vnl_velocity_to_ket(
+            psi_k, kdata.Z, kdata.dZ, E_SR)                # (3, nb, 2, ngkmax)
+        ket = sigma_dot_cartesian_kets(v_sr)
+        if has_so:
+            a = int(channel) - 1
+            v_so_a = apply_vnl_velocity_to_ket(
+                psi_k, kdata.Z, kdata.dZ[a:a + 1], E_SO)[0]  # (nb, 2, ngkmax)
+            ket = ket + jnp.einsum(
+                "ij,bjg->big", _PAULI_JNP[a], v_so_a, optimize=True)
+        return ket * gmask.astype(ket.dtype)
 
-    @jax.jit
-    def _batch(psi_2, gvecs_int, kvecs_frac, ngk_valid):
+    @functools.partial(jax.jit, static_argnames=("channel",))
+    def _batch(psi_2, gvecs_int, kvecs_frac, ngk_valid, *, channel):
+        channel = int(channel)
+        if channel not in (1, 2, 3):
+            raise ValueError(
+                f"nonlocal_velocity_lift: channel must be 1, 2 or 3; got "
+                f"{channel}")
         psi_L = jnp.asarray(psi_2)[:, :, :2, :]
         return jax.lax.map(
-            lambda args: _one_k(*args),
+            lambda args: _one_k(*args, channel),
             (psi_L,
              jnp.asarray(gvecs_int, dtype=jnp.int32),
              jnp.asarray(kvecs_frac, dtype=jnp.float64),
