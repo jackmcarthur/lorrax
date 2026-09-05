@@ -417,29 +417,6 @@ class DftVelocityHeadData:
     validation: None = None
 
 
-def _ascii_stamp(io, path: str, name: str) -> str:
-    """A ``uint8`` provenance stamp, read through SlabIO, as ``str``.
-
-    ``write_attr`` publishes these as ``uint8`` datasets.  The phdf5
-    transport's dtype table has no unsigned type, so the read asks for
-    ``int32`` and HDF5 widens — the same route
-    ``file_io.parallel_transport._decode_i32_text`` already takes for the
-    W-av stamps, and the reason it takes it.
-    """
-    raw = np.asarray(io.read_small(name, dtype=np.int32), dtype=np.int32)
-    if raw.ndim != 1 or np.any(raw < 0) or np.any(raw > 255):
-        raise ValueError(
-            f"{path}: {name} is not a 1-D byte-valued stamp dataset; "
-            "regenerate with get_dipole_mtxels")
-    try:
-        return bytes(raw.astype(np.uint8).tolist()).decode("ascii")
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise ValueError(
-            f"{path}: {name} is not an ASCII SHA-256 stamp; regenerate with "
-            "get_dipole_mtxels"
-        ) from exc
-
-
 def load_parallel_transport_head(
     path: str,
     *,
@@ -477,6 +454,7 @@ def load_parallel_transport_head(
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
         load_link_singular_values,
+        read_text_stamp,
     )
     from file_io.slab_io import SlabIO
     from common.parallel_transport import band_storage_extent, wfn_fingerprint
@@ -513,8 +491,7 @@ def load_parallel_transport_head(
             io.read_small("reciprocal_lattice_cart", dtype=np.float64),
             dtype=np.float64,
         )
-        fingerprint = _ascii_stamp(
-            io, path, "wfn_fingerprint_utf8")
+        fingerprint = read_text_stamp(io, "wfn_fingerprint")
 
         expected_nb = int(meta.b_id_4_user)
         expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -722,6 +699,7 @@ def load_dft_velocity_head(
     from file_io.parallel_transport import (
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
+        read_text_stamp,
     )
     from file_io.slab_io import SlabIO
 
@@ -737,7 +715,7 @@ def load_dft_velocity_head(
             io.read_small("reciprocal_lattice_cart", dtype=np.float64),
             dtype=np.float64,
         )
-        fingerprint = _ascii_stamp(io, path, "wfn_fingerprint_utf8")
+        fingerprint = read_text_stamp(io, "wfn_fingerprint")
         expected_reciprocal = (
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )
