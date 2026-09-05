@@ -280,16 +280,21 @@ samples remain unchanged and the quadrature session retains the expanded
 support on later maps. Interior holes still require an explicit patch.
 Quadrature nodes remain frozen while their certified boxes cover the map.
 
-**17. The active-window scissor freeze remains necessary in the measured
-Na comparison.** States inside the active Sigma band window but outside the
+**17. The active-window scissor freeze has a convergence comparison gate.**
+States inside the active Sigma band window but outside the
 retained self-consistent block follow the affine law fitted at map 0. The
-energy-dependent pad and per-k identity partition do not make a per-map
-refit equivalent: on the +21 eV Na P4 comparison, the conduction slope
+energy-dependent pad and per-k identity partition are being compared with a
+per-map refit: on the +21 eV Na P4 comparison, the conduction slope
 changes from 1.117004 at map 0 to 1.166066 at trial map 1. The trusted
 outputs initially agree within 0.0194 meV, but by trial map 3 their
 mean-aligned differences reach 40.19 meV on bands 5-10 and 131.05 meV on
-the full protected set 5-13. Both exceed the 2 meV removal threshold, so
-`SCState.frozen_scissor_fits` and its capture/reuse remain. See sandbox
+the full protected set 5-13. These moving trial outputs do not decide
+whether the freeze is needed at convergence. Compare the mean-aligned
+bands 5-10 accepted-pair tables at maps 12-16 and the band-5 shape after
+rigid alignment; the freeze stays only if those differ by more than 2 meV.
+Report the refitted law's per-map alpha/beta changes separately.
+`SCState.frozen_scissor_fits` and its capture/reuse remain pending that
+comparison. See sandbox
 `runs/DEV/150_sc_partition_pad_2026-09-05/evidence/na_comparison_map0003.json`
 (jobs 57950126.27/.28); this early-map comparison is not a convergence
 claim. The sum-band tail beyond the Sigma window keeps its per-map refit:
