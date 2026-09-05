@@ -48,6 +48,7 @@ a consumer from ever being reached under ``low_mem_bands = true``).
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 from dataclasses import dataclass
 
@@ -1828,9 +1829,21 @@ def _rotate_wavefunctions_face(
         fk = face_kernel_kwargs(wfns_dft)
         nk_face, nb_full, n_rmu, ns = fk['face_shape']
         U = _place_U_face(U_dft_to_qp_active, mesh_xy)
-        rotate = _face_rotate_kernel(
-            mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
-        psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
+        psi_nmu = psi_mun = None
+        carrier_rotated = None
+        if wfns_dft.psi_nmu is not None:
+            rotate = _face_rotate_kernel(
+                mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
+            psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
+        else:
+            # Parents-only storage: the carrier is the run's only ψ.  Rotate
+            # its four faces with U on the parents' OWN full-k rows -- the
+            # transported child basis is the parent basis, so the map's
+            # rotation at a child row is the parent's (conjugated on
+            # antiunitary rows, which the carrier never materializes).
+            carrier_rotated = _rotate_parent_carrier(
+                wfns_dft.green_parent, U, a_lo=a_lo, nb_active=nb_active,
+                nb_full=nb_full, ns=ns, mesh_xy=mesh_xy)
 
         # enk/occ: SAME expression as the legacy sibling (layout-independent
         # — enk/occ are always P(None,None) replicated regardless of ψ
@@ -1853,10 +1866,56 @@ def _rotate_wavefunctions_face(
             _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
 
     # As above, the host DFT binding cannot follow a QP-rotated carrier.
-    return Wavefunctions(
+    rotated = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
         enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout='face',
     )
+    if carrier_rotated is None:
+        return rotated
+    packed_nmu, packed_mun, can_nmu, can_mun, plan = carrier_rotated
+    return dataclasses.replace(
+        rotated,
+        green_parent=build_packed_parent_green_carrier(
+            rotated, packed_nmu, packed_mun, plan=plan, mesh_xy=mesh_xy,
+            psi_nmu_canonical=can_nmu, psi_mun_canonical=can_mun))
+
+
+def _rotate_parent_carrier(carrier, U_placed, *, a_lo, nb_active, nb_full,
+                           ns, mesh_xy):
+    """Rotate a :class:`ParentGreenCarrier`'s four faces on the parent rows.
+
+    ``U_placed`` is the FULL-k placed active rotation; its rows at
+    ``plan.parent_full_rows`` are the parents' own.  The packed pair and
+    the canonical pair each go through :func:`_face_rotate_kernel` at
+    their own centroid extent and ``nk = n_parent``.  Returns the four
+    rotated faces and the plan; the caller rebinds them to the rotated
+    bundle's energy/occupation tables.
+    """
+    if carrier is None or carrier.psi_nmu_canonical is None:
+        raise ValueError(
+            "rotate_wavefunctions: a face bundle without full-k faces needs "
+            "a projection-capable parent carrier to rotate.")
+    plan = carrier.plan
+    rows = getattr(plan, 'parent_full_rows', None)
+    if rows is None:
+        raise ValueError(
+            "rotate_wavefunctions: the parent plan names no full-k rows "
+            "(hand-assembled plan); cannot select the parents' rotation.")
+    U_par = jax.lax.with_sharding_constraint(
+        jnp.take(U_placed, jnp.asarray(np.asarray(rows), dtype=jnp.int32),
+                 axis=0),
+        NamedSharding(mesh_xy, P(None, None, None)))
+    n_parent = int(plan.n_parent)
+    rot_packed = _face_rotate_kernel(
+        mesh_xy, a_lo, nb_active, nb_full, int(plan.n_centroid_packed), ns,
+        n_parent)
+    rot_can = _face_rotate_kernel(
+        mesh_xy, a_lo, nb_active, nb_full,
+        int(carrier.psi_mun_canonical.shape[2]), ns, n_parent)
+    packed_nmu, packed_mun = rot_packed(carrier.psi_nmu, carrier.psi_mun, U_par)
+    can_nmu, can_mun = rot_can(
+        carrier.psi_nmu_canonical, carrier.psi_mun_canonical, U_par)
+    return packed_nmu, packed_mun, can_nmu, can_mun, plan
 
 
 def rotate_wavefunctions(

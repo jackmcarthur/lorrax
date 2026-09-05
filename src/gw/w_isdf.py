@@ -695,7 +695,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
-    *, layout: str = "legacy", face_shape=None,
+    *, layout: str = "legacy", face_shape=None, k_unfold_plan=None,
 ):
     """Retarded finite-occupation chi0 on one positive-time sweep.
 
@@ -725,7 +725,7 @@ def _get_chi_fractional_contour_kernel(
             f"_get_chi_fractional_contour_kernel: layout must be 'legacy' "
             f"or 'face', got {layout!r}")
     cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(),
-                 n_out, layout, face_shape)
+                 n_out, layout, face_shape, id(k_unfold_plan))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -737,7 +737,7 @@ def _get_chi_fractional_contour_kernel(
                 "_get_chi_fractional_contour_kernel(layout='face') requires "
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
         kernel = _get_chi_fractional_contour_kernel_face(
-            mesh_xy, grid, n_out, face_shape)
+            mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -882,6 +882,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
+    *, k_unfold_plan=None,
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -927,10 +928,22 @@ def _get_chi_fractional_contour_kernel_face(
     nk = int(np.prod(grid))
     n_out = int(n_out)
     nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
-    if nk_shape != nk:
+    # Raw-parent transport (``k_unfold_plan``): the two G's are contracted
+    # on the n_parent packed parent faces and unfolded to full k in PACKED
+    # centroid order before the FFT -- the minimax kernel's own seam
+    # (``_get_chi_minimax_kernel_face``) -- and the finished χ0(q) is
+    # restored to the canonical order at the end.
+    expected_input_nk = (
+        nk if k_unfold_plan is None else int(k_unfold_plan.n_parent))
+    if nk_shape != expected_input_nk:
         raise ValueError(
             f"_get_chi_fractional_contour_kernel_face: face_shape "
-            f"nk={nk_shape} does not match kgrid's prod={nk}")
+            f"nk={nk_shape} does not match the expected input k extent "
+            f"{expected_input_nk}")
+    if k_unfold_plan is not None and int(k_unfold_plan.n_full) != nk:
+        raise ValueError(
+            "_get_chi_fractional_contour_kernel_face: plan n_full "
+            f"{k_unfold_plan.n_full} != prod(kgrid)={nk}.")
 
     G_fftn = make_flat_k_fftn(
         mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
@@ -948,7 +961,14 @@ def _get_chi_fractional_contour_kernel_face(
     # and Gu build this kernel ever does — mirrors
     # _get_chi_minimax_kernel_face's own g_plan.
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
-                       nq=nk, dtype=jnp.complex128)
+                       nq=expected_input_nk, dtype=jnp.complex128)
+    _unfold_output = "packed" if k_unfold_plan is not None else "canonical"
+
+    def _finish(value):
+        value_q = chi_fftn(value)
+        if k_unfold_plan is not None:
+            value_q = k_unfold_plan.restore_operator_basis(value_q)
+        return value_q
 
     @partial(
         jax.jit,
@@ -1007,6 +1027,8 @@ def _get_chi_fractional_contour_kernel_face(
                     band_weight=occ_f,
                     layout="face",
                     gemm=g_plan,
+                    k_unfold_plan=k_unfold_plan,
+                    k_unfold_output=_unfold_output,
                 )),
                 G_shard,
             )
@@ -1020,6 +1042,8 @@ def _get_chi_fractional_contour_kernel_face(
                     band_weight=occ_u,
                     layout="face",
                     gemm=g_plan,
+                    k_unfold_plan=k_unfold_plan,
+                    k_unfold_output=_unfold_output,
                 )),
                 G_shard,
             )
@@ -1049,7 +1073,7 @@ def _get_chi_fractional_contour_kernel_face(
             (time_nodes, jnp.transpose(projection_rows)),
             unroll=1,
         )
-        return tuple(chi_fftn(value) for value in final_R)
+        return tuple(_finish(value) for value in final_R)
 
     return integrate
 
@@ -1589,10 +1613,12 @@ def _chi_face_kwargs(wfns) -> dict:
 def _chi_parent_face_kwargs(wfns) -> dict:
     """Minimax-G shape kwargs, including raw-parent transport when present.
 
-    Fractional-occupation response still consumes the primary full-k carrier
-    directly.  Keeping that dispatch on :func:`_chi_face_kwargs` prevents an
-    attached acceleration carrier from changing a kernel whose symmetry
-    transport has not been derived yet.
+    The minimax and fractional-CONTOUR kernels take the plan: their G's are
+    one-particle ``build_G_tau`` contractions, so the parent transport is
+    the Green-function rule.  The fractional static-Γ and direct-q PAIR
+    SCANS still consume the primary full-k carrier through
+    :func:`_chi_face_kwargs`: their divided-difference weight couples both
+    band indices and needs the ψ faces themselves at every k.
     """
     from .wavefunction_bundle import green_face_kernel_kwargs
     return green_face_kernel_kwargs(wfns)
@@ -2846,6 +2872,23 @@ def _chi0_fractional_contour_args(
         (idx >= u_slice.start) & (idx < u_slice.stop), dtype=occ_full.dtype)
     occ_f_face = occ_full * f_ind[None, :]
     occ_u_face = (1.0 - occ_full) * u_ind[None, :]
+    carrier = wfns.green_parent
+    if carrier is not None:
+        # Raw parents: the packed parent faces and the parents' rows of
+        # the (star-invariant) energy and weight tables; the kernel built
+        # with the matching ``k_unfold_plan`` transports G to full k.
+        plan = carrier.plan
+        args = (
+            jnp.asarray(time_nodes, dtype=jnp.float64),
+            jnp.asarray(projection_rows, dtype=jnp.complex128),
+            carrier.psi_mun,
+            carrier.psi_nmu,
+            carrier.enk,
+            plan.parent_rows(occ_f_face),
+            plan.parent_rows(occ_u_face),
+            jnp.asarray(eref, dtype=jnp.float64),
+        )
+        return args, z_values.size
     args = (
         jnp.asarray(time_nodes, dtype=jnp.float64),
         jnp.asarray(projection_rows, dtype=jnp.complex128),
@@ -2895,7 +2938,7 @@ def compute_chi0_contour_fractional(
         occupation_window_threshold,
     )
     kernel = _get_chi_fractional_contour_kernel(
-        mesh_xy, kgrid, n_out, **_chi_face_kwargs(wfns))
+        mesh_xy, kgrid, n_out, **_chi_parent_face_kwargs(wfns))
     values = kernel(*args)
     return values[0] if n_out == 1 else values
 
@@ -3112,7 +3155,7 @@ def _get_chi_fractional_q_kernel(
 def _fractional_pair_scan_face(
     psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
     occ_a, occ_b, surface_a, surface_b, z_values, *,
-    nb_full, nb_logical, tile,
+    nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
 ):
     """Face-layout sibling of :func:`_fractional_pair_scan`.
 
@@ -3147,10 +3190,36 @@ def _fractional_pair_scan_face(
     ``ppermute`` ring was considered and deferred, not needed at the
     scale this session gated.
     """
-    nk = psi_mun_a.shape[0]
+    # The k extent of the PAIR SUM is the energy table's (full BZ).  With
+    # raw parents (``unfold_x``/``unfold_y`` given) the ψ operands carry
+    # n_parent rows and every band tile is unfolded to full k after its
+    # gather -- symmetry_maps.unfold_wavefunction_local, tables already
+    # sliced to this rank's μ slab -- so the tile, not a face, is the
+    # largest full-k ψ object that ever exists.  ``roll_b`` is the k−q map
+    # applied to the "b" role AFTER the unfold (full-k rows).
+    nk = energy_a.shape[0]
     ns = psi_mun_a.shape[1]
     nmu_x_loc = psi_mun_a.shape[2]
     nmu_y_loc = psi_nmu_a.shape[3]
+    if (unfold_x is None) != (unfold_y is None):
+        raise ValueError(
+            "_fractional_pair_scan_face: give unfold tables for BOTH faces "
+            "or neither.")
+    if unfold_x is not None:
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import unfold_wavefunction_local
+
+    def _children(tile_psi, tables):
+        """(n_parent, s, mu_loc, t) -> (nk, s, mu_loc, t) by the typed action;
+        identity when the operand already spans full k."""
+        if tables is None:
+            return tile_psi
+        return unfold_wavefunction_local(
+            tile_psi, spin_axis=1, mu_axis=2, mesh_axis=None, **tables)
+
+    def _roll(tile_psi):
+        return tile_psi if roll_b is None else jnp.take(tile_psi, roll_b, axis=0)
     shard_w_y = psi_mun_a.shape[3]   # psi_mun's own 'y'-shard width (bands)
     shard_w_x = psi_nmu_a.shape[1]   # psi_nmu's own 'x'-shard width (bands)
     y_idx = jax.lax.axis_index('y')
@@ -3242,8 +3311,8 @@ def _fractional_pair_scan_face(
     def _outer(acc, ia_step):
         ia = ia_step * tile
         ga = ia + jnp.arange(tile)
-        a_x = _gather_mun(psi_mun_a, ia)
-        a_y = _gather_nmu(psi_nmu_a, ia)
+        a_x = _children(_gather_mun(psi_mun_a, ia), unfold_x)
+        a_y = _children(_gather_nmu(psi_nmu_a, ia), unfold_y)
         ea = jax.lax.dynamic_slice(ea_full, (0, ia), (nk, tile))
         fa = jax.lax.dynamic_slice(fa_full, (0, ia), (nk, tile))
         sa = jax.lax.dynamic_slice(sa_full, (0, ia), (nk, tile))
@@ -3251,8 +3320,8 @@ def _fractional_pair_scan_face(
         def _inner(acc_inner, ib_step):
             ib = ib_step * tile
             gb = ib + jnp.arange(tile)
-            b_x = _gather_mun(psi_mun_b, ib)
-            b_y = _gather_nmu(psi_nmu_b, ib)
+            b_x = _roll(_children(_gather_mun(psi_mun_b, ib), unfold_x))
+            b_y = _roll(_children(_gather_nmu(psi_nmu_b, ib), unfold_y))
             eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
             fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
             sb = jax.lax.dynamic_slice(sb_full, (0, ib), (nk, tile))
@@ -3268,8 +3337,51 @@ def _fractional_pair_scan_face(
     return chi / jnp.sqrt(jnp.asarray(nk, jnp.float64))
 
 
+_PARENT_UNFOLD_OPERANDS = {}
+
+
+def _parent_face_unfold_operands(plan, mesh_xy):
+    """The eight placed table operands the parent pair scans take, cached per
+    plan: rows/operations/parent k/spin action replicated, the centroid
+    offset and wrap tables sharded on the axis of the face they serve."""
+    key = (id(plan), id(mesh_xy))
+    hit = _PARENT_UNFOLD_OPERANDS.get(key)
+    if hit is not None:
+        return hit
+    t = plan.wavefunction_unfold_tables()
+    from common.collectives import device_put_process_local
+    rep = lambda spec: NamedSharding(mesh_xy, spec)
+    ops = (
+        device_put_process_local(jnp.asarray(t["irr_idx"], jnp.int32), rep(P(None))),
+        device_put_process_local(jnp.asarray(t["sym_idx"], jnp.int32), rep(P(None))),
+        device_put_process_local(jnp.asarray(t["k_irr_frac"], jnp.float64), rep(P(None, None))),
+        device_put_process_local(jnp.asarray(t["spin_action_full"], jnp.complex128), rep(P(None, None, None))),
+        device_put_process_local(jnp.asarray(t["local_perm"], jnp.int32), rep(P(None, "x"))),
+        device_put_process_local(jnp.asarray(t["L_table"], jnp.float64), rep(P(None, "x", None))),
+        device_put_process_local(jnp.asarray(t["local_perm"], jnp.int32), rep(P(None, "y"))),
+        device_put_process_local(jnp.asarray(t["L_table"], jnp.float64), rep(P(None, "y", None))),
+    )
+    hit = (ops, int(t["n_sym_spatial"]))
+    _PARENT_UNFOLD_OPERANDS[key] = hit
+    return hit
+
+
+_PARENT_UNFOLD_SPECS = (P(None), P(None), P(None, None), P(None, None, None),
+                        P(None, "x"), P(None, "x", None),
+                        P(None, "y"), P(None, "y", None))
+
+
+def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
+                                 n_sym_spatial):
+    common = dict(irr_idx=irr, sym_idx=sym, k_irr_frac=kfrac,
+                  spin_action_full=U, n_sym_spatial=n_sym_spatial)
+    return (dict(common, local_perm=perm_x, L_table=L_x),
+            dict(common, local_perm=perm_y, L_table=L_y))
+
+
 def _get_chi_static_fractional_gamma_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
+    k_unfold_plan=None,
 ):
     """Face-layout sibling of :func:`_get_chi_static_fractional_gamma_kernel`.
     See that function's docstring for the physics; only the operand
@@ -3280,23 +3392,43 @@ def _get_chi_static_fractional_gamma_kernel_face(
 
     tile = int(pair_tile)
     key = ("static_fractional_gamma_face", id(mesh_xy), int(nb_full),
-           int(nb_logical), tile)
+           int(nb_logical), tile, id(k_unfold_plan))
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
 
-    def _local(psi_mun, psi_nmu, energies, occupations, surface_weight):
-        return _fractional_pair_scan_face(
-            psi_mun, psi_nmu, psi_mun, psi_nmu, energies, energies,
-            occupations, occupations, surface_weight, surface_weight,
-            jnp.zeros((1,), dtype=jnp.complex128),
-            nb_full=nb_full, nb_logical=nb_logical, tile=tile)
+    if k_unfold_plan is None:
+        def _local(psi_mun, psi_nmu, energies, occupations, surface_weight):
+            return _fractional_pair_scan_face(
+                psi_mun, psi_nmu, psi_mun, psi_nmu, energies, energies,
+                occupations, occupations, surface_weight, surface_weight,
+                jnp.zeros((1,), dtype=jnp.complex128),
+                nb_full=nb_full, nb_logical=nb_logical, tile=tile)
+        in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
+                    P(None, None))
+    else:
+        # Raw parents: the packed parent faces plus the unfold tables; each
+        # band tile is unfolded to full k inside the scan.  The result is in
+        # PACKED centroid order on both axes; the caller restores it.
+        n_sym_spatial = int(k_unfold_plan.n_sym_spatial)
+
+        def _local(psi_mun, psi_nmu, energies, occupations, surface_weight,
+                   *tables):
+            unfold_x, unfold_y = _unfold_tables_from_operands(
+                *tables, n_sym_spatial=n_sym_spatial)
+            return _fractional_pair_scan_face(
+                psi_mun, psi_nmu, psi_mun, psi_nmu, energies, energies,
+                occupations, occupations, surface_weight, surface_weight,
+                jnp.zeros((1,), dtype=jnp.complex128),
+                nb_full=nb_full, nb_logical=nb_logical, tile=tile,
+                unfold_x=unfold_x, unfold_y=unfold_y)
+        in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
+                    P(None, None)) + _PARENT_UNFOLD_SPECS
 
     kernel = jax.jit(shard_map(
         _local,
         mesh=mesh_xy,
-        in_specs=(PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
-                  P(None, None)),
+        in_specs=in_specs,
         out_specs=P(None, "x", "y"),
         check_vma=False,
     ))
@@ -3306,7 +3438,7 @@ def _get_chi_static_fractional_gamma_kernel_face(
 
 def _get_chi_fractional_q_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
-    n_z: int,
+    n_z: int, k_unfold_plan=None,
 ):
     """Face-layout sibling of :func:`_get_chi_fractional_q_kernel`.  The
     k−q roll is unaffected by layout (a rank-local ``jnp.take`` on the
@@ -3317,28 +3449,50 @@ def _get_chi_fractional_q_kernel_face(
 
     tile = int(pair_tile)
     key = ("direct_fractional_q_face", id(mesh_xy), int(nb_full),
-           int(nb_logical), tile, int(n_z))
+           int(nb_logical), tile, int(n_z), id(k_unfold_plan))
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
 
-    def _local(psi_mun, psi_nmu, kminq_idx, energies, occupations,
-               surface_weight, z_values):
-        psi_mun_b = jnp.take(psi_mun, kminq_idx, axis=0)
-        psi_nmu_b = jnp.take(psi_nmu, kminq_idx, axis=0)
-        eb = jnp.take(energies, kminq_idx, axis=0)
-        fb = jnp.take(occupations, kminq_idx, axis=0)
-        sb = jnp.take(surface_weight, kminq_idx, axis=0)
-        return _fractional_pair_scan_face(
-            psi_mun, psi_nmu, psi_mun_b, psi_nmu_b, energies, eb,
-            occupations, fb, surface_weight, sb, z_values,
-            nb_full=nb_full, nb_logical=nb_logical, tile=tile)
+    if k_unfold_plan is None:
+        def _local(psi_mun, psi_nmu, kminq_idx, energies, occupations,
+                   surface_weight, z_values):
+            psi_mun_b = jnp.take(psi_mun, kminq_idx, axis=0)
+            psi_nmu_b = jnp.take(psi_nmu, kminq_idx, axis=0)
+            eb = jnp.take(energies, kminq_idx, axis=0)
+            fb = jnp.take(occupations, kminq_idx, axis=0)
+            sb = jnp.take(surface_weight, kminq_idx, axis=0)
+            return _fractional_pair_scan_face(
+                psi_mun, psi_nmu, psi_mun_b, psi_nmu_b, energies, eb,
+                occupations, fb, surface_weight, sb, z_values,
+                nb_full=nb_full, nb_logical=nb_logical, tile=tile)
+        in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
+                    P(None, None), P(None, None), P(None))
+    else:
+        # Raw parents: the k−q roll acts on FULL-k rows, so it is applied
+        # to each unfolded band tile inside the scan (``roll_b``), never to
+        # the parent operand.
+        n_sym_spatial = int(k_unfold_plan.n_sym_spatial)
+
+        def _local(psi_mun, psi_nmu, kminq_idx, energies, occupations,
+                   surface_weight, z_values, *tables):
+            unfold_x, unfold_y = _unfold_tables_from_operands(
+                *tables, n_sym_spatial=n_sym_spatial)
+            eb = jnp.take(energies, kminq_idx, axis=0)
+            fb = jnp.take(occupations, kminq_idx, axis=0)
+            sb = jnp.take(surface_weight, kminq_idx, axis=0)
+            return _fractional_pair_scan_face(
+                psi_mun, psi_nmu, psi_mun, psi_nmu, energies, eb,
+                occupations, fb, surface_weight, sb, z_values,
+                nb_full=nb_full, nb_logical=nb_logical, tile=tile,
+                unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx)
+        in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
+                    P(None, None), P(None, None), P(None)) + _PARENT_UNFOLD_SPECS
 
     kernel = jax.jit(shard_map(
         _local,
         mesh=mesh_xy,
-        in_specs=(PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
-                  P(None, None), P(None, None), P(None)),
+        in_specs=in_specs,
         out_specs=P(None, "x", "y"),
         check_vma=False,
     ))
@@ -3415,6 +3569,21 @@ def compute_chi0_static_fractional_gamma(
     e_full = jnp.pad(e, pad2)
     f_full = jnp.pad(f, pad2)
     surface_full = jnp.pad(surface, pad2)
+    carrier = wfns.green_parent
+    if carrier is not None:
+        # Raw parents: packed parent faces + unfold tables in, PACKED-order
+        # χ out; restore the canonical centroid order once.
+        plan = carrier.plan
+        tables, _ = _parent_face_unfold_operands(plan, mesh_xy)
+        value = _get_chi_static_fractional_gamma_kernel_face(
+            mesh_xy,
+            nb_full=nb_full,
+            nb_logical=int(nb_logical),
+            pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
+            k_unfold_plan=plan,
+        )(carrier.psi_mun, carrier.psi_nmu, e_full, f_full, surface_full,
+          *tables)
+        return plan.restore_operator_basis(value)
     return _get_chi_static_fractional_gamma_kernel_face(
         mesh_xy,
         nb_full=nb_full,
@@ -3572,15 +3741,27 @@ def compute_chi0_direct_fractional(
     e_full = jnp.pad(e, pad2)
     f_full = jnp.pad(f, pad2)
     surface_full = jnp.pad(surface, pad2)
+    carrier = wfns.green_parent
+    plan = None if carrier is None else carrier.plan
+    psi_mun_in, psi_nmu_in = (
+        (wfns.psi_mun, wfns.psi_nmu) if carrier is None
+        else (carrier.psi_mun, carrier.psi_nmu))
+    tables = () if plan is None else _parent_face_unfold_operands(plan, mesh_xy)[0]
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
-        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size)
+        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size,
+        k_unfold_plan=plan)
     rows = []
     for q_row, row in enumerate(kmq):
         started = time.monotonic()
         value = kernel(
-            wfns.psi_mun, wfns.psi_nmu, jnp.asarray(row), e_full, f_full,
-            surface_full, jnp.asarray(z))
+            psi_mun_in, psi_nmu_in, jnp.asarray(row), e_full, f_full,
+            surface_full, jnp.asarray(z), *tables)
+        if plan is not None:
+            # PACKED centroid order on both axes -> canonical, one q row
+            # ((n_z, mu, nu), still P(None,'x','y')) at a time: never the
+            # stacked full-BZ sample set as one operand.
+            value = plan.restore_operator_basis(value)
         if progress_fn is not None:
             value.block_until_ready()
             progress_fn(q_row + 1, len(kmq), time.monotonic() - started)

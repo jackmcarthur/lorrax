@@ -129,6 +129,20 @@ class CentroidKUnfoldPlan:
         return (self.sym_perm % int(self.layout.axis_shard_size)).astype(
             np.int32)
 
+    def wavefunction_unfold_tables(self) -> dict:
+        """Host tables for ``symmetry_maps.unfold_wavefunction_local`` on a
+        packed face: the parents' rows and operations of every full-k row,
+        the parents' k, the owner-local centroid offsets and wraps over the
+        COMPLETE packed endpoint, and the spinor representation.  A consumer
+        streams children of a packed parent face from these without a full-k
+        face ever being resident (the fractional-occupation pair scans)."""
+        return dict(
+            irr_idx=self.irr_idx, sym_idx=self.sym_idx,
+            k_irr_frac=self.k_parent_frac,
+            local_perm=self.centroid_local_perm, L_table=self.L_table,
+            spin_action_full=self.spin_action_full,
+            n_sym_spatial=int(self.n_sym_spatial))
+
     def real_grid_tiles(self, *, target_width: int) -> "RealGridOrbitTiles":
         """Orbit-closed real-grid tiles for this plan's Y axis and group."""
         if self.spatial_ops is None or self.fft_grid is None:

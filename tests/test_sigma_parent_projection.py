@@ -11,6 +11,15 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
 * Parents-only bundle: a face bundle with BOTH full-k faces ``None`` and
   the carrier as its only ψ names the full-k face shape and the route's
   parent shapes to the kernel factories (``sigma_face_kernel_kwargs``).
+* Fractional-occupation contour χ0 (``w_isdf.compute_chi0_contour_fractional``)
+  on the parents-only bundle equals the full-k face bundle (CPU steps
+  without the host FFT FFI report partial scope; run the worker on GPUs).
+* Fractional static-Γ and direct-q pair scans on the parents-only bundle
+  equal the full-k face bundle: each band tile is unfolded from the packed
+  parents inside the scan (``symmetry_maps.unfold_wavefunction_local``).
+* SC rotation: ``wavefunction_bundle.rotate_wavefunctions`` on the
+  parents-only bundle rotates the carrier's faces with U at the parents'
+  rows and equals the rotated full-k faces read at those rows.
 * Σ projection: ``ppm_tau_kernel._make_project_ri_reduce_scatter(parent_route)``
   — select the parents' rows of a full-k operator, project with the
   CANONICAL parent faces, broadcast the band matrix — equals the full-k face
@@ -225,11 +234,108 @@ def _worker() -> int:
         == (n_parent, nb, plan.n_centroid_packed, ns)
         and tuple(kw["parent_route"].proj_face_shape) == (n_parent, nb, n_mu, ns))
 
+    # Fractional-occupation CONTOUR χ0 on the parents-only bundle equals the
+    # full-k face bundle (its two G's ride the same parent transport).
+    from gw.efermi import mp1_occupations
+    from gw.w_isdf import compute_chi0_contour_fractional
+    enk_parent = rng.uniform(-1.0, 1.0, size=(n_parent, nb))
+    enk_parent[:, :2] -= 40.0
+    enk_parent[:, -2:] += 40.0
+    enk_full_np = enk_parent[irr]                      # star-invariant table
+    enk_j = jnp.asarray(enk_full_np)
+    mu_f = float(np.median(enk_full_np))
+    f_kn = mp1_occupations(enk_j, mu_f, 0.15)
+    slices = BandSlices.from_band_edges(0, 0, nb // 2, nb, nb)
+    wfns_full = Wavefunctions(
+        psi_nmu=psi_nmu_full, psi_mun=psi_mun_full, enk=enk_j, occ=f_kn,
+        slices=slices, layout="face")
+    carrier_e = ParentGreenCarrier(
+        psi_nmu=psi_nmu_pk, psi_mun=psi_mun_pk,
+        enk=jnp.asarray(enk_parent), occ=jnp.asarray(np.asarray(f_kn)[parent_rows]),
+        plan=plan, psi_nmu_canonical=psi_nmu_par, psi_mun_canonical=psi_mun_par)
+    wfns_par = Wavefunctions(
+        enk=enk_j, occ=f_kn, slices=slices, layout="face",
+        green_parent=carrier_e)
+    meta = SimpleNamespace(nk_tot=nk, nkx=kgrid[0], nky=kgrid[1], nkz=kgrid[2])
+    t_nodes = np.asarray([0.1, 0.5, 1.3])
+    w_rows = np.asarray([0.4, 0.3, 0.2])
+    z_c = np.asarray([0.05 + 0.2j])
+    try:
+        chi_full = np.asarray(jax.block_until_ready(compute_chi0_contour_fractional(
+            wfns_full, t_nodes, w_rows, z_c, meta, mesh,
+            occupations=f_kn, energy_reference=mu_f)))
+        chi_par = np.asarray(jax.block_until_ready(compute_chi0_contour_fractional(
+            wfns_par, t_nodes, w_rows, z_c, meta, mesh,
+            occupations=f_kn, energy_reference=mu_f)))
+        frac_contour = float(np.max(np.abs(chi_par - chi_full))) / float(
+            np.max(np.abs(chi_full)))
+    except RuntimeError as exc:
+        if "FFTW3-ABI host backend is unavailable" not in str(exc):
+            raise
+        frac_contour = "skip: host FFT FFI backend unavailable"
+
+    # The two fractional PAIR SCANS (static Γ, direct q) need ψ itself at
+    # every k: on the parents-only bundle each band tile is unfolded from
+    # the packed parents inside the scan (symmetry_maps.
+    # unfold_wavefunction_local).  No FFT is involved, so this runs on CPU.
+    from gw.efermi import OccupationState, mp1_negative_derivative
+    from gw.w_isdf import (
+        compute_chi0_direct_fractional, compute_chi0_static_fractional_gamma)
+    surf = mp1_negative_derivative(enk_j, mu_f, 0.15)
+    g_full = np.asarray(jax.block_until_ready(compute_chi0_static_fractional_gamma(
+        wfns_full, enk_j, f_kn, surf, meta, mesh, nb_logical=nb - 1)))
+    g_par = np.asarray(jax.block_until_ready(compute_chi0_static_fractional_gamma(
+        wfns_par, enk_j, f_kn, surf, meta, mesh, nb_logical=nb - 1)))
+    frac_gamma = float(np.max(np.abs(g_par - g_full))) / float(np.max(np.abs(g_full)))
+    kfrac_i = np.rint(kfrac * np.asarray(kgrid)).astype(int)
+    kminq = np.asarray([[2 * ((kfrac_i[k, 0] - kfrac_i[q, 0]) % 2)
+                         + ((kfrac_i[k, 1] - kfrac_i[q, 1]) % 2)
+                         for k in range(nk)] for q in range(nk)], dtype=np.int32)
+    occ_state = OccupationState(
+        f_kn=f_kn, mu_ry=mu_f, smearing_family="mp1", smearing_width_ry=0.15,
+        n_electrons=float(np.sum(np.asarray(f_kn))))
+    z_direct = np.asarray([0.03 + 0.1j, 0.2 + 0.05j])
+    d_full = np.asarray(jax.block_until_ready(compute_chi0_direct_fractional(
+        wfns_full, z_direct, meta, mesh, occupation_state=occ_state,
+        kminq_rows=kminq, nb_logical=nb - 1)))
+    d_par = np.asarray(jax.block_until_ready(compute_chi0_direct_fractional(
+        wfns_par, z_direct, meta, mesh, occupation_state=occ_state,
+        kminq_rows=kminq, nb_logical=nb - 1)))
+    frac_direct = float(np.max(np.abs(d_par - d_full))) / float(np.max(np.abs(d_full)))
+    # The self-consistent map's rotation on a parents-only bundle: rotating
+    # the carrier with U on the parents' rows equals rotating the full-k
+    # faces and reading the parents' rows back (children share the parent's
+    # U in the transported gauge, conjugated on antiunitary rows).
+    from gw.wavefunction_bundle import rotate_wavefunctions
+    U_par_np = np.stack([np.linalg.qr(_crand(rng, nb, nb))[0] for _ in range(n_parent)])
+    U_full_np = np.stack([np.conj(U_par_np[irr[k]]) if sym[k] >= n_tran else U_par_np[irr[k]]
+                          for k in range(nk)])
+    e_new_par = rng.uniform(-1.0, 1.0, size=(n_parent, nb))
+    e_new_full = jnp.asarray(e_new_par[irr])
+    rot_full = rotate_wavefunctions(
+        wfns_full, jnp.asarray(U_full_np), enk_active_new=e_new_full, efermi=None,
+        mesh_xy=mesh, active_slice=slice(0, nb))
+    rot_par = rotate_wavefunctions(
+        wfns_par, jnp.asarray(U_full_np), enk_active_new=e_new_full, efermi=None,
+        mesh_xy=mesh, active_slice=slice(0, nb))
+    rc = rot_par.green_parent
+    full_nmu = np.asarray(rot_full.psi_nmu)[parent_rows]
+    full_mun = np.asarray(rot_full.psi_mun)[parent_rows]
+    rot_rel = max(
+        float(np.max(np.abs(np.asarray(rc.psi_nmu_canonical) - full_nmu))) / float(np.max(np.abs(full_nmu))),
+        float(np.max(np.abs(np.asarray(rc.psi_mun_canonical) - full_mun))) / float(np.max(np.abs(full_mun))))
+    packed_ref = np.asarray(plan.pack_face_pair(rot_full.psi_nmu[parent_rows], rot_full.psi_mun[parent_rows])[0])
+    rot_rel = max(rot_rel, float(np.max(np.abs(np.asarray(rc.psi_nmu) - packed_ref))) / float(np.max(np.abs(packed_ref))))
+
     print(json.dumps({
+        "sc_rotation_parents_vs_full_rel": rot_rel,
         "g_rel": g_rel, "proj_rel": proj_rel,
         "conj_rule_rel_on_tr_rows": conj_rel_trs,
         "conj_rule_rel_on_unitary_rows": conj_rel_uni,
         "parents_only_bundle_names_full_k_shapes": parents_only_ok,
+        "fractional_contour_parents_vs_full_rel": frac_contour,
+        "fractional_static_gamma_parents_vs_full_rel": frac_gamma,
+        "fractional_direct_q_parents_vs_full_rel": frac_direct,
     }))
     return 0
 
@@ -268,6 +374,14 @@ def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
     assert out["conj_rule_rel_on_unitary_rows"] < _TOL, out
     assert out["conj_rule_rel_on_tr_rows"] > 0.1, out
     assert out["parents_only_bundle_names_full_k_shapes"] is True, out
+    fc = out["fractional_contour_parents_vs_full_rel"]
+    if isinstance(fc, str):
+        print("PARTIAL SCOPE: fractional contour arm " + fc)
+    else:
+        assert fc < 1.0e-10, f"fractional contour χ0 on parents vs full k: {out}"
+    assert out["fractional_static_gamma_parents_vs_full_rel"] < 1.0e-10, out
+    assert out["sc_rotation_parents_vs_full_rel"] < 1.0e-10, out
+    assert out["fractional_direct_q_parents_vs_full_rel"] < 1.0e-10, out
 
 
 if __name__ == "__main__":

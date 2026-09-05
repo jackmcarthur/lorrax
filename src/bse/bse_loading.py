@@ -850,6 +850,8 @@ def _read_bse_tensors(
     """
     if not _bse_slabio_usable(log_fn=log_fn):
         with h5py.File(restart_file, "r") as f:
+            from file_io.tagged_arrays import require_full_k_psi
+            require_full_k_psi(f, where="BSE restart-file ψ reader")
             vq_dset = f[vq_key]
             wq_dset = f[wq_key]
             psi_dset = f["psi_full_y"]

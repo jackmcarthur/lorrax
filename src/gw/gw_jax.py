@@ -1130,8 +1130,11 @@ def main(argv=None):
 		# row when it fires and must not hide inside ``(untimed)``.
 		with timing.section("gw_jax.sc_driver", announce=True,
 		                    label="self-consistent QSGW driver"):
+			# The self-consistent map takes the Σ bundle: under parents-only
+			# storage its carrier is the run's only ψ and the map's rotation
+			# acts on it (wavefunction_bundle.rotate_wavefunctions).
 			sc_result = run_sc_driver(
-				wfns, V_q, kin_ion,
+				wfns_sigma, V_q, kin_ion,
 				head_channel=getattr(isdf, 'head_channel', None),
 				wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
 				charge_zeta_identity=isdf.charge_zeta_identity,

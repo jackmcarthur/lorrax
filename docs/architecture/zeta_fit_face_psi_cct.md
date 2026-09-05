@@ -402,14 +402,26 @@ never forms the full-k faces at all: the loader samples the raw parents
 (`load_centroids_band_chunked(k_domain="ibz")`), the face bundle carries
 `psi_nmu = psi_mun = None` with the parent carrier as its only ψ, and
 `face_extents` names the full-k shapes to the kernel factories from the
-carrier.  The run announces `ψ storage: parents only`.  Consumers that
-still read full-k faces keep the run on full k and are named in the log:
-`head_correction = full` (dynamic head wings), `occ_smearing_family`
-(fractional-occupation response), `qp_solver = self_consistent`, non-RPA
-diagrams, ζ reuse, and `write_restart_tensors = true` (the `psi_full_y`
-append that `restart = true`, BSE and downfold read).  Porting those is the
-remaining "psi_nk_full" scope; the static head wing is a |ψ|² permutation,
-the dynamic wings need the plan's missing Cartesian action.
+carrier.  The run announces `ψ storage: parents only`.  ζ reuse is
+allowed (the plan does not depend on the fit).  Restart tensors carry the
+raw-parent faces in canonical order (`psi_parent_y`, `psi_parent_y_mun`,
+`psi_parent_k_rows`) and no `psi_full_y`; the restart branch rebuilds the
+plan and the carrier from them and announces `ψ storage: parents only
+(restart)`.  Fractional occupations are parent-capable: the contour χ0
+rides the Green transport, and the static-Γ / direct-q pair scans unfold
+each band tile from the packed parents inside the scan
+(`symmetry_maps.unfold_wavefunction_local`, the one-endpoint typed action).
+The self-consistent map's rotation acts on the carrier's four faces at the
+parents' rows (`wavefunction_bundle.rotate_wavefunctions`).
+
+Consumers that still read full-k ψ keep the run on full k and are named
+in the log: `head_correction = full` (dynamic head wings: the static wing
+is a |ψ|² permutation, the dynamic wings need the plan's missing Cartesian
+action), `qp_solver = self_consistent` (the density rebuild loads ψ(G) on
+the full BZ; the IBZ path is `rho_from_wfns(kweights, sym_perm)`), and
+non-RPA diagrams.  BSE and downfold read `psi_full_y` and refuse a
+parents-only restart file by name (`file_io.tagged_arrays.
+require_full_k_psi`) until they take the parent unfold.
 
 ## Current face-route boundaries
 

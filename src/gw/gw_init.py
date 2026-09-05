@@ -3132,6 +3132,34 @@ def build_wavefunction_bundle(
 	return wfns
 
 
+def _parents_only_consumer_blockers(cfg) -> list:
+	"""Consumers of this run that still read FULL-k centroid faces.
+
+	Empty means every wavefunction consumer is parent-capable and the run
+	may store raw parents only (``gw_init`` parents-only storage).  Each
+	entry is the log line's reason.  The dynamic head wings need the
+	Cartesian action the plan does not own; the self-consistent map's
+	density rebuild loads ψ(G) on the full BZ; non-RPA diagrams are not on
+	the parent χ0 route.  Fractional occupations are parent-capable (the
+	contour χ0 rides the Green transport, the pair scans unfold band tiles
+	from the packed parents).
+	"""
+	blockers = []
+	if str(getattr(cfg.head.correction, 'value',
+	               cfg.head.correction)) == 'full':
+		blockers.append(
+			"head_correction = full (the dynamic head wings read full-k faces)")
+	if str(getattr(cfg.qp_solver, 'value',
+	               cfg.qp_solver)) == 'self_consistent':
+		blockers.append(
+			"qp_solver = self_consistent (the map rotates the full-k bundle)")
+	if (bool(cfg.compute_mode.needs_screening)
+			and str(getattr(cfg.screening.diagrams, 'value',
+			                cfg.screening.diagrams)) != 'w_rpa'):
+		blockers.append("non-RPA screening diagrams")
+	return blockers
+
+
 def _resolve_parent_green_admission(
 	cfg, meta, wfn, band_slices, *, backend, print_fn=print,
 ):
@@ -3228,6 +3256,7 @@ def prepare_isdf_and_wavefunctions(
 	charge_zeta_identity_receipt = None
 	photon_g0_vectors = None
 	green_parent_carrier = None
+	sigma_parent_carrier = None
 
 	if not cfg.restart:
 		# One bounded canonical HDF5 scan supplies every receipt for this
@@ -3307,33 +3336,9 @@ def prepare_isdf_and_wavefunctions(
 			# consumer that still reads full-k faces keeps the run on full k
 			# and is named in the log.
 			_parents_only = False
-			_parents_only_blockers = []
-			if _parent_plan_wanted:
-				if chunks is None:
-					_parents_only_blockers.append(
-						"zeta reuse (no fresh charge fit)")
-				if str(getattr(cfg.head.correction, 'value',
-				               cfg.head.correction)) == 'full':
-					_parents_only_blockers.append(
-						"head_correction = full (the dynamic head wings read "
-						"full-k faces)")
-				if getattr(cfg, 'occ_smearing_family', None) is not None:
-					_parents_only_blockers.append(
-						"occ_smearing_family (fractional-occupation response "
-						"reads full-k faces)")
-				if str(getattr(cfg.qp_solver, 'value',
-				               cfg.qp_solver)) == 'self_consistent':
-					_parents_only_blockers.append(
-						"qp_solver = self_consistent (the map rotates the "
-						"full-k bundle)")
-				if (bool(cfg.compute_mode.needs_screening)
-						and str(getattr(cfg.screening.diagrams, 'value',
-						                cfg.screening.diagrams)) != 'w_rpa'):
-					_parents_only_blockers.append("non-RPA screening diagrams")
-				if restart_tensor_writes_enabled(cfg, tensors_filename):
-					_parents_only_blockers.append(
-						"write_restart_tensors = true (the psi_full_y append, "
-						"restart = true and BSE read full-k faces)")
+			_parents_only_blockers = (
+				_parents_only_consumer_blockers(cfg)
+				if _parent_plan_wanted else [])
 			_parents_only_wanted = (
 				_parent_plan_wanted and not _parents_only_blockers)
 			if _parent_plan_wanted and _parents_only_blockers:
@@ -3402,7 +3407,10 @@ def prepare_isdf_and_wavefunctions(
 						# no other wavefunction to read.
 						_parents_only = True
 						_parent_green_plan = _candidate_plan
-						_parent_zeta_plan = _candidate_plan
+						# The ζ plan is consumed only by a fresh charge fit; a
+						# reused ζ leaves it unused (the fit is skipped).
+						if chunks is not None:
+							_parent_zeta_plan = _candidate_plan
 					elif _parent_green_fits:
 						if _parent_green_candidate:
 							_parent_green_plan = _candidate_plan
@@ -3833,6 +3841,18 @@ def prepare_isdf_and_wavefunctions(
 						n_rmu_logical=int(meta.n_rmu),
 						psi_full_y=wfns.psi_nmu,
 						psi_full_y_mun=wfns.psi_mun,
+						# Parents-only storage: the raw-parent faces (k_irr
+						# rows, canonical order) are the file's ψ; the
+						# full-k faces above are None and are not written.
+						psi_parent_y=(
+							sigma_parent_carrier.psi_nmu_canonical
+							if _parents_only else None),
+						psi_parent_y_mun=(
+							sigma_parent_carrier.psi_mun_canonical
+							if _parents_only else None),
+						parent_k_rows=(
+							_candidate_plan.parent_full_rows
+							if _parents_only else None),
 						mesh=mesh_xy, mode="a",
 						psi_full_y_transverse=(
 							wfns_transverse.psi_nmu
@@ -3943,7 +3963,13 @@ def prepare_isdf_and_wavefunctions(
 			sanity.check_positive(
 				"restart V_q[q=0] trace",
 				float(jnp.trace(V_qmunu[0]).real), print_fn=print0)
-			if cfg.memory.low_mem_bands:
+			if cfg.memory.low_mem_bands and rs.psi_nmu is None:
+				# Parents-only file: the raw-parent faces are the ψ content.
+				sanity.check_finite("restart ψ (psi_parent_y)",
+				                    rs.psi_nmu_parent, print_fn=print0)
+				sanity.check_finite("restart ψ (psi_parent_y_mun)",
+				                    rs.psi_mun_parent, print_fn=print0)
+			elif cfg.memory.low_mem_bands:
 				sanity.check_finite("restart ψ (psi_full_y -> psi_nmu)",
 				                    rs.psi_nmu, print_fn=print0)
 				sanity.check_finite("restart ψ (psi_full_y_mun)",
@@ -4024,8 +4050,57 @@ def prepare_isdf_and_wavefunctions(
 					rs.psi_nmu, rs.psi_mun, enk_full=rs.enk_full,
 					slices=band_slices, mesh_xy=mesh_xy,
 					basis_receipt=charge_basis_receipt)
-				print0(f"  Wavefunctions loaded from restart (face layout: "
-				       f"psi_nmu/psi_mun; low_mem_bands=true)")
+				if rs.psi_nmu is None:
+					# Parents-only restart: the file stores the raw-parent
+					# faces (k_irr rows) and no full-k ψ.  Rebuild the plan
+					# and the carrier; every consumer must be parent-capable,
+					# exactly as when the file was written.
+					_blockers = _parents_only_consumer_blockers(cfg)
+					if _blockers:
+						raise ValueError(
+							f"restart: {tensors_filename} stores raw-parent ψ "
+							"faces only (psi_parent_y), but this deck has "
+							"consumers that read full-k faces: "
+							+ "; ".join(_blockers)
+							+ ".  Rerun with restart = false, or drop those "
+							"consumers.")
+					from .centroid_k_unfold import build_centroid_k_unfold_plan
+					from .wavefunction_bundle import (
+						build_packed_parent_green_carrier)
+					_restart_plan = build_centroid_k_unfold_plan(
+						sym, centroid_indices, meta.fft_grid, mesh_xy,
+						nspinor=int(meta.nspinor),
+						parent_k_frac=wfn.kvecs(k='ibz'),
+						canonical_centroid_extent=int(meta.n_rmu_padded))
+					if (_restart_plan.parent_full_rows is None
+							or not np.array_equal(
+								np.asarray(_restart_plan.parent_full_rows),
+								np.asarray(rs.parent_k_rows))):
+						raise ValueError(
+							f"restart: {tensors_filename} names parent rows "
+							f"{np.asarray(rs.parent_k_rows).tolist()} but this "
+							"WFN's plan names "
+							f"{None if _restart_plan.parent_full_rows is None else np.asarray(_restart_plan.parent_full_rows).tolist()}; "
+							"the file was written from a different WFN or "
+							"symmetry set.")
+					with mesh_xy:
+						_packed = _restart_plan.pack_face_pair(
+							rs.psi_nmu_parent, rs.psi_mun_parent)
+					sigma_parent_carrier = build_packed_parent_green_carrier(
+						wfns, *_packed, plan=_restart_plan, mesh_xy=mesh_xy,
+						psi_nmu_canonical=rs.psi_nmu_parent,
+						psi_mun_canonical=rs.psi_mun_parent)
+					green_parent_carrier = sigma_parent_carrier
+					print0(
+						"  ψ storage: parents only (restart) -- "
+						f"{_restart_plan.n_parent} raw WFN parents read from "
+						f"{os.path.basename(tensors_filename)} stand in for "
+						f"{_restart_plan.n_full} full k rows in screening and "
+						"Σ through the typed local unfold; no full-k face "
+						"was formed.")
+				else:
+					print0(f"  Wavefunctions loaded from restart (face layout: "
+					       f"psi_nmu/psi_mun; low_mem_bands=true)")
 			else:
 				wfns = build_wavefunction_bundle(
 					wfn, sym, meta, band_slices, mesh_xy,
