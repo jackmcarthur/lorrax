@@ -72,24 +72,36 @@ with $(k+G)$ in Bohr⁻¹ — i.e. the BGW HDF5 `wfn.bvec` (stored in reciprocal
 > **Live addition (2026-09-04): velocity balance for the current carrier.**
 > The lift above is the CHARGE carrier and stays as written (its
 > small-component density is the $O(\alpha^2)$ Dirac density).  The
-> SPATIAL-CURRENT carrier ($\mu_L\in\{1,2,3\}$: transverse ζ fits, $\Sigma^B$,
-> the finite-q $\alpha^i$ vertex) may instead be lifted with
-> $\psi_S=\tfrac{\alpha_{\rm FS}}{2}\,\sigma\!\cdot\!v\,\psi_L$,
-> $v = p + i[V_{\rm NL}, r] = p + \partial V_{\rm NL}/\partial k$ (Hartree units;
-> the code adds $\tfrac{\alpha}{4}\sum_a\sigma^a(\partial V^{\rm Ry}_{\rm NL}/\partial k_a)\psi_L$
-> to the $\sigma\!\cdot\!p$ term), deck key `bispinor_current_balance = velocity`.
-> Then at $q=0$, $\tfrac{2}{\alpha}\langle m|\alpha^i|n\rangle
-> = \langle m|v^{\rm Ry}_i|n\rangle + \tfrac{i}{2}\epsilon_{ijk}\langle m|[\sigma^k, \partial_j V_{\rm NL}]|n\rangle$:
-> the current vertex is the pseudo-Hamiltonian's velocity at first order,
-> which the $\sigma\!\cdot\!p$ lift misses by exactly $\partial V_{\rm NL}/\partial k$
-> (the "gauged nonlocal-pseudopotential track" the static head gate names).
-> The commutator term survives only through the j-resolved (spin-orbit)
-> part of $V_{\rm NL}$.  Both channels are the existing $\tilde\gamma$-bilinears
-> on different 4-spinors, so nothing in the ζ/Σ machinery changes; the
-> transverse ζ stamp and the finite-q `dipole.h5` carry the lift.  Owner:
-> `common/bispinor_init.lift_to_4spinor(representation="velocity")`,
-> provider `psp/vnl_ops.nonlocal_velocity_lift`, resolver
-> `common/four_current_model.resolve_four_current_representation(current_lift=)`.
+> SPATIAL-CURRENT carriers ($\mu_L\in\{1,2,3\}$: transverse ζ fits, $\Sigma^B$,
+> the packed current blocks, the finite-q $\alpha^i$ vertex) may instead be
+> lifted ONE CARRIER PER CHANNEL $a$,
+> $\psi_S^{(a)}=\tfrac{\alpha_{\rm FS}}{4}\big[\sigma\!\cdot\!(2(k+G)+\partial V^{\rm Ry}_{\rm SR}/\partial k)
+> + \sigma^a\,\partial V^{\rm Ry}_{\rm SO}/\partial k_a\big]\psi_L$,
+> deck key `bispinor_current_balance = velocity`, with $V_{\rm NL}=V_{\rm SR}+V_{\rm SO}$
+> the j-averaged and spin-orbit parts.  Because $[\sigma, V_{\rm SR}]=0$ the
+> spin-scalar velocity may sit inside the $\sigma$ sandwich
+> ($\sigma^a\sigma^b V_b + V_b\sigma^b\sigma^a = 2V_a$), and because
+> $\sigma^a\sigma^a=1$ the spin-orbit part behind $\sigma^a$ alone returns
+> $\psi_L^\dagger\,\partial_a V_{\rm SO}\,\psi_L+{\rm h.c.}$ exactly, so at $q=0$
+> $\tfrac{2}{\alpha}\langle m|\alpha^a|n\rangle^{(a)} = \langle m|2(k+G)_a+\partial_a V_{\rm NL}|n\rangle$:
+> the pseudo-Hamiltonian's velocity including spin-orbit, plus the Gordon spin
+> current at finite $q$.  A single $\sigma\!\cdot\!v$ carrier would add
+> $\tfrac{i}{2}\epsilon_{abc}\langle[\sigma^c,\partial_b V_{\rm SO}]\rangle$, measured
+> at 20% of $|\partial V_{\rm NL}/\partial k|$ on MoS2 with j-resolved projectors;
+> no single four-spinor lift can remove it (the sandwich map has 8 real
+> degrees of freedom against the 12 a spin-matrix-valued velocity needs), the
+> per-channel carriers do.  Endpoint rule: every $G$ endpoint and $\Sigma$
+> bra/ket for label $a$ is drawn from carrier $a$
+> (`gw.wavefunction_bundle.LorentzCarriers`); the transverse samples triple,
+> the spinor width stays four, and the $\tilde\gamma$-bilinear machinery is
+> untouched.  Owners: `common/bispinor_init.lift_to_4spinor(representation=
+> "velocity_a")`, provider `psp/vnl_ops.nonlocal_velocity_lift(setup)(...,
+> channel=a)` with `spin_orbit_split_E`, resolver
+> `common/four_current_model.resolve_four_current_representation(current_lift=)`
+> and its `current_lift_for(mu_L)`.  The static-gauge Hall producer already
+> builds the same exact current differently ($\sigma\!\cdot\!p$ carrier plus the
+> explicit ICL projector jet in the large sector) and refuses a velocity
+> carrier.
 > Not yet: the $i[\Sigma^{GW}, r]$ piece (self-consistency-dependent), and the
 > exact Hartree/SC density rebuild still shares one carrier (kept on
 > $\sigma\!\cdot\!p$; see `docs/architecture/four_current_wiring.md`).

@@ -1095,7 +1095,19 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     isometric_lift = lift_mode == ISOMETRIC_KINETIC_BALANCE_LIFT
     if lift_mode not in (
             RAW_KINETIC_BALANCE_LIFT, ISOMETRIC_KINETIC_BALANCE_LIFT):
-        raise AssertionError("kinetic-balance lift owner admitted a bad mode")
+        # This operator adds the projector current EXPLICITLY, as the ICL
+        # jet (alpha/2) dV_NL/dk psi_L in the large sector; its four-spinor
+        # input must therefore carry the sigma.p small component only.  A
+        # velocity-balance carrier already holds dV_NL/dk inside psi_S and
+        # would count it twice.  The two constructions agree on the
+        # Hamiltonian's velocity; this one is the exact Pauli current with
+        # no spin sandwich, the other is the ISDF pair-density carrier.
+        raise ValueError(
+            "GATE uniform_gauge_operator_lift: kinetic_balance_lift="
+            f"{lift_mode!r} is refused here.  This operator adds the "
+            "explicit projector jet to a sigma.p (or isometric) carrier; a "
+            "velocity-balance carrier would double count dV_NL/dk.  Load "
+            "the scalar-head (charge) carrier for the static-gauge sweep.")
     B = jnp.asarray(B_host, dtype=jnp.float64)
 
     def op(psi_n, gvec, gmask, bidx, kvec):

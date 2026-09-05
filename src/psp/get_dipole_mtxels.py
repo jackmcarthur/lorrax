@@ -160,7 +160,9 @@ def compute_block_direct_cnk(*args, **kwargs):
 @functools.partial(jax.jit, static_argnames=('selected_dirac_current',))
 def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
                                 map_arr, mask, *,
-                                selected_dirac_current=False):
+                                selected_dirac_current=False,
+                                alpha_bra_channels=None,
+                                alpha_ket_channels=None):
     """Symmetric-velocity cell overlap on G-sphere with umklapp lookup.
 
     All inputs in the canonical-kmq / k G-sphere layouts:
@@ -183,7 +185,11 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
                  v_R = ⟨bra | (kin + VNL(k))|ket⟩       — bra unchanged
                  v_L = ⟨(kin + VNL(k_can_kmq))|bra⟩† |ket⟩
     alpha_mn : (3, nc, nv) complex128 or None — exact selected
-                 ⟨bra|alpha_i|ket⟩ on the same four-spinor coefficients.
+                 ⟨bra|alpha_i|ket⟩ on the same four-spinor coefficients,
+                 or, when ``alpha_bra_channels``/``alpha_ket_channels``
+                 (3-tuples of ``(nc, 4, nG_can)`` / ``(nv, 4, nG_k)``) are
+                 given, on channel i's OWN carrier at both endpoints (the
+                 per-channel velocity balance; endpoint rule).
     """
     # Bra aligned to ket's G-axis: (nc, ns, nG_k).
     bra_aligned = jnp.take(c_can_m, map_arr, axis=-1)
@@ -212,9 +218,16 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
         alpha_channels = []
         for mu in (1, 2, 3):
             perm, phase = gamma_perm_phase(mu)
-            alpha_ket = gamma_apply(c_n_k, perm, phase, axis=1)
+            if alpha_ket_channels is None:
+                bra_mu, ket_mu = bra_aligned, c_n_k
+            else:
+                ket_mu = alpha_ket_channels[mu - 1]
+                bra_mu = jnp.take(alpha_bra_channels[mu - 1], map_arr, axis=-1)
+                bra_mu = jnp.where(mask[None, None, :], bra_mu,
+                                   jnp.zeros((), dtype=bra_mu.dtype))
+            alpha_ket = gamma_apply(ket_mu, perm, phase, axis=1)
             alpha_channels.append(jnp.einsum(
-                'msG,nsG->mn', jnp.conj(bra_aligned), alpha_ket,
+                'msG,nsG->mn', jnp.conj(bra_mu), alpha_ket,
                 optimize=True))
         alpha_mn = jnp.stack(alpha_channels, axis=0)
     return rho_mn, v_sym, alpha_mn
@@ -229,16 +242,18 @@ def compute_finite_q_mtxels(
     nv_block: int,
     nc_block: int,
     vnl_velocity_sign: float = VNL_VELOCITY_SIGN_SHIPPED,
-    bispinor_lift: str = "raw",
+    alpha_lifts: tuple[str, str, str] | None = None,
     progress_fn=None,
     diagnostic_fn=None,
 ):
     """Driver: produce symmetric finite-q matrix elements on G-sphere.
 
-    ``bispinor_lift`` is the SPATIAL-CURRENT carrier's lift
-    (``resolve_four_current_representation(...).current_lift``): the
-    ``alpha_cvkq`` vertex is a current, so it takes the current carrier,
-    while the q=0 dipole/head producer keeps the scalar-head (charge) one.
+    ``alpha_lifts`` are the three SPATIAL-CURRENT carrier lifts
+    (``resolve_four_current_representation(...).current_lift_for(a)``): the
+    ``alpha_cvkq`` vertex is a current, so channel a takes carrier a at both
+    endpoints, while ``rho_cvkq``/``v_cvkq`` and the q=0 dipole/head producer
+    keep the scalar-head (sigma.p) carrier.  ``None`` (or three ``"raw"``)
+    reproduces the one-carrier arithmetic byte for byte.
 
     Returns numpy arrays:
       rho_cvkq[nc, nv, nk, nq] complex128  — ⟨u_{c, k-q} | u_{v, k}⟩_cell
@@ -320,6 +335,18 @@ def compute_finite_q_mtxels(
     vket_c_per_k = []     # (3, nc, ns, ngkmax)  each
     psi_v_per_k  = []     # (nv, ns, ngkmax)
     psi_c_per_k  = []     # (nc, ns, ngkmax)
+    # Per-channel alpha carriers (velocity balance): channel a's ket and
+    # bra four-spinors, lifted from ONE two-spinor read per k through
+    # ``WfnLoader.lift``.  Empty when every channel rides the sigma.p
+    # carrier already held in psi_v_per_k/psi_c_per_k.
+    _alpha_lifts = tuple(str(l).strip().lower() for l in (alpha_lifts or ()))
+    per_channel_alpha = bool(bispinor) and any(
+        l != "raw" for l in _alpha_lifts)
+    alpha_v_per_k = [[] for _ in range(3)]   # channel -> list over k
+    alpha_c_per_k = [[] for _ in range(3)]
+    if per_channel_alpha:
+        from common.wfn_transforms import to_box
+        from common.collectives import single_device_mesh as process_local_mesh
     prep_progress = LoopProgress(
         nk_full, progress_fn or (lambda _line: None),
         title="finite-q velocity preparation", item_name="full-BZ k point",
@@ -333,8 +360,7 @@ def compute_finite_q_mtxels(
         # previous route indexed a resident (nk, nb, ns, nx, ny, nz)
         # array, i.e. it held EVERY k's box for the whole call.
         psi_k = load_kpoint_fftbox_local(wfn, meta, ik, int(nb),
-                                         bispinor=bool(bispinor),
-                                         bispinor_lift=bispinor_lift)
+                                         bispinor=bool(bispinor))
         # Gather FFT-box layout → G-sphere coeffs at this k's integer G-list.
         # The mask zeroes the pad columns, which is what makes the finite,
         # K=kvec values of Z/dZ on those columns inert downstream.
@@ -344,6 +370,20 @@ def compute_finite_q_mtxels(
         psi_c = psi_k_G[c_lo:c_hi]
         psi_v_per_k.append(psi_v)
         psi_c_per_k.append(psi_c)
+        if per_channel_alpha:
+            psi2_k = wfn.load_process_local(bands=(0, int(nb)), k=[ik])
+            lifted = {}
+            for a, lift in enumerate(_alpha_lifts):
+                if lift not in lifted:
+                    psi4 = wfn.lift(psi2_k, k=[ik], bispinor_lift=lift)
+                    box = to_box(psi4, wfn.box_index(k=[ik]),
+                                 tuple(int(s) for s in meta.fft_grid),
+                                 mesh=process_local_mesh())
+                    lifted[lift] = gather_psi_G_from_crys(box, Gk_int, g_mask)
+                    del box
+                alpha_v_per_k[a].append(lifted[lift][v_lo:n_occ])
+                alpha_c_per_k[a].append(lifted[lift][c_lo:c_hi])
+            del psi2_k, lifted
 
         # Kinetic apply (Rydberg p = 2(k+G)).
         v_kin_v = apply_kinetic_velocity_to_ket(psi_v, Gk_int, kvec, bvec_blat)
@@ -424,6 +464,12 @@ def compute_finite_q_mtxels(
                 vket_v_per_k[ik],  vket_c_per_k[ikmq],
                 map_arr_j, mask_j,
                 selected_dirac_current=bool(bispinor),
+                alpha_bra_channels=(
+                    tuple(alpha_c_per_k[a][ikmq] for a in range(3))
+                    if per_channel_alpha else None),
+                alpha_ket_channels=(
+                    tuple(alpha_v_per_k[a][ik] for a in range(3))
+                    if per_channel_alpha else None),
             )
             rho_cvkq[:, :, ik, jq] = np.asarray(rho_mn)
             v_cvkq[:, :, :, ik, jq] = np.asarray(v_sym)
@@ -1244,12 +1290,14 @@ def main(argv=None):
 		compute_transfer_q2=False,
 	)
 	if current_lift == "velocity":
-		# The finite-q alpha vertex lifts its four-spinors with sigma.v; the
-		# same projector setup that supplies the dipole's dV_NL/dk supplies
-		# the loader's small-component velocity.
+		# The finite-q alpha vertex lifts channel a's four-spinors with the
+		# per-channel velocity balance; the same projector setup that
+		# supplies the dipole's dV_NL/dk supplies the loader's small
+		# components.
 		wfn.nonlocal_velocity_lift = vnl_ops.nonlocal_velocity_lift(vnl_setup)
-		print("  finite-q alpha vertex: spatial-current carrier lifted with "
-		      "sigma.v, v = p + dV_NL/dk (bispinor_current_balance = velocity)")
+		print("  finite-q alpha vertex: one spatial-current carrier per "
+		      "channel, psi_S^(a) = (alpha/4)[sigma.(2(k+G)+dV_SR/dk) + "
+		      "sigma^a dV_SO/dk_a] psi_L (bispinor_current_balance = velocity)")
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
 		"Output writer  : rank-zero artifact writer after a bounded owner gather",
@@ -1293,9 +1341,14 @@ def main(argv=None):
 	if args.static_gauge_hall_only:
 		from gw.qsgw_head import static_gauge_hall_transaction
 
+		# The static-gauge operator adds the projector current itself (the
+		# ICL jet), so it takes the scalar-head (sigma.p) carrier, named
+		# here from the resolver and handed to the sweep, which refuses any
+		# velocity-balance lift (common.mtxel_sweep.uniform_gauge_operator).
+		_head_lift = representation.charge_lift or "raw"
 		psi_G = wfn.load(
 			bands=(0, nb), k="full_bz", sharding=band_sphere_spec(),
-			bispinor=True)
+			bispinor=True, bispinor_lift=_head_lift)
 		geom = SweepGeometry(
 			mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
 			ngkmax=int(psi_G.shape[3]), nb=nb, ns=int(psi_G.shape[2]),
@@ -1306,7 +1359,8 @@ def main(argv=None):
 				bvec=wfn.bvec, blat=wfn.blat, vnl_setup=vnl_setup,
 				gvecs=gtab.gvecs, gmask=gtab.mask,
 				box_index=wfn.box_index(k="full_bz"),
-				kvecs=np.asarray(gtab.kvecs))
+				kvecs=np.asarray(gtab.kvecs),
+				kinetic_balance_lift=_head_lift)
 		with timing.section("static_gauge_hall_reduce"):
 			hall = static_gauge_hall_transaction(
 				uniform_gauge, wfn=wfn, sym=sym, band_start=0,
@@ -1710,7 +1764,9 @@ def main(argv=None):
 				nv_block=int(nval),
 				nc_block=int(ncond),
 				vnl_velocity_sign=vnl_velocity_sign,
-				bispinor_lift=current_lift,
+				alpha_lifts=tuple(
+					representation.current_lift_for(a) or "raw"
+					for a in (1, 2, 3)),
 				progress_fn=report.progress,
 				diagnostic_fn=debug_print if debug else None,
 			)

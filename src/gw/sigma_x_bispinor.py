@@ -60,6 +60,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .v_q_bispinor import BispinorVqReader
 from .wavefunction_bundle import (
+    as_lorentz_carriers, endpoint_bundles,
     bundle_bytes_per_rank,
     face_kernel_kwargs,
     padded_centroid_extent,
@@ -134,6 +135,7 @@ def compute_sigma_x_bispinor(
     """
     from .cohsex_sigma import _make_cohsex_kernels
     nk_tot = int(meta.nk_tot)
+    carriers = as_lorentz_carriers(wfns_transverse)
     # layout dispatch: face_kernel_kwargs(wfns_transverse) is {} under
     # layout='legacy' (dead-code-eliminated at trace time, byte-identical
     # to the pre-2026-08-23 unconditional call) and {"layout": "face",
@@ -188,22 +190,23 @@ def compute_sigma_x_bispinor(
 ) as reader:
         for i in _TRANSVERSE_INDICES:
             for j in _TRANSVERSE_INDICES:
-                wfns_ij = with_lorentz_vertices(wfns_transverse, i, j)
+                # ENDPOINT RULE: the G-build's direct operand and the
+                # projection bra come from the label-i carrier, the
+                # conjugated operand and the ket from the label-j carrier.
+                # With one shared carrier this is the historical
+                # ``with_lorentz_vertices(wfns, i, j)`` byte for byte; with
+                # per-channel velocity carriers it is what keeps
+                # Sigma^{ij} = (Sigma^{ji})^dagger.  Face's two-array carrier
+                # serves BOTH the G-build and the outer projection, hence
+                # ``sigma_sx``'s ``wfns_g=`` (gw.cohsex_sigma.
+                # _make_cohsex_kernels_face's own docstring).
+                proj_ij, g_ij = endpoint_bundles(
+                    carriers.channel(i), carriers.channel(j), i, j)
                 V_ij = _pad_V_to_padded(reader.get_tile(i, j))
-                if wfns_transverse.layout == "face":
-                    # Face's two-array carrier serves BOTH the G-build's
-                    # internal band sum AND the outer projection bra/ket
-                    # (unlike legacy's four independent fields) — the
-                    # G-build must read the γ̃-inserted operands
-                    # (``wfns_ij``) while projection reads the ORIGINAL,
-                    # un-rotated ones (``wfns_transverse``).
-                    # ``sigma_sx``'s ``wfns_g=`` parameter exists
-                    # precisely for this (gw.cohsex_sigma.
-                    # _make_cohsex_kernels_face's own docstring).
-                    contrib = sigma_sx_k(
-                        wfns_transverse, Gij, V_ij, wfns_g=wfns_ij)
+                if carriers.layout == "face":
+                    contrib = sigma_sx_k(proj_ij, Gij, V_ij, wfns_g=g_ij)
                 else:
-                    contrib = sigma_sx_k(wfns_ij, Gij, V_ij)
+                    contrib = sigma_sx_k(proj_ij, Gij, V_ij)
                 contrib.block_until_ready()
                 # Per-tile diagonal trace (eV) for diagnostic comparison
                 # against agent-B's MoS2 reference values (commit 69e8863).

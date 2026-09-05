@@ -1951,8 +1951,14 @@ def compute_experimental_no_pair_photon_chi0(
             f"bundles: layout C/T=({layout.padded_extent(0)},"
             f"{layout.padded_extent(1)}), wfns C/T=({n_c},{n_t})")
     nq = int(meta.nk_tot)
-    families = (wfns_charge, wfns_transverse,
-                wfns_transverse, wfns_transverse)
+    # ENDPOINT RULE: block (A, B) draws its left Green's-function endpoint
+    # from the label-A carrier and its right endpoint from the label-B
+    # carrier.  Under the shipped sigma.p lift the three transverse labels
+    # are one bundle; under the per-channel velocity balance they differ.
+    from .wavefunction_bundle import as_lorentz_carriers
+    carriers = as_lorentz_carriers(wfns_transverse)
+    families = (wfns_charge, carriers.channel(1),
+                carriers.channel(2), carriers.channel(3))
 
     def get_block(A, B):
         chi_ab = compute_no_pair_dirac_current_block(
@@ -1991,13 +1997,6 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
-    #: The charge zeta identity receipt the caller bound (gw_jax passes
-    #: ``isdf.charge_zeta_identity``, the same digest the MPA/tagged-array
-    #: stores authenticate against).  Carried, not consumed here: the packed
-    #: body owns no store of its own yet.  It was passed by the caller since
-    #: 684c1903 but never accepted, which refused every full_static_cohsex
-    #: deck at the screening stage with a TypeError.
-    charge_zeta_identity: object | None = None
 
 
 def _load_static_photon_hall(
@@ -2094,7 +2093,6 @@ def compute_static_photon_response(
     wf_binding_charge=None,
     wf_binding_transverse=None,
     wfn_fingerprint_binding=None,
-    charge_zeta_identity=None,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
     dyson_solver: str = "distributed",
@@ -2267,9 +2265,18 @@ def compute_static_photon_response(
         n_packed = int(layout.packed_extent)
         n_ranks = max(int(jax.process_count()), 1)
         body_bytes = 16.0 * int(meta.nk_tot) * n_packed * n_packed / n_ranks
+        from common.bispinor_init import kinetic_balance_lift_provenance
+        from common.four_current_model import (
+            resolve_four_current_representation)
+        _rep = resolve_four_current_representation(
+            bool(getattr(config, "bispinor", True)),
+            getattr(config, "bispinor_gw", None),
+            current_lift=getattr(config, "bispinor_current_lift", None))
         print_fn(
-            "  [photon response] DECLARED no-pair model "
-            "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
+            "  [photon response] DECLARED no-pair model: charge carrier "
+            f"{kinetic_balance_lift_provenance(_rep.charge_lift or 'raw')}; "
+            "current carrier "
+            f"{kinetic_balance_lift_provenance(_rep.current_lift or 'raw')}; "
             "j=c*Psi^dagger*alpha*Psi; "
             + ("bubble-screened Breit; "
                f"current_contact={current_contact}; "
@@ -2426,7 +2433,6 @@ def compute_static_photon_response(
             current_contact=current_contact,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
-            charge_zeta_identity=charge_zeta_identity,
             approximation=(
                 "gamma_completed_no_pair_static_photon_v1"
                 if coupled_head
@@ -2437,7 +2443,6 @@ def compute_static_photon_response(
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
-        charge_zeta_identity=charge_zeta_identity,
         approximation=(
             "gamma_completed_bare_transverse_photon_v1"
             if coupled_head

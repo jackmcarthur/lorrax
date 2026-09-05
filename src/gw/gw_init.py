@@ -849,38 +849,111 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw,
 		current_lift=cfg.bispinor_current_lift)
-	with timing.section("gw_jax.load_centroid_wfns_current"):
-		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
-			wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
-			band_range=band_slices.full_range,
-			band_chunk_size=int(band_chunk_size),
-			k_chunk_size=k_chunk_size,
-			bispinor_lift=representation.current_lift,
-		)
-	psi_mun_fresh_T = None
-	psi_nmu_fresh_T = None
-	if cfg.memory.low_mem_bands:
-		from jax.sharding import NamedSharding
-		from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
-		with mesh_xy:
-			psi_nmu_fresh_T = jax.lax.with_sharding_constraint(
-				psi_curr_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
-			psi_mun_fresh_T = jax.lax.with_sharding_constraint(
-				jnp.conj(psi_curr_rmuT_X).transpose(0, 3, 1, 2),
-				NamedSharding(mesh_xy, PSI_MUN_SPEC))
-		del psi_curr_rmu_Y, psi_curr_rmuT_X
-		psi_curr_rmu_Y = None
-		psi_curr_rmuT_X = None
+	# ONE sample set per DISTINCT carrier.  Under the shipped sigma.p lift
+	# the three Lorentz labels share one carrier (one load, as before);
+	# under the per-channel velocity balance each label has its own lift
+	# and its own sample set (three loads of the same window).
+	# ponytail: three WFN passes; lift once per carrier from one
+	# two-spinor pass through WfnLoader.lift when the transverse sampling
+	# cost shows on a production deck.
+	lifts = tuple(representation.current_lift_for(a) or "raw"
+	              for a in (1, 2, 3))
+	samples_by_lift = {}
+	for lift in lifts:
+		if lift in samples_by_lift:
+			continue
+		with timing.section("gw_jax.load_centroid_wfns_current"):
+			psi_Y, psi_X = load_centroids_band_chunked(
+				wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
+				band_range=band_slices.full_range,
+				band_chunk_size=int(band_chunk_size),
+				k_chunk_size=k_chunk_size,
+				bispinor_lift=lift,
+			)
+		psi_mun = None
+		psi_nmu = None
+		if cfg.memory.low_mem_bands:
+			from jax.sharding import NamedSharding
+			from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+			with mesh_xy:
+				psi_nmu = jax.lax.with_sharding_constraint(
+					psi_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+				psi_mun = jax.lax.with_sharding_constraint(
+					jnp.conj(psi_X).transpose(0, 3, 1, 2),
+					NamedSharding(mesh_xy, PSI_MUN_SPEC))
+			del psi_Y, psi_X
+			psi_Y = None
+			psi_X = None
+		samples_by_lift[lift] = {
+			'psi_rmu_Y':     psi_Y,
+			'psi_rmuT_X':    psi_X,
+			'psi_mun_fresh': psi_mun,
+			'psi_nmu_fresh': psi_nmu,
+			'bispinor_lift': lift,
+		}
+	channels = tuple(samples_by_lift[lift] for lift in lifts)
+	one_carrier = len(samples_by_lift) == 1
 	# Keeping these arrays alive across the return is intentional —
 	# they are the only way the σ^B kernel can sample ψ at r_{μ_T}.
-	return {
-		'psi_rmu_Y':        psi_curr_rmu_Y,
-		'psi_rmuT_X':       psi_curr_rmuT_X,
+	# The four psi keys at the top level exist ONLY for one shared carrier
+	# (byte-identical to the historical dict); with three carriers a reader
+	# that forgot to ask for its channel gets a KeyError, not channel 1.
+	out = {
 		'meta':             meta_T,
 		'centroid_indices': cent_T_idx,
-		'psi_mun_fresh':    psi_mun_fresh_T,
-		'psi_nmu_fresh':    psi_nmu_fresh_T,
+		'channels':         channels,
+		'lifts':            lifts,
+		'one_carrier':      one_carrier,
 	}
+	if one_carrier:
+		out.update({k: channels[0][k] for k in (
+			'psi_rmu_Y', 'psi_rmuT_X', 'psi_mun_fresh', 'psi_nmu_fresh')})
+	return out
+
+
+def _first_channel(x):
+	"""Channel 1 of a per-channel tuple, or the array itself."""
+	return x[0] if isinstance(x, tuple) else x
+
+
+def _transverse_field_channels(carriers, field: str):
+	"""``field`` of each transverse carrier, as one array (shared carrier,
+	byte-identical restart schema) or a 3-tuple (per-channel carriers)."""
+	from .wavefunction_bundle import as_lorentz_carriers
+	carriers = as_lorentz_carriers(carriers)
+	if carriers.one_carrier:
+		return getattr(carriers.channel(1), field)
+	return tuple(getattr(carriers.channel(a), field) for a in (1, 2, 3))
+
+
+def _transverse_carriers_from_restart(first, second, build_one):
+	"""Rebuild the σ^B carriers from restart arrays (each an array for one
+	shared carrier or a 3-tuple for per-channel carriers)."""
+	from .wavefunction_bundle import LorentzCarriers
+	if not isinstance(first, tuple):
+		return LorentzCarriers.shared(build_one(first, second))
+	return LorentzCarriers(tuple(
+		build_one(first[a], second[a] if isinstance(second, tuple) else second)
+		for a in range(3)))
+
+
+def _transverse_carriers_from_samples(transverse_wfn_data, build_one):
+	"""Build the σ^B-side carriers, one bundle per DISTINCT sample set.
+
+	``build_one(sample_dict) -> Wavefunctions``.  Channels sharing a
+	sample set share the bundle object, so the shipped one-carrier case
+	builds exactly one bundle (as before) and ``LorentzCarriers.one_carrier``
+	is True.
+	"""
+	from .wavefunction_bundle import LorentzCarriers
+	built = {}
+	out = []
+	for ch in transverse_wfn_data['channels']:
+		key = id(ch)
+		if key not in built:
+			built[key] = build_one(ch)
+		out.append(built[key])
+	return LorentzCarriers(tuple(out))
 
 
 def resolve_zeta_fit_edge(band_slices, zeta_nband):
@@ -2452,8 +2525,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				_chunks_T['centroid_k_chunk']
 				if _chunks_T is not None
 				else zeta_contract.loader_k_chunk))
-		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
-		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
+		# Per-channel sample sets: ``_fit_transverse_channel`` reads
+		# ``transverse_wfn_data['channels'][mu_L - 1]`` (one shared set under
+		# the sigma.p lift, three under the velocity balance).
 
 		# low_mem_bands = true: _transverse_wfn_data already converted
 		# psi_curr_rmu_Y/psi_curr_rmuT_X to the two-face carrier internally
@@ -2462,10 +2536,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# conversion so this branch and the ζ-reuse early return
 		# (gw_init.fit_zeta's own "REUSING the existing ζ" path, which
 		# also calls _transverse_wfn_data) get an identically-built face
-		# carrier rather than each converting it their own way.  Just
-		# read the two fields back out here.
-		psi_mun_fresh_T = transverse_wfn_data['psi_mun_fresh']
-		psi_nmu_fresh_T = transverse_wfn_data['psi_nmu_fresh']
+		# carrier rather than each converting it their own way.
 		if cfg.memory.low_mem_bands:
 			print_fn("  [bispinor] ψ_T face conversion (low_mem_bands): "
 			         "psi_nmu_T/psi_mun_T built from the transverse "
@@ -2508,7 +2579,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				print_fn(f"  [zeta reuse] μ_L={mu_L} accepted at "
 				         f"{zeta_mu_path}; fit skipped independently.")
 				return
-			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
+			# ENDPOINT RULE at the fit: channel mu_L's zeta is fit to pair
+			# densities of channel mu_L's carrier (both endpoints).
+			_ch_T = transverse_wfn_data['channels'][mu_L - 1]
+			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path} "
+			         f"(carrier lift {_ch_T['bispinor_lift']!r})")
 			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
 			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
 				fit_zeta_to_h5(
@@ -2516,10 +2591,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					centroid_indices=cents_curr_idx,
 					mesh_xy=mesh_xy,
 					chunk_r=_chunks_T['chunk_r'], output_file=zeta_mu_path,
-					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
+					psi_rmu_Y=_ch_T['psi_rmu_Y'], psi_rmuT_X=_ch_T['psi_rmuT_X'],
 					low_mem_bands=bool(cfg.memory.low_mem_bands),
-					psi_mun_fresh=psi_mun_fresh_T,
-					psi_nmu_fresh=psi_nmu_fresh_T,
+					psi_mun_fresh=_ch_T['psi_mun_fresh'],
+					psi_nmu_fresh=_ch_T['psi_nmu_fresh'],
 					band_chunk_size=_chunks_T['band_chunk'],
 					q_chunk_size=_chunks_T['q_chunk'],
 					bispinor=True,
@@ -2540,7 +2615,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					face_y_cache_r_tile=int(
 						_chunks_T.get('face_y_cache_r_tile', 0)),
 					vertex_mu_L=mu_L,
-					bispinor_lift=(representation.current_lift or "raw"),
+					bispinor_lift=(representation.current_lift_for(mu_L)
+					               or "raw"),
 					# Transverse ζ IBZ-write activates whenever the
 					# bispinor V_q orchestrator iterates IBZ q's — same
 					# gate the charge ζ uses (LORRAX_FORCE_FULL_BZ off),
@@ -3554,16 +3630,17 @@ def prepare_isdf_and_wavefunctions(
 				# exactly what the legacy branch below does too).
 				if transverse_wfn_data is not None:
 					with timing.section("gw_jax.wavefunction_setup"):
-						wfns_transverse = wavefunctions_face_from_restart(
-							transverse_wfn_data['psi_nmu_fresh'],
-							transverse_wfn_data['psi_mun_fresh'],
-							enk_full=_enk_full_face,
-							slices=band_slices, mesh_xy=mesh_xy,
-							basis_receipt=transverse_basis_receipt)
+						wfns_transverse = _transverse_carriers_from_samples(
+							transverse_wfn_data,
+							lambda ch: wavefunctions_face_from_restart(
+								ch['psi_nmu_fresh'], ch['psi_mun_fresh'],
+								enk_full=_enk_full_face,
+								slices=band_slices, mesh_xy=mesh_xy,
+								basis_receipt=transverse_basis_receipt))
 					print0(f"  [bispinor] σ^B-side Wfns built on "
 					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
 					       f"transverse centroids (face layout; "
-					       f"low_mem_bands=true)")
+					       f"low_mem_bands=true; {wfns_transverse!r})")
 
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
@@ -3673,17 +3750,19 @@ def prepare_isdf_and_wavefunctions(
 					# r_{μ_T} without re-reading WFN.h5.
 					wfns_transverse = None
 					if transverse_wfn_data is not None:
-						wfns_transverse = build_wavefunction_bundle(
-							wfn, sym,
-							transverse_wfn_data['meta'],
-							band_slices, mesh_xy,
-							psi_rmu_Y=transverse_wfn_data['psi_rmu_Y'],
-							psi_rmuT_X=transverse_wfn_data['psi_rmuT_X'],
-							basis_receipt=transverse_basis_receipt,
-							enk_full=enk_full, print_fn=print0)
+						wfns_transverse = _transverse_carriers_from_samples(
+							transverse_wfn_data,
+							lambda ch: build_wavefunction_bundle(
+								wfn, sym,
+								transverse_wfn_data['meta'],
+								band_slices, mesh_xy,
+								psi_rmu_Y=ch['psi_rmu_Y'],
+								psi_rmuT_X=ch['psi_rmuT_X'],
+								basis_receipt=transverse_basis_receipt,
+								enk_full=enk_full, print_fn=print0))
 						print0(f"  [bispinor] σ^B-side Wfns built on "
 						       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
-						       f"transverse centroids")
+						       f"transverse centroids ({wfns_transverse!r})")
 
 			# Append ψ to the now-open restart file.  Bispinor: also the
 			# σ^B-side transverse-centroid ψ (per-channel second dataset),
@@ -3724,14 +3803,19 @@ def prepare_isdf_and_wavefunctions(
 						psi_full_y_mun=wfns.psi_mun,
 						mesh=mesh_xy, mode="a",
 						psi_full_y_transverse=(
-							wfns_transverse.psi_nmu
+							_transverse_field_channels(
+								wfns_transverse, 'psi_nmu')
 							if wfns_transverse is not None else None),
 						psi_full_y_transverse_mun=(
-							wfns_transverse.psi_mun
+							_transverse_field_channels(
+								wfns_transverse, 'psi_mun')
 							if wfns_transverse is not None else None),
 						n_rmu_transverse_logical=(
 							int(transverse_wfn_data['meta'].n_rmu)
 							if transverse_wfn_data is not None else None),
+						transverse_lift_family=(
+							representation.current_lift
+							if wfns_transverse is not None else None),
 					)
 				else:
 					write_restart_state_to_h5(
@@ -3740,11 +3824,15 @@ def prepare_isdf_and_wavefunctions(
 						psi_full_y=wfns.psi_yr, mesh=mesh_xy,
 						mode="a",
 						psi_full_y_transverse=(
-							wfns_transverse.psi_yr
+							_transverse_field_channels(
+								wfns_transverse, 'psi_yr')
 							if wfns_transverse is not None else None),
 						n_rmu_transverse_logical=(
 							int(transverse_wfn_data['meta'].n_rmu)
 							if transverse_wfn_data is not None else None),
+						transverse_lift_family=(
+							representation.current_lift
+							if wfns_transverse is not None else None),
 					)
 				# Stamp the centroid tables' CONTENT hashes so a restart
 				# can verify the quadrature points, not just their counts
@@ -3994,9 +4082,25 @@ def prepare_isdf_and_wavefunctions(
 				_have_t = _stamped.get('centroids_transverse_md5')
 				transverse_basis_receipt = None
 				_n_rmu_T_padded = (
-					int(rs.psi_nmu_transverse.shape[-1])
+					int(_first_channel(rs.psi_nmu_transverse).shape[-1])
 					if cfg.memory.low_mem_bands else
-					int(rs.psi_rmu_Y_transverse.shape[-1]))
+					int(_first_channel(rs.psi_rmu_Y_transverse).shape[-1]))
+				# The stored transverse carriers must be the run's: a file
+				# written under the sigma.p lift holds one carrier and a
+				# velocity run needs three (with dV_NL/dk inside psi_S), and
+				# vice versa.  A legacy file carries no stamp and IS the
+				# sigma.p arm.
+				_stored_family = getattr(rs, 'transverse_lift_family', None)
+				_want_family = representation.current_lift or "raw"
+				if (_stored_family or "raw") != _want_family:
+					raise ValueError(
+						"GATE bispinor_restart_transverse_carrier: "
+						f"{tensors_filename} stores the transverse ψ for the "
+						f"{(_stored_family or 'raw')!r} current carrier, but "
+						f"this deck runs bispinor_current_balance = "
+						f"{('velocity' if _want_family == 'velocity' else 'kinetic')} "
+						f"({_want_family!r}).  Set restart = false to refit and "
+						f"rewrite the restart tensors under this carrier.")
 				meta_restart_transverse = replace(
 					meta, n_rmu=int(_n_rmu_curr_now),
 					n_rmu_padded=_n_rmu_T_padded, nspinor=4, npol=4)
@@ -4052,22 +4156,25 @@ def prepare_isdf_and_wavefunctions(
 					sanity.check_finite(
 						"restart transverse ψ (psi_full_y_transverse, "
 						"face)", rs.psi_nmu_transverse, print_fn=print0)
-					wfns_transverse = wavefunctions_face_from_restart(
+					wfns_transverse = _transverse_carriers_from_restart(
 						rs.psi_nmu_transverse, rs.psi_mun_transverse,
-						enk_full=rs.enk_full, slices=band_slices,
-						mesh_xy=mesh_xy,
-						basis_receipt=transverse_basis_receipt)
+						lambda nmu, mun: wavefunctions_face_from_restart(
+							nmu, mun,
+							enk_full=rs.enk_full, slices=band_slices,
+							mesh_xy=mesh_xy,
+							basis_receipt=transverse_basis_receipt))
 				else:
 					sanity.check_finite(
 						"restart transverse ψ (psi_full_y_transverse)",
 						rs.psi_rmu_Y_transverse, print_fn=print0)
-					wfns_transverse = build_wavefunction_bundle(
-						wfn, sym, meta_restart_transverse,
-						band_slices, mesh_xy,
-						psi_rmu_Y=rs.psi_rmu_Y_transverse,
-						psi_rmuT_X=rs.psi_rmuT_X_transverse,
-						basis_receipt=transverse_basis_receipt,
-						enk_full=rs.enk_full, print_fn=print0)
+					wfns_transverse = _transverse_carriers_from_restart(
+						rs.psi_rmu_Y_transverse, rs.psi_rmuT_X_transverse,
+						lambda y, x: build_wavefunction_bundle(
+							wfn, sym, meta_restart_transverse,
+							band_slices, mesh_xy,
+							psi_rmu_Y=y, psi_rmuT_X=x,
+							basis_receipt=transverse_basis_receipt,
+							enk_full=rs.enk_full, print_fn=print0))
 				print0(f"  [bispinor] σ^B-side Wfns rebuilt from restart "
 				       f"(layout="
 				       f"{'face' if cfg.memory.low_mem_bands else 'legacy'}, "

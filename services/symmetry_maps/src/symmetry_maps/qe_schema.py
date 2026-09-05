@@ -76,6 +76,10 @@ class QESymmetryReceipt:
     kgrid: np.ndarray
     kpoints_crystal: np.ndarray
     nspinor: int
+    #: QE's ``<spinorbit>`` (lspinorb).  The ONLY authoritative record of
+    #: whether the run used j-resolved projectors; ``noncolin`` does not
+    #: imply it.  ``None`` when the schema has no such element.
+    spinorbit: bool | None
     do_magnetization: bool | None
     nosym: bool
     noinv: bool
@@ -95,6 +99,10 @@ class QESymmetryBinding:
     antiunitary: np.ndarray
     qe_permitted_pure_time_reversal: bool
     equivalent_schema_paths: tuple[str, ...] = ()
+    #: ``QESymmetryReceipt.spinorbit`` of the authenticated schema, so the
+    #: WFN loader can expose it (``WfnLoader.spinorbit``) to
+    #: ``psp.vnl_ops.resolve_soc_mode`` instead of measuring.
+    spinorbit: bool | None = None
 
     @property
     def n_antiunitary(self) -> int:
@@ -149,6 +157,7 @@ def _read_qe_symmetry_receipt_cached(
     kpoints_cart_input: list[np.ndarray] = []
     kgrid: np.ndarray | None = None
     noncolin = False
+    spinorbit: bool | None = None
     do_magnetization: bool | None = None
     current_info_anti = False
     current_info_kind: str | None = None
@@ -175,6 +184,8 @@ def _read_qe_symmetry_receipt_cached(
             flags[tag] = _bool_text(elem.text)
         elif tag == "noncolin" and "band_structure" in ancestry:
             noncolin = _bool_text(elem.text)
+        elif tag == "spinorbit" and "band_structure" in ancestry:
+            spinorbit = _bool_text(elem.text)
         elif tag == "do_magnetization" and "magnetization" in ancestry:
             do_magnetization = _bool_text(elem.text)
         elif parent == "symmetries" and tag == "nsym":
@@ -286,6 +297,7 @@ def _read_qe_symmetry_receipt_cached(
         kgrid=kgrid,
         kpoints_crystal=k_crystal,
         nspinor=2 if noncolin else 1,
+        spinorbit=spinorbit,
         do_magnetization=do_magnetization,
         nosym=flags.get("nosym", False),
         noinv=flags.get("noinv", False),
@@ -375,6 +387,7 @@ def bind_qe_symmetry_receipt(wfn, receipt: QESymmetryReceipt) -> QESymmetryBindi
         antiunitary=typed,
         qe_permitted_pure_time_reversal=(
             not bool(receipt.noinv) and not magnetic_symmetry),
+        spinorbit=receipt.spinorbit,
     )
 
 
@@ -468,14 +481,11 @@ def resolve_qe_symmetry_binding(
     aliases = tuple(
         binding.schema_path for binding in bindings
         if binding.schema_path != selected.schema_path)
-    selected = QESymmetryBinding(
-        schema_path=selected.schema_path,
-        schema_sha256=selected.schema_sha256,
-        antiunitary=selected.antiunitary,
-        qe_permitted_pure_time_reversal=(
-            selected.qe_permitted_pure_time_reversal),
-        equivalent_schema_paths=aliases,
-    )
+    # Re-spelled field by field, this copy silently dropped every binding
+    # field added later (spinorbit was the first casualty); replace keeps
+    # the whole authenticated record and adds only the aliases.
+    import dataclasses as _dc
+    selected = _dc.replace(selected, equivalent_schema_paths=aliases)
     diagnostic = (
         f"authenticated {selected.schema_path} "
         f"(sha256={selected.schema_sha256[:12]}, "

@@ -526,7 +526,10 @@ class AuthenticatedWavefunctions:
     receipt: WavefunctionBasisReceipt
 
     def __post_init__(self) -> None:
-        if not isinstance(self.wavefunctions, Wavefunctions):
+        # A transverse binding names the LorentzCarriers container (one
+        # object whether the three labels share a carrier or not), so the
+        # identity check in w_isdf compares against what Sigma consumes.
+        if not isinstance(self.wavefunctions, (Wavefunctions, LorentzCarriers)):
             raise TypeError(
                 "AuthenticatedWavefunctions requires a Wavefunctions "
                 f"carrier; got {type(self.wavefunctions).__name__}")
@@ -751,6 +754,110 @@ def with_lorentz_vertices(
         return wfns
     import dataclasses
     return dataclasses.replace(wfns, **updates)
+
+
+class LorentzCarriers:
+    """The spatial-current carriers: one :class:`Wavefunctions` per Lorentz
+    label ``mu_L`` in {1, 2, 3}, on the transverse centroid set.
+
+    Under the shipped ``sigma.p`` lift the three labels ride ONE
+    four-spinor, so all three entries are the same object (no copies);
+    under the per-channel velocity balance (``common.bispinor_init``,
+    ``bispinor_current_balance = velocity``) each label has its own carrier,
+    and every Green's-function endpoint or Sigma bra/ket for label ``mu_L``
+    must be drawn from ``channel(mu_L)``.  That endpoint rule is the whole
+    of the two-carrier bookkeeping (docs/architecture/four_current_wiring.md).
+
+    Attribute reads fall through to channel 1 so extent, layout and band
+    window readers (``padded_centroid_extent``, ``.layout``, ``.slices``,
+    ``psi_inventory_bytes``) need no special case: those are properties every
+    channel shares.  A block builder that wants an endpoint asks for it.
+    """
+
+    def __init__(self, channels):
+        chans = tuple(channels)
+        if len(chans) != 3:
+            raise ValueError(
+                f"LorentzCarriers needs exactly three channel bundles; got "
+                f"{len(chans)}")
+        object.__setattr__(self, "_channels", chans)
+
+    @classmethod
+    def shared(cls, wfns: "Wavefunctions") -> "LorentzCarriers":
+        """All three labels on one bundle (the shipped sigma.p carrier)."""
+        return cls((wfns, wfns, wfns))
+
+    @property
+    def channels(self) -> tuple:
+        return self._channels
+
+    @property
+    def one_carrier(self) -> bool:
+        """True when the three labels are literally the same bundle."""
+        first = self._channels[0]
+        return all(c is first for c in self._channels)
+
+    def channel(self, mu_L: int) -> "Wavefunctions":
+        mu_L = int(mu_L)
+        if mu_L not in (1, 2, 3):
+            raise ValueError(
+                f"LorentzCarriers.channel: mu_L must be 1, 2 or 3; got {mu_L}")
+        return self._channels[mu_L - 1]
+
+    def __getattr__(self, name):
+        # Only reached for names not found on the container itself.
+        return getattr(self._channels[0], name)
+
+    def __repr__(self) -> str:
+        tag = "one carrier" if self.one_carrier else "three carriers"
+        return f"LorentzCarriers({tag}, layout={self._channels[0].layout!r})"
+
+
+def as_lorentz_carriers(wfns) -> "LorentzCarriers | None":
+    """Accept a bare bundle (shared across labels) or a LorentzCarriers."""
+    if wfns is None or isinstance(wfns, LorentzCarriers):
+        return wfns
+    return LorentzCarriers.shared(wfns)
+
+
+def endpoint_bundles(left: "Wavefunctions", right: "Wavefunctions",
+                     mu_L: int, nu_L: int):
+    """Operands for a Sigma block whose two endpoints ride different carriers.
+
+    Returns ``(proj, g)``: ``proj`` supplies the OUTER projection (bra from
+    ``left``, ket from ``right``) and ``g`` the G-build's two operands with
+    ``gamma~^{mu_L}`` folded into the direct field (from ``left``) and
+    ``gamma~^{nu_L}`` into the conjugated one (from ``right``).  Under
+    ``layout='legacy'`` the four fields are independent arrays, so ONE mixed
+    bundle serves both roles and ``g`` is ``None``; under ``layout='face'``
+    the same two arrays serve both roles and the two objects differ (this is
+    the reason ``cohsex_sigma``'s face ``sigma_sx`` has ``wfns_g``).
+
+    ``left is right`` reproduces :func:`with_lorentz_vertices` byte for
+    byte: ``(left, with_lorentz_vertices(left, mu_L, nu_L))`` on face and
+    ``(with_lorentz_vertices(left, mu_L, nu_L), None)`` on legacy.
+    """
+    import dataclasses
+    if left.layout != right.layout:
+        raise ValueError(
+            "endpoint_bundles: the two endpoint carriers must share a "
+            f"layout; got {left.layout!r} and {right.layout!r}")
+    if left.slices != right.slices:
+        raise ValueError(
+            "endpoint_bundles: the two endpoint carriers must share a band "
+            "window; their BandSlices differ")
+    if left is right:
+        g = with_lorentz_vertices(left, mu_L, nu_L)
+        return (left, g) if left.layout == "face" else (g, None)
+    left_g = with_lorentz_vertices(left, mu_L, 0)
+    right_g = with_lorentz_vertices(right, 0, nu_L)
+    if left.layout == "face":
+        proj = dataclasses.replace(left, psi_mun=right.psi_mun)
+        g = dataclasses.replace(left_g, psi_nmu=right_g.psi_nmu)
+        return proj, g
+    mixed = dataclasses.replace(
+        left_g, psi_yr=right_g.psi_yr, psi_yn=right.psi_yn)
+    return mixed, None
 
 
 def psi_field_names(layout: str) -> tuple[str, ...]:

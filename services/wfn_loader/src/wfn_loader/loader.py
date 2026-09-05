@@ -410,6 +410,26 @@ class WfnLoader:
         return self._path
 
     @property
+    def spinorbit(self):
+        """QE's ``<spinorbit>`` (lspinorb) from the authenticated schema
+        bound at symmetry initialization; ``None`` when no schema is bound
+        or it carries no such element.
+
+        ``psp.vnl_ops.resolve_soc_mode`` reads this to decide j-resolved
+        versus j-averaged projectors from DATA instead of measuring against
+        the multiplets (which refuses as UNMEASURABLE on a deck like bulk Bi,
+        whose degenerate manifolds do not discriminate).  Binding the schema
+        needs the symmetry tables, so this builds them on first use, exactly
+        as :meth:`symmetry` would.
+        """
+        if not self._qe_symmetry_checked:
+            self.symmetry()
+        binding = self.qe_symmetry_binding
+        if binding is None:
+            return None
+        return getattr(binding, "spinorbit", None)
+
+    @property
     def occupations_are_exact_integer(self) -> bool:
         """Whether the complete WFN table is exactly ``[1...1,0...0]``.
 

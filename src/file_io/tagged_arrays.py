@@ -483,6 +483,7 @@ def write_restart_state_to_h5(
     psi_full_y_transverse=None,
     psi_full_y_transverse_mun=None,
     n_rmu_transverse_logical: int | None = None,
+    transverse_lift_family: str | None = None,
     enk_full=None,
     S_qmunu=None,
     V0_noG0_munu=None,
@@ -629,6 +630,32 @@ def write_restart_state_to_h5(
     n_T = (int(n_rmu_transverse_logical)
            if n_rmu_transverse_logical is not None else None)
 
+    # Transverse ψ arrives as ONE array (the shipped sigma.p carrier shared
+    # by the three Lorentz labels — historical dataset names, byte-identical
+    # schema) or as a 3-TUPLE (one carrier per label under the velocity
+    # balance): channel 1 keeps the historical names, channels 2 and 3 get
+    # the ``_c2``/``_c3`` suffix, and the file is stamped with the carrier
+    # count and lift family so a reader cannot pair a sigma.p file with a
+    # velocity run.
+    def _channels(x):
+        if x is None:
+            return None
+        return tuple(x) if isinstance(x, (tuple, list)) else (x,)
+    _t_nmu = _channels(psi_full_y_transverse)
+    _t_mun = _channels(psi_full_y_transverse_mun)
+    if _t_nmu is not None and len(_t_nmu) not in (1, 3):
+        raise ValueError(
+            "write_restart_state_to_h5: psi_full_y_transverse must be one "
+            f"array or a 3-tuple of per-channel arrays; got {len(_t_nmu)}")
+    if (_t_mun is not None and _t_nmu is not None
+            and len(_t_mun) != len(_t_nmu)):
+        raise ValueError(
+            "write_restart_state_to_h5: psi_full_y_transverse and its mun "
+            "face must have the same channel count")
+
+    def _t_name(base, a):
+        return base if a == 0 else f"{base}_c{a + 1}"
+
     write_plan = {}
 
     def _plan(name, arr, *, mu_axes=(), n_logical=None, band_axes=()):
@@ -652,10 +679,12 @@ def write_restart_state_to_h5(
     _plan("psi_full_y", psi_full_y, mu_axes=(-1,), band_axes=(1,))
     _plan("psi_full_y_mun", psi_full_y_mun, mu_axes=(-2,), band_axes=(-1,))
     _plan("enk_full", enk_full, band_axes=(-1,))
-    _plan("psi_full_y_transverse", psi_full_y_transverse,
-          mu_axes=(-1,), n_logical=n_T, band_axes=(1,))
-    _plan("psi_full_y_transverse_mun", psi_full_y_transverse_mun,
-          mu_axes=(-2,), n_logical=n_T, band_axes=(-1,))
+    for a, arr in enumerate(_t_nmu or ()):
+        _plan(_t_name("psi_full_y_transverse", a), arr,
+              mu_axes=(-1,), n_logical=n_T, band_axes=(1,))
+    for a, arr in enumerate(_t_mun or ()):
+        _plan(_t_name("psi_full_y_transverse_mun", a), arr,
+              mu_axes=(-2,), n_logical=n_T, band_axes=(-1,))
     _plan("W0_qmunu", W0_qmunu, mu_axes=(-2, -1))
 
     if init_W0 and W0_qmunu is None:
@@ -771,18 +800,28 @@ def write_restart_state_to_h5(
 
         # Bispinor per-channel ψ: μ axis clipped to the TRANSVERSE
         # logical extent (its own centroid count, not n_rmu_logical).
-        if psi_full_y_transverse is not None:
-            _write("psi_full_y_transverse", psi_full_y_transverse)
+        if _t_nmu is not None:
+            for a, arr in enumerate(_t_nmu):
+                _write(_t_name("psi_full_y_transverse", a), arr)
             # Face layout (low_mem_bands): the ADDITIVE second face of
             # the transverse carrier, mirroring psi_full_y_mun exactly
             # ((nk, s, μ_T, n) — μ at axis -2).  Written only when the
             # caller holds a face-layout transverse bundle; a legacy
             # caller passes None and the file stays byte-identical to
             # the pre-face schema.
-            _write("psi_full_y_transverse_mun", psi_full_y_transverse_mun)
+            for a, arr in enumerate(_t_mun or ()):
+                _write(_t_name("psi_full_y_transverse_mun", a), arr)
             # Stamped for the load-time extent cross-check in
             # read_restart_state_from_h5.
             io.write_attr("n_rmu_transverse_logical", np.int64(n_T))
+            # ``write_attr`` queues a small DATASET (see SlabIO.write_attr);
+            # h5py has no conversion for a Python str, so the family stamp
+            # is fixed-width bytes.
+            io.write_attr("transverse_carriers", np.int64(len(_t_nmu)))
+            if transverse_lift_family is not None:
+                io.write_attr(
+                    "transverse_lift_family",
+                    np.bytes_(str(transverse_lift_family).encode("utf-8")))
 
         # W0_qmunu: either write the real data or pre-allocate an
         # all-zeros placeholder.
@@ -1474,8 +1513,31 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                   for k in ("V_qmunu", "S_qmunu", "V0_noG0_munu",
                             "psi_full_y", "psi_full_y_mun",
                             "psi_full_y_transverse",
-                            "psi_full_y_transverse_mun")
+                            "psi_full_y_transverse_mun",
+                            "psi_full_y_transverse_c2",
+                            "psi_full_y_transverse_c3",
+                            "psi_full_y_transverse_mun_c2",
+                            "psi_full_y_transverse_mun_c3")
                   if k in f}
+        # Per-channel transverse carriers (velocity balance) versus the one
+        # shared sigma.p carrier; the family stamp travels with them.  Both
+        # are small datasets (SlabIO.write_attr), like n_rmu_transverse_logical.
+        transverse_carriers = (
+            int(np.asarray(f["transverse_carriers"])[()])
+            if "transverse_carriers" in f else 1)
+        transverse_lift_family = None
+        if "transverse_lift_family" in f:
+            _fam = np.asarray(f["transverse_lift_family"])[()]
+            transverse_lift_family = (
+                _fam.decode("utf-8") if isinstance(_fam, bytes)
+                else str(_fam))
+        if transverse_carriers == 3 and (
+                "psi_full_y_transverse_c2" not in shapes
+                or "psi_full_y_transverse_c3" not in shapes):
+            raise ValueError(
+                f"Restart file {filename} is stamped with three transverse "
+                "carriers but lacks psi_full_y_transverse_c2/_c3: torn write; "
+                "regenerate the restart tensors (restart=false).")
         dtypes = {k: f[k].dtype for k in shapes}
         for name in shapes:
             _validate_shape_receipt(name, f[name])
@@ -1617,13 +1679,19 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
             psi_full_y_transverse = None
             if n_rmu_T_disk is not None:
                 # (missing-mun refusal fired in pass 1, before SlabIO)
-                psi_nmu_T = _read_psi(
-                    io, "psi_full_y_transverse", n_rmu_T_disk,
-                    spec=psi_nmu_spec)
-                psi_mun_T = _read_psi(
-                    io, "psi_full_y_transverse_mun", n_rmu_T_disk,
-                    spec=psi_mun_spec, mu_axis=-2, spinor_axis=1,
-                    band_axis=-1)
+                def _t_name(base, a):
+                    return base if a == 0 else f"{base}_c{a + 1}"
+                nmu_T = tuple(
+                    _read_psi(io, _t_name("psi_full_y_transverse", a),
+                              n_rmu_T_disk, spec=psi_nmu_spec)
+                    for a in range(transverse_carriers))
+                mun_T = tuple(
+                    _read_psi(io, _t_name("psi_full_y_transverse_mun", a),
+                              n_rmu_T_disk, spec=psi_mun_spec, mu_axis=-2,
+                              spinor_axis=1, band_axis=-1)
+                    for a in range(transverse_carriers))
+                psi_nmu_T = nmu_T[0] if transverse_carriers == 1 else nmu_T
+                psi_mun_T = mun_T[0] if transverse_carriers == 1 else mun_T
             else:
                 psi_nmu_T = None
                 psi_mun_T = None
@@ -1634,10 +1702,17 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
             psi_mun = None
             psi_nmu_T = None
             psi_mun_T = None
-            psi_full_y_transverse = (
-                _read_psi(io, "psi_full_y_transverse", n_rmu_T_disk,
-                          spec=psi_spec)
-                if n_rmu_T_disk is not None else None)
+            if n_rmu_T_disk is not None:
+                def _t_name(base, a):
+                    return base if a == 0 else f"{base}_c{a + 1}"
+                y_T = tuple(
+                    _read_psi(io, _t_name("psi_full_y_transverse", a),
+                              n_rmu_T_disk, spec=psi_spec)
+                    for a in range(transverse_carriers))
+                psi_full_y_transverse = (
+                    y_T[0] if transverse_carriers == 1 else y_T)
+            else:
+                psi_full_y_transverse = None
 
     # G0: μ-class, read whole above.  Collapse a legacy 2-D (nqz, μ) store
     # to its q=0 row, pad to the same in-memory μ extent as everything
@@ -1686,7 +1761,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
     del nspinor  # gated above; the extent itself rides on the arrays
     return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
             psi_full_y_transverse, n_rmu_T_disk, psi_nmu, psi_mun,
-            psi_nmu_T, psi_mun_T, charge_zeta_identity)
+            psi_nmu_T, psi_mun_T, charge_zeta_identity,
+            transverse_lift_family)
 
 
 def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
@@ -1782,7 +1858,8 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     # the read (SlabIO returns the tile), so none of it survives here.
     (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
      psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
-     psi_nmu_T, psi_mun_T, charge_zeta_identity) = read_restart_state_from_h5(
+     psi_nmu_T, psi_mun_T, charge_zeta_identity,
+     transverse_lift_family) = read_restart_state_from_h5(
         filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
         n_band_carrier=(
             int(band_slices.b4) - int(band_slices.b0)
@@ -1802,6 +1879,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
             psi_nmu_transverse=psi_nmu_T, psi_mun_transverse=psi_mun_T,
             n_rmu_transverse_disk=n_rmu_T_disk,
             charge_zeta_identity=charge_zeta_identity,
+            transverse_lift_family=transverse_lift_family,
         )
 
     x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
@@ -1824,9 +1902,16 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         with timing.section(
                 "gw_jax.restart.final_reshard.transverse", announce=True,
                 label="restart final transverse-wavefunction reshard"):
-            psi_rmuT_X_T = jax.lax.with_sharding_constraint(
-                jnp.conj(psi_rmu_Y_T).transpose(0, 3, 1, 2), x1_psi_X)
-            jax.block_until_ready(psi_rmuT_X_T)
+            def _derive_x(y):
+                x = jax.lax.with_sharding_constraint(
+                    jnp.conj(y).transpose(0, 3, 1, 2), x1_psi_X)
+                jax.block_until_ready(x)
+                return x
+            # One shared carrier: one array (historical); per-channel
+            # carriers: a 3-tuple, derived channel by channel.
+            psi_rmuT_X_T = (
+                tuple(_derive_x(y) for y in psi_rmu_Y_T)
+                if isinstance(psi_rmu_Y_T, tuple) else _derive_x(psi_rmu_Y_T))
 
     return SimpleNamespace(
         V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
@@ -1838,4 +1923,5 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         psi_nmu_transverse=None, psi_mun_transverse=None,
         n_rmu_transverse_disk=n_rmu_T_disk,
         charge_zeta_identity=charge_zeta_identity,
+        transverse_lift_family=transverse_lift_family,
     )

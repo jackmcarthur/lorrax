@@ -151,7 +151,13 @@ def _diagnostic_diagonal(matrix, basis_rotation, mesh_xy):
 
 
 def _bundle_for_channel(wfns_charge, wfns_transverse, channel: int):
-    return wfns_charge if int(channel) == 0 else wfns_transverse
+    """The carrier for one Lorentz label: charge for 0, else the label's
+    own transverse carrier (``LorentzCarriers.channel``; a bare bundle is
+    shared across the three labels)."""
+    if int(channel) == 0:
+        return wfns_charge
+    from .wavefunction_bundle import as_lorentz_carriers
+    return as_lorentz_carriers(wfns_transverse).channel(int(channel))
 
 
 def _require_packed_operator(name, packed, mesh_xy):

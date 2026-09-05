@@ -3398,24 +3398,21 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                     f"the near-null transverse modes) and the block-cyclic "
                     f"descriptors need n % px == n % py == 0.  Either pick "
                     f"a transverse centroid count divisible by both mesh "
-                    f"axes, change the process mesh, set "
-                    f"distributed_lu = off (per-q replicated "
-                    f"jnp.linalg.solve, valid at any extent), or use "
-                    f"transverse_zeta_solve = rank_truncate (its "
-                    f"distributed plan runs pzheevd at the PADDED extent "
-                    f"— divisible by construction — with exactly-inert "
-                    f"pad modes, so any count fits any square mesh).")
+                    f"axes (regenerate centroids_file_current), change the "
+                    f"process mesh, or set linalg = local (the per-q "
+                    f"replicated solve, valid at any extent).  The former "
+                    f"distributed_lu / transverse_zeta_solve deck keys are "
+                    f"retired; linalg is the one dial.")
             if jax.process_index() == 0:
                 print(
                     f"  [solver resolve] transverse LU: auto resolved to "
                     f"{kind} but n_rmu_T={n_log} does not divide the "
                     f"{px}x{py} mesh axes (block-cyclic descriptor rule); "
-                    f"demoting to the per-q replicated LU "
-                    f"(distributed_lu-equivalent 'off') so the solve runs "
-                    f"at the logical extent.  For a distributed transverse "
-                    f"plan at ANY count use transverse_zeta_solve = "
-                    f"rank_truncate + distributed_zeta_solve = distributed "
-                    f"(pzheevd at the padded extent).", flush=True)
+                    f"demoting to the per-q replicated LU so the solve "
+                    f"runs at the logical extent.  A distributed transverse "
+                    f"plan needs a count divisible by both mesh axes "
+                    f"(regenerate centroids_file_current) or a mesh that "
+                    f"divides it.", flush=True)
             return 'lu'
     return kind
 

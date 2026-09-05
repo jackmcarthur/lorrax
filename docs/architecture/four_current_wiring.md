@@ -246,9 +246,11 @@ on the config** — its consumers call it locally (`gw_config.py:378`,
 
 **THREE branches (2026-09-04)**: non-bispinor (everything False),
 bispinor/kinetic (both lifts `raw`, `scalar_head_bispinor=True`) and
-bispinor/velocity (`current_lift="velocity"`,
-`spatial_current_representation="velocity_kinetic_balance_alpha_spatial_current_v1"`,
-charge side unchanged).  The two shipped `bispinor_gw` values ride the same
+bispinor/velocity (`current_lift="velocity"`, the FAMILY name;
+`current_lift_for(mu_L)` gives the per-channel carrier selector
+`velocity_1/2/3`; `spatial_current_representation=
+"velocity_kinetic_balance_per_channel_alpha_spatial_current_v1"`; charge
+side unchanged).  The two shipped `bispinor_gw` values ride the same
 carrier, so `model` is accepted and ignored; the one carrier dial is the
 deck's `bispinor_current_balance`, passed as `current_lift=` by every call
 site that owns a current-channel object (`gw_init` ×4, `sigma_dispatch`,
@@ -256,10 +258,27 @@ site that owns a current-channel object (`gw_init` ×4, `sigma_dispatch`,
 `psp/get_dipole_mtxels`).  The velocity lift needs `dV_NL/dk`: `gw_jax`
 builds the projector setup from `pseudo_dir` and attaches
 `psp.vnl_ops.nonlocal_velocity_lift(setup)` to `WfnLoader.nonlocal_velocity_lift`;
-the loader routes its own G table, k representatives and `ngk_valid` mask to
-it and hands the σ·(dV_NL/dk ψ_L) ket to `lift_to_4spinor(representation=
-"velocity")`, which adds `(α/4)` of it (Ry→Hartree ½) to the σ·p small
-component.  Two places still share ONE carrier between ρ and the Dirac
+the loader routes its own G table, k representatives, `ngk_valid` mask and the
+channel to it and hands the channel's ket `Σ_b σ^b (dV_SR/dk_b ψ_L) + σ^a
+(dV_SO/dk_a ψ_L)` to `lift_to_4spinor(representation="velocity_a")`, which adds
+`(α/4)` of it (Ry→Hartree ½) to the σ·p small component.  ONE CARRIER PER
+CHANNEL: `gw_init._transverse_wfn_data` samples the transverse centroids once
+per distinct lift (three loads under velocity, one under kinetic) and the
+σ^B-side bundles become a `gw.wavefunction_bundle.LorentzCarriers`, whose
+`channel(mu_L)` is the endpoint every block builder uses — `w_isdf`'s
+`families = (charge, T1, T2, T3)`, `photon_sigma._bundle_for_channel`,
+`sigma_x_bispinor` through `endpoint_bundles(left, right, i, j)` (G-direct and
+bra from carrier i, G-conjugated and ket from carrier j).  The transverse ζ of
+channel a is fit on carrier a; restart tensors store channels 2 and 3 as
+`psi_full_y_transverse_c2/_c3` (+`_mun`) beside the historical channel-1 names
+and stamp `transverse_carriers`/`transverse_lift_family`, and a run refuses a
+file written under the other family.  `WfnLoader.lift(psi_2, k=, bispinor_lift=)`
+lifts an already loaded two-spinor window into any carrier; the dipole
+producer's finite-q α vertex uses it for channel a's carrier at both endpoints.
+The static-gauge Hall producer is a different, exact construction of the same
+current (σ·p carrier plus the explicit ICL projector jet) and refuses a
+velocity carrier (`uniform_gauge_operator`), because the jet would then be
+counted twice.  Two places still share ONE carrier between ρ and the Dirac
 current — the exact Hartree (`sigma_dispatch` → `kin_ion_io.compute_hartree_matrix`)
 and the SC density rebuild (`sc_iteration`) — and keep the charge lift for
 both, announced with a printed notice. The two carrier-comparison branches went with their deck spellings.

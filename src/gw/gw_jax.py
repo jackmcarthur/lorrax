@@ -818,7 +818,9 @@ def main(argv=None):
 					wf_binding_charge=isdf.wf_binding_charge,
 					wf_binding_transverse=isdf.wf_binding_transverse,
 					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
-					charge_zeta_identity=isdf.charge_zeta_identity,
+					# No charge_zeta_identity here: the packed body persists no
+					# store, so the receipt has no consumer on this path (it is
+					# bound where it is consumed, in compute_screening_model).
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
