@@ -91,6 +91,17 @@ def test_a_zeta_cohsex_gnppm_and_b_mpa_one_update_match_references(
         report,
     )]
     assert residuals == pytest.approx([3.640565708, 0.3476255047], abs=2e-5)
+    partitions = re.findall(
+        r"SC iteration: call=\d+ role=linear .*?"
+        r"active=(\S+) protected=(\S+) in_range=(\S+)", report,
+    )
+    assert partitions == [("1-3", "1-2", "1-2")] * 2
+    box_line = next(line for line in report.splitlines()
+                    if "SC fixed window: ω≥E_F cond:pole_tail" in line)
+    assert "box=(" in box_line and "padded_box=(" in box_line
+    sup, target = (float(value) for value in re.search(
+        r"sup=([0-9.e+-]+)/([0-9.e+-]+)", box_line).groups())
+    assert sup <= target == pytest.approx(1.0e-3)
     assert "rebuilds_this_iteration=6, rebuilds_total=6" in report
     assert "SC map gain:" in report and "= 0.185134" in report
     assert "SC done: 2 GW map calls" in report

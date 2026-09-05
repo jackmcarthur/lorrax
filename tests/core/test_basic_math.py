@@ -7,6 +7,7 @@ import pytest
 import minimax
 import vcoul
 from gw.gw_config import LorraxConfig
+from lxkit.deck_doctor import required_input_paths
 from wfn_loader import WfnLoader
 
 
@@ -57,3 +58,21 @@ def test_retired_slab_transport_key_is_one_strict_refusal(tmp_path):
     with pytest.raises(ValueError, match="must be removed") as exc:
         LorraxConfig.from_input_file(str(deck), print_fn=lambda *_a: None)
     assert "slab_io" in str(exc.value)
+
+
+def test_deck_doctor_input_closure_accepts_both_tiny_systems(core_fixtures):
+    """Strict-parse both production inputs through the doctor's path owner."""
+    cases = (("A", "cohsex.in", 21, False),
+             ("B", "mpa_sc1.in", 13, True))
+    for label, name, n_rmu, wants_restart in cases:
+        deck = core_fixtures / label / name
+        config = LorraxConfig.from_input_file(
+            str(deck), runtime_platform="gpu", resolve_hardware=False,
+            print_fn=lambda *_a: None,
+        )
+        rows = required_input_paths(config, deck, n_rmu=n_rmu)
+        assert rows and all(row.path.is_file() for row in rows)
+        roles = {row.role for row in rows}
+        assert {"DFT wavefunctions", "ISDF centroids",
+                "mean-field Hamiltonian"} <= roles
+        assert ("ISDF restart tensors" in roles) is wants_restart
