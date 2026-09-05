@@ -24,11 +24,9 @@ memory_per_device_gb = 4.0
 
 METAL = """\
 compute_mode = mpa
-mpa_material_class = metal
 occ_smearing_family = mp1
 occ_smearing_width_ry = 0.02
 fermi_reference = mp1_fixed_n
-sigma_omega_layout = sharded
 """
 
 
@@ -58,7 +56,7 @@ def test_route_axis_default_and_exact_spellings(tmp_path):
     (METAL + "sigma_freq_route = internal_ff_cd\n"
      + "qp_solver = fixed_point\n", "one_shot_dft"),
     ("compute_mode = mpa\nsigma_freq_route = internal_ff_cd\n",
-     "mpa_material_class = metal"),
+     "occ_smearing_family = mp1"),
 ])
 def test_route_scope_is_refused_at_config_resolution(tmp_path, extra, match):
     with pytest.raises(ValueError, match=match):
