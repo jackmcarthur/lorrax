@@ -93,7 +93,10 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
 
     from common import parallel_transport as pt_common
     import file_io.slab_io as slab_io_mod
-    from file_io.parallel_transport import SCHEMA_VERSION
+    from file_io.parallel_transport import (
+        SCHEMA_VERSION,
+        WFN_FINGERPRINT_BYTES_DATASET,
+    )
 
     fingerprint = "a" * 64
     raw = {
@@ -114,9 +117,8 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
     }
     raw["kgrid"] = np.asarray([2, 2, 2], dtype=np.int32)
     raw["reciprocal_lattice_cart"] = np.eye(3)
-    raw["wfn_fingerprint_utf8"] = np.frombuffer(
-        fingerprint.encode("ascii"), dtype=np.uint8
-    )
+    raw[WFN_FINGERPRINT_BYTES_DATASET] = np.frombuffer(
+        fingerprint.encode("ascii"), dtype=np.uint8).astype(np.int32)
     raw.update(
         {
             f"velocity_validation_{key}": np.asarray(value, dtype=np.float64)
@@ -193,7 +195,8 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
     # Every stamp the REFUSAL DECISION needs, and the uint8 provenance
     # stamp, came through the scalar door.
     for name in ("schema_version", "band_stop", "kgrid",
-                 "reciprocal_lattice_cart", "wfn_fingerprint_utf8"):
+                 "reciprocal_lattice_cart",
+                 WFN_FINGERPRINT_BYTES_DATASET):
         assert name in small_reads, f"{name} was not read through read_small"
     # The validation FLOATS are read only past the refusal check (see the
     # docstring's 2026-08-23 update) -- this fixture refuses, so none of
@@ -230,7 +233,10 @@ def test_pt_loader_refuses_a_velocity_only_artifact_instead_of_crashing(
     """
     from common import parallel_transport as pt_common
     import file_io.slab_io as slab_io_mod
-    from file_io.parallel_transport import SCHEMA_VERSION
+    from file_io.parallel_transport import (
+        SCHEMA_VERSION,
+        WFN_FINGERPRINT_BYTES_DATASET,
+    )
 
     fingerprint = "b" * 64
     raw = {
@@ -248,9 +254,8 @@ def test_pt_loader_refuses_a_velocity_only_artifact_instead_of_crashing(
     }
     raw["kgrid"] = np.asarray([2, 2, 2], dtype=np.int32)
     raw["reciprocal_lattice_cart"] = np.eye(3)
-    raw["wfn_fingerprint_utf8"] = np.frombuffer(
-        fingerprint.encode("ascii"), dtype=np.uint8
-    )
+    raw[WFN_FINGERPRINT_BYTES_DATASET] = np.frombuffer(
+        fingerprint.encode("ascii"), dtype=np.uint8).astype(np.int32)
     # Deliberately NO "velocity_validation_{atol,rtol,max_abs,...}" keys --
     # exactly what a real velocity-only artifact never writes.
 

@@ -413,13 +413,11 @@ class DftVelocityHeadData:
 
 
 def _ascii_stamp(io, path: str, name: str) -> str:
-    """A ``uint8`` provenance stamp, read through SlabIO, as ``str``.
+    """An int32 byte-valued provenance stamp, read through SlabIO, as str.
 
-    ``write_attr`` publishes these as ``uint8`` datasets.  The phdf5
-    transport's dtype table has no unsigned type, so the read asks for
-    ``int32`` and HDF5 widens — the same route
-    ``file_io.parallel_transport._decode_i32_text`` already takes for the
-    W-av stamps, and the reason it takes it.
+    The phdf5 transport's dtype table intentionally has no unsigned byte
+    type.  The artifact owner therefore publishes this numeric view beside
+    its historical uint8 external-tool view.
     """
     raw = np.asarray(io.read_small(name, dtype=np.int32), dtype=np.int32)
     if raw.ndim != 1 or np.any(raw < 0) or np.any(raw > 255):
@@ -468,6 +466,7 @@ def load_parallel_transport_head(
     from file_io.parallel_transport import (
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
+        WFN_FINGERPRINT_BYTES_DATASET,
         load_full_bz_links,
         load_link_singular_values,
     )
@@ -507,7 +506,7 @@ def load_parallel_transport_head(
             dtype=np.float64,
         )
         fingerprint = _ascii_stamp(
-            io, path, "wfn_fingerprint_utf8")
+            io, path, WFN_FINGERPRINT_BYTES_DATASET)
 
         expected_nb = int(meta.b_id_4_user)
         expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -688,6 +687,7 @@ def load_dft_velocity_head(
     from file_io.parallel_transport import (
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
+        WFN_FINGERPRINT_BYTES_DATASET,
     )
     from file_io.slab_io import SlabIO
 
@@ -703,7 +703,8 @@ def load_dft_velocity_head(
             io.read_small("reciprocal_lattice_cart", dtype=np.float64),
             dtype=np.float64,
         )
-        fingerprint = _ascii_stamp(io, path, "wfn_fingerprint_utf8")
+        fingerprint = _ascii_stamp(
+            io, path, WFN_FINGERPRINT_BYTES_DATASET)
         expected_reciprocal = (
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )

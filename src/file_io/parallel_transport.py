@@ -97,6 +97,8 @@ __all__ = [
     "SCHEMA_VERSION",
     "SINGULAR_VALUES_DATASET",
     "VELOCITY_DFT_DATASET",
+    "WFN_FINGERPRINT_BYTES_DATASET",
+    "WFN_PATH_BYTES_DATASET",
     "complete_velocity_validation",
     "W_AV_DENSITY_DATASET",
     "WAvStencilMetadata",
@@ -112,6 +114,9 @@ __all__ = [
     "write_w_av_stencil_artifact",
     "write_velocity_validation",
 ]
+
+WFN_PATH_BYTES_DATASET = "wfn_path_bytes_i32"
+WFN_FINGERPRINT_BYTES_DATASET = "wfn_fingerprint_bytes_i32"
 
 
 @dataclass(frozen=True)
@@ -191,9 +196,9 @@ def _read_w_av_metadata(io: SlabIO) -> WAvStencilMetadata:
         kgrid_shift=_read("kgrid_shift", 1).astype(np.float64),
         reciprocal_lattice_cart=(
             _read("reciprocal_lattice_cart", 2).astype(np.float64)),
-        wfn_path=_decode_i32_text(_read("wfn_path_bytes_i32", 1)),
+        wfn_path=_decode_i32_text(_read(WFN_PATH_BYTES_DATASET, 1)),
         wfn_fingerprint=_decode_i32_text(
-            _read("wfn_fingerprint_bytes_i32", 1)),
+            _read(WFN_FINGERPRINT_BYTES_DATASET, 1)),
         first_neighbors=bool(_scalar("w_av_first_neighbors")),
         second_neighbors=bool(_scalar("w_av_second_neighbors")),
         seed_steps=_read("w_av_seed_steps", 2).astype(np.int32),
@@ -525,6 +530,17 @@ def initialize_parallel_transport_artifact(
             "wfn_fingerprint_utf8",
             np.frombuffer(
                 str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8))
+        # SlabIO/PHDF5 deliberately supports compute dtypes, not uint8.
+        # Retain the historical external-tool view above and publish the one
+        # numeric byte view consumed by both QSGW head loaders.
+        io.write_attr(
+            WFN_PATH_BYTES_DATASET,
+            np.frombuffer(str(wfn_path).encode("utf-8"),
+                          dtype=np.uint8).astype(np.int32))
+        io.write_attr(
+            WFN_FINGERPRINT_BYTES_DATASET,
+            np.frombuffer(str(wfn_fingerprint).encode("utf-8"),
+                          dtype=np.uint8).astype(np.int32))
         io.write_attr("polar_rcond", np.float64(rcond))
         # Numeric convention stamps are SlabIO-readable on every backend.
         # 1 means the sole supported convention documented by this schema.
@@ -963,11 +979,11 @@ def _write_w_av_stage(
             # for external HDF5 tools and add an int32 byte view for every
             # production consumer that must remain behind the SlabIO door.
             io.write_attr(
-                "wfn_path_bytes_i32",
+                WFN_PATH_BYTES_DATASET,
                 np.frombuffer(str(wfn_path).encode("utf-8"),
                               dtype=np.uint8).astype(np.int32))
             io.write_attr(
-                "wfn_fingerprint_bytes_i32",
+                WFN_FINGERPRINT_BYTES_DATASET,
                 np.frombuffer(str(wfn_fingerprint).encode("utf-8"),
                               dtype=np.uint8).astype(np.int32))
         for k_start in range(0, nk, k_batch):
