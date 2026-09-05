@@ -868,6 +868,7 @@ def rcrop_nojit(
     tol: float = 1e-10,
     print_fn: Callable = None,
     entry_sharding=None,
+    metric=None,
 ) -> AccelerationResult:
     """rCROP without JIT - for use when residual_fn contains JIT'd code.
 
@@ -903,6 +904,15 @@ def rcrop_nojit(
             (``out_shardings``, not a ``device_put`` of a single-device
             zeros, which would materialise the thing being avoided).  Left
             ``None``, the buffers are uncommitted exactly as before.
+        metric: Optional real weights broadcastable to ``x0``'s shape.
+            The Gram that fixes the mixing coefficients, and the residual
+            norms, are taken over ``f * metric``; the iterate update is
+            still the full elementwise combination.  A 0/1 mask restricts
+            the least squares to the entries the caller trusts: the QSGW
+            driver passes the non-scissored band block, so the scissored
+            tail (which moves by eV per map from its own refit) cannot
+            steer the coefficients.  ``None`` is the unweighted solve,
+            bit for bit.
 
     Returns:
         AccelerationResult
@@ -930,6 +940,9 @@ def rcrop_nojit(
     x = _entry(x0)
     f = _entry(residual_fn(x))
 
+    def _weighted(v):
+        return v if metric is None else v * metric
+
     # History buffers
     Xhist = _zeros_hist()
     Fhist = _zeros_hist()
@@ -943,7 +956,7 @@ def rcrop_nojit(
     # Rank-agnostic 2-norm: a pure reduction over every axis.
     # ``jnp.linalg.norm(A)`` would ravel first, which is a reshape of a
     # sharded operand.
-    res0 = float(jnp.sqrt(jnp.sum(jnp.abs(f) ** 2)))
+    res0 = float(jnp.sqrt(jnp.sum(jnp.abs(_weighted(f)) ** 2)))
     res_history = [res0]
 
     if res0 <= tol:
@@ -975,7 +988,7 @@ def rcrop_nojit(
 
         # Solve for mixing coefficients.  The only collective in the
         # accelerator: one (m+1, m+1) Gram plus two length-(m+1) reductions.
-        alpha = _solve_crop_alpha_stacked(Fw)
+        alpha = _solve_crop_alpha_stacked(_weighted(Fw))
 
         # Update iterate: contraction over the LEADING axis only, so it is
         # elementwise in the operand axes — no communication.
@@ -990,7 +1003,7 @@ def rcrop_nojit(
         head = (head + 1) % m
         filled = min(filled + 1, m)
 
-        res = float(jnp.sqrt(jnp.sum(jnp.abs(f_new) ** 2)))
+        res = float(jnp.sqrt(jnp.sum(jnp.abs(_weighted(f_new)) ** 2)))
         res_history.append(res)
 
         if print_fn is not None and it < 10:

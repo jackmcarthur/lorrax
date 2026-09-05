@@ -4630,6 +4630,26 @@ def _run_rcrop(
     # that should not have existed.  Local precision can disguise a
     # global error, so the factor is gone rather than corrected.
 
+    # THE ACCELERATOR FITS ONLY THE NON-SCISSORED BLOCK.  The carry holds
+    # every active band, but the scissored tail is re-derived from its own
+    # (alpha, beta) refit each map and moves by eV per map (Na eta=0.5,
+    # bands 41-86 at 30-96 eV: 0.7-3.9 eV per map while bands 5-10 moved
+    # 35-70 meV; runs/Na/12_sc_observables_eta05_2026-09-04 arm A).  Those
+    # entries are not a self-consistency residual, and letting them into
+    # the Gram steered the coefficients (entry mu 2.09 eV at map 2).  The
+    # criterion already excludes them; so does the metric now.  All-true
+    # mask (a semiconductor's full window): weights of exactly 1.0, the
+    # unweighted solve bit for bit.
+    _init_partition = state_init.partition
+    _fit_mask = (np.asarray(_init_partition.protected_mask, bool).reshape(-1)
+                 | np.asarray(_init_partition.in_range_mask, bool).reshape(-1))
+    _nbp = int(x0.shape[-1])
+    _metric_np = np.zeros((1, _nbp, _nbp), dtype=np.float64)
+    _metric_np[0, :_fit_mask.size, :_fit_mask.size] = np.outer(_fit_mask, _fit_mask)
+    print_fn(
+        f"  SC rCROP metric: Gram over the non-scissored block only "
+        f"(bands {_band_ranges(_fit_mask, band_offset=int(inputs.band_slices.sigma.start))}, "
+        f"{int(_fit_mask.sum())} of {_fit_mask.size}; scissored rows follow the map)")
     try:
         result = rcrop_nojit(
             residual_fn,
@@ -4640,6 +4660,7 @@ def _run_rcrop(
             tol=0.0,   # see above: rCROP does not decide convergence
             print_fn=None,  # we print our own RMS-ΔE history above
             entry_sharding=entry_sh,
+            metric=jnp.asarray(_metric_np),
         )
     except _Converged as stop:
         # The criterion fired inside the map.  Return the accepted
