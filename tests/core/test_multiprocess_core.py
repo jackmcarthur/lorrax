@@ -18,7 +18,7 @@ def test_real_p4_distrib_la_matrix():
     root = mesh_launch.REPO_ROOT
     command = (
         sys.executable,
-        "services/distrib_la/tests/test_distrib_la_multiproc.py",
+        "tests/core/distrib_la_p4.py",
         "--mesh", "2x2", "--dtypes", "complex128",
     )
     result = mesh_launch.run_mesh4(
