@@ -1,0 +1,79 @@
+{
+  "additional_reference_source_commits": {
+    "htransform_bse_exciton": "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0"
+  },
+  "cold_build": {
+    "bse_tda_seconds": 7.25,
+    "cohsex_seconds": 15.48,
+    "exciton_bands_seconds": 15.29,
+    "gn_ppm_seconds_cold": 67.0,
+    "htransform_centroid_selection_seconds": 3.076,
+    "htransform_seconds": 10.96,
+    "mean_field_base_seconds": 10.644153629007633,
+    "mean_field_plus_htransform_basis_seconds": 13.720153629007633
+  },
+  "files": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "Li.upf": "3654e8a51fb6c60c124c97ea3a67a54c87a0e477e49effd65aa73a45288f48f9",
+    "MEAN_FIELD.json": "67abfeb711a0f3ad93a80044494c43a3e2ccd0996827c045344d7031c11260ac",
+    "WFN.h5": "d58bb868f9f80e2b413511a77927ee80e94bae2581907fffdc025eebfc435998",
+    "build/nscf.in": "50b05bd059e8fc953d500c81e780fbbb425eeccb56951b738b28347619dd2132",
+    "build/pw2bgw.in": "ff490f34bbb5134f621e242e9313cffd7ac9cb235608ce1e68ae1e6e2a28042d",
+    "build/scf.in": "242368655396f3439776743e35fba171265a7a2d7c307511c1b2edfb1b3f8bd1",
+    "centroids_frac_21.txt": "537720a003c4459db06bd4531d0b5ea9d3d867824826ff1934da6c59f018e944",
+    "centroids_frac_31_htransform.txt": "c47e8a423bfb4a27f944843aa908fb20f823f58485840bc971db54baee185d68",
+    "cohsex.in": "bc72db236fe510acbdb5e4aeb860f2ea9a7f142a214893266a9dfe6d008f12a3",
+    "cohsex_eqp0.dat": "94854f895c71de1e8e08636bc906e0bc94d91ac5d34d95de7767188eb66b47ba",
+    "cohsex_eqp1.dat": "94854f895c71de1e8e08636bc906e0bc94d91ac5d34d95de7767188eb66b47ba",
+    "cohsex_sigma.dat": "bb1f5217ddbb4c5311080c6c2b52982d699aa4cdff6b6d403a09b78b1a563486",
+    "data-file-schema.xml": "1c56efabba25453edc51d244edbca62f4eff7fda08239db9b34f3dc2921942ac",
+    "dipole.h5": "2c8729d4cf98983d0a2795e4c76dc9fc3187b39472679ba880c5897bf8a4a117",
+    "excited_state_ref.json": "d15974c29353717da3bd088b7687b2c35353c8b2876bb29dc7bd010aa4077ab3",
+    "exciton.in": "ea390df406849da2619cb4a255c9f01a016fe87883ad045e66a8bfb39928680c",
+    "exciton_gw.in": "7606603a39f62c2ade3d8d0e3930471749b89f8d0cfcd36b550000ae67337bd1",
+    "gnppm.in": "a01a74aa7d60352abb94b8cadd0a3e3b2c259ef6a57373d05abd2de7172a4ef6",
+    "gnppm_eqp0.dat": "43bdb3a1e05bb6f0fd0c1c794cf654ebdce231b5b01e5a69495e7aaa9696ba59",
+    "gnppm_eqp1.dat": "26ab986528e407073393fe58ad1b23d69f6955a549ff8846d095ade535e25e0b",
+    "gnppm_sigma.dat": "58e854dd15bcbcc7e03d0f24c827c47570e28315c71264819373a945a04b71f1",
+    "gnppm_sigma.h5": "1ea6dd2698bc0624764981f42dc1fe09f56b897d6783466ffb21f6d8c71de5db",
+    "htransform.in": "6ad8419b584988496cbd18dd386c01d26ceed3fb25cfa8f35c75e198de1c114c",
+    "kin_ion.h5": "f9434b0deccc7c5ae4aacfd48493b24d4654cabec60bda70941bfb682f3c4879",
+    "kmeans.out": "7e60c6d2423019d4a758e2d6f643a2a851e11bafd00a11bf1269edd478053ef9",
+    "kmeans_htransform.out": "cbbb4ed04bc653318a5fdd850c7b54c373d63c90d3e6f52ad583a9e0f5a43031",
+    "tmp/isdf_tensors_21.h5": "b398b8ce038290121dfaa4ab7e2cf64441c99355532527b8684e8707670448d0",
+    "tmp/isdf_tensors_31.h5": "80d5d08b57b050cd70cbb4f1d87a0fc0f16ce71d494849d72ff1acb2e10bb6a1",
+    "tmp/sigma_quadrature_rules/rule_0068e07e7b7b3ad0.npz": "628cace211df40e56ac50945b2356aa9d18838da3d60c170e4551ab7d1854cde",
+    "tmp/sigma_quadrature_rules/rule_1b805a1502d55a96.npz": "ec6151d8a15780b6f4f40922338276801d06e1b9e1a2c98539ef6c7674f2d042",
+    "tmp/sigma_quadrature_rules/rule_5fb71587b78cbcca.npz": "e6859d41495fdc00bac252f0e5f7a21cd7e80d587652338cef8efdae5a2ce8d8",
+    "tmp/sigma_quadrature_rules/rule_688029a5c6de33a4.npz": "6fb33c60770f92168f072a52e3c813b8df52b8c76fa8e7585de77c9ea998928d",
+    "tmp/sigma_quadrature_rules/rule_6fd72ec6c60a95b1.npz": "67efb96b53459f27aa5df81fba4cc605c90d49c1c84869b7d384ad8e5c458e6b",
+    "tmp/sigma_quadrature_rules/rule_80dfa16c570ceba4.npz": "9b82464961a9c014b6520f35c1331e447c76096daa410d46db07b3548791e584",
+    "tmp/sigma_quadrature_rules/rule_9a6dbbf6ee194082.npz": "f712d3188653deee04d7b334884bf0b7148072c63e714bd79cfc7fbef03935b9",
+    "tmp/zeta_q.h5": "765a28236cd498ef244060eefa2d90bef31cfcedc2e174a8023af4c187767c71"
+  },
+  "reference_source_commit": "298c89ac588300460f241191bff2e65d8a50b824",
+  "schema": "lorrax-core-fixture-v1",
+  "shape": {
+    "active_bands": 7,
+    "atoms": 2,
+    "centroids": 21,
+    "fft_grid": [
+      15,
+      15,
+      15
+    ],
+    "full_k": 9,
+    "guard_bands": 1,
+    "htransform_centroids": 31,
+    "kgrid": [
+      3,
+      3,
+      1
+    ],
+    "spatial_operations": 1,
+    "spinor": 1,
+    "stored_k": 5,
+    "trs": true
+  },
+  "system": "A"
+}

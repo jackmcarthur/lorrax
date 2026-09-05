@@ -1,0 +1,54 @@
+==============================================================================
+LORRAX ISDF CENTROID SELECTION
+==============================================================================
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 1
+Accelerators   : 4 GPU devices (NVIDIA A100-SXM4-40GB, 4 per rank)
+Processor mesh : 2 x 2  (centroid selection)
+CPU allocation : 128 cores per rank
+Host threads   : OPENBLAS_NUM_THREADS=64 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : eager reader
+Selection      : feature-weighted k-means on the real-space FFT grid
+
+CENTROID PROVENANCE
+-------------------
+LORRAX ISDF centroid coordinates (fractional crystal units)
+feature fit: left=(0, 1), right=(0, 7): sqrt(sum_k w_k sum_m,n |psi_mk^dag psi_nk|^2); unit band weights
+source wavefunctions: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/B-e42a911f6048652a23cea6637f5dc8981e5f7f5c3ef74cbc252f05459a3a78d5/WFN.h5
+selection metric: sqrt(diag q=0 charge Gram), left=(0, 1), right=(0, 7), unit band weights
+electrons: 2; occupied-band boundary: 1
+FFT grid: (18, 18, 20); k grid: (1, 1, 1); shift: (0.0, 0.0, 0.0)
+selection: weighted k-means; seed=42; rho_power=1; requested=13; candidates=13; written=14
+pruning: not applied; pair-density windows left=(0, 1), right=(0, 7) (explicit feature pair)
+symmetry closure: orbit-aware; spatial operations=2
+coordinates: x y z snapped to FFT grid; 14 unique points
+intended channels: gamma^0 (charge) ISDF
+
+FILES
+-----
+Source WFN     : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/B-e42a911f6048652a23cea6637f5dc8981e5f7f5c3ef74cbc252f05459a3a78d5/WFN.h5
+Centroids      : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/B-e42a911f6048652a23cea6637f5dc8981e5f7f5c3ef74cbc252f05459a3a78d5/centroids_frac_14.txt
+Report         : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/B-e42a911f6048652a23cea6637f5dc8981e5f7f5c3ef74cbc252f05459a3a78d5/kmeans.out
+
+TIMING (POST-STARTUP)
+---------------------
+Wavefunction setup [setup.wfn_io]       : 0.041 s
+Feature metric [setup.weight]           : 0.518 s
+Weighted k-means [kmeans]               : 3.107 s
+  Initialization [kmeans/init]          : 1.204 s
+  Lloyd iterations [kmeans/lloyd]       : 1.095 s
+  Final assignment [kmeans/assign_labels]: 0.396 s
+Orbit snap/unfold [snap_unfold]         : 0.001 s
+Lloyd-state release [release_before_prune]: 0.000 s
+Gram and selection [prune]              : 0.000 s
+  Gram build [prune/prune.gram]         : 0.000 s
+  Block selection [prune/prune.select]  : 0.000 s
+Other selection work                    : 0.006 s
+Selection wall : 3.673 s
+LORRAX ISDF centroid selection completed.

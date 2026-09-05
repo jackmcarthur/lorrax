@@ -41,9 +41,9 @@ if "jax" not in _sys.modules:
 # Safe at this point: harness imports stdlib + numpy and no jax, so
 # nothing has initialised a CUDA backend yet.
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
-import fast_gate  # noqa: E402
 import harness  # noqa: E402
 import known_failure_ledger  # noqa: E402
+from core import manifest as core_manifest  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # ONE GPU PER PROCESS THAT RUNS TESTS.  Not a preference — three separate
@@ -528,28 +528,37 @@ def pytest_addoption(parser):
         help="run ONLY the named service's suite (e.g. --only-service="
              "distrib_la).  Deselects lorrax's own tests and every other "
              "service.")
-    gate = parser.getgroup("gate", "LORRAX default gate vs census")
+    gate = parser.getgroup("gate", "LORRAX core, extended and full tiers")
     gate.addoption(
         "--census", action="store_true", default=False,
         help="run the FULL census — exactly what a bare `pytest` collected "
              "before 2026-08-09, and what tests/KNOWN_FAILURES.md accounts "
              "for.  `-m census` is the same thing.")
+    gate.addoption(
+        "--full", action="store_true", default=False,
+        help="run the nightly full tier (an exact alias for --census)")
+    gate.addoption(
+        "--core-extended", action="store_true", default=False,
+        help="run the under-ten-minute tiny/synthetic extension of core")
+    gate.addoption(
+        "--build-fixtures", action="store_true", default=False,
+        help="build/hash-check the tiny QE mean fields, verify every "
+             "committed derived reference, and exit without running tests")
 
 
 # ---------------------------------------------------------------------------
-# THE DEFAULT GATE  (the owner, 2026-08-09)
+# THE DEFAULT CORE  (the owner, 2026-09-04)
 # ---------------------------------------------------------------------------
-#     "really we should run that Si test calculation (granted for all
-#      drivers that were touched since last ran) and the tests for the
-#      services and have that basically be it."
+# The ordinary developer verdict is a fixed two-minute tier: the tiny cached
+# A/B fixture family plus one representative cell for each major service and
+# runtime guard. The per-defect zoo and real production decks are --full.
 #
-# TWO TIERS, and the split is a SELECTION, not a deletion:
+# THREE TIERS:
 #
-#   pytest                 -> the Si end-to-end test calculation for the
-#                             drivers this branch touched, plus every
-#                             service's own suite.  Minutes.
-#   pytest --census        -> byte-for-byte the run `pytest` used to be.
-#   pytest -m census       -> the same thing (see `census` below).
+#   pytest                 -> two-minute core
+#   pytest --core-extended -> additional tiny/synthetic/provider cells
+#   pytest --full          -> nightly full suite
+#   --census / -m census   -> compatibility spellings of --full
 #
 # WHY THE DESELECTION IS A HOOK AND NOT A SECOND `-m`.  Same reason the
 # service deselection above is: pyproject sets `addopts = "-m 'not extra'"`,
@@ -559,15 +568,13 @@ def pytest_addoption(parser):
 # had narrowed the run.  A hook acts on the items `-m` already selected, so
 # it composes by construction.
 #
-# WHY EVERY CELL CARRIES `census` RATHER THAN ONLY THE ZOO.  So that
-# `pytest -m census` means what the owner said it means — EVERYTHING —
-# instead of "everything except the Si gates", which is the one shape of
-# census that could not account for KNOWN_FAILURES.md.  The marker is
+# WHY EVERY CELL CARRIES `census` RATHER THAN ONLY THE ZOO. So that the
+# compatibility spelling `pytest -m census` still means EVERYTHING. The marker is
 # applied to every collected item EXCEPT those already carrying `extra`,
 # which keeps `-m census` collecting exactly the set `-m 'not extra'` did.
 #
 # WHEN THE GATE STANDS DOWN.  The default tier applies to a BARE `pytest`
-# and to nothing else.  Naming paths, `-m`, `-k`, `--census` or
+# and to nothing else. Naming paths, `-m`, `-k`, `--full`, `--census` or
 # `LX_CENSUS=1` all mean the caller has already said what they want, and a
 # second opinion from this hook would only be a way to lose tests they
 # asked for.
@@ -633,6 +640,8 @@ def _cmdline_select_flags(args) -> list:
 
 def _explicit_selection(config) -> str:
     """Why this hook should stand down, or "" to run the default gate."""
+    if config.getoption("--full"):
+        return "--full"
     if config.getoption("--census"):
         return "--census"
     if (os.environ.get("LX_CENSUS", "") or "").strip() not in (
@@ -685,30 +694,29 @@ _GATE_NOTE = pytest.StashKey[list]()
 
 
 def _apply_default_gate(config, items):
-    """Narrow a bare ``pytest`` to the default tier.  No-op otherwise."""
+    """Narrow a bare ``pytest`` to the explicit core roster."""
     stood_down = _explicit_selection(config)
-    drivers, why = fast_gate.selected_drivers(fast_gate.REPO_ROOT)
-    roster = fast_gate.smoke_node_ids(drivers)
-    undecked = sorted(d for d in drivers if d in fast_gate.UNDECKED)
     note = config.stash.setdefault(_GATE_NOTE, [])
     if stood_down:
         note.append(f"gate: CENSUS ({stood_down}) — full suite, "
                     "KNOWN_FAILURES.md accounting applies")
         return
+    extended = config.getoption("--core-extended")
+    roster = (core_manifest.CORE_EXTENDED_NODES if extended
+              else core_manifest.CORE_NODES)
+    tier = "CORE-EXTENDED" if extended else "CORE"
     note.append(
-        "gate: DEFAULT (fast) — Si e2e smoke for "
-        + (", ".join(sorted(drivers)) if drivers else "NO drivers")
-        + f" [{why}] + every services/ suite.  Full set: pytest --census")
-    for d in undecked:
-        note.append(f"gate: {d} was touched but has NO runnable in-tree "
-                    f"deck — {fast_gate.UNDECKED[d]}")
+        f"gate: DEFAULT ({tier}) — tests/core plus {len(roster)} exact "
+        "established contract cells.  Nightly set: pytest --full")
 
     keep, drop, hit = [], [], set()
     for item in items:
         nodeid = item.nodeid
-        if fast_gate.is_service_item(nodeid):
+        if (nodeid.startswith("tests/core/")
+                and (extended
+                     or item.get_closest_marker("core_extended") is None)):
             keep.append(item)
-        elif fast_gate.matches(nodeid, roster):
+        elif core_manifest.matches(nodeid, roster):
             keep.append(item)
             hit.add(nodeid.split("[", 1)[0])
         else:
@@ -722,7 +730,7 @@ def _apply_default_gate(config, items):
     missing = sorted(roster - hit)
     if missing:
         raise pytest.UsageError(
-            "tests/fast_gate.py names cells that do not exist:\n    "
+            "tests/core/manifest.py names cells that do not exist:\n    "
             + "\n    ".join(missing)
             + "\n\nThe default gate would run without them and report green. "
               "Fix the roster (or the rename) — do not delete the entry.")
@@ -822,6 +830,23 @@ def pytest_sessionstart(session):
     ``a-w`` turns that into an immediate EACCES.  ``harness.copy_fixture``
     restores owner-write on the run-dir COPY, so nothing legitimate breaks.
     """
+    if session.config.getoption("--build-fixtures"):
+        from core.fixtures import build_fixtures, stamp_references
+
+        build_fixtures.main([])
+        for label in build_fixtures.SYSTEMS:
+            path = stamp_references.HERE / label / "PROVENANCE.json"
+            got = _json.loads(path.read_text(encoding="utf-8"))
+            if got != stamp_references.expected(label):
+                raise pytest.UsageError(
+                    f"{path}: committed derived-reference stamp is stale; "
+                    "review the regenerated results, then run "
+                    "python -m core.fixtures.stamp_references to publish it")
+        pytest.exit(
+            "core fixture build/cache verification complete; tests were not run",
+            returncode=0,
+        )
+
     changed = harness.protect_fixtures()
     if changed:
         tw = session.config.get_terminal_writer()

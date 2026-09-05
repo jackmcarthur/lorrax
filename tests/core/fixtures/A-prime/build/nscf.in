@@ -1,0 +1,46 @@
+&control
+   prefix = 'core_lih_p1_trbroken'
+   pseudo_dir = './'
+   outdir = './'
+   calculation = 'nscf'
+   disk_io = 'low'
+/
+&system
+   ibrav = 0
+   nat = 2
+   ntyp = 2
+   ecutwfc = 15.0
+   ecutrho = 60.0
+   nbnd = 7
+   noncolin = .true.
+   lspinorb = .true.
+   no_t_rev = .true.
+   tot_charge = 1.0
+   starting_magnetization(1) = 0.5
+   starting_magnetization(2) = 0.5
+   occupations = 'fixed'
+/
+&electrons
+   electron_maxstep = 200
+   conv_thr = 1.0d-10
+   diago_thr_init = 1.0d-10
+   diagonalization = 'david'
+   diago_david_ndim = 4
+   diago_full_acc = .true.
+/
+
+ATOMIC_SPECIES
+   H  1.00794 'H.upf'
+   Li 6.94100 'Li.upf'
+
+CELL_PARAMETERS bohr
+   6.0 0.0 0.0
+   0.7 5.8 0.0
+   0.4 0.9 6.2
+
+ATOMIC_POSITIONS crystal
+   H  0.1700000000 0.2300000000 0.3100000000
+   Li 0.6100000000 0.4200000000 0.7700000000
+
+K_POINTS automatic
+   3 3 1 0 0 0
