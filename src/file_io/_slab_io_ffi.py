@@ -2638,6 +2638,17 @@ class _FfiBackend(_DatasetGeometry):
         # the callers, not of this method, and it is not checkable here.
         # An unconditional barrier costs one rendezvous per file close
         # and removes the question.
+        deferred_hosts = []
+        if (_worker_error is None
+                and (self._deferred_attrs or self._deferred_ds_attrs)):
+            # A deferred value may be a JAX scalar/array.  Materializing it
+            # can lower communication, so every process does that before the
+            # rank-0 h5py writer gate (INVARIANTS row 21).
+            for name, value in self._deferred_attrs:
+                host = value
+                if not isinstance(host, np.ndarray):
+                    host = np.asarray(jax.device_get(host))
+                deferred_hosts.append((name, host))
         if (_worker_error is None
                 and (self._deferred_attrs or self._deferred_ds_attrs)
                 and jax.process_index() == 0):
@@ -2649,12 +2660,9 @@ class _FfiBackend(_DatasetGeometry):
                         cnt=(len(self._deferred_attrs),
                              len(self._deferred_ds_attrs))), \
                     h5py.File(self.path, "a") as h5:
-                for name, value in self._deferred_attrs:
+                for name, host in deferred_hosts:
                     if name in h5:
                         del h5[name]
-                    host = value
-                    if not isinstance(host, np.ndarray):
-                        host = np.asarray(jax.device_get(host))
                     h5.create_dataset(name, data=host)
                 # AFTER the small datasets, because that loop
                 # delete-and-recreates by name and a recreated dataset

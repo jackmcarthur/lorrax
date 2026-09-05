@@ -162,8 +162,10 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
     # continuous ρ in e/bohr³ via the N_grid/vol factor (cf. charge_density.py).
     rho_r = rho_r * (spin_factor / nk_full) * (N_grid / vol)
 
+    # This reduction can synchronize a distributed JAX value.  Execute it
+    # on every rank even though only a verbose rank prints the result.
+    integral = float(jnp.sum(rho_r)) * vol / N_grid
     if verbose:
-        integral = float(jnp.sum(rho_r)) * vol / N_grid
         dt = time.perf_counter() - t0
         print(f"  ρ_val integral: {integral:.4f} e  "
               f"(expected {spin_factor * n_occ}, {dt:.2f}s)")

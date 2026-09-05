@@ -1115,6 +1115,8 @@ def main(argv=None):
 			sc_result = run_sc_driver(
 				wfns, V_q, kin_ion,
 				head_channel=getattr(isdf, 'head_channel', None),
+				wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+				charge_zeta_identity=isdf.charge_zeta_identity,
 				quad=quad, e_ref=e_ref,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,

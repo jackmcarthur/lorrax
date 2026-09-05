@@ -206,11 +206,14 @@ rather than rebuild if a state leaves its padded box. One-shot results are
 bit-identical with and without the freeze. The eqp1 file is written from the
 converged map.
 
-**13. There is no printed map gain yet.** The ratio (on-shell Σ change) /
-(input eigenvalue change) between consecutive maps predicted every failure in
-the 2026-09-03 study; above 1 the loop will not contract. It can be computed
-from data the loop already has and should be printed after map 2. Until it
-is, use pitfall 9's budget rule.
+**13. Map gain is a diagnostic, not a controller.** From map 2 onward the
+driver prints `SC map gain: max |dSigma_on-shell| / max |dE_in| = ...`, using
+the adjacent changes over the non-scissored set, and stores the same gain and
+worst-state tuple in the `eqp0_iterNNNN.dat` / `eqp1_iterNNNN.dat` comments.
+The ratio predicted every failure in the 2026-09-03 study; a value above 1 is
+evidence that the sampled map is not contracting. It does not change damping,
+convergence, refusal, or any other control decision (TASTE 59); pitfall 9's
+budget rule still owns when a run stops.
 
 ## Evidence
 
