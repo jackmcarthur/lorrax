@@ -362,6 +362,7 @@ def validate_kin_ion_against_run(
 	*,
 	expected_bispinor: bool,
 	expected_bispinor_gw_mode: str | None = None,
+	expected_current_lift: str | None = None,
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
@@ -387,7 +388,8 @@ def validate_kin_ion_against_run(
 			f"uses bispinor={bool(expected_bispinor)}; regenerate it.")
 
 	representation = resolve_four_current_representation(
-		expected_bispinor, expected_bispinor_gw_mode)
+		expected_bispinor, expected_bispinor_gw_mode,
+		current_lift=expected_current_lift)
 	if expected_bispinor:
 		for attr, expected in (
 			("charge_representation", representation.charge_representation),

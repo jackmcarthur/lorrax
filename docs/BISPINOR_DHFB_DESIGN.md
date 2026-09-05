@@ -69,6 +69,31 @@ $$\Psi_{nk}(G) = \begin{pmatrix}\psi_L\\\psi_S\end{pmatrix},\quad
 
 with $(k+G)$ in Bohr⁻¹ — i.e. the BGW HDF5 `wfn.bvec` (stored in reciprocal-lattice units) is multiplied by `wfn.blat = 2π/alat` once at the `WfnLoader` file-format boundary.  [`bispinor_init.py`](../src/common/bispinor_init.py) accepts only that explicitly Cartesian basis.
 
+> **Live addition (2026-09-04): velocity balance for the current carrier.**
+> The lift above is the CHARGE carrier and stays as written (its
+> small-component density is the $O(\alpha^2)$ Dirac density).  The
+> SPATIAL-CURRENT carrier ($\mu_L\in\{1,2,3\}$: transverse ζ fits, $\Sigma^B$,
+> the finite-q $\alpha^i$ vertex) may instead be lifted with
+> $\psi_S=\tfrac{\alpha_{\rm FS}}{2}\,\sigma\!\cdot\!v\,\psi_L$,
+> $v = p + i[V_{\rm NL}, r] = p + \partial V_{\rm NL}/\partial k$ (Hartree units;
+> the code adds $\tfrac{\alpha}{4}\sum_a\sigma^a(\partial V^{\rm Ry}_{\rm NL}/\partial k_a)\psi_L$
+> to the $\sigma\!\cdot\!p$ term), deck key `bispinor_current_balance = velocity`.
+> Then at $q=0$, $\tfrac{2}{\alpha}\langle m|\alpha^i|n\rangle
+> = \langle m|v^{\rm Ry}_i|n\rangle + \tfrac{i}{2}\epsilon_{ijk}\langle m|[\sigma^k, \partial_j V_{\rm NL}]|n\rangle$:
+> the current vertex is the pseudo-Hamiltonian's velocity at first order,
+> which the $\sigma\!\cdot\!p$ lift misses by exactly $\partial V_{\rm NL}/\partial k$
+> (the "gauged nonlocal-pseudopotential track" the static head gate names).
+> The commutator term survives only through the j-resolved (spin-orbit)
+> part of $V_{\rm NL}$.  Both channels are the existing $\tilde\gamma$-bilinears
+> on different 4-spinors, so nothing in the ζ/Σ machinery changes; the
+> transverse ζ stamp and the finite-q `dipole.h5` carry the lift.  Owner:
+> `common/bispinor_init.lift_to_4spinor(representation="velocity")`,
+> provider `psp/vnl_ops.nonlocal_velocity_lift`, resolver
+> `common/four_current_model.resolve_four_current_representation(current_lift=)`.
+> Not yet: the $i[\Sigma^{GW}, r]$ piece (self-consistency-dependent), and the
+> exact Hartree/SC density rebuild still shares one carrier (kept on
+> $\sigma\!\cdot\!p$; see `docs/architecture/four_current_wiring.md`).
+
 **Polarizability and screening (charge channel only):**
 
 $$\chi^0_{00,q}(\omega) = -\mathrm{Tr}_{\rm bispinor}\big[\tilde\gamma^0\,G^0(12)\,\tilde\gamma^0\,G^0(21)\big]

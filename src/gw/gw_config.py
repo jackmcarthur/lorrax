@@ -380,6 +380,34 @@ def uses_four_spinor_finite_q_charge(bispinor: bool, bispinor_gw) -> bool:
     ).charge_bispinor
 
 
+#: Deck spelling of ``bispinor_current_balance`` -> lift selector
+#: (``common.bispinor_init.{RAW,VELOCITY}_KINETIC_BALANCE_LIFT``).
+_BISPINOR_CURRENT_BALANCE_TO_LIFT = {
+    "kinetic": "raw",
+    "velocity": "velocity",
+}
+
+
+def coerce_bispinor_current_lift(value) -> str:
+    """``bispinor_current_balance`` deck value -> lift selector string.
+
+    Two values, no aliases: ``kinetic`` (the shipped ``sigma.p`` lift,
+    selector ``"raw"``) and ``velocity`` (``sigma.v``, selector
+    ``"velocity"``).  Empty/None is the default ``kinetic``.
+    """
+    spelling = str(value if value is not None else "kinetic").strip().lower()
+    if not spelling:
+        spelling = "kinetic"
+    try:
+        return _BISPINOR_CURRENT_BALANCE_TO_LIFT[spelling]
+    except KeyError:
+        raise ValueError(
+            f"bispinor_current_balance={value!r} is not a known balance; "
+            "expected 'kinetic' (sigma.p, default) or 'velocity' "
+            "(sigma.v, v = p + dV_NL/dk).  doc: docs/input_reference.md, "
+            "bispinor_current_balance.") from None
+
+
 #: The LEGACY spellings of the self-energy axis, and the canonical key that
 #: replaces each.  ``compute_mode`` / ``qp_solver`` are the load-bearing axes
 #: (see :meth:`LorraxConfig.compute_mode` / :meth:`LorraxConfig.qp_solver`);
@@ -1513,6 +1541,10 @@ _DEFAULTS = {
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
+    # Directory holding the run's *.upf, read only when a deck key needs
+    # projectors inside gwjax (``bispinor_current_balance = velocity``).
+    # Empty = the input file's directory, as the kin_ion/dipole producers.
+    "pseudo_dir": "",
     # Three human-readable text outputs (always written), plus one opt-in
     # fixed-Sigma eigenvalue-self-consistent QP ladder:
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
@@ -1695,6 +1727,16 @@ _DEFAULTS = {
     # Orthogonal four-current screening policy.  The historical
     # charge-screened + bare-transverse exchange path remains the default.
     "bispinor_gw": "bare_transverse",
+    # Which small-component balance lifts the SPATIAL-CURRENT carrier
+    # (transverse zeta fits, Sigma^B, the finite-q alpha vertex).
+    #   kinetic  — psi_S = (alpha/2) sigma.p psi_L, the shipped lift.
+    #   velocity — psi_S = (alpha/2) sigma.v psi_L, v = p + dV_NL/dk: the
+    #              alpha^i vertex becomes the pseudo-Hamiltonian's velocity
+    #              at first order in q (owner request 2026-09-04).  Needs
+    #              the run's *.upf (``pseudo_dir``).
+    # The CHARGE carrier is sigma.p in both cases.  Resolved once by
+    # ``common.four_current_model.resolve_four_current_representation``.
+    "bispinor_current_balance": "kinetic",
     # The relative sign of the i[r, V_NL] commutator in the assembled
     # velocity, read by ``psp.get_dipole_mtxels`` and passed to
     # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the legacy shipped
@@ -2346,6 +2388,7 @@ _LEGACY_DECK_KEYS = frozenset({
 _NORMALIZE_STR = {
     "compute_mode",
     "bispinor_gw",
+    "bispinor_current_balance",
     "qp_solver",
     "sc_accelerator",
     "sc_head_update",
@@ -3232,6 +3275,8 @@ class FilePaths:
     # ``None`` falls back to the scalar charge-only path (CC tile only).
     centroids_file_current: str | None
     kin_ion_file: str
+    # ``None`` = the input file's directory (the producers' convention).
+    pseudo_dir: str | None
     parallel_transport_file: str
     static_gauge_hall_file: str
     sigma_diag_file: str
@@ -3834,6 +3879,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    # The resolver owns the "velocity needs bispinor" refusal; calling it
+    # here makes a scalar deck naming the velocity carrier stop at parse
+    # time, with the resolver's own message, instead of inside a stage.
+    resolve_four_current_representation(
+        bool(config.bispinor), mode,
+        current_lift=getattr(config, "bispinor_current_lift", None))
     if (bool(config.bispinor)
             and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS):
         raise ValueError(
@@ -4942,6 +4993,11 @@ class LorraxConfig:
     do_screened: bool
     bispinor: bool
     bispinor_gw: BispinorGWMode
+    #: Lift selector for the SPATIAL-CURRENT carrier, from the deck's
+    #: ``bispinor_current_balance`` (``coerce_bispinor_current_lift``):
+    #: ``"raw"`` (kinetic, sigma.p) or ``"velocity"`` (sigma.v).  Every
+    #: consumer passes it to ``resolve_four_current_representation``.
+    bispinor_current_lift: str
     #: Raw deck spelling resolved by the canonical dipole producer at the
     #: point of use.  Keeping the spelling (rather than a second resolver in
     #: gw_config) lets every velocity consumer take the producer's exact arm.
@@ -5359,6 +5415,7 @@ class LorraxConfig:
             centroids_file=str(_g("centroids_file")),
             centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
+            pseudo_dir=(str(_g("pseudo_dir")) or None),
             parallel_transport_file=str(_g("parallel_transport_file")),
             static_gauge_hall_file=str(_g("static_gauge_hall_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
@@ -5738,6 +5795,8 @@ class LorraxConfig:
             do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
             bispinor_gw=coerce_bispinor_gw_mode(_g("bispinor_gw")),
+            bispinor_current_lift=coerce_bispinor_current_lift(
+                _g("bispinor_current_balance")),
             vnl_velocity_sign=str(_g("vnl_velocity_sign") or ""),
             # Compatibility mirror only.  Every new head decision reads the
             # enum above; keeping this resolved bool prevents old consumers

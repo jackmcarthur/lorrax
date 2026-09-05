@@ -570,7 +570,8 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
 
     representation = resolve_four_current_representation(
         bool(params.get("_four_current_bispinor", False)),
-        params.get("bispinor_gw"))
+        params.get("bispinor_gw"),
+        current_lift=params.get("_bispinor_current_lift"))
     explicit_comparison = bool(params.get("_four_current_bispinor", False)) and (
         not representation.scalar_head_bispinor)
     if not sanity.sanity_enabled() and not explicit_comparison:
@@ -592,9 +593,15 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
                  f"({type(exc).__name__}: {exc})")
         return
     expected_bispinor = params.get("_charge_bispinor")
+    # Only a non-shipped spatial-current carrier is asked of the file: a
+    # legacy dipole.h5 carries no lift stamp and IS the sigma.p arm.
+    expected_current_lift = (
+        representation.current_lift
+        if representation.current_lift not in (None, "raw") else None)
     authenticated = check_dipole_provenance(
         dipole_path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
-        bispinor=expected_bispinor, print_fn=print_fn)
+        bispinor=expected_bispinor,
+        bispinor_current_lift=expected_current_lift, print_fn=print_fn)
     if explicit_comparison and not authenticated:
         raise ValueError(
             "GATE comparison_charge_dipole_provenance: the explicit "
@@ -1664,7 +1671,8 @@ class HeadResolver:
         from common.four_current_model import (
             resolve_four_current_representation)
         representation = resolve_four_current_representation(
-            bool(config.bispinor), config.bispinor_gw)
+            bool(config.bispinor), config.bispinor_gw,
+            current_lift=getattr(config, "bispinor_current_lift", None))
         self._params = {
             # These are GW-run controls, not head sub-config fields.  The
             # dipole provenance reader must compare against the consumer's
@@ -1676,6 +1684,7 @@ class HeadResolver:
                 getattr(config, "bispinor_gw", "bare_transverse"),
                 "value", getattr(config, "bispinor_gw", "bare_transverse")),
             "_four_current_bispinor": bool(config.bispinor),
+            "_bispinor_current_lift": representation.current_lift,
             "_charge_bispinor": representation.scalar_head_bispinor,
             "wcoul0_source": head.wcoul0_source,
             "wcoul0_eta": head.wcoul0_eta,

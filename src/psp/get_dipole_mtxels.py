@@ -56,12 +56,12 @@ from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common.bispinor_init import (
 	ALPHA_FS, DIRAC_ALPHA_VERTEX_PROVENANCE,
-	KINETIC_BALANCE_LIFT_PROVENANCE, NO_PAIR_DIRAC_CURRENT_MODEL,
+	NO_PAIR_DIRAC_CURRENT_MODEL, kinetic_balance_lift_provenance,
 )
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
 from gw.gw_config import (
-	BispinorGWMode, coerce_bispinor_gw_mode,
+	BispinorGWMode, coerce_bispinor_current_lift, coerce_bispinor_gw_mode,
 	read_lorrax_input as read_cohsex_input,
 )
 from common.four_current_model import resolve_four_current_representation
@@ -229,10 +229,16 @@ def compute_finite_q_mtxels(
     nv_block: int,
     nc_block: int,
     vnl_velocity_sign: float = VNL_VELOCITY_SIGN_SHIPPED,
+    bispinor_lift: str = "raw",
     progress_fn=None,
     diagnostic_fn=None,
 ):
     """Driver: produce symmetric finite-q matrix elements on G-sphere.
+
+    ``bispinor_lift`` is the SPATIAL-CURRENT carrier's lift
+    (``resolve_four_current_representation(...).current_lift``): the
+    ``alpha_cvkq`` vertex is a current, so it takes the current carrier,
+    while the q=0 dipole/head producer keeps the scalar-head (charge) one.
 
     Returns numpy arrays:
       rho_cvkq[nc, nv, nk, nq] complex128  — ⟨u_{c, k-q} | u_{v, k}⟩_cell
@@ -327,7 +333,8 @@ def compute_finite_q_mtxels(
         # previous route indexed a resident (nk, nb, ns, nx, ny, nz)
         # array, i.e. it held EVERY k's box for the whole call.
         psi_k = load_kpoint_fftbox_local(wfn, meta, ik, int(nb),
-                                         bispinor=bool(bispinor))
+                                         bispinor=bool(bispinor),
+                                         bispinor_lift=bispinor_lift)
         # Gather FFT-box layout → G-sphere coeffs at this k's integer G-list.
         # The mask zeroes the pad columns, which is what makes the finite,
         # K=kvec values of Z/dZ on those columns inert downstream.
@@ -497,7 +504,7 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
                              nb_written, bispinor, skip_vnl, vnl_mode,
                              vnl_velocity_sign=None, nspinor=None,
-                             soc=None) -> None:
+                             soc=None, bispinor_current_lift=None) -> None:
     """Record what this ``dipole.h5`` was built from.
 
     ``vnl_velocity_sign`` is the RESOLVED relative sign of the nonlocal
@@ -542,6 +549,11 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
         h5.attrs["prov_nspinor"] = int(nspinor)
     if soc is not None:
         h5.attrs["prov_soc"] = bool(soc)
+    if bispinor_current_lift is not None:
+        # Which carrier the finite-q alpha vertex was lifted with
+        # (``resolve_four_current_representation(...).current_lift``).
+        # Absent on files written before 2026-09-04 = the raw sigma.p lift.
+        h5.attrs["prov_bispinor_current_lift"] = str(bispinor_current_lift)
 
 
 def _resolve_dipole_nb_written(wfn, *, ncond, nband) -> int:
@@ -613,6 +625,7 @@ def _q0_ncond_coverage(h5, *, wfn, ncond, nband) -> tuple[bool, str]:
 def check_dipole_provenance(
     path, *, wfn, nval, ncond, nband,
     bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
+    bispinor_current_lift=None,
     wfn_fingerprint_binding=None,
     print_fn=print,
 ) -> bool:
@@ -691,6 +704,11 @@ def check_dipole_provenance(
         "prov_skip_vnl": skip_vnl,
         "prov_vnl_mode": vnl_mode,
         "prov_vnl_velocity_sign": vnl_velocity_sign,
+        # Pass this ONLY when the run lifts the spatial-current carrier with
+        # something other than the shipped sigma.p: a legacy file has no
+        # stamp and is exactly the sigma.p arm, so the kinetic run must not
+        # ask; a velocity run must, and then an unstamped file refuses.
+        "prov_bispinor_current_lift": bispinor_current_lift,
     }
     want.update({key: value for key, value in optional.items()
                  if value is not None})
@@ -1061,9 +1079,15 @@ def main(argv=None):
 			"kinetic-balance four-current is present")
 	# This producer owns the scalar charge/head vertex.  One carrier for both
 	# shipped bispinor_gw values, resolved in ONE place so this stage cannot
-	# disagree with the ISDF fits or Sigma about what a four-spinor is.
-	bispinor = resolve_four_current_representation(
-		four_current_bispinor, bispinor_gw_mode).scalar_head_bispinor
+	# disagree with the ISDF fits or Sigma about what a four-spinor is.  The
+	# deck's ``bispinor_current_balance`` moves only the SPATIAL-CURRENT
+	# carrier (the finite-q alpha vertex below); the q=0 dipole stays on it.
+	representation = resolve_four_current_representation(
+		four_current_bispinor, bispinor_gw_mode,
+		current_lift=coerce_bispinor_current_lift(
+			params.get("bispinor_current_balance")))
+	bispinor = representation.scalar_head_bispinor
+	current_lift = representation.current_lift or "raw"
 
 	# Every communicator the sweep and the closing gather will use was
 	# warmed by the module-top ``initialize_communicator_stack()``
@@ -1219,6 +1243,13 @@ def main(argv=None):
 		compute_contact=bool(args.static_gauge_hall_only),
 		compute_transfer_q2=False,
 	)
+	if current_lift == "velocity":
+		# The finite-q alpha vertex lifts its four-spinors with sigma.v; the
+		# same projector setup that supplies the dipole's dV_NL/dk supplies
+		# the loader's small-component velocity.
+		wfn.nonlocal_velocity_lift = vnl_ops.nonlocal_velocity_lift(vnl_setup)
+		print("  finite-q alpha vertex: spatial-current carrier lifted with "
+		      "sigma.v, v = p + dV_NL/dk (bispinor_current_balance = velocity)")
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
 		"Output writer  : rank-zero artifact writer after a bounded owner gather",
@@ -1679,6 +1710,7 @@ def main(argv=None):
 				nv_block=int(nval),
 				nc_block=int(ncond),
 				vnl_velocity_sign=vnl_velocity_sign,
+				bispinor_lift=current_lift,
 				progress_fn=report.progress,
 				diagnostic_fn=debug_print if debug else None,
 			)
@@ -1723,7 +1755,8 @@ def main(argv=None):
 				nband=nband, nb_written=nb, bispinor=bispinor,
 				skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
 				vnl_velocity_sign=vnl_velocity_sign,
-				nspinor=int(wfn.nspinor), soc=bool(vnl_setup.soc))
+				nspinor=int(wfn.nspinor), soc=bool(vnl_setup.soc),
+				bispinor_current_lift=(current_lift if bispinor else None))
 			if rho_cvkq is not None:
 				fq = h5.create_group('finite_q')
 				fq.create_dataset('rho_cvkq', data=rho_cvkq)
@@ -1753,7 +1786,8 @@ def main(argv=None):
 						"q_cart_bohr^-1 dot (2*alpha_cvkq/alpha_fs)")
 					ds_ward.attrs['energy_source'] = "WFN mean-field eigenvalues"
 					fq.attrs['selected_current_model'] = NO_PAIR_DIRAC_CURRENT_MODEL
-					fq.attrs['selected_current_lift'] = KINETIC_BALANCE_LIFT_PROVENANCE
+					fq.attrs['selected_current_lift'] = (
+						kinetic_balance_lift_provenance(current_lift))
 					fq.attrs['selected_current_operator'] = DIRAC_ALPHA_VERTEX_PROVENANCE
 					fq.attrs['selected_current_gauge_completion'] = "none_diagnostic_only"
 					fq.attrs['alpha_fs'] = float(ALPHA_FS)

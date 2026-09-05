@@ -37,8 +37,18 @@ KINETIC_BALANCE_LIFT_PROVENANCE = (
 ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE = (
     "Psi=[I;X](I+X^dagger*X)^(-1/2)*psi_L;X=(alpha_fs/2)*sigma.p"
 )
+# Velocity balance (owner request 2026-09-04): the SPATIAL-CURRENT carrier
+# only.  ``v = p + dV_NL/dk`` is the pseudo-Hamiltonian's velocity, so the
+# alpha^i vertex built from this lift is the first-order current of the
+# Hamiltonian the states came from (Ward identity at O(q)).  The charge
+# carrier keeps ``sigma.p``: its small-component density is the O(alpha^2)
+# Dirac density, and a V_NL-dressed |psi_S|^2 has no place in it.
+VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE = (
+    "psi_S=(alpha_fs/2)*sigma.v*psi_L;v=p+dV_NL/dk"
+)
 RAW_KINETIC_BALANCE_LIFT = "raw"
 ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"
+VELOCITY_KINETIC_BALANCE_LIFT = "velocity"
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
 )
@@ -51,10 +61,13 @@ def kinetic_balance_lift_provenance(representation: str) -> str:
         return KINETIC_BALANCE_LIFT_PROVENANCE
     if mode == ISOMETRIC_KINETIC_BALANCE_LIFT:
         return ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE
+    if mode == VELOCITY_KINETIC_BALANCE_LIFT:
+        return VELOCITY_KINETIC_BALANCE_LIFT_PROVENANCE
     raise ValueError(
         f"unknown kinetic-balance representation {representation!r}; "
-        f"expected {RAW_KINETIC_BALANCE_LIFT!r} or "
-        f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
+        f"expected {RAW_KINETIC_BALANCE_LIFT!r}, "
+        f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r} or "
+        f"{VELOCITY_KINETIC_BALANCE_LIFT!r}")
 
 
 def _isometric_kinetic_balance_factor(K_cart_bohr_inv):
@@ -90,6 +103,25 @@ def sigma_dot_cartesian(psi_L, vector_cart):
     return jnp.einsum(
         "aij,...ga,...bjg->...big", paulis, vector, psi,
         optimize=True)
+
+
+def sigma_dot_cartesian_kets(kets):
+    r"""Contract ``sigma`` with a Cartesian stack of two-component kets.
+
+    ``kets`` has shape ``(..., 3, band, 2, G)`` — one ket per Cartesian
+    component, e.g. ``(dV_NL/dk_a) psi_L`` from
+    ``psp.vnl_ops.apply_vnl_velocity_to_ket``.  Returns
+    ``sum_a sigma^a ket_a`` with shape ``(..., band, 2, G)``.  This is
+    :func:`sigma_dot_cartesian` for an operator-valued vector: there the
+    vector multiplies ``psi_L`` pointwise in G, here each component has
+    already acted on ``psi_L``.  No prefactor is included.
+    """
+    kets = jnp.asarray(kets)
+    if kets.ndim < 4 or int(kets.shape[-4]) != 3 or int(kets.shape[-2]) != 2:
+        raise ValueError(
+            "sigma_dot_cartesian_kets requires kets with shape "
+            f"(..., 3, band, 2, G), got {tuple(kets.shape)}")
+    return jnp.einsum("aij,...abjg->...big", paulis, kets, optimize=True)
 
 
 def kinetic_balance_lift_jet(
@@ -234,6 +266,7 @@ def get_small_psi_component(gvecs, kvec, bvec_cart_bohr, psi_G):
 def lift_to_4spinor(
     psi_2, gvecs, kvecs, bvec_cart_bohr, *,
     representation: str = RAW_KINETIC_BALANCE_LIFT,
+    sigma_vnl_velocity_ry=None,
 ):
     """k-batched 2-spinor ψ → 4-spinor ψ via the small-component lift.
 
@@ -245,6 +278,19 @@ def lift_to_4spinor(
 
     to both upper and lower blocks.  Since ``(σ·K)†(σ·K)=|K|² I``, this is
     exactly ``[I;X](I+X†X)^(-1/2)`` without a redundant 2×2 matrix inverse.
+
+    ``representation='velocity'`` replaces ``p`` by the pseudo-Hamiltonian
+    velocity ``v = p + i[V_NL, r] = p + dV_NL/dk`` (Hartree units), i.e.
+
+    ``ψ_S = (α/2) σ·p ψ_L + (α/4) Σ_a σ^a (dV_NL^{Ry}/dk_a ψ_L)``
+
+    — the second term is ``sigma_vnl_velocity_ry`` (``(n_k, nb, 2, ngkmax)``,
+    Rydberg velocity units, the same ``dV_NL/dk`` the dipole sweep adds to
+    ``2(k+G)``, already contracted with σ by
+    :func:`sigma_dot_cartesian_kets`; ``psp.vnl_ops.nonlocal_velocity_lift``
+    produces it) and the ½ is the Ry→Hartree velocity conversion.  It is
+    REQUIRED for this representation and REFUSED for the others: a supplied
+    ket that was silently ignored is the failure class this tree pays for.
     Pure ``jnp`` (no jit / sharding here — the caller wraps it; see
     ``WfnLoader._get_bispinor_lift_jit``).
 
@@ -275,14 +321,34 @@ def lift_to_4spinor(
     p_cart = pkG @ bvec_cart_bohr                             # (n_k, ngkmax, 3)
     psi_S = jnp.complex128(HALFALPHA) * sigma_dot_cartesian(
         psi_2, p_cart)
-    lifted = jnp.concatenate([psi_2, psi_S], axis=2)
     mode = str(representation).strip().lower()
-    if mode == RAW_KINETIC_BALANCE_LIFT:
+    if mode == VELOCITY_KINETIC_BALANCE_LIFT:
+        if sigma_vnl_velocity_ry is None:
+            raise ValueError(
+                "lift_to_4spinor(representation='velocity') requires "
+                "sigma_vnl_velocity_ry = sum_a sigma^a (dV_NL/dk_a psi_L); "
+                "attach psp.vnl_ops.nonlocal_velocity_lift(setup) to the "
+                "loader (WfnLoader.nonlocal_velocity_lift).")
+        sigma_v = jnp.asarray(sigma_vnl_velocity_ry)
+        if tuple(sigma_v.shape) != tuple(psi_S.shape):
+            raise ValueError(
+                "lift_to_4spinor: sigma_vnl_velocity_ry shape "
+                f"{tuple(sigma_v.shape)} != psi_L shape {tuple(psi_S.shape)}")
+        # (alpha/2) * (1/2): dV_NL/dk arrives in Rydberg velocity units
+        # (dH_Ry/dk), and the Hartree velocity is half of that.
+        psi_S = psi_S + jnp.complex128(0.5 * HALFALPHA) * sigma_v
+    elif sigma_vnl_velocity_ry is not None:
+        raise ValueError(
+            "lift_to_4spinor: sigma_vnl_velocity_ry is only meaningful for "
+            f"representation='velocity', got {representation!r}")
+    lifted = jnp.concatenate([psi_2, psi_S], axis=2)
+    if mode in (RAW_KINETIC_BALANCE_LIFT, VELOCITY_KINETIC_BALANCE_LIFT):
         return lifted
     if mode != ISOMETRIC_KINETIC_BALANCE_LIFT:
         raise ValueError(
             f"unknown kinetic-balance representation {representation!r}; "
-            f"expected {RAW_KINETIC_BALANCE_LIFT!r} or "
-            f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
+            f"expected {RAW_KINETIC_BALANCE_LIFT!r}, "
+            f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r} or "
+            f"{VELOCITY_KINETIC_BALANCE_LIFT!r}")
     r = _isometric_kinetic_balance_factor(p_cart)
     return lifted * r[:, None, None, :]

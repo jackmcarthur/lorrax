@@ -321,8 +321,22 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
     from .kin_ion_io import compute_hartree_matrix
 
     representation = resolve_four_current_representation(
-        config.bispinor, config.bispinor_gw)
+        config.bispinor, config.bispinor_gw,
+        current_lift=config.bispinor_current_lift)
     include_transverse = bool(config.bispinor)
+    # ONE psi serves rho, the Dirac current and <m|V_H + alpha.A|n> here, so
+    # the two carriers cannot both be honoured when they differ.  The
+    # charge carrier wins: rho and V_H are the ~500 eV cancellation, the
+    # Hartree current is a mean-field object whose V_NL dressing is
+    # O(alpha^2 V_NL) and vanishes identically on a time-reversal-symmetric
+    # cell.  Announced, not silent.
+    if (include_transverse
+            and representation.current_lift != representation.charge_lift):
+        print_fn(
+            "  V_H: charge and current share one carrier here; using the "
+            f"charge lift {representation.charge_lift!r} for both "
+            f"(deck spatial-current lift {representation.current_lift!r} "
+            "applies to the ISDF transverse channel and the finite-q vertex).")
     hartree_meta = (replace(meta, nspinor=4, npol=4)
                     if include_transverse and int(meta.nspinor) != 4 else meta)
     print_fn(
@@ -339,7 +353,7 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
             int(wfn.nspinor)
             if include_transverse and not representation.charge_bispinor
             else None),
-        bispinor_lift=(representation.current_lift or "raw"),
+        bispinor_lift=(representation.charge_lift or "raw"),
         print_fn=print_fn, return_sharded=True)
     charge = exact.charge if include_transverse else exact
     window = (slice(None),

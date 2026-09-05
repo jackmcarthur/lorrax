@@ -483,6 +483,22 @@ def main(argv=None):
 	# ``Meta`` describes the charge/CC carrier.  Spatial-current enablement
 	# remains the independently parsed ``config.bispinor`` policy.
 	meta.bispinor = charge_bispinor
+	if config.bispinor_current_lift == "velocity":
+		# The spatial-current carrier is lifted with sigma.v; the loader
+		# needs dV_NL/dk, which lives in the run's projectors.  Built once
+		# here, attached to the one loader every stage reads through.
+		from psp.vnl_ops import nonlocal_velocity_lift_from_pseudo_dir
+		_pseudo_dir = config.paths.pseudo_dir or input_dir
+		# ``report.progress`` is the retained run record; ``print0`` sinks
+		# component chatter, and which carrier ran is not chatter.
+		wfn.nonlocal_velocity_lift = nonlocal_velocity_lift_from_pseudo_dir(
+			wfn, sym, meta, _pseudo_dir, sys_dim=int(config.sys_dim),
+			caller="gw_jax.bispinor_current_balance",
+			print_fn=report.progress)
+		report.progress(
+			"Bispinor spatial-current carrier: VELOCITY balance "
+			"psi_S = (alpha/2) sigma.v psi_L, v = p + dV_NL/dk "
+			f"(projectors from {_pseudo_dir}); charge carrier stays sigma.p.")
 	band_slices = BandSlices.from_band_edges(
 		*meta.band_edges, b4_chi=meta.b_id_4_chi,
 		b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
@@ -1087,6 +1103,7 @@ def main(argv=None):
 		config.paths.kin_ion_file,
 		expected_bispinor=config.bispinor,
 		expected_bispinor_gw_mode=config.bispinor_gw.value,
+		expected_current_lift=config.bispinor_current_lift,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
 		band_stop=band_slices.b3,
