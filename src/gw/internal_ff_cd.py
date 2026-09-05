@@ -611,9 +611,14 @@ def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
     U = device_put_process_local(
         identity, NamedSharding(mesh, P(None, "x", "y")))
     response = build_iteration_head_response(
-        None, None, velocity.velocity_dft_cart, U,
-        wfns.enk[:, :nb_storage], state.f_kn[:, :nb_storage],
-        np.asarray([0.0 + 0.0j], np.complex128),
+        delta_h_dft=None,
+        forward_links=None,
+        forward_neighbors=None,
+        velocity_dft_cart=velocity.velocity_dft_cart,
+        U_dft_to_qp=U,
+        energies_qp_kn_ry=wfns.enk[:, :nb_storage],
+        occupations_qp_kn=state.f_kn[:, :nb_storage],
+        omegas_ry=np.asarray([0.0 + 0.0j], np.complex128),
         surface_weight_qp_kn=surface_kn[:, :nb_storage], mesh=mesh,
         kgrid=tuple(int(x) for x in wfn.kgrid),
         bvec_cart=velocity.reciprocal_lattice_cart,
