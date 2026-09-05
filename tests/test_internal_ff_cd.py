@@ -10,8 +10,11 @@ import pytest
 from gw.gw_config import (
     LorraxConfig, SigmaFrequencyRoute, coerce_sigma_frequency_route)
 from gw.internal_ff_cd import (
-    REAL_MAX_EV, RESPONSE_WIDTHS_EV, _load_checkpoint,
-    _real_coefficients, _save_checkpoint, imag_grid, real_grid)
+    CD_CONTROL_TOL_MEV, IMAG_FINE_INTERVALS, REAL_COARSE_STEP_EV,
+    REAL_HARD_MAX_EV, REAL_MAX_EV, REAL_STEP_EV, RESPONSE_WIDTHS_EV,
+    _coarse_imag_grid, _coarse_real_grid, _control_certificate,
+    _load_checkpoint, _real_coefficients, _real_coverage_max,
+    _save_checkpoint, imag_grid, real_grid)
 
 
 BASE = """\
@@ -68,10 +71,41 @@ def test_referee_grids_are_fixed_covering_and_nested():
         grid = real_grid(width)
         assert grid[0] == 0.0
         assert grid[-1] == REAL_MAX_EV
-        assert np.all(np.diff(grid) > 0.0)
+        np.testing.assert_allclose(np.diff(grid), REAL_STEP_EV)
+        coarse = grid[_coarse_real_grid(grid, width)]
+        np.testing.assert_allclose(np.diff(coarse), REAL_COARSE_STEP_EV)
     grid = imag_grid()
     assert grid[0] == 0.0 and grid[-1] == 100.0
+    assert grid.size == IMAG_FINE_INTERVALS + 1
     assert np.all(np.diff(grid) > 0.0)
+    np.testing.assert_array_equal(grid[_coarse_imag_grid(grid)], grid[::2])
+
+
+def test_real_coverage_is_data_derived_guarded_and_interpolation_safe():
+    required = 95.9568
+    ceiling = _real_coverage_max(required)
+    assert ceiling == 96.5
+    grid = real_grid(RESPONSE_WIDTHS_EV[-1], max_ev=ceiling)
+    assert grid[-1] == ceiling
+    assert grid[-2] > required
+    assert grid[-1] % REAL_COARSE_STEP_EV == 0.0
+    with pytest.raises(ValueError, match="oracle guard"):
+        _real_coverage_max(REAL_HARD_MAX_EV)
+
+
+def test_quadrature_certificate_cannot_hide_cancellation():
+    zero = np.zeros(2, np.complex128)
+    real_fine = np.asarray([0.001, 0.0], np.complex128)
+    imag_fine = np.asarray([-0.001, 0.0], np.complex128)
+    deltas, worst, resolved = _control_certificate(
+        real_fine=real_fine, real_coarse=zero,
+        imag_fine=imag_fine, imag_coarse=zero, imag_tail=imag_fine,
+        tolerance_mev=CD_CONTROL_TOL_MEV)
+    np.testing.assert_allclose(real_fine + imag_fine, zero)
+    assert deltas["imag_full_minus_tail_ev"][0] == 0.0
+    assert worst[0] == 1.0
+    assert not resolved[0]
+    assert resolved[1]
 
 
 def test_streamed_real_coefficients_are_exact_linear_interpolation():

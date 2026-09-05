@@ -1,9 +1,10 @@
-"""Tier-0 fit-free full-frequency correlation self energy.
+"""Tier-0 fit-free full-frequency correlation-self-energy oracle.
 
-This is the production form of the direct-SoS referee (sandbox claim 0363):
+This is the maintained form of the direct-SoS referee (sandbox claim 0363):
 ordered-pair Adler--Wiser chi0, the production distributed Dyson solve,
 canonical q-star unfold, and numerical contour deformation.  No MPA sample
-or pole store is accepted by this module.
+or pole store is accepted by this module.  The route is deliberately an
+O(N^4) oracle and is not eligible to become the production frequency model.
 
 The large objects retain their natural two-dimensional mesh layout.  In
 particular chi and W are ``P(None, 'x', 'y')``.  The contour contraction is
@@ -35,8 +36,14 @@ FREQUENCY_BATCH = 4
 IMAG_ORIGIN_LIMIT_EV = 1.0e-10
 CENTER_SHIFT_EV = 1.0e-10
 REAL_MAX_EV = 70.0
+REAL_STEP_EV = 0.25
+REAL_COARSE_STEP_EV = 0.50
+REAL_HARD_MAX_EV = 250.0
 IMAG_MAX_EV = 100.0
-RESPONSE_WIDTHS_EV = (0.10, 0.05, 0.025, 0.0125, 0.00625)
+IMAG_MAP_SCALE_EV = 2.5
+IMAG_FINE_INTERVALS = 64
+CD_CONTROL_TOL_MEV = 0.5
+RESPONSE_WIDTHS_EV = (0.25,)
 
 
 @dataclass(frozen=True)
@@ -46,61 +53,98 @@ class InternalFFResult:
     artifact_path: str
 
 
-def _segmented_grid(segments) -> np.ndarray:
-    pieces = []
-    for lo, hi, step in segments:
-        row = np.arange(lo, hi + 0.25 * step, step, dtype=np.float64)
-        if pieces and abs(float(row[0] - pieces[-1][-1])) < 1.0e-12:
-            row = row[1:]
-        pieces.append(row)
-    out = np.concatenate(pieces)
-    if out.size < 2 or np.any(np.diff(out) <= 0.0):
-        raise ValueError("internal_ff_cd frequency grid is not increasing")
-    return out
+def real_grid(width_ev: float, *, max_ev: float = REAL_MAX_EV) -> np.ndarray:
+    """Uniform residue line at the requested physical broadening.
 
-
-def real_grid(width_ev: float) -> np.ndarray:
-    """The referee grid at one response width, extended to 70 eV."""
+    ``max_ev`` is normally derived from the run's complete target/intermediate
+    energy-difference table.  The exported default exists only for small
+    deterministic tests; it is not the production coverage decision.
+    """
     width_ev = float(width_ev)
     if width_ev not in RESPONSE_WIDTHS_EV:
         raise ValueError(
             f"internal_ff_cd response width {width_ev} eV is not in the "
-            f"certification ladder {RESPONSE_WIDTHS_EV}")
-    mid = 0.4 if width_ev == 0.10 else 0.2
-    high = 2.0 if width_ev == 0.10 else 1.0
-    return _segmented_grid(((0.0, 12.0, width_ev),
-                            (12.0 + mid, 30.0, mid),
-                            (30.0 + high, REAL_MAX_EV, high)))
+            f"fixed oracle policy {RESPONSE_WIDTHS_EV}")
+    max_ev = float(max_ev)
+    if not (np.isfinite(max_ev) and 0.0 < max_ev <= REAL_HARD_MAX_EV):
+        raise ValueError(
+            f"internal_ff_cd real coverage must lie in (0, "
+            f"{REAL_HARD_MAX_EV}] eV, got {max_ev!r}")
+    n = int(np.ceil(max_ev / REAL_STEP_EV - 1.0e-12))
+    return REAL_STEP_EV * np.arange(n + 1, dtype=np.float64)
 
 
-def imag_grid() -> np.ndarray:
-    return _segmented_grid(((0.0, 6.0, 0.05),
-                            (6.2, 30.0, 0.2),
-                            (31.0, IMAG_MAX_EV, 1.0)))
+def imag_grid(n_intervals: int = IMAG_FINE_INTERVALS) -> np.ndarray:
+    """Nested tangent-mapped imaginary grid including 0 and the tail edge."""
+    n_intervals = int(n_intervals)
+    if n_intervals <= 0:
+        raise ValueError("internal_ff_cd imaginary intervals must be positive")
+    theta_max = np.arctan(IMAG_MAX_EV / IMAG_MAP_SCALE_EV)
+    theta = np.linspace(0.0, theta_max, n_intervals + 1)
+    grid = IMAG_MAP_SCALE_EV * np.tan(theta)
+    grid[0], grid[-1] = 0.0, IMAG_MAX_EV
+    return grid
 
 
 def _coarse_real_grid(fine: np.ndarray, width_ev: float) -> np.ndarray:
-    wanted = _segmented_grid(((0.0, 12.0, 2.0 * width_ev),
-                              (12.4, 30.0, 0.4),
-                              (32.0, REAL_MAX_EV, 2.0)))
-    return _require_nested(fine, wanted)
+    del width_ev
+    stride = int(round(REAL_COARSE_STEP_EV / REAL_STEP_EV))
+    if stride <= 1 or not np.isclose(
+            stride * REAL_STEP_EV, REAL_COARSE_STEP_EV):
+        raise AssertionError("real CD fine/coarse spacings are not nested")
+    idx = np.arange(0, fine.size, stride, dtype=np.int32)
+    if idx[-1] != fine.size - 1:
+        idx = np.append(idx, fine.size - 1).astype(np.int32)
+    return idx
 
 
 def _coarse_imag_grid(fine: np.ndarray) -> np.ndarray:
-    wanted = _segmented_grid(((0.0, 6.0, 0.1),
-                              (6.4, 30.0, 0.4),
-                              (32.0, IMAG_MAX_EV, 2.0)))
-    return _require_nested(fine, wanted)
+    if fine.size != IMAG_FINE_INTERVALS + 1:
+        raise ValueError(
+            "internal_ff_cd coarse imaginary certificate requires the "
+            f"canonical {IMAG_FINE_INTERVALS + 1}-node fine grid")
+    return np.arange(0, fine.size, 2, dtype=np.int32)
 
 
-def _require_nested(fine: np.ndarray, wanted: np.ndarray) -> np.ndarray:
-    pos = np.searchsorted(fine, wanted)
-    lo = np.clip(pos - 1, 0, fine.size - 1)
-    hi = np.clip(pos, 0, fine.size - 1)
-    idx = np.where(abs(fine[lo] - wanted) <= abs(fine[hi] - wanted), lo, hi)
-    if float(np.max(abs(fine[idx] - wanted))) > 1.0e-10:
-        raise ValueError("internal_ff_cd coarse grid is not nested in fine grid")
-    return idx.astype(np.int32)
+def _real_coverage_max(required_max_ev: float) -> float:
+    """Return an interpolation-safe, coarse-grid-aligned real ceiling."""
+    required_max_ev = float(required_max_ev)
+    if not (np.isfinite(required_max_ev) and required_max_ev >= 0.0):
+        raise ValueError(
+            "internal_ff_cd residue coverage must be finite and nonnegative, "
+            f"got {required_max_ev!r}")
+    # Linear interpolation needs a node strictly above every residue energy.
+    # Align that guard node to both the 0.25 eV fine and 0.50 eV control grids.
+    max_ev = REAL_COARSE_STEP_EV * np.ceil(
+        (required_max_ev + REAL_STEP_EV) / REAL_COARSE_STEP_EV)
+    if max_ev > REAL_HARD_MAX_EV + 1.0e-12:
+        raise ValueError(
+            "internal_ff_cd interpolation-safe real W coverage would require "
+            f"{max_ev:.6f} eV for a {required_max_ev:.6f} eV residue, beyond "
+            f"the explicit {REAL_HARD_MAX_EV:.6f} eV oracle guard")
+    return float(max_ev)
+
+
+def _control_certificate(*, real_fine: np.ndarray,
+                         real_coarse: np.ndarray,
+                         imag_fine: np.ndarray,
+                         imag_coarse: np.ndarray,
+                         imag_tail: np.ndarray,
+                         tolerance_mev: float = CD_CONTROL_TOL_MEV):
+    """Certify each quadrature control separately, without cancellation."""
+    deltas = {
+        "real_fine_minus_coarse_ev": np.asarray(real_fine - real_coarse),
+        "imag_fine_minus_coarse_ev": np.asarray(imag_fine - imag_coarse),
+        "imag_full_minus_tail_ev": np.asarray(imag_fine - imag_tail),
+    }
+    component_abs_mev = np.stack([
+        1000.0 * np.abs(delta.real) for delta in deltas.values()
+    ] + [
+        1000.0 * np.abs(delta.imag) for delta in deltas.values()
+    ])
+    worst_mev = np.max(component_abs_mev, axis=0)
+    resolved = worst_mev <= float(tolerance_mev)
+    return deltas, worst_mev, resolved
 
 
 def _panel_bounds(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -449,8 +493,9 @@ def compute_internal_ff_cd(
 
     The external target set is the file wedge (``kirr_fullids``) times the
     complete Sigma evaluation window.  The returned array is unfolded to
-    the driver's full k set.  A failed response-width cell is written to the
-    ledger and then refused by name; it is never hidden by a mean.
+    the driver's full k set.  A failed quadrature-control cell is written to
+    the ledger and then refused by name; it is never hidden by cancellation
+    or a mean.
     """
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from symmetry_maps import unfold_isdf_operator
@@ -509,11 +554,7 @@ def compute_internal_ff_cd(
     x_signed = target_e_ev[:, None, None] - inner_e_ev + CENTER_SHIFT_EV
     x_abs = abs(x_signed)
     max_required = float(np.max(x_abs[:, :, :band_slices.nb_sigma_sum]))
-    if max_required > REAL_MAX_EV + 1.0e-10:
-        raise ValueError(
-            f"internal_ff_cd real W coverage stops at {REAL_MAX_EV:.6f} eV "
-            f"but a contour residue needs {max_required:.6f} eV; "
-            "extrapolation is forbidden")
+    real_max_ev = _real_coverage_max(max_required)
     residue_sign = np.where(x_signed >= 0.0, -(1.0 - inner_f), inner_f)
 
     direct = make_direct_kernel(
@@ -573,7 +614,7 @@ def compute_internal_ff_cd(
     final_coarse_real = None
     checkpoint_dir = Path(input_dir) / "internal_ff_cd_checkpoints"
     for width in RESPONSE_WIDTHS_EV:
-        grid = real_grid(width)
+        grid = real_grid(width, max_ev=real_max_ev)
         coarse = (_coarse_real_grid(grid, width)
                   if width == RESPONSE_WIDTHS_EV[-1] else None)
         coarse_lookup = ({int(i): j for j, i in enumerate(coarse)}
@@ -642,6 +683,7 @@ def compute_internal_ff_cd(
     icoarse = _coarse_imag_grid(igrid)
     icoarse_lookup = {int(i): j for j, i in enumerate(icoarse)}
     itail = igrid[igrid <= 60.0 + 1.0e-12]
+    tail_panel_max_ev = float(_panel_bounds(itail)[1][-1])
     identity = _checkpoint_identity(
         kind="imaginary", grid=igrid, width_ev=None,
         target_k=target_k, target_b=target_b, state=state,
@@ -710,39 +752,43 @@ def compute_internal_ff_cd(
         wfns, target_k, target_b, state=state, config=config, meta=meta,
         mesh=mesh_xy, sym=sym, wfn=wfn, V_q=V_q,
         band_slices=band_slices, print_fn=print_fn)
-    totals = np.stack(real_results) + imag_accum[None] + head_ev[None]
-    re_steps_mev = 1000.0 * np.diff(np.real(totals), axis=0)
-    im_steps_mev = 1000.0 * np.diff(np.imag(totals), axis=0)
-    contracts = abs(re_steps_mev[-1]) < abs(re_steps_mev[-2])
+    totals = real_results[-1] + imag_accum + head_ev
+    controls, control_max_mev, contracts = _control_certificate(
+        real_fine=real_results[-1], real_coarse=final_coarse_real,
+        imag_fine=imag_accum, imag_coarse=imag_coarse,
+        imag_tail=imag_tail)
     unresolved = np.flatnonzero(~contracts)
-    coarse_total = final_coarse_real + imag_coarse + head_ev
-    controls = {
-        "grid_fine_minus_coarse_ev": totals[-1] - coarse_total,
-        "imag_100_minus_60_ev": imag_accum - imag_tail,
-        "center_branch_shift_ev": np.full(n_targets, CENTER_SHIFT_EV),
-    }
     labels = _target_labels(sym, target_k, target_b, band_slices.b0)
     records = []
     for i, label in enumerate(labels):
         records.append({
             **label,
             "resolved": bool(contracts[i]),
-            "response_widths_ev": list(RESPONSE_WIDTHS_EV),
-            "response_re_successive_steps_mev": re_steps_mev[:, i].tolist(),
-            "response_im_successive_steps_mev": im_steps_mev[:, i].tolist(),
-            "sigma_c_ev": [float(totals[-1, i].real),
-                            float(totals[-1, i].imag)],
+            "control_tolerance_mev": CD_CONTROL_TOL_MEV,
+            "control_max_component_mev": float(control_max_mev[i]),
+            "response_width_ev": float(RESPONSE_WIDTHS_EV[-1]),
+            "sigma_c_ev": [float(totals[i].real),
+                            float(totals[i].imag)],
             "body_residue_ev": [float(real_results[-1][i].real),
                                   float(real_results[-1][i].imag)],
             "body_imag_axis_ev": [float(imag_accum[i].real),
                                     float(imag_accum[i].imag)],
             "head_ev": [float(head_ev[i].real), float(head_ev[i].imag)],
-            "grid_fine_minus_coarse_mev": [
-                float(1000.0 * controls["grid_fine_minus_coarse_ev"][i].real),
-                float(1000.0 * controls["grid_fine_minus_coarse_ev"][i].imag)],
-            "imag_100_minus_60_mev": [
-                float(1000.0 * controls["imag_100_minus_60_ev"][i].real),
-                float(1000.0 * controls["imag_100_minus_60_ev"][i].imag)],
+            "real_fine_minus_coarse_mev": [
+                float(1000.0 * controls[
+                    "real_fine_minus_coarse_ev"][i].real),
+                float(1000.0 * controls[
+                    "real_fine_minus_coarse_ev"][i].imag)],
+            "imag_fine_minus_coarse_mev": [
+                float(1000.0 * controls[
+                    "imag_fine_minus_coarse_ev"][i].real),
+                float(1000.0 * controls[
+                    "imag_fine_minus_coarse_ev"][i].imag)],
+            "imag_full_minus_tail_mev": [
+                float(1000.0 * controls[
+                    "imag_full_minus_tail_ev"][i].real),
+                float(1000.0 * controls[
+                    "imag_full_minus_tail_ev"][i].imag)],
         })
     artifact = {
         "schema": 1,
@@ -768,9 +814,16 @@ def compute_internal_ff_cd(
             "q_wedge": int(q_full.size), "q_full": nk,
         },
         "coverage": {
-            "real_max_ev": REAL_MAX_EV,
+            "real_max_ev": real_max_ev,
             "residue_required_max_ev": max_required,
             "imag_max_ev": IMAG_MAX_EV,
+            "imag_tail_last_sample_ev": float(itail[-1]),
+            "imag_tail_panel_max_ev": tail_panel_max_ev,
+        },
+        "certificate": {
+            "tolerance_mev": CD_CONTROL_TOL_MEV,
+            "rule": "max absolute real/imag component of each independent "
+                    "real-grid, imaginary-grid, and imaginary-tail control",
         },
         "grids": grid_records,
         "head": head_record,
@@ -786,16 +839,21 @@ def compute_internal_ff_cd(
     if unresolved.size:
         names = [
             f"k={labels[i]['k_crystal']}, band={labels[i]['band_one_based']} "
-            f"(last steps {re_steps_mev[-2, i]:+.3f}, "
-            f"{re_steps_mev[-1, i]:+.3f} meV)" for i in unresolved]
+            f"(real-grid={1000.0 * controls['real_fine_minus_coarse_ev'][i].real:+.3f}"
+            f"{1000.0 * controls['real_fine_minus_coarse_ev'][i].imag:+.3f}i, "
+            f"imag-grid={1000.0 * controls['imag_fine_minus_coarse_ev'][i].real:+.3f}"
+            f"{1000.0 * controls['imag_fine_minus_coarse_ev'][i].imag:+.3f}i, "
+            f"imag-tail={1000.0 * controls['imag_full_minus_tail_ev'][i].real:+.3f}"
+            f"{1000.0 * controls['imag_full_minus_tail_ev'][i].imag:+.3f}i meV)"
+            for i in unresolved]
         raise RuntimeError(
-            "internal_ff_cd response-width contraction failed at the "
-            f"eta_W floor {RESPONSE_WIDTHS_EV[-1]} eV for "
+            "internal_ff_cd componentwise quadrature certificate exceeded "
+            f"{CD_CONTROL_TOL_MEV:g} meV for "
             f"{len(names)} cells; they are NAMED UNRESOLVED and no mean or "
             "full-deck claim is emitted. Artifact: " + artifact_path + "\n  "
             + "\n  ".join(names))
 
-    sigma_irr = totals[-1].reshape(k_wedge.size, sigma_bands.size)
+    sigma_irr = totals.reshape(k_wedge.size, sigma_bands.size)
     sigma_full = sigma_irr[np.asarray(sym.irr_idx_k, dtype=np.int32)]
     return InternalFFResult(
         sigma_c_diag_ev=np.asarray(sigma_full),
@@ -807,4 +865,6 @@ __all__ = [
     "InternalFFResult", "compute_internal_ff_cd", "make_direct_kernel",
     "make_weighted_contract_kernel", "real_grid", "imag_grid",
     "FREQUENCY_BATCH", "RESPONSE_WIDTHS_EV", "REAL_MAX_EV", "IMAG_MAX_EV",
+    "REAL_STEP_EV", "REAL_COARSE_STEP_EV", "REAL_HARD_MAX_EV",
+    "IMAG_FINE_INTERVALS", "CD_CONTROL_TOL_MEV",
 ]
