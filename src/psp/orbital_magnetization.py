@@ -65,6 +65,10 @@ from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 import psp.vnl_ops as vnl_ops
+from psp.orbital_response import (
+    magnetic_axial_projector,
+    orbital_pieces_at_k,
+)
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -125,42 +129,6 @@ def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb, gvectors=None):
     return v_kin, v_nl, eps, sz
 
 
-# ----------------------------------------------------------------------
-#  Modern-theory sum-over-states summand at one k
-# ----------------------------------------------------------------------
-def orbital_pieces_at_k(v, eps, nocc, deps_tol):
-    """mu-independent building blocks of the orbital-moment summand at one k.
-
-    Returns (PA, PB), each (3, nb, nb) complex, with the per-(gamma, n, m) terms
-
-        PA[g,n,m] = occ[n] * cross_g[n,m] * (eps_n + eps_m) / (eps_n-eps_m)^2
-        PB[g,n,m] = occ[n] * cross_g[n,m] /               (eps_n-eps_m)^2
-
-    where cross_g[n,m] = eps_{g a b} v^a_nm v^b_mn, index map v^a_nm = v[a,n,m]
-    (bra n, ket m), so cross_z = v[0]*v[1].T - v[1]*v[0].T (element-wise).
-    The full summand at chemical potential mu is then linear in mu:
-
-        summand_g(mu)[n,m] = PA[g,n,m] - 2*mu*PB[g,n,m]
-
-    so ANY mu, the per-band breakdown (sum over m), and the band-ceiling
-    convergence (cumsum over m) all follow from one pass — no recomputation.
-    The (-1/2) prefactor and Im[.] are applied by the caller.  Degenerate /
-    diagonal denominators (|eps_n-eps_m| <= deps_tol) are masked to 0.
-    """
-    nb = v.shape[1]
-    vt = np.swapaxes(v, 1, 2)                        # vt[a, n, m] = v[a, m, n]
-    cross = np.stack([v[1] * vt[2] - v[2] * vt[1],   # x  (eps_xab, ab=yz)
-                      v[2] * vt[0] - v[0] * vt[2],   # y  (ab=zx)
-                      v[0] * vt[1] - v[1] * vt[0]])   # z  (ab=xy)   (3,nb,nb)
-    deps = eps[:, None] - eps[None, :]               # eps_n - eps_m
-    mask = np.abs(deps) > deps_tol
-    inv2 = np.where(mask, 1.0 / np.where(mask, deps, 1.0) ** 2, 0.0)  # 1/Delta^2
-    occ = np.zeros((nb, 1)); occ[:nocc, 0] = 1.0     # outer sum over occupied n
-    Wa = occ * ((eps[:, None] + eps[None, :]) * inv2)
-    Wb = occ * inv2
-    return cross * Wa[None], cross * Wb[None]         # PA, PB : (3, nb, nb)
-
-
 def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
     """Symmetry-reduced orbital-magnetization accumulation.
 
@@ -178,33 +146,9 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
         w_ibz = w_ibz / w_ibz.sum()
     B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
 
-    active_rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
-    # This is a cell-integrated q=0 vector, so every Seitz translation phase
-    # is unity; the shared typed action owns the remaining rotation/TR signs.
-    action = sym.cartesian_action(
-        active_rows, axial=True, time_odd=True)
+    Pmat, active_rows = magnetic_axial_projector(sym, m_axis)
     m = np.asarray(m_axis, dtype=np.float64)
-    m_norm = float(np.linalg.norm(m))
-    if m.shape != (3,) or not np.all(np.isfinite(m)) or m_norm <= 1.0e-12:
-        raise ValueError(
-            "orbmag IBZ magnetization axis must be a finite nonzero 3-vector; "
-            f"got {m_axis!r}.")
-    m = m / m_norm
-    if not bool(sym.trs_allowed):
-        if str(sym.operation_typing_source) != "qe-schema":
-            raise RuntimeError(
-                "orbmag IBZ on a time-reversal-broken reference requires "
-                "authenticated QE operation typing.")
-        mapped_m = np.einsum('sij,j->si', action, m)
-        bad = np.flatnonzero(~np.all(np.isclose(
-            mapped_m, m[None, :], rtol=0.0, atol=1.0e-6), axis=1))
-        if bad.size:
-            raise ValueError(
-                "orbmag magnetization axis is inconsistent with active "
-                f"typed operation row {int(active_rows[bad[0]])}.")
-    # Do not select a second subgroup here. In particular, pure time reversal
-    # must remain present on a nonmagnet and project a time-odd moment to zero.
-    Pmat = np.asarray(action, dtype=np.float64).mean(axis=0)
+    m = m / np.linalg.norm(m)
     print(f"[orbmag-ibz] nk_ibz={nrk}  full-BZ={int(sym.nk_tot)}  "
           f"|G|={len(active_rows)} active typed ops  "
           f"mag-axis={tuple(float(x) for x in m)}")
@@ -263,6 +207,83 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
     PB_band_z = np.einsum('a,anm->nm', Pmat[2], PB_band)
     info = {"nk_ibz": nrk, "nG": len(active_rows), "idx": active_rows.tolist()}
     return cA, cB, PA_band_z, PB_band_z, -float(S_sum[2]), E, info
+
+
+def run_dipole_orbmag(wfn, sym, dipole_path, nbnd, nocc, deps_tol, m_axis):
+    """Contract an authenticated full-BZ ``dipole.h5`` without redoing it."""
+    import h5py
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    path = Path(dipole_path).resolve()
+    with h5py.File(path, "r") as h5:
+        attrs = h5.attrs
+        required = (
+            "prov_nval", "prov_ncond", "prov_nband", "prov_nb_written",
+            "prov_bispinor", "prov_skip_vnl", "prov_vnl_mode",
+            "prov_vnl_velocity_sign",
+        )
+        missing = [name for name in required if name not in attrs]
+        if missing:
+            raise SystemExit(
+                "[orbmag] ERROR: dipole reuse requires complete operator and "
+                f"window provenance; {path} lacks {missing}.")
+        stamp = {name: attrs[name] for name in required}
+    ok = check_dipole_provenance(
+        path, wfn=wfn,
+        nval=int(stamp["prov_nval"]),
+        ncond=int(stamp["prov_ncond"]),
+        nband=int(stamp["prov_nband"]),
+        bispinor=bool(stamp["prov_bispinor"]),
+        skip_vnl=bool(stamp["prov_skip_vnl"]),
+        vnl_mode=str(stamp["prov_vnl_mode"]),
+        vnl_velocity_sign=float(stamp["prov_vnl_velocity_sign"]),
+    )
+    if not ok:
+        raise SystemExit(
+            "[orbmag] ERROR: dipole provenance did not authenticate against "
+            "this WFN; refusing reuse.")
+
+    nk = int(sym.nk_tot)
+    nb_written = int(stamp["prov_nb_written"])
+    if nbnd > nb_written:
+        raise SystemExit(
+            f"[orbmag] ERROR: --nbnd={nbnd} exceeds the authenticated "
+            f"dipole extent {nb_written}.")
+    E = np.stack([
+        np.asarray(wfn.energies[0, int(sym.irr_idx_k[ik]), :nbnd],
+                   dtype=np.float64)
+        for ik in range(nk)
+    ])
+    cA_raw = np.zeros(3, dtype=np.complex128)
+    cB_raw = np.zeros(3, dtype=np.complex128)
+    PA_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+    PB_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+    with h5py.File(path, "r") as h5:
+        dataset = h5["dipole_cart"]
+        if tuple(dataset.shape[:2]) != (3, nk):
+            raise SystemExit(
+                "[orbmag] ERROR: dipole carrier has shape "
+                f"{dataset.shape}; expected (3,{nk},nb,nb).")
+        for ik in range(nk):
+            velocity = np.asarray(dataset[:, ik, :nbnd, :nbnd])
+            pa, pb = orbital_pieces_at_k(
+                velocity, E[ik], nocc, deps_tol)
+            cA_raw += pa.sum(axis=(1, 2)) / nk
+            cB_raw += pb.sum(axis=(1, 2)) / nk
+            PA_band += pa / nk
+            PB_band += pb / nk
+            if (ik + 1) % 12 == 0 or ik == nk - 1:
+                print(f"         dipole k {ik + 1}/{nk}")
+    projector, rows = magnetic_axial_projector(sym, m_axis)
+    cA = projector.astype(np.complex128) @ cA_raw
+    cB = projector.astype(np.complex128) @ cB_raw
+    PA_band_z = np.einsum("a,anm->nm", projector[2], PA_band)
+    PB_band_z = np.einsum("a,anm->nm", projector[2], PB_band)
+    info = {
+        "nk_ibz": int(wfn.nkpts), "nG": len(rows), "idx": rows.tolist(),
+        "method": "authenticated_dipole", "path": str(path),
+    }
+    return cA, cB, PA_band_z, PB_band_z, np.nan, E, info
 
 
 # ----------------------------------------------------------------------
@@ -445,6 +466,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(allow_abbrev=False,
         description="Per-cell orbital magnetic moment (modern theory, dH/dk).")
     p.add_argument("--wfn", required=True, help="WFN.h5 (BGW format, nspinor=2)")
+    p.add_argument("--dipole", default=None,
+                   help="Reuse an authenticated full-BZ dipole.h5 velocity "
+                        "instead of rebuilding it from WFN coefficients.")
     p.add_argument("--nbnd", type=int, default=None,
                    help="Inner-sum band ceiling (default: all bands in file)")
     p.add_argument("--nocc", type=int, default=None,
@@ -515,6 +539,12 @@ def main(argv=None):
           f"nk_ibz={int(wfn.nrk) if hasattr(wfn,'nrk') else len(wfn.kweights)}  "
           f"nk_full={int(sym.nk_tot)}")
 
+    if args.dipole and (args.method != "sos" or args.skip_vnl
+                        or args.vnl_sign != "auto"):
+        sys.exit("[orbmag] ERROR: --dipole is an already assembled full "
+                 "velocity and only supports --method sos with the default "
+                 "operator convention.")
+
     # Pseudopotentials for the nonlocal velocity (dV_NL/dk).
     pdirs = [args.pseudo_dir] if args.pseudo_dir else []
     pdirs += [str(wfn_path.parent),
@@ -527,7 +557,7 @@ def main(argv=None):
             if pseudos:
                 print(f"[orbmag] pseudopotentials from: {d}  -> {list(pseudos)}")
                 break
-    if not args.skip_vnl and not pseudos:
+    if not args.dipole and not args.skip_vnl and not pseudos:
         sys.exit("[orbmag] ERROR: no *.upf found (need them for dV_NL/dk). "
                  "Pass --pseudo-dir, or --skip-vnl for a kinetic-only diagnostic.")
     if pseudos:
@@ -537,7 +567,7 @@ def main(argv=None):
             pass
 
     vnl_setup = None
-    if not args.skip_vnl:
+    if not args.dipole and not args.skip_vnl:
         vnl_setup = vnl_ops.build_vnl_setup(
             wfn, sym, meta, pseudos, nspinor=nspinor)
 
@@ -547,7 +577,21 @@ def main(argv=None):
               f"{int(sym.nk_tot)}); pass --ibz for typed magnetic symmetry.")
 
     out_extra = {}                                   # branch-specific --out payload
-    if args.method == "sternheimer":
+    if args.dipole:
+        print("[orbmag] reusing authenticated full-BZ velocity: "
+              f"{Path(args.dipole).resolve()}")
+        cA, cB, PA_band_z, PB_band_z, m_spin_z, E, info = run_dipole_orbmag(
+            wfn, sym, args.dipole, nbnd, nocc, deps_tol,
+            np.asarray(args.mag_axis, dtype=np.float64))
+
+        def C_of_mu(m):
+            return cA - 2.0 * m * cB
+        out_extra = {
+            "cA": cA, "cB": cB,
+            "dipole_path": np.asarray(str(Path(args.dipole).resolve())),
+            "ibz_ops": np.asarray(info["idx"]),
+        }
+    elif args.method == "sternheimer":
         # ---- band-sum-free Sternheimer covariant-derivative branch -------
         if vnl_setup is None:
             sys.exit("[orbmag] ERROR: --method sternheimer needs the full KS H "
@@ -647,11 +691,15 @@ def main(argv=None):
     if gap_eV < 0:
         print("         NOTE: negative indirect gap at this k-sampling -> the "
               "moment is mu-dependent (run --mu-scan).")
-    print(f"\n[orbmag] spin moment  sum_occ <sigma_z> = {-m_spin_z:+.4f}  -> "
-          f"|m_spin| = {abs(m_spin_z):.3f} mu_B  (expect ~6 for CrI3)")
+    if np.isfinite(m_spin_z):
+        print(f"\n[orbmag] spin moment  sum_occ <sigma_z> = {-m_spin_z:+.4f}  -> "
+              f"|m_spin| = {abs(m_spin_z):.3f} mu_B  (expect ~6 for CrI3)")
+    else:
+        print("\n[orbmag] spin moment not recomputed: authenticated dipole "
+              "contains the orbital velocity but not <sigma>.")
 
     m_orb = -MU_B_PREFACTOR * C_of_mu(mu).imag       # (3,) mu_B, file frame
-    frame = 1.0 if m_spin_z >= 0 else -1.0
+    frame = 1.0 if not np.isfinite(m_spin_z) or m_spin_z >= 0 else -1.0
     m_orb_par = float(frame * m_orb[2])              # along spin-moment axis
 
     print("\n" + "=" * 64)
@@ -660,9 +708,12 @@ def main(argv=None):
     print(f"  m_x = {m_orb[0]:+.5f}   m_y = {m_orb[1]:+.5f}   "
           f"(should be ~0 by symmetry)")
     print(f"  m_z = {m_orb[2]:+.5f}   (file z-axis = crystal c, out of plane)")
-    print(f"  orbital moment along spin axis: {m_orb_par:+.5f} mu_B  "
-          f"({'PARALLEL' if m_orb_par>0 else 'ANTIPARALLEL'} to spin)")
-    print(f"  spin moment |m_spin| = {abs(m_spin_z):.3f} mu_B")
+    if np.isfinite(m_spin_z):
+        print(f"  orbital moment along spin axis: {m_orb_par:+.5f} mu_B  "
+              f"({'PARALLEL' if m_orb_par>0 else 'ANTIPARALLEL'} to spin)")
+        print(f"  spin moment |m_spin| = {abs(m_spin_z):.3f} mu_B")
+    else:
+        print("  spin-axis relation unavailable in dipole-reuse mode")
     if args.method == "sternheimer":
         print(f"  [Sternheimer covariant-derivative: BAND-SUM-FREE, "
               f"{info['nk_ibz']} full-BZ k, occupied-only]")

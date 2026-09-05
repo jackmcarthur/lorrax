@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 import numpy as np
 
 # THE startup call (runtime module docstring): env defaults, fail-fast
@@ -941,6 +942,242 @@ def require_newton_converged(residual: float, *, where: str) -> None:
             f"{NEWTON_RESIDUAL_MAX:.1e}-Ry residual cap after 50 steps")
 
 
+def fourier_hermitian_with_crystal_derivative(q_frac, R_grid, operator_R):
+    """Evaluate one Hermitian Fourier operator and its analytic derivative.
+
+    This is the value convention used by the path and fine-grid htransform:
+    ``Herm[sum_R exp(-2 pi i q.R) O_R]``.  The derivative is with respect to
+    fractional crystal coordinates.  Cartesian conversion belongs to the
+    observable that knows the reciprocal lattice.
+    """
+    phase = jnp.exp(-2j * jnp.pi * (q_frac @ R_grid.T))
+    raw = 0.5 * jnp.einsum("br,rij->bij", phase, operator_R,
+                            optimize=True)
+    derivative_raw = 0.5 * jnp.einsum(
+        "br,ra,rij->baij", phase, -2j * jnp.pi * R_grid, operator_R,
+        optimize=True)
+    matrix = raw + jnp.swapaxes(raw, -1, -2).conj()
+    derivative = (
+        derivative_raw
+        + jnp.swapaxes(derivative_raw, -1, -2).conj())
+    return matrix, derivative
+
+
+def velocity_from_transformed_derivative(
+        dfH_cart, vectors, transformed_energies, energies,
+        *, degeneracy_tolerance_ry: float):
+    """Convert ``d f(H)`` to off-diagonal ``dH`` in H's eigenbasis."""
+    right = jnp.einsum(
+        "baij,bjn->bain", dfH_cart, vectors, optimize=True)
+    dfH_eigen = jnp.einsum(
+        "bim,bain->bamn", jnp.conj(vectors), right, optimize=True)
+    dE = energies[:, :, None] - energies[:, None, :]
+    dlam = (transformed_energies[:, :, None]
+            - transformed_energies[:, None, :])
+    separated = jnp.abs(dE) > float(degeneracy_tolerance_ry)
+    f_floor = (128.0 * jnp.finfo(jnp.float64).eps
+               * jnp.maximum(
+                   1.0,
+                   jnp.abs(transformed_energies[:, :, None])
+                   + jnp.abs(transformed_energies[:, None, :])))
+    stable = jnp.abs(dlam) > f_floor
+    unsafe = separated & (~stable)
+    ratio = jnp.where(
+        separated & stable,
+        dE / jnp.where(stable, dlam, 1.0),
+        0.0)
+    return dfH_eigen * ratio[:, None], unsafe
+
+
+def htransform_orbital_magnetization(
+        fH_R, transform, R_grid, *, fine_grid, nstates: int,
+        band_ceiling: int, nocc: int, bvec_cart, sym, mesh_xy: Mesh,
+        mu_ev: float | None = None, degeneracy_tolerance_ev: float = 1.4e-3,
+        magnetization_axis=(0.0, 0.0, 1.0), log_fn=None,
+        progress_fn=None):
+    """Modern-theory moment of the Hamiltonian represented by ``fH_R``.
+
+    For off-diagonal eigenstate pairs, functional calculus gives
+
+    ``<m|dH|n> = (E_m-E_n)/(f(E_m)-f(E_n)) <m|d f(H)|n>``.
+
+    Differentiating the existing Fourier series therefore includes every
+    term in the interpolated Hamiltonian.  With DFT energies it is the full
+    mean-field velocity; with an authenticated QP overlay it also contains
+    the covariant self-energy commutator contribution.  No separate velocity
+    or symmetry implementation is introduced.
+    """
+    from psp.orbital_response import (
+        magnetic_axial_projector,
+        moment_mu_b,
+        orbital_cA_cB_jax,
+    )
+    from common.progress import LoopProgress
+
+    log = log_fn if log_fn is not None else (lambda *_a, **_k: None)
+    grid = tuple(int(x) for x in fine_grid)
+    if len(grid) != 3 or any(x <= 0 for x in grid):
+        raise ValueError(
+            "htransform orbital-magnetization grid must contain three "
+            f"positive integers; got {fine_grid!r}.")
+    nstates = int(nstates)
+    band_ceiling = int(band_ceiling)
+    nocc = int(nocc)
+    operator_rank = int(fH_R.shape[-1])
+    if int(fH_R.shape[-2]) != operator_rank or nstates > operator_rank:
+        raise ValueError(
+            "htransform orbital magnetization requires a square Galerkin "
+            f"Hamiltonian whose rank covers every fitted state; got "
+            f"shape={tuple(fH_R.shape)}, fitted_states={nstates}.")
+    if not (0 < nocc < band_ceiling <= nstates):
+        raise ValueError(
+            "htransform orbital magnetization requires "
+            f"0 < nocc < band_ceiling <= nstates; got "
+            f"{nocc}, {band_ceiling}, {nstates}.")
+    tol_ry = float(degeneracy_tolerance_ev) / RYD_TO_EV
+    if not np.isfinite(tol_ry) or tol_ry < 0.0:
+        raise ValueError(
+            "orbital degeneracy tolerance must be finite and non-negative; "
+            f"got {degeneracy_tolerance_ev!r} eV.")
+
+    q_host = np.stack(np.meshgrid(
+        *(np.arange(n, dtype=np.float64) / n for n in grid),
+        indexing="ij"), axis=-1).reshape(-1, 3)
+    q_host = (q_host + 0.5) % 1.0 - 0.5
+    nq = int(q_host.shape[0])
+    batch_size = padded_axis(
+        1, mesh_xy, name="htransform orbital q batch",
+        spec=P(("x", "y"), None), axis=0).carrier
+    q_pad = padded_axis(
+        nq, batch_size, name="htransform orbital q carrier").pad
+    if q_pad:
+        q_host = np.concatenate(
+            (q_host, np.zeros((q_pad, 3), dtype=np.float64)), axis=0)
+    q_dev = device_put_process_local(
+        q_host, NamedSharding(mesh_xy, P(None, None)))
+
+    batch_matrix = NamedSharding(mesh_xy, P(("x", "y"), None, None))
+    batch_derivative = NamedSharding(
+        mesh_xy, P(("x", "y"), None, None, None))
+    batch_vector = NamedSharding(mesh_xy, P(("x", "y"), None))
+    batch_scalar = NamedSharding(mesh_xy, P(("x", "y"),))
+    replicated = NamedSharding(mesh_xy, P())
+    a_f, n_f, shift = (float(x) for x in transform)
+    B_inv = jnp.asarray(
+        np.linalg.inv(np.asarray(bvec_cart, dtype=np.float64)),
+        dtype=jnp.float64)
+
+    @partial(
+        jax.jit,
+        out_shardings=(batch_vector, batch_vector, batch_scalar,
+                       batch_scalar, replicated, replicated))
+    def _batch(q_batch, operator_R):
+        fH, dfH_crys = fourier_hermitian_with_crystal_derivative(
+            q_batch, R_grid, operator_R)
+        fH = jax.lax.with_sharding_constraint(fH, batch_matrix)
+        dfH_crys = jax.lax.with_sharding_constraint(
+            dfH_crys, batch_derivative)
+        lam_all, vectors_all = jax.vmap(jnp.linalg.eigh)(fH)
+        lam = lam_all[:, :nstates]
+        vectors = vectors_all[:, :, :band_ceiling]
+        energies_all, inverse_residual = newton_inv(
+            a_f, n_f, shift, lam.real)
+        energies = energies_all[:, :band_ceiling]
+
+        # Convert crystal derivatives exactly as the explicit-WFN
+        # Hellmann-Feynman check does: grad_cart = inv(B) @ grad_crys.
+        dfH_cart = jnp.einsum(
+            "ai,bimn->bamn", B_inv, dfH_crys, optimize=True)
+        velocity, unsafe = velocity_from_transformed_derivative(
+            dfH_cart, vectors, lam[:, :band_ceiling], energies,
+            degeneracy_tolerance_ry=tol_ry)
+        cA, cB = orbital_cA_cB_jax(
+            velocity, energies, nocc=nocc, deps_tol_ry=tol_ry)
+        return (
+            cA, cB, energies[:, nocc - 1], energies[:, nocc],
+            jnp.sum(unsafe.astype(jnp.int64)), inverse_residual)
+
+    cA_rows = []
+    cB_rows = []
+    v_rows = []
+    c_rows = []
+    unsafe_pairs = 0
+    inverse_residual = 0.0
+    n_batches = int((nq + q_pad) // batch_size)
+    progress = LoopProgress(
+        n_batches, progress_fn or (lambda *_: None),
+        title="htransform orbital magnetization",
+        item_name="k batch", max_updates=min(12, n_batches),
+        enabled=progress_fn is not None).start()
+    for start in range(0, nq + q_pad, batch_size):
+        result = _batch(q_dev[start:start + batch_size], fH_R)
+        jax.block_until_ready(result)
+        cA_rows.append(gather_to_host(result[0]))
+        cB_rows.append(gather_to_host(result[1]))
+        v_rows.append(gather_to_host(result[2]))
+        c_rows.append(gather_to_host(result[3]))
+        unsafe_pairs += int(jax.device_get(result[4]))
+        inverse_residual = max(
+            inverse_residual, float(jax.device_get(result[5])))
+        progress.step()
+    progress.finish()
+    require_newton_converged(
+        inverse_residual, where="htransform orbital magnetization")
+    if unsafe_pairs:
+        raise ValueError(
+            "htransform orbital magnetization found "
+            f"{unsafe_pairs} nondegenerate band pair(s) whose transformed "
+            "divided difference is numerically singular. Add guard bands "
+            "above the orbital band ceiling; do not zero an unresolved "
+            "velocity contribution.")
+
+    cA_q = np.concatenate(cA_rows, axis=0)[:nq]
+    cB_q = np.concatenate(cB_rows, axis=0)[:nq]
+    valence = np.concatenate(v_rows, axis=0)[:nq]
+    conduction = np.concatenate(c_rows, axis=0)[:nq]
+    cA_raw = cA_q.mean(axis=0)
+    cB_raw = cB_q.mean(axis=0)
+    projector, rows = magnetic_axial_projector(sym, magnetization_axis)
+    cA = projector.astype(np.complex128) @ cA_raw
+    cB = projector.astype(np.complex128) @ cB_raw
+    vbm = float(np.max(valence))
+    cbm = float(np.min(conduction))
+    mu_ry = (0.5 * (vbm + cbm) if mu_ev is None
+             else float(mu_ev) / RYD_TO_EV)
+    raw_moment = moment_mu_b(cA_raw, cB_raw, mu_ry)
+    projected_moment = moment_mu_b(cA, cB, mu_ry)
+    record = {
+        "schema": "lorrax.htransform.orbital_magnetization/v1",
+        "grid": list(grid),
+        "nk": nq,
+        "nocc": nocc,
+        "band_ceiling": band_ceiling,
+        "fitted_states": nstates,
+        "mu_ev": mu_ry * RYD_TO_EV,
+        "mu_source": "midgap_on_fine_grid" if mu_ev is None else "explicit",
+        "vbm_ev": vbm * RYD_TO_EV,
+        "cbm_ev": cbm * RYD_TO_EV,
+        "gap_ev": (cbm - vbm) * RYD_TO_EV,
+        "degeneracy_tolerance_ev": float(degeneracy_tolerance_ev),
+        "symmetry_rows": rows.astype(int).tolist(),
+        "raw_moment_mu_b": np.asarray(raw_moment).astype(float).tolist(),
+        "moment_mu_b": np.asarray(projected_moment).astype(float).tolist(),
+        "cA_real": np.asarray(cA.real).astype(float).tolist(),
+        "cA_imag": np.asarray(cA.imag).astype(float).tolist(),
+        "cB_real": np.asarray(cB.real).astype(float).tolist(),
+        "cB_imag": np.asarray(cB.imag).astype(float).tolist(),
+        "newton_inverse_residual_ry": inverse_residual,
+        "operator": "analytic derivative of interpolated Hamiltonian",
+    }
+    log(
+        "  [orbmag] grid=" + "x".join(str(x) for x in grid)
+        + f" bands=1:{band_ceiling} nocc={nocc} "
+        + f"gap={record['gap_ev']:.6f} eV mu={record['mu_ev']:.6f} eV; "
+        + "m(mu_B)=[" + ",".join(
+            f"{x:+.8f}" for x in record["moment_mu_b"]) + "]")
+    return record
+
+
 def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
     nelec = int(wfn.nelec)
     nsigmarange = (int(nelec - nval), int(nelec + ncond))
@@ -1508,7 +1745,12 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None,
                 band_start: int = 0, n_return_bands: int | None = None,
                 qp_corrected_band_range: tuple[int, int] | None = None,
-                progress_fn=None, quality_record_fn=None, sym=None):
+                progress_fn=None, quality_record_fn=None, sym=None,
+                orbital_magnetization_grid=None,
+                orbital_magnetization_band_ceiling: int | None = None,
+                orbital_magnetization_mu_ev: float | None = None,
+                orbital_magnetization_degeneracy_tol_ev: float = 1.4e-3,
+                magnetization_axis=(0.0, 0.0, 1.0)):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1609,6 +1851,33 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
     jax.block_until_ready(R_grid)                            # instrument:
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
+
+    orbital_magnetization = None
+    if orbital_magnetization_grid is not None:
+        if sym is None:
+            raise ValueError(
+                "htransform orbital magnetization requires the WFNLoader "
+                "symmetry service; a bare symmetry-less library call cannot "
+                "authenticate an axial time-odd observable.")
+        orbital_magnetization = htransform_orbital_magnetization(
+            fH_R, (a_f, n_f, shift), R_grid,
+            fine_grid=orbital_magnetization_grid,
+            nstates=int(states),
+            band_ceiling=(
+                nb_keep if orbital_magnetization_band_ceiling is None
+                else int(orbital_magnetization_band_ceiling)),
+            nocc=int(wfn.nelec),
+            bvec_cart=(np.asarray(wfn.bvec, dtype=np.float64)
+                       * float(wfn.blat)),
+            sym=sym,
+            mesh_xy=mesh_xy,
+            mu_ev=orbital_magnetization_mu_ev,
+            degeneracy_tolerance_ev=(
+                orbital_magnetization_degeneracy_tol_ev),
+            magnetization_axis=magnetization_axis,
+            log_fn=log_fn,
+            progress_fn=progress_fn,
+        )
 
     # ── Kpath-batch processing ───────────────────────────────────────────
     # fH_R stays SHARDED P(None, 'x', 'y'): the (rank, rank) face is split
@@ -2108,6 +2377,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         "coincident_exact": coincident_exact,
         "coincident_max_abs_ry": coincident_max_abs_ry,
         "coincident_rms_ry": coincident_rms_ry,
+        "orbital_magnetization": orbital_magnetization,
         "kpath_data": (kpath_frac, x_path, node_indices, node_labels, gamma_positions),
     }
 
@@ -2272,6 +2542,30 @@ def main(argv=None):
              "every Plan.batched call in this driver. auto preserves the "
              "backend's robust distributed route; batch_reshard moves q "
              "onto the mesh and runs whole-matrix local JAX linalg.")
+    parser.add_argument(
+        "--orbital-magnetization-grid", type=int, nargs=3, default=None,
+        metavar=("NKX", "NKY", "NKZ"),
+        help="Evaluate the modern-theory orbital moment on this uniform "
+             "fine grid from the same interpolated Hamiltonian.")
+    parser.add_argument(
+        "--orbital-magnetization-band-ceiling", type=int, default=None,
+        help="Inner-state ceiling inside the fitted htransform window "
+             "(default: the returned nval+ncond window).")
+    parser.add_argument(
+        "--orbital-magnetization-mu", type=float, default=None,
+        help="Chemical potential in eV (default: fine-grid midgap).")
+    parser.add_argument(
+        "--orbital-degeneracy-tol", type=float, default=1.4e-3,
+        help="Energy-denominator tolerance in eV (default: 1.4e-3).")
+    parser.add_argument(
+        "--mag-axis", type=float, nargs=3, default=(0.0, 0.0, 1.0),
+        metavar=("MX", "MY", "MZ"),
+        help="Cartesian magnetization direction for typed symmetry "
+             "projection (default: +z).")
+    parser.add_argument(
+        "--orbital-magnetization-out", default="orbital_magnetization.json",
+        help="JSON result written beside the input deck when an orbital "
+             "grid is requested.")
     args = parser.parse_args(argv)
     input_dir = os.path.dirname(os.path.abspath(args.input))
 
@@ -2439,7 +2733,16 @@ def main(argv=None):
                              qp_corrected_band_range=qp_corrected_band_range,
                              progress_fn=report.progress,
                              quality_record_fn=_quality_records.append,
-                             sym=sym)
+                             sym=sym,
+                             orbital_magnetization_grid=(
+                                 args.orbital_magnetization_grid),
+                             orbital_magnetization_band_ceiling=(
+                                 args.orbital_magnetization_band_ceiling),
+                             orbital_magnetization_mu_ev=(
+                                 args.orbital_magnetization_mu),
+                             orbital_magnetization_degeneracy_tol_ev=(
+                                 args.orbital_degeneracy_tol),
+                             magnetization_axis=args.mag_axis)
     _transform_progress.step()
     _transform_progress.finish()
 
@@ -2531,6 +2834,12 @@ def main(argv=None):
             band_start=result["band_start"],
             nb_fit=result["nb_fit"],
         )
+        if result["orbital_magnetization"] is not None:
+            orbital_path = _output_path(args.orbital_magnetization_out)
+            with open(orbital_path, "x", encoding="utf8") as handle:
+                json.dump(result["orbital_magnetization"], handle,
+                          indent=2, sort_keys=True)
+                handle.write("\n")
     _write_progress.step()
     _write_progress.finish()
 
@@ -2605,6 +2914,11 @@ def main(argv=None):
     _file_rows.extend([
         ("interpolated bands",
          "written" if os.path.exists(output_path) else "absent", output_path),
+        ("orbital magnetization",
+         ("written" if args.orbital_magnetization_grid is not None
+          else "not requested"),
+         (_output_path(args.orbital_magnetization_out)
+          if args.orbital_magnetization_grid is not None else "-")),
         ("calculation report", "written", report.path),
     ])
     report.timings(timing.records(), wall=_wall)
