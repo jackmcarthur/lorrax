@@ -256,7 +256,7 @@ def protected_band_convergence(
 
     ``e_*_ev`` are ``(nk, nb_active)`` eV, already aligned to map-0
     QP identities and averaged within exact multiplets by the SC caller.
-    The test set is the frozen ``protected_mask | in_range_mask``: full
+    The test set is the current per-k ``protected_mask | in_range_mask``: full
     protected diagonals plus the unprotected in-range diagonals. This is
     exactly the diagonal-retention mask in ``apply_band_partition``.
     Callers without rotations (fixed-Sigma EVSC) supply their own labels.
@@ -1531,6 +1531,7 @@ def run_fixed_sigma_evsc(
     band_slices: BandSlices,
     wfn,
     mesh_xy: Mesh,
+    sym=None,
     print_fn: Callable = print,
 ) -> FixedSigmaEVSCResult:
     """Iterate a fixed full-matrix Sigma(omega) table to eigenvalue SC.
@@ -1639,6 +1640,9 @@ def run_fixed_sigma_evsc(
     omega_ry = np.asarray(omega_ry, dtype=np.float64)
     efermi_ev = float(efermi_ev)
     e_dft_full_ry = np.asarray(wfn.energies[0], dtype=np.float64)
+    if sym is not None:
+        from symmetry_maps import unfold_file_wedge_to_full_bz
+        e_dft_full_ry = np.asarray(unfold_file_wedge_to_full_bz(sym, e_dft_full_ry))
     partition = build_omega_band_partition(
         e_dft_ry, e_dft_full_ry,
         band_offset=b0,
@@ -2722,8 +2726,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # The broadcast is a device gather and keeps the operand's sharding
     # (``symmetry_maps``, ``_row_out_sharding``), so U_full arrives
     # at ``band_rotation_spec`` — what ``rotate_bands`` and
-    # ``rotate_wavefunctions`` want — and U never crosses to the host.  It
-    # needs no ``_place`` first, unlike the host-numpy form it replaces.
+    # ``rotate_wavefunctions`` want. Identity assignment below reads only
+    # the loop-k rotation; this full-BZ operand stays band-sharded.
     ks = _kstar(inputs)
     U_full = U_qp if ks.is_identity else ks.broadcast(U_qp)
     E_full = E_qp_ry if ks.is_identity else ks.broadcast(E_qp_ry)
@@ -2788,15 +2792,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # the identity and those bands took no correction at all.
     #
     # On the first map the spectrum IS the DFT spectrum and mu IS the DFT
-    # mu, so this reproduces the frozen partition exactly; it only starts
-    # to differ once the spectrum has actually moved.
+    # mu. Later maps follow reference identities through sorted crossings.
     # ------------------------------------------------------------------
     # Classify energies by DFT-state identity, never by sorted eigenvalue
     # position. The small loop-k overlap assignment is broadcast as an
     # energy/index table; the full-BZ rotation stays band-sharded.
     from common.collectives import gather_to_host
     from .sc_state_identity import assign_qp_identity
+    from symmetry_maps import unfold_file_wedge_to_full_bz
 
+    reference_full = np.asarray(unfold_file_wedge_to_full_bz(
+        inputs.sym, np.asarray(inputs.wfn.energies[0], dtype=np.float64)))
     e_reference = np.asarray(inputs.e_dft_active_kn_ry) * RYD_TO_EV
     e_reference_loop = e_reference if ks.is_identity else np.asarray(ks.select(e_reference))
     e_current_loop = np.asarray(E_qp_ry) * RYD_TO_EV
@@ -2814,9 +2820,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
               float(inputs.wfn.efermi) * RYD_TO_EV)
     partition = build_omega_band_partition(
         energies_loop / RYD_TO_EV,
-        np.asarray(inputs.wfn.energies[0], dtype=np.float64)
-        if ks.is_identity else
-        np.asarray(ks.select(inputs.wfn.energies[0]), dtype=np.float64),
+        reference_full if ks.is_identity else np.asarray(ks.select(reference_full)),
         band_offset=int(inputs.band_slices.b0),
         omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
         omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
@@ -3425,8 +3429,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.print_fn)
     # The scissor and partition operands are indexed by k and were built
     # on the full BZ; take their IBZ rows so every operand of the H
-    # assembly is on one k-set.  The masks are band-only, so selecting
-    # rows cannot change what they mean.
+    # assembly is on one k-set. The per-k identity masks take the same rows.
     e_dft_act = inputs.e_dft_active_kn_ry
     val_mask = inputs.valence_mask_active_kn
     if not ks.is_identity:
@@ -5510,8 +5513,11 @@ def run_sc_driver(
     # One constructor owns the all-k window predicate and whole-multiplet
     # promotion.  EQP2 uses the same constructor below; neither ladder can
     # silently invent a different protected subspace.
+    from symmetry_maps import unfold_file_wedge_to_full_bz
     partition = build_omega_band_partition(
-        e_dft_active_kn_ry, np.asarray(wfn.energies[0], dtype=np.float64),
+        e_dft_active_kn_ry,
+        np.asarray(unfold_file_wedge_to_full_bz(
+            sym, np.asarray(wfn.energies[0], dtype=np.float64))),
         band_offset=int(band_slices.b0),
         omega_min_abs_ev=omega_min_ev,
         omega_max_abs_ev=omega_max_ev,
