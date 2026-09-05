@@ -611,8 +611,9 @@ def main(argv=None):
 	# The Σ kernels take the parent carrier whenever one exists: their G
 	# contraction and band projection then run on the raw parents and the
 	# band matrix is broadcast back to full k (gw.wavefunction_bundle.
-	# sigma_face_kernel_kwargs).  Head, density, output and restart
-	# consumers keep the primary full-k bundle.
+	# sigma_face_kernel_kwargs); the q->0 head wings take the same view and
+	# stream the children from the carrier.  Density, output and restart
+	# consumers keep the primary bundle.
 	sigma_parent_carrier = getattr(isdf, 'sigma_parent_carrier', None)
 	wfns_sigma = wfns
 	if sigma_parent_carrier is not None:
@@ -743,8 +744,10 @@ def main(argv=None):
 			# built on the run's own charge centroids.  The separate
 			# source-Pauli head bundle went with the two retired
 			# carrier-comparison modes (2026-09-01).
+			# The Sigma view carries the parent carrier: on parents-only
+			# storage the wings stream the children from it (qsgw_head).
 			oneshot_head_response = build_dft_head_response(
-				wfns, oneshot_omegas,
+				wfns_sigma, oneshot_omegas,
 				input_dir=input_dir, mesh=mesh_xy,
 				wfn=wfn, meta=meta, config=config)
 			print0(
