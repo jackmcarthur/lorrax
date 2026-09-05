@@ -2512,6 +2512,13 @@ def _sc_head_frequency_plan(
     return requests, None, head_omegas
 
 
+# The self-consistent in-range set keeps this margin from the Sigma grid
+# edge: the same 2 eV state pad the frozen box rules use
+# (sigma_box_plan._SC_STATE_PAD_EV), so a band trusted at map 0 has room to
+# move without leaving the grid or dragging off-grid multiplet partners in.
+SC_EDGE_MARGIN_EV = 2.0
+
+
 def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
     """Run-derived Schmitt margin for the re-anchored Sigma window."""
     # Half a sampled omega bin is unresolved by the grid.  Metallic
@@ -2859,6 +2866,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                                     if state.partition is not None
                                     else inputs.partition),
                 hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
+                edge_margin_ev=SC_EDGE_MARGIN_EV,
                 label=f"SC map {int(state.iteration)} (mu-anchored)",
                 print_fn=inputs.print_fn)
     partition = _apply_sc_buffer_partition(partition, inputs)
@@ -5357,6 +5365,7 @@ def run_sc_driver(
         band_offset=int(band_slices.b0),
         omega_min_abs_ev=omega_min_ev,
         omega_max_abs_ev=omega_max_ev,
+        edge_margin_ev=SC_EDGE_MARGIN_EV,
         label="SC", print_fn=print_fn)
 
     # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two

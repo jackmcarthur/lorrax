@@ -224,6 +224,7 @@ def build_omega_band_partition(
     omega_max_abs_ev: float,
     previous_partition: BandPartition | None = None,
     hysteresis_margin_ev: float = 0.0,
+    edge_margin_ev: float = 0.0,
     label: str = "SC",
     print_fn=print,
 ) -> BandPartition:
@@ -240,6 +241,34 @@ def build_omega_band_partition(
     e_dft_ev = np.asarray(e_dft_kn_ry, dtype=np.float64) * RYD_TO_EV
     band_in_grid, _ = classify_bands_in_grid(
         e_dft_ev, float(omega_min_abs_ev), float(omega_max_abs_ev))
+    edge = float(edge_margin_ev)
+    if edge < 0.0 or not np.isfinite(edge):
+        raise ValueError("edge_margin_ev must be finite and nonnegative")
+    if edge > 0.0:
+        # A SELF-CONSISTENT set needs room to move.  A band whose all-k range
+        # ends within ``edge`` of the grid edge is inside today and outside
+        # after one QP shift; and its degenerate partners, promoted to keep
+        # the multiplet whole, can sit far above the grid with a clamped
+        # Sigma that then couples into the trusted block.  Measured on Na
+        # (86 bands, top +24 eV): band 14 tops out 1.7 eV under the edge, its
+        # Gamma partners 15-23 were promoted, and the k=1 triplet 11-13 moved
+        # 6.4 eV in one map (runs/Na/12_sc_observables_eta05_2026-09-04,
+        # arms G/H).  The margin is the SC state pad the box rules use.
+        with_margin, _ = classify_bands_in_grid(
+            e_dft_ev, float(omega_min_abs_ev) + edge,
+            float(omega_max_abs_ev) - edge)
+        excluded = band_in_grid & ~with_margin
+        if excluded.any():
+            lo_k = e_dft_ev.min(axis=0); hi_k = e_dft_ev.max(axis=0)
+            rows = ", ".join(
+                f"{int(n) + int(band_offset) + 1} [{lo_k[n]:.2f}, {hi_k[n]:.2f}]"
+                for n in np.flatnonzero(excluded))
+            print_fn(
+                f"  {label} partition: {int(excluded.sum())} band(s) inside "
+                f"the grid but within {edge:.1f} eV of an edge are scissored, "
+                f"not self-consistent (band [all-k range, eV]: {rows}; grid "
+                f"[{float(omega_min_abs_ev):.2f}, {float(omega_max_abs_ev):.2f}])")
+        band_in_grid = with_margin
     in_range = jnp.asarray(band_in_grid, dtype=bool)
     protected = np.asarray(band_in_grid, dtype=bool)
     margin = float(hysteresis_margin_ev)

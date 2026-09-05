@@ -60,3 +60,24 @@ def test_promoted_protected_bands_outside_the_grid_are_not_escapes():
         omega_step_ev=0.25, iteration=1, print_fn=lambda _s: None)
     # the in-range pair's smallest margin is to the bottom edge: -3 - (-15)
     assert margin == pytest.approx(12.0)
+
+
+def test_edge_margin_scissors_bands_that_end_within_the_pad(capsys):
+    from gw.band_partition import build_omega_band_partition
+    from common.units import RYD_TO_EV
+    # two k rows, five bands; grid [-15, 24]; band 4 tops out at 22.5 (1.5 eV
+    # under the edge) and band 5 at 26 (outside).
+    e_ev = np.array([[-3.0, 1.0, 9.0, 13.0, 20.0], [-2.0, 2.0, 10.0, 22.5, 26.0]])
+    part = build_omega_band_partition(
+        e_ev / RYD_TO_EV, e_ev / RYD_TO_EV, band_offset=4,
+        omega_min_abs_ev=-15.0, omega_max_abs_ev=24.0, edge_margin_ev=2.0,
+        label="SC", print_fn=print)
+    assert np.asarray(part.in_range_mask).tolist() == [True, True, True, False, False]
+    out = capsys.readouterr().out
+    assert "1 band(s) inside the grid but within 2.0 eV of an edge are scissored" in out
+    assert "8 [13.00, 22.50]" in out
+    plain = build_omega_band_partition(
+        e_ev / RYD_TO_EV, e_ev / RYD_TO_EV, band_offset=4,
+        omega_min_abs_ev=-15.0, omega_max_abs_ev=24.0,
+        label="SC", print_fn=lambda _s: None)
+    assert np.asarray(plain.in_range_mask).tolist() == [True, True, True, True, False]
