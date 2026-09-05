@@ -1,0 +1,22 @@
+&input_pw2bgw
+   prefix = 'core_lih_p1'
+   real_or_complex = 2
+   wfng_flag = .true.
+   wfng_file = 'WFN'
+   rhog_flag = .false.
+   vxc_flag = .true.
+   vxc_file = 'vxc.dat'
+   vxc_diag_nmin = 1
+   vxc_diag_nmax = 8
+   kih_flag = .true.
+   kih_file = 'kih.dat'
+   vscg_flag = .false.
+   vkbg_flag = .false.
+   wfng_kgrid = .true.
+   wfng_nk1 = 3
+   wfng_nk2 = 3
+   wfng_nk3 = 1
+   wfng_dk1 = 0.0
+   wfng_dk2 = 0.0
+   wfng_dk3 = 0.0
+/

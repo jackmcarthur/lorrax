@@ -1,0 +1,25 @@
+{
+  "cache": "/pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/B-e42a911f6048652a23cea6637f5dc8981e5f7f5c3ef74cbc252f05459a3a78d5",
+  "cold_build_seconds": 13.608722165998188,
+  "input_sha256": "e42a911f6048652a23cea6637f5dc8981e5f7f5c3ef74cbc252f05459a3a78d5",
+  "outputs": {
+    "He.upf": "b0c5b4036abe1d2ccbc97fe1d183a511a39dcee85c7801cdf488e3701207d428",
+    "WFN.h5": "1ddafc0ac3273ed83fb720795042f36e1c149e3301b76ddaac5a97aaba182776",
+    "centroids_frac_13.txt": "9c9237b65196c5b2fb1cba0466af4d36234f7175ddce0bc4d2117693d76c5eca",
+    "data-file-schema.xml": "4f472860e747c3fd04880f9b50c5942fed903a084adc595d9814219daa248050",
+    "kmeans.out": "f4af691c12c131b2d31d9b1efb56e6301bb61fd9f3e0585b6fc004ded954b2bc"
+  },
+  "pseudopotentials": {
+    "He.upf": "b0c5b4036abe1d2ccbc97fe1d183a511a39dcee85c7801cdf488e3701207d428"
+  },
+  "schema": "lorrax-core-mean-field-v1",
+  "source_commit": "298c89ac588300460f241191bff2e65d8a50b824",
+  "source_dirty": false,
+  "staged_cache_reused": false,
+  "system": "B",
+  "tools": {
+    "pw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw.x",
+    "pw2bgw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw2bgw.x",
+    "wfn2hdf.x": "/global/common/software/nersc9/berkeleygw/zen3/gcc-12/mpich/berkeleygw/BerkeleyGW-4.0/bin/wfn2hdf.x"
+  }
+}

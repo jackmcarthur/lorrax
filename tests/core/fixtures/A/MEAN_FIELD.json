@@ -1,0 +1,29 @@
+{
+  "cache": "/pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-eba6ee7ab306428c928bd124dc4ab4815bf674286b03e83c65f137c05160e70b",
+  "cold_build_seconds": 13.720153629007633,
+  "input_sha256": "820a6acda79eff44244f52f70c62449878966727844644465450567a0b9637ea",
+  "outputs": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "Li.upf": "3654e8a51fb6c60c124c97ea3a67a54c87a0e477e49effd65aa73a45288f48f9",
+    "WFN.h5": "d58bb868f9f80e2b413511a77927ee80e94bae2581907fffdc025eebfc435998",
+    "centroids_frac_21.txt": "537720a003c4459db06bd4531d0b5ea9d3d867824826ff1934da6c59f018e944",
+    "centroids_frac_31_htransform.txt": "c47e8a423bfb4a27f944843aa908fb20f823f58485840bc971db54baee185d68",
+    "data-file-schema.xml": "1c56efabba25453edc51d244edbca62f4eff7fda08239db9b34f3dc2921942ac",
+    "kmeans.out": "7e60c6d2423019d4a758e2d6f643a2a851e11bafd00a11bf1269edd478053ef9",
+    "kmeans_htransform.out": "cbbb4ed04bc653318a5fdd850c7b54c373d63c90d3e6f52ad583a9e0f5a43031"
+  },
+  "pseudopotentials": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "Li.upf": "3654e8a51fb6c60c124c97ea3a67a54c87a0e477e49effd65aa73a45288f48f9"
+  },
+  "schema": "lorrax-core-mean-field-v1",
+  "source_commit": "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0",
+  "source_dirty": true,
+  "staged_cache_reused": true,
+  "system": "A",
+  "tools": {
+    "pw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw.x",
+    "pw2bgw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw2bgw.x",
+    "wfn2hdf.x": "/global/common/software/nersc9/berkeleygw/zen3/gcc-12/mpich/berkeleygw/BerkeleyGW-4.0/bin/wfn2hdf.x"
+  }
+}

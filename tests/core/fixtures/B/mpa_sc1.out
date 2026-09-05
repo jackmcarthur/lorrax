@@ -1,0 +1,203 @@
+==============================================================================
+LORRAX GW CALCULATION
+==============================================================================
+Input          : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/mpa_sc1.in
+Method         : mpa / self_consistent
+  [config provenance] mpa_sampling_alpha = 1 (deck)
+[config provenance] linalg = local (deck)
+linalg = local: fastest, but each task holds ceil(N_q_irr/P) complete N_mu x N_mu dense matrices (here ceil(1/1) x 13^2 x 16 B = 0.00258 MiB per task, complex128) plus their factor workspace; on large systems where that is a large fraction of memory per task, set linalg = distributed
+[config provenance] low_mem_bands = false (default)
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 1
+Accelerators   : 1 GPU devices (NVIDIA A100-SXM4-40GB, 1 per rank)
+Processor mesh : 1 x 1  (centroid axes X x Y)
+CPU allocation : 128 cores per rank
+Host threads   : OPENBLAS_NUM_THREADS=64 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)
+
+METHOD AND PHYSICAL PATHWAYS
+----------------------------
+Self-energy    : multipole-approximation GW; self-consistent QSGW effective Hamiltonian
+QP consistency  : self_consistent | other options: fixed_point (diagonal on-shell), self_consistent (rebuild G/W/Sigma)
+EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma eigenvalue self-consistency)
+Screening      : RPA Dyson series; minimax imaginary-axis quadrature
+Long wavelength: head=off; source=s_tensor
+Coulomb system : 3D bulk; Hartree=live G-space
+Spin channels  : charge (scalar)
+Degenerate sets: averaged at 1.36057e-05 eV
+ISDF state     : restart requested
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : eager reader
+Dense linalg   : local layout
+LORRAX_BANDS_GEMM_FFI      = NATIVE : right-GEMM contraction forming G(tau) (native XLA dot lowering)
+LORRAX_FFT_FFI             = ON     : flat-k FFTs for ISDF, chi0 and Sigma (cuFFT flat-k FFI)
+LORRAX_FFT_FFI_FUSED       = ON     : fused tau-domain convolution (cuFFT fused-convolution FFI)
+LORRAX_CONV_KPAIR_FFI      = ON     : pair-density convolution forming V(q) (cuFFT pair-convolution FFI)
+
+CRYSTAL SYMMETRY AND BRILLOUIN-ZONE SAMPLING
+--------------------------------------------
+Real-space action: r' = R^-1 r + tau
+Spatial group   : 2 operations; 0 with fractional translations
+QE schema      : FOUND data-file-schema.xml at /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/data-file-schema.xml
+QE schema hash : SHA256 4f472860e747
+Stored QE type : 2 unitary; 0 composed with time reversal
+Active op rows : 2 unitary; 2 TR-composed
+Inversion      : present at S02 (QE-TR=no; used=unitary+TR)
+DFT 2c TRS     : NOT APPLICABLE (nspin=1, nspinor=1)
+Global TRS     : enabled for BZ unfolding
+  op   QE time-reversal status       R^-1 and fractional translation
+  S01  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  0  1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S02  QE-TR=no      active=unitary+TR R^-1=[-1  0  0;  0 -1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+Full BZ grid   : 1 k points | mesh 1 x 1 x 1 | shift (0.00000, 0.00000, 0.00000)
+Stored IBZ     : 1 k points
+  ik        kx        ky        kz     weight
+    1   0.00000   0.00000   0.00000   1.00000
+Centroid orbit: CLOSED : 2/2 spatial operations preserve 13 sites (tol=1.00000e-05)
+TRS pathways   : automatic from SymMaps.trs_allowed=true; no input override
+MPA chi0 route : global time reversal MEASURED to hold; incumbent symmetric completion retained bit-for-bit
+
+BAND SPACES AND ENERGY COVERAGE
+-------------------------------
+Electrons      : 2.00000; occupied-band boundary = 1
+Occupied bands : 1-1
+QP valence     : 1-1
+QP conduction  : 2-3
+QP matrix      : 1-3
+chi0/W sum     : 1-7
+Sigma sum      : 1-7
+Loaded ISDF psi: 1-7
+zeta fit       : left 1-3; right 1-7
+  SC: mode=mpa, max_iter=2, tol=5.0e-01 eV, accel=linear, exact_degeneracy_tol=1.0e-04 eV, tail_fit=frontier, buffer=0/edge, buffer_mode=diagonal, α=1.00
+  SC fixed quadrature: iteration=1, initialized=True, rebuilds_this_iteration=0, rebuilds_total=0, pair_cost=20, initial_pair_cost=20, state_pad=2.0 eV, pole_pad=10.0%
+    SC fixed window: ω≥E_F cond:pole_tail: n_tau=5, nodes=70611c671bdf9311, cache=init:hit:rule_084da603462db44e.npz, box=(-43.83726137946766, -10.608144688988093, 0.2501929932367757, 14.967081683390324) eV, padded_box=(-48.604535966432515, -8.948224683042502, 0.2501736939130981, 16.438789851729357) eV, sup=0.000891438/0.001 (relative), kappa_max=1.58122, noise=9.48706e-08/5e-05
+    SC fixed window: ω≥E_F val:bulk: n_tau=5, nodes=2cfc64d859562ccf, cache=init:hit:rule_fadb0870c98d62e3.npz, box=(22.785695247601154, 46.78218289020151, 0.2501929932367757, 14.967081683390324) eV, padded_box=(21.125775241655568, 51.549457477166364, 0.2501736939130981, 16.438789851729357) eV, sup=0.000970014/0.001 (relative), kappa_max=1.5857, noise=9.5152e-08/5e-05
+    SC fixed window: ω<E_F cond:bulk: n_tau=5, nodes=096094fba05be246, cache=init:hit:rule_5e631c1e61a42876.npz, box=(-55.81726137946766, -23.62814468898809, 0.2501929932367757, 14.967081683390324) eV, padded_box=(-60.584535966432526, -21.968224683042504, 0.2501736939130981, 16.438789851729357) eV, sup=0.000936682/0.001 (relative), kappa_max=1.49765, noise=8.98365e-08/5e-05
+    SC fixed window: ω<E_F val:pole_tail: n_tau=5, nodes=618e163e0871c5d0, cache=init:hit:rule_df46d3a9609732e8.npz, box=(10.805695247601154, 33.7621828902015, 0.2501929932367757, 14.967081683390324) eV, padded_box=(9.145775241655565, 38.52945747716636, 0.2501736939130981, 16.438789851729357) eV, sup=0.000843315/0.001 (relative), kappa_max=1.28113, noise=7.68609e-08/5e-05
+Started Sigma tau sweep at 19:28:00.
+[ 19:28:00 | ░░░░░░░░░░ |   5% ] tau node  1 / 20 · ETA 6 s
+[ 19:28:00 | █░░░░░░░░░ |  10% ] tau node  2 / 20 · ETA 3 s
+[ 19:28:00 | ██░░░░░░░░ |  15% ] tau node  3 / 20 · ETA 2 s
+[ 19:28:00 | ██░░░░░░░░ |  20% ] tau node  4 / 20 · ETA 1 s
+[ 19:28:00 | ██░░░░░░░░ |  25% ] tau node  5 / 20 · ETA 1 s
+[ 19:28:00 | ███░░░░░░░ |  30% ] tau node  6 / 20 · ETA 1 s
+[ 19:28:00 | ████░░░░░░ |  35% ] tau node  7 / 20 · ETA 1 s
+[ 19:28:00 | ████░░░░░░ |  40% ] tau node  8 / 20 · ETA 0 s
+[ 19:28:00 | ████░░░░░░ |  45% ] tau node  9 / 20 · ETA 0 s
+[ 19:28:00 | █████░░░░░ |  50% ] tau node 10 / 20 · ETA 0 s
+[ 19:28:00 | ██████░░░░ |  55% ] tau node 11 / 20 · ETA 0 s
+[ 19:28:00 | ██████░░░░ |  60% ] tau node 12 / 20 · ETA 0 s
+[ 19:28:00 | ██████░░░░ |  65% ] tau node 13 / 20 · ETA 0 s
+[ 19:28:00 | ███████░░░ |  70% ] tau node 14 / 20 · ETA 0 s
+[ 19:28:00 | ████████░░ |  75% ] tau node 15 / 20 · ETA 0 s
+[ 19:28:00 | ████████░░ |  80% ] tau node 16 / 20 · ETA 0 s
+[ 19:28:00 | ████████░░ |  85% ] tau node 17 / 20 · ETA 0 s
+[ 19:28:00 | █████████░ |  90% ] tau node 18 / 20 · ETA 0 s
+[ 19:28:00 | ██████████ |  95% ] tau node 19 / 20 · ETA 0 s
+[ 19:28:00 | ██████████ | 100% ] tau node 20 / 20 · ETA 0 s
+Finished Sigma tau sweep at 19:28:00.  Elapsed: 0 s.
+  SC map energies: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/eqp0_iter0000.dat
+  SC map eqp1: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/eqp1_iter0000.dat
+    SC iteration: call=0000 role=linear gap=13.558889548 eV max|dE|=3.640565708e+00 eV active=1-3 protected=1-2 in_range=1-2
+    SC convergence: max|dE| = 3.640566 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 3.008076 eV, RMS_all(3) = 2.456084 eV (diagnostics, NOT the criterion) | not converged
+  SC fixed quadrature: iteration=2, initialized=False, rebuilds_this_iteration=6, rebuilds_total=6, pair_cost=37, initial_pair_cost=20, state_pad=2.0 eV, pole_pad=10.0%
+    SC fixed window: ω≥E_F cond:resonant: n_tau=4, nodes=23d70d615a2d37b7, cache=rebuild:sc-fixed, box=(-22.10813920813348, -7.113963706212281, 1.8270567217842513, 10.21243449063136) eV, padded_box=(-25.36375140202817, -6.100099156733087, 1.669351049605826, 11.208677939694494) eV, sup=0.000985677/0.001 (relative), kappa_max=1.24974, noise=7.49914e-08/5e-05
+    SC fixed window: ω≥E_F cond:state_tail: n_tau=5, nodes=70611c671bdf9311, cache=rebuild:sc-fixed, box=(-31.0832117579153, -11.016716061300087, 1.8270567217842513, 10.21243449063136) eV, padded_box=(-34.33882395180999, -10.002851511820893, 1.669351049605826, 11.208677939694494) eV, sup=0.000891438/0.001 (relative), kappa_max=1.58122, noise=9.48706e-08/5e-05
+    SC fixed window: ω≥E_F cond:pole_tail: n_tau=5, nodes=70611c671bdf9311, cache=hit:sc-fixed, box=(-42.880672752302154, -11.433221066476815, 0.251645721714529, 11.55854627174364) eV, padded_box=(-48.604535966432515, -8.948224683042502, 0.2501736939130981, 16.438789851729357) eV, sup=0.000891438/0.001 (relative), kappa_max=1.58122, noise=9.48706e-08/5e-05
+    SC fixed window: ω≥E_F val:bulk: n_tau=5, nodes=e4a2376e7ecd973e, cache=rebuild:sc-fixed, box=(13.041070173913756, 40.07698599021308, 0.251645721714529, 11.55854627174364) eV, padded_box=(12.004048431522296, 44.51361502263332, 0.25148114954307604, 12.689400898918004) eV, sup=0.000732862/0.001 (relative), kappa_max=1.47047, noise=8.81803e-08/5e-05
+    SC fixed window: ω<E_F cond:bulk: n_tau=5, nodes=27d2f9f39c8c7c8b, cache=rebuild:sc-fixed, box=(-54.95338608265509, -19.724841218476563, 0.251645721714529, 11.55854627174364) eV, padded_box=(-59.39001511507533, -18.687819476085103, 0.25148114954307604, 12.689400898918004) eV, sup=0.000915697/0.001 (relative), kappa_max=1.54671, noise=9.27437e-08/5e-05
+    SC fixed window: ω<E_F val:resonant: n_tau=7, nodes=f7e830ac7f62bf32, cache=rebuild:sc-fixed, box=(1.292642103036411, 15.246817604957608, 1.8270567217842513, 10.21243449063136) eV, padded_box=(0.4135396061767165, 18.502429798852305, 1.669351049605826, 11.208677939694494) eV, sup=0.000752758/0.001 (relative), kappa_max=1.43726, noise=8.62334e-08/5e-05
+    SC fixed window: ω<E_F val:pole_tail: n_tau=6, nodes=6d122601e64fe94a, cache=rebuild:sc-fixed, box=(5.789450021914006, 26.964272659860132, 0.251645721714529, 11.55854627174364) eV, padded_box=(4.279590294722522, 31.410173025315665, 0.25148114954307604, 12.689400898918004) eV, sup=0.000934245/0.001 (relative), kappa_max=1.82644, noise=1.09551e-07/5e-05
+Started Sigma tau sweep at 19:28:02.
+[ 19:28:02 | ░░░░░░░░░░ |   3% ] tau node  1 / 37 · ETA 0 s
+[ 19:28:02 | █░░░░░░░░░ |   8% ] tau node  3 / 37 · ETA 0 s
+[ 19:28:02 | █░░░░░░░░░ |  14% ] tau node  5 / 37 · ETA 0 s
+[ 19:28:02 | ██░░░░░░░░ |  19% ] tau node  7 / 37 · ETA 0 s
+[ 19:28:02 | ██░░░░░░░░ |  24% ] tau node  9 / 37 · ETA 0 s
+[ 19:28:02 | ███░░░░░░░ |  27% ] tau node 10 / 37 · ETA 0 s
+[ 19:28:02 | ███░░░░░░░ |  32% ] tau node 12 / 37 · ETA 0 s
+[ 19:28:02 | ████░░░░░░ |  38% ] tau node 14 / 37 · ETA 0 s
+[ 19:28:02 | ████░░░░░░ |  43% ] tau node 16 / 37 · ETA 0 s
+[ 19:28:02 | █████░░░░░ |  49% ] tau node 18 / 37 · ETA 0 s
+[ 19:28:02 | █████░░░░░ |  54% ] tau node 20 / 37 · ETA 0 s
+[ 19:28:02 | ██████░░░░ |  59% ] tau node 22 / 37 · ETA 0 s
+[ 19:28:02 | ██████░░░░ |  65% ] tau node 24 / 37 · ETA 0 s
+[ 19:28:02 | ███████░░░ |  70% ] tau node 26 / 37 · ETA 0 s
+[ 19:28:02 | ████████░░ |  76% ] tau node 28 / 37 · ETA 0 s
+[ 19:28:02 | ████████░░ |  78% ] tau node 29 / 37 · ETA 0 s
+[ 19:28:02 | ████████░░ |  84% ] tau node 31 / 37 · ETA 0 s
+[ 19:28:02 | █████████░ |  89% ] tau node 33 / 37 · ETA 0 s
+[ 19:28:02 | █████████░ |  95% ] tau node 35 / 37 · ETA 0 s
+[ 19:28:02 | ██████████ | 100% ] tau node 37 / 37 · ETA 0 s
+Finished Sigma tau sweep at 19:28:02.  Elapsed: 0 s.
+  SC map energies: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/eqp0_iter0001.dat
+  SC map eqp1: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/eqp1_iter0001.dat
+SC map gain: max |dSigma_on-shell| / max |dE_in| = 0.185134 (worst k=0 band=1: dSigma=673.992284 meV / dE=3640.565708 meV)
+    SC iteration: call=0001 role=linear gap=13.218899821 eV max|dE|=3.476255047e-01 eV active=1-3 protected=1-2 in_range=1-2
+    SC convergence: max|dE| = 0.347626 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 0.245868 eV, RMS_all(3) = 1.286368 eV (diagnostics, NOT the criterion) | CONVERGED
+  SC verdict: CONVERGED after 2 GW map calls; max|dE| = 0.347626 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 0.245868 eV, RMS_all(3) = 1.286368 eV (diagnostics, NOT the criterion) | CONVERGED
+  SC done: 2 GW map calls, final RMS ΔE = 1.2864e+00 eV
+
+DYNAMIC SIGMA ENERGY COVERAGE
+-----------------------------
+Energy origin   : E_F = -7.74046 eV (midgap)
+Sigma omega    : [-12.00000, +12.00000] eV relative to E_F; step=1.00000 eV; 25 points
+DFT QP valence : [-7.49935, -7.49935] eV relative to E_F
+DFT QP conduct.: [+7.49935, +13.70040] eV relative to E_F
+Coverage status : INCOMPLETE
+Grid shortfall  : 1.70040 eV above protected DFT states
+Band tail      : OFF | estimator=spectral_shell | brackets=total_fractions
+
+FUNDAMENTAL GAP
+---------------
+DFT gap        : 14.99870 eV
+Full-matrix effective-H gap: 13.21890 eV (insulating)
+Gap correction : -1.77980 eV relative to DFT
+State energies  : written to the EQP files listed below
+
+MAJOR-STAGE TIMING
+------------------
+  stage                    wall (s)     fraction
+  runtime bring-up             2.10      13.54%
+  pre-main + imports           0.82       5.31%
+  input + run setup            0.17       1.11%
+  restart load                 0.75       4.85%
+  ISDF setup + I/O             0.02       0.10%
+  minimax quadrature           0.07       0.48%
+  Sigma rule plan              0.19       1.25%
+  Sigma tau sweep              0.65       4.20%
+  Sigma other                 10.49      67.69%
+  mean-field load              0.04       0.28%
+  QP solve + diagonalize       0.06       0.37%
+  result writes                0.03       0.17%
+  other driver work            0.10       0.65%
+  total run                   15.49     100.00%
+
+WARNINGS
+--------
+  Minimax quadrature: 1 catalog entries used (7 nodes); requested tolerance 1.00000e-06; worst reported error 8.33000e-08. Catalog generator/backend provenance is UNCERTIFIED.
+  RuntimeWarning: minimax: UNCERTIFIED SOLVE noncrossing_imag/inverse_imag R=1.59189 target 1e-06 n_max=64 -> 3 nodes, max_err 4.324e-07, sum|w| 132.5, kappa0 16.18 | cache /global/homes/j/jackm/.cache/lorrax/minimax_quadratures/noncrossing_imag_v2_ef49bb07ca8582891a01969b26c394564cf46170b76acbf828426e5c2b217eb4.npz sha256:dc0562ae02922c78 gen n/a (solved in-process) backend cpu:numpy-2.5.2/scipy-1.18.1/x86_64 UNCERTIFIED -- UNCERTIFIED, NOT REPRODUCIBLE ACROSS HOSTS. No shipped table matched this request, so the rule was computed in-process by a SciPy optimiser whose answer depends on this machine's LAPACK (three hosts, three answers, kappa0 varying by 900x -- survey section 2.4). LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE=0 makes this a refusal instead.
+  WARNING: dynamic Sigma grid is incomplete for protected DFT states (1.70040 eV above); Sigma(E_DFT) has 1/3 out-of-grid cells; out-of-range policy=clamp. Widen sigma_omega_min_ev / sigma_omega_max_ev or add a sigma_omega_patches_ev window; use LORRAX_OMEGA_OUT_OF_RANGE=refuse when endpoint values must never enter an output.
+
+OUTPUT FILES AND INPUTS
+-----------------------
+  role                     state       path
+  input deck               read        /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/mpa_sc1.in
+  DFT wavefunctions        read        /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/WFN.h5
+  ISDF centroids           read        /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/centroids_frac_13.txt
+  mean-field Hamiltonian   read        /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/kin_ion.h5
+  long-wave dipoles        read        /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/dipole.h5
+  parallel transport       absent      /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/parallel_transport.h5
+  ISDF restart tensors     present     /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/tmp/isdf_tensors_13.h5
+  self-energy table        written     /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/mpa_sc1_sigma.dat
+  fixed-DFT-state diagonal zeroth-order energies written     /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/mpa_sc1_eqp0.dat
+  fixed-DFT-state diagonal Z-linearized energies written     /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/mpa_sc1_eqp1.dat
+  full-matrix effective-H rotations written     /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/qp_wfn_rotations.h5
+  matched full-matrix QP wavefunctions written     /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/WFN_qp.h5
+  dynamic Sigma spectrum   written     /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/mpa_sc1_sigma.h5
+
+LORRAX GW calculation completed.
+Report written to /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/B/mpa_sc1.out

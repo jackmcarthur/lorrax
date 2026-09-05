@@ -208,6 +208,15 @@ def test_the_controller_does_not_narrow_what_the_workers_inherit(tmp_path):
                  "known_failure_ledger.py", "KNOWN_FAILURES.md"):
         (tmp_path / name).write_text(
             (harness.REPO_ROOT / "tests" / name).read_text())
+    # The default selector now imports its exact roster from the core package
+    # during conftest import. This isolated controller probe must therefore
+    # stage that dependency too; otherwise it dies before the GPU-pinning
+    # behavior under test can run.
+    core = tmp_path / "core"
+    core.mkdir()
+    for name in ("__init__.py", "manifest.py"):
+        (core / name).write_text(
+            (harness.REPO_ROOT / "tests" / "core" / name).read_text())
     # EACH WORKER REPORTS THROUGH A FILE, not through stdout.  Under xdist a
     # worker's stdout does not reach the controller (execnet owns it, and -s
     # does not change that) -- measured here first: 16 probe cells passed

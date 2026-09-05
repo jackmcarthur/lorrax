@@ -1,0 +1,54 @@
+==============================================================================
+LORRAX ISDF CENTROID SELECTION
+==============================================================================
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 1
+Accelerators   : 1 GPU devices (NVIDIA A100-SXM4-40GB, 1 per rank)
+Processor mesh : 1 x 1  (centroid selection)
+CPU allocation : 128 cores per rank
+Host threads   : OPENBLAS_NUM_THREADS=64 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : eager reader
+Selection      : feature-weighted k-means on the real-space FFT grid
+
+CENTROID PROVENANCE
+-------------------
+LORRAX ISDF centroid coordinates (fractional crystal units)
+feature fit: left=(0, 2), right=(0, 3): sqrt(sum_k w_k sum_m,n |psi_mk^dag psi_nk|^2); unit band weights
+source wavefunctions: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/A/WFN.h5
+selection metric: sqrt(diag q=0 charge Gram), left=(0, 2), right=(0, 3), unit band weights
+electrons: 4; occupied-band boundary: 2
+FFT grid: (15, 15, 15); k grid: (3, 3, 1); shift: (0.0, 0.0, 0.0)
+selection: weighted k-means; seed=42; rho_power=1; requested=31; candidates=31; written=31
+pruning: not applied; pair-density windows left=(0, 2), right=(0, 3) (explicit feature pair)
+symmetry closure: orbit-aware; spatial operations=1
+coordinates: x y z snapped to FFT grid; 31 unique points
+intended channels: gamma^0 (charge) ISDF
+
+FILES
+-----
+Source WFN     : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/A/WFN.h5
+Centroids      : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/A/centroids_frac_31_htransform.txt
+Report         : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/A/kmeans_htransform.out
+
+TIMING (POST-STARTUP)
+---------------------
+Wavefunction setup [setup.wfn_io]       : 0.045 s
+Feature metric [setup.weight]           : 0.513 s
+Weighted k-means [kmeans]               : 2.509 s
+  Initialization [kmeans/init]          : 1.008 s
+  Lloyd iterations [kmeans/lloyd]       : 0.820 s
+  Final assignment [kmeans/assign_labels]: 0.332 s
+Orbit snap/unfold [snap_unfold]         : 0.001 s
+Lloyd-state release [release_before_prune]: 0.000 s
+Gram and selection [prune]              : 0.000 s
+  Gram build [prune/prune.gram]         : 0.000 s
+  Block selection [prune/prune.select]  : 0.000 s
+Other selection work                    : 0.007 s
+Selection wall : 3.076 s
+LORRAX ISDF centroid selection completed.
