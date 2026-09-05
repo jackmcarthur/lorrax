@@ -2751,7 +2751,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # instead of the silent edge clamp.
             partition = state.partition
             _refuse_frozen_partition_escape(
-                partition, _e_active_now,
+                partition, _e_active_now * RYD_TO_EV,   # E_full is in Ry
                 band_offset=int(inputs.band_slices.b0),
                 omega_min_abs_ev=_omega_lo, omega_max_abs_ev=_omega_hi,
                 tolerance_ev=_partition_hysteresis_margin_ev(inputs),
