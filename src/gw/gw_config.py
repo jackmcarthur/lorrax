@@ -468,6 +468,9 @@ class SigmaChannel(str, enum.Enum):
         }[self]
 
 
+INTERNAL_FF_CD_RESPONSE_WIDTH_EV = 0.25
+
+
 class SigmaFrequencyRoute(str, enum.Enum):
     """Frequency representation used by the dynamic MPA compute mode.
 
@@ -1708,10 +1711,10 @@ _DEFAULTS = {
     # docstring for why it is spelled ``mpa`` rather than ``full_freq``.
     "compute_mode": "auto",
     # Dynamic full-frequency route.  ``mpa`` preserves every pre-Tier-0
-    # deck byte-for-byte.  ``internal_ff_cd`` is the fit-free production
-    # reference: direct ordered-pair chi0, distributed Dyson W, and contour
-    # deformation.  The latter is deliberately explicit; ``auto`` never
-    # turns a scale run into the much dearer reference calculation.
+    # deck byte-for-byte.  ``internal_ff_cd`` is the fit-free O(N^4) oracle:
+    # direct ordered-pair chi0, distributed Dyson W, and contour deformation.
+    # It is deliberately explicit; ``auto`` never turns an O(N^3) scale run
+    # into the much dearer reference calculation.
     "sigma_freq_route": "mpa",
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
@@ -5915,6 +5918,15 @@ class LorraxConfig:
                 raise ValueError(
                     "sigma_freq_route = internal_ff_cd is certified for "
                     "screening_diagrams = w_rpa only.")
+            if not np.isclose(
+                    resolved.sigma.regularization_ev,
+                    INTERNAL_FF_CD_RESPONSE_WIDTH_EV,
+                    rtol=0.0, atol=1.0e-14):
+                raise ValueError(
+                    "sigma_freq_route = internal_ff_cd requires "
+                    "sigma_regularization_ev = "
+                    f"{INTERNAL_FF_CD_RESPONSE_WIDTH_EV:g}; this is the "
+                    "fixed physical width of its real-axis W samples.")
             if (resolved.occ_smearing_family != "mp1"
                     or resolved.occ_smearing_width_ry is None
                     or resolved.sigma.fermi_reference != "mp1_fixed_n"):

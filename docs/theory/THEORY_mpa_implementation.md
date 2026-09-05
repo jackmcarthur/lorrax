@@ -950,11 +950,12 @@ already-built $G$ and $W$ tiles and contains no pole-fit policy.
 
 ## 16. Tier 0 is the only MPA certification reference
 
-`sigma_freq_route = internal_ff_cd` is the fit-free production reference:
-direct ordered-pair $\chi_0$, the production distributed Dyson solve, the
-canonical q-star unfold, and numerical contour deformation.  Its $\chi$ and
-$W$ remain `P(None,x,y)` and its contour weights are applied before the mesh
-reduction, so no process receives an $N_\mu^2$ object.
+`sigma_freq_route = internal_ff_cd` is the fit-free $O(N^4)$ oracle, not a
+production frequency model: direct ordered-pair $\chi_0$, the production
+distributed Dyson solve, the canonical q-star unfold, and numerical contour
+deformation.  Its $\chi$ and $W$ remain `P(None,x,y)` and its contour weights
+are applied before the mesh reduction, so no process receives an
+$N_\mu^2$ object.
 
 An MPA run is **not certified by interpolation residuals, sample
 reconstruction, pole-count stability, or any other diagnostic of its own fit**.
@@ -963,11 +964,13 @@ against `internal_ff_cd` on a deck reachable by Tier 0, with matched occupation
 broadening, screening-band count, Coulomb/q0 convention, and external-cell
 scope.  The Tier-0 side must itself pass, per cell:
 
-1. contraction on the last response-width halving (a failure is named
-   unresolved and is never included in an average);
-2. the declared eta_W floor or a demonstrated eta_W-to-zero limit;
-3. nested real/imaginary grid controls and the 70 eV residue-coverage refusal;
-4. occupation and Coulomb provenance stamps.
+1. the fixed $\eta_W=0.25$ eV physical broadening, checked against the deck;
+2. a 0.25 eV real line through an interpolation-safe ceiling derived from the
+   complete target/intermediate energy table, with no extrapolation;
+3. separate nested fine/coarse real, fine/coarse imaginary, and imaginary-tail
+   controls below 0.5 meV in every real/imaginary component (a cancellation
+   between controls cannot pass);
+4. occupation, Coulomb, source, and grid provenance stamps.
 
 Only after those gates may the A/B certify MPA.  A green fit diagnostic without
 that A/B is explicitly not a production certification.

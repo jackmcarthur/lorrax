@@ -60,6 +60,10 @@ def test_route_axis_default_and_exact_spellings(tmp_path):
      + "qp_solver = fixed_point\n", "one_shot_dft"),
     ("compute_mode = mpa\nsigma_freq_route = internal_ff_cd\n",
      "occ_smearing_family = mp1"),
+    (METAL + "sigma_freq_route = internal_ff_cd\n"
+     + "qp_solver = one_shot_dft\n"
+     + "sigma_regularization_ev = 0.1\n",
+     "sigma_regularization_ev = 0.25"),
 ])
 def test_route_scope_is_refused_at_config_resolution(tmp_path, extra, match):
     with pytest.raises(ValueError, match=match):

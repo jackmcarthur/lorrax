@@ -28,6 +28,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
+from .gw_config import INTERNAL_FF_CD_RESPONSE_WIDTH_EV
 
 
 PAIR_TILE = 4
@@ -43,7 +44,7 @@ IMAG_MAX_EV = 100.0
 IMAG_MAP_SCALE_EV = 2.5
 IMAG_FINE_INTERVALS = 64
 CD_CONTROL_TOL_MEV = 0.5
-RESPONSE_WIDTHS_EV = (0.25,)
+RESPONSE_WIDTHS_EV = (INTERNAL_FF_CD_RESPONSE_WIDTH_EV,)
 
 
 @dataclass(frozen=True)
@@ -791,7 +792,7 @@ def compute_internal_ff_cd(
                     "imag_full_minus_tail_ev"][i].imag)],
         })
     artifact = {
-        "schema": 1,
+        "schema": 2,
         "route": "internal_ff_cd",
         "status": "pass" if unresolved.size == 0 else "unresolved",
         "jobid": os.environ.get("SLURM_JOB_ID", "unknown"),
