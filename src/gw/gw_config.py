@@ -484,6 +484,25 @@ class SigmaFrequencyRoute(str, enum.Enum):
     MPA = "mpa"
 
 
+class InternalFFCDOutput(str, enum.Enum):
+    """Output surface of the one internal full-frequency CD owner."""
+
+    ON_SHELL_DIAGONAL = "on_shell_diagonal"
+    SELECTED_MATRIX_BLOCK = "selected_matrix_block"
+
+
+def coerce_internal_ff_cd_output(output) -> InternalFFCDOutput:
+    if isinstance(output, InternalFFCDOutput):
+        return output
+    raw = str(output).strip().lower()
+    try:
+        return InternalFFCDOutput(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"internal_ff_cd_output={raw!r} is not known; expected one of: "
+            + ", ".join(value.value for value in InternalFFCDOutput)) from exc
+
+
 def coerce_sigma_frequency_route(route) -> SigmaFrequencyRoute:
     if isinstance(route, SigmaFrequencyRoute):
         return route
@@ -1717,6 +1736,9 @@ _DEFAULTS = {
     # It is deliberately explicit; ``auto`` never turns an O(N^3) scale run
     # into the much dearer reference calculation.
     "sigma_freq_route": "mpa",
+    # One output axis beneath the single internal_ff_cd W/chi0 owner.  The
+    # default preserves the existing scalar referee byte-for-byte.
+    "internal_ff_cd_output": "on_shell_diagonal",
     # Offline W evidence from the existing Tier-0 Dyson stream.  This is a
     # fixed-policy oracle observer, not a second screening route.
     "internal_ff_cd_w_observer": False,
@@ -2385,6 +2407,7 @@ _NORMALIZE_STR = {
     "compute_mode",
     "bispinor_gw",
     "sigma_freq_route",
+    "internal_ff_cd_output",
     "qp_solver",
     "sc_accelerator",
     "sc_head_update",
@@ -4291,6 +4314,8 @@ class DynamicSigmaConfig:
     quadrature_reduction_seconds: float = 120.0
     quadrature_cache_dir: str = "auto"
     freq_route: SigmaFrequencyRoute = SigmaFrequencyRoute.MPA
+    internal_ff_cd_output: InternalFFCDOutput = (
+        InternalFFCDOutput.ON_SHELL_DIAGONAL)
     w_observer: bool = False
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
@@ -4336,6 +4361,11 @@ class DynamicSigmaConfig:
                 "DynamicSigmaConfig.freq_route must be a "
                 "SigmaFrequencyRoute member; use "
                 "coerce_sigma_frequency_route for deck strings.")
+        if not isinstance(self.internal_ff_cd_output, InternalFFCDOutput):
+            raise ValueError(
+                "DynamicSigmaConfig.internal_ff_cd_output must be an "
+                "InternalFFCDOutput member; use "
+                "coerce_internal_ff_cd_output for deck strings.")
         if self.omega_step_ev <= 0.0:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         if self.omega_max_ev < self.omega_min_ev:
@@ -5512,6 +5542,8 @@ class LorraxConfig:
         )
         sigma = DynamicSigmaConfig(
             freq_route=coerce_sigma_frequency_route(_g("sigma_freq_route")),
+            internal_ff_cd_output=coerce_internal_ff_cd_output(
+                _g("internal_ff_cd_output")),
             w_observer=bool(_g("internal_ff_cd_w_observer")),
             omega_min_ev=float(_g("sigma_omega_min_ev")),
             omega_max_ev=float(_g("sigma_omega_max_ev")),
@@ -5913,6 +5945,14 @@ class LorraxConfig:
                 "internal_ff_cd_w_observer = true requires "
                 "sigma_freq_route = internal_ff_cd; it observes the one "
                 "Tier-0 Dyson stream and does not construct W independently.")
+        if (resolved.sigma.internal_ff_cd_output
+                is not InternalFFCDOutput.ON_SHELL_DIAGONAL
+                and resolved.sigma.freq_route
+                is not SigmaFrequencyRoute.INTERNAL_FF_CD):
+            raise ValueError(
+                "internal_ff_cd_output = selected_matrix_block requires "
+                "sigma_freq_route = internal_ff_cd; it selects the output "
+                "of that one Tier-0 stream and does not create another W.")
         if resolved.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD:
             if resolved.compute_mode is not ComputeMode.MPA:
                 raise ValueError(
@@ -5921,11 +5961,11 @@ class LorraxConfig:
                     "consumes it.")
             if resolved.qp_solver is not QPSolver.ONE_SHOT_DFT:
                 raise ValueError(
-                    "sigma_freq_route = internal_ff_cd currently produces "
-                    "the Tier-0 on-shell diagonal at E_DFT and therefore "
-                    "requires qp_solver = one_shot_dft. fixed_point and "
-                    "self_consistent require an off-shell matrix Sigma(omega) "
-                    "cube and are refused rather than silently using MPA.")
+                    "sigma_freq_route = internal_ff_cd is currently "
+                    "certified only for qp_solver = one_shot_dft. The "
+                    "selected_matrix_block arm emits an off-shell cube, but "
+                    "fixed_point/self_consistent use remains unverified and "
+                    "is refused rather than silently changing routes.")
             if resolved.screening.diagrams is not ScreeningDiagrams.W_RPA:
                 raise ValueError(
                     "sigma_freq_route = internal_ff_cd is certified for "

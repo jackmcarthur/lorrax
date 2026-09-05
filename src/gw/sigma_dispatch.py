@@ -1382,6 +1382,43 @@ def compute_sigma_xc(
                 charge_zeta_identity=charge_zeta_identity,
                 coulomb_policy_receipt=coulomb_policy_receipt,
                 print_fn=print_fn)
+            if tier0.sigma_c_body_omega_ry is not None:
+                if (tier0.head_sigma_diag_w_kn_ry is None
+                        or tier0.sigma_band_axis is None):
+                    raise ValueError(
+                        "internal_ff_cd selected_matrix_block returned an "
+                        "incomplete body/head/band-axis result")
+                from .efermi import resolve_sigma_efermi_ry
+                sigma_efermi_ry, sigma_efermi_provenance = (
+                    resolve_sigma_efermi_ry(
+                        config.sigma.fermi_reference,
+                        occupation_state=occupation_state, wfn=wfn))
+                if not np.isclose(
+                        sigma_efermi_ry,
+                        float(tier0.efermi_ev) / RYD_TO_EV,
+                        rtol=0.0, atol=1.0e-14):
+                    raise ValueError(
+                        "internal_ff_cd selected_matrix_block omega "
+                        "reference differs from the dynamic finalizer: "
+                        f"{tier0.efermi_ev / RYD_TO_EV} vs "
+                        f"{sigma_efermi_ry} Ry")
+                return finalize_dynamic_sigma(
+                    tier0.sigma_c_body_omega_ry,
+                    tier0.head_sigma_diag_w_kn_ry,
+                    sigma_band_axis=tier0.sigma_band_axis,
+                    sig_x=sig_x, sig_h=sig_h,
+                    v_h_scalar=v_h_scalar,
+                    h_transverse=h_transverse,
+                    hartree_omitted=bool(omit_v_h),
+                    e_qp_ev=e_qp_ev,
+                    config=config, meta=meta, mesh_xy=mesh_xy,
+                    sym=sym, wfn=wfn, band_slices=band_slices,
+                    input_dir=input_dir,
+                    write_sigma_omega_h5=write_sigma_omega_h5,
+                    sigma_lorentz_static_skij_ry=sigma_lorentz,
+                    print_fn=print_fn,
+                    efermi_ry=sigma_efermi_ry,
+                    efermi_provenance=sigma_efermi_provenance)
             sigma_c_ev = np.asarray(tier0.sigma_c_diag_ev)
             expected = (int(meta.nk_tot), int(meta.nb_sigma))
             if sigma_c_ev.shape != expected:

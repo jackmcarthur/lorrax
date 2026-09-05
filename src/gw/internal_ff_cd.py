@@ -40,6 +40,7 @@ TARGET_TILE = 4
 INTERMEDIATE_BAND_TILE = 4
 EXTERNAL_FREQUENCY_TILE = 4
 FREQUENCY_BATCH = 4
+MATRIX_CHECKPOINT_FREQUENCIES = 16
 IMAG_ORIGIN_LIMIT_EV = 1.0e-10
 CENTER_SHIFT_EV = 1.0e-10
 REAL_MAX_EV = 70.0
@@ -59,6 +60,7 @@ RESPONSE_WIDTHS_EV = (INTERNAL_FF_CD_RESPONSE_WIDTH_EV,)
 BODY_ACCUMULATOR_SEMANTIC_EPOCH = (
     "internal-ff-cd-body-v2:ordered-pair-dyson-qstar-contour")
 CHECKPOINT_SCHEMA = 2
+MATRIX_CHECKPOINT_SCHEMA = 1
 ARRAY_RECEIPT_SCHEME = "numpy-c-order-sha256-v1"
 STAGE_TIMING_KEYS = (
     "dyson_solve_wall_seconds",
@@ -69,9 +71,12 @@ STAGE_TIMING_KEYS = (
 
 @dataclass(frozen=True)
 class InternalFFResult:
-    sigma_c_diag_ev: np.ndarray
+    sigma_c_diag_ev: np.ndarray | None
     efermi_ev: float
     artifact_path: str
+    sigma_c_body_omega_ry: jax.Array | None = None
+    head_sigma_diag_w_kn_ry: jax.Array | None = None
+    sigma_band_axis: object | None = None
 
 
 def real_grid(width_ev: float, *, max_ev: float = REAL_MAX_EV) -> np.ndarray:
@@ -554,6 +559,86 @@ def _make_weighted_block_contract_kernel(
     return apply
 
 
+def _make_matrix_accumulator_kernels(
+        mesh: Mesh, *, matrix_shape: tuple[int, int, int, int],
+        head_shape: tuple[int, int, int]):
+    """Create distributed zero/add/pin operations for one selected cube."""
+    matrix_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    # Shard the analytic diagonal by its one band axis.  Replication over y
+    # makes the x-owned band block available on the diagonal matrix rank
+    # (x == y) without ever replicating the whole O(nomega*nk*nb) carrier.
+    head_sharding = NamedSharding(mesh, P(None, None, "x"))
+
+    make_matrix_zero = jax.jit(
+        lambda: jnp.zeros(matrix_shape, dtype=jnp.complex128),
+        out_shardings=matrix_sharding)
+    make_head_zero = jax.jit(
+        lambda: jnp.zeros(head_shape, dtype=jnp.complex128),
+        out_shardings=head_sharding)
+
+    @jax.jit
+    def add_matrix_tile(accumulator, tile, omega_lo):
+        zero = jnp.asarray(0, dtype=omega_lo.dtype)
+        start = (omega_lo, zero, zero, zero)
+        return jax.lax.dynamic_update_slice(
+            accumulator,
+            jax.lax.dynamic_slice(
+                accumulator, start, tile.shape) + tile,
+            start)
+
+    add_matrix_tile = jax.jit(
+        add_matrix_tile, out_shardings=matrix_sharding)
+
+    @jax.jit
+    def add_head_sample(accumulator, omega_abs_ev, omega_valid,
+                        energies_ev, occupations, wc0_ry, rule,
+                        inverse_volume_nk):
+        x_signed = (
+            omega_abs_ev[:, None, None] - energies_ev[None, :, :]
+            + CENTER_SHIFT_EV)
+        coefficient = _device_contour_weight(
+            rule, x_signed, occupations[None, :, :])
+        coefficient = jnp.where(
+            omega_valid[:, None, None], coefficient, 0.0)
+        # The body path consumes S=-Wc.  The Gamma scalar follows the same
+        # convention and differs only by its analytic volume normalization.
+        return accumulator - coefficient * wc0_ry * inverse_volume_nk
+
+    add_head_sample = jax.jit(
+        add_head_sample, out_shardings=head_sharding)
+
+    @jax.jit
+    def pin_head_on_shell(head, omega_rel_ev, energy_rel_ev,
+                          static_head_ry, band_valid):
+        """Minimum-norm two-node correction reproducing eta=0 on shell."""
+        n_omega = int(head.shape[0])
+        hi = jnp.searchsorted(omega_rel_ev, energy_rel_ev, side="right")
+        hi = jnp.clip(hi, 1, n_omega - 1)
+        lo = hi - 1
+        w_hi = ((energy_rel_ev - omega_rel_ev[lo])
+                / (omega_rel_ev[hi] - omega_rel_ev[lo]))
+        w_hi = jnp.where(energy_rel_ev <= omega_rel_ev[0], 0.0, w_hi)
+        w_hi = jnp.where(energy_rel_ev >= omega_rel_ev[-1], 1.0, w_hi)
+        w_lo = 1.0 - w_hi
+        current = (
+            jnp.take_along_axis(head, lo[None], axis=0)[0] * w_lo
+            + jnp.take_along_axis(head, hi[None], axis=0)[0] * w_hi)
+        delta = jnp.where(band_valid[None], static_head_ry - current, 0.0)
+        denom = jnp.maximum(w_lo * w_lo + w_hi * w_hi,
+                            jnp.finfo(jnp.float64).tiny)
+        omega_index = jnp.arange(n_omega)[:, None, None]
+        correction = delta[None] * (
+            jnp.where(omega_index == lo[None], w_lo[None] / denom[None], 0.0)
+            + jnp.where(omega_index == hi[None],
+                        w_hi[None] / denom[None], 0.0))
+        return head + correction
+
+    pin_head_on_shell = jax.jit(
+        pin_head_on_shell, out_shardings=head_sharding)
+    return (make_matrix_zero, make_head_zero, add_matrix_tile,
+            add_head_sample, pin_head_on_shell)
+
+
 def _real_coefficients(grid: np.ndarray, iw: int, x_abs: np.ndarray,
                        sign: np.ndarray) -> np.ndarray:
     idx = np.searchsorted(grid, x_abs, side="right") - 1
@@ -714,6 +799,26 @@ def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
     return identity
 
 
+def _matrix_output_identity(identity: dict, *, omega_rel_ev,
+                            sigma_band_axis, nk: int) -> dict:
+    """Bind the scalar W-prefix identity to its selected output carrier."""
+    out = dict(identity)
+    out.update({
+        "matrix_checkpoint_schema": MATRIX_CHECKPOINT_SCHEMA,
+        "output": "selected_matrix_block",
+        "omega_rel_ev": _array_receipt(omega_rel_ev, dtype=np.float64),
+        "full_bz_k_rows": int(nk),
+        "sigma_band_axis": {
+            "logical": int(sigma_band_axis.logical),
+            "carrier": int(sigma_band_axis.carrier),
+            "partition": "P(None,None,x,y)",
+        },
+        "external_frequency_tile": EXTERNAL_FREQUENCY_TILE,
+        "intermediate_band_tile": INTERMEDIATE_BAND_TILE,
+    })
+    return out
+
+
 def _load_checkpoint(path: Path, identity, n_targets, n_accumulators, *,
                      return_stage_timings: bool = False):
     empty_stages = {key: 0.0 for key in STAGE_TIMING_KEYS}
@@ -794,17 +899,246 @@ def _save_checkpoint(path: Path, identity, completed, accumulators,
     os.replace(tmp, path)
 
 
-def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
-                          mesh, sym, wfn, V_q, band_slices,
-                          nb_chi_logical, print_fn):
-    """The referee's pole-free static metallic head and eta=0 half residue."""
+def _canonical_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _matrix_checkpoint_paths(base_path: Path) -> tuple[Path, tuple[Path, Path]]:
+    base = Path(base_path)
+    return (
+        Path(str(base) + ".current.json"),
+        (Path(str(base) + ".slot0.h5"), Path(str(base) + ".slot1.h5")),
+    )
+
+
+def _read_matrix_checkpoint_pointer(base_path: Path):
+    """Read one atomic identity pointer and require all hosts saw one image."""
+    from common.collectives import all_gather_processes
+
+    pointer_path, _ = _matrix_checkpoint_paths(base_path)
+    raw = pointer_path.read_bytes() if pointer_path.exists() else b""
+    gathered = np.asarray(all_gather_processes(
+        np.frombuffer(hashlib.sha256(raw).digest(), dtype=np.uint8)),
+        dtype=np.uint8)
+    if np.any(gathered != gathered[:1]):
+        raise RuntimeError(
+            "internal_ff_cd matrix checkpoint pointer changed while ranks "
+            f"were opening it: {pointer_path}")
+    if not raw:
+        return None
+    try:
+        pointer = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"internal_ff_cd matrix checkpoint pointer is corrupt: "
+            f"{pointer_path}") from exc
+    required = {"schema", "slot", "generation", "completed", "identity"}
+    if set(pointer) != required:
+        raise ValueError(
+            "internal_ff_cd matrix checkpoint pointer keys differ from the "
+            f"schema: got {sorted(pointer)}, required {sorted(required)}")
+    if (int(pointer["schema"]) != MATRIX_CHECKPOINT_SCHEMA
+            or int(pointer["slot"]) not in (0, 1)):
+        raise ValueError(
+            f"internal_ff_cd matrix checkpoint pointer is invalid: {pointer}")
+    return pointer
+
+
+def _atomic_write_matrix_pointer(pointer_path: Path, pointer: dict) -> None:
+    """Publish the only mutable checkpoint byte after its slot commits."""
+    pointer_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(pointer_path) + f".tmp.{os.getpid()}")
+    payload = (_canonical_json(pointer) + "\n").encode("utf-8")
+    with tmp.open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, pointer_path)
+    directory_fd = os.open(pointer_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _save_matrix_checkpoint(
+        base_path: Path, identity: dict, completed: int,
+        accumulators: tuple[jax.Array, ...],
+        head_accumulators: tuple[jax.Array, ...], *, mesh: Mesh,
+        logical_matrix_shape: tuple[int, int, int, int],
+        logical_head_shape: tuple[int, int, int],
+        chi_wall: float = 0.0, solve_contract_wall: float = 0.0,
+        stage_timings: dict | None = None) -> dict:
+    """Commit an all-P matrix prefix to an inactive SlabIO slot.
+
+    The active file is immutable.  Only after the inactive SlabIO handle has
+    closed (and therefore stamped its commit receipt) does rank zero replace
+    the tiny identity pointer.  At no point is a matrix accumulator converted
+    to NumPy or gathered on a host.
+    """
+    from common.collectives import rank0_transaction
+    from file_io.slab_io import SlabIO
+
+    if not accumulators or len(accumulators) != len(head_accumulators):
+        raise ValueError(
+            "internal_ff_cd matrix checkpoint requires matching nonempty "
+            "body/head accumulator tuples")
+    grid_n = int(identity.get("grid_n", -1))
+    completed = int(completed)
+    if completed < 0 or completed > grid_n:
+        raise ValueError(
+            f"internal_ff_cd matrix checkpoint completed={completed} outside "
+            f"[0,{grid_n}]")
+    logical_matrix_shape = tuple(int(v) for v in logical_matrix_shape)
+    logical_head_shape = tuple(int(v) for v in logical_head_shape)
+    body_shapes = {tuple(int(v) for v in value.shape)
+                   for value in accumulators}
+    head_shapes = {tuple(int(v) for v in value.shape)
+                   for value in head_accumulators}
+    if len(body_shapes) != 1 or len(head_shapes) != 1:
+        raise ValueError("internal_ff_cd checkpoint accumulator shapes differ")
+    matrix_carrier, head_carrier = next(iter(body_shapes)), next(iter(head_shapes))
+    if (len(matrix_carrier) != 4 or len(head_carrier) != 3
+            or any(a > b for a, b in zip(logical_matrix_shape, matrix_carrier))
+            or any(a > b for a, b in zip(logical_head_shape, head_carrier))):
+        raise ValueError(
+            "internal_ff_cd checkpoint logical/carrier shapes are invalid: "
+            f"matrix {logical_matrix_shape}/{matrix_carrier}, "
+            f"head {logical_head_shape}/{head_carrier}")
+
+    pointer_path, slot_paths = _matrix_checkpoint_paths(base_path)
+    current = _read_matrix_checkpoint_pointer(base_path)
+    if current is not None and current["identity"] != identity:
+        raise ValueError(
+            "internal_ff_cd matrix checkpoint identity changed; start a new "
+            f"run variant rather than overwriting its slots: {base_path}")
+    if current is not None and completed < int(current["completed"]):
+        raise ValueError(
+            "internal_ff_cd matrix checkpoint cannot move backwards: "
+            f"completed={completed} after {int(current['completed'])}")
+    active = -1 if current is None else int(current["slot"])
+    generation = 0 if current is None else int(current["generation"]) + 1
+    inactive = 0 if active != 0 else 1
+    slot_path = slot_paths[inactive]
+    identity_bytes = _canonical_json(identity).encode("utf-8")
+    identity_sha256 = hashlib.sha256(identity_bytes).digest()
+    stages = ({key: 0.0 for key in STAGE_TIMING_KEYS}
+              if stage_timings is None else {
+                  key: float(stage_timings[key]) for key in STAGE_TIMING_KEYS
+              })
+
+    rank0_transaction(
+        pointer_path, stage="internal_ff_cd.matrix_checkpoint_directory",
+        write=lambda: pointer_path.parent.mkdir(parents=True, exist_ok=True))
+    with SlabIO(slot_path, mode="w", mesh=mesh) as io:
+        for index, value in enumerate(accumulators):
+            name = f"body_accumulator_{index}"
+            io.create_dataset(
+                name, shape=logical_matrix_shape, dtype=np.complex128)
+            io.write_slab(
+                name, value, valid_shape=logical_matrix_shape,
+                dtype=np.complex128)
+        for index, value in enumerate(head_accumulators):
+            name = f"head_accumulator_{index}"
+            io.create_dataset(
+                name, shape=logical_head_shape, dtype=np.complex128)
+            io.write_slab(
+                name, value, valid_shape=logical_head_shape,
+                dtype=np.complex128)
+        io.write_attr("matrix_checkpoint_schema", np.int64(
+            MATRIX_CHECKPOINT_SCHEMA))
+        io.write_attr(
+            "identity_sha256_bytes", np.frombuffer(
+                identity_sha256, dtype=np.uint8).astype(np.int32))
+        io.write_attr("generation", np.int64(generation))
+        io.write_attr("completed", np.int64(completed))
+        io.write_attr("n_accumulators", np.int64(len(accumulators)))
+        io.write_attr("chi_wall_seconds", np.float64(chi_wall))
+        io.write_attr(
+            "solve_contract_wall_seconds", np.float64(solve_contract_wall))
+        for key, value in stages.items():
+            io.write_attr(key, np.float64(value))
+
+    pointer = {
+        "schema": MATRIX_CHECKPOINT_SCHEMA,
+        "slot": inactive,
+        "generation": generation,
+        "completed": completed,
+        "identity": identity,
+    }
+    rank0_transaction(
+        pointer_path, stage="internal_ff_cd.matrix_checkpoint_publish",
+        write=lambda: _atomic_write_matrix_pointer(pointer_path, pointer))
+    return pointer
+
+
+def _load_matrix_checkpoint(
+        base_path: Path, identity: dict, n_accumulators: int, *, mesh: Mesh,
+        matrix_carrier_shape: tuple[int, int, int, int],
+        head_carrier_shape: tuple[int, int, int],
+        logical_matrix_shape: tuple[int, int, int, int],
+        logical_head_shape: tuple[int, int, int],
+        return_stage_timings: bool = False):
+    """Read only the slot named by the atomic pointer, directly to shards."""
+    from file_io.slab_io import SlabIO
+
+    pointer = _read_matrix_checkpoint_pointer(base_path)
+    if pointer is None:
+        return None
+    if pointer["identity"] != identity:
+        raise ValueError(
+            "internal_ff_cd matrix checkpoint identity changed; start a new "
+            f"run variant rather than mixing prefixes: {base_path}")
+    identity_sha256 = hashlib.sha256(
+        _canonical_json(identity).encode("utf-8")).digest()
+    pointer_path, slot_paths = _matrix_checkpoint_paths(base_path)
+    del pointer_path
+    slot_path = slot_paths[int(pointer["slot"])]
+    with SlabIO(slot_path, mode="r", mesh=mesh) as io:
+        stamped_digest = bytes(np.asarray(
+            io.read_small("identity_sha256_bytes"), dtype=np.uint8))
+        generation = int(io.read_small("generation"))
+        completed = int(io.read_small("completed"))
+        stamped_n = int(io.read_small("n_accumulators"))
+        if stamped_digest != identity_sha256:
+            raise ValueError(
+                f"internal_ff_cd matrix slot identity mismatch: {slot_path}")
+        if (generation != int(pointer["generation"])
+                or completed != int(pointer["completed"])):
+            raise ValueError(
+                "internal_ff_cd matrix pointer/slot generation mismatch: "
+                f"{pointer} vs generation={generation},completed={completed}")
+        if stamped_n != int(n_accumulators):
+            raise ValueError(
+                f"internal_ff_cd matrix slot has {stamped_n} accumulators; "
+                f"expected {n_accumulators}")
+        body = tuple(io.read_slab(
+            f"body_accumulator_{index}", shape=matrix_carrier_shape,
+            valid_shape=logical_matrix_shape, mesh=mesh,
+            partition_spec=P(None, None, "x", "y"), dtype=np.complex128)
+                     for index in range(stamped_n))
+        head = tuple(io.read_slab(
+            f"head_accumulator_{index}", shape=head_carrier_shape,
+            valid_shape=logical_head_shape, mesh=mesh,
+            partition_spec=P(None, None, "x"), dtype=np.complex128)
+                     for index in range(stamped_n))
+        chi_wall = float(io.read_small("chi_wall_seconds"))
+        solve_contract_wall = float(io.read_small(
+            "solve_contract_wall_seconds"))
+        stages = {
+            key: float(io.read_small(key)) for key in STAGE_TIMING_KEYS
+        }
+    values = (completed, body, head, chi_wall, solve_contract_wall)
+    return values + (stages,) if return_stage_timings else values
+
+
+def _prepare_head_response_context(
+        wfns, *, state, config, meta, mesh, sym, wfn, band_slices,
+        nb_chi_logical):
+    """Prepare the one q->0 response owner for static and streamed samples."""
     from common.collectives import device_put_process_local
-    from common.kq_mapping import kminq_idx_for_iq
     from .fermi_surface import star_symmetrize_weights, tetrahedron_delta_weights
-    from .qsgw_head import (build_iteration_head_response,
-                            finalize_iteration_head_sample,
-                            load_dft_velocity_head)
-    from .w_isdf import solve_w
+    from .qsgw_head import load_dft_velocity_head
 
     nk = int(meta.nk_tot)
     surface = tetrahedron_delta_weights(
@@ -836,18 +1170,51 @@ def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
         (nk, nb_storage, nb_storage)).copy()
     U = device_put_process_local(
         identity, NamedSharding(mesh, P(None, "x", "y")))
-    response = build_iteration_head_response(
-        None, None, velocity.velocity_dft_cart, U,
+    return {
+        "surface_kn": surface_kn,
+        "velocity": velocity,
+        "U": U,
+        "nb_logical": nb_logical,
+        "nb_storage": nb_storage,
+    }
+
+
+def _build_head_response(
+        context, z_ry, *, wfns, state, config, meta, mesh, wfn):
+    """Build dynamic head/wings at exactly the streamed body frequencies."""
+    from .qsgw_head import build_iteration_head_response
+
+    nb_storage = int(context["nb_storage"])
+    velocity = context["velocity"]
+    return build_iteration_head_response(
+        None, None, velocity.velocity_dft_cart, context["U"],
         wfns.enk[:, :nb_storage], state.f_kn[:, :nb_storage],
-        np.asarray([0.0 + 0.0j], np.complex128),
-        surface_weight_qp_kn=surface_kn[:, :nb_storage], mesh=mesh,
+        np.asarray(z_ry, np.complex128),
+        surface_weight_qp_kn=context["surface_kn"][:, :nb_storage], mesh=mesh,
         kgrid=tuple(int(x) for x in wfn.kgrid),
         bvec_cart=velocity.reciprocal_lattice_cart,
-        nb_logical=nb_logical,
+        nb_logical=int(context["nb_logical"]),
         sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),
         efermi_ry=float(state.mu_ry), wfn=wfn, meta=meta, config=config,
         wfns_qp=wfns, eta_ry=0.0)
-    gamma_map = kminq_idx_for_iq(sym, 0)[None, :]
+
+
+def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
+                          mesh, sym, wfn, V_q, band_slices,
+                          nb_chi_logical, print_fn, context=None):
+    """The referee's pole-free static metallic head and eta=0 half residue."""
+    from .qsgw_head import finalize_iteration_head_sample
+    from .w_isdf import solve_w
+
+    nk = int(meta.nk_tot)
+    if context is None:
+        context = _prepare_head_response_context(
+            wfns, state=state, config=config, meta=meta, mesh=mesh, sym=sym,
+            wfn=wfn, band_slices=band_slices,
+            nb_chi_logical=nb_chi_logical)
+    response = _build_head_response(
+        context, np.asarray([0.0 + 0.0j], np.complex128), wfns=wfns,
+        state=state, config=config, meta=meta, mesh=mesh, wfn=wfn)
     # The production head owns the tetrahedron surface convention.  Its
     # body matrix is solved directly, exactly as in the referee route.
     head_chi = response.static_chi_body_gamma.copy()
@@ -913,6 +1280,7 @@ def compute_internal_ff_cd(
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from symmetry_maps import unfold_isdf_operator
     from .efermi import OccupationState, mp1_negative_derivative
+    from .gw_config import InternalFFCDOutput
     from .v_q_g_flat import _resolve_ibz_q_list
     from .w_isdf import solve_w
 
@@ -939,6 +1307,9 @@ def compute_internal_ff_cd(
             float(config.occ_broadening_ry),
             state_capacity=float(spin_degeneracy_factor(wfn)))
     state = occupation_state
+    selected_matrix = (
+        config.sigma.internal_ff_cd_output
+        is InternalFFCDOutput.SELECTED_MATRIX_BLOCK)
     surface = mp1_negative_derivative(
         wfns.enk, float(state.mu_ry), float(state.smearing_width_ry))
 
@@ -967,28 +1338,113 @@ def compute_internal_ff_cd(
     sigma_bands = np.arange(
         int(band_slices.sigma.start or 0), int(band_slices.sigma.stop),
         dtype=np.int32)
-    target_k = np.repeat(k_wedge, sigma_bands.size)
-    target_b = np.tile(sigma_bands, k_wedge.size)
-    n_targets = int(target_k.size)
     q_rows = np.arange(nk, dtype=np.int32)
-    kmq_target = np.stack([
-        kq_map_full[int(k), q_rows] for k in target_k]).astype(np.int32)
     energies_ev = np.asarray(wfns.enk, np.float64) * RYD_TO_EV
     occupations = np.asarray(state.f_kn, np.float64)
-    target_e_ev = energies_ev[target_k, target_b]
-    inner_e_ev = energies_ev[kmq_target]
-    inner_f = occupations[kmq_target]
-    x_signed = target_e_ev[:, None, None] - inner_e_ev + CENTER_SHIFT_EV
-    x_abs = abs(x_signed)
-    max_required = float(np.max(x_abs[:, :, :nb_sigma_logical]))
-    real_max_ev = _real_coverage_max(max_required)
-    residue_sign = np.where(x_signed >= 0.0, -(1.0 - inner_f), inner_f)
+
+    if selected_matrix:
+        if getattr(wfns, "layout", "legacy") != "legacy":
+            raise ValueError(
+                "internal_ff_cd selected_matrix_block currently requires "
+                "the legacy wavefunction carrier used by its direct chi0; "
+                "a face-layout port must extend the same block projector, "
+                "not introduce a second Green-function owner")
+        if int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
+            raise ValueError(
+                "internal_ff_cd selected_matrix_block requires the square "
+                "2D processor grid used by its band-diagonal head injection; "
+                f"got mesh {mesh_xy.shape}")
+        from common.collectives import device_put_process_local
+        from runtime.padding import pad_to_axis
+        from .ppm_sigma import sigma_band_axis
+
+        target_k = np.arange(nk, dtype=np.int32)
+        target_b = sigma_bands.copy()
+        n_targets = int(nk)
+        kmq_target = np.asarray(kq_map_full, np.int32)
+        omega_rel_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+        if (omega_rel_ev.ndim != 1 or omega_rel_ev.size < 2
+                or np.any(np.diff(omega_rel_ev) <= 0.0)):
+            raise ValueError(
+                "internal_ff_cd selected_matrix_block requires a strictly "
+                "increasing Sigma omega grid with at least two values")
+        omega_abs_logical_ev = omega_rel_ev + float(state.mu_ry) * RYD_TO_EV
+        omega_carrier_n = (
+            (omega_rel_ev.size + EXTERNAL_FREQUENCY_TILE - 1)
+            // EXTERNAL_FREQUENCY_TILE * EXTERNAL_FREQUENCY_TILE)
+        omega_abs_ev = np.pad(
+            omega_abs_logical_ev,
+            (0, omega_carrier_n - omega_rel_ev.size), mode="edge")
+        omega_valid = np.arange(omega_carrier_n) < omega_rel_ev.size
+        max_required = float(np.max(np.abs(
+            omega_abs_logical_ev[:, None, None]
+            - energies_ev[None, :, :nb_sigma_logical])))
+        real_max_ev = _real_coverage_max(max_required)
+        x_signed = x_abs = residue_sign = None
+
+        sigma_axis = sigma_band_axis(
+            int(sigma_bands.size), mesh_xy, ansatz="internal_ff_cd")
+        psi_proj_xr = pad_to_axis(
+            wfns.xr(band_slices.sigma), sigma_axis, axis=1)
+        psi_proj_yn = pad_to_axis(
+            wfns.yn(band_slices.sigma), sigma_axis, axis=3)
+        matrix_shape = (
+            int(omega_carrier_n), nk, int(sigma_axis.carrier),
+            int(sigma_axis.carrier))
+        logical_matrix_shape = (
+            int(omega_rel_ev.size), nk, int(sigma_axis.logical),
+            int(sigma_axis.logical))
+        head_shape = (
+            int(omega_carrier_n), nk, int(sigma_axis.carrier))
+        logical_head_shape = (
+            int(omega_rel_ev.size), nk, int(sigma_axis.logical))
+        block_contract = _make_weighted_block_contract_kernel(
+            mesh_xy, n_target_k=nk, inner_stop=nb_sigma_logical)
+        (make_matrix_zero, make_head_zero, add_matrix_tile,
+         add_head_sample, pin_head_on_shell) = _make_matrix_accumulator_kernels(
+             mesh_xy, matrix_shape=matrix_shape, head_shape=head_shape)
+        head_energy_host = np.pad(
+            energies_ev[:, sigma_bands],
+            ((0, 0), (0, sigma_axis.carrier - sigma_axis.logical)))
+        head_occ_host = np.pad(
+            occupations[:, sigma_bands],
+            ((0, 0), (0, sigma_axis.carrier - sigma_axis.logical)))
+        head_energy_ev = device_put_process_local(
+            head_energy_host, NamedSharding(mesh_xy, P(None, "x")))
+        head_occupations = device_put_process_local(
+            head_occ_host, NamedSharding(mesh_xy, P(None, "x")))
+        omega_abs_device = jnp.asarray(omega_abs_ev, dtype=jnp.float64)
+        omega_valid_device = jnp.asarray(omega_valid)
+        head_context = _prepare_head_response_context(
+            wfns, state=state, config=config, meta=meta, mesh=mesh_xy,
+            sym=sym, wfn=wfn, band_slices=band_slices,
+            nb_chi_logical=nb_chi_logical)
+        gamma_rows = np.flatnonzero(q_full == 0)
+        if gamma_rows.size != 1:
+            raise ValueError(
+                "internal_ff_cd selected_matrix_block requires exactly one "
+                f"Gamma row in the q wedge, got {gamma_rows.tolist()}")
+        gamma_row = int(gamma_rows[0])
+    else:
+        target_k = np.repeat(k_wedge, sigma_bands.size)
+        target_b = np.tile(sigma_bands, k_wedge.size)
+        n_targets = int(target_k.size)
+        kmq_target = np.stack([
+            kq_map_full[int(k), q_rows] for k in target_k]).astype(np.int32)
+        target_e_ev = energies_ev[target_k, target_b]
+        inner_e_ev = energies_ev[kmq_target]
+        inner_f = occupations[kmq_target]
+        x_signed = target_e_ev[:, None, None] - inner_e_ev + CENTER_SHIFT_EV
+        x_abs = abs(x_signed)
+        max_required = float(np.max(x_abs[:, :, :nb_sigma_logical]))
+        real_max_ev = _real_coverage_max(max_required)
+        residue_sign = np.where(
+            x_signed >= 0.0, -(1.0 - inner_f), inner_f)
 
     direct = make_direct_kernel(
         mesh_xy, nb_logical=nb_chi_logical)
-    contract = make_weighted_contract_kernel(
-        mesh_xy, n_targets=n_targets,
-        inner_stop=nb_sigma_logical)
+    contract = (None if selected_matrix else make_weighted_contract_kernel(
+        mesh_xy, n_targets=n_targets, inner_stop=nb_sigma_logical))
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
     body_provenance = _body_checkpoint_provenance(
         energies_ry=wfns.enk, state=state,
@@ -1058,19 +1514,50 @@ def compute_internal_ff_cd(
                 body_provenance=body_provenance,
                 w_observer_identity=observer_identity)
             planned_identity["grid_n"] = int(planned_grid.size)
-            planned_checkpoint = (
-                checkpoint_dir / f"real_eta_{width:.8f}.npz")
-            preexisting_completed.append(_load_checkpoint(
-                planned_checkpoint, planned_identity, n_targets, 2)[0])
+            if selected_matrix:
+                planned_identity = _matrix_output_identity(
+                    planned_identity, omega_rel_ev=omega_rel_ev,
+                    sigma_band_axis=sigma_axis, nk=nk)
+                planned_checkpoint = (
+                    checkpoint_dir / f"real_eta_{width:.8f}.matrix")
+                pointer = _read_matrix_checkpoint_pointer(planned_checkpoint)
+                if pointer is None:
+                    preexisting_completed.append(0)
+                else:
+                    if pointer["identity"] != planned_identity:
+                        raise ValueError(
+                            "internal_ff_cd selected checkpoint identity "
+                            f"changed before W-observer open: {planned_checkpoint}")
+                    preexisting_completed.append(int(pointer["completed"]))
+            else:
+                planned_checkpoint = (
+                    checkpoint_dir / f"real_eta_{width:.8f}.npz")
+                preexisting_completed.append(_load_checkpoint(
+                    planned_checkpoint, planned_identity, n_targets, 2)[0])
         planned_identity = _checkpoint_identity(
             kind="imaginary", grid=planned_igrid, width_ev=None,
             target_k=target_k, target_b=target_b,
             body_provenance=body_provenance,
             w_observer_identity=observer_identity)
         planned_identity["grid_n"] = int(planned_igrid.size)
-        preexisting_completed.append(_load_checkpoint(
-            checkpoint_dir / "imaginary.npz", planned_identity,
-            n_targets, 3)[0])
+        if selected_matrix:
+            planned_identity = _matrix_output_identity(
+                planned_identity, omega_rel_ev=omega_rel_ev,
+                sigma_band_axis=sigma_axis, nk=nk)
+            planned_checkpoint = checkpoint_dir / "imaginary.matrix"
+            pointer = _read_matrix_checkpoint_pointer(planned_checkpoint)
+            if pointer is None:
+                preexisting_completed.append(0)
+            else:
+                if pointer["identity"] != planned_identity:
+                    raise ValueError(
+                        "internal_ff_cd selected checkpoint identity changed "
+                        f"before W-observer open: {planned_checkpoint}")
+                preexisting_completed.append(int(pointer["completed"]))
+        else:
+            preexisting_completed.append(_load_checkpoint(
+                checkpoint_dir / "imaginary.npz", planned_identity,
+                n_targets, 3)[0])
         if any(preexisting_completed) and not (
                 Path(observer_spec.payload_path).exists()
                 and Path(observer_spec.sidecar_path).exists()):
@@ -1082,7 +1569,8 @@ def compute_internal_ff_cd(
             observer_spec, mesh_xy=mesh_xy, v_wedge=v_wedge)
         observer_receipt = observer.artifact_receipt
 
-    def frequency_batch(z_ry, coefficient_rows, global_frequency_index=None):
+    def frequency_batch(z_ry, coefficient_rows, global_frequency_index=None,
+                        selected_state=None):
         """Evaluate a fixed-size referee frequency batch.
 
         The direct pair scan is substantially more efficient with its
@@ -1091,6 +1579,11 @@ def compute_internal_ff_cd(
         replicated or retained as spectral history.
         """
         z = jnp.asarray(z_ry, dtype=jnp.complex128)
+        head_response = None
+        if selected_matrix:
+            head_response = _build_head_response(
+                head_context, np.asarray(z_ry, np.complex128), wfns=wfns,
+                state=state, config=config, meta=meta, mesh=mesh_xy, wfn=wfn)
         chi_rows = [
             direct(wfns.psi_xn, wfns.psi_yn, jnp.asarray(kmq_wedge[i]),
                    wfns.enk, state.f_kn, surface, z)
@@ -1100,6 +1593,13 @@ def compute_internal_ff_cd(
         chi_completed_at = time.perf_counter()
         stage_seconds = {key: 0.0 for key in STAGE_TIMING_KEYS}
         outputs = []
+        if selected_matrix:
+            if selected_state is None:
+                raise ValueError(
+                    "selected_matrix_block frequency batch lacks its "
+                    "distributed accumulators")
+            selected_body = list(selected_state[0])
+            selected_head = list(selected_state[1])
         if observer is not None and (
                 global_frequency_index is None
                 or len(global_frequency_index) != len(coefficient_rows)):
@@ -1132,19 +1632,52 @@ def compute_internal_ff_cd(
                 # CD spectral convention S=(I-epsilon^-1)V = -Wc.
                 t_stage = time.perf_counter()
                 row = []
-                for coeff in coefficients:
-                    value = -contract(
-                        wfns.psi_xn, wfns.psi_yn, wc_full,
-                        jnp.asarray(target_k), jnp.asarray(target_b),
-                        jnp.asarray(kmq_target),
-                        jnp.asarray(coeff, jnp.float64))
-                    host = np.asarray(value)
-                    if not np.all(np.isfinite(host)):
-                        bad = int(np.flatnonzero(~np.isfinite(host))[0])
-                        raise FloatingPointError(
-                            "internal_ff_cd nonfinite contracted stream at "
-                            f"target {bad}")
-                    row.append(host * (RYD_TO_EV / nk))
+                if selected_matrix:
+                    from .qsgw_head import finalize_iteration_head_sample
+                    sample = finalize_iteration_head_sample(
+                        head_response, jb, w_wedge[gamma_row],
+                        wfn=wfn, meta=meta, config=config, mesh=mesh_xy)
+                    wc0_ry = complex(sample.wcoul0) - complex(sample.vc0)
+                    for accumulator_index, rule in coefficients:
+                        for omega_lo in range(
+                                0, omega_carrier_n,
+                                EXTERNAL_FREQUENCY_TILE):
+                            omega_hi = omega_lo + EXTERNAL_FREQUENCY_TILE
+                            value = -block_contract(
+                                wfns.psi_xn, wfns.psi_yn,
+                                psi_proj_xr, psi_proj_yn, wc_full,
+                                jnp.asarray(kmq_target),
+                                jnp.asarray(energies_ev, jnp.float64),
+                                jnp.asarray(occupations, jnp.float64),
+                                omega_abs_device[omega_lo:omega_hi],
+                                omega_valid_device[omega_lo:omega_hi],
+                                jnp.asarray(rule, jnp.float64))
+                            selected_body[accumulator_index] = add_matrix_tile(
+                                selected_body[accumulator_index], value / nk,
+                                jnp.asarray(omega_lo, jnp.int32))
+                        selected_head[accumulator_index] = add_head_sample(
+                            selected_head[accumulator_index],
+                            omega_abs_device, omega_valid_device,
+                            head_energy_ev, head_occupations,
+                            jnp.asarray(wc0_ry, jnp.complex128),
+                            jnp.asarray(rule, jnp.float64),
+                            jnp.asarray(
+                                1.0 / (float(meta.cell_volume) * nk),
+                                jnp.float64))
+                else:
+                    for coeff in coefficients:
+                        value = -contract(
+                            wfns.psi_xn, wfns.psi_yn, wc_full,
+                            jnp.asarray(target_k), jnp.asarray(target_b),
+                            jnp.asarray(kmq_target),
+                            jnp.asarray(coeff, jnp.float64))
+                        host = np.asarray(value)
+                        if not np.all(np.isfinite(host)):
+                            bad = int(np.flatnonzero(~np.isfinite(host))[0])
+                            raise FloatingPointError(
+                                "internal_ff_cd nonfinite contracted stream "
+                                f"at target {bad}")
+                        row.append(host * (RYD_TO_EV / nk))
                 outputs.append(row)
                 del w_wedge, wc_wedge, wc_full
                 stage_seconds["contract_host_checks_wall_seconds"] += (
@@ -1153,11 +1686,15 @@ def compute_internal_ff_cd(
                 if observer is not None:
                     observer.close(body_complete=False)
                 raise
-        return outputs, chi_completed_at, stage_seconds
+        selected_out = ((tuple(selected_body), tuple(selected_head))
+                        if selected_matrix else None)
+        return outputs, selected_out, chi_completed_at, stage_seconds
 
     real_results = []
+    real_head_results = []
     grid_records = []
     final_coarse_real = None
+    final_coarse_real_head = None
     for width in RESPONSE_WIDTHS_EV:
         arm_name = f"real_eta_{width:.8f}"
         arm_start = (0 if observer is None else
@@ -1173,14 +1710,38 @@ def compute_internal_ff_cd(
             body_provenance=body_provenance,
             w_observer_identity=observer_identity)
         identity["grid_n"] = int(grid.size)
-        checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.npz"
-        (completed, loaded, chi_wall, solve_contract_wall,
-         stage_wall) = _load_checkpoint(
-            checkpoint, identity, n_targets, 2,
-            return_stage_timings=True)
+        if selected_matrix:
+            identity = _matrix_output_identity(
+                identity, omega_rel_ev=omega_rel_ev,
+                sigma_band_axis=sigma_axis, nk=nk)
+            checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.matrix"
+            loaded_matrix = _load_matrix_checkpoint(
+                checkpoint, identity, 2, mesh=mesh_xy,
+                matrix_carrier_shape=matrix_shape,
+                head_carrier_shape=head_shape,
+                logical_matrix_shape=logical_matrix_shape,
+                logical_head_shape=logical_head_shape,
+                return_stage_timings=True)
+            if loaded_matrix is None:
+                completed = 0
+                loaded = (make_matrix_zero(), make_matrix_zero())
+                loaded_head = (make_head_zero(), make_head_zero())
+                chi_wall = solve_contract_wall = 0.0
+                stage_wall = {key: 0.0 for key in STAGE_TIMING_KEYS}
+            else:
+                (completed, loaded, loaded_head, chi_wall,
+                 solve_contract_wall, stage_wall) = loaded_matrix
+        else:
+            checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.npz"
+            (completed, loaded, chi_wall, solve_contract_wall,
+             stage_wall) = _load_checkpoint(
+                checkpoint, identity, n_targets, 2,
+                return_stage_timings=True)
         if observer is not None:
             observer.require_checkpoint_prefix(arm_name, completed)
         accum, coarse_accum = loaded
+        if selected_matrix:
+            head_accum, coarse_head_accum = loaded_head
         if rank == 0 and completed:
             print_fn(
                 f"  internal_ff_cd resume real eta_W={width:g} eV: "
@@ -1190,36 +1751,66 @@ def compute_internal_ff_cd(
             hi = min(lo + FREQUENCY_BATCH, grid.size)
             coefficient_rows = []
             for iw in range(lo, hi):
-                coeff = _real_coefficients(grid, iw, x_abs, residue_sign)
-                coeffs = [coeff]
+                coeff = (_real_node_descriptor(grid, iw) if selected_matrix
+                         else _real_coefficients(
+                             grid, iw, x_abs, residue_sign))
+                coeffs = ([(0, coeff)] if selected_matrix else [coeff])
                 if iw in coarse_lookup:
                     cj = coarse_lookup[iw]
                     cgrid = grid[coarse]
-                    ccoeff = _real_coefficients(
-                        cgrid, cj, x_abs, residue_sign)
-                    coeffs.append(ccoeff)
+                    ccoeff = (
+                        _real_node_descriptor(cgrid, cj) if selected_matrix
+                        else _real_coefficients(
+                            cgrid, cj, x_abs, residue_sign))
+                    coeffs.append((1, ccoeff) if selected_matrix else ccoeff)
                 coefficient_rows.append(coeffs)
             t_batch = time.perf_counter()
             z_batch = (grid[lo:hi] / RYD_TO_EV
                        + 1j * (width / RYD_TO_EV))
             if observer is None:
-                values, t_after_chi, stage_batch = frequency_batch(
-                    z_batch, coefficient_rows)
+                values, selected_state, t_after_chi, stage_batch = (
+                    frequency_batch(
+                        z_batch, coefficient_rows,
+                        selected_state=(
+                            ((accum, coarse_accum),
+                             (head_accum, coarse_head_accum)))
+                        if selected_matrix else None))
             else:
-                values, t_after_chi, stage_batch = frequency_batch(
+                values, selected_state, t_after_chi, stage_batch = frequency_batch(
                     z_batch, coefficient_rows,
-                    np.arange(arm_start + lo, arm_start + hi, dtype=np.int64))
+                    np.arange(arm_start + lo, arm_start + hi, dtype=np.int64),
+                    selected_state=(
+                        ((accum, coarse_accum),
+                         (head_accum, coarse_head_accum)))
+                    if selected_matrix else None)
             chi_wall += t_after_chi - t_batch
             solve_contract_wall += time.perf_counter() - t_after_chi
             for key in STAGE_TIMING_KEYS:
                 stage_wall[key] += stage_batch[key]
-            for jb, iw in enumerate(range(lo, hi)):
-                accum += values[jb][0]
-                if iw in coarse_lookup:
-                    coarse_accum += values[jb][1]
-            if observer is not None:
+            if selected_matrix:
+                ((accum, coarse_accum),
+                 (head_accum, coarse_head_accum)) = selected_state
+            else:
+                for jb, iw in enumerate(range(lo, hi)):
+                    accum += values[jb][0]
+                    if iw in coarse_lookup:
+                        coarse_accum += values[jb][1]
+            publish_prefix = (
+                not selected_matrix
+                or hi == len(grid)
+                or hi % MATRIX_CHECKPOINT_FREQUENCIES == 0)
+            if observer is not None and publish_prefix:
                 observer.commit_prefix(arm_name, hi)
-            if rank == 0:
+            if selected_matrix and publish_prefix:
+                _save_matrix_checkpoint(
+                    checkpoint, identity, hi, (accum, coarse_accum),
+                    (head_accum, coarse_head_accum), mesh=mesh_xy,
+                    logical_matrix_shape=logical_matrix_shape,
+                    logical_head_shape=logical_head_shape,
+                    chi_wall=chi_wall,
+                    solve_contract_wall=solve_contract_wall,
+                    stage_timings=stage_wall)
+            elif not selected_matrix and rank == 0:
                 _save_checkpoint(
                     checkpoint, identity, hi, (accum, coarse_accum),
                     chi_wall, solve_contract_wall,
@@ -1230,6 +1821,11 @@ def compute_internal_ff_cd(
                     f"{hi}/{len(grid)} frequencies")
         real_results.append(accum)
         final_coarse_real = coarse_accum if coarse is not None else final_coarse_real
+        if selected_matrix:
+            real_head_results.append(head_accum)
+            final_coarse_real_head = (
+                coarse_head_accum if coarse is not None
+                else final_coarse_real_head)
         grid_records.append({
             "kind": "real", "eta_w_ev": width, "n": int(grid.size),
             "min_ev": float(grid[0]), "max_ev": float(grid[-1]),
@@ -1259,14 +1855,40 @@ def compute_internal_ff_cd(
         body_provenance=body_provenance,
         w_observer_identity=observer_identity)
     identity["grid_n"] = int(igrid.size)
-    checkpoint = checkpoint_dir / "imaginary.npz"
-    (completed, loaded, chi_wall, solve_contract_wall,
-     stage_wall) = _load_checkpoint(
-        checkpoint, identity, n_targets, 3,
-        return_stage_timings=True)
+    if selected_matrix:
+        identity = _matrix_output_identity(
+            identity, omega_rel_ev=omega_rel_ev,
+            sigma_band_axis=sigma_axis, nk=nk)
+        checkpoint = checkpoint_dir / "imaginary.matrix"
+        loaded_matrix = _load_matrix_checkpoint(
+            checkpoint, identity, 3, mesh=mesh_xy,
+            matrix_carrier_shape=matrix_shape,
+            head_carrier_shape=head_shape,
+            logical_matrix_shape=logical_matrix_shape,
+            logical_head_shape=logical_head_shape,
+            return_stage_timings=True)
+        if loaded_matrix is None:
+            completed = 0
+            loaded = (make_matrix_zero(), make_matrix_zero(),
+                      make_matrix_zero())
+            loaded_head = (make_head_zero(), make_head_zero(),
+                           make_head_zero())
+            chi_wall = solve_contract_wall = 0.0
+            stage_wall = {key: 0.0 for key in STAGE_TIMING_KEYS}
+        else:
+            (completed, loaded, loaded_head, chi_wall,
+             solve_contract_wall, stage_wall) = loaded_matrix
+    else:
+        checkpoint = checkpoint_dir / "imaginary.npz"
+        (completed, loaded, chi_wall, solve_contract_wall,
+         stage_wall) = _load_checkpoint(
+            checkpoint, identity, n_targets, 3,
+            return_stage_timings=True)
     if observer is not None:
         observer.require_checkpoint_prefix(arm_name, completed)
     imag_accum, imag_coarse, imag_tail = loaded
+    if selected_matrix:
+        imag_head, imag_coarse_head, imag_tail_head = loaded_head
     if rank == 0 and completed:
         print_fn(
             f"  internal_ff_cd resume imaginary: {completed}/{len(igrid)} "
@@ -1276,42 +1898,73 @@ def compute_internal_ff_cd(
         hi = min(lo + FREQUENCY_BATCH, igrid.size)
         coefficient_rows = []
         for iw in range(lo, hi):
-            coeff = _imag_coefficients(igrid, iw, x_signed)
-            coeffs = [coeff]
+            coeff = (_imaginary_node_descriptor(igrid, iw)
+                     if selected_matrix else
+                     _imag_coefficients(igrid, iw, x_signed))
+            coeffs = ([(0, coeff)] if selected_matrix else [coeff])
             if iw in icoarse_lookup:
                 cj = icoarse_lookup[iw]
                 cgrid = igrid[icoarse]
-                ccoeff = _imag_coefficients(cgrid, cj, x_signed)
-                coeffs.append(ccoeff)
+                ccoeff = (_imaginary_node_descriptor(cgrid, cj)
+                          if selected_matrix else
+                          _imag_coefficients(cgrid, cj, x_signed))
+                coeffs.append((1, ccoeff) if selected_matrix else ccoeff)
             if iw < itail.size:
-                tcoeff = _imag_coefficients(itail, iw, x_signed)
-                coeffs.append(tcoeff)
+                tcoeff = (_imaginary_node_descriptor(itail, iw)
+                          if selected_matrix else
+                          _imag_coefficients(itail, iw, x_signed))
+                coeffs.append((2, tcoeff) if selected_matrix else tcoeff)
             coefficient_rows.append(coeffs)
         z_imag_ev = np.maximum(igrid[lo:hi], IMAG_ORIGIN_LIMIT_EV)
         t_batch = time.perf_counter()
         z_batch = 1j * z_imag_ev / RYD_TO_EV
         if observer is None:
-            values, t_after_chi, stage_batch = frequency_batch(
-                z_batch, coefficient_rows)
-        else:
-            values, t_after_chi, stage_batch = frequency_batch(
+            values, selected_state, t_after_chi, stage_batch = frequency_batch(
                 z_batch, coefficient_rows,
-                np.arange(arm_start + lo, arm_start + hi, dtype=np.int64))
+                selected_state=(
+                    ((imag_accum, imag_coarse, imag_tail),
+                     (imag_head, imag_coarse_head, imag_tail_head)))
+                if selected_matrix else None)
+        else:
+            values, selected_state, t_after_chi, stage_batch = frequency_batch(
+                z_batch, coefficient_rows,
+                np.arange(arm_start + lo, arm_start + hi, dtype=np.int64),
+                selected_state=(
+                    ((imag_accum, imag_coarse, imag_tail),
+                     (imag_head, imag_coarse_head, imag_tail_head)))
+                if selected_matrix else None)
         chi_wall += t_after_chi - t_batch
         solve_contract_wall += time.perf_counter() - t_after_chi
         for key in STAGE_TIMING_KEYS:
             stage_wall[key] += stage_batch[key]
-        for jb, iw in enumerate(range(lo, hi)):
-            imag_accum += values[jb][0]
-            offset = 1
-            if iw in icoarse_lookup:
-                imag_coarse += values[jb][offset]
-                offset += 1
-            if iw < itail.size:
-                imag_tail += values[jb][offset]
-        if observer is not None:
+        if selected_matrix:
+            ((imag_accum, imag_coarse, imag_tail),
+             (imag_head, imag_coarse_head, imag_tail_head)) = selected_state
+        else:
+            for jb, iw in enumerate(range(lo, hi)):
+                imag_accum += values[jb][0]
+                offset = 1
+                if iw in icoarse_lookup:
+                    imag_coarse += values[jb][offset]
+                    offset += 1
+                if iw < itail.size:
+                    imag_tail += values[jb][offset]
+        publish_prefix = (
+            not selected_matrix
+            or hi == len(igrid)
+            or hi % MATRIX_CHECKPOINT_FREQUENCIES == 0)
+        if observer is not None and publish_prefix:
             observer.commit_prefix(arm_name, hi)
-        if rank == 0:
+        if selected_matrix and publish_prefix:
+            _save_matrix_checkpoint(
+                checkpoint, identity, hi,
+                (imag_accum, imag_coarse, imag_tail),
+                (imag_head, imag_coarse_head, imag_tail_head), mesh=mesh_xy,
+                logical_matrix_shape=logical_matrix_shape,
+                logical_head_shape=logical_head_shape,
+                chi_wall=chi_wall, solve_contract_wall=solve_contract_wall,
+                stage_timings=stage_wall)
+        elif not selected_matrix and rank == 0:
             _save_checkpoint(
                 checkpoint, identity, hi,
                 (imag_accum, imag_coarse, imag_tail),
@@ -1336,6 +1989,147 @@ def compute_internal_ff_cd(
     })
     if observer is not None:
         observer.close(body_complete=True)
+
+    if selected_matrix:
+        head_target_k = np.repeat(np.arange(nk, dtype=np.int32),
+                                  sigma_bands.size)
+        head_target_b = np.tile(sigma_bands, nk)
+        static_head_ev_flat, head_record = _compute_head_diag_ev(
+            wfns, head_target_k, head_target_b, state=state, config=config,
+            meta=meta, mesh=mesh_xy, sym=sym, wfn=wfn, V_q=V_q,
+            band_slices=band_slices, nb_chi_logical=nb_chi_logical,
+            print_fn=print_fn, context=head_context)
+        static_head_host = np.pad(
+            static_head_ev_flat.reshape(nk, sigma_bands.size) / RYD_TO_EV,
+            ((0, 0), (0, sigma_axis.carrier - sigma_axis.logical)))
+        static_head = device_put_process_local(
+            static_head_host, NamedSharding(mesh_xy, P(None, "x")))
+        energy_rel_ev = head_energy_ev - float(state.mu_ry) * RYD_TO_EV
+        band_valid = jnp.arange(sigma_axis.carrier) < sigma_axis.logical
+        omega_rel_device = jnp.asarray(omega_rel_ev, jnp.float64)
+
+        def pin(value):
+            return pin_head_on_shell(
+                value[:omega_rel_ev.size], omega_rel_device,
+                energy_rel_ev, static_head, band_valid)
+
+        fine_head = pin(real_head_results[-1] + imag_head)
+        coarse_real_head = pin(final_coarse_real_head + imag_head)
+        coarse_imag_head = pin(real_head_results[-1] + imag_coarse_head)
+        tail_imag_head = pin(real_head_results[-1] + imag_tail_head)
+        fine_real = real_results[-1][:omega_rel_ev.size]
+        coarse_real = final_coarse_real[:omega_rel_ev.size]
+        fine_imag = imag_accum[:omega_rel_ev.size]
+        coarse_imag = imag_coarse[:omega_rel_ev.size]
+        tail_imag = imag_tail[:omega_rel_ev.size]
+
+        def component_max_mev(value):
+            maximum = jnp.maximum(
+                jnp.max(jnp.abs(jnp.real(value))),
+                jnp.max(jnp.abs(jnp.imag(value))))
+            return float(np.asarray(maximum)) * RYD_TO_EV * 1000.0
+
+        controls = {
+            "body_real_fine_minus_coarse_mev": component_max_mev(
+                fine_real - coarse_real),
+            "body_imag_fine_minus_coarse_mev": component_max_mev(
+                fine_imag - coarse_imag),
+            "body_imag_full_minus_tail_mev": component_max_mev(
+                fine_imag - tail_imag),
+            "head_real_fine_minus_coarse_mev": component_max_mev(
+                fine_head - coarse_real_head),
+            "head_imag_fine_minus_coarse_mev": component_max_mev(
+                fine_head - coarse_imag_head),
+            "head_imag_full_minus_tail_mev": component_max_mev(
+                fine_head - tail_imag_head),
+        }
+        worst_control_mev = max(controls.values())
+        body = fine_real + fine_imag
+        dynamic_head = fine_head
+        finite = bool(np.asarray(jnp.all(jnp.isfinite(body)))) and bool(
+            np.asarray(jnp.all(jnp.isfinite(dynamic_head))))
+        if not finite:
+            raise FloatingPointError(
+                "internal_ff_cd selected_matrix_block produced a nonfinite "
+                "body or head shard")
+
+        artifact = {
+            "schema": 3,
+            "route": "internal_ff_cd",
+            "output": "selected_matrix_block",
+            "status": ("pass" if worst_control_mev <= CD_CONTROL_TOL_MEV
+                       else "unresolved"),
+            "jobid": os.environ.get("SLURM_JOB_ID", "unknown"),
+            "source_commit": os.environ.get(
+                "LORRAX_SOURCE_COMMIT", "working-tree"),
+            "wall_seconds": time.perf_counter() - t_start,
+            "checkpoint_provenance": {
+                "schema": MATRIX_CHECKPOINT_SCHEMA,
+                **body_provenance,
+            },
+            "sharding": {
+                "chi": "P(None,x,y)",
+                "W": "P(None,x,y)",
+                "sigma_body": "P(None,None,x,y)",
+                "sigma_head": "P(None,None,x) analytic diagonal",
+                "replicated_matrix_cube_per_process": False,
+                "full_bz_k_rows": nk,
+                "sigma_band_logical": int(sigma_axis.logical),
+                "sigma_band_carrier": int(sigma_axis.carrier),
+            },
+            "omega": {
+                "reference": "fixed-N MP1 mu",
+                "reference_ev": float(state.mu_ry) * RYD_TO_EV,
+                "n": int(omega_rel_ev.size),
+                "min_ev": float(omega_rel_ev[0]),
+                "max_ev": float(omega_rel_ev[-1]),
+                "sha256": _hash_array(omega_rel_ev),
+            },
+            "coverage": {
+                "real_max_ev": real_max_ev,
+                "residue_required_max_ev": max_required,
+                "imag_max_ev": IMAG_MAX_EV,
+                "imag_tail_last_sample_ev": float(itail[-1]),
+                "imag_tail_panel_max_ev": tail_panel_max_ev,
+            },
+            "certificate": {
+                "tolerance_mev": CD_CONTROL_TOL_MEV,
+                "rule": "max absolute real/imag component, body and head "
+                        "certified independently without cancellation",
+                "worst_component_mev": worst_control_mev,
+                **controls,
+            },
+            "head": {
+                **head_record,
+                "dynamic_samples": "same streamed real/imag W batches",
+                "on_shell_pin": "minimum-norm correction on the two "
+                                 "bracketing omega nodes reproduces the "
+                                 "existing eta=0 half-residue exactly",
+            },
+            "grids": grid_records,
+        }
+        if observer_receipt is not None:
+            artifact["w_observer"] = observer_receipt
+        artifact_path = os.path.join(input_dir, "internal_ff_cd.json")
+        if rank == 0:
+            Path(artifact_path).write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+        from jax.experimental import multihost_utils
+        multihost_utils.sync_global_devices(
+            "internal_ff_cd_selected_matrix_artifact")
+        if worst_control_mev > CD_CONTROL_TOL_MEV:
+            raise RuntimeError(
+                "internal_ff_cd selected_matrix_block componentwise "
+                f"quadrature certificate is {worst_control_mev:.6f} meV, "
+                f"above {CD_CONTROL_TOL_MEV:g} meV; artifact: "
+                f"{artifact_path}")
+        return InternalFFResult(
+            sigma_c_diag_ev=None,
+            efermi_ev=float(state.mu_ry) * RYD_TO_EV,
+            artifact_path=artifact_path,
+            sigma_c_body_omega_ry=body,
+            head_sigma_diag_w_kn_ry=dynamic_head,
+            sigma_band_axis=sigma_axis)
 
     head_ev, head_record = _compute_head_diag_ev(
         wfns, target_k, target_b, state=state, config=config, meta=meta,

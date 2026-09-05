@@ -370,6 +370,7 @@ _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
 # the band-diagonal adder used by the ``sigma_omega_layout=sharded`` path.
 _EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
 _ADD_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
+_ADD_BAND_DIAG_X_KERNEL_CACHE: dict[int, object] = {}
 _SET_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
 
@@ -435,13 +436,48 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     path's dense ``Σ + head`` performs on the diagonal; off-diagonal
     elements are left untouched (the dense path adds exact 0.0 there).
 
-    ``diag_w_kn`` is host numpy (nω, nk, nb), bit-identical on every rank
-    by construction (pure function of replicated inputs) — placed with
-    ``device_put_process_local`` per the AA.1 rule.
+    ``diag_w_kn`` is host NumPy, replicated JAX, or ``P(None,None,'x')``.
+    The latter is injected only on diagonal mesh ranks (x == y), whose local
+    square matrix tile owns exactly that x-band interval.  Thus the streamed
+    analytic head remains sharded and reaches this owner without a gather.
     """
     from common.collectives import device_put_process_local
 
     mesh_xy = sigma_w_kij.sharding.mesh
+    diag_spec = getattr(getattr(diag_w_kn, "sharding", None), "spec", None)
+    if isinstance(diag_w_kn, jax.Array) and diag_spec is not None:
+        normalized = tuple(diag_spec) + (None,) * (3 - len(tuple(diag_spec)))
+        if normalized == (None, None, "x"):
+            key = id(mesh_xy)
+            fn_x = _ADD_BAND_DIAG_X_KERNEL_CACHE.get(key)
+            if fn_x is None:
+                from functools import partial
+                from common.shard_map import shard_map
+
+                @jax.jit
+                @partial(
+                    shard_map, mesh=mesh_xy,
+                    in_specs=(P(None, None, "x", "y"),
+                              P(None, None, "x")),
+                    out_specs=P(None, None, "x", "y"), check_vma=False)
+                def _add_diag_x(tile, diag):
+                    if (tile.shape[2] != tile.shape[3]
+                            or tile.shape[2] != diag.shape[2]):
+                        raise ValueError(
+                            "x-sharded dynamic head requires equal local "
+                            "matrix row/column band tiles")
+                    diagonal_rank = (
+                        jax.lax.axis_index("x") == jax.lax.axis_index("y"))
+                    contribution = jnp.where(
+                        diagonal_rank, diag,
+                        jnp.zeros((), dtype=diag.dtype))
+                    index = jnp.arange(tile.shape[2])
+                    return tile.at[:, :, index, index].add(contribution)
+
+                fn_x = _add_diag_x
+                _ADD_BAND_DIAG_X_KERNEL_CACHE[key] = fn_x
+            return fn_x(sigma_w_kij, diag_w_kn)
+
     key = id(mesh_xy)
     fn = _ADD_BAND_DIAG_KERNEL_CACHE.get(key)
     if fn is None:
@@ -474,9 +510,15 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
         fn = _add_diag
         _ADD_BAND_DIAG_KERNEL_CACHE[key] = fn
 
-    diag_rep = device_put_process_local(
-        np.ascontiguousarray(np.asarray(diag_w_kn, dtype=np.complex128)),
-        NamedSharding(mesh_xy, P(None, None, None)))
+    if isinstance(diag_w_kn, jax.Array):
+        expected = NamedSharding(mesh_xy, P(None, None, None))
+        diag_rep = jax.jit(
+            lambda value: value.astype(sigma_w_kij.dtype),
+            out_shardings=expected)(diag_w_kn)
+    else:
+        diag_rep = device_put_process_local(
+            np.ascontiguousarray(np.asarray(diag_w_kn, dtype=np.complex128)),
+            NamedSharding(mesh_xy, P(None, None, None)))
     return fn(sigma_w_kij, diag_rep)
 
 

@@ -88,7 +88,7 @@ def extract_sigma_diag_logical(
 
 def add_head_sigma_diag(
     sigma_c_body_omega: jax.Array,
-    head_sigma_diag_w_kn_ry: np.ndarray | None,
+    head_sigma_diag_w_kn_ry: np.ndarray | jax.Array | None,
     *,
     band_axis=None,
 ) -> jax.Array:
@@ -105,11 +105,15 @@ def add_head_sigma_diag(
     if head_sigma_diag_w_kn_ry is None:
         return sigma_c_body_omega
 
-    head = np.asarray(head_sigma_diag_w_kn_ry)
-    expected_head = tuple(sigma_c_body_omega.shape[:2]) + (
+    head = (head_sigma_diag_w_kn_ry if isinstance(
+        head_sigma_diag_w_kn_ry, jax.Array)
+            else np.asarray(head_sigma_diag_w_kn_ry))
+    prefix = tuple(sigma_c_body_omega.shape[:2])
+    expected_logical = prefix + (
         int(band_axis.logical) if band_axis is not None
         else int(sigma_c_body_omega.shape[2]),)
-    if head.shape != expected_head:
+    expected_carrier = prefix + (int(sigma_c_body_omega.shape[2]),)
+    if tuple(head.shape) not in {expected_logical, expected_carrier}:
         raise ValueError(
             "dynamic Sigma head shape must match the body diagonal: "
             f"head={head.shape}, body={sigma_c_body_omega.shape}")
@@ -121,7 +125,8 @@ def add_head_sigma_diag(
         authenticate_axis(
             sigma_c_body_omega, band_axis, axis=-1,
             where="dynamic Sigma body producer")
-        head = pad_to_axis(jnp.asarray(head), band_axis, axis=-1)
+        if tuple(head.shape) == expected_logical:
+            head = pad_to_axis(jnp.asarray(head), band_axis, axis=-1)
 
     from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
     if is_band_sharded_sigma_omega(sigma_c_body_omega):
