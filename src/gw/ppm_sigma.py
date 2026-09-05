@@ -627,7 +627,12 @@ def _compute_invalid_static_sigma(
             # strip to nb_sigma below — same "weight, don't window" +
             # late-window pattern as cohsex_sigma's own face kernels.
             psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
-            nb_real = int(s.nb_sigma)
+            # The strip below consumes the band-window receipt, exactly as
+            # the legacy branch receives one from pad_sigma_window; its
+            # ``logical`` is nb_sigma and the face projection's wider nb_full
+            # matrix is the source it strips.
+            nb_real = sigma_band_axis(
+                int(s.nb_sigma), mesh_xy, ansatz="static face")
 
         # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
         # band tensor before building the next centroid-square G: this makes
@@ -730,7 +735,12 @@ def _invalid_static_coh_by_bracket(
                 wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
         else:
             psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
-            nb_real = int(s.nb_sigma)
+            # The strip below consumes the band-window receipt, exactly as
+            # the legacy branch receives one from pad_sigma_window; its
+            # ``logical`` is nb_sigma and the face projection's wider nb_full
+            # matrix is the source it strips.
+            nb_real = sigma_band_axis(
+                int(s.nb_sigma), mesh_xy, ansatz="static face")
         for lo, hi in brackets:
             if wfns.layout == "legacy":
                 G_ri = build_G(
