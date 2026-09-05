@@ -89,7 +89,7 @@ def _kwargs(mesh):
         b_id_0=0, b_id_4_chi_user=2, nspinor=4,
         nspinor_wfnfile=2, cell_volume=9.0)
     config = SimpleNamespace(
-        nval=1, ncond=1, nband=2, vnl_velocity_sign=1.0,
+        nval=1, ncond=1, nband=2,
         head=SimpleNamespace(wcoul0_eta=0.0))
     return dict(
         input_dir="/bounded/not-read", mesh=mesh, wfn=wfn, meta=meta,

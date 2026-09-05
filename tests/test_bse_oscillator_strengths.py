@@ -344,56 +344,53 @@ def test_the_two_projection_routes_now_agree_and_the_wrong_one_still_fails():
 
 
 # ---------------------------------------------------------------------------
-# 3. How much the velocity sign is actually worth, measured here
+# 3. How much the nonlocal term is actually worth, measured here
 # ---------------------------------------------------------------------------
 #
 # The cells above pin the fixtures, which are stored arrays and therefore
 # cannot move until somebody regenerates them.  That leaves the question
-# the whole file exists for -- how much does the SIGN move oscillator
-# strengths? -- answered only on the cluster.  It does not have to be.
-# ``dipole_operator`` runs on a synthetic projector setup on any CPU, so
-# the sensitivity is measurable right here, and a number measured is a
-# number that can gate.
+# the whole file exists for -- how much does the i[r, V_NL] term move
+# oscillator strengths? -- answered only on the cluster.  It does not have
+# to be.  ``dipole_operator`` runs on a synthetic projector setup on any
+# CPU, so the sensitivity is measurable right here, and a number measured
+# is a number that can gate.
 
-#: Median relative change in |d|^2 per matrix element between the two
-#: arms on the synthetic setup, measured at 0.456.  The assertion uses
-#: 0.05 -- a ninefold margin -- because the point is not to pin this
-#: fixture's exact sensitivity but to refuse a tree in which the sign
-#: has quietly stopped mattering, which is what a knob wired to nothing
-#: would look like.
-_SIGN_MOVES_F_BY_AT_LEAST = 0.05
+#: Median relative change in |d|^2 per matrix element between p alone and
+#: p + dV_NL/dK on the synthetic setup.  The assertion uses 0.05 because
+#: the point is not to pin this fixture's exact sensitivity but to refuse
+#: a tree in which the projector term has quietly stopped reaching the
+#: assembled velocity.
+_NONLOCAL_TERM_MOVES_F_BY_AT_LEAST = 0.05
 
 
-def _both_arms_matrix_elements():
-    """<m|v|n> at both signs, from the synthetic setup the knob file owns.
+def _matrix_elements_without_and_with_the_nonlocal_term():
+    """<m|v|n> for p alone and for p + dV_NL/dK, from the synthetic
+    setup ``tests/test_dipole_vnl_velocity_sign`` owns.
 
     Imported rather than rebuilt: that file's ``_vnl_setup`` is
     deliberately built with a random nonzero ``E_super`` (a null one
-    makes v_NL vanish and both arms agree), and duplicating 120 lines of
+    makes v_NL vanish and the two agree), and duplicating 120 lines of
     projector construction to say the same thing twice is how two
     fixtures drift into disagreeing about what they test.
     """
     from tests.test_dipole_vnl_velocity_sign import (
         _apply_one_k, _fixture, _geom, _mesh, _mtxel, _vnl_setup)
-    from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
-                                    VNL_VELOCITY_SIGN_SHIPPED, dipole_operator)
+    from common.mtxel_sweep import dipole_operator
 
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
     setup = _vnl_setup()
-    arms = {}
+    got = {}
     with mesh:
         geom = _geom(mesh)
-        for tag, sign in (("shipped", VNL_VELOCITY_SIGN_SHIPPED),
-                          ("flipped", VNL_VELOCITY_SIGN_FLIPPED)):
-            op = dipole_operator(geom, bvec=bvec, blat=blat,
-                                 vnl_setup=setup, vnl_velocity_sign=sign)
-            arms[tag] = np.asarray([
+        for tag, vnl in (("p", None), ("p+vnl", setup)):
+            op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=vnl)
+            got[tag] = np.asarray([
                 _mtxel(_apply_one_k(op, psi[ik], gv[ik], gmask[ik],
                                     bidx[ik], kvecs[ik]),
                        psi[ik], gmask[ik])
                 for ik in range(psi.shape[0])])
-    return arms["shipped"], arms["flipped"]
+    return got["p"], got["p+vnl"]
 
 
 def _median_relative_move(a, b):
@@ -401,38 +398,37 @@ def _median_relative_move(a, b):
     return float(np.median(np.abs(fb - fa) / (np.abs(fa) + 1.0e-30)))
 
 
-def test_the_velocity_sign_moves_oscillator_strengths():
+def test_the_nonlocal_term_moves_oscillator_strengths():
     """The measurement this file was built to make.
 
-    Oscillator strengths are ``|d|^2``, and the two arms differ by
-    ``2 * v_NL`` inside ``d`` -- not by a global phase, which ``|d|^2``
-    would not see.  So the two arms give genuinely different absorption,
-    and this is the cell that says by how much without a cluster.
+    Oscillator strengths are ``|d|^2``, and p + dV_NL/dK differs from p
+    by the whole projector term inside ``d`` -- not by a global phase,
+    which ``|d|^2`` would not see.  This is the cell that says by how
+    much without a cluster.
     """
-    shipped, flipped = _both_arms_matrix_elements()
-    move = _median_relative_move(shipped, flipped)
-    assert move > _SIGN_MOVES_F_BY_AT_LEAST, (
-        f"the two velocity arms moved |d|^2 by a median of {move:.3e}, "
-        f"below {_SIGN_MOVES_F_BY_AT_LEAST}.  Either the knob stopped "
-        f"reaching the assembly or the projector term went null -- both "
-        f"turn every other cell in this file into a tautology.")
+    p_only, full = _matrix_elements_without_and_with_the_nonlocal_term()
+    move = _median_relative_move(p_only, full)
+    assert move > _NONLOCAL_TERM_MOVES_F_BY_AT_LEAST, (
+        f"the nonlocal term moved |d|^2 by a median of {move:.3e}, "
+        f"below {_NONLOCAL_TERM_MOVES_F_BY_AT_LEAST}.  Either the "
+        f"projector term stopped reaching the assembly or it went null -- "
+        f"both turn every other cell in this file into a tautology.")
 
 
 def test_the_sensitivity_measurement_is_not_a_tautology():
     """RED TWIN for the cell above.
 
-    With a null ``E_super`` the nonlocal term vanishes identically, both
-    arms collapse onto bare ``p``, and the sensitivity cell would be
+    With a null ``E_super`` the nonlocal term vanishes identically, the
+    operator collapses onto bare ``p``, and the sensitivity cell would be
     measuring nothing while still reading green if its threshold were
     written the other way round.  This asserts the collapse really is
-    what a dead knob looks like, so the threshold above has a meaning.
+    what a dead projector looks like, so the threshold above has a meaning.
     """
     import jax.numpy as jnp
     from dataclasses import replace
     from tests.test_dipole_vnl_velocity_sign import (
         _apply_one_k, _fixture, _geom, _mesh, _mtxel, _vnl_setup)
-    from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
-                                    VNL_VELOCITY_SIGN_SHIPPED, dipole_operator)
+    from common.mtxel_sweep import dipole_operator
 
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
@@ -440,19 +436,18 @@ def test_the_sensitivity_measurement_is_not_a_tautology():
     got = {}
     with mesh:
         geom = _geom(mesh)
-        for tag, sign in (("shipped", VNL_VELOCITY_SIGN_SHIPPED),
-                          ("flipped", VNL_VELOCITY_SIGN_FLIPPED)):
-            op = dipole_operator(geom, bvec=bvec, blat=blat,
-                                 vnl_setup=dead, vnl_velocity_sign=sign)
+        for tag, vnl in (("p", None), ("dead", dead)):
+            op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=vnl)
             got[tag] = np.asarray([
                 _mtxel(_apply_one_k(op, psi[ik], gv[ik], gmask[ik],
                                     bidx[ik], kvecs[ik]),
                        psi[ik], gmask[ik])
                 for ik in range(psi.shape[0])])
-    move = _median_relative_move(got["shipped"], got["flipped"])
+    move = _median_relative_move(got["p"], got["dead"])
     assert move < 1.0e-12, (
         f"a null projector strength still moved |d|^2 by {move:.3e}, so "
-        f"the arms differ by something that is not the nonlocal term")
+        f"the operator differs from p by something that is not the "
+        f"nonlocal term")
 
 
 # ---------------------------------------------------------------------------
@@ -486,11 +481,8 @@ def test_the_producer_reaches_the_same_oscillator_strengths():
     absorption numbers, which is the join the data-level gate cannot
     make on its own.
     """
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
-    from common.mtxel_sweep import VNL_VELOCITY_SIGN_SHIPPED
+    from common.mtxel_sweep import VNL_VELOCITY_SIGN
 
-    # The arm a bare run takes must still be the arm the references were
-    # cut at, whatever the shipped default has become.
-    resolved = resolve_vnl_velocity_sign(None, "")
-    assert resolved in (-1.0, +1.0)
-    assert resolved == VNL_VELOCITY_SIGN_SHIPPED or resolved == +1.0
+    # The velocity a bare run builds must be the one the references were
+    # cut at (``prov_vnl_velocity_sign = +1.0`` on every committed fixture).
+    assert VNL_VELOCITY_SIGN == +1.0

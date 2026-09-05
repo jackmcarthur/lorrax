@@ -35,10 +35,9 @@ Landed:
   site is one sweep rather than three.
 * `blocks_to_host` — the explicit boundary; see §6.4 below.
 * The three call sites: `gw.kin_ion_io.compute_hartree_matrix`,
-  `gw.kin_ion_io.main`, `psp.get_dipole_mtxels.main`.
-  `--vnl-mode=numeric` stays on the per-k route (its finite difference picks
-  a step from that k's median |K| on the host and needs 4–8 extra projector
-  builds per component per k; it is a cross-check of the analytic dZ).
+  `gw.kin_ion_io.main`, `psp.get_dipole_mtxels.main`.  The per-k route
+  survives only for the `LORRAX_DEBUG_PRINT` table; the `--vnl-mode=numeric`
+  finite-difference cross-check was retired 2026-09-05.
 * Gate `tests/multi_device/mtxel_callsite_gate.py` — all three sites vs the
   local plan on MoS₂ 4×4 (deck_b300, nk=16, nb=28) at P=4, per shard.
   Job 7889210: V_H 9.6e-16, kin+ion 1.4e-15, dipole 2.8e-15, the boundary
@@ -75,8 +74,8 @@ Three sweeps, three call sites, one shape:
 | ⟨mk\|r\|nk⟩ | `psp/get_dipole_mtxels.py:750, 849` | `_dipole_block` | `(nk, 3, nb, nb)` |
 
 (Line numbers are pre-conversion. `_vh_block` and the default-mode
-`_dipole_block` are gone; `_dipole_block` survives for `--vnl-mode=numeric`
-and the `LORRAX_DEBUG_PRINT` table, which needs p and p+v_NL separately.)
+`_dipole_block` are gone; `_dipole_block` survives for the
+`LORRAX_DEBUG_PRINT` table, which needs p and p+v_NL separately.)
 
 All three called `common/collectives.py:985 gather_k_blocks`, which is
 **k-partitioned and returns an array identical on every rank**. Three

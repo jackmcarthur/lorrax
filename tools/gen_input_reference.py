@@ -51,7 +51,6 @@ KEYS: dict[str, tuple[str, str]] = {
     "sys_dim": ("System", "System dimensionality (2 = slab): selects the Coulomb truncation."),
     "ecutrho": ("System", "Density-grid cutoff (Ry) for the psp tools (kin_ion/dipole); None = the WFN's own ecutwfc."),
     "bispinor": ("System", "Bispinor (4-spinor) run: 4-channel zeta-fit, Sigma^B transverse channels, two centroid files."),
-    "vnl_velocity_sign": ("System", "Relative sign of the i[r, V_NL] commutator in the assembled velocity, read by `psp.get_dipole_mtxels` (CLI `--vnl-velocity-sign` overrides). `-1`/`shipped` is the shipped assembly, `+1`/`flipped` the arm reproducing BerkeleyGW's q->0 head; empty means NOT DECLARED and resolves to the shipped sign, which is why the default is a string rather than a float."),
     "fermi_reference": ("System", "Where E_F sits inside the gap for the G/W time kernels (midgap default)."),
     # ---- ISDF / zeta ----
     "centroids_file": ("ISDF / zeta", "Charge-channel ISDF centroid table written by centroid.kmeans_cli."),

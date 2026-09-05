@@ -3460,12 +3460,9 @@ def read_authenticated_dipole_velocity(
     # Fail before the host read and every sharded head allocation.  Shape does
     # not identify a velocity artifact: in particular, a two-spinor dipole and
     # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
-    # The producer owns both the stamp grammar and sign resolution; consume
-    # those owners directly rather than mirroring either convention here.
-    from psp.get_dipole_mtxels import (
-        check_dipole_provenance, resolve_vnl_velocity_sign)
-    expected_vnl_sign = resolve_vnl_velocity_sign(
-        None, config.vnl_velocity_sign)
+    # The producer owns the stamp grammar (and the one velocity convention
+    # it checks for); consume it directly rather than mirroring it here.
+    from psp.get_dipole_mtxels import check_dipole_provenance
     from common.four_current_model import resolve_four_current_representation
     representation = resolve_four_current_representation(
         bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
@@ -3478,8 +3475,6 @@ def read_authenticated_dipole_velocity(
             nband=int(config.nband),
             bispinor=representation.scalar_head_bispinor,
             skip_vnl=False,
-            vnl_mode="analytic",
-            vnl_velocity_sign=expected_vnl_sign,
             wfn_fingerprint_binding=wfn_fingerprint_binding):
         raise ValueError(
             "GATE dft_head_dipole_provenance: the full head received an "

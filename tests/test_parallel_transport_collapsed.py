@@ -195,8 +195,8 @@ def test_mos2_slab_position_operator_reproduces_the_exact_z_velocity():
                 nspinor=2, print_fn=lambda *a, **k: None)
             v = np.asarray(sweep_matrix_elements(
                 psi_G, operator=dipole_operator(
-                    geom, bvec=wfn.bvec, blat=wfn.blat, vnl_setup=setup,
-                    vnl_velocity_sign=+1.0), **kw))[:, :, :nb, :nb]
+                    geom, bvec=wfn.bvec, blat=wfn.blat,
+                    vnl_setup=setup), **kw))[:, :, :nb, :nb]
         nk = one.shape[0]
         eye = np.broadcast_to(np.eye(nb), (nk, nb, nb))
         np.testing.assert_allclose(one, eye, atol=1e-9)          # (a)

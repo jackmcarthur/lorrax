@@ -441,15 +441,13 @@ def test_dft_head_refuses_dipole_provenance_before_read_or_allocation(
 
     (tmp_path / "dipole.h5").write_bytes(b"not read")
     monkeypatch.setattr(
-        dipole_owner, "resolve_vnl_velocity_sign", lambda *_args: +1)
-    monkeypatch.setattr(
         dipole_owner, "check_dipole_provenance", lambda *_args, **_kw: False)
     monkeypatch.setattr(
         dipole_reader, "read_dipole_h5",
         lambda *_args, **_kw: pytest.fail("dipole payload was read"))
 
     config = SimpleNamespace(
-        nval=2, ncond=2, nband=4, vnl_velocity_sign="")
+        nval=2, ncond=2, nband=4)
     meta = SimpleNamespace(nspinor=4)
     with pytest.raises(ValueError, match="dft_head_dipole_provenance"):
         qsgw_head.build_dft_head_response(

@@ -231,7 +231,7 @@ def _write_stamped(path, wfn, **kw):
         stamp_dipole_provenance(h5, wfn=wfn, wfn_path="WFN.h5",
                                 nval=2, ncond=3, nband=8,
                                 nb_written=4, bispinor=False,
-                                skip_vnl=False, vnl_mode="analytic", **kw)
+                                skip_vnl=False, **kw)
 
 
 def test_prov_nspinor_and_soc_are_stamped_and_accepted(tmp_path):

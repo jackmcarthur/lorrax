@@ -823,144 +823,66 @@ def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
                     key=('vnl', geom.ngkmax, geom.ns, id(vnl_setup)))
 
 
-#: The shipped relative sign of the nonlocal commutator term inside
-#: :func:`dipole_operator`, as a named constant so the two arms of the
-#: open question can be spelled without a magic ``-1.0`` at four call
-#: sites.  ``-1.0`` is what every ``dipole.h5`` in the tree was built
-#: with and is the default everywhere; see that function's SIGN section
-#: for what is actually in dispute.
-VNL_VELOCITY_SIGN_SHIPPED = -1.0
-
-#: The other arm.  It is not "the fix" — the choice is the owner's — it
-#: is the second reproducible configuration, so that a measurement of
-#: the difference does not require patching a source file.
-VNL_VELOCITY_SIGN_FLIPPED = +1.0
-
-
-_VNL_VELOCITY_SIGN_WORDS = {
-    "shipped": VNL_VELOCITY_SIGN_SHIPPED,
-    "minus": VNL_VELOCITY_SIGN_SHIPPED,
-    "flipped": VNL_VELOCITY_SIGN_FLIPPED,
-    "plus": VNL_VELOCITY_SIGN_FLIPPED,
-}
-
-
-def require_vnl_velocity_sign(value) -> float:
-    """Return one of the two characterized nonlocal-velocity signs.
-
-    ``value`` is the resolved ``vnl_velocity_sign`` deck/CLI value or the
-    direct :func:`dipole_operator` argument.  This is the single owner of
-    both the word aliases and the two-arm validation, so the producer and
-    operator cannot drift on which values are meaningful.
-    """
-    raw = value
-    if isinstance(raw, str):
-        raw = raw.strip().lower()
-        raw = _VNL_VELOCITY_SIGN_WORDS.get(raw, raw)
-    try:
-        sign = float(raw)
-    except (TypeError, ValueError):
-        sign = None
-    if sign not in (VNL_VELOCITY_SIGN_SHIPPED,
-                    VNL_VELOCITY_SIGN_FLIPPED):
-        raise ValueError(
-            "GATE vnl_velocity_sign: the nonlocal velocity has only two "
-            "characterized sign arms.\n"
-            f"  got:  vnl_velocity_sign = {value!r}\n"
-            "  want: vnl_velocity_sign in {-1, +1, shipped, minus, "
-            "flipped, plus}\n"
-            "  why:  this is a sign, not a scale; any other multiplier "
-            "would produce a velocity operator that is neither measured "
-            "arm and that no BerkeleyGW comparison characterizes\n"
-            "  doc:  docs/input_reference.md, vnl_velocity_sign.")
-    return sign
+#: The sign with which ``dV_NL/dK`` enters the assembled velocity,
+#: ``v = p + dV_NL/dK`` (Ry; ``p - i[r, V_NL]`` in the stored convention).
+#: Decided by measurement against BerkeleyGW's q -> 0 head on 2026-08-09
+#: (the table in :func:`dipole_operator`); the ``-1`` arm and its
+#: ``vnl_velocity_sign`` knob were retired on 2026-09-05.  Every
+#: ``dipole.h5`` carries this value as ``prov_vnl_velocity_sign`` so a
+#: file built with the retired arm is refused by
+#: ``psp.get_dipole_mtxels.check_dipole_provenance``.
+VNL_VELOCITY_SIGN = +1.0
 
 
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
-                    vnl_setup=None,
-                    vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED) -> Operator:
-    """``v ∘ ψ = 2(k+G)_cart ψ ± (∂V_NL/∂K_cart) ψ`` — THREE components.
+                    vnl_setup=None) -> Operator:
+    """``v ∘ ψ = 2(k+G)_cart ψ + (∂V_NL/∂K_cart) ψ`` — THREE components.
 
     The velocity matrix ``psp.get_dipole_mtxels`` writes is
     ``p - i[r, V_NL]`` in the stored convention, assembled here as
-    ``p_cart + v_NL_cart``.  WHICH ARM A FILE WAS BUILT WITH IS NOT A
-    PROPERTY OF THIS DOCSTRING: it is stamped into every ``dipole.h5``
-    as ``prov_vnl_velocity_sign``, and files written before that stamp
-    existed are the ``-1`` arm.  Both halves already have
-    apply-to-ket kernels — ``dft_operators.apply_kinetic_velocity_to_ket``
-    and ``vnl_ops.apply_vnl_velocity_to_ket``, each ``(3, nb, ns, nG)`` —
-    so this operator is their difference and no velocity physics is
-    written twice.
+    ``p_cart + v_NL_cart``.  Both halves already have apply-to-ket
+    kernels — ``dft_operators.apply_kinetic_velocity_to_ket`` and
+    ``vnl_ops.apply_vnl_velocity_to_ket``, each ``(3, nb, ns, nG)`` — so
+    this operator is their sum and no velocity physics is written twice.
 
     ``vnl_setup=None`` reproduces ``--skip-vnl`` (p̂ only).
 
     The component axis is moved to the END, where the sweep's specs
     expect it; that is a transpose of the operator output, not of ψ.
 
-    THE SIGN, WHICH WAS AN OPEN QUESTION AND IS NOW DECIDED
-    -------------------------------------------------------
-    ``vnl_velocity_sign`` multiplies the nonlocal term and nothing else.
-    It takes exactly ``+1.0`` (the DEFAULT since 2026-08-09) or ``-1.0``
-    (the arm every ``dipole.h5`` committed before that date was built
-    with, kept reachable so those files stay reproducible).  The two
-    signs are separate branches rather than a scalar multiply, so the
-    legacy arm still executes the literal subtraction it always did.
-
-    The decision was measured, not argued.  On the si_bigcond_prep mean
-    field at the band window matched to the BerkeleyGW contour-
-    deformation reference (nval 8 / ncond 92 / nband 100), against
-    BerkeleyGW's own stored q → 0 head at all 265 CD frequencies —
-    the two percentage columns are eps00 and omega_p SEPARATELY, which
-    an earlier draft of this table collapsed into one and thereby
-    understated the shipped arm's eps00 error by half:
+    THE SIGN OF THE NONLOCAL TERM (:data:`VNL_VELOCITY_SIGN`)
+    ---------------------------------------------------------
+    Until 2026-08-09 the term entered with a MINUS, and until 2026-09-05
+    both arms stayed reachable through a ``vnl_velocity_sign`` knob.  The
+    decision was measured, not argued: on the si_bigcond_prep mean field
+    at the band window matched to the BerkeleyGW contour-deformation
+    reference (nval 8 / ncond 92 / nband 100), against BerkeleyGW's own
+    stored q → 0 head at all 265 CD frequencies,
 
         arm                       eps00(0)   d_eps    omega_p    d_wp
         BerkeleyGW (reference)     24.2205      --   18.101 eV     --
         p only (``--skip-vnl``)    27.8686  +15.06%  19.546 eV  +7.99%
-        sign −1 (legacy)           31.8204  +31.38%  21.259 eV +17.45%
-        sign +1 (DEFAULT)          24.2208   +0.00%  18.101 eV  +0.00%
+        sign −1 (retired)          31.8204  +31.38%  21.259 eV +17.45%
+        sign +1 (this operator)    24.2208   +0.00%  18.101 eV  +0.00%
 
-    The structural argument is the sharpest: dropping the term entirely
-    is BETTER than including it with the legacy sign, which is the
-    signature of a sign and not of a magnitude.  Four further witnesses
-    agree, three of them internal to this tree — the surviving
-    ``vnl_ops.vnl_velocity_matrix`` derivative owner and
-    ``orbital_magnetization`` use ``+dV_NL/dK``, and ``--vnl-mode numeric``
-    did too (by way of a double negation nobody had noticed).
-
+    Dropping the term entirely is BETTER than including it with the
+    retired sign, which is the signature of a sign and not of a
+    magnitude; ``vnl_ops.vnl_velocity_matrix`` and
+    ``orbital_magnetization`` use the same ``+dV_NL/dK``.
     ``gw.mpa.head_dipole.head_fsum_from_transitions`` carries the same
-    table and the f-sum saturations beside it.
+    table with the f-sum saturations beside it.  None of this touches
+    the per-(ψ, G-list) projector contraction, which reproduces Quantum
+    ESPRESSO to ~10 significant figures.
 
-    WHAT THIS KNOB IS NOT.  It is not a claim about the per-(ψ, G-list)
-    projector contraction, which reproduces Quantum ESPRESSO to ~10
-    significant figures and which the standing project rule protects.
-    Only the sign with which the assembled term enters the velocity is
-    parameterised here.
-
-    WHAT THE DEFAULT CHANGE DID NOT DO.  It did not re-cut the committed
-    fixtures.  Every ``dipole.h5`` under ``tests/regression`` was built
-    with ``-1`` and still is, so until those are regenerated a bare run
-    of this operator and the files in the tree are two different
-    operators — which is precisely what ``prov_vnl_velocity_sign`` on
-    the h5 exists to make visible, and what
-    ``tests/test_bse_oscillator_strengths.py`` exists to notice.
-
-    THE CACHE HAZARD THE KEY CLOSES.  ``_operator_key`` is the sweep's
-    jit-cache identity, and two operators that hash the same share a
-    compiled program — which for a closed-over sign would mean the
-    second arm of an A/B silently re-running the first.  That is exactly
-    the defect class this project has already paid for twice, so the
-    sign joins the key.  Two sweeps at the two signs in one process is
-    a supported thing to do, and it is what the test does.
+    A ``dipole.h5`` says which sign built it (``prov_vnl_velocity_sign``);
+    ``psp.get_dipole_mtxels.check_dipole_provenance`` refuses a file
+    stamped with the retired arm.
     """
     from psp.dft_operators import apply_kinetic_velocity_to_ket
     from psp import vnl_ops
 
-    sign = require_vnl_velocity_sign(vnl_velocity_sign)
-
     B = jnp.asarray(np.asarray(bvec, dtype=np.float64) * float(blat),
                     dtype=jnp.float64)
-    flipped = sign > 0.0
 
     def op(psi_n, gvec, gmask, bidx, kvec, B):
         psi = _ket(psi_n, gmask)
@@ -972,13 +894,12 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
             v_nl = vnl_ops.apply_vnl_velocity_to_ket(
                 psi[:, :ns_e], kdata.Z, kdata.dZ, kdata.E_super)
             pad = _pad_spinor(v_nl, int(psi.shape[1]))
-            v = v + pad if flipped else v - pad
+            v = v + pad
         return jnp.moveaxis(v, 0, -1)[None]
 
     return Operator(apply=op, post=1.0, ncomp=3, consts=(B,),
                     key=('dipole', geom.ngkmax, geom.ns, float(blat),
-                         None if vnl_setup is None else id(vnl_setup),
-                         sign))
+                         None if vnl_setup is None else id(vnl_setup)))
 
 
 class UniformGaugeCurrentMatrixElements(NamedTuple):

@@ -1,48 +1,30 @@
-"""The relative sign of i[r, V_NL] in the assembled velocity, as a knob.
+"""The nonlocal term enters the velocity as ``p + dV_NL/dK``, and only so.
 
-WHAT WAS IN DISPUTE, AND HOW IT WAS SETTLED.
-``common.mtxel_sweep.dipole_operator`` used to assemble the velocity as
-``p`` MINUS the nonlocal commutator term.  Measured against BerkeleyGW's
-own q -> 0 head at all 265 contour-deformation frequencies on the
-si_bigcond_prep mean field (nval 8 / ncond 92 / nband 100), that arm is
-31.38 % high in eps00(0) and 17.45 % high in omega_p, while the other
-agrees to 1.0e-5.  ``gw.mpa.head_dipole.head_fsum_from_transitions``
-carries the whole four-arm table.  **The owner ruled on 2026-08-09 and
-the default is now the PLUS arm.**  This file no longer gates "the
-default is the legacy sign"; it gates that both arms remain reachable
-from a keyword, a CLI flag and a deck key without anybody patching a
-source file, that the default really is the new one at the operator's
-cache key, and that the LEGACY arm is still bit-identical to the
-pre-knob expression -- which is what keeps every ``dipole.h5`` built
-before the flip reproducible.
+HISTORY, IN THREE LINES.  ``common.mtxel_sweep.dipole_operator`` once
+assembled ``p`` MINUS the nonlocal commutator term.  Measured against
+BerkeleyGW's q -> 0 head on silicon (the table in that function's
+docstring), the minus arm is 31 % high in eps00(0) while the plus arm
+agrees to 1e-5; the owner ruled for plus on 2026-08-09, and on
+2026-09-05 the ``vnl_velocity_sign`` knob that kept the minus arm
+reachable, the ``--vnl-mode numeric`` finite-difference cross-check and
+their CLI/deck plumbing were retired.  There is one velocity now.
 
-THE FALSE CASE, WHICH IS THE WHOLE POINT.  This project's named failure
-mode is a key that is parsed, stored and never read -- ``x_only`` was a
-value of ``compute_mode`` while 62 decks wrote ``x_only = false``
-believing it a switch, and ``screening_method = ctsp`` reached a typed
-field no reader touched and silently ran minimax.  Grepping for
-references does not prove a knob is live.  So every assertion below is
-paired: the legacy arm must be BIT-IDENTICAL to the expression the code
-had before the knob existed, and the two arms must DIFFER by a margin
-no rounding could produce.  A knob that passed the first and failed the
-second would be exactly the defect.
-
-THE CACHE COLLISION IS A REAL HAZARD HERE, not a hypothetical one.  The
-sweep's jit cache is keyed on ``_operator_key``, and a sign closed over
-by the operator's ``apply`` closure without entering that tuple would
-hash identically for the two arms -- so an A/B in one process would
-serve the FIRST arm's compiled program to the second and the two arms
-would agree, which is the shape of the defect that once let both halves
-of an A/B import the same tree and agree at "128 passed" while testing
-neither branch.  ``test_sweep_does_not_serve_one_arm_for_the_other``
-runs the two sweeps in one process, in both orders, and is the check
-that would fail if the sign left the key.
+WHAT THIS FILE GATES.  (1) The operator IS ``p + dV_NL/dK``, bit for
+bit against the two kernels it is built from.  (2) The nonlocal term is
+live -- the operator differs from bare ``p`` by exactly that term, so a
+tree in which the projector term stopped reaching the assembly fails
+here rather than in an absorption spectrum.  (3) Every ``dipole.h5`` is
+stamped ``analytic`` / ``+1``, and the provenance check refuses a file
+stamped with the retired arm.  (4) The retired deck key refuses by name
+instead of being parsed, stored and never read -- this project's named
+failure mode.
 
 Everything here is synthetic and device-free: the V_NL setup is a
 handful of random projector rows, because the quantity under test is a
 sign and not a pseudopotential.  The per-(psi, G-list) projector
 contraction is NOT touched -- it reproduces Quantum ESPRESSO to ~10
 significant figures and the standing project rule protects it.
+``tests/test_bse_oscillator_strengths.py`` imports the fixtures below.
 """
 from __future__ import annotations
 
@@ -52,12 +34,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh
 
-from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
-                                VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
-                                _operator_key, blocks_to_host,
-                                dipole_operator, sweep_matrix_elements)
+from common.mtxel_sweep import (VNL_VELOCITY_SIGN, SweepGeometry,
+                                _operator_key, dipole_operator)
 
 NK, NB, NS, NGK, NGKMAX = 2, 4, 1, 10, 12
 GRID = (4, 4, 4)
@@ -83,14 +63,12 @@ def _vnl_setup(seed=11):
     a full-rank dZ, and no more, because the quantity under test is a
     SIGN and not a pseudopotential.  The row metadata is laid out
     atom-major to match the order ``_build_vnl_kdata_core`` reshapes its
-    dZ blocks into; a mismatch there would pair a projector with the
-    wrong derivative and both arms would move together, which is why the
-    straddle assertion in the perturbation test is worth having.
+    dZ blocks into.
 
     E_super is deliberately random and not the zeros
     ``tests/test_psp_padded_gvectors`` uses: a null E_super makes
-    ``v_nl`` identically zero, both arms agree, and this whole file
-    becomes a tautology wearing a measurement's clothes.
+    ``v_nl`` identically zero and this whole file becomes a tautology
+    wearing a measurement's clothes.
     """
     from psp import vnl_ops
 
@@ -164,15 +142,14 @@ def _apply_one_k(op, psi, gv, gmask, bidx, kvec):
                  jnp.asarray(kvec), *op.consts)))
 
 
-def _pre_knob_ket(psi, gv, gmask, kvec, bvec, blat, setup, sign):
-    """The expression the code had BEFORE the knob, written out here.
+def _reference_ket(psi, gv, gmask, kvec, bvec, blat, setup, sign=+1.0):
+    """``p ψ + sign · (dV_NL/dK) ψ`` written out from the two kernels.
 
-    This is the reference the default arm must match bit for bit, and it
-    is written from the kernels rather than from a saved array on
-    purpose: a frozen array would prove the code matches its own past
-    self on one fixture, while this reproduces the literal line
-    ``v = v - _pad_spinor(v_nl, ...)`` and therefore fails if the
-    default stops being that line.
+    Built from the kernels rather than from a saved array on purpose: a
+    frozen array would prove the code matches its own past self on one
+    fixture, while this reproduces the literal line ``v = v + pad`` and
+    therefore fails if the operator stops being that line.  ``sign`` is
+    here only so the red twin can build the retired arm.
     """
     from psp.dft_operators import apply_kinetic_velocity_to_ket
     from psp import vnl_ops
@@ -188,7 +165,7 @@ def _pre_knob_ket(psi, gv, gmask, kvec, bvec, blat, setup, sign):
     ns_e = int(kdata.E_super.shape[0])
     v_nl = vnl_ops.apply_vnl_velocity_to_ket(ket[:, :ns_e], kdata.Z,
                                              kdata.dZ, kdata.E_super)
-    v = v - v_nl if sign < 0.0 else v + v_nl
+    v = v + v_nl if sign > 0.0 else v - v_nl
     return np.asarray(jax.device_get(jnp.moveaxis(v, 0, -1)[None]))
 
 
@@ -200,309 +177,93 @@ def _mtxel(ket_out, psi, gmask):
 
 
 # ---------------------------------------------------------------------------
-# 1. The default arm is the pre-knob expression, bit for bit
+# 1. The operator is p + dV_NL/dK, bit for bit
 # ---------------------------------------------------------------------------
 
-def test_default_arm_is_bit_identical_to_the_pre_knob_assembly():
-    """The DEFAULT is the flipped arm; the LEGACY arm is still exact.
+def test_the_constant_is_plus_one():
+    assert VNL_VELOCITY_SIGN == +1.0
 
-    Two assertions that used to be one.  Before 2026-08-09 the default
-    was the legacy sign and this cell proved the knob had not disturbed
-    it.  The default has since moved -- so what needs proving is (a)
-    that it really moved, at the operator's cache key and not merely in
-    a docstring, and (b) that the legacy arm, explicitly requested, is
-    STILL the pre-knob expression bit for bit.  (b) is the promise that
-    keeps every ``dipole.h5`` committed before the flip reproducible,
-    and it is the one that would quietly rot if nobody checked it.
-    """
+
+def test_operator_is_p_plus_dvnl_dk_bit_for_bit():
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
     setup = _vnl_setup()
     with mesh:
         geom = _geom(mesh)
         op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup)
-        assert op.key[-1] == VNL_VELOCITY_SIGN_FLIPPED, (
-            "the default must BE the flipped sign, not merely behave "
-            "like it: a default that resolved elsewhere and happened to "
-            "agree on this fixture would pass every assertion below")
-
-        legacy = dipole_operator(geom, bvec=bvec, blat=blat,
-                                 vnl_setup=setup,
-                                 vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED)
         for ik in range(NK):
-            got = _apply_one_k(legacy, psi[ik], gv[ik], gmask[ik],
-                               bidx[ik], kvecs[ik])
-            ref = _pre_knob_ket(psi[ik], gv[ik], gmask[ik], kvecs[ik],
-                                bvec, blat, setup,
-                                VNL_VELOCITY_SIGN_SHIPPED)
+            got = _apply_one_k(op, psi[ik], gv[ik], gmask[ik], bidx[ik],
+                               kvecs[ik])
+            ref = _reference_ket(psi[ik], gv[ik], gmask[ik], kvecs[ik],
+                                 bvec, blat, setup)
             assert np.array_equal(got, ref), (
-                f"k={ik}: the legacy arm moved off the pre-knob "
-                f"expression by {np.max(np.abs(got - ref)):.3e}.  This "
-                f"assertion is bit-identity and not a tolerance, because "
-                f"the promise it keeps is that every dipole.h5 built "
-                f"before the flip is still reproducible.")
+                f"k={ik}: the operator moved off p + dV_NL/dK by "
+                f"{np.max(np.abs(got - ref)):.3e}.  Bit identity, not a "
+                f"tolerance: the reference is the literal expression the "
+                f"operator is documented to be.")
 
 
-def test_the_bit_identity_reference_can_fail():
-    """The FALSE case for the reference itself.
-
-    ``test_default_arm_is_bit_identical_...`` is only evidence if its
-    reference can disagree.  Feed the same reference builder the other
-    sign and it must not match -- otherwise the comparison is between
-    two spellings of one number and proves nothing about either arm.
-
-    It follows the primary cell onto the LEGACY arm: since the default
-    moved to ``+1`` this must compare the legacy operator against the
-    flipped reference, or it would be handing the builder the very sign
-    the operator now uses and asserting they differ, which is a cell
-    that fails for the wrong reason.
-    """
+def test_the_reference_can_fail():
+    """The retired minus arm must NOT match, or the cell above compares
+    two spellings of one number and proves nothing."""
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
     setup = _vnl_setup()
     with mesh:
         geom = _geom(mesh)
-        op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup,
-                             vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED)
+        op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup)
         got = _apply_one_k(op, psi[0], gv[0], gmask[0], bidx[0], kvecs[0])
-        wrong = _pre_knob_ket(psi[0], gv[0], gmask[0], kvecs[0], bvec, blat,
-                              setup, VNL_VELOCITY_SIGN_FLIPPED)
-        assert not np.array_equal(got, wrong)
-        assert np.max(np.abs(got - wrong)) > 1e-6 * np.max(np.abs(got))
+        retired = _reference_ket(psi[0], gv[0], gmask[0], kvecs[0], bvec,
+                                 blat, setup, sign=-1.0)
+        assert not np.array_equal(got, retired)
+        assert np.max(np.abs(got - retired)) > 1e-6 * np.max(np.abs(got))
 
 
 # ---------------------------------------------------------------------------
-# 2. The flipped arm MOVES the physics -- the perturbation test
+# 2. The nonlocal term is live, and it is the whole difference from p
 # ---------------------------------------------------------------------------
 
-def test_flipped_arm_moves_the_matrix_elements():
-    """Perturb it and watch the physics move.
-
-    The margin asserted is not "not equal": the two arms must differ by
-    exactly twice the nonlocal term, which is a statement about WHAT
-    moved and not merely that something did.  A knob wired to the wrong
-    operand would fail this while passing a bare inequality.
-    """
+def test_the_nonlocal_term_is_live_and_is_the_whole_difference_from_p():
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
     setup = _vnl_setup()
     with mesh:
         geom = _geom(mesh)
-        shipped = dipole_operator(geom, bvec=bvec, blat=blat,
-                                  vnl_setup=setup,
-                                  vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED)
-        flipped = dipole_operator(geom, bvec=bvec, blat=blat,
-                                  vnl_setup=setup,
-                                  vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED)
+        full = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup)
         p_only = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=None)
         for ik in range(NK):
             args = (psi[ik], gv[ik], gmask[ik], bidx[ik], kvecs[ik])
-            m_s = _mtxel(_apply_one_k(shipped, *args), psi[ik], gmask[ik])
-            m_f = _mtxel(_apply_one_k(flipped, *args), psi[ik], gmask[ik])
+            m_full = _mtxel(_apply_one_k(full, *args), psi[ik], gmask[ik])
             m_p = _mtxel(_apply_one_k(p_only, *args), psi[ik], gmask[ik])
-            scale = np.max(np.abs(m_s))
-            moved = np.max(np.abs(m_f - m_s))
-            assert moved > 1e-3 * scale, (
-                f"k={ik}: flipping the sign moved the matrix elements by "
-                f"{moved:.3e} against a scale of {scale:.3e}.  A knob that "
-                f"is parsed, stored and never read is this project's named "
-                f"failure mode; this is the assertion that catches it.")
-            # The two arms straddle p exactly: (v_+ + v_-)/2 == p.
-            assert np.allclose(0.5 * (m_f + m_s), m_p, rtol=1e-12,
-                               atol=1e-12 * scale), (
-                f"k={ik}: the two arms do not straddle the momentum-only "
-                f"operator, so what the knob moved is not the nonlocal "
-                f"term.")
-            assert np.max(np.abs(m_s - m_p)) > 1e-3 * scale, (
-                "fixture produced a null nonlocal term, which would make "
-                "every assertion in this file vacuous")
+            scale = np.max(np.abs(m_full))
+            assert np.max(np.abs(m_full - m_p)) > 1e-3 * scale, (
+                f"k={ik}: the projector term is not reaching the assembled "
+                f"velocity (or the fixture produced a null one)")
+            # ... and what it adds is dV_NL/dK and nothing else.
+            v_nl_only = (_reference_ket(*args[:3], kvecs[ik], bvec, blat, setup)
+                         - _reference_ket(*args[:3], kvecs[ik], bvec, blat,
+                                          setup, sign=-1.0)) / 2.0
+            assert np.allclose(m_full - m_p, _mtxel(v_nl_only, psi[ik], gmask[ik]),
+                               rtol=1e-12, atol=1e-12 * scale)
 
 
-# ---------------------------------------------------------------------------
-# 3. The cache key -- and the sweep that would collide without it
-# ---------------------------------------------------------------------------
-
-def test_operator_key_separates_the_two_arms_and_nothing_else():
-    mesh = _mesh()
-    _psi, _gv, _gmask, _bidx, _kv, bvec, blat = _fixture()
-    setup = _vnl_setup()
-    with mesh:
-        geom = _geom(mesh)
-        k_s = _operator_key(dipole_operator(
-            geom, bvec=bvec, blat=blat, vnl_setup=setup,
-            vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED))
-        k_f = _operator_key(dipole_operator(
-            geom, bvec=bvec, blat=blat, vnl_setup=setup,
-            vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED))
-    assert k_s != k_f, (
-        "the two arms hash the same, so the sweep's jit cache would serve "
-        "one arm's compiled program for the other")
-    # ... and the sign is the ONLY thing that separates them, which is
-    # what makes the inequality above evidence about the sign rather than
-    # about some incidental difference between two factory calls.
-    assert k_s[:-1] == k_f[:-1]
-    assert (k_s[-1], k_f[-1]) == (VNL_VELOCITY_SIGN_SHIPPED,
-                                  VNL_VELOCITY_SIGN_FLIPPED)
-
-
-@pytest.mark.parametrize("order", [(-1.0, 1.0), (1.0, -1.0)])
-def test_sweep_does_not_serve_one_arm_for_the_other(order):
-    """Both arms, both orders, one process -- the end-to-end cache check.
-
-    Run in both orders on purpose: a cache that collides returns the
-    FIRST arm's answer for both, so a single order would be passed by an
-    implementation that always returns the flipped arm.
-    """
-    mesh = _mesh()
-    psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
-    setup = _vnl_setup()
-    with mesh:
-        geom = _geom(mesh)
-        sharding = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
-        psi_j = jax.device_put(jnp.asarray(psi), sharding)
-        out = {}
-        for sign in order:
-            op = dipole_operator(geom, bvec=bvec, blat=blat,
-                                 vnl_setup=setup, vnl_velocity_sign=sign)
-            blk = sweep_matrix_elements(
-                psi_j, geom=geom, operator=op, gvecs=jnp.asarray(gv),
-                gmask=jnp.asarray(gmask), box_index=jnp.asarray(bidx),
-                kvecs=jnp.asarray(kvecs))
-            out[sign] = np.asarray(blocks_to_host(blk, nb=NB))
-    scale = np.max(np.abs(out[-1.0]))
-    moved = np.max(np.abs(out[1.0] - out[-1.0]))
-    assert moved > 1e-3 * scale, (
-        f"the two arms came back {moved:.3e} apart on a scale of "
-        f"{scale:.3e} after two sweeps in one process: the second sweep "
-        f"was served the first's compiled program, which is what the "
-        f"sign in _operator_key exists to prevent.")
-
-
-# ---------------------------------------------------------------------------
-# 4. The refusal, and the producer's resolution order
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("bad", [0.0, 2.0, -0.5, "sideways"])
-def test_operator_refuses_anything_that_is_not_a_sign(bad):
+def test_operator_key_separates_p_only_from_p_plus_vnl():
+    """The sweep's jit cache is keyed on ``_operator_key``; the two
+    operators must not share a compiled program."""
     mesh = _mesh()
     *_, bvec, blat = _fixture()
+    setup = _vnl_setup()
     with mesh:
         geom = _geom(mesh)
-        with pytest.raises(ValueError) as exc:
-            dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=None,
-                            vnl_velocity_sign=bad)
-    message = str(exc.value)
-    for part in ("got:", "want:", "why:"):
-        assert part in message
-
-
-@pytest.mark.parametrize("cli, deck, want", [
-    (None, "", VNL_VELOCITY_SIGN_FLIPPED),          # neither: the default
-    (None, None, VNL_VELOCITY_SIGN_FLIPPED),        # absent key
-    (None, "-1", VNL_VELOCITY_SIGN_SHIPPED),
-    (None, "+1", VNL_VELOCITY_SIGN_FLIPPED),
-    (None, "flipped", VNL_VELOCITY_SIGN_FLIPPED),
-    (None, "shipped", VNL_VELOCITY_SIGN_SHIPPED),
-    (1.0, "", VNL_VELOCITY_SIGN_FLIPPED),           # CLI with no deck key
-    (1.0, "-1", VNL_VELOCITY_SIGN_FLIPPED),         # CLI beats the deck
-    (-1.0, "+1", VNL_VELOCITY_SIGN_SHIPPED),        # ... in both directions
-])
-def test_producer_resolution_order(cli, deck, want):
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
-
-    assert resolve_vnl_velocity_sign(cli, deck) == want
-
-
-@pytest.mark.parametrize("deck", ["0", "2", "yes", "-1.5"])
-def test_producer_refuses_a_deck_key_that_is_not_a_sign(deck):
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
-
-    with pytest.raises(ValueError, match="vnl_velocity_sign") as exc:
-        resolve_vnl_velocity_sign(None, deck)
-    for part in ("got:", "want:", "why:"):
-        assert part in str(exc.value)
-
-
-def test_producer_and_operator_share_one_sign_validation_owner():
-    """The parser resolves precedence; common.mtxel_sweep owns validity."""
-    import inspect
-    from common import mtxel_sweep
-    from psp import get_dipole_mtxels
-
-    assert "GATE vnl_velocity_sign" in inspect.getsource(
-        mtxel_sweep.require_vnl_velocity_sign)
-    assert "GATE vnl_velocity_sign" not in inspect.getsource(
-        get_dipole_mtxels.resolve_vnl_velocity_sign)
-
-
-def _deck(tmp_path, body):
-    p = tmp_path / "deck.in"
-    p.write_text("[cohsex]\nwfn_file = WFN.h5\n" + body)
-    return str(p)
-
-
-@pytest.mark.parametrize("written, want", [("+1", "+1"), ("-1", "-1"),
-                                           ("flipped", "flipped")])
-def test_the_deck_key_survives_the_deck_reader(tmp_path, written, want):
-    """The FALSE case a grep would have passed, and did.
-
-    ``read_lorrax_input`` builds its params dict from ``_DEFAULTS``
-    ALONE, so a key absent from that table is parsed, reported as
-    unrecognized and dropped -- and the producer then reads its own
-    default and runs the OTHER ARM while the deck says otherwise.  That
-    is not hypothetical: the first flipped-arm ``dipole.h5`` of this
-    campaign came back stamped ``-1.0``, with "1 unrecognized deck
-    key(s)" in the log, because the key had been plumbed everywhere
-    except into ``_DEFAULTS``.  Reading the value back verbatim -- not
-    folded to a bool, not coerced -- is what says the whole chain from
-    the deck line to the resolver is connected.
-    """
-    from gw.gw_config import read_lorrax_input
-
-    params = read_lorrax_input(
-        _deck(tmp_path, f"vnl_velocity_sign = {written}\n"))
-    assert params["vnl_velocity_sign"] == want
-
-
-def test_a_deck_that_omits_the_key_reads_as_not_declared(tmp_path):
-    """Empty is UNSET and must stay distinguishable from an explicit
-    ``-1``: the two produce the same operator and the same numbers, but
-    only one of them is a deck that made a choice."""
-    from gw.gw_config import read_lorrax_input
-
-    params = read_lorrax_input(_deck(tmp_path, ""))
-    assert params["vnl_velocity_sign"] == ""
-
-
-def test_strict_keys_accepts_a_deck_that_names_the_sign(tmp_path):
-    """Always-strict parsing accepts the registered sign key."""
-    from gw.gw_config import read_lorrax_input
-
-    params = read_lorrax_input(_deck(tmp_path, "vnl_velocity_sign = +1\n"))
-    assert params["vnl_velocity_sign"] == "+1"
-
-
-def test_the_whole_chain_from_deck_line_to_resolved_sign(tmp_path):
-    """Deck text in, arm out -- the two halves joined.
-
-    Each half is gated above; this is the cell that fails if they are
-    gated against different spellings of the key.
-    """
-    from gw.gw_config import read_lorrax_input
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
-
-    for written, want in (("+1", VNL_VELOCITY_SIGN_FLIPPED),
-                          ("-1", VNL_VELOCITY_SIGN_SHIPPED),
-                          ("flipped", VNL_VELOCITY_SIGN_FLIPPED),
-                          ("", VNL_VELOCITY_SIGN_FLIPPED)):
-        line = f"vnl_velocity_sign = {written}\n" if written else ""
-        params = read_lorrax_input(_deck(tmp_path, line))
-        got = resolve_vnl_velocity_sign(None, params["vnl_velocity_sign"])
-        assert got == want, (written, got, want)
+        k_full = _operator_key(dipole_operator(geom, bvec=bvec, blat=blat,
+                                               vnl_setup=setup))
+        k_p = _operator_key(dipole_operator(geom, bvec=bvec, blat=blat,
+                                            vnl_setup=None))
+    assert k_full != k_p
 
 
 # ---------------------------------------------------------------------------
-# 5. The stamp -- a dipole.h5 that cannot say which arm built it
+# 3. The stamp, and the refusal of the retired arm
 # ---------------------------------------------------------------------------
 
 class _FakeWfn:
@@ -522,27 +283,100 @@ def _stamp(path, **kw):
         h5.create_dataset("dipole_cart", data=np.zeros((3, 1, 1, 1)))
         stamp_dipole_provenance(h5, wfn=_FakeWfn(), wfn_path="WFN.h5",
                                 nval=2, ncond=3, nband=8, nb_written=4,
-                                bispinor=False, skip_vnl=False,
-                                vnl_mode="analytic", **kw)
+                                bispinor=False, skip_vnl=False, **kw)
 
 
-@pytest.mark.parametrize("sign", [VNL_VELOCITY_SIGN_SHIPPED,
-                                  VNL_VELOCITY_SIGN_FLIPPED])
-def test_the_stamp_records_the_arm_that_ran(tmp_path, sign):
-    import h5py
-
-    p = tmp_path / "dipole.h5"
-    _stamp(p, vnl_velocity_sign=sign)
-    with h5py.File(str(p), "r") as h5:
-        assert float(h5.attrs["prov_vnl_velocity_sign"]) == sign
-
-
-def test_an_unstamped_file_stays_unstamped(tmp_path):
-    """``None`` is "written before the knob existed", which is a real
-    state on disk and must not be forged into a claim about the arm."""
+def test_every_stamp_says_analytic_plus_one(tmp_path):
     import h5py
 
     p = tmp_path / "dipole.h5"
     _stamp(p)
     with h5py.File(str(p), "r") as h5:
-        assert "prov_vnl_velocity_sign" not in h5.attrs
+        assert float(h5.attrs["prov_vnl_velocity_sign"]) == +1.0
+        assert h5.attrs["prov_vnl_mode"] == "analytic"
+
+
+@pytest.mark.parametrize("stale", [
+    {"prov_vnl_velocity_sign": -1.0},          # the retired arm
+    {"prov_vnl_mode": "numeric"},              # the retired cross-check
+])
+def test_the_provenance_check_refuses_the_retired_arm(tmp_path, monkeypatch,
+                                                      stale):
+    import h5py
+
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _stamp(p)
+    lines = []
+    assert check_dipole_provenance(p, wfn=wfn, nval=2, ncond=3, nband=8,
+                                   print_fn=lines.append) is True
+    with h5py.File(str(p), "r+") as h5:
+        for key, value in stale.items():
+            h5.attrs[key] = value
+    lines = []
+    assert check_dipole_provenance(p, wfn=wfn, nval=2, ncond=3, nband=8,
+                                   print_fn=lines.append) is False
+    (key,) = stale
+    assert any(key in line for line in lines)
+
+
+def test_a_stamp_without_the_sign_is_refused(tmp_path, monkeypatch):
+    """A stamped file that cannot say its arm predates 2026-08-09 and was
+    built with the retired minus; it is uncheckable, not legacy-accepted."""
+    import h5py
+
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    p = tmp_path / "dipole.h5"
+    _stamp(p)
+    with h5py.File(str(p), "r+") as h5:
+        del h5.attrs["prov_vnl_velocity_sign"]
+    assert check_dipole_provenance(p, wfn=_FakeWfn(), nval=2, ncond=3,
+                                   nband=8, print_fn=lambda *a: None) is False
+
+
+# ---------------------------------------------------------------------------
+# 4. The retired deck key and CLI flags refuse by name
+# ---------------------------------------------------------------------------
+
+def _deck(tmp_path, body):
+    p = tmp_path / "deck.in"
+    p.write_text("[cohsex]\nwfn_file = WFN.h5\n" + body)
+    return str(p)
+
+
+@pytest.mark.parametrize("written", ["+1", "-1", "flipped", ""])
+def test_the_deck_key_is_retired(tmp_path, written):
+    from gw.gw_config import read_lorrax_input
+
+    with pytest.raises(ValueError, match="vnl_velocity_sign.*retired"):
+        read_lorrax_input(_deck(tmp_path, f"vnl_velocity_sign = {written}\n"))
+
+
+def test_a_deck_without_the_key_reads(tmp_path):
+    from gw.gw_config import read_lorrax_input
+
+    params = read_lorrax_input(_deck(tmp_path, ""))
+    assert "vnl_velocity_sign" not in params
+
+
+def test_the_producer_has_no_numeric_arm_and_no_sign_flag():
+    """Source-text scan of the producer: the CLI surface is gone, not
+    merely ignored.  Read as text so the scan needs no FFI host library."""
+    import pathlib
+
+    from common import mtxel_sweep
+
+    # ``psp`` is a namespace package; locate the tree from a real module.
+    src = (pathlib.Path(mtxel_sweep.__file__).parents[1] / "psp"
+           / "get_dipole_mtxels.py").read_text()
+    for gone in ("--vnl-mode", "--vnl-h", "--vnl-num-scheme",
+                 "--vnl-velocity-sign", "resolve_vnl_velocity_sign",
+                 "compute_vnl_matrix_from_setup"):
+        assert gone not in src, gone

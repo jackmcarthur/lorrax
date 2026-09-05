@@ -97,7 +97,7 @@ def test_wfn_fingerprint_refuses_sampled_coefficient_mismatch(
         stamp_dipole_provenance(
             h5, wfn=wfn_a, wfn_path=path_a,
             nval=8, ncond=32, nband=40, nb_written=40,
-            bispinor=False, skip_vnl=False, vnl_mode="analytic")
+            bispinor=False, skip_vnl=False)
     lines = []
     assert check_dipole_provenance(
         dipole, wfn=wfn_b, nval=8, ncond=32, nband=40,
@@ -140,7 +140,7 @@ def test_wfn_fingerprint_accepts_byte_identical_copy(tmp_path):
         stamp_dipole_provenance(
             h5, wfn=wfn_a, wfn_path=path_a,
             nval=8, ncond=32, nband=40, nb_written=40,
-            bispinor=False, skip_vnl=False, vnl_mode="analytic")
+            bispinor=False, skip_vnl=False)
     lines = []
     assert check_dipole_provenance(
         dipole, wfn=wfn_b, nval=8, ncond=32, nband=40,

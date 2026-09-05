@@ -303,7 +303,7 @@ def _write_stamped(path, wfn, *, nb_written=4, dataset_nb=None,
             h5.create_group("finite_q")
         stamp_dipole_provenance(h5, wfn=wfn, wfn_path="WFN.h5",
                                  nb_written=nb_written, bispinor=False,
-                                 skip_vnl=False, vnl_mode="analytic", **kw)
+                                 skip_vnl=False, **kw)
 
 
 def test_provenance_guard_accepts_its_own_stamp(tmp_path):
@@ -311,39 +311,38 @@ def test_provenance_guard_accepts_its_own_stamp(tmp_path):
 
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, wfn, nval=2, ncond=3, nband=8,
-                   vnl_velocity_sign=+1)
+    _write_stamped(p, wfn, nval=2, ncond=3, nband=8)
     assert check_dipole_provenance(
         p, wfn=wfn, nval=2, ncond=3, nband=8,
-        bispinor=False, skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=+1, print_fn=lambda *a: None) is True
+        bispinor=False, skip_vnl=False, print_fn=lambda *a: None) is True
 
 
 def test_provenance_guard_refuses_representation_or_vnl_sign_mismatch(
         tmp_path, monkeypatch):
     """Equal shapes do not make two velocity operators interchangeable."""
+    import h5py
     from common import sanity
     from psp.get_dipole_mtxels import check_dipole_provenance
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, wfn, nval=2, ncond=3, nband=8,
-                   vnl_velocity_sign=+1)
+    _write_stamped(p, wfn, nval=2, ncond=3, nband=8)
 
     representation_lines = []
     assert check_dipole_provenance(
         p, wfn=wfn, nval=2, ncond=3, nband=8,
-        bispinor=True, skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=+1,
+        bispinor=True, skip_vnl=False,
         print_fn=representation_lines.append) is False
     assert any("prov_bispinor" in line for line in representation_lines)
 
+    # A file from the retired -1 arm: right shape, wrong operator.
+    with h5py.File(str(p), "r+") as h5:
+        h5.attrs["prov_vnl_velocity_sign"] = -1.0
     sign_lines = []
     assert check_dipole_provenance(
         p, wfn=wfn, nval=2, ncond=3, nband=8,
-        bispinor=False, skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=-1,
+        bispinor=False, skip_vnl=False,
         print_fn=sign_lines.append) is False
     assert any("prov_vnl_velocity_sign" in line for line in sign_lines)
 
@@ -615,11 +614,11 @@ def test_psp_drivers_import_the_service():
 # band-sharded (nk·nb·ns·ngkmax·16 B — 1.2 GB globally at b600, ≈19 MB/rank
 # at P=64).  That is the OTHER array: the box is nx·ny·nz per band where the
 # sphere is ngkmax, and the sweep forms no box at all.  The streaming
-# spellings below stay because the per-k route survives for
-# ``--vnl-mode=numeric`` and the ``LORRAX_DEBUG_PRINT`` table.
+# spelling below stays because the per-k route survives for the
+# ``LORRAX_DEBUG_PRINT`` table.
 
 _RESIDENT_SPELLINGS = ("read_Gvecs_to_devices", "shard_over_k")
-_STREAMING_SPELLINGS = ("load_kpoint_fftbox_local", "gather_k_blocks")
+_STREAMING_SPELLINGS = ("load_kpoint_fftbox_local",)
 
 
 def test_dipole_driver_streams_k_rather_than_materialising_all_of_them():
