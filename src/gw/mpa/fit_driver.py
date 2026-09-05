@@ -69,10 +69,49 @@ _FIT_EIG = "jax_qr"
 # receipt schema owns the value because it authenticates opens against epochs;
 # this alias keeps the loop readable without creating a second policy value.
 _FIT_CHECKPOINT_BLOCKS = mpa_store.FIT_IO_CHECKPOINT_BLOCKS
+# The source block is sharded over every process before fitting.  Let a
+# default run spend one legacy dense-matrix tile *per process* on that read,
+# but never increase the local allowance beyond this cap.  The Loewner
+# kernel still consumes one legacy global tile at a time; separating these
+# two widths is what removes HDF5 calls and output drains without changing a
+# single elementwise solve.
+_FIT_IO_LOCAL_EXPANSION_CAP_BYTES = 64 * 2 ** 20
 
 
 def _fit_eig(solve):
     return "lapack" if solve == "thiele" else _FIT_EIG
+
+
+def _fit_column_plans(n_mu, n_omega, tile_bytes, mesh_xy):
+    """Return independent source-I/O and Loewner-compute column plans.
+
+    An explicit ``tile_bytes`` retains its historical meaning and disables
+    automatic expansion.  With the default one-tile policy, the collective
+    source block can use the processes that shard its row axis: its global
+    allowance grows by ``P`` while its local increase is capped at 64 MiB.
+    The compute plan remains the historical one-global-tile shape so the
+    compiled kernel, poles and arithmetic are unchanged.
+    """
+    compute_bytes = (
+        mpa_store.one_tile_bytes(n_mu) if tile_bytes is None
+        else int(tile_bytes))
+    processes = max(1, int(getattr(mesh_xy, "size", 1)))
+    if tile_bytes is not None or processes == 1:
+        io_bytes = compute_bytes
+    else:
+        full_q_bytes = (
+            int(n_omega) * int(n_mu) * int(n_mu)
+            * mpa_store.COMPLEX128_BYTES)
+        local_increment = min(
+            compute_bytes, _FIT_IO_LOCAL_EXPANSION_CAP_BYTES)
+        io_bytes = min(
+            full_q_bytes,
+            max(compute_bytes, processes * local_increment))
+    return (
+        tiling.plan_column_walk(n_mu, n_omega, io_bytes),
+        tiling.plan_column_walk(n_mu, n_omega, compute_bytes),
+        processes,
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -255,6 +294,7 @@ def fit_one_block(
     mesh_xy,
     n_cols_buffer=None,
     tile_bytes=None,
+    fit_tile_bytes=None,
     rcond=1.0e-13,
     solve="loewner",
     header=None,
@@ -286,6 +326,13 @@ def fit_one_block(
     mesh_xy
         The run mesh.  The full ``('x', 'y')`` mesh shards the row axis;
         frequency and the scheduled column buffer remain replicated.
+    tile_bytes, fit_tile_bytes
+        Collective source-I/O and compute-microbatch budgets, respectively.
+        The production driver may read a wider all-P-sharded source block and
+        pass the historical one-tile budget as ``fit_tile_bytes``.  This
+        changes only batching: every element still enters the same kernel
+        exactly once.  Direct callers that omit ``fit_tile_bytes`` retain
+        one fit dispatch per source block.
     fit_writer
         Optional live :class:`file_io.mpa_store.FitWriter`.  The production
         driver supplies one for the checkpoint epoch.  ``None`` uses the
@@ -308,6 +355,7 @@ def fit_one_block(
     residual from the same solve; diagnostics therefore add no second fit.
 
     """
+    import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from common.collectives import device_put_process_local
@@ -370,14 +418,33 @@ def fit_one_block(
     row_ids = device_put_process_local(
         np.arange(n_mu_padded, dtype=np.int32),
         NamedSharding(mesh_xy, P(("x", "y"))))
-    if ordered:
-        outputs = kernel(
-            block, negative_block, z_dev, row_ids,
-            np.int32(n_mu), np.int32(n_cols))
+    fit_n_cols = (
+        int(n_cols_buffer) if fit_tile_bytes is None else
+        mpa_store.choose_column_budget(
+            n_mu, n_omega * (2 if ordered else 1), fit_tile_bytes))
+    outputs = []
+    for start in range(0, int(n_cols_buffer), fit_n_cols):
+        stop = min(start + fit_n_cols, int(n_cols_buffer))
+        logical = max(0, min(n_cols, stop) - start)
+        positive = block[..., start:stop]
+        if ordered:
+            value = kernel(
+                positive, negative_block[..., start:stop], z_dev, row_ids,
+                np.int32(n_mu), np.int32(logical))
+        else:
+            value = kernel(
+                positive, z_dev, row_ids,
+                np.int32(n_mu), np.int32(logical))
+        outputs.append(value)
+    if len(outputs) == 1:
+        Omega, B, B_odd, condition, maxima, finite = outputs[0]
     else:
-        outputs = kernel(
-            block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
-    Omega, B, B_odd, condition, maxima, finite = outputs
+        Omega, B, B_odd, condition = (
+            jnp.concatenate([value[index] for value in outputs], axis=-1)
+            for index in range(4))
+        maxima = jnp.max(jnp.stack(
+            [value[4] for value in outputs]), axis=0)
+        finite = jnp.min(jnp.stack([value[5] for value in outputs]))
     Omega.block_until_ready()
     t_fit = time.perf_counter() - t_fit
 
@@ -411,7 +478,7 @@ def fit_one_block(
         "n_elements": int(n_mu * n_cols),
         "bytes_read": ((2 if ordered else 1) * n_omega * n_mu * n_cols
                        * mpa_store.COMPLEX128_BYTES),
-        "fit_dispatches": 1,
+        "fit_dispatches": len(outputs),
         "pade_solves": int(n_mu * n_cols),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
@@ -487,6 +554,7 @@ def run_fit_driver(
     w_negative_name=None,
     mesh_xy,
     tile_bytes=None,
+    fit_tile_bytes=None,
     rcond=1.0e-13,
     solve="loewner",
     provenance=None,
@@ -519,6 +587,13 @@ def run_fit_driver(
     append it after COMPLETE: its own finalize duration is unknowable before
     that last write, and mutating a finalized artifact to record it would
     violate the store's write-once contract.
+
+    DEFAULT MEMORY POLICY.  The on-disk walk and the elementwise Loewner
+    launch have independent widths.  When ``tile_bytes`` is omitted, the
+    collective read can spend up to one legacy matrix tile per row-sharding
+    process (with a 64 MiB local expansion cap), while each fit dispatch
+    retains the historical one-global-tile budget.  Passing ``tile_bytes``
+    explicitly preserves the old single-budget behavior.
     """
     n = int(n_p)
     rcond = float(rcond)
@@ -574,8 +649,18 @@ def run_fit_driver(
                 f"negative_shape={negative_stamped.shape}, z_shape={z.shape}, "
                 "required negative omega == -z exactly")
 
-    plan = tiling.plan_column_walk(
-        n_mu, n_omega * (2 if ordered else 1), tile_bytes)
+    effective_n_omega = n_omega * (2 if ordered else 1)
+    plan, compute_plan, io_processes = _fit_column_plans(
+        n_mu, effective_n_omega, tile_bytes, mesh_xy)
+    if fit_tile_bytes is not None:
+        compute_plan = tiling.plan_column_walk(
+            n_mu, effective_n_omega, fit_tile_bytes)
+        if compute_plan["n_cols"] > plan["n_cols"]:
+            raise ValueError(
+                "run_fit_driver: fit_tile_bytes may not make a compute "
+                "microbatch wider than its source-I/O block; got "
+                f"{compute_plan['n_cols']} fit columns against "
+                f"{plan['n_cols']} I/O columns")
     fit_provenance = _bind_sample_artifact_identities(
         header, negative_header, provenance)
     fit_provenance.update({
@@ -585,7 +670,7 @@ def run_fit_driver(
         "fit_fused": True,
     })
     schedule = tuple(tiling.fit_schedule(
-        n_q, n_mu, n_omega * (2 if ordered else 1), tile_bytes))
+        n_q, n_mu, effective_n_omega, plan["tile_bytes"]))
     ledger = None
     must_allocate = not os.path.exists(os.fspath(fit_dest))
     if not must_allocate:
@@ -646,6 +731,9 @@ def run_fit_driver(
         "n_blocks_per_q": int(plan["n_blocks"]),
         "tile_bytes": int(plan["tile_bytes"]),
         "cost_sentence": plan["cost"],
+        "fit_n_cols_budget": int(compute_plan["n_cols"]),
+        "fit_tile_bytes": int(compute_plan["tile_bytes"]),
+        "io_processes": int(io_processes),
         "blocks_walked": 0,
         "blocks_skipped": 0,
         "checkpoint_blocks": _FIT_CHECKPOINT_BLOCKS,
@@ -723,7 +811,11 @@ def run_fit_driver(
                     mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
                     w_negative_name=w_negative_name,
                     negative_header=negative_header,
-                    tile_bytes=tile_bytes, rcond=rcond,
+                    tile_bytes=plan["tile_bytes"],
+                    fit_tile_bytes=(
+                        compute_plan["tile_bytes"]
+                        if fit_tile_bytes is None else fit_tile_bytes),
+                    rcond=rcond,
                     solve=solve, header=header, fit_writer=fit_writer,
                     w_reader=w_reader)
                 ledger = stats["ledger"]
@@ -824,7 +916,9 @@ def format_cost_report(report):
         f"  eig             {r['eig']}, fused=yes",
         f"  walk            {r['blocks_walked']} blocks "
         f"({r['n_blocks_per_q']} per q x {r['n_q']} q), "
-        f"{r['n_cols_budget']} columns per block",
+        f"{r['n_cols_budget']} I/O columns per block",
+        f"  compute batch   {r.get('fit_n_cols_budget', r['n_cols_budget'])} "
+        f"columns per fit dispatch",
         f"  resume          {r['blocks_skipped']} blocks skipped; "
         f"checkpoint epoch={r['checkpoint_blocks']} blocks, "
         f"{r['checkpoint_epochs_committed']}/"
@@ -847,8 +941,12 @@ def format_cost_report(report):
         f"{r['bytes_budget_total']} B "
         f"({r['bytes_budget_total'] / mib:.2f} MiB)",
         f"  peak block      {r['peak_block_bytes']} B "
-        f"({r['peak_block_bytes'] / mib:.3f} MiB) against one tile of "
-        f"{r['tile_bytes']} B ({r['tile_bytes'] / mib:.3f} MiB)",
+        f"({r['peak_block_bytes'] / mib:.3f} MiB) against the collective "
+        f"I/O budget of {r['tile_bytes']} B "
+        f"({r['tile_bytes'] / mib:.3f} MiB), row-sharded over "
+        f"{r.get('io_processes', 1)} processes",
+        f"  fit tile        {r.get('fit_tile_bytes', r['tile_bytes'])} B "
+        f"({r.get('fit_tile_bytes', r['tile_bytes']) / mib:.3f} MiB)",
         f"  budget rule     {r['cost_sentence']}",
         f"  worst condition {r['condition_max']:.3e}, worst backward "
         f"error {r['backward_error_max']:.3e}",
