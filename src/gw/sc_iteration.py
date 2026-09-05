@@ -2432,6 +2432,56 @@ def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
     )
 
 
+def _refuse_frozen_partition_escape(
+    partition, e_active_kn_ev, *, band_offset: int, omega_min_abs_ev: float,
+    omega_max_abs_ev: float, tolerance_ev: float, omega_step_ev: float,
+    iteration: int, print_fn=print) -> float:
+    """Check every frozen protected/in-range state is still on the grid.
+
+    Returns the smallest remaining margin to an edge (eV).  A state farther
+    outside than ``tolerance_ev`` (half an omega bin or the occupation
+    broadening, whichever is larger) refuses with the band, the k row, the
+    energy, the edge it crossed, and the deck value that would clear it by
+    the SC state pad (2 eV, rounded up to the omega step).
+    """
+    trusted = (np.asarray(partition.protected_mask, dtype=bool).reshape(-1)
+               | np.asarray(partition.in_range_mask, dtype=bool).reshape(-1))
+    e = np.asarray(e_active_kn_ev, dtype=np.float64)
+    if not trusted.any():
+        return float("inf")
+    cols = np.flatnonzero(trusted)
+    sub = e[:, cols]
+    margin_top = float(omega_max_abs_ev - sub.max())
+    margin_bot = float(sub.min() - omega_min_abs_ev)
+    print_fn(
+        f"    SC partition: frozen from map 0 "
+        f"({_band_ranges(trusted, band_offset=band_offset)}, "
+        f"{int(trusted.sum())} of {trusted.size}); edge margins now "
+        f"{margin_bot:.3f} eV (bottom) / {margin_top:.3f} eV (top)")
+    worst = min(margin_top, margin_bot)
+    if worst >= -float(tolerance_ev):
+        return worst
+    pad = 2.0
+    if margin_top < margin_bot:
+        k, j = np.unravel_index(int(np.argmax(sub)), sub.shape)
+        edge, key = "top", "sigma_omega_max_ev"
+        need = np.ceil((sub.max() + pad - omega_max_abs_ev) / omega_step_ev) * omega_step_ev
+    else:
+        k, j = np.unravel_index(int(np.argmin(sub)), sub.shape)
+        edge, key = "bottom", "sigma_omega_min_ev"
+        need = -np.ceil((omega_min_abs_ev - sub.min() + pad) / omega_step_ev) * omega_step_ev
+    band = int(band_offset + cols[j] + 1)
+    raise ValueError(
+        f"SC map {iteration}: frozen in-range band {band} left the Sigma grid "
+        f"at the {edge} edge: E(k={int(k)}, band {band}) = {sub[k, j]:.3f} eV "
+        f"against the edge at {omega_max_abs_ev if edge == 'top' else omega_min_abs_ev:.3f} eV "
+        f"(overshoot {-worst:.3f} eV, tolerance {tolerance_ev:.3f} eV). The "
+        f"partition is fixed at map 0 so the map stays continuous; widen the "
+        f"grid by {abs(need):.2f} eV ({key} moved {'up' if edge == 'top' else 'down'} "
+        f"by that amount, which clears the state by the 2 eV SC pad) or "
+        f"shrink the trusted set with ncond.")
+
+
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
     """Current partition, with compatibility for synthetic bare states."""
     return state.partition if state.partition is not None else inputs.partition
@@ -2682,17 +2732,40 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # and bands as inputs.e_dft_active_kn_ry, which is what the partition
         # masks are applied to.
         _e_active_now = np.asarray(E_full, dtype=np.float64)
-        partition = build_omega_band_partition(
-            _e_active_now, np.asarray(enk_entry, dtype=np.float64),
-            band_offset=int(inputs.band_slices.b0),
-            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
-            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
-            previous_partition=(state.partition
-                                if state.partition is not None
-                                else inputs.partition),
-            hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
-            label=f"SC map {int(state.iteration)} (mu-anchored)",
-            print_fn=inputs.print_fn)
+        _omega_lo = float(inputs.config.sigma.omega_min_ev) + _mu_ev
+        _omega_hi = float(inputs.config.sigma.omega_max_ev) + _mu_ev
+        if int(state.iteration) > 0 and state.partition is not None:
+            # STATE IDENTITY IS FIXED AT MAP 0.  Re-classifying bands against
+            # the window every map made the map discontinuous: on Na
+            # (86 bands, top +18 eV) bands 9-10 reach 17.2 eV and bands 11-13
+            # straddle the edge, so a ~1 eV QP shift moved them in and out of
+            # the in-range set map to map (5-10 -> 5-8, protected 5-10 <->
+            # 5-13), and the loop floored at 60 meV per map on the Fermi
+            # window (runs/Na/12_sc_observables_eta05_2026-09-04, arms A/D/E).
+            # The grid still re-anchors on this map's mu; only the set of
+            # bands trusted on it is frozen.  A frozen state whose energy
+            # leaves the grid refuses with the window value that clears it,
+            # instead of the silent edge clamp.
+            partition = state.partition
+            _refuse_frozen_partition_escape(
+                partition, _e_active_now,
+                band_offset=int(inputs.band_slices.b0),
+                omega_min_abs_ev=_omega_lo, omega_max_abs_ev=_omega_hi,
+                tolerance_ev=_partition_hysteresis_margin_ev(inputs),
+                omega_step_ev=float(inputs.config.sigma.omega_step_ev),
+                iteration=int(state.iteration), print_fn=inputs.print_fn)
+        else:
+            partition = build_omega_band_partition(
+                _e_active_now, np.asarray(enk_entry, dtype=np.float64),
+                band_offset=int(inputs.band_slices.b0),
+                omega_min_abs_ev=_omega_lo,
+                omega_max_abs_ev=_omega_hi,
+                previous_partition=(state.partition
+                                    if state.partition is not None
+                                    else inputs.partition),
+                hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
+                label=f"SC map {int(state.iteration)} (mu-anchored)",
+                print_fn=inputs.print_fn)
     partition = _apply_sc_buffer_partition(partition, inputs)
     buffer_mask = _sc_buffer_mask(inputs)
     if buffer_mask.any():
