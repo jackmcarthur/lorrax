@@ -17,6 +17,8 @@ CORE_CELLS = {
 
 
 if __name__ == "__main__":
+    from runtime import initialize_communicator_stack, run_main_and_finalize
+    initialize_communicator_stack(platform="gpu")
     root = Path(__file__).resolve().parents[2]
     namespace = runpy.run_path(str(
         root / "services/distrib_la/tests/test_distrib_la_multiproc.py"))
@@ -24,5 +26,4 @@ if __name__ == "__main__":
     cells = [row for row in namespace["_CLI_CELLS"] if row[0] in CORE_CELLS]
     assert {row[0] for row in cells} == CORE_CELLS, "stale core matrix roster"
     main.__globals__["_CLI_CELLS"] = cells
-    from runtime import run_main_and_finalize
     run_main_and_finalize(main)
