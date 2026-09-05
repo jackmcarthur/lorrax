@@ -363,16 +363,24 @@ def main(argv=None):
 			# into the RUN RECORD: which of two physically equivalent-inside-
 			# the-envelope routes ran is exactly the fact a later reader needs
 			# (they differ in the q->0 head mechanism).
-			report.progress(
-				"Photon route   : "
-				+ ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
-				   "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
-				   "completion carries both the charge head and the bare "
-				   f"<D_TT>) -- {_bare_reason}"
-				   if _bare_taken else
-				   "incumbent charge-screened W + Sigma^B "
-				   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
-				   f"head -- {_bare_reason}"))
+			if _bare_taken and uses_dynamic_packed_photon_route(config):
+				_route = (
+					"packed dynamic current-only photon operator "
+					"(CC block absent; W_CURRENT = V_CURRENT; Gamma-cell "
+					"completion carries bare <D_TT> only) -- "
+					f"{_bare_reason}")
+			elif _bare_taken:
+				_route = (
+					"packed static photon operator (chi_TT = chi_CT = 0; "
+					"scalar Dyson on CC, W_packed = diag(W_00, D_TT); the "
+					"Gamma-cell completion carries both the charge head and "
+					f"the bare <D_TT>) -- {_bare_reason}")
+			else:
+				_route = (
+					"incumbent charge-screened W + Sigma^B "
+					"(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
+					f"head -- {_bare_reason}")
+			report.progress(f"Photon route   : {_route}")
 		# HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
 		# docs/architecture/decisions.md; TASTE.md row 20).  The packed route
 		# already prints a boxed WARNING banner and a `Photon head` record
@@ -758,6 +766,50 @@ def main(argv=None):
 	photon_response = None
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		W_by_role = {}
+		if uses_static_photon_response(config):
+			# The only packed SC class admitted by gw_config is the bare
+			# dynamic family.  Its current operator and bare <D_TT> head live
+			# entirely in the centroid/Coulomb basis and are built once; every
+			# map below rotates both wavefunction bundles and re-contracts this
+			# same operator.  Scalar W_00(omega), its charge head, and Hartree
+			# remain live per-map owners in sc_iteration.
+			if (packed_photon_screens_current(config)
+					or not uses_dynamic_packed_photon_route(config)):
+				raise RuntimeError(
+					"packed SC reached a response class without a per-map "
+					"screening/completion owner; config validation should have "
+					"refused it")
+			if wfns_transverse is None or bispinor_v_q_path is None:
+				raise RuntimeError(
+					"dynamic packed SC requires the transverse wavefunction "
+					"bundle and v_q_bispinor.h5")
+			from .w_isdf import compute_static_photon_response
+			with timing.section(
+					"gw_jax.static_photon_response", announce=True,
+					label="immutable bare-current photon operator"):
+				photon_response = compute_static_photon_response(
+					wfns, wfns_transverse, quad, bispinor_v_q_path,
+					meta, mesh_xy, screen_current=False, W_charge=None,
+					wfn=wfn, config=config,
+					photon_g0_vectors=isdf.photon_g0_vectors,
+					wf_binding_charge=isdf.wf_binding_charge,
+					wf_binding_transverse=isdf.wf_binding_transverse,
+					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+					energy_reference=e_ref,
+					dyson_solver=config.backend.w_dyson_solver,
+					distrib_la_batched_route=(
+						config.backend.distrib_la_batched_route),
+					print_fn=print0)
+			report.progress(
+				"Photon Sigma   : self-consistent dynamic packed route -- "
+				"immutable bare current operator built once; packed CC block "
+				"ABSENT; scalar W_00(omega), charge head and four-current "
+				"Hartree rebuilt per map; current vertices re-contracted from "
+				"that map's rotated orbitals.")
+			report.progress(
+				"Photon head    : bare <D> inserted into V and logical "
+				"W_CURRENT = V_CURRENT; charge S/wing fold and coupled Dyson "
+				"SKIPPED (no packed-CC consumer).")
 	else:
 		with timing.section("gw_jax.screening", announce=True,
 		                    label="screening (chi0 -> W)"):
@@ -797,7 +849,7 @@ def main(argv=None):
 						tensors_filename=tensors_filename,
 						static_only=not _dynamic_packed,
 						print_fn=print0)
-					if not _screens_current:
+					if not _screens_current and not _dynamic_packed:
 						_W_charge = W_by_role.get("static")
 						if _W_charge is None:
 							raise RuntimeError(
@@ -834,17 +886,21 @@ def main(argv=None):
 					"  static photon route: "
 					+ ("full_static_cohsex (sixteen chi blocks, one packed "
 					   "Dyson solve)" if _screens_current else
-					   "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
-					   "scalar Dyson on CC, W_packed = diag(W_00, D_TT))")
+					   ("bare_transverse as the packed path (chi_TT = chi_CT = 0; "
+					    "packed CC block ABSENT, no W carrier; "
+					    "W_CURRENT = V_CURRENT)" if _dynamic_packed else
+					    "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
+					    "scalar Dyson on CC, W_packed = diag(W_00, D_TT))"))
 					+ ("" if not _dynamic_packed else
-					   "; DYNAMIC packed route: the CC block carries "
-					   f"compute_mode = {mode.value} at every omega and the "
+					   "; DYNAMIC packed route: the scalar owner carries "
+					   f"compute_mode = {mode.value} W_00 at every omega and the "
 					   "twelve current blocks are frozen at omega = 0"))
 				print0(
 					"  static photon response: "
 					f"approximation={photon_response.approximation}, "
 					f"current_model={photon_response.current_model}, "
 					f"current_contact={photon_response.current_contact}, "
+					f"charge_block_state={photon_response.charge_block_state}, "
 					f"packed_extent={photon_response.layout.packed_extent}")
 				# The run record (gwjax.out) must state the Gamma-cell status
 				# of the packed mode in production mode, where print0 sinks
@@ -859,11 +915,13 @@ def main(argv=None):
 					# Both facts are physics, so neither is left to a log.
 					report.progress(
 						"Photon Sigma   : dynamic packed route -- "
-						f"W_packed(omega) = diag(W_00(omega), W_TT, W_CT) with "
-						f"compute_mode = {mode.value} on the CHARGE block and "
+						"packed CC block ABSENT (not zero-filled); "
+						f"compute_mode = {mode.value} scalar Sigma owns W_00(omega), "
+						"W_CURRENT = V_CURRENT, and "
 						"the twelve current blocks STATIC (omega = 0). The "
-						"charge q->0 head is the dynamic model's; the TT/CT "
-						"q->0 head is the packed Gamma-cell completion's. "
+						"charge q->0 head is the dynamic model's; the packed "
+						"Gamma completion inserts bare <D> only and skips the "
+						"unconsumed charge S/wing fold. "
 						"Sigma^B is the TT block of the packed operator, not "
 						"a separate term.")
 				else:
@@ -873,19 +931,28 @@ def main(argv=None):
 						"Sigma_COH and the per-state CC / CT+TC / TT split is "
 						"written to sigma_diag.dat.")
 				_hc = photon_response.head_completion
-				report.progress(
-					"Photon head    : "
-					+ ("DEBUG: Gamma-cell head disabled by head_correction=off "
-					   "(headless packed body; NOT a production calculation)"
-					   if _hc is None else
-					   "Gamma-cell completion applied (bare <D> into V, "
-					   "charge S00/wing head into W); "
-					   f"hall_source={_hc.hall_source}; "
-					   f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
-					   f"ward={_hc.ward_residual:.3e}; "
-						   f"hermiticity={_hc.hermiticity_residual:.3e}; "
-						   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
-						   f"cubature_orders={_hc.cubature_receipt.orders}"))
+				if _hc is None:
+					report.progress(
+						"Photon head    : DEBUG: Gamma-cell head disabled by "
+						"head_correction=off (headless packed body; NOT a "
+						"production calculation)")
+				elif _hc.charge_block_state == "absent_dynamic_scalar_owner":
+					report.progress(
+						"Photon head    : bare <D> inserted into V and logical "
+						"W_CURRENT = V_CURRENT; packed CC block ABSENT; charge "
+						"S/wing fold and coupled Dyson SKIPPED (no consumer); "
+						f"cubature_orders={_hc.cubature_receipt.orders}")
+				else:
+					report.progress(
+						"Photon head    : Gamma-cell completion applied (bare "
+						"<D> into V, charge S00/wing head into W); "
+						f"hall_source={_hc.hall_source}; "
+						f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
+						f"ward={_hc.ward_residual:.3e}; "
+						f"hermiticity={_hc.hermiticity_residual:.3e}; "
+						"dyson_forward_bound="
+						f"{_hc.max_dyson_forward_error_bound:.3e}; "
+						f"cubature_orders={_hc.cubature_receipt.orders}")
 				if _hc is not None:
 					report.progress(
 						"Photon WS cert : "
@@ -893,8 +960,10 @@ def main(argv=None):
 						f"nodes={_hc.observed_physical_counts}; "
 						f"final_error_ratio="
 						f"{_hc.mixed_convergence_error_ratios[-1]:.3e}; "
-						f"max_dyson_backward_residual="
-						f"{_hc.max_backward_residual:.3e}")
+						+ ("no packed Dyson solve"
+						 if _hc.max_backward_residual is None else
+						 f"max_dyson_backward_residual="
+						 f"{_hc.max_backward_residual:.3e}"))
 			else:
 				W_by_role = compute_screening_model(
 					mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
@@ -1152,6 +1221,9 @@ def main(argv=None):
 				band_slices=band_slices, input_dir=input_dir,
 				tensors_filename=tensors_filename,
 				enk_dft=enk_dft, material_class=material_class,
+				wfns_transverse=(
+					wfns_transverse if photon_response is not None else None),
+				photon_response=photon_response,
 				print_fn=print0, record_fn=report.progress)
 		sigma_result = sc_result.sigma_result_dft
 		sigma_total = sc_result.sigma_total_dft
