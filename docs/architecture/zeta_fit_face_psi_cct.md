@@ -437,8 +437,8 @@ becomes λ_max when C is small and the cut drops real modes.
 
 ### Σ on the parents and parents-only storage
 
-The same plan and carrier serve Σ (`gw.wavefunction_bundle.ParentSigmaRoute`,
-`sigma_face_kernel_kwargs`, `parent_sigma_operands`): G is contracted on the
+The same plan and carrier serve Σ (`sigma_face_kernel_kwargs` passes the
+existing `CentroidKUnfoldPlan`; `parent_sigma_operands` supplies the arrays): G is contracted on the
 parent faces (`build_G(..., k_unfold_plan=plan)`) and unfolded to full k in
 the run's order, the full-k Σ operator after the FFT convolution is selected
 on the parents' own full-k rows (`plan.parent_full_rows` =

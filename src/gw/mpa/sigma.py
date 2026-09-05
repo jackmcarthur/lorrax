@@ -264,7 +264,7 @@ def _integrate_sigma_batches(
         if not brackets:
             raise ValueError("MPA Sigma band-bracket plan must be nonempty")
     face_kwargs = sigma_face_kernel_kwargs(wfns)
-    parent_route = face_kwargs.get("parent_route")
+    k_unfold_plan = face_kwargs.get("k_unfold_plan")
     if wfns.layout == "legacy":
         # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
         # extent.  Identical on an unsplit deck.  UNVERIFIED on a split
@@ -294,7 +294,7 @@ def _integrate_sigma_batches(
         # runtime-owned carrier, and the accumulator is born at that carrier
         # width.  It stays there until a logical output consumer strips by
         # ``sigma_axis``; no nondivisible sharded array is ever published.
-        if parent_route is not None:
+        if k_unfold_plan is not None:
             # Raw parents only: the parent faces feed the G contraction (the
             # plan transports G to full k) and the projection (the spatial
             # tail selects, projects, broadcasts).  Bracket packing is not
@@ -409,12 +409,12 @@ def _integrate_sigma_batches(
                                 jnp.asarray(weight, jnp.float64),
                                 np.asarray(win.mask_A).shape))
             E_A_call = row.E_A
-            if parent_route is not None:
+            if k_unfold_plan is not None:
                 # The G contraction runs on the raw parents: its energy and
                 # selector tables are the parents' rows of the star-invariant
                 # full-k tables (one child per raw row, plan.parent_rows).
-                E_A_call = parent_route.plan.parent_rows(row.E_A)
-                selector = parent_route.plan.parent_rows(
+                E_A_call = k_unfold_plan.parent_rows(row.E_A)
+                selector = k_unfold_plan.parent_rows(
                     jnp.reshape(selector, np.shape(row.E_A)))
             if not sweep_started:
                 first_t = np.asarray(

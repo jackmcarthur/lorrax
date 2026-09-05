@@ -637,45 +637,13 @@ def green_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
     }
 
 
-@dataclass(frozen=True, eq=False)
-class ParentSigmaRoute:
-    """What a Σ kernel factory needs to work from raw parents only.
-
-    ``plan`` transports a parent-contracted Green function to full k
-    (``build_G(..., k_unfold_plan=plan)``); ``g_face_shape`` is the
-    ``(n_parent, nb_full, mu, ns)`` shape its GEMM plans are built for.
-    ``k_rows`` are the full-k rows that ARE the raw parents: after the
-    (full-k, layout-agnostic) FFT convolution the self-energy operator is
-    selected on them and projected onto the parents' bands with the same
-    parent faces.  The resulting band matrix is broadcast back to
-    full k by the typed band-index unfold of ``sym``
-    (``symmetry_maps.unfold_file_wedge_band_operator`` with the
-    ``transpose`` rule: Σ transforms like G, so its band matrix is
-    transposed, not conjugated, on time-reversed rows), so every
-    downstream consumer keeps its full-k
-    contract while no full-k wavefunction is ever read.  ``eq=False``:
-    identity-keyed, like the plan it wraps.
-    """
-
-    plan: object
-    k_rows: np.ndarray
-    sym: object
-    g_face_shape: tuple
-
-    @property
-    def n_parent(self) -> int:
-        return int(self.k_rows.shape[0])
-
-
 def sigma_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
-    """:func:`face_kernel_kwargs` plus ``parent_route`` when possible.
+    """:func:`face_kernel_kwargs` plus the carrier's ``k_unfold_plan``.
 
-    The route exists when the bundle carries a :class:`ParentGreenCarrier`
-    whose plan names the parents' full-k rows.  ``face_shape`` stays the
-    FULL-k shape: consumers still size
-    their full-k accumulators by it, and the parent extents travel on the
-    route.  Under ``layout='legacy'`` or without such a carrier this is
-    exactly :func:`face_kernel_kwargs`.
+    ``face_shape`` names the full-k accumulator. The existing plan owns the
+    parent count, parent rows and symmetry action used for both Green
+    contraction and band projection. Factories retain the plan as an identity
+    cache key; no per-call route copies its tables or shapes.
     """
     result = face_kernel_kwargs(wfns)
     carrier = wfns.green_parent
@@ -683,14 +651,7 @@ def sigma_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
             or getattr(carrier.plan, 'parent_full_rows', None) is None
             or getattr(carrier.plan, 'sym', None) is None):
         return result
-    plan = carrier.plan
-    n_parent, ns, mu, nb = (int(v) for v in carrier.psi_mun.shape)
-    result["parent_route"] = ParentSigmaRoute(
-        plan=plan,
-        k_rows=np.asarray(plan.parent_full_rows, dtype=np.int32),
-        sym=plan.sym,
-        g_face_shape=(n_parent, nb, mu, ns),
-    )
+    result["k_unfold_plan"] = carrier.plan
     return result
 
 

@@ -608,18 +608,17 @@ def _compute_invalid_static_sigma(
 
     Gij = build_Gij(meta, mesh_xy, occupation_state)
     face_kwargs = sigma_face_kernel_kwargs(wfns)
-    parent_route = face_kwargs.get("parent_route")
+    k_unfold_plan = face_kwargs.get("k_unfold_plan")
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
     g_plan = (_face_g_plan(
-                  mesh_xy, face_kwargs["face_shape"] if parent_route is None
-                  else parent_route.g_face_shape)
+                  mesh_xy, face_kwargs["face_shape"] if k_unfold_plan is None
+                  else (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
              if wfns.layout == "face" else None)
-    k_unfold_plan = None if parent_route is None else parent_route.plan
-    if parent_route is not None:
-        # Raw parents only: packed faces feed the G contraction, canonical
-        # faces the projection; the spatial tail selects and broadcasts.
+    if k_unfold_plan is not None:
+        # Raw parents only: the same faces feed G and band projection;
+        # the spatial tail selects and broadcasts.
         (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
         g_carrier = wfns.green_parent
     else:
@@ -736,18 +735,17 @@ def _invalid_static_coh_by_bracket(
     from .greens_function_kernel import build_G
 
     face_kwargs = sigma_face_kernel_kwargs(wfns)
-    parent_route = face_kwargs.get("parent_route")
+    k_unfold_plan = face_kwargs.get("k_unfold_plan")
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
     g_plan = (_face_g_plan(
-                  mesh_xy, face_kwargs["face_shape"] if parent_route is None
-                  else parent_route.g_face_shape)
+                  mesh_xy, face_kwargs["face_shape"] if k_unfold_plan is None
+                  else (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
              if wfns.layout == "face" else None)
-    k_unfold_plan = None if parent_route is None else parent_route.plan
-    if parent_route is not None:
-        # Raw parents only: packed faces feed the G contraction, canonical
-        # faces the projection; the spatial tail selects and broadcasts.
+    if k_unfold_plan is not None:
+        # Raw parents only: the same faces feed G and band projection;
+        # the spatial tail selects and broadcasts.
         (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
         g_carrier = wfns.green_parent
     else:

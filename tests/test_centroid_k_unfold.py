@@ -328,3 +328,61 @@ def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
     jax.block_until_ready((packed, packed2))
     assert packed.shape == (3, 1, n_pk, 1, n_pk)
     assert packed2.shape == (3, 1, n_pk, 1, n_pk)
+
+
+def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkeypatch):
+    """Stub numerical backends to isolate cache lifetime and row selection.
+
+    The independent projection parity test covers the physical action. Here
+    two equal-shaped production plans must reuse only their own kernel, and
+    the cache must keep its identity owner alive after the bundle is gone.
+    """
+    import gc
+    import weakref
+    from gw import ppm_tau_kernel as tau
+    from gw.wavefunction_bundle import sigma_face_kernel_kwargs
+
+    mesh = _mesh_2x2()
+    centroids = np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]])
+
+    def bundle(rows):
+        sym = _symmetry_fixture()
+        sym.kirr_fullids = np.asarray(rows, dtype=np.int32)
+        plan = build_centroid_k_unfold_plan(
+            sym, centroids, (2, 2, 1), mesh, nspinor=1)
+        return SimpleNamespace(
+            layout="face", psi_mun=np.zeros((3, 1, 4, 1)),
+            slices=SimpleNamespace(nb_full=1),
+            green_parent=SimpleNamespace(
+                plan=plan, psi_mun=np.zeros((2, 1, 4, 1)),
+                psi_nmu=np.zeros((2, 1, 1, 4))))
+
+    monkeypatch.setattr(tau, "_sigma_spatial_kernel_cache", {})
+    monkeypatch.setattr(tau, "_fft_ffi_fused_enabled", lambda: True)
+    monkeypatch.setattr(tau, "ensure_jax_compile_cache", lambda: None)
+    monkeypatch.setattr("common.fft_helpers.make_flat_k_gw_conv",
+                        lambda *a, **k: lambda g, w: g)
+    monkeypatch.setattr("common.contract_bands.contract_bands_block_reshard",
+                        lambda *a, **k: lambda left, operator, right: operator)
+    monkeypatch.setattr("symmetry_maps.unfold_file_wedge_band_operator",
+                        lambda sym, value, **k: value)
+
+    def factory(wfns):
+        return tau.get_sigma_spatial_kernel(
+            mesh_xy=mesh, kgrid=(3, 1, 1), merged_x=True,
+            **sigma_face_kernel_kwargs(wfns))
+
+    first = bundle([0, 2])
+    owner = weakref.ref(first.green_parent.plan)
+    kernel = factory(first)
+    assert factory(first) is kernel
+    del first
+    gc.collect()
+    assert owner() is not None
+
+    second = factory(bundle([1, 2]))
+    assert second is not kernel
+    np.testing.assert_array_equal(np.asarray(kernel.conv_project(
+        None, None, jnp.asarray([10., 20., 30.]), None)), [10., 30.])
+    np.testing.assert_array_equal(np.asarray(second.conv_project(
+        None, None, jnp.asarray([10., 20., 30.]), None)), [20., 30.])
