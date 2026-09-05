@@ -1,9 +1,6 @@
 """Refusal and phase-receipt contracts for centroid pruning."""
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 
 
 def test_distributed_gram_diagnostic_excludes_padding_and_always_executes():
@@ -43,8 +40,8 @@ def test_select_phase_receipts_name_lower_compile_and_execute(monkeypatch):
     lines = []
     monkeypatch.setattr(pc.jax, "block_until_ready", lambda value: value)
     monkeypatch.setattr(pc, "process_rank", lambda: 0)
-    got = pc._run_bounded_select(
-        _Step(), (17,), time_budget_s=2.0,
+    got = pc._run_select_with_progress(
+        _Step(), (17,),
         n_candidates=1028, n_groups=25, point_budget=800,
         print_fn=lines.append, start_progress=lambda: None)
     assert got == 17
@@ -56,44 +53,43 @@ def test_select_phase_receipts_name_lower_compile_and_execute(monkeypatch):
     assert "candidates=1028 groups=25 point_budget=800" in lines[0]
 
 
-def test_select_time_budget_refuses_with_the_stuck_phase():
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    code = r'''
-import time
-from centroid import pivoted_cholesky as pc
+def test_select_heartbeat_survives_skew_on_nonroot(monkeypatch):
+    import io
+    import time
+    from centroid import pivoted_cholesky as pc
 
-class Step:
-    def lower(self, *operands):
-        time.sleep(5.0)
+    stream = io.StringIO()
+    monkeypatch.setattr(pc, "_SELECT_HEARTBEAT_S", 0.01)
+    monkeypatch.setattr(pc, "process_rank", lambda: 3)
+    monkeypatch.setattr(pc, "failure_output_streams", lambda: (stream,))
+    monkeypatch.setattr(pc.jax, "block_until_ready", lambda value: value)
 
-pc.process_rank = lambda: 0
-pc._run_bounded_select(
-    Step(), (1,), time_budget_s=0.05,
-    n_candidates=1028, n_groups=25, point_budget=800,
-    print_fn=lambda text: print(text, flush=True),
-    start_progress=lambda: None)
-'''
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.path.join(root, "src") + os.pathsep + env.get(
-        "PYTHONPATH", "")
-    out = subprocess.run(
-        [sys.executable, "-c", code], env=env,
-        capture_output=True, text=True, timeout=5)
-    combined = out.stdout + out.stderr
-    assert out.returncode == 124, combined
-    assert "GATE centroid_select_time_budget" in combined
-    assert "phase=lowering" in combined
-    assert "candidates=1028 groups=25 point_budget=800" in combined
+    class Step:
+        def lower(self, *operands):
+            time.sleep(0.08)
+            return self
+
+        def compile(self):
+            return lambda value: value
+
+    got = pc._run_select_with_progress(
+        Step(), (17,), n_candidates=1028, n_groups=25, point_budget=800,
+        print_fn=lambda text: None, start_progress=lambda: None)
+    assert got == 17
+    text = stream.getvalue()
+    assert "rank=3 still working phase=lowering" in text
+    assert "elapsed_s=" in text
+    assert "candidates=1028 groups=25 point_budget=800" in text
+    time.sleep(0.03)
+    assert stream.getvalue() == text  # the reporter stopped with the selector
 
 
-def test_kmeans_cli_declares_a_finite_select_budget():
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.path.join(root, "src") + os.pathsep + env.get(
-        "PYTHONPATH", "")
+def test_kmeans_cli_has_no_process_local_budget():
+    import subprocess
+    import sys
+
     out = subprocess.run(
         [sys.executable, "-m", "centroid.kmeans_cli", "--help"],
-        env=env, capture_output=True, text=True, timeout=5)
+        capture_output=True, text=True, timeout=10)
     assert out.returncode == 0, out.stderr
-    assert "--prune-time-budget-seconds" in out.stdout
-    assert "default 900 s" in out.stdout
+    assert "--prune-time-budget-seconds" not in out.stdout

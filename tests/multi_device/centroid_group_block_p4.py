@@ -144,11 +144,11 @@ def main() -> None:
     # incident stopped before this selector because rank 0 alone evaluated a
     # distributed Gram diagnostic.  Exercise that asymmetric print policy,
     # then require a 1028-candidate / 25-group selection to finish under one
-    # finite lower+compile+execute budget and to report every admitted group.
+    # supervised step and to report every admitted group.
     from centroid.pivoted_cholesky import (
         _make_group_progress_reporter,
         _report_logical_gram_diagonal,
-        _run_bounded_select,
+        _run_select_with_progress,
     )
 
     production_sizes = np.asarray(
@@ -184,9 +184,9 @@ def main() -> None:
         tol_rel=1e-13, progress_fn=report_group)
     production_gid_dev = device_put_process_local(production_gid, row1)
     started = time.perf_counter()
-    production_got = _run_bounded_select(
+    production_got = _run_select_with_progress(
         production_step, (production_G, production_gid_dev, None),
-        time_budget_s=30.0, n_candidates=production_M,
+        n_candidates=production_M,
         n_groups=int(production_sizes.size),
         point_budget=production_budget, print_fn=rank0_log,
         start_progress=start_progress)

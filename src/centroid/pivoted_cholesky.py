@@ -87,6 +87,8 @@ from . import distribution as dist
 import symmetry_maps                                            # noqa: E402
 
 
+_SELECT_HEARTBEAT_S = 60.0
+
 _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
@@ -146,35 +148,27 @@ def _make_group_progress_reporter(
     return report, start
 
 
-def _run_bounded_select(
+def _run_select_with_progress(
     select_step,
     operands,
     *,
-    time_budget_s: float,
     n_candidates: int,
     n_groups: int,
     point_budget: int,
     print_fn,
     start_progress,
 ):
-    """Lower, compile, and execute one selector under one finite deadline.
+    """Lower, compile, and execute with phase receipts and 60-second heartbeats.
 
-    A Python exception cannot reliably interrupt a thread blocked in a PJRT
-    device invocation.  On expiry every rank therefore writes the same named
-    refusal and exits immediately, matching the distributed fail-fast rule:
-    attempting backend teardown after one rank leaves a collective is itself
-    an unbounded wait.
+    Arrival skew is normal in distributed work. Only the step supervisor may
+    enforce walltime: a process-local exit can strand peers in a collective.
     """
-    budget = float(time_budget_s)
-    if not math.isfinite(budget) or budget <= 0.0:
-        raise ValueError(
-            "--prune-time-budget-seconds must be finite and > 0; "
-            f"got {time_budget_s!r}")
     operands = tuple(operands)
     started = time.perf_counter()
     lock = threading.Lock()
     state = {"phase": "lowering", "phase_start": started, "done": False}
-    rank0 = process_rank() == 0
+    rank = process_rank()
+    stopped = threading.Event()
 
     def set_phase(phase: str) -> float:
         now = time.perf_counter()
@@ -186,38 +180,34 @@ def _run_bounded_select(
             f"elapsed_s={now - started:.3f}")
         return now
 
-    def expire() -> None:
-        now = time.perf_counter()
-        with lock:
-            if state["done"]:
-                return
-            phase = str(state["phase"])
-            phase_start = float(state["phase_start"])
-        message = (
-            "pivoted-Cholesky REFUSES [GATE centroid_select_time_budget]: "
-            f"--prune-time-budget-seconds got: {budget:g}; want: selector "
-            "lowering, compilation, and execution to complete within the "
-            "declared wall-time budget; why: continuing would leave all P "
-            "ranks in an unbounded lowering/device/collective wait. "
-            f"phase={phase} phase_wall_s={now - phase_start:.3f} "
-            f"elapsed_s={now - started:.3f} candidates={n_candidates} "
-            f"groups={n_groups} point_budget={point_budget}.\n")
-        if rank0:
+    def heartbeat() -> None:
+        while not stopped.wait(_SELECT_HEARTBEAT_S):
+            now = time.perf_counter()
+            with lock:
+                if state["done"]:
+                    return
+                phase = str(state["phase"])
+                phase_start = float(state["phase_start"])
+            # Do not use the caller's rank-0-only progress printer: a delayed
+            # non-root rank must be able to identify itself and its phase.
+            message = (
+                f"[centroid-select-heartbeat] rank={rank} still working "
+                f"phase={phase} phase_wall_s={now - phase_start:.3f} "
+                f"elapsed_s={now - started:.3f} candidates={n_candidates} "
+                f"groups={n_groups} point_budget={point_budget}\n")
             for stream in failure_output_streams():
                 try:
                     stream.write(message)
                     stream.flush()
                 except Exception:
                     pass
-        os._exit(124)
 
     print_fn(
         "[centroid-select] state=start "
         f"candidates={n_candidates} groups={n_groups} "
-        f"point_budget={point_budget} time_budget_s={budget:g}")
-    timer = threading.Timer(budget, expire)
-    timer.daemon = True
-    timer.start()
+        f"point_budget={point_budget} walltime_owner=step-supervisor")
+    reporter = threading.Thread(target=heartbeat, daemon=True)
+    reporter.start()
     try:
         phase_start = set_phase("lowering")
         lowered = select_step.lower(*operands)
@@ -245,7 +235,8 @@ def _run_bounded_select(
     finally:
         with lock:
             state["done"] = True
-        timer.cancel()
+        stopped.set()
+        reporter.join()
 
 
 @lru_cache(maxsize=None)
@@ -937,7 +928,6 @@ def prune_candidates_by_pivoted_cholesky(
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
     group_block: bool = False,
-    select_time_budget_s: float = 900.0,
     progress_print_fn=print,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
@@ -976,10 +966,9 @@ def prune_candidates_by_pivoted_cholesky(
     returns the largest greedy whole-orbit set no larger than the point budget;
     there is no partial last block for the host to repair.
 
-    ``select_time_budget_s`` is a finite wall budget spanning selector
-    lowering, compilation, and execution. ``progress_print_fn`` receives one
-    receipt per completely deflated group.  The Gram build has its own stage
-    timing and is outside this selector-specific deadline.
+    ``progress_print_fn`` receives phase receipts and one receipt per completely
+    deflated group. Each rank reports its active phase every 60 seconds; the
+    step supervisor owns walltime across all ranks.
 
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
@@ -1164,9 +1153,8 @@ def prune_candidates_by_pivoted_cholesky(
                 mesh_axis=select_axis, tol_rel=tol_rel,
                 progress_fn=progress_fn)
             (piv, L, rank, d_final, d_taken, trR_over_trG,
-             psd_info) = _run_bounded_select(
+             psd_info) = _run_select_with_progress(
                  select_step, (G, group_id_jax, active_init),
-                 time_budget_s=select_time_budget_s,
                  n_candidates=M, n_groups=n_groups, point_budget=budget,
                  print_fn=progress_print_fn or (lambda _message: None),
                  start_progress=start_progress)

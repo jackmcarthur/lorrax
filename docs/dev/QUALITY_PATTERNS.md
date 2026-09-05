@@ -78,6 +78,8 @@ promise its handler runs"). And numerical contracts need STRICT tests:
 eigenpair residuals, not eigenvalue agreement; orthonormality alone certified
 garbage.
 
+**No process-local deadline inside a collective region: heartbeats name the missing party or active rank and phase; the step supervisor owns whole-step walltime.**
+
 ## 7. The rc=0 class — success codes are not evidence
 The −136 eV gap ran to completion "successfully"; a NaN-producing solver bug
 exited 0; a half-written ζ was indistinguishable from a complete one; P ranks
