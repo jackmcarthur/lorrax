@@ -67,4 +67,3 @@ Three refusal classes remain and are not pad opportunities:
 `tests/test_padding_owner_static.py` is the executable register. It rejects a
 second round-up spelling, mesh-divisor modulo, or mesh-divisibility refusal
 outside the owner unless the exact topology/physics exception above is named.
-
