@@ -56,14 +56,21 @@ chunk and real-space chunk divisibility refusals are likewise producer pads.
 The former W/Dyson equal-shape check now authenticates the canonical product
 carrier rather than accepting a merely equal, noncanonical pair.
 
-Three refusal classes remain and are not pad opportunities:
+Four refusal classes remain and are not pad opportunities:
 
 - the runtime and BSE ring require a supported square process topology;
 - the transverse indefinite LU must solve at the logical extent, so it selects
   a rank-truncated distributed route when that logical extent cannot shard;
+- distributed-linear-algebra and symmetry providers authenticate that an
+  already-produced carrier satisfies their collective layout; they do not
+  choose a new physical carrier extent;
 - cyclic ring and `ppermute` modulo expressions select neighbour ranks, not
   carrier extents.
 
 `tests/test_padding_owner_static.py` is the executable register. It rejects a
 second round-up spelling, mesh-divisor modulo, or mesh-divisibility refusal
-outside the owner unless the exact topology/physics exception above is named.
+outside the owner unless the exact topology/physics/provider exception above
+is named with its reason and follow-up. It scans both `src/` and service source.
+The register also exposes one concurrent-lane defect rather than accepting it:
+LXDOCTOR still tests the logical Sigma window against the mesh and must retire
+that diagnostic on its owning lane; runtime physics no longer makes that test.

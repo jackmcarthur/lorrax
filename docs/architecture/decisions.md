@@ -26,9 +26,13 @@ consumers strip by receipt. Thus 86 physical bands on a 4×4 mesh use an
 88-band carrier with two exact-zero rows and columns. ζ band tails, centroid
 families, q batches, and band/r chunks follow the same producer/consumer rule.
 
-The only remaining divisibility refusals concern unsupported process topology
-or a solve for which padding is not inert. A static source census names those
-exceptions and rejects every new local arithmetic/refusal site.
+The only remaining physics refusals concern unsupported process topology or a
+solve for which padding is not inert. Distributed and symmetry services may
+authenticate an already-produced carrier at their provider boundary, but may
+not plan its extent. A static census covers `src/` and service source, names
+every exception with a disposition, and rejects every new local arithmetic or
+refusal site. Its registered LXDOCTOR logical-window diagnostic is an
+outstanding concurrent-lane defect to retire, not an accepted runtime rule.
 
 This supersedes the incomplete 2026-08-22 helper ruling and the 2026-08-06
 decision declining a common band-padding owner. Licenses deleting:
