@@ -109,7 +109,8 @@ from .minimax_screening import build_static_quadrature
 from .screening import (
 	compute_screening_model, driver_persists_w0, screening_requests_for)
 from .sigma_dispatch import compute_sigma_xc
-from .qsgw_utils import extract_sigma_diag_replicated, solve_qp
+from .qsgw_utils import solve_qp
+from .dynamic_sigma import extract_sigma_diag_logical
 from .degen_average import (
 	average_sigma_components,
 	average_within_degenerate_sets,
@@ -1325,8 +1326,9 @@ def main(argv=None):
 	# Σ_c diagonal on the ω-grid: feed the eqp1.dat writer's central-diff
 	# Z-factor.  Pulled from the on-device sharded tensor when available.
 	if sigma_c_omega is not None:
-		sigma_c_omega_diag_ev = np.asarray(extract_sigma_diag_replicated(
-			sigma_c_omega, mesh_xy)) * RYD_TO_EV
+		sigma_c_omega_diag_ev = extract_sigma_diag_logical(
+			sigma_c_omega, mesh_xy,
+			band_axis=sigma_result.sigma_band_axis) * RYD_TO_EV
 		if not config.no_degen_averaging:
 			# Output-only diagonal curve.  The full persisted operator stays raw,
 			# while this curve uses the SAME canonical group owner at every omega;

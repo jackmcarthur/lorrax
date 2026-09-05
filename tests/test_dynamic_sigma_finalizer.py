@@ -9,6 +9,24 @@ import pytest
 from jax.sharding import Mesh
 
 
+def test_output_diagonal_strips_the_tagged_sigma_band_carrier():
+    from gw.dynamic_sigma import extract_sigma_diag_logical
+    from runtime.padding import PaddedAxis
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    sigma = np.zeros((2, 1, 4, 4), dtype=np.complex128)
+    diagonal = np.arange(8, dtype=np.float64).reshape(2, 1, 4)
+    idx = np.arange(4)
+    sigma[:, :, idx, idx] = diagonal
+
+    got = extract_sigma_diag_logical(
+        jnp.asarray(sigma), mesh,
+        band_axis=PaddedAxis("Sigma band window", 3, 4, 4))
+
+    np.testing.assert_array_equal(got, diagonal[..., :3])
+    assert got.shape == (2, 1, 3)
+
+
 def test_head_diagonal_is_added_once_and_only_on_the_diagonal():
     from gw.dynamic_sigma import add_head_sigma_diag
 

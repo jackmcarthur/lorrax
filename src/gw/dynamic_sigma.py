@@ -54,6 +54,38 @@ class OmegaCoverage:
                 f"out_of_range_policy={self.policy}")
 
 
+def extract_sigma_diag_logical(
+    sigma_c_omega: jax.Array,
+    mesh_xy,
+    *,
+    band_axis=None,
+) -> np.ndarray:
+    """Replicate the Sigma_c(omega) diagonal and restore its logical bands.
+
+    Parameters
+    ----------
+    sigma_c_omega
+        Correlation self-energy with shape
+        (n_omega, nk, nb_carrier, nb_carrier).
+    mesh_xy
+        Process mesh owning the two carrier band faces.
+    band_axis : runtime.padding.PaddedAxis or None
+        Logical/carrier receipt published by the Sigma producer.
+
+    Returns
+    -------
+    np.ndarray
+        Replicated diagonal with shape (n_omega, nk, nb_logical).
+    """
+    from .qsgw_utils import extract_sigma_diag_replicated
+    diagonal = np.asarray(
+        extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
+    if band_axis is not None:
+        from runtime.padding import strip_axis
+        diagonal = np.asarray(strip_axis(diagonal, band_axis, axis=-1))
+    return diagonal
+
+
 def add_head_sigma_diag(
     sigma_c_body_omega: jax.Array,
     head_sigma_diag_w_kn_ry: np.ndarray | None,
@@ -159,14 +191,10 @@ def eval_sigma_c_at_dft_energies(
         f"({provenance}; VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
-    from .qsgw_utils import (extract_sigma_diag_replicated,
-                             interp_along_omega, omega_coverage,
+    from .qsgw_utils import (interp_along_omega, omega_coverage,
                              resolve_out_of_range_policy)
-    sig_c_diag = np.asarray(
-        extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
-    if band_axis is not None:
-        from runtime.padding import strip_axis
-        sig_c_diag = np.asarray(strip_axis(sig_c_diag, band_axis, axis=-1))
+    sig_c_diag = extract_sigma_diag_logical(
+        sigma_c_omega, mesh_xy, band_axis=band_axis)
     sig_c_diag = sig_c_diag * RYD_TO_EV
     grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
     # THE OUTPUT PATH, so the policy is named and the count is REPORTED.
