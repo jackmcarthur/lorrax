@@ -7,10 +7,14 @@ or pole store is accepted by this module.  The route is deliberately an
 O(N^4) oracle and is not eligible to become the production frequency model.
 
 The large objects retain their natural two-dimensional mesh layout.  In
-particular chi and W are ``P(None, 'x', 'y')``.  The contour contraction is
-weighted before its mesh psum, so its replicated result is one scalar per
-external target; neither an N_mu by N_mu matrix nor the target-q-band
-spectral history is materialized on a process.
+particular chi and W are ``P(None, 'x', 'y')``.  The incumbent diagonal
+contour contraction is weighted before its mesh psum, so its replicated
+result is one scalar per external target.  The selected-block seam below
+instead builds one bounded external-frequency tile of the weighted centroid
+operator and routes its band projection through
+``common.contract_bands.contract_bands_block_reshard``.  That shared owner
+reduce-scatters the square result directly to ``P(None, None, 'x', 'y')``;
+the block route must never replace it with a replicated projection.
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ from .gw_config import INTERNAL_FF_CD_RESPONSE_WIDTH_EV
 
 PAIR_TILE = 4
 TARGET_TILE = 4
+INTERMEDIATE_BAND_TILE = 4
+EXTERNAL_FREQUENCY_TILE = 4
 FREQUENCY_BATCH = 4
 IMAG_ORIGIN_LIMIT_EV = 1.0e-10
 CENTER_SHIFT_EV = 1.0e-10
@@ -324,6 +330,226 @@ def make_weighted_contract_kernel(mesh: Mesh, *, n_targets: int,
         return mapped(
             psi_xn, psi_yn, wc, target_k, target_b, kmq,
             coeff.reshape(coeff.shape[0], coeff.shape[1] * coeff.shape[2]))
+
+    return apply
+
+
+# Descriptor fields shared by the host quadrature planner and the device
+# weighted-operator builder.  A fixed-width numeric row is intentional: one
+# compiled block kernel serves real fine/coarse and imaginary fine/coarse/tail
+# rules without a Python callback or a second contraction pathway.
+_RULE_KIND = 0
+_RULE_LEFT = 1
+_RULE_CENTER = 2
+_RULE_RIGHT = 3
+_RULE_PANEL_START = 4
+_RULE_PANEL_END = 5
+_RULE_HAS_LEFT = 6
+_RULE_HAS_RIGHT = 7
+_RULE_SIZE = 8
+_RULE_REAL = 0
+_RULE_IMAGINARY = 1
+
+
+def _real_node_descriptor(grid: np.ndarray, iw: int) -> np.ndarray:
+    """Return the device rule for one piecewise-linear real-axis node."""
+    grid = np.asarray(grid, dtype=np.float64)
+    iw = int(iw)
+    if grid.ndim != 1 or grid.size < 2 or np.any(np.diff(grid) <= 0.0):
+        raise ValueError("real contour grid must be strictly increasing")
+    if not 0 <= iw < grid.size:
+        raise IndexError(f"real contour node {iw} outside [0,{grid.size})")
+    row = np.zeros(_RULE_SIZE, dtype=np.float64)
+    row[_RULE_KIND] = _RULE_REAL
+    row[_RULE_CENTER] = grid[iw]
+    row[_RULE_LEFT] = grid[iw - 1] if iw else grid[iw]
+    row[_RULE_RIGHT] = grid[iw + 1] if iw + 1 < grid.size else grid[iw]
+    row[_RULE_HAS_LEFT] = float(iw > 0)
+    row[_RULE_HAS_RIGHT] = float(iw + 1 < grid.size)
+    return row
+
+
+def _imaginary_node_descriptor(grid: np.ndarray, iw: int) -> np.ndarray:
+    """Return the exact incumbent atan-panel rule for one imaginary node."""
+    grid = np.asarray(grid, dtype=np.float64)
+    iw = int(iw)
+    if grid.ndim != 1 or grid.size < 2 or np.any(np.diff(grid) <= 0.0):
+        raise ValueError("imaginary contour grid must be strictly increasing")
+    if not 0 <= iw < grid.size:
+        raise IndexError(f"imaginary contour node {iw} outside [0,{grid.size})")
+    starts, ends = _panel_bounds(grid)
+    row = np.zeros(_RULE_SIZE, dtype=np.float64)
+    row[_RULE_KIND] = _RULE_IMAGINARY
+    row[_RULE_PANEL_START] = starts[iw]
+    row[_RULE_PANEL_END] = ends[iw]
+    return row
+
+
+def _device_contour_weight(rule, x_signed, occupations):
+    """Evaluate one contour basis function on a bounded state tile."""
+    x_abs = jnp.abs(x_signed)
+
+    def real_weight(_):
+        left = rule[_RULE_LEFT]
+        center = rule[_RULE_CENTER]
+        right = rule[_RULE_RIGHT]
+        has_left = rule[_RULE_HAS_LEFT] > 0.5
+        has_right = rule[_RULE_HAS_RIGHT] > 0.5
+        left_den = jnp.where(has_left, center - left, 1.0)
+        right_den = jnp.where(has_right, right - center, 1.0)
+        left_arm = jnp.where(
+            has_left & (x_abs >= left) & (x_abs <= center),
+            (x_abs - left) / left_den, 0.0)
+        right_arm = jnp.where(
+            has_right & (x_abs >= center) & (x_abs <= right),
+            (right - x_abs) / right_den, 0.0)
+        hat = jnp.maximum(left_arm, right_arm)
+        residue_sign = jnp.where(
+            x_signed >= 0.0, -(1.0 - occupations), occupations)
+        return residue_sign * hat
+
+    def imaginary_weight(_):
+        return (
+            jnp.arctan(rule[_RULE_PANEL_END] / x_signed)
+            - jnp.arctan(rule[_RULE_PANEL_START] / x_signed)
+        ) / jnp.pi
+
+    return jax.lax.cond(
+        jnp.asarray(rule[_RULE_KIND], jnp.int32) == _RULE_REAL,
+        real_weight, imaginary_weight, operand=None)
+
+
+def _make_weighted_block_operator_kernel(
+        mesh: Mesh, *, n_target_k: int, inner_stop: int,
+        omega_tile: int = EXTERNAL_FREQUENCY_TILE,
+        inner_tile: int = INTERMEDIATE_BAND_TILE):
+    """Build one weighted centroid-operator tile for selected-k blocks.
+
+    For one already-resident full-q ``Wc(z_j)`` this forms
+
+    ``O[e,k,s,mu,s',nu] = sum_q,l c_j(e,k,q,l) psi_l psi_l^* Wc_j``.
+
+    The external-frequency extent is a fixed small tile and the intermediate
+    band sum is a ``lax.scan`` over ``inner_tile`` states.  The result retains
+    ``P(None,None,None,'x',None,'y')``; its only intended consumer is the
+    canonical band projector.  No chi, Dyson, q-star, or symmetry logic lives
+    here.
+    """
+    from common.shard_map import shard_map
+    from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
+
+    n_target_k = int(n_target_k)
+    inner_stop = int(inner_stop)
+    omega_tile = int(omega_tile)
+    inner_tile = int(inner_tile)
+    if min(n_target_k, inner_stop, omega_tile, inner_tile) <= 0:
+        raise ValueError(
+            "weighted block operator extents and tiles must be positive")
+    inner_pad = ((inner_stop + inner_tile - 1) // inner_tile) * inner_tile
+    n_inner_tiles = inner_pad // inner_tile
+
+    def local(psi_xn, psi_yn, wc, kmq, energies_ev, occupations,
+              omega_abs_ev, omega_valid, rule):
+        nb = int(psi_xn.shape[-1])
+        if inner_stop > nb:
+            raise ValueError(
+                f"weighted block inner_stop={inner_stop} exceeds "
+                f"wavefunction carrier {nb}")
+        band_pad = inner_pad - nb
+        if band_pad > 0:
+            psi_x = jnp.pad(psi_xn, ((0, 0), (0, 0), (0, 0),
+                                     (0, band_pad)))
+            psi_y = jnp.pad(psi_yn, ((0, 0), (0, 0), (0, 0),
+                                     (0, band_pad)))
+            energy = jnp.pad(energies_ev, ((0, 0), (0, band_pad)))
+            occ = jnp.pad(occupations, ((0, 0), (0, band_pad)))
+        else:
+            psi_x, psi_y = psi_xn, psi_yn
+            energy, occ = energies_ev, occupations
+
+        nspin = int(psi_x.shape[1])
+        nmu_x, nmu_y = int(psi_x.shape[2]), int(psi_y.shape[2])
+        nq = int(wc.shape[0])
+        zero = jnp.zeros(
+            (omega_tile, n_target_k, nspin, nmu_x, nspin, nmu_y),
+            dtype=jnp.complex128)
+
+        def add_state_tile(accumulator, flat_index):
+            iq = flat_index // n_inner_tiles
+            il = (flat_index % n_inner_tiles) * inner_tile
+            i0 = jnp.asarray(0, dtype=il.dtype)
+            kmi = jax.lax.dynamic_index_in_dim(
+                kmq, iq, axis=1, keepdims=False)
+            px = jnp.take(psi_x, kmi, axis=0)
+            py = jnp.take(psi_y, kmi, axis=0)
+            px = jax.lax.dynamic_slice(
+                px, (i0, i0, i0, il),
+                (n_target_k, nspin, nmu_x, inner_tile))
+            py = jax.lax.dynamic_slice(
+                py, (i0, i0, i0, il),
+                (n_target_k, nspin, nmu_y, inner_tile))
+            ek = jnp.take(energy, kmi, axis=0)
+            fk = jnp.take(occ, kmi, axis=0)
+            ek = jax.lax.dynamic_slice(
+                ek, (i0, il), (n_target_k, inner_tile))
+            fk = jax.lax.dynamic_slice(
+                fk, (i0, il), (n_target_k, inner_tile))
+            x_signed = (
+                omega_abs_ev[:, None, None] - ek[None, :, :]
+                + CENTER_SHIFT_EV)
+            coeff = _device_contour_weight(rule, x_signed, fk[None, :, :])
+            logical_l = (
+                il + jnp.arange(inner_tile, dtype=jnp.int32) < inner_stop)
+            coeff = jnp.where(
+                omega_valid[:, None, None] & logical_l[None, None, :],
+                coeff, 0.0)
+            density = jnp.einsum(
+                "ksal,ktbl,ekl->eksatb", px, jnp.conj(py), coeff,
+                optimize=True)
+            wq = jax.lax.dynamic_index_in_dim(
+                wc, iq, axis=0, keepdims=False)
+            return accumulator + density * wq[None, None, None, :, None, :], None
+
+        result, _ = jax.lax.scan(
+            add_state_tile, zero,
+            jnp.arange(nq * n_inner_tiles, dtype=jnp.int32), unroll=1)
+        return result
+
+    return jax.jit(shard_map(
+        local, mesh=mesh,
+        in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None, "x", "y"),
+                  P(None, None), P(None, None), P(None, None), P(None),
+                  P(None), P(None)),
+        out_specs=P(None, None, None, "x", None, "y"),
+        check_vma=False))
+
+
+def _make_weighted_block_contract_kernel(
+        mesh: Mesh, *, n_target_k: int, inner_stop: int,
+        omega_tile: int = EXTERNAL_FREQUENCY_TILE,
+        inner_tile: int = INTERMEDIATE_BAND_TILE):
+    """Compose the one weighted-operator builder with the shared projector.
+
+    ``psi_left`` and ``psi_right`` are the already-selected, zero-padded
+    square Sigma target window.  The returned tile is
+    ``(omega_tile,k,m,n)`` at ``P(None,None,'x','y')``.  The two-stage
+    reduce-scatter and its divisibility checks remain owned solely by
+    :mod:`common.contract_bands`.
+    """
+    from common.contract_bands import contract_bands_block_reshard
+
+    build_operator = _make_weighted_block_operator_kernel(
+        mesh, n_target_k=n_target_k, inner_stop=inner_stop,
+        omega_tile=omega_tile, inner_tile=inner_tile)
+    project = contract_bands_block_reshard(mesh, extra="leading")
+
+    @jax.jit
+    def apply(psi_xn, psi_yn, psi_left, psi_right, wc, kmq,
+              energies_ev, occupations, omega_abs_ev, omega_valid, rule):
+        operator = build_operator(
+            psi_xn, psi_yn, wc, kmq, energies_ev, occupations,
+            omega_abs_ev, omega_valid, rule)
+        return project(psi_left, operator, psi_right)
 
     return apply
 
