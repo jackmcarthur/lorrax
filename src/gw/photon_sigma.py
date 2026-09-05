@@ -6,8 +6,8 @@ screened four-current propagators ``V^{AB}``, ``W^{AB}`` (Lorentz ``A,B in
 {C, T1, T2, T3}``) as one packed, two-dimensionally sharded operator with
 its Gamma cell already completed.  :func:`compute_static_photon_sigma`
 streams the sixteen rectangular block views through the ordinary static
-COHSEX kernels with the Lorentz vertices folded into the wavefunction
-bundles, accumulating ``Sigma_X`` (bare), ``Sigma_SX`` and ``Sigma_COH``
+COHSEX kernels with Lorentz vertices applied to the Green operands,
+accumulating ``Sigma_X`` (bare), ``Sigma_SX`` and ``Sigma_COH``
 (screened) as one loop; ``Sigma^B`` (bare transverse exchange) is the TT
 part of ``Sigma_X`` here, not a separate term.  The physics kernels remain
 the existing owners:
@@ -167,16 +167,9 @@ def _require_packed_operator(name, packed, mesh_xy):
 
 def _make_photon_static_block_kernel(
     mesh_xy: Mesh, kgrid, nk_tot: int, wfns_left, wfns_right, *,
-    with_q0_diagnostic: bool,
+    with_q0_diagnostic: bool, vertex_pair=(0, 0),
 ):
-    """One block contraction, specialized only by endpoint carrier shapes.
-
-    The Lorentz matrices are folded into the two bundles outside this kernel
-    by :func:`gw.wavefunction_bundle.with_lorentz_vertices`; their channel
-    numbers therefore never become static kernel arguments.  ``term`` is a
-    dynamic selector so X, SX, and COH share one executable while executing
-    one Green/operator tile at a time.
-    """
+    """Contract X, SX or COH with vertices applied only to the Green operands."""
     from ffi import ffi_dial_key
 
     from .wavefunction_bundle import face_kernel_kwargs
@@ -185,7 +178,7 @@ def _make_photon_static_block_kernel(
     key = (id(mesh_xy), tuple(int(v) for v in kgrid), int(nk_tot),
            ffi_dial_key(), wfns_left.layout,
            endpoint.get("face_shape"), endpoint.get("right_face_shape"),
-           bool(with_q0_diagnostic))
+           bool(with_q0_diagnostic), tuple(vertex_pair))
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
 
@@ -215,103 +208,112 @@ def _make_photon_static_block_kernel(
     else:
         g_plan = None
 
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+
     @jax.jit
-    def contract_block(wfns_left, wfns_right, wfns_left_g, wfns_right_g,
-                       Gij, W_AB, V_AB, W_head_AB, V_head_AB, term):
-        s_left = wfns_left.slices
-        s_right = wfns_right.slices
-
-        if wfns_left.layout == "legacy":
-            def occupied(interactions):
-                interaction, head_interaction = interactions
-                G = build_G(
-                    wfns_left_g.xn(s_left.sigma),
-                    wfns_right_g.yr(s_right.sigma), Gij=Gij)
-                O = convolve(G, interaction, 1.0)
-                result = project(
-                    wfns_left.xr(s_left.sigma), O,
-                    wfns_right.yn(s_right.sigma))
-                if with_q0_diagnostic:
-                    O_head = convolve_q0(G, head_interaction, 1.0)
-                    head_result = project(
-                        wfns_left.xr(s_left.sigma), O_head,
-                        wfns_right.yn(s_right.sigma))
-                else:
-                    head_result = result
-                return result, head_result
-
-            def coh(_):
-                G = build_G(
-                    wfns_left_g.xn(s_left.sigma_sum),
-                    wfns_right_g.yr(s_right.sigma_sum))
-                O = convolve(G, W_AB - V_AB, -0.5)
-                result = project(
-                    wfns_left.xr(s_left.sigma), O,
-                    wfns_right.yn(s_right.sigma))
-                if with_q0_diagnostic:
-                    O_head = convolve_q0(
-                        G, W_head_AB - V_head_AB, -0.5)
-                    head_result = project(
-                        wfns_left.xr(s_left.sigma), O_head,
-                        wfns_right.yn(s_right.sigma))
-                else:
-                    head_result = result
-                return result, head_result
+    def contract_block(wfns_left, wfns_right, Gij, W_AB, V_AB,
+                       W_head_AB, V_head_AB, term):
+        s = wfns_left.slices
+        if wfns_left.layout == "face":
+            direct, conjugated = wfns_left.psi_mun, wfns_right.psi_nmu
+            bra, ket = wfns_left.psi_nmu, wfns_right.psi_mun
+            occ = _occ_diag_full(Gij, s.nb_sigma, s.nb_full)
+            ri = wfns_left.band_mask(s.sigma_sum).astype(jnp.complex128)
         else:
-            occ = _occ_diag_full(
-                Gij, s_left.nb_sigma, s_left.nb_full)
-            ri_mask = wfns_left.band_mask(
-                s_left.sigma_sum).astype(jnp.complex128)
+            direct, conjugated = wfns_left.psi_xn, wfns_right.psi_yr
+            bra, ket = wfns_left.xr(s.sigma), wfns_right.yn(s.sigma)
+        A, B = vertex_pair
+        if A:
+            direct = gamma_apply(direct, *gamma_perm_phase(A), axis=1)
+        if B:
+            conjugated = gamma_apply(conjugated, *gamma_perm_phase(B), axis=2)
 
-            def occupied(interactions):
-                interaction, head_interaction = interactions
-                G = build_G(
-                    wfns_left_g.psi_mun, wfns_right_g.psi_nmu,
-                    phases=occ, layout="face", gemm=g_plan)
-                O = convolve(G, interaction, 1.0)
-                result = project(
-                    wfns_left.psi_nmu, O, wfns_right.psi_mun)
-                if with_q0_diagnostic:
-                    O_head = convolve_q0(G, head_interaction, 1.0)
-                    head_result = project(
-                        wfns_left.psi_nmu, O_head, wfns_right.psi_mun)
-                else:
-                    head_result = result
-                return result, head_result
+        def green(is_coh):
+            if wfns_left.layout == "face":
+                phases = ri if is_coh else occ
+                return build_G(direct, conjugated, phases=phases,
+                               layout="face", gemm=g_plan)
+            bands = s.sigma_sum if is_coh else s.sigma
+            return build_G(direct[..., bands], conjugated[:, bands],
+                           Gij=None if is_coh else Gij)
 
-            def coh(_):
-                G = build_G(
-                    wfns_left_g.psi_mun, wfns_right_g.psi_nmu,
-                    phases=ri_mask, layout="face", gemm=g_plan)
-                O = convolve(G, W_AB - V_AB, -0.5)
-                result = project(
-                    wfns_left.psi_nmu, O, wfns_right.psi_mun)
-                if with_q0_diagnostic:
-                    O_head = convolve_q0(
-                        G, W_head_AB - V_head_AB, -0.5)
-                    head_result = project(
-                        wfns_left.psi_nmu, O_head, wfns_right.psi_mun)
-                else:
-                    head_result = result
-                return result, head_result
+        def evaluate(G, interaction, head_interaction, sign):
+            result = project(bra, convolve(G, interaction, sign), ket)
+            head = (project(bra, convolve_q0(G, head_interaction, sign), ket)
+                    if with_q0_diagnostic else result)
+            return result, head
 
-        def x_or_sx(_):
-            interactions = jax.lax.cond(
-                term == _TERM_X,
-                lambda __: (V_AB, V_head_AB),
-                lambda __: (W_AB, W_head_AB),
-                operand=None,
-            )
-            return occupied(interactions)
+        def coh(_):
+            return evaluate(green(True), W_AB - V_AB,
+                            W_head_AB - V_head_AB, -0.5)
 
-        result, head_result = jax.lax.cond(
-            term == _TERM_COH, coh, x_or_sx, operand=None)
-        if with_q0_diagnostic:
-            return result, head_result
-        return result
+        def occupied(_):
+            interaction, head = jax.lax.cond(
+                term == _TERM_X, lambda _: (V_AB, V_head_AB),
+                lambda _: (W_AB, W_head_AB), operand=None)
+            return evaluate(green(False), interaction, head, 1.0)
+
+        result, head = jax.lax.cond(
+            term == _TERM_COH, coh, occupied, operand=None)
+        return (result, head) if with_q0_diagnostic else result
 
     _photon_sigma_kernel_cache[key] = contract_block
     return contract_block
+
+
+def contract_lorentz_blocks(
+    blocks, *, carrier_C, carrier_T, plan_C, plan_T, term, mesh_xy,
+    meta, Gij, get_block, with_q0_diagnostic=False,
+    diagnostic_basis_rotation=None, print_fn=print, verbose=True,
+):
+    """Sum requested Lorentz blocks, synchronizing each tile before restoring the next."""
+    from .wavefunction_bundle import padded_centroid_extent
+
+    if plan_C is not None or plan_T is not None:
+        raise NotImplementedError("Lorentz parent contraction awaits the S3 unfold seam")
+    sig = [None, None, None]
+    sectors = [None, None, None]
+    head_diag = [[None] * 3 for _ in range(3)]
+    head_total = [None, None, None]
+    for A, B in blocks:
+        left = _bundle_for_channel(carrier_C, carrier_T, A)
+        right = _bundle_for_channel(carrier_C, carrier_T, B)
+        kernel = _make_photon_static_block_kernel(
+            mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
+            with_q0_diagnostic=with_q0_diagnostic, vertex_pair=(A, B))
+        V, W, V_head, W_head = get_block(A, B)
+        expected = (int(meta.nk_tot), padded_centroid_extent(left),
+                    padded_centroid_extent(right))
+        if V.shape != expected or W.shape != expected:
+            raise ValueError(f"photon block ({A},{B}): expected {expected}, "
+                             f"got V{V.shape} and W{W.shape}")
+        sector = _head_sector(A, B)
+        physical = None
+        for t in term:
+            result = kernel(left, right, Gij, W, V, W_head, V_head,
+                            jnp.asarray(t, dtype=jnp.int32))
+            value, head = result if with_q0_diagnostic else (result, None)
+            sig[t] = value if sig[t] is None else sig[t] + value
+            sig[t].block_until_ready()
+            if t in (_TERM_SX, _TERM_COH):
+                physical = value if physical is None else physical + value
+            if with_q0_diagnostic:
+                diagonal = _diagnostic_diagonal(
+                    _sigma_window_matrix(head, carrier_C),
+                    diagnostic_basis_rotation, mesh_xy)
+                previous = head_diag[t][sector]
+                head_diag[t][sector] = diagonal if previous is None else previous + diagonal
+                previous = head_total[t]
+                head_total[t] = diagonal if previous is None else previous + diagonal
+                head_diag[t][sector].block_until_ready()
+        if physical is not None:
+            previous = sectors[sector]
+            sectors[sector] = physical if previous is None else previous + physical
+            sectors[sector].block_until_ready()
+        del V, W, V_head, W_head, result, value, head, physical
+        if verbose and jax.process_index() == 0:
+            print_fn(f"  photon Sigma block ({A},{B}) complete")
+    return sig, sectors, head_diag, head_total
 
 
 def compute_static_photon_sigma(
@@ -395,117 +397,26 @@ def compute_static_photon_sigma(
                 f"input_basis={diagnostic_input_basis!r}, rotation="
                 f"{'set' if diagnostic_basis_rotation is not None else 'None'}")
 
-    sig_x = None
-    sig_sx = None
-    sig_coh = None
-    head_diag = [[None for _ in range(3)] for _ in range(3)]
-    head_total_diag = [None for _ in range(3)]
-    sigma_sector = [None for _ in range(3)]
+    def get_block(A, B):
+        V = photon_block_view(V_packed, photon_layout, A, B, mesh_xy)
+        W = photon_block_view(W_packed, photon_layout, A, B, mesh_xy)
+        if q0_factors is None:
+            return V, W, V, W
+        return (V, W, photon_q0_low_rank_block(
+            (q0_factors.bare_pair,), photon_layout, A, B, mesh_xy),
+            photon_q0_low_rank_block(
+                q0_factors.screened_pairs, photon_layout, A, B, mesh_xy))
 
-    from .wavefunction_bundle import (
-        padded_centroid_extent, with_lorentz_vertices)
-
-    for A in _CHANNELS:
-        left = _bundle_for_channel(wfns_charge, wfns_transverse, A)
-        left_g = with_lorentz_vertices(left, A, 0)
-        n_left = padded_centroid_extent(left)
-        for B in _CHANNELS:
-            if blocks == PHOTON_BLOCKS_CURRENT and A == 0 and B == 0:
-                # The dynamic packed route's charge channel is the scalar
-                # Sigma_x + Sigma_c(omega); the packed operator's CC block is
-                # its omega = 0 sample and is not summed a second time here.
-                continue
-            right = _bundle_for_channel(wfns_charge, wfns_transverse, B)
-            right_g = with_lorentz_vertices(right, 0, B)
-            n_right = padded_centroid_extent(right)
-            contract_block = _make_photon_static_block_kernel(
-                mesh_xy, meta.kgrid, int(meta.nk_tot), left, right,
-                with_q0_diagnostic=q0_factors is not None)
-            V_AB = photon_block_view(V_packed, photon_layout, A, B, mesh_xy)
-            W_AB = photon_block_view(W_packed, photon_layout, A, B, mesh_xy)
-            expected = (int(meta.nk_tot), n_left, n_right)
-            if tuple(V_AB.shape) != expected or tuple(W_AB.shape) != expected:
-                raise ValueError(
-                    f"photon block ({A},{B}) shape mismatch: expected padded "
-                    f"{expected} from its wavefunction endpoints, got "
-                    f"V{tuple(V_AB.shape)} and W{tuple(W_AB.shape)}.")
-
-            if q0_factors is not None:
-                V_head_AB = photon_q0_low_rank_block(
-                    (q0_factors.bare_pair,), photon_layout, A, B, mesh_xy)
-                W_head_AB = photon_q0_low_rank_block(
-                    q0_factors.screened_pairs, photon_layout, A, B, mesh_xy)
-            else:
-                # Closed-static false branch: these aliases are dead JIT
-                # operands and allocate no second body/block.
-                V_head_AB, W_head_AB = V_AB, W_AB
-
-            x_result = contract_block(
-                left, right, left_g, right_g, Gij, W_AB, V_AB,
-                W_head_AB, V_head_AB,
-                jnp.asarray(_TERM_X, dtype=jnp.int32))
-            if q0_factors is None:
-                x_AB, x_head_AB = x_result, None
-            else:
-                x_AB, x_head_AB = x_result
-            sig_x = x_AB if sig_x is None else sig_x + x_AB
-            sig_x.block_until_ready()
-            sx_result = contract_block(
-                left, right, left_g, right_g, Gij, W_AB, V_AB,
-                W_head_AB, V_head_AB,
-                jnp.asarray(_TERM_SX, dtype=jnp.int32))
-            if q0_factors is None:
-                sx_AB, sx_head_AB = sx_result, None
-            else:
-                sx_AB, sx_head_AB = sx_result
-            sig_sx = sx_AB if sig_sx is None else sig_sx + sx_AB
-            sig_sx.block_until_ready()
-            coh_result = contract_block(
-                left, right, left_g, right_g, Gij, W_AB, V_AB,
-                W_head_AB, V_head_AB,
-                jnp.asarray(_TERM_COH, dtype=jnp.int32))
-            if q0_factors is None:
-                coh_AB, coh_head_AB = coh_result, None
-            else:
-                coh_AB, coh_head_AB = coh_result
-            sig_coh = coh_AB if sig_coh is None else sig_coh + coh_AB
-
-            sector = _head_sector(A, B)
-            physical_AB = sx_AB + coh_AB
-            sector_previous = sigma_sector[sector]
-            sigma_sector[sector] = (
-                physical_AB if sector_previous is None
-                else sector_previous + physical_AB)
-            sigma_sector[sector].block_until_ready()
-
-            if q0_factors is not None:
-                # Batch the orthogonal X/SX/COH terms through one canonical
-                # diagonal rotation.  This is one half-rotation per Lorentz
-                # block, not three full dense U A U^dagger materialisations.
-                contributions = jnp.stack(
-                    (x_head_AB, sx_head_AB, coh_head_AB), axis=1)
-                contributions = _sigma_window_matrix(
-                    contributions, wfns_charge)
-                diagonal_tkn = jnp.moveaxis(_diagnostic_diagonal(
-                    contributions, diagnostic_basis_rotation, mesh_xy), 1, 0)
-                diagonal_tkn.block_until_ready()
-                for term in range(3):
-                    diagonal = diagonal_tkn[term]
-                    previous = head_diag[term][sector]
-                    head_diag[term][sector] = (
-                        diagonal if previous is None else previous + diagonal)
-                    total_previous = head_total_diag[term]
-                    head_total_diag[term] = (
-                        diagonal if total_previous is None
-                        else total_previous + diagonal)
-                    head_diag[term][sector].block_until_ready()
-
-            # Synchronize the small accumulator before advancing the block.
-            # This is the lifetime boundary that prevents two W/G body tiles
-            # from coexisting through asynchronous dispatch.
-            sig_coh.block_until_ready()
-            if verbose and jax.process_index() == 0:
-                print_fn(f"  packed photon COHSEX block ({A},{B}) complete")
+    selected = [(A, B) for A in _CHANNELS for B in _CHANNELS
+                if blocks != PHOTON_BLOCKS_CURRENT or (A, B) != (0, 0)]
+    sig, sigma_sector, head_diag, head_total_diag = contract_lorentz_blocks(
+        selected, carrier_C=wfns_charge, carrier_T=wfns_transverse,
+        plan_C=None, plan_T=None, term=(_TERM_X, _TERM_SX, _TERM_COH),
+        mesh_xy=mesh_xy, meta=meta, Gij=Gij, get_block=get_block,
+        with_q0_diagnostic=q0_factors is not None,
+        diagnostic_basis_rotation=diagnostic_basis_rotation,
+        print_fn=print_fn, verbose=verbose)
+    sig_x, sig_sx, sig_coh = sig
 
     from .cohsex_sigma import _replicate_band_sigma
     sig_x = _replicate_band_sigma(sig_x, mesh_xy)
