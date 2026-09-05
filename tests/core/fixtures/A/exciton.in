@@ -1,0 +1,20 @@
+[cohsex]
+restart = true
+centroids_file = centroids_frac_31_htransform.txt
+nval = 1
+ncond = 2
+number_bands = 7
+sys_dim = 3
+compute_mode = cohsex
+qp_solver = one_shot_dft
+linalg = local
+bispinor = false
+head_correction = off
+mc_average_vcoul_body = false
+screening_method = minimax
+wfn_file = WFN.h5
+
+K_POINTS {crystal_b}
+2
+  0.000000  0.000000  0.000000  1  # G
+  0.333333333333  0.000000000000  0.000000000000  1  # X

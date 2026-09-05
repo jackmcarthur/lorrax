@@ -1,0 +1,24 @@
+[cohsex]
+restart = false
+centroids_file = centroids_frac_21.txt
+nval = 2
+ncond = 3
+number_bands = 7
+sys_dim = 3
+compute_mode = cohsex
+qp_solver = one_shot_dft
+linalg = local
+bispinor = false
+head_correction = off
+mc_average_vcoul_body = false
+screening_method = minimax
+write_restart_tensors = true
+sigma_freq_debug_output = false
+fermi_reference = midgap
+wfn_file = WFN.h5
+kin_ion_file = kin_ion.h5
+sigma_diag_file = cohsex_sigma.dat
+eqp0_file = cohsex_eqp0.dat
+eqp1_file = cohsex_eqp1.dat
+report_file = cohsex.out
+sigma_omega_h5_file = cohsex_sigma.h5

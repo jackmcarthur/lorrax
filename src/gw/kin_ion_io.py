@@ -681,6 +681,13 @@ def build_valence_density_distributed(wfn, sym, meta, *,
                  max_bands_per_item=max_bands_per_item))
     mine = local_share(items)
     wk = 1.0 / float(nk)
+    # Even an idle rank must compile the process-local box/FFT kernels:
+    # compile agreement is world-wide. A zero-weight copy of the first
+    # uniform-width item joins those kernels without adding charge/current.
+    # The weight is a traced scalar, so this is the same program on all ranks.
+    if not mine and items:
+        mine = [items[0]]
+        wk = 0.0
     print_fn(f"    rho{' + signed J/c' if include_current else ''} sweep: "
              f"{len(items)} (k, band-chunk) items over "
              f"P={world} ranks; this rank has {len(mine)}"

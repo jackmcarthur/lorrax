@@ -69,7 +69,7 @@ def baseline():
 
 
 # ---------------------------------------------------------------------------
-# THE DEFAULT GATE vs THE CENSUS  (2026-08-09)
+# THE DEFAULT CORE vs THE FULL TIER  (2026-09-04)
 # ---------------------------------------------------------------------------
 # The same instrument, pointed at the second collection hook in this tree.
 # The risk is identical in shape and worse in consequence: the default gate
@@ -99,27 +99,26 @@ def test_the_default_gate_is_a_strict_subset_of_the_census(
         "did not fire, and every branch is paying the full price")
 
 
-def test_the_default_gate_is_the_si_smoke_plus_the_services(default_gate):
-    """The owner's sentence, as a measurement.
+def test_the_default_gate_is_exactly_core_plus_its_roster(
+        default_gate, baseline):
+    """Measure the fixed core selection by node ID, not only by count."""
+    from core import manifest
 
-    "run that Si test calculation (granted for all drivers that were
-     touched since last ran) and the tests for the services and have that
-     basically be it."
-
-    ``LX_GATE_DRIVERS=all`` pins the widest form of the default tier, so
-    this cell does not depend on what the branch happens to have touched.
-    """
-    import fast_gate
-
-    wide = _collect(census=False, env_extra={"LX_GATE_DRIVERS": "all"})
-    own = {n for n in wide if not _is_service(n)}
-    roster = fast_gate.smoke_node_ids(fast_gate.DRIVERS)
-    assert own == roster, (
-        "the default tier's non-service half is not the fast_gate roster.\n"
-        f"  only in the run:    {sorted(own - roster)}\n"
-        f"  only in the roster: {sorted(roster - own)}")
-    assert {n for n in wide if _is_service(n)}, (
-        "the default gate dropped the service suites, which are half of it")
+    core_paths = _collect("tests/core", census=False)
+    core_paths = {
+        nodeid for nodeid in core_paths
+        if "test_fixture_a_standalone_htransform_and_direct_tda_reference"
+        not in nodeid
+    }
+    roster = {
+        nodeid for nodeid in baseline
+        if manifest.matches(nodeid, manifest.CORE_NODES)
+    }
+    expected = core_paths | roster
+    assert default_gate == expected, (
+        "the default tier differs from tests/core plus CORE_NODES.\n"
+        f"  only in the run:    {sorted(default_gate - expected)}\n"
+        f"  only in the roster: {sorted(expected - default_gate)}")
 
 
 def _is_service(nodeid: str) -> bool:

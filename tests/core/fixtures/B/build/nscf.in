@@ -1,0 +1,40 @@
+&control
+   prefix = 'core_he'
+   pseudo_dir = './'
+   outdir = './'
+   calculation = 'nscf'
+   disk_io = 'low'
+/
+&system
+   ibrav = 0
+   nat = 1
+   ntyp = 1
+   ecutwfc = 15.0
+   ecutrho = 60.0
+   nbnd = 8
+   occupations = 'fixed'
+   assume_isolated = 'mt'
+/
+&electrons
+   electron_maxstep = 200
+   conv_thr = 1.0d-10
+   diago_thr_init = 1.0d-10
+   diagonalization = 'david'
+   diago_david_ndim = 4
+   diago_full_acc = .true.
+/
+
+ATOMIC_SPECIES
+   He 4.002602 'He.upf'
+
+CELL_PARAMETERS bohr
+   7.0 0.0 0.0
+   0.3 7.3 0.0
+   0.2 0.4 7.7
+
+ATOMIC_POSITIONS crystal
+   He 0.5000000000 0.5000000000 0.5000000000
+
+K_POINTS crystal
+1
+   0.0 0.0 0.0 1.0

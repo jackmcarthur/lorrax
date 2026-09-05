@@ -2694,10 +2694,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # hidden assert_equal; same rank-invariance argument, and here
             # each rank stages only its own nb²/(px·py) block).
             E_qp_ry = device_put_process_local(E_np, rep2)
+            from runtime.padding import pad_square, padded_axis
+            rotation_spec = _band_rotation_spec()
+            rotation_axis = padded_axis(
+                nb, inputs.mesh_xy, name="SC initial band rotation",
+                specs=((rotation_spec, 1), (rotation_spec, 2)))
             U_qp = device_put_process_local(
-                np.broadcast_to(
+                pad_square(np.broadcast_to(
                     np.eye(nb, dtype=np.complex128), H_np.shape),
-                NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
+                    rotation_axis, pad_diagonal=1.0),
+                NamedSharding(inputs.mesh_xy, rotation_spec))
+            # Match distributed_eigh_bands' logical return seam while
+            # preserving an exact identity in degenerate DFT subspaces.
+            U_qp = U_qp[:, :nb, :nb]
     if E_qp_ry is None:
         # TWO INDEPENDENT DECISIONS, and they used to be one condition.
         #
@@ -5751,8 +5760,14 @@ def run_sc_driver(
     # than a slow success — and plain ``jax.device_put`` of a host array
     # fires the hidden replica ``assert_equal`` all-gather.  ``_place``
     # routes each kind correctly; only the spec changed.
-    U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
-               _band_rotation_spec())
+    U = state_final.outputs.sigma_basis_U
+    # An eigh-stripped logical device rotation can have uneven band axes.
+    # Keep its existing placement until the Sigma receipt pads it below;
+    # the logical-only contractions constrain their temporaries inside jit.
+    if not (isinstance(U, jax.Array)
+            and sigma_result.sigma_band_axis is not None
+            and sigma_result.sigma_band_axis.pad > 0):
+        U = _place(U, mesh_xy, _band_rotation_spec())
     U_sigma = U
     if sigma_result.sigma_band_axis is not None:
         from runtime.padding import pad_square

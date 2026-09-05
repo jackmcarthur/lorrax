@@ -1,0 +1,44 @@
+{
+  "cold_build": {
+    "mean_field_seconds": 30.52218297199579
+  },
+  "files": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "MEAN_FIELD.json": "e91b95c89f953b10ff9fdcb773b5ab2e435b5835cd896043333de2fc1e9cc62e",
+    "WFN.h5": "a347c956bf3f19d71ba25a9fa8df268988457ed61c1687b5698c29b20f979305",
+    "build/nscf.in": "6adbcc3387cbd6b7ce39e1759080f9ae616592e9f42dd6dde7fa1db04df9afe2",
+    "build/pw2bgw.in": "7278f4f4e6ae711131415d5b9a0c0755f7fb23902624abd60d4d2fd68156d544",
+    "build/scf.in": "6dd1ee945615333cfa03a89c2379f9232fcd1a38aa817c000dd2df3f326194f6",
+    "centroids_frac_23_literal.txt": "cf712d099b7c7b314304825a3f9e5f28381ee2db6f431ac77bc8fc119ea860e8",
+    "centroids_frac_48.txt": "5b3e45dc9f9692617538b576ec1accb6fee59d7a399b62c73ffc0806fba986f9",
+    "data-file-schema.xml": "c7294dceb9485a4e2cc4e3fe77d359545300d6da4f67b675d43c97b2adb621fc",
+    "kmeans.out": "b033905483afd7ea12b7cc98b028a974b4ff48de0646e41e85a59addae73a488",
+    "kmeans_literal.out": "f35fb0b7e0e0abea4124bddc0b1565522afe73cf0f15b49d06c5c3346c6c8aa1"
+  },
+  "reference_source_commit": "298c89ac588300460f241191bff2e65d8a50b824",
+  "schema": "lorrax-core-fixture-v1",
+  "shape": {
+    "active_bands": 8,
+    "atoms": 2,
+    "centroids": 48,
+    "fft_grid": [
+      12,
+      12,
+      12
+    ],
+    "fractional_translation_operations": 24,
+    "full_k": 8,
+    "guard_bands": 0,
+    "kgrid": [
+      2,
+      2,
+      2
+    ],
+    "non_orbit_centroids": 23,
+    "spatial_operations": 48,
+    "spinor": 1,
+    "stored_k": 3,
+    "trs": true
+  },
+  "system": "A-cubic"
+}

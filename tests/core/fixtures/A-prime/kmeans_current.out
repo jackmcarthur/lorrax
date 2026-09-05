@@ -1,0 +1,58 @@
+==============================================================================
+LORRAX ISDF CENTROID SELECTION
+==============================================================================
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 4
+Accelerators   : 4 GPU devices (NVIDIA A100-SXM4-40GB, 1 per rank)
+Processor mesh : 2 x 2  (centroid selection)
+CPU allocation : 32 cores per rank
+Host threads   : OPENBLAS_NUM_THREADS=16 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : phdf5 reader
+Selection      : feature-weighted k-means on the real-space FFT grid
+
+CENTROID PROVENANCE
+-------------------
+LORRAX ISDF centroid coordinates (fractional crystal units)
+feature fit: left=(0, 3), right=(0, 7): sqrt(sum_k w_k sum_i,m,n |Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights
+source wavefunctions: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-prime-e9f9825cc44e557806680192fdd0185af41eaabc970507c51bb8b61233e0fc80/WFN.h5
+selection metric: sqrt(diag q=0 transverse Gram), left=(0, 3), right=(0, 7), unit band weights
+electrons: 3; occupied-band boundary: 3
+FFT grid: (15, 15, 15); k grid: (3, 3, 1); shift: (0.0, 0.0, 0.0)
+selection: weighted k-means; seed=42; rho_power=1; requested=21; candidates=32; written=21
+pruning: pivoted Cholesky; achieved numerical rank=21; pair-density windows left=(0, 3), right=(0, 7) (explicit feature pair)
+symmetry closure: orbit-aware; spatial operations=1
+coordinates: x y z snapped to FFT grid; 21 unique points
+intended channels: gamma^{1,2,3} (current) ISDF
+
+FILES
+-----
+Source WFN     : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-prime-e9f9825cc44e557806680192fdd0185af41eaabc970507c51bb8b61233e0fc80/WFN.h5
+Centroids      : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-prime-e9f9825cc44e557806680192fdd0185af41eaabc970507c51bb8b61233e0fc80/centroids_frac_21_current.txt
+Report         : /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-prime-e9f9825cc44e557806680192fdd0185af41eaabc970507c51bb8b61233e0fc80/kmeans_current.out
+
+TIMING (POST-STARTUP)
+---------------------
+Wavefunction setup [setup.wfn_io]       : 0.049 s
+Feature metric [setup.weight]           : 0.953 s
+Weighted k-means [kmeans]               : 2.913 s
+  Initialization [kmeans/init]          : 1.079 s
+  Lloyd iterations [kmeans/lloyd]       : 0.929 s
+  Final assignment [kmeans/assign_labels]: 0.456 s
+Orbit snap/unfold [snap_unfold]         : 0.001 s
+Lloyd-state release [release_before_prune]: 0.070 s
+Gram and selection [prune]              : 6.094 s
+  Gram build [prune/prune.gram]         : 4.304 s
+  Block selection [prune/prune.select]  : 1.595 s
+Other selection work                    : 0.287 s
+Selection wall : 10.366 s
+
+WARNINGS
+--------
+  RuntimeWarning: WFN two-component TRS check FAILED for WFN.h5: TIME-REVERSAL SYMMETRY IS BROKEN in the two-component DFT reference: an independent raw-pair/TRIM occupied-density residual 5.774e-01 exceeds 1.0e-06.
+LORRAX ISDF centroid selection completed.

@@ -1,0 +1,41 @@
+{
+  "cold_build": {
+    "mean_field_seconds": 56.0
+  },
+  "files": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "Li.upf": "3654e8a51fb6c60c124c97ea3a67a54c87a0e477e49effd65aa73a45288f48f9",
+    "MEAN_FIELD.json": "4eb762a29de2d27716f8c0803fa8b01cc199ba0fae1584e3baedf6d94493707a",
+    "WFN.h5": "d25271194e110be962cb01a9bdc8b2fbe6d89b68baaf4906d371f165745d1d26",
+    "build/nscf.in": "bcc6a87606bf98d4c1488c91c569cd9756fc6f324526384e25685a7b9813d640",
+    "build/pw2bgw.in": "c16bcee6a451cd07707235326196321ec8c8f3be1fea5623fd32ba9cb88016d1",
+    "build/scf.in": "86779e48782f9115e87c3ec95b10d4f8ff281e2f98e91e446cb29d8a53d4d563",
+    "centroids_frac_21_current.txt": "041b3cef2b97603e6e205d97480f7c0eedce53021b0225b480a1d70c0edbd63c",
+    "data-file-schema.xml": "df38ff17135abcc318ec5a367c2f2f592a52691862335dfa27606a68cc36781e",
+    "kmeans_current.out": "c6a0a8d2ec079fdf4289928838b341b6abf37ea8a5ffe1214d7eebabcff84e2b"
+  },
+  "reference_source_commit": "298c89ac588300460f241191bff2e65d8a50b824",
+  "schema": "lorrax-core-fixture-v1",
+  "shape": {
+    "active_bands": 7,
+    "atoms": 2,
+    "centroids": 21,
+    "fft_grid": [
+      15,
+      15,
+      15
+    ],
+    "full_k": 9,
+    "guard_bands": 0,
+    "kgrid": [
+      3,
+      3,
+      1
+    ],
+    "spatial_operations": 1,
+    "spinor": 2,
+    "stored_k": 9,
+    "trs": false
+  },
+  "system": "A-prime"
+}
