@@ -329,6 +329,60 @@ alive during STEP 6 are the persistent face carrier (already counted,
 `2·S/(Px·Py)`, shared with the post-fit bundle) and the bounded per-bc
 transients `_z_q_face` builds and frees each scan iteration.
 
+## Raw-parent contraction on orbit-closed real-grid tiles (2026-09-05)
+
+Both fit projectors are band sums that need every full-zone k only AFTER
+the sum: at a child `k = g·kbar` the pair projector is the typed symmetry
+image of the raw parent's,
+
+    D_k = U_g · [ exp(2πi kbar·(L_mu − L_r)) D_kbar(alpha_g(mu), alpha_g(r)) ] · U_g†,
+
+conjugated once more on antiunitary rows, with `D_k[a,mu,b,r] = sum_n w_n
+psi_{nka}(mu) psi*_{nkb}(r) = conj(P_k)`.  So when the deck runs the face
+carrier on a symmetry-reduced WFN with an orbit-closed centroid set, the
+fit contracts on the WFN's raw rows only (`gw.centroid_k_unfold.
+CentroidKUnfoldPlan`, the same plan the screening Green function uses) and
+transports the completed operator with the service's collective-free local
+gathers.  The full-k faces are not read by the fit at all; the parent faces
+are `n_parent/nk` of their size and the parent `PsiGStore`/ψ(r) cache the
+same fraction.
+
+The image permutes BOTH endpoints.  Centroids are orbit-packed so the
+`alpha_g` gather stays on one X owner.  A contiguous r slab is not closed
+under the group, so `_z_q_face_parent` streams orbit-closed **tiles**
+(`gw.centroid_k_unfold.RealGridOrbitTiles`: complete orbits, each whole on
+one Y owner, owner-local zero pads, one static width ≤ the planner's
+`chunk_r`, tables as runtime operands) and the r gather stays on one Y
+owner.  The kernel accumulates the open-spin parent projectors over the
+band chunks exactly as `_z_q_face` does (Y block through
+`to_rpoints_inner` at the tile slots, X block by the masked `psum('y')`),
+then per OUTPUT spin block `(a,b)` accumulates
+`sum_cd U[a,c]U*[b,d] · unfold_operator_local(D[c,:,d,:])`, conjugates,
+and runs the unchanged IFFT/product/FFT tail — one full-k block live at a
+time, the memory contract of the incumbent scalar-pair loop.  The Z_q tile
+leaves the kernel with centroids in packed order and r in slot order; the
+q-selected RHS is restored to canonical centroid order by one x exchange
+(`plan.restore_left_basis`) before the unchanged solve, and
+`accumulate_rchunk_to_gflat(r_indices=...)` scatters the slots into the
+G-flat box.  `_c_q_face_parent` is the square case: one planned GEMM per
+side on `n_parent` rows, `plan.unfold_operator`, conj, the `_c_q_face`
+tail, one canonical restore.
+
+Admission (`gw.gw_init.prepare_isdf_and_wavefunctions`): `low_mem_bands`,
+`bispinor = false`, one- or two-component spinors, `wfn.nkpts < nk_tot`,
+an orbit-closed centroid set whose packed extent bridges to the canonical
+carrier, and a fresh charge fit.  No deck key; a run announces
+`C_q on raw parents` / `Z_q on raw parents` with the tile census.  The
+charge vertex only: a current vertex needs the Cartesian action the plan
+does not own.  Parity gates: `tests/test_isdf_zq_parent_parity.py`
+(children generated from parents by the typed action, glide + k
+reduction + TR row + SU(2) mixing; parent Z_q on every tile and parent C_q
+equal the full-k face kernels at <1e-10) and
+`tests/test_parent_projector_unfold_oracle.py` (the transport against
+`WfnLoader`'s own ψ unfold on the in-tree Si WFN, 1.7e-15; the wrong
+phase sign, dropped antiunitary conjugation and identity spinor arms are
+O(1)).
+
 ## Current face-route boundaries
 
 `fit_zeta_to_h5(low_mem_bands=True)` refuses, by name, before any

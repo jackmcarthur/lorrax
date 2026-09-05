@@ -155,10 +155,11 @@ def _case_gflat() -> dict:
     permuted = _run(rch[..., sigma],
                     r_indices=(r0 + sigma).astype(np.int32))
 
-    # Pad slots: sentinel ``n_rtot`` with exactly-zero slab columns.
+    # Pad slots: DISTINCT out-of-range sentinels (the kernel promises unique
+    # indices) with exactly-zero slab columns.
     idx_pad = np.concatenate(
         [np.arange(r0, r0 + r_len, dtype=np.int32),
-         np.full(3, n_rtot, dtype=np.int32)])
+         n_rtot + np.arange(3, dtype=np.int32)])
     rch_pad = np.concatenate(
         [rch, np.zeros((n_q, n_rmu, 3), dtype=rch.dtype)], axis=-1)
     padded = _run(rch_pad, r_indices=idx_pad)

@@ -1549,8 +1549,8 @@ def accumulate_rchunk_to_gflat(
             (zero-pad) so the contrib they produce is zero — no
             contamination of ``acc``.
          b. Slab → FFT box via ``dynamic_update_slice_in_dim`` at
-            offset ``r0``, or, on the ``r_indices`` path, via a
-            ``.at[:, r_indices].set(..., mode='drop')`` scatter.
+            offset ``r0``, or, on the ``r_indices`` path, via a gather
+            through the inverse slot table (see the kernel body).
          c. Per-q Bloch phase, if ``qvec_frac`` given: separable
             ``exp(-2πi q · r)`` factors, pre-computed per q at trace
             time, gathered per row by ``q_row``.
@@ -1587,6 +1587,9 @@ def accumulate_rchunk_to_gflat(
         not contiguous in the flat r index.  Entries outside
         ``[0, nx·ny·nz)`` are pad slots; the scatter drops them and the
         phase lookup clips them.  Exactly one of ``r0`` / ``r_indices``.
+        The indices must be DISTINCT, pad sentinels included (the caller
+        gives each pad slot its own out-of-range value): the scatter is
+        lowered with ``unique_indices=True`` so no atomic path is needed.
     sphere_idx
         ``(n_q, ngkmax)`` int32 flat-FFT indices.  Every q has the
         same ``ngkmax`` axis length with potentially different index
@@ -1721,6 +1724,20 @@ def accumulate_rchunk_to_gflat(
                 rx_slab = r_idx_slab // ny_nz
                 ry_slab = (r_idx_slab // jnp.int32(nz)) % jnp.int32(ny)
                 rz_slab = r_idx_slab %  jnp.int32(nz)
+            if indexed:
+                # The slab-to-box placement as a GATHER, not a scatter: the
+                # inverse table ``box_from_slab[r]`` names the slab column
+                # holding grid cell ``r`` (or the appended zero column).  It
+                # is built once per call from the (r_len,) index table —
+                # every real index is distinct, and pad sentinels lie outside
+                # the box so the drop leaves their cells pointing at the
+                # zero column.  A scatter into the (cs, n_rtot) box was
+                # measured at 1.27 s per tile against 5 ms for the slab
+                # path (Si P4, 2026-09-05); this gather restores that class.
+                box_from_slab = jnp.full((n_rtot,), r_len_i, dtype=jnp.int32)
+                box_from_slab = box_from_slab.at[r_].set(
+                    jnp.arange(r_len_i, dtype=jnp.int32), mode='drop',
+                    unique_indices=True)
 
             def body(acc, i):
                 i0    = i * cs
@@ -1736,12 +1753,14 @@ def accumulate_rchunk_to_gflat(
                     phy_q = phy[q_row][:, ry_slab]
                     phz_q = phz[q_row][:, rz_slab]
                     sub = sub * phx_q * phy_q * phz_q
-                buf = jnp.zeros((cs, n_rtot), dtype=sub.dtype)
                 if indexed:
-                    # ``mode='drop'`` discards the pad slots, leaving those
-                    # box cells at the zeros they were initialised to.
-                    buf = buf.at[:, r_].set(sub, mode='drop')
+                    sub_pad = jnp.concatenate(
+                        [sub, jnp.zeros((cs, 1), dtype=sub.dtype)], axis=-1)
+                    # Every table entry lies in [0, r_len]: real cells name
+                    # their slab column, pads name the zero column.
+                    buf = jnp.take(sub_pad, box_from_slab, axis=-1)
                 else:
+                    buf = jnp.zeros((cs, n_rtot), dtype=sub.dtype)
                     buf = jax.lax.dynamic_update_slice_in_dim(
                         buf, sub, r_, axis=-1)
                 box = buf.reshape(cs, nx, ny, nz)
