@@ -759,8 +759,9 @@ def main(argv=None):
         # colA_z/colB_z: z-component band-resolved columns (summed over occ n,
         # BZ-weighted) — cumsum over the inner-m index gives m_z vs band ceiling
         # (the band-convergence curve) at any mu, in either mode.
-        _mode = args.method if args.method == "sternheimer" else (
-            "ibz" if args.ibz else "full")
+        _mode = ("dipole" if args.dipole else args.method
+                 if args.method == "sternheimer" else
+                 "ibz" if args.ibz else "full")
         np.savez_compressed(args.out, E=E, mu=mu, nocc=nocc, m_orb=m_orb,
                             m_spin_z=m_spin_z, mode=_mode,
                             colA_z=PA_band_z.sum(axis=0), colB_z=PB_band_z.sum(axis=0),

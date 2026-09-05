@@ -169,11 +169,9 @@ computed sign is reported, not assumed. The expected magnitude for CrI₃ is
 * **Nonlocal-velocity sign (definitive).** The sign of `dV_NL/dk` is fixed by a
   direct off-diagonal finite difference of `⟨m|V_NL(k)|n⟩` (ψ held fixed):
   the analytic `compute_vnl_velocity_cart` equals `+dV_NL/dk` to ratio +1.000.
-  Hence the physical velocity is **`v = p + vNL`** (the canonical surviving
-  `vnl_ops` convention). The dipole driver's `p − vNL` flip is a
-  BerkeleyGW-matching convention for optical matrix elements, *not* the
-  physical velocity, and must not be used here — it would flip the orbital
-  moment's sign (CrI₃: `+0.026` → `−0.081 μ_B`).
+  Hence the physical velocity is **`v = p + vNL`**. Current dipole stores use
+  this convention; orbital-magnetization reuse refuses legacy `p − vNL`
+  stores.
 * **Symmetry.** `m_x, m_y ≈ 0` for an out-of-plane ferromagnet.
 * **Spin moment.** `|m_spin| ≈ 6 μ_B` cross-checks the wavefunction/occupations
   and pins the reporting axis.

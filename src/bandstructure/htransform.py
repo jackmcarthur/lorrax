@@ -1878,6 +1878,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             log_fn=log_fn,
             progress_fn=progress_fn,
         )
+        orbital_magnetization["coarse_grid"] = list(kgrid)
 
     # ── Kpath-batch processing ───────────────────────────────────────────
     # fH_R stays SHARDED P(None, 'x', 'y'): the (rank, rank) face is split
@@ -2835,6 +2836,7 @@ def main(argv=None):
             nb_fit=result["nb_fit"],
         )
         if result["orbital_magnetization"] is not None:
+            result["orbital_magnetization"]["state_source"] = _energy_source
             orbital_path = _output_path(args.orbital_magnetization_out)
             with open(orbital_path, "x", encoding="utf8") as handle:
                 json.dump(result["orbital_magnetization"], handle,
