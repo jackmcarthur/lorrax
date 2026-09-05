@@ -71,7 +71,10 @@ _CARRY_KEYS = {
 # What a bare INPUT SCState is constructed with in the drivers: the read
 # set above plus head_surface_weight_kn, which rides along for carry
 # continuity (the map re-derives it at entry and never reads the carry).
-_STATE_INPUT_KEYS = _CARRY_KEYS | {"head_surface_weight_kn"}
+# ``frozen_scissor_fits`` is the map-0 affine tail law carried to every later
+# map input (a closure parameter fixed at map 0, not a Sigma result); the map
+# reads it through ``_frozen_scissor_fits`` only.
+_STATE_INPUT_KEYS = _CARRY_KEYS | {"head_surface_weight_kn", "frozen_scissor_fits"}
 
 
 def test_gw_iteration_map_reads_only_the_carry_and_the_counter():
