@@ -64,14 +64,14 @@ for the real one, which is exactly what the deleted shim was.
 | name | what it is |
 |---|---|
 | `WfnLoader(path, *, mesh=None, backend='auto', qe_schema=None)` | Open the WFN and check a 2c DFT reference before symmetry unfolding. `qe_schema=None` performs bounded WFN-anchored discovery at first `symmetry()`; an explicit schema must authenticate or the call refuses. |
-| `load(*, bands, k='full_bz', sharding=None, bispinor=False)` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. |
-| `nonlocal_velocity_lift` (attribute, default `None`) | The driver-attached `psp.vnl_ops.nonlocal_velocity_lift(setup)` callable that `bispinor_lift="velocity_1/2/3"` needs (channel a's projector-velocity ket for the per-channel velocity balance). The loader owns no projectors; a velocity request with no hook refuses by name (`GATE bispinor_velocity_lift_needs_projectors`). `gw_jax` and `psp.get_dipole_mtxels` attach it from the deck's pseudopotentials. |
+| `load(*, bands, k='full_bz', sharding=None, bispinor=False, bispinor_lift="raw")` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. `bispinor_lift` names the four-spinor carrier: `raw` (σ·p, the shipped lift), `isometric` (library only), or `velocity_1/2/3` (one current carrier per Cartesian channel; branch `feat/bispinor-velocity-lift-2026-09-04`). The family name `velocity` is not a carrier and is refused by the lift. |
+| `nonlocal_velocity_lift` (attribute, default `None`) | The driver-attached callable `f(psi_2, gvecs_int, kvecs_frac, ngk_valid, *, channel)` that `bispinor_lift="velocity_1/2/3"` needs: channel a's projector-velocity ket, `(n_k, nb, 2, ngkmax)`, Ry velocity units. The loader owns no projectors; a velocity request with no hook refuses by name (`GATE bispinor_velocity_lift_needs_projectors`). `gw_jax` and `centroid.kmeans_cli` attach `psp.vnl_ops.nonlocal_velocity_lift_from_pseudo_dir(...)` (which also carries `.provenance`), `psp.get_dipole_mtxels` attaches `psp.vnl_ops.nonlocal_velocity_lift(setup)`. |
 | `lift(psi_2, *, k, bispinor_lift, sharding=None)` | Lift an already loaded `(n_k, nb, 2, ngkmax)` two-spinor window (same `k` request) into any four-spinor carrier without re-reading WFN.h5; how a consumer that needs several carriers of one window (three velocity channels plus the σ·p charge carrier) pays one read. |
 | `spinorbit` (property) | QE's `<spinorbit>` from the authenticated schema bound at symmetry initialization, `None` when unbound. Read by `psp.vnl_ops.resolve_soc_mode`, so j-resolved/j-averaged projectors follow the DFT run's record instead of a multiplet measurement (which refuses as UNMEASURABLE on bulk Bi). |
-| `load_process_local(*, bands, k, bispinor=False)` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. |
+| `load_process_local(*, bands, k, bispinor=False, bispinor_lift="raw")` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. Same `bispinor_lift` selectors as `load`. |
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
 | `full_k_parent_groups(full_k=None)` | Stable O(nk) grouping of requested full-BZ rows by raw IBZ parent. |
-| `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False)` | Apply the canonical typed unitary/antiunitary action to one already-loaded raw parent row. Consumers can realize a star with one child workspace and no parent re-read. |
+| `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False, bispinor_lift="raw")` | Apply the canonical typed unitary/antiunitary action to one already-loaded raw parent row. Consumers can realize a star with one child workspace and no parent re-read. Same `bispinor_lift` selectors as `load`; a `velocity_a` lift is evaluated on the child's own G list and k. |
 | `full_k_box_index_one_dev(full_k)` | Build one child's replicated FFT gather index from the current parent G row; strict one-k streams avoid retained full-BZ G/index tables. |
 | `ibz_box_index_one_dev(parent)` | Build the matching FFT gather index for one raw WFN parent without creating a complete IBZ index table. |
 | `gvecs(k=...)` | `(n_k, ngkmax, 3)` int32, pad rows = the FFT-box **pad sentinel**, never zeros. |
@@ -118,7 +118,11 @@ for the real one, which is exactly what the deleted shim was.
   FFT indices are retained across those tiles, then released. A nonzero child
   phase is one separate device vector; zero translations skip it. No dense
   full-k phase, G-vector, or FFT-index table exists on this path. The
-  four-component lift derives child G on device from the same parent row.
+  four-component lift derives child G on device from the same parent row; a
+  `velocity_a` lift hands that child G list, the child's k and `ngk_valid` to
+  the attached `nonlocal_velocity_lift`, so the projector velocity is
+  evaluated in the child's own gauge, and the resulting ket is one extra
+  band-sharded operand of the lift kernel.
 * **Late mesh binding is narrow.** `adopt_mesh` switches only a
   multi-process, auto-picked, currently-eager loader; explicit requests
   are never overridden.

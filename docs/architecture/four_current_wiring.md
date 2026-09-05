@@ -18,6 +18,13 @@ disagree with this one, they win — this page owns the *wiring* only.
 > [theory page](../theory/four-current-head-corrections.md#four-current-phase-status).
 > Every source citation below was re-read at this tip: the line is a locator,
 > while the named function or gate is the durable owner.
+>
+> The spatial-current carrier, its Σ-velocity and the collapsed-axis
+> connection — [their own section](#current-carrier-wiring), the Stage 1 rows
+> for `bispinor_current_balance` / `pseudo_dir` / `sc_current_velocity_update`,
+> and the matching `gwjax.out` and refusal rows — are on branch
+> `feat/bispinor-velocity-lift-2026-09-04` at tip `4074ab3d` (2026-09-05),
+> **not on `main`**.
 
 ## The routes
 
@@ -231,6 +238,9 @@ object each key ends up on and who reads it.
 | `static_gauge_hall_file` | `""` — EMPTY (`:1503`) | `config.paths.static_gauge_hall_file` | P; optional. An UNNAMED file means `σ_H = 0`, announced. Every named path is authenticated by the loader; an absent one refuses there. The bare route accepts only an exact-zero artifact and refuses a nonzero Hall vector |
 | `linalg` | `local` | the parser-cached backend profile (including `config.backend.transverse_zeta_solve`) | both |
 | `transverse_zeta_rcond` | `1e-10` (`:1916`, validate `:5741-5745`) | `config.backend.transverse_zeta_rcond` (`:4774`) | both |
+| `bispinor_current_balance` (branch) | `kinetic` (`coerce_bispinor_current_lift` `:391`: `kinetic → "raw"`, `velocity → "velocity"`) | `config.bispinor_current_lift`, consumed only through `resolve_four_current_representation(current_lift=)` | both; [the carrier section](#current-carrier-wiring) |
+| `pseudo_dir` (branch) | `""` = the input directory (`file_io/paths.resolve_input_paths` leaves an empty path empty) | `config.paths.pseudo_dir`; read by `gw_jax` only under `bispinor_current_balance = velocity` | both |
+| `sc_current_velocity_update` (branch) | `auto` (`CURRENT_VELOCITY_UPDATES` `:4633`) | `config.sc.current_velocity_update`, resolved once by `sc_iteration.resolve_current_velocity_update` (`:2617`) | the dynamic packed SC class |
 
 The retired stage/backend keys refuse by name; implementation-specific
 overrides, where available, are debug-only CLI or `LORRAX_*` controls.
@@ -246,44 +256,19 @@ on the config** — its consumers call it locally (`gw_config.py:378`,
 `psp/get_dipole_mtxels.py:1093`), so grep for
 `resolve_four_current_representation`, not for a config attribute.
 
-**THREE branches (2026-09-04)**: non-bispinor (everything False),
-bispinor/kinetic (both lifts `raw`, `scalar_head_bispinor=True`) and
-bispinor/velocity (`current_lift="velocity"`, the FAMILY name;
-`current_lift_for(mu_L)` gives the per-channel carrier selector
+**THREE branches (2026-09-04, branch `feat/bispinor-velocity-lift-2026-09-04`)**:
+non-bispinor (everything False), bispinor/kinetic (both lifts `raw`,
+`scalar_head_bispinor=True`) and bispinor/velocity (`current_lift="velocity"`,
+the family name; `current_lift_for(mu_L)` gives the per-channel selector
 `velocity_1/2/3`; `spatial_current_representation=
-"velocity_kinetic_balance_per_channel_alpha_spatial_current_v1"`; charge
-side unchanged).  The two shipped `bispinor_gw` values ride the same
-carrier, so `model` is accepted and ignored; the one carrier dial is the
-deck's `bispinor_current_balance`, passed as `current_lift=` by every call
-site that owns a current-channel object (`gw_init` ×4, `sigma_dispatch`,
-`sc_iteration` ×2, `head_correction`, `file_io/kin_ion`,
-`psp/get_dipole_mtxels`).  The velocity lift needs `dV_NL/dk`: `gw_jax`
-builds the projector setup from `pseudo_dir` and attaches
-`psp.vnl_ops.nonlocal_velocity_lift(setup)` to `WfnLoader.nonlocal_velocity_lift`;
-the loader routes its own G table, k representatives, `ngk_valid` mask and the
-channel to it and hands the channel's ket `Σ_b σ^b (dV_SR/dk_b ψ_L) + σ^a
-(dV_SO/dk_a ψ_L)` to `lift_to_4spinor(representation="velocity_a")`, which adds
-`(α/4)` of it (Ry→Hartree ½) to the σ·p small component.  ONE CARRIER PER
-CHANNEL: `gw_init._transverse_wfn_data` samples the transverse centroids once
-per distinct lift (three loads under velocity, one under kinetic) and the
-σ^B-side bundles become a `gw.wavefunction_bundle.LorentzCarriers`, whose
-`channel(mu_L)` is the endpoint every block builder uses — `w_isdf`'s
-`families = (charge, T1, T2, T3)`, `photon_sigma._bundle_for_channel`,
-`sigma_x_bispinor` through `endpoint_bundles(left, right, i, j)` (G-direct and
-bra from carrier i, G-conjugated and ket from carrier j).  The transverse ζ of
-channel a is fit on carrier a; restart tensors store channels 2 and 3 as
-`psi_full_y_transverse_c2/_c3` (+`_mun`) beside the historical channel-1 names
-and stamp `transverse_carriers`/`transverse_lift_family`, and a run refuses a
-file written under the other family.  `WfnLoader.lift(psi_2, k=, bispinor_lift=)`
-lifts an already loaded two-spinor window into any carrier; the dipole
-producer's finite-q α vertex uses it for channel a's carrier at both endpoints.
-The static-gauge Hall producer is a different, exact construction of the same
-current (σ·p carrier plus the explicit ICL projector jet) and refuses a
-velocity carrier (`uniform_gauge_operator`), because the jet would then be
-counted twice.  Two places still share ONE carrier between ρ and the Dirac
-current — the exact Hartree (`sigma_dispatch` → `kin_ion_io.compute_hartree_matrix`)
-and the SC density rebuild (`sc_iteration`) — and keep the charge lift for
-both, announced with a printed notice. The two carrier-comparison branches went with their deck spellings.
+"velocity_kinetic_balance_per_channel_alpha_spatial_current_v1"`; charge side
+unchanged). The two shipped `bispinor_gw` values ride the same carrier, so
+`model` is accepted and ignored; the one carrier dial is the deck's
+`bispinor_current_balance`, passed as `current_lift=`. Everything that dial
+wires — the loader hook, the carriers and their endpoints, the restart
+datasets, the dipole producer, kmeans, the Σ-velocity seam and the
+collapsed-axis connection — is [its own section below](#current-carrier-wiring);
+the physics is [theory §7](../theory/four-current-head-corrections.md#current-carrier). The two carrier-comparison branches went with their deck spellings.
 It stays a resolver rather than collapsing into `bool(bispinor)` because the
 `charge_representation` / `spatial_current_representation` provenance stamps
 the `dipole.h5` / `kin_ion.h5` / ζ authenticators compare against need ONE
@@ -397,7 +382,7 @@ already held.
 | object | producer | shape | sharding |
 |---|---|---|---|
 | one no-pair block `χ^{IJ}_0` | `w_isdf.compute_no_pair_dirac_current_block` (`:1665`) | `(nq, μ_L, μ_R)` c128 | `P(None,'x','y')` |
-| the sixteen blocks (`screen_current = True` only) | `compute_experimental_no_pair_photon_chi0` (`:1788`); T1/T2/T3 share one transverse bundle | — | — |
+| the sixteen blocks (`screen_current = True` only) | `compute_experimental_no_pair_photon_chi0` (`:1788`); families `(charge, T1, T2, T3)` from `LorentzCarriers.channel` — one shared transverse bundle under `bispinor_current_balance = kinetic`, three carriers under `velocity` ([the carrier section](#current-carrier-wiring)) | — | — |
 | TT Ward subtraction | `_subtract_static_tt_contact` (`:1776`), applied inside the sixteen-block builder | `Π(q) − Π(0)` | in place, buffer donated |
 | packed `V`, `χ_0`, `W` | `photon_layout.pack_photon_operator` (`:219`), `w_isdf.solve_w` (`:1431`) | `(nq, N_packed, N_packed)` c128 | `P(None,'x','y')` |
 
@@ -641,6 +626,170 @@ their historical columns byte-for-byte.
 | `packed photon COHSEX block (A,B) complete` ×16 | `photon_sigma.py:508` | the packed Σ ran — and there will be no `Σ^B tile` lines |
 | `rho + signed J/c sweep` | `kin_ion_io.py:689` | the transverse Hartree ran |
 | the `V_H` matrix label carrying `+ <m\|sum_i alpha_i A_i\|n>` | `kin_ion_io.py:991-993` | same, at the matrix sweep |
+| `Bispinor spatial-current carrier: VELOCITY balance … (projectors from <dir>); charge carrier stays sigma.p.` (branch) | `gw_jax.py:498-513` | the deck runs `bispinor_current_balance = velocity`; names `pseudo_dir`. Its absence on a bispinor deck is the shipped σ·p carrier |
+| `[photon response] DECLARED no-pair model: charge carrier …; current carrier …` (branch) | `w_isdf.compute_static_photon_response` | the two carrier provenance strings the packed body was built from |
+| `[photon response] chi0_packed/W_packed Hermiticity residual …`, `[photon Sigma] packed Sigma_x/Sigma_sx/Sigma_coh Hermiticity residual …` (branch) | `w_isdf._report_packed_hermiticity`, `photon_sigma.compute_static_photon_sigma` | `LORRAX_DEBUG_PRINT=1` only: the carrier-bookkeeping certificate ([theory §7.2](../theory/four-current-head-corrections.md#current-carrier)) |
+| `V_H: charge and current share one carrier here; using the charge lift …` (branch) | `sigma_dispatch._compute_live_hartree` | the registered shared-carrier boundary fired; velocity decks only |
+| `[bispinor] μ_L=a → …/zeta_q_mu<a>.h5 (carrier lift 'velocity_a')` (branch) | `gw_init._fit_transverse_channel` | channel `a`'s ζ was fit on carrier `a` |
+| `SC current carriers: Sigma-velocity OFF (deck) \| OFF (auto): … \| COVARIANT — … \| INTERBAND — … OMITTED: …` (branch) | `sc_iteration.resolve_current_velocity_update` | which Σ-velocity route the QSGW map runs and what it omits; printed on every QSGW run, scalar decks included |
+| `finite-link velocity rule per axis: x=order-4 (max\|dv\|=… of …), …` (branch) | `file_io/parallel_transport.complete_velocity_validation` | the producer's per-axis derivative rule and gate error — in the dipole producer's log, not `gwjax.out` |
+
+## The spatial-current carrier, its Σ-velocity, and the collapsed-axis connection {#current-carrier-wiring}
+
+> Branch `feat/bispinor-velocity-lift-2026-09-04`, tip `4074ab3d`
+> (2026-09-04/05), **not on `main`**. Physics:
+> [theory §7](../theory/four-current-head-corrections.md#current-carrier).
+> Line numbers below are at that tip.
+
+**Resolver.** `common/four_current_model.resolve_four_current_representation(bispinor, model, *, current_lift=)`
+(`:101`) gains one argument and the result one method. `current_lift` is the
+deck's `bispinor_current_balance` coerced by
+`gw_config.coerce_bispinor_current_lift` (`:391`; `kinetic → "raw"`,
+`velocity → "velocity"`, stored as `LorraxConfig.bispinor_current_lift`).
+On the result `current_lift` is the family name; `current_lift_for(mu_L)`
+(`:74`) is the one place it becomes a loader selector (`raw`, or
+`velocity_1/2/3`); `one_current_carrier` (`:95`) says whether the three labels
+share a bundle. `spatial_current_representation` becomes
+`velocity_kinetic_balance_per_channel_alpha_spatial_current_v1` under
+velocity; `charge_lift` and the charge stamp never move. Callers passing
+`current_lift=`: `gw_init` ×4, `sigma_dispatch._compute_live_hartree`,
+`sc_iteration` ×2, `head_correction.HeadResolver`,
+`file_io/kin_ion.validate_kin_ion_against_run`, `psp/get_dipole_mtxels.main`,
+`centroid/kmeans_cli._current_carrier_lifts`, and
+`gw_config.refuse_unsupported_bispinor_gw` at parse time, so `velocity` with
+`bispinor = false` refuses before any stage.
+
+**Lift and hook.** `common/bispinor_init.lift_to_4spinor(representation="velocity_a", sigma_vnl_velocity_ry=)`
+adds `(α/4)` of the channel's projector-velocity ket to the σ·p small
+component; the family name `"velocity"` is refused there (`:354`). The ket
+`Σ_b σ^b (∂_b V_SR ψ_L) + σ^a (∂_a V_SO ψ_L)`, `(n_k, nb, 2, ngkmax)` in Ry
+velocity units, comes from
+`psp/vnl_ops.nonlocal_velocity_lift(setup)(psi_2, gvecs_int, kvecs_frac, ngk_valid, channel=a)`
+(`:2368`; `lax.map` over k, pad columns zeroed; `spin_orbit_split_E` `:2348`
+supplies `E_SR`/`E_SO` from `VNLSetup.E_super_scalar`, the j-averaged blocks
+kept beside the selected ones). Drivers attach it to
+`WfnLoader.nonlocal_velocity_lift`: `gw_jax` (`:498-513`) and
+`centroid.kmeans_cli` (`:516-522`) through
+`nonlocal_velocity_lift_from_pseudo_dir` (`:2447`; loads `*.upf` from
+`pseudo_dir`, runs the producers' operator preflight when `sys_dim` is known,
+returns a `NonlocalVelocityLift` carrying `.provenance`), and
+`psp.get_dipole_mtxels` (`:1342-1349`) from its own `vnl_setup`. The loader
+routes its G table, k representatives, `ngk_valid` and the channel to the hook
+(`WfnLoader._sigma_vnl_velocity`, `loader.py:2046`) from `load`,
+`load_process_local`, `lift` (`:2078`; lifts an already loaded two-spinor
+window into any carrier) and the parent-stream `unfold_parent_to_full_k`
+(`:887`, which builds the child's own G list for it). A velocity request with
+no hook refuses (`GATE bispinor_velocity_lift_needs_projectors`).
+
+**Carriers and endpoints.** `gw_init._transverse_wfn_data` (`:825`) samples
+the transverse centroids once per distinct lift (one load under kinetic, three
+under velocity) and returns `channels`, three sample dicts that are the same
+object under kinetic. `_transverse_carriers_from_samples` (`:940`) builds one
+`Wavefunctions` per distinct set into `gw.wavefunction_bundle.LorentzCarriers`
+(`:757`; three entries, `channel(mu_L)`, `one_carrier`, `LorentzCarriers.shared`);
+`as_lorentz_carriers` (`:814`) accepts a bare bundle. Consumers:
+`w_isdf.compute_experimental_no_pair_photon_chi0` families
+`(charge, T1, T2, T3)` (`:1960-1963`); `photon_sigma._bundle_for_channel`
+(`:157`); `sigma_x_bispinor` through `endpoint_bundles(left, right, i, j)`
+(`wavefunction_bundle.py:821`: G-direct operand and projection bra from
+carrier `i`, G-conjugated operand and ket from carrier `j`; `left is right`
+reproduces `with_lorentz_vertices` byte for byte). The transverse ζ of channel
+`a` is fit on carrier `a` (`_fit_transverse_channel`,
+`bispinor_lift=current_lift_for(mu_L)`, `gw_init.py:2619`), and the transverse
+ζ stamp names the family whenever it is not `raw` (`:1594`).
+`AuthenticatedWavefunctions` accepts the container (`:530`).
+`rotate_wavefunctions` refuses the container (`:1905`);
+`rotate_lorentz_carriers` (`:1927`) rotates each distinct channel once.
+
+**Restart.** `file_io/tagged_arrays.write_restart_state_to_h5` takes
+`psi_full_y_transverse[_mun]` as one array or a 3-tuple; channels 2 and 3 are
+written as `psi_full_y_transverse_c2/_c3` (+`_mun`) beside the historical
+names, with small datasets `transverse_carriers` (int) and
+`transverse_lift_family` (bytes). `read_restart_state_from_h5` returns tuples
+when stamped 3 and refuses a torn write. `gw_init.prepare_isdf_and_wavefunctions`
+(`:4090-4105`) refuses a file whose family differs from the deck's
+(`GATE bispinor_restart_transverse_carrier`); an unstamped file is `raw`.
+`_transverse_carriers_from_restart` (`:929`) rebuilds the container on either
+layout.
+
+**Dipole producer.** `psp/get_dipole_mtxels.compute_finite_q_mtxels(alpha_lifts=)`
+lifts channel `a`'s finite-q `α` vertex on carrier `a` at both endpoints from
+one two-spinor read per k (`WfnLoader.lift`, `:375-388`;
+`_cell_overlap_with_lookup(alpha_bra_channels=, alpha_ket_channels=)`), while
+`rho_cvkq`/`v_cvkq` and the q = 0 velocity keep the scalar-head carrier.
+`dipole.h5` root attr `prov_bispinor_current_lift` and
+`finite_q/selected_current_lift` carry the lift; `check_dipole_provenance(bispinor_current_lift=)`
+asks for the stamp only under velocity — a legacy unstamped file is the σ·p
+arm. The static-gauge Hall producer loads the charge carrier by name, and
+`common/mtxel_sweep.uniform_gauge_operator` refuses a velocity lift
+(`GATE uniform_gauge_operator_lift`, `:1175`): it adds the projector jet
+itself.
+
+**kmeans.** `centroid.kmeans_cli --density-mode current --current-balance velocity --pseudo-dir <dir>`
+→ `sampling_metric.build_feature_metric_diagonal(bispinor_lifts=)`: one
+two-spinor load per band window, `WfnLoader.lift` once per distinct carrier,
+one `(D_L, D_R)` pair per carrier, `Σ_i Tr(D_L^(i) α_i D_R^(i) α_i)/α²`
+(`_transverse_metric_diagonal_per_channel`); the projector memory plan prices
+the carriers; three `raw` is the historical kernel; one non-`raw` carrier
+shared by all channels refuses (`:408-418`). The pivoted-Cholesky prune Gram
+still scans the shared σ·p carrier (`isdf.gram_q0_tiled_from_psi_sm`), and the
+centroid header says so.
+
+**The Σ-velocity seam (QSGW).** `run_sc_driver` calls
+`sc_iteration.resolve_current_velocity_update(config, wfns_transverse=, parallel_transport=, input_dir=, …)`
+(`:2617`) once, returning `("off" | "covariant" | "interband", dipole velocity or None)`
+into `SCInputs.current_velocity_update` and `SCInputs.dipole_velocity_dft`
+(`(3, nk, nb_m, nb_m)` at `P(None,None,'x','y')`,
+`qsgw_head.load_dipole_velocity_sharded` `:3496`, first
+`nb_m = min(b_id_4_user, transverse nb)` bands; the SC class already refuses
+`b0 != 0`). In `gw_iteration_map`: `_delta_h_manifold` (`:2591`) builds
+`ΔH = H_QP − H_DFT` on the head manifold once per map (the head's own
+`assemble_delta_head_manifold`); `qsgw_head.covariant_velocity_correction(delta_head, pt, …)`
+(`:3526`, = `covariant_link_derivative` with the stencil orders and the
+collapsed position) or
+`qsgw_head.interband_dipole_velocity_correction(delta, v_dipole, e_dft, degeneracy_tol_ry=)`
+(`:3568`, a `make_distributed_band_matmul` kernel) gives `v_Δ`;
+`wavefunction_bundle.add_covariant_current_velocity(carriers_dft, v_Δ, mesh_xy=)`
+(`:2046`; refuses a shared carrier, `GATE sc_current_velocity_needs_per_channel_carriers`;
+`_add_small_component_velocity` `:1986` reuses the QP rotation kernels with
+`(v_Δ)^a` in place of `U` on `[0, nb_m)`, both layouts) →
+`rotate_lorentz_carriers`. On the covariant route the head takes the same
+operator (`build_iteration_head_response(delta_velocity_dft=)`, refused
+without links). `qsgw_head.read_authenticated_dipole_velocity` (`:3441`) is
+the dipole read the fixed DFT head and the interband route share.
+
+**The collapsed-axis connection (parallel-transport artifact).** Rule owner:
+`common.parallel_transport.link_stencil_orders(kgrid) -> (o_x, o_y, o_z)`
+(`:70`) with values `4`, `2`, `COLLAPSED_AXIS = 0`; a two-point axis refuses
+(`GATE pt_two_point_axis`), and `undersampled_link_axes` (`:111`) now names
+only those. Producer (`get_dipole_mtxels --parallel-transport-out`):
+`collapsed_axis_position_operators` (`:825`) runs
+`common.mtxel_sweep.collapsed_position_operator(geom, axis=, center=)`
+(`:598`; the sawtooth's exact Fourier coefficients as a Toeplitz along the
+box's `a` axis, inside a `shard_map` on the band-sharded box; `center` from
+`collapsed_axis_center(atom_crys, axis)`) on the resident file-wedge ψ for each
+collapsed axis, unfolds with
+`symmetry_maps.unfold_file_wedge_polar_matrix(..., time_odd=False)` as the
+Cartesian vector `Z_a b̂_a`, Hermitises, and hands
+`file_io/parallel_transport.initialize_parallel_transport_artifact(collapsed_position_kmajor=, collapsed_axis_centers=)`
+the `(nk, 3, nb, nb)` result: dataset `collapsed_position_reduced`
+`(3, nk, nb, nb)` at `P(None,None,'x','y')` (`:524`), attrs
+`link_stencil_orders`, `collapsed_axis_flags`, `collapsed_axis_center_frac`.
+The link stream still runs on every axis (a collapsed axis's forward neighbour
+is the point itself through `b_i`; the derivative kernels never read that
+link). Consumers: `fourth_order_connection` (`:679`) /
+`fourth_order_covariant_derivative` (`:739`) with `stencil_orders=,
+collapsed_position=` (`_resolve_axis_rules` `:650` validates the pair; `None`
+is the historical all-fourth-order call, bit-identical);
+`_write_connection_stage`; `complete_velocity_validation` (per-axis
+`max_abs_axis_{x,y,z}` in the stamped metrics and the refusal text);
+`qsgw_head.load_parallel_transport_head` (reads the dataset into
+`ParallelTransportHeadData.collapsed_position`; refuses a pre-2026-09-05
+artifact on a collapsed grid by the missing stamp, `:620-640`);
+`covariant_link_derivative(collapsed_position=)`;
+`sc_iteration.load_head_velocity_source` (`:5310-5316`, skips collapsed-axis
+singular values in the window-hybridization preflight) and
+`_refuse_unsupported_link_stencil` (`:5092`, two-point axes only).
 
 ## Refusals, compressed
 
@@ -677,6 +826,18 @@ and again at driver entry (`gw_init.py:3101`).
 | `GATE static_gauge_hall_{schema,partial,artifact_absent}` and the authentication gates | `file_io/static_gauge_head.py:69,77,83,200,203`; identity checks `:235-256` | Hall artifact partial, wrong schema, or not authenticating against this WFN, band manifold or `nk_tot`. **An absent file is not one of these** on the packed path: it means `σ_H = 0`, announced |
 | `GATE static_gauge_raw_hall_degenerate` | `qsgw_head.py:2686` | degenerate differently-occupied states |
 | (no id) insulating-only Hall | `qsgw_head.py:2808` | any fractional occupation |
+| `bispinor_current_balance_requires_bispinor` (branch) | `common/four_current_model.resolve_four_current_representation`, called at parse by `refuse_unsupported_bispinor_gw` | `bispinor_current_balance = velocity` with `bispinor = false` |
+| `bispinor_current_balance_needs_pseudopotentials` (branch) | `psp/vnl_ops.nonlocal_velocity_lift_from_pseudo_dir` | velocity balance with no `*.upf` in `pseudo_dir` |
+| `bispinor_velocity_lift_needs_projectors` (branch) | `wfn_loader.WfnLoader._sigma_vnl_velocity` | a `velocity_a` lift requested on a loader with no attached hook |
+| `vnl_spin_orbit_split_unavailable` (branch) | `psp/vnl_ops.spin_orbit_split_E` | a j-resolved pseudopotential that cannot be j-averaged, so `V_SR + V_SO` has no split |
+| `bispinor_restart_transverse_carrier` (branch) | `gw_init.prepare_isdf_and_wavefunctions` (`:4098`) | restart tensors written under the other `bispinor_current_balance` |
+| `uniform_gauge_operator_lift` (branch) | `common/mtxel_sweep.uniform_gauge_operator` (`:1175`) | the static-gauge sweep handed a velocity-balance carrier; its explicit projector jet would double count `dV_NL/dk` |
+| `sc_current_velocity_update_unavailable` (branch) | `sc_iteration.resolve_current_velocity_update` | a named route whose prerequisite is missing: no transverse bundle, kinetic balance, no links for `covariant`, no `dipole.h5` for `interband` |
+| `sc_current_velocity_needs_per_channel_carriers` (branch) | `wavefunction_bundle.add_covariant_current_velocity` | the Σ-velocity asked of a shared σ·p carrier |
+| (TypeError) `rotate_wavefunctions received a LorentzCarriers container` (branch) | `wavefunction_bundle.rotate_wavefunctions` (`:1905`) | a bare rotation of the container, which would silently keep channel 1 only; `rotate_lorentz_carriers` is the spelling |
+| `pt_two_point_axis`; `PT-LINK-STENCIL-UNSUPPORTED`; `pt_head_stencil_unsupported` (branch) | `common/parallel_transport.link_stencil_orders`; `file_io/parallel_transport.write_parallel_transport_artifact`; `sc_iteration._refuse_unsupported_link_stencil` | a reduced k axis with exactly two mesh points: no finite difference exists and it is not a vacuum direction. One rule, three sites |
+| `pt_collapsed_axis_needs_position` (branch) | `common/parallel_transport._resolve_axis_rules`, `file_io/parallel_transport.initialize_parallel_transport_artifact` | a collapsed axis with no position operator supplied (or one supplied with no collapsed axis) |
+| (no id) pre-2026-09-05 artifact on a collapsed grid (branch) | `qsgw_head.load_parallel_transport_head` | the artifact carries no `link_stencil_orders` stamp; regenerate with `get_dipole_mtxels --parallel-transport-out` |
 
 **Three refusals are absent at `34228021`.** `full_static_bispinor_gauge_head_unavailable`,
 `GATE static_gauge_head_end_to_end_uncertified` and

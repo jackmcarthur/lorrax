@@ -48,6 +48,12 @@ on **both** routes, and no other key — not
 `bispinor_tt_head_correction`, not `restart`, not `no_local_fields` — can
 reach a different head.
 
+The carrier of the current channels is a separate axis from the routes in
+the table: `bispinor_current_balance` picks the four-spinor the spatial-current
+channels ride (§7). `kinetic` is the shipped σ·p carrier and the default;
+`velocity` is on branch `feat/bispinor-velocity-lift-2026-09-04`, not on
+`main`.
+
 Two facts follow from the table and are easy to miss:
 
 * The photon sector's **current** blocks have no frequency dependence
@@ -463,7 +469,7 @@ screened-current spelling and the coupled completion is on under the default
 `full_static_cohsex` builds one packed
 `C ⊕ T_1 ⊕ T_2 ⊕ T_3` operator (`gw.photon_layout`): the sixteen bare blocks
 `D^{IJ}_q(μ,ν)` from `v_q_bispinor.h5`, the sixteen no-pair response blocks
-`χ^{IJ}_0` from the kinetic-balance current
+`χ^{IJ}_0` from the four-spinor current (the spatial-current carrier of §7)
 (`gw.w_isdf.compute_experimental_no_pair_photon_chi0`, TT blocks
 Ward-subtracted as `Π(q) − Π(0)`), and one distributed Dyson solve
 `W = (1 − Dχ_0)^{-1} D`. `gw.photon_sigma` then contracts all sixteen
@@ -699,5 +705,202 @@ and refusal at `34228021` — is
 | bare dynamic SC rotation/re-contraction and per-map certificate | `src/gw/sc_iteration.py`, `wfns_transverse_qp` plus the `SC packed current map` record line |
 | bounded packed-head response record (`StaticPhotonHeadResponse`; Hall optional), and the by-declaration content list | `src/gw/static_gauge_response.py` (the module docstring) |
 | Hall artifact schema | `src/file_io/static_gauge_head.py` |
-| four-current carrier resolution (`bispinor_gw` models) | `src/common/four_current_model.py` |
+| four-current carrier resolution (`bispinor_gw` models, `bispinor_current_balance`; which lift each Lorentz label takes) | `src/common/four_current_model.py` (`resolve_four_current_representation`, `FourCurrentRepresentation.current_lift_for`) |
 | head-source frequency plan (GN/HL/MPA) | `src/gw/ppm_pipeline.py`, `src/gw/screening.py` |
+| the σ·p charge lift and the per-channel velocity lifts of the current carrier, with their provenance strings (§7.1–7.2) | `src/common/bispinor_init.py` (`lift_to_4spinor`, `VELOCITY_KINETIC_BALANCE_LIFTS`) |
+| the projector velocity ket per channel and the exact `V_SR + V_SO` split (§7.2) | `src/psp/vnl_ops.py` (`nonlocal_velocity_lift`, `spin_orbit_split_E`) |
+| the endpoint rule — one carrier per Lorentz label, and the operands of a Σ block whose two endpoints ride different carriers (§7.2) | `src/gw/wavefunction_bundle.py` (`LorentzCarriers`, `endpoint_bundles`) |
+| the Σ-velocity of the current carriers and its two routes (§7.3) | `src/gw/wavefunction_bundle.py` (`add_covariant_current_velocity`), `src/gw/qsgw_head.py` (`covariant_velocity_correction`, `interband_dipole_velocity_correction`), `src/gw/sc_iteration.py` (`resolve_current_velocity_update`) |
+| the per-axis derivative rule and the collapsed-axis connection (§7.4) | `src/common/parallel_transport.py` (`link_stencil_orders`, `fourth_order_covariant_derivative`), `src/common/mtxel_sweep.py` (`collapsed_position_operator`) |
+
+## 7. The spatial-current carrier: kinetic balance, the per-channel velocity lift, its Σ-velocity, and the collapsed-axis connection {#current-carrier}
+
+> On branch `feat/bispinor-velocity-lift-2026-09-04` (2026-09-04/05), **not on
+> `main`**. The default deck is unchanged: `bispinor_current_balance = kinetic`
+> is byte-identical to the shipped lift. Wiring is
+> [here](../architecture/four_current_wiring.md#current-carrier-wiring); the
+> deck keys are `bispinor_current_balance`, `pseudo_dir`,
+> `sc_current_velocity_update` and `parallel_transport_file` in the
+> [input reference](../input_reference.md). Evidence: the sandbox report
+> `reports/bispinor_velocity_lift_2026-09-04/report.md` and the run directories
+> named below.
+
+### 7.1 Two carriers
+
+The four-spinor is `Ψ = (ψ_L, ψ_S)` with `ψ_L` the DFT two-spinor. The charge
+channel `γ̃^0 = 1` rides the kinetic-balance lift `ψ_S = (α/2) σ·p ψ_L`,
+`p = k+G` in bohr⁻¹ ([`BISPINOR_DHFB_DESIGN.md`](../BISPINOR_DHFB_DESIGN.md)
+§3). Its small-component density is the `O(α²)` Dirac density, and nothing in
+this section changes it.
+
+The spatial-current channels `γ̃^a = α^a` couple `L` and `S`:
+`j^a_mn = ψ_m† α^a ψ_n = ψ_L,m† σ^a ψ_S,n + h.c.` With the σ·p lift, at
+`q = 0`,
+
+$$
+\tfrac{2}{\alpha}\langle m|\alpha^a|n\rangle = \langle m|2(k+G)_a|n\rangle
+\quad\text{(Ry)},
+$$
+
+the bare momentum, plus the Gordon spin current at finite `q`. The velocity of
+the pseudo-Hamiltonian is `v = p + i[V_NL, r] = p + ∂V_NL/∂k`; the σ·p
+carrier misses `∂V_NL/∂k`, which is 0.23 of `|2(k+G)|` on Bi and is what
+`dipole.h5` and the static-gauge head already carry.
+`bispinor_current_balance` selects the carrier of the spatial-current channels
+only: the transverse ζ fits, `Σ^B`, the packed current blocks and the finite-q
+`α` vertex.
+
+### 7.2 One carrier per Cartesian channel
+
+`bispinor_current_balance = velocity` lifts channel `a` with
+
+$$
+\psi_S^{(a)} = \tfrac{\alpha}{4}\Big[\sigma\!\cdot\!\big(2(k+G) + \partial V_{\rm SR}/\partial k\big)
++ \sigma^a\,\partial_a V_{\rm SO}\Big]\psi_L
+\qquad\text{(Ry velocities)},
+$$
+
+`V_NL = V_SR + V_SO` the j-averaged and spin-orbit parts of the projector
+operator. Why the split: `[σ, V_SR] = 0`, so
+`σ^a σ^b V_b + V_b σ^b σ^a = 2 V_a` and a spin-scalar velocity may sit inside
+the σ sandwich. `V_SO` does not commute with σ; in the sandwich it adds
+`(i/2) ε_abc ⟨m|[σ^c, ∂_b V_SO]|n⟩`, which is not part of `∂H/∂k`
+(measured 0.20 of `|∂V_NL/∂k|` on MoS2 and 0.92 on Bi with j-resolved
+projectors). Behind `σ^a` alone, `σ^a σ^a = 1` returns `⟨m|∂_a V_SO|n⟩`
+exactly. No single four-spinor removes the term for all three channels at
+once (the sandwich map `X → σ^a X + X† σ^a` has 8 real degrees of freedom; a
+spin-matrix-valued velocity needs 12), so there is one carrier per channel.
+Result, gated to `1e-11` relative on the MoS2 `cohsex_debug` fixture
+(`tests/test_bispinor_velocity_lift.py`):
+
+$$
+\tfrac{2}{\alpha}\langle m|\alpha^a|n\rangle^{(a)}
+= \langle m|2(k+G)_a + \partial_a V_{\rm NL}|n\rangle
+\quad\text{(Ry), spin-orbit included, no remainder,}
+$$
+
+plus the Gordon spin current at finite `q`. The spinor width stays four; the
+transverse centroid samples triple; no `G` block, vertex table or contraction
+changes.
+
+**Endpoint rule.** Every Green's-function endpoint and every Σ bra/ket for
+Lorentz label `a` is drawn from carrier `a`:
+`G^{AB}(μ_A, ν_B) = Σ_l Ψ^A_l(μ) Ψ^B_l(ν)†`, and the two-component effective
+operator is `Σ_AB (L^A)† Σ^{AB} L^B` with `L^A` the lift of channel `A`.
+Hermiticity `Σ^{AB†} = Σ^{BA}` follows, and it is the machine check: under
+`LORRAX_DEBUG_PRINT=1` the packed `χ_0`, `W` and `Σ_x/SX/COH` print
+`max|B − B†|/max|B|`; a carrier leaking across a label would leave
+`(relative carrier difference) × |CT|/|CC|`. Measured `2e-16` (`χ_0`),
+`9e-14` (`W`), `1e-16` (`Σ_x`) with three carriers on MoS2 3×3 at P4
+(`runs/DEV/322_bispinor_velocity_lift_20260904`, leg 10).
+
+**Two other current constructions in the tree.** The static-gauge Hall/head
+producer builds the same Hamiltonian velocity differently: the σ·p carrier
+plus the explicit projector jet `(α/2) ∂V_NL/∂k ψ_L` in the large sector, no
+spin sandwich. It refuses a velocity carrier, because the jet would then count
+`∂V_NL/∂k` twice. The exact Hartree and the SC density rebuild load one ψ for
+ρ and `J` and keep the charge lift for both; on a time-reversal-symmetric cell
+the Hartree current vanishes identically, and the `V_NL` dressing of the
+mean-field current is `O(α² V_NL)`. Both are announced in the run record.
+
+**Measured** (MoS2 3×3 `bispinor_debug`, `nval = ncond = 4`,
+`runs/DEV/322_bispinor_velocity_lift_20260904`): velocity minus kinetic moves
+`sigX` by 0.875 meV max on the bare route and 1.78 meV max on the packed
+route, and `sigC` by exactly 0 (`W_00` and `Σ_c` ride the charge carrier).
+Kinetic is byte-identical to `origin/main`. On Bi the term the single-carrier
+form would have added is 0.19 of the total velocity, so the effect there is
+expected larger and is unmeasured.
+
+### 7.3 The Σ-velocity of the current carriers in QSGW
+
+With `H_QP = H_DFT + ΔH` the velocity is `v_QP = v_DFT + v_Δ`,
+`v_Δ = −i[r, ΔH] = D_k ΔH` in the Bloch basis (the covariant derivative
+`∂_k ΔH − i[A, ΔH]`). Each map, channel `a`'s small component gains
+
+$$
+\psi_S^{(a)} \mathrel{+}= \tfrac{\alpha}{4}\,\sigma^a \sum_m \psi_{L,m}\,(v_\Delta)^a_{mn},
+$$
+
+a band-space contraction of the resident large components on the head
+manifold, added in the DFT basis before the map's QP rotation; then every
+distinct channel carrier is rotated. No G-space work and no ζ refit: the term
+is a linear combination of pair densities the fit already spans, and ISDF
+interpolation is linear. Map 0 has `ΔH = 0`, so the one-shot equivalence
+holds. The charge carrier is untouched.
+
+Two routes for `v_Δ` (`sc_current_velocity_update`):
+
+* `covariant`: `D ΔH` by the finite-link covariant derivative the head already
+  uses under `sc_head_update = parallel_transport`, built once per map and
+  handed to both consumers (one operator, two consumers).
+* `interband`: `−i[r, ΔH]` with the interband dipole
+  `r_mn = −i v_mn/(e_m − e_n)` from the exact DFT velocity in `dipole.h5`.
+  Exact for the interband part: on a k-diagonal `ΔH` it is the scissor
+  renormalisation `v_mn (E_n − E_m)/(e_n − e_m)`, on a rotated `ΔH` the
+  explicit interband commutator. It **omits** the k-derivative part
+  `∂_k Δ_mn − i(A_nn − A_mm) Δ_mn`: the change of the intraband group velocity
+  and the diagonal-connection term. Pairs within `sc_exact_degeneracy_tol_ev`
+  carry no interband dipole. The head keeps its own velocity on this route.
+
+`auto` takes covariant when the links are resident, else interband when
+`dipole.h5` is beside the deck, else off; the run record names the route and
+what it omits.
+
+**Measured** (MoS2 3×3 QSGW, GN-PPM, `sc_tol_ev = 1e-5`,
+`runs/MoS2/31_sigma_velocity_sc_20260905`, arms 11–13): the converged `E_QP`
+moves by 0.24 meV max under the carrier and by a further 0.22 meV max under
+the interband Σ-velocity (gap +0.12 meV). Both are below the 2 meV gate of
+TASTE 77 and below what a 3×3 grid can claim as converged.
+
+Not done: entering `i[Σ, r]` through the pair densities themselves (the
+band-rotation route, with or without a `ζ^0` component on the transverse set;
+derivation in the report, round 3).
+
+### 7.4 The collapsed-axis connection
+
+Write `k = Σ_a κ_a b_a`. The finite-link covariant derivative along reduced
+axis `a` is `D_a O = ∂_{κ_a} O − i[A_a, O]`, `A_a` the reduced Berry
+connection. On a **collapsed** axis — one mesh point; the cell is
+vacuum-padded along it, a slab normal or a wire's two transverse directions —
+`∂_{κ_a}` of anything vanishes, and `A_a` is the band matrix of the position
+conjugate to `κ_a`,
+
+$$
+Z_a = \langle m|\,b_a\!\cdot\! r\,|n\rangle = 2\pi\,\langle m|f_a|n\rangle ,
+$$
+
+`f_a` the fractional coordinate — a bounded operator because ψ vanishes in the
+vacuum. So `D_a O = −i[Z_a, O]` exactly; no k derivative is fabricated. The
+position enters as the sawtooth `2π wrap(f_a − f_a^0)` with its branch cut
+half a cell from the atoms' circular-mean coordinate `f_a^0`, in the vacuum.
+It is applied in G space through the sawtooth's exact Fourier coefficients,
+`K(g) = i (−1)^g e^{−2πi g f_a^0}/g`, a Toeplitz product along the box's `a`
+axis on the unwrapped `G_a` difference; sampling the sawtooth on the FFT grid
+aliases its `1/g` tail (the two agree to four digits on the fixture, and the
+grid form is kept as the reference). `r` is time-even (`v = dr/dt` is
+time-odd), so the unfold to the full BZ takes no antiunitary sign; applying
+the velocity's sign to `Z` put the wrong sign on every time-reversed `k`
+(found and fixed 2026-09-05).
+
+Per reduced axis (`common.parallel_transport.link_stencil_orders`):
+
+| points on the axis | rule |
+|---|---|
+| ≥ 5 | fourth-order ±2 link stencil (the default, bit-identical to before) |
+| 3 or 4 | second-order ±1 link stencil |
+| 1 | collapsed: `A_a = Z_a`, `D_a O = −i[Z_a, O]` |
+| 2 | refused by name: the ±1 neighbours coincide, and it is not a vacuum direction |
+
+The velocity identity is the gate: on a collapsed axis
+`−i Z_mn (e_n − e_m)/|b_a| = v_a,mn` against the exact `p + ∂V_NL/∂k`
+(`p − i[r, V_NL]` in the stored convention; the only velocity since 2026-09-05,
+`common.mtxel_sweep.VNL_VELOCITY_SIGN`).
+MoS2 3×3×1 at 16 Ry: 1.6 % relative L2 over 424 resolved pairs; the in-plane
+twin fails by 142 %; truncating the sphere to 12/9/6 Ry raises it to
+5.3/8.2/7.5 %; vacuum leakage at the cut ≤ 2.4e-5 per band. The residual is
+the plane-wave basis's incompleteness in the commutator (`−i[z, PHP]` against
+`P(−i[z, H])P`), the same footing the in-plane links stand on. A 2D deck can
+therefore run `sc_head_update = parallel_transport` and the covariant
+Σ-velocity; on a 3×3 in-plane grid the gate refuses on the second-order
+in-plane stencil, as a three-point stencil must, and not on the slab axis
+(`runs/DEV/324_pt_collapsed_axis_20260905`).

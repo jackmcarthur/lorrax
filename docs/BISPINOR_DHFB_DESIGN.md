@@ -30,7 +30,7 @@
 
 **Status:** historical physics design with current implementation addenda
 
-**Last update:** 2026-08-29
+**Last update:** 2026-09-05 (current-carrier pointer; the record itself is unchanged since 2026-08-29)
 
 ## 1. Scope
 
@@ -69,42 +69,18 @@ $$\Psi_{nk}(G) = \begin{pmatrix}\psi_L\\\psi_S\end{pmatrix},\quad
 
 with $(k+G)$ in Bohr⁻¹ — i.e. the BGW HDF5 `wfn.bvec` (stored in reciprocal-lattice units) is multiplied by `wfn.blat = 2π/alat` once at the `WfnLoader` file-format boundary.  [`bispinor_init.py`](../src/common/bispinor_init.py) accepts only that explicitly Cartesian basis.
 
-> **Live addition (2026-09-04): velocity balance for the current carrier.**
-> The lift above is the CHARGE carrier and stays as written (its
-> small-component density is the $O(\alpha^2)$ Dirac density).  The
-> SPATIAL-CURRENT carriers ($\mu_L\in\{1,2,3\}$: transverse ζ fits, $\Sigma^B$,
-> the packed current blocks, the finite-q $\alpha^i$ vertex) may instead be
-> lifted ONE CARRIER PER CHANNEL $a$,
-> $\psi_S^{(a)}=\tfrac{\alpha_{\rm FS}}{4}\big[\sigma\!\cdot\!(2(k+G)+\partial V^{\rm Ry}_{\rm SR}/\partial k)
-> + \sigma^a\,\partial V^{\rm Ry}_{\rm SO}/\partial k_a\big]\psi_L$,
-> deck key `bispinor_current_balance = velocity`, with $V_{\rm NL}=V_{\rm SR}+V_{\rm SO}$
-> the j-averaged and spin-orbit parts.  Because $[\sigma, V_{\rm SR}]=0$ the
-> spin-scalar velocity may sit inside the $\sigma$ sandwich
-> ($\sigma^a\sigma^b V_b + V_b\sigma^b\sigma^a = 2V_a$), and because
-> $\sigma^a\sigma^a=1$ the spin-orbit part behind $\sigma^a$ alone returns
-> $\psi_L^\dagger\,\partial_a V_{\rm SO}\,\psi_L+{\rm h.c.}$ exactly, so at $q=0$
-> $\tfrac{2}{\alpha}\langle m|\alpha^a|n\rangle^{(a)} = \langle m|2(k+G)_a+\partial_a V_{\rm NL}|n\rangle$:
-> the pseudo-Hamiltonian's velocity including spin-orbit, plus the Gordon spin
-> current at finite $q$.  A single $\sigma\!\cdot\!v$ carrier would add
-> $\tfrac{i}{2}\epsilon_{abc}\langle[\sigma^c,\partial_b V_{\rm SO}]\rangle$, measured
-> at 20% of $|\partial V_{\rm NL}/\partial k|$ on MoS2 with j-resolved projectors;
-> no single four-spinor lift can remove it (the sandwich map has 8 real
-> degrees of freedom against the 12 a spin-matrix-valued velocity needs), the
-> per-channel carriers do.  Endpoint rule: every $G$ endpoint and $\Sigma$
-> bra/ket for label $a$ is drawn from carrier $a$
-> (`gw.wavefunction_bundle.LorentzCarriers`); the transverse samples triple,
-> the spinor width stays four, and the $\tilde\gamma$-bilinear machinery is
-> untouched.  Owners: `common/bispinor_init.lift_to_4spinor(representation=
-> "velocity_a")`, provider `psp/vnl_ops.nonlocal_velocity_lift(setup)(...,
-> channel=a)` with `spin_orbit_split_E`, resolver
-> `common/four_current_model.resolve_four_current_representation(current_lift=)`
-> and its `current_lift_for(mu_L)`.  The static-gauge Hall producer already
-> builds the same exact current differently ($\sigma\!\cdot\!p$ carrier plus the
-> explicit ICL projector jet in the large sector) and refuses a velocity
-> carrier.
-> Not yet: the $i[\Sigma^{GW}, r]$ piece (self-consistency-dependent), and the
-> exact Hartree/SC density rebuild still shares one carrier (kept on
-> $\sigma\!\cdot\!p$; see `docs/architecture/four_current_wiring.md`).
+> **Live addition (2026-09-04/05, branch `feat/bispinor-velocity-lift-2026-09-04`, not on `main`).**
+> The lift above is the CHARGE carrier and stays as written. The
+> SPATIAL-CURRENT channels ($\mu_L\in\{1,2,3\}$) may instead ride one carrier
+> per Cartesian channel whose $\alpha^a$ vertex is the pseudo-Hamiltonian's
+> velocity $2(k+G)_a+\partial_a V_{\rm NL}$ exactly, deck key
+> `bispinor_current_balance = velocity`; in a QSGW map those carriers can also
+> take the velocity $\Delta H$ adds (`sc_current_velocity_update`). The
+> physics, the endpoint rule and the measurements are owned by
+> [theory §7](theory/four-current-head-corrections.md#current-carrier); the
+> wiring by [the carrier section](architecture/four_current_wiring.md#current-carrier-wiring).
+> The exact Hartree and the SC density rebuild still share one carrier (kept
+> on $\sigma\!\cdot\!p$).
 
 **Polarizability and screening (charge channel only):**
 
@@ -243,7 +219,7 @@ band-pair cost; it is not the implemented path.
 
 | File | Phase-1 change |
 |---|---|
-| [`src/common/bispinor_init.py`](../src/common/bispinor_init.py) | Single σ·p implementation; requires an explicitly Cartesian reciprocal basis in Bohr⁻¹. |
+| [`src/common/bispinor_init.py`](../src/common/bispinor_init.py) | The σ·p charge lift and (branch `feat/bispinor-velocity-lift-2026-09-04`) the per-channel `velocity_a` lifts of the current carrier, [theory §7](theory/four-current-head-corrections.md#current-carrier); requires an explicitly Cartesian reciprocal basis in Bohr⁻¹. |
 | [`services/wfn_loader/`](services/wfn_loader.md) | The WFN-format boundary folds `wfn.blat` into raw `wfn.bvec` once before calling the lift. |
 | [`src/gw/isdf_fitting.py`](../src/gw/isdf_fitting.py) + [`src/isdf/core.py`](../src/isdf/core.py) | One fit driver and one pair-density/CCT/Z/solve implementation for charge and transverse vertices; the private coordinator only schedules those owners. |
 | [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
@@ -274,7 +250,7 @@ band-pair cost; it is not the implemented path.
 
 ## 8. Out of scope (phase-2)
 
-$\chi^{0i},\chi^{ij}$ • $W^{\mu\nu}$ Dyson (4×4 matrix) • retarded Breit ($D^{ij}(\omega)$) • Sternheimer-side bispinor source • higher-order kinetic balance (DKH4 / σ·v).
+$\chi^{0i},\chi^{ij}$ • $W^{\mu\nu}$ Dyson (4×4 matrix) • retarded Breit ($D^{ij}(\omega)$) • Sternheimer-side bispinor source • higher-order kinetic balance (DKH4). The σ·v (velocity) balance of the current carrier is no longer out of scope: [theory §7](theory/four-current-head-corrections.md#current-carrier).
 
 ## 9. Open questions
 

@@ -71,14 +71,14 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `__init__.py` | Package marker for shared LORRAX utilities. |
 | `async_io.py` | Coordinates asynchronous host I/O work. |
 | `band_degeneracy.py` | Finds degeneracy blocks and validates band-window boundaries. |
-| `bispinor_init.py` | Initializes shared spinor-channel inputs. |
+| `bispinor_init.py` | Lifts two-spinors to four-spinors: the σ·p charge carrier and the per-channel velocity carriers, with their provenance strings. |
 | `chi_from_dipole.py` | Builds response data from dipole matrix elements. |
 | `collectives.py` | Wraps process collectives and communicator warm-up. |
 | `contract_bands.py` | Contracts band axes under explicit chunking. |
 | `coulomb_sphere.py` | Supplies spherical Coulomb-cell integration helpers. |
 | `eigh_block_sweep.py` | Runs blockwise Hermitian eigensolver sweeps. |
 | `fft_helpers.py` | Provides the canonical sharded real/reciprocal FFT factories. |
-| `four_current_model.py` | Defines shared packed-current model vocabulary and validation. |
+| `four_current_model.py` | Resolves the four-current carriers (the charge lift and the per-label current lifts) and their provenance stamps. |
 | `gamma_matrices.py` | Supplies spinor gamma-matrix conventions. |
 | `gauss_legendre.py` | Generates Gauss-Legendre nodes and weights. |
 | `gpu_utils.py` | Detects device memory and allocator state. |
@@ -89,7 +89,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `kq_mapping.py` | Builds k/q index mappings. |
 | `meta.py` | Stores system metadata shared by calculation stages. |
 | `mtxel_sweep.py` | Evaluates matrix elements in bounded sweeps. |
-| `parallel_transport.py` | Constructs band-subspace parallel-transport links. |
+| `parallel_transport.py` | Constructs band-subspace parallel-transport links, the per-axis derivative rule, and the finite-link connection and covariant derivative (position operator on collapsed axes). |
 | `pivoted_cholesky.py` | Implements shared pivoted-Cholesky selection helpers. |
 | `preprocessing_output.py` | Writes preprocessing reports and provenance. |
 | `progress.py` | Renders rank-aware progress output. |
