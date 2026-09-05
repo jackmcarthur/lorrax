@@ -685,7 +685,10 @@ def load_dft_velocity_head(
     the same read-only handle as the payload — one HDF5 library instance
     per file (``docs/architecture/slab_io.md#one-owner``).
     """
-    from common.parallel_transport import band_storage_extent, wfn_fingerprint
+    from common.parallel_transport import (
+        band_matrix_storage_extent,
+        wfn_fingerprint,
+    )
     from file_io.parallel_transport import (
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
@@ -693,7 +696,10 @@ def load_dft_velocity_head(
     from file_io.slab_io import SlabIO
 
     nb = int(meta.b_id_4_user)
-    nb_storage = band_storage_extent(mesh, nb)
+    # This mode consumes only the band matrix.  Unlike the full finite-link
+    # PT route, it has no composite-XY-sharded wavefunction sphere that would
+    # require padding to the full mesh product.
+    nb_storage = band_matrix_storage_extent(mesh, nb)
     with SlabIO(path, mode="r", mesh=mesh) as io:
         schema = int(io.read_small("schema_version", dtype=np.int64))
         band_start = int(io.read_small("band_start", dtype=np.int64))
