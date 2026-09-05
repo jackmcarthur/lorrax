@@ -98,8 +98,11 @@ def test_map_readout_freezes_output_reference_and_does_not_change_carry(monkeypa
     monkeypatch.setattr(collectives, 'gather_to_host', np.asarray)
     monkeypatch.setattr(sc, '_record_sc', lambda inputs, text: logs.append(text))
     output_rotation = [u]
-    monkeypatch.setattr(sc, '_kshard_eigh_kernels',
-                        lambda *a: (lambda h: (e, output_rotation[0]), None))
+    # The readout diagonalises the gathered carry on the host (5f432bb3:
+    # the band-sharded kernel refused indivisible band counts); patch that
+    # seam to hand back the rotated eigenvectors this test exercises.
+    monkeypatch.setattr(sc, '_identity_eigh',
+                        lambda h: (e, output_rotation[0]))
     outputs = sc.SCOutputs(None, u, None, None, None)
     state = sc.SCState(np.diag(e[0])[None], 1, partition, outputs=outputs)
     history = {}

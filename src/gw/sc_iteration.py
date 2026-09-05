@@ -3997,6 +3997,11 @@ def _band_ranges(mask, *, band_offset: int) -> str:
         str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
 
 
+def _identity_eigh(h_host):
+    """Host eigensolve for the identity readout (a seam the tests patch)."""
+    return np.linalg.eigh(h_host)
+
+
 def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
                           history, *, cutoff_ev):
     """Read a map in frozen QP identities; retain only small host diagnostics.
@@ -4021,7 +4026,7 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     # the gathered carry on the host.
     h_host = np.asarray(gather_to_host(state_out.H_qp_dft))
     h_host = 0.5 * (h_host + np.conj(np.swapaxes(h_host, -1, -2)))
-    _, u_out = np.linalg.eigh(h_host)
+    _, u_out = _identity_eigh(h_host)
     u_out = np.asarray(u_out)
     u_in = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))
     nb = e_output_ev.shape[1]
