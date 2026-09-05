@@ -423,6 +423,16 @@ order (`_resolve_ibz_q_list(mu_basis=)` → `basis.pack_tables`); the W0
 pre-unfold capture converts itself back (`PreUnfoldCapture.canonical`) so
 the writer's table cross-check still compares the producer's own tables.
 
+Validation on the Si 4×4×4 80-band deck at P4 (sandbox
+`runs/Si/99_psi_irr_zeta_2026-09-05/`, legs 20 and 21, JID 57941637): the
+fresh packed-order run agrees with the canonical-order run of the same
+quadrature schedule to 5.3 µeV in E_QP over 224 rows (ζ file 9e-8
+relative; the eigensolver regroups the permuted C_q, TASTE 77), and a
+restart from a copy of its canonical tensors reproduces it to the printed
+digit.  One pitfall recorded there: the pad diagonal of C_q must be C's own
+scale (tr C/n), not 1 — under `charge_zeta_solve = rank_truncate` a unit pad
+becomes λ_max when C is small and the cut drops real modes.
+
 ### Σ on the parents and parents-only storage
 
 The same plan and carrier serve Σ (`gw.wavefunction_bundle.ParentSigmaRoute`,
