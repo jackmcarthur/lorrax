@@ -142,12 +142,9 @@ def resolve_restart_file(path: str) -> str:
     directory can legitimately hold several and picking one silently is a
     wrong answer that passes every shape check downstream:
     ``isdf_tensors_1194.h5`` sorts before ``isdf_tensors_276.h5`` and neither
-    order is meaningful.  ``bse_io._find_restart_file`` resolves the same
-    ambiguity by newest mtime with a loud warning, which is the right call
-    for a driver whose input file already named the run.  This one REFUSES
-    instead, because the downfold's whole job is to produce a second bundle
-    at a different mu in a nearby directory — it is the tool most likely to
-    create the ambiguity, so it is the one that must not resolve it by luck.
+    order is meaningful. Like BSE's shared restart resolver, this refuses
+    ambiguity. Downfold can produce a second bundle at a different mu in a
+    nearby directory, so it must not select its parent by filesystem history.
     Name the file when there is more than one.
     """
     if os.path.isfile(path):

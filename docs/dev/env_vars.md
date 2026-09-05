@@ -199,6 +199,13 @@ Ranked.  These escape input-file validation, the run log, and provenance.
    executor `(t, alpha)` live once in `gw.sigma_box_plan`.
 5. *(removed 2026-08-31)* `LORRAX_DELIVERED_TAU_GRID` no longer exists:
    lookup-served rules carry their own nodes and there is one grid mode.
+
+Existing numerics escape (retained for A/B measurements, not a debug-only switch):
+
+| var | owner | default | grammar and risk |
+|---|---|---|---|
+| `LORRAX_MIXEDPREC_ALLOW_TF32` | `bse/w_ladder_mixedprec.py::_refuse_unpinned_matmul_precision` | unset (`""`, disabled) | Exact `1` bypasses the complex64 solver's fp32 matmul-precision refusal; `0` disables it. The existing exact-match grammar is retained: every other value (including `true`, `on`, and whitespace-padded `1`) leaves the guard enabled. This does not set JAX precision; it permits a solve at the existing precision, potentially TF32, with larger matvec error and a higher refinement residual floor. A/B measurement only. |
+
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
 cache (§2 — a machine fact; its mandatory-`""` status during regression
 timing belongs in the job script, not the physics input).
