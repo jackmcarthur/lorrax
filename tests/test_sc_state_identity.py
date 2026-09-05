@@ -81,3 +81,36 @@ def test_three_way_partition_diagonal_and_criterion_agree():
         new = np.zeros((1, 3)); new[0, band] = 1.
         verdict = protected_band_convergence(new, np.zeros_like(new), prot, inr, .1)
         assert verdict.converged == (band == 2)
+
+
+def test_map_readout_freezes_output_reference_and_does_not_change_carry(monkeypatch):
+    from types import SimpleNamespace
+    from gw import sc_iteration as sc
+    from common import collectives
+    from gw.band_partition import BandPartition
+    u = np.eye(3)[None].astype(complex)
+    e = np.array([[0., 1., 3.]])
+    mask = np.ones(3, bool)
+    partition = BandPartition(mask, mask)
+    inputs = SimpleNamespace(mesh_xy=None, config=SimpleNamespace(
+        sc=SimpleNamespace(exact_degeneracy_tol_ev=1e-4)))
+    logs = []
+    monkeypatch.setattr(collectives, 'gather_to_host', np.asarray)
+    monkeypatch.setattr(sc, '_record_sc', lambda inputs, text: logs.append(text))
+    output_rotation = [u]
+    monkeypatch.setattr(sc, '_kshard_eigh_kernels',
+                        lambda *a: (lambda h: (e, output_rotation[0]), None))
+    outputs = sc.SCOutputs(None, u, None, None, None)
+    state = sc.SCState(np.diag(e[0])[None], 1, partition, outputs=outputs)
+    history = {}
+    v0, _ = sc._sc_identity_for_call(inputs, state, e, e, history, cutoff_ev=.01)
+    assert v0.converged
+    output_rotation[0] = u[:, :, [0, 2, 1]]
+    verdict, updated = sc._sc_identity_for_call(
+        inputs, state, e, e, history, cutoff_ev=.01)
+    assert not verdict.converged and verdict.max_abs_ev == 2.
+    assert verdict.rms_all_ev == 0.  # explicitly the legacy sorted diagnostic
+    assert updated.H_qp_dft is state.H_qp_dft
+    np.testing.assert_array_equal(history['u'], u)
+    np.testing.assert_array_equal(updated.outputs.identity['motion_ev'], [[0., 2., -2.]])
+    assert 'sorted-index value 0.000000000e+00' in logs[-1]

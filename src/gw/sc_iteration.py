@@ -4030,6 +4030,7 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
         aligned_out, aligned_in, protected, in_range, cutoff_ev)
     sorted_verdict = protected_band_convergence(
         e_output_ev, e_input_ev, protected, in_range, cutoff_ev)
+    verdict = replace(verdict, rms_all_ev=sorted_verdict.rms_all_ev)
     previous = history['previous']
     motion = (np.full(out_e.shape, np.nan) if previous is None else out_e - previous)
     history['previous'] = out_e.copy()
