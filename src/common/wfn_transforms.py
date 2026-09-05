@@ -62,9 +62,10 @@ if TYPE_CHECKING:
 __all__ = [
     "FULL_BLOCH_TRANSFORM_SCHEME",
     "to_box", "to_rbox", "to_rmu", "to_rchunk",
-    "to_rmu_inner", "to_rchunk_inner", "take_rchunk_padded",
+    "to_rmu_inner", "to_rchunk_inner", "to_rpoints_inner",
+    "take_rchunk_padded",
     "gflat_to_rchunk_aot_memory", "gflat_to_rchunk_aot_peak_bytes",
-    "apply_bloch_phase", "apply_bloch_phase_on_slice",
+    "apply_bloch_phase", "apply_bloch_phase_on_slice", "apply_bloch_phase_at",
     "gflat_to_rmu",
     "accumulate_rchunk_to_gflat",
     # ψ(G)-loading helpers relocated from the former common/load_wfns.py.
@@ -670,6 +671,67 @@ def to_rchunk_inner(
     if kvecs_frac is not None:
         slab = apply_bloch_phase_on_slice(
             slab, kvecs_frac, fft_grid_t, r0, r_len_i)
+    return slab
+
+
+def to_rpoints_inner(
+    psi: jax.Array,
+    g_index: jax.Array,
+    fft_grid: Sequence[int],
+    r_flat_idx: jax.Array,
+    *,
+    norm: str = "backward",
+    kvecs_frac: jax.Array | None = None,
+) -> jax.Array:
+    """The arbitrary-point twin of :func:`to_rchunk_inner`.
+
+    Same body — G-flat → FFT-box → local IFFT → reshape to
+    ``(..., n_rtot)`` → optional Bloch phase — except that the r cells
+    kept are the arbitrary flat FFT indices ``r_flat_idx`` rather than a
+    contiguous run.  This is what an orbit-packed real-grid tile needs:
+    the points of one symmetry orbit are scattered through the flat r
+    index, so no ``dynamic_slice`` can name them.
+
+    Inputs
+    ------
+    psi
+        Shape ``(..., ngkmax)`` c128, with exactly 3 leading axes before
+        ``ngkmax`` — same contract as :func:`to_rchunk_inner`.
+    g_index
+        Shape ``(..., ngkmax)`` int32 flat box indices per k.
+    fft_grid
+        ``(nx, ny, nz)``.
+    r_flat_idx
+        ``(R,)`` int32, possibly traced — the flat-r cells to keep, in
+        any order.  Indices outside ``[0, n_rtot)`` are pad slots that
+        the CALLER masks to zero; this function only keeps the gathers
+        in bounds (it clips them, so those cells come back holding some
+        other cell's finite value, not garbage and not zero).
+    norm
+        FFT normalization, same conventions as ``jnp.fft.ifftn``.
+    kvecs_frac
+        Optional ``(..., 3)`` float64 — when given, the Bloch phase
+        ``exp(+2πi k·r)`` is applied via :func:`apply_bloch_phase_at`.
+
+    Output
+    ------
+    jax.Array
+        Shape ``(..., R)`` c128.
+    """
+    ngkmax = int(psi.shape[-1])
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    nx, ny, nz = fft_grid_t
+    n_rtot = nx * ny * nz
+
+    box = _box_kernel(psi, g_index, ngkmax=ngkmax)
+    rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
+    # Reshape (..., nx, ny, nz) → (..., n_rtot), then gather the tile's
+    # own cells.  Same 3-leading-axes contract as to_rchunk_inner.
+    rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
+    r_idx = jnp.asarray(r_flat_idx, dtype=jnp.int32)
+    slab = jnp.take(rb_flat, jnp.clip(r_idx, 0, n_rtot - 1), axis=-1)
+    if kvecs_frac is not None:
+        slab = apply_bloch_phase_at(slab, kvecs_frac, fft_grid_t, r_idx)
     return slab
 
 
@@ -1445,11 +1507,12 @@ def accumulate_rchunk_to_gflat(
     *,
     mesh: Mesh,
     fft_grid: Sequence[int],
-    r0,
+    r0=None,
     sphere_idx: np.ndarray | jax.Array,
     qvec_frac: np.ndarray | jax.Array | None = None,
     norm: str = "backward",
     chunk_size: int | None = None,
+    r_indices: jax.Array | None = None,
 ) -> jax.Array:
     """Add ``FFT(pad(phase(rchunk)))[sphere_idx]`` into ``gflat_acc``.
 
@@ -1486,7 +1549,8 @@ def accumulate_rchunk_to_gflat(
             (zero-pad) so the contrib they produce is zero — no
             contamination of ``acc``.
          b. Slab → FFT box via ``dynamic_update_slice_in_dim`` at
-            offset ``r0``.
+            offset ``r0``, or, on the ``r_indices`` path, via a
+            ``.at[:, r_indices].set(..., mode='drop')`` scatter.
          c. Per-q Bloch phase, if ``qvec_frac`` given: separable
             ``exp(-2πi q · r)`` factors, pre-computed per q at trace
             time, gathered per row by ``q_row``.
@@ -1516,7 +1580,13 @@ def accumulate_rchunk_to_gflat(
         Static ``(nx, ny, nz)``.
     r0
         Python int or jax-scalar — flat-r start of the slab in
-        ``[0, nx·ny·nz)``.
+        ``[0, nx·ny·nz)``.  Exactly one of ``r0`` / ``r_indices``.
+    r_indices
+        ``(r_len,)`` int32 device array — the arbitrary flat-r cells the
+        slab holds, for an orbit-packed real-grid tile whose points are
+        not contiguous in the flat r index.  Entries outside
+        ``[0, nx·ny·nz)`` are pad slots; the scatter drops them and the
+        phase lookup clips them.  Exactly one of ``r0`` / ``r_indices``.
     sphere_idx
         ``(n_q, ngkmax)`` int32 flat-FFT indices.  Every q has the
         same ``ngkmax`` axis length with potentially different index
@@ -1537,6 +1607,13 @@ def accumulate_rchunk_to_gflat(
     -------
     Updated ``gflat_acc`` (same shape, same sharding).
     """
+    indexed = r_indices is not None
+    if indexed == (r0 is not None):
+        raise ValueError(
+            "accumulate_rchunk_to_gflat: pass exactly one of r0 / r_indices "
+            f"(got r0={r0!r}, r_indices="
+            f"{'an array' if indexed else None}).")
+
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
     n_rtot = nx * ny * nz
@@ -1592,7 +1669,7 @@ def accumulate_rchunk_to_gflat(
         tuple(int(s) for s in rchunk.shape),
         tuple(int(s) for s in gflat_acc.shape),
         fft_grid_t, r_len_i, ngkmax, sphere_id,
-        norm, qvec_shape, qvec_id, cs, n_chunks, pad_N,
+        norm, qvec_shape, qvec_id, cs, n_chunks, pad_N, indexed,
         _sharding_key(rchunk), _sharding_key(gflat_acc),
     )
 
@@ -1620,8 +1697,10 @@ def accumulate_rchunk_to_gflat(
                  in_specs=(in_spec, in_spec, P()),
                  out_specs=out_spec,
                  check_vma=False)
-        def _kernel(rch_, acc_, r0_):
+        def _kernel(rch_, acc_, r_):
             # Per-rank: (n_q, n_mu_local, r_len) / (n_q, n_mu_local, ngkmax).
+            # ``r_`` is the flat-r start scalar (r0 path) or the (r_len,)
+            # index table (r_indices path); both arrive replicated.
             rch_flat = rch_.reshape(N, r_len_i)
             acc_flat = acc_.reshape(N, ngkmax)
             if pad_N:
@@ -1636,7 +1715,8 @@ def accumulate_rchunk_to_gflat(
             # r0_ is loop-invariant within the scan (the scan iterates over
             # rows of the flat (q · μ_local) axis, not r-chunks).
             if phx is not None:
-                r_idx_slab = r0_ + jnp.arange(r_len_i, dtype=jnp.int32)
+                r_idx_slab = (jnp.clip(r_, 0, n_rtot - 1) if indexed
+                              else r_ + jnp.arange(r_len_i, dtype=jnp.int32))
                 ny_nz = jnp.int32(ny * nz)
                 rx_slab = r_idx_slab // ny_nz
                 ry_slab = (r_idx_slab // jnp.int32(nz)) % jnp.int32(ny)
@@ -1657,7 +1737,13 @@ def accumulate_rchunk_to_gflat(
                     phz_q = phz[q_row][:, rz_slab]
                     sub = sub * phx_q * phy_q * phz_q
                 buf = jnp.zeros((cs, n_rtot), dtype=sub.dtype)
-                buf = jax.lax.dynamic_update_slice_in_dim(buf, sub, r0_, axis=-1)
+                if indexed:
+                    # ``mode='drop'`` discards the pad slots, leaving those
+                    # box cells at the zeros they were initialised to.
+                    buf = buf.at[:, r_].set(sub, mode='drop')
+                else:
+                    buf = jax.lax.dynamic_update_slice_in_dim(
+                        buf, sub, r_, axis=-1)
                 box = buf.reshape(cs, nx, ny, nz)
                 G = local_fftn3(box, axes=(-3, -2, -1), norm=norm).reshape(cs, n_rtot)
                 contrib = jnp.take_along_axis(
@@ -1675,8 +1761,11 @@ def accumulate_rchunk_to_gflat(
         return jax.jit(_kernel, donate_argnums=(1,))
 
     fn = _cached_jit('accumulate_rchunk_to_gflat', key, build)
-    r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
-    return fn(rchunk, gflat_acc, r0_arg)
+    if indexed:
+        r_arg = jnp.asarray(r_indices, dtype=jnp.int32)
+    else:
+        r_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
+    return fn(rchunk, gflat_acc, r_arg)
 
 
 # ---------------------------------------------------------------------------
@@ -1741,6 +1830,66 @@ def apply_bloch_phase(
     return box * px * py * pz
 
 
+def apply_bloch_phase_at(
+    slab: jax.Array,
+    kvecs_frac: jax.Array,
+    fft_grid: tuple[int, int, int],
+    flat_idx: jax.Array,
+    *,
+    sign: int = 1,
+) -> jax.Array:
+    """``slab × exp(sign·2πi k·r)`` at arbitrary flat-r grid points.
+
+    The arbitrary-point twin of :func:`apply_bloch_phase_on_slice`, which
+    is now a thin wrapper over this function.  Its slab cells are the
+    contiguous run ``[r0, r0 + r_len)``; here they are whatever flat FFT
+    indices ``flat_idx`` names, in whatever order — the layout an
+    orbit-packed real-grid tile has, where the points of one symmetry
+    orbit are scattered through the flat r index.
+
+    Flat-r convention matches :func:`to_rchunk`:
+    ``r_flat = rx · ny · nz + ry · nz + rz``.
+
+    ``slab``: trailing shape ``(..., r_len)``.  Sharding preserved.
+    ``flat_idx``: ``(r_len,)`` int32, possibly traced.  Entries outside
+        ``[0, nx·ny·nz)`` are inert carrier cells; their phase lookup is
+        clipped into range so every gather stays in bounds, exactly as
+        the contiguous version does for a padded slab tail.  Valid
+        coordinates are unchanged bit-for-bit.
+    """
+    nx, ny, nz = (int(s) for s in fft_grid)
+    r_len_i = int(flat_idx.shape[-1])
+
+    fx = jnp.arange(nx, dtype=jnp.float64) / nx
+    fy = jnp.arange(ny, dtype=jnp.float64) / ny
+    fz = jnp.arange(nz, dtype=jnp.float64) / nz
+    scale = jnp.complex128(int(sign) * 2j * jnp.pi)
+    px = jnp.exp(scale * kvecs_frac[:, 0:1] * fx[None, :])    # (n_k, nx)
+    py = jnp.exp(scale * kvecs_frac[:, 1:2] * fy[None, :])
+    pz = jnp.exp(scale * kvecs_frac[:, 2:3] * fz[None, :])
+
+    # Decode r_flat → (rx, ry, rz) on the slab.  ``ny``/``nz`` are static
+    # so the divmod constants fold cleanly whether ``flat_idx`` is a
+    # constant table or a traced one.
+    flat = jnp.clip(flat_idx, 0, nx * ny * nz - 1)           # (r_len,)
+    rx = flat // (ny * nz)
+    ry = (flat // nz) % ny
+    rz = flat % nz
+
+    # Per-slab-cell phase factor (n_k, r_len).
+    p_x_slab = jnp.take(px, rx, axis=1)                      # (n_k, r_len)
+    p_y_slab = jnp.take(py, ry, axis=1)
+    p_z_slab = jnp.take(pz, rz, axis=1)
+    phase_slab = p_x_slab * p_y_slab * p_z_slab              # (n_k, r_len)
+
+    # Broadcast against slab's trailing r-axis; pad k with intermediate
+    # broadcast axes (band, spinor, μ, ...) just like apply_bloch_phase.
+    n_mid = slab.ndim - 2                                    # k + mid + r
+    mid_shape = (1,) * n_mid
+    phase_slab = phase_slab.reshape(phase_slab.shape[0], *mid_shape, r_len_i)
+    return slab * phase_slab
+
+
 def apply_bloch_phase_on_slice(
     slab: jax.Array,
     kvecs_frac: jax.Array,
@@ -1763,49 +1912,19 @@ def apply_bloch_phase_on_slice(
     than the full box — pulls per-r-cell work from
     ``n_k × nx · ny · nz`` down to ``n_k × r_len``.
 
+    The contiguous run is just one index list, so the body is a call to
+    :func:`apply_bloch_phase_at` with ``r0 + arange(r_len)`` — the same
+    clip and the same ops it always did.
+
     ``slab``: trailing shape ``(..., r_len)``.  Sharding preserved.
     ``r0``: Python int or a jax scalar (traced).  When traced, callers
         are responsible for the bounds check.
     ``r_len``: static int — slab length.
     """
-    nx, ny, nz = (int(s) for s in fft_grid)
     r_len_i = int(r_len)
-
-    fx = jnp.arange(nx, dtype=jnp.float64) / nx
-    fy = jnp.arange(ny, dtype=jnp.float64) / ny
-    fz = jnp.arange(nz, dtype=jnp.float64) / nz
-    scale = jnp.complex128(int(sign) * 2j * jnp.pi)
-    px = jnp.exp(scale * kvecs_frac[:, 0:1] * fx[None, :])    # (n_k, nx)
-    py = jnp.exp(scale * kvecs_frac[:, 1:2] * fy[None, :])
-    pz = jnp.exp(scale * kvecs_frac[:, 2:3] * fz[None, :])
-
-    # Decode r_flat → (rx, ry, rz) on the slab.  Works for both Python-
-    # int ``r0`` (broadcast as a constant) and jax-scalar ``r0`` (each
-    # element a traced add).  ``nyn nz`` are static so divmod constants
-    # fold cleanly.
-    # ``to_rchunk_inner`` permits a fixed-width carrier whose final cells
-    # lie beyond the physical FFT box and are exact zeros.  Clip only the
-    # phase lookup for those inert cells so every gather remains in bounds;
-    # valid slab coordinates are unchanged bit-for-bit.
-    flat = jnp.clip(
-        r0 + jnp.arange(r_len_i, dtype=jnp.int32),
-        0, nx * ny * nz - 1)                                # (r_len,)
-    rx = flat // (ny * nz)
-    ry = (flat // nz) % ny
-    rz = flat % nz
-
-    # Per-slab-cell phase factor (n_k, r_len).
-    p_x_slab = jnp.take(px, rx, axis=1)                      # (n_k, r_len)
-    p_y_slab = jnp.take(py, ry, axis=1)
-    p_z_slab = jnp.take(pz, rz, axis=1)
-    phase_slab = p_x_slab * p_y_slab * p_z_slab              # (n_k, r_len)
-
-    # Broadcast against slab's trailing r-axis; pad k with intermediate
-    # broadcast axes (band, spinor, μ, ...) just like apply_bloch_phase.
-    n_mid = slab.ndim - 2                                    # k + mid + r
-    mid_shape = (1,) * n_mid
-    phase_slab = phase_slab.reshape(phase_slab.shape[0], *mid_shape, r_len_i)
-    return slab * phase_slab
+    return apply_bloch_phase_at(
+        slab, kvecs_frac, fft_grid,
+        r0 + jnp.arange(r_len_i, dtype=jnp.int32), sign=sign)
 
 
 # ===========================================================================
