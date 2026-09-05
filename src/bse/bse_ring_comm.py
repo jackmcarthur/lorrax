@@ -715,12 +715,7 @@ def build_bse_ring_matvec(
     # 'y'); the U transpose to the primitive's k-leading layout is priced
     # by the parity/perf gate, and composes with the future flat-k conv
     # layout (map §6.1 route (a)) which emits k-leading natively.
-    _w_decode = contract_bands_block_reshard(
-        mesh_xy, extra="leading",
-        divisibility_hint=(
-            "BSE callers: n_cond_pad / n_val_pad already pad c to p_x and "
-            "v to p_y (bse_io loader); an indivisible window here means an "
-            "unpadded/hand-built operand."))
+    _w_decode = contract_bands_block_reshard(mesh_xy, extra="leading")
 
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
         nspinor = psi_c_X.shape[2]
@@ -1037,12 +1032,7 @@ def build_bse_ring_matvec_full(
     # 'y'); the U transpose to the primitive's k-leading layout is priced
     # by the parity/perf gate, and composes with the future flat-k conv
     # layout (map §6.1 route (a)) which emits k-leading natively.
-    _w_decode = contract_bands_block_reshard(
-        mesh_xy, extra="leading",
-        divisibility_hint=(
-            "BSE callers: n_cond_pad / n_val_pad already pad c to p_x and "
-            "v to p_y (bse_io loader); an indivisible window here means an "
-            "unpadded/hand-built operand."))
+    _w_decode = contract_bands_block_reshard(mesh_xy, extra="leading")
 
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
         nspinor = psi_c_X.shape[2]
@@ -1441,8 +1431,13 @@ def build_realspace_random_transition_generator(
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
 
-    if n_cond_pad % px != 0 or n_val_pad % py != 0:
-        raise ValueError("n_cond_pad and n_val_pad must be divisible by px/py")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        n_cond_pad, n_cond_pad, mesh_xy, name="BSE conduction carrier",
+        spec=P(None, "x", None, None, None), axis=1)
+    authenticate_padded_axis(
+        n_val_pad, n_val_pad, mesh_xy, name="BSE valence carrier",
+        spec=P(None, None, "y", None, None), axis=2)
 
     v_chunk = n_val_pad // py
 
@@ -1824,5 +1819,3 @@ def ring_matvec_correctness_check(
         print(f"Component error D: { _rel_err(D_ring, D_ref):.3e}")
         print(f"Component error V: { _rel_err(V_ring, V_ref):.3e}")
         print(f"Component error W: { _rel_err(-W_ring, W_ref):.3e}")
-
-

@@ -96,24 +96,30 @@ def test_partial_retention_keeps_one_axis_of_a_square_mesh():
 
 
 # ---------------------------------------------------------------------------
-# padded_extent — the durable half of the module
+# runtime padded_axis — the producer half of the contract
 # ---------------------------------------------------------------------------
-def test_padded_extent_rounds_up_to_the_same_divisor_the_fitter_judges_by():
+def _padded(mesh, entry, n):
+    from runtime.padding import padded_axis
+    return padded_axis(
+        n, mesh, name="test axis", spec=P(entry), axis=0).carrier
+
+
+def test_padded_axis_rounds_up_to_the_same_divisor_the_fitter_judges_by():
     """A call site that pads against one divisor and is judged against another
     is worse than not padding at all, so both must read ``shard_factor``."""
     m64 = _StubMesh(x=8, y=8)
-    assert SF.padded_extent(m64, ("x", "y"), 32) == 64
-    assert SF.padded_extent(m64, "y", 785) == 792
-    assert SF.padded_extent(m64, None, 785) == 785
+    assert _padded(m64, ("x", "y"), 32) == 64
+    assert _padded(m64, "y", 785) == 792
+    assert _padded(m64, None, 785) == 785
 
 
-def test_padded_extent_is_a_no_op_when_the_extent_already_divides():
+def test_padded_axis_is_a_no_op_when_the_extent_already_divides():
     m16 = _StubMesh(x=4, y=4)
-    assert SF.padded_extent(m16, ("x", "y"), 32) == 32
+    assert _padded(m16, ("x", "y"), 32) == 32
 
 
 def test_the_padded_q_batch_is_exactly_what_the_fitter_stops_complaining_about():
-    """THE point of the pair: pad with ``padded_extent`` and ``legal_spec``
+    """THE point of the pair: pad with ``padded_axis`` and ``legal_spec``
     returns the spec untouched — the q-batch stops being degraded at all.
 
     The negative leg (raw 32) is what the exb wall measured; without it this
@@ -122,7 +128,7 @@ def test_the_padded_q_batch_is_exactly_what_the_fitter_stops_complaining_about()
     spec = P(("x", "y"), None, None)
     raw = SF.legal_spec(m64, spec, (32, 608, 608), "unit.pairA")
     assert raw is not spec, "the un-padded batch MUST still degrade"
-    bs = SF.padded_extent(m64, ("x", "y"), 32)
+    bs = _padded(m64, ("x", "y"), 32)
     padded = SF.legal_spec(m64, spec, (bs, 608, 608), "unit.pairB")
     assert padded is spec, "the padded batch must need no fitting at all"
 
@@ -248,7 +254,7 @@ def test_jax_refuses_a_TUPLE_spec_whose_product_does_not_divide():
         "the kept axis must actually split the extent 2 ways"
 
     # And the padded route: pad to 8 and the FULL product is legal again.
-    bs = SF.padded_extent(mesh, ("x", "y"), 6)
+    bs = _padded(mesh, ("x", "y"), 6)
     assert bs == 8
     ok = NamedSharding(mesh, P(("x", "y"), None))
     assert ok.shard_shape((bs, 5)) == (2, 5)

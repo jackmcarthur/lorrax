@@ -2291,7 +2291,7 @@ _DEFAULTS = {
     # fine-grid pass then completes for ANY N_q_fi.  Raise it to trade
     # memory for fewer collectives, lower it on a memory-tight rank.  It is
     # a FLOOR: rounded up to a multiple of the device count so the q axis
-    # stays shardable (bse_setup pads with sharding_fit.padded_extent).
+    # stays shardable (bse_setup pads with runtime.padding.padded_axis).
     # Ignored by the distributed-eigh path, whose chunk is 1 by
     # construction.  See bandstructure.bse_setup.compute_wfns_fi.
     "wfn_fi_q_chunk": 0,

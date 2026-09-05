@@ -1,11 +1,9 @@
 """Unit tests for the σ band-window mesh pad/strip pair.
 
-``gw.ppm_sigma.pad_sigma_window`` / ``strip_sigma_window`` are the fix
-the reduce-scatter divisibility guard in ``ppm_tau_kernel`` prescribes:
-m is padded to a multiple of p_x and n to a multiple of p_y
-INDEPENDENTLY (the p_x·p_y product rule is denounced as up-to-3.16×
-waste in the pad's own docstring), the pad block of Σ is exactly zero,
-and the strip is the single seam where the padded extent stops.
+``gw.ppm_sigma.pad_sigma_window`` delegates to the runtime padding owner and
+returns its tag.  Both matrix axes use one square carrier: the lcm of their
+actual shard divisors, not the device product.  The carrier survives until a
+consumer asks the owner for the logical slice.
 
 QUALITY_PATTERNS class 2 lists the σ-window divisibility among the
 scale-threshold failures: the default suite runs a 1×1 mesh where the
@@ -60,45 +58,40 @@ def test_pad_extents_rectangular_mesh_one_axis_only():
     # MoS2 12x12 configuration: window 70 on an 8x10 mesh.
     # m -> 72 (next multiple of p_x=8); n stays 70 (70 % 10 == 0).
     xr, yn = _psi_pair(nk=2, nb=70, ns=1, nmu=3)
-    xr_p, yn_p, nb_real = pad_sigma_window(xr, yn, _mesh(8, 10))
-    assert nb_real == 70
-    assert xr_p.shape == (2, 72, 1, 3)
-    assert yn_p.shape == (2, 1, 3, 70)
-    # The divisible axis is an identity passthrough — same buffer.
-    assert yn_p is yn
-    # m_pad != n_pad: the independent per-axis contract, NOT the
-    # p_x*p_y product rule (which would demand 80x80 here).
-    assert int(xr_p.shape[1]) != int(yn_p.shape[3])
+    xr_p, yn_p, tag = pad_sigma_window(xr, yn, _mesh(8, 10))
+    assert (tag.logical, tag.carrier, tag.divisor) == (70, 80, 40)
+    assert xr_p.shape == (2, 80, 1, 3)
+    assert yn_p.shape == (2, 1, 3, 80)
 
 
 def test_pad_extents_square_mesh_both_axes():
     xr, yn = _psi_pair(nk=1, nb=70, ns=1, nmu=2)
-    xr_p, yn_p, nb_real = pad_sigma_window(xr, yn, _mesh(8, 8))
-    assert nb_real == 70
+    xr_p, yn_p, tag = pad_sigma_window(xr, yn, _mesh(8, 8))
+    assert tag.logical == 70
     assert xr_p.shape[1] == 72 and yn_p.shape[3] == 72
     # 72x72 = 5184, not the product rule's 128x128 = 16384 (3.16x).
 
 
 def test_pad_noop_when_divisible():
     xr, yn = _psi_pair(nk=1, nb=8, ns=1, nmu=2)
-    xr_p, yn_p, nb_real = pad_sigma_window(xr, yn, _mesh(4, 2))
-    assert nb_real == 8
+    xr_p, yn_p, tag = pad_sigma_window(xr, yn, _mesh(4, 2))
+    assert tag.logical == 8
     # Full identity: both buffers returned untouched.
     assert xr_p is xr and yn_p is yn
 
 
 def test_pad_block_exactly_zero_and_real_block_untouched():
     xr, yn = _psi_pair(nk=2, nb=5, ns=2, nmu=3)
-    xr_p, yn_p, nb_real = pad_sigma_window(xr, yn, _mesh(3, 4))
-    assert (xr_p.shape[1], yn_p.shape[3]) == (6, 8)
+    xr_p, yn_p, tag = pad_sigma_window(xr, yn, _mesh(3, 4))
+    assert (xr_p.shape[1], yn_p.shape[3]) == (12, 12)
     # Pad rows/cols are EXACT zeros (the Σ pad block being exactly zero
     # is bilinear in these).
-    assert np.all(np.asarray(xr_p)[:, nb_real:] == 0.0)
-    assert np.all(np.asarray(yn_p)[..., nb_real:] == 0.0)
+    assert np.all(np.asarray(xr_p)[:, tag.logical:] == 0.0)
+    assert np.all(np.asarray(yn_p)[..., tag.logical:] == 0.0)
     # The real block is bit-identical to the input.
-    np.testing.assert_array_equal(np.asarray(xr_p)[:, :nb_real],
+    np.testing.assert_array_equal(np.asarray(xr_p)[:, :tag.logical],
                                   np.asarray(xr))
-    np.testing.assert_array_equal(np.asarray(yn_p)[..., :nb_real],
+    np.testing.assert_array_equal(np.asarray(yn_p)[..., :tag.logical],
                                   np.asarray(yn))
 
 
@@ -112,7 +105,9 @@ def test_strip_one_axis_padded_m_only():
     nb = 70
     sigma = jnp.asarray(np.arange(2 * 3 * 72 * 70, dtype=np.float64)
                         .reshape(2, 3, 72, 70))
-    out = strip_sigma_window(sigma, nb)
+    from runtime.padding import PaddedAxis
+    out = strip_sigma_window(
+        sigma, PaddedAxis("Sigma bands", nb, 70, 1))
     assert out.shape == (2, 3, 70, 70)
     np.testing.assert_array_equal(np.asarray(out),
                                   np.asarray(sigma)[..., :nb, :nb])
@@ -122,7 +117,9 @@ def test_strip_both_axes_padded():
     nb = 5
     sigma = jnp.asarray(np.random.default_rng(3)
                         .standard_normal((1, 6, 8)))
-    out = strip_sigma_window(sigma, nb)
+    from runtime.padding import PaddedAxis
+    out = strip_sigma_window(
+        sigma, PaddedAxis("Sigma bands", nb, 8, 1))
     assert out.shape == (1, 5, 5)
     np.testing.assert_array_equal(np.asarray(out),
                                   np.asarray(sigma)[..., :nb, :nb])
@@ -132,8 +129,10 @@ def test_strip_noop_and_none():
     nb = 4
     sigma = jnp.zeros((2, nb, nb))
     # Unpadded input: identity (same object, no slice copy).
-    assert strip_sigma_window(sigma, nb) is sigma
-    assert strip_sigma_window(None, nb) is None
+    from runtime.padding import PaddedAxis
+    tag = PaddedAxis("Sigma bands", nb, nb, 1)
+    assert strip_sigma_window(sigma, tag) is sigma
+    assert strip_sigma_window(None, tag) is None
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +145,7 @@ def test_pad_strip_round_trip(p_x, p_y, nb):
     exactly-zero pad block, and strip recovers exactly the unpadded
     contraction — the guarantee the shared spatial kernel relies on."""
     xr, yn = _psi_pair(nk=1, nb=nb, ns=1, nmu=2)
-    xr_p, yn_p, nb_real = pad_sigma_window(xr, yn, _mesh(p_x, p_y))
+    xr_p, yn_p, tag = pad_sigma_window(xr, yn, _mesh(p_x, p_y))
 
     def _sigma(a_xr, a_yn):
         # Σ[k,m,n] = Σ_{s,μ,s',μ'} ψ*_m σ ψ_n with σ = identity coupling:
@@ -158,10 +157,10 @@ def test_pad_strip_round_trip(p_x, p_y, nb):
     assert padded.shape == (1, xr_p.shape[1], yn_p.shape[3])
     # Pad block exactly zero (rows m >= nb and cols n >= nb).
     pb = np.asarray(padded)
-    assert np.all(pb[:, nb_real:, :] == 0.0)
-    assert np.all(pb[:, :, nb_real:] == 0.0)
+    assert np.all(pb[:, tag.logical:, :] == 0.0)
+    assert np.all(pb[:, :, tag.logical:] == 0.0)
     # Strip == the unpadded contraction, bit-identical (pure data
     # movement: appending zero bands perturbs no existing element).
-    stripped = strip_sigma_window(padded, nb_real)
+    stripped = strip_sigma_window(padded, tag)
     np.testing.assert_array_equal(np.asarray(stripped),
                                   np.asarray(_sigma(xr, yn)))

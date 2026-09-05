@@ -179,7 +179,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import warm_mesh_cliques
-from runtime.padding import round_up, spec_divisor
+from runtime.padding import spec_divisor
 
 #: The two exchange schedules that land on ``P((ax_x, ax_y), None, None)``.
 #: ``split_b_first`` is the default and the measured one; ``flatten_m_first``
@@ -196,17 +196,6 @@ __all__ = [
     "ROUTES",
     "DEFAULT_ROUTE",
 ]
-
-
-_DIVISIBILITY_MSG = (
-    "face_to_batch_reshard: the staged exchange tiles B over {ax_x}·{ax_y}, "
-    "M over {ax_x} and N over {ax_y}, so all three must divide exactly; got "
-    "B={b} (% {ndev} = {b_rem}), M={m} (% {px} = {m_rem}), N={n} "
-    "(% {py} = {n_rem}) on a {px}x{py} mesh.  Fix by PADDING the offending "
-    "extent to the mesh (common.sharding_fit.padded_extent), not by degrading "
-    "the spec: a degraded spec here is a replicated batch, which is the "
-    "failure this primitive exists to remove.{hint}"
-)
 
 
 def band_to_product_r_reshard(
@@ -298,12 +287,13 @@ def band_to_product_r_reshard(
                 f"committed to {in_spec} on the supplied Mesh; got "
                 f"spec={P(*actual_spec)} on {type(sharding).__name__}. "
                 "Refusing an implicit pre-reshard at the shard_map boundary.")
-        if shape[1] % band_divisor or shape[3] % r_divisor:
-            raise ValueError(
-                "band_to_product_r_reshard requires the band and r extents "
-                f"to divide the {p_x}x{p_y} mesh product: shape={shape}. "
-                "Pad bands through WfnLoader and r through "
-                "runtime.padding.pad_axis.")
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            shape[1], shape[1], band_divisor,
+            name="band-to-r band carrier")
+        authenticate_padded_axis(
+            shape[3], shape[3], r_divisor,
+            name="band-to-r real-space carrier")
         return compiled(a)
 
     # Production calls enter through ``_reshard`` so the concrete array's
@@ -468,15 +458,23 @@ def face_to_batch_reshard_supported(mesh: Mesh, shape, *,
         return False
     if len(shape) != 3:
         return False
-    p_x, p_y = int(mesh.shape[ax_x]), int(mesh.shape[ax_y])
     b, m, n = (int(s) for s in shape)
-    return b % (p_x * p_y) == 0 and m % p_x == 0 and n % p_y == 0
+    from runtime.padding import padded_axis
+    return (
+        padded_axis(
+            b, mesh, name="face batch carrier",
+            spec=P(('x', 'y'), None, None), axis=0).carrier == b
+        and padded_axis(
+            m, mesh, name="face row carrier",
+            spec=P(None, 'x', None), axis=1).carrier == m
+        and padded_axis(
+            n, mesh, name="face column carrier",
+            spec=P(None, None, 'y'), axis=2).carrier == n)
 
 
 def face_to_batch_reshard(mesh: Mesh, *,
                           axes: tuple[str, str] = ("x", "y"),
                           route: str = DEFAULT_ROUTE,
-                          divisibility_hint: str = "",
                           log_fn=None) -> Callable:
     """Factory: a ``shard_map``'d ``(B, M, N)`` face→batch reshard.
 
@@ -492,9 +490,6 @@ def face_to_batch_reshard(mesh: Mesh, *,
         One of :data:`ROUTES` — which pair of exchanges to issue.  See the
         module docstring; the two are element-identical and differ only in
         schedule, peer counts and (for ``flatten_m_first``) a local M pad.
-    divisibility_hint
-        Appended to the divisibility refusal so a call site can name its
-        own padding lever.
     log_fn
         Optional rank-0 logger; used to announce the ``flatten_m_first``
         pad, which is a real cost and must never be silent.
@@ -539,7 +534,8 @@ def face_to_batch_reshard(mesh: Mesh, *,
             f"agreeing.  Build the mesh with {ax_y!r} minor, or pass "
             f"axes=(major, minor) matching your mesh.")
     p_x, p_y = int(mesh.shape[ax_x]), int(mesh.shape[ax_y])
-    ndev = p_x * p_y
+    from runtime.padding import mesh_divisor
+    ndev = mesh_divisor(mesh)
     _log = log_fn if log_fn is not None else (lambda *a, **k: None)
 
     def _body_split_b_first(a):
@@ -608,20 +604,22 @@ def face_to_batch_reshard(mesh: Mesh, *,
                 f"face_to_batch_reshard expects a rank-3 (B, M, N) array, "
                 f"got shape {shape}")
         b, m, n = shape
-        if b % ndev or m % p_x or n % p_y:
-            raise ValueError(_DIVISIBILITY_MSG.format(
-                b=b, m=m, n=n, px=p_x, py=p_y, ndev=ndev,
-                b_rem=b % ndev, m_rem=m % p_x, n_rem=n % p_y,
-                ax_x=ax_x, ax_y=ax_y,
-                hint=(("  " + divisibility_hint) if divisibility_hint
-                      else "")))
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            b, b, ndev, name="face-to-batch batch carrier")
+        authenticate_padded_axis(
+            m, m, p_x, name="face-to-batch row carrier")
+        authenticate_padded_axis(
+            n, n, p_y, name="face-to-batch column carrier")
         sm = _sm_cache.get(shape)
         if sm is None:
             if route == "split_b_first":
                 sm = _make_sm(_body_split_b_first)
             else:
                 m_loc = m // p_x
-                m_pad = round_up(m_loc, p_y)
+                from runtime.padding import padded_axis
+                m_pad = padded_axis(
+                    m_loc, p_y, name="face-to-batch local row carrier").carrier
                 if m_pad == m_loc:
                     keep = None
                 else:

@@ -16,16 +16,14 @@ from common.progress import LoopProgress
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
-from gw.ppm_sigma import (SigmaOmegaResult,
-                          _residue_for_space,
-                          assert_sharded_sigma_window_divides_mesh,
-                          pad_sigma_window, strip_sigma_window)
+from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_box_plan import plan_sigma_windows
 from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import face_kernel_kwargs
 from runtime.env_flags import env_bool
+from runtime.padding import pad_to_axis
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             CROSSING_NODE_FLOOR,
@@ -166,6 +164,8 @@ def _integrate_sigma_batches(
         raise ValueError("omega_grid_ry must be a nonempty vector")
 
     s = wfns.slices
+    sigma_axis = sigma_band_axis(
+        int(s.nb_sigma), mesh_xy, ansatz="dynamic")
     bracketed = brackets is not None
     if bracketed:
         brackets = tuple(
@@ -183,17 +183,10 @@ def _integrate_sigma_batches(
         state_slice = s.full if bracketed else s.sigma_sum
         psi_coh_xn, psi_coh_yr = wfns.xn(state_slice), wfns.yr(state_slice)
         psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
-        # THE SAME precondition the PPM sharded branch owns.  This executor
-        # accumulates into a P(None,None,'x','y') array and then strips the pad
-        # block off both trailing axes, which on an indivisible window leaves a
-        # sharded array whose declared spec no longer divides its own shape.
-        # Before 2026-08-22 there was no divisibility check anywhere in this
-        # module while ppm_sigma refused the same case by name -- two contracts
-        # at one seam.
-        assert_sharded_sigma_window_divides_mesh(
-            int(psi_proj_xr.shape[1]), mesh_xy, ansatz="compute_mode = mpa")
-        psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
-            psi_proj_xr, psi_proj_yn, mesh_xy)
+        psi_proj_xr = pad_to_axis(
+            psi_proj_xr, sigma_axis, axis=1)
+        psi_proj_yn = pad_to_axis(
+            psi_proj_yn, sigma_axis, axis=3)
         spatial_shape = (int(psi_proj_xr.shape[0]),
                          int(psi_proj_xr.shape[1]),
                          int(psi_proj_yn.shape[3]))
@@ -204,36 +197,12 @@ def _integrate_sigma_batches(
         # UNSLICED for both roles — the accumulator BUILDS at the mesh-
         # divisible nb_full extent regardless of nb_sigma, and always
         # will: contract_bands.contract_bands_block_reshard's face arm
-        # (_face_project_kernel) builds its two distrib_la.gemm_plans
-        # EAGERLY at the fixed face_shape width (nb_full), shared with
-        # this same kernel's "coh"/G-build plan, so narrowing psi_proj's
-        # INPUT width would desync it from a plan compiled for nb_full —
-        # not this executor's call to make without reopening
-        # contract_bands.py's shared GEMM-plan contract (report §5: "do
-        # not fork ... a second Sigma projector").
-        #
-        # THE FIX (2026-08-23): the part that genuinely must land at
-        # nb_sigma is the OUTPUT — Sigma_c(omega,k,m,n)'s own (m,n) axes
-        # — not the input.  strip_sigma_window's device-array arm now
-        # applies wavefunction_bundle.pack_band_window's OWN mechanism
-        # (jax.lax.slice_in_dim + jax.lax.with_sharding_constraint) to
-        # those trailing axes in place of the numpy-style slice that is
-        # illegal on a mesh-sharded axis — the output-side analog of that
-        # primitive's input-side repack, reusing its idiom rather than
-        # inventing a second one.  That mechanism is legal ONLY when the
-        # target extent already divides the mesh (with_sharding_
-        # constraint requires it); an indivisible Σ window is the
-        # genuinely impossible sub-case and is refused by name, by the
-        # SAME shared owner the legacy branch above calls
-        # (assert_sharded_sigma_window_divides_mesh — "ONE owner for a
-        # contract two ansaetze reach at the same seam").  Reachability:
-        # low_mem_bands_dynamic_ppm_unported still refuses every
-        # compute_mode this function serves pending its own end-to-end
-        # gate (gw_config.py), so this arm is exercised by the parity
-        # tests and that gate, not yet by a general production path.
-        nb_real = int(s.nb_sigma)
-        assert_sharded_sigma_window_divides_mesh(
-            nb_real, mesh_xy, ansatz="compute_mode = mpa")
+        # The face projector's GEMM plan now takes the requested projection
+        # carrier separately from the resident full-band face.  The producer
+        # selects the logical Sigma window, appends exact-zero rows to the
+        # runtime-owned carrier, and the accumulator is born at that carrier
+        # width.  It stays there until a logical output consumer strips by
+        # ``sigma_axis``; no nondivisible sharded array is ever published.
         if bracketed and len(brackets) > 1:
             from gw.wavefunction_bundle import pack_band_window
             packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
@@ -244,8 +213,13 @@ def _integrate_sigma_batches(
         else:
             psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
             pack_brackets = False
-        psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
-        spatial_shape = (int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
+        psi_proj_xr = pad_to_axis(
+            wfns.psi_nmu, sigma_axis, axis=1)
+        psi_proj_yn = pad_to_axis(
+            wfns.psi_mun, sigma_axis, axis=3)
+        spatial_shape = (
+            int(meta.nk_tot), sigma_axis.carrier, sigma_axis.carrier)
+        face_kwargs["face_band_extent"] = sigma_axis.carrier
     if wfns.layout == "legacy":
         pack_brackets = False
     if bracketed:
@@ -368,8 +342,7 @@ def _integrate_sigma_batches(
         gc.collect()
     progress.finish()
 
-    sigma = strip_sigma_window(
-        accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
+    sigma = accumulator.finalize()
     if bracketed:
         sigma = jax.jit(
             lambda values: jnp.cumsum(values, axis=0),
@@ -400,6 +373,7 @@ def _integrate_sigma_batches(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
         sigma_c_kij=sigma,
+        band_axis=sigma_axis,
         band_counts=(() if band_counts is None else tuple(band_counts)),
         odd_even_residue_ratio=ratio)
 

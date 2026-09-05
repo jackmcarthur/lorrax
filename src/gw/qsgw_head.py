@@ -164,7 +164,6 @@ must not be gated.  Every head consumer reads the measured verdict from
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import lcm
 from typing import Callable
 
 import jax
@@ -346,8 +345,12 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
     module dispatches a foreign sharding or invents a second placement path.
     """
     nb = int(v.shape[-1])
-    alignment = lcm(int(mesh.shape["x"]), int(mesh.shape["y"]))
-    nb_padded = ((nb + alignment - 1) // alignment) * alignment
+    from runtime.padding import padded_axis
+    band_axis = padded_axis(
+        nb, mesh, name="QSGW head band carrier",
+        specs=((P(None, None, "x", None), 2),
+               (P(None, None, None, "y"), 3)))
+    nb_padded = band_axis.carrier
     if nb_padded != nb:
         pad = nb_padded - nb
         v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
@@ -1215,7 +1218,10 @@ def _s_tensor_kernel(
         # costs nothing extra.
         n_omega = omegas.shape[0]
         block = min(_HEAD_WING_FREQUENCY_BLOCK, int(n_omega))
-        n_padded = ((int(n_omega) + block - 1) // block) * block
+        from runtime.padding import padded_axis
+        n_padded = padded_axis(
+            int(n_omega), block,
+            name="head-wing frequency block carrier").carrier
         pad = n_padded - int(n_omega)
         omega_blocks = jnp.pad(
             omegas, (0, pad), constant_values=jnp.asarray(1.0j, dtype=omegas.dtype)
@@ -1308,7 +1314,10 @@ def _head_wing_kernel_legacy(
 
     def _frequency_layout(n_omega):
         block = min(_HEAD_WING_FREQUENCY_BLOCK, int(n_omega))
-        padded = ((int(n_omega) + block - 1) // block) * block
+        from runtime.padding import padded_axis
+        padded = padded_axis(
+            int(n_omega), block,
+            name="face head-wing frequency carrier").carrier
         return block, padded
 
     def _local(
@@ -1670,7 +1679,10 @@ def _head_wing_kernel_face(
             jnp.abs(omegas) > 1.0e-15, 1.0 / z,
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
         freq_block = min(_HEAD_WING_FREQUENCY_BLOCK, int(n_omega))
-        n_omega_padded = ((int(n_omega) + freq_block - 1) // freq_block) * freq_block
+        from runtime.padding import padded_axis
+        n_omega_padded = padded_axis(
+            int(n_omega), freq_block,
+            name="face head response frequency carrier").carrier
         freq_pad = n_omega_padded - int(n_omega)
         z_blocks = jnp.pad(
             z, (0, freq_pad),
@@ -1701,8 +1713,12 @@ def _head_wing_kernel_face(
 
         # ---- Y_x: mu on X (psi_mun's own axis), gather bands over Y ----
         mu_x_block = min(_HEAD_WING_MU_BLOCK, int(mu_x_local))
-        n_x_blocks = -(-int(mu_x_local) // mu_x_block)
-        mu_x_padded = n_x_blocks * mu_x_block
+        from runtime.padding import padded_axis
+        mu_x_axis = padded_axis(
+            int(mu_x_local), mu_x_block,
+            name="face head left-centroid work carrier")
+        mu_x_padded = mu_x_axis.carrier
+        n_x_blocks = mu_x_padded // mu_x_block
         bra_mun_padded = jnp.pad(
             bra_mun_local,
             ((0, 0), (0, 0), (0, mu_x_padded - mu_x_local), (0, 0)))
@@ -1744,8 +1760,11 @@ def _head_wing_kernel_face(
 
         # ---- Z_y: mu on Y (psi_nmu's own axis), gather bands over X ----
         mu_y_block = min(_HEAD_WING_MU_BLOCK, int(mu_y_local))
-        n_y_blocks = -(-int(mu_y_local) // mu_y_block)
-        mu_y_padded = n_y_blocks * mu_y_block
+        mu_y_axis = padded_axis(
+            int(mu_y_local), mu_y_block,
+            name="face head right-centroid work carrier")
+        mu_y_padded = mu_y_axis.carrier
+        n_y_blocks = mu_y_padded // mu_y_block
         bra_nmu_padded = jnp.pad(
             bra_nmu_local,
             ((0, 0), (0, 0), (0, 0), (0, mu_y_padded - mu_y_local)))

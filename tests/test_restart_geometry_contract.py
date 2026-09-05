@@ -85,6 +85,11 @@ def host_transport(monkeypatch):
     monkeypatch.setattr(tagged_arrays.jax, "process_index", lambda: 0)
     monkeypatch.setattr(tagged_arrays.jax, "device_count", lambda: 1)
     monkeypatch.setattr(
+        tagged_arrays, "NamedSharding", lambda mesh, spec: (mesh, spec))
+    monkeypatch.setattr(
+        tagged_arrays.jax.lax, "with_sharding_constraint",
+        lambda value, _sharding: value)
+    monkeypatch.setattr(
         collectives, "device_put_process_local", lambda value, _sharding: value)
     return _HostSlabIO
 
@@ -93,6 +98,11 @@ def _bands(carrier):
     return SimpleNamespace(
         b0=0, b1=0, b2=46, b3=72, b4=int(carrier),
         b4_chi=int(carrier), b4_sigma=int(carrier), b4_logical=184)
+
+
+def _mesh_product(divisor):
+    """Minimal mesh geometry for host-only writer preflight tests."""
+    return SimpleNamespace(axis_names=("p",), shape={"p": int(divisor)})
 
 
 @pytest.mark.parametrize("kind", ["mu", "band", "w0"])
@@ -113,16 +123,16 @@ def test_short_source_refuses_before_slabio_opens(
             tagged_arrays.write_restart_state_to_h5(
                 path, n_rmu_logical=5,
                 G0_mu_nu=np.zeros(4, dtype=np.complex128),
-                mesh=object(), mode="w")
+                mesh=_mesh_product(1), mode="w")
         elif kind == "band":
             tagged_arrays.write_restart_state_to_h5(
                 path, n_rmu_logical=2,
                 enk_full=np.zeros((1, 183), dtype=np.float64),
-                band_slices=_bands(216), mesh=object(), mode="w")
+                band_slices=_bands(216), mesh=_mesh_product(36), mode="w")
         else:
             tagged_arrays.write_w0_qmunu_to_h5(
                 path, np.zeros((1, 4, 4), dtype=np.complex128),
-                n_rmu_logical=5, mesh=object())
+                n_rmu_logical=5, mesh=_mesh_product(1))
     assert opens == []
     assert not (tmp_path / "must_not_exist.h5").exists()
 
@@ -135,13 +145,16 @@ def test_poisoned_mu_pad_is_clipped_and_both_shapes_are_receipted(
     source[5:] = np.nan + 9j
     tagged_arrays.write_restart_state_to_h5(
         path, n_rmu_logical=5, G0_mu_nu=source,
-        mesh=object(), mode="w")
+        mesh=_mesh_product(4), mode="w")
 
     with h5py.File(path, "r") as f:
         ds = f["G0_mu_nu"]
         np.testing.assert_array_equal(ds[:], source[:5])
         assert tuple(ds.attrs[tagged_arrays.RESTART_LOGICAL_SHAPE_ATTR]) == (5,)
         assert tuple(ds.attrs[tagged_arrays.RESTART_CARRIER_SHAPE_ATTR]) == (8,)
+        np.testing.assert_array_equal(
+            ds.attrs[tagged_arrays.RESTART_PADDED_AXES_ATTR],
+            np.asarray(((0, 5, 8, 4),), dtype=np.int64))
 
 
 def test_charge_zeta_receipt_fresh_stamp_and_read(tmp_path, host_transport):
@@ -151,7 +164,7 @@ def test_charge_zeta_receipt_fresh_stamp_and_read(tmp_path, host_transport):
         path, n_rmu_logical=2,
         V_qmunu=np.eye(2, dtype=np.complex128)[None],
         psi_full_y=np.ones((1, 1, 1, 2), dtype=np.complex128),
-        charge_zeta_identity=receipt, mesh=object(), mode="w")
+        charge_zeta_identity=receipt, mesh=_mesh_product(1), mode="w")
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
                 axis_names=("x", "y"))
     state = tagged_arrays.load_restart_state_from_h5(path, mesh)
@@ -179,23 +192,28 @@ def test_malformed_charge_zeta_receipt_refuses_before_tensor_read(
     assert opens == []
 
 
-def _write_then_repad(tmp_path, host_transport, source_carrier, target_carrier):
+def _write_then_repad(
+        tmp_path, host_transport, source_carrier, target_carrier):
     path = str(tmp_path / f"p{source_carrier}_to_p{target_carrier}.h5")
     logical = 184
     rng = np.random.default_rng(source_carrier * 1000 + target_carrier)
-    psi = np.full((1, source_carrier, 1, 2),
-                  complex(7.0e6, -3.0e6), dtype=np.complex128)
-    psi[:, :logical] = (
+    source_divisor = {216: 36, 192: 16}[source_carrier]
+    target_divisor = {216: 36, 192: 16}[target_carrier]
+    psi = np.zeros(
+        (1, source_carrier, 1, source_divisor), dtype=np.complex128)
+    psi[:, :logical, :, :2] = (
         rng.standard_normal((1, logical, 1, 2))
         + 1j * rng.standard_normal((1, logical, 1, 2)))
     enk = np.full((1, source_carrier), 9.0e6, dtype=np.float64)
     enk[:, :logical] = np.linspace(-3.0, 5.0, logical)[None, :]
-    V = np.eye(2, dtype=np.complex128)[None, :, :]
+    V = np.zeros(
+        (1, source_divisor, source_divisor), dtype=np.complex128)
+    V[:, :2, :2] = np.eye(2, dtype=np.complex128)[None, :, :]
 
     tagged_arrays.write_restart_state_to_h5(
         path, n_rmu_logical=2, V_qmunu=V, psi_full_y=psi,
         enk_full=enk, band_slices=_bands(source_carrier),
-        mesh=object(), mode="w")
+        mesh=_mesh_product(source_divisor), mode="w")
 
     # The identity is the 184-band physical prefix; the source carrier is a
     # receipt, not part of the comparison.  A changed physical top still
@@ -209,17 +227,19 @@ def _write_then_repad(tmp_path, host_transport, source_carrier, target_carrier):
             0, 0, 46, 72, source_carrier)
         assert f["psi_full_y"].shape == (1, logical, 1, 2)
         assert f["enk_full"].shape == (1, logical)
-        np.testing.assert_array_equal(f["psi_full_y"][:], psi[:, :logical])
+        np.testing.assert_array_equal(
+            f["psi_full_y"][:], psi[:, :logical, :, :2])
         np.testing.assert_array_equal(f["enk_full"][:], enk[:, :logical])
 
-    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
-                axis_names=("x", "y"))
+    mesh = _mesh_product(target_divisor)
     state = tagged_arrays.read_restart_state_from_h5(
         path, mesh, n_band_carrier=target_carrier)
     psi_got, enk_got = state[2], state[3]
-    assert psi_got.shape == (1, target_carrier, 1, 2)
+    assert psi_got.shape == (1, target_carrier, 1, target_divisor)
     assert enk_got.shape == (1, target_carrier)
-    np.testing.assert_array_equal(psi_got[:, :logical], psi[:, :logical])
+    np.testing.assert_array_equal(
+        psi_got[:, :logical, :, :2], psi[:, :logical, :, :2])
+    assert not np.any(psi_got[..., 2:])
     np.testing.assert_array_equal(enk_got[:, :logical], enk[:, :logical])
     assert not np.any(psi_got[:, logical:])
     np.testing.assert_array_equal(
@@ -227,11 +247,13 @@ def _write_then_repad(tmp_path, host_transport, source_carrier, target_carrier):
         np.full((1, target_carrier - logical), 6.0, dtype=np.float64))
 
 
-def test_p36_to_p16_preserves_the_logical_prefix(tmp_path, host_transport):
+def test_p36_to_p16_preserves_the_logical_prefix(
+        tmp_path, host_transport):
     _write_then_repad(tmp_path, host_transport, 216, 192)
 
 
-def test_p16_to_p36_preserves_the_logical_prefix(tmp_path, host_transport):
+def test_p16_to_p36_preserves_the_logical_prefix(
+        tmp_path, host_transport):
     _write_then_repad(tmp_path, host_transport, 192, 216)
 
 
@@ -271,4 +293,26 @@ def test_torn_dataset_shape_receipt_refuses_before_slab_read(
     with pytest.raises(ValueError, match="stamped logical storage shape"):
         tagged_arrays.read_restart_state_from_h5(
             str(path), object(), n_band_carrier=1)
+    assert opens == []
+
+
+def test_noncanonical_padded_axis_receipt_refuses_before_slab_read(
+        tmp_path, monkeypatch):
+    """Logical 6 is shardable by each side of 2x2 but needs carrier 8."""
+    path = tmp_path / "noncanonical_carrier.h5"
+    with h5py.File(path, "w") as f:
+        ds = f.create_dataset(
+            "V_qmunu", shape=(1, 6, 6), dtype=np.complex128)
+        ds.attrs[tagged_arrays.RESTART_LOGICAL_SHAPE_ATTR] = (1, 6, 6)
+        ds.attrs[tagged_arrays.RESTART_CARRIER_SHAPE_ATTR] = (1, 6, 6)
+        ds.attrs[tagged_arrays.RESTART_PADDED_AXES_ATTR] = (
+            (1, 6, 6, 4), (2, 6, 6, 4))
+        f.create_dataset(
+            "psi_full_y", shape=(1, 1, 1, 6), dtype=np.complex128)
+
+    opens = []
+    monkeypatch.setattr(
+        slab_io, "SlabIO", lambda *_a, **_k: opens.append(True))
+    with pytest.raises(ValueError, match="expected 8"):
+        tagged_arrays.read_restart_state_from_h5(str(path), object())
     assert opens == []

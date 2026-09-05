@@ -757,8 +757,11 @@ def legacy_square_mesh_occupation_digests(
             "legacy_square_mesh_occupation_digests: live occupations are "
             "nonzero outside logical_nband; refusing to call that tail "
             "process padding")
+    from runtime.padding import padded_axis, product_divisor
     extents = {
-        ((logical + side * side - 1) // (side * side)) * (side * side)
+        padded_axis(
+            logical, product_divisor(side, side),
+            name="legacy occupation band carrier").carrier
         for side in range(1, side_max + 1)
     }
     return frozenset(

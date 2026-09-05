@@ -53,28 +53,35 @@ def test_the_unsharded_degrade_branch_is_gone():
 
 
 def test_the_band_divisor_comes_from_the_spec_not_from_the_mesh_axes():
-    """``spec_divisor``, the same expression every other band pad uses.
+    """The owner receives both specs and returns their shared receipt.
 
     Deriving it from ``px`` and ``py`` directly over-pads whenever the spec
     replicates a band axis, and it is exactly the drift that made
     ``_resolve_sc_eigh`` take its divisor from the spec (24e341d).
     """
-    assert "spec_divisor(mesh, spec, 1)" in _RCROP
-    assert "spec_divisor(mesh, spec, 2)" in _RCROP
-    # one extent for both axes, or the carry stops being square
-    assert "_math.lcm(" in _RCROP
+    function = next(
+        node for node in ast.walk(_TREE)
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_rcrop")
+    call = next(
+        node for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "padded_axis")
+    keywords = {item.arg: item.value for item in call.keywords}
+    assert ast.unparse(keywords["specs"]) == "((spec, 1), (spec, 2))"
+    assert "band_div = band_axis.divisor" in _RCROP
+    assert "nb_pad = band_axis.carrier" in _RCROP
 
 
 def test_the_pad_goes_through_the_shared_helper():
-    """``runtime.padding.pad_axis`` -- not a hand-rolled ``jnp.pad``.
+    """``runtime.padding.pad_square`` -- not a hand-rolled ``jnp.pad``.
 
     The helper is what guarantees the no-op case returns the SAME array,
     which is what makes a divisible nb byte-identical to the pre-pad code.
     A local ``jnp.pad`` would allocate even at zero pad and lose that.
     """
     assert "from runtime.padding import" in _RCROP
-    assert "pad_axis(A, band_div, axis=1).array" in _RCROP
-    assert "pad_axis(A, band_div, axis=2).array" in _RCROP
+    assert "pad_square(A, band_axis, axes=(1, 2))" in _RCROP
     assert "jnp.pad(" not in _RCROP
 
 

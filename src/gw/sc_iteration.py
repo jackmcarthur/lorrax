@@ -1216,16 +1216,17 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
         return "native"
 
     from common.wfn_layout import band_sphere_spec
-    from runtime.padding import spec_divisor, round_up
+    from runtime.padding import padded_axis
 
     ndev = int(mesh_xy.size)
     px, py = (int(mesh_xy.shape[a]) for a in mesh_xy.axis_names)
-    pad_div = spec_divisor(mesh_xy, band_sphere_spec(), 1)
     # ``distributed_eigh_bands`` pads to this and slices BACK by count, so
     # an indivisible nb is no longer a reason to refuse or to degrade — it
     # is just a pad.  The backend probe below must therefore be asked about
     # the extent the eigh actually runs at, not about nb.
-    nb_solve = round_up(nb, pad_div)
+    nb_solve = padded_axis(
+        nb, mesh_xy, name="SC eigensolver band carrier",
+        spec=band_sphere_spec(), axis=1).carrier
 
     if requested == "distributed":
         return "distributed"
@@ -1436,6 +1437,10 @@ def _sigma_c_at_dft_diag_from_dft_cube(
             "evaluation energies to rebuild Sigma_c(E_DFT)")
     diagonal_ev = np.asarray(extract_sigma_diag_replicated(
         sigma_c_omega_dft_ry, mesh)) * RYD_TO_EV
+    if sigma_result.sigma_band_axis is not None:
+        from runtime.padding import strip_axis
+        diagonal_ev = np.asarray(strip_axis(
+            diagonal_ev, sigma_result.sigma_band_axis, axis=-1))
     return interp_along_omega(
         diagonal_ev,
         np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
@@ -1530,6 +1535,7 @@ def run_fixed_sigma_evsc(
             f"run_fixed_sigma_evsc: E_DFT must be (nk,nb), got "
             f"{e_dft_ry.shape}.")
     nk, nb = (int(v) for v in e_dft_ry.shape)
+    band_axis = sigma_result.sigma_band_axis
     b0 = int(band_slices.b0)
     nb_sigma = int(band_slices.nb_sigma)
     if nb != nb_sigma:
@@ -1542,7 +1548,12 @@ def run_fixed_sigma_evsc(
             "run_fixed_sigma_evsc: the fixed-Sigma ladder needs an occupied "
             "and an unoccupied frontier inside the active window; got "
             f"b0={b0}, meta.nelec={int(meta.nelec)}, nb={nb}.")
-    expected_cube = (len(np.asarray(omega_ev)), nk, nb, nb)
+    nb_carrier = int(band_axis.carrier) if band_axis is not None else nb
+    if band_axis is not None and int(band_axis.logical) != nb:
+        raise ValueError(
+            "run_fixed_sigma_evsc: Sigma band receipt and DFT ladder "
+            f"disagree; receipt logical={band_axis.logical}, ladder nb={nb}.")
+    expected_cube = (len(np.asarray(omega_ev)), nk, nb_carrier, nb_carrier)
     if tuple(sigma_c_dft.shape) != expected_cube:
         raise ValueError(
             "run_fixed_sigma_evsc: full Sigma cube and DFT ladder disagree; "
@@ -1562,6 +1573,9 @@ def run_fixed_sigma_evsc(
     h0_dft = _place(h0_dft, mesh_xy, rotation_spec)
     sigma_c_dft = _place(
         sigma_c_dft, mesh_xy, P(None, None, "x", "y"))
+    if band_axis is not None:
+        from runtime.padding import pad_square
+        sigma_x_dft = pad_square(sigma_x_dft, band_axis)
     sigma_x_dft = _place(sigma_x_dft, mesh_xy, rotation_spec)
     omega_ev = np.asarray(omega_ev, dtype=np.float64)
     omega_ry = np.asarray(omega_ry, dtype=np.float64)
@@ -1692,14 +1706,20 @@ def run_fixed_sigma_evsc(
             sigma_x_qp = sigma_x_dft
             sigma_c_qp = sigma_c_dft
         else:
+            U_sigma = U_dft_to_qp
+            if band_axis is not None:
+                from runtime.padding import pad_square
+                U_sigma = pad_square(
+                    U_sigma, band_axis, pad_diagonal=1.0)
             sigma_x_qp = _rotate_fixed_matrix(
-                sigma_x_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
+                sigma_x_dft, U_sigma, mesh=mesh_xy, to_qp=True)
             sigma_c_qp = _rotate_sigma_omega_cube(
-                sigma_c_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
+                sigma_c_dft, U_sigma, mesh=mesh_xy, to_qp=True)
 
         sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
             sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
-            replicated_output=False)
+            replicated_output=(band_axis is not None and band_axis.pad > 0),
+            band_axis=band_axis)
         if int(diagnostics["n_clipped"]) != int(n_out):
             raise RuntimeError(
                 "run_fixed_sigma_evsc: omega_coverage/build_qsgw_sigma_xc "
@@ -3729,6 +3749,10 @@ def _sc_z_factors(
         extract_sigma_diag_replicated(cube, inputs.mesh_xy),
         dtype=np.complex128,
     ) * RYD_TO_EV
+    if sigma.sigma_band_axis is not None:
+        from runtime.padding import strip_axis
+        sigma_c_diag_ev = np.asarray(strip_axis(
+            sigma_c_diag_ev, sigma.sigma_band_axis, axis=-1))
     _, z_factor = compute_z_factor_from_omega_grid(
         sigma_c_omega_diag_ev=sigma_c_diag_ev,
         omega_rel_ev=np.asarray(omega, dtype=np.float64),
@@ -4429,7 +4453,7 @@ def _run_rcrop(
     #
     # An nb that already divides pads by zero rows: ``pad_axis`` returns
     # the SAME array, so the production path is byte-identical to before.
-    from runtime.padding import pad_axis, round_up, spec_divisor
+    from runtime.padding import pad_square, padded_axis
 
     spec = _band_rotation_spec()
     px, py = (int(mesh.shape[a]) for a in mesh.axis_names)
@@ -4439,14 +4463,14 @@ def _run_rcrop(
     # the mesh here is how the loader and the sweep would drift apart.
     # ONE extent for BOTH axes, so the carry stays square — the residual is
     # H_out − H_in and the re-Hermitisation below both need that.
-    band_div = _math.lcm(spec_divisor(mesh, spec, 1),
-                         spec_divisor(mesh, spec, 2))
-    nb_pad = round_up(nb, band_div)
+    band_axis = padded_axis(
+        nb, mesh, name="SC history band carrier",
+        specs=((spec, 1), (spec, 2)))
+    band_div = band_axis.divisor
+    nb_pad = band_axis.carrier
 
     def _pad_bands(A):
-        A = pad_axis(A, band_div, axis=1).array
-        A = pad_axis(A, band_div, axis=2).array
-        return A
+        return pad_square(A, band_axis, axes=(1, 2))
 
     entry_sh = NamedSharding(mesh, spec)
     x0 = jax.device_put(_pad_bands(H0), entry_sh)
@@ -5452,9 +5476,16 @@ def run_sc_driver(
     # routes each kind correctly; only the spec changed.
     U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
                _band_rotation_spec())
+    U_sigma = U
+    if sigma_result.sigma_band_axis is not None:
+        from runtime.padding import pad_square
+        U_sigma = _place(
+            pad_square(
+                U, sigma_result.sigma_band_axis, pad_diagonal=1.0),
+            mesh_xy, _band_rotation_spec())
     sigma_c_omega_dft = (
         _rotate_sigma_omega_cube(
-            sigma_result.sigma_c_omega_kij_ry, U,
+            sigma_result.sigma_c_omega_kij_ry, U_sigma,
             mesh=mesh_xy, to_qp=False)
         if sigma_result.sigma_c_omega_kij_ry is not None else None)
     sigma_c_at_dft_dft = (
@@ -5765,6 +5796,7 @@ def dump_sigma_omega_h5_final(
             - float(sigma_result.efermi_dft_ev)),
         eval_energies_provenance="self_consistent_qp",
         omega_coverage=sigma_result.omega_coverage,
+        band_axis=sigma_result.sigma_band_axis,
         sym=sym, print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")

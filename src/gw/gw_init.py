@@ -2165,7 +2165,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			**_delta_args, stack_three_solves=False)
 		_distributed_delta = _coupled_mu123_zq_incremental_bytes(
 			**_delta_args, stack_three_solves=False)
-		_p_xy = _p_x * _p_y
+		from runtime.padding import mesh_divisor
+		_p_xy = mesh_divisor(mesh_xy)
 		_mu_T = int(_meta_T.n_rmu_padded)
 		_local_operand_floor = _batch_reshard_operand_floor_bytes(
 			batch=int(_meta_T.nk_tot), mu=_mu_T,

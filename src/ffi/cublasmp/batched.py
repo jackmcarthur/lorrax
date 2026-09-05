@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 from common.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
+from runtime.padding import authenticate_padded_axis
 
 from ..common.ffi_loader import get_lib
 from ..cusolvermp.context import get_or_init_context
@@ -263,9 +264,9 @@ def batched_fused_w_solve_jit(
     the end-of-run timing report.
     """
     Px, Py = _validate_mesh(mesh)
-    if n % Px != 0 or n % Py != 0:
-        raise ValueError(
-            f"N={n} must be divisible by both Px={Px} and Py={Py}.")
+    authenticate_padded_axis(
+        n, n, mesh, name="cuBLASMp W-solve centroid carrier",
+        specs=((P("x", None), 0), (P(None, "y"), 1)))
     if Px != Py:
         # The fused solve runs cusolverMpPotrf internally, which needs
         # square ScaLAPACK blocks (mb == nb) — impossible with the

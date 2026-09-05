@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from runtime.padding import authenticate_padded_axis
 
 from .common import ffi_loader
 from .common.ffi_loader import get_lib
@@ -507,9 +508,10 @@ def read_sharded_slab(
     """
     p, q = validate_mesh_2d(mesh)
     n_rows, n_cols = int(global_shape[0]), int(global_shape[1])
-    if n_rows % p or n_cols % q:
-        raise ValueError(
-            f"global shape ({n_rows},{n_cols}) must divide mesh ({p},{q})")
+    authenticate_padded_axis(
+        n_rows, n_rows, p, name=f"{ds_name} parallel-HDF5 row carrier")
+    authenticate_padded_axis(
+        n_cols, n_cols, q, name=f"{ds_name} parallel-HDF5 column carrier")
 
     ds_id = _register_and_open_dataset(fh, ds_name, mesh)
     local_shape = (n_rows // p, n_cols // q)
@@ -858,9 +860,12 @@ def write_sharded_slab(
         tuple(int(s) for s in global_shape)
         if global_shape is not None else (valid_rows, valid_cols)
     )
-    if phys_rows % p or phys_cols % q:
-        raise ValueError(
-            f"physical shape ({phys_rows},{phys_cols}) must divide mesh ({p},{q})")
+    authenticate_padded_axis(
+        phys_rows, phys_rows, p,
+        name=f"{ds_name} parallel-HDF5 row carrier")
+    authenticate_padded_axis(
+        phys_cols, phys_cols, q,
+        name=f"{ds_name} parallel-HDF5 column carrier")
     if valid_rows > phys_rows or valid_cols > phys_cols:
         raise ValueError(
             f"valid_shape ({valid_rows},{valid_cols}) exceeds physical "

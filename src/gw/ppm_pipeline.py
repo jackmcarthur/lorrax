@@ -50,6 +50,7 @@ from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
     fit_ppm,
 )
+from runtime.padding import PaddedAxis
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class PPMOutputs:
     """Ansatz-specific PPM outputs handed to the dynamic finalizer."""
 
     sigma_c_body_omega: jax.Array          # (n_omega, nk, nb, nb)  Ry
+    band_axis: PaddedAxis | None = None
     # Kept separate: injection is shared by every dynamic ansatz in
     # ``dynamic_sigma.add_head_sigma_diag``.
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
@@ -759,6 +761,7 @@ def compute_ppm_sigma_pipeline(
 
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
+        band_axis=sigma_omega.band_axis,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
         band_extrapolation=extrap_payload,
         sigma_c_body_omega_unextrap=sigma_c_body_omega_unextrap,

@@ -23,7 +23,6 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.wfn_layout import band_sphere_spec
-from runtime.padding import round_up, spec_divisor
 
 
 __all__ = [
@@ -115,8 +114,10 @@ def band_storage_extent(mesh, nbands: int) -> int:
         raise ValueError(
             "parallel transport requires mesh axes ('x','y'); "
             f"got {names!r}")
-    divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)
-    return round_up(int(nbands), divisor)
+    from runtime.padding import padded_axis
+    return padded_axis(
+        int(nbands), mesh, name="parallel-transport band carrier",
+        spec=band_sphere_spec(), axis=1).carrier
 
 
 def fingerprint_update_value(digest, label: str, value) -> None:

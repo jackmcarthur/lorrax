@@ -727,11 +727,15 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
     _pc_deck = int(getattr(getattr(config, "screening", None),
                            "ladder_probe_chunk", 0) or 0)
     if _pc_deck > 0:
-        _py = int(mesh_xy.devices.shape[1])
-        probe_chunk = ((_pc_deck + _py - 1) // _py) * _py
+        from runtime.padding import padded_axis
+        probe_axis = padded_axis(
+            _pc_deck, mesh_xy, name="ladder probe chunk",
+            spec=P("y"), axis=0)
+        probe_chunk = probe_axis.carrier
         print_fn(
             f"  w_bse: ladder_probe_chunk={_pc_deck}"
-            + (f" rounded up to {probe_chunk} (mesh 'y'={_py} multiple)"
+            + (f" rounded up to {probe_chunk} "
+               f"(mesh divisor={probe_axis.divisor})"
                if probe_chunk != _pc_deck else "")
             + f" — probe columns solved {probe_chunk} per block instead "
               f"of the whole padded basis in one allocation")

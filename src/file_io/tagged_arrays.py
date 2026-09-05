@@ -14,10 +14,19 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier
 import common.timing as timing
+from runtime.padding import (
+    authenticate_axis,
+    authenticate_padded_axis,
+    mesh_divisor,
+    pad_to_axis,
+    padded_axis,
+    padded_mu_axis,
+)
 
 
 RESTART_LOGICAL_SHAPE_ATTR = "restart_logical_shape"
 RESTART_CARRIER_SHAPE_ATTR = "restart_carrier_shape"
+RESTART_PADDED_AXES_ATTR = "restart_padded_axes"
 BAND_WINDOW_SCHEMA_DATASET = "band_window_schema"
 BAND_WINDOW_SCHEMA_VERSION = 2
 BAND_WINDOW_CARRIER_DATASET = "band_window_carrier"
@@ -117,14 +126,22 @@ def _mu_logical_shape(shape, mu_axes, n_rmu_logical, *, where="restart tensor"):
         shape, mu_axes, n_rmu_logical, where=where)
 
 
-def _shape_receipt_attrs(carrier_shape, logical_shape):
+def _shape_receipt_attrs(
+        carrier_shape, logical_shape, *, axis_receipts=()):
     """Dataset attrs that keep producer carrier and disk shape distinct."""
-    return {
+    attrs = {
         RESTART_CARRIER_SHAPE_ATTR: np.asarray(
             tuple(int(v) for v in carrier_shape), dtype=np.int64),
         RESTART_LOGICAL_SHAPE_ATTR: np.asarray(
             tuple(int(v) for v in logical_shape), dtype=np.int64),
     }
+    if axis_receipts:
+        attrs[RESTART_PADDED_AXES_ATTR] = np.asarray(
+            tuple((int(axis), int(tag.logical), int(tag.carrier),
+                   int(tag.divisor))
+                  for axis, tag in axis_receipts),
+            dtype=np.int64)
+    return attrs
 
 
 def _band_window_receipts(band_slices):
@@ -157,6 +174,19 @@ def _band_window_receipts(band_slices):
     return logical, carrier, split
 
 
+def _loaded_band_axis(logical: int, mesh_or_divisor):
+    """Canonical receipt shared by every persistent restart band dataset."""
+    shape = getattr(mesh_or_divisor, "shape", {})
+    if "x" in shape and "y" in shape:
+        from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
+        return padded_axis(
+            int(logical), mesh_or_divisor, name="restart loaded-band carrier",
+            specs=((PSI_NMU_SPEC, 1), (PSI_MUN_SPEC, 3)))
+    return padded_axis(
+        int(logical), mesh_divisor(mesh_or_divisor),
+        name="restart loaded-band carrier")
+
+
 def _validate_shape_receipt(name, ds) -> None:
     """Refuse an authenticated dataset whose stored shape changed."""
     if RESTART_LOGICAL_SHAPE_ATTR not in ds.attrs:
@@ -182,6 +212,30 @@ def _validate_shape_receipt(name, ds) -> None:
             f"Restart dataset {name!r}: producer carrier receipt "
             f"{carrier} cannot cover logical storage shape {actual}. The "
             "file is internally inconsistent.")
+    if RESTART_PADDED_AXES_ATTR not in ds.attrs:
+        return
+    receipts = np.asarray(ds.attrs[RESTART_PADDED_AXES_ATTR], dtype=np.int64)
+    if receipts.ndim != 2 or receipts.shape[1] != 4:
+        raise ValueError(
+            f"Restart dataset {name!r}: {RESTART_PADDED_AXES_ATTR!r} must "
+            f"have shape (n,4); got {receipts.shape}.")
+    seen = set()
+    for raw_axis, logical, carried, divisor in receipts.tolist():
+        axis = int(raw_axis)
+        if not 0 <= axis < len(actual) or axis in seen:
+            raise ValueError(
+                f"Restart dataset {name!r}: invalid or repeated padded axis "
+                f"{axis} in {RESTART_PADDED_AXES_ATTR!r}.")
+        seen.add(axis)
+        tag = authenticate_padded_axis(
+            int(logical), int(carried), int(divisor),
+            name=f"Restart dataset {name!r} axis {axis}")
+        if actual[axis] != tag.logical or carrier[axis] != tag.carrier:
+            raise ValueError(
+                f"Restart dataset {name!r}: padded-axis receipt for axis "
+                f"{axis} declares logical/carrier "
+                f"{tag.logical}/{tag.carrier}, but dataset/carrier shapes "
+                f"declare {actual[axis]}/{carrier[axis]}.")
 
 
 def _restart_write_log_on() -> bool:
@@ -594,11 +648,21 @@ def write_restart_state_to_h5(
     # previous file.  The plan also keeps the producer carrier shape beside the
     # logical disk shape instead of making readers reverse-engineer one from
     # the other.
+    carrier_divisor = mesh_divisor(
+        mesh if mesh is not None else int(jax.device_count()))
     band_receipts = None
     n_band_logical = None
+    loaded_band_tag = None
     if band_slices is not None:
         band_receipts = _band_window_receipts(band_slices)
         n_band_logical = int(band_receipts[0][4] - band_receipts[0][0])
+        loaded_band_tag = _loaded_band_axis(
+            n_band_logical,
+            mesh if mesh is not None else carrier_divisor)
+        authenticate_padded_axis(
+            n_band_logical,
+            int(band_receipts[1][4] - band_receipts[1][0]),
+            loaded_band_tag.divisor, name=loaded_band_tag.name)
     elif mode != "w" and any(
             arr is not None for arr in (
                 psi_full_y, psi_full_y_mun, psi_full_y_transverse,
@@ -619,6 +683,9 @@ def write_restart_state_to_h5(
                         f"Restart file {filename}: schema-{schema} band_window "
                         f"has {len(stored_logical)} entries, expected 5.")
                 n_band_logical = stored_logical[4] - stored_logical[0]
+                loaded_band_tag = _loaded_band_axis(
+                    n_band_logical,
+                    mesh if mesh is not None else carrier_divisor)
 
     if ((psi_full_y_transverse is not None
          or psi_full_y_transverse_mun is not None)
@@ -630,20 +697,39 @@ def write_restart_state_to_h5(
            if n_rmu_transverse_logical is not None else None)
 
     write_plan = {}
-
     def _plan(name, arr, *, mu_axes=(), n_logical=None, band_axes=()):
         if arr is None:
             return
         n_log = n_rmu_logical if n_logical is None else n_logical
+        ndim = len(tuple(arr.shape))
+        axis_receipts = []
+        mu_tag = padded_mu_axis(int(n_log), carrier_divisor)
         shape = _mu_logical_shape(
             arr.shape, mu_axes, n_log,
             where=f"write_restart_state_to_h5 dataset {name!r}")
+        for raw_axis in mu_axes:
+            axis = int(raw_axis) % ndim
+            authenticate_axis(
+                arr, mu_tag, axis=axis,
+                where=f"write_restart_state_to_h5 dataset {name!r}")
+            axis_receipts.append((axis, mu_tag))
         if band_axes and n_band_logical is not None:
+            band_tag = loaded_band_tag
+            if band_tag is None:
+                raise RuntimeError(
+                    f"restart dataset {name!r}: missing loaded-band receipt")
             shape = _logical_storage_shape(
                 shape, band_axes, n_band_logical,
                 where=f"write_restart_state_to_h5 dataset {name!r} band axis")
+            for raw_axis in band_axes:
+                axis = int(raw_axis) % ndim
+                authenticate_axis(
+                    arr, band_tag, axis=axis,
+                    where=f"write_restart_state_to_h5 dataset {name!r}")
+                axis_receipts.append((axis, band_tag))
         write_plan[name] = (
-            shape, _shape_receipt_attrs(arr.shape, shape))
+            shape, _shape_receipt_attrs(
+                arr.shape, shape, axis_receipts=axis_receipts))
 
     _plan("V_qmunu", V_on_disk, mu_axes=(-2, -1))
     _plan("S_qmunu", S_qmunu, mu_axes=(-2, -1))
@@ -960,7 +1046,19 @@ def write_w0_qmunu_to_h5(
     shape = _mu_logical_shape(
         W0_qmunu.shape, (-2, -1), n_rmu_logical,
         where="write_w0_qmunu_to_h5 dataset 'W0_qmunu'")
-    shape_attrs = _shape_receipt_attrs(W0_qmunu.shape, shape)
+    mu_tag = padded_mu_axis(
+        int(n_rmu_logical),
+        mesh if mesh is not None else int(jax.device_count()))
+    authenticate_axis(
+        W0_qmunu, mu_tag, axis=-2,
+        where="write_w0_qmunu_to_h5 dataset 'W0_qmunu'")
+    authenticate_axis(
+        W0_qmunu, mu_tag, axis=-1,
+        where="write_w0_qmunu_to_h5 dataset 'W0_qmunu'")
+    ndim = int(W0_qmunu.ndim)
+    shape_attrs = _shape_receipt_attrs(
+        W0_qmunu.shape, shape,
+        axis_receipts=((ndim - 2, mu_tag), (ndim - 1, mu_tag)))
     with SlabIO(filename, mode="a", mesh=mesh,
 ) as io:
         _t0 = time.time()
@@ -1370,7 +1468,7 @@ def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
 
 
 def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
-                               n_band_carrier=None):
+                               band_receipt=None, n_band_carrier=None):
     """Read canonical restart state as PER-RANK TILES (restart format v2).
 
     Returns arrays that are ALREADY sharded on ``mesh_xy`` and ALREADY at
@@ -1455,10 +1553,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
     nmu-order dataset refuses by name.
     """
     from .slab_io import SlabIO
-    from runtime.padding import padded_mu_extent
     from common.collectives import device_put_process_local
-
-    divisor = int(jax.device_count())
 
     # ---- pass 1: geometry + the small replicated arrays, serial h5py ----
     with h5py.File(filename, "r") as f:
@@ -1505,8 +1600,10 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                 where=f"Restart file {filename}")
             if CHARGE_ZETA_IDENTITY_DATASET in f else None)
 
+    divisor = mesh_divisor(mesh_xy)
     n_rmu_disk = int(shapes["V_qmunu"][-1])
-    n_rmu_pad = padded_mu_extent(n_rmu_disk, divisor)
+    mu_axis = padded_mu_axis(n_rmu_disk, divisor)
+    n_rmu_pad = mu_axis.carrier
     nspinor = _check_nspinor(shapes["psi_full_y"][2],
                              f"read_restart_state_from_h5({filename})")
 
@@ -1547,6 +1644,12 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                 f"gw_jax.restart.wedge_transform.{name}", announce=True,
                 label=f"restart wedge transform {name}"):
             arr = _collapse_leading(arr, shapes[name], mesh_xy)
+            authenticate_axis(
+                arr, mu_axis, axis=-2,
+                where=f"read_restart_state_from_h5 dataset {name!r}")
+            authenticate_axis(
+                arr, mu_axis, axis=-1,
+                where=f"read_restart_state_from_h5 dataset {name!r}")
         # THE UNFOLD, AFTER THE READ AND BEFORE THE CALLER SEES IT.  The
         # request above derives its q extent from the dataset shape, so a
         # wedge simply arrives as (n_q_ibz, mu_pad, nu_pad) on the same spec
@@ -1571,20 +1674,18 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
             return None
         ds = shapes[name]
         _check_nspinor(ds[spinor_axis], f"{name} in {filename}")
-        pad = padded_mu_extent(int(n_mu_logical), divisor)
+        mu_tag = padded_mu_axis(int(n_mu_logical), divisor)
         shape = list(int(s) for s in ds)
-        shape[mu_axis] = int(pad)
+        mu_index = int(mu_axis) % len(shape)
+        shape[mu_index] = mu_tag.carrier
+        b_axis = int(band_axis) % len(shape)
+        band_tag = (band_receipt if band_receipt is not None else
+                    _loaded_band_axis(int(ds[b_axis]), mesh_xy))
         if n_band_carrier is not None:
-            b_axis = int(band_axis)
-            if b_axis < 0:
-                b_axis += len(shape)
-            if shape[b_axis] > int(n_band_carrier):
-                raise ValueError(
-                    f"Restart dataset {name!r} stores {shape[b_axis]} logical "
-                    f"bands but this run's carrier has only "
-                    f"{int(n_band_carrier)} slots. The band identity preflight "
-                    "should have refused this mismatch before tensor I/O.")
-            shape[b_axis] = int(n_band_carrier)
+            band_tag = authenticate_padded_axis(
+                band_tag.logical, int(n_band_carrier), band_tag.divisor,
+                name=band_tag.name)
+        shape[b_axis] = band_tag.carrier
         with timing.section(
                 f"gw_jax.restart.read.{name}", announce=True,
                 label=f"restart SlabIO read {name}"):
@@ -1592,6 +1693,12 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                 name, shape=tuple(shape), dtype=dtypes[name],
                 mesh=mesh_xy, partition_spec=spec)
             jax.block_until_ready(arr)
+        authenticate_axis(
+            arr, mu_tag, axis=mu_index,
+            where=f"read_restart_state_from_h5 dataset {name!r}")
+        authenticate_axis(
+            arr, band_tag, axis=b_axis,
+            where=f"read_restart_state_from_h5 dataset {name!r}")
         return arr
 
     n_rmu_T_disk = (int(shapes["psi_full_y_transverse"][-1])
@@ -1647,9 +1754,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
     if G0_mu_nu is not None:
         if G0_mu_nu.ndim > 1:
             G0_mu_nu = G0_mu_nu[0]
-        g0_pad = int(n_rmu_pad) - int(G0_mu_nu.shape[-1])
-        if g0_pad > 0:
-            G0_mu_nu = np.pad(G0_mu_nu, (0, g0_pad))
+        G0_mu_nu = np.asarray(pad_to_axis(
+            G0_mu_nu, mu_axis, axis=-1))
         # ``device_put_process_local``, NOT ``jax.device_put`` (AA.1):
         # G0 is host numpy read identically on every rank, and a plain
         # device_put onto a multi-process NamedSharding fires a hidden
@@ -1661,24 +1767,21 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
             np.ascontiguousarray(G0_mu_nu),
             NamedSharding(mesh_xy, P("y")))
     if enk_full is not None:
+        n_disk_band = int(enk_full.shape[-1])
+        band_tag = (band_receipt if band_receipt is not None else
+                    _loaded_band_axis(n_disk_band, mesh_xy))
         if n_band_carrier is not None:
-            n_disk_band = int(enk_full.shape[-1])
-            n_target_band = int(n_band_carrier)
-            if n_disk_band > n_target_band:
+            band_tag = authenticate_padded_axis(
+                band_tag.logical, int(n_band_carrier), band_tag.divisor,
+                name=band_tag.name)
+        if band_tag.pad:
+            if enk_full.size == 0:
                 raise ValueError(
-                    f"Restart enk_full stores {n_disk_band} logical bands but "
-                    f"this run's carrier has only {n_target_band} slots. The "
-                    "band identity preflight should have refused this mismatch.")
-            if n_disk_band < n_target_band:
-                if enk_full.size == 0:
-                    raise ValueError(
-                        "Restart enk_full is empty and cannot define the finite "
-                        "energy sentinel needed for band-carrier padding.")
-                sentinel = float(np.max(enk_full)) + 1.0
-                pad = np.full(
-                    (enk_full.shape[0], n_target_band - n_disk_band),
-                    sentinel, dtype=enk_full.dtype)
-                enk_full = np.concatenate((enk_full, pad), axis=-1)
+                    "Restart enk_full is empty and cannot define the finite "
+                    "energy sentinel needed for band-carrier padding.")
+            sentinel = float(np.max(enk_full)) + 1.0
+            enk_full = np.asarray(pad_to_axis(
+                enk_full, band_tag, axis=-1, fill=sentinel))
         enk_full = device_put_process_local(
             np.ascontiguousarray(enk_full),
             NamedSharding(mesh_xy, P(None, None)))
@@ -1717,7 +1820,6 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
     only when the dataset itself is the thing under suspicion.
     """
     from .slab_io import SlabIO
-    from runtime.padding import padded_mu_extent
 
     with h5py.File(filename, "r") as f:
         if name not in f:
@@ -1727,12 +1829,19 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
         wedge_tables = _qirr_wedge_tables(f)
 
     n_rmu_disk = int(ds_shape[-1] if n_rmu_logical is None else n_rmu_logical)
-    n_rmu_pad = padded_mu_extent(n_rmu_disk, int(jax.device_count()))
+    mu_tag = padded_mu_axis(n_rmu_disk, mesh_xy)
+    n_rmu_pad = mu_tag.carrier
     off, shape, spec = _munu_slab_request(ds_shape, n_rmu_pad)
     with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
         arr = io.read_slab(name, shape=shape, dtype=ds_dtype, offset=off,
                            mesh=mesh_xy, partition_spec=spec)
     arr = _collapse_leading(arr, ds_shape, mesh_xy)
+    authenticate_axis(
+        arr, mu_tag, axis=-2,
+        where=f"read_munu_tensor_from_h5 dataset {name!r}")
+    authenticate_axis(
+        arr, mu_tag, axis=-1,
+        where=f"read_munu_tensor_from_h5 dataset {name!r}")
     return _unfold_wedge(arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
 
 
@@ -1780,13 +1889,22 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     # the reader had to be guarded off above one process.  The pad is now
     # the read (SlabIO zero-fills past the dataset) and the sharding is
     # the read (SlabIO returns the tile), so none of it survives here.
+    band_axis = None
+    if band_slices is not None:
+        n_band_logical = (
+            int(getattr(band_slices, "b4_logical", 0) or band_slices.b4)
+            - int(band_slices.b0))
+        band_axis = _loaded_band_axis(n_band_logical, mesh_xy)
+        authenticate_padded_axis(
+            band_axis.logical,
+            int(band_slices.b4) - int(band_slices.b0),
+            band_axis.divisor, name=band_axis.name)
+
     (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
      psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
      psi_nmu_T, psi_mun_T, charge_zeta_identity) = read_restart_state_from_h5(
         filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
-        n_band_carrier=(
-            int(band_slices.b4) - int(band_slices.b0)
-            if band_slices is not None else None))
+        band_receipt=band_axis)
 
     if low_mem_bands:
         # No derivation, no reshard: both faces already arrived at their

@@ -2638,8 +2638,6 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     from bandstructure.htransform import initialize_wfns
     from common.psi_G_store import build_psi_G_store
     from common.wfn_layout import band_sphere_spec
-    from runtime.padding import round_up, spec_divisor
-
     # THE ζ SOLVE, BEFORE ANYTHING EXPENSIVE.  A refit whose solve does not
     # match the producer's cannot reproduce the producer's tiles no matter how
     # good its ψ representation is (five parents, §4 of
@@ -2803,13 +2801,16 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     # the old full-grid host Ψ plus dense projector/B materialisation.
     if int(r_chunk) <= 0:
         raise ValueError(f"refit_prepare: r_chunk={r_chunk} must be positive")
-    p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
     # One low-memory WFN carrier.  This is a storage schedule only; the
     # Galerkin factor was already fitted.  Sixteen is the established refit
     # carrier, rounded only when a wider process product is the minimum legal
     # band shard.
     band_hint = max(1, min(16, nb_wide))
-    band_carrier = round_up(band_hint, p_band)
+    from runtime.padding import padded_axis
+    band_axis = padded_axis(
+        band_hint, mesh_xy, name="BSE refit band carrier",
+        spec=band_sphere_spec(), axis=1)
+    band_carrier = band_axis.carrier
     band_chunk_ranges = tuple(
         (b0, min(b0 + band_carrier, band_range_fh[1]))
         for b0 in range(band_range_fh[0], band_range_fh[1], band_carrier))

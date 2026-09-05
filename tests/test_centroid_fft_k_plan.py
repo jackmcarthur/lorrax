@@ -158,4 +158,7 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
     assert assignments["existing_live_bytes"] == (
         "worst_process_resident_bytes(existing_live_local_bytes)"
     )
-    assert assignments["nk_accum"] == "round_up(nk_tot, k_tile)"
+    assert assignments["nk_accum"] == (
+        "padded_axis(nk_tot, k_tile, name='centroid stream k "
+        "accumulator').carrier"
+    )

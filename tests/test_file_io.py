@@ -842,7 +842,9 @@ def test_normalize_slab_request_allows_nonzero_read_offset_without_extent():
 def test_validate_block_divisible_rejects_ragged_write_axis():
     # INTERNAL post-condition since decisions.md 2026-08-04 — both FFI
     # entry points pad to divisibility before they reach it.
-    with pytest.raises(ValueError, match="dimension 1 size 70001"):
+    with pytest.raises(ValueError, match=(
+            "write_slab 'zeta_q' dimension 1: carrier extent is 70001, "
+            "expected 70016 for logical extent 70001 and divisor 16")):
         _validate_block_divisible(
             op="write_slab",
             name="zeta_q",

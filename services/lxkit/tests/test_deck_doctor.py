@@ -186,3 +186,43 @@ def test_backend_probe_does_not_hide_bad_science_geometry(monkeypatch):
     with pytest.raises(ValueError, match="needs a true-2D mesh"):
         _backend_lines(
             config, n_rmu=64, gpu=True, science_mesh=(1, 1))
+
+
+def test_indivisible_sigma_window_reports_the_driver_carrier(
+        tmp_path, monkeypatch, capsys):
+    """Na's physical 86 bands are served as 88 on a 4x4 science mesh."""
+    import numpy as np
+    import lxkit.deck_doctor as doctor
+    import gw.gw_config as config_module
+    import file_io.centroids as centroids
+    import file_io.mf_header as mf_header
+
+    deck = tmp_path / "cohsex.in"
+    deck.touch()
+    config = _config(tmp_path)
+    config.compute_mode = SimpleNamespace(value="mpa", is_dynamic=True)
+    config.qp_solver = SimpleNamespace(value="one_shot_dft")
+    config.ncond = 81
+    config.bispinor = False
+    config.memory = SimpleNamespace(
+        per_device_gb=0, chunk_target_utilization=0.85, band_chunk_size=0,
+        r_chunk_override=0, gflat_chunk_size=0, vq_g_chunk_size=0,
+        low_mem_bands=False)
+    config.backend = SimpleNamespace(summary=lambda: "auto")
+    monkeypatch.setattr(doctor, "_source_root_and_runtime",
+                        lambda *a, **k: (tmp_path, tmp_path / "runtime.py"))
+    monkeypatch.setattr(doctor, "_git_receipt", lambda *a: ("test", False))
+    monkeypatch.setattr(doctor, "_check_input_rows", lambda *a, **k: set())
+    monkeypatch.setattr(config_module.LorraxConfig, "from_input_file",
+                        lambda *a, **k: config)
+    monkeypatch.setattr(config_module, "infer_material_class", lambda *a: "metal")
+    monkeypatch.setattr(config_module, "validate_material_inputs", lambda *a: None)
+    monkeypatch.setattr(centroids, "load_centroids", lambda *a: (None, None, 896))
+    monkeypatch.setattr(mf_header, "read_mf_header", lambda *a: SimpleNamespace(
+        occs=np.ones((1, 1, 5)), ifmax=np.array([5]), fft_grid=(1, 1, 1)))
+    doctor.inspect_deck(SimpleNamespace(
+        deck=deck, source_root=tmp_path, gpu=False, nodes=4,
+        gpus_per_node=4, ranks=16, site_gpus_per_node=4))
+    output = capsys.readouterr().out
+    assert "SIGMA_WINDOW logical=86 carrier=88 divisor=4 pad=2" in output
+    assert "DECK_DOCTOR_OK" in output

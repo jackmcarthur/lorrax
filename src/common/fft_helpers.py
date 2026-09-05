@@ -1,10 +1,10 @@
-import math
 from typing import Callable, Literal
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map
+from runtime.padding import authenticate_padded_axis, combined_divisor
 
 
 # Value-level parity contract for the canonical flat-k service.  This is the
@@ -199,30 +199,10 @@ def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[in
     Raises:
         ValueError: If no valid block size exists (n_rmu incompatible with mesh)
     """
-    target_J = math.lcm(Pr, Pc)
-
-    if n_rmu % target_J == 0:
-        block_size = n_rmu // target_J
-        return block_size, target_J
-
-    # Try multiples of lcm(Pr, Pc)
-    for j_mult in range(2, 20):
-        J = target_J * j_mult
-        if n_rmu % J == 0:
-            block_size = n_rmu // J
-            return block_size, J
-
-    # Last resort: find any valid block size
-    for b in range(n_rmu, 0, -1):
-        if n_rmu % b == 0:
-            J = n_rmu // b
-            if J % Pr == 0 and J % Pc == 0:
-                return b, J
-
-    raise ValueError(
-        f"No valid block size for n_rmu={n_rmu} with mesh {Pr}×{Pc}. "
-        f"n_rmu should be divisible by lcm({Pr},{Pc})={target_J} or a multiple thereof."
-    )
+    tag = authenticate_padded_axis(
+        n_rmu, n_rmu, combined_divisor(Pr, Pc),
+        name="2-D FFT centroid carrier")
+    return n_rmu // tag.divisor, tag.divisor
 
 
 # ============================================================================

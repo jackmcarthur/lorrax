@@ -240,7 +240,7 @@ def build_static_photon_head_response(
         wfn_fingerprint_binding=wfn_fingerprint_binding)
     if direct.Y_x is None or direct.Z_y is None:
         raise ValueError("incumbent charge response returned no body wings")
-    charge_extent = int(layout.padded_extent(0))
+    charge_extent = int(layout.carrier_extent(0))
     if (tuple(direct.Y_x.shape) != (1, 3, charge_extent)
             or tuple(direct.Z_y.shape) != (1, charge_extent, 3)):
         raise ValueError(
@@ -251,10 +251,10 @@ def build_static_photon_head_response(
     charge_y = direct.Y_x[0, :2, :]
     charge_z = jnp.transpose(direct.Z_y[0, :, :2], (1, 0))
     zeros_x = tuple(
-        _channel_zeros(2, layout.padded_extent(A), mesh, "x")
+        _channel_zeros(2, layout.carrier_extent(A), mesh, "x")
         for A in range(1, 4))
     zeros_y = tuple(
-        _channel_zeros(2, layout.padded_extent(A), mesh, "y")
+        _channel_zeros(2, layout.carrier_extent(A), mesh, "y")
         for A in range(1, 4))
     Y_x = pack_photon_channel_vectors(
         (charge_y, *zeros_x), layout, mesh, axis_name="x")

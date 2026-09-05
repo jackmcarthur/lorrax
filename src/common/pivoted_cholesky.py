@@ -425,9 +425,9 @@ def make_sharded_pivoted_cholesky_select(
     n_dev = _mesh_axis_size(
         mesh, mesh_axis, "make_sharded_pivoted_cholesky_select"
     )
-    if M % n_dev != 0:
-        raise ValueError(f"M={M} must be divisible by product of mesh axes "
-                         f"{mesh_axis} (= {n_dev})")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        M, M, n_dev, name="pivoted-Cholesky row carrier")
     M_slab = M // n_dev
 
     row_shard = PartitionSpec(mesh_axis, None)
@@ -674,9 +674,9 @@ def make_sharded_group_block_pivoted_cholesky_select(
     n_dev = _mesh_axis_size(
         mesh, mesh_axis, "make_sharded_group_block_pivoted_cholesky_select"
     )
-    if M % n_dev != 0:
-        raise ValueError(f"M={M} must be divisible by product of mesh axes "
-                         f"{mesh_axis} (= {n_dev})")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        M, M, n_dev, name="group pivoted-Cholesky row carrier")
     if point_budget < 1 or point_budget > M:
         raise ValueError(
             f"point_budget must lie in [1, M={M}]; got {point_budget}")

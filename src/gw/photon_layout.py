@@ -45,7 +45,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from runtime.padding import padded_mu_extent
+from runtime.padding import PaddedAxis, padded_mu_axis
 
 
 N_LORENTZ = 4
@@ -60,25 +60,24 @@ PHOTON_BARE_PROPAGATOR = "instantaneous_coulomb_gauge_v1"
 class PhotonBasisLayout:
     """Immutable direct-sum ordering and internal-padding invariant."""
 
-    logical_extents: tuple[int, int, int, int]
-    padded_extents: tuple[int, int, int, int]
+    channel_axes: tuple[PaddedAxis, PaddedAxis, PaddedAxis, PaddedAxis]
     mesh_side: int
     ordering: str = PHOTON_BASIS_ORDERING
     bare_propagator: str = PHOTON_BARE_PROPAGATOR
 
     def __post_init__(self) -> None:
-        logical = tuple(int(n) for n in self.logical_extents)
-        padded = tuple(int(n) for n in self.padded_extents)
+        logical = self.logical_extents
+        padded = self.carrier_extents
         side = int(self.mesh_side)
-        if len(logical) != N_LORENTZ or len(padded) != N_LORENTZ:
+        if len(self.channel_axes) != N_LORENTZ:
             raise ValueError("PhotonBasisLayout requires four Lorentz extents")
         if side < 1 or any(n < 1 for n in logical):
             raise ValueError(
                 f"invalid PhotonBasisLayout logical={logical}, mesh_side={side}")
-        if any(p < n or p % side for n, p in zip(logical, padded)):
+        divisors = {int(tag.divisor) for tag in self.channel_axes}
+        if len(divisors) != 1:
             raise ValueError(
-                "padded extents must cover logical extents and divide the "
-                f"mesh side: logical={logical}, padded={padded}, side={side}")
+                f"photon channels carry different divisors {sorted(divisors)}")
         if logical[1:] != (logical[1],) * 3 or padded[1:] != (padded[1],) * 3:
             raise ValueError(
                 "one transverse centroid family must serve T1/T2/T3; got "
@@ -95,37 +94,47 @@ class PhotonBasisLayout:
                 "full photon response requires a square ('x','y') mesh so "
                 "row/column interleaving is one identical permutation; got "
                 f"{px}x{py}")
-        divisor = px * py
-        p_c = padded_mu_extent(int(n_charge), divisor)
-        p_t = padded_mu_extent(int(n_transverse), divisor)
+        p_c = padded_mu_axis(int(n_charge), mesh_xy)
+        p_t = padded_mu_axis(int(n_transverse), mesh_xy)
         return cls(
-            logical_extents=(int(n_charge), int(n_transverse),
-                             int(n_transverse), int(n_transverse)),
-            padded_extents=(p_c, p_t, p_t, p_t),
+            channel_axes=(p_c, p_t, p_t, p_t),
             mesh_side=px)
 
     @property
+    def logical_extents(self) -> tuple[int, int, int, int]:
+        return tuple(int(tag.logical) for tag in self.channel_axes)
+
+    @property
+    def carrier_extents(self) -> tuple[int, int, int, int]:
+        return tuple(int(tag.carrier) for tag in self.channel_axes)
+
+    @property
     def packed_extent(self) -> int:
-        return sum(self.padded_extents)
+        return sum(self.carrier_extents)
 
     def logical_extent(self, channel: int) -> int:
         self._check_channel(channel)
         return self.logical_extents[int(channel)]
 
-    def padded_extent(self, channel: int) -> int:
+    def carrier_extent(self, channel: int) -> int:
         self._check_channel(channel)
-        return self.padded_extents[int(channel)]
+        return self.carrier_extents[int(channel)]
+
+    def channel_axis(self, channel: int) -> PaddedAxis:
+        """Logical/carrier receipt for one Lorentz centroid family."""
+        self._check_channel(channel)
+        return self.channel_axes[int(channel)]
 
     def local_offset(self, channel: int) -> int:
         """Channel offset inside one packed device shard."""
         self._check_channel(channel)
         return sum(p // self.mesh_side
-                   for p in self.padded_extents[:int(channel)])
+                   for p in self.carrier_extents[:int(channel)])
 
     def block_shape(self, nq: int, channel_left: int,
                     channel_right: int) -> tuple[int, int, int]:
-        return (int(nq), self.padded_extent(channel_left),
-                self.padded_extent(channel_right))
+        return (int(nq), self.carrier_extent(channel_left),
+                self.carrier_extent(channel_right))
 
     def assert_mesh(self, mesh_xy: Mesh) -> None:
         px = int(mesh_xy.shape['x'])
@@ -210,7 +219,7 @@ def _insert(packed, block, layout, A, B, mesh_xy):
     scalar = lambda x: jnp.asarray(int(x), dtype=jnp.int32)
     return _insert_program(
         layout, mesh_xy, int(packed.shape[0]),
-        layout.padded_extent(A), layout.padded_extent(B))(
+        layout.carrier_extent(A), layout.carrier_extent(B))(
             packed, block,
             scalar(layout.local_offset(A)), scalar(layout.local_offset(B)),
             scalar(layout.logical_extent(A)), scalar(layout.logical_extent(B)))
@@ -290,7 +299,7 @@ def photon_block_view(
     scalar = lambda x: jnp.asarray(int(x), dtype=jnp.int32)
     return _view_program(
         layout, mesh_xy, int(packed.shape[0]),
-        layout.padded_extent(A), layout.padded_extent(B))(
+        layout.carrier_extent(A), layout.carrier_extent(B))(
             packed, scalar(layout.local_offset(A)),
             scalar(layout.local_offset(B)))
 
@@ -364,7 +373,7 @@ def unpack_photon_response_tiles(
 
 def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
     """One local graph for embedding four channel vectors in packed space."""
-    padded = tuple(int(n) for n in layout.padded_extents)
+    padded = tuple(int(n) for n in layout.carrier_extents)
     key = (id(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
     if key in _vector_pack_cache:
         return _vector_pack_cache[key]
@@ -420,7 +429,7 @@ def pack_photon_channel_vectors(
 ) -> jax.Array:
     """Embed four native channel vectors in the packed photon basis.
 
-    Input channel ``A`` has shape ``(nq, layout.padded_extent(A))`` and is
+    Input channel ``A`` has shape ``(nq, layout.carrier_extent(A))`` and is
     already sharded ``P(None, axis_name)``.  The result has shape
     ``(nq, 4, layout.packed_extent)`` with sharding
     ``P(None, None, axis_name)``; row ``A`` contains the input only in the
@@ -441,7 +450,7 @@ def pack_photon_channel_vectors(
     dtype = np.dtype(vectors_by_channel[0].dtype)
     wanted = NamedSharding(mesh_xy, P(None, axis_name))
     for channel, vector in enumerate(vectors_by_channel):
-        expected = (nq, layout.padded_extent(channel))
+        expected = (nq, layout.carrier_extent(channel))
         if tuple(vector.shape) != expected:
             raise ValueError(
                 f"photon channel {channel} vector shape {vector.shape} != "
@@ -506,7 +515,7 @@ def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
 
 def _q0_update_program(layout, mesh_xy, nq, dtype):
     """One shape-stable local graph per padded q=0 update geometry."""
-    key = (id(mesh_xy), tuple(layout.padded_extents), int(nq),
+    key = (id(mesh_xy), tuple(layout.carrier_extents), int(nq),
            np.dtype(dtype).str)
     if key in _q0_update_cache:
         return _q0_update_cache[key]
@@ -528,7 +537,7 @@ def _q0_update_program(layout, mesh_xy, nq, dtype):
         left_pieces = []
         right_pieces = []
         for channel in range(N_LORENTZ):
-            local = layout.padded_extent(channel) // layout.mesh_side
+            local = layout.carrier_extent(channel) // layout.mesh_side
             left_pieces.append(_q0_local_factor_piece(
                 left_rows, axis_name="x", local_extent=local,
                 local_offset=layout.local_offset(channel),
@@ -713,7 +722,7 @@ def photon_q0_low_rank_block(
         rights.append(right)
     scalar = lambda value: jnp.asarray(int(value), dtype=jnp.int32)
     return _q0_block_program(
-        mesh_xy, layout.padded_extent(A), layout.padded_extent(B), dtype,
+        mesh_xy, layout.carrier_extent(A), layout.carrier_extent(B), dtype,
         len(pairs))(
             *lefts, *rights,
             scalar(layout.local_offset(A)), scalar(layout.local_offset(B)),

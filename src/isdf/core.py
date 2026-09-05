@@ -29,7 +29,6 @@ from common import timing
 from runtime.padding import (
 	bounded_partition_tile,
 	pad_last_axis_to,
-	round_up,
 	solve_at_logical,
 )
 from runtime import debug_print_enabled
@@ -872,16 +871,13 @@ def gram_q0_tiled_from_psi_sm(
 	width = int(tile_width)
 	if width <= 0:
 		raise ValueError(f"tile_width must be positive; got {width}")
-	n_x = int(mesh_xy.shape['x'])
-	n_y = int(mesh_xy.shape['y'])
-	if n_points % n_x or n_points % n_y:
-		raise ValueError(
-			"candidate extent must divide both mesh axes for a P('x','y') "
-			f"destination; got n_points={n_points}, mesh={n_x}x{n_y}")
-	if width % n_x or width % n_y:
-		raise ValueError(
-			"tile_width must divide both mesh axes; "
-			f"got tile_width={width}, mesh={n_x}x{n_y}")
+	from runtime.padding import authenticate_padded_axis
+	authenticate_padded_axis(
+		n_points, n_points, mesh_xy, name="Gram candidate carrier",
+		specs=((P('x', None), 0), (P(None, 'y'), 1)))
+	authenticate_padded_axis(
+		width, width, mesh_xy, name="Gram tile carrier",
+		specs=((P('x', None), 0), (P(None, 'y'), 1)))
 	if mode == "transverse":
 		perm = _gammas_perm
 		phase = _gammas_phase
@@ -923,16 +919,19 @@ def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
 		raise ValueError(
 			"transverse Gram planning requires nspinor=4; got "
 			f"{int(nspinor)}")
-	n_x = int(mesh_xy.shape['x'])
-	n_y = int(mesh_xy.shape['y'])
 	width = int(tile_width)
-	if (int(n_points) <= 0 or width <= 0
-	        or int(n_points) % n_x or int(n_points) % n_y
-	        or width % n_x or width % n_y):
+	if int(n_points) <= 0 or width <= 0:
 		raise ValueError(
-			"tiled Gram planning requires positive candidate/tile extents "
-			"divisible by both mesh axes; got "
-			f"n_points={int(n_points)}, tile_width={width}, mesh={n_x}x{n_y}")
+			"tiled Gram planning requires positive candidate/tile extents; "
+			f"got n_points={int(n_points)}, tile_width={width}")
+	from runtime.padding import authenticate_padded_axis
+	authenticate_padded_axis(
+		int(n_points), int(n_points), mesh_xy,
+		name="AOT Gram candidate carrier",
+		specs=((P('x', None), 0), (P(None, 'y'), 1)))
+	authenticate_padded_axis(
+		width, width, mesh_xy, name="AOT Gram tile carrier",
+		specs=((P('x', None), 0), (P(None, 'y'), 1)))
 	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
 	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
 	xy_sh = NamedSharding(mesh_xy, P('x', 'y'))
@@ -1723,10 +1722,10 @@ def _z_q_legacy(
 	n_zchunk = int(r_chunk_size)
 	p_x = int(mesh_xy.shape['x'])
 	p_y = int(mesh_xy.shape['y'])
-	if n_zchunk % p_y != 0:
-		raise ValueError(
-			f"z_q_from_psi_sm: r_chunk_size={n_zchunk} not divisible by "
-			f"p_y={p_y} (out_spec=P(None,'x','y') requires this).")
+	from runtime.padding import authenticate_padded_axis
+	authenticate_padded_axis(
+		n_zchunk, n_zchunk, mesh_xy, name="zeta real-space chunk carrier",
+		spec=P(None, 'x', 'y'), axis=2)
 	r_loc = n_zchunk // p_y
 
 	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
@@ -1766,7 +1765,8 @@ def _z_q_legacy(
 		# bc-aligned scan body.  Each iter gathers ``bpd_max_global =
 		# P · _bpd_max`` bands (the bc's full band width), so the L/R
 		# masks index into a static-size axis.
-		P_total = p_x * p_y
+		from runtime.padding import mesh_divisor
+		P_total = mesh_divisor(mesh_xy)
 		bpd_max = int(_psi_G_store._bpd_max)
 		bpd_max_global = bpd_max * P_total          # padded global bc band count
 		n_bc = len(bcr)
@@ -1782,7 +1782,12 @@ def _z_q_legacy(
 		_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
 		for _bc in range(n_bc):
 			_bpd = int(_psi_G_store._bpd_per_bc[_bc])
-			_nb_tot = _bpd * P_total  # == b_hi-b_lo (sharded load is P-divisible)
+			_bc_width = int(bcr[_bc][1] - bcr[_bc][0])
+			from runtime.padding import authenticate_padded_axis
+			_bc_axis = authenticate_padded_axis(
+				_bc_width, _bc_width, P_total,
+				name=f"zeta band chunk {_bc}")
+			_nb_tot = _bc_axis.carrier
 			# Precondition guard (device-invariance audit): each band-chunk
 			# width MUST be world_size-divisible, else floor-div silently drops
 			# bands and the populate tile assignment shape-mismatches at P>1.
@@ -1790,11 +1795,11 @@ def _z_q_legacy(
 			# (band_chunk_size), and an assert vanishes under `python -O`,
 			# re-arming exactly the silent band-dropping this guards
 			# (audit fix/zq 2026-07-28).
-			if _nb_tot != (bcr[_bc][1] - bcr[_bc][0]) or _bpd > bpd_max:
+			if _bpd != _nb_tot // P_total or _bpd > bpd_max:
 				raise ValueError(
-					f"z_q band chunk {_bc} width {bcr[_bc][1]-bcr[_bc][0]} is not a "
-					f"multiple of world_size {P_total} (bpd_per_bc={_bpd}); set "
-					f"band_chunk_size to a multiple of world_size")
+					f"z_q band chunk {_bc} carrier metadata disagrees: width="
+					f"{_nb_tot}, expected bands/rank={_nb_tot // P_total}, "
+					f"stored bands/rank={_bpd}, maximum={bpd_max}")
 			if _bpd <= 0:
 				continue  # zero-width bc: every slot is masked downstream
 			# out pos p -> src slot (strided real bands compacted to front);
@@ -2147,7 +2152,7 @@ def _z_q_legacy(
 		# wide so every mesh can lower the same wrapper without allocating a
 		# full-grid cache merely to exercise the historical path.
 		psi_r_cache = jnp.zeros(
-			(1, 1, p_x * p_y, 1, 1), dtype=jnp.complex128)
+			(1, 1, P_total, 1, 1), dtype=jnp.complex128)
 	return _pair_pipeline_sm_cache[cache_key](
 		psi_l_X, psi_r_X, perm_L, phase_L, perm_R, phase_R, r_start_arg,
 		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache)
@@ -2281,26 +2286,27 @@ def _z_q_face(
 			f"matching psi_mun's own band extent; got "
 			f"{tuple(weight_l.shape)}/{tuple(weight_r.shape)}.")
 	n_zchunk = int(r_chunk_size)
-	p_x = int(mesh_xy.shape['x'])
 	p_y = int(mesh_xy.shape['y'])
-	if n_zchunk % p_y != 0:
-		raise ValueError(
-			f"_z_q_face: r_chunk_size={n_zchunk} not divisible by "
-			f"p_y={p_y} (out_spec=P(None,'x','y') requires this).")
-	if nb_face % p_y != 0:
-		raise ValueError(
-			f"_z_q_face: psi_mun's band extent {nb_face} is not divisible "
-			f"by p_y={p_y} — PSI_MUN_SPEC's own 'y'-sharding contract "
-			f"requires this (BandSlices.b4 is world-size-padded, and "
-			f"psi_mun spans the fit's FULL [b0,b4) load extent).")
+	from runtime.padding import authenticate_padded_axis
+	authenticate_padded_axis(
+		n_zchunk, n_zchunk, mesh_xy,
+		name="face zeta real-space chunk carrier",
+		spec=P(None, 'x', 'y'), axis=2)
+	authenticate_padded_axis(
+		nb_face, nb_face, mesh_xy, name="face zeta band carrier",
+		spec=P(None, 'y', None, 'x'), axis=1)
 	r_loc = n_zchunk // p_y
 	cache_y_r_tile = int(cache_y_r_tile)
 	if cache_y_blocks:
 		if cache_y_r_tile <= 0:
 			cache_y_r_tile = n_zchunk
+		if cache_y_r_tile <= n_zchunk:
+			authenticate_padded_axis(
+				cache_y_r_tile, cache_y_r_tile, mesh_xy,
+				name="face zeta cache tile carrier",
+				spec=P(None, None, 'y'), axis=2)
 		if (cache_y_r_tile > n_zchunk
-				or cache_y_r_tile % p_y
-				or n_zchunk % cache_y_r_tile):
+				or n_zchunk // cache_y_r_tile * cache_y_r_tile != n_zchunk):
 			raise ValueError(
 				"_z_q_face: cache_y_r_tile must be a positive, p_y-aligned "
 				"exact divisor of r_chunk_size; got "
@@ -2349,7 +2355,8 @@ def _z_q_face(
 	# (0-based) band index directly, with no separate parameter needed.
 	_bfs = bcr[0][0]
 	use_psi_r_cache = psi_r_cache is not None
-	P_total = p_x * p_y
+	from runtime.padding import mesh_divisor
+	P_total = mesh_divisor(mesh_xy)
 	local_band_chunk_shape = tuple(
 		int(v) for v in psi_G_store.local_band_chunk_shape)
 	if local_band_chunk_shape[0] != nk or local_band_chunk_shape[2] != ns:
@@ -2371,14 +2378,16 @@ def _z_q_face(
 	_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
 	for _bc in range(n_bc):
 		_bc_width = bcr[_bc][1] - bcr[_bc][0]
-		_bpd, _remainder = divmod(_bc_width, P_total)
-		_nb_tot = _bpd * P_total
-		if _remainder or _bpd > bpd_max:
+		from runtime.padding import authenticate_padded_axis
+		_bc_axis = authenticate_padded_axis(
+			_bc_width, _bc_width, P_total,
+			name=f"face zeta band chunk {_bc}")
+		_nb_tot = _bc_axis.carrier
+		_bpd = _nb_tot // P_total
+		if _bpd > bpd_max:
 			raise ValueError(
-				f"_z_q_face band chunk {_bc} width "
-				f"{_bc_width} is not a multiple of "
-				f"world_size {P_total} (bpd_per_bc={_bpd}); set "
-				f"band_chunk_size to a multiple of world_size")
+				f"_z_q_face band chunk {_bc} has {_bpd} bands/rank, "
+				f"exceeding the allocated maximum {bpd_max}")
 		if _bpd <= 0:
 			continue
 		_p = np.arange(bpd_max_global)
@@ -2784,7 +2793,7 @@ def _z_q_face(
 	                else r_start_dyn)
 	if psi_r_cache is None:
 		psi_r_cache = jnp.zeros(
-			(1, 1, p_x * p_y, 1, 1), dtype=jnp.complex128)
+			(1, 1, P_total, 1, 1), dtype=jnp.complex128)
 	return _pair_pipeline_sm_cache[cache_key](
 		psi_mun, weight_l.astype(jnp.float64), weight_r.astype(jnp.float64),
 		perm_L, phase_L, perm_R, phase_R,
@@ -3387,7 +3396,11 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
         px = int(mesh_xy.shape['x'])
         py = int(mesh_xy.shape['y'])
         n_log = int(n_rmu_logical)
-        if (n_log % px) or (n_log % py):
+        from runtime.padding import padded_axis
+        _logical_carrier = padded_axis(
+            n_log, mesh_xy, name="transverse logical LU extent",
+            specs=((P('x', None), 0), (P(None, 'y'), 1)))
+        if _logical_carrier.pad:
             if override in ('on', 'cusolvermp', 'scalapack'):
                 raise ValueError(
                     f"distributed_lu={override!r} was explicitly requested, "
@@ -4392,11 +4405,15 @@ def _qparallel_announce(nq: int, n_rmu: int, n_log: int,
     if sig in _qparallel_announced:
         return
     _qparallel_announced.add(sig)
-    blk = -(-int(nq) // ndev)
+    from runtime.padding import padded_axis
+    q_axis = padded_axis(
+        int(nq), mesh_xy, name="zeta-factor q carrier",
+        spec=P(('x', 'y'), None, None), axis=0)
+    blk = q_axis.carrier // ndev
     print(f"  [zeta factor] replicated plan, q-parallel execution: "
           f"nq={nq} scattered over {ndev} devices "
           f"(ceil(nq/P)={blk} whole ({n_rmu},{n_rmu}) tile(s)/device, "
-          f"q-pad {round_up(int(nq), ndev) - int(nq)}); factors are "
+          f"q-pad {q_axis.pad}); factors are "
           f"bit-identical to the all-ranks execution "
           f"(LORRAX_ZETA_QPARALLEL=0 restores it)", flush=True)
     if ndev > int(nq):
@@ -4480,7 +4497,10 @@ def _factor_c_q_replicated_qparallel(
     rank_log = mode in ('rank_truncate', 'transverse_rank_truncate')
     ndev = int(mesh_xy.devices.size)
     py = int(mesh_xy.shape['y'])
-    nq_pad = round_up(int(nq), ndev)
+    from runtime.padding import padded_axis
+    nq_pad = padded_axis(
+        int(nq), mesh_xy, name="zeta-factor q carrier",
+        spec=P(('x', 'y'), None, None), axis=0).carrier
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
@@ -4794,7 +4814,10 @@ def _factor_c_q_transverse_lu(
         _qparallel_announce_transverse(nq, n_rmu, n_log, mesh_xy)
         ndev = int(mesh_xy.devices.size)
         py = int(mesh_xy.shape['y'])
-        nq_pad = round_up(int(nq), ndev)
+        from runtime.padding import padded_axis
+        nq_pad = padded_axis(
+            int(nq), mesh_xy, name="transverse-factor q carrier",
+            spec=P(('x', 'y'), None, None), axis=0).carrier
         blk = nq_pad // ndev
         q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
         mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
@@ -4866,7 +4889,11 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
     if sig in _transverse_qparallel_announced:
         return
     _transverse_qparallel_announced.add(sig)
-    blk = -(-int(nq) // ndev)
+    from runtime.padding import padded_axis
+    q_axis = padded_axis(
+        int(nq), mesh_xy, name="transverse zeta-factor q carrier",
+        spec=P(('x', 'y'), None, None), axis=0)
+    blk = q_axis.carrier // ndev
     print(f"  [zeta transverse factor] hoisted per-q LU, q-parallel "
           f"execution: nq={nq} scattered over {ndev} devices "
           f"(ceil(nq/P)={blk} whole ({n_log},{n_log}) tile(s)/device); "
@@ -6084,7 +6111,11 @@ def solve_zeta(
     if solver_kind in ('cusolvermp_lu', 'scalapack_lu') and mu_pad:
         Px_ = int(mesh_xy.shape['x'])
         Py_ = int(mesh_xy.shape['y'])
-        if (n_log % Px_) or (n_log % Py_):
+        from runtime.padding import padded_axis
+        logical_lu_axis = padded_axis(
+            n_log, mesh_xy, name="logical distributed LU extent",
+            specs=((P('x', None), 0), (P(None, 'y'), 1)))
+        if logical_lu_axis.pad:
             # The indefinite solve MUST run at the logical extent (see
             # ``n_rmu_logical`` above), but the distributed block-cyclic
             # descriptors need n % Px == n % Py == 0.  Fall back to the
@@ -6191,8 +6222,11 @@ def solve_zeta(
         return _distributed_backsolve(Z_q, mesh_xy, _run_lu)
 
     # Compute padding needed for even sharding across all devices
-    total_devices = mesh_xy.devices.size
-    n_zchunk_padded = round_up(n_zchunk, total_devices)
+    from runtime.padding import padded_axis
+    z_axis = padded_axis(
+        n_zchunk, mesh_xy, name="zeta RHS column carrier",
+        spec=P(None, None, ('x', 'y')), axis=2)
+    n_zchunk_padded = z_axis.carrier
     needs_padding = n_zchunk_padded != n_zchunk
 
     z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
@@ -6206,7 +6240,8 @@ def solve_zeta(
     # per_q tier consumes it directly instead of asking for a replica.
     L_batch_xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     q_batch = min(q_chunk_size, nq)
-    nq_padded = round_up(nq, q_batch)
+    nq_padded = padded_axis(
+        nq, q_batch, name="zeta solve q-batch carrier").carrier
 
     # Dispatch on solver_kind (already resolved above).  The solve itself is
     # independent of the particular transverse gamma; the outer r-chunk

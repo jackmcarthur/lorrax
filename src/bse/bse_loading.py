@@ -1058,7 +1058,7 @@ def load_bse_data_from_restart_sharded(
             mesh_xy, origin="bse_loading.load_bse_data_from_restart_sharded")
         # Disk stores the LOGICAL μ extent; re-pad to the ONE in-memory
         # convention (mesh-product round-up, runtime.padding).
-        n_rmu_pad = padded_mu_extent(n_rmu, grid_x * grid_y)
+        n_rmu_pad = padded_mu_extent(n_rmu, mesh_xy)
         mu_per_x = n_rmu_pad // grid_x
         nu_per_y = n_rmu_pad // grid_y
 
@@ -1384,7 +1384,8 @@ def _load_ring_subset(
     W0_qmunu = W0_qmunu_flat
     nk = nkx * nky * nkz
     # Same μ re-pad convention as the sharded loader above.
-    n_rmu_pad = padded_mu_extent(n_rmu, px * py)
+    from runtime.padding import product_divisor
+    n_rmu_pad = padded_mu_extent(n_rmu, product_divisor(px, py))
 
     n_bands_total = nb_total
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)

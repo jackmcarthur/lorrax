@@ -38,7 +38,7 @@ from common.wfn_transforms import (
     load_centroids_band_chunked,
 )
 from distrib_la import plan as linalg_plan
-from runtime.padding import round_up, spec_divisor
+from runtime.padding import spec_divisor
 
 
 __all__ = [
@@ -453,12 +453,12 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
             raise ValueError("Galerkin basis provenance mismatch: "
                              + ", ".join(mismatches))
         physical = stored["rank"]
-        px = spec_divisor(mesh_xy, P("x", None), axis=0)
-        py = spec_divisor(mesh_xy, P(None, "y"), axis=1)
-        align = math.lcm(px, py)
-        carrier = round_up(physical, align)
-        if extra_rank_pad:
-            carrier = round_up(carrier + extra_rank_pad, align)
+        from runtime.padding import padded_axis
+        rank_axis = padded_axis(
+            physical, mesh_xy, name="Galerkin restart rank carrier",
+            specs=((P("x", None), 0), (P(None, "y"), 1)),
+            extra=extra_rank_pad)
+        carrier = rank_axis.carrier
         shapes = ((stored["nk"], stored["nb"], carrier),
                   (carrier, stored["nspinor"], stored["centroid_shape"][0]),
                   (carrier, carrier))
@@ -498,9 +498,10 @@ def _whole_state_memory_ledger(
     alternatives; the returned ``HWM`` is their maximum, never their sum.
     """
     p = int(mesh_xy.size)
-    rank_carrier = round_up(
-        int(search_rank),
-        math.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])))
+    from runtime.padding import padded_axis
+    rank_carrier = padded_axis(
+        int(search_rank), mesh_xy, name="Galerkin search-rank carrier",
+        specs=((P("x", None), 0), (P(None, "y"), 1))).carrier
     r_spec = P(None, None, ('y', 'x'))
     r_divisor = spec_divisor(mesh_xy, r_spec, axis=2)
     stream = plan_galerkin_stream(
@@ -583,10 +584,13 @@ def _resolve_whole_state_stream_budget(
     if requested_q_tile_budget <= 0:
         raise ValueError(
             "whole-state Galerkin stream budget must be positive")
+    from runtime.padding import padded_axis
+    search_axis = padded_axis(
+        search_rank, mesh_xy, name="Galerkin budget rank carrier",
+        specs=((P("x", None), 0), (P(None, "y"), 1)))
     bytes_per_local_r = (
-        round_up(search_rank, math.lcm(
-            int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])))
-        * int(nspinor) * np.dtype(np.complex128).itemsize)
+        search_axis.carrier * int(nspinor)
+        * np.dtype(np.complex128).itemsize)
     target_utilization = bfc_fragmentation_target_utilization(nspinor)
     capacity_target = (
         float(device_pool_limit) * target_utilization
@@ -759,13 +763,18 @@ def fit_galerkin_basis(
     candidate_hash = hashlib.sha256(
         candidates.astype("<i8", copy=False).tobytes()).hexdigest()
 
-    p_total = int(mesh_xy.size)
-    candidate_carrier = round_up(n_candidates, p_total)
-    align = math.lcm(
-        int(mesh_xy.shape['x']), int(mesh_xy.shape['y']))
-    p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
+    from runtime.padding import padded_axis
+    candidate_carrier = padded_axis(
+        n_candidates, mesh_xy, name="Galerkin candidate carrier").carrier
+    p_band = padded_axis(
+        1, mesh_xy, name="Galerkin band divisor",
+        spec=band_sphere_spec(), axis=1).divisor
     bc_hint = max(p_band, min(int(band_chunk_size), nb))
-    bc_carrier = round_up(bc_hint, p_band)
+    band_axis = padded_axis(
+        bc_hint, mesh_xy, name="Galerkin band-chunk carrier",
+        spec=band_sphere_spec(), axis=1)
+    p_band = band_axis.divisor
+    bc_carrier = band_axis.carrier
     while True:
         try:
             q_tile_budget, _memory_ledger = \
@@ -898,9 +907,10 @@ def fit_galerkin_basis(
         selected = candidates[piv_host[:rank_phys]]
         pivot_hash = hashlib.sha256(
             selected.astype("<i8", copy=False).tobytes()).hexdigest()
-        rank = round_up(rank_phys, align)
-        if extra_rank_pad:
-            rank = round_up(rank + extra_rank_pad, align)
+        rank = padded_axis(
+            rank_phys, mesh_xy, name="Galerkin selected-rank carrier",
+            specs=((P("x", None), 0), (P(None, "y"), 1)),
+            extra=extra_rank_pad).carrier
         n_pad = rank - rank_phys
         log_fn(
             f"  [qrcp] raw rank={rank_qr}, delivered physical rank="
@@ -1027,12 +1037,10 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
     if fn is not None:
         return fn
 
-    p_x = int(mesh_.shape['x'])
-    p_y = int(mesh_.shape['y'])
-    if rank_ % p_x or rank_ % p_y:
-        raise ValueError(
-            "_make_fold_G_kernel: the carried Galerkin rank must divide "
-            f"both mesh axes; rank={rank_}, mesh={p_x}x{p_y}")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        rank_, rank_, mesh_, name="Galerkin rank carrier",
+        specs=((P('x', None), 0), (P(None, 'y'), 1)))
 
     @partial(
         shard_map,
@@ -1275,7 +1283,10 @@ def _build_randomized_state_sketch(
     sketch = _zeros()
     t0 = time.time()
     for r_idx, (r0, r1) in enumerate(plan.r_chunk_ranges):
-        r_carrier = round_up(r1 - r0, r_divisor)
+        from runtime.padding import padded_axis
+        r_carrier = padded_axis(
+            r1 - r0, r_divisor,
+            name="Galerkin sketch real-space carrier").carrier
         draw = _make_sketch_random_kernel(
             mesh=mesh_xy, sketch_rows=sketch_rows, nspinor=nspinor,
             r_carrier=r_carrier, row_layout=random_layout, seed=seed)
@@ -1326,9 +1337,11 @@ def _build_selected_rows_for_rchunk(
         rank_carrier: int, r0: int, r1: int, row_layout, psi_layout):
     nk = int(meta.nk_tot)
     nspinor = int(meta.nspinor)
-    r_carrier = round_up(
-        int(r1) - int(r0),
-        spec_divisor(mesh_xy, row_layout.spec, axis=2))
+    from runtime.padding import padded_axis
+    r_carrier = padded_axis(
+        int(r1) - int(r0), mesh_xy,
+        name="Galerkin selected-row real-space carrier",
+        spec=row_layout.spec, axis=2).carrier
 
     rows = _make_selected_zero_kernel(
         mesh=mesh_xy, row_count=rank_carrier, nspinor=nspinor,
@@ -1543,7 +1556,10 @@ def iter_galerkin_rchunks(
             raise ValueError(
                 f"iter_galerkin_rchunks: r slab [{r0},{r1}) escapes "
                 f"[0,{int(meta.n_rtot)})")
-        r_carrier = round_up(r1 - r0, r_divisor)
+        from runtime.padding import padded_axis
+        r_carrier = padded_axis(
+            r1 - r0, r_divisor,
+            name="Galerkin iteration real-space carrier").carrier
         selected_rows = _make_selected_zero_kernel(
             mesh=mesh_xy, row_count=rank, nspinor=nspinor,
             r_carrier=r_carrier, row_layout=row_layout)()
@@ -1672,7 +1688,10 @@ def _build_physical_coefficients(
     chunks = [_zeros_coeff() for _ in source.band_chunk_ranges]
     t0 = time.time()
     for r_idx, (r0, r1) in enumerate(plan.r_chunk_ranges):
-        r_carrier = round_up(r1 - r0, r_divisor)
+        from runtime.padding import padded_axis
+        r_carrier = padded_axis(
+            r1 - r0, r_divisor,
+            name="Galerkin coefficient real-space carrier").carrier
         selected_rows = _build_selected_rows_for_rchunk(
             source=source, mesh_xy=mesh_xy, meta=meta,
             selected_maps=maps, rank_carrier=rank_carrier,
@@ -1767,7 +1786,10 @@ def plan_galerkin_stream(*, rank: int, nspinor: int, n_rtot: int,
         for r0 in range(0, n_rtot, r_chunk)
     )
     max_r_logical = max(r1 - r0 for r0, r1 in r_chunk_ranges)
-    max_r_carrier = round_up(max_r_logical, r_mesh_divisor)
+    from runtime.padding import padded_axis
+    max_r_carrier = padded_axis(
+        max_r_logical, r_mesh_divisor,
+        name="Galerkin stream real-space carrier").carrier
     q_tile_local_bytes = (
         rank * nspinor * (max_r_carrier // r_mesh_divisor)
         * np.dtype(np.complex128).itemsize

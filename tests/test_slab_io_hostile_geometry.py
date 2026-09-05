@@ -101,7 +101,8 @@ def test_nondivisible_sharded_extent_refuses_naming_the_padded_shape():
     ``partition_spec`` and JAX will not build one at 17/4.  The refusal
     must name the shape the caller should ask for instead.
     """
-    with pytest.raises(ValueError, match="not divisible") as ei:
+    with pytest.raises(
+            ValueError, match="carrier extent is 17, expected 20") as ei:
         _validate_block_divisible(
             op="read_slab", name="D", shape=(17, 16),
             axis_count_per_dim=(1, 1), axis_flat=(0, 1),
@@ -112,7 +113,8 @@ def test_nondivisible_sharded_extent_refuses_naming_the_padded_shape():
 
 def test_padded_extent_that_is_itself_not_divisible_refuses():
     """A caller who pads to 18 on a 4-wide mesh axis is still wrong."""
-    with pytest.raises(ValueError, match="dimension 0 size 18"):
+    with pytest.raises(
+            ValueError, match="dimension 0: carrier extent is 18, expected 20"):
         _validate_block_divisible(
             op="write_slab", name="D", shape=(18, 24),
             axis_count_per_dim=(1, 1), axis_flat=(0, 1),
@@ -131,7 +133,8 @@ def test_replicated_dims_are_never_divisibility_checked():
         axis_count_per_dim=(0, 1, 1), axis_flat=(0, 1),
         mesh_shape=(4, 4))
     # ...and the sharded dims of that same operand ARE checked
-    with pytest.raises(ValueError, match="dimension 1 size 17"):
+    with pytest.raises(
+            ValueError, match="dimension 1: carrier extent is 17, expected 20"):
         _validate_block_divisible(
             op="write_slab", name="D", shape=(3, 17, 23),
             axis_count_per_dim=(0, 1, 1), axis_flat=(0, 1),
@@ -140,7 +143,7 @@ def test_replicated_dims_are_never_divisibility_checked():
 
 def test_one_dim_sharded_by_both_mesh_axes_uses_the_axis_PRODUCT():
     """P(('x','y'), None) on 4x4 needs dim 0 divisible by 16, not 4."""
-    with pytest.raises(ValueError, match="mesh-axis product 16"):
+    with pytest.raises(ValueError, match="logical extent 20 and divisor 16"):
         _validate_block_divisible(
             op="write_slab", name="D", shape=(20, 5),
             axis_count_per_dim=(2, 0), axis_flat=(0, 1),

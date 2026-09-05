@@ -821,7 +821,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             sym_perm=(None if parent_tables is None
                       else np.asarray(parent_tables.sym_perm)[:, :mu_L]))
         mu_S = int(sel.mu_small)
-        mu_S_pad = int(padded_mu_extent(mu_S, int(jax.device_count())))
+        mu_S_pad = int(padded_mu_extent(mu_S, mesh_xy))
     print_fn(sel.describe())
     if sel.eigen_rank_kept < mu_S:
         print_fn(

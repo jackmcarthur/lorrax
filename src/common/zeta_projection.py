@@ -192,10 +192,12 @@ def _check_mesh(mesh_xy: Mesh, axes: tuple[str, str]) -> tuple[int, int]:
     return int(mesh_xy.shape[ax_x]), int(mesh_xy.shape[ax_y])
 
 
-def _require_div(n: int, px: int, py: int, what: str, axes) -> None:
-    if n % px or n % py:
-        raise ValueError(_MU_DIV_MSG.format(
-            what=what, n=n, px=px, py=py, ax_x=axes[0], ax_y=axes[1]))
+def _require_div(n: int, mesh_xy: Mesh, what: str, axes) -> None:
+    from runtime.padding import authenticate_padded_axis
+    ax_x, ax_y = axes
+    authenticate_padded_axis(
+        n, n, mesh_xy, name=f"zeta projection {what} carrier",
+        specs=((P(ax_x, None), 0), (P(None, ax_y), 1)))
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +367,7 @@ def zeta_overlap_block_reshard(
     from common.shard_map import shard_map
 
     ax_x, ax_y = axes
-    p_x, p_y = _check_mesh(mesh_xy, axes)
+    _check_mesh(mesh_xy, axes)
 
     def _overlap(zeta_S, zeta_L):
         if zeta_S.ndim != 3 or zeta_L.ndim != 3:
@@ -381,15 +383,11 @@ def zeta_overlap_block_reshard(
                 f"the SAME per-q G-sphere.  Two ζ files built on different "
                 f"FFT grids / cutoffs cannot be overlapped; refit one of "
                 f"them on the other's grid.")
-        _require_div(mu_l, p_x, p_y, "mu_L", axes)
-        if n_g % (p_x * p_y):
-            raise ValueError(
-                f"zeta_projection: n_G={n_g} must be a multiple of the mesh "
-                f"size p_{ax_x}·p_{ax_y}={p_x * p_y} — G is the contraction "
-                f"axis and is flat-sharded over the whole mesh.  Pad the "
-                f"G-sphere with zero rows (ngkmax padding is already the "
-                f"on-disk ζ contract: file_io.zeta_loader zero-fills past "
-                f"ngk[q]) or drop to a mesh whose size divides n_G.")
+        _require_div(mu_l, mesh_xy, "mu_L", axes)
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            n_g, n_g, mesh_xy, name="zeta overlap G carrier",
+            spec=P(None, None, (ax_x, ax_y)), axis=2)
 
         chunk = mu_s_chunk
         if chunk is None:
@@ -477,9 +475,6 @@ def zeta_overlap_single_axis(
             f"g_axis={g_axis!r} must be two DISTINCT axes of the mesh "
             f"{names} — μ_L and G are tiled on different mesh axes so the "
             f"rank-local partial is already the output shard.")
-    p_mu = int(mesh_xy.shape[mu_axis])
-    p_g = int(mesh_xy.shape[g_axis])
-
     def _overlap(zeta_S, zeta_L):
         n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
         n_q_l, mu_l, n_g_l = (int(d) for d in zeta_L.shape)
@@ -488,19 +483,14 @@ def zeta_overlap_single_axis(
                 f"ζ_S {tuple(zeta_S.shape)} and ζ_L {tuple(zeta_L.shape)} "
                 f"must agree on (n_q, n_G) — the overlap is per-q and over "
                 f"the SAME per-q G-sphere.")
-        if mu_l % p_mu:
-            raise ValueError(
-                f"zeta_overlap_single_axis: mu_L={mu_l} must be a multiple "
-                f"of p_{mu_axis}={p_mu} (ζ_L is block-sharded on that axis). "
-                f"Pad the large centroid set with zero ζ rows — inert in "
-                f"the overlap — and slice the pad off T afterwards.")
-        if n_g % p_g:
-            raise ValueError(
-                f"zeta_overlap_single_axis: n_G={n_g} must be a multiple of "
-                f"p_{g_axis}={p_g} (G is the sharded contraction axis). Pad "
-                f"the G-sphere with zero rows; that is already the on-disk "
-                f"ngkmax contract (file_io.zeta_loader zero-fills past "
-                f"ngk[q]).")
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            mu_l, mu_l, mesh_xy,
+            name="single-axis zeta large-centroid carrier",
+            spec=P(None, mu_axis, g_axis), axis=1)
+        authenticate_padded_axis(
+            n_g, n_g, mesh_xy, name="single-axis zeta G carrier",
+            spec=P(None, mu_axis, g_axis), axis=2)
 
         def _body(zS, zL):
             loc = jnp.einsum('qmg,qng->qmn', jnp.conj(zS), zL, optimize=True)
@@ -528,15 +518,12 @@ def zeta_gram_single_axis(mesh_xy: Mesh, *, g_axis: str) -> Callable:
     names = tuple(mesh_xy.axis_names)
     if g_axis not in names:
         raise ValueError(f"g_axis={g_axis!r} not in mesh axes {names}")
-    p_g = int(mesh_xy.shape[g_axis])
-    other = [a for a in names if a != g_axis]
-
     def _gram(zeta_S):
         n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
-        if n_g % p_g:
-            raise ValueError(
-                f"zeta_gram_single_axis: n_G={n_g} must be a multiple of "
-                f"p_{g_axis}={p_g}.")
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            n_g, n_g, mesh_xy, name="single-axis zeta Gram G carrier",
+            spec=P(None, None, g_axis), axis=2)
 
         def _body(zS):
             loc = jnp.einsum('qmg,qng->qmn', jnp.conj(zS), zS, optimize=True)
@@ -572,10 +559,10 @@ def zeta_gram_replicated(
 
     def _gram(zeta_S):
         n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
-        if n_g % (p_x * p_y):
-            raise ValueError(
-                f"zeta_projection.gram: n_G={n_g} must be a multiple of the "
-                f"mesh size {p_x * p_y} (G is the sharded contraction axis).")
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            n_g, n_g, mesh_xy, name="replicated zeta Gram G carrier",
+            spec=P(None, None, (ax_x, ax_y)), axis=2)
         chunk = mu_s_chunk
         if chunk is None:
             per_row = n_q * mu_s * 16.0
@@ -937,8 +924,8 @@ def build_zeta_transfer(
     p_x, p_y = _check_mesh(mesh_xy, axes)
     n_q, mu_s, n_g = (int(d) for d in zeta_S.shape)
     mu_l = int(zeta_L.shape[1])
-    _require_div(mu_s, p_x, p_y, "mu_S", axes)
-    _require_div(mu_l, p_x, p_y, "mu_L", axes)
+    _require_div(mu_s, mesh_xy, "mu_S", axes)
+    _require_div(mu_l, mesh_xy, "mu_L", axes)
 
     overlap = zeta_overlap_block_reshard(
         mesh_xy, axes=axes, mu_s_chunk=mu_s_chunk)
@@ -1016,12 +1003,7 @@ def project_w_between_zeta_bases(
     _check_mesh(mesh_xy, axes)
     warm_mesh_cliques(mesh_xy)
     inner = contract_bands_block_reshard(
-        mesh_xy, channels="none", extra="none", axes=axes,
-        divisibility_hint=(
-            "Here m = n = mu_S (the SMALL ζ basis) and the contracted axis "
-            "is mu_L: pad the small centroid set to a multiple of p_x and "
-            "of p_y (zero ζ rows are inert in the overlap) and slice the "
-            "pad off W_S afterwards."))
+        mesh_xy, channels="none", extra="none", axes=axes)
     o_sh = NamedSharding(mesh_xy, P(None, None, ax_x, None, ax_y))
 
     def _project(W_L, psi_left, psi_right):

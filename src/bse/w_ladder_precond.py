@@ -542,12 +542,11 @@ def apply_lifted_resolvent_block(G_zeta, z, dq: dict, stack: PrecondStack,
     the baseline.  Returns ``(T_tile[sh.V], resids, iters)``.
     """
     sh = stack.sh
-    px, py = sh.X.mesh.devices.shape
     n_probe = int(G_zeta.shape[0])
-    if n_probe % py != 0:
-        raise ValueError(
-            f"probe block n_probe={n_probe} must be a multiple of py={py} "
-            "(reduce-scatter tiles nu over y); pad with zero rows.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        n_probe, n_probe, sh.X.mesh, name="BSE preconditioner probe carrier",
+        spec=P("y", None), axis=0)
     n_rmu = int(dq["V_q0"].shape[0])
     nk = int(dq["nkx"] * dq["nky"] * dq["nkz"])
 
@@ -993,10 +992,11 @@ def apply_fgmres_resolvent_block(G_zeta, z, dq: dict, stack: PrecondStack,
     seed_v = dq["V_q0"] if seed_v is None else seed_v
     snapshot_v = dq["V_q0"] if snapshot_v is None else snapshot_v
     sh = stack.sh
-    px, py = sh.X.mesh.devices.shape
     n_probe = int(G_zeta.shape[0])
-    if n_probe % py != 0:
-        raise ValueError(f"n_probe={n_probe} must be a multiple of py={py}.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        n_probe, n_probe, sh.X.mesh, name="BSE lifted probe carrier",
+        spec=P("y", None), axis=0)
     n_rmu = int(dq["V_q0"].shape[0])
     nk = int(dq["nkx"] * dq["nky"] * dq["nkz"])
 
@@ -1081,10 +1081,14 @@ def compute_wc_qwedge_lifted(
     z_list_ry = np.asarray(z_list_ry, dtype=np.complex128)
     if z_list_ry.ndim != 1 or z_list_ry.size == 0:
         raise ValueError("z_list_ry must be a non-empty 1-D complex list.")
-    if probe_chunk is not None and (int(probe_chunk) <= 0
-                                    or int(probe_chunk) % py != 0):
-        raise ValueError(
-            f"probe_chunk={probe_chunk} must be a positive multiple of py={py}.")
+    if probe_chunk is not None:
+        if int(probe_chunk) <= 0:
+            raise ValueError(f"probe_chunk must be positive; got {probe_chunk}")
+        from runtime.padding import padded_axis
+        probe_chunk = padded_axis(
+            int(probe_chunk), mesh_xy,
+            name="BSE preconditioner probe chunk",
+            spec=P("y"), axis=0).carrier
 
     data, sym = _load_wedge_payload(restart_path, mesh_xy, input_file)
     q_list = np.asarray(sym.q_irr_kgrid_int, dtype=int)

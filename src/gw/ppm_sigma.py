@@ -32,6 +32,7 @@ from .ppm_windows import (
 )
 from .ppm_tau_kernel import get_sigma_spatial_kernel
 from .wavefunction_bundle import face_kernel_kwargs
+from runtime.padding import PaddedAxis
 
 if TYPE_CHECKING:
     from .band_extrapolation import BandBracketPlan
@@ -114,6 +115,10 @@ class SigmaOmegaResult:
     # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
+    #: Logical Sigma band window and its square mesh carrier.  Consumers keep
+    #: the carrier while either band axis is sharded and derive every mask or
+    #: slice from this receipt.
+    band_axis: PaddedAxis | None = None
     #: Optional exact ordered-residue contribution on the SAME omega grid:
     #: ``Sigma_c[B,D] - Sigma_c[B,D=0]``.  GN-PPM carries this beside the
     #: result in ``PPMOutputs`` because of its band-bracket pipeline; MPA has
@@ -495,224 +500,53 @@ def fit_ppm(
 # ---------------------------------------------------------------------------
 
 def pad_sigma_window(psi_proj_xr, psi_proj_yn, mesh_xy):
-    """Zero-pad the sigma band window: m to a multiple of ``p_x``, n of ``p_y``.
+    """Zero-pad both projected-band operands to one square Sigma carrier.
 
-    ``ppm_tau_kernel._make_project_ri_reduce_scatter`` reduce-scatters m over
-    ``'x'`` and n over ``'y'``, and the shared device accumulator holds
-    Sigma_c(w,k,m,n) at ``P(None, None, 'x', 'y')`` — so BOTH need ``m % p_x == 0`` and
-    ``n % p_y == 0``.  ``common/meta.py`` rounds ``b_id_4`` (the FULL window)
-    to ``world_size`` but never the sigma window ``b3-b0``, so an indivisible
-    QP window is reachable and fired on MoS2 12x12 (m=n=70, mesh 8x10).
-
-    Padding is the fix the guard itself prescribes, and it is exact: every
-    output element ``Sigma[k,m,n]`` is an INDEPENDENT contraction
-    ``psi*_m . sigma . psi_n``, so appending bands adds output rows/columns
-    without perturbing any existing one.  The pad rows are exactly zero, so
-    the pad block of Sigma is exactly zero too — and it is stripped by
-    :func:`strip_sigma_window` before Sigma leaves the branch, so nothing
-    downstream (host buffer, eqp write) ever sees the padded extent.
-
-    Mirrors the established zero-pad-band contract used by the wfn loader
-    (``load_psi_gflat_padded``) and htransform (``band_pad_to``).
-
-    **The two axes are padded INDEPENDENTLY, and that is the whole point.**
-    The precondition is ``m % p_x == 0`` AND ``n % p_y == 0`` — two separate
-    one-axis constraints, because ``m`` is reduce-scattered over ``'x'``
-    only and ``n`` over ``'y'`` only.  Rounding *both* up to a multiple of
-    the PRODUCT ``p_x·p_y`` (what this used to do) satisfies them, but pays
-    for it in the largest object the Σ branch carries: Σ_c(ω, k, m, n) and
-    every per-τ tile that feeds it scale as ``m_pad · n_pad``.  On MoS₂
-    12×12 at P=80 (8×10, window 70) that is 80×80 = 6400 where 72×70 = 5040
-    suffices — **1.27× of the Σ_c tile, the host accumulate and the D2H
-    copy, for nothing** — and on a square mesh it is far worse: at P=64
-    (8×8) the product rule demands 128×128 = 16384 against 72×72 = 5184,
-    i.e. **3.16×**.  Since Y.4 recommends square meshes for two independent
-    reasons, the product rule was on a collision course with the mesh shape
-    the campaign is moving to.
-
-    Exactness is unchanged by the split: every output element
-    ``Sigma[k,m,n]`` is an independent contraction, so the pad extent on
-    one axis cannot perturb any element of the other, and the pad block is
-    exactly zero either way.
-
-    Returns ``(xr_padded, yn_padded, nb_real)``; a no-op (identity, same
-    buffers) on whichever axis already divides.  The caller reads the two
-    padded extents back off the returned arrays' shapes — they are no
-    longer equal in general.
+    The returned third value is the :class:`runtime.padding.PaddedAxis`
+    receipt.  Production calls the same owner directly in ``gw.mpa.sigma``;
+    this small adapter remains the projection primitive's focused test seam.
     """
-    p_x = int(mesh_xy.shape['x'])
-    p_y = int(mesh_xy.shape['y'])
-    nb_real = int(psi_proj_xr.shape[1])
-    m_pad = -(-nb_real // p_x) * p_x          # round up to p_x  (reduce-scatter 'x')
-    n_pad = -(-nb_real // p_y) * p_y          # round up to p_y  (reduce-scatter 'y')
-    # psi_xr : (nk, m, s, mu_X) at P(None,None,None,'x') -> band axis 1
-    # psi_yn : (nk, s, mu_Y, n) at P(None,None,'y',None) -> band axis 3
-    # Neither band axis is mesh-sharded, so both pads are rank-local.
-    xr_p = (psi_proj_xr if m_pad == nb_real else
-            jnp.pad(psi_proj_xr,
-                    ((0, 0), (0, m_pad - nb_real), (0, 0), (0, 0))))
-    yn_p = (psi_proj_yn if n_pad == nb_real else
-            jnp.pad(psi_proj_yn,
-                    ((0, 0), (0, 0), (0, 0), (0, n_pad - nb_real))))
-    return xr_p, yn_p, nb_real
+    from runtime.padding import pad_to_axis, padded_axis
+
+    tag = padded_axis(
+        int(psi_proj_xr.shape[1]), mesh_xy, name="Sigma band window",
+        specs=(
+            (P(None, "x"), 1),
+            (P(None, None, None, "y"), 3),
+        ))
+    return (
+        pad_to_axis(psi_proj_xr, tag, axis=1),
+        pad_to_axis(psi_proj_yn, tag, axis=3),
+        tag,
+    )
 
 
-def assert_sharded_sigma_window_divides_mesh(nb_proj: int, mesh_xy, *,
-                                             ansatz: str):
-    """THE precondition for a mesh-SHARDED ``Sigma_c(w,k,m,n)`` cube.
+def sigma_band_axis(nb_proj: int, mesh_xy, *, ansatz: str):
+    """Return the square mesh carrier receipt for a Sigma band window.
 
-    ONE owner for a contract two ansaetze reach at the same seam.  Before
-    2026-08-22 the GN/HL-PPM branch refused an indivisible sigma band
-    window by name here while the MPA executor
-    (``gw.mpa.sigma._integrate_sigma_batches``) padded with
-    :func:`pad_sigma_window`, accumulated into a
-    ``P(None,None,'x','y')`` array and stripped it again -- silently, and
-    with no divisibility check anywhere in that module.  Two contracts at
-    one seam is one contract too many: either pad+strip is safe on the
-    sharded consumer path, in which case the PPM refusal should cite the
-    proof and go, or it is not, in which case MPA must refuse too.  It is
-    not, and the reason is in :func:`strip_sigma_window`.
-
-    WHY PAD+STRIP IS NOT SAFE ON A SHARDED CUBE.  ``pad_sigma_window`` is
-    exact -- every ``Sigma[k,m,n]`` is an independent contraction, so the
-    pad block is exactly zero and stripping it loses nothing.  That
-    argument is about VALUES and it holds here too.  What does not hold is
-    the LAYOUT: the accumulator is born at ``P(None,None,'x','y')`` on the
-    PADDED extents (``m_pad % p_x == 0`` by construction), and
-    ``strip_sigma_window`` then slices it back to ``nb_real`` on both
-    trailing axes.  When ``nb_real`` does not divide the mesh the result is
-    an array whose declared sharding no longer divides its own shape, and
-    every downstream consumer that reads the layout off the array
-    (``qsgw_utils.is_band_sharded_sigma_omega``, the QSGW Hermitize, the
-    SlabIO write) inherits that.  The PPM refusal already names the
-    Hermitize; this makes the same statement once, for both.
-
-    Raises ``ValueError`` naming the window, the mesh and the fix.  No-op
-    when both axes divide.
+    Both matrix axes share one tag so Hermitisation remains square even on a
+    rectangular mesh.  The runtime owner derives the least common compatible
+    divisor from the two actual specs.
     """
-    p_x = int(mesh_xy.shape['x'])
-    p_y = int(mesh_xy.shape['y'])
-    nb = int(nb_proj)
-    if nb % p_x == 0 and nb % p_y == 0:
-        return
-    raise ValueError(
-        f"{ansatz}: a mesh-sharded Sigma_c(w,k,m,n) cube requires the "
-        f"sigma band window to divide the mesh on BOTH axes: nb={nb}, "
-        f"mesh {p_x}x{p_y} (nb%p_x={nb % p_x}, nb%p_y={nb % p_y}).  The "
-        f"pad/strip pair is exact in VALUE but leaves a sharded array "
-        f"whose declared P(None,None,'x','y') no longer divides its own "
-        f"shape, and the QSGW Hermitize needs a square unpadded extent.  "
-        f"Choose nval+ncond divisible by both mesh extents"
-        + (", or use sigma_omega_layout = replicated."
-           if ansatz.endswith("ppm") else
-           " (compute_mode = mpa has no replicated cube plan)."))
+    from runtime.padding import padded_axis
+
+    return padded_axis(
+        int(nb_proj), mesh_xy, name=f"{ansatz} Sigma band window",
+        specs=(
+            (P(None, "x"), 1),
+            (P(None, None, None, "y"), 3),
+        ))
 
 
-def _make_strip_sharded_sigma_window(mesh_xy: Mesh, ndim: int, nb_real: int):
-    """The device-array arm of :func:`strip_sigma_window`.
-
-    Ordinary numpy-style trailing-axis indexing (``sigma_kij[..., :nb_real,
-    :nb_real]``) is illegal on a LIVE ``P(...,'x','y')``-sharded axis whenever
-    the sliced extent would not itself divide the mesh --
-    :func:`assert_sharded_sigma_window_divides_mesh` exists to refuse that
-    case before this function is ever reached; ``nb_real`` arriving here is
-    always mesh-divisible on both trailing axes.
-
-    Given that precondition, this applies EXACTLY the mechanism
-    :func:`gw.wavefunction_bundle.pack_band_window` already uses on its own
-    ψ pair -- ``jax.lax.slice_in_dim`` on each mesh-sharded axis followed by
-    ``jax.lax.with_sharding_constraint`` back onto the canonical
-    ``P(...,'x','y')`` spec, run inside a cached ``jax.jit`` -- to Σ_c's OWN
-    trailing (m, n) axes instead of ψ's band axis.  Same idiom, different
-    tensor; not a second mechanism (2026-08-23, the MPA split-Σ-window fix).
-    """
-    axis_m, axis_n = ndim - 2, ndim - 1
-    spec = P(*((None,) * axis_m), 'x', 'y')
-
-    @jax.jit
-    def strip(sigma_kij):
-        out = jax.lax.slice_in_dim(sigma_kij, 0, nb_real, axis=axis_m)
-        out = jax.lax.slice_in_dim(out, 0, nb_real, axis=axis_n)
-        return jax.lax.with_sharding_constraint(
-            out, NamedSharding(mesh_xy, spec))
-    return strip
-
-
-def _strip_sharded_sigma_window_kernel(mesh_xy: Mesh, ndim: int, nb_real: int):
-    """One compiled repack kernel per ``(mesh, ndim, nb_real)`` -- the same
-    ``common.wfn_transforms._cached_jit`` idiom
-    ``wavefunction_bundle._pack_band_window_kernel`` uses, so a caller that
-    revisits the same (layout, window) does not re-trace."""
-    from common.wfn_transforms import _cached_jit
-    return _cached_jit(
-        'strip_sharded_sigma_window', (id(mesh_xy), ndim, nb_real),
-        lambda: _make_strip_sharded_sigma_window(mesh_xy, ndim, nb_real))
-
-
-def strip_sigma_window(sigma_kij, nb_real: int, *, mesh_xy: Mesh | None = None):
-    """Publish the leading logical window of a wider (..., m, n) Sigma.
-
-    Under legacy the wider tail is :func:`pad_sigma_window`'s exact-zero
-    mesh pad (bilinear in zero-padded psi).  Under the face carrier it can
-    contain real higher-band matrix elements; selecting the leading block
-    is still exact because every output ``Sigma[k,m,n]`` is an independent
-    contraction.  This is the single seam where either internal carrier
-    stops.  No-op when the input already has the logical extent.
-
-    BOTH trailing extents are tested: since ``pad_sigma_window`` pads m and n
-    independently, one axis can be at the real extent while the other is
-    padded (mesh 8×10, window 70 → m=72, n=70).  Testing only the last axis
-    would have returned an m-padded Σ untouched.
-
-    ``mesh_xy`` (2026-08-23): pass this when ``sigma_kij`` is a LIVE
-    ``jax.Array`` still carrying a mesh-partitioned ``P(...,'x','y')``
-    sharding on its trailing axes -- both dynamic-Sigma face finalizers use
-    it today: ``gw.mpa.sigma._integrate_sigma_batches`` directly, and this
-    module after its per-rank HOST tiles have been reassembled as a live
-    sharded array.  It is the EXPLICIT switch to the mesh-aware repack kernel
-    (:func:`_strip_sharded_sigma_window_kernel`), not an implicit sniff of
-    ``sigma_kij``'s type: every existing host/numpy caller, and the unit
-    tests that build a bare single-device ``jnp.asarray`` cube, never pass
-    it and take the ordinary trailing-axis slice below completely
-    unchanged.  A genuinely mesh-sharded array arriving with ``mesh_xy =
-    None`` refuses loudly instead of silently mis-indexing.
-    """
+def strip_sigma_window(
+        sigma_kij, band_axis: PaddedAxis, *, mesh_xy: Mesh | None = None):
+    """Strip the square carrier at a consumer that requires logical bands."""
+    del mesh_xy  # layout is carried by the array; extent is carried by the tag
     if sigma_kij is None:
         return sigma_kij
-    nb_real = int(nb_real)
-    if (int(sigma_kij.shape[-2]) == nb_real
-            and int(sigma_kij.shape[-1]) == nb_real):
-        return sigma_kij
-    # ``mesh_xy`` is the caller's explicit signal that ``sigma_kij`` is a
-    # LIVE mesh-sharded jax.Array, not an implicit type sniff: existing
-    # host/numpy AND plain single-device jax.Array callers (the unit tests
-    # in tests/test_sigma_window_pad.py build bare ``jnp.asarray`` cubes
-    # with no mesh at all) never pass it and take the ordinary slice below
-    # completely unchanged.
-    if mesh_xy is not None:
-        kernel = _strip_sharded_sigma_window_kernel(
-            mesh_xy, int(sigma_kij.ndim), nb_real)
-        return kernel(sigma_kij)
-    if isinstance(sigma_kij, jax.Array):
-        sharding = getattr(sigma_kij, "sharding", None)
-        if (isinstance(sharding, NamedSharding)
-                and sharding.spec[-2] is not None
-                and sharding.spec[-1] is not None):
-            # Defensive backstop for a FUTURE caller that forgets mesh_xy,
-            # not a path any current caller reaches: a genuinely
-            # mesh-sharded array here would silently mis-shard under the
-            # plain slice below (the exact hazard assert_sharded_sigma_
-            # window_divides_mesh exists to prevent upstream) rather than
-            # loudly refuse.
-            raise ValueError(
-                "strip_sigma_window: sigma_kij is mesh-sharded "
-                f"(spec={tuple(sharding.spec)}) on its trailing axes but "
-                "mesh_xy was not given -- ordinary indexing is illegal on "
-                "a P(...,'x','y')-sharded axis whose sliced extent would "
-                "not itself divide the mesh; pass mesh_xy so the legal "
-                "slice+reshard kernel (pack_band_window's own mechanism) "
-                "can run.")
-    return sigma_kij[..., :nb_real, :nb_real]
+    from runtime.padding import strip_axis
+    return strip_axis(
+        strip_axis(sigma_kij, band_axis, axis=-2), band_axis, axis=-1)
 
 
 
@@ -973,11 +807,15 @@ def _ppm_as_one_pole_store_fields(
     return Omega[None, ...], B[None, ...], D
 
 
-def _add_static_ppm_term(sigma_c_kij, sigma_static_host, mesh_xy):
+def _add_static_ppm_term(
+        sigma_c_kij, sigma_static_host, mesh_xy, band_axis: PaddedAxis):
     """Add one static invalid-pole term to every cumulative band count."""
     from common.collectives import device_put_process_local
+    from runtime.padding import pad_square
 
     static_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    sigma_static_host = pad_square(
+        jnp.asarray(sigma_static_host, dtype=jnp.complex128), band_axis)
     static = device_put_process_local(
         np.asarray(sigma_static_host, dtype=np.complex128), static_sharding)
     return jax.jit(
@@ -1151,11 +989,12 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:
         sigma_c_kij = _add_static_ppm_term(
-            sigma_c_kij, sigma_static_host, mesh_xy)
+            sigma_c_kij, sigma_static_host, mesh_xy, result.band_axis)
     return SigmaOmegaResult(
         omega_ry=result.omega_ry,
         omega_ev=result.omega_ev,
         sigma_c_kij=sigma_c_kij,
+        band_axis=result.band_axis,
         sigma_c_odd_kij=result.sigma_c_odd_kij,
         band_counts=result.band_counts,
         static_coh_at_counts=static_coh_at_counts,

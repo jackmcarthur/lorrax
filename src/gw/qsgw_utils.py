@@ -722,6 +722,7 @@ def build_qsgw_sigma_xc(
     *,
     replicated_output: bool = True,
     one_sided_core_mask: np.ndarray | None = None,
+    band_axis=None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
@@ -777,6 +778,23 @@ def build_qsgw_sigma_xc(
             f"sigma_x_kij_ry must have shape (nk, nb, nb); "
             f"got {sigma_x_kij_ry.shape}.")
     n_omega, nk, nb, nb2 = sigma_c_omega_ry.shape
+    logical_nb = nb
+    if band_axis is not None:
+        from runtime.padding import authenticate_axis, pad_square, pad_to_axis
+        authenticate_axis(
+            sigma_c_omega_ry, band_axis, axis=-2,
+            where="QSGW Sigma_c consumer")
+        authenticate_axis(
+            sigma_c_omega_ry, band_axis, axis=-1,
+            where="QSGW Sigma_c consumer")
+        logical_nb = int(band_axis.logical)
+        if E.shape != (nk, logical_nb):
+            raise ValueError(
+                f"e_qp_kn_ev must have logical shape ({nk}, {logical_nb}); "
+                f"got {E.shape}.")
+        sigma_x_kij_ry = pad_square(sigma_x_kij_ry, band_axis)
+        E = np.asarray(pad_to_axis(
+            jnp.asarray(E), band_axis, axis=-1))
     if nb != nb2 or sigma_x_kij_ry.shape != (nk, nb, nb):
         raise ValueError(
             f"shape mismatch: sigma_c={sigma_c_omega_ry.shape}, "
@@ -787,22 +805,28 @@ def build_qsgw_sigma_xc(
     one_sided = one_sided_core_mask is not None
     if one_sided:
         core_mask = np.asarray(one_sided_core_mask, dtype=bool).reshape(-1)
-        if core_mask.shape != (nb,):
+        expected_core = logical_nb if band_axis is not None else nb
+        if core_mask.shape != (expected_core,):
             raise ValueError(
                 "one_sided_core_mask must have one entry per Sigma band; "
-                f"got {core_mask.shape}, expected ({nb},).")
+                f"got {core_mask.shape}, expected ({expected_core},).")
         if not core_mask.any() or core_mask.all():
             raise ValueError(
                 "one_sided_core_mask must identify nonempty core and buffer "
                 "subspaces.")
     else:
-        core_mask = np.zeros(nb, dtype=bool)
+        core_mask = np.zeros(logical_nb, dtype=bool)
+    if band_axis is not None:
+        from runtime.padding import pad_to_axis
+        core_mask = np.asarray(pad_to_axis(
+            jnp.asarray(core_mask), band_axis, axis=-1), dtype=bool)
 
     # Linear-interp index/weight arrays, host-side then pushed replicated.
     omega_lo = float(omega[0])
     omega_hi = float(omega[-1])
     E_clamped = np.clip(E, omega_lo, omega_hi)
-    n_clipped = int(np.count_nonzero(E_clamped != E))
+    n_clipped = int(np.count_nonzero(
+        E_clamped[:, :logical_nb] != E[:, :logical_nb]))
     idx_hi = np.clip(np.searchsorted(omega, E_clamped, side="left"),
                      1, n_omega - 1)
     idx_lo = idx_hi - 1
@@ -838,14 +862,22 @@ def build_qsgw_sigma_xc(
         idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, core_j,
     )
     sigma_xc_qsgw.block_until_ready()
+    if band_axis is not None and replicated_output:
+        from runtime.padding import strip_axis
+        sigma_xc_qsgw = strip_axis(
+            strip_axis(sigma_xc_qsgw, band_axis, axis=-2),
+            band_axis, axis=-1)
 
     diagnostics = {
         "n_clipped": float(n_clipped),
-        "frac_clipped": float(n_clipped) / float(nk * nb) if nk * nb else 0.0,
+        "frac_clipped": (
+            float(n_clipped) / float(nk * logical_nb)
+            if nk * logical_nb else 0.0),
         "omega_min_ev": omega_lo,
         "omega_max_ev": omega_hi,
         "n_one_sided_edges": float(
-            2 * int(core_mask.sum()) * int((~core_mask).sum()) * nk),
+            2 * int(core_mask[:logical_nb].sum())
+            * int((~core_mask[:logical_nb]).sum()) * nk),
     }
     return sigma_xc_qsgw, diagnostics
 
@@ -983,6 +1015,11 @@ def solve_qp(
 
     sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
         sigma_c_omega, mesh_xy))
+    band_axis = sigma_result.sigma_band_axis
+    if band_axis is not None:
+        from runtime.padding import strip_axis
+        sigma_c_diag_w_kn_ry = np.asarray(strip_axis(
+            sigma_c_diag_w_kn_ry, band_axis, axis=-1))
     sigma_x_diag_kn_ry = np.real(
         static_sigma_diag_to_host(sig_x, mesh_xy))
     sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
@@ -1055,7 +1092,10 @@ def solve_qp(
     sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
         sigma_c_omega, sig_x,
         omega_grid_ry * RYD_TO_EV, E_sc_rel_ev, mesh_xy,
-        replicated_output=not is_band_sharded_sigma_omega(sigma_c_omega),
+        replicated_output=(
+            not is_band_sharded_sigma_omega(sigma_c_omega)
+            or (band_axis is not None and band_axis.pad > 0)),
+        band_axis=band_axis,
     )
     print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
         f"({100*qsgw_diag['frac_clipped']:.1f}%)")

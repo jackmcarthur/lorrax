@@ -355,19 +355,18 @@ def inspect_deck(args) -> None:
     nelec = (int(header.ifmax.max()) if header.ifmax.size
              else int((header.occs[0, 0] > 0.5).sum()))
     sigma_window = nelec + int(config.ncond) + sc_buffer
-    divides = sigma_window % px == 0 and sigma_window % py == 0
+    from types import SimpleNamespace
+    from gw.ppm_sigma import sigma_band_axis
+
+    band_axis = sigma_band_axis(
+        sigma_window, SimpleNamespace(shape={"x": px, "y": py}),
+        ansatz=config.compute_mode.value)
     print(f"GEOMETRY nodes={args.nodes} gpus_per_node={args.gpus_per_node} "
           f"ranks={args.ranks} mesh={px}x{py}")
-    print(f"SIGMA_WINDOW bands={sigma_window} nelec={nelec} "
-          f"ncond={config.ncond} sc_buffer={sc_buffer} "
-          f"divides_mesh={str(divides).lower()}")
-    if config.compute_mode.is_dynamic and not divides:
-        _fail(
-            "LX-DECK-SIGMA-MESH",
-            f"dynamic Sigma window {sigma_window} does not divide {px}x{py}",
-            "the Sigma band window divisible by both mesh axes",
-            "choose a fitting square rank count or adjust the physical band window",
-        )
+    print(f"SIGMA_WINDOW logical={band_axis.logical} "
+          f"carrier={band_axis.carrier} divisor={band_axis.divisor} "
+          f"pad={band_axis.pad} nelec={nelec} "
+          f"ncond={config.ncond} sc_buffer={sc_buffer}")
 
     for line in _device_lines(gpu=args.gpu):
         print(line)

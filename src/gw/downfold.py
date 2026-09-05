@@ -947,13 +947,9 @@ def select_cur_centroids(
                                     "downfold.select_cur_centroids")
     n_dev = dist.n_shards(mesh_xy, select_axis)
     M_pad = int(S_q0.shape[-1])
-    if M_pad % n_dev:
-        raise ValueError(
-            f"downfold: the parent Gram came back at M_pad={M_pad}, which "
-            f"the mesh product {n_dev} does not divide.  The sharded select "
-            f"needs an even row split; the restart reader pads mu to "
-            f"padded_mu_extent(mu_L, device_count), so this means the mesh "
-            f"changed under the array.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        mu_L, M_pad, n_dev, name="downfold parent-centroid carrier")
     n_pad = M_pad - mu_L
 
     G_rows = jax.lax.with_sharding_constraint(

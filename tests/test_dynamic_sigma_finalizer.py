@@ -9,6 +9,24 @@ import pytest
 from jax.sharding import Mesh
 
 
+def test_output_diagonal_strips_the_tagged_sigma_band_carrier():
+    from gw.dynamic_sigma import extract_sigma_diag_logical
+    from runtime.padding import PaddedAxis
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    sigma = np.zeros((2, 1, 4, 4), dtype=np.complex128)
+    diagonal = np.arange(8, dtype=np.float64).reshape(2, 1, 4)
+    idx = np.arange(4)
+    sigma[:, :, idx, idx] = diagonal
+
+    got = extract_sigma_diag_logical(
+        jnp.asarray(sigma), mesh,
+        band_axis=PaddedAxis("Sigma band window", 3, 4, 4))
+
+    np.testing.assert_array_equal(got, diagonal[..., :3])
+    assert got.shape == (2, 1, 3)
+
+
 def test_head_diagonal_is_added_once_and_only_on_the_diagonal():
     from gw.dynamic_sigma import add_head_sigma_diag
 
@@ -47,9 +65,10 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     qsgw_xc = 3 * sig_x
     calls = []
 
-    def add(got_body, got_head):
+    def add(got_body, got_head, **kwargs):
         calls.append("head")
         assert got_body is body and got_head is head
+        assert kwargs["band_axis"].logical == 2
         return post_head
 
     coverage = SimpleNamespace(
@@ -82,9 +101,10 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
         assert kwargs["omega_coverage"] is coverage
         return "/tmp/sigma_mnk.h5"
 
-    def build(got_sigma, got_x, omega, energy, got_mesh):
+    def build(got_sigma, got_x, omega, energy, got_mesh, **kwargs):
         calls.append("qsgw")
         assert got_sigma is post_head and got_mesh is mesh
+        assert kwargs["band_axis"].logical == 2
         np.testing.assert_array_equal(omega, [-1.0, 1.0])
         # The QSGW ansatz is evaluated at e_qp_ev on the finalize's OWN
         # reference — one subtraction, not a second opinion about the zero.
@@ -107,8 +127,10 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
         omega_grid_ev=np.asarray([-1.0, 1.0]),
         omega_grid_ry=np.asarray([-0.1, 0.1]),
     )
+    from runtime.padding import PaddedAxis
     result = dispatch.finalize_dynamic_sigma(
         body, head,
+        sigma_band_axis=PaddedAxis("Sigma band window", 2, 2, 1),
         sig_x=sig_x, sig_h=sig_h, e_qp_ev=np.asarray([[2.0, 3.0]]),
         config=config, meta=object(), mesh_xy=mesh, sym=object(),
         wfn=SimpleNamespace(efermi=0.0), band_slices=object(),
