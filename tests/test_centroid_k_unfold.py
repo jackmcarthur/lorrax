@@ -310,25 +310,20 @@ def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
     w_isdf._chi_minimax_kernel_cache.clear()
 
 
-def test_overpadded_canonical_bridge_is_supported():
-    """An overpadded canonical carrier remains a valid bridge geometry."""
+def test_overpadded_canonical_carrier_is_refused_by_the_producer():
+    """Canonical padding is the runtime receipt, not an arbitrary extent."""
     mesh = _mesh_2x2()
     centroids = np.asarray(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
         dtype=np.int32)
-    plan = build_centroid_k_unfold_plan(
-        _symmetry_fixture(), centroids, (2, 2, 1), mesh,
-        nspinor=1,
-        parent_k_frac=np.asarray([[0.0, 0.0, 0.0],
-                                  [0.5, 0.0, 0.0]]),
-        canonical_centroid_extent=8,
-    )
-    # This deliberately overpads the canonical side beyond the grouped
-    # extent, which production Meta never does.  The refusal is about order,
-    # not mere inequality: canonical must fit inside the packed work basis.
-    assert not plan.supports_canonical_bridge
-    with pytest.raises(ValueError, match="not exceed the orbit-packed"):
-        plan._canonical_source_map()
+    with pytest.raises(ValueError, match="canonical centroid carrier is 8, expected 4"):
+        build_centroid_k_unfold_plan(
+            _symmetry_fixture(), centroids, (2, 2, 1), mesh,
+            nspinor=1,
+            parent_k_frac=np.asarray([[0.0, 0.0, 0.0],
+                                      [0.5, 0.0, 0.0]]),
+            canonical_centroid_extent=8,
+        )
 
 
 def test_orbit_padding_is_cropped_without_replicating_operator_axes():
