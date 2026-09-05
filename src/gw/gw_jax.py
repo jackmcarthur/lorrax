@@ -108,7 +108,9 @@ from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from .screening import (
 	compute_screening_model, driver_persists_w0, screening_requests_for)
-from .sigma_dispatch import compute_sigma_xc
+from .sigma_dispatch import (
+	SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, compute_sigma_xc,
+	sigma_result_on_kset)
 from .qsgw_utils import solve_qp
 from .dynamic_sigma import extract_sigma_diag_logical
 from .degen_average import (
@@ -1025,6 +1027,11 @@ def main(argv=None):
 				material_class=material_class,
 				print_fn=print0,
 			)
+		# The one-shot path deliberately retains the full BZ.  Use the same
+		# named k-set boundary as the SC map, here as a validation rather than
+		# a selection, so both paths state what their Sigma tables contain.
+		sigma_result = sigma_result_on_kset(
+			sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=int(meta.nk_tot))
 		# Screening bodies have no consumer after Sigma.  In the photon mode
 		# this drops the packed V/W pair at the exact lifetime boundary rather
 		# than carrying O(N_gamma^2) arrays through QP/output post-processing.
@@ -1131,6 +1138,16 @@ def main(argv=None):
 		sigma_total = sc_result.sigma_total_dft
 		rotations_written = sc_result.rotations_written
 		final_static_head_terms = sc_result.static_head_terms_dft
+		if sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
+			# SC's retained Sigma, its H/E/U and the mean-field operators used
+			# by post-processing all stay on the loop's star wedge.  Output
+			# writers alone unfold that complete result to their file wedge.
+			from ffi import _services
+			_services.ensure_on_path()
+			from symmetry_maps import KStarMap
+			_output_kstar = KStarMap.from_sym(sym, int(wfn.ntran))
+			kin_ion = _output_kstar.select(kin_ion)
+			enk_dft = _output_kstar.select(enk_dft)
 	else:
 		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
 		# E_DFT inside compute_sigma_xc (pass-through; also covers static
@@ -1446,6 +1463,7 @@ def main(argv=None):
 		band_stop=band_slices.b3,
 		use_ppm=mode.is_dynamic,
 		self_consistent=qp_solver is QPSolver.SELF_CONSISTENT,
+		sigma_kset=sigma_result.kset,
 		sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,

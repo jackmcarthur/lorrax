@@ -20,6 +20,14 @@ every non-scissored band moves by less than `sc_tol_ev`. Within the active
 subspace (`nval + ncond` bands around E_F) each band is in one of three
 classes (`gw/band_partition.py`):
 
+The loop has one k-set invariant: its retained H, E, U, every k-indexed
+`SigmaResult` table, and density-SC Hartree components all carry exactly the
+loop's k-set (the star wedge when `sc_on_ibz = true`). The full BZ exists only
+inside a map while the k-grid FFT builds Sigma, and in the separate one-shot
+writer path. At the map boundary one named seam selects the complete retained
+result and its defining U together; diagnostics and writers consume that
+selection and never select or broadcast an individual Sigma table again.
+
 | class | diagonal of H' | off-diagonals |
 |---|---|---|
 | protected (inside the Σ(ω) grid) | full Σ at the QP energy | kept, protected×protected only |

@@ -891,6 +891,7 @@ def write_qsgw_sigma_cube(
     sigma_xc_qsgw_kij_ry,
     *,
     config,
+    star_already_selected: bool = False,
     print_fn=print,
 ) -> bool:
     """Append ``sigma_xc_qsgw_kij_ev`` to a ``sigma_mnk.h5`` just written.
@@ -943,6 +944,7 @@ def write_qsgw_sigma_cube(
             sigma_omega_h5_path,
             {"sigma_xc_qsgw_kij_ev":
                 RYD_TO_EV * np.asarray(sigma_xc_qsgw_kij_ry)},
+            star_already_selected=star_already_selected,
             print_fn=print_fn)
     barrier("qsgw_sigma_cube_append")
     return True

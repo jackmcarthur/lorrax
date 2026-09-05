@@ -779,8 +779,8 @@ def write_sigma_freq_debug_table(
 # THAT IS NOT THE THING THIS FILE REFUSED, and the distinction is the whole
 # design.  What was refused — and stays refused — is storing the wedge and
 # REBUILDING the other nk−nrk rows from it on read.  ``gw.sc_iteration``
-# says why in one line: "H/E/U on the IBZ, Σ on the full BZ".  Every full-BZ
-# k is an INDEPENDENT evaluation, so an unfold would replace nk−nrk
+# performs the extraction at its one map-output seam.  Every full-BZ k is an
+# INDEPENDENT evaluation, so an unfold would replace nk−nrk
 # measurements with reconstructions, and on a deck whose quadrature is not
 # orbit-closed those reconstructions are wrong by the amounts below.  No
 # reader in this module unfolds; a consumer that wants full-BZ Σ rows must
@@ -796,11 +796,11 @@ def write_sigma_freq_debug_table(
 # in (SPEC_qirr_restart_tensors §2a: Σ star spread 16.884 → 0.743 meV, a 23x
 # gain, against +4.4 meV on BSE at fixed rank), an artifact that no longer
 # carries the star members cannot be measured for it afterwards.  So the
-# measurement moved to WRITE time: :func:`sigma_star_spread_stats` runs on
-# the complete full-BZ cube before a single row is dropped, and its four
-# numbers are logged and stamped onto every extracted dataset.  The metric
-# survives the extraction; only the ability to recompute it from the file
-# does not.
+# measurement runs before selection: at WRITE time for one-shot results, via
+# :func:`sigma_star_spread_stats`, and inside the SC map before its retained
+# output seam.  An SC terminal write receives only the retained star wedge,
+# so it omits the unrecoverable per-dataset spread attrs rather than unfolding
+# and stamping a manufactured zero.
 #
 # THE NUMBERS, and what they turned out to be.  Measured on
 # ``tests/regression/cohsex_debug/sigma_mnk.h5`` (nk 9, nrk 3 — a 3.00x
@@ -1045,8 +1045,10 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	}
 
 
-def extract_and_stamp_k_irr(payload, star, *, omega_ev=None, nk_full=None,
-                            print_fn=None):
+def extract_and_stamp_k_irr(
+	payload, star, *, omega_ev=None, nk_full=None,
+	star_already_selected=False, print_fn=None,
+):
 	"""THE RULED ORDERING, in one implementation.  Measure, then drop.
 
 	``payload`` maps dataset name → array (or ``None``, which passes
@@ -1071,6 +1073,12 @@ def extract_and_stamp_k_irr(payload, star, *, omega_ev=None, nk_full=None,
 	``tests/test_sigma_kirr_extraction.py`` demonstrates rather than
 	asserts.
 
+	``star_already_selected=True`` is the SC terminal-write contract: every
+	array already carries the map seam's star-wedge rows.  Their storage is
+	stamped but they are not selected a second time.  Star-spread attributes
+	are deliberately absent because the discarded members cannot be measured;
+	manufacturing an exact-zero spread by unfolding would be a fake green.
+
 	``star`` of ``None`` is the full-BZ write.  The payload comes back
 	untouched and ``attrs_for`` returns ``None`` for every name, which is
 	the no-attr-means-full back-compat direction: a file that carries no
@@ -1084,63 +1092,72 @@ def extract_and_stamp_k_irr(payload, star, *, omega_ev=None, nk_full=None,
 			f"this function does not know which of their axes is k.  Add the "
 			f"dataset there with its k axis; do not let it default to 0.")
 	if star is None:
+		if star_already_selected:
+			raise ValueError(
+				"extract_and_stamp_k_irr: star_already_selected requires star "
+				"tables to stamp the retained rows")
 		return dict(payload), (lambda name: None), None, None
 
 	irr_idx_k, sym_idx_k, n_sym_spatial = star
 	irr_idx_k = np.asarray(irr_idx_k)
 	sym_idx_k = np.asarray(sym_idx_k, dtype=np.int32)
-	if nk_full is not None and irr_idx_k.size != int(nk_full):
+	if (not star_already_selected and nk_full is not None
+			and irr_idx_k.size != int(nk_full)):
 		raise ValueError(
 			f"star tables describe {irr_idx_k.size} full-BZ k but the "
 			f"Σ cube has nk={int(nk_full)}; the sweep and the tables are not "
 			f"from the same run.")
 	rows_to_keep, compact_irr = compact_star_tables(irr_idx_k)
 
-	# EVERY ARRAY MUST ARRIVE ON THE FULL BZ.  An already-extracted array
-	# handed in here would be measured against a star relation it no longer
-	# has the members for and then dropped a second time; the shapes make
-	# that statable, so it is stated.
+	# Every ordinary array arrives on the full BZ.  The SC terminal writer is
+	# the sole exception: its complete retained result already lives on the
+	# star wedge and this function only validates/stamps it.
+	expected_nk = len(rows_to_keep) if star_already_selected else irr_idx_k.size
 	for name, arr in payload.items():
 		if arr is None:
 			continue
 		k_axis = SIGMA_K_AXIS[name]
 		nk_seen = int(np.shape(arr)[k_axis])
-		if nk_seen != irr_idx_k.size:
+		if nk_seen != expected_nk:
 			raise ValueError(
-				f"{name}: axis {k_axis} has {nk_seen} rows but the star "
-				f"tables describe {irr_idx_k.size} full-BZ k.  This function "
-				f"takes COMPLETE full-BZ arrays — it is what makes the "
-				f"spread statistic measurable at all — and "
-				f"{len(rows_to_keep)} rows would be an already-extracted one.")
+				f"{name}: axis {k_axis} has {nk_seen} rows, expected "
+				f"{expected_nk} for "
+				f"{'the retained star wedge' if star_already_selected else 'the COMPLETE full-BZ payload'}.")
 
 	# MEASURED ON THE COMPLETE ARRAYS, BEFORE ANY ROW IS DROPPED.
 	omega_index = (int(np.argmin(np.abs(np.asarray(omega_ev))))
 	               if omega_ev is not None else None)
 	stamps: dict[str, dict] = {}
-	for name, arr in payload.items():
-		if arr is None:
-			continue
-		stats = sigma_star_spread_stats(
-			arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
-			k_axis=SIGMA_K_AXIS[name], omega_index=omega_index)
-		stamps[name] = stats
-		if print_fn is not None:
-			print_fn(
-				f"  Σ star spread [{name}]: raw {stats['raw_ev']:.4f} eV, "
-				f"diag {stats['diag_ev']:.4f} eV, gauge-blind "
-				f"‖·‖_F {stats['frobenius_ev']:.4f} / "
-				f"|Tr| {stats['trace_ev']:.4f} eV")
+	if not star_already_selected:
+		for name, arr in payload.items():
+			if arr is None:
+				continue
+			stats = sigma_star_spread_stats(
+				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
+				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index)
+			stamps[name] = stats
+			if print_fn is not None:
+				print_fn(
+					f"  Σ star spread [{name}]: raw {stats['raw_ev']:.4f} eV, "
+					f"diag {stats['diag_ev']:.4f} eV, gauge-blind "
+					f"‖·‖_F {stats['frobenius_ev']:.4f} / "
+					f"|Tr| {stats['trace_ev']:.4f} eV")
 	if print_fn is not None:
-		print_fn(
-			f"  Σ k axis EXTRACTED to k_irr: {irr_idx_k.size} -> "
-			f"{len(rows_to_keep)} rows (selection, not reconstruction).")
+		if star_already_selected:
+			print_fn(
+				f"  Σ k axis already on retained k_irr: {len(rows_to_keep)} "
+				"rows (validated and stamped; no second selection).")
+		else:
+			print_fn(
+				f"  Σ k axis EXTRACTED to k_irr: {irr_idx_k.size} -> "
+				f"{len(rows_to_keep)} rows (selection, not reconstruction).")
 
 	# ...and only now are they dropped.
-	out = {
+	out = (dict(payload) if star_already_selected else {
 		name: (None if arr is None else star_select_k_irr(
 			arr, rows_to_keep, k_axis=SIGMA_K_AXIS[name]))
 		for name, arr in payload.items()
-	}
+	})
 
 	def attrs_for(name):
 		a = {
@@ -1273,6 +1290,7 @@ def write_sigma_omega_h5(
 	hartree_transverse_kij_ev=None,
 	mesh=None,
 	star=None,
+	star_already_selected=False,
 	omega_reference_ev=None,
 	omega_reference_provenance=None,
 	sigma_regularization=None,
@@ -1327,6 +1345,11 @@ def write_sigma_omega_h5(
 	    the COMPLETE arrays, and only then are rows dropped.  Measuring
 	    after the drop would measure nothing — there would be one member
 	    per star left to compare.
+	``star_already_selected``
+	    True only for the SC terminal writer, whose complete retained result
+	    already crossed the map's star-wedge seam.  The rows are validated and
+	    stamped without another selection; per-dataset star-spread attributes
+	    are omitted because the discarded full-BZ members are no longer held.
 
 	``omega_reference_ev`` / ``omega_reference_provenance``
 	    THE ENERGY ``omega_ev`` IS MEASURED FROM, and where it came from
@@ -1397,7 +1420,9 @@ def write_sigma_omega_h5(
 				f"V_H={component_flags[0]}, H_T={component_flags[1]}.")
 		_assert_direct_field_sum(
 			hartree_kij_ev, hartree_scalar_kij_ev,
-			hartree_transverse_kij_ev, where="full-BZ raw Sigma input")
+			hartree_transverse_kij_ev,
+			where=("retained star-wedge raw Sigma input"
+			       if star_already_selected else "full-BZ raw Sigma input"))
 	receipt_schema = (
 		EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION
 		if component_aware else EQP_ASSEMBLY_SCHEMA_VERSION)
@@ -1442,7 +1467,8 @@ def write_sigma_omega_h5(
 	# The ordering is :func:`extract_and_stamp_k_irr`'s, shared with the
 	# QSGW appender rather than spelled twice.
 	payload, _attrs, compact_irr, sym_idx_k = extract_and_stamp_k_irr(
-		payload, star, omega_ev=omega_ev, nk_full=nk, print_fn=print_fn)
+		payload, star, omega_ev=omega_ev, nk_full=nk,
+		star_already_selected=star_already_selected, print_fn=print_fn)
 	if star is not None:
 		nk = int(np.shape(payload["sigma_total_kij_ev"])[1])
 		storage_shape = (n_omega, nk, logical_nb, logical_nb)
@@ -1472,7 +1498,7 @@ def write_sigma_omega_h5(
 		attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
 		attrs["direct_field_semantics"] = semantics
 		attrs[DIRECT_FIELD_SUM_RULE_ATTR] = DIRECT_FIELD_SUM_RULE
-		attrs[DIRECT_FIELD_SUM_FULL_BZ_ATTR] = True
+		attrs[DIRECT_FIELD_SUM_FULL_BZ_ATTR] = not star_already_selected
 		attrs[DIRECT_FIELD_SUM_FILE_WEDGE_ATTR] = True
 		return attrs
 
@@ -2259,7 +2285,9 @@ def read_eqp_assembly_receipt(filepath):
 # guards the append too, with no second copy of any of them here.
 
 
-def append_qsgw_datasets_h5(filepath, payload, *, print_fn=None):
+def append_qsgw_datasets_h5(
+	filepath, payload, *, star_already_selected=False, print_fn=None,
+):
 	"""Add the QSGW / QP-ladder datasets to an existing ``sigma_mnk.h5``.
 
 	Parameters
@@ -2272,10 +2300,11 @@ def append_qsgw_datasets_h5(filepath, payload, *, print_fn=None):
 		``FileNotFoundError``.
 	payload
 		``name → array`` for any subset of :data:`QSGW_PLOT_DATASETS`.
-		Arrays arrive on the FULL BZ whatever the file stores, because the
-		star-spread statistic is measured before the rows are dropped and
-		it cannot be measured any other way.  A ``None`` value is skipped,
-		which is how a mode that did not build a quantity says so.
+		Arrays ordinarily arrive on the full BZ.  With
+		``star_already_selected=True`` they arrive on the SC map's retained
+		star wedge and are stamped without a second selection.  A ``None``
+		value is skipped, which is how a mode that did not build a quantity
+		says so.
 	print_fn
 		Rank-0 print.  Gets the spread lines and one summary naming every
 		dataset written.
@@ -2322,7 +2351,8 @@ def append_qsgw_datasets_h5(filepath, payload, *, print_fn=None):
 	# Same ordering as the creating writer, same function: measure on the
 	# complete arrays, then drop.
 	payload, attrs_for, _, _ = extract_and_stamp_k_irr(
-		payload, star, omega_ev=omega_ev, nk_full=nk_full, print_fn=print_fn)
+		payload, star, omega_ev=omega_ev, nk_full=nk_full,
+		star_already_selected=star_already_selected, print_fn=print_fn)
 	if star is None:
 		for name, arr in payload.items():
 			nk_seen = int(np.shape(arr)[SIGMA_K_AXIS[name]])
