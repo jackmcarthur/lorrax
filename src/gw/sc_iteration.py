@@ -2536,8 +2536,11 @@ def _refuse_frozen_partition_escape(
     energy, the edge it crossed, and the deck value that would clear it by
     the SC state pad (2 eV, rounded up to the omega step).
     """
-    trusted = (np.asarray(partition.protected_mask, dtype=bool).reshape(-1)
-               | np.asarray(partition.in_range_mask, dtype=bool).reshape(-1))
+    # Only the in-range set is checked: those bands were inside the grid at
+    # every k at map 0.  Protected-but-out-of-range bands exist by design
+    # (whole-multiplet promotion across the edge, warned by the partition
+    # constructor) and keep the historical edge clamp.
+    trusted = np.asarray(partition.in_range_mask, dtype=bool).reshape(-1)
     e = np.asarray(e_active_kn_ev, dtype=np.float64)
     if not trusted.any():
         return float("inf")
