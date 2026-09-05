@@ -1578,7 +1578,8 @@ def _resolve_zeta_fit_contract(
 		mesh_xy, band_sphere_spec(), axis=1)
 	loader_k_chunk, _ = centroid_fft_tile_geometry(
 		nk=int(meta.nk_tot), band_chunk=_loader_band_request,
-		p_band=_loader_p_band)
+		p_band=_loader_p_band,
+		local_row_target=_loader_band_request)
 	return _ZetaFitContract(
 		zeta_h5_path=zeta_h5_path,
 		band_range_left=band_range_left,
@@ -1719,6 +1720,7 @@ def _plan_gflat_chunks_for_channel(
 	chunks = {
 		'band_chunk': int(gflat_plan.band_chunk),
 		'centroid_k_chunk': int(gflat_plan.centroid_k_chunk),
+		'psi_cache_k_chunk': int(gflat_plan.psi_cache_k_chunk),
 		'chunk_r': int(gflat_plan.r_chunk),
 		'q_chunk': int(gflat_plan.q_chunk),
 		'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
@@ -2077,6 +2079,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		print_fn("    ψ(r) source: " + (
 			"hoisted all-band cache" if chunks.get('cache_psi_r', True)
 			else "streamed band-chunk FFT"))
+		if chunks.get('cache_psi_r', True):
+			print_fn(
+				f"    ψ(r) cache k tile: {chunks['psi_cache_k_chunk']}")
 		if chunks.get('gflat_chunk_size') is not None:
 			print_fn(f"    GFlat cs:    {chunks['gflat_chunk_size']}")
 		print_fn(f"    Zeta output: {zeta_h5_path}")
@@ -2293,6 +2298,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				zeta_rcond=cfg.backend.zeta_rcond,
 				gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 				cache_psi_r=bool(chunks.get('cache_psi_r', True)),
+				cache_psi_r_k_chunk=int(
+					chunks.get('psi_cache_k_chunk', int(meta.nk_tot))),
 				cache_face_y_blocks=bool(
 					chunks.get('cache_face_y_blocks', False)),
 				face_y_cache_r_tile=int(
@@ -2536,6 +2543,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
 					gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
 					cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
+					cache_psi_r_k_chunk=int(_chunks_T.get(
+						'psi_cache_k_chunk', int(meta_curr.nk_tot))),
 					cache_face_y_blocks=bool(
 						_chunks_T.get('cache_face_y_blocks', False)),
 					face_y_cache_r_tile=int(

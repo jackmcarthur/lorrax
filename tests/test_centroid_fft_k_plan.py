@@ -74,6 +74,41 @@ def test_stage_a_bounds_local_rows_at_p1_and_p16():
     # resolves its physical band tile through runtime.padding.round_up.
     assert centroid_fft_tile_geometry(
         nk=36, band_chunk=7, p_band=4) == (4, 8)
+    # A P100 carrier still executes the requested 16 local rows; divisibility
+    # padding is allocation, not permission to grow the work tile with P.
+    assert centroid_fft_tile_geometry(
+        nk=144, band_chunk=100, p_band=100,
+        local_row_target=16) == (16, 16)
+
+
+def test_vi3_p144_full_band_cache_fits_without_streaming():
+    """The authoritative VI3 WFN geometry fits without low_mem_bands."""
+    meta = SimpleNamespace(
+        nk_tot=144,
+        nspinor=2,
+        n_rmu=2176,
+        n_rmu_padded=2304,
+        n_rtot=80 * 80 * 216,
+        fft_grid=(80, 80, 216),
+    )
+    plan = plan_gflat_chunks(
+        meta=meta,
+        mesh_xy=SimpleNamespace(shape={"x": 12, "y": 12}),
+        nb_total=272,
+        fit_nb_total=272,
+        ngkmax=72541,
+        n_q_disk=144,
+        budget_gb=57.44,
+        band_chunk_override=16,
+        pair_density_slots=3,
+        low_mem_bands=False,
+    )
+
+    assert plan.cache_psi_r
+    assert plan.psi_cache_k_chunk == meta.nk_tot
+    assert plan.centroid_fft_rows_local == 16
+    assert plan.p_min <= 144
+    assert plan.hwm_bytes < plan.budget_bytes
 
 
 def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
@@ -131,6 +166,16 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
         for kw in call.keywords if kw.arg == "loader_k_chunk"
     )
     assert ast.unparse(contract_k) == "loader_k_chunk"
+
+    fit_calls = _calls(_function(gw_tree, "fit_zeta"), "fit_zeta_to_h5")
+    assert len(fit_calls) == 2
+    cache_k_values = [
+        ast.unparse(next(
+            kw.value for kw in call.keywords
+            if kw.arg == "cache_psi_r_k_chunk"))
+        for call in fit_calls
+    ]
+    assert all("psi_cache_k_chunk" in value for value in cache_k_values)
 
     loader = _function(wfn_tree, "load_centroids_band_chunked")
     gram = _function(pivot_tree, "build_gram_q0_via_loadwfns")

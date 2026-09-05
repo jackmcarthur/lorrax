@@ -340,13 +340,16 @@ def _factor_mesh(pp: int) -> tuple[int, int]:
 
 def centroid_fft_tile_geometry(
     *, nk: int, band_chunk: int, p_band: int,
+    local_row_target: int | None = None,
 ) -> tuple[int, int]:
     """Return ``(k_tile, local_flat_rows)`` for a centroid WFN transfer.
 
     The loader mesh-rounds its global band tile before distributing that
     axis.  Bound ``k_tile * (band_tile / p_band)`` by that same physical band
     tile, so the local FFT-row batch does not grow just because the band axis
-    is divided over more ranks.  This pure rule also serves artifact-reuse
+    is divided over more ranks.  ``local_row_target`` preserves the logical
+    work tile when ``band_chunk`` has already been mesh-rounded.  This pure
+    rule also serves artifact-reuse
     paths, which need a safe centroid resample but deliberately do not run the
     full zeta-fit memory planner.
     """
@@ -361,7 +364,12 @@ def centroid_fft_tile_geometry(
     band_tile = padded_axis(
         band_chunk, p_band, name="centroid FFT band tile").carrier
     local_bands = band_tile // p_band
-    k_tile = min(nk, max(1, band_tile // local_bands))
+    row_target = (
+        band_tile if local_row_target is None else int(local_row_target))
+    if row_target <= 0:
+        raise ValueError(
+            f"centroid FFT local_row_target must be positive; got {row_target}")
+    k_tile = min(nk, max(1, row_target // local_bands))
     return k_tile, k_tile * local_bands
 
 
@@ -562,6 +570,11 @@ class GFlatChunkPlan:
     centroid_fft_bytes: float
     #: Full-nk to_rchunk_inner price for psi-r cache/streamed face stages.
     zeta_transform_fft_bytes: float
+    #: k rows transformed per dispatch while filling the hoisted ψ(r) cache.
+    #: This tiles only the one-time build; the completed cache is unchanged.
+    psi_cache_k_chunk: int
+    #: Per-rank peak of one cache-build k tile.
+    psi_cache_fft_bytes: float
     r_chunk: int
     n_r_chunks: int
     q_chunk: int
@@ -663,6 +676,10 @@ class GFlatChunkPlan:
             f"{self.centroid_fft_bytes / 1e9:.3f} GB/dev",
             f"    zeta FFT      = full-nk transform, "
             f"{self.zeta_transform_fft_bytes / 1e9:.3f} GB/dev",
+            *([f"    cache-build k = {self.psi_cache_k_chunk} / "
+               f"{self.n_q_full} rows per one-time FFT "
+               f"({self.psi_cache_fft_bytes / 1e9:.3f} GB/dev)"]
+              if self.cache_psi_r else []),
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q rows        = selected Q {self.n_q_selected} / "
             f"full-zone K {self.n_q_full}",
@@ -949,9 +966,15 @@ def plan_gflat_chunks(
         psi_r_cache = _c128(
             nk, n_bc * bc, ns, n_rtot, shard=p_xy)
         centroid_k, _ = centroid_fft_tile_geometry(
-            nk=nk, band_chunk=bc, p_band=p_xy)
+            nk=nk, band_chunk=bc, p_band=p_xy,
+            local_row_target=(
+                int(band_chunk_override)
+                if band_chunk_override and band_chunk_override > 0 else bc))
         centroid_fft_t = _fft_for_bc(bc, nk_extent=centroid_k)
-        zeta_fft_t = _fft_for_bc(bc, nk_extent=nk)
+        # A hoisted cache may fill the same final carrier in bounded k tiles;
+        # only the streamed route must transform the full k axis here.
+        zeta_fft_t = _fft_for_bc(
+            bc, nk_extent=(1 if cache_psi_r else nk))
         if low_mem_bands:
             face = _stage_C_face_terms(
                 nk=nk, ns=ns, mu=mu, face_nb=face_nb,
@@ -995,7 +1018,11 @@ def plan_gflat_chunks(
                 bc *= 2
 
     centroid_k_chunk, centroid_fft_rows_local = centroid_fft_tile_geometry(
-        nk=nk, band_chunk=band_chunk, p_band=p_xy)
+        nk=nk, band_chunk=band_chunk, p_band=p_xy,
+        local_row_target=(
+            int(band_chunk_override)
+            if band_chunk_override and band_chunk_override > 0
+            else band_chunk))
     fft_box_A = _fft_for_bc(
         band_chunk, nk_extent=centroid_k_chunk)
     fft_box_zeta_transform = _fft_for_bc(
@@ -1014,6 +1041,25 @@ def plan_gflat_chunks(
         persistent["psi_r_cache"] = _c128(
             nk, _cache_n_bc * band_chunk, ns, n_rtot, shard=p_xy)
     persistent_total = sum(persistent.values())
+
+    # Bound only the ONE-TIME ψ(r)-cache population over k.  The completed
+    # cache, its sharding and every later fit contraction are unchanged.  Keep
+    # the historical full-k executable whenever it fits the target; otherwise
+    # halve the tile until the cache-plus-FFT build fits, with k=1 as the
+    # structural floor.  Each candidate is priced by the same production FFT
+    # query as every other Stage-A box.
+    psi_cache_k_chunk = nk if cache_psi_r else 0
+    fft_box_cache_build = fft_box_zeta_transform if cache_psi_r else 0.0
+    if cache_psi_r and persistent_total + fft_box_cache_build > target:
+        k_candidate = nk
+        while k_candidate > 1:
+            k_candidate = max(1, k_candidate // 2)
+            candidate_fft = _fft_for_bc(
+                band_chunk, nk_extent=k_candidate)
+            psi_cache_k_chunk = k_candidate
+            fft_box_cache_build = candidate_fft
+            if persistent_total + candidate_fft <= target:
+                break
 
     # ---- Phase 2: dial chunk_r against Stage C's slope ------------------
     # The face route has three non-overlapping peaks: current-r Y-cache
@@ -1234,7 +1280,7 @@ def plan_gflat_chunks(
     # sees only ``centroid_k_chunk``; the psi-r cache / streamed face source
     # passes full nk to the incumbent to_rchunk_inner owner.
     A_t = fft_box_A
-    A_psi_r_cache_t = fft_box_zeta_transform if cache_psi_r else 0.0
+    A_psi_r_cache_t = fft_box_cache_build if cache_psi_r else 0.0
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
     if low_mem_bands:
@@ -1380,6 +1426,8 @@ def plan_gflat_chunks(
         centroid_fft_rows_local=int(centroid_fft_rows_local),
         centroid_fft_bytes=float(fft_box_A),
         zeta_transform_fft_bytes=float(fft_box_zeta_transform),
+        psi_cache_k_chunk=int(psi_cache_k_chunk),
+        psi_cache_fft_bytes=float(fft_box_cache_build),
         r_chunk=int(r_chunk),
         n_r_chunks=int(n_r_chunks),
         q_chunk=int(q_chunk),

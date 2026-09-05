@@ -163,8 +163,12 @@ def test_cri3_prices_bounded_centroid_and_full_k_zeta_ffts_separately():
     assert hoisted.cache_psi_r
     assert (hoisted.peak_breakdown["A_centroid_load"]
             - hoisted.persistent_bytes) == 5_760_000_000
+    assert hoisted.psi_cache_k_chunk == 18
     assert (hoisted.peak_breakdown["A_psi_r_cache_build"]
-            - hoisted.persistent_bytes) == 12_960_000_000
+            - hoisted.persistent_bytes) == 6_480_000_000
+    # Reporting retains the full-nk streamed-transform price even though the
+    # one-time hoisted-cache population is safely k tiled.
+    assert hoisted.zeta_transform_fft_bytes == 12_960_000_000
 
 
 def test_face_pair_arena_distinguishes_charge_and_current_executables():

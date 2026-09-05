@@ -1477,7 +1477,9 @@ def _c_q_face(
 	             perm_L, phase_L, perm_R, phase_R)
 
 
-def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
+def build_psi_r_cache_sm(
+	psi_G_store, *, mesh_xy: Mesh, k_chunk_size: int | None = None
+) -> jax.Array:
 	"""Hoist all ψ(G)->ψ(r) transforms out of the outer r-chunk loop.
 
 	The returned global array has shape
@@ -1489,6 +1491,9 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 	ragged final item cannot be the output of the same ``lax.scan`` and would
 	create a second compiled cache/slice family.  For the 50-band Si window,
 	bc16 therefore carries 64 slots (28% pad; priced exactly by the planner).
+	``k_chunk_size`` bounds only the one-time transform used to fill that
+	cache.  It leaves the returned carrier and every later fit contraction
+	unchanged; a terminal k tile is exact-zero padded and stripped here.
 	"""
 	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
 	nk = int(psi_G_store.meta.nk_tot)
@@ -1497,6 +1502,13 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 	n_bc = len(psi_G_store.band_chunk_ranges)
 	bpd_max = int(psi_G_store._bpd_max)
 	ngkmax = int(psi_G_store._per_rank_shape[3])
+	k_chunk = nk if k_chunk_size is None else int(k_chunk_size)
+	if k_chunk <= 0:
+		raise ValueError(
+			f"build_psi_r_cache_sm requires k_chunk_size > 0; got {k_chunk}")
+	k_chunk = min(k_chunk, nk)
+	n_k_chunks = math.ceil(nk / k_chunk)
+	nk_transport = n_k_chunks * k_chunk
 	if n_bc <= 0 or bpd_max <= 0:
 		raise ValueError(
 			f"build_psi_r_cache_sm requires non-empty band chunks; "
@@ -1504,16 +1516,26 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 
 	key = (
 		id(mesh_xy), id(psi_G_store), tuple(psi_G_store.band_chunk_ranges),
-		nk, ns, n_rtot, bpd_max, ngkmax, fft_grid,
+		nk, ns, n_rtot, bpd_max, ngkmax, fft_grid, k_chunk,
 	)
 	fn = _psi_r_cache_sm_cache.get(key)
 	if fn is None:
 		_store = psi_G_store
 		out_sds = jax.ShapeDtypeStruct(
-			(nk, bpd_max, ns, ngkmax), jnp.complex128)
+			(k_chunk, bpd_max, ns, ngkmax), jnp.complex128)
 
-		def _slice_host(x_idx, y_idx, bc_idx):
-			return _store._slice_local_tile_bc(x_idx, y_idx, bc_idx)
+		def _slice_host(x_idx, y_idx, bc_idx, k_idx):
+			k_start = int(k_idx) * k_chunk
+			if hasattr(_store, "read_local_band_k_chunk"):
+				return _store.read_local_band_k_chunk(
+					x_idx, y_idx, bc_idx, k_start, k_chunk)
+			full = _store._slice_local_tile_bc(x_idx, y_idx, bc_idx)
+			out = np.zeros(
+				(k_chunk, bpd_max, ns, ngkmax), dtype=full.dtype)
+			k_stop = min(k_start + k_chunk, nk)
+			if k_start < k_stop:
+				out[:k_stop - k_start] = full[k_start:k_stop]
+			return out
 
 		@partial(
 			shard_map,
@@ -1525,15 +1547,33 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 		def _local(g_index_dev, kvecs_frac_dev):
 			x_idx = jax.lax.axis_index('x')
 			y_idx = jax.lax.axis_index('y')
+			k_pad = nk_transport - nk
+			g_pad = ((0, k_pad),) + ((0, 0),) * (g_index_dev.ndim - 1)
+			kv_pad = ((0, k_pad),) + ((0, 0),) * (kvecs_frac_dev.ndim - 1)
+			g_index_transport = jnp.pad(g_index_dev, g_pad)
+			kvecs_transport = jnp.pad(kvecs_frac_dev, kv_pad)
 
 			def body(_carry, bc_idx):
-				psi_G_bc = _io_callback(
-					_slice_host, out_sds, x_idx, y_idx, bc_idx,
-					ordered=False)
-				psi_r_bc = to_rchunk_inner(
-					psi_G_bc, g_index_dev, fft_grid,
-					jnp.int32(0), n_rtot,
-					kvecs_frac=kvecs_frac_dev, norm="ortho")
+				def k_body(_kcarry, k_idx):
+					psi_G_k = _io_callback(
+						_slice_host, out_sds, x_idx, y_idx, bc_idx, k_idx,
+						ordered=False)
+					k_start = k_idx * jnp.int32(k_chunk)
+					g_index_k = jax.lax.dynamic_slice_in_dim(
+						g_index_transport, k_start, k_chunk, axis=0)
+					kvecs_k = jax.lax.dynamic_slice_in_dim(
+						kvecs_transport, k_start, k_chunk, axis=0)
+					psi_r_k = to_rchunk_inner(
+						psi_G_k, g_index_k, fft_grid,
+						jnp.int32(0), n_rtot,
+						kvecs_frac=kvecs_k, norm="ortho")
+					return _kcarry, psi_r_k
+
+				_, psi_r_tiles = jax.lax.scan(
+					k_body, jnp.int32(0),
+					jnp.arange(n_k_chunks, dtype=jnp.int32), unroll=1)
+				psi_r_bc = psi_r_tiles.reshape(
+					nk_transport, bpd_max, ns, n_rtot)[:nk]
 				return _carry, psi_r_bc
 
 			_, cache = jax.lax.scan(

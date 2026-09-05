@@ -456,7 +456,7 @@ location:
 
 | Peak | Stage | Persistent | Transient (per scan iter, aliased) |
 |---|---|---|---|
-| **A** | `load_centroid_wfns` (pre-loop, once per channel) | centroid output being filled `(n_k, n_s, n_rmu, n_b/P)` | ψ(G)→r FFT box `4·16·n_k·B_b·n_s·n_r / (p_x · p_y)`, replicated `(n_k, n_r)` phase table |
+| **A** | centroid load and hoisted ψ(r)-cache build (pre-loop, once per channel) | centroid output or completed cache | ψ(G)→r FFT box over the planner-bounded k tile; the final cache carrier is unchanged |
 | **B** | `CCT + factor` (pre-loop) | centroids (L+R copies) | open-spin `P_l + P_r (n_k, n_s², μ, μ)`, `C_q (n_q, μ, μ)`, factor or pseudo-inverse `(n_q, μ, μ)` |
 | **C** | `fit_one_rchunk` + ζ solve (inside r-chunk loop) | centroids + `L_q` (base) | larger of the pair-density/r-chunk live set and route-specific RHS/output + factor-gather live set |
 | **D** | `accumulate_rchunk_to_gflat` (right after each `fit_one_rchunk`) | `gflat_acc (n_q^disk, n_rmu/p_xy, ngkmax)` | `zeta_chunk (n_q^disk, n_rmu/p_xy, B_r)`, per-scan-iter FFT box `cs · n_r · 16 · fft_factor` |
@@ -465,14 +465,16 @@ location:
 
 ### Peak A — Band-chunked centroid load
 
-`ψ(G) → IFFT → sample at r_μ`.  Runs once per channel (charge + 3
-transverse on bispinor).  For planning, the whole fit-loop persistent floor
-is charged at this peak, including the completed rectangular ψ(r) cache.
-The transient is the compiled ψ(G)→ψ(r) FFT box.
+`ψ(G) → IFFT → sample at r_μ`, plus the separate one-time fill of the
+all-band ψ(r) cache. Both run once per channel (charge + 3 transverse on
+bispinor). The centroid loader and cache builder tile k independently; mesh
+padding of the band carrier may not grow their local FFT-row target. The
+cache-build tile changes only its population schedule, not its final shape or
+the later r-chunk fit.
 
 ```
-peak_A = persistent_total
-       + _fft_box_bytes(n_k, B_b, n_s, fft_grid, mesh_xy, P)
+peak_A_centroid = persistent_total + fft(k_centroid_tile)
+peak_A_cache    = persistent_total + fft(k_cache_tile)
 ```
 
 ### Peak B — CCT + factor
@@ -575,7 +577,9 @@ short discrete ladders for mesh-compatible band chunks and the rank floor:
    a 50-band window at bc16 carries 64 slots (28% overhead), measured/priced
    as 7.25 rather than 5.66 GB at P=1 on Si 80 Ry.  A ragged last item would
    require a second cache/slice executable family and is not a trivial memory
-   correction.
+   correction.  The builder fills this same carrier in the largest
+   halving-ladder k tile admitted by the measured FFT peak; it never selects
+   the streamed ``low_mem_bands`` schedule on behalf of a full-band run.
 2. **Pick `band_chunk` first** — primary lever on Peak A and Peak C.
    The shipping no-key value is the owner-selected 16.  Its pre-AOT P=4 Si
    80 Ry premise (33 ms steady z_q at bc16 versus 46 ms full-window) was
@@ -648,9 +652,9 @@ Run order in `gw_init.prepare_isdf_and_wavefunctions`:
    memory_per_device_gb, mesh}`; build the persistent inventory and search
    for `P_min`.  A requested mesh below that floor is reported as an
    infeasible warning by `gw_init` rather than silently changing the mesh.
-2. **One G-flat plan** (`plan_gflat_chunks`) resolves `band_chunk`,
-   `r_chunk`, `q_chunk`, and `gflat_chunk_size`, plus the rank floor and
-   A–F peaks.
+2. **One G-flat plan** (`plan_gflat_chunks`) resolves `band_chunk`, the two
+   one-time FFT k tiles, `r_chunk`, `q_chunk`, and `gflat_chunk_size`, plus the
+   rank floor and A–F peaks.
 3. **Fit and solve** consume that plan.  The requested ζ-solve route is
    already represented in Peak C and printed beside `q_chunk`.
 4. **Vq G chunk** resolves independently: explicit `vq_g_chunk_size`, or

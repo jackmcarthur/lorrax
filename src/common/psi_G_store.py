@@ -453,6 +453,42 @@ class PsiGStore:
         out[:, : b_hi - b_lo, :, :] = tile[:, b_lo:b_hi, :, :]
         return out
 
+    def read_local_band_k_chunk(
+        self, x_idx, y_idx, bc_idx, k_start, k_count
+    ) -> np.ndarray:
+        """Return one static-size k tile of a local band-chunk carrier.
+
+        A terminal tile is exact-zero padded.  This is the host-side source
+        for the bounded one-time ψ(r) cache builder; it does not alter the
+        cached carrier or the later r-chunk fit schedule.
+        """
+        if getattr(self, "_closed", False):
+            raise RuntimeError(
+                "PsiGStore.read_local_band_k_chunk: the store is closed")
+        if not self._host_tiles:
+            raise RuntimeError(
+                "PsiGStore.read_local_band_k_chunk: host tiles were released")
+        x, y, bc = int(x_idx), int(y_idx), int(bc_idx)
+        k0, nk_tile = int(k_start), int(k_count)
+        if not 0 <= bc < len(self.band_chunk_ranges):
+            raise ValueError(
+                f"read_local_band_k_chunk: bc_idx={bc} not in "
+                f"[0, {len(self.band_chunk_ranges)})")
+        if k0 < 0 or nk_tile <= 0:
+            raise ValueError(
+                f"read_local_band_k_chunk: invalid k tile {k0}:{k0 + nk_tile}")
+        tile = self._host_tiles[(x, y)]
+        b_lo = self._bc_band_offsets[bc]
+        b_hi = self._bc_band_offsets[bc + 1]
+        nk, _, ns, ngkmax = tile.shape
+        out = np.zeros(
+            (nk_tile, self._bpd_max, ns, ngkmax), dtype=tile.dtype)
+        k1 = min(k0 + nk_tile, nk)
+        if k0 < k1:
+            out[: k1 - k0, : b_hi - b_lo, :, :] = tile[
+                k0:k1, b_lo:b_hi, :, :]
+        return out
+
     def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx) -> np.ndarray:
         """Compatibility adapter; new consumers use the public method."""
         return self.read_local_band_chunk(x_idx, y_idx, bc_idx)

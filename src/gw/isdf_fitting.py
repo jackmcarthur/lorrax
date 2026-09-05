@@ -209,6 +209,7 @@ def fit_zeta_to_h5(
     zeta_cutoff_ry: float | None = None,
     low_mem_bands: bool = False,
     cache_psi_r: bool = True,
+    cache_psi_r_k_chunk: int | None = None,
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
     psi_nmu_fresh: jax.Array | None = None,
@@ -299,6 +300,10 @@ def fit_zeta_to_h5(
                     ψ(G)->ψ(r_chunk) route and keeps the host staging store
                     open through the r loop.  The memory planner selects
                     False only when a low-memory run cannot hold the cache.
+        cache_psi_r_k_chunk: Planner-owned k tile for the one-time cache
+                    population FFT.  It changes neither the completed cache
+                    nor the later r-chunk loop.  None preserves the full-k
+                    build.
         cache_face_y_blocks: Internal face-kernel memory-plan decision.
                     True reuses one bounded current-r Y cache across scalar
                     spin pairs; False repeats the canonical transform as the
@@ -1321,7 +1326,8 @@ def fit_zeta_to_h5(
     if cache_psi_r:
         with timing.section("zeta_fit.build_psi_r_cache"):
             psi_r_cache = build_psi_r_cache_sm(
-                psi_G_store, mesh_xy=mesh_xy)
+                psi_G_store, mesh_xy=mesh_xy,
+                k_chunk_size=cache_psi_r_k_chunk)
             psi_r_cache.block_until_ready()
         _cache_local_bytes = sum(
             int(shard.data.size) * int(shard.data.dtype.itemsize)

@@ -384,7 +384,9 @@ def test_hoisted_psi_r_cache_matches_streaming_path():
         band_range_left=(0, 8), band_range_right=(0, 8),
         r_start_dyn=0, r_chunk_size=int(synth['n_zchunk']),
         kgrid=synth['kgrid'], mesh_xy=MESH)
-    cache = build_psi_r_cache_sm(store, mesh_xy=MESH)
+    # nk=4 with k_chunk=3 exercises the exact-zero terminal tile and proves
+    # that k tiling changes only the one-time cache construction schedule.
+    cache = build_psi_r_cache_sm(store, mesh_xy=MESH, k_chunk_size=3)
     cached = z_q_from_psi_sm(
         psi_l_X, psi_r_X, store, cache,
         band_chunk_ranges=band_chunks,
