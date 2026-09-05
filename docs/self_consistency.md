@@ -280,18 +280,20 @@ samples remain unchanged and the quadrature session retains the expanded
 support on later maps. Interior holes still require an explicit patch.
 Quadrature nodes remain frozen while their certified boxes cover the map.
 
-**17. The active-window scissor law is frozen at map 0.** States inside the
-Sigma window but outside the omega grid follow an affine law fitted to the
-trusted block's shifts; refitting it every map moved Na's 30-96 eV states by
-up to 17.7 eV in one map and fed that back through the sum over states. The
-law fitted at map 0 is carried on every later map input (`SC scissor: frozen
-from map 0 (...)`), as standard QSGW practice gives the states above the
-self-energy subspace one fixed correction. The sum-band tail beyond the
-Sigma window keeps its per-map refit: freezing it moved the Si b80/c504 gap
-by 22 meV at map 6, a closure change on semiconductors that nothing
-justifies. The reviewers' remaining candidates for a metal residual after
-these closures, the per-map MPA pole refit and the sorted-index state
-identity, are registered in the sandbox issues ledger.
+**17. The active-window scissor freeze remains necessary in the measured
+Na comparison.** States inside the active Sigma band window but outside the
+retained self-consistent block follow the affine law fitted at map 0. The
+energy-dependent pad and per-k identity partition do not make a per-map
+refit equivalent: on the +21 eV Na P4 comparison, the conduction slope
+changes from 1.117004 at map 0 to 1.166066 at trial map 1. The trusted
+outputs initially agree within 0.0194 meV, but by trial map 3 their
+mean-aligned differences reach 40.19 meV on bands 5-10 and 131.05 meV on
+the full protected set 5-13. Both exceed the 2 meV removal threshold, so
+`SCState.frozen_scissor_fits` and its capture/reuse remain. See sandbox
+`runs/DEV/150_sc_partition_pad_2026-09-05/evidence/na_comparison_map0003.json`
+(jobs 57950126.27/.28); this early-map comparison is not a convergence
+claim. The sum-band tail beyond the Sigma window keeps its per-map refit:
+freezing that distinct tail moved the Si b80/c504 gap by 22 meV at map 6.
 
 **18. Partition identities are per k, and Hamiltonian masks use the carry's
 basis.** Overlap assignment against reference DFT multiplets finds the sorted
@@ -309,6 +311,12 @@ criterion, rCROP Gram block and identity comments. The eqp body retains sorted
 eigenvalues and the identity comments retain DFT-band labels. Each map reports
 bands protected at all k and k rows where the sorted protected columns differ
 from the reference labels.
+For the motion readout, the first map output supplies a fixed QP reference
+labelled by its overlap with whole DFT multiplets. Later input and output
+columns are assigned to those reference multiplets over all active candidates;
+their block means define the identity criterion even if a multiplet splits.
+`SC_identity` comments describe eqp0 motion in both eqp0 and eqp1 files and
+use the file's k-block index (the first integer in a body row is spin).
 
 **19. On metals the self-consistent set should stop where the quasiparticle
 stops being well defined; convergence time is set by the largest Z in the
@@ -352,24 +360,3 @@ control), `si_centroid_ladder_sc_2026-09-03` (resolution ladder),
 structures), `sc_fixed_rules_eqp1_2026-09-03` (claim 662, frozen rules),
 `sigma_eta_literal_no_ceiling_2026-09-03` (claims 637/639),
 `qsgw_two_level_2026-09-03` (the frozen-W inner loop, branch only).
-
-**18. QP identities, not sorted eigenvalue ordinals, define SC motion.**
-The first map output supplies a fixed QP reference whose labels are the
-trusted DFT bands: at map 0 each trusted DFT band (whole DFT multiplets) is
-assigned by overlap to the output column that carries it, and later input
-and output eigenvectors are assigned to those reference multiplets by
-maximum projector overlap, using all active candidate columns so crossings
-with scissored levels cannot relabel the target. Sorted position is not a
-label: on Na with the window top at +15 eV the scissored Gamma triplet 11-13
-sits below the protected doublet at sorted 9-11 in the map-0 output, and a
-sorted-band mask cut that multiplet and refused. The reference groups are
-the DFT multiplets (a doublet the map splits by more than the exact
-tolerance stays one block with its mean energy), so the `SC_identity`
-comments and the eqp body agree. `SC identity` prints this
-input-to-output L-infinity criterion beside the sorted-index value. The
-`SC_identity` eqp comments give map-0 labels, sorted input/output columns,
-block means and adjacent-output motion on the file's k-block index (the
-first integer in a body row is spin). They describe eqp0 even in the eqp1
-file. The Hamiltonian carry and accelerator are unchanged. The diagonal
-retention mask is `protected | in_range`, including protected multiplet
-members; only non-protected out-of-range diagonals are scissored.
