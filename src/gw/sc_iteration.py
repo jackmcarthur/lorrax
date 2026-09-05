@@ -3824,10 +3824,15 @@ def _sc_map_gain_for_call(
     # QSGW maps studied in pitfall 13.
     if sigma_on_shell is None:
         return None, None
-    current = (
-        np.asarray(e_input_ev, dtype=np.float64).copy(),
-        np.asarray(sigma_on_shell, dtype=np.complex128).copy(),
-    )
+    e_now = np.asarray(e_input_ev, dtype=np.float64)
+    sigma_now = np.asarray(sigma_on_shell, dtype=np.complex128)
+    if e_now.shape[0] != sigma_now.shape[0]:
+        # H/E/U live on the IBZ while Sigma is built on the full BZ (the
+        # KStarMap k-set invariant).  Measure both on Sigma's k-set so the
+        # worst state names one row of the Sigma table.  Si b80/c504 P4:
+        # E=(8,16) against Sigma=(64,16) refused every QSGW map 2.
+        e_now = np.asarray(_kstar(inputs).broadcast(e_now), dtype=np.float64)
+    current = (e_now.copy(), sigma_now.copy())
     if previous is None:
         return None, current
     partition = _state_partition(state_out, inputs)
