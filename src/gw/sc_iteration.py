@@ -649,24 +649,39 @@ class SCState:
 
 def _sc_output_tables_on_loop_kset(
     sigma_result: SigmaResult,
+    delta_h_qp_full,
+    delta_h_qp_unextrap_full,
     sigma_basis_U_full,
     exact_hartree_full: SCExactHartree | None,
     kstar,
-) -> tuple[SigmaResult, jax.Array, SCExactHartree | None]:
+) -> tuple[
+        SigmaResult, jax.Array, SCExactHartree | None, jax.Array,
+        jax.Array | None]:
     """Assemble retained SC outputs at the map's sole k-set seam.
 
     ``compute_sigma_xc`` and density-SC Hartree construction necessarily run
     on the full BZ.  Nothing beyond this function may select an individual
     retained Sigma table: the complete :class:`SigmaResult`, its defining
     DFT→QP rotation and the paired exact-Hartree components move to the loop
-    k-set together.
+    k-set together.  The two Hamiltonian updates are formed before this call
+    and selected first: that preserves the incumbent arithmetic order (form
+    the full-BZ sum, then take its loop rows) bit for bit.
     """
     if kstar.is_identity:
+        delta_h_qp = delta_h_qp_full
+        delta_h_qp_unextrap = delta_h_qp_unextrap_full
         sigma_loop = sigma_result_on_kset(
             sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=kstar.nk_full)
         U_loop = sigma_basis_U_full
         exact_loop = exact_hartree_full
     else:
+        # Keep these two takes ahead of the retained-table takes.  The update
+        # is the numerical product of the map; selecting its already-formed
+        # full-BZ sum is the established, trajectory-pinned operation.
+        delta_h_qp = kstar.select(delta_h_qp_full)
+        delta_h_qp_unextrap = (
+            kstar.select(delta_h_qp_unextrap_full)
+            if delta_h_qp_unextrap_full is not None else None)
         sigma_loop = sigma_result_on_kset(
             sigma_result, kset=SIGMA_KSET_STAR_WEDGE, nk=kstar.nk_irr,
             select_rows=kstar.select)
@@ -696,7 +711,9 @@ def _sc_output_tables_on_loop_kset(
                 raise ValueError(
                     f"SC output seam: exact Hartree {name} has "
                     f"{np.shape(value)[0]} rows, expected {kstar.nk_irr}")
-    return sigma_loop, U_loop, exact_loop
+    return (
+        sigma_loop, U_loop, exact_loop, delta_h_qp,
+        delta_h_qp_unextrap)
 
 
 # ---------------------------------------------------------------------------
@@ -3206,13 +3223,31 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             "density-SC direct-field owner")
     _check_sigma_stage(sigma_result, print_fn=inputs.print_fn)
 
+    # Form the complete full-BZ update before selecting it.  This is the
+    # incumbent numerical order pinned by the SC trajectory; selecting V_H
+    # and Sigma_xc separately and adding their loop rows is algebraically
+    # equivalent but changes the compiled arithmetic graph.
+    delta_h_qp_full = (
+        sigma_result.sigma_xc_kij_ry
+        if exact_hartree_dft is not None
+        else sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry)
+    sigma_xc_unextrap_full = getattr(
+        sigma_result, "sigma_xc_kij_ry_unextrap", None)
+    delta_h_qp_unextrap_full = (
+        None if sigma_xc_unextrap_full is None else
+        sigma_xc_unextrap_full
+        if exact_hartree_dft is not None else
+        sigma_result.v_h_kij_ry + sigma_xc_unextrap_full)
+
     # THE ONE RETAINED-TABLE K-SET SEAM.  Sigma and density-SC Hartree need
     # full-BZ inputs while they are being built.  From this point onward the
     # map, every diagnostic and every SC output record sees only the loop's
     # k-set; no consumer selects one table independently.
-    sigma_result, sigma_basis_U, exact_hartree_dft = (
+    (sigma_result, sigma_basis_U, exact_hartree_dft, delta_h_qp,
+     delta_h_qp_unextrap) = (
         _sc_output_tables_on_loop_kset(
-            sigma_result, U_full, exact_hartree_dft, ks))
+            sigma_result, delta_h_qp_full, delta_h_qp_unextrap_full,
+            U_full, exact_hartree_dft, ks))
 
     # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
     # (as if every band were protected); the partition step below masks
@@ -3224,10 +3259,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # rotation, which is the whole reason it is contracted with ψ_dft.
     # Under density-SC the direct field is caller-owned and SigmaResult uses
     # a scalar-zero sentinel rather than allocating a full zero band matrix.
-    delta_h_qp = (
-        sigma_result.sigma_xc_kij_ry
-        if exact_hartree_dft is not None
-        else sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry)
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     exact_hartree_terms = None
     if exact_hartree_dft is not None:
@@ -3275,15 +3306,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # so the two Hamiltonians differ in exactly one thing: whether Σ_c
     # carries the extrapolated band tail.  It is diagonalized, reported and
     # dropped; it never reaches the carry, rCROP or any artifact.
-    sigma_xc_unextrap = getattr(
-        sigma_result, "sigma_xc_kij_ry_unextrap", None)
-    if sigma_xc_unextrap is not None:
-        delta_h_qp_n3 = (
-            sigma_xc_unextrap
-            if exact_hartree_dft is not None
-            else sigma_result.v_h_kij_ry + sigma_xc_unextrap)
+    if delta_h_qp_unextrap is not None:
         delta_h_dft_n3 = _rotate_to_dft_basis(
-            delta_h_qp_n3, U_qp, mesh=inputs.mesh_xy)
+            delta_h_qp_unextrap, U_qp, mesh=inputs.mesh_xy)
         if exact_hartree_terms is not None:
             scalar, transverse = exact_hartree_terms
             delta_h_dft_n3 = (

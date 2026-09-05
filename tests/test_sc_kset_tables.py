@@ -83,8 +83,12 @@ def test_sc_output_seam_selects_every_retained_sigma_table():
         efermi_ry=0.25,
     )
 
-    sigma_loop, U_loop, exact_loop = _sc_output_tables_on_loop_kset(
-        sigma_full, U_full, exact_full, kstar)
+    delta_full = matrix + 100
+    delta_unextrap_full = matrix + 110
+    (sigma_loop, U_loop, exact_loop, delta_loop,
+     delta_unextrap_loop) = _sc_output_tables_on_loop_kset(
+        sigma_full, delta_full, delta_unextrap_full, U_full, exact_full,
+        kstar)
 
     assert sigma_loop.kset == SIGMA_KSET_STAR_WEDGE
     for name, k_axis in SIGMA_RESULT_K_AXES.items():
@@ -109,6 +113,9 @@ def test_sc_output_seam_selects_every_retained_sigma_table():
     np.testing.assert_array_equal(
         np.asarray(exact_loop.transverse_dft),
         exact_full.transverse_dft[kept])
+    np.testing.assert_array_equal(np.asarray(delta_loop), delta_full[kept])
+    np.testing.assert_array_equal(
+        np.asarray(delta_unextrap_loop), delta_unextrap_full[kept])
     selected_mask = mask[kept]
     np.testing.assert_array_equal(
         sigma_loop.omega_coverage.mask_kn, selected_mask)
