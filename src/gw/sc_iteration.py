@@ -4013,9 +4013,16 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     protected = np.asarray(partition.protected_mask, dtype=bool)
     in_range = np.asarray(partition.in_range_mask, dtype=bool)
     mask = protected | in_range
-    eigh, _ = _kshard_eigh_kernels(inputs.mesh_xy, _band_rotation_spec())
-    _, output_u = eigh(state_out.H_qp_dft)
-    u_out = np.asarray(gather_to_host(output_u))
+    # HOST EIGENVECTORS FOR A HOST READOUT.  The band-sharded eigh kernel
+    # requires the band count to divide both mesh axes; the carry is not
+    # padded here (the core tier's 3-band fixture on a 2x2 mesh raised
+    # IndivisibleError, 2026-09-05).  The identity is a diagnostic over
+    # |overlap|^2, phase-free, and (nk_loop, nb, nb) is small: diagonalise
+    # the gathered carry on the host.
+    h_host = np.asarray(gather_to_host(state_out.H_qp_dft))
+    h_host = 0.5 * (h_host + np.conj(np.swapaxes(h_host, -1, -2)))
+    _, u_out = np.linalg.eigh(h_host)
+    u_out = np.asarray(u_out)
     u_in = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))
     nb = e_output_ev.shape[1]
     u_in = u_in[:, :nb, :nb]
