@@ -179,6 +179,8 @@ def _refuse_unpinned_matmul_precision() -> None:
     quietly stops converging to its advertised residual.  Pinning costs nothing
     at the production block width."""
     import os
+    # Retain the exact 0|1 escape grammar: only literal "1" bypasses the
+    # guard; all other strings keep it enabled (docs/dev/env_vars.md).
     if os.environ.get(_ALLOW_TF32_ENV, "") == "1":
         return
     prec = getattr(jax.config, "jax_default_matmul_precision", None)

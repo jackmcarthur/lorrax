@@ -5,7 +5,9 @@
 
 Walks the AST (not grep) for ``os.environ.get`` / ``os.getenv`` /
 ``os.environ[...]`` / ``os.environ.setdefault`` / ``"X" in os.environ`` and
-prints each variable with its literal default at every site.  Sites whose
+prints each variable with its literal default at every site. Names may be
+string literals or module-level literal-string assignments (including annotated
+assignments); imported attributes and computed names are not resolved.  Sites whose
 literal defaults DISAGREE are flagged ``<<< MULTIPLE DEFAULTS`` — that is
 the drift this exists to catch (one module defaulting a knob to 4 while
 another defaults it to 8 is invisible until it bites).
@@ -85,6 +87,31 @@ class EnvReadVisitor(ast.NodeVisitor):
     def __init__(self, path, hits):
         self.path = path
         self.hits = hits
+        self.module_strings = {}
+
+    def visit_Module(self, node):
+        # Resolve literal module constants without importing/executing source.
+        # Local assignments, imported attributes and computed names are outside
+        # this bounded audit; a nonliteral reassignment invalidates a binding.
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                targets, value = stmt.targets, stmt.value
+            elif isinstance(stmt, ast.AnnAssign):
+                targets, value = [stmt.target], stmt.value
+            else:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    self.module_strings.pop(target.id, None)
+                    name = const_str(value)
+                    if name is not None:
+                        self.module_strings[target.id] = name
+        self.generic_visit(node)
+
+    def _env_name(self, node):
+        if isinstance(node, ast.Name):
+            return self.module_strings.get(node.id)
+        return const_str(node)
 
     def _add(self, name, lineno, default):
         self.hits[name].append((str(self.path), lineno, default))
@@ -104,7 +131,7 @@ class EnvReadVisitor(ast.NodeVisitor):
                     and base.attr == "environ":
                 ok = True
             if ok and node.args:
-                name = const_str(node.args[0])
+                name = self._env_name(node.args[0])
                 if name:
                     default = (lit(node.args[1])
                                if len(node.args) > 1 else "None")
@@ -113,13 +140,13 @@ class EnvReadVisitor(ast.NodeVisitor):
         elif isinstance(f, ast.Attribute) and f.attr == "setdefault" and \
                 isinstance(f.value, ast.Attribute) and \
                 f.value.attr == "environ" and node.args:
-            name = const_str(node.args[0])
+            name = self._env_name(node.args[0])
             if name:
                 self._add(name, node.lineno, "setdefault " + (
                     lit(node.args[1]) if len(node.args) > 1 else "?"))
         # env_bool("X", d) / _env_falsy("X") / ... — helper-mediated reads
         elif fname in ENV_HELPERS and node.args:
-            name = const_str(node.args[0])
+            name = self._env_name(node.args[0])
             if name:
                 default = (lit(node.args[1])
                            if len(node.args) > 1 else "<helper>")
@@ -129,7 +156,7 @@ class EnvReadVisitor(ast.NodeVisitor):
         if fname in ENV_KWARG_CALLS:
             for kw in node.keywords:
                 if kw.arg == "env":
-                    name = const_str(kw.value)
+                    name = self._env_name(kw.value)
                     if name:
                         self._add(name, node.lineno, "Gate(env=...)")
         self.generic_visit(node)
@@ -141,14 +168,14 @@ class EnvReadVisitor(ast.NodeVisitor):
             # py<3.9 wraps the subscript in ast.Index
             if s.__class__.__name__ == "Index":
                 s = s.value
-            name = const_str(s)
+            name = self._env_name(s)
             if name:
                 self._add(name, node.lineno, "<required/assign>")
         self.generic_visit(node)
 
     def visit_Compare(self, node):
         # "X" in os.environ
-        name = const_str(node.left)
+        name = self._env_name(node.left)
         if name is not None:
             for op, cmp in zip(node.ops, node.comparators):
                 if isinstance(op, ast.In) and isinstance(cmp, ast.Attribute) \
@@ -172,6 +199,8 @@ def collect(root):
 
 _SELFTEST_SRC = '''
 import os
+_CONST_ENV = "SELFTEST_CONSTANT"
+constant = os.environ.get(_CONST_ENV, "")
 a = os.environ.get("SELFTEST_RAW", "1")
 b = os.getenv("SELFTEST_GETENV")
 c = os.environ["SELFTEST_REQ"]
@@ -186,7 +215,7 @@ g = Gate(env="SELFTEST_GATE", target="t", platforms=(), modes=(),
 _SELFTEST_EXPECT = {
     "SELFTEST_RAW", "SELFTEST_GETENV", "SELFTEST_REQ", "SELFTEST_SET",
     "SELFTEST_PRESENCE", "SELFTEST_HELPER", "SELFTEST_FALSY",
-    "SELFTEST_GATE",
+    "SELFTEST_GATE", "SELFTEST_CONSTANT",
 }
 
 
