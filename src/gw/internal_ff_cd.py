@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.gauss_patterson import gauss_patterson
 from common.units import RYD_TO_EV
 from .gw_config import INTERNAL_FF_CD_RESPONSE_WIDTH_EV
 
@@ -34,15 +35,17 @@ from .gw_config import INTERNAL_FF_CD_RESPONSE_WIDTH_EV
 PAIR_TILE = 4
 TARGET_TILE = 4
 FREQUENCY_BATCH = 4
-IMAG_ORIGIN_LIMIT_EV = 1.0e-10
 CENTER_SHIFT_EV = 1.0e-10
 REAL_MAX_EV = 70.0
-REAL_STEP_EV = 0.25
-REAL_COARSE_STEP_EV = 0.50
+REAL_STEP_EV = 0.125
+REAL_COARSE_STEP_EV = 0.25
+REAL_ESCALATION_STEP_EV = 0.0625
+REAL_QUINTIC_CONTROL_DENOMINATOR = 12.0
 REAL_HARD_MAX_EV = 250.0
-IMAG_MAX_EV = 100.0
 IMAG_MAP_SCALE_EV = 2.5
-IMAG_FINE_INTERVALS = 64
+IMAG_RULE_NODES = (31, 63, 127)
+IMAG_BASE_RULE_NODES = 63
+IMAG_ESCALATION_RULE_NODES = 127
 CD_CONTROL_TOL_MEV = 0.5
 RESPONSE_WIDTHS_EV = (INTERNAL_FF_CD_RESPONSE_WIDTH_EV,)
 
@@ -51,11 +54,12 @@ RESPONSE_WIDTHS_EV = (INTERNAL_FF_CD_RESPONSE_WIDTH_EV,)
 # weighted contour accumulator changes meaning.  Head-only, diagnostics, and
 # comment changes deliberately do not invalidate an expensive body resume.
 BODY_ACCUMULATOR_SEMANTIC_EPOCH = (
-    "internal-ff-cd-body-v2:ordered-pair-dyson-qstar-contour")
-CHECKPOINT_SCHEMA = 2
+    "internal-ff-cd-body-v3:quintic-gp-static-subtracted-family-receipts")
+CHECKPOINT_SCHEMA = 3
 ARRAY_RECEIPT_SCHEME = "numpy-c-order-sha256-v1"
 STAGE_TIMING_KEYS = (
     "dyson_solve_wall_seconds",
+    "w_derivative_wall_seconds",
     "q_unfold_wall_seconds",
     "contract_host_checks_wall_seconds",
 )
@@ -89,36 +93,44 @@ def real_grid(width_ev: float, *, max_ev: float = REAL_MAX_EV) -> np.ndarray:
     return REAL_STEP_EV * np.arange(n + 1, dtype=np.float64)
 
 
-def imag_grid(n_intervals: int = IMAG_FINE_INTERVALS) -> np.ndarray:
-    """Nested tangent-mapped imaginary grid including 0 and the tail edge."""
-    n_intervals = int(n_intervals)
-    if n_intervals <= 0:
-        raise ValueError("internal_ff_cd imaginary intervals must be positive")
-    theta_max = np.arctan(IMAG_MAX_EV / IMAG_MAP_SCALE_EV)
-    theta = np.linspace(0.0, theta_max, n_intervals + 1)
-    grid = IMAG_MAP_SCALE_EV * np.tan(theta)
-    grid[0], grid[-1] = 0.0, IMAG_MAX_EV
-    return grid
+def _mapped_imag_rule(n_nodes: int) -> tuple[np.ndarray, np.ndarray]:
+    """Map one frozen Gauss--Patterson rule from ``[-1,1]`` to ``[0,inf)``.
+
+    The returned weights integrate in the intermediate angle ``theta``;
+    the tangent Jacobian is kept explicit in the target coefficient so the
+    node set remains target-independent and auditable.
+    """
+    nodes, weights = gauss_patterson(n_nodes)
+    theta = 0.25 * np.pi * (nodes + 1.0)
+    return (IMAG_MAP_SCALE_EV * np.tan(theta),
+            0.25 * np.pi * weights)
 
 
-def _coarse_real_grid(fine: np.ndarray, width_ev: float) -> np.ndarray:
-    del width_ev
-    stride = int(round(REAL_COARSE_STEP_EV / REAL_STEP_EV))
-    if stride <= 1 or not np.isclose(
-            stride * REAL_STEP_EV, REAL_COARSE_STEP_EV):
-        raise AssertionError("real CD fine/coarse spacings are not nested")
-    idx = np.arange(0, fine.size, stride, dtype=np.int32)
-    if idx[-1] != fine.size - 1:
-        idx = np.append(idx, fine.size - 1).astype(np.int32)
-    return idx
+def imag_grid(n_nodes: int = IMAG_ESCALATION_RULE_NODES) -> np.ndarray:
+    """Return the exact-static sample followed by nested imaginary nodes.
 
-
-def _coarse_imag_grid(fine: np.ndarray) -> np.ndarray:
-    if fine.size != IMAG_FINE_INTERVALS + 1:
+    The 127-node evaluation order starts with the complete 63-node rule and
+    appends only its 64 new nodes.  Consequently an accepted 31/63 control
+    never evaluates an escalation frequency, while a refusal can resume the
+    same checkpoint without rebuilding any shared ``W(iu)`` sample.
+    """
+    n_nodes = int(n_nodes)
+    if n_nodes not in (IMAG_BASE_RULE_NODES, IMAG_ESCALATION_RULE_NODES):
         raise ValueError(
-            "internal_ff_cd coarse imaginary certificate requires the "
-            f"canonical {IMAG_FINE_INTERVALS + 1}-node fine grid")
-    return np.arange(0, fine.size, 2, dtype=np.int32)
+            "internal_ff_cd imaginary evaluation grid must use 63 or 127 "
+            f"Gauss--Patterson nodes, got {n_nodes}")
+    base, _ = _mapped_imag_rule(IMAG_BASE_RULE_NODES)
+    if n_nodes == IMAG_BASE_RULE_NODES:
+        return np.concatenate(([0.0], base))
+    full, _ = _mapped_imag_rule(IMAG_ESCALATION_RULE_NODES)
+    base_bits = {np.float64(value).tobytes() for value in base}
+    new = np.asarray([
+        value for value in full
+        if np.float64(value).tobytes() not in base_bits
+    ], np.float64)
+    if new.size != IMAG_ESCALATION_RULE_NODES - IMAG_BASE_RULE_NODES:
+        raise AssertionError("Gauss--Patterson mapped nesting was lost")
+    return np.concatenate(([0.0], base, new))
 
 
 def _real_coverage_max(required_max_ev: float) -> float:
@@ -140,43 +152,73 @@ def _real_coverage_max(required_max_ev: float) -> float:
     return float(max_ev)
 
 
+def _uniform_real_grid(step_ev: float, max_ev: float) -> np.ndarray:
+    n = int(round(float(max_ev) / float(step_ev)))
+    if not np.isclose(n * float(step_ev), float(max_ev)):
+        raise AssertionError(
+            f"real CD ceiling {max_ev} eV is not aligned to h={step_ev} eV")
+    return float(step_ev) * np.arange(n + 1, dtype=np.float64)
+
+
+def _real_family_plan(max_ev: float):
+    """Return nested quintic grids in checkpoint-safe evaluation order.
+
+    All ``h=0.125`` nodes are evaluated first.  Only if the componentwise
+    ``0.25 -> 0.125`` certificate refuses are the interleaved ``h=0.0625``
+    nodes appended.  Each already-built W sample contributes to every
+    compatible family, so escalation never rebuilds W.
+    """
+    coarse = _uniform_real_grid(REAL_COARSE_STEP_EV, max_ev)
+    base = _uniform_real_grid(REAL_STEP_EV, max_ev)
+    fine = _uniform_real_grid(REAL_ESCALATION_STEP_EV, max_ev)
+    base_bits = {np.float64(value).tobytes() for value in base}
+    new = np.asarray([
+        value for value in fine
+        if np.float64(value).tobytes() not in base_bits
+    ], np.float64)
+    if new.size != fine.size - base.size:
+        raise AssertionError("nested real CD evaluation order was lost")
+    evaluation = np.concatenate((base, new))
+    names = tuple(
+        f"quintic_h{step:.8f}"
+        for step in (REAL_COARSE_STEP_EV, REAL_STEP_EV,
+                     REAL_ESCALATION_STEP_EV))
+    return evaluation, names, (coarse, base, fine), int(base.size)
+
+
 def _control_certificate(*, real_fine: np.ndarray,
                          real_coarse: np.ndarray,
                          imag_fine: np.ndarray,
                          imag_coarse: np.ndarray,
-                         imag_tail: np.ndarray,
+                         real_control_scale: float = 1.0,
                          tolerance_mev: float = CD_CONTROL_TOL_MEV):
     """Certify each quadrature control separately, without cancellation."""
     deltas = {
         "real_fine_minus_coarse_ev": np.asarray(real_fine - real_coarse),
         "imag_fine_minus_coarse_ev": np.asarray(imag_fine - imag_coarse),
-        "imag_full_minus_tail_ev": np.asarray(imag_fine - imag_tail),
     }
     component_abs_mev = np.stack([
-        1000.0 * np.abs(delta.real) for delta in deltas.values()
-    ] + [
-        1000.0 * np.abs(delta.imag) for delta in deltas.values()
+        1000.0 * float(real_control_scale)
+        * np.abs(deltas["real_fine_minus_coarse_ev"].real),
+        1000.0 * np.abs(deltas["imag_fine_minus_coarse_ev"].real),
+        1000.0 * float(real_control_scale)
+        * np.abs(deltas["real_fine_minus_coarse_ev"].imag),
+        1000.0 * np.abs(deltas["imag_fine_minus_coarse_ev"].imag),
     ])
     worst_mev = np.max(component_abs_mev, axis=0)
     resolved = worst_mev <= float(tolerance_mev)
     return deltas, worst_mev, resolved
 
-
-def _panel_bounds(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    starts = np.empty_like(grid)
-    ends = np.empty_like(grid)
-    starts[0] = 0.0
-    ends[0] = 0.5 * (grid[0] + grid[1])
-    starts[1:] = 0.5 * (grid[:-1] + grid[1:])
-    ends[1:-1] = 0.5 * (grid[1:-1] + grid[2:])
-    ends[-1] = 0.5 * (-grid[-2] + 3.0 * grid[-1])
-    return starts, ends
-
-
 def _direct_pair_scan(psi_x_a, psi_y_a, psi_x_b, psi_y_b,
                       energy_a, energy_b, occ_a, occ_b, surface_a,
-                      surface_b, z_values, *, nb_logical: int, tile: int):
+                      surface_b, z_values, *, nb_logical: int, tile: int,
+                      derivative_order: int = 0):
     """Exact referee ordered-pair Adler--Wiser sum."""
+    derivative_order = int(derivative_order)
+    if derivative_order not in (0, 1, 2):
+        raise ValueError(
+            "direct ordered-pair derivative_order must be 0, 1, or 2, "
+            f"got {derivative_order}")
     nk, nspinor, nmu_x, nb = psi_x_a.shape
     nmu_y = psi_y_a.shape[2]
     nb_pad = ((int(nb) + tile - 1) // tile) * tile
@@ -227,15 +269,45 @@ def _direct_pair_scan(psi_x_a, psi_y_a, psi_x_b, psi_y_b,
         dy = jnp.einsum("ksna,ksnb->knab", pya, jnp.conj(pyb), optimize=True)
         add = jnp.einsum("zkab,kmab,knab->zmn", weights, dx,
                          jnp.conj(dy), optimize=True)
-        return accumulator + add, None
+        if derivative_order == 0:
+            return accumulator + add, None
+        denominator = de[None] + z[:, None, None, None]
+        nonsingular = abs(denominator) > 1.0e-30
+        safe_denominator = jnp.where(nonsingular, denominator, 1.0)
+        derivative_weights = jnp.where(
+            nonsingular, -df[None] / safe_denominator ** 2, 0.0)
+        derivative_weights = jnp.where(logical, derivative_weights, 0.0)
+        derivative_add = jnp.einsum(
+            "zkab,kmab,knab->zmn", derivative_weights, dx,
+            jnp.conj(dy), optimize=True)
+        if derivative_order == 1:
+            chi, chi_prime = accumulator
+            return (chi + add, chi_prime + derivative_add), None
+        second_weights = jnp.where(
+            nonsingular, 2.0 * df[None] / safe_denominator ** 3, 0.0)
+        second_weights = jnp.where(logical, second_weights, 0.0)
+        second_add = jnp.einsum(
+            "zkab,kmab,knab->zmn", second_weights, dx,
+            jnp.conj(dy), optimize=True)
+        chi, chi_prime, chi_second = accumulator
+        return (chi + add, chi_prime + derivative_add,
+                chi_second + second_add), None
 
     zero = jnp.zeros((z.size, nmu_x, nmu_y), jnp.complex128)
-    chi, _ = jax.lax.scan(pair_tile, zero,
-                          jnp.arange(ntiles * ntiles), unroll=1)
-    return chi / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+    if derivative_order == 0:
+        initial = zero
+    else:
+        initial = tuple(zero for _ in range(derivative_order + 1))
+    response, _ = jax.lax.scan(
+        pair_tile, initial, jnp.arange(ntiles * ntiles), unroll=1)
+    norm = jnp.sqrt(jnp.asarray(nk, jnp.float64))
+    if derivative_order:
+        return tuple(value / norm for value in response)
+    return response / norm
 
 
-def make_direct_kernel(mesh: Mesh, *, nb_logical: int, tile: int = PAIR_TILE):
+def make_direct_kernel(mesh: Mesh, *, nb_logical: int, tile: int = PAIR_TILE,
+                       derivative_order: int = 0):
     from common.shard_map import shard_map
     from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
 
@@ -245,46 +317,64 @@ def make_direct_kernel(mesh: Mesh, *, nb_logical: int, tile: int = PAIR_TILE):
             psi_xn, psi_yn, pbx, pby, energies, jnp.take(energies, kminusq, axis=0),
             occupations, jnp.take(occupations, kminusq, axis=0), surface,
             jnp.take(surface, kminusq, axis=0), z,
-            nb_logical=nb_logical, tile=tile)
+            nb_logical=nb_logical, tile=tile,
+            derivative_order=derivative_order)
 
+    out_specs = (tuple(P(None, "x", "y")
+                       for _ in range(int(derivative_order) + 1))
+                 if derivative_order else P(None, "x", "y"))
     return jax.jit(shard_map(
         local, mesh=mesh,
         in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None), P(None, None),
                   P(None, None), P(None, None), P(None)),
-        out_specs=P(None, "x", "y"), check_vma=False))
+        out_specs=out_specs, check_vma=False))
 
 
 def make_weighted_contract_kernel(mesh: Mesh, *, n_targets: int,
                                   inner_stop: int,
                                   tile: int = TARGET_TILE):
-    """Contract and reduce one W frequency without a spectral-history cube."""
+    """Contract operator/coefficient families without spectral history.
+
+    ``operators`` is ``(operator,q,mu,nu)`` and ``coefficients`` is
+    ``(operator,family,target,q,band)``.  The target overlap rows are formed
+    once, then shared by every predeclared coefficient family (and by the
+    value/first/second-derivative operator tuple on the Hermite arm).
+    """
     from common.shard_map import shard_map
     from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
 
     n_pad = ((int(n_targets) + tile - 1) // tile) * tile
     ntiles = n_pad // tile
 
-    def local(psi_xn, psi_yn, wc, target_k, target_b, kmq, coeff_flat):
+    def local(psi_xn, psi_yn, operators, target_k, target_b, kmq,
+              coeff_flat):
         nb = int(psi_xn.shape[-1])
         # Coefficients have no spatial/centroid axes.  Keep that distinction
         # visible to sharding audits by transporting the (target,q*band)
         # table as a replicated rank-2 scalar table, then exposing q/band
         # only inside this local contraction.
-        coeff = coeff_flat.reshape(n_targets, kmq.shape[1], nb)
+        n_operators = int(operators.shape[0])
+        n_families = int(coeff_flat.shape[1])
+        coeff = coeff_flat.reshape(
+            n_operators, n_families, n_targets, kmq.shape[1], nb)
         tk = jnp.pad(target_k, (0, n_pad - n_targets))
         tb = jnp.pad(target_b, (0, n_pad - n_targets))
         kmap = jnp.pad(kmq, ((0, n_pad - n_targets), (0, 0)))
-        cfull = jnp.pad(coeff, ((0, n_pad - n_targets), (0, 0), (0, 0)))
+        cfull = jnp.pad(
+            coeff,
+            ((0, 0), (0, 0), (0, n_pad - n_targets), (0, 0), (0, 0)))
         valid = jnp.arange(n_pad) < n_targets
-        out0 = jnp.zeros((n_pad,), jnp.complex128)
+        out0 = jnp.zeros((n_families, n_pad), jnp.complex128)
 
         def target_tile(out, it):
             lo = it * tile
             tki = jax.lax.dynamic_slice(tk, (lo,), (tile,))
             tbi = jax.lax.dynamic_slice(tb, (lo,), (tile,))
             kmi = jax.lax.dynamic_slice(kmap, (lo, 0), (tile, kmq.shape[1]))
-            ci = jax.lax.dynamic_slice(cfull, (lo, 0, 0),
-                                       (tile, coeff.shape[1], coeff.shape[2]))
+            ci = jax.lax.dynamic_slice(
+                cfull, (0, 0, lo, 0, 0),
+                (n_operators, n_families, tile,
+                 coeff.shape[3], coeff.shape[4]))
             vi = jax.lax.dynamic_slice(valid, (lo,), (tile,))
             tx_rows = jnp.take(psi_xn, tki, axis=0)
             ty_rows = jnp.take(psi_yn, tki, axis=0)
@@ -298,49 +388,130 @@ def make_weighted_contract_kernel(mesh: Mesh, *, n_targets: int,
                 tile, kmi.shape[1], psi_yn.shape[1], psi_yn.shape[2], nb)
             dx = jnp.einsum("tsu,tqsum->tqmu", jnp.conj(tx), ix, optimize=True)
             dy = jnp.einsum("tsu,tqsum->tqmu", jnp.conj(ty), iy, optimize=True)
-            logical_n = (jnp.arange(nb) < int(inner_stop))[None, None, :]
+            logical_n = (
+                jnp.arange(nb) < int(inner_stop))[None, None, None, None, :]
             ci = jnp.where(logical_n, ci, 0.0)
             partial = jnp.einsum(
-                "tqn,tqna,qab,tqnb->t", ci, dx, wc, jnp.conj(dy),
+                "oftqn,tqna,oqab,tqnb->ft", ci, dx, operators,
+                jnp.conj(dy),
                 optimize=True)
             total = jax.lax.psum(partial, ("x", "y"))
-            total = jnp.where(vi, total, 0.0)
-            return jax.lax.dynamic_update_slice(out, total, (lo,)), None
+            total = jnp.where(vi[None, :], total, 0.0)
+            return jax.lax.dynamic_update_slice(out, total, (0, lo)), None
 
         out, _ = jax.lax.scan(target_tile, out0, jnp.arange(ntiles), unroll=1)
-        return out[:n_targets]
+        return out[:, :n_targets]
 
     mapped = jax.jit(shard_map(
         local, mesh=mesh,
-        in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None, "x", "y"),
-                  P(None), P(None), P(None, None), P(None, None)),
-        out_specs=P(None), check_vma=False))
+        in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None, None, "x", "y"),
+                  P(None), P(None), P(None, None),
+                  P(None, None, None, None)),
+        out_specs=P(None, None), check_vma=False))
 
-    def apply(psi_xn, psi_yn, wc, target_k, target_b, kmq, coeff):
-        if coeff.ndim != 3:
+    def apply(psi_xn, psi_yn, operators, target_k, target_b, kmq,
+              coefficients):
+        if operators.ndim != 4:
             raise ValueError(
-                f"weighted contour coefficients must be (target,q,band), "
-                f"got {coeff.shape}")
+                "weighted contour operators must be (operator,q,mu,nu), "
+                f"got {operators.shape}")
+        if coefficients.ndim != 5:
+            raise ValueError(
+                "weighted contour coefficients must be "
+                "(operator,family,target,q,band), got "
+                f"{coefficients.shape}")
+        if (operators.shape[0] != coefficients.shape[0]
+                or coefficients.shape[2] != n_targets):
+            raise ValueError(
+                "weighted contour operator/family carriers disagree: "
+                f"operators={operators.shape}, coefficients={coefficients.shape}, "
+                f"n_targets={n_targets}")
         return mapped(
-            psi_xn, psi_yn, wc, target_k, target_b, kmq,
-            coeff.reshape(coeff.shape[0], coeff.shape[1] * coeff.shape[2]))
+            psi_xn, psi_yn, operators, target_k, target_b, kmq,
+            coefficients.reshape(
+                coefficients.shape[0], coefficients.shape[1],
+                coefficients.shape[2],
+                coefficients.shape[3] * coefficients.shape[4]))
 
     return apply
 
 
-def _real_coefficients(grid: np.ndarray, iw: int, x_abs: np.ndarray,
-                       sign: np.ndarray) -> np.ndarray:
+def _real_quintic_coefficients(grid: np.ndarray, iw: int,
+                               x_abs: np.ndarray,
+                               sign: np.ndarray) -> tuple[np.ndarray,
+                                                         np.ndarray,
+                                                         np.ndarray]:
+    """Value, ``d/dz_Ry``, and ``d2/dz_Ry2`` quintic coefficients."""
     idx = np.searchsorted(grid, x_abs, side="right") - 1
     idx = np.clip(idx, 0, grid.size - 2)
-    frac = (x_abs - grid[idx]) / (grid[idx + 1] - grid[idx])
-    return sign * (np.where(idx == iw, 1.0 - frac, 0.0)
-                   + np.where(idx + 1 == iw, frac, 0.0))
+    interval_ev = grid[idx + 1] - grid[idx]
+    frac = (x_abs - grid[idx]) / interval_ev
+    h00 = 1.0 - 10.0 * frac**3 + 15.0 * frac**4 - 6.0 * frac**5
+    h10 = frac - 6.0 * frac**3 + 8.0 * frac**4 - 3.0 * frac**5
+    h20 = 0.5 * (frac**2 - 3.0 * frac**3
+                 + 3.0 * frac**4 - frac**5)
+    h01 = 10.0 * frac**3 - 15.0 * frac**4 + 6.0 * frac**5
+    h11 = -4.0 * frac**3 + 7.0 * frac**4 - 3.0 * frac**5
+    h21 = 0.5 * (frac**3 - 2.0 * frac**4 + frac**5)
+    value = sign * (np.where(idx == iw, h00, 0.0)
+                    + np.where(idx + 1 == iw, h01, 0.0))
+    derivative = sign * (interval_ev / RYD_TO_EV) * (
+        np.where(idx == iw, h10, 0.0)
+        + np.where(idx + 1 == iw, h11, 0.0))
+    second = sign * (interval_ev / RYD_TO_EV) ** 2 * (
+        np.where(idx == iw, h20, 0.0)
+        + np.where(idx + 1 == iw, h21, 0.0))
+    return value, derivative, second
 
 
-def _imag_coefficients(grid: np.ndarray, iw: int, x_signed: np.ndarray) -> np.ndarray:
-    starts, ends = _panel_bounds(grid)
-    return (np.arctan(ends[iw] / x_signed)
-            - np.arctan(starts[iw] / x_signed)) / np.pi
+def _imag_family_plan() -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
+    """Return evaluation grid and angle weights aligned for all three rules."""
+    evaluation = imag_grid(IMAG_ESCALATION_RULE_NODES)
+    names = tuple(f"gauss_patterson_{n}" for n in IMAG_RULE_NODES)
+    aligned = np.zeros((len(names), evaluation.size), np.float64)
+    index = {np.float64(value).tobytes(): i
+             for i, value in enumerate(evaluation)}
+    for family, n_nodes in enumerate(IMAG_RULE_NODES):
+        nodes, weights = _mapped_imag_rule(n_nodes)
+        for node, weight in zip(nodes, weights):
+            aligned[family, index[np.float64(node).tobytes()]] = weight
+    expected = [n for n in IMAG_RULE_NODES]
+    actual = np.count_nonzero(aligned, axis=1).tolist()
+    if actual != expected:
+        raise AssertionError(
+            f"Gauss--Patterson family alignment {actual} != {expected}")
+    return evaluation, names, aligned
+
+
+def _imag_kernel_coefficient(u_ev: float, x_signed: np.ndarray) -> np.ndarray:
+    theta = np.arctan(float(u_ev) / IMAG_MAP_SCALE_EV)
+    jacobian = IMAG_MAP_SCALE_EV / np.cos(theta) ** 2
+    return (x_signed * jacobian
+            / (np.pi * (x_signed ** 2 + float(u_ev) ** 2)))
+
+
+def _imag_static_coefficients(evaluation: np.ndarray,
+                              angle_weights: np.ndarray,
+                              x_signed: np.ndarray) -> np.ndarray:
+    """Exact static half term minus each rule's quadrature of that constant."""
+    out = np.broadcast_to(
+        0.5 * np.sign(x_signed),
+        (angle_weights.shape[0],) + x_signed.shape).copy()
+    for iw in range(1, evaluation.size):
+        if np.any(angle_weights[:, iw]):
+            kernel = _imag_kernel_coefficient(evaluation[iw], x_signed)
+            out -= angle_weights[:, iw, None, None, None] * kernel[None]
+    return out
+
+
+def _imag_coefficients(iw: int, *, evaluation: np.ndarray,
+                       angle_weights: np.ndarray,
+                       static_coefficients: np.ndarray,
+                       x_signed: np.ndarray) -> np.ndarray:
+    if int(iw) == 0:
+        return static_coefficients
+    kernel = _imag_kernel_coefficient(evaluation[int(iw)], x_signed)
+    return angle_weights[:, int(iw), None, None, None] * kernel[None]
 
 
 def _hash_array(array: np.ndarray) -> str:
@@ -466,7 +637,10 @@ def _body_checkpoint_provenance(
             "target_tile": TARGET_TILE,
             "frequency_batch": FREQUENCY_BATCH,
             "center_shift_ev": CENTER_SHIFT_EV,
-            "imag_origin_limit_ev": IMAG_ORIGIN_LIMIT_EV,
+            "real_step_ev": REAL_STEP_EV,
+            "real_coarse_step_ev": REAL_COARSE_STEP_EV,
+            "imag_map_scale_ev": IMAG_MAP_SCALE_EV,
+            "imag_rule_nodes": list(IMAG_RULE_NODES),
         },
     }
 
@@ -488,12 +662,17 @@ def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
     return identity
 
 
-def _load_checkpoint(path: Path, identity, n_targets, n_accumulators, *,
+def _load_checkpoint(path: Path, identity, n_targets, family_names, *,
                      return_stage_timings: bool = False):
+    family_names = tuple(str(name) for name in family_names)
+    grid_n = int(identity["grid_n"])
     empty_stages = {key: 0.0 for key in STAGE_TIMING_KEYS}
     if not path.exists():
-        result = (0, [np.zeros(n_targets, np.complex128)
-                      for _ in range(n_accumulators)], 0.0, 0.0)
+        contributions = np.zeros(
+            (grid_n, len(family_names), n_targets), np.complex128)
+        accumulators = [np.zeros(n_targets, np.complex128)
+                        for _ in family_names]
+        result = (0, contributions, accumulators, 0.0, 0.0)
         return result + (empty_stages,) if return_stage_timings else result
     with np.load(path, allow_pickle=False) as data:
         stamped = json.loads(str(np.asarray(data["identity_json"])[()]))
@@ -509,31 +688,49 @@ def _load_checkpoint(path: Path, identity, n_targets, n_accumulators, *,
                 "unavailable without an old-grid prefix and exact-zero "
                 "padded-orbital proof.")
         completed = int(np.asarray(data["completed"])[()])
-        accum = np.asarray(data["accumulators"], np.complex128)
-        if accum.shape != (n_accumulators, n_targets):
+        stamped_families = tuple(json.loads(str(np.asarray(
+            data["family_names_json"])[()])))
+        if stamped_families != family_names:
             raise ValueError(
-                f"internal_ff_cd checkpoint {path} accumulator shape "
-                f"{accum.shape} != {(n_accumulators, n_targets)}")
-        grid_n = int(identity["grid_n"])
+                f"internal_ff_cd checkpoint {path} coefficient families "
+                f"{stamped_families} != {family_names}")
+        contributions = np.asarray(data["contributions"], np.complex128)
+        expected_shape = (grid_n, len(family_names), n_targets)
+        if contributions.shape != expected_shape:
+            raise ValueError(
+                f"internal_ff_cd checkpoint {path} contribution shape "
+                f"{contributions.shape} != {expected_shape}")
         if completed < 0 or completed > grid_n or (
                 completed % FREQUENCY_BATCH != 0 and completed != grid_n):
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} has invalid completed="
                 f"{completed}")
-        if not np.all(np.isfinite(accum)):
+        if not np.all(np.isfinite(contributions[:completed])):
             raise ValueError(
-                f"internal_ff_cd checkpoint {path} has nonfinite accumulator")
-        result = (completed, [row.copy() for row in accum],
+                f"internal_ff_cd checkpoint {path} has nonfinite contributions")
+        if np.any(contributions[completed:] != 0.0):
+            raise ValueError(
+                f"internal_ff_cd checkpoint {path} has data beyond its "
+                f"completed prefix {completed}")
+        stamped_receipt = json.loads(str(np.asarray(
+            data["contributions_receipt_json"])[()]))
+        actual_receipt = _array_receipt(contributions[:completed])
+        if stamped_receipt != actual_receipt:
+            raise ValueError(
+                f"internal_ff_cd checkpoint {path} contribution receipt "
+                "does not match its completed prefix")
+        accum = contributions[:completed].sum(axis=0)
+        result = (completed, contributions, [row.copy() for row in accum],
                   float(np.asarray(data["chi_wall_seconds"])[()]),
                   float(np.asarray(data["solve_contract_wall_seconds"])[()]))
-        if not all(np.isfinite(value) and value >= 0.0 for value in result[2:]):
+        if not all(np.isfinite(value) and value >= 0.0 for value in result[3:]):
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} has invalid aggregate "
                 "wall timing")
         missing_stages = [key for key in STAGE_TIMING_KEYS if key not in data]
         if return_stage_timings and missing_stages:
             raise ValueError(
-                f"internal_ff_cd checkpoint {path} lacks schema-2 stage "
+                f"internal_ff_cd checkpoint {path} lacks schema-3 stage "
                 f"timings {missing_stages}")
         stages = {
             key: (float(np.asarray(data[key])[()]) if key in data else 0.0)
@@ -546,7 +743,8 @@ def _load_checkpoint(path: Path, identity, n_targets, n_accumulators, *,
         return result + (stages,) if return_stage_timings else result
 
 
-def _save_checkpoint(path: Path, identity, completed, accumulators,
+def _save_checkpoint(path: Path, identity, completed, contributions,
+                     family_names,
                      chi_wall, solve_contract_wall, *, stage_timings=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -555,11 +753,16 @@ def _save_checkpoint(path: Path, identity, completed, accumulators,
                   key: float(stage_timings[key]) for key in STAGE_TIMING_KEYS
               })
     with tmp.open("wb") as stream:
+        contributions = np.asarray(contributions, np.complex128)
+        completed = int(completed)
         np.savez(
             stream,
             identity_json=np.asarray(json.dumps(identity, sort_keys=True)),
-            completed=np.asarray(int(completed), np.int64),
-            accumulators=np.stack(accumulators),
+            completed=np.asarray(completed, np.int64),
+            family_names_json=np.asarray(json.dumps(list(family_names))),
+            contributions=contributions,
+            contributions_receipt_json=np.asarray(json.dumps(
+                _array_receipt(contributions[:completed]), sort_keys=True)),
             chi_wall_seconds=np.asarray(float(chi_wall), np.float64),
             solve_contract_wall_seconds=np.asarray(
                 float(solve_contract_wall), np.float64),
@@ -695,7 +898,7 @@ def compute_internal_ff_cd(
     from .efermi import OccupationState, mp1_negative_derivative
     from .qsgw_head import preflight_dft_velocity_head
     from .v_q_g_flat import _resolve_ibz_q_list
-    from .w_isdf import solve_w
+    from .w_isdf import differentiate_w_twice, solve_w
 
     t_start = time.perf_counter()
     rank = int(jax.process_index())
@@ -773,11 +976,18 @@ def compute_internal_ff_cd(
     real_max_ev = _real_coverage_max(max_required)
     residue_sign = np.where(x_signed >= 0.0, -(1.0 - inner_f), inner_f)
 
-    direct = make_direct_kernel(
+    direct_imag = make_direct_kernel(
         mesh_xy, nb_logical=nb_chi_logical)
+    direct_real = make_direct_kernel(
+        mesh_xy, nb_logical=nb_chi_logical, derivative_order=2)
     contract = make_weighted_contract_kernel(
         mesh_xy, n_targets=n_targets,
         inner_stop=nb_sigma_logical)
+    (rgrid, real_family_names, real_family_grids,
+     real_base_stop) = _real_family_plan(real_max_ev)
+    igrid, imag_family_names, imag_angle_weights = _imag_family_plan()
+    imag_static_coeff = _imag_static_coefficients(
+        igrid, imag_angle_weights, x_signed)
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
     body_provenance = _body_checkpoint_provenance(
         energies_ry=wfns.enk, state=state,
@@ -813,21 +1023,25 @@ def compute_internal_ff_cd(
 
         real_arm_plans = []
         for width in RESPONSE_WIDTHS_EV:
-            planned_grid = real_grid(width, max_ev=real_max_ev)
+            planned_grid = rgrid
             planned_z = (planned_grid + 1j * width) / RYD_TO_EV
             real_arm_plans.append({
                 "name": f"real_eta_{width:.8f}",
                 "requested_z_ry": planned_z,
                 "evaluated_z_ry": planned_z,
+                "terminal_prefixes": [real_base_stop, planned_grid.size],
             })
-        planned_igrid = imag_grid()
+        planned_igrid = igrid
         observer_spec = plan_w_observer(
             input_dir=input_dir, real_arms=real_arm_plans,
             imag_grid={
                 "name": "imaginary",
                 "requested_z_ry": 1j * planned_igrid / RYD_TO_EV,
-                "evaluated_z_ry": 1j * np.maximum(
-                    planned_igrid, IMAG_ORIGIN_LIMIT_EV) / RYD_TO_EV,
+                "evaluated_z_ry": 1j * planned_igrid / RYD_TO_EV,
+                "terminal_prefixes": [
+                    1 + IMAG_BASE_RULE_NODES,
+                    1 + IMAG_ESCALATION_RULE_NODES,
+                ],
             },
             q_full=q_full, q_irr_frac=qfrac,
             bvec_cart=CoulombGeometry.from_wfn(wfn).bvec,
@@ -840,26 +1054,30 @@ def compute_internal_ff_cd(
         # checkpoint refuses here because it lacks the observer identity.
         preexisting_completed = []
         for width in RESPONSE_WIDTHS_EV:
-            planned_grid = real_grid(width, max_ev=real_max_ev)
+            planned_grid = rgrid
             planned_identity = _checkpoint_identity(
                 kind="real", grid=planned_grid, width_ev=width,
                 target_k=target_k, target_b=target_b,
                 body_provenance=body_provenance,
                 w_observer_identity=observer_identity)
             planned_identity["grid_n"] = int(planned_grid.size)
+            planned_identity["coefficient_families"] = list(
+                real_family_names)
             planned_checkpoint = (
                 checkpoint_dir / f"real_eta_{width:.8f}.npz")
             preexisting_completed.append(_load_checkpoint(
-                planned_checkpoint, planned_identity, n_targets, 2)[0])
+                planned_checkpoint, planned_identity, n_targets,
+                real_family_names)[0])
         planned_identity = _checkpoint_identity(
             kind="imaginary", grid=planned_igrid, width_ev=None,
             target_k=target_k, target_b=target_b,
             body_provenance=body_provenance,
             w_observer_identity=observer_identity)
         planned_identity["grid_n"] = int(planned_igrid.size)
+        planned_identity["coefficient_families"] = list(imag_family_names)
         preexisting_completed.append(_load_checkpoint(
             checkpoint_dir / "imaginary.npz", planned_identity,
-            n_targets, 3)[0])
+            n_targets, imag_family_names)[0])
         if any(preexisting_completed) and not (
                 Path(observer_spec.payload_path).exists()
                 and Path(observer_spec.sidecar_path).exists()):
@@ -871,7 +1089,8 @@ def compute_internal_ff_cd(
             observer_spec, mesh_xy=mesh_xy, v_wedge=v_wedge)
         observer_receipt = observer.artifact_receipt
 
-    def frequency_batch(z_ry, coefficient_rows, global_frequency_index=None):
+    def frequency_batch(z_ry, coefficient_rows, *, derivative_order: int,
+                        global_frequency_index=None):
         """Evaluate a fixed-size referee frequency batch.
 
         The direct pair scan is substantially more efficient with its
@@ -880,12 +1099,25 @@ def compute_internal_ff_cd(
         replicated or retained as spectral history.
         """
         z = jnp.asarray(z_ry, dtype=jnp.complex128)
-        chi_rows = [
-            direct(wfns.psi_xn, wfns.psi_yn, jnp.asarray(kmq_wedge[i]),
-                   wfns.enk, state.f_kn, surface, z)
+        response_rows = [
+            (direct_real if derivative_order else direct_imag)(
+                wfns.psi_xn, wfns.psi_yn, jnp.asarray(kmq_wedge[i]),
+                wfns.enk, state.f_kn, surface, z)
             for i in range(q_full.size)]
-        chi_bq = jnp.stack(chi_rows, axis=1)
+        if derivative_order:
+            chi_bq = jnp.stack([row[0] for row in response_rows], axis=1)
+            chi_prime_bq = jnp.stack(
+                [row[1] for row in response_rows], axis=1)
+            chi_second_bq = jnp.stack(
+                [row[2] for row in response_rows], axis=1)
+        else:
+            chi_bq = jnp.stack(response_rows, axis=1)
+            chi_prime_bq = None
+            chi_second_bq = None
         chi_bq.block_until_ready()
+        if chi_prime_bq is not None:
+            chi_prime_bq.block_until_ready()
+            chi_second_bq.block_until_ready()
         chi_completed_at = time.perf_counter()
         stage_seconds = {key: 0.0 for key in STAGE_TIMING_KEYS}
         outputs = []
@@ -903,6 +1135,17 @@ def compute_internal_ff_cd(
                 w_wedge.block_until_ready()
                 stage_seconds["dyson_solve_wall_seconds"] += (
                     time.perf_counter() - t_stage)
+                w_prime_wedge = None
+                w_second_wedge = None
+                if derivative_order:
+                    t_stage = time.perf_counter()
+                    w_prime_wedge, w_second_wedge = differentiate_w_twice(
+                        w_wedge, chi_prime_bq[jb], chi_second_bq[jb],
+                        meta, mesh_xy)
+                    w_prime_wedge.block_until_ready()
+                    w_second_wedge.block_until_ready()
+                    stage_seconds["w_derivative_wall_seconds"] += (
+                        time.perf_counter() - t_stage)
                 t_stage = time.perf_counter()
                 wc_wedge = w_wedge - v_wedge
                 if observer is not None:
@@ -916,26 +1159,45 @@ def compute_internal_ff_cd(
                     mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial,
                     trs_rule="pair_transpose")
                 wc_full.block_until_ready()
+                operator_rows = [wc_full]
+                if derivative_order:
+                    w_prime_full = unfold_isdf_operator(
+                        w_prime_wedge, irr_idx=irr_idx, sym_idx=sym_idx,
+                        sym_perm=sym_perm, L_table=l_table,
+                        q_irr_frac=qfrac, mesh_xy=mesh_xy,
+                        n_sym_spatial=n_sym_spatial,
+                        trs_rule="pair_transpose")
+                    w_prime_full.block_until_ready()
+                    w_second_full = unfold_isdf_operator(
+                        w_second_wedge, irr_idx=irr_idx, sym_idx=sym_idx,
+                        sym_perm=sym_perm, L_table=l_table,
+                        q_irr_frac=qfrac, mesh_xy=mesh_xy,
+                        n_sym_spatial=n_sym_spatial,
+                        trs_rule="pair_transpose")
+                    w_second_full.block_until_ready()
+                    operator_rows.extend((w_prime_full, w_second_full))
                 stage_seconds["q_unfold_wall_seconds"] += (
                     time.perf_counter() - t_stage)
                 # CD spectral convention S=(I-epsilon^-1)V = -Wc.
                 t_stage = time.perf_counter()
-                row = []
-                for coeff in coefficients:
-                    value = -contract(
-                        wfns.psi_xn, wfns.psi_yn, wc_full,
-                        jnp.asarray(target_k), jnp.asarray(target_b),
-                        jnp.asarray(kmq_target),
-                        jnp.asarray(coeff, jnp.float64))
-                    host = np.asarray(value)
-                    if not np.all(np.isfinite(host)):
-                        bad = int(np.flatnonzero(~np.isfinite(host))[0])
-                        raise FloatingPointError(
-                            "internal_ff_cd nonfinite contracted stream at "
-                            f"target {bad}")
-                    row.append(host * (RYD_TO_EV / nk))
-                outputs.append(row)
+                value = -contract(
+                    wfns.psi_xn, wfns.psi_yn,
+                    jnp.stack(operator_rows, axis=0),
+                    jnp.asarray(target_k), jnp.asarray(target_b),
+                    jnp.asarray(kmq_target),
+                    jnp.asarray(coefficients, jnp.float64))
+                host = np.asarray(value) * (RYD_TO_EV / nk)
+                if not np.all(np.isfinite(host)):
+                    bad_family, bad_target = np.unravel_index(
+                        int(np.flatnonzero(~np.isfinite(host))[0]), host.shape)
+                    raise FloatingPointError(
+                        "internal_ff_cd nonfinite contracted stream at "
+                        f"family {bad_family}, target {bad_target}")
+                outputs.append(host)
                 del w_wedge, wc_wedge, wc_full
+                if derivative_order:
+                    del (w_prime_wedge, w_second_wedge, w_prime_full,
+                         w_second_full)
                 stage_seconds["contract_host_checks_wall_seconds"] += (
                     time.perf_counter() - t_stage)
             except BaseException:
@@ -947,85 +1209,121 @@ def compute_internal_ff_cd(
     real_results = []
     grid_records = []
     final_coarse_real = None
+    final_real_rule_pair = None
+    real_family_index = []
+    for family_grid in real_family_grids:
+        lookup = {np.float64(value).tobytes(): i
+                  for i, value in enumerate(family_grid)}
+        real_family_index.append(np.asarray([
+            lookup.get(np.float64(value).tobytes(), -1) for value in rgrid
+        ], np.int32))
     for width in RESPONSE_WIDTHS_EV:
         arm_name = f"real_eta_{width:.8f}"
         arm_start = (0 if observer is None else
                      int(observer.spec.arm(arm_name)["start"]))
-        grid = real_grid(width, max_ev=real_max_ev)
-        coarse = (_coarse_real_grid(grid, width)
-                  if width == RESPONSE_WIDTHS_EV[-1] else None)
-        coarse_lookup = ({int(i): j for j, i in enumerate(coarse)}
-                         if coarse is not None else {})
         identity = _checkpoint_identity(
-            kind="real", grid=grid, width_ev=width,
+            kind="real", grid=rgrid, width_ev=width,
             target_k=target_k, target_b=target_b,
             body_provenance=body_provenance,
             w_observer_identity=observer_identity)
-        identity["grid_n"] = int(grid.size)
+        identity["grid_n"] = int(rgrid.size)
+        identity["coefficient_families"] = list(real_family_names)
         checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.npz"
-        (completed, loaded, chi_wall, solve_contract_wall,
+        (completed, contributions, loaded, chi_wall, solve_contract_wall,
          stage_wall) = _load_checkpoint(
-            checkpoint, identity, n_targets, 2,
+            checkpoint, identity, n_targets, real_family_names,
             return_stage_timings=True)
         if observer is not None:
             observer.require_checkpoint_prefix(arm_name, completed)
-        accum, coarse_accum = loaded
+        del loaded
+        real_resumed_at_frequency = completed
         if rank == 0 and completed:
             print_fn(
                 f"  internal_ff_cd resume real eta_W={width:g} eV: "
-                f"{completed}/{len(grid)} frequencies from {checkpoint}")
+                f"{completed}/{len(rgrid)} frequencies from {checkpoint}")
         t_arm = time.perf_counter()
-        for lo in range(completed, grid.size, FREQUENCY_BATCH):
-            hi = min(lo + FREQUENCY_BATCH, grid.size)
-            coefficient_rows = []
-            for iw in range(lo, hi):
-                coeff = _real_coefficients(grid, iw, x_abs, residue_sign)
-                coeffs = [coeff]
-                if iw in coarse_lookup:
-                    cj = coarse_lookup[iw]
-                    cgrid = grid[coarse]
-                    ccoeff = _real_coefficients(
-                        cgrid, cj, x_abs, residue_sign)
-                    coeffs.append(ccoeff)
-                coefficient_rows.append(coeffs)
-            t_batch = time.perf_counter()
-            z_batch = (grid[lo:hi] / RYD_TO_EV
-                       + 1j * (width / RYD_TO_EV))
-            if observer is None:
-                values, t_after_chi, stage_batch = frequency_batch(
-                    z_batch, coefficient_rows)
-            else:
-                values, t_after_chi, stage_batch = frequency_batch(
-                    z_batch, coefficient_rows,
-                    np.arange(arm_start + lo, arm_start + hi, dtype=np.int64))
-            chi_wall += t_after_chi - t_batch
-            solve_contract_wall += time.perf_counter() - t_after_chi
-            for key in STAGE_TIMING_KEYS:
-                stage_wall[key] += stage_batch[key]
-            for jb, iw in enumerate(range(lo, hi)):
-                accum += values[jb][0]
-                if iw in coarse_lookup:
-                    coarse_accum += values[jb][1]
-            if observer is not None:
-                observer.commit_prefix(arm_name, hi)
-            if rank == 0:
-                _save_checkpoint(
-                    checkpoint, identity, hi, (accum, coarse_accum),
-                    chi_wall, solve_contract_wall,
-                    stage_timings=stage_wall)
-            if rank == 0 and (hi == len(grid) or hi % 50 < FREQUENCY_BATCH):
-                print_fn(
-                    f"  internal_ff_cd real eta_W={width:g} eV: "
-                    f"{hi}/{len(grid)} frequencies")
-        real_results.append(accum)
-        final_coarse_real = coarse_accum if coarse is not None else final_coarse_real
+        def advance_real(stop, start, chi_seconds, solve_seconds):
+            for lo in range(start, stop, FREQUENCY_BATCH):
+                hi = min(lo + FREQUENCY_BATCH, stop)
+                coefficient_rows = []
+                for iw in range(lo, hi):
+                    family_rows = []
+                    for family_grid, index_rows in zip(
+                            real_family_grids, real_family_index):
+                        family_iw = int(index_rows[iw])
+                        if family_iw < 0:
+                            family_rows.append(np.zeros(
+                                (3,) + x_abs.shape, np.float64))
+                        else:
+                            family_rows.append(np.stack(
+                                _real_quintic_coefficients(
+                                    family_grid, family_iw, x_abs,
+                                    residue_sign)))
+                    coefficient_rows.append(np.stack(family_rows, axis=1))
+                t_batch = time.perf_counter()
+                z_batch = (rgrid[lo:hi] / RYD_TO_EV
+                           + 1j * (width / RYD_TO_EV))
+                if observer is None:
+                    values, t_after_chi, stage_batch = frequency_batch(
+                        z_batch, coefficient_rows, derivative_order=2)
+                else:
+                    values, t_after_chi, stage_batch = frequency_batch(
+                        z_batch, coefficient_rows, derivative_order=2,
+                        global_frequency_index=np.arange(
+                            arm_start + lo, arm_start + hi, dtype=np.int64))
+                chi_seconds += t_after_chi - t_batch
+                solve_seconds += time.perf_counter() - t_after_chi
+                for key in STAGE_TIMING_KEYS:
+                    stage_wall[key] += stage_batch[key]
+                for jb, iw in enumerate(range(lo, hi)):
+                    contributions[iw] = values[jb]
+                if observer is not None:
+                    observer.commit_prefix(arm_name, hi)
+                if rank == 0:
+                    _save_checkpoint(
+                        checkpoint, identity, hi, contributions,
+                        real_family_names, chi_seconds, solve_seconds,
+                        stage_timings=stage_wall)
+                if rank == 0 and (hi == stop or hi % 50 < FREQUENCY_BATCH):
+                    print_fn(
+                        f"  internal_ff_cd real eta_W={width:g} eV: "
+                        f"{hi}/{len(rgrid)} frequencies")
+            return stop if start < stop else start, chi_seconds, solve_seconds
+
+        preexisting_escalation = completed > real_base_stop
+        if completed < real_base_stop:
+            completed, chi_wall, solve_contract_wall = advance_real(
+                real_base_stop, completed, chi_wall, solve_contract_wall)
+        base_accum = contributions[:real_base_stop].sum(axis=0)
+        base_delta = base_accum[1] - base_accum[0]
+        base_control_mev = (
+            1000.0 / REAL_QUINTIC_CONTROL_DENOMINATOR
+            * np.maximum(np.abs(base_delta.real), np.abs(base_delta.imag)))
+        escalated = bool(preexisting_escalation or np.any(
+            base_control_mev > CD_CONTROL_TOL_MEV))
+        if escalated and completed < rgrid.size:
+            completed, chi_wall, solve_contract_wall = advance_real(
+                rgrid.size, completed, chi_wall, solve_contract_wall)
+        all_accum = contributions[:completed].sum(axis=0)
+        if escalated:
+            real_accum, real_coarse = all_accum[2], all_accum[1]
+            real_rule_pair = [REAL_STEP_EV, REAL_ESCALATION_STEP_EV]
+        else:
+            real_accum, real_coarse = base_accum[1], base_accum[0]
+            real_rule_pair = [REAL_COARSE_STEP_EV, REAL_STEP_EV]
+        real_results.append(real_accum)
+        final_coarse_real = real_coarse
+        final_real_rule_pair = real_rule_pair
         grid_records.append({
-            "kind": "real", "eta_w_ev": width, "n": int(grid.size),
-            "min_ev": float(grid[0]), "max_ev": float(grid[-1]),
-            "sha256": _hash_array(grid),
+            "kind": "real", "eta_w_ev": width,
+            "n_planned": int(rgrid.size), "n_evaluated": int(completed),
+            "min_ev": float(np.min(rgrid)), "max_ev": float(np.max(rgrid)),
+            "rule_pair_ev": real_rule_pair, "escalated": escalated,
+            "control_estimator": "abs(fine-coarse)/12",
+            "sha256": _hash_array(rgrid),
             "frequency_batch": FREQUENCY_BATCH,
             "checkpoint": str(checkpoint),
-            "resumed_at_frequency": completed,
+            "resumed_at_frequency": real_resumed_at_frequency,
             "chi_wall_seconds": chi_wall,
             "solve_contract_wall_seconds": solve_contract_wall,
             **stage_wall,
@@ -1037,85 +1335,100 @@ def compute_internal_ff_cd(
     arm_name = "imaginary"
     arm_start = (0 if observer is None else
                  int(observer.spec.arm(arm_name)["start"]))
-    igrid = imag_grid()
-    icoarse = _coarse_imag_grid(igrid)
-    icoarse_lookup = {int(i): j for j, i in enumerate(icoarse)}
-    itail = igrid[igrid <= 60.0 + 1.0e-12]
-    tail_panel_max_ev = float(_panel_bounds(itail)[1][-1])
     identity = _checkpoint_identity(
         kind="imaginary", grid=igrid, width_ev=None,
         target_k=target_k, target_b=target_b,
         body_provenance=body_provenance,
         w_observer_identity=observer_identity)
     identity["grid_n"] = int(igrid.size)
+    identity["coefficient_families"] = list(imag_family_names)
     checkpoint = checkpoint_dir / "imaginary.npz"
-    (completed, loaded, chi_wall, solve_contract_wall,
+    (completed, contributions, loaded, chi_wall, solve_contract_wall,
      stage_wall) = _load_checkpoint(
-        checkpoint, identity, n_targets, 3,
+        checkpoint, identity, n_targets, imag_family_names,
         return_stage_timings=True)
+    imag_resumed_at_frequency = completed
     if observer is not None:
         observer.require_checkpoint_prefix(arm_name, completed)
-    imag_accum, imag_coarse, imag_tail = loaded
+    del loaded
     if rank == 0 and completed:
         print_fn(
             f"  internal_ff_cd resume imaginary: {completed}/{len(igrid)} "
             f"frequencies from {checkpoint}")
     t_arm = time.perf_counter()
-    for lo in range(completed, igrid.size, FREQUENCY_BATCH):
-        hi = min(lo + FREQUENCY_BATCH, igrid.size)
-        coefficient_rows = []
-        for iw in range(lo, hi):
-            coeff = _imag_coefficients(igrid, iw, x_signed)
-            coeffs = [coeff]
-            if iw in icoarse_lookup:
-                cj = icoarse_lookup[iw]
-                cgrid = igrid[icoarse]
-                ccoeff = _imag_coefficients(cgrid, cj, x_signed)
-                coeffs.append(ccoeff)
-            if iw < itail.size:
-                tcoeff = _imag_coefficients(itail, iw, x_signed)
-                coeffs.append(tcoeff)
-            coefficient_rows.append(coeffs)
-        z_imag_ev = np.maximum(igrid[lo:hi], IMAG_ORIGIN_LIMIT_EV)
-        t_batch = time.perf_counter()
-        z_batch = 1j * z_imag_ev / RYD_TO_EV
-        if observer is None:
-            values, t_after_chi, stage_batch = frequency_batch(
-                z_batch, coefficient_rows)
-        else:
-            values, t_after_chi, stage_batch = frequency_batch(
-                z_batch, coefficient_rows,
-                np.arange(arm_start + lo, arm_start + hi, dtype=np.int64))
-        chi_wall += t_after_chi - t_batch
-        solve_contract_wall += time.perf_counter() - t_after_chi
-        for key in STAGE_TIMING_KEYS:
-            stage_wall[key] += stage_batch[key]
-        for jb, iw in enumerate(range(lo, hi)):
-            imag_accum += values[jb][0]
-            offset = 1
-            if iw in icoarse_lookup:
-                imag_coarse += values[jb][offset]
-                offset += 1
-            if iw < itail.size:
-                imag_tail += values[jb][offset]
-        if observer is not None:
-            observer.commit_prefix(arm_name, hi)
-        if rank == 0:
-            _save_checkpoint(
-                checkpoint, identity, hi,
-                (imag_accum, imag_coarse, imag_tail),
-                chi_wall, solve_contract_wall,
-                stage_timings=stage_wall)
-        if rank == 0 and (hi == len(igrid) or hi % 50 < FREQUENCY_BATCH):
-            print_fn(f"  internal_ff_cd imaginary: {hi}/{len(igrid)} frequencies")
+    def advance_imaginary(stop, start, chi_seconds, solve_seconds):
+        for lo in range(start, stop, FREQUENCY_BATCH):
+            hi = min(lo + FREQUENCY_BATCH, stop)
+            coefficient_rows = [
+                _imag_coefficients(
+                    iw, evaluation=igrid,
+                    angle_weights=imag_angle_weights,
+                    static_coefficients=imag_static_coeff,
+                    x_signed=x_signed)[None, ...]
+                for iw in range(lo, hi)
+            ]
+            t_batch = time.perf_counter()
+            z_batch = 1j * igrid[lo:hi] / RYD_TO_EV
+            if observer is None:
+                values, t_after_chi, stage_batch = frequency_batch(
+                    z_batch, coefficient_rows, derivative_order=0)
+            else:
+                values, t_after_chi, stage_batch = frequency_batch(
+                    z_batch, coefficient_rows, derivative_order=0,
+                    global_frequency_index=np.arange(
+                        arm_start + lo, arm_start + hi, dtype=np.int64))
+            chi_seconds += t_after_chi - t_batch
+            solve_seconds += time.perf_counter() - t_after_chi
+            for key in STAGE_TIMING_KEYS:
+                stage_wall[key] += stage_batch[key]
+            for jb, iw in enumerate(range(lo, hi)):
+                contributions[iw] = values[jb]
+            if observer is not None:
+                observer.commit_prefix(arm_name, hi)
+            if rank == 0:
+                _save_checkpoint(
+                    checkpoint, identity, hi, contributions,
+                    imag_family_names, chi_seconds, solve_seconds,
+                    stage_timings=stage_wall)
+            if rank == 0 and (hi == stop or hi % 50 < FREQUENCY_BATCH):
+                print_fn(
+                    f"  internal_ff_cd imaginary: {hi}/{len(igrid)} "
+                    "frequencies")
+        return stop if start < stop else start, chi_seconds, solve_seconds
+
+    base_stop = 1 + IMAG_BASE_RULE_NODES
+    preexisting_escalation = completed > base_stop
+    if completed < base_stop:
+        completed, chi_wall, solve_contract_wall = advance_imaginary(
+            base_stop, completed, chi_wall, solve_contract_wall)
+    base_accum = contributions[:base_stop].sum(axis=0)
+    base_delta = base_accum[1] - base_accum[0]
+    base_worst_mev = 1000.0 * np.maximum(
+        np.abs(base_delta.real), np.abs(base_delta.imag))
+    escalated = bool(preexisting_escalation or np.any(
+        base_worst_mev > CD_CONTROL_TOL_MEV))
+    if escalated and completed < igrid.size:
+        completed, chi_wall, solve_contract_wall = advance_imaginary(
+            igrid.size, completed, chi_wall, solve_contract_wall)
+    all_accum = contributions[:completed].sum(axis=0)
+    if escalated:
+        imag_accum, imag_coarse = all_accum[2], all_accum[1]
+        imag_rule_pair = [IMAG_BASE_RULE_NODES,
+                          IMAG_ESCALATION_RULE_NODES]
+    else:
+        imag_accum, imag_coarse = all_accum[1], all_accum[0]
+        imag_rule_pair = [IMAG_RULE_NODES[0], IMAG_BASE_RULE_NODES]
     grid_records.append({
-        "kind": "imaginary", "eta_w_ev": 0.0, "n": int(igrid.size),
-        "min_ev": float(igrid[0]), "max_ev": float(igrid[-1]),
-        "origin_limit_ev": IMAG_ORIGIN_LIMIT_EV,
+        "kind": "imaginary", "eta_w_ev": 0.0,
+        "n_planned": int(igrid.size), "n_evaluated": int(completed),
+        "domain_ev": [0.0, "infinity"],
+        "largest_finite_node_ev": float(np.max(igrid[:completed])),
+        "static_subtraction": "exact_S0_half_plus_quadrature_of_Siu_minus_S0",
+        "rule_pair": imag_rule_pair, "escalated": escalated,
         "sha256": _hash_array(igrid),
         "frequency_batch": FREQUENCY_BATCH,
         "checkpoint": str(checkpoint),
-        "resumed_at_frequency": completed,
+        "resumed_at_frequency": imag_resumed_at_frequency,
         "chi_wall_seconds": chi_wall,
         "solve_contract_wall_seconds": solve_contract_wall,
         **stage_wall,
@@ -1135,7 +1448,7 @@ def compute_internal_ff_cd(
     controls, control_max_mev, contracts = _control_certificate(
         real_fine=real_results[-1], real_coarse=final_coarse_real,
         imag_fine=imag_accum, imag_coarse=imag_coarse,
-        imag_tail=imag_tail)
+        real_control_scale=1.0 / REAL_QUINTIC_CONTROL_DENOMINATOR)
     unresolved = np.flatnonzero(~contracts)
     labels = _target_labels(sym, target_k, target_b, band_slices.b0)
     records = []
@@ -1158,19 +1471,20 @@ def compute_internal_ff_cd(
                     "real_fine_minus_coarse_ev"][i].real),
                 float(1000.0 * controls[
                     "real_fine_minus_coarse_ev"][i].imag)],
+            "real_calibrated_control_mev": [
+                float(1000.0 / REAL_QUINTIC_CONTROL_DENOMINATOR * controls[
+                    "real_fine_minus_coarse_ev"][i].real),
+                float(1000.0 / REAL_QUINTIC_CONTROL_DENOMINATOR * controls[
+                    "real_fine_minus_coarse_ev"][i].imag)],
             "imag_fine_minus_coarse_mev": [
                 float(1000.0 * controls[
                     "imag_fine_minus_coarse_ev"][i].real),
                 float(1000.0 * controls[
                     "imag_fine_minus_coarse_ev"][i].imag)],
-            "imag_full_minus_tail_mev": [
-                float(1000.0 * controls[
-                    "imag_full_minus_tail_ev"][i].real),
-                float(1000.0 * controls[
-                    "imag_full_minus_tail_ev"][i].imag)],
+            "imag_rule_pair": imag_rule_pair,
         })
     artifact = {
-        "schema": 2,
+        "schema": 3,
         "route": "internal_ff_cd",
         "status": "pass" if unresolved.size == 0 else "unresolved",
         "jobid": os.environ.get("SLURM_JOB_ID", "unknown"),
@@ -1181,9 +1495,11 @@ def compute_internal_ff_cd(
             **body_provenance,
         },
         "sharding": {
-            "chi": "P(None,x,y)", "W": "P(None,x,y)",
+            "chi": "P(None,x,y)", "chi_prime": "P(None,x,y)",
+            "chi_second": "P(None,x,y)", "W": "P(None,x,y)",
+            "W_prime": "P(None,x,y)", "W_second": "P(None,x,y)",
             "replicated_nmu2_per_process": False,
-            "contract_output": "one complex scalar per external target",
+            "contract_output": "(coefficient_family,target) complex scalars",
         },
         "stamps": {
             "occupation_hash": state.occ_hash,
@@ -1200,14 +1516,22 @@ def compute_internal_ff_cd(
         "coverage": {
             "real_max_ev": real_max_ev,
             "residue_required_max_ev": max_required,
-            "imag_max_ev": IMAG_MAX_EV,
-            "imag_tail_last_sample_ev": float(itail[-1]),
-            "imag_tail_panel_max_ev": tail_panel_max_ev,
+            "real_rule_pair_ev": final_real_rule_pair,
+            "imag_domain_ev": [0.0, "infinity"],
+            "imag_map_scale_ev": IMAG_MAP_SCALE_EV,
+            "imag_rule_pair": imag_rule_pair,
+            "imag_escalated": escalated,
+            "eta_w_broadening_bias": "excluded_from_quadrature_certificate",
         },
         "certificate": {
             "tolerance_mev": CD_CONTROL_TOL_MEV,
-            "rule": "max absolute real/imag component of each independent "
-                    "real-grid, imaginary-grid, and imaginary-tail control",
+            "rule": "max absolute real/imag component of the independent "
+                    "calibrated quintic real-grid estimator "
+                    "abs(fine-coarse)/12 and same-domain nested imaginary "
+                    "control; eta_W broadening bias is excluded",
+            "real_estimator_status": "empirically calibrated on planted "
+                                     "single/crowded/continuum poles; not a "
+                                     "mathematical error bound",
         },
         "grids": grid_records,
         "head": head_record,
@@ -1225,12 +1549,11 @@ def compute_internal_ff_cd(
     if unresolved.size:
         names = [
             f"k={labels[i]['k_crystal']}, band={labels[i]['band_one_based']} "
-            f"(real-grid={1000.0 * controls['real_fine_minus_coarse_ev'][i].real:+.3f}"
-            f"{1000.0 * controls['real_fine_minus_coarse_ev'][i].imag:+.3f}i, "
+            f"(real-grid={1000.0 / REAL_QUINTIC_CONTROL_DENOMINATOR * controls['real_fine_minus_coarse_ev'][i].real:+.3f}"
+            f"{1000.0 / REAL_QUINTIC_CONTROL_DENOMINATOR * controls['real_fine_minus_coarse_ev'][i].imag:+.3f}i, "
             f"imag-grid={1000.0 * controls['imag_fine_minus_coarse_ev'][i].real:+.3f}"
-            f"{1000.0 * controls['imag_fine_minus_coarse_ev'][i].imag:+.3f}i, "
-            f"imag-tail={1000.0 * controls['imag_full_minus_tail_ev'][i].real:+.3f}"
-            f"{1000.0 * controls['imag_full_minus_tail_ev'][i].imag:+.3f}i meV)"
+            f"{1000.0 * controls['imag_fine_minus_coarse_ev'][i].imag:+.3f}i "
+            f"meV; imag-rules={imag_rule_pair})"
             for i in unresolved]
         raise RuntimeError(
             "internal_ff_cd componentwise quadrature certificate exceeded "
@@ -1250,7 +1573,8 @@ def compute_internal_ff_cd(
 __all__ = [
     "InternalFFResult", "compute_internal_ff_cd", "make_direct_kernel",
     "make_weighted_contract_kernel", "real_grid", "imag_grid",
-    "FREQUENCY_BATCH", "RESPONSE_WIDTHS_EV", "REAL_MAX_EV", "IMAG_MAX_EV",
+    "FREQUENCY_BATCH", "RESPONSE_WIDTHS_EV", "REAL_MAX_EV",
     "REAL_STEP_EV", "REAL_COARSE_STEP_EV", "REAL_HARD_MAX_EV",
-    "IMAG_FINE_INTERVALS", "CD_CONTROL_TOL_MEV",
+    "IMAG_RULE_NODES", "IMAG_BASE_RULE_NODES",
+    "IMAG_ESCALATION_RULE_NODES", "CD_CONTROL_TOL_MEV",
 ]

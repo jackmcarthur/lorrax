@@ -1576,6 +1576,71 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
         return solve_fn(V_q, chi0_q, pref)
 
 
+def differentiate_w(W_q, chi0_prime_q, meta, mesh_xy, *,
+                    n_rmu_logical=None):
+    r"""Differentiate the solved Dyson equation at fixed bare ``V``.
+
+    For ``W=(1-V p chi0)^{-1}V`` and the physical response prefactor ``p``
+    owned by this module,
+
+    ``dW/dz = p W (d chi0/dz) W``.
+
+    Both products go through the public ``distrib_la.matmul`` door with its
+    provider-backed batched route.  Thus the input, intermediate, and output
+    remain ``P(None,'x','y')``; this helper neither introduces a second Dyson
+    solve nor materialises a complete centroid matrix on one process.
+    """
+    _require_w_operand_geometry(
+        W_q, chi0_prime_q, meta, mesh_xy,
+        n_rmu_logical=n_rmu_logical)
+    from distrib_la import matmul
+
+    pref = _w_solve_pref_scalar(meta)
+    with jax_profile.annotation("W_derivative"):
+        left = matmul(
+            W_q, chi0_prime_q, mesh=mesh_xy,
+            backend="auto", batched_route="auto")
+        return matmul(
+            left, W_q, mesh=mesh_xy, alpha=pref,
+            backend="auto", batched_route="auto")
+
+
+def differentiate_w_twice(W_q, chi0_prime_q, chi0_second_q, meta, mesh_xy,
+                          *, n_rmu_logical=None):
+    r"""Return the first two frequency derivatives of a solved Dyson W.
+
+    At fixed bare ``V`` and with the response prefactor ``p`` owned here,
+
+    ``W'  = p W chi' W``
+
+    ``W'' = p W chi'' W + 2 p**2 W chi' W chi' W``.
+
+    Five provider-backed all-P GEMMs suffice: the already-formed ``W chi'``
+    is shared by ``W'`` and the noncommuting quadratic term.  Every operand,
+    intermediate, and result retains ``P(None,'x','y')`` ownership.
+    """
+    _require_w_operand_geometry(
+        W_q, chi0_prime_q, meta, mesh_xy,
+        n_rmu_logical=n_rmu_logical)
+    _require_w_operand_geometry(
+        W_q, chi0_second_q, meta, mesh_xy,
+        n_rmu_logical=n_rmu_logical)
+    from distrib_la import matmul
+
+    pref = _w_solve_pref_scalar(meta)
+    kwargs = {
+        "mesh": mesh_xy, "backend": "auto", "batched_route": "auto"}
+    with jax_profile.annotation("W_first_second_derivative"):
+        left_prime = matmul(W_q, chi0_prime_q, **kwargs)
+        w_prime = matmul(left_prime, W_q, alpha=pref, **kwargs)
+        left_second = matmul(W_q, chi0_second_q, **kwargs)
+        linear_second = matmul(
+            left_second, W_q, alpha=pref, **kwargs)
+        quadratic_second = matmul(
+            left_prime, w_prime, alpha=2.0 * pref, **kwargs)
+        return w_prime, linear_second + quadratic_second
+
+
 def _chi_face_kwargs(wfns) -> dict:
     """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
     ``face_shape`` kwargs :func:`_get_chi_minimax_kernel` needs otherwise.

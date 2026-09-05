@@ -23,8 +23,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 PROPOSAL_RANK = 16
 HELDOUT_RANK = 32
 PROBE_RANK = PROPOSAL_RANK + HELDOUT_RANK
-OBSERVER_SCHEMA = 1
-_PROBE_NAMESPACE = b"internal_ff_w_observer_v1\0"
+OBSERVER_SCHEMA = 2
+_PROBE_NAMESPACE = b"internal_ff_w_observer_v2\0"
 _SPLITMIX_ADD = np.uint64(0x9E3779B97F4A7C15)
 _SPLITMIX_MUL1 = np.uint64(0xBF58476D1CE4E5B9)
 _SPLITMIX_MUL2 = np.uint64(0x94D049BB133111EB)
@@ -137,12 +137,24 @@ def _normalise_arm(raw, *, code: int, kind: str) -> dict:
     if not requested.size or not (
             np.all(np.isfinite(requested)) and np.all(np.isfinite(evaluated))):
         raise ValueError(f"W observer arm {name!r} has an invalid frequency grid")
+    terminal_prefixes = tuple(int(value) for value in raw.get(
+        "terminal_prefixes", (requested.size,)))
+    if (not terminal_prefixes
+            or tuple(sorted(set(terminal_prefixes))) != terminal_prefixes
+            or any(value <= 0 or value > requested.size
+                   for value in terminal_prefixes)
+            or terminal_prefixes[-1] != requested.size):
+        raise ValueError(
+            f"W observer arm {name!r} terminal prefixes must be unique, "
+            f"ascending, positive, and end at {requested.size}; got "
+            f"{terminal_prefixes}")
     return {
         "name": name,
         "kind": kind,
         "code": int(code),
         "requested": requested,
         "evaluated": evaluated,
+        "terminal_prefixes": terminal_prefixes,
     }
 
 
@@ -193,7 +205,7 @@ def plan_w_observer(*, input_dir, real_arms, imag_grid, q_full,
         arms.append({
             "name": arm["name"], "kind": arm["kind"],
             "code": arm["code"], "start": start, "stop": stop,
-            "n": n,
+            "n": n, "terminal_prefixes": list(arm["terminal_prefixes"]),
         })
         start = stop
     z_requested = np.concatenate(requested)
@@ -203,7 +215,7 @@ def plan_w_observer(*, input_dir, real_arms, imag_grid, q_full,
 
     identity = {
         "schema": OBSERVER_SCHEMA,
-        "policy": "internal_ff_w_observer_v1",
+        "policy": "internal_ff_w_observer_v2",
         "body_provenance": body_provenance,
         "nmu_logical": nmu_logical,
         "q_full": _array_receipt(q_full),
@@ -535,10 +547,11 @@ class InternalFFWObserver:
         if body_complete:
             incomplete = {
                 arm["name"]: (self._state["ready_prefix_by_arm"][arm["name"]],
-                              arm["n"])
+                              arm["terminal_prefixes"])
                 for arm in self.spec.arms
                 if int(self._state["ready_prefix_by_arm"][arm["name"]])
-                != int(arm["n"])
+                not in tuple(int(value)
+                             for value in arm["terminal_prefixes"])
             }
             if incomplete:
                 raise ValueError(
@@ -573,16 +586,17 @@ class CompletedInternalFFWObserver:
     def require_checkpoint_prefix(self, arm: str, completed: int) -> None:
         plan = self.spec.arm(arm)
         completed = int(completed)
-        expected = int(plan["n"])
         ready = int(self._state["ready_prefix_by_arm"][arm])
-        if ready != expected:
+        terminals = tuple(int(value) for value in plan["terminal_prefixes"])
+        if ready not in terminals:
             raise ValueError(
                 f"completed W observer has nonterminal {arm} readiness "
-                f"{ready}/{expected}; start a new run variant")
-        if completed != expected:
+                f"{ready}; accepted prefixes are {terminals}; start a new "
+                "run variant")
+        if completed != ready:
             raise ValueError(
                 f"completed W observer is read-only but the matching CD "
-                f"checkpoint covers {completed}/{expected} frequencies for "
+                f"checkpoint covers {completed}/{ready} frequencies for "
                 f"{arm}; missing Sigma body work cannot be resumed without "
                 "a writable matching observer. Start a new run variant.")
 
@@ -651,11 +665,12 @@ def open_w_observer(spec, *, mesh_xy, v_wedge):
             incomplete = {
                 arm["name"]: (
                     int(state["ready_prefix_by_arm"][arm["name"]]),
-                    int(arm["n"]),
+                    list(arm["terminal_prefixes"]),
                 )
                 for arm in spec.arms
                 if int(state["ready_prefix_by_arm"][arm["name"]])
-                != int(arm["n"])
+                not in tuple(int(value)
+                             for value in arm["terminal_prefixes"])
             }
             if incomplete:
                 raise ValueError(
