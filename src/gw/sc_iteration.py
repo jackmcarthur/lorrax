@@ -4047,30 +4047,47 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
         # never cuts one in the input spectrum).
         slot, _, blocks0, _ = assign_qp_identity(
             u_in, e_input_ev, u_out, e_output_ev, mask, **kw)
-        labels = np.zeros(slot.shape, dtype=bool)
         found = slot >= 0
+        labels = np.zeros(slot.shape, dtype=bool)
         labels[np.nonzero(found)[0], slot[found]] = True
-        history.update(u=u_out.copy(), e=np.asarray(e_output_ev).copy(),
-                       mask=mask.copy(), labels=labels, slot=slot,
-                       blocks=blocks0, previous=None)
+        # The reference groups are the DFT (symmetry) multiplets, not the
+        # adjacent-gap groups of the map-0 output spectrum: a degenerate
+        # pair that the map splits by more than the exact tolerance would
+        # otherwise become two gauge-dependent singlets.  Members of one
+        # DFT multiplet therefore carry their block-mean output energy in
+        # the reference spectrum (Si replay6, 2026-09-05).
+        e_ref = np.array(e_output_ev, dtype=np.float64)
+        for k in range(slot.shape[0]):
+            for block in np.unique(blocks0[k][blocks0[k] >= 0]):
+                members = slot[k, blocks0[k] == block]
+                e_ref[k, members] = e_ref[k, members].mean()
+        history.update(u=u_out.copy(), e=e_ref, mask=mask.copy(),
+                       labels=labels, slot=slot, previous=None)
     if not np.array_equal(mask, history['mask']):
         raise ValueError('SC identity: trusted mask changed after map 0')
     slot = history['slot']
+    found = slot >= 0
     rows = np.arange(slot.shape[0])[:, None]
-    cols = np.where(slot >= 0, slot, 0)
+    cols = np.where(found, slot, 0)
+    dft_of_label = np.full(slot.shape, -1, dtype=int)
+    dft_of_label[np.nonzero(found)[0], slot[found]] = np.nonzero(found)[1]
 
     def by_dft_band(table, fill):
         # label-indexed (map-0 output column) -> DFT-band-indexed
-        return np.where(slot >= 0, np.asarray(table)[rows, cols], fill)
+        return np.where(found, np.asarray(table)[rows, cols], fill)
 
     args = (history['u'], history['e'], )
-    out_index, out_e, _, weight = assign_qp_identity(
+    out_index, out_e, block_label, weight = assign_qp_identity(
         *args, u_out, e_output_ev, history['labels'], **kw)
     in_index, in_e, _, _ = assign_qp_identity(
         *args, u_in, e_input_ev, history['labels'], **kw)
     out_index, in_index = by_dft_band(out_index, -1), by_dft_band(in_index, -1)
     out_e, in_e = by_dft_band(out_e, np.nan), by_dft_band(in_e, np.nan)
-    weight, blocks = by_dft_band(weight, np.nan), history['blocks']
+    weight = by_dft_band(weight, np.nan)
+    # block labels in DFT-band terms, from the same reference grouping that
+    # produced the block means (so the eqp comments and the body agree)
+    first_label = by_dft_band(block_label, 0)
+    blocks = np.where(found, dft_of_label[rows, first_label], -1)
     # Preserve the legacy all-band RMS as a sorted diagnostic. Only trusted
     # columns enter the criterion and receive the overlap/block-mean readout.
     aligned_in, aligned_out = np.array(e_input_ev), np.array(e_output_ev)

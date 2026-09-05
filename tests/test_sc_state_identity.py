@@ -175,3 +175,21 @@ def test_map0_dft_multiplet_cut_by_the_band_mask_still_refuses(monkeypatch):
         monkeypatch, e_out, np.eye(4)[None].astype(complex))
     with pytest.raises(ValueError, match='cuts a multiplet'):
         sc._sc_identity_for_call(inputs, state, e_dft, e_out, {}, cutoff_ev=.01)
+
+
+
+def test_reference_groups_are_the_dft_multiplets_even_when_the_map_splits_them(monkeypatch):
+    # DFT: bands 0,1 an exact doublet (trusted), 2,3 untrusted.  The map-0
+    # output splits the doublet by 3e-4 eV (> exact tolerance 1e-4): the
+    # readout still treats it as one block with the block-mean energy, and
+    # its block label is the DFT band 0 for both members.
+    e_dft = np.array([[1., 1., 3., 4.]])
+    e_out = np.array([[0.9998, 1.0001, 3., 4.]])
+    sc, inputs, state, _ = _identity_call_fixture(
+        monkeypatch, e_out, np.eye(4)[None].astype(complex))
+    history = {}
+    _, updated = sc._sc_identity_for_call(inputs, state, e_dft, e_out, history, cutoff_ev=.01)
+    ident = updated.outputs.identity
+    np.testing.assert_allclose(ident['output_ev'][0, :2], [0.99995, 0.99995])
+    np.testing.assert_array_equal(ident['blocks'][0], [0, 0, -1, -1])
+    np.testing.assert_allclose(history['e'][0, :2], [0.99995, 0.99995])
