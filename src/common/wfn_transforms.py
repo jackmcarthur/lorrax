@@ -2626,10 +2626,10 @@ def load_centroids_band_chunked(
     stage_Y_4d = NamedSharding(mesh_xy, P(None, 'y', None, None))
     stage_X_4d = NamedSharding(mesh_xy, P(None, 'x', None, None))
 
-    # Same divisor + test-only extra pad as Meta.n_rmu_padded — the ψ
-    # centroid extent loaded here must equal the meta extent the ζ-fit
-    # kernels were shaped with.
-    n_rmu_padded = padded_mu_extent(n_rmu, mesh_xy)
+    # A packed basis already owns its runtime extent. The extra-padding
+    # knob applies only to canonical staging, never a second time here.
+    n_rmu_padded = (mu_basis.n_packed if mu_basis is not None
+                    else padded_mu_extent(n_rmu, mesh_xy))
     loader = wfn  # reuse top-level WfnLoader
     # The shared GW memory plan already owns a positive Stage-A band chunk;
     # honor it here instead of bulk-loading the very tensor it prices.  Prune

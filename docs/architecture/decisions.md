@@ -582,16 +582,21 @@ kernel between the I/O seams converts between orders, and no second
 in-memory order exists: the parent-k Green contraction, the ζ-fit tiles, the
 τ chain, V, χ0, W and the static kernels all compute in it.  A conversion is
 legal only where bytes cross a file boundary (readers pack, writers unpack;
-`common/centroid_basis.py`), and it is an all-to-all round trip per axis,
-never an all-gather.  Files keep the canonical centroid-file order, suffix
-padded, so restart files and the MPA store are processor-grid agnostic and
-BSE, htransform and downfold read them unchanged.
+`common/centroid_basis.py`), using an all-to-all round trip per sharded axis.
+Files keep the canonical centroid-file order at logical extent, so restart
+files and the MPA store are processor-grid agnostic. Canonical suffix padding
+belongs only to I/O staging. The seam handles staging carriers both smaller
+and larger than the packed extent; BSE, htransform and downfold read the
+same logical files.
 
 Consequences the pads impose: dense μ solves run at the whole packed extent
-with 1 on the pad diagonal of C_q (`meta.mu_solve_extent`), and any
+with C_q's physical mean diagonal on its pad slots (`meta.mu_solve_extent`),
+and any
 "logical prefix" test on a μ axis is a defect; use `meta.mu_active_mask`.
 The test-only `LORRAX_EXTRA_MU_PAD` knob still sizes the canonical carrier
-(files) and no longer changes the in-memory extent.  Bispinor decks, trivial
+(I/O staging) and no longer changes the orbit-packed runtime extent.
+`PackedCentroidBasis.solve_axis` supplies the solve receipt; the loader and
+q-table construction consume that basis's extent without padding it again.  Bispinor decks, trivial
 groups and non-closed centroid sets take the identity layout, so their
 behaviour is the pre-2026-09-05 canonical one.
 

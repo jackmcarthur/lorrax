@@ -398,7 +398,8 @@ samples ψ at the packed centroid table and zeroes the pad slots; from
 there ψ faces, Z_q, C_q, ζ(μ,G), V, χ0, W, pole residues, G and Σ all
 inherit the order and no kernel converts.  Two things change because the
 pads are interleaved: dense factors/solves run at the whole packed extent
-with 1 on the pad diagonal of C_q (its pad rows/columns are exact zeros,
+with the physical mean diagonal on C_q's pad slots (its pad rows/columns
+are initially exact zeros,
 Z's pad rows are zero, so ζ's are; `meta.mu_solve_extent`), and the
 GN-PPM "pad modes born dead" selector is the active-slot mask
 (`meta.mu_active_mask`) rather than an index prefix.  The Dyson matrix
@@ -406,18 +407,21 @@ GN-PPM "pad modes born dead" selector is the active-slot mask
 or a non-closed centroid set uses the identity layout (canonical order,
 every conversion a no-op).
 
-Files keep the CANONICAL centroid-file order, suffix padded to the mesh
-multiple, so ζ h5, restart tensors and the MPA sample/pole store stay
-processor-grid agnostic and BSE/htransform/downfold read them unchanged.
+Files keep the CANONICAL centroid-file order at logical extent, so ζ h5,
+restart tensors and the MPA sample/pole store stay processor-grid agnostic.
+Canonical suffix padding is I/O staging only; its extent may be smaller or
+larger than the packed runtime extent. BSE/htransform/downfold read the
+logical files unchanged.
 Conversion happens ONLY at the I/O seam, through the basis: a writer
 unpacks (`unpack_axis`/`unpack_operator`: ζ(μ,G) before its slab write,
 V/W0/ψ faces before the restart writer, χ/W samples and GN-PPM poles
 before the store), a reader packs (`pack_axis`/`pack_operator`: V after
 its assembly from the ζ file, restart tensors and faces after the reader,
 pole batches after the store read, the head-channel columns).  Each
-conversion is one volume-preserving all-to-all round trip per axis with a
-rank-local prefix pad/crop inside the shard (never an all-gather; the
-extent change 836↔840 on Si is a per-shard slice).  In-memory q-wedge
+conversion is one all-to-all round trip per axis with a rank-local prefix
+pad/crop inside the shard (never an all-gather of the input carrier; the
+extent change 836↔840 on Si is a per-shard slice). Split-axis divisibility
+can require temporary local padding.  In-memory q-wedge
 unfold tables come from the canonical resolution conjugated into the packed
 order (`_resolve_ibz_q_list(mu_basis=)` → `basis.pack_tables`); the W0
 pre-unfold capture converts itself back (`PreUnfoldCapture.canonical`) so

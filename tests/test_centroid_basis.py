@@ -139,3 +139,48 @@ def test_identity_basis_is_a_no_op():
     open_set = PackedCentroidBasis.build(
         cents[:1], _sym_swap_xy(), (4, 4, 1), mesh)
     assert open_set.is_identity
+
+
+@pytest.mark.parametrize("extra", [0, 4, 8])
+def test_file_carrier_can_be_smaller_equal_or_larger_than_runtime(monkeypatch, extra):
+    """Physical operators and Dyson solves survive either I/O extent change."""
+    from gw.w_isdf import solve_w
+
+    mesh = _mesh_2x2()
+    monkeypatch.setenv("LORRAX_EXTRA_MU_PAD", str(extra))
+    cycle = np.asarray([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.int32)
+    sym = SimpleNamespace(
+        sym_matrices=np.stack([np.eye(3, dtype=np.int32), cycle, cycle @ cycle]),
+        translations=np.zeros((3, 3)))
+    cents = np.asarray([[1, 0, 0], [0, 1, 0], [0, 0, 1], [2, 2, 2]])
+    basis = PackedCentroidBasis.build(cents, sym, (4, 4, 4), mesh)
+    assert basis.n_packed == 8
+    assert basis.n_canonical == 4 + extra
+    assert basis.solve_axis.logical == basis.solve_axis.carrier == 8
+    # The object owns its table even if the caller reuses the input buffer.
+    cents[:] = 0
+    assert not basis.canonical_indices.flags.writeable
+    assert np.any(basis.canonical_indices)
+
+    canonical = np.zeros((4, basis.n_canonical, basis.n_canonical), complex)
+    canonical[:, np.arange(4), np.arange(4)] = 0.1
+    sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    packed = basis.pack_operator(jax.device_put(canonical, sharding))
+    np.testing.assert_array_equal(np.asarray(basis.unpack_operator(packed)), canonical)
+    assert np.count_nonzero(np.asarray(packed)[:, ~basis.active_mask, :]) == 0
+    assert np.count_nonzero(np.asarray(packed)[:, :, ~basis.active_mask]) == 0
+    meta = SimpleNamespace(nk_tot=4, nspin=1, nspinor_wfnfile=1,
+                           n_rmu=4, mu_basis=basis,
+                           mu_solve_extent=basis.solve_axis.logical)
+    W = solve_w(packed, 2 * packed, meta, mesh, dyson_solver="local")
+    # W = V/(1 - pref V chi), pref = 2/sqrt(nq) = 1 for four q rows.
+    expected = canonical / (1 - 0.1 * 0.2)
+    np.testing.assert_allclose(np.asarray(basis.unpack_operator(W)), expected,
+                               rtol=1e-13, atol=1e-15)
+    hlo = jax.jit(lambda x: basis.pack_operator(x, spec=sharding.spec)).lower(
+        jax.device_put(canonical, sharding)).compile().as_text().lower()
+    assert 'all-gather(' not in hlo
+
+    flat = jax.device_put(canonical, NamedSharding(mesh, P(None, ('x', 'y'), None)))
+    np.testing.assert_array_equal(np.asarray(basis.unpack_axis(
+        basis.pack_axis(flat, 1), 1)), canonical)
