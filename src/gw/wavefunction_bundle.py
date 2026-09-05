@@ -1744,6 +1744,13 @@ def _rotate_wavefunctions_face(
             rotate = _face_rotate_kernel(
                 mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
             psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
+            if wfns_dft.green_parent is not None:
+                # A carrier beside full-k faces (the self-consistent map
+                # keeps both) rotates with them, so every iteration's
+                # screening and Sigma take the same route as iteration 0.
+                carrier_rotated = _rotate_parent_carrier(
+                    wfns_dft.green_parent, U, a_lo=a_lo, nb_active=nb_active,
+                    nb_full=nb_full, ns=ns, mesh_xy=mesh_xy)
         else:
             # Parents-only storage: the carrier is the run's only ψ.  Rotate
             # its faces with U on the parents' OWN full-k rows -- the

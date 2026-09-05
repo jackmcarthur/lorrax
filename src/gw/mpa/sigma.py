@@ -294,6 +294,9 @@ def _integrate_sigma_batches(
         # runtime-owned carrier, and the accumulator is born at that carrier
         # width.  It stays there until a logical output consumer strips by
         # ``sigma_axis``; no nondivisible sharded array is ever published.
+        # The projection operands default to the full-k faces; the parent
+        # route below replaces both roles with the parent faces.
+        psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
         if k_unfold_plan is not None:
             # Raw parents only: the parent faces feed the G contraction (the
             # plan transports G to full k) and the projection (the spatial

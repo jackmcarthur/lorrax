@@ -295,6 +295,13 @@ def _to_store_order(value, meta):
     return value if basis is None else basis.unpack_operator(value)
 
 
+def _to_run_order(value, meta):
+    """A slab read back from the store, packed into the run's order before it
+    meets V, the Dyson solve or the head channel."""
+    basis = getattr(meta, 'mu_basis', None)
+    return value if basis is None else basis.pack_operator(value)
+
+
 def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
     value = _to_store_order(_to_wedge(value, q_idx, mesh_xy), meta)
     value.block_until_ready()
@@ -466,6 +473,7 @@ def _solve_wc(
         if not wc_ready[index] or bgw_q0 is not None:
             chi, _ = mpa_store.read_w_slab_collective(
                 sample_path, _CHI, index, mesh_xy=mesh_xy)
+            chi = _to_run_order(chi, meta)
         chi_q0 = None
         if bgw_q0 is not None:
             # ``solve_w`` donates the full chi buffer.  Retain only one
@@ -477,7 +485,7 @@ def _solve_wc(
             if need_live_w:
                 Wc, _ = mpa_store.read_w_slab_collective(
                     sample_path, _WC, index, mesh_xy=mesh_xy)
-                W = Wc + V
+                W = _to_run_order(Wc, meta) + V
                 W.block_until_ready()
             else:
                 Wc = W = None
@@ -537,6 +545,7 @@ def _solve_wc(
 
             chi_reflected, _ = mpa_store.read_w_slab_collective(
                 sample_path, reflected_chi_name, index, mesh_xy=mesh_xy)
+            chi_reflected = _to_run_order(chi_reflected, meta)
             W_reflected = solve_w(
                 V, chi_reflected, meta, mesh_xy,
                 dyson_solver=dyson_solver,

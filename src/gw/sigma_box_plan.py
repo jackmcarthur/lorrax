@@ -239,8 +239,15 @@ def make_sigma_box_spec(
 
 def _rule_cache_lookup(
     directory, box, eps, relative, *, noise_amplification_cap,
+    reduction_steps=None,
 ):
-    """Return the smallest compatible rule plus any unreadable-path warnings."""
+    """Return the smallest compatible rule plus any unreadable-path warnings.
+
+    ``reduction_steps`` is part of the rule's identity: a certificate reduced
+    under a deterministic step budget and one reduced under the wall clock
+    are different rules for the same box, and a deck that names a step
+    budget must never be served a clock-reduced entry (or vice versa).
+    """
     if directory is None:
         return None, ()
     warnings = []
@@ -261,6 +268,11 @@ def _rule_cache_lookup(
             with np.load(path) as data:
                 if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
                         or bool(data["relative"]) != relative):
+                    continue
+                cached_steps = (int(data["reduction_steps"])
+                                if "reduction_steps" in data else -1)
+                if cached_steps != (-1 if reduction_steps is None
+                                    else int(reduction_steps)):
                     continue
                 # Cache entries pre-dating the executor-noise stamp, or
                 # entries built for a looser consumer, are not compatible.
@@ -294,13 +306,15 @@ def _rule_cache_lookup(
     return best, tuple(warnings)
 
 
-def _rule_cache_store(directory, rule, noise_amplification):
+def _rule_cache_store(directory, rule, noise_amplification,
+                      reduction_steps=None):
     """Atomically store one immutable box certificate, or return a warning."""
     if directory is None:
         return None
+    steps = -1 if reduction_steps is None else int(reduction_steps)
     identity = hashlib.sha256(json.dumps(
         ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
-         bool(rule.relative)]
+         bool(rule.relative), steps]
     ).encode())
     identity.update(np.ascontiguousarray(rule.times).view(np.uint8).tobytes())
     identity.update(np.ascontiguousarray(rule.weights).view(np.uint8).tobytes())
@@ -323,7 +337,7 @@ def _rule_cache_store(directory, rule, noise_amplification):
                 kappa_max=float(rule.kappa_max),
                 roundoff_amplification=float(noise_amplification),
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
-                seconds=float(rule.seconds))
+                seconds=float(rule.seconds), reduction_steps=int(steps))
         os.replace(temporary, path)
     except OSError as exc:
         if temporary is not None:
@@ -390,7 +404,8 @@ def _fit_rule(
     noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
     cached, cache_lookup_warnings = _rule_cache_lookup(
         cache_dir, requested_box, eps, relative,
-        noise_amplification_cap=noise_amplification_cap)
+        noise_amplification_cap=noise_amplification_cap,
+        reduction_steps=reduction_steps)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
@@ -463,7 +478,8 @@ def _fit_rule(
         # cancellation cap but misses Sigma's eps-scaled noise cap must not
         # poison every subsequent attempt for this box.
         cache_write_warning = _rule_cache_store(
-            cache_dir, rule, noise_amplification)
+            cache_dir, rule, noise_amplification,
+            reduction_steps=reduction_steps)
     node_digest = hashlib.sha256(
         np.ascontiguousarray(times).view(np.uint8).tobytes()
         + np.ascontiguousarray(weights).view(np.uint8).tobytes()

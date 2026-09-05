@@ -3278,7 +3278,9 @@ def _prepare_parent_wavefunction_plan(
 				nspinor=int(meta.nspinor),
 				parent_k_frac=wfn.kvecs(k='ibz'),
 				layout=meta.mu_basis.layout)
-		except ValueError as plan_error:
+		except (ValueError, RuntimeError) as plan_error:
+			# The symmetry service raises RuntimeError on a set that is not
+			# orbit-closed; both refusals mean the same thing here: full k.
 			print_fn(
 				"  Parent-k contraction inactive (Green and ζ fit): "
 				"the centroid basis cannot form an exact orbit-local "
