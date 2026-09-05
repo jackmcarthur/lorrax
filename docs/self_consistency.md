@@ -202,7 +202,7 @@ coefficients refit each map, so including them would re-count in-range drift.
 `max|dE|` in the log is over that set; a "converged" loop says nothing about
 the tail's own Σ.
 
-**11. Metals and spin-orbit systems are untested in the loop.** MPA on
+**11. Spin-orbit systems are untested in the loop; metals are covered by pitfalls 16-19.** MPA on
 metals (`mpa_material_class = metal`) has wider pole widths and partial
 occupations; the non-identifiability of pitfall 2 is worse when the fit family
 is richer. Bi (bispinor) and Na are the pending cases.
@@ -288,6 +288,34 @@ justifies. The reviewers' remaining candidates for a metal residual after
 these closures, the per-map MPA pole refit and the sorted-index state
 identity, are registered in the sandbox issues ledger.
 
+**19. On metals the self-consistent set should stop where the quasiparticle
+stops being well defined; convergence time is set by the largest Z in the
+set.** Na eta=0.5 (86 bands, 8x8x8, 896 centroids), three trusted sets run
+to convergence side by side: band 5 alone (window top +11 eV), bands 5-10
+(+21 eV) and bands 5-13 (+24 eV). Per accepted map, the unmixed output
+motion of every band with map-0 quasiparticle weight Z in (0.55, 0.8)
+(bands 5-8, Z from the eqp1 diagnostic `(eqp1 - E_DFT)/(eqp0 - E_DFT)`)
+halves; bands 9-13, whose Z is 0.97-1.74 (more than a plasmon energy above
+mu, where Re Sigma(omega) is flat or rising on shell), walk monotonically at
+map gain about 1 and reach their fixed point 1.3-2 eV above G0W0 only after
+12-14 accepted maps. The Fermi band's shape is a window-independent
+observable: its k-resolved energies agree to under 10 meV across the three
+sets (bandwidth 6.831 / 6.827 / 6.837 eV against 6.581 DFT-seeded), while
+its absolute position moves 41 meV when bands 11-13 join the set (bands
+5 alone and 5-10 agree to 2.5 meV). Bands 5-10 converge to about 1 meV per
+map by accepted map 22 and reach a 2 meV rCROP residual at map 28; 5-13 is
+still at 5-9 meV per map on bands 12-13 at map 26. Production on Na:
+`sigma_omega_max_ev = 21` (trusted 5-10), report the Fermi window, and do
+not stop on the rCROP L-infinity residual while Z >= 1 states walk. A
+partition by quasiparticle well-definedness (Z below about 0.9 at every k
+at map 0) instead of by energy window is registered; in Na the multiplet
+chain links bands 5-10, so it needs per-k masks. The single measurement that
+decides the next structural change is a small-kick response at a retained
+input: chi0, the body W and the final trusted-block H scale linearly
+(ratio 10.1-10.6 for a 10x kick) while the fitted scalar head does not
+(48.6, pole count changes), which names the head MPA refit as the first
+non-smooth stage of the map.
+
 ## Evidence
 
 Sandbox reports (paths under
@@ -300,11 +328,18 @@ structures), `sc_fixed_rules_eqp1_2026-09-03` (claim 662, frozen rules),
 `qsgw_two_level_2026-09-03` (the frozen-W inner loop, branch only).
 
 **18. QP identities, not sorted eigenvalue ordinals, define SC motion.**
-The first map output supplies a fixed QP reference. Later input and output
-eigenvectors are assigned to those reference multiplets by maximum projector
-overlap, using all active candidate columns so crossings with scissored
-levels cannot relabel the target. Exact multiplets use the configured SC
-exact-degeneracy tolerance and their mean energy. `SC identity` prints this
+The first map output supplies a fixed QP reference whose labels are the
+trusted DFT bands: at map 0 each trusted DFT band (whole DFT multiplets) is
+assigned by overlap to the output column that carries it, and later input
+and output eigenvectors are assigned to those reference multiplets by
+maximum projector overlap, using all active candidate columns so crossings
+with scissored levels cannot relabel the target. Sorted position is not a
+label: on Na with the window top at +15 eV the scissored Gamma triplet 11-13
+sits below the protected doublet at sorted 9-11 in the map-0 output, and a
+sorted-band mask cut that multiplet and refused. The reference groups are
+the DFT multiplets (a doublet the map splits by more than the exact
+tolerance stays one block with its mean energy), so the `SC_identity`
+comments and the eqp body agree. `SC identity` prints this
 input-to-output L-infinity criterion beside the sorted-index value. The
 `SC_identity` eqp comments give map-0 labels, sorted input/output columns,
 block means and adjacent-output motion on the file's k-block index (the
