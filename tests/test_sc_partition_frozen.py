@@ -58,4 +58,5 @@ def test_promoted_protected_bands_outside_the_grid_are_not_escapes():
         _partition(3, 0, 2, protected_hi=3), e, band_offset=0,
         omega_min_abs_ev=-15.0, omega_max_abs_ev=24.0, tolerance_ev=0.136,
         omega_step_ev=0.25, iteration=1, print_fn=lambda _s: None)
-    assert margin == pytest.approx(23.0)
+    # the in-range pair's smallest margin is to the bottom edge: -3 - (-15)
+    assert margin == pytest.approx(12.0)
