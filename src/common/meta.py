@@ -3,7 +3,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from runtime.padding import round_up as _round_up
+from runtime.padding import padded_axis
 
 
 @dataclass
@@ -14,7 +14,7 @@ class Meta:
     b_id_1: int
     b_id_2: int
     b_id_3: int
-    b_id_4: int               # padded upper bound: divisible by world; used everywhere shapes matter
+    b_id_4: int               # padded upper bound for the persistent WFN face layouts
     fft_grid: tuple
     cell_volume: float
     n_rtot: int
@@ -123,6 +123,7 @@ class Meta:
         bispinor: bool = False,
         nband_chi: int | None = None,
         nband_sigma: int | None = None,
+        mesh_xy=None,
     ):
         rank = jax.process_index()
         rank_topo = np.where(np.asarray(jax.devices()) == rank)
@@ -147,9 +148,10 @@ class Meta:
         # consume occupation weights rather than integer band manifolds.
         b_id_2 = int(wfn.nelec)
         b_id_3 = int(wfn.nelec + ncond)
-        # b_id_4 is the padded upper bound: rounded up so the band axis
-        # divides the device mesh.  Sharded readers + Cholesky tiles +
-        # FFT helpers all assume b_id_4 - b_id_0 % world_size == 0.
+        # b_id_4 is the padded upper bound for the two persistent face-WFN
+        # layouts.  Their band axes are sharded over x and y separately, so
+        # the canonical divisor is lcm(px, py), NOT the device product.  The
+        # transient G-sphere loader uses independently product-padded chunks.
         # Output writers slice back to b_id_4_user (the user's nband).
         # ψ(G) for bands in [b_id_4_user, b_id_4) is forced to zero in
         # load_centroids_band_chunked; energies use a finite sentinel; pair
@@ -170,7 +172,19 @@ class Meta:
                 f"gw_config.resolve_band_counts; do not re-derive it here.")
         b_id_4_user = int(nband)
         world_size = int(jax.device_count())
-        b_id_4 = _round_up(b_id_4_user, world_size)
+        if mesh_xy is None:
+            # Compatibility for standalone P=1 constructors and old library
+            # callers. Production drivers pass their live mesh so the owner
+            # derives the divisor from the actual face specs below.
+            band_divisor_or_mesh = world_size
+            band_specs = None
+        else:
+            from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
+            band_divisor_or_mesh = mesh_xy
+            band_specs = ((PSI_NMU_SPEC, 1), (PSI_MUN_SPEC, 3))
+        b_id_4 = padded_axis(
+            b_id_4_user, band_divisor_or_mesh,
+            name="full loaded-band carrier", specs=band_specs).carrier
         # The LARGER count takes the padded edge (so the default path is
         # byte-for-byte what it was); the smaller takes its literal value.
         b_id_4_chi = b_id_4 if nband_chi >= nband_sigma else nband_chi

@@ -1058,7 +1058,7 @@ def load_bse_data_from_restart_sharded(
             mesh_xy, origin="bse_loading.load_bse_data_from_restart_sharded")
         # Disk stores the LOGICAL μ extent; re-pad to the ONE in-memory
         # convention (mesh-product round-up, runtime.padding).
-        n_rmu_pad = padded_mu_extent(n_rmu, grid_x * grid_y)
+        n_rmu_pad = padded_mu_extent(n_rmu, mesh_xy)
         mu_per_x = n_rmu_pad // grid_x
         nu_per_y = n_rmu_pad // grid_y
 
@@ -1245,17 +1245,11 @@ def load_bse_data_from_restart_sharded(
 
 
 def _find_restart_file(input_file: str) -> str:
-    """Locate ``isdf_tensors_<n_rmu>.h5`` — loudly when the choice is ambiguous.
+    """Locate the unique canonical ISDF restart beside the input deck.
 
-    ``isdf_tensors_*.h5`` is namespaced by centroid count, so a run
-    directory used for a μ-sweep holds several, and lexicographic order is
-    meaningless across them (``isdf_tensors_1194.h5`` sorts before
-    ``isdf_tensors_276.h5``).  Picking the wrong one is SILENT: the BSE
-    kernel is built from a different ISDF basis than Σ was, every stage
-    reports success, and the exciton spectrum is quietly wrong.  So the
-    NEWEST wins and the ambiguity is named in the log.
-    ``gw.downfold_run.resolve_restart_file`` refuses the same ambiguity
-    instead, deliberately — see its docstring for why the two differ.
+    Centroid counts name different ISDF bases. Neither filename ordering nor
+    modification time identifies the basis used for the run's Σ/eqp inputs;
+    choosing one can silently change the exciton spectrum.
     """
     input_dir = os.path.dirname(os.path.abspath(input_file))
     candidates = []
@@ -1265,19 +1259,16 @@ def _find_restart_file(input_file: str) -> str:
     if not candidates:
         raise FileNotFoundError(f"Could not find canonical restart file isdf_tensors_*.h5 in {input_dir}")
     if len(candidates) > 1:
-        chosen = max(candidates, key=os.path.getmtime)
-        others = ", ".join(os.path.basename(p) for p in candidates
-                           if p != chosen)
-        print(
-            f"  *** LORRAX SANITY: {len(candidates)} restart tensor files "
-            f"match isdf_tensors_*.h5 in {input_dir} — they hold DIFFERENT "
-            f"ISDF bases (different centroid counts).  Using the newest, "
-            f"{os.path.basename(chosen)}; ignoring: {others}.  If that is "
-            f"not the basis this BSE's eqp/Σ inputs were built with, the "
-            f"exciton spectrum will be wrong with no other symptom — pass "
-            f"the file explicitly or clean the run directory. ***",
-            flush=True)
-        return chosen
+        raise ValueError(
+            f"GATE bse_restart_ambiguous: input_file={input_file!r}; "
+            f"got: {len(candidates)} canonical restart bundles: "
+            f"{sorted(candidates)}. "
+            f"want: exactly one canonical bundle in the run directory "
+            f"(including tmp/). why: these bundles can hold different ISDF "
+            f"bases; choosing by mtime can silently change the exciton spectrum. "
+            f"fix: leave exactly one canonical bundle in {input_dir}, matching "
+            f"this run's Σ/eqp inputs; move the other isdf_tensors_*.h5 "
+            f"bundles out of the run directory and its tmp/ subdirectory.")
     return candidates[0]
 
 
@@ -1384,7 +1375,8 @@ def _load_ring_subset(
     W0_qmunu = W0_qmunu_flat
     nk = nkx * nky * nkz
     # Same μ re-pad convention as the sharded loader above.
-    n_rmu_pad = padded_mu_extent(n_rmu, px * py)
+    from runtime.padding import product_divisor
+    n_rmu_pad = padded_mu_extent(n_rmu, product_divisor(px, py))
 
     n_bands_total = nb_total
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)

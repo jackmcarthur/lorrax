@@ -95,7 +95,7 @@ def _packed_index(layout, mesh, channel, logical):
 
     vectors = []
     for row in range(4):
-        vector = np.zeros((1, layout.padded_extent(row)), dtype=np.complex128)
+        vector = np.zeros((1, layout.carrier_extent(row)), dtype=np.complex128)
         if row == channel:
             vector[0, logical] = 1.0
         vectors.append(_put(vector, mesh, (None, "x")))
@@ -122,7 +122,7 @@ def _response(mesh, layout, sigma_h, *, wfn, wfn_binding, meta):
     from common.parallel_transport import fingerprint_from_binding
     from gw.static_gauge_response import build_static_photon_head_response
 
-    charge_extent = layout.padded_extent(0)
+    charge_extent = layout.carrier_extent(0)
     Y = np.zeros((1, 3, charge_extent), np.complex128)
     for a in range(2):
         Y[0, a, 0] = (0.11 + 0.03j) * (a + 1)
@@ -372,7 +372,7 @@ def _run_gate(mesh, wfn, output_dir):
         for row in range(4):
             value = 1.0 + 0.07j * (row + 1)
             vector = np.zeros(
-                (1, layout.padded_extent(row)), dtype=np.complex128)
+                (1, layout.carrier_extent(row)), dtype=np.complex128)
             vector[0, 0] = value
             vectors.append(jax.device_put(vector, sharding))
         return pack_photon_channel_vectors(
@@ -384,7 +384,7 @@ def _run_gate(mesh, wfn, output_dir):
     g0_y = packed_vertex("y")
 
     rng = np.random.default_rng(2026082607)
-    nk, nb, ns, mu = nq, 4, 4, layout.padded_extent(0)
+    nk, nb, ns, mu = nq, 4, 4, layout.carrier_extent(0)
     psi_c = (rng.standard_normal((nk, nb, ns, mu))
              + 1j * rng.standard_normal((nk, nb, ns, mu)))
     psi_t = (rng.standard_normal((nk, nb, ns, mu))

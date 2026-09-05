@@ -39,7 +39,6 @@ compares body-to-body.
 """
 from __future__ import annotations
 
-import math
 import time
 import numpy as np
 import h5py
@@ -859,12 +858,11 @@ def build_probe_rhs(G_zeta, data, gen, sh):
 
     Returns ``rhs`` on ``sh.X_full`` = ``(2, n_probe, c_X, v_Y, k)``.
     """
-    px, py = sh.X.mesh.devices.shape
     n_probe = int(G_zeta.shape[0])
-    if n_probe % py != 0:
-        raise ValueError(
-            f"probe block n_probe={n_probe} must be a multiple of py={py} "
-            "(reduce-scatter tiles nu over y); pad the probe block with zero rows.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        n_probe, n_probe, sh.X.mesh, name="BSE probe carrier",
+        spec=P("y", None), axis=0)
     n_rmu = int(data["V_q0"].shape[0])
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
     # Process-local (scorecard AA.1): the probe block is identical on every
@@ -1049,10 +1047,12 @@ def _resolve_wc_columns(cols, z, data, matvec, diag_h, gen, snapshot, sh,
     gains the per-column GMRES iteration count — see
     :func:`apply_screening_resolvent_block` for why that is opt-in.
     """
-    px, py = sh.X.mesh.devices.shape
     n_rmu = int(data["V_q0"].shape[0])
     cols = np.asarray(cols, dtype=int)
-    n_pad = int(math.ceil(len(cols) / py) * py)
+    from runtime.padding import padded_axis
+    n_pad = padded_axis(
+        len(cols), sh.X.mesh, name="BSE exact-W probe carrier",
+        spec=P("y", None), axis=0).carrier
     G = np.zeros((n_pad, n_rmu), dtype=np.float64)
     for i, nu0 in enumerate(cols):
         G[i, int(nu0)] = 1.0
@@ -1356,7 +1356,10 @@ def main(argv=None) -> None:
             # Unit-column probe block for the selected columns, zero-padded up to
             # a multiple of py — the same block _resolve_wc_columns builds.
             cols = np.asarray(st["cols"], dtype=int)
-            n_pad_probe = int(math.ceil(len(cols) / py_) * py_)
+            from runtime.padding import padded_axis
+            n_pad_probe = padded_axis(
+                len(cols), mesh_xy, name="BSE exact-W comparison carrier",
+                spec=P("y", None), axis=0).carrier
             G = np.zeros((n_pad_probe, n_rmu), dtype=np.float64)
             for i, nu0 in enumerate(cols):
                 G[i, int(nu0)] = 1.0
@@ -1383,7 +1386,6 @@ def main(argv=None) -> None:
             rel_by_q.append(rels.max())
             st["t0"] = time.perf_counter()
 
-        py_ = int(mesh_xy.devices.shape[1])
         with timing.section("w_exact.resolve_q"):
             sweep_q_wedge(
                 data, mesh_xy, q_list, [z], include_w=False,

@@ -393,7 +393,7 @@ def _main():
         try:
             fn()
         except Exception as exc:            # noqa: BLE001 — this IS the tally
-            msg = (str(exc).splitlines() or [""])[0]
+            msg = str(exc)
             failures.append("FAIL %s — %s: %s"
                             % (name, type(exc).__name__, msg))
             print(failures[-1])
@@ -405,9 +405,6 @@ def _main():
         print(line)
     return 1 if failures else 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(_main())
 
 
 # ===========================================================================
@@ -463,3 +460,61 @@ def test_a_service_env_read_is_actually_visible_to_the_registry():
     assert not [n for n in src_only if n.startswith("LORRAX_TRS")], (
         f"{trs} is now read from src/ as well, so it no longer demonstrates "
         f"the services-only hole; pin a var that only a service reads")
+
+
+def test_module_constant_read_must_have_a_registry_row():
+    """A constant spelling must not conceal an unregistered source read."""
+    import collections
+    hits = collections.defaultdict(list)
+    src = ('import os\n'
+           '_ENV = "LORRAX_UNREGISTERED_CONSTANT"\n'
+           'def read():\n'
+           '    return os.environ.get(_ENV, "")\n')
+    env_audit.EnvReadVisitor("constant_fixture.py", hits).visit(ast.parse(src))
+    name = "LORRAX_UNREGISTERED_CONSTANT"
+    assert hits[name] == [("constant_fixture.py", 4, "''")], dict(hits)
+    exact, globs = registry_vocabulary(_registry_text())
+    assert not covered(name, exact, globs), "unregistered constant falsely covered"
+
+
+def test_module_constants_work_for_every_read_shape():
+    """Raw, helper, keyword, subscription and membership share resolution."""
+    import collections
+    hits = collections.defaultdict(list)
+    src = ('import os\n'
+           '_A = _B = "LORRAX_CONSTANT"\n'
+           '_C: str = "LORRAX_ANNOTATED"\n'
+           'os.environ.get(_A, "")\n'
+           'os.getenv(_B)\n'
+           'os.environ.setdefault(_A, "x")\n'
+           'os.environ[_A]\n'
+           '_A in os.environ\n'
+           'env_bool(_A, False)\n'
+           'Gate(env=_C)\n'
+           'def local():\n'
+           '    _LOCAL = "LORRAX_LOCAL_ONLY"\n'
+           '    return os.getenv(_LOCAL)\n')
+    env_audit.EnvReadVisitor("fixture.py", hits).visit(ast.parse(src))
+    assert set(hits) == {"LORRAX_CONSTANT", "LORRAX_ANNOTATED"}, dict(hits)
+    assert len(hits["LORRAX_CONSTANT"]) == 6
+    assert hits["LORRAX_ANNOTATED"] == [("fixture.py", 10, "Gate(env=...)")]
+
+
+def test_deleting_tf32_row_exposes_the_source_read():
+    """The real precision escape is visible, and its one row is necessary."""
+    name = "LORRAX_MIXEDPREC_ALLOW_TF32"
+    sites = python_read_sites()
+    assert name in sites, "the module-constant TF32 read is invisible"
+    assert any(f.endswith("bse/w_ladder_mixedprec.py") for f, _, _ in sites[name])
+    text = _registry_text()
+    exact, globs = registry_vocabulary(text)
+    assert covered(name, exact, globs)
+    rows = [line for line in text.splitlines() if name in line]
+    assert len(rows) == 1 and rows[0].startswith("|"), rows
+    without = "\n".join(line for line in text.splitlines() if name not in line)
+    exact, globs = registry_vocabulary(without)
+    assert not covered(name, exact, globs), "deleting TF32 row did not break coverage"
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

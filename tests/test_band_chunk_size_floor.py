@@ -56,6 +56,32 @@ def _cpu_mesh(p_x: int, p_y: int) -> Mesh:
     return Mesh(devs, axis_names=('x', 'y'))
 
 
+def test_internal_hint_is_mesh_rounded_and_window_capped():
+    mesh = _cpu_mesh(2, 2)
+    plan = plan_gflat_chunks(
+        meta=_fake_meta(), mesh_xy=mesh,
+        nb_total=120, fit_nb_total=14,
+        ngkmax=5000, n_q_disk=36,
+        budget_gb=28.0,
+        band_chunk_override=16,
+        r_chunk_override=4096,
+    )
+    # _bump_bc(16), capped at ceil(14/P)*P = 16.
+    assert plan.band_chunk == 16
+
+
+def test_internal_hint_caps_below_sixteen_on_p1():
+    plan = plan_gflat_chunks(
+        meta=_fake_meta(), mesh_xy=_cpu_mesh(1, 1),
+        nb_total=12, fit_nb_total=12,
+        ngkmax=5000, n_q_disk=36,
+        budget_gb=28.0,
+        band_chunk_override=16,
+        r_chunk_override=4096,
+    )
+    assert plan.band_chunk == 12
+
+
 # ---------------------------------------------------------------------------
 # Core regression: the CrI3 planner case (override=2, world_size=16)
 # ---------------------------------------------------------------------------
@@ -276,8 +302,8 @@ def test_a_non_divisible_band_chunk_is_refused():
     with pytest.raises(ValueError) as exc:
         assert_band_chunks_divisible(ranges, 4)
     text = str(exc.value)
-    assert "[48, 50)" in text and "drops 2" in text
-    assert "band_chunk_size" in text
+    assert "[48, 50)" in text
+    assert "carrier extent is 2, expected 4" in text
 
 
 def test_a_divisible_split_is_accepted():

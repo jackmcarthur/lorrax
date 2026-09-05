@@ -32,6 +32,7 @@ from common.gauss_legendre import (
     GAUSS_LEGENDRE_INTERVAL_PROVENANCE,
     gauss_legendre_interval,
 )
+from runtime.padding import padded_axis
 
 
 # Canonical Pauli matrices (the same tables ``common.gamma_matrices`` owns),
@@ -1714,8 +1715,10 @@ def _apply_vnl_derivatives_between_g_carriers(
     nband, nG_source = int(psi.shape[0]), int(psi.shape[-1])
     nG_target = int(G_target.shape[0])
     gstep = int(g_chunk)
-    source_carrier = ((nG_source + gstep - 1) // gstep) * gstep
-    target_carrier = ((nG_target + gstep - 1) // gstep) * gstep
+    source_carrier = padded_axis(
+        nG_source, gstep, name="source nonlocal-projector G chunk").carrier
+    target_carrier = padded_axis(
+        nG_target, gstep, name="target nonlocal-projector G chunk").carrier
     source_pad = source_carrier - nG_source
     target_pad = target_carrier - nG_target
     psi_pad = jnp.pad(psi, ((0, 0), (0, 0), (0, source_pad)))

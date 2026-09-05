@@ -193,6 +193,104 @@ def test_pad_axis_fill_is_keyword_only_and_signed():
     assert same.logical == 3 and same.padded == 3 and same.array is x
 
 
+def test_padded_axis_tag_owns_extent_mask_pad_strip_and_authentication():
+    from runtime.padding import (
+        PaddedAxis, authenticate_axis, axis_mask, pad_to_axis, padded_axis,
+        strip_axis)
+
+    tag = padded_axis(86, 4, name="Sigma band window")
+    assert tag == PaddedAxis(
+        name="Sigma band window", logical=86, carrier=88, divisor=4)
+    assert np.array_equal(np.asarray(axis_mask(tag)), np.arange(88) < 86)
+
+    logical = jnp.arange(2 * 86, dtype=jnp.float64).reshape(2, 86)
+    carrier = pad_to_axis(logical, tag, axis=1)
+    authenticate_axis(carrier, tag, axis=1, where="test producer")
+    assert carrier.shape == (2, 88)
+    assert np.array_equal(np.asarray(carrier[:, :86]), np.asarray(logical))
+    assert np.array_equal(np.asarray(carrier[:, 86:]), np.zeros((2, 2)))
+    assert np.array_equal(np.asarray(strip_axis(carrier, tag, axis=1)),
+                          np.asarray(logical))
+
+    # A producer may begin from a wider reusable carrier.  The owner trims the
+    # logical prefix and publishes the canonical carrier.
+    wider = jnp.pad(logical, ((0, 0), (0, 10)), constant_values=7)
+    normalized = pad_to_axis(wider, tag, axis=1)
+    assert np.array_equal(np.asarray(normalized), np.asarray(carrier))
+
+
+def test_padded_axis_spec_derives_product_divisor_inside_owner():
+    from runtime.padding import padded_axis
+
+    class MeshShape:
+        shape = {"x": 4, "y": 4}
+        axis_names = ("x", "y")
+
+    tag = padded_axis(
+        18, MeshShape(), name="flat band carrier",
+        spec=(None, ("x", "y"), None), axis=1)
+    assert (tag.logical, tag.carrier, tag.divisor) == (18, 32, 16)
+
+    shared = padded_axis(
+        86, MeshShape(), name="Sigma square band carrier",
+        specs=(
+            ((None, None, "x", None), 2),
+            ((None, None, None, "y"), 3),
+        ))
+    assert (shared.logical, shared.carrier, shared.divisor) == (86, 88, 4)
+
+
+def test_authenticate_padded_axis_recomputes_the_canonical_receipt():
+    from runtime.padding import authenticate_padded_axis
+
+    class MeshShape:
+        shape = {"x": 4, "y": 4}
+        axis_names = ("x", "y")
+
+    specs = (((None, "x"), 1), ((None, None, "y"), 2))
+    tag = authenticate_padded_axis(
+        86, 88, MeshShape(), name="Sigma band window", specs=specs)
+    assert (tag.logical, tag.carrier, tag.divisor) == (86, 88, 4)
+    with pytest.raises(ValueError, match="carrier extent is 86, expected 88"):
+        authenticate_padded_axis(
+            86, 86, MeshShape(), name="Sigma band window", specs=specs)
+
+
+def test_authenticate_padded_axis_preserves_a_producer_extra_pad_receipt():
+    """A requested invariance pad is canonical because its receipt says so."""
+    from runtime.padding import authenticate_padded_axis, padded_axis
+
+    producer = padded_axis(
+        399, 1, name="centroid mu", extra=12)
+    got = authenticate_padded_axis(
+        399, 411, producer, name="Dyson row-centroid carrier")
+    assert (got.logical, got.carrier, got.divisor) == (399, 411, 1)
+    with pytest.raises(ValueError, match="carrier extent is 399, expected 411"):
+        authenticate_padded_axis(
+            399, 399, producer, name="Dyson row-centroid carrier")
+
+
+def test_pad_square_can_identity_embed_a_rotation():
+    from runtime.padding import pad_square, padded_axis
+
+    tag = padded_axis(3, 2, name="rotation bands")
+    U = jnp.eye(3, dtype=jnp.complex128)[None]
+    got = np.asarray(pad_square(U, tag, pad_diagonal=1.0))
+    assert np.array_equal(got, np.eye(4, dtype=np.complex128)[None])
+
+
+def test_padded_axis_refusal_names_logical_and_carrier_extents():
+    from runtime.padding import PaddedAxis, pad_to_axis
+
+    with pytest.raises(ValueError, match="logical extent 5 exceeds carrier extent 4"):
+        PaddedAxis(name="q batch", logical=5, carrier=4, divisor=4)
+    tag = PaddedAxis(name="q batch", logical=5, carrier=8, divisor=4)
+    with pytest.raises(
+            ValueError,
+            match="logical extent 5 exceeds source carrier extent 3"):
+        pad_to_axis(jnp.zeros((3,)), tag)
+
+
 def test_pad_axis_is_bit_identical_to_both_helpers_it_replaced():
     """The A/B that licensed the deletion.  BIT equality, not a tolerance.
 
@@ -443,28 +541,33 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
         )
 
     assert has_centroid_assignment(
-        "band_tile", "round_up(requested_band_tile, p_band)")
+        "band_tile",
+        "padded_axis(requested_band_tile, p_band, "
+        "name='centroid stream band tile').carrier")
     assert has_centroid_assignment(
-        "nb_accum", "round_up(nb_total, band_tile)")
+        "nb_accum",
+        "padded_axis(nb_total, band_tile, "
+        "name='centroid stream band accumulator').carrier")
     assert has_centroid_assignment(
         "nb_per_band_shard",
         "band_tile // p_band if stream_tiles "
-        "else round_up(nb_total, p_band) // p_band",
+        "else padded_axis(nb_total, p_band, "
+        "name='centroid bulk band carrier').carrier // p_band",
     )
     assert has_centroid_assignment(
         "nb_padded_global",
         "band_tile if stream_tiles else nb_per_band_shard * p_band",
     )
     assert "(nb_total + n_devices - 1) // n_devices" not in centroid_body
-    assert "divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)" in parallel
-    assert "p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in galerkin_body
+    assert "spec=band_sphere_spec(), axis=1).carrier" in parallel
+    assert "spec=band_sphere_spec(), axis=1).divisor" in galerkin_body
     assert "p_band = max(1, int(mesh_xy.size))" not in galerkin_body
-    assert "n_pad = round_up(nq, batch_size) - nq" in ht
+    assert "nq, batch_size, name=\"htransform path-q carrier\").pad" in ht
     assert "n_pad = (-nq) % batch_size" not in ht
     assert "band_divisor = spec_divisor(mesh, in_spec, axis=1)" in move_body
     assert "r_divisor = spec_divisor(mesh, out_spec, axis=3)" in move_body
     assert "ndev = p_x * p_y" not in move_body
-    assert "m_pad = round_up(m_loc, p_y)" in staged
+    assert "m_loc, p_y, name=\"face-to-batch local row carrier\").carrier" in staged
     assert "m_pad = -(-m_loc // p_y) * p_y" not in staged
     assert "p = shard_factor(mesh, picked)" in subset_body
     assert "p *= int(mesh.shape[a])" not in subset_body

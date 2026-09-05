@@ -3,12 +3,10 @@
 Three sibling drifts, one file, because they are the same defect three
 times: a rule that one ansatz enforced and its sibling did not.
 
-**(a) The sharded-cube divisibility precondition.**  ``ppm_sigma`` refused
-an indivisible sigma band window by name under
-``sigma_omega_layout=sharded`` while ``gw.mpa.sigma`` padded, accumulated
-into a ``P(None,None,'x','y')`` array and stripped the same cube with no
-divisibility check anywhere in the module.  One contract at one seam now:
-``ppm_sigma.assert_sharded_sigma_window_divides_mesh``.
+**(a) The sharded-cube carrier.** Both ansaetze now ask
+``runtime.padding`` for the same square mesh carrier. An indivisible logical
+window is represented by exact-zero rows and never published with an illegal
+sharding.
 
 **(b) The effective Sigma broadening xi.**  GN-PPM silently raised the
 deck's ``sigma_regularization_ev`` to a window-dependent conditioning
@@ -45,7 +43,7 @@ from common.units import RYD_TO_EV
 
 
 # ---------------------------------------------------------------------------
-# (a) one divisibility precondition
+# (a) one mesh-carrier owner
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
@@ -56,8 +54,8 @@ def mesh22():
     return Mesh(np.array(d[:4]).reshape(2, 2), ("x", "y"))
 
 
-def test_both_ansatze_call_the_same_sharded_window_precondition():
-    """Source gate: the MPA executor must not re-derive the divisibility rule.
+def test_both_ansatze_call_the_same_sharded_window_owner():
+    """Source gate: neither executor may re-derive divisibility arithmetic.
 
     A source cell rather than a run cell because reaching the MPA executor
     needs a pole store on disk.  The point being pinned is structural --
@@ -68,33 +66,22 @@ def test_both_ansatze_call_the_same_sharded_window_precondition():
     root = pathlib.Path(__file__).resolve().parents[1] / "src" / "gw"
     mpa = (root / "mpa" / "sigma.py").read_text()
     ppm = (root / "ppm_sigma.py").read_text()
-    assert "assert_sharded_sigma_window_divides_mesh(" in mpa, (
-        "the MPA executor pads and strips a sharded cube without the "
-        "precondition the PPM branch refuses on")
-    assert ppm.count("def assert_sharded_sigma_window_divides_mesh") == 1
+    assert "sigma_band_axis(" in mpa
+    assert ppm.count("def sigma_band_axis") == 1
+    assert "assert_sharded_sigma_window_divides_mesh" not in ppm
     # And the rule is not ALSO spelled out inline in the MPA module.
     mpa_code = "\n".join(l.split("#", 1)[0] for l in mpa.splitlines())
     assert "% p_x" not in mpa_code and "% p_y" not in mpa_code
 
 
-def test_the_precondition_refuses_an_indivisible_window(mesh22):
-    from gw.ppm_sigma import assert_sharded_sigma_window_divides_mesh
+def test_an_indivisible_window_gets_the_same_carrier_for_both_ansatze(mesh22):
+    from gw.ppm_sigma import sigma_band_axis
 
-    # Divides both axes -> silent.
-    assert_sharded_sigma_window_divides_mesh(8, mesh22, ansatz="gn_ppm")
-    # ODD counts only: on a 2x2 mesh anything even divides both axes,
-    # so an even nb would be testing the silent branch by accident.
     for nb in (7, 9, 15):
-        with pytest.raises(ValueError) as exc:
-            assert_sharded_sigma_window_divides_mesh(
-                nb, mesh22, ansatz="compute_mode = mpa")
-        msg = str(exc.value)
-        assert str(nb) in msg and "2x2" in msg
-        # The MPA arm must NOT advise a layout it has no plan for.
-        assert "sigma_omega_layout = replicated" not in msg
-    with pytest.raises(ValueError) as exc:
-        assert_sharded_sigma_window_divides_mesh(7, mesh22, ansatz="gn_ppm")
-    assert "sigma_omega_layout = replicated" in str(exc.value)
+        tags = [sigma_band_axis(nb, mesh22, ansatz=ansatz)
+                for ansatz in ("gn_ppm", "compute_mode = mpa")]
+        assert [(t.logical, t.carrier, t.divisor) for t in tags] == [
+            (nb, nb + 1, 2), (nb, nb + 1, 2)]
 
 
 # ---------------------------------------------------------------------------

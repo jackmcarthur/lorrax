@@ -248,7 +248,10 @@ A level assignment nobody argued is a level assignment nobody will keep.
 10. **`runtime/padding.py` — L3, though it is arithmetic.** `round_up` looks
     like L2 mathematics. It exists **only** because a mesh axis has to divide
     an extent; delete the mesh and the module has no reason to exist. Level
-    follows the reason, not the body.
+    follows the reason, not the body. It is also the sole owner of logical-to-
+    carrier receipts, exact-zero producer padding, consumer masks/slices, and
+    spec-derived divisors; the complete contract and refusal register are in
+    [Mesh-padded axes](padding.md).
 11. **`common/vma.py` — L3, not L2, and the choice is the tighter one.** It
     would have passed L2's own test ("could this lift into another physics
     code unchanged?") — but so would `common/shard_map.py`, which is L3, and

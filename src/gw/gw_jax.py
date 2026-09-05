@@ -108,8 +108,11 @@ from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from .screening import (
 	compute_screening_model, driver_persists_w0, screening_requests_for)
-from .sigma_dispatch import compute_sigma_xc
-from .qsgw_utils import extract_sigma_diag_replicated, solve_qp
+from .sigma_dispatch import (
+	SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, compute_sigma_xc,
+	sigma_result_on_kset)
+from .qsgw_utils import solve_qp
+from .dynamic_sigma import extract_sigma_diag_logical
 from .degen_average import (
 	average_sigma_components,
 	average_within_degenerate_sets,
@@ -470,7 +473,8 @@ def main(argv=None):
 	                        int(config.ncond) + _sc_buffer, config.nband,
 	                        n_rmu, charge_bispinor,
 	                        nband_chi=config.bands.chi,
-	                        nband_sigma=config.bands.sigma)
+	                        nband_sigma=config.bands.sigma,
+	                        mesh_xy=mesh_xy)
 	if _sc_buffer:
 		print0(
 			f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
@@ -524,27 +528,19 @@ def main(argv=None):
 		       f"(padded from {meta.b_id_4_user} to the world size).")
 	check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
 
-	# ---- dynamic-Sigma layout: resolve-time capacity/geometry gate ----
-	# The config-level axis checks (self_consistent) already ran
-	# in ``config.qp_solver``; the two conditions below need the mesh and the
-	# σ window, known only here.  Refusing NOW costs seconds; refusing at the
-	# Σ stage would waste the whole ζ fit (pattern #6: the resolve-time check
-	# must test what will execute).  The Σ driver re-checks divisibility at
-	# its own seam as the last-line guard.
-	# THE SAME precondition the Σ drivers enforce, asked EARLY.  It is one
-	# function (``ppm_sigma.assert_sharded_sigma_window_divides_mesh``); this
-	# used to be a third hand-written copy of the modulus test, alongside the
-	# PPM branch's and — absent entirely — the MPA executor's.
+	# ---- dynamic-Sigma logical/carrier receipt ----
+	# Resolve the same square carrier the producer will use, early enough to
+	# print the allocation shape before ζ fitting.  This is informational:
+	# indivisible windows are ordinary exact-zero pads, not a geometry refusal.
 	#
-	# ``compute_mode = mpa`` reaches it whatever the deck says about the
-	# layout, because the MPA executor emits the sharded cube unconditionally
-	# (the dispatch refuses ``replicated`` by name for that reason).
+	# ``compute_mode = mpa`` reaches it whatever the deck says about layout,
+	# because the MPA executor emits the sharded cube unconditionally.
 	_p_x = int(mesh_xy.devices.shape[0])
 	_p_y = int(mesh_xy.devices.shape[1])
 	_nbs = int(meta.nb_sigma)
 	if mode.is_dynamic:
-		from .ppm_sigma import assert_sharded_sigma_window_divides_mesh
-		assert_sharded_sigma_window_divides_mesh(
+		from .ppm_sigma import sigma_band_axis
+		_sigma_axis = sigma_band_axis(
 			_nbs, mesh_xy,
 			ansatz=f"compute_mode = {getattr(mode, 'value', mode)}")
 		# The second refusal that used to live here -- sharded layout with
@@ -555,7 +551,8 @@ def main(argv=None):
 		# so it was also the weakest.  Nothing can select that writer now.
 		print0(
 			f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
-			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh end-to-end "
+			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh at "
+			f"logical/carrier={_sigma_axis.logical}/{_sigma_axis.carrier} "
 			f"(consumers read tiles; no full-cube replication).")
 
 	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
@@ -1048,6 +1045,11 @@ def main(argv=None):
 				material_class=material_class,
 				print_fn=print0,
 			)
+		# The one-shot path deliberately retains the full BZ.  Use the same
+		# named k-set boundary as the SC map, here as a validation rather than
+		# a selection, so both paths state what their Sigma tables contain.
+		sigma_result = sigma_result_on_kset(
+			sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=int(meta.nk_tot))
 		# Screening bodies have no consumer after Sigma.  In the photon mode
 		# this drops the packed V/W pair at the exact lifetime boundary rather
 		# than carrying O(N_gamma^2) arrays through QP/output post-processing.
@@ -1155,6 +1157,16 @@ def main(argv=None):
 		sigma_total = sc_result.sigma_total_dft
 		rotations_written = sc_result.rotations_written
 		final_static_head_terms = sc_result.static_head_terms_dft
+		if sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
+			# SC's retained Sigma, its H/E/U and the mean-field operators used
+			# by post-processing all stay on the loop's star wedge.  Output
+			# writers alone unfold that complete result to their file wedge.
+			from ffi import _services
+			_services.ensure_on_path()
+			from symmetry_maps import KStarMap
+			_output_kstar = KStarMap.from_sym(sym, int(wfn.ntran))
+			kin_ion = _output_kstar.select(kin_ion)
+			enk_dft = _output_kstar.select(enk_dft)
 	else:
 		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
 		# E_DFT inside compute_sigma_xc (pass-through; also covers static
@@ -1352,8 +1364,9 @@ def main(argv=None):
 	# Σ_c diagonal on the ω-grid: feed the eqp1.dat writer's central-diff
 	# Z-factor.  Pulled from the on-device sharded tensor when available.
 	if sigma_c_omega is not None:
-		sigma_c_omega_diag_ev = np.asarray(extract_sigma_diag_replicated(
-			sigma_c_omega, mesh_xy)) * RYD_TO_EV
+		sigma_c_omega_diag_ev = extract_sigma_diag_logical(
+			sigma_c_omega, mesh_xy,
+			band_axis=sigma_result.sigma_band_axis) * RYD_TO_EV
 		if not config.no_degen_averaging:
 			# Output-only diagonal curve.  The full persisted operator stays raw,
 			# while this curve uses the SAME canonical group owner at every omega;
@@ -1469,6 +1482,7 @@ def main(argv=None):
 		band_stop=band_slices.b3,
 		use_ppm=mode.is_dynamic,
 		self_consistent=qp_solver is QPSolver.SELF_CONSISTENT,
+		sigma_kset=sigma_result.kset,
 		sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,

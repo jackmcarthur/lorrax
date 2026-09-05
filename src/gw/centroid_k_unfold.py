@@ -194,22 +194,37 @@ class CentroidKUnfoldPlan:
         """
         canonical = int(self.canonical_centroid_extent)
         complete_mesh = int(self.mesh_xy.size)
+        from runtime.padding import padded_axis
         return (
             canonical >= self.n_centroid_logical
             and canonical <= self.n_centroid_packed
-            and canonical % complete_mesh == 0
-            and self.n_centroid_packed % complete_mesh == 0
+            and padded_axis(
+                canonical, complete_mesh,
+                name="canonical centroid bridge").carrier == canonical
+            and padded_axis(
+                self.n_centroid_packed, complete_mesh,
+                name="packed centroid bridge").carrier
+            == self.n_centroid_packed
         )
 
     def _canonical_source_map(self) -> np.ndarray:
         """Complete destination-to-source map, including padding rows."""
-        if not self.supports_canonical_bridge:
+        canonical = int(self.canonical_centroid_extent)
+        if (canonical < self.n_centroid_logical
+                or canonical > self.n_centroid_packed):
             raise ValueError(
                 "CentroidKUnfoldPlan: canonical centroid extent must cover "
-                "the logical basis, not exceed the orbit-packed extent, and "
-                "divide the complete mesh; got logical/packed/canonical="
+                "the logical basis and not exceed the orbit-packed extent; "
+                "got logical/packed/canonical="
                 f"{self.n_centroid_logical}/{self.n_centroid_packed}/"
                 f"{self.canonical_centroid_extent}.")
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            self.n_centroid_logical, canonical, self.mesh_xy,
+            name="canonical centroid unfold carrier")
+        authenticate_padded_axis(
+            self.n_centroid_packed, self.n_centroid_packed, self.mesh_xy,
+            name="orbit-packed centroid unfold carrier")
         extent = self.n_centroid_packed
         logical = self.n_centroid_logical
         source = np.empty((extent,), dtype=np.int32)
@@ -394,13 +409,16 @@ def build_centroid_k_unfold_plan(
     canonical_extent = (
         int(len(centroid_fft_idx)) if canonical_centroid_extent is None
         else int(canonical_centroid_extent))
-    if (canonical_extent < int(len(centroid_fft_idx))
-            or canonical_extent % shape[0]):
+    from runtime.padding import padded_axis
+    canonical_axis = padded_axis(
+        int(len(centroid_fft_idx)), mesh_xy,
+        name="canonical centroid unfold carrier")
+    if canonical_extent != canonical_axis.carrier:
         raise ValueError(
-            "build_centroid_k_unfold_plan: canonical_centroid_extent must "
-            "cover every logical centroid and divide both square mesh axes; "
-            f"got {canonical_extent} for {len(centroid_fft_idx)} centroids "
-            f"on {shape}.")
+            "build_centroid_k_unfold_plan: canonical centroid carrier is "
+            f"{canonical_extent}, expected {canonical_axis.carrier} for "
+            f"logical extent {canonical_axis.logical} and divisor "
+            f"{canonical_axis.divisor}.")
 
     return CentroidKUnfoldPlan(
         mesh_xy=mesh_xy,

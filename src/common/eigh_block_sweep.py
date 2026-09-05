@@ -18,12 +18,12 @@ bootstrap()
 
 import numpy as np                                            # noqa: E402
 import jax
-import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from common.collectives import (all_gather_processes,          # noqa: E402
                                 device_put_process_local,
                                 process_rank, resolve_mesh)
+from runtime.padding import padded_axis                        # noqa: E402
 
 
 def _log(msg: str) -> None:
@@ -63,7 +63,11 @@ def main() -> int:
          f"{'max|evals-ref|':>14}")
     n_failed = 0
     for block in args.blocks:
-        if args.n % (block * p) != 0 or args.n % (block * q) != 0:
+        row_axis = padded_axis(
+            args.n, block * p, name="eigh sweep row block carrier")
+        col_axis = padded_axis(
+            args.n, block * q, name="eigh sweep column block carrier")
+        if row_axis.pad or col_axis.pad:
             _log(f"  block={block:<4}   skip: n%block*{p}!=0")
             continue
 

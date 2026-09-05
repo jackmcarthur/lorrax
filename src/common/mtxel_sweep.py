@@ -317,11 +317,11 @@ class SweepGeometry:
     """
 
     __slots__ = ("mesh", "fft_grid", "ngkmax", "nb", "nb_logical", "ns",
-                 "nk", "cell_volume", "ngrid", "p_prod")
+                 "nk", "cell_volume", "ngrid", "p_prod", "band_axis")
 
     def __init__(self, *, mesh: Mesh, fft_grid: Sequence[int], ngkmax: int,
                  nb: int, ns: int, nk: int, cell_volume: float):
-        from runtime.padding import round_up, spec_divisor
+        from runtime.padding import padded_axis
 
         self.mesh = mesh
         self.fft_grid = tuple(int(s) for s in fft_grid)
@@ -343,9 +343,12 @@ class SweepGeometry:
         # Not a nicety at production shapes: nb=600 on an 8×8 mesh is
         # 64·9.375, and JAX raises IndivisibleError when the sharded array is
         # CONSTRUCTED rather than degrading (job 7888869).
-        self.p_prod = spec_divisor(mesh, self.spec_sphere_xy, 1)
-        self.nb_logical = int(nb)
-        self.nb = round_up(int(nb), self.p_prod)
+        self.band_axis = padded_axis(
+            int(nb), mesh, name="matrix-element sweep band carrier",
+            spec=self.spec_sphere_xy, axis=1)
+        self.p_prod = self.band_axis.divisor
+        self.nb_logical = self.band_axis.logical
+        self.nb = self.band_axis.carrier
 
     # Sphere-shaped operands, band-sharded over the WHOLE mesh.  Used for
     # the n side during the operator: FFT work is 2nb/P per rank with no

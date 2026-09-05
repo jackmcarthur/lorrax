@@ -44,6 +44,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier as _barrier, device_put_process_local
 from runtime import debug_print_enabled
+from runtime.padding import authenticate_padded_axis, padded_axis
 
 from . import h5_journal as _journal
 
@@ -1065,7 +1066,8 @@ def mesh_divisible_shape(shape, mesh, partition_spec) -> tuple[int, ...]:
         for k in range(n_ax):
             div *= int(mesh.shape[mesh.axis_names[axis_flat[flat + k]]])
         flat += n_ax
-        out[d] = -(-out[d] // div) * div          # ceil to a multiple of div
+        out[d] = padded_axis(
+            out[d], div, name=f"SlabIO dimension {d}").carrier
     return tuple(out)
 
 
@@ -1603,15 +1605,8 @@ def _validate_block_divisible(
         axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
         mesh_shape=mesh_shape, ndim=len(tuple(shape)))
     for d, size in enumerate(tuple(int(s) for s in shape)):
-        if divs[d] > 1 and size % divs[d]:
-            raise ValueError(
-                f"{op} {name!r}: dimension {d} size {size} is not "
-                f"divisible by its mesh-axis product {divs[d]}, so the "
-                f"array you asked for cannot be sharded this way — JAX "
-                f"itself refuses to build it (IndivisibleError).  Ask for "
-                f"dimension {d} at {-(-size // divs[d]) * divs[d]} "
-                f"instead: SlabIO fills what the dataset covers and zeroes "
-                f"the rest, and you state nothing else.")
+        authenticate_padded_axis(
+            size, size, divs[d], name=f"{op} {name!r} dimension {d}")
 
 
 # ---------------------------------------------------------------------------

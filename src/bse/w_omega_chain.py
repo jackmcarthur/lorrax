@@ -89,6 +89,7 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from common.collectives import device_put_process_local
 
@@ -496,7 +497,6 @@ def eval_w_omega_chain(chain, data, snapshot, sh, z, *, m_use=None):
     C = np.linalg.solve(z2 * np.eye(m_use * p) - T, E)           # (m_use*p, p)
     C = C.reshape(m_use, p, p)
 
-    px, py = sh.X.mesh.devices.shape
     C_dev = jax.device_put(jnp.asarray(C))
     V_use = jax.lax.with_sharding_constraint(
         chain["V_stack"][:m_use], sh.X_full)
@@ -508,7 +508,10 @@ def eval_w_omega_chain(chain, data, snapshot, sh, z, *, m_use=None):
 
     # Pad the probe (batch) axis to a multiple of py for the reduce-scatter
     # snapshot (nu is tiled over y); the pad columns are zero.
-    n_pad = int(np.ceil(p / py) * py)
+    from runtime.padding import padded_axis
+    n_pad = padded_axis(
+        p, sh.X.mesh, name="BSE omega-chain probe carrier",
+        spec=P("y", None, None, None), axis=0).carrier
     if n_pad != p:
         pad = jnp.zeros((n_pad - p,) + s.shape[1:], dtype=s.dtype)
         s = jax.lax.with_sharding_constraint(

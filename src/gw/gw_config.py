@@ -1484,9 +1484,10 @@ _DEFAULTS = {
     # (rho, J) four-current would be internally inconsistent; an explicit
     # false is preserved and refused by the four-current gate below.
     "density_self_consistent": False,
-    # Run the SC loop's H / E / U on the STAR wedge, broadcasting back at
-    # the boundary.  Sigma stays on the full BZ -- it is an FFT over the
-    # k-grid.  Off keeps the loop entirely full-BZ.
+    # Run the SC loop's retained H / E / U / Sigma tables on the STAR wedge.
+    # A map broadcasts H/E/U to the full BZ for the k-grid FFT, then selects
+    # every retained table together at its output seam.  Off keeps the loop
+    # entirely full-BZ.
     #
     # DEFAULT FLIPPED False -> True, 2026-08-15, on the owner's standing
     # directive that H^QP be built and eigh'd only on symmetry-reduced
@@ -2333,7 +2334,7 @@ _DEFAULTS = {
     # fine-grid pass then completes for ANY N_q_fi.  Raise it to trade
     # memory for fewer collectives, lower it on a memory-tight rank.  It is
     # a FLOOR: rounded up to a multiple of the device count so the q axis
-    # stays shardable (bse_setup pads with sharding_fit.padded_extent).
+    # stays shardable (bse_setup pads with runtime.padding.padded_axis).
     # Ignored by the distributed-eigh path, whose chunk is 1 by
     # construction.  See bandstructure.bse_setup.compute_wfns_fi.
     "wfn_fi_q_chunk": 0,

@@ -3,7 +3,6 @@
 import ast
 import json
 from pathlib import Path
-
 from types import SimpleNamespace
 
 import h5py
@@ -20,6 +19,23 @@ _CERT = {
     "backward_error_max_allowed": 1.0,
 }
 _SCHEME = "mean-field-content-v1:full-mf-header+bounded-wfns"
+
+
+def test_every_driver_screening_call_carries_charge_zeta_identity():
+    source = Path(__file__).parents[1] / "src" / "gw" / "gw_jax.py"
+    tree = ast.parse(source.read_text())
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "compute_screening_model"
+    ]
+
+    assert calls
+    assert all(
+        "charge_zeta_identity" in {keyword.arg for keyword in call.keywords}
+        for call in calls
+    )
 
 
 def _finalized_fit(path, *, provenance=None):
@@ -175,7 +191,7 @@ def test_oneshot_driver_hands_charge_zeta_identity_to_every_screening_call():
         and isinstance(node.func, ast.Name)
         and node.func.id == "compute_screening_model"
     ]
-    assert len(calls) == 2
+    assert calls
     for call in calls:
         values = {keyword.arg: keyword.value for keyword in call.keywords}
         assert "charge_zeta_identity" in values

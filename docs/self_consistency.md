@@ -20,6 +20,14 @@ every non-scissored band moves by less than `sc_tol_ev`. Within the active
 subspace (`nval + ncond` bands around E_F) each band is in one of three
 classes (`gw/band_partition.py`):
 
+The loop has one k-set invariant: its retained H, E, U, every k-indexed
+`SigmaResult` table, and density-SC Hartree components all carry exactly the
+loop's k-set (the star wedge when `sc_on_ibz = true`). The full BZ exists only
+inside a map while the k-grid FFT builds Sigma, and in the separate one-shot
+writer path. At the map boundary one named seam selects the complete retained
+result and its defining U together; diagnostics and writers consume that
+selection and never select or broadcast an individual Sigma table again.
+
 | class | diagonal of H' | off-diagonals |
 |---|---|---|
 | protected (inside the Σ(ω) grid) | full Σ at the QP energy | kept, protected×protected only |
@@ -214,6 +222,24 @@ The ratio predicted every failure in the 2026-09-03 study; a value above 1 is
 evidence that the sampled map is not contracting. It does not change damping,
 convergence, refusal, or any other control decision (TASTE 59); pitfall 9's
 budget rule still owns when a run stops.
+
+**14. The accelerator must see the same state set as the criterion.** The
+rCROP carry is the whole active window in the DFT basis, but the scissored
+bands are re-derived from their own (alpha, beta) refit each map and move by
+electron-volts per map (Na eta=0.5, 86 bands on a [-15,+18] eV grid: bands
+41-86 at 30-96 eV moved 0.7-3.9 eV per map while the in-range bands 5-10 moved
+35-70 meV). When those entries entered the least squares, the accelerator's
+trials wandered (entry mu 2.09 eV at map 2, in-range residual 3.7 eV). The
+Gram and the residual norms are now taken over the non-scissored block only,
+the outer product of the initial ``protected | in_range`` mask; the update
+still mixes the full carry and the scissored rows keep following the map. A
+full window (a semiconductor with every band in range) has weights of exactly
+1.0 and is bit identical to the unweighted solve. The log line is
+``SC rCROP metric: Gram over the non-scissored block only (bands a-b, n of nb)``.
+On metals a local gain above 1 can remain at Fermi-crossing states, where the
+exchange term responds to an occupation flip under the smearing width; that is
+the physics of the map, not the accelerator, and is read from pitfall 13's
+line.
 
 ## Evidence
 

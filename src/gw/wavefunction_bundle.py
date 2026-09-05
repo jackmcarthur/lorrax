@@ -49,7 +49,6 @@ a consumer from ever being reached under ``low_mem_bands = true``).
 from __future__ import annotations
 
 import functools
-import math
 from dataclasses import dataclass
 
 import jax
@@ -59,7 +58,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
 from file_io.wfn_basis import WavefunctionBasisReceipt
-from runtime.padding import round_up, spec_divisor
 
 
 # ---------------------------------------------------------------------------
@@ -1203,9 +1201,13 @@ def pack_band_window(
             f"silently under-pad whichever axis is smaller on a "
             f"rectangular mesh rather than refusing the unsupported "
             f"geometry by name.")
-    q = px
     width = hi_ - lo
-    w_pad = round_up(width, q)
+    from runtime.padding import padded_axis
+    window_axis = padded_axis(
+        width, mesh_xy, name="packed band window",
+        specs=((P(None, None, None, "x"), 3),
+               (P(None, "y", None, None), 1)))
+    w_pad = window_axis.carrier
     if lo == 0 and hi_ == nb_full:
         # nb_full % q == 0 is BandSlices' own invariant (the world-size pad
         # on b4), so w_pad == width == nb_full here always; the window IS
@@ -1671,11 +1673,13 @@ def _rotate_wavefunctions_legacy(
     # indivisible axis outright rather than degrading (runtime.padding).
     # The divisors come from the spec, not from mesh.shape, so a
     # band_mix_spec that ever became a product axis stays covered.
-    pad_div = 1
-    for _field, spec, _band_axis in _PSI_LAYOUTS:
-        pad_div = math.lcm(pad_div, spec_divisor(
-            mesh_xy, band_mix_spec(_contract_axis(mesh_xy, spec)), 1))
-    nb_pad = round_up(nb_active, pad_div)
+    from runtime.padding import padded_axis
+    active_axis = padded_axis(
+        nb_active, mesh_xy, name="wavefunction rotation band window",
+        specs=tuple(
+            (band_mix_spec(_contract_axis(mesh_xy, spec)), 1)
+            for _field, spec, _band_axis in _PSI_LAYOUTS))
+    nb_pad = active_axis.carrier
 
     U = _place_U(U_dft_to_qp_active, mesh_xy, nb_pad)
 

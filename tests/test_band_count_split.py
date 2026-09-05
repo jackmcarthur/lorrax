@@ -395,6 +395,28 @@ def test_meta_refuses_an_nband_that_is_not_the_max():
                          nband_chi=40, nband_sigma=40)
 
 
+def test_meta_loaded_face_band_carrier_uses_specs_not_mesh_product():
+    """Na's 86-band P16 face carrier is 88, not product-padded 96."""
+    pytest.importorskip("jax")
+    from common.meta import Meta
+
+    mesh = types.SimpleNamespace(
+        axis_names=("x", "y"), shape={"x": 4, "y": 4})
+    wfn = types.SimpleNamespace(
+        nelec=5, fft_grid=(8, 8, 8), cell_volume=1.0, nspin=1,
+        nspinor=1, kgrid=(2, 2, 2))
+    sym = types.SimpleNamespace(nk_tot=8)
+
+    meta = Meta.from_system(
+        wfn, sym, 5, 81, 86, 16, False,
+        nband_chi=86, nband_sigma=86, mesh_xy=mesh)
+
+    assert meta.b_id_4_user == 86
+    assert meta.b_id_4 == 88
+    assert meta.b_id_4_chi == 88
+    assert meta.b_id_4_sigma == 88
+
+
 # ---------------------------------------------------------------------------
 # (6) THE DEGENERACY GUARDS, FIRING INDEPENDENTLY
 # ---------------------------------------------------------------------------

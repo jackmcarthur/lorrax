@@ -46,7 +46,7 @@ from typing import Sequence, TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from runtime.padding import round_up, pad_axis, spec_divisor
+from runtime.padding import pad_axis, spec_divisor
 from common.shard_map import shard_map
 from common.staged_reshard import band_to_product_r_reshard
 from common.wfn_layout import band_sphere_spec
@@ -1545,10 +1545,10 @@ def accumulate_rchunk_to_gflat(
     r_len_i   = int(rchunk.shape[-1])
     mu_gflat_spec = P(None, ('x', 'y'), None)
     p_prod    = spec_divisor(mesh, mu_gflat_spec, axis=1)
-    if n_rmu_pad % p_prod != 0:
-        raise ValueError(
-            f"accumulate_rchunk_to_gflat: n_rmu_padded={n_rmu_pad} not "
-            f"divisible by mesh.size={p_prod}.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        n_rmu_pad, n_rmu_pad, mesh,
+        name="gflat centroid carrier", spec=mu_gflat_spec, axis=1)
     n_mu_local = n_rmu_pad // p_prod
     N          = n_q * n_mu_local
 
@@ -2163,7 +2163,10 @@ def prepare_rchunk_carrier(
         out_r = out_y
 
     logical_extent = r_end - r_start
-    carrier_extent = round_up(logical_extent, r_pad_divisor)
+    from runtime.padding import padded_axis
+    r_axis = padded_axis(
+        logical_extent, r_pad_divisor, name="WFN real-space chunk carrier")
+    carrier_extent = r_axis.carrier
     if (product_reshard is not None and carrier_extent != logical_extent
             and r_end != n_rtot):
         raise ValueError(
@@ -2181,7 +2184,7 @@ def prepare_rchunk_carrier(
             return jax.lax.with_sharding_constraint(a, out_y)
         return product_reshard(a)
 
-    return carrier_extent, out_r, _finish
+    return r_axis, out_r, _finish
 
 
 def iter_psi_rchunk_bandwise(
@@ -2234,13 +2237,14 @@ def iter_psi_rchunk_bandwise(
     nk_tot = int(meta.nk_tot)
     nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
     n_rchunk = int(r_end - r_start)
-    n_rchunk_carrier, out_r, _finish_r_carrier = prepare_rchunk_carrier(
+    r_axis, out_r, _finish_r_carrier = prepare_rchunk_carrier(
         mesh_xy,
         r_start=r_start,
         r_end=r_end,
         n_rtot=meta.n_rtot,
         product_r_spec=product_r_spec,
     )
+    n_rchunk_carrier = r_axis.carrier
 
     if band_chunk_ranges is None:
         nb_total = b_end - b_start
@@ -2503,9 +2507,15 @@ def load_centroids_band_chunked(
     k_tile = min(nk_tot, requested_k_tile) if stream_tiles else nk_tot
     band_tile = nb_total
     if stream_tiles:
-        band_tile = round_up(requested_band_tile, p_band)
-    nk_accum = round_up(nk_tot, k_tile)
-    nb_accum = round_up(nb_total, band_tile)
+        from runtime.padding import padded_axis
+        band_tile = padded_axis(
+            requested_band_tile, p_band,
+            name="centroid stream band tile").carrier
+    from runtime.padding import padded_axis
+    nk_accum = padded_axis(
+        nk_tot, k_tile, name="centroid stream k accumulator").carrier
+    nb_accum = padded_axis(
+        nb_total, band_tile, name="centroid stream band accumulator").carrier
     parent_groups = None
     parent_stream_active = False
     from wfn_loader import IBZRows
@@ -2525,7 +2535,11 @@ def load_centroids_band_chunked(
     # because they coexist at the insert boundary.
     nb_per_band_shard = (
         band_tile // p_band if stream_tiles
-        else round_up(nb_total, p_band) // p_band
+        else (
+            padded_axis(
+                nb_total, p_band,
+                name="centroid bulk band carrier").carrier
+            // p_band)
     )
     nb_padded_global = (
         band_tile if stream_tiles else nb_per_band_shard * p_band
@@ -2567,16 +2581,21 @@ def load_centroids_band_chunked(
             # float64 Cartesian momentum row. It is device-local and never
             # enters the loader's host full-k G cache.
             parent_stream_extra_bytes += int(loader.ngkmax) * 3 * 8
+    from runtime.padding import padded_axis
+    mu_x_local = padded_axis(
+        n_rmu_padded, n_x,
+        name="centroid X-shard memory carrier").carrier // n_x
+    mu_y_local = padded_axis(
+        n_rmu_padded, n_y,
+        name="centroid Y-shard memory carrier").carrier // n_y
     output_local_bytes = (
         nk_accum * nb_accum * nspinor * 16
-        * (((n_rmu_padded + n_x - 1) // n_x)
-           + ((n_rmu_padded + n_y - 1) // n_y))
+        * (mu_x_local + mu_y_local)
     )
     if return_parents:
         output_local_bytes += (
             int(loader.nkpts) * nb_accum * nspinor * 16
-            * (((n_rmu_padded + n_x - 1) // n_x)
-               + ((n_rmu_padded + n_y - 1) // n_y))
+            * (mu_x_local + mu_y_local)
         )
     tile_band_output_local_bytes = 0
     tile_face_local_bytes = 0
@@ -2586,8 +2605,7 @@ def load_centroids_band_chunked(
         )
         tile_face_local_bytes = (
             k_tile * band_tile * nspinor * 16
-            * (((n_rmu_padded + n_x - 1) // n_x)
-               + ((n_rmu_padded + n_y - 1) // n_y))
+            * (mu_x_local + mu_y_local)
         )
     # A caller-provided G-flat tensor is already in memory_stats(); only price
     # it here when this call will allocate it.  This avoids double-charging

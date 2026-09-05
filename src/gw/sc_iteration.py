@@ -81,7 +81,9 @@ from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
 from .gw_config import ComputeMode, HeadCorrection
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
-from .sigma_dispatch import SigmaResult, compute_sigma_xc
+from .sigma_dispatch import (
+    SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, SigmaResult,
+    compute_sigma_xc, sigma_result_on_kset)
 from .wavefunction_bundle import (
     BandSlices, Wavefunctions, rotate_wavefunctions)
 
@@ -408,9 +410,10 @@ class SCInputs:
     #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
     #: runs entirely on the full BZ, which is what every result before
     #: 2026-08-04 did and what the one-shot equivalence gate pins.  When
-    #: given, H / E / U / the carried state live on the IBZ and only Σ is
-    #: built on the full BZ — Σ comes from an FFT over the k-grid, which
-    #: needs the whole grid (decisions.md, TRS veto scope).
+    #: given, H / E / U / the carried state and retained Sigma tables live
+    #: on the star wedge.  Sigma is temporarily built on the full BZ — it
+    #: comes from an FFT over the k-grid — then crosses the map's one output
+    #: seam (decisions.md, TRS veto scope).
     kstar: object | None = None
     #: Validated, device-resident nearest-neighbour links + exact DFT
     #: velocity.  None preserves the historical fixed-DFT head path exactly.
@@ -530,10 +533,10 @@ class SCMapScreeningArtifacts:
 class SCExactHartree:
     """Caller-owned direct field rebuilt from one SC map's orbitals.
 
-    Every matrix is on the full BZ in the original DFT basis.  Keeping the
-    scalar and transverse pieces separate preserves ``sigma_mnk.h5``'s
-    decomposition; :attr:`total` is the only combination that enters the
-    Hamiltonian.
+    Every retained matrix is on the loop's k-set in the original DFT basis.
+    Keeping the scalar and transverse pieces separate preserves
+    ``sigma_mnk.h5``'s decomposition; :attr:`total` is the only combination
+    that enters the Hamiltonian.
     """
 
     scalar_dft: jax.Array
@@ -567,20 +570,20 @@ class SCOutputs:
     ``dump_sigma_omega_h5_final``, ``dump_qp_wfn_artifacts``, the per-map
     snapshot); nothing here feeds the next fixed-point evaluation.
 
-    ``sigma_result`` and ``sigma_basis_U`` are on the FULL BZ and must
-    AGREE, because they are consumed together by ``run_sc_driver``'s
-    final rotate-back — Σ is a k-grid FFT, so its k-set is not
-    negotiable, and the U stored beside it follows.  ``sigma_basis_U``
-    is the DFT→QP unitary that DEFINED the basis ``sigma_result`` was
-    computed in (the eigh of the *previous* carry) — the writer must
-    rotate Σ back to DFT with THIS U, not the converged U of the final
-    carry: the two agree only at convergence, and using the converged U
-    mis-rotates Σ_x/V_H whenever the loop stops before the fixed point
-    (maximally so at max_iter=1, where the correct U is the identity).
+    ``sigma_result``, ``sigma_basis_U`` and ``exact_hartree_dft`` are all on
+    the LOOP's k-set and must agree.  Σ is built on the full BZ because its
+    k-grid FFT needs every point; the map's one output seam selects every
+    retained table together.  ``sigma_basis_U`` is the DFT→QP unitary that
+    DEFINED the basis ``sigma_result`` was computed in (the eigh of the
+    *previous* carry) — the writer must rotate Σ back to DFT with THIS U,
+    not the converged U of the final carry: the two agree only at
+    convergence, and using the converged U mis-rotates Σ_x/V_H whenever the
+    loop stops before the fixed point (maximally so at max_iter=1, where the
+    correct U is the identity).
     """
 
     sigma_result: SigmaResult
-    sigma_basis_U: jax.Array         # (nk, nb, nb) ⟨DFT_m|QP_n⟩, full BZ
+    sigma_basis_U: jax.Array     # (nk_loop, nb, nb) ⟨DFT_m|QP_n⟩
     scissor_fit: ScissorFit | None
     tail_scissor_fit: ScissorFit | None
     screening: SCMapScreeningArtifacts
@@ -603,9 +606,9 @@ class SCDriverResult:
 class SCState:
     """State carried across self-consistent iterations.
 
-    K-SET INVARIANT (with ``SCInputs.kstar``): ``H_qp_dft`` is on the
-    LOOP's k-set — the IBZ when a map is given — while ``outputs``
-    carries full-BZ objects (see :class:`SCOutputs`).
+    K-SET INVARIANT (with ``SCInputs.kstar``): ``H_qp_dft`` and every
+    k-indexed object in ``outputs`` are on the LOOP's k-set — the star wedge
+    when a non-identity map is given (see :class:`SCOutputs`).
 
     The primary iteration carry is ``H_qp_dft``.  When metallic occupations
     are enabled, ``occupation_state`` is the ONE per-iteration
@@ -642,6 +645,75 @@ class SCState:
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
     convergence_verdict: ConvergenceVerdict | None = None
+
+
+def _sc_output_tables_on_loop_kset(
+    sigma_result: SigmaResult,
+    delta_h_qp_full,
+    delta_h_qp_unextrap_full,
+    sigma_basis_U_full,
+    exact_hartree_full: SCExactHartree | None,
+    kstar,
+) -> tuple[
+        SigmaResult, jax.Array, SCExactHartree | None, jax.Array,
+        jax.Array | None]:
+    """Assemble retained SC outputs at the map's sole k-set seam.
+
+    ``compute_sigma_xc`` and density-SC Hartree construction necessarily run
+    on the full BZ.  Nothing beyond this function may select an individual
+    retained Sigma table: the complete :class:`SigmaResult`, its defining
+    DFT→QP rotation and the paired exact-Hartree components move to the loop
+    k-set together.  The two Hamiltonian updates are formed before this call
+    and selected first: that preserves the incumbent arithmetic order (form
+    the full-BZ sum, then take its loop rows) bit for bit.
+    """
+    if kstar.is_identity:
+        delta_h_qp = delta_h_qp_full
+        delta_h_qp_unextrap = delta_h_qp_unextrap_full
+        sigma_loop = sigma_result_on_kset(
+            sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=kstar.nk_full)
+        U_loop = sigma_basis_U_full
+        exact_loop = exact_hartree_full
+    else:
+        # Keep these two takes ahead of the retained-table takes.  The update
+        # is the numerical product of the map; selecting its already-formed
+        # full-BZ sum is the established, trajectory-pinned operation.
+        delta_h_qp = kstar.select(delta_h_qp_full)
+        delta_h_qp_unextrap = (
+            kstar.select(delta_h_qp_unextrap_full)
+            if delta_h_qp_unextrap_full is not None else None)
+        sigma_loop = sigma_result_on_kset(
+            sigma_result, kset=SIGMA_KSET_STAR_WEDGE, nk=kstar.nk_irr,
+            select_rows=kstar.select)
+        U_loop = kstar.select(sigma_basis_U_full)
+        exact_loop = (
+            None if exact_hartree_full is None else
+            replace(
+                exact_hartree_full,
+                scalar_dft=kstar.select(exact_hartree_full.scalar_dft),
+                transverse_dft=(
+                    kstar.select(exact_hartree_full.transverse_dft)
+                    if exact_hartree_full.transverse_dft is not None
+                    else None),
+            )
+        )
+
+    if int(np.shape(U_loop)[0]) != int(kstar.nk_irr):
+        raise ValueError(
+            "SC output seam: Sigma-basis rotation has "
+            f"{np.shape(U_loop)[0]} rows, expected {kstar.nk_irr} on the "
+            "loop k-set")
+    if exact_loop is not None:
+        for name in ("scalar_dft", "transverse_dft"):
+            value = getattr(exact_loop, name)
+            if value is not None and int(np.shape(value)[0]) != int(
+                    kstar.nk_irr):
+                raise ValueError(
+                    f"SC output seam: exact Hartree {name} has "
+                    f"{np.shape(value)[0]} rows, expected {kstar.nk_irr}")
+    return (
+        sigma_loop, U_loop, exact_loop, delta_h_qp,
+        delta_h_qp_unextrap)
 
 
 # ---------------------------------------------------------------------------
@@ -1216,16 +1288,17 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
         return "native"
 
     from common.wfn_layout import band_sphere_spec
-    from runtime.padding import spec_divisor, round_up
+    from runtime.padding import padded_axis
 
     ndev = int(mesh_xy.size)
     px, py = (int(mesh_xy.shape[a]) for a in mesh_xy.axis_names)
-    pad_div = spec_divisor(mesh_xy, band_sphere_spec(), 1)
     # ``distributed_eigh_bands`` pads to this and slices BACK by count, so
     # an indivisible nb is no longer a reason to refuse or to degrade — it
     # is just a pad.  The backend probe below must therefore be asked about
     # the extent the eigh actually runs at, not about nb.
-    nb_solve = round_up(nb, pad_div)
+    nb_solve = padded_axis(
+        nb, mesh_xy, name="SC eigensolver band carrier",
+        spec=band_sphere_spec(), axis=1).carrier
 
     if requested == "distributed":
         return "distributed"
@@ -1436,6 +1509,10 @@ def _sigma_c_at_dft_diag_from_dft_cube(
             "evaluation energies to rebuild Sigma_c(E_DFT)")
     diagonal_ev = np.asarray(extract_sigma_diag_replicated(
         sigma_c_omega_dft_ry, mesh)) * RYD_TO_EV
+    if sigma_result.sigma_band_axis is not None:
+        from runtime.padding import strip_axis
+        diagonal_ev = np.asarray(strip_axis(
+            diagonal_ev, sigma_result.sigma_band_axis, axis=-1))
     return interp_along_omega(
         diagonal_ev,
         np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
@@ -1530,6 +1607,7 @@ def run_fixed_sigma_evsc(
             f"run_fixed_sigma_evsc: E_DFT must be (nk,nb), got "
             f"{e_dft_ry.shape}.")
     nk, nb = (int(v) for v in e_dft_ry.shape)
+    band_axis = sigma_result.sigma_band_axis
     b0 = int(band_slices.b0)
     nb_sigma = int(band_slices.nb_sigma)
     if nb != nb_sigma:
@@ -1542,7 +1620,12 @@ def run_fixed_sigma_evsc(
             "run_fixed_sigma_evsc: the fixed-Sigma ladder needs an occupied "
             "and an unoccupied frontier inside the active window; got "
             f"b0={b0}, meta.nelec={int(meta.nelec)}, nb={nb}.")
-    expected_cube = (len(np.asarray(omega_ev)), nk, nb, nb)
+    nb_carrier = int(band_axis.carrier) if band_axis is not None else nb
+    if band_axis is not None and int(band_axis.logical) != nb:
+        raise ValueError(
+            "run_fixed_sigma_evsc: Sigma band receipt and DFT ladder "
+            f"disagree; receipt logical={band_axis.logical}, ladder nb={nb}.")
+    expected_cube = (len(np.asarray(omega_ev)), nk, nb_carrier, nb_carrier)
     if tuple(sigma_c_dft.shape) != expected_cube:
         raise ValueError(
             "run_fixed_sigma_evsc: full Sigma cube and DFT ladder disagree; "
@@ -1562,6 +1645,9 @@ def run_fixed_sigma_evsc(
     h0_dft = _place(h0_dft, mesh_xy, rotation_spec)
     sigma_c_dft = _place(
         sigma_c_dft, mesh_xy, P(None, None, "x", "y"))
+    if band_axis is not None:
+        from runtime.padding import pad_square
+        sigma_x_dft = pad_square(sigma_x_dft, band_axis)
     sigma_x_dft = _place(sigma_x_dft, mesh_xy, rotation_spec)
     omega_ev = np.asarray(omega_ev, dtype=np.float64)
     omega_ry = np.asarray(omega_ry, dtype=np.float64)
@@ -1692,14 +1778,20 @@ def run_fixed_sigma_evsc(
             sigma_x_qp = sigma_x_dft
             sigma_c_qp = sigma_c_dft
         else:
+            U_sigma = U_dft_to_qp
+            if band_axis is not None:
+                from runtime.padding import pad_square
+                U_sigma = pad_square(
+                    U_sigma, band_axis, pad_diagonal=1.0)
             sigma_x_qp = _rotate_fixed_matrix(
-                sigma_x_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
+                sigma_x_dft, U_sigma, mesh=mesh_xy, to_qp=True)
             sigma_c_qp = _rotate_sigma_omega_cube(
-                sigma_c_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
+                sigma_c_dft, U_sigma, mesh=mesh_xy, to_qp=True)
 
         sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
             sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
-            replicated_output=False)
+            replicated_output=(band_axis is not None and band_axis.pad > 0),
+            band_axis=band_axis)
         if int(diagnostics["n_clipped"]) != int(n_out):
             raise RuntimeError(
                 "run_fixed_sigma_evsc: omega_coverage/build_qsgw_sigma_xc "
@@ -3155,6 +3247,32 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             "density-SC direct-field owner")
     _check_sigma_stage(sigma_result, print_fn=inputs.print_fn)
 
+    # Form the complete full-BZ update before selecting it.  This is the
+    # incumbent numerical order pinned by the SC trajectory; selecting V_H
+    # and Sigma_xc separately and adding their loop rows is algebraically
+    # equivalent but changes the compiled arithmetic graph.
+    delta_h_qp_full = (
+        sigma_result.sigma_xc_kij_ry
+        if exact_hartree_dft is not None
+        else sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry)
+    sigma_xc_unextrap_full = getattr(
+        sigma_result, "sigma_xc_kij_ry_unextrap", None)
+    delta_h_qp_unextrap_full = (
+        None if sigma_xc_unextrap_full is None else
+        sigma_xc_unextrap_full
+        if exact_hartree_dft is not None else
+        sigma_result.v_h_kij_ry + sigma_xc_unextrap_full)
+
+    # THE ONE RETAINED-TABLE K-SET SEAM.  Sigma and density-SC Hartree need
+    # full-BZ inputs while they are being built.  From this point onward the
+    # map, every diagnostic and every SC output record sees only the loop's
+    # k-set; no consumer selects one table independently.
+    (sigma_result, sigma_basis_U, exact_hartree_dft, delta_h_qp,
+     delta_h_qp_unextrap) = (
+        _sc_output_tables_on_loop_kset(
+            sigma_result, delta_h_qp_full, delta_h_qp_unextrap_full,
+            U_full, exact_hartree_dft, ks))
+
     # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
     # (as if every band were protected); the partition step below masks
     # off non-protected off-diagonals and overrides out-of-range
@@ -3165,40 +3283,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # rotation, which is the whole reason it is contracted with ψ_dft.
     # Under density-SC the direct field is caller-owned and SigmaResult uses
     # a scalar-zero sentinel rather than allocating a full zero band matrix.
-    delta_h_qp = (
-        sigma_result.sigma_xc_kij_ry
-        if exact_hartree_dft is not None
-        else sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry)
-    if not ks.is_identity:
-        # Σ ARRIVES ON THE FULL BZ AND IS SELECTED HERE.  Selection is a
-        # row take, not a symmetry operation -- these ARE the IBZ k.  The
-        # star spread is the free check that the two k-sets agree, and the
-        # only one that catches a gauge mismatch upstream; hermiticity,
-        # the norm and the electron count all survive one.
-        # ``spread_rel`` does both reductions (residual and scale) in one
-        # compiled module and brings back 16 bytes, where the two-call form
-        # read this (nk, nb, nb) array back twice to print one line.  Its
-        # scalar read still synchronises, but the iteration synchronises
-        # anyway in ``_run_linear_mixing`` / ``_run_rcrop``.
-        # MOVED, 2026-08-16: the star-spread enforcement used to run HERE,
-        # on the raw Sigma+V_H, and that is a different object from the one
-        # that ships.  ``apply_band_partition`` below zeroes every
-        # off-diagonal outside protected x protected, so it is the LAST thing
-        # that can break the star relation -- and until the partition was
-        # promoted to whole multiplets it could, by treating two members of a
-        # degenerate manifold differently.  Checking before it ran meant the
-        # gate certified an object the loop then modified.  See the call after
-        # ``apply_band_partition``.
-        delta_h_qp = ks.select(delta_h_qp)
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     exact_hartree_terms = None
     if exact_hartree_dft is not None:
         scalar = exact_hartree_dft.scalar_dft
         transverse = exact_hartree_dft.transverse_dft
-        if not ks.is_identity:
-            scalar = ks.select(scalar)
-            if transverse is not None:
-                transverse = ks.select(transverse)
         exact_hartree_terms = (scalar, transverse)
         delta_h_dft = (
             _add_exact_scalar_hartree(delta_h_dft, scalar)
@@ -3241,17 +3330,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # so the two Hamiltonians differ in exactly one thing: whether Σ_c
     # carries the extrapolated band tail.  It is diagonalized, reported and
     # dropped; it never reaches the carry, rCROP or any artifact.
-    sigma_xc_unextrap = getattr(
-        sigma_result, "sigma_xc_kij_ry_unextrap", None)
-    if sigma_xc_unextrap is not None:
-        delta_h_qp_n3 = (
-            sigma_xc_unextrap
-            if exact_hartree_dft is not None
-            else sigma_result.v_h_kij_ry + sigma_xc_unextrap)
-        if not ks.is_identity:
-            delta_h_qp_n3 = ks.select(delta_h_qp_n3)
+    if delta_h_qp_unextrap is not None:
         delta_h_dft_n3 = _rotate_to_dft_basis(
-            delta_h_qp_n3, U_qp, mesh=inputs.mesh_xy)
+            delta_h_qp_unextrap, U_qp, mesh=inputs.mesh_xy)
         if exact_hartree_terms is not None:
             scalar, transverse = exact_hartree_terms
             delta_h_dft_n3 = (
@@ -3387,12 +3468,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         head_surface_weight_kn=entry_surface_weight_kn,
         outputs=SCOutputs(
             sigma_result=sigma_result,
-            # FULL-BZ U.  These two fields are consumed TOGETHER by
-            # run_sc_driver's final rotate-back, so they must share a
-            # k-set, and ``sigma_result``'s is the full BZ by
-            # construction -- compute_sigma_xc runs there.  Storing the
-            # IBZ U_qp here is the mismatch that raised 'k' 10 vs 16.
-            sigma_basis_U=U_full,
+            # The defining U and SigmaResult were selected together by the
+            # seam above; their k axes cannot diverge in a later consumer.
+            sigma_basis_U=sigma_basis_U,
             scissor_fit=scissor_fit,
             tail_scissor_fit=tail_fit,
             screening=SCMapScreeningArtifacts(
@@ -3714,7 +3792,7 @@ def _sc_z_factors(
 ) -> np.ndarray:
     """Return per-state Z for the exact dynamic Sigma built by one map.
 
-    The Sigma cube and evaluation ladder are full-BZ quantities in the
+    The Sigma cube and evaluation ladder are on the loop's k-set in the
     current QP basis.  Diagonal extraction is collective for a band-sharded
     cube, so every rank calls this before the snapshot writer's rank gate.
     Static modes have zero frequency derivative and therefore return one.
@@ -3733,6 +3811,10 @@ def _sc_z_factors(
         extract_sigma_diag_replicated(cube, inputs.mesh_xy),
         dtype=np.complex128,
     ) * RYD_TO_EV
+    if sigma.sigma_band_axis is not None:
+        from runtime.padding import strip_axis
+        sigma_c_diag_ev = np.asarray(strip_axis(
+            sigma_c_diag_ev, sigma.sigma_band_axis, axis=-1))
     _, z_factor = compute_z_factor_from_omega_grid(
         sigma_c_omega_diag_ev=sigma_c_diag_ev,
         omega_rel_ev=np.asarray(omega, dtype=np.float64),
@@ -3749,10 +3831,10 @@ def _dump_sc_rotation(
 ) -> str | None:
     """Persist the exact DFT→QP rotation consumed by one SC map.
 
-    ``sigma_basis_U`` is already the full-BZ rotation paired with this map's
-    Sigma result.  The dump is opt-in through ``sc_dump_dir`` and is small for
-    diagnostic windows.  Every rank joins the gather and the post-write
-    barrier; only rank zero writes the ``.npy`` file.
+    ``sigma_basis_U`` is already the loop-k-set rotation paired with this
+    map's Sigma result.  The dump is opt-in through ``sc_dump_dir`` and is
+    small for diagnostic windows.  Every rank joins the gather and the
+    post-write barrier; only rank zero writes the ``.npy`` file.
     """
     dump_dir = inputs.config.sc.dump_dir
     if not dump_dir:
@@ -3806,12 +3888,11 @@ def _sc_map_gain_for_call(
         return None, None
     e_now = np.asarray(e_input_ev, dtype=np.float64)
     sigma_now = np.asarray(sigma_on_shell, dtype=np.complex128)
-    if e_now.shape[0] != sigma_now.shape[0]:
-        # H/E/U live on the IBZ while Sigma is built on the full BZ (the
-        # KStarMap k-set invariant).  Measure both on Sigma's k-set so the
-        # worst state names one row of the Sigma table.  Si b80/c504 P4:
-        # E=(8,16) against Sigma=(64,16) refused every QSGW map 2.
-        e_now = np.asarray(_kstar(inputs).broadcast(e_now), dtype=np.float64)
+    if e_now.shape != sigma_now.shape:
+        raise ValueError(
+            "SC map gain: retained E and Sigma tables must already share "
+            f"the loop k-set and band window, got E={e_now.shape}, "
+            f"Sigma={sigma_now.shape}")
     current = (e_now.copy(), sigma_now.copy())
     if previous is None:
         return None, current
@@ -3933,19 +4014,21 @@ def _write_sc_eqp_snapshot(
             reduce_full_bz_to_file_wedge(sym, np.asarray(a)),
             dtype=np.float64)
 
+    def _loop_to_file_wedge(a):
+        table = np.asarray(a)
+        if state_out.outputs.sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
+            table = unfold_star_wedge_to_full_bz(sym, table)
+        return _to_file_wedge(table)
+
     kpoints = _to_file_wedge(
         np.asarray(sym.unfolded_kpts, dtype=np.float64))
     e_dft = _to_file_wedge(
         np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV)
-    if getattr(inputs, "kstar", None) is None:
-        e_output = _to_file_wedge(e_output)          # loop ran full-BZ
-    else:
-        e_output = _to_file_wedge(                    # loop ran star-wedge
-            unfold_star_wedge_to_full_bz(sym, e_output))
+    e_output = _loop_to_file_wedge(e_output)
     sigma_e_eval = state_out.outputs.sigma_result.e_eval_ev
-    e_eval = (e_output.copy() if sigma_e_eval is None else _to_file_wedge(
+    e_eval = (e_output.copy() if sigma_e_eval is None else _loop_to_file_wedge(
         np.asarray(sigma_e_eval, dtype=np.float64)))
-    z_factor = _to_file_wedge(z_factor_full)
+    z_factor = _loop_to_file_wedge(z_factor_full)
     if e_eval.shape != e_output.shape or z_factor.shape != e_output.shape:
         raise ValueError(
             "SC eqp1 snapshot shape mismatch after file-wedge reduction: "
@@ -4430,7 +4513,7 @@ def _run_rcrop(
     #
     # An nb that already divides pads by zero rows: ``pad_axis`` returns
     # the SAME array, so the production path is byte-identical to before.
-    from runtime.padding import pad_axis, round_up, spec_divisor
+    from runtime.padding import pad_square, padded_axis
 
     spec = _band_rotation_spec()
     px, py = (int(mesh.shape[a]) for a in mesh.axis_names)
@@ -4440,14 +4523,14 @@ def _run_rcrop(
     # the mesh here is how the loader and the sweep would drift apart.
     # ONE extent for BOTH axes, so the carry stays square — the residual is
     # H_out − H_in and the re-Hermitisation below both need that.
-    band_div = _math.lcm(spec_divisor(mesh, spec, 1),
-                         spec_divisor(mesh, spec, 2))
-    nb_pad = round_up(nb, band_div)
+    band_axis = padded_axis(
+        nb, mesh, name="SC history band carrier",
+        specs=((spec, 1), (spec, 2)))
+    band_div = band_axis.divisor
+    nb_pad = band_axis.carrier
 
     def _pad_bands(A):
-        A = pad_axis(A, band_div, axis=1).array
-        A = pad_axis(A, band_div, axis=2).array
-        return A
+        return pad_square(A, band_axis, axes=(1, 2))
 
     entry_sh = NamedSharding(mesh, spec)
     x0 = jax.device_put(_pad_bands(H0), entry_sh)
@@ -4634,6 +4717,26 @@ def _run_rcrop(
     # that should not have existed.  Local precision can disguise a
     # global error, so the factor is gone rather than corrected.
 
+    # THE ACCELERATOR FITS ONLY THE NON-SCISSORED BLOCK.  The carry holds
+    # every active band, but the scissored tail is re-derived from its own
+    # (alpha, beta) refit each map and moves by eV per map (Na eta=0.5,
+    # bands 41-86 at 30-96 eV: 0.7-3.9 eV per map while bands 5-10 moved
+    # 35-70 meV; runs/Na/12_sc_observables_eta05_2026-09-04 arm A).  Those
+    # entries are not a self-consistency residual, and letting them into
+    # the Gram steered the coefficients (entry mu 2.09 eV at map 2).  The
+    # criterion already excludes them; so does the metric now.  All-true
+    # mask (a semiconductor's full window): weights of exactly 1.0, the
+    # unweighted solve bit for bit.
+    _init_partition = state_init.partition
+    _fit_mask = (np.asarray(_init_partition.protected_mask, bool).reshape(-1)
+                 | np.asarray(_init_partition.in_range_mask, bool).reshape(-1))
+    _nbp = int(x0.shape[-1])
+    _metric_np = np.zeros((1, _nbp, _nbp), dtype=np.float64)
+    _metric_np[0, :_fit_mask.size, :_fit_mask.size] = np.outer(_fit_mask, _fit_mask)
+    print_fn(
+        f"  SC rCROP metric: Gram over the non-scissored block only "
+        f"(bands {_band_ranges(_fit_mask, band_offset=int(inputs.band_slices.sigma.start))}, "
+        f"{int(_fit_mask.sum())} of {_fit_mask.size}; scissored rows follow the map)")
     try:
         result = rcrop_nojit(
             residual_fn,
@@ -4644,6 +4747,7 @@ def _run_rcrop(
             tol=0.0,   # see above: rCROP does not decide convergence
             print_fn=None,  # we print our own RMS-ΔE history above
             entry_sharding=entry_sh,
+            metric=jnp.asarray(_metric_np),
         )
     except _Converged as stop:
         # The criterion fired inside the map.  Return the accepted
@@ -5210,7 +5314,9 @@ def run_sc_driver(
                      "singleton on this deck; running on the full BZ.")
         else:
             kstar = kstar_io
-            print_fn(f"  SC: {kstar!r} — H/E/U on the IBZ, Σ on the full BZ")
+            print_fn(
+                f"  SC: {kstar!r} — H/E/U and retained Σ on the star "
+                "wedge; full BZ exists only inside each map")
             # Device gather — ``np.asarray`` here would raise "spans
             # non-addressable devices" the moment ``kin_ion`` arrives
             # sharded, and it is the same (nk, nb, nb) object as U.
@@ -5432,9 +5538,16 @@ def run_sc_driver(
     # routes each kind correctly; only the spec changed.
     U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
                _band_rotation_spec())
+    U_sigma = U
+    if sigma_result.sigma_band_axis is not None:
+        from runtime.padding import pad_square
+        U_sigma = _place(
+            pad_square(
+                U, sigma_result.sigma_band_axis, pad_diagonal=1.0),
+            mesh_xy, _band_rotation_spec())
     sigma_c_omega_dft = (
         _rotate_sigma_omega_cube(
-            sigma_result.sigma_c_omega_kij_ry, U,
+            sigma_result.sigma_c_omega_kij_ry, U_sigma,
             mesh=mesh_xy, to_qp=False)
         if sigma_result.sigma_c_omega_kij_ry is not None else None)
     sigma_c_at_dft_dft = (
@@ -5664,7 +5777,8 @@ def dump_sigma_omega_h5_final(
 ) -> str | None:
     """Write the converged ``sigma_mnk.h5`` once after SC convergence.
 
-    Pulls the full ω-grid Σ_c tensor from ``state.outputs.sigma_result``
+    Pulls the loop-k-set ω-grid Σ_c tensor from
+    ``state.outputs.sigma_result``
     (which the iteration map captures from each
     :func:`compute_sigma_xc` call but does NOT write to disk during SC
     iterations — see the ``write_sigma_omega_h5=False`` flag in
@@ -5707,12 +5821,11 @@ def dump_sigma_omega_h5_final(
     from .dynamic_sigma import write_sigma_omega
     from .qsgw_utils import write_qsgw_sigma_cube
 
-    # ``sym`` TURNS THE k_irr EXTRACTION ON, and the ordering it needs is
-    # already the ordering this function has: Sigma arrives on the full BZ
-    # (``H/E/U on the IBZ, Sigma on the full BZ``), the accumulation is
-    # complete and the kernel has exited by the time the SC loop reaches
-    # convergence, and only then is this called.  The writer measures the
-    # star spread on those complete rows before dropping any.
+    # Sigma already crossed the map's one k-set seam with every retained
+    # table.  The terminal writer stamps those star-wedge rows directly; it
+    # must not select them a second time.
+    star_already_selected = (
+        sigma_result.kset == SIGMA_KSET_STAR_WEDGE)
     path = write_sigma_omega(
         sigma_result.sigma_c_omega_kij_ry,
         sig_x=sigma_result.sigma_x_kij_ry,
@@ -5745,7 +5858,9 @@ def dump_sigma_omega_h5_final(
             - float(sigma_result.efermi_dft_ev)),
         eval_energies_provenance="self_consistent_qp",
         omega_coverage=sigma_result.omega_coverage,
-        sym=sym, print_fn=print_fn,
+        band_axis=sigma_result.sigma_band_axis,
+        sym=sym, star_already_selected=star_already_selected,
+        print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")
     # THE QSGW CUBE, WRITTEN WHERE IT IS STILL IN ITS OWN BASIS.  Under
@@ -5757,11 +5872,12 @@ def dump_sigma_omega_h5_final(
     # call, and appending it AFTER that would put one DFT-basis matrix in
     # a file of QP-basis ones with matching shape, dtype and stamp.
     # Nothing downstream would notice; this seam is the reason it cannot
-    # happen.  Full BZ either way, so the k_irr extraction that ran on
-    # the cubes above runs on this one identically.
+    # happen.  It carries the same loop k-set as the cubes above and is
+    # stamped without another extraction.
     write_qsgw_sigma_cube(
         path, sigma_result.sigma_xc_kij_ry,
-        config=config, print_fn=print_fn)
+        config=config, star_already_selected=star_already_selected,
+        print_fn=print_fn)
     return path
 
 

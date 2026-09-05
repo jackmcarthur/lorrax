@@ -130,21 +130,11 @@ def assert_band_chunks_divisible(band_chunk_ranges, world_size: int) -> None:
     p = int(world_size)
     if p <= 0:
         raise ValueError(f"world_size must be positive, got {world_size!r}")
-    bad = [(i, int(b_lo), int(b_hi))
-           for i, (b_lo, b_hi) in enumerate(band_chunk_ranges)
-           if (int(b_hi) - int(b_lo)) % p]
-    if not bad:
-        return
-    detail = "; ".join(
-        f"chunk {i} = [{lo}, {hi}) is {hi - lo} bands, which floor-divides "
-        f"to {(hi - lo) // p} per rank and drops {(hi - lo) % p}"
-        for i, lo, hi in bad)
-    raise ValueError(
-        f"PsiGStore: band-chunk width is not divisible by the world size "
-        f"{p}, so the per-rank band tile would silently drop the "
-        f"remainder.  {detail}.  Set band_chunk_size to a multiple of {p}, "
-        f"or pad the transport range up to one the way gw.isdf_fitting "
-        f"does (`_bfe_transport`) and zero the non-physical tail bands.")
+    from runtime.padding import authenticate_padded_axis
+    for i, (b_lo, b_hi) in enumerate(band_chunk_ranges):
+        authenticate_padded_axis(
+            int(b_hi) - int(b_lo), int(b_hi) - int(b_lo), p,
+            name=f"PsiGStore band chunk {i} [{int(b_lo)}, {int(b_hi)})")
 
 
 class PsiGStore:
@@ -546,14 +536,14 @@ class PsiGStore:
         from common.wfn_transforms import prepare_rchunk_carrier
         r_start = int(r_start)
         r_end = int(r_end)
-        n_r_carrier, _, finish_r_carrier = prepare_rchunk_carrier(
+        r_axis, _, finish_r_carrier = prepare_rchunk_carrier(
             self.mesh,
             r_start=r_start,
             r_end=r_end,
             n_rtot=self.meta.n_rtot,
             product_r_spec=product_r_spec,
         )
-        kernel = self._rchunk_kernel(n_r_carrier)
+        kernel = self._rchunk_kernel(r_axis.carrier)
         r_start_dev = jnp.asarray(r_start, dtype=jnp.int32)
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
             psi_band_r = kernel(

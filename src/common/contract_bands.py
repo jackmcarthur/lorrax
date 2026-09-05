@@ -285,17 +285,6 @@ def bands_gemm_ffi_enabled() -> bool:
 # The primitive
 # ---------------------------------------------------------------------------
 
-_DIVISIBILITY_MSG = (
-    "contract_bands_block_reshard needs the band window divisible by the "
-    "mesh: m={m} must be a multiple of p_{ax_x}={px} and n={n} of "
-    "p_{ax_y}={py} (the two psum_scatters tile m over '{ax_x}' and n over "
-    "'{ax_y}').  Pad m and n INDEPENDENTLY (m -> p_{ax_x}, n -> p_{ax_y}) "
-    "at the caller and strip the zero pad downstream — do NOT round to a "
-    "multiple of the p_{ax_x}*p_{ax_y} product (up to 3.16x tile waste; "
-    "audit fix/zq 2026-07-28).  Sigma callers: gw.ppm_sigma.pad_sigma_window "
-    "is the existing helper.{hint}")
-
-
 #: ``(nk, nb_full, n_rmu, nspinor)`` — the four static ints
 #: :func:`contract_bands_block_reshard`'s face path needs to build its two
 #: ``distrib_la.gemm_plan``s EAGERLY (their shapes are fixed at
@@ -306,8 +295,14 @@ _DIVISIBILITY_MSG = (
 FaceProjectShape = tuple
 
 
-def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
-                         channels: str = "none", right_face_shape=None):
+def _face_project_kernel(
+    mesh_xy: Mesh,
+    face_shape,
+    axes: tuple[str, str],
+    channels: str = "none",
+    right_face_shape=None,
+    band_extent=None,
+):
     """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
     no psum_scatter — cuBLASMp's own distributed algorithm does the
     reduction the legacy body does by hand.  See the module docstring's
@@ -350,6 +345,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
 
     ax_x, ax_y = axes
     nk, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
+    nb_project = nb_full if band_extent is None else int(band_extent)
     if right_face_shape is None:
         right_face_shape = face_shape
     nk_right, nb_right, n_rmu_right, ns_right = (
@@ -361,9 +357,9 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
             f"{face_shape} and {right_face_shape}")
     mu_s_left = n_rmu_left * ns
     mu_s_right = n_rmu_right * ns
-    plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_full, nq=nk,
+    plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_project, nq=nk,
                       dtype=jnp.complex128)
-    plan2 = gemm_plan(mesh_xy, m=nb_full, k=mu_s_left, n=nb_full, nq=nk,
+    plan2 = gemm_plan(mesh_xy, m=nb_project, k=mu_s_left, n=nb_project, nq=nk,
                       dtype=jnp.complex128)
 
     def _check(psi_nmu, O, psi_mun):
@@ -375,9 +371,9 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
                 f"{tuple(psi_nmu.shape)}, {tuple(O.shape)}, "
                 f"{tuple(psi_mun.shape)}")
         expected = (
-            (nk, nb_full, ns, n_rmu_left),
+            (nk, nb_project, ns, n_rmu_left),
             (nk, ns, n_rmu_left, ns, n_rmu_right),
-            (nk, ns, n_rmu_right, nb_full),
+            (nk, ns, n_rmu_right, nb_project),
         )
         got = (tuple(psi_nmu.shape), tuple(O.shape), tuple(psi_mun.shape))
         if got != expected:
@@ -425,10 +421,10 @@ def contract_bands_block_reshard(
     channels: str = "none",
     extra: str = "none",
     axes: tuple[str, str] = ("x", "y"),
-    divisibility_hint: str = "",
     layout: str = "legacy",
     face_shape=None,
     right_face_shape=None,
+    face_band_extent=None,
 ) -> Callable:
     """Build the band projection + reshard primitive (module docstring).
 
@@ -464,8 +460,6 @@ def contract_bands_block_reshard(
     axes
         Mesh axis names ``(ax_x, ax_y)``; ax_x shards μ/m, ax_y shards
         ν/n.  Default matches every production mesh.
-    divisibility_hint
-        Extra caller-specific text appended to the divisibility refusal.
     layout
         ``"legacy"`` (default): the shard_map + psum_scatter body below,
         BYTE-IDENTICAL to the code this module shipped before
@@ -529,7 +523,8 @@ def contract_bands_block_reshard(
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
         return _face_project_kernel(
             mesh_xy, face_shape, axes, channels=channels,
-            right_face_shape=right_face_shape)
+            right_face_shape=right_face_shape,
+            band_extent=face_band_extent)
 
     from common.shard_map import shard_map
 
@@ -582,9 +577,6 @@ def contract_bands_block_reshard(
         #   extra='leading' where the GEMM plan matters.
         if _BANDS_GEMM_GATE.resolve(mesh_xy) is None or extra == "minor":
             use_ffi = False
-
-    p_x = mesh_xy.shape[ax_x]
-    p_y = mesh_xy.shape[ax_y]
 
     # -- rank-local GEMM helpers ---------------------------------------
     # The LARGE right contraction, optionally through the FFI handler.
@@ -787,11 +779,13 @@ def contract_bands_block_reshard(
                 f"channels='none' (the de-promoted chain applies "
                 f"automatically).")
         m, n = int(psi_left.shape[1]), int(psi_right.shape[3])
-        if m % p_x or n % p_y:
-            raise ValueError(_DIVISIBILITY_MSG.format(
-                m=m, n=n, px=p_x, py=p_y, ax_x=ax_x, ax_y=ax_y,
-                hint=(("  " + divisibility_hint) if divisibility_hint
-                      else "")))
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            m, m, mesh_xy, name="band projector left carrier",
+            spec=P(None, ax_x, None, None), axis=1)
+        authenticate_padded_axis(
+            n, n, mesh_xy, name="band projector right carrier",
+            spec=P(None, None, None, ax_y), axis=3)
 
     def _project(psi_left, o, psi_right):
         _check_shapes(psi_left, o, psi_right)

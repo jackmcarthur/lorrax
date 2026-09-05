@@ -258,7 +258,7 @@ def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
     rng = np.random.default_rng(seed)
     layout = PhotonBasisLayout.from_centroid_extents(4, 3, mesh)
     n_packed = layout.packed_extent
-    charge_extent = layout.padded_extent(0)
+    charge_extent = layout.carrier_extent(0)
 
     # Magnitudes are physical-scale, not decorative: the slab kernel has
     # v(q) -> 8*pi*zc/q, so the charge screening strength is 8*pi*f2d*S and
@@ -335,7 +335,7 @@ def _fixture(mesh, *, sigma_H, wings=True, seed=20260901):
     # g0_Y carrying the same values as g0_X; two independent draws break it.
     g0_hosts = []
     for row in range(4):
-        width = layout.padded_extent(row)
+        width = layout.carrier_extent(row)
         logical = layout.logical_extent(row)
         vec = np.zeros((1, width), dtype=np.complex128)
         vec[0, :logical] = (rng.normal(size=logical)
@@ -361,7 +361,7 @@ def _logical_mask(layout, mesh):
     """
     ones = []
     for row in range(4):
-        vec = np.zeros((1, layout.padded_extent(row)), dtype=np.complex128)
+        vec = np.zeros((1, layout.carrier_extent(row)), dtype=np.complex128)
         vec[0, :layout.logical_extent(row)] = 1.0
         ones.append(_put(vec, mesh, P(None, "x")))
     packed = _gather(pack_photon_channel_vectors(

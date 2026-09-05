@@ -62,12 +62,12 @@ before, often 8x less.
 
 THE DURABLE FIX IS TO NOT NEED THIS AT ALL
 ------------------------------------------
-:func:`padded_extent` is the other half of the module and the one that should
+:func:`runtime.padding.padded_axis` is the producer half and the one that should
 be reached for first: pad the extent so the requested spec is legal, instead
 of degrading the spec so the extent fits.
 
 * ``bandstructure.bse_setup`` now pads its **q-batch** with it —
-  ``padded_extent(mesh, ('x','y'), batch_size)``.  Measured on the MoS2 4x4
+  ``padded_axis(batch_size, mesh, spec=P(('x','y')), axis=0)``.  Measured on the MoS2 4x4
   deck, 91-Q exciton path: the 32-wide batch could not split 64 devices, so
   every device ran all 32 ``eigh`` instead of its own share, and
   ``htransform_psi_cQ`` cost 866.5 s at P=64 against 105.7 s at P=16 (jobs
@@ -92,7 +92,7 @@ from __future__ import annotations
 from itertools import combinations
 from runtime.padding import spec_divisor
 
-__all__ = ["legal_spec", "fit_sharding", "shard_factor", "padded_extent"]
+__all__ = ["legal_spec", "fit_sharding", "shard_factor"]
 
 _ANNOUNCED: set = set()
 
@@ -105,24 +105,6 @@ def shard_factor(mesh, entry) -> int:
     axis.
     """
     return spec_divisor(mesh, (entry,), axis=0)
-
-
-def padded_extent(mesh, entry, n: int) -> int:
-    """Smallest extent >= ``n`` that ``entry`` can split evenly.
-
-    THE first-choice call: pad the extent so the intended spec is legal,
-    rather than degrade the spec so the extent fits.  ``entry`` is a
-    ``PartitionSpec`` entry (``None`` / ``'x'`` / ``('x','y')``), so the
-    divisor comes from the same :func:`shard_factor` the fitter uses — a call
-    site cannot pad against one divisor and be judged against another.
-
-    Zero pad rows are the caller's responsibility and are only ever a
-    PLACEMENT concern here: the q-batch pad in ``bse_setup`` is extra q-points
-    whose results are sliced off, not extra terms in a sum.
-    """
-    from runtime.padding import round_up
-
-    return round_up(int(n), shard_factor(mesh, entry))
 
 
 def _largest_divisible_subset(mesh, names, dim: int):
@@ -140,7 +122,9 @@ def _largest_divisible_subset(mesh, names, dim: int):
         for sub in combinations(range(len(names)), k):
             picked = tuple(names[i] for i in sub)
             p = shard_factor(mesh, picked)
-            if dim % p == 0:
+            from runtime.padding import padded_axis
+            if padded_axis(
+                    dim, p, name="candidate sharding subset").carrier == dim:
                 return picked
     return ()
 
@@ -175,7 +159,8 @@ def legal_spec(mesh, spec, shape, what: str = "", print_fn=None,
             out.append(e)
             continue
         dim = int(shape[i]) if i < len(shape) else 0
-        if dim % n == 0:
+        from runtime.padding import padded_axis
+        if padded_axis(dim, n, name="candidate sharding spec").carrier == dim:
             out.append(e)
             continue
         # Tuple entries flatten several mesh axes onto ONE array axis, so a
@@ -223,7 +208,7 @@ def legal_spec(mesh, spec, shape, what: str = "", print_fn=None,
             f"(x{want // got if got else want} the intended "
             f"{elems * int(itemsize) / float(want) / 1024 ** 3:.3f} GiB; "
             f"assumes {itemsize} B/element).  Durable fix: pad the extent — "
-            f"sharding_fit.padded_extent (see common/sharding_fit.py).")
+            "runtime.padding.padded_axis with the intended PartitionSpec.")
     return P(*out)
 
 

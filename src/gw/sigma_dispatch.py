@@ -34,7 +34,7 @@ file write, QSGW build).
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Callable
 
@@ -46,6 +46,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
+from runtime.padding import PaddedAxis
 from .gw_config import (
     BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
     band_extrapolation_is_consumable,
@@ -58,6 +59,11 @@ from .gw_config import (
 # ---------------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------------
+
+SIGMA_KSET_FULL_BZ = "full_bz"
+SIGMA_KSET_STAR_WEDGE = "star_wedge"
+SIGMA_KSETS = (SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE)
+
 
 @dataclass(frozen=True)
 class SigmaResult:
@@ -136,6 +142,7 @@ class SigmaResult:
     #: keeps the default path's object graph unchanged.
     sigma_xc_kij_ry_unextrap: jax.Array | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
+    sigma_band_axis: PaddedAxis | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     sigma_c_odd_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
@@ -150,6 +157,10 @@ class SigmaResult:
     #: answer the finalize interpolated with (audit A2), instead of
     #: re-deriving it from a config key one layer further from the choice.
     omega_reference_provenance: str | None = None
+    #: K-point set carried by every k-indexed table in this result.  A
+    #: one-shot result remains on the full BZ; the SC map changes the tag and
+    #: every table together at its single output seam.
+    kset: str = SIGMA_KSET_FULL_BZ
     #: :class:`gw.dynamic_sigma.OmegaCoverage` for the at-DFT interpolation
     #: — WHICH (k, n) the ω grid actually sampled, and what was done with the
     #: rest.  Carried on the result rather than recomputed by each writer
@@ -168,6 +179,10 @@ class SigmaResult:
     ppm_odd_even_residue_ratio: float | None = None
 
     def __post_init__(self) -> None:
+        if self.kset not in SIGMA_KSETS:
+            raise ValueError(
+                f"SigmaResult: invalid kset {self.kset!r}; expected one of "
+                f"{SIGMA_KSETS}")
         if self.hartree_omitted:
             if self.h_transverse_kij_ry is not None:
                 raise ValueError(
@@ -267,9 +282,11 @@ BASIS_FREE_FIELDS = (
     "omega_grid_ev",
     "omega_grid_ry",
     "sigma_omega_h5_path",
+    "sigma_band_axis",
     "photon_head_sigma_basis",
     "efermi_dft_ev",
     "omega_reference_provenance",
+    "kset",
     "band_extrapolation_counts",
     "band_extrapolation_estimator",
     "band_extrapolation_scheme",
@@ -277,6 +294,128 @@ BASIS_FREE_FIELDS = (
     "ppm_probe_hermiticity_residual",
     "ppm_odd_even_residue_ratio",
 )
+
+
+#: Axis carrying k for every k-indexed member of :class:`SigmaResult`.
+#: This is the complete ownership table for the SC map's one selection seam;
+#: a new retained Sigma table must be named here as well as in the basis
+#: partition above.  ``omega_coverage`` is handled through its ``mask_kn``.
+SIGMA_RESULT_K_AXES = {
+    "v_h_kij_ry": 0,
+    "v_h_scalar_kij_ry": 0,
+    "h_transverse_kij_ry": 0,
+    "sigma_x_kij_ry": 0,
+    "sigma_xc_kij_ry": 0,
+    "sigma_xc_kij_ry_unextrap": 0,
+    "sigma_sx_kij_ry": 0,
+    "sigma_coh_kij_ry": 0,
+    "sigma_lorentz_skij_ry": 1,
+    "photon_head_sigma_diag_tskn_ry": 2,
+    "sigma_c_omega_kij_ry": 1,
+    "sigma_c_at_dft_diag_ev": 0,
+    "sigma_c_odd_at_dft_diag_ev": 0,
+    "omega_dft_rel_ev": 0,
+    "e_eval_ev": 0,
+    "head_sigma_diag_w_kn_ry": 1,
+    "omega_coverage": 0,
+}
+
+
+def sigma_result_on_kset(
+    result: SigmaResult, *, kset: str, nk: int,
+    select_rows: Callable | None = None,
+) -> SigmaResult:
+    """Return one Sigma result whose every k table is on ``kset``.
+
+    This is the named k-set boundary shared by both driver paths.  The
+    one-shot driver calls it without ``select_rows`` to certify that its
+    result is on the full BZ.  The SC map calls it once with
+    :meth:`symmetry_maps.KStarMap.select` to move the complete result from
+    the full BZ to the loop's star wedge.  Consumers may validate the tag;
+    they must not select an individual retained table again.
+
+    Parameters
+    ----------
+    result
+        Sigma pipeline result.  All populated k-indexed members must share
+        its ``result.kset``.
+    kset
+        Target k-set, either ``"full_bz"`` or ``"star_wedge"``.
+    nk
+        Exact row count on the target k-set.
+    select_rows
+        Optional leading-axis full-BZ-to-star-wedge selector.  Supplying it
+        is the only supported k-set transition.
+
+    Returns
+    -------
+    SigmaResult
+        A validated result with all populated k axes of length ``nk``.
+    """
+    if kset not in SIGMA_KSETS:
+        raise ValueError(
+            f"sigma_result_on_kset: invalid target {kset!r}; expected one "
+            f"of {SIGMA_KSETS}")
+    if select_rows is None:
+        if result.kset != kset:
+            raise ValueError(
+                "sigma_result_on_kset: changing k-set requires the map "
+                f"selector ({result.kset!r} -> {kset!r})")
+    elif not (result.kset == SIGMA_KSET_FULL_BZ
+              and kset == SIGMA_KSET_STAR_WEDGE):
+        raise ValueError(
+            "sigma_result_on_kset: the selector is only valid for the "
+            f"full-BZ -> star-wedge seam, got {result.kset!r} -> {kset!r}")
+
+    updates = {}
+    for name, k_axis in SIGMA_RESULT_K_AXES.items():
+        value = getattr(result, name)
+        if value is None:
+            continue
+        if name == "omega_coverage":
+            value = value.mask_kn
+        shape = tuple(np.shape(value))
+        if not shape:
+            if result.hartree_omitted and name in {
+                    "v_h_kij_ry", "v_h_scalar_kij_ry"}:
+                continue
+            raise ValueError(
+                f"sigma_result_on_kset: {name} has no k axis: {shape}")
+        if k_axis >= len(shape):
+            raise ValueError(
+                f"sigma_result_on_kset: {name} shape {shape} has no axis "
+                f"{k_axis}")
+
+        selected = value
+        if select_rows is not None:
+            if k_axis:
+                moveaxis = (jnp.moveaxis if isinstance(value, jax.Array)
+                            else np.moveaxis)
+                selected = moveaxis(value, k_axis, 0)
+                selected = select_rows(selected)
+                selected = moveaxis(selected, 0, k_axis)
+            else:
+                selected = select_rows(value)
+        if int(np.shape(selected)[k_axis]) != int(nk):
+            raise ValueError(
+                f"sigma_result_on_kset: {name} k axis has "
+                f"{np.shape(selected)[k_axis]} rows on {kset}, expected {nk}")
+
+        if name == "omega_coverage":
+            mask = np.asarray(selected, dtype=bool)
+            n_uncovered = int(mask.size - np.count_nonzero(mask))
+            updates[name] = replace(
+                result.omega_coverage,
+                mask_kn=mask,
+                n_uncovered=n_uncovered,
+                fraction_uncovered=(n_uncovered / mask.size
+                                    if mask.size else 0.0),
+            )
+        elif select_rows is not None:
+            updates[name] = selected
+
+    updates["kset"] = kset
+    return replace(result, **updates)
 
 
 def _place_band_rotation(U, mesh_xy, dtype):
@@ -371,6 +510,7 @@ def finalize_dynamic_sigma(
     sigma_c_body_omega: jax.Array,
     head_sigma_diag_w_kn_ry: np.ndarray | None,
     *,
+    sigma_band_axis: PaddedAxis | None,
     sig_x: jax.Array,
     sig_h: jax.Array,
     v_h_scalar: jax.Array | None = None,
@@ -432,7 +572,8 @@ def finalize_dynamic_sigma(
 
     with timing.section("gw_jax.dynamic_sigma_finalize"):
         sigma_c_omega = add_head_sigma_diag(
-            sigma_c_body_omega, head_sigma_diag_w_kn_ry)
+            sigma_c_body_omega, head_sigma_diag_w_kn_ry,
+            band_axis=sigma_band_axis)
 
         (sigma_c_at_dft_ev,
          omega_dft_rel_ev,
@@ -443,6 +584,7 @@ def finalize_dynamic_sigma(
             config=config,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy, print_fn=print_fn,
+            band_axis=sigma_band_axis,
             efermi_ry=efermi_ry,
             efermi_provenance=efermi_provenance,
         )
@@ -457,6 +599,7 @@ def finalize_dynamic_sigma(
                 config=config,
                 band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
                 mesh_xy=mesh_xy, print_fn=lambda *args, **kwargs: None,
+                band_axis=sigma_band_axis,
                 efermi_ry=efermi_ry,
                 efermi_provenance=efermi_provenance,
             )
@@ -505,6 +648,7 @@ def finalize_dynamic_sigma(
                     else "self_consistent_qp"),
                 omega_coverage=omega_coverage,
                 sym=sym, band_extrapolation=band_extrapolation,
+                band_axis=sigma_band_axis,
                 print_fn=print_fn,
             )
         else:
@@ -535,6 +679,7 @@ def finalize_dynamic_sigma(
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
+            band_axis=sigma_band_axis,
             **qsgw_edge_kwargs,
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
@@ -568,10 +713,12 @@ def finalize_dynamic_sigma(
         sigma_xc_qsgw_unextrap = None
         if sigma_c_body_omega_unextrap is not None:
             sigma_c_omega_unextrap = add_head_sigma_diag(
-                sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry)
+                sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
+                band_axis=sigma_band_axis)
             sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
                 sigma_c_omega_unextrap, sig_x_rep,
                 omega_grid_ev, e_qp_rel_ev, mesh_xy,
+                band_axis=sigma_band_axis,
                 **qsgw_edge_kwargs,
             )
 
@@ -606,6 +753,7 @@ def finalize_dynamic_sigma(
         sigma_lorentz_skij_ry=sigma_lorentz,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
         sigma_c_omega_kij_ry=sigma_c_omega,
+        sigma_band_axis=sigma_band_axis,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         sigma_c_odd_at_dft_diag_ev=sigma_c_odd_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
@@ -1364,6 +1512,7 @@ def compute_sigma_xc(
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
         return finalize_dynamic_sigma(
             body.sigma_c_kij, head_diag,
+            sigma_band_axis=body.band_axis,
             sig_x=sig_x, sig_h=sig_h,
             v_h_scalar=v_h_scalar, h_transverse=h_transverse,
             hartree_omitted=bool(omit_v_h),
@@ -1432,6 +1581,7 @@ def compute_sigma_xc(
     return finalize_dynamic_sigma(
         ppm_outputs.sigma_c_body_omega,
         ppm_outputs.head_sigma_diag_w_kn_ry,
+        sigma_band_axis=ppm_outputs.band_axis,
         photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
         photon_head_sigma_basis=photon_head_sigma_basis,
         sigma_lorentz_static_skij_ry=sigma_lorentz,

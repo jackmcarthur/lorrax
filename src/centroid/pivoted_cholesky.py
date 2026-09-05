@@ -79,13 +79,14 @@ from common.pivoted_cholesky import (
     make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
 )
-from runtime.padding import round_up
 from runtime.production_stream import failure_output_streams
 
 from . import distribution as dist
 
 import symmetry_maps                                            # noqa: E402
 
+
+_SELECT_HEARTBEAT_S = 60.0
 
 _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
@@ -106,10 +107,12 @@ def _report_logical_gram_diagonal(G, n_logical: int, *, verbose: bool,
     """Collectively measure a distributed Gram diagonal and print on rank 0."""
     diag_min, diag_max = _logical_gram_diagonal_extrema(G, n_logical)
     jax.block_until_ready((diag_min, diag_max))
+    diag_min_value = float(diag_min)
+    diag_max_value = float(diag_max)
     if verbose:
         print_fn(
             f"[pivoted_cholesky] G built, shape=({n_logical}, {n_logical}), "
-            f"diag range [{float(diag_min):.3e}, {float(diag_max):.3e}]")
+            f"diag range [{diag_min_value:.3e}, {diag_max_value:.3e}]")
     return diag_min, diag_max
 
 
@@ -146,35 +149,27 @@ def _make_group_progress_reporter(
     return report, start
 
 
-def _run_bounded_select(
+def _run_select_with_progress(
     select_step,
     operands,
     *,
-    time_budget_s: float,
     n_candidates: int,
     n_groups: int,
     point_budget: int,
     print_fn,
     start_progress,
 ):
-    """Lower, compile, and execute one selector under one finite deadline.
+    """Lower, compile, and execute with phase receipts and 60-second heartbeats.
 
-    A Python exception cannot reliably interrupt a thread blocked in a PJRT
-    device invocation.  On expiry every rank therefore writes the same named
-    refusal and exits immediately, matching the distributed fail-fast rule:
-    attempting backend teardown after one rank leaves a collective is itself
-    an unbounded wait.
+    Arrival skew is normal in distributed work. Only the step supervisor may
+    enforce walltime: a process-local exit can strand peers in a collective.
     """
-    budget = float(time_budget_s)
-    if not math.isfinite(budget) or budget <= 0.0:
-        raise ValueError(
-            "--prune-time-budget-seconds must be finite and > 0; "
-            f"got {time_budget_s!r}")
     operands = tuple(operands)
     started = time.perf_counter()
     lock = threading.Lock()
     state = {"phase": "lowering", "phase_start": started, "done": False}
-    rank0 = process_rank() == 0
+    rank = process_rank()
+    stopped = threading.Event()
 
     def set_phase(phase: str) -> float:
         now = time.perf_counter()
@@ -186,38 +181,34 @@ def _run_bounded_select(
             f"elapsed_s={now - started:.3f}")
         return now
 
-    def expire() -> None:
-        now = time.perf_counter()
-        with lock:
-            if state["done"]:
-                return
-            phase = str(state["phase"])
-            phase_start = float(state["phase_start"])
-        message = (
-            "pivoted-Cholesky REFUSES [GATE centroid_select_time_budget]: "
-            f"--prune-time-budget-seconds got: {budget:g}; want: selector "
-            "lowering, compilation, and execution to complete within the "
-            "declared wall-time budget; why: continuing would leave all P "
-            "ranks in an unbounded lowering/device/collective wait. "
-            f"phase={phase} phase_wall_s={now - phase_start:.3f} "
-            f"elapsed_s={now - started:.3f} candidates={n_candidates} "
-            f"groups={n_groups} point_budget={point_budget}.\n")
-        if rank0:
+    def heartbeat() -> None:
+        while not stopped.wait(_SELECT_HEARTBEAT_S):
+            now = time.perf_counter()
+            with lock:
+                if state["done"]:
+                    return
+                phase = str(state["phase"])
+                phase_start = float(state["phase_start"])
+            # Do not use the caller's rank-0-only progress printer: a delayed
+            # non-root rank must be able to identify itself and its phase.
+            message = (
+                f"[centroid-select-heartbeat] rank={rank} still working "
+                f"phase={phase} phase_wall_s={now - phase_start:.3f} "
+                f"elapsed_s={now - started:.3f} candidates={n_candidates} "
+                f"groups={n_groups} point_budget={point_budget}\n")
             for stream in failure_output_streams():
                 try:
                     stream.write(message)
                     stream.flush()
                 except Exception:
                     pass
-        os._exit(124)
 
     print_fn(
         "[centroid-select] state=start "
         f"candidates={n_candidates} groups={n_groups} "
-        f"point_budget={point_budget} time_budget_s={budget:g}")
-    timer = threading.Timer(budget, expire)
-    timer.daemon = True
-    timer.start()
+        f"point_budget={point_budget} walltime_owner=step-supervisor")
+    reporter = threading.Thread(target=heartbeat, daemon=True)
+    reporter.start()
     try:
         phase_start = set_phase("lowering")
         lowered = select_step.lower(*operands)
@@ -245,7 +236,8 @@ def _run_bounded_select(
     finally:
         with lock:
             state["done"] = True
-        timer.cancel()
+        stopped.set()
+        reporter.join()
 
 
 @lru_cache(maxsize=None)
@@ -424,8 +416,13 @@ def gram_col_block_device_bytes(
     """
     x_i = max(1, int(x_shards))
     y_i = max(1, int(y_shards))
-    rows_local = (min(int(n_rows), int(block_width)) + x_i - 1) // x_i
-    cols_local = (int(block_width) + y_i - 1) // y_i
+    from runtime.padding import padded_axis
+    rows_local = padded_axis(
+        min(int(n_rows), int(block_width)), x_i,
+        name="Gram row-shard carrier").carrier // x_i
+    cols_local = padded_axis(
+        int(block_width), y_i,
+        name="Gram column-shard carrier").carrier // y_i
     return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
 
 
@@ -487,7 +484,10 @@ def _auto_gram_width_from_compiled_peaks(
     itself is always queried and certified.
     """
     d = max(1, int(divisor))
-    floor = ((max(1, _GRAM_MIN_COL_BLOCK) + d - 1) // d) * d
+    from runtime.padding import padded_axis
+    floor = padded_axis(
+        max(1, _GRAM_MIN_COL_BLOCK), d,
+        name="pivoted-Cholesky Gram floor").carrier
     ceiling = (int(max_width) // d) * d
     width = min(max(floor, (int(seed_width) // d) * d), ceiling)
     checked: dict[int, dict[str, int]] = {}
@@ -523,7 +523,10 @@ def _auto_gram_width_from_compiled_peaks(
     # nearly 4x the useful square work.  Keep the SAME number of scan iterations
     # and shrink to the minimum aligned width that still covers the extent.
     ntiles, _, _ = gram_tile_schedule(ceiling, width)
-    compact = round_up(-(-ceiling // ntiles), d)
+    from runtime.padding import padded_axis
+    compact = padded_axis(
+        -(-ceiling // ntiles), d,
+        name="pivoted-Cholesky compact tile").carrier
     compact = min(width, max(floor, compact))
     if compact != width:
         compact_facts = check(compact)
@@ -937,7 +940,6 @@ def prune_candidates_by_pivoted_cholesky(
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
     group_block: bool = False,
-    select_time_budget_s: float = 900.0,
     progress_print_fn=print,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
@@ -976,10 +978,9 @@ def prune_candidates_by_pivoted_cholesky(
     returns the largest greedy whole-orbit set no larger than the point budget;
     there is no partial last block for the host to repair.
 
-    ``select_time_budget_s`` is a finite wall budget spanning selector
-    lowering, compilation, and execution. ``progress_print_fn`` receives one
-    receipt per completely deflated group.  The Gram build has its own stage
-    timing and is outside this selector-specific deadline.
+    ``progress_print_fn`` receives phase receipts and one receipt per completely
+    deflated group. Each rank reports its active phase every 60 seconds; the
+    step supervisor owns walltime across all ranks.
 
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
@@ -1110,12 +1111,9 @@ def prune_candidates_by_pivoted_cholesky(
     # n_pad rows/cols are zero-padding, NOT candidates.
     M_pad = int(G.shape[0])
     n_pad = M_pad - M
-    if M_pad % n_dev != 0:
-        raise ValueError(
-            f"Gram came back with M_pad={M_pad}, which the mesh product "
-            f"{n_dev} does not divide (logical M={M}). The sharded select "
-            f"needs an even row split; expected round_up(M, {n_dev})="
-            f"{-(-M // n_dev) * n_dev}.")
+    from runtime.padding import authenticate_padded_axis
+    authenticate_padded_axis(
+        M, M_pad, n_dev, name="pivoted-Cholesky candidate carrier")
 
     # This diagnostic consumes a globally sharded value, so every process
     # must execute it even though only rank 0 prints.  Putting the JAX work
@@ -1164,9 +1162,8 @@ def prune_candidates_by_pivoted_cholesky(
                 mesh_axis=select_axis, tol_rel=tol_rel,
                 progress_fn=progress_fn)
             (piv, L, rank, d_final, d_taken, trR_over_trG,
-             psd_info) = _run_bounded_select(
+             psd_info) = _run_select_with_progress(
                  select_step, (G, group_id_jax, active_init),
-                 time_budget_s=select_time_budget_s,
                  n_candidates=M, n_groups=n_groups, point_budget=budget,
                  print_fn=progress_print_fn or (lambda _message: None),
                  start_progress=start_progress)
@@ -1642,7 +1639,11 @@ def build_gram_q0_via_loadwfns(
         float(meta.memory_per_device_gb) * 1e9
         * _GRAM_SEED_BUDGET_FRACTION
     )
-    tile_divisor = math.lcm(n_x, n_y)
+    from runtime.padding import padded_axis
+    tile_divisor = padded_axis(
+        1, mesh_xy, name="Gram square-tile divisor",
+        specs=((PartitionSpec('x', None), 0),
+               (PartitionSpec(None, 'y'), 1))).divisor
     block_source = "auto"
     if env_cb:
         block_source = "LORRAX_GRAM_COL_BLOCK override"
@@ -1660,7 +1661,10 @@ def build_gram_q0_via_loadwfns(
         # A manual width keeps its historical floor and is rounded UP so the
         # now-square tile divides BOTH mesh axes.  It is an explicit override,
         # so it may exceed auto's target and the diagnostic below says so.
-        col_block = round_up(col_block, tile_divisor)
+        from runtime.padding import padded_axis
+        col_block = padded_axis(
+            col_block, tile_divisor,
+            name="pivoted-Cholesky column block").carrier
     else:
         if gram_col_block_bytes(nk_, ns_, M_cols) <= seed_budget_bytes:
             col_block = M_cols
@@ -1728,11 +1732,13 @@ def build_gram_q0_via_loadwfns(
         resident_bytes = worst_process_resident_bytes(resident_local_bytes)
 
         target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
+        from runtime.padding import padded_axis
+        gram_rows_local = padded_axis(
+            M_cols, n_x, name="Gram resident row carrier").carrier // n_x
+        gram_cols_local = padded_axis(
+            M_cols, n_y, name="Gram resident column carrier").carrier // n_y
         gram_local_bytes = (
-            ((M_cols + n_x - 1) // n_x)
-            * ((M_cols + n_y - 1) // n_y)
-            * _GRAM_COMPLEX_BYTES
-        )
+            gram_rows_local * gram_cols_local * _GRAM_COMPLEX_BYTES)
 
         def _compiled_live_set(tile_width):
             tile_width = int(tile_width)

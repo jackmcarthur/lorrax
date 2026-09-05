@@ -179,7 +179,7 @@ def test_an_indivisible_band_window_is_SERVED_when_asked_explicitly():
     assert _resolve(10, 2, 2, eigh="distributed") == "distributed"
 
 
-def test_the_backend_probe_asks_about_the_PADDED_extent():
+def test_the_backend_probe_asks_about_the_PADDED_extent(monkeypatch):
     """``auto`` must probe the extent the eigh runs at, not ``nb``.
 
     ``distrib_la.resolve_backend`` has its own divisibility guard.  Probing
@@ -187,14 +187,21 @@ def test_the_backend_probe_asks_about_the_PADDED_extent():
     logical ``nb`` would trip it for every indivisible window and degrade
     to native — reinstating the lifted refusal by accident, silently.
     """
-    body = _resolver_src()
-    assert "n=nb_solve" in body, (
-        "the resolve_backend probe must be asked about round_up(nb, "
-        "pad_div), not nb")
-    assert "round_up(nb, pad_div)" in body
+    import distrib_la
+
+    probed = []
+
+    def resolve(op, backend, mesh, *, n):
+        probed.append(n)
+        return "native"
+
+    monkeypatch.setattr(distrib_la, "resolve_backend", resolve)
+    _resolve(10, 2, 2, per_device_gb=1e-6)
+    assert probed == [12]
 
 
-def test_the_divisor_is_the_band_divisor_not_the_two_axes_separately():
+def test_the_divisor_is_the_band_divisor_not_the_two_axes_separately(
+        monkeypatch):
     """nb = 10 on a 2×2 mesh divides both axes and is STILL padded to 12.
 
     The divisor is ``spec_divisor(mesh, band_sphere_spec(), 1)`` — px·py
@@ -203,11 +210,24 @@ def test_the_divisor_is_the_band_divisor_not_the_two_axes_separately():
     backend probe and the pad both use; it is simply no longer a reason
     to refuse.
     """
-    from runtime.padding import round_up
+    from common.wfn_layout import band_sphere_spec
+    import runtime.padding as padding
+
     assert 10 % 2 == 0                       # divides both axes...
-    assert round_up(10, 2 * 2) == 12         # ...and is still padded to 12
-    # and the resolver takes that divisor from the spec, not from px, py
-    assert "spec_divisor(mesh_xy, band_sphere_spec(), 1)" in _resolver_src()
+    seen = {}
+    real_padded_axis = padding.padded_axis
+
+    def _record(logical, geometry, **kwargs):
+        tag = real_padded_axis(logical, geometry, **kwargs)
+        seen.update(tag=tag, kwargs=kwargs)
+        return tag
+
+    monkeypatch.setattr(padding, "padded_axis", _record)
+    assert _resolve(10, 2, 2, eigh="distributed") == "distributed"
+    assert seen["kwargs"]["spec"] == band_sphere_spec()
+    assert seen["kwargs"]["axis"] == 1
+    assert (seen["tag"].logical, seen["tag"].carrier,
+            seen["tag"].divisor) == (10, 12, 4)
 
 
 # ---------------------------------------------------------------------------

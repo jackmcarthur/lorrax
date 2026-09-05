@@ -161,8 +161,8 @@ def test_solve_w_refuses_equal_but_noncanonical_centroid_extents():
     mesh = SimpleNamespace(axis_names=("x", "y"),
                            shape={"x": 6, "y": 6})
     with pytest.raises(ValueError, match=(
-            r"canonical product-padded centroid carrier "
-            r"\(\*,2088,2088\).*got equal .*\(65, 2070, 2070\)")):
+            r"Dyson row-centroid carrier: carrier extent is 2070, expected "
+            r"2088 for logical extent 2070 and divisor 36")):
         solve_w(operand, operand, meta, mesh, dyson_solver="distributed")
 
 
@@ -207,8 +207,8 @@ def test_precompile_solve_w_refuses_the_same_noncanonical_carrier(
     mesh = SimpleNamespace(axis_names=("x", "y"),
                            shape={"x": 6, "y": 6})
     with pytest.raises(ValueError, match=(
-            r"canonical product-padded centroid carrier "
-            r"\(\*,2088,2088\).*got equal .*\(65, 2070, 2070\)")):
+            r"Dyson row-centroid carrier: carrier extent is 2070, expected "
+            r"2088 for logical extent 2070 and divisor 36")):
         w_isdf.precompile_solve_w(
             operand, operand, meta, mesh, dyson_solver="distributed")
 
