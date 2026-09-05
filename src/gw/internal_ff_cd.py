@@ -37,14 +37,9 @@ TARGET_TILE = 4
 FREQUENCY_BATCH = 4
 CENTER_SHIFT_EV = 1.0e-10
 REAL_MAX_EV = 70.0
-# The first usable residue line is the physical eta=0.25 eV grid.  Its
-# h=0.50 control is accumulated from a subset of exactly the same W/W'/W''
-# samples.  Only a failed componentwise certificate buys the interleaved
-# h=0.125 rows.  Keep these as nested binary fractions: checkpoint resume and
-# the no-repeat escalation contract compare their float64 bit patterns.
-REAL_STEP_EV = 0.25
-REAL_COARSE_STEP_EV = 0.50
-REAL_ESCALATION_STEP_EV = 0.125
+REAL_STEP_EV = 0.125
+REAL_COARSE_STEP_EV = 0.25
+REAL_ESCALATION_STEP_EV = 0.0625
 REAL_QUINTIC_CONTROL_DENOMINATOR = 12.0
 REAL_HARD_MAX_EV = 250.0
 IMAG_MAP_SCALE_EV = 2.5
@@ -59,7 +54,7 @@ RESPONSE_WIDTHS_EV = (INTERNAL_FF_CD_RESPONSE_WIDTH_EV,)
 # weighted contour accumulator changes meaning.  Head-only, diagnostics, and
 # comment changes deliberately do not invalidate an expensive body resume.
 BODY_ACCUMULATOR_SEMANTIC_EPOCH = (
-    "internal-ff-cd-body-v4:quarter-ev-quintic-gp-static-subtracted")
+    "internal-ff-cd-body-v3:quintic-gp-static-subtracted-family-receipts")
 CHECKPOINT_SCHEMA = 3
 ARRAY_RECEIPT_SCHEME = "numpy-c-order-sha256-v1"
 STAGE_TIMING_KEYS = (
@@ -145,8 +140,8 @@ def _real_coverage_max(required_max_ev: float) -> float:
         raise ValueError(
             "internal_ff_cd residue coverage must be finite and nonnegative, "
             f"got {required_max_ev!r}")
-    # Interpolation needs a node strictly above every residue energy.  Align
-    # that guard node to both the 0.25 eV base and 0.50 eV control grids.
+    # Linear interpolation needs a node strictly above every residue energy.
+    # Align that guard node to both the 0.25 eV fine and 0.50 eV control grids.
     max_ev = REAL_COARSE_STEP_EV * np.ceil(
         (required_max_ev + REAL_STEP_EV) / REAL_COARSE_STEP_EV)
     if max_ev > REAL_HARD_MAX_EV + 1.0e-12:
@@ -168,8 +163,8 @@ def _uniform_real_grid(step_ev: float, max_ev: float) -> np.ndarray:
 def _real_family_plan(max_ev: float):
     """Return nested quintic grids in checkpoint-safe evaluation order.
 
-    All ``h=0.25`` nodes are evaluated first.  Only if the componentwise
-    ``0.50 -> 0.25`` certificate refuses are the interleaved ``h=0.125``
+    All ``h=0.125`` nodes are evaluated first.  Only if the componentwise
+    ``0.25 -> 0.125`` certificate refuses are the interleaved ``h=0.0625``
     nodes appended.  Each already-built W sample contributes to every
     compatible family, so escalation never rebuilds W.
     """
@@ -644,7 +639,6 @@ def _body_checkpoint_provenance(
             "center_shift_ev": CENTER_SHIFT_EV,
             "real_step_ev": REAL_STEP_EV,
             "real_coarse_step_ev": REAL_COARSE_STEP_EV,
-            "real_escalation_step_ev": REAL_ESCALATION_STEP_EV,
             "imag_map_scale_ev": IMAG_MAP_SCALE_EV,
             "imag_rule_nodes": list(IMAG_RULE_NODES),
         },
