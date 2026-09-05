@@ -2106,6 +2106,48 @@ def fft_grid_pullback_perm(
     return sym_perm.astype(np.int32)
 
 
+def real_space_orbit_labels(
+    sym_matrices: np.ndarray,
+    translations: np.ndarray,
+    fft_grid: np.ndarray | tuple[int, int, int],
+) -> np.ndarray:
+    """Orbit label of every FFT-grid point under the spatial group.
+
+    A point's label is the smallest flat C-order index in its orbit, so two
+    points share a label exactly when some operation maps one onto the
+    other.  The table is built one operation at a time through
+    :func:`centroid_source_map_and_wrap` on the complete grid — the same
+    snapped source map the centroid tables use, so a tile of complete orbits
+    built from these labels is closed under exactly the action the ζ-fit
+    transport applies.  Peak host memory is O(n_rtot); the O(n_sym·n_rtot)
+    pull-back table of :func:`fft_grid_pullback_perm` is never formed, which
+    matters on ten-million-point grids.  Because the group is closed under
+    inversion, the source points ``{alpha_s(r)}`` of one point ARE its
+    orbit, and a single pass of running minima yields the orbit minimum.
+
+    ``translations`` is BGW ``tnp`` (``2π·τ``), as everywhere in this module.
+    """
+    fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    n_rtot = int(fg.prod())
+    ix, iy, iz = np.meshgrid(
+        np.arange(fg[0]), np.arange(fg[1]), np.arange(fg[2]), indexing='ij')
+    r_idx = np.stack(
+        [ix.reshape(-1), iy.reshape(-1), iz.reshape(-1)],
+        axis=1).astype(np.int32)
+    S = np.asarray(sym_matrices, dtype=np.int64)
+    if S.ndim != 3 or S.shape[1:] != (3, 3):
+        raise ValueError(
+            f"real_space_orbit_labels: sym_matrices must be (n_sym,3,3); "
+            f"got {S.shape}")
+    tau = np.asarray(translations, dtype=np.float64)[:S.shape[0]]
+    label = np.arange(n_rtot, dtype=np.int64)
+    for s in range(int(S.shape[0])):
+        source, _ = centroid_source_map_and_wrap(
+            r_idx, S[s:s + 1], tau[s:s + 1], fg, validate=True)
+        np.minimum(label, source[0], out=label)
+    return label.astype(np.int32)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Pre-sweep spellings — MODULE-LEVEL half of the compat layer
 # ─────────────────────────────────────────────────────────────────────────

@@ -221,6 +221,8 @@ from symmetry_maps.maps import (
     apply_spinor_rotation,
     unfold_psi,
     unfold_isdf_operator,
+    unfold_operator_local,
+    open_spin_block_coefficient,
     reorder_isdf_operator_basis,
     unfold_spin_centroid_operator,
     unfold_isdf_one_leg,
@@ -265,6 +267,7 @@ from symmetry_maps.orbit_syms import (
     grid_point_image_perm,
     orbit_images,
     permutation_orbit_labels,
+    real_space_orbit_labels,
     r_action_forward,
     r_action_forward_one,
     snap_to_grid_and_split_wrap,
@@ -323,6 +326,7 @@ __all__ = [
     "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
+    "unfold_operator_local", "open_spin_block_coefficient",
     "reorder_isdf_operator_basis",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
     "mix_channels_by_proper_rotation",
@@ -332,7 +336,7 @@ __all__ = [
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
-    "permutation_orbit_labels",
+    "permutation_orbit_labels", "real_space_orbit_labels",
     "fft_grid_pullback_perm", "grid_point_image_perm",
     "PolarFFTFieldProjection", "project_polar_fft_field",
     "r_action_forward", "r_action_forward_one",
