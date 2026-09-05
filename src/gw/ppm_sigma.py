@@ -544,6 +544,15 @@ def strip_sigma_window(
     del mesh_xy  # layout is carried by the array; extent is carried by the tag
     if sigma_kij is None:
         return sigma_kij
+    if not isinstance(band_axis, PaddedAxis):
+        # An int used to be the whole contract here; the padding owner's tag
+        # replaced it (2026-09-04) and the static-limit term kept passing
+        # nb_sigma, which died inside runtime.padding as
+        # "'int' object has no attribute 'logical'" on every GN-PPM deck
+        # with an invalid pole (MoS2 3x3 bispinor SC, 2026-09-05).
+        raise TypeError(
+            "strip_sigma_window needs the Sigma window's PaddedAxis tag "
+            f"(sigma_band_axis(...)); got {type(band_axis).__name__}")
     from runtime.padding import strip_axis
     return strip_axis(
         strip_axis(sigma_kij, band_axis, axis=-2), band_axis, axis=-1)
@@ -627,7 +636,10 @@ def _compute_invalid_static_sigma(
             # strip to nb_sigma below — same "weight, don't window" +
             # late-window pattern as cohsex_sigma's own face kernels.
             psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
-            nb_real = int(s.nb_sigma)
+            # The Sigma window's tag, like the legacy branch's
+            # pad_sigma_window: strip_sigma_window takes the tag, not nb.
+            nb_real = sigma_band_axis(
+                int(s.nb_sigma), mesh_xy, ansatz="ppm static limit")
 
         # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
         # band tensor before building the next centroid-square G: this makes
@@ -730,7 +742,10 @@ def _invalid_static_coh_by_bracket(
                 wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
         else:
             psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
-            nb_real = int(s.nb_sigma)
+            # The Sigma window's tag, like the legacy branch's
+            # pad_sigma_window: strip_sigma_window takes the tag, not nb.
+            nb_real = sigma_band_axis(
+                int(s.nb_sigma), mesh_xy, ansatz="ppm static limit")
         for lo, hi in brackets:
             if wfns.layout == "legacy":
                 G_ri = build_G(
