@@ -244,36 +244,3 @@ def test_the_solve_payload_shapes_are_the_pre_extraction_ones():
         target_key=1e-6, max_nodes=64) == {
         "solver": "noncrossing_imag", "logR_key": 1.0, "omega_hat_key": 2.0,
         "target_key": 1e-6, "max_nodes": 64}
-    assert cached_solve_payload(
-        "crossing", A_key=40.0, target_key=1e-6, max_nodes=500,
-        eps_q_key=1e-3, target_kind="hgl") == {
-        "solver": "crossing", "A_key": 40.0, "target_key": 1e-6,
-        "max_nodes": 500, "eps_q_key": 1e-3, "target_kind": "hgl"}
-
-
-def test_a_solve_writes_the_versioned_entry_and_reuses_it(isolated_cache,
-                                                          monkeypatch):
-    """End to end through the door: solve once, then hit the cache.
-
-    A_dim = 20 at a loose tier so the solve is a second rather than a
-    minute; the point is the round trip, not the numerics.
-    """
-    pytest.importorskip("scipy")
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "1")
-    first = M.solve_uncertified(family="crossing", target="hgl",
-                                range_value=20.0, error_bound=1.0e-6,
-                                n_max=60, eps_q=1.0e-3)
-    assert first.provenance.source == "runtime-uncertified"
-    files = sorted(p.name for p in isolated_cache.glob("crossing_v*.npz"))
-    assert len(files) == 1, files
-
-    # A fresh process would read it back; in-process the lru_cache would
-    # answer first, so the cache layer is asked directly.
-    payload = {"solver": "crossing", "A_key": 20.0, "target_key": 1.0e-6,
-               "max_nodes": 60, "eps_q_key": 1.0e-3, "target_kind": "hgl"}
-    tau, w, err, prov = CA.load("crossing", payload)
-    assert prov.source == "cache"
-    assert tau.tobytes() == np.asarray(first.nodes,
-                                       dtype=np.float64).tobytes()
-    assert w.tobytes() == np.asarray(first.weights, dtype=np.float64).tobytes()
-    assert err == first.max_error

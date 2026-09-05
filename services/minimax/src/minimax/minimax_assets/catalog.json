@@ -15,12 +15,6 @@
       "problem": "1/x on [1, R]",
       "error_metric": "linf_abs_scaled_1_over_x",
       "physical_error_note": "runtime rescales tables from [1,R] to [x_min,x_max], so absolute error scales as error_bound / x_min"
-    },
-    "crossing": {
-      "problem": "G(u) on [0, A_dim]",
-      "error_metric": "linf_abs_target",
-      "eps_q": 0.001,
-      "target_kind": "hgl"
     }
   },
   "sweeps": {
@@ -30,11 +24,6 @@
       6.86665972794514e-08,
       3e-08,
       1.837465441237269e-08
-    ],
-    "crossing_A_dim_values": [
-      20.0,
-      24.0,
-      40.0
     ],
     "noncrossing_R_values": [
       10.0,
@@ -55,78 +44,6 @@
     ]
   },
   "tables": [
-    {
-      "family": "crossing",
-      "target_kind": "hgl",
-      "error_bound": 2e-07,
-      "error_metric": "linf_abs_target",
-      "range_param": "A_dim",
-      "range_max": 20.0,
-      "eps_q": 0.001,
-      "node_count": 26,
-      "max_error": 1.4259105292346863e-07,
-      "file": "crossing/crossing_hgl_A_20p000000_eps_2p0em07_epsq_1p0em03.npz"
-    },
-    {
-      "family": "crossing",
-      "target_kind": "hgl",
-      "error_bound": 1e-06,
-      "error_metric": "linf_abs_target",
-      "range_param": "A_dim",
-      "range_max": 20.0,
-      "eps_q": 0.001,
-      "node_count": 25,
-      "max_error": 4.4319801295600314e-07,
-      "file": "crossing/crossing_hgl_A_20p000000_eps_1p0em06_epsq_1p0em03.npz"
-    },
-    {
-      "family": "crossing",
-      "target_kind": "hgl",
-      "error_bound": 1.837465441237269e-08,
-      "error_metric": "linf_abs_target",
-      "range_param": "A_dim",
-      "range_max": 24.0,
-      "eps_q": 0.001,
-      "node_count": 38,
-      "max_error": 7.759544937147034e-09,
-      "file": "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz"
-    },
-    {
-      "family": "crossing",
-      "target_kind": "hgl",
-      "error_bound": 2e-07,
-      "error_metric": "linf_abs_target",
-      "range_param": "A_dim",
-      "range_max": 40.0,
-      "eps_q": 0.001,
-      "node_count": 48,
-      "max_error": 1.5280168876724565e-07,
-      "file": "crossing/crossing_hgl_A_40p000000_eps_2p0em07_epsq_1p0em03.npz"
-    },
-    {
-      "family": "crossing",
-      "target_kind": "hgl",
-      "error_bound": 1e-06,
-      "error_metric": "linf_abs_target",
-      "range_param": "A_dim",
-      "range_max": 40.0,
-      "eps_q": 0.001,
-      "node_count": 48,
-      "max_error": 1.5280168876724565e-07,
-      "file": "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz"
-    },
-    {
-      "family": "crossing",
-      "target_kind": "hgl",
-      "error_bound": 1e-06,
-      "error_metric": "linf_abs_target",
-      "range_param": "A_dim",
-      "range_max": 60.0,
-      "eps_q": 0.001,
-      "node_count": 66,
-      "max_error": 9.435262925405752e-07,
-      "file": "crossing/crossing_hgl_A_60p000000_eps_1p0em06_epsq_1p0em03.npz"
-    },
     {
       "family": "noncrossing",
       "error_bound": 2e-07,

@@ -156,8 +156,8 @@ def _make_project_ri_reduce_scatter(
     * ``merged_x=False`` → primitive ``channels="split_reim"``: σ^τ is
       split elementwise into σ_R = Re σ^τ, σ_I = Im σ^τ BEFORE projection
       and each real channel rides its own de-promoted GEMM chain,
-      S_R = ψ†σ_Rψ, S_I = ψ†σ_Iψ.  What crossing (HGL core) windows
-      dispatch — but NO LONGER because they must.  This bullet used to
+      S_R = ψ†σ_Rψ, S_I = ψ†σ_Iψ.  What retired crossing windows once
+      dispatched — but NO LONGER because they must.  This bullet used to
       argue that the crossing consumer weights S_R and S_I with two
       INDEPENDENT real ω-vectors (Re(c)·S_I + Im(c)·S_R) and that the
       pair is unrecoverable from X (2n² real dof against 4n²).  That
@@ -395,7 +395,7 @@ def _stack_channels(outs, mesh_xy: Mesh):
     """Stack a per-bracket list of kernel outputs on a new LEADING axis.
 
     The τ kernel's output is either one complex array (merged Laplace plan)
-    or the ``(S_R, S_I)`` pair (crossing plan), so the stack has to be
+    or the ``(S_R, S_I)`` pair (legacy split plan), so the stack has to be
     channel-wise; a single ``jnp.stack`` on the tuple would build a
     (2, n_brk, ...) object and silently swap the two axes' meaning.
 
@@ -897,8 +897,8 @@ def get_shared_sigma_tau_kernel(
     contract_bands`` path.  This wrapper changes only the scalar frequency
     synthesis: several poles and compatible windows are summed into one W
     tile before that unchanged convolution.  It always uses the single
-    complex projection carrier; HGL's missing sine arm is completed once by
-    :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
+    complex projection carrier; any anti-Hermitian completion is applied once
+    by :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
 
     This is the entry point ``gw.mpa.sigma`` calls for every dynamic pole
     model.  ``brackets=None`` retains the ordinary MPA shape; a tuple asks the

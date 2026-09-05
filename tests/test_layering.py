@@ -1608,7 +1608,7 @@ def test_every_package_in_the_map_exists(sources):
 #: with NO shim and NO row below.  ``gw.minimax_screening`` — the module's
 #: one production importer, then and now — says ``import minimax as _mm``
 #: and reaches only ``serve`` / ``Quadrature`` / the refusal types, all of
-#: which are top-level names.  The offline solver half (``G_hgl``,
+#: which are top-level names.  The offline solver half (``G_fermi``,
 #: ``noncrossing_grids``, …) is on the door too, behind a PEP-562 lazy
 #: ``__getattr__``, precisely so that the generator tool and the
 #: certification tier can have those names without anybody writing

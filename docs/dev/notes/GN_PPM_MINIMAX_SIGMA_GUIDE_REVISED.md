@@ -1,5 +1,11 @@
 # Full-Frequency GW Self-Energy via GN-PPM and Minimax-Windowed CTSP in the ISDF Basis
 
+> **Historical design note.** Its HGL crossing-window sections describe a
+> retired route and are not an implementation specification. Current MPA
+> Sigma assembly is owned by `docs/theory/THEORY_mpa_implementation.md`;
+> current static/imaginary minimax rules are documented in
+> `docs/theory/minimax-quadrature.md`.
+
 ### Purpose
 
 Reference for computing the **correlation self-energy** (\Sigma^c_{kij}(\omega)) using:

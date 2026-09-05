@@ -255,7 +255,6 @@ def test_static_no_clobber_preserves_prior_rows_bytes_and_sweep(
 
     prior_sweeps = {
         "error_bounds": [1.0e-6, 2.0e-7],
-        "crossing_A_dim_values": [20.0, 40.0],
         "noncrossing_R_values": [10.0, 100.0],
     }
     old_entry = {
@@ -305,11 +304,7 @@ def test_static_no_clobber_preserves_prior_rows_bytes_and_sweep(
     doc = static_gen.generate_assets(
         output_root=tmp_path,
         error_bounds=[6.86665972794514e-8],
-        crossing_a_values=[20.0, 40.0, 60.0],
         noncrossing_r_values=[92.36189541312947],
-        families=["noncrossing"],
-        crossing_eps_q=1.0e-3,
-        crossing_target_kind="hgl",
         clobber=False,
     )
 
@@ -317,7 +312,6 @@ def test_static_no_clobber_preserves_prior_rows_bytes_and_sweep(
     assert old_path.read_bytes() == old_bytes
     assert doc["sweeps"]["error_bounds"] == [
         1.0e-6, 2.0e-7, 6.86665972794514e-8]
-    assert doc["sweeps"]["crossing_A_dim_values"] == [20.0, 40.0]
     assert doc["sweeps"]["noncrossing_R_values"] == [
         10.0, 92.36189541312947, 100.0]
 

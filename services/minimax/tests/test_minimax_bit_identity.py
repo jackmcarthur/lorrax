@@ -11,14 +11,13 @@ something measures it.  Two claims here, and they are different:
    loader that had quietly started rounding.
 2. **The selection rule chooses the same table.**  The WP1 census measured
    54 distinct requests across the frozen decks, the campaign decks and
-   the suite, of which 51 were served, touching exactly SIX of the 31
-   shipped tables.  Those six, and the requests that reach them, are
+   the suite. The surviving production requests touch three noncrossing
+   tables. Those tables, and the requests that reach them, are
    pinned here by name.  If the selection rule drifts, this file names the
    request that moved and the table it moved to.
 
-The six-table fact is worth pinning for its own sake: it is the measured
-answer to "how much of this bundle is load-bearing", and it is what makes
-the certification campaign (WP6) affordable.
+This set is the measured answer to "how much of this bundle is
+load-bearing", and it keeps the certification campaign affordable.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ import pytest
 import minimax as M
 from minimax import _catalog as C
 
-#: WP1 census §2.6 — the only six shipped tables the entire measured
+#: WP1 census §2.6 — the surviving shipped tables the measured
 #: surface ever loads, with the load counts it measured.  The counts are
 #: not asserted (they are a property of the decks, not of this service);
 #: the SET is.
@@ -37,7 +36,6 @@ _CENSUS_TABLES = {
     "noncrossing/noncrossing_R_10p000000_eps_1p0em06.npz": 47,
     "noncrossing/noncrossing_R_46p415888_eps_1p0em06.npz": 10,
     "noncrossing/noncrossing_R_21p544347_eps_1p0em06.npz": 8,
-    "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz": 6,
 }
 
 #: Requests taken verbatim from the census's deck and suite tables, with
@@ -56,10 +54,6 @@ _CENSUS_REQUESTS = [
     # the middle bucket
     (("noncrossing", "inverse", 15.0, 1.0e-6, 64, None),
      "noncrossing/noncrossing_R_21p544347_eps_1p0em06.npz"),
-    # the production crossing request, which pins at A_core = 24.0 exactly
-    # for as long as the conditioning floor stays engaged (census §2.3)
-    (("crossing", "hgl", 24.0, 1.0e-6, 500, 1.0e-3),
-     "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz"),
 ]
 
 

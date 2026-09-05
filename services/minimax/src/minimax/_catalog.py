@@ -105,10 +105,10 @@ def load_catalog_dict(name: str = "catalog.json") -> dict[str, Any]:
     event to every caller and they are not the same defect.
 
     CACHED, as it was before the extraction (``@lru_cache(maxsize=1)`` on
-    ``_load_shipped_minimax_catalog``).  Not cosmetic: one Σ build issues
-    2 crossing + 6 noncrossing window requests, times P ranks, times the
-    MPA pass plan's fourteen — re-reading and re-parsing the bundle on
-    each would be a real cost for no information.  ``maxsize=4`` because
+    ``_load_shipped_minimax_catalog``).  Not cosmetic: screening repeats
+    the same static and imaginary requests across ranks and response passes;
+    re-reading and re-parsing the bundle on each would be a real cost for no
+    information.  ``maxsize=4`` because
     the bundle now carries more than one catalog file.
     :func:`clear_caches` is the test hook.
     """

@@ -653,10 +653,8 @@ def main(argv=None):
 	if do_screened:
 		# The minimax τ-axis, solved on G's actual spectral range — shared
 		# by every χ₀ build this run (static + probe W here, SC re-solves).
-		# TIMED because it is the classic mis-attribution on this path: the
-		# crossing-minimax solve costs ~95 s cold with no cache and no
-		# shipped table (XPROF_TRACE_GUIDE §"Known LORRAX cost centers"),
-		# and with no row of its own that 95 s reads as "GW startup".
+		# TIMED because an uncached static/imaginary minimax solve belongs to
+		# quadrature setup rather than to otherwise opaque "GW startup".
 		with timing.section("gw_jax.minimax_quadrature", announce=True,
 		                    label="minimax tau-axis"):
 			# The minimax service announces every served/uncertified rule with

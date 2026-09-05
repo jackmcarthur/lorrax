@@ -54,7 +54,6 @@ where = ["src"]
 minimax = [
     "minimax_assets/*.json",
     "minimax_assets/*.md",
-    "minimax_assets/crossing/*.npz",
     "minimax_assets/noncrossing/*.npz",
     "minimax_assets/complex_laplace/*.npz",
     # `damped_line` arrives with the second family's catalog.  Its row

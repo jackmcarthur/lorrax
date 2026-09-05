@@ -17,7 +17,7 @@ paired cell is what makes it evidence.
      ``TableUnreadable`` /
      ``CatalogCorrupt``
  F5  ``UncertifiedSolveRefused`` with the hatch set, it solves and announces
- F6  ``SamplingUnsupported``     the three live cells resolve
+ F6  ``SamplingUnsupported``     the remaining live cells resolve
 ===  ==========================  =========================================
 """
 
@@ -35,7 +35,7 @@ from minimax import _catalog as C
 # ---------------------------------------------------------------------------
 
 def test_f1_a_request_outside_the_catalog_refuses_and_names_both_levers():
-    """A_dim = 83 is the G2 gate's own request, and the catalog stops at 60.
+    """R = 1e6 is beyond the shipped noncrossing catalog.
 
     The message shape is the ruling, not a nicety: a refusal that does not
     tell you how to make it go away is a crash with better manners.  It
@@ -44,12 +44,12 @@ def test_f1_a_request_outside_the_catalog_refuses_and_names_both_levers():
     GENERATOR lever (so the catalog can be extended to cover it).
     """
     with pytest.raises(M.NoCertifiedTable) as excinfo:
-        M.lookup(family="crossing", target="hgl", range_value=83.0,
-                 error_bound=1.0e-6, n_max=500, eps_q=1.0e-3)
+        M.lookup(family="noncrossing", target="inverse", range_value=1.0e6,
+                 error_bound=1.0e-6, n_max=64)
     text = str(excinfo.value)
-    assert "A_dim=83" in text
-    assert "nearest certified below: A_dim=60" in text, text
-    assert "omega_max" in text and "xi" in text, text
+    assert "R=1e+06" in text
+    assert "nearest certified below: R=100000" in text, text
+    assert "band-energy span" in text, text
     assert "generate_minimax_assets.py" in text, text
 
 
@@ -178,12 +178,12 @@ def test_f3_an_undeclared_target_refuses_and_lists_the_vocabulary():
 
 
 def test_f3_a_target_the_family_cannot_serve_refuses():
-    """'hgl' is a real target and 'noncrossing' is a real family; the PAIR
+    """'fermi' is an offline target and 'noncrossing' is a real family; the PAIR
     is the error.  Accepting it would serve a 1/x table to a caller who
     asked for a sign-regularization, which is a wrong answer rather than a
     missing one."""
     with pytest.raises(M.UnknownTarget) as excinfo:
-        M.lookup(family="noncrossing", target="hgl",
+        M.lookup(family="noncrossing", target="fermi",
                  range_value=10.0, error_bound=1.0e-6, n_max=64)
     assert "cannot serve" in str(excinfo.value)
 
@@ -208,7 +208,7 @@ def test_f3_false_case_every_declared_vocabulary_member_resolves():
         assert spec.character in M.CHARACTERS, (name, spec.character)
     # every target is reachable from some family, except the one the
     # design registers as a hole on purpose
-    served = {f.target for f in M.FAMILIES.values()} | {"hgl", "fermi"}
+    served = {f.target for f in M.FAMILIES.values()} | {"fermi"}
     assert set(M.TARGETS) - served == set(), set(M.TARGETS) - served
 
 
@@ -307,7 +307,7 @@ def test_f4c_a_present_but_unparseable_eps_q_refuses():
     eps_q is corruption, and the two were indistinguishable."""
     with pytest.raises(M.CatalogCorrupt) as excinfo:
         M.parse_catalog({"tables": [
-            {"family": "crossing", "target_kind": "hgl", "range_max": 20.0,
+            {"family": "synthetic", "target_kind": "fermi", "range_max": 20.0,
              "error_bound": 1.0e-6, "node_count": 26, "eps_q": "wide",
              "file": "c.npz"}]}, catalog_name="forged")
     assert "eps_q" in str(excinfo.value)
@@ -335,7 +335,7 @@ def test_f4c_absence_of_an_optional_field_is_not_corruption():
 def test_f4_false_case_the_shipped_bundle_loads_and_every_entry_parses():
     """The FALSE case for all of F4: the real artifact is healthy.
 
-    31 entries in ``catalog.json``, 54 in the complex_laplace one and 29
+    28 entries in ``catalog.json``, 54 in the complex_laplace one and 29
     in the damped_line one, every payload resolvable and every field
     typed.  If this cell ever goes red the bundle is broken, which is
     exactly the event the four refusals above exist to report instead of
@@ -349,7 +349,7 @@ def test_f4_false_case_the_shipped_bundle_loads_and_every_entry_parses():
     that would not be pinning anything.
     """
     view = M.catalog()
-    assert len(view) == 31
+    assert len(view) == 28
     assert view.schema_version == 1
     for entry in view.entries:
         tau, alpha, err, _k, h = C.load_table(entry)
@@ -380,11 +380,12 @@ def test_f6_the_strip_cell_refuses_by_name():
     assert "WP9" in text or "campaign" in text, text
 
 
-def test_f6_false_case_the_three_live_cells_resolve():
-    """The FALSE case, and the 2×2 read out loud."""
+def test_f6_false_case_the_live_cells_resolve_and_retired_real_refuses():
+    """Read the remaining production cells out loud."""
     assert M.family_for_character("static") == "noncrossing"
-    assert M.family_for_character("real") == "crossing"
     assert M.family_for_character("imag") == "noncrossing_imag"
+    with pytest.raises(M.SamplingUnsupported):
+        M.family_for_character("real")
 
 
 def test_f6_a_character_that_is_not_one_of_the_four_refuses():
@@ -456,10 +457,10 @@ def test_nearest_certified_never_raises_even_on_nonsense():
 
 
 def test_nearest_certified_finds_the_edge_of_the_certified_region():
-    q = M.nearest_certified(family="crossing", target="hgl",
-                            range_value=83.0, error_bound=1.0e-6,
-                            n_max=500, eps_q=1.0e-3)
-    assert q is not None and q.range_value == 60.0
+    q = M.nearest_certified(family="noncrossing", target="inverse",
+                            range_value=1.0e6, error_bound=1.0e-6,
+                            n_max=64)
+    assert q is not None and q.range_value == 100000.0
     assert q.provenance.source == "shipped"
 
 

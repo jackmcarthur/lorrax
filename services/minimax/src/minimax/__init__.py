@@ -69,7 +69,7 @@ WHO CALLS WHAT
     That 2×2's dispatch, with F6 for the empty cell.
 ``Quadrature`` / ``Provenance``
     What comes back.  ``Provenance.one_line()`` is what the driver logs.
-``G_hgl``, ``noncrossing_grids``, ``crossing_grids``, …
+``G_fermi``, ``noncrossing_grids``, ``crossing_grids``, …
     The OFFLINE solvers, on the door but imported LAZILY (PEP 562): they
     are the only thing here that needs scipy, and a production lookup must
     not pay for it.  A generator campaign touches these; a run does not.
@@ -168,19 +168,12 @@ from minimax.targets import (
 #: Serving a certified table must not import an optimiser, and this is how
 #: that stays true while keeping the names on the door.
 #:
-#: SEVERAL OF THESE HAVE NO CALLER, AND THAT IS ON PURPOSE FOR NOW.  The
-#: Remez solver, the binary-search crossing builder, the two error models
-#: and the three rescalers are 469 of ``solver.py``'s 1059 lines and
-#: nothing in the tree calls them; the deletion manifest is written up in
-#: ``~/lorrax_service_phase/DELETION_MANIFEST_minimax.md`` and is waiting
-#: on the owner's sign-off.  Until that arrives the extraction must not
-#: SHRINK the surface it moved — a move and a deletion in one commit is
-#: two changes wearing one diff — so every name ``common.minimax``
-#: published is published here.  Sign-off deletes the code and these rows
-#: together, in one commit that is about deletion and nothing else.
+#: The generic crossing fitter and its Fermi target remain available for
+#: offline numerical experiments.  They are not a production family and do
+#: not provide a fallback for the retired HGL target.
 _SOLVER_NAMES = (
     # target functions
-    "G_hgl", "G_fermi", "tau_max_hgl", "tau_max_fermi",
+    "G_fermi", "tau_max_fermi",
     # the three grid drivers production reached for
     "noncrossing_grids", "noncrossing_imag_grids", "crossing_grids",
     # the solvers under them

@@ -13,27 +13,23 @@ family of quadrature rules:
 ===========  ==========================  =============================
              ω = 0                       ω ≠ 0
 ===========  ==========================  =============================
-ϖ = 0        ``noncrossing``  (1/x)      ``crossing``  (HGL sine sum)
+ϖ = 0        ``noncrossing``  (1/x)      no production family
 ϖ ≠ 0        ``noncrossing_imag`` /      ``damped_line``  — DOES NOT
              ``complex_laplace``         EXIST (WP9)
 ===========  ==========================  =============================
 
-Three of those cells have code; the fourth is the line
-``gw/screening.py:527-531`` refuses at, and it is the wall the whole MPA
-initiative is walking toward.  Writing the table down as data is what lets
+Two cells have a production family.  The real-frequency HGL cell was retired
+after its last production caller was deleted; the strip cell remains the line
+``gw/screening.py:527-531`` refuses at.  Writing the table down as data lets
 :func:`~minimax.door.family_for_character` refuse the empty cell BY NAME
 (F6) instead of failing somewhere inside a kernel — and it is what makes
 the missing cell a row in a table rather than a new subsystem.
 
-WHY THE CATALOG'S NAMES AND NOT THE DESIGN'S ROUTE NAMES.  The design
-brief calls the four cells ``exponential_sum`` / ``sine_sum`` /
-``exponential_sum_imag`` / ``damped_line``, which is what they are
-mathematically.  The shipped catalog keys on ``noncrossing`` /
-``crossing`` / ``noncrossing_imag`` / ``complex_laplace``, which is what
-they are called on disk.  A door that renamed them would have to translate
-at every lookup and would break byte-comparison against the shipped
-bundle, so :class:`FamilySpec` carries BOTH: ``name`` is the catalog key
-and the door's argument, ``route`` is the mathematical cell.
+WHY THE CATALOG'S NAMES AND NOT THE DESIGN'S ROUTE NAMES.  The live
+families retain their on-disk catalog names.  A door that renamed them would
+have to translate at every lookup and would break byte-comparison against
+the shipped bundle, so :class:`FamilySpec` carries BOTH: ``name`` is the
+catalog key and the door's argument, ``route`` is the mathematical cell.
 """
 
 from __future__ import annotations
@@ -109,12 +105,6 @@ TARGETS: Mapping[str, TargetSpec] = MappingProxyType({
         definition="x/(x^2 + omega_hat^2) on x in [1, R]",
         version=1,
         domain="imag"),
-    "hgl": TargetSpec(
-        name="hgl",
-        definition=("G_hgl(u) on u in [0, A]; "
-                    "Im[sqrt(pi/2) exp(-(u+i)^2/2)(1 + i erfi((u+i)/sqrt2))]"),
-        version=1,
-        domain="real"),
     "fermi": TargetSpec(
         name="fermi",
         definition="G_fermi(u) = tanh-regularized sign target on u in [0, A]",
@@ -134,13 +124,9 @@ TARGETS: Mapping[str, TargetSpec] = MappingProxyType({
 })
 
 
-#: ``target_kind='fermi'`` is REGISTERED AS A HOLE, not as a family.  It is
-#: reachable only from the generator (survey §1.6), no shipped table carries
-#: it, so every ``fermi`` request is a runtime solve by construction.  Under
-#: R1 it becomes a refusal naming an empty family — either tabulate it or
-#: delete the vocabulary entry, which is an owner row (design §12) and not
-#: this branch's call.  It stays in :data:`TARGETS` so the refusal can name
-#: it instead of calling it a typo.
+#: ``fermi`` is an offline-solver target, not a production family.  It remains
+#: enumerable so offline callers do not need a private import, but no door
+#: request can select it.
 _FERMI_IS_A_HOLE = True
 
 
@@ -157,25 +143,9 @@ FAMILIES: Mapping[str, FamilySpec] = MappingProxyType({
         range_lever=("lower R = x_max/x_min — the band-energy span over the "
                      "gap; R <= 1e5 is certified"),
         generator_hint=("tools/generate_minimax_assets.py "
-                        "--family noncrossing "
-                        "--r-max <R> --error-tier <eps>   (offline)"),
+                        "--noncrossing-r-max <R> "
+                        "--error-bound <eps>   (offline)"),
         description="1/x as a sum of decaying exponentials on [1, R]."),
-    "crossing": FamilySpec(
-        name="crossing",
-        route="sine_sum",
-        target="hgl",
-        character="real",
-        range_param="A_dim",
-        catalog="catalog.json",
-        shipped=True,
-        wired=True,
-        range_lever=("lower A_core = 2*omega_max/xi + 2*edge_factor — either "
-                     "a narrower Sigma_c omega grid or a larger broadening "
-                     "xi; A_dim <= 60 is certified"),
-        generator_hint=("tools/generate_minimax_assets.py --family crossing "
-                        "--a-max <A> --error-tier <eps>   (~1 core-hour, "
-                        "offline)"),
-        description="The HGL regularized sign target as a signed sine sum."),
     "noncrossing_imag": FamilySpec(
         name="noncrossing_imag",
         route="exponential_sum_imag",
@@ -183,8 +153,7 @@ FAMILIES: Mapping[str, FamilySpec] = MappingProxyType({
         character="imag",
         range_param="R",
         catalog="catalog.json",
-        # MEASURED, and it is R1's structural hole: `catalog.json` carries
-        # 31 entries in two families, `{'crossing': 5, 'noncrossing': 26}`.
+        # MEASURED: `catalog.json` carries only noncrossing entries.
         # There is no `noncrossing_imag` family at all, which is why
         # `build_imag_quadrature` -- on the path of EVERY GN-PPM run -- is a
         # 100% runtime-solve path with no table behind it.

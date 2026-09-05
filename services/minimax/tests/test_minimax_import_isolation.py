@@ -137,7 +137,7 @@ def test_the_lookup_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
             # is what catches an __all__ that quietly emptied, and a
             # deliberate door change is exactly the kind of edit that
             # should have to touch a test.
-                "assert len(M.__all__) == 101, (len(M.__all__), M.__all__)\n"
+                "assert len(M.__all__) == 100, (len(M.__all__), M.__all__)\n"
             # Only the NON-lazy half is touched by name here: hasattr on a
             # solver name would fire the PEP-562 __getattr__ and import
             # scipy, which is the very thing the next assertion denies.
@@ -152,8 +152,8 @@ def test_the_lookup_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
             "        continue\n"
             "    assert hasattr(M, _n), _n\n"
             "v = M.catalog()\n"
-                "assert len(v) == 34, len(v)\n"
-            "assert v.families() == ('crossing', 'noncrossing'), v\n"
+                "assert len(v) == 28, len(v)\n"
+            "assert v.families() == ('noncrossing',), v\n"
             "q = M.lookup(family='noncrossing', target='inverse',\n"
             "             range_value=10.0, error_bound=1e-6, n_max=64)\n"
             "assert q.node_count == 7 and q.nodes.dtype.name == 'float64'\n"
@@ -184,16 +184,12 @@ def test_a_refusal_is_reachable_and_readable_with_no_scipy():
             "import sys, minimax as M\n"
             "try:\n"
             "    M.lookup(family='crossing', target='hgl', range_value=83.0,\n"
-            "             error_bound=1e-6, n_max=500, eps_q=1e-3)\n"
-            "except M.NoCertifiedTable as e:\n"
+            "             error_bound=1e-6, n_max=500)\n"
+            "except M.UnknownTarget as e:\n"
             "    t = str(e)\n"
-            "    assert 'A_dim=83' in t, t\n"
-            "    assert 'nearest certified below' in t, t\n"
-            "    assert 'reachable by' in t, t\n"
-            "    assert 'or generate' in t, t\n"
+            "    assert 'unknown family' in t, t\n"
             "else:\n"
-            "    raise AssertionError('A_dim=83 is outside the catalog and "
-            "did not refuse')\n"
+            "    raise AssertionError('retired HGL route did not refuse')\n"
             "assert 'scipy' not in sys.modules\n"))
     assert run.loaded == ()
 
@@ -201,8 +197,8 @@ def test_a_refusal_is_reachable_and_readable_with_no_scipy():
 def test_the_solver_half_is_reachable_when_scipy_is_there():
     """The lazy door is a DEFERRAL, not a removal.
 
-    ``from minimax import G_hgl`` must work — the generator campaign and
-    the certification tier need those names — and it must be the moment
+    ``from minimax import G_fermi`` must work for offline experiments, and it
+    must be the moment
     scipy arrives, not before.  Both halves of that are asserted here, in
     one child, because asserting only the first would be satisfied by an
     eager import.
@@ -215,7 +211,7 @@ def test_the_solver_half_is_reachable_when_scipy_is_there():
             _CPU_PIN +
             "import sys, minimax as M\n"
             "assert 'scipy' not in sys.modules, 'import minimax ate scipy'\n"
-            "g = M.G_hgl\n"
+            "g = M.G_fermi\n"
             "assert 'scipy' in sys.modules, 'the lazy door did not fire'\n"
             "import numpy as np\n"
             "u = np.array([0.5])\n"

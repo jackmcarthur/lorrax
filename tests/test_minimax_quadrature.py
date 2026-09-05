@@ -100,12 +100,12 @@ def test_find_shipped_table_entry_prefers_smallest_range_then_loosest_error():
     assert entry.file == "noncrossing/loose.npz"
 
 
-def test_find_shipped_table_entry_filters_crossing_metadata():
+def test_catalog_selector_filters_optional_target_metadata():
     catalog = {
         "tables": [
             {
                 "family": "crossing",
-                "target_kind": "fermi",
+                "target_kind": "other",
                 "range_max": 80.0,
                 "error_bound": 1.0e-6,
                 "eps_q": 1.0e-3,
@@ -114,7 +114,7 @@ def test_find_shipped_table_entry_filters_crossing_metadata():
             },
             {
                 "family": "crossing",
-                "target_kind": "hgl",
+                "target_kind": "fermi",
                 "range_max": 80.0,
                 "error_bound": 1.0e-6,
                 "eps_q": 1.0e-2,
@@ -123,7 +123,7 @@ def test_find_shipped_table_entry_filters_crossing_metadata():
             },
             {
                 "family": "crossing",
-                "target_kind": "hgl",
+                "target_kind": "fermi",
                 "range_max": 80.0,
                 "error_bound": 1.0e-6,
                 "eps_q": 1.0e-3,
@@ -132,7 +132,7 @@ def test_find_shipped_table_entry_filters_crossing_metadata():
             },
             {
                 "family": "crossing",
-                "target_kind": "hgl",
+                "target_kind": "fermi",
                 "range_max": 80.0,
                 "error_bound": 1.0e-6,
                 "eps_q": 1.0e-3,
@@ -148,7 +148,7 @@ def test_find_shipped_table_entry_filters_crossing_metadata():
         range_value=60.0,
         target_error=1.0e-6,
         max_nodes=64,
-        target_kind="hgl",
+        target_kind="fermi",
         eps_q=1.0e-3,
     )
 
@@ -249,41 +249,6 @@ def test_imag_laplace_lookup_and_fallback_share_physical_error_rescale(
     assert select_seen["target_error"] == requested * x_min
     assert serve_seen["error_bound"] == requested * x_min
     assert quad.max_error == requested
-
-
-def test_solve_phase_minimax_bandwidth_carries_the_crossing_table_unrescaled():
-    """The crossing wrapper does NOT divide -- ξ enters at the consumer.
-
-    ``ppm_windows`` applies ``t = τ/ξ`` itself, so a division here would
-    apply it twice.  The asymmetry with the Laplace wrapper above is the
-    reason both cells exist.
-    """
-    tau_hat = np.array([0.5, 1.5], dtype=np.float64)
-    alpha_hat = np.array([0.1, 0.2], dtype=np.float64)
-    err_hat = 9.0e-7
-
-    import pytest as _pytest
-    mp = _pytest.MonkeyPatch()
-    try:
-        mp.setattr(ms._mm, "serve",
-                   lambda **kw: _served(tau_hat, alpha_hat, err_hat,
-                                        family="crossing", target="hgl",
-                                        source="runtime-uncertified"))
-        quad = ms.solve_phase_minimax_bandwidth(
-            83.0,
-            target_error=1.0e-6,
-            max_nodes=500,
-            eps_q=1.0e-3,
-            target_kind="hgl",
-        )
-    finally:
-        mp.undo()
-
-    np.testing.assert_allclose(quad.tau, tau_hat)
-    np.testing.assert_allclose(quad.alpha, alpha_hat)
-    assert quad.max_error == err_hat
-    assert quad.target_kind == "hgl"
-    assert "runtime solve" in quad.provenance
 
 
 def test_solve_laplace_minimax_interval_forwards_the_shipped_table_flag(monkeypatch):

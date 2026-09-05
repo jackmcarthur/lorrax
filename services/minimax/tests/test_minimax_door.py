@@ -52,7 +52,7 @@ def test_the_solver_half_is_deferred_until_it_is_named():
         "import sys; sys.path.insert(0, %r)\n"
         "import minimax\n"
         "assert 'minimax.solver' not in sys.modules, 'eager'\n"
-        "minimax.G_hgl\n"
+        "minimax.G_fermi\n"
         "assert 'minimax.solver' in sys.modules, 'never loaded'\n"
         "print('OK')\n" % (src,))
     out = subprocess.run([sys.executable, "-c", probe],
@@ -87,7 +87,7 @@ def test_the_declared_families_match_the_shipped_bundle():
 
 
 def test_the_catalog_view_is_enumerable_without_solving_anything():
-    """31 entries, two families, no optimiser.
+    """28 entries, one family, no optimiser.
 
     The "no optimiser" half is NOT asserted here with
     ``'minimax.solver' not in sys.modules`` — in a shared session another
@@ -98,9 +98,8 @@ def test_the_catalog_view_is_enumerable_without_solving_anything():
     scrubbed one by the isolation suite.
     """
     view = M.catalog()
-    assert len(view) == len(view.entries) == 31
-    assert len(view.for_family("crossing")) == 5
-    assert len(view.for_family("noncrossing")) == 26
+    assert len(view) == len(view.entries) == 28
+    assert len(view.for_family("noncrossing")) == 28
 
 
 # ---------------------------------------------------------------------------
@@ -371,46 +370,12 @@ def test_f5_a_miss_with_the_hatch_closed_is_a_refusal(monkeypatch,
     """
     monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "0")
     with pytest.raises(M.UncertifiedSolveRefused) as excinfo:
-        M.serve(family="crossing", target="hgl", range_value=83.0,
-                error_bound=1.0e-6, n_max=500, eps_q=1.0e-3)
+        M.serve(family="noncrossing", target="inverse", range_value=1.0e6,
+                error_bound=1.0e-6, n_max=64)
     text = str(excinfo.value)
     assert M.RUNTIME_SOLVE_ENV in text
-    assert "no certified crossing table for A_dim=83" in text
-    assert "nearest certified below: A_dim=60" in text
-
-
-def test_f5_false_case_with_the_hatch_open_it_solves_and_says_so(
-        monkeypatch, isolated_cache):
-    """The FALSE case for F5, and the loudest line in the service.
-
-    A solve must name the request, the achieved error, the measured Σ|w|
-    and κ₀, and the words *uncertified, not reproducible across hosts* —
-    because the comfortable failure mode of this whole design is that the
-    hatch stays open forever and nobody notices.  The defence is that
-    every log says so.
-
-    A_dim = 20 rather than 83: the point of this cell is the ANNOUNCEMENT,
-    and a small bandwidth solves in a second where the G2 gate's 83 takes
-    the better part of a minute.
-    """
-    pytest.importorskip("scipy")
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "1")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        q = M.serve(family="crossing", target="hgl", range_value=20.0,
-                    error_bound=1.0e-6, n_max=60, eps_q=1.0e-3,
-                    use_shipped=False)
-    assert q.provenance.source == "runtime-uncertified"
-    assert q.provenance.certified is False
-    assert q.kappa0 is not None
-    lines = [str(w.message) for w in caught
-             if "UNCERTIFIED SOLVE" in str(w.message)]
-    assert len(lines) == 1, lines
-    line = lines[0]
-    assert "crossing/hgl A_dim=20" in line
-    assert "sum|w|" in line and "kappa0" in line
-    assert "NOT REPRODUCIBLE ACROSS HOSTS" in line
-    assert M.RUNTIME_SOLVE_ENV in line
+    assert "no certified noncrossing table for R=1e+06" in text
+    assert "nearest certified below: R=100000" in text
 
 
 def test_serve_prefers_the_certified_table_over_the_hatch(isolated_cache):
@@ -419,8 +384,8 @@ def test_serve_prefers_the_certified_table_over_the_hatch(isolated_cache):
     never reach the solver."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        q = M.serve(family="crossing", target="hgl", range_value=40.0,
-                    error_bound=1.0e-6, n_max=500, eps_q=1.0e-3)
+        q = M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                    error_bound=1.0e-6, n_max=64)
     assert q.provenance.source == "shipped"
     assert not [w for w in caught if "UNCERTIFIED SOLVE" in str(w.message)]
 

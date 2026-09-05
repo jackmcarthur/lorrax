@@ -1,5 +1,9 @@
 # Channel Hermiticity of $\sigma^\tau$ and legal GEMM reductions in the PPM $\Sigma_c$ projection
 
+> **Historical derivation.** The HGL crossing channel analyzed here is
+> retired. This memo remains as evidence for why that channel could not use
+> the Laplace symmetry reductions; it is not a current assembly guide.
+
 **Scope.** Derivation memo for LORRAX @ `b436e47`. Question: given Hermitian $G$ and $W$,
 what symmetry do the elementwise channel objects $\sigma_R=\mathrm{Re}\,\sigma^\tau$ and
 $\sigma_I=\mathrm{Im}\,\sigma^\tau$ carry in $(r_\mu, r_\nu)$, per window family, and which

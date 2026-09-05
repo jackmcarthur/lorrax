@@ -4,8 +4,9 @@
 > real-pole GL/HGL rewrite and is not a specification for MPA. Current MPA
 > sampling, complex-pole fitting, literal-eta core/stripe/slab partition, and
 > positive causal crossing rule are owned by
-> `docs/theory/THEORY_mpa_implementation.md`. Current GN-PPM HGL theory is
-> owned by `docs/theory/minimax-quadrature.md`. Do not implement from the
+> `docs/theory/THEORY_mpa_implementation.md`. Current static/imaginary
+> minimax theory is owned by `docs/theory/minimax-quadrature.md`; HGL is
+> retired. Do not implement from the
 > checklist below.
 
 Status: Stages 1-3 completed for chi path

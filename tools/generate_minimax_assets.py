@@ -54,13 +54,11 @@ from minimax import (  # noqa: E402
 
 
 DEFAULT_ERROR_BOUNDS = (1.0e-6, 2.0e-7)
-DEFAULT_CROSSING_A_VALUES = tuple(float(v) for v in range(20, 201, 20))
 DEFAULT_NONCROSSING_R_VALUES = tuple(
     float(v) for v in np.logspace(1.0, 5.0, num=(5 - 1) * 3 + 1)
 )
 DEFAULT_OUTPUT_ROOT = (REPO_ROOT / "services" / "minimax" / "src" / "minimax"
                        / "minimax_assets")
-DEFAULT_FAMILIES = ("crossing", "noncrossing")
 _NONCROSSING_CERT_GRID_SIZE = 20_001
 _NONCROSSING_KAPPA0_BOUND = 2.0
 
@@ -279,20 +277,8 @@ def _iter_error_bounds(values: Iterable[float]) -> list[float]:
     return cleaned
 
 
-def _iter_families(values: Iterable[str]) -> list[str]:
-    cleaned = []
-    for value in values:
-        family = str(value).strip().lower()
-        if family not in {"crossing", "noncrossing"}:
-            raise ValueError(f"Unsupported family {value!r}; expected 'crossing' or 'noncrossing'.")
-        if family not in cleaned:
-            cleaned.append(family)
-    if not cleaned:
-        raise ValueError("Need at least one quadrature family.")
-    return cleaned
-
-
-def _build_readme_text(*, crossing_a_values: list[float], noncrossing_r_values: list[float], error_bounds: list[float], crossing_eps_q: float, crossing_target_kind: str) -> str:
+def _build_readme_text(*, noncrossing_r_values: list[float],
+                       error_bounds: list[float]) -> str:
     return f"""# Shipped Minimax Quadratures
 
 This directory contains precomputed minimax quadrature tables for runtime reuse by
@@ -322,19 +308,9 @@ The physical absolute error then scales as `error_bound / x_min`.
 
 This is not a relative-at-endpoint criterion.
 
-### Crossing
-
-Crossing tables are generated for the absolute L-infinity error on the target function
-itself:
-
-`max_u | G(u) - approx(u) | <= error_bound`, for `u in [0, A_dim]`.
-
 ## Sweep values in this bundle
 
 - Error bounds: {", ".join(f"{v:.1e}" for v in error_bounds)}
-- Crossing target kind: `{crossing_target_kind}`
-- Crossing `eps_q`: {crossing_eps_q:.3e}
-- Crossing `A_dim` values: {", ".join(f"{v:.6g}" for v in crossing_a_values)}
 - Noncrossing `R` values: {", ".join(f"{v:.6g}" for v in noncrossing_r_values)}
 
 The machine-readable descriptor is `catalog.json`.
@@ -344,11 +320,8 @@ The machine-readable descriptor is `catalog.json`.
 def _build_catalog(
     *,
     tables: list[dict[str, object]],
-    crossing_a_values: list[float],
     noncrossing_r_values: list[float],
     error_bounds: list[float],
-    crossing_eps_q: float,
-    crossing_target_kind: str,
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -369,16 +342,9 @@ def _build_catalog(
                 "error_metric": "linf_abs_scaled_1_over_x",
                 "physical_error_note": "runtime rescales tables from [1,R] to [x_min,x_max], so absolute error scales as error_bound / x_min",
             },
-            "crossing": {
-                "problem": "G(u) on [0, A_dim]",
-                "error_metric": "linf_abs_target",
-                "eps_q": float(crossing_eps_q),
-                "target_kind": str(crossing_target_kind),
-            },
         },
         "sweeps": {
             "error_bounds": [float(v) for v in error_bounds],
-            "crossing_A_dim_values": [float(v) for v in crossing_a_values],
             "noncrossing_R_values": [float(v) for v in noncrossing_r_values],
         },
         "tables": tables,
@@ -416,11 +382,9 @@ def _merged_sweep_values(
     output_root: Path,
     *,
     error_bounds: list[float],
-    crossing_a_values: list[float],
     noncrossing_r_values: list[float],
-    families: list[str],
     clobber: bool,
-) -> tuple[list[float], list[float], list[float]]:
+) -> tuple[list[float], list[float]]:
     """Keep the catalog census cumulative under ``--no-clobber``.
 
     The solve loops still receive exactly the requested cells.  These values
@@ -430,13 +394,13 @@ def _merged_sweep_values(
     """
 
     if clobber:
-        return error_bounds, crossing_a_values, noncrossing_r_values
+        return error_bounds, noncrossing_r_values
     try:
         prior = json.loads(
             (output_root / "catalog.json").read_text(encoding="utf-8"))
         sweeps = prior.get("sweeps", {})
     except (OSError, json.JSONDecodeError, AttributeError):
-        return error_bounds, crossing_a_values, noncrossing_r_values
+        return error_bounds, noncrossing_r_values
 
     def _union(prior_values, requested_values, *, reverse=False):
         return sorted({float(value) for value in
@@ -445,15 +409,11 @@ def _merged_sweep_values(
 
     catalog_errors = _union(
         sweeps.get("error_bounds"), error_bounds, reverse=True)
-    catalog_crossing = _union(
-        sweeps.get("crossing_A_dim_values"),
-        crossing_a_values if "crossing" in families else [],
-    )
     catalog_noncrossing = _union(
         sweeps.get("noncrossing_R_values"),
-        noncrossing_r_values if "noncrossing" in families else [],
+        noncrossing_r_values,
     )
-    return catalog_errors, catalog_crossing, catalog_noncrossing
+    return catalog_errors, catalog_noncrossing
 
 
 def _sorted_table_entries(table_map: dict[str, dict[str, object]]) -> list[dict[str, object]]:
@@ -473,19 +433,13 @@ def _flush_outputs(
     output_root: Path,
     *,
     tables: list[dict[str, object]],
-    crossing_a_values: list[float],
     noncrossing_r_values: list[float],
     error_bounds: list[float],
-    crossing_eps_q: float,
-    crossing_target_kind: str,
 ) -> dict[str, object]:
     catalog = _build_catalog(
         tables=tables,
-        crossing_a_values=crossing_a_values,
         noncrossing_r_values=noncrossing_r_values,
         error_bounds=error_bounds,
-        crossing_eps_q=crossing_eps_q,
-        crossing_target_kind=crossing_target_kind,
     )
     with (output_root / "catalog.json").open("w", encoding="utf-8") as fh:
         json.dump(catalog, fh, indent=2, sort_keys=False)
@@ -493,11 +447,8 @@ def _flush_outputs(
     with (output_root / "README.md").open("w", encoding="utf-8") as fh:
         fh.write(
             _build_readme_text(
-                crossing_a_values=crossing_a_values,
                 noncrossing_r_values=noncrossing_r_values,
                 error_bounds=error_bounds,
-                crossing_eps_q=crossing_eps_q,
-                crossing_target_kind=crossing_target_kind,
             )
         )
     return catalog
@@ -507,182 +458,110 @@ def generate_assets(
     *,
     output_root: Path,
     error_bounds: list[float],
-    crossing_a_values: list[float],
     noncrossing_r_values: list[float],
-    crossing_eps_q: float,
-    crossing_target_kind: str,
-    families: list[str],
     clobber: bool,
 ) -> dict[str, object]:
-    crossing_dir = output_root / "crossing"
     noncrossing_dir = output_root / "noncrossing"
-    if "crossing" in families:
-        _ensure_clean_dir(crossing_dir, clobber=clobber)
-    if "noncrossing" in families:
-        _ensure_clean_dir(noncrossing_dir, clobber=clobber)
+    _ensure_clean_dir(noncrossing_dir, clobber=clobber)
 
-    table_map = {} if clobber else _load_existing_tables(output_root)
+    table_map = {} if clobber else {
+        path: entry
+        for path, entry in _load_existing_tables(output_root).items()
+        if entry.get("family") == "noncrossing"
+    }
     (catalog_error_bounds,
-     catalog_crossing_a_values,
      catalog_noncrossing_r_values) = _merged_sweep_values(
          output_root,
          error_bounds=error_bounds,
-         crossing_a_values=crossing_a_values,
          noncrossing_r_values=noncrossing_r_values,
-         families=families,
          clobber=clobber,
      )
-    total_tables = 0
-    if "crossing" in families:
-        total_tables += len(error_bounds) * len(crossing_a_values)
-    if "noncrossing" in families:
-        total_tables += len(error_bounds) * len(noncrossing_r_values)
+    total_tables = len(error_bounds) * len(noncrossing_r_values)
     table_index = 0
 
-    if "crossing" in families:
-        for err in error_bounds:
-            for A_dim in crossing_a_values:
-                table_index += 1
-                fname = (
-                    f"crossing_{crossing_target_kind}"
-                    f"_A_{_format_float_token(A_dim)}"
-                    f"_eps_{_format_error_token(err)}"
-                    f"_epsq_{_format_error_token(crossing_eps_q)}.npz"
+    for err in error_bounds:
+        for R in noncrossing_r_values:
+            table_index += 1
+            fname = (
+                f"noncrossing_R_{_format_float_token(R)}"
+                f"_eps_{_format_error_token(err)}.npz"
+            )
+            rel_path = Path("noncrossing") / fname
+            table_path = noncrossing_dir / fname
+            if table_path.exists():
+                tau, alpha, max_error = _read_table(table_path)
+                action = "reuse"
+            else:
+                _q = solve_uncertified(
+                    family="noncrossing",
+                    target="inverse",
+                    range_value=float(R),
+                    error_bound=float(err),
+                    n_max=64,
                 )
-                rel_path = Path("crossing") / fname
-                table_path = crossing_dir / fname
-                if table_path.exists():
-                    tau, alpha, max_error = _read_table(table_path)
-                    action = "reuse"
-                else:
-                    _q = solve_uncertified(
-                        family="crossing",
-                        target=str(crossing_target_kind),
-                        range_value=float(A_dim),
-                        error_bound=float(err),
-                        n_max=500,
-                        eps_q=float(crossing_eps_q),
-                    )
-                    tau, alpha, max_error = _q.nodes, _q.weights, _q.max_error
-                    _write_table(
-                        table_path, tau=tau, alpha=alpha,
-                        max_error=max_error)
-                    action = "solve"
-                table_map[rel_path.as_posix()] = {
-                    "family": "crossing",
-                    "target_kind": str(crossing_target_kind),
-                    "error_bound": float(err),
-                    "error_metric": "linf_abs_target",
-                    "range_param": "A_dim",
-                    "range_max": float(A_dim),
-                    "eps_q": float(crossing_eps_q),
-                    "node_count": int(len(tau)),
-                    "max_error": float(max_error),
-                    "file": rel_path.as_posix(),
-                }
-                print(
-                    f"[{table_index:02d}/{total_tables:02d}] {action:5s} crossing "
-                    f"A={A_dim:.6g} err<={err:.1e} nodes={len(tau)} max|Δ|={float(max_error):.3e}"
-                )
-                _flush_outputs(
-                    output_root,
-                    tables=_sorted_table_entries(table_map),
-                    crossing_a_values=catalog_crossing_a_values,
-                    noncrossing_r_values=catalog_noncrossing_r_values,
-                    error_bounds=catalog_error_bounds,
-                    crossing_eps_q=crossing_eps_q,
-                    crossing_target_kind=crossing_target_kind,
-                )
-
-    if "noncrossing" in families:
-        for err in error_bounds:
-            for R in noncrossing_r_values:
-                table_index += 1
-                fname = (
-                    f"noncrossing_R_{_format_float_token(R)}"
-                    f"_eps_{_format_error_token(err)}.npz"
-                )
-                rel_path = Path("noncrossing") / fname
-                table_path = noncrossing_dir / fname
-                if table_path.exists():
-                    tau, alpha, max_error = _read_table(table_path)
-                    action = "reuse"
-                else:
-                    _q = solve_uncertified(
-                        family="noncrossing",
-                        target="inverse",
-                        range_value=float(R),
-                        error_bound=float(err),
-                        n_max=64,
-                    )
-                    tau, alpha, max_error = _q.nodes, _q.weights, _q.max_error
-                    action = "solve"
-                certificate = certify_noncrossing_inverse(
-                    tau, alpha, float(R), float(err))
-                if not certificate["certified"]:
-                    raise RuntimeError(
-                        f"noncrossing R={R:g} eps={err:.1e} failed "
-                        f"certification: {certificate['failures']}")
-                max_error = float(certificate["max_error"])
-                _write_table(
-                    table_path, tau=tau, alpha=alpha, max_error=max_error,
-                    certificate=certificate)
-                table_map[rel_path.as_posix()] = {
-                    "family": "noncrossing",
-                    "error_bound": float(err),
-                    "error_metric": "linf_abs_scaled_1_over_x",
-                    "range_param": "R",
-                    "range_max": float(R),
-                    "node_count": int(len(tau)),
-                    "max_error": float(max_error),
-                    "held_out_max_error": float(
-                        certificate["held_out_max_error"]),
-                    "kappa0": float(certificate["kappa0"]),
-                    "kappa0_bound": float(certificate["kappa0_bound"]),
-                    "sum_abs_alpha": float(certificate["sum_abs_alpha"]),
-                    "rescale_max_error_ratio": float(
-                        certificate["rescale_max_error_ratio"]),
-                    "payload_sha256": str(certificate["payload_sha256"]),
-                    "certified": True,
-                    "certification": {
-                        "method": (
-                            "held-out log grid plus endpoints, analytic "
-                            "derivative roots, and bounded local extrema"),
-                        "held_out_grid_size": int(certificate["n_eval"]),
-                        "derivative_root_count": int(
-                            certificate["derivative_root_count"]),
-                        "local_refinement_count": int(
-                            certificate["local_refinement_count"]),
-                        "checks": [
-                            "refined_error", "positive_nodes",
-                            "positive_weights", "kappa0", "rescale",
-                        ],
-                    },
-                    "provenance": _generator_provenance(),
-                    "file": rel_path.as_posix(),
-                }
-                print(
-                    f"[{table_index:02d}/{total_tables:02d}] {action:5s} noncrossing "
-                    f"R={R:.6g} err<={err:.1e} nodes={len(tau)} max|Δ|={float(max_error):.3e}"
-                )
-                _flush_outputs(
-                    output_root,
-                    tables=_sorted_table_entries(table_map),
-                    crossing_a_values=catalog_crossing_a_values,
-                    noncrossing_r_values=catalog_noncrossing_r_values,
-                    error_bounds=catalog_error_bounds,
-                    crossing_eps_q=crossing_eps_q,
-                    crossing_target_kind=crossing_target_kind,
-                )
+                tau, alpha, max_error = _q.nodes, _q.weights, _q.max_error
+                action = "solve"
+            certificate = certify_noncrossing_inverse(
+                tau, alpha, float(R), float(err))
+            if not certificate["certified"]:
+                raise RuntimeError(
+                    f"noncrossing R={R:g} eps={err:.1e} failed "
+                    f"certification: {certificate['failures']}")
+            max_error = float(certificate["max_error"])
+            _write_table(
+                table_path, tau=tau, alpha=alpha, max_error=max_error,
+                certificate=certificate)
+            table_map[rel_path.as_posix()] = {
+                "family": "noncrossing",
+                "error_bound": float(err),
+                "error_metric": "linf_abs_scaled_1_over_x",
+                "range_param": "R",
+                "range_max": float(R),
+                "node_count": int(len(tau)),
+                "max_error": float(max_error),
+                "held_out_max_error": float(
+                    certificate["held_out_max_error"]),
+                "kappa0": float(certificate["kappa0"]),
+                "kappa0_bound": float(certificate["kappa0_bound"]),
+                "sum_abs_alpha": float(certificate["sum_abs_alpha"]),
+                "rescale_max_error_ratio": float(
+                    certificate["rescale_max_error_ratio"]),
+                "payload_sha256": str(certificate["payload_sha256"]),
+                "certified": True,
+                "certification": {
+                    "method": (
+                        "held-out log grid plus endpoints, analytic "
+                        "derivative roots, and bounded local extrema"),
+                    "held_out_grid_size": int(certificate["n_eval"]),
+                    "derivative_root_count": int(
+                        certificate["derivative_root_count"]),
+                    "local_refinement_count": int(
+                        certificate["local_refinement_count"]),
+                    "checks": [
+                        "refined_error", "positive_nodes",
+                        "positive_weights", "kappa0", "rescale",
+                    ],
+                },
+                "provenance": _generator_provenance(),
+                "file": rel_path.as_posix(),
+            }
+            print(
+                f"[{table_index:02d}/{total_tables:02d}] {action:5s} "
+                f"noncrossing R={R:.6g} err<={err:.1e} "
+                f"nodes={len(tau)} max|Δ|={float(max_error):.3e}"
+            )
+            _flush_outputs(
+                output_root,
+                tables=_sorted_table_entries(table_map),
+                noncrossing_r_values=catalog_noncrossing_r_values,
+                error_bounds=catalog_error_bounds,
+            )
 
     catalog = _flush_outputs(
         output_root,
         tables=_sorted_table_entries(table_map),
-        crossing_a_values=catalog_crossing_a_values,
         noncrossing_r_values=catalog_noncrossing_r_values,
         error_bounds=catalog_error_bounds,
-        crossing_eps_q=crossing_eps_q,
-        crossing_target_kind=crossing_target_kind,
     )
     return catalog
 
@@ -701,38 +580,6 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=None,
         help="Absolute error bound to tabulate. Repeat for multiple values.",
-    )
-    ap.add_argument(
-        "--family",
-        type=str,
-        action="append",
-        default=None,
-        help="Quadrature family to generate: crossing or noncrossing. Repeat to request both.",
-    )
-    ap.add_argument(
-        "--crossing-a-max",
-        type=float,
-        default=200.0,
-        help="Largest crossing A_dim value to tabulate.",
-    )
-    ap.add_argument(
-        "--crossing-a-step",
-        type=float,
-        default=20.0,
-        help="Step size for crossing A_dim sweep.",
-    )
-    ap.add_argument(
-        "--crossing-eps-q",
-        type=float,
-        default=1.0e-3,
-        help="eps_q parameter for crossing HGL/Fermi support truncation.",
-    )
-    ap.add_argument(
-        "--crossing-target-kind",
-        type=str,
-        default="hgl",
-        choices=("hgl", "fermi"),
-        help="Crossing target family to generate.",
     )
     ap.add_argument(
         "--noncrossing-r-min",
@@ -763,9 +610,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     error_bounds = _iter_error_bounds(args.error_bound or DEFAULT_ERROR_BOUNDS)
-    families = _iter_families(args.family or DEFAULT_FAMILIES)
-    crossing_count = int(round(args.crossing_a_max / args.crossing_a_step))
-    crossing_a_values = [float(v) for v in np.arange(1, crossing_count + 1) * float(args.crossing_a_step)]
     decades = math.log10(args.noncrossing_r_max) - math.log10(args.noncrossing_r_min)
     n_intervals = int(round(decades * int(args.noncrossing_intervals_per_decade)))
     noncrossing_r_values = [
@@ -779,17 +623,12 @@ def main() -> None:
     catalog = generate_assets(
         output_root=args.output_root,
         error_bounds=error_bounds,
-        crossing_a_values=crossing_a_values,
         noncrossing_r_values=noncrossing_r_values,
-        crossing_eps_q=float(args.crossing_eps_q),
-        crossing_target_kind=str(args.crossing_target_kind),
-        families=families,
         clobber=not args.no_clobber,
     )
     print(f"Wrote minimax assets to {args.output_root}")
     print(f"  tables: {len(catalog['tables'])}")
-    print(f"  families: {', '.join(families)}")
-    print(f"  crossing A values: {len(crossing_a_values)}")
+    print("  family: noncrossing")
     print(f"  noncrossing R values: {len(noncrossing_r_values)}")
     print(f"  error bounds: {', '.join(f'{v:.1e}' for v in error_bounds)}")
 

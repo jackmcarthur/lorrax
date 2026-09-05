@@ -1,8 +1,8 @@
-# Minimax quadrature for static and plasmon-pole GW
+# Minimax quadrature for static and imaginary-frequency screening
 
-This chapter describes the scalar quadratures used by static screening and the
-GN/HL plasmon-pole self-energy. The current MPA body uses fitted complex poles,
-a positive causal crossing rule, and complex-sector rules instead; see
+This chapter describes the scalar minimax quadratures used by static and
+imaginary-frequency screening. Dynamic GN/HL-PPM and MPA Sigma share the
+uniform denominator-box rule and one time-domain executor; see
 [Multipole frequency integration](THEORY_mpa_implementation.md).
 
 The physics owner supplies an energy interval and a target function. The
@@ -13,8 +13,8 @@ escape hatch is enabled.
 
 ## 1. Why reciprocal kernels are separated
 
-After a spectral window is referenced to one edge, its denominator is either
-sign definite or crosses zero.
+After a spectral window is referenced to one edge, a sign-definite denominator
+admits a Laplace representation.
 
 For \(x\in[x_{\min},x_{\max}]\) with \(x_{\min}>0\),
 
@@ -34,24 +34,10 @@ N=\mathcal O\!\left(
 \right).
 $$
 
-If \(x\) changes sign, one decaying Laplace contour cannot cover the complete
-interval. A crossing rule instead represents an odd, regularized reciprocal
-by a sine sum,
-
-$$
-g_\xi(x)
-\approx\sum_{\ell=1}^N a_\ell\sin(\tau_\ell x),
-\qquad
-g_\xi(-x)=-g_\xi(x),
-\qquad
-g_\xi(0)=0.
-$$
-
-The scale \(\xi\) is part of the observable regularization, not a numerical
-way to hide a singular denominator. Crossing rank is linear in the scaled
-bandwidth \(A=E_{\mathrm{bw}}/\xi\) at fixed error for the learned sine
-family. The older HGL target remains a supported GN/PPM asset; it is not the
-MPA crossing construction.
+The retired HGL sine target changed the fixed-Lorentzian observable and had no
+remaining production caller. It is no longer a minimax family or fallback.
+Intervals crossing zero belong to the uniform denominator-box owner, which
+keeps the configured broadening fixed.
 
 ## 2. Static and imaginary-axis screening
 
@@ -99,7 +85,7 @@ Hermitian `B` and odd Hermitian `D`, and the Sigma owner selects `B+D` for
 empty/conduction branches and `B-D` for occupied/valence branches; the
 quadrature service does not choose a residue.
 
-## 3. Real-frequency PPM windows
+## 3. Dynamic Sigma boundary
 
 A PPM self-energy denominator is schematically
 
@@ -107,29 +93,18 @@ $$
 d(\omega)=\omega-E_A-\Omega.
 $$
 
-For each causal branch, the planner partitions the Cartesian
-\((E_A,\Omega)\) domain so that every cell is either:
-
-- **noncrossing**, where \(d\) has a fixed sign and a rescaled exponential
-  rule is valid; or
-- **crossing**, where the requested \(\omega\) interval overlaps the cell and
-  the regularized sine rule is required.
+For each causal branch, the shared planner partitions the Cartesian
+\((E_A,\Omega)\) domain into uniform denominator boxes. Those boxes, their
+fixed-eta target, and their node-reduction certificate are not minimax catalog
+assets and are documented by the MPA theory owner.
 
 The rectangular windows are not cosmetic. They preserve separability:
 one band-restricted Green function and one pole-restricted screened
 interaction can be formed independently. A selector depending on each
 \((E_A,\Omega)\) pair would recreate the pairwise cost.
 
-For a sine atom,
-
-$$
-\sin(\tau d)
-=\frac{e^{i\tau d}-e^{-i\tau d}}{2i}.
-$$
-
-The two exponentials become forward and backward real-time propagators. Their
-completion must be performed before a band projection unless the relevant
-matrix adjoint identity has been proved.
+This boundary is deliberate: the minimax service does not choose dynamic
+Sigma regularization or create a second executor.
 
 ## 4. Error and stability
 
@@ -182,18 +157,16 @@ when two windows reuse the same scalar node set.
 
 ## 6. Ownership and tuning
 
-`services/minimax` owns target definitions, catalog lookup, provenance,
-certification, and offline solvers. `gw.minimax_screening` owns physical
-intervals, energy references, and rescaling. `gw.ppm_sigma` owns PPM causal
-branches and window selectors. The shared Green-function and convolution
-kernels own no quadrature policy.
+`services/minimax` owns static/imaginary target definitions, catalog lookup,
+provenance, certification, and offline solvers. `gw.minimax_screening` owns
+physical intervals, energy references, and rescaling. Dynamic Sigma planning
+belongs to the denominator-box owner. The shared Green-function and
+convolution kernels own no quadrature policy.
 
 Exact tolerances and node caps are documented in the
-[input reference](../input_reference.md). When a wider band interval exceeds
-a shipped table, generate and certify a wider asset or refuse; do not clip the
-interval. When a denominator approaches zero, route it to the crossing family
-or change the declared physical regularization; do not lower-bound it
-silently.
+[input reference](../input_reference.md). When a wider static/imaginary band
+interval exceeds a shipped table, generate and certify a wider asset or
+refuse; do not clip the interval.
 
 ## References
 

@@ -11,9 +11,8 @@ layer over the ``minimax`` service, and the boundary is the one
 shipped catalog and the disk cache are ``services/minimax/`` now; what
 stays here is everything that knows about physics.  Concretely:
 
-* the three ``solve_*`` wrappers rescale the service's SCALED tables
-  (``[1, R]`` for the Laplace families, ``[0, A]`` for the crossing one)
-  into Rydberg and name *windows*.  For a Laplace family both the achieved
+* the live ``solve_*`` wrappers rescale the service's SCALED Laplace tables
+  on ``[1, R]`` into Rydberg and name *windows*. For a Laplace family both the achieved
   error and the requested physical error scale with ``1/x_min``; keeping
   that units conversion here makes this the single physical-window owner;
 * ``MinimaxNodes`` and the complex128 / ``time_axis`` convention stay,
@@ -153,8 +152,8 @@ def _scalar_to_host_float(a) -> float:
 #
 #  WHAT STAYED HERE, and why: the RESCALE.  The door serves tables in the
 #  scaled units the catalog tabulates (`[1, R]` for the Laplace families,
-#  `[0, A]` for the crossing one); the three wrappers below divide by
-#  `x_min` and name windows in Rydberg.  Keeping that split is what makes
+#  `[1, R]`); the live wrappers below divide by `x_min` and name windows in
+#  Rydberg. Keeping that split is what makes
 #  the extraction bit-identical by construction rather than by tolerance --
 #  the bytes are `np.load`'s, and the arithmetic that follows them is the
 #  same arithmetic in the same module.
@@ -165,10 +164,9 @@ def _scalar_to_host_float(a) -> float:
 class MinimaxNodes:
     """τ nodes + weights in complex form, passable to jit as a pytree.
 
-    Both chi0's Laplace quad (real τ → Im(t)=0) and sigma's crossing /
-    non-crossing quads (``-1j·τ`` or ``τ/ξ``) live in the same complex128
-    storage so one sibling function shape (``minimax_tau_integrate_*``)
-    handles both pipelines.
+    Both chi0's real-axis Laplace quadrature and Sigma's imaginary-time
+    Laplace quadratures live in the same complex128 storage so one sibling
+    function shape (``minimax_tau_integrate_*``) handles both pipelines.
     """
 
     t: jax.Array       # complex128, shape (n,)
@@ -200,27 +198,6 @@ def _laplace_to_minimax_nodes(
         raise ValueError(
             f"Unknown time_axis={time_axis!r}; expected 'real' or 'imag'.")
     return MinimaxNodes(t=t, alpha=alpha_j.astype(jnp.complex128))
-
-
-def _crossing_to_minimax_nodes(
-    tau: np.ndarray, alpha: np.ndarray, *, time_axis: str,
-) -> MinimaxNodes:
-    """Convert a crossing quadrature into complex ``MinimaxNodes``.
-
-    ``time_axis='crossing_hgl'`` keeps τ real (cast to complex) — the
-    crossing window integrates ``Im[...]`` on the real-τ axis directly.
-    Callers that need to rescale by 1/ξ apply that externally.
-    """
-    if time_axis != 'crossing_hgl':
-        raise ValueError(
-            f"Unknown time_axis={time_axis!r} for crossing quadrature; "
-            f"expected 'crossing_hgl'.")
-    tau_j = jnp.asarray(np.asarray(tau, dtype=np.float64), dtype=jnp.float64)
-    alpha_j = jnp.asarray(np.asarray(alpha, dtype=np.float64), dtype=jnp.float64)
-    return MinimaxNodes(
-        t=tau_j.astype(jnp.complex128),
-        alpha=alpha_j.astype(jnp.complex128),
-    )
 
 
 @dataclass(frozen=True)
@@ -262,28 +239,6 @@ class LaplaceMinimaxQuadrature:
         in a jit or pass as an argument.
         """
         return _laplace_to_minimax_nodes(
-            self.tau, self.alpha, time_axis=time_axis)
-
-
-@dataclass(frozen=True)
-class CrossingMinimaxQuadrature:
-    """Quadrature summary for crossing regularization target on ``[0, A_dim]``."""
-
-    A_dim: float
-    tau: np.ndarray
-    alpha: np.ndarray
-    max_error: float
-    target_kind: str
-    #: See :class:`LaplaceMinimaxQuadrature.provenance`.
-    provenance: str | None = None
-
-    @property
-    def node_count(self) -> int:
-        return int(self.tau.shape[0])
-
-    def to_minimax_nodes(self, *, time_axis: str = 'crossing_hgl') -> MinimaxNodes:
-        """Return ``MinimaxNodes`` for the crossing-window τ axis."""
-        return _crossing_to_minimax_nodes(
             self.tau, self.alpha, time_axis=time_axis)
 
 
@@ -1243,48 +1198,6 @@ def solve_laplace_minimax_imag_interval(
         max_error_odd=err_odd,
         n_odd_extra=int(n_extra),
     )
-
-
-def solve_phase_minimax_bandwidth(
-    A_dim: float,
-    *,
-    target_error: float = 1.0e-6,
-    max_nodes: int = 500,
-    eps_q: float = 1.0e-3,
-    target_kind: str = "hgl",
-    use_shipped_tables: bool = True,
-) -> CrossingMinimaxQuadrature:
-    """Fit crossing regularization target on ``[0, A_dim]`` as ``sum alpha_l sin(tau_l u)``.
-
-    Error convention:
-      ``target_error`` is the L-infinity absolute error on the target function itself,
-      e.g. ``max_{u in [0, A_dim]} |G(u) - approx(u)|`` for the chosen regularization
-      target. This is the same absolute convention used by the current solver and the
-      shipped tables below.
-    """
-
-    A_dim = max(float(A_dim), 1.0e-12)
-    target_error = max(float(target_error), 1.0e-14)
-    eps_q = max(float(eps_q), 1.0e-12)
-    max_nodes = max(8, int(max_nodes))
-    kind = str(target_kind).strip().lower()
-
-    served = _mm.serve(
-        family="crossing", target=kind,
-        range_value=A_dim, error_bound=target_error, n_max=max_nodes,
-        eps_q=eps_q, use_shipped=bool(use_shipped_tables),
-    )
-    tau_hat, w_hat, err = served.nodes, served.weights, served.max_error
-    return CrossingMinimaxQuadrature(
-        A_dim=A_dim,
-        tau=np.asarray(tau_hat, dtype=np.float64),
-        alpha=np.asarray(w_hat, dtype=np.float64),
-        max_error=float(err),
-        target_kind=kind,
-        provenance=served.provenance.one_line(),
-    )
-
-
 
 
 # ---------------------------------------------------------------------------

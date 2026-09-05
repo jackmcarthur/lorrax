@@ -354,7 +354,7 @@ def test_report_collapses_minimax_catalog_receipts(tmp_path):
         "target 1e-06 -> 8 nodes, max_err 1.85e-07 | shipped a.npz "
         "sha256:aaaa gen unrecorded backend unrecorded UNCERTIFIED")
     report.legacy_print(
-        "RuntimeWarning: minimax: served crossing/hgl A_dim=24 "
+        "RuntimeWarning: minimax: served noncrossing/inverse R=100 "
         "target 1e-06 -> 48 nodes, max_err 3.2e-07 | shipped b.npz "
         "sha256:bbbb gen unrecorded backend unrecorded UNCERTIFIED")
     report.finish()

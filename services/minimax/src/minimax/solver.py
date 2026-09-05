@@ -24,27 +24,12 @@ References:
 
 import warnings
 import numpy as np
-from scipy.special import wofz
 from scipy.optimize import least_squares, linprog, brentq
 
 
 # ================================================================
-# Target functions for crossing regularizations
+# Optional target function for offline crossing-rule experiments
 # ================================================================
-
-def G_hgl(u):
-    """HGL target: Im[sqrt(pi/2) * exp(-(u+i)^2/2) * (1 + i*erfi((u+i)/sqrt2))].
-
-    Rewritten via Faddeeva w(z) for numerical stability:
-      sqrt(pi/2) * (2*exp(-z^2/2) - w(-z/sqrt2)),  z = u + i.
-    """
-    u = np.asarray(u, dtype=float)
-    z = u + 1j
-    val = np.sqrt(np.pi / 2.0) * (2.0 * np.exp(-z**2 / 2.0) - wofz(-z / np.sqrt(2.0)))
-    result = np.imag(val)
-    result = np.where(np.abs(u) < 1e-30, 0.0, result)
-    return result
-
 
 def G_fermi(u):
     """Fermi target: 1/u - pi/(2 sinh(pi u/2))."""
@@ -53,11 +38,6 @@ def G_fermi(u):
     val = 1.0 / safe - np.pi / (2.0 * np.sinh(np.pi * safe / 2.0))
     val = np.where(np.abs(u) < 1e-14, 0.0, val)
     return val
-
-
-def tau_max_hgl(eps_q):
-    """Effective support for HGL weight: sqrt(2 ln(1/eps_q))."""
-    return np.sqrt(2.0 * np.log(1.0 / eps_q))
 
 
 def tau_max_fermi(eps_q):

@@ -5,8 +5,8 @@ gaps by name; runtime solving is not a service path.*
 
 R1 SHIPS IN TWO STAGES, and this module is stage 1.  The reason is a
 measurement, not a preference: the imaginary-axis family has **no shipped
-tables at all** — ``catalog.json`` carries 31 entries in two families,
-``{'crossing': 5, 'noncrossing': 26}``, and ``build_imag_quadrature``, on
+tables at all** — ``catalog.json`` carries only noncrossing entries, and
+``build_imag_quadrature``, on
 the path of every GN-PPM run there has ever been, is a 100% runtime-solve
 path with nothing behind it.  Applied literally today, lookup-and-refuse
 refuses the default production deck.  So:
@@ -77,15 +77,7 @@ def reset_announcements() -> None:
 # ---------------------------------------------------------------------------
 
 def _resolve(family: str, target: str) -> tuple[Any, str | None]:
-    """``(FamilySpec, target_kind)``, or F3.
-
-    ``target_kind`` is the catalog's discriminant for the crossing family
-    (``'hgl'`` / ``'fermi'``) and ``None`` everywhere else, because no
-    other family's rows carry one.  Getting that mapping wrong would make
-    every crossing lookup match the first row of the wrong regularization,
-    which is precisely the class of bug a declared vocabulary exists to
-    make impossible.
-    """
+    """Return ``(FamilySpec, catalog discriminant)``, or F3."""
     spec = FAMILIES.get(family)
     if spec is None:
         raise UnknownTarget(
@@ -95,12 +87,6 @@ def _resolve(family: str, target: str) -> tuple[Any, str | None]:
         raise UnknownTarget(
             f"minimax: unknown target {target!r} for family {family!r}.  "
             f"Declared targets: {sorted(TARGETS)}.")
-    if spec.name == "crossing":
-        if target not in ("hgl", "fermi"):
-            raise UnknownTarget(
-                f"minimax: family 'crossing' regularizes with target_kind "
-                f"'hgl' or 'fermi'; {target!r} is neither.")
-        return spec, target
     if target != spec.target:
         raise UnknownTarget(
             f"minimax: family {family!r} approximates {spec.target!r} "
@@ -112,11 +98,9 @@ def _resolve(family: str, target: str) -> tuple[Any, str | None]:
 def family_for_character(character: str) -> str:
     """The family serving an analytic character of ``z``, or F6.
 
-    R4's 2×2 dispatch, over declarative data.  Three cells resolve; the
-    strip cell — both parts of ``z`` nonzero, which is where MPA lives —
-    refuses, because ``damped_line`` does not exist yet.  That refusal is
-    ``gw/screening.py:527-531`` moved to the place that can name what is
-    missing and what would create it.
+    R4's 2×2 dispatch, over declarative data. Static and imaginary cells
+    resolve. The retired real-frequency HGL cell and the unwired strip cell
+    refuse at this owner rather than selecting a different rule.
     """
     if character not in CHARACTERS:
         raise SamplingUnsupported(
@@ -234,8 +218,8 @@ def lookup(*, family: str, target: str, range_value: float,
            error_bound: float, n_max: int, **family_kw) -> Quadrature:
     """The whole runtime surface.  Refuses (F1–F4) or returns.  NEVER solves.
 
-    ``family_kw`` carries the family's own discriminants — ``eps_q`` for
-    the crossing family, ``beta``/``beta_clause`` for ``complex_laplace``.
+    ``family_kw`` carries the complex-Laplace ``beta``/``beta_clause``
+    discriminants.
     Unknown keywords are refused rather than ignored: a silently-dropped
     selector is how you serve a table fitted to a different function.
     """
@@ -264,7 +248,6 @@ def lookup(*, family: str, target: str, range_value: float,
             spec, target, range_value=range_value, error_bound=error_bound,
             n_max=n_max, beta=beta, beta_clause=beta_clause)
 
-    eps_q = family_kw.pop("eps_q", None)
     if family_kw:
         raise UnknownTarget(
             f"minimax: family {family!r} takes no {sorted(family_kw)} "
@@ -285,12 +268,12 @@ def lookup(*, family: str, target: str, range_value: float,
     entry = _cat.select_entry(
         view.entries, family,
         range_value=range_value, target_error=error_bound,
-        max_nodes=n_max, target_kind=target_kind, eps_q=eps_q)
+        max_nodes=n_max, target_kind=target_kind, eps_q=None)
 
     if entry is None:
         below = _cat.nearest_below(
             view.entries, family, range_value=range_value,
-            target_error=error_bound, target_kind=target_kind, eps_q=eps_q)
+            target_error=error_bound, target_kind=target_kind, eps_q=None)
         extra = ""
         if not spec.shipped:
             extra = (f"the {family!r} family has ZERO shipped entries — this "
@@ -324,7 +307,7 @@ def nearest_certified(*, family: str, target: str, range_value: float,
         entry = _cat.nearest_below(
             view.entries, family, range_value=range_value,
             target_error=error_bound, target_kind=target_kind,
-            eps_q=family_kw.get("eps_q"))
+            eps_q=None)
         if entry is None:
             return None
         tau, alpha, max_error, kappa0, table_hash = _cat.load_table(entry)
@@ -376,17 +359,10 @@ def _kappa0(family: str, tau: np.ndarray, w: np.ndarray,
             range_value: float) -> float:
     """The amplification metric, per family.
 
-    For the exponential-sum families this is the catalog's own definition
-    (``max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}``, normalised
-    against the pure-damping envelope 1/u).  For the crossing family it is
-    Σ|α| — which is the quantity survey §2.4 measured moving by three
-    orders of magnitude between hosts, and the quantity the shipped
-    crossing tables are compared on.  One name, two definitions, stated
-    rather than blurred.
+    This is the catalog's definition for the exponential-sum families:
+    ``max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}``, normalised
+    against the pure-damping envelope ``1/u``.
     """
-    w = np.asarray(w)
-    if family == "crossing":
-        return _sum_abs_w(w)
     return noncrossing_kappa0(tau, w, range_value)
 
 
@@ -439,7 +415,6 @@ def serve(*, family: str, target: str, range_value: float,
     the uncertified path, which still announces.
     """
     spec, target_kind = _resolve(family, target)
-    eps_q = family_kw.get("eps_q")
     omega_hat = family_kw.get("omega_hat")
     beta_kw = {k: family_kw[k] for k in ("beta", "beta_clause")
                if k in family_kw}
@@ -449,7 +424,6 @@ def serve(*, family: str, target: str, range_value: float,
             return lookup(family=family, target=target,
                           range_value=range_value, error_bound=error_bound,
                           n_max=n_max,
-                          **({"eps_q": eps_q} if eps_q is not None else {}),
                           **beta_kw)
         except NoCertifiedTable as miss:
             reason = str(miss)
@@ -467,8 +441,7 @@ def serve(*, family: str, target: str, range_value: float,
 
     return solve_uncertified(
         family=family, target=target, range_value=range_value,
-        error_bound=error_bound, n_max=n_max,
-        eps_q=eps_q, omega_hat=omega_hat)
+        error_bound=error_bound, n_max=n_max, omega_hat=omega_hat)
 
 
 # ---------------------------------------------------------------------------
@@ -526,36 +499,6 @@ def _solve_noncrossing_imag_scaled_cached(logR_key: float,
         _cache._payload_hash(tau, w), _cache.backend_tag())
 
 
-@lru_cache(maxsize=128)
-def _solve_crossing_scaled_cached(A_key: float, target_key: float,
-                                  max_nodes: int, eps_q_key: float,
-                                  target_kind: str):
-    payload = {"solver": "crossing", "A_key": float(A_key),
-               "target_key": float(target_key), "max_nodes": int(max_nodes),
-               "eps_q_key": float(eps_q_key), "target_kind": str(target_kind)}
-    from minimax import cache as _cache                # noqa: PLC0415
-    cached = _cache.load("crossing", payload)
-    if cached is not None:
-        return cached
-    from minimax import solver as _solver              # noqa: PLC0415
-    if target_kind == "hgl":
-        G_func, tau_max_func = _solver.G_hgl, _solver.tau_max_hgl
-    elif target_kind == "fermi":
-        G_func, tau_max_func = _solver.G_fermi, _solver.tau_max_fermi
-    else:
-        raise UnknownTarget(
-            f"minimax: unknown crossing target_kind={target_kind!r}.")
-    tau, w, _n, err = _solver.crossing_grids(
-        float(A_key), float(target_key), G_func, tau_max_func,
-        eps_q=float(eps_q_key), N_max=max_nodes)
-    tau = np.asarray(tau, dtype=np.float64)
-    w = np.asarray(w, dtype=np.float64)
-    err = float(err)
-    _cache.store("crossing", payload, tau, w, err)
-    return tau, w, err, runtime_provenance(
-        _cache._payload_hash(tau, w), _cache.backend_tag())
-
-
 def _tolerance_key(error_bound: float) -> float:
     """Round a tolerance for the cache key WITHOUT rounding it away.
 
@@ -590,14 +533,13 @@ def _tolerance_key(error_bound: float) -> float:
 
 def solve_uncertified(*, family: str, target: str, range_value: float,
                       error_bound: float, n_max: int,
-                      eps_q: float | None = None,
                       omega_hat: float | None = None) -> Quadrature:
     """Run the offline solver in-process, and SAY SO.
 
     The rounding of every cache key below is carried verbatim from the
     pre-extraction call sites, for the reason given above the wrappers.
     """
-    spec, target_kind = _resolve(family, target)
+    spec, _ = _resolve(family, target)
     if family == "noncrossing":
         tau, w, err, prov = _solve_noncrossing_scaled_cached(
             round(float(np.log(float(range_value))), 12),
@@ -610,12 +552,6 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
             round(float(np.log(float(range_value))), 12),
             round(float(omega_hat), 12),
             _tolerance_key(error_bound), int(n_max))
-    elif family == "crossing":
-        tau, w, err, prov = _solve_crossing_scaled_cached(
-            round(float(range_value), 12), _tolerance_key(error_bound),
-            int(n_max),
-            round(float(eps_q if eps_q is not None else 1.0e-3), 12),
-            str(target_kind))
     else:
         raise UncertifiedSolveRefused(
             f"minimax: family {family!r} has no in-process solver.  "
@@ -643,10 +579,4 @@ def cached_solve_payload(family: str, **kw) -> dict[str, Any]:
                 "omega_hat_key": float(kw["omega_hat_key"]),
                 "target_key": float(kw["target_key"]),
                 "max_nodes": int(kw["max_nodes"])}
-    if family == "crossing":
-        return {"solver": "crossing", "A_key": float(kw["A_key"]),
-                "target_key": float(kw["target_key"]),
-                "max_nodes": int(kw["max_nodes"]),
-                "eps_q_key": float(kw["eps_q_key"]),
-                "target_kind": str(kw["target_kind"])}
     raise UnknownTarget(f"minimax: no solver payload shape for {family!r}.")
