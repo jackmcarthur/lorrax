@@ -302,13 +302,13 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                          nk_tot: int, *, layout: str = "legacy",
-                         face_shape=None, parent_route=None):
+                         face_shape=None, k_unfold_plan=None):
     """Cached factory returning the SX/COH kernels.
 
-    ``parent_route`` (:class:`gw.wavefunction_bundle.ParentSigmaRoute`, face
+    ``k_unfold_plan`` (:class:`gw.centroid_k_unfold.CentroidKUnfoldPlan`, face
     layout only) makes the kernels read the bundle's parent carrier: G is
     contracted on the raw parents and transported by the plan, Σ_k is
-    selected on the parents' rows, projected with the canonical parent
+    selected on the parents' rows, projected with the same parent
     faces and broadcast back to full k.  Same outputs, no full-k ψ read.
 
     Keyed on (id(mesh_xy), kgrid, ffi_dial_key(), layout, face_shape) —
@@ -325,7 +325,6 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     ``layout='face'`` requires ``face_shape=(nk, nb_full, n_rmu,
     nspinor)`` so its distributed GEMM plans can be fixed eagerly.
     """
-    from .ppm_tau_kernel import _route_key
     if layout not in ("legacy", "face"):
         raise ValueError(
             f"_make_cohsex_kernels: layout must be 'legacy' or 'face', "
@@ -339,11 +338,11 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # as an unrelated FFI probe error from work that was about to be
     # thrown away anyway.
     from ffi import ffi_dial_key
-    if parent_route is not None and layout != "face":
+    if k_unfold_plan is not None and layout != "face":
         raise ValueError(
-            "_make_cohsex_kernels(parent_route=...) requires layout='face'.")
+            "_make_cohsex_kernels(k_unfold_plan=...) requires layout='face'.")
     cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
-                layout, face_shape, _route_key(parent_route))
+                layout, face_shape, k_unfold_plan)
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
@@ -352,7 +351,7 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         kernels = _make_cohsex_kernels_legacy(_convolve)
     else:
         kernels = _make_cohsex_kernels_face(
-            mesh_xy, face_shape, _convolve, parent_route=parent_route)
+            mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan)
 
     _cohsex_kernel_cache[cache_key] = kernels
     return kernels
@@ -403,12 +402,12 @@ def _make_cohsex_kernels_legacy(_convolve):
 
 
 def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
-                              parent_route=None):
+                              k_unfold_plan=None):
     """Face-layout kernel bodies.
 
-    With ``parent_route`` the G-build plan is sized at the PACKED parent
+    With ``k_unfold_plan`` the G-build plan is sized at the PACKED parent
     face (``n_parent`` rows) and ``build_G`` transports the operator to full
-    k through the plan; the projection plan is sized at the CANONICAL parent
+    k through the plan; the projection plan uses the same parent
     face, the operator is selected on the parents' rows first, and the band
     matrix is broadcast by the typed band-index unfold.  ``wfns_g`` (the
     bispinor vertex trick) is not combined with the route.
@@ -436,8 +435,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
     from common.contract_bands import contract_bands_block_reshard
 
     nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
-    g_shape = (face_shape if parent_route is None
-               else parent_route.g_face_shape)
+    g_shape = (face_shape if k_unfold_plan is None
+               else (k_unfold_plan.n_parent, *face_shape[1:]))
     nk_g, nb_g, n_rmu_g, ns_g = (int(v) for v in g_shape)
     mu_s = n_rmu_g * ns_g
 
@@ -445,18 +444,17 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                        dtype=jnp.complex128)
     proj_fn = contract_bands_block_reshard(
         mesh_xy, layout="face", face_shape=tuple(g_shape))
-    k_unfold_plan = None if parent_route is None else parent_route.plan
-    if parent_route is not None:
+    if k_unfold_plan is not None:
         from ffi import _services
         _services.ensure_on_path()
         from symmetry_maps import unfold_file_wedge_band_operator
-        _k_rows = np.asarray(parent_route.k_rows, dtype=np.int32)
-        _sym = parent_route.sym
+        _k_rows = np.asarray(k_unfold_plan.parent_full_rows, dtype=np.int32)
+        _sym = k_unfold_plan.sym
 
     def _g_operands(wfns, wfns_g=None):
         """(direct face, conjugated face, band-table owner) for the G build."""
         g = wfns_g if wfns_g is not None else wfns
-        if parent_route is None:
+        if k_unfold_plan is None:
             return g.psi_mun, g.psi_nmu, g
         if wfns_g is not None:
             raise NotImplementedError(
@@ -467,7 +465,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         return c.psi_mun, c.psi_nmu, c
 
     def _project_bands(wfns, sigma_k):
-        if parent_route is None:
+        if k_unfold_plan is None:
             return _project(wfns.psi_nmu, wfns.psi_mun, sigma_k,
                             layout="face", face_project_fn=proj_fn)
         c = wfns.green_parent

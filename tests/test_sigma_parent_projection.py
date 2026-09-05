@@ -1,7 +1,7 @@
 """The raw-parent Σ route equals the full-k face route, and its antiunitary
 rule is the transpose.
 
-Two seams of ``gw.wavefunction_bundle.ParentSigmaRoute`` are checked on the
+Two seams of ``gw.centroid_k_unfold.CentroidKUnfoldPlan`` are checked on the
 synthetic symmetric fixture of ``tests/test_isdf_zq_parent_parity.py`` (a
 glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
 
@@ -20,7 +20,7 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
 * SC rotation: ``wavefunction_bundle.rotate_wavefunctions`` on the
   parents-only bundle rotates the carrier's faces with U at the parents'
   rows and equals the rotated full-k faces read at those rows.
-* Σ projection: ``ppm_tau_kernel._make_project_ri_reduce_scatter(parent_route)``
+* Σ projection: ``ppm_tau_kernel._make_project_ri_reduce_scatter(k_unfold_plan)``
   — select the parents' rows of a full-k operator, project with the parent
   faces, broadcast the band matrix — equals the full-k face projector on an
   operator that transforms like a Green function (``plan.unfold_operator``
@@ -68,7 +68,6 @@ def _worker() -> int:
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
     from gw.greens_function_kernel import build_G
     from gw.ppm_tau_kernel import _make_project_ri_reduce_scatter
-    from gw.wavefunction_bundle import ParentSigmaRoute
     from symmetry_maps import (
         centroid_source_map_and_wrap, spinor_rotation_for_sym_row,
         unfold_file_wedge_band_operator)
@@ -191,12 +190,9 @@ def _worker() -> int:
     ref = np.asarray(jax.block_until_ready(
         full_project(psi_nmu_full, sigma_full, psi_mun_full)))
 
-    route = ParentSigmaRoute(
-        plan=plan, k_rows=parent_rows, sym=sym_fx,
-        g_face_shape=(n_parent, nb, n_pk, ns))
     project = _make_project_ri_reduce_scatter(
         mesh, merged_x=True, layout="face", face_shape=(nk, nb, n_pk, ns),
-        parent_route=route)
+        k_unfold_plan=plan)
     got = np.asarray(jax.block_until_ready(jax.jit(project)(
         psi_nmu_pk, sigma_full, psi_mun_pk)))
     scale = float(np.max(np.abs(ref)))
@@ -232,8 +228,7 @@ def _worker() -> int:
     parents_only_ok = bool(
         tuple(kw["face_shape"]) == (nk, nb, n_pk, ns)
         and padded_centroid_extent(bare) == n_pk
-        and tuple(kw["parent_route"].g_face_shape)
-        == (n_parent, nb, n_pk, ns))
+        and kw["k_unfold_plan"] is plan)
 
     # Fractional-occupation CONTOUR χ0 on the parents-only bundle equals the
     # full-k face bundle (its two G's ride the same parent transport).
