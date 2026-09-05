@@ -1411,14 +1411,45 @@ def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
 def _sharded_identity(*, nk: int, nb: int, sharding) -> jax.Array:
     """``(nk, nb, nb)`` complex identity per k, materialised sharded.
 
-    A jitted constructor: no host copy, and no eager ``device_put`` at
-    a spec the mesh may not divide (``nb % px``, ``nb % py``).
+    A jitted constructor: no host copy of nk*nb^2 complex numbers.  It
+    does NOT lift the divisibility requirement -- JAX 0.9.1 refuses an
+    uneven ``NamedSharding`` on a jit output exactly as on an eager
+    placement -- so ``refuse_indivisible_sc_window`` gates ``nb`` first.
     """
     @_functools.partial(jax.jit, static_argnums=(0, 1), out_shardings=sharding)
     def _build(nk_, nb_):
         eye = jnp.eye(nb_, dtype=jnp.complex128)
         return jnp.broadcast_to(eye, (nk_, nb_, nb_))
     return _build(int(nk), int(nb))
+
+
+def refuse_indivisible_sc_window(nb: int, mesh_xy: Mesh, *, nval: int,
+                                 ncond: int, where: str) -> None:
+    """Refuse an active window the mesh cannot shard on BOTH band axes.
+
+    Every U-shaped object of the SC map and the eqp2 ladder lives at
+    ``band_rotation_spec`` = P(None, x, y); JAX 0.9.1 refuses an uneven
+    NamedSharding on a jit output as on an eager placement
+    (IndivisibleError, measured at nb=190 on a 4x4 mesh, CrI3
+    2026-09-05, 1877 s into the run).  Name the fix instead of paying
+    the one-shot Sigma first.
+    """
+    px, py = (int(mesh_xy.shape[a]) for a in mesh_xy.axis_names)
+    nb = int(nb)
+    if nb % px == 0 and nb % py == 0:
+        return
+    lcm = px * py // _math.gcd(px, py)
+    ncond_up = int(ncond) + ((-nb) % lcm)
+    raise ValueError(
+        f"GATE sc_window_indivisible: {where}: the active window has "
+        f"nb = nval + ncond = {nb} bands, which the ({px} x {py}) mesh "
+        f"cannot shard on both band axes (nb % {px} = {nb % px}, "
+        f"nb % {py} = {nb % py}).\n"
+        f"  fix:  ncond = {ncond_up} (nval {int(nval)} + ncond a multiple "
+        f"of {lcm}), or a mesh that divides {nb}\n"
+        "  why:  the QP rotation U and its rotated operators are sharded "
+        "P(None, x, y) on every map and in the eqp2 ladder, and JAX "
+        "0.9.1 has no uneven NamedSharding")
 
 
 def _band_rotation_spec() -> P:
@@ -1706,9 +1737,7 @@ def run_fixed_sigma_evsc(
 
     rotation_spec = _band_rotation_spec()
     matrix_sharding = NamedSharding(mesh_xy, rotation_spec)
-    ident = np.broadcast_to(
-        np.eye(nb, dtype=np.complex128)[None, :, :], (nk, nb, nb)).copy()
-    U_seed = _place(ident, mesh_xy, rotation_spec)
+    U_seed = _sharded_identity(nk=nk, nb=nb, sharding=matrix_sharding)
     h0_dft = jnp.asarray(kin_ion_dft_ry) + jnp.asarray(v_h_dft)
     h0_dft = _place(h0_dft, mesh_xy, rotation_spec)
     sigma_c_dft = _place(
@@ -2688,6 +2717,14 @@ def resolve_current_velocity_update(
             "manifold (sc_head_update = parallel_transport, >= 5 k points "
             "on every axis); this deck has none.  Use 'interband' (dipole "
             "commutator, no k stencil) or 'auto'.")
+    if requested == "interband" and links:
+        raise ValueError(
+            "GATE sc_current_velocity_update_conflict: "
+            "sc_current_velocity_update = interband with the finite-link "
+            "manifold resident (sc_head_update = parallel_transport): the "
+            "head adds the covariant D Delta H to its velocity, and the "
+            "current carriers must see the SAME operator (one operator, two "
+            "consumers).  Use 'covariant' or 'auto'.")
     if requested in ("auto", "interband") and have_dipole:
         from .qsgw_head import load_dipole_velocity_sharded
         nb = min(int(meta.b_id_4_user), int(wfns_transverse.enk.shape[1]))
@@ -2796,11 +2833,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # hidden assert_equal; same rank-invariance argument, and here
             # each rank stages only its own nb²/(px·py) block).
             E_qp_ry = device_put_process_local(E_np, rep2)
-            # Built ON DEVICE under jit, not staged on the host: an eager
-            # device_put at band_rotation_spec needs nb divisible by both
-            # mesh axes (IndivisibleError at nb=190 on a 4x4 mesh, CrI3
-            # 2026-09-05), while a jitted constructor takes any nb the way
-            # every later map's sharding constraint already does.
+            # Built ON DEVICE under jit, not staged on the host.  The band
+            # axes must divide the mesh either way (IndivisibleError at
+            # nb=190 on a 4x4 mesh, CrI3 2026-09-05; JAX 0.9.1 has no
+            # uneven NamedSharding), which refuse_indivisible_sc_window
+            # checks before the first Sigma is spent.
             U_qp = _sharded_identity(
                 nk=int(H_np.shape[0]), nb=nb,
                 sharding=NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
@@ -3165,6 +3202,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         raise ValueError(
             "SCInputs.current_velocity_update must be 'off', 'covariant' or "
             f"'interband'; got {inputs.current_velocity_update!r}")
+    if delta_velocity_dft is not None:
+        # The one number that says whether -i[r, Delta H] is being
+        # amplified by a near-degenerate pair the interband dipole
+        # cannot resolve (r_mn ~ 1/(e_m - e_n) with no clamp): printed
+        # every map so a blow-up is visible where it happens.
+        v_ref = (pt.velocity_dft_cart
+                 if inputs.current_velocity_update == "covariant"
+                 else inputs.dipole_velocity_dft)
+        ratio = (float(jnp.max(jnp.abs(delta_velocity_dft)))
+                 / max(float(jnp.max(jnp.abs(v_ref))), 1e-300))
+        inputs.print_fn(
+            f"    SC current carriers: max|v_Delta| / max|v_DFT| = "
+            f"{ratio:.3e} ({inputs.current_velocity_update})")
 
     wfns_transverse_qp = None
     if inputs.wfns_transverse_dft is not None:

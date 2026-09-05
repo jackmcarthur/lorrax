@@ -351,6 +351,11 @@ def compute_finite_q_mtxels(
                     box = to_box(psi4, wfn.box_index(k=[ik]),
                                  tuple(int(s) for s in meta.fft_grid),
                                  mesh=process_local_mesh())
+                    # ``k=[ik]`` keeps a singleton k axis: (1, nb, 4, nx,
+                    # ny, nz).  The gather wants ONE k's box (nb, ns, nx,
+                    # ny, nz), as load_kpoint_fftbox_local returns it.
+                    if box.ndim == 6:
+                        box = box[0]
                     lifted[lift] = gather_psi_G_from_crys(box, Gk_int, g_mask)
                     del box
                 alpha_v_per_k[a].append(lifted[lift][v_lo:n_occ])
@@ -486,7 +491,7 @@ _PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
                "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
                "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign",
                "prov_nspinor", "prov_soc",
-               "prov_q0_operator_scheme")
+               "prov_q0_operator_scheme", "prov_bispinor_current_lift")
 
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
                              nb_written, bispinor, skip_vnl, nspinor=None,
@@ -710,6 +715,16 @@ def check_dipole_provenance(
                                             int(wfn.nspinor)):
         bad.append(("prov_nspinor", attrs["prov_nspinor"],
                     int(wfn.nspinor)))
+    # prov_bispinor_current_lift: required-IF-PRESENT as well.  A stamped
+    # file names the carrier its finite-q alpha vertex was lifted with; a
+    # run asking for another carrier, or for none (the shipped sigma.p,
+    # "raw"), must not consume it.
+    expected_lift = bispinor_current_lift or "raw"
+    if ("prov_bispinor_current_lift" in attrs
+            and "prov_bispinor_current_lift" not in want
+            and _prov_ne(attrs["prov_bispinor_current_lift"], expected_lift)):
+        bad.append(("prov_bispinor_current_lift",
+                    attrs["prov_bispinor_current_lift"], expected_lift))
     if bad:
         detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
                            for k, got, exp in bad)
@@ -779,7 +794,16 @@ def collapsed_axis_position_operators(
 	B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
 	centers = np.full(3, np.nan, dtype=np.float64)
 	position = jnp.zeros_like(jnp.asarray(template))
-	for axis in collapsed_axes(wfn.kgrid):
+	axes = list(collapsed_axes(wfn.kgrid))
+	bhat = {a: jnp.asarray(B[a] / np.linalg.norm(B[a])) for a in axes}
+	# The Cartesian position vector restricted to the collapsed axes,
+	# sum_a Z_a b_a-hat, built on the file wedge and unfolded ONCE: a
+	# rotation that maps one collapsed axis onto another (a wire's C4 or
+	# diagonal mirror about its axis) mixes the Z_a, which an axis-by-axis
+	# unfold would project away.  For a slab (one collapsed axis) the two
+	# spellings agree.
+	Z_vec_file = None
+	for axis in axes:
 		center = collapsed_axis_center(wfn.atom_crys, axis)
 		centers[axis] = center
 		with timing.section("parallel_transport_position"):
@@ -789,20 +813,22 @@ def collapsed_axis_position_operators(
 				geom=geom, gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
 				box_index=wfn.box_index(k="ibz"),
 				kvecs=np.asarray(gtab_file.kvecs))
-		bhat = jnp.asarray(B[axis] / np.linalg.norm(B[axis]))
-		# r is a TIME-EVEN polar vector (v = dr/dt is the odd one), so the
-		# antiunitary rows take no velocity sign here.
-		Z_vec = unfold_file_wedge_polar_matrix(
-			sym, Z_file[:, None, :, :] * bhat[None, :, None, None],
-			time_odd=False)
-		Z_full = jnp.einsum("j,kjmn->kmn", bhat, Z_vec, optimize=True)
+		term = Z_file[:, None, :, :] * bhat[axis][None, :, None, None]
+		Z_vec_file = term if Z_vec_file is None else Z_vec_file + term
+		emit(f"Collapsed k axis {'xyz'[axis]}: position operator "
+		     f"Z = <m| b . r |n> on the file wedge, centre f0 = "
+		     f"{center:.6f} (fractional), branch cut in the vacuum at "
+		     f"f0 + 1/2; max|Z| = "
+		     f"{float(jax.device_get(jnp.max(jnp.abs(Z_file)))):.4f}")
+	if Z_vec_file is None:
+		return position, centers
+	# r is a TIME-EVEN polar vector (v = dr/dt is the odd one), so the
+	# antiunitary rows take no velocity sign here.
+	Z_vec = unfold_file_wedge_polar_matrix(sym, Z_vec_file, time_odd=False)
+	for axis in axes:
+		Z_full = jnp.einsum("j,kjmn->kmn", bhat[axis], Z_vec, optimize=True)
 		Z_full = 0.5 * (Z_full + jnp.swapaxes(jnp.conj(Z_full), -1, -2))
 		position = position.at[:, axis].set(Z_full)
-		emit(f"Collapsed k axis {'xyz'[axis]}: position operator "
-		     f"Z = <m| b . r |n> on {int(Z_full.shape[0])} k, centre f0 = "
-		      f"{center:.6f} (fractional), branch cut in the vacuum at "
-		      f"f0 + 1/2; max|Z| = "
-		      f"{float(jax.device_get(jnp.max(jnp.abs(Z_full)))):.4f}")
 	return position, centers
 
 

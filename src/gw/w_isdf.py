@@ -1944,8 +1944,9 @@ def compute_experimental_no_pair_photon_chi0(
             "full four-current response requires layout='face' for both "
             "charge and transverse endpoint bundles (low_mem_bands=true); "
             f"got {wfns_charge.layout!r}/{wfns_transverse.layout!r}")
-    n_c = int(wfns_charge.psi_mun.shape[2])
-    n_t = int(wfns_transverse.psi_mun.shape[2])
+    from .wavefunction_bundle import padded_centroid_extent
+    n_c = padded_centroid_extent(wfns_charge)
+    n_t = padded_centroid_extent(wfns_transverse)
     if (n_c != layout.carrier_extent(0) or
             n_t != layout.carrier_extent(1)):
         raise ValueError(

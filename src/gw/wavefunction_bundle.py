@@ -535,8 +535,12 @@ class AuthenticatedWavefunctions:
             raise TypeError(
                 "AuthenticatedWavefunctions requires a canonical basis "
                 f"receipt; got {type(self.receipt).__name__}")
-        self.receipt.assert_matches_carrier(
-            self.wavefunctions, where="AuthenticatedWavefunctions")
+        # Every distinct channel carrier is bound to the receipt; a
+        # per-channel velocity carrier has three, and a check of the
+        # container would have seen channel 1 only.
+        for carrier in as_lorentz_carriers(self.wavefunctions).distinct_channels:
+            self.receipt.assert_matches_carrier(
+                carrier, where="AuthenticatedWavefunctions")
 
 
 def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
@@ -558,8 +562,11 @@ def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
     a second time (TASTE microservice rule: a routine used in 2+ places
     gets one owner).
     """
-    if wfns_right is None:
-        wfns_right = wfns
+    # A LorentzCarriers container stands for its channel 1 here: the face
+    # shape (nk, nb_full, n_rmu, nspinor) is the same for every channel.
+    wfns = as_lorentz_carriers(wfns).channel(1)
+    wfns_right = (wfns if wfns_right is None
+                  else as_lorentz_carriers(wfns_right).channel(1))
     if wfns.layout != wfns_right.layout:
         raise ValueError(
             "face_kernel_kwargs: endpoint layouts differ: "
@@ -802,9 +809,35 @@ class LorentzCarriers:
                 f"LorentzCarriers.channel: mu_L must be 1, 2 or 3; got {mu_L}")
         return self._channels[mu_L - 1]
 
-    def __getattr__(self, name):
-        # Only reached for names not found on the container itself.
-        return getattr(self._channels[0], name)
+    # The four quantities every channel shares (bands, energies,
+    # occupations, layout) are delegated by name.  A psi field is NOT: a
+    # container has three of each, and reading one through the container
+    # silently meant channel 1 (the channel-drop 7d204b62 fixed; the
+    # receipt that authenticated channel 1 only).  Ask ``channel(a)``.
+    @property
+    def layout(self):
+        return self._channels[0].layout
+
+    @property
+    def slices(self):
+        return self._channels[0].slices
+
+    @property
+    def enk(self):
+        return self._channels[0].enk
+
+    @property
+    def occ(self):
+        return self._channels[0].occ
+
+    @property
+    def distinct_channels(self) -> tuple:
+        """The distinct bundles, in channel order (one for a shared carrier)."""
+        out = []
+        for c in self._channels:
+            if not any(c is o for o in out):
+                out.append(c)
+        return tuple(out)
 
     def __repr__(self) -> str:
         tag = "one carrier" if self.one_carrier else "three carriers"
@@ -881,6 +914,7 @@ def padded_centroid_extent(wfns: "Wavefunctions") -> int:
     photon response, the sixteen-block photon Σ and the bare Σ^B all pad
     their on-disk V tiles up to this extent and must agree on it.
     """
+    wfns = as_lorentz_carriers(wfns).channel(1)   # same extent per channel
     if wfns.layout == "legacy":
         return int(wfns.psi_yr.shape[-1])
     if wfns.layout == "face":
@@ -919,17 +953,21 @@ def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
     model of the same number; see ``gw.sigma_x_bispinor``'s disclosure
     print for the call site.
     """
+    carriers = as_lorentz_carriers(wfns).distinct_channels
     out: dict = {}
-    for f in psi_field_names(wfns.layout):
-        arr = getattr(wfns, f)
-        if arr is None:
-            continue
-        out[f] = int(sum(int(s.data.nbytes) for s in arr.addressable_shards))
-    if wfns.green_parent is not None:
-        for f in ("psi_nmu", "psi_mun"):
-            arr = getattr(wfns.green_parent, f)
-            out[f"green_parent.{f}"] = int(sum(
+    for i, one in enumerate(carriers):
+        tag = "" if len(carriers) == 1 else f"carrier{i + 1}."
+        for f in psi_field_names(one.layout):
+            arr = getattr(one, f)
+            if arr is None:
+                continue
+            out[f"{tag}{f}"] = int(sum(
                 int(s.data.nbytes) for s in arr.addressable_shards))
+        if one.green_parent is not None:
+            for f in ("psi_nmu", "psi_mun"):
+                arr = getattr(one.green_parent, f)
+                out[f"{tag}green_parent.{f}"] = int(sum(
+                    int(s.data.nbytes) for s in arr.addressable_shards))
     out["total"] = int(sum(out.values()))
     return out
 

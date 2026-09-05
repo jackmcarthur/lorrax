@@ -489,6 +489,20 @@ def main(argv=None):
 			f"valence/conduction window + {_sc_buffer} diagonal state(s) "
 			f"at each edge; mode={config.sc.buffer_mode}, "
 			f"tail_fit={config.sc.tail_fit}")
+	if (config.qp_solver is QPSolver.SELF_CONSISTENT
+			or bool(getattr(config, "write_eqp2", False))):
+		# The QP rotation lives at P(None, x, y) on every map and in the
+		# eqp2 ladder; refuse an active window the mesh cannot shard NOW,
+		# not 30 minutes later at map 0 (CrI3 nb=190 on 4x4, 2026-09-05).
+		from .sc_iteration import refuse_indivisible_sc_window
+		refuse_indivisible_sc_window(
+			int(meta.nb_sigma), mesh_xy, nval=int(config.nval),
+			ncond=int(config.ncond),
+			where=("qp_solver = self_consistent"
+			       if config.qp_solver is QPSolver.SELF_CONSISTENT
+			       else "write_eqp2 = true")
+			      + (f" (sc buffer_nbands {_sc_buffer} per edge included)"
+			         if _sc_buffer else ""))
 	meta.rank = RUNTIME.process_index
 	meta.n_proc = RUNTIME.process_count
 	meta.sys_dim = config.sys_dim

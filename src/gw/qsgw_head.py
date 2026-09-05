@@ -602,13 +602,17 @@ def load_parallel_transport_head(
             try:
                 stored_orders = np.asarray(io.read_small(
                     "link_stencil_orders", dtype=np.int32)).reshape(3)
-            except Exception as exc:   # SlabIO raises its own family
+            except (KeyError, RuntimeError, OSError) as exc:
+                # SlabIO's missing-dataset errors (h5py KeyError, the FFI's
+                # RuntimeError); the reader's own words are kept so a
+                # transport fault is not mistaken for an old artifact.
                 raise ValueError(
                     f"{path}: the k grid {tuple(expected_kgrid)} has a "
-                    "collapsed axis but the artifact carries no "
-                    "link_stencil_orders stamp: it predates the collapsed-"
-                    "axis position operator (2026-09-05); regenerate it "
-                    "with get_dipole_mtxels --parallel-transport-out") from exc
+                    "collapsed axis but link_stencil_orders could not be "
+                    f"read ({type(exc).__name__}: {exc}).  An artifact "
+                    "that predates the collapsed-axis position operator "
+                    "(2026-09-05) has no such stamp; regenerate it with "
+                    "get_dipole_mtxels --parallel-transport-out") from exc
             if tuple(int(o) for o in stored_orders) != tuple(
                     link_stencil_orders(expected_kgrid)):
                 raise ValueError(
@@ -3444,7 +3448,14 @@ def read_authenticated_dipole_velocity(
     from common.four_current_model import resolve_four_current_representation
     representation = resolve_four_current_representation(
         bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
-        getattr(config, "bispinor_gw", "bare_transverse"))
+        getattr(config, "bispinor_gw", "bare_transverse"),
+        current_lift=getattr(config, "bispinor_current_lift", None))
+    # Ask for the current-carrier lift only when it is not the shipped
+    # sigma.p (same reading as head_correction._check_dipole_provenance);
+    # the checker refuses a stamped mismatch in both directions.
+    expected_current_lift = (
+        representation.current_lift
+        if representation.current_lift not in (None, "raw") else None)
     if not check_dipole_provenance(
             dipole_path,
             wfn=wfn,
@@ -3453,6 +3464,7 @@ def read_authenticated_dipole_velocity(
             nband=int(config.nband),
             bispinor=representation.scalar_head_bispinor,
             skip_vnl=False,
+            bispinor_current_lift=expected_current_lift,
             wfn_fingerprint_binding=wfn_fingerprint_binding):
         raise ValueError(
             "GATE dft_head_dipole_provenance: the full head received an "

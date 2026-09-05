@@ -192,17 +192,27 @@ def write_text_stamp(io: SlabIO, name: str, text: str) -> None:
 
 
 def read_text_stamp(io: SlabIO, name: str) -> str:
-    """The one reader of :func:`write_text_stamp`'s stamps (int32 view)."""
+    """The one reader of :func:`write_text_stamp`'s stamps.
+
+    Prefers the int32 byte view; an artifact written before it existed
+    (uint8 view only) is read through the same door where the backend can
+    widen uint8 (serial h5py, the pre-metadata FFI route) and refuses by
+    name where it cannot (the phdf5 metadata route).
+    """
+    errors = (KeyError, RuntimeError, OSError, ValueError, TypeError)
     try:
-        raw = io.read_small(f"{name}_bytes_i32", dtype=np.int32)
-    except Exception as exc:
-        raise ValueError(
-            f"{io.path}: text stamp {name!r} has no int32 byte view "
-            f"({name}_bytes_i32).  The artifact predates 2026-09-05, when "
-            "the uint8-only stamp stopped being readable through the phdf5 "
-            "transport; regenerate it with get_dipole_mtxels "
-            "--parallel-transport-out.") from exc
-    return _decode_i32_text(raw)
+        return _decode_i32_text(io.read_small(f"{name}_bytes_i32", dtype=np.int32))
+    except errors as exc_i32:
+        try:
+            return _decode_i32_text(io.read_small(f"{name}_utf8", dtype=np.int32))
+        except errors as exc_u8:
+            raise ValueError(
+                f"{io.path}: text stamp {name!r} could not be read: the int32 "
+                f"view {name}_bytes_i32 ({type(exc_i32).__name__}: {exc_i32}) "
+                f"and the uint8 view {name}_utf8 ({type(exc_u8).__name__}: "
+                f"{exc_u8}).  A uint8-only artifact cannot be read through "
+                "the phdf5 metadata transport; regenerate it with "
+                "get_dipole_mtxels --parallel-transport-out.") from exc_u8
 
 
 def _read_w_av_metadata(io: SlabIO) -> WAvStencilMetadata:
