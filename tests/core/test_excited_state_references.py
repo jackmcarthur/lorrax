@@ -42,6 +42,11 @@ def _run_module(run_dir, module, argv, *, timeout=120):
 def _stage(source, target):
     shutil.copytree(source, target)
     harness.make_writable(target)
+    # _find_restart_file deliberately chooses the newest candidate when a
+    # sweep directory holds several bases. Core keeps both the 21-centroid
+    # GW bundle and the 31-centroid excited-state bundle, so remove the
+    # inapplicable copy from this private staged directory.
+    (target / "tmp" / "isdf_tensors_21.h5").unlink()
     return target
 
 

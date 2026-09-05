@@ -241,6 +241,11 @@ def run_mesh4(argv, *, cwd, env=None, timeout=1800, mode=None,
         procs, outs = [], []
         for i in range(NPROC):
             renv = dict(base)
+            # A pytest parent has already initialized its own single-process
+            # JAX runtime. Its idempotence sentinel is process-local state
+            # encoded in the environment and must not cross this exec
+            # boundary: these children are a new four-process world.
+            renv.pop("_LORRAX_JAX_DISTRIBUTED_DONE", None)
             renv["JAX_PROCESS_COUNT"] = str(NPROC)
             renv["JAX_PROCESS_INDEX"] = str(i)
             renv["JAX_COORDINATOR_ADDRESS"] = f"127.0.0.1:{port}"
