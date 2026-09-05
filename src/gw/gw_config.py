@@ -2127,7 +2127,10 @@ _DEFAULTS = {
     # Deterministic alternative to the wall budget: an integer number of
     # reduction passes per window.  Unset keeps the wall budget; set, the
     # clock is ignored and the accepted rule (hence the Σ τ-node count) is
-    # a function of the deck alone.
+    # a function of the deck alone.  0 = the polished interpolatory start
+    # (seconds of planning, more τ nodes): the fast A/B setting.  On Si
+    # 4x4x4 one pass costs ~33 s of planning per run (30 passes: 985 s,
+    # 378 nodes; the 120 s wall budget reached ~474 nodes).
     "sigma_quadrature_reduction_steps": None,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
@@ -4314,9 +4317,10 @@ class DynamicSigmaConfig:
             raise ValueError(
                 "sigma_quadrature_reduction_seconds must be finite and > 0.")
         if self.quadrature_reduction_steps is not None and (
-                int(self.quadrature_reduction_steps) < 1):
+                int(self.quadrature_reduction_steps) < 0):
             raise ValueError(
-                "sigma_quadrature_reduction_steps must be >= 1 when set.")
+                "sigma_quadrature_reduction_steps must be >= 0 when set "
+                "(0 = the polished interpolatory start, no reduction).")
         if not str(self.quadrature_cache_dir).strip():
             raise ValueError(
                 "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")
