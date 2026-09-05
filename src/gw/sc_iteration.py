@@ -2531,9 +2531,12 @@ def _frozen_scissor_fits(state):
     runs/Na/12_sc_observables_eta05_2026-09-04) and fed that back into the
     trusted block through the sum over states.  Standard QSGW practice
     (Kotani-van Schilfgaarde; Questaal) gives the states above the
-    self-energy subspace one fixed correction; that is what this does.
-    Returns (active_window_fit, sum_band_tail_fit); either is None when map
-    0 has not produced it, and then the caller fits as before.
+    self-energy subspace one fixed correction; that is what this does for
+    the ACTIVE-window scissor (states inside the Sigma window but outside
+    the omega grid).  The sum-band tail beyond the Sigma window keeps its
+    per-map refit: freezing it changed the Si QSGW gap by 22 meV.
+    Returns (active_window_fit, sum_band_tail_fit); the second element is
+    carried for the record and not consumed.
     """
     if int(getattr(state, "iteration", 0)) <= 0:
         return None, None
@@ -3013,8 +3016,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if scissor_classes is not None:
             valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
             fit_mask_kn = fit_mask_kn & ~crossing_kn
-        _frozen_tail = _frozen_scissor_fits(state)[1]
-        tail_fit = _frozen_tail if _frozen_tail is not None else fit_scissor(
+        # The SUM-BAND tail (bands beyond the Sigma window) keeps its
+        # per-map refit: freezing it moved the Si b80/c504 QSGW gap by 22 meV
+        # at map 6 (si_p4_replay4 vs attempt 3), a closure change on
+        # semiconductors that nothing here justifies.  Only the ACTIVE-window
+        # scissor (states inside the Sigma window but outside the omega grid,
+        # Na's 14-86) is frozen; see _frozen_scissor_fits.
+        tail_fit = fit_scissor(
             E_dft_kn_ev=e_dft_fit_ev,
             E_qp_kn_ev=(
                 np.asarray(E_qp_ry, dtype=np.float64) * RYD_TO_EV),
