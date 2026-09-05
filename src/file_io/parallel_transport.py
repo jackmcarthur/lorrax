@@ -97,8 +97,6 @@ __all__ = [
     "SCHEMA_VERSION",
     "SINGULAR_VALUES_DATASET",
     "VELOCITY_DFT_DATASET",
-    "WFN_FINGERPRINT_BYTES_DATASET",
-    "WFN_PATH_BYTES_DATASET",
     "complete_velocity_validation",
     "W_AV_DENSITY_DATASET",
     "WAvStencilMetadata",
@@ -111,13 +109,11 @@ __all__ = [
     "transported_frame",
     "validate_parallel_transport_artifact",
     "write_parallel_transport_artifact",
+    "read_text_stamp",
+    "write_text_stamp",
     "write_w_av_stencil_artifact",
     "write_velocity_validation",
 ]
-
-WFN_PATH_BYTES_DATASET = "wfn_path_bytes_i32"
-WFN_FINGERPRINT_BYTES_DATASET = "wfn_fingerprint_bytes_i32"
-
 
 @dataclass(frozen=True)
 class WAvStencilMetadata:
@@ -167,9 +163,39 @@ class WAvStencilMetadata:
 
 def _decode_i32_text(value) -> str:
     raw = np.asarray(value, dtype=np.int32)
-    if np.any(raw < 0) or np.any(raw > 255):
-        raise ValueError("W-av text metadata contains a non-byte value")
+    if raw.ndim != 1 or np.any(raw < 0) or np.any(raw > 255):
+        raise ValueError("text stamp is not a 1-D byte-valued dataset")
     return bytes(raw.astype(np.uint8).tolist()).decode("utf-8")
+
+
+def write_text_stamp(io: SlabIO, name: str, text: str) -> None:
+    """Publish a text stamp as ``<name>_utf8`` AND ``<name>_bytes_i32``.
+
+    The uint8 spelling is for external HDF5 tools.  The int32 byte view is
+    the one every SlabIO reader takes: the phdf5 transport's dtype table
+    has no unsigned type, so a uint8 dataset cannot even be
+    geometry-queried through it (measured on CrI3 at P16, 2026-09-05:
+    ``phdf5 dataset_geometry: dataset 'wfn_fingerprint_utf8' has a
+    datatype this transport does not speak``; the serial-h5py fallback
+    only exists for FFI libraries that predate the metadata API).
+    """
+    raw = np.frombuffer(str(text).encode("utf-8"), dtype=np.uint8)
+    io.write_attr(f"{name}_utf8", raw)
+    io.write_attr(f"{name}_bytes_i32", raw.astype(np.int32))
+
+
+def read_text_stamp(io: SlabIO, name: str) -> str:
+    """The one reader of :func:`write_text_stamp`'s stamps (int32 view)."""
+    try:
+        raw = io.read_small(f"{name}_bytes_i32", dtype=np.int32)
+    except Exception as exc:
+        raise ValueError(
+            f"{io.path}: text stamp {name!r} has no int32 byte view "
+            f"({name}_bytes_i32).  The artifact predates 2026-09-05, when "
+            "the uint8-only stamp stopped being readable through the phdf5 "
+            "transport; regenerate it with get_dipole_mtxels "
+            "--parallel-transport-out.") from exc
+    return _decode_i32_text(raw)
 
 
 def _read_w_av_metadata(io: SlabIO) -> WAvStencilMetadata:
@@ -196,9 +222,8 @@ def _read_w_av_metadata(io: SlabIO) -> WAvStencilMetadata:
         kgrid_shift=_read("kgrid_shift", 1).astype(np.float64),
         reciprocal_lattice_cart=(
             _read("reciprocal_lattice_cart", 2).astype(np.float64)),
-        wfn_path=_decode_i32_text(_read(WFN_PATH_BYTES_DATASET, 1)),
-        wfn_fingerprint=_decode_i32_text(
-            _read(WFN_FINGERPRINT_BYTES_DATASET, 1)),
+        wfn_path=read_text_stamp(io, "wfn_path"),
+        wfn_fingerprint=read_text_stamp(io, "wfn_fingerprint"),
         first_neighbors=bool(_scalar("w_av_first_neighbors")),
         second_neighbors=bool(_scalar("w_av_second_neighbors")),
         seed_steps=_read("w_av_seed_steps", 2).astype(np.int32),
@@ -523,24 +548,8 @@ def initialize_parallel_transport_artifact(
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
         io.write_attr("irr_idx_k", np.asarray(sym.irr_idx_k, dtype=np.int32))
         io.write_attr("sym_idx_k", np.asarray(sym.sym_idx_k, dtype=np.int32))
-        io.write_attr(
-            "wfn_path_utf8",
-            np.frombuffer(str(wfn_path).encode("utf-8"), dtype=np.uint8))
-        io.write_attr(
-            "wfn_fingerprint_utf8",
-            np.frombuffer(
-                str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8))
-        # SlabIO/PHDF5 deliberately supports compute dtypes, not uint8.
-        # Retain the historical external-tool view above and publish the one
-        # numeric byte view consumed by both QSGW head loaders.
-        io.write_attr(
-            WFN_PATH_BYTES_DATASET,
-            np.frombuffer(str(wfn_path).encode("utf-8"),
-                          dtype=np.uint8).astype(np.int32))
-        io.write_attr(
-            WFN_FINGERPRINT_BYTES_DATASET,
-            np.frombuffer(str(wfn_fingerprint).encode("utf-8"),
-                          dtype=np.uint8).astype(np.int32))
+        write_text_stamp(io, "wfn_path", wfn_path)
+        write_text_stamp(io, "wfn_fingerprint", wfn_fingerprint)
         io.write_attr("polar_rcond", np.float64(rcond))
         # Numeric convention stamps are SlabIO-readable on every backend.
         # 1 means the sole supported convention documented by this schema.
@@ -943,9 +952,7 @@ def _write_w_av_stage(
             })
         io.write_attr("w_av_complete", np.asarray([0], dtype=np.int32))
         if mode == "w":
-            io.write_attr(
-                "artifact_kind_utf8",
-                np.frombuffer(b"w_av_finite_q_stencil", dtype=np.uint8))
+            write_text_stamp(io, "artifact_kind", "w_av_finite_q_stencil")
             io.write_attr("band_start", np.asarray([0], dtype=np.int32))
             io.write_attr("band_stop", np.asarray([nb], dtype=np.int32))
             io.write_attr("spin_channel", np.asarray([0], dtype=np.int32))
@@ -967,25 +974,8 @@ def _write_w_av_stage(
             io.write_attr(
                 "reciprocal_units_bohr_inverse",
                 np.asarray([1], dtype=np.int32))
-            io.write_attr(
-                "wfn_path_utf8",
-                np.frombuffer(str(wfn_path).encode("utf-8"), dtype=np.uint8))
-            io.write_attr(
-                "wfn_fingerprint_utf8",
-                np.frombuffer(
-                    str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8))
-            # SlabIO's collective reader deliberately supports the numeric
-            # compute dtypes, not uint8.  Keep the historical uint8 spelling
-            # for external HDF5 tools and add an int32 byte view for every
-            # production consumer that must remain behind the SlabIO door.
-            io.write_attr(
-                WFN_PATH_BYTES_DATASET,
-                np.frombuffer(str(wfn_path).encode("utf-8"),
-                              dtype=np.uint8).astype(np.int32))
-            io.write_attr(
-                WFN_FINGERPRINT_BYTES_DATASET,
-                np.frombuffer(str(wfn_fingerprint).encode("utf-8"),
-                              dtype=np.uint8).astype(np.int32))
+            write_text_stamp(io, "wfn_path", wfn_path)
+            write_text_stamp(io, "wfn_fingerprint", wfn_fingerprint)
         for k_start in range(0, nk, k_batch):
             k_stop = min(k_start + k_batch, nk)
             center_ids = list(range(k_start, k_stop))
