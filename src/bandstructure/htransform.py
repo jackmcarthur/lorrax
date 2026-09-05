@@ -2561,11 +2561,7 @@ def main(argv=None):
     # the barrier and the SlabIO collective are already no-ops.
     from common.collectives import barrier
     barrier("htransform.outputs_written")
-    try:
-        wfn.close()
-    except Exception as exc:                                  # noqa: BLE001
-        log(f"WARNING: WfnLoader.close() failed "
-            f"({type(exc).__name__}: {exc}); continuing to exit")
+    wfn.close()
     # Close the table against the PROCESS wall, not against ``main()``'s.
     # ``_pre_main`` is everything above this function: the module body's
     # ``initialize_communicator_stack()`` (env, jax.distributed, backend init,

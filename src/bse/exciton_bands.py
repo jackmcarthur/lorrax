@@ -2748,12 +2748,7 @@ def main(argv=None):
     # handles, so the later ``__del__`` becomes a no-op on every rank and
     # nothing collective is left to interpreter shutdown.  A no-op at P=1,
     # where the SlabIO barrier is already a no-op.
-    try:
-        wfn.close()
-    except Exception as exc:                                  # noqa: BLE001
-        report.legacy_print(
-            f"WARNING: WfnLoader.close() failed "
-            f"({type(exc).__name__}: {exc}); continuing to exit")
+    wfn.close()
 
     report.timings(tuple(timers.items()), wall=time.time() - t_wall)
     dat_path = os.path.abspath(args.out_prefix + ".dat")
