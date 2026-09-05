@@ -414,13 +414,12 @@ class DftVelocityHeadData:
 
 
 def _ascii_stamp(io, path: str, name: str) -> str:
-    """A ``uint8`` provenance stamp, read through SlabIO, as ``str``.
+    """An int32 byte-valued provenance stamp, read through SlabIO.
 
-    ``write_attr`` publishes these as ``uint8`` datasets.  The phdf5
-    transport's dtype table has no unsigned type, so the read asks for
-    ``int32`` and HDF5 widens — the same route
-    ``file_io.parallel_transport._decode_i32_text`` already takes for the
-    W-av stamps, and the reason it takes it.
+    The PHDF5 transport cannot introspect an unsigned source datatype before
+    HDF5 conversion.  The parallel-transport owner therefore publishes a
+    numeric int32 byte view for this in-process path while retaining its
+    historical uint8 spelling for external HDF5 tools.
     """
     raw = np.asarray(io.read_small(name, dtype=np.int32), dtype=np.int32)
     if raw.ndim != 1 or np.any(raw < 0) or np.any(raw > 255):
@@ -508,7 +507,7 @@ def load_parallel_transport_head(
             dtype=np.float64,
         )
         fingerprint = _ascii_stamp(
-            io, path, "wfn_fingerprint_utf8")
+            io, path, "wfn_fingerprint_bytes_i32")
 
         expected_nb = int(meta.b_id_4_user)
         expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -705,7 +704,8 @@ def load_dft_velocity_head(
             io.read_small("reciprocal_lattice_cart", dtype=np.float64),
             dtype=np.float64,
         )
-        fingerprint = _ascii_stamp(io, path, "wfn_fingerprint_utf8")
+        fingerprint = _ascii_stamp(
+            io, path, "wfn_fingerprint_bytes_i32")
         expected_reciprocal = (
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )
