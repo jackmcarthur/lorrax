@@ -179,17 +179,14 @@ computed sign is reported, not assumed. The expected magnitude for CrI₃ is
 ## 8. Interpolated-Hamiltonian route
 
 `bandstructure.htransform --orbital-magnetization-grid` evaluates the same
-formula without finite-differencing bands. It differentiates the existing
-Fourier series for `f(H)` and recovers off-diagonal `dH/dk` with
-
-```
-<m|dH|n> = (E_m-E_n)/(f(E_m)-f(E_n)) <m|d f(H)|n>.
-```
-
-Thus a DFT-only run contains the full mean-field velocity and no synthetic
-self-energy term. A QP-Hamiltonian run differentiates that complete operator,
-so its covariant `[r,Sigma]` term is present automatically. Both routes share
-the modern-theory contraction and the typed axial/time-odd symmetry projector.
+formula without finite-differencing bands. It consumes the authenticated exact
+DFT velocity produced with the WFN, projects it into htransform's shared
+Galerkin basis, and Fourier-interpolates that operator beside `f(H)`. This is
+necessary because the Galerkin basis is built from full-Bloch states:
+differentiating its matrix alone omits the basis-connection contribution.
+Both DFT routes share the modern-theory contraction and typed axial/time-odd
+symmetry projector. QP orbital magnetization refuses until the QSGW covariant
+velocity owner supplies the self-energy derivative/connection contribution.
 
 ## Sources
 

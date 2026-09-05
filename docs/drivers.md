@@ -257,14 +257,17 @@ header.
 
 Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat]`; the production scientific report is `htransform.out` and the interpolated table is `bandstructure.dat` (override with `--report-file` / `--output-file`). Kernel diagnostics use the driver-wide `LORRAX_DEBUG_PRINT=1` switch. The whole-state memory ledger prints and checks the exact mesh-dependent live set before compilation; do not reuse performance or rank expectations from the deleted centroid-Gram implementation.
 
-`--orbital-magnetization-grid NX NY NZ` differentiates this same Fourier
-Hamiltonian analytically and evaluates the modern-theory moment on a uniform
-fine grid. With no QP input this is the complete interpolated DFT velocity;
-with a QP Hamiltonian the same derivative includes its covariant
-`[r,Sigma]` contribution. `--orbital-magnetization-band-ceiling` must remain
-below the fitted guard shoulder. The result is written to
-`orbital_magnetization.json` by default and uses the WFN symmetry service's
-typed axial/time-odd projector.
+`--orbital-magnetization-grid NX NY NZ` evaluates the modern-theory moment on
+a uniform fine grid. It requires
+`--orbital-magnetization-dft-velocity parallel_transport.h5`: the existing
+authenticated exact DFT velocity is projected into the shared Galerkin basis
+and Fourier-interpolated beside `fH_R`. Differentiating `fH_R` is not a
+substitute because the fitted full-Bloch basis carries a connection term.
+QP overlays currently refuse: their physical velocity also needs the QSGW
+owner's covariant self-energy derivative/connection contribution.
+`--orbital-magnetization-band-ceiling` must remain below the fitted guard
+shoulder. The result is written to `orbital_magnetization.json` by default and
+uses the WFN symmetry service's typed axial/time-odd projector.
 
 **Whole-state memory gate.** `isdf.galerkin` owns one bounded, zeta-style outer-r/inner-band stream for the randomized sketch, exact selected-state Gram, and physical projection. Its canonical `PsiGStore` supplies full-Bloch G-flat→r chunks; no full-r basis or second WFN/FFT route exists. The precompile ledger prices each alternative stage, including compiled WFN transform workspace, candidate/sketch faces, selected-state rows, factor, and coefficients; it reduces the WFN band carrier and then the r carrier before refusing against the worst-rank allocator budget. `LORRAX_GALERKIN_CHUNK_GIB` controls the stream tile only and never changes candidates, pivots, or delivered rank.
 
@@ -300,6 +303,7 @@ Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.n
 | `--a-band` | top band | band whose bandwidth sets the f-transform scale a |
 | `--guard-bands` | 4 | fit this many extra conduction bands above the returned `nval+ncond` window; the returned bands must pass the shared f-shoulder gate, while the guards absorb the transform's exact-zero top edge |
 | `--orbital-magnetization-grid` | none | uniform fine mesh for the modern-theory moment; omission does no observable work |
+| `--orbital-magnetization-dft-velocity` | none | authenticated velocity-only `parallel_transport.h5`; required with the orbital grid and matched to the WFN/grid/band manifold before payload I/O |
 | `--orbital-magnetization-band-ceiling` | returned window | common occupied+empty band ceiling, strictly inside fitted guards |
 | env `LORRAX_GALERKIN_CHUNK_GIB` | 6 | bounded whole-state r-stream tile budget; changes chunk count, never fitted basis semantics |
 

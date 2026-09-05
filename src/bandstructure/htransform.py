@@ -942,70 +942,66 @@ def require_newton_converged(residual: float, *, where: str) -> None:
             f"{NEWTON_RESIDUAL_MAX:.1e}-Ry residual cap after 50 steps")
 
 
-def fourier_hermitian_with_crystal_derivative(q_frac, R_grid, operator_R):
-    """Evaluate one Hermitian Fourier operator and its analytic derivative.
+def fourier_hermitian(q_frac, R_grid, operator_R):
+    """Evaluate ``Herm[sum_R exp(-2 pi i q.R) O_R]``.
 
-    This is the value convention used by the path and fine-grid htransform:
-    ``Herm[sum_R exp(-2 pi i q.R) O_R]``.  The derivative is with respect to
-    fractional crystal coordinates.  Cartesian conversion belongs to the
-    observable that knows the reciprocal lattice.
+    Matrix axes are the final two axes; arbitrary replicated component axes
+    may sit between the lattice-R and matrix axes.  This is the one Fourier
+    value convention used by path energies and interpolated observables.
     """
     phase = jnp.exp(-2j * jnp.pi * (q_frac @ R_grid.T))
-    raw = 0.5 * jnp.einsum("br,rij->bij", phase, operator_R,
-                            optimize=True)
-    derivative_raw = 0.5 * jnp.einsum(
-        "br,ra,rij->baij", phase, -2j * jnp.pi * R_grid, operator_R,
-        optimize=True)
+    raw = 0.5 * jnp.tensordot(phase, operator_R, axes=((1,), (0,)))
     matrix = raw + jnp.swapaxes(raw, -1, -2).conj()
-    derivative = (
-        derivative_raw
-        + jnp.swapaxes(derivative_raw, -1, -2).conj())
-    return matrix, derivative
+    return matrix
 
 
-def velocity_from_transformed_derivative(
-        dfH_cart, vectors, transformed_energies, energies,
-        *, degeneracy_tolerance_ry: float):
-    """Convert ``d f(H)`` to off-diagonal ``dH`` in H's eigenbasis."""
-    right = jnp.einsum(
-        "baij,bjn->bain", dfH_cart, vectors, optimize=True)
-    dfH_eigen = jnp.einsum(
-        "bim,bain->bamn", jnp.conj(vectors), right, optimize=True)
-    dE = energies[:, :, None] - energies[:, None, :]
-    dlam = (transformed_energies[:, :, None]
-            - transformed_energies[:, None, :])
-    separated = jnp.abs(dE) > float(degeneracy_tolerance_ry)
-    f_floor = (128.0 * jnp.finfo(jnp.float64).eps
-               * jnp.maximum(
-                   1.0,
-                   jnp.abs(transformed_energies[:, :, None])
-                   + jnp.abs(transformed_energies[:, None, :])))
-    stable = jnp.abs(dlam) > f_floor
-    unsafe = separated & (~stable)
-    ratio = jnp.where(
-        separated & stable,
-        dE / jnp.where(stable, dlam, 1.0),
-        0.0)
-    return dfH_eigen * ratio[:, None], unsafe
+def build_galerkin_velocity_R(
+        ctilde, velocity_dft_cart, kgrid, mesh_xy: Mesh, *, log_fn=None):
+    """Project exact DFT velocity and Fourier-transform it on the coarse grid.
+
+    The source velocity is authenticated by ``gw.qsgw_head`` before this
+    function is called.  Both the projected k-space matrix and returned
+    lattice-R matrix retain a two-dimensional face layout.
+    """
+    from gw.qsgw_head import project_band_operator_to_galerkin
+
+    log = log_fn if log_fn is not None else (lambda *_a, **_k: None)
+    velocity_basis = project_band_operator_to_galerkin(
+        velocity_dft_cart, ctilde, mesh=mesh_xy)
+    face = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    spec_3d = P(None, None, None, None, "x", "y")
+    inverse = make_flat_k_ifftn(
+        mesh_xy, tuple(int(n) for n in kgrid), spec_3d, norm="backward")
+
+    @partial(jax.jit, in_shardings=face, out_shardings=face)
+    def _to_R(component_k):
+        k_component = jnp.moveaxis(component_k, 0, 1)
+        return inverse(k_component)
+
+    velocity_R = _to_R(velocity_basis)
+    jax.block_until_ready(velocity_R)
+    del velocity_basis
+    total_gib = int(np.prod(velocity_R.shape)) * 16 / 2**30
+    log(
+        "  [route] orbital velocity: authenticated DFT band operator -> "
+        "shared Galerkin basis -> canonical flat-k IFFT; "
+        f"shape={tuple(int(n) for n in velocity_R.shape)}, "
+        f"global={total_gib:.3f} GiB, layout=P(None,None,'x','y')")
+    return velocity_R
 
 
 def htransform_orbital_magnetization(
-        fH_R, transform, R_grid, *, fine_grid, nstates: int,
-        band_ceiling: int, nocc: int, bvec_cart, sym, mesh_xy: Mesh,
+        fH_R, velocity_R, transform, R_grid, *, fine_grid, nstates: int,
+        band_ceiling: int, nocc: int, sym, mesh_xy: Mesh,
         mu_ev: float | None = None, degeneracy_tolerance_ev: float = 1.4e-3,
         magnetization_axis=(0.0, 0.0, 1.0), log_fn=None,
         progress_fn=None):
-    """Modern-theory moment of the Hamiltonian represented by ``fH_R``.
+    """Modern-theory moment from interpolated energies and DFT velocity.
 
-    For off-diagonal eigenstate pairs, functional calculus gives
-
-    ``<m|dH|n> = (E_m-E_n)/(f(E_m)-f(E_n)) <m|d f(H)|n>``.
-
-    Differentiating the existing Fourier series therefore includes every
-    term in the interpolated Hamiltonian.  With DFT energies it is the full
-    mean-field velocity; with an authenticated QP overlay it also contains
-    the covariant self-energy commutator contribution.  No separate velocity
-    or symmetry implementation is introduced.
+    ``velocity_R`` is the authenticated physical DFT velocity projected into
+    the same shared Galerkin basis as ``fH_R``.  Differentiating ``fH_R`` is
+    not equivalent: this basis is fitted from full-Bloch states and its
+    connection term is essential.
     """
     from psp.orbital_response import (
         magnetic_axial_projector,
@@ -1029,6 +1025,12 @@ def htransform_orbital_magnetization(
             "htransform orbital magnetization requires a square Galerkin "
             f"Hamiltonian whose rank covers every fitted state; got "
             f"shape={tuple(fH_R.shape)}, fitted_states={nstates}.")
+    if tuple(velocity_R.shape) != (
+            int(fH_R.shape[0]), 3, operator_rank, operator_rank):
+        raise ValueError(
+            "htransform orbital velocity must be (nR,3,rank,rank) in the "
+            f"same Galerkin basis as fH_R; got {tuple(velocity_R.shape)} "
+            f"versus fH_R={tuple(fH_R.shape)}.")
     if not (0 < nocc < band_ceiling <= nstates):
         raise ValueError(
             "htransform orbital magnetization requires "
@@ -1057,26 +1059,23 @@ def htransform_orbital_magnetization(
         q_host, NamedSharding(mesh_xy, P(None, None)))
 
     batch_matrix = NamedSharding(mesh_xy, P(("x", "y"), None, None))
-    batch_derivative = NamedSharding(
+    batch_velocity = NamedSharding(
         mesh_xy, P(("x", "y"), None, None, None))
     batch_vector = NamedSharding(mesh_xy, P(("x", "y"), None))
     batch_scalar = NamedSharding(mesh_xy, P(("x", "y"),))
     replicated = NamedSharding(mesh_xy, P())
     a_f, n_f, shift = (float(x) for x in transform)
-    B_inv = jnp.asarray(
-        np.linalg.inv(np.asarray(bvec_cart, dtype=np.float64)),
-        dtype=jnp.float64)
-
     @partial(
         jax.jit,
         out_shardings=(batch_vector, batch_vector, batch_scalar,
-                       batch_scalar, replicated, replicated))
-    def _batch(q_batch, operator_R):
-        fH, dfH_crys = fourier_hermitian_with_crystal_derivative(
-            q_batch, R_grid, operator_R)
+                       batch_scalar, replicated))
+    def _batch(q_batch, energy_R, physical_velocity_R):
+        fH = fourier_hermitian(q_batch, R_grid, energy_R)
         fH = jax.lax.with_sharding_constraint(fH, batch_matrix)
-        dfH_crys = jax.lax.with_sharding_constraint(
-            dfH_crys, batch_derivative)
+        velocity_basis = fourier_hermitian(
+            q_batch, R_grid, physical_velocity_R)
+        velocity_basis = jax.lax.with_sharding_constraint(
+            velocity_basis, batch_velocity)
         lam_all, vectors_all = jax.vmap(jnp.linalg.eigh)(fH)
         lam = lam_all[:, :nstates]
         vectors = vectors_all[:, :, :band_ceiling]
@@ -1084,24 +1083,20 @@ def htransform_orbital_magnetization(
             a_f, n_f, shift, lam.real)
         energies = energies_all[:, :band_ceiling]
 
-        # Convert crystal derivatives exactly as the explicit-WFN
-        # Hellmann-Feynman check does: grad_cart = inv(B) @ grad_crys.
-        dfH_cart = jnp.einsum(
-            "ai,bimn->bamn", B_inv, dfH_crys, optimize=True)
-        velocity, unsafe = velocity_from_transformed_derivative(
-            dfH_cart, vectors, lam[:, :band_ceiling], energies,
-            degeneracy_tolerance_ry=tol_ry)
+        right = jnp.einsum(
+            "baij,bjn->bain", velocity_basis, vectors, optimize=True)
+        velocity = jnp.einsum(
+            "bim,bain->bamn", jnp.conj(vectors), right, optimize=True)
         cA, cB = orbital_cA_cB_jax(
             velocity, energies, nocc=nocc, deps_tol_ry=tol_ry)
         return (
             cA, cB, energies[:, nocc - 1], energies[:, nocc],
-            jnp.sum(unsafe.astype(jnp.int64)), inverse_residual)
+            inverse_residual)
 
     cA_rows = []
     cB_rows = []
     v_rows = []
     c_rows = []
-    unsafe_pairs = 0
     inverse_residual = 0.0
     n_batches = int((nq + q_pad) // batch_size)
     progress = LoopProgress(
@@ -1110,27 +1105,19 @@ def htransform_orbital_magnetization(
         item_name="k batch", max_updates=min(12, n_batches),
         enabled=progress_fn is not None).start()
     for start in range(0, nq + q_pad, batch_size):
-        result = _batch(q_dev[start:start + batch_size], fH_R)
+        result = _batch(
+            q_dev[start:start + batch_size], fH_R, velocity_R)
         jax.block_until_ready(result)
         cA_rows.append(gather_to_host(result[0]))
         cB_rows.append(gather_to_host(result[1]))
         v_rows.append(gather_to_host(result[2]))
         c_rows.append(gather_to_host(result[3]))
-        unsafe_pairs += int(jax.device_get(result[4]))
         inverse_residual = max(
-            inverse_residual, float(jax.device_get(result[5])))
+            inverse_residual, float(jax.device_get(result[4])))
         progress.step()
     progress.finish()
     require_newton_converged(
         inverse_residual, where="htransform orbital magnetization")
-    if unsafe_pairs:
-        raise ValueError(
-            "htransform orbital magnetization found "
-            f"{unsafe_pairs} nondegenerate band pair(s) whose transformed "
-            "divided difference is numerically singular. Add guard bands "
-            "above the orbital band ceiling; do not zero an unresolved "
-            "velocity contribution.")
-
     cA_q = np.concatenate(cA_rows, axis=0)[:nq]
     cB_q = np.concatenate(cB_rows, axis=0)[:nq]
     valence = np.concatenate(v_rows, axis=0)[:nq]
@@ -1147,7 +1134,7 @@ def htransform_orbital_magnetization(
     raw_moment = moment_mu_b(cA_raw, cB_raw, mu_ry)
     projected_moment = moment_mu_b(cA, cB, mu_ry)
     record = {
-        "schema": "lorrax.htransform.orbital_magnetization/v1",
+        "schema": "lorrax.htransform.orbital_magnetization/v2",
         "grid": list(grid),
         "nk": nq,
         "nocc": nocc,
@@ -1167,7 +1154,7 @@ def htransform_orbital_magnetization(
         "cB_real": np.asarray(cB.real).astype(float).tolist(),
         "cB_imag": np.asarray(cB.imag).astype(float).tolist(),
         "newton_inverse_residual_ry": inverse_residual,
-        "operator": "analytic derivative of interpolated Hamiltonian",
+        "operator": "authenticated DFT velocity projected and interpolated",
     }
     log(
         "  [orbmag] grid=" + "x".join(str(x) for x in grid)
@@ -1747,6 +1734,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 qp_corrected_band_range: tuple[int, int] | None = None,
                 progress_fn=None, quality_record_fn=None, sym=None,
                 orbital_magnetization_grid=None,
+                orbital_dft_velocity_cart=None,
                 orbital_magnetization_band_ceiling: int | None = None,
                 orbital_magnetization_mu_ev: float | None = None,
                 orbital_magnetization_degeneracy_tol_ev: float = 1.4e-3,
@@ -1859,16 +1847,22 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 "htransform orbital magnetization requires the WFNLoader "
                 "symmetry service; a bare symmetry-less library call cannot "
                 "authenticate an axial time-odd observable.")
+        if orbital_dft_velocity_cart is None:
+            raise ValueError(
+                "htransform orbital magnetization requires an authenticated "
+                "DFT velocity carrier; provide the velocity-only parallel-"
+                "transport artifact at the driver boundary.")
+        velocity_R = build_galerkin_velocity_R(
+            coeffs, orbital_dft_velocity_cart, kgrid, mesh_xy,
+            log_fn=log_fn)
         orbital_magnetization = htransform_orbital_magnetization(
-            fH_R, (a_f, n_f, shift), R_grid,
+            fH_R, velocity_R, (a_f, n_f, shift), R_grid,
             fine_grid=orbital_magnetization_grid,
             nstates=int(states),
             band_ceiling=(
                 nb_keep if orbital_magnetization_band_ceiling is None
                 else int(orbital_magnetization_band_ceiling)),
             nocc=int(wfn.nelec),
-            bvec_cart=(np.asarray(wfn.bvec, dtype=np.float64)
-                       * float(wfn.blat)),
             sym=sym,
             mesh_xy=mesh_xy,
             mu_ev=orbital_magnetization_mu_ev,
@@ -1878,6 +1872,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             log_fn=log_fn,
             progress_fn=progress_fn,
         )
+        del velocity_R
         orbital_magnetization["coarse_grid"] = list(kgrid)
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -1904,12 +1899,10 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
 
     def _fourier_matrix(batch_k, operator_R):
         """The one path-q contraction for both fH and active character."""
-        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))
-        mat = 0.5 * jnp.einsum(
-            'bk,kij->bij', phase, operator_R, optimize=True)
+        mat = fourier_hermitian(batch_k, R_grid, operator_R)
         mat = jax.lax.with_sharding_constraint(mat, face_ij_shard)
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
-        return mat + jnp.swapaxes(mat, 1, 2).conj()
+        return mat
 
     if not use_active:
         @partial(jax.jit, out_shardings=batch_eig_shard)
@@ -2549,6 +2542,11 @@ def main(argv=None):
         help="Evaluate the modern-theory orbital moment on this uniform "
              "fine grid from the same interpolated Hamiltonian.")
     parser.add_argument(
+        "--orbital-magnetization-dft-velocity", default=None,
+        help="Authenticated velocity-only parallel_transport.h5 for the "
+             "same DFT WFN and fitted band manifold. Required with "
+             "--orbital-magnetization-grid.")
+    parser.add_argument(
         "--orbital-magnetization-band-ceiling", type=int, default=None,
         help="Inner-state ceiling inside the fitted htransform window "
              "(default: the returned nval+ncond window).")
@@ -2568,6 +2566,21 @@ def main(argv=None):
         help="JSON result written beside the input deck when an orbital "
              "grid is requested.")
     args = parser.parse_args(argv)
+    _orbital_requested = args.orbital_magnetization_grid is not None
+    _orbital_velocity_requested = (
+        args.orbital_magnetization_dft_velocity is not None)
+    if _orbital_requested != _orbital_velocity_requested:
+        raise SystemExit(
+            "FATAL: --orbital-magnetization-grid and --orbital-"
+            "magnetization-dft-velocity must be supplied together.")
+    if _orbital_requested and (args.eqp_file or args.qp_rotations):
+        raise SystemExit(
+            "FATAL: QP orbital magnetization is not yet supported. The "
+            "physical QP velocity requires the covariant self-energy "
+            "derivative/connection from the QSGW velocity owner; a "
+            "derivative of the full-Bloch htransform matrix is not that "
+            "operator. Run the DFT-only observable without --eqp-file or "
+            "--qp-rotations.")
     input_dir = os.path.dirname(os.path.abspath(args.input))
 
     def _output_path(value: str) -> str:
@@ -2624,6 +2637,13 @@ def main(argv=None):
     if args.eqp_file:
         _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file)
                      else os.path.join(_input_dir, args.eqp_file))
+    _orbital_velocity_path = None
+    if args.orbital_magnetization_dft_velocity:
+        _orbital_velocity_path = (
+            args.orbital_magnetization_dft_velocity
+            if os.path.isabs(args.orbital_magnetization_dft_velocity)
+            else os.path.join(
+                _input_dir, args.orbital_magnetization_dft_velocity))
     from file_io.qp_wfn import refuse_conflicting_qp_state_sources
     refuse_conflicting_qp_state_sources(
         wfn_path=_wfn_path, eqp_file=_eqp_path,
@@ -2664,6 +2684,17 @@ def main(argv=None):
     _setup_progress.step()
     _setup_progress.finish()
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
+    orbital_dft_velocity_cart = None
+    if _orbital_velocity_path is not None:
+        from gw.qsgw_head import load_dft_velocity_head
+        velocity_source = load_dft_velocity_head(
+            _orbital_velocity_path, mesh=mesh_xy, wfn=wfn, meta=meta)
+        orbital_dft_velocity_cart = velocity_source.velocity_dft_cart
+        log(
+            "  [orbmag] authenticated exact DFT velocity: "
+            f"{_orbital_velocity_path}; logical bands="
+            f"{int(velocity_source.nb_logical)}")
+        del velocity_source
     qp_corrected_band_range = None
     if _qp_rotations_path is not None:
         (ctilde, enk_sigma,
@@ -2737,6 +2768,8 @@ def main(argv=None):
                              sym=sym,
                              orbital_magnetization_grid=(
                                  args.orbital_magnetization_grid),
+                             orbital_dft_velocity_cart=(
+                                 orbital_dft_velocity_cart),
                              orbital_magnetization_band_ceiling=(
                                  args.orbital_magnetization_band_ceiling),
                              orbital_magnetization_mu_ev=(
@@ -2913,6 +2946,9 @@ def main(argv=None):
         _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file) else
                      os.path.join(input_dir, args.eqp_file))
         _file_rows.append(("QP energies", "read", _eqp_path))
+    if _orbital_velocity_path is not None:
+        _file_rows.append(
+            ("authenticated DFT velocity", "read", _orbital_velocity_path))
     _file_rows.extend([
         ("interpolated bands",
          "written" if os.path.exists(output_path) else "absent", output_path),

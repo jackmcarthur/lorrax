@@ -962,6 +962,50 @@ def rotate_velocity_to_qp(velocity_cart, U_dft_to_qp, *, mesh: Mesh):
     return _rotation_kernel(mesh)(velocity_cart, U_dft_to_qp)
 
 
+def project_band_operator_to_galerkin(
+    operator_cart,
+    coefficients_kna,
+    *,
+    mesh: Mesh,
+):
+    """Project band matrices into a shared Galerkin basis.
+
+    ``coefficients_kna`` stores ``<B_a|psi_kn>``.  The returned operator is
+    therefore ``C.T @ operator @ C.conj()`` with layout
+    ``P(component,k,'x','y')``.  This is the same distributed two-sided
+    contraction as the QP velocity rotation, not a second matrix-product
+    implementation.
+    """
+    from runtime.padding import pad_axis
+
+    operator = jnp.asarray(operator_cart, dtype=jnp.complex128)
+    coefficients = jnp.asarray(coefficients_kna, dtype=jnp.complex128)
+    if operator.ndim != 4 or operator.shape[-2] != operator.shape[-1]:
+        raise ValueError(
+            "band operator must be (n_component,nk,nb,nb); got "
+            f"{operator.shape}.")
+    if coefficients.ndim != 3:
+        raise ValueError(
+            "Galerkin coefficients must be (nk,nb,rank); got "
+            f"{coefficients.shape}.")
+    if int(operator.shape[1]) != int(coefficients.shape[0]):
+        raise ValueError(
+            "band operator and Galerkin coefficients have different k "
+            f"extents: {operator.shape[1]} != {coefficients.shape[0]}.")
+    nb_storage = int(operator.shape[-1])
+    nb_logical = int(coefficients.shape[1])
+    if nb_logical > nb_storage:
+        raise ValueError(
+            "Galerkin coefficient band extent exceeds the operator storage "
+            f"extent: {nb_logical} > {nb_storage}.")
+    if nb_logical < nb_storage:
+        coefficients = pad_axis(
+            coefficients, nb_storage, axis=1).array
+    # _rotation_kernel computes U^H O U.  With U_na=conj(C_na), this is
+    # exactly C^T O C^*, including exact-zero padded band rows.
+    return _rotation_kernel(mesh)(operator, jnp.conj(coefficients))
+
+
 def rotate_velocity_active_to_qp(velocity_cart, U_active, *, mesh: Mesh):
     """Apply blockdiag(U_active,I)^H v blockdiag(U_active,I).
 

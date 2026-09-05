@@ -3,69 +3,65 @@
 import numpy as np
 
 
-def test_fourier_derivative_matches_centered_difference():
+def test_fourier_hermitian_accepts_component_axis():
     import jax.numpy as jnp
-    from bandstructure.htransform import (
-        fourier_hermitian_with_crystal_derivative,
-    )
+    from bandstructure.htransform import fourier_hermitian
 
     rng = np.random.default_rng(202609051)
     R = np.asarray([[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0]])
-    raw = (rng.normal(size=(len(R), 4, 4))
-           + 1j * rng.normal(size=(len(R), 4, 4)))
+    raw = (rng.normal(size=(len(R), 3, 4, 4))
+           + 1j * rng.normal(size=(len(R), 3, 4, 4)))
     q = np.asarray([[0.173, -0.219, 0.0]])
-    value, derivative = fourier_hermitian_with_crystal_derivative(
+    value = np.asarray(fourier_hermitian(
         jnp.asarray(q), jnp.asarray(R), jnp.asarray(raw))
-    value = np.asarray(value)
-    derivative = np.asarray(derivative)
-    step = 1.0e-6
-    for axis in range(3):
-        dq = np.zeros_like(q)
-        dq[:, axis] = step
-        plus = np.asarray(fourier_hermitian_with_crystal_derivative(
-            jnp.asarray(q + dq), jnp.asarray(R), jnp.asarray(raw))[0])
-        minus = np.asarray(fourier_hermitian_with_crystal_derivative(
-            jnp.asarray(q - dq), jnp.asarray(R), jnp.asarray(raw))[0])
-        np.testing.assert_allclose(
-            derivative[:, axis], (plus - minus) / (2.0 * step),
-            rtol=2.0e-10, atol=2.0e-10)
+    )
+    phase = np.exp(-2j * np.pi * (q @ R.T))
+    contracted = 0.5 * np.tensordot(phase, raw, axes=((1,), (0,)))
+    ref = contracted + contracted.swapaxes(-1, -2).conj()
+    np.testing.assert_allclose(value, ref, rtol=2e-15, atol=2e-15)
     np.testing.assert_allclose(value, value.swapaxes(-1, -2).conj())
 
 
-def test_divided_difference_recovers_original_velocity():
+def test_projected_velocity_roundtrip_recovers_band_operator_on_coarse_grid():
+    import jax
     import jax.numpy as jnp
     from bandstructure.htransform import (
-        velocity_from_transformed_derivative,
+        build_R_grid_np,
+        build_galerkin_velocity_R,
+        fourier_hermitian,
     )
+    from jax.sharding import Mesh
 
     rng = np.random.default_rng(202609052)
-    nb = 5
-    z = rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb))
-    vectors, _ = np.linalg.qr(z)
-    energies = np.asarray([[-1.1, -0.4, 0.2, 0.9, 1.8]])
-    transformed = energies + 0.17 * energies ** 3
-    raw = (rng.normal(size=(1, 3, nb, nb))
-           + 1j * rng.normal(size=(1, 3, nb, nb)))
-    velocity_eigen = 0.5 * (raw + raw.swapaxes(-1, -2).conj())
-    for i in range(nb):
-        velocity_eigen[:, :, i, i] = 0.0
-    dE = energies[:, :, None] - energies[:, None, :]
-    dlam = transformed[:, :, None] - transformed[:, None, :]
-    offdiag = ~np.eye(nb, dtype=bool)[None]
-    transformed_slope = np.divide(
-        dlam, dE, out=np.zeros_like(dlam), where=offdiag)
-    df_eigen = velocity_eigen * transformed_slope[:, None]
-    df_global = np.einsum(
-        "bim,bamn,bjn->baij", vectors[None], df_eigen,
-        vectors[None].conj(), optimize=True)
-
-    got, unsafe = velocity_from_transformed_derivative(
-        jnp.asarray(df_global), jnp.asarray(vectors[None]),
-        jnp.asarray(transformed), jnp.asarray(energies),
-        degeneracy_tolerance_ry=1.0e-10)
-    assert not np.any(np.asarray(unsafe))
+    grid = (2, 2, 1)
+    nk, nb = 4, 4
+    coefficients = []
+    for _ in range(nk):
+        z = rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb))
+        coefficients.append(np.linalg.qr(z)[0])
+    coefficients = np.asarray(coefficients)
+    raw = (rng.normal(size=(3, nk, nb, nb))
+           + 1j * rng.normal(size=(3, nk, nb, nb)))
+    velocity = 0.5 * (raw + raw.swapaxes(-1, -2).conj())
+    devices = np.asarray(jax.devices())
+    if devices.size >= 4:
+        devices = devices[:4].reshape(2, 2)
+    else:
+        devices = devices[:1].reshape(1, 1)
+    mesh = Mesh(devices, ("x", "y"))
+    velocity_R = build_galerkin_velocity_R(
+        jnp.asarray(coefficients), jnp.asarray(velocity), grid, mesh)
+    q = np.stack(np.meshgrid(
+        np.arange(2) / 2.0, np.arange(2) / 2.0, [0.0], indexing="ij"),
+        axis=-1).reshape(-1, 3)
+    basis_velocity = np.asarray(fourier_hermitian(
+        jnp.asarray(q), jnp.asarray(build_R_grid_np(grid)), velocity_R))
+    vectors = coefficients.transpose(0, 2, 1)
+    got = np.einsum(
+        "bim,baij,bjn->bamn", np.conj(vectors), basis_velocity, vectors,
+        optimize=True)
     np.testing.assert_allclose(
-        np.asarray(got), velocity_eigen, rtol=2.0e-12, atol=2.0e-12)
+        got, velocity.transpose(1, 0, 2, 3), rtol=3e-13, atol=3e-13)
 
 
 def test_shared_jax_orbital_contraction_matches_incumbent_numpy():
