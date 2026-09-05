@@ -73,14 +73,7 @@ class Hit:
 # here must already be replicated or have had their rank-symmetric collective
 # completed before the branch.  Keep the reason on the same row so a reviewer
 # can decide whether a future edit invalidates it.
-_ALLOWLIST: dict[str, str] = {
-    "src/centroid/pivoted_cholesky.py:112:27:float(jax-value)": (
-        "diag_min is a replicated scalar whose JIT and readiness wait run on every rank"
-    ),
-    "src/centroid/pivoted_cholesky.py:112:50:float(jax-value)": (
-        "diag_max is a replicated scalar whose JIT and readiness wait run on every rank"
-    ),
-}
+_ALLOWLIST: dict[str, str] = {}
 
 
 _HOST = "host"
