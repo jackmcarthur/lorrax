@@ -236,3 +236,34 @@ def test_mos2_slab_position_operator_reproduces_the_exact_z_velocity():
         assert twin > 0.5, twin
     finally:
         wfn.close()
+
+
+def test_polar_unfold_time_even_differs_from_time_odd_only_on_antiunitary_rows():
+    """The position operator is a time-EVEN polar vector; the velocity is
+    time-odd.  On the MoS2 fixture (file wedge with time-reversal partners)
+    the two unfolds must differ by exactly -1 on the antiunitary rows and
+    agree elsewhere; the velocity's sign applied to r flipped Z on those k
+    and broke the slab gate on the collapsed axis (2026-09-05)."""
+    wfn_path = FIXTURE_DIR / "WFNsmall.h5"
+    if not wfn_path.exists():
+        pytest.skip("cohsex_debug fixture missing")
+    from symmetry_maps import unfold_file_wedge_polar_matrix
+    from wfn_loader import WfnLoader
+    wfn = WfnLoader(str(wfn_path))
+    try:
+        sym = wfn.symmetry()
+        rng = np.random.default_rng(3)
+        nb = 4
+        data = _herm(rng, int(sym.nk_red), 3, nb, nb)
+        odd = np.asarray(unfold_file_wedge_polar_matrix(sym, data))
+        even = np.asarray(unfold_file_wedge_polar_matrix(sym, data, time_odd=False))
+        rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
+        act_odd = np.asarray(sym.cartesian_action(rows, axial=False, time_odd=True))
+        act_even = np.asarray(sym.cartesian_action(rows, axial=False, time_odd=False))
+        anti = np.array([not np.allclose(a, b) for a, b in zip(act_odd, act_even)])
+        assert anti.any(), "the fixture must carry an antiunitary row for this test"
+        assert (~anti).any()
+        np.testing.assert_allclose(even[anti], -odd[anti], atol=1e-13)
+        np.testing.assert_allclose(even[~anti], odd[~anti], atol=1e-13)
+    finally:
+        wfn.close()

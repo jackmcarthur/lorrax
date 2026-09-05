@@ -3835,7 +3835,8 @@ def unfold_file_wedge_to_full_bz(sym, data):
                           trs_reference="ibz_slab")
 
 
-def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
+def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3,
+                                   time_odd=True):
     """FILE-wedge polar band matrix → full BZ, on the input's backend.
 
     This is the canonical route for a cheap same-k observable such as
@@ -3843,8 +3844,12 @@ def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
     ordinary file-wedge unfold first gathers their band matrices and applies
     antiunitary conjugation.  The target row's forward Cartesian action then
     mixes the explicit polar-vector axis.  Its antiunitary half already
-    contains the time-odd minus sign, so no second velocity-parity rule is
-    accepted here.
+    contains the time-odd minus sign for a VELOCITY (``time_odd=True``, the
+    default and the only historical caller); a time-EVEN polar vector such
+    as the position operator ``<m k| r |n k>`` (the collapsed-axis
+    connection of the parallel-transport artifact) passes
+    ``time_odd=False`` and takes the same spatial action without that sign.
+    No second parity rule is accepted beyond this one flag.
 
     Nonsymmorphic translation phases cancel between the equal-k bra and ket.
     Quantities with distinct endpoints must instead use the directed-edge
@@ -3857,7 +3862,7 @@ def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
     out = unfold_file_wedge_to_full_bz(sym, data)
     sym_rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
     rotations = np.asarray(sym.cartesian_action(
-        sym_rows, axial=False, time_odd=True), dtype=np.float64)
+        sym_rows, axial=False, time_odd=bool(time_odd)), dtype=np.float64)
     if sym_rows.shape != (int(sym.nk_tot),):
         raise ValueError(
             "unfold_file_wedge_polar_matrix: sym.sym_idx_k must have one "

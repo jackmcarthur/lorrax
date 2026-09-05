@@ -854,8 +854,11 @@ def collapsed_axis_position_operators(
 				box_index=wfn.box_index(k="ibz"),
 				kvecs=np.asarray(gtab_file.kvecs))
 		bhat = jnp.asarray(B[axis] / np.linalg.norm(B[axis]))
+		# r is a TIME-EVEN polar vector (v = dr/dt is the odd one), so the
+		# antiunitary rows take no velocity sign here.
 		Z_vec = unfold_file_wedge_polar_matrix(
-			sym, Z_file[:, None, :, :] * bhat[None, :, None, None])
+			sym, Z_file[:, None, :, :] * bhat[None, :, None, None],
+			time_odd=False)
 		Z_full = jnp.einsum("j,kjmn->kmn", bhat, Z_vec, optimize=True)
 		Z_full = 0.5 * (Z_full + jnp.swapaxes(jnp.conj(Z_full), -1, -2))
 		position = position.at[:, axis].set(Z_full)

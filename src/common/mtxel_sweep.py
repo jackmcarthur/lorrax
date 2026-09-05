@@ -631,15 +631,28 @@ def collapsed_position_operator(
             0.0 + 0.0j)
     M_j = jnp.asarray(K, dtype=jnp.complex128)                    # (n, n): out i, in j
     mesh = geom.mesh
-    box_sharding = NamedSharding(mesh, geom.spec_box_xy)
+    box_spec = geom.spec_box_xy
     box_axis = 3 + a
+    from common.shard_map import shard_map
+
+    def _toeplitz_local(box_local, M):
+        # Rank-local: the Toeplitz acts along a replicated FFT axis, so it
+        # never needs another rank's bands.  Left to XLA's own propagation
+        # the einsum on the band-sharded box gathered the FULL band axis
+        # (10.35 GiB, CrI3 250 bands, P4 A100-40GB, 2026-09-05).
+        moved = jnp.moveaxis(box_local, box_axis, -1)
+        return jnp.moveaxis(
+            jnp.einsum("...j,ij->...i", moved, M, optimize=True), -1, box_axis)
+
+    toeplitz = shard_map(
+        _toeplitz_local, mesh=mesh, in_specs=(box_spec, P()),
+        out_specs=box_spec, check_vma=False)
 
     def op(psi_n, gvec, gmask, bidx, kvec, M):
         box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)      # (1, nb, ns, nx, ny, nz)
-        moved = jnp.moveaxis(box, box_axis, -1)
-        phi = jnp.moveaxis(
-            jnp.einsum("...j,ij->...i", moved, M, optimize=True), -1, box_axis)
-        phi = jax.lax.with_sharding_constraint(phi, box_sharding)
+        box = jax.lax.with_sharding_constraint(
+            box, NamedSharding(mesh, box_spec))
+        phi = toeplitz(box, M)
         out = phi[..., gvec[:, 0], gvec[:, 1], gvec[:, 2]]
         return out * gmask[None, None, None, :].astype(out.dtype)
 

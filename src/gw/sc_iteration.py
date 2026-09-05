@@ -5305,8 +5305,17 @@ def load_head_velocity_source(
 
     source = load_parallel_transport_head(
         pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
+    # A collapsed axis's stored "link" is the plane-wave overlap
+    # <psi| e^{-i b.r} |psi> (the neighbour is the point itself through
+    # b_i): its singular values are far below one by construction and say
+    # nothing about window hybridization, which is a property of the
+    # transport along the sampled directions only.
+    from common.parallel_transport import collapsed_axes
+    sv = np.array(source.singular_values, dtype=np.float64, copy=True)
+    for axis in collapsed_axes(wfn.kgrid):
+        sv[:, axis, :] = 1.0
     _refuse_hybridized_window_edge(
-        source.singular_values, source.nb_logical,
+        sv, source.nb_logical,
         where=f"sc_head_update={mode}")
     vgate = source.validation
     print_fn(
