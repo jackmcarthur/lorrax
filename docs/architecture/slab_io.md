@@ -123,7 +123,8 @@ rank. Only global data success permits metadata materialization and rank-0
 publication, whose verdict is broadcast by `rank0_transaction`.
 
 `file_io.commit_state` owns the `lorrax_io_committed` dataset. New files start
-with HDF5's zero fill; appends invalidate the receipt before any data mutation.
+with an explicit collective zero write (the native DCPL disables filling);
+appends invalidate the receipt before any data mutation.
 The serial metadata writer sets it to one last. SlabIO reads and restart readers
 refuse a present incomplete receipt; legacy files keep their format checks.
 This is an error-reporting and restart protocol, not recovery from a process

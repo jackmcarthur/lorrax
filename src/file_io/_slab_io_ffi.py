@@ -1944,6 +1944,28 @@ class _FfiBackend(_DatasetGeometry):
         if mode != "r":
             from .commit_state import COMMIT_STATE
             self.create_dataset(COMMIT_STATE, shape=(1,), dtype=np.int32)
+            # The native DCPL uses H5D_FILL_TIME_NEVER. Persist zero
+            # before callers can enqueue tensors. Rank 0 owns the logical
+            # element; every other rank participates with an empty slab.
+            count = int(mesh.size)
+            sharding = NamedSharding(mesh, P(tuple(mesh.axis_names)))
+            pending = jax.make_array_from_callback(
+                (count,), sharding,
+                lambda index: np.zeros((count,), dtype=np.int32)[index])
+            try:
+                self.write_slab(COMMIT_STATE, pending)
+                self._drain_pending()
+            except BaseException as exc:
+                self._context_error = exc
+            # Construction precedes __enter__: an initialization failure
+            # must itself bring every rank through collective close.
+            from common.collectives import agree_io_error
+            try:
+                agree_io_error(getattr(self, "_context_error", None),
+                               path=path, stage="SlabIO.initialize_receipt")
+            except BaseException:
+                self.close()
+                raise
 
     # ------------------------------------------------------------------
     def create_dataset(

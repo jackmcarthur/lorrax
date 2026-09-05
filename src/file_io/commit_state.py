@@ -1,7 +1,8 @@
 """Persistent completion receipt for collective artifact mutations (L3).
 
-Zero is the HDF5 fill value: even a new writer dying before its first data
-write leaves an uncommitted file. Legacy artifacts without this dataset retain
+SlabIO explicitly writes zero before tensor writes: the native provider uses
+H5D_FILL_TIME_NEVER, so creation alone cannot initialize the receipt. Legacy
+artifacts without this dataset retain
 their format-specific checks. This receipt authenticates completion, not physics.
 """
 COMMIT_STATE = 'lorrax_io_committed'

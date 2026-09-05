@@ -11,7 +11,7 @@ from pathlib import Path
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument('mode', choices=['slab_failure', 'metadata_failure', 'rank0_failure', 'success', 'restart'])
+parser.add_argument('mode', choices=['marker_failure', 'slab_failure', 'metadata_failure', 'rank0_failure', 'success', 'restart'])
 parser.add_argument('directory')
 args = parser.parse_args()
 
@@ -29,6 +29,31 @@ rank = jax.process_index()
 assert jax.process_count() == 4
 out = Path(args.directory)
 path = out / 'slab.h5'
+# Poison the newly-created receipt to prove zero initialization is explicit.
+if args.mode == 'slab_failure':
+    from file_io._slab_io_ffi import _FfiBackend
+    original_create = _FfiBackend.create_dataset
+    def poison_receipt(self, name, **kwargs):
+        original_create(self, name, **kwargs)
+        if name == COMMIT_STATE:
+            count = int(self.mesh.size)
+            poison = jax.make_array_from_callback(
+                (count,), NamedSharding(self.mesh, P(tuple(self.mesh.axis_names))),
+                lambda index: np.ones((count,), dtype=np.int32)[index])
+            self.write_slab(name, poison)
+            self._drain_pending()
+    _FfiBackend.create_dataset = poison_receipt
+elif args.mode == 'marker_failure':
+    from common.async_io import AsyncDispatcher
+    original_submit = AsyncDispatcher.submit
+    def fail_initialization(self, task):
+        def queued():
+            task()
+            if rank == 1:
+                raise OSError('injected receipt initialization write failure')
+        original_submit(self, queued)
+    AsyncDispatcher.submit = fail_initialization
+
 started = time.monotonic()
 error = None
 try:
@@ -79,8 +104,12 @@ except (RuntimeError, ValueError) as exc:
     error = str(exc)
     assert 'GATE io_global_commit' in error, error
     assert str(path if args.mode != 'rank0_failure' else out) in error
-    if args.mode == 'slab_failure':
+    if args.mode in {'slab_failure', 'marker_failure'}:
         assert 'stage=SlabIO.data_close; failing rank=1' in error
+        if args.mode == 'marker_failure':
+            with h5py.File(path, 'r') as f:
+                assert int(f[COMMIT_STATE][0]) == 0
+                assert 'V_qmunu' not in f
     elif args.mode == 'metadata_failure':
         assert 'stage=SlabIO.metadata_commit; failing rank=0' in error
     elif args.mode == 'rank0_failure':
