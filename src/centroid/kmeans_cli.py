@@ -14,8 +14,6 @@ from __future__ import annotations
 import argparse
 
 
-_DEFAULT_PRUNE_TIME_BUDGET_SECONDS = 900.0
-
 # ─────────────────────────────────────────────────────────────────────────
 # Arg parser
 # ─────────────────────────────────────────────────────────────────────────
@@ -48,13 +46,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="k-means runs for ⌈N_c·oversample⌉ then prunes via "
                         "pivoted Cholesky (default 1.5). Set to 1.0 to "
                         "disable pivoted-Cholesky pruning.")
-    p.add_argument(
-        "--prune-time-budget-seconds", type=float,
-        default=_DEFAULT_PRUNE_TIME_BUDGET_SECONDS,
-        help="Finite wall-time budget for pivoted-Cholesky lowering, "
-             "compilation, and execution (default 900 s). A budget expiry "
-             "writes a phase-named refusal and terminates every rank without "
-             "waiting for distributed backend teardown.")
     p.add_argument("--prune-n-val", type=int, default=None,
                    help="Override pivoted-Cholesky n_val (default = wfn.nelec).")
     p.add_argument("--prune-n-cond", type=int, default=None,
@@ -428,9 +419,6 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
                     else "charge"),
         k_weights=full_k_quadrature_weights(wfn, sym),
         verbose=(debug_print_enabled() and process_rank() == 0),
-        select_time_budget_s=getattr(
-            args, "prune_time_budget_seconds",
-            _DEFAULT_PRUNE_TIME_BUDGET_SECONDS),
         progress_print_fn=rank0_print,
     )
     if args.prune_window == "v_x_vc":

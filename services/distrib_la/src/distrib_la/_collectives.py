@@ -12,6 +12,8 @@ it, which is this one: the cuSOLVERMp context bootstrap ships an
 from __future__ import annotations
 
 import os
+import sys
+import time
 
 import numpy as np
 from lxkit import device_put_process_local
@@ -20,8 +22,33 @@ __all__ = ["broadcast_bytes", "device_put_process_local",
            "warm_mesh_cliques"]
 
 
-def broadcast_bytes(buf: np.ndarray, *, key: str,
-                    timeout_ms: int = 60_000) -> np.ndarray:
+_BOOTSTRAP_HEARTBEAT_MS = 60_000
+
+
+def _wait_for_bootstrap(client, key: str, rank: int) -> str:
+    """Wait for rank 0's opaque payload; only retry the KV client's timeout.
+
+    Service-local sibling of common.jax_compile_cache's wait: distrib_la is
+    independently installable and cannot import LORRAX's common package.
+    Walltime belongs to the whole-step supervisor, never an arriving rank.
+    """
+    from jax.errors import JaxRuntimeError
+
+    started = time.monotonic()
+    while True:
+        try:
+            return client.blocking_key_value_get(key, _BOOTSTRAP_HEARTBEAT_MS)
+        except (TimeoutError, JaxRuntimeError) as exc:
+            if not isinstance(exc, TimeoutError) and not str(exc).startswith(
+                    "DEADLINE_EXCEEDED:"):
+                raise
+            print(
+                f"[cuSOLVERMp bootstrap] rank={rank} still waiting for rank 0 "
+                f"to publish NCCL ID key={key} "
+                f"({time.monotonic() - started:.0f} s elapsed)", file=sys.stderr, flush=True)
+
+
+def broadcast_bytes(buf: np.ndarray, *, key: str) -> np.ndarray:
     """Broadcast a ``uint8`` numpy buffer from rank 0 to all JAX processes.
 
     Byte-exact, and that is the whole point.  Under
@@ -45,7 +72,8 @@ def broadcast_bytes(buf: np.ndarray, *, key: str,
     client = global_state.client
     if int(jax.process_index()) == 0:
         client.key_value_set(key, buf.tobytes().hex())
-    payload = bytes.fromhex(client.blocking_key_value_get(key, timeout_ms))
+    payload = bytes.fromhex(_wait_for_bootstrap(
+        client, key, int(jax.process_index())))
     if len(payload) != buf.size:
         raise RuntimeError(
             f"broadcast_bytes: received {len(payload)} bytes, "
