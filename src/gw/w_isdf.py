@@ -1515,7 +1515,8 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
 
     The q axis may be full-BZ or an irreducible wedge; its mapping belongs to
     the screening/MPA caller.  The two centroid axes, however, must be one
-    square canonical product-padded carrier shared by V and chi.
+    square runtime carrier shared by V and chi, owned by the packed basis
+    when present or by the canonical suffix-padding receipt otherwise.
     """
     v_shape = tuple(int(n) for n in V_q.shape)
     chi_shape = tuple(int(n) for n in chi0_q.shape)
@@ -1530,7 +1531,9 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
             f"got V_q.shape=chi0_q.shape={v_shape}.")
     n_logical = (int(getattr(meta, 'mu_solve_extent', meta.n_rmu))
                  if n_rmu_logical is None else int(n_rmu_logical))
-    mu_axis = padded_mu_axis(n_logical, mesh_xy)
+    basis = getattr(meta, "mu_basis", None)
+    mu_axis = (basis.solve_axis if basis is not None and n_rmu_logical is None
+               else padded_mu_axis(n_logical, mesh_xy))
     authenticate_padded_axis(
         mu_axis.logical, v_shape[1], mu_axis,
         name="Dyson row-centroid carrier")
@@ -1546,8 +1549,8 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
-    Scalar inputs must use the one canonical in-memory carrier extent
-    ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  Their q axis may be full-BZ
+    Scalar inputs use ``meta.mu_basis``'s packed runtime extent when present,
+    otherwise ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  Their q axis may be full-BZ
     or an irreducible wedge; q-set ownership stays with the caller.  A packed
     direct-sum caller supplies ``n_rmu_logical`` explicitly because its
     channel padding is internal rather than one trailing scalar prefix.  The

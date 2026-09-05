@@ -4,17 +4,17 @@ Every centroid axis a gwjax run computes on (ψ faces, Z_q, C_q, ζ(μ,G), V,
 χ0, W, pole residues, G, Σ) is in the ORBIT-PACKED order of
 :mod:`common.grouped_layout`: complete symmetry orbits live on one X (or Y)
 shard so every symmetry action is a rank-local gather, and each shard ends in
-exact-zero pad slots.  Files keep the CANONICAL centroid-file order, suffix
-padded to the mesh multiple (``runtime.padding.padded_mu_axis``), so a
-restart file is processor-grid agnostic.  This object owns the packed order
+exact-zero pad slots. Files keep the CANONICAL centroid-file order at the
+logical extent. Their in-memory I/O staging carrier is suffix padded to the
+mesh multiple (``runtime.padding.padded_mu_axis``); no processor padding is
+persisted.  This object owns the packed order
 and the two conversions, which are legal only at the I/O seam: a reader
 packs what it read, a writer unpacks what it is about to write.  Nothing
 between the seams converts.
 
-The conversions never replicate a centroid axis: each is one
-volume-preserving all-to-all round trip per axis (the same pattern as the
-symmetry service's operator transport), with the extent change done as a
-rank-local prefix pad/crop inside the shard.
+Each device conversion uses an all-to-all round trip per axis. The extent
+change is a rank-local prefix pad/crop; a temporary split-axis pad can be
+needed for divisibility. No all-gather of the input carrier is used.
 """
 from __future__ import annotations
 
@@ -31,27 +31,7 @@ from common.grouped_layout import (
     build_square_grouped_shard_layout,
     identity_square_grouped_shard_layout,
 )
-from runtime.padding import padded_mu_extent, spec_divisor
-
-
-def _shardwise_prefix_map(base_map, canonical: int, n_shards: int) -> np.ndarray:
-    """Re-lay a destination-to-source map so each shard's canonical rows are
-    that shard's OWN prefix (shard ``s`` receives canonical rows
-    ``[s*c, (s+1)*c)`` then its share of the pad rows), so the extent change
-    between the packed and the canonical carrier is a rank-local slice."""
-    base = np.asarray(base_map, dtype=np.int32)
-    extent, canonical, n_shards = int(base.shape[0]), int(canonical), int(n_shards)
-    if extent % n_shards or canonical % n_shards:
-        raise ValueError(
-            "centroid basis: packed and canonical extents must both divide "
-            f"the shard count; got {extent}/{canonical}/{n_shards}.")
-    sh, c = extent // n_shards, canonical // n_shards
-    pads = base[canonical:]
-    out = np.empty((extent,), dtype=np.int32)
-    for s in range(n_shards):
-        out[s * sh: s * sh + c] = base[s * c: (s + 1) * c]
-        out[s * sh + c: (s + 1) * sh] = pads[s * (sh - c): (s + 1) * (sh - c)]
-    return out
+from runtime.padding import PaddedAxis, padded_mu_extent, spec_divisor
 
 
 def _permute_sharded_axis(arr, axis, source_map, mesh, spec, *, pad_to=None,
@@ -72,6 +52,8 @@ def _permute_sharded_axis(arr, axis, source_map, mesh, spec, *, pad_to=None,
     axis_name = names[0] if len(names) == 1 else names
     local = [int(arr.shape[i]) // int(spec_divisor(mesh, spec, i))
              for i in range(ndim)]
+    if ndim < 2:
+        raise ValueError("centroid basis: sharded conversion needs a second axis")
     split = max((i for i in range(ndim) if i != axis), key=lambda i: local[i])
     source = np.asarray(source_map, dtype=np.int32)
 
@@ -121,8 +103,9 @@ class PackedCentroidBasis:
         group, or ``identity=True`` gives the identity layout: the packed
         order IS the canonical suffix-padded order and every conversion is a
         no-op."""
-        idx = np.ascontiguousarray(np.asarray(
-            jax.device_get(centroid_indices), dtype=np.int32))
+        idx = np.array(jax.device_get(centroid_indices), dtype=np.int32,
+                       order="C", copy=True)
+        idx.setflags(write=False)
         shape = tuple(int(mesh_xy.shape[a]) for a in ('x', 'y'))
         groups = None
         if not identity:
@@ -214,17 +197,41 @@ class PackedCentroidBasis:
 
     # ---- device arrays (the I/O seam) --------------------------------------
     @property
-    def _canonical_source_map(self) -> np.ndarray:
-        ax = self.layout.axis
-        source = np.empty((self.n_packed,), dtype=np.int32)
-        source[:self.n_logical] = ax.canonical_to_packed
-        source[self.n_logical:] = np.flatnonzero(~ax.active_mask)
-        return source
+    def solve_axis(self) -> PaddedAxis:
+        """Dense-solve receipt; interleaved pads are inside the solve extent.
+
+        The active-slot mask remains owned by the layout. A prefix receipt
+        must never reinterpret it as the first ``n_logical`` packed slots.
+        """
+        return PaddedAxis(
+            name="centroid solve", logical=(self.n_logical if self.is_identity
+                                            else self.n_packed),
+            carrier=self.n_packed, divisor=int(self.mesh_xy.size))
 
     @lru_cache(maxsize=None)
     def _maps(self, n_shards: int):
-        unpack = _shardwise_prefix_map(
-            self._canonical_source_map, self.n_canonical, n_shards)
+        """Inverse permutations on a common, locally padded I/O carrier.
+
+        Either order can have the larger extent. Embed each original shard
+        as its own prefix in the common carrier, map physical rows by the
+        layout, and pair the remaining zero slots bijectively. Both extent
+        changes are then local pad/crop operations around one permutation.
+        """
+        extent = max(self.n_canonical, self.n_packed)
+        if any(n % n_shards for n in (self.n_canonical, self.n_packed)):
+            raise ValueError("centroid basis: carrier must divide the shard count")
+        slots = np.arange(extent, dtype=np.int32).reshape(n_shards, -1)
+        canonical = slots[:, :self.n_canonical // n_shards].reshape(-1)
+        packed = slots[:, :self.n_packed // n_shards].reshape(-1)
+        dst = canonical[:self.n_logical]
+        src = packed[self.layout.axis.canonical_to_packed]
+        dst_pad = np.ones(extent, dtype=bool)
+        src_pad = np.ones(extent, dtype=bool)
+        dst_pad[dst] = False
+        src_pad[src] = False
+        unpack = np.empty(extent, dtype=np.int32)
+        unpack[dst] = src
+        unpack[dst_pad] = np.flatnonzero(src_pad)
         return unpack, np.argsort(unpack).astype(np.int32)
 
     @staticmethod
@@ -250,7 +257,8 @@ class PackedCentroidBasis:
         _, pack = self._maps(n_shards)
         return _permute_sharded_axis(
             arr, axis, pack, self.mesh_xy, spec,
-            pad_to=self.n_packed // n_shards)
+            pad_to=max(self.n_canonical, self.n_packed) // n_shards,
+            crop_to=self.n_packed // n_shards)
 
     def unpack_axis(self, arr, axis: int, *, spec=None):
         """Packed → canonical suffix-padded carrier, on one sharded axis."""
@@ -266,6 +274,7 @@ class PackedCentroidBasis:
         unpack, _ = self._maps(n_shards)
         return _permute_sharded_axis(
             arr, axis, unpack, self.mesh_xy, spec,
+            pad_to=max(self.n_canonical, self.n_packed) // n_shards,
             crop_to=self.n_canonical // n_shards)
 
     def pack_operator(self, op, *, spec=None):

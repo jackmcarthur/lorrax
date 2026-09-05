@@ -299,7 +299,8 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
             # failure shape) with a loud error.
             from runtime.padding import padded_mu_extent
             n_rmu_log = int(sym_perm.shape[-1])
-            n_rmu_pad = padded_mu_extent(n_rmu_log, int(jax.device_count()))
+            n_rmu_pad = (mu_basis.n_packed if mu_basis is not None else
+                         padded_mu_extent(n_rmu_log, int(jax.device_count())))
             if n_rmu_pad > n_rmu_log:
                 tail = np.broadcast_to(
                     np.arange(n_rmu_log, n_rmu_pad, dtype=sym_perm.dtype),

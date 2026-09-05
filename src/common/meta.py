@@ -64,10 +64,9 @@ class Meta:
     @property
     def mu_solve_extent(self) -> int:
         """μ extent dense solves run at: the whole packed carrier when the
-        pads are interleaved per shard (identity on the pad diagonal keeps
-        them inert), the logical prefix otherwise."""
-        if self.mu_basis is not None and not self.mu_basis.is_identity:
-            return int(self.n_rmu_padded)
+        pads are interleaved per shard, the logical prefix otherwise."""
+        if self.mu_basis is not None:
+            return self.mu_basis.solve_axis.logical
         return int(self.n_rmu)
 
     @property
