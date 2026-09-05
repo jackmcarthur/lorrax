@@ -379,7 +379,7 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
 
 def _fit_rule(
     spec, eps, reduction_seconds, cache_dir, eta, *, cache_build_widen=True,
-    enforce_sup_error=True,
+    enforce_sup_error=True, reduction_steps=None,
 ):
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
@@ -398,7 +398,12 @@ def _fit_rule(
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None and cache_build_widen
                      else requested_box)
-        build_kwargs = {"time_budget": reduction_seconds}
+        # A step budget replaces the wall clock: deterministic across
+        # machines (sigma_quadrature_reduction_steps).
+        build_kwargs = (
+            {"reduction_steps": int(reduction_steps)}
+            if reduction_steps is not None
+            else {"time_budget": reduction_seconds})
         if relative:
             # For a sign-definite rule the service's kappa is
             # sum|term|/|Q|, while Sigma's noise amplification is
@@ -522,7 +527,7 @@ def _parallel_fits(specs, worker):
 
 def fit_sigma_box_specs(
     specs, eta_ry, *, eps, reduction_seconds, cache_dir,
-    cache_build_widen=True, enforce_sup_error=True,
+    cache_build_widen=True, enforce_sup_error=True, reduction_steps=None,
 ):
     """Fit independent route-neutral box specifications across processes.
 
@@ -545,7 +550,8 @@ def fit_sigma_box_specs(
         rows, lambda index: _fit_rule(
             rows[index], tolerance, budget, cache_dir, eta,
             cache_build_widen=bool(cache_build_widen),
-            enforce_sup_error=bool(enforce_sup_error)))
+            enforce_sup_error=bool(enforce_sup_error),
+            reduction_steps=reduction_steps))
 
 
 def _box_contains(outer, inner):
@@ -635,6 +641,7 @@ def _fixed_fit_for_spec(entry, spec):
 
 def _fit_fixed_sc_rules(
     specs, eta, *, eps, reduction_seconds, cache_dir, session,
+    reduction_steps=None,
 ):
     """Fit one padded SC rule set, then reuse those exact nodes.
 
@@ -654,7 +661,7 @@ def _fit_fixed_sc_rules(
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
             cache_dir=cache_dir, cache_build_widen=False,
-            enforce_sup_error=False)
+            enforce_sup_error=False, reduction_steps=reduction_steps)
         rules = {}
         for spec, padded_spec, fit in zip(rows, padded, fits):
             frozen = dict(fit)
@@ -712,7 +719,7 @@ def _fit_fixed_sc_rules(
         new_fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
             cache_dir=cache_dir, cache_build_widen=False,
-            enforce_sup_error=False)
+            enforce_sup_error=False, reduction_steps=reduction_steps)
         for spec, padded_spec, fit in zip(rebuild, padded, new_fits):
             rebuilt = dict(fit)
             rebuilt["cache_status"] = "rebuild:sc-fixed"
@@ -791,6 +798,7 @@ def plan_sigma_windows(
     print_fn=print,
     edge_factor=1.5,
     fixed_rule_session=None,
+    reduction_steps=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -816,6 +824,11 @@ def plan_sigma_windows(
     reduction_seconds
         Per-window Gauss-reduction wall budget.  Independent windows are
         assigned round-robin across processes.
+    reduction_steps
+        ``None`` keeps the wall budget.  An integer replaces it by that
+        many reduction passes per window, so the accepted rule -- and the
+        Σ τ-node count -- is a function of the inputs alone
+        (``sigma_quadrature_reduction_steps``).
     cache_dir
         Directory for immutable box-rule certificates, or ``None``.
     fixed_rule_session
@@ -919,14 +932,20 @@ def plan_sigma_windows(
         branch_reports.append(report)
 
     fixed_receipt = None
+    if reduction_steps is not None and process_rank() == 0:
+        print_fn(
+            f"  Sigma rule reduction: deterministic budget of "
+            f"{int(reduction_steps)} passes per window "
+            "(sigma_quadrature_reduction_seconds ignored)")
     if fixed_rule_session is None:
         fits, fit_rows = fit_sigma_box_specs(
             specs, eta, eps=tolerance, reduction_seconds=budget,
-            cache_dir=cache_dir)
+            cache_dir=cache_dir, reduction_steps=reduction_steps)
     else:
         fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
             specs, eta, eps=tolerance, reduction_seconds=budget,
-            cache_dir=cache_dir, session=fixed_rule_session)
+            cache_dir=cache_dir, session=fixed_rule_session,
+            reduction_steps=reduction_steps)
     if process_rank() == 0:
         announced = set()
         for fit in fits:

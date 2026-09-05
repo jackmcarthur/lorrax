@@ -555,8 +555,13 @@ class _CloudFit:
                 found = (s_t, w_t, res)
         return found
 
-    def reduce(self, s, ok, deadline, batch_frac=0.10, K=6, nstep=60, keep=2):
-        """Gauss-type reduction with lookahead, bounded by ``deadline``.
+    def reduce(self, s, ok, deadline, batch_frac=0.10, K=6, nstep=60, keep=2,
+               max_steps=None):
+        """Gauss-type reduction with lookahead, bounded by ``deadline`` or,
+        when ``max_steps`` is given, by that many loop passes (a batch
+        attempt or a single-removal round each) -- a budget that depends on
+        the inputs alone, not on the clock, so two machines produce the same
+        rule.
 
         The start is first polished to the optimum for its node count; if
         even that is not accepted the caller keeps the interpolatory rule.
@@ -599,7 +604,10 @@ class _CloudFit:
             return None                                             # caller keeps the start
         best = (s.copy(), w.copy())
         batch = max(1, int(batch_frac * s.size))
-        while s.size > 2 and time.perf_counter() < deadline:
+        steps = 0
+        while s.size > 2 and time.perf_counter() < deadline and (
+                max_steps is None or steps < int(max_steps)):
+            steps += 1
             order = np.argsort(self.loo_scores(s, w))
             if batch > 1:
                 drop, protected = [], set()
@@ -1050,7 +1058,7 @@ def _select_backend(backend, n_start, cloud_size):
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
                        reduce=True, time_budget=None, relative=None,
-                       backend=None):
+                       backend=None, reduction_steps=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
 
@@ -1129,7 +1137,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             e_, k_ = _score_cloud(fit, s_, w_, d_check, rho_check)
             return e_ <= eps and k_ <= kappa_cap
 
-        deadline = t0 + (float(time_budget) if time_budget is not None else 1e30)
+        # ``reduction_steps`` makes the budget a pass count: the clock is
+        # ignored and the same inputs give the same rule on any machine.
+        deadline = t0 + (
+            float(time_budget)
+            if time_budget is not None and reduction_steps is None else 1e30)
         # The start must be accepted before anything can be removed.  In the
         # relative currency a loose eps (1e-3) with the default eps/10 basis
         # can leave the near corner of a wide box (R ~ 500) above eps even
@@ -1147,7 +1159,8 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
                                    rho=rho, check_cloud=(d_check, rho_check, eps, kappa_cap))
             else:
                 fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
-            red = fit.reduce(s, ok, deadline)       # start acceptance ignores the deadline
+            red = fit.reduce(s, ok, deadline,       # start acceptance ignores the budget
+                             max_steps=reduction_steps)
             if red is not None:
                 break
         if red is not None:

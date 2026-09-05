@@ -300,7 +300,8 @@ def _integrate_sigma_batches(
             # projection (the spatial tail selects, projects, broadcasts).
             # Bracket packing is not combined with the route.
             (psi_coh_xn, psi_coh_yr,
-             psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
+             psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(
+                wfns, projection="packed")
             pack_brackets = False
         elif bracketed and len(brackets) > 1:
             from gw.wavefunction_bundle import pack_band_window
@@ -369,6 +370,13 @@ def _integrate_sigma_batches(
     sweep_wall_start = None
     stop_probe = False
     for lo, Omega, B, B_odd in batches:
+        if parent_route is not None:
+            # The parent chain runs in PACKED centroid order: pack the
+            # residues once per batch so every W(τ) built from them is
+            # packed too (G is unfolded to packed full k and never restored).
+            B = parent_route.plan.pack_square_operator(B)
+            if B_odd is not None:
+                B_odd = parent_route.plan.pack_square_operator(B_odd)
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
             max_d = max(
@@ -687,6 +695,7 @@ def compute_sigma_c_mpa_omega_grid(
     quadrature_reduction_seconds,
     quadrature_cache_dir,
     omega_grid_step_ry,
+    quadrature_reduction_steps=None,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
@@ -785,6 +794,7 @@ def compute_sigma_c_mpa_omega_grid(
                     regularization_width_ry,
                     eps=quadrature_eps,
                     reduction_seconds=quadrature_reduction_seconds,
+                    reduction_steps=quadrature_reduction_steps,
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
                     fixed_rule_session=fixed_quadrature_session)

@@ -2124,6 +2124,11 @@ _DEFAULTS = {
     # (relative paths are resolved beside the input deck).
     "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_reduction_seconds": 120.0,
+    # Deterministic alternative to the wall budget: an integer number of
+    # reduction passes per window.  Unset keeps the wall budget; set, the
+    # clock is ignored and the accepted rule (hence the Σ τ-node count) is
+    # a function of the deck alone.
+    "sigma_quadrature_reduction_steps": None,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
@@ -2391,6 +2396,7 @@ _NULLABLE_BOOL = frozenset({
 _NULLABLE_INT = frozenset({
     "zeta_nband",
     "mpa_sampling_alpha",
+    "sigma_quadrature_reduction_steps",
     # The band-count family's three "the deck did not say" slots.  They are
     # nullable for the same reason ``zeta_nband`` is — ``None`` has to be
     # distinguishable from any integer a deck could write — and integer for
@@ -4251,6 +4257,8 @@ class DynamicSigmaConfig:
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
     quadrature_eps: float = 1.0e-4
     quadrature_reduction_seconds: float = 120.0
+    #: ``None`` = wall budget; an integer = deterministic pass budget.
+    quadrature_reduction_steps: int | None = None
     quadrature_cache_dir: str = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
@@ -4305,6 +4313,10 @@ class DynamicSigmaConfig:
                 and self.quadrature_reduction_seconds > 0.0):
             raise ValueError(
                 "sigma_quadrature_reduction_seconds must be finite and > 0.")
+        if self.quadrature_reduction_steps is not None and (
+                int(self.quadrature_reduction_steps) < 1):
+            raise ValueError(
+                "sigma_quadrature_reduction_steps must be >= 1 when set.")
         if not str(self.quadrature_cache_dir).strip():
             raise ValueError(
                 "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")
@@ -5475,6 +5487,9 @@ class LorraxConfig:
             quadrature_eps=float(_g("sigma_quadrature_eps")),
             quadrature_reduction_seconds=float(
                 _g("sigma_quadrature_reduction_seconds")),
+            quadrature_reduction_steps=(
+                None if _g("sigma_quadrature_reduction_steps") is None
+                else int(_g("sigma_quadrature_reduction_steps"))),
             quadrature_cache_dir=str(
                 _g("sigma_quadrature_cache_dir")).strip(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
