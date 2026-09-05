@@ -3218,10 +3218,16 @@ def prepare_isdf_and_wavefunctions(
 	transverse_basis_receipt = None
 	basis_wfn_fingerprint_binding = None
 	charge_zeta_identity_receipt = None
+	coulomb_policy_receipt = None
 	photon_g0_vectors = None
 	green_parent_carrier = None
 
 	if not cfg.restart:
+		# V is constructed in this branch, so the running policy is the policy
+		# of the resident tensor.  Keep the owner's flat receipt beside V for
+		# consumers that need immutable restart/checkpoint provenance.
+		from file_io import coulomb_policy_from_config
+		coulomb_policy_receipt = coulomb_policy_from_config(cfg, meta)
 		# One bounded canonical HDF5 scan supplies every receipt for this
 		# loaded source.  In particular a bispinor run must not reopen/sample
 		# the WFN independently for its charge and transverse identities.
@@ -3616,7 +3622,6 @@ def prepare_isdf_and_wavefunctions(
 				cfg, sym=sym, centroid_indices=centroid_indices,
 				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
-				from file_io import coulomb_policy_from_config
 				from file_io.qp_wfn import (
 					qp_state_source_provenance_from_binding)
 				write_restart_state_to_h5(
@@ -3627,7 +3632,7 @@ def prepare_isdf_and_wavefunctions(
 					# restart and compute_V_q never re-runs, so without this
 					# an averaging-policy change is inherited in silence with
 					# every other guard passing.
-					coulomb_policy=coulomb_policy_from_config(cfg, meta),
+					coulomb_policy=coulomb_policy_receipt,
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
@@ -3820,7 +3825,14 @@ def prepare_isdf_and_wavefunctions(
 			# stored V a legitimate tensor built under another convention,
 			# and which one the operator wants is not this seam's call.
 			# What is removed is the silence.
-			from file_io import describe_coulomb_policy_match
+			from file_io import (describe_coulomb_policy_match,
+			                     read_coulomb_policy_from_h5)
+			# The resident V came from the restart, not the running config.  Its
+			# stored construction policy is therefore the only honest receipt.
+			# Legacy absence remains None so provenance-strict consumers can
+			# refuse; established restart consumers retain warning-only policy.
+			coulomb_policy_receipt = read_coulomb_policy_from_h5(
+				tensors_filename)
 			print0(describe_coulomb_policy_match(tensors_filename, cfg, meta))
 			# Restart is the seam where "rc=0 but garbage" was born (job
 			# 7874375: a changed band window silently reused tensors built
@@ -4103,6 +4115,9 @@ def prepare_isdf_and_wavefunctions(
 		# same WFN.  Legacy restart bundles legitimately carry ``None``.
 		wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
 		charge_zeta_identity=charge_zeta_identity_receipt,
+		# The policy of the resident V: running policy for a fresh build,
+		# immutable file stamp for a restart.  None names a legacy unstamped V.
+		coulomb_policy=coulomb_policy_receipt,
 		# Host-only provenance stays in these orchestration bindings rather
 		# than entering Wavefunctions' JAX pytree.  QP rotation returns only a
 		# numerical carrier, so it cannot accidentally inherit a DFT binding.
