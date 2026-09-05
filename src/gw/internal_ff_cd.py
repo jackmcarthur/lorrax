@@ -43,9 +43,9 @@ REAL_ESCALATION_STEP_EV = 0.0625
 REAL_QUINTIC_CONTROL_DENOMINATOR = 12.0
 REAL_HARD_MAX_EV = 250.0
 IMAG_MAP_SCALE_EV = 2.5
-IMAG_RULE_NODES = (31, 63, 127)
+IMAG_RULE_NODES = (31, 63, 127, 255)
 IMAG_BASE_RULE_NODES = 63
-IMAG_ESCALATION_RULE_NODES = 127
+IMAG_ESCALATION_RULE_NODES = 255
 CD_CONTROL_TOL_MEV = 0.5
 RESPONSE_WIDTHS_EV = (INTERNAL_FF_CD_RESPONSE_WIDTH_EV,)
 
@@ -109,28 +109,33 @@ def _mapped_imag_rule(n_nodes: int) -> tuple[np.ndarray, np.ndarray]:
 def imag_grid(n_nodes: int = IMAG_ESCALATION_RULE_NODES) -> np.ndarray:
     """Return the exact-static sample followed by nested imaginary nodes.
 
-    The 127-node evaluation order starts with the complete 63-node rule and
-    appends only its 64 new nodes.  Consequently an accepted 31/63 control
-    never evaluates an escalation frequency, while a refusal can resume the
-    same checkpoint without rebuilding any shared ``W(iu)`` sample.
+    Every evaluation order starts with the complete 63-node rule and appends
+    only the new nodes at each requested Gauss--Patterson level.  Thus the
+    255-node order has the complete 127-node order as an exact prefix.  An
+    accepted 31/63 control never evaluates an escalation frequency, while a
+    refusal can resume a checkpoint without rebuilding a shared ``W(iu)``
+    sample.
     """
     n_nodes = int(n_nodes)
-    if n_nodes not in (IMAG_BASE_RULE_NODES, IMAG_ESCALATION_RULE_NODES):
+    supported = tuple(
+        n for n in IMAG_RULE_NODES if n >= IMAG_BASE_RULE_NODES)
+    if n_nodes not in supported:
         raise ValueError(
-            "internal_ff_cd imaginary evaluation grid must use 63 or 127 "
-            f"Gauss--Patterson nodes, got {n_nodes}")
-    base, _ = _mapped_imag_rule(IMAG_BASE_RULE_NODES)
-    if n_nodes == IMAG_BASE_RULE_NODES:
-        return np.concatenate(([0.0], base))
-    full, _ = _mapped_imag_rule(IMAG_ESCALATION_RULE_NODES)
-    base_bits = {np.float64(value).tobytes() for value in base}
-    new = np.asarray([
-        value for value in full
-        if np.float64(value).tobytes() not in base_bits
-    ], np.float64)
-    if new.size != IMAG_ESCALATION_RULE_NODES - IMAG_BASE_RULE_NODES:
-        raise AssertionError("Gauss--Patterson mapped nesting was lost")
-    return np.concatenate(([0.0], base, new))
+            "internal_ff_cd imaginary evaluation grid must use one of "
+            f"{supported} Gauss--Patterson nodes, got {n_nodes}")
+    evaluation = [0.0]
+    seen = set()
+    for level in supported:
+        nodes, _ = _mapped_imag_rule(level)
+        new = [value for value in nodes
+               if np.float64(value).tobytes() not in seen]
+        if len(new) != level - len(seen):
+            raise AssertionError("Gauss--Patterson mapped nesting was lost")
+        evaluation.extend(new)
+        seen.update(np.float64(value).tobytes() for value in nodes)
+        if level == n_nodes:
+            break
+    return np.asarray(evaluation, np.float64)
 
 
 def _real_coverage_max(required_max_ev: float) -> float:
@@ -662,46 +667,136 @@ def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
     return identity
 
 
+def _gp255_predecessor_identity(identity: dict) -> dict:
+    """Build the one accepted schema-3 predecessor of a GP255 checkpoint.
+
+    This is deliberately not a generic identity relaxation.  It recognizes
+    only the default-off-observer GP127 semantics immediately preceding the
+    GP255 append.  All physical inputs, targets, real grids, and numerical
+    parameters other than the appended imaginary rule must remain exact.
+    """
+    if "w_observer_identity" in identity:
+        raise ValueError(
+            "GP255 append migration does not support W-observer identities")
+    legacy = json.loads(json.dumps(identity))
+    parameters = legacy["body_provenance"]["algorithm_parameters"]
+    if parameters.get("imag_rule_nodes") != [31, 63, 127, 255]:
+        raise ValueError(
+            "GP255 append migration requires current rule nodes "
+            "[31, 63, 127, 255]")
+    parameters["imag_rule_nodes"] = [31, 63, 127]
+    if legacy["kind"] == "imaginary":
+        old_grid = imag_grid(127)
+        legacy["grid"] = _array_receipt(old_grid, dtype=np.float64)
+        legacy["grid_n"] = int(old_grid.size)
+        legacy["coefficient_families"] = [
+            "gauss_patterson_31", "gauss_patterson_63",
+            "gauss_patterson_127",
+        ]
+    elif legacy["kind"] != "real":
+        raise ValueError(
+            f"GP255 append migration does not know kind {legacy['kind']!r}")
+    return legacy
+
+
+def _append_gp255_contributions(old: np.ndarray, n_targets: int):
+    """Retain GP31/63/127 exactly and seed GP255 at old nonstatic nodes.
+
+    At a nonzero nested node, the only family-dependent factor in the
+    imaginary contraction is its scalar Patterson weight.  The GP255 value
+    can therefore be obtained algebraically from the retained GP127 value.
+    The static-subtraction coefficient is target/intermediate-state dependent
+    and cannot be recovered this way; the caller must rebuild W(0) once.
+    """
+    old_grid = imag_grid(127)
+    evaluation, names, aligned = _imag_family_plan()
+    if not np.array_equal(evaluation[:old_grid.size], old_grid):
+        raise AssertionError("GP255 evaluation grid lost its exact GP127 prefix")
+    expected = (old_grid.size, 3, int(n_targets))
+    if old.shape != expected:
+        raise ValueError(
+            f"GP255 predecessor contributions {old.shape} != {expected}")
+    expanded = np.zeros(
+        (evaluation.size, len(names), int(n_targets)), np.complex128)
+    expanded[:old_grid.size, :3] = old
+    old_weights = aligned[2, 1:old_grid.size]
+    new_weights = aligned[3, 1:old_grid.size]
+    if np.any(old_weights == 0.0) or np.any(new_weights == 0.0):
+        raise AssertionError("GP127/255 shared-node weights must be nonzero")
+    expanded[1:old_grid.size, 3] = (
+        old[1:, 2] * (new_weights / old_weights)[:, None])
+    return expanded
+
+
 def _load_checkpoint(path: Path, identity, n_targets, family_names, *,
-                     return_stage_timings: bool = False):
+                     return_stage_timings: bool = False,
+                     terminal_prefixes=(), allow_gp255_append: bool = False,
+                     return_migration: bool = False):
     family_names = tuple(str(name) for name in family_names)
     grid_n = int(identity["grid_n"])
     empty_stages = {key: 0.0 for key in STAGE_TIMING_KEYS}
+    migration = None
     if not path.exists():
         contributions = np.zeros(
             (grid_n, len(family_names), n_targets), np.complex128)
         accumulators = [np.zeros(n_targets, np.complex128)
                         for _ in family_names]
         result = (0, contributions, accumulators, 0.0, 0.0)
-        return result + (empty_stages,) if return_stage_timings else result
+        if return_stage_timings:
+            result += (empty_stages,)
+        return result + (migration,) if return_migration else result
     with np.load(path, allow_pickle=False) as data:
         stamped = json.loads(str(np.asarray(data["identity_json"])[()]))
         if stamped != identity:
-            old_schema = stamped.get("schema", "absent")
-            raise ValueError(
-                f"internal_ff_cd checkpoint {path} has stale identity; "
-                f"checkpoint schema={old_schema!r}, required schema="
-                f"{identity.get('schema')!r}. Delete or move the incomplete "
-                "run variant rather than mixing numerical semantics, grids, "
-                "occupations, Coulomb/ISDF receipts, q maps, band carriers, "
-                "or targets. Automatic prefix migration is intentionally "
-                "unavailable without an old-grid prefix and exact-zero "
-                "padded-orbital proof.")
+            predecessor = (_gp255_predecessor_identity(identity)
+                           if allow_gp255_append else None)
+            if stamped != predecessor:
+                old_schema = stamped.get("schema", "absent")
+                raise ValueError(
+                    f"internal_ff_cd checkpoint {path} has stale identity; "
+                    f"checkpoint schema={old_schema!r}, required schema="
+                    f"{identity.get('schema')!r}. Delete or move the "
+                    "incomplete run variant rather than mixing numerical "
+                    "semantics, grids, occupations, Coulomb/ISDF receipts, "
+                    "q maps, band carriers, or targets. The only automatic "
+                    "schema-3 migration is the exact GP127-to-GP255 append.")
+            migration = {
+                "policy": "schema3_exact_gp127_to_gp255_append_v1",
+                "kind": str(identity["kind"]),
+                "source_rule_nodes": [31, 63, 127],
+                "target_rule_nodes": [31, 63, 127, 255],
+                "source_identity_sha256": hashlib.sha256(
+                    json.dumps(stamped, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "target_identity_sha256": hashlib.sha256(
+                    json.dumps(identity, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+            }
         completed = int(np.asarray(data["completed"])[()])
         stamped_families = tuple(json.loads(str(np.asarray(
             data["family_names_json"])[()])))
-        if stamped_families != family_names:
+        expected_families = (tuple(predecessor["coefficient_families"])
+                             if migration is not None else family_names)
+        if stamped_families != expected_families:
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} coefficient families "
-                f"{stamped_families} != {family_names}")
+                f"{stamped_families} != {expected_families}")
         contributions = np.asarray(data["contributions"], np.complex128)
-        expected_shape = (grid_n, len(family_names), n_targets)
+        loaded_grid_n = (int(predecessor["grid_n"])
+                         if migration is not None else grid_n)
+        expected_shape = (
+            loaded_grid_n, len(expected_families), int(n_targets))
         if contributions.shape != expected_shape:
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} contribution shape "
                 f"{contributions.shape} != {expected_shape}")
+        accepted_prefixes = {int(value) for value in terminal_prefixes}
         if completed < 0 or completed > grid_n or (
-                completed % FREQUENCY_BATCH != 0 and completed != grid_n):
+                completed % FREQUENCY_BATCH != 0
+                and completed != loaded_grid_n
+                and completed not in accepted_prefixes):
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} has invalid completed="
                 f"{completed}")
@@ -719,6 +814,40 @@ def _load_checkpoint(path: Path, identity, n_targets, family_names, *,
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} contribution receipt "
                 "does not match its completed prefix")
+        if migration is not None:
+            if (identity["kind"] == "imaginary"
+                    and completed != loaded_grid_n):
+                raise ValueError(
+                    "GP255 append migration requires a complete predecessor "
+                    f"checkpoint, got {completed}/{loaded_grid_n}")
+            if (identity["kind"] == "real"
+                    and completed not in accepted_prefixes
+                    and completed != loaded_grid_n):
+                raise ValueError(
+                    "GP255 append migration requires a certified real "
+                    f"terminal prefix, got {completed}/{loaded_grid_n}")
+            migration["source_completed"] = int(completed)
+            migration["source_contributions_receipt"] = actual_receipt
+            if identity["kind"] == "imaginary":
+                contributions = _append_gp255_contributions(
+                    contributions, n_targets)
+                migration["retained_128x3_prefix_receipt"] = _array_receipt(
+                    contributions[:loaded_grid_n, :3])
+                if (migration["retained_128x3_prefix_receipt"]
+                        != actual_receipt):
+                    raise AssertionError(
+                        "GP255 migration changed the retained GP127 prefix")
+                migration["static_refresh_required"] = True
+            else:
+                migration["retained_real_payload_receipt"] = _array_receipt(
+                    contributions[:completed])
+                if migration["retained_real_payload_receipt"] != actual_receipt:
+                    raise AssertionError(
+                        "GP255 migration changed the real payload")
+                migration["static_refresh_required"] = False
+        elif "migration_receipt_json" in data:
+            migration = json.loads(str(np.asarray(
+                data["migration_receipt_json"])[()]))
         accum = contributions[:completed].sum(axis=0)
         result = (completed, contributions, [row.copy() for row in accum],
                   float(np.asarray(data["chi_wall_seconds"])[()]),
@@ -740,12 +869,15 @@ def _load_checkpoint(path: Path, identity, n_targets, family_names, *,
                    for value in stages.values()):
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} has invalid stage timing")
-        return result + (stages,) if return_stage_timings else result
+        if return_stage_timings:
+            result += (stages,)
+        return result + (migration,) if return_migration else result
 
 
 def _save_checkpoint(path: Path, identity, completed, contributions,
                      family_names,
-                     chi_wall, solve_contract_wall, *, stage_timings=None):
+                     chi_wall, solve_contract_wall, *, stage_timings=None,
+                     migration_receipt=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     stages = ({key: 0.0 for key in STAGE_TIMING_KEYS}
@@ -755,6 +887,10 @@ def _save_checkpoint(path: Path, identity, completed, contributions,
     with tmp.open("wb") as stream:
         contributions = np.asarray(contributions, np.complex128)
         completed = int(completed)
+        fields = {}
+        if migration_receipt is not None:
+            fields["migration_receipt_json"] = np.asarray(json.dumps(
+                migration_receipt, sort_keys=True))
         np.savez(
             stream,
             identity_json=np.asarray(json.dumps(identity, sort_keys=True)),
@@ -766,6 +902,7 @@ def _save_checkpoint(path: Path, identity, completed, contributions,
             chi_wall_seconds=np.asarray(float(chi_wall), np.float64),
             solve_contract_wall_seconds=np.asarray(
                 float(solve_contract_wall), np.float64),
+            **fields,
             **{key: np.asarray(value, np.float64)
                for key, value in stages.items()})
     os.replace(tmp, path)
@@ -1230,12 +1367,22 @@ def compute_internal_ff_cd(
         identity["coefficient_families"] = list(real_family_names)
         checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.npz"
         (completed, contributions, loaded, chi_wall, solve_contract_wall,
-         stage_wall) = _load_checkpoint(
+         stage_wall, checkpoint_migration) = _load_checkpoint(
             checkpoint, identity, n_targets, real_family_names,
-            return_stage_timings=True)
+            return_stage_timings=True,
+            terminal_prefixes=(real_base_stop, rgrid.size),
+            allow_gp255_append=True, return_migration=True)
         if observer is not None:
             observer.require_checkpoint_prefix(arm_name, completed)
         del loaded
+        if checkpoint_migration is not None and rank == 0:
+            # Restamp only after the exact predecessor identity and payload
+            # receipt have both been authenticated by _load_checkpoint.
+            _save_checkpoint(
+                checkpoint, identity, completed, contributions,
+                real_family_names, chi_wall, solve_contract_wall,
+                stage_timings=stage_wall,
+                migration_receipt=checkpoint_migration)
         real_resumed_at_frequency = completed
         if rank == 0 and completed:
             print_fn(
@@ -1283,7 +1430,8 @@ def compute_internal_ff_cd(
                     _save_checkpoint(
                         checkpoint, identity, hi, contributions,
                         real_family_names, chi_seconds, solve_seconds,
-                        stage_timings=stage_wall)
+                        stage_timings=stage_wall,
+                        migration_receipt=checkpoint_migration)
                 if rank == 0 and (hi == stop or hi % 50 < FREQUENCY_BATCH):
                     print_fn(
                         f"  internal_ff_cd real eta_W={width:g} eV: "
@@ -1323,6 +1471,7 @@ def compute_internal_ff_cd(
             "sha256": _hash_array(rgrid),
             "frequency_batch": FREQUENCY_BATCH,
             "checkpoint": str(checkpoint),
+            "checkpoint_migration": checkpoint_migration,
             "resumed_at_frequency": real_resumed_at_frequency,
             "chi_wall_seconds": chi_wall,
             "solve_contract_wall_seconds": solve_contract_wall,
@@ -1344,9 +1493,11 @@ def compute_internal_ff_cd(
     identity["coefficient_families"] = list(imag_family_names)
     checkpoint = checkpoint_dir / "imaginary.npz"
     (completed, contributions, loaded, chi_wall, solve_contract_wall,
-     stage_wall) = _load_checkpoint(
+     stage_wall, checkpoint_migration) = _load_checkpoint(
         checkpoint, identity, n_targets, imag_family_names,
-        return_stage_timings=True)
+        return_stage_timings=True,
+        terminal_prefixes=(1 + IMAG_BASE_RULE_NODES, igrid.size),
+        allow_gp255_append=True, return_migration=True)
     imag_resumed_at_frequency = completed
     if observer is not None:
         observer.require_checkpoint_prefix(arm_name, completed)
@@ -1356,6 +1507,34 @@ def compute_internal_ff_cd(
             f"  internal_ff_cd resume imaginary: {completed}/{len(igrid)} "
             f"frequencies from {checkpoint}")
     t_arm = time.perf_counter()
+    if (checkpoint_migration is not None
+            and checkpoint_migration.get("static_refresh_required")):
+        # GP255's nonstatic shared-node rows are exact scalar rescalings of
+        # retained GP127 rows.  Its static-subtraction coefficient is not, so
+        # this is the sole predecessor frequency that must be rebuilt.
+        t_batch = time.perf_counter()
+        static_rows = [_imag_coefficients(
+            0, evaluation=igrid, angle_weights=imag_angle_weights,
+            static_coefficients=imag_static_coeff,
+            x_signed=x_signed)[None, ...]]
+        values, t_after_chi, stage_batch = frequency_batch(
+            np.asarray([0.0j], np.complex128), static_rows,
+            derivative_order=0)
+        chi_wall += t_after_chi - t_batch
+        solve_contract_wall += time.perf_counter() - t_after_chi
+        for key in STAGE_TIMING_KEYS:
+            stage_wall[key] += stage_batch[key]
+        contributions[0, -1] = values[0][-1]
+        checkpoint_migration["static_refresh_required"] = False
+        checkpoint_migration["static_refresh_frequency_evaluations"] = 1
+        checkpoint_migration["gp255_static_contribution_receipt"] = (
+            _array_receipt(contributions[0, -1]))
+        if rank == 0:
+            _save_checkpoint(
+                checkpoint, identity, completed, contributions,
+                imag_family_names, chi_wall, solve_contract_wall,
+                stage_timings=stage_wall,
+                migration_receipt=checkpoint_migration)
     def advance_imaginary(stop, start, chi_seconds, solve_seconds):
         for lo in range(start, stop, FREQUENCY_BATCH):
             hi = min(lo + FREQUENCY_BATCH, stop)
@@ -1389,7 +1568,8 @@ def compute_internal_ff_cd(
                 _save_checkpoint(
                     checkpoint, identity, hi, contributions,
                     imag_family_names, chi_seconds, solve_seconds,
-                    stage_timings=stage_wall)
+                    stage_timings=stage_wall,
+                    migration_receipt=checkpoint_migration)
             if rank == 0 and (hi == stop or hi % 50 < FREQUENCY_BATCH):
                 print_fn(
                     f"  internal_ff_cd imaginary: {hi}/{len(igrid)} "
@@ -1412,9 +1592,8 @@ def compute_internal_ff_cd(
             igrid.size, completed, chi_wall, solve_contract_wall)
     all_accum = contributions[:completed].sum(axis=0)
     if escalated:
-        imag_accum, imag_coarse = all_accum[2], all_accum[1]
-        imag_rule_pair = [IMAG_BASE_RULE_NODES,
-                          IMAG_ESCALATION_RULE_NODES]
+        imag_accum, imag_coarse = all_accum[-1], all_accum[-2]
+        imag_rule_pair = [IMAG_RULE_NODES[-2], IMAG_RULE_NODES[-1]]
     else:
         imag_accum, imag_coarse = all_accum[1], all_accum[0]
         imag_rule_pair = [IMAG_RULE_NODES[0], IMAG_BASE_RULE_NODES]
@@ -1428,6 +1607,7 @@ def compute_internal_ff_cd(
         "sha256": _hash_array(igrid),
         "frequency_batch": FREQUENCY_BATCH,
         "checkpoint": str(checkpoint),
+        "checkpoint_migration": checkpoint_migration,
         "resumed_at_frequency": imag_resumed_at_frequency,
         "chi_wall_seconds": chi_wall,
         "solve_contract_wall_seconds": solve_contract_wall,
