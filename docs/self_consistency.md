@@ -215,6 +215,24 @@ evidence that the sampled map is not contracting. It does not change damping,
 convergence, refusal, or any other control decision (TASTE 59); pitfall 9's
 budget rule still owns when a run stops.
 
+**14. The accelerator must see the same state set as the criterion.** The
+rCROP carry is the whole active window in the DFT basis, but the scissored
+bands are re-derived from their own (alpha, beta) refit each map and move by
+electron-volts per map (Na eta=0.5, 86 bands on a [-15,+18] eV grid: bands
+41-86 at 30-96 eV moved 0.7-3.9 eV per map while the in-range bands 5-10 moved
+35-70 meV). When those entries entered the least squares, the accelerator's
+trials wandered (entry mu 2.09 eV at map 2, in-range residual 3.7 eV). The
+Gram and the residual norms are now taken over the non-scissored block only,
+the outer product of the initial ``protected | in_range`` mask; the update
+still mixes the full carry and the scissored rows keep following the map. A
+full window (a semiconductor with every band in range) has weights of exactly
+1.0 and is bit identical to the unweighted solve. The log line is
+``SC rCROP metric: Gram over the non-scissored block only (bands a-b, n of nb)``.
+On metals a local gain above 1 can remain at Fermi-crossing states, where the
+exchange term responds to an occupation flip under the smearing width; that is
+the physics of the map, not the accelerator, and is read from pitfall 13's
+line.
+
 ## Evidence
 
 Sandbox reports (paths under
