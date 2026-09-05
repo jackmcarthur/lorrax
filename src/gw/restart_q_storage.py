@@ -112,6 +112,10 @@ class RestartQStorage:
         ``capture is None`` is NOT demoted — that is a plumbing failure, not
         a structural fact, and the writer refuses it by name.
         """
+        if capture is not None:
+            # Files keep the canonical centroid order; the producer's block
+            # is in the run's packed order.  Convert once, here, at the seam.
+            capture = capture.canonical()
         if capture is None or self.mode != "ibz":
             return dataclasses.replace(self, capture=capture)
         import numpy as np
@@ -340,6 +344,32 @@ class PreUnfoldCapture:
     sym_perm: object
     L_table: object
     n_sym_spatial: int
+    #: The run's packed centroid order the block and its tables are in
+    #: (``common.centroid_basis``); ``None`` means canonical already.
+    mu_basis: object = None
+
+    def canonical(self) -> "PreUnfoldCapture":
+        """This capture in the canonical centroid order the file stores:
+        the block unpacked at the I/O seam, its tables un-conjugated, so the
+        writer's cross-check still compares the producer's own tables."""
+        if self.mu_basis is None:
+            return self
+        basis = self.mu_basis
+        perm, L = basis.unpack_tables(self.sym_perm, self.L_table)
+        # The writer strips the pad from the padded tables; give it the
+        # canonical suffix-padded form the pre-packed producers always had.
+        n_pad = int(basis.n_canonical) - int(basis.n_logical)
+        if n_pad:
+            import numpy as np
+            tail = np.broadcast_to(
+                np.arange(basis.n_logical, basis.n_canonical, dtype=perm.dtype),
+                (perm.shape[0], n_pad))
+            perm = np.concatenate([perm, tail], axis=-1)
+            L = np.concatenate(
+                [L, np.zeros((L.shape[0], n_pad, 3), dtype=L.dtype)], axis=1)
+        return dataclasses.replace(
+            self, X_ibz=basis.unpack_operator(self.X_ibz),
+            sym_perm=perm, L_table=L, mu_basis=None)
 
     def tables(self):
         """A ``symmetry_maps.QirrTables`` for this capture.
@@ -384,7 +414,7 @@ def capture_scope():
 
 def deposit_pre_unfold(name, X_ibz, *, n_rmu_logical,
                        q_irr_frac, irr_idx_q, sym_idx_q, sym_perm, L_table,
-                       n_sym_spatial):
+                       n_sym_spatial, mu_basis=None):
     """Offer the pre-unfold block for whoever is writing the restart file.
 
     Called from the unfold sites, which do not know and MUST NOT know
@@ -399,7 +429,8 @@ def deposit_pre_unfold(name, X_ibz, *, n_rmu_logical,
         name=str(name), X_ibz=X_ibz,
         n_rmu_logical=int(n_rmu_logical), q_irr_frac=q_irr_frac,
         irr_idx_q=irr_idx_q, sym_idx_q=sym_idx_q, sym_perm=sym_perm,
-        L_table=L_table, n_sym_spatial=int(n_sym_spatial))
+        L_table=L_table, n_sym_spatial=int(n_sym_spatial),
+        mu_basis=mu_basis)
 
 
 def take_pre_unfold(name):

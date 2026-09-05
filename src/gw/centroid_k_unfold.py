@@ -7,8 +7,9 @@ This module is the GW adapter between three existing owners:
 * :mod:`common.grouped_layout` owns reversible whole-orbit packing.
 
 It contains no independent symmetry algebra.  A plan is immutable host
-metadata plus small device helpers: pack a centroid axis once, contract on
-raw WFN parent k rows, then unfold the resulting two-endpoint operator.
+metadata plus one device helper: contract on raw WFN parent k rows in the
+run's orbit-packed centroid order (``common.centroid_basis``), then unfold
+the resulting two-endpoint operator to full k, still in that order.
 """
 from __future__ import annotations
 
@@ -32,7 +33,6 @@ from symmetry_maps import (
     centroid_source_map_and_wrap,
     permutation_orbit_labels,
     real_space_orbit_labels,
-    reorder_isdf_operator_basis,
     unfold_spin_centroid_operator,
 )
 
@@ -71,57 +71,6 @@ def parent_k_contraction_profitable(
     return avoided >= _MIN_AVOIDED_BAND_WORK
 
 
-def _shardwise_prefix_map(base_map, canonical: int, n_shards: int) -> np.ndarray:
-    """Re-lay a destination-to-source map so each shard's canonical rows are
-    that shard's OWN prefix.
-
-    ``base_map`` puts the ``canonical`` kept rows at the global prefix and
-    the pad rows at the global suffix.  Cropping THAT layout to ``canonical``
-    is not shard-aligned (Si: 836 of 840 rows, 420 per X shard), and XLA
-    lowers the global slice as an all-gather of the whole axis on every rank
-    (KNOWN_LORRAX_ISSUES 2026-09-05, HLO module 0250).  Here shard ``s``
-    receives canonical rows ``[s*c, (s+1)*c)`` followed by its share of the
-    pad rows, so the crop becomes a rank-local slice
-    (:func:`_local_prefix_crop`) and the axis is never replicated.
-    """
-    base = np.asarray(base_map, dtype=np.int32)
-    extent = int(base.shape[0])
-    canonical = int(canonical)
-    n_shards = int(n_shards)
-    if extent % n_shards or canonical % n_shards:
-        raise ValueError(
-            "shard-wise canonical crop needs both the packed and the "
-            f"canonical extent divisible by the shard count; got packed "
-            f"{extent}, canonical {canonical}, shards {n_shards}.")
-    sh, c = extent // n_shards, canonical // n_shards
-    pads = base[canonical:]
-    out = np.empty((extent,), dtype=np.int32)
-    for sidx in range(n_shards):
-        out[sidx * sh: sidx * sh + c] = base[sidx * c: (sidx + 1) * c]
-        out[sidx * sh + c: (sidx + 1) * sh] = pads[
-            sidx * (sh - c): (sidx + 1) * (sh - c)]
-    return out
-
-
-def _local_prefix_crop(operator, mesh_xy: Mesh, *, left=None, right=None):
-    """Keep each rank's own prefix on the sharded endpoint(s) of a
-    ``P(None,'x','y')`` operator.  A slice inside ``shard_map`` is
-    rank-local; the same slice on the global array to a non-shard-aligned
-    extent makes XLA all-gather the axis first."""
-    from common.shard_map import shard_map
-    spec = P(None, 'x', 'y')
-
-    def body(x):
-        if left is not None:
-            x = x[:, :int(left), :]
-        if right is not None:
-            x = x[:, :, :int(right)]
-        return x
-
-    return shard_map(body, mesh=mesh_xy, in_specs=spec, out_specs=spec,
-                     check_vma=False)(operator)
-
-
 def _readonly(value, dtype) -> np.ndarray:
     out = np.array(value, dtype=dtype, copy=True)
     out.setflags(write=False)
@@ -148,7 +97,6 @@ class CentroidKUnfoldPlan:
     spin_action_full: np.ndarray
     n_sym_spatial: int
     nspinor: int
-    canonical_centroid_extent: int
     #: The spatial Seitz rows and FFT grid the centroid tables were built
     #: from, kept so real-grid tiles for the ζ-fit RHS are closed under the
     #: SAME action.  ``None`` only on hand-assembled test plans.
@@ -206,31 +154,6 @@ class CentroidKUnfoldPlan:
             target_width=int(target_width),
             shard_multiple=int(self.mesh_xy.shape['x']))
 
-    def restore_left_basis(self, operator_packed):
-        """Packed→canonical on the LEFT (centroid) axis of ``(q, mu, r)``.
-
-        The ζ-fit RHS leaves its r endpoint in tile order (the solve does not
-        care which r is which) and needs only its centroid axis in the
-        canonical order the factor ``C`` was formed in.  One x-axis exchange,
-        then the known-zero owner-pad rows are cropped, exactly as
-        :meth:`finish_green` does on both axes.
-        """
-        packed = jnp.asarray(operator_packed)
-        if packed.ndim != 3:
-            raise ValueError(
-                "CentroidKUnfoldPlan.restore_left_basis requires a rank-three "
-                f"(q, mu, r) operator; got {packed.shape}.")
-        n_x = int(self.mesh_xy.shape['x'])
-        target = int(self.canonical_centroid_extent)
-        reordered = reorder_isdf_operator_basis(
-            packed,
-            left_source_map=_shardwise_prefix_map(
-                self._canonical_source_map(), target, n_x),
-            right_source_map=None,
-            mesh_xy=self.mesh_xy)
-        # Each X shard now holds its canonical rows as a prefix: crop locally.
-        return _local_prefix_crop(reordered, self.mesh_xy, left=target // n_x)
-
     @property
     def n_full(self) -> int:
         return int(self.irr_idx.shape[0])
@@ -273,112 +196,6 @@ class CentroidKUnfoldPlan:
             source[unused] = 0
         return jnp.take(src, jnp.asarray(source), axis=axis)
 
-    def pack_centroid_axis(self, array, *, axis: int, spec: P):
-        """Pack one canonical centroid axis and zero every padding row."""
-        src = jnp.asarray(array)
-        axis = int(axis) % src.ndim
-        logical = self.n_centroid_logical
-        if int(src.shape[axis]) < logical:
-            raise ValueError(
-                "CentroidKUnfoldPlan.pack_centroid_axis: source centroid "
-                f"extent {src.shape[axis]} is smaller than {logical}.")
-        packed_to_canonical = self.layout.axis.packed_to_canonical
-        active = packed_to_canonical >= 0
-        gather = np.where(active, packed_to_canonical, 0).astype(np.int32)
-        out = jnp.take(src, jnp.asarray(gather), axis=axis)
-        mask_shape = [1] * out.ndim
-        mask_shape[axis] = self.n_centroid_packed
-        out = jnp.where(
-            jnp.asarray(active).reshape(mask_shape), out,
-            jnp.asarray(0, dtype=out.dtype))
-        return jax.lax.with_sharding_constraint(
-            out, NamedSharding(self.mesh_xy, spec))
-
-    def pack_square_operator(self, operator):
-        """Pack BOTH centroid axes (the last two) of a ``(..., mu, mu)``
-        operator into the orbit-packed order, pad rows zero, sharded
-        ``P(..., 'x', 'y')``.  One-time per operand: the dynamic Σ chain on
-        the parent route runs entirely in packed order (G is unfolded to
-        packed full k and never restored per τ node), so the screened
-        interaction's residues follow it once."""
-        arr = jnp.asarray(operator)
-        lead = (None,) * (int(arr.ndim) - 2)
-        out = self.pack_centroid_axis(
-            arr, axis=arr.ndim - 2, spec=P(*lead, 'x', None))
-        return self.pack_centroid_axis(
-            out, axis=arr.ndim - 1, spec=P(*lead, 'x', 'y'))
-
-    def pack_face_pair(self, psi_nmu, psi_mun):
-        """Pack raw-parent face operands without changing their roles."""
-        if int(psi_nmu.shape[0]) != self.n_parent:
-            raise ValueError(
-                "CentroidKUnfoldPlan.pack_face_pair: psi_nmu k extent "
-                f"{psi_nmu.shape[0]} != n_parent={self.n_parent}.")
-        if int(psi_mun.shape[0]) != self.n_parent:
-            raise ValueError(
-                "CentroidKUnfoldPlan.pack_face_pair: psi_mun k extent "
-                f"{psi_mun.shape[0]} != n_parent={self.n_parent}.")
-        return (
-            self.pack_centroid_axis(
-                psi_nmu, axis=3, spec=P(None, 'x', None, 'y')),
-            self.pack_centroid_axis(
-                psi_mun, axis=2, spec=P(None, None, 'x', 'y')),
-        )
-
-    @property
-    def supports_canonical_bridge(self) -> bool:
-        """Whether the canonical basis is a prefix after packed reordering.
-
-        The square grouped layout pads to a complete-mesh multiple, while the
-        canonical carrier uses the smallest complete-mesh multiple covering
-        the logical rows.  Orbit imbalance can therefore make the packed
-        extent larger, never smaller.  Reorder at the packed extent first;
-        the surplus rows are then known-zero shard padding and may be cropped
-        with both operator axes still distributed.
-        """
-        canonical = int(self.canonical_centroid_extent)
-        complete_mesh = int(self.mesh_xy.size)
-        from runtime.padding import padded_axis
-        return (
-            canonical >= self.n_centroid_logical
-            and canonical <= self.n_centroid_packed
-            and padded_axis(
-                canonical, complete_mesh,
-                name="canonical centroid bridge").carrier == canonical
-            and padded_axis(
-                self.n_centroid_packed, complete_mesh,
-                name="packed centroid bridge").carrier
-            == self.n_centroid_packed
-        )
-
-    def _canonical_source_map(self) -> np.ndarray:
-        """Complete destination-to-source map, including padding rows."""
-        canonical = int(self.canonical_centroid_extent)
-        if (canonical < self.n_centroid_logical
-                or canonical > self.n_centroid_packed):
-            raise ValueError(
-                "CentroidKUnfoldPlan: canonical centroid extent must cover "
-                "the logical basis and not exceed the orbit-packed extent; "
-                "got logical/packed/canonical="
-                f"{self.n_centroid_logical}/{self.n_centroid_packed}/"
-                f"{self.canonical_centroid_extent}.")
-        from runtime.padding import authenticate_padded_axis
-        authenticate_padded_axis(
-            self.n_centroid_logical, canonical, self.mesh_xy,
-            name="canonical centroid unfold carrier")
-        authenticate_padded_axis(
-            self.n_centroid_packed, self.n_centroid_packed, self.mesh_xy,
-            name="orbit-packed centroid unfold carrier")
-        extent = self.n_centroid_packed
-        logical = self.n_centroid_logical
-        source = np.empty((extent,), dtype=np.int32)
-        source[:logical] = self.layout.axis.canonical_to_packed
-        packed_pad = np.flatnonzero(~self.layout.axis.active_mask)
-        if packed_pad.size != extent - logical:
-            raise AssertionError("packed/canonical padding cardinality drift")
-        source[logical:] = packed_pad
-        return source
-
     def unfold_operator(self, operator_parent):
         """Transport ``(k_parent,s,mu,s,nu)`` to full k locally."""
         return unfold_spin_centroid_operator(
@@ -393,101 +210,13 @@ class CentroidKUnfoldPlan:
             mesh_xy=self.mesh_xy,
             # Grouped-layout padding is a suffix of EACH owner shard, not a
             # single global suffix.  The packed source maps permute those pad
-            # rows among themselves and pack_centroid_axis made them exactly
-            # zero, so the prefix-mask convention of the generic service is
-            # neither needed nor correct here.  Treat the complete packed
-            # extent as active for transport; finish_green removes the known
-            # pad rows after restoring canonical order.
+            # rows among themselves and the loader made them exactly zero, so
+            # the prefix-mask convention of the generic service is neither
+            # needed nor correct here: the complete packed extent is active.
             logical_centroid_extent=self.n_centroid_packed,
             axis_local=True,
         )
 
-    def finish_green(self, operator_parent):
-        """Unfold parent k locally, then restore today's canonical basis.
-
-        The one-time basis move is the bring-up bridge while V/W and
-        projection remain in canonical centroid order.  It uses the symmetry
-        service's volume-preserving two-axis permutation: every intermediate
-        remains ``P(None,'x','y')`` and no rank materializes a complete
-        centroid axis.  Once those consumers use this same packed plan, the
-        bridge disappears without changing the Green contraction or symmetry
-        algebra.
-        """
-        packed = self.unfold_operator(operator_parent)
-        ns = int(self.nspinor)
-        extent = self.n_centroid_packed
-        source_mu = self._canonical_source_map()
-        spin = np.arange(ns, dtype=np.int32)
-        source_endpoint = (
-            source_mu[:, None] * ns + spin[None, :]).reshape(extent * ns)
-        flat_sharding = NamedSharding(self.mesh_xy, P(None, 'x', 'y'))
-        flat = jax.lax.with_sharding_constraint(
-            jnp.transpose(packed, (0, 2, 1, 4, 3)).reshape(
-                self.n_full, extent * ns, extent * ns),
-            flat_sharding)
-        canonical_flat = self.restore_operator_basis(
-            flat,
-            source_map=source_endpoint,
-            canonical_extent=int(self.canonical_centroid_extent) * ns)
-        canonical_extent = int(self.canonical_centroid_extent)
-        canonical = jnp.transpose(
-            canonical_flat.reshape(
-                self.n_full, canonical_extent, ns,
-                canonical_extent, ns),
-            (0, 2, 1, 4, 3))
-        return jax.lax.with_sharding_constraint(
-            canonical,
-            NamedSharding(self.mesh_xy, P(None, None, 'x', None, 'y')))
-
-    def restore_operator_basis(
-        self,
-        operator_packed,
-        *,
-        source_map=None,
-        canonical_extent=None,
-    ):
-        """Restore one packed ``P(batch,X,Y)`` operator to canonical order.
-
-        Reordering happens before cropping, at the complete packed extent.
-        Thus the only nonlocal operation is the symmetry service's
-        volume-preserving all-to-all backend; surplus owner-padding rows are
-        discarded only after they have been moved to the global suffix.
-        ``source_map``/``canonical_extent`` generalize the scalar-centroid
-        operation to the merged ``(mu,spin)`` endpoints used by Green's
-        functions.
-        """
-        packed = jnp.asarray(operator_packed)
-        if packed.ndim != 3 or packed.shape[1] != packed.shape[2]:
-            raise ValueError(
-                "CentroidKUnfoldPlan.restore_operator_basis requires a "
-                f"square rank-three operator; got {packed.shape}.")
-        if source_map is None:
-            source = self._canonical_source_map()
-        else:
-            source = np.asarray(source_map, dtype=np.int32)
-        extent = int(packed.shape[1])
-        if source.shape != (extent,):
-            raise ValueError(
-                "CentroidKUnfoldPlan.restore_operator_basis source map "
-                f"must have shape ({extent},); got {source.shape}.")
-        target = (
-            int(self.canonical_centroid_extent)
-            if canonical_extent is None else int(canonical_extent))
-        if not 0 < target <= extent:
-            raise ValueError(
-                "CentroidKUnfoldPlan.restore_operator_basis canonical "
-                f"extent must lie in (0,{extent}]; got {target}.")
-        n_x = int(self.mesh_xy.shape['x'])
-        n_y = int(self.mesh_xy.shape['y'])
-        reordered = reorder_isdf_operator_basis(
-            packed,
-            left_source_map=_shardwise_prefix_map(source, target, n_x),
-            right_source_map=_shardwise_prefix_map(source, target, n_y),
-            mesh_xy=self.mesh_xy)
-        # Both endpoints hold their canonical rows as per-shard prefixes: the
-        # crop is rank-local, no axis is ever gathered.
-        return _local_prefix_crop(
-            reordered, self.mesh_xy, left=target // n_x, right=target // n_y)
 
 
 def build_centroid_k_unfold_plan(
@@ -498,9 +227,14 @@ def build_centroid_k_unfold_plan(
     *,
     nspinor: int,
     parent_k_frac=None,
-    canonical_centroid_extent=None,
+    layout=None,
 ) -> CentroidKUnfoldPlan:
     """Bind canonical symmetry tables to one orbit-packed centroid basis.
+
+    ``layout`` is the run's :class:`SquareGroupedShardLayout`
+    (``meta.mu_basis.layout``): the plan's tables are conjugated into THAT
+    order, so its unfold acts directly on the arrays the run computes on.
+    Omitted (tests), the layout is built here from the same orbits.
 
     ``parent_k_frac`` is the raw WFN k table.  When omitted, the exact file
     wedge rows owned by ``SymMaps.kirr_fullids`` are used; that mapping is
@@ -529,7 +263,12 @@ def build_centroid_k_unfold_plan(
         extend_trs=True,
     )
     groups = permutation_orbit_labels(sym_perm)
-    layout = build_square_grouped_shard_layout(groups, shape)
+    if layout is None:
+        layout = build_square_grouped_shard_layout(groups, shape)
+    elif int(layout.axis.n_logical) != int(sym_perm.shape[-1]):
+        raise ValueError(
+            "build_centroid_k_unfold_plan: the run's centroid layout holds "
+            f"{layout.axis.n_logical} centroids, the table {sym_perm.shape[-1]}.")
     packed_perm = layout.axis.pack_permutations_host(sym_perm)
     packed_wraps = layout.axis.pack_host(wraps, axis=1, fill_value=0)
 
@@ -553,20 +292,6 @@ def build_centroid_k_unfold_plan(
             f"raw parent table of length {parent_k.shape[0]}.")
     spin = np.asarray(sym.spinor_action(sym_idx, nspinor=ns),
                       dtype=np.complex128)
-    canonical_extent = (
-        int(len(centroid_fft_idx)) if canonical_centroid_extent is None
-        else int(canonical_centroid_extent))
-    from runtime.padding import padded_axis
-    canonical_axis = padded_axis(
-        int(len(centroid_fft_idx)), mesh_xy,
-        name="canonical centroid unfold carrier")
-    if canonical_extent != canonical_axis.carrier:
-        raise ValueError(
-            "build_centroid_k_unfold_plan: canonical centroid carrier is "
-            f"{canonical_extent}, expected {canonical_axis.carrier} for "
-            f"logical extent {canonical_axis.logical} and divisor "
-            f"{canonical_axis.divisor}.")
-
     return CentroidKUnfoldPlan(
         mesh_xy=mesh_xy,
         layout=layout,
@@ -578,7 +303,6 @@ def build_centroid_k_unfold_plan(
         spin_action_full=_readonly(spin, np.complex128),
         n_sym_spatial=n_spatial,
         nspinor=ns,
-        canonical_centroid_extent=canonical_extent,
         spatial_ops=_readonly(
             np.asarray(sym.sym_matrices)[:n_spatial], np.int64),
         translations=_readonly(

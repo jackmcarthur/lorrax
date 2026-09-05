@@ -21,10 +21,11 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
   parents-only bundle rotates the carrier's faces with U at the parents'
   rows and equals the rotated full-k faces read at those rows.
 * Σ projection: ``ppm_tau_kernel._make_project_ri_reduce_scatter(parent_route)``
-  — select the parents' rows of a full-k operator, project with the
-  CANONICAL parent faces, broadcast the band matrix — equals the full-k face
-  projector on an operator that transforms like a Green function
-  (``plan.finish_green`` of a NON-Hermitian parent operator).  The
+  — select the parents' rows of a full-k operator, project with the parent
+  faces, broadcast the band matrix — equals the full-k face projector on an
+  operator that transforms like a Green function (``plan.unfold_operator``
+  of a NON-Hermitian parent operator).  Every face is in the run's packed
+  centroid order, the one in-memory order.  The
   ``conj`` broadcast rule is shown to be wrong on the time-reversed row and
   right on the unitary rows, which is why the route names ``transpose``.
 
@@ -135,8 +136,10 @@ def _worker() -> int:
 
     plan = build_centroid_k_unfold_plan(
         sym_fx, cent_idx, fft_grid, mesh, nspinor=ns,
-        parent_k_frac=parent_k, canonical_centroid_extent=n_mu)
+        parent_k_frac=parent_k)
     assert np.array_equal(plan.parent_full_rows, parent_rows)
+    n_pk = int(plan.n_centroid_packed)
+    pack = plan.layout.axis.pack_host   # stands in for the loader's sampling
 
     # ---- parents at the centroids and their typed-action children -------
     psi_parent = _crand(rng, n_parent, nb, ns, n_mu)
@@ -150,16 +153,16 @@ def _worker() -> int:
             val = np.conj(val)
         psi_full[k] = np.einsum("ac,ncr->nar", U_eff, val, optimize=True)
 
+    # Every face is in the run's PACKED centroid order (the one in-memory
+    # order); the full-k reference route runs in it too.
     mun_sh = NamedSharding(mesh, P(None, None, "x", "y"))
     nmu_sh = NamedSharding(mesh, P(None, "x", None, "y"))
-    psi_nmu_full = jax.device_put(jnp.asarray(psi_full), nmu_sh)
+    psi_nmu_full = jax.device_put(jnp.asarray(pack(psi_full, axis=3)), nmu_sh)
     psi_mun_full = jax.device_put(
-        jnp.asarray(psi_full.transpose(0, 2, 3, 1)), mun_sh)
-    psi_nmu_par = jax.device_put(jnp.asarray(psi_parent), nmu_sh)
-    psi_mun_par = jax.device_put(
-        jnp.asarray(psi_parent.transpose(0, 2, 3, 1)), mun_sh)
-    with mesh:
-        psi_nmu_pk, psi_mun_pk = plan.pack_face_pair(psi_nmu_par, psi_mun_par)
+        jnp.asarray(pack(psi_full.transpose(0, 2, 3, 1), axis=2)), mun_sh)
+    psi_nmu_pk = jax.device_put(jnp.asarray(pack(psi_parent, axis=3)), nmu_sh)
+    psi_mun_pk = jax.device_put(
+        jnp.asarray(pack(psi_parent.transpose(0, 2, 3, 1), axis=2)), mun_sh)
 
     # ---- G: parent contraction + plan == full-k contraction --------------
     phases_parent = _crand(rng, n_parent, nb)
@@ -180,42 +183,29 @@ def _worker() -> int:
         jnp.asarray(O_parent),
         NamedSharding(mesh, P(None, None, "x", None, "y")))
     with mesh:
-        sigma_full = jax.block_until_ready(plan.finish_green(O_parent))
-    assert sigma_full.shape == (nk, ns, n_mu, ns, n_mu)
+        sigma_full = jax.block_until_ready(plan.unfold_operator(O_parent))
+    assert sigma_full.shape == (nk, ns, n_pk, ns, n_pk)
 
     full_project = contract_bands_block_reshard(
-        mesh, layout="face", face_shape=(nk, nb, n_mu, ns))
+        mesh, layout="face", face_shape=(nk, nb, n_pk, ns))
     ref = np.asarray(jax.block_until_ready(
         full_project(psi_nmu_full, sigma_full, psi_mun_full)))
 
     route = ParentSigmaRoute(
         plan=plan, k_rows=parent_rows, sym=sym_fx,
-        g_face_shape=(n_parent, nb, plan.n_centroid_packed, ns),
-        proj_face_shape=(n_parent, nb, n_mu, ns))
+        g_face_shape=(n_parent, nb, n_pk, ns))
     project = _make_project_ri_reduce_scatter(
-        mesh, merged_x=True, layout="face", face_shape=(nk, nb, n_mu, ns),
+        mesh, merged_x=True, layout="face", face_shape=(nk, nb, n_pk, ns),
         parent_route=route)
     got = np.asarray(jax.block_until_ready(jax.jit(project)(
-        psi_nmu_par, sigma_full, psi_mun_par)))
+        psi_nmu_pk, sigma_full, psi_mun_pk)))
     scale = float(np.max(np.abs(ref)))
     proj_rel = float(np.max(np.abs(got - ref))) / scale
 
-    # The dynamic chain's PACKED order: the operator unfolded to packed full
-    # k (no restore), projected with the packed parent faces.  Same band
-    # matrix.
-    with mesh:
-        sigma_packed = jax.block_until_ready(plan.unfold_operator(O_parent))
-    project_packed = _make_project_ri_reduce_scatter(
-        mesh, merged_x=True, layout="face", face_shape=(nk, nb, n_mu, ns),
-        parent_route=route, packed_projection=True)
-    got_packed = np.asarray(jax.block_until_ready(jax.jit(project_packed)(
-        psi_nmu_pk, sigma_packed, psi_mun_pk)))
-    proj_packed_rel = float(np.max(np.abs(got_packed - ref))) / scale
-
     # The discriminator: the conj rule on the time-reversed row (k3).
     inner = contract_bands_block_reshard(
-        mesh, layout="face", face_shape=(n_parent, nb, n_mu, ns))
-    on_parents = inner(psi_nmu_par, sigma_full[parent_rows], psi_mun_par)
+        mesh, layout="face", face_shape=(n_parent, nb, n_pk, ns))
+    on_parents = inner(psi_nmu_pk, sigma_full[parent_rows], psi_mun_pk)
     conj_rule = np.asarray(jax.block_until_ready(
         unfold_file_wedge_band_operator(sym_fx, on_parents, trs_rule="conj")))
     trs_rows = np.flatnonzero(sym >= n_tran)
@@ -233,18 +223,17 @@ def _worker() -> int:
     carrier = ParentGreenCarrier(
         psi_nmu=psi_nmu_pk, psi_mun=psi_mun_pk,
         enk=jnp.zeros((n_parent, nb)), occ=jnp.zeros((n_parent, nb)),
-        plan=plan, psi_nmu_canonical=psi_nmu_par, psi_mun_canonical=psi_mun_par)
+        plan=plan)
     bare = Wavefunctions(
         enk=zeros_full, occ=zeros_full,
         slices=BandSlices.from_band_edges(0, 0, nb // 2, nb, nb),
         layout="face", green_parent=carrier)
     kw = sigma_face_kernel_kwargs(bare)
     parents_only_ok = bool(
-        tuple(kw["face_shape"]) == (nk, nb, n_mu, ns)
-        and padded_centroid_extent(bare) == n_mu
+        tuple(kw["face_shape"]) == (nk, nb, n_pk, ns)
+        and padded_centroid_extent(bare) == n_pk
         and tuple(kw["parent_route"].g_face_shape)
-        == (n_parent, nb, plan.n_centroid_packed, ns)
-        and tuple(kw["parent_route"].proj_face_shape) == (n_parent, nb, n_mu, ns))
+        == (n_parent, nb, n_pk, ns))
 
     # Fractional-occupation CONTOUR χ0 on the parents-only bundle equals the
     # full-k face bundle (its two G's ride the same parent transport).
@@ -264,7 +253,7 @@ def _worker() -> int:
     carrier_e = ParentGreenCarrier(
         psi_nmu=psi_nmu_pk, psi_mun=psi_mun_pk,
         enk=jnp.asarray(enk_parent), occ=jnp.asarray(np.asarray(f_kn)[parent_rows]),
-        plan=plan, psi_nmu_canonical=psi_nmu_par, psi_mun_canonical=psi_mun_par)
+        plan=plan)
     wfns_par = Wavefunctions(
         enk=enk_j, occ=f_kn, slices=slices, layout="face",
         green_parent=carrier_e)
@@ -334,15 +323,12 @@ def _worker() -> int:
     full_nmu = np.asarray(rot_full.psi_nmu)[parent_rows]
     full_mun = np.asarray(rot_full.psi_mun)[parent_rows]
     rot_rel = max(
-        float(np.max(np.abs(np.asarray(rc.psi_nmu_canonical) - full_nmu))) / float(np.max(np.abs(full_nmu))),
-        float(np.max(np.abs(np.asarray(rc.psi_mun_canonical) - full_mun))) / float(np.max(np.abs(full_mun))))
-    packed_ref = np.asarray(plan.pack_face_pair(rot_full.psi_nmu[parent_rows], rot_full.psi_mun[parent_rows])[0])
-    rot_rel = max(rot_rel, float(np.max(np.abs(np.asarray(rc.psi_nmu) - packed_ref))) / float(np.max(np.abs(packed_ref))))
+        float(np.max(np.abs(np.asarray(rc.psi_nmu) - full_nmu))) / float(np.max(np.abs(full_nmu))),
+        float(np.max(np.abs(np.asarray(rc.psi_mun) - full_mun))) / float(np.max(np.abs(full_mun))))
 
     print(json.dumps({
         "sc_rotation_parents_vs_full_rel": rot_rel,
         "g_rel": g_rel, "proj_rel": proj_rel,
-        "proj_packed_rel": proj_packed_rel,
         "conj_rule_rel_on_tr_rows": conj_rel_trs,
         "conj_rule_rel_on_unitary_rows": conj_rel_uni,
         "parents_only_bundle_names_full_k_shapes": parents_only_ok,
@@ -376,26 +362,40 @@ def _run_worker(ndev: int = 4, timeout: int = 600):
     return json.loads(lines[-1])
 
 
-def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
-    out = _run_worker()
+_WORKER_RESULT: dict = {}
+
+
+def _worker_result():
+    """One CPU worker per module; every cell below reads its JSON."""
+    if not _WORKER_RESULT:
+        _WORKER_RESULT.update(_run_worker())
+    out = _WORKER_RESULT
     if "skip" in out:
         pytest.skip(f"parent Σ route parity: {out['skip']}")
+    return out
+
+
+def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
+    out = _worker_result()
     assert out["g_rel"] < _TOL, f"G on parents vs full k: {out}"
     assert out["proj_rel"] < _TOL, f"Σ projection on parents vs full k: {out}"
-    assert out["proj_packed_rel"] < _TOL, f"packed-order Σ projection: {out}"
     # The conj rule is right on unitary rows and wrong on the antiunitary
     # one: the transpose is the discriminating choice, not a convention.
     assert out["conj_rule_rel_on_unitary_rows"] < _TOL, out
     assert out["conj_rule_rel_on_tr_rows"] > 0.1, out
     assert out["parents_only_bundle_names_full_k_shapes"] is True, out
-    fc = out["fractional_contour_parents_vs_full_rel"]
-    if isinstance(fc, str):
-        print("PARTIAL SCOPE: fractional contour arm " + fc)
-    else:
-        assert fc < 1.0e-10, f"fractional contour χ0 on parents vs full k: {out}"
     assert out["fractional_static_gamma_parents_vs_full_rel"] < 1.0e-10, out
     assert out["sc_rotation_parents_vs_full_rel"] < 1.0e-10, out
     assert out["fractional_direct_q_parents_vs_full_rel"] < 1.0e-10, out
+
+
+def test_fractional_contour_chi0_on_parents_matches_full_k():
+    """Its own cell: without the host FFT FFI this arm is SKIPPED, not
+    folded into a passing test (the P4 GPU legs cover it)."""
+    fc = _worker_result()["fractional_contour_parents_vs_full_rel"]
+    if isinstance(fc, str):
+        pytest.skip("fractional contour arm: " + fc)
+    assert fc < 1.0e-10, f"fractional contour χ0 on parents vs full k: {fc}"
 
 
 if __name__ == "__main__":

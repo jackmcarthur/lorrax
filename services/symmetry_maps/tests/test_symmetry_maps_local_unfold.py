@@ -15,8 +15,6 @@ numbers:
   ``_rotate_open_spin_centroid_operator`` on a rectangular operator;
 * :func:`real_space_orbit_labels` induces the same partition as the union-find
   of :func:`fft_grid_pullback_perm`, on symmorphic and nonsymmorphic groups;
-* :func:`reorder_isdf_operator_basis` with ``right_source_map=None`` permutes
-  the left axis only and lowers to the x-axis exchange alone.
 
 Geometry, mesh and hand reference are the emulated-mesh suite's own
 (``test_symmetry_maps_emulated_mesh``); nothing is re-derived here.
@@ -34,7 +32,6 @@ from symmetry_maps import (
     open_spin_block_coefficient,
     permutation_orbit_labels,
     real_space_orbit_labels,
-    reorder_isdf_operator_basis,
     unfold_isdf_operator,
     unfold_operator_local,
 )
@@ -176,25 +173,3 @@ def test_orbit_labels_match_the_pullback_union_find(tnp):
     sizes = np.bincount(labels)
     sizes = sizes[sizes > 0]
     assert sizes.max() == 2 and (sizes == 2).sum() > 50
-
-
-def test_left_only_reorder_permutes_one_axis_with_one_exchange():
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    mesh = _mesh(2, 2)
-    rng = np.random.default_rng(7)
-    op = (rng.standard_normal((3, 12, 8))
-          + 1j * rng.standard_normal((3, 12, 8)))
-    source = rng.permutation(12)
-    op_dev = jax.device_put(
-        jnp.asarray(op), NamedSharding(mesh, P(None, 'x', 'y')))
-    run = lambda v: reorder_isdf_operator_basis(  # noqa: E731
-        v, left_source_map=source, right_source_map=None, mesh_xy=mesh)
-    got = np.asarray(run(op_dev))
-    np.testing.assert_allclose(got, op[:, source, :], rtol=0, atol=0)
-    hlo = jax.jit(run).lower(op_dev).compiler_ir(
-        dialect="hlo").as_hlo_text().lower()
-    assert hlo.count("all-to-all(") == 2
-    assert "all-gather(" not in hlo

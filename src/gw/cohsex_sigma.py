@@ -325,6 +325,7 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     ``layout='face'`` requires ``face_shape=(nk, nb_full, n_rmu,
     nspinor)`` so its distributed GEMM plans can be fixed eagerly.
     """
+    from .ppm_tau_kernel import _route_key
     if layout not in ("legacy", "face"):
         raise ValueError(
             f"_make_cohsex_kernels: layout must be 'legacy' or 'face', "
@@ -342,7 +343,7 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         raise ValueError(
             "_make_cohsex_kernels(parent_route=...) requires layout='face'.")
     cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
-                layout, face_shape, id(parent_route))
+                layout, face_shape, _route_key(parent_route))
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
@@ -443,9 +444,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
     g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_g, n=mu_s, nq=nk_g,
                        dtype=jnp.complex128)
     proj_fn = contract_bands_block_reshard(
-        mesh_xy, layout="face",
-        face_shape=(face_shape if parent_route is None
-                    else parent_route.proj_face_shape))
+        mesh_xy, layout="face", face_shape=tuple(g_shape))
     k_unfold_plan = None if parent_route is None else parent_route.plan
     if parent_route is not None:
         from ffi import _services
@@ -473,7 +472,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                             layout="face", face_project_fn=proj_fn)
         c = wfns.green_parent
         parent_rows = _project(
-            c.psi_nmu_canonical, c.psi_mun_canonical,
+            c.psi_nmu, c.psi_mun,
             jnp.take(sigma_k, jnp.asarray(_k_rows), axis=0),
             layout="face", face_project_fn=proj_fn)
         # Static Σ is Hermitian, so conj and transpose coincide; use the

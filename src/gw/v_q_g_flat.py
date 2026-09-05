@@ -221,7 +221,7 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
 
 def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
                         context="V_q / W q-grid reduction",
-                        return_resolution=False):
+                        return_resolution=False, mu_basis=None):
     """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
     Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
@@ -280,6 +280,13 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
             context=context)
         if res.use_ibz:
             sym_perm, L_table = res.tables()
+        if sym_perm is not None and mu_basis is not None:
+            # In-memory consumers (W, χ) hold their operators in the run's
+            # packed centroid order: conjugate the canonical tables into it.
+            # The pad bake below is then a no-op (the packed extent is
+            # already the complete-mesh carrier).  V is built from the
+            # canonical ζ file and passes no basis.
+            sym_perm, L_table = mu_basis.pack_tables(sym_perm, L_table)
         if sym_perm is not None:
             # Bake the μ pad into the tables ONCE at construction:
             # identity tail on the permutation (pad centroids map to

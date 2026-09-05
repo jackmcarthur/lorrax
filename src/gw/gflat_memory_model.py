@@ -417,13 +417,13 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     else:
         psi_copies = 2 * psi_one / p_x + 2 * psi_one / p_y
     if parent_route is not None:
-        # The raw-parent carrier: packed AND canonical face pairs at
-        # n_parent rows (gw.wavefunction_bundle.ParentGreenCarrier).  Under
-        # parents-only storage it is the run's ONLY psi; otherwise it sits
-        # beside the full-k faces.
-        carrier = 4.0 * _c128(
+        # The raw-parent carrier: one face pair at n_parent rows
+        # (gw.wavefunction_bundle.ParentGreenCarrier).  Under parents-only
+        # storage it is the run's ONLY psi; otherwise it sits beside the
+        # full-k faces.
+        carrier = 2.0 * _c128(
             int(parent_route["n_parent"]), ns,
-            int(parent_route["mu_packed"]), nb) / P_
+            mu, nb) / P_
         psi_copies = carrier if parent_route.get("parents_only") \
             else psi_copies + carrier
     return {
@@ -538,7 +538,6 @@ def _stage_C_face_terms(
     projector = 0.0
     if parent_route is not None:
         psi_rows = int(parent_route["n_parent"])
-        mu = int(parent_route["mu_packed"])
         projector = 2.0 * _c128(psi_rows, ns, ns, mu, shard=p_xy)
     face_conj = _c128(psi_rows, ns, mu, face_nb, shard=p_xy)
     x_block = _c128(psi_rows, x_rows, max(1, mu // p_x), band_chunk)
@@ -684,8 +683,7 @@ class GFlatChunkPlan:
                f"{self.face_y_cache_bytes / 1e9:.3f} GB/dev"]
               if self.psi_layout == "face" else []),
             *([f"    parent route  = {int(self.parent_route['n_parent'])} raw "
-               f"parents over {int(self.parent_route['mu_packed'])} packed "
-               "centroids; psi terms at n_parent rows"
+               "parents; psi terms at n_parent rows"
                + (" (parents-only storage: no full-k faces)"
                   if self.parent_route.get("parents_only") else
                   " beside the full-k faces")]
@@ -777,7 +775,7 @@ def plan_gflat_chunks(
     measured ``ns²`` arena.  False preserves the independently calibrated
     four-slot identity/charge executable.
 
-    ``parent_route`` (``{"n_parent", "mu_packed", "parents_only"}`` or
+    ``parent_route`` (``{"n_parent", "parents_only"}`` or
     ``None``): the raw-parent contraction of the ζ fit
     (``gw.centroid_k_unfold.CentroidKUnfoldPlan``).  It prices the psi-side
     Stage-C terms and the persistent carrier at ``n_parent`` rows over the

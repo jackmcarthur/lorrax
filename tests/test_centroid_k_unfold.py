@@ -130,21 +130,15 @@ def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():
         rng.normal(size=(2, 4, 1, 4))
         + 1j * rng.normal(size=(2, 4, 1, 4)))
     psi_mun_np = psi_nmu_np.transpose(0, 2, 3, 1)
+    # The loader samples the packed table directly; here the host packer
+    # stands in for it (zero pad slots).
+    psi_nmu = jnp.asarray(plan.layout.axis.pack_host(psi_nmu_np, axis=3))
+    psi_mun = jnp.asarray(plan.layout.axis.pack_host(psi_mun_np, axis=2))
     with mesh:
-        psi_nmu, psi_mun = plan.pack_face_pair(
-            jnp.asarray(psi_nmu_np), jnp.asarray(psi_mun_np))
         parent_op = jnp.einsum(
             'ksmn,kntv->ksmtv', psi_mun, jnp.conj(psi_nmu),
             optimize=True)
         full_op = plan.unfold_operator(parent_op)
-        canonical_op = plan.finish_green(parent_op)
-
-    packed_nmu = np.asarray(psi_nmu)
-    packed_mun = np.asarray(psi_mun)
-    np.testing.assert_allclose(
-        plan.layout.axis.unpack_host(packed_nmu, axis=3), psi_nmu_np)
-    np.testing.assert_allclose(
-        plan.layout.axis.unpack_host(packed_mun, axis=2), psi_mun_np)
 
     parent = np.asarray(parent_op)
     expected = np.empty_like(np.asarray(full_op))
@@ -155,12 +149,6 @@ def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():
         expected[child] = np.take(transported, perm, axis=3)
     np.testing.assert_allclose(np.asarray(full_op), expected, rtol=2e-13,
                                atol=2e-13)
-    expected_canonical = plan.layout.axis.unpack_host(expected, axis=2)
-    expected_canonical = plan.layout.axis.unpack_host(
-        expected_canonical, axis=4)
-    np.testing.assert_allclose(
-        np.asarray(canonical_op), expected_canonical,
-        rtol=2e-13, atol=2e-13)
 
 
 def test_parent_scalar_rows_do_not_masquerade_as_parent_wavefunctions():
@@ -175,11 +163,12 @@ def test_parent_scalar_rows_do_not_masquerade_as_parent_wavefunctions():
 
 
 def _full_children_from_parent(parent, plan):
-    """Explicit spatial-only child ψ for the fixture's zero-phase actions."""
-    parent = np.asarray(parent)
+    """Explicit spatial-only child ψ for the fixture's zero-phase actions,
+    in the run's PACKED centroid order (pad slots zero)."""
+    parent = np.asarray(parent)   # canonical order, n_logical slots
     out = np.zeros(
         (plan.n_full,) + parent.shape[1:-1]
-        + (plan.canonical_centroid_extent,), dtype=parent.dtype)
+        + (plan.n_centroid_packed,), dtype=parent.dtype)
     to_packed = plan.layout.axis.canonical_to_packed
     to_canonical = plan.layout.axis.packed_to_canonical
     for child, (parent_row, sym_row) in enumerate(
@@ -187,7 +176,8 @@ def _full_children_from_parent(parent, plan):
         for target in range(plan.n_centroid_logical):
             source_packed = plan.sym_perm[int(sym_row), to_packed[target]]
             source = to_canonical[source_packed]
-            out[child, ..., target] = parent[int(parent_row), ..., source]
+            out[child, ..., to_packed[target]] = parent[
+                int(parent_row), ..., source]
     return out
 
 
@@ -230,14 +220,16 @@ def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
         nspinor=1,
         parent_k_frac=np.asarray([[0.0, 0.0, 0.0],
                                   [0.5, 0.0, 0.0]]),
-        canonical_centroid_extent=4,
     )
     rng = np.random.default_rng(20260901)
     nk_parent, nb, ns = plan.n_parent, 4, 1
     parent = (
         rng.normal(size=(nk_parent, nb, ns, len(centroids)))
         + 1j * rng.normal(size=(nk_parent, nb, ns, len(centroids))))
+    # Both routes run in the run's packed centroid order (the loader samples
+    # the packed table); the full-k children are formed in that order too.
     full = _full_children_from_parent(parent, plan)
+    parent = plan.layout.axis.pack_host(parent, axis=3)
     full_energy = np.asarray([
         [-1.4, -0.5, 0.7, 1.6],
         [-1.4, -0.5, 0.7, 1.6],
@@ -287,10 +279,9 @@ def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
         np.asarray(got_parent), np.asarray(got_full),
         rtol=3e-12, atol=3e-12)
 
-    # Parent->full transport stays local inside every scan iteration.  The
-    # only nonlocal basis move is the single packed->canonical operator
-    # restore after the complete chi accumulation (four all-to-alls: a
-    # volume-preserving round trip for each endpoint, never an all-gather).
+    # Parent->full transport stays local inside every scan iteration and
+    # chi leaves in the run's packed order: no basis move, no collective
+    # beyond the k FFTs.
     vmax, cmin = -0.3, 0.7
     tau = np.asarray(quad.tau, dtype=np.float64)
     nodes = MinimaxNodes(
@@ -305,125 +296,9 @@ def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
         jnp.asarray(vmax), jnp.asarray(cmin)).compiler_ir(
             dialect="hlo").as_hlo_text().lower()
     assert "all-gather(" not in hlo
-    assert hlo.count("all-to-all(") == 4
+    assert "all-to-all(" not in hlo
 
     w_isdf._chi_minimax_kernel_cache.clear()
-
-
-def test_overpadded_canonical_carrier_is_refused_by_the_producer():
-    """Canonical padding is the runtime receipt, not an arbitrary extent."""
-    mesh = _mesh_2x2()
-    centroids = np.asarray(
-        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
-        dtype=np.int32)
-    with pytest.raises(ValueError, match="canonical centroid carrier is 8, expected 4"):
-        build_centroid_k_unfold_plan(
-            _symmetry_fixture(), centroids, (2, 2, 1), mesh,
-            nspinor=1,
-            parent_k_frac=np.asarray([[0.0, 0.0, 0.0],
-                                      [0.5, 0.0, 0.0]]),
-            canonical_centroid_extent=8,
-        )
-
-
-def test_orbit_padding_is_cropped_without_replicating_operator_axes():
-    """Packed 8 -> canonical 4 keeps an all-P operator at every seam."""
-    mesh = _mesh_2x2()
-    layout = build_square_grouped_shard_layout(
-        np.asarray([0, 0, 0, 1], dtype=np.int32), (2, 2))
-    assert layout.axis.n_padded == 8
-    identity_perm = layout.axis.pack_permutations_host(
-        np.arange(4, dtype=np.int32)[None, :])
-    plan = CentroidKUnfoldPlan(
-        mesh_xy=mesh,
-        layout=layout,
-        irr_idx=np.asarray([0], dtype=np.int32),
-        sym_idx=np.asarray([0], dtype=np.int32),
-        sym_perm=identity_perm,
-        L_table=np.zeros((1, 8, 3), dtype=np.int64),
-        k_parent_frac=np.zeros((1, 3), dtype=np.float64),
-        spin_action_full=np.ones((1, 1, 1), dtype=np.complex128),
-        n_sym_spatial=1,
-        nspinor=1,
-        canonical_centroid_extent=4,
-    )
-    assert plan.supports_canonical_bridge
-    canonical = np.arange(16, dtype=np.float64).reshape(4, 4)
-    packed = np.zeros((1, 1, 8, 1, 8), dtype=np.complex128)
-    dst = layout.axis.canonical_to_packed
-    packed[0, 0, dst[:, None], 0, dst[None, :]] = canonical
-    operand = jax.device_put(
-        jnp.asarray(packed),
-        NamedSharding(mesh, P(None, None, 'x', None, 'y')))
-
-    result = plan.finish_green(operand)
-    np.testing.assert_allclose(
-        np.asarray(result)[0, 0, :, 0, :], canonical, rtol=0, atol=0)
-    assert result.shape == (1, 1, 4, 1, 4)
-    assert result.sharding.spec == P(None, None, 'x', None, 'y')
-
-    hlo = jax.jit(plan.finish_green).lower(operand).compiler_ir(
-        dialect="hlo").as_hlo_text().lower()
-    assert "all-gather(" not in hlo
-    assert hlo.count("all-to-all(") == 4
-
-
-def test_nonaligned_canonical_crop_is_rank_local():
-    """Packed 12 -> canonical 8 on a 2x2 mesh: the crop crosses a shard
-    boundary (6 packed rows per X shard, 4 canonical), which the old global
-    slice lowered as an all-gather of the whole centroid axis."""
-    mesh = _mesh_2x2()
-    layout = build_square_grouped_shard_layout(
-        np.asarray([0, 0, 0, 0, 0, 1, 1, 1], dtype=np.int32), (2, 2))
-    packed_extent = int(layout.axis.n_padded)
-    assert packed_extent > 8 and packed_extent % 2 == 0
-    identity_perm = layout.axis.pack_permutations_host(
-        np.arange(8, dtype=np.int32)[None, :])
-    plan = CentroidKUnfoldPlan(
-        mesh_xy=mesh,
-        layout=layout,
-        irr_idx=np.asarray([0], dtype=np.int32),
-        sym_idx=np.asarray([0], dtype=np.int32),
-        sym_perm=identity_perm,
-        L_table=np.zeros((1, packed_extent, 3), dtype=np.int64),
-        k_parent_frac=np.zeros((1, 3), dtype=np.float64),
-        spin_action_full=np.ones((1, 1, 1), dtype=np.complex128),
-        n_sym_spatial=1,
-        nspinor=1,
-        canonical_centroid_extent=8,
-    )
-    assert plan.supports_canonical_bridge
-    canonical = np.arange(64, dtype=np.float64).reshape(8, 8)
-    packed = np.zeros((1, 1, packed_extent, 1, packed_extent),
-                      dtype=np.complex128)
-    dst = layout.axis.canonical_to_packed
-    packed[0, 0, dst[:, None], 0, dst[None, :]] = canonical
-    operand = jax.device_put(
-        jnp.asarray(packed),
-        NamedSharding(mesh, P(None, None, 'x', None, 'y')))
-    result = plan.finish_green(operand)
-    np.testing.assert_allclose(
-        np.asarray(result)[0, 0, :, 0, :], canonical, rtol=0, atol=0)
-    assert result.shape == (1, 1, 8, 1, 8)
-    hlo = jax.jit(plan.finish_green).lower(operand).compiler_ir(
-        dialect="hlo").as_hlo_text().lower()
-    assert "all-gather(" not in hlo
-    # the zeta-fit RHS: left axis canonical, right axis (r) untouched
-    rhs = np.zeros((2, packed_extent, 4), dtype=np.complex128)
-    rows = np.arange(16, dtype=np.float64).reshape(8, 2)
-    for q in range(2):
-        rhs[q, dst, :] = np.repeat(rows[:, q:q + 1], 4, axis=1) + q
-    rhs_dev = jax.device_put(
-        jnp.asarray(rhs), NamedSharding(mesh, P(None, 'x', 'y')))
-    left = plan.restore_left_basis(rhs_dev)
-    assert left.shape == (2, 8, 4)
-    for q in range(2):
-        np.testing.assert_allclose(
-            np.asarray(left)[q], np.repeat(rows[:, q:q + 1], 4, axis=1) + q,
-            rtol=0, atol=0)
-    hlo_left = jax.jit(plan.restore_left_basis).lower(rhs_dev).compiler_ir(
-        dialect="hlo").as_hlo_text().lower()
-    assert "all-gather(" not in hlo_left
 
 
 def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
@@ -431,7 +306,6 @@ def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
     import symmetry_maps.maps as maps_impl
 
     maps_impl._UNFOLD_ISDF_OPERATOR_JIT_CACHE.clear()
-    maps_impl._REORDER_ISDF_OPERATOR_JIT_CACHE.clear()
     mesh = _mesh_2x2()
     centroids = np.asarray(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
@@ -440,17 +314,17 @@ def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
         _symmetry_fixture(), centroids, (2, 2, 1), mesh,
         nspinor=1,
         parent_k_frac=np.asarray([[0.0, 0.0, 0.0],
-                                  [0.5, 0.0, 0.0]]),
-        canonical_centroid_extent=4)
+                                  [0.5, 0.0, 0.0]]))
+    n_pk = plan.n_centroid_packed
     operand = jax.device_put(
-        jnp.ones((2, 1, 4, 1, 4), dtype=jnp.complex128),
+        jnp.ones((2, 1, n_pk, 1, n_pk), dtype=jnp.complex128),
         NamedSharding(mesh, P(None, None, 'x', None, 'y')))
 
     # The first outer jit creates the service cache.  The second consumes the
     # cached inner executable from a distinct trace; a captured tracer used to
     # escape here and fail before execution.
     packed = jax.jit(plan.unfold_operator)(operand)
-    canonical = jax.jit(plan.finish_green)(operand)
-    jax.block_until_ready((packed, canonical))
-    assert packed.shape == (3, 1, 4, 1, 4)
-    assert canonical.shape == (3, 1, 4, 1, 4)
+    packed2 = jax.jit(lambda o: plan.unfold_operator(o) * 2.0)(operand)
+    jax.block_until_ready((packed, packed2))
+    assert packed.shape == (3, 1, n_pk, 1, n_pk)
+    assert packed2.shape == (3, 1, n_pk, 1, n_pk)

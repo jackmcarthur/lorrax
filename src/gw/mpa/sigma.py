@@ -295,13 +295,12 @@ def _integrate_sigma_batches(
         # width.  It stays there until a logical output consumer strips by
         # ``sigma_axis``; no nondivisible sharded array is ever published.
         if parent_route is not None:
-            # Raw parents only: packed parent faces feed the G contraction
-            # (the plan transports G to full k), canonical parent faces the
-            # projection (the spatial tail selects, projects, broadcasts).
-            # Bracket packing is not combined with the route.
+            # Raw parents only: the parent faces feed the G contraction (the
+            # plan transports G to full k) and the projection (the spatial
+            # tail selects, projects, broadcasts).  Bracket packing is not
+            # combined with the route.
             (psi_coh_xn, psi_coh_yr,
-             psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(
-                wfns, projection="packed")
+             psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
             pack_brackets = False
         elif bracketed and len(brackets) > 1:
             from gw.wavefunction_bundle import pack_band_window
@@ -370,19 +369,19 @@ def _integrate_sigma_batches(
     sweep_wall_start = None
     stop_probe = False
     for lo, Omega, B, B_odd in batches:
-        if parent_route is not None:
-            # The parent chain runs in PACKED centroid order: pack every
-            # operator-shaped pole field once per batch so W(τ) built from
-            # them is packed too (G is unfolded to packed full k and never
-            # restored).  GN-PPM's pole frequency is per (q, mu, nu) and must
-            # follow the residues; MPA's scalar poles are left alone.
-            _plan = parent_route.plan
-            _mu_can = int(_plan.canonical_centroid_extent)
-            B = _plan.pack_square_operator(B)
+        if getattr(meta, 'mu_basis', None) is not None:
+            # The pole store keeps the canonical centroid order; the run
+            # computes in its packed order.  Pack every operator-shaped pole
+            # field once per batch at this read seam.  GN-PPM's pole frequency
+            # is per (q, mu, nu) and follows the residues; MPA's scalar poles
+            # are left alone.
+            _basis = meta.mu_basis
+            _mu_can = int(_basis.n_canonical)
+            B = _basis.pack_operator(B)
             if B_odd is not None:
-                B_odd = _plan.pack_square_operator(B_odd)
+                B_odd = _basis.pack_operator(B_odd)
             if Omega.ndim >= 2 and tuple(Omega.shape[-2:]) == (_mu_can, _mu_can):
-                Omega = _plan.pack_square_operator(Omega)
+                Omega = _basis.pack_operator(Omega)
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
             max_d = max(

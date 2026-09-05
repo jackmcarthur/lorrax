@@ -40,6 +40,15 @@ _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 #: single callable, since 2026-08-15: the W-only half is hoistable and the
 #: band-bracket loop hoists it.
 _sigma_spatial_kernel_cache: dict[tuple[object, ...], "SpatialKernel"] = {}
+
+
+def _route_key(parent_route):
+    """Cache identity of a parent route: its persistent plan (identity-keyed,
+    held by the carrier for the run) and its face shape.  The route object
+    itself is rebuilt per call and its id may be recycled."""
+    if parent_route is None:
+        return None
+    return (id(parent_route.plan), tuple(int(v) for v in parent_route.g_face_shape))
 _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
@@ -100,7 +109,7 @@ def _fft_ffi_fused_enabled() -> bool:
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = False,
     layout: str = "legacy", face_shape=None, face_band_extent=None,
-    parent_route=None, packed_projection: bool = False,
+    parent_route=None,
 ) -> Callable[..., jax.Array]:
     """Build the shard_map'd ψ* σ ψ projector that reduce-scatters the output.
 
@@ -238,13 +247,9 @@ def _make_project_ri_reduce_scatter(
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import unfold_file_wedge_band_operator
-    # ``packed_projection``: the operator arrives in PACKED centroid order
-    # (the dynamic chain never restores G per τ node) and is projected with
-    # the packed parent faces; otherwise canonical order and canonical faces.
     inner = contract_bands_block_reshard(
         mesh_xy, channels="none", layout="face",
-        face_shape=tuple(parent_route.g_face_shape if packed_projection
-                         else parent_route.proj_face_shape),
+        face_shape=tuple(parent_route.g_face_shape),
         face_band_extent=face_band_extent)
     k_rows = np.asarray(parent_route.k_rows, dtype=np.int32)
     sym = parent_route.sym
@@ -293,7 +298,6 @@ def get_sigma_spatial_kernel(
     face_shape=None,
     face_band_extent=None,
     parent_route=None,
-    packed_projection: bool = False,
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
@@ -337,7 +341,7 @@ def get_sigma_spatial_kernel(
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            bool(merged_x), layout, face_shape, face_band_extent,
-           id(parent_route), bool(packed_projection))
+           _route_key(parent_route))
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -361,8 +365,7 @@ def get_sigma_spatial_kernel(
 
     project = _make_project_ri_reduce_scatter(
         mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
-        face_band_extent=face_band_extent, parent_route=parent_route,
-        packed_projection=packed_projection)
+        face_band_extent=face_band_extent, parent_route=parent_route)
 
     @jax.jit
     def prep_w(W_q):
@@ -477,10 +480,9 @@ def _get_sigma_kij_kernel(
     face layout only): the ``psi_coh_*`` operands are the PACKED raw-parent
     faces and ``E_A``/``mask_A`` are parent-row tables — ``build_G_tau``
     contracts on ``n_parent`` rows and the plan transports the completed
-    operator to PACKED full k (``k_unfold_output="packed"``: no canonical
-    restore per τ node); the FFT convolution runs in packed order against
-    residues the caller packed once (``plan.pack_square_operator``); the
-    ``psi_proj_*`` operands are the PACKED parent faces and the spatial
+    operator to full k in the run's packed centroid order; the FFT convolution
+    runs against residues in that same order; the
+    ``psi_proj_*`` operands are the same parent faces and the spatial
     kernel's projection tail selects, projects and broadcasts (see
     :func:`_make_project_ri_reduce_scatter`).  Bracket packing is not
     combined with the route (the mask loop serves every bracket count).
@@ -579,7 +581,7 @@ def _get_sigma_kij_kernel(
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(pack_brackets), bool(energy_windows),
-           id(parent_route))
+           _route_key(parent_route))
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
@@ -591,14 +593,12 @@ def _get_sigma_kij_kernel(
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
         layout=layout, face_shape=face_shape,
-        face_band_extent=face_band_extent, parent_route=parent_route,
-        packed_projection=parent_route is not None)
+        face_band_extent=face_band_extent, parent_route=parent_route)
 
     g_plan = None
     g_plans = None
     use_packed = False
     k_unfold_plan = None if parent_route is None else parent_route.plan
-    _unfold_output = "packed" if parent_route is not None else "canonical"
     if layout == "face":
         from distrib_la import gemm_plan
         g_shape = (face_shape if parent_route is None
@@ -655,22 +655,18 @@ def _get_sigma_kij_kernel(
                 return build_G_tau(
                     xn, yr, E, 1j * t, e_ref=ref, mask=sel,
                     E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan,
-                    k_unfold_plan=k_unfold_plan,
-                    k_unfold_output=_unfold_output)
+                    k_unfold_plan=k_unfold_plan)
             return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
                                layout=layout, gemm=g_plan,
-                               k_unfold_plan=k_unfold_plan,
-                    k_unfold_output=_unfold_output)
+                               k_unfold_plan=k_unfold_plan)
         if energy_windows:
             return build_G_tau(
                 xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
                 E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan,
-                k_unfold_plan=k_unfold_plan,
-                    k_unfold_output=_unfold_output)
+                k_unfold_plan=k_unfold_plan)
         return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
                            layout=layout, gemm=g_plan,
-                           k_unfold_plan=k_unfold_plan,
-                    k_unfold_output=_unfold_output)
+                           k_unfold_plan=k_unfold_plan)
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
@@ -999,7 +995,7 @@ def get_shared_sigma_tau_kernel(
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
-           bool(pack_brackets), id(parent_route))
+           bool(pack_brackets), _route_key(parent_route))
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 

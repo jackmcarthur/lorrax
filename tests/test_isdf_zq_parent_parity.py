@@ -142,22 +142,23 @@ def _worker(case_name: str) -> int:
 
     plan = build_centroid_k_unfold_plan(
         sym_fx, cent_idx, fft_grid, mesh, nspinor=ns,
-        parent_k_frac=parent_k, canonical_centroid_extent=8)
+        parent_k_frac=parent_k)
     tiles = plan.real_grid_tiles(target_width=32)
     assert tiles.width <= 32 and tiles.n_tiles >= 2, (tiles.width, tiles.n_tiles)
 
-    # ---- centroid faces: full-k canonical, parent packed ----------------
+    # ---- centroid faces, both in the run's PACKED order ------------------
+    # (the loader samples the packed table; the host packer stands in here)
+    pack = plan.layout.axis.pack_host
     mun_sh = NamedSharding(mesh, P(None, None, "x", "y"))
     nmu_sh = NamedSharding(mesh, P(None, "x", None, "y"))
-    psi_mun_full = jax.device_put(jnp.asarray(
-        psi_full[:, :, :, cent_flat].transpose(0, 2, 3, 1)), mun_sh)
-    psi_nmu_full = jax.device_put(jnp.asarray(
-        psi_full[:, :, :, cent_flat]), nmu_sh)
-    with mesh:
-        psi_nmu_pk, psi_mun_pk = plan.pack_face_pair(
-            jax.device_put(jnp.asarray(psi_parent[:, :, :, cent_flat]), nmu_sh),
-            jax.device_put(jnp.asarray(
-                psi_parent[:, :, :, cent_flat].transpose(0, 2, 3, 1)), mun_sh))
+    psi_mun_full = jax.device_put(jnp.asarray(pack(
+        psi_full[:, :, :, cent_flat].transpose(0, 2, 3, 1), axis=2)), mun_sh)
+    psi_nmu_full = jax.device_put(jnp.asarray(pack(
+        psi_full[:, :, :, cent_flat], axis=3)), nmu_sh)
+    psi_nmu_pk = jax.device_put(jnp.asarray(pack(
+        psi_parent[:, :, :, cent_flat], axis=3)), nmu_sh)
+    psi_mun_pk = jax.device_put(jnp.asarray(pack(
+        psi_parent[:, :, :, cent_flat].transpose(0, 2, 3, 1), axis=2)), mun_sh)
     jax.block_until_ready((psi_nmu_pk, psi_mun_pk))
 
     # ---- ψ(G) mock stores: the identity FFT box ----------------------------
@@ -227,7 +228,9 @@ def _worker(case_name: str) -> int:
         r_start_dyn=0, r_chunk_size=n_rtot,
         kgrid=kgrid, mesh_xy=mesh, layout="face",
         psi_mun=psi_mun_full, weight_l=w_l, weight_r=w_r,
-        cache_face_y_blocks=True)))               # (nk, 8, 64)
+        cache_face_y_blocks=True)))               # (nk, mu_pk, 64)
+    # both routes run in the packed order; compare in canonical rows
+    Z_face = plan.layout.axis.unpack_host(Z_face, axis=1)   # (nk, 8, 64)
 
     # ---- parent route, both ψ(r) sources, every tile -------------------
     parent_cache = jax.block_until_ready(
@@ -250,8 +253,8 @@ def _worker(case_name: str) -> int:
                 tile_r_index=jnp.asarray(r_index, dtype=jnp.int32),
                 tile_local_perm=jnp.asarray(local_perm),
                 tile_wraps=jnp.asarray(wraps))
-            Z_can = np.asarray(jax.block_until_ready(
-                plan.restore_left_basis(Z_pk)))   # (nk, 8, width)
+            Z_can = plan.layout.axis.unpack_host(
+                np.asarray(jax.block_until_ready(Z_pk)), axis=1)  # (nk, 8, width)
             assert Z_can.shape == (nk, 8, tiles.width), Z_can.shape
             diff = Z_can[:, :, active] - Z_face[:, :, r_index[active]]
             max_rel = max(max_rel, float(np.max(np.abs(diff))) / scale)

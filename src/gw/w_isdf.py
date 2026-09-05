@@ -519,19 +519,13 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
                        mask=mask_v, layout="face", gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan,
-                       k_unfold_output=(
-                           "packed" if k_unfold_plan is not None
-                           else "canonical")),
+                       k_unfold_plan=k_unfold_plan),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
                        mask=mask_c, layout="face", gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan,
-                       k_unfold_output=(
-                           "packed" if k_unfold_plan is not None
-                           else "canonical")),
+                       k_unfold_plan=k_unfold_plan),
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
@@ -541,10 +535,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     )
 
     def _finish_chi(value):
-        value_q = _chi_fftn_local(value)
-        if k_unfold_plan is not None:
-            value_q = k_unfold_plan.restore_operator_basis(value_q)
-        return value_q
+        return _chi_fftn_local(value)
 
     if n_out >= 2:
         _chi_R_out = tuple(_chi_R_shard for _ in range(n_out))
@@ -962,13 +953,8 @@ def _get_chi_fractional_contour_kernel_face(
     # _get_chi_minimax_kernel_face's own g_plan.
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                        nq=expected_input_nk, dtype=jnp.complex128)
-    _unfold_output = "packed" if k_unfold_plan is not None else "canonical"
-
     def _finish(value):
-        value_q = chi_fftn(value)
-        if k_unfold_plan is not None:
-            value_q = k_unfold_plan.restore_operator_basis(value_q)
-        return value_q
+        return chi_fftn(value)
 
     @partial(
         jax.jit,
@@ -1028,7 +1014,6 @@ def _get_chi_fractional_contour_kernel_face(
                     layout="face",
                     gemm=g_plan,
                     k_unfold_plan=k_unfold_plan,
-                    k_unfold_output=_unfold_output,
                 )),
                 G_shard,
             )
@@ -1043,7 +1028,6 @@ def _get_chi_fractional_contour_kernel_face(
                     layout="face",
                     gemm=g_plan,
                     k_unfold_plan=k_unfold_plan,
-                    k_unfold_output=_unfold_output,
                 )),
                 G_shard,
             )
@@ -1513,8 +1497,8 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
     # passes the complete packed carrier extent explicitly.  Never infer the
     # latter from ``n_rmu`` merely because it is the array width -- that was
     # the historical opt-out-by-omission path for scalar padding.
-    n_log = (int(meta.n_rmu) if n_rmu_logical is None
-             else int(n_rmu_logical))
+    n_log = (int(getattr(meta, 'mu_solve_extent', meta.n_rmu))
+             if n_rmu_logical is None else int(n_rmu_logical))
 
     if dyson == "distributed":
         solve_fn = _get_w_solve_fn_distributed(
@@ -1544,8 +1528,8 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
         raise ValueError(
             "solve_w requires equal rank-3 square (q,mu,nu) operands; "
             f"got V_q.shape=chi0_q.shape={v_shape}.")
-    n_logical = (int(meta.n_rmu) if n_rmu_logical is None
-                 else int(n_rmu_logical))
+    n_logical = (int(getattr(meta, 'mu_solve_extent', meta.n_rmu))
+                 if n_rmu_logical is None else int(n_rmu_logical))
     mu_axis = padded_mu_axis(n_logical, mesh_xy)
     authenticate_padded_axis(
         mu_axis.logical, v_shape[1], mu_axis,
@@ -3571,11 +3555,11 @@ def compute_chi0_static_fractional_gamma(
     surface_full = jnp.pad(surface, pad2)
     carrier = wfns.green_parent
     if carrier is not None:
-        # Raw parents: packed parent faces + unfold tables in, PACKED-order
-        # χ out; restore the canonical centroid order once.
+        # Raw parents: packed parent faces + unfold tables in, χ out in the
+        # run's packed order like every other operator.
         plan = carrier.plan
         tables, _ = _parent_face_unfold_operands(plan, mesh_xy)
-        value = _get_chi_static_fractional_gamma_kernel_face(
+        return _get_chi_static_fractional_gamma_kernel_face(
             mesh_xy,
             nb_full=nb_full,
             nb_logical=int(nb_logical),
@@ -3583,7 +3567,6 @@ def compute_chi0_static_fractional_gamma(
             k_unfold_plan=plan,
         )(carrier.psi_mun, carrier.psi_nmu, e_full, f_full, surface_full,
           *tables)
-        return plan.restore_operator_basis(value)
     return _get_chi_static_fractional_gamma_kernel_face(
         mesh_xy,
         nb_full=nb_full,
@@ -3757,11 +3740,6 @@ def compute_chi0_direct_fractional(
         value = kernel(
             psi_mun_in, psi_nmu_in, jnp.asarray(row), e_full, f_full,
             surface_full, jnp.asarray(z), *tables)
-        if plan is not None:
-            # PACKED centroid order on both axes -> canonical, one q row
-            # ((n_z, mu, nu), still P(None,'x','y')) at a time: never the
-            # stacked full-BZ sample set as one operand.
-            value = plan.restore_operator_basis(value)
         if progress_fn is not None:
             value.block_until_ready()
             progress_fn(q_row + 1, len(kmq), time.monotonic() - started)

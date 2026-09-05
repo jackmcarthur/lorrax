@@ -1519,10 +1519,8 @@ def _c_q_face_parent(
 	UNCHANGED k-IFFT / spin-trace / k-FFT tail of :func:`_c_q_face`.  The
 	incumbent tail consumes ``P = conj(D)``; the elementwise conjugate is
 	taken after the unfold so that no second spin or phase convention is
-	written here.  Both centroid endpoints are in the plan's orbit-packed
-	order through the tail; the returned ``C_q`` is restored to canonical
-	order once (:meth:`restore_operator_basis`), because the factor/solve
-	invariants assume a logical-prefix centroid block.
+	written here.  Both centroid endpoints are in the run's orbit-packed
+	order, like every other operator.
 
 	Charge channel only: a current vertex needs the Cartesian action the plan
 	does not own (``gw.gw_init._resolve_parent_green_admission``).
@@ -1595,8 +1593,7 @@ def _c_q_face_parent(
 			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
 			return C_q_3d.reshape(nk, mu_loc, col_loc)
 
-		C_packed = _tail(D_l_full, D_r_full)
-		return plan.restore_operator_basis(C_packed)
+		return _tail(D_l_full, D_r_full)
 
 	return _fused(psi_mun_parent, psi_nmu_parent,
 	             jnp.asarray(weight_l, dtype=jnp.float64),
@@ -3057,8 +3054,7 @@ def _z_q_face_parent(
 	    tile_local_perm: (2·n_sym, R_t) int32 owner-local r source offsets
 	    tile_wraps     : (2·n_sym, R_t, 3) lattice wraps of the r sources
 	Returns ``Z_q`` (nk_full, mu_pk, R_t) P(None,'x','y'): centroids in the
-	plan's PACKED order (restore with ``plan.restore_left_basis`` before the
-	canonical solve), r in the tile's slot order, pad slots exactly zero.
+	run's packed order, r in the tile's slot order, pad slots exactly zero.
 	Charge channel only (see :func:`_c_q_face_parent`).
 	"""
 	from common.wfn_transforms import to_rpoints_inner
@@ -7409,19 +7405,15 @@ def _make_fit_one_rchunk_kernel(
         # preserves that JIT's numerical lowering and bit identity.
         if q_irr_idx_j is not None and int(Z_q.shape[0]) == int(meta.nk_tot):
             Z_q = Z_q[q_irr_idx_j]
-        if (k_unfold_plan is not None
-                and int(Z_q.shape[1]) == int(k_unfold_plan.n_centroid_packed)
-                and int(Z_q.shape[1]) != int(meta.n_rmu_padded)):
-            Z_q = k_unfold_plan.restore_left_basis(Z_q)
-        # ``n_rmu_logical=meta.n_rmu``: the per-q dense solves run at
-        # the LOGICAL μ extent (ζ pad rows zero-filled after) so ζ is
-        # independent of the pad extent / device count.  See
-        # solve_zeta's n_rmu_logical docstring.
+        # ``n_rmu_logical=meta.mu_solve_extent``: the per-q dense solves
+        # run at the LOGICAL μ extent (ζ pad rows zero-filled after) when
+        # the pads are a suffix, and at the whole packed carrier (identity
+        # on the pad diagonal, zero pad rows in Z) when they are interleaved.
         return solve_zeta(
             L_q, Z_q, mesh_xy, q_chunk_size,
             solver_kind=solver_kind,
             cct_trace_per_q=cct_trace_per_q,
-            n_rmu_logical=int(meta.n_rmu),
+            n_rmu_logical=int(getattr(meta, 'mu_solve_extent', meta.n_rmu)),
             zeta_gather=zeta_gather,
             lu_piv=lu_piv,
             distrib_la_batched_route=distrib_la_batched_route)
@@ -7662,11 +7654,6 @@ def fit_one_rchunk(
             if q_irr_full_idx is not None:
                 Z_q = Z_q[jnp.asarray(
                     np.asarray(q_irr_full_idx, dtype=np.int32))]
-            if k_unfold_plan is not None:
-                # Parent route: centroids leave the kernel in the plan's
-                # packed order; the factor was formed canonically.  One
-                # x-axis exchange on the q-selected RHS, then the solve.
-                Z_q = k_unfold_plan.restore_left_basis(Z_q)
             Z_q.block_until_ready()
         else:
             Z_q = _prebuilt_Z_q

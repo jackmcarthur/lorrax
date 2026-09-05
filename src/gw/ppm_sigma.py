@@ -341,6 +341,7 @@ def fit_ppm(
     print_fn=None,
     model_label: str = "PPM",
     n_mu_logical: int,
+    mu_active_mask=None,
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
     ordered_orientations: bool = False,
@@ -381,6 +382,7 @@ def fit_ppm(
     fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
+         mu_active_mask=mu_active_mask,
          q_neg_index=q_neg_index,
          coarsen_extreme_tails=bool(coarsen_extreme_tails),
          ordered_orientations=bool(ordered_orientations),
@@ -975,6 +977,12 @@ def compute_sigma_c_ppm_omega_grid(
 
     Omega_p, B_p, B_odd_p = _ppm_as_one_pole_store_fields(
         state, ppm.B_odd_q)
+    if getattr(meta, 'mu_basis', None) is not None:
+        # The store keeps the canonical centroid order (grid-agnostic).
+        Omega_p, B_p = (meta.mu_basis.unpack_operator(Omega_p),
+                        meta.mu_basis.unpack_operator(B_p))
+        if B_odd_p is not None:
+            B_odd_p = meta.mu_basis.unpack_operator(B_odd_p)
     from file_io.mpa_store import write_complete_pole_store_collective
 
     diagram_value = str(getattr(

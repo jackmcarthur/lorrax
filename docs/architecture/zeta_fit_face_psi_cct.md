@@ -363,18 +363,17 @@ through a `lax.scan` inside the local `shard_map`: one full-k IFFT pair
 is live at a time. A Python-unrolled loop lets the compiler overlap these
 buffers, increasing the live set and cold compile time. The scan leaves
 the parent band contraction and service-owned spin/phase/TRS action intact.  The Z_q tile
-leaves the kernel with centroids in packed order and r in slot order; the
-q-selected RHS is restored to canonical centroid order by one x exchange
-(`plan.restore_left_basis`) before the unchanged solve, and
+leaves the kernel with centroids in the run's packed order (the one
+in-memory order, see below) and r in slot order; the q-selected RHS goes
+straight to the unchanged solve, and
 `accumulate_rchunk_to_gflat(r_indices=...)` scatters the slots into the
 G-flat box.  `_c_q_face_parent` is the square case: one planned GEMM per
 side on `n_parent` rows, `plan.unfold_operator`, conj, the `_c_q_face`
-tail, one canonical restore.
+tail.
 
 Admission (`gw.gw_init.prepare_isdf_and_wavefunctions`): `low_mem_bands`,
 `bispinor = false`, one- or two-component spinors, `wfn.nkpts < nk_tot`,
-an orbit-closed centroid set whose packed extent bridges to the canonical
-carrier, and a fresh charge fit.  No deck key; a run announces
+an orbit-closed centroid set, and a fresh charge fit.  No deck key; a run announces
 `C_q on raw parents` / `Z_q on raw parents` with the tile census.  The
 charge vertex only: a current vertex needs the Cartesian action the plan
 does not own.  Parity gates: `tests/test_isdf_zq_parent_parity.py`
@@ -386,38 +385,60 @@ equal the full-k face kernels at <1e-10) and
 phase sign, dropped antiunitary conjugation and identity spinor arms are
 O(1)).
 
+### One in-memory centroid order; files stay canonical
+
+Every centroid axis a gwjax run computes on is in the ORBIT-PACKED order of
+`common.grouped_layout` (`common.centroid_basis.PackedCentroidBasis`,
+built once in `gw_jax` from the centroid table and the point group and
+carried as `meta.mu_basis`; `meta.n_rmu_padded` is its packed extent).
+Whole symmetry orbits sit on one X (or Y) shard, so every symmetry action
+is a rank-local gather; each shard ends in exact-zero pad slots, so the
+pads are interleaved per shard and are NOT a global suffix.  The loader
+samples ψ at the packed centroid table and zeroes the pad slots; from
+there ψ faces, Z_q, C_q, ζ(μ,G), V, χ0, W, pole residues, G and Σ all
+inherit the order and no kernel converts.  Two things change because the
+pads are interleaved: dense factors/solves run at the whole packed extent
+with 1 on the pad diagonal of C_q (its pad rows/columns are exact zeros,
+Z's pad rows are zero, so ζ's are; `meta.mu_solve_extent`), and the
+GN-PPM "pad modes born dead" selector is the active-slot mask
+(`meta.mu_active_mask`) rather than an index prefix.  The Dyson matrix
+`1 - Vχ` already carries 1 on its pads.  A bispinor deck, a trivial group
+or a non-closed centroid set uses the identity layout (canonical order,
+every conversion a no-op).
+
+Files keep the CANONICAL centroid-file order, suffix padded to the mesh
+multiple, so ζ h5, restart tensors and the MPA sample/pole store stay
+processor-grid agnostic and BSE/htransform/downfold read them unchanged.
+Conversion happens ONLY at the I/O seam, through the basis: a writer
+unpacks (`unpack_axis`/`unpack_operator`: ζ(μ,G) before its slab write,
+V/W0/ψ faces before the restart writer, χ/W samples and GN-PPM poles
+before the store), a reader packs (`pack_axis`/`pack_operator`: V after
+its assembly from the ζ file, restart tensors and faces after the reader,
+pole batches after the store read, the head-channel columns).  Each
+conversion is one volume-preserving all-to-all round trip per axis with a
+rank-local prefix pad/crop inside the shard (never an all-gather; the
+extent change 836↔840 on Si is a per-shard slice).  In-memory q-wedge
+unfold tables come from the canonical resolution conjugated into the packed
+order (`_resolve_ibz_q_list(mu_basis=)` → `basis.pack_tables`); the W0
+pre-unfold capture converts itself back (`PreUnfoldCapture.canonical`) so
+the writer's table cross-check still compares the producer's own tables.
+
 ### Σ on the parents and parents-only storage
 
 The same plan and carrier serve Σ (`gw.wavefunction_bundle.ParentSigmaRoute`,
 `sigma_face_kernel_kwargs`, `parent_sigma_operands`): G is contracted on the
-packed parent faces (`build_G(..., k_unfold_plan=plan)`), the full-k Σ
-operator after the FFT convolution is selected on the parents' own full-k
-rows (`plan.parent_full_rows` = `SymMaps.kirr_fullids`), projected with the
-CANONICAL parent faces, and the band matrix is broadcast to full k by
+parent faces (`build_G(..., k_unfold_plan=plan)`) and unfolded to full k in
+the run's order, the full-k Σ operator after the FFT convolution is selected
+on the parents' own full-k rows (`plan.parent_full_rows` =
+`SymMaps.kirr_fullids`), projected with the same parent faces, and the band
+matrix is broadcast to full k by
 `symmetry_maps.unfold_file_wedge_band_operator(trs_rule="transpose")`.  The
 rule is the transpose because Σ transforms like G: with ψ_Θk = Θψ_k,
 G_Θk(r,r') = G_k(r',r) at the same complex frequency, so Σ_Θk,mn = Σ_k,nm
 (the conj rule would flip Im Σ on the diagonal).  Gate:
-`tests/test_sigma_parent_projection.py`.
-
-The dynamic τ chain runs entirely in PACKED centroid order: G is unfolded
-to packed full k (`k_unfold_output="packed"`, no `finish_green` restore per
-τ node — that restore was four all-to-all exchanges per node on Si), the
-screened interaction's residues are packed once per pole batch
-(`plan.pack_square_operator`), the FFT convolution is order-agnostic, and
-the projection uses the packed parent faces
-(`parent_sigma_operands(projection="packed")`).  ψ†Σψ is the same in either
-basis because the permutation acts on both factors and the pad slots of ψ
-are zero.  The static kernels (invalid-pole limit, COHSEX) keep the
-canonical order through `finish_green`.
-
-Where a canonical crop is still needed (`restore_left_basis` for the ζ-fit
-RHS, `restore_operator_basis` in `finish_green`), the reorder lays each
-shard's canonical rows as that shard's OWN prefix
-(`_shardwise_prefix_map`) and the crop is a rank-local slice inside a
-`shard_map` (`_local_prefix_crop`).  The former global slice to a
-non-shard-aligned extent made XLA all-gather the whole centroid axis on
-every rank (Si: c128[8, 840, 1384] from a [8, 420, 1384] tile).
+`tests/test_sigma_parent_projection.py`.  There is no per-τ-node basis
+move anywhere (the former canonical restore cost four all-to-all exchanges
+per node on Si).
 
 When every wavefunction consumer of a run is parent-capable, `gw_init`
 never forms the full-k faces at all: the loader samples the raw parents
@@ -427,13 +448,13 @@ never forms the full-k faces at all: the loader samples the raw parents
 carrier.  The run announces `ψ storage: parents only`.  ζ reuse is
 allowed (the plan does not depend on the fit).  Restart tensors carry the
 raw-parent faces in canonical order (`psi_parent_y`, `psi_parent_y_mun`,
-`psi_parent_k_rows`) and no `psi_full_y`; the restart branch rebuilds the
-plan and the carrier from them and announces `ψ storage: parents only
+`psi_parent_k_rows`) and no `psi_full_y`; the restart branch packs them,
+rebuilds the plan and the carrier and announces `ψ storage: parents only
 (restart)`.  Fractional occupations are parent-capable: the contour χ0
 rides the Green transport, and the static-Γ / direct-q pair scans unfold
 each band tile from the packed parents inside the scan
 (`symmetry_maps.unfold_wavefunction_local`, the one-endpoint typed action).
-The self-consistent map's rotation acts on the carrier's four faces at the
+The self-consistent map's rotation acts on the carrier's faces at the
 parents' rows (`wavefunction_bundle.rotate_wavefunctions`).
 
 Consumers that still read full-k ψ keep the run on full k and are named

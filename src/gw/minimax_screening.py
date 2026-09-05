@@ -323,6 +323,7 @@ def fit_gn_ppm_from_wc_pair(
     coarsen_extreme_tails: bool = False,
     ordered_orientations: bool = False,
     print_fn=print,
+    mu_active_mask=None,
 ) -> GNPPMFitResult:
     """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
 
@@ -409,6 +410,10 @@ def fit_gn_ppm_from_wc_pair(
             f"positive; got {fallback_omega!r}.")
     _z = jnp.asarray(probe_omega, dtype=jnp.complex128)
     _fb = jnp.asarray(fallback_host, dtype=jnp.float64)
+    # The real centroid slots as a traced operand: the run's packed order
+    # interleaves its pad slots per shard, so a prefix cannot name them.
+    _mask = (None if mu_active_mask is None
+             else jnp.asarray(np.asarray(mu_active_mask, dtype=bool)))
     _W0 = jnp.asarray(Wc0_qmunu)
     ordered = bool(ordered_orientations)
     debug_odd_off = env_bool(
@@ -481,12 +486,12 @@ def fit_gn_ppm_from_wc_pair(
             (omega_vals, B_vals, good, n_good, n_modes,
              omega_min, omega_max, pair_rel_min,
              a_odd) = _gn_ppm_fit_kernel_ordered(
-                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
+                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log, _mask)
         else:
             # Whole thing fits: the historical single-shot call, untouched.
             (omega_vals, B_vals, good, n_good, n_modes,
              omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
-                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
+                Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log, _mask)
     else:
         _om, _bv, _gd, _aod = [], [], [], []
         n_good = jnp.asarray(0.0, dtype=jnp.float64)
@@ -500,13 +505,13 @@ def fit_gn_ppm_from_wc_pair(
                 (_o, _b, _g, _ng, _nm,
                  _omin, _omax, _rmin, _a) = _gn_ppm_fit_kernel_ordered(
                      Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
-                     _z, _fb, n_log)
+                     _z, _fb, n_log, _mask)
                 _aod.append(_a)
             else:
                 (_o, _b, _g, _ng, _nm,
                  _omin, _omax, _rmin) = _gn_ppm_fit_kernel(
                      Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
-                     _z, _fb, n_log)
+                     _z, _fb, n_log, _mask)
             _om.append(_o); _bv.append(_b); _gd.append(_g)
             # Exact integer counts -> summation order is irrelevant.
             n_good = n_good + _ng
@@ -804,7 +809,8 @@ def _coarsen_gn_ppm_extreme_tails(
     )
 
 @partial(jax.jit, static_argnums=(4,))
-def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
+def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log,
+                       mu_active_mask=None):
     """The GN-PPM fit as ONE XLA module.  Elementwise; layout-preserving.
 
     Why jitted (scorecard J.3 / AD).  Run eagerly this chain materialises
@@ -837,7 +843,10 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
     Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
     n_mu = int(Wc0.shape[-1])
 
-    mu_log = jnp.arange(n_mu) < n_log
+    # The real centroid slots: a boolean selector when the run's packed order
+    # interleaves its pad slots per shard, the logical prefix otherwise.
+    mu_log = (mu_active_mask if mu_active_mask is not None
+              else jnp.arange(n_mu) < n_log)
     mode_mask = mu_log[:, None] & mu_log[None, :]   # (μ, ν) logical selector
 
     denom = Wc0 - Wc_probe
@@ -941,7 +950,7 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
 
 @partial(jax.jit, static_argnums=(4,))
 def _gn_ppm_fit_kernel_ordered(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback,
-                               n_log):
+                               n_log, mu_active_mask=None):
     """The ordered-orientation twin of :func:`_gn_ppm_fit_kernel`.
 
     Same module, same eight outputs, plus the anti-Hermitian half of the
@@ -962,7 +971,7 @@ def _gn_ppm_fit_kernel_ordered(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback,
     anti = 0.5 * (Wc_probe - Wc_probe_adj)
     (omega_vals, B_vals, good, n_good, n_modes,
      omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
-        Wc0_qmunu, herm, z_probe, fallback, n_log)
+        Wc0_qmunu, herm, z_probe, fallback, n_log, mu_active_mask)
     return (
         omega_vals, B_vals, good, n_good, n_modes,
         omega_min, omega_max, pair_rel_min, anti,

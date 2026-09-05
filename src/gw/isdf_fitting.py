@@ -403,8 +403,8 @@ def fit_zeta_to_h5(
         if psi_nmu_parent is None or psi_mun_parent is None:
             raise ValueError(
                 "fit_zeta_to_h5: k_unfold_plan requires psi_nmu_parent= and "
-                "psi_mun_parent= (the plan's packed raw-parent faces, "
-                "gw.wavefunction_bundle.pack_parent_green_faces).")
+                "psi_mun_parent= (the raw-parent faces, "
+                "gw.wavefunction_bundle.parent_faces).")
         if (int(psi_mun_parent.shape[0]) != int(k_unfold_plan.n_parent)
                 or int(psi_mun_parent.shape[2])
                 != int(k_unfold_plan.n_centroid_packed)):
@@ -456,8 +456,13 @@ def fit_zeta_to_h5(
     # sees a non-singular matrix at its true extent.  zeta_q on disk
     # has logical extent (SlabIO clips the padded output against the
     # dataset's extent on write).
-    n_rmu = meta.n_rmu                      # logical
-    n_rmu_padded = meta.n_rmu_padded        # padded
+    n_rmu = meta.n_rmu                      # logical (the file extent)
+    n_rmu_padded = meta.n_rmu_padded        # padded (the in-memory carrier)
+    # Dense factor/solve extent: the whole carrier when the run's packed
+    # centroid order interleaves its pad slots per shard (identity on the pad
+    # diagonal below keeps them inert), the logical prefix otherwise.
+    n_rmu_solve = int(getattr(meta, 'mu_solve_extent', n_rmu))
+    mu_basis = getattr(meta, 'mu_basis', None)
     n_rtot = meta.n_rtot
     nk_tot = meta.nk_tot
     kgrid = meta.kgrid
@@ -824,6 +829,14 @@ def fit_zeta_to_h5(
         del C_q
         flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
+        if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
+            # Interleaved pad slots (orbit-packed order): C_q's pad rows and
+            # columns are exact zeros, so put 1 on the pad diagonal and the
+            # factor is nonsingular while Z's zero pad rows give zeta_pad = 0.
+            _pad_diag = jnp.diag(jnp.asarray(
+                ~mu_basis.active_mask, dtype=C_q_flat.dtype))
+            C_q_flat = jax.lax.with_sharding_constraint(
+                C_q_flat + _pad_diag[None], flat_shard)
         if _q_neg_idx is not None:
             C_q_flat = complete_ordered_pair_normal_equations(
                 C_q_flat, _q_neg_idx)
@@ -966,7 +979,7 @@ def fit_zeta_to_h5(
                 ('cusolvermp_lu', 'scalapack_lu')):
             with timing.section("zeta_fit.trace_L_q"):
                 factor_trace_per_q = jnp.einsum(
-                    'qii->q', C_q_flat[:, :n_rmu, :n_rmu])
+                    'qii->q', C_q_flat[:, :n_rmu_solve, :n_rmu_solve])
                 factor_trace_per_q.block_until_ready()
         if int(vertex_mu_L) == 0:
             _how = ("rank-truncated pinv"
@@ -1015,7 +1028,7 @@ def fit_zeta_to_h5(
             # distributed-library plan.
             L_q, lu_piv = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
-                n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
+                n_rmu_logical=n_rmu_solve, solver_kind=_resolved_solver_kind,
                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
                 transverse_zeta_rcond=float(transverse_zeta_rcond),
                 distrib_la_batched_route=distrib_la_batched_route,
@@ -1023,7 +1036,7 @@ def fit_zeta_to_h5(
         else:
             L_q = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
-                n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
+                n_rmu_logical=n_rmu_solve, solver_kind=_resolved_solver_kind,
                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
                 distrib_la_batched_route=distrib_la_batched_route)
             lu_piv = None
@@ -1062,7 +1075,7 @@ def fit_zeta_to_h5(
             # extent is already logical.  solve_zeta divides by the
             # logical n to match.
             cct_trace_per_q = jnp.einsum(
-                'qii->q', L_q[:, :n_rmu, :n_rmu])
+                'qii->q', L_q[:, :n_rmu_solve, :n_rmu_solve])
             cct_trace_per_q.block_until_ready()
     else:
         cct_trace_per_q = None
@@ -1684,7 +1697,7 @@ def fit_zeta_to_h5(
                                 vertex_mu_L=1,
                                 solver_kind=_resolved_solver_kind,
                                 cct_trace_per_q=trace_mu_q,
-                                n_rmu_logical=int(n_rmu),
+                                n_rmu_logical=n_rmu_solve,
                                 zeta_gather=_resolved_zeta_gather,
                                 distrib_la_batched_route=(
                                     distrib_la_batched_route))
@@ -1906,12 +1919,13 @@ def fit_zeta_to_h5(
                 _mask, gflat_acc, jnp.zeros_like(gflat_acc))
         jax.block_until_ready(gflat_acc)
         _n_G_sph = int(gflat_acc.shape[-1])
-        # On-disk extent is LOGICAL n_rmu (stated once, at the
-        # ``create_dataset`` above); in-memory buffer is PADDED
-        # ``n_rmu_padded``.  SlabIO clips the trailing μ pad rows
-        # against the dataset's own extent (they are zero by
-        # construction — L_q's pad block is identity), identically on
-        # every backend, with nothing said here.
+        # On-disk extent is LOGICAL n_rmu in the CANONICAL centroid order
+        # (stated once, at the ``create_dataset`` above).  The buffer is in
+        # the run's packed order: convert at this seam (one exchange), then
+        # SlabIO clips the trailing canonical pad rows against the dataset's
+        # own extent, identically on every backend.
+        if mu_basis is not None:
+            gflat_acc = mu_basis.unpack_axis(gflat_acc, 1)
         zeta_io.write_slab('zeta_q_G', gflat_acc)
     del gflat_acc
 

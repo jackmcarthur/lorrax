@@ -290,6 +290,9 @@ def _to_wedge(value, q_idx, mesh_xy):
 
 def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
     value = _to_wedge(value, q_idx, mesh_xy)
+    if getattr(meta, 'mu_basis', None) is not None:
+        # The store keeps the canonical centroid order (grid-agnostic).
+        value = meta.mu_basis.unpack_operator(value)
     value.block_until_ready()
     mpa_store.write_w_slab_collective(
         path, name, index, value, mesh_xy=mesh_xy,

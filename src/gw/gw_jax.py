@@ -468,13 +468,22 @@ def main(argv=None):
 	# historical Meta construction.
 	_sc_buffer = (int(config.sc.buffer_nbands)
 	              if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
+	# THE in-memory centroid order (common.centroid_basis): whole symmetry
+	# orbits per shard so every symmetry action is rank-local; files keep
+	# the canonical order and convert at the I/O seam.  A bispinor deck keeps
+	# the canonical order: its transverse channel has no packed layout yet.
+	from common.centroid_basis import PackedCentroidBasis
+	mu_basis = PackedCentroidBasis.build(
+		centroid_indices, sym, wfn.fft_grid, mesh_xy,
+		identity=bool(config.bispinor))
+	print0(f"  {mu_basis.describe()}")
 	meta = Meta.from_system(wfn, sym,
 	                        int(config.nval) + _sc_buffer,
 	                        int(config.ncond) + _sc_buffer, config.nband,
 	                        n_rmu, charge_bispinor,
 	                        nband_chi=config.bands.chi,
 	                        nband_sigma=config.bands.sigma,
-	                        mesh_xy=mesh_xy)
+	                        mesh_xy=mesh_xy, mu_basis=mu_basis)
 	if _sc_buffer:
 		print0(
 			f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "

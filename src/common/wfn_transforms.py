@@ -2581,6 +2581,15 @@ def load_centroids_band_chunked(
     nk_tot = (int(meta.nk_tot) if domain == "full_bz"
               else int(wfn.nkpts))
     nspinor = int(meta.nspinor)
+    # The run's in-memory centroid order (``meta.mu_basis``): sample ψ at the
+    # PACKED table and zero its pad slots, so every face leaves here in the
+    # order the whole run computes in.  Without a basis the canonical table
+    # is sampled and suffix-padded as before.
+    mu_basis = getattr(meta, 'mu_basis', None)
+    mu_active_mask = None
+    if mu_basis is not None:
+        centroid_indices = mu_basis.packed_indices
+        mu_active_mask = np.asarray(mu_basis.active_mask, dtype=bool)
     n_rmu = int(centroid_indices.shape[0])
     centroid_idx_np = np.asarray(centroid_indices, dtype=np.int32)
     n_rtot = int(meta.fft_grid[0]) * int(meta.fft_grid[1]) * int(meta.fft_grid[2])
@@ -2827,6 +2836,10 @@ def load_centroids_band_chunked(
     @partial(jax.jit, out_shardings=(out_Y, out_X))
     def _reshard_centroid_tile(psi_rmu_band):
         pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
+        if mu_active_mask is not None:
+            psi_rmu_band = jnp.where(
+                jnp.asarray(mu_active_mask)[None, None, None, :],
+                psi_rmu_band, jnp.zeros((), dtype=psi_rmu_band.dtype))
         psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
         if n_rmu_padded > n_rmu:
             psi_rmu = jnp.pad(psi_rmu, pad_cfg)

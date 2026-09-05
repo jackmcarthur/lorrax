@@ -1602,15 +1602,15 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                 "(psi_parent_y, written by a parents-only low_mem_bands run) "
                 "and no full-k psi_full_y; the legacy layout has no parent "
                 "reader.  Read it with low_mem_bands = true.")
-        parent_k_rows = (
-            np.asarray(f["psi_parent_k_rows"][()], dtype=np.int64)
-            if has_parent_psi else None)
-        if has_parent_psi and (parent_k_rows is None
-                               or "psi_parent_y_mun" not in f):
+        if has_parent_psi and not (
+                "psi_parent_y_mun" in f and "psi_parent_k_rows" in f):
             raise ValueError(
                 f"Restart file {filename} has psi_parent_y but not both "
                 "psi_parent_y_mun and psi_parent_k_rows: a torn parents-only "
                 "write.  Rerun with restart = false.")
+        parent_k_rows = (
+            np.asarray(f["psi_parent_k_rows"][()], dtype=np.int64)
+            if has_parent_psi else None)
         # THE UNFOLD TABLES, while this handle is open and before any tensor
         # bytes move.  Empty on every full-BZ and legacy file, which is what
         # keeps those reads on the byte path they have always had.
