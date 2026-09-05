@@ -371,12 +371,18 @@ def _integrate_sigma_batches(
     stop_probe = False
     for lo, Omega, B, B_odd in batches:
         if parent_route is not None:
-            # The parent chain runs in PACKED centroid order: pack the
-            # residues once per batch so every W(τ) built from them is
-            # packed too (G is unfolded to packed full k and never restored).
-            B = parent_route.plan.pack_square_operator(B)
+            # The parent chain runs in PACKED centroid order: pack every
+            # operator-shaped pole field once per batch so W(τ) built from
+            # them is packed too (G is unfolded to packed full k and never
+            # restored).  GN-PPM's pole frequency is per (q, mu, nu) and must
+            # follow the residues; MPA's scalar poles are left alone.
+            _plan = parent_route.plan
+            _mu_can = int(_plan.canonical_centroid_extent)
+            B = _plan.pack_square_operator(B)
             if B_odd is not None:
-                B_odd = parent_route.plan.pack_square_operator(B_odd)
+                B_odd = _plan.pack_square_operator(B_odd)
+            if Omega.ndim >= 2 and tuple(Omega.shape[-2:]) == (_mu_can, _mu_can):
+                Omega = _plan.pack_square_operator(Omega)
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
             max_d = max(
