@@ -3301,10 +3301,49 @@ def prepare_isdf_and_wavefunctions(
 				and not bool(cfg.bispinor)
 				and int(meta.nspinor) in (1, 2)
 				and int(wfn.nkpts) < int(meta.nk_tot))
+			# Parents-only ψ storage: when every wavefunction consumer of
+			# this run is parent-capable, the full-k centroid faces are
+			# never formed and the raw parents are the run's only ψ.  Each
+			# consumer that still reads full-k faces keeps the run on full k
+			# and is named in the log.
+			_parents_only = False
+			_parents_only_blockers = []
+			if _parent_plan_wanted:
+				if chunks is None:
+					_parents_only_blockers.append(
+						"zeta reuse (no fresh charge fit)")
+				if str(getattr(cfg.head.correction, 'value',
+				               cfg.head.correction)) == 'full':
+					_parents_only_blockers.append(
+						"head_correction = full (the dynamic head wings read "
+						"full-k faces)")
+				if getattr(cfg, 'occ_smearing_family', None) is not None:
+					_parents_only_blockers.append(
+						"occ_smearing_family (fractional-occupation response "
+						"reads full-k faces)")
+				if str(getattr(cfg.qp_solver, 'value',
+				               cfg.qp_solver)) == 'self_consistent':
+					_parents_only_blockers.append(
+						"qp_solver = self_consistent (the map rotates the "
+						"full-k bundle)")
+				if (bool(cfg.compute_mode.needs_screening)
+						and str(getattr(cfg.screening.diagrams, 'value',
+						                cfg.screening.diagrams)) != 'w_rpa'):
+					_parents_only_blockers.append("non-RPA screening diagrams")
+				if restart_tensor_writes_enabled(cfg, tensors_filename):
+					_parents_only_blockers.append(
+						"write_restart_tensors = true (the psi_full_y append, "
+						"restart = true and BSE read full-k faces)")
+			_parents_only_wanted = (
+				_parent_plan_wanted and not _parents_only_blockers)
+			if _parent_plan_wanted and _parents_only_blockers:
+				print0("  ψ storage: full-k faces kept because "
+				       + "; ".join(_parents_only_blockers) + ".")
 			if (bool(cfg.memory.low_mem_bands)
 					and bool(cfg.compute_mode.needs_screening)
 					and int(wfn.nkpts) < int(meta.nk_tot)
-					and not _parent_green_work_ok):
+					and not _parent_green_work_ok
+					and not _parents_only_wanted):
 				_avoided = (int(band_slices.nb_full)
 					* (int(meta.nk_tot) - int(wfn.nkpts))
 					/ int(meta.nk_tot))
@@ -3356,6 +3395,14 @@ def prepare_isdf_and_wavefunctions(
 							f"{_candidate_plan.n_centroid_packed}/"
 							f"{meta.n_rmu_padded} while preserving all-P matrix "
 							"storage; using the full-k path.")
+					elif _parents_only_wanted:
+						# Parents-only storage: the carrier REPLACES the full-k
+						# faces (n_parent/nk of their bytes) so it always fits,
+						# and the Green work score does not apply -- screening has
+						# no other wavefunction to read.
+						_parents_only = True
+						_parent_green_plan = _candidate_plan
+						_parent_zeta_plan = _candidate_plan
 					elif _parent_green_fits:
 						if _parent_green_candidate:
 							_parent_green_plan = _candidate_plan
@@ -3395,11 +3442,18 @@ def prepare_isdf_and_wavefunctions(
 						if chunks is not None
 						else zeta_contract.loader_k_chunk),
 					bispinor_lift=(representation.charge_lift or "raw"),
+					k_domain=("ibz" if _parents_only else "full_bz"),
 					return_ibz_parents=(
-						_parent_green_plan is not None
-						or _parent_zeta_plan is not None),
+						not _parents_only
+						and (_parent_green_plan is not None
+						     or _parent_zeta_plan is not None)),
 				)
-			if _parent_green_plan is None and _parent_zeta_plan is None:
+			if _parents_only:
+				# Raw parents only: the loader sampled the WFN rows as stored;
+				# no full-k face exists to drop.
+				_parent_rmu_Y, _parent_rmuT_X = _loaded_centroid_faces
+				psi_rmu_Y = psi_rmuT_X = None
+			elif _parent_green_plan is None and _parent_zeta_plan is None:
 				psi_rmu_Y, psi_rmuT_X = _loaded_centroid_faces
 				_parent_rmu_Y = _parent_rmuT_X = None
 			else:
@@ -3430,15 +3484,16 @@ def prepare_isdf_and_wavefunctions(
 				from jax.sharding import NamedSharding
 				from .wavefunction_bundle import (
 					PSI_MUN_SPEC, PSI_NMU_SPEC, pack_parent_green_faces)
-				with mesh_xy:
-					psi_nmu_fresh = jax.lax.with_sharding_constraint(
-						psi_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
-					psi_mun_fresh = jax.lax.with_sharding_constraint(
-						jnp.conj(psi_rmuT_X).transpose(0, 3, 1, 2),
-						NamedSharding(mesh_xy, PSI_MUN_SPEC))
-				del psi_rmu_Y, psi_rmuT_X
-				psi_rmu_Y = None
-				psi_rmuT_X = None
+				if psi_rmu_Y is not None:
+					with mesh_xy:
+						psi_nmu_fresh = jax.lax.with_sharding_constraint(
+							psi_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+						psi_mun_fresh = jax.lax.with_sharding_constraint(
+							jnp.conj(psi_rmuT_X).transpose(0, 3, 1, 2),
+							NamedSharding(mesh_xy, PSI_MUN_SPEC))
+					del psi_rmu_Y, psi_rmuT_X
+					psi_rmu_Y = None
+					psi_rmuT_X = None
 				_parent_canonical_faces = None
 				if _parent_green_plan is not None or _parent_zeta_plan is not None:
 					from .wavefunction_bundle import parent_faces_canonical
@@ -3450,12 +3505,18 @@ def prepare_isdf_and_wavefunctions(
 					_parent_canonical_faces = parent_faces_canonical(
 						_parent_rmu_Y, _parent_rmuT_X, mesh_xy=mesh_xy)
 					del _parent_rmu_Y, _parent_rmuT_X
-				print0("  ψ face conversion (low_mem_bands): psi_nmu/"
-				       "psi_mun built from the fresh load; BOTH "
-				       "single-axis copies (psi_rmu_Y, psi_rmuT_X) "
-				       "dropped before the ζ fit -- the r-chunk loop "
-				       "now reads psi_mun_fresh directly, one "
-				       "band-chunk at a time (isdf.core._z_q_face).")
+				if _parents_only:
+					print0("  ψ storage: parents only -- no full-k centroid face "
+					       f"was formed; {_candidate_plan.n_parent} raw WFN parents "
+					       f"stand in for {_candidate_plan.n_full} full k rows in the "
+					       "ζ fit, screening and Σ through the typed local unfold.")
+				else:
+					print0("  ψ face conversion (low_mem_bands): psi_nmu/"
+					       "psi_mun built from the fresh load; BOTH "
+					       "single-axis copies (psi_rmu_Y, psi_rmuT_X) "
+					       "dropped before the ζ fit -- the r-chunk loop "
+					       "now reads psi_mun_fresh directly, one "
+					       "band-chunk at a time (isdf.core._z_q_face).")
 
 			zeta_path, mem_est, transverse_wfn_data = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
@@ -3581,7 +3642,8 @@ def prepare_isdf_and_wavefunctions(
 						f"centroid carrier {_parent_green_bytes / 1e9:.3f} "
 						"GB/dev.  Full-k FFTs and observables remain unchanged.")
 				print0(f"  Wavefunctions built (b0:b4={band_slices.nb_full} "
-				       f"bands, face layout: psi_nmu/psi_mun; "
+				       f"bands, face layout: "
+				       f"{'no full-k faces (parents-only storage)' if _parents_only else 'psi_nmu/psi_mun'}; "
 				       f"low_mem_bands=true) — V_q's baseline is the "
 				       f"face floor alone, no fit-input carryover")
 				# No deletion needed here any more.  Both single-axis

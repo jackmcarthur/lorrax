@@ -8,6 +8,9 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
 * G: ``build_G`` on the PACKED parent faces with ``k_unfold_plan`` equals
   ``build_G`` on the full-k faces, with complex (real-time-like) band phases
   so the antiunitary rule of the operator transport is live.
+* Parents-only bundle: a face bundle with BOTH full-k faces ``None`` and
+  the carrier as its only ψ names the full-k face shape and the route's
+  parent shapes to the kernel factories (``sigma_face_kernel_kwargs``).
 * Σ projection: ``ppm_tau_kernel._make_project_ri_reduce_scatter(parent_route)``
   — select the parents' rows of a full-k operator, project with the
   CANONICAL parent faces, broadcast the band matrix — equals the full-k face
@@ -199,10 +202,34 @@ def _worker() -> int:
     conj_rel_trs = float(np.max(np.abs(conj_rule[trs_rows] - ref[trs_rows]))) / scale
     conj_rel_uni = float(np.max(np.abs(conj_rule[uni_rows] - ref[uni_rows]))) / scale
 
+    # A parents-only bundle -- face layout, BOTH full-k faces None, the
+    # carrier its only ψ -- must name the full-k extents to every kernel
+    # factory exactly as a full-k bundle does (gw_init parents-only storage).
+    from gw.wavefunction_bundle import (
+        BandSlices, ParentGreenCarrier, Wavefunctions, padded_centroid_extent,
+        sigma_face_kernel_kwargs)
+    zeros_full = jnp.zeros((nk, nb))
+    carrier = ParentGreenCarrier(
+        psi_nmu=psi_nmu_pk, psi_mun=psi_mun_pk,
+        enk=jnp.zeros((n_parent, nb)), occ=jnp.zeros((n_parent, nb)),
+        plan=plan, psi_nmu_canonical=psi_nmu_par, psi_mun_canonical=psi_mun_par)
+    bare = Wavefunctions(
+        enk=zeros_full, occ=zeros_full,
+        slices=BandSlices.from_band_edges(0, 0, nb // 2, nb, nb),
+        layout="face", green_parent=carrier)
+    kw = sigma_face_kernel_kwargs(bare)
+    parents_only_ok = bool(
+        tuple(kw["face_shape"]) == (nk, nb, n_mu, ns)
+        and padded_centroid_extent(bare) == n_mu
+        and tuple(kw["parent_route"].g_face_shape)
+        == (n_parent, nb, plan.n_centroid_packed, ns)
+        and tuple(kw["parent_route"].proj_face_shape) == (n_parent, nb, n_mu, ns))
+
     print(json.dumps({
         "g_rel": g_rel, "proj_rel": proj_rel,
         "conj_rule_rel_on_tr_rows": conj_rel_trs,
         "conj_rule_rel_on_unitary_rows": conj_rel_uni,
+        "parents_only_bundle_names_full_k_shapes": parents_only_ok,
     }))
     return 0
 
@@ -240,6 +267,7 @@ def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
     # one: the transpose is the discriminating choice, not a convention.
     assert out["conj_rule_rel_on_unitary_rows"] < _TOL, out
     assert out["conj_rule_rel_on_tr_rows"] > 0.1, out
+    assert out["parents_only_bundle_names_full_k_shapes"] is True, out
 
 
 if __name__ == "__main__":

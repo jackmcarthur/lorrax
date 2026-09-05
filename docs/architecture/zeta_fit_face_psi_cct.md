@@ -383,6 +383,34 @@ equal the full-k face kernels at <1e-10) and
 phase sign, dropped antiunitary conjugation and identity spinor arms are
 O(1)).
 
+### Σ on the parents and parents-only storage
+
+The same plan and carrier serve Σ (`gw.wavefunction_bundle.ParentSigmaRoute`,
+`sigma_face_kernel_kwargs`, `parent_sigma_operands`): G is contracted on the
+packed parent faces (`build_G(..., k_unfold_plan=plan)`), the full-k Σ
+operator after the FFT convolution is selected on the parents' own full-k
+rows (`plan.parent_full_rows` = `SymMaps.kirr_fullids`), projected with the
+CANONICAL parent faces, and the band matrix is broadcast to full k by
+`symmetry_maps.unfold_file_wedge_band_operator(trs_rule="transpose")`.  The
+rule is the transpose because Σ transforms like G: with ψ_Θk = Θψ_k,
+G_Θk(r,r') = G_k(r',r) at the same complex frequency, so Σ_Θk,mn = Σ_k,nm
+(the conj rule would flip Im Σ on the diagonal).  Gate:
+`tests/test_sigma_parent_projection.py`.
+
+When every wavefunction consumer of a run is parent-capable, `gw_init`
+never forms the full-k faces at all: the loader samples the raw parents
+(`load_centroids_band_chunked(k_domain="ibz")`), the face bundle carries
+`psi_nmu = psi_mun = None` with the parent carrier as its only ψ, and
+`face_extents` names the full-k shapes to the kernel factories from the
+carrier.  The run announces `ψ storage: parents only`.  Consumers that
+still read full-k faces keep the run on full k and are named in the log:
+`head_correction = full` (dynamic head wings), `occ_smearing_family`
+(fractional-occupation response), `qp_solver = self_consistent`, non-RPA
+diagrams, ζ reuse, and `write_restart_tensors = true` (the `psi_full_y`
+append that `restart = true`, BSE and downfold read).  Porting those is the
+remaining "psi_nk_full" scope; the static head wing is a |ψ|² permutation,
+the dynamic wings need the plan's missing Cartesian action.
+
 ## Current face-route boundaries
 
 `fit_zeta_to_h5(low_mem_bands=True)` refuses, by name, before any

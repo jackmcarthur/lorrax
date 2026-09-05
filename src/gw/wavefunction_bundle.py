@@ -323,6 +323,11 @@ class Wavefunctions:
     :func:`build_wavefunctions_face` (face) rather than this dataclass
     directly — both name every field explicitly, including the ``None``
     half, so a caller cannot omit the layout tag's inverse by accident.
+
+    Under ``layout = "face"`` BOTH faces are also ``None`` when the run
+    stores raw parents only (``gw_init`` parents-only storage): the
+    ``green_parent`` carrier is then every ψ the run has, and
+    :func:`face_extents` reads the full-k extents from it.
     """
 
     enk: jax.Array       # (nk, nb_full) replicated
@@ -550,6 +555,33 @@ class AuthenticatedWavefunctions:
             self.wavefunctions, where="AuthenticatedWavefunctions")
 
 
+def face_extents(wfns: "Wavefunctions") -> tuple[int, int, int]:
+    """``(nk_full, nspinor, mu_padded)`` of a face bundle.
+
+    Read off ``psi_mun`` when the full-k faces exist; when the run stores
+    raw parents only (``gw_init`` parents-only storage: both faces
+    ``None``), off the parent carrier -- its plan names the full-k row
+    count and its CANONICAL faces carry the padded centroid extent every
+    full-k operator is stored at.  Every full-k shape a kernel factory
+    sizes itself by comes through here, so a parents-only bundle looks to
+    the factories exactly like a full-k one.
+    """
+    if wfns.layout != "face":
+        raise ValueError(
+            f"face_extents: layout={wfns.layout!r} carries no face.")
+    if wfns.psi_mun is not None:
+        nk, s, mu, _ = wfns.psi_mun.shape
+        return int(nk), int(s), int(mu)
+    carrier = wfns.green_parent
+    if carrier is None or carrier.psi_mun_canonical is None:
+        raise ValueError(
+            "face_extents: this face bundle holds no full-k faces and no "
+            "projection-capable parent carrier; nothing names its shape.")
+    return (int(carrier.plan.n_full), int(carrier.psi_mun.shape[1]),
+            int(carrier.psi_mun_canonical.shape[2]))
+
+
+
 def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
     """``{}`` under ``layout='legacy'``; ``{"layout": "face", "face_shape":
     (nk, nb_full, n_rmu, nspinor)}`` under ``layout='face'``.  With a
@@ -577,8 +609,8 @@ def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
             f"{wfns.layout!r} vs {wfns_right.layout!r}")
     if wfns.layout != "face":
         return {}
-    nk, s, mu, _ = wfns.psi_mun.shape
-    nk_r, s_r, mu_r, _ = wfns_right.psi_mun.shape
+    nk, s, mu = face_extents(wfns)
+    nk_r, s_r, mu_r = face_extents(wfns_right)
     left_shape = (nk, wfns.slices.nb_full, mu, s)
     right_shape = (nk_r, wfns_right.slices.nb_full, mu_r, s_r)
     result = {"layout": "face", "face_shape": left_shape}
@@ -915,7 +947,7 @@ def padded_centroid_extent(wfns: "Wavefunctions") -> int:
     if wfns.layout == "legacy":
         return int(wfns.psi_yr.shape[-1])
     if wfns.layout == "face":
-        return int(wfns.psi_mun.shape[2])
+        return face_extents(wfns)[2]
     raise ValueError(
         f"padded_centroid_extent: unknown layout {wfns.layout!r}")
 
@@ -957,8 +989,11 @@ def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
             continue
         out[f] = int(sum(int(s.data.nbytes) for s in arr.addressable_shards))
     if wfns.green_parent is not None:
-        for f in ("psi_nmu", "psi_mun"):
+        for f in ("psi_nmu", "psi_mun",
+                  "psi_nmu_canonical", "psi_mun_canonical"):
             arr = getattr(wfns.green_parent, f)
+            if arr is None:
+                continue
             out[f"green_parent.{f}"] = int(sum(
                 int(s.data.nbytes) for s in arr.addressable_shards))
     out["total"] = int(sum(out.values()))

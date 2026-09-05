@@ -343,10 +343,12 @@ def fit_zeta_to_h5(
                 "norms arm.  Set low_mem_bands=false, or drop pseudobands, "
                 "for this deck.  See KNOWN_LORRAX_ISSUES.md, \"zeta-fit "
                 "face CCT: pseudobands unported\".")
-        if psi_nmu_fresh is None or psi_mun_fresh is None:
+        if ((psi_nmu_fresh is None or psi_mun_fresh is None)
+                and k_unfold_plan is None):
             raise ValueError(
                 "fit_zeta_to_h5: low_mem_bands=True requires psi_nmu_fresh="
-                " and psi_mun_fresh= (the two-face carrier) -- see "
+                " and psi_mun_fresh= (the two-face carrier) unless a "
+                "k_unfold_plan with the packed parent faces is given -- see "
                 "gw.gw_init.prepare_isdf_and_wavefunctions.")
         if psi_rmu_Y is not None:
             raise ValueError(
@@ -542,13 +544,25 @@ def fit_zeta_to_h5(
                 # .nbytes check used to confirm the carrier's face arrays
                 # are genuinely 2*S/(Px*Py), not a same-shape single-axis
                 # replica.
-                _nmu_b = sum(int(s.data.nbytes)
-                             for s in psi_nmu_fresh.addressable_shards)
-                _mun_b = sum(int(s.data.nbytes)
-                             for s in psi_mun_fresh.addressable_shards)
-                print_fn(f"  [face carrier, per-rank bytes] psi_nmu_fresh="
-                         f"{_nmu_b/1e9:.4f} GB  psi_mun_fresh={_mun_b/1e9:.4f} "
-                         f"GB  (2*S/(Px*Py) expected)")
+                if psi_nmu_fresh is not None:
+                    _nmu_b = sum(int(s.data.nbytes)
+                                 for s in psi_nmu_fresh.addressable_shards)
+                    _mun_b = sum(int(s.data.nbytes)
+                                 for s in psi_mun_fresh.addressable_shards)
+                    print_fn(f"  [face carrier, per-rank bytes] psi_nmu_fresh="
+                             f"{_nmu_b/1e9:.4f} GB  psi_mun_fresh={_mun_b/1e9:.4f} "
+                             f"GB  (2*S/(Px*Py) expected)")
+                else:
+                    # Parents-only storage: the packed parent faces are the
+                    # run's only ψ, n_parent/nk of the full-k face bytes.
+                    _nmu_b = sum(int(s.data.nbytes)
+                                 for s in psi_nmu_parent.addressable_shards)
+                    _mun_b = sum(int(s.data.nbytes)
+                                 for s in psi_mun_parent.addressable_shards)
+                    print_fn(f"  [parent face carrier, per-rank bytes] "
+                             f"psi_nmu_parent={_nmu_b/1e9:.4f} GB  "
+                             f"psi_mun_parent={_mun_b/1e9:.4f} GB  "
+                             "(no full-k face resident)")
         else:
             # Cheap views — the caller keeps the full arrays alive for the
             # post-fit wfn bundle build, so we don't need independent
@@ -699,18 +713,24 @@ def fit_zeta_to_h5(
             # kernel._build_G_face's g_plan reuse across Gv/Gc).
             with timing.section("zeta_fit.CCT.face_gemm_plan"):
                 from distrib_la import gemm_plan as _gemm_plan
-                _ns_face = int(psi_mun_fresh.shape[1])
-                _nb_face = int(psi_mun_fresh.shape[3])
-                if int(psi_nmu_fresh.shape[1]) != _nb_face:
+                # Face extents from whichever pair the fit reads: the packed
+                # parent faces on the parent route (the full-k faces may not
+                # exist at all), the fresh full-k faces otherwise.
+                _face_l, _face_r = (
+                    (psi_mun_parent, psi_nmu_parent) if parent_route
+                    else (psi_mun_fresh, psi_nmu_fresh))
+                _ns_face = int(_face_l.shape[1])
+                _nb_face = int(_face_l.shape[3])
+                if int(_face_r.shape[1]) != _nb_face:
                     raise ValueError(
-                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun_fresh "
-                        f"band extent {_nb_face} != psi_nmu_fresh's "
-                        f"{int(psi_nmu_fresh.shape[1])}.")
-                if int(psi_nmu_fresh.shape[2]) != _ns_face:
+                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun "
+                        f"band extent {_nb_face} != psi_nmu's "
+                        f"{int(_face_r.shape[1])}.")
+                if int(_face_r.shape[2]) != _ns_face:
                     raise ValueError(
-                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun_fresh "
-                        f"spin extent {_ns_face} != psi_nmu_fresh's "
-                        f"{int(psi_nmu_fresh.shape[2])}.")
+                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun "
+                        f"spin extent {_ns_face} != psi_nmu's "
+                        f"{int(_face_r.shape[2])}.")
                 # GEMM-seam merge folds (s, μ) into ONE axis of size μ*ns
                 # (common.contract_bands.merge_spin_centroid) -- m/n must
                 # match that merged extent, exactly as
