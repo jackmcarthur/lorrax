@@ -31,8 +31,8 @@ solve for which padding is not inert. Distributed and symmetry services may
 authenticate an already-produced carrier at their provider boundary, but may
 not plan its extent. A static census covers `src/` and service source, names
 every exception with a disposition, and rejects every new local arithmetic or
-refusal site. Its registered LXDOCTOR logical-window diagnostic is an
-outstanding concurrent-lane defect to retire, not an accepted runtime rule.
+refusal site. The deck doctor reports the same logical/carrier/divisor receipt
+as the Sigma driver; an indivisible logical window is not a refusal.
 
 This supersedes the incomplete 2026-08-22 helper ruling and the 2026-08-06
 decision declining a common band-padding owner. Licenses deleting:

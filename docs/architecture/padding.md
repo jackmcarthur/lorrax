@@ -30,6 +30,9 @@ spec. If one axis must satisfy several specs, the owner uses their least common
 multiple. A product-sharded axis uses the product of the mesh axes in that
 single spec entry. This distinction covers the regression where a logical
 extent divides each mesh side but does not divide their product.
+Controlled invariance tests may request an extra pad from the owner. Consumers
+authenticate that explicit producer receipt, including its larger carrier,
+instead of reconstructing the minimum from the divisor alone.
 
 Dense solves run on the logical block through `solve_at_logical`; padding an
 ill-conditioned operator and solving the larger system is not an equivalent
@@ -71,6 +74,6 @@ Four refusal classes remain and are not pad opportunities:
 second round-up spelling, mesh-divisor modulo, or mesh-divisibility refusal
 outside the owner unless the exact topology/physics/provider exception above
 is named with its reason and follow-up. It scans both `src/` and service source.
-The register also exposes one concurrent-lane defect rather than accepting it:
-LXDOCTOR still tests the logical Sigma window against the mesh and must retire
-that diagnostic on its owning lane; runtime physics no longer makes that test.
+The deck doctor uses the driver's `sigma_band_axis` receipt and prints the
+logical extent, carrier, divisor, and pad. An indivisible physical band window
+is supported by that carrier and is not a preflight refusal.

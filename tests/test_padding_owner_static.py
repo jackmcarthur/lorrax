@@ -56,16 +56,7 @@ MODULO_EXCEPTIONS = {
         "reason": "cyclic y-axis ppermute destination",
         "follow_up": "retire with the legacy head-wing kernel",
     },
-    ("services/lxkit/src/lxkit/deck_doctor.py", "inspect_deck",
-     "sigma_window % px"): {
-        "reason": "concurrently owned launcher diagnostic, not runtime physics",
-        "follow_up": "LXDOCTOR owner must retire the logical-window refusal",
-    },
-    ("services/lxkit/src/lxkit/deck_doctor.py", "inspect_deck",
-     "sigma_window % py"): {
-        "reason": "concurrently owned launcher diagnostic, not runtime physics",
-        "follow_up": "LXDOCTOR owner must retire the logical-window refusal",
-    },
+
 }
 
 
