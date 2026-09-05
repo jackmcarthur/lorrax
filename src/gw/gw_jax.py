@@ -141,6 +141,25 @@ from .gw_output import (
 	write_results,
 )
 
+
+def _driver_builds_oneshot_head_response(
+		config, *, do_screened: bool, qp_solver: QPSolver) -> bool:
+	"""Whether the pre-screening driver owns a one-shot head frequency plan.
+
+	The internal contour-deformation oracle constructs and consumes its exact
+	static metallic head inside the streamed contour.  It therefore owns no
+	MPA sample plan or direct-response frequency vector here.
+	"""
+	return bool(
+		do_screened
+		and config.head.correction is HeadCorrection.FULL
+		and config.screening.diagrams is ScreeningDiagrams.W_RPA
+		and not packed_photon_replaces_charge_sigma(config)
+		and qp_solver is not QPSolver.SELF_CONSISTENT
+		and config.sigma.freq_route
+			is not SigmaFrequencyRoute.INTERNAL_FF_CD)
+
+
 def _setup_runtime() -> None:
 	"""Pre-init MPI for the one parallel-HDF5 transport.
 
@@ -686,19 +705,12 @@ def main(argv=None):
 	oneshot_head_response = None
 	oneshot_head_requests = None
 	oneshot_mpa_plan = None
-	if (do_screened
-			and config.head.correction is HeadCorrection.FULL
-			and config.screening.diagrams is ScreeningDiagrams.W_RPA
-			# The DYNAMIC packed route keeps the scalar charge owner (its CC
-			# channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
-			# the direct DFT response its q->0 head samples are finalized
-			# from.  Only the STATIC packed mode, whose packed Gamma-cell
-			# completion replaces that machinery outright, skips it.
-			and not packed_photon_replaces_charge_sigma(config)
-			# Every self-consistent mode builds its exact frequency plan and
-			# response inside the map.  A pre-map response would exist only to
-			# seed a restart artifact and could be mistaken for final physics.
-			and qp_solver is not QPSolver.SELF_CONSISTENT):
+	if _driver_builds_oneshot_head_response(
+			config, do_screened=do_screened, qp_solver=qp_solver):
+		# The packed-route and self-consistent exclusions are owned by
+		# ``_driver_builds_oneshot_head_response``.  In particular, a
+		# pre-map response for a self-consistent mode could be mistaken for
+		# final physics.
 		from .qsgw_head import build_dft_head_response
 		if mode.value == "mpa":
 			from .mpa import sample_plan
