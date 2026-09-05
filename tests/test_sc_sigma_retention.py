@@ -168,6 +168,15 @@ def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
         )
 
     monkeypatch.setattr(sc_iteration, "gw_iteration_map", _map)
+    # This fixture tests carry ownership with an opaque output sentinel.
+    # Real rotation/readout integration is covered in test_sc_state_identity.
+    def _identity(inputs, state, e_input, e_output, history, *, cutoff_ev):
+        partition = inputs.partition
+        return sc_iteration.protected_band_convergence(
+            e_output, e_input, partition.protected_mask,
+            partition.in_range_mask, cutoff_ev), state
+
+    monkeypatch.setattr(sc_iteration, "_sc_identity_for_call", _identity)
     monkeypatch.setattr(sc_iteration, "_write_sc_eqp_snapshot",
                         lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sc_iteration, "_maybe_dump_e_history",
