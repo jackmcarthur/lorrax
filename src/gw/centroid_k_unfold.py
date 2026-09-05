@@ -25,11 +25,13 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.grouped_layout import (
     SquareGroupedShardLayout,
+    build_grouped_shard_layout,
     build_square_grouped_shard_layout,
 )
 from symmetry_maps import (
     centroid_source_map_and_wrap,
     permutation_orbit_labels,
+    real_space_orbit_labels,
     reorder_isdf_operator_basis,
     unfold_spin_centroid_operator,
 )
@@ -96,10 +98,63 @@ class CentroidKUnfoldPlan:
     n_sym_spatial: int
     nspinor: int
     canonical_centroid_extent: int
+    #: The spatial Seitz rows and FFT grid the centroid tables were built
+    #: from, kept so real-grid tiles for the ζ-fit RHS are closed under the
+    #: SAME action.  ``None`` only on hand-assembled test plans.
+    spatial_ops: np.ndarray | None = None
+    translations: np.ndarray | None = None
+    fft_grid: np.ndarray | None = None
 
     @property
     def n_parent(self) -> int:
         return int(self.k_parent_frac.shape[0])
+
+    @property
+    def centroid_local_perm(self) -> np.ndarray:
+        """Owner-local gather offsets of the packed centroid source map.
+
+        ``sym_perm`` never crosses an X shard (the grouped layout refused
+        any orbit that would), so ``sym_perm % shard`` is the offset the
+        manual-mode local unfold gathers with.  Same reduction
+        :func:`unfold_spin_centroid_operator` performs for ``axis_local``.
+        """
+        return (self.sym_perm % int(self.layout.axis_shard_size)).astype(
+            np.int32)
+
+    def real_grid_tiles(self, *, target_width: int) -> "RealGridOrbitTiles":
+        """Orbit-closed real-grid tiles for this plan's Y axis and group."""
+        if self.spatial_ops is None or self.fft_grid is None:
+            raise ValueError(
+                "CentroidKUnfoldPlan.real_grid_tiles: this plan carries no "
+                "spatial operations/FFT grid (hand-assembled test plan).")
+        return build_real_grid_orbit_tiles(
+            self.spatial_ops, self.translations, self.fft_grid,
+            n_y=int(self.mesh_xy.shape['y']),
+            target_width=int(target_width),
+            shard_multiple=int(self.mesh_xy.shape['x']))
+
+    def restore_left_basis(self, operator_packed):
+        """Packed→canonical on the LEFT (centroid) axis of ``(q, mu, r)``.
+
+        The ζ-fit RHS leaves its r endpoint in tile order (the solve does not
+        care which r is which) and needs only its centroid axis in the
+        canonical order the factor ``C`` was formed in.  One x-axis exchange,
+        then the known-zero owner-pad rows are cropped, exactly as
+        :meth:`finish_green` does on both axes.
+        """
+        packed = jnp.asarray(operator_packed)
+        if packed.ndim != 3:
+            raise ValueError(
+                "CentroidKUnfoldPlan.restore_left_basis requires a rank-three "
+                f"(q, mu, r) operator; got {packed.shape}.")
+        reordered = reorder_isdf_operator_basis(
+            packed,
+            left_source_map=self._canonical_source_map(),
+            right_source_map=None,
+            mesh_xy=self.mesh_xy)
+        canonical = reordered[:, :int(self.canonical_centroid_extent), :]
+        return jax.lax.with_sharding_constraint(
+            canonical, NamedSharding(self.mesh_xy, P(None, 'x', 'y')))
 
     @property
     def n_full(self) -> int:
@@ -432,11 +487,136 @@ def build_centroid_k_unfold_plan(
         n_sym_spatial=n_spatial,
         nspinor=ns,
         canonical_centroid_extent=canonical_extent,
+        spatial_ops=_readonly(
+            np.asarray(sym.sym_matrices)[:n_spatial], np.int64),
+        translations=_readonly(
+            np.asarray(sym.translations)[:n_spatial], np.float64),
+        fft_grid=_readonly(np.asarray(fft_grid).reshape(3), np.int64),
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class RealGridOrbitTiles:
+    """Fixed-width real-grid tiles made of complete symmetry orbits.
+
+    The ζ-fit RHS ``Z_q(mu, r)`` is streamed over its r endpoint.  A
+    contiguous r slab is not closed under the point group, so a parent-k
+    build of it would need sources outside the slab (recomputed, retained,
+    or communicated — all three lose the parent-k saving).  These tiles are
+    unions of complete orbits placed so that every orbit lies inside one Y
+    owner: ``r_index[t, slot]`` is the flat C-order grid index held in
+    packed slot ``slot`` of tile ``t`` (``-1`` marks an owner-local pad
+    slot), and slot ``slot`` belongs to Y owner ``slot // shard_size``.
+    The symmetry gather on the r endpoint is then local to each Y shard,
+    exactly as the orbit-packed centroid gather is local to each X shard.
+    Pads trail within each owner, hold exact zeros in every carrier and map
+    to themselves under every operation.  All tiles share one width so one
+    compiled kernel serves them; the tables below are runtime operands.
+    """
+
+    fft_grid: np.ndarray
+    spatial_ops: np.ndarray
+    translations: np.ndarray
+    n_y: int
+    shard_size: int
+    r_index: np.ndarray
+
+    @property
+    def n_tiles(self) -> int:
+        return int(self.r_index.shape[0])
+
+    @property
+    def width(self) -> int:
+        return int(self.n_y) * int(self.shard_size)
+
+    @property
+    def n_rtot(self) -> int:
+        return int(np.prod(self.fft_grid))
+
+    def active_mask(self, tile: int) -> np.ndarray:
+        return self.r_index[int(tile)] >= 0
+
+    def source_tables(self, tile: int) -> tuple[np.ndarray, np.ndarray]:
+        """Owner-local source map and lattice wrap for one tile.
+
+        Returns ``(local_perm, wraps)``: ``(2·n_sym, width)`` int32 gather
+        offsets inside each Y owner and ``(2·n_sym, width, 3)`` int8 wraps,
+        rows ``[n_sym:]`` duplicating ``[:n_sym]`` (time reversal fixes r).
+        The tables come from :func:`symmetry_maps.centroid_source_map_and_wrap`
+        on the tile's active points — the one source-map owner — which
+        also refuses if the tile is not closed.  Pads are fixed points.
+        """
+        row = self.r_index[int(tile)]
+        slots = np.flatnonzero(row >= 0)
+        flat = row[slots]
+        fg = self.fft_grid
+        pts = np.stack(
+            [flat // (fg[1] * fg[2]), (flat // fg[2]) % fg[1], flat % fg[2]],
+            axis=1).astype(np.int32)
+        perm_active, wrap_active = centroid_source_map_and_wrap(
+            pts, self.spatial_ops, self.translations, fg, extend_trs=True)
+        n_rows = int(perm_active.shape[0])
+        width = self.width
+        perm = np.broadcast_to(
+            np.arange(width, dtype=np.int64), (n_rows, width)).copy()
+        perm[:, slots] = slots[perm_active]
+        wraps = np.zeros((n_rows, width, 3), dtype=np.int8)
+        wraps[:, slots] = wrap_active
+        owner = np.arange(width) // int(self.shard_size)
+        if np.any(owner[perm] != owner[None, :]):
+            raise AssertionError(
+                "RealGridOrbitTiles: an orbit crosses a Y owner; the "
+                "grouped layout should have made that impossible.")
+        return (perm % int(self.shard_size)).astype(np.int32), wraps
+
+
+def build_real_grid_orbit_tiles(
+    spatial_ops, translations, fft_grid, *, n_y: int, target_width: int,
+    shard_multiple: int = 1,
+) -> RealGridOrbitTiles:
+    """Partition the FFT grid into orbit-closed tiles of one fixed width.
+
+    Orbits are labelled by :func:`symmetry_maps.real_space_orbit_labels`
+    (O(n_rtot) host memory) and placed by the same LPT packing that places
+    centroid orbits (:func:`common.grouped_layout.build_grouped_shard_layout`)
+    over ``n_tiles·n_y`` equal Y-owner shards; tile ``t`` is shards
+    ``[t·n_y, (t+1)·n_y)``.  ``target_width`` is the memory planner's r
+    chunk; the realized width is the smallest LPT placement whose padded
+    owner extent fits it (one more tile is added while it does not), and it
+    is a multiple of ``n_y·shard_multiple`` so the r axis stays a legal
+    carrier for every downstream reshard.
+    """
+    ops = np.asarray(spatial_ops, dtype=np.int64)
+    tau = np.asarray(translations, dtype=np.float64)
+    fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    n_y = int(n_y)
+    multiple = int(shard_multiple)
+    labels = real_space_orbit_labels(ops, tau, fg)
+    n_rtot = int(labels.size)
+    width = max(int(target_width), n_y * multiple)
+    n_tiles = max(1, -(-n_rtot // width))
+    while True:
+        layout = build_grouped_shard_layout(
+            labels, n_tiles * n_y, shard_size_multiple=multiple)
+        if n_y * int(layout.shard_size) <= width or n_tiles * n_y >= n_rtot:
+            break
+        n_tiles += 1
+    r_index = layout.packed_to_canonical.reshape(
+        n_tiles, n_y * int(layout.shard_size))
+    return RealGridOrbitTiles(
+        fft_grid=_readonly(fg, np.int64),
+        spatial_ops=_readonly(ops, np.int64),
+        translations=_readonly(tau, np.float64),
+        n_y=n_y,
+        shard_size=int(layout.shard_size),
+        r_index=_readonly(r_index, np.int64),
     )
 
 
 __all__ = [
     "CentroidKUnfoldPlan",
+    "RealGridOrbitTiles",
     "build_centroid_k_unfold_plan",
+    "build_real_grid_orbit_tiles",
     "parent_k_contraction_profitable",
 ]
