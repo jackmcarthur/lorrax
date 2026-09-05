@@ -437,3 +437,65 @@ def test_canonical_compile_text_hides_only_process_local_handles():
     assert canonical_compile_text(a) != canonical_compile_text(c)
     assert b"<process-local>" in canonical_compile_text(a)
     assert b"m = 896" in canonical_compile_text(a)
+
+
+# --- skew is not disagreement: _wait_for_key ---------------------------------
+
+class _LateKeyClient:
+    """A coordination client whose key arrives only after ``late`` polls."""
+
+    def __init__(self, late):
+        self.late = late
+        self.calls = 0
+
+    def blocking_key_value_get_bytes(self, key, timeout_ms):
+        self.calls += 1
+        if self.calls <= self.late:
+            raise RuntimeError("DEADLINE_EXCEEDED: key not set")
+        return b"arrived"
+
+
+def test_wait_for_key_without_deadline_waits_out_the_skew(monkeypatch):
+    from common import jax_compile_cache as jcc
+    said = []
+    monkeypatch.setattr(jcc, "_say", said.append)
+    monkeypatch.setattr(jcc, "_AGREEMENT_HEARTBEAT_S", 0.001)
+    client = _LateKeyClient(late=3)
+    out = jcc._wait_for_key(client, "k", 0.0, what="rank 3 to reach the f compile")
+    assert out == b"arrived" and client.calls == 4
+    assert len(said) == 3 and "rank 3 to reach the f compile" in said[0]
+
+
+def test_wait_for_key_with_finite_deadline_still_refuses(monkeypatch):
+    import pytest
+    from common import jax_compile_cache as jcc
+    monkeypatch.setattr(jcc, "_say", lambda _line: None)
+    monkeypatch.setattr(jcc, "_AGREEMENT_HEARTBEAT_S", 0.001)
+    with pytest.raises((TimeoutError, RuntimeError)):
+        jcc._wait_for_key(_LateKeyClient(late=10 ** 6), "k", 0.01, what="x")
+
+
+def test_wait_for_key_propagates_non_timeout_failures():
+    import pytest
+    from common import jax_compile_cache as jcc
+
+    class _Broken:
+        def blocking_key_value_get_bytes(self, key, timeout_ms):
+            raise RuntimeError("UNAVAILABLE: coordination service is gone")
+
+    with pytest.raises(RuntimeError, match="UNAVAILABLE"):
+        jcc._wait_for_key(_Broken(), "k", 0.0, what="x")
+
+
+def test_agreement_deadline_env_default_is_unbounded(monkeypatch):
+    import pytest
+    from common import jax_compile_cache as jcc
+    monkeypatch.delenv("LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S", raising=False)
+    assert jcc._agreement_deadline_env(
+        "LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S",
+        jcc._COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S) == 0.0
+    monkeypatch.setenv("LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S", "-1")
+    with pytest.raises(ValueError):
+        jcc._agreement_deadline_env("LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S", 0.0)
+    assert "no deadline" in jcc._deadline_text(0.0)
+    assert "60-second deadline" in jcc._deadline_text(60.0)

@@ -120,6 +120,15 @@ def _safe_trace(msg: str) -> None:
 		pass
 
 
+
+def _exc_text(error: BaseException | None) -> str:
+	"""One line naming the exception that closed a stage, so the cause is
+	on the raising rank's log even when the teardown that follows hangs."""
+	if error is None:
+		return ""
+	first = (str(error).strip().splitlines() or [""])[0]
+	return f"{type(error).__name__}: {first[:200]}" if first else type(error).__name__
+
 class TimingNode:
 	__slots__ = ("name", "count", "inclusive", "exclusive", "children")
 
@@ -189,7 +198,8 @@ class TimingSection:
 			end = time.perf_counter()
 			self.collector._leave(
 				self, end=end,
-				failed=exc_type is not None or watcher_failed)
+				failed=exc_type is not None or watcher_failed,
+				error=exc)
 		# Do not suppress exceptions
 		return False
 
@@ -306,7 +316,7 @@ class TimingCollector:
 		return section
 
 	def _leave(self, section: TimingSection, *, end: float,
-	           failed: bool) -> None:
+	           failed: bool, error: BaseException | None = None) -> None:
 		inclusive = end - section.start
 		exclusive = inclusive - section.child_elapsed
 		with self._heartbeat_condition:
@@ -327,7 +337,7 @@ class TimingCollector:
 			if cadence:
 				_safe_trace("  " * depth
 				            + f"<- {section._display_name()}  {inclusive:.1f} s"
-				            + ("  [EXC]" if failed else ""))
+				            + (f"  [EXC] {_exc_text(error)}" if failed else ""))
 
 	def reset(self) -> None:
 		stack = getattr(self._local, "stack", None)
