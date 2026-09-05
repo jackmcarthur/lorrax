@@ -97,3 +97,6 @@ a.out
 src/ffi/cpp/build_cloud/
 # ...and the host build tree build_ffi_host.sh writes beside it.
 src/ffi/cpp/build_host_cloud/
+
+# Shared, retained P4 pytest driver staging and rendezvous.
+.pytest_core_runs/

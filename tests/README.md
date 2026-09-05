@@ -53,21 +53,25 @@ committed derived-reference stamp, and exits before test collection.
 
 ## Process geometry
 
-Every landing-quality GPU program is verified at P=4; P1 is only the
-deterministic/timing twin. On Perlmutter, use `lx`: `lx test` reserves the
-four-GPU node, mesh-marked cells run in one grouped child, and
-`procs(4)` cells launch four real ranks. See `AGENT_PREAMBLE.md` for the
-machine evidence contract.
-
-Direct diagnostic invocations use the same source closure as `lx test`:
+The cached driver family supports four independent pytest ranks, which is
+the landing command for the core fixture layer:
 
 ```bash
-lx run -N 1 -G 1 -n 1 env PYTHONPATH=<worktree>/src:<each-service>/src \
-  python3 -m pytest -q <node-id>
-lx run -N 1 -G 4 -n 4 env PYTHONPATH=<worktree>/src:<each-service>/src \
-  python3 <p4-program>
+lx run -N 1 -G 4 -n 4 python3 -m pytest tests/core -p no:cacheprovider -q --tb=short --basetemp=<scratch>/core
 ```
 
-`tests/bench/` and `services/*/bench/` are standalone measurement drivers,
-not pytest suites. `tests/multi_device/` holds cross-process/cross-GPU scripts
-that cannot be expressed honestly as an in-process mesh cell.
+`lx test` uses one task and xdist workers; it is a different launch shape.
+Under plain P4 pytest, `core/rank_session.py` stages each driver directory
+once on rank zero and broadcasts its absolute path. It waits for all child
+exit codes and shares rank-zero stdout before the next driver starts. The
+children retain their Slurm rank environment and initialize MPI/JAX themselves.
+The pytest parents use bounded socket rendezvous, without initializing MPI.
+The dense-linalg child uses those four existing ranks rather than spawning
+another process group. Excited-state drivers use a 2x2 mesh at P4.
+
+Shared driver work directories are retained in `.pytest_core_runs/` in the
+checkout, outside pytest's temporary-directory cleanup. An explicit basetemp
+is suffixed per rank for ordinary private fixtures. This supports both default
+`/tmp` basetemp and a shared scratch basetemp without collective HDF5 opens
+using different filenames, or one rank deleting another rank's work.
+Delete `.pytest_core_runs/` only after all associated pytest jobs have ended.

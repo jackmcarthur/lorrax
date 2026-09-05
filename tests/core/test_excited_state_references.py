@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 import harness
+from core import rank_session
 
 
 RYD_TO_EV = 13.6056980659
@@ -28,15 +29,10 @@ def _run_module(run_dir, module, argv, *, timeout=120):
     cache.mkdir(exist_ok=True)
     env["ISDF_JAX_CACHE_DIR"] = str(cache)
     env.pop("JAX_COMPILATION_CACHE_DIR", None)
-    result = subprocess.run(
+    return rank_session.run_child(lambda: subprocess.run(
         [sys.executable, "-u", "-m", module, *argv], cwd=run_dir,
         env=env, capture_output=True, text=True, timeout=timeout, check=False,
-    )
-    assert result.returncode == 0, (
-        f"{module} failed\n--- stdout ---\n{result.stdout[-6000:]}\n"
-        f"--- stderr ---\n{result.stderr[-6000:]}"
-    )
-    return result
+    ), run_dir / module)
 
 
 def _stage(source, target):
@@ -77,18 +73,21 @@ def test_fixture_a_htransform_reference_matches_coarse_grid(core_fixtures):
 
 
 @pytest.mark.gpu
-def test_fixture_a_exciton_band_reference(core_fixtures, tmp_path):
+def test_fixture_a_exciton_band_reference(core_fixtures):
     """Exercise htransform plus a tiny TDA solve at Gamma and one finite Q."""
     if not harness.gpu_available():
         pytest.skip("tiny exciton reference is the GPU core cell")
     source = core_fixtures / "A"
-    run = _stage(source, tmp_path / "A-exciton")
+    run = rank_session.stage(source, _stage)
     ref = json.loads((source / "excited_state_ref.json").read_text())
+    # The 2x2 mesh pads the nine physical transitions to 36 states. Nine
+    # Krylov steps do not converge the padded spectrum to the reference.
     _run_module(run, "bse.exciton_bands", [
         "-i", "exciton.in", "--n-val", "1", "--n-cond", "1",
-        "--n-eig", "2", "--block-size", "1", "--max-iter", "9",
+        "--n-eig", "2", "--block-size", "1", "--max-iter", "36",
         "--vq-mode", "ongrid", "--q-per-segment", "1",
-        "--band-degeneracy", "off", "--px", "1", "--py", "1",
+        "--band-degeneracy", "off", "--px", "2" if rank_session._resolve_proc_count() == 4 else "1",
+        "--py", "2" if rank_session._resolve_proc_count() == 4 else "1",
         "--out-prefix", "core_exciton", "--report-file", "core_exciton.out",
     ])
     exciton = _rows(run / "core_exciton.dat", skip_columns=6)
@@ -101,13 +100,13 @@ def test_fixture_a_exciton_band_reference(core_fixtures, tmp_path):
 @pytest.mark.core_extended
 @pytest.mark.gpu
 def test_fixture_a_standalone_htransform_and_direct_tda_reference(
-    core_fixtures, tmp_path,
+    core_fixtures,
 ):
     """Run the standalone views already covered by the fused exciton cell."""
     if not harness.gpu_available():
         pytest.skip("standalone excited-state drivers require a GPU")
     source = core_fixtures / "A"
-    run = _stage(source, tmp_path / "A-excited-standalone")
+    run = rank_session.stage(source, _stage)
     ref = json.loads((source / "excited_state_ref.json").read_text())
     tol = ref["tolerances_ev"]
 
@@ -122,11 +121,16 @@ def test_fixture_a_standalone_htransform_and_direct_tda_reference(
         atol=tol["htransform"],
     )
 
+    # Davidson seeds physical transitions and converges individual states;
+    # scalar Lanczos at the full padded dimension suffers exact breakdown.
     bse = _run_module(run, "bse.bse_jax", [
         "-i", "cohsex.in", "--bse", "--lanczos", "--tda",
+        "--solver", "davidson",
         "--n-val", "1", "--n-cond", "1", "--n-occ", "2",
-        "--band-degeneracy", "off", "--max-lanczos-iter", "9",
-        "--n-eig", "2", "--block-size", "1", "--px", "1", "--py", "1",
+        "--band-degeneracy", "off", "--max-lanczos-iter", "36",
+        "--n-eig", "2", "--block-size", "1",
+        "--px", "2" if rank_session._resolve_proc_count() == 4 else "1",
+        "--py", "2" if rank_session._resolve_proc_count() == 4 else "1",
         "--report-file", "core_bse.out",
     ])
     bse_ev = np.asarray([
