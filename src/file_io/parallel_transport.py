@@ -525,6 +525,18 @@ def initialize_parallel_transport_artifact(
             "wfn_fingerprint_utf8",
             np.frombuffer(
                 str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8))
+        # SlabIO's collective reader supports numeric compute dtypes, not
+        # uint8.  Retain the historical external-tool spelling above and
+        # publish the same bytes as int32 for in-process consumers, matching
+        # the W-av transaction below.
+        io.write_attr(
+            "wfn_path_bytes_i32",
+            np.frombuffer(str(wfn_path).encode("utf-8"),
+                          dtype=np.uint8).astype(np.int32))
+        io.write_attr(
+            "wfn_fingerprint_bytes_i32",
+            np.frombuffer(str(wfn_fingerprint).encode("utf-8"),
+                          dtype=np.uint8).astype(np.int32))
         io.write_attr("polar_rcond", np.float64(rcond))
         # Numeric convention stamps are SlabIO-readable on every backend.
         # 1 means the sole supported convention documented by this schema.
