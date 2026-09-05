@@ -3634,34 +3634,54 @@ def _take_rows(A, rows):
            A.dtype, repr(out_sh))
 
     def _build():
-        rows_j = jnp.asarray(rows)
-
+        # Host constants become device constants INSIDE the traced body.
+        # Converting them at build scope would capture a tracer when the
+        # first call happens under an outer jit (the Σ projection tail
+        # broadcasts inside its own compiled kernel) and poison this
+        # process-global cache for every later caller.
         def _f(x):
-            return x[rows_j]
+            return x[jnp.asarray(rows)]
         return _jit_with(_f, out_sh)
 
     return _cached_star_jit(key, _build)(A)
 
 
-def _broadcast_rows(A_irr, take, trs):
-    """``A_irr[take]`` with ``conj`` on the rows ``trs`` marks."""
+def _broadcast_rows(A_irr, take, trs, *, transpose=False):
+    """``A_irr[take]`` with the antiunitary rule on the rows ``trs`` marks.
+
+    ``transpose=False``: conjugate (an observable's band matrix; the
+    historical rule).  ``transpose=True``: transpose the two band axes
+    without conjugating — the rule for a frequency-dependent operator whose
+    antiunitary image is its transpose (Green function, self-energy).  Both
+    are expressed through :func:`apply_band_matrix_symmetry`
+    (``antiunitary`` alone, or ``antiunitary`` with ``reverse``).
+    """
+    trs_np = np.asarray(trs)
     if not isinstance(A_irr, jax.Array):
         out = np.asarray(A_irr)[take]
-        return apply_band_matrix_symmetry(out, antiunitary=trs)
+        if transpose:
+            return apply_band_matrix_symmetry(
+                out, antiunitary=trs_np, reverse=trs_np)
+        return apply_band_matrix_symmetry(out, antiunitary=trs_np)
     out_sh = _row_out_sharding(A_irr)
     ndim = int(A_irr.ndim)
-    any_trs = bool(np.any(trs))
-    key = ("bcast", take.tobytes(), trs.tobytes(),
+    any_trs = bool(np.any(trs_np))
+    key = ("bcast", take.tobytes(), trs_np.tobytes(), bool(transpose),
            tuple(int(s) for s in A_irr.shape), A_irr.dtype, repr(out_sh))
 
     def _build():
-        take_j = jnp.asarray(take)
-        trs_j = jnp.asarray(np.asarray(trs).reshape((-1,) + (1,) * (ndim - 1)))
+        trs_shaped = trs_np.reshape((-1,) + (1,) * (ndim - 1))
 
         def _f(x):
-            out = x[take_j]
+            # Constants materialize inside the trace (see _take_rows).
+            out = x[jnp.asarray(take)]
             if any_trs:
-                out = apply_band_matrix_symmetry(out, antiunitary=trs_j)
+                flag = jnp.asarray(trs_shaped)
+                if transpose:
+                    out = apply_band_matrix_symmetry(
+                        out, antiunitary=flag, reverse=flag)
+                else:
+                    out = apply_band_matrix_symmetry(out, antiunitary=flag)
             return out
         return _jit_with(_f, out_sh)
 
@@ -3771,8 +3791,13 @@ def star_select(A_full, irr_idx_k):
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
-                   irr_labels=None, *, trs_reference):
+                   irr_labels=None, *, trs_reference, trs_rule="conj"):
     """Spread an IBZ band-index quantity over the full BZ.
+
+    ``trs_rule`` is what the antiunitary rows do to the operand: ``"conj"``
+    (the historical rule, an observable's band matrix) or ``"transpose"``
+    (the two band axes swapped without conjugation — a frequency-dependent
+    operator's band matrix; see :func:`unfold_file_wedge_band_operator`).
 
     ``A_irr`` is ``(n_k_irr, ...)``; the result is ``(n_k_full, ...)``.
     A gather plus a CONJUGATION on the rows a predicate selects.  A
@@ -3857,7 +3882,12 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
             "star_broadcast: trs_reference must be 'star_row' (A_irr came "
             "from star_select, rows are full-BZ) or 'ibz_slab' (A_irr is "
             f"the untransformed IBZ slab); got {trs_reference!r}.")
-    return _broadcast_rows(A_irr, take, conj)
+    if trs_rule not in ("conj", "transpose"):
+        raise ValueError(
+            "star_broadcast: trs_rule must be 'conj' or 'transpose'; "
+            f"got {trs_rule!r}.")
+    return _broadcast_rows(A_irr, take, conj,
+                           transpose=(trs_rule == "transpose"))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -3952,6 +3982,43 @@ def unfold_file_wedge_to_full_bz(sym, data):
     return star_broadcast(data, irr, sidx, nss,
                           irr_labels=np.arange(n_rows, dtype=np.int32),
                           trs_reference="ibz_slab")
+
+
+def unfold_file_wedge_band_operator(sym, data, *, trs_rule):
+    r"""FILE wedge → full BZ for the band matrix of a k-diagonal OPERATOR.
+
+    Same rows and gather as :func:`unfold_file_wedge_to_full_bz`; the
+    antiunitary rule is the caller's explicit choice, because the two
+    physically distinct cases give different matrices on time-reversed rows:
+
+    ``trs_rule="conj"``
+        An observable: ``<m,Θk|O|n,Θk> = conj(<m,k|O|n,k>)``.  What the
+        file-wedge unfold does by itself.
+    ``trs_rule="transpose"``
+        A frequency-dependent operator that transforms like the Green
+        function.  With ψ_{Θk} = Θψ_k, ``G_{Θk}(r,r') = G_k(r',r)`` at the
+        SAME complex frequency (the weight e^{-τE} is not conjugated —
+        ``unfold_isdf_operator``'s ``pair_transpose`` rule), and the
+        convolution Σ = Σ_q G_{k-q}·W_q inherits it because W obeys
+        reciprocity.  Then ``Σ_{Θk,mn} = Σ ψ*_{Θk,m} Σ_{Θk} ψ_{Θk,n} =
+        Σ_{k,nm}``: the band matrix is TRANSPOSED, not conjugated; on the
+        diagonal the two rules differ by the sign of Im Σ, i.e. by the
+        lifetime.  Hermitian operators (static Σ) satisfy both at once.
+
+    This is the broadcast the raw-parent Σ route uses after projecting
+    the full-k operator on the parents' own rows.  There is no default: a
+    caller that has not decided which object it holds gets a ``TypeError``
+    here rather than a plausible wrong matrix on the antiunitary rows.
+    """
+    irr, sidx, nss = _star_tables_of(sym)
+    n_rows = int(np.shape(data)[0])
+    if n_rows != int(sym.nk_red):
+        raise ValueError(
+            f"unfold_file_wedge_band_operator: operand has {n_rows} rows "
+            f"but the FILE wedge is sym.nk_red = {int(sym.nk_red)}.")
+    return star_broadcast(data, irr, sidx, nss,
+                          irr_labels=np.arange(n_rows, dtype=np.int32),
+                          trs_reference="ibz_slab", trs_rule=trs_rule)
 
 
 def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
