@@ -243,20 +243,20 @@ exchange term responds to an occupation flip under the smearing width; that is
 the physics of the map, not the accelerator, and is read from pitfall 13's
 line.
 
-**15. The fixed-SC rules are accepted above eps, and the log says so.** The
-one-shot planner refuses a rule whose certified sup error exceeds
-`sigma_quadrature_eps`. The fixed-SC initializer and its rebuilds do not
-(`enforce_sup_error=False`): the reduction budget can expire on a hard window
-and return the interpolatory start, and re-applying the gate there refused
-the padded Si boxes at 3e-5 for a 1e-4 request. On Na eta=0.5 (86 bands, MPA)
-the conduction pole-tail rule was retained at sup=0.0405, four hundred times
-eps, in every self-consistent arm, with 906 nodes and kappa_max 3123, while
-every other window met eps. How much of the QSGW residual that error produces
-is being measured (sandbox lane QUADCHECK, `runs/DEV/148_quadcheck_2026-09-05`);
-until then the driver prints one `!!! SC rule ... accepted ABOVE eps` line per
-such window with the ratio, and a run whose log carries that line is not
-certified at eps. The acceptance policy (a relax factor, a per-window eps, or
-a refusal naming the remedy) follows that measurement.
+**15. One quadrature acceptance on every path.** The one-shot planner, the
+fixed-SC initializer and its rebuilds all require the certified sup error at
+or below `sigma_quadrature_eps`; a build that misses gets one retry with five
+times the reduction budget and then refuses, naming the window, its box,
+the achieved sup, the node count and the remedy. The 2026-09-03 bypass
+(`enforce_sup_error=False`) let Na retain a conduction pole-tail rule at
+sup=0.0405 against eps=1e-4 with 906 nodes in every self-consistent arm; its
+actual support has a 24-node rule at eps (sandbox lane QUADCHECK). The cause
+was the SC pad: the ten-percent pole pad pushed a strictly negative support
+across zero and asked for a crossing rule. The pad now keeps sign-definite
+supports sign-definite (the zero-side edge moves at most halfway to zero;
+a support that really crosses later is a box escape and rebuilds), and the
+disk cache never returns a certificate above eps. Do not loosen eps to admit
+a rule.
 
 ## Evidence
 

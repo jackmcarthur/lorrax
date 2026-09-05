@@ -270,6 +270,12 @@ def _rule_cache_lookup(
                         or float(data["roundoff_amplification"])
                         > noise_amplification_cap):
                     continue
+                # A cached certificate above eps is not a rule for this
+                # request, whatever its node count; it must not shadow a
+                # buildable accurate one (Na pole-tail, 2026-09-05).
+                if (not np.isfinite(float(data["sup_error"]))
+                        or float(data["sup_error"]) > eps):
+                    continue
                 cached_box = tuple(float(value) for value in data["box"])
                 if not (cached_box[0] <= box[0]
                         and cached_box[1] >= box[1]
@@ -379,7 +385,6 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
 
 def _fit_rule(
     spec, eps, reduction_seconds, cache_dir, eta, *, cache_build_widen=True,
-    enforce_sup_error=True,
 ):
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
@@ -411,17 +416,32 @@ def _fit_rule(
                 noise_amplification_cap / (1.0 + eps))
         rule = build_uniform_rule(build_box, eps, **build_kwargs)
         cache_status = "miss" if cache_dir is not None else "off"
+        if rule.sup_error > eps:
+            # The reduction budget can expire and return the interpolatory
+            # start.  A budget is not a correctness switch: try once more
+            # with five times the time before refusing.
+            retry_kwargs = dict(build_kwargs)
+            retry_kwargs["time_budget"] = 5.0 * float(reduction_seconds)
+            retry = build_uniform_rule(build_box, eps, **retry_kwargs)
+            if retry.sup_error <= eps:
+                rule = retry
+                cache_status += ":retry"
 
-    # Preserve the historical one-shot acceptance policy exactly.  Only the
-    # fixed-SC initializer delegates finite-box acceptance to the service: its
-    # reduction budget may expire and return the interpolatory eps/10 start,
-    # whose ``sup_error`` is a check-cloud diagnostic.  Reapplying this gate
-    # there made the time budget a correctness switch and refused the padded
-    # Si boxes at 3e-5.
-    if enforce_sup_error and rule.sup_error > eps:
+    # ONE ACCEPTANCE ON EVERY PATH.  One-shot, fixed-SC initialization and
+    # its rebuilds all require the certified sup error at or below eps; the
+    # fixed-SC bypass (enforce_sup_error=False, 2026-09-03) let Na retain a
+    # conduction pole-tail rule at 400 x eps in every self-consistent arm.
+    if not np.isfinite(rule.sup_error) or rule.sup_error > eps:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
-            f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
+            f"{rule.sup_error:.6g} exceeds eps={eps:.6g} after the retry "
+            f"({int(np.asarray(rule.times).size)} nodes on box "
+            f"{tuple(round(float(v), 6) for v in rule.box)}, kind "
+            f"{spec.get('kind', '?')}, cache={cache_status}). Remedy: a "
+            f"sign-preserving or split product window (the SC pad now keeps "
+            f"sign-definite supports sign-definite), a longer "
+            f"sigma_quadrature_reduction_seconds, or a certified crossing "
+            f"rule; do not loosen sigma_quadrature_eps to admit this rule.")
     # Runtime perturbations must be bounded in the SAME currency as the
     # approximation.  ``kappa = sum|term|/|Q|`` is already relative for a
     # sign-definite box, but it overstates a crossing box's peak-relative
@@ -522,7 +542,7 @@ def _parallel_fits(specs, worker):
 
 def fit_sigma_box_specs(
     specs, eta_ry, *, eps, reduction_seconds, cache_dir,
-    cache_build_widen=True, enforce_sup_error=True,
+    cache_build_widen=True,
 ):
     """Fit independent route-neutral box specifications across processes.
 
@@ -544,8 +564,7 @@ def fit_sigma_box_specs(
     return _parallel_fits(
         rows, lambda index: _fit_rule(
             rows[index], tolerance, budget, cache_dir, eta,
-            cache_build_widen=bool(cache_build_widen),
-            enforce_sup_error=bool(enforce_sup_error)))
+            cache_build_widen=bool(cache_build_widen)))
 
 
 def _box_contains(outer, inner):
@@ -598,6 +617,18 @@ def _sc_padded_box_spec(spec, eta):
         box[0] -= state_pad_ry
     if spec["kind"] in ("crossing", "sign_definite_positive"):
         box[1] += state_pad_ry
+    # A SIGN-DEFINITE SUPPORT STAYS SIGN-DEFINITE.  The pole pad above can
+    # push the zero-side edge of a strictly negative (or positive) support
+    # across zero, which turns an easy relative rule into a crossing rule
+    # the builder cannot certify: the Na conduction pole-tail window was
+    # retained at sup=0.04 against eps=1e-4 with 906 nodes, while its actual
+    # support has a 24-node rule at eps (lane QUADCHECK, 2026-09-05).  The
+    # pad toward zero is capped at half the support's distance to zero; a
+    # support that really crosses later is a box escape and rebuilds.
+    if spec["kind"] == "sign_definite_negative" and spec["box"][1] < 0.0:
+        box[1] = min(box[1], 0.5 * spec["box"][1])
+    if spec["kind"] == "sign_definite_positive" and spec["box"][0] > 0.0:
+        box[0] = max(box[0], 0.5 * spec["box"][0])
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
@@ -653,8 +684,7 @@ def _fit_fixed_sc_rules(
         padded = [_sc_padded_box_spec(spec, eta) for spec in rows]
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
-            cache_dir=cache_dir, cache_build_widen=False,
-            enforce_sup_error=False)
+            cache_dir=cache_dir, cache_build_widen=False)
         rules = {}
         for spec, padded_spec, fit in zip(rows, padded, fits):
             frozen = dict(fit)
@@ -711,8 +741,7 @@ def _fit_fixed_sc_rules(
         padded = [_sc_padded_box_spec(spec, eta) for spec in rebuild]
         new_fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
-            cache_dir=cache_dir, cache_build_widen=False,
-            enforce_sup_error=False)
+            cache_dir=cache_dir, cache_build_widen=False)
         for spec, padded_spec, fit in zip(rebuild, padded, new_fits):
             rebuilt = dict(fit)
             rebuilt["cache_status"] = "rebuild:sc-fixed"
@@ -938,23 +967,6 @@ def plan_sigma_windows(
                 if warning not in announced:
                     print_fn(warning)
                     announced.add(warning)
-        # THE RELAXED ACCEPTANCE IS NEVER SILENT.  The fixed-SC path does
-        # not enforce the one-shot sup-error gate (see _fit_fixed_sc_rules);
-        # a rule retained above eps is a bounded numerical error only if its
-        # window carries little spectral mass, which nobody has measured.
-        # Na eta=0.5 (2026-09-04): the conduction pole-tail rule sat at
-        # sup=0.0405 against eps=1e-4 in every self-consistent arm and the
-        # three independent reviewers found it before the coordinator did.
-        for spec, fit in zip(specs, fits):
-            if float(fit["sup_error"]) > float(tolerance):
-                print_fn(
-                    f"!!! SC rule {spec['name']!r} accepted ABOVE eps: "
-                    f"sup={fit['sup_error']:.6g} = "
-                    f"{float(fit['sup_error']) / float(tolerance):.0f} x eps "
-                    f"({fit['node_count']} nodes; the fixed-SC path does not "
-                    f"enforce the one-shot acceptance; its Sigma error on this "
-                    f"window is unbounded here — docs/self_consistency.md "
-                    f"pitfall 15)")
     # The (window, tau) pair count is reported, never refused on: the owner
     # eliminated the pair ceiling (2026-09-02).  A count above what a deck
     # can afford is a planning question answered by eps and the window
