@@ -256,6 +256,20 @@ def test_authenticate_padded_axis_recomputes_the_canonical_receipt():
             86, 86, MeshShape(), name="Sigma band window", specs=specs)
 
 
+def test_authenticate_padded_axis_preserves_a_producer_extra_pad_receipt():
+    """A requested invariance pad is canonical because its receipt says so."""
+    from runtime.padding import authenticate_padded_axis, padded_axis
+
+    producer = padded_axis(
+        399, 1, name="centroid mu", extra=12)
+    got = authenticate_padded_axis(
+        399, 411, producer, name="Dyson row-centroid carrier")
+    assert (got.logical, got.carrier, got.divisor) == (399, 411, 1)
+    with pytest.raises(ValueError, match="carrier extent is 399, expected 411"):
+        authenticate_padded_axis(
+            399, 399, producer, name="Dyson row-centroid carrier")
+
+
 def test_pad_square_can_identity_embed_a_rotation():
     from runtime.padding import pad_square, padded_axis
 

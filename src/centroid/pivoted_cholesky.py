@@ -105,10 +105,12 @@ def _report_logical_gram_diagonal(G, n_logical: int, *, verbose: bool,
     """Collectively measure a distributed Gram diagonal and print on rank 0."""
     diag_min, diag_max = _logical_gram_diagonal_extrema(G, n_logical)
     jax.block_until_ready((diag_min, diag_max))
+    diag_min_value = float(diag_min)
+    diag_max_value = float(diag_max)
     if verbose:
         print_fn(
             f"[pivoted_cholesky] G built, shape=({n_logical}, {n_logical}), "
-            f"diag range [{float(diag_min):.3e}, {float(diag_max):.3e}]")
+            f"diag range [{diag_min_value:.3e}, {diag_max_value:.3e}]")
     return diag_min, diag_max
 
 

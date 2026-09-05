@@ -1524,10 +1524,10 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
                  else int(n_rmu_logical))
     mu_axis = padded_mu_axis(n_logical, mesh_xy)
     authenticate_padded_axis(
-        mu_axis.logical, v_shape[1], mu_axis.divisor,
+        mu_axis.logical, v_shape[1], mu_axis,
         name="Dyson row-centroid carrier")
     authenticate_padded_axis(
-        mu_axis.logical, v_shape[2], mu_axis.divisor,
+        mu_axis.logical, v_shape[2], mu_axis,
         name="Dyson column-centroid carrier")
     return n_logical
 

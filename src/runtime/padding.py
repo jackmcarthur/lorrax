@@ -196,13 +196,30 @@ def authenticate_padded_axis(
     """Authenticate the canonical carrier for one logical mesh axis.
 
     Readers and consumers use this counterpart to :func:`padded_axis` when
-    both extents already exist.  The expected carrier and every divisor are
-    derived here; callers never inspect a modulus or silently accept an
-    over-padded shape from another convention.
+    both extents already exist.  ``divisor_or_mesh`` may instead be the
+    producer's :class:`PaddedAxis` receipt; that form preserves a deliberately
+    requested extra carrier pad rather than reconstructing the smallest
+    carrier from its divisor.  Otherwise the expected carrier and every
+    divisor are derived here.  Callers never inspect a modulus or silently
+    accept an over-padded shape from another convention.
     """
-    expected = padded_axis(
-        logical, divisor_or_mesh, name=name, spec=spec, axis=axis,
-        specs=specs)
+    if isinstance(divisor_or_mesh, PaddedAxis):
+        if spec is not None or specs is not None or axis is not None:
+            raise TypeError(
+                f"{name}: a PaddedAxis receipt cannot be combined with "
+                "spec, specs, or axis")
+        receipt = divisor_or_mesh
+        if int(logical) != receipt.logical:
+            raise ValueError(
+                f"{name}: logical extent is {int(logical)}, but the "
+                f"producer receipt records {receipt.logical}")
+        expected = PaddedAxis(
+            name=str(name), logical=receipt.logical,
+            carrier=receipt.carrier, divisor=receipt.divisor)
+    else:
+        expected = padded_axis(
+            logical, divisor_or_mesh, name=name, spec=spec, axis=axis,
+            specs=specs)
     observed = int(carrier)
     if observed != expected.carrier:
         raise ValueError(
