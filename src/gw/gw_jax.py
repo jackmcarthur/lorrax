@@ -545,7 +545,9 @@ def main(argv=None):
 	_p_x = int(mesh_xy.devices.shape[0])
 	_p_y = int(mesh_xy.devices.shape[1])
 	_nbs = int(meta.nb_sigma)
-	if mode.is_dynamic:
+	_cd_streamed_diag = (
+		config.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD)
+	if mode.is_dynamic and not _cd_streamed_diag:
 		from .ppm_sigma import assert_sharded_sigma_window_divides_mesh
 		assert_sharded_sigma_window_divides_mesh(
 			_nbs, mesh_xy,
@@ -560,6 +562,12 @@ def main(argv=None):
 			f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
 			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh end-to-end "
 			f"(consumers read tiles; no full-cube replication).")
+	elif _cd_streamed_diag:
+		print0(
+			"  Sigma omega layout: no frequency cube; internal_ff_cd "
+			"streams replicated physical-target coefficients and returns "
+			"only the physical on-shell diagonal (target tiles are padded "
+			"internally).")
 
 	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
 	# Σ_X diagnostic, the SC initial state, degeneracy averaging, and the
