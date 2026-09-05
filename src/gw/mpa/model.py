@@ -288,11 +288,15 @@ def _to_wedge(value, q_idx, mesh_xy):
         out_sharding=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
+def _to_store_order(value, meta):
+    """The store keeps the canonical centroid order (grid-agnostic); the run
+    computes in its packed order.  Every sample slab converts here, once."""
+    basis = getattr(meta, 'mu_basis', None)
+    return value if basis is None else basis.unpack_operator(value)
+
+
 def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
-    value = _to_wedge(value, q_idx, mesh_xy)
-    if getattr(meta, 'mu_basis', None) is not None:
-        # The store keeps the canonical centroid order (grid-agnostic).
-        value = meta.mu_basis.unpack_operator(value)
+    value = _to_store_order(_to_wedge(value, q_idx, mesh_xy), meta)
     value.block_until_ready()
     mpa_store.write_w_slab_collective(
         path, name, index, value, mesh_xy=mesh_xy,
@@ -520,7 +524,7 @@ def _solve_wc(
                 mesh=mesh_xy,
             ))
         if not wc_ready[index]:
-            Wc = W - V
+            Wc = _to_store_order(W - V, meta)
             Wc.block_until_ready()
             mpa_store.write_w_slab_collective(
                 sample_path, _WC, index, Wc, mesh_xy=mesh_xy,
@@ -541,9 +545,9 @@ def _solve_wc(
             # plane.  Causality gives W(-z)=W(-conj(z))^dagger.  This is an
             # independently sampled partner, not a Hermitisation of W(z).
             Wc_negative = jnp.conj(jnp.swapaxes(W_reflected - V, -1, -2))
-            Wc_negative = jax.lax.with_sharding_constraint(
+            Wc_negative = _to_store_order(jax.lax.with_sharding_constraint(
                 Wc_negative,
-                NamedSharding(mesh_xy, P(None, "x", "y")))
+                NamedSharding(mesh_xy, P(None, "x", "y"))), meta)
             Wc_negative.block_until_ready()
             mpa_store.write_w_slab_collective(
                 sample_path, negative_wc_name, index, Wc_negative,
@@ -1014,6 +1018,7 @@ def build_mpa_fit(
     def _write_wedge(point, chi_wedge):
         if ready[_CHI][int(point["index"])]:
             return
+        chi_wedge = _to_store_order(chi_wedge, meta)
         chi_wedge.block_until_ready()
         mpa_store.write_w_slab_collective(
             sample_path, _CHI, point["index"], chi_wedge, mesh_xy=mesh_xy,
