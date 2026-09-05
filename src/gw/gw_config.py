@@ -1717,6 +1717,9 @@ _DEFAULTS = {
     # It is deliberately explicit; ``auto`` never turns an O(N^3) scale run
     # into the much dearer reference calculation.
     "sigma_freq_route": "mpa",
+    # Offline W evidence from the existing Tier-0 Dyson stream.  This is a
+    # fixed-policy oracle observer, not a second screening route.
+    "internal_ff_cd_w_observer": False,
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
     # from the deprecated ``self_consistent`` key (true → self_consistent)
@@ -4288,6 +4291,7 @@ class DynamicSigmaConfig:
     quadrature_reduction_seconds: float = 120.0
     quadrature_cache_dir: str = "auto"
     freq_route: SigmaFrequencyRoute = SigmaFrequencyRoute.MPA
+    w_observer: bool = False
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
     #: patches at ``omega_step_ev``, replacing the contiguous grid.  The
@@ -5508,6 +5512,7 @@ class LorraxConfig:
         )
         sigma = DynamicSigmaConfig(
             freq_route=coerce_sigma_frequency_route(_g("sigma_freq_route")),
+            w_observer=bool(_g("internal_ff_cd_w_observer")),
             omega_min_ev=float(_g("sigma_omega_min_ev")),
             omega_max_ev=float(_g("sigma_omega_max_ev")),
             omega_step_ev=float(_g("sigma_omega_step_ev")),
@@ -5902,6 +5907,12 @@ class LorraxConfig:
         announce_legacy_sigma_axis_keys(
             _named_keys, resolved.compute_mode, resolved.qp_solver,
             print_fn=print_fn)
+        if (resolved.sigma.w_observer and resolved.sigma.freq_route
+                is not SigmaFrequencyRoute.INTERNAL_FF_CD):
+            raise ValueError(
+                "internal_ff_cd_w_observer = true requires "
+                "sigma_freq_route = internal_ff_cd; it observes the one "
+                "Tier-0 Dyson stream and does not construct W independently.")
         if resolved.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD:
             if resolved.compute_mode is not ComputeMode.MPA:
                 raise ValueError(
