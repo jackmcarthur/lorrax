@@ -472,8 +472,8 @@ def _body_checkpoint_provenance(
 
 
 def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
-                         body_provenance):
-    return {
+                         body_provenance, w_observer_identity=None):
+    identity = {
         "schema": CHECKPOINT_SCHEMA,
         "route": "internal_ff_cd",
         "kind": str(kind),
@@ -483,6 +483,9 @@ def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
         "target_b": _array_receipt(target_b, dtype=np.int32),
         "body_provenance": body_provenance,
     }
+    if w_observer_identity is not None:
+        identity["w_observer_identity"] = str(w_observer_identity)
+    return identity
 
 
 def _load_checkpoint(path: Path, identity, n_targets, n_accumulators, *,
@@ -782,7 +785,78 @@ def compute_internal_ff_cd(
         b0=b0, V_q=V_q, nmu_logical=meta.n_rmu, nk=nk,
         mesh_xy=mesh_xy)
 
-    def frequency_batch(z_ry, coefficient_rows):
+    checkpoint_dir = Path(input_dir) / "internal_ff_cd_checkpoints"
+    observer = None
+    observer_identity = None
+    observer_receipt = None
+    if config.sigma.w_observer:
+        # Lazy by contract: the default-off oracle does not import the
+        # observer, create its kernel, or execute an additional JAX op.
+        from vcoul import CoulombGeometry
+        from .internal_ff_w_observer import (
+            open_w_observer, plan_w_observer)
+
+        real_arm_plans = []
+        for width in RESPONSE_WIDTHS_EV:
+            planned_grid = real_grid(width, max_ev=real_max_ev)
+            planned_z = (planned_grid + 1j * width) / RYD_TO_EV
+            real_arm_plans.append({
+                "name": f"real_eta_{width:.8f}",
+                "requested_z_ry": planned_z,
+                "evaluated_z_ry": planned_z,
+            })
+        planned_igrid = imag_grid()
+        observer_spec = plan_w_observer(
+            input_dir=input_dir, real_arms=real_arm_plans,
+            imag_grid={
+                "name": "imaginary",
+                "requested_z_ry": 1j * planned_igrid / RYD_TO_EV,
+                "evaluated_z_ry": 1j * np.maximum(
+                    planned_igrid, IMAG_ORIGIN_LIMIT_EV) / RYD_TO_EV,
+            },
+            q_full=q_full, q_irr_frac=qfrac,
+            bvec_cart=CoulombGeometry.from_wfn(wfn).bvec,
+            nmu_logical=meta.n_rmu,
+            centroid_identity=body_provenance["centroid_indices"],
+            body_provenance=body_provenance)
+        observer_identity = observer_spec.identity_digest
+        # Authenticate every pre-existing body prefix before mode="w" may
+        # create observer bytes.  In particular, an old default-off CD
+        # checkpoint refuses here because it lacks the observer identity.
+        preexisting_completed = []
+        for width in RESPONSE_WIDTHS_EV:
+            planned_grid = real_grid(width, max_ev=real_max_ev)
+            planned_identity = _checkpoint_identity(
+                kind="real", grid=planned_grid, width_ev=width,
+                target_k=target_k, target_b=target_b,
+                body_provenance=body_provenance,
+                w_observer_identity=observer_identity)
+            planned_identity["grid_n"] = int(planned_grid.size)
+            planned_checkpoint = (
+                checkpoint_dir / f"real_eta_{width:.8f}.npz")
+            preexisting_completed.append(_load_checkpoint(
+                planned_checkpoint, planned_identity, n_targets, 2)[0])
+        planned_identity = _checkpoint_identity(
+            kind="imaginary", grid=planned_igrid, width_ev=None,
+            target_k=target_k, target_b=target_b,
+            body_provenance=body_provenance,
+            w_observer_identity=observer_identity)
+        planned_identity["grid_n"] = int(planned_igrid.size)
+        preexisting_completed.append(_load_checkpoint(
+            checkpoint_dir / "imaginary.npz", planned_identity,
+            n_targets, 3)[0])
+        if any(preexisting_completed) and not (
+                Path(observer_spec.payload_path).exists()
+                and Path(observer_spec.sidecar_path).exists()):
+            raise ValueError(
+                "internal_ff_cd checkpoints have consumed W frequencies but "
+                "the matching W observer transaction is absent; missing W "
+                "cannot be reconstructed. Start a new run variant.")
+        observer = open_w_observer(
+            observer_spec, mesh_xy=mesh_xy, v_wedge=v_wedge)
+        observer_receipt = observer.artifact_receipt
+
+    def frequency_batch(z_ry, coefficient_rows, global_frequency_index=None):
         """Evaluate a fixed-size referee frequency batch.
 
         The direct pair scan is substantially more efficient with its
@@ -800,50 +874,65 @@ def compute_internal_ff_cd(
         chi_completed_at = time.perf_counter()
         stage_seconds = {key: 0.0 for key in STAGE_TIMING_KEYS}
         outputs = []
+        if observer is not None and (
+                global_frequency_index is None
+                or len(global_frequency_index) != len(coefficient_rows)):
+            raise ValueError(
+                "W observer requires one global index per frequency row")
         for jb, coefficients in enumerate(coefficient_rows):
-            t_stage = time.perf_counter()
-            w_wedge = solve_w(
-                v_wedge, chi_bq[jb].copy(), meta, mesh_xy,
-                dyson_solver="distributed")
-            w_wedge.block_until_ready()
-            stage_seconds["dyson_solve_wall_seconds"] += (
-                time.perf_counter() - t_stage)
-            t_stage = time.perf_counter()
-            wc_wedge = w_wedge - v_wedge
-            wc_full = unfold_isdf_operator(
-                wc_wedge, irr_idx=irr_idx, sym_idx=sym_idx,
-                sym_perm=sym_perm, L_table=l_table, q_irr_frac=qfrac,
-                mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial,
-                trs_rule="pair_transpose")
-            wc_full.block_until_ready()
-            stage_seconds["q_unfold_wall_seconds"] += (
-                time.perf_counter() - t_stage)
-            # CD spectral convention S=(I-epsilon^-1)V = -Wc.
-            t_stage = time.perf_counter()
-            row = []
-            for coeff in coefficients:
-                value = -contract(
-                    wfns.psi_xn, wfns.psi_yn, wc_full,
-                    jnp.asarray(target_k), jnp.asarray(target_b),
-                    jnp.asarray(kmq_target), jnp.asarray(coeff, jnp.float64))
-                host = np.asarray(value)
-                if not np.all(np.isfinite(host)):
-                    bad = int(np.flatnonzero(~np.isfinite(host))[0])
-                    raise FloatingPointError(
-                        "internal_ff_cd nonfinite contracted stream at target "
-                        f"{bad}")
-                row.append(host * (RYD_TO_EV / nk))
-            outputs.append(row)
-            del w_wedge, wc_wedge, wc_full
-            stage_seconds["contract_host_checks_wall_seconds"] += (
-                time.perf_counter() - t_stage)
+            try:
+                t_stage = time.perf_counter()
+                w_wedge = solve_w(
+                    v_wedge, chi_bq[jb].copy(), meta, mesh_xy,
+                    dyson_solver="distributed")
+                w_wedge.block_until_ready()
+                stage_seconds["dyson_solve_wall_seconds"] += (
+                    time.perf_counter() - t_stage)
+                t_stage = time.perf_counter()
+                wc_wedge = w_wedge - v_wedge
+                if observer is not None:
+                    observer.observe(global_frequency_index[jb], wc_wedge)
+                wc_full = unfold_isdf_operator(
+                    wc_wedge, irr_idx=irr_idx, sym_idx=sym_idx,
+                    sym_perm=sym_perm, L_table=l_table, q_irr_frac=qfrac,
+                    mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial,
+                    trs_rule="pair_transpose")
+                wc_full.block_until_ready()
+                stage_seconds["q_unfold_wall_seconds"] += (
+                    time.perf_counter() - t_stage)
+                # CD spectral convention S=(I-epsilon^-1)V = -Wc.
+                t_stage = time.perf_counter()
+                row = []
+                for coeff in coefficients:
+                    value = -contract(
+                        wfns.psi_xn, wfns.psi_yn, wc_full,
+                        jnp.asarray(target_k), jnp.asarray(target_b),
+                        jnp.asarray(kmq_target),
+                        jnp.asarray(coeff, jnp.float64))
+                    host = np.asarray(value)
+                    if not np.all(np.isfinite(host)):
+                        bad = int(np.flatnonzero(~np.isfinite(host))[0])
+                        raise FloatingPointError(
+                            "internal_ff_cd nonfinite contracted stream at "
+                            f"target {bad}")
+                    row.append(host * (RYD_TO_EV / nk))
+                outputs.append(row)
+                del w_wedge, wc_wedge, wc_full
+                stage_seconds["contract_host_checks_wall_seconds"] += (
+                    time.perf_counter() - t_stage)
+            except BaseException:
+                if observer is not None:
+                    observer.close(body_complete=False)
+                raise
         return outputs, chi_completed_at, stage_seconds
 
     real_results = []
     grid_records = []
     final_coarse_real = None
-    checkpoint_dir = Path(input_dir) / "internal_ff_cd_checkpoints"
     for width in RESPONSE_WIDTHS_EV:
+        arm_name = f"real_eta_{width:.8f}"
+        arm_start = (0 if observer is None else
+                     int(observer.spec.arm(arm_name)["start"]))
         grid = real_grid(width, max_ev=real_max_ev)
         coarse = (_coarse_real_grid(grid, width)
                   if width == RESPONSE_WIDTHS_EV[-1] else None)
@@ -852,13 +941,16 @@ def compute_internal_ff_cd(
         identity = _checkpoint_identity(
             kind="real", grid=grid, width_ev=width,
             target_k=target_k, target_b=target_b,
-            body_provenance=body_provenance)
+            body_provenance=body_provenance,
+            w_observer_identity=observer_identity)
         identity["grid_n"] = int(grid.size)
         checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.npz"
         (completed, loaded, chi_wall, solve_contract_wall,
          stage_wall) = _load_checkpoint(
             checkpoint, identity, n_targets, 2,
             return_stage_timings=True)
+        if observer is not None:
+            observer.require_checkpoint_prefix(arm_name, completed)
         accum, coarse_accum = loaded
         if rank == 0 and completed:
             print_fn(
@@ -879,9 +971,15 @@ def compute_internal_ff_cd(
                     coeffs.append(ccoeff)
                 coefficient_rows.append(coeffs)
             t_batch = time.perf_counter()
-            values, t_after_chi, stage_batch = frequency_batch(
-                grid[lo:hi] / RYD_TO_EV
-                + 1j * (width / RYD_TO_EV), coefficient_rows)
+            z_batch = (grid[lo:hi] / RYD_TO_EV
+                       + 1j * (width / RYD_TO_EV))
+            if observer is None:
+                values, t_after_chi, stage_batch = frequency_batch(
+                    z_batch, coefficient_rows)
+            else:
+                values, t_after_chi, stage_batch = frequency_batch(
+                    z_batch, coefficient_rows,
+                    np.arange(arm_start + lo, arm_start + hi, dtype=np.int64))
             chi_wall += t_after_chi - t_batch
             solve_contract_wall += time.perf_counter() - t_after_chi
             for key in STAGE_TIMING_KEYS:
@@ -890,6 +988,8 @@ def compute_internal_ff_cd(
                 accum += values[jb][0]
                 if iw in coarse_lookup:
                     coarse_accum += values[jb][1]
+            if observer is not None:
+                observer.commit_prefix(arm_name, hi)
             if rank == 0:
                 _save_checkpoint(
                     checkpoint, identity, hi, (accum, coarse_accum),
@@ -916,6 +1016,9 @@ def compute_internal_ff_cd(
             "wall_seconds": time.perf_counter() - t_arm,
         })
 
+    arm_name = "imaginary"
+    arm_start = (0 if observer is None else
+                 int(observer.spec.arm(arm_name)["start"]))
     igrid = imag_grid()
     icoarse = _coarse_imag_grid(igrid)
     icoarse_lookup = {int(i): j for j, i in enumerate(icoarse)}
@@ -924,13 +1027,16 @@ def compute_internal_ff_cd(
     identity = _checkpoint_identity(
         kind="imaginary", grid=igrid, width_ev=None,
         target_k=target_k, target_b=target_b,
-        body_provenance=body_provenance)
+        body_provenance=body_provenance,
+        w_observer_identity=observer_identity)
     identity["grid_n"] = int(igrid.size)
     checkpoint = checkpoint_dir / "imaginary.npz"
     (completed, loaded, chi_wall, solve_contract_wall,
      stage_wall) = _load_checkpoint(
         checkpoint, identity, n_targets, 3,
         return_stage_timings=True)
+    if observer is not None:
+        observer.require_checkpoint_prefix(arm_name, completed)
     imag_accum, imag_coarse, imag_tail = loaded
     if rank == 0 and completed:
         print_fn(
@@ -954,8 +1060,14 @@ def compute_internal_ff_cd(
             coefficient_rows.append(coeffs)
         z_imag_ev = np.maximum(igrid[lo:hi], IMAG_ORIGIN_LIMIT_EV)
         t_batch = time.perf_counter()
-        values, t_after_chi, stage_batch = frequency_batch(
-            1j * z_imag_ev / RYD_TO_EV, coefficient_rows)
+        z_batch = 1j * z_imag_ev / RYD_TO_EV
+        if observer is None:
+            values, t_after_chi, stage_batch = frequency_batch(
+                z_batch, coefficient_rows)
+        else:
+            values, t_after_chi, stage_batch = frequency_batch(
+                z_batch, coefficient_rows,
+                np.arange(arm_start + lo, arm_start + hi, dtype=np.int64))
         chi_wall += t_after_chi - t_batch
         solve_contract_wall += time.perf_counter() - t_after_chi
         for key in STAGE_TIMING_KEYS:
@@ -968,6 +1080,8 @@ def compute_internal_ff_cd(
                 offset += 1
             if iw < itail.size:
                 imag_tail += values[jb][offset]
+        if observer is not None:
+            observer.commit_prefix(arm_name, hi)
         if rank == 0:
             _save_checkpoint(
                 checkpoint, identity, hi,
@@ -991,6 +1105,8 @@ def compute_internal_ff_cd(
             solve_contract_wall - sum(stage_wall.values())),
         "wall_seconds": time.perf_counter() - t_arm,
     })
+    if observer is not None:
+        observer.close(body_complete=True)
 
     head_ev, head_record = _compute_head_diag_ev(
         wfns, target_k, target_b, state=state, config=config, meta=meta,
@@ -1080,6 +1196,8 @@ def compute_internal_ff_cd(
         "unresolved_target_indices": unresolved.tolist(),
         "records": records,
     }
+    if observer_receipt is not None:
+        artifact["w_observer"] = observer_receipt
     artifact_path = os.path.join(input_dir, "internal_ff_cd.json")
     if rank == 0:
         Path(artifact_path).write_text(
