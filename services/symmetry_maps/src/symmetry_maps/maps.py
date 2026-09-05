@@ -938,6 +938,9 @@ def _permute_isdf_operator_axes_local(
         mode='promise_in_bounds')
 
 
+_UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
+
+
 def _apply_unfold_phase_and_trs_local(
     V_full_local, phase_mu, phase_nu, trs_mask, *, pair_transpose: bool,
 ):
