@@ -334,7 +334,8 @@ def _hash_array(array: np.ndarray) -> str:
 
 
 def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
-                         state, config, band_slices, nmu, nk):
+                         state, config, nb_chi_logical,
+                         nb_sigma_logical, nmu, nk):
     return {
         "schema": 1,
         "route": "internal_ff_cd",
@@ -344,8 +345,8 @@ def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
         "target_k_sha256": _hash_array(np.asarray(target_k, np.int32)),
         "target_b_sha256": _hash_array(np.asarray(target_b, np.int32)),
         "occupation_hash": str(state.occ_hash),
-        "number_bands_chi": int(band_slices.nb_chi),
-        "number_bands_sigma": int(band_slices.nb_sigma_sum),
+        "number_bands_chi": int(nb_chi_logical),
+        "number_bands_sigma": int(nb_sigma_logical),
         "nmu": int(nmu), "nk": int(nk),
         "mc_average_vcoul_body": bool(config.head.mc_average_vcoul_body),
         "bgw_metal_q0_treatment": str(config.head.bgw_metal_q0_treatment),
@@ -398,7 +399,8 @@ def _save_checkpoint(path: Path, identity, completed, accumulators,
 
 
 def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
-                          mesh, sym, wfn, V_q, band_slices, print_fn):
+                          mesh, sym, wfn, V_q, band_slices,
+                          nb_chi_logical, print_fn):
     """The referee's pole-free static metallic head and eta=0 half residue."""
     from common.collectives import device_put_process_local
     from common.kq_mapping import kminq_idx_for_iq
@@ -416,24 +418,36 @@ def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
     surface_kn = jnp.asarray(surface * nk, dtype=jnp.float64)
     velocity = load_dft_velocity_head(
         config.paths.parallel_transport_file, mesh=mesh, wfn=wfn, meta=meta)
-    nb = int(band_slices.nb_chi)
-    if nb > int(velocity.nb_logical):
+    nb_logical = int(nb_chi_logical)
+    nb_storage = int(band_slices.nb_full)
+    if int(wfns.enk.shape[1]) != nb_storage:
+        raise ValueError(
+            "internal_ff_cd head carrier mismatch: BandSlices storage "
+            f"extent is {nb_storage}, wfns.enk has {wfns.enk.shape[1]}")
+    if tuple(velocity.velocity_dft_cart.shape[-2:]) != (
+            nb_storage, nb_storage):
+        raise ValueError(
+            "internal_ff_cd velocity carrier mismatch: expected padded "
+            f"matrix extent {nb_storage}, got "
+            f"{tuple(velocity.velocity_dft_cart.shape[-2:])}")
+    if nb_logical > int(velocity.nb_logical):
         raise ValueError(
             "internal_ff_cd head response requests "
-            f"number_bands_chi={nb}, but the velocity store covers only "
+            f"number_bands_chi={nb_logical}, but the velocity store covers only "
             f"{int(velocity.nb_logical)} bands")
     identity = np.broadcast_to(
-        np.eye(nb, dtype=np.complex128)[None], (nk, nb, nb)).copy()
+        np.eye(nb_storage, dtype=np.complex128)[None],
+        (nk, nb_storage, nb_storage)).copy()
     U = device_put_process_local(
         identity, NamedSharding(mesh, P(None, "x", "y")))
     response = build_iteration_head_response(
         None, None, velocity.velocity_dft_cart, U,
-        wfns.enk[:, :nb], state.f_kn[:, :nb],
+        wfns.enk[:, :nb_storage], state.f_kn[:, :nb_storage],
         np.asarray([0.0 + 0.0j], np.complex128),
-        surface_weight_qp_kn=surface_kn[:, :nb], mesh=mesh,
+        surface_weight_qp_kn=surface_kn[:, :nb_storage], mesh=mesh,
         kgrid=tuple(int(x) for x in wfn.kgrid),
         bvec_cart=velocity.reciprocal_lattice_cart,
-        nb_logical=nb,
+        nb_logical=nb_logical,
         sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),
         efermi_ry=float(state.mu_ry), wfn=wfn, meta=meta, config=config,
         wfns_qp=wfns, eta_ry=0.0)
@@ -507,6 +521,20 @@ def compute_internal_ff_cd(
     t_start = time.perf_counter()
     rank = int(jax.process_index())
     nk = int(meta.nk_tot)
+    b0 = int(band_slices.b0)
+    nb_storage = int(band_slices.nb_full)
+    nb_chi_logical = int(meta.b_id_4_chi_user) - b0
+    nb_sigma_logical = int(meta.b_id_4_sigma_user) - b0
+    if int(wfns.enk.shape[1]) != nb_storage:
+        raise ValueError(
+            "internal_ff_cd band carrier mismatch: "
+            f"BandSlices.nb_full={nb_storage}, wfns.enk={wfns.enk.shape}")
+    for name, value in (("number_bands_chi", nb_chi_logical),
+                        ("number_bands_sigma", nb_sigma_logical)):
+        if not 0 < value <= nb_storage:
+            raise ValueError(
+                f"internal_ff_cd {name}={value} is outside padded carrier "
+                f"extent {nb_storage}")
     if occupation_state is None:
         occupation_state = OccupationState.solve_mp1(
             wfns.enk, np.full(nk, 1.0 / nk), float(wfn.num_electrons),
@@ -554,15 +582,15 @@ def compute_internal_ff_cd(
     inner_f = occupations[kmq_target]
     x_signed = target_e_ev[:, None, None] - inner_e_ev + CENTER_SHIFT_EV
     x_abs = abs(x_signed)
-    max_required = float(np.max(x_abs[:, :, :band_slices.nb_sigma_sum]))
+    max_required = float(np.max(x_abs[:, :, :nb_sigma_logical]))
     real_max_ev = _real_coverage_max(max_required)
     residue_sign = np.where(x_signed >= 0.0, -(1.0 - inner_f), inner_f)
 
     direct = make_direct_kernel(
-        mesh_xy, nb_logical=int(band_slices.nb_chi))
+        mesh_xy, nb_logical=nb_chi_logical)
     contract = make_weighted_contract_kernel(
         mesh_xy, n_targets=n_targets,
-        inner_stop=int(band_slices.nb_sigma_sum))
+        inner_stop=nb_sigma_logical)
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
 
     def frequency_batch(z_ry, coefficient_rows):
@@ -623,7 +651,8 @@ def compute_internal_ff_cd(
         identity = _checkpoint_identity(
             kind="real", grid=grid, width_ev=width,
             target_k=target_k, target_b=target_b, state=state,
-            config=config, band_slices=band_slices,
+            config=config, nb_chi_logical=nb_chi_logical,
+            nb_sigma_logical=nb_sigma_logical,
             nmu=meta.n_rmu, nk=nk)
         identity["grid_n"] = int(grid.size)
         checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.npz"
@@ -688,7 +717,8 @@ def compute_internal_ff_cd(
     identity = _checkpoint_identity(
         kind="imaginary", grid=igrid, width_ev=None,
         target_k=target_k, target_b=target_b, state=state,
-        config=config, band_slices=band_slices,
+        config=config, nb_chi_logical=nb_chi_logical,
+        nb_sigma_logical=nb_sigma_logical,
         nmu=meta.n_rmu, nk=nk)
     identity["grid_n"] = int(igrid.size)
     checkpoint = checkpoint_dir / "imaginary.npz"
@@ -752,7 +782,8 @@ def compute_internal_ff_cd(
     head_ev, head_record = _compute_head_diag_ev(
         wfns, target_k, target_b, state=state, config=config, meta=meta,
         mesh=mesh_xy, sym=sym, wfn=wfn, V_q=V_q,
-        band_slices=band_slices, print_fn=print_fn)
+        band_slices=band_slices, nb_chi_logical=nb_chi_logical,
+        print_fn=print_fn)
     totals = real_results[-1] + imag_accum + head_ev
     controls, control_max_mev, contracts = _control_certificate(
         real_fine=real_results[-1], real_coarse=final_coarse_real,
@@ -810,8 +841,9 @@ def compute_internal_ff_cd(
             "mu_ry": float(state.mu_ry),
             "mc_average_vcoul_body": bool(config.head.mc_average_vcoul_body),
             "bgw_metal_q0_treatment": config.head.bgw_metal_q0_treatment,
-            "number_bands_chi": int(band_slices.nb_chi),
-            "number_bands_sigma": int(band_slices.nb_sigma_sum),
+            "number_bands_chi": nb_chi_logical,
+            "number_bands_sigma": nb_sigma_logical,
+            "band_carrier_storage": nb_storage,
             "q_wedge": int(q_full.size), "q_full": nk,
         },
         "coverage": {
