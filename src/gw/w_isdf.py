@@ -2294,8 +2294,10 @@ def compute_static_photon_response(
         # Two-carrier certificate (debug only: the transpose is a full-body
         # reshard).  A static response is Hermitian in its packed (A mu),(B nu)
         # index at every q, and that holds ONLY if the CT block's charge end
-        # and the TC block's charge end were built from the same carrier;
-        # a carrier leaking across a Lorentz label breaks it at O(1).
+        # and the TC block's charge end were built from the same carrier; a
+        # carrier leaking across a Lorentz label leaves a residual of order
+        # (relative carrier difference) x |CT|/|CC|, many orders above the
+        # 2e-16 measured on MoS2 (runs/DEV/322, 2026-09-04).
         _report_packed_hermiticity("chi0_packed", chi_packed, print_fn)
 
         W_packed = solve_w(
