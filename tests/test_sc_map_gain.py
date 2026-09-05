@@ -105,3 +105,37 @@ def test_map_two_is_the_first_driver_diagnostic():
     assert diagnostic2.gain == pytest.approx(0.5)
     assert diagnostic2.worst_band == 6
     assert history is not None
+
+
+def test_ibz_eigenvalues_are_measured_on_the_full_bz_sigma_k_set():
+    """H/E/U live on the IBZ and Sigma on the full BZ (KStarMap invariant).
+    Si b80/c504 P4: E=(8,16) against Sigma=(64,16) refused every map 2."""
+    mask = np.array([True, True])
+    partition = SimpleNamespace(protected_mask=mask, in_range_mask=mask)
+    kstar = SimpleNamespace(
+        is_identity=False, broadcast=lambda A: np.asarray(A)[[0, 0, 1]])
+    inputs = SimpleNamespace(
+        partition=partition, kstar=kstar,
+        band_slices=SimpleNamespace(sigma=slice(0, 2)),
+    )
+
+    def state(sigma, iteration):
+        sigma_result = SimpleNamespace(
+            sigma_c_at_dft_diag_ev=np.asarray(sigma, dtype=np.complex128),
+            e_eval_ev=None)
+        return sc_iteration.SCState(
+            H_qp_dft=np.zeros((2, 2, 2)), iteration=iteration,
+            partition=partition,
+            outputs=SimpleNamespace(sigma_result=sigma_result))
+
+    e1 = np.array([[1.0, 2.0], [1.5, 2.5]])          # 2 IBZ rows
+    s1 = [[0.0, 0.1], [0.0, 0.1], [0.3, 0.2]]          # 3 full-BZ rows
+    _, history = sc_iteration._sc_map_gain_for_call(
+        inputs, state(s1, 1), e1, None)
+    assert history[0].shape == (3, 2)
+    e2 = np.array([[1.0, 2.04], [1.5, 2.5]])
+    s2 = [[0.0, 0.12], [0.0, 0.12], [0.3, 0.26]]
+    diagnostic, _ = sc_iteration._sc_map_gain_for_call(
+        inputs, state(s2, 2), e2, history)
+    assert diagnostic.gain == pytest.approx(0.06 / 0.04)
+    assert diagnostic.worst_k == 2 and diagnostic.worst_band == 2
