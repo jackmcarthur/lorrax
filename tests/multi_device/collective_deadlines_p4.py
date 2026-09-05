@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -111,9 +112,16 @@ def main():
     pc._run_select_with_progress = recorded_select
     # Exercise the production driver against private copies of the same Si WFN.
     from centroid import kmeans_cli
-    os.chdir(output)
+    # Use one private input workspace so the source-path provenance bytes
+    # agree too; move each completed output into its immutable arm directory.
+    os.chdir(evidence / "input")
     sys.argv = ["kmeans_cli", "336", "--seed", "42", "--orbit"]
     assert kmeans_cli.main() == 0
+    if rank == 0:
+        for filename in ("centroids_frac_336.txt", "kmeans.out"):
+            shutil.move(filename, output / filename)
+    from jax.experimental import multihost_utils
+    multihost_utils.sync_global_devices("deadline-pin-centroid-saved")
     pc._run_select_with_progress = real_select
 
     # Force a new bootstrap namespace/mesh layout: kmeans may already have
@@ -131,8 +139,8 @@ def main():
             return original_fill(address)
         mp.loader.fill_nccl_unique_id = delayed_fill
     started = time.monotonic()
-    handle = mp._make_ctx(rt.mesh, col_major=False)
-    mp.loader.destroy_cusolvermp_context(handle)
+    assert mp._ctx_key(rt.mesh, False) not in mp._CTX_CACHE
+    mp.get_or_init_context(rt.mesh, col_major=False)
     if args.arm == "after":
         mp.loader.fill_nccl_unique_id = original_fill
     bootstrap_elapsed = time.monotonic() - started
