@@ -3245,9 +3245,8 @@ def _z_q_face_parent(
 		                   P(None, None, None)),
 		         out_specs=out_spec, check_vma=False)
 		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_):
-			def unfold_block(D_, a, b):
+			def unfold_block(D_, coef):
 				"""One full-k output spin block of P = conj(U D U†)."""
-				coef = open_spin_block_coefficient(spin_np, a, b)
 				acc = None
 				for c in range(ns):
 					for d in range(ns):
@@ -3264,19 +3263,27 @@ def _z_q_face_parent(
 						acc = term if acc is None else acc + term
 				return jnp.conj(acc)             # (nk, mu_loc, r_loc)
 
-			Z_R = jnp.zeros(
-				(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128)
-			for a in range(ns):
-				for b in range(ns):
-					P_l_R = local_ifftn3(
-						unfold_block(D_l_, a, b).reshape(
-							nkx, nky, nkz, mu_loc, r_loc),
-						axes=(0, 1, 2), norm='forward')
-					P_r_R = local_ifftn3(
-						unfold_block(D_r_, a, b).reshape(
-							nkx, nky, nkz, mu_loc, r_loc),
-						axes=(0, 1, 2), norm='forward')
-					Z_R = Z_R + jnp.conj(P_l_R) * P_r_R
+			# A scan keeps one output spin block live, rather than unrolling
+			# four full-k IFFT pairs into the same executable/live set.
+			coefficients = jnp.stack([
+				open_spin_block_coefficient(spin_np, a, b)
+				for a in range(ns) for b in range(ns)])
+
+			def spin_body(Z_R, coef):
+				P_l_R = local_ifftn3(
+					unfold_block(D_l_, coef).reshape(
+						nkx, nky, nkz, mu_loc, r_loc),
+					axes=(0, 1, 2), norm='forward')
+				P_r_R = local_ifftn3(
+					unfold_block(D_r_, coef).reshape(
+						nkx, nky, nkz, mu_loc, r_loc),
+					axes=(0, 1, 2), norm='forward')
+				return Z_R + jnp.conj(P_l_R) * P_r_R, None
+
+			Z_R, _ = jax.lax.scan(
+				spin_body, jnp.zeros(
+					(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
+				coefficients, unroll=1)
 			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
 			return Z_q_3d.reshape(nk, mu_loc, r_loc)
 

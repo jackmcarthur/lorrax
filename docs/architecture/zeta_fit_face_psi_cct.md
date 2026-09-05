@@ -358,8 +358,11 @@ band chunks exactly as `_z_q_face` does (Y block through
 `to_rpoints_inner` at the tile slots, X block by the masked `psum('y')`),
 then per OUTPUT spin block `(a,b)` accumulates
 `sum_cd U[a,c]U*[b,d] · unfold_operator_local(D[c,:,d,:])`, conjugates,
-and runs the unchanged IFFT/product/FFT tail — one full-k block live at a
-time, the memory contract of the incumbent scalar-pair loop.  The Z_q tile
+and runs the unchanged IFFT/product/FFT tail. The output spin blocks run
+through a `lax.scan` inside the local `shard_map`: one full-k IFFT pair
+is live at a time. A Python-unrolled loop lets the compiler overlap these
+buffers, increasing the live set and cold compile time. The scan leaves
+the parent band contraction and service-owned spin/phase/TRS action intact.  The Z_q tile
 leaves the kernel with centroids in packed order and r in slot order; the
 q-selected RHS is restored to canonical centroid order by one x exchange
 (`plan.restore_left_basis`) before the unchanged solve, and
