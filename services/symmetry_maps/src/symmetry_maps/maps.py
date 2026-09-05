@@ -1123,6 +1123,87 @@ def unfold_operator_local(
         V_full_local, phase_mu, phase_nu, trs_mask, pair_transpose=False)
 
 
+def unfold_wavefunction_local(
+    psi_parent_local,
+    *,
+    irr_idx,
+    sym_idx,
+    k_irr_frac,
+    local_perm,
+    L_table,
+    spin_action_full,
+    n_sym_spatial,
+    spin_axis: int,
+    mu_axis: int,
+    mesh_axis=None,
+):
+    r"""Children ψ_{gk̄} from raw parents on one μ-local slab, by the typed action.
+
+        ψ_{gk̄,a}(μ) = Σ_c U_g[a,c] · T_g[ e^{2πi k̄·L_{g,μ}} ψ_{k̄,c}(α_g μ) ]
+
+    ``T_g`` is complex conjugation on antiunitary rows (``g >=
+    n_sym_spatial``) and the identity otherwise; ``U_g`` is the spinor
+    representation.  This is the action the loader's host unfold applies to
+    every child row and the one :func:`unfold_operator_local` applies to
+    both endpoints of an operator; here it is applied to ONE wavefunction
+    endpoint, so a consumer that needs ψ itself at every k (a band-pair
+    weight that couples both band indices, which no one-particle Green
+    contraction reproduces) can stream children from the stored parents
+    without any full-k face ever being resident.
+
+    ``psi_parent_local`` is this rank's ``(n_parent, ...)`` slab of an
+    orbit-PACKED face: ``mu_axis`` names the centroid axis, ``spin_axis``
+    the spinor axis; every gather stays inside the slab because orbits never
+    cross a shard.  ``local_perm`` ``(n_rows, n_mu)`` are owner-local gather
+    offsets and ``L_table`` ``(n_rows, n_mu, 3)`` the lattice wraps, both
+    over the slab's own μ extent when ``mesh_axis`` is ``None`` (the
+    caller sliced them, e.g. as ``shard_map`` operands sharded on the same
+    axis as μ) or over the COMPLETE packed endpoint when ``mesh_axis`` names
+    the mesh axis μ is sharded on (sliced here by ``axis_index``).
+    ``irr_idx``/``sym_idx`` are ``(n_full,)``, ``k_irr_frac`` ``(n_parent,
+    3)``; ``spin_action_full`` is ``(n_full, ns, ns)`` -- the spinor matrix
+    of EACH FULL-k ROW (the plan's table, ``sym.spinor_action(sym_idx)``),
+    not a per-operation table.  Returns ``(n_full, ...)`` in the same axis
+    order.
+    """
+    x = jnp.asarray(psi_parent_local)
+    ndim = int(x.ndim)
+    mu_axis = int(mu_axis) % ndim
+    spin_axis = int(spin_axis) % ndim
+    if mu_axis == 0 or spin_axis == 0 or mu_axis == spin_axis:
+        raise ValueError(
+            "unfold_wavefunction_local: axis 0 is the k axis; mu_axis and "
+            f"spin_axis must be distinct non-zero axes, got {mu_axis}, "
+            f"{spin_axis}.")
+    irr = jnp.asarray(irr_idx, dtype=jnp.int32)
+    sym = jnp.asarray(sym_idx, dtype=jnp.int32)
+    n_full = int(irr.shape[0])
+    mu_loc = int(x.shape[mu_axis])
+    perm_rows = jnp.take(jnp.asarray(local_perm, dtype=jnp.int32), sym, axis=0)
+    L_rows = jnp.take(jnp.asarray(L_table, dtype=jnp.float64), sym, axis=0)
+    k_rows = jnp.take(jnp.asarray(k_irr_frac, dtype=jnp.float64), irr, axis=0)
+    phase = jnp.exp(2j * jnp.pi * jnp.einsum(
+        'qi,qmi->qm', k_rows, L_rows).astype(jnp.complex128))
+    if mesh_axis is not None:
+        start = jax.lax.axis_index(mesh_axis) * mu_loc
+        perm_rows = jax.lax.dynamic_slice_in_dim(perm_rows, start, mu_loc, axis=1)
+        phase = jax.lax.dynamic_slice_in_dim(phase, start, mu_loc, axis=1)
+    rows = jnp.take(x, irr, axis=0)
+    idx_shape = [1] * ndim
+    idx_shape[0] = n_full
+    idx_shape[mu_axis] = mu_loc
+    rows = jnp.take_along_axis(rows, perm_rows.reshape(idx_shape), axis=mu_axis)
+    rows = rows * phase.reshape(idx_shape)
+    trs_shape = [1] * ndim
+    trs_shape[0] = n_full
+    rows = jnp.where((sym >= int(n_sym_spatial)).reshape(trs_shape),
+                     jnp.conj(rows), rows)
+    U_rows = jnp.asarray(spin_action_full, dtype=rows.dtype)   # (n_full, ns, ns)
+    moved = jnp.moveaxis(rows, spin_axis, -1)
+    moved = jnp.einsum('qac,q...c->q...a', U_rows, moved)
+    return jnp.moveaxis(moved, -1, spin_axis)
+
+
 def open_spin_block_coefficient(spin_action_full, a: int, b: int):
     """``coef[k, c, d] = U_k[a, c]·conj(U_k[b, d])``: one output spin block.
 
