@@ -916,14 +916,16 @@ def main(argv=None):
 					tensors_filename=tensors_filename,
 					print_fn=print0)
 		if green_parent_carrier is not None:
-			# Every chi0 call above blocks before returning.  Release the parent
-			# carrier before W persistence and Sigma so it cannot inflate those
-			# unrelated live sets or become an unused jit operand.
+			# Every chi0 call above blocks before returning.  Drop the
+			# screening view's reference so it is not an unused jit operand
+			# downstream.  The arrays themselves stay resident: the Sigma
+			# view (wfns_sigma) holds the same carrier, priced as such.
 			isdf.green_parent_carrier = None
 			wfns_screening = None
 			green_parent_carrier = None
 			gc.collect()
-			print0("  Parent-k Green carrier released after screening.")
+			print0("  Parent-k Green carrier detached from the screening view "
+			       "(the Sigma view keeps it).")
 
 	if (oneshot_head_response is not None
 			and not packed_photon_replaces_charge_sigma(config)):

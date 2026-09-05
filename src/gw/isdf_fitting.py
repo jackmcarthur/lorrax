@@ -1420,6 +1420,17 @@ def fit_zeta_to_h5(
             target_width=int(chunk_r))
         num_chunks = int(real_grid_tiles.n_tiles)
         n_rchunk = int(real_grid_tiles.width)
+        if n_rchunk > int(chunk_r):
+            # A tile holds whole real-space orbits on each Y owner, so its
+            # width is bounded below by n_y x the largest orbit.  When the
+            # planner's chunk_r sits under that floor the tiles are WIDER
+            # than what was priced: say so, loudly, rather than OOM in
+            # silence (planner floor: KNOWN_LORRAX_ISSUES 2026-09-05).
+            print_fn(
+                f"  *** LORRAX SANITY: orbit-closed r tiles are {n_rchunk} "
+                f"slots wide but the memory plan priced chunk_r = "
+                f"{int(chunk_r)}; the Z_q / solve / zeta chunk live set is "
+                f"{n_rchunk / max(1, int(chunk_r)):.2f}x the planned one. ***")
         print_fn(
             f"  Z_q on raw parents: {k_unfold_plan.n_parent} parent k rows "
             f"-> {nk_tot} full k by the typed unfold on {num_chunks} "

@@ -362,10 +362,16 @@ class WavefunctionBasisReceipt:
                 f"energy carrier width {int(carrier.enk.shape[1])}")
         mu_extents = []
         spin_extents = []
+        # Parents-only storage keeps its psi in the parent carrier; the
+        # receipt authenticates those faces exactly as it does full-k ones.
+        parent = getattr(carrier, "green_parent", None)
+        parent_faces = (() if parent is None else
+                        ((parent.psi_nmu, 3, 2), (parent.psi_mun, 2, 1)))
         for value, mu_axis, spin_axis in (
                 (carrier.psi_xn, 2, 1), (carrier.psi_xr, 3, 2),
                 (carrier.psi_yr, 3, 2), (carrier.psi_yn, 2, 1),
-                (carrier.psi_nmu, 3, 2), (carrier.psi_mun, 2, 1)):
+                (carrier.psi_nmu, 3, 2), (carrier.psi_mun, 2, 1),
+                *parent_faces):
             if value is not None:
                 mu_extents.append(int(value.shape[mu_axis]))
                 spin_extents.append(int(value.shape[spin_axis]))
