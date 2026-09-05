@@ -916,6 +916,16 @@ def _first_channel(x):
 	return x[0] if isinstance(x, tuple) else x
 
 
+def _restart_channels(x):
+	"""``(label, array)`` per stored transverse carrier: one for a shared
+	carrier, three for per-channel carriers.  A sanity check handed the
+	tuple itself would ``np.asarray`` it -- a host gather of every channel
+	onto every rank."""
+	if not isinstance(x, tuple):
+		return [("", x)]
+	return [(f" channel {a}", arr) for a, arr in zip((1, 2, 3), x)]
+
+
 def _transverse_field_channels(carriers, field: str):
 	"""``field`` of each transverse carrier, as one array (shared carrier,
 	byte-identical restart schema) or a 3-tuple (per-channel carriers)."""
@@ -4154,9 +4164,10 @@ def prepare_isdf_and_wavefunctions(
 				if cfg.memory.low_mem_bands:
 					from .wavefunction_bundle import (
 						wavefunctions_face_from_restart)
-					sanity.check_finite(
-						"restart transverse ψ (psi_full_y_transverse, "
-						"face)", rs.psi_nmu_transverse, print_fn=print0)
+					for _label, _arr in _restart_channels(rs.psi_nmu_transverse):
+						sanity.check_finite(
+							"restart transverse ψ (psi_full_y_transverse, "
+							f"face){_label}", _arr, print_fn=print0)
 					wfns_transverse = _transverse_carriers_from_restart(
 						rs.psi_nmu_transverse, rs.psi_mun_transverse,
 						lambda nmu, mun: wavefunctions_face_from_restart(
@@ -4165,9 +4176,10 @@ def prepare_isdf_and_wavefunctions(
 							mesh_xy=mesh_xy,
 							basis_receipt=transverse_basis_receipt))
 				else:
-					sanity.check_finite(
-						"restart transverse ψ (psi_full_y_transverse)",
-						rs.psi_rmu_Y_transverse, print_fn=print0)
+					for _label, _arr in _restart_channels(rs.psi_rmu_Y_transverse):
+						sanity.check_finite(
+							f"restart transverse ψ (psi_full_y_transverse){_label}",
+							_arr, print_fn=print0)
 					wfns_transverse = _transverse_carriers_from_restart(
 						rs.psi_rmu_Y_transverse, rs.psi_rmuT_X_transverse,
 						lambda y, x: build_wavefunction_bundle(

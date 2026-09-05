@@ -2065,28 +2065,6 @@ def _load_static_photon_hall(
     return hall
 
 
-def _report_packed_hermiticity(name: str, body, print_fn=print) -> None:
-    """Print ``max|B - B^dagger| / max|B|`` of a packed static body (debug only).
-
-    ``body`` is ``(nq, N_packed, N_packed)``; the dagger is over the packed
-    (Lorentz, centroid) index at fixed q.  Gated on ``debug_print_enabled``
-    because the transpose reshards the whole body.  Printed, not gated: the
-    number is a measurement of the four-current carrier bookkeeping.
-    """
-    from runtime import debug_print_enabled
-    if not debug_print_enabled():
-        return
-    diff = jnp.max(jnp.abs(body - jnp.conj(jnp.swapaxes(body, -1, -2))))
-    scale = jnp.max(jnp.abs(body))
-    diff = float(jax.block_until_ready(diff))
-    scale = float(jax.block_until_ready(scale))
-    if jax.process_index() == 0:
-        print_fn(
-            f"  [photon response] {name} Hermiticity residual "
-            f"max|B-B^dagger|/max|B| = {diff / max(scale, 1e-300):.3e} "
-            f"(max|B| = {scale:.6e})")
-
-
 def compute_static_photon_response(
     wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
     meta, mesh_xy, *,
@@ -2309,8 +2287,19 @@ def compute_static_photon_response(
         # and the TC block's charge end were built from the same carrier; a
         # carrier leaking across a Lorentz label leaves a residual of order
         # (relative carrier difference) x |CT|/|CC|, many orders above the
-        # 2e-16 measured on MoS2 (runs/DEV/322, 2026-09-04).
-        _report_packed_hermiticity("chi0_packed", chi_packed, print_fn)
+        # 2e-16 measured on MoS2 (runs/DEV/322, 2026-09-04).  One owner:
+        # ``sanity.check_hermitian`` fuses transpose and reductions in one
+        # jit, so the (mu, mu) operands stay tile-local (its docstring names
+        # the all-gather an eager spelling costs); ``measurement`` prints
+        # the number on every call and never refuses.
+        from common import sanity
+        from runtime import debug_print_enabled
+        _carrier_cause = ("four-current carrier bookkeeping: the CT and TC "
+                          "blocks' charge ends must ride the same carrier")
+        if debug_print_enabled():
+            sanity.check_hermitian(
+                "chi0_packed", chi_packed, print_fn=print_fn, always=True,
+                measurement=True, cause=_carrier_cause)
 
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
@@ -2324,7 +2313,10 @@ def compute_static_photon_response(
         # while the asynchronous distributed LU still owns A, RHS and donated
         # chi.  Finish the response here, inside its timing/lifetime boundary.
         W_packed.block_until_ready()
-        _report_packed_hermiticity("W_packed", W_packed, print_fn)
+        if debug_print_enabled():
+            sanity.check_hermitian(
+                "W_packed", W_packed, print_fn=print_fn, always=True,
+                measurement=True, cause=_carrier_cause)
     elif charge_block_state == STATIC_PHOTON_CHARGE_BLOCK_PRESENT:
         # chi_TT = chi_CT = 0 makes the packed Dyson equation block diagonal:
         #     W_packed = diag((1 - D_00 chi_00)^-1 D_00, D_TT),  W_CT = 0.

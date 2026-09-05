@@ -571,19 +571,14 @@ def compute_static_photon_sigma(
         # is a rank-divergent program and the cross-rank compile-agreement
         # gate refuses it (measured: 'jit_swapaxes' vs 'jit_broadcast_in_dim',
         # runs/DEV/322 step 20:55:45).
+        from common import sanity
         for name, arr in (("Sigma_x", sig_x), ("Sigma_sx", sig_sx),
                           ("Sigma_coh", sig_coh)):
-            diff = jnp.max(jnp.abs(
-                arr - jnp.conj(jnp.swapaxes(arr, -1, -2))))
-            scale = jnp.max(jnp.abs(arr))
-            diff = float(jax.block_until_ready(diff))
-            scale = float(jax.block_until_ready(scale))
-            if jax.process_index() == 0:
-                print_fn(
-                    f"  [photon Sigma] packed {name} Hermiticity residual "
-                    f"max|S-S^dagger|/max|S| = "
-                    f"{diff / max(scale, 1e-300):.3e} "
-                    f"(max|S| = {scale:.6e} Ry)")
+            sanity.check_hermitian(
+                f"packed {name}", arr, print_fn=print_fn, always=True,
+                measurement=True,
+                cause="two-carrier endpoint bookkeeping (the CT and TC "
+                      "blocks must carry the same carrier at each end)")
     zero_matrix = jnp.zeros_like(sig_sx)
     sigma_components = jnp.stack([
         zero_matrix if value is None else value for value in sigma_sector])
