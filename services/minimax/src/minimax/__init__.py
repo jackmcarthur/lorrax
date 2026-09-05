@@ -115,6 +115,7 @@ from minimax._catalog import (
 #: it is on the surface anyway, because a door nobody can reach is how a
 #: shipped catalog quietly becomes unreachable bytes.
 from minimax import beta_selector, damped_line_selector, family_axes
+from minimax.cd_imaginary import CompactCDImaginary
 from minimax.door import (
     RUNTIME_SOLVE_ENV,
     catalog,

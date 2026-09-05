@@ -212,9 +212,14 @@ def _control_certificate(*, real_fine: np.ndarray,
 def _direct_pair_scan(psi_x_a, psi_y_a, psi_x_b, psi_y_b,
                       energy_a, energy_b, occ_a, occ_b, surface_a,
                       surface_b, z_values, *, nb_logical: int, tile: int,
-                      derivative_order: int = 0):
+                      derivative_order: int = 0,
+                      zero_frequency_limit: str = "thermodynamic"):
     """Exact referee ordered-pair Adler--Wiser sum."""
     derivative_order = int(derivative_order)
+    if zero_frequency_limit not in ("thermodynamic", "dynamic"):
+        raise ValueError("direct ordered-pair zero_frequency_limit must be thermodynamic or dynamic")
+    if zero_frequency_limit == "dynamic" and derivative_order:
+        raise ValueError("dynamic zero limit is a value-only imaginary-arm mode")
     if derivative_order not in (0, 1, 2):
         raise ValueError(
             "direct ordered-pair derivative_order must be 0, 1, or 2, "
@@ -258,8 +263,18 @@ def _direct_pair_scan(psi_x_a, psi_y_a, psi_x_b, psi_y_b,
         static = jnp.where(
             separated, df / jnp.where(separated, de, 1.0),
             -0.5 * (sa[:, :, None] + sb[:, None, :]))
-        dynamic = df[None] / (de[None] + z[:, None, None, None])
-        weights = jnp.where((abs(z) <= 1.0e-30)[:, None, None, None],
+        if zero_frequency_limit == "dynamic":
+            # The one-sided u->0+ limit excludes *exact* de=0 pairs at
+            # every q, not only intraband q=0. Canonical occupations must
+            # have df=0 there (authenticated geometry preflight). Tiny
+            # nonzero de remains df/de; the thermodynamic 64-eps branch
+            # is deliberately not reused for this different limit.
+            nonzero = de != 0.0
+            static = jnp.where(nonzero, df / jnp.where(nonzero, de, 1.0), 0.0)
+        denominator = de[None] + z[:, None, None, None]
+        dynamic = df[None] / jnp.where(denominator != 0.0, denominator, 1.0)
+        zero_sample = z == 0.0 if zero_frequency_limit == "dynamic" else abs(z) <= 1.0e-30
+        weights = jnp.where(zero_sample[:, None, None, None],
                             static[None], dynamic)
         ga, gb = ia + jnp.arange(tile), ib + jnp.arange(tile)
         logical = ((ga[:, None] < int(nb_logical))
@@ -307,7 +322,8 @@ def _direct_pair_scan(psi_x_a, psi_y_a, psi_x_b, psi_y_b,
 
 
 def make_direct_kernel(mesh: Mesh, *, nb_logical: int, tile: int = PAIR_TILE,
-                       derivative_order: int = 0):
+                       derivative_order: int = 0,
+                       zero_frequency_limit: str = "thermodynamic"):
     from common.shard_map import shard_map
     from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
 
@@ -318,7 +334,8 @@ def make_direct_kernel(mesh: Mesh, *, nb_logical: int, tile: int = PAIR_TILE,
             occupations, jnp.take(occupations, kminusq, axis=0), surface,
             jnp.take(surface, kminusq, axis=0), z,
             nb_logical=nb_logical, tile=tile,
-            derivative_order=derivative_order)
+            derivative_order=derivative_order,
+            zero_frequency_limit=zero_frequency_limit)
 
     out_specs = (tuple(P(None, "x", "y")
                        for _ in range(int(derivative_order) + 1))
@@ -504,6 +521,33 @@ def _imag_static_coefficients(evaluation: np.ndarray,
     return out
 
 
+def _load_compact_imaginary_plan(input_dir, *, energies_ry, occupations,
+                                 target_k, target_b, kq_map_full):
+    """Authenticate a frozen response-free coefficient artifact, not a new W path."""
+    from minimax import CompactCDImaginary
+
+    base = Path(input_dir) / "internal_ff_cd_compact_plan"
+    receipt = json.loads(base.with_suffix(".json").read_text())
+    if (receipt.get("schema") != "run91-compact-imaginary-plan-v1"
+            or receipt.get("response_values_seen") is not False
+            or receipt.get("distinct_w_builds") != 56):
+        raise ValueError("compact CD requires its frozen response-free 56-build plan")
+    with np.load(base.with_suffix(".npz"), allow_pickle=False) as stored:
+        arrays = {key: np.asarray(stored[key]) for key in (
+            "nodes_ev", "greenx_weights_ev", "linear_table", "log_edges", "scale_ev")}
+    for key, value in arrays.items():
+        if _array_receipt(value) != receipt["receipts"][key]:
+            raise ValueError(f"compact CD plan array receipt differs: {key}")
+    geometry = receipt["geometry_receipts"]
+    for key, value in dict(energies_ry=energies_ry, f_kn=occupations,
+                           target_k=target_k, target_b=target_b,
+                           kqfull_map=kq_map_full).items():
+        if _array_receipt(value) != geometry[key]:
+            raise ValueError(f"compact CD geometry differs from its pre-W freeze: {key}")
+    plan = CompactCDImaginary(**{**arrays, "scale_ev": float(arrays["scale_ev"])})
+    return plan, receipt
+
+
 def _imag_coefficients(iw: int, *, evaluation: np.ndarray,
                        angle_weights: np.ndarray,
                        static_coefficients: np.ndarray,
@@ -663,7 +707,8 @@ def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
 
 
 def _load_checkpoint(path: Path, identity, n_targets, family_names, *,
-                     return_stage_timings: bool = False):
+                     return_stage_timings: bool = False,
+                     terminal_prefixes: tuple[int, ...] = ()):
     family_names = tuple(str(name) for name in family_names)
     grid_n = int(identity["grid_n"])
     empty_stages = {key: 0.0 for key in STAGE_TIMING_KEYS}
@@ -701,7 +746,8 @@ def _load_checkpoint(path: Path, identity, n_targets, family_names, *,
                 f"internal_ff_cd checkpoint {path} contribution shape "
                 f"{contributions.shape} != {expected_shape}")
         if completed < 0 or completed > grid_n or (
-                completed % FREQUENCY_BATCH != 0 and completed != grid_n):
+                completed % FREQUENCY_BATCH != 0 and completed != grid_n
+                and completed not in terminal_prefixes):
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} has invalid completed="
                 f"{completed}")
@@ -976,8 +1022,12 @@ def compute_internal_ff_cd(
     real_max_ev = _real_coverage_max(max_required)
     residue_sign = np.where(x_signed >= 0.0, -(1.0 - inner_f), inner_f)
 
+    compact_imag, compact_receipt = _load_compact_imaginary_plan(
+        input_dir, energies_ry=np.asarray(wfns.enk, np.float64)[:, :nb_chi_logical],
+        occupations=occupations[:, :nb_chi_logical], target_k=target_k,
+        target_b=target_b, kq_map_full=kq_map_full)
     direct_imag = make_direct_kernel(
-        mesh_xy, nb_logical=nb_chi_logical)
+        mesh_xy, nb_logical=nb_chi_logical, zero_frequency_limit="dynamic")
     direct_real = make_direct_kernel(
         mesh_xy, nb_logical=nb_chi_logical, derivative_order=2)
     contract = make_weighted_contract_kernel(
@@ -985,9 +1035,8 @@ def compute_internal_ff_cd(
         inner_stop=nb_sigma_logical)
     (rgrid, real_family_names, real_family_grids,
      real_base_stop) = _real_family_plan(real_max_ev)
-    igrid, imag_family_names, imag_angle_weights = _imag_family_plan()
-    imag_static_coeff = _imag_static_coefficients(
-        igrid, imag_angle_weights, x_signed)
+    igrid, imag_family_names = compact_imag.nodes_ev, compact_imag.family_names
+    imag_static_coeff = compact_imag.coefficient(0, x_signed)
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
     body_provenance = _body_checkpoint_provenance(
         energies_ry=wfns.enk, state=state,
@@ -1038,10 +1087,7 @@ def compute_internal_ff_cd(
                 "name": "imaginary",
                 "requested_z_ry": 1j * planned_igrid / RYD_TO_EV,
                 "evaluated_z_ry": 1j * planned_igrid / RYD_TO_EV,
-                "terminal_prefixes": [
-                    1 + IMAG_BASE_RULE_NODES,
-                    1 + IMAG_ESCALATION_RULE_NODES,
-                ],
+                "terminal_prefixes": [int(igrid.size)],
             },
             q_full=q_full, q_irr_frac=qfrac,
             bvec_cart=CoulombGeometry.from_wfn(wfn).bvec,
@@ -1067,7 +1113,7 @@ def compute_internal_ff_cd(
                 checkpoint_dir / f"real_eta_{width:.8f}.npz")
             preexisting_completed.append(_load_checkpoint(
                 planned_checkpoint, planned_identity, n_targets,
-                real_family_names)[0])
+                real_family_names, terminal_prefixes=(real_base_stop,))[0])
         planned_identity = _checkpoint_identity(
             kind="imaginary", grid=planned_igrid, width_ev=None,
             target_k=target_k, target_b=target_b,
@@ -1075,6 +1121,7 @@ def compute_internal_ff_cd(
             w_observer_identity=observer_identity)
         planned_identity["grid_n"] = int(planned_igrid.size)
         planned_identity["coefficient_families"] = list(imag_family_names)
+        planned_identity["compact_imaginary_plan"] = compact_receipt
         preexisting_completed.append(_load_checkpoint(
             checkpoint_dir / "imaginary.npz", planned_identity,
             n_targets, imag_family_names)[0])
@@ -1232,7 +1279,7 @@ def compute_internal_ff_cd(
         (completed, contributions, loaded, chi_wall, solve_contract_wall,
          stage_wall) = _load_checkpoint(
             checkpoint, identity, n_targets, real_family_names,
-            return_stage_timings=True)
+            return_stage_timings=True, terminal_prefixes=(real_base_stop,))
         if observer is not None:
             observer.require_checkpoint_prefix(arm_name, completed)
         del loaded
@@ -1342,6 +1389,7 @@ def compute_internal_ff_cd(
         w_observer_identity=observer_identity)
     identity["grid_n"] = int(igrid.size)
     identity["coefficient_families"] = list(imag_family_names)
+    identity["compact_imaginary_plan"] = compact_receipt
     checkpoint = checkpoint_dir / "imaginary.npz"
     (completed, contributions, loaded, chi_wall, solve_contract_wall,
      stage_wall) = _load_checkpoint(
@@ -1360,11 +1408,8 @@ def compute_internal_ff_cd(
         for lo in range(start, stop, FREQUENCY_BATCH):
             hi = min(lo + FREQUENCY_BATCH, stop)
             coefficient_rows = [
-                _imag_coefficients(
-                    iw, evaluation=igrid,
-                    angle_weights=imag_angle_weights,
-                    static_coefficients=imag_static_coeff,
-                    x_signed=x_signed)[None, ...]
+                (imag_static_coeff if iw == 0 else
+                 compact_imag.coefficient(iw, x_signed))[None, ...]
                 for iw in range(lo, hi)
             ]
             t_batch = time.perf_counter()
@@ -1396,34 +1441,21 @@ def compute_internal_ff_cd(
                     "frequencies")
         return stop if start < stop else start, chi_seconds, solve_seconds
 
-    base_stop = 1 + IMAG_BASE_RULE_NODES
-    preexisting_escalation = completed > base_stop
-    if completed < base_stop:
-        completed, chi_wall, solve_contract_wall = advance_imaginary(
-            base_stop, completed, chi_wall, solve_contract_wall)
-    base_accum = contributions[:base_stop].sum(axis=0)
-    base_delta = base_accum[1] - base_accum[0]
-    base_worst_mev = 1000.0 * np.maximum(
-        np.abs(base_delta.real), np.abs(base_delta.imag))
-    escalated = bool(preexisting_escalation or np.any(
-        base_worst_mev > CD_CONTROL_TOL_MEV))
-    if escalated and completed < igrid.size:
+    escalated = False
+    if completed < igrid.size:
         completed, chi_wall, solve_contract_wall = advance_imaginary(
             igrid.size, completed, chi_wall, solve_contract_wall)
     all_accum = contributions[:completed].sum(axis=0)
-    if escalated:
-        imag_accum, imag_coarse = all_accum[2], all_accum[1]
-        imag_rule_pair = [IMAG_BASE_RULE_NODES,
-                          IMAG_ESCALATION_RULE_NODES]
-    else:
-        imag_accum, imag_coarse = all_accum[1], all_accum[0]
-        imag_rule_pair = [IMAG_RULE_NODES[0], IMAG_BASE_RULE_NODES]
+    imag_accum, imag_coarse = all_accum[0], all_accum[1]
+    imag_rule_pair = [32, 24]
     grid_records.append({
         "kind": "imaginary", "eta_w_ev": 0.0,
         "n_planned": int(igrid.size), "n_evaluated": int(completed),
         "domain_ev": [0.0, "infinity"],
         "largest_finite_node_ev": float(np.max(igrid[:completed])),
-        "static_subtraction": "exact_S0_half_plus_quadrature_of_Siu_minus_S0",
+        "static_subtraction": "dynamic_A_Bb_exact_plus_quadrature_of_Wc_minus_Bb",
+        "coefficient_families": list(imag_family_names),
+        "compact_imaginary_plan": compact_receipt,
         "rule_pair": imag_rule_pair, "escalated": escalated,
         "sha256": _hash_array(igrid),
         "frequency_batch": FREQUENCY_BATCH,
@@ -1518,7 +1550,7 @@ def compute_internal_ff_cd(
             "residue_required_max_ev": max_required,
             "real_rule_pair_ev": final_real_rule_pair,
             "imag_domain_ev": [0.0, "infinity"],
-            "imag_map_scale_ev": IMAG_MAP_SCALE_EV,
+            "imag_map_scale_ev": compact_imag.scale_ev,
             "imag_rule_pair": imag_rule_pair,
             "imag_escalated": escalated,
             "eta_w_broadening_bias": "excluded_from_quadrature_certificate",
@@ -1527,7 +1559,7 @@ def compute_internal_ff_cd(
             "tolerance_mev": CD_CONTROL_TOL_MEV,
             "rule": "max absolute real/imag component of the independent "
                     "calibrated quintic real-grid estimator "
-                    "abs(fine-coarse)/12 and same-domain nested imaginary "
+                    "abs(fine-coarse)/12 and same-domain independent compact imaginary "
                     "control; eta_W broadening bias is excluded",
             "real_estimator_status": "empirically calibrated on planted "
                                      "single/crowded/continuum poles; not a "

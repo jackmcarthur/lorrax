@@ -965,12 +965,58 @@ broadening, screening-band count, Coulomb/q0 convention, and external-cell
 scope.  The Tier-0 side must itself pass, per cell:
 
 1. the fixed $\eta_W=0.25$ eV physical broadening, checked against the deck;
-2. a 0.25 eV real line through an interpolation-safe ceiling derived from the
+2. a quintic real line through an interpolation-safe ceiling derived from the
    complete target/intermediate energy table, with no extrapolation;
-3. separate nested fine/coarse real, fine/coarse imaginary, and imaginary-tail
-   controls below 0.5 meV in every real/imaginary component (a cancellation
-   between controls cannot pass);
+3. separate real-grid and same-domain imaginary-family controls below 0.5 meV
+   in every real/imaginary component (a cancellation between controls cannot
+   pass; empirical estimator agreement is not a mathematical error bound);
 4. occupation, Coulomb, source, and grid provenance stamps.
 
 Only after those gates may the A/B certify MPA.  A green fit diagnostic without
 that A/B is explicitly not a production certification.
+
+### Compact imaginary oracle (Run91 feature; measurement required)
+
+The route consumes a response-free, frozen pair of
+`internal_ff_cd_compact_plan.json` and `.npz` beside its input. The JSON binds
+every numerical table and the canonical physical energy/occupation/target/q
+geometry with exact receipts. A missing or different artifact refuses before
+response work. `services/minimax.CompactCDImaginary` serves coefficients; it
+knows no W, wavefunctions, bands, or file format. The existing CD frequency
+batch constructs W once and contracts both coefficient families immediately.
+
+For signed x, a=|x|, s=sign(x), the dynamic anchor A=Wc(i0+) and
+B(u)=A b²/(u²+b²) give the exact identity
+
+`I(x) = s A b/[2(a+b)] + integral_0^infinity x[Wc(iu)-B(u)]/[pi(a²+u²)] du`.
+
+The existing ordered-pair owner has a value-only `dynamic` zero mode: exact
+de=0 pairs contribute zero, including finite-q degeneracies, while every
+nonzero de retains df/de. Authenticated canonical occupations must give df=0
+on exact degeneracies. Thermodynamic static screening keeps its original
+mode and is not the imaginary-arm anchor. No analytic continuation is used.
+
+The primary uses t=(u-b)/(u+b), 32 Chebyshev intervals:31 positive nodes plus
+A; the infinite endpoint is known Wc=0 and is not built. Its Lorentzian
+moments are generated offline at80 decimal digits, then served by a small
+piecewise Chebyshev table and Clenshaw evaluation. A float64 forward moment
+recurrence is unstable near a=b and is never evaluated at runtime. The
+independent GreenX24 ordinary-du rule shares A, making56 distinct builds.
+Both remove B exactly, so their residual vanishes at both endpoints and
+metallic |u| cusp behavior is smooth in the linear-rational coordinate.
+The frozen table covers near-degenerate target denominators without making
+the artificial center shift determine GreenX's transition-energy ratio.
+
+GreenX tables: Kaltak et al., DOI10.1021/ct5001268; GX-TimeFrequency,
+DOI10.21105/joss.05570. Their scalar fitting range alone does not certify
+metallic Sigma. Run91 therefore retains planted pole/cusp/near-zero/tail
+controls and independently compares all290 Na imaginary channels; it does
+not escalate to hundreds of nodes when the56-build union fails.
+
+The real-body semantic identity is deliberately unchanged, allowing an
+authenticated private copy of the real1201 base prefix to resume under the
+2401-node planned refinement. Only the explicitly owner-planned terminal
+prefix is accepted; receipts and zero beyond-prefix checks still apply.
+The imaginary checkpoint additionally stamps its compact plan and cannot
+consume the old GP checkpoint. Real0.25→0.125 eV `/12` control and the
+compact-family imaginary difference are reported separately.
