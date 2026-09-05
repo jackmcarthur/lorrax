@@ -5847,9 +5847,9 @@ def dump_qp_wfn_artifacts(
     ``logical_band_stop`` is the unpadded end of the sum-band ladder.  It
     is required only when the final map used an energy-only tail scissor.
 
-    Both files are rank-0-only writes (h5py is single-writer); a
-    multihost barrier follows so the caller can rely on both files
-    existing on every rank when this function returns.
+    Both files are rank-0-only writes (h5py is single-writer). Each write
+    broadcasts its verdict: every rank returns after both files finish,
+    or raises the same named failure before the next write.
 
     Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry)``.
     """
