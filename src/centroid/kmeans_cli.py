@@ -109,6 +109,24 @@ def build_parser() -> argparse.ArgumentParser:
                         "'_current') and a header comment naming the "
                         "density, so a downstream gw_jax run can read both "
                         "files unambiguously.")
+    p.add_argument("--current-balance", choices=("kinetic", "velocity"),
+                   default="kinetic",
+                   help="Small-component balance of the current carriers the "
+                        "--density-mode current weight is built from.  "
+                        "'kinetic' (default): one sigma.p carrier for all "
+                        "three Dirac-current channels, the shipped weight.  "
+                        "'velocity': one carrier per channel a, psi_S^(a) = "
+                        "(alpha/4)[sigma.(2(k+G)+dV_SR/dk) + sigma^a "
+                        "dV_SO/dk_a] psi_L, so channel a's alpha^a vertex is "
+                        "the pseudo-Hamiltonian's velocity exactly (the same "
+                        "bispinor_current_balance = velocity a gw_jax deck "
+                        "names).  Needs the run's *.upf (--pseudo-dir).  The "
+                        "pivoted-Cholesky prune Gram still uses the shared "
+                        "sigma.p carrier and says so.")
+    p.add_argument("--pseudo-dir", type=str, default=".",
+                   help="Directory holding the *.upf pseudopotentials "
+                        "(default: the current directory); read only for "
+                        "--current-balance velocity.")
     p.add_argument("--out-suffix", type=str, default=None,
                    help="Suffix appended to the output filename.  Default "
                         "is '' for --density-mode scalar and '_current' "
@@ -144,6 +162,7 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 print0 = debug_print
 
 import gc
+import os
 import time
 
 import jax
@@ -313,6 +332,19 @@ def _resolve_symmetry(args, wfn):
     return None, None, None, 1, False
 
 
+def _current_carrier_lifts(args):
+    """The three Lorentz-label carrier selectors for --density-mode current
+    (``None`` for the shared sigma.p carrier)."""
+    if args.density_mode != "current" or args.current_balance == "kinetic":
+        return None
+    from common.four_current_model import resolve_four_current_representation
+    from gw.gw_config import coerce_bispinor_current_lift
+    rep = resolve_four_current_representation(
+        True, "bare_transverse",
+        current_lift=coerce_bispinor_current_lift(args.current_balance))
+    return tuple(rep.current_lift_for(a) for a in (1, 2, 3))
+
+
 def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     """Build the feature-row norm used by both k-means and pruning.
 
@@ -336,16 +368,21 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     left_range, right_range, range_label = prune_band_ranges(
         args, n_val, n_cond)
     mode = "transverse" if args.density_mode == "current" else "charge"
+    lifts = _current_carrier_lifts(args)
     channel = ("Σ_i |Ψ_m†α_iΨ_n/α_fs|²" if mode == "transverse" else
                "|ψ_m†ψ_n|²")
+    carrier = ("" if mode != "transverse" else
+               (" [current carriers: per-channel velocity balance]"
+                if lifts is not None else " [current carrier: sigma.p]"))
     print0(
         f"k-means weight: sqrt(Σ_k w_k Σ_{{m∈{left_range},n∈{right_range}}} "
-        f"{channel}); [{range_label}], unit band weights")
+        f"{channel}); [{range_label}], unit band weights{carrier}")
     from .sampling_metric import build_feature_metric_diagonal
     metric_diagonal = build_feature_metric_diagonal(
         wfn, sym, left_range, right_range, gamma_mode=mode,
         dist_mesh=dist_mesh,
         verbose=(debug_print_enabled() and process_rank() == 0),
+        bispinor_lifts=lifts,
     )
     if R is not None:
         from .charge_density import symmetrize_on_grid
@@ -353,7 +390,10 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     weight = np.sqrt(metric_diagonal)
     label = (
         f"sqrt(diag q=0 {mode} Gram), left={left_range}, "
-        f"right={right_range}, unit band weights")
+        f"right={right_range}, unit band weights"
+        + ("" if mode != "transverse" else
+           (", per-channel velocity carriers" if lifts is not None
+            else ", sigma.p carrier")))
     return weight, label, (left_range, right_range)
 
 
@@ -485,6 +525,13 @@ def main():
     with timing.section("setup.wfn_io"):
         wfn = WfnLoader("WFN.h5")
         sym = wfn.symmetry()
+        if args.density_mode == "current" and args.current_balance == "velocity":
+            # The per-channel carriers need dV_NL/dk from the run's
+            # projectors; the loader owns none, the driver attaches them.
+            from psp.vnl_ops import nonlocal_velocity_lift_from_pseudo_dir
+            wfn.nonlocal_velocity_lift = nonlocal_velocity_lift_from_pseudo_dir(
+                wfn, sym, None, args.pseudo_dir, sys_dim=None,
+                caller="centroid.kmeans_cli", print_fn=print0)
 
         n_rtot = int(np.prod(wfn.fft_grid))
         init_method, init_msg = _decide_init_method(N_c, n_rtot)
@@ -612,7 +659,12 @@ def main():
         feature_fit = (
             f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
             "sqrt(sum_k w_k sum_i,m,n "
-            "|Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights")
+            "|Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights; "
+            f"current_balance={args.current_balance}"
+            + ("" if args.current_balance == "kinetic" else
+               f" [{wfn.nonlocal_velocity_lift.provenance}; projectors "
+               f"{os.path.abspath(args.pseudo_dir)}; prune Gram: shared "
+               "sigma.p carrier]"))
     else:
         feature_fit = (
             f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "

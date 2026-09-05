@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from pathlib import Path
 from types import MethodType
 
 import jax.numpy as jnp
@@ -331,3 +332,139 @@ def test_builder_has_no_occupation_or_persistent_pullback_cache():
     bad_attrs = {n.attr for n in ast.walk(bad) if isinstance(n, ast.Attribute)}
     assert not bad_names.isdisjoint(forbidden)
     assert not bad_attrs.isdisjoint(forbidden)
+
+
+# ---------------------------------------------------------------------------
+# per-channel current carriers (bispinor_current_balance = velocity)
+# ---------------------------------------------------------------------------
+
+def test_per_channel_transverse_kernel_matches_shared_and_direct():
+    from centroid.sampling_metric import (
+        _transverse_metric_diagonal, _transverse_metric_diagonal_per_channel)
+    rng = np.random.default_rng(904)
+
+    def herm(n):
+        a = rng.standard_normal((4, 4, 2, 1, 3)) + 1j * rng.standard_normal(
+            (4, 4, 2, 1, 3))
+        return a + np.conj(np.swapaxes(a, 0, 1))
+
+    d_l, d_r = herm(0), herm(1)
+    shared = np.asarray(_transverse_metric_diagonal(d_l, d_r, 0.7))
+    same = np.asarray(_transverse_metric_diagonal_per_channel(
+        (d_l, d_l, d_l), (d_r, d_r, d_r), 0.7))
+    np.testing.assert_array_equal(same, shared)
+
+    lefts, rights = (herm(2), herm(3), herm(4)), (herm(5), herm(6), herm(7))
+    got = np.asarray(_transverse_metric_diagonal_per_channel(lefts, rights, 0.7))
+    want = np.zeros(d_l.shape[-3:])
+    for i, mu in enumerate((1, 2, 3)):
+        alpha = np.asarray(gammas[mu])
+        want += np.real(np.einsum(
+            "abxyz,bc,cdxyz,da->xyz", lefts[i], alpha, rights[i], alpha,
+            optimize=True))
+    want *= (0.7 ** 2 / ALPHA_FS) ** 2
+    np.testing.assert_allclose(got, want, rtol=1e-13, atol=1e-13)
+    assert np.max(np.abs(got - shared)) > 1e-3 * np.max(np.abs(shared))
+
+
+def test_three_raw_lifts_are_the_shared_carrier(monkeypatch):
+    import common.collectives as C
+    import common.wfn_transforms as T
+
+    psi = _current_psi()
+    monkeypatch.setattr(T, "to_rbox", lambda values, *a, **k: values)
+    monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
+    loader = _fake_loader(psi, [0.4, 0.6], raw_nspinor=2, bispinor=True)
+    shared = build_feature_metric_diagonal(
+        loader, _Star([0, 1], [0, 0]), (0, 2), (1, 3),
+        gamma_mode="transverse", verbose=False)
+    loader = _fake_loader(psi, [0.4, 0.6], raw_nspinor=2, bispinor=True)
+    got = build_feature_metric_diagonal(
+        loader, _Star([0, 1], [0, 0]), (0, 2), (1, 3),
+        gamma_mode="transverse", verbose=False,
+        bispinor_lifts=("raw", "raw", "raw"))
+    np.testing.assert_array_equal(got, shared)
+    assert loader.requests == [(0, 0, 3), (1, 0, 3)]
+    with pytest.raises(ValueError, match="one distinct carrier per Lorentz"):
+        build_feature_metric_diagonal(
+            loader, _Star([0, 1], [0, 0]), (0, 2), (1, 3),
+            gamma_mode="transverse", verbose=False,
+            bispinor_lifts=("velocity_1",) * 3)
+    with pytest.raises(ValueError, match="only meaningful"):
+        build_feature_metric_diagonal(
+            loader, _Star([0, 1], [0, 0]), (0, 2), (1, 3),
+            gamma_mode="charge", verbose=False,
+            bispinor_lifts=("raw", "raw", "raw"))
+
+
+_FIXTURE_DIR = Path(__file__).parent / "regression" / "cohsex_debug"
+
+
+def test_velocity_carriers_feed_channel_by_channel_on_the_mos2_fixture(
+        monkeypatch):
+    """End to end on WFNsmall.h5 with its FR projectors: channel i of the
+    weight is built from carrier velocity_i.  Reference: the explicit
+    state-pair sum per channel on the same lifted windows, symmetry
+    replaced by an identity star so the quadrature is the plain k sum."""
+    wfn_path = _FIXTURE_DIR / "WFNsmall.h5"
+    if not wfn_path.exists() or not list(_FIXTURE_DIR.glob("*.upf")):
+        pytest.skip("cohsex_debug fixture or its pseudopotentials missing")
+    import common.collectives as C
+    from common.collectives import single_device_mesh
+    from common.wfn_transforms import to_rbox
+    from psp import vnl_ops
+    from psp.pseudos import load_pseudopotentials
+    from wfn_loader import IBZRows, WfnLoader
+
+    monkeypatch.setattr(C, "process_rank_world", lambda: (0, 1))
+    wfn = WfnLoader(str(wfn_path))
+    try:
+        if int(wfn.nspinor) != 2:
+            pytest.skip("needs a 2-spinor WFN")
+        sym_real = wfn.symmetry()
+        setup = vnl_ops.build_vnl_setup(
+            wfn, sym_real, None, load_pseudopotentials(str(_FIXTURE_DIR)),
+            nspinor=2, print_fn=lambda *a, **k: None)
+        wfn.nonlocal_velocity_lift = vnl_ops.nonlocal_velocity_lift(setup)
+        nk = int(wfn.nkpts)
+        star = _Star(list(range(nk)), [0] * nk)     # identity quadrature
+        left, right = (0, 6), (2, 10)
+        lifts = ("velocity_1", "velocity_2", "velocity_3")
+        got = build_feature_metric_diagonal(
+            wfn, star, left, right, gamma_mode="transverse", verbose=False,
+            bispinor_lifts=lifts)
+        raw = build_feature_metric_diagonal(
+            wfn, star, left, right, gamma_mode="transverse", verbose=False)
+
+        fft_grid = tuple(int(v) for v in wfn.fft_grid)
+        scale = float(np.sqrt(np.prod(fft_grid) / float(wfn.cell_volume)))
+        weights = np.asarray(wfn.kweights, dtype=np.float64)
+        weights = weights / weights.sum()
+        lo, hi = 0, 10
+        mask_l = np.array([left[0] <= b < left[1] for b in range(lo, hi)])
+        mask_r = np.array([right[0] <= b < right[1] for b in range(lo, hi)])
+        want = np.zeros(fft_grid)
+        mesh = single_device_mesh()
+        for p in range(nk):
+            k_spec = IBZRows((p,))
+            psi_2 = wfn.load_process_local(bands=(lo, hi), k=k_spec)
+            box = wfn.box_index(k=k_spec)
+            for i, lift in enumerate(lifts):
+                psi_r = np.asarray(to_rbox(
+                    wfn.lift(psi_2, k=k_spec, bispinor_lift=lift), box,
+                    fft_grid, mesh=mesh, norm="ortho"))[0]
+                vertex = np.asarray(gammas[i + 1]) / ALPHA_FS
+                feats = np.einsum(
+                    "maxyz,ab,nbxyz->mnxyz", np.conj(psi_r[mask_l]), vertex,
+                    psi_r[mask_r], optimize=True)
+                want += weights[p] * scale ** 4 * np.sum(
+                    np.abs(feats) ** 2, axis=(0, 1))
+        top = float(np.max(want))
+        np.testing.assert_allclose(got, want, rtol=0.0, atol=1e-12 * top)
+        # Not a no-op: the dV_NL/dk piece moves the weight.
+        rel = np.linalg.norm(got - raw) / np.linalg.norm(raw)
+        assert rel > 1e-3, rel
+    finally:
+        wfn.close()
+
+

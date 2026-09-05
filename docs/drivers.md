@@ -75,6 +75,8 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c` (legacy) / `v_x_vc` (adds v×v for V_H) / `vc_x_vc` (full sigma square, use when ncond >> nval) |
 | `--fit-window L0:L1,R0:R1` | unset | Explicit candidate-and-pruning pair, e.g. `0:16,0:28`; does not change physical occupancy |
 | `--density-mode` | `scalar` | `scalar` = charge feature-row norm/Gram; `current` = gauge-invariant three-current feature-row norm/Gram (suffix `_current`). Current mode requires atom-orbit closure, `rho_power=1`, and transverse-Gram pruning. |
+| `--current-balance` | `kinetic` | small-component balance of the `--density-mode current` carriers: `kinetic` = one sigma.p carrier for the three Dirac-current channels (the shipped weight); `velocity` = one carrier per channel a, psi_S^(a) = (alpha/4)[sigma.(2(k+G)+dV_SR/dk) + sigma^a dV_SO/dk_a] psi_L, so channel a's alpha^a vertex is the pseudo-Hamiltonian velocity exactly (the deck's `bispinor_current_balance = velocity`). Needs `--pseudo-dir`. The pivoted-Cholesky prune Gram still uses the shared sigma.p carrier; the header says so. |
+| `--pseudo-dir` | `.` | directory with the run's `*.upf`; read only for `--current-balance velocity` |
 | `--orbit` / `--no-orbit` | auto (on if atom group has >1 row) | close the set under atom-derived spatial Seitz operations |
 | `--rho-power` | 1.0 | weight^alpha; centroid density ~ w^(0.6*alpha) |
 | `LORRAX_CENTROID_SELECT` (env) | `deliver` | what the select does when the pool is numerically flat but still has candidates; `strict` restores the 2026-08-07 refusal |

@@ -16,6 +16,7 @@ autodiff-safe behaviour at K=0.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import time
 from dataclasses import dataclass
@@ -2441,14 +2442,16 @@ def nonlocal_velocity_lift(setup: VNLSetup):
 
 
 def nonlocal_velocity_lift_from_pseudo_dir(
-    wfn, sym, meta, pseudo_dir, *, sys_dim: int, caller: str,
+    wfn, sym, meta, pseudo_dir, *, sys_dim: int | None, caller: str,
     print_fn=print,
 ):
     """Load ``*.upf`` from ``pseudo_dir``, build the projector setup, and
     return :func:`nonlocal_velocity_lift` for it.  The one preflight the
-    kin_ion/dipole producers run (``psp.operator_checks``) runs here too, so
-    a deck asking for velocity balance without projectors refuses by name
-    instead of lifting with ``V_NL = 0``."""
+    kin_ion/dipole producers run (``psp.operator_checks``) runs here too when
+    the caller knows its ``sys_dim`` (the GW deck does; the centroid selector
+    has no Coulomb geometry and passes ``None``, keeping only the
+    missing-projector refusal), so a deck asking for velocity balance without
+    projectors refuses by name instead of lifting with ``V_NL = 0``."""
     from psp.pseudos import load_pseudopotentials
     from psp.operator_checks import validate_operator_inputs
     pseudos = load_pseudopotentials(str(pseudo_dir))
@@ -2462,10 +2465,25 @@ def nonlocal_velocity_lift_from_pseudo_dir(
             "  want: the deck's pseudopotentials beside the input file, or "
             "pseudo_dir = <directory>\n"
             "  doc:  docs/input_reference.md, bispinor_current_balance.")
-    validate_operator_inputs(pseudos, wfn, int(sys_dim), caller=caller)
+    if sys_dim is not None:
+        validate_operator_inputs(pseudos, wfn, int(sys_dim), caller=caller)
     setup = build_vnl_setup(
         wfn, sym, meta, pseudos, nspinor=int(wfn.nspinor), print_fn=print_fn)
-    return nonlocal_velocity_lift(setup)
+    return NonlocalVelocityLift(
+        nonlocal_velocity_lift(setup),
+        provenance=f"V_NL {setup.soc_provenance}")
+
+
+@dataclasses.dataclass(frozen=True)
+class NonlocalVelocityLift:
+    """The loader's ``nonlocal_velocity_lift`` hook plus the one line that
+    says which projectors it carries, for the consumer's own report."""
+    batch: object
+    provenance: str
+
+    def __call__(self, psi_2, gvecs_int, kvecs_frac, ngk_valid, *, channel):
+        return self.batch(psi_2, gvecs_int, kvecs_frac, ngk_valid,
+                          channel=channel)
 
 
 @jax.jit

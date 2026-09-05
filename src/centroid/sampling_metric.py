@@ -79,6 +79,30 @@ def _transverse_metric_diagonal(
     return out * jnp.square(current_scale)
 
 
+@jax.jit
+def _transverse_metric_diagonal_per_channel(
+    density_left_by_channel,
+    density_right_by_channel,
+    wavefunction_scale,
+):
+    """``sum_i Tr(D_L^(i) alpha_i D_R^(i) alpha_i) / alpha_fs^2`` with channel
+    i's projectors built from channel i's OWN carrier (the per-channel
+    velocity balance; ``common.bispinor_init``).  With one shared carrier
+    this is :func:`_transverse_metric_diagonal` term by term."""
+    out = jnp.zeros(density_left_by_channel[0].shape[-3:], dtype=jnp.float64)
+    for mu in (1, 2, 3):
+        perm, phase = gamma_perm_phase(mu)
+        alpha_left = gamma_apply(
+            density_left_by_channel[mu - 1], perm, phase, axis=0)
+        alpha_right = gamma_apply(
+            density_right_by_channel[mu - 1], perm, phase, axis=0)
+        out = out + jnp.real(jnp.sum(
+            alpha_left * jnp.swapaxes(alpha_right, 0, 1), axis=(0, 1)))
+    current_scale = (
+        jnp.asarray(wavefunction_scale, dtype=jnp.float64) ** 2 / ALPHA_FS)
+    return out * jnp.square(current_scale)
+
+
 def feature_metric_diagonal_from_psi_r(
     psi_r,
     mask_left,
@@ -275,14 +299,19 @@ def _projector_memory_plan(
     ns: int,
     *,
     device_memory_bytes: int | None,
+    n_carriers: int = 1,
 ) -> tuple[int, int]:
-    """Return projector bytes/cap, refusing before an unbounded HBM attempt."""
-    if min(n_grid, ns) <= 0:
+    """Return projector bytes/cap, refusing before an unbounded HBM attempt.
+
+    ``n_carriers`` distinct four-spinor carriers hold one (D_L, D_R) pair
+    each (three under the per-channel velocity balance)."""
+    if min(n_grid, ns, n_carriers) <= 0:
         raise ValueError("metric memory plan requires positive grid/spin sizes")
     budget = _PROJECTOR_BUDGET_BYTES
     if device_memory_bytes is not None and int(device_memory_bytes) > 0:
         budget = min(budget, max(1024 ** 3, int(device_memory_bytes) // 4))
-    bytes_per_point = 2 * int(ns) ** 2 * np.dtype(np.complex128).itemsize
+    bytes_per_point = (2 * int(n_carriers) * int(ns) ** 2
+                       * np.dtype(np.complex128).itemsize)
     projector_bytes = bytes_per_point * int(n_grid)
     if projector_bytes > budget:
         raise MemoryError(
@@ -304,8 +333,18 @@ def build_feature_metric_diagonal(
     gamma_mode: str,
     dist_mesh=None,
     verbose: bool = True,
+    bispinor_lifts: tuple[str, str, str] | None = None,
 ):
     """Build the q=0 feature-Gram diagonal on the WFN FFT grid.
+
+    ``bispinor_lifts`` (transverse mode only) names the four-spinor carrier
+    of each Lorentz label, ``resolve_four_current_representation(...).
+    current_lift_for(a)``: ``None`` or three ``"raw"`` is the shipped
+    sigma.p carrier shared by the three channels (one load per band window,
+    byte-identical to the historical weight); distinct lifts load the
+    two-spinor window once and lift it once per carrier through
+    ``WfnLoader.lift``, and channel i's ``Tr(D_L alpha_i D_R alpha_i)`` is
+    built from channel i's own projectors.
 
     The returned field is
 
@@ -355,6 +394,26 @@ def build_feature_metric_diagonal(
             f"WFN cell volume must be finite and positive, got {cell_volume}")
     wavefunction_scale = float(np.sqrt(n_grid / cell_volume))
     ns = 4 if mode == "transverse" else int(wfn.nspinor)
+    lifts = ("raw", "raw", "raw")
+    if bispinor_lifts is not None:
+        if mode != "transverse":
+            raise ValueError(
+                "bispinor_lifts is only meaningful for gamma_mode='transverse'")
+        lifts = tuple(str(l).strip().lower() for l in bispinor_lifts)
+        if len(lifts) != 3:
+            raise ValueError(
+                f"bispinor_lifts needs one selector per Lorentz label; got "
+                f"{bispinor_lifts!r}")
+    distinct_lifts = tuple(dict.fromkeys(lifts))
+    per_channel = mode == "transverse" and len(distinct_lifts) > 1
+    if not per_channel and distinct_lifts != ("raw",):
+        # One non-sigma.p carrier for all three channels is the retired
+        # single sigma.v carrier (its alpha^a vertex carries the
+        # (i/2) eps_abc [sigma^c, d_b V_SO] artifact); refuse it by name.
+        raise ValueError(
+            "bispinor_lifts must be three 'raw' (shared sigma.p carrier) or "
+            "one distinct carrier per Lorentz label; got "
+            f"{bispinor_lifts!r}")
 
     parents_used, star_plan, _ = _quadrature_tables(wfn, sym)
 
@@ -378,7 +437,8 @@ def build_feature_metric_diagonal(
     except Exception:
         device_memory_bytes = None
     projector_bytes, projector_cap = _projector_memory_plan(
-        n_grid, ns, device_memory_bytes=device_memory_bytes)
+        n_grid, ns, device_memory_bytes=device_memory_bytes,
+        n_carriers=len(distinct_lifts))
     n_rounds = -(-int(parents_used.size) // world)
     parents_local = [
         (int(parent), True) for parent in parents_used[rank::world]]
@@ -387,10 +447,12 @@ def build_feature_metric_diagonal(
     if rank == 0:
         print(
             f"  {mode} metric plan: {len(parents_used)} parent(s) over "
-            f"{world} rank(s); two full-grid projectors "
+            f"{world} rank(s); {2 * len(distinct_lifts)} full-grid projectors "
             f"{projector_bytes / 2**30:.2f} GiB/rank "
             f"(cap {projector_cap / 2**30:.2f}), WFN chunk <= 4.00 GiB, "
-            "one scalar-grid psum",
+            "one scalar-grid psum"
+            + ("" if not per_channel else
+               f"; per-channel current carriers {lifts}"),
             flush=True)
 
     t0 = time.perf_counter()
@@ -403,32 +465,53 @@ def build_feature_metric_diagonal(
         k_spec = IBZRows((parent,))
         box_index = wfn.box_index(k=k_spec)
         zero = jnp.zeros((ns, ns) + fft_grid, dtype=jnp.complex128)
-        density_left, density_right = zero, jnp.zeros_like(zero)
+        # One (D_L, D_R) pair per DISTINCT carrier.  The shared-carrier case
+        # is the historical single pair; the per-channel case lifts one
+        # two-spinor window once per carrier.
+        dens = {lift: (zero, jnp.zeros_like(zero)) for lift in distinct_lifts}
         for lo, canonical_mask in windows:
             left_mask = _window_mask(lo, canonical_mask, left_range)
             right_mask = _window_mask(lo, canonical_mask, right_range)
             if not include_parent:
                 left_mask = np.zeros_like(left_mask)
                 right_mask = np.zeros_like(right_mask)
-            psi_g = wfn.load_process_local(
-                bands=(lo, lo + width), k=k_spec,
-                bispinor=(mode == "transverse"))
-            psi_r = to_rbox(
-                psi_g, box_index, fft_grid, mesh=mesh, norm="ortho")
-            if int(psi_r.shape[0]) != 1 or int(psi_r.shape[2]) != ns:
-                raise ValueError(
-                    "one-parent WfnLoader request returned incompatible "
-                    f"shape {psi_r.shape}; expected k=1, ns={ns}")
-            density_left, density_right = _accumulate_subspace_density_matrices(
-                density_left, density_right, psi_r[0],
-                jnp.asarray(left_mask), jnp.asarray(right_mask))
-            density_left.block_until_ready()
-            density_right.block_until_ready()
-            del psi_g, psi_r
+            if per_channel:
+                psi_2 = wfn.load_process_local(
+                    bands=(lo, lo + width), k=k_spec)
+                lifted = {
+                    lift: wfn.lift(psi_2, k=k_spec, bispinor_lift=lift)
+                    for lift in distinct_lifts}
+                del psi_2
+            else:
+                lifted = {"raw": wfn.load_process_local(
+                    bands=(lo, lo + width), k=k_spec,
+                    bispinor=(mode == "transverse"))}
+            for lift, psi_g in lifted.items():
+                psi_r = to_rbox(
+                    psi_g, box_index, fft_grid, mesh=mesh, norm="ortho")
+                if int(psi_r.shape[0]) != 1 or int(psi_r.shape[2]) != ns:
+                    raise ValueError(
+                        "one-parent WfnLoader request returned incompatible "
+                        f"shape {psi_r.shape}; expected k=1, ns={ns}")
+                d_l, d_r = dens[lift]
+                d_l, d_r = _accumulate_subspace_density_matrices(
+                    d_l, d_r, psi_r[0],
+                    jnp.asarray(left_mask), jnp.asarray(right_mask))
+                d_l.block_until_ready()
+                d_r.block_until_ready()
+                dens[lift] = (d_l, d_r)
+                del psi_r
+            del lifted
+        density_left, density_right = dens[distinct_lifts[0]]
 
         if mode == "charge":
             parent_metric = _charge_metric_diagonal(
                 density_left, density_right, wavefunction_scale)
+        elif per_channel:
+            parent_metric = _transverse_metric_diagonal_per_channel(
+                tuple(dens[lift][0] for lift in lifts),
+                tuple(dens[lift][1] for lift in lifts),
+                wavefunction_scale)
         else:
             parent_metric = _transverse_metric_diagonal(
                 density_left, density_right, wavefunction_scale)
@@ -454,7 +537,7 @@ def build_feature_metric_diagonal(
             real_parents_done += 1
         else:
             parent_metric.block_until_ready()
-        del density_left, density_right, parent_metric
+        del density_left, density_right, parent_metric, dens
         if verbose and time.perf_counter() - last_log > 5.0:
             last_log = time.perf_counter()
             print(
@@ -476,7 +559,9 @@ def build_feature_metric_diagonal(
     metric = np.maximum(metric, 0.0)
     if verbose:
         model = ("identity charge vertex" if mode == "charge" else
-                 NO_PAIR_DIRAC_CURRENT_MODEL)
+                 NO_PAIR_DIRAC_CURRENT_MODEL
+                 + ("" if not per_channel else
+                    f" with per-channel carriers {lifts}"))
         print(
             f"  {mode} feature-Gram diagonal ({model}, left={left_range}, "
             f"right={right_range}, unit band weights, {len(parents_used)} "
