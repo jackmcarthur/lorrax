@@ -347,9 +347,8 @@ class Wavefunctions:
     # ---- face (two 2-D-sharded copies); None under layout="legacy" -----
     psi_nmu: jax.Array | None = None  # (nk, n_X, s, μ_Y)
     psi_mun: jax.Array | None = None  # (nk, s, μ_X, n_Y)
-    #: Optional raw-parent, orbit-packed operands.  This is an acceleration
-    #: carrier only; all observable/runtime operators remain in the primary
-    #: bundle's canonical full-k basis until their own packed seam lands.
+    #: Raw-parent faces in the same packed centroid order as every operator.
+    #: They are the only stored faces when all consumers support parents.
     green_parent: ParentGreenCarrier | None = None
     #: STATIC (pytree meta, never traced).  "legacy" | "face".
     layout: str = "legacy"
