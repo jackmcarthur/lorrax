@@ -81,7 +81,9 @@ from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
 from .gw_config import ComputeMode, HeadCorrection
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
-from .sigma_dispatch import SigmaResult, compute_sigma_xc
+from .sigma_dispatch import (
+    SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, SigmaResult,
+    compute_sigma_xc, sigma_result_on_kset)
 from .wavefunction_bundle import (
     BandSlices, Wavefunctions, rotate_wavefunctions)
 
@@ -408,9 +410,10 @@ class SCInputs:
     #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
     #: runs entirely on the full BZ, which is what every result before
     #: 2026-08-04 did and what the one-shot equivalence gate pins.  When
-    #: given, H / E / U / the carried state live on the IBZ and only Σ is
-    #: built on the full BZ — Σ comes from an FFT over the k-grid, which
-    #: needs the whole grid (decisions.md, TRS veto scope).
+    #: given, H / E / U / the carried state and retained Sigma tables live
+    #: on the star wedge.  Sigma is temporarily built on the full BZ — it
+    #: comes from an FFT over the k-grid — then crosses the map's one output
+    #: seam (decisions.md, TRS veto scope).
     kstar: object | None = None
     #: Validated, device-resident nearest-neighbour links + exact DFT
     #: velocity.  None preserves the historical fixed-DFT head path exactly.
@@ -530,10 +533,10 @@ class SCMapScreeningArtifacts:
 class SCExactHartree:
     """Caller-owned direct field rebuilt from one SC map's orbitals.
 
-    Every matrix is on the full BZ in the original DFT basis.  Keeping the
-    scalar and transverse pieces separate preserves ``sigma_mnk.h5``'s
-    decomposition; :attr:`total` is the only combination that enters the
-    Hamiltonian.
+    Every retained matrix is on the loop's k-set in the original DFT basis.
+    Keeping the scalar and transverse pieces separate preserves
+    ``sigma_mnk.h5``'s decomposition; :attr:`total` is the only combination
+    that enters the Hamiltonian.
     """
 
     scalar_dft: jax.Array
@@ -567,20 +570,20 @@ class SCOutputs:
     ``dump_sigma_omega_h5_final``, ``dump_qp_wfn_artifacts``, the per-map
     snapshot); nothing here feeds the next fixed-point evaluation.
 
-    ``sigma_result`` and ``sigma_basis_U`` are on the FULL BZ and must
-    AGREE, because they are consumed together by ``run_sc_driver``'s
-    final rotate-back — Σ is a k-grid FFT, so its k-set is not
-    negotiable, and the U stored beside it follows.  ``sigma_basis_U``
-    is the DFT→QP unitary that DEFINED the basis ``sigma_result`` was
-    computed in (the eigh of the *previous* carry) — the writer must
-    rotate Σ back to DFT with THIS U, not the converged U of the final
-    carry: the two agree only at convergence, and using the converged U
-    mis-rotates Σ_x/V_H whenever the loop stops before the fixed point
-    (maximally so at max_iter=1, where the correct U is the identity).
+    ``sigma_result``, ``sigma_basis_U`` and ``exact_hartree_dft`` are all on
+    the LOOP's k-set and must agree.  Σ is built on the full BZ because its
+    k-grid FFT needs every point; the map's one output seam selects every
+    retained table together.  ``sigma_basis_U`` is the DFT→QP unitary that
+    DEFINED the basis ``sigma_result`` was computed in (the eigh of the
+    *previous* carry) — the writer must rotate Σ back to DFT with THIS U,
+    not the converged U of the final carry: the two agree only at
+    convergence, and using the converged U mis-rotates Σ_x/V_H whenever the
+    loop stops before the fixed point (maximally so at max_iter=1, where the
+    correct U is the identity).
     """
 
     sigma_result: SigmaResult
-    sigma_basis_U: jax.Array         # (nk, nb, nb) ⟨DFT_m|QP_n⟩, full BZ
+    sigma_basis_U: jax.Array     # (nk_loop, nb, nb) ⟨DFT_m|QP_n⟩
     scissor_fit: ScissorFit | None
     tail_scissor_fit: ScissorFit | None
     screening: SCMapScreeningArtifacts
@@ -603,9 +606,9 @@ class SCDriverResult:
 class SCState:
     """State carried across self-consistent iterations.
 
-    K-SET INVARIANT (with ``SCInputs.kstar``): ``H_qp_dft`` is on the
-    LOOP's k-set — the IBZ when a map is given — while ``outputs``
-    carries full-BZ objects (see :class:`SCOutputs`).
+    K-SET INVARIANT (with ``SCInputs.kstar``): ``H_qp_dft`` and every
+    k-indexed object in ``outputs`` are on the LOOP's k-set — the star wedge
+    when a non-identity map is given (see :class:`SCOutputs`).
 
     The primary iteration carry is ``H_qp_dft``.  When metallic occupations
     are enabled, ``occupation_state`` is the ONE per-iteration
@@ -642,6 +645,58 @@ class SCState:
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
     convergence_verdict: ConvergenceVerdict | None = None
+
+
+def _sc_output_tables_on_loop_kset(
+    sigma_result: SigmaResult,
+    sigma_basis_U_full,
+    exact_hartree_full: SCExactHartree | None,
+    kstar,
+) -> tuple[SigmaResult, jax.Array, SCExactHartree | None]:
+    """Assemble retained SC outputs at the map's sole k-set seam.
+
+    ``compute_sigma_xc`` and density-SC Hartree construction necessarily run
+    on the full BZ.  Nothing beyond this function may select an individual
+    retained Sigma table: the complete :class:`SigmaResult`, its defining
+    DFT→QP rotation and the paired exact-Hartree components move to the loop
+    k-set together.
+    """
+    if kstar.is_identity:
+        sigma_loop = sigma_result_on_kset(
+            sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=kstar.nk_full)
+        U_loop = sigma_basis_U_full
+        exact_loop = exact_hartree_full
+    else:
+        sigma_loop = sigma_result_on_kset(
+            sigma_result, kset=SIGMA_KSET_STAR_WEDGE, nk=kstar.nk_irr,
+            select_rows=kstar.select)
+        U_loop = kstar.select(sigma_basis_U_full)
+        exact_loop = (
+            None if exact_hartree_full is None else
+            replace(
+                exact_hartree_full,
+                scalar_dft=kstar.select(exact_hartree_full.scalar_dft),
+                transverse_dft=(
+                    kstar.select(exact_hartree_full.transverse_dft)
+                    if exact_hartree_full.transverse_dft is not None
+                    else None),
+            )
+        )
+
+    if int(np.shape(U_loop)[0]) != int(kstar.nk_irr):
+        raise ValueError(
+            "SC output seam: Sigma-basis rotation has "
+            f"{np.shape(U_loop)[0]} rows, expected {kstar.nk_irr} on the "
+            "loop k-set")
+    if exact_loop is not None:
+        for name in ("scalar_dft", "transverse_dft"):
+            value = getattr(exact_loop, name)
+            if value is not None and int(np.shape(value)[0]) != int(
+                    kstar.nk_irr):
+                raise ValueError(
+                    f"SC output seam: exact Hartree {name} has "
+                    f"{np.shape(value)[0]} rows, expected {kstar.nk_irr}")
+    return sigma_loop, U_loop, exact_loop
 
 
 # ---------------------------------------------------------------------------
@@ -3151,6 +3206,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             "density-SC direct-field owner")
     _check_sigma_stage(sigma_result, print_fn=inputs.print_fn)
 
+    # THE ONE RETAINED-TABLE K-SET SEAM.  Sigma and density-SC Hartree need
+    # full-BZ inputs while they are being built.  From this point onward the
+    # map, every diagnostic and every SC output record sees only the loop's
+    # k-set; no consumer selects one table independently.
+    sigma_result, sigma_basis_U, exact_hartree_dft = (
+        _sc_output_tables_on_loop_kset(
+            sigma_result, U_full, exact_hartree_dft, ks))
+
     # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
     # (as if every band were protected); the partition step below masks
     # off non-protected off-diagonals and overrides out-of-range
@@ -3165,36 +3228,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         sigma_result.sigma_xc_kij_ry
         if exact_hartree_dft is not None
         else sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry)
-    if not ks.is_identity:
-        # Σ ARRIVES ON THE FULL BZ AND IS SELECTED HERE.  Selection is a
-        # row take, not a symmetry operation -- these ARE the IBZ k.  The
-        # star spread is the free check that the two k-sets agree, and the
-        # only one that catches a gauge mismatch upstream; hermiticity,
-        # the norm and the electron count all survive one.
-        # ``spread_rel`` does both reductions (residual and scale) in one
-        # compiled module and brings back 16 bytes, where the two-call form
-        # read this (nk, nb, nb) array back twice to print one line.  Its
-        # scalar read still synchronises, but the iteration synchronises
-        # anyway in ``_run_linear_mixing`` / ``_run_rcrop``.
-        # MOVED, 2026-08-16: the star-spread enforcement used to run HERE,
-        # on the raw Sigma+V_H, and that is a different object from the one
-        # that ships.  ``apply_band_partition`` below zeroes every
-        # off-diagonal outside protected x protected, so it is the LAST thing
-        # that can break the star relation -- and until the partition was
-        # promoted to whole multiplets it could, by treating two members of a
-        # degenerate manifold differently.  Checking before it ran meant the
-        # gate certified an object the loop then modified.  See the call after
-        # ``apply_band_partition``.
-        delta_h_qp = ks.select(delta_h_qp)
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     exact_hartree_terms = None
     if exact_hartree_dft is not None:
         scalar = exact_hartree_dft.scalar_dft
         transverse = exact_hartree_dft.transverse_dft
-        if not ks.is_identity:
-            scalar = ks.select(scalar)
-            if transverse is not None:
-                transverse = ks.select(transverse)
         exact_hartree_terms = (scalar, transverse)
         delta_h_dft = (
             _add_exact_scalar_hartree(delta_h_dft, scalar)
@@ -3244,8 +3282,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             sigma_xc_unextrap
             if exact_hartree_dft is not None
             else sigma_result.v_h_kij_ry + sigma_xc_unextrap)
-        if not ks.is_identity:
-            delta_h_qp_n3 = ks.select(delta_h_qp_n3)
         delta_h_dft_n3 = _rotate_to_dft_basis(
             delta_h_qp_n3, U_qp, mesh=inputs.mesh_xy)
         if exact_hartree_terms is not None:
@@ -3383,12 +3419,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         head_surface_weight_kn=entry_surface_weight_kn,
         outputs=SCOutputs(
             sigma_result=sigma_result,
-            # FULL-BZ U.  These two fields are consumed TOGETHER by
-            # run_sc_driver's final rotate-back, so they must share a
-            # k-set, and ``sigma_result``'s is the full BZ by
-            # construction -- compute_sigma_xc runs there.  Storing the
-            # IBZ U_qp here is the mismatch that raised 'k' 10 vs 16.
-            sigma_basis_U=U_full,
+            # The defining U and SigmaResult were selected together by the
+            # seam above; their k axes cannot diverge in a later consumer.
+            sigma_basis_U=sigma_basis_U,
             scissor_fit=scissor_fit,
             tail_scissor_fit=tail_fit,
             screening=SCMapScreeningArtifacts(
@@ -3710,7 +3743,7 @@ def _sc_z_factors(
 ) -> np.ndarray:
     """Return per-state Z for the exact dynamic Sigma built by one map.
 
-    The Sigma cube and evaluation ladder are full-BZ quantities in the
+    The Sigma cube and evaluation ladder are on the loop's k-set in the
     current QP basis.  Diagonal extraction is collective for a band-sharded
     cube, so every rank calls this before the snapshot writer's rank gate.
     Static modes have zero frequency derivative and therefore return one.
@@ -3745,10 +3778,10 @@ def _dump_sc_rotation(
 ) -> str | None:
     """Persist the exact DFT→QP rotation consumed by one SC map.
 
-    ``sigma_basis_U`` is already the full-BZ rotation paired with this map's
-    Sigma result.  The dump is opt-in through ``sc_dump_dir`` and is small for
-    diagnostic windows.  Every rank joins the gather and the post-write
-    barrier; only rank zero writes the ``.npy`` file.
+    ``sigma_basis_U`` is already the loop-k-set rotation paired with this
+    map's Sigma result.  The dump is opt-in through ``sc_dump_dir`` and is
+    small for diagnostic windows.  Every rank joins the gather and the
+    post-write barrier; only rank zero writes the ``.npy`` file.
     """
     dump_dir = inputs.config.sc.dump_dir
     if not dump_dir:
@@ -3802,15 +3835,11 @@ def _sc_map_gain_for_call(
         return None, None
     e_now = np.asarray(e_input_ev, dtype=np.float64)
     sigma_now = np.asarray(sigma_on_shell, dtype=np.complex128)
-    if e_now.shape[0] != sigma_now.shape[0]:
-        # ``sigma_c_at_dft_diag_ev`` is the full-BZ diagnostic table formed
-        # before the SC finalize; the update itself consumes Sigma selected
-        # to the IBZ (``ks.select(delta_h_qp)`` in gw_iteration_map).  Use
-        # that same IBZ copy here, so E and Sigma share the loop's k-set and
-        # the worst state names an IBZ row like every other SC line.  Si
-        # b80/c504 P4: E=(8,16) against Sigma=(64,16) refused every map 2.
-        sigma_now = np.asarray(
-            _kstar(inputs).select(sigma_now), dtype=np.complex128)
+    if e_now.shape != sigma_now.shape:
+        raise ValueError(
+            "SC map gain: retained E and Sigma tables must already share "
+            f"the loop k-set and band window, got E={e_now.shape}, "
+            f"Sigma={sigma_now.shape}")
     current = (e_now.copy(), sigma_now.copy())
     if previous is None:
         return None, current
@@ -3932,19 +3961,21 @@ def _write_sc_eqp_snapshot(
             reduce_full_bz_to_file_wedge(sym, np.asarray(a)),
             dtype=np.float64)
 
+    def _loop_to_file_wedge(a):
+        table = np.asarray(a)
+        if state_out.outputs.sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
+            table = unfold_star_wedge_to_full_bz(sym, table)
+        return _to_file_wedge(table)
+
     kpoints = _to_file_wedge(
         np.asarray(sym.unfolded_kpts, dtype=np.float64))
     e_dft = _to_file_wedge(
         np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV)
-    if getattr(inputs, "kstar", None) is None:
-        e_output = _to_file_wedge(e_output)          # loop ran full-BZ
-    else:
-        e_output = _to_file_wedge(                    # loop ran star-wedge
-            unfold_star_wedge_to_full_bz(sym, e_output))
+    e_output = _loop_to_file_wedge(e_output)
     sigma_e_eval = state_out.outputs.sigma_result.e_eval_ev
-    e_eval = (e_output.copy() if sigma_e_eval is None else _to_file_wedge(
+    e_eval = (e_output.copy() if sigma_e_eval is None else _loop_to_file_wedge(
         np.asarray(sigma_e_eval, dtype=np.float64)))
-    z_factor = _to_file_wedge(z_factor_full)
+    z_factor = _loop_to_file_wedge(z_factor_full)
     if e_eval.shape != e_output.shape or z_factor.shape != e_output.shape:
         raise ValueError(
             "SC eqp1 snapshot shape mismatch after file-wedge reduction: "
@@ -5209,7 +5240,9 @@ def run_sc_driver(
                      "singleton on this deck; running on the full BZ.")
         else:
             kstar = kstar_io
-            print_fn(f"  SC: {kstar!r} — H/E/U on the IBZ, Σ on the full BZ")
+            print_fn(
+                f"  SC: {kstar!r} — H/E/U and retained Σ on the star "
+                "wedge; full BZ exists only inside each map")
             # Device gather — ``np.asarray`` here would raise "spans
             # non-addressable devices" the moment ``kin_ion`` arrives
             # sharded, and it is the same (nk, nb, nb) object as U.
@@ -5663,7 +5696,8 @@ def dump_sigma_omega_h5_final(
 ) -> str | None:
     """Write the converged ``sigma_mnk.h5`` once after SC convergence.
 
-    Pulls the full ω-grid Σ_c tensor from ``state.outputs.sigma_result``
+    Pulls the loop-k-set ω-grid Σ_c tensor from
+    ``state.outputs.sigma_result``
     (which the iteration map captures from each
     :func:`compute_sigma_xc` call but does NOT write to disk during SC
     iterations — see the ``write_sigma_omega_h5=False`` flag in
@@ -5706,12 +5740,11 @@ def dump_sigma_omega_h5_final(
     from .dynamic_sigma import write_sigma_omega
     from .qsgw_utils import write_qsgw_sigma_cube
 
-    # ``sym`` TURNS THE k_irr EXTRACTION ON, and the ordering it needs is
-    # already the ordering this function has: Sigma arrives on the full BZ
-    # (``H/E/U on the IBZ, Sigma on the full BZ``), the accumulation is
-    # complete and the kernel has exited by the time the SC loop reaches
-    # convergence, and only then is this called.  The writer measures the
-    # star spread on those complete rows before dropping any.
+    # Sigma already crossed the map's one k-set seam with every retained
+    # table.  The terminal writer stamps those star-wedge rows directly; it
+    # must not select them a second time.
+    star_already_selected = (
+        sigma_result.kset == SIGMA_KSET_STAR_WEDGE)
     path = write_sigma_omega(
         sigma_result.sigma_c_omega_kij_ry,
         sig_x=sigma_result.sigma_x_kij_ry,
@@ -5744,7 +5777,8 @@ def dump_sigma_omega_h5_final(
             - float(sigma_result.efermi_dft_ev)),
         eval_energies_provenance="self_consistent_qp",
         omega_coverage=sigma_result.omega_coverage,
-        sym=sym, print_fn=print_fn,
+        sym=sym, star_already_selected=star_already_selected,
+        print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")
     # THE QSGW CUBE, WRITTEN WHERE IT IS STILL IN ITS OWN BASIS.  Under
@@ -5756,11 +5790,12 @@ def dump_sigma_omega_h5_final(
     # call, and appending it AFTER that would put one DFT-basis matrix in
     # a file of QP-basis ones with matching shape, dtype and stamp.
     # Nothing downstream would notice; this seam is the reason it cannot
-    # happen.  Full BZ either way, so the k_irr extraction that ran on
-    # the cubes above runs on this one identically.
+    # happen.  It carries the same loop k-set as the cubes above and is
+    # stamped without another extraction.
     write_qsgw_sigma_cube(
         path, sigma_result.sigma_xc_kij_ry,
-        config=config, print_fn=print_fn)
+        config=config, star_already_selected=star_already_selected,
+        print_fn=print_fn)
     return path
 
 

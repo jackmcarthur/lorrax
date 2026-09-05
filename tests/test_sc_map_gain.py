@@ -107,16 +107,12 @@ def test_map_two_is_the_first_driver_diagnostic():
     assert history is not None
 
 
-def test_ibz_eigenvalues_are_measured_on_the_full_bz_sigma_k_set():
-    """The retained Sigma table is the full-BZ diagnostic; the readout uses
-    the IBZ copy the update consumes (ks.select), as the owner ruled.
-    Si b80/c504 P4: E=(8,16) against Sigma=(64,16) refused every map 2."""
+def test_map_gain_refuses_tables_not_already_on_the_loop_kset():
+    """The diagnostic is a consumer, not a hidden second selection seam."""
     mask = np.array([True, True])
     partition = SimpleNamespace(protected_mask=mask, in_range_mask=mask)
-    kstar = SimpleNamespace(
-        is_identity=False, select=lambda A: np.asarray(A)[[0, 2]])
     inputs = SimpleNamespace(
-        partition=partition, kstar=kstar,
+        partition=partition,
         band_slices=SimpleNamespace(sigma=slice(0, 2)),
     )
 
@@ -129,14 +125,8 @@ def test_ibz_eigenvalues_are_measured_on_the_full_bz_sigma_k_set():
             partition=partition,
             outputs=SimpleNamespace(sigma_result=sigma_result))
 
-    e1 = np.array([[1.0, 2.0], [1.5, 2.5]])          # 2 IBZ rows
-    s1 = [[0.0, 0.1], [0.0, 0.1], [0.3, 0.2]]          # 3 full-BZ rows
-    _, history = sc_iteration._sc_map_gain_for_call(
-        inputs, state(s1, 1), e1, None)
-    assert history[0].shape == (2, 2) and history[1].shape == (2, 2)
-    e2 = np.array([[1.0, 2.04], [1.5, 2.5]])
-    s2 = [[0.0, 0.12], [0.0, 0.12], [0.3, 0.26]]
-    diagnostic, _ = sc_iteration._sc_map_gain_for_call(
-        inputs, state(s2, 2), e2, history)
-    assert diagnostic.gain == pytest.approx(0.06 / 0.04)
-    assert diagnostic.worst_k == 1 and diagnostic.worst_band == 2
+    e_loop = np.array([[1.0, 2.0], [1.5, 2.5]])
+    sigma_full = [[0.0, 0.1], [0.0, 0.1], [0.3, 0.2]]
+    with pytest.raises(ValueError, match="must already share the loop k-set"):
+        sc_iteration._sc_map_gain_for_call(
+            inputs, state(sigma_full, 1), e_loop, None)

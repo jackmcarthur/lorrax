@@ -34,7 +34,7 @@ file write, QSGW build).
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Callable
 
@@ -58,6 +58,11 @@ from .gw_config import (
 # ---------------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------------
+
+SIGMA_KSET_FULL_BZ = "full_bz"
+SIGMA_KSET_STAR_WEDGE = "star_wedge"
+SIGMA_KSETS = (SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE)
+
 
 @dataclass(frozen=True)
 class SigmaResult:
@@ -150,6 +155,10 @@ class SigmaResult:
     #: answer the finalize interpolated with (audit A2), instead of
     #: re-deriving it from a config key one layer further from the choice.
     omega_reference_provenance: str | None = None
+    #: K-point set carried by every k-indexed table in this result.  A
+    #: one-shot result remains on the full BZ; the SC map changes the tag and
+    #: every table together at its single output seam.
+    kset: str = SIGMA_KSET_FULL_BZ
     #: :class:`gw.dynamic_sigma.OmegaCoverage` for the at-DFT interpolation
     #: — WHICH (k, n) the ω grid actually sampled, and what was done with the
     #: rest.  Carried on the result rather than recomputed by each writer
@@ -168,6 +177,10 @@ class SigmaResult:
     ppm_odd_even_residue_ratio: float | None = None
 
     def __post_init__(self) -> None:
+        if self.kset not in SIGMA_KSETS:
+            raise ValueError(
+                f"SigmaResult: invalid kset {self.kset!r}; expected one of "
+                f"{SIGMA_KSETS}")
         if self.hartree_omitted:
             if self.h_transverse_kij_ry is not None:
                 raise ValueError(
@@ -270,6 +283,7 @@ BASIS_FREE_FIELDS = (
     "photon_head_sigma_basis",
     "efermi_dft_ev",
     "omega_reference_provenance",
+    "kset",
     "band_extrapolation_counts",
     "band_extrapolation_estimator",
     "band_extrapolation_scheme",
@@ -277,6 +291,128 @@ BASIS_FREE_FIELDS = (
     "ppm_probe_hermiticity_residual",
     "ppm_odd_even_residue_ratio",
 )
+
+
+#: Axis carrying k for every k-indexed member of :class:`SigmaResult`.
+#: This is the complete ownership table for the SC map's one selection seam;
+#: a new retained Sigma table must be named here as well as in the basis
+#: partition above.  ``omega_coverage`` is handled through its ``mask_kn``.
+SIGMA_RESULT_K_AXES = {
+    "v_h_kij_ry": 0,
+    "v_h_scalar_kij_ry": 0,
+    "h_transverse_kij_ry": 0,
+    "sigma_x_kij_ry": 0,
+    "sigma_xc_kij_ry": 0,
+    "sigma_xc_kij_ry_unextrap": 0,
+    "sigma_sx_kij_ry": 0,
+    "sigma_coh_kij_ry": 0,
+    "sigma_lorentz_skij_ry": 1,
+    "photon_head_sigma_diag_tskn_ry": 2,
+    "sigma_c_omega_kij_ry": 1,
+    "sigma_c_at_dft_diag_ev": 0,
+    "sigma_c_odd_at_dft_diag_ev": 0,
+    "omega_dft_rel_ev": 0,
+    "e_eval_ev": 0,
+    "head_sigma_diag_w_kn_ry": 1,
+    "omega_coverage": 0,
+}
+
+
+def sigma_result_on_kset(
+    result: SigmaResult, *, kset: str, nk: int,
+    select_rows: Callable | None = None,
+) -> SigmaResult:
+    """Return one Sigma result whose every k table is on ``kset``.
+
+    This is the named k-set boundary shared by both driver paths.  The
+    one-shot driver calls it without ``select_rows`` to certify that its
+    result is on the full BZ.  The SC map calls it once with
+    :meth:`symmetry_maps.KStarMap.select` to move the complete result from
+    the full BZ to the loop's star wedge.  Consumers may validate the tag;
+    they must not select an individual retained table again.
+
+    Parameters
+    ----------
+    result
+        Sigma pipeline result.  All populated k-indexed members must share
+        its ``result.kset``.
+    kset
+        Target k-set, either ``"full_bz"`` or ``"star_wedge"``.
+    nk
+        Exact row count on the target k-set.
+    select_rows
+        Optional leading-axis full-BZ-to-star-wedge selector.  Supplying it
+        is the only supported k-set transition.
+
+    Returns
+    -------
+    SigmaResult
+        A validated result with all populated k axes of length ``nk``.
+    """
+    if kset not in SIGMA_KSETS:
+        raise ValueError(
+            f"sigma_result_on_kset: invalid target {kset!r}; expected one "
+            f"of {SIGMA_KSETS}")
+    if select_rows is None:
+        if result.kset != kset:
+            raise ValueError(
+                "sigma_result_on_kset: changing k-set requires the map "
+                f"selector ({result.kset!r} -> {kset!r})")
+    elif not (result.kset == SIGMA_KSET_FULL_BZ
+              and kset == SIGMA_KSET_STAR_WEDGE):
+        raise ValueError(
+            "sigma_result_on_kset: the selector is only valid for the "
+            f"full-BZ -> star-wedge seam, got {result.kset!r} -> {kset!r}")
+
+    updates = {}
+    for name, k_axis in SIGMA_RESULT_K_AXES.items():
+        value = getattr(result, name)
+        if value is None:
+            continue
+        if name == "omega_coverage":
+            value = value.mask_kn
+        shape = tuple(np.shape(value))
+        if not shape:
+            if result.hartree_omitted and name in {
+                    "v_h_kij_ry", "v_h_scalar_kij_ry"}:
+                continue
+            raise ValueError(
+                f"sigma_result_on_kset: {name} has no k axis: {shape}")
+        if k_axis >= len(shape):
+            raise ValueError(
+                f"sigma_result_on_kset: {name} shape {shape} has no axis "
+                f"{k_axis}")
+
+        selected = value
+        if select_rows is not None:
+            if k_axis:
+                moveaxis = (jnp.moveaxis if isinstance(value, jax.Array)
+                            else np.moveaxis)
+                selected = moveaxis(value, k_axis, 0)
+                selected = select_rows(selected)
+                selected = moveaxis(selected, 0, k_axis)
+            else:
+                selected = select_rows(value)
+        if int(np.shape(selected)[k_axis]) != int(nk):
+            raise ValueError(
+                f"sigma_result_on_kset: {name} k axis has "
+                f"{np.shape(selected)[k_axis]} rows on {kset}, expected {nk}")
+
+        if name == "omega_coverage":
+            mask = np.asarray(selected, dtype=bool)
+            n_uncovered = int(mask.size - np.count_nonzero(mask))
+            updates[name] = replace(
+                result.omega_coverage,
+                mask_kn=mask,
+                n_uncovered=n_uncovered,
+                fraction_uncovered=(n_uncovered / mask.size
+                                    if mask.size else 0.0),
+            )
+        elif select_rows is not None:
+            updates[name] = selected
+
+    updates["kset"] = kset
+    return replace(result, **updates)
 
 
 def _place_band_rotation(U, mesh_xy, dtype):

@@ -17,6 +17,7 @@ from common.units import RYD_TO_EV
 from .gw_config import (
     ComputeMode, SigmaChannel, UNIMPLEMENTED_MODES, explain_missing_channels,
     mode_builds_channels, sigma_channels_for)
+from .sigma_dispatch import SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE
 
 HEAD_PERSIST_ITERATION_SEAM = "head-persist-iteration-seam-v1"
 
@@ -114,6 +115,10 @@ class GWResults:
     sig_x_diag_ry: np.ndarray | None = None
     use_ppm: bool = False
     self_consistent: bool = False
+    # One-shot results are full-BZ; self-consistent results may be retained
+    # on the loop's star wedge.  Every k-indexed field in this container uses
+    # this same set.  Writers convert the complete set to the file wedge.
+    sigma_kset: str = SIGMA_KSET_FULL_BZ
     sigma_c_diag_at_dft_ry: np.ndarray | None = None
     sigma_xc_at_dft_ev: np.ndarray | None = None
     # Output-conditioned ω-grid Σ_c diagonal (PPM modes only).  The live
@@ -123,8 +128,9 @@ class GWResults:
     sigma_c_omega_diag_ev: np.ndarray | None = None
     omega_rel_ev: np.ndarray | None = None
     # The energies Σ WAS EVALUATED AT this call (``SigmaResult.e_eval_ev``),
-    # absolute eV, shape (nk_full, nb_sigma).  E_DFT for a one-shot run;
-    # the map's input QP energies under self-consistency.  eqp1's
+    # absolute eV, shape (nk_result, nb_sigma).  E_DFT for a one-shot run;
+    # the map's input QP energies on the loop k-set under self-consistency.
+    # eqp1's
     # linearization is centred here — ``eqp_bgw.compute_eqp_diag``.
     e_eval_ev: np.ndarray | None = None
     # The ω reference the Σ(ω) grid was built with and the finalize
@@ -156,6 +162,11 @@ class GWResults:
     sigma_c_odd_diag_at_dft_ry: np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        if self.sigma_kset not in (
+                SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE):
+            raise ValueError(
+                "GWResults.sigma_kset must be 'full_bz' or 'star_wedge'; "
+                f"got {self.sigma_kset!r}")
         if self.sig_h_scalar is None:
             if self.h_transverse is not None:
                 raise ValueError(
@@ -212,6 +223,32 @@ def _result_matrix_diag(results: GWResults, name: str):
     if arr.ndim != 3 or arr.shape[1] != arr.shape[2]:
         raise ValueError(f"GWResults.{name} must be (nk,nb,nb); got {arr.shape}")
     return np.diagonal(arr, axis1=1, axis2=2)
+
+
+def sigma_table_to_file_wedge(
+    sym, table, *, source_kset: str, k_axis: int = 0,
+) -> np.ndarray:
+    """Put a tagged Sigma/result table on the WFN file wedge.
+
+    The one-shot path supplies full-BZ tables.  The SC path supplies the
+    loop's star wedge and therefore travels star wedge -> full BZ -> file
+    wedge through the symmetry service.  This output-boundary conversion is
+    not a second SC selection: every retained table remains on one k-set and
+    is converted only while being serialized.
+    """
+    from symmetry_maps import (
+        reduce_full_bz_to_file_wedge, unfold_star_wedge_to_full_bz)
+
+    values = np.asarray(table)
+    if k_axis:
+        values = np.moveaxis(values, k_axis, 0)
+    if source_kset == SIGMA_KSET_STAR_WEDGE:
+        values = unfold_star_wedge_to_full_bz(sym, values)
+    elif source_kset != SIGMA_KSET_FULL_BZ:
+        raise ValueError(
+            f"sigma_table_to_file_wedge: unknown k-set {source_kset!r}")
+    values = np.asarray(reduce_full_bz_to_file_wedge(sym, values))
+    return np.moveaxis(values, 0, k_axis) if k_axis else values
 
 
 # ---------------------------------------------------------------------------
@@ -946,13 +983,16 @@ def write_freq_debug(
     )
     _cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
     _cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
-    # THE WEDGE, like every other text file this module writes.  Each
-    # column above was built on the full BZ because that is the shape the
-    # Sigma arrays arrive in; the rows kept are the ones Sigma was
-    # actually extracted on, and the same reduction on the k-list names them.
+    # THE FILE WEDGE, like every other text file this module writes.  Every
+    # column shares GWResults.sigma_kset; one-shot columns arrive full-BZ,
+    # while SC columns arrive on the loop's star wedge.  The named boundary
+    # below handles both without any consumer selecting one retained table.
     from symmetry_maps import reduce_full_bz_to_file_wedge
-    _cols = [(name, np.asarray(reduce_full_bz_to_file_wedge(sym, np.asarray(arr))))
-             for name, arr in _cols]
+    _cols = [
+        (name, sigma_table_to_file_wedge(
+            sym, arr, source_kset=results.sigma_kset))
+        for name, arr in _cols
+    ]
     write_sigma_freq_debug_table(
         config.debug.sigma_freq_debug_file, _cols,
         kpoints_crys=np.asarray(reduce_full_bz_to_file_wedge(
@@ -1180,7 +1220,11 @@ def write_qsgw_qp_ladders(
         name: float(np.abs(arr - ref_ev).max())
         for name, arr in payload.items() if arr.shape == ref_ev.shape
     }
-    written = append_qsgw_datasets_h5(path, payload, print_fn=print_fn)
+    written = append_qsgw_datasets_h5(
+        path, payload,
+        star_already_selected=(
+            results.sigma_kset == SIGMA_KSET_STAR_WEDGE),
+        print_fn=print_fn)
     if deltas:
         print_fn(
             "  QP ladders vs this run's E_qp (max |Δ|, eV): "
@@ -1577,13 +1621,12 @@ def write_results(
         else sig_h_scalar_out + h_transverse_out)
 
     # ── THE k-BASIS OF EVERY TEXT FILE THIS FUNCTION WRITES ───────────────
-    # Sigma is EXTRACTED on the irreducible wedge; the full-BZ arrays this
-    # function receives are its symmetry image and carry no independent
-    # information.  So every text file below is written on the wedge, one
-    # block per ``wfn.kpoints`` entry, each block stating its crystal
-    # coordinate.  ``reduce_full_bz_to_file_wedge`` is the ONLY way rows
-    # are selected here, and ``kpts_irr`` — the same reduction applied to
-    # the k-list — labels exactly those rows.
+    # Sigma is EXTRACTED on the irreducible wedge.  One-shot results reach
+    # this function on the full BZ; SC results reach it on the loop's star
+    # wedge.  So every text file below is written on the WFN file wedge, one
+    # block per ``wfn.kpoints`` entry.  ``sigma_table_to_file_wedge`` is the
+    # sole conversion for result tables, and the full-BZ k-list is reduced by
+    # the same symmetry service to label those rows.
     #
     # ``sym.unfolded_kpts`` (the full-BZ list) reaches disk unreduced for
     # ``qp_wfn_rotations.h5`` alone, which stores the full zone on purpose.  A consumer that needs the full BZ unfolds
@@ -1592,8 +1635,9 @@ def write_results(
     from symmetry_maps import reduce_full_bz_to_file_wedge
 
     def _wedge(a):
-        """full BZ -> the file wedge, through the service."""
-        return np.asarray(reduce_full_bz_to_file_wedge(sym, np.asarray(a)))
+        """The result's tagged k-set -> file wedge, through the service."""
+        return sigma_table_to_file_wedge(
+            sym, a, source_kset=results.sigma_kset)
 
     def _wedge_sectors(a):
         """Apply the canonical k reduction to each Lorentz sector."""
@@ -1602,7 +1646,8 @@ def write_results(
     # The wedge's k-list is the full-BZ list put through the SAME
     # reduction, so the coordinates and the rows cannot disagree about
     # which k they are: one selection applied twice.
-    kpts_irr = _wedge(np.asarray(sym.unfolded_kpts, dtype=np.float64))
+    kpts_irr = np.asarray(reduce_full_bz_to_file_wedge(
+        sym, np.asarray(sym.unfolded_kpts, dtype=np.float64)))
 
     # ── THE STAR SPREAD IS MEASURED HERE, BECAUSE HERE IS WHERE IT EXISTS ─
     # ``_star_spread`` (tests/harness.py) is the worst per-band
@@ -1632,8 +1677,15 @@ def write_results(
     # k into stars by matching mean-field ENERGY vectors to 2e-3 eV — a
     # fingerprint that aliases whenever two stars are degenerate, and one
     # of the sites this branch is removing.
-    _spread_per_band, _star_spread_ev, _nstar = _star_spread_of_sigma_diag(
-        sx_out + corr_out, sym)
+    if results.sigma_kset == SIGMA_KSET_FULL_BZ:
+        _spread_per_band, _star_spread_ev, _nstar = (
+            _star_spread_of_sigma_diag(sx_out + corr_out, sym))
+    else:
+        # The SC map measured the complete full-BZ relation before its output
+        # seam.  Re-unfolding retained star rows here would manufacture an
+        # exact-zero spread, so omit the unrecoverable per-band diagnostic
+        # instead of stamping a fake green.
+        _spread_per_band = _star_spread_ev = _nstar = None
 
     # THE DEGENERACY-RESOLVED TWIN.  Measured on the SAME full-BZ Sigma and
     # the SAME star labels, but on degenerate SUBSPACES rather than single
@@ -1641,8 +1693,11 @@ def write_results(
     # symmetry-invariant quantity at all.  It takes the DFT ladder to know
     # where the multiplets are, and that is the array the window was sliced
     # out of.
-    _spread_multiplet = _star_spread_over_multiplets(
-        sx_out + corr_out, sym, np.asarray(results.E_dft_ry, dtype=np.float64))
+    _spread_multiplet = (
+        _star_spread_over_multiplets(
+            sx_out + corr_out, sym,
+            np.asarray(results.E_dft_ry, dtype=np.float64))
+        if results.sigma_kset == SIGMA_KSET_FULL_BZ else None)
 
     # The table write is deferred until the EqpAssembly exists: that object
     # is the one owner of raw Z and its pathology mask, and sigma_diag.dat
@@ -1732,7 +1787,7 @@ def write_results(
                     "write_results: GWResults.e_eval_ev has IBZ shape "
                     f"{e_eval_ev_irr.shape} against E_DFT {e_dft_ev_irr.shape} "
                     "— the energies Sigma was evaluated at must be on the "
-                    "driver's full-BZ k-set and the sigma band window.")
+                    "driver's tagged result k-set and the sigma band window.")
             e_eval_rel_ev_irr = e_eval_ev_irr - float(results.efermi_ev)
 
     # Assemble FIRST.  This object is now the one producer of the exact H/X,
@@ -1810,8 +1865,11 @@ def write_results(
         append_eqp_assembly_receipt_h5(
             results.sigma_omega_h5_path,
             assembly=assembly,
-            file_wedge_full_bz_rows=_wedge(np.arange(
-                int(np.shape(sym.unfolded_kpts)[0]), dtype=np.int64)),
+            file_wedge_full_bz_rows=np.asarray(
+                reduce_full_bz_to_file_wedge(
+                    sym, np.arange(
+                        int(np.shape(sym.unfolded_kpts)[0]),
+                        dtype=np.int64))),
             degeneracy_policy=degeneracy_policy,
             degeneracy_tol_ry=degeneracy_tol_ry,
             print_fn=print_fn,
@@ -1899,10 +1957,20 @@ def write_results(
         from ffi import _services as _svc
         _svc.ensure_on_path()
         import symmetry_maps as _sm
+        rotation_U = np.asarray(results.U_qp)
+        rotation_E = np.asarray(results.E_qp_ry)
+        if results.sigma_kset == SIGMA_KSET_STAR_WEDGE:
+            # This artifact intentionally stores the full BZ.  Expand the
+            # paired E/U only at its serialization boundary; the retained SC
+            # result remains on the loop k-set.
+            rotation_U = np.asarray(
+                _sm.unfold_star_wedge_to_full_bz(sym, rotation_U))
+            rotation_E = np.asarray(
+                _sm.unfold_star_wedge_to_full_bz(sym, rotation_E))
         write_qp_rotations_h5(
             os.path.join(input_dir, "qp_wfn_rotations.h5"),
-            U_mnk=results.U_qp,
-            E_qp_nk=results.E_qp_ry / 2.0,  # Ry → Hartree
+            U_mnk=rotation_U,
+            E_qp_nk=rotation_E / 2.0,  # Ry → Hartree
             band_start=results.band_start,
             band_stop=results.band_stop,
             kpoints_crys=np.asarray(sym.unfolded_kpts, dtype=np.float64),

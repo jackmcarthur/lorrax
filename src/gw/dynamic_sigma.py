@@ -203,6 +203,7 @@ def write_sigma_omega(
     eval_energies_provenance,
     omega_coverage=None,
     sym=None,
+    star_already_selected: bool = False,
     band_extrapolation=None,
     print_fn=None,
 ) -> str:
@@ -296,6 +297,7 @@ def write_sigma_omega(
                 None if h_transverse is None
                 else RYD_TO_EV * h_transverse),
             mesh=mesh_xy, star=star,
+            star_already_selected=star_already_selected,
             omega_reference_ev=omega_reference_ev,
             omega_reference_provenance=omega_reference_provenance,
             sigma_regularization=sigma_regularization,
@@ -319,6 +321,7 @@ def write_sigma_omega(
             None if h_transverse is None
             else RYD_TO_EV * h_transverse),
         mesh=mesh_xy, star=star,
+        star_already_selected=star_already_selected,
         omega_reference_ev=omega_reference_ev,
         omega_reference_provenance=omega_reference_provenance,
         sigma_regularization=sigma_regularization,
