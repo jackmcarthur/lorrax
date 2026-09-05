@@ -365,6 +365,46 @@ def _create_datasets(io, spec: WObserverSpec) -> None:
         io.create_dataset(name, shape=shape, dtype=np.complex128)
 
 
+def _validate_resume_state(state: dict, spec: WObserverSpec,
+                           nmu_storage: int) -> None:
+    if state.get("schema") != OBSERVER_SCHEMA:
+        raise ValueError(
+            f"W observer sidecar schema {state.get('schema')!r} is not "
+            f"{OBSERVER_SCHEMA}")
+    expected_carrier = {
+        "logical": int(spec.nmu_logical),
+        "storage": int(nmu_storage),
+        "padding_policy": "zero_probe_and_slabio_logical_extent_clip",
+    }
+    if state.get("centroid_carrier") != expected_carrier:
+        raise ValueError(
+            "W observer centroid carrier changed across resume; start a new "
+            "run variant")
+    expected_datasets = {
+        name: {"shape": list(shape), "dtype": "complex128"}
+        for name, shape in _dataset_shapes(spec).items()
+    }
+    if state.get("datasets") != expected_datasets:
+        raise ValueError(
+            "W observer sidecar dataset schema changed; start a new run variant")
+    ready = state.get("ready_prefix_by_arm")
+    expected_arms = {arm["name"] for arm in spec.arms}
+    if not isinstance(ready, dict) or set(ready) != expected_arms:
+        raise ValueError("W observer sidecar readiness arms are incompatible")
+    for arm in spec.arms:
+        value = ready[arm["name"]]
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 0 or value > int(arm["n"])):
+            raise ValueError(
+                f"W observer sidecar has invalid {arm['name']} prefix {value!r}")
+    timings = state.get("observer_seconds")
+    if not isinstance(timings, dict) or set(timings) != {
+            "action", "enqueue", "drain"} or any(
+                not np.isfinite(value) or value < 0.0
+                for value in timings.values()):
+        raise ValueError("W observer sidecar has invalid timing accumulators")
+
+
 def _write_allocation_metadata(io, spec: WObserverSpec) -> None:
     io.write_attr("observer_schema", np.asarray(OBSERVER_SCHEMA, np.int32))
     io.write_attr("observer_identity_json", np.bytes_(
@@ -560,15 +600,7 @@ def open_w_observer(spec, *, mesh_xy, v_wedge) -> InternalFFWObserver:
             raise ValueError(
                 f"W observer sidecar status {state.get('status')!r} is not "
                 "resumable; start a new run variant")
-        expected_carrier = {
-            "logical": int(spec.nmu_logical),
-            "storage": nmu_storage,
-            "padding_policy": "zero_probe_and_slabio_logical_extent_clip",
-        }
-        if state.get("centroid_carrier") != expected_carrier:
-            raise ValueError(
-                "W observer centroid carrier changed across resume; start a "
-                "new run variant")
+        _validate_resume_state(state, spec, nmu_storage)
 
     barrier("internal_ff_w_observer_before_append")
     io = SlabIO(spec.payload_path, mode="a", mesh=mesh_xy)
