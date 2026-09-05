@@ -2378,11 +2378,11 @@ def compute_static_photon_response(
         from .wavefunction_bundle import padded_centroid_extent
         n_c = padded_centroid_extent(wfns_charge)
         n_t = padded_centroid_extent(wfns_transverse)
-        if (n_c != layout.padded_extent(0) or n_t != layout.padded_extent(1)):
+        if (n_c != layout.carrier_extent(0) or n_t != layout.carrier_extent(1)):
             raise ValueError(
                 "photon layout padded extents do not match wavefunction "
-                f"bundles: layout C/T=({layout.padded_extent(0)},"
-                f"{layout.padded_extent(1)}), wfns C/T=({n_c},{n_t})")
+                f"bundles: layout C/T=({layout.carrier_extent(0)},"
+                f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
         W_packed = None
     # This packed path bypasses screening._gate_w, so apply its two valid
     # static stage invariants here through the shared sanity owner.  Full-q

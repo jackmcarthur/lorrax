@@ -1521,6 +1521,17 @@ _DEFAULTS = {
     # ``dft_velocity`` runs the same head chain on the artifact's exact DFT
     # p-matrix velocity stage only, without the links.
     "sc_head_update": "off",       # off | parallel_transport | dft_velocity
+    # The Sigma-velocity of the per-channel current carriers
+    # (bispinor_current_balance = velocity, qp_solver = self_consistent):
+    # channel a's small component gains (alpha/4) sigma^a (v_Delta)^a psi_L
+    # with v_Delta the velocity Delta H = H_QP - H_DFT adds, so the alpha^a
+    # vertex is the QP Hamiltonian's velocity, not the DFT one.  ``auto``
+    # takes the covariant finite-link DDeltaH when sc_head_update =
+    # parallel_transport supplies it (the head's own velocity), else the
+    # interband dipole commutator -i[r, DeltaH] from dipole.h5 (r_mn =
+    # -i v_mn/(e_m - e_n); omits the intraband/k-derivative part, stated in
+    # the run record), else off.
+    "sc_current_velocity_update": "auto",   # auto | off | covariant | interband
     "parallel_transport_file": "parallel_transport.h5",
     # Optional Hall (Chern-Simons) artifact for the packed static photon
     # Gamma-cell completion.  EMPTY BY DEFAULT (lane J section 2, item 9):
@@ -2393,6 +2404,7 @@ _NORMALIZE_STR = {
     "qp_solver",
     "sc_accelerator",
     "sc_head_update",
+    "sc_current_velocity_update",
     "wcoul0_source", "head_correction", "screening_method",
     "screening_diagrams",
     "minimax_energy_reference",
@@ -4614,6 +4626,12 @@ class MPAConfig:
 #: dispatch cannot disagree about what "a metal head mode" is.
 METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
 
+#: ``sc_current_velocity_update`` vocabulary.  ``auto`` resolves to the
+#: first available route in this order: ``covariant`` (the head's finite-link
+#: DDeltaH, sc_head_update = parallel_transport), ``interband`` (the dipole
+#: commutator -i[r, DeltaH] from dipole.h5), ``off``.
+CURRENT_VELOCITY_UPDATES = ("auto", "off", "covariant", "interband")
+
 
 @dataclass(frozen=True)
 class SCConfig:
@@ -4672,6 +4690,10 @@ class SCConfig:
     #: velocity alone.  ``METAL_HEAD_UPDATES`` is the vocabulary consumers
     #: test against; do not spell the pair out a second time.
     head_update: str = "off"
+    #: ``sc_current_velocity_update``: the Sigma-velocity of the per-channel
+    #: current carriers (see ``_DEFAULTS``).  Resolved against the run's
+    #: artifacts by ``sc_iteration.resolve_current_velocity_update``.
+    current_velocity_update: str = "auto"
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -4714,6 +4736,11 @@ class SCConfig:
                 "sc_head_update must be 'off', "
                 + " or ".join(repr(v) for v in METAL_HEAD_UPDATES)
                 + f"; got {self.head_update!r}.")
+        if self.current_velocity_update not in CURRENT_VELOCITY_UPDATES:
+            raise ValueError(
+                "sc_current_velocity_update must be one of "
+                + ", ".join(repr(v) for v in CURRENT_VELOCITY_UPDATES)
+                + f"; got {self.current_velocity_update!r}.")
 
 
 @dataclass(frozen=True)
@@ -5670,6 +5697,8 @@ class LorraxConfig:
             # new knob must not add one.
             eigh=_linalg.sc_eigh,
             head_update=str(_g("sc_head_update")).strip().lower(),
+            current_velocity_update=str(
+                _g("sc_current_velocity_update")).strip().lower(),
         )
         eqp2 = EQP2Config(
             enabled=bool(_g("write_eqp2")),

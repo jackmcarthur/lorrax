@@ -411,6 +411,13 @@ class SCInputs:
     #: route its CC block is absent and it is independent of the QP map;
     #: each map still rotates both wavefunction bundles and re-contracts it.
     wfns_transverse_dft: Wavefunctions | None = None
+    #: Resolved ``sc_current_velocity_update`` ("off" | "covariant" |
+    #: "interband") — :func:`resolve_current_velocity_update`, once, in
+    #: ``run_sc_driver``.  "off" is the historical map bit for bit.
+    current_velocity_update: str = "off"
+    #: The interband route's exact DFT velocity from dipole.h5, first
+    #: ``nb_m`` bands, ``(3, nk, nb_m, nb_m)`` at ``P(None, None, 'x', 'y')``.
+    dipole_velocity_dft: jax.Array | None = None
     photon_response: object | None = None
     #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
     #: runs entirely on the full BZ, which is what every result before
@@ -2581,6 +2588,123 @@ def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
     return state.partition if state.partition is not None else inputs.partition
 
 
+def _delta_h_manifold(state, inputs, wfns_qp, ks, *, nb_storage: int):
+    """``Delta H = H_QP - H_DFT`` on the first ``nb_storage`` bundle bands,
+    DFT basis, full BZ: the active block from the carried Hamiltonian, a
+    diagonal energy shift on the scissored tail (the head's own object,
+    ``qsgw_head.assemble_delta_head_manifold``)."""
+    from .qsgw_head import assemble_delta_head_manifold
+
+    if int(wfns_qp.enk.shape[1]) < int(nb_storage):
+        raise ValueError(
+            f"Delta H manifold asks for {int(nb_storage)} bands, but the SC "
+            f"wavefunction bundle has only {int(wfns_qp.enk.shape[1])}.")
+    H_active_full = (
+        state.H_qp_dft if ks.is_identity else ks.broadcast(state.H_qp_dft))
+    e_dft_active = inputs.e_dft_active_kn_ry
+    nb_active = int(H_active_full.shape[-1])
+    h_dft_active = (
+        e_dft_active[:, :, None]
+        * jnp.eye(nb_active, dtype=jnp.complex128)[None, :, :])
+    delta_active = H_active_full - h_dft_active
+    tail_diagonal = (wfns_qp.enk[:, :nb_storage]
+                     - inputs.wfns_dft.enk[:, :nb_storage])
+    return assemble_delta_head_manifold(
+        delta_active, tail_diagonal, nb_storage=int(nb_storage),
+        mesh=inputs.mesh_xy)
+
+
+def resolve_current_velocity_update(
+    config, *, wfns_transverse, parallel_transport, input_dir, mesh_xy, wfn,
+    meta, wfn_fingerprint_binding=None, print_fn=print,
+):
+    """Turn ``sc_current_velocity_update`` into ("off"|"covariant"|
+    "interband", dipole velocity or None), once, and SAY which and why.
+
+    ``auto``: covariant when the head's finite links are resident
+    (sc_head_update = parallel_transport), else interband when dipole.h5 is
+    beside the deck, else off.  A named route that is unavailable refuses.
+    Both routes need the per-channel carriers (bispinor_current_balance =
+    velocity) and an SC class that carries the transverse bundle (the
+    dynamic packed bispinor class).
+    """
+    import os
+
+    requested = str(config.sc.current_velocity_update)
+    velocity_balance = (
+        str(getattr(config, "bispinor_current_lift", "raw") or "raw")
+        == "velocity")
+    links = (parallel_transport is not None
+             and getattr(parallel_transport, "forward_links", None)
+             is not None)
+    dipole_path = os.path.join(input_dir, "dipole.h5")
+    have_dipole = os.path.exists(dipole_path)
+    blockers = []
+    if wfns_transverse is None:
+        blockers.append(
+            "this SC class carries no transverse current bundle (only the "
+            "dynamic packed bispinor class does)")
+    if not velocity_balance:
+        blockers.append(
+            "bispinor_current_balance is not 'velocity' (the term is "
+            "channel a's sigma^a (v_Delta)^a psi_L; a shared sigma.p "
+            "carrier has no channel)")
+    if requested == "off":
+        print_fn("  SC current carriers: Sigma-velocity OFF (deck).")
+        return "off", None
+    if blockers:
+        if requested == "auto":
+            print_fn("  SC current carriers: Sigma-velocity OFF (auto): "
+                     + "; ".join(blockers) + ".")
+            return "off", None
+        raise ValueError(
+            f"GATE sc_current_velocity_update_unavailable: "
+            f"sc_current_velocity_update = {requested} needs what this deck "
+            "lacks:\n  - " + "\n  - ".join(blockers))
+    if requested in ("auto", "covariant") and links:
+        print_fn(
+            "  SC current carriers: Sigma-velocity COVARIANT — channel a's "
+            "small component gains (alpha/4) sigma^a (D Delta H)^a psi_L "
+            "each map, the finite-link D Delta H the head adds to its "
+            "velocity (same operator, two consumers).")
+        return "covariant", None
+    if requested == "covariant":
+        raise ValueError(
+            "GATE sc_current_velocity_update_unavailable: "
+            "sc_current_velocity_update = covariant needs the finite-link "
+            "manifold (sc_head_update = parallel_transport, >= 5 k points "
+            "on every axis); this deck has none.  Use 'interband' (dipole "
+            "commutator, no k stencil) or 'auto'.")
+    if requested in ("auto", "interband") and have_dipole:
+        from .qsgw_head import load_dipole_velocity_sharded
+        nb = min(int(meta.b_id_4_user), int(wfns_transverse.enk.shape[1]))
+        velocity, path = load_dipole_velocity_sharded(
+            input_dir, mesh=mesh_xy, wfn=wfn, meta=meta, config=config,
+            nb=nb, wfn_fingerprint_binding=wfn_fingerprint_binding)
+        print_fn(
+            "  SC current carriers: Sigma-velocity INTERBAND — channel a's "
+            "small component gains (alpha/4) sigma^a (-i[r, Delta H])^a "
+            "psi_L each map, r_mn = -i v_mn/(e_m - e_n) from "
+            f"{path} on {nb} bands (pairs within "
+            f"{float(config.sc.exact_degeneracy_tol_ev):.1e} eV excluded). "
+            "OMITTED: the k-derivative part (intraband group-velocity "
+            "change, diagonal connection), which needs a k stencil; the "
+            "head keeps its own velocity"
+            + (" (finite-link covariant)" if links else
+               " (QP-rotated DFT p-matrix or fixed DFT)") + ".")
+        return "interband", velocity
+    if requested == "interband":
+        raise ValueError(
+            "GATE sc_current_velocity_update_unavailable: "
+            "sc_current_velocity_update = interband needs dipole.h5 beside "
+            f"the deck; missing {dipole_path}.")
+    print_fn(
+        "  SC current carriers: Sigma-velocity OFF (auto): neither finite "
+        "links (sc_head_update = parallel_transport) nor dipole.h5 are "
+        "available.")
+    return "off", None
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -2989,13 +3113,58 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         mesh_xy=inputs.mesh_xy,
         active_slice=inputs.band_slices.sigma,
     )
+    # THE VELOCITY Delta H ADDS, built once per map (DFT basis).  Two
+    # consumers: the head (covariant route only, its own velocity) and the
+    # per-channel current carriers below.  ``delta_head`` is the head
+    # manifold ``Delta H = H_QP - H_DFT`` the head block also uses.
+    pt = getattr(inputs, "parallel_transport", None)
+    delta_head = None
+    delta_velocity_dft = None
+    if pt is not None and pt.forward_links is not None:
+        delta_head = _delta_h_manifold(
+            state, inputs, wfns_qp, ks,
+            nb_storage=int(pt.velocity_dft_cart.shape[-1]))
+    if inputs.current_velocity_update == "covariant":
+        from .qsgw_head import covariant_velocity_correction
+        if delta_head is None:
+            raise RuntimeError(
+                "sc_current_velocity_update = covariant resolved without "
+                "finite links; resolve_current_velocity_update must refuse "
+                "this before the loop")
+        delta_velocity_dft = covariant_velocity_correction(
+            delta_head, pt, mesh=inputs.mesh_xy,
+            kgrid=tuple(int(n) for n in inputs.wfn.kgrid))
+    elif inputs.current_velocity_update == "interband":
+        from .qsgw_head import interband_dipole_velocity_correction
+        nb_dip = int(inputs.dipole_velocity_dft.shape[-1])
+        delta_velocity_dft = interband_dipole_velocity_correction(
+            _delta_h_manifold(state, inputs, wfns_qp, ks, nb_storage=nb_dip),
+            inputs.dipole_velocity_dft,
+            inputs.wfns_dft.enk[:, :nb_dip],
+            mesh=inputs.mesh_xy,
+            degeneracy_tol_ry=(
+                float(inputs.config.sc.exact_degeneracy_tol_ev) / RYD_TO_EV))
+    elif inputs.current_velocity_update != "off":
+        raise ValueError(
+            "SCInputs.current_velocity_update must be 'off', 'covariant' or "
+            f"'interband'; got {inputs.current_velocity_update!r}")
+
     wfns_transverse_qp = None
     if inputs.wfns_transverse_dft is not None:
         # The packed current vertices are orbital dependent even though the
         # bare current operator is not.  Reapply this map's SAME U/E update
         # to the immutable transverse DFT bundle before every contraction.
-        wfns_transverse_qp = rotate_wavefunctions(
-            inputs.wfns_transverse_dft, U_full,
+        # With the Sigma-velocity on, channel a's small component first
+        # gains (alpha/4) sigma^a (v_Delta)^a psi_L in the DFT basis, then
+        # every distinct channel carrier is rotated.
+        from .wavefunction_bundle import (
+            add_covariant_current_velocity, rotate_lorentz_carriers)
+        carriers_dft = inputs.wfns_transverse_dft
+        if delta_velocity_dft is not None:
+            carriers_dft = add_covariant_current_velocity(
+                carriers_dft, delta_velocity_dft, mesh_xy=inputs.mesh_xy)
+        wfns_transverse_qp = rotate_lorentz_carriers(
+            carriers_dft, U_full,
             enk_active_new=E_full, enk_base=enk_base,
             efermi=float(efermi_ry),
             mesh_xy=inputs.mesh_xy,
@@ -3077,7 +3246,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_head_response = None
     iteration_static_head_terms = inputs.static_head_terms
     head_occ_kn = None
-    pt = getattr(inputs, "parallel_transport", None)
     fixed_dft_full_head = inputs.fixed_dft_head_response is not None
     if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
@@ -3099,22 +3267,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # O(nk*nb_storage^2) manifold and finite-link derivative for a term
         # that is then dropped.  Everything below this point is shared.
         forward_links = pt.forward_links
-        delta_head = None
-        if forward_links is not None:
-            H_active_full = (
-                state.H_qp_dft if ks.is_identity
-                else ks.broadcast(state.H_qp_dft))
-            e_dft_active = inputs.e_dft_active_kn_ry
-            nb_active = int(H_active_full.shape[-1])
-            h_dft_active = (
-                e_dft_active[:, :, None]
-                * jnp.eye(nb_active, dtype=jnp.complex128)[None, :, :])
-            delta_active = H_active_full - h_dft_active
-            tail_diagonal = (wfns_qp.enk[:, :nb_storage]
-                             - inputs.wfns_dft.enk[:, :nb_storage])
-            delta_head = assemble_delta_head_manifold(
-                delta_active, tail_diagonal, nb_storage=nb_storage,
-                mesh=inputs.mesh_xy)
+        # ``delta_head`` (the Delta H manifold) was built above, before the
+        # transverse rotation, because the current carriers consume it too;
+        # None under sc_head_update = dft_velocity (no links, no DeltaH).
 
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
@@ -3155,6 +3310,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # over the full Px*Py mesh and frequency-blocked in each ring.
             wfns_qp=wfns_qp,
             eta_ry=(0.0 if mpa_mode else None),
+            # The covariant route hands the head the SAME D Delta H the
+            # current carriers took; the interband route leaves the head's
+            # own velocity (dft_velocity by contract) alone.
+            delta_velocity_dft=(
+                delta_velocity_dft
+                if inputs.current_velocity_update == "covariant" else None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
@@ -5440,6 +5601,14 @@ def run_sc_driver(
             f"{len(fixed_head_omegas)} frequency sample(s); each map folds "
             "them once through its resident W.")
 
+    current_velocity_update, dipole_velocity_dft = (
+        resolve_current_velocity_update(
+            config, wfns_transverse=wfns_transverse,
+            parallel_transport=parallel_transport, input_dir=input_dir,
+            mesh_xy=mesh_xy, wfn=wfn, meta=meta,
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
+            print_fn=record_fn or print_fn))
+
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
         head_channel=head_channel,
@@ -5459,6 +5628,8 @@ def run_sc_driver(
         material_class=material_class,
         wfns_transverse_dft=wfns_transverse,
         photon_response=photon_response,
+        current_velocity_update=current_velocity_update,
+        dipole_velocity_dft=dipole_velocity_dft,
         kstar=kstar,
         parallel_transport=parallel_transport,
         fixed_dft_head_response=fixed_dft_head_response,

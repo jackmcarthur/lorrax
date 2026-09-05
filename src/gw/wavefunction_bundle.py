@@ -1902,6 +1902,14 @@ def rotate_wavefunctions(
     active_slice
         Contiguous active band block.  Defaults to ``wfns_dft.slices.sigma``.
     """
+    if isinstance(wfns_dft, LorentzCarriers):
+        # ``__getattr__`` would hand channel 1's arrays to the layout
+        # dispatch below and return ONE rotated bundle, silently dropping
+        # channels 2 and 3 of a per-channel velocity balance.
+        raise TypeError(
+            "rotate_wavefunctions received a LorentzCarriers container; "
+            "rotate the spatial-current carriers with "
+            "rotate_lorentz_carriers, which rotates every distinct channel.")
     if wfns_dft.layout == 'legacy':
         impl = _rotate_wavefunctions_legacy
     elif wfns_dft.layout == 'face':
@@ -1914,6 +1922,158 @@ def rotate_wavefunctions(
         wfns_dft, U_dft_to_qp_active, enk_active_new=enk_active_new,
         enk_base=enk_base, efermi=efermi, mesh_xy=mesh_xy,
         active_slice=active_slice)
+
+
+def rotate_lorentz_carriers(
+    carriers,
+    U_dft_to_qp_active: jax.Array,
+    *,
+    enk_active_new: jax.Array,
+    enk_base: jax.Array | None = None,
+    efermi: float | None,
+    mesh_xy: Mesh,
+    active_slice: slice | None = None,
+) -> "LorentzCarriers":
+    """:func:`rotate_wavefunctions` on every DISTINCT channel of the
+    spatial-current carriers; labels sharing one bundle keep sharing it
+    (the shipped sigma.p carrier rotates once, the per-channel velocity
+    balance three times)."""
+    carriers = as_lorentz_carriers(carriers)
+    rotated: dict = {}
+    out = []
+    for channel in carriers.channels:
+        key = id(channel)
+        if key not in rotated:
+            rotated[key] = rotate_wavefunctions(
+                channel, U_dft_to_qp_active, enk_active_new=enk_active_new,
+                enk_base=enk_base, efermi=efermi, mesh_xy=mesh_xy,
+                active_slice=active_slice)
+        out.append(rotated[key])
+    return LorentzCarriers(tuple(out))
+
+
+# ---------------------------------------------------------------------------
+# The Sigma-velocity of the per-channel current carriers
+#
+#   psi_S^(a) += (alpha/4) sigma^a  sum_m psi_L,m (v_Delta)^a_mn
+#
+# (v_Delta)^a = the Ry velocity Delta H = H_QP - H_DFT adds (``qsgw_head.
+# covariant_velocity_correction`` or ``interband_dipole_velocity_correction``,
+# DFT basis, (3, nk, nb_m, nb_m)).  With the per-channel balance
+# (``common.bispinor_init``, one carrier per Cartesian channel) the channel-a
+# small component is (alpha/4)[sigma.v_SR + sigma^a v_SO,a] psi_L in G space;
+# the Sigma term is band-space only, so it is a band contraction of the
+# resident LARGE components, placed behind sigma^a, added to the resident
+# small components.  The contraction reuses the QP rotation kernels with
+# (v_Delta)^a in the place of U over the block [0, nb_m); a band mask removes
+# the pass-through bands those kernels leave untouched.
+# ---------------------------------------------------------------------------
+
+@functools.partial(jax.jit, static_argnames=("spinor_axis", "band_axis"))
+def _add_small_component(psi, contracted, band_mask, sigma_a, coef, *,
+                         spinor_axis: int, band_axis: int):
+    shape = [1] * psi.ndim
+    shape[band_axis] = -1
+    c = contracted * band_mask.reshape(shape).astype(contracted.dtype)
+    c_large = jnp.moveaxis(
+        jax.lax.slice_in_dim(c, 0, 2, axis=spinor_axis), spinor_axis, 0)
+    s = jnp.moveaxis(
+        jnp.einsum("st,t...->s...", sigma_a, c_large), 0, spinor_axis)
+    small = jax.lax.slice_in_dim(psi, 2, 4, axis=spinor_axis) + coef * s
+    return jax.lax.dynamic_update_slice_in_dim(psi, small, 2, axis=spinor_axis)
+
+
+def _add_small_component_velocity(wfns: "Wavefunctions", velocity_a, sigma_a,
+                                  *, mesh_xy: Mesh) -> "Wavefunctions":
+    """One channel: ``small += (alpha/4) sigma_a (psi_L velocity_a)``."""
+    import dataclasses
+    from common.bispinor_init import HALFALPHA
+
+    M = jnp.asarray(velocity_a, dtype=jnp.complex128)
+    nb_full = int(wfns.enk.shape[1])
+    if M.ndim != 3 or M.shape[-1] != M.shape[-2]:
+        raise ValueError(
+            f"velocity_a must be (nk, nb_m, nb_m); got {M.shape}")
+    nb_m = int(M.shape[-1])
+    if nb_m > nb_full:
+        raise ValueError(
+            f"Sigma-velocity manifold ({nb_m} bands) exceeds the carrier's "
+            f"band window ({nb_full})")
+    coef = jnp.asarray(0.5 * HALFALPHA, dtype=jnp.complex128)   # alpha/4
+    sigma = jnp.asarray(sigma_a, dtype=jnp.complex128)
+    band_mask = jnp.arange(nb_full) < nb_m
+    with mesh_xy:
+        if wfns.layout == "legacy":
+            if int(wfns.psi_xn.shape[1]) != 4:
+                raise ValueError(
+                    "the Sigma-velocity needs four-spinor current carriers; "
+                    f"got nspinor={int(wfns.psi_xn.shape[1])}")
+            from runtime.padding import padded_axis
+            nb_pad = padded_axis(
+                nb_m, mesh_xy, name="current Sigma-velocity band manifold",
+                specs=tuple(
+                    (band_mix_spec(_contract_axis(mesh_xy, spec)), 1)
+                    for _field, spec, _band_axis in _PSI_LAYOUTS)).carrier
+            contract = _rotate_kernel(mesh_xy, 0, nb_m, nb_pad)
+            T = contract(wfns.psi_xn, wfns.psi_xr, wfns.psi_yr, wfns.psi_yn,
+                         _place_U(M, mesh_xy, nb_pad))
+            new = {}
+            for (name, _spec, band_axis), t in zip(_PSI_LAYOUTS, T):
+                spinor_axis = 1 if band_axis == 3 else 2
+                new[name] = _add_small_component(
+                    getattr(wfns, name), t, band_mask, sigma, coef,
+                    spinor_axis=spinor_axis, band_axis=band_axis)
+            return dataclasses.replace(wfns, **new)
+        fk = face_kernel_kwargs(wfns)
+        nk_face, nb_face, n_rmu, ns = fk['face_shape']
+        if int(ns) != 4:
+            raise ValueError(
+                "the Sigma-velocity needs four-spinor current carriers; "
+                f"got nspinor={int(ns)}")
+        contract = _face_rotate_kernel(
+            mesh_xy, 0, nb_m, nb_face, n_rmu, ns, nk_face)
+        t_nmu, t_mun = contract(
+            wfns.psi_nmu, wfns.psi_mun, _place_U_face(M, mesh_xy))
+        psi_nmu = _add_small_component(
+            wfns.psi_nmu, t_nmu, band_mask, sigma, coef,
+            spinor_axis=2, band_axis=1)
+        psi_mun = _add_small_component(
+            wfns.psi_mun, t_mun, band_mask, sigma, coef,
+            spinor_axis=1, band_axis=3)
+        return dataclasses.replace(wfns, psi_nmu=psi_nmu, psi_mun=psi_mun)
+
+
+def add_covariant_current_velocity(carriers, delta_velocity_dft, *,
+                                   mesh_xy: Mesh) -> "LorentzCarriers":
+    """Give the three current carriers the velocity ``Delta H`` adds.
+
+    ``delta_velocity_dft`` is ``(3, nk, nb_m, nb_m)`` in the basis the
+    carriers are expressed in (call BEFORE the QP rotation with the
+    DFT-basis operator, or after it with the rotated one).  Channel a's
+    small component gains ``(alpha/4) sigma^a sum_m psi_L,m v^a_mn``; the
+    large components and bands beyond ``nb_m`` are untouched.  Refuses a
+    shared carrier: with one sigma.p four-spinor for all three labels there
+    is no channel to attach a channel-a term to.
+    """
+    from common.gamma_matrices import paulis
+
+    carriers = as_lorentz_carriers(carriers)
+    if carriers.one_carrier:
+        raise ValueError(
+            "GATE sc_current_velocity_needs_per_channel_carriers: the "
+            "Sigma-velocity term is channel-a's sigma^a (v_Delta)^a psi_L; "
+            "the three labels share one sigma.p carrier here "
+            "(bispinor_current_balance = kinetic), which has no such "
+            "channel.  Set bispinor_current_balance = velocity or "
+            "sc_current_velocity_update = off.")
+    v = jnp.asarray(delta_velocity_dft, dtype=jnp.complex128)
+    if v.ndim != 4 or int(v.shape[0]) != 3:
+        raise ValueError(
+            f"delta_velocity_dft must be (3, nk, nb, nb); got {v.shape}")
+    return LorentzCarriers(tuple(
+        _add_small_component_velocity(
+            carriers.channel(a), v[a - 1], paulis[a - 1], mesh_xy=mesh_xy)
+        for a in (1, 2, 3)))
 
 
 # ---------------------------------------------------------------------------

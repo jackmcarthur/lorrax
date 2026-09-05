@@ -284,7 +284,8 @@ def test_sc_map_rotates_and_recontracts_current_bundle():
 
     from gw import sc_iteration
     source = inspect.getsource(sc_iteration.gw_iteration_map)
-    assert "wfns_transverse_qp = rotate_wavefunctions" in source
+    assert "wfns_transverse_qp = rotate_lorentz_carriers" in source
+    assert "add_covariant_current_velocity" in source
     assert "wfns_transverse=wfns_transverse_qp" in source
     assert "photon_response=inputs.photon_response" in source
     assert "SC packed current map" in source

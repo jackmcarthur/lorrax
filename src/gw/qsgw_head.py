@@ -3261,8 +3261,14 @@ def build_iteration_head_response(
     config,
     wfns_qp=None,
     eta_ry: float | None = None,
+    delta_velocity_dft=None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
+
+    ``delta_velocity_dft`` is the already-built ``D Delta H`` of
+    :func:`covariant_velocity_correction` when the caller also feeds it to
+    the current carriers; ``None`` builds it here.  Passing one without
+    links is refused: the two consumers must see the same operator.
 
     ``forward_links=None`` is ``sc_head_update = dft_velocity``: no link
     manifold is resident, so the covariant ``DΔH`` correction is dropped
@@ -3272,19 +3278,27 @@ def build_iteration_head_response(
     ISDF wings, the static κ² — is the SAME code on both routes.
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+    if delta_velocity_dft is not None and forward_links is None:
+        raise ValueError(
+            "build_iteration_head_response: a precomputed D Delta H was "
+            "handed to a head that carries no links (sc_head_update = "
+            "dft_velocity drops the covariant correction by contract)")
     if forward_links is not None:
         if forward_neighbors is None:
             raise ValueError(
                 "forward_neighbors are required when forward_links are present"
             )
-        v_dft_basis = v_dft_basis + covariant_link_derivative(
-            delta_h_dft,
-            forward_links,
-            forward_neighbors,
-            mesh=mesh,
-            kgrid=kgrid,
-            bvec_cart=bvec_cart,
-        )
+        if delta_velocity_dft is None:
+            delta_velocity_dft = covariant_link_derivative(
+                delta_h_dft,
+                forward_links,
+                forward_neighbors,
+                mesh=mesh,
+                kgrid=kgrid,
+                bvec_cart=bvec_cart,
+            )
+        v_dft_basis = v_dft_basis + jnp.asarray(
+            delta_velocity_dft, dtype=jnp.complex128)
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)
@@ -3379,24 +3393,16 @@ def build_iteration_head_response(
     )
 
 
-def build_dft_head_response(
-    wfns,
-    omegas_ry,
-    *,
-    input_dir: str,
-    mesh: Mesh,
-    wfn,
-    meta,
-    config,
-    wfn_fingerprint_binding=None,
-) -> IterationHeadResponse:
-    """Build the one-shot DFT head on exactly the chi0 band manifold.
+def read_authenticated_dipole_velocity(
+    input_dir: str, *, wfn, meta, config, wfn_fingerprint_binding=None,
+):
+    """``dipole.h5``'s exact DFT velocity ``v = p + i[r, V_NL]`` (Ry
+    velocity, ``(3, nk_full, nb, nb)`` host complex128, DFT band basis),
+    authenticated against this run before the read.
 
-    This is the non-self-consistent entry to the same sharded direct-head and
-    wing kernels used by QSGW.  In particular, both ``S_direct`` and ``Y/Z``
-    use ``[b0,b4_chi)``; constructing the scalar from every band in a larger
-    dipole file while the body uses ``number_bands_chi`` is refused by shape
-    and slicing here rather than silently mixing transition manifolds.
+    Returns ``(velocity_cart, dipole_path)``.  The one owner of the read and
+    of the provenance refusal; the fixed DFT head and the interband
+    Sigma-velocity of the current carriers both consume it.
     """
     import os
     from common.chi_from_dipole import read_dipole_h5
@@ -3439,6 +3445,140 @@ def build_dft_head_response(
             "  why:  S_direct and the wings must use the same WFN and "
             "velocity operator as the finite-q charge response")
     velocity_cart, _ = read_dipole_h5(dipole_path)
+    return np.asarray(velocity_cart, dtype=np.complex128), dipole_path
+
+
+def load_dipole_velocity_sharded(
+    input_dir: str, *, mesh: Mesh, wfn, meta, config, nb: int,
+    wfn_fingerprint_binding=None,
+):
+    """The first ``nb`` bands of :func:`read_authenticated_dipole_velocity`
+    placed at ``P(None, None, 'x', 'y')`` for the interband Sigma-velocity.
+
+    Byte figure (TASTE rule 1): the host read is the whole
+    ``3*nk*nb_file^2*16`` B artifact per rank (117 MB on CrI3 6x6x1 / 260
+    bands); the device copy is band-sharded.  A hyperslab read through
+    ``SlabIO`` (the parallel-transport loader's route) is the upgrade if a
+    deck's dipole file outgrows host memory.
+    """
+    velocity, path = read_authenticated_dipole_velocity(
+        input_dir, wfn=wfn, meta=meta, config=config,
+        wfn_fingerprint_binding=wfn_fingerprint_binding)
+    nk = int(meta.nk_tot)
+    if velocity.shape[0] != 3 or velocity.shape[1] != nk:
+        raise ValueError(
+            f"{path}: dipole_cart has shape {velocity.shape}; want "
+            f"(3, {nk}, nb, nb) on the full BZ")
+    if int(velocity.shape[-1]) < int(nb):
+        raise ValueError(
+            f"{path}: dipole_cart covers {velocity.shape[-1]} bands but the "
+            f"current carriers ask for {int(nb)}")
+    v = np.ascontiguousarray(velocity[:, :, :nb, :nb])
+    return device_put_process_local(
+        v, NamedSharding(mesh, P(None, None, "x", "y"))), path
+
+
+def covariant_velocity_correction(delta_head, pt, *, mesh: Mesh, kgrid):
+    """``D Delta H``: the velocity the QP Hamiltonian adds to the DFT one.
+
+    The finite-link covariant derivative of ``Delta H = H_QP - H_DFT`` on
+    the head manifold, DFT basis, Ry velocity, ``(3, nk, nb, nb)``.  The
+    head adds it to ``velocity_dft_cart``; the per-channel current carriers
+    add ``(alpha/4) sigma^a (D Delta H)^a psi_L`` to channel a's small
+    component (``wavefunction_bundle.add_covariant_current_velocity``).
+    One object, two consumers.
+    """
+    return covariant_link_derivative(
+        delta_head, pt.forward_links, pt.forward_neighbors,
+        mesh=mesh, kgrid=kgrid, bvec_cart=pt.reciprocal_lattice_cart)
+
+
+def _interband_velocity_kernel(mesh: Mesh) -> Callable:
+    key = ("interband_dipole_velocity", id(mesh))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from common.parallel_transport import make_distributed_band_matmul
+
+    multiply = make_distributed_band_matmul(mesh, n_batch_axes=2)
+
+    @jax.jit
+    def _kernel(velocity, delta, energies_kn, tol):
+        # r_mn = -i v_mn / (e_m - e_n) on resolved pairs; v = -i[r, H_DFT]
+        # is the convention every velocity here uses (v_kin = 2(k+G) Ry).
+        de = energies_kn[:, :, None] - energies_kn[:, None, :]
+        resolved = jnp.abs(de) > tol
+        r = jnp.where(
+            resolved[None],
+            (-1j) * velocity / jnp.where(resolved, de, 1.0)[None],
+            0.0 + 0.0j)
+        d3 = jnp.broadcast_to(delta[None], r.shape)
+        return (-1j) * (multiply(r, d3) - multiply(d3, r))
+
+    _KERNEL_CACHE[key] = _kernel
+    return _kernel
+
+
+def interband_dipole_velocity_correction(
+    delta_dft, velocity_dft_cart, energies_dft_kn_ry, *, mesh: Mesh,
+    degeneracy_tol_ry: float,
+):
+    """``-i[r, Delta H]`` with the INTERBAND dipole ``r_mn = -i v_mn/(e_m - e_n)``.
+
+    The velocity ``Delta H`` adds, evaluated without a k derivative: exact
+    for the interband part of a k-diagonal ``Delta H`` (the scissor
+    renormalisation ``v_mn (E_n - E_m)/(e_n - e_m)`` of every interband
+    velocity) and for the interband commutator of a rotated one; it OMITS
+    the k-derivative part ``d_k Delta_mn - i (A_nn - A_mm) Delta_mn`` — the
+    change of the intraband group velocity and the diagonal-connection
+    term — which only a k stencil (``covariant_velocity_correction``)
+    supplies.  Pairs closer than ``degeneracy_tol_ry`` carry no interband
+    dipole (their velocity is intraband) and are left alone.
+
+    ``delta_dft`` (nk, nb, nb) and ``velocity_dft_cart`` (3, nk, nb, nb) on
+    the same DFT band manifold; ``energies_dft_kn_ry`` (nk, nb) replicated.
+    Returns (3, nk, nb, nb) at ``P(None, None, 'x', 'y')``.
+    """
+    v = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+    d = jnp.asarray(delta_dft, dtype=jnp.complex128)
+    e = jnp.asarray(energies_dft_kn_ry, dtype=jnp.float64)
+    if v.ndim != 4 or int(v.shape[0]) != 3 or v.shape[-1] != v.shape[-2]:
+        raise ValueError(
+            f"velocity_dft_cart must be (3, nk, nb, nb); got {v.shape}")
+    if tuple(d.shape) != tuple(v.shape[1:]):
+        raise ValueError(
+            "interband_dipole_velocity_correction: Delta H and the dipole "
+            f"velocity disagree; got {d.shape} and {v.shape}")
+    if tuple(e.shape) != tuple(v.shape[1:3]):
+        raise ValueError(
+            "interband_dipole_velocity_correction: energies must be "
+            f"(nk, nb) = {tuple(v.shape[1:3])}; got {e.shape}")
+    return _interband_velocity_kernel(mesh)(
+        v, d, e, jnp.asarray(float(degeneracy_tol_ry), dtype=jnp.float64))
+
+
+def build_dft_head_response(
+    wfns,
+    omegas_ry,
+    *,
+    input_dir: str,
+    mesh: Mesh,
+    wfn,
+    meta,
+    config,
+    wfn_fingerprint_binding=None,
+) -> IterationHeadResponse:
+    """Build the one-shot DFT head on exactly the chi0 band manifold.
+
+    This is the non-self-consistent entry to the same sharded direct-head and
+    wing kernels used by QSGW.  In particular, both ``S_direct`` and ``Y/Z``
+    use ``[b0,b4_chi)``; constructing the scalar from every band in a larger
+    dipole file while the body uses ``number_bands_chi`` is refused by shape
+    and slicing here rather than silently mixing transition manifolds.
+    """
+    velocity_cart, dipole_path = read_authenticated_dipole_velocity(
+        input_dir, wfn=wfn, meta=meta, config=config,
+        wfn_fingerprint_binding=wfn_fingerprint_binding)
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)
     nb_logical = b4 - b0
