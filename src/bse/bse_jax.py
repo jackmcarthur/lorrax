@@ -859,12 +859,7 @@ def main(argv=None) -> int:
         stage_progress=stage_progress,
     )
 
-    try:
-        wfn.close()
-    except Exception as exc:                                  # noqa: BLE001
-        report.legacy_print(
-            f"WARNING: WfnLoader.close() failed "
-            f"({type(exc).__name__}: {exc}); continuing to exit")
+    wfn.close()
     file_rows = [
         ("human-readable report", "written", report_path),
         ("GW/BSE restart", "read", result["restart_file"]),

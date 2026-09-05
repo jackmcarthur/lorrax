@@ -176,10 +176,13 @@ def test_charge_zeta_identity_ignores_only_wfn_locator_fields(monkeypatch):
 
 
 def test_mpa_refuses_legacy_restart_without_charge_zeta_receipt():
-    with pytest.raises(ValueError, match="restart = false"):
-        model._canonical_charge_zeta_identity(None)
+    with pytest.raises(ValueError, match="restart = false") as refusal:
+        model._canonical_charge_zeta_identity(None, source_path="/private/restart.h5")
+    assert "/private/restart.h5" in str(refusal.value)
+    assert "new run variant with an empty restart/tmp directory" in str(refusal.value)
     with pytest.raises(ValueError, match="exactly scheme and digest"):
-        model._canonical_charge_zeta_identity({"scheme": "only"})
+        model._canonical_charge_zeta_identity(
+            {"scheme": "only"}, source_path="/private/restart.h5")
 
 
 def test_oneshot_driver_hands_charge_zeta_identity_to_every_screening_call():

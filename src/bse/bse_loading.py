@@ -76,6 +76,8 @@ def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
     refused.  That claim is the only way to catch the one state the numbers
     cannot betray: a full-size zero placeholder passes every shape check.
     """
+    from file_io.commit_state import assert_committed
+    assert_committed(dset.file, path=restart_file)
     if dset.attrs.get("V_ready", True):
         return
     raise ValueError(

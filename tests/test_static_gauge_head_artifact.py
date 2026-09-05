@@ -224,3 +224,21 @@ def test_response_tile_adapters_delegate_canonical_pack_and_views():
             if (A, B) != (0, 0):
                 np.testing.assert_array_equal(
                     np.asarray(jax.device_get(views[A][B])), 0.0)
+
+
+@pytest.mark.parametrize('partial', [False, True])
+def test_immutable_output_refusal_names_path_flag_and_recovery(tmp_path, partial):
+    from file_io.static_gauge_head import _immutable_partial_paths
+    path = tmp_path / 'hall.h5'
+    collision = path.with_name('hall.h5.partial') if partial else path
+    collision.touch()
+    with pytest.raises(FileExistsError) as raised:
+        _immutable_partial_paths(path, artifact_name='StaticGaugeHall')
+    message = str(raised.value)
+    assert str(collision) in message
+    assert '--static-gauge-hall-out' in message
+    if partial:
+        assert 'Verify no writer is live' in message
+        assert 'move or delete this exact private partial' in message
+    else:
+        assert 'Choose a new output path' in message

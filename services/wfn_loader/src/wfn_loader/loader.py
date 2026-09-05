@@ -501,21 +501,24 @@ class WfnLoader:
 
     # ------------------------------------------------------------------
     def close(self) -> None:
-        f = getattr(self, "_file", None)
-        if f is not None:
-            try:
-                f.close()
-            except Exception:
-                pass
-            self._file = None
-        sio = getattr(self, "_slab_io", None)
-        if sio is not None:
-            try:
-                sio.close()
-            except Exception:
-                pass
-            self._slab_io = None
+        """Release both handles, propagating the first cleanup failure.
+
+        Detach before closing so destructor cleanup cannot repeat a failed
+        collective close.  Still close the SlabIO handle if h5py close fails.
+        """
+        error = None
+        for name in ("_file", "_slab_io"):
+            handle = getattr(self, name, None)
+            setattr(self, name, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as exc:
+                    if error is None:
+                        error = exc
         self._parent_unfold_g_cache = None
+        if error is not None:
+            raise error
 
     def __enter__(self) -> "WfnLoader":
         return self
@@ -524,7 +527,17 @@ class WfnLoader:
         self.close()
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as exc:
+            # Interpreter teardown must be best effort; explicit close above
+            # is the deterministic API and must never suppress a failure.
+            try:
+                import sys
+                print(f"WfnLoader destructor cleanup failed: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            except BaseException:
+                pass
 
     # ------------------------------------------------------------------
     # Backend selection

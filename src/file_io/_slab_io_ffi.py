@@ -1798,6 +1798,23 @@ class _FfiBackend(_DatasetGeometry):
         self.path = path
         self.mesh = mesh
         self.mode = mode
+        # Invalidate an append before MPI-IO can mutate old committed data.
+        # A reader checks before opening the collective handle as well.
+        from common.collectives import rank0_transaction
+        from .commit_state import assert_committed, set_commit_state
+
+        def _preflight_file():
+            if mode in ("a", "r") and os.path.exists(path):
+                import h5py
+                from .hdf5_owner import STACK_H5PY, open_scope
+                with open_scope(path, STACK_H5PY, mode,
+                                where="SlabIO commit-state preflight"), \
+                        h5py.File(path, mode) as h5:
+                    assert_committed(h5, path=path)
+                    if mode == "a":
+                        set_commit_state(h5, False)
+
+        rank0_transaction(path, stage="SlabIO.open", write=_preflight_file)
         # mode='w' must REPLACE the inode (rank-0 unlink + barrier,
         # shared with _MpiHostBackend — see _replace_inode_for_write):
         # Lustre layout is fixed at inode create, so H5Fcreate(TRUNC)
@@ -1919,6 +1936,31 @@ class _FfiBackend(_DatasetGeometry):
         # only place that can put a denominator under the flush is the
         # drain — see close().
         self._queued_bytes: int = 0
+        if mode != "r":
+            from .commit_state import COMMIT_STATE
+            self.create_dataset(COMMIT_STATE, shape=(1,), dtype=np.int32)
+            # The native DCPL uses H5D_FILL_TIME_NEVER. Persist zero
+            # before callers can enqueue tensors. Rank 0 owns the logical
+            # element; every other rank participates with an empty slab.
+            count = int(mesh.size)
+            sharding = NamedSharding(mesh, P(tuple(mesh.axis_names)))
+            pending = jax.make_array_from_callback(
+                (count,), sharding,
+                lambda index: np.zeros((count,), dtype=np.int32)[index])
+            try:
+                self.write_slab(COMMIT_STATE, pending)
+                self._drain_pending()
+            except BaseException as exc:
+                self._context_error = exc
+            # Construction precedes __enter__: an initialization failure
+            # must itself bring every rank through collective close.
+            from common.collectives import agree_io_error
+            try:
+                agree_io_error(getattr(self, "_context_error", None),
+                               path=path, stage="SlabIO.initialize_receipt")
+            except BaseException:
+                self.close()
+                raise
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -2532,6 +2574,8 @@ class _FfiBackend(_DatasetGeometry):
 
     # ------------------------------------------------------------------
     def close(self) -> None:
+        if not self.fh:
+            return
         # Drain pending writes on the Python worker thread, then stop
         # the worker, THEN close the MPI-IO handle.  Order matters:
         # close_ctx() in C++ also drains its own task queue, but an
@@ -2558,7 +2602,8 @@ class _FfiBackend(_DatasetGeometry):
         # _raise_if_error`` also CLEARS the error as it raises, so nothing
         # downstream would re-raise it either.  Record it, complete the
         # teardown every rank is inside, then raise at the end.
-        _worker_error: BaseException | None = None
+        _worker_error: BaseException | None = (
+            getattr(self, "_context_error", None) if self.mode != "r" else None)
         _drained_bytes = 0
         _t0 = _time.perf_counter()
         try:
@@ -2599,10 +2644,15 @@ class _FfiBackend(_DatasetGeometry):
             # SIGSEGV that lands in the writer-thread join inside this
             # very call.  A journal whose last line is this one names the
             # ctx handle that died (SLAB_IO_ROOT_CAUSE_AUDIT.md §A/S1).
-            with _journal.op_scope("close", self.path, stack=_J_FFI,
-                                   mode=self.mode, handle=self.fh):
-                self._close_file(self.fh)
-            self.fh = 0
+            try:
+                with _journal.op_scope("close", self.path, stack=_J_FFI,
+                                       mode=self.mode, handle=self.fh):
+                    self._close_file(self.fh)
+            except BaseException as exc:
+                if _worker_error is None:
+                    _worker_error = exc
+            finally:
+                self.fh = 0
             _t_close = _time.perf_counter() - _t0
             if _verbose:
                 print(f"  [SlabIO.close] H5Fclose returned in "
@@ -2620,64 +2670,41 @@ class _FfiBackend(_DatasetGeometry):
         if getattr(self, "_owner_token", None) is not None:
             note_close(self.path, self._owner_token)
             self._owner_token = None
-        # Now that MPI-IO has released the file, rank 0 can safely
-        # reopen with h5py to tack on the deferred small-metadata
-        # datasets (omega_ev and friends) and the deferred dataset
-        # attributes (``k_storage`` and friends).  ONE reopen for both:
-        # they are deferred for the same reason and land in the same
-        # place, and a second open would be a second thing to keep in
-        # step with the barrier below.
-        #
-        # The rank-0 h5py block is gated on the deferred lists; the
-        # BARRIER is not, and must not be.  Those lists are per-rank
-        # Python lists, so gating a collective on them makes the number
-        # of barriers a rank executes depend on that rank's own control
-        # flow — the deadlock shape this audit is looking for.  Today
-        # every ``write_attr`` / ``create_dataset`` call site is SPMD so
-        # the lists are the same everywhere, but that is a property of
-        # the callers, not of this method, and it is not checkable here.
-        # An unconditional barrier costs one rendezvous per file close
-        # and removes the question.
+        from common.collectives import agree_io_error, rank0_transaction
+        from .commit_state import set_commit_state
+
+        # Phase 1: no process may materialize metadata or publish anything
+        # until every process has completed data teardown successfully.
+        attrs, ds_attrs = self._deferred_attrs, self._deferred_ds_attrs
+        self._deferred_attrs, self._deferred_ds_attrs = [], []
+        agree_io_error(_worker_error, path=self.path, stage="SlabIO.data_close")
         deferred_hosts = []
-        if (_worker_error is None
-                and (self._deferred_attrs or self._deferred_ds_attrs)):
-            # A deferred value may be a JAX scalar/array.  Materializing it
-            # can lower communication, so every process does that before the
-            # rank-0 h5py writer gate (INVARIANTS row 21).
-            for name, value in self._deferred_attrs:
-                host = value
-                if not isinstance(host, np.ndarray):
-                    host = np.asarray(jax.device_get(host))
-                deferred_hosts.append((name, host))
-        if (_worker_error is None
-                and (self._deferred_attrs or self._deferred_ds_attrs)
-                and jax.process_index() == 0):
+        dataset_attr_hosts = []
+
+        def _materialize():
+            for name, value in attrs:
+                deferred_hosts.append((name, np.asarray(jax.device_get(value))))
+            for name, values in ds_attrs:
+                dataset_attr_hosts.append((name, {
+                    key: _host_attr_value(value) for key, value in values.items()}))
+
+        def _publish():
+            if self.mode == "r" and not (attrs or ds_attrs):
+                return
             import h5py
             with open_scope(self.path, STACK_H5PY, "a",
                             where="_FfiBackend.close deferred-attr reopen"), \
-                    _journal.op_scope(
-                        "attr_w", self.path, stack=_J_H5PY, mode="a",
-                        cnt=(len(self._deferred_attrs),
-                             len(self._deferred_ds_attrs))), \
+                    _journal.op_scope("attr_w", self.path, stack=_J_H5PY,
+                                      mode="a", cnt=(len(attrs), len(ds_attrs))), \
                     h5py.File(self.path, "a") as h5:
                 for name, host in deferred_hosts:
                     if name in h5:
                         del h5[name]
                     h5.create_dataset(name, data=host)
-                # AFTER the small datasets, because that loop
-                # delete-and-recreates by name and a recreated dataset
-                # would come back stripped of anything stamped first.
-                _apply_dataset_attrs(h5, self._deferred_ds_attrs)
-                # Explicit flush before close: this is the ONE serial-h5py
-                # write onto a file the FFI also drives, so its bytes must
-                # be durable before any rank's next collective open sees
-                # the superblock (audit A1 item 3).
+                _apply_dataset_attrs(h5, dataset_attr_hosts)
+                # Phase 2: all metadata precedes the durable completion bit.
                 h5.flush()
-        # Same reason as the write-ordering barriers above: rank 0 may
-        # have just rewritten datasets in this file with serial h5py, and
-        # no other rank may reopen it until that is durable.
-        _barrier("slab_io_ffi_close_attrs")
-        self._deferred_attrs = []
-        self._deferred_ds_attrs = []
-        if _worker_error is not None:
-            raise _worker_error
+                set_commit_state(h5, True)
+
+        rank0_transaction(self.path, stage="SlabIO.metadata_commit",
+                          validate=_materialize, write=_publish)

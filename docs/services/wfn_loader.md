@@ -80,7 +80,7 @@ for the real one, which is exactly what the deleted shim was.
 | header surface | The `MfHeader` fields (`nkpts`, `nbands`, `nspinor`, `kgrid`, `fft_grid`, `bvec`, …) plus derived `nelec/vbm/cbm/efermi/atom_crys`, same names `WFNReader` exposed. |
 | `trs_holds`, `trs_reference` | 2c occupied-subspace verdict and receipt. `density_symmetry` is a temporary compatibility alias. |
 | `qe_symmetry_binding`, `qe_symmetry_diagnostic` | Authenticated per-operation unitary/antiunitary provenance, or the reason initialization must use and loudly announce the WFN-only fallback. |
-| `close()` / context manager | Releases the h5py handle and the SlabIO handle. |
+| `close()` / context manager | Releases both handles and propagates close failures; only destructor cleanup suppresses, with a diagnostic. |
 
 ## Contract
 

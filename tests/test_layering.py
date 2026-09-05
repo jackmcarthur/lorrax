@@ -166,7 +166,8 @@ _L3_MODULES = frozenset({
     # is which devices a single process owns and which hyperslab each of
     # them holds — process/device/file facts, the same ones
     # ``_slab_io_ffi`` is made of — so it sits beside it and not above it.
-    "file_io.slab_io", "file_io._slab_io_ffi", "file_io._slab_io_serial",
+    "file_io.slab_io", "file_io._slab_io_ffi",
+    "file_io.commit_state", "file_io._slab_io_serial",
     "file_io.paths", "file_io.hdf5_owner", "file_io.h5_journal",
 })
 #: Whole packages at L3.  Two of the three services are here for the same

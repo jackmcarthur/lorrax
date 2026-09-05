@@ -238,12 +238,13 @@ class SlabIO:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        self._backend._context_error = exc
         self.close()
 
     def close(self) -> None:
         """Drain, close collectively, then stamp the deferred metadata.
 
-        COLLECTIVE, and it is four steps rather than one — which is why
+        COLLECTIVE, and it includes global agreement — which is why
         it is the method that shows up in crash reports:
 
         1. drain THIS rank's queued writes.  The FFI writer is
@@ -255,14 +256,14 @@ class SlabIO:
         4. release the :mod:`file_io.hdf5_owner` claim — then RANK 0
            reopens the file with serial h5py to write the deferred
            :meth:`write_attr` datasets and :meth:`stamp_dataset_attrs`
-           attributes, flushes, and every rank meets an unconditional
-           barrier after it.  That reopen is the other HDF5 library
+           attributes after all ranks agree data close succeeded. Rank 0
+           publishes the commit receipt last and broadcasts its verdict.  That reopen is the other HDF5 library
            instance touching this path, and it is legal only because
            step 3 already let go.
 
         A worker-thread exception does NOT skip the teardown.  It is
         recorded, the collective completes on every rank, and it is
-        re-raised at the end (decisions.md 2026-08-04): a rank that
+        reported identically on every rank (decisions.md 2026-08-04): a rank that
         raised out of the middle would leave its peers inside
         ``H5Fclose`` with no message.
 

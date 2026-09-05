@@ -117,10 +117,16 @@ def _immutable_partial_paths(
             f"{final_path.parent}")
     if os.path.lexists(final_path):
         raise FileExistsError(
-            f"immutable {artifact_name} artifact already exists: {final_path}")
+            f"immutable {artifact_name} artifact already exists: {final_path}. "
+            "Choose a new output path with --static-gauge-hall-out "
+            "(static_gauge_hall_file for the consuming deck); preserve the "
+            "completed artifact.")
     if os.path.lexists(partial_path):
         raise FileExistsError(
-            f"stale/in-flight {artifact_name} partial exists: {partial_path}")
+            f"stale/in-flight {artifact_name} partial exists: {partial_path}. "
+            "Verify no writer is live, then move or delete this exact private "
+            f"partial {partial_path} before retrying --static-gauge-hall-out "
+            f"{final_path}; alternatively choose a new output path.")
     return final_path, partial_path
 
 

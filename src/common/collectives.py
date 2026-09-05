@@ -94,6 +94,8 @@ __all__ = [
     "device_count",
     # barriers
     "barrier",
+    "agree_io_error",
+    "rank0_transaction",
     # mesh construction (and the warm-up that must accompany it)
     "resolve_mesh",
     "single_device_mesh",
@@ -1407,3 +1409,82 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
         print_fn(f"[collectives] warmed {len(groups)} MPI cliques for mesh "
                  f"{tuple(mesh.devices.shape)} axes={axes} in {dt*1e3:.0f} ms")
     return dt
+
+
+# Fixed-size control receipts, never tensor payloads.  At P ranks the gather
+# occupies P * 4096 bytes on each host, independent of the artifact's size.
+def _io_error_receipt(error):
+    import json
+    import numpy as np
+
+    receipt = (error is not None, process_rank(),
+               type(error).__name__[:80] if error is not None else '',
+               str(error)[:240] if error is not None else '')
+    data = json.dumps(receipt, ensure_ascii=True).encode('ascii')
+    result = np.zeros(4096, dtype=np.uint8)
+    result[:len(data)] = np.frombuffer(data, dtype=np.uint8)
+    return result
+
+
+def _raise_io_receipts(receipts, *, path, stage):
+    import json
+
+    for data in receipts:
+        failed, rank, kind, message = json.loads(bytes(data).rstrip(b'\0'))
+        if failed:
+            raise RuntimeError(
+                f"GATE io_global_commit: path={path}; stage={stage}; "
+                f"failing rank={rank}; {kind}: {message}. "
+                "Artifact publication refused; inspect this private artifact "
+                "and rebuild in a new run directory.")
+
+
+def agree_io_error(error, *, path, stage):
+    """Raise the same bounded I/O failure on every rank after local teardown.
+
+    Parameters
+    ----------
+    error : BaseException or None
+        This rank's error; all ranks must call even when locally successful.
+    path : path-like
+        Replicated artifact path, retained verbatim in the refusal.
+    stage : str
+        Replicated action name. The lowest failing rank supplies the error.
+    """
+    receipts = all_gather_processes(_io_error_receipt(error))
+    _raise_io_receipts(receipts, path=path, stage=stage)
+
+
+def rank0_transaction(path, *, stage, write, validate=None):
+    """Validate on all ranks, perform serial I/O, then broadcast its verdict.
+
+    Parameters
+    ----------
+    path : path-like
+        Replicated destination, named in every rank's failure.
+    stage : str
+        Replicated transaction name.
+    write : callable
+        Rank-0-only filesystem action. Must contain no physics collectives.
+    validate : callable, optional
+        Preflight called on every rank before mutation. Materialize replicated
+        JAX metadata here, never inside ``write``. No tensor is gathered here.
+    """
+    if validate is not None:
+        error = None
+        try:
+            validate()
+        except BaseException as exc:
+            error = exc
+        agree_io_error(error, path=path, stage=f'{stage}/preflight')
+    error = None
+    if process_rank() == 0:
+        try:
+            write()
+        except BaseException as exc:
+            error = exc
+    receipt = _io_error_receipt(error)
+    if process_count() > 1:
+        from jax.experimental import multihost_utils as mh
+        receipt = mh.broadcast_one_to_all(receipt, is_source=process_rank() == 0)
+    _raise_io_receipts([receipt], path=path, stage=stage)
