@@ -3215,6 +3215,75 @@ def _resolve_parent_green_admission(
 	)
 
 
+def _prepare_parent_wavefunction_plan(
+	cfg, meta, wfn, band_slices, *, sym, centroid_indices, mesh_xy,
+	print_fn=print,
+):
+	"""Build the shared parent plan before fit-specific memory planning.
+
+	Returns
+	-------
+	plan : CentroidKUnfoldPlan or None
+	    Exact transport in the run's centroid basis, or the named full-k fallback.
+	green_candidate : bool
+	    Whether Green contraction meets its measured hardware/work policy.
+	parents_only_wanted : bool
+	    Whether every wavefunction consumer can use raw-parent storage.
+	"""
+	green_candidate, work_ok = (
+		_resolve_parent_green_admission(
+			cfg, meta, wfn, band_slices,
+			backend=jax.default_backend(), print_fn=print_fn))
+	can_use_parents = (
+		bool(cfg.memory.low_mem_bands)
+		and not bool(cfg.bispinor)
+		and int(meta.nspinor) in (1, 2)
+		and int(wfn.nkpts) < int(meta.nk_tot))
+	# Parents-only ψ storage: when every wavefunction consumer of
+	# this run is parent-capable, the full-k centroid faces are
+	# never formed and the raw parents are the run's only ψ.  Each
+	# consumer that still reads full-k faces keeps the run on full k
+	# and is named in the log.
+	blockers = (
+		_parents_only_consumer_blockers(cfg)
+		if can_use_parents else [])
+	parents_only_wanted = (
+		can_use_parents and not blockers)
+	if can_use_parents and blockers:
+		print_fn("  ψ storage: full-k faces kept because "
+		       + "; ".join(blockers) + ".")
+	if (bool(cfg.memory.low_mem_bands)
+			and bool(cfg.compute_mode.needs_screening)
+			and int(wfn.nkpts) < int(meta.nk_tot)
+			and not work_ok
+			and not parents_only_wanted):
+		avoided = (int(band_slices.nb_full)
+			* (int(meta.nk_tot) - int(wfn.nkpts))
+			/ int(meta.nk_tot))
+		print_fn(
+			"  Parent-k Green contraction inactive: shape "
+			f"(full k={int(meta.nk_tot)}, parent k={int(wfn.nkpts)}, "
+			f"bands={int(band_slices.nb_full)}, avoided-band score="
+			f"{avoided:.1f}) is outside the measured safe envelope "
+			"(at least 2x k reduction and score >= 3.5); using full k.")
+	plan = None
+	if can_use_parents:
+		from .centroid_k_unfold import build_centroid_k_unfold_plan
+		try:
+			plan = build_centroid_k_unfold_plan(
+				sym, centroid_indices, meta.fft_grid, mesh_xy,
+				nspinor=int(meta.nspinor),
+				parent_k_frac=wfn.kvecs(k='ibz'),
+				layout=meta.mu_basis.layout)
+		except ValueError as plan_error:
+			print_fn(
+				"  Parent-k contraction inactive (Green and ζ fit): "
+				"the centroid basis cannot form an exact orbit-local "
+				f"plan ({plan_error}); using the full-k path.")
+			plan = None
+	return plan, green_candidate, parents_only_wanted
+
+
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
 	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None,
@@ -3326,58 +3395,12 @@ def prepare_isdf_and_wavefunctions(
 			# reports/parent_k_zq_construction_2026-09-02).  Both routes share
 			# ONE plan and ONE pair of packed parent faces.
 			_parent_zeta_plan = None
-			_parent_green_candidate, _parent_green_work_ok = (
-				_resolve_parent_green_admission(
-					cfg, meta, wfn, band_slices,
-					backend=jax.default_backend(), print_fn=print0))
-			_parent_plan_wanted = (
-				bool(cfg.memory.low_mem_bands)
-				and not bool(cfg.bispinor)
-				and int(meta.nspinor) in (1, 2)
-				and int(wfn.nkpts) < int(meta.nk_tot))
-			# Parents-only ψ storage: when every wavefunction consumer of
-			# this run is parent-capable, the full-k centroid faces are
-			# never formed and the raw parents are the run's only ψ.  Each
-			# consumer that still reads full-k faces keeps the run on full k
-			# and is named in the log.
+			(_candidate_plan, _parent_green_candidate,
+			 _parents_only_wanted) = _prepare_parent_wavefunction_plan(
+				cfg, meta, wfn, band_slices, sym=sym,
+				centroid_indices=centroid_indices, mesh_xy=mesh_xy,
+				print_fn=print0)
 			_parents_only = False
-			_parents_only_blockers = (
-				_parents_only_consumer_blockers(cfg)
-				if _parent_plan_wanted else [])
-			_parents_only_wanted = (
-				_parent_plan_wanted and not _parents_only_blockers)
-			if _parent_plan_wanted and _parents_only_blockers:
-				print0("  ψ storage: full-k faces kept because "
-				       + "; ".join(_parents_only_blockers) + ".")
-			if (bool(cfg.memory.low_mem_bands)
-					and bool(cfg.compute_mode.needs_screening)
-					and int(wfn.nkpts) < int(meta.nk_tot)
-					and not _parent_green_work_ok
-					and not _parents_only_wanted):
-				_avoided = (int(band_slices.nb_full)
-					* (int(meta.nk_tot) - int(wfn.nkpts))
-					/ int(meta.nk_tot))
-				print0(
-					"  Parent-k Green contraction inactive: shape "
-					f"(full k={int(meta.nk_tot)}, parent k={int(wfn.nkpts)}, "
-					f"bands={int(band_slices.nb_full)}, avoided-band score="
-					f"{_avoided:.1f}) is outside the measured safe envelope "
-					"(at least 2x k reduction and score >= 3.5); using full k.")
-			_candidate_plan = None
-			if _parent_plan_wanted:
-				from .centroid_k_unfold import build_centroid_k_unfold_plan
-				try:
-					_candidate_plan = build_centroid_k_unfold_plan(
-						sym, centroid_indices, meta.fft_grid, mesh_xy,
-						nspinor=int(meta.nspinor),
-						parent_k_frac=wfn.kvecs(k='ibz'),
-						layout=meta.mu_basis.layout)
-				except ValueError as _parent_plan_error:
-					print0(
-						"  Parent-k contraction inactive (Green and ζ fit): "
-						"the centroid basis cannot form an exact orbit-local "
-						f"plan ({_parent_plan_error}); using the full-k path.")
-					_candidate_plan = None
 			# Plan chunks ONCE for a channel that will actually FIT.  The
 			# canonical planner still owns band/r/q/G-flat chunks, P_min and
 			# the binding-stage report; a proven reuse bypasses that fit-only
