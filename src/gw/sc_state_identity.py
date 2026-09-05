@@ -6,7 +6,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
-                       trusted_mask, *, degeneracy_tol_ev):
+                       trusted_mask, *, degeneracy_tol_ev, priority_mask=None):
     """Match QP states to fixed map-0 multiplets without sorting identities.
 
     Parameters
@@ -43,7 +43,10 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
     At an accidental degeneracy shared by distinct reference multiplets,
     capacity slots can divide that eigenspace; its members have the same
     energy and are reported only through their reference-block means.
-    No array returned here is an input to the Hamiltonian map.
+    The SC map uses assignments to classify state energies in reference
+    coordinates. Output energies remain exact-multiplet means for readout.
+    ``priority_mask``, when supplied, reserves the original trusted labels'
+    optimal assignment before newly tracked labels take the remaining columns.
     """
     u0, u = np.asarray(reference_u), np.asarray(current_u)
     e0, e = np.asarray(reference_e_ev), np.asarray(current_e_ev)
@@ -57,6 +60,8 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
     if not all(np.isfinite(a).all() for a in (u0, u, e0, e)):
         raise ValueError('SC identity: non-finite rotation or spectrum')
     mask = np.broadcast_to(mask, e.shape)
+    priority = (mask if priority_mask is None else
+                np.broadcast_to(np.asarray(priority_mask, dtype=bool), e.shape) & mask)
     indices = np.full(e.shape, -1, dtype=int)
     blocks = np.full(e.shape, -1, dtype=int)
     energies = np.full(e.shape, np.nan)
@@ -83,8 +88,20 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
         for group in current_groups:
             if len(group) > 1:
                 score[:, group] = score[:, group].mean(axis=1, keepdims=True)
-        rows, columns = linear_sum_assignment(score, maximize=True)
-        assigned = columns[np.argsort(rows)]
+        # Keep established readout identities' original optimization intact.
+        # Newly tracked labels receive the remaining columns; admitting a
+        # state must not relabel an already reported multiplet.
+        first = np.flatnonzero(priority[k, labels])
+        later = np.flatnonzero(~priority[k, labels])
+        assigned = np.empty(len(labels), dtype=int)
+        available = np.arange(e.shape[1])
+        for selected in (first, later):
+            if not selected.size:
+                continue
+            rows, columns = linear_sum_assignment(
+                score[np.ix_(selected, available)], maximize=True)
+            assigned[selected[rows]] = available[columns]
+            available = np.setdiff1d(available, available[columns])
         for group, rows in selected_groups:
             members = np.sort(assigned[rows])
             indices[k, group] = members

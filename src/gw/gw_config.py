@@ -5228,18 +5228,30 @@ class LorraxConfig:
             n = int(np.floor(
                 (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev
                 + 0.5)) + 1
-            return (p.omega_min_ev
+            grid = (p.omega_min_ev
                     + p.omega_step_ev * np.arange(n, dtype=np.float64))
-        pieces = []
-        for lo, hi in patches:
-            n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
-            pieces.append(lo + p.omega_step_ev * np.arange(
-                n, dtype=np.float64))
-        grid = np.concatenate(pieces)
+        else:
+            pieces = []
+            for lo, hi in patches:
+                n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
+                pieces.append(lo + p.omega_step_ev * np.arange(
+                    n, dtype=np.float64))
+            grid = np.concatenate(pieces)
         if np.any(np.diff(grid) <= 0.0):
             raise ValueError(
                 "sigma_omega_patches_ev produced a non-increasing grid; "
                 "patches must be ascending and disjoint")
+        if self.qp_solver is QPSolver.SELF_CONSISTENT:
+            from .scissor import sc_padded_window_ev
+            lo, hi = sc_padded_window_ev(grid[0], grid[-1])
+            n_lower = int(np.ceil((grid[0] - lo) / p.omega_step_ev))
+            n_upper = int(np.ceil((hi - grid[-1]) / p.omega_step_ev))
+            # Preserve every requested sample exactly. Padding adds support;
+            # sigma.omega_min/max remain the classification window.
+            grid = np.concatenate((
+                grid[0] - p.omega_step_ev * np.arange(n_lower, 0, -1),
+                grid,
+                grid[-1] + p.omega_step_ev * np.arange(1, n_upper + 1)))
         return grid
 
     @property

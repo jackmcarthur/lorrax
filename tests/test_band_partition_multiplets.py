@@ -12,10 +12,8 @@ degenerate manifold the band label is arbitrary, so the answer starts depending
 on the eigensolver's ordering, and the result is ``eigh``'d and reported as QP
 energies.
 
-MEASURED on the only committed SC deck (``gnppm_debug``): **no boundary splits
-a multiplet**, so the promotion is a no-op there and every output is
-byte-identical.  These cells therefore carry the whole burden of proving the
-promotion works, because no in-tree deck exercises it.
+The reference multiplets close independently at each k. These synthetic
+cells exercise protection, absolute-band offsets and exact tolerances.
 """
 from __future__ import annotations
 
@@ -52,10 +50,10 @@ def test_a_split_multiplet_is_reported():
     part = _partition([False, False, True, True, False, False, False])
     lines = []
     n, worst = part.report_multiplet_splits(_ladder(), 0, print_fn=lines.append)
-    assert n == 1, (n, lines)
+    assert n == 4, (n, lines)
     assert worst == pytest.approx(0.0, abs=1e-9)
-    assert any("CUT A DEGENERATE MULTIPLET" in ln for ln in lines)
-    assert any("absolute 4" in ln for ln in lines)
+    assert all("multiplet split at k=" in ln for ln in lines)
+    assert any("bands 4/5" in ln for ln in lines)
 
 
 def test_a_clean_partition_reports_no_split():
@@ -74,7 +72,7 @@ def test_the_promotion_grows_the_mask_to_the_whole_multiplet():
     part = _partition([False, False, True, True, False, False, False])
     out = part.promoted_to_multiplets(_ladder(), 0, print_fn=lambda *_: None)
     got = np.asarray(out.protected_mask)
-    assert got.tolist() == [False, False, True, True, True, False, False], got
+    assert got.tolist() == [[False, False, True, True, True, False, False]] * 4, got
 
 
 def test_the_promotion_GROWS_and_never_shrinks():
@@ -82,8 +80,8 @@ def test_the_promotion_GROWS_and_never_shrinks():
 
     Dropping the protected member would remove off-diagonal Σ from a band the
     ω-grid actually covers — a loss of physics to buy the same invariance.
-    Growing admits a band whose Σ is edge-clamped, which is visible and is
-    what ``warn_if_protected_outside_grid`` is for.
+    Growing can admit a band outside the requested window; quadrature
+    support must cover every protected member.
     """
     for mask in ([False, False, True, False, False, False, False],
                  [False, False, False, False, True, False, False],
@@ -108,7 +106,7 @@ def test_a_clean_mask_is_left_exactly_alone():
     mask = [False, False, True, True, True, False, False]
     part = _partition(mask)
     out = part.promoted_to_multiplets(_ladder(), 0, print_fn=lambda *_: None)
-    assert np.asarray(out.protected_mask).tolist() == mask
+    assert np.asarray(out.protected_mask).tolist() == [mask] * 4
 
 
 def test_in_range_mask_is_NOT_promoted():
@@ -121,7 +119,7 @@ def test_in_range_mask_is_NOT_promoted():
     part = _partition([False, False, True, False, False, False, False])
     out = part.promoted_to_multiplets(_ladder(), 0, print_fn=lambda *_: None)
     assert np.array_equal(np.asarray(out.in_range_mask),
-                          np.asarray(part.in_range_mask))
+                          np.broadcast_to(part.in_range_mask, (4, 7)))
     assert not np.array_equal(np.asarray(out.protected_mask),
                               np.asarray(out.in_range_mask))
 
@@ -137,26 +135,29 @@ def test_band_offset_maps_the_active_window_onto_absolute_bands():
     part = _partition(active)
     lines = []
     n, _ = part.report_multiplet_splits(_ladder(), 2, print_fn=lines.append)
-    assert n == 1, lines
-    assert any("active band 1 (absolute 3)" in ln for ln in lines)
+    assert n == 4, lines
+    assert any("bands 3/4" in ln for ln in lines)
     out = np.asarray(part.promoted_to_multiplets(
         _ladder(), 2, print_fn=lambda *_: None).protected_mask)
-    assert out.tolist() == [True, True, True, False, False], out
+    assert out.tolist() == [[True, True, True, False, False]] * 4, out
 
 
-def test_the_report_demands_the_untruncated_ladder():
-    """It passes ``is_full_spectrum=True``, so a window would be a lie.
+def test_full_reference_ladder_detects_an_active_window_cut():
+    """A protected partner beyond the active extent must not be hidden."""
+    part = _partition([False, False, True, True])
+    with pytest.raises(ValueError, match="crosses the active window"):
+        part.promoted_to_multiplets(_ladder(), 0, print_fn=lambda _: None)
 
-    Pinned because the whole reason ``boundary_min_gaps`` grew that argument
-    is that handed a window it returns +inf at the outer edge and cannot see
-    the cut that produced it.  A caller here that started passing
-    ``e_dft_active_kn_ry`` would silently stop checking the top boundary.
-    """
-    import ast
-    import inspect
-    src = inspect.getsource(BandPartition.report_multiplet_splits)
-    tree = ast.parse(src.lstrip().replace("\n    ", "\n"))
-    calls = [ast.unparse(n) for n in ast.walk(tree)
-             if isinstance(n, ast.Call)
-             and "boundary_min_gaps" in ast.unparse(n.func)]
-    assert calls and all("is_full_spectrum=True" in c for c in calls), calls
+
+def test_sc_exact_tolerance_preserves_a_resolved_reference_splitting():
+    from common.units import RYD_TO_EV
+
+    e = np.array([[0., 0.0005, 2.]]) / RYD_TO_EV
+    part = _partition([True, False, False])
+    default = part.promoted_to_multiplets(e, 0, print_fn=lambda _: None)
+    exact = part.promoted_to_multiplets(
+        e, 0, degeneracy_tol_ev=1e-5, print_fn=lambda _: None)
+    np.testing.assert_array_equal(default.protected_mask, [[True, True, False]])
+    np.testing.assert_array_equal(exact.protected_mask, [[True, False, False]])
+    assert part.report_multiplet_splits(
+        e, 0, degeneracy_tol_ev=1e-5, print_fn=lambda _: None)[0] == 0

@@ -34,6 +34,7 @@ from common.units import RYD_TO_EV
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaWindow
+from gw.scissor import sc_state_pad_ev
 from minimax import (
     UniformRule,
     box_samples,
@@ -45,7 +46,6 @@ from minimax import (
 _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
-_SC_STATE_PAD_EV = 2.0
 _SC_POLE_PAD_FRACTION = 0.10
 
 
@@ -644,7 +644,9 @@ def _box_escape_reasons(outer, inner):
 def _sc_padded_box_spec(spec, eta):
     """Return the iteration-1 SC certificate box required by policy.
 
-    State drift gets 2 eV on the movable real edge(s).  Pole drift is
+    State drift uses the classification pad on the movable real edge(s).
+    Branch state energies already measure distance from mu; take the largest
+    allowance in this product window so every state is covered. Pole drift is
     covered independently by widening every real and imaginary pole extent
     by ten percent before recomputing the denominator box.
     """
@@ -665,7 +667,9 @@ def _sc_padded_box_spec(spec, eta):
         min(spec["box"][2], pole_box[2]),
         max(spec["box"][3], pole_box[3]),
     ]
-    state_pad_ry = _SC_STATE_PAD_EV / RYD_TO_EV
+    state_pad_ev = float(np.max(sc_state_pad_ev(
+        np.asarray(spec["states"]) * RYD_TO_EV)))
+    state_pad_ry = state_pad_ev / RYD_TO_EV
     if spec["kind"] in ("crossing", "sign_definite_negative"):
         box[0] -= state_pad_ry
     if spec["kind"] in ("crossing", "sign_definite_positive"):
@@ -688,7 +692,7 @@ def _sc_padded_box_spec(spec, eta):
         "sign_definite_positive" if box[0] > 0.0 else
         "sign_definite_negative" if box[1] < 0.0 else "crossing")
     padded["sc_unpadded_box"] = tuple(spec["box"])
-    padded["sc_state_pad_ev"] = _SC_STATE_PAD_EV
+    padded["sc_state_pad_ev"] = state_pad_ev
     padded["sc_pole_pad_fraction"] = _SC_POLE_PAD_FRACTION
     if not _box_contains(padded["box"], spec["box"]):
         raise RuntimeError(
@@ -1128,7 +1132,9 @@ def plan_sigma_windows(
                 fixed_receipt.get("rebuild_count_total", 0)),
             "sc_fixed_initial_window_tau_pairs": int(
                 fixed_rule_session["initial_window_tau_pairs"]),
-            "sc_state_edge_padding_ev": _SC_STATE_PAD_EV,
+            "sc_state_edge_padding_ev": max(
+                (float(np.max(sc_state_pad_ev(spec["states"] * RYD_TO_EV)))
+                 for spec in specs), default=0.0),
             "sc_pole_extent_padding_fraction": _SC_POLE_PAD_FRACTION,
         })
     else:

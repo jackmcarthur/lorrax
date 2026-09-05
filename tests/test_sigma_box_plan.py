@@ -277,7 +277,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
     _, subset_geometry = plan_sigma_windows(
-        _summaries(), [_branch_at((0.1, 0.2))],
+        _summaries(), [_branch_at((0.1, 0.12))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     assert calls == []
     _, restored_geometry = plan_sigma_windows(
@@ -334,7 +334,7 @@ def test_sc_fixed_session_rebuilds_a_window_absent_from_iteration_one(
     assert geometry["sc_fixed_total_rebuild_count"] == rebuilt
 
 
-def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
+def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
     eta = 0.1
     spec = make_sigma_box_spec(
         name="crossing", frequencies=(-2.0, 2.0), states=(-0.2, 0.2),
@@ -346,14 +346,15 @@ def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
     pole_box, _, _ = _box_for_window(
         spec["frequencies"], spec["states"], expanded_poles,
         spec["pole_sign"], eta)
+    pad_ev = 0.5 + 0.10 * (0.2 * RYD_TO_EV)
     expected = (
-        min(spec["box"][0], pole_box[0]) - 2.0 / RYD_TO_EV,
-        max(spec["box"][1], pole_box[1]) + 2.0 / RYD_TO_EV,
+        min(spec["box"][0], pole_box[0]) - pad_ev / RYD_TO_EV,
+        max(spec["box"][1], pole_box[1]) + pad_ev / RYD_TO_EV,
         min(spec["box"][2], pole_box[2]),
         max(spec["box"][3], pole_box[3]),
     )
     np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
-    assert padded["sc_state_pad_ev"] == 2.0
+    assert padded["sc_state_pad_ev"] == pad_ev
     assert padded["sc_pole_pad_fraction"] == 0.10
 
 

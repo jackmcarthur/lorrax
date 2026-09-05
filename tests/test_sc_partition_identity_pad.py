@@ -1,0 +1,131 @@
+"""Identity classification, local multiplets and shared SC pad contracts."""
+import numpy as np
+import jax.numpy as jnp
+import pytest
+
+from common.units import RYD_TO_EV
+from gw.band_partition import BandPartition, apply_band_partition, build_omega_band_partition
+from gw.sc_state_identity import assign_qp_identity
+from gw.scissor import sc_state_pad_ev
+
+
+def _partition(energy_ev, reference_ev, *, previous=None, indices=None, log=None):
+    return build_omega_band_partition(
+        np.asarray(energy_ev) / RYD_TO_EV,
+        np.asarray(reference_ev) / RYD_TO_EV,
+        band_offset=0, omega_min_abs_ev=-2.0, omega_max_abs_ev=5.0,
+        previous_partition=previous, mu_ev=0.0,
+        current_indices_kn=indices, print_fn=(log.append if log is not None else lambda _: None))
+
+
+@pytest.mark.parametrize('energy,pad', [(0.0, 0.5), (5.0, 1.0), (20.0, 2.5)])
+def test_pad_sizes(energy, pad):
+    assert sc_state_pad_ev(energy) == pytest.approx(pad)
+    assert sc_state_pad_ev(-energy) == pytest.approx(pad)
+
+
+def test_hysteresis_enter_retain_escape():
+    reference = np.array([[0.0, 4.9], [0.0, 5.1]])
+    outside = _partition(reference, reference)
+    assert not np.asarray(outside.protected_mask)[:, 1].any()
+    entered_e = np.array([[0.0, 4.9], [0.0, 5.0]])
+    entered = _partition(entered_e, reference, previous=outside)
+    assert np.asarray(entered.protected_mask)[:, 1].all()
+    retained_e = np.array([[0.0, 5.9], [0.0, 6.0]])
+    retained = _partition(retained_e, reference, previous=entered)
+    assert np.asarray(retained.protected_mask)[:, 1].all()
+    assert not np.asarray(retained.in_range_mask)[:, 1].any()
+    log = []
+    escaped_e = np.array([[0.0, 5.9], [0.0, 6.2]])
+    escaped = _partition(escaped_e, reference, previous=retained, log=log)
+    assert not np.asarray(escaped.protected_mask)[:, 1].any()
+    assert any('escape: band=2, k=1' in line and 'pad=1.120000' in line for line in log)
+    h = jnp.asarray([[[1., .2], [.2, 7.]], [[1., .2], [.2, 8.]]])
+    kept = apply_band_partition(h, protected_mask=retained.protected_mask,
+                               in_range_mask=retained.in_range_mask,
+                               scissor_E_qp_kn=jnp.zeros((2, 2)))
+    np.testing.assert_array_equal(kept, h)
+
+
+def test_reference_multiplets_close_per_k_without_transitive_union():
+    # Labels 1/2 share a multiplet only at k=0; 2/3 only at k=1.
+    reference = np.array([[0., 0., 8.], [0., 8., 8.]])
+    part = _partition(reference, reference)
+    np.testing.assert_array_equal(part.protected_mask,
+                                  [[True, True, False], [True, False, False]])
+
+
+def test_crossing_scissored_doublet_preserves_protected_identity_block():
+    # A spectator plus protected singlet below the window edge; the tail
+    # doublet crosses the singlet only at k=1. Carry coordinates stay DFT.
+    reference = np.array([[0., 4., 7., 7.], [0., 4., 7., 7.]])
+    identity_e = np.array([[0., 4., 7., 7.], [0., 4., 3., 3.]])
+    order = np.argsort(identity_e, axis=1, kind='stable')
+    u0 = np.broadcast_to(np.eye(4), (2, 4, 4)).copy()
+    u = np.stack([u0[k][:, order[k]] for k in range(2)])
+    sorted_e = np.take_along_axis(identity_e, order, axis=1)
+    indices, aligned_e, _, _ = assign_qp_identity(
+        u0, reference, u, sorted_e, np.ones((2, 4), bool), degeneracy_tol_ev=1e-5)
+    log = []
+    part = _partition(aligned_e, reference, indices=indices, log=log)
+    np.testing.assert_array_equal(part.protected_mask,
+                                  [[True, True, False, False]] * 2)
+    assert any('k=1:' in line and 'sorted columns=[1, 4]' in line for line in log)
+    h = np.broadcast_to(np.diag([1., 5., 9., 9.]), (2, 4, 4)).copy()
+    h[:, 0, 1] = h[:, 1, 0] = .25
+    h[:, 1, 2] = h[:, 2, 1] = .75
+    result = np.asarray(apply_band_partition(
+        jnp.asarray(h), protected_mask=part.protected_mask,
+        in_range_mask=part.in_range_mask,
+        scissor_E_qp_kn=jnp.asarray([[1., 5., 10., 10.]] * 2)))
+    np.testing.assert_array_equal(result[:, 0, 1], [.25, .25])
+    np.testing.assert_array_equal(result[:, 1, 2], [0., 0.])
+    # Red twin: substituting sorted-column masks on the DFT carry drops
+    # the physical protected coupling at precisely the crossing k.
+    wrong_mask = np.array([[True, True, False, False],
+                           [True, False, False, True]])
+    wrong = np.asarray(apply_band_partition(
+        jnp.asarray(h), protected_mask=jnp.asarray(wrong_mask),
+        in_range_mask=jnp.asarray(wrong_mask),
+        scissor_E_qp_kn=jnp.asarray([[1., 5., 10., 10.]] * 2)))
+    assert wrong[0, 0, 1] == pytest.approx(.25)
+    assert wrong[1, 0, 1] == 0.0
+    assert not np.array_equal(wrong, result)
+    # In sorted coordinates the same retained coupling has moved to column 4.
+    sorted_result = u.conj().transpose(0, 2, 1) @ result @ u
+    assert sorted_result[1, 0, 3] == pytest.approx(.25)
+    np.testing.assert_array_equal(sorted_result[1, 0, 1:3], [0., 0.])
+
+
+def test_sampled_grid_covers_entire_energy_dependent_hysteresis():
+    from types import SimpleNamespace
+    from gw.gw_config import LorraxConfig, QPSolver
+    from gw.scissor import sc_padded_window_ev
+    sigma = SimpleNamespace(omega_min_ev=-2., omega_max_ev=5.,
+                            omega_step_ev=.25, parsed_omega_patches_ev=lambda: [])
+    cfg = SimpleNamespace(sigma=sigma, qp_solver=QPSolver.SELF_CONSISTENT)
+    sampled = LorraxConfig.omega_grid_ev.fget(cfg)
+    lo, hi = sc_padded_window_ev(-2., 5.)
+    assert lo == pytest.approx(-2.5 / .9)
+    assert hi == pytest.approx(5.5 / .9)
+    assert hi - sc_state_pad_ev(hi) == pytest.approx(5.)
+    assert sampled[0] <= lo and sampled[-1] >= hi
+    original = -2. + .25 * np.arange(29)
+    np.testing.assert_array_equal(sampled[(sampled >= -2.) & (sampled <= 5.)], original)
+    cfg.qp_solver = QPSolver.ONE_SHOT_DFT
+    np.testing.assert_array_equal(LorraxConfig.omega_grid_ev.fget(cfg), original)
+
+
+def test_identity_priority_preserves_established_readout_assignment():
+    rng = np.random.default_rng(74)
+    reference = np.eye(5)[None]
+    current = np.linalg.qr(rng.normal(size=(5, 5)))[0][None]
+    energy = np.arange(5.)[None]
+    trusted = np.array([True, True, False, False, False])
+    old, _, _, _ = assign_qp_identity(reference, energy, current, energy,
+                                     trusted, degeneracy_tol_ev=1e-4)
+    extended, _, _, _ = assign_qp_identity(
+        reference, energy, current, energy, np.ones(5, bool),
+        priority_mask=trusted, degeneracy_tol_ev=1e-4)
+    np.testing.assert_array_equal(extended[:, trusted], old[:, trusted])
+    np.testing.assert_array_equal(np.sort(extended, axis=1), [np.arange(5)])

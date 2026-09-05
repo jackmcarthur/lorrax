@@ -322,6 +322,42 @@ def apply_conduction_scissor_to_tail(
 # Per-band in-grid classification
 # ---------------------------------------------------------------------------
 
+_SC_PAD_BASE_EV = 0.5
+_SC_PAD_FRACTION = 0.10
+
+
+def sc_state_pad_ev(energy_relative_to_mu_ev):
+    """Energy drift allowance shared by SC classification and quadrature.
+
+    Parameters
+    ----------
+    energy_relative_to_mu_ev : array_like
+        Host state energies E - mu in eV, of any shape.
+
+    Returns
+    -------
+    ndarray
+        Pad in eV with the input shape: 0.5 + 0.10 * abs(E - mu).
+        The constant covers near-Fermi trial motion; the proportional term
+        covers the roughly ten-percent spectral stretch measured on Na.
+    """
+    return _SC_PAD_BASE_EV + _SC_PAD_FRACTION * np.abs(
+        np.asarray(energy_relative_to_mu_ev, dtype=np.float64))
+
+
+def sc_padded_window_ev(lower_ev, upper_ev):
+    """Outer energies satisfying E >= lo-pad(E), E <= hi+pad(E).
+
+    Bounds and returned scalars are relative to mu, in eV. Solving these
+    inequalities covers the entire hysteresis region, including the extra
+    allowance gained as a state moves away from mu.
+    """
+    lower = float(lower_ev) - _SC_PAD_BASE_EV
+    upper = float(upper_ev) + _SC_PAD_BASE_EV
+    return (lower / (1.0 + _SC_PAD_FRACTION * np.sign(lower)),
+            upper / (1.0 - _SC_PAD_FRACTION * np.sign(upper)))
+
+
 def classify_bands_in_grid(
     E_kn_ev: np.ndarray,
     omega_min_ev: float,

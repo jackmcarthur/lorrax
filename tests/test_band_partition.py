@@ -10,8 +10,8 @@ Synthetic ``H_full`` constructions exercise:
 3. **Scissor override on out-of-range diagonals** — non-protected
    bands flagged out-of-range take the supplied ``scissor_E_qp_kn``
    diagonal; in-range bands keep ``H_full``'s diagonal.
-4. **All-caps warning** — fires when a protected band leaks outside
-   the ω-grid range.
+4. **Support reporting** — names protected states outside the requested
+   window without claiming a quadrature coverage failure.
 """
 from __future__ import annotations
 
@@ -110,8 +110,8 @@ def test_warn_on_protected_out_of_grid():
     buf = io.StringIO()
     part.warn_if_protected_outside_grid(print_fn=lambda *a, **k: print(*a, file=buf, **k))
     msg = buf.getvalue()
-    assert "WARNING" in msg
-    assert "1 PROTECTED BANDS" in msg or "1 of" in msg.lower()
+    assert "1 protected (k,state) members outside" in msg
+    assert "quadrature support must cover them" in msg
 
 
 def test_no_warning_when_all_protected_in_range():
@@ -148,7 +148,7 @@ def test_reanchored_partition_hysteresis_breaks_edge_band_two_cycle():
         offdiagonals.append(float(h_next[0, 0, 1] * RYD_TO_EV))
         previous = partition
 
-    assert masks == [[1, 1]] * 6
+    assert masks == [[[1, 1]]] * 6
     np.testing.assert_allclose(uppers, [1.061267292017] * 6, atol=1e-12)
     np.testing.assert_allclose(offdiagonals, [0.2] * 6, atol=1e-14)
 
@@ -160,4 +160,4 @@ def test_reanchored_partition_hysteresis_breaks_edge_band_two_cycle():
         band_offset=0, omega_min_abs_ev=-1.0, omega_max_abs_ev=1.0,
         previous_partition=previous, hysteresis_margin_ev=0.125,
         print_fn=lambda *_args: None)
-    np.testing.assert_array_equal(drifted.protected_mask, [True, False])
+    np.testing.assert_array_equal(drifted.protected_mask, [[True, False]])

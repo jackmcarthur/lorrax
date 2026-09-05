@@ -832,7 +832,7 @@ def compute_sigma_c_mpa_omega_grid(
                     f"pair_cost={geometry['window_tau_pairs']}, "
                     f"initial_pair_cost="
                     f"{geometry['sc_fixed_initial_window_tau_pairs']}, "
-                    f"state_pad={geometry['sc_state_edge_padding_ev']:.1f} eV, "
+                    f"max_state_pad={geometry['sc_state_edge_padding_ev']:.3f} eV (energy-proportional), "
                     f"pole_pad="
                     f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}%")
             for branch in geometry["branches"]:
