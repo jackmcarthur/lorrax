@@ -578,11 +578,8 @@ def _get_sigma_kij_kernel(
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
-    # Parent route: the whole dynamic chain runs in PACKED centroid order.
-    # G is unfolded to packed full k (no per-node canonical restore, which
-    # cost four all-to-all exchanges per τ node on Si), W's residues are
-    # packed once by the caller, and the projection uses the packed parent
-    # faces.  The static kernels keep the canonical order.
+    # G, W and projection faces share the run's packed centroid order,
+    # as in the static kernels. Pole batches convert only at the store seam.
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
         layout=layout, face_shape=face_shape,

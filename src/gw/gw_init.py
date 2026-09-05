@@ -3225,6 +3225,9 @@ def _prepare_parent_wavefunction_plan(
 ):
 	"""Build the shared parent plan before fit-specific memory planning.
 
+	``centroid_indices`` is the host canonical ``(n_mu, 3)`` integer FFT-grid
+	table. The returned plan acts on the mesh-sharded packed runtime basis.
+
 	Returns
 	-------
 	plan : CentroidKUnfoldPlan or None
