@@ -209,10 +209,12 @@ is richer. Bi (bispinor) and Na are the pending cases.
 
 **12. Quadrature rules are frozen across maps** (2026-09-03). The first map
 plans and certifies one rule per product window on the window's box padded by
-`sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and refuse
-rather than rebuild if a state leaves its padded box. One-shot results are
-bit-identical with and without the freeze. The eqp1 file is written from the
-converged map.
+`sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and, when
+a state leaves its padded box or a window appears that iteration 1 did not
+have, rebuild that rule on the escaped box with the same padding
+(`rebuild:sc-fixed`, counted in the geometry receipt and printed per map;
+main 0cfaf059). One-shot results are bit-identical with and without the
+freeze. The eqp1 file is written from the converged map.
 
 **13. Map gain is a diagnostic, not a controller.** From map 2 onward the
 driver prints `SC map gain: max |dSigma_on-shell| / max |dE_in| = ...`, using
@@ -240,6 +242,21 @@ On metals a local gain above 1 can remain at Fermi-crossing states, where the
 exchange term responds to an occupation flip under the smearing width; that is
 the physics of the map, not the accelerator, and is read from pitfall 13's
 line.
+
+**15. The fixed-SC rules are accepted above eps, and the log says so.** The
+one-shot planner refuses a rule whose certified sup error exceeds
+`sigma_quadrature_eps`. The fixed-SC initializer and its rebuilds do not
+(`enforce_sup_error=False`): the reduction budget can expire on a hard window
+and return the interpolatory start, and re-applying the gate there refused
+the padded Si boxes at 3e-5 for a 1e-4 request. On Na eta=0.5 (86 bands, MPA)
+the conduction pole-tail rule was retained at sup=0.0405, four hundred times
+eps, in every self-consistent arm, with 906 nodes and kappa_max 3123, while
+every other window met eps. How much of the QSGW residual that error produces
+is being measured (sandbox lane QUADCHECK, `runs/DEV/148_quadcheck_2026-09-05`);
+until then the driver prints one `!!! SC rule ... accepted ABOVE eps` line per
+such window with the ratio, and a run whose log carries that line is not
+certified at eps. The acceptance policy (a relax factor, a per-window eps, or
+a refusal naming the remedy) follows that measurement.
 
 ## Evidence
 

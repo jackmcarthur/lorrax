@@ -938,6 +938,23 @@ def plan_sigma_windows(
                 if warning not in announced:
                     print_fn(warning)
                     announced.add(warning)
+        # THE RELAXED ACCEPTANCE IS NEVER SILENT.  The fixed-SC path does
+        # not enforce the one-shot sup-error gate (see _fit_fixed_sc_rules);
+        # a rule retained above eps is a bounded numerical error only if its
+        # window carries little spectral mass, which nobody has measured.
+        # Na eta=0.5 (2026-09-04): the conduction pole-tail rule sat at
+        # sup=0.0405 against eps=1e-4 in every self-consistent arm and the
+        # three independent reviewers found it before the coordinator did.
+        for spec, fit in zip(specs, fits):
+            if float(fit["sup_error"]) > float(tolerance):
+                print_fn(
+                    f"!!! SC rule {spec['name']!r} accepted ABOVE eps: "
+                    f"sup={fit['sup_error']:.6g} = "
+                    f"{float(fit['sup_error']) / float(tolerance):.0f} x eps "
+                    f"({fit['node_count']} nodes; the fixed-SC path does not "
+                    f"enforce the one-shot acceptance; its Sigma error on this "
+                    f"window is unbounded here — docs/self_consistency.md "
+                    f"pitfall 15)")
     # The (window, tau) pair count is reported, never refused on: the owner
     # eliminated the pair ceiling (2026-09-02).  A count above what a deck
     # can afford is a planning question answered by eps and the window

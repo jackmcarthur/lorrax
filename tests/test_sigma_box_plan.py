@@ -366,14 +366,18 @@ def test_fixed_sc_accepts_the_box_services_finite_fallback(monkeypatch):
 
     monkeypatch.setattr(
         "gw.sigma_box_plan.build_uniform_rule", diagnostic_above_eps)
+    said = []
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4, reduction_seconds=120.0,
         cache_dir=None, fixed_rule_session={},
-        print_fn=lambda *_args, **_kwargs: None)
+        print_fn=lambda *args, **_kwargs: said.append(" ".join(map(str, args))))
     assert len(plan) == 3
     assert all(row["sup_error"] == pytest.approx(5.5e-4)
                for row in geometry["branches"][0]["windows"])
+    # The relaxed acceptance is announced, per window, with the ratio.
+    loud = [line for line in said if "accepted ABOVE eps" in line]
+    assert len(loud) == 3 and all("= 6 x eps" in line for line in loud)
 
 
 def test_one_shot_preserves_the_historical_sup_error_refusal(monkeypatch):
