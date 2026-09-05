@@ -805,6 +805,8 @@ def compute_sigma_xc(
     omit_v_h: bool = False,
     iteration_head=None,
     occupation_state=None,
+    charge_zeta_identity=None,
+    coulomb_policy_receipt=None,
     material_class: str,
     fixed_quadrature_session=None,
     print_fn: Callable = print,
@@ -865,6 +867,10 @@ def compute_sigma_xc(
         term take the same ``diag(f)`` weights Σ_c does.  ``None`` is
         the insulating default and every static channel is then
         bit-for-bit the integer ``occ > 0.5`` projector.
+    charge_zeta_identity, coulomb_policy_receipt
+        Host-only construction receipts for the resident charge-ISDF basis
+        and bare Coulomb tensor.  Ordinary Sigma routes ignore them; the
+        provenance-strict Tier-0 checkpoint route requires both.
     wfns_transverse, bispinor_v_q_path
         Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
         tile file).  Both-or-neither; the static kernels fold Σ^B into
@@ -1368,7 +1374,10 @@ def compute_sigma_xc(
                 wfns, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
                 sym=sym, wfn=wfn, band_slices=band_slices,
                 centroid_indices=centroid_indices, input_dir=input_dir,
-                occupation_state=occupation_state, print_fn=print_fn)
+                occupation_state=occupation_state,
+                charge_zeta_identity=charge_zeta_identity,
+                coulomb_policy_receipt=coulomb_policy_receipt,
+                print_fn=print_fn)
             sigma_c_ev = np.asarray(tier0.sigma_c_diag_ev)
             expected = (int(meta.nk_tot), int(meta.nb_sigma))
             if sigma_c_ev.shape != expected:

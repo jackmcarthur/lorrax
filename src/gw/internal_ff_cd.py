@@ -46,6 +46,20 @@ IMAG_FINE_INTERVALS = 64
 CD_CONTROL_TOL_MEV = 0.5
 RESPONSE_WIDTHS_EV = (INTERNAL_FF_CD_RESPONSE_WIDTH_EV,)
 
+# Checkpoint compatibility follows numerical semantics, not incidental source
+# bytes.  Bump this value whenever the ordered-pair response, Dyson/unfold, or
+# weighted contour accumulator changes meaning.  Head-only, diagnostics, and
+# comment changes deliberately do not invalidate an expensive body resume.
+BODY_ACCUMULATOR_SEMANTIC_EPOCH = (
+    "internal-ff-cd-body-v2:ordered-pair-dyson-qstar-contour")
+CHECKPOINT_SCHEMA = 2
+ARRAY_RECEIPT_SCHEME = "numpy-c-order-sha256-v1"
+STAGE_TIMING_KEYS = (
+    "dyson_solve_wall_seconds",
+    "q_unfold_wall_seconds",
+    "contract_host_checks_wall_seconds",
+)
+
 
 @dataclass(frozen=True)
 class InternalFFResult:
@@ -333,59 +347,210 @@ def _hash_array(array: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(array).view(np.uint8)).hexdigest()
 
 
-def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
-                         state, config, nb_chi_logical,
-                         nb_sigma_logical, nmu, nk):
+def _array_receipt(array, *, dtype=None) -> dict:
+    """Compact exact receipt for a replicated host array; never gathers JAX."""
+    values = np.asarray(array, dtype=dtype)
+    if values.dtype.hasobject:
+        raise TypeError("internal_ff_cd cannot receipt an object array")
+    values = np.ascontiguousarray(values)
+    digest = hashlib.sha256()
+    digest.update(ARRAY_RECEIPT_SCHEME.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(values.dtype.str.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(json.dumps(list(values.shape)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(values.view(np.uint8))
     return {
-        "schema": 1,
-        "route": "internal_ff_cd",
-        "kind": str(kind),
-        "grid_sha256": _hash_array(grid),
-        "eta_w_ev": None if width_ev is None else float(width_ev),
-        "target_k_sha256": _hash_array(np.asarray(target_k, np.int32)),
-        "target_b_sha256": _hash_array(np.asarray(target_b, np.int32)),
-        "occupation_hash": str(state.occ_hash),
-        "number_bands_chi": int(nb_chi_logical),
-        "number_bands_sigma": int(nb_sigma_logical),
-        "nmu": int(nmu), "nk": int(nk),
-        "mc_average_vcoul_body": bool(config.head.mc_average_vcoul_body),
-        "bgw_metal_q0_treatment": str(config.head.bgw_metal_q0_treatment),
-        "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "scheme": ARRAY_RECEIPT_SCHEME,
+        "dtype": values.dtype.str,
+        "shape": [int(v) for v in values.shape],
+        "sha256": digest.hexdigest(),
     }
 
 
-def _load_checkpoint(path: Path, identity, n_targets, n_accumulators):
+def _require_charge_zeta_identity(receipt) -> dict:
+    if not isinstance(receipt, dict) or set(receipt) != {"scheme", "digest"}:
+        raise ValueError(
+            "internal_ff_cd requires the canonical two-field "
+            "charge_zeta_identity receipt; legacy/unstamped ISDF state "
+            "cannot support an exact body checkpoint")
+    out = {"scheme": str(receipt["scheme"]),
+           "digest": str(receipt["digest"])}
+    if not out["scheme"] or not out["digest"]:
+        raise ValueError(
+            "internal_ff_cd charge_zeta_identity fields must be nonempty")
+    return out
+
+
+def _require_coulomb_policy_receipt(receipt) -> str:
+    from file_io import COULOMB_POLICY_KEYS, format_coulomb_policy
+
+    if not isinstance(receipt, dict):
+        raise ValueError(
+            "internal_ff_cd requires the Coulomb policy stamped with the "
+            "resident V; a legacy/unstamped restart cannot resume exactly")
+    expected, actual = set(COULOMB_POLICY_KEYS), set(receipt)
+    if actual != expected:
+        raise ValueError(
+            "internal_ff_cd Coulomb receipt keys differ from the current "
+            f"owner schema: missing={sorted(expected - actual)}, "
+            f"unknown={sorted(actual - expected)}")
+    return format_coulomb_policy(receipt)
+
+
+def _body_checkpoint_provenance(
+        *, energies_ry, state, charge_zeta_identity,
+        coulomb_policy_receipt, q_mapping, centroid_indices,
+        nb_chi_logical, nb_sigma_logical, band_carrier_storage,
+        b0, V_q, nmu_logical, nk, mesh_xy) -> dict:
+    """Receipts for every available numerical input to the body accumulator."""
+    nb_physical = max(int(nb_chi_logical), int(nb_sigma_logical))
+    energies = np.asarray(energies_ry, np.float64)
+    occupations = np.asarray(state.f_kn, np.float64)
+    if energies.shape[0] != int(nk) or occupations.shape != energies.shape:
+        raise ValueError(
+            "internal_ff_cd energy/occupation carrier mismatch while "
+            f"building checkpoint provenance: {energies.shape} vs "
+            f"{occupations.shape}, nk={nk}")
+    if energies.shape[1] != int(band_carrier_storage):
+        raise ValueError(
+            "internal_ff_cd energy carrier changed before checkpoint "
+            f"provenance: {energies.shape[1]} != {band_carrier_storage}")
+    q_receipts = {
+        str(name): _array_receipt(values)
+        for name, values in sorted(q_mapping.items())
+    }
+    return {
+        "body_accumulator_semantic_epoch": BODY_ACCUMULATOR_SEMANTIC_EPOCH,
+        "bands": {
+            "b0": int(b0),
+            "number_bands_chi": int(nb_chi_logical),
+            "number_bands_sigma": int(nb_sigma_logical),
+            # This is a carrier compatibility gate, not a physical count.
+            "band_carrier_storage": int(band_carrier_storage),
+        },
+        "energies_ry": _array_receipt(
+            energies[:, :nb_physical], dtype=np.float64),
+        "occupation": {
+            "family": str(state.smearing_family),
+            "width_ry": float(state.smearing_width_ry),
+            "mu_ry": float(state.mu_ry),
+            "owner_hash": str(state.occ_hash),
+            "physical_f_kn": _array_receipt(
+                occupations[:, :nb_physical], dtype=np.float64),
+        },
+        "charge_zeta_identity": _require_charge_zeta_identity(
+            charge_zeta_identity),
+        "centroid_indices": _array_receipt(
+            centroid_indices, dtype=np.int64),
+        "q_mapping": q_receipts,
+        "coulomb": {
+            "construction_policy": _require_coulomb_policy_receipt(
+                coulomb_policy_receipt),
+            # V is distributed and is deliberately neither gathered nor
+            # duplicated for hashing.  The construction receipts above bind
+            # its zeta/source and policy; these fields bind its live carrier.
+            "shape": [int(v) for v in V_q.shape],
+            "dtype": str(V_q.dtype),
+            "nmu_logical": int(nmu_logical),
+        },
+        # Reduction topology affects floating-point order.  Even equal carrier
+        # extents therefore cannot move a checkpoint between P4 and P16.
+        "mesh_shape": {
+            str(axis): int(mesh_xy.shape[axis]) for axis in mesh_xy.axis_names
+        },
+        "nk": int(nk),
+        "algorithm_parameters": {
+            "pair_tile": PAIR_TILE,
+            "target_tile": TARGET_TILE,
+            "frequency_batch": FREQUENCY_BATCH,
+            "center_shift_ev": CENTER_SHIFT_EV,
+            "imag_origin_limit_ev": IMAG_ORIGIN_LIMIT_EV,
+        },
+    }
+
+
+def _checkpoint_identity(*, kind, grid, width_ev, target_k, target_b,
+                         body_provenance):
+    return {
+        "schema": CHECKPOINT_SCHEMA,
+        "route": "internal_ff_cd",
+        "kind": str(kind),
+        "grid": _array_receipt(grid, dtype=np.float64),
+        "eta_w_ev": None if width_ev is None else float(width_ev),
+        "target_k": _array_receipt(target_k, dtype=np.int32),
+        "target_b": _array_receipt(target_b, dtype=np.int32),
+        "body_provenance": body_provenance,
+    }
+
+
+def _load_checkpoint(path: Path, identity, n_targets, n_accumulators, *,
+                     return_stage_timings: bool = False):
+    empty_stages = {key: 0.0 for key in STAGE_TIMING_KEYS}
     if not path.exists():
-        return 0, [np.zeros(n_targets, np.complex128)
-                   for _ in range(n_accumulators)], 0.0, 0.0
+        result = (0, [np.zeros(n_targets, np.complex128)
+                      for _ in range(n_accumulators)], 0.0, 0.0)
+        return result + (empty_stages,) if return_stage_timings else result
     with np.load(path, allow_pickle=False) as data:
         stamped = json.loads(str(np.asarray(data["identity_json"])[()]))
         if stamped != identity:
+            old_schema = stamped.get("schema", "absent")
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} has stale identity; "
-                "delete or move the incomplete run variant rather than "
-                "mixing grids, occupations, Coulomb policy, band counts, "
-                "targets, or source revisions")
+                f"checkpoint schema={old_schema!r}, required schema="
+                f"{identity.get('schema')!r}. Delete or move the incomplete "
+                "run variant rather than mixing numerical semantics, grids, "
+                "occupations, Coulomb/ISDF receipts, q maps, band carriers, "
+                "or targets. Automatic prefix migration is intentionally "
+                "unavailable without an old-grid prefix and exact-zero "
+                "padded-orbital proof.")
         completed = int(np.asarray(data["completed"])[()])
         accum = np.asarray(data["accumulators"], np.complex128)
         if accum.shape != (n_accumulators, n_targets):
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} accumulator shape "
                 f"{accum.shape} != {(n_accumulators, n_targets)}")
-        if completed < 0 or (completed % FREQUENCY_BATCH != 0
-                             and completed != int(identity["grid_n"])):
+        grid_n = int(identity["grid_n"])
+        if completed < 0 or completed > grid_n or (
+                completed % FREQUENCY_BATCH != 0 and completed != grid_n):
             raise ValueError(
                 f"internal_ff_cd checkpoint {path} has invalid completed="
                 f"{completed}")
-        return (completed, [row.copy() for row in accum],
-                float(np.asarray(data["chi_wall_seconds"])[()]),
-                float(np.asarray(data["solve_contract_wall_seconds"])[()]))
+        if not np.all(np.isfinite(accum)):
+            raise ValueError(
+                f"internal_ff_cd checkpoint {path} has nonfinite accumulator")
+        result = (completed, [row.copy() for row in accum],
+                  float(np.asarray(data["chi_wall_seconds"])[()]),
+                  float(np.asarray(data["solve_contract_wall_seconds"])[()]))
+        if not all(np.isfinite(value) and value >= 0.0 for value in result[2:]):
+            raise ValueError(
+                f"internal_ff_cd checkpoint {path} has invalid aggregate "
+                "wall timing")
+        missing_stages = [key for key in STAGE_TIMING_KEYS if key not in data]
+        if return_stage_timings and missing_stages:
+            raise ValueError(
+                f"internal_ff_cd checkpoint {path} lacks schema-2 stage "
+                f"timings {missing_stages}")
+        stages = {
+            key: (float(np.asarray(data[key])[()]) if key in data else 0.0)
+            for key in STAGE_TIMING_KEYS
+        }
+        if not all(np.isfinite(value) and value >= 0.0
+                   for value in stages.values()):
+            raise ValueError(
+                f"internal_ff_cd checkpoint {path} has invalid stage timing")
+        return result + (stages,) if return_stage_timings else result
 
 
 def _save_checkpoint(path: Path, identity, completed, accumulators,
-                     chi_wall, solve_contract_wall):
+                     chi_wall, solve_contract_wall, *, stage_timings=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
+    stages = ({key: 0.0 for key in STAGE_TIMING_KEYS}
+              if stage_timings is None else {
+                  key: float(stage_timings[key]) for key in STAGE_TIMING_KEYS
+              })
     with tmp.open("wb") as stream:
         np.savez(
             stream,
@@ -394,7 +559,9 @@ def _save_checkpoint(path: Path, identity, completed, accumulators,
             accumulators=np.stack(accumulators),
             chi_wall_seconds=np.asarray(float(chi_wall), np.float64),
             solve_contract_wall_seconds=np.asarray(
-                float(solve_contract_wall), np.float64))
+                float(solve_contract_wall), np.float64),
+            **{key: np.asarray(value, np.float64)
+               for key, value in stages.items()})
     os.replace(tmp, path)
 
 
@@ -502,6 +669,8 @@ def compute_internal_ff_cd(
     centroid_indices,
     input_dir: str,
     occupation_state=None,
+    charge_zeta_identity=None,
+    coulomb_policy_receipt=None,
     print_fn: Callable = print,
 ) -> InternalFFResult:
     """Compute the Tier-0 on-shell diagonal and its refusal-grade ledger.
@@ -592,6 +761,26 @@ def compute_internal_ff_cd(
         mesh_xy, n_targets=n_targets,
         inner_stop=nb_sigma_logical)
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+    body_provenance = _body_checkpoint_provenance(
+        energies_ry=wfns.enk, state=state,
+        charge_zeta_identity=charge_zeta_identity,
+        coulomb_policy_receipt=coulomb_policy_receipt,
+        q_mapping={
+            "q_full": q_full,
+            "kmq_wedge": kmq_wedge,
+            "kmq_target": kmq_target,
+            "irr_idx": irr_idx,
+            "sym_idx": sym_idx,
+            "sym_perm": sym_perm,
+            "l_table": l_table,
+            "qfrac": qfrac,
+        },
+        centroid_indices=centroid_indices,
+        nb_chi_logical=nb_chi_logical,
+        nb_sigma_logical=nb_sigma_logical,
+        band_carrier_storage=nb_storage,
+        b0=b0, V_q=V_q, nmu_logical=meta.n_rmu, nk=nk,
+        mesh_xy=mesh_xy)
 
     def frequency_batch(z_ry, coefficient_rows):
         """Evaluate a fixed-size referee frequency batch.
@@ -608,19 +797,29 @@ def compute_internal_ff_cd(
             for i in range(q_full.size)]
         chi_bq = jnp.stack(chi_rows, axis=1)
         chi_bq.block_until_ready()
-        chi_seconds = time.perf_counter()
+        chi_completed_at = time.perf_counter()
+        stage_seconds = {key: 0.0 for key in STAGE_TIMING_KEYS}
         outputs = []
         for jb, coefficients in enumerate(coefficient_rows):
+            t_stage = time.perf_counter()
             w_wedge = solve_w(
                 v_wedge, chi_bq[jb].copy(), meta, mesh_xy,
                 dyson_solver="distributed")
+            w_wedge.block_until_ready()
+            stage_seconds["dyson_solve_wall_seconds"] += (
+                time.perf_counter() - t_stage)
+            t_stage = time.perf_counter()
             wc_wedge = w_wedge - v_wedge
             wc_full = unfold_isdf_operator(
                 wc_wedge, irr_idx=irr_idx, sym_idx=sym_idx,
                 sym_perm=sym_perm, L_table=l_table, q_irr_frac=qfrac,
                 mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial,
                 trs_rule="pair_transpose")
+            wc_full.block_until_ready()
+            stage_seconds["q_unfold_wall_seconds"] += (
+                time.perf_counter() - t_stage)
             # CD spectral convention S=(I-epsilon^-1)V = -Wc.
+            t_stage = time.perf_counter()
             row = []
             for coeff in coefficients:
                 value = -contract(
@@ -636,7 +835,9 @@ def compute_internal_ff_cd(
                 row.append(host * (RYD_TO_EV / nk))
             outputs.append(row)
             del w_wedge, wc_wedge, wc_full
-        return outputs, chi_seconds
+            stage_seconds["contract_host_checks_wall_seconds"] += (
+                time.perf_counter() - t_stage)
+        return outputs, chi_completed_at, stage_seconds
 
     real_results = []
     grid_records = []
@@ -650,14 +851,14 @@ def compute_internal_ff_cd(
                          if coarse is not None else {})
         identity = _checkpoint_identity(
             kind="real", grid=grid, width_ev=width,
-            target_k=target_k, target_b=target_b, state=state,
-            config=config, nb_chi_logical=nb_chi_logical,
-            nb_sigma_logical=nb_sigma_logical,
-            nmu=meta.n_rmu, nk=nk)
+            target_k=target_k, target_b=target_b,
+            body_provenance=body_provenance)
         identity["grid_n"] = int(grid.size)
         checkpoint = checkpoint_dir / f"real_eta_{width:.8f}.npz"
-        completed, loaded, chi_wall, solve_contract_wall = _load_checkpoint(
-            checkpoint, identity, n_targets, 2)
+        (completed, loaded, chi_wall, solve_contract_wall,
+         stage_wall) = _load_checkpoint(
+            checkpoint, identity, n_targets, 2,
+            return_stage_timings=True)
         accum, coarse_accum = loaded
         if rank == 0 and completed:
             print_fn(
@@ -678,11 +879,13 @@ def compute_internal_ff_cd(
                     coeffs.append(ccoeff)
                 coefficient_rows.append(coeffs)
             t_batch = time.perf_counter()
-            values, t_after_chi = frequency_batch(
+            values, t_after_chi, stage_batch = frequency_batch(
                 grid[lo:hi] / RYD_TO_EV
                 + 1j * (width / RYD_TO_EV), coefficient_rows)
             chi_wall += t_after_chi - t_batch
             solve_contract_wall += time.perf_counter() - t_after_chi
+            for key in STAGE_TIMING_KEYS:
+                stage_wall[key] += stage_batch[key]
             for jb, iw in enumerate(range(lo, hi)):
                 accum += values[jb][0]
                 if iw in coarse_lookup:
@@ -690,7 +893,8 @@ def compute_internal_ff_cd(
             if rank == 0:
                 _save_checkpoint(
                     checkpoint, identity, hi, (accum, coarse_accum),
-                    chi_wall, solve_contract_wall)
+                    chi_wall, solve_contract_wall,
+                    stage_timings=stage_wall)
             if rank == 0 and (hi == len(grid) or hi % 50 < FREQUENCY_BATCH):
                 print_fn(
                     f"  internal_ff_cd real eta_W={width:g} eV: "
@@ -706,6 +910,9 @@ def compute_internal_ff_cd(
             "resumed_at_frequency": completed,
             "chi_wall_seconds": chi_wall,
             "solve_contract_wall_seconds": solve_contract_wall,
+            **stage_wall,
+            "solve_contract_unattributed_wall_seconds": float(
+                solve_contract_wall - sum(stage_wall.values())),
             "wall_seconds": time.perf_counter() - t_arm,
         })
 
@@ -716,14 +923,14 @@ def compute_internal_ff_cd(
     tail_panel_max_ev = float(_panel_bounds(itail)[1][-1])
     identity = _checkpoint_identity(
         kind="imaginary", grid=igrid, width_ev=None,
-        target_k=target_k, target_b=target_b, state=state,
-        config=config, nb_chi_logical=nb_chi_logical,
-        nb_sigma_logical=nb_sigma_logical,
-        nmu=meta.n_rmu, nk=nk)
+        target_k=target_k, target_b=target_b,
+        body_provenance=body_provenance)
     identity["grid_n"] = int(igrid.size)
     checkpoint = checkpoint_dir / "imaginary.npz"
-    completed, loaded, chi_wall, solve_contract_wall = _load_checkpoint(
-        checkpoint, identity, n_targets, 3)
+    (completed, loaded, chi_wall, solve_contract_wall,
+     stage_wall) = _load_checkpoint(
+        checkpoint, identity, n_targets, 3,
+        return_stage_timings=True)
     imag_accum, imag_coarse, imag_tail = loaded
     if rank == 0 and completed:
         print_fn(
@@ -747,10 +954,12 @@ def compute_internal_ff_cd(
             coefficient_rows.append(coeffs)
         z_imag_ev = np.maximum(igrid[lo:hi], IMAG_ORIGIN_LIMIT_EV)
         t_batch = time.perf_counter()
-        values, t_after_chi = frequency_batch(
+        values, t_after_chi, stage_batch = frequency_batch(
             1j * z_imag_ev / RYD_TO_EV, coefficient_rows)
         chi_wall += t_after_chi - t_batch
         solve_contract_wall += time.perf_counter() - t_after_chi
+        for key in STAGE_TIMING_KEYS:
+            stage_wall[key] += stage_batch[key]
         for jb, iw in enumerate(range(lo, hi)):
             imag_accum += values[jb][0]
             offset = 1
@@ -763,7 +972,8 @@ def compute_internal_ff_cd(
             _save_checkpoint(
                 checkpoint, identity, hi,
                 (imag_accum, imag_coarse, imag_tail),
-                chi_wall, solve_contract_wall)
+                chi_wall, solve_contract_wall,
+                stage_timings=stage_wall)
         if rank == 0 and (hi == len(igrid) or hi % 50 < FREQUENCY_BATCH):
             print_fn(f"  internal_ff_cd imaginary: {hi}/{len(igrid)} frequencies")
     grid_records.append({
@@ -776,6 +986,9 @@ def compute_internal_ff_cd(
         "resumed_at_frequency": completed,
         "chi_wall_seconds": chi_wall,
         "solve_contract_wall_seconds": solve_contract_wall,
+        **stage_wall,
+        "solve_contract_unattributed_wall_seconds": float(
+            solve_contract_wall - sum(stage_wall.values())),
         "wall_seconds": time.perf_counter() - t_arm,
     })
 
@@ -829,6 +1042,10 @@ def compute_internal_ff_cd(
         "jobid": os.environ.get("SLURM_JOB_ID", "unknown"),
         "source_commit": os.environ.get("LORRAX_SOURCE_COMMIT", "working-tree"),
         "wall_seconds": time.perf_counter() - t_start,
+        "checkpoint_provenance": {
+            "schema": CHECKPOINT_SCHEMA,
+            **body_provenance,
+        },
         "sharding": {
             "chi": "P(None,x,y)", "W": "P(None,x,y)",
             "replicated_nmu2_per_process": False,

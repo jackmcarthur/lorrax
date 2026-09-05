@@ -1038,6 +1038,8 @@ def main(argv=None):
 				bispinor_v_q_path=bispinor_v_q_path,
 				photon_response=photon_response,
 				occupation_state=oneshot_occupation_state,
+				charge_zeta_identity=isdf.charge_zeta_identity,
+				coulomb_policy_receipt=isdf.coulomb_policy,
 				material_class=material_class,
 				print_fn=print0,
 			)
