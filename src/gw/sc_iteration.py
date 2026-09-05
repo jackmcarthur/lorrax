@@ -645,6 +645,10 @@ class SCState:
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
     convergence_verdict: ConvergenceVerdict | None = None
+    # (active_window_fit, sum_band_tail_fit) from map 0, carried on every
+    # later map input so the tail law is fixed for the loop; see
+    # _frozen_scissor_fits.  None on map 0 and on the one-shot path.
+    frozen_scissor_fits: tuple | None = None
 
 
 def _sc_output_tables_on_loop_kset(
@@ -2512,6 +2516,44 @@ def _sc_head_frequency_plan(
     return requests, None, head_omegas
 
 
+# The self-consistent in-range set keeps this margin from the Sigma grid
+# edge: the same 2 eV state pad the frozen box rules use
+# (sigma_box_plan._SC_STATE_PAD_EV), so a band trusted at map 0 has room to
+# move without leaving the grid or dragging off-grid multiplet partners in.
+SC_EDGE_MARGIN_EV = 2.0
+
+
+def _frozen_scissor_fits(state):
+    """The map-0 scissor laws, reused by every later map.
+
+    Refitting the affine tail law from the trusted block's shifts every map
+    moved the 96 eV Na states by up to 17.7 eV in one map (arm D map 3,
+    runs/Na/12_sc_observables_eta05_2026-09-04) and fed that back into the
+    trusted block through the sum over states.  Standard QSGW practice
+    (Kotani-van Schilfgaarde; Questaal) gives the states above the
+    self-energy subspace one fixed correction; that is what this does for
+    the ACTIVE-window scissor (states inside the Sigma window but outside
+    the omega grid).  The sum-band tail beyond the Sigma window keeps its
+    per-map refit: freezing it changed the Si QSGW gap by 22 meV.
+    Returns (active_window_fit, sum_band_tail_fit); the second element is
+    carried for the record and not consumed.
+    """
+    if int(getattr(state, "iteration", 0)) <= 0:
+        return None, None
+    fits = getattr(state, "frozen_scissor_fits", None)
+    if fits is None:
+        return None, None
+    return tuple(fits)
+
+
+def _capture_frozen_scissor_fits(outputs):
+    """The pair to carry forward, taken from the FIRST map's outputs."""
+    if outputs is None:
+        return None
+    return (getattr(outputs, "scissor_fit", None),
+            getattr(outputs, "tail_scissor_fit", None))
+
+
 def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
     """Run-derived Schmitt margin for the re-anchored Sigma window."""
     # Half a sampled omega bin is unresolved by the grid.  Metallic
@@ -2522,6 +2564,59 @@ def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
         0.5 * float(inputs.config.sigma.omega_step_ev),
         float(inputs.config.occ_broadening_ry) * RYD_TO_EV,
     )
+
+
+def _refuse_frozen_partition_escape(
+    partition, e_active_kn_ev, *, band_offset: int, omega_min_abs_ev: float,
+    omega_max_abs_ev: float, tolerance_ev: float, omega_step_ev: float,
+    iteration: int, print_fn=print) -> float:
+    """Check every frozen protected/in-range state is still on the grid.
+
+    Returns the smallest remaining margin to an edge (eV).  A state farther
+    outside than ``tolerance_ev`` (half an omega bin or the occupation
+    broadening, whichever is larger) refuses with the band, the k row, the
+    energy, the edge it crossed, and the deck value that would clear it by
+    the SC state pad (2 eV, rounded up to the omega step).
+    """
+    # Only the in-range set is checked: those bands were inside the grid at
+    # every k at map 0.  Protected-but-out-of-range bands exist by design
+    # (whole-multiplet promotion across the edge, warned by the partition
+    # constructor) and keep the historical edge clamp.
+    trusted = np.asarray(partition.in_range_mask, dtype=bool).reshape(-1)
+    e = np.asarray(e_active_kn_ev, dtype=np.float64)
+    if not trusted.any():
+        return float("inf")
+    cols = np.flatnonzero(trusted)
+    sub = e[:, cols]
+    margin_top = float(omega_max_abs_ev - sub.max())
+    margin_bot = float(sub.min() - omega_min_abs_ev)
+    print_fn(
+        f"    SC partition: frozen from map 0 "
+        f"({_band_ranges(trusted, band_offset=band_offset)}, "
+        f"{int(trusted.sum())} of {trusted.size}); edge margins now "
+        f"{margin_bot:.3f} eV (bottom) / {margin_top:.3f} eV (top)")
+    worst = min(margin_top, margin_bot)
+    if worst >= -float(tolerance_ev):
+        return worst
+    pad = 2.0
+    if margin_top < margin_bot:
+        k, j = np.unravel_index(int(np.argmax(sub)), sub.shape)
+        edge, key = "top", "sigma_omega_max_ev"
+        need = np.ceil((sub.max() + pad - omega_max_abs_ev) / omega_step_ev) * omega_step_ev
+    else:
+        k, j = np.unravel_index(int(np.argmin(sub)), sub.shape)
+        edge, key = "bottom", "sigma_omega_min_ev"
+        need = -np.ceil((omega_min_abs_ev - sub.min() + pad) / omega_step_ev) * omega_step_ev
+    band = int(band_offset + cols[j] + 1)
+    raise ValueError(
+        f"SC map {iteration}: frozen in-range band {band} left the Sigma grid "
+        f"at the {edge} edge: E(k={int(k)}, band {band}) = {sub[k, j]:.3f} eV "
+        f"against the edge at {omega_max_abs_ev if edge == 'top' else omega_min_abs_ev:.3f} eV "
+        f"(overshoot {-worst:.3f} eV, tolerance {tolerance_ev:.3f} eV). The "
+        f"partition is fixed at map 0 so the map stays continuous; widen the "
+        f"grid by {abs(need):.2f} eV ({key} moved {'up' if edge == 'top' else 'down'} "
+        f"by that amount, which clears the state by the 2 eV SC pad) or "
+        f"shrink the trusted set with ncond.")
 
 
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
@@ -2774,17 +2869,41 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # and bands as inputs.e_dft_active_kn_ry, which is what the partition
         # masks are applied to.
         _e_active_now = np.asarray(E_full, dtype=np.float64)
-        partition = build_omega_band_partition(
-            _e_active_now, np.asarray(enk_entry, dtype=np.float64),
-            band_offset=int(inputs.band_slices.b0),
-            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
-            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
-            previous_partition=(state.partition
-                                if state.partition is not None
-                                else inputs.partition),
-            hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
-            label=f"SC map {int(state.iteration)} (mu-anchored)",
-            print_fn=inputs.print_fn)
+        _omega_lo = float(inputs.config.sigma.omega_min_ev) + _mu_ev
+        _omega_hi = float(inputs.config.sigma.omega_max_ev) + _mu_ev
+        if int(state.iteration) > 0 and state.partition is not None:
+            # STATE IDENTITY IS FIXED AT MAP 0.  Re-classifying bands against
+            # the window every map made the map discontinuous: on Na
+            # (86 bands, top +18 eV) bands 9-10 reach 17.2 eV and bands 11-13
+            # straddle the edge, so a ~1 eV QP shift moved them in and out of
+            # the in-range set map to map (5-10 -> 5-8, protected 5-10 <->
+            # 5-13), and the loop floored at 60 meV per map on the Fermi
+            # window (runs/Na/12_sc_observables_eta05_2026-09-04, arms A/D/E).
+            # The grid still re-anchors on this map's mu; only the set of
+            # bands trusted on it is frozen.  A frozen state whose energy
+            # leaves the grid refuses with the window value that clears it,
+            # instead of the silent edge clamp.
+            partition = state.partition
+            _refuse_frozen_partition_escape(
+                partition, _e_active_now * RYD_TO_EV,   # E_full is in Ry
+                band_offset=int(inputs.band_slices.b0),
+                omega_min_abs_ev=_omega_lo, omega_max_abs_ev=_omega_hi,
+                tolerance_ev=_partition_hysteresis_margin_ev(inputs),
+                omega_step_ev=float(inputs.config.sigma.omega_step_ev),
+                iteration=int(state.iteration), print_fn=inputs.print_fn)
+        else:
+            partition = build_omega_band_partition(
+                _e_active_now, np.asarray(enk_entry, dtype=np.float64),
+                band_offset=int(inputs.band_slices.b0),
+                omega_min_abs_ev=_omega_lo,
+                omega_max_abs_ev=_omega_hi,
+                previous_partition=(state.partition
+                                    if state.partition is not None
+                                    else inputs.partition),
+                hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
+                edge_margin_ev=SC_EDGE_MARGIN_EV,
+                label=f"SC map {int(state.iteration)} (mu-anchored)",
+                print_fn=inputs.print_fn)
     partition = _apply_sc_buffer_partition(partition, inputs)
     buffer_mask = _sc_buffer_mask(inputs)
     if buffer_mask.any():
@@ -2897,6 +3016,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if scissor_classes is not None:
             valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
             fit_mask_kn = fit_mask_kn & ~crossing_kn
+        # The SUM-BAND tail (bands beyond the Sigma window) keeps its
+        # per-map refit: freezing it moved the Si b80/c504 QSGW gap by 22 meV
+        # at map 6 (si_p4_replay4 vs attempt 3), a closure change on
+        # semiconductors that nothing here justifies.  Only the ACTIVE-window
+        # scissor (states inside the Sigma window but outside the omega grid,
+        # Na's 14-86) is frozen; see _frozen_scissor_fits.
         tail_fit = fit_scissor(
             E_dft_kn_ev=e_dft_fit_ev,
             E_qp_kn_ev=(
@@ -3387,6 +3512,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # EQP2.  ``ks`` is deliberately passed rather than spelling weights:
     # the fit is a reduction over k and must use the multiplicities of the
     # exact rows selected above.
+    _frozen_active, _frozen_tail_unused = _frozen_scissor_fits(state)
+    if _frozen_active is not None:
+        inputs.print_fn(
+            f"    SC scissor: frozen from map 0 ({_frozen_active.summary()})")
     H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, partition, ks,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
@@ -3395,7 +3524,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             H, inputs=inputs, kstar=ks, n_occ=n_occ,
             use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
-        scissor_fit=tail_fit,
+        scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
@@ -4301,9 +4430,14 @@ def _run_linear_mixing(
             partition=state.partition,
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
+            frozen_scissor_fits=state.frozen_scissor_fits,
         )
         map_input = state
         state_map = gw_iteration_map(map_input, inputs)
+        if map_input.frozen_scissor_fits is None:
+            _frozen_fits = _capture_frozen_scissor_fits(state_map.outputs)
+        else:
+            _frozen_fits = map_input.frozen_scissor_fits
         E_candidate_ev = (
             np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
         # Outputs, W and head all describe the MAP INPUT.  Record that exact
@@ -4330,6 +4464,7 @@ def _run_linear_mixing(
             partition=_state_partition(state_map, inputs),
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
+            frozen_scissor_fits=_frozen_fits,
         )
         E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -4568,6 +4703,7 @@ def _run_rcrop(
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
+    _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -4600,9 +4736,12 @@ def _run_rcrop(
             partition=_partition[0],
             occupation_state=_occ_state[0],
             head_surface_weight_kn=_head_surface_weight[0],
+            frozen_scissor_fits=_frozen_fits[0],
         )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
+        if _frozen_fits[0] is None:
+            _frozen_fits[0] = _capture_frozen_scissor_fits(state_out.outputs)
         _partition[0] = _state_partition(state_out, inputs)
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
@@ -5281,6 +5420,7 @@ def run_sc_driver(
         band_offset=int(band_slices.b0),
         omega_min_abs_ev=omega_min_ev,
         omega_max_abs_ev=omega_max_ev,
+        edge_margin_ev=SC_EDGE_MARGIN_EV,
         label="SC", print_fn=print_fn)
 
     # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two

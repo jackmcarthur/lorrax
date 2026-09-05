@@ -209,10 +209,12 @@ is richer. Bi (bispinor) and Na are the pending cases.
 
 **12. Quadrature rules are frozen across maps** (2026-09-03). The first map
 plans and certifies one rule per product window on the window's box padded by
-`sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and refuse
-rather than rebuild if a state leaves its padded box. One-shot results are
-bit-identical with and without the freeze. The eqp1 file is written from the
-converged map.
+`sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and, when
+a state leaves its padded box or a window appears that iteration 1 did not
+have, rebuild that rule on the escaped box with the same padding
+(`rebuild:sc-fixed`, counted in the geometry receipt and printed per map;
+main 0cfaf059). One-shot results are bit-identical with and without the
+freeze. The eqp1 file is written from the converged map.
 
 **13. Map gain is a diagnostic, not a controller.** From map 2 onward the
 driver prints `SC map gain: max |dSigma_on-shell| / max |dE_in| = ...`, using
@@ -240,6 +242,21 @@ On metals a local gain above 1 can remain at Fermi-crossing states, where the
 exchange term responds to an occupation flip under the smearing width; that is
 the physics of the map, not the accelerator, and is read from pitfall 13's
 line.
+
+**15. One quadrature acceptance on every path.** The one-shot planner, the
+fixed-SC initializer and its rebuilds all require the certified sup error at
+or below `sigma_quadrature_eps`; a build that misses gets one retry with five
+times the reduction budget and then refuses, naming the window, its box,
+the achieved sup, the node count and the remedy. The 2026-09-03 bypass
+(`enforce_sup_error=False`) let Na retain a conduction pole-tail rule at
+sup=0.0405 against eps=1e-4 with 906 nodes in every self-consistent arm; its
+actual support has a 24-node rule at eps (sandbox lane QUADCHECK). The cause
+was the SC pad: the ten-percent pole pad pushed a strictly negative support
+across zero and asked for a crossing rule. The pad now keeps sign-definite
+supports sign-definite (the zero-side edge moves at most halfway to zero;
+a support that really crosses later is a box escape and rebuilds), and the
+disk cache never returns a certificate above eps. Do not loosen eps to admit
+a rule.
 
 ## Evidence
 

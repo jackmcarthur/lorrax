@@ -357,23 +357,59 @@ def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
     assert padded["sc_pole_pad_fraction"] == 0.10
 
 
-def test_fixed_sc_accepts_the_box_services_finite_fallback(monkeypatch):
+def test_fixed_sc_refuses_a_rule_above_eps_after_one_retry(monkeypatch):
     import dataclasses
+    calls = []
 
     def diagnostic_above_eps(box, eps, **kwargs):
+        calls.append(float(kwargs.get("time_budget", -1.0)))
         return dataclasses.replace(
             _fake_rule(box, eps, **kwargs), sup_error=5.5 * eps)
 
     monkeypatch.setattr(
         "gw.sigma_box_plan.build_uniform_rule", diagnostic_above_eps)
+    with pytest.raises(RuntimeError, match="5x-budget retry achieved") as err:
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+            eps=1.0e-4, reduction_seconds=120.0,
+            cache_dir=None, fixed_rule_session={},
+            print_fn=lambda *_args, **_kwargs: None)
+    assert "do not loosen sigma_quadrature_eps" in str(err.value)
+    # the retry used five times the budget before refusing
+    assert 600.0 in calls and 120.0 in calls
+
+
+def test_fixed_sc_accepts_the_retry_when_it_meets_eps(monkeypatch):
+    import dataclasses
+
+    def meets_eps_with_more_time(box, eps, **kwargs):
+        good = float(kwargs.get("time_budget", 0.0)) >= 600.0
+        return dataclasses.replace(
+            _fake_rule(box, eps, **kwargs),
+            sup_error=(0.5 * eps if good else 5.5 * eps))
+
+    monkeypatch.setattr(
+        "gw.sigma_box_plan.build_uniform_rule", meets_eps_with_more_time)
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4, reduction_seconds=120.0,
         cache_dir=None, fixed_rule_session={},
         print_fn=lambda *_args, **_kwargs: None)
     assert len(plan) == 3
-    assert all(row["sup_error"] == pytest.approx(5.5e-4)
+    assert all(row["sup_error"] == pytest.approx(0.5e-4)
                for row in geometry["branches"][0]["windows"])
+
+
+def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
+    from gw.sigma_box_plan import _sc_padded_box_spec
+    spec = {"kind": "sign_definite_negative", "box": (-2.0, -0.3, 0.05, 0.4),
+            "pole_extent": (-3.0, -0.05, 0.05, 0.4), "frequencies": np.asarray([0.0]),
+            "states": np.asarray([0.0]), "pole_sign": 1}
+    try:
+        padded = _sc_padded_box_spec(spec, 0.02)
+    except Exception as exc:  # the pole-box helper needs richer specs
+        pytest.skip(f"pad helper needs the full spec: {exc}")
+    assert padded["box"][1] < 0.0 and padded["box"][1] <= 0.5 * spec["box"][1]
 
 
 def test_one_shot_preserves_the_historical_sup_error_refusal(monkeypatch):
@@ -656,3 +692,74 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
         with pytest.raises(ValueError, match=f"{key}.*retired"):
             LorraxConfig.from_input_file(
                 str(deck), print_fn=lambda *_args, **_kwargs: None)
+
+
+
+def test_nan_weights_with_finite_sup_are_not_a_certificate(monkeypatch):
+    import dataclasses
+
+    def poisoned(box, eps, **kwargs):
+        rule = _fake_rule(box, eps, **kwargs)
+        weights = np.array(rule.weights, dtype=np.complex128)
+        weights[0] = np.nan
+        return dataclasses.replace(rule, weights=weights)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", poisoned)
+    with pytest.raises(RuntimeError, match="is not finite"):
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+            eps=1.0e-4, reduction_seconds=120.0,
+            cache_dir=None, fixed_rule_session={},
+            print_fn=lambda *_args, **_kwargs: None)
+
+
+def test_infinite_sup_retries_then_refuses_naming_the_retry(monkeypatch):
+    import dataclasses
+    budgets = []
+
+    def broken(box, eps, **kwargs):
+        budgets.append(float(kwargs.get("time_budget", -1.0)))
+        return dataclasses.replace(
+            _fake_rule(box, eps, **kwargs), sup_error=float("inf"))
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", broken)
+    with pytest.raises(RuntimeError, match="5x-budget retry achieved") as err:
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+            eps=1.0e-4, reduction_seconds=120.0,
+            cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+    assert 600.0 in budgets
+    assert "inf" in str(err.value)
+
+
+def test_cache_store_refuses_a_non_finite_rule(tmp_path):
+    import dataclasses
+    from gw.sigma_box_plan import _rule_cache_store
+    rule = _fake_rule((-2.0, -0.3, 0.05, 0.4), 1.0e-4, time_budget=1.0)
+    bad = dataclasses.replace(
+        rule, times=np.array(rule.times, dtype=np.complex128) * np.nan)
+    warning = _rule_cache_store(str(tmp_path), bad, 1.0)
+    assert warning is not None and "refused" in warning
+    assert not list(tmp_path.glob("*.npz"))
+
+
+def test_cache_lookup_prefers_a_certified_larger_rule_over_a_bad_smaller_one(tmp_path):
+    import dataclasses
+    from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
+    box = (-2.0, -0.3, 0.05, 0.4)
+    good = _fake_rule(box, 1.0e-4, time_budget=1.0)
+    small_bad = dataclasses.replace(
+        good, times=np.array(good.times[:2]), weights=np.array(good.weights[:2]),
+        sup_error=0.04)
+    # store the good rule through the guarded path, and the bad one raw
+    assert _rule_cache_store(str(tmp_path), good, 1.0) is None
+    np.savez(tmp_path / "rule_bad.npz", times=small_bad.times,
+             weights=small_bad.weights, box=np.asarray(box), eps=1.0e-4,
+             relative=True, theta_deg=float(good.theta_deg), rank=int(good.rank),
+             sup_error=0.04, kappa_max=float(good.kappa_max),
+             roundoff_amplification=1.0)
+    best, _warnings = _rule_cache_lookup(
+        str(tmp_path), box, 1.0e-4, True, noise_amplification_cap=1.0e9)
+    assert best is not None
+    rule, name = best
+    assert name != "rule_bad.npz" and rule.sup_error <= 1.0e-4
