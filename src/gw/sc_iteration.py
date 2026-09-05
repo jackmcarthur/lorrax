@@ -1408,6 +1408,19 @@ def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
         f"{kind!r}.")
 
 
+def _sharded_identity(*, nk: int, nb: int, sharding) -> jax.Array:
+    """``(nk, nb, nb)`` complex identity per k, materialised sharded.
+
+    A jitted constructor: no host copy, and no eager ``device_put`` at
+    a spec the mesh may not divide (``nb % px``, ``nb % py``).
+    """
+    @_functools.partial(jax.jit, static_argnums=(0, 1), out_shardings=sharding)
+    def _build(nk_, nb_):
+        eye = jnp.eye(nb_, dtype=jnp.complex128)
+        return jnp.broadcast_to(eye, (nk_, nb_, nb_))
+    return _build(int(nk), int(nb))
+
+
 def _band_rotation_spec() -> P:
     """``gw.qsgw_density.band_rotation_spec()``, resolved lazily.
 
@@ -2783,10 +2796,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # hidden assert_equal; same rank-invariance argument, and here
             # each rank stages only its own nb²/(px·py) block).
             E_qp_ry = device_put_process_local(E_np, rep2)
-            U_qp = device_put_process_local(
-                np.broadcast_to(
-                    np.eye(nb, dtype=np.complex128), H_np.shape),
-                NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
+            # Built ON DEVICE under jit, not staged on the host: an eager
+            # device_put at band_rotation_spec needs nb divisible by both
+            # mesh axes (IndivisibleError at nb=190 on a 4x4 mesh, CrI3
+            # 2026-09-05), while a jitted constructor takes any nb the way
+            # every later map's sharding constraint already does.
+            U_qp = _sharded_identity(
+                nk=int(H_np.shape[0]), nb=nb,
+                sharding=NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
     if E_qp_ry is None:
         # TWO INDEPENDENT DECISIONS, and they used to be one condition.
         #
