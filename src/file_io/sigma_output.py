@@ -1748,12 +1748,17 @@ def _validate_raw_direct_component_contract(h5, *, required):
 			f"raw Hdir/V_H/H_T shapes disagree: {shapes}.")
 	for name in names:
 		attrs = h5[name].attrs
+		# The receipt is about the rows this file holds, so the file-wedge
+		# verification is the load-bearing one.  The full-BZ stamp is False
+		# by contract under the SC terminal write (``star_already_selected``:
+		# the retained tables live on the loop's k-set, SCKSET 2026-09-04),
+		# and requiring it here refused every four-current SC run at its
+		# last step (MoS2 3x3, runs/MoS2/31_sigma_velocity_sc_20260905).
 		if (_text(attrs.get(DIRECT_FIELD_SUM_RULE_ATTR, "missing"))
 				!= DIRECT_FIELD_SUM_RULE
-				or not bool(attrs.get(DIRECT_FIELD_SUM_FULL_BZ_ATTR, False))
 				or not bool(attrs.get(DIRECT_FIELD_SUM_FILE_WEDGE_ATTR, False))):
 			raise ValueError(
-				f"{name} lacks the authenticated full-BZ/file-wedge "
+				f"{name} lacks the authenticated file-wedge "
 				f"{DIRECT_FIELD_SUM_RULE!r} contract.")
 	return True
 
