@@ -85,10 +85,11 @@ def layout_dial_record_lines(
         f"({provenance})")
     if low_mem:
         lines.append(
-            "low_mem_bands = true is a capacity escape hatch: saves memory "
-            f"(band chunks of {int(config.memory.band_chunk_size)}) but takes "
-            "longer; set false whenever the full-band carrier fits, especially "
-            "for multi-node dynamic Sigma sweeps")
+            "low_mem_bands = true: the two-face wavefunction carrier (band "
+            f"chunks of {int(config.memory.band_chunk_size)}); required for the "
+            "raw-parent (k_irr) route, which contracts G and the ISDF pair "
+            "densities on the WFN's own k rows.  On an unreduced k grid the "
+            "four-copy carrier (false) is faster when it fits.")
     return tuple(lines)
 
 
