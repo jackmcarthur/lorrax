@@ -85,9 +85,10 @@ def layout_dial_record_lines(
         f"({provenance})")
     if low_mem:
         lines.append(
-            "low_mem_bands = true: saves memory "
+            "low_mem_bands = true is a capacity escape hatch: saves memory "
             f"(band chunks of {int(config.memory.band_chunk_size)}) but takes "
-            "longer; set false on systems that fit")
+            "longer; set false whenever the full-band carrier fits, especially "
+            "for multi-node dynamic Sigma sweeps")
     return tuple(lines)
 
 

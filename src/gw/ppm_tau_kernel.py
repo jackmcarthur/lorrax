@@ -22,7 +22,6 @@ only dynamic-pole synthesis wrapper used by ``gw.mpa.sigma``.
 
 from __future__ import annotations
 
-import os
 from functools import partial
 from typing import Callable, NamedTuple
 
@@ -33,6 +32,7 @@ import numpy as np
 
 from common import timing
 from common.jax_compile_cache import ensure_jax_compile_cache
+from runtime.env_flags import env_bool
 
 
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
@@ -68,8 +68,7 @@ def _stage_timing_enabled() -> bool:
     Scale-neutral: overhead is O(1) host work per τ stage, independent of
     n_atoms / N_μ / nk / P / backend.
     """
-    return os.environ.get("LORRAX_SIGMA_TAU_TIMING", "0").strip().lower() in (
-        "1", "true", "yes", "on")
+    return env_bool("LORRAX_SIGMA_TAU_TIMING", False)
 
 
 def _fft_ffi_fused_enabled() -> bool:
@@ -787,12 +786,12 @@ def _get_sigma_kij_kernel(
         _sigma_kij_kernel_cache[key] = kernel
         return kernel
 
-    if layout == "face":
+    if layout == "face" and brackets is not None:
         raise NotImplementedError(
             "_get_sigma_kij_kernel(layout='face'): LORRAX_SIGMA_TAU_TIMING "
-            "stage-split diagnostic is not ported for the face carrier — "
-            "an opt-in profiling knob, not the production path; set "
-            "LORRAX_SIGMA_TAU_TIMING=0 (the default) under low_mem_bands.")
+            "stage-split diagnostic is not ported for bracketed face "
+            "carriers — an opt-in profiling knob, not the production path; "
+            "set LORRAX_SIGMA_TAU_TIMING=0 (the default) for that case.")
 
     build_g = jax.jit(_g_from_selector)
 
