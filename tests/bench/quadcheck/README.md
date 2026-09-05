@@ -27,8 +27,33 @@ result: all four refuse. No production module is changed on disk. Replace
 `test_fixed_sc_accepts_the_box_services_finite_fallback` with this refusal
 contract when the coordinator approves the production policy.
 
-Run all scripts through checkout-local `lx run --jid JOB -N 1 -G 0 -n 1` with
+Run scalar and policy scripts through checkout-local `lx run --jid JOB -N 1 -G 0 -n 1` with
 `JAX_PLATFORMS=cpu`. The policy tests deliberately live under the excluded
 `bench` directory; the current-policy red test is not added to the default gate.
-Actual Sigma replay remains a P4 requirement and needs an authenticated input
-H/E/U/occupation checkpoint plus W/head and the retained rule session.
+
+The coordinator authorized the affine input for a meV diagnostic on September 5:
+its residual against retained rotations is 1.4572556481210558e-10 eV. This does
+not make it a byte-authenticated restart. `replay_sigma.py` runs the production
+SC map at P4 with this input, retained W/head, the geometric bare-X head, and
+MP1 occupations at the retained chemical potential. It compares all retained
+rules, a 24-node replacement for `ω≥E_F cond:pole_tail`, and an independently
+constructed 384-node contour/pane control for that window. All other rules and
+the partition are held fixed. Paths and the retained chemical potential are
+deliberately specific to this evidence set.
+
+`contour_reference.py` constructs the independent control with composite
+Gauss–Legendre quadrature on a decaying complex-time ray. Its truncation bound
+is analytic; discretization accuracy is independently sampled. The attempted
+`pane_reference.py` fit refused and is retained as evidence, not used in Sigma.
+`compare_replay.py` reports covered on-shell samples separately from endpoint
+clamping, fixed DFT principal-block eigenvalue shifts, and full-H shifts.
+
+`review_policy.py` probes the exact source of commit `6035f72f` with injected
+boundary cases. Its results distinguish the landed finite-error acceptance
+policy from remaining nonfinite-value and refusal-message gaps.
+
+Run the combined Sigma leg with `lx run --jid 57930535 -N 1 -G 4 -n 4`,
+`LX_BASE_MODULE=lorrax_A`, `LORRAX_CHECKOUT` set to this checkout, and
+`XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`,
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.85`. Evidence lives in the sibling sandbox at
+`runs/Na/14_quadcheck_2026-09-05`; its `replay/run_replay.sh` records the command.
