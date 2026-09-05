@@ -243,6 +243,31 @@ class PackedCentroidBasis:
     def _shards(self, spec, axis):
         return int(spec_divisor(self.mesh_xy, spec, axis))
 
+    @lru_cache(maxsize=None)
+    def _axis_kernel(self, axis, spec, unpack):
+        """Keep one compiled I/O permutation per basis, axis and sharding.
+
+        Eager shard_map execution recreates tiny executables on every call.
+        Compile the same local pad/permutation/crop as one distributed unit.
+        JAX specializes this callable for each operand shape and dtype.
+        """
+        n_shards = self._shards(spec, axis)
+        inverse, forward = self._maps(n_shards)
+        source = inverse if unpack else forward
+        # Either order may have the larger extent: pad to the common carrier,
+        # permute, crop to the target (rank-local prefix operations).
+        common = max(self.n_canonical, self.n_packed) // n_shards
+        target = (self.n_canonical if unpack else self.n_packed) // n_shards
+        return jax.jit(lambda arr: _permute_sharded_axis(
+            arr, axis, source, self.mesh_xy, spec, pad_to=common,
+            crop_to=target))
+
+    @lru_cache(maxsize=None)
+    def _operator_kernel(self, spec, unpack):
+        convert = self.unpack_axis if unpack else self.pack_axis
+        return jax.jit(lambda op: convert(
+            convert(op, -2, spec=spec), -1, spec=spec))
+
     def pack_axis(self, arr, axis: int, *, spec=None):
         """Canonical suffix-padded carrier → packed, on one sharded axis."""
         if self.is_identity:
@@ -253,12 +278,7 @@ class PackedCentroidBasis:
             raise ValueError(
                 f"centroid basis: pack_axis expects the canonical carrier "
                 f"{self.n_canonical} on axis {axis}; got {arr.shape}.")
-        n_shards = self._shards(spec, axis)
-        _, pack = self._maps(n_shards)
-        return _permute_sharded_axis(
-            arr, axis, pack, self.mesh_xy, spec,
-            pad_to=max(self.n_canonical, self.n_packed) // n_shards,
-            crop_to=self.n_packed // n_shards)
+        return self._axis_kernel(axis, spec, False)(arr)
 
     def unpack_axis(self, arr, axis: int, *, spec=None):
         """Packed → canonical suffix-padded carrier, on one sharded axis."""
@@ -270,22 +290,20 @@ class PackedCentroidBasis:
             raise ValueError(
                 f"centroid basis: unpack_axis expects the packed carrier "
                 f"{self.n_packed} on axis {axis}; got {arr.shape}.")
-        n_shards = self._shards(spec, axis)
-        unpack, _ = self._maps(n_shards)
-        return _permute_sharded_axis(
-            arr, axis, unpack, self.mesh_xy, spec,
-            pad_to=max(self.n_canonical, self.n_packed) // n_shards,
-            crop_to=self.n_canonical // n_shards)
+        return self._axis_kernel(axis, spec, True)(arr)
 
     def pack_operator(self, op, *, spec=None):
         """Both centroid axes (the last two) of a ``(..., mu, nu)`` operator."""
+        if self.is_identity:
+            return op
         spec = self._spec(op, spec)
-        return self.pack_axis(self.pack_axis(op, -2, spec=spec), -1, spec=spec)
+        return self._operator_kernel(spec, False)(op)
 
     def unpack_operator(self, op, *, spec=None):
+        if self.is_identity:
+            return op
         spec = self._spec(op, spec)
-        return self.unpack_axis(
-            self.unpack_axis(op, -2, spec=spec), -1, spec=spec)
+        return self._operator_kernel(spec, True)(op)
 
 
 __all__ = ["PackedCentroidBasis"]
