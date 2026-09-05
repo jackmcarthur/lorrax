@@ -81,3 +81,16 @@ def test_edge_margin_scissors_bands_that_end_within_the_pad(capsys):
         omega_min_abs_ev=-15.0, omega_max_abs_ev=24.0,
         label="SC", print_fn=lambda _s: None)
     assert np.asarray(plain.in_range_mask).tolist() == [True, True, True, True, False]
+
+
+def test_scissor_fits_are_frozen_from_map_zero():
+    fits = ("active-fit", "tail-fit")
+    assert sc_iteration._frozen_scissor_fits(
+        SimpleNamespace(iteration=0, frozen_scissor_fits=fits)) == (None, None)
+    assert sc_iteration._frozen_scissor_fits(
+        SimpleNamespace(iteration=3, frozen_scissor_fits=None)) == (None, None)
+    assert sc_iteration._frozen_scissor_fits(
+        SimpleNamespace(iteration=3, frozen_scissor_fits=fits)) == fits
+    outputs = SimpleNamespace(scissor_fit="a", tail_scissor_fit=None)
+    assert sc_iteration._capture_frozen_scissor_fits(outputs) == ("a", None)
+    assert sc_iteration._capture_frozen_scissor_fits(None) is None

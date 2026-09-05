@@ -645,6 +645,10 @@ class SCState:
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
     convergence_verdict: ConvergenceVerdict | None = None
+    # (active_window_fit, sum_band_tail_fit) from map 0, carried on every
+    # later map input so the tail law is fixed for the loop; see
+    # _frozen_scissor_fits.  None on map 0 and on the one-shot path.
+    frozen_scissor_fits: tuple | None = None
 
 
 def _sc_output_tables_on_loop_kset(
@@ -2519,6 +2523,34 @@ def _sc_head_frequency_plan(
 SC_EDGE_MARGIN_EV = 2.0
 
 
+def _frozen_scissor_fits(state):
+    """The map-0 scissor laws, reused by every later map.
+
+    Refitting the affine tail law from the trusted block's shifts every map
+    moved the 96 eV Na states by up to 17.7 eV in one map (arm D map 3,
+    runs/Na/12_sc_observables_eta05_2026-09-04) and fed that back into the
+    trusted block through the sum over states.  Standard QSGW practice
+    (Kotani-van Schilfgaarde; Questaal) gives the states above the
+    self-energy subspace one fixed correction; that is what this does.
+    Returns (active_window_fit, sum_band_tail_fit); either is None when map
+    0 has not produced it, and then the caller fits as before.
+    """
+    if int(getattr(state, "iteration", 0)) <= 0:
+        return None, None
+    fits = getattr(state, "frozen_scissor_fits", None)
+    if fits is None:
+        return None, None
+    return tuple(fits)
+
+
+def _capture_frozen_scissor_fits(outputs):
+    """The pair to carry forward, taken from the FIRST map's outputs."""
+    if outputs is None:
+        return None
+    return (getattr(outputs, "scissor_fit", None),
+            getattr(outputs, "tail_scissor_fit", None))
+
+
 def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
     """Run-derived Schmitt margin for the re-anchored Sigma window."""
     # Half a sampled omega bin is unresolved by the grid.  Metallic
@@ -2981,7 +3013,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if scissor_classes is not None:
             valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
             fit_mask_kn = fit_mask_kn & ~crossing_kn
-        tail_fit = fit_scissor(
+        _frozen_tail = _frozen_scissor_fits(state)[1]
+        tail_fit = _frozen_tail if _frozen_tail is not None else fit_scissor(
             E_dft_kn_ev=e_dft_fit_ev,
             E_qp_kn_ev=(
                 np.asarray(E_qp_ry, dtype=np.float64) * RYD_TO_EV),
@@ -3471,6 +3504,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # EQP2.  ``ks`` is deliberately passed rather than spelling weights:
     # the fit is a reduction over k and must use the multiplicities of the
     # exact rows selected above.
+    _frozen_active, _frozen_tail_unused = _frozen_scissor_fits(state)
+    if _frozen_active is not None:
+        inputs.print_fn(
+            f"    SC scissor: frozen from map 0 ({_frozen_active.summary()})")
     H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, partition, ks,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
@@ -3479,7 +3516,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             H, inputs=inputs, kstar=ks, n_occ=n_occ,
             use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
-        scissor_fit=tail_fit,
+        scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
@@ -4385,9 +4422,14 @@ def _run_linear_mixing(
             partition=state.partition,
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
+            frozen_scissor_fits=state.frozen_scissor_fits,
         )
         map_input = state
         state_map = gw_iteration_map(map_input, inputs)
+        if map_input.frozen_scissor_fits is None:
+            _frozen_fits = _capture_frozen_scissor_fits(state_map.outputs)
+        else:
+            _frozen_fits = map_input.frozen_scissor_fits
         E_candidate_ev = (
             np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
         # Outputs, W and head all describe the MAP INPUT.  Record that exact
@@ -4414,6 +4456,7 @@ def _run_linear_mixing(
             partition=_state_partition(state_map, inputs),
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
+            frozen_scissor_fits=_frozen_fits,
         )
         E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -4652,6 +4695,7 @@ def _run_rcrop(
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
+    _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -4684,9 +4728,12 @@ def _run_rcrop(
             partition=_partition[0],
             occupation_state=_occ_state[0],
             head_surface_weight_kn=_head_surface_weight[0],
+            frozen_scissor_fits=_frozen_fits[0],
         )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
+        if _frozen_fits[0] is None:
+            _frozen_fits[0] = _capture_frozen_scissor_fits(state_out.outputs)
         _partition[0] = _state_partition(state_out, inputs)
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
