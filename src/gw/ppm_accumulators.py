@@ -166,6 +166,9 @@ class DeviceOmegaAccumulator:
             self._window = _device_omega_add(
                 self._sharding, self._omega_axis)(
                 self._window, sigma_tau, coeff)
+        # The caller may block on the updated accumulator when profiling.
+        # Production ignores this return and keeps the incumbent async path.
+        return self._total if self._window is None else self._window
 
     def end_window(self):
         if self._coeff is None:

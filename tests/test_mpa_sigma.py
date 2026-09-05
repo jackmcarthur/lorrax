@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import pytest
 
 from gw.mpa.sigma import (_attach_ordered_odd_sigma, _batch_rows, _branches,
+                          _resolve_debug_max_tau_dispatches,
                           _resolve_mpa_odd_residue_debug)
 from gw.ppm_sigma import (SigmaOmegaResult, _SigmaPhysicsState,
                           _ppm_as_one_pole_store_fields)
@@ -81,6 +82,22 @@ def test_mpa_debug_odd_residue_switch_warns_and_refuses_trs(monkeypatch):
                for line in messages)
     with pytest.raises(ValueError, match="debug_gn_odd_residue_off_scope"):
         _resolve_mpa_odd_residue_debug(False, print_fn=messages.append)
+
+
+def test_mpa_debug_tau_bound_is_positive_and_announced(monkeypatch):
+    messages = []
+    monkeypatch.delenv("LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES", raising=False)
+    assert _resolve_debug_max_tau_dispatches(
+        print_fn=messages.append) is None
+
+    monkeypatch.setenv("LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES", "12")
+    assert _resolve_debug_max_tau_dispatches(print_fn=messages.append) == 12
+    assert any("WILL NOT produce" in line for line in messages)
+
+    for bad in ("0", "-2", "twelve"):
+        monkeypatch.setenv("LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES", bad)
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            _resolve_debug_max_tau_dispatches(print_fn=messages.append)
 
 
 def test_mpa_odd_sigma_is_exact_production_twin_difference():
