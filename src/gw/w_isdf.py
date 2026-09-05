@@ -1993,6 +1993,13 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
+    #: The charge zeta identity receipt the caller bound (gw_jax passes
+    #: ``isdf.charge_zeta_identity``, the same digest the MPA/tagged-array
+    #: stores authenticate against).  Carried, not consumed here: the packed
+    #: body owns no store of its own yet.  It was passed by the caller since
+    #: 684c1903 but never accepted, which refused every full_static_cohsex
+    #: deck at the screening stage with a TypeError.
+    charge_zeta_identity: object | None = None
 
 
 def _load_static_photon_hall(
@@ -2089,6 +2096,7 @@ def compute_static_photon_response(
     wf_binding_charge=None,
     wf_binding_transverse=None,
     wfn_fingerprint_binding=None,
+    charge_zeta_identity=None,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
     dyson_solver: str = "distributed",
@@ -2418,6 +2426,7 @@ def compute_static_photon_response(
             current_contact=current_contact,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
+            charge_zeta_identity=charge_zeta_identity,
             approximation=(
                 "gamma_completed_no_pair_static_photon_v1"
                 if coupled_head
@@ -2428,6 +2437,7 @@ def compute_static_photon_response(
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
+        charge_zeta_identity=charge_zeta_identity,
         approximation=(
             "gamma_completed_bare_transverse_photon_v1"
             if coupled_head
