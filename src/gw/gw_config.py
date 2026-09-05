@@ -5916,11 +5916,16 @@ class LorraxConfig:
                 raise ValueError(
                     "sigma_freq_route = internal_ff_cd is certified for "
                     "screening_diagrams = w_rpa only.")
-            if resolved.mpa.material_class != "metal":
+            if (resolved.occ_smearing_family != "mp1"
+                    or resolved.occ_smearing_width_ry is None
+                    or resolved.sigma.fermi_reference != "mp1_fixed_n"):
                 raise ValueError(
                     "sigma_freq_route = internal_ff_cd currently promotes "
-                    "the certified metallic referee and requires "
-                    "mpa_material_class = metal.")
+                    "the metallic referee and requires the explicit "
+                    "occ_smearing_family = mp1, occ_smearing_width_ry, and "
+                    "fermi_reference = mp1_fixed_n declaration. The loaded "
+                    "WFN occupations are checked independently at driver "
+                    "entry.")
             if not resolved.do_G0:
                 raise ValueError(
                     "sigma_freq_route = internal_ff_cd requires do_G0 = true: "
