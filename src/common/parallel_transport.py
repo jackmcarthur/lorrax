@@ -29,6 +29,7 @@ __all__ = [
     "build_forward_neighbor_table",
     "build_neighbor_table",
     "build_g_wrap_lookup",
+    "band_matrix_storage_extent",
     "band_storage_extent",
     "fourth_order_connection",
     "fourth_order_covariant_derivative",
@@ -118,6 +119,31 @@ def band_storage_extent(mesh, nbands: int) -> int:
     return padded_axis(
         int(nbands), mesh, name="parallel-transport band carrier",
         spec=band_sphere_spec(), axis=1).carrier
+
+
+def band_matrix_storage_extent(mesh, nbands: int) -> int:
+    """Return the carrier needed by a distributed PT band matrix alone.
+
+    The full parallel-transport builder deliberately uses
+    :func:`band_storage_extent`: its wavefunction sphere shards one band axis
+    over the composite ``('x','y')`` mesh and therefore needs a mesh-product
+    carrier.  A velocity-only consumer reads no wavefunction sphere or link
+    payload.  Its two band axes are independently sharded over ``x`` and
+    ``y``, so the canonical carrier is instead the least common multiple of
+    those two per-axis divisors.  Keeping this distinction at the layout
+    owner avoids both over-padding a P16 velocity from 86 to 96 and slicing a
+    sharded matrix after the collective HDF5 read.
+    """
+    names = tuple(str(a) for a in mesh.axis_names)
+    if names != ("x", "y"):
+        raise ValueError(
+            "parallel transport requires mesh axes ('x','y'); "
+            f"got {names!r}")
+    from runtime.padding import padded_axis
+    return padded_axis(
+        int(nbands), mesh, name="parallel-transport band-matrix carrier",
+        specs=((P(None, None, "x", None), 2),
+               (P(None, None, None, "y"), 3))).carrier
 
 
 def fingerprint_update_value(digest, label: str, value) -> None:
