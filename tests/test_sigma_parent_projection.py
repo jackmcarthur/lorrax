@@ -17,6 +17,10 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
 * Fractional static-Γ and direct-q pair scans on the parents-only bundle
   equal the full-k face bundle: each band tile is unfolded from the packed
   parents inside the scan (``symmetry_maps.unfold_wavefunction_local``).
+* q→0 head wings (``qsgw_head.head_wings_sharded`` and the static wings) on
+  the parents-only bundle equal the full-k face bundle: the children are
+  streamed one parent star at a time from the packed parents
+  (``w_isdf.iter_parent_children_faces``).
 * SC rotation: ``wavefunction_bundle.rotate_wavefunctions`` on the
   parents-only bundle rotates the carrier's faces with U at the parents'
   rows and equals the rotated full-k faces read at those rows.
@@ -303,6 +307,31 @@ def _worker() -> int:
         wfns_par, z_direct, meta, mesh, occupation_state=occ_state,
         kminq_rows=kminq, nb_logical=nb - 1)))
     frac_direct = float(np.max(np.abs(d_par - d_full))) / float(np.max(np.abs(d_full)))
+    # The q->0 head wings on the parents-only bundle equal the full-k face
+    # bundle: the children are streamed one parent star at a time
+    # (w_isdf.iter_parent_children_faces) with the velocity read at every k.
+    from gw.qsgw_head import head_wings_sharded, static_head_wings_sharded
+    v_np = _crand(rng, 3, nk, nb, nb)
+    v_np = 0.5 * (v_np + np.conj(np.swapaxes(v_np, -1, -2)))
+    omegas = np.asarray([0.0, 0.3 + 0.05j])
+    wing_kw = dict(mesh=mesh, nb_logical=nb - 1, nk_tot=nk, nspin=1,
+                   nspinor=ns, eta_ry=0.02, surface_weight_kn=surf)
+    Yf, Zf = head_wings_sharded(jnp.asarray(v_np), wfns_full, enk_j, f_kn,
+                                omegas, **wing_kw)
+    Yp, Zp = head_wings_sharded(jnp.asarray(v_np), wfns_par, enk_j, f_kn,
+                                omegas, **wing_kw)
+    jax.block_until_ready((Yf, Zf, Yp, Zp))
+    wings_rel = max(
+        float(np.max(np.abs(np.asarray(Yp) - np.asarray(Yf)))) / float(np.max(np.abs(np.asarray(Yf)))),
+        float(np.max(np.abs(np.asarray(Zp) - np.asarray(Zf)))) / float(np.max(np.abs(np.asarray(Zf)))))
+    sf = static_head_wings_sharded(wfns_full, surf, mesh=mesh, nb_logical=nb - 1,
+                                   nk_tot=nk, nspin=1, nspinor=ns)
+    sp = static_head_wings_sharded(wfns_par, surf, mesh=mesh, nb_logical=nb - 1,
+                                   nk_tot=nk, nspin=1, nspinor=ns)
+    jax.block_until_ready((sf, sp))
+    static_wings_rel = max(
+        float(np.max(np.abs(np.asarray(sp[i]) - np.asarray(sf[i])))) / float(np.max(np.abs(np.asarray(sf[i]))))
+        for i in range(2))
     # The self-consistent map's rotation on a parents-only bundle: rotating
     # the carrier with U on the parents' rows equals rotating the full-k
     # faces and reading the parents' rows back (children share the parent's
@@ -328,6 +357,8 @@ def _worker() -> int:
 
     print(json.dumps({
         "sc_rotation_parents_vs_full_rel": rot_rel,
+        "head_wings_parents_vs_full_rel": wings_rel,
+        "static_head_wings_parents_vs_full_rel": static_wings_rel,
         "g_rel": g_rel, "proj_rel": proj_rel,
         "conj_rule_rel_on_tr_rows": conj_rel_trs,
         "conj_rule_rel_on_unitary_rows": conj_rel_uni,
@@ -387,6 +418,8 @@ def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
     assert out["fractional_static_gamma_parents_vs_full_rel"] < 1.0e-10, out
     assert out["sc_rotation_parents_vs_full_rel"] < 1.0e-10, out
     assert out["fractional_direct_q_parents_vs_full_rel"] < 1.0e-10, out
+    assert out["head_wings_parents_vs_full_rel"] < 1.0e-10, out
+    assert out["static_head_wings_parents_vs_full_rel"] < 1.0e-10, out
 
 
 def test_fractional_contour_chi0_on_parents_matches_full_k():

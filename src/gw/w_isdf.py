@@ -3355,6 +3355,72 @@ _PARENT_UNFOLD_SPECS = (P(None), P(None), P(None, None), P(None, None, None),
                         P(None, "y"), P(None, "y", None))
 
 
+_CHILD_FACE_KERNELS: dict = {}
+
+
+def iter_parent_children_faces(carrier, mesh_xy, *, slices):
+    """Yield ``(rows, child_bundle)`` per parent star of a
+    :class:`gw.wavefunction_bundle.ParentGreenCarrier`: the full-k rows that
+    are the children of one raw parent and a face bundle holding THEIR two
+    faces, built by the one-endpoint typed action
+    (``symmetry_maps.unfold_wavefunction_local``) from the packed parent
+    faces.  For consumers that need ψ itself at every k but only as a sum
+    over k (the q→0 head wings): one star is resident at a time, never a
+    full-k face.  ``child_bundle`` carries ``layout='face'``, ``psi_mun``/
+    ``psi_nmu`` at the star's rows, the parent's energies/occupations on
+    those rows, and ``slices``."""
+    from types import SimpleNamespace
+    from common.shard_map import shard_map
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import unfold_wavefunction_local
+    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+
+    plan = carrier.plan
+    ops, n_sym_spatial = _parent_face_unfold_operands(plan, mesh_xy)
+    irr, sym_rows, kfrac, U, perm_x, L_x, perm_y, L_y = ops
+    irr_np = np.asarray(plan.irr_idx)
+
+    def _kernel(spec, spin_axis, mu_axis, perm_spec, L_spec, n_rows):
+        key = (id(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
+        hit = _CHILD_FACE_KERNELS.get(key)
+        if hit is None:
+            def body(psi, irr_r, sym_r, kfrac_r, U_r, perm, L):
+                return unfold_wavefunction_local(
+                    psi, irr_idx=irr_r, sym_idx=sym_r, k_irr_frac=kfrac_r,
+                    spin_action_full=U_r, local_perm=perm, L_table=L,
+                    n_sym_spatial=n_sym_spatial, spin_axis=spin_axis,
+                    mu_axis=mu_axis, mesh_axis=None)
+            hit = jax.jit(shard_map(
+                body, mesh=mesh_xy,
+                in_specs=(spec, P(None), P(None), P(None, None),
+                          P(None, None, None), perm_spec, L_spec),
+                out_specs=spec, check_vma=False))
+            _CHILD_FACE_KERNELS[key] = hit
+        return hit
+
+    rep = lambda spec: NamedSharding(mesh_xy, spec)
+    for parent in range(int(plan.n_parent)):
+        rows = np.flatnonzero(irr_np == parent)
+        if rows.size == 0:
+            continue
+        r = jnp.asarray(rows, dtype=jnp.int32)
+        irr_r = jax.lax.with_sharding_constraint(jnp.take(irr, r), rep(P(None)))
+        sym_r = jax.lax.with_sharding_constraint(jnp.take(sym_rows, r), rep(P(None)))
+        U_r = jax.lax.with_sharding_constraint(
+            jnp.take(U, r, axis=0), rep(P(None, None, None)))
+        mun = _kernel(PSI_MUN_SPEC, 1, 2, P(None, "x"), P(None, "x", None),
+                      rows.size)(carrier.psi_mun, irr_r, sym_r, kfrac, U_r,
+                                 perm_x, L_x)
+        nmu = _kernel(PSI_NMU_SPEC, 2, 3, P(None, "y"), P(None, "y", None),
+                      rows.size)(carrier.psi_nmu, irr_r, sym_r, kfrac, U_r,
+                                 perm_y, L_y)
+        yield rows, SimpleNamespace(
+            layout="face", psi_mun=mun, psi_nmu=nmu, slices=slices,
+            enk=jnp.broadcast_to(carrier.enk[parent][None], (rows.size,) + carrier.enk.shape[1:]),
+            occ=jnp.broadcast_to(carrier.occ[parent][None], (rows.size,) + carrier.occ.shape[1:]))
+
+
 def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
                                  n_sym_spatial):
     common = dict(irr_idx=irr, sym_idx=sym, k_irr_frac=kfrac,
