@@ -3439,10 +3439,16 @@ def prepare_isdf_and_wavefunctions(
 				del psi_rmu_Y, psi_rmuT_X
 				psi_rmu_Y = None
 				psi_rmuT_X = None
+				_parent_canonical_faces = None
 				if _parent_green_plan is not None or _parent_zeta_plan is not None:
+					from .wavefunction_bundle import parent_faces_canonical
 					_parent_green_faces = pack_parent_green_faces(
 						_parent_rmu_Y, _parent_rmuT_X,
 						plan=_candidate_plan, mesh_xy=mesh_xy)
+					# The same raw rows in canonical centroid order: the Σ
+					# projection operands of the parent carrier.
+					_parent_canonical_faces = parent_faces_canonical(
+						_parent_rmu_Y, _parent_rmuT_X, mesh_xy=mesh_xy)
 					del _parent_rmu_Y, _parent_rmuT_X
 				print0("  ψ face conversion (low_mem_bands): psi_nmu/"
 				       "psi_mun built from the fresh load; BOTH "
@@ -3545,14 +3551,29 @@ def prepare_isdf_and_wavefunctions(
 						slices=band_slices, mesh_xy=mesh_xy,
 						basis_receipt=charge_basis_receipt)
 				green_parent_carrier = None
-				if _parent_green_plan is not None:
+				sigma_parent_carrier = None
+				if _parent_green_faces is not None:
 					from .wavefunction_bundle import (
 						build_packed_parent_green_carrier)
-					green_parent_carrier = (
-						build_packed_parent_green_carrier(
-							wfns, *_parent_green_faces,
-							plan=_parent_green_plan, mesh_xy=mesh_xy))
-					del _parent_green_faces
+					# ONE carrier: packed faces for Green contractions,
+					# canonical faces for the Σ band projection.  Screening
+					# takes it only under the measured Green admission; Σ
+					# takes it whenever the plan exists.
+					_parent_carrier = build_packed_parent_green_carrier(
+						wfns, *_parent_green_faces,
+						plan=_candidate_plan, mesh_xy=mesh_xy,
+						psi_nmu_canonical=_parent_canonical_faces[0],
+						psi_mun_canonical=_parent_canonical_faces[1])
+					del _parent_green_faces, _parent_canonical_faces
+					sigma_parent_carrier = _parent_carrier
+					print0(
+						"  Parent-k Sigma route ready: G contracted on "
+						f"{_candidate_plan.n_parent} raw WFN parents and Σ_k "
+						"projected on their bands, broadcast to "
+						f"{_candidate_plan.n_full} full k rows by the typed "
+						"band-index unfold.")
+				if _parent_green_plan is not None:
+					green_parent_carrier = _parent_carrier
 					print0(
 						"  Parent-k Green contraction ready: "
 						f"{_parent_green_plan.n_parent} raw WFN parents -> "
@@ -4119,6 +4140,7 @@ def prepare_isdf_and_wavefunctions(
 		# deliberately separate from the primary Wavefunctions pytree so head,
 		# Sigma, density and output kernels cannot inherit unused large inputs.
 		green_parent_carrier=green_parent_carrier,
+		sigma_parent_carrier=sigma_parent_carrier,
 		n_rmu_charge_logical=int(meta.n_rmu),
 		n_rmu_transverse_logical=(
 			int(transverse_basis_receipt.n_rmu_logical)

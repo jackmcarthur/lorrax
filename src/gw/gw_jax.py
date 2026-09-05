@@ -599,6 +599,17 @@ def main(argv=None):
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
 	green_parent_carrier = getattr(isdf, 'green_parent_carrier', None)
+	# The Σ kernels take the parent carrier whenever one exists: their G
+	# contraction and band projection then run on the raw parents and the
+	# band matrix is broadcast back to full k (gw.wavefunction_bundle.
+	# sigma_face_kernel_kwargs).  Head, density, output and restart
+	# consumers keep the primary full-k bundle.
+	sigma_parent_carrier = getattr(isdf, 'sigma_parent_carrier', None)
+	wfns_sigma = wfns
+	if sigma_parent_carrier is not None:
+		from dataclasses import replace as _dc_replace_sigma
+		wfns_sigma = _dc_replace_sigma(
+			wfns, green_parent=sigma_parent_carrier)
 	if green_parent_carrier is None:
 		wfns_screening = wfns
 	else:
@@ -1012,7 +1023,7 @@ def main(argv=None):
 		with timing.section("gw_jax.sigma"):
 			sigma_result = compute_sigma_xc(
 				mode,
-				wfns=wfns, V_q=V_q, W_by_role=W_by_role,
+				wfns=wfns_sigma, V_q=V_q, W_by_role=W_by_role,
 				e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,

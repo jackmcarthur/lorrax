@@ -272,13 +272,26 @@ _LAYOUTS = ('legacy', 'face')
 
 @dataclass
 class ParentGreenCarrier:
-    """Orbit-packed raw-parent operands for Green-function contractions."""
+    """Raw-parent operands: packed faces for Green contractions, canonical
+    faces for band projections.
+
+    ``psi_nmu``/``psi_mun`` are in the plan's orbit-PACKED centroid order,
+    the order the collective-free unfold needs.  ``psi_nmu_canonical``/
+    ``psi_mun_canonical`` are the same raw-parent rows in the CANONICAL
+    centroid order every full-k operator (Σ_k after the FFT convolution,
+    V, W) is stored in; they project such an operator onto the parent
+    rows' bands without a basis bridge.  All four are ``n_parent`` k rows
+    — the parent carrier holds no full-k wavefunction.  ``None`` canonical
+    faces mark a screening-only carrier built before the projection seam.
+    """
 
     psi_nmu: jax.Array
     psi_mun: jax.Array
     enk: jax.Array
     occ: jax.Array
     plan: object
+    psi_nmu_canonical: jax.Array | None = None
+    psi_mun_canonical: jax.Array | None = None
 
     @functools.partial(jax.jit, static_argnames=('bands',))
     def band_mask(self, bands: slice) -> jax.Array:
@@ -291,7 +304,8 @@ class ParentGreenCarrier:
 
 jax.tree_util.register_dataclass(
     ParentGreenCarrier,
-    data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ'],
+    data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ',
+                 'psi_nmu_canonical', 'psi_mun_canonical'],
     meta_fields=['plan'],
 )
 
@@ -597,6 +611,89 @@ def green_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
     }
 
 
+@dataclass(frozen=True, eq=False)
+class ParentSigmaRoute:
+    """What a Σ kernel factory needs to work from raw parents only.
+
+    ``plan`` transports a parent-contracted Green function to full k
+    (``build_G(..., k_unfold_plan=plan)``); ``g_face_shape`` is the
+    ``(n_parent, nb_full, mu_packed, ns)`` shape its GEMM plan is built for.
+    ``k_rows`` are the full-k rows that ARE the raw parents: after the
+    (full-k, layout-agnostic) FFT convolution the self-energy operator is
+    selected on them and projected onto the parents' bands with the
+    canonical parent faces (``proj_face_shape``, ``(n_parent, nb_full,
+    mu_canonical, ns)``).  The resulting band matrix is broadcast back to
+    full k by the typed band-index unfold of ``sym``
+    (``symmetry_maps.unfold_file_wedge_band_operator`` with the
+    ``transpose`` rule: Σ transforms like G, so its band matrix is
+    transposed, not conjugated, on time-reversed rows), so every
+    downstream consumer keeps its full-k
+    contract while no full-k wavefunction is ever read.  ``eq=False``:
+    identity-keyed, like the plan it wraps.
+    """
+
+    plan: object
+    k_rows: np.ndarray
+    sym: object
+    g_face_shape: tuple
+    proj_face_shape: tuple
+
+    @property
+    def n_parent(self) -> int:
+        return int(self.k_rows.shape[0])
+
+
+def sigma_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
+    """:func:`face_kernel_kwargs` plus ``parent_route`` when possible.
+
+    The route exists when the bundle carries a :class:`ParentGreenCarrier`
+    with canonical parent faces and a plan that names the parents' full-k
+    rows.  ``face_shape`` stays the FULL-k shape: consumers still size
+    their full-k accumulators by it, and the parent extents travel on the
+    route.  Under ``layout='legacy'`` or without such a carrier this is
+    exactly :func:`face_kernel_kwargs`.
+    """
+    result = face_kernel_kwargs(wfns)
+    carrier = wfns.green_parent
+    if (not result or carrier is None
+            or carrier.psi_nmu_canonical is None
+            or getattr(carrier.plan, 'parent_full_rows', None) is None
+            or getattr(carrier.plan, 'sym', None) is None):
+        return result
+    plan = carrier.plan
+    n_parent, ns, mu_packed, nb = (int(v) for v in carrier.psi_mun.shape)
+    mu_can = int(carrier.psi_mun_canonical.shape[2])
+    result["parent_route"] = ParentSigmaRoute(
+        plan=plan,
+        k_rows=np.asarray(plan.parent_full_rows, dtype=np.int32),
+        sym=plan.sym,
+        g_face_shape=(n_parent, nb, mu_packed, ns),
+        proj_face_shape=(n_parent, nb, mu_can, ns),
+    )
+    return result
+
+
+def parent_sigma_operands(wfns: "Wavefunctions"):
+    """The Σ kernel operands of the parent route, in the kernels' slot order.
+
+    ``(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, enk, occ)``: the
+    PACKED parent faces for the G contraction (first operand direct, second
+    conjugated inside ``build_G``), the CANONICAL parent faces for the band
+    projection (first operand conjugated inside the projector), and the
+    parent-row energy/occupation tables.  Same six roles the full-k face
+    call sites fill from ``wfns`` itself.
+    """
+    carrier = wfns.green_parent
+    if carrier is None or carrier.psi_nmu_canonical is None:
+        raise ValueError(
+            "parent_sigma_operands: the bundle carries no projection-capable "
+            "parent carrier (build_packed_parent_green_carrier with the "
+            "canonical faces).")
+    return (carrier.psi_mun, carrier.psi_nmu,
+            carrier.psi_nmu_canonical, carrier.psi_mun_canonical,
+            carrier.enk, carrier.occ)
+
+
 def pack_parent_green_faces(
     psi_rmu_Y_parent, psi_rmuT_X_parent, *, plan, mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array]:
@@ -610,11 +707,34 @@ def pack_parent_green_faces(
         return plan.pack_face_pair(psi_nmu, psi_mun)
 
 
+def parent_faces_canonical(
+    psi_rmu_Y_parent, psi_rmuT_X_parent, *, mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array]:
+    """Raw-parent loader outputs as the two face layouts, canonical order.
+
+    The same two constraints :func:`build_wavefunctions_face` applies to the
+    full-k load, on ``n_parent`` rows; nothing is packed.  These are the
+    projection operands of :class:`ParentGreenCarrier`.
+    """
+    with mesh_xy:
+        psi_nmu = jax.lax.with_sharding_constraint(
+            psi_rmu_Y_parent, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+        psi_mun = jax.lax.with_sharding_constraint(
+            jnp.conj(psi_rmuT_X_parent).transpose(0, 3, 1, 2),
+            NamedSharding(mesh_xy, PSI_MUN_SPEC))
+    return psi_nmu, psi_mun
+
+
 def build_packed_parent_green_carrier(
     wfns: "Wavefunctions", psi_nmu_parent, psi_mun_parent, *, plan,
-    mesh_xy: Mesh,
+    mesh_xy: Mesh, psi_nmu_canonical=None, psi_mun_canonical=None,
 ) -> ParentGreenCarrier:
-    """Bind packed raw-parent faces to the full-k bundle's scalar tables."""
+    """Bind packed raw-parent faces to the full-k bundle's scalar tables.
+
+    ``psi_nmu_canonical``/``psi_mun_canonical`` (:func:`parent_faces_canonical`)
+    make the carrier able to project a canonical full-k operator onto the
+    parent rows' bands; without them it serves Green contractions only.
+    """
     if wfns.layout != "face":
         raise ValueError(
             "build_packed_parent_green_carrier requires layout='face'; "
@@ -643,8 +763,26 @@ def build_packed_parent_green_carrier(
         rep2 = NamedSharding(mesh_xy, P(None, None))
         enk = jax.lax.with_sharding_constraint(enk, rep2)
         occ = jax.lax.with_sharding_constraint(occ, rep2)
+    if (psi_nmu_canonical is None) != (psi_mun_canonical is None):
+        raise ValueError(
+            "build_packed_parent_green_carrier: give both canonical parent "
+            "faces or neither.")
+    if psi_nmu_canonical is not None:
+        n_can = int(psi_nmu_canonical.shape[3])
+        if (tuple(int(v) for v in psi_nmu_canonical.shape)
+                != (int(plan.n_parent), int(wfns.slices.nb_full),
+                    int(plan.nspinor), n_can)
+                or tuple(int(v) for v in psi_mun_canonical.shape)
+                != (int(plan.n_parent), int(plan.nspinor), n_can,
+                    int(wfns.slices.nb_full))):
+            raise ValueError(
+                "build_packed_parent_green_carrier: canonical parent faces "
+                f"{tuple(psi_nmu_canonical.shape)}/"
+                f"{tuple(psi_mun_canonical.shape)} disagree with the plan.")
     return ParentGreenCarrier(
-        psi_nmu=psi_nmu, psi_mun=psi_mun, enk=enk, occ=occ, plan=plan)
+        psi_nmu=psi_nmu, psi_mun=psi_mun, enk=enk, occ=occ, plan=plan,
+        psi_nmu_canonical=psi_nmu_canonical,
+        psi_mun_canonical=psi_mun_canonical)
 
 
 def attach_packed_parent_green_carrier(

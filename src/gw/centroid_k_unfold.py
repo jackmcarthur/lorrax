@@ -104,6 +104,14 @@ class CentroidKUnfoldPlan:
     spatial_ops: np.ndarray | None = None
     translations: np.ndarray | None = None
     fft_grid: np.ndarray | None = None
+    #: The full-k row that IS raw parent ``i`` (``SymMaps.kirr_fullids``): a
+    #: full-k operator selected on these rows is the raw-gauge operator a
+    #: band projection with the raw parent wavefunctions expects.  ``sym``
+    #: is the typed table source for the band-index broadcast back to full
+    #: k (``symmetry_maps.unfold_file_wedge_band_operator``).  ``None`` only on
+    #: hand-assembled test plans.
+    parent_full_rows: np.ndarray | None = None
+    sym: object = None
 
     @property
     def n_parent(self) -> int:
@@ -492,6 +500,12 @@ def build_centroid_k_unfold_plan(
         translations=_readonly(
             np.asarray(sym.translations)[:n_spatial], np.float64),
         fft_grid=_readonly(np.asarray(fft_grid).reshape(3), np.int64),
+        parent_full_rows=(
+            _readonly(np.asarray(sym.kirr_fullids), np.int32)
+            if getattr(sym, 'kirr_fullids', None) is not None
+            and int(np.asarray(sym.kirr_fullids).shape[0]) == parent_k.shape[0]
+            else None),
+        sym=sym,
     )
 
 
