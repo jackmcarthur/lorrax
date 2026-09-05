@@ -526,6 +526,21 @@ def compute_static_photon_sigma(
     sig_x.block_until_ready()
     sig_sx.block_until_ready()
     sig_coh.block_until_ready()
+    # Two-carrier certificate (debug only, replicated (nk, nb, nb) arrays):
+    # Sigma^{AB} = (Sigma^{BA})^dagger requires the CT and TC blocks to
+    # carry the same carrier at each endpoint; the total must be Hermitian
+    # per k whichever four-spinor each Lorentz channel rode.
+    from runtime import debug_print_enabled
+    if debug_print_enabled() and jax.process_index() == 0:
+        for name, arr in (("Sigma_x", sig_x), ("Sigma_sx", sig_sx),
+                          ("Sigma_coh", sig_coh)):
+            diff = float(jnp.max(jnp.abs(
+                arr - jnp.conj(jnp.swapaxes(arr, -1, -2)))))
+            scale = float(jnp.max(jnp.abs(arr)))
+            print_fn(
+                f"  [photon Sigma] packed {name} Hermiticity residual "
+                f"max|S-S^dagger|/max|S| = {diff / max(scale, 1e-300):.3e} "
+                f"(max|S| = {scale:.6e} Ry)")
     zero_matrix = jnp.zeros_like(sig_sx)
     sigma_components = jnp.stack([
         zero_matrix if value is None else value for value in sigma_sector])
