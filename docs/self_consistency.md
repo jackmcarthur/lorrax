@@ -258,6 +258,36 @@ a support that really crosses later is a box escape and rebuilds), and the
 disk cache never returns a certificate above eps. Do not loosen eps to admit
 a rule.
 
+**16. The self-consistent state set is fixed at map 0, with a margin from the
+grid edge.** Re-classifying bands against the (mu-anchored) Sigma window on
+every map made the iteration map discontinuous on Na (86 bands, top +18 eV):
+bands 9-10 reach 17.2 eV at some k and 11-13 straddle the edge, so ~1 eV QP
+shifts moved them in and out of the in-range set map to map and the loop
+floored. From map 1 the trusted set is the one chosen at map 0; the grid still
+re-anchors on each map's mu. At map 0 a band inside the grid whose all-k range
+ends within `SC_EDGE_MARGIN_EV` (2 eV, the SC state pad) of an edge is
+scissored, not self-consistent: at +24 eV band 14 sat 1.7 eV under the top and
+keeping its Gamma multiplet whole had promoted bands 15-23 (up to 16 eV above
+the grid, Sigma clamped) into the protected block, which threw the k=1 triplet
+6.4 eV in one map. A frozen in-range state that leaves the grid refuses with
+the band, the k row, the energy and the deck value that clears it. The log
+lines are `SC partition: N band(s) inside the grid but within 2.0 eV of an
+edge are scissored` and `SC partition: frozen from map 0 (...)`. A window
+whose bands never change class is bit identical.
+
+**17. The active-window scissor law is frozen at map 0.** States inside the
+Sigma window but outside the omega grid follow an affine law fitted to the
+trusted block's shifts; refitting it every map moved Na's 30-96 eV states by
+up to 17.7 eV in one map and fed that back through the sum over states. The
+law fitted at map 0 is carried on every later map input (`SC scissor: frozen
+from map 0 (...)`), as standard QSGW practice gives the states above the
+self-energy subspace one fixed correction. The sum-band tail beyond the
+Sigma window keeps its per-map refit: freezing it moved the Si b80/c504 gap
+by 22 meV at map 6, a closure change on semiconductors that nothing
+justifies. The reviewers' remaining candidates for a metal residual after
+these closures, the per-map MPA pole refit and the sorted-index state
+identity, are registered in the sandbox issues ledger.
+
 ## Evidence
 
 Sandbox reports (paths under
