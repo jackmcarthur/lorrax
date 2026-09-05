@@ -217,6 +217,13 @@ _UNIFORM_RULE_NAMES = (
     "rule_roundoff_amplification", "rule_sup_error",
 )
 
+# Full causal, fixed-phase real-time successor to the historical odd-only
+# sine fit.  SciPy-backed offline fitting, so retain the lazy import boundary.
+_PAIRED_CAUSAL_RULE_NAMES = (
+    "PairedCausalRule", "build_paired_causal_rule",
+    "build_paired_causal_rule_ladder", "evaluate_paired_rule",
+)
+
 # Delivered-error fitting on a weighted complex support.  Also SciPy
 # (linprog), so it lives behind the same lazy door: a production table
 # lookup must not import an optimiser.
@@ -261,6 +268,9 @@ def __getattr__(name: str):
     if name in _UNIFORM_RULE_NAMES:
         from minimax import uniform_rule as _uniform   # noqa: PLC0415
         return getattr(_uniform, name)
+    if name in _PAIRED_CAUSAL_RULE_NAMES:
+        from minimax import paired_causal_rule as _paired  # noqa: PLC0415
+        return getattr(_paired, name)
     if name in _RECIPROCAL_FIT_NAMES:
         from minimax import reciprocal_fit as _measure  # noqa: PLC0415
         return getattr(_measure, name)
@@ -283,6 +293,7 @@ def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
                   | set(_FREQUENCY_FIT_NAMES)
                   | set(_UNIFORM_RULE_NAMES)
+                  | set(_PAIRED_CAUSAL_RULE_NAMES)
                   | set(_RECIPROCAL_FIT_NAMES)
                   | set(_TIME_NODE_SEARCH_NAMES)
                   | set(_MEASURE_WINDOW_NAMES)
@@ -314,6 +325,8 @@ __all__ = [
     *_FREQUENCY_FIT_NAMES,
     # --- uniform denominator-box rules (lazy; scipy) -----------------------
     *_UNIFORM_RULE_NAMES,
+    # --- fixed-eta paired causal real-time rules (lazy; scipy) ---------------
+    *_PAIRED_CAUSAL_RULE_NAMES,
     # --- delivered-error fitting on a weighted support (lazy; scipy) -------
     *_RECIPROCAL_FIT_NAMES,
     *_TIME_NODE_SEARCH_NAMES,
