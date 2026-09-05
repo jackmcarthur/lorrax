@@ -70,6 +70,23 @@ def test_route_scope_is_refused_at_config_resolution(tmp_path, extra, match):
         config(tmp_path, extra)
 
 
+def test_cd_owns_no_driver_mpa_head_plan(tmp_path):
+    from gw.gw_jax import _driver_builds_oneshot_head_response
+
+    cd = config(
+        tmp_path, METAL
+        + "sigma_freq_route = internal_ff_cd\n"
+        + "qp_solver = one_shot_dft\n")
+    assert not _driver_builds_oneshot_head_response(
+        cd, do_screened=True, qp_solver=cd.qp_solver)
+
+    mpa = config(
+        tmp_path, METAL
+        + "qp_solver = one_shot_dft\n")
+    assert _driver_builds_oneshot_head_response(
+        mpa, do_screened=True, qp_solver=mpa.qp_solver)
+
+
 def test_referee_grids_are_fixed_covering_and_nested():
     for width in RESPONSE_WIDTHS_EV:
         grid = real_grid(width)
