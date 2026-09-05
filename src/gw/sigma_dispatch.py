@@ -419,10 +419,11 @@ def sigma_result_on_kset(
 
 
 def _place_band_rotation(U, mesh_xy, dtype):
-    """``U`` as a global array at ``qsgw_density.band_rotation_spec``.
+    """Prepare global ``U`` for the canonical band-rotation jit.
 
-    A no-op ``device_put`` on the SC path (every producer already emits
-    that layout).  The host branch is not dead: on a reduced k-set the
+    Device inputs retain their placement until the rotation jit constrains
+    its temporaries, including uneven logical eigenvector extents. The host
+    branch is not dead: on a reduced k-set the
     k-star broadcast can leave a numpy U, and plain ``jax.device_put`` of
     a host array onto a multi-process sharding fires JAX's hidden replica
     ``assert_equal`` all-gather (common.collectives header).
@@ -431,7 +432,10 @@ def _place_band_rotation(U, mesh_xy, dtype):
 
     sh = NamedSharding(mesh_xy, band_rotation_spec())
     if isinstance(U, jax.Array):
-        return jax.device_put(jnp.asarray(U, dtype=dtype), sh)
+        # Logical eigenvectors can be indivisible after the eigh seam strips
+        # its carrier. The rotation jit constrains its padded temporaries;
+        # eager device_put cannot represent an uneven logical output shard.
+        return jnp.asarray(U, dtype=dtype)
     return device_put_process_local(np.asarray(U, dtype=dtype), sh)
 
 

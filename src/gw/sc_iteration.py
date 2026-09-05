@@ -256,21 +256,12 @@ def protected_band_convergence(
 ) -> ConvergenceVerdict:
     """Has every NON-SCISSORED band moved by less than ``cutoff_ev``?
 
-    ``e_*_ev`` are ``(nk, nb_active)`` eV.  The test set is
-    ``protected_mask | in_range_mask``, both from the ITERATION-LOCAL
-    :class:`~gw.band_partition.BandPartition` -- never a band-index
-    window written down somewhere else.  A frozen window keeps testing
-    the bands that WERE in range; the set that matters is the one this
-    iteration actually treated as physical.
-
-    WHY THE UNION AND NOT ``protected_mask`` ALONE.  The partition is
-    THREE-way and only the third category is scissored:
-    ``apply_band_partition`` substitutes alpha*E_DFT + beta exactly where
-    ``in_range_mask`` is False.  A band in range but NOT protected keeps
-    its own Sigma-derived diagonal and merely loses off-diagonal mixing --
-    a genuine degree of freedom.  Today ``run_sc_driver`` builds both
-    masks from the same ``in_range``, so the two spellings agree; that is
-    a property of that ONE line, not of this predicate.
+    ``e_*_ev`` are ``(nk, nb_active)`` eV, already aligned to map-0
+    QP identities and averaged within exact multiplets by the SC caller.
+    The test set is the frozen ``protected_mask | in_range_mask``: full
+    protected diagonals plus the unprotected in-range diagonals. This is
+    exactly the diagonal-retention mask in ``apply_band_partition``.
+    Callers without rotations (fixed-Sigma EVSC) supply their own labels.
 
     WHY SCISSORED BANDS ARE EXCLUDED.  Their energies are alpha*E_DFT +
     beta with the coefficients refitted each iteration FROM the in-range
@@ -588,6 +579,7 @@ class SCOutputs:
     tail_scissor_fit: ScissorFit | None
     screening: SCMapScreeningArtifacts
     exact_hartree_dft: SCExactHartree | None = None
+    identity: dict | None = None  # map-0 overlap readout; never fed to F(H)
 
 
 @dataclass(frozen=True)
@@ -645,6 +637,10 @@ class SCState:
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
     convergence_verdict: ConvergenceVerdict | None = None
+    # (active_window_fit, sum_band_tail_fit) from map 0, carried on every
+    # later map input so the tail law is fixed for the loop; see
+    # _frozen_scissor_fits.  None on map 0 and on the one-shot path.
+    frozen_scissor_fits: tuple | None = None
 
 
 def _sc_output_tables_on_loop_kset(
@@ -2512,6 +2508,44 @@ def _sc_head_frequency_plan(
     return requests, None, head_omegas
 
 
+# The self-consistent in-range set keeps this margin from the Sigma grid
+# edge: the same 2 eV state pad the frozen box rules use
+# (sigma_box_plan._SC_STATE_PAD_EV), so a band trusted at map 0 has room to
+# move without leaving the grid or dragging off-grid multiplet partners in.
+SC_EDGE_MARGIN_EV = 2.0
+
+
+def _frozen_scissor_fits(state):
+    """The map-0 scissor laws, reused by every later map.
+
+    Refitting the affine tail law from the trusted block's shifts every map
+    moved the 96 eV Na states by up to 17.7 eV in one map (arm D map 3,
+    runs/Na/12_sc_observables_eta05_2026-09-04) and fed that back into the
+    trusted block through the sum over states.  Standard QSGW practice
+    (Kotani-van Schilfgaarde; Questaal) gives the states above the
+    self-energy subspace one fixed correction; that is what this does for
+    the ACTIVE-window scissor (states inside the Sigma window but outside
+    the omega grid).  The sum-band tail beyond the Sigma window keeps its
+    per-map refit: freezing it changed the Si QSGW gap by 22 meV.
+    Returns (active_window_fit, sum_band_tail_fit); the second element is
+    carried for the record and not consumed.
+    """
+    if int(getattr(state, "iteration", 0)) <= 0:
+        return None, None
+    fits = getattr(state, "frozen_scissor_fits", None)
+    if fits is None:
+        return None, None
+    return tuple(fits)
+
+
+def _capture_frozen_scissor_fits(outputs):
+    """The pair to carry forward, taken from the FIRST map's outputs."""
+    if outputs is None:
+        return None
+    return (getattr(outputs, "scissor_fit", None),
+            getattr(outputs, "tail_scissor_fit", None))
+
+
 def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
     """Run-derived Schmitt margin for the re-anchored Sigma window."""
     # Half a sampled omega bin is unresolved by the grid.  Metallic
@@ -2522,6 +2556,59 @@ def _partition_hysteresis_margin_ev(inputs: SCInputs) -> float:
         0.5 * float(inputs.config.sigma.omega_step_ev),
         float(inputs.config.occ_broadening_ry) * RYD_TO_EV,
     )
+
+
+def _refuse_frozen_partition_escape(
+    partition, e_active_kn_ev, *, band_offset: int, omega_min_abs_ev: float,
+    omega_max_abs_ev: float, tolerance_ev: float, omega_step_ev: float,
+    iteration: int, print_fn=print) -> float:
+    """Check every frozen protected/in-range state is still on the grid.
+
+    Returns the smallest remaining margin to an edge (eV).  A state farther
+    outside than ``tolerance_ev`` (half an omega bin or the occupation
+    broadening, whichever is larger) refuses with the band, the k row, the
+    energy, the edge it crossed, and the deck value that would clear it by
+    the SC state pad (2 eV, rounded up to the omega step).
+    """
+    # Only the in-range set is checked: those bands were inside the grid at
+    # every k at map 0.  Protected-but-out-of-range bands exist by design
+    # (whole-multiplet promotion across the edge, warned by the partition
+    # constructor) and keep the historical edge clamp.
+    trusted = np.asarray(partition.in_range_mask, dtype=bool).reshape(-1)
+    e = np.asarray(e_active_kn_ev, dtype=np.float64)
+    if not trusted.any():
+        return float("inf")
+    cols = np.flatnonzero(trusted)
+    sub = e[:, cols]
+    margin_top = float(omega_max_abs_ev - sub.max())
+    margin_bot = float(sub.min() - omega_min_abs_ev)
+    print_fn(
+        f"    SC partition: frozen from map 0 "
+        f"({_band_ranges(trusted, band_offset=band_offset)}, "
+        f"{int(trusted.sum())} of {trusted.size}); edge margins now "
+        f"{margin_bot:.3f} eV (bottom) / {margin_top:.3f} eV (top)")
+    worst = min(margin_top, margin_bot)
+    if worst >= -float(tolerance_ev):
+        return worst
+    pad = 2.0
+    if margin_top < margin_bot:
+        k, j = np.unravel_index(int(np.argmax(sub)), sub.shape)
+        edge, key = "top", "sigma_omega_max_ev"
+        need = np.ceil((sub.max() + pad - omega_max_abs_ev) / omega_step_ev) * omega_step_ev
+    else:
+        k, j = np.unravel_index(int(np.argmin(sub)), sub.shape)
+        edge, key = "bottom", "sigma_omega_min_ev"
+        need = -np.ceil((omega_min_abs_ev - sub.min() + pad) / omega_step_ev) * omega_step_ev
+    band = int(band_offset + cols[j] + 1)
+    raise ValueError(
+        f"SC map {iteration}: frozen in-range band {band} left the Sigma grid "
+        f"at the {edge} edge: E(k={int(k)}, band {band}) = {sub[k, j]:.3f} eV "
+        f"against the edge at {omega_max_abs_ev if edge == 'top' else omega_min_abs_ev:.3f} eV "
+        f"(overshoot {-worst:.3f} eV, tolerance {tolerance_ev:.3f} eV). The "
+        f"partition is fixed at map 0 so the map stays continuous; widen the "
+        f"grid by {abs(need):.2f} eV ({key} moved {'up' if edge == 'top' else 'down'} "
+        f"by that amount, which clears the state by the 2 eV SC pad) or "
+        f"shrink the trusted set with ncond.")
 
 
 def _state_partition(state: SCState, inputs: SCInputs) -> BandPartition:
@@ -2607,10 +2694,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # hidden assert_equal; same rank-invariance argument, and here
             # each rank stages only its own nb²/(px·py) block).
             E_qp_ry = device_put_process_local(E_np, rep2)
+            from runtime.padding import pad_square, padded_axis
+            rotation_spec = _band_rotation_spec()
+            rotation_axis = padded_axis(
+                nb, inputs.mesh_xy, name="SC initial band rotation",
+                specs=((rotation_spec, 1), (rotation_spec, 2)))
             U_qp = device_put_process_local(
-                np.broadcast_to(
+                pad_square(np.broadcast_to(
                     np.eye(nb, dtype=np.complex128), H_np.shape),
-                NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
+                    rotation_axis, pad_diagonal=1.0),
+                NamedSharding(inputs.mesh_xy, rotation_spec))
+            # Match distributed_eigh_bands' logical return seam while
+            # preserving an exact identity in degenerate DFT subspaces.
+            U_qp = U_qp[:, :nb, :nb]
     if E_qp_ry is None:
         # TWO INDEPENDENT DECISIONS, and they used to be one condition.
         #
@@ -2774,17 +2870,41 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # and bands as inputs.e_dft_active_kn_ry, which is what the partition
         # masks are applied to.
         _e_active_now = np.asarray(E_full, dtype=np.float64)
-        partition = build_omega_band_partition(
-            _e_active_now, np.asarray(enk_entry, dtype=np.float64),
-            band_offset=int(inputs.band_slices.b0),
-            omega_min_abs_ev=float(inputs.config.sigma.omega_min_ev) + _mu_ev,
-            omega_max_abs_ev=float(inputs.config.sigma.omega_max_ev) + _mu_ev,
-            previous_partition=(state.partition
-                                if state.partition is not None
-                                else inputs.partition),
-            hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
-            label=f"SC map {int(state.iteration)} (mu-anchored)",
-            print_fn=inputs.print_fn)
+        _omega_lo = float(inputs.config.sigma.omega_min_ev) + _mu_ev
+        _omega_hi = float(inputs.config.sigma.omega_max_ev) + _mu_ev
+        if int(state.iteration) > 0 and state.partition is not None:
+            # STATE IDENTITY IS FIXED AT MAP 0.  Re-classifying bands against
+            # the window every map made the map discontinuous: on Na
+            # (86 bands, top +18 eV) bands 9-10 reach 17.2 eV and bands 11-13
+            # straddle the edge, so a ~1 eV QP shift moved them in and out of
+            # the in-range set map to map (5-10 -> 5-8, protected 5-10 <->
+            # 5-13), and the loop floored at 60 meV per map on the Fermi
+            # window (runs/Na/12_sc_observables_eta05_2026-09-04, arms A/D/E).
+            # The grid still re-anchors on this map's mu; only the set of
+            # bands trusted on it is frozen.  A frozen state whose energy
+            # leaves the grid refuses with the window value that clears it,
+            # instead of the silent edge clamp.
+            partition = state.partition
+            _refuse_frozen_partition_escape(
+                partition, _e_active_now * RYD_TO_EV,   # E_full is in Ry
+                band_offset=int(inputs.band_slices.b0),
+                omega_min_abs_ev=_omega_lo, omega_max_abs_ev=_omega_hi,
+                tolerance_ev=_partition_hysteresis_margin_ev(inputs),
+                omega_step_ev=float(inputs.config.sigma.omega_step_ev),
+                iteration=int(state.iteration), print_fn=inputs.print_fn)
+        else:
+            partition = build_omega_band_partition(
+                _e_active_now, np.asarray(enk_entry, dtype=np.float64),
+                band_offset=int(inputs.band_slices.b0),
+                omega_min_abs_ev=_omega_lo,
+                omega_max_abs_ev=_omega_hi,
+                previous_partition=(state.partition
+                                    if state.partition is not None
+                                    else inputs.partition),
+                hysteresis_margin_ev=_partition_hysteresis_margin_ev(inputs),
+                edge_margin_ev=SC_EDGE_MARGIN_EV,
+                label=f"SC map {int(state.iteration)} (mu-anchored)",
+                print_fn=inputs.print_fn)
     partition = _apply_sc_buffer_partition(partition, inputs)
     buffer_mask = _sc_buffer_mask(inputs)
     if buffer_mask.any():
@@ -2897,6 +3017,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if scissor_classes is not None:
             valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
             fit_mask_kn = fit_mask_kn & ~crossing_kn
+        # The SUM-BAND tail (bands beyond the Sigma window) keeps its
+        # per-map refit: freezing it moved the Si b80/c504 QSGW gap by 22 meV
+        # at map 6 (si_p4_replay4 vs attempt 3), a closure change on
+        # semiconductors that nothing here justifies.  Only the ACTIVE-window
+        # scissor (states inside the Sigma window but outside the omega grid,
+        # Na's 14-86) is frozen; see _frozen_scissor_fits.
         tail_fit = fit_scissor(
             E_dft_kn_ev=e_dft_fit_ev,
             E_qp_kn_ev=(
@@ -3387,6 +3513,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # EQP2.  ``ks`` is deliberately passed rather than spelling weights:
     # the fit is a reduction over k and must use the multiplicities of the
     # exact rows selected above.
+    _frozen_active, _frozen_tail_unused = _frozen_scissor_fits(state)
+    if _frozen_active is not None:
+        inputs.print_fn(
+            f"    SC scissor: frozen from map 0 ({_frozen_active.summary()})")
     H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, partition, ks,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
@@ -3395,7 +3525,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             H, inputs=inputs, kstar=ks, n_occ=n_occ,
             use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
-        scissor_fit=tail_fit,
+        scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
@@ -3867,6 +3997,124 @@ def _band_ranges(mask, *, band_offset: int) -> str:
         str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
 
 
+def _identity_eigh(h_host):
+    """Host eigensolve for the identity readout (a seam the tests patch)."""
+    return np.linalg.eigh(h_host)
+
+
+def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
+                          history, *, cutoff_ev):
+    """Read a map in frozen QP identities; retain only small host diagnostics.
+
+    The reference is the first map OUTPUT. Its labels are the trusted DFT
+    bands: at map 0 each trusted DFT band is assigned (by multiplet
+    overlap through the map's own input rotation) to the output column
+    that carries it, and later maps are matched to THOSE columns. Sorted
+    position is not identity: on Na (+15 eV top) the scissored Gamma
+    triplet 11-13 lands below the protected doublet at sorted 9-11, so a
+    sorted-band mask cut an exact multiplet and the readout refused
+    (arms N1/N2, 2026-09-05). Every returned table is indexed by DFT
+    band. Output eigenvectors come from the host eigensolve of the
+    gathered carry; the map's retained ``sigma_basis_U`` supplies its
+    input eigenvectors. Neither eigenvectors nor assignments replace the
+    Hamiltonian carry.
+    """
+    from common.collectives import gather_to_host
+    from .sc_state_identity import assign_qp_identity
+
+    partition = _state_partition(state_out, inputs)
+    protected = np.asarray(partition.protected_mask, dtype=bool)
+    in_range = np.asarray(partition.in_range_mask, dtype=bool)
+    mask = protected | in_range
+    # HOST EIGENVECTORS FOR A HOST READOUT.  The band-sharded eigh kernel
+    # requires the band count to divide both mesh axes; the carry is not
+    # padded here (the core tier's 3-band fixture on a 2x2 mesh raised
+    # IndivisibleError, 2026-09-05).  The identity is a diagnostic over
+    # |overlap|^2, phase-free, and (nk_loop, nb, nb) is small: diagonalise
+    # the gathered carry on the host.
+    h_host = np.asarray(gather_to_host(state_out.H_qp_dft))
+    h_host = 0.5 * (h_host + np.conj(np.swapaxes(h_host, -1, -2)))
+    _, u_out = _identity_eigh(h_host)
+    u_out = np.asarray(u_out)
+    u_in = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))
+    nb = e_output_ev.shape[1]
+    u_in = u_in[:, :nb, :nb]
+    u_out = u_out[:, :nb, :nb]
+    kw = dict(degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
+    if not history:
+        # DFT band -> map-0 output column, whole DFT multiplets (the
+        # partition promotes to whole multiplets, so the trusted band mask
+        # never cuts one in the input spectrum).
+        slot, _, blocks0, _ = assign_qp_identity(
+            u_in, e_input_ev, u_out, e_output_ev, mask, **kw)
+        found = slot >= 0
+        labels = np.zeros(slot.shape, dtype=bool)
+        labels[np.nonzero(found)[0], slot[found]] = True
+        # The reference groups are the DFT (symmetry) multiplets, not the
+        # adjacent-gap groups of the map-0 output spectrum: a degenerate
+        # pair that the map splits by more than the exact tolerance would
+        # otherwise become two gauge-dependent singlets.  Members of one
+        # DFT multiplet therefore carry their block-mean output energy in
+        # the reference spectrum (Si replay6, 2026-09-05).
+        e_ref = np.array(e_output_ev, dtype=np.float64)
+        for k in range(slot.shape[0]):
+            for block in np.unique(blocks0[k][blocks0[k] >= 0]):
+                members = slot[k, blocks0[k] == block]
+                e_ref[k, members] = e_ref[k, members].mean()
+        history.update(u=u_out.copy(), e=e_ref, mask=mask.copy(),
+                       labels=labels, slot=slot, previous=None)
+    if not np.array_equal(mask, history['mask']):
+        raise ValueError('SC identity: trusted mask changed after map 0')
+    slot = history['slot']
+    found = slot >= 0
+    rows = np.arange(slot.shape[0])[:, None]
+    cols = np.where(found, slot, 0)
+    dft_of_label = np.full(slot.shape, -1, dtype=int)
+    dft_of_label[np.nonzero(found)[0], slot[found]] = np.nonzero(found)[1]
+
+    def by_dft_band(table, fill):
+        # label-indexed (map-0 output column) -> DFT-band-indexed
+        return np.where(found, np.asarray(table)[rows, cols], fill)
+
+    args = (history['u'], history['e'], )
+    out_index, out_e, block_label, weight = assign_qp_identity(
+        *args, u_out, e_output_ev, history['labels'], **kw)
+    in_index, in_e, _, _ = assign_qp_identity(
+        *args, u_in, e_input_ev, history['labels'], **kw)
+    out_index, in_index = by_dft_band(out_index, -1), by_dft_band(in_index, -1)
+    out_e, in_e = by_dft_band(out_e, np.nan), by_dft_band(in_e, np.nan)
+    weight = by_dft_band(weight, np.nan)
+    # block labels in DFT-band terms, from the same reference grouping that
+    # produced the block means (so the eqp comments and the body agree)
+    first_label = by_dft_band(block_label, 0)
+    blocks = np.where(found, dft_of_label[rows, first_label], -1)
+    # Preserve the legacy all-band RMS as a sorted diagnostic. Only trusted
+    # columns enter the criterion and receive the overlap/block-mean readout.
+    aligned_in, aligned_out = np.array(e_input_ev), np.array(e_output_ev)
+    aligned_in[:, mask], aligned_out[:, mask] = in_e[:, mask], out_e[:, mask]
+    verdict = protected_band_convergence(
+        aligned_out, aligned_in, protected, in_range, cutoff_ev)
+    sorted_verdict = protected_band_convergence(
+        e_output_ev, e_input_ev, protected, in_range, cutoff_ev)
+    verdict = replace(verdict, rms_all_ev=sorted_verdict.rms_all_ev)
+    previous = history['previous']
+    motion = (np.full(out_e.shape, np.nan) if previous is None else out_e - previous)
+    history['previous'] = out_e.copy()
+    reassigned = np.sum(out_index[:, mask] != np.flatnonzero(mask), axis=1)
+    worst_k = int(np.argmax(reassigned))
+    info = dict(input_indices=in_index, output_indices=out_index,
+                blocks=blocks, input_ev=in_e, output_ev=out_e,
+                residual_ev=out_e-in_e, motion_ev=motion, weight=weight,
+                sorted_max_ev=sorted_verdict.max_abs_ev)
+    state_out = replace(state_out, outputs=replace(state_out.outputs, identity=info))
+    _record_sc(inputs,
+        f'SC identity: max |dE| by overlap = {verdict.max_abs_ev:.9e} eV '
+        f'(sorted-index value {sorted_verdict.max_abs_ev:.9e} eV; '
+        f'{int(reassigned[worst_k])} reassignments at k={worst_k}; '
+        f'total={int(reassigned.sum())})')
+    return verdict, state_out
+
+
 def _sc_map_gain_for_call(
     inputs: SCInputs,
     state_out: SCState,
@@ -3889,6 +4137,17 @@ def _sc_map_gain_for_call(
             "SC map gain: retained E and Sigma tables must already share "
             f"the loop k-set and band window, got E={e_now.shape}, "
             f"Sigma={sigma_now.shape}")
+    identity = getattr(state_out.outputs, 'identity', None)
+    if identity is not None:
+        e_now = e_now.copy()
+        sigma_aligned = sigma_now.copy()
+        for k, block_row in enumerate(identity['blocks']):
+            for block in np.unique(block_row[block_row >= 0]):
+                labels = np.flatnonzero(block_row == block)
+                columns = identity['input_indices'][k, labels]
+                e_now[k, labels] = identity['input_ev'][k, labels]
+                sigma_aligned[k, labels] = sigma_now[k, columns].mean()
+        sigma_now = sigma_aligned
     current = (e_now.copy(), sigma_now.copy())
     if previous is None:
         return None, current
@@ -4034,8 +4293,10 @@ def _write_sc_eqp_snapshot(
     # mask, fallback, membership test, convergence test, or map update here.
     eqp1_output = e_eval + z_factor * (e_output - e_eval)
 
+    snapshot_partition = _state_partition(state_out, inputs)
     active_scissored = np.flatnonzero(
-        ~np.asarray(inputs.partition.in_range_mask, dtype=bool))
+        ~(np.asarray(snapshot_partition.protected_mask, dtype=bool)
+          | np.asarray(snapshot_partition.in_range_mask, dtype=bool)))
     band_offset = int(inputs.band_slices.sigma.start)
     active_labels = ",".join(
         str(band_offset + int(i) + 1) for i in active_scissored)
@@ -4080,6 +4341,32 @@ def _write_sc_eqp_snapshot(
     ]
     if map_gain is not None:
         comments.insert(2, map_gain.stamp())
+    identity = getattr(state_out.outputs, 'identity', None)
+    if identity is not None:
+        tables = {key: _loop_to_file_wedge(identity[key]) for key in
+                  ('input_indices', 'output_indices', 'blocks', 'input_ev',
+                   'output_ev', 'residual_ev', 'motion_ev', 'weight')}
+        comments.append('SC_identity refers to eqp0 map output; labels are '
+                        'the trusted DFT bands, matched at map 0 to the output '
+                        'columns that carry them; QP multiplet means; '
+                        'k_file_0based indexes the k block, body columns '
+                        'remain ispin, iband, E_DFT, E_QP')
+        for k, row in enumerate(tables['blocks'].astype(int)):
+            for block in np.unique(row[row >= 0]):
+                labels = np.flatnonzero(row == block)
+                first = labels[0]
+                def band_list(a):
+                    return ','.join(str(int(v) + band_offset + 1) for v in a)
+                comments.append(
+                    f'SC_identity k_file_0based={k} '
+                    f'map0_bands_1based={band_list(labels)} '
+                    f'input_sorted_bands_1based={band_list(tables["input_indices"][k, labels])} '
+                    f'output_sorted_bands_1based={band_list(tables["output_indices"][k, labels])} '
+                    f'E_input_mean_ev={tables["input_ev"][k, first]:.12e} '
+                    f'E_output_mean_ev={tables["output_ev"][k, first]:.12e} '
+                    f'residual_ev={tables["residual_ev"][k, first]:.12e} '
+                    f'motion_ev={tables["motion_ev"][k, first]:.12e} '
+                    f'projector_weight={tables["weight"][k, first]:.12e}')
     comments = tuple(comments)
     path = os.path.join(
         inputs.input_dir, f"eqp0_iter{int(call_index):04d}.dat")
@@ -4217,13 +4504,8 @@ def run_self_consistency(
         e_new_ev = (
             np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
         rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
-        verdict = protected_band_convergence(
-            e_new_ev, e_initial_ev,
-            np.asarray(_state_partition(state_new, inputs).protected_mask,
-                       dtype=bool).reshape(-1),
-            np.asarray(_state_partition(state_new, inputs).in_range_mask,
-                       dtype=bool).reshape(-1),
-            tol_ev)
+        verdict, state_new = _sc_identity_for_call(
+            inputs, state_new, e_initial_ev, e_new_ev, {}, cutoff_ev=tol_ev)
         state_new = replace(state_new, convergence_verdict=verdict)
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
@@ -4284,6 +4566,7 @@ def _run_linear_mixing(
     #: was stamped from the wrong one.
     _out_history: list[np.ndarray] = [E_prev_ev.copy()]
     gain_previous: tuple[np.ndarray, np.ndarray] | None = None
+    identity_history = {}
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
@@ -4301,9 +4584,14 @@ def _run_linear_mixing(
             partition=state.partition,
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
+            frozen_scissor_fits=state.frozen_scissor_fits,
         )
         map_input = state
         state_map = gw_iteration_map(map_input, inputs)
+        if map_input.frozen_scissor_fits is None:
+            _frozen_fits = _capture_frozen_scissor_fits(state_map.outputs)
+        else:
+            _frozen_fits = map_input.frozen_scissor_fits
         E_candidate_ev = (
             np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
         # Outputs, W and head all describe the MAP INPUT.  Record that exact
@@ -4330,6 +4618,7 @@ def _run_linear_mixing(
             partition=_state_partition(state_map, inputs),
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
+            frozen_scissor_fits=_frozen_fits,
         )
         E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -4348,13 +4637,9 @@ def _run_linear_mixing(
         # break on ``rms < tol_ev`` -- an RMS over ALL active bands
         # including the scissored ones, both the looser test and a
         # different set.
-        verdict = protected_band_convergence(
-            E_candidate_ev, E_prev_ev,
-            np.asarray(_state_partition(state_map, inputs).protected_mask,
-                       dtype=bool),
-            np.asarray(_state_partition(state_map, inputs).in_range_mask,
-                       dtype=bool),
-            tol_ev)
+        verdict, state_map = _sc_identity_for_call(
+            inputs, state_map, E_prev_ev, E_candidate_ev, identity_history,
+            cutoff_ev=tol_ev)
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
         # a stamp computed from ``E_new_ev`` (post-mix) described a
@@ -4568,6 +4853,8 @@ def _run_rcrop(
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
+    _identity_history = {}
+    _frozen_fits: list = [getattr(state_init, "frozen_scissor_fits", None)]
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -4600,9 +4887,12 @@ def _run_rcrop(
             partition=_partition[0],
             occupation_state=_occ_state[0],
             head_surface_weight_kn=_head_surface_weight[0],
+            frozen_scissor_fits=_frozen_fits[0],
         )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
+        if _frozen_fits[0] is None:
+            _frozen_fits[0] = _capture_frozen_scissor_fits(state_out.outputs)
         _partition[0] = _state_partition(state_out, inputs)
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
@@ -4616,13 +4906,9 @@ def _run_rcrop(
         # difference can be driven small by damping while F still has no
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
-        _verdict = protected_band_convergence(
-            E_new, E_in,
-            np.asarray(_state_partition(state_out, inputs).protected_mask,
-                       dtype=bool),
-            np.asarray(_state_partition(state_out, inputs).in_range_mask,
-                       dtype=bool),
-            tol_ev)
+        _verdict, state_out = _sc_identity_for_call(
+            inputs, state_out, E_in, E_new, _identity_history, cutoff_ev=tol_ev)
+        _last_outputs[0] = state_out.outputs
         _last_verdict[0] = _verdict
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
@@ -5281,6 +5567,7 @@ def run_sc_driver(
         band_offset=int(band_slices.b0),
         omega_min_abs_ev=omega_min_ev,
         omega_max_abs_ev=omega_max_ev,
+        edge_margin_ev=SC_EDGE_MARGIN_EV,
         label="SC", print_fn=print_fn)
 
     # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two
@@ -5532,8 +5819,14 @@ def run_sc_driver(
     # than a slow success — and plain ``jax.device_put`` of a host array
     # fires the hidden replica ``assert_equal`` all-gather.  ``_place``
     # routes each kind correctly; only the spec changed.
-    U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
-               _band_rotation_spec())
+    U = state_final.outputs.sigma_basis_U
+    # An eigh-stripped logical device rotation can have uneven band axes.
+    # Keep its existing placement until the Sigma receipt pads it below;
+    # the logical-only contractions constrain their temporaries inside jit.
+    if not (isinstance(U, jax.Array)
+            and sigma_result.sigma_band_axis is not None
+            and sigma_result.sigma_band_axis.pad > 0):
+        U = _place(U, mesh_xy, _band_rotation_spec())
     U_sigma = U
     if sigma_result.sigma_band_axis is not None:
         from runtime.padding import pad_square

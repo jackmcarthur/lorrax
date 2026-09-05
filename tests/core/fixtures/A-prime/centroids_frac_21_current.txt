@@ -1,0 +1,32 @@
+# LORRAX ISDF centroid coordinates (fractional crystal units)
+# feature fit: left=(0, 3), right=(0, 7): sqrt(sum_k w_k sum_i,m,n |Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights
+# source wavefunctions: /pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-prime-e9f9825cc44e557806680192fdd0185af41eaabc970507c51bb8b61233e0fc80/WFN.h5
+# selection metric: sqrt(diag q=0 transverse Gram), left=(0, 3), right=(0, 7), unit band weights
+# electrons: 3; occupied-band boundary: 3
+# FFT grid: (15, 15, 15); k grid: (3, 3, 1); shift: (0.0, 0.0, 0.0)
+# selection: weighted k-means; seed=42; rho_power=1; requested=21; candidates=32; written=21
+# pruning: pivoted Cholesky; achieved numerical rank=21; pair-density windows left=(0, 3), right=(0, 7) (explicit feature pair)
+# symmetry closure: orbit-aware; spatial operations=1
+# coordinates: x y z snapped to FFT grid; 21 unique points
+# intended channels: gamma^{1,2,3} (current) ISDF
+0.666667 0.466667 0.866667
+0.733333 0.466667 0.733333
+0.133333 0.133333 0.266667
+0.666667 0.333333 0.800000
+0.733333 0.200000 0.733333
+0.466667 0.466667 0.733333
+0.266667 0.266667 0.400000
+0.666667 0.533333 0.600000
+0.600000 0.600000 0.733333
+0.066667 0.333333 0.333333
+0.466667 0.333333 0.800000
+0.200000 0.066667 0.133333
+0.666667 0.400000 0.666667
+0.533333 0.266667 0.933333
+0.333333 0.133333 0.266667
+0.533333 0.400000 0.600000
+0.600000 0.266667 0.733333
+0.200000 0.066667 0.466667
+0.533333 0.466667 0.866667
+0.066667 0.466667 0.533333
+0.200000 0.400000 0.266667

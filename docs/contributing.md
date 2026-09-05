@@ -34,7 +34,7 @@ Both rules have machine enforcement: `tests/test_layering.py` for the import
 direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 `tests/test_env_registry.py` for the environment surface.
 
-## Two test tiers: the default gate and the census
+## Test tiers
 
 > **THE FOUR-GPU RULE — every GPU verification leg runs at P=4.** It applies to
 > both tiers below. A P=1-only verification is never sufficient for landing;
@@ -44,54 +44,35 @@ direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 > four GPUs on the node; a driver leg wants `-G 4` rather than the one-GPU
 > default.
 
-There are exactly two ways to run the suite, and they answer different
-questions.
+The ordinary developer verdict is a two-minute core over tiny cached systems.
+The old suite is the nightly full tier.
 
 ```bash
-uv run python -m pytest -q            # DEFAULT GATE — minutes
-uv run python -m pytest -q --census   # THE CENSUS — everything
-lx test                               # Perlmutter: the default gate
-lx test --census                      # Perlmutter: the census
+uv run python -m pytest -q                 # default core
+uv run python -m pytest -q --full          # nightly full tier
+lx test                                    # developer pre-push
+lx test --full                             # nightly
 ```
 
-The **default gate** is the owner's sentence, implemented: run the Si
-end-to-end test calculation for the drivers your branch actually touched,
-plus every service's own suite, and have that basically be it. It is what you
-run after a change. It is minutes, not tens of minutes, and it is minutes
-because it is a handful of real end-to-end driver runs rather than a thousand
-unit cells.
+The default core authenticates and runs only the tiny A/B fixture family plus
+the exact service/runtime roster in `tests/core/manifest.py`. It covers the
+major modules and one hostile size per contract without running a production
+deck. `--core-extended` adds redundant standalone tiny drivers and optional
+provider checks while staying below ten minutes.
 
-The **census** is everything, and it is what a bare `pytest` used to be —
-the same collected set, unchanged. It is what `tests/KNOWN_FAILURES.md`
-accounts for, and it is what you run before a release, after a merge wave, or
-whenever you want the whole accounting rather than a verdict on your change.
+The **full tier** owns the historical real-deck regressions, per-defect twins,
+and `tests/KNOWN_FAILURES.md` accounting. `--census` and `-m census` remain
+compatible aliases. A named path, `-m`, `-k`, or service-selection option is
+an explicit selection and stands the default narrowing down.
 
-Why the split exists, in the owner's words: the suite accreted a per-fix unit
-cell for every bug the tree ever had, and running all of them on every branch
-stopped being a signal and started being a tax. **Nothing was deleted.** Every
-red-twin and gate cell still exists, still has to be green, and still runs —
-under `--census` rather than on every invocation.
-
-Which drivers count as "touched" is decided by a deliberately coarse
-file→driver map in `tests/fast_gate.py` — `src/bse/*`
-reaches the BSE drivers, `src/gw/*` the GW drivers, `src/psp/*` and
-`src/common/*` reach everything, a service reaches its own suite and its
-dependents, and **anything unmapped reaches everything**, which is the
-fail-safe direction. The same file names the drivers that have no runnable
-in-tree deck; touch one of those and the run tells you, out loud, that the
-default gate says nothing about it.
-
-The gate stands down and you get the census whenever you have already said
-what you want: `--census`, `-m`, `-k`, a named path, `--no-services`,
-`--only-service`, or `LX_CENSUS=1` in the environment. `LX_GATE_DRIVERS`
-(`all` / `none` / a comma-separated list) overrides the diff, and
-`LX_GATE_REF` changes the base the diff is taken against (default:
-merge-base with `origin/main`).
+Fixture generation is not part of either timing. `lx test --build-fixtures`
+builds or hits the hash-addressed QE cache, verifies the committed SHA-256
+reference stamps, and exits without running tests.
 
 ## Before committing
 
-- `uv run python -m pytest -q` after anything longer than a one-liner — the
-  default gate. Run `--census` before you ask anyone to land it.
+- `lx test` is the developer pre-push verdict. Run `lx test --full` in the
+  nightly/release lane.
 - `tools/release_check.sh` is the one command that runs the pre-push set: the
   login-node AST suites (layering, cross-file, env registry, env grammar, FFT
   shard-map), the input-reference drift check, and the origin-delta blob and

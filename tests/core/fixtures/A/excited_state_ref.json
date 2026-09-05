@@ -1,0 +1,36 @@
+{
+  "bse_tda_eigenvalues_ev": [
+    4.29738,
+    4.5856
+  ],
+  "exciton_bands_ev": [
+    [
+      4.297375,
+      4.585595
+    ],
+    [
+      4.168802,
+      4.996192
+    ]
+  ],
+  "htransform_path_ev": [
+    [
+      -39.08480353,
+      -1.81504693
+    ],
+    [
+      -39.10839497,
+      -0.98012694
+    ],
+    [
+      -39.00565277,
+      0.0
+    ]
+  ],
+  "reference_source_commit": "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0",
+  "tolerances_ev": {
+    "bse_tda": 2e-05,
+    "exciton_bands": 2e-05,
+    "htransform": 2e-05
+  }
+}

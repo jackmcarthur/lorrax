@@ -1160,7 +1160,7 @@ _CLI_CELLS = [
     ("scalapack_hostile_extents", "cpu",
      lambda mesh, dt: check_hostile_extents_through_the_ffi(
          mesh, dt, backend="scalapack", op="solve_lu")),
-    ("slate_factor_solve", "",
+    ("slate_factor_solve", "cpu",
      lambda mesh, dt: check_slate_factor_solve(mesh, dt)),
     ("cusolvermp_factor_solve", "CUDA",
      lambda mesh, dt: check_cusolvermp_factor_solve(mesh, dt)),
@@ -1182,7 +1182,7 @@ _CLI_CELLS = [
     ("matmul_scalapack", "cpu",
      lambda mesh, dt: check_distributed_matmul(
          mesh, dt, backend="scalapack", batched_route="auto", nq=4)),
-    ("matmul_slate", "",
+    ("matmul_slate", "cpu",
      lambda mesh, dt: check_distributed_matmul(
          mesh, dt, backend="slate", batched_route="auto", nq=4)),
     ("gemm_plan_cublasmp", "CUDA",

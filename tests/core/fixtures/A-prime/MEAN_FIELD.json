@@ -1,0 +1,27 @@
+{
+  "cache": "/pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-prime-e9f9825cc44e557806680192fdd0185af41eaabc970507c51bb8b61233e0fc80",
+  "cold_build_seconds": 56.0,
+  "input_sha256": "e9f9825cc44e557806680192fdd0185af41eaabc970507c51bb8b61233e0fc80",
+  "outputs": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "Li.upf": "3654e8a51fb6c60c124c97ea3a67a54c87a0e477e49effd65aa73a45288f48f9",
+    "WFN.h5": "d25271194e110be962cb01a9bdc8b2fbe6d89b68baaf4906d371f165745d1d26",
+    "centroids_frac_21_current.txt": "041b3cef2b97603e6e205d97480f7c0eedce53021b0225b480a1d70c0edbd63c",
+    "data-file-schema.xml": "df38ff17135abcc318ec5a367c2f2f592a52691862335dfa27606a68cc36781e",
+    "kmeans_current.out": "c6a0a8d2ec079fdf4289928838b341b6abf37ea8a5ffe1214d7eebabcff84e2b"
+  },
+  "pseudopotentials": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "Li.upf": "3654e8a51fb6c60c124c97ea3a67a54c87a0e477e49effd65aa73a45288f48f9"
+  },
+  "schema": "lorrax-core-mean-field-v1",
+  "source_commit": "298c89ac588300460f241191bff2e65d8a50b824",
+  "source_dirty": false,
+  "staged_cache_reused": true,
+  "system": "A-prime",
+  "tools": {
+    "pw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw.x",
+    "pw2bgw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw2bgw.x",
+    "wfn2hdf.x": "/global/common/software/nersc9/berkeleygw/zen3/gcc-12/mpich/berkeleygw/BerkeleyGW-4.0/bin/wfn2hdf.x"
+  }
+}

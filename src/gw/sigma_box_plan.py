@@ -282,6 +282,12 @@ def _rule_cache_lookup(
                         or float(data["roundoff_amplification"])
                         > noise_amplification_cap):
                     continue
+                # A cached certificate above eps is not a rule for this
+                # request, whatever its node count; it must not shadow a
+                # buildable accurate one (Na pole-tail, 2026-09-05).
+                if (not np.isfinite(float(data["sup_error"]))
+                        or float(data["sup_error"]) > eps):
+                    continue
                 cached_box = tuple(float(value) for value in data["box"])
                 if not (cached_box[0] <= box[0]
                         and cached_box[1] >= box[1]
@@ -306,11 +312,33 @@ def _rule_cache_lookup(
     return best, tuple(warnings)
 
 
+def _rule_is_certified(rule, eps) -> bool:
+    """A rule is a rule only if every number in it is finite and sup <= eps.
+
+    A finite ``sup_error`` beside NaN nodes or weights is not a certificate
+    (lane QUADCHECK's boundary probe, JID 57930535.148, 2026-09-05): the
+    executor would multiply NaN into every Sigma element and the noise gate
+    compares NaN with a ceiling, which never refuses.
+    """
+    times = np.asarray(rule.times)
+    weights = np.asarray(rule.weights)
+    return bool(
+        times.size > 0 and weights.size == times.size
+        and np.all(np.isfinite(times)) and np.all(np.isfinite(weights))
+        and np.isfinite(float(rule.sup_error))
+        and float(rule.sup_error) <= float(eps)
+        and np.isfinite(float(rule.kappa_max)))
+
+
 def _rule_cache_store(directory, rule, noise_amplification,
                       reduction_steps=None):
     """Atomically store one immutable box certificate, or return a warning."""
     if directory is None:
         return None
+    if not (_rule_is_certified(rule, float(rule.eps))
+            and np.isfinite(float(noise_amplification))):
+        return ("WARNING sigma quadrature cache store refused an uncertified "
+                "or non-finite rule (nothing written)")
     steps = -1 if reduction_steps is None else int(reduction_steps)
     identity = hashlib.sha256(json.dumps(
         ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
@@ -393,13 +421,14 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
 
 def _fit_rule(
     spec, eps, reduction_seconds, cache_dir, eta, *, cache_build_widen=True,
-    enforce_sup_error=True, reduction_steps=None,
+    reduction_steps=None,
 ):
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
+    retry_note = ""
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
     cached, cache_lookup_warnings = _rule_cache_lookup(
@@ -431,17 +460,39 @@ def _fit_rule(
                 noise_amplification_cap / (1.0 + eps))
         rule = build_uniform_rule(build_box, eps, **build_kwargs)
         cache_status = "miss" if cache_dir is not None else "off"
+        if not _rule_is_certified(rule, eps):
+            # The reduction budget can expire and return the interpolatory
+            # start.  A budget is not a correctness switch: try once more
+            # with five times the time before refusing.  A non-finite
+            # certificate retries too (it is a failed build, not a verdict).
+            retry_kwargs = dict(build_kwargs)
+            retry_kwargs["time_budget"] = 5.0 * float(reduction_seconds)
+            retry = build_uniform_rule(build_box, eps, **retry_kwargs)
+            retry_note = (f"; the 5x-budget retry achieved sup="
+                          f"{float(retry.sup_error):.6g} with "
+                          f"{int(np.asarray(retry.times).size)} nodes")
+            if _rule_is_certified(retry, eps):
+                rule = retry
+                cache_status += ":retry"
 
-    # Preserve the historical one-shot acceptance policy exactly.  Only the
-    # fixed-SC initializer delegates finite-box acceptance to the service: its
-    # reduction budget may expire and return the interpolatory eps/10 start,
-    # whose ``sup_error`` is a check-cloud diagnostic.  Reapplying this gate
-    # there made the time budget a correctness switch and refused the padded
-    # Si boxes at 3e-5.
-    if enforce_sup_error and rule.sup_error > eps:
+    # ONE ACCEPTANCE ON EVERY PATH.  One-shot, fixed-SC initialization and
+    # its rebuilds all require the certified sup error at or below eps; the
+    # fixed-SC bypass (enforce_sup_error=False, 2026-09-03) let Na retain a
+    # conduction pole-tail rule at 400 x eps in every self-consistent arm.
+    if not _rule_is_certified(rule, eps):
+        cache_note = ("" if cache_dir is None
+                      else f", cache directory {os.path.abspath(cache_dir)}")
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
-            f"{rule.sup_error:.6g} exceeds eps={eps:.6g}")
+            f"{float(rule.sup_error):.6g} exceeds eps={eps:.6g} or the rule "
+            f"is not finite ({int(np.asarray(rule.times).size)} nodes on box "
+            f"{tuple(round(float(v), 6) for v in rule.box)}, kind "
+            f"{spec.get('kind', '?')}, cache={cache_status}{cache_note}"
+            f"{retry_note}). Remedy: a "
+            f"sign-preserving or split product window (the SC pad now keeps "
+            f"sign-definite supports sign-definite), a longer "
+            f"sigma_quadrature_reduction_seconds, or a certified crossing "
+            f"rule; do not loosen sigma_quadrature_eps to admit this rule.")
     # Runtime perturbations must be bounded in the SAME currency as the
     # approximation.  ``kappa = sum|term|/|Q|`` is already relative for a
     # sign-definite box, but it overstates a crossing box's peak-relative
@@ -453,7 +504,7 @@ def _fit_rule(
     noise_amplification = rule_roundoff_amplification(
         rule.times, rule.weights, noise_cloud, noise_rho)
     noise_bound = noise_amplification * _RUNTIME_NOISE_EPSILON
-    if noise_bound > noise_budget:
+    if not np.isfinite(noise_bound) or noise_bound > noise_budget:
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: runtime-noise "
             f"bound {noise_bound:.6g} exceeds {noise_budget:.6g}")
@@ -543,7 +594,7 @@ def _parallel_fits(specs, worker):
 
 def fit_sigma_box_specs(
     specs, eta_ry, *, eps, reduction_seconds, cache_dir,
-    cache_build_widen=True, enforce_sup_error=True, reduction_steps=None,
+    cache_build_widen=True, reduction_steps=None,
 ):
     """Fit independent route-neutral box specifications across processes.
 
@@ -566,7 +617,6 @@ def fit_sigma_box_specs(
         rows, lambda index: _fit_rule(
             rows[index], tolerance, budget, cache_dir, eta,
             cache_build_widen=bool(cache_build_widen),
-            enforce_sup_error=bool(enforce_sup_error),
             reduction_steps=reduction_steps))
 
 
@@ -620,6 +670,18 @@ def _sc_padded_box_spec(spec, eta):
         box[0] -= state_pad_ry
     if spec["kind"] in ("crossing", "sign_definite_positive"):
         box[1] += state_pad_ry
+    # A SIGN-DEFINITE SUPPORT STAYS SIGN-DEFINITE.  The pole pad above can
+    # push the zero-side edge of a strictly negative (or positive) support
+    # across zero, which turns an easy relative rule into a crossing rule
+    # the builder cannot certify: the Na conduction pole-tail window was
+    # retained at sup=0.04 against eps=1e-4 with 906 nodes, while its actual
+    # support has a 24-node rule at eps (lane QUADCHECK, 2026-09-05).  The
+    # pad toward zero is capped at half the support's distance to zero; a
+    # support that really crosses later is a box escape and rebuilds.
+    if spec["kind"] == "sign_definite_negative" and spec["box"][1] < 0.0:
+        box[1] = min(box[1], 0.5 * spec["box"][1])
+    if spec["kind"] == "sign_definite_positive" and spec["box"][0] > 0.0:
+        box[0] = max(box[0], 0.5 * spec["box"][0])
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
@@ -677,7 +739,7 @@ def _fit_fixed_sc_rules(
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
             cache_dir=cache_dir, cache_build_widen=False,
-            enforce_sup_error=False, reduction_steps=reduction_steps)
+            reduction_steps=reduction_steps)
         rules = {}
         for spec, padded_spec, fit in zip(rows, padded, fits):
             frozen = dict(fit)
@@ -735,7 +797,7 @@ def _fit_fixed_sc_rules(
         new_fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
             cache_dir=cache_dir, cache_build_widen=False,
-            enforce_sup_error=False, reduction_steps=reduction_steps)
+            reduction_steps=reduction_steps)
         for spec, padded_spec, fit in zip(rebuild, padded, new_fits):
             rebuilt = dict(fit)
             rebuilt["cache_status"] = "rebuild:sc-fixed"

@@ -1,0 +1,26 @@
+{
+  "cache": "/pscratch/sd/j/jackm/wt_codex_suitegut/tests/core/fixtures/.build-cache/A-cubic-4eefde5fa461c7af2a98a2303ad4f029440a47386358bebaef7b36275fa88eb7",
+  "cold_build_seconds": 30.52218297199579,
+  "input_sha256": "4eefde5fa461c7af2a98a2303ad4f029440a47386358bebaef7b36275fa88eb7",
+  "outputs": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "WFN.h5": "a347c956bf3f19d71ba25a9fa8df268988457ed61c1687b5698c29b20f979305",
+    "centroids_frac_23_literal.txt": "cf712d099b7c7b314304825a3f9e5f28381ee2db6f431ac77bc8fc119ea860e8",
+    "centroids_frac_48.txt": "5b3e45dc9f9692617538b576ec1accb6fee59d7a399b62c73ffc0806fba986f9",
+    "data-file-schema.xml": "c7294dceb9485a4e2cc4e3fe77d359545300d6da4f67b675d43c97b2adb621fc",
+    "kmeans.out": "b033905483afd7ea12b7cc98b028a974b4ff48de0646e41e85a59addae73a488",
+    "kmeans_literal.out": "f35fb0b7e0e0abea4124bddc0b1565522afe73cf0f15b49d06c5c3346c6c8aa1"
+  },
+  "pseudopotentials": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6"
+  },
+  "schema": "lorrax-core-mean-field-v1",
+  "source_commit": "c68247405a2bdeb34f5c6338469b96a85cbdec38",
+  "source_dirty": false,
+  "system": "A-cubic",
+  "tools": {
+    "pw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw.x",
+    "pw2bgw.x": "/global/common/software/nersc9/espresso/7.3.1-libxc-6.2.2-cpu/bin/pw2bgw.x",
+    "wfn2hdf.x": "/global/common/software/nersc9/berkeleygw/zen3/gcc-12/mpich/berkeleygw/BerkeleyGW-4.0/bin/wfn2hdf.x"
+  }
+}

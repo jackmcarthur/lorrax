@@ -79,13 +79,12 @@ uv run python -m gw.kin_ion_io -i cohsex.in
 # GW calculation
 uv run python -m gw.gw_jax -i cohsex.in
 
-# Tests -- the DEFAULT GATE: the Si end-to-end calculation for the drivers
-# this branch touched, plus the services' own suites.  Minutes.
+# Tests -- the DEFAULT CORE: tiny cached A/B systems plus one basic contract
+# for every major module.  Target: two minutes.
 uv run python -m pytest -q
 
-# The CENSUS: everything.  What a bare `pytest` used to be, and what
-# tests/KNOWN_FAILURES.md accounts for.
-uv run python -m pytest -q --census
+# The nightly FULL tier: historical real decks and defect twins.
+uv run python -m pytest -q --full
 ```
 
 ### Perlmutter (Shifter, via the `lx` harness)
@@ -195,9 +194,8 @@ pipeline; the old refactor-map reports directory was purged.
 ## Before committing
 
 Run `uv run python -m pytest -q` after long running branches (5+ small commits) -- that is the
-DEFAULT GATE (Si end-to-end smoke for the drivers you touched + the services' suites; minutes).
-Run `uv run python -m pytest -q --census` -- the full suite, and the run KNOWN_FAILURES.md
-accounts for -- before asking for a landing.  See `tests/README.md` and `docs/contributing.md`.
+two-minute DEFAULT CORE. Run `uv run python -m pytest -q --full` in the nightly/release lane;
+it is the suite KNOWN_FAILURES.md accounts for. See `tests/README.md` and `docs/contributing.md`.
 **Every GPU verification leg runs at P=4, in ONE combined leg** -- gates, driver and red
 twin together, not one leg per gate; a P=1-only verification is never sufficient for
 landing (unit and CPU cells are exempt). `AGENT_PREAMBLE.md` owns that rule and its

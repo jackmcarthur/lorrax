@@ -75,11 +75,12 @@ def test_offdiag_masking_protected_block_only():
                         f"off-diag at ({k},{m},{n}) not zero: {out[k, m, n]}")
 
 
-def test_outofrange_diagonal_takes_scissor():
+def test_only_unprotected_outofrange_diagonal_takes_scissor():
     nk, nb = 2, 4
     H = _random_hermitian(nk, nb, seed=2)
     protected = jnp.asarray([True, False, False, True])
-    # Bands 0, 2 in range; bands 1, 3 out of range.
+    # Bands 0, 2 in range; bands 1, 3 out of range. Protected band 3
+    # keeps its full diagonal, so only band 1 takes the scissor.
     in_range = jnp.asarray([True, False, True, False])
     scissor = jnp.asarray(
         [[10.0 + 0j, 11.0, 12.0, 13.0], [20.0 + 0j, 21.0, 22.0, 23.0]],
@@ -93,7 +94,8 @@ def test_outofrange_diagonal_takes_scissor():
     H_np = np.asarray(H)
     for k in range(nk):
         for n in range(nb):
-            expected = H_np[k, n, n] if bool(in_range[n]) else complex(scissor[k, n])
+            expected = (H_np[k, n, n] if bool(protected[n] | in_range[n])
+                        else complex(scissor[k, n]))
             np.testing.assert_allclose(
                 out[k, n, n], expected, atol=1e-14,
                 err_msg=f"diagonal at ({k},{n}) wrong: got {out[k, n, n]}, expected {expected}")

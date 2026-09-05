@@ -202,17 +202,19 @@ coefficients refit each map, so including them would re-count in-range drift.
 `max|dE|` in the log is over that set; a "converged" loop says nothing about
 the tail's own Σ.
 
-**11. Metals and spin-orbit systems are untested in the loop.** MPA on
+**11. Spin-orbit systems are untested in the loop; metals are covered by pitfalls 16-19.** MPA on
 metals (`mpa_material_class = metal`) has wider pole widths and partial
 occupations; the non-identifiability of pitfall 2 is worse when the fit family
 is richer. Bi (bispinor) and Na are the pending cases.
 
 **12. Quadrature rules are frozen across maps** (2026-09-03). The first map
 plans and certifies one rule per product window on the window's box padded by
-`sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and refuse
-rather than rebuild if a state leaves its padded box. One-shot results are
-bit-identical with and without the freeze. The eqp1 file is written from the
-converged map.
+`sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and, when
+a state leaves its padded box or a window appears that iteration 1 did not
+have, rebuild that rule on the escaped box with the same padding
+(`rebuild:sc-fixed`, counted in the geometry receipt and printed per map;
+main 0cfaf059). One-shot results are bit-identical with and without the
+freeze. The eqp1 file is written from the converged map.
 
 **13. Map gain is a diagnostic, not a controller.** From map 2 onward the
 driver prints `SC map gain: max |dSigma_on-shell| / max |dE_in| = ...`, using
@@ -241,6 +243,79 @@ exchange term responds to an occupation flip under the smearing width; that is
 the physics of the map, not the accelerator, and is read from pitfall 13's
 line.
 
+**15. One quadrature acceptance on every path.** The one-shot planner, the
+fixed-SC initializer and its rebuilds all require the certified sup error at
+or below `sigma_quadrature_eps`; a build that misses gets one retry with five
+times the reduction budget and then refuses, naming the window, its box,
+the achieved sup, the node count and the remedy. The 2026-09-03 bypass
+(`enforce_sup_error=False`) let Na retain a conduction pole-tail rule at
+sup=0.0405 against eps=1e-4 with 906 nodes in every self-consistent arm; its
+actual support has a 24-node rule at eps (sandbox lane QUADCHECK). The cause
+was the SC pad: the ten-percent pole pad pushed a strictly negative support
+across zero and asked for a crossing rule. The pad now keeps sign-definite
+supports sign-definite (the zero-side edge moves at most halfway to zero;
+a support that really crosses later is a box escape and rebuilds), and the
+disk cache never returns a certificate above eps. Do not loosen eps to admit
+a rule.
+
+**16. The self-consistent state set is fixed at map 0, with a margin from the
+grid edge.** Re-classifying bands against the (mu-anchored) Sigma window on
+every map made the iteration map discontinuous on Na (86 bands, top +18 eV):
+bands 9-10 reach 17.2 eV at some k and 11-13 straddle the edge, so ~1 eV QP
+shifts moved them in and out of the in-range set map to map and the loop
+floored. From map 1 the trusted set is the one chosen at map 0; the grid still
+re-anchors on each map's mu. At map 0 a band inside the grid whose all-k range
+ends within `SC_EDGE_MARGIN_EV` (2 eV, the SC state pad) of an edge is
+scissored, not self-consistent: at +24 eV band 14 sat 1.7 eV under the top and
+keeping its Gamma multiplet whole had promoted bands 15-23 (up to 16 eV above
+the grid, Sigma clamped) into the protected block, which threw the k=1 triplet
+6.4 eV in one map. A frozen in-range state that leaves the grid refuses with
+the band, the k row, the energy and the deck value that clears it. The log
+lines are `SC partition: N band(s) inside the grid but within 2.0 eV of an
+edge are scissored` and `SC partition: frozen from map 0 (...)`. A window
+whose bands never change class is bit identical.
+
+**17. The active-window scissor law is frozen at map 0.** States inside the
+Sigma window but outside the omega grid follow an affine law fitted to the
+trusted block's shifts; refitting it every map moved Na's 30-96 eV states by
+up to 17.7 eV in one map and fed that back through the sum over states. The
+law fitted at map 0 is carried on every later map input (`SC scissor: frozen
+from map 0 (...)`), as standard QSGW practice gives the states above the
+self-energy subspace one fixed correction. The sum-band tail beyond the
+Sigma window keeps its per-map refit: freezing it moved the Si b80/c504 gap
+by 22 meV at map 6, a closure change on semiconductors that nothing
+justifies. The reviewers' remaining candidates for a metal residual after
+these closures, the per-map MPA pole refit and the sorted-index state
+identity, are registered in the sandbox issues ledger.
+
+**19. On metals the self-consistent set should stop where the quasiparticle
+stops being well defined; convergence time is set by the largest Z in the
+set.** Na eta=0.5 (86 bands, 8x8x8, 896 centroids), three trusted sets run
+to convergence side by side: band 5 alone (window top +11 eV), bands 5-10
+(+21 eV) and bands 5-13 (+24 eV). Per accepted map, the unmixed output
+motion of every band with map-0 quasiparticle weight Z in (0.55, 0.8)
+(bands 5-8, Z from the eqp1 diagnostic `(eqp1 - E_DFT)/(eqp0 - E_DFT)`)
+halves; bands 9-13, whose Z is 0.97-1.74 (more than a plasmon energy above
+mu, where Re Sigma(omega) is flat or rising on shell), walk monotonically at
+map gain about 1 and reach their fixed point 1.3-2 eV above G0W0 only after
+12-14 accepted maps. The Fermi band's shape is a window-independent
+observable: its k-resolved energies agree to under 10 meV across the three
+sets (bandwidth 6.831 / 6.827 / 6.837 eV against 6.581 DFT-seeded), while
+its absolute position moves 41 meV when bands 11-13 join the set (bands
+5 alone and 5-10 agree to 2.5 meV). Bands 5-10 converge to about 1 meV per
+map by accepted map 22 and reach a 2 meV rCROP residual at map 28; 5-13 is
+still at 5-9 meV per map on bands 12-13 at map 26. Production on Na:
+`sigma_omega_max_ev = 21` (trusted 5-10), report the Fermi window, and do
+not stop on the rCROP L-infinity residual while Z >= 1 states walk. A
+partition by quasiparticle well-definedness (Z below about 0.9 at every k
+at map 0) instead of by energy window is registered; in Na the multiplet
+chain links bands 5-10, so it needs per-k masks. The single measurement that
+decides the next structural change is a small-kick response at a retained
+input: chi0, the body W and the final trusted-block H scale linearly
+(ratio 10.1-10.6 for a 10x kick) while the fitted scalar head does not
+(48.6, pole count changes), which names the head MPA refit as the first
+non-smooth stage of the map.
+
 ## Evidence
 
 Sandbox reports (paths under
@@ -251,3 +326,24 @@ control), `si_centroid_ladder_sc_2026-09-03` (resolution ladder),
 structures), `sc_fixed_rules_eqp1_2026-09-03` (claim 662, frozen rules),
 `sigma_eta_literal_no_ceiling_2026-09-03` (claims 637/639),
 `qsgw_two_level_2026-09-03` (the frozen-W inner loop, branch only).
+
+**18. QP identities, not sorted eigenvalue ordinals, define SC motion.**
+The first map output supplies a fixed QP reference whose labels are the
+trusted DFT bands: at map 0 each trusted DFT band (whole DFT multiplets) is
+assigned by overlap to the output column that carries it, and later input
+and output eigenvectors are assigned to those reference multiplets by
+maximum projector overlap, using all active candidate columns so crossings
+with scissored levels cannot relabel the target. Sorted position is not a
+label: on Na with the window top at +15 eV the scissored Gamma triplet 11-13
+sits below the protected doublet at sorted 9-11 in the map-0 output, and a
+sorted-band mask cut that multiplet and refused. The reference groups are
+the DFT multiplets (a doublet the map splits by more than the exact
+tolerance stays one block with its mean energy), so the `SC_identity`
+comments and the eqp body agree. `SC identity` prints this
+input-to-output L-infinity criterion beside the sorted-index value. The
+`SC_identity` eqp comments give map-0 labels, sorted input/output columns,
+block means and adjacent-output motion on the file's k-block index (the
+first integer in a body row is spin). They describe eqp0 even in the eqp1
+file. The Hamiltonian carry and accelerator are unchanged. The diagonal
+retention mask is `protected | in_range`, including protected multiplet
+members; only non-protected out-of-range diagonals are scissored.
