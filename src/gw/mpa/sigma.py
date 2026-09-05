@@ -626,10 +626,21 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
     than only in the planner keeps ONE support: ``sigma_windows._a_space``
     re-applies the same floor to the same weights, so the two agree by
     construction instead of by review.
+
+    The Sigma carrier can end above ``b4_logical`` when the larger chi/Sigma
+    consumer is padded to the process mesh.  Those storage-only wavefunction
+    rows are exactly zero, but their finite energy/occupation sentinels are
+    not physical spectral support.  Apply the canonical band-identity mask
+    here, at the sole branch seam, so insulating and fractional planners see
+    exactly the states the existing G contraction can consume.
     """
+    sigma_sum = wfns.slices.sigma_sum
+    logical_stop = min(
+        int(sigma_sum.stop), int(wfns.slices.nb_full_logical))
+    logical = wfns.band_mask(slice(0, logical_stop))[:, sigma_sum]
     if occupation_state is None:
-        energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
-        occupied = wfns.occ[:, wfns.slices.sigma_sum] > 0.5
+        energy = wfns.enk[:, sigma_sum] - float(efermi_ry)
+        occupied = wfns.occ[:, sigma_sum] > 0.5
         # Do not clip these distances at zero.  In a small-gap or inverted
         # system an unoccupied state may sit below E_F (or an occupied state
         # above it); occupation still chooses the band sum.  A cell whose
@@ -637,7 +648,8 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
         # by the planner's excursion-deepened edge (sigma_windows._geometry).
         return branches_for_omega_grid(
             omega, E_cond=energy, H_val=-energy,
-            cond_mask=~occupied, val_mask=occupied)
+            cond_mask=(~occupied) & logical,
+            val_mask=occupied & logical)
     mu = float(occupation_state.mu_ry)
     if abs(float(efermi_ry) - mu) > 1.0e-12:
         raise ValueError(
@@ -646,11 +658,12 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
             f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
             "per iteration — pass the state's own mu.")
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
-                    wfns.enk.shape)[:, wfns.slices.sigma_sum]
-    energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
+                    wfns.enk.shape)[:, sigma_sum]
+    energy = wfns.enk[:, sigma_sum] - mu
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
-        cond_mask=(f != 1.0), val_mask=(f != 0.0),
+        cond_mask=(f != 1.0) & logical,
+        val_mask=(f != 0.0) & logical,
         cond_weight=1.0 - f, val_weight=f,
         occupation_window_threshold=occupation_window_threshold)
 
