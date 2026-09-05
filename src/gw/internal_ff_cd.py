@@ -892,6 +892,9 @@ def compute_internal_ff_cd(
                 wc_wedge = w_wedge - v_wedge
                 if observer is not None:
                     observer.observe(global_frequency_index[jb], wc_wedge)
+                    # The observer owns its timings; do not charge its action
+                    # or enqueue latency to the production q-unfold stage.
+                    t_stage = time.perf_counter()
                 wc_full = unfold_isdf_operator(
                     wc_wedge, irr_idx=irr_idx, sym_idx=sym_idx,
                     sym_perm=sym_perm, L_table=l_table, q_irr_frac=qfrac,
