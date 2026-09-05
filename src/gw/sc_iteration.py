@@ -3316,6 +3316,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             delta_velocity_dft=(
                 delta_velocity_dft
                 if inputs.current_velocity_update == "covariant" else None),
+            collapsed_position=getattr(pt, "collapsed_position", None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
@@ -5111,20 +5112,14 @@ def _refuse_unsupported_link_stencil(kgrid, *, where: str) -> None:
         return
     raise ValueError(
         "GATE pt_head_stencil_unsupported: "
-        f"{where} requires the nearest-neighbour link/fourth-order "
-        "connection stencil along every Cartesian mesh direction.\n"
-        f"  got:  kgrid={grid}, undersampled axes {', '.join(bad_axes)}\n"
-        f"  want: >={MIN_STENCIL_POINTS} mesh points on every axis, or a "
-        "head mode that needs no links\n"
-        "  fix:  for a genuinely lower-dimensional deck (a collapsed axis "
-        "with kgrid[i]=1, e.g. a slab), set sc_head_update=dft_velocity — "
-        "it reads the exact DFT p-matrix velocity alone and needs no "
-        "stencil on any axis; for an undersampled but periodic axis "
-        "(1 < kgrid[i] < 5), densify the mesh along it\n"
-        "  why:  the fourth-order +/-2 connection stencil differentiates "
-        "along k; a direction with too few points cannot support it, and "
-        "it is never fabricated as an analytic zero (KNOWN_LORRAX_ISSUES.md, "
-        "file_io/parallel_transport.py row, fix note)\n"
+        f"{where} needs a derivative rule on every reduced k axis "
+        "(common.parallel_transport.link_stencil_orders: fourth order at "
+        f">= {MIN_STENCIL_POINTS} points, second order at 3-4, the "
+        "real-space position operator on a collapsed 1-point axis).\n"
+        f"  got:  kgrid={grid}, two-point axes {', '.join(bad_axes)}\n"
+        "  want: >= 3 mesh points or exactly 1 on every axis\n"
+        "  fix:  densify the two-point axis or collapse it; "
+        "sc_head_update=dft_velocity needs no stencil at all\n"
         "  doc:  reports/metal_head_pt_pipelines_2026-08-23/PLAN.md, "
         "pipeline step 3(c)")
 

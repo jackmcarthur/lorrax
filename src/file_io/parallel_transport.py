@@ -29,6 +29,9 @@ from common.parallel_transport import (
     make_cross_k_overlap,
     make_distributed_band_matmul,
     MIN_STENCIL_POINTS,
+    COLLAPSED_AXIS,
+    collapsed_axes,
+    link_stencil_orders,
     undersampled_link_axes,
 )
 from common.wfn_layout import band_sphere_spec
@@ -41,6 +44,11 @@ SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
 CONNECTION_CART_DATASET = "berry_connection_cart"
 VELOCITY_DFT_DATASET = "velocity_dft_cart"
+#: ``(3, nk, nb, nb)`` band matrix of the reduced-coordinate position
+#: ``b_a . r`` on every COLLAPSED axis a (one mesh point; a vacuum direction),
+#: zero on the stencil axes.  The connection along a collapsed axis, and the
+#: operator whose commutator is the covariant derivative there.
+COLLAPSED_POSITION_DATASET = "collapsed_position_reduced"
 ENERGIES_DATASET = "dft_energies_ry_full"
 W_AV_DENSITY_DATASET = "w_av_density_mtxel"
 W_AV_SCHEMA_VERSION = 3
@@ -403,8 +411,18 @@ def initialize_parallel_transport_artifact(
     wfn_path: str,
     wfn_fingerprint: str,
     rcond: float = 1.0e-10,
+    collapsed_position_kmajor=None,
+    collapsed_axis_centers=None,
 ) -> None:
     """Create the schema and write exact velocity before the WFN stream.
+
+    ``collapsed_position_kmajor`` ``(nk_full, 3, nb_pad, nb_pad)`` is the
+    position operator ``Z_a`` of every collapsed axis (zero elsewhere), the
+    connection those axes use instead of a link stencil
+    (``common.parallel_transport.link_stencil_orders``); it is REQUIRED when
+    the k grid has a collapsed axis and refused when it has none.
+    ``collapsed_axis_centers`` are the three slab/wire centre fractional
+    coordinates (NaN on stencil axes), stamped for provenance.
 
     This is a separate transaction so the dipole producer can release its
     resident full-BZ wavefunctions and sharded velocity before loading the
@@ -445,6 +463,32 @@ def initialize_parallel_transport_artifact(
         raise ValueError(
             f"velocity band shape {tuple(velocity.shape[-2:])} does not "
             f"contain logical nbands={nb}")
+    orders = link_stencil_orders(kgrid)
+    collapsed = collapsed_axes(kgrid)
+    if collapsed and collapsed_position_kmajor is None:
+        raise ValueError(
+            "GATE pt_collapsed_axis_needs_position: kgrid "
+            f"{kgrid} has collapsed axis/axes {collapsed} and the artifact "
+            "needs their real-space position operator (the producer's "
+            "collapsed-axis sweep); none was supplied.")
+    if not collapsed and collapsed_position_kmajor is not None:
+        raise ValueError(
+            f"kgrid {kgrid} has no collapsed axis; a collapsed position "
+            "operator was supplied anyway")
+    position = None
+    if collapsed:
+        position = jnp.asarray(collapsed_position_kmajor)
+        if tuple(position.shape) != tuple(velocity.shape):
+            raise ValueError(
+                "collapsed_position_kmajor must match the velocity shape "
+                f"{tuple(velocity.shape)}; got {tuple(position.shape)}")
+    centers = np.full(3, np.nan, dtype=np.float64)
+    if collapsed_axis_centers is not None:
+        centers = np.asarray(collapsed_axis_centers, dtype=np.float64)
+        if centers.shape != (3,):
+            raise ValueError(
+                f"collapsed_axis_centers must be three values; got "
+                f"{centers.shape}")
 
     with SlabIO(str(path), mode="w", mesh=mesh) as io:
         io.create_dataset(
@@ -477,6 +521,19 @@ def initialize_parallel_transport_artifact(
                 "manifold": "bands [band_start, band_stop)",
             })
         io.create_dataset(
+            COLLAPSED_POSITION_DATASET, shape=(3, nk, nb, nb),
+            dtype=np.complex128,
+            attrs={
+                "k_storage": "full_bz",
+                "components": ("reduced reciprocal coordinates: "
+                               "Z_a = <m| b_a . r |n> = 2 pi <m| f_a |n>"),
+                "band_layout": "P(None,None,x,y)",
+                "hermitian": True,
+                "nonzero_axes": "collapsed (one-point) axes only",
+                "branch_cut": ("half a cell from the atoms' circular-mean "
+                               "fractional coordinate, in the vacuum"),
+            })
+        io.create_dataset(
             CONNECTION_REDUCED_DATASET, shape=(3, nk, nb, nb),
             dtype=np.complex128,
             attrs={
@@ -484,7 +541,9 @@ def initialize_parallel_transport_artifact(
                 "components": "reduced reciprocal coordinates",
                 "band_layout": "P(None,None,x,y)",
                 "hermitian": True,
-                "finite_difference_order": 4,
+                "finite_difference_order": (
+                    "per axis: 4 (>=5 points), 2 (3-4 points), "
+                    "position operator (collapsed)"),
             })
         io.create_dataset(
             CONNECTION_CART_DATASET, shape=(3, nk, nb, nb),
@@ -501,6 +560,17 @@ def initialize_parallel_transport_artifact(
             velocity_dir_major,
             NamedSharding(mesh, P(None, None, "x", "y")))
         io.write_slab(VELOCITY_DFT_DATASET, velocity_dir_major)
+        if position is not None:
+            position_dir_major = jax.lax.with_sharding_constraint(
+                jnp.moveaxis(position, 1, 0),
+                NamedSharding(mesh, P(None, None, "x", "y")))
+            io.write_slab(COLLAPSED_POSITION_DATASET, position_dir_major)
+        io.write_attr("link_stencil_orders",
+                      np.asarray(orders, dtype=np.int32))
+        io.write_attr("collapsed_axis_flags",
+                      np.asarray([int(n == 1) for n in kgrid],
+                                 dtype=np.int32))
+        io.write_attr("collapsed_axis_center_frac", centers)
         io.write_attr(ENERGIES_DATASET, energies)
         io.write_attr(OCCUPATIONS_DATASET, occupations)
         io.write_attr("schema_version", np.int32(SCHEMA_VERSION))
@@ -707,12 +777,22 @@ def _write_connection_stage(
             full_links, block_sharding)
 
         spacing = 1.0 / np.asarray(wfn.kgrid, dtype=np.float64)
-        @jax.jit
-        def _connection(links):
-            return fourth_order_connection(
-                links, full_plus, spacing, band_matmul=band_matmul)
+        kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
+        orders = link_stencil_orders(kgrid)
+        position = None
+        if COLLAPSED_AXIS in orders:
+            position = io.read_slab(
+                COLLAPSED_POSITION_DATASET,
+                shape=(3, int(sym.nk_tot), nb_storage, nb_storage),
+                partition_spec=block_spec)
 
-        connection_reduced = _connection(full_links)
+        @jax.jit
+        def _connection(links, position):
+            return fourth_order_connection(
+                links, full_plus, spacing, band_matmul=band_matmul,
+                stencil_orders=orders, collapsed_position=position)
+
+        connection_reduced = _connection(full_links, position)
         connection_reduced = jax.lax.with_sharding_constraint(
             connection_reduced, block_sharding)
 
@@ -1101,37 +1181,33 @@ def write_parallel_transport_artifact(
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file.
 
-    THE STENCIL GATE LIVES HERE NOW, per axis, not in the artifact
-    initializer -- this is the ONLY stage that differentiates along k, and
-    the only one :func:`common.parallel_transport.undersampled_link_axes`
-    needs to protect.  A direction with too few points (including a
-    genuinely collapsed ``kgrid[i] == 1`` slab axis) refuses by name here;
-    it is never fabricated as an analytic zero (KNOWN_LORRAX_ISSUES.md row
-    at this file's :func:`initialize_parallel_transport_artifact` /
-    ``get_dipole_mtxels.py:1309-1317``, fix note).
+    THE STENCIL GATE LIVES HERE, per axis, not in the artifact initializer
+    -- this is the ONLY stage that differentiates along k.  Since 2026-09-05
+    the rule is :func:`common.parallel_transport.link_stencil_orders`: >= 5
+    points take the fourth-order +/-2 stencil, 3 or 4 the second-order
+    +/-1 one, and a collapsed axis (``kgrid[i] == 1``, a slab normal or a
+    wire's transverse directions) takes the real-space position operator
+    the initializer already stored as its connection; only a two-point axis
+    has no rule and refuses here.  The link stream itself runs on every
+    axis (a collapsed axis's forward neighbour is the point itself through
+    the reciprocal vector ``b_i``; the derivative kernels never read that
+    link).
     """
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
     bad_axes = undersampled_link_axes(kgrid)
     if bad_axes:
         raise ValueError(
-            "PT-LINK-STENCIL-UNSUPPORTED refusal: the nearest-neighbour "
-            "link stage and its fourth-order +/-2 connection stencil "
-            "require at least "
-            f"{MIN_STENCIL_POINTS} distinct mesh points along every "
-            "Cartesian mesh direction.\n"
-            f"  got:  kgrid={kgrid}, undersampled axes "
-            f"{', '.join(bad_axes)} "
-            f"({'; '.join(f'{a}: {n} point(s)' for a, n in zip('xyz', kgrid) if a in bad_axes)})\n"
-            "  want: >=5 mesh points on every axis that carries dispersion, "
-            "or no request for the link/connection stage at all\n"
-            "  fix:  for a genuinely lower-dimensional deck (a collapsed "
-            "axis with kgrid[i]=1, e.g. a 9x9x1 slab), request only the "
-            "exact DFT velocity -- sc_head_update=dft_velocity reads "
-            "velocity_dft_cart alone and never calls this stage; for an "
-            "undersampled but periodic axis (1 < kgrid[i] < 5), densify "
-            "the mesh along it\n"
-            "  doc:  reports/metal_head_pt_pipelines_2026-08-23/PLAN.md, "
-            "pipeline step 3")
+            "PT-LINK-STENCIL-UNSUPPORTED refusal: a reduced axis with "
+            "exactly two mesh points supports no finite difference (its "
+            "+/-1 neighbours coincide) and is not a collapsed vacuum "
+            "direction either.\n"
+            f"  got:  kgrid={kgrid}, two-point axes {', '.join(bad_axes)}\n"
+            "  want: >= 3 mesh points (second-order stencil), >= "
+            f"{MIN_STENCIL_POINTS} (fourth-order), or exactly 1 (a "
+            "collapsed axis, taken through the real-space position "
+            "operator)\n"
+            "  fix:  densify the axis to >= 3 points or collapse it to 1\n"
+            "  doc:  common.parallel_transport.link_stencil_orders")
     plan_polar, edge_table, apply_symmetry, q_stencil_table = (
         _require_service_apis())
     nb_padded = band_storage_extent(mesh, int(nbands))
@@ -1309,8 +1385,15 @@ def complete_velocity_validation(
     atol: float,
     rtol: float,
     scope_blocks=(),
+    collapsed_position=None,
 ) -> dict[str, object]:
     """Run and stamp the finite-link DFT head-velocity gate.
+
+    ``collapsed_position`` ``(3, nk, nb, nb)`` is required when ``kgrid``
+    has a collapsed axis: there the reconstructed velocity is
+    ``-i[Z_a, diag(E)]``, i.e. ``-i Z_mn (E_n - E_m)``, which tests the
+    position operator (its vacuum branch cut included) against the exact
+    ``p + i[r, V_NL]`` with no k stencil in the way.
 
     Both this producer-side gate and QSGW call
     :func:`common.parallel_transport.fourth_order_covariant_derivative`.
@@ -1366,13 +1449,27 @@ def complete_velocity_validation(
     _diagonal_hamiltonian = jax.jit(
         _diagonal_hamiltonian, out_shardings=h_sharding)
     H = _diagonal_hamiltonian(energies.astype(links.real.dtype))
+    orders = link_stencil_orders(grid)
     reduced = fourth_order_covariant_derivative(
-        H, links, plus, spacing, band_matmul=band_matmul)
+        H, links, plus, spacing, band_matmul=band_matmul,
+        stencil_orders=orders, collapsed_position=collapsed_position)
     reconstructed = reduced_covector_to_cartesian(reduced, reciprocal)
 
     metrics = _velocity_error_metrics(
         reconstructed, exact, atol=float(atol), rtol=float(rtol))
     metrics["entrywise_passed"] = bool(metrics["passed"])
+    metrics["stencil_orders"] = tuple(int(o) for o in orders)
+    # Per-Cartesian-axis reduction of the same error, so a slab's collapsed
+    # axis (position operator) and its stencil axes are judged separately.
+    axis_error = jnp.abs(reconstructed - exact)
+    metrics["max_abs_by_axis"] = tuple(
+        float(v) for v in jax.device_get(
+            jnp.max(axis_error.reshape(3, -1), axis=1)))
+    metrics["exact_max_abs_by_axis"] = tuple(
+        float(v) for v in jax.device_get(
+            jnp.max(jnp.abs(exact).reshape(3, -1), axis=1)))
+    for name, value in zip("xyz", metrics["max_abs_by_axis"]):
+        metrics[f"max_abs_axis_{name}"] = float(value)
 
     delta_e = energies[:, :, None] - energies[:, None, :]
     occupation_difference = (
@@ -1434,6 +1531,15 @@ def complete_velocity_validation(
     )
 
     blocks = tuple(int(m) for m in scope_blocks if 0 < int(m) <= nb)
+    if jax.process_index() == 0:
+        rule = {COLLAPSED_AXIS: "position", 2: "order-2", 4: "order-4"}
+        print("  finite-link velocity rule per axis: "
+              + ", ".join(
+                  f"{a}={rule[o]} (max|dv|={e:.3e} of {x:.3e})"
+                  for a, o, e, x in zip(
+                      "xyz", metrics["stencil_orders"],
+                      metrics["max_abs_by_axis"],
+                      metrics["exact_max_abs_by_axis"])))
     if blocks:
         metrics["blocks"] = _block_scoped_metrics(
             reconstructed, exact, blocks, atol=float(atol), rtol=float(rtol))
@@ -1456,7 +1562,15 @@ def complete_velocity_validation(
             f"{metrics['transition_overlap_imag']:+.6e}j, "
             f"required response <= {float(rtol):.6e} and overlap real >= "
             f"{1.0 - float(rtol):.6e}; full-matrix diagnostic max_abs="
-            f"{metrics['max_abs']:.6e}")
+            f"{metrics['max_abs']:.6e}; per Cartesian axis (rule, max|dv| of "
+            "max|v|): "
+            + ", ".join(
+                f"{a}={ {COLLAPSED_AXIS: 'position', 2: 'order-2', 4: 'order-4'}[o] }"
+                f" {e:.3e} of {x:.3e}"
+                for a, o, e, x in zip(
+                    "xyz", metrics["stencil_orders"],
+                    metrics["max_abs_by_axis"],
+                    metrics["exact_max_abs_by_axis"])))
         # A refusal that carries its own numbers: a caller scanning band
         # windows or tolerances should never have to re-run to read them.
         refusal.metrics = metrics
@@ -1594,6 +1708,12 @@ def validate_parallel_transport_artifact(
         links = load_full_bz_links(
             io, mesh=mesh, nk=nk, nb_storage=nb_storage,
             nb_logical=nb)
+        collapsed_position = None
+        if collapsed_axes(grid):
+            collapsed_position = io.read_slab(
+                COLLAPSED_POSITION_DATASET,
+                shape=(3, nk, nb_storage, nb_storage),
+                partition_spec=P(None, None, "x", "y"))
     if nb <= 0 or nb > int(np.shape(energies)[1]):
         raise ValueError(
             f"nbands={nb} outside SlabIO energy extent {np.shape(energies)[1]}")
@@ -1606,7 +1726,8 @@ def validate_parallel_transport_artifact(
         velocity_exact_cart=velocity,
         links_full=links,
         forward_neighbors=forward_neighbors,
-        atol=float(atol), rtol=float(rtol), scope_blocks=scope_blocks)
+        atol=float(atol), rtol=float(rtol), scope_blocks=scope_blocks,
+        collapsed_position=collapsed_position)
 
 
 def _velocity_error_metrics(
@@ -1696,6 +1817,7 @@ _VELOCITY_GATE_KEYS = (
 )
 _VELOCITY_DIAGNOSTIC_KEYS = (
     "entrywise_passed",
+    "max_abs_axis_x", "max_abs_axis_y", "max_abs_axis_z",
 )
 
 

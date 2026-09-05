@@ -595,6 +595,59 @@ def local_potential_operator(
     return Operator(apply=op, post=float(_sc.post), consts=(V_r_j,), key=key)
 
 
+def collapsed_position_operator(
+    geom: SweepGeometry, *, axis: int, center: float,
+) -> Operator:
+    """``zeta_a = 2 pi wrap(f_a - f_a^0)``, the position conjugate to a
+    COLLAPSED reduced k axis, applied in G space with the sawtooth's exact
+    Fourier coefficients.
+
+    ``f_a`` is the fractional coordinate along reduced axis ``a`` and the
+    branch cut sits half a cell from ``center`` ``f_a^0`` (the slab or wire
+    centre), in the vacuum where the wavefunctions vanish.  The sawtooth
+    ``2 pi wrap(x)`` has the series ``sum_{g != 0} i (-1)^g / g e^{2 pi i g x}``,
+    so ``(zeta psi)(G) = sum_g K(g) psi(G - g e_a)`` with
+    ``K(g) = i (-1)^g e^{-2 pi i g f_a^0} / g`` -- a Toeplitz product along
+    the box's ``a`` axis on the UNWRAPPED integer ``G_a`` difference, no
+    FFT, no grid.  Sampling ``zeta`` on the FFT grid instead aliases the
+    sawtooth's slow ``1/g`` tail into the pair densities (measured 1.6 %
+    on the MoS2 3x3x1 fixture's z-velocity identity; this route is exact
+    for the band-limited pair density and leaves only the vacuum-tail
+    assumption).  The result is ``<m| zeta_a |n>`` dimensionless (the
+    ``a`` component of the reduced-coordinate Berry connection); ``post =
+    1``, since ``psi(G)`` is normalised on the sphere.
+    """
+    a = int(axis)
+    if a not in (0, 1, 2):
+        raise ValueError(f"axis must be 0, 1 or 2; got {axis}")
+    n = int(geom.fft_grid[a])
+    g_of_index = np.fft.fftfreq(n, 1.0 / n).astype(np.int64)     # box order
+    diff = g_of_index[:, None] - g_of_index[None, :]             # G_a(i) - G_a(j)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        K = np.where(
+            diff != 0,
+            1.0j * ((-1.0) ** diff) * np.exp(-2.0j * np.pi * diff * float(center))
+            / np.where(diff != 0, diff, 1),
+            0.0 + 0.0j)
+    M_j = jnp.asarray(K, dtype=jnp.complex128)                    # (n, n): out i, in j
+    mesh = geom.mesh
+    box_sharding = NamedSharding(mesh, geom.spec_box_xy)
+    box_axis = 3 + a
+
+    def op(psi_n, gvec, gmask, bidx, kvec, M):
+        box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)      # (1, nb, ns, nx, ny, nz)
+        moved = jnp.moveaxis(box, box_axis, -1)
+        phi = jnp.moveaxis(
+            jnp.einsum("...j,ij->...i", moved, M, optimize=True), -1, box_axis)
+        phi = jax.lax.with_sharding_constraint(phi, box_sharding)
+        out = phi[..., gvec[:, 0], gvec[:, 1], gvec[:, 2]]
+        return out * gmask[None, None, None, :].astype(out.dtype)
+
+    key = ('collapsed_position', geom.fft_grid, geom.ngkmax, geom.ns, a,
+           round(float(center), 12))
+    return Operator(apply=op, post=1.0, consts=(M_j,), key=key)
+
+
 def four_current_potential_operator(
     geom: SweepGeometry, V_scalar_r, V_vector_r, *, charge_nspinor: int,
 ) -> Operator:

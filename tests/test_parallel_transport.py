@@ -148,19 +148,30 @@ def test_wfn_fingerprint_accepts_byte_identical_copy(tmp_path):
     assert any("window nval=8 ncond=32 nband=40" in line for line in lines)
 
 
-def test_undersampled_link_axes_names_collapsed_and_undersampled_axes():
-    """The shared per-axis threshold: clean, undersampled and collapsed."""
+def test_undersampled_link_axes_names_only_two_point_axes():
+    """Per-axis rule (2026-09-05): >= 5 points fourth order, 3-4 second
+    order, 1 point collapsed (position operator), 2 points refused."""
+    from common.parallel_transport import COLLAPSED_AXIS, link_stencil_orders
     assert undersampled_link_axes((8, 8, 8)) == []
     assert undersampled_link_axes((5, 5, 5)) == []          # exactly at floor
-    assert undersampled_link_axes((4, 6, 6)) == ["x"]
-    assert undersampled_link_axes((9, 9, 1)) == ["z"]        # 2D-slab class
-    assert undersampled_link_axes((3, 1, 2)) == ["x", "y", "z"]
+    assert undersampled_link_axes((4, 6, 6)) == []          # second order now
+    assert undersampled_link_axes((9, 9, 1)) == []          # 2D slab: collapsed
+    assert undersampled_link_axes((3, 1, 2)) == ["z"]       # only the 2-point axis
+    assert link_stencil_orders((8, 8, 8)) == (4, 4, 4)
+    assert link_stencil_orders((6, 6, 1)) == (4, 4, COLLAPSED_AXIS)
+    assert link_stencil_orders((3, 3, 1)) == (2, 2, COLLAPSED_AXIS)
+    assert link_stencil_orders((4, 6, 6)) == (2, 4, 4)
+    assert link_stencil_orders((5, 1, 1)) == (4, COLLAPSED_AXIS, COLLAPSED_AXIS)
+    with pytest.raises(ValueError, match="pt_two_point_axis"):
+        link_stencil_orders((2, 6, 6))
 
 
-def test_link_stage_refuses_an_aliased_fourth_order_mesh_before_io():
-    """D2/D3(c): the stencil gate now lives on the LINK remainder, not the
-    velocity-writing initializer — and it still fires before any I/O."""
-    wfn = types.SimpleNamespace(kgrid=np.asarray([4, 6, 6]))
+def test_link_stage_refuses_a_two_point_axis_before_io():
+    """D2/D3(c): the stencil gate lives on the LINK remainder, not the
+    velocity-writing initializer, and fires before any I/O.  Only a
+    two-point axis is unsupported now (no finite difference, not a vacuum
+    direction)."""
+    wfn = types.SimpleNamespace(kgrid=np.asarray([2, 6, 6]))
     try:
         write_parallel_transport_artifact(
             "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
@@ -168,24 +179,22 @@ def test_link_stage_refuses_an_aliased_fourth_order_mesh_before_io():
     except ValueError as exc:
         msg = str(exc)
         assert "PT-LINK-STENCIL-UNSUPPORTED" in msg
-        assert "kgrid=(4, 6, 6)" in msg and "undersampled axes x" in msg
+        assert "kgrid=(2, 6, 6)" in msg and "two-point axes x" in msg
     else:
-        raise AssertionError("undersampled fourth-order mesh was accepted")
+        raise AssertionError("two-point mesh was accepted")
 
 
-def test_link_stage_refuses_a_collapsed_2d_axis_before_io():
-    """A genuinely collapsed slab axis (kgrid[i]=1) refuses HERE too — it is
-    never fabricated as an analytic zero (KNOWN_LORRAX_ISSUES.md fix note);
-    a deck that wants only the velocity must ask for that instead (D2)."""
-    wfn = types.SimpleNamespace(kgrid=np.asarray([9, 9, 1]))
-    try:
-        write_parallel_transport_artifact(
-            "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
-            bispinor=False)
-    except ValueError as exc:
-        assert "undersampled axes z" in str(exc)
-    else:
-        raise AssertionError("collapsed 2D axis was accepted by the link stage")
+def test_link_stage_accepts_collapsed_and_second_order_axes_at_the_gate():
+    """A collapsed slab axis (kgrid[i]=1) and a 3- or 4-point axis pass the
+    gate (2026-09-05): the collapsed axis takes the real-space position
+    operator, the short axes the second-order stencil.  The probe fails
+    downstream on the ``sym=None`` it supplies, past the removed refusal."""
+    for grid in ((9, 9, 1), (4, 6, 6), (3, 3, 1), (7, 1, 1)):
+        wfn = types.SimpleNamespace(kgrid=np.asarray(grid))
+        with pytest.raises((AttributeError, TypeError, RuntimeError)):
+            write_parallel_transport_artifact(
+                "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
+                bispinor=False)
 
 
 def test_initialize_no_longer_gates_the_velocity_write_on_kgrid():
@@ -443,21 +452,26 @@ def _identity_links(nk, nb):
 
 def test_completion_runs_shared_spectral_service_and_stamps(monkeypatch):
     """Producer completion calls the shared finite-link service and passes."""
-    energies = np.array([[0.2, 0.8], [0.3, 0.9]])
-    occupations = np.array([[1.0, 0.0], [1.0, 0.0]])
-    exact = np.zeros((3, 2, 2, 2), dtype=np.complex128)
+    energies = np.array([[0.2, 0.8], [0.3, 0.9], [0.25, 0.85]])
+    occupations = np.array([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]])
+    exact = np.zeros((3, 3, 2, 2), dtype=np.complex128)
     exact[:, :, 1, 0] = np.array(
         [1.0 + 0.2j, 0.4 - 0.3j, -0.7 + 0.1j])[:, None]
     exact[:, :, 0, 1] = np.conj(exact[:, :, 1, 0])
+    # (3, 1, 1): a second-order axis and two collapsed axes (2026-09-05); a
+    # two-point axis has no derivative rule and is refused by name.
     plus = build_forward_neighbor_table(
-        np.array([[0, 0, 0], [1, 0, 0]]), (2, 1, 1))
+        np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]]), (3, 1, 1))
+    zero_position = np.zeros((3, 3, 2, 2), dtype=np.complex128)
     calls = []
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
-    def covariant(H, links, neighbors, spacing, *, band_matmul):
-        del band_matmul
+    def covariant(H, links, neighbors, spacing, *, band_matmul,
+                  stencil_orders=None, collapsed_position=None):
+        del band_matmul, collapsed_position
         calls.append((tuple(H.shape), tuple(links.shape),
-                      np.asarray(neighbors), np.asarray(spacing)))
+                      np.asarray(neighbors), np.asarray(spacing),
+                      tuple(stencil_orders)))
         return jnp.asarray(exact)
 
     monkeypatch.setattr(
@@ -466,19 +480,20 @@ def test_completion_runs_shared_spectral_service_and_stamps(monkeypatch):
         pt_io, "write_velocity_validation",
         lambda path, *, mesh, metrics: calls.append(("stamp", metrics.copy())))
     metrics = complete_velocity_validation(
-        "not-opened.h5", mesh=mesh, kgrid=(2, 1, 1),
+        "not-opened.h5", mesh=mesh, kgrid=(3, 1, 1),
         bvec_cart=np.eye(3), energies_full=energies,
         occupations_full=occupations, velocity_exact_cart=exact,
-        links_full=_identity_links(2, 2), forward_neighbors=plus,
-        atol=1.0e-12, rtol=1.0e-12)
+        links_full=_identity_links(3, 2), forward_neighbors=plus,
+        atol=1.0e-12, rtol=1.0e-12, collapsed_position=zero_position)
     assert metrics["passed"]
     derivative_calls = [c for c in calls if c[0] != "stamp"]
     assert len(derivative_calls) == 1
     shapes = derivative_calls[0]
-    assert shapes[0] == (2, 2, 2)
-    assert shapes[1] == (3, 2, 2, 2)
+    assert shapes[0] == (3, 2, 2)
+    assert shapes[1] == (3, 3, 2, 2)
     np.testing.assert_array_equal(shapes[2], plus)
-    np.testing.assert_allclose(shapes[3], [0.5, 1.0, 1.0])
+    np.testing.assert_allclose(shapes[3], [1.0 / 3.0, 1.0, 1.0])
+    assert shapes[4] == (2, 0, 0)          # second order, collapsed, collapsed
     assert calls[-1][0] == "stamp"
     assert calls[-1][1]["passed"]
     assert calls[-1][1]["transition_overlap_real"] == pytest.approx(1.0)
@@ -487,19 +502,24 @@ def test_completion_runs_shared_spectral_service_and_stamps(monkeypatch):
 
 def test_completion_sign_red_twin_stamps_failure_then_refuses(monkeypatch):
     """A phase-reversed derivative fails even though its response is equal."""
-    energies = np.array([[0.2, 0.8], [0.3, 0.9]])
-    occupations = np.array([[1.0, 0.0], [1.0, 0.0]])
-    exact = np.zeros((3, 2, 2, 2), dtype=np.complex128)
+    energies = np.array([[0.2, 0.8], [0.3, 0.9], [0.25, 0.85]])
+    occupations = np.array([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]])
+    exact = np.zeros((3, 3, 2, 2), dtype=np.complex128)
     exact[:, :, 1, 0] = np.array(
         [1.0 + 0.2j, 0.4 - 0.3j, -0.7 + 0.1j])[:, None]
     exact[:, :, 0, 1] = np.conj(exact[:, :, 1, 0])
+    # (3, 1, 1): a second-order axis and two collapsed axes (2026-09-05); a
+    # two-point axis has no derivative rule and is refused by name.
     plus = build_forward_neighbor_table(
-        np.array([[0, 0, 0], [1, 0, 0]]), (2, 1, 1))
+        np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]]), (3, 1, 1))
+    zero_position = np.zeros((3, 3, 2, 2), dtype=np.complex128)
     stamps = []
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
-    def wrong_covariant(H, links, neighbors, spacing, *, band_matmul):
+    def wrong_covariant(H, links, neighbors, spacing, *, band_matmul,
+                        stencil_orders=None, collapsed_position=None):
         del H, links, neighbors, spacing, band_matmul
+        del stencil_orders, collapsed_position
         return -jnp.asarray(exact)
 
     monkeypatch.setattr(
@@ -511,11 +531,11 @@ def test_completion_sign_red_twin_stamps_failure_then_refuses(monkeypatch):
             RuntimeError,
             "parallel-transport finite-link DFT head validation failed"):
         complete_velocity_validation(
-            "not-opened.h5", mesh=mesh, kgrid=(2, 1, 1),
+            "not-opened.h5", mesh=mesh, kgrid=(3, 1, 1),
             bvec_cart=np.eye(3), energies_full=energies,
             occupations_full=occupations, velocity_exact_cart=exact,
-            links_full=_identity_links(2, 2), forward_neighbors=plus,
-            atol=1.0e-12, rtol=1.0e-12)
+            links_full=_identity_links(3, 2), forward_neighbors=plus,
+            atol=1.0e-12, rtol=1.0e-12, collapsed_position=zero_position)
     assert len(stamps) == 1
     assert not stamps[0]["passed"]
     assert stamps[0]["head_response_relative_frobenius"] < 1.0e-12

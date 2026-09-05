@@ -37,6 +37,7 @@ import jax.numpy as jnp
 
 from wfn_loader import WfnLoader                                    # noqa: E402
 from symmetry_maps import unfold_file_wedge_polar_matrix            # noqa: E402
+from common.parallel_transport import collapsed_axes                 # noqa: E402
 from common import timing
 from common.collectives import barrier, gather_k_blocks
 from common.preprocessing_output import (PreprocessingProductionReport,
@@ -819,6 +820,52 @@ def _prov_show(v) -> str:
 # --------------------------
 # Main driver
 # --------------------------
+
+
+def collapsed_axis_position_operators(
+	psi_G, *, wfn, sym, meta, geom, gtab_file, template, emit=print):
+	"""``Z_a = <m| b_a . r |n>`` on the full BZ for every collapsed k axis.
+
+	One :func:`common.mtxel_sweep.collapsed_position_operator` sweep per
+	collapsed axis on the resident file-wedge ``psi_G`` (the velocity's own
+	sweep machinery; the sawtooth ``2 pi wrap(f_a - f_a^0)`` enters through
+	its exact Fourier coefficients, centre from
+	:func:`common.parallel_transport.collapsed_axis_center`), then the
+	polar unfold to the full BZ as the Cartesian vector ``Z_a b_a-hat``
+	(``unfold_file_wedge_polar_matrix``; a mirror through the slab flips
+	``b_a`` and with it ``Z_a``, which a scalar unfold would miss), and
+	Hermitisation.  Returns ``(Z (nk, 3, nb_pad, nb_pad) like template, zero
+	on stencil axes; centres (3,) with NaN on stencil axes)``.
+	"""
+	from common.mtxel_sweep import collapsed_position_operator
+	from common.parallel_transport import collapsed_axes, collapsed_axis_center
+
+	B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+	centers = np.full(3, np.nan, dtype=np.float64)
+	position = jnp.zeros_like(jnp.asarray(template))
+	for axis in collapsed_axes(wfn.kgrid):
+		center = collapsed_axis_center(wfn.atom_crys, axis)
+		centers[axis] = center
+		with timing.section("parallel_transport_position"):
+			Z_file = sweep_matrix_elements(
+				psi_G, operator=collapsed_position_operator(
+					geom, axis=axis, center=center),
+				geom=geom, gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
+				box_index=wfn.box_index(k="ibz"),
+				kvecs=np.asarray(gtab_file.kvecs))
+		bhat = jnp.asarray(B[axis] / np.linalg.norm(B[axis]))
+		Z_vec = unfold_file_wedge_polar_matrix(
+			sym, Z_file[:, None, :, :] * bhat[None, :, None, None])
+		Z_full = jnp.einsum("j,kjmn->kmn", bhat, Z_vec, optimize=True)
+		Z_full = 0.5 * (Z_full + jnp.swapaxes(jnp.conj(Z_full), -1, -2))
+		position = position.at[:, axis].set(Z_full)
+		emit(f"Collapsed k axis {'xyz'[axis]}: position operator "
+		     f"Z = <m| b . r |n> on {int(Z_full.shape[0])} k, centre f0 = "
+		      f"{center:.6f} (fractional), branch cut in the vacuum at "
+		      f"f0 + 1/2; max|Z| = "
+		      f"{float(jax.device_get(jnp.max(jnp.abs(Z_full)))):.4f}")
+	return position, centers
+
 
 def main(argv=None):
 	_t_main = time.perf_counter()
@@ -1673,6 +1720,23 @@ def main(argv=None):
 					validate_parallel_transport_artifact,
 					write_parallel_transport_artifact)
 				pt_path = Path(args.parallel_transport_out).resolve()
+				# COLLAPSED AXES (a slab normal, a wire's transverse pair): no k
+				# stencil exists there, and none is fabricated.  The connection
+				# along a collapsed reduced axis is the band matrix of the
+				# position conjugate to it, Z_a = <m| b_a . r |n> = 2 pi <m| f_a |n>,
+				# a genuine bounded operator because the wavefunctions vanish in
+				# the vacuum where the sawtooth's branch cut sits.  It rides the
+				# SAME sweep as the velocity (one local operator per axis on the
+				# resident file-wedge psi), embedded as the Cartesian vector
+				# Z_a b_a-hat so the polar unfold handles a mirror's sign.
+				collapsed_position_kmajor = None
+				collapsed_centers = None
+				if collapsed_axes(wfn.kgrid):
+					collapsed_position_kmajor, collapsed_centers = (
+						collapsed_axis_position_operators(
+							psi_G, wfn=wfn, sym=sym, meta=meta, geom=geom,
+							gtab_file=gtab_file, template=H_v,
+							emit=report.emit))
 				with timing.section("parallel_transport_velocity"):
 					initialize_parallel_transport_artifact(
 						pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
@@ -1682,7 +1746,10 @@ def main(argv=None):
 						velocity_dft_kmajor=H_v,
 						wfn_path=str(wfn_path),
 						wfn_fingerprint=wfn_fingerprint(wfn),
-						rcond=float(args.parallel_transport_rcond))
+						rcond=float(args.parallel_transport_rcond),
+						collapsed_position_kmajor=collapsed_position_kmajor,
+						collapsed_axis_centers=collapsed_centers)
+				del collapsed_position_kmajor
 				write_pt_remainder = write_parallel_transport_artifact
 				validate_pt_artifact = validate_parallel_transport_artifact
 			# THE BOUNDARY, named rather than implied: the only consumer

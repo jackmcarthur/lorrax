@@ -379,6 +379,11 @@ class ParallelTransportHeadData:
     #: refuse a window edge that cuts a hybridized manifold.  See
     #: ``file_io.parallel_transport.load_link_singular_values``.
     singular_values: np.ndarray
+    #: ``(3, nk, nb_storage, nb_storage)`` position operator of the collapsed
+    #: (one-point, vacuum) axes, zero on stencil axes; ``None`` when the k
+    #: grid has no collapsed axis.  The connection along a collapsed axis
+    #: (``common.parallel_transport.link_stencil_orders``).
+    collapsed_position: object = None
 
 
 @dataclass(frozen=True)
@@ -465,7 +470,9 @@ def load_parallel_transport_head(
 
     One handle, one library, one open.
     """
+    from common.parallel_transport import collapsed_axes, link_stencil_orders
     from file_io.parallel_transport import (
+        COLLAPSED_POSITION_DATASET,
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
@@ -609,6 +616,32 @@ def load_parallel_transport_head(
         # preflight in ``sc_iteration.load_head_velocity_source`` reads it
         # off the returned object.
         singular_values = load_link_singular_values(io, nb_logical=expected_nb)
+        collapsed_position = None
+        if collapsed_axes(expected_kgrid):
+            # A collapsed axis has no link stencil; its connection is the
+            # stored position operator.  An artifact that predates it has
+            # no such dataset and refuses here by name instead of reading a
+            # short slab.
+            try:
+                stored_orders = np.asarray(io.read_small(
+                    "link_stencil_orders", dtype=np.int32)).reshape(3)
+            except Exception as exc:   # SlabIO raises its own family
+                raise ValueError(
+                    f"{path}: the k grid {tuple(expected_kgrid)} has a "
+                    "collapsed axis but the artifact carries no "
+                    "link_stencil_orders stamp: it predates the collapsed-"
+                    "axis position operator (2026-09-05); regenerate it "
+                    "with get_dipole_mtxels --parallel-transport-out") from exc
+            if tuple(int(o) for o in stored_orders) != tuple(
+                    link_stencil_orders(expected_kgrid)):
+                raise ValueError(
+                    f"{path}: stored link_stencil_orders "
+                    f"{tuple(int(o) for o in stored_orders)} != "
+                    f"{link_stencil_orders(expected_kgrid)} for kgrid "
+                    f"{tuple(expected_kgrid)}")
+            collapsed_position = io.read_slab(
+                COLLAPSED_POSITION_DATASET, shape=large_shape,
+                partition_spec=spec)
 
     expected_prefix = (3, int(meta.nk_tot))
     if (
@@ -653,6 +686,7 @@ def load_parallel_transport_head(
         reciprocal_lattice_cart=reciprocal,
         validation=validation,
         singular_values=singular_values,
+        collapsed_position=collapsed_position,
     )
 
 
@@ -867,28 +901,37 @@ def covariant_link_derivative(
     mesh: Mesh,
     kgrid,
     bvec_cart,
+    collapsed_position=None,
 ):
     """Return the direct finite-link covariant derivative of ``Delta H``.
 
     Neighbouring operators are transported into the central DFT basis before
-    the fourth-order reduced-coordinate stencil is applied.  This is one
-    gauge-covariant discrete object; no separately differentiated Hamiltonian
-    and connection commutator have to cancel on a finite grid.
+    the reduced-coordinate stencil is applied (fourth order on >= 5-point
+    axes, second order on 3- or 4-point axes); a collapsed axis takes
+    ``-i[Z_a, Delta H]`` with the stored position operator
+    ``collapsed_position`` (``common.parallel_transport.link_stencil_orders``).
+    This is one gauge-covariant discrete object; no separately
+    differentiated Hamiltonian and connection commutator have to cancel on a
+    finite grid.
     """
     from common.parallel_transport import (
         fourth_order_covariant_derivative,
+        link_stencil_orders,
         make_distributed_band_matmul,
     )
 
     delta = jnp.asarray(delta_h_dft, dtype=jnp.complex128)
     links = jnp.asarray(forward_links, dtype=jnp.complex128)
-    spacing = 1.0 / np.asarray(tuple(int(n) for n in kgrid), dtype=np.float64)
+    grid = tuple(int(n) for n in kgrid)
+    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
     reduced = fourth_order_covariant_derivative(
         delta,
         links,
         np.asarray(forward_neighbors, dtype=np.int64),
         spacing,
         band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
+        stencil_orders=link_stencil_orders(grid),
+        collapsed_position=collapsed_position,
     )
     return reduced_covector_to_cartesian(reduced, bvec_cart)
 
@@ -3262,6 +3305,7 @@ def build_iteration_head_response(
     wfns_qp=None,
     eta_ry: float | None = None,
     delta_velocity_dft=None,
+    collapsed_position=None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -3296,6 +3340,7 @@ def build_iteration_head_response(
                 mesh=mesh,
                 kgrid=kgrid,
                 bvec_cart=bvec_cart,
+                collapsed_position=collapsed_position,
             )
         v_dft_basis = v_dft_basis + jnp.asarray(
             delta_velocity_dft, dtype=jnp.complex128)
@@ -3490,7 +3535,8 @@ def covariant_velocity_correction(delta_head, pt, *, mesh: Mesh, kgrid):
     """
     return covariant_link_derivative(
         delta_head, pt.forward_links, pt.forward_neighbors,
-        mesh=mesh, kgrid=kgrid, bvec_cart=pt.reciprocal_lattice_cart)
+        mesh=mesh, kgrid=kgrid, bvec_cart=pt.reciprocal_lattice_cart,
+        collapsed_position=getattr(pt, "collapsed_position", None))
 
 
 def _interband_velocity_kernel(mesh: Mesh) -> Callable:

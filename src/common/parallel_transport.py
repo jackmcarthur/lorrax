@@ -39,6 +39,10 @@ __all__ = [
     "make_distributed_band_matmul",
     "make_cross_k_link",
     "MIN_STENCIL_POINTS",
+    "collapsed_axes",
+    "collapsed_axis_center",
+    "collapsed_axis_coordinate",
+    "link_stencil_orders",
     "undersampled_link_axes",
     "WFN_FINGERPRINT_SCHEME",
     "bind_wfn_fingerprint",
@@ -47,48 +51,132 @@ __all__ = [
     "wfn_fingerprint",
 ]
 
-#: Minimum distinct mesh points a Cartesian direction needs to support the
-#: advertised fourth-order +/-2 link stencil (``fourth_order_connection`` /
-#: ``fourth_order_covariant_derivative``).  THE ONE PLACE THIS THRESHOLD IS
-#: DECIDED -- both the artifact producer
-#: (``file_io.parallel_transport.write_parallel_transport_artifact``) and the
-#: driver-entry preflight (``gw.sc_iteration.load_head_velocity_source``) read
-#: this name rather than each carrying its own literal ``5``, which is
-#: exactly the shadow-accounting failure class this tree's
-#: ``docs/dev/QUALITY_PATTERNS.md`` #3 names.
+#: Minimum distinct mesh points a reduced direction needs for the
+#: fourth-order +/-2 link stencil.  Below it, 3 or 4 points take the
+#: second-order +/-1 stencil; 1 point is a COLLAPSED (non-periodic, vacuum-
+#: padded) direction and takes no stencil at all but the real-space
+#: position operator (:func:`link_stencil_orders`); 2 points support no
+#: derivative and are refused (:func:`undersampled_link_axes`).  THE ONE
+#: PLACE THESE THRESHOLDS ARE DECIDED -- the artifact producer
+#: (``file_io.parallel_transport``), the connection/derivative kernels and
+#: the driver-entry preflight (``gw.sc_iteration.load_head_velocity_source``)
+#: read these names rather than each carrying its own literals.
 MIN_STENCIL_POINTS: int = 5
+
+#: :func:`link_stencil_orders` value for a collapsed direction.
+COLLAPSED_AXIS: int = 0
+
+
+def link_stencil_orders(kgrid) -> tuple[int, int, int]:
+    """Per reduced axis: ``4`` (>= 5 points), ``2`` (3 or 4 points), or
+    :data:`COLLAPSED_AXIS` (1 point).  A 2-point axis is refused by name:
+    its +/-1 neighbours are the same point and no finite difference exists.
+
+    A collapsed axis is a direction the cell is NOT periodic in physically
+    (a slab normal, a wire's two transverse axes): the wavefunctions vanish
+    in the vacuum, the position along it is a genuine bounded operator on
+    the cell, and the Berry connection along that reduced axis is its band
+    matrix ``Z_a = <m| b_a . r |n>`` (:func:`collapsed_axis_coordinate`).
+    The covariant derivative there is ``-i[Z_a, O]`` exactly; no k
+    derivative is fabricated (the old refusal's "analytic zero" is not
+    this: the connection term is kept, only the vanishing ``d_k`` is not).
+    """
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    orders = []
+    for axis, n in zip("xyz", grid):
+        if n <= 0:
+            raise ValueError(f"kgrid must be positive; got {grid}")
+        if n == 1:
+            orders.append(COLLAPSED_AXIS)
+        elif n == 2:
+            raise ValueError(
+                "GATE pt_two_point_axis: a reduced k axis with exactly two "
+                f"mesh points ({axis}: kgrid={grid}) supports no finite "
+                "difference (its +/-1 neighbours coincide) and is not a "
+                "collapsed vacuum direction either; densify it to >= 3 "
+                "points or collapse it to 1.")
+        elif n < MIN_STENCIL_POINTS:
+            orders.append(2)
+        else:
+            orders.append(4)
+    return tuple(orders)
+
+
+def collapsed_axes(kgrid) -> tuple[int, ...]:
+    """Indices of the reduced axes with one mesh point."""
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    return tuple(i for i, n in enumerate(grid) if n == 1)
 
 
 def undersampled_link_axes(kgrid) -> list[str]:
-    """Cartesian directions whose mesh cannot support the link stencil.
+    """Cartesian directions whose mesh cannot support ANY link stencil.
 
-    Applies PER AXIS, and ONLY to the stages that differentiate along k --
-    the nearest-neighbour link build and the fourth-order connection/
-    covariant-derivative stencil it feeds.  It does NOT apply to the
-    unconditional, gauge-free exact-DFT-velocity write
-    (``v = p + i[r,V_NL]`` needs no neighbouring k at all), which is why
-    that write is no longer gated on this check (KNOWN_LORRAX_ISSUES.md row
-    at ``file_io/parallel_transport.py:407-415`` / ``get_dipole_mtxels.py:
-    1309-1317``, 2026-08-19).
+    Applies PER AXIS, and ONLY to the stages that differentiate along k.
+    It does NOT apply to the unconditional, gauge-free exact-DFT-velocity
+    write (``v = p + i[r,V_NL]`` needs no neighbouring k at all).
 
-    A genuinely collapsed direction (``kgrid[i] == 1``, e.g. the z axis of a
-    9x9x1 slab deck) is reported exactly like an undersampled periodic one
-    (``1 < kgrid[i] < 5``) -- NOT stamped as an analytic zero.  The fix note
-    on that same register row is explicit: "Do not fabricate a z derivative
-    for the separate covariant parallel-transport mode."  A 2D deck that
-    wants only the velocity reaches the links-free producer/consumer path
-    instead of asking this function anything; a 2D deck that asks for the
-    full ``parallel_transport`` link stage is refused, by name, on every
-    caller of this function.
+    Since 2026-09-05 only a TWO-point axis is unsupported: a collapsed axis
+    (``kgrid[i] == 1``) takes the real-space position operator as its
+    connection and 3- or 4-point axes take the second-order stencil
+    (:func:`link_stencil_orders`).  Before that, every axis below
+    :data:`MIN_STENCIL_POINTS` was refused, which shut every 2D and 1D deck
+    out of the covariant head and the current carriers' Sigma-velocity.
 
     Returns
     -------
     list[str]
-        The undersampled axis names, a subset of ``["x", "y", "z"]``, in
-        that fixed order.  Empty iff every direction supports the stencil.
+        The unsupported axis names, a subset of ``["x", "y", "z"]``, in
+        that fixed order.  Empty iff every direction has a derivative rule.
     """
     grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
-    return [axis for axis, n in zip("xyz", grid) if n < MIN_STENCIL_POINTS]
+    return [axis for axis, n in zip("xyz", grid) if n == 2]
+
+
+def collapsed_axis_center(atom_crys, axis: int) -> float:
+    """``f_a^0``: the circular mean of the atoms' fractional coordinates
+    along reduced axis ``a`` -- the slab/wire centre the position
+    sawtooth is wrapped around (its branch cut is half a cell away, in the
+    vacuum)."""
+    a = int(axis)
+    if a not in (0, 1, 2):
+        raise ValueError(f"axis must be 0, 1 or 2; got {axis}")
+    frac = np.asarray(atom_crys, dtype=np.float64)
+    if frac.ndim != 2 or frac.shape[1] != 3 or frac.shape[0] == 0:
+        raise ValueError(
+            f"atom_crys must be (nat, 3) fractional coordinates; got "
+            f"{frac.shape}")
+    angles = 2.0 * np.pi * frac[:, a]
+    return float(np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())
+                 / (2.0 * np.pi)) % 1.0
+
+
+def collapsed_axis_coordinate(fft_grid, atom_crys, axis: int):
+    """``zeta_a(r) = 2 pi * wrap(f_a(r) - f_a^0)`` SAMPLED on the FFT grid,
+    and ``f_a^0``.  A diagnostic / reference form: the production operator
+    (``common.mtxel_sweep.collapsed_position_operator``) applies the same
+    sawtooth through its exact Fourier coefficients instead, because the
+    grid sample aliases the ``1/g`` tail into the pair densities.
+
+    ``f_a`` is the fractional coordinate along reduced axis ``a`` of every
+    FFT-grid point, ``f_a^0`` the circular mean of the atoms' fractional
+    coordinates along ``a`` (the slab or wire centre), and the wrap puts the
+    branch cut of the sawtooth half a cell away from that centre, in the
+    vacuum where the wavefunctions vanish.  ``2 pi f_a = b_a . r`` is the
+    coordinate conjugate to the reduced k component ``kappa_a``, so
+    ``-i[<zeta_a>, O]`` is the reduced-coordinate covariant derivative
+    along ``a`` and needs the SAME ``reduced_covector_to_cartesian`` as the
+    stencil axes.  Returns ``(zeta_r (nx, ny, nz) float64, f_a^0)``.
+    """
+    grid = tuple(int(n) for n in fft_grid)
+    a = int(axis)
+    center = collapsed_axis_center(atom_crys, a)
+    f = np.arange(grid[a], dtype=np.float64) / float(grid[a])
+    wrapped = np.mod(f - center + 0.5, 1.0) - 0.5
+    zeta_line = 2.0 * np.pi * wrapped
+    shape = [1, 1, 1]
+    shape[a] = grid[a]
+    zeta_r = np.broadcast_to(zeta_line.reshape(shape), grid).copy()
+    return zeta_r, center
 
 _BAND_MATMUL_CACHE = {}
 
@@ -559,19 +647,54 @@ def make_distributed_band_matmul(mesh, *, n_batch_axes: int):
     return matmul
 
 
+def _resolve_axis_rules(stencil_orders, collapsed_position, shape):
+    """Validate the per-axis rule set shared by the two stencil kernels."""
+    orders = ((4, 4, 4) if stencil_orders is None
+              else tuple(int(o) for o in stencil_orders))
+    if len(orders) != 3 or any(o not in (COLLAPSED_AXIS, 2, 4)
+                               for o in orders):
+        raise ValueError(
+            "stencil_orders must be three values from "
+            f"{{{COLLAPSED_AXIS}, 2, 4}}; got {stencil_orders!r}")
+    position = None
+    if COLLAPSED_AXIS in orders:
+        if collapsed_position is None:
+            raise ValueError(
+                "GATE pt_collapsed_axis_needs_position: a collapsed axis "
+                f"(stencil_orders={orders}) needs the real-space position "
+                "operator Z_a (3, nk, nb, nb); none was supplied.  The "
+                "artifact's collapsed_position_reduced dataset carries it.")
+        position = jnp.asarray(collapsed_position)
+        if tuple(position.shape) != tuple(shape):
+            raise ValueError(
+                f"collapsed_position must have shape {tuple(shape)}; got "
+                f"{tuple(position.shape)}")
+    elif collapsed_position is not None:
+        raise ValueError(
+            "collapsed_position was supplied but no axis is collapsed "
+            f"(stencil_orders={orders})")
+    return orders, position
+
+
 def fourth_order_connection(
     forward_links: jax.Array,
     forward_neighbors: np.ndarray,
     reduced_spacing: Sequence[float],
     *,
     band_matmul,
+    stencil_orders=None,
+    collapsed_position=None,
 ) -> jax.Array:
-    """Construct the Hermitian fourth-order reduced-coordinate connection.
+    """Construct the Hermitian reduced-coordinate connection, axis by axis.
 
     ``forward_links`` is ``(3, nk, nb, nb)`` and may be tiled
-    ``P(None,None,'x','y')``. The result has the same shape and is
-    value-level fourth-order finite-difference parity, not bit parity with a
-    continuum derivative.
+    ``P(None,None,'x','y')``. The result has the same shape.  Per axis
+    (:func:`link_stencil_orders`): order 4 is the +/-2 finite-difference
+    connection (value-level fourth-order parity, not bit parity with a
+    continuum derivative); order 2 the +/-1 one; a collapsed axis takes
+    ``A_a = Z_a`` from ``collapsed_position`` ``(3, nk, nb, nb)``, the
+    band matrix of the position conjugate to that reduced coordinate.
+    ``stencil_orders=None`` is the historical all-fourth-order call.
     """
     links = jnp.asarray(forward_links)
     plus = np.asarray(forward_neighbors, dtype=np.int32)
@@ -587,18 +710,27 @@ def fourth_order_connection(
     if spacing.shape != (3,) or np.any(spacing <= 0.0):
         raise ValueError(
             f"reduced_spacing must be three positive values; got {spacing}")
+    orders, position = _resolve_axis_rules(
+        stencil_orders, collapsed_position, links.shape)
     minus = inverse_neighbor_table(plus)
     components = []
     for idir in range(3):
+        if orders[idir] == COLLAPSED_AXIS:
+            Z = position[idir]
+            components.append(0.5 * (Z + jnp.swapaxes(jnp.conj(Z), -1, -2)))
+            continue
         lp1 = links[idir]
         km1 = minus[:, idir]
-        km2 = minus[km1, idir]
-        lp2 = band_matmul(lp1, lp1[plus[:, idir]])
         lm1 = jnp.swapaxes(jnp.conj(lp1[km1]), -1, -2)
-        lm2 = band_matmul(
-            lm1, jnp.swapaxes(jnp.conj(lp1[km2]), -1, -2))
-        A = (1.0j / (12.0 * float(spacing[idir]))) * (
-            -lp2 + 8.0 * lp1 - 8.0 * lm1 + lm2)
+        if orders[idir] == 2:
+            A = (1.0j / (2.0 * float(spacing[idir]))) * (lp1 - lm1)
+        else:
+            km2 = minus[km1, idir]
+            lp2 = band_matmul(lp1, lp1[plus[:, idir]])
+            lm2 = band_matmul(
+                lm1, jnp.swapaxes(jnp.conj(lp1[km2]), -1, -2))
+            A = (1.0j / (12.0 * float(spacing[idir]))) * (
+                -lp2 + 8.0 * lp1 - 8.0 * lm1 + lm2)
         A = 0.5 * (A + jnp.swapaxes(jnp.conj(A), -1, -2))
         components.append(A)
     return jnp.stack(components, axis=0)
@@ -611,6 +743,8 @@ def fourth_order_covariant_derivative(
     reduced_spacing: Sequence[float],
     *,
     band_matmul,
+    stencil_orders=None,
+    collapsed_position=None,
 ) -> jax.Array:
     r"""Differentiate a band operator after finite-link parallel transport.
 
@@ -619,10 +753,17 @@ def fourth_order_covariant_derivative(
     ``L_i(k) O(k+b_i) L_i(k)^H``.
 
     Each neighbour is therefore expressed in the central ``k`` basis before
-    the fourth-order stencil is applied.  This is the discrete, structurally
+    the stencil is applied.  This is the discrete, structurally
     gauge-covariant spelling of ``partial_i O - i[A_i,O]``; it avoids splitting
     two large gauge-dependent terms whose finite-grid derivatives obey no
     exact product rule.
+
+    Per axis (:func:`link_stencil_orders`, ``stencil_orders``): order 4 is
+    the +/-2 stencil (the historical and default rule), order 2 the +/-1
+    stencil for 3- or 4-point axes, and a COLLAPSED axis (one mesh point,
+    a vacuum direction) takes ``-i[Z_a, O]`` with ``Z_a`` from
+    ``collapsed_position`` ``(3, nk, nb, nb)`` -- exact, since ``d_kappa_a``
+    of anything vanishes there and the connection IS the position matrix.
 
     Parameters
     ----------
@@ -664,6 +805,8 @@ def fourth_order_covariant_derivative(
     if spacing.shape != (3,) or np.any(spacing <= 0.0):
         raise ValueError(
             f"reduced_spacing must be three positive values; got {spacing}")
+    orders, position = _resolve_axis_rules(
+        stencil_orders, collapsed_position, links.shape)
 
     minus = inverse_neighbor_table(plus)
 
@@ -675,18 +818,26 @@ def fourth_order_covariant_derivative(
 
     rows = []
     for idir in range(3):
+        if orders[idir] == COLLAPSED_AXIS:
+            Z = position[idir]
+            rows.append((-1.0j) * (
+                band_matmul(Z, operator) - band_matmul(operator, Z)))
+            continue
         lp1 = links[idir]
         kp1 = plus[:, idir]
-        kp2 = plus[kp1, idir]
         km1 = minus[:, idir]
+        lm1 = jnp.swapaxes(jnp.conj(lp1[km1]), -1, -2)
+        tp1 = _transport(lp1, operator[kp1])
+        tm1 = _transport(lm1, operator[km1])
+        if orders[idir] == 2:
+            rows.append((tp1 - tm1) / (2.0 * float(spacing[idir])))
+            continue
+        kp2 = plus[kp1, idir]
         km2 = minus[km1, idir]
         lp2 = band_matmul(lp1, lp1[kp1])
-        lm1 = jnp.swapaxes(jnp.conj(lp1[km1]), -1, -2)
         lm2 = band_matmul(
             lm1, jnp.swapaxes(jnp.conj(lp1[km2]), -1, -2))
-        tp1 = _transport(lp1, operator[kp1])
         tp2 = _transport(lp2, operator[kp2])
-        tm1 = _transport(lm1, operator[km1])
         tm2 = _transport(lm2, operator[km2])
         rows.append(
             (-tp2 + 8.0 * tp1 - 8.0 * tm1 + tm2)
