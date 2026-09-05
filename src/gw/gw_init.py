@@ -1595,7 +1595,7 @@ def _resolve_zeta_fit_contract(
 
 def _plan_gflat_chunks_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, is_bispinor, n_q_selected,
-		face_current_vertex=False, print_fn=print):
+		face_current_vertex=False, parent_route=None, print_fn=print):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
 	typically ≈ μ_C/3).
@@ -1663,6 +1663,7 @@ def _plan_gflat_chunks_for_channel(
 		distributed_zeta_solve=str(cfg.backend.distributed_zeta_solve),
 		low_mem_bands=bool(mem.low_mem_bands),
 		face_current_vertex=bool(face_current_vertex),
+		parent_route=parent_route,
 		# Stage F writes per-rank hyperslabs; the planner therefore
 		# charges only the local sharded tile.
 	)
@@ -3288,24 +3289,6 @@ def prepare_isdf_and_wavefunctions(
 				wfn_fingerprint_binding=basis_wfn_fingerprint_binding)
 			charge_zeta_reused = bool(zeta_contract.reuse_charge)
 
-			# Plan chunks ONCE for a channel that will actually FIT.  The
-			# canonical planner still owns band/r/q/G-flat chunks, P_min and
-			# the binding-stage report; a proven reuse bypasses that fit-only
-			# lifecycle completely.  fit_zeta's transverse re-plan uses this
-			# same owner, so fresh charge and transverse channels cannot drift.
-			chunks = None
-			gflat_plan = None
-			if not charge_zeta_reused:
-				_n_q_selected_charge = (
-					int(np.asarray(sym.q_irr_full_idx).shape[0])
-					if zeta_contract.write_ibz_only_charge
-					else int(meta.nk_tot))
-				chunks, gflat_plan = _plan_gflat_chunks_for_channel(
-					meta=meta, cfg=cfg, band_slices=band_slices,
-					mesh_xy=mesh_xy,
-					is_bispinor=bool(int(meta.nspinor) == 4),
-					n_q_selected=_n_q_selected_charge,
-					print_fn=print0)
 
 			# Parent-k Green acceleration is internal and shape-derived: only
 			# the face layout can contract its band axis safely, only scalar/2c
@@ -3373,6 +3356,34 @@ def prepare_isdf_and_wavefunctions(
 						"the centroid basis cannot form an exact orbit-local "
 						f"plan ({_parent_plan_error}); using the full-k path.")
 					_candidate_plan = None
+			# Plan chunks ONCE for a channel that will actually FIT.  The
+			# canonical planner still owns band/r/q/G-flat chunks, P_min and
+			# the binding-stage report; a proven reuse bypasses that fit-only
+			# lifecycle completely.  fit_zeta's transverse re-plan uses this
+			# same owner, so fresh charge and transverse channels cannot drift.
+			# It runs AFTER the raw-parent plan is built so the psi-side terms
+			# are priced at the rows the fit will actually hold.
+			chunks = None
+			gflat_plan = None
+			if not charge_zeta_reused:
+				_n_q_selected_charge = (
+					int(np.asarray(sym.q_irr_full_idx).shape[0])
+					if zeta_contract.write_ibz_only_charge
+					else int(meta.nk_tot))
+				chunks, gflat_plan = _plan_gflat_chunks_for_channel(
+					meta=meta, cfg=cfg, band_slices=band_slices,
+					mesh_xy=mesh_xy,
+					is_bispinor=bool(int(meta.nspinor) == 4),
+					n_q_selected=_n_q_selected_charge,
+					parent_route=(
+						None if _candidate_plan is None else dict(
+							n_parent=int(_candidate_plan.n_parent),
+							mu_packed=int(_candidate_plan.n_centroid_packed),
+							parents_only=bool(
+								_parents_only_wanted
+								and _candidate_plan.supports_canonical_bridge))),
+					print_fn=print0)
+
 				if _candidate_plan is not None:
 					# Reordering stays at the orbit-packed all-P extent.  Any
 					# surplus rows are known-zero per-owner suffixes and are
