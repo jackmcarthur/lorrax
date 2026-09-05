@@ -925,6 +925,7 @@ def compute_screening_model(
                 mesh_xy=mesh_xy, wfn=wfn,
                 wfn_fingerprint_binding=wfn_fingerprint_binding,
                 charge_zeta_identity=charge_zeta_identity,
+                charge_zeta_source_path=tensors_filename,
                 occupation_state=occupation_state,
                 material_class=material_class, print_fn=print_fn)
             return {"mpa_fit": fit_path, "mpa_fit_reused": True}
@@ -955,6 +956,7 @@ def compute_screening_model(
             run_dir, label, wfns=wfns, wfn=wfn, V_q=V_q, quad=quad, sym=sym,
             wfn_fingerprint_binding=wfn_fingerprint_binding,
             charge_zeta_identity=charge_zeta_identity,
+            charge_zeta_source_path=tensors_filename,
             centroid_indices=centroid_indices, head_resolver=head_resolver,
             config=config, meta=meta, mesh_xy=mesh_xy,
             energy_reference=e_ref, plan=mpa_plan,

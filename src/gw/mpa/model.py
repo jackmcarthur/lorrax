@@ -37,13 +37,16 @@ def _canonical_wfn_identity(wfn, wfn_fingerprint_binding=None):
     }
 
 
-def _canonical_charge_zeta_identity(receipt):
+def _canonical_charge_zeta_identity(receipt, *, source_path):
     """Validate gw_init's opaque charge-zeta receipt for MPA transport."""
     if receipt is None:
         raise ValueError(
             "MPA requires the authenticated charge-zeta identity stored with "
-            "the ISDF restart. This restart predates that receipt; rerun with "
-            "restart = false to regenerate the restart and MPA artifacts.")
+            f"the ISDF restart at {os.path.abspath(os.fspath(source_path))}. "
+            "This source predates that receipt. Copy the input deck into a "
+            "new run variant with an empty restart/tmp directory, set "
+            "restart = false, and rerun GW there to regenerate the restart "
+            "and MPA artifacts without colliding with completed stores.")
     if not isinstance(receipt, dict) or set(receipt) != {"scheme", "digest"}:
         raise ValueError(
             "MPA charge-zeta identity must contain exactly scheme and digest")
@@ -123,6 +126,7 @@ def validate_reused_mpa_fit(
     fit_path, *, config, live_plan, sym, centroid_indices, meta, mesh_xy, wfn,
     wfn_fingerprint_binding=None,
     charge_zeta_identity=None,
+    charge_zeta_source_path=None,
     occupation_state, material_class, print_fn=print,
 ):
     """Certify an explicit read-only one-shot MPA fit against this run.
@@ -148,7 +152,8 @@ def validate_reused_mpa_fit(
     # from its P36 carrier extent 2088), and also makes reuse mesh-dependent.
     logical_tables = tables.logical(int(meta.n_rmu)).canonical()
     wfn_identity = _canonical_wfn_identity(wfn, wfn_fingerprint_binding)
-    zeta_identity = _canonical_charge_zeta_identity(charge_zeta_identity)
+    zeta_identity = _canonical_charge_zeta_identity(
+        charge_zeta_identity, source_path=charge_zeta_source_path or path)
     ledger = mpa_store.validate_fit_store(
         path,
         expected_identity={
@@ -832,6 +837,7 @@ def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     wfn_fingerprint_binding=None,
     charge_zeta_identity=None,
+    charge_zeta_source_path=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
     occupation_state=None, material_class, head_channel=None, wc_source=None,
@@ -925,7 +931,9 @@ def build_mpa_fit(
     provenance = {
         "screening_diagrams": diagrams,
         **_canonical_wfn_identity(wfn, wfn_fingerprint_binding),
-        **_canonical_charge_zeta_identity(charge_zeta_identity),
+        **_canonical_charge_zeta_identity(
+            charge_zeta_identity, source_path=charge_zeta_source_path or os.path.join(
+                root, f"isdf_tensors_{int(meta.n_rmu)}.h5")),
     }
     # The origin shift is stamped ONLY when the deck declared it: it enters
     # mpa_store's `extra` channel as the additive attr
