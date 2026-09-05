@@ -367,8 +367,10 @@ def _create_datasets(io, spec: WObserverSpec) -> None:
 
 def _write_allocation_metadata(io, spec: WObserverSpec) -> None:
     io.write_attr("observer_schema", np.asarray(OBSERVER_SCHEMA, np.int32))
-    io.write_attr("observer_identity_json", _canonical_json(spec.identity))
-    io.write_attr("body_provenance_json", _canonical_json(spec.body_provenance))
+    io.write_attr("observer_identity_json", np.bytes_(
+        _canonical_json(spec.identity)))
+    io.write_attr("body_provenance_json", np.bytes_(
+        _canonical_json(spec.body_provenance)))
     io.write_attr("z_requested_ry", spec.z_requested_ry)
     io.write_attr("z_evaluated_ry", spec.z_evaluated_ry)
     io.write_attr("arm_code", spec.arm_code)
@@ -381,13 +383,14 @@ def _write_allocation_metadata(io, spec: WObserverSpec) -> None:
     io.write_attr("probe_column_role", np.asarray(
         ["proposal"] * PROPOSAL_RANK + ["heldout"] * HELDOUT_RANK,
         dtype="S8"))
-    io.write_attr("logical_shapes_json", _canonical_json(_dataset_shapes(spec)))
-    io.write_attr("partition_specs_json", _canonical_json({
+    io.write_attr("logical_shapes_json", np.bytes_(
+        _canonical_json(_dataset_shapes(spec))))
+    io.write_attr("partition_specs_json", np.bytes_(_canonical_json({
         "v_selected_qmunu": "P(None,x,y)",
         "probe_qmur": "P(None,y,None)",
         "wc_selected_zqmunu": "P(None,None,x,y)",
         "wc_action_zqmur": "P(None,None,x,None)",
-    }))
+    })))
 
 
 class InternalFFWObserver:
