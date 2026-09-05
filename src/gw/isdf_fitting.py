@@ -831,12 +831,20 @@ def fit_zeta_to_h5(
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
         if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
             # Interleaved pad slots (orbit-packed order): C_q's pad rows and
-            # columns are exact zeros, so put 1 on the pad diagonal and the
-            # factor is nonsingular while Z's zero pad rows give zeta_pad = 0.
+            # columns are exact zeros.  Put C's own MEAN DIAGONAL (tr C/n per
+            # q; the pad rows contribute nothing to the trace) on the pad
+            # diagonal: the factor is nonsingular, Z's zero pad rows give
+            # zeta_pad = 0, and the pad eigenvalues sit inside the active
+            # spectrum -- a unit pad would BE lambda_max when C's scale is
+            # small and the rank-truncation cut rcond*lambda_max would then
+            # drop real modes (Si leg 20 attempt 1: 39 meV).
+            _pad_scale = (jnp.trace(C_q_flat, axis1=-2, axis2=-1).real
+                          / float(n_rmu)).astype(C_q_flat.dtype)
             _pad_diag = jnp.diag(jnp.asarray(
                 ~mu_basis.active_mask, dtype=C_q_flat.dtype))
             C_q_flat = jax.lax.with_sharding_constraint(
-                C_q_flat + _pad_diag[None], flat_shard)
+                C_q_flat + _pad_scale[:, None, None] * _pad_diag[None],
+                flat_shard)
         if _q_neg_idx is not None:
             C_q_flat = complete_ordered_pair_normal_equations(
                 C_q_flat, _q_neg_idx)
