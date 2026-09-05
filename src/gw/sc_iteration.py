@@ -4006,10 +4006,18 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
                           history, *, cutoff_ev):
     """Read a map in frozen QP identities; retain only small host diagnostics.
 
-    The reference is the first map OUTPUT, not its DFT input rotation.
-    Output eigenvectors are computed with the existing k-sharded kernel;
-    the map's retained ``sigma_basis_U`` supplies its input eigenvectors.
-    Neither eigenvectors nor assignments replace the Hamiltonian carry.
+    The reference is the first map OUTPUT. Its labels are the trusted DFT
+    bands: at map 0 each trusted DFT band is assigned (by multiplet
+    overlap through the map's own input rotation) to the output column
+    that carries it, and later maps are matched to THOSE columns. Sorted
+    position is not identity: on Na (+15 eV top) the scissored Gamma
+    triplet 11-13 lands below the protected doublet at sorted 9-11, so a
+    sorted-band mask cut an exact multiplet and the readout refused
+    (arms N1/N2, 2026-09-05). Every returned table is indexed by DFT
+    band. Output eigenvectors come from the host eigensolve of the
+    gathered carry; the map's retained ``sigma_basis_U`` supplies its
+    input eigenvectors. Neither eigenvectors nor assignments replace the
+    Hamiltonian carry.
     """
     from common.collectives import gather_to_host
     from .sc_state_identity import assign_qp_identity
@@ -4032,17 +4040,37 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     nb = e_output_ev.shape[1]
     u_in = u_in[:, :nb, :nb]
     u_out = u_out[:, :nb, :nb]
+    kw = dict(degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
     if not history:
+        # DFT band -> map-0 output column, whole DFT multiplets (the
+        # partition promotes to whole multiplets, so the trusted band mask
+        # never cuts one in the input spectrum).
+        slot, _, blocks0, _ = assign_qp_identity(
+            u_in, e_input_ev, u_out, e_output_ev, mask, **kw)
+        labels = np.zeros(slot.shape, dtype=bool)
+        found = slot >= 0
+        labels[np.nonzero(found)[0], slot[found]] = True
         history.update(u=u_out.copy(), e=np.asarray(e_output_ev).copy(),
-                       mask=mask.copy(), previous=None)
+                       mask=mask.copy(), labels=labels, slot=slot,
+                       blocks=blocks0, previous=None)
     if not np.array_equal(mask, history['mask']):
         raise ValueError('SC identity: trusted mask changed after map 0')
-    args = (history['u'], history['e'])
-    kw = dict(degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
-    out_index, out_e, blocks, weight = assign_qp_identity(
-        *args, u_out, e_output_ev, mask, **kw)
+    slot = history['slot']
+    rows = np.arange(slot.shape[0])[:, None]
+    cols = np.where(slot >= 0, slot, 0)
+
+    def by_dft_band(table, fill):
+        # label-indexed (map-0 output column) -> DFT-band-indexed
+        return np.where(slot >= 0, np.asarray(table)[rows, cols], fill)
+
+    args = (history['u'], history['e'], )
+    out_index, out_e, _, weight = assign_qp_identity(
+        *args, u_out, e_output_ev, history['labels'], **kw)
     in_index, in_e, _, _ = assign_qp_identity(
-        *args, u_in, e_input_ev, mask, **kw)
+        *args, u_in, e_input_ev, history['labels'], **kw)
+    out_index, in_index = by_dft_band(out_index, -1), by_dft_band(in_index, -1)
+    out_e, in_e = by_dft_band(out_e, np.nan), by_dft_band(in_e, np.nan)
+    weight, blocks = by_dft_band(weight, np.nan), history['blocks']
     # Preserve the legacy all-band RMS as a sorted diagnostic. Only trusted
     # columns enter the criterion and receive the overlap/block-mean readout.
     aligned_in, aligned_out = np.array(e_input_ev), np.array(e_output_ev)
@@ -4301,9 +4329,11 @@ def _write_sc_eqp_snapshot(
         tables = {key: _loop_to_file_wedge(identity[key]) for key in
                   ('input_indices', 'output_indices', 'blocks', 'input_ev',
                    'output_ev', 'residual_ev', 'motion_ev', 'weight')}
-        comments.append('SC_identity refers to eqp0 map output; map-0 QP '
-                        'multiplet means; k_file_0based indexes the k block, '
-                        'body columns remain ispin, iband, E_DFT, E_QP')
+        comments.append('SC_identity refers to eqp0 map output; labels are '
+                        'the trusted DFT bands, matched at map 0 to the output '
+                        'columns that carry them; QP multiplet means; '
+                        'k_file_0based indexes the k block, body columns '
+                        'remain ispin, iband, E_DFT, E_QP')
         for k, row in enumerate(tables['blocks'].astype(int)):
             for block in np.unique(row[row >= 0]):
                 labels = np.flatnonzero(row == block)

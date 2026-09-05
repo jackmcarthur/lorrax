@@ -59,8 +59,8 @@ def test_doublet_triplet_exchange_is_blockwise_and_gauge_invariant():
         np.testing.assert_array_equal(blocks, [[0, 1, 1, 3, 3, 3]])
 
 
-def test_reference_multiplet_cut_refuses():
-    with pytest.raises(ValueError, match='cuts multiplet'):
+def test_reference_label_set_cutting_a_multiplet_refuses():
+    with pytest.raises(ValueError, match='cuts a multiplet'):
         assign_qp_identity(np.eye(3)[None], [[0., 1., 1.]], np.eye(3)[None],
                            [[0., 1., 1.]], [True, True, False],
                            degeneracy_tol_ev=1e-4)
@@ -117,3 +117,61 @@ def test_map_readout_freezes_output_reference_and_does_not_change_carry(monkeypa
     np.testing.assert_array_equal(history['u'], u)
     np.testing.assert_array_equal(updated.outputs.identity['motion_ev'], [[0., 2., -2.]])
     assert 'sorted-index value 0.000000000e+00' in logs[-1]
+
+
+
+def _identity_call_fixture(monkeypatch, e_out, u_out):
+    from types import SimpleNamespace
+    from gw import sc_iteration as sc
+    from common import collectives
+    from gw.band_partition import BandPartition
+    nb = e_out.shape[1]
+    mask = np.zeros(nb, bool)
+    mask[:2] = True
+    partition = BandPartition(mask, mask)
+    inputs = SimpleNamespace(mesh_xy=None, config=SimpleNamespace(
+        sc=SimpleNamespace(exact_degeneracy_tol_ev=1e-4)))
+    monkeypatch.setattr(collectives, 'gather_to_host', np.asarray)
+    monkeypatch.setattr(sc, '_record_sc', lambda inputs, text: None)
+    rotation = [u_out]
+    monkeypatch.setattr(sc, '_identity_eigh', lambda h: (e_out, rotation[0]))
+    u_dft = np.eye(nb)[None].astype(complex)
+    outputs = sc.SCOutputs(None, u_dft, None, None, None)
+    state = sc.SCState(np.diag(e_out[0])[None], 1, partition, outputs=outputs)
+    return sc, inputs, state, rotation
+
+
+def test_map0_labels_follow_dft_overlap_across_a_scissored_crossing(monkeypatch):
+    # DFT: bands 0,1 trusted; 2,3 an exact scissored doublet.  Map-0 output:
+    # the doublet lands at sorted 1-2 BELOW trusted band 1 (sorted 3).  A
+    # sorted-band mask [T,T,F,F] cuts that doublet (the Na Gamma refusal);
+    # labels by DFT overlap do not, and band 1 reads its own energy.
+    e_dft = np.array([[0., 2., 3., 3.]])
+    e_out = np.array([[0., 1., 1., 2.]])
+    u_out = np.eye(4)[None].astype(complex)[:, :, [0, 2, 3, 1]]
+    sc, inputs, state, rotation = _identity_call_fixture(monkeypatch, e_out, u_out)
+    history = {}
+    v0, updated = sc._sc_identity_for_call(
+        inputs, state, e_dft, e_out, history, cutoff_ev=.01)
+    ident = updated.outputs.identity
+    np.testing.assert_array_equal(ident['output_indices'][0], [0, 3, -1, -1])
+    np.testing.assert_array_equal(history['labels'][0], [True, False, False, True])
+    assert ident['output_ev'][0, 1] == 2. and np.isnan(ident['output_ev'][0, 2])
+    assert v0.converged and v0.max_abs_ev == 0.  # sorted band 1 would read |1-2| = 1 eV
+    # a later map with the doublet crossing back above band 1: still band 1
+    rotation[0] = np.eye(4)[None].astype(complex)
+    e_later = np.array([[0., 2., 3., 3.]])
+    verdict, updated = sc._sc_identity_for_call(
+        inputs, state, e_later, e_later, history, cutoff_ev=.01)
+    np.testing.assert_array_equal(updated.outputs.identity['output_indices'][0], [0, 1, -1, -1])
+    assert updated.outputs.identity['output_ev'][0, 1] == 2.
+    np.testing.assert_array_equal(updated.outputs.identity['motion_ev'][0, :2], [0., 0.])
+
+
+def test_map0_dft_multiplet_cut_by_the_band_mask_still_refuses(monkeypatch):
+    e_dft = np.array([[0., 1., 1., 3.]])  # trusted 0,1 cuts the DFT doublet 1,2
+    e_out = np.array([[0., 1., 1., 3.]])
+    sc, inputs, state, _ = _identity_call_fixture(
+        monkeypatch, e_out, np.eye(4)[None].astype(complex))
+    with pytest.raises(ValueError, match='cuts a multiplet'):
+        sc._sc_identity_for_call(inputs, state, e_dft, e_out, {}, cutoff_ev=.01)

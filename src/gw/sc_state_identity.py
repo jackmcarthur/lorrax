@@ -15,9 +15,13 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
         Column rotations ``U[k,m,n] = <DFT_m|QP_n>`` on the same loop k set.
     reference_e_ev, current_e_ev : (nk, nb) real host arrays
         Sorted spectra in eV, paired with the rotation columns.
-    trusted_mask : (nb,) bool
-        Fixed map-0 target labels. Candidate columns span the whole active
-        window because a trusted state can cross a scissored sorted level.
+    trusted_mask : (nb,) or (nk, nb) bool
+        Reference labels (columns of ``reference_u``) to match. Candidate
+        columns span the whole active window because a trusted state can
+        cross a scissored sorted level. A per-k mask names, at each k, the
+        map-0 output columns that carry the trusted DFT bands (they are not
+        the sorted positions of those bands once a scissored multiplet has
+        crossed them: Na Gamma, arms N1/N2, 2026-09-05).
     degeneracy_tol_ev : float
         The SC exact-degeneracy tolerance, in eV (not the window margin).
 
@@ -46,18 +50,19 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
     mask = np.asarray(trusted_mask, dtype=bool)
     if (e.ndim != 2 or e0.shape != e.shape or
             u.shape != e.shape + (e.shape[1],) or u0.shape != u.shape or
-            mask.shape != (e.shape[1],)):
+            mask.shape not in ((e.shape[1],), e.shape)):
         raise ValueError('SC identity: inconsistent rotation/spectrum/mask shapes')
     if not mask.any():
         raise ValueError('SC identity: empty trusted subspace')
     if not all(np.isfinite(a).all() for a in (u0, u, e0, e)):
         raise ValueError('SC identity: non-finite rotation or spectrum')
-    labels = np.flatnonzero(mask)
+    mask = np.broadcast_to(mask, e.shape)
     indices = np.full(e.shape, -1, dtype=int)
     blocks = np.full(e.shape, -1, dtype=int)
     energies = np.full(e.shape, np.nan)
     weights = np.full(e.shape, np.nan)
     for k in range(e.shape[0]):
+        labels = np.flatnonzero(mask[k])
         # BGW adjacent-gap grouping, at the SC exact-degeneracy tolerance.
         groups = np.split(np.arange(e.shape[1]),
                           np.flatnonzero(np.diff(e0[k]) > degeneracy_tol_ev) + 1)
@@ -65,11 +70,11 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
         score = np.empty((len(labels), e.shape[1]))
         selected_groups = []
         for group in groups:
-            if not mask[group].any():
+            if not mask[k, group].any():
                 continue
-            if not mask[group].all():
-                raise ValueError(f'SC identity: map-0 trusted mask cuts multiplet '
-                                 f'at k={k}, bands={group.tolist()}')
+            if not mask[k, group].all():
+                raise ValueError(f'SC identity: the reference label set cuts a '
+                                 f'multiplet at k={k}, columns={group.tolist()}')
             rows = np.searchsorted(labels, group)
             score[rows] = overlap[group].sum(axis=0)
             selected_groups.append((group, rows))
