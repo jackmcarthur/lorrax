@@ -1,5 +1,5 @@
 {
-  "scope": "Leading real-FLOP arithmetic and logical application bytes, not measured vendor wire bytes; beta/packing/head tails excluded. Sigma projection stored band width assumed30 at P4; verify P16 storage before using numeric projection entries. Source71ae0bde executes TWO parent Green GEMMs on antiunitary decks, hence four distributed GEMMs per tau; the old PERF2 class had three.",
+  "scope": "Leading real-FLOP arithmetic and logical application bytes, not measured vendor wire bytes; beta/packing/head tails excluded. Sigma projection stored band width30 at P4 and32 at P16, verified in optimized HLO. Source71ae0bde executes TWO parent Green GEMMs on antiunitary decks, hence four distributed GEMMs per tau; the old PERF2 class had three.",
   "rows": [
     {
       "route": "P",
@@ -52,7 +52,8 @@
           "SUMMA_broadcasts_static": 200,
           "SUMMA_broadcasts_tau": 112
         }
-      }
+      },
+      "sigma_stored_bands": 30
     },
     {
       "route": "F",
@@ -105,7 +106,8 @@
           "SUMMA_broadcasts_static": 432,
           "SUMMA_broadcasts_tau": 432
         }
-      }
+      },
+      "sigma_stored_bands": 30
     },
     {
       "route": "P",
@@ -125,7 +127,7 @@
         "CC": {
           "G_static_flops_rank": 8517058560.0,
           "G_tau_flops_rank": 3312189440.0,
-          "projection_two_gemm_flops_rank": 628696320.0,
+          "projection_two_gemm_flops_rank": 671154176.0,
           "G_full_carrier_bytes_rank": 212926464.0,
           "operator_full_carrier_bytes_rank": 13307904.0,
           "SUMMA_broadcasts_static": 400,
@@ -134,7 +136,7 @@
         "CT": {
           "G_static_flops_rank": 3137863680.0,
           "G_tau_flops_rank": 1220280320.0,
-          "projection_two_gemm_flops_rank": 231624960.0,
+          "projection_two_gemm_flops_rank": 247267328.0,
           "G_full_carrier_bytes_rank": 78446592.0,
           "operator_full_carrier_bytes_rank": 4902912.0,
           "SUMMA_broadcasts_static": 400,
@@ -143,7 +145,7 @@
         "TC": {
           "G_static_flops_rank": 3137863680.0,
           "G_tau_flops_rank": 1220280320.0,
-          "projection_two_gemm_flops_rank": 236463360.0,
+          "projection_two_gemm_flops_rank": 252772352.0,
           "G_full_carrier_bytes_rank": 78446592.0,
           "operator_full_carrier_bytes_rank": 4902912.0,
           "SUMMA_broadcasts_static": 400,
@@ -152,13 +154,14 @@
         "TT": {
           "G_static_flops_rank": 1156055040.0,
           "G_tau_flops_rank": 449576960.0,
-          "projection_two_gemm_flops_rank": 87118080.0,
+          "projection_two_gemm_flops_rank": 93126656.0,
           "G_full_carrier_bytes_rank": 28901376.0,
           "operator_full_carrier_bytes_rank": 1806336.0,
           "SUMMA_broadcasts_static": 400,
           "SUMMA_broadcasts_tau": 224
         }
-      }
+      },
+      "sigma_stored_bands": 32
     },
     {
       "route": "F",
@@ -178,7 +181,7 @@
         "CC": {
           "G_static_flops_rank": 8517058560.0,
           "G_tau_flops_rank": 8517058560.0,
-          "projection_two_gemm_flops_rank": 3233295360.0,
+          "projection_two_gemm_flops_rank": 3451650048.0,
           "G_full_carrier_bytes_rank": 212926464.0,
           "operator_full_carrier_bytes_rank": 13307904.0,
           "SUMMA_broadcasts_static": 864,
@@ -187,7 +190,7 @@
         "CT": {
           "G_static_flops_rank": 2913730560.0,
           "G_tau_flops_rank": 2913730560.0,
-          "projection_two_gemm_flops_rank": 1106127360.0,
+          "projection_two_gemm_flops_rank": 1180827648.0,
           "G_full_carrier_bytes_rank": 72843264.0,
           "operator_full_carrier_bytes_rank": 4552704.0,
           "SUMMA_broadcasts_static": 864,
@@ -196,7 +199,7 @@
         "TC": {
           "G_static_flops_rank": 2913730560.0,
           "G_tau_flops_rank": 2913730560.0,
-          "projection_two_gemm_flops_rank": 1132047360.0,
+          "projection_two_gemm_flops_rank": 1210318848.0,
           "G_full_carrier_bytes_rank": 72843264.0,
           "operator_full_carrier_bytes_rank": 4552704.0,
           "SUMMA_broadcasts_static": 864,
@@ -205,13 +208,14 @@
         "TT": {
           "G_static_flops_rank": 996802560.0,
           "G_tau_flops_rank": 996802560.0,
-          "projection_two_gemm_flops_rank": 387279360.0,
+          "projection_two_gemm_flops_rank": 414056448.0,
           "G_full_carrier_bytes_rank": 24920064.0,
           "operator_full_carrier_bytes_rank": 1557504.0,
           "SUMMA_broadcasts_static": 864,
           "SUMMA_broadcasts_tau": 864
         }
-      }
+      },
+      "sigma_stored_bands": 32
     }
   ]
 }

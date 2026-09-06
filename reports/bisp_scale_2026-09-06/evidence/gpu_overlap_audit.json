@@ -96,6 +96,48 @@
       "clean_gpu_interval": true
     }
   ],
+  "103_final_matrix_P4": [
+    {
+      "step": "lx-Xg4-123003-543237-1984",
+      "id": "57982945.203",
+      "start": "2026-09-06T12:30:08",
+      "end": "2026-09-06T12:40:58",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "117_zeta_profiles_P4": [
+    {
+      "step": "lx-Xg4-132429-779844-9647",
+      "id": "57982945.233",
+      "start": "2026-09-06T13:24:30",
+      "end": "2026-09-06T13:28:08",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "118_zeta_profiles_P16": [
+    {
+      "step": "lx-Xg4-140325-924900-4910",
+      "id": "57988457.68",
+      "start": "2026-09-06T14:03:28",
+      "end": "2026-09-06T14:07:32",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-140325-943995-7265",
+          "id": "57988457.67",
+          "seconds": 102.0,
+          "nodes": [
+            "nid001112",
+            "nid001113",
+            "nid001116",
+            "nid001117"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
   "11_F_dynamic_P4_copied_rules_compatible": [
     {
       "step": "lx-Xg4-110524-30421-1513",
@@ -115,6 +157,46 @@
       "clean_gpu_interval": false
     }
   ],
+  "120_final_matrix_P16_preflight": [
+    {
+      "step": "lx-Xg4-124919-641781-9910",
+      "id": "57988457.1",
+      "start": "2026-09-06T12:49:21",
+      "end": "2026-09-06T13:04:46",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "126_9x9_clean_P4": [
+    {
+      "step": "lx-Xg4-131617-747058-1237",
+      "id": "57988457.8",
+      "start": "2026-09-06T13:16:18",
+      "end": "2026-09-06T13:18:44",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "127_surface_P4_runner_fixed": [
+    {
+      "step": "lx-Xg4-131335-724532-5279",
+      "id": "57988457.7",
+      "start": "2026-09-06T13:13:36",
+      "end": "2026-09-06T13:16:16",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "129_F_zeta_P4_face_capture": [
+    {
+      "step": "lx-Xg4-133148-815088-6247",
+      "id": "57982945.240",
+      "start": "2026-09-06T13:31:50",
+      "end": "2026-09-06T13:33:46",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
   "12_P_static_P4_profile_fresh": [
     {
       "step": "lx-Xg4-105913-2356430-4328",
@@ -125,6 +207,46 @@
       "clean_gpu_interval": true
     }
   ],
+  "136_final_source_P16": [
+    {
+      "step": "lx-Xg4-141411-1064403-7247",
+      "id": "57988457.74",
+      "start": "2026-09-06T14:14:13",
+      "end": "2026-09-06T14:17:50",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "139_zeta_P16_clean": [
+    {
+      "step": "lx-Xg4-141942-1078641-7260",
+      "id": "57988457.78",
+      "start": "2026-09-06T14:19:42",
+      "end": "2026-09-06T14:23:55",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-141942-1067651-7078",
+          "id": "57988457.79",
+          "seconds": 87.0,
+          "nodes": [
+            "nid001112"
+          ]
+        },
+        {
+          "step": "lx-Xg4-141942-1096406-6092",
+          "id": "57988457.80",
+          "seconds": 105.0,
+          "nodes": [
+            "nid001112",
+            "nid001113",
+            "nid001116",
+            "nid001117"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
   "14_P_static_P4_restore_resident": [
     {
       "step": "lx-Xg4-110000-2359242-4220",
@@ -133,6 +255,125 @@
       "end": "2026-09-06T11:01:11",
       "overlaps": [],
       "clean_gpu_interval": true
+    }
+  ],
+  "150_static_P_P4_phase2_integrated": [
+    {
+      "step": "lx-Xg4-135340-945402-1243",
+      "id": "57988457.45",
+      "start": "2026-09-06T13:53:40",
+      "end": "2026-09-06T13:54:51",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "154_dynamic_P_P4_phase2_integrated": [
+    {
+      "step": "lx-Xg4-135445-948880-9013",
+      "id": "57988457.49",
+      "start": "2026-09-06T13:54:47",
+      "end": "2026-09-06T13:56:38",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "158_static_P_P4_own_zeta_phase2_integrated": [
+    {
+      "step": "lx-Xg4-135505-952976-2634",
+      "id": "57988457.51",
+      "start": "2026-09-06T13:55:05",
+      "end": "2026-09-06T13:56:48",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "162_original_C597_T194_P4_fresh_phase2_integrated": [
+    {
+      "step": "lx-Xg4-135658-962384-1354",
+      "id": "57988457.54",
+      "start": "2026-09-06T13:57:00",
+      "end": "2026-09-06T13:58:43",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "163_original_C597_T194_P16_fresh_phase2_integrated": [
+    {
+      "step": "lx-Xg4-141752-1073065-8542",
+      "id": "57988457.76",
+      "start": "2026-09-06T14:17:52",
+      "end": "2026-09-06T14:19:40",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "164_original_C597_T194_P16_restart_phase2_integrated": [
+    {
+      "step": "lx-Xg4-141942-1096406-6092",
+      "id": "57988457.80",
+      "start": "2026-09-06T14:19:45",
+      "end": "2026-09-06T14:21:30",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-141942-1078641-7260",
+          "id": "57988457.78",
+          "seconds": 105.0,
+          "nodes": [
+            "nid001112",
+            "nid001113",
+            "nid001116",
+            "nid001117"
+          ]
+        },
+        {
+          "step": "lx-Xg4-141942-1067651-7078",
+          "id": "57988457.79",
+          "seconds": 84.0,
+          "nodes": [
+            "nid001112"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "165_six_static_P4_F_compatible_phase2_integrated": [
+    {
+      "step": "lx-Xg4-140000-982748-8936",
+      "id": "57988457.61",
+      "start": "2026-09-06T14:00:05",
+      "end": "2026-09-06T14:01:08",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "166_six_dynamic_P4_F_compatible_phase2_integrated": [
+    {
+      "step": "lx-Xg4-140010-984809-7247",
+      "id": "57988457.62",
+      "start": "2026-09-06T14:00:11",
+      "end": "2026-09-06T14:02:55",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "167_six_static_own_zeta_P4_F_compatible_phase2_integrated": [
+    {
+      "step": "lx-Xg4-140017-987752-6746",
+      "id": "57988457.63",
+      "start": "2026-09-06T14:00:22",
+      "end": "2026-09-06T14:02:12",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-140021-988279-2173",
+          "id": "57988457.64",
+          "seconds": 72.0,
+          "nodes": [
+            "nid001116"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
     }
   ],
   "20_combined_experiments_P4": [
@@ -533,6 +774,26 @@
       "id": "57982945.163",
       "start": "2026-09-06T11:57:43",
       "end": "2026-09-06T11:58:54",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "70_profiles_common_P16": [
+    {
+      "step": "lx-Xg4-132155-757259-3784",
+      "id": "57988457.11",
+      "start": "2026-09-06T13:21:55",
+      "end": "2026-09-06T13:46:33",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "76_profiles_common_P4": [
+    {
+      "step": "lx-Xg4-130807-715734-2513",
+      "id": "57982945.226",
+      "start": "2026-09-06T13:08:08",
+      "end": "2026-09-06T13:23:33",
       "overlaps": [],
       "clean_gpu_interval": true
     }

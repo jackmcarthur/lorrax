@@ -1,0 +1,74 @@
+{
+  "66_P_static_P16_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/66_P_static_P16_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/66_P_static_P16_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/66_P_static_P16_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/66_P_static_P16_profile_common/compile_modules.jsonl"
+  },
+  "67_F_static_P16_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/67_F_static_P16_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/67_F_static_P16_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/67_F_static_P16_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/67_F_static_P16_profile_common/compile_modules.jsonl"
+  },
+  "68_P_dynamic_P16_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/68_P_dynamic_P16_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/68_P_dynamic_P16_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/68_P_dynamic_P16_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/68_P_dynamic_P16_profile_common/compile_modules.jsonl"
+  },
+  "69_F_dynamic_P16_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/69_F_dynamic_P16_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/69_F_dynamic_P16_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/69_F_dynamic_P16_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/69_F_dynamic_P16_profile_common/compile_modules.jsonl"
+  },
+  "72_P_static_P4_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/72_P_static_P4_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/72_P_static_P4_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/72_P_static_P4_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/72_P_static_P4_profile_common/compile_modules.jsonl"
+  },
+  "73_F_static_P4_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/73_F_static_P4_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/73_F_static_P4_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/73_F_static_P4_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/73_F_static_P4_profile_common/compile_modules.jsonl"
+  },
+  "74_P_dynamic_P4_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/74_P_dynamic_P4_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/74_P_dynamic_P4_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/74_P_dynamic_P4_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/74_P_dynamic_P4_profile_common/compile_modules.jsonl"
+  },
+  "75_F_dynamic_P4_profile_common": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/75_F_dynamic_P4_profile_common/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/75_F_dynamic_P4_profile_common/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/75_F_dynamic_P4_profile_common/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/75_F_dynamic_P4_profile_common/compile_modules.jsonl"
+  },
+  "113_P_zeta_P4_profile": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/113_P_zeta_P4_profile/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/113_P_zeta_P4_profile/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/113_P_zeta_P4_profile/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/113_P_zeta_P4_profile/compile_modules.jsonl"
+  },
+  "128_F_zeta_P4_face_profile": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/128_F_zeta_P4_face_profile/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/128_F_zeta_P4_face_profile/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/128_F_zeta_P4_face_profile/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/128_F_zeta_P4_face_profile/compile_modules.jsonl"
+  },
+  "137_P_zeta_P16_clean": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/137_P_zeta_P16_clean/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/137_P_zeta_P16_clean/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/137_P_zeta_P16_clean/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/137_P_zeta_P16_clean/compile_modules.jsonl"
+  },
+  "138_F_zeta_P16_clean": {
+    "native_instances": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/138_F_zeta_P16_clean/native_instances.json",
+    "hlo_summary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/138_F_zeta_P16_clean/xla_dump_rank0/hlo_summary.json",
+    "boundary": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/138_F_zeta_P16_clean/boundary.jsonl",
+    "compile_modules": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/138_F_zeta_P16_clean/compile_modules.jsonl"
+  }
+}

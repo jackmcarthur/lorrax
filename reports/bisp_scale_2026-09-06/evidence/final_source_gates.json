@@ -1,0 +1,112 @@
+[
+  {
+    "run": "130_P_static_P4_final",
+    "compile_count": 584,
+    "compiler_s": 39.92,
+    "stages": {
+      "runtime bring-up": 5.87,
+      "pre-main + imports": 0.42,
+      "input + run setup": 0.17,
+      "V(q)": 4.88,
+      "ISDF setup + I/O": 11.66,
+      "minimax quadrature": 0.19,
+      "screening support": 28.63,
+      "Sigma other": 20.59,
+      "mean-field load": 0.08,
+      "QP solve + diagonalize": 0.32,
+      "result writes": 0.1,
+      "other driver work": 1.24,
+      "total run": 74.15
+    }
+  },
+  {
+    "run": "131_P_dynamic_P4_final",
+    "compile_count": 772,
+    "compiler_s": 54.33,
+    "stages": {
+      "runtime bring-up": 3.65,
+      "pre-main + imports": 1.88,
+      "input + run setup": 0.25,
+      "V(q)": 4.67,
+      "ISDF setup + I/O": 9.94,
+      "minimax quadrature": 0.15,
+      "chi0": 4.2,
+      "W": 5.61,
+      "screening support": 18.74,
+      "W persist + q0 head": 0.83,
+      "Sigma rule plan": 0.14,
+      "Sigma tau sweep": 6.77,
+      "Sigma other": 28.37,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.23,
+      "result writes": 0.06,
+      "other driver work": 8.42,
+      "total run": 93.97
+    }
+  },
+  {
+    "run": "132_P_static_P4_9x9_final",
+    "compile_count": 556,
+    "compiler_s": 35.03,
+    "stages": {
+      "runtime bring-up": 5.74,
+      "pre-main + imports": 0.36,
+      "input + run setup": 0.24,
+      "V(q)": 4.91,
+      "ISDF setup + I/O": 7.42,
+      "minimax quadrature": 0.15,
+      "screening support": 28.09,
+      "Sigma other": 19.39,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.11,
+      "other driver work": 1.09,
+      "total run": 67.83
+    }
+  },
+  {
+    "run": "134_P_static_P16_final",
+    "compile_count": 556,
+    "compiler_s": 31.58,
+    "stages": {
+      "runtime bring-up": 6.25,
+      "pre-main + imports": 0.35,
+      "input + run setup": 0.68,
+      "V(q)": 5.17,
+      "ISDF setup + I/O": 7.25,
+      "minimax quadrature": 0.16,
+      "screening support": 46.02,
+      "Sigma other": 20.26,
+      "mean-field load": 0.06,
+      "QP solve + diagonalize": 0.29,
+      "result writes": 0.1,
+      "other driver work": 0.98,
+      "total run": 87.57
+    }
+  },
+  {
+    "run": "135_P_dynamic_P16_final",
+    "compile_count": 775,
+    "compiler_s": 48.92,
+    "stages": {
+      "runtime bring-up": 4.88,
+      "pre-main + imports": 1.57,
+      "input + run setup": 0.75,
+      "V(q)": 5.03,
+      "ISDF setup + I/O": 7.37,
+      "minimax quadrature": 0.2,
+      "chi0": 5.86,
+      "W": 6.84,
+      "screening support": 37.44,
+      "W persist + q0 head": 0.84,
+      "Sigma rule plan": 0.1,
+      "Sigma tau sweep": 10.5,
+      "Sigma other": 30.53,
+      "mean-field load": 0.06,
+      "QP solve + diagonalize": 0.29,
+      "result writes": 0.07,
+      "other driver work": 8.47,
+      "total run": 120.8
+    }
+  }
+]
