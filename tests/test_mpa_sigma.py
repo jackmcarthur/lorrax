@@ -130,7 +130,7 @@ def test_small_gap_branching_follows_occupation_not_energy_sign():
         # over -- and the causal branching is a statement about the SIGMA
         # sum.  Omitting ``full`` makes this cell fail loudly if the
         # production code ever reaches back for the larger consumer's count.
-        slices=SimpleNamespace(sigma_sum=slice(None)))
+        slices=SimpleNamespace(sigma_sum=slice(None), nb_sigma_sum=4, nb_full_logical=4))
     branches = _branches(wfns, np.asarray([-0.2, 0.4]), 0.0)
     pos_cond = next(b for b in branches
                     if b.space == "cond" and not b.neg_omega_half)
@@ -160,7 +160,7 @@ def test_branches_metallize_only_with_an_occupation_state():
         # max(chi, sigma) and the causal branching is a statement about the
         # SIGMA band sum.  Omitting ``full`` makes the cell fail loudly if
         # the production code reaches back for the larger consumer's count.
-        slices=SimpleNamespace(sigma_sum=slice(0, 3)))
+        slices=SimpleNamespace(sigma_sum=slice(0, 3), nb_sigma_sum=3, nb_full_logical=3))
     omega = np.asarray([0.0, 0.4])
 
     legacy = _branches(wfns, omega, 0.25)

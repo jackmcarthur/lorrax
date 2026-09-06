@@ -1,4 +1,5 @@
 """Failure scenarios from the PARTPAD landing review, 2026-09-06."""
+from dataclasses import replace
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -156,7 +157,6 @@ def test_trial_classification_does_not_change_accepted_gram(monkeypatch):
 
 
 def test_partition_transition_cannot_report_convergence(monkeypatch):
-    from dataclasses import replace
     from test_sc_state_identity import _identity_call_fixture
     e = np.array([[0., 1., 3.]])
     sc, inputs, state, _ = _identity_call_fixture(monkeypatch, e, np.eye(3)[None])
@@ -256,3 +256,27 @@ def test_eqp2_passes_sc_exact_multiplet_tolerance(monkeypatch):
             band_slices=BandSlices.from_band_edges(0, 0, 1, 3, 3),
             wfn=SimpleNamespace(energies=energy[None]),
             mesh_xy=single_device_mesh(), print_fn=lambda _: None)
+
+
+def test_sign_preserving_pad_contains_the_reserved_support():
+    from gw.sigma_box_plan import make_sigma_box_spec, _sc_padded_box_spec, _box_contains
+    # The original zero-side edge is far from zero; the reserved external
+    # frequencies approach it. Clipping at half the ORIGINAL edge loses
+    # most of that reservation even though the result remains sign definite.
+    args = dict(name='reserved-negative', states=np.array([1.]),
+                pole_stats=[(2., 2., .1, .1)], pole_sign=1., eta_ry=.1)
+    original = make_sigma_box_spec(frequencies=np.array([0., 1.]), **args)
+    original['sc_support_frequencies'] = np.array([0., 2.8])
+    prospective = make_sigma_box_spec(frequencies=np.array([0., 2.8]), **args)
+    padded = _sc_padded_box_spec(original, .1)
+    assert _box_contains(padded['box'], prospective['box'])
+    assert padded['box'][1] < 0.
+
+
+def test_new_product_name_reuses_an_existing_certificate(monkeypatch):
+    from test_sigma_box_plan import _branch, _plan
+    session = {}
+    _plan(monkeypatch, fixed_rule_session=session)
+    renamed = _branch(tag='new product family')
+    _, geometry = _plan(monkeypatch, renamed, fixed_rule_session=session)
+    assert geometry['sc_fixed_rebuilds_this_iteration'] == 0
