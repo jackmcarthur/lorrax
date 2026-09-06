@@ -1613,8 +1613,10 @@ Two things make it invisible today:
 **RESOLVED 2026-08-16 — owner ruling: "I want degenerate spaces degenerate in
 LORRAX."**  Both halves landed.  `BandPartition.report_multiplet_splits` names
 every splitting boundary and the gap it cuts; `promoted_to_multiplets` grows
-the mask outward so no manifold is split, and `run_sc_driver` calls them in
-that order.  `_check_kstar_spread` moved to AFTER `apply_band_partition`, so
+the mask outward so no manifold is split. The shared
+`build_omega_band_partition` constructor closes local reference multiplets,
+reports splits, then reports protected states outside the requested window
+through its debug printer (rewired by REVIEWFIX, 2026-09-06).  `_check_kstar_spread` moved to AFTER `apply_band_partition`, so
 it now gates the object that ships.
 
 **MEASURED on `gnppm_debug`, the only committed deck running the SC path:

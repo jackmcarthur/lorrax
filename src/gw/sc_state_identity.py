@@ -6,7 +6,8 @@ from scipy.optimize import linear_sum_assignment
 
 
 def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
-                       trusted_mask, *, degeneracy_tol_ev, priority_mask=None):
+                       trusted_mask, *, degeneracy_tol_ev, priority_mask=None,
+                       overlap_weights=None):
     """Match QP states to fixed map-0 multiplets without sorting identities.
 
     Parameters
@@ -45,19 +46,27 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
     energy and are reported only through their reference-block means.
     The SC map uses assignments to classify state energies in reference
     coordinates. Output energies remain exact-multiplet means for readout.
+    ``overlap_weights`` may supply device-computed |reference† current|²;
+    in that case the two rotation arguments may be None and are not read.
     ``priority_mask``, when supplied, reserves the original trusted labels'
     optimal assignment before newly tracked labels take the remaining columns.
     """
     u0, u = np.asarray(reference_u), np.asarray(current_u)
+    supplied_overlap = overlap_weights is not None
     e0, e = np.asarray(reference_e_ev), np.asarray(current_e_ev)
     mask = np.asarray(trusted_mask, dtype=bool)
     if (e.ndim != 2 or e0.shape != e.shape or
-            u.shape != e.shape + (e.shape[1],) or u0.shape != u.shape or
+            (not supplied_overlap and
+             (u.shape != e.shape + (e.shape[1],) or u0.shape != u.shape)) or
             mask.shape not in ((e.shape[1],), e.shape)):
         raise ValueError('SC identity: inconsistent rotation/spectrum/mask shapes')
     if not mask.any():
         raise ValueError('SC identity: empty trusted subspace')
-    if not all(np.isfinite(a).all() for a in (u0, u, e0, e)):
+    arrays = ((np.asarray(overlap_weights), e0, e) if supplied_overlap
+              else (u0, u, e0, e))
+    if supplied_overlap and arrays[0].shape != e.shape + (e.shape[1],):
+        raise ValueError('SC identity: inconsistent overlap/spectrum shapes')
+    if not all(np.isfinite(a).all() for a in arrays):
         raise ValueError('SC identity: non-finite rotation or spectrum')
     mask = np.broadcast_to(mask, e.shape)
     priority = (mask if priority_mask is None else
@@ -71,13 +80,15 @@ def assign_qp_identity(reference_u, reference_e_ev, current_u, current_e_ev,
         # BGW adjacent-gap grouping, at the SC exact-degeneracy tolerance.
         groups = np.split(np.arange(e.shape[1]),
                           np.flatnonzero(np.diff(e0[k]) > degeneracy_tol_ev) + 1)
-        overlap = np.abs(u0[k].conj().T @ u[k]) ** 2
+        overlap = (np.asarray(overlap_weights)[k] if supplied_overlap else
+                   np.abs(u0[k].conj().T @ u[k]) ** 2)
         score = np.empty((len(labels), e.shape[1]))
         selected_groups = []
         for group in groups:
             if not mask[k, group].any():
                 continue
-            if not mask[k, group].all():
+            if (not mask[k, group].all() or
+                    (priority[k, group].any() and not priority[k, group].all())):
                 raise ValueError(f'SC identity: the reference label set cuts a '
                                  f'multiplet at k={k}, columns={group.tolist()}')
             rows = np.searchsorted(labels, group)

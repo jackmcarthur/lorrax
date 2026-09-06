@@ -661,6 +661,10 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
     re-applies the same floor to the same weights, so the two agree by
     construction instead of by review.
     """
+    # Keep the executor's padded carrier shape, but exclude storage-only
+    # slots from every physical product window (including SC rotations).
+    s = wfns.slices
+    logical = jnp.arange(s.nb_sigma_sum) < s.nb_full_logical
     if occupation_state is None:
         energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
         occupied = wfns.occ[:, wfns.slices.sigma_sum] > 0.5
@@ -671,7 +675,7 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
         # by the planner's excursion-deepened edge (sigma_windows._geometry).
         return branches_for_omega_grid(
             omega, E_cond=energy, H_val=-energy,
-            cond_mask=~occupied, val_mask=occupied)
+            cond_mask=(~occupied) & logical, val_mask=occupied & logical)
     mu = float(occupation_state.mu_ry)
     if abs(float(efermi_ry) - mu) > 1.0e-12:
         raise ValueError(
@@ -684,7 +688,7 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
     energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
-        cond_mask=(f != 1.0), val_mask=(f != 0.0),
+        cond_mask=(f != 1.0) & logical, val_mask=(f != 0.0) & logical,
         cond_weight=1.0 - f, val_weight=f,
         occupation_window_threshold=occupation_window_threshold)
 

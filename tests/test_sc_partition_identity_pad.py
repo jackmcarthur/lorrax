@@ -58,8 +58,12 @@ def test_hysteresis_enter_retain_escape():
     log = []
     escaped_e = np.array([[0.0, 5.9], [0.0, 6.2]])
     escaped = _partition(escaped_e, reference, previous=retained, log=log)
-    assert not np.asarray(escaped.protected_mask)[:, 1].any()
-    assert any('escape: band=2, k=1' in line and 'pad=1.120000' in line for line in log)
+    assert np.asarray(escaped.protected_mask)[:, 1].all()
+    assert escaped.changed
+    dropped = _partition(escaped_e, reference, previous=escaped)
+    assert not np.asarray(dropped.protected_mask)[:, 1].any()
+    assert dropped.changed
+    assert any('escape band=2, k=1' in line and 'pad=1.120000' in line for line in log)
     h = jnp.asarray([[[1., .2], [.2, 7.]], [[1., .2], [.2, 8.]]])
     kept = apply_band_partition(h, protected_mask=retained.protected_mask,
                                in_range_mask=retained.in_range_mask,

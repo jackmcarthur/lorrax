@@ -96,22 +96,16 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
                 atol=MPA_EQP_ATOL_EV)
 
     _run(run_b, "mpa_sc1.in", allow_runtime_solve=True)
-    # MPA tolerance, as for the one-shot references above: the SC window
-    # state set carries the padded active extent, so the certified rules
-    # (eps 1e-3) differ between P1 and P4 and the map output moves ~0.1 meV
-    # (registered on main, 2026-09-06; boxes differ by P on the base too).
     _assert_eqp(run_b / "mpa_sc1_eqp0.dat", source_b / "mpa_sc1_eqp0.dat",
-                atol=MPA_EQP_ATOL_EV)
+                atol=EQP_ATOL_EV)
     _assert_eqp(run_b / "mpa_sc1_eqp1.dat", source_b / "mpa_sc1_eqp1.dat",
-                atol=MPA_EQP_ATOL_EV)
+                atol=EQP_ATOL_EV)
     report = (run_b / "mpa_sc1.out").read_text(encoding="utf-8")
     residuals = [float(value) for value in re.findall(
         r"SC iteration: call=\d+ role=linear .*?max\|dE\|=([0-9.e+-]+)",
         report,
     )]
-    # MPA tolerance for the residual and gain literals too (P-dependent
-    # window boxes, see the eqp comparison above).
-    assert residuals == pytest.approx([3.640626335, 0.3476362983], abs=2e-4)
+    assert residuals == pytest.approx([3.640626335, 0.3476362983], abs=2e-5)
     partitions = re.findall(
         r"SC iteration: call=\d+ role=linear .*?"
         r"active=(\S+) protected=(\S+) in_range=(\S+)", report,
@@ -125,7 +119,7 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
     assert sup <= target == pytest.approx(1.0e-3)
     assert "rebuilds_this_iteration=6, rebuilds_total=6" in report
     gain = float(re.search(r"SC map gain:.*? = ([0-9.e+-]+)", report)[1])
-    assert gain == pytest.approx(0.185133, abs=1e-4)
+    assert gain == pytest.approx(0.185133, abs=1e-5)
     assert "SC done: 2 GW map calls" in report
 
 

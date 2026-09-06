@@ -25,7 +25,7 @@ def _config(*, tol_ev=1.0e-9, max_iter=30, accelerator="linear"):
         eqp2=SimpleNamespace(
             tol_ev=tol_ev, max_iter=max_iter, accelerator=accelerator,
             history_depth=5),
-        sc=SimpleNamespace(eigh="native"),
+        sc=SimpleNamespace(eigh="native", exact_degeneracy_tol_ev=1e-4),
         memory=SimpleNamespace(per_device_gb=4.0),
     )
 

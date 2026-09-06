@@ -130,6 +130,21 @@ def band_rotation_spec() -> P:
     return P(None, "x", "y")
 
 
+@jax.jit
+def band_rotation_weights(rotation, reference=None):
+    """Projector overlaps |reference† U|², retaining the band's device layout.
+
+    Parameters
+    ----------
+    rotation, reference : (nk, nb, nb) complex, band_rotation_spec
+        Column rotations in a common basis. None reference denotes identity
+        and omits the matrix product. Only real weights need reach the host.
+    """
+    overlap = (rotation if reference is None else
+               jnp.swapaxes(jnp.conj(reference), -1, -2) @ rotation)
+    return jnp.real(overlap * jnp.conj(overlap))
+
+
 # ---------------------------------------------------------------------------
 # THE band-rotation primitive.  One operation, two uses.
 # ---------------------------------------------------------------------------

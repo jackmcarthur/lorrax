@@ -470,9 +470,7 @@ def _apply_sc_buffer_partition(
     protected = np.asarray(
         partition.protected_mask, dtype=bool).copy()
     protected[..., buffer] = False
-    return BandPartition(
-        protected_mask=jnp.asarray(protected),
-        in_range_mask=partition.in_range_mask)
+    return replace(partition, protected_mask=jnp.asarray(protected))
 
 
 @jax.jit
@@ -631,6 +629,7 @@ class SCState:
     # later map input so the tail law is fixed for the loop; see
     # _frozen_scissor_fits.  None on map 0 and on the one-shot path.
     frozen_scissor_fits: tuple | None = None
+    role: str = "accepted"
 
 
 def _sc_output_tables_on_loop_kset(
@@ -1594,6 +1593,8 @@ def run_fixed_sigma_evsc(
             f"run_fixed_sigma_evsc: E_DFT must be (nk,nb), got "
             f"{e_dft_ry.shape}.")
     nk, nb = (int(v) for v in e_dft_ry.shape)
+    if sym is None and np.shape(wfn.energies[0])[0] != nk:
+        raise ValueError("EQP2 requires sym to unfold the WFN file wedge onto the full k set")
     band_axis = sigma_result.sigma_band_axis
     b0 = int(band_slices.b0)
     nb_sigma = int(band_slices.nb_sigma)
@@ -1648,6 +1649,7 @@ def run_fixed_sigma_evsc(
         band_offset=b0,
         omega_min_abs_ev=float(omega_ev[0]) + efermi_ev,
         omega_max_abs_ev=float(omega_ev[-1]) + efermi_ev,
+        degeneracy_tol_ev=float(config.sc.exact_degeneracy_tol_ev),
         label="EQP2", print_fn=print_fn)
     protected = np.asarray(
         partition.protected_mask, dtype=bool)
@@ -2543,9 +2545,11 @@ def _partition_on_loop(partition, inputs):
     ks = _kstar(inputs)
     if ks.is_identity:
         return partition
-    return BandPartition(
+    return replace(partition,
         protected_mask=ks.select(partition.protected_mask),
-        in_range_mask=ks.select(partition.in_range_mask))
+        in_range_mask=ks.select(partition.in_range_mask),
+        escaped_mask=(None if partition.escaped_mask is None else
+                      ks.select(partition.escaped_mask)))
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
@@ -2807,17 +2811,21 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     e_reference_loop = e_reference if ks.is_identity else np.asarray(ks.select(e_reference))
     e_current_loop = np.asarray(E_qp_ry) * RYD_TO_EV
     nb_identity = e_current_loop.shape[1]
-    reference_u = np.broadcast_to(np.eye(nb_identity),
-                                 e_current_loop.shape + (nb_identity,))
+    from .qsgw_density import band_rotation_weights
+    weights_loop = np.asarray(gather_to_host(band_rotation_weights(U_qp)))
     indices_loop, energies_loop, _, _ = assign_qp_identity(
-        reference_u, e_reference_loop,
-        np.asarray(gather_to_host(U_qp)), e_current_loop,
-        np.ones(nb_identity, dtype=bool),
+        None, e_reference_loop, None, e_current_loop,
+        np.ones(nb_identity, dtype=bool), overlap_weights=weights_loop,
         degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
+    inputs.print_fn(f"SC identity host transfer: DFT overlap bytes={weights_loop.nbytes}; "
+                    f"former complex rotation bytes={2 * weights_loop.nbytes}")
+    del weights_loop
     energies_loop = np.take_along_axis(e_current_loop, indices_loop, axis=1)
-    _mu_ev = (float(entry_occ_state.mu_ry) * RYD_TO_EV
-              if entry_occ_state is not None else
-              float(inputs.wfn.efermi) * RYD_TO_EV)
+    from .efermi import resolve_sigma_efermi_ry
+    _mu_ry, _ = resolve_sigma_efermi_ry(
+        inputs.config.sigma.fermi_reference,
+        occupation_state=entry_occ_state, wfn=inputs.wfn)
+    _mu_ev = _mu_ry * RYD_TO_EV
     partition = build_omega_band_partition(
         energies_loop / RYD_TO_EV,
         reference_full if ks.is_identity else np.asarray(ks.select(reference_full)),
@@ -2829,11 +2837,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         mu_ev=_mu_ev, current_indices_kn=indices_loop,
         degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev),
         label=f"SC map {int(state.iteration)} (identity, mu-anchored)",
-        print_fn=lambda line: _record_sc(inputs, line))
+        print_fn=inputs.print_fn)
     if not ks.is_identity:
-        partition = BandPartition(
+        partition = replace(partition,
             protected_mask=ks.broadcast(partition.protected_mask),
-            in_range_mask=ks.broadcast(partition.in_range_mask))
+            in_range_mask=ks.broadcast(partition.in_range_mask),
+            escaped_mask=ks.broadcast(partition.escaped_mask))
     partition = _apply_sc_buffer_partition(partition, inputs)
     buffer_mask = _sc_buffer_mask(inputs)
     if buffer_mask.any():
@@ -3282,19 +3291,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         energy_relative_ev = energies_loop - _mu_ev
         expanded_grid = extend_sc_omega_grid_ev(
             sampled_grid, energy_relative_ev, required_kn,
-            float(inputs.config.sigma.omega_step_ev))
-        escaped_kn = required_kn & (
+            float(inputs.config.sigma.omega_step_ev), role=state.role)
+        escaped_kn = (state.role != "trial") & required_kn & (
             (energy_relative_ev < sampled_grid[0])
             | (energy_relative_ev > sampled_grid[-1]))
         for k, n in zip(*np.nonzero(escaped_kn)):
             energy = float(energy_relative_ev[k, n])
-            _record_sc(
-                inputs, f"SC sampled-support growth: "
+            inputs.print_fn(
+                f"SC sampled-support growth: "
                 f"band={int(inputs.band_slices.b0) + int(n) + 1}, k={int(k)}, "
                 f"E-mu={energy:+.6f} eV, pad={float(sc_state_pad_ev(energy)):.6f} eV; "
                 f"sampled [{sampled_grid[0]:+.6f}, {sampled_grid[-1]:+.6f}] -> "
                 f"[{expanded_grid[0]:+.6f}, {expanded_grid[-1]:+.6f}] eV")
-        if session is not None:
+        if session is not None and state.role != "trial":
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
             # Certify prospective external samples without evaluating them at
             # map zero. Include the growth helper's pad and grid rounding;
@@ -3306,11 +3315,22 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             certificate_grid = extend_sc_omega_grid_ev(
                 requested, np.asarray([retained_edges]), [[True, True]],
                 float(inputs.config.sigma.omega_step_ev))
-            session["external_support_ev"] = (
+            external_support = (
                 min(float(certificate_grid[0]), float(expanded_grid[0])),
                 max(float(certificate_grid[-1]), float(expanded_grid[-1])))
+            session.setdefault("mpa", {})["external_support_ev"] = external_support
+            ppm_session = session.setdefault("ppm", {})
+            for engine in ("primary", "odd_even_reference"):
+                ppm_session.setdefault(engine, {})["external_support_ev"] = external_support
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
+    # One production receipt per map; per-state details use legacy_print.
+    report_partition = _partition_on_loop(partition, inputs)
+    grid_note = (f"; sampled=[{expanded_grid[0]:+.6f}, {expanded_grid[-1]:+.6f}] eV"
+                 if inputs.config.compute_mode.is_dynamic else "")
+    _record_sc(inputs, report_partition.summary(
+        energies_loop, indices_loop, band_offset=int(inputs.band_slices.b0),
+        mu_ev=_mu_ev) + f"; map={state.iteration}" + grid_note)
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -3501,6 +3521,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             H, inputs=inputs, kstar=ks, n_occ=n_occ,
             use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
+        current_indices_kn=indices_loop,
         scissor_fit=(_frozen_active if _frozen_active is not None else tail_fit),
         use_valence_fit=(inputs.config.sc.tail_fit == "buffer_edges"),
         label="SC", print_fn=inputs.print_fn)
@@ -3656,7 +3677,7 @@ def _scissor_E_qp_for_outofrange(
     retained = np.asarray(retained_mask, dtype=bool)
     # Fast path: nothing to extrapolate.
     if bool(retained.all()):
-        return e_dft_kn_ry, None
+        return e_dft_kn_ry, scissor_fit
 
     retained_kn = np.broadcast_to(
         retained, e_dft_np.shape).astype(bool)
@@ -3716,6 +3737,7 @@ def _apply_scissor_partition_policy(
     n_occ: int,
     candidate_efermi_fn: Callable[[jax.Array], float],
     band_classes=None,
+    current_indices_kn=None,
     scissor_fit: ScissorFit | None = None,
     use_valence_fit: bool = False,
     label: str = "SC",
@@ -3756,6 +3778,9 @@ def _apply_scissor_partition_policy(
                 dtype=np.int64)
             frontier_kn = np.zeros(retained_kn.shape, dtype=bool)
             frontier_kn[:, frontier] = True
+            if current_indices_kn is not None:
+                frontier_kn = np.take_along_axis(
+                    frontier_kn, np.asarray(current_indices_kn), axis=1)
         bad_frontier = np.argwhere(frontier_kn & ~retained_kn)
         if bad_frontier.size:
             raise ValueError(
@@ -4016,21 +4041,33 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     h_host = 0.5 * (h_host + np.conj(np.swapaxes(h_host, -1, -2)))
     _, u_out = _identity_eigh(h_host)
     u_out = np.asarray(u_out)
-    u_in = np.asarray(gather_to_host(state_out.outputs.sigma_basis_U))
+    from .qsgw_density import band_rotation_weights
     nb = e_output_ev.shape[1]
-    u_in = u_in[:, :nb, :nb]
+    u_in = state_out.outputs.sigma_basis_U[:, :nb, :nb]
     u_out = u_out[:, :nb, :nb]
+    # Keep complex rotations on device. Readout and classification use
+    # distinct reference projectors; each transfers its real weights once.
+    def overlap_on_host(reference, current):
+        sharding = getattr(u_in, "sharding", None)
+        reference = jax.device_put(reference, sharding)
+        current = jax.device_put(current, sharding)
+        return np.asarray(gather_to_host(band_rotation_weights(current, reference)))
+
     kw = dict(degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
+    initial_overlap = None
     if not history:
         # DFT band -> map-0 output column, whole DFT multiplets (the
         # partition promotes to whole multiplets, so the trusted band mask
         # never cuts one in the input spectrum).
         # Validate whole trusted reference multiplets using the established
         # readout, then fill the rest without changing those assignments.
-        assign_qp_identity(u_in, e_input_ev, u_out, e_output_ev, mask, **kw)
+        initial_overlap = overlap_on_host(u_in, u_out)
+        assign_qp_identity(None, e_input_ev, None, e_output_ev, mask,
+                           overlap_weights=initial_overlap, **kw)
         slot, _, blocks0, _ = assign_qp_identity(
-            u_in, e_input_ev, u_out, e_output_ev,
-            np.ones(mask.shape, dtype=bool), priority_mask=mask, **kw)
+            None, e_input_ev, None, e_output_ev,
+            np.ones(mask.shape, dtype=bool), priority_mask=mask,
+            overlap_weights=initial_overlap, **kw)
         labels = np.zeros(slot.shape, dtype=bool)
         labels[np.nonzero(mask)[0], slot[mask]] = True
         # The reference groups are the DFT (symmetry) multiplets, not the
@@ -4061,9 +4098,16 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     out_index, out_e, block_label, weight = assign_qp_identity(
         *args, u_out, e_output_ev, np.ones(mask.shape, dtype=bool),
         priority_mask=history['labels'], **kw)
+    input_overlap = (np.swapaxes(initial_overlap, -1, -2)
+                     if initial_overlap is not None else
+                     overlap_on_host(history['u'], u_in))
     in_index, in_e, _, _ = assign_qp_identity(
-        *args, u_in, e_input_ev, np.ones(mask.shape, dtype=bool),
-        priority_mask=history['labels'], **kw)
+        None, history['e'], None, e_input_ev, np.ones(mask.shape, dtype=bool),
+        priority_mask=history['labels'], overlap_weights=input_overlap, **kw)
+    if hasattr(inputs, "print_fn"):
+        inputs.print_fn(f"SC identity host transfer: QP-reference overlap bytes="
+                        f"{input_overlap.nbytes}; former complex rotation bytes="
+                        f"{2 * input_overlap.nbytes}")
     out_index, in_index = by_dft_band(out_index, -1), by_dft_band(in_index, -1)
     out_e, in_e = by_dft_band(out_e, np.nan), by_dft_band(in_e, np.nan)
     weight = by_dft_band(weight, np.nan)
@@ -4079,7 +4123,8 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
         aligned_out, aligned_in, protected, in_range, cutoff_ev)
     sorted_verdict = protected_band_convergence(
         e_output_ev, e_input_ev, protected, in_range, cutoff_ev)
-    verdict = replace(verdict, rms_all_ev=sorted_verdict.rms_all_ev)
+    verdict = replace(verdict, rms_all_ev=sorted_verdict.rms_all_ev,
+                      converged=verdict.converged and not partition.changed)
     previous = history['previous']
     motion = (np.full(out_e.shape, np.nan) if previous is None else out_e - previous)
     history['previous'] = out_e.copy()
@@ -4703,6 +4748,14 @@ def _run_linear_mixing(
     return last_evaluated, rms_history
 
 
+
+def _refresh_rcrop_metric(metric, partition, nb, *, role):
+    """Refresh the caller-owned per-state mask only at accepted iterates."""
+    if role != "trial":
+        metric[:, :nb] = np.broadcast_to(np.asarray(
+            partition.protected_mask | partition.in_range_mask, dtype=bool),
+            (metric.shape[0], nb))
+
 def _run_rcrop(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, history_depth: int,
@@ -4896,8 +4949,10 @@ def _run_rcrop(
         # consumer -- ``dump_sigma_omega_h5_final`` -- and it survives:
         # this cell is refilled below and the loop exits with it.
         _last_outputs[0] = None
+        role = ("initial" if _iter_idx[0] == 0 else
+                "trial" if _iter_idx[0] % 2 else "accepted_input_map")
         state_in = SCState(
-            H_qp_dft=H,
+            role=role, H_qp_dft=H,
             iteration=_iter_idx[0],
             partition=_partition[0],
             occupation_state=_occ_state[0],
@@ -4908,12 +4963,11 @@ def _run_rcrop(
         _last_outputs[0] = state_out.outputs
         if _frozen_fits[0] is None:
             _frozen_fits[0] = _capture_frozen_scissor_fits(state_out.outputs)
-        _partition[0] = _state_partition(state_out, inputs)
-        metric_partition = _partition_on_loop(_partition[0], inputs)
-        metric_mask = np.broadcast_to(np.asarray(
-            metric_partition.protected_mask | metric_partition.in_range_mask,
-            dtype=bool), (int(x0.shape[0]), nb))
-        _metric_np[:, :nb, :nb] = metric_mask[:, :, None] * metric_mask[:, None, :]
+        if role != "trial":
+            _partition[0] = _state_partition(state_out, inputs)
+        _refresh_rcrop_metric(
+            _metric_np, _partition_on_loop(_state_partition(state_out, inputs), inputs),
+            nb, role=role)
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
@@ -5037,11 +5091,11 @@ def _run_rcrop(
     # rcrop_nojit consumes this caller-owned array at each weighting call.
     # Refresh it after classification; the same current identity block then
     # weights every history entry in that solve. Padded entries stay zero.
-    _metric_np = np.zeros((int(x0.shape[0]), _nbp, _nbp), dtype=np.float64)
-    _metric_np[:, :nb, :nb] = _fit_mask[:, :, None] * _fit_mask[:, None, :]
+    _metric_np = np.zeros((int(x0.shape[0]), _nbp), dtype=bool)
+    _metric_np[:, :nb] = _fit_mask
     print_fn(
         "  SC rCROP metric: Gram over the per-k non-scissored DFT identity "
-        "block; masks refreshed after each map, scissored rows follow the map")
+        "block; masks refreshed on accepted maps, scissored rows follow the map")
     try:
         result = rcrop_nojit(
             residual_fn,
@@ -5201,8 +5255,7 @@ def _refuse_degenerate_window_edge(
     so, unlike D3(a), it applies to BOTH metal head modes.  Reuses
     :func:`common.band_degeneracy.check_band_window`, the SAME "minimum gap
     over k across a boundary" primitive this module already applies to the
-    SC active window elsewhere (``BandPartition.report_multiplet_splits`` /
-    ``promoted_to_multiplets``), rather than a second notion of "clean
+    SC active window at driver startup (including restart), rather than a second notion of "clean
     boundary" for the head window specifically — CLAUDE.md: single source of
     truth; rebuilding a symmetry/degeneracy primitive is banned.
 
@@ -5513,6 +5566,12 @@ def run_sc_driver(
         is completed inside this function so its W body and head samples
         cannot be separated at the caller boundary.
     """
+    # Restart skips zeta fitting, so validate the active edge independently
+    # before entering the loop, with the same strict owner as a fresh fit.
+    from common.band_degeneracy import check_band_window
+    check_band_window(np.asarray(wfn.energies[0]), int(band_slices.b0),
+                      int(band_slices.b3), mode="strict",
+                      where="SC nval/ncond active window (fresh or restart)")
     import dataclasses
 
     # THE b0 == 0 ASSUMPTION, MADE EXPLICIT.  Every occupancy in this
@@ -5572,7 +5631,9 @@ def run_sc_driver(
         efermi_ev = float(_mu_ry) * RYD_TO_EV
         efermi_dft_scissor_ry = float(_mu_ry)
     else:
-        efermi_ev = float(wfn.efermi) * RYD_TO_EV
+        from .efermi import resolve_sigma_efermi_ry
+        efermi_ev = resolve_sigma_efermi_ry(
+            config.sigma.fermi_reference, occupation_state=None, wfn=wfn)[0] * RYD_TO_EV
         # The Sigma grid keeps its established loader reference above.  The
         # LOW-VALENCE DISPLACEMENT is a different invariant: it compares the
         # SC map's DFT and candidate Fermi levels, so both endpoints must use

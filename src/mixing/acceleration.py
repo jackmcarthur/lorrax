@@ -912,7 +912,12 @@ def rcrop_nojit(
             driver passes the non-scissored band block, so the scissored
             tail (which moves by eV per map from its own refit) cannot
             steer the coefficients.  ``None`` is the unweighted solve,
-            bit for bit.
+            bit for bit. For a square matrix carry, a per-state mask with
+            shape ``x0.shape[:-1]`` forms its outer product on device.
+            Aliasing contract: a caller-owned NumPy metric is read afresh
+            at every weighting call; residual_fn may mutate it in place on
+            accepted calls only. Trial probes must leave it unchanged.
+            Do not hoist its device conversion outside ``_weighted``.
 
     Returns:
         AccelerationResult
@@ -941,7 +946,12 @@ def rcrop_nojit(
     f = _entry(residual_fn(x))
 
     def _weighted(v):
-        return v if metric is None else v * metric
+        if metric is None:
+            return v
+        weights = jnp.asarray(metric)
+        if weights.shape == shape[:-1]:
+            weights = weights[..., :, None] * weights[..., None, :]
+        return v * weights
 
     # History buffers
     Xhist = _zeros_hist()

@@ -142,11 +142,11 @@ structurally.
 
 **3. The Σ(ω) grid must contain every protected band at every k, and must not
 be wider than it needs to be.** The default grid is ±5 eV around E_F; a
-protected window of 8 valence bands on Si reaches −12 eV. A protected band
-outside the grid triggers the all-caps warning from
-`BandPartition.warn_if_protected_outside_grid`, and its off-diagonals then mix
-edge-clamped Σ values into the eigenproblem. Set the grid to the window plus a
-margin (2 eV is enough for the frozen rules, pitfall 12). Do not chase
+protected window of 8 valence bands on Si reaches −12 eV. Protected states outside the requested window are reported by
+`BandPartition.warn_if_protected_outside_grid` in debug output. Accepted
+maps grow sampled support before evaluating those states; the production
+record gives one partition summary per map. The common energy-dependent
+pad controls hysteresis and quadrature certification (pitfall 16). Do not chase
 semicore states by widening: the node count of the crossing rules grows like
 bandwidth × ln(10/ε)/(π η), and a [−90, +20] eV CrI3 grid at η = 0.25 eV cost
 80 min per Σ evaluation on 16 GPUs. Keep the grid within ±15 eV and let deeper
@@ -238,7 +238,10 @@ the update
 still mixes the full carry and the scissored rows keep following the map. A
 full window (a semiconductor with every band in range) has weights of exactly
 1.0 and is bit identical to the unweighted solve. The log line is
-``SC rCROP metric: Gram over the non-scissored block only (bands a-b, n of nb)``.
+``SC rCROP metric: Gram over the per-k non-scissored DFT identity block``.
+The caller owns a per-state Boolean mask, refreshed only on accepted calls;
+rCROP forms its outer product on device. Discarded probes cannot change
+the quadratic form used for the accepted history.
 On metals a local gain above 1 can remain at Fermi-crossing states, where the
 exchange term responds to an occupation flip under the smearing width; that is
 the physics of the map, not the accelerator, and is read from pitfall 13's
@@ -267,9 +270,13 @@ padded by `pad(E) = 0.5 eV + 0.10 |E - mu|`. The pad is 0.5 eV at mu,
 1.5 eV at 10 eV and 2.5 eV at 20 eV. This replaces the inward 2 eV edge
 margin and frozen sorted-index set: near-mu motion is small, while Na's
 spectrum stretches by about ten percent and the upper states moved 1.2–2.2 eV.
-Classification runs on every map, including rCROP trials. An escape prints
-the band identity, k, energy and pad; the state is reclassified and the
-quadrature planner retains its existing rebuild-on-box-escape behavior.
+Classification runs on every map, including rCROP trials, but trials do not
+commit classification memory or grow the sampled grid. On an accepted escape
+map the identity remains protected, its grid grows before Sigma evaluation,
+and convergence is forbidden. The next accepted map scissors it; re-entry
+requires the entire band range inside the requested window. The production
+summary names the escape's band, k, energy and pad; debug output carries all
+per-state rows. Quadrature retains its rebuild-on-box-escape behavior.
 The quadrature state support uses the same pad; pole padding and certified
 acceptance are unchanged. The sampled omega grid is the REQUESTED grid at
 map 0 for every state, so SC iteration 1 equals the one-shot and a state
@@ -277,8 +284,9 @@ outside the requested window keeps the one-shot treatment (pre-padding the
 grid re-evaluated such states and moved the GN-PPM invariance fixture by
 0.28 eV, 2026-09-05). When a retained state drifts past the requested
 bounds, only the outer sampled endpoints grow, to the escaped energy plus
-its pad (`SC sampled-support growth: ...`); old samples remain unchanged and
-the quadrature session keeps the grown support on later maps and trials.
+its pad (`SC sampled-support growth: ...` in debug output), rounded outward
+in blocks of four samples. Old samples remain unchanged and the quadrature
+session keeps the grown support on later maps and trials.
 Certificates reserve this prospective external-frequency extent, including
 the growth pad and grid rounding, without evaluating those samples at map 0.
 Padding intermediate states alone does not cover external-frequency growth.

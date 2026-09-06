@@ -358,7 +358,7 @@ def sc_padded_window_ev(lower_ev, upper_ev):
             upper / (1.0 - _SC_PAD_FRACTION * np.sign(upper)))
 
 
-def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev):
+def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev, *, role="accepted"):
     """Cover retained raw SC energies by extending only outer samples.
 
     Parameters
@@ -376,7 +376,8 @@ def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev):
     -------
     ndarray
         Monotone sampled support containing every old sample unchanged.
-        Only uncovered required states trigger growth, to E +/- pad(E).
+        Only uncovered required states trigger growth, to E +/- pad(E),
+        rounded outward to a multiple of four added samples per edge.
         Interior gaps retain the existing patched-grid coverage refusal.
     """
     from common.units import RYD_TO_EV
@@ -398,6 +399,8 @@ def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev):
     assert_omega_grid_covers(
         energy / RYD_TO_EV, required, grid / RYD_TO_EV,
         context="SC retained identity support")
+    if role == "trial":
+        return grid
     below = required & (energy < grid[0])
     above = required & (energy > grid[-1])
     if not (below.any() or above.any()):
@@ -406,8 +409,8 @@ def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev):
              if below.any() else float(grid[0]))
     upper = (float(np.max(energy[above] + sc_state_pad_ev(energy[above])))
              if above.any() else float(grid[-1]))
-    n_lower = int(np.ceil((grid[0] - lower) / step))
-    n_upper = int(np.ceil((upper - grid[-1]) / step))
+    n_lower = 4 * int(np.ceil((grid[0] - lower) / (4 * step)))
+    n_upper = 4 * int(np.ceil((upper - grid[-1]) / (4 * step)))
     return np.concatenate((
         grid[0] - step * np.arange(n_lower, 0, -1), grid,
         grid[-1] + step * np.arange(1, n_upper + 1)))

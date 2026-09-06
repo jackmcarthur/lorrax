@@ -376,8 +376,8 @@ class GWProductionReport:
         if not config.compute_mode.is_dynamic:
             return
         b = band_slices
-        grid_lo = float(config.sigma.omega_min_ev)
-        grid_hi = float(config.sigma.omega_max_ev)
+        omega_grid = np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
+        grid_lo, grid_hi = float(omega_grid[0]), float(omega_grid[-1])
         ef_ev = float(sigma_result.efermi_dft_ev)
         provenance = (getattr(sigma_result, "omega_reference_provenance", None)
                       or config.sigma.fermi_reference)
@@ -398,8 +398,6 @@ class GWProductionReport:
 
         self.heading("Dynamic Sigma energy coverage")
         self.emit(f"Energy origin   : E_F = {ef_ev:+.5f} eV ({provenance})")
-        omega_grid = np.asarray(
-            getattr(sigma_result, "omega_grid_ev", ()), dtype=np.float64)
         grid_note = (f"; step={float(config.sigma.omega_step_ev):.5f} eV; "
                      f"{int(omega_grid.size)} points")
         self.emit(f"Sigma omega    : [{grid_lo:+.5f}, {grid_hi:+.5f}] eV "

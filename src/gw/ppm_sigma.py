@@ -268,6 +268,7 @@ def _prepare_sigma_state(
     valid_mask_q: jax.Array,
     use_midgap: jax.Array,
     keep_invalid: jax.Array,
+    logical_mask: jax.Array | None = None,
 ) -> _SigmaPhysicsState:
     """Derive Fermi level + derived energy/PPM arrays in one fused trace.
 
@@ -293,8 +294,9 @@ def _prepare_sigma_state(
     """
     # TODO(metal-greens): the finite-occupation Green's-function/Sigma
     # decomposition needs particle/hole weights f and 1-f, not f > 0.5.
-    occ_mask = occ_full > 0.5
-    unocc_mask = ~occ_mask
+    live = jnp.ones_like(occ_full, dtype=bool) if logical_mask is None else logical_mask
+    occ_mask = (occ_full > 0.5) & live
+    unocc_mask = (occ_full <= 0.5) & live
 
     vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
     cbm = jnp.min(jnp.where(unocc_mask, enk_full, 1.0e30))
@@ -934,7 +936,8 @@ def compute_sigma_c_ppm_omega_grid(
         state = _prepare_sigma_state(
             enk_full, occ_full, ppm.B_q, ppm.Omega_q, valid_mask,
             jnp.asarray(sigma_cfg.fermi_reference == "midgap", dtype=bool),
-            jnp.asarray(keep_invalid, dtype=bool))
+            jnp.asarray(keep_invalid, dtype=bool),
+            jnp.arange(s.nb_full) < s.nb_full_logical)
 
     regularization_width_ry = (
         float(sigma_cfg.regularization_ev) / RYD_TO_EV)
@@ -1014,8 +1017,8 @@ def compute_sigma_c_ppm_omega_grid(
         omega_req,
         E_cond=state.E_cond,
         H_val=state.H_val,
-        cond_mask=state.cond_mask,
-        val_mask=state.val_mask)
+        cond_mask=state.cond_mask & (jnp.arange(s.nb_full) < s.nb_sigma_sum),
+        val_mask=state.val_mask & (jnp.arange(s.nb_full) < s.nb_sigma_sum))
     result = compute_sigma_c_mpa_omega_grid(
         wfns, fit_store_path, meta, mesh_xy,
         omega_grid_ry=omega_req,

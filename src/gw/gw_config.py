@@ -5229,7 +5229,11 @@ class LorraxConfig:
                 and getattr(self, "sc_omega_grid_ev", None) is not None):
             # The SC session's sampled support, grown only when a retained
             # state escaped the requested window (extend_sc_omega_grid_ev).
-            return np.asarray(self.sc_omega_grid_ev, dtype=np.float64)
+            grid = np.asarray(self.sc_omega_grid_ev, dtype=np.float64)
+            if (grid.ndim != 1 or grid.size < 2 or not np.isfinite(grid).all()
+                    or np.any(np.diff(grid) <= 0.0)):
+                raise ValueError("SC omega support requires an ascending finite grid")
+            return grid
         p = self.sigma
         patches = p.parsed_omega_patches_ev()
         if not patches:
