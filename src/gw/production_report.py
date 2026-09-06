@@ -88,8 +88,7 @@ def layout_dial_record_lines(
             "low_mem_bands = true: the two-face wavefunction carrier (band "
             f"chunks of {int(config.memory.band_chunk_size)}); required for the "
             "raw-parent (k_irr) route, which contracts G and the ISDF pair "
-            "densities on the WFN's own k rows.  On an unreduced k grid the "
-            "four-copy carrier (false) is faster when it fits.")
+            "densities on the WFN's own k rows.")
     return tuple(lines)
 
 

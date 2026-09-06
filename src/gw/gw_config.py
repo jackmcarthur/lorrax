@@ -5520,7 +5520,7 @@ class LorraxConfig:
         )
         if not bool(_g("low_mem_bands")):
             print_fn(
-                "WARNING: low_mem_bands = false: the full-k carrier no longer "
+                "[config provenance] WARNING: low_mem_bands = false: the full-k carrier no longer "
                 "exists; proceeding on raw parents.")
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
