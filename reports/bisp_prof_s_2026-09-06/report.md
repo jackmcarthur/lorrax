@@ -584,3 +584,18 @@ The common-basis104–107 logs contain aggregate compile-cache summaries, not pe
 Run32 is queued on authorized57988457 behind a four-node campaign step. Named allocation attempt34 was refused with QOSMaxSubmitJobPerUserLimit; the receipt is `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/34_P3_allocation/attempt1.log`. No science verdict exists for phase3 yet. Source-only finding: repeated exact C_q construction is in `src/isdf/core.py:_c_q_face_parent`, which creates a fresh `_fused` jit on each call; it is an ISDF/ZW boundary, not a Sigma factory, and is reported here for that owner without editing it.
 
 CPU baseline38 passes23 physics oracles (`driver.1.log`, JID57988457). Run-local candidate39 failed before arithmetic on an unbound manual mesh axis; candidate40, with the static kernel's shard_map wrapper, passes all23 including the complex antiunitary tau sum. Production remains frozen for GPU baselines. CPU initializer probe41 (`lx-Xg0-134320-881449-7187`, JID57988457) measures10 exact repeated `_zeros` calls: incumbent10 compiles/0.240868s, hoisted JAX function1/0.021115s, exact values and sharding. This justifies testing a shape-keyed initializer after the dynamic gate; it does not establish a whole-run improvement.
+
+### Dynamic CC before change
+
+| deck / native capture | nodes | first instrumented host ms / warm median ms | selected warm device ms / CUDA sum ms | transport-heavy CUDA range ms | optimized tau bytes/rank | explicit HLO collectives |
+|---|---:|---:|---:|---:|---:|---|
+| MoS2 6x6, run33, lx-Xg4-134911-920500-8530 |115|196.056 /33.910|32.384151 /31.615167|14.3603|1,787,348,337|none|
+| Si GN, run24, lx-Xg4-135417-946966-8718 |29|195.217 /40.612|39.064191 /38.316097|14.9653|2,019,986,453|none|
+
+Both captures are rank0 on JID57988457 and retain exact EQP/sector rows against their rebased controls (210 MoS2 rows,256 Si rows). The captured unit is invocation1, zero-based, with zero compiles; CUDA startup adds about11s to its host wall, so that outlier is not presented as a tau execution cost. The tables use the median of all warm calls and native launch correlation. Native artifacts: MoS2 `prof_s/33_P3_dynamic_profile/unit_2160_0.json` and Si `prof_s/24_P3_gn_profile/unit_1289_0.json`, with boundary.jsonl, async_collectives.json and canonical HLO census beside them. The native ordinal0 is the only captured occurrence, corresponding to warm host invocation1. DLA NCCL is still present despite zero explicit HLO collectives.
+
+The transport-heavy range includes the open-spin rotation and fused layout/gather work; it is not a standalone spin-only timing. Per-rank complex128 payloads: MoS2 K36,s4,N80,M600,P4 has two child faces55,296,000 bytes and one full operator829,440,000 bytes; Si K64,s4,N32,M480,P4 has two faces31,457,280 bytes and one operator943,718,400 bytes. Parent-face payloads replace K with n_parent7/8. The candidate keeps the final full Green; a smaller transport input does not itself prove a lower optimized peak.
+
+| Speed item | Site | Gate step / artifact | Before → after |
+|---|---|---|---|
+| 1: dynamic CC child faces | `src/gw/ppm_tau_kernel.py::_get_sigma_kij_kernel` | `lx-Xg0-141347-1062624-1170`; `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/47_cpu_dynamic_faces/` | Complex frequency-weighted antiunitary oracle: 1 passed; CPU compile 10 / 0.3231 s; warm timing unavailable in this oracle. MoS2 boundary operator 829,440,000 → two faces 55,296,000 B/rank; Si 943,718,400 → 31,457,280 B/rank (final G retained). |

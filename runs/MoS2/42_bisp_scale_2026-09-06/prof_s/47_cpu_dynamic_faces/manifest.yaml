@@ -1,0 +1,10 @@
+run_id: 47_cpu_dynamic_faces
+system: synthetic
+pipeline: dynamic_tau_complex_oracle
+platform: perlmutter
+variant_of: 40_cpu_P3_faces_local
+reused: existing complex tau oracle
+pool: 57992641
+steps:
+  gate:
+    state: complete
