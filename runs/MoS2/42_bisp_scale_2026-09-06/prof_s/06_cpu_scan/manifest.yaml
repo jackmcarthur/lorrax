@@ -1,0 +1,13 @@
+run_id: 06_cpu_scan
+system: MoS2
+pipeline: pytest physics oracles
+platform: perlmutter
+variant_of: orchestrator71ae0bde
+reused: existing independent dense physics oracles
+pool: 57982945
+geometry: CPU one process four emulated devices
+steps:
+  pytest:
+    state: failed
+
+completion_receipt: '[lx] step lx-Xg0-114509-284511-9392 exit 1 in 52 s'

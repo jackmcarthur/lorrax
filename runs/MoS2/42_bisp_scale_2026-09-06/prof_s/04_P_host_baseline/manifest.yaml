@@ -1,4 +1,4 @@
-run_id: 28_P_coupled_host
+run_id: 04_P_host_baseline
 system: MoS2
 pipeline: gwjax
 platform: perlmutter
@@ -11,4 +11,4 @@ steps:
   sigma:
     state: complete
 
-completion_receipt: '[lx] step lx-Xg4-123600-575295-5784 exit 0 in 72 s'
+completion_receipt: '[lx] step lx-Xg4-114002-258518-9170 exit 0 in 73 s'

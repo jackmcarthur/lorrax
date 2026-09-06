@@ -1,0 +1,12 @@
+run_id: 03_P_static_profile
+system: MoS2
+pipeline: lorrax_only
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/02_P_static_P4_fresh
+reused: private tmp and canonical input links
+source_pin: 71ae0bde
+geometry: {nodes: 1, gpus: 4, ranks: 4}
+steps:
+  lorrax: {state: complete}
+
+completion_receipt: '[lx] step lx-Xg4-113635-230722-5731 exit 0 in 198 s'

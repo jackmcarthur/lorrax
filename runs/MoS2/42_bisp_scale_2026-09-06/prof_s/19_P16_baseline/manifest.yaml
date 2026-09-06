@@ -1,4 +1,4 @@
-run_id: 28_P_coupled_host
+run_id: 19_P16_baseline
 system: MoS2
 pipeline: gwjax
 platform: perlmutter
@@ -6,9 +6,11 @@ variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/wo
 reused: copied tmp zeta and rule caches; immutable WFN, centroids, kin_ion, dipole
 source: source_head.txt plus source.diff
 pool: 57982945
-geometry: P4 one rank per GPU
+geometry: P16 one rank per GPU
 steps:
   sigma:
-    state: complete
+    state: failed
 
-completion_receipt: '[lx] step lx-Xg4-123600-575295-5784 exit 0 in 72 s'
+source_mode: orchestrator71ae0bde exact src/services
+
+launch_result: LX-POOLFULL rc96 after --wait 1800; no compute step created

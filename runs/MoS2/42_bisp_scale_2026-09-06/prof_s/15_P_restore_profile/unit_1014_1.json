@@ -1,0 +1,46 @@
+{
+  "program": 1014,
+  "occurrence": 1,
+  "occurrences": 3,
+  "label": "XlaModule:#hlo_module=jit_restore,program_id=1014#",
+  "host_range_ms": 0.309408,
+  "projected_ms": 0.100767,
+  "kernel_count": 5,
+  "kernel_sum_ms": 0.100671,
+  "kernels": [
+    {
+      "name": "loop_complex_fusion",
+      "count": 1,
+      "sum_ms": 0.002592
+    },
+    {
+      "name": "loop_dynamic_slice_fusion",
+      "count": 1,
+      "sum_ms": 0.001856
+    },
+    {
+      "name": "wrapped_slice",
+      "count": 1,
+      "sum_ms": 0.023296
+    },
+    {
+      "name": "loop_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.071391
+    },
+    {
+      "name": "loop_broadcast_fusion",
+      "count": 1,
+      "sum_ms": 0.001536
+    }
+  ],
+  "thunks": [
+    {
+      "name": "Thunk:#hlo_op=command_buffer_1#",
+      "kernels": 5,
+      "projected_ms": 0.100767,
+      "kernel_sum_ms": 0.100671
+    }
+  ],
+  "scope": "Native launch-correlation projection; nested thunk ranges must not be summed"
+}
