@@ -180,3 +180,9 @@
 | Whole wall s |753.07|731.07|excluded: startup contention in P|
 | Step / audit |57988457/lx-Xg4-150412-1355239-5472 exit0|Slurm.118 overlaps.117 for110s|completed_receipts.json, identity.json, D/gpu_overlap_audit.json; Na04 parent-only repeat queued after9×9, main reference reused|
 | Phase pin / refresh |measured fe2a6937|origin/main d3d4b03a|hourly fetch22:28UTC sees ORCH b1d8b8f1; immutable phase pin preserved per speed protocol|
+
+| Matched9×9 follow-up | Result | Step / artifact | Disposition |
+|---|---|---|---|
+| Eight union-box certificates |eps1e-5, reduction_steps0; all original error/noise guards pass|57988457/lx-Xg0-152909-1494895-4356 exit0; D12_nine_common_rules/rules_receipt.json|same immutable certificates for P4/P16|
+| R208 P4 replay selector |Both sources reject an already-contained box due to additional1e-3 proximity assertion; no EQP|57988457/lx-Xg4-153138-1497102-7816 exit1; R208/01 and02 driver.rank0.log|scaffolding failure; corrected containment selector in new R209 and unrun R216, original certificate guards unchanged|
+| Quiescent measurement start |P16 matrix and Na parent repeat wait for other GPU steps to drain before imports; active-start receipt retained|D/quiescent_start.py; per-master quiescent_JOB_STEP.json|whole-step overlap and active-science overlap audited separately; no cancellation of shared jobs|
