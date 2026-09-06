@@ -391,3 +391,79 @@ def test_near_boundary_cache_hit_reaudits_the_same_nodes(tmp_path):
     hit, _ = _rule_cache_lookup(str(tmp_path), request, 1e-3, True,
                                noise_amplification_cap=100.)
     assert hit is None
+
+
+@pytest.mark.parametrize('broad_nodes,tight_contains,expected_nodes,builds', [
+    (199, True, 126, 0),
+    (199, False, 126, 1),
+    (157, False, 157, 0),
+])
+def test_cache_cost_cap_prefers_the_measured_na_window(
+        tmp_path, monkeypatch, broad_nodes, tight_contains, expected_nodes, builds):
+    from gw import sigma_box_plan as boxes
+    from minimax import UniformRule
+
+    # Na call 4: the old narrow certificate misses a slightly moved edge;
+    # the broad conduction certificate contains it but costs 199 vs 126.
+    request = np.array([-21.5, 26.5, .5, 22.56]) / RYD_TO_EV
+    tight = np.array([-21.6, 26.6, .49, 22.6]) / RYD_TO_EV
+    if not tight_contains:
+        tight[1] = 26.49 / RYD_TO_EV
+    broad = np.array([-46.1, 28.9, .49, 22.7]) / RYD_TO_EV
+
+    def rule(box, nodes):
+        return UniformRule(times=np.zeros(nodes, complex),
+            weights=np.ones(nodes, complex) / nodes, box=tuple(box),
+            eps=1e-4, relative=False, theta_deg=0., rank=nodes,
+            sup_error=5e-5, kappa_max=1., seconds=0.)
+
+    for box, nodes in ((tight, 126), (broad, broad_nodes)):
+        assert boxes._rule_cache_store(str(tmp_path), rule(box, nodes), 1.) is None
+    built = []
+    def build(box, eps, **kwargs):
+        built.append(box)
+        return rule(box, 126)
+    monkeypatch.setattr(boxes, 'build_uniform_rule', build)
+    monkeypatch.setattr(boxes, 'rule_roundoff_amplification', lambda *a: 1.)
+    spec = boxes.make_sigma_box_spec(name='Na valence resonant',
+        frequencies=np.array([0.]), states=np.array([40.]) / RYD_TO_EV,
+        pole_stats=[(0., 0., 0., 0.)], pole_sign=-1., eta_ry=.5 / RYD_TO_EV)
+    spec.update(box=tuple(request), kind='crossing')
+    fit = boxes._fit_rule(spec, 1e-4, 1., str(tmp_path), .5 / RYD_TO_EV,
+                          cache_build_widen=False)
+    assert fit['node_count'] == expected_nodes
+    assert len(built) == builds
+    if builds:
+        np.testing.assert_array_equal(built[0], request)
+        hit, warnings = boxes._rule_cache_lookup(str(tmp_path), request,
+            1e-4, False, noise_amplification_cap=100., state_pad_ry=5. / RYD_TO_EV)
+        assert not warnings and hit[0].node_count == 126
+
+
+def test_cache_cost_cap_preserves_fixture_b_exact_producer_hit(tmp_path):
+    from pathlib import Path
+    import shutil
+    from gw import sigma_box_plan as boxes
+    from minimax import UniformRule
+
+    producer = (Path(__file__).parent / 'core/fixtures/B/tmp/sigma_quadrature_rules'
+                / 'rule_3b8d00303cfd366b.npz')
+    shutil.copyfile(producer, tmp_path / producer.name)
+    with np.load(producer) as data:
+        box = tuple(data['box'])
+        times = data['times'].copy()
+        eps = float(data['eps'])
+        relative = bool(data['relative'])
+        steps = int(data['reduction_steps'])
+    # A cheap nested one-shot window is not a cost bound for the full box.
+    nested = ((box[0] + box[1]) / 2., box[1], box[2], box[3])
+    tiny = UniformRule(times=np.zeros(2, complex), weights=np.ones(2, complex),
+        box=nested, eps=eps, relative=relative, theta_deg=0., rank=2,
+        sup_error=eps / 2., kappa_max=1., seconds=0.)
+    steps = None if steps == -1 else steps
+    assert boxes._rule_cache_store(str(tmp_path), tiny, 1., steps) is None
+    hit, warnings = boxes._rule_cache_lookup(str(tmp_path), box, eps, relative,
+        noise_amplification_cap=1000., reduction_steps=steps,
+        state_pad_ry=2. / RYD_TO_EV)
+    assert not warnings and hit[1] == producer.name
+    np.testing.assert_array_equal(hit[0].times, times)
