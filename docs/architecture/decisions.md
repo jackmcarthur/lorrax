@@ -572,6 +572,34 @@ Licenses deleting: rectangular-mesh accommodation in the mesh resolver
 and any divisibility contortions that exist only to serve non-square
 grids. Does NOT license adding idle-rank truncation.
 
+## 2026-09-05 — One in-memory centroid order (orbit-packed); files canonical
+
+Every centroid axis a gwjax run computes on is in the orbit-packed order of
+`common.grouped_layout` (whole symmetry orbits per X/Y shard, per-shard zero
+pad suffixes), owned by `common.centroid_basis.PackedCentroidBasis` and
+carried as `meta.mu_basis`; `meta.n_rmu_padded` is its packed extent.  No
+kernel between the I/O seams converts between orders, and no second
+in-memory order exists: the parent-k Green contraction, the ζ-fit tiles, the
+τ chain, V, χ0, W and the static kernels all compute in it.  A conversion is
+legal only where bytes cross a file boundary (readers pack, writers unpack;
+`common/centroid_basis.py`), using an all-to-all round trip per sharded axis.
+Files keep the canonical centroid-file order at logical extent, so restart
+files and the MPA store are processor-grid agnostic. Canonical suffix padding
+belongs only to I/O staging. The seam handles staging carriers both smaller
+and larger than the packed extent; BSE, htransform and downfold read the
+same logical files.
+
+Consequences the pads impose: dense μ solves run at the whole packed extent
+with C_q's physical mean diagonal on its pad slots (`meta.mu_solve_extent`),
+and any
+"logical prefix" test on a μ axis is a defect; use `meta.mu_active_mask`.
+The test-only `LORRAX_EXTRA_MU_PAD` knob still sizes the canonical carrier
+(I/O staging) and no longer changes the orbit-packed runtime extent.
+`PackedCentroidBasis.solve_axis` supplies the solve receipt; the loader and
+q-table construction consume that basis's extent without padding it again.  Bispinor decks, trivial
+groups and non-closed centroid sets take the identity layout, so their
+behaviour is the pre-2026-09-05 canonical one.
+
 ## 2026-08-18 — ζ band chunks default to 16; zero opts into the planner
 
 The no-key `band_chunk_size` value is 16, mesh-rounded and capped at the

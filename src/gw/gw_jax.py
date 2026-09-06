@@ -468,13 +468,22 @@ def main(argv=None):
 	# historical Meta construction.
 	_sc_buffer = (int(config.sc.buffer_nbands)
 	              if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
+	# THE in-memory centroid order (common.centroid_basis): whole symmetry
+	# orbits per shard so every symmetry action is rank-local; files keep
+	# the canonical order and convert at the I/O seam.  A bispinor deck keeps
+	# the canonical order: its transverse channel has no packed layout yet.
+	from common.centroid_basis import PackedCentroidBasis
+	mu_basis = PackedCentroidBasis.build(
+		centroid_indices, sym, wfn.fft_grid, mesh_xy,
+		identity=bool(config.bispinor))
+	print0(f"  {mu_basis.describe()}")
 	meta = Meta.from_system(wfn, sym,
 	                        int(config.nval) + _sc_buffer,
 	                        int(config.ncond) + _sc_buffer, config.nband,
 	                        n_rmu, charge_bispinor,
 	                        nband_chi=config.bands.chi,
 	                        nband_sigma=config.bands.sigma,
-	                        mesh_xy=mesh_xy)
+	                        mesh_xy=mesh_xy, mu_basis=mu_basis)
 	if _sc_buffer:
 		print0(
 			f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
@@ -599,6 +608,18 @@ def main(argv=None):
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
 	green_parent_carrier = getattr(isdf, 'green_parent_carrier', None)
+	# The Σ kernels take the parent carrier whenever one exists: their G
+	# contraction and band projection then run on the raw parents and the
+	# band matrix is broadcast back to full k (gw.wavefunction_bundle.
+	# sigma_face_kernel_kwargs); the q->0 head wings take the same view and
+	# stream the children from the carrier.  Density, output and restart
+	# consumers keep the primary bundle.
+	sigma_parent_carrier = getattr(isdf, 'sigma_parent_carrier', None)
+	wfns_sigma = wfns
+	if sigma_parent_carrier is not None:
+		from dataclasses import replace as _dc_replace_sigma
+		wfns_sigma = _dc_replace_sigma(
+			wfns, green_parent=sigma_parent_carrier)
 	if green_parent_carrier is None:
 		wfns_screening = wfns
 	else:
@@ -723,8 +744,10 @@ def main(argv=None):
 			# built on the run's own charge centroids.  The separate
 			# source-Pauli head bundle went with the two retired
 			# carrier-comparison modes (2026-09-01).
+			# The Sigma view carries the parent carrier: on parents-only
+			# storage the wings stream the children from it (qsgw_head).
 			oneshot_head_response = build_dft_head_response(
-				wfns, oneshot_omegas,
+				wfns_sigma, oneshot_omegas,
 				input_dir=input_dir, mesh=mesh_xy,
 				wfn=wfn, meta=meta, config=config)
 			print0(
@@ -893,14 +916,16 @@ def main(argv=None):
 					tensors_filename=tensors_filename,
 					print_fn=print0)
 		if green_parent_carrier is not None:
-			# Every chi0 call above blocks before returning.  Release the parent
-			# carrier before W persistence and Sigma so it cannot inflate those
-			# unrelated live sets or become an unused jit operand.
+			# Every chi0 call above blocks before returning.  Drop the
+			# screening view's reference so it is not an unused jit operand
+			# downstream.  The arrays themselves stay resident: the Sigma
+			# view (wfns_sigma) holds the same carrier, priced as such.
 			isdf.green_parent_carrier = None
 			wfns_screening = None
 			green_parent_carrier = None
 			gc.collect()
-			print0("  Parent-k Green carrier released after screening.")
+			print0("  Parent-k Green carrier detached from the screening view "
+			       "(the Sigma view keeps it).")
 
 	if (oneshot_head_response is not None
 			and not packed_photon_replaces_charge_sigma(config)):
@@ -1012,7 +1037,7 @@ def main(argv=None):
 		with timing.section("gw_jax.sigma"):
 			sigma_result = compute_sigma_xc(
 				mode,
-				wfns=wfns, V_q=V_q, W_by_role=W_by_role,
+				wfns=wfns_sigma, V_q=V_q, W_by_role=W_by_role,
 				e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,
@@ -1119,8 +1144,11 @@ def main(argv=None):
 		# row when it fires and must not hide inside ``(untimed)``.
 		with timing.section("gw_jax.sc_driver", announce=True,
 		                    label="self-consistent QSGW driver"):
+			# The self-consistent map takes the Σ bundle: under parents-only
+			# storage its carrier is the run's only ψ and the map's rotation
+			# acts on it (wavefunction_bundle.rotate_wavefunctions).
 			sc_result = run_sc_driver(
-				wfns, V_q, kin_ion,
+				wfns_sigma, V_q, kin_ion,
 				head_channel=getattr(isdf, 'head_channel', None),
 				wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
 				charge_zeta_identity=isdf.charge_zeta_identity,

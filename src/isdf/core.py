@@ -27,6 +27,7 @@ from common import rank_criterion
 from common import spectral_closure
 from common import timing
 from runtime.padding import (
+	authenticate_padded_axis,
 	bounded_partition_tile,
 	pad_last_axis_to,
 	solve_at_logical,
@@ -1098,6 +1099,7 @@ def c_q_from_psi_sm(
 	weight_l: jax.Array | None = None,
 	weight_r: jax.Array | None = None,
 	gemm=None,
+	k_unfold_plan=None,
 ) -> jax.Array:
 	"""C_q, the ζ fit's CCT Gram (band contraction + IFFT/γ̃/FFT over k).
 
@@ -1161,6 +1163,17 @@ def c_q_from_psi_sm(
 			"c_q_from_psi_sm(layout='face') requires psi_mun=, psi_nmu=, "
 			"weight_l=, weight_r=, gemm= (see gw.isdf_fitting.fit_zeta_to_h5"
 			").")
+	if k_unfold_plan is not None:
+		# Raw-parent contraction: psi_mun/psi_nmu are the plan's PACKED
+		# parent faces and ``gemm`` is planned at nq = n_parent.
+		if gamma_L is not None or gamma_R is not None:
+			raise ValueError(
+				"c_q_from_psi_sm(k_unfold_plan=...): the parent-k route "
+				"owns the charge vertex only.")
+		return _c_q_face_parent(
+			psi_mun, psi_nmu, weight_l, weight_r,
+			k_unfold_plan=k_unfold_plan, kgrid=kgrid, mesh_xy=mesh_xy,
+			gemm=gemm)
 	return _c_q_face(psi_mun, psi_nmu, weight_l, weight_r,
 	                 gamma_L, gamma_R,
 	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm)
@@ -1477,6 +1490,116 @@ def _c_q_face(
 	             perm_L, phase_L, perm_R, phase_R)
 
 
+def _c_q_face_parent(
+	psi_mun_parent: jax.Array,
+	psi_nmu_parent: jax.Array,
+	weight_l: jax.Array,
+	weight_r: jax.Array,
+	*,
+	k_unfold_plan,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+	gemm,
+) -> jax.Array:
+	"""Face-layout C_q contracted on raw WFN parents only.
+
+	The band contraction of the CCT Gram is the whole of its cost.  On a
+	symmetry-reduced grid it need not be repeated on every child k: the pair
+	projector at a child is the typed symmetry image of the projector at its
+	raw parent.  So this kernel forms the Green-oriented projector
+
+	    D^A_kbar[a, mu, b, nu] = sum_n w^A_n psi_{n kbar a}(mu) conj(psi_{n kbar b}(nu))
+
+	with ONE planned GEMM per side on the ``n_parent`` raw rows (the same
+	``merge_spin_centroid``/``gemm``/``split_spin_centroid`` seam as
+	:func:`_c_q_face` and ``greens_function_kernel._build_G_face``), hands the
+	completed operator to the plan's typed, collective-free unfold
+	(:meth:`gw.centroid_k_unfold.CentroidKUnfoldPlan.unfold_operator`, the
+	route the screening Green function already takes), and only then runs the
+	UNCHANGED k-IFFT / spin-trace / k-FFT tail of :func:`_c_q_face`.  The
+	incumbent tail consumes ``P = conj(D)``; the elementwise conjugate is
+	taken after the unfold so that no second spin or phase convention is
+	written here.  Both centroid endpoints are in the run's orbit-packed
+	order, like every other operator.
+
+	Charge channel only: a current vertex needs the Cartesian action the plan
+	does not own (``gw.gw_init._resolve_parent_green_admission``).
+
+	    psi_mun_parent : (n_parent, s, mu_pk, nb)  P(None,None,'x','y'), packed
+	    psi_nmu_parent : (n_parent, nb, s, mu_pk)  P(None,'x',None,'y'), packed
+	    gemm           : GemmPlan with m = n = mu_pk*s, k = nb, nq = n_parent
+	Returns ``C_q`` (nk_full, n_rmu_canonical, n_rmu_canonical) P(None,'x','y').
+	"""
+	n_parent, s_, mu_pk, nb = (int(v) for v in psi_mun_parent.shape)
+	nkx, nky, nkz = kgrid
+	nk = nkx * nky * nkz
+	plan = k_unfold_plan
+	if int(plan.n_parent) != n_parent or int(plan.n_full) != nk:
+		raise ValueError(
+			"_c_q_face_parent: plan k extents (parent/full) "
+			f"{plan.n_parent}/{plan.n_full} disagree with the operands "
+			f"{n_parent}/{nk}.")
+	if int(plan.n_centroid_packed) != mu_pk or int(plan.nspinor) != s_:
+		raise ValueError(
+			"_c_q_face_parent: psi_mun_parent must be in the plan's packed "
+			f"centroid order with its spin extent; got mu={mu_pk}, s={s_} "
+			f"vs plan {plan.n_centroid_packed}/{plan.nspinor}.")
+	if tuple(int(v) for v in psi_nmu_parent.shape) != (n_parent, nb, s_, mu_pk):
+		raise ValueError(
+			"_c_q_face_parent: psi_nmu_parent shape "
+			f"{tuple(psi_nmu_parent.shape)} != {(n_parent, nb, s_, mu_pk)}.")
+	px = int(mesh_xy.shape['x'])
+	py = int(mesh_xy.shape['y'])
+	mu_loc = mu_pk // px
+	col_loc = mu_pk // py
+
+	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
+	w_rep = NamedSharding(mesh_xy, P(None))
+	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+	pair_spec = P(None, None, 'x', None, 'y')
+
+	@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep),
+	         out_shardings=out_C)
+	def _fused(psi_mun_, psi_nmu_, w_l, w_r):
+		def _projector(w):
+			A = merge_spin_centroid(psi_mun_, 1, 2)            # (p, mu*s, nb)
+			A = A * w[None, None, :].astype(A.dtype)
+			B = merge_spin_centroid(jnp.conj(psi_nmu_), 2, 3)  # (p, nb, nu*s)
+			D = gemm(A, B)                                      # (p, mu*s, nu*s)
+			D = split_spin_centroid(D, 1, s_, mu_pk)
+			return split_spin_centroid(D, 3, s_, mu_pk)         # (p, s, mu, s, nu)
+
+		# Parent contraction, then the plan's local typed transport: the
+		# full-k operator is a transient, never a stored carrier.
+		D_l_full = plan.unfold_operator(_projector(w_l))
+		D_r_full = plan.unfold_operator(_projector(w_r))
+
+		@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
+		         out_specs=P(None, 'x', 'y'), check_vma=False)
+		def _tail(D_l_, D_r_):
+			# The incumbent ISDF tail is written for P = conj(D).
+			P_l_3d = jnp.conj(D_l_).reshape(
+				nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+			P_r_3d = jnp.conj(D_r_).reshape(
+				nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+			P_l_R_conj = jnp.conj(P_l_R)
+			del P_l_3d, P_l_R
+			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+			del P_r_3d
+			C_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 5))
+			del P_l_R_conj, P_r_R
+			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
+			return C_q_3d.reshape(nk, mu_loc, col_loc)
+
+		return _tail(D_l_full, D_r_full)
+
+	return _fused(psi_mun_parent, psi_nmu_parent,
+	             jnp.asarray(weight_l, dtype=jnp.float64),
+	             jnp.asarray(weight_r, dtype=jnp.float64))
+
+
 def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 	"""Hoist all ψ(G)->ψ(r) transforms out of the outer r-chunk loop.
 
@@ -1491,12 +1614,13 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 	bc16 therefore carries 64 slots (28% pad; priced exactly by the planner).
 	"""
 	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
-	nk = int(psi_G_store.meta.nk_tot)
-	ns = int(psi_G_store.meta.nspinor)
+	# The store's own k extent: full-zone rows for the production carrier,
+	# raw parent rows for a ``k_domain='ibz'`` store.  ``meta.nk_tot`` is the
+	# former in both cases and must not size a parent cache.
+	nk, bpd_max, ns, ngkmax = (
+		int(v) for v in psi_G_store.local_band_chunk_shape)
 	n_rtot = math.prod(fft_grid)
 	n_bc = len(psi_G_store.band_chunk_ranges)
-	bpd_max = int(psi_G_store._bpd_max)
-	ngkmax = int(psi_G_store._per_rank_shape[3])
 	if n_bc <= 0 or bpd_max <= 0:
 		raise ValueError(
 			f"build_psi_r_cache_sm requires non-empty band chunks; "
@@ -1571,6 +1695,10 @@ def z_q_from_psi_sm(
 	weight_r: jax.Array | None = None,
 	cache_face_y_blocks: bool = False,
 	face_y_cache_r_tile: int = 0,
+	k_unfold_plan=None,
+	tile_r_index: jax.Array | None = None,
+	tile_local_perm: jax.Array | None = None,
+	tile_wraps: jax.Array | None = None,
 ) -> jax.Array:
 	"""Z_q, the ζ fit's r-chunk pair-density RHS (band contraction + IFFT/γ̃/FFT,
 	streamed over r-chunks).
@@ -1621,6 +1749,28 @@ def z_q_from_psi_sm(
 			"z_q_from_psi_sm(layout='face') requires psi_mun=, weight_l=, "
 			"weight_r= and psi_G_store= (see gw.isdf_fitting.fit_zeta_to_h5"
 			").")
+	if k_unfold_plan is not None:
+		# Raw-parent contraction on one orbit-closed real-grid tile.  The
+		# same face carrier slot carries the plan's PACKED parent faces and
+		# the store holds parent rows; ``r_start_dyn``/``r_chunk_size`` are
+		# replaced by the tile's slot tables.  See :func:`_z_q_face_parent`.
+		if tile_r_index is None or tile_local_perm is None or tile_wraps is None:
+			raise ValueError(
+				"z_q_from_psi_sm(k_unfold_plan=...) requires tile_r_index=, "
+				"tile_local_perm= and tile_wraps= (gw.centroid_k_unfold."
+				"RealGridOrbitTiles.source_tables).")
+		if gamma_L is not None or gamma_R is not None:
+			raise ValueError(
+				"z_q_from_psi_sm(k_unfold_plan=...): the parent-k route "
+				"owns the charge vertex only; current vertices need the "
+				"Cartesian action (gw.gw_init._resolve_parent_green_admission).")
+		return _z_q_face_parent(
+			psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
+			k_unfold_plan=k_unfold_plan,
+			tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
+			tile_wraps=tile_wraps,
+			band_chunk_ranges=band_chunk_ranges,
+			kgrid=kgrid, mesh_xy=mesh_xy)
 	return _z_q_face(
 		psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
 		gamma_L, gamma_R,
@@ -2799,6 +2949,361 @@ def _z_q_face(
 		perm_L, phase_L, perm_R, phase_R,
 		r_start_arg, psi_G_store.g_index, psi_G_store.kvecs_frac,
 		psi_r_cache)
+
+
+def _band_chunk_compaction(bcr, bpd_max: int, P_total: int):
+	"""Per-chunk Y-side compaction table (and whether it is the identity).
+
+	After ``all_to_all('y')`` + ``all_gather('x')`` every rank holds all P
+	ranks' ``bpd_max`` band slots of one chunk; a chunk narrower than the
+	uniform carrier leaves its real bands at stride ``bpd_max``.  The table
+	maps the compact global band position back to that slot.  Shared by the
+	parent-k kernel; the two full-k kernels keep their own frozen copies.
+	"""
+	n_bc = len(bcr)
+	bpd_max_global = int(bpd_max) * int(P_total)
+	table = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
+	for bc, (lo, hi) in enumerate(bcr):
+		width = int(hi) - int(lo)
+		axis = authenticate_padded_axis(
+			width, width, int(P_total), name=f"parent zeta band chunk {bc}")
+		bpd = axis.carrier // int(P_total)
+		if bpd > int(bpd_max):
+			raise ValueError(
+				f"band chunk {bc} has {bpd} bands/rank, exceeding the "
+				f"allocated maximum {bpd_max}")
+		if bpd <= 0:
+			continue
+		p = np.arange(bpd_max_global)
+		table[bc] = np.where(
+			p < axis.carrier, (p // bpd) * int(bpd_max) + (p % bpd), bpd)
+	identity = bool(n_bc > 0 and np.array_equal(
+		table, np.broadcast_to(
+			np.arange(bpd_max_global, dtype=np.int32),
+			(n_bc, bpd_max_global))))
+	return table, identity
+
+
+def _z_q_face_parent(
+	psi_mun_parent: jax.Array,
+	psi_G_store,
+	psi_r_cache: jax.Array | None,
+	weight_l: jax.Array,
+	weight_r: jax.Array,
+	*,
+	k_unfold_plan,
+	tile_r_index: jax.Array,
+	tile_local_perm: jax.Array,
+	tile_wraps: jax.Array,
+	band_chunk_ranges: tuple[tuple[int, int], ...],
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+) -> jax.Array:
+	r"""Face-layout Z_q on one orbit-closed real-grid tile, from raw parents.
+
+	The pair-density RHS of the ζ fit,
+
+	    Z_q(mu, r) = FFT_k [ IFFT_k(P^L_k)(mu, r)^* · IFFT_k(P^R_k)(mu, r) ],
+	    P^A_k(mu, r) = sum_n w^A_n psi^*_{nk}(mu) psi_{nk}(r),
+
+	needs the pair density at EVERY full-zone k before its two k-transforms,
+	but the band contraction that forms it is only needed on the raw WFN
+	parents: at a child ``k = g·kbar`` the projector is the typed symmetry
+	image of the parent's,
+
+	    D_k = U_g · [ e^{2πi kbar·(L_mu − L_r)} D_kbar(alpha_g(mu), alpha_g(r)) ] · U_g†,
+	    D_k[a, mu, b, r] = sum_n w_n psi_{nka}(mu) psi^*_{nkb}(r) = conj(P_k),
+
+	conjugated once more on antiunitary rows.  That image is a permutation
+	of BOTH endpoints.  Centroids are orbit-packed so ``alpha_g`` stays on
+	one X owner (``gw.centroid_k_unfold``); a contiguous r slab is not
+	closed, so this kernel takes its r endpoint from an orbit-closed tile
+	(``RealGridOrbitTiles``: complete orbits, each whole on one Y owner,
+	owner-local pads) and the gather stays on one Y owner too.  The
+	transport is therefore collective-free, and the tile's tables are
+	RUNTIME operands so every tile reuses one executable.
+
+	Stages, in one compiled program:
+
+	1. ``_projectors`` (manual ``shard_map``): stream the band chunks exactly
+	   as :func:`_z_q_face` does — Y block through the store/cache and the
+	   canonical ``to_rpoints_inner`` gather at the tile's points, then
+	   ``all_to_all('y')`` + ``all_gather('x')``; X block by the same masked
+	   ``psum('y')`` broadcast from ``psi_mun`` — but on ``n_parent`` k rows
+	   and WITHOUT conjugating the X operand, accumulating the open-spin
+	   Green-oriented projectors ``D^L_kbar``, ``D^R_kbar``
+	   ``(n_parent, s, mu_loc, s, r_loc)``.  Both spin pairs are carried
+	   because the spin action mixes them; at parent size that costs less
+	   than one full-k scalar carry.
+	2. ``_tile_tail`` (manual ``shard_map``): for each OUTPUT spin block
+	   ``(a, b)`` — one full-k block live at a time, the memory contract of
+	   the incumbent scalar-pair loop — accumulate
+	   ``sum_{c,d} U[a,c] U^*[b,d] · unfold(D[c,:,d,:])`` through
+	   :func:`symmetry_maps.unfold_operator_local` (gathers, phases,
+	   antiunitary conjugation) and :func:`symmetry_maps.open_spin_block_coefficient`
+	   (the spin representation), conjugate to obtain ``P_k``, k-IFFT both
+	   sides and add ``conj(P^L_R)·P^R_R`` into ``Z_R``; k-FFT once at the end.
+	   No symmetry algebra is written here; both helpers are the service's.
+
+	    psi_mun_parent : (n_parent, s, mu_pk, nb_face) P(None,None,'x','y'),
+	                     orbit-packed, un-conjugated raw-parent ψ(r_mu)
+	    psi_G_store    : ``PsiGStore(k_domain='ibz')`` (parent rows)
+	    psi_r_cache    : optional hoisted parent ψ(r) cache
+	                     (n_bc, n_parent, B_c, s, n_rtot) P(None,None,('x','y'),None,None)
+	    tile_r_index   : (R_t,) int32 flat grid index per slot, -1 pads
+	    tile_local_perm: (2·n_sym, R_t) int32 owner-local r source offsets
+	    tile_wraps     : (2·n_sym, R_t, 3) lattice wraps of the r sources
+	Returns ``Z_q`` (nk_full, mu_pk, R_t) P(None,'x','y'): centroids in the
+	run's packed order, r in the tile's slot order, pad slots exactly zero.
+	Charge channel only (see :func:`_c_q_face_parent`).
+	"""
+	from common.wfn_transforms import to_rpoints_inner
+	from ffi import _services
+	_services.ensure_on_path()
+	from symmetry_maps import (
+		open_spin_block_coefficient, unfold_operator_local)
+
+	plan = k_unfold_plan
+	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
+	n_rtot = int(np.prod(fft_grid))
+	nkx, nky, nkz = kgrid
+	nk = nkx * nky * nkz
+	n_parent, ns, mu_pk, nb_face = (int(v) for v in psi_mun_parent.shape)
+	if int(plan.n_parent) != n_parent or int(plan.n_full) != nk:
+		raise ValueError(
+			"_z_q_face_parent: plan k extents (parent/full) "
+			f"{plan.n_parent}/{plan.n_full} disagree with the operands "
+			f"{n_parent}/{nk}.")
+	if int(plan.n_centroid_packed) != mu_pk or int(plan.nspinor) != ns:
+		raise ValueError(
+			"_z_q_face_parent: psi_mun_parent must be in the plan's packed "
+			f"centroid order with its spin extent; got mu={mu_pk}, s={ns} vs "
+			f"plan {plan.n_centroid_packed}/{plan.nspinor}.")
+	if int(weight_l.shape[0]) != nb_face or int(weight_r.shape[0]) != nb_face:
+		raise ValueError(
+			f"_z_q_face_parent: weight_l/weight_r must have shape ({nb_face},); "
+			f"got {tuple(weight_l.shape)}/{tuple(weight_r.shape)}.")
+	R_t = int(tile_r_index.shape[0])
+	p_x = int(mesh_xy.shape['x'])
+	p_y = int(mesh_xy.shape['y'])
+	authenticate_padded_axis(
+		R_t, R_t, mesh_xy, name="parent zeta real-grid tile carrier",
+		spec=P(None, 'x', 'y'), axis=2)
+	authenticate_padded_axis(
+		nb_face, nb_face, mesh_xy, name="parent zeta band carrier",
+		spec=P(None, 'y', None, 'x'), axis=1)
+	r_loc = R_t // p_y
+	mu_loc = mu_pk // p_x
+	n_rows = 2 * int(plan.n_sym_spatial)
+	if (tuple(int(v) for v in tile_local_perm.shape) != (n_rows, R_t)
+			or tuple(int(v) for v in tile_wraps.shape) != (n_rows, R_t, 3)):
+		raise ValueError(
+			"_z_q_face_parent: tile tables must be (2·n_sym, R_t) and "
+			f"(2·n_sym, R_t, 3) with n_sym={plan.n_sym_spatial}, R_t={R_t}; "
+			f"got {tuple(tile_local_perm.shape)}/{tuple(tile_wraps.shape)}.")
+
+	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
+	if not bcr:
+		raise ValueError("_z_q_face_parent: band_chunk_ranges is empty")
+	_bfs = bcr[0][0]
+	use_psi_r_cache = psi_r_cache is not None
+	from runtime.padding import mesh_divisor
+	P_total = mesh_divisor(mesh_xy)
+	local_band_chunk_shape = tuple(
+		int(v) for v in psi_G_store.local_band_chunk_shape)
+	if local_band_chunk_shape[0] != n_parent or local_band_chunk_shape[2] != ns:
+		raise ValueError(
+			"_z_q_face_parent: PsiGStore must hold the raw parent rows "
+			"(k_domain='ibz') with the carrier's spin extent: "
+			f"store={local_band_chunk_shape}, n_parent={n_parent}, ns={ns}")
+	bpd_max = int(local_band_chunk_shape[1])
+	bpd_max_global = int(psi_G_store.band_chunk_carrier)
+	if bpd_max_global != bpd_max * P_total:
+		raise ValueError(
+			"_z_q_face_parent: PsiGStore carrier metadata is inconsistent: "
+			f"band_chunk_carrier={bpd_max_global}, local width={bpd_max}, "
+			f"world_size={P_total}")
+	n_bc = len(bcr)
+	_y_compact_idx_np, _y_compact_identity = _band_chunk_compaction(
+		bcr, bpd_max, P_total)
+	_b_lo_rel_np = np.asarray([lo - _bfs for (lo, _hi) in bcr], dtype=np.int32)
+	_b_hi_rel_np = np.asarray([hi - _bfs for (_lo, hi) in bcr], dtype=np.int32)
+	ngkmax = int(local_band_chunk_shape[3])
+	_slicer_out_sds = jax.ShapeDtypeStruct(
+		(n_parent, bpd_max, ns, ngkmax), jnp.complex128)
+
+	def _slicer_host(x_idx, y_idx, bc_idx):
+		return psi_G_store.read_local_band_chunk(x_idx, y_idx, bc_idx)
+
+	# Plan tables are closure constants (one plan per fit); the tile tables
+	# are runtime operands (one executable for every tile).
+	irr_idx_np = np.asarray(plan.irr_idx, dtype=np.int32)
+	sym_idx_np = np.asarray(plan.sym_idx, dtype=np.int32)
+	k_parent_np = np.asarray(plan.k_parent_frac, dtype=np.float64)
+	left_local_perm_np = np.asarray(plan.centroid_local_perm, dtype=np.int32)
+	left_L_np = np.asarray(plan.L_table, dtype=np.float64)
+	spin_np = np.asarray(plan.spin_action_full, dtype=np.complex128)
+	n_sym_spatial = int(plan.n_sym_spatial)
+
+	mun_spec = P(None, None, 'x', 'y')
+	pair_spec = P(None, None, 'x', None, 'y')
+	out_spec = P(None, 'x', 'y')
+	w_spec = P(None)
+	cache_spec = P(None, None, ('x', 'y'), None, None)
+
+	cache_key = (
+		'z_q_face_parent', id(mesh_xy), id(psi_G_store), id(plan),
+		n_parent, ns, mu_pk, nb_face, R_t, nkx, nky, nkz, bcr,
+		use_psi_r_cache,
+		(None if psi_r_cache is None
+		 else tuple(int(s) for s in psi_r_cache.shape)),
+	)
+	if cache_key not in _pair_pipeline_sm_cache:
+
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(mun_spec, w_spec, w_spec, P(), P(), P(None, None),
+		                   cache_spec),
+		         out_specs=(pair_spec, pair_spec), check_vma=False)
+		def _projectors(psi_mun_, w_l_, w_r_, r_index_, g_index_dev,
+		                kvecs_frac_dev, psi_r_cache_):
+			x_idx = jax.lax.axis_index('x')
+			y_idx = jax.lax.axis_index('y')
+			shard_w = psi_mun_.shape[3]
+			b_lo_rel_arr = jnp.asarray(_b_lo_rel_np)
+			b_hi_rel_arr = jnp.asarray(_b_hi_rel_np)
+			if not _y_compact_identity:
+				y_compact_idx = jnp.asarray(_y_compact_idx_np)
+			active = (r_index_ >= 0)
+			safe_r = jnp.clip(r_index_, 0, n_rtot - 1)
+
+			def load_y_block(bc_idx):
+				"""ψ_kbar(r) at the tile's slots, all bands of one chunk,
+				this rank's Y slab: the incumbent transaction on parent rows
+				with the arbitrary-point gather in place of the slab slice."""
+				if use_psi_r_cache:
+					slab = jnp.take(psi_r_cache_[bc_idx], safe_r, axis=-1)
+				else:
+					psi_G_bc = _io_callback(
+						_slicer_host, _slicer_out_sds,
+						x_idx, y_idx, bc_idx, ordered=False)
+					slab = to_rpoints_inner(
+						psi_G_bc, g_index_dev, fft_grid, r_index_,
+						kvecs_frac=kvecs_frac_dev, norm="ortho")
+				slab = jnp.where(active[None, None, None, :], slab, 0)
+				col = jax.lax.all_to_all(
+					slab, 'y', split_axis=3, concat_axis=1, tiled=True)
+				blk = jax.lax.all_gather(col, axis_name='x', axis=1, tiled=True)
+				if not _y_compact_identity:
+					blk = jnp.take(blk, y_compact_idx[bc_idx], axis=1)
+				return blk                       # (p, bc_global, s, r_loc)
+
+			def load_x_block(bc_idx):
+				"""ψ_kbar(r_mu) for one band chunk, un-conjugated (the
+				Green-oriented projector's direct operand), broadcast from
+				its owning y rank by the same masked psum as _z_q_face."""
+				p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
+				global_band = b_lo_rel_arr[bc_idx] + p_arr
+				owner_y = global_band // shard_w
+				local_idx = jnp.clip(
+					global_band - y_idx * shard_w, 0, shard_w - 1)
+				gathered = jnp.take(psi_mun_, local_idx, axis=3)
+				gathered = jnp.where(
+					(owner_y == y_idx)[None, None, None, :], gathered, 0)
+				return jax.lax.psum(gathered, 'y')   # (p, s, mu_loc, bc_global)
+
+			def band_body(carry, bc_idx):
+				D_l_acc, D_r_acc = carry
+				y_conj = jnp.conj(load_y_block(bc_idx))   # (p, n, b, r)
+				x = load_x_block(bc_idx)                    # (p, a, m, n)
+				p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
+				global_band = b_lo_rel_arr[bc_idx] + p_arr
+				bc_valid = global_band < b_hi_rel_arr[bc_idx]
+				g_clamped = jnp.clip(global_band, 0, nb_face - 1)
+				w_l_bc = jnp.where(bc_valid, jnp.take(w_l_, g_clamped), 0.0)
+				w_r_bc = jnp.where(bc_valid, jnp.take(w_r_, g_clamped), 0.0)
+				x_l = x * w_l_bc[None, None, None, :].astype(x.dtype)
+				x_r = x * w_r_bc[None, None, None, :].astype(x.dtype)
+				D_l_acc = D_l_acc + jnp.einsum(
+					'kamn,knbr->kambr', x_l, y_conj, optimize=True)
+				D_r_acc = D_r_acc + jnp.einsum(
+					'kamn,knbr->kambr', x_r, y_conj, optimize=True)
+				return (D_l_acc, D_r_acc), None
+
+			zeros = jnp.zeros(
+				(n_parent, ns, mu_loc, ns, r_loc), dtype=jnp.complex128)
+			(D_l, D_r), _ = jax.lax.scan(
+				band_body, (zeros, zeros),
+				jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+			return D_l, D_r
+
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(pair_spec, pair_spec, P(None, None),
+		                   P(None, None, None)),
+		         out_specs=out_spec, check_vma=False)
+		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_):
+			def unfold_block(D_, coef):
+				"""One full-k output spin block of P = conj(U D U†)."""
+				acc = None
+				for c in range(ns):
+					for d in range(ns):
+						S = unfold_operator_local(
+							D_[:, c, :, d, :],
+							irr_idx=irr_idx_np, sym_idx=sym_idx_np,
+							q_irr_frac=k_parent_np,
+							left_local_perm=left_local_perm_np,
+							left_L_table=left_L_np,
+							right_local_perm=local_perm_r_,
+							right_L_table=wraps_r_,
+							n_sym_spatial=n_sym_spatial)
+						term = coef[:, c, d][:, None, None] * S
+						acc = term if acc is None else acc + term
+				return jnp.conj(acc)             # (nk, mu_loc, r_loc)
+
+			# A scan keeps one output spin block live, rather than unrolling
+			# four full-k IFFT pairs into the same executable/live set.
+			coefficients = jnp.stack([
+				open_spin_block_coefficient(spin_np, a, b)
+				for a in range(ns) for b in range(ns)])
+
+			def spin_body(Z_R, coef):
+				P_l_R = local_ifftn3(
+					unfold_block(D_l_, coef).reshape(
+						nkx, nky, nkz, mu_loc, r_loc),
+					axes=(0, 1, 2), norm='forward')
+				P_r_R = local_ifftn3(
+					unfold_block(D_r_, coef).reshape(
+						nkx, nky, nkz, mu_loc, r_loc),
+					axes=(0, 1, 2), norm='forward')
+				return Z_R + jnp.conj(P_l_R) * P_r_R, None
+
+			Z_R, _ = jax.lax.scan(
+				spin_body, jnp.zeros(
+					(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
+				coefficients, unroll=1)
+			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
+			return Z_q_3d.reshape(nk, mu_loc, r_loc)
+
+		@jax.jit
+		def fn(psi_mun_, w_l_, w_r_, r_index_, local_perm_r_, wraps_r_,
+		        g_index_, kvecs_frac_, psi_r_cache_):
+			D_l, D_r = _projectors(
+				psi_mun_, w_l_, w_r_, r_index_, g_index_, kvecs_frac_,
+				psi_r_cache_)
+			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_)
+
+		_pair_pipeline_sm_cache[cache_key] = fn
+
+	if psi_r_cache is None:
+		psi_r_cache = jnp.zeros(
+			(1, 1, P_total, 1, 1), dtype=jnp.complex128)
+	return _pair_pipeline_sm_cache[cache_key](
+		psi_mun_parent,
+		jnp.asarray(weight_l, dtype=jnp.float64),
+		jnp.asarray(weight_r, dtype=jnp.float64),
+		jnp.asarray(tile_r_index, dtype=jnp.int32),
+		jnp.asarray(tile_local_perm, dtype=jnp.int32),
+		jnp.asarray(tile_wraps, dtype=jnp.float64),
+		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache)
 
 
 def _z_q_face_coupled_mu123(
@@ -6707,6 +7212,7 @@ def _make_fit_one_rchunk_kernel(
     layout: str = "legacy",
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    k_unfold_plan=None,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` carrying
@@ -6751,11 +7257,22 @@ def _make_fit_one_rchunk_kernel(
     decision; it is static, cache-keyed, and has no frontend/env spelling.
     ``face_y_cache_r_tile`` is its bounded internal global-r tile; zero means
     the full outer chunk for compatibility.
+
+    ``k_unfold_plan`` (face layout only) switches ``z_q_phase`` to the
+    raw-parent route: ``psi_mun`` is then the plan's PACKED parent face, the
+    store holds parent rows, and the r "chunk" is one orbit-closed tile whose
+    slot tables arrive as runtime operands (:func:`_z_q_face_parent`).  The
+    resulting ``Z_q`` has its centroid axis in packed order; ``solve_phase``
+    restores canonical order right after the q selection, before the solve.
     """
     if layout not in ("legacy", "face"):
         raise ValueError(
             f"_make_fit_one_rchunk_kernel: layout must be 'legacy' or "
             f"'face', got {layout!r}")
+    if k_unfold_plan is not None and layout != "face":
+        raise ValueError(
+            "_make_fit_one_rchunk_kernel: the raw-parent route needs the "
+            "face carrier (low_mem_bands=true).")
     nk_tot = meta.nk_tot
     vertex_mu_L = int(vertex_mu_L)
     if vertex_mu_L < 0 or vertex_mu_L > 3:
@@ -6808,8 +7325,23 @@ def _make_fit_one_rchunk_kernel(
         psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
         norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase,
         psi_r_cache, psi_mun=None, weight_l=None, weight_r=None,
+        tile_r_index=None, tile_local_perm=None, tile_wraps=None,
     ):
-        if layout == "face":
+        if k_unfold_plan is not None:
+            Z_q = z_q_from_psi_sm(
+                psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
+                band_chunk_ranges=band_chunk_ranges,
+                r_start_dyn=r_start_dyn,
+                r_chunk_size=actual_n_rchunk,
+                kgrid=kgrid, mesh_xy=mesh_xy,
+                layout="face", psi_mun=psi_mun,
+                weight_l=weight_l, weight_r=weight_r,
+                k_unfold_plan=k_unfold_plan,
+                tile_r_index=tile_r_index,
+                tile_local_perm=tile_local_perm,
+                tile_wraps=tile_wraps,
+            )
+        elif layout == "face":
             # low_mem_bands=True: the band-contraction operand is read
             # per-bc out of the persistent face carrier (psi_mun),
             # never a resident single-axis array — see _z_q_face.
@@ -6873,15 +7405,15 @@ def _make_fit_one_rchunk_kernel(
         # preserves that JIT's numerical lowering and bit identity.
         if q_irr_idx_j is not None and int(Z_q.shape[0]) == int(meta.nk_tot):
             Z_q = Z_q[q_irr_idx_j]
-        # ``n_rmu_logical=meta.n_rmu``: the per-q dense solves run at
-        # the LOGICAL μ extent (ζ pad rows zero-filled after) so ζ is
-        # independent of the pad extent / device count.  See
-        # solve_zeta's n_rmu_logical docstring.
+        # ``n_rmu_logical=meta.mu_solve_extent``: the per-q dense solves
+        # run at the LOGICAL μ extent (ζ pad rows zero-filled after) when
+        # the pads are a suffix, and at the whole packed carrier (identity
+        # on the pad diagonal, zero pad rows in Z) when they are interleaved.
         return solve_zeta(
             L_q, Z_q, mesh_xy, q_chunk_size,
             solver_kind=solver_kind,
             cct_trace_per_q=cct_trace_per_q,
-            n_rmu_logical=int(meta.n_rmu),
+            n_rmu_logical=int(getattr(meta, 'mu_solve_extent', meta.n_rmu)),
             zeta_gather=zeta_gather,
             lu_piv=lu_piv,
             distrib_la_batched_route=distrib_la_batched_route)
@@ -6902,6 +7434,9 @@ def _make_fit_one_rchunk_kernel(
         psi_mun=None,
         weight_l=None,
         weight_r=None,
+        tile_r_index=None,
+        tile_local_perm=None,
+        tile_wraps=None,
     ):
         # Composed (z_q ∘ solve) under one ``@jax.jit`` — preserved for
         # the AOT memory model path which lowers a single callable.
@@ -6921,7 +7456,8 @@ def _make_fit_one_rchunk_kernel(
         Z_q = z_q_phase(
             psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
             norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase,
-            psi_r_cache, psi_mun, weight_l, weight_r)
+            psi_r_cache, psi_mun, weight_l, weight_r,
+            tile_r_index, tile_local_perm, tile_wraps)
         return solve_phase(Z_q, L_q, cct_trace_per_q,
                            lu_piv if lu_hoisted else None)
 
@@ -6964,6 +7500,10 @@ def fit_one_rchunk(
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
     _prebuilt_Z_q: jax.Array | None = None,
+    k_unfold_plan=None,
+    tile_r_index: jax.Array | None = None,
+    tile_local_perm: jax.Array | None = None,
+    tile_wraps: jax.Array | None = None,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -6998,6 +7538,12 @@ def fit_one_rchunk(
             raise ValueError(
                 "fit_one_rchunk(layout='face') requires psi_mun=, "
                 "weight_l= and weight_r=.")
+    if k_unfold_plan is not None and (
+            tile_r_index is None or tile_local_perm is None
+            or tile_wraps is None):
+        raise ValueError(
+            "fit_one_rchunk(k_unfold_plan=...) requires the tile's slot "
+            "tables: tile_r_index=, tile_local_perm=, tile_wraps=.")
     # conv_kpair passes the monomial gamma as FFI attributes, so the Lorentz
     # channel is structural and keys the cache.  The historical runtime gamma
     # operands remain in the callable ABI, but the native post-pair path uses
@@ -7040,6 +7586,7 @@ def fit_one_rchunk(
         str(layout),
         bool(_cache_y_blocks),
         int(_cache_y_r_tile),
+        id(k_unfold_plan),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -7069,6 +7616,7 @@ def fit_one_rchunk(
             layout=str(layout),
             cache_face_y_blocks=bool(_cache_y_blocks),
             face_y_cache_r_tile=int(_cache_y_r_tile),
+            k_unfold_plan=k_unfold_plan,
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -7097,7 +7645,8 @@ def fit_one_rchunk(
                 psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
                 norms_l, norms_r, r_start_dyn,
                 gamma_perm, gamma_phase, psi_r_cache,
-                psi_mun, weight_l, weight_r)
+                psi_mun, weight_l, weight_r,
+                tile_r_index, tile_local_perm, tile_wraps)
             # Keep the full-domain charge completion inside z_q_phase, but
             # select in this separate scheduling operation before the outer
             # wait.  Putting the take inside the compiled physics producer

@@ -48,6 +48,7 @@ a consumer from ever being reached under ``low_mem_bands = true``).
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 from dataclasses import dataclass
 
@@ -272,7 +273,14 @@ _LAYOUTS = ('legacy', 'face')
 
 @dataclass
 class ParentGreenCarrier:
-    """Orbit-packed raw-parent operands for Green-function contractions."""
+    """Raw-parent operands for Green contractions and band projections.
+
+    ``psi_nmu``/``psi_mun`` are the raw WFN parent rows in the run's
+    orbit-packed centroid order (the one in-memory order, so the plan's
+    unfold is collective-free and every full-k operator -- Σ_k after the FFT
+    convolution, V, W -- projects onto them directly).  ``n_parent`` k rows:
+    the parent carrier holds no full-k wavefunction.
+    """
 
     psi_nmu: jax.Array
     psi_mun: jax.Array
@@ -309,6 +317,11 @@ class Wavefunctions:
     :func:`build_wavefunctions_face` (face) rather than this dataclass
     directly — both name every field explicitly, including the ``None``
     half, so a caller cannot omit the layout tag's inverse by accident.
+
+    Under ``layout = "face"`` BOTH faces are also ``None`` when the run
+    stores raw parents only (``gw_init`` parents-only storage): the
+    ``green_parent`` carrier is then every ψ the run has, and
+    :func:`face_extents` reads the full-k extents from it.
     """
 
     enk: jax.Array       # (nk, nb_full) replicated
@@ -334,9 +347,8 @@ class Wavefunctions:
     # ---- face (two 2-D-sharded copies); None under layout="legacy" -----
     psi_nmu: jax.Array | None = None  # (nk, n_X, s, μ_Y)
     psi_mun: jax.Array | None = None  # (nk, s, μ_X, n_Y)
-    #: Optional raw-parent, orbit-packed operands.  This is an acceleration
-    #: carrier only; all observable/runtime operators remain in the primary
-    #: bundle's canonical full-k basis until their own packed seam lands.
+    #: Raw-parent faces in the same packed centroid order as every operator.
+    #: They are the only stored faces when all consumers support parents.
     green_parent: ParentGreenCarrier | None = None
     #: STATIC (pytree meta, never traced).  "legacy" | "face".
     layout: str = "legacy"
@@ -536,6 +548,33 @@ class AuthenticatedWavefunctions:
             self.wavefunctions, where="AuthenticatedWavefunctions")
 
 
+def face_extents(wfns: "Wavefunctions") -> tuple[int, int, int]:
+    """``(nk_full, nspinor, mu_padded)`` of a face bundle.
+
+    Read off ``psi_mun`` when the full-k faces exist; when the run stores
+    raw parents only (``gw_init`` parents-only storage: both faces
+    ``None``), off the parent carrier -- its plan names the full-k row
+    count and its faces carry the padded centroid extent every full-k
+    operator is stored at.  Every full-k shape a kernel factory
+    sizes itself by comes through here, so a parents-only bundle looks to
+    the factories exactly like a full-k one.
+    """
+    if wfns.layout != "face":
+        raise ValueError(
+            f"face_extents: layout={wfns.layout!r} carries no face.")
+    if wfns.psi_mun is not None:
+        nk, s, mu, _ = wfns.psi_mun.shape
+        return int(nk), int(s), int(mu)
+    carrier = wfns.green_parent
+    if carrier is None:
+        raise ValueError(
+            "face_extents: this face bundle holds no full-k faces and no "
+            "parent carrier; nothing names its shape.")
+    return (int(carrier.plan.n_full), int(carrier.psi_mun.shape[1]),
+            int(carrier.psi_mun.shape[2]))
+
+
+
 def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
     """``{}`` under ``layout='legacy'``; ``{"layout": "face", "face_shape":
     (nk, nb_full, n_rmu, nspinor)}`` under ``layout='face'``.  With a
@@ -563,8 +602,8 @@ def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
             f"{wfns.layout!r} vs {wfns_right.layout!r}")
     if wfns.layout != "face":
         return {}
-    nk, s, mu, _ = wfns.psi_mun.shape
-    nk_r, s_r, mu_r, _ = wfns_right.psi_mun.shape
+    nk, s, mu = face_extents(wfns)
+    nk_r, s_r, mu_r = face_extents(wfns_right)
     left_shape = (nk, wfns.slices.nb_full, mu, s)
     right_shape = (nk_r, wfns_right.slices.nb_full, mu_r, s_r)
     result = {"layout": "face", "face_shape": left_shape}
@@ -597,24 +636,66 @@ def green_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
     }
 
 
-def pack_parent_green_faces(
-    psi_rmu_Y_parent, psi_rmuT_X_parent, *, plan, mesh_xy: Mesh,
+def sigma_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
+    """:func:`face_kernel_kwargs` plus the carrier's ``k_unfold_plan``.
+
+    ``face_shape`` names the full-k accumulator. The existing plan owns the
+    parent count, parent rows and symmetry action used for both Green
+    contraction and band projection. Factories retain the plan as an identity
+    cache key; no per-call route copies its tables or shapes.
+    """
+    result = face_kernel_kwargs(wfns)
+    carrier = wfns.green_parent
+    if (not result or carrier is None
+            or getattr(carrier.plan, 'parent_full_rows', None) is None
+            or getattr(carrier.plan, 'sym', None) is None):
+        return result
+    result["k_unfold_plan"] = carrier.plan
+    return result
+
+
+def parent_sigma_operands(wfns: "Wavefunctions"):
+    """The Σ kernel operands of the parent route, in the kernels' slot order.
+
+    ``(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, enk, occ)``: the
+    parent faces for the G contraction (first operand direct, second
+    conjugated inside ``build_G``), the same faces for the band projection
+    (first operand conjugated inside the projector), and the parent-row
+    energy/occupation tables.  Same six roles the full-k face call sites
+    fill from ``wfns`` itself.
+    """
+    carrier = wfns.green_parent
+    if carrier is None:
+        raise ValueError(
+            "parent_sigma_operands: the bundle carries no parent carrier.")
+    return (carrier.psi_mun, carrier.psi_nmu,
+            carrier.psi_nmu, carrier.psi_mun,
+            carrier.enk, carrier.occ)
+
+
+def parent_faces(
+    psi_rmu_Y_parent, psi_rmuT_X_parent, *, mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array]:
-    """Convert raw-parent loader outputs to the orbit-packed face layout."""
+    """Raw-parent loader outputs as the two face layouts.
+
+    The same two constraints :func:`build_wavefunctions_face` applies to the
+    full-k load, on ``n_parent`` rows.  The loader already sampled the run's
+    packed centroid order, so nothing is permuted here.
+    """
     with mesh_xy:
         psi_nmu = jax.lax.with_sharding_constraint(
             psi_rmu_Y_parent, NamedSharding(mesh_xy, PSI_NMU_SPEC))
         psi_mun = jax.lax.with_sharding_constraint(
             jnp.conj(psi_rmuT_X_parent).transpose(0, 3, 1, 2),
             NamedSharding(mesh_xy, PSI_MUN_SPEC))
-        return plan.pack_face_pair(psi_nmu, psi_mun)
+    return psi_nmu, psi_mun
 
 
 def build_packed_parent_green_carrier(
     wfns: "Wavefunctions", psi_nmu_parent, psi_mun_parent, *, plan,
     mesh_xy: Mesh,
 ) -> ParentGreenCarrier:
-    """Bind packed raw-parent faces to the full-k bundle's scalar tables."""
+    """Bind raw-parent faces to the full-k bundle's scalar tables."""
     if wfns.layout != "face":
         raise ValueError(
             "build_packed_parent_green_carrier requires layout='face'; "
@@ -662,9 +743,9 @@ def attach_parent_green_carrier(
     wfns: "Wavefunctions", psi_rmu_Y_parent, psi_rmuT_X_parent, *, plan,
     mesh_xy: Mesh,
 ) -> "Wavefunctions":
-    """Pack and attach raw-parent loader outputs to a face bundle."""
-    psi_nmu, psi_mun = pack_parent_green_faces(
-        psi_rmu_Y_parent, psi_rmuT_X_parent, plan=plan, mesh_xy=mesh_xy)
+    """Attach raw-parent loader outputs to a face bundle."""
+    psi_nmu, psi_mun = parent_faces(
+        psi_rmu_Y_parent, psi_rmuT_X_parent, mesh_xy=mesh_xy)
     return attach_packed_parent_green_carrier(
         wfns, psi_nmu, psi_mun, plan=plan, mesh_xy=mesh_xy)
 
@@ -777,7 +858,7 @@ def padded_centroid_extent(wfns: "Wavefunctions") -> int:
     if wfns.layout == "legacy":
         return int(wfns.psi_yr.shape[-1])
     if wfns.layout == "face":
-        return int(wfns.psi_mun.shape[2])
+        return face_extents(wfns)[2]
     raise ValueError(
         f"padded_centroid_extent: unknown layout {wfns.layout!r}")
 
@@ -821,6 +902,8 @@ def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
     if wfns.green_parent is not None:
         for f in ("psi_nmu", "psi_mun"):
             arr = getattr(wfns.green_parent, f)
+            if arr is None:
+                continue
             out[f"green_parent.{f}"] = int(sum(
                 int(s.data.nbytes) for s in arr.addressable_shards))
     out["total"] = int(sum(out.values()))
@@ -1655,9 +1738,28 @@ def _rotate_wavefunctions_face(
         fk = face_kernel_kwargs(wfns_dft)
         nk_face, nb_full, n_rmu, ns = fk['face_shape']
         U = _place_U_face(U_dft_to_qp_active, mesh_xy)
-        rotate = _face_rotate_kernel(
-            mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
-        psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
+        psi_nmu = psi_mun = None
+        carrier_rotated = None
+        if wfns_dft.psi_nmu is not None:
+            rotate = _face_rotate_kernel(
+                mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
+            psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
+            if wfns_dft.green_parent is not None:
+                # A carrier beside full-k faces (the self-consistent map
+                # keeps both) rotates with them, so every iteration's
+                # screening and Sigma take the same route as iteration 0.
+                carrier_rotated = _rotate_parent_carrier(
+                    wfns_dft.green_parent, U, a_lo=a_lo, nb_active=nb_active,
+                    nb_full=nb_full, ns=ns, mesh_xy=mesh_xy)
+        else:
+            # Parents-only storage: the carrier is the run's only ψ.  Rotate
+            # its faces with U on the parents' OWN full-k rows -- the
+            # transported child basis is the parent basis, so the map's
+            # rotation at a child row is the parent's (conjugated on
+            # antiunitary rows, which the carrier never materializes).
+            carrier_rotated = _rotate_parent_carrier(
+                wfns_dft.green_parent, U, a_lo=a_lo, nb_active=nb_active,
+                nb_full=nb_full, ns=ns, mesh_xy=mesh_xy)
 
         # enk/occ: SAME expression as the legacy sibling (layout-independent
         # — enk/occ are always P(None,None) replicated regardless of ψ
@@ -1680,10 +1782,49 @@ def _rotate_wavefunctions_face(
             _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
 
     # As above, the host DFT binding cannot follow a QP-rotated carrier.
-    return Wavefunctions(
+    rotated = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
         enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout='face',
     )
+    if carrier_rotated is None:
+        return rotated
+    packed_nmu, packed_mun, plan = carrier_rotated
+    return dataclasses.replace(
+        rotated,
+        green_parent=build_packed_parent_green_carrier(
+            rotated, packed_nmu, packed_mun, plan=plan, mesh_xy=mesh_xy))
+
+
+def _rotate_parent_carrier(carrier, U_placed, *, a_lo, nb_active, nb_full,
+                           ns, mesh_xy):
+    """Rotate a :class:`ParentGreenCarrier`'s two faces on the parent rows.
+
+    ``U_placed`` is the FULL-k placed active rotation; its rows at
+    ``plan.parent_full_rows`` are the parents' own.  The face pair goes
+    through :func:`_face_rotate_kernel` at ``nk = n_parent``.  Returns the
+    rotated faces and the plan; the caller rebinds them to the rotated
+    bundle's energy/occupation tables.
+    """
+    if carrier is None:
+        raise ValueError(
+            "rotate_wavefunctions: a face bundle without full-k faces needs "
+            "a parent carrier to rotate.")
+    plan = carrier.plan
+    rows = getattr(plan, 'parent_full_rows', None)
+    if rows is None:
+        raise ValueError(
+            "rotate_wavefunctions: the parent plan names no full-k rows "
+            "(hand-assembled plan); cannot select the parents' rotation.")
+    U_par = jax.lax.with_sharding_constraint(
+        jnp.take(U_placed, jnp.asarray(np.asarray(rows), dtype=jnp.int32),
+                 axis=0),
+        NamedSharding(mesh_xy, P(None, None, None)))
+    n_parent = int(plan.n_parent)
+    rot = _face_rotate_kernel(
+        mesh_xy, a_lo, nb_active, nb_full, int(plan.n_centroid_packed), ns,
+        n_parent)
+    packed_nmu, packed_mun = rot(carrier.psi_nmu, carrier.psi_mun, U_par)
+    return packed_nmu, packed_mun, plan
 
 
 def rotate_wavefunctions(

@@ -389,6 +389,11 @@ def extra_mu_pad() -> int:
 
     NEVER set this in production runs — it only wastes memory at best
     and, before the pad-extent fixes, changed answers at worst.
+
+    Since the orbit-packed in-memory centroid order (2026-09-05,
+    ``common.centroid_basis``) the knob sizes only the CANONICAL carrier
+    files are read and written at; the in-memory extent is the packed
+    layout's and does not move with it.
     """
     import os
     raw = os.environ.get("LORRAX_EXTRA_MU_PAD", "").strip()

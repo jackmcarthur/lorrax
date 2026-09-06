@@ -6,8 +6,8 @@ modulus, a least common multiple, or a rounded carrier extent.
 
 ## Contract
 
-Every mesh-padded axis has one `PaddedAxis(name, logical, carrier, divisor)`
-receipt. The producer obtains it with `padded_axis` (or the centroid-specific
+A prefix followed by suffix padding has one
+`PaddedAxis(name, logical, carrier, divisor)` receipt. The producer obtains it with `padded_axis` (or the centroid-specific
 `padded_mu_axis`) and creates the carrier with `pad_to_axis`, `pad_axis`, or
 `pad_square`. Padding is exact zero unless the numerical object requires an
 inert diagonal sentinel, such as a BSE energy or an eigensolver matrix.
@@ -34,11 +34,31 @@ Controlled invariance tests may request an extra pad from the owner. Consumers
 authenticate that explicit producer receipt, including its larger carrier,
 instead of reconstructing the minimum from the divisor alone.
 
-Dense solves run on the logical block through `solve_at_logical`; padding an
-ill-conditioned operator and solving the larger system is not an equivalent
-operation. A consumer may refuse only when padding is not mathematically inert,
+For suffix-padded axes, dense solves run on the logical block through
+`solve_at_logical`; padding an ill-conditioned operator and solving the larger
+system can change conditioning. Orbit-packed centroids are a separate case:
+`PackedCentroidBasis` owns their active-slot map and complete solve extent.
+A consumer may refuse only when padding is not mathematically inert,
 or when a supplied logical extent exceeds its carrier. Error messages name the
 axis and both extents; they do not prescribe internal helper calls to users.
+
+## Orbit-packed runtime centroids
+
+GW's `meta.mu_basis` owns the grouped layout and its active-slot map. Physical
+centroids can lie after an interior pad, so neither `strip_axis` nor a logical
+prefix mask describes that order. `basis.solve_axis` names the full packed
+solve extent; `meta.n_rmu` remains the physical count. The C_q pad diagonal
+uses the physical mean diagonal so artificial unit modes do not set the
+rank-truncation cutoff. This does not make conditioning diagnostics a count
+of physical modes; that distinction remains relevant when auditing a factor.
+
+Files store canonical logical rows. Their suffix-padded I/O staging carrier
+uses `padded_mu_axis` and may be smaller or larger than the packed carrier.
+Only the basis conversion seam moves between them. The loader, q tables and
+Dyson geometry consume the packed extent directly; `LORRAX_EXTRA_MU_PAD`
+changes canonical staging, not a nonidentity orbit layout. Identity/no-basis
+channels retain the suffix contract. Transverse metadata must not inherit a
+charge basis belonging to a different centroid table.
 
 ## Owned axis families
 
@@ -47,7 +67,7 @@ axis and both extents; they do not prescribe internal helper calls to users.
 | loaded, χ, ζ and packed band windows | `Meta`, WFN loading, ζ fitting, and `pack_band_window` | band slices plus `PaddedAxis` | masks retain the requested interval; projection/output uses the logical slice |
 | Σ band window | `sigma_band_axis` before the projected operands enter MPA/GN-PPM | `SigmaOmegaResult.band_axis` → `SigmaResult.sigma_band_axis` | QP, QSGW, SC, `eqp.dat`, and `sigma.h5` strip from that receipt |
 | SC/QP protected square matrices | rotation/history producers | one receipt shared by both matrix axes | sentinel/identity pad is removed after eigensolve or at the QP boundary |
-| charge and transverse centroids | centroid/WFN/V producers and `PhotonBasisLayout.channel_axes` | `Meta.n_rmu` or each channel's `PaddedAxis` | contractions mask; Dyson solves slice logical; restart/output stores logical shapes |
+| charge and transverse centroids | `PackedCentroidBasis`, canonical loaders and `PhotonBasisLayout.channel_axes` | basis active map / solve receipt, or a suffix `PaddedAxis` | packed solves retain the carrier; suffix solves use the prefix; restart/output stores canonical logical shapes |
 | q batches | screening, ζ, BSE and interpolation batch producers | local `PaddedAxis` held for the batch lifetime | the final q result is sliced to the requested q count |
 | band and real-space chunks | chunk planner/stream producer | a per-chunk `PaddedAxis` | masks/slices discard only the tail of the final chunk |
 

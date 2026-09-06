@@ -40,6 +40,8 @@ _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 #: single callable, since 2026-08-15: the W-only half is hoistable and the
 #: band-bracket loop hoists it.
 _sigma_spatial_kernel_cache: dict[tuple[object, ...], "SpatialKernel"] = {}
+
+
 _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
@@ -100,8 +102,21 @@ def _fft_ffi_fused_enabled() -> bool:
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = False,
     layout: str = "legacy", face_shape=None, face_band_extent=None,
+    k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
     """Build the shard_map'd ψ* σ ψ projector that reduce-scatters the output.
+
+    ``k_unfold_plan`` (:class:`gw.centroid_k_unfold.CentroidKUnfoldPlan`,
+    face layout only): the projector's ψ operands are the packed raw-
+    parent faces, so the full-k operator is first selected on the parents'
+    own full-k rows, projected there (GEMM plans at ``n_parent`` rows), and
+    the band matrix is broadcast back to full k by the typed band-index
+    unfold (transposed on time-reversed rows: Σ transforms like G).  The
+    returned callable keeps
+    the same ``(psi_xr, sigma_k, psi_yn) -> (nk, m, n)`` contract.  Only the
+    merged single-complex chain is offered on this route: the split
+    (Re σ, Im σ) channels transform differently under time reversal and no
+    caller selects them.
 
     ``layout='face'`` (2026-08-22, the dynamic PPM/MPA Σ_c(τ) face port):
     routes through ``common.contract_bands.contract_bands_block_reshard(
@@ -210,13 +225,37 @@ def _make_project_ri_reduce_scatter(
     """
     from common.contract_bands import contract_bands_block_reshard
 
-    return contract_bands_block_reshard(
-        mesh_xy,
-        channels=("none" if merged_x else "split_reim"),
-        layout=layout,
-        face_shape=face_shape,
-        face_band_extent=face_band_extent,
-    )
+    if k_unfold_plan is None:
+        return contract_bands_block_reshard(
+            mesh_xy,
+            channels=("none" if merged_x else "split_reim"),
+            layout=layout,
+            face_shape=face_shape,
+            face_band_extent=face_band_extent,
+        )
+    if layout != "face" or not merged_x:
+        raise ValueError(
+            "_make_project_ri_reduce_scatter(k_unfold_plan=...) requires the "
+            "face layout and the merged single-complex projection chain.")
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import unfold_file_wedge_band_operator
+    inner = contract_bands_block_reshard(
+        mesh_xy, channels="none", layout="face",
+        face_shape=(k_unfold_plan.n_parent, *face_shape[1:]),
+        face_band_extent=face_band_extent)
+    k_rows = np.asarray(k_unfold_plan.parent_full_rows, dtype=np.int32)
+    sym = k_unfold_plan.sym
+
+    def project(psi_xr, sigma_k, psi_yn):
+        sigma_parent = jnp.take(sigma_k, jnp.asarray(k_rows), axis=0)
+        # Σ transforms like G: the band matrix is TRANSPOSED on antiunitary
+        # rows (unfold_file_wedge_band_operator's derivation), never
+        # conjugated.
+        return unfold_file_wedge_band_operator(
+            sym, inner(psi_xr, sigma_parent, psi_yn), trs_rule="transpose")
+
+    return project
 
 
 class SpatialKernel(NamedTuple):
@@ -251,6 +290,7 @@ def get_sigma_spatial_kernel(
     layout: str = "legacy",
     face_shape=None,
     face_band_extent=None,
+    k_unfold_plan=None,
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
@@ -293,7 +333,8 @@ def get_sigma_spatial_kernel(
         make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           bool(merged_x), layout, face_shape, face_band_extent)
+           bool(merged_x), layout, face_shape, face_band_extent,
+           k_unfold_plan)
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -317,7 +358,7 @@ def get_sigma_spatial_kernel(
 
     project = _make_project_ri_reduce_scatter(
         mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
-        face_band_extent=face_band_extent)
+        face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
 
     @jax.jit
     def prep_w(W_q):
@@ -424,8 +465,20 @@ def _get_sigma_kij_kernel(
     layout: str = "legacy", face_shape=None, face_band_extent=None,
     pack_brackets: bool = True,
     energy_windows: bool = False,
+    k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
     """GN/MPA adapter that builds G and calls the shared spatial kernel.
+
+    ``k_unfold_plan`` (:class:`gw.centroid_k_unfold.CentroidKUnfoldPlan`,
+    face layout only): the ``psi_coh_*`` operands are the PACKED raw-parent
+    faces and ``E_A``/``mask_A`` are parent-row tables — ``build_G_tau``
+    contracts on ``n_parent`` rows and the plan transports the completed
+    operator to full k in the run's packed centroid order; the FFT convolution
+    runs against residues in that same order; the
+    ``psi_proj_*`` operands are the same parent faces and the spatial
+    kernel's projection tail selects, projects and broadcasts (see
+    :func:`_make_project_ri_reduce_scatter`).  Bracket packing is not
+    combined with the route (the mask loop serves every bracket count).
 
     ``brackets``
         ``None`` (the MPA/shared-multipole shape): one G(τ) over the whole
@@ -511,23 +564,35 @@ def _get_sigma_kij_kernel(
             "_get_sigma_kij_kernel(layout='face') requires "
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
     from ffi import ffi_dial_key
+    if k_unfold_plan is not None and layout != "face":
+        raise ValueError(
+            "_get_sigma_kij_kernel(k_unfold_plan=...) requires layout='face'.")
+    if k_unfold_plan is not None:
+        # One G-build family per bracket count; the route's packed parent
+        # faces cannot be repacked per bracket without a second owner.
+        pack_brackets = False
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-           face_band_extent, bool(pack_brackets), bool(energy_windows))
+           face_band_extent, bool(pack_brackets), bool(energy_windows),
+           k_unfold_plan)
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
+    # G, W and projection faces share the run's packed centroid order,
+    # as in the static kernels. Pole batches convert only at the store seam.
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
         layout=layout, face_shape=face_shape,
-        face_band_extent=face_band_extent)
+        face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
 
     g_plan = None
     g_plans = None
     use_packed = False
     if layout == "face":
         from distrib_la import gemm_plan
-        nk_f, nb_full_f, n_rmu_f, ns_f = (int(v) for v in face_shape)
+        g_shape = (face_shape if k_unfold_plan is None
+                   else (k_unfold_plan.n_parent, *face_shape[1:]))
+        nk_f, nb_full_f, n_rmu_f, ns_f = (int(v) for v in g_shape)
         mu_s_f = n_rmu_f * ns_f
         g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_f,
                            nq=nk_f, dtype=jnp.complex128)
@@ -578,15 +643,19 @@ def _get_sigma_kij_kernel(
             if energy_windows:
                 return build_G_tau(
                     xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                    E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
+                    E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan,
+                    k_unfold_plan=k_unfold_plan)
             return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                               layout=layout, gemm=g_plan)
+                               layout=layout, gemm=g_plan,
+                               k_unfold_plan=k_unfold_plan)
         if energy_windows:
             return build_G_tau(
                 xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
+                E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan,
+                k_unfold_plan=k_unfold_plan)
         return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                           layout=layout, gemm=g_plan)
+                           layout=layout, gemm=g_plan,
+                           k_unfold_plan=k_unfold_plan)
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
@@ -890,6 +959,7 @@ def get_shared_sigma_tau_kernel(
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "legacy", face_shape=None, face_band_extent=None,
     pack_brackets: bool = True,
+    k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -914,7 +984,7 @@ def get_shared_sigma_tau_kernel(
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
-           bool(pack_brackets))
+           bool(pack_brackets), k_unfold_plan)
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
@@ -925,7 +995,7 @@ def get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         brackets=brackets, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent,
-        pack_brackets=pack_brackets)
+        pack_brackets=pack_brackets, k_unfold_plan=k_unfold_plan)
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,

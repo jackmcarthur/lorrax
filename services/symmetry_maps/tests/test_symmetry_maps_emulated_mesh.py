@@ -44,7 +44,6 @@ import pytest
 from lxkit.testing import require_devices
 from symmetry_maps import (KStarMap, centroid_source_map_and_wrap,
                            mix_channels_by_proper_rotation, star_broadcast,
-                           reorder_isdf_operator_basis,
                            star_select, star_spread,
                            spinor_rotation_for_sym_row,
                            unfold_isdf_operator,
@@ -358,35 +357,6 @@ def test_axis_local_packed_unfold_matches_canonical_without_collectives():
     forbidden = ("all-to-all(", "all-gather(", "collective-permute(",
                  "reduce-scatter(", "all-reduce(")
     assert not [name for name in forbidden if name in hlo]
-
-
-def test_operator_basis_reorder_crosses_both_shards_without_replication():
-    """The public bridge applies arbitrary rectangular endpoint maps."""
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    mesh = _mesh(2, 2)
-    rng = np.random.default_rng(2026090103)
-    host = (rng.standard_normal((3, 8, 12))
-            + 1j * rng.standard_normal((3, 8, 12)))
-    left = np.asarray([6, 1, 4, 7, 0, 5, 2, 3], dtype=np.int32)
-    right = np.asarray([9, 2, 11, 4, 1, 8, 0, 7, 5, 10, 3, 6],
-                       dtype=np.int32)
-    sharding = NamedSharding(mesh, P(None, 'x', 'y'))
-    operand = jax.device_put(jnp.asarray(host), sharding)
-    got = reorder_isdf_operator_basis(
-        operand, left_source_map=left, right_source_map=right,
-        mesh_xy=mesh)
-    expected = host[:, left][:, :, right]
-    np.testing.assert_allclose(np.asarray(got), expected, rtol=0, atol=0)
-    assert got.sharding.spec == sharding.spec
-    hlo = jax.jit(lambda x: reorder_isdf_operator_basis(
-        x, left_source_map=left, right_source_map=right,
-        mesh_xy=mesh)).lower(operand).compiler_ir(
-            dialect="hlo").as_hlo_text().lower()
-    assert "all-gather(" not in hlo
-    assert hlo.count("all-to-all(") == 4
 
 
 def test_open_spin_green_unfold_uses_transpose_not_conjugation_for_tr():

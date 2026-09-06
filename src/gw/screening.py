@@ -285,7 +285,8 @@ def compute_static_w(
             sym=sym, centroid_indices=centroid_indices,
             kgrid=tuple(meta.kgrid),
             fft_grid=tuple(meta.fft_grid),
-            context=f"W[{role}] Dyson solve q-grid reduction")
+            context=f"W[{role}] Dyson solve q-grid reduction",
+            mu_basis=getattr(meta, 'mu_basis', None))
     else:
         use_ibz_w = False
 
@@ -550,7 +551,8 @@ def compute_static_w(
                         n_rmu_logical=int(meta.n_rmu),
                         q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
                         sym_idx_q=unfold_sym, sym_perm=sym_perm,
-                        L_table=L_table, n_sym_spatial=n_sym_spatial)
+                        L_table=L_table, n_sym_spatial=n_sym_spatial,
+                        mu_basis=getattr(meta, 'mu_basis', None))
                     W_q = unfold_isdf_operator(
                         W_q_solve,
                         irr_idx=full_to_irr_idx,

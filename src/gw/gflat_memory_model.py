@@ -370,7 +370,8 @@ def centroid_fft_tile_geometry(
 # ---------------------------------------------------------------------------
 
 def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
-                      p_x, p_y, low_mem_bands: bool = False) -> dict:
+                      p_x, p_y, low_mem_bands: bool = False,
+                      parent_route=None) -> dict:
     """The un-chunkable floor resident across the whole r-chunk loop.
 
     ``L_q`` and ``gflat_acc`` are ÷P (μ²/μ-family), both at the
@@ -415,6 +416,16 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
         psi_copies = 2.0 * psi_one / P_
     else:
         psi_copies = 2 * psi_one / p_x + 2 * psi_one / p_y
+    if parent_route is not None:
+        # The raw-parent carrier: one face pair at n_parent rows
+        # (gw.wavefunction_bundle.ParentGreenCarrier).  Under parents-only
+        # storage it is the run's ONLY psi; otherwise it sits beside the
+        # full-k faces.
+        carrier = 2.0 * _c128(
+            int(parent_route["n_parent"]), ns,
+            mu, nb) / P_
+        psi_copies = carrier if parent_route.get("parents_only") \
+            else psi_copies + carrier
     return {
         "L_q":         _c128(nq_disk, mu, mu, shard=P_),
         "gflat_acc":   _c128(nq_disk, mu, ngkmax, shard=P_),
@@ -502,7 +513,7 @@ def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
 
 def _stage_C_face_terms(
         *, nk, ns, mu, face_nb, slots, p_x, p_y, p_xy,
-        band_chunk, n_band_chunks) -> dict[str, float]:
+        band_chunk, n_band_chunks, parent_route=None) -> dict[str, float]:
     """Analytic live-shape census for the scalar-pair face kernel.
 
     Source evaluates one scalar spin pair at a time, but the executable's
@@ -517,12 +528,23 @@ def _stage_C_face_terms(
     the repeated-transform fallback retains one slab and its source.
     """
     x_rows = 1 if int(ns) == 1 else 2
-    face_conj = _c128(nk, ns, mu, face_nb, shard=p_xy)
-    x_block = _c128(nk, x_rows, max(1, mu // p_x), band_chunk)
+    # Raw-parent route: every psi-side term is at n_parent rows over the
+    # PACKED centroid extent (the fit reads the packed parent faces), and
+    # two open-spin projectors D_L/D_R (n_parent, ns, mu, ns, r) are live
+    # beside the tail.  The tail itself stays FULL k: after the unfold the
+    # pair densities are (nk, mu/Px, r/Py) whatever the parent count, one
+    # output spin block at a time (isdf.core._z_q_face_parent's scan).
+    psi_rows = nk
+    projector = 0.0
+    if parent_route is not None:
+        psi_rows = int(parent_route["n_parent"])
+        projector = 2.0 * _c128(psi_rows, ns, ns, mu, shard=p_xy)
+    face_conj = _c128(psi_rows, ns, mu, face_nb, shard=p_xy)
+    x_block = _c128(psi_rows, x_rows, max(1, mu // p_x), band_chunk)
     pair_rank3 = _c128(nk, mu, shard=p_xy)
-    pair_peak = float(slots) * pair_rank3
-    y_block = _c128(nk, band_chunk, ns, shard=p_y)
-    y_source = _c128(nk, max(1, band_chunk // p_xy), ns)
+    pair_peak = float(slots) * pair_rank3 + projector
+    y_block = _c128(psi_rows, band_chunk, ns, shard=p_y)
+    y_source = _c128(psi_rows, max(1, band_chunk // p_xy), ns)
     y_cache = float(n_band_chunks) * y_block
     return {
         # psi_mun_conj plus the selected-row gather and psum result.
@@ -629,6 +651,9 @@ class GFlatChunkPlan:
     #: chunk is partitioned into equal cache-sized transactions, preserving
     #: solve amortization without crossing into the ns² repeated route.
     face_y_cache_r_tile: int = 0
+    #: The raw-parent route the psi-side Stage-C terms were priced for
+    #: (``plan_gflat_chunks(parent_route=)``), or ``None``.
+    parent_route: object = None
     #: Per-rank bytes in the selected face Y cache at resolved r width.
     face_y_cache_bytes: float = 0.0
 
@@ -657,6 +682,12 @@ class GFlatChunkPlan:
             *([f"    face Y cache = "
                f"{self.face_y_cache_bytes / 1e9:.3f} GB/dev"]
               if self.psi_layout == "face" else []),
+            *([f"    parent route  = {int(self.parent_route['n_parent'])} raw "
+               "parents; psi terms at n_parent rows"
+               + (" (parents-only storage: no full-k faces)"
+                  if self.parent_route.get("parents_only") else
+                  " beside the full-k faces")]
+              if self.parent_route else []),
             f"    band_chunk    = {self.band_chunk}",
             f"    centroid FFT = k_tile {self.centroid_k_chunk}, "
             f"{self.centroid_fft_rows_local} local rows, "
@@ -708,6 +739,7 @@ def plan_gflat_chunks(
     distributed_zeta_solve: str = "auto",
     low_mem_bands: bool = False,
     face_current_vertex: bool = False,
+    parent_route=None,
 ) -> GFlatChunkPlan:
     """Pick ``(band_chunk, centroid_k_chunk, r_chunk, q_chunk,
     gflat_chunk_size)`` so the
@@ -742,6 +774,14 @@ def plan_gflat_chunks(
     ``face_current_vertex`` selects the nonidentity-current face executable's
     measured ``ns²`` arena.  False preserves the independently calibrated
     four-slot identity/charge executable.
+
+    ``parent_route`` (``{"n_parent", "parents_only"}`` or
+    ``None``): the raw-parent contraction of the ζ fit
+    (``gw.centroid_k_unfold.CentroidKUnfoldPlan``).  It prices the psi-side
+    Stage-C terms and the persistent carrier at ``n_parent`` rows over the
+    packed centroid extent and adds the two open-spin projectors; the
+    full-k tail arena is unchanged.  ``parents_only`` means the carrier is
+    the run's only psi (no full-k faces at all).
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
@@ -791,9 +831,14 @@ def plan_gflat_chunks(
     target = budget * target_utilization
 
     inventory_nb = face_nb if low_mem_bands else nb
+    if parent_route is not None and not low_mem_bands:
+        raise ValueError(
+            "plan_gflat_chunks: parent_route requires low_mem_bands (the "
+            "parent faces are face-layout carriers).")
     sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu,
                nb=inventory_nb,
-               ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands))
+               ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands),
+               parent_route=parent_route)
 
     # The hoisted ψ(r) cache has no centroid axis: at large FFT grids it can
     # dominate a low-memory face calculation even though every centroid
@@ -1029,7 +1074,8 @@ def plan_gflat_chunks(
         face_terms = _stage_C_face_terms(
             nk=nk, ns=ns, mu=mu, face_nb=face_nb,
             slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
-            band_chunk=band_chunk, n_band_chunks=_cache_n_bc)
+            band_chunk=band_chunk, n_band_chunks=_cache_n_bc,
+            parent_route=parent_route)
         # to_rchunk_inner consumes the full-nk carrier.  This is deliberately
         # the 12.96-GB CrI3/P16 term, not Stage A's 5.76-GB bounded k tile.
         streamed_fft = 0.0 if cache_psi_r else fft_box_zeta_transform
@@ -1375,6 +1421,7 @@ def plan_gflat_chunks(
     hwm = peaks[bottleneck]
 
     return GFlatChunkPlan(
+        parent_route=parent_route,
         band_chunk=int(band_chunk),
         centroid_k_chunk=int(centroid_k_chunk),
         centroid_fft_rows_local=int(centroid_fft_rows_local),

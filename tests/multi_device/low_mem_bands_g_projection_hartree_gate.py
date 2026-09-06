@@ -267,12 +267,17 @@ def check_g_parent_unfold(mesh, dtype="complex128", *, ns=2, mu=8, nb=8,
         np.zeros(mu, dtype=np.int32)), axis=1)
     plan = build_centroid_k_unfold_plan(
         sym, centroids, (mu, 1, 1), mesh, nspinor=ns,
-        parent_k_frac=np.zeros((nk_parent, 3), dtype=np.float64),
-        canonical_centroid_extent=mu)
+        parent_k_frac=np.zeros((nk_parent, 3), dtype=np.float64))
 
     rng = np.random.default_rng(2026090101 + ns)
     parent_np = _rng_mat(rng, (nk_parent, nb, ns, mu), dtype)
     full_np = parent_np[irr]
+    # Every face is in the run's packed centroid order (the loader samples
+    # the packed table; the host packer stands in for it here).
+    pack = plan.layout.axis.pack_host
+    parent_np = pack(parent_np, axis=3)
+    full_np = pack(full_np, axis=3)
+    mu = int(plan.n_centroid_packed)
     full_mun = _put(
         full_np.transpose(0, 2, 3, 1), mesh,
         (None, None, "x", "y"))
@@ -281,9 +286,6 @@ def check_g_parent_unfold(mesh, dtype="complex128", *, ns=2, mu=8, nb=8,
         parent_np.transpose(0, 2, 3, 1), mesh,
         (None, None, "x", "y"))
     parent_nmu = _put(parent_np, mesh, (None, "x", None, "y"))
-    with mesh:
-        parent_nmu, parent_mun = plan.pack_face_pair(
-            parent_nmu, parent_mun)
 
     full_gemm = gemm_plan(
         mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk_full, dtype=dtype)

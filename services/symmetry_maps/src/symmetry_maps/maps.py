@@ -886,6 +886,10 @@ def _permute_isdf_operator_axes_local(
     endpoint is split while this endpoint is concatenated, the permutation
     is applied, and the original 2-D sharding is restored.  Consequently no
     intermediate is larger than the input tile on any rank.
+
+    ``right_source_map=None`` together with ``right_local_source_map=None``
+    means the right endpoint keeps its order: only the left map is applied
+    and the y-axis round trip is skipped entirely.
     """
     n_left_local = int(operator_local.shape[1])
     n_right_local = int(operator_local.shape[2])
@@ -919,6 +923,8 @@ def _permute_isdf_operator_axes_local(
         return jnp.take_along_axis(
             permuted_left, local_right[:, None, :], axis=2,
             mode='promise_in_bounds')
+    if right_source_map is None:
+        return permuted_left
     if mesh_y > 1:
         right_full = jax.lax.all_to_all(
             permuted_left, 'y', split_axis=1, concat_axis=2, tiled=True)
@@ -932,81 +938,203 @@ def _permute_isdf_operator_axes_local(
         mode='promise_in_bounds')
 
 
-_REORDER_ISDF_OPERATOR_JIT_CACHE: dict = {}
-
-
-def reorder_isdf_operator_basis(
-    operator,
-    *,
-    left_source_map,
-    right_source_map,
-    mesh_xy,
-):
-    """Reorder both axes of an all-P sharded ISDF operator.
-
-    ``operator`` is ``(n_batch,n_left,n_right)`` with
-    ``P(None,'x','y')`` sharding.  Each rank-one map is destination-to-source
-    and must be a permutation of its complete endpoint.  The endpoint
-    extents are unchanged; on a multi-rank axis the implementation uses the
-    same volume-preserving all-to-all backend as the canonical symmetry
-    unfold, never an all-gather or a one-axis-sharded matrix transient.
-    """
-    shape = tuple(int(v) for v in operator.shape)
-    if len(shape) != 3:
-        raise ValueError(
-            "reorder_isdf_operator_basis: operator must have shape "
-            f"(n_batch,n_left,n_right); got {shape}.")
-    left = np.asarray(left_source_map, dtype=np.int32)
-    right = np.asarray(right_source_map, dtype=np.int32)
-    for label, source, extent in (
-            ("left", left, shape[1]), ("right", right, shape[2])):
-        if source.shape != (extent,):
-            raise ValueError(
-                "reorder_isdf_operator_basis: "
-                f"{label}_source_map must have shape ({extent},); got "
-                f"{source.shape}.")
-        if not np.array_equal(np.sort(source), np.arange(extent)):
-            raise ValueError(
-                "reorder_isdf_operator_basis: "
-                f"{label}_source_map must be a complete permutation.")
-    px = int(mesh_xy.shape['x'])
-    py = int(mesh_xy.shape['y'])
-    if shape[1] % (px * py) or shape[2] % (px * py):
-        raise ValueError(
-            "reorder_isdf_operator_basis: endpoint extents must divide the "
-            f"complete mesh ({px}x{py}) for volume-preserving all-to-all; "
-            f"got {shape[1]}/{shape[2]}.")
-    key = (
-        shape,
-        left.shape, left.tobytes(),
-        right.shape, right.tobytes(),
-        id(mesh_xy),
-    )
-    fn = _REORDER_ISDF_OPERATOR_JIT_CACHE.get(key)
-    if fn is None:
-        # Keep closure constants as host arrays.  This factory is legal inside
-        # a surrounding jit trace (the chi tau-scan first reaches it there);
-        # constructing JAX arrays here would capture DynamicJaxprTracers in
-        # the global cache and poison the next specialization.
-        left_rows = np.broadcast_to(left, (shape[0], shape[1])).copy()
-        right_rows = np.broadcast_to(right, (shape[0], shape[2])).copy()
-        sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=P(None, 'x', 'y'),
-                 out_specs=P(None, 'x', 'y'),
-                 check_vma=False)
-        def _kernel(local_operator):
-            return _permute_isdf_operator_axes_local(
-                local_operator, left_rows, right_rows,
-                mesh_x=px, mesh_y=py)
-
-        fn = jax.jit(_kernel, in_shardings=sharding, out_shardings=sharding)
-        _REORDER_ISDF_OPERATOR_JIT_CACHE[key] = fn
-    return fn(operator)
-
-
 _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
+
+
+def _apply_unfold_phase_and_trs_local(
+    V_full_local, phase_mu, phase_nu, trs_mask, *, pair_transpose: bool,
+):
+    """The umklapp phase and the time-reversal rule on one local tile.
+
+    ``V_full_local`` is ``(n_q_full, mu_loc, nu_loc)`` after both endpoint
+    gathers; ``phase_mu``/``phase_nu`` are this rank's slices of
+    ``exp(2πi q_irr·L)`` for each endpoint; ``trs_mask`` marks antiunitary
+    rows.  The Hermitian rule conjugates the whole phased tile on those rows;
+    the pair-transpose rule instead swaps which endpoint's phase is
+    conjugated, because its operand is already the transposed partner.  One
+    body serves the top-level unfold kernel and the manual-mode local body.
+    """
+    if pair_transpose:
+        mu_phase = jnp.where(trs_mask[:, None],
+                             jnp.conj(phase_mu), phase_mu)
+        nu_phase = jnp.where(trs_mask[:, None],
+                             phase_nu, jnp.conj(phase_nu))
+        return (mu_phase[:, :, None] * V_full_local
+                * nu_phase[:, None, :])
+    V_full_local = (phase_mu[:, :, None] * V_full_local
+                    * jnp.conj(phase_nu)[:, None, :])
+    return jnp.where(
+        trs_mask[:, None, None], jnp.conj(V_full_local), V_full_local)
+
+
+def unfold_operator_local(
+    operator_parent_local,
+    *,
+    irr_idx,
+    sym_idx,
+    q_irr_frac,
+    left_local_perm,
+    left_L_table,
+    right_local_perm,
+    right_L_table,
+    n_sym_spatial,
+):
+    r"""Transport one local rectangular tile from raw parents to full k.
+
+    The manual-mode twin of :func:`unfold_isdf_operator`'s axis-local
+    Hermitian action, for a caller that already stands inside an
+    ``('x','y')`` ``shard_map`` and therefore cannot call the top-level jit.
+    ``operator_parent_local`` is this rank's ``(n_parent, mu_loc, nu_loc)``
+    tile of a ``P(None,'x','y')`` operator whose two endpoints are both
+    orbit-packed, so every gather stays inside the rank's own X or Y shard.
+    The result is the same rank's ``(n_full, mu_loc, nu_loc)`` tile of
+
+        X_full[q, mu, nu] = exp(2πi q_irr·(L^L_{s,mu} − L^R_{s,nu}))
+                            X_ibz[i(q), alpha^L_s(mu), alpha^R_s(nu)],
+
+    conjugated on antiunitary rows — the ``trs_rule="conj"`` action, which is
+    the only one a pair projector with real band weights and two different
+    endpoints has (there is no transposed partner for a rectangular tile).
+
+    Tables are indexed by typed operation row over the COMPLETE padded
+    endpoint: ``left_local_perm``/``right_local_perm`` are
+    ``(n_rows, n_left)``/``(n_rows, n_right)`` owner-local gather offsets
+    (packed source ``% shard extent``), ``left_L_table``/``right_L_table``
+    the matching ``(n_rows, n_endpoint, 3)`` lattice wraps.  They may be
+    traced operands: a real-grid tile changes tables on every call, and a
+    caller that baked them as constants would compile once per tile.  The
+    orbit-packing certificate (no gather crosses a shard) belongs to the
+    caller's plan; this body cannot check it under ``jit`` and does not try.
+    """
+    irr = jnp.asarray(irr_idx, dtype=jnp.int32)
+    sym = jnp.asarray(sym_idx, dtype=jnp.int32)
+    trs_mask = sym >= int(n_sym_spatial)
+    left_local_q = jnp.take(
+        jnp.asarray(left_local_perm, dtype=jnp.int32), sym, axis=0)
+    right_local_q = jnp.take(
+        jnp.asarray(right_local_perm, dtype=jnp.int32), sym, axis=0)
+    at_irr = jnp.take(operator_parent_local, irr, axis=0)
+    V_full_local = _permute_isdf_operator_axes_local(
+        at_irr, None, None, mesh_x=1, mesh_y=1,
+        left_local_source_map=left_local_q,
+        right_local_source_map=right_local_q)
+
+    q_per_q = jnp.take(
+        jnp.asarray(q_irr_frac, dtype=jnp.float64), irr, axis=0)
+    L_left = jnp.take(
+        jnp.asarray(left_L_table, dtype=jnp.float64), sym, axis=0)
+    L_right = jnp.take(
+        jnp.asarray(right_L_table, dtype=jnp.float64), sym, axis=0)
+    phase_left = jnp.exp(2j * jnp.pi * jnp.einsum(
+        'qi,qmi->qm', q_per_q, L_left).astype(jnp.complex128))
+    phase_right = jnp.exp(2j * jnp.pi * jnp.einsum(
+        'qi,qmi->qm', q_per_q, L_right).astype(jnp.complex128))
+    mu_local = int(V_full_local.shape[1])
+    nu_local = int(V_full_local.shape[2])
+    x_idx = jax.lax.axis_index('x')
+    y_idx = jax.lax.axis_index('y')
+    phase_mu = jax.lax.dynamic_slice_in_dim(
+        phase_left, x_idx * mu_local, mu_local, axis=1)
+    phase_nu = jax.lax.dynamic_slice_in_dim(
+        phase_right, y_idx * nu_local, nu_local, axis=1)
+    return _apply_unfold_phase_and_trs_local(
+        V_full_local, phase_mu, phase_nu, trs_mask, pair_transpose=False)
+
+
+def unfold_wavefunction_local(
+    psi_parent_local,
+    *,
+    irr_idx,
+    sym_idx,
+    k_irr_frac,
+    local_perm,
+    L_table,
+    spin_action_full,
+    n_sym_spatial,
+    spin_axis: int,
+    mu_axis: int,
+    mesh_axis=None,
+):
+    r"""Children ψ_{gk̄} from raw parents on one μ-local slab, by the typed action.
+
+        ψ_{gk̄,a}(μ) = Σ_c U_g[a,c] · T_g[ e^{2πi k̄·L_{g,μ}} ψ_{k̄,c}(α_g μ) ]
+
+    ``T_g`` is complex conjugation on antiunitary rows (``g >=
+    n_sym_spatial``) and the identity otherwise; ``U_g`` is the spinor
+    representation.  This is the action the loader's host unfold applies to
+    every child row and the one :func:`unfold_operator_local` applies to
+    both endpoints of an operator; here it is applied to ONE wavefunction
+    endpoint, so a consumer that needs ψ itself at every k (a band-pair
+    weight that couples both band indices, which no one-particle Green
+    contraction reproduces) can stream children from the stored parents
+    without any full-k face ever being resident.
+
+    ``psi_parent_local`` is this rank's ``(n_parent, ...)`` slab of an
+    orbit-PACKED face: ``mu_axis`` names the centroid axis, ``spin_axis``
+    the spinor axis; every gather stays inside the slab because orbits never
+    cross a shard.  ``local_perm`` ``(n_rows, n_mu)`` are owner-local gather
+    offsets and ``L_table`` ``(n_rows, n_mu, 3)`` the lattice wraps, both
+    over the slab's own μ extent when ``mesh_axis`` is ``None`` (the
+    caller sliced them, e.g. as ``shard_map`` operands sharded on the same
+    axis as μ) or over the COMPLETE packed endpoint when ``mesh_axis`` names
+    the mesh axis μ is sharded on (sliced here by ``axis_index``).
+    ``irr_idx``/``sym_idx`` are ``(n_full,)``, ``k_irr_frac`` ``(n_parent,
+    3)``; ``spin_action_full`` is ``(n_full, ns, ns)`` -- the spinor matrix
+    of EACH FULL-k ROW (the plan's table, ``sym.spinor_action(sym_idx)``),
+    not a per-operation table.  Returns ``(n_full, ...)`` in the same axis
+    order.
+    """
+    x = jnp.asarray(psi_parent_local)
+    ndim = int(x.ndim)
+    mu_axis = int(mu_axis) % ndim
+    spin_axis = int(spin_axis) % ndim
+    if mu_axis == 0 or spin_axis == 0 or mu_axis == spin_axis:
+        raise ValueError(
+            "unfold_wavefunction_local: axis 0 is the k axis; mu_axis and "
+            f"spin_axis must be distinct non-zero axes, got {mu_axis}, "
+            f"{spin_axis}.")
+    irr = jnp.asarray(irr_idx, dtype=jnp.int32)
+    sym = jnp.asarray(sym_idx, dtype=jnp.int32)
+    n_full = int(irr.shape[0])
+    mu_loc = int(x.shape[mu_axis])
+    perm_rows = jnp.take(jnp.asarray(local_perm, dtype=jnp.int32), sym, axis=0)
+    L_rows = jnp.take(jnp.asarray(L_table, dtype=jnp.float64), sym, axis=0)
+    k_rows = jnp.take(jnp.asarray(k_irr_frac, dtype=jnp.float64), irr, axis=0)
+    phase = jnp.exp(2j * jnp.pi * jnp.einsum(
+        'qi,qmi->qm', k_rows, L_rows).astype(jnp.complex128))
+    if mesh_axis is not None:
+        start = jax.lax.axis_index(mesh_axis) * mu_loc
+        perm_rows = jax.lax.dynamic_slice_in_dim(perm_rows, start, mu_loc, axis=1)
+        phase = jax.lax.dynamic_slice_in_dim(phase, start, mu_loc, axis=1)
+    rows = jnp.take(x, irr, axis=0)
+    idx_shape = [1] * ndim
+    idx_shape[0] = n_full
+    idx_shape[mu_axis] = mu_loc
+    rows = jnp.take_along_axis(rows, perm_rows.reshape(idx_shape), axis=mu_axis)
+    rows = rows * phase.reshape(idx_shape)
+    trs_shape = [1] * ndim
+    trs_shape[0] = n_full
+    rows = jnp.where((sym >= int(n_sym_spatial)).reshape(trs_shape),
+                     jnp.conj(rows), rows)
+    U_rows = jnp.asarray(spin_action_full, dtype=rows.dtype)   # (n_full, ns, ns)
+    moved = jnp.moveaxis(rows, spin_axis, -1)
+    moved = jnp.einsum('qac,q...c->q...a', U_rows, moved)
+    return jnp.moveaxis(moved, -1, spin_axis)
+
+
+def open_spin_block_coefficient(spin_action_full, a: int, b: int):
+    """``coef[k, c, d] = U_k[a, c]·conj(U_k[b, d])``: one output spin block.
+
+    The ``(a, b)`` block of the canonical spin action ``U O U†`` in
+    :func:`_rotate_open_spin_centroid_operator` is
+    ``sum_{c,d} coef[k, c, d] O[k, c, :, d, :]``.  A consumer that can hold
+    only one full-k output block at a time — the rectangular pair projector
+    of the ζ fit — accumulates that sum from its small parent blocks instead
+    of materializing the whole rotated operator.  The coefficient is the
+    spin representation and lives here so no consumer restates it.
+    """
+    U = jnp.asarray(spin_action_full)
+    return U[:, int(a), :, None] * jnp.conj(U[:, int(b), None, :])
 
 
 def _get_unfold_isdf_operator_jit(
@@ -1152,19 +1280,9 @@ def _get_unfold_isdf_operator_jit(
             phase_left, x_idx * mu_local, mu_local, axis=1)
         phase_nu = jax.lax.dynamic_slice_in_dim(
             phase_right, y_idx * nu_local, nu_local, axis=1)
-        if pair_transpose:
-            mu_phase = jnp.where(trs_mask_j[:, None],
-                                 jnp.conj(phase_mu), phase_mu)
-            nu_phase = jnp.where(trs_mask_j[:, None],
-                                 phase_nu, jnp.conj(phase_nu))
-            V_full_local = (mu_phase[:, :, None] * V_full_local
-                            * nu_phase[:, None, :])
-        else:
-            V_full_local = (phase_mu[:, :, None] * V_full_local
-                            * jnp.conj(phase_nu)[:, None, :])
-            V_full_local = jnp.where(
-                trs_mask_j[:, None, None],
-                jnp.conj(V_full_local), V_full_local)
+        V_full_local = _apply_unfold_phase_and_trs_local(
+            V_full_local, phase_mu, phase_nu, trs_mask_j,
+            pair_transpose=pair_transpose)
         if (int(logical_left) != n_left_padded
                 or int(logical_right) != n_right_padded):
             global_left = x_idx * mu_local + jnp.arange(mu_local)
@@ -3515,34 +3633,54 @@ def _take_rows(A, rows):
            A.dtype, repr(out_sh))
 
     def _build():
-        rows_j = jnp.asarray(rows)
-
+        # Host constants become device constants INSIDE the traced body.
+        # Converting them at build scope would capture a tracer when the
+        # first call happens under an outer jit (the Σ projection tail
+        # broadcasts inside its own compiled kernel) and poison this
+        # process-global cache for every later caller.
         def _f(x):
-            return x[rows_j]
+            return x[jnp.asarray(rows)]
         return _jit_with(_f, out_sh)
 
     return _cached_star_jit(key, _build)(A)
 
 
-def _broadcast_rows(A_irr, take, trs):
-    """``A_irr[take]`` with ``conj`` on the rows ``trs`` marks."""
+def _broadcast_rows(A_irr, take, trs, *, transpose=False):
+    """``A_irr[take]`` with the antiunitary rule on the rows ``trs`` marks.
+
+    ``transpose=False``: conjugate (an observable's band matrix; the
+    historical rule).  ``transpose=True``: transpose the two band axes
+    without conjugating — the rule for a frequency-dependent operator whose
+    antiunitary image is its transpose (Green function, self-energy).  Both
+    are expressed through :func:`apply_band_matrix_symmetry`
+    (``antiunitary`` alone, or ``antiunitary`` with ``reverse``).
+    """
+    trs_np = np.asarray(trs)
     if not isinstance(A_irr, jax.Array):
         out = np.asarray(A_irr)[take]
-        return apply_band_matrix_symmetry(out, antiunitary=trs)
+        if transpose:
+            return apply_band_matrix_symmetry(
+                out, antiunitary=trs_np, reverse=trs_np)
+        return apply_band_matrix_symmetry(out, antiunitary=trs_np)
     out_sh = _row_out_sharding(A_irr)
     ndim = int(A_irr.ndim)
-    any_trs = bool(np.any(trs))
-    key = ("bcast", take.tobytes(), trs.tobytes(),
+    any_trs = bool(np.any(trs_np))
+    key = ("bcast", take.tobytes(), trs_np.tobytes(), bool(transpose),
            tuple(int(s) for s in A_irr.shape), A_irr.dtype, repr(out_sh))
 
     def _build():
-        take_j = jnp.asarray(take)
-        trs_j = jnp.asarray(np.asarray(trs).reshape((-1,) + (1,) * (ndim - 1)))
+        trs_shaped = trs_np.reshape((-1,) + (1,) * (ndim - 1))
 
         def _f(x):
-            out = x[take_j]
+            # Constants materialize inside the trace (see _take_rows).
+            out = x[jnp.asarray(take)]
             if any_trs:
-                out = apply_band_matrix_symmetry(out, antiunitary=trs_j)
+                flag = jnp.asarray(trs_shaped)
+                if transpose:
+                    out = apply_band_matrix_symmetry(
+                        out, antiunitary=flag, reverse=flag)
+                else:
+                    out = apply_band_matrix_symmetry(out, antiunitary=flag)
             return out
         return _jit_with(_f, out_sh)
 
@@ -3652,8 +3790,13 @@ def star_select(A_full, irr_idx_k):
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
-                   irr_labels=None, *, trs_reference):
+                   irr_labels=None, *, trs_reference, trs_rule="conj"):
     """Spread an IBZ band-index quantity over the full BZ.
+
+    ``trs_rule`` is what the antiunitary rows do to the operand: ``"conj"``
+    (the historical rule, an observable's band matrix) or ``"transpose"``
+    (the two band axes swapped without conjugation — a frequency-dependent
+    operator's band matrix; see :func:`unfold_file_wedge_band_operator`).
 
     ``A_irr`` is ``(n_k_irr, ...)``; the result is ``(n_k_full, ...)``.
     A gather plus a CONJUGATION on the rows a predicate selects.  A
@@ -3738,7 +3881,12 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
             "star_broadcast: trs_reference must be 'star_row' (A_irr came "
             "from star_select, rows are full-BZ) or 'ibz_slab' (A_irr is "
             f"the untransformed IBZ slab); got {trs_reference!r}.")
-    return _broadcast_rows(A_irr, take, conj)
+    if trs_rule not in ("conj", "transpose"):
+        raise ValueError(
+            "star_broadcast: trs_rule must be 'conj' or 'transpose'; "
+            f"got {trs_rule!r}.")
+    return _broadcast_rows(A_irr, take, conj,
+                           transpose=(trs_rule == "transpose"))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -3833,6 +3981,43 @@ def unfold_file_wedge_to_full_bz(sym, data):
     return star_broadcast(data, irr, sidx, nss,
                           irr_labels=np.arange(n_rows, dtype=np.int32),
                           trs_reference="ibz_slab")
+
+
+def unfold_file_wedge_band_operator(sym, data, *, trs_rule):
+    r"""FILE wedge → full BZ for the band matrix of a k-diagonal OPERATOR.
+
+    Same rows and gather as :func:`unfold_file_wedge_to_full_bz`; the
+    antiunitary rule is the caller's explicit choice, because the two
+    physically distinct cases give different matrices on time-reversed rows:
+
+    ``trs_rule="conj"``
+        An observable: ``<m,Θk|O|n,Θk> = conj(<m,k|O|n,k>)``.  What the
+        file-wedge unfold does by itself.
+    ``trs_rule="transpose"``
+        A frequency-dependent operator that transforms like the Green
+        function.  With ψ_{Θk} = Θψ_k, ``G_{Θk}(r,r') = G_k(r',r)`` at the
+        SAME complex frequency (the weight e^{-τE} is not conjugated —
+        ``unfold_isdf_operator``'s ``pair_transpose`` rule), and the
+        convolution Σ = Σ_q G_{k-q}·W_q inherits it because W obeys
+        reciprocity.  Then ``Σ_{Θk,mn} = Σ ψ*_{Θk,m} Σ_{Θk} ψ_{Θk,n} =
+        Σ_{k,nm}``: the band matrix is TRANSPOSED, not conjugated; on the
+        diagonal the two rules differ by the sign of Im Σ, i.e. by the
+        lifetime.  Hermitian operators (static Σ) satisfy both at once.
+
+    This is the broadcast the raw-parent Σ route uses after projecting
+    the full-k operator on the parents' own rows.  There is no default: a
+    caller that has not decided which object it holds gets a ``TypeError``
+    here rather than a plausible wrong matrix on the antiunitary rows.
+    """
+    irr, sidx, nss = _star_tables_of(sym)
+    n_rows = int(np.shape(data)[0])
+    if n_rows != int(sym.nk_red):
+        raise ValueError(
+            f"unfold_file_wedge_band_operator: operand has {n_rows} rows "
+            f"but the FILE wedge is sym.nk_red = {int(sym.nk_red)}.")
+    return star_broadcast(data, irr, sidx, nss,
+                          irr_labels=np.arange(n_rows, dtype=np.int32),
+                          trs_reference="ibz_slab", trs_rule=trs_rule)
 
 
 def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):

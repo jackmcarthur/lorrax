@@ -935,7 +935,8 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
      use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
         kgrid=tuple(meta.kgrid), fft_grid=tuple(meta.fft_grid),
-        context=f"W[{label}] ladder wedge -> full BZ unfold")
+        context=f"W[{label}] ladder wedge -> full BZ unfold",
+        mu_basis=getattr(meta, 'mu_basis', None))
     if not use_ibz:
         raise ValueError(
             "GATE w_bse_needs_an_orbit_closed_wedge: the ladder computes "
@@ -1143,6 +1144,9 @@ def make_ladder_wc_source(
             Wc = _assert_mu_width(
                 wedge.wc[index], mu_target,
                 where=f"MPA Wc slab z[{index}]")
+            if getattr(meta_, 'mu_basis', None) is not None:
+                # The store keeps the canonical centroid order.
+                Wc = meta_.mu_basis.unpack_operator(Wc)
             Wc.block_until_ready()
             mpa_store.write_w_slab_collective(
                 sample_path, _WC, index, Wc, mesh_xy=mesh_,

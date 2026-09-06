@@ -1470,6 +1470,8 @@ def compute_sigma_xc(
             quadrature_eps=float(config.sigma.quadrature_eps),
             quadrature_reduction_seconds=float(
                 config.sigma.quadrature_reduction_seconds),
+            quadrature_reduction_steps=getattr(
+                config.sigma, "quadrature_reduction_steps", None),
             quadrature_cache_dir=quadrature_cache_dir,
             omega_grid_step_ry=(
                 float(config.sigma.omega_step_ev) / RYD_TO_EV),

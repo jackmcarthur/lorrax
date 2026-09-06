@@ -31,7 +31,8 @@ from .ppm_windows import (
     resolve_sigma_regularization,
 )
 from .ppm_tau_kernel import get_sigma_spatial_kernel
-from .wavefunction_bundle import face_kernel_kwargs
+from .wavefunction_bundle import (
+    parent_sigma_operands, sigma_face_kernel_kwargs)
 from runtime.padding import PaddedAxis
 
 if TYPE_CHECKING:
@@ -340,6 +341,7 @@ def fit_ppm(
     print_fn=None,
     model_label: str = "PPM",
     n_mu_logical: int,
+    mu_active_mask=None,
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
     ordered_orientations: bool = False,
@@ -380,6 +382,7 @@ def fit_ppm(
     fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
+         mu_active_mask=mu_active_mask,
          q_neg_index=q_neg_index,
          coarsen_extreme_tails=bool(coarsen_extreme_tails),
          ordered_orientations=bool(ordered_orientations),
@@ -604,12 +607,24 @@ def _compute_invalid_static_sigma(
     from .greens_function_kernel import build_G
 
     Gij = build_Gij(meta, mesh_xy, occupation_state)
-    face_kwargs = face_kernel_kwargs(wfns)
+    face_kwargs = sigma_face_kernel_kwargs(wfns)
+    k_unfold_plan = face_kwargs.get("k_unfold_plan")
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
-    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+    g_plan = (_face_g_plan(
+                  mesh_xy, face_kwargs["face_shape"] if k_unfold_plan is None
+                  else (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
              if wfns.layout == "face" else None)
+    if k_unfold_plan is not None:
+        # Raw parents only: the same faces feed G and band projection;
+        # the spatial tail selects and broadcasts.
+        (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
+        g_carrier = wfns.green_parent
+    else:
+        g_mun, g_nmu = wfns.psi_mun, wfns.psi_nmu
+        proj_xr, proj_yn = wfns.psi_nmu, wfns.psi_mun
+        g_carrier = wfns
 
     with mesh_xy:
         W_static = jnp.where(
@@ -626,8 +641,13 @@ def _compute_invalid_static_sigma(
             # Face: project over the FULL nb_full extent (report §3), then
             # strip to nb_sigma below — same "weight, don't window" +
             # late-window pattern as cohsex_sigma's own face kernels.
-            psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
-            nb_real = int(s.nb_sigma)
+            psi_xr, psi_yn = proj_xr, proj_yn
+            # The strip below consumes the band-window receipt, exactly as
+            # the legacy branch receives one from pad_sigma_window; its
+            # ``logical`` is nb_sigma and the face projection's wider nb_full
+            # matrix is the source it strips.
+            nb_real = sigma_band_axis(
+                int(s.nb_sigma), mesh_xy, ansatz="static face")
 
         # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
         # band tensor before building the next centroid-square G: this makes
@@ -640,8 +660,11 @@ def _compute_invalid_static_sigma(
         else:
             nb_full = int(s.nb_full)
             phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
-            G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
-                            layout="face", gemm=g_plan)
+            if k_unfold_plan is not None:
+                phases = k_unfold_plan.parent_rows(phases)
+            G_occ = build_G(g_mun, g_nmu, phases=phases,
+                            layout="face", gemm=g_plan,
+                            k_unfold_plan=k_unfold_plan)
         sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
         sx_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_sx), nb_real), dtype=np.complex128)
@@ -650,9 +673,10 @@ def _compute_invalid_static_sigma(
         if wfns.layout == "legacy":
             G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
         else:
-            mask = wfns.band_mask(s.sigma_sum).astype(jnp.complex128)
-            G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=mask,
-                           layout="face", gemm=g_plan)
+            mask = g_carrier.band_mask(s.sigma_sum).astype(jnp.complex128)
+            G_ri = build_G(g_mun, g_nmu, phases=mask,
+                           layout="face", gemm=g_plan,
+                           k_unfold_plan=k_unfold_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
         ri_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_ri), nb_real), dtype=np.complex128)
@@ -710,12 +734,24 @@ def _invalid_static_coh_by_bracket(
     from common.collectives import gather_to_host
     from .greens_function_kernel import build_G
 
-    face_kwargs = face_kernel_kwargs(wfns)
+    face_kwargs = sigma_face_kernel_kwargs(wfns)
+    k_unfold_plan = face_kwargs.get("k_unfold_plan")
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
-    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+    g_plan = (_face_g_plan(
+                  mesh_xy, face_kwargs["face_shape"] if k_unfold_plan is None
+                  else (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
              if wfns.layout == "face" else None)
+    if k_unfold_plan is not None:
+        # Raw parents only: the same faces feed G and band projection;
+        # the spatial tail selects and broadcasts.
+        (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
+        g_carrier = wfns.green_parent
+    else:
+        g_mun, g_nmu = wfns.psi_mun, wfns.psi_nmu
+        proj_xr, proj_yn = wfns.psi_nmu, wfns.psi_mun
+        g_carrier = wfns
 
     out = []
     with mesh_xy:
@@ -729,8 +765,13 @@ def _invalid_static_coh_by_bracket(
             psi_xr, psi_yn, nb_real = pad_sigma_window(
                 wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
         else:
-            psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
-            nb_real = int(s.nb_sigma)
+            psi_xr, psi_yn = proj_xr, proj_yn
+            # The strip below consumes the band-window receipt, exactly as
+            # the legacy branch receives one from pad_sigma_window; its
+            # ``logical`` is nb_sigma and the face projection's wider nb_full
+            # matrix is the source it strips.
+            nb_real = sigma_band_axis(
+                int(s.nb_sigma), mesh_xy, ansatz="static face")
         for lo, hi in brackets:
             if wfns.layout == "legacy":
                 G_ri = build_G(
@@ -742,10 +783,11 @@ def _invalid_static_coh_by_bracket(
                 # psi_mun/psi_nmu cannot be sliced to an arbitrary band
                 # sub-range, so the bracket becomes a band-range mask
                 # applied as a phase weight instead.
-                mask = wfns.band_mask(
+                mask = g_carrier.band_mask(
                     slice(int(lo), int(hi))).astype(jnp.complex128)
-                G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=mask,
-                               layout="face", gemm=g_plan)
+                G_ri = build_G(g_mun, g_nmu, phases=mask,
+                               layout="face", gemm=g_plan,
+                               k_unfold_plan=k_unfold_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
             ri_host = np.asarray(strip_sigma_window(
                 gather_to_host(sig_ri), nb_real), dtype=np.complex128)
@@ -933,6 +975,12 @@ def compute_sigma_c_ppm_omega_grid(
 
     Omega_p, B_p, B_odd_p = _ppm_as_one_pole_store_fields(
         state, ppm.B_odd_q)
+    if getattr(meta, 'mu_basis', None) is not None:
+        # The store keeps the canonical centroid order (grid-agnostic).
+        Omega_p, B_p = (meta.mu_basis.unpack_operator(Omega_p),
+                        meta.mu_basis.unpack_operator(B_p))
+        if B_odd_p is not None:
+            B_odd_p = meta.mu_basis.unpack_operator(B_odd_p)
     from file_io.mpa_store import write_complete_pole_store_collective
 
     diagram_value = str(getattr(
@@ -977,6 +1025,8 @@ def compute_sigma_c_ppm_omega_grid(
         quadrature_eps=float(sigma_cfg.quadrature_eps),
         quadrature_reduction_seconds=float(
             sigma_cfg.quadrature_reduction_seconds),
+        quadrature_reduction_steps=getattr(
+            sigma_cfg, "quadrature_reduction_steps", None),
         quadrature_cache_dir=quadrature_cache_dir,
         omega_grid_step_ry=float(sigma_cfg.omega_step_ev) / RYD_TO_EV,
         pole_batch_size=int(mpa_cfg.pole_batch_size),

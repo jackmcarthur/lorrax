@@ -24,7 +24,8 @@ from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_box_plan import plan_sigma_windows
 from gw.sigma_plan import resolve_sigma_plan
-from gw.wavefunction_bundle import face_kernel_kwargs
+from gw.wavefunction_bundle import (
+    parent_sigma_operands, sigma_face_kernel_kwargs)
 from runtime.env_flags import env_bool
 from runtime.padding import pad_to_axis
 
@@ -262,7 +263,8 @@ def _integrate_sigma_batches(
             for lo, hi in brackets)
         if not brackets:
             raise ValueError("MPA Sigma band-bracket plan must be nonempty")
-    face_kwargs = face_kernel_kwargs(wfns)
+    face_kwargs = sigma_face_kernel_kwargs(wfns)
+    k_unfold_plan = face_kwargs.get("k_unfold_plan")
     if wfns.layout == "legacy":
         # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
         # extent.  Identical on an unsplit deck.  UNVERIFIED on a split
@@ -292,7 +294,18 @@ def _integrate_sigma_batches(
         # runtime-owned carrier, and the accumulator is born at that carrier
         # width.  It stays there until a logical output consumer strips by
         # ``sigma_axis``; no nondivisible sharded array is ever published.
-        if bracketed and len(brackets) > 1:
+        # The projection operands default to the full-k faces; the parent
+        # route below replaces both roles with the parent faces.
+        psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
+        if k_unfold_plan is not None:
+            # Raw parents only: the parent faces feed the G contraction (the
+            # plan transports G to full k) and the projection (the spatial
+            # tail selects, projects, broadcasts).  Bracket packing is not
+            # combined with the route.
+            (psi_coh_xn, psi_coh_yr,
+             psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
+            pack_brackets = False
+        elif bracketed and len(brackets) > 1:
             from gw.wavefunction_bundle import pack_band_window
             packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
                       for lo, hi in brackets]
@@ -303,9 +316,9 @@ def _integrate_sigma_batches(
             psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
             pack_brackets = False
         psi_proj_xr = pad_to_axis(
-            wfns.psi_nmu, sigma_axis, axis=1)
+            psi_proj_xr, sigma_axis, axis=1)
         psi_proj_yn = pad_to_axis(
-            wfns.psi_mun, sigma_axis, axis=3)
+            psi_proj_yn, sigma_axis, axis=3)
         spatial_shape = (
             int(meta.nk_tot), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier
@@ -359,6 +372,19 @@ def _integrate_sigma_batches(
     sweep_wall_start = None
     stop_probe = False
     for lo, Omega, B, B_odd in batches:
+        if getattr(meta, 'mu_basis', None) is not None:
+            # The pole store keeps the canonical centroid order; the run
+            # computes in its packed order.  Pack every operator-shaped pole
+            # field once per batch at this read seam.  GN-PPM's pole frequency
+            # is per (q, mu, nu) and follows the residues; MPA's scalar poles
+            # are left alone.
+            _basis = meta.mu_basis
+            _mu_can = int(_basis.n_canonical)
+            B = _basis.pack_operator(B)
+            if B_odd is not None:
+                B_odd = _basis.pack_operator(B_odd)
+            if Omega.ndim >= 2 and tuple(Omega.shape[-2:]) == (_mu_can, _mu_can):
+                Omega = _basis.pack_operator(Omega)
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
             max_d = max(
@@ -385,13 +411,21 @@ def _integrate_sigma_batches(
                             * jnp.reshape(
                                 jnp.asarray(weight, jnp.float64),
                                 np.asarray(win.mask_A).shape))
+            E_A_call = row.E_A
+            if k_unfold_plan is not None:
+                # The G contraction runs on the raw parents: its energy and
+                # selector tables are the parents' rows of the star-invariant
+                # full-k tables (one child per raw row, plan.parent_rows).
+                E_A_call = k_unfold_plan.parent_rows(row.E_A)
+                selector = k_unfold_plan.parent_rows(
+                    jnp.reshape(selector, np.shape(row.E_A)))
             if not sweep_started:
                 first_t = np.asarray(
                     jax.device_get(win.nodes.t), np.complex128)[0]
                 prewarm_args = (
                     psi_coh_xn, psi_coh_yr,
                     psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B_branch, Omega,
+                    E_A_call, selector, B_branch, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
@@ -436,7 +470,7 @@ def _integrate_sigma_batches(
                         sigma_tau = tau_kernel(
                             psi_coh_xn, psi_coh_yr,
                             psi_proj_xr, psi_proj_yn,
-                            row.E_A, selector, B_branch, Omega,
+                            E_A_call, selector, B_branch, Omega,
                             pole_indices, bounds, phase_real,
                             jnp.asarray(win.E_ref_A),
                             jnp.asarray(win.E_ref_B),
@@ -451,7 +485,7 @@ def _integrate_sigma_batches(
                     sigma_tau = tau_kernel(
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
-                        row.E_A, selector, B_branch, Omega,
+                        E_A_call, selector, B_branch, Omega,
                         pole_indices, bounds, phase_real,
                         jnp.asarray(win.E_ref_A),
                         jnp.asarray(win.E_ref_B),
@@ -669,6 +703,7 @@ def compute_sigma_c_mpa_omega_grid(
     quadrature_reduction_seconds,
     quadrature_cache_dir,
     omega_grid_step_ry,
+    quadrature_reduction_steps=None,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
@@ -767,6 +802,7 @@ def compute_sigma_c_mpa_omega_grid(
                     regularization_width_ry,
                     eps=quadrature_eps,
                     reduction_seconds=quadrature_reduction_seconds,
+                    reduction_steps=quadrature_reduction_steps,
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
                     fixed_rule_session=fixed_quadrature_session)

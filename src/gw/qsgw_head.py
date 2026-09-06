@@ -2046,6 +2046,37 @@ def _head_wings_sharded_face(
     endpoint bundles remain in those same two canonical face orientations;
     this helper neither applies operators nor creates an alternate carrier.
     """
+    if (getattr(wfns, "layout", None) == "face" and wfns.psi_mun is None
+            and getattr(wfns, "green_parent", None) is not None):
+        # Parents-only storage: the wings are a sum over k, so stream the
+        # children of one raw parent at a time (w_isdf.iter_parent_children_
+        # faces) and accumulate; no full-k face is ever resident.  The
+        # velocity is on file at every k already (dipole.h5 covers nk_tot).
+        if body_bra_wfns is not None or body_ket_wfns is not None:
+            raise ValueError(
+                "head_wings_sharded(layout='face'): separately supplied "
+                "endpoint bundles are not combined with parents-only storage.")
+        from gw.w_isdf import iter_parent_children_faces
+        v_all = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+        e_all = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+        f_all = jnp.asarray(occupations_kn, dtype=jnp.float64)
+        s_all = (None if surface_weight_kn is None
+                 else jnp.asarray(surface_weight_kn, dtype=jnp.float64))
+        Y_x = Z_y = None
+        for rows, child in iter_parent_children_faces(
+                wfns.green_parent, mesh, slices=wfns.slices):
+            r = jnp.asarray(rows, dtype=jnp.int32)
+            y, z = _head_wings_sharded_face(
+                jnp.take(v_all, r, axis=1), child, jnp.take(e_all, r, axis=0),
+                jnp.take(f_all, r, axis=0), omegas_ry, mesh=mesh,
+                nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
+                nspinor=nspinor, eta_ry=eta_ry,
+                surface_weight_kn=(None if s_all is None
+                                   else jnp.take(s_all, r, axis=0)))
+            Y_x = y if Y_x is None else Y_x + y
+            Z_y = z if Z_y is None else Z_y + z
+        return Y_x, Z_y
+
     bra_wfns = wfns if body_bra_wfns is None else body_bra_wfns
     ket_wfns = wfns if body_ket_wfns is None else body_ket_wfns
 
@@ -2296,6 +2327,22 @@ def _static_head_wings_sharded_face(
     if surface.ndim != 2:
         raise ValueError(
             f"static head surface weights must be (nk,nb), got {surface.shape}")
+    if (wfns.psi_mun is None
+            and getattr(wfns, "green_parent", None) is not None):
+        # Parents-only storage: stream the children star by star (see
+        # _head_wings_sharded_face); the static wing is a plain k sum.
+        from gw.w_isdf import iter_parent_children_faces
+        left = right = None
+        for rows, child in iter_parent_children_faces(
+                wfns.green_parent, mesh, slices=wfns.slices):
+            r = jnp.asarray(rows, dtype=jnp.int32)
+            a, b = _static_head_wings_sharded_face(
+                child, jnp.take(surface, r, axis=0), mesh=mesh,
+                nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
+                nspinor=nspinor)
+            left = a if left is None else left + a
+            right = b if right is None else right + b
+        return left, right
     if wfns.psi_mun is None or wfns.psi_nmu is None:
         raise ValueError(
             "static_head_wings_sharded(layout='face') requires "

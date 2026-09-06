@@ -28,12 +28,9 @@ class Meta:
     nky: int
     nkz: int
     nk_tot: int
-    n_rmu_padded: int = 0     # n_rmu rounded up to ``world_size`` (= jax.device_count() = ∏ p_a
-                              # over the device mesh).  Worst-case sharding divisor — any
-                              # single- or product-axis PartitionSpec on the μ dim divides this.
-                              # Mirrors the band-axis pattern (b_id_4 padded vs b_id_4_user
-                              # logical).  Output writers state n_rmu as the dataset shape;
-                              # in-memory shardings use n_rmu_padded.
+    n_rmu_padded: int = 0     # runtime centroid carrier: mu_basis.n_packed,
+                              # or the canonical suffix-padded extent without
+                              # a basis. Writers store n_rmu physical rows.
     b_id_4_user: int = 0      # original user-supplied nband; b_id_4_user == b_id_4 when no pad. Output writers slice to this.
     # ── THE χ / Σ BAND-COUNT SPLIT (2026-08-16) ──────────────────────────
     # Global top of the χ0/W band sum and of the Σ band sum respectively.
@@ -55,6 +52,26 @@ class Meta:
     # slice is load-bearing, not decorative.
     b_id_4_chi: int = 0
     b_id_4_sigma: int = 0
+    # The run's in-memory centroid order (``common.centroid_basis``):
+    # ``n_rmu_padded`` is ITS packed extent and files convert at the I/O
+    # seam.  ``None`` (drivers without a symmetry-packed basis) keeps the
+    # canonical suffix-padded carrier.
+    mu_basis: object = None
+
+    @property
+    def mu_solve_extent(self) -> int:
+        """μ extent dense solves run at: the whole packed carrier when the
+        pads are interleaved per shard, the logical prefix otherwise."""
+        if self.mu_basis is not None:
+            return self.mu_basis.solve_axis.logical
+        return int(self.n_rmu)
+
+    @property
+    def mu_active_mask(self):
+        """Boolean ``(n_rmu_padded,)`` selector of the real centroid slots."""
+        if self.mu_basis is not None:
+            return np.asarray(self.mu_basis.active_mask, dtype=bool)
+        return np.arange(int(self.n_rmu_padded)) < int(self.n_rmu)
 
     @property
     def b_id_4_chi_user(self) -> int:
@@ -124,6 +141,7 @@ class Meta:
         nband_chi: int | None = None,
         nband_sigma: int | None = None,
         mesh_xy=None,
+        mu_basis=None,
     ):
         rank = jax.process_index()
         rank_topo = np.where(np.asarray(jax.devices()) == rank)
@@ -206,13 +224,11 @@ class Meta:
         npol = 4 if nspinor == 4 else 1
         nkx, nky, nkz = (int(x) for x in wfn.kgrid)
         nk_tot = int(sym.nk_tot)
-        # n_rmu_padded uses world_size (== ∏ p_a over the device mesh), the
-        # worst-case divisor for any single- or product-axis PartitionSpec on
-        # the μ dim.  Parallel to b_id_4's use of world_size (line 100).
-        # ``padded_mu_extent`` = round_up(n_rmu, world_size) plus the
-        # test-only LORRAX_EXTRA_MU_PAD rows (pad-extent-invariance gate).
+        # The basis owns runtime orbit packing. Without one, use the
+        # canonical carrier from the padding owner, including any test pad.
         from runtime.padding import padded_mu_extent
-        n_rmu_padded = padded_mu_extent(n_rmu, world_size)
+        n_rmu_padded = (int(mu_basis.n_packed) if mu_basis is not None
+                        else padded_mu_extent(n_rmu, world_size))
         return cls(
             rank,
             n_proc,
@@ -238,4 +254,5 @@ class Meta:
             b_id_4_user=b_id_4_user,
             b_id_4_chi=b_id_4_chi,
             b_id_4_sigma=b_id_4_sigma,
+            mu_basis=mu_basis,
         )

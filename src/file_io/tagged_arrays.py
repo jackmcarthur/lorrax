@@ -537,6 +537,9 @@ def write_restart_state_to_h5(
     psi_full_y_mun=None,
     psi_full_y_transverse=None,
     psi_full_y_transverse_mun=None,
+    psi_parent_y=None,
+    psi_parent_y_mun=None,
+    parent_k_rows=None,
     n_rmu_transverse_logical: int | None = None,
     enk_full=None,
     S_qmunu=None,
@@ -667,7 +670,8 @@ def write_restart_state_to_h5(
     elif mode != "w" and any(
             arr is not None for arr in (
                 psi_full_y, psi_full_y_mun, psi_full_y_transverse,
-                psi_full_y_transverse_mun, enk_full)):
+                psi_full_y_transverse_mun, psi_parent_y, psi_parent_y_mun,
+                enk_full)):
         # Append calls intentionally do not repeat band_slices.  A schema-2
         # file's band_window is logical, so it is sufficient to clip the later
         # psi faces to the same portable disk extent.  A legacy file has no
@@ -738,6 +742,19 @@ def write_restart_state_to_h5(
     _plan("G0_mu_nu", G0_mu_nu, mu_axes=(-1,))
     _plan("psi_full_y", psi_full_y, mu_axes=(-1,), band_axes=(1,))
     _plan("psi_full_y_mun", psi_full_y_mun, mu_axes=(-2,), band_axes=(-1,))
+    # Parents-only storage (gw_init): the raw-parent faces in CANONICAL
+    # centroid order, n_parent = k_irr rows, and nothing on the full BZ.
+    # ``psi_parent_k_rows`` names the full-k row each parent IS
+    # (SymMaps.kirr_fullids), so a restart can check its plan against the
+    # file before trusting the rows.
+    _plan("psi_parent_y", psi_parent_y, mu_axes=(-1,), band_axes=(1,))
+    _plan("psi_parent_y_mun", psi_parent_y_mun, mu_axes=(-2,),
+          band_axes=(-1,))
+    if (psi_parent_y is None) != (psi_parent_y_mun is None) or (
+            (psi_parent_y is not None) != (parent_k_rows is not None)):
+        raise ValueError(
+            "write_restart_state_to_h5: psi_parent_y, psi_parent_y_mun and "
+            "parent_k_rows travel together (all or none).")
     _plan("enk_full", enk_full, band_axes=(-1,))
     _plan("psi_full_y_transverse", psi_full_y_transverse,
           mu_axes=(-1,), n_logical=n_T, band_axes=(1,))
@@ -755,6 +772,9 @@ def write_restart_state_to_h5(
 
     with SlabIO(filename, mode=mode, mesh=mesh,
 ) as io:
+        if parent_k_rows is not None:
+            io.write_attr("psi_parent_k_rows",
+                          np.asarray(parent_k_rows, dtype=np.int64))
         if mode == "w":
             io.write_attr("restart_format_version", np.int64(2))
             if qp_state_source_record is not None:
@@ -854,6 +874,10 @@ def write_restart_state_to_h5(
         # (nk, s, μ, n): μ is axis -2, not -1 — the mun face's axis order
         # differs from every other dataset this writer knows about.
         _write("psi_full_y_mun", psi_full_y_mun)
+        # Parents-only storage: the raw-parent faces (k_irr rows), same
+        # two axis orders as the full-k pair above.
+        _write("psi_parent_y", psi_parent_y)
+        _write("psi_parent_y_mun", psi_parent_y_mun)
         _write("enk_full", enk_full)
 
         # Bispinor per-channel ψ: μ axis clipped to the TRANSVERSE
@@ -1566,10 +1590,27 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
 
     # ---- pass 1: geometry + the small replicated arrays, serial h5py ----
     with h5py.File(filename, "r") as f:
-        if "psi_full_y" not in f:
+        has_full_psi = "psi_full_y" in f
+        has_parent_psi = "psi_parent_y" in f
+        if not has_full_psi and not has_parent_psi:
             raise ValueError(
                 f"Restart file {filename} is missing canonical psi_full_y "
                 "dataset. Regenerate restart tensors with current gw_jax.")
+        if has_parent_psi and not has_full_psi and not low_mem_bands:
+            raise ValueError(
+                f"Restart file {filename} stores the raw-parent ψ faces only "
+                "(psi_parent_y, written by a parents-only low_mem_bands run) "
+                "and no full-k psi_full_y; the legacy layout has no parent "
+                "reader.  Read it with low_mem_bands = true.")
+        if has_parent_psi and not (
+                "psi_parent_y_mun" in f and "psi_parent_k_rows" in f):
+            raise ValueError(
+                f"Restart file {filename} has psi_parent_y but not both "
+                "psi_parent_y_mun and psi_parent_k_rows: a torn parents-only "
+                "write.  Rerun with restart = false.")
+        parent_k_rows = (
+            np.asarray(f["psi_parent_k_rows"][()], dtype=np.int64)
+            if has_parent_psi else None)
         # THE UNFOLD TABLES, while this handle is open and before any tensor
         # bytes move.  Empty on every full-BZ and legacy file, which is what
         # keeps those reads on the byte path they have always had.
@@ -1578,7 +1619,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                   for k in ("V_qmunu", "S_qmunu", "V0_noG0_munu",
                             "psi_full_y", "psi_full_y_mun",
                             "psi_full_y_transverse",
-                            "psi_full_y_transverse_mun")
+                            "psi_full_y_transverse_mun",
+                            "psi_parent_y", "psi_parent_y_mun")
                   if k in f}
         dtypes = {k: f[k].dtype for k in shapes}
         for name in shapes:
@@ -1591,7 +1633,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                 f"by a legacy-layout run.  Read it with low_mem_bands = "
                 f"false, or rerun with restart = false so the transverse "
                 f"face pair is written.")
-        if low_mem_bands and "psi_full_y_mun" not in shapes:
+        if low_mem_bands and has_full_psi and "psi_full_y_mun" not in shapes:
             raise ValueError(
                 f"Restart file {filename} has no 'psi_full_y_mun' dataset "
                 "but low_mem_bands = true was requested.  Either this file "
@@ -1613,8 +1655,9 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
     n_rmu_disk = int(shapes["V_qmunu"][-1])
     mu_axis = padded_mu_axis(n_rmu_disk, divisor)
     n_rmu_pad = mu_axis.carrier
-    nspinor = _check_nspinor(shapes["psi_full_y"][2],
-                             f"read_restart_state_from_h5({filename})")
+    nspinor = _check_nspinor(
+        shapes["psi_full_y" if has_full_psi else "psi_parent_y"][2],
+        f"read_restart_state_from_h5({filename})")
 
     # Integrity cross-check of the stamped transverse extent against the
     # dataset it describes (audit 2026-07-28: the stamp used to be
@@ -1717,13 +1760,24 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
         V_qmunu = _read_munu(io, "V_qmunu")
         S_qmunu = _read_munu(io, "S_qmunu")
         V0_noG0_munu = _read_munu(io, "V0_noG0_munu")
+        psi_nmu_parent = None
+        psi_mun_parent = None
         if low_mem_bands:
             psi_full_y = None
+            # ``_read_psi`` returns None for an absent dataset: a
+            # parents-only file has no full-k pair.
             psi_nmu = _read_psi(io, "psi_full_y", n_rmu_disk,
                                 spec=psi_nmu_spec)
             psi_mun = _read_psi(io, "psi_full_y_mun", n_rmu_disk,
                                 spec=psi_mun_spec, mu_axis=-2, spinor_axis=1,
                                 band_axis=-1)
+            # Raw-parent faces (canonical order, k_irr rows) at the SAME
+            # two face specs: one direct hyperslab each.
+            psi_nmu_parent = _read_psi(io, "psi_parent_y", n_rmu_disk,
+                                       spec=psi_nmu_spec)
+            psi_mun_parent = _read_psi(io, "psi_parent_y_mun", n_rmu_disk,
+                                       spec=psi_mun_spec, mu_axis=-2,
+                                       spinor_axis=1, band_axis=-1)
             # Transverse (bispinor) faces: same two-hyperslab pattern at
             # the transverse μ extent.  A file holding the nmu-order
             # dataset WITHOUT the additive mun face was written by a
@@ -1798,7 +1852,28 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
     del nspinor  # gated above; the extent itself rides on the arrays
     return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
             psi_full_y_transverse, n_rmu_T_disk, psi_nmu, psi_mun,
-            psi_nmu_T, psi_mun_T, charge_zeta_identity)
+            psi_nmu_T, psi_mun_T, charge_zeta_identity,
+            psi_nmu_parent, psi_mun_parent, parent_k_rows)
+
+
+def require_full_k_psi(f, *, where: str) -> None:
+    """Refuse, by name, a restart file that stores raw-parent ψ only.
+
+    ``gw_init``'s parents-only storage writes ``psi_parent_y`` (k_irr rows)
+    and no ``psi_full_y``.  Readers that still want the full-k faces (BSE,
+    downfold) call this before touching ``psi_full_y`` so the failure names
+    its cause instead of a KeyError.
+    """
+    if "psi_full_y" in f:
+        return
+    if "psi_parent_y" in f:
+        raise ValueError(
+            f"{where}: {f.filename} stores the raw-parent ψ faces only "
+            "(psi_parent_y, written by a parents-only GW run) and no "
+            "psi_full_y.  This reader has no parent unfold yet; it needs "
+            "a GW run that kept the full-k faces, or the parent-aware port "
+            "(KNOWN_LORRAX_ISSUES.md, 2026-09-05).")
+    raise ValueError(f"{where}: {f.filename} has no psi_full_y dataset.")
 
 
 def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
@@ -1911,7 +1986,8 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
 
     (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
      psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
-     psi_nmu_T, psi_mun_T, charge_zeta_identity) = read_restart_state_from_h5(
+     psi_nmu_T, psi_mun_T, charge_zeta_identity,
+     psi_nmu_parent, psi_mun_parent, parent_k_rows) = read_restart_state_from_h5(
         filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
         band_receipt=band_axis)
 
@@ -1929,6 +2005,8 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
             psi_nmu_transverse=psi_nmu_T, psi_mun_transverse=psi_mun_T,
             n_rmu_transverse_disk=n_rmu_T_disk,
             charge_zeta_identity=charge_zeta_identity,
+            psi_nmu_parent=psi_nmu_parent, psi_mun_parent=psi_mun_parent,
+            parent_k_rows=parent_k_rows,
         )
 
     x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
@@ -1965,4 +2043,5 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         psi_nmu_transverse=None, psi_mun_transverse=None,
         n_rmu_transverse_disk=n_rmu_T_disk,
         charge_zeta_identity=charge_zeta_identity,
+        psi_nmu_parent=None, psi_mun_parent=None, parent_k_rows=None,
     )

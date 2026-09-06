@@ -409,6 +409,59 @@ def build_grouped_shard_layout(
     return validate_grouped_shard_layout(out)
 
 
+def identity_square_grouped_shard_layout(
+    n_logical: int,
+    n_padded: int,
+    mesh_shape: tuple[int, int],
+) -> SquareGroupedShardLayout:
+    """The canonical suffix-padded order as a (trivial) square layout.
+
+    Every row is its own group in canonical order and all ``n_padded -
+    n_logical`` pad slots sit at the global suffix, so packing is the
+    identity.  Used when a centroid set has no nontrivial orbit structure to
+    exploit (trivial group, non-closed set, or a channel that keeps the
+    canonical order).
+    """
+    shape = tuple(int(x) for x in mesh_shape)
+    if len(shape) != 2 or shape[0] < 1 or shape[0] != shape[1]:
+        raise ValueError(
+            "identity_square_grouped_shard_layout requires a positive square "
+            f"mesh shape; got {shape}.")
+    side = shape[0]
+    n, n_pad = int(n_logical), int(n_padded)
+    if n < 1 or n_pad < n or n_pad % (side * side):
+        raise ValueError(
+            "identity_square_grouped_shard_layout: n_padded must be a "
+            f"complete-mesh multiple covering n_logical; got {n}/{n_pad} on "
+            f"{shape}.")
+    shard_size = n_pad // side
+    packed_to_canonical = np.full((n_pad,), -1, dtype=np.int64)
+    packed_to_canonical[:n] = np.arange(n)
+    owner = np.arange(n) // shard_size
+    out = object.__new__(GroupedShardLayout)
+    fields = {
+        "n_logical": n, "n_groups": n, "n_shards": side,
+        "shard_size": shard_size, "n_padded": n_pad,
+        "packed_to_canonical": _readonly(packed_to_canonical, np.int64),
+        "canonical_to_packed": _readonly(np.arange(n), np.int64),
+        "canonical_group_id": _readonly(np.arange(n), np.int32),
+        "packed_group_id": _readonly(
+            np.where(packed_to_canonical >= 0, packed_to_canonical, n),
+            np.int32),
+        "active_mask": _readonly(packed_to_canonical >= 0, bool),
+        "group_owner": _readonly(owner, np.int32),
+        "group_start": _readonly(np.arange(n), np.int64),
+        "group_size": _readonly(np.ones((n,), dtype=np.int32), np.int32),
+        "shard_load": _readonly(np.bincount(owner, minlength=side), np.int64),
+    }
+    for name, value in fields.items():
+        object.__setattr__(out, name, value)
+    sq = object.__new__(SquareGroupedShardLayout)
+    object.__setattr__(sq, "side", side)
+    object.__setattr__(sq, "axis", validate_grouped_shard_layout(out))
+    return sq
+
+
 def build_square_grouped_shard_layout(
     group_id,
     mesh_shape: tuple[int, int],
@@ -437,5 +490,6 @@ __all__ = [
     "SquareGroupedShardLayout",
     "build_grouped_shard_layout",
     "build_square_grouped_shard_layout",
+    "identity_square_grouped_shard_layout",
     "validate_grouped_shard_layout",
 ]

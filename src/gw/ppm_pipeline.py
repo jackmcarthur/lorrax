@@ -579,6 +579,7 @@ def compute_ppm_sigma_pipeline(
             print_fn=print_fn,
             model_label=label,
             n_mu_logical=int(meta.n_rmu),
+            mu_active_mask=getattr(meta, 'mu_active_mask', None),
             q_neg_index=q_neg,
             # User-ruled GN variant: re-anchor the exact 0.2% tails at the fit
             # owner before the incumbent exact-pane planner sees the reduced

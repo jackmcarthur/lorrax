@@ -164,6 +164,7 @@ class PsiGStore:
         bispinor: bool = False,
         bispinor_lift: str = "raw",
         band_pad_to: int | None = None,
+        k_domain: str = "full_bz",
     ):
         self.loader = loader
         self.mesh = mesh_xy
@@ -171,8 +172,19 @@ class PsiGStore:
         self.meta = meta
         self.bispinor = bool(bispinor)
         self.bispinor_lift = str(bispinor_lift)
+        # Which k rows the store holds: the unfolded full BZ (the production
+        # ζ-fit source) or the WFN file's own raw parent rows.  A parent-k
+        # consumer wants the IBZ rows themselves, not their images, and the
+        # loader's k table, box index and coefficient rows must all come from
+        # the same domain or k and G fall out of gauge.
+        self.k_domain = str(k_domain)
+        if self.k_domain not in ("full_bz", "ibz"):
+            raise ValueError(
+                "PsiGStore: k_domain must be 'full_bz' or 'ibz'; got "
+                f"{k_domain!r}")
 
-        nk = int(meta.nk_tot)
+        nk = (int(loader.nkpts) if self.k_domain == "ibz"
+              else int(meta.nk_tot))
         ns = int(meta.nspinor)
         ngkmax = int(loader.ngkmax)
         p = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
@@ -304,7 +316,7 @@ class PsiGStore:
             with timing.section("psi_G_store.populate.loader_load"):
                 psi_G_bc = load_psi_gflat_padded(
                     self.loader, (bc_start, bc_end), mesh_xy=self.mesh,
-                    bispinor=self.bispinor, k="full_bz",
+                    bispinor=self.bispinor, k=self.k_domain,
                     pad_to=self._band_pad_to, sharding=sharding_spec,
                     bispinor_lift=self.bispinor_lift)
                 if psi_G_bc is not None:
@@ -339,12 +351,12 @@ class PsiGStore:
             # REPLICATED buffer (0.16 GB/rank each), accumulating to
             # ~1.3 GB/rank wasted by V_q time (agent_h §3 Finding 3).
             self._g_index_dev = self.loader.box_index_dev(
-                k="full_bz", mesh=self.mesh)
+                k=self.k_domain, mesh=self.mesh)
             # k and G are one gauge contract owned by WfnLoader. Rebuilding
             # k from integer grid labels can pick a different reciprocal-
             # lattice image than ``box_index``'s G table (notably on an
             # identity-only WFN whose stored full grid is centered).
-            kvecs_frac = self.loader.kvecs(k="full_bz")
+            kvecs_frac = self.loader.kvecs(k=self.k_domain)
             # Process-local placement — see
             # ``common.collectives.device_put_process_local``: on a
             # multi-process mesh ``jax.device_put(numpy, sharding)``
@@ -600,6 +612,7 @@ def build_psi_G_store(
     bispinor: bool = False,
     bispinor_lift: str = "raw",
     band_pad_to: int | None = None,
+    k_domain: str = "full_bz",
 ) -> PsiGStore:
     """Construct the one ψ(G-flat) host store.
 
@@ -612,6 +625,10 @@ def build_psi_G_store(
     while preserving the logical ``band_chunk_ranges`` exposed by the store.
     It must be at least every logical chunk width and divisible by the
     band-sharding mesh product.
+
+    ``k_domain='ibz'`` builds the store over the WFN file's own raw parent
+    rows (``loader.nkpts`` of them) instead of the unfolded full BZ, for a
+    consumer that works at parent k.
     """
     loader = wfn  # reuse top-level WfnLoader; opening a second one would
                   # re-slurp wfns/coeffs into host RAM.
@@ -619,4 +636,4 @@ def build_psi_G_store(
         loader=loader, mesh_xy=mesh_xy,
         band_chunk_ranges=band_chunk_ranges, meta=meta,
         bispinor=bispinor, bispinor_lift=bispinor_lift,
-        band_pad_to=band_pad_to)
+        band_pad_to=band_pad_to, k_domain=k_domain)

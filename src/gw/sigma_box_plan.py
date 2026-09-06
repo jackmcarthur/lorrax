@@ -239,8 +239,15 @@ def make_sigma_box_spec(
 
 def _rule_cache_lookup(
     directory, box, eps, relative, *, noise_amplification_cap,
+    reduction_steps=None,
 ):
-    """Return the smallest compatible rule plus any unreadable-path warnings."""
+    """Return the smallest compatible rule plus any unreadable-path warnings.
+
+    ``reduction_steps`` is part of the rule's identity: a certificate reduced
+    under a deterministic step budget and one reduced under the wall clock
+    are different rules for the same box, and a deck that names a step
+    budget must never be served a clock-reduced entry (or vice versa).
+    """
     if directory is None:
         return None, ()
     warnings = []
@@ -261,6 +268,11 @@ def _rule_cache_lookup(
             with np.load(path) as data:
                 if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
                         or bool(data["relative"]) != relative):
+                    continue
+                cached_steps = (int(data["reduction_steps"])
+                                if "reduction_steps" in data else -1)
+                if cached_steps != (-1 if reduction_steps is None
+                                    else int(reduction_steps)):
                     continue
                 # Cache entries pre-dating the executor-noise stamp, or
                 # entries built for a looser consumer, are not compatible.
@@ -318,7 +330,8 @@ def _rule_is_certified(rule, eps) -> bool:
         and np.isfinite(float(rule.kappa_max)))
 
 
-def _rule_cache_store(directory, rule, noise_amplification):
+def _rule_cache_store(directory, rule, noise_amplification,
+                      reduction_steps=None):
     """Atomically store one immutable box certificate, or return a warning."""
     if directory is None:
         return None
@@ -326,9 +339,10 @@ def _rule_cache_store(directory, rule, noise_amplification):
             and np.isfinite(float(noise_amplification))):
         return ("WARNING sigma quadrature cache store refused an uncertified "
                 "or non-finite rule (nothing written)")
+    steps = -1 if reduction_steps is None else int(reduction_steps)
     identity = hashlib.sha256(json.dumps(
         ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
-         bool(rule.relative)]
+         bool(rule.relative), steps]
     ).encode())
     identity.update(np.ascontiguousarray(rule.times).view(np.uint8).tobytes())
     identity.update(np.ascontiguousarray(rule.weights).view(np.uint8).tobytes())
@@ -351,7 +365,7 @@ def _rule_cache_store(directory, rule, noise_amplification):
                 kappa_max=float(rule.kappa_max),
                 roundoff_amplification=float(noise_amplification),
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
-                seconds=float(rule.seconds))
+                seconds=float(rule.seconds), reduction_steps=int(steps))
         os.replace(temporary, path)
     except OSError as exc:
         if temporary is not None:
@@ -407,6 +421,7 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
 
 def _fit_rule(
     spec, eps, reduction_seconds, cache_dir, eta, *, cache_build_widen=True,
+    reduction_steps=None,
 ):
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
@@ -418,7 +433,8 @@ def _fit_rule(
     noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
     cached, cache_lookup_warnings = _rule_cache_lookup(
         cache_dir, requested_box, eps, relative,
-        noise_amplification_cap=noise_amplification_cap)
+        noise_amplification_cap=noise_amplification_cap,
+        reduction_steps=reduction_steps)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
@@ -426,7 +442,12 @@ def _fit_rule(
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None and cache_build_widen
                      else requested_box)
-        build_kwargs = {"time_budget": reduction_seconds}
+        # A step budget replaces the wall clock: deterministic across
+        # machines (sigma_quadrature_reduction_steps).
+        build_kwargs = (
+            {"reduction_steps": int(reduction_steps)}
+            if reduction_steps is not None
+            else {"time_budget": reduction_seconds})
         if relative:
             # For a sign-definite rule the service's kappa is
             # sum|term|/|Q|, while Sigma's noise amplification is
@@ -508,7 +529,8 @@ def _fit_rule(
         # cancellation cap but misses Sigma's eps-scaled noise cap must not
         # poison every subsequent attempt for this box.
         cache_write_warning = _rule_cache_store(
-            cache_dir, rule, noise_amplification)
+            cache_dir, rule, noise_amplification,
+            reduction_steps=reduction_steps)
     node_digest = hashlib.sha256(
         np.ascontiguousarray(times).view(np.uint8).tobytes()
         + np.ascontiguousarray(weights).view(np.uint8).tobytes()
@@ -572,7 +594,7 @@ def _parallel_fits(specs, worker):
 
 def fit_sigma_box_specs(
     specs, eta_ry, *, eps, reduction_seconds, cache_dir,
-    cache_build_widen=True,
+    cache_build_widen=True, reduction_steps=None,
 ):
     """Fit independent route-neutral box specifications across processes.
 
@@ -594,7 +616,8 @@ def fit_sigma_box_specs(
     return _parallel_fits(
         rows, lambda index: _fit_rule(
             rows[index], tolerance, budget, cache_dir, eta,
-            cache_build_widen=bool(cache_build_widen)))
+            cache_build_widen=bool(cache_build_widen),
+            reduction_steps=reduction_steps))
 
 
 def _box_contains(outer, inner):
@@ -696,6 +719,7 @@ def _fixed_fit_for_spec(entry, spec):
 
 def _fit_fixed_sc_rules(
     specs, eta, *, eps, reduction_seconds, cache_dir, session,
+    reduction_steps=None,
 ):
     """Fit one padded SC rule set, then reuse those exact nodes.
 
@@ -714,7 +738,8 @@ def _fit_fixed_sc_rules(
         padded = [_sc_padded_box_spec(spec, eta) for spec in rows]
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
-            cache_dir=cache_dir, cache_build_widen=False)
+            cache_dir=cache_dir, cache_build_widen=False,
+            reduction_steps=reduction_steps)
         rules = {}
         for spec, padded_spec, fit in zip(rows, padded, fits):
             frozen = dict(fit)
@@ -771,7 +796,8 @@ def _fit_fixed_sc_rules(
         padded = [_sc_padded_box_spec(spec, eta) for spec in rebuild]
         new_fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
-            cache_dir=cache_dir, cache_build_widen=False)
+            cache_dir=cache_dir, cache_build_widen=False,
+            reduction_steps=reduction_steps)
         for spec, padded_spec, fit in zip(rebuild, padded, new_fits):
             rebuilt = dict(fit)
             rebuilt["cache_status"] = "rebuild:sc-fixed"
@@ -850,6 +876,7 @@ def plan_sigma_windows(
     print_fn=print,
     edge_factor=1.5,
     fixed_rule_session=None,
+    reduction_steps=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -875,6 +902,11 @@ def plan_sigma_windows(
     reduction_seconds
         Per-window Gauss-reduction wall budget.  Independent windows are
         assigned round-robin across processes.
+    reduction_steps
+        ``None`` keeps the wall budget.  An integer replaces it by that
+        many reduction passes per window, so the accepted rule -- and the
+        Σ τ-node count -- is a function of the inputs alone
+        (``sigma_quadrature_reduction_steps``).
     cache_dir
         Directory for immutable box-rule certificates, or ``None``.
     fixed_rule_session
@@ -978,14 +1010,20 @@ def plan_sigma_windows(
         branch_reports.append(report)
 
     fixed_receipt = None
+    if reduction_steps is not None and process_rank() == 0:
+        print_fn(
+            f"  Sigma rule reduction: deterministic budget of "
+            f"{int(reduction_steps)} passes per window "
+            "(sigma_quadrature_reduction_seconds ignored)")
     if fixed_rule_session is None:
         fits, fit_rows = fit_sigma_box_specs(
             specs, eta, eps=tolerance, reduction_seconds=budget,
-            cache_dir=cache_dir)
+            cache_dir=cache_dir, reduction_steps=reduction_steps)
     else:
         fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
             specs, eta, eps=tolerance, reduction_seconds=budget,
-            cache_dir=cache_dir, session=fixed_rule_session)
+            cache_dir=cache_dir, session=fixed_rule_session,
+            reduction_steps=reduction_steps)
     if process_rank() == 0:
         announced = set()
         for fit in fits:

@@ -92,10 +92,6 @@ MODULO_EXCEPTIONS.update(_registered({
 
 MODULO_EXCEPTIONS.update(_registered({
     ("services/symmetry_maps/src/symmetry_maps/maps.py",
-     "reorder_isdf_operator_basis", "shape[1] % (px * py)"),
-    ("services/symmetry_maps/src/symmetry_maps/maps.py",
-     "reorder_isdf_operator_basis", "shape[2] % (px * py)"),
-    ("services/symmetry_maps/src/symmetry_maps/maps.py",
      "unfold_spin_centroid_operator", "n_left * ns % px"),
     ("services/symmetry_maps/src/symmetry_maps/maps.py",
      "unfold_spin_centroid_operator", "perm_ms % (n_left * ns // px)"),

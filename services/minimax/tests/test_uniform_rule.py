@@ -119,3 +119,22 @@ def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
     sup, kappa = rule_sup_error(rule.times, rule.weights, d)
     assert sup <= 1.5e-4 and kappa <= 1.0e4
     assert abs(rule.node_count - ref.node_count) <= 3, (rule.node_count, ref.node_count)
+
+
+def test_step_budget_is_deterministic_and_ignores_the_clock():
+    """``reduction_steps`` makes the accepted rule a function of the inputs:
+    two builds agree bit for bit, and a wall budget passed alongside is
+    ignored (the same rule again), unlike the wall-clock mode whose node
+    count depends on how far the reduction got before the deadline."""
+    box = (2.0 * ETA, 400.0 * ETA, ETA, 30.0 * ETA)
+    first = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
+    second = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
+    third = build_uniform_rule(box, 1.0e-4, reduction_steps=3, time_budget=1e-3)
+    _check(first, box, 1.0e-4)
+    np.testing.assert_array_equal(first.times, second.times)
+    np.testing.assert_array_equal(first.weights, second.weights)
+    np.testing.assert_array_equal(first.times, third.times)
+    np.testing.assert_array_equal(first.weights, third.weights)
+    # fewer passes cannot reach fewer nodes than more passes
+    more = build_uniform_rule(box, 1.0e-4, reduction_steps=12)
+    assert more.node_count <= first.node_count

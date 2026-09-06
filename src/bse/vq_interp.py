@@ -481,6 +481,8 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     # ``close_zeta_coarse(zx)``.
     fr = h5py.File(restart_file, "r")
     zx["_h5_restart"] = fr
+    from file_io.tagged_arrays import require_full_k_psi
+    require_full_k_psi(fr, where="vq_interp restart-file ψ reader")
     zx["psi"] = fr["psi_full_y"][()]          # (nk, nb, ns, n_mu) u at centroids
     zx["kgrid"] = fr["kgrid"][()].astype(int)
     # LAZY — disk tiles (gate reference) — UNLESS the file stores the q
