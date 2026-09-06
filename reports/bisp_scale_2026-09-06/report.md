@@ -63,3 +63,22 @@ New union-box certificates preserve all error/containment/noise guards; the eigh
 P16 parent09 finishes94s step wall (lx-Xg4-112718-6609-6855),646 compile events/34.26s rank0; parent dynamic23 finishes133s (lx-Xg4-112855-174741-8396),892 events/52.91s. Fixed10/24 refuse logical transverse194 at P16 in core.py:3407. A common whole-orbit logical200 set is being built for a compatible P4/P16 matrix; old and new centroid measurements will remain separate.
 
 Hourly fetch found integration71ae0bde (after af85d474), which removes both antiunitary collective permutes from each parent tau and defers band unfolding until after the frequency sum. Existing captures retain their af85d474 provenance; new-tip measurements will be separately labeled.
+
+## Audited common-basis P4 matrix (claim1294)
+
+Step57982945/lx-Xg4-123003-543237-1984 exits0 in655s. Slurm accounting shows no GPU overlap. Code71ae0bde, fixed e1559a07, common logicalC597/T200; 115 identical certified quadrature nodes. Artifacts: `runs/DEV/116_bisp_scale_codex_2026-09-06/final_P4.json`, `identity_104_105.json` through `identity_106_111.json`; run master103.
+
+| Arm | Total s | Sigma other s | Tau sweep s | Compiles | Compiler s |
+|---|---:|---:|---:|---:|---:|
+|104 P static baseline|67.11|20.15|—|674|38.06|
+|105 F static baseline|57.13|20.61|—|578|30.31|
+|106 P dynamic baseline|96.51|31.34|7.29|894|57.49|
+|107 F dynamic baseline|86.87|29.94|8.93|772|45.21|
+|108 P static direct zeros|64.30|18.09|—|610|35.95|
+|109 P dynamic direct zeros|92.84|28.56|7.15|798|54.28|
+|110 P static plus host placement|62.35|17.98|—|589|35.64|
+|111 P dynamic plus host placement|92.20|28.45|6.77|777|53.93|
+
+All four prototype arms preserve both printed EQP files and every sector row exactly against their P baseline. P/F remains FAIL; no equivalent-science speedup is certified. Prototype compilation remains11 static/5 dynamic modules above F. Cold end-to-end P is slower even after these changes.
+
+Dedicated four-node allocation57988457 succeeded on fallback attempt5 after four QOS refusals (`runs/DEV/116_bisp_scale_codex_2026-09-06/06_pool_fallback/allocation5.log`). Shared-pool queued master96 was cancelled before science. Dedicated master119 failed before science because its copied runner omitted preflight.py; corrected master120 preserves that attempt and is running. Future legs are pinned to our dedicated pool. Hourly fetch found ORCH443e95be; its additional head-factor placement changes are held separate until this71ae0bde matrix completes.
