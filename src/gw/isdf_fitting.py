@@ -37,7 +37,7 @@ from isdf.core import (
     factor_c_q,
     fit_one_rchunk,
     solve_zeta,
-    _z_q_face_coupled_mu123,
+    _z_q_face_parent,
     _resolve_solver_kind,
     _resolve_zeta_gather,
     _band_norms_slice,
@@ -1673,26 +1673,17 @@ def fit_zeta_to_h5(
             _prebuilt_zeta = None
             if _coupled_mu123_coordinator is not None:
                 def _build_coupled_Z_q():
-                    _cache_cap = int(face_y_cache_r_tile) or actual_n_rchunk
-                    _cache_tile = bounded_partition_tile(
-                        actual_n_rchunk, _cache_cap,
-                        int(mesh_xy.shape['y']))
-                    if _cache_tile <= 0:
-                        raise ValueError(
-                            "coupled mu123 Zq requires a valid bounded "
-                            "face-Y cache tile")
-                    return _z_q_face_coupled_mu123(
-                        psi_mun_parent if parent_route else psi_mun_fresh,
-                        psi_G_store, psi_r_cache, weight_l_face, weight_r_face,
+                    if not parent_route:
+                        raise ValueError("Coupled current zeta requires raw parent wavefunctions")
+                    return _z_q_face_parent(
+                        psi_mun_parent, psi_G_store, psi_r_cache,
+                        weight_l_face, weight_r_face,
                         band_chunk_ranges=band_chunk_ranges,
-                        r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
-                        r_chunk_size=actual_n_rchunk,
                         kgrid=kgrid, mesh_xy=mesh_xy,
-                        cache_y_r_tile=_cache_tile,
-                        k_unfold_plan=k_unfold_plan,
-                        tile_r_index=_tile_args.get("tile_r_index"),
-                        tile_local_perm=_tile_args.get("tile_local_perm"),
-                        tile_wraps=_tile_args.get("tile_wraps"))
+                        k_unfold_plan=k_unfold_plan, coupled_mu123=True,
+                        tile_r_index=_tile_args["tile_r_index"],
+                        tile_local_perm=_tile_args["tile_local_perm"],
+                        tile_wraps=_tile_args["tile_wraps"])
 
                 if _coupled_stacked_solve:
                     def _build_coupled_zeta():

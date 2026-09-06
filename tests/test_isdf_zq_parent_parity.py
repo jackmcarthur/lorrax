@@ -261,11 +261,11 @@ def _worker(case_name: str) -> int:
                 tile_local_perm=jnp.asarray(local_perm),
                 tile_wraps=jnp.asarray(wraps))
             if vertex and cache is not None:
-                from isdf.core import _z_q_face_coupled_mu123
-                coupled = _z_q_face_coupled_mu123(
+                from isdf.core import _z_q_face_parent
+                coupled = _z_q_face_parent(
                     psi_mun_pk, parent_store, cache, w_l, w_r,
                     band_chunk_ranges=band_chunk_ranges,
-                    r_start_dyn=0, r_chunk_size=tiles.width,
+                    coupled_mu123=True,
                     kgrid=kgrid, mesh_xy=mesh, k_unfold_plan=plan,
                     tile_r_index=jnp.asarray(r_index),
                     tile_local_perm=jnp.asarray(local_perm), tile_wraps=jnp.asarray(wraps))

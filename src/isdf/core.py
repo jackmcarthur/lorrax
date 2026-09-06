@@ -3341,56 +3341,6 @@ def _z_q_face_parent(
 		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache)
 
 
-def _z_q_face_coupled_mu123(
-	psi_mun: jax.Array,
-	psi_G_store,
-	psi_r_cache: jax.Array | None,
-	weight_l: jax.Array,
-	weight_r: jax.Array,
-	*,
-	band_chunk_ranges: tuple[tuple[int, int], ...],
-	r_start_dyn,
-	r_chunk_size: int,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	cache_y_r_tile: int = 0,
-	k_unfold_plan=None,
-	tile_r_index=None,
-	tile_local_perm=None,
-	tile_wraps=None,
-) -> jax.Array:
-	"""Private prototype returning ``Z_q[mu123,q,mu_X,r_Y]``.
-
-	The incumbent Y transform/scatter and one full-spin X owner broadcast are
-	built once per band chunk.  Channels then execute sequentially with the
-	accepted scalar-spin-pair and band scans, so only one channel's two P
-	carries are live at a time.  The solver remains outside this transport
-	prototype and consumes each leading-axis slice through its existing owner.
-	"""
-	if int(psi_mun.shape[1]) != 4:
-		raise ValueError(
-			"_z_q_face_coupled_mu123 requires a four-spinor face carrier")
-	if k_unfold_plan is not None:
-		return _z_q_face_parent(
-			psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
-			k_unfold_plan=k_unfold_plan, coupled_mu123=True,
-			tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
-			tile_wraps=tile_wraps, band_chunk_ranges=band_chunk_ranges,
-			kgrid=kgrid, mesh_xy=mesh_xy)
-	_gamma_mu123 = tuple(_gamma_perm_phase_mu(mu) for mu in (1, 2, 3))
-	perm_mu123 = jnp.stack(tuple(gamma[0] for gamma in _gamma_mu123))
-	phase_mu123 = jnp.stack(tuple(gamma[1] for gamma in _gamma_mu123))
-	return _z_q_face(
-		psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
-		gamma_L=(perm_mu123, phase_mu123),
-		gamma_R=(perm_mu123, phase_mu123),
-		band_chunk_ranges=band_chunk_ranges,
-		r_start_dyn=r_start_dyn, r_chunk_size=r_chunk_size,
-		kgrid=kgrid, mesh_xy=mesh_xy,
-		cache_y_blocks=True, cache_y_r_tile=cache_y_r_tile,
-		coupled_mu123=True)
-
-
 # Backward-compat shim removed — old z_q_from_psi_sm signature
 # (consumed pre-computed psi_l_Y / psi_r_Y) is gone.  Call sites
 # updated in `_make_fit_one_rchunk_kernel._kernel`.

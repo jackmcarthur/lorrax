@@ -1128,3 +1128,5 @@ The capacity equations, host-spill pricing, solve operand floor, and
 fragmentation target are owned by [the memory model](memory-model.md) and
 `gw.gflat_memory_model`. The large-centroid alternatives and their sharding
 costs are summarized in [`docs/dev/large_nmu_operation.md`](../dev/large_nmu_operation.md).
+
+The coupled current fit calls `_z_q_face_parent(coupled_mu123=True)` directly; it requires a typed parent plan and orbit-tile tables. The former `_z_q_face_coupled_mu123` full-k wrapper is removed.

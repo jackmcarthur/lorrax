@@ -347,30 +347,6 @@ def _worker(case_name: str) -> int:
         weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
         cache_face_y_blocks=False))
 
-    # One focused private-prototype discriminator: the coupled route must
-    # reproduce three independently compiled accepted channel kernels while
-    # sharing their Y transform and full-spin X owner broadcast.
-    coupled_values = ()
-    if case_name == "gamma_mu1_nu1":
-        from isdf.core import _z_q_face_coupled_mu123
-        Z_coupled = jax.block_until_ready(_z_q_face_coupled_mu123(
-            jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
-            cached_store, psi_r_cache,
-            jnp.asarray(w_l), jnp.asarray(w_r),
-            band_chunk_ranges=band_chunk_ranges,
-            r_start_dyn=r_start, r_chunk_size=n_zchunk,
-            kgrid=kgrid, mesh_xy=mesh))
-        Z_single_mu = tuple(jax.block_until_ready(z_q_from_psi_sm(
-            psi_G_store=cached_store, psi_r_cache=psi_r_cache,
-            band_chunk_ranges=band_chunk_ranges,
-            r_start_dyn=r_start, r_chunk_size=n_zchunk,
-            kgrid=kgrid, mesh_xy=mesh, layout="face",
-            psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
-            gamma_L=gamma_perm_phase(mu), gamma_R=gamma_perm_phase(mu),
-            weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
-            cache_face_y_blocks=True)) for mu in (1, 2, 3))
-        coupled_values = (Z_coupled, *Z_single_mu)
-
     # Production-closure seam: direct z_q parity alone does not prove the
     # planner-owned structural bit reaches ``fit_one_rchunk``'s factory/cache
     # key.  Run the full z_q -> solve closure for charge ns=1/2, the short-r
@@ -435,9 +411,6 @@ def _worker(case_name: str) -> int:
     fit_outputs_np = tuple(
         np.asarray(_mhu.process_allgather(value, tiled=True))
         for value in fit_outputs)
-    coupled_values_np = tuple(
-        np.asarray(_mhu.process_allgather(value, tiled=True))
-        for value in coupled_values)
     Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
     if tail_logical is None:
         comparisons = (Zf, Zfsc, Zfst, Zfsr, *fit_outputs_np)
@@ -485,13 +458,6 @@ def _worker(case_name: str) -> int:
         float(np.abs(Zfst - Zfsc).max()),
         float(np.abs(Zfst - Zfsr).max()))
     route_max_rel = route_max_abs / max(float(np.abs(Zfsc).max()), 1e-300)
-    coupled_max_rel = 0.0
-    if coupled_values_np:
-        coupled_stack, *coupled_singles = coupled_values_np
-        coupled_reference = np.stack(coupled_singles)
-        coupled_max_rel = float(np.abs(
-            coupled_stack - coupled_reference).max()) / max(
-                float(np.abs(coupled_reference).max()), 1e-300)
     for store in (cached_store, streamed_store):
         store.close()
         for attr, expected in (
@@ -514,7 +480,6 @@ def _worker(case_name: str) -> int:
         "fit_one_rchunk_routes": len(fit_outputs_np),
         "cache_route_max_abs": route_max_abs,
         "cache_route_max_rel": route_max_rel,
-        "coupled_mu123_max_rel": coupled_max_rel,
     }))
     return 0
 
