@@ -6,4 +6,5 @@ pool: 57988457
 source: run-local tau_candidate.py loaded in place of gw.ppm_tau_kernel; production baseline unchanged
 steps:
   gate:
-    state: pending
+    state: complete
+receipt: "[lx] step lx-Xg0-134127-870825-7599 exit 0 in 24 s"

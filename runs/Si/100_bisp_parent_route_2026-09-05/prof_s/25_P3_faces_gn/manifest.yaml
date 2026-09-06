@@ -1,4 +1,4 @@
-run_id: 23_P3_gn_baseline
+run_id: 25_P3_faces_gn
 system: Si
 pipeline: gwjax
 platform: perlmutter
@@ -8,5 +8,5 @@ pool: 57988457
 geometry: P4 one rank per GPU
 steps:
   sigma:
-    state: complete
-receipt: "[lx] step lx-Xg4-135242-941227-2733 exit 0 in 78 s"
+    state: skipped
+disposition: latest gate requires MoS2 TRS rows; no duplicate Si leg

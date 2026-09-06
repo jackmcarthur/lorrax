@@ -1,4 +1,4 @@
-run_id: 37_F3_dynamic_receipts
+run_id: 45_F3_dynamic_retry
 system: MoS2
 pipeline: gwjax
 platform: perlmutter
@@ -8,4 +8,5 @@ pool: 57988457
 geometry: P4 one rank per GPU
 steps:
   sigma:
-    state: failed
+    state: skipped
+disposition: superseded by one-leg speed protocol and existing controls
