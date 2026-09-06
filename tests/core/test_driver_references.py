@@ -100,6 +100,11 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
                 atol=EQP_ATOL_EV)
     _assert_eqp(run_b / "mpa_sc1_eqp1.dat", source_b / "mpa_sc1_eqp1.dat",
                 atol=EQP_ATOL_EV)
+    # The retained buffer state's map output distinguishes PARTPAD from
+    # the former scissored result; final EQP files alone hide that change.
+    for name in ("eqp0_iter0000.dat", "eqp0_iter0001.dat",
+                 "eqp1_iter0000.dat", "eqp1_iter0001.dat"):
+        _assert_eqp(run_b / name, source_b / name, atol=EQP_ATOL_EV)
     report = (run_b / "mpa_sc1.out").read_text(encoding="utf-8")
     residuals = [float(value) for value in re.findall(
         r"SC iteration: call=\d+ role=linear .*?max\|dE\|=([0-9.e+-]+)",
